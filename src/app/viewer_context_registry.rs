@@ -806,6 +806,12 @@ pub(in crate::app) struct ViewerContextBundle {
     stack_script_error: Option<String>,
     stack_selection_target: Option<crate::filename_stack_ui::StackSelectionTarget>,
     items: Vec<GridItem>,
+    page_identity_index: Arc<super::file_type_resume::PreparedPageIdentityIndex>,
+    current_book_bookmarks: Vec<crate::book_bookmarks::BookBookmark>,
+    current_book_bookmarks_key: Option<BookBookmarkProjectionKey>,
+    current_book_bookmarks_request: Option<CurrentBookBookmarksRequest>,
+    book_bookmark_title_edit: Option<BookBookmarkTitleEdit>,
+    bookmark_view_registered_total: usize,
     items_generation: u64,
     visible_indices: Vec<usize>,
     /// `items` と同じ添字の正規化済み basename と、その worker lifecycle。
@@ -1530,6 +1536,34 @@ impl<'a> ContextRef<'a> {
         }
     }
 
+    pub(in crate::app) fn book_bookmarks_request(self) -> Option<&'a CurrentBookBookmarksRequest> {
+        match self.source {
+            ContextRefSource::Mounted(app) => app.current_book_bookmarks_request.as_ref(),
+            ContextRefSource::AtRest(bundle) => bundle.current_book_bookmarks_request.as_ref(),
+        }
+    }
+
+    pub(in crate::app) fn book_bookmarks_key(self) -> Option<&'a BookBookmarkProjectionKey> {
+        match self.source {
+            ContextRefSource::Mounted(app) => app.current_book_bookmarks_key.as_ref(),
+            ContextRefSource::AtRest(bundle) => bundle.current_book_bookmarks_key.as_ref(),
+        }
+    }
+
+    pub(in crate::app) fn book_bookmarks(self) -> &'a [crate::book_bookmarks::BookBookmark] {
+        match self.source {
+            ContextRefSource::Mounted(app) => &app.current_book_bookmarks,
+            ContextRefSource::AtRest(bundle) => &bundle.current_book_bookmarks,
+        }
+    }
+
+    pub(in crate::app) fn book_bookmark_title_editing(self) -> bool {
+        match self.source {
+            ContextRefSource::Mounted(app) => app.book_bookmark_title_edit.is_some(),
+            ContextRefSource::AtRest(bundle) => bundle.book_bookmark_title_edit.is_some(),
+        }
+    }
+
     pub(in crate::app) fn video_audio_mode(self) -> Option<usize> {
         match self.source {
             ContextRefSource::Mounted(app) => app.video_audio_mode,
@@ -1690,6 +1724,7 @@ impl ViewerContextBundle {
     /// one-shot worker だが、owner の消滅後に CPU / GPU / AI 処理を続ける理由がないので、
     /// 各 worker が既に監視している cancel token を立てる。
     fn cancel_all_context_work(&mut self) {
+        self.current_book_bookmarks_request = None;
         crate::thumb_loader::cancel_raw_thumb_tickets(&self.raw_thumb_develop);
         self.cancel_token.store(true, Ordering::Relaxed);
         if let Some(q) = &self.reload_queue {
@@ -1815,6 +1850,12 @@ impl ViewerContextBundle {
             stack_script_error: None,
             stack_selection_target: None,
             items: Vec::new(),
+            page_identity_index: Default::default(),
+            current_book_bookmarks: Vec::new(),
+            current_book_bookmarks_key: None,
+            current_book_bookmarks_request: None,
+            book_bookmark_title_edit: None,
+            bookmark_view_registered_total: 0,
             items_generation: 0,
             visible_indices: Vec::new(),
             facet_name_cache: Vec::new(),
@@ -2182,6 +2223,12 @@ impl App {
             stack_script_error,
             stack_selection_target,
             items,
+            page_identity_index,
+            current_book_bookmarks,
+            current_book_bookmarks_key,
+            current_book_bookmarks_request,
+            book_bookmark_title_edit,
+            bookmark_view_registered_total,
             items_generation,
             visible_indices,
             facet_name_cache,
@@ -2450,6 +2497,12 @@ impl App {
         swap_field!(stack_script_error);
         swap_field!(stack_selection_target);
         swap_field!(items);
+        swap_field!(page_identity_index);
+        swap_field!(current_book_bookmarks);
+        swap_field!(current_book_bookmarks_key);
+        swap_field!(current_book_bookmarks_request);
+        swap_field!(book_bookmark_title_edit);
+        swap_field!(bookmark_view_registered_total);
         swap_field!(items_generation);
         swap_field!(visible_indices);
         swap_field!(facet_name_cache);
@@ -2738,6 +2791,15 @@ impl App {
     pub(in crate::app) fn split_current_context_preserving_main_grid(
         &mut self,
     ) -> Box<ViewerContextBundle> {
+        // This boundary executes only after the table admitted the successful fork.
+        // The transient reader and its return lifetime move as one owner; the main
+        // projection receives the unchanged, already prepared physical basis.
+        let direct_owner = self.direct_media_reader_active().then(|| {
+            (
+                self.snapshot.take().expect("direct media owner exists"),
+                std::mem::take(&mut self.top_level_grid_view),
+            )
+        });
         crate::thumb_loader::cancel_raw_thumb_tickets(&self.raw_thumb_develop);
         // Forking changes the exact viewer owner even when the new payload retains the same
         // fullscreen index. Never carry a physical right-button sequence across that boundary.
@@ -2778,6 +2840,12 @@ impl App {
             stack_script_error,
             stack_selection_target,
             items,
+            page_identity_index,
+            current_book_bookmarks,
+            current_book_bookmarks_key,
+            current_book_bookmarks_request,
+            book_bookmark_title_edit,
+            bookmark_view_registered_total,
             items_generation,
             visible_indices,
             facet_name_cache,
@@ -3051,6 +3119,8 @@ impl App {
             stack_script_error,
             stack_selection_target,
             items,
+            page_identity_index,
+            bookmark_view_registered_total,
             items_generation,
             visible_indices,
             facet_name_cache,
@@ -3102,6 +3172,10 @@ impl App {
 
         // 再生中 player / pending と fullscreen viewer の一時 UI だけを parked 所有へ移す。
         move_to_parked!(
+            current_book_bookmarks,
+            current_book_bookmarks_key,
+            current_book_bookmarks_request,
+            book_bookmark_title_edit,
             stack_return_state,
             vst3_deferred_media_open,
             fullscreen_idx,
@@ -3325,6 +3399,30 @@ impl App {
             erase_inpaint_pending,
             ai_classify_cache,
         );
+        if let Some((mut snapshot, surface)) = direct_owner {
+            self.items = std::mem::take(&mut snapshot.saved_items);
+            self.thumbnails = std::mem::take(&mut snapshot.saved_thumbnails);
+            self.image_metas = std::mem::take(&mut snapshot.saved_image_metas);
+            self.visible_indices = std::mem::take(&mut snapshot.saved_visible_indices);
+            self.page_identity_index = snapshot.saved_page_identity_index.clone();
+            self.scroll_offset_y = snapshot.saved_scroll_offset_y;
+            self.selected = snapshot.saved_selected;
+            self.zip_nav = snapshot.saved_zip_nav.take();
+            self.top_level_grid_view = top_level_grid_view::TopLevelGridView::default();
+            // Appended target removal leaves every basis index stable. Retain its
+            // metadata/edit caches and invalidate only generation-bound main work.
+            self.bump_items_generation();
+            self.viewer_navigation_caches.invalidate();
+            // The generation setter retires requests and owned CPU images together.
+            let basis_len = self.items.len();
+            self.checked.retain(|idx| *idx < basis_len);
+            self.rating_cache.retain(|idx, _| *idx < basis_len);
+            self.rotation_cache.remove(&basis_len);
+            self.details_order.retain(|idx| *idx < basis_len);
+            parked.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+            parked.snapshot = Some(snapshot);
+            parked.top_level_grid_view = surface;
+        }
         parked
     }
 
@@ -3386,21 +3484,21 @@ impl App {
         detached.display_epub_source = self.display_epub_source.clone();
         detached.fullscreen_epub_source = self.fullscreen_epub_source.clone();
         detached.current_folder = Some(physical_context.to_path_buf());
-        detached.visible_indices = detached
-            .items
-            .iter()
-            .enumerate()
-            .filter_map(|(item_idx, item)| {
-                item_belongs_to_detached_physical_scope(item, physical_context).then_some(item_idx)
-            })
-            .collect();
-        detached.top_level_grid_view = top_level_grid_view::TopLevelGridView::default();
-        // 物理フォルダ scope の detached は「その 1 フォルダの一覧」として作り直すので、
-        // top-level surface と対で snapshot の退避も持ち込まない。呼び出し側は
-        // `is_snapshot_active()` で snapshot 中の source を既に弾いているが、
-        // **作成ポリシーとして明示**しておく (退避だけ相続して surface が Folder に
-        // 戻っていると、解除の行き先が無い state になる)。
-        detached.snapshot = None;
+        if !parked_direct_media_owner(&detached) {
+            detached.visible_indices = detached
+                .items
+                .iter()
+                .enumerate()
+                .filter_map(|(item_idx, item)| {
+                    item_belongs_to_detached_physical_scope(item, physical_context)
+                        .then_some(item_idx)
+                })
+                .collect();
+        }
+        if !parked_direct_media_owner(&detached) {
+            detached.top_level_grid_view = top_level_grid_view::TopLevelGridView::default();
+            detached.snapshot = None;
+        }
         detached.rating_filter_suppressed_at = None;
         detached.global_search_subfolder_restore = None;
         detached.favsearch_subfolder_restore = None;
@@ -7235,4 +7333,14 @@ mod tests {
         let unknown = ViewerContextId(table.next_serial);
         assert_eq!(table.residence(unknown), ContextResidence::Unknown);
     }
+}
+
+#[cfg(windows)]
+fn parked_direct_media_owner(bundle: &ViewerContextBundle) -> bool {
+    bundle.snapshot.as_ref().is_some_and(|snapshot| {
+        matches!(
+            snapshot.source_label,
+            crate::snapshot::SnapshotSourceLabel::DirectMedia { .. }
+        )
+    })
 }

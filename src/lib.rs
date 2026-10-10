@@ -21,6 +21,11 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#[cfg(test)]
+#[path = "../tests/support/ui_harness.rs"]
+pub(crate) mod test_ui;
+mod wgpu_backend_policy;
+
 pub mod activity_gate;
 pub mod adjustment;
 pub mod adjustment_db;
@@ -49,6 +54,7 @@ pub use ui_dialogs::settings_restore::draw_preferences_transfer_disabled_entry_s
 pub use ui_dialogs::settings_restore::draw_preferences_transfer_entry_snapshot_fixture;
 pub mod archive_cache;
 pub mod archive_converter;
+pub mod archive_origin;
 pub(crate) mod audio_album_art;
 pub mod audio_decode;
 pub mod audio_normalize_db;
@@ -97,6 +103,7 @@ pub mod dwm_iconic_thumbnail;
 #[cfg(windows)]
 pub mod dwm_transitions;
 mod empty_items_reason;
+pub mod file_type_visibility;
 mod gpu_anime4k;
 mod gpu_lanczos;
 pub mod metadata_transfer;
@@ -1255,6 +1262,16 @@ pub fn run() -> eframe::Result {
     let perf_enabled = std::env::args().any(|a| a == "--perf-log" || a == "--perf-log-path")
         || perf_log_path.is_some();
     perf::init_with_path(perf_enabled, Some(prog_start), perf_log_path);
+    #[cfg(all(feature = "test-script", windows))]
+    if test_script_path.is_some() {
+        if let Some(directory) = test_evidence_dir.as_deref() {
+            if let Err(error) = test_script::release_checks::arm_startup(directory) {
+                write_to_parent_console(&format!("error: {error}\n"));
+                entry_trace.finish(miv_startup::Outcome::Error);
+                exit_startup(2);
+            }
+        }
+    }
 
     // WASAPI can take over a second to create the first output stream on a cold
     // boot. Warm it in the background so the first video open does not freeze
@@ -1476,8 +1493,8 @@ pub fn run() -> eframe::Result {
     // wgpu 既定のスコアリングでは Vulkan が DX12 より優先選択される環境があるため、
     // カスタムアダプタセレクタで明示的に DX12 アダプタを最優先する。DX12 が無ければ
     // Vulkan、それも無ければ任意の adapter を返す (eframe / egui 自体は描画される)。
-    // 動画 GPU 経路は実行時に `cc.wgpu_render_state.adapter.get_info().backend` を見て
-    // DX12 のときだけ有効化、Vulkan ならスキップして CPU readback で再生する。
+    // native video は独立した D3D11 device、HUD は別の DX12 Instance を使い、
+    // root GUI の選択 backend に依存しない。
     let mut wgpu_options = egui_wgpu::WgpuConfiguration::default();
     configure_wgpu_presentation(&mut wgpu_options);
     wgpu_options.startup_diagnostics = Some(Arc::new(|event| {
@@ -1528,7 +1545,7 @@ pub fn run() -> eframe::Result {
         }
     }));
     if let egui_wgpu::WgpuSetup::CreateNew(create_new) = &mut wgpu_options.wgpu_setup {
-        create_new.instance_descriptor.backends = wgpu::Backends::DX12 | wgpu::Backends::VULKAN;
+        create_new.instance_descriptor.backends = wgpu_backend_policy::native_backends();
         create_new.native_adapter_selector = Some(std::sync::Arc::new(
             |adapters: &[wgpu::Adapter], _surface: Option<&wgpu::Surface<'_>>| {
                 if let Some(a) = adapters
@@ -1774,11 +1791,8 @@ pub fn run() -> eframe::Result {
             if let Some(rs) = cc.wgpu_render_state.clone() {
                 #[cfg(windows)]
                 {
-                    // 実際に選ばれた wgpu バックエンドを確認。動画 GPU 経路は
-                    // `wgpu_hal::api::Dx12` 経由で D3D11 NT shared texture を
-                    // import するので **DX12 でないと使えない**。Vulkan
-                    // (= リモートデスクトップ等の fallback) では GPU video device を
-                    // 作らず CPU readback + swscale 経路にフォールバックする。
+                    // root GUI の backend を診断用に記録する。native video の
+                    // 独立した D3D11 device 作成を、この値で制限しない。
                     let backend = rs.adapter.get_info().backend;
                     crate::logger::log(format!("wgpu backend selected: {backend:?}"));
                     // GpuVideoDevice は wgpu backend に依存せず独立した D3D11 device を
@@ -2190,3 +2204,8 @@ mod tests {
         assert!(path.ends_with("book.zip"));
     }
 }
+
+pub use ui_dialogs::preferences::draw_file_type_visibility_snapshot_fixture;
+pub use ui_main::draw_file_type_visibility_status_snapshot_fixture;
+
+pub(crate) mod archive_visibility;

@@ -206,13 +206,12 @@ mod adjust_scope_selector_tests {
 
     #[test]
     fn adjust_scope_top_radio_uses_maximum_limit_for_258px_body() {
-        use egui_kittest::Harness;
         use std::sync::{Arc, Mutex};
 
         let measured = Arc::new(Mutex::new(Vec::new()));
         let measured_in_ui = measured.clone();
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(400.0, 72.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -248,13 +247,12 @@ mod adjust_scope_selector_tests {
 
     #[test]
     fn adjust_scope_action_labels_fit_258px_body() {
-        use egui_kittest::Harness;
         use std::sync::{Arc, Mutex};
 
         let measured = Arc::new(Mutex::new(Vec::new()));
         let measured_in_ui = measured.clone();
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(400.0, 180.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -1620,10 +1618,8 @@ mod local_adjust_segmentation_tests {
     /// - 「選択レイヤーまでプレビュー」チェックボックスのラベル文字列
     #[test]
     fn local_adjust_panel_snapshot_empty_layer_list() {
-        use egui_kittest::Harness;
-
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(280.0, 200.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -1669,10 +1665,8 @@ mod local_adjust_segmentation_tests {
 
     #[test]
     fn colorize_preset_slots_snapshot_single_row() {
-        use egui_kittest::Harness;
-
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(280.0, 90.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -1697,10 +1691,8 @@ mod local_adjust_segmentation_tests {
 
     #[test]
     fn colorize_gradient_preview_snapshot_custom_palette() {
-        use egui_kittest::Harness;
-
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(280.0, 92.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -1745,12 +1737,10 @@ mod local_adjust_segmentation_tests {
         selected_layer: usize,
         preview_to_selected_layer: bool,
     ) {
-        use egui_kittest::Harness;
-
         let mut fonts_ready = false;
         let layers = std::sync::Arc::new(layers);
         let layers_for_render = std::sync::Arc::clone(&layers);
-        let mut harness = Harness::builder().with_size(size).build(move |ctx| {
+        let mut harness = crate::test_ui::builder().with_size(size).build(move |ctx| {
             crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
             if !fonts_ready {
                 crate::ui_fonts::configure_fonts(ctx);
@@ -1891,8 +1881,6 @@ mod local_adjust_segmentation_tests {
         params: local_adjust_core::RepairParams,
         mask: local_adjust_core::LocalMask,
     ) {
-        use egui_kittest::Harness;
-
         let mut fonts_ready = false;
         let mut layer = snapshot_layer(
             "修復／塗り",
@@ -1900,7 +1888,7 @@ mod local_adjust_segmentation_tests {
             local_adjust_core::LocalEffect::Repair(params),
             true,
         );
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(320.0, 590.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -10605,12 +10593,12 @@ mod creative_lut_ui_tests {
 
     #[test]
     fn image_creative_lut_popup_is_dark_and_shows_builtin_presets_in_light_app() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
         let mut fonts_ready = false;
         let mut selected_id = None;
         let creative_luts = crate::creative_lut::builtin_creative_lut_entries();
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(380.0, 520.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Light);
@@ -15293,6 +15281,7 @@ impl App {
                                         if ui.small_button("名前を編集").clicked() {
                                             start_title_edit =
                                                 Some(crate::app::BookBookmarkTitleEdit {
+                                                    focus_viewport: ctx.viewport_id(),
                                                     id: bookmark.id,
                                                     title: bookmark
                                                         .title

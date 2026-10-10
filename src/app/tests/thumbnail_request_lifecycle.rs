@@ -1165,10 +1165,20 @@ fn lifecycle_sibling_mount_hide_restore_and_retire_preserve_owned_resources() {
                 }
                 app.cancel_token.store(true, Ordering::Relaxed);
             }
-            3 => app.install_prepared_aggregate_items(
-                vec![GridItem::Image(PathBuf::from(r"c:\new\0.png"))],
-                vec![Some((10, 20))],
-            ),
+            3 => {
+                let items = vec![GridItem::Image(PathBuf::from(r"c:\new\0.png"))];
+                let page_identity_index =
+                    Arc::new(file_type_resume::PreparedPageIdentityIndex::prepare(
+                        &items,
+                        None,
+                        app.settings.file_type_visibility.clone(),
+                    ));
+                app.install_prepared_aggregate_items(
+                    items,
+                    vec![Some((10, 20))],
+                    page_identity_index,
+                );
+            }
             4 => {
                 app.fullscreen_idx = Some(0);
                 app.close_fullscreen();

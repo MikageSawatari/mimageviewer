@@ -4,6 +4,54 @@ use super::*;
 
 #[path = "tests/thumbnail_request_lifecycle.rs"]
 mod thumbnail_request_lifecycle;
+impl App {
+    pub(crate) fn folder_order_refresh_pending_for_test(&self) -> bool {
+        self.folder_pane_open_pending
+            .as_ref()
+            .is_some_and(|pending| {
+                matches!(
+                    pending.purpose,
+                    FolderOpenScanPurpose::CurrentViewOrderRefresh { .. }
+                )
+            })
+    }
+    /// Fixtures that require an admitted, usable listing wait for its real worker owner.
+    pub(crate) fn finish_page_identity_preparation_for_test(&mut self) {
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while self.sidecar_restore_active() {
+            self.poll_sidecar_restore(&ctx);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "listing identity preparation did not settle"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    pub(crate) fn finish_history_restore_preparation_for_test(&mut self) {
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while self
+            .top_level_grid_view
+            .history_navigation_transition()
+            .is_some()
+            || self.subfolder_expansion_install_pending.is_some()
+            || self.sidecar_restore_active()
+        {
+            self.poll_collection_history_transition(&ctx);
+            if self.subfolder_expansion_install_pending.is_some() {
+                self.finish_subfolder_expansion_prepare_for_test();
+            }
+            self.poll_sidecar_restore(&ctx);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "history restore preparation did not settle"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+}
 
 #[cfg(test)]
 mod file_organize_tests {
@@ -24,6 +72,7 @@ mod file_organize_tests {
         std::fs::create_dir(&origin).unwrap();
         std::fs::create_dir(&destination).unwrap();
         app.load_folder(origin.clone());
+        app.finish_page_identity_preparation_for_test();
         let history = app.folder_nav_history_snapshot();
         assert!(
             app.apply_fullscreen_close_nav_immediate(crate::ui_main::AddressBarNav::Direct(
@@ -221,6 +270,102 @@ mod folder_mtime_rescan_tests {
     use super::*;
     use folder_scan::signature_tests::{fixture, real_changes};
 
+    #[test]
+    fn visibility_external_rescan_restores_semantic_cursor_after_actual_hydration() {
+        for case in ["cursor", "explicit", "operation"] {
+            let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+            let mut app = setup_app();
+            let folder = app.tmp.path().join("cursor-rescan");
+            std::fs::create_dir(&folder).unwrap();
+            let page = folder.join("page.png");
+            let later = folder.join("z.png");
+            for path in [&page, &later] {
+                image::RgbImage::new(1, 1).save(path).unwrap();
+            }
+            app.settings.sidecar_backup_enabled = false;
+            app.settings.tag_sidecar_backup_enabled = false;
+            app.load_folder_with_scan(folder.clone(), None);
+            let settle = |app: &mut App| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while app.sidecar_restore_active() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "cursor hydration timeout"
+                    );
+                    app.poll_sidecar_restore(&egui::Context::default());
+                    std::thread::yield_now();
+                }
+            };
+            settle(&mut app);
+            app.selected = app
+                .items
+                .iter()
+                .position(|item| matches!(item, GridItem::Image(path) if path == &page));
+            app.scroll_offset_y = 125.0;
+            let old_index = app.selected.unwrap();
+            if case == "explicit" {
+                app.select_after_load = Some("z.png".into());
+            }
+            if case == "operation" {
+                app.request_post_operation_selection(
+                    folder.clone(),
+                    crate::post_operation_selection::ExpectedOutputs::AddedSince(
+                        [later.clone()].into_iter().collect(),
+                    ),
+                );
+                assert!(app.apply_post_operation_selection());
+            }
+            image::RgbImage::new(1, 1)
+                .save(folder.join("a.png"))
+                .unwrap();
+            let scan = folder_scan::scan_directory_with_settings(&folder, &app.settings).unwrap();
+            let signature = signature_from_scan(&scan);
+            app.apply_external_rescan(
+                folder.clone(),
+                std::time::SystemTime::now(),
+                scan,
+                signature,
+            );
+            assert!(
+                app.sidecar_restore_active(),
+                "must exercise the actual asynchronous owner"
+            );
+            settle(&mut app);
+            let added = folder.join("a.png");
+            let expected = match case {
+                "explicit" => &later,
+                "operation" => &added,
+                _ => &page,
+            };
+            assert!(
+                matches!(&app.items[app.selected.unwrap()], GridItem::Image(path) if path == expected)
+            );
+            if case != "operation" {
+                assert_ne!(
+                    app.selected,
+                    Some(old_index),
+                    "the new row shifts the saved raw cursor"
+                );
+                assert_eq!(app.scroll_offset_y, 125.0);
+            } else {
+                assert_eq!(app.checked.len(), 2, "both operation outputs are selected");
+            }
+            assert!(app.scroll_to_selected);
+            assert!(app.select_after_load.is_none());
+            if case == "operation" {
+                app.reload_current_folder_preserving_override();
+                settle(&mut app);
+                assert!(
+                    matches!(&app.items[app.selected.unwrap()], GridItem::Image(path) if path == &added)
+                );
+                assert!(
+                    app.select_after_load.is_none(),
+                    "the previous lower-priority hint must not survive"
+                );
+            }
+        }
+    }
+
     fn prepare() -> (AppTestEnv, PathBuf) {
         let mut app = setup_app();
         let folder = app.tmp.path().join("folder_mtime_rescan");
@@ -366,6 +511,7 @@ mod folder_mtime_rescan_tests {
             );
             assert_ne!(app.items_generation, generation, "{label}");
             assert_eq!(app.current_folder_signature, Some(signature), "{label}");
+            app.finish_page_identity_preparation_for_test();
         }
     }
 
@@ -431,6 +577,7 @@ mod folder_mtime_rescan_tests {
                 mtime: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2),
                 items_generation: app.items_generation + u64::from(case == "stale"),
                 scan_options: ExternalRescanOptions {
+                    file_type_visibility: Default::default(),
                     include_convertible_archives: true,
                     include_epub: true,
                     show_hidden_files: false,
@@ -1446,7 +1593,13 @@ fn mutation_refresh_navigation_retires_pin_materialization_owner_and_keeps_sibli
             "mount alone preserves the parked owner"
         );
         // Prepared aggregate adoption (search / smart / collection) owns the same invalidation.
-        mounted.install_prepared_aggregate_items(vec![GridItem::Image(page)], vec![None]);
+        let items = vec![GridItem::Image(page)];
+        let page_identity_index = Arc::new(file_type_resume::PreparedPageIdentityIndex::prepare(
+            &items,
+            None,
+            mounted.settings.file_type_visibility.clone(),
+        ));
+        mounted.install_prepared_aggregate_items(items, vec![None], page_identity_index);
         assert!(sibling_cancel.load(Ordering::Relaxed));
         assert!(!mounted.current_view_pin_refreshes.contains_key(&sibling));
         assert!(!successor_cancel.load(Ordering::Relaxed));
@@ -1650,6 +1803,7 @@ fn mutation_refresh_rating_sort_fixture() -> AppTestEnvForTest {
             OpenRequestOwner::RatingPhysical(owner),
             crate::app::StartupListIntent::ExplicitList,
         ));
+        app.finish_page_identity_preparation_for_test();
     }
     let future = app.tmp.path().join("future");
     app.folder_nav_forward_stack = vec![FolderNavHistoryTarget::Path(future).into()];
@@ -2024,6 +2178,7 @@ fn epub_batch_completion_refreshes_grid_and_applies_same_name_pdf_priority() {
     std::fs::write(&epub, b"epub").unwrap();
     app.settings.skip_epub_if_pdf_exists = true;
     app.load_folder(folder.clone());
+    app.finish_page_identity_preparation_for_test();
     assert!(
         app.items
             .iter()
@@ -3189,6 +3344,7 @@ fn listed_epub_directory_opens_as_folder_under_ignore() {
     let child = parent.join("book.epub");
     std::fs::create_dir_all(&child).unwrap();
     app.load_folder(parent);
+    app.finish_page_identity_preparation_for_test();
     assert!(
         app.items
             .iter()
@@ -3223,6 +3379,7 @@ fn archive_suffix_directories_open_as_folders_under_ignore() {
         let child = parent.join(format!("book.{suffix}"));
         std::fs::create_dir_all(&child).unwrap();
         app.load_folder(parent);
+        app.finish_page_identity_preparation_for_test();
         app.settings.archive_file_handling = crate::settings::ArchiveFileHandling::Ignore;
         assert_eq!(
             app.load_folder_or_convert_archive_with_auto_fullscreen_owned(
@@ -3249,6 +3406,7 @@ fn ignored_archive_file_does_not_retire_pending_direct_pdf_owner() {
     std::fs::write(&source, b"%PDF-1.4\n").unwrap();
     std::fs::write(&ignored, b"RAR").unwrap();
     app.load_folder(root);
+    app.finish_page_identity_preparation_for_test();
     assert_eq!(
         app.load_pdf_as_folder_owned(
             source.clone(),
@@ -3363,6 +3521,7 @@ fn newer_open_classification_cancels_old_result_without_adopting_it() {
     std::fs::create_dir(&first).unwrap();
     std::fs::create_dir(&second).unwrap();
     app.load_folder(source);
+    app.finish_page_identity_preparation_for_test();
     app.settings.epub_file_handling = crate::settings::EpubFileHandling::Ignore;
     assert_eq!(
         app.load_folder_or_convert_archive_with_auto_fullscreen_owned(
@@ -5527,6 +5686,7 @@ fn phase_b_search_batch(
         }],
         scanned_candidates: valid_hits,
         valid_hits,
+        visibility_notice: None,
     }
 }
 
@@ -5998,6 +6158,7 @@ fn phase_b_rating_pending_result_publishes_after_shared_star_write() {
     );
     for _ in 0..100 {
         app.poll_rating_view();
+        app.poll_sidecar_restore(&egui::Context::default());
         if app.rating_view_pending.is_none() && app.items.is_empty() {
             break;
         }
@@ -6183,10 +6344,12 @@ fn reading_history_filters_ignored_epub_when_entered_again() {
         })
         .collect::<Vec<_>>();
     app.install_reading_history_entries(entries.clone());
+    app.finish_page_identity_preparation_for_test();
     assert_eq!(app.items.len(), 2);
 
     app.settings.epub_file_handling = crate::settings::EpubFileHandling::Ignore;
     app.install_reading_history_entries(entries);
+    app.finish_page_identity_preparation_for_test();
     assert_eq!(app.items.len(), 1);
     assert!(
         matches!(&app.items[0], GridItem::PdfFile(path) if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("pdf")))
@@ -8067,6 +8230,7 @@ fn a_second_context_taking_a_snapshot_does_not_clobber_the_first_stash() {
         &[r"E:\alpha\a1.jpg", r"E:\alpha\a2.jpg"],
     );
     app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+    app.finish_page_identity_preparation_for_test();
     assert!(app.is_snapshot_active());
 
     let other = app.build_window_context_for_test(901, |ctx| {
@@ -8078,6 +8242,7 @@ fn a_second_context_taking_a_snapshot_does_not_clobber_the_first_stash() {
             "a freshly built context must not inherit another context's snapshot"
         );
         ctx.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        ctx.finish_page_identity_preparation_for_test();
         assert!(ctx.is_snapshot_active());
     })
     .expect("second context must mount");
@@ -8119,6 +8284,7 @@ fn deactivating_does_not_restore_another_context_stash_for_the_same_folder() {
 
     seed_snapshot_context(&mut app, r"E:\shared", &[r"E:\shared\main.jpg"]);
     app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+    app.finish_page_identity_preparation_for_test();
 
     let other = app.build_window_context_for_test(902, |ctx| {
         // 同じ origin、中身だけ違う。
@@ -8126,6 +8292,7 @@ fn deactivating_does_not_restore_another_context_stash_for_the_same_folder() {
     });
     app.with_viewer_context(other, |ctx| {
         ctx.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        ctx.finish_page_identity_preparation_for_test();
     })
     .expect("second context must mount");
 
@@ -9780,6 +9947,7 @@ fn metadata_panel_test_zip_nav(zip_path: PathBuf, names: &[&str]) -> crate::zip_
             entry_name: (*name).to_string(),
             uncompressed_size: 0,
             mtime: 0,
+            container_ancestry: Vec::new(),
         })
         .collect();
     let tree = std::sync::Arc::new(crate::zip_tree::ZipTree::build(zip_path, entries));
@@ -11022,6 +11190,7 @@ fn auto_fullscreen_image_only_folder_opens_page_after_load() {
     app.pending_auto_fs_open = true;
 
     app.load_folder(folder.clone());
+    app.finish_page_identity_preparation_for_test();
 
     assert_eq!(app.current_folder.as_deref(), Some(folder.as_path()));
     assert_eq!(app.fullscreen_idx, Some(0));
@@ -11387,6 +11556,7 @@ fn auto_fullscreen_image_only_folder_preserves_grid_intent_for_always_new_detach
     app.pending_auto_fs_open = true;
 
     app.load_folder(folder.clone());
+    app.finish_page_identity_preparation_for_test();
 
     assert_eq!(app.current_folder.as_deref(), Some(folder.as_path()));
     assert_eq!(
@@ -12216,6 +12386,7 @@ fn omitted_entries_are_exposed_only_for_the_normal_folder_surface() {
     let mut app = setup_app_for_test();
     let folder = PathBuf::from(r"C:\pictures");
     let counts = crate::app::folder_scan::OmittedFolderEntryCounts {
+        file_type: 0,
         same_name: 3,
         hidden: 2,
         ignored_archive: 4,
@@ -12696,8 +12867,10 @@ pub(crate) mod phase_c_support {
                 std::time::Instant::now() < deadline,
                 "フォルダー再走査が返らない"
             );
+            app.poll_sidecar_restore(&egui::Context::default());
             app.poll_external_rescan(&egui::Context::default());
         }
+        app.finish_page_identity_preparation_for_test();
     }
 
     /// テスト終了時に `data_dir::set_test_override(None)` + `reset_global_for_test()` +
@@ -12764,6 +12937,7 @@ pub(crate) mod phase_c_support {
         /// Exercise the production staged child entry while older navigation fixtures are
         /// migrated to wait for the visible adoption instead of assuming synchronous loading.
         pub(crate) fn begin_staged_smart_drill(&mut self, path: &std::path::Path) -> bool {
+            self.finish_page_identity_preparation_for_test();
             let Some(kind) = self.app.smart_physical_target_kind(path) else {
                 return false;
             };
@@ -12787,8 +12961,10 @@ pub(crate) mod phase_c_support {
             assert!(self.begin_staged_smart_drill(path));
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
+                self.poll_sidecar_restore(ctx);
                 self.poll_smart_folder(ctx);
                 if self.smart_folder_transition.is_none()
+                    && !self.sidecar_restore_active()
                     && self
                         .top_level_grid_view
                         .smart_folder()
@@ -14012,6 +14188,7 @@ mod startup_open_path_resolve_tests {
             )
             .unwrap();
         app.load_folder(source.clone());
+        app.finish_page_identity_preparation_for_test();
         assert!(
             app.items
                 .iter()
@@ -14059,6 +14236,7 @@ mod startup_open_path_resolve_tests {
             )
             .unwrap();
         app.load_folder(source.clone());
+        app.finish_page_identity_preparation_for_test();
         assert!(
             app.items
                 .iter()
@@ -14121,6 +14299,7 @@ mod startup_open_path_resolve_tests {
                 )
                 .unwrap();
             app.load_folder(folder.clone());
+            app.finish_page_identity_preparation_for_test();
             assert!(app.peek_pdf_meta_cache(&pdf, false).is_some());
             app.set_quick_folder_slot_target(super::QuickFolderSlotId::A, folder);
             app.set_quick_folder_slot_target(super::QuickFolderSlotId::B, staged.clone());
@@ -14158,6 +14337,7 @@ mod startup_open_path_resolve_tests {
                     placeholder_count: 2
                 })
             ));
+            app.finish_page_identity_preparation_for_test();
             let rows = app.items.clone();
             let visible = app.visible_indices.clone();
             let selection = app.selected;
@@ -14242,6 +14422,7 @@ mod startup_open_path_resolve_tests {
                     .is_none()
             );
             app.load_folder(folder);
+            app.finish_page_identity_preparation_for_test();
             assert_eq!(
                 app.load_pdf_as_folder_owned(
                     pdf.clone(),
@@ -14262,6 +14443,7 @@ mod startup_open_path_resolve_tests {
                     .iter()
                     .any(|state| matches!(state, crate::grid_item::ThumbnailState::Pending))
             );
+            app.finish_page_identity_preparation_for_test();
             let visible_generation = app.items_generation;
             let placeholder_workers = Arc::clone(&app.cancel_token);
             assert!(!placeholder_workers.load(Ordering::Relaxed));
@@ -14322,6 +14504,7 @@ mod startup_open_path_resolve_tests {
                 )
                 .unwrap();
             app.load_folder(folder);
+            app.finish_page_identity_preparation_for_test();
             let owner_id = crate::bookmark_browser::BookmarkOpenRequestId(31);
             arm_book_bookmark(&mut app, owner_id, warm.clone(), std::time::Instant::now());
             assert!(app.load_folder_with_scan_owned(
@@ -14335,6 +14518,7 @@ mod startup_open_path_resolve_tests {
                 }),
                 crate::app::StartupListIntent::ExplicitList,
             ));
+            app.finish_page_identity_preparation_for_test();
             let rows = app.items.clone();
             let address = app.address.clone();
             let history = app.folder_nav_history_snapshot();
@@ -14395,7 +14579,9 @@ mod startup_open_path_resolve_tests {
         let pdf = folder.join("book.pdf");
         std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
         app.load_folder(folder);
+        app.finish_page_identity_preparation_for_test();
         app.enter_drive_list(None);
+        app.finish_page_identity_preparation_for_test();
         let rows = app.items.clone();
         let owner_id = crate::bookmark_browser::BookmarkOpenRequestId(28);
         arm_book_bookmark(&mut app, owner_id, pdf.clone(), std::time::Instant::now());
@@ -14451,6 +14637,7 @@ mod startup_open_path_resolve_tests {
         let epub = folder.join("book.epub");
         write_history_review_epub(&epub);
         app.load_folder(folder);
+        app.finish_page_identity_preparation_for_test();
         app.enter_drive_list(None);
         let rows = app.items.clone();
         let owner_id = crate::bookmark_browser::BookmarkOpenRequestId(29);
@@ -14542,7 +14729,9 @@ mod startup_open_path_resolve_tests {
             let pdf = folder.join("book.pdf");
             std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
             app.load_folder(folder);
+            app.finish_page_identity_preparation_for_test();
             app.enter_drive_list(None);
+            app.finish_page_identity_preparation_for_test();
             let rows = app.items.clone();
             let address = app.address.clone();
             let owner_id = crate::bookmark_browser::BookmarkOpenRequestId(30);
@@ -14640,6 +14829,7 @@ mod startup_open_path_resolve_tests {
         std::fs::write(&prompt, b"%PDF-1.4\n").unwrap();
         std::fs::write(&other, b"%PDF-1.4\n").unwrap();
         app.load_folder(folder);
+        app.finish_page_identity_preparation_for_test();
         let before = app.folder_nav_history_snapshot();
         let rows = app.items.clone();
         app.pdf_password_request = Some(super::PdfPasswordRequest::legacy(prompt.clone()));
@@ -14679,6 +14869,7 @@ mod startup_open_path_resolve_tests {
         std::fs::write(&other, b"%PDF-1.4\n").unwrap();
         std::fs::write(&prompt, b"%PDF-1.4\n").unwrap();
         app.load_folder(folder);
+        app.finish_page_identity_preparation_for_test();
         let rows = app.items.clone();
         let history = app.folder_nav_history_snapshot();
         let detached =
@@ -15115,6 +15306,7 @@ mod startup_open_path_resolve_tests {
         app.visible_indices = vec![0];
         app.selected = Some(0);
         app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        app.finish_page_identity_preparation_for_test();
         assert!(app.is_snapshot_active());
         assert_eq!(app.snapshot_owner_entry(source), Some(0));
         app.fs_feedback_toast = None;
@@ -15134,6 +15326,7 @@ mod startup_open_path_resolve_tests {
         app.visible_indices = vec![0, 1];
         app.selected = Some(0);
         app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        app.finish_page_identity_preparation_for_test();
         assert!(app.is_snapshot_active());
         assert_eq!(app.snapshot_owner_entry(source), Some(0));
         assert_eq!(app.snapshot_owner_entry(folder), Some(1));
@@ -15601,6 +15794,7 @@ mod startup_open_path_resolve_tests {
         app.visible_indices = vec![0];
         app.selected = Some(0);
         app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        app.finish_page_identity_preparation_for_test();
         app.fs_feedback_toast = None;
         let request_id = crate::bookmark_browser::BookmarkOpenRequestId(704);
         arm_book_bookmark(
@@ -15631,6 +15825,7 @@ mod startup_open_path_resolve_tests {
             }),
             bookmark_relative_page_openable: None,
             elapsed_ms: 1.0,
+            direct_media: None,
         })
         .expect("held resolver receiver must remain owned");
 
@@ -15800,7 +15995,7 @@ mod startup_open_path_resolve_tests {
 
     #[test]
     fn cancel_button_closes_normal_archive_scan_and_cancels_worker() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
         use std::cell::RefCell;
         use std::rc::Rc;
 
@@ -15808,7 +16003,7 @@ mod startup_open_path_resolve_tests {
         let source = app.borrow().tmp.path().join("button-normal-scan.7z");
         let (tx, cancel) = install_normal_archive_scan_transition(&mut app.borrow_mut(), source);
         let app_for_ui = Rc::clone(&app);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(640.0, 360.0))
             .build(move |ctx| {
                 app_for_ui.borrow_mut().show_archive_convert_dialog(ctx);
@@ -15880,6 +16075,7 @@ mod startup_open_path_resolve_tests {
                 }),
                 bookmark_relative_page_openable: None,
                 elapsed_ms: 1.0,
+                direct_media: None,
             },
             &egui::Context::default(),
         );
@@ -16246,6 +16442,7 @@ mod startup_open_path_resolve_tests {
                 resolved: None,
                 bookmark_relative_page_openable: None,
                 elapsed_ms: 1.0,
+                direct_media: None,
             })
             .is_err(),
             "late result receiver must be gone"
@@ -16295,6 +16492,7 @@ mod startup_open_path_resolve_tests {
                 resolved: None,
                 bookmark_relative_page_openable: None,
                 elapsed_ms: 1.0,
+                direct_media: None,
             })
             .is_err(),
             "late bookmark completion receiver must be gone"
@@ -16412,6 +16610,7 @@ mod startup_open_path_resolve_tests {
                 }),
                 bookmark_relative_page_openable: None,
                 elapsed_ms: 1.0,
+                direct_media: None,
             },
             &ctx,
         );
@@ -17165,6 +17364,7 @@ mod phase_c_key_tests {
             std::fs::create_dir_all(later.join("child")).unwrap();
             std::fs::write(child.join("page.jpg"), b"fixture").unwrap();
             app.load_folder(child.clone());
+            app.finish_page_identity_preparation_for_test();
             app.selected = Some(0);
             let source_rows = app.items.clone();
             let source_selected = app.selected;
@@ -17198,6 +17398,7 @@ mod phase_c_key_tests {
             app.folder_history.insert(later.clone(), (0.0, Some(0)));
             let scan = crate::app::scan_directory(&later);
             app.load_folder_with_scan(later.clone(), Some(scan));
+            app.finish_page_identity_preparation_for_test();
             assert_eq!(app.current_folder.as_ref(), Some(&later));
             let selected = app
                 .selected
@@ -17227,6 +17428,7 @@ mod phase_c_key_tests {
         std::fs::create_dir_all(&child).unwrap();
         std::fs::write(child.join("page.jpg"), b"fixture").unwrap();
         app.load_folder(child.clone());
+        app.finish_page_identity_preparation_for_test();
         app.selected = Some(0);
         let rows = app.items.clone();
         let history = app.folder_nav_history_snapshot();
@@ -18916,6 +19118,7 @@ mod folder_pane_open_nav_tests {
 
     fn empty_scan() -> ScannedDir {
         ScannedDir {
+            auxiliary_media: Default::default(),
             complete_audio_inventory: None,
             folders: Vec::new(),
             all_media: Vec::new(),
@@ -19640,7 +19843,7 @@ mod phase_c_folder_nav_history_tests {
             .expect("book resume DB")
             .set(&book, 12)
             .expect("seed book resume");
-        app.last_book_resume = Some((book.clone(), 12, None));
+        app.last_book_resume = Some((book.clone(), 12, None, None));
         app.settings
             .video_resume_positions
             .insert("/miv-test/movie.mp4".to_string(), 91.5);
@@ -19692,7 +19895,14 @@ mod phase_c_folder_nav_history_tests {
 
         // 場所の記憶以外はこの操作の対象外。
         assert_eq!(app.checked, HashSet::from([1, 3]));
-        assert_eq!(app.last_book_resume, Some((book.clone(), 12, None)));
+        assert_eq!(
+            app.last_book_resume.as_ref().map(|(path, page, meter, _)| (
+                path.clone(),
+                *page,
+                *meter
+            )),
+            Some((book.clone(), 12, None))
+        );
         assert_eq!(
             app.book_resume_db
                 .as_ref()
@@ -20007,10 +20217,12 @@ mod phase_c_folder_nav_history_tests {
         let ctx = egui::Context::default();
         for _ in 0..1000 {
             app.settle_open_path_classification_for_test();
+            app.poll_sidecar_restore(&ctx);
             if app
                 .top_level_grid_view
                 .history_navigation_transition()
                 .is_none()
+                && !app.sidecar_restore_active()
             {
                 return;
             }
@@ -20048,6 +20260,7 @@ mod phase_c_folder_nav_history_tests {
     }
 
     fn start_staged_epub_dialog_for_test(app: &mut App, epub: &std::path::Path) -> u64 {
+        app.finish_page_identity_preparation_for_test();
         assert!(app.start_physical_history_transition(
             super::PhysicalHistoryIntent::Navigation {
                 replay: None,
@@ -20264,6 +20477,7 @@ mod phase_c_folder_nav_history_tests {
             ),
         );
         app.poll_collection_history_transition(&egui::Context::default());
+        app.finish_page_identity_preparation_for_test();
         assert_eq!(app.current_folder.as_deref(), Some(epub.as_path()));
         assert_eq!(app.fullscreen_idx, Some(0));
         assert!(app.pdf_enumerate_pending.is_none());
@@ -20324,6 +20538,7 @@ mod phase_c_folder_nav_history_tests {
         std::fs::create_dir(&old).unwrap();
         app.active_quick_folder_slot = None;
         app.load_folder(old.clone());
+        app.finish_page_identity_preparation_for_test();
         let epub = app.tmp.path().join("save-book.epub");
         let pdf = epub.with_extension("pdf");
         std::fs::write(&epub, b"test EPUB source").unwrap();
@@ -21355,6 +21570,7 @@ mod phase_c_folder_nav_history_tests {
             Vec::new(),
             None,
         );
+        app.finish_page_identity_preparation_for_test();
 
         assert_eq!(app.current_folder.as_ref(), Some(&cached_zip));
         assert_eq!(app.archive_source_override.as_ref(), Some(&source));
@@ -22370,7 +22586,7 @@ mod phase_c_folder_nav_history_tests {
         for _ in 0..1000 {
             app.poll_rating_view();
             app.poll_sidecar_restore(&ctx);
-            if app.rating_view_pending.is_none() {
+            if app.rating_view_pending.is_none() && !app.sidecar_restore_active() {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -22404,6 +22620,7 @@ mod phase_c_folder_nav_history_tests {
                 panic!("fixture expected folder preflight");
             };
             let mut scan = crate::app::folder_scan::ScannedDir {
+                auxiliary_media: Default::default(),
                 folders: Vec::new(),
                 all_media: Vec::new(),
                 complete_audio_inventory: None,
@@ -22436,6 +22653,7 @@ mod phase_c_folder_nav_history_tests {
                 );
             app.replace_history_navigation_transition(Some(transition));
             app.poll_collection_history_transition(&egui::Context::default());
+            app.finish_page_identity_preparation_for_test();
             assert_eq!(app.current_folder.as_deref(), Some(parent));
             return;
         }
@@ -22449,6 +22667,7 @@ mod phase_c_folder_nav_history_tests {
             None,
         );
         app.finish_main_list_open(crate::app::StartupListIntent::ExplicitList);
+        app.finish_page_identity_preparation_for_test();
     }
 
     #[test]
@@ -22469,9 +22688,14 @@ mod phase_c_folder_nav_history_tests {
             app.record_folder_nav_transition(&zip);
             app.load_zip_as_folder_prepared(
                 zip.clone(),
-                crate::zip_loader::enumerate_image_entries_detailed(&zip).unwrap(),
+                crate::zip_loader::PreparedZipEnumeration::prepare(
+                    zip.clone(),
+                    crate::zip_loader::enumerate_image_entries_detailed(&zip).unwrap(),
+                    Default::default(),
+                ),
                 crate::app::StartupListIntent::ExplicitList,
             );
+            app.finish_page_identity_preparation_for_test();
             app.selected = Some(3);
             app.scroll_offset_y = 96.0;
             assert!(
@@ -22502,9 +22726,14 @@ mod phase_c_folder_nav_history_tests {
         app.scroll_offset_y = 640.0;
         app.load_zip_as_folder_prepared(
             zip.clone(),
-            crate::zip_loader::enumerate_image_entries_detailed(&zip).unwrap(),
+            crate::zip_loader::PreparedZipEnumeration::prepare(
+                zip.clone(),
+                crate::zip_loader::enumerate_image_entries_detailed(&zip).unwrap(),
+                Default::default(),
+            ),
             crate::app::StartupListIntent::ExplicitList,
         );
+        app.finish_page_identity_preparation_for_test();
         app.selected = Some(3);
         let Some(crate::ui_main::AddressBarNav::Direct(target, restore_intent)) =
             app.handle_grid_parent_folder_action()
@@ -22544,7 +22773,11 @@ mod phase_c_folder_nav_history_tests {
             app.record_folder_nav_transition(&source);
             app.load_zip_as_folder_prepared_with_logical_source(
                 backing.clone(),
-                crate::zip_loader::enumerate_image_entries_detailed(&backing).unwrap(),
+                crate::zip_loader::PreparedZipEnumeration::prepare(
+                    backing.clone(),
+                    crate::zip_loader::enumerate_image_entries_detailed(&backing).unwrap(),
+                    Default::default(),
+                ),
                 Some(&source),
                 crate::app::StartupListIntent::InternalHydration(Box::new(
                     crate::app::StartupListIntent::ExplicitList,
@@ -22552,6 +22785,7 @@ mod phase_c_folder_nav_history_tests {
             );
             app.adopt_staged_archive_source_alias(&source, &backing);
             app.finish_main_list_open(crate::app::StartupListIntent::ExplicitList);
+            app.finish_page_identity_preparation_for_test();
             app.selected = Some(3);
             assert!(
                 app.dispatch_main_folder_history_input(FolderHistoryDirection::Back)
@@ -22596,6 +22830,7 @@ mod phase_c_folder_nav_history_tests {
             ),
             FolderOpenOutcome::Loaded
         ));
+        app.finish_page_identity_preparation_for_test();
         app.selected = Some(3);
         assert!(
             app.dispatch_main_folder_history_input(FolderHistoryDirection::Back)
@@ -23125,6 +23360,7 @@ mod phase_c_folder_nav_history_tests {
             FolderOpenOutcome::Loaded
         );
         assert_eq!(app.items.len(), 2);
+        app.finish_page_identity_preparation_for_test();
         app.pdf_enumerate_pending.as_mut().unwrap().2 =
             crate::pdf_loader::completed_enumerate_result_handle(
                 &pdf,
@@ -24418,7 +24654,11 @@ mod phase_c_folder_nav_history_tests {
         let startup_before = app.settings.startup_list_restore.clone();
         app.load_zip_as_folder_prepared(
             zip.clone(),
-            crate::zip_loader::enumerate_image_entries_detailed(&zip).unwrap(),
+            crate::zip_loader::PreparedZipEnumeration::prepare(
+                zip.clone(),
+                crate::zip_loader::enumerate_image_entries_detailed(&zip).unwrap(),
+                Default::default(),
+            ),
             crate::app::StartupListIntent::PageContinuation,
         );
         assert_eq!(app.settings.startup_list_restore, startup_before);
@@ -24943,6 +25183,7 @@ mod phase_c_folder_nav_history_tests {
         app.current_folder = Some(real.clone());
 
         app.enter_drive_list_from_navigation(Some(real.clone()));
+        app.finish_page_identity_preparation_for_test();
 
         assert!(app.items_are_drive_list);
         assert_eq!(app.folder_nav_back_stack, vec![real.clone()]);
@@ -24960,6 +25201,7 @@ mod phase_c_folder_nav_history_tests {
             Some(&FolderNavHistoryTarget::Path(real.clone()))
         );
         let before = app.folder_nav_history_snapshot();
+        app.finish_page_identity_preparation_for_test();
         app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
         assert_eq!(
             app.folder_nav_history_snapshot().back_stack,
@@ -24972,6 +25214,7 @@ mod phase_c_folder_nav_history_tests {
             vec![super::drive_list_synthetic_path()]
         );
 
+        app.finish_page_identity_preparation_for_test();
         app.dispatch_main_folder_history_input(FolderHistoryDirection::Forward);
         assert!(app.items_are_drive_list);
         assert_eq!(
@@ -24983,6 +25226,7 @@ mod phase_c_folder_nav_history_tests {
         let opened = app.tmp.path().join("opened-from-drive-list");
         std::fs::create_dir_all(&opened).unwrap();
         app.load_folder(opened);
+        app.finish_page_identity_preparation_for_test();
         assert_eq!(
             app.folder_history_back_target(),
             Some(&FolderNavHistoryTarget::Path(
@@ -24995,6 +25239,7 @@ mod phase_c_folder_nav_history_tests {
                 super::drive_list_synthetic_path()
             ))
         );
+        app.finish_page_identity_preparation_for_test();
         app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
         assert!(app.items_are_drive_list);
     }
@@ -25084,6 +25329,7 @@ mod phase_c_folder_nav_history_tests {
         app.current_folder = Some(before);
 
         app.enter_reading_history();
+        app.finish_page_identity_preparation_for_test();
         assert!(app.items_are_reading_history_view);
         assert_eq!(
             app.current_folder.as_ref(),
@@ -25091,6 +25337,7 @@ mod phase_c_folder_nav_history_tests {
         );
 
         app.load_folder(after.clone());
+        app.finish_page_identity_preparation_for_test();
         assert_eq!(
             app.folder_nav_back_stack
                 .last()
@@ -25106,6 +25353,7 @@ mod phase_c_folder_nav_history_tests {
                 super::reading_history_synthetic_path()
             ))
         );
+        app.finish_page_identity_preparation_for_test();
         app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
         assert!(app.items_are_reading_history_view);
         assert_eq!(
@@ -25124,6 +25372,7 @@ mod phase_c_folder_nav_history_tests {
             app.folder_history_forward_target(),
             Some(&FolderNavHistoryTarget::Path(after.clone()))
         );
+        app.finish_page_identity_preparation_for_test();
         app.dispatch_main_folder_history_input(FolderHistoryDirection::Forward);
         finish_staged_physical_history_for_test(&mut app);
 
@@ -25133,6 +25382,7 @@ mod phase_c_folder_nav_history_tests {
                 super::reading_history_synthetic_path()
             ))
         );
+        app.finish_page_identity_preparation_for_test();
         app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
         assert!(app.items_are_reading_history_view);
     }
@@ -25218,6 +25468,7 @@ mod phase_c_folder_nav_history_tests {
         app.subfolder_expansion_roots = vec![root.clone()];
         app.subfolder_expansion_saved_folder = Some(root.clone());
         app.subfolder_expansion_snapshot = Some(SubfolderExpansionSnapshot {
+            file_type_visibility: Default::default(),
             root: root.clone(),
             roots: vec![root],
             scan_filter: Default::default(),
@@ -25246,8 +25497,9 @@ mod phase_c_folder_nav_history_tests {
                 super::subfolder_expansion_synthetic_path()
             ))
         );
+        app.finish_page_identity_preparation_for_test();
         app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
-        app.finish_subfolder_expansion_prepare_for_test();
+        app.finish_history_restore_preparation_for_test();
         assert!(app.items_are_subfolder_expansion_view);
         assert_eq!(
             app.current_folder.as_ref(),
@@ -25425,6 +25677,7 @@ mod phase_c_folder_nav_history_tests {
         app.subfolder_expansion_roots = vec![a.clone()];
         app.subfolder_expansion_saved_folder = Some(root.clone());
         app.subfolder_expansion_snapshot = Some(SubfolderExpansionSnapshot {
+            file_type_visibility: Default::default(),
             root,
             roots: vec![a],
             scan_filter: Default::default(),
@@ -25460,8 +25713,9 @@ mod phase_c_folder_nav_history_tests {
             "検索専用restoreと履歴restoreへ同じサブ展開stateを二重取得しない"
         );
 
+        app.finish_page_identity_preparation_for_test();
         app.close_favsearch();
-        app.finish_subfolder_expansion_prepare_for_test();
+        app.finish_history_restore_preparation_for_test();
 
         assert!(!app.favsearch.active);
         assert!(!app.suppress_nav_record_for_search_restore);
@@ -25803,6 +26057,7 @@ mod phase_c_folder_nav_history_tests {
             app.poll_favsearch();
             std::thread::yield_now();
         }
+        app.finish_page_identity_preparation_for_test();
         assert!(app.items_generation > generation);
         assert_eq!(app.items.len(), 2);
         assert!(app.favsearch.active);
@@ -25871,6 +26126,7 @@ mod phase_c_folder_nav_history_tests {
             std::thread::yield_now();
         }
         assert!(app.items_generation > generation);
+        app.finish_page_identity_preparation_for_test();
         assert_eq!(app.items.len(), 2);
         assert!(app.favsearch.active);
         assert_ne!(
@@ -26138,6 +26394,7 @@ mod phase_c_folder_nav_history_tests {
             std::thread::yield_now();
         };
         assert!(app.resolve_main_folder_open_ready(&ctx, ready).is_none());
+        app.finish_page_identity_preparation_for_test();
         assert_eq!(app.current_folder.as_ref(), Some(&directory));
         let idx = app
             .fullscreen_idx
@@ -26255,10 +26512,7 @@ mod phase_c_folder_nav_history_tests {
 
     #[test]
     fn section1339_address_bar_zip_enter_keeps_copied_path_across_row_refresh() {
-        use egui_kittest::{
-            Harness,
-            kittest::{NodeT, Queryable},
-        };
+        use egui_kittest::kittest::{NodeT, Queryable};
         use std::{
             cell::{Cell, RefCell},
             rc::Rc,
@@ -26288,7 +26542,7 @@ mod phase_c_folder_nav_history_tests {
         let app = Rc::new(RefCell::new(env));
         let render = Rc::clone(&app);
         let fonts = Cell::new(false);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1200.0, 280.0))
             .build(move |ctx| {
                 crate::ime_focus::install_ime_input_policy(ctx);
@@ -27599,16 +27853,19 @@ mod phase_c_drill_nav_tests {
             && std::time::Instant::now() < deadline
         {
             app.poll_rating_view();
+            app.poll_sidecar_restore(&egui::Context::default());
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(app.items_are_rating_view);
         let requested =
             crate::rating_view::RatingViewSort::Normal(crate::settings::SortOrder::RatingDesc);
         let chosen = requested.normalized_for_rating_view();
+        app.finish_page_identity_preparation_for_test();
         app.set_rating_view_sort(requested);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while app.rating_view_pending.is_some() && std::time::Instant::now() < deadline {
             app.poll_rating_view();
+            app.poll_sidecar_restore(&egui::Context::default());
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(app.rating_view_sort, chosen);
@@ -27628,11 +27885,13 @@ mod phase_c_drill_nav_tests {
             .unwrap()
             .set_user_rating(&second_key, 3, Some(&meta))
             .unwrap();
+        app.finish_page_identity_preparation_for_test();
         app.reload_top_level_grid(&ctx);
         assert_eq!(app.rating_view_sort, chosen);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while app.rating_view_pending.is_some() && std::time::Instant::now() < deadline {
             app.poll_rating_view();
+            app.poll_sidecar_restore(&egui::Context::default());
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(app.rating_view_sort, chosen);
@@ -27682,21 +27941,25 @@ mod phase_c_drill_nav_tests {
                 && std::time::Instant::now() < deadline
             {
                 app.poll_rating_view();
+                app.poll_sidecar_restore(&egui::Context::default());
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
             assert!(app.items_are_rating_view);
             let requested = crate::rating_view::RatingViewSort::Normal(initial);
             let selected = requested.normalized_for_rating_view();
+            app.finish_page_identity_preparation_for_test();
             app.set_rating_view_sort(requested);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while app.rating_view_pending.is_some() && std::time::Instant::now() < deadline {
                 app.poll_rating_view();
+                app.poll_sidecar_restore(&egui::Context::default());
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
             assert_eq!(app.rating_view_sort, selected);
             assert_eq!(app.settings.rating_view_sort, selected);
             assert_eq!(app.settings.sort_order, initial);
 
+            app.finish_page_identity_preparation_for_test();
             app.reload_current_rating_view_preserving_sort();
             assert!(app.rating_view_pending.is_some());
             // Remote changes the global setting while this prepared view is still open.
@@ -27704,6 +27967,7 @@ mod phase_c_drill_nav_tests {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while app.rating_view_pending.is_some() && std::time::Instant::now() < deadline {
                 app.poll_rating_view();
+                app.poll_sidecar_restore(&egui::Context::default());
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
             assert!(
@@ -27765,6 +28029,7 @@ mod phase_c_drill_nav_tests {
         .unwrap();
         let before_install = app.items_generation;
         app.poll_rating_view();
+        app.poll_sidecar_restore(&egui::Context::default());
         assert!(app.items_are_rating_view);
         assert_eq!(app.items_generation, before_install.wrapping_add(1));
         assert_eq!(
@@ -27783,6 +28048,7 @@ mod phase_c_drill_nav_tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
             app.poll_rating_view();
+            app.poll_sidecar_restore(&egui::Context::default());
             if app.rating_view_pending.is_none()
                 && app.rating_view_rows.iter().any(|row| row.key == keys[3].0)
             {
@@ -29238,6 +29504,7 @@ mod phase_c_drill_nav_tests {
         app.subfolder_expansion_roots = vec![a.clone()];
         app.subfolder_expansion_saved_folder = Some(root.clone());
         app.subfolder_expansion_snapshot = Some(SubfolderExpansionSnapshot {
+            file_type_visibility: Default::default(),
             root: root.clone(),
             roots: vec![a.clone()],
             scan_filter: Default::default(),
@@ -29292,6 +29559,7 @@ mod phase_c_drill_nav_tests {
         app.subfolder_expansion_roots = vec![a.clone()];
         app.subfolder_expansion_saved_folder = Some(root.clone());
         app.subfolder_expansion_snapshot = Some(SubfolderExpansionSnapshot {
+            file_type_visibility: Default::default(),
             root: root.clone(),
             roots: vec![a],
             scan_filter: Default::default(),
@@ -29345,6 +29613,7 @@ mod phase_c_drill_nav_tests {
         app.subfolder_expansion_roots = vec![a.clone()];
         app.subfolder_expansion_saved_folder = Some(root.clone());
         app.subfolder_expansion_snapshot = Some(SubfolderExpansionSnapshot {
+            file_type_visibility: Default::default(),
             root,
             roots: vec![a],
             scan_filter: Default::default(),
@@ -29396,6 +29665,7 @@ mod phase_c_drill_nav_tests {
         app.subfolder_expansion_roots = vec![a.clone()];
         app.subfolder_expansion_saved_folder = Some(root.clone());
         app.subfolder_expansion_snapshot = Some(SubfolderExpansionSnapshot {
+            file_type_visibility: Default::default(),
             root,
             roots: vec![a],
             scan_filter: Default::default(),
@@ -29437,8 +29707,9 @@ mod phase_c_drill_nav_tests {
         );
         assert!(app.folder_nav_subfolder_restore.is_none());
 
+        app.finish_page_identity_preparation_for_test();
         app.close_tag_view();
-        app.finish_subfolder_expansion_prepare_for_test();
+        app.finish_history_restore_preparation_for_test();
 
         assert!(!app.tag_view.active);
         assert!(!app.suppress_nav_record_for_search_restore);
@@ -29503,6 +29774,7 @@ mod phase_c_drill_nav_tests {
         app.subfolder_expansion_roots = vec![a.clone()];
         app.subfolder_expansion_saved_folder = Some(root.clone());
         app.subfolder_expansion_snapshot = Some(SubfolderExpansionSnapshot {
+            file_type_visibility: Default::default(),
             root,
             roots: vec![a],
             scan_filter: Default::default(),
@@ -29524,6 +29796,7 @@ mod phase_c_drill_nav_tests {
         app.rating_view_saved_folder = Some(subfolder_expansion_synthetic_path());
 
         app.apply_rating_view_result(crate::rating_view::RatingViewBuildResult {
+            visibility_notice: None,
             stars: 3,
             rows: vec![crate::rating_view::RatingViewRow {
                 key: "rating-hit".to_string(),
@@ -29541,8 +29814,9 @@ mod phase_c_drill_nav_tests {
         );
         assert!(app.folder_nav_subfolder_restore.is_none());
 
+        app.finish_page_identity_preparation_for_test();
         app.close_rating_view();
-        app.finish_subfolder_expansion_prepare_for_test();
+        app.finish_history_restore_preparation_for_test();
 
         assert!(!app.items_are_rating_view);
         assert!(!app.suppress_nav_record_for_search_restore);
@@ -31109,6 +31383,8 @@ fn unchanged_bookmark_refresh_keeps_grid_and_tag_cache_mounted() {
 
     let (tx, rx) = std::sync::mpsc::channel();
     tx.send(Ok(crate::bookmark_browser::BookmarkBrowserBuildResult {
+        visibility_notice: None,
+        registered_total: 1,
         rows: vec![row],
         video_thumb_overrides: app.video_thumb_overrides.clone(),
     }))
@@ -31662,6 +31938,7 @@ fn ignored_epub_bookmark_resolver_keeps_refusal_feedback() {
             }),
             bookmark_relative_page_openable: None,
             elapsed_ms: 1.0,
+            direct_media: None,
         },
         &egui::Context::default(),
     );
@@ -32369,6 +32646,63 @@ fn begin_detached_bookmark_media_test(
         media_dir.clone(),
         true,
     ));
+    let context_id = app
+        .active_viewer_context_id()
+        .expect("direct media fallback must publish its context before hydration");
+    let session = app
+        .active_detached_session
+        .expect("direct media fallback must publish its window session before hydration");
+    assert_eq!(
+        session.source,
+        if is_audio {
+            DetachedSource::Audio
+        } else {
+            DetachedSource::Video
+        }
+    );
+    assert_eq!(
+        session.content_phase,
+        DetachedSessionContentPhase::Preparing
+    );
+    assert_eq!(
+        app.viewer_context_window(context_id),
+        Some(session.window_id)
+    );
+    app.with_active_viewer_context(|active| {
+        assert_eq!(active.projected_viewer_context_id(), context_id);
+        assert_eq!(
+            active.navigation_scope,
+            ViewerNavigationScope::DetachedPhysical
+        );
+        assert_eq!(active.current_folder.as_deref(), Some(media_dir.as_path()));
+        assert_eq!(active.fullscreen_idx, None);
+        let deferred_idx = active
+            .sidecar_restore_deferred_media_target(&target)
+            .expect("accepted fallback must carry the exact live media deferral");
+        assert!(matches!(
+            active.items.get(deferred_idx),
+            Some(GridItem::Video(path) | GridItem::Audio(path)) if path == &target
+        ));
+        assert!(matches!(
+            &active.bookmark_open_pending,
+            Some(crate::bookmark_browser::PendingBookmarkOpen::Media(pending))
+                if pending.path == target && pending.pts_secs == 42.0
+        ));
+        active.finish_page_identity_preparation_for_test();
+        assert_eq!(active.fullscreen_idx, Some(deferred_idx));
+        assert!(matches!(
+            &active.bookmark_open_pending,
+            Some(crate::bookmark_browser::PendingBookmarkOpen::Media(pending))
+                if pending.path == target && pending.pts_secs == 42.0
+        ));
+    })
+    .expect("real identity preparation must complete inside the published media context");
+    assert_eq!(app.active_viewer_context_id(), Some(context_id));
+    assert_eq!(app.active_detached_window_id(), Some(session.window_id));
+    assert_eq!(
+        app.viewer_context_window(context_id),
+        Some(session.window_id)
+    );
     (media_dir, target, other)
 }
 
@@ -32795,6 +33129,7 @@ mod phase_c_drill_address_tests {
             hits,
             scanned_candidates: 412_000,
             valid_hits: 3,
+            visibility_notice: None,
         })
         .unwrap();
 
@@ -32863,6 +33198,7 @@ mod phase_c_drill_address_tests {
                 .collect(),
             scanned_candidates: 412_000,
             valid_hits: 3,
+            visibility_notice: None,
         })
         .unwrap();
 
@@ -32938,6 +33274,7 @@ mod phase_c_drill_address_tests {
                 hits: Vec::new(),
                 scanned_candidates: page * crate::global_search::PAGE_SIZE,
                 valid_hits: 0,
+                visibility_notice: None,
             })
             .unwrap();
         }
@@ -35749,6 +36086,7 @@ mod favorite_adjustment_defaults_tests {
             Vec::new(),
             None,
         );
+        app.finish_page_identity_preparation_for_test();
 
         assert_eq!(
             app.selected,
@@ -35790,6 +36128,7 @@ mod favorite_adjustment_defaults_tests {
             Vec::new(),
             None,
         );
+        app.finish_page_identity_preparation_for_test();
 
         assert_eq!(
             app.scroll_offset_y, 321.0,
@@ -38530,6 +38869,7 @@ mod favorite_adjustment_defaults_tests {
             .take_pending_return_to_parent_nav()
             .expect("parent return request should become navigation");
         assert!(app.apply_fullscreen_close_nav_immediate(nav));
+        app.finish_page_identity_preparation_for_test();
 
         assert_eq!(app.current_folder.as_deref(), Some(parent.as_path()));
         assert_eq!(app.fullscreen_idx, None);
@@ -38751,11 +39091,25 @@ mod favorite_adjustment_defaults_tests {
         // 画像 (本ページ) idx 0 → 記録される
         app.record_book_resume(0);
         let meter = crate::book_resume_db::ReadingMeterValue::new(1, 1);
-        assert_eq!(app.last_book_resume, Some((folder.clone(), 0, meter)));
+        assert_eq!(
+            app.last_book_resume.as_ref().map(|(path, page, meter, _)| (
+                path.clone(),
+                *page,
+                *meter
+            )),
+            Some((folder.clone(), 0, meter))
+        );
 
         // フォルダタイル idx 1 → 対象外。直近記録は据え置き
         app.record_book_resume(1);
-        assert_eq!(app.last_book_resume, Some((folder, 0, meter)));
+        assert_eq!(
+            app.last_book_resume.as_ref().map(|(path, page, meter, _)| (
+                path.clone(),
+                *page,
+                *meter
+            )),
+            Some((folder, 0, meter))
+        );
     }
 
     #[test]
@@ -38941,16 +39295,19 @@ mod favorite_adjustment_defaults_tests {
                 entry_name: "10.jpg".to_string(),
                 uncompressed_size: 0,
                 mtime: 300,
+                container_ancestry: Vec::new(),
             },
             crate::zip_loader::ZipImageEntry {
                 entry_name: "2.jpg".to_string(),
                 uncompressed_size: 0,
                 mtime: 200,
+                container_ancestry: Vec::new(),
             },
             crate::zip_loader::ZipImageEntry {
                 entry_name: "1.jpg".to_string(),
                 uncompressed_size: 0,
                 mtime: 100,
+                container_ancestry: Vec::new(),
             },
         ];
         let tree = std::sync::Arc::new(crate::zip_tree::ZipTree::build(zip_path, entries));
@@ -39135,6 +39492,7 @@ mod favorite_adjustment_defaults_tests {
             Vec::new(),
             None,
         );
+        app.finish_page_identity_preparation_for_test();
         assert_eq!(app.spread_mode, crate::settings::SpreadMode::Ltr);
         assert_eq!(app.reading_flow, crate::settings::ReadingFlow::Vertical);
         assert_eq!(
@@ -39162,6 +39520,7 @@ mod favorite_adjustment_defaults_tests {
             Vec::new(),
             None,
         );
+        app.finish_page_identity_preparation_for_test();
         assert_eq!(app.spread_mode, crate::settings::SpreadMode::Single);
         assert_eq!(app.reading_flow, crate::settings::ReadingFlow::Vertical);
         assert_eq!(
@@ -41211,6 +41570,7 @@ mod favorite_adjustment_defaults_tests {
                 entry_name: n.to_string(),
                 uncompressed_size: 0,
                 mtime: 0,
+                container_ancestry: Vec::new(),
             })
             .collect();
         let tree = std::sync::Arc::new(crate::zip_tree::ZipTree::build(zip_path, entries));
@@ -44108,7 +44468,15 @@ mod favorite_adjustment_defaults_tests {
         nav.enter("bookA/");
         app.zip_nav = Some(nav);
         app.record_book_resume(0);
-        assert_eq!(app.last_book_resume, None, "本の中では resume を記録しない");
+        assert_eq!(
+            app.last_book_resume.as_ref().map(|(path, page, meter, _)| (
+                path.clone(),
+                *page,
+                *meter
+            )),
+            None,
+            "本の中では resume を記録しない"
+        );
 
         // ルート表示 (フラット ZIP 相当) → 従来どおり記録される
         app.items[0] = GridItem::ZipImage {
@@ -44118,7 +44486,11 @@ mod favorite_adjustment_defaults_tests {
         app.zip_nav = Some(test_zip_nav(&["p1.jpg", "p2.jpg"]));
         app.record_book_resume(0);
         assert_eq!(
-            app.last_book_resume,
+            app.last_book_resume.as_ref().map(|(path, page, meter, _)| (
+                path.clone(),
+                *page,
+                *meter
+            )),
             Some((
                 zip_path,
                 0,
@@ -44903,17 +45275,46 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
-    fn pending_rating_view_zipdir_open_enters_prefix_after_zip_load() {
+    fn visibility_pending_rating_zip_prefix_is_materialized_before_its_single_live_map_worker() {
         let mut app = setup_app();
         let zip_path = std::path::PathBuf::from(r"C:\test\outer.zip");
         app.current_folder = Some(zip_path.clone());
-        app.zip_nav = Some(test_zip_nav(&["bookA/p1.jpg", "bookB/p1.jpg"]));
+        let nav = test_zip_nav(&["bookA/p1.jpg", "bookB/p1.jpg"]);
+        app.settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("png".into());
         app.pending_rating_view_zipdir_open = Some(crate::app::PendingRatingViewZipDirOpen {
             source_path: zip_path.clone(),
             dir_prefix: "bookB/".to_string(),
         });
 
-        assert!(app.enter_pending_rating_view_zipdir_after_open(&zip_path));
+        let prepared = app.prepare_zip_grid(
+            zip_path.clone(),
+            crate::zip_loader::PreparedZipEnumeration {
+                raw: crate::zip_loader::ZipEnumeration {
+                    entries: Vec::new(),
+                    has_foreign_archives: false,
+                    legacy_renames: Vec::new(),
+                },
+                tree: Arc::clone(&nav.tree),
+                policy: app.settings.file_type_visibility.clone(),
+            },
+            None,
+            StartupListIntent::ExplicitList,
+        );
+        assert!(app.sidecar_restore.is_none());
+        assert!(app.pending_rating_view_zipdir_open.is_some());
+        let input_seq = app.input_seq;
+        app.finalize_prepared_zip_grid(
+            zip_path,
+            input_seq,
+            prepared,
+            VisibleInstallAuthority::Ordinary,
+            StartupListIntent::ExplicitList,
+        );
+        assert!(app.pending_rating_view_zipdir_open.is_none());
+        app.finish_page_identity_preparation_for_test();
         assert!(
             app.items.iter().any(|item| matches!(
                 item,
@@ -44921,6 +45322,22 @@ mod favorite_adjustment_defaults_tests {
                     if entry_name == "bookB/p1.jpg"
             )),
             "pending ZipDir open should materialize the requested book prefix"
+        );
+        assert_eq!(
+            app.page_identity_index.policy,
+            app.settings.file_type_visibility
+        );
+        let index = app.items.iter().position(|item| matches!(item, GridItem::ZipImage { entry_name, .. } if entry_name == "bookB/p1.jpg")).unwrap();
+        assert_eq!(
+            app.page_identity_index
+                .resolve(&crate::book_resume_db::ReadingPosition {
+                    page: 88,
+                    identity: crate::book_resume_db::PageIdentity::for_item(
+                        &app.items[index],
+                        None
+                    ),
+                }),
+            file_type_resume::PositionResolution::Restored(index)
         );
     }
 
@@ -48783,6 +49200,7 @@ mod favorite_adjustment_defaults_tests {
     fn drain_folder_nav_burst_for_test(app: &mut App, ctx: &egui::Context) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while app.folder_nav_pending.is_some() {
+            app.poll_sidecar_restore(ctx);
             if let Some(result) = app.poll_folder_nav() {
                 app.apply_folder_nav_result(ctx, result);
             } else {
@@ -48793,6 +49211,7 @@ mod favorite_adjustment_defaults_tests {
                 std::thread::yield_now();
             }
         }
+        app.finish_page_identity_preparation_for_test();
         assert_eq!(app.pending_folder_nav_steps, 0);
     }
 
@@ -49650,6 +50069,7 @@ mod favorite_adjustment_defaults_tests {
     fn keyboard_owner_ignores_bookmark_title_draft_without_a_live_claim() {
         let mut app = setup_app();
         app.book_bookmark_title_edit = Some(BookBookmarkTitleEdit {
+            focus_viewport: egui::ViewportId::ROOT,
             id: 7,
             title: "draft".to_owned(),
             request_focus: false,
@@ -59691,6 +60111,8 @@ mod native_video_rating_key_tests {
         let generation_before = app.items_generation;
         let (tx, rx) = std::sync::mpsc::channel();
         tx.send(Ok(crate::bookmark_browser::BookmarkBrowserBuildResult {
+            visibility_notice: None,
+            registered_total: 1,
             rows: vec![row],
             video_thumb_overrides: app.video_thumb_overrides.clone(),
         }))
@@ -64330,6 +64752,7 @@ mod still_window_mode_key_tests {
                 entry_name: n.to_string(),
                 uncompressed_size: 0,
                 mtime: 0,
+                container_ancestry: Vec::new(),
             })
             .collect();
         let tree = std::sync::Arc::new(crate::zip_tree::ZipTree::build(zip_path, entries));
@@ -66916,6 +67339,7 @@ mod still_window_mode_key_tests {
             .expect("release controlled physical scan");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
+            app.poll_sidecar_restore(&ctx);
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
                 updated = app.update_active_viewer_context(ctx, None).updated;
             });
@@ -67472,6 +67896,7 @@ mod still_window_mode_key_tests {
                 resolved: None,
                 bookmark_relative_page_openable: None,
                 elapsed_ms: 1.0,
+                direct_media: None,
             })
             .is_err(),
             "late resolver completion must not resurrect the retired shell"
@@ -67897,18 +68322,23 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         entry_names: &[&str],
     ) {
         let (tx, rx) = mpsc::channel();
-        tx.send(Ok(crate::zip_loader::ZipEnumeration {
-            entries: entry_names
-                .iter()
-                .map(|entry_name| crate::zip_loader::ZipImageEntry {
-                    entry_name: (*entry_name).to_string(),
-                    uncompressed_size: 1,
-                    mtime: 1,
-                })
-                .collect(),
-            has_foreign_archives: false,
-            legacy_renames: Vec::new(),
-        }))
+        tx.send(Ok(crate::zip_loader::PreparedZipEnumeration::prepare(
+            backing_archive.to_path_buf(),
+            crate::zip_loader::ZipEnumeration {
+                entries: entry_names
+                    .iter()
+                    .map(|entry_name| crate::zip_loader::ZipImageEntry {
+                        entry_name: (*entry_name).to_string(),
+                        uncompressed_size: 1,
+                        mtime: 1,
+                        container_ancestry: Vec::new(),
+                    })
+                    .collect(),
+                has_foreign_archives: false,
+                legacy_renames: Vec::new(),
+            },
+            Default::default(),
+        )))
         .unwrap();
 
         app.with_active_viewer_context(|mounted| {
@@ -68991,6 +69421,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             .poll_folder_pane_open(&ctx)
             .expect("the completed main-owned candidate scan");
         assert!(app.resolve_main_folder_open_ready(&ctx, ready).is_none());
+        app.finish_page_identity_preparation_for_test();
         assert_eq!(app.active_viewer_context_id(), Some(context_id));
         assert_eq!(app.active_detached_session.unwrap().window_id, window_id);
         run_active_detached_frame_for_test(&mut app, &ctx);
@@ -69450,6 +69881,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             app.update_active_viewer_context(ctx, None).updated;
         });
+        app.finish_page_identity_preparation_for_test();
         app.with_active_viewer_context(|active| {
             let fullscreen_item = active.fullscreen_idx.and_then(|idx| active.items.get(idx));
             assert!(
@@ -70517,7 +70949,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let window_id = 25u64;
-        let (zip_tx, zip_rx) = mpsc::channel::<Result<crate::zip_loader::ZipEnumeration, String>>();
+        let (zip_tx, zip_rx) =
+            mpsc::channel::<Result<crate::zip_loader::PreparedZipEnumeration, String>>();
 
         install_detached_transition_gap_for_test(&mut app, window_id, |bundle| {
             bundle.current_folder = Some(PathBuf::from(r"C:\books\second.zip"));
@@ -71673,6 +72106,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 }),
                 bookmark_relative_page_openable: None,
                 elapsed_ms: 1.0,
+                direct_media: None,
             };
             if completion_time == "published" {
                 tx.send(result()).unwrap();
@@ -75252,6 +75686,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.pending_auto_fs_open = true;
 
         app.load_folder(folder.clone());
+        app.finish_page_identity_preparation_for_test();
 
         assert_eq!(app.current_folder.as_deref(), Some(folder.as_path()));
         assert_eq!(
@@ -80958,6 +81393,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 entry_name: "native.zip/p01.jpg".to_string(),
                 uncompressed_size: 1,
                 mtime: 0,
+                container_ancestry: Vec::new(),
             }],
             has_foreign_archives: true,
             legacy_renames: Vec::new(),
@@ -80966,12 +81402,17 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.finalize_zip_enumerate(
             zip_path.clone(),
             0,
-            Ok(enumeration),
+            Ok(crate::zip_loader::PreparedZipEnumeration::prepare(
+                zip_path.clone(),
+                enumeration,
+                Default::default(),
+            )),
             None,
             VisibleInstallAuthority::Ordinary,
             crate::app::StartupListIntent::ExplicitList,
         );
 
+        app.finish_page_identity_preparation_for_test();
         let state = app
             .archive_convert
             .as_ref()
@@ -86670,6 +87111,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.archive_source_override = Some(src.clone());
         app.zip_nav = Some(test_zip_nav_for(cache.clone(), &["p1.jpg", "p2.jpg"]));
         app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
+        app.finish_page_identity_preparation_for_test();
         let idx = app
             .items
             .iter()
@@ -86708,6 +87150,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             &["bookA/p1.jpg", "bookB/only/p1.jpg"],
         ));
         app.zip_nav_enter("bookB/");
+        app.finish_page_identity_preparation_for_test();
         let idx = app
             .items
             .iter()
@@ -87206,6 +87649,7 @@ mod rating_view_navigation_tests {
         );
         assert_eq!(app.rating_view_nav_stack, vec![path.clone()]);
 
+        app.finish_page_identity_preparation_for_test();
         let owner = app.rating_view_physical_load_owner(&path).unwrap();
         assert!(app.start_rating_physical_open(owner, crate::app::StartupListIntent::ExplicitList));
         for _ in 0..200 {
@@ -87227,6 +87671,7 @@ mod rating_view_navigation_tests {
 
         assert_eq!(app.rating_view_nav_stack, vec![path]);
 
+        app.finish_page_identity_preparation_for_test();
         app.close_rating_view();
 
         assert!(
@@ -87616,6 +88061,7 @@ mod always_visible_selection_cursor_tests {
                 entry_name: n.to_string(),
                 uncompressed_size: 0,
                 mtime: 0,
+                container_ancestry: Vec::new(),
             })
             .collect();
         let tree = std::sync::Arc::new(crate::zip_tree::ZipTree::build(zip_path, entries));
@@ -88702,8 +89148,12 @@ mod smart_folder_transition_tests {
     fn wait_for_smart_folder(app: &mut App, ctx: &egui::Context, id: uuid::Uuid) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
+            app.poll_sidecar_restore(ctx);
             app.poll_smart_folder(ctx);
-            if app.items_are_smart_folder_view && app.current_smart_folder_id == Some(id) {
+            if app.items_are_smart_folder_view
+                && app.current_smart_folder_id == Some(id)
+                && !app.sidecar_restore_active()
+            {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -88714,6 +89164,7 @@ mod smart_folder_transition_tests {
     fn wait_for_smart_folder_idle(app: &mut App, ctx: &egui::Context, id: uuid::Uuid) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
+            app.poll_sidecar_restore(ctx);
             app.poll_smart_folder(ctx);
             app.poll_search(ctx);
             if app.items_are_smart_folder_view
@@ -88722,6 +89173,7 @@ mod smart_folder_transition_tests {
                 && app.smart_folder_prepare_pending.is_none()
                 && app.smart_folder_transition.is_none()
                 && app.search_pending.is_none()
+                && !app.sidecar_restore_active()
             {
                 return;
             }
@@ -88732,13 +89184,20 @@ mod smart_folder_transition_tests {
 
     fn wait_for_staged_smart_terminal(app: &mut App, ctx: &egui::Context) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while app.smart_folder_transition.is_some() && std::time::Instant::now() < deadline {
+        while (app.smart_folder_transition.is_some() || app.sidecar_restore_active())
+            && std::time::Instant::now() < deadline
+        {
+            app.poll_sidecar_restore(ctx);
             app.poll_smart_folder(ctx);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(
             app.smart_folder_transition.is_none(),
             "staged Smart request did not finish"
+        );
+        assert!(
+            !app.sidecar_restore_active(),
+            "staged Smart listing did not become ready"
         );
     }
 
@@ -88749,6 +89208,7 @@ mod smart_folder_transition_tests {
             .smart_folder()
             .and_then(|state| state.scoped_current())
             != Some(path)
+            || app.sidecar_restore_active()
         {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -89010,6 +89470,7 @@ mod smart_folder_transition_tests {
                 .map(|entry| &entry.location),
             Some(&FolderNavHistoryTarget::Path(prior)),
         );
+        app.finish_page_identity_preparation_for_test();
         assert!(!app.suppress_folder_nav_record_once);
 
         assert!(matches!(
@@ -89304,6 +89765,7 @@ mod smart_folder_transition_tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while app.current_folder.as_deref() != Some(child.as_path()) {
             assert!(std::time::Instant::now() < deadline);
+            app.poll_sidecar_restore(&ctx);
             app.poll_smart_folder(&ctx);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -89491,6 +89953,7 @@ mod smart_folder_transition_tests {
                 std::time::Instant::now() < deadline,
                 "warm PDF adoption timed out"
             );
+            app.poll_sidecar_restore(&ctx);
             app.poll_smart_folder(&ctx);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -89506,6 +89969,7 @@ mod smart_folder_transition_tests {
             "Smart PDF adoption must discard the prior ZIP's nested bytes"
         );
 
+        app.finish_page_identity_preparation_for_test();
         let placeholder_generation = app.items_generation;
         let placeholder_workers = std::sync::Arc::clone(&app.cancel_token);
         assert!(!placeholder_workers.load(std::sync::atomic::Ordering::Relaxed));
@@ -89924,9 +90388,11 @@ mod smart_folder_transition_tests {
                 std::time::Instant::now() < deadline,
                 "child was not adopted"
             );
+            app.poll_sidecar_restore(&ctx);
             app.poll_smart_folder(&ctx);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        app.finish_page_identity_preparation_for_test();
         let parent = match app.resolve_grid_parent_nav() {
             Some(crate::ui_main::AddressBarNav::Direct(path, _)) => path,
             other => panic!("Backspace must resolve to smart root: {other:?}"),
@@ -90064,6 +90530,7 @@ mod smart_folder_transition_tests {
             CollectionResolvedKind::Image,
         );
         app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        app.finish_page_identity_preparation_for_test();
         assert!(app.is_snapshot_active());
         let definition = definition("Rejected Smart Child", source);
         let id = definition.id;
@@ -90152,6 +90619,7 @@ mod smart_folder_transition_tests {
         std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
         section1339_seed_warm_pdf(&mut app, &parent, &pdf);
         app.load_folder(parent.clone());
+        app.finish_page_identity_preparation_for_test();
         app.settings.facet_filter.exts.insert("pdf".into());
         let before = app.folder_nav_history_snapshot();
         assert_eq!(
@@ -90173,6 +90641,7 @@ mod smart_folder_transition_tests {
         assert!(!app.settings.facet_filter.is_active());
         let adopted = app.folder_nav_history_snapshot();
         let facet = app.facet_navigation.clone();
+        app.finish_page_identity_preparation_for_test();
         app.pdf_enumerate_pending.as_mut().unwrap().2 =
             crate::pdf_loader::completed_enumerate_result_handle(
                 &pdf,
@@ -90202,6 +90671,7 @@ mod smart_folder_transition_tests {
         std::fs::write(&cold, b"%PDF-1.4\n").unwrap();
         section1339_seed_warm_pdf(&mut app, &parent, &warm);
         app.load_folder(parent.clone());
+        app.finish_page_identity_preparation_for_test();
         app.settings.facet_filter.exts.insert("pdf".into());
         assert_eq!(
             app.load_pdf_as_folder_owned(
@@ -90211,6 +90681,7 @@ mod smart_folder_transition_tests {
             ),
             FolderOpenOutcome::Loaded
         );
+        app.finish_page_identity_preparation_for_test();
         app.settings.facet_filter.exts.insert("png".into());
         let history = app.folder_nav_history_snapshot();
         let facet = app.facet_navigation.clone();
@@ -90278,6 +90749,7 @@ mod smart_folder_transition_tests {
         let pdf = parent.join("locked.pdf");
         std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
         app.load_folder(parent.clone());
+        app.finish_page_identity_preparation_for_test();
         app.settings.facet_filter.exts.insert("pdf".into());
         let history = app.folder_nav_history_snapshot();
         let facet = app.facet_navigation.clone();
@@ -90364,6 +90836,7 @@ mod smart_folder_transition_tests {
                 )
                 .unwrap();
             app.load_folder(parent);
+            app.finish_page_identity_preparation_for_test();
             assert_eq!(
                 app.load_pdf_as_folder_owned(
                     pdf.clone(),
@@ -90373,6 +90846,7 @@ mod smart_folder_transition_tests {
                 FolderOpenOutcome::Loaded
             );
             assert_eq!(app.items.len(), 2, "warm pages display before verification");
+            app.finish_page_identity_preparation_for_test();
             let source_route = app.facet_navigation.route().clone();
             let source_generation = app.items_generation;
             let row_navigation = app.capture_main_list_navigation(
@@ -90409,6 +90883,7 @@ mod smart_folder_transition_tests {
                     }),
                 );
             app.poll_pdf_enumerate();
+            app.finish_page_identity_preparation_for_test();
             assert!(app.items_generation > source_generation);
             assert_eq!(app.items.len(), 3);
             assert_eq!(app.facet_navigation.route(), &source_route);
@@ -90421,6 +90896,7 @@ mod smart_folder_transition_tests {
             let ctx = egui::Context::default();
             if supersede {
                 app.load_folder(other.clone());
+                app.finish_page_identity_preparation_for_test();
                 wait_for_staged_smart_terminal(&mut app, &ctx);
                 assert_eq!(app.current_folder.as_ref(), Some(&other));
                 assert!(!app.items_are_smart_folder_view);
@@ -90745,6 +91221,7 @@ mod smart_folder_transition_tests {
 
     fn activate_convertible_archive_snapshot(app: &mut App, source: &Path) {
         app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        app.finish_page_identity_preparation_for_test();
         assert!(app.is_snapshot_active());
         assert_eq!(app.snapshot_owner_entry(source), Some(0));
         assert!(matches!(
@@ -91402,6 +91879,7 @@ mod smart_folder_transition_tests {
                 std::time::Instant::now() < deadline,
                 "staged cache ZIP did not install"
             );
+            app.poll_sidecar_restore(&ctx);
             app.poll_smart_folder(&ctx);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -91474,6 +91952,7 @@ mod smart_folder_transition_tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while app.current_folder.as_deref() != Some(target.as_path()) {
             assert!(std::time::Instant::now() < deadline, "PDF adopt timed out");
+            app.poll_sidecar_restore(&ctx);
             app.poll_smart_folder(&ctx);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -91526,9 +92005,11 @@ mod smart_folder_transition_tests {
                         std::time::Instant::now() < deadline,
                         "child adoption stalled"
                     );
+                    app.poll_sidecar_restore(&ctx);
                     app.poll_smart_folder(&ctx);
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
+                app.finish_page_identity_preparation_for_test();
                 let synthetic = crate::app::smart_folder::smart_folder_synthetic_path(id);
                 assert!(app.restore_smart_folder_for_synthetic_path(&synthetic));
                 assert!(app.smart_folder_transition.is_some());
@@ -91558,7 +92039,12 @@ mod smart_folder_transition_tests {
         let index = select_real_path(&mut app, &zip_path);
         let stale_result = crate::zip_loader::enumerate_image_entries_detailed(&zip_path).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
-        tx.send(Ok(stale_result)).unwrap();
+        tx.send(Ok(crate::zip_loader::PreparedZipEnumeration::prepare(
+            zip_path.clone(),
+            stale_result,
+            Default::default(),
+        )))
+        .unwrap();
         let old_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         app.zip_enumerate_pending = Some(ZipEnumeratePending {
             zip_path: zip_path.clone(),
@@ -91579,11 +92065,13 @@ mod smart_folder_transition_tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while app.current_folder.as_deref() != Some(zip_path.as_path()) {
             assert!(std::time::Instant::now() < deadline, "ZIP adopt timed out");
+            app.poll_sidecar_restore(&ctx);
             app.poll_smart_folder(&ctx);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(old_cancel.load(std::sync::atomic::Ordering::Relaxed));
         assert!(app.zip_enumerate_pending.is_none());
+        app.finish_page_identity_preparation_for_test();
         let generation = app.items_generation;
         app.poll_zip_enumerate();
         assert_eq!(app.items_generation, generation);
@@ -91607,11 +92095,12 @@ mod smart_folder_transition_tests {
         wait_for_smart_folder(&mut app, &ctx, id);
         let index = select_real_path(&mut app, &zip_path);
         let (tx, rx) = std::sync::mpsc::channel();
-        tx.send(Ok(crate::zip_loader::enumerate_image_entries_detailed(
-            &old_path,
-        )
-        .unwrap()))
-            .unwrap();
+        tx.send(Ok(crate::zip_loader::PreparedZipEnumeration::prepare(
+            old_path.clone(),
+            crate::zip_loader::enumerate_image_entries_detailed(&old_path).unwrap(),
+            Default::default(),
+        )))
+        .unwrap();
         let old_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         app.zip_enumerate_pending = Some(ZipEnumeratePending {
             zip_path: old_path,
@@ -91631,10 +92120,12 @@ mod smart_folder_transition_tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while app.current_folder.as_deref() != Some(zip_path.as_path()) {
             assert!(std::time::Instant::now() < deadline, "ZIP adopt timed out");
+            app.poll_sidecar_restore(&ctx);
             app.poll_smart_folder(&ctx);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(old_cancel.load(std::sync::atomic::Ordering::Relaxed));
+        app.finish_page_identity_preparation_for_test();
         assert_eq!(app.fullscreen_idx, Some(0));
         assert!(app.fs_nav_after_pdf_enumerate.is_none());
     }
@@ -91738,6 +92229,7 @@ mod smart_folder_transition_tests {
                 std::time::Instant::now() < deadline,
                 "first child adoption stalled"
             );
+            app.poll_sidecar_restore(&ctx);
             app.poll_smart_folder(&ctx);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -91751,10 +92243,12 @@ mod smart_folder_transition_tests {
         // Cancelling the second preflight leaves the already adopted folder as the visible owner.
         app.cancel_smart_folder_pending_and_restore_origin();
         assert!(app.smart_folder_transition.is_none());
+        app.poll_sidecar_restore(&ctx);
         app.poll_smart_folder(&ctx);
         assert_eq!(app.current_folder.as_deref(), Some(nested.as_path()));
         assert!(app.zip_enumerate_pending.is_none());
         assert!(!app.fs_navigation_sequence_owned_by_smart_folder());
+        app.finish_page_identity_preparation_for_test();
 
         app.open_staged_smart_folder_and_wait(&ctx, &first);
         let mode = super::FolderNavMode::SmartFolder {
@@ -91791,9 +92285,11 @@ mod smart_folder_transition_tests {
                 app.visible_indices,
                 app.fs_nav_locked_gen,
             );
+            app.poll_sidecar_restore(&ctx);
             app.poll_smart_folder(&ctx);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        app.finish_page_identity_preparation_for_test();
         assert!(app.smart_folder_transition.is_none());
         assert_eq!(app.fullscreen_idx, Some(0));
         assert!(!app.fs_navigation_sequence_owned_by_smart_folder());
@@ -91809,6 +92305,7 @@ mod smart_folder_transition_tests {
         let outside = app.tmp.path().join("outside-nested-zip");
         std::fs::create_dir_all(&outside).unwrap();
         app.load_folder(outside.clone());
+        app.finish_page_identity_preparation_for_test();
         assert!(app.top_level_grid_view.smart_folder_session().is_none());
         app.folder_nav_back_stack = vec![FolderNavHistoryTarget::SmartFolder(saved.clone()).into()];
         assert!(app.begin_smart_history_navigation(
@@ -91822,6 +92319,7 @@ mod smart_folder_transition_tests {
                 std::time::Instant::now() < deadline,
                 "nested ZIP history restore stalled"
             );
+            app.poll_sidecar_restore(&ctx);
             app.poll_smart_folder(&ctx);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -91895,6 +92393,7 @@ mod smart_folder_transition_tests {
         let outside = app.tmp.path().join("outside-nested-pdf");
         std::fs::create_dir_all(&outside).unwrap();
         app.load_folder(outside.clone());
+        app.finish_page_identity_preparation_for_test();
         app.folder_nav_back_stack = vec![FolderNavHistoryTarget::SmartFolder(saved.clone()).into()];
         assert!(app.begin_smart_history_navigation(
             saved,
@@ -91908,6 +92407,7 @@ mod smart_folder_transition_tests {
                 std::time::Instant::now() < deadline,
                 "nested PDF history restore stalled"
             );
+            app.poll_sidecar_restore(&ctx);
             app.poll_smart_folder(&ctx);
             if !injected {
                 injected = app.replace_staged_pdf_enumeration_for_test(
@@ -92018,8 +92518,12 @@ mod smart_folder_transition_tests {
         assert_ne!(app.current_folder.as_deref(), Some(cached.as_path()));
         let enumeration = crate::zip_loader::enumerate_image_entries_detailed(&cached).unwrap();
         let grid = app.prepare_zip_grid(
-            cached,
-            enumeration,
+            cached.clone(),
+            crate::zip_loader::PreparedZipEnumeration::prepare(
+                cached,
+                enumeration,
+                Default::default(),
+            ),
             Some(&source),
             crate::app::StartupListIntent::ExplicitList,
         );
@@ -92254,6 +92758,7 @@ mod smart_folder_transition_tests {
         let cancel = install_pending_direct_rar_completion(&mut app, &stale_source, true);
 
         app.deactivate_snapshot();
+        app.finish_page_identity_preparation_for_test();
         assert!(app.archive_convert.is_some());
         assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
         app.settings.rating_filter = [false, false, false, false, false, true];
@@ -92366,6 +92871,7 @@ mod smart_folder_transition_tests {
         );
 
         app.deactivate_snapshot();
+        app.finish_page_identity_preparation_for_test();
         app.settings.rating_filter = [false, false, false, false, false, true];
         app.visible_indices = vec![1];
         app.selected = Some(1);
@@ -92535,7 +93041,11 @@ mod smart_folder_transition_tests {
 
     fn drain_smart_folder_nav(app: &mut App, ctx: &egui::Context) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while app.folder_nav_pending.is_some() || app.smart_folder_transition.is_some() {
+        while app.folder_nav_pending.is_some()
+            || app.smart_folder_transition.is_some()
+            || app.sidecar_restore_active()
+        {
+            app.poll_sidecar_restore(ctx);
             if let Some(result) = app.poll_folder_nav() {
                 app.apply_folder_nav_result(ctx, result);
             }
@@ -92567,6 +93077,7 @@ mod smart_folder_transition_tests {
                 app.install_rating_view_rows();
             }
         }
+        app.finish_page_identity_preparation_for_test();
         app.current_folder
             .clone()
             .expect("synthetic view must install its location")
@@ -92643,6 +93154,7 @@ mod smart_folder_transition_tests {
         );
 
         app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        app.finish_page_identity_preparation_for_test();
         assert!(app.is_snapshot_active());
         app.deactivate_snapshot();
         wait_for_smart_folder_scope(&mut app, &ctx, &child);
@@ -92655,6 +93167,7 @@ mod smart_folder_transition_tests {
         );
 
         app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        app.finish_page_identity_preparation_for_test();
         app.load_folder(grandchild.clone());
         assert!(
             matches!(
@@ -93088,7 +93601,8 @@ mod smart_folder_transition_tests {
         ));
         let ctx = egui::Context::default();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while app.smart_folder_transition.is_some() {
+        while app.smart_folder_transition.is_some() || app.sidecar_restore_active() {
+            app.poll_sidecar_restore(&ctx);
             app.poll_smart_folder(&ctx);
             assert!(
                 std::time::Instant::now() < deadline,
@@ -93097,6 +93611,7 @@ mod smart_folder_transition_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         app.poll_pdf_enumerate();
+        app.finish_page_identity_preparation_for_test();
         assert!(matches!(app.items.as_slice(), [GridItem::PdfPage { .. }]));
     }
 
@@ -93406,6 +93921,7 @@ mod smart_folder_transition_tests {
         assert!(app.begin_staged_smart_drill(&pdf));
         finish_smart_pdf_enumeration(&mut app, &pdf);
         app.load_folder(normal.clone());
+        app.finish_page_identity_preparation_for_test();
 
         let before = app.folder_nav_history_snapshot();
         let back = match app.folder_history_back_target() {
@@ -94038,7 +94554,7 @@ mod smart_folder_transition_tests {
             &crate::app::smart_folder::smart_folder_synthetic_path(id),
             true,
             false,
-            opts,
+            opts.clone(),
             app.settings.folder_skip_limit,
             &cancel,
         )
@@ -94049,7 +94565,7 @@ mod smart_folder_transition_tests {
             &crate::app::smart_folder::smart_folder_synthetic_path(id),
             true,
             true,
-            opts,
+            opts.clone(),
             app.settings.folder_skip_limit,
             &cancel,
         )
@@ -94064,7 +94580,7 @@ mod smart_folder_transition_tests {
             &second,
             false,
             true,
-            opts,
+            opts.clone(),
             app.settings.folder_skip_limit,
             &cancel,
         )
@@ -94078,7 +94594,7 @@ mod smart_folder_transition_tests {
             &first,
             true,
             false,
-            opts,
+            opts.clone(),
             app.settings.folder_skip_limit,
             &cancel,
         )
@@ -94090,7 +94606,7 @@ mod smart_folder_transition_tests {
             &first_child,
             true,
             false,
-            opts,
+            opts.clone(),
             app.settings.folder_skip_limit,
             &cancel,
         )
@@ -94102,7 +94618,7 @@ mod smart_folder_transition_tests {
             &later_child,
             true,
             false,
-            opts,
+            opts.clone(),
             app.settings.folder_skip_limit,
             &cancel,
         )
@@ -94225,6 +94741,7 @@ mod smart_folder_transition_tests {
                         app.thumbnails = vec![ThumbnailState::Failed];
                         app.visible_indices = vec![0];
                         app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+                        app.finish_page_identity_preparation_for_test();
                         assert!(app.is_snapshot_active());
                     }
 
@@ -94344,6 +94861,7 @@ mod smart_folder_transition_tests {
         app.thumbnails = vec![ThumbnailState::Failed];
         app.visible_indices = vec![0];
         app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        app.finish_page_identity_preparation_for_test();
         assert!(app.is_snapshot_active());
         let definition = definition("Smart", source);
         let id = definition.id;
@@ -94434,6 +94952,7 @@ mod smart_folder_transition_tests {
                     _ => unreachable!(),
                 };
                 app.activate_snapshot(label);
+                app.finish_page_identity_preparation_for_test();
                 assert!(app.is_snapshot_active());
 
                 let definition = definition("Smart", source);
@@ -94618,6 +95137,7 @@ mod smart_folder_transition_tests {
             app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::FavSearch {
                 query: "page".into(),
             });
+            app.finish_page_identity_preparation_for_test();
 
             match target {
                 SearchMode::LocalMeta => {
@@ -94930,6 +95450,7 @@ mod smart_folder_transition_tests {
         };
         let entries = vec![entry("b.jpg", 2), entry("a.jpg", 1)];
         let snapshot = SmartFolderSnapshot {
+            file_type_visibility: Default::default(),
             definition,
             entries: std::sync::Arc::new(entries),
             video_thumb_overrides: std::collections::HashMap::new(),
@@ -95013,6 +95534,7 @@ mod smart_folder_transition_tests {
             )
             .unwrap();
         let snapshot = SmartFolderSnapshot {
+            file_type_visibility: Default::default(),
             definition,
             entries: std::sync::Arc::new(entries),
             video_thumb_overrides: std::collections::HashMap::new(),
@@ -95095,6 +95617,7 @@ mod smart_folder_transition_tests {
             )
             .unwrap();
         let snapshot = SmartFolderSnapshot {
+            file_type_visibility: Default::default(),
             definition,
             entries: std::sync::Arc::new(entries),
             video_thumb_overrides: std::collections::HashMap::new(),
@@ -95132,6 +95655,7 @@ mod smart_folder_transition_tests {
         let id = definition.id;
         app.settings.smart_folders = vec![definition.clone()];
         let snapshot = SmartFolderSnapshot {
+            file_type_visibility: Default::default(),
             definition: definition.clone(),
             entries: std::sync::Arc::new(vec![SmartFolderEntry {
                 source_id: definition.rules[0].id,
@@ -95193,6 +95717,7 @@ mod smart_folder_transition_tests {
         app.subfolder_expansion_roots = vec![root.clone()];
         app.subfolder_expansion_saved_folder = Some(root.clone());
         app.subfolder_expansion_snapshot = Some(SubfolderExpansionSnapshot {
+            file_type_visibility: Default::default(),
             root: root.clone(),
             roots: vec![root],
             scan_filter: Default::default(),
@@ -95222,8 +95747,9 @@ mod smart_folder_transition_tests {
 
         let back = app.folder_history_back_entry().unwrap().clone();
         assert_eq!(back, super::subfolder_expansion_synthetic_path());
+        app.finish_page_identity_preparation_for_test();
         app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
-        app.finish_subfolder_expansion_prepare_for_test();
+        app.finish_history_restore_preparation_for_test();
         assert!(app.items_are_subfolder_expansion_view);
         assert!(
             app.items
@@ -95358,6 +95884,7 @@ fn subfolder_display_prepare_blocks_background_input() {
         Some(subfolder_expansion::SubfolderExpansionConfirmPending {
             navigation: None,
             snapshot: subfolder_expansion::SubfolderExpansionSnapshot {
+                file_type_visibility: Default::default(),
                 root: root.clone(),
                 roots: vec![root],
                 scan_filter: Default::default(),
@@ -96227,6 +96754,7 @@ fn start_bookmark_title_edit_after_handler(app: &mut App, ctx: &egui::Context, f
         ctx.cumulative_pass_nr(),
     );
     app.book_bookmark_title_edit = Some(BookBookmarkTitleEdit {
+        focus_viewport: ctx.viewport_id(),
         id: bookmark_id,
         title: String::from("editing"),
         request_focus: true,
@@ -96389,6 +96917,7 @@ fn bookmark_title_draft_without_focus_or_ime_allows_fullscreen_arrows() {
     let _input_guard = crate::key_input::lock_test_input();
     let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
     app.book_bookmark_title_edit = Some(BookBookmarkTitleEdit {
+        focus_viewport: egui::ViewportId::ROOT,
         id: 42,
         title: String::from("draft only"),
         request_focus: false,
@@ -97736,6 +98265,7 @@ fn child_archive_page_count_uses_warm_zip_tree_total() {
         entry_name: entry_name.to_owned(),
         uncompressed_size: 100,
         mtime: 1_700_000_000,
+        container_ancestry: Vec::new(),
     })
     .collect();
     let nav = crate::zip_tree::ZipNavState::new(std::sync::Arc::new(
@@ -98086,6 +98616,7 @@ fn prepared_aggregate_installs_exact_per_item_edit_state() {
         Vec::new(),
         metadata,
     );
+    app.finish_page_identity_preparation_for_test();
 
     assert_eq!(app.adjustment_page_params.get(&0), Some(&params));
     assert_eq!(app.export_crop_page_settings.get(&0), Some(&crop));
@@ -98869,6 +99400,7 @@ mod rating_folder_r2_tests {
         crate::rating_sort::with_test_rating_order(rating_request(), || {
             app.load_folder_with_scan(folder.clone(), None)
         });
+        app.finish_page_identity_preparation_for_test();
         assert_eq!(app.items[0].name(), "p0000.jpg");
         assert!(
             app.fs_feedback_toast
@@ -98887,6 +99419,7 @@ mod rating_folder_r2_tests {
         RATING_INSTALL_UI_PREWARMS.with(|calls| assert_eq!(calls.get(), 1));
         app.settings.sort_order = crate::settings::SortOrder::FileName;
         app.load_folder_with_scan(folder, None);
+        app.finish_page_identity_preparation_for_test();
         assert_eq!(
             app.items
                 .iter()
@@ -98919,6 +99452,7 @@ mod rating_folder_r2_tests {
         crate::rating_sort::with_test_rating_order(rating_request(), || {
             app.load_folder_with_scan(folder.clone(), None)
         });
+        app.finish_page_identity_preparation_for_test();
         assert!(matches!(&app.items[0], GridItem::Image(path) if path == &b));
         app.selected = Some(0);
         app.preserve_cursor_hint_for_reload();
@@ -98930,6 +99464,7 @@ mod rating_folder_r2_tests {
         crate::rating_sort::with_test_rating_order(rating_request(), || {
             app.load_folder_with_scan(folder, None)
         });
+        app.finish_page_identity_preparation_for_test();
         assert!(matches!(&app.items[0], GridItem::Image(path) if path == &a));
         assert!(
             matches!(app.selected.and_then(|idx| app.items.get(idx)), Some(GridItem::Image(path)) if path == &b)
@@ -98955,6 +99490,7 @@ mod rating_folder_r2_tests {
             crate::rating_sort::with_test_rating_order(rating_request(), || {
                 app.load_folder_with_scan(folder.clone(), None)
             });
+            app.finish_page_identity_preparation_for_test();
             assert_eq!(
                 app.items
                     .iter()
@@ -99000,6 +99536,7 @@ mod rating_folder_r2_tests {
     fn real_fixed_view_entries_disable_the_shared_toolbar_and_menu_sort_predicate() {
         let mut app = setup_app();
         app.enter_reading_history_from_menu();
+        app.finish_page_identity_preparation_for_test();
         assert_eq!(
             app.grid_sort_lock_reason(),
             Some(GridSortLockReason::FixedOrder)
@@ -99013,6 +99550,7 @@ mod rating_folder_r2_tests {
             None,
             "bookmark view retains its own selectable sort"
         );
+        app.finish_page_identity_preparation_for_test();
         app.enter_drive_list_from_navigation(None);
         assert_eq!(
             app.grid_sort_lock_reason(),
@@ -99610,6 +100148,7 @@ mod ring_picker_owner_tests {
             std::fs::write(folder.join(name), b"not decoded by this test").unwrap();
         }
         app.load_folder(folder.clone());
+        app.finish_page_identity_preparation_for_test();
         assert_eq!(app.items.len(), 2, "前提: 開いた窓に一覧がある");
         app.settings.sort_order = crate::settings::SortOrder::FileName;
 
@@ -102649,6 +103188,7 @@ fn section1335_direct_zip_exit_restart_keeps_explicit_parent_list() {
     env.settings.startup_folder_mode = crate::settings::StartupFolderMode::Previous;
     env.settings.auto_fullscreen_zip_pdf = true;
     env.load_folder(parent.clone());
+    env.finish_page_identity_preparation_for_test();
     assert_eq!(env.settings.last_folder.as_ref(), Some(&parent));
     assert!(matches!(
         env.load_folder_or_convert_archive_with_auto_fullscreen(book.clone(), true),
@@ -102685,6 +103225,226 @@ fn section1335_direct_zip_exit_restart_keeps_explicit_parent_list() {
 #[path = "tests/startup_restore.rs"]
 mod startup_restore_tests;
 
+#[test]
+fn file_type_visibility_apply_keeps_live_reader_and_defers_source_reload() {
+    let mut app = setup_app_for_test();
+    let page = GridItem::Image(PathBuf::from("kept.png"));
+    app.items = vec![page.clone()];
+    app.fullscreen_idx = Some(0);
+    app.page_identity_index = Arc::new(file_type_resume::PreparedPageIdentityIndex::prepare(
+        &app.items,
+        None,
+        Default::default(),
+    ));
+    app.settings
+        .file_type_visibility
+        .excluded_extensions
+        .insert("png".into());
+    app.apply_file_type_visibility_change(&egui::Context::default());
+    assert_eq!(app.items, vec![page]);
+    assert_eq!(app.fullscreen_idx, Some(0));
+    assert!(app.page_identity_index.policy.is_all_visible());
+    assert!(app.pending_reload);
+}
+
+#[test]
+fn visibility_remove_rows_preserves_exact_remaining_identity_and_saved_context_index() {
+    let mut app = setup_app_for_test();
+    let rows = ["a.jpg", "b.jpg", "c.jpg"].map(|name| GridItem::Image(app.tmp.path().join(name)));
+    app.items = rows.to_vec();
+    app.thumbnails = vec![ThumbnailState::Pending; 3];
+    app.image_metas = vec![None; 3];
+    app.visible_indices = vec![0, 1, 2];
+    let mut policy = crate::file_type_visibility::FileTypeVisibility::default();
+    policy.excluded_extensions.insert("png".into());
+    app.page_identity_index = Arc::new(file_type_resume::PreparedPageIdentityIndex::prepare(
+        &app.items,
+        None,
+        policy.clone(),
+    ));
+    let saved_index = Arc::clone(&app.page_identity_index);
+    let position = |index: usize| crate::book_resume_db::ReadingPosition {
+        page: index,
+        identity: crate::book_resume_db::PageIdentity::for_item(&rows[index], None),
+    };
+    app.remove_items_batch(&[1]);
+    assert_eq!(app.items, vec![rows[0].clone(), rows[2].clone()]);
+    assert_eq!(app.page_identity_index.policy, policy);
+    assert_eq!(
+        app.page_identity_index.resolve(&position(2)),
+        file_type_resume::PositionResolution::Restored(1)
+    );
+    assert_eq!(
+        app.page_identity_index.resolve(&position(1)),
+        file_type_resume::PositionResolution::HiddenIdentity
+    );
+    assert_eq!(
+        saved_index.resolve(&position(2)),
+        file_type_resume::PositionResolution::Restored(2)
+    );
+    assert_eq!(
+        saved_index.resolve(&position(1)),
+        file_type_resume::PositionResolution::Restored(1)
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn visibility_detached_collection_root_adopts_its_captured_policy_and_identity() {
+    let mut app = setup_app_for_test();
+    let old = GridItem::Image(app.tmp.path().join("old.jpg"));
+    let mut old_policy = crate::file_type_visibility::FileTypeVisibility::default();
+    old_policy.excluded_extensions.insert("jpg".into());
+    app.page_identity_index = Arc::new(file_type_resume::PreparedPageIdentityIndex::prepare(
+        &[old.clone()],
+        None,
+        old_policy,
+    ));
+    let previous_map = Arc::clone(&app.page_identity_index);
+    let page = app.tmp.path().join("collection.jpg");
+    image::RgbImage::new(1, 1).save(&page).unwrap();
+    install_collection_item_for_detached_plan(
+        &mut app,
+        &page,
+        crate::collection_store::CollectionResolvedKind::Image,
+    );
+    let mut accepted_policy = crate::file_type_visibility::FileTypeVisibility::default();
+    accepted_policy.excluded_extensions.insert("png".into());
+    app.page_identity_index = Arc::new(file_type_resume::PreparedPageIdentityIndex::prepare(
+        &app.items,
+        None,
+        accepted_policy.clone(),
+    ));
+    let accepted_map = Arc::clone(&app.page_identity_index);
+    let position = crate::book_resume_db::ReadingPosition {
+        page: 8,
+        identity: crate::book_resume_db::PageIdentity::for_item(&app.items[0], None),
+    };
+    let plan = app.detached_collection_root_image_open_plan(0).unwrap();
+    app.settings.file_type_visibility = Default::default();
+    assert!(app.start_active_detached_collection_root_image(
+        plan,
+        &egui::Context::default(),
+        None,
+        None
+    ));
+    app.with_active_viewer_context(|active| {
+        assert_eq!(active.page_identity_index.policy, accepted_policy);
+        assert!(Arc::ptr_eq(&active.page_identity_index, &accepted_map));
+        assert_eq!(
+            active.page_identity_index.resolve(&position),
+            file_type_resume::PositionResolution::Restored(0)
+        );
+    })
+    .unwrap();
+    assert!(Arc::ptr_eq(&app.page_identity_index, &accepted_map));
+    assert_eq!(
+        previous_map.resolve(&crate::book_resume_db::ReadingPosition {
+            page: 0,
+            identity: crate::book_resume_db::PageIdentity::for_item(&old, None),
+        }),
+        file_type_resume::PositionResolution::Restored(0)
+    );
+}
+
+#[test]
+fn file_type_visibility_thumbnail_request_routes_policy_before_pin_resolution() {
+    let container = PathBuf::from("book");
+    let mut pins = HashMap::new();
+    pins.insert(
+        crate::path_key::normalize_keep_drive(&container),
+        crate::folder_thumb_pins::FolderPinSource::File {
+            rel: "hidden.png".into(),
+            kind: crate::folder_thumb_pins::FileKind::Image,
+        },
+    );
+    let mut policy = crate::file_type_visibility::FileTypeVisibility::default();
+    policy.excluded_extensions.insert("png".into());
+    let request = make_load_request_with_visibility(
+        &GridItem::Folder(container.clone()),
+        0,
+        1,
+        1,
+        false,
+        None,
+        Some(crate::settings::SortOrder::Numeric),
+        1,
+        &pins,
+        &Default::default(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        &policy,
+    )
+    .unwrap();
+    assert_eq!(request.path, container);
+    assert_eq!(request.file_type_visibility, policy);
+    assert!(request.resolve_override.is_none());
+    let key = crate::thumb_loader::cache_key_for_request(&request).unwrap();
+    assert!(key.contains("|types:"));
+    assert!(!key.contains(crate::thumb_loader::CACHE_KEY_PIN_SUFFIX));
+}
+
+#[test]
+fn excluded_png_zip_parent_seed_never_becomes_first_visible_jpg_cache() {
+    let mut app = setup_app_for_test();
+    let parent = app.tmp.path().join("projected-parent-seed");
+    std::fs::create_dir_all(&parent).unwrap();
+    let zip_path = parent.join("book.zip");
+    let cache_dir = crate::catalog::default_cache_dir();
+    let parent_db = crate::catalog::CatalogDb::open(&cache_dir, &parent).unwrap();
+    let target_db = crate::catalog::CatalogDb::open(&cache_dir, &zip_path).unwrap();
+    let old_key = format!("{}book.zip", crate::thumb_loader::CACHE_KEY_ZIP);
+    let mut old_png = Vec::new();
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        2,
+        2,
+        image::Rgba([255, 0, 0, 255]),
+    ))
+    .write_to(
+        &mut std::io::Cursor::new(&mut old_png),
+        image::ImageFormat::WebP,
+    )
+    .unwrap();
+    parent_db
+        .save(&old_key, 1, 1, 2, 2, None, &old_png)
+        .unwrap();
+    app.settings
+        .file_type_visibility
+        .excluded_extensions
+        .insert("png".into());
+    app.items = vec![GridItem::ZipImage {
+        zip_path: zip_path.clone(),
+        entry_name: "2.jpg".into(),
+    }];
+    let map = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+    app.setup_virtual_folder_seed_and_writeback(&zip_path, &target_db, &map);
+    assert!(target_db.load_one("2.jpg").unwrap().is_none());
+    assert!(map.read().unwrap().is_empty());
+    let scoped = crate::thumb_loader::representative_cache_key_for_policy(
+        &old_key,
+        &app.settings.file_type_visibility,
+    );
+    assert_eq!(
+        app.virtual_folder_writeback.as_ref().unwrap().parent_key,
+        scoped
+    );
+    let first_jpg = crate::catalog::CacheEntry {
+        ..parent_db.load_one(&old_key).unwrap().unwrap()
+    };
+    map.write().unwrap().insert("2.jpg".into(), first_jpg);
+    app.fire_virtual_folder_writeback_if_ready(0);
+    assert_eq!(
+        parent_db.load_one(&old_key).unwrap().unwrap().jpeg_data,
+        old_png
+    );
+    assert!(parent_db.load_one(&scoped).unwrap().is_some());
+}
+
+#[path = "tests/file_type_visibility_fixes.rs"]
+mod file_type_visibility_fixes;
 mod background_click_scroll_regression_tests {
     use super::*;
     use egui_kittest::Harness;
@@ -102708,7 +103468,7 @@ mod background_click_scroll_regression_tests {
 
     fn harness(app: AppTestEnvForTest) -> Harness<'static, State> {
         let mut fonts_set = false;
-        Harness::builder()
+        crate::test_ui::builder()
             .with_size(egui::vec2(2000.0, 480.0))
             .with_step_dt(0.01)
             .build_state(
@@ -102812,6 +103572,7 @@ mod background_click_scroll_regression_tests {
         let origin = app.tmp.path().join("origin");
         install_items(&mut app, &origin, 240);
         app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        app.finish_page_identity_preparation_for_test();
         assert!(app.is_snapshot_active());
         install_items(&mut app, &origin.join("child"), 41);
         app.settings.grid_view_mode = view;

@@ -268,7 +268,19 @@ native リストは jpg / jpeg / png / webp / bmp / gif / heic / heif / avif / j
 RAW preview / codec 不在 / plugin の扱い、orientation、縮小・WebP、静止サムネイルは既存画像経路を使う。
 APIC の §3.2 の入力上限を sidecar の対応形式へ転用して既存動画画像を制限しない。
 複数同 stem 画像は既存 filter の順序と map への採用規則を共有し、音声専用の拡張子優先順は設けない。
-現状は filter が走査順の全候補を返し、map 化で後の候補が残るため、常に JPEG 優先とは説明しない。
+現状は filter が入力順の全候補を返し、map 化で後の候補が残るため、常に JPEG 優先とは説明しない。
+
+**§1.345統合レビュー修正（2026-10-09）:** 表示行の種類投影と補助画像候補の採用を分離する。
+`AuxiliaryMediaCandidates`は同じ物理フォルダの既存走査から、表示対象のVideo/Audioと
+種類設定に左右されないImage候補を取得し、既存のアップスケール派生ペア判定を適用する。
+通常／Remote物理一覧は一覧と同じstable sort（名前・日付・size等）、Smart／集約／サブ展開は
+既存走査順で全候補を返し、既存mapの最後の候補を採用する。表示投影後の画像からmapを上書きしない。
+名前昇順の `song.mp3 / song.jpg / song.png` はPNG採用を維持し、PNGだけの種類除外でもJPGへ変えない。
+動画・音声自体の除外は候補sourceにも適用し、派生動画を除外して元動画が戻る場合は
+元動画の同名画像を保持する。サブ展開は出荷版どおりAudioを候補sourceから先に除く。
+補助候補のmtime/sizeは既存のフォルダ更新signatureへ含め、表示行と重複計上しない。
+新しい走査、watcher、DB、pending/context ownerは追加せず、既存workerの走査成果物だけを使う。
+
 
 `filter_video_image_duplicates`、`discover_aggregate_video_sidecars_while`、`video_thumb_overrides`、
 prepared listing / collection / smart / viewer bundle の対応 map を **媒体共通へ拡張する一経路**とする。

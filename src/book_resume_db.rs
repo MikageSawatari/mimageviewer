@@ -9,9 +9,10 @@
 //! 同じ規則。`rotation_db.rs` 等の per-item DB はドライブ文字を保持する別規則なので
 //! 混同しないこと (別ドライブの同名パスは同一キーに畳まれるトレードオフがある)。
 //!
-//! 値は `items` 内の index。ZIP/PDF は列挙順が決定的なので index が安定する。
-//! 通常フォルダはファイル追加削除で多少ずれるが、その場合は復元時に範囲・種別を
-//! 検証して妥当でなければ先頭にフォールバックする (呼び出し側の責務)。
+//! 従来の `items` index と optional な論理ページ identity を同じ transaction で保存する。
+//! 新版の復元は同じ identity を照合し、種類除外後の同じ index の別画像を代用しない。
+//! 旧版の raw-only 更新は同値でも trigger により identity を失効させる。
+//! 同名の実 directory とネスト書庫の衝突は非対応 (2026-10-08 利用者決定)。
 //!
 //! ページ送りのたびに書き込みが走るため、**書き込みは [`BookResumeWriter`] の専用
 //! スレッドへ逃がして UI スレッドの同期 SQLite I/O を避ける**。読み出し
@@ -27,6 +28,57 @@ use std::sync::{
 use std::time::Duration;
 
 use crate::path_key;
+
+/// Logical page identity. Physical cache paths never identify converted documents.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PageIdentity {
+    Image {
+        path: String,
+    },
+    Archive {
+        container: String,
+        entry_name: String,
+    },
+    Document {
+        container: String,
+        page_num: usize,
+    },
+}
+
+impl PageIdentity {
+    pub(crate) fn for_item(
+        item: &crate::grid_item::GridItem,
+        logical: Option<&Path>,
+    ) -> Option<Self> {
+        use crate::grid_item::GridItem;
+        match item {
+            GridItem::Image(path) => Some(Self::Image {
+                path: path_key::normalize_keep_drive(path),
+            }),
+            GridItem::ZipImage {
+                zip_path,
+                entry_name,
+            } => Some(Self::Archive {
+                container: path_key::normalize_keep_drive(logical.unwrap_or(zip_path)),
+                entry_name: entry_name.replace('\\', "/"),
+            }),
+            GridItem::PdfPage {
+                pdf_path, page_num, ..
+            } => Some(Self::Document {
+                container: path_key::normalize_keep_drive(logical.unwrap_or(pdf_path)),
+                page_num: *page_num as usize,
+            }),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadingPosition {
+    pub page: usize,
+    pub identity: Option<PageIdentity>,
+}
 
 /// HUDと同じ読み順で記録したanchorの1-based位置。内容変更後も次の記録まで保持する。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,7 +120,7 @@ impl BookResumeDb {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let conn = rusqlite::Connection::open(path)?;
+        let mut conn = rusqlite::Connection::open(path)?;
         // 読み (UI スレッド) と書き ([`BookResumeWriter`] スレッド) で 2 接続が同じ
         // ファイルを触るため、稀な競合で SQLITE_BUSY を即時エラーにせず待たせる。
         conn.busy_timeout(Duration::from_secs(3))?;
@@ -78,6 +130,25 @@ impl BookResumeDb {
                 page INTEGER NOT NULL DEFAULT 0
             )",
         )?;
+        // Released readers may update page without knowing the additive identity column.
+        // Install the column and unconditional invalidation trigger atomically.
+        let has_identity = conn
+            .prepare("PRAGMA table_info(book_resume)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .any(|column| column == "page_identity");
+        let tx = conn.transaction()?;
+        if !has_identity {
+            tx.execute_batch("ALTER TABLE book_resume ADD COLUMN page_identity TEXT")?;
+        }
+        tx.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS book_resume_raw_invalidates_identity
+            AFTER UPDATE OF page ON book_resume BEGIN
+                UPDATE book_resume SET page_identity=NULL WHERE path=NEW.path;
+            END",
+        )?;
+        tx.commit()?;
         Ok(Self { conn })
     }
 
@@ -98,6 +169,55 @@ impl BookResumeDb {
             Ok(v.max(0) as usize)
         })
         .ok()
+    }
+
+    pub fn get_position(&self, path: &Path) -> Option<ReadingPosition> {
+        self.conn
+            .query_row(
+                "SELECT page,page_identity FROM book_resume WHERE path=?1",
+                [normalize_path(path)],
+                |row| {
+                    let page: i64 = row.get(0)?;
+                    let encoded: Option<String> = row.get(1)?;
+                    Ok(ReadingPosition {
+                        page: page.max(0) as usize,
+                        identity: encoded.and_then(|value| serde_json::from_str(&value).ok()),
+                    })
+                },
+            )
+            .ok()
+    }
+
+    fn set_position(
+        &mut self,
+        path: &Path,
+        page: usize,
+        meter: Option<ReadingMeterValue>,
+        identity: Option<&PageIdentity>,
+        meter_ready: bool,
+    ) -> Result<(), rusqlite::Error> {
+        let tx = self.conn.transaction()?;
+        let key = normalize_path(path);
+        let meter = meter.and_then(|v| ReadingMeterValue::new(v.ordinal, v.total));
+        if meter_ready {
+            tx.execute("INSERT INTO book_resume(path,page,page_ordinal,page_total)
+                VALUES (?1,?2,?3,?4) ON CONFLICT(path) DO UPDATE SET
+                page=excluded.page,page_ordinal=excluded.page_ordinal,page_total=excluded.page_total",
+                rusqlite::params![key, page as i64, meter.map(|v| v.ordinal as i64), meter.map(|v| v.total as i64)])?;
+        } else {
+            tx.execute(
+                "INSERT INTO book_resume(path,page) VALUES (?1,?2)
+                ON CONFLICT(path) DO UPDATE SET page=excluded.page",
+                rusqlite::params![key, page as i64],
+            )?;
+        }
+        let encoded = identity
+            .map(|value| serde_json::to_string(value).expect("page identity serialization"));
+        tx.execute(
+            "UPDATE book_resume SET page_identity=?1 WHERE path=?2",
+            rusqlite::params![encoded, key],
+        )?;
+        tx.commit()
     }
 
     /// 最後に読んだページ index を保存する。
@@ -205,7 +325,12 @@ fn normalize_path(path: &Path) -> String {
 /// の「UI スレッドの同期 I/O は worker 化」)。メーターの移行/全行読込/clearも同じFIFO。
 /// 従来のraw位置復元の読み出しは `BookResumeDb` 側に維持する。
 enum Command {
-    Record(PathBuf, usize, Option<ReadingMeterValue>),
+    Record(
+        PathBuf,
+        usize,
+        Option<ReadingMeterValue>,
+        Option<PageIdentity>,
+    ),
     Read(mpsc::Sender<MeterReadResult>),
     Clear(mpsc::Sender<Result<usize, String>>),
     #[cfg(test)]
@@ -254,12 +379,9 @@ impl BookResumeWriter {
                 // 溜まっている分は Disconnected 前に drain されるので取りこぼしは無い。
                 while let Ok(command) = rx.recv() {
                     match command {
-                        Command::Record(path, page, value) => {
-                            let result = if meter_ready {
-                                db.set_meter(&path, page, value)
-                            } else {
-                                db.set(&path, page)
-                            };
+                        Command::Record(path, page, value, identity) => {
+                            let result =
+                                db.set_position(&path, page, value, identity.as_ref(), meter_ready);
                             if let Err(e) = result {
                                 crate::logger::log(format!("book-resume writer: set failed: {e}"));
                             }
@@ -309,7 +431,17 @@ impl BookResumeWriter {
     }
 
     pub fn record(&self, path: &Path, page: usize, value: Option<ReadingMeterValue>) -> bool {
-        self.send(Command::Record(path.to_path_buf(), page, value))
+        self.record_identity(path, page, value, None)
+    }
+
+    pub fn record_identity(
+        &self,
+        path: &Path,
+        page: usize,
+        value: Option<ReadingMeterValue>,
+        identity: Option<PageIdentity>,
+    ) -> bool {
+        self.send(Command::Record(path.to_path_buf(), page, value, identity))
     }
 
     pub(crate) fn read_all(&self) -> mpsc::Receiver<MeterReadResult> {
@@ -358,6 +490,81 @@ mod tests {
     use super::*;
 
     #[test]
+    fn page_identity_new_old_new_and_same_raw_invalidation() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("resume.db");
+        let book = Path::new("C:/book.zip");
+        let identity = PageIdentity::Archive {
+            container: path_key::normalize_keep_drive(book),
+            entry_name: "2.png".into(),
+        };
+        let meter = ReadingMeterValue::new(2, 3);
+        let mut db = BookResumeDb::open_at(&db_path).unwrap();
+        db.migrate_meter_columns().unwrap();
+        db.set_position(book, 1, meter, Some(&identity), true)
+            .unwrap();
+        assert_eq!(
+            db.get_position(book).unwrap().identity,
+            Some(identity.clone())
+        );
+        // Exact released page-only SQL, running against the same DB after a downgrade.
+        let old = rusqlite::Connection::open(&db_path).unwrap();
+        for page in [2_i64, 1, 1] {
+            old.execute(
+                "INSERT INTO book_resume (path, page) VALUES (?1, ?2)
+                ON CONFLICT(path) DO UPDATE SET page = ?2",
+                rusqlite::params![normalize_path(book), page],
+            )
+            .unwrap();
+            let reopened = BookResumeDb::open_at(&db_path).unwrap();
+            assert_eq!(
+                reopened.get_position(book).unwrap(),
+                ReadingPosition {
+                    page: page as usize,
+                    identity: None
+                }
+            );
+            assert_eq!(
+                reopened
+                    .read_meters()
+                    .unwrap()
+                    .values
+                    .get(&normalize_path(book)),
+                Some(&meter)
+            );
+            db.set_position(book, 1, meter, Some(&identity), true)
+                .unwrap();
+            assert_eq!(
+                db.get_position(book).unwrap().identity,
+                Some(identity.clone())
+            );
+        }
+        db.set(book, 1).unwrap();
+        assert!(db.get_position(book).unwrap().identity.is_none());
+    }
+
+    #[test]
+    fn old_resume_schema_adds_identity_without_changing_raw() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("old.db");
+        let old = rusqlite::Connection::open(&path).unwrap();
+        old.execute_batch(
+            "CREATE TABLE book_resume(path TEXT PRIMARY KEY,page INTEGER NOT NULL DEFAULT 0);
+            INSERT INTO book_resume(path,page) VALUES ('/book.zip',1)",
+        )
+        .unwrap();
+        drop(old);
+        let db = BookResumeDb::open_at(&path).unwrap();
+        assert_eq!(
+            db.get_position(Path::new("C:/book.zip")).unwrap(),
+            ReadingPosition {
+                page: 1,
+                identity: None
+            }
+        );
+    }
+
+    #[test]
     fn book_resume_meter_migration_preserves_legacy_and_nulls() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("resume.db");
@@ -374,8 +581,18 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(columns, ["path", "page", "page_ordinal", "page_total"]);
+        assert_eq!(
+            columns,
+            [
+                "path",
+                "page",
+                "page_identity",
+                "page_ordinal",
+                "page_total"
+            ]
+        );
         assert_eq!(db.get(book), Some(7));
+        assert_eq!(db.get_position(book).unwrap().identity, None);
         assert_eq!(
             db.read_meters().unwrap().values[&normalize_path(book)],
             None
@@ -404,7 +621,7 @@ mod tests {
         for (idx, (ordinal, total)) in [(0, 5), (1, 0), (6, 5), (-1, 5)].into_iter().enumerate() {
             db.conn
                 .execute(
-                    "INSERT INTO book_resume VALUES (?1,0,?2,?3)",
+                    "INSERT INTO book_resume(path,page,page_ordinal,page_total) VALUES (?1,0,?2,?3)",
                     rusqlite::params![format!("bad{idx}"), ordinal, total],
                 )
                 .unwrap();

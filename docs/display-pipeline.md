@@ -7,6 +7,11 @@
 
 ### 音声セルの代表画像 (§1.347、2026-10-08)
 
+同名補助画像の採用は表示行の種類投影から独立している。画像種類を隠しても既存の候補順で
+選んだ表紙／動画sidecarを維持する。通常／Remoteは一覧sort、Smart／集約は既存走査順を使い、
+候補mapを表示画像で上書きしない（[候補採用規則](audio-album-art-plan.md)）。
+
+
 Audio は既存 worker / texture backlog に乗り、同名 sidecar → MP3 先頭 ID3v2 の前面表紙優先 → 音楽アイコンの順で表示する。`ThumbnailState::NoArt` は正常終端で、Failed とともに一覧世代内では再投入・hover repaint を続けない。Loaded の画像寸法を Auto 比率へ使い、画像のない音声を分母から除く。全音声が終端なら Auto 未確定も現在の比率で終わる。
 
 `ThumbMsgPayload` が Pixels / SourcePixels / ProvisionalPixels / NoArt / Failed / Canceled / Finalized を一つに所有する。Audio は保存完了後に終端 Pixels または画像なし終端を一通知で送り、source生成の二通知契約とは分ける。音声マークは `AudioThumbnailIndicator` の音楽アイコン (既定) / 文字バッジ / なし。画像なしではどの設定でも音楽アイコンを描く。音声を補正対象の画像ページにせず、再生画面・入力操作は保持する。[詳細設計](audio-album-art-plan.md)。

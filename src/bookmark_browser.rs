@@ -482,6 +482,21 @@ pub fn sort_and_materialize_rows(
     sort: BookmarkViewSort,
     display_order: &crate::settings::GridDisplayOrder,
 ) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
+    sort_and_materialize_rows_with_visibility(
+        rows,
+        sort,
+        display_order,
+        &crate::file_type_visibility::FileTypeVisibility::default(),
+    )
+}
+
+pub fn sort_and_materialize_rows_with_visibility(
+    rows: &mut Vec<BookmarkBrowserRow>,
+    sort: BookmarkViewSort,
+    display_order: &crate::settings::GridDisplayOrder,
+    visibility: &crate::file_type_visibility::FileTypeVisibility,
+) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
+    rows.retain(|row| bookmark_row_is_visible(visibility, row));
     sort_rows(rows, sort);
     crate::grid_item::materialize_view_rows(
         rows,
@@ -494,7 +509,32 @@ pub fn sort_and_materialize_rows(
 
 pub struct BookmarkBrowserBuildResult {
     pub rows: Vec<BookmarkBrowserRow>,
+    /// Full stored registration count, captured before any display policy projection.
+    pub registered_total: usize,
     pub(crate) video_thumb_overrides: std::collections::HashMap<String, PathBuf>,
+    pub(crate) visibility_notice: Option<crate::archive_visibility::ArchiveVisibilityNotice>,
+}
+
+pub(crate) struct BookBookmarkProjection {
+    pub(crate) bookmarks: Vec<crate::book_bookmarks::BookBookmark>,
+    pub(crate) notice: Option<crate::archive_visibility::ArchiveVisibilityNotice>,
+}
+
+/// Worker projection shared by PC, Remote and the global bookmark producer. Stored
+/// registrations remain untouched, including missing/unknown rows' delete routes.
+pub(crate) fn project_book_bookmarks(
+    mut bookmarks: Vec<crate::book_bookmarks::BookBookmark>,
+    visibility: &crate::file_type_visibility::FileTypeVisibility,
+    cancel: &AtomicBool,
+) -> BookBookmarkProjection {
+    let mut projection =
+        crate::archive_visibility::ArchiveVisibilityProjection::new(visibility, cancel);
+    bookmarks
+        .retain(|bookmark| !cancel.load(Ordering::Relaxed) && projection.allows_bookmark(bookmark));
+    BookBookmarkProjection {
+        bookmarks,
+        notice: projection.notice(),
+    }
 }
 
 pub struct BookmarkBrowserPending {
@@ -515,62 +555,71 @@ pub fn spawn_build(settings: crate::settings::Settings) -> BookmarkBrowserPendin
     std::thread::Builder::new()
         .name("bookmark-browser-build".to_string())
         .spawn(move || {
-            let result = build_rows(&cancel_worker)
-                .map_err(|err| err.to_string())
-                .and_then(|rows| {
-                    let media_paths = rows
-                        .iter()
-                        .filter(|row| !row.missing && row.marker_thumbnail.is_none())
-                        .filter_map(|row| match &row.item {
-                            GridItem::Video(path) | GridItem::Audio(path) => Some(path.clone()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>();
-                    let sidecars =
-                        crate::app::folder_scan::discover_aggregate_video_sidecars_while(
-                            &settings,
-                            &media_paths,
-                            64,
-                            || !cancel_worker.load(Ordering::Relaxed),
-                        )
-                        .ok_or_else(|| "cancelled".to_string())?;
-                    if sidecars.skipped_parents > 0 {
-                        crate::logger::log(format!(
-                            "bookmark sidecar discovery capped: scanned={} skipped={}",
-                            sidecars.scanned_parents, sidecars.skipped_parents
-                        ));
-                    }
-                    for (parent, error) in &sidecars.scan_errors {
-                        crate::logger::log(format!(
-                            "bookmark sidecar discovery failed {}: {error}",
-                            parent.display()
-                        ));
-                    }
-                    Ok(BookmarkBrowserBuildResult {
-                        rows,
-                        video_thumb_overrides: sidecars.by_video_path,
-                    })
-                });
+            let result =
+                build_rows_with_access(&cancel_worker, false, &settings.file_type_visibility)
+                    .map_err(|err| err.to_string())
+                    .and_then(|mut result| {
+                        let media_paths = result
+                            .rows
+                            .iter()
+                            .filter(|row| !row.missing && row.marker_thumbnail.is_none())
+                            .filter_map(|row| match &row.item {
+                                GridItem::Video(path) | GridItem::Audio(path) => Some(path.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>();
+                        let sidecars =
+                            crate::app::folder_scan::discover_aggregate_video_sidecars_while(
+                                &settings,
+                                &media_paths,
+                                64,
+                                || !cancel_worker.load(Ordering::Relaxed),
+                            )
+                            .ok_or_else(|| "cancelled".to_string())?;
+                        if sidecars.skipped_parents > 0 {
+                            crate::logger::log(format!(
+                                "bookmark sidecar discovery capped: scanned={} skipped={}",
+                                sidecars.scanned_parents, sidecars.skipped_parents
+                            ));
+                        }
+                        for (parent, error) in &sidecars.scan_errors {
+                            crate::logger::log(format!(
+                                "bookmark sidecar discovery failed {}: {error}",
+                                parent.display()
+                            ));
+                        }
+                        result.video_thumb_overrides = sidecars.by_video_path;
+                        Ok(result)
+                    });
             let _ = tx.send(result);
         })
         .ok();
     BookmarkBrowserPending { cancel, rx }
 }
 
-fn build_rows(cancel: &AtomicBool) -> Result<Vec<BookmarkBrowserRow>, rusqlite::Error> {
-    build_rows_with_access(cancel, false)
-}
-
 /// remote IPC の read model 用。mIV の bookmark view と同じ行構築・並び順を使いつつ、
 /// DB はすべて read-only で開く。
 pub fn build_rows_readonly() -> Result<Vec<BookmarkBrowserRow>, rusqlite::Error> {
-    build_rows_with_access(&AtomicBool::new(false), true)
+    build_rows_readonly_with_visibility(&Default::default())
+}
+
+pub fn build_rows_readonly_with_visibility(
+    visibility: &crate::file_type_visibility::FileTypeVisibility,
+) -> Result<Vec<BookmarkBrowserRow>, rusqlite::Error> {
+    build_rows_readonly_with_visibility_and_total(visibility).map(|result| result.rows)
+}
+
+pub fn build_rows_readonly_with_visibility_and_total(
+    visibility: &crate::file_type_visibility::FileTypeVisibility,
+) -> Result<BookmarkBrowserBuildResult, rusqlite::Error> {
+    build_rows_with_access(&AtomicBool::new(false), true, visibility)
 }
 
 fn build_rows_with_access(
     cancel: &AtomicBool,
     read_only: bool,
-) -> Result<Vec<BookmarkBrowserRow>, rusqlite::Error> {
+    visibility: &crate::file_type_visibility::FileTypeVisibility,
+) -> Result<BookmarkBrowserBuildResult, rusqlite::Error> {
     let mut rows = Vec::new();
     let media = if read_only {
         if crate::video_bookmarks::VideoBookmarkDb::db_path()
@@ -584,9 +633,20 @@ fn build_rows_with_access(
     } else {
         crate::video_bookmarks::VideoBookmarkDb::open()?.list_all_global()?
     };
+    let book_bookmarks = if read_only {
+        crate::book_bookmarks::load_all_from_disk_readonly()?
+    } else {
+        crate::book_bookmarks::load_all_from_disk()?
+    };
+    let registered_total = media.len() + book_bookmarks.len();
     for bookmark in media {
         if cancel.load(Ordering::Relaxed) {
-            return Ok(Vec::new());
+            return Ok(BookmarkBrowserBuildResult {
+                rows: Vec::new(),
+                registered_total,
+                visibility_notice: None,
+                video_thumb_overrides: Default::default(),
+            });
         }
         let ext = bookmark
             .path
@@ -595,6 +655,16 @@ fn build_rows_with_access(
             .unwrap_or("")
             .to_lowercase();
         let is_audio = crate::folder_tree::SUPPORTED_AUDIO_EXTENSIONS.contains(&ext.as_str());
+        if !visibility.allows_path(
+            if is_audio {
+                crate::file_type_visibility::FileTypeCategory::Audio
+            } else {
+                crate::file_type_visibility::FileTypeCategory::Video
+            },
+            &bookmark.path,
+        ) {
+            continue;
+        }
         let missing = !bookmark.path.try_exists().unwrap_or(false);
         let item = if is_audio {
             GridItem::Audio(bookmark.path.clone())
@@ -626,17 +696,18 @@ fn build_rows_with_access(
         crate::archive_cache::ArchiveCacheDb::open().ok()
     };
     let mut book_missing_cache = HashMap::new();
-    let book_bookmarks = if read_only {
-        crate::book_bookmarks::load_all_from_disk_readonly()?
-    } else {
-        crate::book_bookmarks::load_all_from_disk()?
-    };
-    for bookmark in book_bookmarks {
+    let projected = project_book_bookmarks(book_bookmarks, visibility, cancel);
+    for bookmark in projected.bookmarks {
         if cancel.load(Ordering::Relaxed) {
-            return Ok(Vec::new());
+            return Ok(BookmarkBrowserBuildResult {
+                rows: Vec::new(),
+                registered_total,
+                visibility_notice: None,
+                video_thumb_overrides: Default::default(),
+            });
         }
         let (mut item, relative_page_missing, mut relative_page_provenance) =
-            book_grid_item(&bookmark, archive_cache.as_ref());
+            book_grid_item_with_visibility(&bookmark, archive_cache.as_ref(), visibility);
         // Filesystem relative page は materialize と存在判定を1回の containment check で
         // 行う。unsafe/missing path を GridItem::Image にせず、後段の metadata / thumb
         // I/O に渡さない。
@@ -667,7 +738,53 @@ fn build_rows_with_access(
         });
     }
     sort_rows(&mut rows, BookmarkViewSort::default());
-    Ok(rows)
+    Ok(BookmarkBrowserBuildResult {
+        rows,
+        registered_total,
+        visibility_notice: projected.notice,
+        video_thumb_overrides: Default::default(),
+    })
+}
+
+/// Pure bookmark projection. Use the stored logical source/identity even when the
+/// materialized item is a missing placeholder or points into a converted archive cache.
+pub fn book_bookmark_is_visible(
+    visibility: &crate::file_type_visibility::FileTypeVisibility,
+    bookmark: &crate::book_bookmarks::BookBookmark,
+) -> bool {
+    use crate::book_bookmarks::{BookContainerKind, PageIdentity};
+    match (&bookmark.container_kind, &bookmark.page_identity) {
+        (
+            BookContainerKind::CompiledBook | BookContainerKind::ImageFolder,
+            PageIdentity::RelativePath(relative),
+        ) => visibility.allows_physical_file(Path::new(relative)),
+        (
+            BookContainerKind::Zip | BookContainerKind::OtherArchive,
+            PageIdentity::ArchiveEntry(member),
+        ) => visibility.allows_physical_file(Path::new(member)),
+        (BookContainerKind::Pdf, _) => {
+            visibility.allows_grid_item(&GridItem::PdfFile(bookmark.container_path.clone()))
+        }
+        (BookContainerKind::CompiledBook | BookContainerKind::ImageFolder, _) => true,
+        _ => visibility.allows_physical_file(&bookmark.container_path),
+    }
+}
+
+pub fn bookmark_row_is_visible(
+    visibility: &crate::file_type_visibility::FileTypeVisibility,
+    row: &BookmarkBrowserRow,
+) -> bool {
+    match &row.source {
+        BookmarkRowSource::Media { path, is_audio, .. } => visibility.allows_path(
+            if *is_audio {
+                crate::file_type_visibility::FileTypeCategory::Audio
+            } else {
+                crate::file_type_visibility::FileTypeCategory::Video
+            },
+            path,
+        ),
+        BookmarkRowSource::Book(bookmark) => book_bookmark_is_visible(visibility, bookmark),
+    }
 }
 
 fn source_meta(path: &Path) -> Option<(i64, i64)> {
@@ -720,6 +837,18 @@ fn book_grid_item(
     Option<bool>,
     Option<crate::book_bookmarks::RelativePageProvenance>,
 ) {
+    book_grid_item_with_visibility(bookmark, archive_cache, &Default::default())
+}
+
+fn book_grid_item_with_visibility(
+    bookmark: &crate::book_bookmarks::BookBookmark,
+    archive_cache: Option<&crate::archive_cache::ArchiveCacheDb>,
+    visibility: &crate::file_type_visibility::FileTypeVisibility,
+) -> (
+    GridItem,
+    Option<bool>,
+    Option<crate::book_bookmarks::RelativePageProvenance>,
+) {
     use crate::book_bookmarks::{BookContainerKind, PageIdentity, RelativePagePathResolution};
     match (&bookmark.container_kind, &bookmark.page_identity) {
         (
@@ -764,7 +893,9 @@ fn book_grid_item(
         (BookContainerKind::OtherArchive, PageIdentity::ArchiveEntry(entry_name)) => {
             let backing_path = source_meta(&bookmark.container_path)
                 .and_then(|(mtime, size)| {
-                    archive_cache.and_then(|db| db.peek(&bookmark.container_path, mtime, size))
+                    archive_cache.and_then(|db| {
+                        db.peek_with_visibility(&bookmark.container_path, mtime, size, visibility)
+                    })
                 })
                 .unwrap_or_else(|| bookmark.container_path.clone());
             (
@@ -874,11 +1005,19 @@ fn book_page_missing(
 
 pub struct BookmarkDeletePending {
     pub keys: Vec<(u8, i64)>,
+    pub book_containers: Vec<PathBuf>,
     pub rx: mpsc::Receiver<Result<(), String>>,
 }
 
 pub fn spawn_delete(rows: &[BookmarkBrowserRow]) -> BookmarkDeletePending {
     let keys = rows.iter().map(BookmarkBrowserRow::stable_key).collect();
+    let book_containers = rows
+        .iter()
+        .filter_map(|row| match &row.source {
+            BookmarkRowSource::Book(bookmark) => Some(bookmark.container_path.clone()),
+            BookmarkRowSource::Media { .. } => None,
+        })
+        .collect();
     let sources: Vec<_> = rows.iter().map(|row| row.source.clone()).collect();
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
@@ -909,7 +1048,11 @@ pub fn spawn_delete(rows: &[BookmarkBrowserRow]) -> BookmarkDeletePending {
             let _ = tx.send(result);
         })
         .ok();
-    BookmarkDeletePending { keys, rx }
+    BookmarkDeletePending {
+        keys,
+        book_containers,
+        rx,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1060,6 +1203,180 @@ impl BookmarkViewReturnTarget {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn visibility_bookmark_worker_uses_ancestry_and_preserves_legacy_registrations() {
+        use crate::book_bookmarks::{BookContainerKind, PageIdentity};
+        let guard = crate::data_dir::TestDataDirGuard::new();
+        let (source, cached) = crate::archive_visibility::legacy_conversion_fixture(guard.path());
+        crate::book_bookmarks::load_all_from_disk().unwrap();
+        let conn = rusqlite::Connection::open(crate::book_bookmarks::db_path()).unwrap();
+        for (id, member) in [
+            (1, "root.jpg"),
+            (2, "chapter.zip/page.jpg"),
+            (3, "notes.zip/page.jpg"),
+            (4, "missing.jpg"),
+        ] {
+            conn.execute("INSERT INTO book_bookmarks (id, container_key, container_path, container_kind, page_kind, page_value, page_key, page_index_hint, created_at_ms) VALUES (?1, ?2, ?3, 'other_archive', 'archive_entry', ?4, ?4, 0, ?1)", rusqlite::params![id, crate::book_bookmarks::container_key(&source), source.to_string_lossy(), member]).unwrap();
+        }
+        let stored = crate::book_bookmarks::load_all_from_disk_readonly().unwrap();
+        let policy = crate::file_type_visibility::FileTypeVisibility {
+            excluded_categories: [crate::file_type_visibility::FileTypeCategory::Zip]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let cancel = AtomicBool::new(false);
+        let legacy = project_book_bookmarks(stored.clone(), &policy, &cancel);
+        assert_eq!(
+            legacy
+                .bookmarks
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec![4]
+        );
+        assert!(legacy.notice.is_some());
+        let global = build_rows_readonly_with_visibility_and_total(&policy).unwrap();
+        assert_eq!(global.registered_total, 4);
+        assert_eq!(global.rows.len(), 1);
+        assert!(
+            matches!(&global.rows[0].source, BookmarkRowSource::Book(bookmark) if bookmark.id == 4)
+        );
+        assert!(
+            !global.rows[0].missing,
+            "unverified OtherArchive members retain the existing open/delete route without declaring them missing"
+        );
+        assert_eq!(global.visibility_notice, legacy.notice);
+        crate::archive_visibility::regenerate_conversion_fixture(&source, &cached);
+        let restored = project_book_bookmarks(stored.clone(), &policy, &cancel);
+        assert_eq!(
+            restored
+                .bookmarks
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec![4, 3, 1]
+        );
+        assert_eq!(restored.notice, None);
+        let global = build_rows_readonly_with_visibility_and_total(&policy).unwrap();
+        assert_eq!(global.rows.len(), 3);
+        assert_eq!(global.registered_total, 4);
+        assert_eq!(global.visibility_notice, None);
+        assert_eq!(
+            stored,
+            crate::book_bookmarks::load_all_from_disk_readonly().unwrap()
+        );
+        let mut native = stored[1].clone();
+        native.container_kind = BookContainerKind::Zip;
+        native.page_identity = PageIdentity::ArchiveEntry("chapter.zip/page.jpg".into());
+        assert!(
+            project_book_bookmarks(vec![native.clone()], &policy, &cancel)
+                .bookmarks
+                .is_empty()
+        );
+        native.page_identity = PageIdentity::ArchiveEntry("notes.zip/page.jpg".into());
+        assert_eq!(
+            project_book_bookmarks(vec![native], &policy, &cancel)
+                .bookmarks
+                .len(),
+            1
+        );
+        std::fs::remove_file(&source).unwrap();
+        let missing = build_rows_readonly_with_visibility_and_total(&policy).unwrap();
+        assert_eq!(missing.rows.len(), 4);
+        assert!(missing.rows.iter().all(|row| row.missing));
+        assert_eq!(missing.registered_total, 4);
+        assert_eq!(missing.visibility_notice, None);
+        crate::book_bookmarks::remove_from_disk(4).unwrap();
+        assert_eq!(
+            crate::book_bookmarks::load_all_from_disk_readonly()
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn bookmark_projection_uses_member_and_logical_document_identity_even_when_missing() {
+        use crate::book_bookmarks::{BookBookmark, BookContainerKind, PageIdentity};
+        use crate::file_type_visibility::{FileTypeCategory, FileTypeVisibility};
+        let bookmark = |path: &str, kind, identity| BookBookmark {
+            id: 7,
+            container_key: crate::book_bookmarks::container_key(Path::new(path)),
+            container_path: PathBuf::from(path),
+            container_kind: kind,
+            page_identity: identity,
+            page_index_hint: 42,
+            created_at_ms: 1,
+            title: None,
+        };
+        let hidden_png = bookmark(
+            "missing.rar",
+            BookContainerKind::OtherArchive,
+            PageIdentity::ArchiveEntry("chapter/cover.PNG".into()),
+        );
+        let visible_jpg = bookmark(
+            "missing.rar",
+            BookContainerKind::OtherArchive,
+            PageIdentity::ArchiveEntry("chapter/page.jpg".into()),
+        );
+        let document = bookmark(
+            "logical.epub",
+            BookContainerKind::Pdf,
+            PageIdentity::PdfPage(9),
+        );
+        let folder = bookmark(
+            "actual-directory.zip",
+            BookContainerKind::ImageFolder,
+            PageIdentity::RelativePath("page.jpg".into()),
+        );
+        let mut policy = FileTypeVisibility::default();
+        policy.excluded_extensions.insert("png".into());
+        policy.excluded_categories.insert(FileTypeCategory::Zip);
+        assert!(!book_bookmark_is_visible(&policy, &hidden_png));
+        assert!(book_bookmark_is_visible(&policy, &visible_jpg));
+        assert!(book_bookmark_is_visible(&policy, &folder));
+        policy.excluded_categories.insert(FileTypeCategory::Image);
+        assert!(book_bookmark_is_visible(&policy, &document));
+        policy.excluded_categories.insert(FileTypeCategory::Epub);
+        assert!(!book_bookmark_is_visible(&policy, &document));
+        policy.excluded_categories.remove(&FileTypeCategory::Image);
+        policy.excluded_categories.insert(FileTypeCategory::Rar);
+        assert!(book_bookmark_is_visible(&policy, &visible_jpg));
+        assert_eq!(visible_jpg.page_index_hint, 42);
+        assert_eq!(visible_jpg.id, 7);
+    }
+
+    #[test]
+    fn bookmark_projection_keeps_row_metadata_and_ids_aligned() {
+        let mut policy = crate::file_type_visibility::FileTypeVisibility::default();
+        policy.excluded_extensions.insert("mp4".into());
+        let mut video = media_row(1, 100, "hidden");
+        video.missing = true;
+        let mut audio = media_row(2, 200, "audio");
+        let path = PathBuf::from("visible.flac");
+        audio.source = BookmarkRowSource::Media {
+            id: 2,
+            path: path.clone(),
+            pts_secs: 5.0,
+            title: None,
+            is_audio: true,
+        };
+        audio.item = GridItem::Audio(path);
+        audio.image_meta = Some((200, 1234));
+        let mut rows = vec![video, audio];
+        let (items, meta) = sort_and_materialize_rows_with_visibility(
+            &mut rows,
+            BookmarkViewSort::CreatedAtDesc,
+            &Default::default(),
+            &policy,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].stable_key(), (0, 2));
+        assert_eq!(items, vec![rows[0].item.clone()]);
+        assert_eq!(meta, vec![Some((200, 1234))]);
+    }
 
     #[cfg(windows)]
     fn create_dir_link(target: &Path, link: &Path) -> bool {

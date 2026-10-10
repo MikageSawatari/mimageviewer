@@ -4340,7 +4340,7 @@ async function loadCollection(route, options = {}) {
   return true;
 }
 
-function applyCollectionData(route, data, forceSinglePage, options = {}) {
+export function applyCollectionData(route, data, forceSinglePage, options = {}) {
   const baseHash = collectionHash(route.collectionKind, route.value);
   if (state.pagePrefetchContextIdentity !== baseHash) {
     state.pagePrefetchContextIdentity = baseHash;
@@ -4348,6 +4348,8 @@ function applyCollectionData(route, data, forceSinglePage, options = {}) {
   }
   state.collection = {
     kind: route.collectionKind,
+    visibilityNotice: typeof data.visibility_notice === "string" ? data.visibility_notice : null,
+    registeredTotal: Number.isSafeInteger(data.registered_total) ? data.registered_total : null,
     value: route.value,
     title: data.title ?? "一覧",
     truncated: Boolean(data.truncated),
@@ -4574,6 +4576,7 @@ async function showContainer(address) {
   const initialImageIndex = containerInitialImageIndex({
     openMode: state.container?.openMode,
     resumePage: state.container?.resumePage,
+    resumeRefusal: state.container?.resumeRefusal,
     images: state.images,
   });
   const gridAlreadyShown =
@@ -4707,6 +4710,7 @@ export function applyContainerData(address, data, forceSinglePage, options = {})
     otherCount: Math.max(0, Math.floor(Number(data.other_count) || 0)),
     forceSinglePage,
     resumePage: data.resume_page ?? null,
+    resumeRefusal: data.resume_refusal ?? null,
     openMode: data.open_mode ?? "grid",
   };
   state.gridSortState = normalizeRemoteGridSortState(data.sort_state);
@@ -4799,8 +4803,18 @@ export function containerRuntimeStateForTest() {
   };
 }
 
-export function containerInitialImageIndex({ openMode, resumePage, images }) {
-  if (openMode === "grid" || !images.length) return -1;
+export function containerResumeRefusalNotice(reason) {
+  if (reason === "saved_page_unavailable") {
+    return "保存したページを現在の一覧で確認できません。一覧からページを選んでください。";
+  }
+  if (reason === "legacy_position_unverified") {
+    return "現在の表示設定では保存した読書位置を確認できません。一覧からページを選んでください。";
+  }
+  return "";
+}
+
+export function containerInitialImageIndex({ openMode, resumePage, resumeRefusal, images }) {
+  if (openMode === "grid" || containerResumeRefusalNotice(resumeRefusal) || !images.length) return -1;
   if (openMode === "resume_page" && resumePage) {
     const resumeIndex = images.findIndex(
       (entry) =>
@@ -5237,6 +5251,7 @@ function applyPersistentCollectionSnapshot(data, forceSinglePage, options = {}) 
   };
   state.collection = {
     kind: "saved_collection",
+    registeredTotal: Number.isSafeInteger(data.registered_total) ? data.registered_total : null,
     value: data.collection_id,
     title: data.title ?? "コレクション",
     truncated: Boolean(data.truncated),
@@ -6802,21 +6817,27 @@ export function renderFolder(listMetrics = null, preserveRequestController = nul
   gridActionNotice.hidden = true;
   gridActionNotice.setAttribute("role", "status");
   gridActionNotice.setAttribute("aria-live", "polite");
-  if (!state.collection && !state.container && state.gridSortNotice) {
-    gridActionNotice.textContent = state.gridSortNotice;
+  const resumeNotice = containerResumeRefusalNotice(state.container?.resumeRefusal);
+  const actionNotice = resumeNotice || state.collection?.visibilityNotice ||
+    (!state.collection && !state.container ? state.gridSortNotice : "");
+  if (actionNotice) {
+    gridActionNotice.textContent = actionNotice;
     gridActionNotice.hidden = false;
   }
   state.gridActionNotice = gridActionNotice;
+  const registeredTotal = state.collection?.registeredTotal;
+  const registrationNotice = Number.isSafeInteger(registeredTotal)
+    ? `表示 ${state.entries.length} / 登録 ${registeredTotal}`
+    : "";
+  const limitNotice = (state.collection ?? state.container)?.truncated
+    ? "件数が多いため先頭 " + (state.collection ?? state.container).entryLimit + " 件を表示しています。"
+    : "";
   const collectionLimitNotice = textElement(
     "p",
-    (state.collection ?? state.container)?.truncated
-      ? "件数が多いため先頭 " +
-        (state.collection ?? state.container).entryLimit +
-        " 件を表示しています。"
-      : "",
+    [registrationNotice, limitNotice].filter(Boolean).join(" · "),
     "thumbnail-service-notice"
   );
-  collectionLimitNotice.hidden = !(state.collection ?? state.container)?.truncated;
+  collectionLimitNotice.hidden = !registrationNotice && !limitNotice;
   const space = element("div", "virtual-space");
   const windowElement = element("div", "virtual-window");
   space.append(windowElement);
@@ -10043,6 +10064,7 @@ export function normalizeRemoteBookBookmarkList(value) {
   const rows = Array.isArray(value?.rows) ? value.rows : [];
   return {
     supported: Boolean(value?.supported),
+    visibilityNotice: typeof value?.visibility_notice === "string" ? value.visibility_notice : null,
     rows: rows.flatMap((row) => {
       const id = Number(row?.id);
       if (!Number.isSafeInteger(id)) return [];
@@ -12238,7 +12260,7 @@ export class ViewerAdjustmentPanel {
   }
 }
 
-class ViewerBookmarkPanel {
+export class ViewerBookmarkPanel {
   constructor() {
     this.root = element("div", "viewer-bookmark-panel");
     this.content = element("div", "viewer-bookmark-content");
@@ -12358,7 +12380,12 @@ class ViewerBookmarkPanel {
     } else {
       for (const row of list.rows) rows.append(this.buildRow(row));
     }
-    this.content.replaceChildren(header, rows);
+    const content = [header];
+    if (list.visibilityNotice) {
+      content.push(textElement("p", list.visibilityNotice, "viewer-bookmark-hint"));
+    }
+    content.push(rows);
+    this.content.replaceChildren(...content);
   }
 
   buildRow(row) {

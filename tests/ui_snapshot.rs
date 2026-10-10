@@ -27,6 +27,9 @@
 
 use egui_kittest::{Harness, kittest::Queryable};
 
+#[path = "support/ui_harness.rs"]
+mod test_ui;
+
 #[test]
 fn chrome_suppression_settings_light() {
     chrome_suppression_settings_snapshot(
@@ -234,7 +237,7 @@ fn startup_dialogs_small_viewport() {
             for &(kind, buttons) in STARTUP_DIALOG_CASES {
                 let size = egui::vec2(width as f32, height as f32);
                 let mut fonts_ready = false;
-                let mut harness = Harness::builder().with_size(size).build_state(
+                let mut harness = test_ui::builder().with_size(size).build_state(
                     move |ctx, actions: &mut Actions| {
                         mimageviewer::os_theme::apply_resolved(
                             ctx,
@@ -362,7 +365,7 @@ fn startup_dialogs_refit_after_viewport_resize() {
     for scale in [1.0, 2.0] {
         for &(kind, buttons) in STARTUP_DIALOG_CASES {
             let mut fonts_ready = false;
-            let mut harness = Harness::builder()
+            let mut harness = test_ui::builder()
                 .with_size(egui::vec2(1920.0, 1440.0))
                 .build_state(
                     move |ctx, state: &mut (Vec<egui::Id>, Vec<egui::Response>)| {
@@ -535,7 +538,7 @@ fn folder_toolbar_snapshot_status_label() {
                 };
                 let mut fonts_ready = false;
                 let mut path = String::from(r"C:\Pictures\日本語フォルダ");
-                let mut harness = Harness::builder()
+                let mut harness = test_ui::builder()
                     .with_size(egui::vec2(width * zoom, 120.0 * zoom))
                     .build(move |ctx| {
                         ctx.set_zoom_factor(zoom);
@@ -618,7 +621,7 @@ fn folder_toolbar_flexible_snapshots() {
                 for buttons in [true, false] {
                     let mut fonts_ready = false;
                     let mut path = String::from(r"C:\Pictures\日本語フォルダ");
-                    let mut harness = Harness::builder()
+                    let mut harness = test_ui::builder()
                         .with_size(egui::vec2(width, 240.0 * zoom))
                         .build(move |ctx| {
                             ctx.set_zoom_factor(zoom);
@@ -840,7 +843,7 @@ fn draw_folder_toolbar_fixture(
 
 fn snapshot_color_presets(name: &str, width: f32) {
     let mut fonts_ready = false;
-    let mut harness = Harness::builder()
+    let mut harness = test_ui::builder()
         .with_size(egui::vec2(width, 160.0))
         .build(move |ctx| {
             mimageviewer::os_theme::apply_resolved(
@@ -880,6 +883,33 @@ fn preferences_transfer_entry_disabled_dark() {
         "preferences_transfer_entry_disabled_dark",
         mimageviewer::os_theme::ResolvedTheme::Dark,
         mimageviewer::draw_preferences_transfer_disabled_entry_snapshot_fixture,
+    );
+}
+
+#[test]
+fn file_type_visibility_preferences_dark() {
+    snapshot_with_theme_contrast_and_size(
+        "file_type_visibility_preferences_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::Standard,
+        egui::vec2(760.0, 700.0),
+        mimageviewer::draw_file_type_visibility_snapshot_fixture,
+    );
+}
+
+#[test]
+fn file_type_visibility_status_dark() {
+    use egui_kittest::kittest::Queryable;
+    snapshot_with_theme_contrast_and_size_with_interaction(
+        "file_type_visibility_status_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::Standard,
+        egui::vec2(760.0, 400.0),
+        mimageviewer::draw_file_type_visibility_status_snapshot_fixture,
+        |harness| {
+            harness.get_by_label("非表示 10 件").click();
+            harness.run();
+        },
     );
 }
 
@@ -1066,7 +1096,7 @@ fn snapshot_file_organize_modal(
     )>,
 ) {
     let mut fonts_ready = false;
-    let mut harness = Harness::builder().with_size(size).build(move |ctx| {
+    let mut harness = test_ui::builder().with_size(size).build(move |ctx| {
         mimageviewer::os_theme::apply_resolved_with_contrast(
             ctx,
             theme,
@@ -1278,7 +1308,7 @@ fn snapshot_with_theme_options(
     interact: impl FnOnce(&mut Harness<'_>),
 ) {
     let mut fonts_ready = false;
-    let mut harness = Harness::builder().with_size(size).build(move |ctx| {
+    let mut harness = test_ui::builder().with_size(size).build(move |ctx| {
         mimageviewer::os_theme::apply_resolved_with_contrast(ctx, resolved, contrast);
         if !fonts_ready {
             install_app_fonts(ctx);
@@ -1311,7 +1341,7 @@ fn snapshot_with_ui_font(
     mut build_ui: impl FnMut(&mut egui::Ui),
 ) {
     let mut fonts_ready = false;
-    let mut harness = Harness::builder()
+    let mut harness = test_ui::builder()
         .with_size(egui::vec2(480.0, 260.0))
         .build(move |ctx| {
             mimageviewer::os_theme::apply_resolved(
@@ -2885,7 +2915,7 @@ fn content_restore_prompt_long_paths() {
     let mut dont_ask_again = false;
     let mut fonts_ready = false;
     const WINDOW_SIZE: egui::Vec2 = egui::vec2(980.0, 600.0);
-    let mut harness = Harness::builder().with_size(WINDOW_SIZE).build(move |ctx| {
+    let mut harness = test_ui::builder().with_size(WINDOW_SIZE).build(move |ctx| {
         mimageviewer::os_theme::apply_resolved(ctx, mimageviewer::os_theme::ResolvedTheme::Light);
         if !fonts_ready {
             install_app_fonts(ctx);
@@ -2955,7 +2985,7 @@ fn content_restore_prompt_light() {
     ];
     let mut dont_ask_again = false;
     let mut fonts_ready = false;
-    let mut harness = Harness::builder()
+    let mut harness = test_ui::builder()
         .with_size(egui::vec2(980.0, 600.0))
         .build(move |ctx| {
             mimageviewer::os_theme::apply_resolved(

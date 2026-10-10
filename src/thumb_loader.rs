@@ -48,6 +48,16 @@ pub(crate) fn request_worker_priority_key(
 }
 
 impl LoadRequest {
+    /// A derived source still completes the outer UI request, including its row.
+    fn inherit_request_identity_from(&mut self, outer: &Self) {
+        self.idx = outer.idx;
+        self.request_id = outer.request_id;
+        self.items_gen = outer.items_gen;
+        self.input_seq = outer.input_seq;
+        self.context_epoch = outer.context_epoch;
+        self.priority = outer.priority;
+    }
+
     /// The source variant owns this distinction; idx is unused for catalog work.
     pub(crate) fn grid_index(&self) -> Option<usize> {
         match self.raw_source {
@@ -180,7 +190,13 @@ pub const CACHE_KEY_SEARCH_REP: &str = "searchrep:";
 /// 詳細: [docs/auto-thumb-aspect-plan.md §4.1.2](../../docs/auto-thumb-aspect-plan.md)
 pub fn cache_key_for_request(req: &LoadRequest) -> Option<std::borrow::Cow<'_, str>> {
     if let Some(ref key) = req.cache_key_override {
-        Some(std::borrow::Cow::Borrowed(key.as_str()))
+        if is_representative_cache_key(key) {
+            Some(std::borrow::Cow::Owned(
+                representative_cache_key_for_policy(key, &req.file_type_visibility),
+            ))
+        } else {
+            Some(std::borrow::Cow::Borrowed(key.as_str()))
+        }
     } else if let Some(page_num) = req.pdf_page {
         Some(std::borrow::Cow::Owned(
             crate::grid_item::pdf_page_cache_key(page_num),
@@ -193,6 +209,169 @@ pub fn cache_key_for_request(req: &LoadRequest) -> Option<std::borrow::Cow<'_, s
             .and_then(|n| n.to_str())
             .map(std::borrow::Cow::Borrowed)
     }
+}
+
+fn is_representative_cache_key(key: &str) -> bool {
+    [
+        CACHE_KEY_FOLDER,
+        CACHE_KEY_ZIP,
+        CACHE_KEY_PDF,
+        CACHE_KEY_ARCHIVE,
+        CACHE_KEY_SEARCH_REP,
+        "zipdir:",
+    ]
+    .into_iter()
+    .any(|prefix| key.starts_with(prefix))
+}
+
+/// Policy values belong to derived representative caches; individual page/image decode caches
+/// retain their released keys. The all-visible policy may reuse released representative rows.
+pub fn representative_cache_key_for_policy(
+    key: &str,
+    policy: &crate::file_type_visibility::FileTypeVisibility,
+) -> String {
+    if !is_representative_cache_key(key) {
+        return key.to_owned();
+    }
+    let split = key.find(CACHE_KEY_PIN_SUFFIX).unwrap_or(key.len());
+    let (base, pin) = key.split_at(split);
+    let base = base
+        .rsplit_once("|types:")
+        .filter(|(_, fingerprint)| {
+            fingerprint.len() == 16 && fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        .map_or(base, |(base, _)| base);
+    if policy.is_all_visible() {
+        format!("{base}{pin}")
+    } else {
+        let suffix = format!("|types:{:016x}", policy.fingerprint());
+        format!("{base}{suffix}{pin}")
+    }
+}
+
+pub fn resolved_pin_allowed(
+    target: &crate::folder_thumb_pins::ResolvedPinTarget,
+    policy: &crate::file_type_visibility::FileTypeVisibility,
+) -> bool {
+    use crate::file_type_visibility::FileTypeCategory as C;
+    use crate::folder_thumb_pins::ResolvedKind as K;
+    match target.kind {
+        K::Folder => true,
+        K::Image => policy.allows_path(
+            if crate::raw_format::is_raw_path(&target.abs_path) {
+                C::Raw
+            } else {
+                C::Image
+            },
+            &target.abs_path,
+        ),
+        K::Video => policy.allows_path(C::Video, &target.abs_path),
+        K::ZipEntry => {
+            policy.allows_physical_file(&target.abs_path)
+                && target
+                    .zip_entry
+                    .as_deref()
+                    .is_some_and(|entry| policy.allows_physical_file(Path::new(entry)))
+        }
+        K::ZipFirstImage | K::ArchiveFirstImage | K::ZipDirRepresentative => {
+            policy.allows_physical_file(&target.abs_path)
+        }
+        K::PdfFirstPage | K::PdfPage => policy.allows_path(
+            if is_epub_path(&target.abs_path) {
+                C::Epub
+            } else {
+                C::Pdf
+            },
+            &target.abs_path,
+        ),
+    }
+}
+
+pub fn folder_pin_source_allowed(
+    container: &Path,
+    source: &crate::folder_thumb_pins::FolderPinSource,
+    policy: &crate::file_type_visibility::FileTypeVisibility,
+) -> bool {
+    use crate::file_type_visibility::FileTypeCategory as C;
+    use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+    match source {
+        FolderPinSource::File { rel, kind } => {
+            let path = container.join(rel);
+            match kind {
+                FileKind::Folder => true,
+                FileKind::Image => policy.allows_path(
+                    if crate::raw_format::is_raw_path(&path) {
+                        C::Raw
+                    } else {
+                        C::Image
+                    },
+                    &path,
+                ),
+                FileKind::Video => policy.allows_path(C::Video, &path),
+                FileKind::ZipFile => policy.allows_path(C::Zip, &path),
+                FileKind::PdfFile => {
+                    policy.allows_path(if is_epub_path(&path) { C::Epub } else { C::Pdf }, &path)
+                }
+                FileKind::ConvertibleArchive => policy.allows_physical_file(&path),
+            }
+        }
+        FolderPinSource::ZipEntry { zip_rel, entry } => {
+            let path = if zip_rel.is_empty() {
+                container.to_path_buf()
+            } else {
+                container.join(zip_rel)
+            };
+            policy.allows_physical_file(&path) && policy.allows_physical_file(Path::new(entry))
+        }
+        FolderPinSource::ZipDir { zip_rel, .. } => {
+            policy.allows_physical_file(&container.join(zip_rel))
+        }
+        FolderPinSource::PdfPage { pdf_rel, .. } => {
+            let path = if pdf_rel.is_empty() {
+                container.to_path_buf()
+            } else {
+                container.join(pdf_rel)
+            };
+            policy.allows_path(if is_epub_path(&path) { C::Epub } else { C::Pdf }, &path)
+        }
+    }
+}
+
+/// Run only on the direct pin's source worker. Catalog-only parent/drive reads rely on the
+/// policy-scoped row written by that worker and never reopen an archive to choose a winner.
+fn policy_archive_pin_visible(req: &LoadRequest, cancel: Option<&AtomicBool>) -> bool {
+    if let Some(entry) = req.zip_entry.as_deref() {
+        if !req
+            .file_type_visibility
+            .allows_physical_file(Path::new(entry))
+        {
+            return false;
+        }
+        if !req.file_type_visibility.requires_archive_origins() {
+            return true;
+        }
+    }
+    let Ok(enumeration) =
+        crate::zip_loader::enumerate_image_entries_detailed_with_cancel(&req.path, cancel)
+    else {
+        return false;
+    };
+    enumeration.entries.iter().any(|entry| {
+        req.zip_entry
+            .as_deref()
+            .is_none_or(|name| entry.entry_name == name)
+            && req
+                .zip_dir_prefix
+                .as_deref()
+                .is_none_or(|prefix| entry.entry_name.starts_with(prefix))
+            && req
+                .file_type_visibility
+                .allows_physical_file(Path::new(&entry.entry_name))
+            && entry
+                .container_ancestry
+                .iter()
+                .all(|origin| origin.allows(&req.file_type_visibility))
+    })
 }
 
 /// フォルダ代表サムネの自動選定用 cache key を組み立てる。
@@ -550,6 +729,8 @@ pub struct LoadRequest {
     pub request_id: ThumbnailRequestId,
     /// 通常画像ならファイルパス、ZIP 画像なら ZIP ファイルのパス
     pub path: std::path::PathBuf,
+    /// Immutable listing policy captured with the request and its representative cache identity.
+    pub file_type_visibility: crate::file_type_visibility::FileTypeVisibility,
     /// manifest relative page の trust root。Some の通常画像は path から直接読まず、
     /// open 済みハンドルを containment 検証した後の bytes だけを decoder へ渡す。
     pub relative_page_provenance: Option<crate::book_bookmarks::RelativePageProvenance>,
@@ -599,9 +780,8 @@ pub struct LoadRequest {
     /// 明示ピンだけを解決する特殊要求。未解決 / Folder leaf はアイコン fallback
     /// に倒し、通常フォルダ代表探索には進ませない。
     pub pinned_only: Option<PinnedOnlyRequest>,
-    /// The original automatic folder request. Only an EPUB page pin carries
-    /// this; a missing conversion/source is resolved on the worker and then
-    /// follows the same auto-representative path as an unresolved PDF pin.
+    /// Original automatic request for worker-resolved EPUB or policy-excluded archive pins.
+    /// The pin registration remains intact; only its effective representative changes.
     pub epub_pin_fallback: Option<Box<LoadRequest>>,
     /// CachePolicy に関係なく、このリクエストの結果を catalog に保存する。
     /// ドライブ直下フォルダの明示ピン代表など、後段の cache-only 表示がユーザーの
@@ -873,7 +1053,17 @@ pub(crate) fn remote_raw_thumbnail_requirement(
     if let Some(sort) = req.folder_thumb_sort
         && path.is_dir()
     {
-        match resolve_folder_thumb_image(&path, sort, req.folder_thumb_depth, pin_db) {
+        match select_folder_thumb_image_with_policy(
+            &path,
+            sort,
+            req.folder_thumb_depth,
+            pin_db,
+            &crate::catalog::default_cache_dir(),
+            None,
+            &req.file_type_visibility,
+        )
+        .0
+        {
             Some(FolderThumbResolution::Image(selected)) => path = selected,
             Some(FolderThumbResolution::CachedPinned(cached)) => {
                 path = cached.source_path;
@@ -890,6 +1080,7 @@ pub(crate) fn remote_raw_thumbnail_requirement(
             return RemoteRawThumbRequirement::NotRaw;
         };
         crate::zip_tree::ZipTree::build(path.clone(), entries)
+            .project(&req.file_type_visibility)
             .representative_for_prefix_str(
                 prefix,
                 req.folder_thumb_sort
@@ -908,7 +1099,7 @@ pub(crate) fn remote_raw_thumbnail_requirement(
                     crate::folder_tree::is_zip_extension(&extension.to_ascii_lowercase())
                 }))
     {
-        crate::zip_loader::read_first_image_bytes(&path).map(|(entry, _)| entry)
+        crate::zip_loader::first_visible_image_entry(&path, None, &req.file_type_visibility)
     } else {
         None
     };
@@ -1631,6 +1822,11 @@ fn send_pinned_only_cached(
     catalog: Option<&crate::catalog::CatalogDb>,
     cancel: Option<&Arc<AtomicBool>>,
 ) -> bool {
+    if !folder_pin_source_allowed(&req.path, &pin.source, &req.file_type_visibility) {
+        return false;
+    }
+    let cache_key_prefix =
+        representative_cache_key_for_policy(&pin.cache_key_prefix, &req.file_type_visibility);
     let canceled = || cancel.is_some_and(|flag| flag.load(Ordering::Acquire));
     if canceled() {
         return false;
@@ -1654,14 +1850,14 @@ fn send_pinned_only_cached(
         // child pin, PDF generation, and exact writer key are resolved. The
         // following exact lookup is authoritative and replaces or rejects it.
         let preview = if let Some(db) = resumed.as_ref() {
-            db.load_latest_with_prefix(&pin.cache_key_prefix)
+            db.load_latest_with_prefix(&cache_key_prefix)
                 .ok()
                 .flatten()
                 .map(|(_, entry)| entry)
         } else {
             cache_map.read().ok().and_then(|map| {
                 map.iter()
-                    .filter(|(key, _)| key.starts_with(&pin.cache_key_prefix))
+                    .filter(|(key, _)| key.starts_with(&cache_key_prefix))
                     .max_by_key(|(_, entry)| (entry.mtime, entry.file_size))
                     .map(|(_, entry)| entry.clone())
             })
@@ -1728,53 +1924,51 @@ fn send_pinned_only_cached(
         None => None,
     };
     let cached = if let Some(db) = resumed.as_ref() {
-        db.load_latest_with_prefix_matching(&pin.cache_key_prefix, epub_stamp)
+        db.load_latest_with_prefix_matching(&cache_key_prefix, epub_stamp)
             .ok()
             .flatten()
-            .map(|(key, entry)| {
-                (
-                    key,
-                    entry.jpeg_data,
-                    entry.source_dims,
-                    entry.layout_dims,
-                    entry.mtime,
-                    entry.file_size,
-                )
-            })
     } else {
         cache_map.read().ok().and_then(|map| {
             map.iter()
                 .filter(|(key, entry)| {
-                    key.starts_with(&pin.cache_key_prefix)
+                    key.starts_with(&cache_key_prefix)
                         && epub_stamp.is_none_or(|(mtime, size)| {
                             entry.mtime == mtime && entry.file_size == size
                         })
                 })
                 .max_by_key(|(_, entry)| (entry.mtime, entry.file_size))
-                .map(|(key, entry)| {
-                    (
-                        key.clone(),
-                        entry.jpeg_data.clone(),
-                        entry.source_dims,
-                        entry.layout_dims,
-                        entry.mtime,
-                        entry.file_size,
-                    )
-                })
+                .map(|(key, entry)| (key.clone(), entry.clone()))
         })
     };
     if canceled() {
         return false;
     }
+    let cached = cached.filter(|(key, entry)| {
+        let mut seed_request = req.clone();
+        seed_request.cache_key_override = Some(key.clone());
+        seed_request.folder_thumb_provenance = Some(crate::catalog::FolderThumbProvenance::Seeded);
+        folder_cached_row_usable(&seed_request, entry, pin_db)
+    });
 
-    let Some((filename, webp_data, source_dims, layout_dims, mtime, file_size)) = cached else {
+    let Some((filename, entry)) = cached else {
         crate::logger::log(format!(
             "drive-list pin: cached thumbnail missing ({})",
             pin.cache_key_prefix
         ));
         return false;
     };
+    let crate::catalog::CacheEntry {
+        jpeg_data: webp_data,
+        source_dims,
+        layout_dims,
+        mtime,
+        file_size,
+        ..
+    } = entry;
 
+    if canceled() {
+        return false;
+    }
     let ci = crate::catalog::decode_thumb_to_color_image(&webp_data);
     let _ = tx.send(
         ThumbMsg::from_legacy_parts(
@@ -1823,14 +2017,17 @@ fn send_pinned_child_folder_cached(
     };
     let use_full_path = crate::path_key::is_drive_or_share_root(&req.path);
     let source = pin_db.and_then(|db| db.lookup(&child));
-    let resolved = source.as_ref().and_then(|source| {
-        crate::folder_thumb_pins::resolve_pin_target_cascaded_via(
-            &child,
-            source,
-            |path| pin_db.and_then(|db| db.lookup(path)),
-            req.folder_thumb_depth as usize,
-        )
-    });
+    let resolved = source
+        .as_ref()
+        .and_then(|source| {
+            crate::folder_thumb_pins::resolve_pin_target_cascaded_via(
+                &child,
+                source,
+                |path| pin_db.and_then(|db| db.lookup(path)),
+                req.folder_thumb_depth as usize,
+            )
+        })
+        .filter(|target| resolved_pin_allowed(target, &req.file_type_visibility));
     // The folder writer falls back to its automatic representative when a pin
     // target disappears. Read that exact auto row in the cache-only path too.
     let provenance = if resolved
@@ -1873,6 +2070,7 @@ fn send_pinned_child_folder_cached(
         || base_key.clone(),
         |target| pinned_folder_row_key(&base_key, &target.source_id, generation),
     );
+    let key = representative_cache_key_for_policy(&key, &req.file_type_visibility);
     let local;
     let catalog = if let Some(resumed) = resumed {
         resumed
@@ -1896,16 +2094,13 @@ fn send_pinned_child_folder_cached(
     if canceled() {
         return false;
     }
-    if provenance == crate::catalog::FolderThumbProvenance::AutoSelected {
-        // The ordinary child-folder read owns auto-row proof validation:
-        // winner state, pin revision, and every folder/catalog dependency.
-        let mut child_request = req.clone();
-        child_request.path = child;
-        child_request.cache_key_override = Some(key.clone());
-        child_request.folder_thumb_provenance = Some(provenance);
-        if !folder_cached_row_usable(&child_request, &entry, pin_db) {
-            return false;
-        }
+    // Includes a policy-scoped automatic fallback for an excluded nested leaf pin.
+    let mut child_request = req.clone();
+    child_request.path = child;
+    child_request.cache_key_override = Some(key.clone());
+    child_request.folder_thumb_provenance = Some(provenance);
+    if !folder_cached_row_usable(&child_request, &entry, pin_db) {
+        return false;
     }
     if let Some(target) = resolved.as_ref() {
         let (mtime, size) = generation.unwrap_or((target.mtime, target.file_size));
@@ -2000,6 +2195,9 @@ pub fn process_load_request(
     adjustment_db: Option<&crate::adjustment_db::AdjustmentDb>,
     raw_handoff: Option<&RawThumbHandoff>,
 ) {
+    if let Some(key) = req.cache_key_override.as_mut() {
+        *key = representative_cache_key_for_policy(key, &req.file_type_visibility);
+    }
     if let LoadRequestSource::AudioThumbnail(audio) = &req.raw_source {
         // Display/ordering stamps (notably bookmarks/history) never participate in Audio source identity.
         let should_cancel = || {
@@ -2145,14 +2343,55 @@ pub fn process_load_request(
         return;
     }
 
+    if !req.file_type_visibility.is_all_visible()
+        && req.source_policy.allows_source()
+        && req.epub_pin_fallback.is_some()
+        && req
+            .cache_key_override
+            .as_deref()
+            .is_some_and(|key| key.contains(CACHE_KEY_PIN_SUFFIX))
+        && (req.zip_entry.is_some()
+            || matches!(
+                req.resolve_override,
+                Some(ResolveStrategy::ZipDirRepresentative | ResolveStrategy::ZipFirstImage)
+            ))
+        && !policy_archive_pin_visible(req, cancel.map(AsRef::as_ref))
+    {
+        let mut fallback = req.epub_pin_fallback.as_deref().unwrap().clone();
+        fallback.inherit_request_identity_from(req);
+        // Keep the writer/reader pin route and stamp: parent and drive consumers must find
+        // the completed automatic projection without inspecting archive ancestry themselves.
+        fallback.cache_key_override = req.cache_key_override.clone();
+        fallback.mtime = req.mtime;
+        fallback.file_size = req.file_size;
+        fallback.force_cache = req.force_cache;
+        process_load_request(
+            &mut fallback,
+            cache_map,
+            tx,
+            catalog,
+            thumb_px,
+            thumb_quality,
+            display_px,
+            cache_decision,
+            gen_done,
+            stats,
+            cancel,
+            keep_start,
+            keep_end,
+            still_seek_thumbnail_pages,
+            pin_db,
+            edit_preview_db,
+            adjustment_db,
+            raw_handoff,
+        );
+        return;
+    }
+
     let fallback_or_fail = || {
         if let Some(fallback) = req.epub_pin_fallback.as_deref() {
             let mut fallback = fallback.clone();
-            fallback.request_id = req.request_id;
-            fallback.items_gen = req.items_gen;
-            fallback.input_seq = req.input_seq;
-            fallback.context_epoch = req.context_epoch;
-            fallback.priority = req.priority;
+            fallback.inherit_request_identity_from(req);
             process_load_request(
                 &mut fallback,
                 cache_map,
@@ -2473,7 +2712,7 @@ pub fn process_load_request(
     let (resolved_folder_image, cached_pinned_folder_thumb, folder_selection_proof) =
         if is_folder_thumb {
             let t_resolve = std::time::Instant::now();
-            let (resolution, proof) = select_folder_thumb_image_with_cache_dir(
+            let (resolution, proof) = select_folder_thumb_image_with_policy(
                 &req.path,
                 req.folder_thumb_sort
                     .unwrap_or(crate::settings::SortOrder::Numeric),
@@ -2481,6 +2720,7 @@ pub fn process_load_request(
                 pin_db,
                 &crate::catalog::default_cache_dir(),
                 cancel,
+                &req.file_type_visibility,
             );
             let resolve_ms = t_resolve.elapsed().as_secs_f64() * 1000.0;
             if resolve_ms > 10.0 {
@@ -2539,7 +2779,8 @@ pub fn process_load_request(
             // フォルダ一覧のサムネ生成段階で済ませると、ZIP を開く前にピン/★ が直る。
             crate::zip_key_migration::migrate_if_needed(&req.path, &enumeration.legacy_renames);
             let entries = enumeration.entries;
-            let tree = crate::zip_tree::ZipTree::build(req.path.clone(), entries);
+            let tree = crate::zip_tree::ZipTree::build(req.path.clone(), entries)
+                .project(&req.file_type_visibility);
             tree.representative_for_prefix_str(
                 prefix,
                 req.folder_thumb_sort
@@ -2600,7 +2841,21 @@ pub fn process_load_request(
         // cache_key_override あり + pdf_page なし + フォルダでない = ZipFile サムネイル
         // ZIP を 1 回だけ開いてエントリ名 + バイト列を同時取得
         let t_zip = std::time::Instant::now();
-        match crate::zip_loader::read_first_image_bytes(&req.path) {
+        let first = if req.file_type_visibility.is_all_visible() {
+            crate::zip_loader::read_first_image_bytes(&req.path)
+        } else {
+            crate::zip_loader::first_visible_image_entry(
+                &req.path,
+                cancel.map(|token| token.as_ref()),
+                &req.file_type_visibility,
+            )
+            .and_then(|name| {
+                crate::zip_loader::read_entry_bytes(&req.path, &name)
+                    .ok()
+                    .map(|bytes| (name, bytes))
+            })
+        };
+        match first {
             Some((name, bytes)) => {
                 let zip_ms = t_zip.elapsed().as_secs_f64() * 1000.0;
                 crate::logger::log(format!(
@@ -3596,6 +3851,8 @@ fn selection_stamp_hooks()
 
 struct FolderResolveContext<'a> {
     cache_dir: &'a Path,
+    policy: &'a crate::file_type_visibility::FileTypeVisibility,
+    pin_db: Option<&'a crate::folder_thumb_pins::FolderThumbPinDb>,
     cancel: Option<&'a Arc<AtomicBool>>,
     catalogs: std::collections::HashMap<std::path::PathBuf, Option<crate::catalog::CatalogDb>>,
     dependencies: Vec<crate::catalog::CatalogProofDependency>,
@@ -3736,15 +3993,57 @@ impl FolderResolveContext<'_> {
         if (entry.mtime, entry.file_size) != (expected_mtime, expected_size) {
             return None;
         }
+        if entry.folder_provenance == Some(crate::catalog::FolderThumbProvenance::AutoSelected) {
+            let automatic = LoadRequest {
+                cache_key_override: Some(key.to_owned()),
+                folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::AutoSelected),
+                file_type_visibility: self.policy.clone(),
+                ..Default::default()
+            };
+            if !folder_cached_row_usable_in_cache_dir_with_pins(
+                &automatic,
+                &entry,
+                self.cache_dir,
+                self.pin_db,
+            ) {
+                return None;
+            }
+        }
+        let (source_path, source_mtime, source_file_size) = if let Some(proof) =
+            entry.selection_proof.as_ref()
+            && entry.folder_provenance == Some(crate::catalog::FolderThumbProvenance::AutoSelected)
+        {
+            // A parent proof must inherit the automatic fallback's true winning source and
+            // dependencies, rather than monitoring only the excluded pin's archive stamp.
+            for dependency in &proof.directories {
+                self.record_dependency(&dependency.directory, dependency.state.clone());
+            }
+            if let crate::catalog::PinStoreProof::Observed(state) = &proof.pin_store {
+                match self.pin_store.as_ref() {
+                    None => self.pin_store = Some(state.clone()),
+                    Some(previous) if previous != state => {
+                        self.pin_store = Some(crate::catalog::CatalogProofState::Unverifiable)
+                    }
+                    _ => {}
+                }
+            }
+            (
+                proof.winner.path.clone(),
+                proof.winner.mtime,
+                proof.winner.file_size,
+            )
+        } else {
+            (source_path.to_path_buf(), expected_mtime, expected_size)
+        };
         let image = crate::catalog::decode_thumb_to_color_image(&entry.jpeg_data)?;
         Some(CachedPinnedFolderThumb {
             image,
             webp_data: entry.jpeg_data,
             source_dims: entry.source_dims,
             layout_dims: entry.layout_dims,
-            source_path: source_path.to_path_buf(),
-            source_mtime: expected_mtime,
-            source_file_size: expected_size,
+            source_path,
+            source_mtime,
+            source_file_size,
             cache_key: key.to_owned(),
         })
     }
@@ -3782,6 +4081,23 @@ fn folder_cached_row_usable_in_cache_dir_with_pins(
     match req.folder_thumb_provenance {
         None => true,
         Some(FolderThumbProvenance::Seeded) => {
+            if entry.folder_provenance == Some(FolderThumbProvenance::AutoSelected)
+                && !req.file_type_visibility.is_all_visible()
+                && req.cache_key_override.as_deref().is_some_and(|key| {
+                    key.contains(&format!(
+                        "|types:{:016x}{CACHE_KEY_PIN_SUFFIX}",
+                        req.file_type_visibility.fingerprint()
+                    ))
+                })
+            {
+                // A policy-excluded archive pin can be served by an automatic folder result
+                // under the same pinned writer key. Validate its complete automatic proof.
+                let mut automatic = req.clone();
+                automatic.folder_thumb_provenance = Some(FolderThumbProvenance::AutoSelected);
+                return folder_cached_row_usable_in_cache_dir_with_pins(
+                    &automatic, entry, cache_dir, pin_db,
+                );
+            }
             // Released leaf-pin and video-frame rows have no provenance field.
             entry.folder_provenance != Some(FolderThumbProvenance::AutoSelected)
         }
@@ -3894,6 +4210,7 @@ fn load_cached_pinned_folder_thumb(
             (resolved.mtime, resolved.file_size, None)
         };
     let cache_key = pinned_folder_row_key(&base_key, &resolved.source_id, generation);
+    let cache_key = representative_cache_key_for_policy(&cache_key, context.policy);
     context.cached_candidate(parent_folder, &cache_key, &resolved.abs_path, mtime, size)
 }
 
@@ -3943,8 +4260,33 @@ fn select_folder_thumb_image_with_cache_dir(
     Option<FolderThumbResolution>,
     Option<crate::catalog::FolderSelectionProof>,
 ) {
+    select_folder_thumb_image_with_policy(
+        folder,
+        sort,
+        remaining_depth,
+        pin_db,
+        cache_dir,
+        cancel,
+        &crate::file_type_visibility::FileTypeVisibility::default(),
+    )
+}
+
+fn select_folder_thumb_image_with_policy(
+    folder: &Path,
+    sort: crate::settings::SortOrder,
+    remaining_depth: u32,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+    cache_dir: &Path,
+    cancel: Option<&Arc<AtomicBool>>,
+    policy: &crate::file_type_visibility::FileTypeVisibility,
+) -> (
+    Option<FolderThumbResolution>,
+    Option<crate::catalog::FolderSelectionProof>,
+) {
     let mut context = FolderResolveContext {
         cache_dir,
+        policy,
+        pin_db,
         cancel,
         catalogs: std::collections::HashMap::new(),
         dependencies: Vec::new(),
@@ -4094,6 +4436,9 @@ fn resolve_folder_thumb_image_inner(
                 expected_stamp: None,
             });
         } else if kind.is_file() {
+            if !context.policy.allows_physical_file(&path) {
+                continue;
+            }
             let ext = path
                 .extension()
                 .and_then(|e| e.to_str())
@@ -4177,7 +4522,7 @@ fn resolve_folder_thumb_image_inner(
         }
         let active_source = context.pin_lookup(pin_db, &candidate.path);
         candidate.has_active_pin = active_source.is_some();
-        candidate.pin = active_source.as_ref().and_then(|source| {
+        let resolved_pin = active_source.as_ref().and_then(|source| {
             crate::folder_thumb_pins::resolve_pin_target_cascaded_via(
                 &candidate.path,
                 source,
@@ -4185,6 +4530,14 @@ fn resolve_folder_thumb_image_inner(
                 configured_depth as usize,
             )
         });
+        // An excluded pin remains registered, but is not an active representative for this policy.
+        if resolved_pin
+            .as_ref()
+            .is_some_and(|target| !resolved_pin_allowed(target, context.policy))
+        {
+            candidate.has_active_pin = false;
+        }
+        candidate.pin = resolved_pin.filter(|target| resolved_pin_allowed(target, context.policy));
         if candidate.is_dir {
             if let Some(pin) = candidate.pin.as_ref()
                 && !matches!(
@@ -4234,6 +4587,9 @@ fn resolve_folder_thumb_image_inner(
                     key.push_str(&format!("|generation:{mtime}:{size}"));
                 }
             }
+        }
+        if let Some(key) = candidate.cache_key.as_mut() {
+            *key = representative_cache_key_for_policy(key, context.policy);
         }
         if context.cancelled() {
             return None;
@@ -7592,6 +7948,293 @@ mod tests {
         crate::catalog::encode_thumb_webp(&image, 8, 75.0)
             .unwrap()
             .0
+    }
+
+    #[test]
+    fn visibility_representative_keys_separate_catalog_seed_without_changing_leaf_decode() {
+        let policy = crate::file_type_visibility::FileTypeVisibility {
+            excluded_extensions: ["png".into()].into_iter().collect(),
+            ..Default::default()
+        };
+        let base = "folderthumb:auto-v3:name:d3:book#pin:image|cover.jpg";
+        let key = representative_cache_key_for_policy(base, &policy);
+        assert_ne!(key, base);
+        assert!(key.contains("|types:"));
+        assert_eq!(key, representative_cache_key_for_policy(&key, &policy));
+        let other = crate::file_type_visibility::FileTypeVisibility {
+            excluded_extensions: ["gif".into()].into_iter().collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            representative_cache_key_for_policy(&key, &other),
+            representative_cache_key_for_policy(base, &other)
+        );
+        assert_eq!(
+            base,
+            representative_cache_key_for_policy(&key, &Default::default())
+        );
+        assert_eq!(
+            base,
+            representative_cache_key_for_policy(base, &Default::default())
+        );
+        let request = LoadRequest {
+            cache_key_override: Some(base.into()),
+            file_type_visibility: policy.clone(),
+            ..Default::default()
+        };
+        assert_eq!(cache_key_for_request(&request).unwrap(), key);
+        let page = LoadRequest {
+            path: "page.jpg".into(),
+            file_type_visibility: policy.clone(),
+            ..Default::default()
+        };
+        assert_eq!(cache_key_for_request(&page).as_deref(), Some("page.jpg"));
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = crate::catalog::CatalogDb::open(tmp.path(), Path::new("book")).unwrap();
+        catalog
+            .save_thumb_bytes(base, 0, 0, Some((8, 8)), &fixture_webp())
+            .unwrap();
+        assert!(
+            catalog.load_one(&key).unwrap().is_none(),
+            "released seed must not cross the policy boundary"
+        );
+    }
+
+    fn visibility_archive_fixture(path: &Path) {
+        use std::io::Write;
+        let mut inner = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        inner
+            .start_file("page.png", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        inner.write_all(b"nested page not decoded").unwrap();
+        let inner = inner.finish().unwrap().into_inner();
+        let mut outer = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        outer
+            .start_file("inner.zip", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        outer.write_all(&inner).unwrap();
+        outer
+            .start_file(
+                "notes.zip/page.png",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        outer.write_all(b"physical directory not decoded").unwrap();
+        outer.finish().unwrap();
+    }
+
+    #[test]
+    fn visibility_pins_use_actual_nested_ancestry_and_keep_suffix_directories() {
+        use crate::folder_thumb_pins::{FolderPinSource, resolve_pin_target};
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("book.cbz");
+        visibility_archive_fixture(&path);
+        let policy = crate::file_type_visibility::FileTypeVisibility {
+            excluded_extensions: ["zip".into()].into_iter().collect(),
+            ..Default::default()
+        };
+        let mut request = LoadRequest {
+            path: path.clone(),
+            file_type_visibility: policy.clone(),
+            zip_entry: Some("inner.zip/page.png".into()),
+            ..Default::default()
+        };
+        assert!(!policy_archive_pin_visible(&request, None));
+        request.zip_entry = Some("notes.zip/page.png".into());
+        assert!(policy_archive_pin_visible(&request, None));
+        let source = FolderPinSource::ZipEntry {
+            zip_rel: "book.cbz".into(),
+            entry: "notes.zip/page.png".into(),
+        };
+        assert!(folder_pin_source_allowed(tmp.path(), &source, &policy));
+        let resolved = resolve_pin_target(tmp.path(), &source).unwrap();
+        assert!(resolved_pin_allowed(&resolved, &policy));
+        let mut outer_hidden = policy;
+        outer_hidden.excluded_extensions.insert("cbz".into());
+        assert!(!folder_pin_source_allowed(
+            tmp.path(),
+            &source,
+            &outer_hidden
+        ));
+        assert!(!resolved_pin_allowed(&resolved, &outer_hidden));
+    }
+
+    #[test]
+    fn visibility_nested_pin_fallback_cache_validates_for_seeded_parent_without_archive_scan() {
+        use crate::catalog::FolderThumbProvenance as P;
+        use crate::folder_thumb_pins::{FolderPinSource, resolve_pin_target};
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let winner = root.join("cover.png");
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([20_u8, 80, 160, 255]))
+            .save(&winner)
+            .unwrap();
+        let archive = root.join("book.cbz");
+        visibility_archive_fixture(&archive);
+        let source = FolderPinSource::ZipEntry {
+            zip_rel: "book.cbz".into(),
+            entry: "inner.zip/page.png".into(),
+        };
+        let resolved = resolve_pin_target(&root, &source).unwrap();
+        let policy = crate::file_type_visibility::FileTypeVisibility {
+            excluded_extensions: ["zip".into()].into_iter().collect(),
+            ..Default::default()
+        };
+        let key = format!(
+            "{}#pin:{}",
+            folder_thumb_cache_key_for_path(&root, false, SortOrder::Numeric, 3, P::Seeded)
+                .unwrap(),
+            resolved.source_id
+        );
+        let catalog = Arc::new(
+            crate::catalog::CatalogDb::open(&tmp.path().join("cache"), tmp.path()).unwrap(),
+        );
+        let map = std::sync::RwLock::new(std::collections::HashMap::new());
+        let fallback = LoadRequest {
+            idx: 7,
+            path: root.clone(),
+            folder_thumb_sort: Some(SortOrder::Numeric),
+            folder_thumb_depth: 3,
+            folder_thumb_provenance: Some(P::AutoSelected),
+            file_type_visibility: policy.clone(),
+            source_policy: LoadSourcePolicy::SourceOnly,
+            ..Default::default()
+        };
+        let mut request = LoadRequest {
+            request_id: ThumbnailRequestId::Registered(1360),
+            items_gen: 19,
+            input_seq: 12,
+            context_epoch: 73,
+            priority: true,
+            path: archive.clone(),
+            zip_entry: Some("inner.zip/page.png".into()),
+            cache_key_override: Some(key.clone()),
+            mtime: resolved.mtime,
+            file_size: resolved.file_size,
+            file_type_visibility: policy.clone(),
+            source_policy: LoadSourcePolicy::SourceOnly,
+            force_cache: true,
+            folder_thumb_provenance: Some(P::Seeded),
+            epub_pin_fallback: Some(Box::new(fallback)),
+            ..Default::default()
+        };
+        let (tx, rx) = mpsc::channel();
+        let done = Arc::new(AtomicUsize::new(0));
+        process_load_request(
+            &mut request,
+            &map,
+            &tx,
+            Some(&catalog),
+            64,
+            75,
+            64,
+            make_decision(CachePolicy::Always, 0, 0),
+            &done,
+            &Arc::new(Mutex::new(crate::stats::ThumbStats::default())),
+            None,
+            &Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(1)),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let messages: Vec<_> = rx.try_iter().collect();
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(
+            messages[0].payload,
+            ThumbMsgPayload::SourcePixels(_)
+        ));
+        assert!(matches!(messages[1].payload, ThumbMsgPayload::Finalized));
+        for message in messages {
+            assert_eq!(message.idx, request.idx);
+            assert_eq!(message.request_id, request.request_id);
+            assert_eq!(message.items_gen, request.items_gen);
+            assert_eq!(message.input_seq, request.input_seq);
+        }
+        assert_eq!(done.load(Ordering::Relaxed), 1);
+        let scoped_key = representative_cache_key_for_policy(&key, &policy);
+        let entry = catalog.load_one(&scoped_key).unwrap().unwrap();
+        assert_eq!(
+            (entry.mtime, entry.file_size),
+            (resolved.mtime, resolved.file_size)
+        );
+        assert_eq!(entry.folder_provenance, Some(P::AutoSelected));
+        assert_eq!(entry.selection_proof.as_ref().unwrap().winner.path, winner);
+        assert!(catalog.load_one(&key).unwrap().is_none());
+        request.cache_key_override = Some(scoped_key);
+        // Pure proof validation must not enumerate the archive. Removing the winning image,
+        // independently of the requested pin stamp, invalidates this automatic fallback.
+        assert!(folder_cached_row_usable_in_cache_dir(
+            &request,
+            &entry,
+            &tmp.path().join("cache")
+        ));
+        let pins = crate::folder_thumb_pins::FolderThumbPinDb::open_at(&tmp.path().join("pins.db"))
+            .unwrap();
+        pins.set(&root, &source).unwrap();
+        let (parent_result, parent_proof) = select_folder_thumb_image_with_policy(
+            tmp.path(),
+            SortOrder::Numeric,
+            3,
+            Some(&pins),
+            &tmp.path().join("cache"),
+            None,
+            &policy,
+        );
+        let Some(FolderThumbResolution::CachedPinned(parent_result)) = parent_result else {
+            panic!("parent must use the completed same-policy fallback catalog row");
+        };
+        assert_eq!(parent_result.source_path, winner);
+        assert_eq!(parent_proof.unwrap().winner.path, winner);
+        let mut all_visible = request.clone();
+        all_visible.file_type_visibility = Default::default();
+        assert!(!folder_cached_row_usable_in_cache_dir(
+            &all_visible,
+            &entry,
+            &tmp.path().join("cache")
+        ));
+        std::fs::remove_file(&winner).unwrap();
+        assert!(!folder_cached_row_usable_in_cache_dir(
+            &request,
+            &entry,
+            &tmp.path().join("cache")
+        ));
+    }
+
+    #[test]
+    fn visibility_folder_auto_skips_hidden_image_and_preserves_hidden_child_pin() {
+        use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let child = root.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("1.png"), b"hidden").unwrap();
+        std::fs::write(child.join("2.jpg"), b"visible").unwrap();
+        let pins = crate::folder_thumb_pins::FolderThumbPinDb::open_at(&tmp.path().join("pins.db"))
+            .unwrap();
+        let source = FolderPinSource::File {
+            rel: "1.png".into(),
+            kind: FileKind::Image,
+        };
+        pins.set(&child, &source).unwrap();
+        let policy = crate::file_type_visibility::FileTypeVisibility {
+            excluded_extensions: ["png".into()].into_iter().collect(),
+            ..Default::default()
+        };
+        let (result, _) = select_folder_thumb_image_with_policy(
+            &root,
+            SortOrder::FileName,
+            3,
+            Some(&pins),
+            &tmp.path().join("catalogs"),
+            None,
+            &policy,
+        );
+        assert_eq!(resolved_image_path(result), Some(child.join("2.jpg")));
+        assert_eq!(pins.lookup(&child), Some(source));
     }
 
     #[test]

@@ -7725,7 +7725,7 @@ pub(crate) mod tests {
         );
         let mut picker_open = false;
         let mut fonts_ready = false;
-        let mut harness = egui_kittest::Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1280.0, 720.0))
             .build(move |ctx| {
                 if !fonts_ready {
@@ -7803,7 +7803,7 @@ pub(crate) mod tests {
             let captured = Arc::new(Mutex::new((None::<egui::Rect>, Vec::new())));
             let captured_for_ui = Arc::clone(&captured);
             let mut fonts_ready = false;
-            let mut harness = egui_kittest::Harness::builder()
+            let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1_200.0, 80.0))
                 .build(move |ctx| {
                     if !fonts_ready {
@@ -8059,7 +8059,6 @@ pub(crate) mod tests {
     #[cfg(feature = "test-script")]
     #[test]
     fn native_top_panorama_click_attributes_only_its_exact_response_command_index() {
-        use egui_kittest::Harness;
         use std::sync::{Arc, Mutex};
 
         let metadata = test_overlay_metadata(
@@ -8081,7 +8080,7 @@ pub(crate) mod tests {
         let captured_for_ui = Arc::clone(&captured);
         let metadata_for_ui = Arc::clone(&metadata_state);
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1_200.0, 80.0))
             .build(move |ctx| {
                 if !fonts_ready {
@@ -8514,13 +8513,11 @@ pub(crate) mod tests {
 
     #[test]
     fn native_top_bar_long_title_snapshot() {
-        use egui_kittest::Harness;
-
         let mut fonts_ready = false;
         let title = "【配信クリップ】魔法の姉妹ルルットリリィ・ライブシーン".repeat(3);
         let mut projection_popup_open = false;
         let mut projection_popup_rect = None;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(720.0, 64.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -8567,12 +8564,11 @@ pub(crate) mod tests {
 
     #[test]
     fn native_bar_lock_button_click_emits_the_selected_toggle_command() {
-        use egui_kittest::Harness;
         use std::sync::{Arc, Mutex};
 
         let captured = Arc::new(Mutex::new(Vec::new()));
         let captured_for_ui = Arc::clone(&captured);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(80.0, 80.0))
             .build(move |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
@@ -8621,8 +8617,6 @@ pub(crate) mod tests {
         initial_downscale_smoothing_percent: u32,
         scale_outside_note: Option<String>,
     ) {
-        use egui_kittest::Harness;
-
         let mut fonts_ready = false;
         let mut panel_tab = NativeVideoLeftPanelTab::Adjustment;
         let mut adjustment_tab = adjustment_tab;
@@ -8639,7 +8633,7 @@ pub(crate) mod tests {
             predicted_us: 6_200,
             budget_us: Some(16_700),
         };
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(340.0, 650.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);

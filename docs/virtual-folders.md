@@ -19,7 +19,13 @@ ZIPの全再読込で準備済みprefixが変わる場合はSameLocationでもro
 場所条件は移動時にactive/frame双方から除く。folder/PDF/ZIPのinstall後は履歴とfacetを確定してから
 sidecar hydrationへ進み、metadata復元後のfirst-displayを既存continuationが担当する。
 failed/cancel/staleの未採用移動は表示、履歴、退避状態を変更しない。
-設定項目や保存・読書位置keyは変えず、§1.345のファイル種類除外は実装しない。
+この段階では設定項目や保存・読書位置keyは変えず、§1.345のファイル種類除外を対象外とした。
+後続の§1.345は `FileTypeVisibility` を共通の一覧投影 owner とし、実 entry のネスト書庫来歴と
+変換 cache の origin manifest を使う。拡張子の付いた実 directory は構造 row として保つ。
+読書位置は論理元 container と完全 entry_name の PageIdentity を照合する。
+同じ書庫に実 directory `book.zip/` とネスト書庫 file `book.zip` が共存する同名衝突は非対応
+（2026-10-08 利用者の選択肢(a)）。既存 reader のネスト書庫としての扱いを変えず、
+この衝突を識別する来歴配管・別の永続 key は追加しない。
 
 ## 合成一覧の採用と採用後hydration（§1.339 / §1.347、2026-10-09）
 

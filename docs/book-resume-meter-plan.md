@@ -1,4 +1,4 @@
-# §1.256 一覧の本サムネイルの読書位置メーター — 記録値を表示する設計
+﻿# §1.256 一覧の本サムネイルの読書位置メーター — 記録値を表示する設計
 
 現行の配置方針は、共有設定ONで全セルに固定下端帯を予約し、下端ラベルを一律13 logical pt上へ移す方式 (§5.1 / §14)。代表画像なし・未ロードの検索セルの多行階層パスは上端を元位置に保ち、下端だけ13pt縮めて末端名を優先する。代表画像ありは背景/パスの全体を13pt移動する方式を維持する (§14.4)。帯はセルの左右4pt内側の幅・高さ9 logical ptで、位置記録の有無や媒体種別によって位置・厚さを変えない。通常コピー/移動は既存再生位置と同じく対象外とする利用者決定を維持する。§10〜§13と§14.3の実装・検証記録は各修正時点の履歴として保持し、後続修正の成功証跡には流用しない。
 
@@ -8,6 +8,13 @@
 要件: [next-release-backlog.md §1.256](next-release-backlog.md#1256-一覧の本サムネイルに前回読んだ位置のメーターを表示する--438-2026-09-19)。本書の仕様判断は、2026-10-04の利用者合意によって以前の厳密な内容照合案を置き換える。file:line は調査基準時点のコード事実、追加する型・列・APIは提案である。
 
 ## 0. 合意した設計と前提
+
+2026-10-08追記（§1.345）: 読書位置のoptional PageIdentityとraw-only更新による失効は
+[file-type-visibility-plan.md §5.5](file-type-visibility-plan.md#55-ページidentityによる復元と旧raw記録r3追加q15)を正本とする。
+書庫ページは論理元container＋完全entry_nameで照合する。同じ外側書庫に実directory
+`book.zip/` とネスト書庫file `book.zip` が共存する同名衝突は、利用者の選択肢(a)の決定
+（2026-10-08）により非対応。既存readerのネスト書庫としての扱いを保ち、衝突のための
+来歴配管を追加しない。二つの実体の読書位置を区別して復元する保証はない。
 
 **実装前提の矛盾 (2026-10-04確認): 通常の削除には「移行前にwriterの処理済みを待つ」経路がない。** `rename_migration_writers_busy` (`src/app.rs:40444`) はrename開始 (`:40507`)、purge retry開始 (`:41034`)、明示メタデータ整理 (`src/ui_dialogs/metadata_cleanup.rs:108`)、明示メタデータ転記 (`src/ui_dialogs/metadata_transfer.rs:303`) に使われる。このpredicateにBookResumeWriterを加える決定は実施可能。一方、通常削除の `start_delete_files` (`src/app.rs:41057`) はjournalのadmissionだけを確認 (`:41069`) し、writer待機なしにdelete workerをspawnする。workerはShell削除後、末尾で直接purge (`src/delete_worker.rs:298`) する。`acquire_delete_epub_guard` (`:203`) はEPUBの範囲保護で、BookResumeWriterのRecord完了を待つものではない。このためpredicateへの追加だけでは「未処理Record → 通常delete/purge → 旧keyへのRecord commit」の復活を防げない。
 
