@@ -2098,12 +2098,14 @@ fn parse_startup_open_path_arg_from(args: &[std::ffi::OsString]) -> Option<std::
 }
 
 fn absolutize_startup_open_path(path: std::path::PathBuf) -> std::path::PathBuf {
+    let path = crate::path_key::normalize_input_path(&path);
     if path.is_absolute() {
         return path;
     }
-    std::env::current_dir()
+    let absolute = std::env::current_dir()
         .map(|cwd| cwd.join(&path))
-        .unwrap_or(path)
+        .unwrap_or(path);
+    crate::path_key::normalize_input_path(&absolute)
 }
 
 fn cli_flag_takes_value(flag: &str) -> bool {
@@ -2275,6 +2277,17 @@ mod tests {
         let path = absolutize_startup_open_path(PathBuf::from("book.zip"));
         assert!(path.is_absolute());
         assert!(path.ends_with("book.zip"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn startup_open_path_standardizes_mixed_absolute_path() {
+        let args = os_args(&["mimageviewer.exe", r"g:/home/comfyui\genshin_random"]);
+        let path = absolutize_startup_open_path(parse_startup_open_path_arg_from(&args).unwrap());
+        assert_eq!(
+            path.as_os_str(),
+            std::ffi::OsStr::new(r"G:\home\comfyui\genshin_random")
+        );
     }
 }
 

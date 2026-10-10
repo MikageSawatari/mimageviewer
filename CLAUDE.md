@@ -602,7 +602,7 @@ egui::Window::new("...").show(ctx, |ui| {
   次 = 最初の子 → 次の兄弟 → 祖先の次の兄弟（再帰）。
   前 = 前の兄弟の最後の子孫 → 親。
 - **BS key**: 親フォルダへ。
-- **Path comparison**: Windows の大文字小文字非区別に対応するため小文字化して比較。
+- **Path comparison**: `folder_tree::path_eq` は `path_key::eq_keep_drive` の再公開。ドライブを保持し、大文字小文字と `/`・`\` の表記差を無視する。受理する実パスは I/O なしの `path_key::normalize_input_path` で Windows 標準表記へ揃える。保存キーの規則は変えない。入口と例外は [docs/virtual-folders.md](docs/virtual-folders.md) の「実パスの比較と入力表記」を参照。
 - **AppleDouble 除外**: macOS/iPhone 由来の `._*` ファイルを自動除外。
 
 ### セキュリティ

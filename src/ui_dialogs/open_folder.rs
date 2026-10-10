@@ -100,7 +100,7 @@ impl App {
         if apply {
             let input = self.open_folder_input.trim().to_string();
             if !input.is_empty() {
-                let p = PathBuf::from(&input);
+                let p = crate::path_key::normalize_input_path(std::path::Path::new(&input));
                 if p.exists() {
                     if let Some(resolved) = crate::folder_tree::resolve_openable_path(&p) {
                         result = Some(resolved);

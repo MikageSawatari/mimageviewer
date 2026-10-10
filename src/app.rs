@@ -24471,6 +24471,7 @@ impl App {
         restore_intent: StartupListIntent,
         navigation: MainListNavigation,
     ) -> bool {
+        let path = crate::path_key::normalize_input_path(&path);
         if Self::path_needs_open_classification(&path) {
             return matches!(
                 self.start_open_path_classification_with_navigation(
@@ -27086,6 +27087,7 @@ impl App {
 
         restore_intent: crate::app::StartupListIntent,
     ) -> FolderOpenOutcome {
+        let path = crate::path_key::normalize_input_path(&path);
         if restore_intent.captures_list_departure() {
             self.capture_main_list_restore_cursor();
         }
@@ -27466,6 +27468,7 @@ impl App {
 
         restore_intent: crate::app::StartupListIntent,
     ) -> FolderOpenOutcome {
+        let path = crate::path_key::normalize_input_path(&path);
         if restore_intent.captures_list_departure() {
             self.capture_main_list_restore_cursor();
         }
@@ -31824,6 +31827,7 @@ impl App {
 
         restore_intent: crate::app::StartupListIntent,
     ) -> bool {
+        let path = crate::path_key::normalize_input_path(&path);
         let restore_intent = if matches!(intent, PhysicalHistoryIntent::RequiredFullscreen { .. })
             || dfs_continuation
                 .as_ref()
@@ -46289,6 +46293,10 @@ impl App {
     ///
     /// 完了時のフォルダ再読み込みは `poll_file_drop_pending` が `pending_reload` を立てて行う。
     pub(crate) fn handle_external_file_drop(&mut self, paths: Vec<PathBuf>) {
+        let paths: Vec<_> = paths
+            .iter()
+            .map(|path| crate::path_key::normalize_input_path(path))
+            .collect();
         if paths.is_empty() {
             return;
         }

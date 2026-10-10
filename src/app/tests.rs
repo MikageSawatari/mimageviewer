@@ -4,6 +4,73 @@ use super::*;
 
 #[path = "tests/thumbnail_request_lifecycle.rs"]
 mod thumbnail_request_lifecycle;
+
+#[cfg(windows)]
+#[test]
+fn mixed_path_open_standardizes_live_location_without_rewriting_saved_favorite() {
+    let mut app = phase_c_support::setup_app();
+    let folder = app.tmp.path().join("mixed-input");
+    std::fs::create_dir(&folder).unwrap();
+    let spelling = folder.to_str().unwrap().replace('\\', "/").to_lowercase();
+    let stored = PathBuf::from(&spelling);
+    app.settings
+        .favorites
+        .push(crate::settings::FavoriteEntry::new(
+            "legacy spelling".to_owned(),
+            stored.clone(),
+        ));
+    let expected = crate::path_key::normalize_input_path(&stored);
+    assert!(matches!(
+        app.load_folder_or_convert_archive(stored.clone()),
+        FolderOpenOutcome::Loaded
+    ));
+    app.finish_page_identity_preparation_for_test();
+    assert_eq!(
+        app.current_folder.as_ref().unwrap().as_os_str(),
+        expected.as_os_str()
+    );
+    assert_eq!(
+        app.settings.favorites[0].path.as_os_str(),
+        stored.as_os_str()
+    );
+    app.set_startup_open_path(stored);
+    assert_eq!(
+        app.startup_open_path.as_ref().unwrap().as_os_str(),
+        expected.as_os_str()
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn mixed_path_history_replay_accepts_old_spelling_and_restores_the_same_folder() {
+    let mut app = phase_c_support::setup_app();
+    app.active_quick_folder_slot = None;
+    let origin = app.tmp.path().join("origin");
+    let destination = app.tmp.path().join("destination");
+    std::fs::create_dir(&origin).unwrap();
+    std::fs::create_dir(&destination).unwrap();
+    app.load_folder(origin.clone());
+    app.finish_page_identity_preparation_for_test();
+    assert!(
+        app.apply_fullscreen_close_nav_immediate(crate::ui_main::AddressBarNav::Direct(
+            destination,
+            StartupListIntent::ExplicitList,
+        ))
+    );
+    app.finish_page_identity_preparation_for_test();
+    let old = PathBuf::from(origin.to_str().unwrap().replace('\\', "/").to_lowercase());
+    let mut snapshot = app.folder_nav_history_snapshot();
+    snapshot.back_stack.last_mut().unwrap().location = FolderNavHistoryTarget::Path(old.clone());
+    app.restore_folder_nav_history(snapshot);
+    app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
+    app.finish_history_restore_preparation_for_test();
+    assert_eq!(
+        app.current_folder.as_ref().unwrap().as_os_str(),
+        crate::path_key::normalize_input_path(&old).as_os_str()
+    );
+    assert!(app.folder_nav_history_snapshot().back_stack.is_empty());
+}
+
 impl App {
     pub(crate) fn folder_order_refresh_pending_for_test(&self) -> bool {
         self.folder_pane_open_pending

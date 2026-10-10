@@ -118,6 +118,26 @@ placeholder は採用後も同じ enumerate handle で検証する。取消・�
 
 ## 1. GridItem バリアント
 
+### 実パスの比較と入力表記 (§1.366)
+
+`folder_tree::path_eq` は既存の `path_key::eq_keep_drive` を再公開し、ドライブを保持した
+小文字化・`\` → `/` の規則で比較する。DFS が親の `read_dir` 結果から現在位置を探す際も、
+入力の `g:/home/comfyui/genshin_random\child` と列挙結果の区切り差で探索を終わらせない。
+ZIP/PDF 本体も同じ比較を使う。ZIP 内 entry/prefix の identity にはこの実パス helper を使わない。
+
+入力表記は `path_key::normalize_input_path` で、Windows では `/` → `\` とドライブ文字の
+大文字化だけを行う。ファイル名の大小文字、相対パス、`.` / `..`、junction/symlink の論理経路、
+verbatim/device namespace の表記を維持し、I/O や保存キーの変更は行わない。
+アドレスバー、フォルダを開くダイアログ、起動引数／既存インスタンス転送、D&D、
+お気に入りの新規登録と通常 open、物理履歴／A・B の復帰要求で適用する。
+既存のお気に入り／履歴／復元設定を一括書換えせず、open 要求として受け取ったコピーを揃える。
+
+Remote の実パスは既存の検証・canonicalize owner で解決し、通常の logical path を標準表記にする。
+変換書庫の公開 source address は既存の完全一致対応表の identity として維持し、
+canonical source/backing と区別する。動画進捗の直接入力も受理時に表記を揃える。
+DB キー、catalog の保存先 hash、元書庫と cache ZIP の identity、ZIP entry/prefix は変更しない。
+一覧で移動先がない場合の新しい境界トーストは追加しない。
+
 `grid_item.rs` の `GridItem` 列挙型は以下の 12 バリアント:
 
 | バリアント | 発生元 | 中身 |

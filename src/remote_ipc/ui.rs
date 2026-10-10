@@ -2375,7 +2375,7 @@ impl crate::app::App {
                 ..
             } => {
                 self.apply_remote_media_resume_update(
-                    std::path::PathBuf::from(&address.path),
+                    crate::path_key::normalize_input_path(std::path::Path::new(&address.path)),
                     *position_secs,
                     *duration_secs,
                     *ended,

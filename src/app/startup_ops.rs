@@ -83,7 +83,7 @@ pub(super) struct DirectMediaPrepared {
 
 impl App {
     pub(crate) fn set_startup_open_path(&mut self, path: PathBuf) {
-        self.startup_open_path = Some(path);
+        self.startup_open_path = Some(crate::path_key::normalize_input_path(&path));
     }
 
     pub(super) fn poll_deferred_startup_open_path(&mut self, ctx: &egui::Context) {
@@ -191,6 +191,7 @@ impl App {
         ctx: &egui::Context,
         navigation: Option<MainListNavigation>,
     ) {
+        let requested = crate::path_key::normalize_input_path(&requested);
         if self.remote_session_blocks_local_control() {
             if matches!(source, StartupOpenPathSource::InitialStartup) {
                 self.startup_open_path = Some(requested);

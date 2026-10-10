@@ -41,6 +41,32 @@ pub fn eq_keep_drive(a: &Path, b: &Path) -> bool {
     normalize_keep_drive(a) == normalize_keep_drive(b)
 }
 
+/// Standardize an accepted physical path without I/O or changing its identity.
+/// This is an input/display spelling, not a persistent key. Keep component casing,
+/// relative/dot components and namespace paths intact; do not resolve symlinks.
+pub(crate) fn normalize_input_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let mut units: Vec<u16> = path.as_os_str().encode_wide().collect();
+        // Verbatim/device namespaces do not use ordinary Win32 separator rules.
+        if units.starts_with(&[92, 92, 63, 92]) || units.starts_with(&[92, 92, 46, 92]) {
+            return path.to_path_buf();
+        }
+        for unit in &mut units {
+            if *unit == 47 {
+                *unit = 92;
+            }
+        }
+        if units.get(1) == Some(&58) && matches!(units[0], 97..=122) {
+            units[0] -= 32;
+        }
+        PathBuf::from(std::ffi::OsString::from_wide(&units))
+    }
+    #[cfg(not(windows))]
+    path.to_path_buf()
+}
+
 /// Compare physical path spellings without I/O or changing persistent DB keys.
 /// Only verbatim drive and UNC paths alias ordinary paths; device/volume namespaces
 /// do not. Resolve lexical dot components without allowing traversal above a root.
@@ -137,6 +163,37 @@ pub(crate) fn restore_existing_path_casing(path: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn input_spelling_preserves_identity_and_persistent_keys() {
+        for (input, expected) in [
+            (
+                r"g:/home/comfyui/genshin_random\yaoyao",
+                r"G:\home\comfyui\genshin_random\yaoyao",
+            ),
+            (r"c:Photos/../日本語", r"C:Photos\..\日本語"),
+            (r"//Server/Share/Mixed\Path", r"\\Server\Share\Mixed\Path"),
+            (r"relative/./Mixed\Path", r"relative\.\Mixed\Path"),
+            (r"\\?\c:\literal/Path", r"\\?\c:\literal/Path"),
+            (r"\\.\c:\literal/Path", r"\\.\c:\literal/Path"),
+            ("", ""),
+        ] {
+            let path = Path::new(input);
+            let accepted = normalize_input_path(path);
+            assert_eq!(accepted.as_os_str(), std::ffi::OsStr::new(expected));
+            assert_eq!(normalize(path), normalize(&accepted));
+            assert_eq!(normalize_keep_drive(path), normalize_keep_drive(&accepted));
+            assert_eq!(normalize_input_path(&accepted), accepted);
+        }
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let raw = std::ffi::OsString::from_wide(&[103, 58, 47, 0xd800]);
+        let accepted = normalize_input_path(Path::new(&raw));
+        assert_eq!(
+            accepted.as_os_str().encode_wide().collect::<Vec<_>>(),
+            [71, 58, 92, 0xd800]
+        );
+    }
 
     #[test]
     fn strips_drive_letter() {
