@@ -4,6 +4,7 @@
 // IComponent / IAudioProcessor / IEditController の取得と最低限の lifecycle 制御まで実装する。
 
 #include "plugin_loader.h"
+#include "now_playing_notify.h"
 #include "utf8_paths.h"
 
 #include <algorithm>
@@ -636,6 +637,11 @@ public:
         return thread_id_.load(std::memory_order_acquire);
     }
 
+    void bind_now_playing(const std::shared_ptr<NowPlayingMailbox>& mailbox) {
+        std::lock_guard<std::mutex> lock(now_playing_mutex_);
+        now_playing_mailbox_ = mailbox; // Same canonical slot incarnation owner.
+    }
+
     // A timeout means the slot GUI thread is stuck in plugin code. The bridge
     // process exits from terminate_bridge_after_gui_timeout rather than
     // returning to the caller with a poisoned plugin instance still alive.
@@ -655,7 +661,9 @@ public:
         post_task([task]() {
             (*task)();
         });
-        if (future.wait_for(timeout) != std::future_status::ready) {
+        const auto wait = await_gui_future(future, timeout, [this] { return now_playing_mailbox(); });
+        if (wait.outcome == GuiFutureWait::NowPlayingTimeout) terminate_now_playing_timeout(wait.mailbox);
+        if (wait.outcome == GuiFutureWait::GuiTimeout) {
             DWORD gui_tid = thread_id_.load(std::memory_order_acquire);
             blog("plugin GUI task timeout label=%s gui_tid=%lu timeout_ms=%llu",
                  label ? label : "(unknown)",
@@ -684,7 +692,9 @@ public:
         post_task([task]() {
             (*task)();
         });
-        if (future.wait_for(timeout) != std::future_status::ready) {
+        const auto wait = await_gui_future(future, timeout, [this] { return now_playing_mailbox(); });
+        if (wait.outcome == GuiFutureWait::NowPlayingTimeout) terminate_now_playing_timeout(wait.mailbox);
+        if (wait.outcome == GuiFutureWait::GuiTimeout) {
             DWORD gui_tid = thread_id_.load(std::memory_order_acquire);
             blog("plugin GUI task timeout label=%s gui_tid=%lu timeout_ms=%llu",
                  label ? label : "(unknown)",
@@ -709,6 +719,12 @@ public:
     }
 
 private:
+    std::shared_ptr<NowPlayingMailbox> now_playing_mailbox() {
+        std::lock_guard<std::mutex> lock(now_playing_mutex_);
+        return now_playing_mailbox_.lock();
+    }
+    std::mutex now_playing_mutex_;
+    std::weak_ptr<NowPlayingMailbox> now_playing_mailbox_;
     void ensure_started() {
         if (running_.load(std::memory_order_acquire)) {
             return;
@@ -2527,6 +2543,26 @@ void PluginLoader::flush_with_silence(uint32_t num_samples) {
     if (!was_processing) {
         set_processing_enabled(false);
     }
+}
+
+void PluginLoader::post_now_playing(std::shared_ptr<NowPlayingMailbox> mailbox,
+                                   std::function<void(std::shared_ptr<NowPlayingMailbox>)> wake) {
+    if (!gui_thread_ || editor_quarantined_.load(std::memory_order_acquire)) {
+        mailbox->close();
+        blog("now_playing slot=%llu receiver=unavailable", static_cast<unsigned long long>(mailbox->slot_id));
+        return;
+    }
+    gui_thread_->bind_now_playing(mailbox);
+    gui_thread_->post_async([this, mailbox = std::move(mailbox), wake = std::move(wake)]() {
+        execute_now_playing(mailbox, GetTickCount64(), [this](const auto& snapshot) {
+            if (!component_ || editor_quarantined_.load(std::memory_order_acquire)) {
+                blog("now_playing slot=%llu revision=%llu receiver=unavailable",
+                    static_cast<unsigned long long>(snapshot.slot_id), static_cast<unsigned long long>(snapshot.revision));
+            } else {
+                notify_now_playing(host_app_.get(), component_.get(), controller_.get(), snapshot);
+            }
+        }, wake); // Return via control, never inline recurse.
+    });
 }
 
 void PluginLoader::unload() {

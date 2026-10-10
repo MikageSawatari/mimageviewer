@@ -24,7 +24,7 @@
   },
   "controller-mapping.md": {
     "include": true,
-    "reason": "v0.12.0 vst-bootstrap.js:34 now exposes physical-control-section; effect/automation and non-player app targets are available. VST-specific limits in controller-mapping.json."
+    "reason": "v0.13.0 vst-bootstrap.js:35 exposes physical-control-section; effect/automation and non-player app targets are available. VST-specific limits in controller-mapping.json."
   },
   "double-blind-test.md": {
     "include": false,

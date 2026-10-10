@@ -4,10 +4,19 @@
 生成 HTML は編集せず、`scripts/gen-effetune-docs.py` またはこのフォルダーの
 訂正ルールを変更する。
 
+2026-10-10 の v0.13.0 実装レビュー訂正:
+
+- `resonator.json`: Adaptive Prediction は同梱 VST の native 処理を使うため、
+  独立版の WebAssembly 音声設定を有効にする条件を除去する。
+- `analyzer.json`: Rhythm Analyzer の曲変更による自動再解析は独立版プレーヤーの
+  説明と区別し、同梱版では Reset 操作を案内する。
+- `test_bundled_prediction_and_rhythm_exclude_standalone_requirements` は生成結果を検査し、
+  新版の更新時にも独立版の操作条件が再流入しないことを確認する。
+
 ```powershell
-python scripts/gen-effetune-docs.py --version v0.12.0
+python scripts/gen-effetune-docs.py --version v0.13.0
 python scripts/test_gen_effetune_docs.py
-python scripts/gen-effetune-docs.py --version v0.12.0 --check
+python scripts/gen-effetune-docs.py --version v0.13.0 --check
 python scripts/gen-sitemap-xml.py
 ```
 
@@ -113,3 +122,18 @@ Tonal Balance EQ の3ページと、設定入口が表示されたコントロ�
   独立版のClean Feed／設定とMac用キー説明だけ訂正。節全体の削除は行わない。
 - 版は出力pathとprovenanceに保持し、利用者ページの転載注記には表示しない。
 - サイトマップは本作業で再生成して検査する。コミット後の日付確定はrelease leadが再生成する。
+
+## 同梱版更新 (2026-10-09)
+
+既定 snapshot は `6791afdfc6f4e6c913b9f48c8189a44e29a09bde`。
+Mixwright v0.13.0 release commit `230e5ad8ae8f6e866bc923419fbc198ee559c856` の
+`external/effetune` submodule と一致する。27原文ファイル（LICENSEを含む）と4画像を
+上流の正確なcommitから取得し、旧snapshotは変更しない。
+公開出力は133 HTML + 4画像、エフェクト113件。旧v0.12.0の版別HTMLは保持する。
+
+- SFZ Note Player / Adaptive Prediction、Guitarと新Visualizerレイアウト・編集操作を収録。
+- `others.json` はnativeの音源フォルダ選択を案内し、Web/Electron固有の保存・取り込み説明を訂正。
+  native保存先とRemoveの削除範囲は公開前の実使用検証に残し、ブラウザ方式から推測しない。
+- `visualizer.json` / `README.json` はNow Playingの文字・画像、欠落時、Local/Remoteの保持・clear、
+  起動時Visualizerを説明する。独立版LANリモート操作は案内に加えない。
+- 生成器は空欄への段落置換を段落の削除として扱う。converterの全出力検査で空要素を拒否する。

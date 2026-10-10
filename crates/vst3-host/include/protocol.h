@@ -10,7 +10,11 @@
 // stdin がクローズされたら bridge は graceful shutdown する。
 //
 // ### 親 → bridge (要求):
-//   {"cmd":"hello","version":5}
+//   {"cmd":"hello","version":6}
+//   {"cmd":"set_now_playing","slot_id":<u64>,"revision":<u64>,"title":"",
+//    "album":"","artist":"","artwork":"<base64>","artworkMimeType":""}
+//     Complete snapshot; revision orders updates within the slot incarnation.
+//     No reply event. GUI notify results go to stderr; hung execution exits host.
 //   {"cmd":"show_gui","slot_id":<u64>,"owner_hwnd":<u64>,"unowned":<0|1>,
 //    "main_hwnd":<u64>, ...} // unowned=1: owner=0; main is DPI/minimize reference only
 //   {"cmd":"sync_gui_main_visibility","slot_id":<u64>} // read current IsIconic, preserve desired visibility
@@ -27,7 +31,7 @@
 //   {"cmd":"shutdown"}              // bridge 終了
 //
 // ### bridge → 親 (応答 / 通知):
-//   {"event":"ready","version":5,"shm_name":"<Windows 名前付きオブジェクト>",
+//   {"event":"ready","version":6,"shm_name":"<Windows 名前付きオブジェクト>",
 //    "shm_size":<u64>,"sig_in":"<event名>","sig_out":"<event名>"}
 //   {"event":"loaded","plugin_name":"<UTF-8>","latency_samples":<u32>,
 //    "params":[{"id":<u32>,"name":"<UTF-8>","default":<f64>}, ...]}
@@ -88,13 +92,14 @@ static_assert(sizeof(ShmHeader) == 272,
 // 1 のままだと「無視されていた hello が黙って通る」状態だった。2 へ上げることで、
 // v0.8.x 以前の bridge exe (= version=1 を返すだけ) は新 Rust 側の比較で reject され、
 // stale bridge による IPC スキーマ不整合を検出できる。
-constexpr uint32_t PROTOCOL_VERSION = 5;
+constexpr uint32_t PROTOCOL_VERSION = 6;
 
 // 制御メッセージの最大長。
 // 通常は 1 KB 未満だが、`plugin_state` event (= IComponent::getState チャンク) は
 // プラグインによっては数百 KB に達する (= ML 系プラグインや、波形 / プリセット
-// 内蔵プラグイン)。base64 化で +33% の overhead を考えても、4 MB あれば実用上
-// 困らない。
+// 内蔵プラグイン)。Now Playing artwork is separately limited to 8,388,608
+// decoded bytes / 11,184,812 base64 characters. The 32 MiB frame limit includes
+// JSON escaping, but excludes the four-byte length prefix.
 // **Rust 側 `src/video/dsp/bridge.rs::read_event_blocking` の同名定数と必ず
 // 一致**させること。ここを変えたら Rust 側も同期する。
 constexpr uint32_t MAX_CONTROL_MSG_SIZE = 32 * 1024 * 1024;

@@ -37,7 +37,9 @@ use windows::core::{HSTRING, PCWSTR};
 /// 1 のままだと stale bridge を検出できなかった。2 へ上げることで v0.8.x 以前の
 /// `mimageviewer-vst3-host.exe` (version=1 を返すだけ) を新 Rust 側で reject できる。
 /// v5: checked GUI-thread presentation outcomes and shared suppression epochs.
-pub const PROTOCOL_VERSION: u32 = 5;
+// v6: bounded, fire-and-forget Now Playing snapshots.
+pub const PROTOCOL_VERSION: u32 = 6;
+pub const MAX_CONTROL_MSG_SIZE: usize = 32 * 1024 * 1024;
 pub(crate) const STATE_WATCHDOG_EXIT_CODE: u32 = 0xEFFE_C001;
 
 static NEXT_AUDIO_PIPE_ID: AtomicU64 = AtomicU64::new(0);
@@ -74,6 +76,17 @@ pub fn shm_size_bytes(capacity_samples: u32) -> u64 {
 #[serde(tag = "cmd")]
 #[serde(rename_all = "lowercase")]
 pub enum Cmd {
+    #[serde(rename = "set_now_playing")]
+    SetNowPlaying {
+        slot_id: u64,
+        revision: u64,
+        title: Arc<str>,
+        album: Arc<str>,
+        artist: Arc<str>,
+        artwork: Arc<str>,
+        #[serde(rename = "artworkMimeType")]
+        artwork_mime_type: Arc<str>,
+    },
     Hello {
         version: u32,
     },
@@ -408,6 +421,8 @@ pub struct Bridge {
     stdin: Mutex<Option<ChildStdin>>,
     #[cfg(test)]
     fake_commands: Option<std::sync::mpsc::Sender<serde_json::Value>>,
+    #[cfg(test)]
+    fake_command_threads: Mutex<Vec<String>>,
     /// 同期 event 受信用 channel。spawn 時に起動した event-pump スレッドが
     /// stdout を読んで非同期 (LatencyChanged / ResetDone) 以外の event をここに流す。
     /// recv() はここから読む。
@@ -757,6 +772,8 @@ impl Bridge {
             stdin: Mutex::new(Some(stdin)),
             #[cfg(test)]
             fake_commands: None,
+            #[cfg(test)]
+            fake_command_threads: Mutex::new(Vec::new()),
             event_rx,
             sync_call_mutex: Mutex::new(()),
             cached_latency_samples: cached_latency,
@@ -1097,6 +1114,12 @@ impl Bridge {
         }
         let payload = serde_json::to_vec(cmd)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        if payload.len() > MAX_CONTROL_MSG_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "control message too large",
+            ));
+        }
         let len = u32::try_from(payload.len()).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "message too large")
         })?;
@@ -1114,12 +1137,22 @@ impl Bridge {
     pub fn send_value(&self, value: &serde_json::Value) -> std::io::Result<()> {
         #[cfg(test)]
         if let Some(commands) = &self.fake_commands {
+            self.fake_command_threads
+                .lock()
+                .unwrap()
+                .push(std::thread::current().name().unwrap_or("unnamed").into());
             return commands.send(value.clone()).map_err(|_| {
                 std::io::Error::new(std::io::ErrorKind::BrokenPipe, "fake host disconnected")
             });
         }
         let payload = serde_json::to_vec(value)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        if payload.len() > MAX_CONTROL_MSG_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "control message too large",
+            ));
+        }
         let len = u32::try_from(payload.len()).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "message too large")
         })?;
@@ -1138,6 +1171,11 @@ impl Bridge {
     /// 内部的には event-pump スレッドが stdout から読み出して channel に流したものを取得。
     /// LatencyChanged event は pump が intercept して `cached_latency_samples` に
     /// 直接反映するため、ここには来ない (= 同期待ちを妨げない)。
+    #[cfg(test)]
+    pub(crate) fn fake_command_threads_for_test(&self) -> Vec<String> {
+        self.fake_command_threads.lock().unwrap().clone()
+    }
+
     pub fn recv(&self) -> std::io::Result<Event> {
         match self.event_rx.recv() {
             Ok(result) => result,
@@ -1176,7 +1214,6 @@ fn read_event_blocking(stdout: &mut ChildStdout) -> std::io::Result<Event> {
     // (= ML / preset 内蔵 plugin)。
     // **C++ 側 `crates/vst3-host/include/protocol.h::MAX_CONTROL_MSG_SIZE`
     // と必ず一致**させること。protocol.h を変えたらここも変える。
-    const MAX_CONTROL_MSG_SIZE: usize = 32 * 1024 * 1024;
     if len > MAX_CONTROL_MSG_SIZE {
         let mut remaining = len;
         let mut scratch = [0u8; 64 * 1024];
@@ -1960,6 +1997,87 @@ mod effetune_host_handler_tests {
                 )
                 .unwrap_err(),
             "reset deadline expired"
+        );
+    }
+}
+#[cfg(test)]
+mod now_playing_wire_tests {
+    use super::*;
+    #[test]
+    fn now_playing_typed_command_serializes_cmd_first_with_exact_wire_keys() {
+        let title = "曲😀 \\\"cmd\\\": \\\"slot_id\\\" \\\\ tail";
+        let command = Cmd::SetNowPlaying {
+            slot_id: 17,
+            revision: 4,
+            title: title.into(),
+            album: "アルバム".into(),
+            artist: "artist".into(),
+            artwork: "".into(),
+            artwork_mime_type: "".into(),
+        };
+        let bytes = serde_json::to_vec(&command).unwrap();
+        assert!(bytes.starts_with(b"{\"cmd\":\"set_now_playing\""));
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["title"], title);
+        assert_eq!(value["slot_id"], 17);
+        assert_eq!(value["artworkMimeType"], "");
+        assert_eq!(
+            value
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                "cmd",
+                "slot_id",
+                "revision",
+                "title",
+                "album",
+                "artist",
+                "artwork",
+                "artworkMimeType"
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert!(matches!(
+            serde_json::from_slice::<Cmd>(&bytes).unwrap(),
+            Cmd::SetNowPlaying {
+                slot_id: 17,
+                revision: 4,
+                ..
+            }
+        ));
+        assert!(
+            serde_json::from_str::<Event>(r#"{"event":"now_playing_ack","slot_id":17}"#).is_err()
+        );
+    }
+    #[test]
+    fn now_playing_maximum_artwork_serializes_inside_control_frame() {
+        use base64::Engine;
+        let data = vec![42; 8 * 1024 * 1024];
+        let artwork = base64::engine::general_purpose::STANDARD.encode(&data);
+        assert_eq!(artwork.len(), 11_184_812);
+        let command = Cmd::SetNowPlaying {
+            slot_id: 3,
+            revision: 8,
+            title: "曲😀".into(),
+            album: "".into(),
+            artist: "".into(),
+            artwork: artwork.into(),
+            artwork_mime_type: "image/png".into(),
+        };
+        let bytes = serde_json::to_vec(&command).unwrap();
+        assert!(bytes.len() < MAX_CONTROL_MSG_SIZE);
+        let Cmd::SetNowPlaying { artwork, .. } = serde_json::from_slice(&bytes).unwrap() else {
+            panic!("wrong command");
+        };
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(&*artwork)
+                .unwrap(),
+            data
         );
     }
 }

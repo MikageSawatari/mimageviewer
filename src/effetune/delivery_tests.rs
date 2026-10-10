@@ -52,9 +52,63 @@ impl FakeHost {
         let worker = std::thread::spawn(move || {
             let mut state = HostSnapshot::default();
             let mut paused = false;
+            let mut metadata_revision = None;
             while let Ok(value) = command_rx.recv() {
                 let cmd = value["cmd"].as_str().unwrap();
                 match cmd {
+                    "set_now_playing" => {
+                        // RegisterBridge resends the current snapshot before GUI work.
+                        // Consume only its exact fire-and-forget wire shape: metadata
+                        // must neither synthesize an ACK nor alter GUI observations.
+                        let keys = value
+                            .as_object()
+                            .unwrap()
+                            .keys()
+                            .map(String::as_str)
+                            .collect::<std::collections::BTreeSet<_>>();
+                        assert_eq!(
+                            keys,
+                            [
+                                "cmd",
+                                "slot_id",
+                                "revision",
+                                "title",
+                                "album",
+                                "artist",
+                                "artwork",
+                                "artworkMimeType"
+                            ]
+                            .into_iter()
+                            .collect()
+                        );
+                        assert_eq!(value["slot_id"], 0);
+                        let revision = value["revision"].as_u64().unwrap();
+                        assert!(metadata_revision.is_none_or(|previous| revision >= previous));
+                        metadata_revision = Some(revision);
+                        for key in ["title", "album", "artist"] {
+                            let text = value[key].as_str().unwrap();
+                            assert!(text.encode_utf16().count() <= 4096 && !text.contains('\0'));
+                        }
+                        let artwork = value["artwork"].as_str().unwrap();
+                        let mime = value["artworkMimeType"].as_str().unwrap();
+                        if artwork.is_empty() {
+                            assert!(mime.is_empty());
+                        } else {
+                            use base64::Engine;
+                            assert!(matches!(
+                                mime,
+                                "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+                            ));
+                            assert!(artwork.len() <= 11_184_812);
+                            assert!(
+                                base64::engine::general_purpose::STANDARD
+                                    .decode(artwork)
+                                    .unwrap()
+                                    .len()
+                                    <= 8 * 1024 * 1024
+                            );
+                        }
+                    }
                     "query_gui_size" => events.emit(Event::GuiSize {
                         width: 640,
                         height: 480,

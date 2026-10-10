@@ -1,8 +1,14 @@
 [
   {
+    "operation": "replace_inline",
+    "anchor": "Ctrl（MacではCmd）",
+    "replacement": "Ctrl",
+    "reason": "mIV is Windows-only; canvas zoom added in v0.13.0."
+  },
+  {
     "operation": "replace_paragraph",
     "anchor": "PCではヘッダーの **Effect Pipeline**、**Music Library** の隣にある **Visualizer** を選びます。モバイルでは右上のメニューボタンの左にある **Visualizer** アイコンを選びます。デスクトップアプリでは **表示 > Visualizer** からも開けます。[ブラウザ拡張版](browser-extension.md)では、Pipeline Editor のヘッダーにある **Visualizer** を選びます。**設定 > 環境設定...** で起動時の表示にも指定できます。",
-    "replacement": "EffeTune 画面のヘッダーにある **Visualizer** ボタンを選びます。mImageViewer には、デスクトップ版 EffeTune の「表示」メニューやミニプレーヤーはありません。",
+    "replacement": "EffeTune 画面のヘッダーにある **Visualizer** ボタンを選びます。**設定 > 環境設定...** で起動時の表示にも指定できます。mImageViewer には、デスクトップ版 EffeTune の「表示」メニューやミニプレーヤーはありません。",
     "reason": "Bundled effetune.html visualizerButton; standalone menu absent."
   },
   {
@@ -14,8 +20,8 @@
   {
     "operation": "insert_note",
     "heading_id": "visualizer",
-    "note": "mImageViewer で再生している曲のジャケット画像・曲名・アルバム名・アーティスト名は、この表示には渡されません。Artwork、Title、Album、Artist は通常表示では空になります。Edit 中の文字は配置を調整するための見本です。自分で選ぶ背景画像は使用できます。",
-    "reason": "ui-manager.js:103,2080 has no audioPlayer; visualizer-view.js:199-202 uses its metadata, renderer skips absent metadata."
+    "note": "mImageViewer の音響調整を使用中は、再生中の曲名・アルバム名・アーティスト名と代表画像をこの表示へ自動で渡します。曲名が無ければ拡張子を除いたファイル名を使い、ほかの情報が無ければ空欄になります。画像は長辺1024ピクセルまでで、動く画像は最初の一枚を使います。先に文字を渡し、画像の準備ができたら表示します。音楽は同名画像・MP3表紙、動画は一覧と同じ代表画像を使います。一時停止やシークでは情報を残し、PCでの停止・閉じる・再生終了では消します。リモートは最後の曲が終わっても情報を残し、次曲への切替中は空になることがあります。Edit 中の文字は配置を調整するための見本です。自分で選ぶ背景画像も使用できます。",
+    "reason": "Mixwright v0.13.0 EffeTune.NowPlaying full snapshots supplied by mIV; user-approved lifecycle and artwork limits in effetune-now-playing-plan.md."
   },
   {
     "operation": "replace_paragraph",

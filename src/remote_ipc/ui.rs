@@ -572,6 +572,14 @@ struct AppRemoteVideoStreaming {
 }
 
 impl AppRemoteVideoStreaming {
+    #[cfg(windows)]
+    fn now_playing_owner(&self) -> crate::effetune::NowPlayingOwner {
+        crate::effetune::NowPlayingOwner::Remote {
+            session: self.session.id().0,
+            registration: self.player.media_identity(),
+        }
+    }
+
     fn published(&self) -> PublishedVideoStream {
         PublishedVideoStream {
             session: self.session.id(),
@@ -1454,6 +1462,25 @@ impl crate::app::App {
             AppRemoteVideoStreamState::Streaming(streaming) => streaming,
         };
         streaming.player.tick(ctx);
+        #[cfg(windows)]
+        if self.effetune.now_playing_owner() == Some(streaming.now_playing_owner())
+            && let Some(info) = streaming.player.info()
+            && (!self.effetune.now_playing_metadata_matches(
+                streaming.now_playing_owner(),
+                streaming.player.path(),
+                info.title.as_deref(),
+                info.album.as_deref(),
+                info.artist.as_deref(),
+            ) || !self.effetune.now_playing_artwork_source_matches(
+                streaming.now_playing_owner(),
+                None,
+                &self.settings,
+            ))
+        {
+            let input = self.now_playing_input_for_player(&streaming.player, None);
+            self.effetune
+                .publish_now_playing(streaming.now_playing_owner(), input);
+        }
         self.remember_confirmed_remote_audio_track(&mut streaming);
         let snapshot = streaming.playback.snapshot();
         streaming.playback.update(
@@ -1484,6 +1511,9 @@ impl crate::app::App {
     }
 
     fn retire_remote_audio_stream(&mut self, streaming: &mut AppRemoteVideoStreaming) {
+        #[cfg(windows)]
+        self.effetune
+            .clear_now_playing(streaming.now_playing_owner());
         let stream_index = streaming.session.retire();
         self.remember_remote_audio_track_index(streaming, stream_index);
     }
@@ -1563,6 +1593,13 @@ impl crate::app::App {
                     return;
                 }
                 self.remember_confirmed_remote_audio_track(&mut starting.streaming);
+                #[cfg(windows)]
+                {
+                    // The metadata player is intentionally paused/headless; Stable is adoption.
+                    let owner = starting.streaming.now_playing_owner();
+                    let input = self.now_playing_input_for_player(&starting.streaming.player, None);
+                    self.effetune.publish_now_playing(owner, input);
+                }
                 let path = starting.streaming.requested_path.clone();
                 let kind = if path
                     .extension()
@@ -4765,6 +4802,186 @@ mod tests {
         }
         assert!(app.settings.video_audio_track_choices.is_empty());
         (app, handle, path, session, generation)
+    }
+
+    #[cfg(windows)]
+    fn now_playing_starting_from_streaming(
+        handle: &SessionHandle,
+        streaming: AppRemoteVideoStreaming,
+    ) -> AppRemoteVideoStarting {
+        let owner = handle.owner_for_test("audio-boundary-test");
+        let request = VideoStreamUiRequest::start_for_test(
+            owner.clone(),
+            streaming.requested_path.clone(),
+            mimageviewer_ipc::VideoStreamQuality::Standard,
+        );
+        let operation = handle
+            .begin_operation(&owner, "now playing start".to_owned())
+            .unwrap();
+        let (claimed, _response) = ClaimedVideoStreamUiRequest::for_test(operation, request);
+        AppRemoteVideoStarting {
+            claimed,
+            streaming,
+            budget: VideoStreamStartBudget::from_enqueued_at(std::time::Instant::now()),
+            waiting_stage: VideoStreamStartStage::Encoder,
+        }
+    }
+
+    #[cfg(windows)]
+    fn now_playing_next_streaming(
+        app: &mut crate::app::App,
+        handle: &SessionHandle,
+        path: &std::path::Path,
+    ) -> AppRemoteVideoStreaming {
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.to_path_buf());
+        player.set_opened_audio_stream_for_test(0, 1);
+        let inputs = player.remote_stream_start_inputs().unwrap();
+        app.create_remote_video_streaming(
+            &handle.owner_for_test("audio-boundary-test"),
+            path,
+            crate::video::stream::quality::QualityPreset::Standard,
+            Some(0),
+            inputs,
+            Box::new(player),
+        )
+        .unwrap()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn now_playing_remote_stable_adopts_paused_headless_and_keeps_pause_ended() {
+        let (mut app, handle, _path, session, _generation) =
+            ready_unharvested_remote_audio_stream();
+        let streaming = app.take_remote_video_streaming().unwrap();
+        assert!(!streaming.player.is_playing());
+        let owner = streaming.now_playing_owner();
+        let starting = now_playing_starting_from_streaming(&handle, streaming);
+        app.finish_stable_remote_video_start(
+            starting,
+            Ok((StreamReconcile::Active, RemoteVideoStartReadiness::Stable)),
+        );
+        assert_eq!(app.effetune.now_playing_owner(), Some(owner));
+        assert!(matches!(
+            app.apply_remote_video_control(session, VideoStreamControlAction::Pause),
+            VideoStreamUiOutcome::Controlled(_)
+        ));
+        assert_eq!(app.effetune.now_playing_owner(), Some(owner));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            match app.remote_video_streaming_status().unwrap() {
+                StreamGenerationStatus::Ended(_) => break,
+                StreamGenerationStatus::Ready(_) | StreamGenerationStatus::Opening => {
+                    assert!(std::time::Instant::now() < deadline, "fixture did not end");
+                    std::thread::yield_now();
+                }
+                status => panic!("remote fixture failed before Ended: {status:?}"),
+            }
+        }
+        app.poll_remote_video_streaming(&egui::Context::default());
+        assert_eq!(
+            app.effetune.now_playing_owner(),
+            Some(owner),
+            "Pause / encoder Ended retain metadata"
+        );
+        app.apply_remote_video_stop(session);
+        assert_eq!(app.effetune.now_playing_owner(), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn now_playing_remote_next_waiting_failure_and_delayed_old_stop_leave_blank() {
+        let (mut app, handle, path, old_session, _) = ready_unharvested_remote_audio_stream();
+        let streaming = app.take_remote_video_streaming().unwrap();
+        let starting = now_playing_starting_from_streaming(&handle, streaming);
+        app.finish_stable_remote_video_start(
+            starting,
+            Ok((StreamReconcile::Active, RemoteVideoStartReadiness::Stable)),
+        );
+        app.cancel_remote_video_stream_state(VideoStreamErrorCode::Failed, "next media");
+        assert_eq!(app.effetune.now_playing_owner(), None);
+        let owner = handle.owner_for_test("audio-boundary-test");
+        let request = VideoStreamUiRequest::start_for_test(
+            owner.clone(),
+            path.clone(),
+            mimageviewer_ipc::VideoStreamQuality::Standard,
+        );
+        let operation = handle
+            .begin_operation(&owner, "now playing opening".to_owned())
+            .unwrap();
+        let (claimed, _response) = ClaimedVideoStreamUiRequest::for_test(operation, request);
+        app.remote_session_ui.video_stream =
+            Some(AppRemoteVideoStreamState::Opening(AppRemoteVideoOpening {
+                claimed,
+                owner,
+                requested_path: path.clone(),
+                quality: crate::video::stream::quality::QualityPreset::Standard,
+                audio_track: None,
+                player: None,
+                budget: VideoStreamStartBudget::from_enqueued_at(std::time::Instant::now()),
+                dsp_admission_deadline: std::time::Instant::now(),
+            }));
+        app.apply_remote_video_stop(old_session);
+        assert!(matches!(
+            app.remote_session_ui.video_stream,
+            Some(AppRemoteVideoStreamState::Opening(_))
+        ));
+        assert_eq!(app.effetune.now_playing_owner(), None);
+        app.cancel_remote_video_stream_state(VideoStreamErrorCode::Failed, "opening failed");
+        assert_eq!(app.effetune.now_playing_owner(), None);
+        let next = now_playing_next_streaming(&mut app, &handle, &path);
+        let starting = now_playing_starting_from_streaming(&handle, next);
+        app.finish_stable_remote_video_start(
+            starting,
+            Ok((
+                StreamReconcile::Active,
+                RemoteVideoStartReadiness::WaitingForEncoder,
+            )),
+        );
+        assert_eq!(app.effetune.now_playing_owner(), None);
+        app.apply_remote_video_stop(old_session);
+        assert!(
+            app.remote_video_starting_for_test(),
+            "old stop cannot cancel new Starting"
+        );
+        let Some(AppRemoteVideoStreamState::Starting(starting)) =
+            app.remote_session_ui.video_stream.take()
+        else {
+            panic!()
+        };
+        app.finish_stable_remote_video_start(starting, Err("next start failed".to_owned()));
+        assert_eq!(app.effetune.now_playing_owner(), None);
+        assert!(app.remote_session_ui.video_stream.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn now_playing_remote_delayed_old_retirement_cannot_clear_new_or_local_owner() {
+        let (mut app, handle, path, old_session, _) = ready_unharvested_remote_audio_stream();
+        let mut old = app.take_remote_video_streaming().unwrap();
+        let old_input = app.now_playing_input_for_player(&old.player, None);
+        app.effetune
+            .publish_now_playing(old.now_playing_owner(), old_input);
+        app.retire_remote_audio_stream(&mut old);
+        assert_eq!(app.effetune.now_playing_owner(), None);
+        let next = now_playing_next_streaming(&mut app, &handle, &path);
+        let next_owner = next.now_playing_owner();
+        let starting = now_playing_starting_from_streaming(&handle, next);
+        app.finish_stable_remote_video_start(
+            starting,
+            Ok((StreamReconcile::Active, RemoteVideoStartReadiness::Stable)),
+        );
+        app.apply_remote_video_stop(old_session);
+        app.retire_remote_audio_stream(&mut old);
+        assert_eq!(app.effetune.now_playing_owner(), Some(next_owner));
+        let local = crate::effetune::NowPlayingOwner::Local(999_359);
+        let input = app.now_playing_input_for_player(&old.player, None);
+        app.effetune.publish_now_playing(local, input);
+        app.cancel_remote_video_stream_state(
+            VideoStreamErrorCode::SessionMismatch,
+            "control returned",
+        );
+        assert_eq!(app.effetune.now_playing_owner(), Some(local));
     }
 
     fn saved_remote_audio_index(app: &crate::app::App, path: &std::path::Path) -> Option<usize> {

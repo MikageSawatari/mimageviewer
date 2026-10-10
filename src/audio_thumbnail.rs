@@ -429,7 +429,7 @@ fn decode_picture(bytes: &[u8], target: u32) -> Option<(image::DynamicImage, (u3
         .flatten()
 }
 
-mod metadata;
+pub(crate) mod metadata;
 
 #[cfg(test)]
 mod tests;
