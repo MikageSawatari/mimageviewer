@@ -13,7 +13,7 @@ use crate::content_identity::{
 
 use super::{
     ShiftClearAllReply, ShiftCountReply, ShiftOperation, ShiftReadReply, ShiftWatermarks,
-    ShiftWriteReply, SpreadShiftPageRef, store,
+    ShiftWriteKind, ShiftWriteReply, SpreadShiftPageRef, store,
 };
 
 #[derive(Clone)]
@@ -89,6 +89,9 @@ struct Admission {
     tx: Option<mpsc::Sender<Command>>,
     mode: AdmissionMode,
     watermarks: ShiftWatermarks,
+    // Published independently of the snapshot, which the worker temporarily
+    // takes for COW/DB work outside this lock.
+    maintenance_epoch: u64,
     snapshot: Option<Arc<Snapshot>>,
     deferred_commands: VecDeque<Command>,
     results: VecDeque<ShiftWriteReply>,
@@ -102,6 +105,8 @@ struct Shared {
     pending: AtomicUsize,
     #[cfg(test)]
     phase_changed: Condvar,
+    #[cfg(test)]
+    write_pause: Mutex<StartupPause>,
 }
 
 #[cfg(test)]
@@ -224,6 +229,7 @@ impl SpreadShiftService {
                     admitted: 0,
                     completed_through: 0,
                 },
+                maintenance_epoch: 0,
                 snapshot: None,
                 deferred_commands: VecDeque::new(),
                 results: VecDeque::new(),
@@ -234,6 +240,8 @@ impl SpreadShiftService {
             pending: AtomicUsize::new(0),
             #[cfg(test)]
             phase_changed: Condvar::new(),
+            #[cfg(test)]
+            write_pause: Mutex::new(None),
         });
         let startup_wait = {
             let mut state = portal.state.lock().unwrap();
@@ -285,13 +293,7 @@ impl SpreadShiftService {
     }
 
     pub(crate) fn maintenance_epoch(&self) -> u64 {
-        self.shared
-            .admission
-            .lock()
-            .unwrap()
-            .snapshot
-            .as_ref()
-            .map_or(0, |s| s.maintenance_epoch)
+        self.shared.admission.lock().unwrap().maintenance_epoch
     }
 
     /// HUD-only observation. This is not a completion proof for open/restore.
@@ -437,23 +439,35 @@ impl SpreadShiftService {
         mutation: Mutation,
     ) -> Result<u64, String> {
         let mut admission = self.shared.admission.lock().unwrap();
-        require_write_admission(&admission)?;
+        if admission.mode.is_closed() {
+            return Err("spread shift writes unavailable during exit".into());
+        }
+        if let Some(snapshot) = &admission.snapshot {
+            snapshot.status.clone()?;
+        }
         let sequence = admission
             .watermarks
             .admitted
             .checked_add(1)
             .ok_or("spread shift sequence exhausted")?;
-        send_command(
-            &self.shared,
-            &mut admission,
-            Command::Write {
-                sequence,
-                scope,
-                operation,
-                mutation,
-            },
-        )?;
-        // Publication is after successful send, while every &self sender and
+        let command = Command::Write {
+            sequence,
+            scope,
+            operation,
+            mutation,
+        };
+        if matches!(
+            admission.mode,
+            AdmissionMode::Maintenance | AdmissionMode::StartingAfterMaintenance
+        ) {
+            // Ordinary edits in unaffected sibling viewers remain admitted.
+            // Reuse the lease's ordered dependency FIFO; the DB stays closed.
+            self.shared.pending.fetch_add(1, Ordering::AcqRel);
+            admission.deferred_commands.push_back(command);
+        } else {
+            send_command(&self.shared, &mut admission, command)?;
+        }
+        // Publication is after successful acceptance, while every &self sender and
         // completion publisher still share this same short admission lock.
         admission.watermarks.admitted = sequence;
         Ok(sequence)
@@ -581,6 +595,14 @@ impl SpreadShiftService {
             .unwrap();
         resume_tx
     }
+
+    #[cfg(test)]
+    fn pause_next_write_snapshot_for_test(&self) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        *self.shared.write_pause.lock().unwrap() = Some((entered_tx, resume_rx));
+        (entered_rx, resume_tx)
+    }
 }
 
 fn require_write_admission(admission: &Admission) -> Result<(), String> {
@@ -615,10 +637,7 @@ fn send_read_error(admission: &Admission, request: ReadRequest, error: String) {
     let _ = request.reply.send(ShiftReadReply {
         cutoff: request.cutoff,
         completed_through: admission.watermarks.completed_through,
-        maintenance_epoch: admission
-            .snapshot
-            .as_ref()
-            .map_or(0, |snapshot| snapshot.maintenance_epoch),
+        maintenance_epoch: admission.maintenance_epoch,
         row: None,
         status: Err(error),
     });
@@ -628,10 +647,7 @@ fn send_count_error(admission: &Admission, request: CountRequest, error: String)
     let _ = request.reply.send(ShiftCountReply {
         cutoff: request.cutoff,
         completed_through: admission.watermarks.completed_through,
-        maintenance_epoch: admission
-            .snapshot
-            .as_ref()
-            .map_or(0, |snapshot| snapshot.maintenance_epoch),
+        maintenance_epoch: admission.maintenance_epoch,
         count: 0,
         status: Err(error),
     });
@@ -875,6 +891,18 @@ fn run_worker(
                 mutation,
             } => {
                 let mut snapshot = shared.admission.lock().unwrap().snapshot.take().unwrap();
+                #[cfg(test)]
+                {
+                    let pause = shared.write_pause.lock().unwrap().take();
+                    if let Some((entered, resume)) = pause {
+                        let _ = entered.send(());
+                        let _ = resume.recv();
+                    }
+                }
+                let kind = match &mutation {
+                    Mutation::Set(_) => ShiftWriteKind::Set,
+                    Mutation::Clear => ShiftWriteKind::Clear,
+                };
                 // COW and all DB/observer work happen outside the UI admission lock.
                 let state = Arc::make_mut(&mut snapshot);
                 let key = scope.storage_key();
@@ -943,6 +971,7 @@ fn run_worker(
                     sequence,
                     scope,
                     operation,
+                    kind,
                     changed,
                     status,
                 });
@@ -1044,6 +1073,7 @@ fn run_worker(
                 admission.snapshot = Some(snapshot);
                 admission.watermarks.completed_through = sequence;
                 admission.changed_scope_keys.extend(changed);
+                admission.maintenance_epoch = epoch + 1;
             }
             Command::BeginMaintenance(reply) => {
                 connection = None;
@@ -1065,6 +1095,7 @@ fn run_worker(
                 }
                 admission.snapshot = Some(Arc::clone(&snapshot));
                 admission.changed_scope_keys.extend(changed);
+                admission.maintenance_epoch = epoch + 1;
                 admission.mode = if admission.mode.is_closed() {
                     AdmissionMode::Closed
                 } else {
@@ -1181,6 +1212,14 @@ mod tests {
                 .all(|reply| reply.changed && reply.status.is_ok())
         );
         assert_eq!(replies[2].operation, operation(3));
+        assert_eq!(
+            replies.iter().map(|reply| reply.kind).collect::<Vec<_>>(),
+            vec![
+                ShiftWriteKind::Set,
+                ShiftWriteKind::Clear,
+                ShiftWriteKind::Set
+            ]
+        );
         owner.shutdown_and_join();
     }
 
@@ -1192,7 +1231,9 @@ mod tests {
         assert!(!temp.path().join("spread_shift.db").exists());
         let clear = service.clear_shift(scope(), operation(1)).unwrap();
         assert_eq!(read(&service, scope(), clear).row, None);
-        assert!(!service.drain_results()[0].changed);
+        let reply = service.drain_results().pop().unwrap();
+        assert!(!reply.changed);
+        assert_eq!(reply.kind, ShiftWriteKind::Clear);
         assert!(!temp.path().join("spread_shift.db").exists());
         assert!(service.is_ready());
         owner.shutdown_and_join();
@@ -1273,7 +1314,6 @@ mod tests {
         service.drain_changed_scope_keys();
         let lease = maintenance_at(temp.path()).unwrap();
         assert!(!service.is_ready());
-        assert!(service.set_shift(scope(), anchor(5), operation(2)).is_err());
         let deferred = service.read_after(scope(), saved);
         let count = service.count_after(saved);
         assert!(matches!(
@@ -1299,6 +1339,144 @@ mod tests {
         );
         assert!(service.is_ready());
         assert_eq!(read(&service, scope(), saved).maintenance_epoch, 1);
+        owner.shutdown_and_join();
+    }
+
+    #[test]
+    fn real_lease_preserves_set_clear_root_read_count_fifo() {
+        let temp = tempfile::tempdir().unwrap();
+        let (service, owner) = SpreadShiftService::spawn_at(temp.path().into(), None).unwrap();
+        let saved = service.set_shift(scope(), anchor(1), operation(1)).unwrap();
+        assert_eq!(read(&service, scope(), saved).row, Some(anchor(1)));
+        service.drain_results();
+        let lease = maintenance_at(temp.path()).unwrap();
+        let before = service.read_after(scope(), saved);
+        let set = service.set_shift(scope(), anchor(5), operation(2)).unwrap();
+        let after_set = service.read_after(scope(), set);
+        let set_count = service.count_after(set);
+        service
+            .rename_book_root(
+                Path::new("C:/books/book.zip"),
+                Path::new("C:/books/new.zip"),
+            )
+            .unwrap();
+        let renamed = BookScopeKey::new("C:/books/new.zip", "chapter").unwrap();
+        let after_rename = service.read_after(renamed.clone(), set + 1);
+        let clear = service.clear_shift(renamed.clone(), operation(3)).unwrap();
+        let after_clear = service.read_after(renamed.clone(), clear);
+        let clear_count = service.count_after(clear);
+        let final_set = service
+            .set_shift(renamed.clone(), anchor(9), operation(4))
+            .unwrap();
+        let after_final_set = service.read_after(renamed.clone(), final_set);
+        service
+            .purge_book_root(Path::new("C:/books/new.zip"))
+            .unwrap();
+        let final_cutoff = service.watermarks().admitted;
+        let after_purge = service.read_after(renamed, final_cutoff);
+        let purge_count = service.count_after(final_cutoff);
+        assert_eq!(service.watermarks().completed_through, saved);
+        for receiver in [
+            &before,
+            &after_set,
+            &after_rename,
+            &after_clear,
+            &after_final_set,
+            &after_purge,
+        ] {
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+        }
+        drop(lease);
+        for (receiver, row, cutoff) in [
+            (before, Some(anchor(1)), saved),
+            (after_set, Some(anchor(5)), set),
+            (after_rename, Some(anchor(5)), set + 1),
+            (after_clear, None, clear),
+            (after_final_set, Some(anchor(9)), final_set),
+            (after_purge, None, final_cutoff),
+        ] {
+            let reply = receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert_eq!(reply.row, row);
+            assert_eq!(reply.completed_through, cutoff);
+            assert_eq!(reply.status, Ok(()));
+        }
+        for (receiver, count, cutoff) in [
+            (set_count, 1, set),
+            (clear_count, 0, clear),
+            (purge_count, 0, final_cutoff),
+        ] {
+            let reply = receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert_eq!(reply.count, count);
+            assert_eq!(reply.completed_through, cutoff);
+            assert_eq!(reply.status, Ok(()));
+        }
+        let replies = service.drain_results();
+        assert_eq!(
+            replies
+                .iter()
+                .map(|reply| (reply.sequence, reply.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                (set, ShiftWriteKind::Set),
+                (clear, ShiftWriteKind::Clear),
+                (final_set, ShiftWriteKind::Set)
+            ]
+        );
+        assert!(
+            replies
+                .iter()
+                .all(|reply| reply.changed && reply.status.is_ok())
+        );
+        owner.shutdown_and_join();
+        assert!(!service.is_busy());
+    }
+
+    #[test]
+    fn restore_epoch_stays_published_while_other_book_write_owns_snapshot() {
+        use super::super::{RestoreReadDependencies, RestoreReceipt};
+        let temp = tempfile::tempdir().unwrap();
+        let (service, owner) = SpreadShiftService::spawn_at(temp.path().into(), None).unwrap();
+        let saved = service.set_shift(scope(), anchor(1), operation(1)).unwrap();
+        read(&service, scope(), saved);
+        drop(maintenance_at(temp.path()).unwrap());
+        assert_eq!(service.maintenance_epoch(), 1);
+        let receipt = RestoreReceipt::capture(
+            8,
+            ViewerContextId::for_test(2),
+            scope(),
+            4,
+            5,
+            &service,
+            None,
+        );
+        let mut reads = RestoreReadDependencies::admit(receipt.clone(), Some(&service), None, None);
+        let (entered, resume) = service.pause_next_write_snapshot_for_test();
+        let other = BookScopeKey::new("C:/books/other.zip", "").unwrap();
+        let other_set = service
+            .set_shift(other.clone(), anchor(9), operation(2))
+            .unwrap();
+        entered.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(service.shared.admission.lock().unwrap().snapshot.is_none());
+        let epoch = service.maintenance_epoch();
+        assert_eq!(epoch, 1);
+        let complete = reads.try_complete(&receipt, epoch).unwrap().unwrap();
+        assert_eq!(complete.shift.unwrap().row, Some(anchor(1)));
+        // Invalid requests also report the published epoch while no snapshot is present.
+        assert_eq!(
+            read(&service, scope(), other_set + 1).maintenance_epoch,
+            epoch
+        );
+        let count_error = service
+            .count_after(other_set + 1)
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(count_error.maintenance_epoch, epoch);
+        assert!(count_error.status.is_err());
+        resume.send(()).unwrap();
+        assert_eq!(read(&service, other, other_set).maintenance_epoch, epoch);
         owner.shutdown_and_join();
     }
 
@@ -1371,11 +1549,17 @@ mod tests {
         read(&service, scope(), saved);
         service.drain_results();
         let lease = maintenance_at(temp.path()).unwrap();
+        let set = service.set_shift(scope(), anchor(6), operation(2)).unwrap();
+        let clear = service.clear_shift(scope(), operation(3)).unwrap();
+        let final_set = service.set_shift(scope(), anchor(8), operation(4)).unwrap();
         service
             .purge_book_root(Path::new("C:/books/book.zip"))
             .unwrap();
-        let pending = service.read_after(scope(), saved + 1);
+        let cutoff = service.watermarks().admitted;
+        let pending = service.read_after(scope(), cutoff);
         service.close_admission();
+        assert!(service.set_shift(scope(), anchor(9), operation(5)).is_err());
+        assert!(service.clear_shift(scope(), operation(6)).is_err());
         assert!(
             service
                 .purge_book_root(Path::new("C:/books/book.zip"))
@@ -1383,8 +1567,7 @@ mod tests {
         );
         let (done_tx, done_rx) = mpsc::channel();
         let exit = std::thread::spawn(move || {
-            owner.shutdown_and_join();
-            done_tx.send(()).unwrap();
+            done_tx.send(owner.shutdown_and_join()).unwrap();
         });
         {
             let mut admission = service.shared.admission.lock().unwrap();
@@ -1395,12 +1578,87 @@ mod tests {
         drop(lease);
         let deleted = pending.recv_timeout(Duration::from_secs(10)).unwrap();
         assert_eq!(deleted.row, None);
-        assert_eq!(deleted.completed_through, saved + 1);
+        assert_eq!(deleted.completed_through, cutoff);
         assert!(deleted.status.is_ok());
-        done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let replies = done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(
+            replies
+                .iter()
+                .map(|reply| (reply.sequence, reply.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                (set, ShiftWriteKind::Set),
+                (clear, ShiftWriteKind::Clear),
+                (final_set, ShiftWriteKind::Set)
+            ]
+        );
+        assert!(
+            replies
+                .iter()
+                .all(|reply| reply.changed && reply.status.is_ok())
+        );
         exit.join().unwrap();
         let (reopened, owner) = SpreadShiftService::spawn_at(temp.path().into(), None).unwrap();
         assert_eq!(read(&reopened, scope(), 0).row, None);
+        owner.shutdown_and_join();
+    }
+
+    #[test]
+    fn startup_lease_accepts_set_clear_and_retains_typed_failed_results() {
+        let temp = tempfile::tempdir().unwrap();
+        let lease = maintenance_at(temp.path()).unwrap();
+        let (service, owner) = SpreadShiftService::spawn_at(temp.path().into(), None).unwrap();
+        let set = service.set_shift(scope(), anchor(1), operation(1)).unwrap();
+        let after_set = service.read_after(scope(), set);
+        let clear = service.clear_shift(scope(), operation(2)).unwrap();
+        let after_clear = service.read_after(scope(), clear);
+        assert_eq!(service.watermarks().admitted, clear);
+        assert_eq!(service.watermarks().completed_through, 0);
+        drop(lease);
+        assert_eq!(
+            after_set.recv_timeout(Duration::from_secs(10)).unwrap().row,
+            Some(anchor(1))
+        );
+        assert_eq!(
+            after_clear
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .row,
+            None
+        );
+        let replies = service.drain_results();
+        assert_eq!(
+            replies.iter().map(|reply| reply.kind).collect::<Vec<_>>(),
+            vec![ShiftWriteKind::Set, ShiftWriteKind::Clear]
+        );
+        assert!(replies.iter().all(|reply| reply.status.is_ok()));
+
+        // Both kinds remain available for notification even if the maintenance
+        // reload finds an unreadable original after the writes were admitted.
+        let lease = maintenance_at(temp.path()).unwrap();
+        let set = service.set_shift(scope(), anchor(3), operation(3)).unwrap();
+        let clear = service.clear_shift(scope(), operation(4)).unwrap();
+        let original = b"invalid sqlite original";
+        std::fs::write(temp.path().join("spread_shift.db"), original).unwrap();
+        drop(lease);
+        assert!(read(&service, scope(), clear).status.is_err());
+        let replies = service.drain_results();
+        assert_eq!(
+            replies
+                .iter()
+                .map(|reply| (reply.sequence, reply.kind))
+                .collect::<Vec<_>>(),
+            vec![(set, ShiftWriteKind::Set), (clear, ShiftWriteKind::Clear)]
+        );
+        assert!(
+            replies
+                .iter()
+                .all(|reply| !reply.changed && reply.status.is_err())
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("spread_shift.db")).unwrap(),
+            original
+        );
         owner.shutdown_and_join();
     }
 
@@ -1532,7 +1790,6 @@ mod tests {
         resume_tx.send(()).unwrap();
         acquired_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         assert!(!service.is_ready());
-        assert!(service.set_shift(scope(), anchor(7), operation(1)).is_err());
         assert!(matches!(
             deferred.try_recv(),
             Err(mpsc::TryRecvError::Empty)

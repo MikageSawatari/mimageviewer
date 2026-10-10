@@ -8,6 +8,113 @@ use crate::book_scope::BookScopeKey;
 use crate::books::BookPathMapping;
 use crate::spread_shift::{SpreadShiftPageRef, SpreadShiftState};
 
+/// Root moves match KeepDrive path components, retaining the original suffix
+/// spelling for actual reads. A neighbouring prefix is never a descendant.
+pub(super) fn map_root_path(path: &Path, source: &Path, target: &Path) -> Option<PathBuf> {
+    let source_key = crate::path_key::normalize_keep_drive(source);
+    let path_key = crate::path_key::normalize_keep_drive(path);
+    if path_key != source_key
+        && !path_key.starts_with(&format!("{}/", source_key.trim_end_matches('/')))
+    {
+        return None;
+    }
+    let suffix = path
+        .components()
+        .skip(source.components().count())
+        .collect::<PathBuf>();
+    let mapped = if suffix.as_os_str().is_empty() {
+        target.to_path_buf()
+    } else {
+        target.join(suffix)
+    };
+    (mapped != path).then_some(mapped)
+}
+
+/// Migrate physical row sources without changing their accepted indices or media
+/// kinds. The same helper serves mounted and parked context ownership boundaries.
+pub(super) fn migrate_items_root(
+    items: &mut [crate::grid_item::GridItem],
+    source: &Path,
+    target: &Path,
+) -> bool {
+    use crate::grid_item::GridItem;
+    let move_path = |path: &mut PathBuf| {
+        if let Some(mapped) = map_root_path(path, source, target) {
+            *path = mapped;
+            true
+        } else {
+            false
+        }
+    };
+    let mut changed = false;
+    for item in items {
+        changed |= match item {
+            GridItem::Folder(path)
+            | GridItem::Image(path)
+            | GridItem::Video(path)
+            | GridItem::Audio(path)
+            | GridItem::ZipFile(path)
+            | GridItem::PdfFile(path)
+            | GridItem::ConvertibleArchive { path, .. }
+            | GridItem::CollectionPlaceholder { path, .. } => move_path(path),
+            GridItem::ZipImage { zip_path, .. } | GridItem::ZipDir { zip_path, .. } => {
+                move_path(zip_path)
+            }
+            GridItem::PdfPage { pdf_path, .. } => move_path(pdf_path),
+            GridItem::Stack { representative, .. } => move_path(representative),
+            GridItem::SearchContainer {
+                path,
+                representative,
+                ..
+            } => {
+                let moved = move_path(path);
+                let representative_moved = representative
+                    .as_mut()
+                    .is_some_and(|value| move_path(&mut value.path));
+                moved || representative_moved
+            }
+        };
+    }
+    changed
+}
+
+pub(super) fn migrate_accepted_root_sources(
+    current_folder: &mut Option<PathBuf>,
+    address: &mut String,
+    archive_source_override: &mut Option<PathBuf>,
+    zip_nav: &mut Option<crate::zip_tree::ZipNavState>,
+    items: &mut [crate::grid_item::GridItem],
+    index: &mut std::sync::Arc<super::file_type_resume::PreparedPageIdentityIndex>,
+    source: &Path,
+    target: &Path,
+) -> bool {
+    let mut changed = false;
+    if let Some(folder) = current_folder
+        && let Some(mapped) = map_root_path(folder, source, target)
+    {
+        *folder = mapped;
+        *address = folder.to_string_lossy().into_owned();
+        changed = true;
+    }
+    if let Some(logical) = archive_source_override
+        && let Some(mapped) = map_root_path(logical, source, target)
+    {
+        *logical = mapped;
+        changed = true;
+    }
+    if let Some(nav) = zip_nav
+        && let Some(mapped) = map_root_path(&nav.tree.zip_path, source, target)
+    {
+        std::sync::Arc::make_mut(&mut nav.tree).zip_path = mapped;
+        changed = true;
+    }
+    changed |= migrate_items_root(items, source, target);
+    if changed {
+        *index = std::sync::Arc::new(index.with_moved_root(source, target));
+    }
+    changed
+}
+
 pub(super) fn migrate(
     owner: &mut ViewerSpreadShift,
     mappings: &[BookPathMapping],

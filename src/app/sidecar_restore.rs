@@ -597,6 +597,23 @@ fn reuse_proof_apply(
 }
 
 impl SidecarRestoreState {
+    /// The Common owner survives context switches until its accepted list is adopted.
+    /// A discarded continuation only drains existing work and cannot publish an old source.
+    pub(super) fn has_pending_book_open(&self, root: &Path) -> bool {
+        !matches!(
+            self.common.continuation,
+            ContinuationOwner::Discarded { .. }
+        ) && !self.common.continuation.cancel().load(Ordering::Relaxed)
+            && (self
+                .common
+                .source_path
+                .as_deref()
+                .is_some_and(|source| crate::path_key::physical_path_is_within(source, root))
+                || self.common.book_restore.as_ref().is_some_and(|restore| {
+                    crate::path_key::physical_path_is_within(restore.logical_source(), root)
+                }))
+    }
+
     pub(super) fn defer_main_list_action(
         &mut self,
         action: super::MainListAfterHydration,
@@ -663,7 +680,6 @@ impl App {
                 self.spread_shift_settings_generation,
                 self.settings.remember_spread_shift_per_book,
                 self.spread_shift_service.as_ref(),
-                self.book_resume_writer.as_ref(),
             );
         }
     }
@@ -3068,6 +3084,49 @@ mod tests {
             },
             phase: Phase::Resuming,
         }
+    }
+
+    #[test]
+    fn pending_book_open_query_keeps_common_logical_source_when_backing_cache_differs() {
+        let mut app = crate::app::setup_app_for_test();
+        let logical = PathBuf::from("C:/books/pending/source.rar");
+        let cache = PathBuf::from("C:/cache/pages.zip");
+        app.current_folder = Some(cache.clone());
+        app.archive_source_override = Some(logical.clone());
+        app.items = vec![GridItem::ZipImage {
+            zip_path: cache.clone(),
+            entry_name: "page.jpg".into(),
+        }];
+        app.settings.remember_spread_shift_per_book = false;
+        let mut state = discarded_restore_state(cache.clone());
+        state.common.continuation = ContinuationOwner::IndexOnly {
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        state.common.book_restore = Some(app.begin_book_shift_restore(1).unwrap());
+        assert!(state.has_pending_book_open(&cache));
+        assert!(state.has_pending_book_open(Path::new("C:/books/pending")));
+        assert!(!state.has_pending_book_open(Path::new("C:/books/other")));
+        state.common.discard_target();
+        assert!(!state.has_pending_book_open(&cache));
+        assert!(!state.has_pending_book_open(&logical));
+    }
+
+    #[test]
+    fn pending_book_open_query_reads_only_accepted_common_source() {
+        let source = PathBuf::from("C:/Books/Opening");
+        let mut state = discarded_restore_state(source.join("chapter"));
+        assert!(!state.has_pending_book_open(&source));
+        let cancel = Arc::new(AtomicBool::new(false));
+        state.common.continuation = ContinuationOwner::IndexOnly {
+            cancel: Arc::clone(&cancel),
+        };
+        assert!(state.has_pending_book_open(Path::new(r"c:\books\opening")));
+        assert!(!state.has_pending_book_open(Path::new("C:/Books/Open")));
+        assert!(!state.has_pending_book_open(Path::new("D:/Books/Opening")));
+        state.phase = Phase::Resuming;
+        assert!(state.has_pending_book_open(&source));
+        cancel.store(true, Ordering::Relaxed);
+        assert!(!state.has_pending_book_open(&source));
     }
 
     fn probe_result(

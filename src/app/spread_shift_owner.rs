@@ -267,12 +267,15 @@ pub(super) struct ViewerBookRestore {
 }
 
 impl ViewerBookRestore {
+    pub(super) fn logical_source(&self) -> &Path {
+        &self.receipt.scope.logical_root
+    }
+
     pub(super) fn refresh_memory_policy(
         &mut self,
         generation: u64,
         memory: bool,
         service: Option<&SpreadShiftService>,
-        resume_writer: Option<&crate::book_resume_db::BookResumeWriter>,
     ) {
         self.receipt.settings_generation = generation;
         self.receipt.shift_cutoff = service.map_or(0, |service| service.watermarks().admitted);
@@ -281,12 +284,8 @@ impl ViewerBookRestore {
         } else {
             ShiftMemoryPolicy::SessionOnly
         };
-        self.reads = RestoreReadDependencies::admit(
-            self.receipt.clone(),
-            memory.then_some(service).flatten(),
-            resume_writer,
-            self.resume_key.as_deref(),
-        );
+        self.reads
+            .refresh_shift_dependency(self.receipt.clone(), memory.then_some(service).flatten());
     }
 }
 
@@ -449,17 +448,14 @@ impl App {
                 .as_ref()
                 .map_or(0, |w| w.watermarks().admitted),
         };
-        // Resume retains its released root-only contract for archive levels.
-        let resume_key = (!retained
-            && self
-                .zip_nav
-                .as_ref()
-                .is_none_or(|nav| nav.current().is_empty()))
-        .then(|| {
-            self.effective_folder()
-                .map(|path| crate::path_key::normalize(&path))
-        })
-        .flatten();
+        // Use the same root qualification and physical key as the resume producer,
+        // including collapsed wrappers and converted archives.
+        let resume_key = (!retained)
+            .then(|| {
+                self.book_resume_recording_folder()
+                    .map(crate::path_key::normalize)
+            })
+            .flatten();
         let memory = self.settings.remember_spread_shift_per_book;
         let reads = RestoreReadDependencies::admit(
             receipt.clone(),

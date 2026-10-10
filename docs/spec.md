@@ -880,10 +880,16 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
   明示ON/OFFはretained待機を取り消し、受入済みの兄弟窓へ旧保存値を適用しない。
   fresh-open待機は元のresume cutoffと捕捉済み対象を保ち、新settings世代・現在のshift受付cutoffで
   依存を再受付する。設定変更で元の読書位置の完了待ちを失わない。
+  差し替えはshift依存のみで、元のresume receiver・取得済み位置も保持する。
+  resumeのroot資格・保存キーは既存記録producerと共用し、単一ラッパーZIP・変換書庫も同じfenceを通す。
   retained/import復元は現在の実ページを含むunitへ正規化するだけで共有resume/historyを書かない。
   importの捕捉FIFO読取はContextRequest workerで待ち、context/items世代採用後に
   current scope + ON + Automaticの一致で使う。成功済みroot/page操作はpureなlive mappingで
   mounted/at-restへ反映し、追加save/mountなし。snapshotはdurable scopeを切り離して現在のnumeric session組を保つ。
+  import後のshift再採用は実際にcommitで変更したscopeだけに限定する。
+  root改名はcontextの参照元・items・identity indexも同じ境界で移行し、snapshotのanchor remapは
+  fullscreenの有無によらずitems交換で行う。case/slash衝突は受入列の先頭slotを選ぶ。
+  保守中のSet/Clearは既存FIFOへ受理し、完了replyの種別から保存/解除を通知する。
   記憶OFFは現表示をsession扱いで保持し、保存値を休眠させ、新規openの復元とnudge保存を止める。
   OFF→ONは適格な操作元Bookのlive調整だけを保存し、調整なしではその場で旧保存値を適用しない。
   siblings/parkedを一斉保存しない。明示ClearはOFF中もlive調整と保存値を消す (Q1)。

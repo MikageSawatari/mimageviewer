@@ -489,6 +489,8 @@ shift Clearへ接続する。HUDと環境設定転送には全体boolを、metad
 表示済みの無関係な兄弟窓へ旧保存値を復元しない。fresh-openのCommon依存は世代不一致だけで
 破棄せず、`refresh_pending_book_shift_memory_policy`が捕捉済みtarget/context/items/open/scopeと
 元のresume cutoffを維持して、新settings世代・現在のshift受付cutoffで読取依存を再受付する。
+再受付するのはshift依存だけで、元のresume receiverと取得済み結果は保持する。
+resumeのroot資格・キーは既存producerの`at_root()`・`current_folder`を共用する。
 これは設定変更に伴う通常遷移であり、retryやまれな失敗の復旧ではない。
 
 新規openのRestoreは既存`sidecar_restore::Common`の`ViewerBookRestore`として受け、最終identity/navへ
@@ -506,6 +508,12 @@ retainedとimportの復元では
 `adopt_shift_layout_without_navigation`が現在の実ページを含むunitへ正規化するだけで、
 共有resume/historyを書かない。metadata importは捕捉FIFO読取をContextRequest workerで待ち、
 context/items世代の採用判定後にcurrent scope + ON + Automaticの一致で調整を採用する。
+shiftの読取対象はmanifestのsection flagではなく、import commitで実際に変更したscope集合に限る。
+root改名は同じ移行境界でmounted/at-restの参照元・items・prepared identity indexを移し、
+scopeだけが新rootを指す状態を作らない。snapshotのanchor remapはfullscreenの有無によらずitems交換で行う。
+製本管理の改名は、同一本のopenが未完了の場合だけ既存pending ownerで待ち、旧keyでの採用後に
+通常workerへ進む。全contextとglobal continuationの捕捉済み対象をread-onlyで照合し、別本や
+未完了openのない改名には待機を追加しない。openの所有・completion契約は変更しない。
 OFFではそのshift読取結果を使わない。D2の自動検証・独立完了レビュー・
 利用者確認はこの記述では完了扱いにしない。Remote saved/groupとG3共同fixtureはD3の範囲。
 

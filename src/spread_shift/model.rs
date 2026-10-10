@@ -175,6 +175,14 @@ pub(crate) enum ShiftPersistence {
     Saved(u64),
     SaveFailed,
 }
+
+/// The admitted operation survives its viewer so completion notifications can
+/// describe the write even after the original context has retired.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShiftWriteKind {
+    Set,
+    Clear,
+}
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum SpreadShiftState {
     #[default]
@@ -492,6 +500,24 @@ pub(crate) struct CompletedRestoreReads {
     pub(crate) resume: Option<ReadingPosition>,
 }
 impl RestoreReadDependencies {
+    /// A memory-policy change replaces only shift adoption. The resume read was
+    /// fixed at open admission, so retain its receiver or already received result.
+    pub(crate) fn refresh_shift_dependency(
+        &mut self,
+        receipt: RestoreReceipt,
+        service: Option<&SpreadShiftService>,
+    ) {
+        debug_assert!(matches!(self.adoption, RestoreReadAdoption::Waiting));
+        debug_assert_eq!(self.receipt.open_id, receipt.open_id);
+        debug_assert_eq!(self.receipt.context_id, receipt.context_id);
+        debug_assert_eq!(self.receipt.scope, receipt.scope);
+        debug_assert_eq!(self.receipt.items_generation, receipt.items_generation);
+        debug_assert_eq!(self.receipt.resume_cutoff, receipt.resume_cutoff);
+        self.shift_rx = service.map(|s| s.read_after(receipt.scope.clone(), receipt.shift_cutoff));
+        self.shift = None;
+        self.receipt = receipt;
+    }
+
     pub(crate) fn admit(
         receipt: RestoreReceipt,
         service: Option<&SpreadShiftService>,
@@ -1091,6 +1117,47 @@ mod tests {
             assert!(Arc::ptr_eq(&captured.units, &live.units));
             assert_eq!(captured.rules, live.rules);
         }
+    }
+
+    #[test]
+    fn memory_refresh_preserves_received_resume_while_replacing_shift_dependency() {
+        let (shift_tx, shift_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let mut original = receipt();
+        let mut pending = RestoreReadDependencies::from_receivers(
+            original.clone(),
+            Some(shift_rx),
+            Some(resume_rx),
+        );
+        let position = ReadingPosition {
+            page: 2,
+            identity: None,
+        };
+        resume_tx
+            .send(PositionReadReply {
+                cutoff: original.resume_cutoff,
+                completed_through: original.resume_cutoff,
+                position: Some(position.clone()),
+                status: Ok(()),
+            })
+            .unwrap();
+        assert!(pending.try_complete(&original, 6).unwrap().is_none());
+        assert!(pending.resume_rx.is_none());
+        assert_eq!(
+            pending.resume.as_ref().unwrap().position,
+            Some(position.clone())
+        );
+
+        // OFF removes the shift wait, but the completed initial resume stays owned.
+        original.settings_generation += 1;
+        original.shift_cutoff += 1;
+        pending.refresh_shift_dependency(original.clone(), None);
+        assert!(shift_tx.send(shift_read(None)).is_err());
+        let completed = pending.try_complete(&original, 6).unwrap().unwrap();
+        assert_eq!(completed.resume, Some(position));
+        assert_eq!(completed.receipt.resume_cutoff, 7);
+        assert!(completed.shift.is_none());
+        assert!(pending.try_complete(&original, 6).is_err());
     }
 
     #[test]

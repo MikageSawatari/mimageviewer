@@ -1657,6 +1657,7 @@ fn mutation_refresh_import_pin_snapshot_retires_only_superseded_materialization_
             ratings: true,
             ..Default::default()
         },
+        &Default::default(),
     );
     assert_eq!(ratings_only.len(), 1);
     assert_eq!(ratings_only[0].context_id, main_id);
@@ -1670,6 +1671,7 @@ fn mutation_refresh_import_pin_snapshot_retires_only_superseded_materialization_
             thumbnail_pins: true,
             ..Default::default()
         },
+        &Default::default(),
     );
     assert_eq!(pin_requests.len(), 1);
     assert_eq!(pin_requests[0].context_id, main_id);
@@ -7784,7 +7786,7 @@ fn metadata_refresh_context_identity_survives_closing_an_earlier_window() {
     app.begin_metadata_import_terminal_refresh();
     while !app.advance_metadata_import_terminal_refresh(&import_root, false) {}
     let request = app
-        .take_metadata_import_refresh_requests(Default::default())
+        .take_metadata_import_refresh_requests(Default::default(), &Default::default())
         .into_iter()
         .find(|request| request.context_id == target_context_id)
         .expect("the target window must have a refresh request before the earlier close");
@@ -7850,7 +7852,7 @@ fn metadata_refresh_context_identity_survives_main_promotion() {
     app.begin_metadata_import_terminal_refresh();
     while !app.advance_metadata_import_terminal_refresh(&import_root, false) {}
     let request = app
-        .take_metadata_import_refresh_requests(Default::default())
+        .take_metadata_import_refresh_requests(Default::default(), &Default::default())
         .into_iter()
         .find(|request| request.context_id == requested_context_id)
         .expect("the context bound as main at request time must have a refresh request");
@@ -7917,7 +7919,8 @@ fn metadata_request_bakes_context_identity_across_bundleless_window() {
 
     app.begin_metadata_import_terminal_refresh();
     while !app.advance_metadata_import_terminal_refresh(&import_root, false) {}
-    let requests = app.take_metadata_import_refresh_requests(Default::default());
+    let requests =
+        app.take_metadata_import_refresh_requests(Default::default(), &Default::default());
 
     assert!(
         requests
@@ -9057,7 +9060,8 @@ fn metadata_import_terminal_index_build_is_split_and_compact() {
     assert!((1..=2_048).contains(&first_frame_items));
 
     while !app.advance_metadata_import_terminal_refresh(&root, false) {}
-    let requests = app.take_metadata_import_refresh_requests(Default::default());
+    let requests =
+        app.take_metadata_import_refresh_requests(Default::default(), &Default::default());
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].items.len(), 5_000);
     assert_eq!(requests[0].folder_pin_paths, vec![root]);
@@ -9315,7 +9319,8 @@ fn parked_pdf_metadata_request_includes_container_rating_key() {
 
     app.begin_metadata_import_terminal_refresh();
     while !app.advance_metadata_import_terminal_refresh(&root, false) {}
-    let requests = app.take_metadata_import_refresh_requests(Default::default());
+    let requests =
+        app.take_metadata_import_refresh_requests(Default::default(), &Default::default());
     let request = requests
         .iter()
         .find(|request| request.context_id == parked_id)
@@ -41016,12 +41021,14 @@ mod favorite_adjustment_defaults_tests {
         let result = crate::books::delete_book(&actual_root, "Book").unwrap();
         app.settings.book_root = Some(app.tmp.path().join("changed-books-setting"));
         let (tx, rx) = std::sync::mpsc::channel();
-        app.book_op_pending = Some(crate::books::BookOpPending {
-            rx,
-            intent: crate::books::BookOpIntent::Delete {
-                path: actual_book.clone(),
+        app.book_op_pending = Some(super::BookManagerPending::Running(
+            crate::books::BookOpPending {
+                rx,
+                intent: crate::books::BookOpIntent::Delete {
+                    path: actual_book.clone(),
+                },
             },
-        });
+        ));
         tx.send(Ok(result)).unwrap();
 
         app.poll_book_op_pending(&ctx);
@@ -41060,12 +41067,14 @@ mod favorite_adjustment_defaults_tests {
         app.delete_pending = None;
 
         let (_book_tx, book_rx) = std::sync::mpsc::channel();
-        app.book_op_pending = Some(crate::books::BookOpPending {
-            rx: book_rx,
-            intent: crate::books::BookOpIntent::Delete {
-                path: PathBuf::from("new"),
+        app.book_op_pending = Some(super::BookManagerPending::Running(
+            crate::books::BookOpPending {
+                rx: book_rx,
+                intent: crate::books::BookOpIntent::Delete {
+                    path: PathBuf::from("new"),
+                },
             },
-        });
+        ));
         app.try_start_next_rename_migration();
         assert!(app.rename_migration_in_flight.is_none());
         app.book_op_pending = None;
@@ -45469,7 +45478,8 @@ mod favorite_adjustment_defaults_tests {
 
         app.begin_metadata_import_terminal_refresh();
         while !app.advance_metadata_import_terminal_refresh(Path::new(r"C:\test"), false) {}
-        let requests = app.take_metadata_import_refresh_requests(Default::default());
+        let requests =
+            app.take_metadata_import_refresh_requests(Default::default(), &Default::default());
         assert_eq!(requests.len(), 1);
         let request = &requests[0];
         let effective = crate::path_key::normalize_keep_drive(&zip_path.join("bookB").join("only"));

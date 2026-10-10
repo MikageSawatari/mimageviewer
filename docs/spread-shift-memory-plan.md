@@ -805,6 +805,62 @@ metadata refresh 9件、`cargo test --test ui_snapshot` 155件も成功。HUDの
 workspace full gate・共同fixtureはD3の最終統合へ、独立構造確認・完了レビューと別承認の実機確認は
 §11.3の検証ownerへ引き継ぐ。コミットは利用者の指示どおり行っていない。
 
+### 11.5 D2bレビュー指摘補正
+
+基点は利用者がcommitした`8bc7efc87`。D2の独立実装レビューはREVISE（P2 7件・P3 2件）。
+本節は指摘の修正と自動検証を記録し、修正後の独立レビュー合格は主張しない。
+P2-6は利用者が**選択肢1（同一本の未完了openと製本管理の改名を直列化）を採択**した。
+同じ本を開いている途中だけ改名を待たせ、旧keyでの採用が終わってから既存の改名・移行境界へ進む。
+2026-10-11に実装と下記自動gate・確認用buildを完了した。修正後の独立完了レビューは未実施・未主張。
+
+| 指摘 | 所有境界での補正と回帰 |
+| --- | --- |
+| P2-1 保守中の通常操作 | Set/ClearをD1の既存保守後FIFOへ受理。実lease中の明示Clear・Q3 setter、混合root/read/write順序・正常exit drainを検証 |
+| P2-2 元resume読取の破棄 | `RestoreReadDependencies::refresh_shift_dependency`でshiftだけを差し替え、resume receiver/取得済み結果を保持。同本後着RecordとOFF/ON遷移、取得済み値の回帰 |
+| P2-3 resume資格/キーの分岐 | 記録producerとcaptureで`book_resume_recording_folder`を共用。`at_root()`と物理`current_folder`を使い、collapsed wrapper ZIP・変換cacheの先行/後着Recordを検証 |
+| P2-4 一時snapshot欠落 | maintenance epochをservice admission ownerに保持。保守後、別本writeがsnapshotを所有する間にも固定readの完了証明を受入できる回帰 |
+| P2-5 無変更importの再採用 | manifest flagではなく`ImportCommittedChanges.spread_shift_scopes`をdispatcherへ渡す。無変更・別scope・Set・covered Clear・cancel適用済commitと同本兄弟sessionを検証 |
+| P2-6 root改名のsource不整合 | 製本管理の同一本の未完了openだけを待ち、旧keyでの採用後に既存root移行境界でmounted/at-restの参照元・items・prepared identityとshift scopeを一緒に移す。別本・通常改名には追加待機を設けない。別本不変・再解決・ON復帰と未完了openの直列化を検証 |
+| P2-7 一覧から固定の旧slot | anchor remapをfullscreen成功分岐からitems交換へ移す。一覧から`[1,3,5]`固定で旧anchor 3がslot 1へ対応する回帰 |
+| P3-1 casefold衝突 | D1と同じ受入列の先頭slotを明示選択。通常準備・追加mergeの`A.jpg/a.jpg`衝突を検証 |
+| P3-2 retired Clear通知 | replyに`ShiftWriteKind::Set/Clear`を保持。元窓を閉じたClear完了も解除通知となり、後継ownerは変わらない回帰 |
+
+状態削減の採択: open continuationの新しい所有・保守中入力停止・resume再読取・兄弟一括復元を作らず、
+既存FIFO、依存owner、commit scope集合、root移行、items交換の一つの確定点へ揃える。
+まれな失敗は既定のログ・通知で扱い、session shift/原本を保持し、retryを追加しない。
+HUDの表示・既定キー・Single移動・設定/転送形式・D3範囲はD2の契約を維持する。
+`BookOpPending`はdocument-open/modal受付を止めず、改名の完了pollもsidecar復元中に動くため、
+改名対象のLive Commonや未採用の`FolderPaneOpenPending`候補と競合し得た。
+単純な取消・reloadはCommonのmutable sidecar予約・初回display continuationや候補のexact target/
+EPUB restoreを失う。App-globalな`pending_reload`をat-restから立てる案も、元のmounted siblingを
+reloadしてしまうため撤去した。typed continuation全体のroot移行と比較し、利用者は同一本の
+open採用を先に終える直列化を選択した。追加のUI操作は不要で、別本のopenや通常改名に追加待機はない。
+製本管理の既存pending ownerを`BookManagerPending::{WaitingRename(captured_request), Running(BookOpPending)}`
+へまとめ、待機と実行を排他的に所有する。Appのread-only queryが全contextとglobal Commonの
+既存source targetを正確に照合し、同一本の未完了openがなくなれば捕捉済み改名を既存workerへ渡す。
+openは旧keyで採用し、既存のsettled境界で参照元・index・scopeを一緒に移行する。
+openのreceiver・continuationの所有は変えず、取消・reload・retry・新しいpending-open ownerを追加しない。
+最終検証（2026-10-11、基点`8bc7efc87`の未commit差分、下記最終command exit 0）:
+
+- `cargo test -p mimageviewer --lib`: 11,873成功、0失敗、55 ignored（1426.62秒）。最終source変更後の全lib。
+- focused: `--lib spread_shift` 94成功、`--lib book_rename` 5成功、`--lib book_root_move` 1成功、
+  `--lib pending_book_open_query` 7成功、`--lib saved_group_actions` 17成功、Collection password lease 1成功。
+  先行checkpointのidentity 5件・snapshot remap 1件も最終全libへ含まれる。
+- `cargo test --test ui_snapshot -- --test-threads=1`: 155成功、0失敗。HUD 8 baselineを含め画像は変更なし。
+- 通常／`--features portable`の`cargo check -p mimageviewer --bin mimageviewer-core`、
+  `cargo fmt --all --check`、UI glyph（危険glyph 0）、`git diff --check`が成功。
+- `scripts/build-dev.ps1 -PreserveRuntime`: normal feature setのcore・remote・EPUB PDF workerをbuildし、
+  runtime/PE検証成功。このworktreeのcoreが動いていないことを確認して実行し、製品は起動していない。
+
+初回全libは11,872成功・1失敗・55 ignored。追加したroot移行回帰が、空suffixの`join`で
+addressへ末尾separatorを追加する誤りを検出した。参照元を移す共通helperでroot自体はtargetを直接
+使うよう修正し、期待値を変えずfocused成功後に全libを再実行した。
+並列UI snapshotは154件成功後に既存Meiryo Boldの1件が停止したため、このworktreeの自分の
+snapshot test processだけを終了し、全155件を直列で成功確認した。停止した実行は成功扱いにしない。
+初回dispatcher fixtureは実際の別窓一覧登録へ修正し、新規query fixtureの借用・本資格も修正してから
+最終全libを実行した。ログは`target/D-1364-d2b-*.log`、実装者handoffは`target/D-1364-d2b-msg.txt`。
+commit・製品起動・実機受入・修正後の独立レビュー合格は行っていない／主張しない。
+
 ## 12. 決定済み事項（番号固定）
 
 2026-10-10の利用者回答で全推奨案を採択。Q2はG Q6の既決定、Q5はR2 coordinator採択を

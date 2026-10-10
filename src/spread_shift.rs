@@ -44,6 +44,7 @@ pub(crate) struct ShiftWriteReply {
     pub(crate) sequence: u64,
     pub(crate) scope: BookScopeKey,
     pub(crate) operation: ShiftOperation,
+    pub(crate) kind: ShiftWriteKind,
     pub(crate) changed: bool,
     pub(crate) status: Result<(), String>,
 }

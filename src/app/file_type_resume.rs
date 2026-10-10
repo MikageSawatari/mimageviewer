@@ -46,10 +46,7 @@ impl PreparedPageIdentityIndex {
                 readable_indices.insert(index);
             }
         }
-        let shift_identities = identities
-            .iter()
-            .map(|(identity, index)| (shift_identity_key(identity), *index))
-            .collect();
+        let shift_identities = prepare_shift_identities(&identities);
         Self {
             policy,
             identities: Arc::new(identities),
@@ -63,6 +60,37 @@ impl PreparedPageIdentityIndex {
         Self {
             policy,
             ..Default::default()
+        }
+    }
+
+    /// A book-root rename preserves row slots. Migrate the prepared logical source
+    /// identities with the accepted sources without reconstructing a projection.
+    pub(crate) fn with_moved_root(&self, source: &Path, target: &Path) -> Self {
+        let mut identities = HashMap::new();
+        for (identity, slot) in self.identities.iter() {
+            let mut identity = identity.clone();
+            let path = match &mut identity {
+                PageIdentity::Image { path } => path,
+                PageIdentity::Archive { container, .. }
+                | PageIdentity::Document { container, .. } => container,
+            };
+            if let Some(mapped) =
+                super::spread_shift_live_mappings::map_root_path(Path::new(path), source, target)
+            {
+                *path = crate::path_key::normalize_keep_drive(&mapped);
+            }
+            identities
+                .entry(identity)
+                .and_modify(|first: &mut usize| *first = (*first).min(*slot))
+                .or_insert(*slot);
+        }
+        let shift_identities = prepare_shift_identities(&identities);
+        Self {
+            policy: self.policy.clone(),
+            identities: Arc::new(identities),
+            shift_identities: Arc::new(shift_identities),
+            current_slots: self.current_slots.clone(),
+            readable_indices: self.readable_indices.clone(),
         }
     }
 
@@ -131,10 +159,7 @@ impl PreparedPageIdentityIndex {
                     .map_or(0, |max| max + 1),
             )
             .max(slots.iter().flatten().max().map_or(0, |max| max + 1));
-        let shift_identities = identities
-            .iter()
-            .map(|(identity, index)| (shift_identity_key(identity), *index))
-            .collect();
+        let shift_identities = prepare_shift_identities(&identities);
         Self {
             policy: self.policy.clone(),
             identities: Arc::new(identities),
@@ -170,6 +195,21 @@ impl PreparedPageIdentityIndex {
             .get(&shift_identity_key(identity))
             .and_then(|slot| self.current_slots.get(*slot).copied().flatten())
     }
+}
+
+/// D1 admits the first row in accepted order for a slash/case collision. These
+/// inputs are HashMaps, so choose that row explicitly rather than their iteration order.
+fn prepare_shift_identities(
+    identities: &HashMap<PageIdentity, usize>,
+) -> HashMap<PageIdentity, usize> {
+    let mut result = HashMap::new();
+    for (identity, index) in identities {
+        result
+            .entry(shift_identity_key(identity))
+            .and_modify(|first: &mut usize| *first = (*first).min(*index))
+            .or_insert(*index);
+    }
+    result
 }
 
 fn shift_identity_key(identity: &PageIdentity) -> PageIdentity {
@@ -276,6 +316,43 @@ mod remap_tests {
             identity: PageIdentity::for_item(item, None),
         }
     }
+    #[test]
+    fn shift_case_collisions_choose_first_accepted_row_in_both_preparation_paths() {
+        for archive in [false, true] {
+            let item = |name: &str| {
+                if archive {
+                    GridItem::ZipImage {
+                        zip_path: "book.zip".into(),
+                        entry_name: name.into(),
+                    }
+                } else {
+                    GridItem::Image(name.into())
+                }
+            };
+            let rows = [item("A.jpg"), item("a.jpg")];
+            let lookup = PageIdentity::for_item(&rows[1], None).unwrap();
+            // Repeat to exercise independently seeded maps; either spelling must use
+            // the deterministic row-order choice without altering resume matching.
+            for _ in 0..32 {
+                let prepared = PreparedPageIdentityIndex::prepare(&rows, None, Default::default());
+                assert_eq!(prepared.resolve_shift_identity(&lookup), Some(0));
+                assert_eq!(
+                    prepared.resolve(&position(&rows[1])),
+                    PositionResolution::Restored(usize::from(archive))
+                );
+                let first =
+                    PreparedPageIdentityIndex::prepare(&rows[..1], None, Default::default());
+                let second =
+                    PreparedPageIdentityIndex::prepare(&rows[1..], None, Default::default());
+                let merged = first.with_mapped_additions(&second, &[Some(1)]);
+                assert_eq!(merged.resolve_shift_identity(&lookup), Some(0));
+                // The first row is the smallest final slot, even if it comes from additions.
+                let reversed = second.with_mapped_additions(&first, &[Some(1)]);
+                assert_eq!(reversed.resolve_shift_identity(&lookup), Some(0));
+            }
+        }
+    }
+
     #[test]
     fn visibility_deletion_remaps_repeated_current_slots_and_preserves_saved_arc() {
         let rows = ["a.jpg", "b.jpg", "c.jpg", "d.jpg"].map(|p| GridItem::Image(p.into()));

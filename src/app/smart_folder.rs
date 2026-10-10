@@ -1192,6 +1192,13 @@ struct SmartFolderNavContinuation {
 }
 
 impl SmartFolderTransition {
+    pub(in crate::app) fn has_pending_book_open(&self, root: &Path) -> bool {
+        !matches!(self.phase, SmartFolderTransitionPhase::Retired)
+            && matches!(&self.target, SmartFolderTransitionTarget::Child { source, .. }
+                if crate::path_key::physical_path_is_within(&source.logical_source, root)
+                    || crate::path_key::physical_path_is_within(&source.load_path, root))
+    }
+
     fn cancel_work(&self) {
         match &self.phase {
             SmartFolderTransitionPhase::RootScan(pending) => pending.cancel(),
@@ -10035,6 +10042,26 @@ mod tests {
                     }
                 )
             })
+    }
+
+    #[test]
+    fn pending_book_open_query_tracks_smart_child_logical_and_cache_targets() {
+        let mut app = crate::app::setup_app_for_test();
+        let (source, _) = stage_smart_epub_conversion(&mut app);
+        app.epub_convert = None;
+        let cache = PathBuf::from("C:/cache/smart-pages.pdf");
+        let transition = app.smart_folder_transition.as_mut().unwrap();
+        let SmartFolderTransitionTarget::Child { source: child, .. } = &mut transition.target
+        else {
+            panic!("expected child target");
+        };
+        child.load_path = cache.clone();
+        assert!(app.has_pending_book_open(&source));
+        assert!(app.has_pending_book_open(&cache));
+        assert!(!app.has_pending_book_open(Path::new("C:/books/other")));
+        app.smart_folder_transition.as_mut().unwrap().phase = SmartFolderTransitionPhase::Retired;
+        assert!(!app.has_pending_book_open(&source));
+        assert!(!app.has_pending_book_open(&cache));
     }
 
     #[test]

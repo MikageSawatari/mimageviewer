@@ -51,10 +51,10 @@ fn book_manager_rename_during_maintenance_lease_keeps_captured_root_and_anchor()
     app.settings.book_root = Some(app.tmp.path().join("other-books"));
     let (tx, rx) = mpsc::channel();
     tx.send(Ok(completed)).unwrap();
-    app.book_op_pending = Some(BookOpPending {
+    app.book_op_pending = Some(super::BookManagerPending::Running(BookOpPending {
         rx,
         intent: BookOpIntent::SourceMutation,
-    });
+    }));
     let lease = crate::spread_shift::maintenance_at(&data).unwrap();
     let before = service.watermarks().admitted;
     app.poll_book_op_pending(&egui::Context::default());
@@ -108,10 +108,10 @@ fn book_manager_delete_during_maintenance_lease_purges_same_name_and_preserves_s
     app.settings.book_root = Some(app.tmp.path().join("other-books"));
     let (tx, rx) = mpsc::channel();
     tx.send(Ok(completed)).unwrap();
-    app.book_op_pending = Some(BookOpPending {
+    app.book_op_pending = Some(super::BookManagerPending::Running(BookOpPending {
         rx,
         intent: BookOpIntent::Delete { path: root.clone() },
-    });
+    }));
     let lease = crate::spread_shift::maintenance_at(&data).unwrap();
     let before = service.watermarks().admitted;
     app.poll_book_op_pending(&egui::Context::default());

@@ -353,6 +353,61 @@ fn q3_successful_mode_repress_mode_flow_and_direction_resets_clear_in_fifo_order
 }
 
 #[test]
+fn explicit_clear_and_q3_resets_during_real_maintenance_keep_fifo_clear_and_notify_success() {
+    let mut env = setup_app();
+    let root = env.tmp.path().join("books/maintenance-reset");
+    let data = env.tmp.path().join("shift-data");
+    install_book(&mut env, &root);
+    let scope = env.current_spread_shift_scope().unwrap();
+    let (service, owner) = runtime(&mut env, &data);
+    let ctx = egui::Context::default();
+    for action in 0..5 {
+        // Start with a durable older row to prove maintenance keeps the admitted
+        // Set/Clear order rather than reporting failure or resurrecting that row.
+        env.set_live_spread_shift(1);
+        row(&service, &scope);
+        env.poll_spread_shift_service();
+        let lease = maintenance_at(&data).unwrap();
+        let before = service.watermarks().admitted;
+        env.fs_feedback_toast = None;
+        env.set_live_spread_shift(3);
+        let current_mode = env.spread_mode;
+        match action {
+            0 => {
+                env.reset_live_spread_shift(true);
+            }
+            1 => env.apply_fullscreen_spread_mode(&ctx, 0, current_mode),
+            2 => env.apply_fullscreen_spread_mode(&ctx, 0, crate::settings::SpreadMode::LtrCover),
+            3 => {
+                env.set_reading_flow_for_fullscreen(&ctx, 0, crate::settings::ReadingFlow::Vertical)
+            }
+            _ => env.set_reading_direction_for_fullscreen(
+                &ctx,
+                0,
+                crate::settings::ReadingDirection::Rtl,
+            ),
+        }
+        assert_eq!(env.spread_shift.state, ViewerShift::None);
+        assert_eq!(service.watermarks().admitted, before + 2);
+        assert!(
+            env.fs_feedback_toast.is_none(),
+            "lease admission is not a write failure"
+        );
+        drop(lease);
+        assert_eq!(row(&service, &scope), None);
+        env.poll_spread_shift_service();
+        assert!(
+            env.fs_feedback_toast
+                .as_ref()
+                .unwrap()
+                .0
+                .contains("解除しました")
+        );
+    }
+    owner.shutdown_and_join();
+}
+
+#[test]
 fn q3_failed_base_setter_does_not_clear_live_or_saved_shift() {
     let mut env = setup_app();
     let root = env.tmp.path().join("books/reset-failed");
@@ -716,6 +771,86 @@ fn retained_readoption_off_keeps_session_and_does_not_wait_for_saved_read() {
 
 #[cfg(windows)]
 #[test]
+fn book_rename_handler_retained_read_adopts_new_scope_and_preserves_siblings() {
+    let mut env = setup_app();
+    let source = env.tmp.path().join("books/rename-source");
+    let target = env.tmp.path().join("books/rename-target");
+    let unrelated = env.tmp.path().join("books/rename-source-sibling");
+    let data = env.tmp.path().join("shift-data");
+    install_book(&mut env, &unrelated);
+    env.settings.remember_spread_shift_per_book = false;
+    assert!(env.set_live_spread_shift(3));
+    let main_shift = env.spread_shift.clone();
+    let main_index = Arc::clone(&env.page_identity_index);
+    let main_generation = env.items_generation;
+    let main_cancel = Arc::clone(&env.cancel_token);
+    let moved = env.build_window_context_for_test(136_421, |app| {
+        install_book(app, &source);
+        assert!(app.set_live_spread_shift(0));
+        app.fullscreen_idx = Some(2);
+    });
+    let sibling = env.build_window_context_for_test(136_422, |app| {
+        install_book(app, &unrelated);
+        assert!(app.set_live_spread_shift(3));
+    });
+    let (service, owner) = runtime(&mut env, &data);
+    env.settings.remember_spread_shift_per_book = true;
+    let old_scope = BookScopeKey::folder(&source).unwrap();
+    let new_scope = BookScopeKey::folder(&target).unwrap();
+    service
+        .set_shift(
+            old_scope.clone(),
+            SpreadShiftPageRef::RelativePath("1.png".into()),
+            ShiftOperation {
+                context_id: ViewerContextId::for_test(999),
+                items_generation: 0,
+                operation_sequence: 1,
+            },
+        )
+        .unwrap();
+    row(&service, &old_scope);
+    // The real application completion boundary receives the final physical root move.
+    env.apply_book_page_edit_moves_with_journal(&[], None, Some((&source, &target)));
+    assert_eq!(row(&service, &old_scope), None);
+    assert_eq!(
+        row(&service, &new_scope),
+        Some(SpreadShiftPageRef::RelativePath("1.png".into()))
+    );
+    assert_eq!(env.current_folder.as_deref(), Some(unrelated.as_path()));
+    assert_eq!(env.spread_shift, main_shift);
+    assert!(Arc::ptr_eq(&env.page_identity_index, &main_index));
+    assert_eq!(env.items_generation, main_generation);
+    assert!(Arc::ptr_eq(&env.cancel_token, &main_cancel));
+    let admitted = service.watermarks().admitted;
+    env.with_window_context_for_test(moved, |app| {
+        assert_eq!(app.current_folder.as_deref(), Some(target.as_path()));
+        assert_eq!(app.current_spread_shift_scope(), Some(new_scope.clone()));
+        assert_eq!(app.items[2], GridItem::Image(target.join("2.png")));
+        app.begin_retained_shift_readoption(&egui::Context::default());
+        app.finish_page_identity_preparation_for_test();
+        assert_eq!(app.spread_shift_anchor_idx(), Some(1));
+        assert_eq!(app.fullscreen_idx, Some(1));
+        // An ordinary F5/reload now targets the migrated accepted source.
+        assert_eq!(app.current_folder.as_deref(), Some(target.as_path()));
+    });
+    env.with_window_context_for_test(sibling, |app| {
+        assert_eq!(app.current_folder.as_deref(), Some(unrelated.as_path()));
+        assert_eq!(app.spread_shift_anchor_idx(), Some(3));
+    });
+    assert_eq!(
+        service.watermarks().admitted,
+        admitted,
+        "retained read does not write"
+    );
+    env.retire_context(moved, "rename_retained_test", |_| ())
+        .unwrap();
+    env.retire_context(sibling, "rename_sibling_test", |_| ())
+        .unwrap();
+    owner.shutdown_and_join();
+}
+
+#[cfg(windows)]
+#[test]
 fn imported_read_applies_only_current_memory_on_scope_and_preserves_sibling() {
     let mut env = setup_app();
     let root = env.tmp.path().join("books/imported");
@@ -837,6 +972,7 @@ fn obsolete_success_notification_does_not_replace_latest_failure_toast() {
     let failure = ShiftWriteReply {
         sequence: service.watermarks().admitted,
         scope,
+        kind: ShiftWriteKind::Set,
         operation: ShiftOperation {
             context_id: env.spread_shift_context_id(),
             items_generation: env.items_generation,
@@ -1153,6 +1289,9 @@ fn sibling_memory_toggle_refreshes_fresh_common_policy_and_keeps_original_resume
         app.set_live_spread_shift(1);
         app.settings.remember_spread_shift_per_book = true;
     });
+    let sibling_reader = env.build_window_context_for_test(136_409, |app| {
+        install_book(app, &root);
+    });
     env.book_resume_writer = crate::book_resume_db::BookResumeWriter::spawn_at(
         env.tmp.path().join("fresh-policy-resume.db"),
     );
@@ -1205,8 +1344,16 @@ fn sibling_memory_toggle_refreshes_fresh_common_policy_and_keeps_original_resume
     };
     assert!(env.begin_sidecar_restore(continuation, false).is_ok());
     let main_context = env.spread_shift_context_id();
+    env.with_window_context_for_test(sibling_reader, |app| {
+        assert!(!app.sidecar_restore_blocks_projected_context());
+        // The fresh-open resume read is already queued before this sibling Record.
+        // Policy changes must preserve that exact read, not reread its old cutoff.
+        app.record_book_resume(4);
+    });
     env.with_window_context_for_test(sibling, |app| {
         assert!(!app.sidecar_restore_blocks_projected_context());
+        app.spread_shift_memory_setting_changed(false);
+        app.spread_shift_memory_setting_changed(true);
         app.spread_shift_memory_setting_changed(false);
         assert_eq!(app.spread_shift_anchor_idx(), Some(1));
         assert_eq!(
@@ -1233,7 +1380,7 @@ fn sibling_memory_toggle_refreshes_fresh_common_policy_and_keeps_original_resume
             .unwrap()
             .watermarks()
             .admitted,
-        resume_cutoff
+        resume_cutoff + 1
     );
     resume_pause.send(()).unwrap();
     env.finish_page_identity_preparation_for_test();
@@ -1320,6 +1467,36 @@ fn parked_reply_targets_its_owner_and_retired_reply_keeps_new_context_unchanged(
     env.poll_spread_shift_service();
     assert_eq!(env.spread_shift, main_state);
     env.with_window_context_for_test(successor, |app| {
+        assert_eq!(app.spread_shift_anchor_idx(), Some(1));
+        assert_eq!(persistence(app), ShiftPersistence::SessionOnly);
+    });
+    let pause = service.pause_for_test();
+    env.with_window_context_for_test(successor, |app| {
+        app.set_live_spread_shift(5);
+        app.reset_live_spread_shift(true);
+    });
+    env.retire_context(successor, "shift_retired_clear_reply_test", |_| ())
+        .unwrap();
+    let clear_successor = env.build_window_context_for_test(136_402, |app| {
+        install_book(app, &root);
+        app.settings.remember_spread_shift_per_book = false;
+        app.set_live_spread_shift(1);
+        app.settings.remember_spread_shift_per_book = true;
+    });
+    env.fs_feedback_toast = None;
+    pause.send(()).unwrap();
+    assert_eq!(row(&service, &BookScopeKey::folder(&root).unwrap()), None);
+    env.poll_spread_shift_service();
+    assert_eq!(env.spread_shift, main_state);
+    assert!(
+        env.fs_feedback_toast
+            .as_ref()
+            .unwrap()
+            .0
+            .contains("解除しました"),
+        "retired Clear still has its own typed completion kind"
+    );
+    env.with_window_context_for_test(clear_successor, |app| {
         assert_eq!(app.spread_shift_anchor_idx(), Some(1));
         assert_eq!(persistence(app), ShiftPersistence::SessionOnly);
     });
@@ -1456,4 +1633,242 @@ fn fresh_common_resume_fence_ends_before_later_session_resume_reads() {
     assert!(read.status.is_ok());
     assert_eq!(read.position.unwrap().page, 4);
     assert_eq!(env.resume_page_for_container(), Some(4));
+}
+
+#[test]
+fn collapsed_zip_root_and_converted_archive_keep_producer_resume_key_and_fixed_read() {
+    for converted in [false, true] {
+        let mut env = setup_app();
+        let physical = env.tmp.path().join(if converted {
+            "archive-cache/pages.zip"
+        } else {
+            "books/wrapped.zip"
+        });
+        let logical = if converted {
+            env.tmp.path().join("books/source.rar")
+        } else {
+            physical.clone()
+        };
+        let entries = (0..6)
+            .map(|page| crate::zip_loader::ZipImageEntry {
+                entry_name: format!("wrapper/{page}.png"),
+                uncompressed_size: 0,
+                mtime: 0,
+                container_ancestry: Vec::new(),
+            })
+            .collect();
+        let tree = Arc::new(crate::zip_tree::ZipTree::build(physical.clone(), entries));
+        let nav = crate::zip_tree::ZipNavState::new(tree.clone());
+        assert!(nav.at_root());
+        assert!(!nav.current().is_empty(), "root is the collapsed wrapper");
+        let (items, metas) = tree.materialize_level(nav.current(), Default::default());
+        env.current_folder = Some(physical.clone());
+        env.archive_source_override = converted.then_some(logical.clone());
+        env.items = items;
+        env.image_metas = metas;
+        env.thumbnails = vec![ThumbnailState::Pending; env.items.len()];
+        env.visible_indices = (0..env.items.len()).collect();
+        env.zip_nav = Some(nav);
+        env.viewer_navigation_caches.invalidate();
+        env.page_identity_index = Arc::new(file_type_resume::PreparedPageIdentityIndex::prepare(
+            &env.items,
+            Some(&logical),
+            env.settings.file_type_visibility.clone(),
+        ));
+        env.settings.remember_spread_shift_per_book = false;
+        // An absent UI read handle makes any synchronous SELECT fallback observable.
+        env.book_resume_db = None;
+        env.book_resume_writer = crate::book_resume_db::BookResumeWriter::spawn_at(
+            env.tmp.path().join("archive-resume.db"),
+        );
+        let pause = env.book_resume_writer.as_ref().unwrap().pause_for_test();
+        if converted {
+            assert!(
+                env.book_resume_writer
+                    .as_ref()
+                    .unwrap()
+                    .record(&logical, 5, None)
+            );
+        }
+        env.record_book_resume(2);
+        let cutoff = env
+            .book_resume_writer
+            .as_ref()
+            .unwrap()
+            .watermarks()
+            .admitted;
+        let mut restore = env.begin_book_shift_restore(136_410).unwrap();
+        assert!(!env.poll_book_shift_restore(&mut restore).unwrap());
+        env.record_book_resume(4);
+        pause.send(()).unwrap();
+        finish_restore(&mut env, &mut restore);
+        let latest = env
+            .book_resume_writer
+            .as_ref()
+            .unwrap()
+            .read_position_after(&crate::path_key::normalize(&physical), cutoff + 1)
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        assert!(latest.status.is_ok());
+        assert_eq!(latest.position.unwrap().page, 4);
+        let initial = env.fenced_book_resume(&physical).unwrap().unwrap();
+        assert_eq!(
+            initial.page, 2,
+            "initial admission must precede the later Record"
+        );
+        assert_eq!(env.resume_page_for_container(), Some(2));
+        env.spread_shift.finish_fenced_book_resume();
+        assert_eq!(env.fenced_book_resume(&physical), None);
+    }
+}
+
+fn begin_test_book_open(app: &mut App, root: &Path) {
+    use super::sidecar_restore::{FirstDisplayAction, SidecarLoadContinuation};
+    let now = Instant::now();
+    let continuation = SidecarLoadContinuation {
+        navigation_after_hydration: None,
+        audio_art_prune: None,
+        first_display_action: FirstDisplayAction::None,
+        restore_intent: StartupListIntent::ExplicitList,
+        auto_aspect_seed: None,
+        source_path: root.to_path_buf(),
+        source_is_directory: true,
+        prepared_subfolder: None,
+        prepared_page_edits: None,
+        prepared_aggregate: None,
+        catalog_existing_keys: Default::default(),
+        video_items: Vec::new(),
+        sli_seq: 0,
+        sli_t0: now,
+        items_len: app.items.len(),
+        detached_physical: false,
+        tx: app.tx.clone(),
+        cancel: Arc::new(AtomicBool::new(false)),
+        restore_started_at: now,
+    };
+    assert!(app.begin_sidecar_restore(continuation, false).is_ok());
+}
+
+fn finish_test_book_rename(app: &mut App, ctx: &egui::Context) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while app.book_op_pending.is_some() {
+        assert!(Instant::now() < deadline, "book rename did not finish");
+        app.poll_book_op_pending(ctx);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn book_rename_waits_for_same_book_open_in_sibling_then_migrates_adopted_old_key() {
+    let mut env = setup_app();
+    let books = env.tmp.path().join("books");
+    let old = books.join("Old");
+    let new = books.join("New");
+    let other = books.join("Other");
+    std::fs::create_dir_all(&old).unwrap();
+    for page in 0..6 {
+        std::fs::write(old.join(format!("{page}.png")), b"page").unwrap();
+    }
+    env.settings.book_root = Some(books);
+    env.settings.sidecar_backup_enabled = false;
+    install_book(&mut env, &other);
+    let unchanged = env.spread_shift.clone();
+    let sibling = env.build_window_context_for_test(136_426, |app| install_book(app, &old));
+    let data = env.tmp.path().join("rename-pending-shifts");
+    let (service, owner) = runtime(&mut env, &data);
+    service
+        .set_shift(
+            BookScopeKey::folder(&old).unwrap(),
+            SpreadShiftPageRef::RelativePath("3.png".into()),
+            ShiftOperation {
+                context_id: sibling,
+                items_generation: 1,
+                operation_sequence: 1,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        row(&service, &BookScopeKey::folder(&old).unwrap()),
+        Some(SpreadShiftPageRef::RelativePath("3.png".into()))
+    );
+    env.with_window_context_for_test(sibling, |app| begin_test_book_open(app, &old));
+    let ctx = egui::Context::default();
+    assert!(env.has_pending_book_open(&old));
+    env.start_book_rename(&ctx, "Old".into(), "New".into());
+    assert!(matches!(
+        env.book_op_pending,
+        Some(BookManagerPending::WaitingRename(_))
+    ));
+    env.poll_book_op_pending(&ctx);
+    assert!(old.exists());
+    assert!(!new.exists());
+    assert_eq!(env.spread_shift, unchanged);
+    // The original open is adopted at the original root, including its saved anchor.
+    env.finish_page_identity_preparation_for_test();
+    env.with_window_context_for_test(sibling, |app| {
+        assert_eq!(app.current_folder.as_deref(), Some(old.as_path()));
+        assert_eq!(
+            app.spread_shift.scope,
+            Some(BookScopeKey::folder(&old).unwrap())
+        );
+        assert_eq!(app.spread_shift_anchor_idx(), Some(3));
+    });
+    assert!(!env.has_pending_book_open(&old));
+    finish_test_book_rename(&mut env, &ctx);
+    assert!(!old.exists());
+    assert!(new.exists());
+    assert_eq!(env.spread_shift, unchanged);
+    env.with_window_context_for_test(sibling, |app| {
+        assert_eq!(app.current_folder.as_deref(), Some(new.as_path()));
+        assert_eq!(
+            app.spread_shift.scope,
+            Some(BookScopeKey::folder(&new).unwrap())
+        );
+        assert_eq!(app.spread_shift_anchor_idx(), Some(3));
+        assert_eq!(
+            app.page_identity_index.resolve_shift_identity(
+                &crate::book_resume_db::PageIdentity::Image {
+                    path: new.join("3.png").to_string_lossy().into_owned()
+                }
+            ),
+            Some(3)
+        );
+    });
+    assert_eq!(row(&service, &BookScopeKey::folder(&old).unwrap()), None);
+    assert_eq!(
+        row(&service, &BookScopeKey::folder(&new).unwrap()),
+        Some(SpreadShiftPageRef::RelativePath("3.png".into()))
+    );
+    owner.shutdown_and_join();
+}
+
+#[test]
+fn book_rename_starts_without_wait_for_no_pending_open_or_unrelated_book_open() {
+    for unrelated_open in [false, true] {
+        let mut env = setup_app();
+        let books = env.tmp.path().join("books");
+        let old = books.join("Old");
+        let new = books.join("New");
+        let unrelated = books.join("Old-other");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("0.png"), b"page").unwrap();
+        env.settings.book_root = Some(books);
+        env.settings.sidecar_backup_enabled = false;
+        if unrelated_open {
+            install_book(&mut env, &unrelated);
+            begin_test_book_open(&mut env, &unrelated);
+            assert!(env.has_pending_book_open(&unrelated));
+        }
+        let ctx = egui::Context::default();
+        assert!(!env.has_pending_book_open(&old));
+        env.start_book_rename(&ctx, "Old".into(), "New".into());
+        assert!(matches!(
+            env.book_op_pending,
+            Some(BookManagerPending::Running(_))
+        ));
+        finish_test_book_rename(&mut env, &ctx);
+        assert!(!old.exists());
+        assert!(new.exists());
+    }
 }

@@ -331,6 +331,24 @@ impl App {
         self.metadata_transfer_writers_busy_for_sidecar_restore(release_tag_db_for_import)
     }
 
+    // Move the existing transfer owner locally while admitting context reads. This
+    // retains the committed scope set without cloning it or deriving it from manifest flags.
+    fn start_ready_metadata_import_refresh(&mut self) {
+        let Some(mut state) = self.metadata_transfer.take() else {
+            return;
+        };
+        let requests = match state.pending_import_result.as_ref() {
+            Some(Ok(summary)) => {
+                self.take_metadata_import_refresh_requests(summary.changed, &summary.committed)
+            }
+            _ => {
+                self.take_metadata_import_refresh_requests(Default::default(), &Default::default())
+            }
+        };
+        start_metadata_import_refresh_worker(&mut state, requests);
+        self.metadata_transfer = Some(state);
+    }
+
     pub(crate) fn show_metadata_transfer_dialog(&mut self, ctx: &egui::Context) {
         if self.metadata_transfer.is_none() {
             return;
@@ -426,17 +444,7 @@ impl App {
                 self.advance_metadata_import_terminal_refresh(root, *recursive)
             });
         if refresh_ready {
-            let changed = self
-                .metadata_transfer
-                .as_ref()
-                .and_then(|state| state.pending_import_result.as_ref())
-                .and_then(|result| result.as_ref().ok())
-                .map(|summary| summary.changed)
-                .unwrap_or_default();
-            let requests = self.take_metadata_import_refresh_requests(changed);
-            if let Some(state) = self.metadata_transfer.as_mut() {
-                start_metadata_import_refresh_worker(state, requests);
-            }
+            self.start_ready_metadata_import_refresh();
         }
         // Thread creation failure reaches Result without a receiver message, so
         // return the moved DB/sidecar ownership in the same frame as well.
@@ -1648,6 +1656,154 @@ mod tests {
             .committed_thumbnail_pin_changes(),
             0
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn spread_shift_import_dispatcher_refreshes_only_committed_scopes() {
+        use crate::app::{ViewerContextId, file_type_resume, tests::phase_c_support};
+        use crate::book_scope::BookScopeKey;
+        use crate::grid_item::{GridItem, ThumbnailState};
+        use crate::spread_shift::{ShiftOperation, SpreadShiftPageRef, SpreadShiftService};
+        use std::time::{Duration, Instant};
+
+        fn install(app: &mut App, root: &std::path::Path, anchor: usize) {
+            app.current_folder = Some(root.to_path_buf());
+            app.items = (0..6)
+                .map(|page| GridItem::Image(root.join(format!("{page}.png"))))
+                .collect();
+            app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+            app.image_metas = vec![None; app.items.len()];
+            app.visible_indices = (0..app.items.len()).collect();
+            app.page_identity_index =
+                Arc::new(file_type_resume::PreparedPageIdentityIndex::prepare(
+                    &app.items,
+                    Some(root),
+                    app.settings.file_type_visibility.clone(),
+                ));
+            app.viewer_navigation_caches.invalidate();
+            app.spread_mode = crate::settings::SpreadMode::Ltr;
+            app.settings.remember_spread_shift_per_book = false;
+            assert!(app.set_live_spread_shift(anchor));
+            app.settings.remember_spread_shift_per_book = true;
+        }
+
+        // The manifest always contains shift data. No-op, other-scope commit,
+        // Set commit, and covered Clear commit must have different live effects.
+        for (changed_scope, cleared) in [(0, false), (1, false), (2, false), (2, true)] {
+            let mut env = phase_c_support::setup_app();
+            let books = env.tmp.path().join("books");
+            let root = books.join("book");
+            let other = books.join("other");
+            let scope = BookScopeKey::folder(&root).unwrap();
+            let other_scope = BookScopeKey::folder(&other).unwrap();
+            install(&mut env, &root, 1);
+            let ctx = egui::Context::default();
+            let sibling =
+                env.push_window_context_for_test(&ctx, 136_420, |app| install(app, &root, 3));
+            let unrelated =
+                env.push_window_context_for_test(&ctx, 136_421, |app| install(app, &other, 2));
+            let (service, owner) =
+                SpreadShiftService::spawn_at(env.tmp.path().join("shift-data"), None).unwrap();
+            env.spread_shift_service = Some(service.clone());
+            service
+                .set_shift(
+                    scope.clone(),
+                    SpreadShiftPageRef::RelativePath("5.png".into()),
+                    ShiftOperation {
+                        context_id: ViewerContextId::for_test(136_499),
+                        items_generation: 1,
+                        operation_sequence: 1,
+                    },
+                )
+                .unwrap();
+            if cleared {
+                service
+                    .clear_shift(
+                        scope.clone(),
+                        ShiftOperation {
+                            context_id: ViewerContextId::for_test(136_499),
+                            items_generation: 1,
+                            operation_sequence: 2,
+                        },
+                    )
+                    .unwrap();
+            }
+            service
+                .read_after(scope.clone(), service.watermarks().admitted)
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            let before = env.spread_shift.clone();
+            let unrelated_before =
+                env.with_window_context_for_test(unrelated, |app| app.spread_shift.clone());
+            env.begin_metadata_import_terminal_refresh();
+            while !env.advance_metadata_import_terminal_refresh(&books, true) {}
+            let mut summary = ImportSummary::default();
+            summary.changed.spread_shift = true;
+            // A cancelled import still refreshes scopes committed before cancellation.
+            summary.cancelled = changed_scope == 2;
+            if changed_scope != 0 {
+                summary.committed.spread_shift_scopes.insert(
+                    if changed_scope == 2 {
+                        &scope
+                    } else {
+                        &other_scope
+                    }
+                    .storage_key(),
+                );
+            }
+            let expected_committed = summary.committed.clone();
+            let mut state = MetadataTransferState::import(books.clone());
+            state.stage = Stage::RefreshPreparing;
+            state.pending_import_result = Some(Ok(summary));
+            env.metadata_transfer = Some(state);
+            env.start_ready_metadata_import_refresh();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while env
+                .metadata_transfer
+                .as_ref()
+                .is_some_and(|state| matches!(state.stage, Stage::Refreshing))
+            {
+                assert!(Instant::now() < deadline, "import refresh did not complete");
+                env.poll_metadata_transfer_worker();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let expected = if changed_scope == 2 {
+                (!cleared).then_some(5)
+            } else {
+                Some(1)
+            };
+            assert_eq!(env.spread_shift_anchor_idx(), expected);
+            env.with_window_context_for_test(sibling, |app| {
+                assert_eq!(
+                    app.spread_shift_anchor_idx(),
+                    if changed_scope == 2 {
+                        expected
+                    } else {
+                        Some(3)
+                    }
+                );
+            });
+            if changed_scope != 2 {
+                assert_eq!(
+                    env.spread_shift, before,
+                    "unchanged book keeps its live session"
+                );
+            }
+            if changed_scope != 1 {
+                assert_eq!(
+                    env.with_window_context_for_test(unrelated, |app| app.spread_shift.clone()),
+                    unrelated_before
+                );
+            }
+            let state = env.metadata_transfer.as_ref().unwrap();
+            let Stage::Result(ResultState::Import(Ok(summary))) = &state.stage else {
+                panic!("refresh did not finish successfully");
+            };
+            assert_eq!(summary.committed, expected_committed);
+            assert!(summary.incomplete_error.is_none());
+            owner.shutdown_and_join();
+        }
     }
 
     #[test]

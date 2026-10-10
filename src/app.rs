@@ -6227,6 +6227,35 @@ fn run_vst3_startup_load(
     }
 }
 
+/// One book-manager request owns either its existing worker or the rename that
+/// waits for an already pending open to adopt its original physical source.
+pub(crate) enum BookManagerPending {
+    Running(crate::books::BookOpPending),
+    WaitingRename(BookRenameRequest),
+}
+
+pub(crate) struct BookRenameRequest {
+    root: PathBuf,
+    old_name: String,
+    new_name: String,
+}
+
+impl BookManagerPending {
+    fn intent(&self) -> &crate::books::BookOpIntent {
+        match self {
+            Self::Running(pending) => &pending.intent,
+            Self::WaitingRename(_) => &crate::books::BookOpIntent::SourceMutation,
+        }
+    }
+
+    fn running_mut(&mut self) -> Option<&mut crate::books::BookOpPending> {
+        match self {
+            Self::Running(pending) => Some(pending),
+            Self::WaitingRename(_) => None,
+        }
+    }
+}
+
 /// 非同期で走っている `navigate_folder_with_skip` ワーカーの状態。
 pub(crate) struct FolderNavPending {
     /// DFS キャンセル用トークン。連打の累積・モード切替・フォルダ強制切替で立てる。
@@ -15736,7 +15765,7 @@ pub struct App {
     /// Ctrl+カメラアイコンで開始する、一回限りの範囲コピー選択。
     pub(crate) capture_region_selection: Option<crate::ui_fullscreen::CaptureRegionSelection>,
     /// 製本のページ追加 / 作成 / 改名 / 削除 / 一覧更新 worker 完了待ち。
-    pub(crate) book_op_pending: Option<crate::books::BookOpPending>,
+    pub(crate) book_op_pending: Option<BookManagerPending>,
     /// 進行中の Append 元に、ファイルへ未焼き込みの編集が含まれるか。
     /// Append 成功後の警告トーストを 1 回に集約するため、単一 book worker と同じ寿命で保持する。
     pub(crate) show_book_manager: bool,
@@ -18550,7 +18579,13 @@ impl App {
                 self.viewer_context_residence(result.operation.context_id),
                 viewer_context_registry::ContextResidence::Retired
             ) {
-                self.show_feedback_toast("見開き調整を保存しました".into());
+                self.show_feedback_toast(
+                    match result.kind {
+                        crate::spread_shift::ShiftWriteKind::Set => "見開き調整を保存しました",
+                        crate::spread_shift::ShiftWriteKind::Clear => "見開き調整を解除しました",
+                    }
+                    .into(),
+                );
             }
         }
         for error in errors {
@@ -44119,6 +44154,7 @@ impl App {
     pub(crate) fn take_metadata_import_refresh_requests(
         &mut self,
         changed: crate::metadata_transfer::ImportChangedSections,
+        committed: &crate::metadata_transfer::ImportCommittedChanges,
     ) -> Vec<metadata_import_refresh::ContextRequest> {
         fn take_current(
             index: &mut Option<MetadataImportRefreshIndex>,
@@ -44159,7 +44195,10 @@ impl App {
                 if let Err(error) = self.with_viewer_context(context_id, |app| {
                     let spread_key = app.spread_container_key_with_fallback();
                     let old_folder_pin_keys = app.folder_pin_map.keys().cloned().collect();
-                    let shift_read = app.admit_imported_shift_read(changed.spread_shift);
+                    let shift_changed = app.spread_shift.scope.as_ref().is_some_and(|scope| {
+                        committed.spread_shift_scopes.contains(&scope.storage_key())
+                    });
+                    let shift_read = app.admit_imported_shift_read(shift_changed);
                     if let Some(request) = take_current(
                         &mut app.metadata_import_refresh_index,
                         context_id,
@@ -44181,7 +44220,11 @@ impl App {
             let context_id = ViewerContextId::single_context();
             let spread_key = self.spread_container_key_with_fallback();
             let old_folder_pin_keys = self.folder_pin_map.keys().cloned().collect();
-            let shift_read = self.admit_imported_shift_read(changed.spread_shift);
+            let shift_changed =
+                self.spread_shift.scope.as_ref().is_some_and(|scope| {
+                    committed.spread_shift_scopes.contains(&scope.storage_key())
+                });
+            let shift_read = self.admit_imported_shift_read(shift_changed);
             if let Some(request) = take_current(
                 &mut self.metadata_import_refresh_index,
                 context_id,
@@ -45562,7 +45605,7 @@ impl App {
             || self
                 .book_op_pending
                 .as_ref()
-                .is_some_and(|pending| pending.intent.blocks_rename_migration())
+                .is_some_and(|pending| pending.intent().blocks_rename_migration())
             || self.book_reorder.as_ref().is_some_and(|state| {
                 state
                     .flush_pending
@@ -48901,10 +48944,11 @@ impl App {
                 let _ = tx.send(result);
             }) {
             Ok(_) => {
-                self.book_op_pending = Some(crate::books::BookOpPending {
-                    rx,
-                    intent: crate::books::BookOpIntent::List { navigation: None },
-                });
+                self.book_op_pending =
+                    Some(BookManagerPending::Running(crate::books::BookOpPending {
+                        rx,
+                        intent: crate::books::BookOpIntent::List { navigation: None },
+                    }));
             }
             Err(err) => {
                 self.show_feedback_toast(format!("本棚一覧 worker を開始できません: {err}"));
@@ -48931,12 +48975,30 @@ impl App {
         if !self.admit_rename_migration_source_change(ctx) {
             return;
         }
-        let root = self.book_root_path();
+        if self.book_op_pending.is_some() {
+            self.show_feedback_toast("製本処理中です".to_string());
+            return;
+        }
+        let request = BookRenameRequest {
+            root: self.book_root_path(),
+            old_name,
+            new_name,
+        };
+        let source = crate::books::book_folder(&request.root, &request.old_name);
+        if self.has_pending_book_open(&source) {
+            self.book_op_pending = Some(BookManagerPending::WaitingRename(request));
+            ctx.request_repaint_after(Duration::from_millis(100));
+        } else {
+            self.start_ready_book_rename(ctx, request);
+        }
+    }
+
+    fn start_ready_book_rename(&mut self, ctx: &egui::Context, request: BookRenameRequest) {
         self.start_book_op(
             ctx,
             "book-rename",
             crate::books::BookOpIntent::SourceMutation,
-            move || crate::books::rename_book(&root, &old_name, &new_name),
+            move || crate::books::rename_book(&request.root, &request.old_name, &request.new_name),
         );
     }
 
@@ -49135,6 +49197,12 @@ impl App {
             }
         }
         // Mirror only the admitted filesystem mutation in the matching live owner.
+        #[cfg(windows)]
+        if let Some((source, target)) = collection_tree_migration
+            && self.migrate_mounted_book_sources_for_root_move(source, target)
+        {
+            self.invalidate_fullscreen_display_unit_owners();
+        }
         if spread_shift_live_mappings::migrate(
             &mut self.spread_shift,
             mappings,
@@ -49405,7 +49473,11 @@ impl App {
                 let _ = tx.send(f());
             }) {
             Ok(_) => {
-                self.book_op_pending = Some(crate::books::BookOpPending { rx, intent });
+                self.book_op_pending =
+                    Some(BookManagerPending::Running(crate::books::BookOpPending {
+                        rx,
+                        intent,
+                    }));
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
                 true
             }
@@ -49417,7 +49489,19 @@ impl App {
     }
 
     pub(crate) fn poll_book_op_pending(&mut self, ctx: &egui::Context) {
-        let Some(pending) = self.book_op_pending.as_ref() else {
+        if let Some(BookManagerPending::WaitingRename(request)) = &self.book_op_pending {
+            let source = crate::books::book_folder(&request.root, &request.old_name);
+            if self.has_pending_book_open(&source) {
+                ctx.request_repaint_after(Duration::from_millis(100));
+                return;
+            }
+            let Some(BookManagerPending::WaitingRename(request)) = self.book_op_pending.take()
+            else {
+                unreachable!("waiting rename owner was inspected above");
+            };
+            self.start_ready_book_rename(ctx, request);
+        }
+        let Some(BookManagerPending::Running(pending)) = self.book_op_pending.as_ref() else {
             return;
         };
         let result = match pending.rx.try_recv() {
@@ -49430,11 +49514,14 @@ impl App {
                 Err("製本処理が中断されました".to_string())
             }
         };
-        let intent = self
+        let BookManagerPending::Running(pending) = self
             .book_op_pending
             .take()
             .expect("book pending is present")
-            .intent;
+        else {
+            unreachable!("running book owner was inspected above");
+        };
+        let intent = pending.intent;
         match result {
             Ok(crate::books::BookOpResult::Append(summary)) => {
                 self.apply_book_page_edit_copies(&summary.edit_copies);
@@ -56958,6 +57045,14 @@ impl App {
         )
     }
 
+    /// The producer and fresh-open fence share the same root eligibility and physical key.
+    pub(super) fn book_resume_recording_folder(&self) -> Option<&Path> {
+        if self.zip_nav.as_ref().is_some_and(|nav| !nav.at_root()) {
+            return None;
+        }
+        self.current_folder.as_deref()
+    }
+
     /// 現在のフルスクリーンページを「最後に読んだページ」として永続記録する。
     /// 画像本のページのみ対象。dedup 付きで連続ページ送り中の重複書き込みを抑える。
     pub(crate) fn record_book_resume(&mut self, idx: usize) {
@@ -56970,10 +57065,7 @@ impl App {
         // 「続きから」着地し得る (レビュー P3)。ルート表示 (フラット ZIP / collapse 済み
         // 単一ラッパー) は再オープン時と同じ階層が materialize されるので従来どおり記録する。
         // 深い階層への cross-book resume は将来課題 (docs/nested-zip-tree-plan.md §14)。
-        if self.zip_nav.as_ref().is_some_and(|n| !n.at_root()) {
-            return;
-        }
-        let Some(folder) = self.current_folder.clone() else {
+        let Some(folder) = self.book_resume_recording_folder().map(Path::to_path_buf) else {
             return;
         };
         let indices = self.get_still_image_indices();

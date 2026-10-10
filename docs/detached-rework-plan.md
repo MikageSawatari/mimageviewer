@@ -1493,6 +1493,30 @@ recreate判定へ新しい推測経路を加える変更ではない。
 自動検証・利用者の実機受入済みを表すものではない。確認結果は取得後に別途記録する。
 正本は[spread-shift-memory-plan.md §11.4](spread-shift-memory-plan.md#114-d2実装接続記録2026-10-10検証完了レビュー待ち)。
 
+2026-10-10 §1.364 D2b レビュー指摘の構造補正（基点`8bc7efc87`、修正の独立確認待ち）:
+
+root改名の既存移行境界で、mounted/at-rest bundleのscopeだけでなく`current_folder`、
+archive source、ZIP tree、items、prepared identity indexも同じsource→target対応へ移す。
+別窓をmountして直す経路や一括reloadを作らず、変更したcontextの既存unit投影を失効する。
+snapshot固定はfullscreen成功分岐からanchor対応付けを外し、items交換で一度だけremapする。
+fresh-openのpolicy変更はshift依存だけを更新し、元resume receiver/取得済み結果を維持する。
+resume資格/キーは記録producerと共用し、保守中の兄弟Set/ClearもD1の既存FIFOへ受理する。
+import後の再採用は実際のcommit変更scopeだけを対象にし、無変更の兄弟sessionを保つ。
+epochとwrite種別はservice/replyのowner事実として保持し、snapshotの一時的有無や元窓の存否から推測しない。
+context参照元・投影・receipt・commitの既存所有境界を一致させる構造補正であり、
+viewport/geometry/placement/focusの推測、delay/retry/repaint、detached bool、pending-openの新しい所有は追加しない。
+ここは実装者の変更範囲・判断理由の記録で、D2bの独立完了レビューや実機受入合格を表さない。
+root改名と未完了Live Common/candidate openの競合は、利用者が選択肢1の直列化を採択した。
+製本管理の改名だけ、全contextとglobal Commonにある同一本の未完了openを既存source targetの
+read-only照合で待つ。別本・通常改名には追加待機を設けない。既存pending ownerを
+`BookManagerPending::{WaitingRename(captured_request), Running(BookOpPending)}`へ集約し、
+旧keyでのopen採用後に既存の改名workerとsettled移行境界へ進み、参照元・index・scopeを一緒に移す。
+open continuation全体の移行と比較して組合せを除去する簡素化であり、部分的取消・App-global reload・
+retry・pending-open ownerの追加は行わない。2026-10-11に全lib・UI snapshot・通常／portable check・
+fmt・glyph検査とnormal-profile確認用buildを完了した。製品起動・修正後の独立合格は主張しない。
+検証結果は[spread-shift-memory-plan.md §11.5](spread-shift-memory-plan.md#115-d2bレビュー指摘補正)と
+`target/D-1364-d2b-msg.txt`へ記録する。
+
 2026-10-10 §1.342 最大倍率・保持軸モデル: 利用者承認の共通capを既存fit descriptorへ
 snapshotとして接続し、ui_fullscreenの単ページ／見開き／連結・capture／navigator consumerが
 同じpolicyを使う。共通cap編集はfavorite専用値を作らず、live編集はメモリだけを変える。

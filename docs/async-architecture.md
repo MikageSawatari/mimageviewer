@@ -17,6 +17,9 @@ pureな`RestoreReadDependencies`が両writerの固定した読取点の完了証
 `poll_book_shift_restore`はcontext/scope/items/settings世代とmaintenance epochを照合し、
 両writerの先行要求が完了した結果だけを一回採用する。保存済みPageRefを最終identity/navへ解決し、
 位置はownerの`FencedResume`に保持して既存のresume consumerへ渡す。
+製本管理の改名は同一本の未完了openだけを`BookManagerPending`で待つ。各contextとglobal ownerの
+捕捉済みsourceをread-only照合し、旧keyでのopen採用後に既存の改名worker・移行境界へ進む。
+openの受信・継続契約を増やさず、通常改名や別本のopenには待機を追加しない。
 同open continuationの初回採用が終わった時点で`finish_fenced_book_resume`が依存を終了する。
 後のsession内resume参照に初回の位置を使い続けず、従来の現在位置参照へ戻す。
 新しい表示後restore callbackやDB待ちloopを作らず、既存warm PDF準備とbase setterの同期契約を保持する。
@@ -32,6 +35,11 @@ ON/OFF時は既存live調整をsession扱いにし、ON化元のBookだけを保
 捨てず、明示設定変更時だけ`refresh_pending_book_shift_memory_policy`で読取依存を再受付する。
 捕捉済みtarget/context/items/open/scope・元のresume cutoffを維持し、settings世代とshift受付cutoff
 だけを現値へ更新する。通常のpolicy遷移であり、retry・まれな失敗の復旧機構ではない。
+この更新はshift依存だけを差し替え、初回resumeのreceiver・取得済み値を保持する。
+resumeの資格とキーは記録producerの`at_root()`・`current_folder`を共用する。
+保守lease中の通常Set/Clearも既存の保守後FIFOへ受理し、兄弟窓の操作を拒否しない。
+maintenance epochはownerの値として保持し、通常writeの一時的なsnapshot移送では変えない。
+write replyはSet/Clear種別も保持し、元contextを閉じた後も対応した成功通知を出す。
 
 新規openの`ViewerBookRestore`は従来どおりglobal `Common` continuationが所有する。
 retained ONの`begin_retained_shift_readoption`は受入済みidentity indexを再利用し、

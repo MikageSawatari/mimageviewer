@@ -1920,6 +1920,9 @@ slot削除やsnapshotのindex変換はowner内のlive resolutionだけをremap�
 snapshot化はdurable scopeを切り離し、その時点のnumeric pairingをOrdinary sessionとして保持する。
 root/pageの成功済みmappingは`spread_shift_live_mappings`でmounted/at-restのlive ownerへ反映し、
 そのための追加saveやmountを行わない。
+root移行では同じ境界で参照元・items・prepared identityも更新し、旧rootの投影を残さない。
+case/slash衝突のshift identityはD1と同じく受入列の先頭slotを決定的に選ぶ。
+snapshotのanchor remapはitems交換で行い、一覧から固定してもfullscreen時と同じ対応付けを使う。
 新規Restoreはsidecar continuation内で先行shift/resumeの完了証明を満たしてから同じ最終列へ
 解決し、位置復元・unit正規化・first-displayへ進む。retained ONの再採用は受入済みidentity indexを使い、
 待機をbundle内の`RetainedReadoption::Idle | Reading`に持たせる。global Commonの別context依存と

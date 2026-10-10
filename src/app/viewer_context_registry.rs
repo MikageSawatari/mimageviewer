@@ -715,7 +715,149 @@ fn reset_audio_art_terminal_rows(
     changed
 }
 
+/// Read the existing candidate owners without draining results or mounting a context.
+/// These requests can still adopt a captured physical source. Decode/prefetch and retained
+/// shift reads operate on an already adopted list and deliberately are not open candidates.
+macro_rules! context_has_pending_book_open {
+    ($owner:expr, $root:expr) => {{
+        let owner = $owner;
+        let within = |path: &Path| crate::path_key::physical_path_is_within(path, $root);
+        owner
+            .folder_pane_open_pending
+            .as_ref()
+            .is_some_and(|pending| !pending.cancel.load(Ordering::Relaxed) && within(&pending.path))
+            || owner.zip_enumerate_pending.as_ref().is_some_and(|pending| {
+                !pending.cancel.load(Ordering::Relaxed) && within(&pending.zip_path)
+            })
+            || owner
+                .pdf_enumerate_pending
+                .as_ref()
+                .is_some_and(|pending| pending_pdf_book_open_is_within(pending, $root))
+            || owner
+                .top_level_grid_view
+                .open_path_classification()
+                .is_some_and(|pending| {
+                    !pending.cancel.load(Ordering::Relaxed) && within(&pending.path)
+                })
+            || owner
+                .top_level_grid_view
+                .history_navigation_transition()
+                .is_some_and(|transition| match transition {
+                    HistoryNavigationTransition::Physical(pending) => within(&pending.path),
+                    HistoryNavigationTransition::Collection(pending) => {
+                        pending_history_book_open_is_within(&pending.target, $root)
+                    }
+                })
+            || owner
+                .pdf_password_request
+                .as_ref()
+                .is_some_and(|pending| within(&pending.path))
+            || owner
+                .top_level_grid_view
+                .has_pending_collection_book_open($root)
+            || owner
+                .epub_convert
+                .as_ref()
+                .is_some_and(|pending| within(&pending.src_path))
+            || owner
+                .bookmark_open_pending
+                .as_ref()
+                .is_some_and(|pending| match pending {
+                    crate::bookmark_browser::PendingBookmarkOpen::Media(pending) => {
+                        within(&pending.path)
+                    }
+                    crate::bookmark_browser::PendingBookmarkOpen::Book(pending) => {
+                        within(&pending.bookmark_source)
+                    }
+                })
+    }};
+}
+
+fn pending_pdf_book_open_is_within(pending: &PdfEnumeratePending, root: &Path) -> bool {
+    !pending.2.cancel.load(Ordering::Relaxed)
+        && (crate::path_key::physical_path_is_within(&pending.0, root)
+            || crate::path_key::physical_path_is_within(&pending.6, root))
+        || matches!(&pending.5, PdfOpenPhase::ColdCandidate { retained_source: Some(source), .. }
+            if pending_pdf_book_open_is_within(source, root))
+}
+
+fn pending_history_book_open_is_within(target: &FolderNavHistoryTarget, root: &Path) -> bool {
+    let path = match target {
+        FolderNavHistoryTarget::Path(path) => Some(path.as_path()),
+        FolderNavHistoryTarget::RatingPhysical(restore) => Some(restore.visible_path.as_path()),
+        FolderNavHistoryTarget::CollectionPhysical(restore) => Some(restore.visible_path.as_path()),
+        FolderNavHistoryTarget::SmartFolder(state) => match &state.position {
+            top_level_grid_view::SmartFolderPosition::Container { current, .. }
+            | top_level_grid_view::SmartFolderPosition::Scoped { current, .. } => {
+                Some(current.as_path())
+            }
+            top_level_grid_view::SmartFolderPosition::Root => None,
+        },
+        FolderNavHistoryTarget::Rating { .. } | FolderNavHistoryTarget::Collection(_) => None,
+    };
+    path.is_some_and(|path| crate::path_key::physical_path_is_within(path, root))
+}
+
+fn pending_startup_book_open_is_within(
+    pending: &StartupOpenPathResolvePending,
+    root: &Path,
+) -> bool {
+    std::iter::successors(Some(pending), |current| {
+        current.held_resolve_for_activation_admission.as_deref()
+    })
+    .any(|current| {
+        !current.cancel.load(Ordering::Relaxed)
+            && crate::path_key::physical_path_is_within(&current.requested, root)
+    })
+}
+
 impl App {
+    /// Only a candidate that can still adopt this book's old source delays its rename.
+    /// Global continuations and all stored contexts are observed without changing residence.
+    pub(in crate::app) fn has_pending_book_open(&self, root: &Path) -> bool {
+        if self
+            .sidecar_restore
+            .as_ref()
+            .is_some_and(|state| state.has_pending_book_open(root))
+            || self
+                .startup_open_path_resolve_pending
+                .as_ref()
+                .is_some_and(|pending| pending_startup_book_open_is_within(pending, root))
+            || self
+                .smart_folder_transition
+                .as_ref()
+                .is_some_and(|pending| pending.has_pending_book_open(root))
+            || self
+                .saved_group_open
+                .as_ref()
+                .is_some_and(|request| request.has_pending_book_open(root))
+            || self.archive_convert.as_ref().is_some_and(|pending| {
+                !matches!(
+                    pending.completion,
+                    crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::SiblingZip
+                ) && !pending.cancel.load(Ordering::Relaxed)
+                    && crate::path_key::physical_path_is_within(&pending.src_path, root)
+            })
+        {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            ContextRef::mounted(self).has_pending_book_open(root)
+                || self.viewer_contexts.table.slots.values().any(|slot| {
+                    let Slot::AtRest(bundle) = slot else {
+                        // Retirement cannot mount/adopt this context again.
+                        return false;
+                    };
+                    ContextRef::at_rest(bundle).has_pending_book_open(root)
+                })
+        }
+        #[cfg(not(windows))]
+        {
+            context_has_pending_book_open!(self, root)
+        }
+    }
+
     /// A global fit-mode change ends each context's selected continuous unit.
     /// Do this at the setting boundary: a parked context may not draw between
     /// two changes, so observing a later layout frame cannot detect the exit.
@@ -1539,6 +1681,13 @@ impl<'a> ContextRef<'a> {
             .into_iter()
             .filter(|owner| owner.is_pending(self))
             .collect()
+    }
+
+    pub(in crate::app) fn has_pending_book_open(self, root: &Path) -> bool {
+        match self.source {
+            ContextRefSource::Mounted(owner) => context_has_pending_book_open!(owner, root),
+            ContextRefSource::AtRest(owner) => context_has_pending_book_open!(owner, root),
+        }
     }
 
     pub(in crate::app) fn current_folder(self) -> Option<&'a Path> {
@@ -3727,15 +3876,54 @@ impl App {
             let bundle = match slot {
                 Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
             };
-            if super::spread_shift_live_mappings::migrate(
+            let sources_changed = root_move.is_some_and(|(source, target)| {
+                super::spread_shift_live_mappings::migrate_accepted_root_sources(
+                    &mut bundle.current_folder,
+                    &mut bundle.address,
+                    &mut bundle.archive_source_override,
+                    &mut bundle.zip_nav,
+                    &mut bundle.items,
+                    &mut bundle.page_identity_index,
+                    source,
+                    target,
+                )
+            });
+            let shift_changed = super::spread_shift_live_mappings::migrate(
                 &mut bundle.spread_shift,
                 mappings,
                 root_move,
-            ) {
+            );
+            if sources_changed {
+                bundle.viewer_navigation_caches.invalidate();
+            }
+            if sources_changed || shift_changed {
                 bundle.fullscreen_navigator_interaction.invalidate();
                 bundle.similar_panel.preview.invalidate();
             }
         }
+    }
+
+    /// Use the same accepted-source boundary as parked contexts. The caller then
+    /// migrates its shift owner before a reload or retained re-adoption can occur.
+    pub(in crate::app) fn migrate_mounted_book_sources_for_root_move(
+        &mut self,
+        source: &Path,
+        target: &Path,
+    ) -> bool {
+        let changed = super::spread_shift_live_mappings::migrate_accepted_root_sources(
+            &mut self.current_folder,
+            &mut self.address,
+            &mut self.archive_source_override,
+            &mut self.zip_nav,
+            &mut self.items,
+            &mut self.page_identity_index,
+            source,
+            target,
+        );
+        if changed {
+            self.viewer_navigation_caches.invalidate();
+        }
+        changed
     }
 
     pub(crate) fn locate_window_context(
@@ -4441,7 +4629,7 @@ impl App {
         self.with_viewer_context(id, f)
             .expect("test window viewer context must mount")
     }
-    pub(in crate::app) fn push_window_context_for_test(
+    pub(crate) fn push_window_context_for_test(
         &mut self,
         ctx: &egui::Context,
         window_id: u64,
@@ -4535,6 +4723,94 @@ mod tests {
     use std::cell::RefCell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::rc::Rc;
+
+    #[cfg(windows)]
+    #[test]
+    fn book_root_move_migrates_parked_source_and_identity_with_shift_owner_only() {
+        use super::super::spread_shift_owner::ViewerShift;
+        use crate::spread_shift::{
+            ShiftPersistence, ShiftResolution, SpreadShiftPageRef, SpreadShiftState,
+        };
+        let mut app = crate::app::setup_app_for_test();
+        let seed = |owner: &mut App, root: &str| {
+            owner.current_folder = Some(PathBuf::from(root));
+            owner.address = root.into();
+            owner.items = (0..4)
+                .map(|idx| GridItem::Image(PathBuf::from(format!("{root}/{idx}.jpg"))))
+                .collect();
+            owner.thumbnails = vec![ThumbnailState::Pending; 4];
+            owner.visible_indices = vec![0, 1, 2, 3];
+            owner.fullscreen_idx = Some(3);
+            owner.page_identity_index = Arc::new(
+                super::super::file_type_resume::PreparedPageIdentityIndex::prepare(
+                    &owner.items,
+                    None,
+                    Default::default(),
+                ),
+            );
+            owner.spread_shift.scope = Some(crate::book_scope::BookScopeKey::folder(root).unwrap());
+            owner.spread_shift.state = ViewerShift::Book(SpreadShiftState::Adjusted {
+                anchor_ref: SpreadShiftPageRef::RelativePath("3.jpg".into()),
+                resolution: ShiftResolution::Resolved(3),
+                persistence: ShiftPersistence::SessionOnly,
+            });
+        };
+        seed(&mut app, "c:/books/book-other");
+        let main_index = Arc::clone(&app.page_identity_index);
+        let main_shift = app.spread_shift.clone();
+        let moved = app.build_window_context_for_test(9821, |owner| seed(owner, "C:/Books/Book"));
+        let sibling = app.build_window_context_for_test(9822, |owner| seed(owner, "d:/books/book"));
+        let sibling_index = Arc::clone(
+            &app.viewer_contexts
+                .table
+                .at_rest(sibling)
+                .unwrap()
+                .page_identity_index,
+        );
+        let sibling_shift = app
+            .viewer_contexts
+            .table
+            .at_rest(sibling)
+            .unwrap()
+            .spread_shift
+            .clone();
+        let source = Path::new("c:/books/book");
+        let target = Path::new("C:/Books/Renamed");
+        app.migrate_at_rest_spread_shifts(&[], Some((source, target)));
+        assert!(Arc::ptr_eq(&main_index, &app.page_identity_index));
+        assert_eq!(app.spread_shift, main_shift);
+        let sibling_bundle = app.viewer_contexts.table.at_rest(sibling).unwrap();
+        assert!(Arc::ptr_eq(
+            &sibling_index,
+            &sibling_bundle.page_identity_index
+        ));
+        assert_eq!(sibling_bundle.spread_shift, sibling_shift);
+        let bundle = app.viewer_contexts.table.at_rest_mut(moved).unwrap();
+        assert_eq!(bundle.current_folder.as_deref(), Some(target));
+        assert_eq!(bundle.address, "C:/Books/Renamed");
+        assert_eq!(bundle.fullscreen_idx, Some(3));
+        assert_eq!(bundle.items[3], GridItem::Image(target.join("3.jpg")));
+        bundle.spread_shift.resolve(
+            &bundle.page_identity_index,
+            &Arc::new(bundle.visible_indices.clone()),
+        );
+        assert_eq!(bundle.spread_shift.anchor_idx(), Some(3));
+        assert_eq!(
+            bundle.spread_shift.scope,
+            Some(crate::book_scope::BookScopeKey::folder(target).unwrap())
+        );
+        // Activation mounts exactly the migrated owner instead of reconstructing the old root.
+        app.with_window_viewer_context(9821, |owner| {
+            assert_eq!(owner.current_folder.as_deref(), Some(target));
+            assert_eq!(owner.items[3], GridItem::Image(target.join("3.jpg")));
+            assert_eq!(owner.spread_shift.anchor_idx(), Some(3));
+        })
+        .unwrap();
+        assert_eq!(
+            app.current_folder.as_deref(),
+            Some(Path::new("c:/books/book-other"))
+        );
+    }
 
     #[cfg(windows)]
     #[test]
@@ -5188,6 +5464,160 @@ mod tests {
                 .unwrap(),
             parked_before.wrapping_add(1)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pending_book_open_query_tracks_stored_candidates_without_mounting() {
+        let mut app = crate::app::setup_app_for_test();
+        let source = PathBuf::from("C:/Books/Pending");
+        let (_tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.folder_pane_open_pending = Some(FolderPaneOpenPending {
+            path: source.join("chapter"),
+            cancel: Arc::clone(&cancel),
+            rx,
+            purpose: FolderOpenScanPurpose::PaneNavigation,
+            epub_restore: None,
+            navigation: None,
+        });
+        assert!(app.has_pending_book_open(&source));
+        assert!(!app.has_pending_book_open(Path::new("C:/Books/PendingSibling")));
+        let parked = app.stash_mounted_and_start_fresh("pending_book_open_query");
+        let mounted = app.projected_viewer_context_id();
+        let generation = app.items_generation;
+        assert!(app.has_pending_book_open(Path::new(r"c:\books\pending")));
+        assert!(
+            app.with_viewer_context_ref(parked, |context| context.has_pending_book_open(&source))
+                .unwrap()
+        );
+        assert_eq!(app.projected_viewer_context_id(), mounted);
+        assert_eq!(app.items_generation, generation);
+        assert!(app.viewer_contexts.table.at_rest(parked).is_some());
+        cancel.store(true, Ordering::Relaxed);
+        assert!(!app.has_pending_book_open(&source));
+        cancel.store(false, Ordering::Relaxed);
+        app.viewer_contexts.table.begin_retire(parked).unwrap();
+        assert!(!app.has_pending_book_open(&source));
+    }
+
+    #[test]
+    fn pending_book_open_query_reads_global_and_held_activation_resolver_targets() {
+        let mut app = crate::app::setup_app_for_test();
+        let source = PathBuf::from("C:/Books/Resolver");
+        let pending = |path: &Path, owner, held| {
+            let (_tx, rx) = mpsc::channel();
+            StartupOpenPathResolvePending {
+                requested: crate::pdf_loader::LeasedEpubPath::try_new(path.to_path_buf()).unwrap(),
+                owner,
+                navigation: None,
+                cancel: Arc::new(AtomicBool::new(false)),
+                rx,
+                started_at: std::time::Instant::now(),
+                toast_shown: false,
+                held_resolve_for_activation_admission: held,
+                diagnostic: None,
+            }
+        };
+        let held = pending(
+            &source.join("page.jpg"),
+            StartupOpenPathOwner::InitialStartup,
+            None,
+        );
+        app.startup_open_path_resolve_pending = Some(pending(
+            Path::new("C:/Books/ResolverSibling"),
+            StartupOpenPathOwner::Activation,
+            Some(Box::new(held)),
+        ));
+        assert!(app.has_pending_book_open(&source));
+        assert!(app.has_pending_book_open(Path::new("C:/Books/ResolverSibling")));
+        assert!(!app.has_pending_book_open(Path::new("C:/Books/Resolve")));
+        app.startup_open_path_resolve_pending
+            .as_ref()
+            .unwrap()
+            .held_resolve_for_activation_admission
+            .as_ref()
+            .unwrap()
+            .cancel
+            .store(true, Ordering::Relaxed);
+        assert!(!app.has_pending_book_open(&source));
+        assert!(app.has_pending_book_open(Path::new("C:/Books/ResolverSibling")));
+    }
+
+    #[test]
+    fn pending_book_open_query_excludes_decoding_and_unrelated_candidates() {
+        let mut app = crate::app::setup_app_for_test();
+        let source = PathBuf::from("C:/Books/Adopted");
+        app.current_folder = Some(source.clone());
+        app.items = vec![GridItem::Image(source.join("page.jpg"))];
+        let (_decode_tx, decode_rx) = mpsc::channel();
+        let input_seq = app.input_seq;
+        app.fs_pending.insert(
+            0,
+            FsPendingValue::new(
+                Arc::new(AtomicBool::new(false)),
+                decode_rx,
+                input_seq,
+                FsLoadPurpose::Prefetch,
+            ),
+        );
+        let (_zip_tx, zip_rx) = mpsc::channel();
+        app.zip_enumerate_pending = Some(ZipEnumeratePending {
+            zip_path: PathBuf::from("C:/Books/AdoptedSibling/book.zip"),
+            restore_intent: StartupListIntent::ExplicitList,
+            input_seq: app.input_seq,
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx: zip_rx,
+        });
+        assert!(!app.has_pending_book_open(&source));
+        assert!(app.has_pending_book_open(Path::new("C:/Books/AdoptedSibling")));
+        assert!(app.fs_pending.contains_key(&0));
+    }
+
+    #[test]
+    fn pending_book_open_query_reads_retained_pdf_source_until_poll_adoption() {
+        let mut app = crate::app::setup_app_for_test();
+        let source = PathBuf::from("C:/Books/Retained.pdf");
+        let candidate = PathBuf::from("C:/Books/Candidate.pdf");
+        let pending = |path: &Path, phase| {
+            (
+                path.to_path_buf(),
+                None,
+                crate::pdf_loader::completed_enumerate_handle_for_test(path, Ok(Vec::new())),
+                Box::new(OpenRequestOwner::Navigation),
+                None,
+                phase,
+                crate::pdf_loader::LeasedEpubPath::try_new(path.to_path_buf()).unwrap(),
+            )
+        };
+        let retained = pending(
+            &source,
+            PdfOpenPhase::CommittedVerification {
+                placeholder_count: 1,
+            },
+        );
+        app.pdf_enumerate_pending = Some(pending(
+            &candidate,
+            PdfOpenPhase::ColdCandidate {
+                retained_source: Some(Box::new(retained)),
+                restore_intent: StartupListIntent::ExplicitList,
+            },
+        ));
+        assert!(app.has_pending_book_open(&source));
+        assert!(app.has_pending_book_open(&candidate));
+        // A delivered result still belongs to its continuation until the regular poll adopts it.
+        assert!(
+            app.pdf_enumerate_pending
+                .as_ref()
+                .unwrap()
+                .2
+                .rx
+                .try_recv()
+                .is_ok()
+        );
+        assert!(app.has_pending_book_open(&candidate));
+        app.pdf_enumerate_pending = None;
+        assert!(!app.has_pending_book_open(&source));
     }
 
     #[cfg(windows)]

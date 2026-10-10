@@ -7660,7 +7660,7 @@ mod tests {
         let ctx = egui::Context::default();
         let revision_wake = CollectionRevisionWake::spawn(&ctx, &watch);
         let target = prepared_target(&prepared.entries[0], CollectionResolvedKind::Pdf);
-        app.pdf_password_request = Some(super::super::PdfPasswordRequest::legacy(pdf));
+        app.pdf_password_request = Some(super::super::PdfPasswordRequest::legacy(pdf.clone()));
         app.top_level_grid_view
             .set_collection_navigation_pending(Some(
                 CollectionNavigationPending::AwaitingPdfPassword {
@@ -7685,6 +7685,68 @@ mod tests {
                     && request.lease.phase() == "pdf_password_input"
         ));
         assert!(app.fs_nav_is_locked());
+
+        assert!(app.has_pending_book_open(&pdf));
+        assert!(!app.has_pending_book_open(&temp.path().join("unrelated.pdf")));
+        let CollectionNavigationPending::AwaitingPdfPassword {
+            request,
+            watch,
+            revision_wake,
+            prepared,
+            target,
+        } = app
+            .top_level_grid_view
+            .take_collection_navigation_pending()
+            .unwrap()
+        else {
+            panic!("the password phase still owns its exact target");
+        };
+        // Submission consumes the visible password request, while the context's typed
+        // preflight continues to own the same physical book until adoption/cancellation.
+        app.pdf_password_request = None;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        app.top_level_grid_view
+            .set_collection_navigation_pending(Some(
+                CollectionNavigationPending::PdfPasswordPreflighting {
+                    request,
+                    watch,
+                    prepared,
+                    target,
+                    password: "query-test".into(),
+                    save: false,
+                    cancel: Arc::clone(&cancel),
+                    receiver,
+                },
+            ));
+        assert!(app.has_pending_book_open(&pdf));
+        cancel.store(true, Ordering::Relaxed);
+        assert!(!app.has_pending_book_open(&pdf));
+
+        let CollectionNavigationPending::PdfPasswordPreflighting {
+            request,
+            watch,
+            prepared,
+            target,
+            ..
+        } = app
+            .top_level_grid_view
+            .take_collection_navigation_pending()
+            .unwrap()
+        else {
+            panic!("the query does not consume the preflight owner");
+        };
+        app.pdf_password_request = Some(super::super::PdfPasswordRequest::legacy(pdf));
+        app.top_level_grid_view
+            .set_collection_navigation_pending(Some(
+                CollectionNavigationPending::AwaitingPdfPassword {
+                    request,
+                    watch,
+                    revision_wake,
+                    prepared,
+                    target,
+                },
+            ));
 
         assert!(app.cancel_collection_pdf_password_request());
         assert!(!app.top_level_grid_view.collection_navigation_pending());
