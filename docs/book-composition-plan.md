@@ -1,8 +1,8 @@
 # §1.242 本の構成 — 設計案
 
-更新: 2026-10-10、R6。ライン G / `next-book`、改訂元 R5 `599001fbd`。
-状態: R5レビューのP2二件/P3とsidecarだけの保存失敗の利用者回答を反映。独立再レビュー・設計採択は未実施。
-初稿照合は `63f2e23ea` 時点、R5/R6追加照合は現在worktreeソース。実装前にE統合後masterへ再照合する。
+更新: 2026-10-10、R6採択後のG0再照合。ライン G / `next-book`、照合tree `76488f0ec`。
+状態: R6は独立再レビューACCEPT、P3文言修正は `330e070f6`。E §1.342のmaster統合 `fa280d0d0` を取り込んだ。
+本更新は§2全参照とG0構造接点のソース再照合。統合後変更の次レビューと§1.364契約合意は未完了。
 
 本書の型名・新規ファイル名は提案であり、現行実装を表さない。実行時の観測はなく、以下の現状はソース調査による。
 
@@ -52,35 +52,36 @@ Ctrl+G/タグ/評価/スマートフォルダ/コレクション/★固定/サ�
 
 ## 2. バックログの前提を現行コードで照合した結果
 
-初稿の表/1〜12の行番号は `63f2e23ea` のもの。R5追加13〜16は現在worktreeのもの。実装開始時はライン E 統合後の symbol で再照合する。
+表と追加前提1〜19の全symbol/参照を、E統合後の `76488f0ec` へ再照合した。
+本文の既存source参照も同treeへ更新。旧lineの単純加算ではなく、git差分の不変区間と現行symbol/周辺処理で確認した。
 「成立」はコード構造の確認であり、実機での成功を意味しない。
 
 | 9月時点の前提 | 現行の根拠 (file:line) | 判定・設計への反映 |
 | --- | --- | --- |
-| 本は名前順で items を作る | `src/app.rs:42` (`BOOK_READING_PAGE_ORDER`)、`:418` (`folder_media_sort_order`)、`src/app/folder_scan.rs:276`、`src/app.rs:35212` (`materialize_zip_grid`) | 成立。PDFは番号順、製本は Numeric、通常フォルダは一覧設定。旧読み順計画の未実装記載は古い |
-| items 順を変えれば下流が揃う | `src/ui_fullscreen.rs:16022` (`ViewerNavigationCaches`)、`src/app.rs:56783` (`current_reading_history_page_position`)、`src/ui_fullscreen.rs:45263` (`grid_selection_indices`) | 主要な下流は追随するが、それだけで完了しない。別 producer と直接 leaf open を揃える必要がある |
-| `visible_indices` は昇順 | `src/app.rs:488`、`:69000` (`binary_search`) | 成立。構成を visible_indices の任意並べ替えとして実装しない |
-| 末尾補助等の適格性は nav数=items数 | `src/ui_fullscreen.rs:16845` (`spread_complete_page_permutation`) | **更新が必要**。現行は `smart_folder_rule_total()` と資格・page data・重複なしの証明。`items.len()` 比較だけではない。構成用の complete proof を生成境界で渡す |
-| ZIPの列生成が分散 | `src/app.rs:33158`, `:35197`, `:35212`, `:35253`, `:35608`, `:35970`, `:36002` | 成立。初回、物理履歴・評価ZipDir着地、階層移動、DFS、スライドショーの本跨ぎを共通化する |
-| 画像フォルダとPDFにも個別列生成 | `src/app/folder_scan.rs:257`, `:276`, `:421`、`src/app.rs:36433` (`adopt_direct_pdf_rows`)、`:37319` (`poll_pdf_enumerate`) | 成立。走査/列挙のI/Oを一本にするのではなく、列挙後の本投影 owner を一本にする |
-| しおり/スナップショットが階層列を再生成 | `src/book_bookmarks.rs:1525` (`resolve_archive_bookmark_target`)、`src/app.rs:47249`、`src/app/snapshot_ops.rs:2241` | 成立。しおり resolver は raw index を算出する。構成後 index と混同できない |
-| Remote ZIPは arrange を通らない | `src/remote_ipc/container.rs:3963`, `:4024` (`enumerate_zip_page_context`)、`:5670`, `:5729` (`enumerate_zip`) | **入口ごとに異なる**。page context側は arrange済み、通常列挙は materialize直後。差が出る実行観測は未確認。二つとも共通投影へ置換 |
+| 本は名前順で items を作る | `src/app.rs:42` (`BOOK_READING_PAGE_ORDER`)、`:418` (`folder_media_sort_order`)、`src/app/folder_scan.rs:276`、`src/app.rs:35384` (`materialize_zip_grid`) | 成立。PDFは番号順、製本は Numeric、通常フォルダは一覧設定。旧読み順計画の未実装記載は古い |
+| items 順を変えれば下流が揃う | `src/ui_fullscreen.rs:16194` (`ViewerNavigationCaches`)、`src/app.rs:56950` (`current_reading_history_page_position`)、`src/ui_fullscreen.rs:46446` (`grid_selection_indices`) | 主要な下流は追随するが、それだけで完了しない。別 producer と直接 leaf open を揃える必要がある |
+| `visible_indices` は昇順 | `src/app.rs:488`、`:69169` (`binary_search`) | 成立。構成を visible_indices の任意並べ替えとして実装しない |
+| 末尾補助等の適格性は nav数=items数 | `src/ui_fullscreen.rs:17016` (`spread_complete_page_permutation`) | **旧バックログから更新済み**。現行は `smart_folder_rule_total()` と資格・page data・重複なしの証明。`items.len()` 比較だけではない。構成用の complete proof を生成境界で渡す |
+| ZIPの列生成が分散 | `src/app.rs:33330`, `:35369`, `:35384`, `:35425`, `:35780`, `:36142`, `:36174` | 成立。初回、物理履歴・評価ZipDir着地、階層移動、DFS、スライドショーの本跨ぎを共通化する |
+| 画像フォルダとPDFにも個別列生成 | `src/app/folder_scan.rs:257`, `:276`, `:425`、`src/app.rs:36605` (`adopt_direct_pdf_rows`)、`:37491` (`poll_pdf_enumerate`) | 成立。走査/列挙のI/Oを一本にするのではなく、列挙後の本投影 owner を一本にする |
+| しおり/スナップショットが階層列を再生成 | `src/book_bookmarks.rs:1525` (`resolve_archive_bookmark_target`)、`src/app.rs:47425`、`src/app/snapshot_ops.rs:2242` | 成立。しおり resolver は raw index を算出する。構成後 index と混同できない |
+| Remote ZIPは arrange を通らない | `src/remote_ipc/container.rs:3963` (`enumerate_zip_page_context`)、`:4024` (`arrange_grid_items`)、`:5670` (`enumerate_zip`)、`:5729` (`materialize_level`) | **入口ごとに異なる**。page context側は arrange済み、通常列挙は materialize直後。差が出る実行観測は未確認。二つとも共通投影へ置換 |
 | Remote画像フォルダも独自 | `src/remote_ipc/container.rs:5552`, `:5565`、`src/app/folder_scan.rs:257` | 既に production folder listing を再利用。新しいRemote専用folder sorterを作らない |
-| 編集中は items を触らず保存後 reload | `src/app.rs:35331`, `:36450` (`prepare_visible_install`)、`src/app/viewer_context_registry.rs:1799` (`set_items_generation`) | 実装可能な所有境界。現在のindexからの直接並べ替えは不可 |
-| 白紙を GridItem にしない | `src/ui_fullscreen.rs:9433` (`SpreadPair`)、`:14174` (`SpreadPageOccurrence`)、`:14338` (`compose_spread_navigation_unit`) | 成立。idxは実在ページ。§1.240の白い相方はplacementで表現済み。新規偽パス/texture/sourceを作る理由がない |
-| 見開きの編集は左ページへpivot | `src/app.rs:11760` (`plan_page_edit_pivot`) | 成立。白紙をDoubleの片側にすると編集targetが壊れる。白紙相方はSingleへ投影 |
-| 見開きは両textureが必要 | `src/ui_fullscreen.rs:40808`, `:40903` (左右source選択・描画)、`src/materializer.rs:44` (`MergedSpread`) | 成立。完成/通過画像はunit単位で揃える。白紙にsource readinessを要求しない |
-| builderは隣接/横長/shiftのみ | `src/ui_fullscreen.rs:14769`, `:14786` | **追加あり**。現在は `PageAloneSettings` と非pairable境界・forced singleton原因も入力。既存自動builderを構成に再適用しない |
-| unit/nav cacheに構成がない | `src/ui_fullscreen.rs:14447` (`SpreadDisplayUnitsToken`)、`:16043` (`ensure_source`)、`:16766` | 成立。unit tokenはitems世代/mode/shift/landscape epoch/page_alone/nav、nav sourceは世代/flow。構成revisionと列投影を同一snapshotに結ぶ |
-| resumeはitems indexだけ | `src/book_resume_db.rs:35`, `:78`, `:140`, `:174`, `:437`、`src/app/file_type_resume.rs:15`, `:135`、`src/app.rs:56644`, `:56871` | **古い**。raw index + optional logical identityのtransaction保存・worker構築対応表が既にある。既存型に構成を投影し、raw-only旧記録だけ橋渡しする |
-| 履歴の位置も要確認 | `src/reading_history_db.rs:59`、`src/app.rs:22179`, `:22225`, `:56783` | historyのlast_pageは1-based読書ordinal、identityではない。履歴はcontainer openを経由する。位置の正本はresumeへ寄せ、表示ordinalを再開indexに転用しない |
+| 編集中は items を触らず保存後 reload | `src/app.rs:35503`, `:36622` (`prepare_visible_install`)、`src/app/viewer_context_registry.rs:1813` (`set_items_generation`) | 実装可能な所有境界。現在のindexからの直接並べ替えは不可 |
+| 白紙を GridItem にしない | `src/ui_fullscreen.rs:9596` (`SpreadPair`)、`:14346` (`SpreadPageOccurrence`)、`:14510` (`compose_spread_navigation_unit`) | 成立。idxは実在ページ。§1.240の白い相方はplacementで表現済み。新規偽パス/texture/sourceを作る理由がない |
+| 見開きの編集は左ページへpivot | `src/app.rs:11918` (`plan_page_edit_pivot`) | 成立。白紙をDoubleの片側にすると編集targetが壊れる。白紙相方はSingleへ投影 |
+| 見開きは両textureが必要 | `src/ui_fullscreen.rs:41633`, `:41728` (左右source選択・描画)、`src/materializer.rs:43` (`MergedSpread`) | 成立。完成/通過画像はunit単位で揃える。白紙にsource readinessを要求しない |
+| builderは隣接/横長/shiftのみ | `src/ui_fullscreen.rs:14941`, `:14958` | **追加あり**。現在は `PageAloneSettings` と非pairable境界・forced singleton原因も入力。既存自動builderを構成に再適用しない |
+| unit/nav cacheに構成がない | `src/ui_fullscreen.rs:14619` (`SpreadDisplayUnitsToken`)、`:16215` (`ensure_source`)、`:16938` | 成立。unit tokenはitems世代/mode/shift/landscape epoch/page_alone/nav、nav sourceは世代/flow。構成revisionと列投影を同一snapshotに結ぶ |
+| resumeはitems indexだけ | `src/book_resume_db.rs:35`, `:78`, `:140`, `:174`, `:437`、`src/app/file_type_resume.rs:15`, `:135`、`src/app.rs:56814`, `:57034` | **古い**。raw index + optional logical identityのtransaction保存・worker構築対応表が既にある。既存型に構成を投影し、raw-only旧記録だけ橋渡しする |
+| 履歴の位置も要確認 | `src/reading_history_db.rs:67`、`src/app.rs:22335`, `:22381`, `:56950` | historyのlast_pageは1-based読書ordinal、identityではない。履歴はcontainer openを経由する。位置の正本はresumeへ寄せ、表示ordinalを再開indexに転用しない |
 | rename/purge/export/content restore登録が必要 | `src/rename_key_migration.rs:939`, `:1198`, `:1299`, `:1447`, `:1523`、`src/content_identity/restore.rs:181`, `:414` | 成立。行キー移行だけではJSON内の画像相対identity改名は更新されない。generic copyと専用ページ改名の双方が必要 |
 | metadata transferを版上げ | `src/metadata_transfer.rs:27`, `:453`, `:492`, `:3203`、`src/app/metadata_import_refresh.rs:534` | 現行出力v9、入力v7/v8/v9。v7だけからの更新案は古い。既存入力版を保持し、新版は統合時の最新+1 |
-| F12 bundle登録 | `src/app/viewer_context_registry.rs:809`, `:815`, `:898`, `:1061`, `:2226`, `:2500`, `:3451` | 成立。items、identity index、unit cache、shiftはcontext所有。構成も同じbundleへ載せ、App globalな現在構成で描かない |
-| 変換書庫のDBキーが割れている | `src/app.rs:25559` (spreadはtree物理root)、`:25616` (pinは元root)、`:46678` (しおり元root)、`src/book_resume_db.rs:50` | 成立。ただしresume logical identityは既に元rootを使う。構成のために既存page編集キーを一斉変更しない |
-| spread_separateへの影響 | `src/view_trim.rs:163`, `:226`, `:378`、`src/ui_view_trim.rs:831`, `:842`、`src/ui_fullscreen.rs:40760` | sideは画面Left/Right。ページordinalの奇偶ではない。構成slotを通してsideを確定する |
-| Remote縦長解除は端末設定 | `crates/remote-web/web/app.js:13202` (`portraitSinglePage`)、`src/remote_ipc/container.rs:6075` (`force_single_page`) | 成立。旧app.js:11536を置換。本体のSplit、端末single強制を構成payloadへ混ぜない |
-| session shiftは再入場で消える | `src/app.rs:25729`, `:44387`、`src/ui_fullscreen.rs:27987`、`src/app/gamepad_input.rs:6550`, `:6964` | 成立。§1.364は未実装。キーだけの抑止では不十分で共通action ownerで拒否する |
+| F12 bundle登録 | `src/app/viewer_context_registry.rs:823`, `:829`, `:912`, `:1075`, `:2241`, `:2515`, `:3466` | 成立。items、identity index、unit cache、shiftはcontext所有。構成も同じbundleへ載せ、App globalな現在構成で描かない |
+| 変換書庫のDBキーが割れている | `src/app.rs:25715` (spreadはtree物理root)、`:25772` (pinは元root)、`:46856` (しおり元root)、`src/book_resume_db.rs:50` | 成立。ただしresume logical identityは既に元rootを使う。構成のために既存page編集キーを一斉変更しない |
+| spread_separateへの影響 | `src/view_trim.rs:163`, `:226`, `:378`、`src/ui_view_trim.rs:831`, `:842`、`src/ui_fullscreen.rs:41592` | sideは画面Left/Right。ページordinalの奇偶ではない。構成slotを通してsideを確定する |
+| Remote縦長解除は端末設定 | `crates/remote-web/web/app.js:13199` (`portraitSinglePage`)、`src/remote_ipc/container.rs:6076` (`force_single_page`) | 成立。旧app.js:11536を置換。本体のSplit、端末single強制を構成payloadへ混ぜない |
+| session shiftは再入場で消える | `src/app.rs:25885`, `:44563`、`src/ui_fullscreen.rs:28390`、`src/app/gamepad_input.rs:6550`, `:6964` | 成立。§1.364は未実装。キーだけの抑止では不十分で共通action ownerで拒否する |
 
 調査で重要な追加前提:
 
@@ -88,72 +89,78 @@ Ctrl+G/タグ/評価/スマートフォルダ/コレクション/★固定/サ�
    構成の非表示、種類除外、一時facet絞り込みを同じ「存在しない」に潰すと、解除/直接移動が壊れる。
 2. ZIP階層はwrapperをcollapseする (`src/zip_tree.rs:217`, `:368`, `:413`)。
    しおりのouter+entryから、実際にページを所有する実効階層を解決してから構成を引く。
-3. 深いZIP階層のresumeは現在記録しない (`src/app.rs:56649`)。
+3. 深いZIP階層のresumeは現在記録しない (`src/app.rs:56824`)。
    本機能に便乗してcross-book resumeを導入しない。階層内の保存時reanchorはidentityで行う。
 4. Remoteはローカル閲覧と排他 (`docs/web-remote-plan.md:51`, `:57`, `:83`)。
    **取得をeditorのUIモーダルで止められるという初稿の前提を撤回**する。
    別スレッドの `SessionStateMachine::acquire` (`src/remote_ipc/session.rs:309`) が先にBeginAcquireを確定し、
    UIは後で全窓を閉じる (`src/remote_ipc/ui.rs:1081`)。この既存契約へeditorも含める (§8.1 / §10.2)。
-5. 初回列生成以外にもitemsが変わる。実削除完了 (`src/app.rs:46052`) は
-   `remove_items_batch` (`:42877`, `:42925`) で直接remove・世代更新し、自動reloadを抑止する (`:46055`)。
+5. 初回列生成以外にもitemsが変わる。実削除完了 (`src/app.rs:46228`) は
+   `remove_items_batch` (`:43053`, `:43101`) で直接remove・世代更新し、自動reloadを抑止する (`:46231`)。
    identity表の既存remapだけでは新設explicit unitは直らない。投影ownerの行変更契約も必要 (§3.2)。
-6. 集約からの直接閲覧はreleased経路 (`src/app/snapshot_ops.rs:1736`)。
-   reader orderはsnapshot/collection/detailsを尊重する (`src/app.rs:68508`)。
-   navは動画も含む (`src/ui_fullscreen.rs:13460`)。本を開き直すことを強制しない (§3.1)。
-7. 退避列の復帰は直接代入 (`src/app/snapshot_ops.rs:1281`, `:1405`、
-   `src/app/viewer_context_registry.rs:3403`)。現在のcurrent_folderだけの変更通知では不十分 (§10.1)。
+6. 集約からの直接閲覧はreleased経路 (`src/app/snapshot_ops.rs:1737`)。
+   reader orderはsnapshot/collection/detailsを尊重する (`src/app.rs:68677`)。
+   navは動画も含む (`src/ui_fullscreen.rs:13632`)。本を開き直すことを強制しない (§3.1)。
+7. 退避列の復帰は直接代入 (`src/app/snapshot_ops.rs:1282`, `:1406`、
+   `src/app/viewer_context_registry.rs:3418`)。現在のcurrent_folderだけの変更通知では不十分 (§10.1)。
 8. メタ情報転送のcontainer familyはorigin一つ (`src/metadata_transfer.rs:2436`) で、
    source/cache混在はエラー (`:2163`)。importは共通target key (`:4396`, `:4695`)。
    構成をそのfamilyへ追加せず、専用の論理scope転送契約へ分離する (§7.3)。
 9. 内容IDはFolderを持たず (`src/content_identity.rs:62`)、Folder itemは対象外 (`:169`)。
    画像本フォルダの外部移動を既存内容IDが復元するという初稿の前提を撤回する (§4.1)。
-   保存成功時のEdit観測も必要 (`src/app.rs:25803`、§7.2)。
+   保存成功時のEdit観測も必要 (`src/app.rs:25962`、§7.2)。
 10. Remoteの方向/表紙操作は既存 `SetSpread` (`src/remote_ipc/ui.rs:2322`, `:2552`)。
     mode/direction/coverを同時に保存する現行経路なので、表示切替だけを許す入口と分離が必要。
     R4の明示決定により、構成あり本の方向/表紙変更を拒否する (§9.1/9.2)。構成なしの既存操作は維持する。
 11. resumeのDBはpath一つにつき一行 (`src/book_resume_db.rs:128`)。
     writer受付 `persist_book_resume_with_identity` (`src/app/book_resume_meter.rs:181`) にcontext優先順位はない。
     窓ごとの再着地から書き込むとreload完了順が共有位置を決める。保存要求の一ownerだけが記録する (§6.1)。
-12. 方向/表紙以外にも、PC HUDの末尾表紙・端配置・強制単独 (`src/ui_fullscreen.rs:25218`, `:25231`, `:25243`)、
-    強制単独KeyAction (`:29564`, `:29577`)、Remote同等要求 (`src/remote_ipc/ui.rs:2327`, `:2331`, `:2350`) がある。
-    現行setterはspread.dbへ保存 (`src/ui_fullscreen.rs:36922`, `:36973`, `:37022`、
+12. 方向/表紙以外にも、PC HUDの末尾表紙・端配置・強制単独 (`src/ui_fullscreen.rs:25466`, `:25479`, `:25491`)、
+    強制単独KeyAction (`:29967`, `:29980`)、Remote同等要求 (`src/remote_ipc/ui.rs:2327`, `:2331`, `:2350`) がある。
+    現行setterはspread.dbへ保存 (`src/ui_fullscreen.rs:37420`, `:37471`, `:37520`、
     `src/remote_ipc/ui.rs:2603`, `:2644`, `:2703`)。R4ではComposedに対する書込前の共通拒否へ接続する (§9.1)。
     R2/R3で提案した構成recordへの直接小編集は、利用者決定により撤回する。
 
-R5/R6の追加前提照合:
+R5/R6の追加前提 (G0で同treeへ再照合):
 
 13. EPUBの `GridItem::PdfPage.pdf_path` は元EPUB。共通PDF列生成は要求された論理パスを保持する
-    (`src/ui_dialogs/epub_convert.rs:661`, `src/app.rs:36590`, `:36769`, `:37070`)。個別編集キーは `page_path_key` →
+    (`src/ui_dialogs/epub_convert.rs:661`, `src/app.rs:36762`, `:36941`, `:37242`)。個別編集キーは `page_path_key` →
     `edit_source::page_key_for_grid_item` → `page_key_for_pdf` → `zip_entry_key` で
     `normalize(元EPUB)::page_<0-based番号>` になる
-    (`src/app.rs:75663`, `src/edit_source.rs:362`, `:394`, `src/adjustment_db.rs:550`, `:561`)。
+    (`src/app.rs:75978`, `src/edit_source.rs:362`, `:394`, `src/adjustment_db.rs:550`, `:561`)。
     物理cache解決は `pdf_loader::resolve_read_target` (`src/pdf_loader.rs:964`) 以後だけ。
     固定ページ寸法は `crates/epub-pdf-worker/src/render.rs:12`, `:114`。
     同一入力/変換器の安定性を利用者の前提として採択し、将来の版差まで一致を保証するとは書かない。
 14. 画像folderのsidecar復元は**自動**。`sidecar_restore_eligible` (`src/app/sidecar_restore.rs:1048`) と
     `ImportFamilies.edits` (`:1161`) がbackup設定に従い、ImportRequiredから確認質問なしでworkerへ
     進む (`:1988`, `:2033`)。既存編集は `ON CONFLICT DO NOTHING` (`src/sidecar_import.rs:1638`)。
-    `sidecar_backup_enabled` は既定true (`src/settings.rs:7716`)。この不足行補充に構成を合わせる (§7.4)。
+    `sidecar_backup_enabled` は既定true (`src/settings.rs:7850`)。この不足行補充に構成を合わせる (§7.4)。
 15. 明示転送は空も置換。page/container family削除→値があるものだけ挿入
     (`src/metadata_transfer.rs:4571`, `:4645`, `:4831`, `:4950`)。
     UIは一括確認一回で範囲・適用数・スキップ数と上書き説明
     (`src/ui_dialogs/metadata_transfer.rs:829`)。カテゴリ選択/本ごとの確認はない (§7.3)。
 16. 現行抽出結果は自動見開きが利用可能で、本境界なしに隣接nav画像を組む
-    (`src/ui_fullscreen.rs:13460`, `:15151`)。cover/shiftも使え、末尾等はcomplete book条件が制限する
-    (`:14898`, `:16864`, `:27987`)。A2はreleased挙動の変更であり、互換テスト差分を限定して説明する。
+    (`src/ui_fullscreen.rs:13632`, `:15323`)。cover/shiftも使え、末尾等はcomplete book条件が制限する
+    (`:15070`, `:17036`, `:28390`)。A2はreleased挙動の変更であり、互換テスト差分を限定して説明する。
 
 17. sidecarの自動復元はmtime秒値の比較ではない。`SidecarDiskToken` はfolder/byte length/mtime nanos/SHA-256を捕捉し、
     `sync_marker()` が内容を混ぜた値を生成する (`src/sidecar.rs:187`, `:203`)。
     probeはmarker完全一致 (`src/sidecar_import.rs:795`)、再利用証明はpending/failed writerを先に判定し、
-    全bytesの再検証も行う (`src/sidecar.rs:358`, `src/sidecar_import/probe_reuse.rs:141`, `:175`)。
+    全bytesの再検証も行う (`src/sidecar.rs:358`, `src/sidecar_import/probe_reuse.rs:141`, `:164`)。
     明示metadata importのmtime秒値 (`src/metadata_transfer.rs:4824`) を構成の消費記録には流用しない (§7.4.2)。
 18. 現行writer/import snapshotはitemsだけで同一性を判定する (`src/sidecar.rs:463`)。
     空itemsならfile削除 (`:1055`)、flush完了はitems Arc/disabledだけを照合 (`:1148`)、
     reservation捕捉もitemsだけ (`:1314`)。root構成を加える時は全snapshot契約を拡張する (§7.4.1)。
-19. 連結読みの通常navはsequenceを作らずearly returnする (`src/ui_fullscreen.rs:11248`)。
-    実際の提示候補は `continuous_reading_layout` (`:37762`, 可視判定 `:37823`) が作り、
-    `draw_fs_continuous_reading` (`:38361`) がtextureを選んで直接paintする (`:38567`)。
+19. 連結読みの通常navはsequenceを作らずearly returnする (`src/ui_fullscreen.rs:11420`)。
+    実際の提示候補は `continuous_reading_layout` (`:38552`, 可視判定 `:38621`) が作り、
+    `draw_fs_continuous_reading` (`:39161`) がtextureを選んで直接paintする (`:39367`)。
     anchor移動へのadmission追加だけでは不十分。既存continuous unit/presentation ownerへ接続する (§6.2)。
+
+20. E §1.342はfitの入力/保持を拡張したが、unit membershipと読書anchorの正本は引き続き
+    `SpreadDisplayComposition` → `fs_navigation_display_demand_for_anchor`
+    (`src/ui_fullscreen.rs:17103`, `:17146`)。新しい `ContinuousSpecifiedFitReference` (`:8163`)、
+    `prepare_continuous_specified_reference` (`:38245`)、`FullscreenFitInput` (`src/fullscreen_specified_scale.rs:52`)
+    を構成のorder/pairing ownerへ置換しない。Eへの接続は§13のG0照合記録に具体化した。
 
 ## 3. 所有境界と処理順 — items生成時の一回の投影
 
@@ -267,7 +274,7 @@ PreparedBookの整数slotは `items_generation` と同時に採用される派�
 初回installだけでなく、全行変更を同じ `update_projection` 境界に含める。
 
 - **実削除**: `remove_items_batch` の既存old→new remap
-  (`src/app.rs:42896`のshift、`:42905`のidentity表更新) をitems/metasと同じUI transactionで
+  (`src/app.rs:43072`のshift、`:43081`のidentity表更新) をitems/metasと同じUI transactionで
   unit全occurrence・補助・anchor/selectionへ適用する。削除slotはNone、後方slotは同じ差分だけ移す。
   `[A,B],[C,D]`からBを削除した結果は `Single(A,元slot), Pair(C,D)`。AとCを組にしない。
   元manifest/identity解決表ではBをMissingへ更新し、構成DBのB参照は保持する。
@@ -276,7 +283,7 @@ PreparedBookの整数slotは `items_generation` と同時に採用される派�
   親一致ならreloadを予約する (`:189`, `:202`)。専用PageRef移行をこの旧→新identity事象に含める。
   identity変更を反映できる列はpure remapを同時採用、再列挙が必要な列は既存reload完了まで旧投影を
   holdover専用とし、旧identityでのresume/export/編集を確定させない。単なるpage-edit rehydrate
-  (`src/app.rs:45625`, `:45708`) だけでは構成identity/units更新の代わりにならない。
+  (`src/app.rs:45801`, `:45884`) だけでは構成identity/units更新の代わりにならない。
 - **追加/外部変更/F5/policy・分類変更**: 新manifestとrecipeから共通ownerが再解決し、一括install。
   数値idxをidentityへ逆推測しない。Missingが同名identityで復帰したら指定unitへ戻る。
 - **subset/詳細sort/復帰**: Bookは元投影のidentityに対するview投影、OrdinaryList/ExtractedResultは従来結果orderの投影。
@@ -479,6 +486,9 @@ unit tokenはLayoutSourceのtagとcomposition revisionを明示追加する。Co
 nav列、items世代、Single/Spread/Splitの閲覧投影、direction、filtered projection identityを含める。
 Automatic branchのlandscape epoch/page_aloneはそのまま必要。
 geometry cacheはさらに既存寸法/回転/trim/scale revisionを使う。手動Pairのtopologyをlandscape epochで変えない。
+G0/E接続: fit/geometry入力は既存 `FullscreenFitInput` のA/O・指定値・共通capとlimits、media rect/pppを含む。
+Gの新unit token/提示許可とこれらのdescriptorを対にし、同じidxや完成textureだけで旧geometryを再利用しない。
+capture/replayは捕捉descriptor、live連結は保持source + 現在trim/rotationから解くEの規則に従う。
 
 旧holdover/passive snapshotはcapture時のunit・role・geometry・構成revisionを保持し、現在の設定から再描画しない。
 source load/cancel/result採用は所有context/世代に限定する。blankがreadinessを永久待機させないこと、
@@ -572,7 +582,7 @@ parked窓やsaved_itemsからownerを取り直さない。
   enqueueは成功replyの処理内で各窓のreload/adoptionを開始する前に行い、後の通常操作のwriteより遅れて発行しない。
   commit失敗/cancelは書かない。各context reload完了を待ってownerを選ばない。
   同値なら既存dedupで省略し、独自の永続exactly-once台帳やretryを作らない。
-- 既存open/navの `record_book_resume` (`src/app.rs:56647`, `:65174`、`src/ui_fullscreen.rs:21155`, `:38352`) は
+- 既存open/navの `record_book_resume` (`src/app.rs:56814`, `:65343`、`src/ui_fullscreen.rs:21359`, `:39152`) は
   保存更新によるreload/adoption/reanchorを「新しい読書操作」として通さない。
   呼出し起点をtypedなProjectionRefreshとして既存install/open効果へ渡し、anchor/メモリのmeterを更新しても
   resume/history書込効果を発行しない。parked復帰・退避一覧の鮮度更新も同じ起点。
@@ -586,13 +596,22 @@ metadata import等に伴う構成投影の背景更新も、新しい読書操�
 現行metadata transferはbook resume/履歴を転送しない。構成importの背景更新も新規resumeを書かない。
 Q5の決定は「次回の再開位置は保存要求の元位置に基づく一つ」であり、兄弟窓の移動先を奪い合わない。
 
+G0照合: 通常open `src/app.rs:65343`、continuous seek `src/ui_fullscreen.rs:21359`、
+continuous reanchor `:39152` は `record_book_resume` を直接呼ぶ。HistoryTriggerだけを弱めてもresumeは止まらない。
+Book reload/復帰は既存のtyped navigation/open purposeへ**投影adoptionの原因**を渡し、その要求終端まで
+通常resume/history発行を行わない。新しい一時suppress boolや窓の優先順位を足さず、保存intentと別のcauseであることを
+受付からreanchorまで保持する。adoption後の寸法/fit後着による自動reanchorもこの投影causeを引き継ぎ、
+最初のpaintやreload完了だけで通常読書writeへ切り替えない。次の通常ユーザーナビ/再開した自動送り要求を
+受理した時に既存閲覧ownerのpurposeを通常読書へ更新し、以後は従来どおり記録する。
+Eのfit参照再選択や初回layoutの自動reanchorも、adoptionから発生する間は同じcauseへ従う。
+
 ### 6.2 連結読みを含む新規提示の許可owner
 
 連結読みは維持し、nav sequenceを強制作成したり、anchor更新まで照合を遅らせたりしない。
-既存 `ContinuousReadingUnitSpec.presentation` (`src/ui_fullscreen.rs:8148`) / 可視位置列 / 描画ownerを使う。
+既存 `ContinuousReadingUnitSpec.presentation` (`src/ui_fullscreen.rs:8224`) / 可視位置列 / 描画ownerを使う。
 そのcontextのcontinuous表示要求へ **viewport内のpresentation occurrenceの許可** を載せる。
 要求は `ViewerContextBundle` の既存continuous runtimeと一緒にmount/deposit/fork/closeされる
-(現在のscroll/layout所有: `src/app/viewer_context_registry.rs:977`, `:1040`, swap `:2631`, `:2678`)。
+(現在のscroll/layout所有: `src/app/viewer_context_registry.rs:991`, `:1054`, swap `:2646`, `:2693`)。
 App共通bool、anchor専用許可、texture cacheに付ける許可の別ownerは作らない。
 
 責務と確定順:
@@ -607,8 +626,8 @@ App共通bool、anchor専用許可、texture cacheに付ける許可の別owner�
    未許可候補の領域は既存loading相当の背景/待機表示だけ。UI同期DB/file I/Oや全結果列の照合はしない。
 3. 新しいunitの提示確定は、そのunitの全presentation候補の照合完了を待つ。
    sourceごとの判定を途中で一枚だけ採用せず、Allowed Pair/片側HiddenのSingle/全Hiddenのskipをatomicに決める。
-   Allowedだけを**提示用pagesとtexture選択入力**へ渡す。texture選択ループ (`src/ui_fullscreen.rs:38485`)
-   と `draw_fs_spread_page` 呼出し (`:38595`) の両方で許可済みprojectionを使う。
+   Allowedだけを**提示用pagesとtexture選択入力**へ渡す。texture選択ループ (`src/ui_fullscreen.rs:39285`)
+   と `draw_fs_spread_page` 呼出し (`:39395`) の両方で許可済みprojectionを使う。
    Checking/Hiddenにはcached processed/raw/transition/thumbnail/pass-throughのどの画像も渡さない。
    paintだけでなく `fullscreen_page_layout` 登録、hit test/編集target、navigator画像、presentation trace、
    読了/位置記録も同じ許可済み投影に従う。キャッシュに画像があることを許可とみなさない。
@@ -630,6 +649,9 @@ Single→Spread、Split切替、補助表紙の新出現も同じ **presentation
 確定後はAllowed PairまたはHidden片側を除くSingleを一回で採用する。page-turn sequence/holdoverの
 役割別presentation、連結のviewport要求が同じ許可resolverを使い、mode handlerに別DB照合を増やさない。
 Bookは採用済み構成snapshotの可視列を入力にでき、OrdinaryList/ExtractedResultは候補ごとにlogical scopeを解決する。
+Eの指定サイズ参照を新たに選ぶ時も許可済みunitだけを渡す (§13 G0照合記録)。未許可/Hiddenの新しい相方を
+fit基準やそのunit自身のgeometryへ確定させてからpaintで隠す実装にはしない。
+一度許可して保持した画面外の参照sourceはmeasurement用に継続できるが、それは再入場の提示許可を兼ねない。
 read-only mount/forkは画像と同じ捕捉済み表示を継続できるが、fork先の新入場/新投影はそのcontextの新要求となる。
 
 ## 7. 新しい本別ストアと既存ライフサイクル
@@ -681,7 +703,7 @@ shiftは許可せず、構成編集も書込停止中は受けない。次のope
 読み取り専用open/closeはmutation-style invalidationを出さない。
 content identityは元メディアの内容であり、構成revisionを内容hashへ混ぜない。
 **構成保存成功時**には、要求時に捕捉したlogical rootへ `ContentIdentityTrigger::Edit` を送る。
-現行 `record_current_container_content_identity` (`src/app.rs:25803`) の考え方を使うが、
+現行 `record_current_container_content_identity` (`src/app.rs:25962`) の考え方を使うが、
 reply時のmount/current_folderを参照しない。PDF/EPUB/ZIP/対応元書庫は新規構成だけの保存でも
 restorable ledgerを作る。nested保存もouter logical rootを観測する。Folderは非対応として送信対象外。
 editor保存/importによる構成作成は同じ成功通知へ接続する。Remoteに構成write入口は作らない。
@@ -843,7 +865,7 @@ DB保存/解除成功後にbackup writeだけ失敗した時は、**DB結果を�
 状態は一つの `CompositionEditorState = Preparing | Editing(draft) | Saving | Reloading`。
 owner context/scope/requestは状態内に持ち、show bool + pending bool + draft Optionを重ねない。
 共通modal helperとローカルopen admissionへ同じ**mount非依存のeditor owner**を登録する (§8.1)。
-既存UI modal判定 (`src/app.rs:21741`, `:21756`, `:37693`) だけをRemoteの確定境界とみなさない。
+既存UI modal判定 (`src/app.rs:21897`, `:21912`, `:37865`) だけをRemoteの確定境界とみなさない。
 
 画面構成:
 
@@ -889,7 +911,7 @@ App/registryの操作routerに一つのtyped local-operation参照
 draft/phaseはそのcontext bundle一つにだけ持つ。ownerはphaseのコピーやboolではなく所在の正本で、
 どのApp投影をmountしても同じ参照からmodalを判定する。
 context所有draftを現在mountのAppフィールドだけから探す実装は禁止。
-`with_window_viewer_context`による兄弟描画 (`src/ui_fullscreen.rs:22457`) でも
+`with_window_viewer_context`による兄弟描画 (`src/ui_fullscreen.rs:22661`) でも
 owner Aを保持し、Bの入力を拒否する。Aを描画する時だけAのdraftへアクセスする。
 main一覧だけにeditorを開いた場合もownerがあり、fullscreen_idx/窓数は所在の判定条件ではない。
 
@@ -901,7 +923,18 @@ lock内に走査/DB/worker待ち・viewport作成・context mount・再入する
 これは**BeginAcquireの拒否条件を増やす新admission gateではなく、既存取得境界でローカル開始を順序付ける拡張**。
 sessionにeditorフラグや別のLocal/Remote ownerを作らない。startのphase確認とowner採用を
 別々のsnapshot読み取りにするとその隙間で取得済editorを作れるので不可。
-session mutexの保持範囲とlock順をG0で独立レビューする。
+G0照合: 使用するlockは `SessionHandle.inner: Arc<Mutex<SessionStateMachine>>`
+(`src/remote_ipc/session.rs:1219`)。別の `ui_request_admission` mutex (`:1225`) はRemote UI queue用で、
+Local-phaseとの確定境界にはならない。private innerをAppから直接触らず、session moduleの短いhelperで
+既存acquire (`:1544`) と同じinnerに入る。新helperは提案であり、現行APIに存在するとは扱わない。
+
+lock順は **UI routerの直列処理 → session.inner → O(1)のowner/ticket採用 + try_send → unlock**。
+App側owner/ticket tableはUI router所有で新mutexを付けない。channel full/disconnectedなら同じ短い受付内で
+未送信ticketを外しEditingへ戻して通知し、write済みとしてbarrierへ数えない。
+inner保持中にui_request_admission/gui gate/registry mount/service lock/DB/flush fenceを取得しない。
+workerはsession/registryのlockを取得せず、完了channelを既存UI routerが収穫してからphaseを確認する。
+既存BeginAcquireのgui gate publicationから逆順でinnerへ戻る経路を新設しない。
+start/saveの非blocking受付と、保存workerが行うmanifest検証/sidecar準備/transactionを分離する。
 
 開始後にBeginAcquireが来たらRemoteが勝つ。prepare replyからEditingへ進む前・入力/save受付・
 reload採用のいずれもrequest相関と既存session phaseを使い、取得開始後に新しいlocal操作を確定しない。
@@ -921,8 +954,11 @@ E側と共有する問い合わせは `resolve_book_layout_source(scope)` (Book�
 ExtractedResultは本別shiftを持ち込まず常にshift禁止。OrdinaryListの従来一時shiftは、その元scopeの構成がない場合に維持する。
 構成snapshotの取得に失敗した状態を「構成なし」としてshiftやbinding変更を許可しない。
 
-`queue_spread_shift_action`が見開きずらしを作る前に共通可否を見る。
-ComposedまたはExtractedResultならactionを消費、anchor/target/cache/DBを変更せず通知する。
+`queue_spread_shift_action`の**Spreadで実際にずらすbranch**へ入る前に共通可否を見る。
+ComposedまたはExtractedResultならそのshift意図を消費、anchor/target/cache/DBを変更せず通知する。
+G0照合: 現行同handler (`src/ui_fullscreen.rs:28390`) のnon-spread branchは通常の一ページ移動。
+`SpreadMode::is_spread` (`src/settings.rs:3096`) はSingle/Splitを含まないため、このfallbackをshift拒否より先に
+通常nav意図へ分離し、Q16のtarget提示許可に通す。Action名だけで入口全体を禁止して単ページ移動を失わない。
 Composedの説明は「本の構成で設定されています。組を変えるには本の構成を編集してください」。
 ExtractedResultには「この結果一覧では見開きをずらせません」と説明する。元本の構成有無を調べない。
 四つのFsSpreadShift Action、カスタムキー、ゲームパッド/リング等で同じ結果にする。
@@ -997,7 +1033,7 @@ Composedでmode欄から読むのはSingle/Spread/Splitの分類だけで、enum
 構成作成時は現在の閲覧modeをcontextへ保持するだけで、このmode行への付随writeを追加しない。
 
 現行 `SpreadMode` はdirection/cover/modeを一つのenumへ含む (`src/settings.rs:3082`)。
-PCの `apply_fullscreen_spread_mode` (`src/ui_fullscreen.rs:37276`) とHUD受付 (`:25152`) は
+PCの `apply_fullscreen_spread_mode` (`src/ui_fullscreen.rs:37798`) とHUD受付 (`:25400`) は
 結合値の保存・方向更新も行うため、構成ありのmode-only入口からその一括更新を直接呼ばない。
 `FsSpreadLtr/Rtl`、cover付き、`FsSpreadSplitLtr/Rtl`は方向/表紙を指定する操作として拒否する
 (`src/keymap.rs:1730`, `:1734`)。`FsSpreadSingle`はmode-onlyへ通す。
@@ -1012,6 +1048,26 @@ Webの単ページ/見開き/横長分割切替はこの一つの入口を使う
 mode-only要求はBookでは構成snapshot、抽出列ではA2固定入力で表示投影を更新し、構成writerを起動しない。抽出列ではDBのmode-only保存も行わない。
 Remoteの端末単ページ強制も引き続きview projectionであり、PC/他端末の本設定を書き換えない。
 この分離は表示切替を維持するためのもの。表紙・方向や周辺操作の直接小編集APIは追加しない。
+
+### 9.3 §1.364との未確定契約 — ラインEの設計待ち
+
+**G0の保留項目。Gはshift store/schema/保存ON・OFF時の解決規則/復元fallbackを設計しない。**
+正本予定はラインE (`C:/home/mimageviewer-nextview`) の `docs/spread-shift-memory-plan.md`。
+この時点ではその設計採択を待ち、下記はGが必要とする接続条件だけを列挙する。
+
+| Eから必要な契約 | Gの確定済み境界 / 用途 |
+| --- | --- |
+| shift解決request/返答の型、採用世代、解決済shiftの意味 | `BookLayoutSource::Automatic(resolved_rules, optional_shift)` へ渡す。Composed/ExtractedResultでは解決・適用しない |
+| 保存対象となるbook資格とscope key、logical/physical/prefix対応 | ZIP階層/元変換書庫/PDF/EPUB/画像folder/OrdinaryListの境界を確認。GのBookScopeをEのDB keyと同一だと仮定しない |
+| anchor identityと当該manifest/nav orderへの解決、Missing/旧記録等の扱い | GはEから解決済み入力を受け、raw slotや保存値を独自に推測しない。Eが選ぶ復元規則/記憶ON・OFFに従う |
+| editor初期化に渡す現在の実効shift snapshot | Preparing受付時のscope/items世代/自動規則と一体で捕捉し、shift適用後の**現在の組**を初期構成にする。保存値の再読込で初期値を変えない |
+| 構成作成/保持/解除と休眠shiftのlifecycle | Q1: 構成作成/保存/失敗でEの保存shiftを消去・更新しない。解除後にその時点のE規則で再解決する。副作用のない境界/APIを合意 |
+| 共通action admissionと返答/失効の順序 | Gの構成あり/Unreadable/A2拒否をEのshift変更**前**に確認。Single/Splitの通常nav fallbackは分離して維持。Ctrl左右/キー再割当/gamepad/HUD/再送も同じ入口。Eの新世代返答が旧projectionへ作用しない |
+| rename/purge/content restore/import/resetの担当と通知 | Eのstore保守はEが所有。Gが休眠値を写したり別transactionで消したりしない。Gの構成revision通知とEのshift通知を混同しない |
+| 共同受入fixtureと統合順 | 記憶ON・OFF/再入場/identity欠落、構成作成・取消・解除、兄弟窓、A2/OrdinaryListの期待値をEの採択後にG3へ具体化する |
+
+記憶規則が決まるまでは§13 G3のshift関連acceptanceは契約待ちと明記し、G1/G2の非shift部分は分離して進められる。
+上記はG0の不足設計をG内で埋める指示ではなく、coordinatorからE設計者へ渡す問い合わせ一覧。
 
 ## 10. F12 / 多窓 / Remote
 
@@ -1046,9 +1102,14 @@ source revisionはscopeの受入manifest/実削除/改名publicationで、contex
    grid復帰では構成照合ゼロ、fullscreen復帰で新たに出すanchor/相方だけ遅延照合し、Hiddenなら§6へ。
 3. どちらも復帰adoption/背景更新から共有resume/historyを新規記録しない (§6.1)。
 
-固定解除 `snapshot_ops.rs:1281`、固定一覧帰還 `:1405`、F12元一覧 `viewer_context_registry.rs:3403` を含め、
+固定解除 `snapshot_ops.rs:1282`、固定一覧帰還 `:1406`、F12元一覧 `viewer_context_registry.rs:3418` を含め、
 Bookの旧items直接代入で旧構成を復活させない。結果列へ新しい構成更新callbackは登録しない。
 Book再取得中は既存loading/holdover、固定membership/source label/pre-search origin/return routeを破棄しない。
+G0照合: snapshot/F12の直接代入は統合後も残る。`adopt_retained_projection` は新しい共通接点として実装が必要。
+Eが追加した `fs_continuous_fit_reference` / retained PDF metadata / captured fit inputも各bundleの寿命に従う。
+新Book投影でidentity/role/slot/sliceが変わるidx参照は旧fit参照ごと採用せず、受入済み新unitでEのresolverを使う。
+同じ投影のread-only復帰/forkでは現在のfit入力/手動zoom/panを保ち、Appのlive sibling値から再生成しない。
+receiptはApp共通storeにだけ保持し、復帰recipeやF12 bundleへ載せない (`330e070f6`の訂正を維持)。
 本から離れている窓をsaveで強制移動させず、退避Bookは復帰時に更新する。
 
 editor terminal closeは §8.1/§10.2に従う。indexを使うdraftを別窓に移植しない。
@@ -1080,10 +1141,10 @@ Remoteの全体編集UI/APIの追加は別段階/要求とし、本機能のPC�
 現在の「後から操作した側が勝つ」を保ち、editor中でもBeginAcquireを拒否しない。
 `poll_remote_session`のAcquiringRemote分岐 (`src/remote_ipc/ui.rs:1081`) の全窓closeに
 editorのterminal closeを含める。`close_all_detached_viewers_for_mode_change`の
-`had_detached == false`早期return (`src/app.rs:58163`) やfullscreen_idxなしでeditorを見落とさない。
+`had_detached == false`早期return (`src/app.rs:58330`) やfullscreen_idxなしでeditorを見落とさない。
 全ローカルsurfaceのclose coordinatorがglobal editor ownerを無条件で列挙し、
 context close関数は同じterminal処理を使う。別modal窓だけ残す設計にしない。
-`local_viewer_close_state` (`src/app.rs:73834`, `:73863`) はeditor owner/viewportと
+`local_viewer_close_state` (`src/app.rs:74141`, `:74170`) はeditor owner/viewportと
 送信済構成writeの終端も含めてClosedを判定する。mount中のApp fieldsや窓数を代用しない。
 
 取得順の証明 (startは §8.1の同じsession mutexで確定):
@@ -1105,7 +1166,13 @@ service drainは既存AcquiringRemoteのclose barrierへ接続し、Remoteの最
 (`src/remote_ipc/pipe.rs:1797`) を通り、AcquiringRemoteはそこで待つ
 (`src/remote_ipc/session.rs:2501`, `:2524`)。write workerも同じ待ちを持つ (`src/remote_ipc/pipe.rs:1338`)。
 この既存activation境界を使用し、取得応答がActiveというだけで列挙を先行させない。
-現在の30秒取得失敗処理 (`src/remote_ipc/ui.rs:1130`付近) は維持し、
+G0照合: 現行 `remote_ipc/ui.rs:1081` は窓close/AI barrierだけでFinishを判定し、editor/ticketはまだ存在しない。
+この同じacquire barrierのFinish条件へ **mount非依存editor ownerが終端 + 送信済save ticketが終端** を追加する。
+ticketは閉じたcontextのdraft内ではなくApp共通worker完了管理に残り、全窓closeで脱落させない。
+`local_viewer_close_state` (`src/app.rs:74141`, `:74170`) だけがClosedでも未完了ticketを見落とさない。
+`finish_acquire` (`src/remote_ipc/session.rs:1656`) はbarrier完了後だけ呼び、Remote read/writeの既存
+`wait_until_active`をそのまま使う。新しいRemote取得拒否条件や二つ目のsession ownerは作らない。
+現在の30秒取得失敗処理 (`src/remote_ipc/ui.rs:1125`) は維持し、
 追加の待ち時間/retry/保存完了後のlocal窓復元を作らない。
 owner窓終了/Local返却/取得abortでも旧requestを新ownerへ配送せず、replyはserviceで完了させる。
 app終了途中のcommitはDB一transactionの従来の保証に任せ、永続draft回復は要求しない。
@@ -1143,7 +1210,7 @@ slot/presentation modeを共通trim resolverへ渡し、local/Remote/continuous/
 
 `logical_root` (元RAR/7z/LZH等) と `physical_read_target` (cache ZIP/直接RAR) をsnapshotで分離する。
 current_folder + archive_source_overrideが同じ受入済cacheを指す場合だけ対応を使う
-(`src/app/snapshot_ops.rs:2241`)。App globalなcache aliasを別contextへ当てない。
+(`src/app/snapshot_ops.rs:2242`)。App globalなcache aliasを別contextへ当てない。
 
 - 構成/構成PageRef/しおり/新target lookupは元root+entry。
 - デコード、既存回転/補正/trim等page DBは現行物理cache側のキーを維持。
@@ -1230,16 +1297,18 @@ view-modeだけをbindingから分離する入口は残す。これを削ると�
 
 設計担当が下記chunkを確定し、各chunkのwriterを一人にする。実装と独立レビューは別context。
 本書では追加subagent/レビュー実行をしていない。設計handoff後にcoordinatorが独立レビューを手配する。
-ライン E の§1.342統合前にはproduct実装を始めない。§1.364と契約が未決のままshift storeを設計しない。
+E §1.342の統合前提は `fa280d0d0` / `76488f0ec` で充足。§1.364の契約待ちは§9.3に分離し、Gではshift storeを設計しない。
 
 ### G0: 設計採択・E統合後の再照合
 
-成果: R6独立レビュー、scope/DTO/shift責任分担、detached構造合意。§14の1〜17とbackupだけの保存失敗は全て決定済み。
+成果: R6独立レビューACCEPTと `330e070f6` の訂正を保持。§14の1〜17とbackupだけの保存失敗は全て決定済み。
+今回のG0ソース照合とE接続の更新は以下。shift-store contractは§9.3の明示保留、detached §11案はhandoffにだけ記載する。
 受入: §2のsymbol/lineをmerge済masterで更新し、Eのgeometry/scale/unit/anchor差分を確認。
 editor start/save-ticketとsession mutexのlock順/全close barrier、Book復帰adoption、
 一つのresume intent、Q16の候補単位admission/連結viewportの提示許可、A2のview-mode境界を構造レビューする。
 G4F採択時は全sidecar snapshot/予約/reuse、内容tokenとroot消費receipt、明示空反映との接続を構造レビューする。
-旧REVISEを文書修正だけでACCEPT扱いにしない。今回の全回答をbriefへ反映し、小編集/EPUB延期を再質問しない。
+R6の実際のACCEPTと、今回の統合後変更に対する次レビューを分ける。次レビュー/設計担当確認前にG0全体を採択済みとしない。
+小編集/EPUB延期/連結読み制限を再導入しない。shift契約待ち以外の今回照合はソース上で完了、実行観測はない。
 
 依存順: **G1 (既存列の統一/A2分類) → G2 (pure model/fixture/共通store) → G3 (本への適用/遅延判定)
 → G4 (editor/多窓) → [G4F (画像folderのみ、切り離し可)] → G5 (最終統合)**。
@@ -1297,6 +1366,8 @@ G1の完了条件へG2以降の構成fixtureを先取りしない。G4F未実装
 - 全pairing action/HUD/setter/Remote bindingを構成ありで拒否し、mode-onlyは維持。
   Single/Split/絞り込み/兄弟mount/同値要求もDB/revision/anchor/cache/resumeを変更しない。
   保存shift休眠、解除時は§1.364の記憶ON/OFF・identity規則。構成なしBook/OrdinaryListは既存操作維持。
+  Ctrl左右等のSingle/Split fallbackは通常ページ移動として維持しhidden targetを照合。Spreadのずらしだけは拒否し、
+  fallback移動で方向/表紙/構成/shift storeを変更しない。§1.364の保存fixtureは§9.3採択待ち。
 - 結果生成/thumbnailに構成lookupゼロ、保存で結果reload/marker/依存token失効ゼロ。
   hidden画像も通常thumbnailで残る。クリック/required snapshot/しおり/評価/履歴の明示targetは直前lookup→toast拒否。
 - 単ページ/見開き/連結/slideshowの次候補だけhidden確認、相方も確認、片側Hidden→元slotSingle、
@@ -1312,6 +1383,11 @@ G1の完了条件へG2以降の構成fixtureを先取りしない。G4F未実装
 - 連結の継続表示は保存時に回収せず、退出→再入場の許可を新しく取る。Hidden→可視変更後も再入場で再確認。
   同一要求内のHiddenをframeごと再照合せず、要求retire/closeで破棄。許可Pending中のholdover/thumbnail fallbackも無許可画像を出さない。cancel/兄弟mount/fork/parked後着の
   replyを他contextへ採用しない。測定で同期I/O/全結果列照合ゼロ、paint記録で無許可画像ゼロを確認。
+- EのSpecifiedScaleで明示Pair/Single+blank/Split/補助を表示。A/O・gap/cap・PDF絶対需要はE oracleと一致し、
+  membershipは回転/landscape後着で再pairされない。paint許可前の相方を新しいfit参照に採用しない。
+  scroll/texture退去/resize/DPIでは参照unitを保持、現在のtrim/rotationで再解決、手動zoom/panは維持。
+  構成reload/実削除はsource/role/slot/sliceの証明でfit参照を保持/remap/失効し、同idxの別identityを参照しない。
+  mounted/parked両ownerと別scope兄弟不変を検証する。指定サイズの可視上限でG独自auto zoomなし。
 - Book詳細sortは構成順lock、抽出詳細sortは結果順、通常folder詳細sortは従来。
 - trim左右別/ページoverride/Blankの実slot/補助/RTL、Singleはsingle margin、既存非構成本は不変。
   Blank source/readinessなし、実Navigationだけをresume/export targetへ。
@@ -1336,8 +1412,13 @@ G1の完了条件へG2以降の構成fixtureを先取りしない。G4F未実装
 - 同一本A20→21/B80→81でreload完了順A→B/B→Aを反転。save owner=Aなら共有resumeは常に21/最大一enqueue。
   parked/退避/F12復帰は81を書かない。一覧のみ元窓はcaptured既存位置、位置なし/対象外/全非表示はKeep。
   commit失敗writeゼロ、Saving中Remote closeも同一intent、import背景更新はKeep。
+  reload/退避復帰後の初回paint・寸法/指定サイズfit後着によるcontinuous自動reanchorもwriteゼロ。
+  次の通常読書要求 (ユーザーナビ/再開自動送り) では既存writeを再開し、位置記憶を恒久的に止めない。
 - snapshot: light/dark、1093×614/1366×728、倍率100/200%、長名、多ページ、白紙/エラーlabel、button到達、IME helper。
   HUD indicator/無効理由「本の構成で設定されています」/有効editor entryとmode切替。
+- Eの前面wheel ownerを実HUD経路で検証。editor entry + wheel/閉じるkeyを同frameに送っても、
+  背景metadata/nav/固定navigatorは不変。旧popupのwheel平滑化残りを次frameのmodalへ流さず、
+  modal終了後の新入力は従来のownerへ戻る。IME確定/取消はhelperで、表示mode/fitの維持を確認。
 
 ### G4F: 画像だけの本フォルダ (独立・切り離し可能)
 
@@ -1409,24 +1490,84 @@ G4F採択時だけfolder専用fixtureを追加し、切った場合はarchives/P
 実装時更新: architecture/virtual-folders/display-pipeline/web-remote/keymap、metadata transfer、EPUB仕様、
 manual本/見開き/検索/設定/Remote、保存先説明、docs索引、detached §11。設計turnは本書とhandoffだけを変更する。
 
-### ライン Eとの再base接点
+### G0照合記録: E統合後の接点と変更一覧 (76488f0ec)
 
-利用者指示: `mimageviewer-nextview`の§1.342指定scaleはG実装より先にmasterへ入る。
-その未統合diffは本worktreeにないため、Eの新型/行番号を本書で推測しない。
+**変更一覧** (元の設計/参照から変えた点を一行ずつ記録):
 
-- `src/ui_fullscreen.rs`: `SpreadDisplayUnit/SpreadDisplayComposition`、unit anchor、
-  `build_spread_display_units_for_nav`、`spread_display_composition_for_anchor`、
-  Single/Spread/continuous layout、holdover/captureの基準geometry、HUD「…」の設定。
-  R4のmode-only入口/本別mode保存と、方向/表紙等の共通拒否もこの既存設定ownerへの接点となる。
-- `src/app.rs`: fullscreen anchor/NavigationDisplayDemand、items install世代、
-  scale状態のcontext ownershipと保存/復元、page-edit pivot、spread設定適用。
-- 関連registry: Eが追加するscale/anchor bundle項目をGのreloadで落とさない。
-  geometryの基準ページはEを正本にし、Gはunit membership/role/slotを渡す。
-- §1.364: E側shift保存scope/identity、HUD表示、LayoutSource contractはG/Eで一度合意して共有。
-  Gは構成あり判定とeditor/initialization、Eは構成なしshift永続化を所有する。
+| # | 再照合結果・今回の更新 | 影響する契約 / 実装stage |
+| --- | --- | --- |
+| 1 | §2の旧185引用を全て同treeへ更新。punctuation/空行を根拠にした参照は該当function/判定へ置換。本文の旧source引用も更新 | 列生成/下流/同期の前提は維持。実行成功の証拠ではない |
+| 2 | Eのunit/anchor resolverは既存正本を維持、fitはtyped A/Oと指定値/capへ拡張。新しい前提20を追加 | Gはorder/role/slotだけを供給し、Eのfit式を複製しない。G3 |
+| 3 | 連結の参照unitと保持sourceを見落とさない条件、source置換時の失効を具体化 | `fs_continuous_fit_reference` はbundle所有。idx一致だけで旧geometryを新Bookへ再利用しない。G1/G3/G4 |
+| 4 | HUD前面wheel配送/キー終了frame/ナビゲータ入力射影を構成editor入口にも接続 | modalの開始と既存popupの入力終端を分離。Eのframe-local ownerを再利用。G4 |
+| 5 | session.innerとRemote UI queue admissionのmutexを明確に区別、start/saveのlock順とsend失敗の受付終端を明記 | §8.1。同じinnerでLocal確認とowner/ticket採用、workerは逆lockなし。G4 |
+| 6 | 現行close/AI barrierにまだないeditor/ticketのFinish条件を明記 | §10.2。送信済save ticketをdraftと共に落とさない。既存finish_acquire/30秒watchdogを維持。G4/G5 |
+| 7 | 退避列の直接代入はE後も残る。共通return adoptionが必要な点と、E状態の維持/失効条件を追記 | §10.1。Book依存不一致はreload、結果gridはlookupなし。G1/G4 |
+| 8 | 通常open/seek/continuous reanchorのresume writeを再確認し、adoption causeを記録入口まで渡す | §6.1。各窓の着地と一つのresume intentを分離。G3/G4 |
+| 9 | Q16可視候補受付にEの指定サイズ参照選択/geometry入力の許可境界も含める | §6.2。cached Hidden/new partnerのpaintだけでなく新fit基準への採用も防ぐ。G3 |
+| 10 | A2 modeとEのfit settingを別軸として確認。既存結合spread setterは依然分離が必要 | §9.2。A2はSingle初期値/一時modeだけ、Eの5方式/手動zoomは維持。G1/G3 |
+| 11 | sidecar token/writer/予約/reuse/receiptのソースはEで変更なし。receipt所有のP3訂正を維持 | §7.4。receiptはApp共通storeのみ、F12はprojection/permit。G4F |
+| 12 | §1.364は別ライン設計中。必要な8契約を§9.3へ集約しG0の保留を明示 | Gはshift store/schema/fallbackを追加しない。E採択後にG3共同fixtureを確定 |
+| 13 | 現行shift handlerがSingle/Splitの一ページnavも担当することを確認。shift拒否前に通常navへ分離する順序を明記 | §9。既に維持を決定した単ページ移動を入口guardで失わない。G3/E契約 |
 
-G1以降のbriefはmerge済masterへrebase後に更新し、Eの指定scale既存テストをそのまま回帰gateへ含める。
-旧anchorやfit算式をG側に複製してconflictを解消しない。
+**Eのgeometry/scale/unit/anchorへの具体的な接続**:
+
+- canonical unit/Navigation/presentationは `SpreadDisplayComposition` → `fs_navigation_display_demand_for_anchor`
+  (`src/ui_fullscreen.rs:17103`, `:17146`) を使用。accepted anchorと画面左右のfirst/secondを混同しない。
+  明示Pairは横長/回転後着でも再pairせず、Gの確定unitをEのlayout resolverへ渡す。
+- `FullscreenFitInput` / `FullscreenFitBasis` / `resolve_specified_scale`
+  (`src/fullscreen_specified_scale.rs:52`, `:13`, `:114`) はA/O、指定値、最大倍率、no_up/downを解く。
+  blankをsource basisへ追加せず、実ページのSingle placement/仮想slotを既存geometryへ渡す。
+  Pairは二枚 + 実効gapをfitし、既定gapを保存し直さない。width/heightの指定値を構成recordへコピーしない。
+- Eのcapture/holdoverはfit input/limits/元寸法からlayout枠とsampling枠を分ける
+  (`src/app.rs:11267`, `src/displayed_image_transform.rs:288`, `src/ui_fullscreen.rs:10511`, `:41571`)。
+  旧描画をlive指定値/新raster/現在の構成から再解決しない。source identity付きPDF絶対需要は
+  `PdfRerenderDemand` (`src/app.rs:7902`) を維持し、G独自のpartner用需要ownerを作らない。
+- 連結の `ContinuousSpecifiedFitReference` / retained source (`src/ui_fullscreen.rs:8163`, `:8177`) は
+  `ViewerContextBundle.fs_continuous_fit_reference` (`src/app/viewer_context_registry.rs:1052`, swap `:2691`) が所有。
+  scrollで参照unitを選び直さず、texture/cache退去後も元寸法を保持し、現在のtrim/rotationでgeometryを解く
+  (`src/ui_fullscreen.rs:38245`, `:38340`)。Q8はtrim sideの解決だけを替え、回転/分割時の既存trim例外を統一しない。
+- items置換は既存 `invalidate_idx_state_and_queues` による参照/PDF需要失効
+  (`src/app.rs:42075`, `:42099`) を使う。純slot remapで同じidentity/role/slot/sliceが残る場合だけEの
+  `ContinuousSpecifiedFitReference::remap_indices` (`src/ui_fullscreen.rs:8192`) で保持できる。
+  parked bundleの `set_items_generation` (`src/app/viewer_context_registry.rs:1813`) は現状layoutを消すだけなので、
+  新投影のadoption ownerがsource/role/slot/slice変更の参照失効も担当する。現在mountのAppだけへ失効を送らない。
+  anchor/相方削除、構成の順/Pair/配置変更で前提が壊れる場合はそのcontextの参照を失効し、新しい許可済みunitを選ぶ。
+  §3.2のitems/unit/identity remapに含め、F5を待って直す設計にはしない。
+- 結果列では構成保存通知によるfit参照全resetを追加しない。既に採用した画面外の参照sourceはmeasurementに使えるが、
+  新規提示permitを兼ねない。新Pair/相方のChecking中は新fit参照を確定せず、旧許可済み表示/背景を維持する。
+  resize/DPI/共通cap変更で同じ参照unitのfitを再解決し、手動zoom/panを巻き戻さない。
+  指定サイズの可視上限は既存遠方unit除外 (`src/ui_fullscreen.rs:38628`, `:38646`) に従い、Gでauto zoomを足さない。
+
+**HUD popupの入力所有**:
+
+`render_fullscreen_viewport` はキー/背面consumerより前に前面wheel ownerを捕捉
+(`src/ui_fullscreen.rs:23779`)。`fullscreen_front_popup_wheel_target` (`:31700`) と
+`FsHudPopupWheelInput` (`:44217`) がTopBar/SeekStrip/Overflowへ配送し、閉じるframeにも残りを消費して
+`discard_pending_scroll`する (`:25295`, `:25302`)。navigatorも同じconsumer射影を使う (`:33214`)。
+構成indicator/無効理由/editor entryは既存HUD popup描画内に置き、別Areaの入力ownerを作らない。
+entryを押したframeでpopupを閉じてeditorを開始しても、既存のframe開始時ownerが残りのwheelを終端し、
+背景nav/metadata/ナビゲータへ流さない。modal開始後はmount非依存editor ownerがkeys/gesture/openを受付拒否する。
+前面のpopup制御と本の構成action admissionを一つのboolへ混ぜず、既存IME helpersを使う。
+
+**G0構造点の照合状態**:
+
+| 点 | 現行コードの確認 | 採択済み設計への接続 / 残るgate |
+| --- | --- | --- |
+| editor start/save | `SessionStateMachine::acquire` (`src/remote_ipc/session.rs:309`) が先にphase確定。innerはprivate | §8.1のsession helperを追加。実装/handler試験と次レビュー |
+| close barrier | `src/remote_ipc/ui.rs:1081` は全窓close + AI静止、wait_until_activeは取得中待機 | §10.2のticket終端を既存barrierへ追加。新拒否gateなし |
+| Book return adoption | snapshot直接復帰 `src/app/snapshot_ops.rs:1282`, `:1406` / F12 `src/app/viewer_context_registry.rs:3418` は残る | §10.1共通adoption。E追加runtimeのscope/世代も保持/失効 |
+| single resume intent | path一行/優先順位なしは変わらず、continuous reanchorもwrite | §6.1の一回intentとtyped adoption cause。A/B完了順反転試験 |
+| Q16/continuous permit | nav early-return `src/ui_fullscreen.rs:11420`、可視列 `:38621`、texture選択 `:39285` / paint `:39395` | §6.2のcontext display demandに許可。Eのfit参照選択も許可済み新unitから |
+| A2 mode boundary | `SpreadMode` (`src/settings.rs:3082`) と `apply_fullscreen_spread_mode` (`src/ui_fullscreen.rs:37798`) は結合値のまま | §9.2のmode-only routing/保存なし。Eのfit設定は別の既存owner |
+| G4F snapshot/receipt | `src/sidecar.rs:463`, `:1055`, `:1148`, `:1314` / token `:203` と `src/sidecar_import.rs:795` は不変 | §7.4の全snapshot/独立family。App-wide receipt。G4Fを共通Bookに混ぜない |
+
+G1〜G5は上記接点をbriefへ反映し、Eの既存testを弱めず回帰gateへ再利用する。
+代表source fixture: `specified_scale_continuous_real_layout_preserves_reference_and_manual_zoom`
+(`src/ui_fullscreen.rs:78702`)、evicted reference再解決 (`:79691`)、popup背面wheel抑止 (`:80460`)、
+終了frame (`:80705`)、固定navigator (`:80863`)。今回はこれらを**読んだだけで再実行していない**。
+detached §11の追記案は `target/G-1242-g0-msg.txt`。次レビュー/設計担当合意後にcoordinatorが反映し、
+本turnで `detached-rework-plan.md` は変更しない。
 
 ### R2〜R5レビュー契約のR6への接続
 
@@ -1473,4 +1614,4 @@ Q14の以前の相談はA2で不要になった。質問の番号を振り直さ
 | フォルダbackupだけの保存失敗 | 成功DB保存/解除を維持して通知。古いbackup/移動前の再保存またはメタ情報書き出しを案内。自動retry/DB-file同時rollbackなし。同じ場所の旧backup消費は§7.4.2で別途保証 | 2026-10-10 |
 
 新しい利用者質問はない。R6の提示許可とsidecar同期receiptは採択済みのQ10/Q16を成立させる所有契約であり、
-連結読みの制限やbackup設定の追加を提案していない。設計採択には独立レビュー/設計担当の構造合意が引き続き必要。
+連結読みの制限やbackup設定の追加を提案していない。R6のACCEPTは維持し、統合後G0差分には次レビュー/設計担当確認が必要。
