@@ -1,6 +1,6 @@
 # §1.364 見開きの一ページずらしの本別記憶 — 設計 R3
 
-更新: 2026-10-11（最新決定は§11.6）。対象: `mimageviewer-nextview` / `next-viewer`、R3照合基点
+更新: 2026-10-11（最新決定は§11.6、resume依存保持の追補は§11.7）。対象: `mimageviewer-nextview` / `next-viewer`、R3照合基点
 `ec4a43b38da862f577b2872ed7c7d626f996be5d`（R2 `1837ded3f` と master の新しいまれな失敗方針を統合済み。製品コードは §1.342 統合済みの `fa280d0d0` と同じ）。
 状態: **Q1〜Q5 はすべて決定済み。利用者への未決質問なし。独立再レビュー・構造合意は別工程で、実装の許可・検収ではない。**
 今回の変更は本書と `target/D-1364-design-r3-msg.txt` だけ。コード変更、テスト実行、ビルド、
@@ -329,6 +329,9 @@ resume と shift を一つの DB transaction にまとめる必要はない。
 
 復元 snapshot の線形化点はこの受付から enqueue した FIFO 読取点。**その読取より後の兄弟窓操作は
 既に受け付けた open の値を差し替えず、次の再入場に反映する**。初期準備だけの古い snapshot は使えない。
+maintenance epochの進行でshift recipeが失効しても、独立したresumeのreceiver・取得結果・
+固定読取点を破棄しない。旧shiftだけを採用せず、元のresume完了証明を満たして調整なしで
+同じcontinuationの初回採用を完了する。DBの非fence SELECTへ戻さない（§11.7）。
 「常に最新commitと一致するまで再試行」や後着save replyを新contextへ再配送する方式にしない。
 explicit target 等で resume を使わない時も shift の fence は必要。記憶 OFF / Composed / A2 なら
 shift適用用読取は不要だが、送信済み保存の完了ownerは残る。構成解除は新しいreceiptで再評価する。
@@ -932,6 +935,50 @@ items・identity・pending load・addressがroot改名で書き換わらない�
 最初のfocusedコンパイルではwrapperの旧method呼出し1か所と`PathBuf` import不足を検出し、
 修正してから上記検証を実行した。初回compileと全libの非ゼロログを保持する。
 ログは`target/D-1364-d2c-*.log`、handoffは`target/D-1364-d2c-msg.txt`へ記録する。
+
+### 11.7 D2d: epoch失効と独立resume完了の分離（2026-10-11）
+
+基点`7e910efcd`の再レビューで、root改名のmaintenance epoch進行がshift読取を失効させると、
+Commonのエラー終端がresume依存を含む`ViewerBookRestore`を破棄し、非fenceの同期SELECTへ
+戻ることを指摘された。通常操作の順序問題であり、まれな失敗の方針へ押し込まない。
+
+`RestoreReadDependencies`の同じ完了境界でshiftのcutoff/完了/status証明とepoch資格を分離する。
+証明が正常でもepochが異なるrecipeはshift依存だけから除き、未受信のresume receiverも
+取得済みresume結果も保持する。epoch進行が受信前・shift受信後のresume待機・resume受信後の
+shift待機のいずれでも、receiptが一致する元のresume読取点を一回採用する。
+結果の`shift: None`は旧recipeの不採用を表し、保存rowがないことを証明したとは扱わない。
+Commonは通常の成功終端で元resumeを`FencedResume`へ渡し、初回採用後に依存を終了する。
+receiptのsupersession、cutoff不一致、worker/読取失敗の既存エラー扱いは変更しない。
+
+組合せ削減は§11.6の利用者決定を維持する。改名待機・live-follow・再読取/retry・追加状態機械は
+作らず、すでに独立して所有されている二つの読取依存のうち失効したrecipeだけを除く。
+元のresumeを取り直さないため、後着の兄弟窓Recordが受付済みopenへ混入しない。
+
+回帰はpure ownerの三つの受信順と、実改名handlerの同本/別本pending openをCommon終端まで
+進める経路を対象にする。先行Recordが未完了の間はCommonが待ち、後着の同本兄弟Recordが
+DBへ完了していても初回位置は元の読取値であること、旧scope/参照元と兄弟ownerが不変であることを確認する。
+製品起動や独立レビュー合格を本追補では主張しない。検証結果は
+`target/D-1364-d2d-*.log`と`target/D-1364-d2d-msg.txt`へ記録する。
+
+自動検証（2026-10-11、基点`7e910efcd`の未commit差分）:
+
+- focused: `--lib book_rename` 4成功、`--lib spread_shift` 93成功。
+- 最終Rust変更後の`cargo test -p mimageviewer --lib`を1回実行し、
+  **11,865成功・0失敗・55 ignored、exit 0（1273.68秒）**。
+  D2cの全libで失敗した二つの実時間音声テストもこの実行で成功したため、単独再実行は行っていない。
+  音声コード・期限・期待値は変更していない。
+- `cargo fmt --all --check`、UI glyph（危険glyph 0）、`git diff --check`が成功。
+
+通常／`--features portable`のcore checkも成功した。
+`cargo test --test ui_snapshot -- --test-threads=1`は155成功・0失敗（163.46秒）。
+HUDを含めsnapshot baselineは変更していない。
+`scripts/build-dev.ps1 -PreserveRuntime`はexit 0で完了し、normal feature setのcore・remote・
+EPUB PDF workerとruntime/PE検証が成功した。このworktreeのcoreが動いていないことを事前確認し、
+installed coreは停止せず、製品も起動していない。commitは行っていない。
+
+初回compileでは共用validatorの別consumer呼出しが署名変更に未追従だった。
+completion proofとepoch資格のvalidatorを分け、layout resolverのepoch拒否契約を維持してから
+上記検証を実行した。初回compileの非ゼロログを保持し、全libは成功した上記1回だけである。
 
 ## 12. 決定済み事項（番号固定）
 

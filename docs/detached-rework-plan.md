@@ -4515,6 +4515,17 @@ QAのcache-read witnessは相関済み画像の受理時に記録し、進捗は
 detached述語・viewport生成・placement・focus・registry protocolは変更しない。
 これは両側の既存ownerを保持する統合であり、新しい待機状態・retry・時間窓を追加しない。
 
+### 2026-10-11 §1.364 D2d: Commonの独立resume依存保持
+
+利用者指定の構造修正として`spread_shift::RestoreReadDependencies`の完了境界を変更する。
+maintenance epochで失効したshift recipeだけを除き、元のresume receiver/取得結果を保持する。
+Common全体を破棄せず元の固定読取点で初回採用を終えるため、別窓の後着Recordを混入させない。
+三つの受信順と、同本/別本openと改名の実handlerからCommon終端までの回帰を追加する。
+改名待機・live-follow・再要求・新しいcontext状態、detached述語/viewport/registryは追加しない。
+失効の責務を独立依存へ限定する所有境界の修正であり、症状guardや待機による修正ではない。
+設計の説明は[spread-shift-memory-plan.md §11.7](spread-shift-memory-plan.md#117-d2d-epoch失効と独立resume完了の分離2026-10-11)。
+本記録は独立構造合意・完了レビュー、製品起動や実機受入を表さない。
+
 ### 2026-10-10 §1.342 HUD fit popup の利用可能高・入力所有修正
 
 §2を読んだ上で、利用者指定の構造修正としてui_fullscreen.rsの共通HUD popup描画境界を変更する。

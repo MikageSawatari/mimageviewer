@@ -1778,9 +1778,16 @@ fn finish_test_book_rename(app: &mut App, ctx: &egui::Context) {
     }
 }
 
+#[cfg(windows)]
 #[test]
 fn book_rename_does_not_wait_for_same_book_pending_open_or_unrelated_open() {
-    for pending in [None, Some("Old"), Some("Old-other")] {
+    for (pending, resume_pending) in [
+        (None, false),
+        (Some("Old"), true),
+        (Some("Old"), false),
+        (Some("Old-other"), true),
+        (Some("Old-other"), false),
+    ] {
         let mut env = setup_app();
         let books = env.tmp.path().join("books");
         let old = books.join("Old");
@@ -1805,13 +1812,54 @@ fn book_rename_does_not_wait_for_same_book_pending_open_or_unrelated_open() {
             )
             .unwrap();
         assert_eq!(row(&service, &old_scope), Some(anchor.clone()));
-        // The original open's read stays unconsumed while the rename completes.
+        let epoch = service.maintenance_epoch();
+        // The original open's shift result stays unconsumed across maintenance.
         let pause = service.pause_for_test();
         let accepted = pending.map(|name| books.join(name));
+        let mut resume_release = None;
+        let mut sibling = None;
         if let Some(source) = &accepted {
             install_book(&mut env, source);
+            sibling = Some(env.build_window_context_for_test(136_411, |app| {
+                install_book(app, source);
+            }));
+            let db_path = env.tmp.path().join("pending-rename-resume.db");
+            env.book_resume_db =
+                Some(crate::book_resume_db::BookResumeDb::open_at(&db_path).unwrap());
+            env.book_resume_writer = crate::book_resume_db::BookResumeWriter::spawn_at(db_path);
+            let writer = env.book_resume_writer.as_ref().unwrap();
+            assert!(writer.record(source, 0, None));
+            writer
+                .read_position_after(&crate::path_key::normalize(source), 1)
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            assert_eq!(
+                env.book_resume_db
+                    .as_ref()
+                    .unwrap()
+                    .get_position(source)
+                    .unwrap()
+                    .page,
+                0
+            );
+            resume_release = Some(writer.pause_for_test());
+            // This admitted save is pending when the original open fixes its read.
+            assert!(writer.record(source, 2, None));
             begin_test_book_open(&mut env, source);
             assert!(env.sidecar_restore_active());
+            // The same-book sibling's later save must not replace the original read.
+            env.with_window_context_for_test(sibling.unwrap(), |app| app.record_book_resume(4));
+            if !resume_pending {
+                resume_release.take().unwrap().send(()).unwrap();
+                let latest = env
+                    .book_resume_writer
+                    .as_ref()
+                    .unwrap()
+                    .read_position_after(&crate::path_key::normalize(source), 3)
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+                assert_eq!(latest.position.unwrap().page, 4);
+            }
         }
         let before = env.spread_shift.clone();
         let ctx = egui::Context::default();
@@ -1838,6 +1886,61 @@ fn book_rename_does_not_wait_for_same_book_pending_open_or_unrelated_open() {
             row(&service, &BookScopeKey::folder(&new).unwrap()),
             Some(anchor)
         );
+        assert!(service.maintenance_epoch() > epoch);
+        if let Some(source) = &accepted {
+            if resume_pending {
+                // Drive Common to its resume-dependent terminal while Record is
+                // still held. Epoch rejection must not bypass this dependency.
+                for _ in 0..20 {
+                    env.poll_sidecar_restore(&ctx);
+                    assert!(env.sidecar_restore_active(), "resume fence was discarded");
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                assert_eq!(
+                    env.book_resume_db
+                        .as_ref()
+                        .unwrap()
+                        .get_position(source)
+                        .unwrap()
+                        .page,
+                    0
+                );
+                resume_release.take().unwrap().send(()).unwrap();
+            }
+            let latest = env
+                .book_resume_writer
+                .as_ref()
+                .unwrap()
+                .read_position_after(&crate::path_key::normalize(source), 3)
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            assert_eq!(latest.position.unwrap().page, 4);
+            env.finish_page_identity_preparation_for_test();
+            assert_eq!(
+                env.selected,
+                Some(2),
+                "Common must adopt the original fixed resume, not DB page 0 or 4"
+            );
+            assert_eq!(
+                env.spread_shift_anchor_idx(),
+                None,
+                "the stale shift recipe was rejected"
+            );
+            assert_eq!(env.current_folder.as_deref(), Some(source.as_path()));
+            assert_eq!(
+                env.fenced_book_resume(source),
+                None,
+                "initial adoption ended the fence"
+            );
+            env.with_window_context_for_test(sibling.unwrap(), |app| {
+                assert_eq!(app.current_folder.as_deref(), Some(source.as_path()));
+                assert_eq!(
+                    app.spread_shift.scope,
+                    Some(BookScopeKey::folder(source).unwrap())
+                );
+                assert_eq!(app.spread_shift_anchor_idx(), None);
+            });
+        }
         owner.shutdown_and_join();
     }
 }

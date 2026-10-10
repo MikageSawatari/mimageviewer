@@ -17,6 +17,8 @@ pureな`RestoreReadDependencies`が両writerの固定した読取点の完了証
 `poll_book_shift_restore`はcontext/scope/items/settings世代とmaintenance epochを照合し、
 両writerの先行要求が完了した結果だけを一回採用する。保存済みPageRefを最終identity/navへ解決し、
 位置はownerの`FencedResume`に保持して既存のresume consumerへ渡す。
+epoch進行はshift recipeだけを不採用にする。独立resumeの元receiver・取得結果は保持して
+同じCommonの完了境界で調整なしの初回採用を完了し、非fence SELECTや後着Recordの再読取へ戻さない。
 root改名は永続storeだけを移し、受付済みopenの捕捉source/scope、receiver、continuationを変更しない。
 同一本の未完了openを待つquery・製本管理の待機wrapperは設けない。open側にlive移行境界がなく、
 shiftの受理済みwrite/read/root操作の順序はD1の単一FIFOが所有する（最新決定は設計§11.6）。

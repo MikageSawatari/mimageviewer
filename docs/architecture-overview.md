@@ -491,6 +491,8 @@ shift Clearへ接続する。HUDと環境設定転送には全体boolを、metad
 破棄せず、`refresh_pending_book_shift_memory_policy`が捕捉済みtarget/context/items/open/scopeと
 元のresume cutoffを維持して、新settings世代・現在のshift受付cutoffで読取依存を再受付する。
 再受付するのはshift依存だけで、元のresume receiverと取得済み結果は保持する。
+maintenance epochの進行でも失効するのはshift recipeだけで、元のresume依存は保持する。
+Commonはその固定読取点を満たして調整なしで初回採用を完了し、同期の非fence SELECTへ戻さない。
 resumeのroot資格・キーは既存producerの`at_root()`・`current_folder`を共用する。
 これは設定変更に伴う通常遷移であり、retryやまれな失敗の復旧ではない。
 

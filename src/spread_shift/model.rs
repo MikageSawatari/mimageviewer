@@ -465,18 +465,26 @@ fn pairing_rejection(availability: PairingEditAvailability) -> &'static str {
     }
 }
 
+fn validate_shift_completion(
+    receipt: &RestoreReceipt,
+    read: &ShiftReadReply,
+) -> Result<(), String> {
+    if read.cutoff != receipt.shift_cutoff || read.completed_through < receipt.shift_cutoff {
+        return Err("shift completion proof does not match restore receipt".into());
+    }
+    read.status.clone()
+}
+
 fn validate_shift_read(
     receipt: &RestoreReceipt,
     epoch: u64,
     read: &ShiftReadReply,
 ) -> Result<(), String> {
-    if read.cutoff != receipt.shift_cutoff
-        || read.completed_through < receipt.shift_cutoff
-        || read.maintenance_epoch != epoch
-    {
+    validate_shift_completion(receipt, read)?;
+    if read.maintenance_epoch != epoch {
         return Err("shift completion proof does not match restore receipt".into());
     }
-    read.status.clone()
+    Ok(())
 }
 
 /// The D2 typed open continuation embeds this dependency owner. Dropping it cancels
@@ -562,8 +570,10 @@ impl RestoreReadDependencies {
         if let Some(rx) = &self.shift_rx {
             match rx.try_recv() {
                 Ok(read) => {
-                    validate_shift_read(&self.receipt, maintenance_epoch, &read)?;
-                    self.shift = Some(read);
+                    validate_shift_completion(&self.receipt, &read)?;
+                    // Maintenance invalidates only the shift recipe. The independent
+                    // resume read remains fixed at admission and must still finish.
+                    self.shift = (read.maintenance_epoch == maintenance_epoch).then_some(read);
                     self.shift_rx = None;
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -594,7 +604,10 @@ impl RestoreReadDependencies {
             return Ok(None);
         }
         if let Some(read) = &self.shift {
-            validate_shift_read(&self.receipt, maintenance_epoch, read)?;
+            validate_shift_completion(&self.receipt, read)?;
+            if read.maintenance_epoch != maintenance_epoch {
+                self.shift = None;
+            }
         }
         self.adoption = RestoreReadAdoption::Consumed;
         Ok(Some(CompletedRestoreReads {
@@ -1290,7 +1303,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_receipt_or_maintenance_and_failed_reads_never_certify_absence() {
+    fn stale_receipt_and_failed_reads_never_certify_absence() {
         let receipt = receipt();
         for mismatch in 0..5 {
             let (tx, rx) = mpsc::channel();
@@ -1319,12 +1332,56 @@ mod tests {
                 .try_complete(&receipt, 6)
                 .is_err()
         );
-        let (tx, rx) = mpsc::channel();
-        tx.send(shift_read(None)).unwrap();
-        assert!(
-            RestoreReadDependencies::from_receivers(receipt.clone(), Some(rx), None)
-                .try_complete(&receipt, 7)
-                .is_err()
-        );
+    }
+
+    #[test]
+    fn maintenance_rejects_only_shift_recipe_and_preserves_resume_in_both_read_orders() {
+        // Cover a reply first polled after maintenance, a cached shift awaiting
+        // resume, and a cached resume awaiting shift. None may trigger a reread.
+        for first in [0, 1, 2] {
+            let receipt = receipt();
+            let (st, sr) = mpsc::channel();
+            let (rt, rr) = mpsc::channel();
+            let mut pending =
+                RestoreReadDependencies::from_receivers(receipt.clone(), Some(sr), Some(rr));
+            let position = ReadingPosition {
+                page: 2,
+                identity: None,
+            };
+            let resume = PositionReadReply {
+                cutoff: receipt.resume_cutoff,
+                completed_through: receipt.resume_cutoff,
+                position: Some(position.clone()),
+                status: Ok(()),
+            };
+            if first == 1 {
+                st.send(shift_read(Some(SpreadShiftPageRef::RelativePath(
+                    "p.jpg".into(),
+                ))))
+                .unwrap();
+            } else if first == 2 {
+                rt.send(resume.clone()).unwrap();
+            }
+            assert!(pending.try_complete(&receipt, 6).unwrap().is_none());
+            // Invalidate an already captured recipe while resume is still pending.
+            assert!(pending.try_complete(&receipt, 7).unwrap().is_none());
+            if first != 1 {
+                st.send(shift_read(Some(SpreadShiftPageRef::RelativePath(
+                    "p.jpg".into(),
+                ))))
+                .unwrap();
+            }
+            if first != 2 {
+                rt.send(resume).unwrap();
+            }
+            let completed = pending.try_complete(&receipt, 7).unwrap().unwrap();
+            assert!(
+                completed.shift.is_none(),
+                "the old recipe must not be adopted"
+            );
+            assert_eq!(completed.resume, Some(position));
+            assert_eq!(completed.receipt, receipt);
+            assert!(pending.try_complete(&receipt, 7).is_err());
+        }
     }
 }
