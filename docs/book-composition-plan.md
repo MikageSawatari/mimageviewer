@@ -819,7 +819,7 @@ ON後のfile tokenは変わる。strict probeは新bytesを検証し、同じroo
 receiptは転送する利用者構成ではなく、**その場所のbackupの消費記録**。
 metadata export/import・content-ID copyではreceiptを運ばず、import destinationのbackupから新たに作る。
 アプリ内folder renameでは移動先の実sidecarとの照合後だけkeyを更新し、purge/resetでは同じfolder範囲を除去する。
-DBファイル単位のF12 bundleはそのDB内receiptも含む。構成なしでもreceiptの存在をDB構成ありとは扱わない。
+receiptはApp共通のstore (DB) に保持し、F12 bundle (viewer contextの実行時状態) へは運ばない。F12 bundleが運ぶのは構成の投影と提示許可だけ。構成なしでもreceiptの存在をDB構成ありとは扱わない。
 自動restoreによる新record採用、またはDB既存行を保持したrootの消費も、検証したsourceと同じtransactionで記録する。
 PendingWriterでもroot witness一致なら再挿入しない。適用時にsequenceをdisk markerへ変換せず、
 既存disk receiptを保ち、diskに載った全snapshotを次のstrict probeで検証して実tokenを記録する。
