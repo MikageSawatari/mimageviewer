@@ -2059,3 +2059,165 @@ fn adjusted_retained_f12_keeps_session_across_unrelated_and_same_book_rename() {
         owner.shutdown_and_join();
     }
 }
+
+#[cfg(windows)]
+#[test]
+fn import_prewrite_cancel_and_errors_preserve_unrelated_pending_fresh_f12_shift() {
+    use crate::metadata_transfer::{TransferError, TransferPhase};
+    for outcome in [
+        "preflight-cancel",
+        "manifest-error",
+        "preflight-error",
+        "committed-cancel",
+    ] {
+        let mut env = setup_app();
+        let books = env.tmp.path().join("books");
+        let main = books.join("Main");
+        let shown = books.join("Shown");
+        let imported = env.tmp.path().join("imported");
+        for root in [&main, &shown, &imported] {
+            std::fs::create_dir_all(root).unwrap();
+            std::fs::write(root.join("0.png"), b"fixture").unwrap();
+            std::fs::write(root.join("1.png"), b"fixture").unwrap();
+        }
+        env.settings.book_root = Some(books);
+        env.settings.sidecar_backup_enabled = false;
+        env.settings.tag_sidecar_backup_enabled = false;
+        install_book(&mut env, &main);
+        env.settings.remember_spread_shift_per_book = false;
+        assert!(env.set_live_spread_shift(2));
+        env.settings.remember_spread_shift_per_book = true;
+        // The real import worker resolves this exact test-owned data directory.
+        let data = crate::data_dir::get();
+        let (service, owner) = runtime(&mut env, &data);
+        let shown_scope = BookScopeKey::folder(&shown).unwrap();
+        let imported_scope = BookScopeKey::folder(&imported).unwrap();
+        let operation = |sequence| ShiftOperation {
+            context_id: ViewerContextId::for_test(136_499),
+            items_generation: 0,
+            operation_sequence: sequence,
+        };
+        let saved = service
+            .set_shift(
+                shown_scope.clone(),
+                SpreadShiftPageRef::RelativePath("1.png".into()),
+                operation(1),
+            )
+            .unwrap();
+        service
+            .set_shift(
+                imported_scope.clone(),
+                SpreadShiftPageRef::RelativePath("0.png".into()),
+                operation(2),
+            )
+            .unwrap();
+        row(&service, &imported_scope);
+        crate::metadata_transfer::export_at(
+            &data,
+            &imported,
+            false,
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        service
+            .clear_shift(imported_scope.clone(), operation(3))
+            .unwrap();
+        assert_eq!(row(&service, &imported_scope), None);
+        let manifest = imported
+            .join(crate::metadata_transfer::SIDECAR_FILENAME)
+            .join("manifest.json");
+        if outcome == "manifest-error" {
+            std::fs::write(&manifest, b"{ invalid manifest").unwrap();
+        } else if outcome == "preflight-error" {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+            let count = value["entry_count"].as_u64().unwrap();
+            value["entry_count"] = (count + 1).into();
+            std::fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+        }
+        let shown_epoch = service.maintenance_epoch_for(&shown_scope);
+        let imported_epoch = service.maintenance_epoch_for(&imported_scope);
+        let before_counter = service.maintenance_epoch();
+        let main_before = env.spread_shift.clone();
+        let main_items = env.items.clone();
+        let main_index = env.page_identity_index.clone();
+        let sibling = env.build_window_context_for_test(136_430, |app| {
+            install_book(app, &shown);
+            // Warm read is synchronously captured, while its original Common
+            // terminal/identity adoption is deliberately left unpolled.
+            begin_test_book_open(app, &shown);
+            assert!(app.sidecar_restore_active());
+            assert_eq!(app.spread_shift_anchor_idx(), None);
+        });
+        assert!(env.sidecar_restore_active());
+        // Production transfers hand this idle connection to the worker. This
+        // harness drops it before the same worker's attach/journal transition.
+        drop(env.tags_db.take());
+        let result = crate::ui_dialogs::metadata_transfer::run_import_worker_for_test(
+            imported.clone(),
+            move |progress, cancel| {
+                if (outcome == "preflight-cancel"
+                    && progress.phase == TransferPhase::ReadingSidecar)
+                    || (outcome == "committed-cancel"
+                        && progress.phase == TransferPhase::Importing
+                        && progress.processed > 0)
+                {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            },
+        );
+        assert!(
+            env.sidecar_restore_active(),
+            "fresh adoption must still be pending"
+        );
+        if outcome == "committed-cancel" {
+            let summary = result.unwrap();
+            assert!(summary.cancelled);
+            assert!(summary.applied_entries > 0);
+            assert!(
+                summary
+                    .committed
+                    .spread_shift_scopes
+                    .contains(&imported_scope.storage_key())
+            );
+            assert!(service.maintenance_epoch_for(&imported_scope) > imported_epoch);
+            assert_eq!(
+                row(&service, &imported_scope),
+                Some(SpreadShiftPageRef::RelativePath("0.png".into()))
+            );
+        } else {
+            let error = result.unwrap_err();
+            if outcome == "preflight-cancel" {
+                assert_eq!(error, TransferError::Cancelled.to_string());
+            }
+            assert_eq!(
+                service.maintenance_epoch_for(&imported_scope),
+                imported_epoch
+            );
+            assert_eq!(row(&service, &imported_scope), None);
+        }
+        assert!(
+            service.maintenance_epoch() > before_counter,
+            "the actual worker maintenance lease completed"
+        );
+        assert_eq!(
+            service.maintenance_epoch_for(&shown_scope),
+            shown_epoch,
+            "unrelated captured read remains qualified: {outcome}"
+        );
+        env.with_window_context_for_test(sibling, |app| {
+            app.finish_page_identity_preparation_for_test();
+            assert_eq!(app.spread_shift_anchor_idx(), Some(1), "{outcome}");
+            assert!(
+                matches!(persistence(app), ShiftPersistence::Saved(sequence) if sequence >= saved)
+            );
+            assert_eq!(app.current_folder.as_deref(), Some(shown.as_path()));
+        });
+        assert!(!env.sidecar_restore_active());
+        assert_eq!(env.spread_shift, main_before);
+        assert_eq!(env.items, main_items);
+        assert!(Arc::ptr_eq(&env.page_identity_index, &main_index));
+        owner.shutdown_and_join();
+    }
+}

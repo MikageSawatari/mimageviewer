@@ -496,6 +496,8 @@ Commonはその固定読取点を満たして調整なしで初回採用を完�
 読取完了のCaptured/Expiredを型で区別し、失効を保存row不在と解釈しない。retainedの
 受入済みsessionとprojectionは失効時に保持する。maintenance資格は対象scopeのstampで照合し、
 別本のroot改名・変更なしlease・通常writeはそのscopeのreadを失効させない（設計§11.8）。
+明示importの書込み前取消・エラーも一括失効にせず、maintenance ownerの再読込した実変更scopeへ
+集約する。無関係なfresh Commonの捕捉済みsaved shiftはそのまま採用できる（設計§11.9）。
 resumeのroot資格・キーは既存producerの`at_root()`・`current_folder`を共用する。
 これは設定変更に伴う通常遷移であり、retryやまれな失敗の復旧ではない。
 

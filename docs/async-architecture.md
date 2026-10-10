@@ -5,7 +5,7 @@
 
 ---
 
-## 本別見開き調整の永続化基盤とviewer接続（§1.364 D1/D2e、2026-10-11）
+## 本別見開き調整の永続化基盤とviewer接続（§1.364 D1/D2f、2026-10-11）
 
 `SpreadShiftService`のUI handleは送信・immutable snapshot lookup・結果pollだけを行い、
 一つのworkerが`spread_shift.db`の接続とSet/Clear/読取を所有する。受付sequenceはownerのFIFOへの受理後、
@@ -88,6 +88,10 @@ EPUBの同階層PDF保存は既存の本leaseを維持し、末尾のmetadata co
 長い変換中にshift保守を占有しない。
 Begin ACKは先行保存・成功Setの内容ID送信と接続closeの後。Endは再読込とepoch公開の後に待機readを返す。
 待機readをEndより前のworker queueへ入れて相互待ちにしない。実変更scopeだけ通知する。
+明示importは`Err`を一括失効へ変換しない。manifest/preflightの取消・エラーは書込み前で、
+正常に再読込できる変更なしsnapshotのstampを維持する。確定batchを伴う取消・部分失敗も
+Endの実変更scope差分へ集約し、読めず影響を確定できないsnapshotだけに既存global fallbackを使う。
+phase追跡や新しい失敗分類は追加しない（設計§11.9）。
 Setとimportのcommit済追加/置換は捕捉logical rootを既存recorderへEditとして送る。
 取消importの確定batchもworkerが送るため、UI receiverの破棄で観測集合を失わない。
 

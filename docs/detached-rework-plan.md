@@ -4515,6 +4515,18 @@ QAのcache-read witnessは相関済み画像の受理時に記録し、進捗は
 detached述語・viewport生成・placement・focus・registry protocolは変更しない。
 これは両側の既存ownerを保持する統合であり、新しい待機状態・retry・時間窓を追加しない。
 
+### 2026-10-11 §1.364 D2f: import取消の失効を既存maintenance ownerへ集約
+
+利用者指定の構造修正として、import workerがすべてのErrからglobal失効を作る経路を撤去する。
+manifest/preflight取消・エラーは変更なしleaseとして扱い、実変更scopeの公開と読めないsnapshotの
+既存global fallbackをserviceのEnd境界が所有する。phase状態や失敗分類を増やさない。
+別F12のfresh Common捕捉→mainの別フォルダimport取消/エラー→元Common終端を通す回帰を追加し、
+saved調整の採用とmain owner/items/indexの不変性を確認する。確定item後の取消も対象scopeだけを更新する。
+製品コードの変更はimport producerだけで、detached述語/viewport/registry/採用ownerは変更しない。
+失効通知の責務を既存ownerへ集約して不要な組合せを除く構造修正であり、症状guardではない。
+詳細は[spread-shift-memory-plan.md §11.9](spread-shift-memory-plan.md#119-d2f-書込み前のimport取消と変更なしlease2026-10-11)。
+本記録は独立構造合意・完了レビューや製品起動・実機受入を表さない。
+
 ### 2026-10-11 §1.364 D2e: retained読取由来とscope資格の所有
 
 利用者指定の構造修正として、依存完了のCaptured/Expiredを型で分離し、現epochのCapturedだけを

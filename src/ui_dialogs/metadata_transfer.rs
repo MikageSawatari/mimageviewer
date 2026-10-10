@@ -1248,6 +1248,16 @@ fn start_import_worker(
     view_trim_batch: Option<crate::view_trim_db::ViewTrimWriteBatch>,
     observer: Option<crate::content_identity::ContentIdentityProducer>,
 ) -> bool {
+    start_import_worker_with_progress(state, resources, view_trim_batch, observer, |_| {})
+}
+
+fn start_import_worker_with_progress(
+    state: &mut MetadataTransferState,
+    resources: ImportWorkerResources,
+    view_trim_batch: Option<crate::view_trim_db::ViewTrimWriteBatch>,
+    observer: Option<crate::content_identity::ContentIdentityProducer>,
+    mut on_progress: impl FnMut(&TransferProgress) + Send + 'static,
+) -> bool {
     if let Some(preview_handle) = state.handle.take() {
         let _ = preview_handle.join();
     }
@@ -1289,6 +1299,7 @@ fn start_import_worker(
             let result = match flush_result {
                 Ok(()) => {
                     crate::metadata_transfer::import_at(&data_dir, &root, &cancel, move |value| {
+                        on_progress(&value);
                         progress_relay.send(value);
                     })
                     .map_err(|error| error.to_string())
@@ -1338,11 +1349,10 @@ fn start_import_worker(
             }
             // The worker owns observation even if cancel/exit drops the receiver.
             // Release the writer before UI terminal handling starts snapshot refresh.
-            if result.is_err()
-                && let Ok(lease) = &lease
-            {
-                lease.invalidate_unknown_failure();
-            }
+            // An Err alone does not prove impact: manifest/preflight cancel
+            // and validation errors precede writes. Lease release reloads the
+            // actual committed rows, stamps only their changed scopes, and uses
+            // the owner's global fallback only if that snapshot is unreadable.
             drop(lease);
             let _ = tx.send(WorkerMessage::Import {
                 result,
@@ -1359,6 +1369,41 @@ fn start_import_worker(
             state.rx = None;
             state.stage = Stage::Result(ResultState::Import(Err(error.to_string())));
             false
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn run_import_worker_for_test(
+    root: PathBuf,
+    mut on_progress: impl FnMut(&TransferProgress, &AtomicBool) + Send + 'static,
+) -> Result<ImportSummary, String> {
+    let mut state = MetadataTransferState::import(root);
+    let cancel = Arc::clone(&state.cancel);
+    assert!(start_import_worker_with_progress(
+        &mut state,
+        ImportWorkerResources {
+            sidecars: HashMap::new(),
+            tags_db: None
+        },
+        None,
+        None,
+        move |value| on_progress(value, &cancel),
+    ));
+    loop {
+        match state
+            .rx
+            .as_ref()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+        {
+            WorkerMessage::Progress(_) => {}
+            WorkerMessage::Import { result, .. } => {
+                state.handle.take().unwrap().join().unwrap();
+                return result;
+            }
+            _ => panic!("unexpected import worker message"),
         }
     }
 }

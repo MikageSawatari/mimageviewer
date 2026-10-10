@@ -1,6 +1,6 @@
 # §1.364 見開きの一ページずらしの本別記憶 — 設計 R3
 
-更新: 2026-10-11（最新決定は§11.6、resume依存保持は§11.7、retained保持とscope epochは§11.8）。対象: `mimageviewer-nextview` / `next-viewer`、R3照合基点
+更新: 2026-10-11（最新決定は§11.6、resume依存保持は§11.7、retained/scope epochは§11.8、import取消は§11.9）。対象: `mimageviewer-nextview` / `next-viewer`、R3照合基点
 `ec4a43b38da862f577b2872ed7c7d626f996be5d`（R2 `1837ded3f` と master の新しいまれな失敗方針を統合済み。製品コードは §1.342 統合済みの `fa280d0d0` と同じ）。
 状態: **Q1〜Q5 はすべて決定済み。利用者への未決質問なし。独立再レビュー・構造合意は別工程で、実装の許可・検収ではない。**
 今回の変更は本書と `target/D-1364-design-r3-msg.txt` だけ。コード変更、テスト実行、ビルド、
@@ -1023,6 +1023,38 @@ fmt check、UI glyph check（0）、diff checkも成功。ログとverification 
 `build-dev.ps1 -PreserveRuntime`もexit 0で完了し、core/remote/EPUB workerをstageした。
 runtime/PE検証はruntime=4 / pe=3で成功。worktree由来のcoreがないことを確認し、
 既存installed runtimeを停止・変更せず、製品は起動していない。commitも行っていない。
+
+### 11.9 D2f: 書込み前のimport取消と変更なしlease（2026-10-11）
+
+基点`8735caa5b`の再レビューで、import workerのすべての`Err`をglobalな影響不明として扱う
+分岐が、書込み前の通常取消でも無関係なfresh openの捕捉済みshiftを失効させることが判明した。
+manifest/preflightの取消・検証・I/OエラーはDB書込み前に返る。apply開始後の取消や部分失敗は
+従来どおり`ImportSummary`のcancelled/incomplete_error/failed_entriesと確定deltaで返る。
+schema初期化・attach中のエラーも、`Err`だけからshift rowの変更有無を推測しない。
+
+組合せ削減としてimport独自の一括失効を撤去し、既存maintenance ownerのEnd境界に任せる。
+そこでstoreの確定snapshotを再読込し、実変更scopeだけへstampを公開する。正常に読めて
+変更のないrowは取消・エラーの種類を問わずstampを維持する。snapshotが読めず影響を確定できない
+場合は既存ownerのglobal fallbackを使う。書込みphaseの追加状態、失敗taxonomy、retry、
+改名待機、live-follow、全窓modalを作らない。従来の取消・部分commit・通知・接続再開は維持する。
+
+回帰は実UI import workerと、そのleaseが使う隔離data_dirを通す。別F12 contextのfresh Commonが
+saved shiftをwarm捕捉し、identity/sidecar終端を未pollのまま、別フォルダのpreflight取消、
+manifest不正、preflight件数不正を完了する。対象外stampが不変で、元Commonを最後まで進めると
+保存済み調整を採用すること、main owner/items/indexが不変であることを検証する。
+確定item後の取消ではimportしたscopeだけが進み、同じfresh contextの資格は維持することも確認する。
+test用progress callbackは実workerへ取消を渡すだけで、通常経路はno-op。追加のUI待機はない。
+
+§11.8の変更なしlease、§6.1の独立resume fence、§11.6のreleased stale-viewとQ1〜Q5を維持する。
+操作・設定・表示・保存形式の仕様変更はなく、マニュアルとUI baselineの変更は不要。
+自動検証は新回帰1件、metadata-transfer 93件、shift関連103件がすべて成功。
+全libをfinal sourceで1回実行し、11,875成功・失敗0・ignore 55（999.88秒）。
+既知のreal-time audio 2件もこの全libで成功し、単独再実行は不要だった。
+UI snapshot 155件成功（133.77秒）、normal/portable core check、fmt、glyph checkも成功。
+当該worktreeのcoreが動いていないことを確認後、`build-dev.ps1 -PreserveRuntime`も成功。
+normal-profile coreと両companionを構築し、VCRT/PE検査はruntime=4・pe=3で成功した。
+検証結果は`target/D-1364-d2f-*.log`と`target/D-1364-d2f-msg.txt`へ記録する。
+本記録は独立レビュー合格、製品起動や実機受入を表さない。
 
 ## 12. 決定済み事項（番号固定）
 
