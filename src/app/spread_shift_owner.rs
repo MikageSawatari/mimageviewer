@@ -267,10 +267,6 @@ pub(super) struct ViewerBookRestore {
 }
 
 impl ViewerBookRestore {
-    pub(super) fn logical_source(&self) -> &Path {
-        &self.receipt.scope.logical_root
-    }
-
     pub(super) fn refresh_memory_policy(
         &mut self,
         generation: u64,

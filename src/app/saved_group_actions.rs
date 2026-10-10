@@ -52,21 +52,6 @@ pub(super) struct SavedGroupOpenTransition {
     phase: SavedGroupOpenPhase,
 }
 
-impl SavedGroupOpenTransition {
-    pub(super) fn has_pending_book_open(&self, root: &std::path::Path) -> bool {
-        match &self.phase {
-            SavedGroupOpenPhase::ScanningBook { path, cancel, .. } => {
-                !cancel.load(Ordering::Relaxed)
-                    && crate::path_key::physical_path_is_within(path, root)
-            }
-            SavedGroupOpenPhase::ReadyBook { path, .. } => {
-                crate::path_key::physical_path_is_within(path, root)
-            }
-            _ => false,
-        }
-    }
-}
-
 impl Drop for SavedGroupOpenTransition {
     fn drop(&mut self) {
         if let SavedGroupOpenPhase::ScanningBook { cancel, .. } = &self.phase {
@@ -224,10 +209,7 @@ impl App {
     }
 
     fn detach_saved_group_book_list(&mut self, id: u64) {
-        if let Some(pending) = self
-            .book_op_pending
-            .as_mut()
-            .and_then(crate::app::BookManagerPending::running_mut)
+        if let Some(pending) = self.book_op_pending.as_mut()
             && let crate::books::BookOpIntent::List { navigation } = &mut pending.intent
             && *navigation == Some(id)
         {
@@ -380,7 +362,7 @@ impl App {
             || action.book_slot_number().is_some()
         {
             if self.book_op_pending.as_ref().is_some_and(|pending| {
-                !matches!(*pending.intent(), crate::books::BookOpIntent::List { .. })
+                !matches!(&pending.intent, crate::books::BookOpIntent::List { .. })
             }) {
                 self.show_feedback_toast("本棚の更新処理が進行中です".into());
                 return None;
@@ -407,11 +389,7 @@ impl App {
             };
             let target = if action == KeyAction::GridOpenActiveBook {
                 Some(self.active_book_folder_path())
-            } else if let Some(pending) = self
-                .book_op_pending
-                .as_mut()
-                .and_then(crate::app::BookManagerPending::running_mut)
-            {
+            } else if let Some(pending) = self.book_op_pending.as_mut() {
                 if let crate::books::BookOpIntent::List { navigation } = &mut pending.intent {
                     *navigation = Some(id);
                     None
@@ -429,10 +407,7 @@ impl App {
                 }
             } else {
                 self.request_book_list_refresh();
-                if let Some(pending) = self
-                    .book_op_pending
-                    .as_mut()
-                    .and_then(crate::app::BookManagerPending::running_mut)
+                if let Some(pending) = self.book_op_pending.as_mut()
                     && let crate::books::BookOpIntent::List { navigation } = &mut pending.intent
                 {
                     *navigation = Some(id);
@@ -537,9 +512,9 @@ impl App {
             SavedGroupOpenPhase::WaitingBookList => {
                 if self.book_op_pending.as_ref().is_some_and(|pending| {
                     matches!(
-                        *pending.intent(),
+                        &pending.intent,
                         crate::books::BookOpIntent::List { navigation: Some(id) }
-                            if id == request.id
+                            if *id == request.id
                     )
                 }) {
                     if let Some(delay) = request.lease.completion_poll_delay() {
@@ -785,12 +760,10 @@ mod tests {
         };
         app.book_list_cache = Some(vec![old]);
         let (sender, receiver) = std::sync::mpsc::channel();
-        app.book_op_pending = Some(crate::app::BookManagerPending::Running(
-            crate::books::BookOpPending {
-                rx: receiver,
-                intent: crate::books::BookOpIntent::List { navigation: None },
-            },
-        ));
+        app.book_op_pending = Some(crate::books::BookOpPending {
+            rx: receiver,
+            intent: crate::books::BookOpIntent::List { navigation: None },
+        });
 
         app.open_book_manager_from_action();
 
@@ -968,10 +941,10 @@ mod tests {
         let id = app.saved_group_open.as_ref().unwrap().id;
         assert!(app.saved_group_open_modal_visible());
         assert!(matches!(
-            *app.book_op_pending.as_ref().unwrap().intent(),
+            &app.book_op_pending.as_ref().unwrap().intent,
             crate::books::BookOpIntent::List {
                 navigation: Some(owner)
-            } if owner == id
+            } if *owner == id
         ));
         for _ in 0..100 {
             app.poll_book_op_pending(&ctx);
@@ -1119,7 +1092,7 @@ mod tests {
         let id = app.saved_group_open.as_ref().unwrap().id;
         assert!(app.cancel_saved_group_open_request(id));
         assert!(matches!(
-            *app.book_op_pending.as_ref().unwrap().intent(),
+            &app.book_op_pending.as_ref().unwrap().intent,
             crate::books::BookOpIntent::List { navigation: None }
         ));
         for _ in 0..100 {

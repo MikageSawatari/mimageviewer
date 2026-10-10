@@ -1456,6 +1456,7 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 ## 11. リワーク外からの変更記録
 
 2026-10-10 §1.364 D2 本別見開き調整のcontext接続（独立確認・検証待ち）:
+以下は履歴。root操作のlive反映は2026-10-11 D2cの記録とspread-shift設計§11.6で撤回する。
 `src/app/spread_shift_owner.rs::ViewerSpreadShift`を`ViewerContextBundle`へ持たせ、
 Appとregistryの既存swap/fork/park/mountの境界でlive調整・PageRef解決・操作receiptを移送する。
 forkは`fork_accepted`で実効layoutだけを複製し、保存rowの再読取やSet/Clearを副作用にしない。
@@ -1495,6 +1496,9 @@ recreate判定へ新しい推測経路を加える変更ではない。
 
 2026-10-10 §1.364 D2b レビュー指摘の構造補正（基点`8bc7efc87`、修正の独立確認待ち）:
 
+以下は履歴。rootのcontext/shift scope移行と同本pending-open直列化は、
+2026-10-11 D2cの記録とspread-shift設計§11.6で撤回する。他の補正・当時の検証記録は保持する。
+
 root改名の既存移行境界で、mounted/at-rest bundleのscopeだけでなく`current_folder`、
 archive source、ZIP tree、items、prepared identity indexも同じsource→target対応へ移す。
 別窓をmountして直す経路や一括reloadを作らず、変更したcontextの既存unit投影を失効する。
@@ -1516,6 +1520,25 @@ retry・pending-open ownerの追加は行わない。2026-10-11に全lib・UI sn
 fmt・glyph検査とnormal-profile確認用buildを完了した。製品起動・修正後の独立合格は主張しない。
 検証結果は[spread-shift-memory-plan.md §11.5](spread-shift-memory-plan.md#115-d2bレビュー指摘補正)と
 `target/D-1364-d2b-msg.txt`へ記録する。
+
+2026-10-11 §1.364 D2c root追従・同本pending-open直列化の構造的撤去（利用者決定、確認待ち）:
+
+利用者は名前変更後のlive追従を§1.364で採用しないと決定した。master `02079f95d`の
+main旧path再読込・F12旧path/旧items保持へ戻し、D1の永続root/相対payload移行を維持する。
+触れる範囲はregistryのmounted/at-rest bundle、`spread_shift_live_mappings`、shift owner、
+既存open/改名入口のroot移行・pending-open照合/待機分岐。参照元・items・prepared identity index・
+pending load・addressとshift scopeを同じ旧rootに留める。shift scopeだけを新rootへ移すと、
+旧contextの後続操作が新rowを変更するため、両者のroot移行を一緒に撤去する。
+受付済みopenの捕捉source/scopeと既存receiver/continuationも旧contextのまま保ち、
+同本pending-open query・製本管理の待機wrapperを撤去する。live移行境界がなくなるので、
+その境界のための直列化も不要になる。受理済みshift write/read/root操作はD1の単一FIFOが整列する。
+
+構造的な理由は、不要と決定したlive追従のproducerと、そのための待機を所有境界で撤去すること。
+新しいguard、delay、retry、repaint、reload、reopen、detached bool、HWND/geometry/placement/
+focus推測を足さない。ページ改名・通常Restore・retained/import・snapshot remapの接続は維持する。
+旧contextのSet/Clearが旧keyを再作成・解除し得る点は利用者了承済みの割り切りで、新rowへ転送しない。
+最新契約・回帰範囲の正本は[spread-shift-memory-plan.md §11.6](spread-shift-memory-plan.md#116-d2c-root追従と同本pending-open直列化の撤去2026-10-11利用者決定)。
+ここは撤去範囲と判断理由の記録で、独立構造合意・完了レビュー・自動検証・実機受入の完了は主張しない。
 
 2026-10-10 §1.342 最大倍率・保持軸モデル: 利用者承認の共通capを既存fit descriptorへ
 snapshotとして接続し、ui_fullscreenの単ページ／見開き／連結・capture／navigator consumerが

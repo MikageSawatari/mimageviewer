@@ -476,8 +476,9 @@ sessionだけ、本はPageRefと`SpreadShiftState`で扱う。旧raw anchor fiel
 `spread_shift_anchor_idx()`が現在解決済みの投影だけを既存display-unit resolverへ渡す。
 items削除・snapshotのslot変換はlive解決位置をremapし、identity/nav列が変わればPageRefを再解決する。
 snapshot化ではdurable scopeを切り離し、その時点のnumeric pairingをOrdinaryのsession調整として保持する。
-`spread_shift_live_mappings`は成功済みroot/page操作と同じmappingをmounted/at-restのlive ownerへ
-pureに反映する。durable移行は既存workerが所有し、live反映のための追加saveやmountは行わない。
+成功済みページ改名のmappingはpure helperで同じ本のlive PageRefへ反映する。
+root改名のdurable移行はD1のworkerが所有し、mounted/at-restのlive ownerのscopeは旧rootを保持する。
+新rootは改めて開いたcontextが使い、旧contextのSet/Clearを新rowへ読み替えない。
 
 `ViewerContextBundle`がこのownerを交換・保持する。F12のcloneはその時のlive調整を複製し、
 保存replyはcontext/items/operation sequenceとscopeが一致する操作ownerへだけ配送する。
@@ -509,11 +510,12 @@ retainedとimportの復元では
 共有resume/historyを書かない。metadata importは捕捉FIFO読取をContextRequest workerで待ち、
 context/items世代の採用判定後にcurrent scope + ON + Automaticの一致で調整を採用する。
 shiftの読取対象はmanifestのsection flagではなく、import commitで実際に変更したscope集合に限る。
-root改名は同じ移行境界でmounted/at-restの参照元・items・prepared identity indexを移し、
-scopeだけが新rootを指す状態を作らない。snapshotのanchor remapはfullscreenの有無によらずitems交換で行う。
-製本管理の改名は、同一本のopenが未完了の場合だけ既存pending ownerで待ち、旧keyでの採用後に
-通常workerへ進む。全contextとglobal continuationの捕捉済み対象をread-onlyで照合し、別本や
-未完了openのない改名には待機を追加しない。openの所有・completion契約は変更しない。
+root改名では参照元・items・prepared identity index・pending load・addressとshift scopeを旧rootに保つ。
+main一覧の旧path再読込・F12の旧items保持はmaster `02079f95d`の挙動を維持し、live追従や自動reopenを
+加えない。同一本の未完了openを待つquery・製本管理の待機wrapperも置かず、受付済みopenは旧scopeを保つ。
+D1の単一FIFOが受理済みshift write/read/root操作を整列する。旧contextのSet/Clearが旧keyを
+再作成・解除し得る点は利用者了承済みの割り切りで、新rowへ書き換えない。
+snapshotのanchor remapはfullscreenの有無によらずitems交換で行う。最新決定は設計§11.6。
 OFFではそのshift読取結果を使わない。D2の自動検証・独立完了レビュー・
 利用者確認はこの記述では完了扱いにしない。Remote saved/groupとG3共同fixtureはD3の範囲。
 

@@ -1,14 +1,15 @@
 # §1.364 見開きの一ページずらしの本別記憶 — 設計 R3
 
-更新: 2026-10-10。対象: `mimageviewer-nextview` / `next-viewer`、照合基点
+更新: 2026-10-11（最新決定は§11.6）。対象: `mimageviewer-nextview` / `next-viewer`、R3照合基点
 `ec4a43b38da862f577b2872ed7c7d626f996be5d`（R2 `1837ded3f` と master の新しいまれな失敗方針を統合済み。製品コードは §1.342 統合済みの `fa280d0d0` と同じ）。
 状態: **Q1〜Q5 はすべて決定済み。利用者への未決質問なし。独立再レビュー・構造合意は別工程で、実装の許可・検収ではない。**
 今回の変更は本書と `target/D-1364-design-r3-msg.txt` だけ。コード変更、テスト実行、ビルド、
 製品起動、コミットは行わない。以下の型・メソッド・テーブル名は、現行と明記したもの以外は提案。
 
-上記はR3文書作成時の作業範囲の記録。後続D2の現在の実装差分は§11.4に追記し、
-設計決定・過去の確認記録は保持する。実装記述だけで自動検証・独立完了レビュー・利用者確認の
-完了を表さない。
+上記はR3文書作成時の作業範囲の記録。後続D2/D2bの実装・確認履歴は§11.4–11.5に保持する。
+root改名のopen-context/shift scope追従と同本pending-open直列化の記述は、
+2026-10-11の利用者決定§11.6で上書きする。Q1〜Q5と他のR3契約は変更しない。
+実装記述だけで自動検証・独立完了レビュー・利用者確認の完了を表さない。
 
 ## 1. 正本・確定要件
 
@@ -527,7 +528,7 @@ Web の rendition key には既存の partner/slot と受入済み layout identi
 | data-dir / 起動 / 保存先移動 | `data_dir::get()`（`src/data_dir.rs:56`）の直下 `spread_shift.db`。通常/portable/`--data-dir`/test overrideを既存共通解決に従わせ、固定APPDATAや別worktreeを参照しない。起動workerがopen/schema確認/read snapshotを作る。data-dir一式の移送ではDBと存在するSQLite家族ファイルを含め、稼働writerを閉じてから扱う。既存settings単体backupとは別 |
 | writer / 終了 / maintenance | App所有service一つ。通常は専用worker、共通保守期間だけ §4.1 のleaseを渡す。`rename_migration_writers_busy`（`src/app.rs:45417`）にも未完了command/未消費成功結果を登録し、旧key write後の移行を保証。通常close/forkでは閉じない。正常process終了は §6.1 のdrain→接続close→process側join。未消費成功reply/内容ID観測も保守開始前に完了 |
 | `rename_key_migration::STORES`（`src/rename_key_migration.rs:939`） | `spread_shift.db / spread_shifts / path / unique=true / KeepDrive / OptionalInLegacySchema` を登録（constructorは `:914`）。未作成ファイル/保守probeの欠落tableは正常不在。serviceが検出した不正DBは §4.4。対象descriptorのlogical slash-family capabilityも登録 |
-| root 改名・アプリ内 folder 移動 / copy | exact + `/` + `::` の既存 family 処理。相対 payload は root 改名では不変。destination があれば既存 conflict 規則を守る |
+| root 改名・アプリ内 folder 移動 / copy | 永続storeのexact + `/` + `::` の既存 family 処理。相対 payload は root 改名では不変。destination があれば既存 conflict 規則を守る。rootの永続移行は開いているcontextの参照元・items・shift scopeを移さない（2026-10-11決定、§11.6） |
 | 個別画像の改名 / 製本順替え | key だけでなく payload の RelativePath を同じ旧→最終 path mapping で変換。しおりの mapping（`src/book_bookmarks.rs:1102`）を共有。scope 内だけ更新、scope 外移動は旧本の Missing を保持し、新本へ shift を勝手にコピーしない |
 | 外部 folder move / rename | Folder は内容 ID 非対応（`src/content_identity.rs:62`）。shift の新 sidecar を作らず、既存 per-book spread と同じく明示 metadata export/import を案内。旧 DB 行は保持。アプリ内移動との違いを明記 |
 | 書庫/PDF/EPUB 外部移動・内容 ID restore | 論理元 root の observation と既存 copy/probe に参加。成功Setとimportのcommit済追加/置換が捕捉rootへEditを送る（下記）。destination既存値は上書きしない。shiftは元rootのexact/slash-familyだけをコピーし、cacheの物理base spreadや既存source/cache四面mappingは別descriptorのまま |
@@ -536,7 +537,7 @@ Web の rendition key には既存の partner/slot と受入済み layout identi
 | 設定復元 / 完全reset | 現行 `settings_restore::full_reset_with_permit`（`src/settings_restore.rs:725`）はsettings家族だけを削除する（`:797`）。spread.db等と同じくshift DBは保持し、設定boolは復元/既定値へ。既存「設定を完全リセット」の削除範囲を拡大しない。全shiftを消す操作は上記の明示clear/cleanupで別に所有し、settings単体backup/restoreにDBを混ぜない |
 | metadata export/import | §9.2 のlogical専用family、schema初期化/ATTACH/journal確認/preview/summary/changed flags/refreshまで登録。保守leaseの間だけimport workerがwrite。exportは先行保存fence後のread transaction |
 | Remote | ContainerEngineに専用snapshot/lookup/identity resolutionを登録。coreはwriterを持たず、IPC→App serviceで変更。取得/再openの先行完了・公開は §8.2。休眠/Composedの変更でcomposition tokenを進めない |
-| import / rename / purge 完了 | service snapshot を更新し、実際に変えた Book scope の context / retained dependency だけを更新。単なる open/close は失効通知を発行しない |
+| import / rename / purge 完了 | durable service snapshotを更新する。importのshift再採用は実際にcommitで変更したscopeのcontext / retained dependencyだけ。ページ改名は同じ本のPageRefへmappingを反映し、purgeは既存の対象限定削除経路に従う。root改名のdurable移行はopen contextやshift ownerのroot/scopeを移さず、pending openも旧scopeを保つ。単なるopen/closeは失効通知を発行しない（§11.6） |
 
 **copy と restorable probe に共通の logical slash-family（R1 P2-3、G も共有）**:
 `restore_copy_mappings`（`src/content_identity/restore.rs:414`）は root の Exact と `::` の VirtualPrefix を作る。
@@ -766,6 +767,9 @@ display-pipeline、async-architecture、virtual-folders、keymap、web-remote、
 
 ### 11.4 D2実装・自動検証記録（2026-10-10、独立完了レビュー待ち）
 
+**履歴として保持。** 本節のroot/page live mappingのうちroot追従は最新の§11.6で撤回された。
+現在のroot改名契約とD2cの範囲は同節を参照する。他のD2接続と下記検証結果は当時の記録。
+
 基点はD1統合後の`33e862221`。この節は`next-viewer`作業差分の実装箇所を記録する。
 自動検証の実施結果は本節末尾に記録する。独立レビューと実機受入は未実施。
 
@@ -806,6 +810,10 @@ workspace full gate・共同fixtureはD3の最終統合へ、独立構造確認�
 §11.3の検証ownerへ引き継ぐ。コミットは利用者の指示どおり行っていない。
 
 ### 11.5 D2bレビュー指摘補正
+
+**履歴として保持。** P2-6に対して採用したopen-context/shift scopeのroot移行と
+同本pending-open直列化は、2026-10-11の最新決定§11.6で撤回する。
+下記の判断・検証結果は撤回前の差分の証拠であり、D2cの検証証拠には流用しない。
 
 基点は利用者がcommitした`8bc7efc87`。D2の独立実装レビューはREVISE（P2 7件・P3 2件）。
 本節は指摘の修正と自動検証を記録し、修正後の独立レビュー合格は主張しない。
@@ -860,6 +868,70 @@ snapshot test processだけを終了し、全155件を直列で成功確認し�
 初回dispatcher fixtureは実際の別窓一覧登録へ修正し、新規query fixtureの借用・本資格も修正してから
 最終全libを実行した。ログは`target/D-1364-d2b-*.log`、実装者handoffは`target/D-1364-d2b-msg.txt`。
 commit・製品起動・実機受入・修正後の独立レビュー合格は行っていない／主張しない。
+
+### 11.6 D2c: root追従と同本pending-open直列化の撤去（2026-10-11利用者決定）
+
+利用者は、名前変更後に開いている窓を追従させる機能を§1.364へ含めないと決定した。
+source inspectionの比較基点はmaster `02079f95d`。製本root改名後、main一覧は旧pathを再読込し、
+F12窓は旧path/旧itemsを保持する。この既存挙動を維持し、新rootへのlive移行・自動reopenを追加しない。
+実機で観測した結果ではない。D2/D2bのroot追従と、そのための同本pending-open待機は本決定で撤回する。
+Q1〜Q5、同一本の通常shift保存→再入場のfence、retained/import採用、snapshot remap、HUD、
+Single移動、ページ改名、D3の範囲は変更しない。
+
+**所有境界と撤去範囲**:
+
+- D1の永続storeのrootキー移行（相対payloadは不変）とページ改名時のRelativePath payload移行、
+  root操作・Set/Clear/readの単一FIFOは維持する。
+  exact/slash/virtual family、destination conflict、内容ID/copy/probe/転送/maintenance登録は変更しない。
+- D2で追加した、mounted/at-restの参照元・items・prepared identity index・addressのroot移行を
+  撤去する。pending loadや結果世代の移行・再要求は追加せず、既存の寿命を維持する。
+  shift ownerのroot/scopeだけを新rootへ動かす処理も同時に撤去する。
+  旧itemsを持つcontextの操作を新rowへ送ると、新rootの正しい保存値を古い操作で変更してしまうため。
+  ページ改名のPageRef反映は同じ本のscope内に維持する。
+- 受付済みopenのsource/scope、receiver、continuationを旧contextのまま保つ。これをlive移行する
+  境界がなくなるため、同一本pending-open query、製本管理の`WaitingRename`直列化wrapperと
+  待機分岐を撤去する。既存の改名worker/pending operationへ戻し、新しいpending-open完了契約を作らない。
+  受理済みshift write/read/root操作の順序はD1の単一FIFOだけが所有する。
+- 古い窓からの後続Set/Clearは捕捉済み旧scope/keyへ送る。root移行後に旧keyを再作成・解除し得る点は
+  利用者了承済みの割り切りであり、新keyへの転送・retry・open待機・自動reopenを追加しない。
+  DB等のまれな失敗は既定のログ・通知・原本保持に従う。
+
+**簡素化の判断**: live追従を維持して未完了openを直列化する案と比較し、
+利用者は機能の組合せ自体を§1.364から外す方針を選んだ。released masterのrename挙動を変えず、
+contextの参照元・items・shift scopeは同じ旧rootに留める。待機対象の照合・live移行・reopenを
+新たな責務として持たない。D2bのP2-6に対する方針変更であり、guardや部分resetによる症状パッチではない。
+detached側の撤去範囲と判断理由は[detached-rework-plan.md §11](detached-rework-plan.md#11-リワーク外からの変更記録)へ記録する。
+
+**回帰と検証の担当**: 永続root/相対payload移行のD1回帰を維持し、mounted/at-restの旧scope・参照元・
+items・identity・pending load・addressがroot改名で書き換わらない回帰へ変更する。
+旧ownerの後続操作が新rowを変えないことと、ページ改名等の維持対象を確認する。
+同本pending-open直列化を約束するテストは撤去し、openの旧scopeが保たれる境界を確認する。
+実装担当が関連自動検証と確認用buildを担当する。
+本記録は独立構造合意・完了レビュー、製品起動、利用者実機受入を表さない。
+
+自動検証（2026-10-11、基点`352a32881`の未commit差分）:
+
+- focused: `--lib book_rename` 4成功、`--lib spread_shift` 92成功、
+  `--lib book_root_rename` 1成功、`--lib saved_group_actions` 17成功。
+- 最終Rust変更後の`cargo test -p mimageviewer --lib`を指定どおり1回実行した。
+  **11,862成功・2失敗・55 ignored、exit 101（1456.05秒）。全lib成功とは扱わない。**
+  失敗は未変更の`video::audio::tests::zero_start_pump_trims_latency_and_preserves_samples_through_eos_loop_and_seek`
+  （3秒内のtail完了）と
+  `video::decoder::audio_track_fixture_tests::exited_audio_worker_rejects_pending_switch_and_keeps_video_seek_alive`
+  （10秒内のworker終了）。単独再実行は各1成功、関連群の直列再実行はaudio 62成功、
+  decoder 33成功・1 ignoredだった。音声コードや期限・期待値を変更していない。
+  並列全体実行での期限超過の原因は確定しておらず、成功した関連群で全libの非ゼロ結果を置き換えない。
+- `cargo test --test ui_snapshot -- --test-threads=1`: 155成功・0失敗（178.62秒）。
+  HUD baselineを含め画像は変更なし。
+- 通常／`--features portable`のcore check、`cargo fmt --all --check`、UI glyph（危険glyph 0）、
+  `git diff --check`が成功。
+- `scripts/build-dev.ps1 -PreserveRuntime`が完了し、normal feature setのcore・remote・EPUB PDF workerと
+  runtime/PE検証を成功確認した。このworktreeのcoreが動いていないことを事前確認し、
+  起動中のinstalled coreを停止せず、製品も起動していない。全libの上記2失敗は未解決の検証結果として残す。
+
+最初のfocusedコンパイルではwrapperの旧method呼出し1か所と`PathBuf` import不足を検出し、
+修正してから上記検証を実行した。初回compileと全libの非ゼロログを保持する。
+ログは`target/D-1364-d2c-*.log`、handoffは`target/D-1364-d2c-msg.txt`へ記録する。
 
 ## 12. 決定済み事項（番号固定）
 

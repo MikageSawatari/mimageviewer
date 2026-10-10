@@ -7686,8 +7686,6 @@ mod tests {
         ));
         assert!(app.fs_nav_is_locked());
 
-        assert!(app.has_pending_book_open(&pdf));
-        assert!(!app.has_pending_book_open(&temp.path().join("unrelated.pdf")));
         let CollectionNavigationPending::AwaitingPdfPassword {
             request,
             watch,
@@ -7713,16 +7711,12 @@ mod tests {
                     watch,
                     prepared,
                     target,
-                    password: "query-test".into(),
+                    password: "password-test".into(),
                     save: false,
                     cancel: Arc::clone(&cancel),
                     receiver,
                 },
             ));
-        assert!(app.has_pending_book_open(&pdf));
-        cancel.store(true, Ordering::Relaxed);
-        assert!(!app.has_pending_book_open(&pdf));
-
         let CollectionNavigationPending::PdfPasswordPreflighting {
             request,
             watch,
@@ -7734,7 +7728,7 @@ mod tests {
             .take_collection_navigation_pending()
             .unwrap()
         else {
-            panic!("the query does not consume the preflight owner");
+            panic!("the preflight still owns its exact target");
         };
         app.pdf_password_request = Some(super::super::PdfPasswordRequest::legacy(pdf));
         app.top_level_grid_view

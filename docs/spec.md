@@ -884,11 +884,15 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
   resumeのroot資格・保存キーは既存記録producerと共用し、単一ラッパーZIP・変換書庫も同じfenceを通す。
   retained/import復元は現在の実ページを含むunitへ正規化するだけで共有resume/historyを書かない。
   importの捕捉FIFO読取はContextRequest workerで待ち、context/items世代採用後に
-  current scope + ON + Automaticの一致で使う。成功済みroot/page操作はpureなlive mappingで
-  mounted/at-restへ反映し、追加save/mountなし。snapshotはdurable scopeを切り離して現在のnumeric session組を保つ。
+  current scope + ON + Automaticの一致で使う。成功済みページ改名のmappingは同じ本のlive PageRefへ
+  pureに反映し、追加save/mountなし。snapshotはdurable scopeを切り離して現在のnumeric session組を保つ。
   import後のshift再採用は実際にcommitで変更したscopeだけに限定する。
-  root改名はcontextの参照元・items・identity indexも同じ境界で移行し、snapshotのanchor remapは
-  fullscreenの有無によらずitems交換で行う。case/slash衝突は受入列の先頭slotを選ぶ。
+  root改名はD1の永続storeだけを移し、開いているcontextの参照元・items・identity index・pending load・
+  addressとshift scopeを旧rootに保つ。mainの旧path再読込・F12の旧items保持はmasterの挙動を維持し、
+  live追従・自動reopen・同一本pending-open直列化は追加しない。新rootは改めて開くときに使う。
+  旧contextのSet/Clearは旧keyを再作成・解除し得るが新rowへ読み替えない（2026-10-11利用者決定）。
+  D1の単一FIFOが受理済みshift write/read/root操作を整列する。
+  snapshotのanchor remapはfullscreenの有無によらずitems交換で行う。case/slash衝突は受入列の先頭slotを選ぶ。
   保守中のSet/Clearは既存FIFOへ受理し、完了replyの種別から保存/解除を通知する。
   記憶OFFは現表示をsession扱いで保持し、保存値を休眠させ、新規openの復元とnudge保存を止める。
   OFF→ONは適格な操作元Bookのlive調整だけを保存し、調整なしではその場で旧保存値を適用しない。

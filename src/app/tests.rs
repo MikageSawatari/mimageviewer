@@ -41021,14 +41021,12 @@ mod favorite_adjustment_defaults_tests {
         let result = crate::books::delete_book(&actual_root, "Book").unwrap();
         app.settings.book_root = Some(app.tmp.path().join("changed-books-setting"));
         let (tx, rx) = std::sync::mpsc::channel();
-        app.book_op_pending = Some(super::BookManagerPending::Running(
-            crate::books::BookOpPending {
-                rx,
-                intent: crate::books::BookOpIntent::Delete {
-                    path: actual_book.clone(),
-                },
+        app.book_op_pending = Some(crate::books::BookOpPending {
+            rx,
+            intent: crate::books::BookOpIntent::Delete {
+                path: actual_book.clone(),
             },
-        ));
+        });
         tx.send(Ok(result)).unwrap();
 
         app.poll_book_op_pending(&ctx);
@@ -41067,14 +41065,12 @@ mod favorite_adjustment_defaults_tests {
         app.delete_pending = None;
 
         let (_book_tx, book_rx) = std::sync::mpsc::channel();
-        app.book_op_pending = Some(super::BookManagerPending::Running(
-            crate::books::BookOpPending {
-                rx: book_rx,
-                intent: crate::books::BookOpIntent::Delete {
-                    path: PathBuf::from("new"),
-                },
+        app.book_op_pending = Some(crate::books::BookOpPending {
+            rx: book_rx,
+            intent: crate::books::BookOpIntent::Delete {
+                path: PathBuf::from("new"),
             },
-        ));
+        });
         app.try_start_next_rename_migration();
         assert!(app.rename_migration_in_flight.is_none());
         app.book_op_pending = None;

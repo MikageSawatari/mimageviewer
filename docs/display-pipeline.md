@@ -1918,9 +1918,10 @@ Bookのitems/nav投影は`PreparedPageIdentityIndex`とnavのArcを対で保持�
 slot削除やsnapshotのindex変換はowner内のlive resolutionだけをremapする。別の同indexページへ
 保存基点を置き換えない。解決済みanchorの変化は既存unit/cache失効点へ接続する。
 snapshot化はdurable scopeを切り離し、その時点のnumeric pairingをOrdinary sessionとして保持する。
-root/pageの成功済みmappingは`spread_shift_live_mappings`でmounted/at-restのlive ownerへ反映し、
-そのための追加saveやmountを行わない。
-root移行では同じ境界で参照元・items・prepared identityも更新し、旧rootの投影を残さない。
+成功済みページ改名のmappingは同じ本のlive PageRefへpureに反映し、追加saveやmountを行わない。
+root改名の永続移行はD1が所有し、開いているcontextの参照元・items・prepared identity・pending load・
+addressとshift scopeは旧rootのまま保持する。mainの旧path再読込・F12の旧items保持を維持し、
+live追従や自動reopenを追加しない。新rootの保存値はそこから改めて開くときに使う（設計§11.6）。
 case/slash衝突のshift identityはD1と同じく受入列の先頭slotを決定的に選ぶ。
 snapshotのanchor remapはitems交換で行い、一覧から固定してもfullscreen時と同じ対応付けを使う。
 新規Restoreはsidecar continuation内で先行shift/resumeの完了証明を満たしてから同じ最終列へ

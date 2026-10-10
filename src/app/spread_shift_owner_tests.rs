@@ -771,20 +771,26 @@ fn retained_readoption_off_keeps_session_and_does_not_wait_for_saved_read() {
 
 #[cfg(windows)]
 #[test]
-fn book_rename_handler_retained_read_adopts_new_scope_and_preserves_siblings() {
+fn book_rename_saved_rows_move_but_open_scopes_and_stale_actions_stay_old() {
     let mut env = setup_app();
-    let source = env.tmp.path().join("books/rename-source");
-    let target = env.tmp.path().join("books/rename-target");
-    let unrelated = env.tmp.path().join("books/rename-source-sibling");
-    let data = env.tmp.path().join("shift-data");
-    install_book(&mut env, &unrelated);
+    let books = env.tmp.path().join("books");
+    let source = books.join("Old");
+    let target = books.join("New");
+    let unrelated = books.join("Old-sibling");
+    std::fs::create_dir_all(&source).unwrap();
+    for page in 0..6 {
+        std::fs::write(source.join(format!("{page}.png")), b"page").unwrap();
+    }
+    env.settings.book_root = Some(books);
+    env.settings.sidecar_backup_enabled = false;
     env.settings.remember_spread_shift_per_book = false;
+    install_book(&mut env, &source);
     assert!(env.set_live_spread_shift(3));
     let main_shift = env.spread_shift.clone();
     let main_index = Arc::clone(&env.page_identity_index);
     let main_generation = env.items_generation;
     let main_cancel = Arc::clone(&env.cancel_token);
-    let moved = env.build_window_context_for_test(136_421, |app| {
+    let stale = env.build_window_context_for_test(136_421, |app| {
         install_book(app, &source);
         assert!(app.set_live_spread_shift(0));
         app.fullscreen_idx = Some(2);
@@ -793,56 +799,70 @@ fn book_rename_handler_retained_read_adopts_new_scope_and_preserves_siblings() {
         install_book(app, &unrelated);
         assert!(app.set_live_spread_shift(3));
     });
+    let data = env.tmp.path().join("rename-shifts");
     let (service, owner) = runtime(&mut env, &data);
     env.settings.remember_spread_shift_per_book = true;
     let old_scope = BookScopeKey::folder(&source).unwrap();
     let new_scope = BookScopeKey::folder(&target).unwrap();
+    let saved = SpreadShiftPageRef::RelativePath("1.png".into());
     service
         .set_shift(
             old_scope.clone(),
-            SpreadShiftPageRef::RelativePath("1.png".into()),
+            saved.clone(),
             ShiftOperation {
-                context_id: ViewerContextId::for_test(999),
+                context_id: stale,
                 items_generation: 0,
                 operation_sequence: 1,
             },
         )
         .unwrap();
-    row(&service, &old_scope);
-    // The real application completion boundary receives the final physical root move.
-    env.apply_book_page_edit_moves_with_journal(&[], None, Some((&source, &target)));
-    assert_eq!(row(&service, &old_scope), None);
-    assert_eq!(
-        row(&service, &new_scope),
-        Some(SpreadShiftPageRef::RelativePath("1.png".into()))
+    assert_eq!(row(&service, &old_scope), Some(saved.clone()));
+    let ctx = egui::Context::default();
+    env.start_book_rename(&ctx, "Old".into(), "New".into());
+    finish_test_book_rename(&mut env, &ctx);
+    assert!(!source.exists());
+    assert!(target.exists());
+    assert!(
+        env.pending_reload,
+        "released main-list reload is still requested"
     );
-    assert_eq!(env.current_folder.as_deref(), Some(unrelated.as_path()));
+    assert_eq!(row(&service, &old_scope), None);
+    assert_eq!(row(&service, &new_scope), Some(saved.clone()));
+    assert_eq!(env.current_folder.as_deref(), Some(source.as_path()));
     assert_eq!(env.spread_shift, main_shift);
     assert!(Arc::ptr_eq(&env.page_identity_index, &main_index));
     assert_eq!(env.items_generation, main_generation);
     assert!(Arc::ptr_eq(&env.cancel_token, &main_cancel));
-    let admitted = service.watermarks().admitted;
-    env.with_window_context_for_test(moved, |app| {
-        assert_eq!(app.current_folder.as_deref(), Some(target.as_path()));
-        assert_eq!(app.current_spread_shift_scope(), Some(new_scope.clone()));
-        assert_eq!(app.items[2], GridItem::Image(target.join("2.png")));
-        app.begin_retained_shift_readoption(&egui::Context::default());
-        app.finish_page_identity_preparation_for_test();
-        assert_eq!(app.spread_shift_anchor_idx(), Some(1));
-        assert_eq!(app.fullscreen_idx, Some(1));
-        // An ordinary F5/reload now targets the migrated accepted source.
-        assert_eq!(app.current_folder.as_deref(), Some(target.as_path()));
+    env.with_window_context_for_test(stale, |app| {
+        assert_eq!(app.current_folder.as_deref(), Some(source.as_path()));
+        assert_eq!(app.current_spread_shift_scope(), Some(old_scope.clone()));
+        assert_eq!(app.spread_shift.scope, Some(old_scope.clone()));
+        assert_eq!(app.items[2], GridItem::Image(source.join("2.png")));
+        assert_eq!(app.spread_shift_anchor_idx(), Some(0));
+        assert_eq!(app.fullscreen_idx, Some(2));
+        // A stale-view operation retains the old key and cannot alter the new row.
+        assert!(app.set_live_spread_shift(5));
     });
+    assert_eq!(
+        row(&service, &old_scope),
+        Some(SpreadShiftPageRef::RelativePath("5.png".into()))
+    );
+    assert_eq!(row(&service, &new_scope), Some(saved.clone()));
+    env.with_window_context_for_test(stale, |app| {
+        assert!(app.reset_live_spread_shift(true));
+    });
+    assert_eq!(row(&service, &old_scope), None);
+    assert_eq!(row(&service, &new_scope), Some(saved));
     env.with_window_context_for_test(sibling, |app| {
         assert_eq!(app.current_folder.as_deref(), Some(unrelated.as_path()));
         assert_eq!(app.spread_shift_anchor_idx(), Some(3));
     });
-    assert_eq!(
-        service.watermarks().admitted,
-        admitted,
-        "retained read does not write"
-    );
-    env.retire_context(moved, "rename_retained_test", |_| ())
+    // Consume the existing main-list request: its target remains the obsolete folder.
+    env.poll_pending_reload(&ctx);
+    assert!(!env.pending_reload);
+    assert_eq!(env.current_folder.as_deref(), Some(source.as_path()));
+    assert_ne!(env.current_folder.as_deref(), Some(target.as_path()));
+    env.retire_context(stale, "rename_stale_test", |_| ())
         .unwrap();
     env.retire_context(sibling, "rename_sibling_test", |_| ())
         .unwrap();
@@ -1758,117 +1778,66 @@ fn finish_test_book_rename(app: &mut App, ctx: &egui::Context) {
     }
 }
 
-#[cfg(windows)]
 #[test]
-fn book_rename_waits_for_same_book_open_in_sibling_then_migrates_adopted_old_key() {
-    let mut env = setup_app();
-    let books = env.tmp.path().join("books");
-    let old = books.join("Old");
-    let new = books.join("New");
-    let other = books.join("Other");
-    std::fs::create_dir_all(&old).unwrap();
-    for page in 0..6 {
-        std::fs::write(old.join(format!("{page}.png")), b"page").unwrap();
-    }
-    env.settings.book_root = Some(books);
-    env.settings.sidecar_backup_enabled = false;
-    install_book(&mut env, &other);
-    let unchanged = env.spread_shift.clone();
-    let sibling = env.build_window_context_for_test(136_426, |app| install_book(app, &old));
-    let data = env.tmp.path().join("rename-pending-shifts");
-    let (service, owner) = runtime(&mut env, &data);
-    service
-        .set_shift(
-            BookScopeKey::folder(&old).unwrap(),
-            SpreadShiftPageRef::RelativePath("3.png".into()),
-            ShiftOperation {
-                context_id: sibling,
-                items_generation: 1,
-                operation_sequence: 1,
-            },
-        )
-        .unwrap();
-    assert_eq!(
-        row(&service, &BookScopeKey::folder(&old).unwrap()),
-        Some(SpreadShiftPageRef::RelativePath("3.png".into()))
-    );
-    env.with_window_context_for_test(sibling, |app| begin_test_book_open(app, &old));
-    let ctx = egui::Context::default();
-    assert!(env.has_pending_book_open(&old));
-    env.start_book_rename(&ctx, "Old".into(), "New".into());
-    assert!(matches!(
-        env.book_op_pending,
-        Some(BookManagerPending::WaitingRename(_))
-    ));
-    env.poll_book_op_pending(&ctx);
-    assert!(old.exists());
-    assert!(!new.exists());
-    assert_eq!(env.spread_shift, unchanged);
-    // The original open is adopted at the original root, including its saved anchor.
-    env.finish_page_identity_preparation_for_test();
-    env.with_window_context_for_test(sibling, |app| {
-        assert_eq!(app.current_folder.as_deref(), Some(old.as_path()));
-        assert_eq!(
-            app.spread_shift.scope,
-            Some(BookScopeKey::folder(&old).unwrap())
-        );
-        assert_eq!(app.spread_shift_anchor_idx(), Some(3));
-    });
-    assert!(!env.has_pending_book_open(&old));
-    finish_test_book_rename(&mut env, &ctx);
-    assert!(!old.exists());
-    assert!(new.exists());
-    assert_eq!(env.spread_shift, unchanged);
-    env.with_window_context_for_test(sibling, |app| {
-        assert_eq!(app.current_folder.as_deref(), Some(new.as_path()));
-        assert_eq!(
-            app.spread_shift.scope,
-            Some(BookScopeKey::folder(&new).unwrap())
-        );
-        assert_eq!(app.spread_shift_anchor_idx(), Some(3));
-        assert_eq!(
-            app.page_identity_index.resolve_shift_identity(
-                &crate::book_resume_db::PageIdentity::Image {
-                    path: new.join("3.png").to_string_lossy().into_owned()
-                }
-            ),
-            Some(3)
-        );
-    });
-    assert_eq!(row(&service, &BookScopeKey::folder(&old).unwrap()), None);
-    assert_eq!(
-        row(&service, &BookScopeKey::folder(&new).unwrap()),
-        Some(SpreadShiftPageRef::RelativePath("3.png".into()))
-    );
-    owner.shutdown_and_join();
-}
-
-#[test]
-fn book_rename_starts_without_wait_for_no_pending_open_or_unrelated_book_open() {
-    for unrelated_open in [false, true] {
+fn book_rename_does_not_wait_for_same_book_pending_open_or_unrelated_open() {
+    for pending in [None, Some("Old"), Some("Old-other")] {
         let mut env = setup_app();
         let books = env.tmp.path().join("books");
         let old = books.join("Old");
         let new = books.join("New");
-        let unrelated = books.join("Old-other");
         std::fs::create_dir_all(&old).unwrap();
         std::fs::write(old.join("0.png"), b"page").unwrap();
-        env.settings.book_root = Some(books);
+        env.settings.book_root = Some(books.clone());
         env.settings.sidecar_backup_enabled = false;
-        if unrelated_open {
-            install_book(&mut env, &unrelated);
-            begin_test_book_open(&mut env, &unrelated);
-            assert!(env.has_pending_book_open(&unrelated));
+        let data = env.tmp.path().join("pending-rename-shifts");
+        let (service, owner) = runtime(&mut env, &data);
+        let old_scope = BookScopeKey::folder(&old).unwrap();
+        let anchor = SpreadShiftPageRef::RelativePath("0.png".into());
+        service
+            .set_shift(
+                old_scope.clone(),
+                anchor.clone(),
+                ShiftOperation {
+                    context_id: env.projected_viewer_context_id(),
+                    items_generation: env.items_generation,
+                    operation_sequence: 1,
+                },
+            )
+            .unwrap();
+        assert_eq!(row(&service, &old_scope), Some(anchor.clone()));
+        // The original open's read stays unconsumed while the rename completes.
+        let pause = service.pause_for_test();
+        let accepted = pending.map(|name| books.join(name));
+        if let Some(source) = &accepted {
+            install_book(&mut env, source);
+            begin_test_book_open(&mut env, source);
+            assert!(env.sidecar_restore_active());
         }
+        let before = env.spread_shift.clone();
         let ctx = egui::Context::default();
-        assert!(!env.has_pending_book_open(&old));
         env.start_book_rename(&ctx, "Old".into(), "New".into());
-        assert!(matches!(
-            env.book_op_pending,
-            Some(BookManagerPending::Running(_))
-        ));
+        assert!(env.book_op_pending.is_some());
         finish_test_book_rename(&mut env, &ctx);
         assert!(!old.exists());
         assert!(new.exists());
+        assert_eq!(env.spread_shift, before);
+        if let Some(source) = &accepted {
+            assert!(
+                env.sidecar_restore_active(),
+                "rename did not wait for open adoption"
+            );
+            assert_eq!(env.current_folder.as_deref(), Some(source.as_path()));
+            assert_eq!(
+                env.spread_shift.scope,
+                Some(BookScopeKey::folder(source).unwrap())
+            );
+        }
+        pause.send(()).unwrap();
+        assert_eq!(row(&service, &old_scope), None);
+        assert_eq!(
+            row(&service, &BookScopeKey::folder(&new).unwrap()),
+            Some(anchor)
+        );
+        owner.shutdown_and_join();
     }
 }

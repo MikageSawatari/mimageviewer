@@ -17,6 +17,9 @@ familyのdelete/insertは既存item SAVEPOINTとbatch commitに参加する。
 外部folder移動は従来どおり内容ID非対応で、明示metadata転送を使う。
 書庫/PDF/EPUBは内容IDcopy/probeのlogical slash-familyでnested-onlyの調整も搬送する。
 D1では既存viewerのshift表示/操作を変えず、Restore/一覧再解決/F12/HUDはD2、RemoteはD3で接続する。
+2026-10-11のD2c決定では、root改名の永続移行だけを維持し、開いているcontextの論理/物理参照元・
+items・shift scopeは旧rootを保つ。新rootへのlive追従・自動reopen・同本pending-open直列化は行わない。
+ページ改名の相対参照移行は維持する。最新契約は[spread-shift-memory-plan.md §11.6](spread-shift-memory-plan.md#116-d2c-root追従と同本pending-open直列化の撤去2026-10-11利用者決定)。
 
 
 ## 本への再入場とfacetの帰路（§1.339）

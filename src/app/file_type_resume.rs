@@ -63,37 +63,6 @@ impl PreparedPageIdentityIndex {
         }
     }
 
-    /// A book-root rename preserves row slots. Migrate the prepared logical source
-    /// identities with the accepted sources without reconstructing a projection.
-    pub(crate) fn with_moved_root(&self, source: &Path, target: &Path) -> Self {
-        let mut identities = HashMap::new();
-        for (identity, slot) in self.identities.iter() {
-            let mut identity = identity.clone();
-            let path = match &mut identity {
-                PageIdentity::Image { path } => path,
-                PageIdentity::Archive { container, .. }
-                | PageIdentity::Document { container, .. } => container,
-            };
-            if let Some(mapped) =
-                super::spread_shift_live_mappings::map_root_path(Path::new(path), source, target)
-            {
-                *path = crate::path_key::normalize_keep_drive(&mapped);
-            }
-            identities
-                .entry(identity)
-                .and_modify(|first: &mut usize| *first = (*first).min(*slot))
-                .or_insert(*slot);
-        }
-        let shift_identities = prepare_shift_identities(&identities);
-        Self {
-            policy: self.policy.clone(),
-            identities: Arc::new(identities),
-            shift_identities: Arc::new(shift_identities),
-            current_slots: self.current_slots.clone(),
-            readable_indices: self.readable_indices.clone(),
-        }
-    }
-
     /// Pure integer reindexing, matching the owning grid's exact removed row slots.
     pub(crate) fn without_removed_indices(&self, removed: &[usize]) -> Self {
         let mut removed = removed.to_vec();

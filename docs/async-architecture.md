@@ -5,7 +5,7 @@
 
 ---
 
-## 本別見開き調整の永続化基盤とviewer接続（§1.364 D1/D2、2026-10-10）
+## 本別見開き調整の永続化基盤とviewer接続（§1.364 D1/D2c、2026-10-11）
 
 `SpreadShiftService`のUI handleは送信・immutable snapshot lookup・結果pollだけを行い、
 一つのworkerが`spread_shift.db`の接続とSet/Clear/読取を所有する。受付sequenceはownerのFIFOへの受理後、
@@ -17,9 +17,9 @@ pureな`RestoreReadDependencies`が両writerの固定した読取点の完了証
 `poll_book_shift_restore`はcontext/scope/items/settings世代とmaintenance epochを照合し、
 両writerの先行要求が完了した結果だけを一回採用する。保存済みPageRefを最終identity/navへ解決し、
 位置はownerの`FencedResume`に保持して既存のresume consumerへ渡す。
-製本管理の改名は同一本の未完了openだけを`BookManagerPending`で待つ。各contextとglobal ownerの
-捕捉済みsourceをread-only照合し、旧keyでのopen採用後に既存の改名worker・移行境界へ進む。
-openの受信・継続契約を増やさず、通常改名や別本のopenには待機を追加しない。
+root改名は永続storeだけを移し、受付済みopenの捕捉source/scope、receiver、continuationを変更しない。
+同一本の未完了openを待つquery・製本管理の待機wrapperは設けない。open側にlive移行境界がなく、
+shiftの受理済みwrite/read/root操作の順序はD1の単一FIFOが所有する（最新決定は設計§11.6）。
 同open continuationの初回採用が終わった時点で`finish_fenced_book_resume`が依存を終了する。
 後のsession内resume参照に初回の位置を使い続けず、従来の現在位置参照へ戻す。
 新しい表示後restore callbackやDB待ちloopを作らず、既存warm PDF準備とbase setterの同期契約を保持する。
@@ -57,8 +57,11 @@ OFFは何も再読取せずlive調整を保つ。retained/import採用は
 metadata importのContextRequestは受付時にscopeとFIFO読取を捕捉する。既存refresh workerが
 その結果を待ち、context/items世代の採用後にcurrent scope + ON + Automaticを照合する。
 shift未変更の区分は捕捉読取を待たず、OFFではshift結果を無視する。
-成功済みroot/page移行をlive ownerへ反映する`spread_shift_live_mappings`はpureで、
-mounted/at-restを追加mountや保存なしで更新する。永続側の移行は同workerの既存FIFOが所有する。
+成功済みページ改名のmappingはpure helperで同じ本のlive PageRefへ反映する。
+root改名ではmounted/at-restの参照元・items・identity index・pending load・addressとshift scopeを
+旧rootのまま保持する。永続側のroot移行・相対payload移行はD1のworker/FIFOが所有し、
+新rootはそこから改めて開いたcontextが使う。旧contextの後続Set/Clearも捕捉済み旧keyへ送る。
+旧keyを再作成・解除し得る点は利用者了承済みの割り切りとし、retryや新しい待機契約を追加しない。
 本節は現在の実装差分の説明で、自動検証・独立完了レビュー合格を表すものではない。
 Remote saved resolution/group・G3共同fixtureはD3で接続する。
 
