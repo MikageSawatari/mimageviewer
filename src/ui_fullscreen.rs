@@ -44234,8 +44234,18 @@ fn draw_fs_fit_popup(
     fs_fit_popup_frame().show(ui, |ui| {
         crate::os_theme::apply_dark_ui(ui);
         ui.spacing_mut().item_spacing.y = 4.0;
+        // The shared floating style reserves zero width. Reserve the full
+        // gutter at this scroll owner so every row's paint, hit targets, and
+        // wrapped help use the same content width outside the bar.
+        let scroll = &mut ui.spacing_mut().scroll;
+        scroll.floating_allocated_width = scroll
+            .floating_allocated_width
+            .max(scroll.bar_inner_margin + scroll.bar_width);
         ui.set_width((size.x - 8.0).max(1.0));
-        egui::ScrollArea::vertical()
+        #[cfg(test)]
+        let (scroll_right, scroll_style) =
+            (ui.available_rect_before_wrap().right(), ui.spacing().scroll);
+        let scroll_output = egui::ScrollArea::vertical()
             .id_salt("fs_fit_popup_scroll")
             .max_height((size.y - 8.0).max(1.0))
             .auto_shrink([false, true])
@@ -44272,8 +44282,25 @@ fn draw_fs_fit_popup(
                 fs_fit_popup_separator(ui);
                 choice.specified_changed = fs_fit_popup_specified_editor(ui, value, favorite);
                 choice
-            })
-            .inner
+            });
+        #[cfg(test)]
+        ui.ctx().data_mut(|data| {
+            let bar = egui::Rect::from_min_max(
+                egui::pos2(
+                    scroll_right - scroll_style.bar_outer_margin - scroll_style.bar_width,
+                    scroll_output.inner_rect.top(),
+                ),
+                egui::pos2(
+                    scroll_right - scroll_style.bar_outer_margin,
+                    scroll_output.inner_rect.bottom(),
+                ),
+            );
+            data.insert_temp(
+                egui::Id::new("fs_fit_popup_scroll_layout"),
+                (scroll_output.inner_rect, bar, scroll_output.content_size),
+            );
+        });
+        scroll_output.inner
     })
 }
 
@@ -79815,6 +79842,137 @@ mod specified_scale_consumer_tests {
             assert_eq!(selected.height(), 32.0);
             assert!(rect.contains_rect(selected));
             assert!(open);
+        }
+    }
+
+    #[test]
+    fn specified_scale_real_popup_content_does_not_overlap_floating_scrollbar() {
+        fn inspect(
+            shape: &egui::epaint::Shape,
+            clip: egui::Rect,
+            bar: egui::Rect,
+            help_seen: &mut bool,
+            background_seen: &mut bool,
+        ) {
+            match shape {
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        inspect(shape, clip, bar, help_seen, background_seen);
+                    }
+                }
+                egui::epaint::Shape::Text(text) => {
+                    let rect = text
+                        .galley
+                        .rect
+                        .translate(text.pos.to_vec2())
+                        .intersect(clip);
+                    if rect.is_positive() && rect.intersects(bar) {
+                        panic!(
+                            "text {:?} overlaps scrollbar: text={rect:?} bar={bar:?}",
+                            text.galley.job.text
+                        );
+                    }
+                    if text.galley.job.text.starts_with("％は画像表示領域") && rect.is_positive()
+                    {
+                        *help_seen = true;
+                    }
+                }
+                egui::epaint::Shape::Rect(rect)
+                    if rect.fill == egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200) =>
+                {
+                    assert!(
+                        !rect.rect.intersect(clip).intersects(bar),
+                        "painted row and its click rect must exclude the scrollbar"
+                    );
+                }
+                egui::epaint::Shape::Rect(rect) if rect.fill == fs_fit_popup_frame().fill => {
+                    assert_eq!(
+                        rect.fill,
+                        egui::Color32::from_rgba_unmultiplied(30, 30, 30, 240),
+                        "keep the previous HUD popup opacity"
+                    );
+                    *background_seen = true;
+                }
+                _ => {}
+            }
+        }
+        for size in [
+            egui::vec2(1093.0, 614.0),
+            egui::vec2(320.0, 320.0),
+            egui::vec2(280.0, 320.0),
+        ] {
+            let ctx = egui::Context::default();
+            crate::ui_fonts::configure_fonts(&ctx);
+            ctx.style_mut(|style| style.spacing.scroll = egui::style::ScrollStyle::floating());
+            let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            let mut open = true;
+            let mut value = FullscreenSpecifiedScale::default();
+            let mut help_seen = false;
+            let mut background_seen = false;
+            for frame in 0..90 {
+                let previous = ctx.data(|data| {
+                    data.get_temp::<(egui::Rect, egui::Rect, egui::Vec2)>(egui::Id::new(
+                        "fs_fit_popup_scroll_layout",
+                    ))
+                });
+                let pointer = previous.map_or(egui::pos2(160.0, 200.0), |(_, bar, _)| bar.center());
+                let mut events = vec![egui::Event::PointerMoved(pointer)];
+                if frame == 30 {
+                    events.push(egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -2000.0),
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
+                let output = fit_popup_frame(&ctx, viewport, events, &mut open, &mut value);
+                let (inner, bar, content) = ctx
+                    .data(|data| {
+                        data.get_temp::<(egui::Rect, egui::Rect, egui::Vec2)>(egui::Id::new(
+                            "fs_fit_popup_scroll_layout",
+                        ))
+                    })
+                    .unwrap();
+                // Once the existing scrollbar reveal animation has settled,
+                // compare real painted content with the full bar envelope.
+                // A tall viewport may fit all content and have no scrollbar.
+                let bar = if frame >= 20 && content.y > inner.height() {
+                    bar
+                } else {
+                    egui::Rect::NOTHING
+                };
+                for shape in &output.shapes {
+                    inspect(
+                        &shape.shape,
+                        shape.clip_rect,
+                        bar,
+                        &mut help_seen,
+                        &mut background_seen,
+                    );
+                }
+                for axis in ["幅", "高さ"] {
+                    if let Some(unit) = ctx.data(|data| {
+                        data.get_temp::<egui::Rect>(egui::Id::new((
+                            "specified_scale_unit_response",
+                            axis,
+                        )))
+                    }) {
+                        if bar.is_positive() {
+                            assert!(
+                                unit.right() <= bar.left(),
+                                "unit button must remain outside the bar: {unit:?} {bar:?}"
+                            );
+                        }
+                    }
+                }
+                assert!(open);
+            }
+            assert!(help_seen, "scroll reaches the wrapped help");
+            assert!(background_seen, "inspect the actual painted HUD background");
+            assert_eq!(
+                ctx.style().spacing.scroll.floating_allocated_width,
+                0.0,
+                "popup gutter must not change the shared style"
+            );
         }
     }
 

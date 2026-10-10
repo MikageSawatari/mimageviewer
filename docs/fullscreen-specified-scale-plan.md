@@ -1003,3 +1003,25 @@ EOF単独再実行は1件成功、全libの4並列再実行は11,480件成功／
 新規source・test・docs・snapshotファイルなし。変更PNG全名、red→greenと検証の実ログ、
 新規確認成果物は`target/E-1342-ui2-msg.txt`へ記録する。製品起動・build-dev・commitは行わず、
 利用者が実機確認中の`target/dev-runtime`には書き込まない。
+
+## 20. HUD popupのfloating scrollbar予約（2026-10-10）
+
+6f999b75cの実機指摘は、popupが共通styleの予約幅0を継承し、
+ScrollAreaの本文・行・widget領域にfloating scrollbarが重なることによる。
+popupのScrollArea ownerだけで `floating_allocated_width` を少なくとも
+`bar_inner_margin + bar_width` にする。本文の折り返し、全sectionの行、右端ON/OFF、
+数値・単位のchildが同じ予約済みcontent rectを使い、draw / click / touchを揃える。
+共通styleや設定・popup寿命・IME・viewport述語には変更を加えない。
+本文だけの右padding、バーの非表示、追加のstateやrepaintで隠す案は採らない。
+
+背景は指定サイズ追加前のmaster `840c309ec` と同じ
+`from_rgba_unmultiplied(30, 30, 30, 240)` を維持する。
+元から約6%の透過がある意匠であり、今回これより薄くしない。
+通常1093×614と320×320 / 280×320で実フォント・実popup描画・hover・wheelを通し、
+展開したバーの領域と可視の本文・行・単位buttonが交差しないこと、
+末尾説明への到達、実描画の背景alpha、共通styleへ予約幅を漏らさないことを回帰検証する。
+既存のIME / handler / narrow reachability回帰も保持する。
+予約なしでは行描画／click rectがバーへ重なるredを確認した。
+意図した全fit popupのsnapshot testだけを更新し、PNG一覧と最終gate結果は
+`target/E-1342-ui3-msg.txt` へ記録する。build-dev・製品起動・commitを行わず、
+実機確認中の `target/dev-runtime` を変更しない。

@@ -1455,6 +1455,15 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+2026-10-10 §1.342 HUD fit popupのscrollbar予約: 利用者の実機指摘とCLAUDE.mdの
+floating scrollbar規則に従い、`ui_fullscreen.rs` の共通popup ScrollArea ownerで
+全行・本文・数値／単位widgetが使うcontent幅へバーのgutterを予約する。
+単独labelの症状paddingではなく、描画／hit／touch領域を同じlayoutへ戻す構造修正である。
+背景は指定サイズ追加前と同じalpha240を維持する。viewport述語・context identity・
+placement / HWND / focus・IME / 設定保存・worker寿命は変更しない。
+新しいstate・待機・repaint・再生成を加えず、実描画の非交差・到達性・opacityを検証する。
+今回の変更の独立レビュー合格を表す記録ではなく、利用者指示の実変更範囲として記す。
+
 **2026-10-09 §1.342 指定サイズfit・canonical枠とcontext-local需要の接続**
 
 利用者の実装指示と独立設計レビュー・構造判定への合意を受領し、
