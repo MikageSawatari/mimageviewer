@@ -1,3 +1,19 @@
+// Evaluate old fixture payloads before borrowing AppTestEnv through DerefMut.
+#[cfg(test)]
+macro_rules! send_thumbnail_for_test {
+    ($app:expr, $msg:expr $(,)?) => {{
+        let message = $msg;
+        $app.send_thumbnail_for_test(message)
+    }};
+}
+#[cfg(test)]
+macro_rules! queue_thumbnail_for_test {
+    ($app:expr, $msg:expr $(,)?) => {{
+        let message = $msg;
+        $app.queue_thumbnail_for_test(message)
+    }};
+}
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -6607,108 +6623,11 @@ struct ThumbnailKeepProjection {
     interactive_pages: HashSet<usize>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ThumbnailRequests {
-    entries: std::collections::HashMap<usize, ThumbnailRequestOwner>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ThumbnailRequestOwner {
-    idle_upgrade: bool,
-    edit_preview_epoch: Option<u64>,
-}
-
-impl ThumbnailRequests {
-    pub(crate) fn clear(&mut self) {
-        self.entries.clear();
-    }
-
-    pub(crate) fn contains_key(&self, idx: &usize) -> bool {
-        self.entries.contains_key(idx)
-    }
-
-    pub(crate) fn get(&self, idx: &usize) -> Option<&bool> {
-        self.entries.get(idx).map(|owner| &owner.idle_upgrade)
-    }
-
-    pub(crate) fn insert(&mut self, idx: usize, idle_upgrade: bool) -> Option<bool> {
-        self.insert_with_edit_preview_epoch(idx, idle_upgrade, None)
-    }
-
-    fn insert_with_edit_preview_epoch(
-        &mut self,
-        idx: usize,
-        idle_upgrade: bool,
-        edit_preview_epoch: Option<u64>,
-    ) -> Option<bool> {
-        self.entries
-            .insert(
-                idx,
-                ThumbnailRequestOwner {
-                    idle_upgrade,
-                    edit_preview_epoch,
-                },
-            )
-            .map(|owner| owner.idle_upgrade)
-    }
-
-    fn owner_matches_edit_preview_epoch(&self, idx: usize, epoch: u64) -> bool {
-        self.entries
-            .get(&idx)
-            .is_some_and(|owner| owner.edit_preview_epoch == Some(epoch))
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub(crate) fn keys(&self) -> impl Iterator<Item = &usize> {
-        self.entries.keys()
-    }
-
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (&usize, &bool)> {
-        self.entries
-            .iter()
-            .map(|(idx, owner)| (idx, &owner.idle_upgrade))
-    }
-
-    pub(crate) fn remove(&mut self, idx: &usize) -> Option<bool> {
-        self.entries.remove(idx).map(|owner| owner.idle_upgrade)
-    }
-}
-
-impl Extend<(usize, bool)> for ThumbnailRequests {
-    fn extend<T: IntoIterator<Item = (usize, bool)>>(&mut self, iter: T) {
-        for (idx, idle_upgrade) in iter {
-            self.insert(idx, idle_upgrade);
-        }
-    }
-}
-
-impl<'a> IntoIterator for &'a ThumbnailRequests {
-    type Item = (&'a usize, &'a bool);
-    type IntoIter = std::iter::Map<
-        std::collections::hash_map::Iter<'a, usize, ThumbnailRequestOwner>,
-        fn((&'a usize, &'a ThumbnailRequestOwner)) -> (&'a usize, &'a bool),
-    >;
-
-    fn into_iter(self) -> Self::IntoIter {
-        fn project<'a>(
-            (idx, owner): (&'a usize, &'a ThumbnailRequestOwner),
-        ) -> (&'a usize, &'a bool) {
-            (idx, &owner.idle_upgrade)
-        }
-        self.entries.iter().map(project)
-    }
-}
+mod thumbnail_requests;
+use thumbnail_requests::{ThumbnailReceipt, ThumbnailRequestKind, ThumbnailRequests};
 
 fn cleanup_stale_edit_preview_request(
     requested: &mut ThumbnailRequests,
-    pending_finalize: &mut HashSet<usize>,
     thumbnails: &mut [ThumbnailState],
     idx: usize,
     result_epoch: u64,
@@ -6717,7 +6636,6 @@ fn cleanup_stale_edit_preview_request(
         return;
     }
     requested.remove(&idx);
-    pending_finalize.remove(&idx);
     if let Some(state) = thumbnails.get_mut(idx)
         && !matches!(state, ThumbnailState::Loaded { .. })
     {
@@ -7973,19 +7891,22 @@ fn finish_out_of_keep_thumbnail_request(
     tx: &mpsc::Sender<crate::thumb_loader::ThumbMsg>,
     gen_done: &AtomicUsize,
 ) {
-    let _ = tx.send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
-        req.idx,
-        None,
-        crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-        false,
-        None,
-        None,
-        None,
-        true,
-        false,
-        req.input_seq,
-        req.items_gen,
-    ));
+    let _ = tx.send(
+        crate::thumb_loader::ThumbMsg::from_legacy_parts(
+            req.idx,
+            None,
+            crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+            false,
+            None,
+            None,
+            None,
+            true,
+            false,
+            req.input_seq,
+            req.items_gen,
+        )
+        .with_request_id(req.request_id),
+    );
     // The initial worker already counted the deferred RAW handoff as unfinished.
     // Its queued follow-up owns that one completion even when keep changed.
     if matches!(
@@ -15030,8 +14951,6 @@ pub struct App {
     /// 実害はごくわずか。)
     pub(crate) keep_start_shared: Arc<AtomicUsize>,
     pub(crate) keep_end_shared: Arc<AtomicUsize>,
-    /// poll_thumbnails で 1 フレームのテクスチャ生成上限を超えた分を次フレームに持ち越す
-    pub(crate) texture_backlog: Vec<crate::thumb_loader::ThumbMsg>,
 
     /// Ctrl+↑↓ のバックグラウンドフォルダナビゲーション結果待ち。
     /// navigate_folder_with_skip をワーカースレッドで実行し、UIスレッドをブロックしない。
@@ -16056,15 +15975,6 @@ pub struct App {
     /// `egui::Context` を持たない軽量 items 差し替え経路で、次フレームに色スキャンを
     /// 起動するための one-shot フラグ。
     pub(crate) color_filter_scope_refresh_pending: bool,
-
-    /// 第2シグナル (`finalized=true`) を受け取ったが、第1シグナルの ColorImage が
-    /// `texture_backlog` でアップロード待ちのため `requested` から remove できなかった
-    /// idx の集合。次回その idx が Loaded 化したタイミングで `requested` から remove する。
-    ///
-    /// これがないと: backlog 詰まり中に finalized で requested を remove → 次フレームに
-    /// `need_load && !requested.contains` で再エンキュー → 同じ画像を何度も decode する
-    /// 無限ループ (重複デコード地獄) になる。
-    pub(crate) pending_finalize: std::collections::HashSet<usize>,
 
     // ── スクロール体感ロギング (--log 時) ──────────────────────────
     /// 直近のフレームで計算した可視範囲 (raw idx)。
@@ -19295,7 +19205,6 @@ impl App {
             details_hover_thumb_viewport_open: false,
             keep_start_shared: Arc::new(AtomicUsize::new(0)),
             keep_end_shared: Arc::new(AtomicUsize::new(0)),
-            texture_backlog: Vec::new(),
             folder_nav_pending: None,
             folder_pane_open_pending: None,
             pending_folder_nav_steps: 0,
@@ -19694,7 +19603,6 @@ impl App {
             facet_tag_search_query: String::new(),
             color_filter: crate::color_search::ColorFilterState::default(),
             color_filter_scope_refresh_pending: false,
-            pending_finalize: std::collections::HashSet::new(),
             last_vis_range: (0, 0),
             vis_settle_at: None,
             vis_first_logged: false,
@@ -26074,8 +25982,6 @@ impl App {
         self.checked.clear();
         crate::thumb_loader::cancel_raw_thumb_tickets(&self.raw_thumb_develop);
         self.requested.clear();
-        self.pending_finalize.clear();
-        self.texture_backlog.clear();
         self.keep_range = (0, 0);
         self.keep_set.clear();
         self.clear_still_seek_thumbnail_requests();
@@ -38972,11 +38878,9 @@ impl App {
         }
 
         let clear_t0 = std::time::Instant::now();
-        let texture_backlog_len = self.texture_backlog.len();
+        let texture_backlog_len = self.requested.images_len();
         let fs_upload_backlog_len = self.fs_upload_backlog.len();
         self.requested.clear();
-        self.pending_finalize.clear();
-        self.texture_backlog.clear();
         self.keep_range = (0, 0);
         self.keep_set.clear();
         self.clear_still_seek_thumbnail_requests();
@@ -39905,6 +39809,9 @@ impl App {
 
     fn set_items_generation(&mut self, items_generation: u64) {
         if self.items_generation != items_generation {
+            // Retire this context's old request namespace, including unadopted images.
+            // Old notifications must not reserve indices in the successor generation.
+            self.requested.clear();
             self.reading_history_sources_pending
                 .remove(&self.projected_viewer_context_id());
             crate::thumb_loader::cancel_raw_thumb_tickets(&self.raw_thumb_develop);
@@ -40672,8 +40579,8 @@ impl App {
                             pending.pin_archive_dependencies.get(&archive_key).cloned()
                         })
                         .unwrap_or_default();
-                    // 判定が付いた候補自身は、cache-only 要求が miss したまま `Requested` で
-                    // 止まっているときだけ組み直す。cache hit で既に描けているサムネイルは、
+                    // 判定が付いた候補自身は、cache-only miss 後の判定待ちなど、
+                    // まだ画像が描けていないときだけ組み直す。cache hit で既に描けているサムネイルは、
                     // 解決後の要求と cache key (`convertible_archive_cache_base_key`) も
                     // mtime / file_size (アーカイブ自身のもの) も同一なので、作り直しても
                     // 同じ絵にしかならない。evict は texture を落として `Evicted` に戻すため、
@@ -41980,7 +41887,7 @@ impl App {
     /// 旧ワーカーの `ThumbMsg` が新 items の同じ idx に着地してサムネが化ける)。
     ///
     /// クリーンアップ内容:
-    /// - requested / pending_finalize / texture_backlog / fs_upload_backlog: idx を含む
+    /// - requested（予約と未採用画像）/ fs_upload_backlog: idx を含む
     ///   キューイング状態
     /// - keep_range / keep_set / keep_start_shared / keep_end_shared: ワーカーの
     ///   in_range 判定境界。新しい update_keep_range_and_requests が次フレームで
@@ -42003,8 +41910,6 @@ impl App {
         // through install_new_items.  The memo is idx-keyed, so retaining it would make an
         // unrelated item at the same index permanently ineligible for idle upgrading.
         self.idle_upgrade_cache_bypass_ineligible.clear();
-        self.pending_finalize.clear();
-        self.texture_backlog.clear();
         self.checked.clear();
         self.keep_range = (0, 0);
         self.keep_set.clear();
@@ -44368,8 +44273,6 @@ impl App {
         self.heavy_io_queue = had_workers.then(|| Arc::clone(&heavy_io_queue));
         crate::thumb_loader::cancel_raw_thumb_tickets(&self.raw_thumb_develop);
         self.requested.clear();
-        self.pending_finalize.clear();
-        self.texture_backlog.clear();
         self.cache_gen_total = 0;
         self.cache_gen_done = Arc::new(AtomicUsize::new(0));
 
@@ -47918,8 +47821,16 @@ impl App {
             .filter_map(|(idx, row)| row.marker_thumbnail.as_ref().map(|image| (idx, image)))
         {
             let [width, height] = image.size;
-            self.texture_backlog
-                .push(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+            let Some(id) = self.requested.begin(
+                idx,
+                self.items_generation,
+                ThumbnailRequestKind::DirectPixels,
+                None,
+            ) else {
+                continue;
+            };
+            self.requested.receive(
+                crate::thumb_loader::ThumbMsg::from_legacy_parts(
                     idx,
                     Some((**image).clone()),
                     crate::thumb_loader::ThumbLoadOrigin::FinalCache,
@@ -47931,7 +47842,9 @@ impl App {
                     false,
                     self.input_seq,
                     self.items_generation,
-                ));
+                )
+                .with_request_id(id),
+            );
         }
         self.rebuild_visible_indices();
         if let Some(return_grid) = return_grid {
@@ -49977,7 +49890,7 @@ impl App {
     /// 現在の可視範囲に最も近い動画を優先する。動画が多いフォルダで下にスクロール
     /// しても、表示中ページの動画が先に埋まるようにする。
     pub(crate) fn spawn_video_thread(
-        &self,
+        &mut self,
         tx: mpsc::Sender<ThumbMsg>,
         cancel: Arc<AtomicBool>,
         video_items: Vec<(usize, PathBuf, u64)>,
@@ -50001,11 +49914,23 @@ impl App {
         // UI 側は自 items_generation と一致しないものを破棄する (旧 items 混入防止)。
         let items_gen = self.items_generation;
 
+        let video_items: Vec<_> = video_items
+            .into_iter()
+            .filter_map(|(idx, path, size)| {
+                self.requested
+                    .begin(idx, items_gen, ThumbnailRequestKind::VideoBatch, None)
+                    .map(|id| (idx, path, size, id))
+            })
+            .collect();
+        if video_items.is_empty() {
+            return;
+        }
         std::thread::spawn(move || {
             use std::time::{Duration, Instant};
 
             struct PendingVideo {
                 idx: usize,
+                request_id: crate::thumb_loader::ThumbnailRequestId,
                 path: PathBuf,
                 file_size: u64,
                 retries: u32,
@@ -50031,7 +49956,7 @@ impl App {
 
             let override_count = video_items
                 .iter()
-                .filter(|(_, p, _)| {
+                .filter(|(_, p, _, _)| {
                     let full_key = crate::path_key::normalize_keep_drive(p);
                     thumb_overrides.contains_key(&full_key)
                         || thumb_overrides.contains_key(&stem_lower(p))
@@ -50049,8 +49974,9 @@ impl App {
             let now0 = Instant::now();
             let mut remaining: Vec<PendingVideo> = video_items
                 .into_iter()
-                .map(|(idx, path, file_size)| PendingVideo {
+                .map(|(idx, path, file_size, request_id)| PendingVideo {
                     idx,
+                    request_id,
                     path,
                     file_size,
                     retries: 0,
@@ -50096,6 +50022,7 @@ impl App {
                 };
                 let PendingVideo {
                     idx,
+                    request_id,
                     path,
                     file_size,
                     retries,
@@ -50200,6 +50127,7 @@ impl App {
                     ));
                     remaining.push(PendingVideo {
                         idx,
+                        request_id,
                         path,
                         file_size,
                         retries: retries + 1,
@@ -50243,25 +50171,82 @@ impl App {
                 // 動画 Shell API はアップグレード経路を持たないので Source origin。
                 // ピクセル寸法は取得できない。動画ロードは LoadRequest を経由しないため
                 // input_seq は動画スレッドでは未使用 (計装経路でエンキューされない)。
-                let _ = tx.send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
-                    idx,
-                    ci,
-                    crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-                    false,
-                    None,
-                    None,
-                    None,
-                    false,
-                    false,
-                    0,
-                    items_gen,
-                ));
+                let _ = tx.send(
+                    crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                        idx,
+                        ci,
+                        crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+                        false,
+                        None,
+                        None,
+                        None,
+                        false,
+                        false,
+                        0,
+                        items_gen,
+                    )
+                    .with_request_id(request_id),
+                );
+            }
+            for video in remaining {
+                let _ = tx.send(
+                    crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                        video.idx,
+                        None,
+                        crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+                        false,
+                        None,
+                        None,
+                        None,
+                        true,
+                        false,
+                        0,
+                        items_gen,
+                    )
+                    .with_request_id(video.request_id),
+                );
             }
             crate::logger::log(format!(
                 "[video thread] end: success={success_count} fail={fail_count} canceled={}",
                 cancel.load(Ordering::Relaxed),
             ));
         });
+    }
+
+    /// Legacy handler fixtures omit admission; lifecycle regressions use explicit begin + ID.
+    #[cfg(test)]
+    fn fixture_thumbnail_message(&mut self, mut msg: ThumbMsg) -> ThumbMsg {
+        use crate::thumb_loader::{ThumbMsgPayload, ThumbnailRequestId};
+        if msg.request_id == ThumbnailRequestId::Standalone
+            && msg.items_gen == self.items_generation
+        {
+            if let ThumbMsgPayload::Pixels(p) = &msg.payload {
+                if p.origin == crate::thumb_loader::ThumbLoadOrigin::DriveListChildSeed {
+                    msg = msg.provisional_pixels();
+                } else if !p.origin.from_cache()
+                    && !matches!(
+                        self.items.get(msg.idx),
+                        Some(GridItem::Audio(_) | GridItem::Video(_))
+                    )
+                {
+                    msg = msg.source_pixels();
+                }
+            }
+            msg = self.requested.correlate_fixture(msg);
+        }
+        msg
+    }
+
+    #[cfg(test)]
+    fn send_thumbnail_for_test(&mut self, msg: ThumbMsg) -> Result<(), mpsc::SendError<ThumbMsg>> {
+        let msg = self.fixture_thumbnail_message(msg);
+        self.tx.send(msg)
+    }
+
+    #[cfg(test)]
+    fn queue_thumbnail_for_test(&mut self, msg: ThumbMsg) {
+        let msg = self.fixture_thumbnail_message(msg);
+        self.requested.receive(msg);
     }
 
     fn reject_stale_edit_preview_thumbnail_result(
@@ -50285,7 +50270,6 @@ impl App {
         // owns the new epoch and must survive this late message.
         cleanup_stale_edit_preview_request(
             &mut self.requested,
-            &mut self.pending_finalize,
             &mut self.thumbnails,
             idx,
             result_epoch,
@@ -50294,417 +50278,243 @@ impl App {
     }
 
     fn poll_thumbnails(&mut self, ctx: &egui::Context, consumption: ThumbnailConsumptionPolicy) {
-        // 1 フレームあたりのテクスチャ生成数を制限する。
-        // load_texture は GPU テクスチャアップロードを伴い、1 枚 0.5-2 ms かかる。
-        // キャッシュヒット時にワーカー全員が一気に結果を返すと 1 フレームで
-        // 数十枚の upload が走りフレーム落ちするため、上限を設ける。
-        // 上限超過分は texture_backlog に ColorImage のまま保持し次フレームで処理する。
+        // Reservation + CPU image lifetime belongs to requested, independent of display state.
         const MAX_TEXTURES_PER_FRAME: u32 = 8;
         let mut textures_created = 0u32;
         let mut received = 0u32;
-        let (keep_start, keep_end) = self.keep_range;
-
-        // バックログ + チャネルから受信した結果を統合して処理する。
-        // バックログを先に処理（既にデコード済みなので優先）。
-        // ループ内で `self` を mutably 借りる経路 (writeback 等) があるため、
-        // ここで Vec に collect してから iterate する (借用衝突回避)。
-        let backlog = std::mem::take(&mut self.texture_backlog);
-        let drain: Vec<_> = backlog
-            .into_iter()
-            .chain(std::iter::from_fn(|| self.rx.try_recv().ok()))
-            .collect();
-
-        for msg in drain {
-            let crate::thumb_loader::ThumbMsg {
-                idx: i,
-                payload,
-                input_seq: req_input_seq,
-                items_gen: msg_items_gen,
-            } = msg;
-            if msg_items_gen != self.items_generation {
+        while let Ok(msg) = self.rx.try_recv() {
+            if msg.items_gen != self.items_generation || !self.requested.matches(&msg) {
                 continue;
             }
+            let i = msg.idx;
             if i >= self.thumbnails.len() {
                 self.requested.remove(&i);
                 continue;
             }
-            if matches!(payload, crate::thumb_loader::ThumbMsgPayload::NoArt) {
-                self.requested.remove(&i);
-                self.pending_finalize.remove(&i);
-                self.thumbnails[i] = ThumbnailState::NoArt;
-                received += 1;
+            if let Some(pixels) = msg.pixels()
+                && self.reject_stale_edit_preview_thumbnail_result(i, pixels.origin)
+            {
                 continue;
             }
-            let (
-                color_image_opt,
+            #[cfg(all(windows, feature = "test-script"))]
+            let cache_read = msg
+                .pixels()
+                .filter(|pixels| pixels.origin.from_cache())
+                .map(|_| (msg.items_gen, msg.input_seq));
+            match self.requested.receive(msg) {
+                ThumbnailReceipt::Ignored => continue,
+                ThumbnailReceipt::Queued => {
+                    #[cfg(all(windows, feature = "test-script"))]
+                    if let Some((items_gen, input_seq)) = cache_read
+                        && let Some(item) = self.items.get(i)
+                    {
+                        crate::test_script::release_checks::trace(
+                            "cache_read",
+                            serde_json::json!({
+                                "key": item.perf_key(),
+                                "idx": i,
+                                "items_gen": items_gen,
+                                "input_seq": input_seq,
+                                "from_cache": true,
+                            }),
+                        );
+                    }
+                }
+                ThumbnailReceipt::Finalized { source_changed } => {
+                    if source_changed {
+                        self.invalidate_color_representative(i);
+                        self.fire_virtual_folder_writeback_if_ready(i);
+                    }
+                }
+                ThumbnailReceipt::Terminal(crate::thumb_loader::ThumbMsgPayload::CacheOnlyMiss) => {
+                    // No display failure: only source admission waits for archive judgement.
+                }
+                ThumbnailReceipt::Terminal(crate::thumb_loader::ThumbMsgPayload::NoArt) => {
+                    self.thumbnails[i] = ThumbnailState::NoArt;
+                }
+                ThumbnailReceipt::Terminal(crate::thumb_loader::ThumbMsgPayload::Canceled) => {
+                    if !matches!(self.thumbnails[i], ThumbnailState::Loaded { .. }) {
+                        self.thumbnails[i] = ThumbnailState::Evicted;
+                    }
+                }
+                ThumbnailReceipt::Terminal(crate::thumb_loader::ThumbMsgPayload::Failed {
+                    ..
+                }) => {
+                    self.thumbnails[i] = ThumbnailState::Failed;
+                }
+                ThumbnailReceipt::Terminal(_) => unreachable!("image payload handled by owner"),
+            }
+            received += 1;
+        }
+        // Older queued images remain first. Taking one does not settle it until upload/discard.
+        while textures_created < MAX_TEXTURES_PER_FRAME {
+            let Some(msg) = self.requested.next_image() else {
+                break;
+            };
+            let i = msg.idx;
+            let request_id = msg.request_id;
+            let req_input_seq = msg.input_seq;
+            if msg.items_gen != self.items_generation || i >= self.thumbnails.len() {
+                self.requested.settle_image(i, request_id);
+                continue;
+            }
+            let pixels = msg.into_pixels().expect("owner queues only image messages");
+            let crate::thumb_loader::ThumbPixels {
+                image: color_image,
                 origin,
                 from_edit_preview,
                 edit_preview_adjustment,
                 source_dims,
                 layout_dims,
-                canceled,
-                finalized,
-            ) = match payload {
-                crate::thumb_loader::ThumbMsgPayload::Pixels(p) => (
-                    Some(p.image),
-                    p.origin,
-                    p.from_edit_preview,
-                    p.edit_preview_adjustment,
-                    p.source_dims,
-                    p.layout_dims,
-                    false,
-                    false,
-                ),
-                crate::thumb_loader::ThumbMsgPayload::Failed { origin } => {
-                    (None, origin, false, None, None, None, false, false)
-                }
-                crate::thumb_loader::ThumbMsgPayload::Canceled => (
-                    None,
-                    crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-                    false,
-                    None,
-                    None,
-                    None,
-                    true,
-                    false,
-                ),
-                crate::thumb_loader::ThumbMsgPayload::Finalized => (
-                    None,
-                    crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-                    false,
-                    None,
-                    None,
-                    None,
-                    false,
-                    true,
-                ),
-                crate::thumb_loader::ThumbMsgPayload::NoArt => unreachable!(),
-            };
+            } = pixels;
+            if self.reject_stale_edit_preview_thumbnail_result(i, origin) {
+                continue;
+            }
             let from_cache = origin.from_cache();
             let blocks_idle_upgrade = origin.blocks_idle_upgrade();
-            // 世代不一致 (旧 items 由来) のメッセージは破棄する。items 差し替え後に
-            // 旧ワーカー結果が同じ idx の新 items に適用されるとサムネが化けるため。
-            // 全エンキュー経路 (通常 / idle upgrade / 動画スレッド) で現世代をスナップ
-            // ショットして載せるので、不一致 = 旧経路と判定してよい。
-            if msg_items_gen != self.items_generation {
-                continue;
-            }
-            // A preview cache clear can overtake a worker that already read the old DB row. The
-            // clear ACK advances the process-local DB epoch before this poll resumes; reject that
-            // late image without disturbing a newer request for the same index.
-            if self.reject_stale_edit_preview_thumbnail_result(i, origin) {
-                received += 1;
-                continue;
-            }
-            if i >= self.thumbnails.len() {
-                self.requested.remove(&i);
-                continue;
-            }
-
-            let in_keep_range = self.keep_set.contains(&i);
-
-            #[cfg(all(windows, feature = "test-script"))]
-            if from_cache && color_image_opt.is_some() {
-                if let Some(item) = self.items.get(i) {
-                    crate::test_script::release_checks::trace(
-                        "cache_read",
-                        serde_json::json!({
-                            "key": item.perf_key(),
-                            "idx": i,
-                            "items_gen": msg_items_gen,
-                            "input_seq": req_input_seq,
-                            "from_cache": true,
-                        }),
+            let is_video = matches!(self.items.get(i), Some(GridItem::Video(_)));
+            let treat_as_in_range = self.keep_set.contains(&i)
+                || (is_video && consumption.keeps_out_of_range_video_texture());
+            if treat_as_in_range {
+                let [w, h] = color_image.size;
+                let rendered_at_px = w.max(h) as u32;
+                let prev_state_was_loaded =
+                    matches!(self.thumbnails[i], ThumbnailState::Loaded { .. });
+                let upload_t0 = std::time::Instant::now();
+                // サムネ補正用に `color_image` を Arc で保持してからテクスチャ化する。
+                // テクスチャアップロードは ColorImage を消費するので、保持用に clone が必要。
+                // 補正対象は Image / ZipImage / PdfPage のみ
+                // (display-pipeline.md §1.5)。動画 / フォルダ / ZIP・PDF
+                // 代表サムネに global_preset が漏れないようゲートする。
+                let retain_pixels_for_adjust = is_thumb_adjust_target(self.items.get(i));
+                let (arc_pixels_opt, edit_layers_opt, image_to_upload) = if retain_pixels_for_adjust
+                {
+                    let (base, layers) = match edit_preview_adjustment {
+                        Some(adjustment) => (
+                            adjustment.base,
+                            Some(std::sync::Arc::new(adjustment.annotation_layers)),
+                        ),
+                        None => (color_image.clone(), None),
+                    };
+                    (Some(std::sync::Arc::new(base)), layers, color_image)
+                } else {
+                    (None, None, color_image)
+                };
+                if let Some(layers) = edit_layers_opt {
+                    self.thumb_edit_preview_layers.insert(i, layers);
+                } else {
+                    self.thumb_edit_preview_layers.remove(&i);
+                }
+                let handle = ctx.load_texture(
+                    format!("thumb_{i}"),
+                    image_to_upload,
+                    egui::TextureOptions::LINEAR,
+                );
+                let upload_ms = upload_t0.elapsed().as_secs_f64() * 1000.0;
+                if let Some(arc) = arc_pixels_opt {
+                    self.thumb_pixels.insert(i, arc);
+                }
+                // 新しいピクセルに差し替わったので、古い補正済みテクスチャは捨てる。
+                // 次フレームで `maybe_apply_thumb_adjustment` により再生成される。
+                self.thumb_adjust_tex.remove(&i);
+                // 完成済み派生 WebP は元 PDF/ZIP 等へ idle quality-upgrade
+                // しない。通常 cache / source へ差し替わった場合は解除する。
+                if blocks_idle_upgrade {
+                    self.idle_upgrade_cache_bypass_ineligible.insert(i);
+                } else {
+                    self.idle_upgrade_cache_bypass_ineligible.remove(&i);
+                }
+                self.thumbnails[i] = ThumbnailState::Loaded {
+                    tex: handle,
+                    origin,
+                    from_edit_preview,
+                    rendered_at_px,
+                    source_dims,
+                    layout_dims,
+                };
+                textures_created += 1;
+                // 見開きの縦横判定はテクスチャ寿命に依存させない。元寸法が無い
+                // 旧 cache 等では、従来の判定と同じくロード済み画像寸法を使う。
+                if let Some(dims) =
+                    source_dims.or_else(|| Some((u32::try_from(w).ok()?, u32::try_from(h).ok()?)))
+                {
+                    self.record_page_dims_for_spread(i, dims);
+                }
+                if let Some(dims) = layout_dims {
+                    self.record_page_layout_dims_for_spread(i, dims);
+                }
+                // auto_aspect: グリッド消費者だけが新規 Loaded の比率を記録。
+                // source_dims が None なら ColorImage の (w, h) を fallback として使う
+                // (動画 Shell サムネ / 旧 cache 由来などで source_dims が無いケース)。
+                if consumption.drives_auto_aspect() && self.settings.thumb_aspect_auto {
+                    let ratio = match layout_dims.or(source_dims) {
+                        Some((sw, sh)) if sw > 0 => sh as f32 / sw as f32,
+                        _ if w > 0 => h as f32 / w as f32,
+                        _ => -1.0,
+                    };
+                    if ratio > 0.0 && ratio.is_finite() {
+                        self.auto_aspect.samples.insert(i, ratio);
+                    }
+                }
+                // Pending/Evicted → Loaded の遷移時のみ ready を emit
+                // (アップグレードで Loaded→Loaded の遷移も起きるためフィルタ)。
+                // seq はエンキュー元のを透過し、decode 中のスクロールで
+                // ready が別操作に紐づくのを防ぐ。
+                if crate::perf::is_enabled() && !prev_state_was_loaded {
+                    let perf_key = self.perf_item_key(i);
+                    crate::perf::event(
+                        "thumb",
+                        "ready",
+                        perf_key.as_deref(),
+                        req_input_seq,
+                        &[
+                            ("idx", serde_json::Value::from(i)),
+                            ("w", serde_json::Value::from(w)),
+                            ("h", serde_json::Value::from(h)),
+                            ("from_cache", serde_json::Value::from(from_cache)),
+                            ("upload_ms", serde_json::Value::from(upload_ms)),
+                        ],
                     );
                 }
-            }
-
-            // finalized = true: 第 2 シグナル (decode 成功 + cache save 完了)。
-            // **`thumbnails[i]` の状態は変更しない**。
-            //
-            // 状態別の処理:
-            //   - Loaded: 正常完了 → requested.remove。
-            //   - Pending: 第1シグナルが texture_backlog でアップロード待ち中。
-            //     requested をここで抜くと次フレームに Pending && !requested.contains
-            //     で再エンキュー → 同じ画像を何度も decode する無限ループになる。
-            //     `pending_finalize` に idx を積み、アップロード完了時 (Loaded 遷移時)
-            //     にまとめて requested を抜く。
-            //   - Evicted / Failed: 第1シグナルは既に処理されており (Loaded 経由で
-            //     Evicted になった or ワーカーが失敗を返した)、ワーカーもこのシグナルで
-            //     終了。ここで requested を抜いておかないと、再スクロールで戻った時に
-            //     `update_keep_range_and_requests` の `requested.contains_key` ガードで
-            //     再エンキューが無限にブロックされ、サムネが Evicted のまま固着する。
-            //
-            // `requested` に無い idx への finalized は、第1シグナルが keep 範囲外で
-            // drop された後の幽霊シグナル。pending_finalize に挿入すると stale 状態が
-            // 残り続けるので無視する。
-            if finalized {
-                // Source decode/cache replacement advances the representative identity. Ordinary
-                // cache reads and GPU eviction do not invalidate unchanged color results.
-                self.invalidate_color_representative(i);
-                // 仮想フォルダの先頭ページ完成を親 catalog にミラー (PDFium 再レンダ
-                // 防止のための writeback)。requested の cleanup より前にやることで、
-                // cache_map から WebP データが消える前に確実に読み出せる。
-                self.fire_virtual_folder_writeback_if_ready(i);
-                if !self.requested.contains_key(&i) {
-                    received += 1;
-                    continue;
-                }
-                match self.thumbnails[i] {
-                    ThumbnailState::Loaded { .. } => {
-                        self.requested.remove(&i);
-                    }
-                    ThumbnailState::Pending => {
-                        self.pending_finalize.insert(i);
-                    }
-                    ThumbnailState::Evicted | ThumbnailState::Failed | ThumbnailState::NoArt => {
-                        // 固着防止: Evicted/Failed で finalize が来たら再エンキュー
-                        // 可能な状態に戻す。
-                        let state_name = match self.thumbnails[i] {
-                            ThumbnailState::Evicted => "Evicted",
-                            ThumbnailState::Failed => "Failed",
-                            ThumbnailState::NoArt => "NoArt",
-                            _ => unreachable!(),
-                        };
-                        self.requested.remove(&i);
-                        self.pending_finalize.remove(&i);
+                // ── スクロール体感: vis 内の Pending → Loaded 遷移を計測 ──
+                if !prev_state_was_loaded
+                    && i >= self.last_vis_range.0
+                    && i < self.last_vis_range.1
+                    && let Some(settle_t) = self.vis_settle_at
+                {
+                    let elapsed_ms = settle_t.elapsed().as_secs_f64() * 1000.0;
+                    if !self.vis_first_logged {
                         crate::logger::log(format!(
-                            "  [poll] finalize on {state_name} idx={i} → cleanup requested (was stuck candidate)"
+                            "[vis] first_visible idx={i} +{elapsed_ms:.1}ms after settle",
                         ));
+                        self.vis_first_logged = true;
                     }
-                }
-                received += 1;
-                continue;
-            }
-
-            // canceled = true: ワーカーが処理を中断 (STALE 等)。
-            // Failed にはせず、Evicted に戻して再試行可能にする。
-            // Loaded 状態は維持 (既にテクスチャがある場合は破棄しない)。
-            if canceled {
-                self.requested.remove(&i);
-                self.pending_finalize.remove(&i);
-                if !matches!(self.thumbnails[i], ThumbnailState::Loaded { .. }) {
-                    self.thumbnails[i] = ThumbnailState::Evicted;
-                }
-                received += 1;
-                continue;
-            }
-
-            // グリッド側の Video は「最初に作ったサムネを以後ずっと保持する」従来設計。
-            // update_keep_range_and_requests は Video を Evicted 化せず、make_load_request も
-            // Video に None を返すため、Grid policy だけは keep 外の結果も必ずテクスチャ化する。
-            // fullscreen-only context はグリッド消費者を持たないので、この強制保持を行わない。
-            let is_video = matches!(self.items.get(i), Some(GridItem::Video(_)));
-            let treat_as_in_range =
-                in_keep_range || (is_video && consumption.keeps_out_of_range_video_texture());
-
-            match color_image_opt {
-                Some(color_image) => {
-                    if treat_as_in_range && textures_created < MAX_TEXTURES_PER_FRAME {
-                        // cache origin: 1 ショット経路 (cache save なし) → 即 remove。
-                        // source origin: from-source 経路。cache save 完了後の
-                        //   第 2 シグナル (canceled=true) 到着まで `requested` を保持。
-                        //   cache save 進行中の再エンキュー + 二重レンダを防ぐ。
-                        if (from_cache || matches!(self.items.get(i), Some(GridItem::Audio(_))))
-                            && origin != crate::thumb_loader::ThumbLoadOrigin::DriveListChildSeed
-                        {
-                            self.requested.remove(&i);
-                        }
-                        let [w, h] = color_image.size;
-                        let rendered_at_px = w.max(h) as u32;
-                        let prev_state_was_loaded =
-                            matches!(self.thumbnails[i], ThumbnailState::Loaded { .. });
-                        let upload_t0 = std::time::Instant::now();
-                        // サムネ補正用に `color_image` を Arc で保持してからテクスチャ化する。
-                        // テクスチャアップロードは ColorImage を消費するので、保持用に clone が必要。
-                        // 補正対象は Image / ZipImage / PdfPage のみ
-                        // (display-pipeline.md §1.5)。動画 / フォルダ / ZIP・PDF
-                        // 代表サムネに global_preset が漏れないようゲートする。
-                        let retain_pixels_for_adjust = is_thumb_adjust_target(self.items.get(i));
-                        let (arc_pixels_opt, edit_layers_opt, image_to_upload) =
-                            if retain_pixels_for_adjust {
-                                let (base, layers) = match edit_preview_adjustment {
-                                    Some(adjustment) => (
-                                        adjustment.base,
-                                        Some(std::sync::Arc::new(adjustment.annotation_layers)),
-                                    ),
-                                    None => (color_image.clone(), None),
-                                };
-                                (Some(std::sync::Arc::new(base)), layers, color_image)
-                            } else {
-                                (None, None, color_image)
-                            };
-                        if let Some(layers) = edit_layers_opt {
-                            self.thumb_edit_preview_layers.insert(i, layers);
-                        } else {
-                            self.thumb_edit_preview_layers.remove(&i);
-                        }
-                        let handle = ctx.load_texture(
-                            format!("thumb_{i}"),
-                            image_to_upload,
-                            egui::TextureOptions::LINEAR,
-                        );
-                        let upload_ms = upload_t0.elapsed().as_secs_f64() * 1000.0;
-                        if let Some(arc) = arc_pixels_opt {
-                            self.thumb_pixels.insert(i, arc);
-                        }
-                        // 新しいピクセルに差し替わったので、古い補正済みテクスチャは捨てる。
-                        // 次フレームで `maybe_apply_thumb_adjustment` により再生成される。
-                        self.thumb_adjust_tex.remove(&i);
-                        // 完成済み派生 WebP は元 PDF/ZIP 等へ idle quality-upgrade
-                        // しない。通常 cache / source へ差し替わった場合は解除する。
-                        if blocks_idle_upgrade {
-                            self.idle_upgrade_cache_bypass_ineligible.insert(i);
-                        } else {
-                            self.idle_upgrade_cache_bypass_ineligible.remove(&i);
-                        }
-                        self.thumbnails[i] = ThumbnailState::Loaded {
-                            tex: handle,
-                            origin,
-                            from_edit_preview,
-                            rendered_at_px,
-                            source_dims,
-                            layout_dims,
-                        };
-                        textures_created += 1;
-                        // 見開きの縦横判定はテクスチャ寿命に依存させない。元寸法が無い
-                        // 旧 cache 等では、従来の判定と同じくロード済み画像寸法を使う。
-                        if let Some(dims) = source_dims
-                            .or_else(|| Some((u32::try_from(w).ok()?, u32::try_from(h).ok()?)))
-                        {
-                            self.record_page_dims_for_spread(i, dims);
-                        }
-                        if let Some(dims) = layout_dims {
-                            self.record_page_layout_dims_for_spread(i, dims);
-                        }
-                        // auto_aspect: グリッド消費者だけが新規 Loaded の比率を記録。
-                        // source_dims が None なら ColorImage の (w, h) を fallback として使う
-                        // (動画 Shell サムネ / 旧 cache 由来などで source_dims が無いケース)。
-                        if consumption.drives_auto_aspect() && self.settings.thumb_aspect_auto {
-                            let ratio = match layout_dims.or(source_dims) {
-                                Some((sw, sh)) if sw > 0 => sh as f32 / sw as f32,
-                                _ if w > 0 => h as f32 / w as f32,
-                                _ => -1.0,
-                            };
-                            if ratio > 0.0 && ratio.is_finite() {
-                                self.auto_aspect.samples.insert(i, ratio);
-                            }
-                        }
-                        // 第2シグナル先着の場合の遅延 requested.remove を実行。
-                        if self.pending_finalize.remove(&i) {
-                            self.requested.remove(&i);
-                        }
-                        // Pending/Evicted → Loaded の遷移時のみ ready を emit
-                        // (アップグレードで Loaded→Loaded の遷移も起きるためフィルタ)。
-                        // seq はエンキュー元のを透過し、decode 中のスクロールで
-                        // ready が別操作に紐づくのを防ぐ。
-                        if crate::perf::is_enabled() && !prev_state_was_loaded {
-                            let perf_key = self.perf_item_key(i);
-                            crate::perf::event(
-                                "thumb",
-                                "ready",
-                                perf_key.as_deref(),
-                                req_input_seq,
-                                &[
-                                    ("idx", serde_json::Value::from(i)),
-                                    ("w", serde_json::Value::from(w)),
-                                    ("h", serde_json::Value::from(h)),
-                                    ("from_cache", serde_json::Value::from(from_cache)),
-                                    ("upload_ms", serde_json::Value::from(upload_ms)),
-                                ],
-                            );
-                        }
-                        // ── スクロール体感: vis 内の Pending → Loaded 遷移を計測 ──
-                        if !prev_state_was_loaded
-                            && i >= self.last_vis_range.0
-                            && i < self.last_vis_range.1
-                            && let Some(settle_t) = self.vis_settle_at
-                        {
-                            let elapsed_ms = settle_t.elapsed().as_secs_f64() * 1000.0;
-                            if !self.vis_first_logged {
-                                crate::logger::log(format!(
-                                    "[vis] first_visible idx={i} +{elapsed_ms:.1}ms after settle",
-                                ));
-                                self.vis_first_logged = true;
-                            }
-                            if !self.vis_all_logged {
-                                let all_loaded = (self.last_vis_range.0..self.last_vis_range.1)
-                                    .all(|j| {
-                                        matches!(
-                                            self.thumbnails.get(j),
-                                            Some(ThumbnailState::Loaded { .. })
-                                        )
-                                    });
-                                if all_loaded {
-                                    crate::logger::log(format!(
-                                        "[vis] all_loaded vis=[{}..{}) +{elapsed_ms:.1}ms after settle",
-                                        self.last_vis_range.0, self.last_vis_range.1,
-                                    ));
-                                    self.vis_all_logged = true;
-                                }
-                            }
-                        }
-                    } else if treat_as_in_range {
-                        // 上限到達で keep_range 内 (or 動画): 次フレームに持ち越す。
-                        // requested は除去しない (重複リクエスト防止)。
-                        self.texture_backlog.push(
-                            crate::thumb_loader::ThumbMsg::from_legacy_parts(
-                                i,
-                                Some(color_image),
-                                origin,
-                                from_edit_preview,
-                                edit_preview_adjustment,
-                                source_dims,
-                                layout_dims,
-                                false,
-                                false,
-                                req_input_seq,
-                                msg_items_gen,
-                            ),
-                        );
-                    } else {
-                        // 範囲外: ColorImage を drop し Evicted にしておく。
-                        // from_cache / from_source に関わらず、UI 側の要求はここで完了扱い。
-                        // from_source 用に requested を残すと、後から届く finalized=true と
-                        // 合わせて `pending_finalize` が stale 化し、スクロールで戻っても
-                        // `requested.contains_key(&i)` により再エンキューが阻まれる
-                        // (= サムネイルが復帰しない) 状態に陥る。
-                        // pending_finalize も念のため掃除する (第 2 シグナル先着の場合)。
-                        crate::logger::log(format!(
-                            "  [main] drop out-of-range thumb: idx={i} keep=[{keep_start}..{keep_end})"
-                        ));
-                        self.requested.remove(&i);
-                        self.pending_finalize.remove(&i);
-                        self.thumb_pixels.remove(&i);
-                        self.thumb_edit_preview_layers.remove(&i);
-                        self.thumb_adjust_tex.remove(&i);
-                        self.thumbnails[i] = ThumbnailState::Evicted;
-                    }
-                }
-                None => {
-                    if origin == crate::thumb_loader::ThumbLoadOrigin::DriveListChildMiss {
-                        // Validation can finish while the provisional seed is
-                        // still waiting for this frame's texture budget.
-                        self.texture_backlog.retain(|queued| {
-                            !(queued.idx == i
-                                && queued.items_gen == msg_items_gen
-                                && queued.pixels().map(|p| p.origin)
-                                    == Some(
-                                        crate::thumb_loader::ThumbLoadOrigin::DriveListChildSeed,
-                                    ))
+                    if !self.vis_all_logged {
+                        let all_loaded = (self.last_vis_range.0..self.last_vis_range.1).all(|j| {
+                            matches!(self.thumbnails.get(j), Some(ThumbnailState::Loaded { .. }))
                         });
+                        if all_loaded {
+                            crate::logger::log(format!(
+                                "[vis] all_loaded vis=[{}..{}) +{elapsed_ms:.1}ms after settle",
+                                self.last_vis_range.0, self.last_vis_range.1,
+                            ));
+                            self.vis_all_logged = true;
+                        }
                     }
-                    self.requested.remove(&i);
-                    self.pending_finalize.remove(&i);
-                    self.thumbnails[i] = ThumbnailState::Failed;
                 }
+            } else {
+                self.thumb_pixels.remove(&i);
+                self.thumb_edit_preview_layers.remove(&i);
+                self.thumb_adjust_tex.remove(&i);
+                self.thumbnails[i] = ThumbnailState::Evicted;
             }
+            self.requested.settle_image(i, request_id);
             received += 1;
         }
-        if received > 0 || !self.texture_backlog.is_empty() {
+        if received > 0 || self.requested.images_len() > 0 {
             crate::logger::log(format!(
                 "  [main] poll_thumbnails: received {received} ({textures_created} textures, {} backlog)",
-                self.texture_backlog.len()
+                self.requested.images_len()
             ));
             ctx.request_repaint();
         }
@@ -50822,7 +50632,7 @@ impl App {
                             req.priority = true;
                         }
                     } else {
-                        locally_canceled.insert(req.idx);
+                        locally_canceled.insert((req.idx, req.request_id));
                         finish_pruned_raw_half_followup(req, &self.tx, &self.cache_gen_done);
                     }
                     keep
@@ -50841,25 +50651,17 @@ impl App {
                             req.priority = true;
                         }
                     } else {
-                        locally_canceled.insert(req.idx);
+                        locally_canceled.insert((req.idx, req.request_id));
                         finish_pruned_raw_half_followup(req, &self.tx, &self.cache_gen_done);
                     }
                     keep
                 });
             }
 
-            for idx in previous_keep_set.difference(&self.keep_set).copied() {
-                if self.pending_finalize.remove(&idx) {
-                    locally_canceled.insert(idx);
-                }
-                let before = self.texture_backlog.len();
-                self.texture_backlog.retain(|msg| msg.idx != idx);
-                if self.texture_backlog.len() != before {
-                    locally_canceled.insert(idx);
-                }
-            }
-            for idx in locally_canceled {
-                self.requested.remove(&idx);
+            // Keep departure discards only images. A running source still owns its save terminal.
+            self.requested.discard_images_outside(&self.keep_set);
+            for (idx, request_id) in locally_canceled {
+                self.requested.cancel_queued(idx, request_id);
             }
         }
 
@@ -51127,8 +50929,15 @@ impl App {
             .edit_preview_cache
             .as_ref()
             .map(crate::edit_preview_cache::EditPreviewCacheService::epoch);
-        self.requested
-            .insert_with_edit_preview_epoch(idx, false, edit_preview_epoch);
+        let Some(request_id) = self.requested.begin(
+            idx,
+            req.items_gen,
+            ThumbnailRequestKind::Normal,
+            edit_preview_epoch,
+        ) else {
+            return;
+        };
+        req.request_id = request_id;
         let (ref mtx, ref cvar) = *queue_arc;
         let mut q = mtx.lock().unwrap();
         q.push(req);
@@ -51680,7 +51489,7 @@ impl App {
                 let keep = keep_set.contains(&r.idx);
                 if !keep {
                     finish_pruned_raw_half_followup(r, &self.tx, &self.cache_gen_done);
-                    requested.remove(&r.idx);
+                    requested.cancel_queued(r.idx, r.request_id);
                     return false;
                 }
                 let now_visible = r.idx >= visible_raw_start && r.idx < visible_raw_end;
@@ -51688,7 +51497,7 @@ impl App {
                 let is_grid_prefetch = !foreground && !r.source_policy.bypasses_cache();
                 if !prefetch_ok && is_grid_prefetch {
                     finish_pruned_raw_half_followup(r, &self.tx, &self.cache_gen_done);
-                    requested.remove(&r.idx);
+                    requested.cancel_queued(r.idx, r.request_id);
                     pruned_regular += 1;
                     return false;
                 }
@@ -51702,9 +51511,16 @@ impl App {
                     || interactive_thumbnail_pages.contains(&r.idx);
             }
             let _q_before = q.len();
-            for r in new_regular {
-                requested.insert_with_edit_preview_epoch(r.idx, false, edit_preview_epoch);
-                q.push(r);
+            for mut r in new_regular {
+                if let Some(id) = requested.begin(
+                    r.idx,
+                    r.items_gen,
+                    ThumbnailRequestKind::Normal,
+                    edit_preview_epoch,
+                ) {
+                    r.request_id = id;
+                    q.push(r);
+                }
             }
             drop(q);
             for _ in 0..regular_count {
@@ -51726,7 +51542,7 @@ impl App {
                 let keep = keep_set.contains(&r.idx);
                 if !keep {
                     finish_pruned_raw_half_followup(r, &self.tx, &self.cache_gen_done);
-                    requested.remove(&r.idx);
+                    requested.cancel_queued(r.idx, r.request_id);
                     return false;
                 }
                 let now_visible = r.idx >= visible_raw_start && r.idx < visible_raw_end;
@@ -51734,7 +51550,7 @@ impl App {
                 let is_grid_prefetch = !foreground && !r.source_policy.bypasses_cache();
                 if !prefetch_ok && is_grid_prefetch {
                     finish_pruned_raw_half_followup(r, &self.tx, &self.cache_gen_done);
-                    requested.remove(&r.idx);
+                    requested.cancel_queued(r.idx, r.request_id);
                     pruned_heavy += 1;
                     return false;
                 }
@@ -51747,9 +51563,16 @@ impl App {
                 r.priority = (r.idx >= visible_raw_start && r.idx < visible_raw_end)
                     || interactive_thumbnail_pages.contains(&r.idx);
             }
-            for r in new_heavy {
-                requested.insert_with_edit_preview_epoch(r.idx, false, edit_preview_epoch);
-                q.push(r);
+            for mut r in new_heavy {
+                if let Some(id) = requested.begin(
+                    r.idx,
+                    r.items_gen,
+                    ThumbnailRequestKind::Normal,
+                    edit_preview_epoch,
+                ) {
+                    r.request_id = id;
+                    q.push(r);
+                }
             }
             drop(q);
             for _ in 0..heavy_count {
@@ -51759,7 +51582,7 @@ impl App {
         if new_hi > 0 || new_lo > 0 {
             crate::logger::log(format!(
                 "  [queue] push +{new_hi}H +{new_lo}L  keep=[{keep_start}..{keep_end})  vis=[{visible_raw_start}..{visible_raw_end})  requested={}",
-                self.requested.len(),
+                self.requested.legacy_len(),
             ));
             // Normal frames also request repaint in the tail via `requested_nonempty`。
             // update には fullscreen/navigation の早期 return があるため、enqueue owner からも
@@ -51779,7 +51602,7 @@ impl App {
         if self.last_stuck_scan_at.elapsed().as_secs() >= 5 {
             self.last_stuck_scan_at = std::time::Instant::now();
             let mut stuck: Vec<(usize, &'static str)> = Vec::new();
-            for (&idx, _) in &self.requested {
+            for (&idx, _) in self.requested.iter() {
                 if !self.keep_set.contains(&idx) {
                     continue;
                 }
@@ -51795,14 +51618,12 @@ impl App {
             }
             if !stuck.is_empty() {
                 stuck.sort_by_key(|(i, _)| *i);
-                let pf = self.pending_finalize.len();
-                let bl = self.texture_backlog.len();
+                let bl = self.requested.images_len();
                 crate::logger::log(format!(
-                    "  [stuck] {} entries in requested but not Loaded (keep=[{}..{}) pending_finalize={} backlog={}): {:?}",
+                    "  [stuck] {} entries in requested but not Loaded (keep=[{}..{}) backlog={}): {:?}",
                     stuck.len(),
                     keep_start,
                     keep_end,
-                    pf,
                     bl,
                     stuck.iter().take(20).collect::<Vec<_>>(),
                 ));
@@ -52085,7 +51906,7 @@ impl App {
         }
 
         // キューと in-flight が両方空のときだけ走らせる
-        if !self.requested.is_empty() {
+        if self.requested.blocks_idle_upgrade() {
             return;
         }
         let Some(reload_arc) = self.reload_queue.clone() else {
@@ -52273,10 +52094,16 @@ impl App {
                 .edit_preview_cache
                 .as_ref()
                 .map(crate::edit_preview_cache::EditPreviewCacheService::epoch);
-            for r in reqs {
-                self.requested
-                    .insert_with_edit_preview_epoch(r.idx, true, edit_preview_epoch);
-                q.push(r);
+            for mut r in reqs {
+                if let Some(id) = self.requested.begin(
+                    r.idx,
+                    r.items_gen,
+                    ThumbnailRequestKind::Upgrade,
+                    edit_preview_epoch,
+                ) {
+                    r.request_id = id;
+                    q.push(r);
+                }
             }
             drop(q);
             for _ in 0..count {
@@ -52308,7 +52135,7 @@ impl App {
         // フレーム長 + Windows タイマー粒度 (~15ms) を十分に上回る余白。
         const MARGIN: std::time::Duration = std::time::Duration::from_millis(50);
 
-        if !self.settings.thumb_idle_upgrade || !self.requested.is_empty() {
+        if !self.settings.thumb_idle_upgrade || self.requested.blocks_idle_upgrade() {
             return None;
         }
 
@@ -52328,31 +52155,14 @@ impl App {
     /// 全件を正確に反映している。queue を別途カウントすると二重計上になるため
     /// `requested` のみを集計する。
     fn count_pending(&self) -> (usize, usize) {
-        let (mut in_normal, mut in_upgrade) = (0usize, 0usize);
-        for (&idx, &is_upgrade) in &self.requested {
-            // keep_set 外 (非可視 + 先読み範囲外) のリクエストは「処理中だがスクロール
-            // またはフィルタ変更で不要になった」もの。進捗バーに含めない
-            // (ワーカー完了時に除去される)。
-            if !self.keep_set.contains(&idx) {
-                continue;
-            }
-            if is_upgrade {
-                in_upgrade += 1;
-            } else {
-                in_normal += 1;
-            }
-        }
-        (in_normal, in_upgrade)
+        let (normal, upgrade, _) = self.requested.progress_counts(&self.keep_set);
+        (normal, upgrade)
     }
 
     /// 現在の要求状況からプログレスバーのピーク値を更新する。
     fn update_progress_peaks(&mut self) {
-        let backlog_count = self.texture_backlog.len();
-        let (cur_normal_raw, cur_upgrade) = self.count_pending();
-        // backlog 内のアイテムは requested に残っており count_pending でカウント
-        // 済みだが、実際にはデコード完了済み。pending として見せると分母が膨らむので
-        // 差し引く (ただし 0 以下にはしない)。
-        let cur_normal = cur_normal_raw.saturating_sub(backlog_count);
+        let (normal, cur_upgrade, queued_normal) = self.requested.progress_counts(&self.keep_set);
+        let cur_normal = normal.saturating_sub(queued_normal);
 
         if cur_normal == 0 {
             self.progress_normal_peak = 0;
@@ -76073,8 +75883,6 @@ impl App {
             }
         }
         self.requested.remove(&idx);
-        self.pending_finalize.remove(&idx);
-        self.texture_backlog.retain(|msg| msg.idx != idx);
         self.thumb_pixels.remove(&idx);
         self.thumb_edit_preview_layers.remove(&idx);
         self.thumb_adjust_tex.remove(&idx);
@@ -90319,15 +90127,10 @@ impl App {
                     // 計装: window state と repaint 駆動条件を frame_gap に同梱する
                     // (2026-05-10、最小化中に App::update が止まらない問題の調査用)。
                     let is_minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
-                    let visible_video_thumb_pending = self.keep_set.iter().any(|&idx| {
-                        matches!(self.items.get(idx), Some(GridItem::Video(_)))
-                            && matches!(
-                                self.thumbnails.get(idx),
-                                Some(ThumbnailState::Pending | ThumbnailState::Evicted)
-                            )
-                    });
-                    let thumbnail_work_active = !self.requested.is_empty()
-                        || !self.texture_backlog.is_empty()
+                    let visible_video_thumb_pending =
+                        self.requested.video_image_pending(&self.keep_set);
+                    let thumbnail_work_active = self.requested.blocks_idle_upgrade()
+                        || self.requested.images_len() > 0
                         || visible_video_thumb_pending;
                     crate::perf::event(
                         "ui",
@@ -90376,11 +90179,11 @@ impl App {
                             ),
                             (
                                 "requested_len",
-                                serde_json::Value::from(self.requested.len() as i64),
+                                serde_json::Value::from(self.requested.legacy_len() as i64),
                             ),
                             (
                                 "texture_backlog_len",
-                                serde_json::Value::from(self.texture_backlog.len() as i64),
+                                serde_json::Value::from(self.requested.images_len() as i64),
                             ),
                             (
                                 "folder_nav_pending",
@@ -92398,13 +92201,7 @@ impl App {
         // 範囲外の `Pending` は「まだ先読み対象に入っていない」正常状態なので、
         // それだけで描画ループを回し続けると、大きなフォルダを開いたままでも
         // メインウィンドウがアイドルにならない。
-        let visible_video_thumb_pending = self.keep_set.iter().any(|&idx| {
-            matches!(self.items.get(idx), Some(GridItem::Video(_)))
-                && matches!(
-                    self.thumbnails.get(idx),
-                    Some(ThumbnailState::Pending | ThumbnailState::Evicted)
-                )
-        });
+        let visible_video_thumb_pending = self.requested.video_image_pending(&self.keep_set);
         // tail repaint の発火理由を perf event で記録する (2026-05-10 計装)。
         // 「アイドル中なのに 60fps で App::update が回り続けている」原因を特定する。
         // 個別の if/else が立ち上がった理由を reasons[] に積み、tail_repaint event として emit する。
@@ -92412,10 +92209,10 @@ impl App {
         if self.folder_nav_pending.is_some() {
             reasons.push("folder_nav_pending");
         }
-        if !self.requested.is_empty() {
+        if self.requested.blocks_idle_upgrade() {
             reasons.push("requested_nonempty");
         }
-        if !self.texture_backlog.is_empty() {
+        if self.requested.images_len() > 0 {
             reasons.push("texture_backlog_nonempty");
         }
         if visible_video_thumb_pending {
@@ -92579,8 +92376,8 @@ impl App {
                 (t_keep - t_poll).as_secs_f64() * 1000.0,
                 (t_pre_grid - t_keep).as_secs_f64() * 1000.0,
                 (t_grid - t_pre_grid).as_secs_f64() * 1000.0,
-                self.texture_backlog.len(),
-                self.requested.len(),
+                self.requested.images_len(),
+                self.requested.legacy_len(),
                 pre_grid_dominant,
             ));
         }
@@ -92715,11 +92512,11 @@ impl App {
                     ),
                     (
                         "texture_backlog",
-                        serde_json::Value::from(self.texture_backlog.len() as i64),
+                        serde_json::Value::from(self.requested.images_len() as i64),
                     ),
                     (
                         "requested",
-                        serde_json::Value::from(self.requested.len() as i64),
+                        serde_json::Value::from(self.requested.legacy_len() as i64),
                     ),
                     (
                         "fullscreen",
@@ -94569,6 +94366,7 @@ fn apply_folder_thumb_pin(
             folder_thumb_depth: base_req.folder_thumb_depth,
             folder_thumb_provenance: folder_provenance,
             idx: base_req.idx,
+            request_id: base_req.request_id,
             source_policy: LoadSourcePolicy::CacheOrSource,
             priority: base_req.priority,
             input_seq: base_req.input_seq,
@@ -94675,6 +94473,7 @@ fn apply_folder_thumb_pin(
         folder_thumb_depth: base_req.folder_thumb_depth,
         folder_thumb_provenance: folder_provenance,
         idx: base_req.idx,
+        request_id: base_req.request_id,
         source_policy: base_req.source_policy,
         priority: base_req.priority,
         input_seq: base_req.input_seq,

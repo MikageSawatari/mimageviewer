@@ -694,7 +694,6 @@ fn reset_audio_art_terminal_rows(
     parent: Option<&Path>,
     thumbnails: &mut [ThumbnailState],
     requested: &mut ThumbnailRequests,
-    pending_finalize: &mut std::collections::HashSet<usize>,
 ) -> usize {
     let mut changed = 0;
     for (idx, (item, state)) in items.iter().zip(thumbnails.iter_mut()).enumerate() {
@@ -711,13 +710,24 @@ fn reset_audio_art_terminal_rows(
         }
         *state = ThumbnailState::Evicted;
         requested.remove(&idx);
-        pending_finalize.remove(&idx);
         changed += 1;
     }
     changed
 }
 
 impl App {
+    #[cfg(all(test, windows))]
+    pub(in crate::app) fn set_viewer_context_generation_for_test(
+        &mut self,
+        id: ViewerContextId,
+        generation: u64,
+    ) {
+        match self.viewer_contexts.table.slots.get_mut(&id) {
+            Some(Slot::AtRest(bundle)) => bundle.set_items_generation(generation),
+            _ => panic!("generation fixture requires an at-rest context"),
+        }
+    }
+
     /// Explicit cache maintenance reopens only terminal audio requests. Mutate
     /// every living owner in place: no mount/swap, generation/cancel change,
     /// viewport routing, SQLite work, or loss of already displayed pixels.
@@ -730,7 +740,6 @@ impl App {
             parent,
             &mut self.thumbnails,
             &mut self.requested,
-            &mut self.pending_finalize,
         );
         #[cfg(windows)]
         for slot in self.viewer_contexts.table.slots.values_mut() {
@@ -742,7 +751,6 @@ impl App {
                 parent,
                 &mut bundle.thumbnails,
                 &mut bundle.requested,
-                &mut bundle.pending_finalize,
             );
         }
         changed
@@ -834,7 +842,6 @@ pub(in crate::app) struct ViewerContextBundle {
     details_thumb_suppression_applied: bool,
     details_hover_thumb_idx: Option<usize>,
     details_hover_thumb_viewport_open: bool,
-    texture_backlog: Vec<crate::thumb_loader::ThumbMsg>,
     details_order: Vec<usize>,
     details_order_revision: u64,
     details_cell_content_revisions: DetailsCellContentRevisions,
@@ -854,7 +861,6 @@ pub(in crate::app) struct ViewerContextBundle {
     tags_cache: std::collections::HashMap<String, Vec<String>>,
     tag_prewarm_pending: Option<crate::tag_prewarm::TagPrewarmPending>,
     tag_prewarm_queued: std::collections::HashSet<usize>,
-    pending_finalize: std::collections::HashSet<usize>,
     // ── per-context ロード複合体 (review-v2.3.0 P2-8/P2-9) ──
     // thumb channel (tx/rx)・cancel_token・ワーカーキュー 2 本は `start_loading_items` が
     // ロードごとに作り直す「現用セット」で、コンテキストに属する。bundle に含めないと
@@ -1705,6 +1711,12 @@ impl ContextMut<'_> {
 
 #[cfg(windows)]
 impl ViewerContextBundle {
+    #[cfg(test)]
+    fn send_thumbnail_for_test(&mut self, msg: ThumbMsg) -> Result<(), mpsc::SendError<ThumbMsg>> {
+        let msg = self.requested.correlate_fixture(msg);
+        self.tx.send(msg)
+    }
+
     /// この viewer context が所有する非同期 work を、context の terminal retire と同じ
     /// ownership 境界で停止する。
     ///
@@ -1786,6 +1798,7 @@ const _: () = {
 impl ViewerContextBundle {
     fn set_items_generation(&mut self, items_generation: u64) {
         if self.items_generation != items_generation {
+            self.requested.clear();
             crate::thumb_loader::cancel_raw_thumb_tickets(&self.raw_thumb_develop);
             self.raw_thumb_develop
                 .lock()
@@ -1871,7 +1884,6 @@ impl ViewerContextBundle {
             details_thumb_suppression_applied: false,
             details_hover_thumb_idx: None,
             details_hover_thumb_viewport_open: false,
-            texture_backlog: Vec::new(),
             details_order: Vec::new(),
             details_order_revision: 0,
             details_cell_content_revisions: DetailsCellContentRevisions::default(),
@@ -1888,7 +1900,6 @@ impl ViewerContextBundle {
             tags_cache: std::collections::HashMap::new(),
             tag_prewarm_pending: None,
             tag_prewarm_queued: std::collections::HashSet::new(),
-            pending_finalize: std::collections::HashSet::new(),
             tx,
             rx,
             cancel_token: Arc::new(AtomicBool::new(false)),
@@ -2129,7 +2140,7 @@ impl App {
         self.pending_folder_nav_steps = 0;
         self.pending_folder_nav_mode = FolderNavMode::Grid;
         crate::thumb_loader::cancel_raw_thumb_tickets(&self.raw_thumb_develop);
-        self.texture_backlog.clear();
+        self.requested.discard_images();
         debug_assert!(
             ContextAsyncOwner::ALL
                 .into_iter()
@@ -2244,7 +2255,6 @@ impl App {
             details_thumb_suppression_applied,
             details_hover_thumb_idx,
             details_hover_thumb_viewport_open,
-            texture_backlog,
             details_order,
             details_order_revision,
             details_cell_content_revisions,
@@ -2261,7 +2271,6 @@ impl App {
             tags_cache,
             tag_prewarm_pending,
             tag_prewarm_queued,
-            pending_finalize,
             tx,
             rx,
             cancel_token,
@@ -2520,7 +2529,6 @@ impl App {
         swap_field!(details_thumb_suppression_applied);
         swap_field!(details_hover_thumb_idx);
         swap_field!(details_hover_thumb_viewport_open);
-        swap_field!(texture_backlog);
         swap_field!(details_order);
         swap_field!(details_order_revision);
         swap_field!(details_cell_content_revisions);
@@ -2537,9 +2545,8 @@ impl App {
         swap_field!(tags_cache);
         swap_field!(tag_prewarm_pending);
         swap_field!(tag_prewarm_queued);
-        swap_field!(pending_finalize);
         // per-context ロード複合体 (review-v2.3.0 P2-8/P2-9)。channel/token/キューが
-        // コンテキストと一緒に移動するので、requested / pending_finalize の bookkeeping は
+        // コンテキストと一緒に移動するので、thumbnail request owner の bookkeeping は
         // swap 後もそのまま信用できる (末尾の clear は不要になった)。
         swap_field!(tx);
         swap_field!(rx);
@@ -2756,7 +2763,7 @@ impl App {
         swap_field!(music_bookmarks_loaded_for);
         swap_field!(last_loop_pos);
 
-        // 旧実装はここで requested / pending_finalize を無条件 clear していた (worker queue が
+        // 旧実装はここで thumbnail request owner を無条件 clear していた (worker queue が
         // App-global で、swap 後の bookkeeping を信用できなかったため)。detached 窓が 1 枚でも
         // あると mount/unmount + parked poll の swap が毎フレーム走るので、main の bookkeeping が
         // 毎フレーム消え、Pending サムネがフレームごとに重複エンキュー/重複デコードされる
@@ -2866,7 +2873,6 @@ impl App {
             details_thumb_suppression_applied,
             details_hover_thumb_idx,
             details_hover_thumb_viewport_open,
-            texture_backlog,
             details_order,
             details_order_revision,
             details_cell_content_revisions,
@@ -2883,7 +2889,6 @@ impl App {
             tags_cache,
             tag_prewarm_pending,
             tag_prewarm_queued,
-            pending_finalize,
             tx,
             rx,
             cancel_token,
@@ -3296,7 +3301,6 @@ impl App {
             details_thumb_suppression_applied,
             details_hover_thumb_idx,
             details_hover_thumb_viewport_open,
-            texture_backlog,
             details_tag_prewarm_indices,
             details_lazy_meta,
             details_meta_pending,
@@ -3310,7 +3314,6 @@ impl App {
             metadata_pending,
             tag_prewarm_pending,
             tag_prewarm_queued,
-            pending_finalize,
             tx,
             rx,
             cancel_token,
@@ -3410,9 +3413,7 @@ impl App {
             // metadata/edit caches and invalidate only generation-bound main work.
             self.bump_items_generation();
             self.viewer_navigation_caches.invalidate();
-            self.requested.clear();
-            self.pending_finalize.clear();
-            self.texture_backlog.clear();
+            // The generation setter retires requests and owned CPU images together.
             let basis_len = self.items.len();
             self.checked.retain(|idx| *idx < basis_len);
             self.rating_cache.retain(|idx, _| *idx < basis_len);
@@ -4555,7 +4556,9 @@ mod tests {
             for idx in 0..4 {
                 owner.requested.insert(idx, false);
             }
-            owner.pending_finalize = std::collections::HashSet::from([0, 1, 2, 3]);
+            for idx in [0, 1, 2, 3] {
+                owner.requested.mark_finalized_for_test(idx);
+            }
             owner.heavy_io_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
         };
         seed(&mut app, "c:/main");
@@ -4594,7 +4597,6 @@ mod tests {
         );
         let assert_rows = |states: &[ThumbnailState],
                            requested: &ThumbnailRequests,
-                           finalize: &std::collections::HashSet<usize>,
                            texture: egui::TextureId| {
             assert!(matches!(states[0], ThumbnailState::Evicted));
             assert!(matches!(states[1], ThumbnailState::Evicted));
@@ -4606,25 +4608,15 @@ mod tests {
             assert!(matches!(states[5], ThumbnailState::Loaded { .. }));
             assert!(!requested.contains_key(&0) && !requested.contains_key(&1));
             assert!(requested.contains_key(&2) && requested.contains_key(&3));
-            assert_eq!(finalize, &std::collections::HashSet::from([2, 3]));
+            assert!(requested.finalized_image_wait(2) && requested.finalized_image_wait(3));
         };
-        assert_rows(
-            &app.thumbnails,
-            &app.requested,
-            &app.pending_finalize,
-            current_snapshot.2,
-        );
+        assert_rows(&app.thumbnails, &app.requested, current_snapshot.2);
         assert_eq!(app.items_generation, current_snapshot.0);
         assert!(Arc::ptr_eq(&app.cancel_token, &current_snapshot.1));
         assert_eq!(app.cancel_token.load(Ordering::Relaxed), current_snapshot.3);
         for (id, generation, token, texture, canceled) in parked_snapshots {
             let owner = app.viewer_contexts.table.at_rest(id).unwrap();
-            assert_rows(
-                &owner.thumbnails,
-                &owner.requested,
-                &owner.pending_finalize,
-                texture,
-            );
+            assert_rows(&owner.thumbnails, &owner.requested, texture);
             assert_eq!(owner.items_generation, generation);
             assert!(Arc::ptr_eq(&owner.cancel_token, &token));
             assert_eq!(owner.cancel_token.load(Ordering::Relaxed), canceled);
@@ -4643,14 +4635,17 @@ mod tests {
             1
         );
         assert!(app.requested.contains_key(&0));
-        app.tx
-            .send(ThumbMsg {
+        send_thumbnail_for_test!(
+            app,
+            ThumbMsg {
+                request_id: crate::thumb_loader::ThumbnailRequestId::Standalone,
                 idx: 0,
                 payload: crate::thumb_loader::ThumbMsgPayload::NoArt,
                 input_seq: app.input_seq,
                 items_gen: app.items_generation,
-            })
-            .unwrap();
+            }
+        )
+        .unwrap();
         app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
         assert!(matches!(app.thumbnails[0], ThumbnailState::NoArt));
         app.enqueue_priority_thumbnail(0);

@@ -421,10 +421,13 @@ wipe/diff比較はpair生成時、360度パノラマはbase upload時だけ同�
 同時保持するerase / local-adjust / conceal / edit / final composite / comic / adjustment textureを
 TextureIdで重複排除して見積もり、補正レイヤーの比較previewも同じkeep-set evictionへ追従させる。
 
-### 3.2 サムネイルアップロードは per-frame スロットリング不要
+### 3.2 サムネイルアップロードは8枚/frameを維持
 
-`thumb.ready` の `upload_ms` は 1 枚 0.3-1ms 程度 (762×572 RGBA)。1 フレームに 50 枚来ても
-合計 50ms なので致命的ではない。サムネイルは特別なペーシングなしで OK。
+サムネイルの `load_texture` はGPU uploadを伴うため、既存の上限8枚/frameを維持する。
+上限超過のColorImageはcontext-localな `ThumbnailRequests` が要求と一緒に所有し、
+sourceのFinalizedが先に届いても画像の採用/破棄まで再enqueueを許可しない（§1.360）。
+表示がEvictedまたはLoaded高画質化中でも同じ契約であり、backlogを増やして予算を迂回しない。
+新しい同期I/O・decode・待機・timerは足さず、keep外動画retry全件の毎frame走査もしない。
 
 ---
 

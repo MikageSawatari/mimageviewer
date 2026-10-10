@@ -71,6 +71,18 @@ def session(pid: int) -> dict:
     return {"t": 0.0, "cat": "session", "kind": "start", "pid": pid}
 
 
+def modifier_probe(t: float = 2.0, **fields) -> dict:
+    return {
+        "t": t,
+        "cat": "input",
+        "kind": "modifier_probe",
+        "trigger": "heartbeat",
+        "keys": [],
+        "wheel": False,
+        **fields,
+    }
+
+
 def collection_lease(
     t: float,
     request_id: int,
@@ -1369,6 +1381,104 @@ class IdleHealthTests(unittest.TestCase):
 
         self.assertEqual(report["status"], "fail")
         self.assertEqual(report["metrics"]["input_events"], 1)
+
+    def test_passive_modifier_heartbeat_is_not_idle_input(self) -> None:
+        for focused in (True, False, None):
+            for ctrl in (True, False):
+                probe = modifier_probe(egui_ctrl=ctrl, os_ctrl=ctrl)
+                if focused is not None:
+                    probe["focused"] = focused
+                with self.subTest(focused=focused, ctrl=ctrl):
+                    events = [frame(0.0, 0), tail(0.0, 0), probe]
+                    report = analyze_idle_health(events, 0.0, 10.0)
+                    self.assertEqual(report["status"], "pass", report["failures"])
+                    self.assertEqual(report["metrics"]["input_events"], 0)
+                    self.assertEqual(report["metrics"]["events"], 3)
+                    self.assertEqual(report["metrics"]["frames"], 1)
+                    self.assertEqual(report["metrics"]["tail_repaint_events"], 1)
+
+    def test_modifier_key_press_release_and_wheel_are_idle_input(self) -> None:
+        probes = [
+            modifier_probe(trigger="key_event", keys=["ArrowRight:down"]),
+            modifier_probe(trigger="key_event", keys=["ArrowRight:up"]),
+            modifier_probe(trigger="wheel", wheel=True),
+            modifier_probe(trigger="key_event"),
+            modifier_probe(trigger="wheel"),
+            modifier_probe(kind="modified_action"),
+            modifier_probe(kind="unknown_input"),
+        ]
+        for probe in probes:
+            with self.subTest(probe=probe):
+                report = analyze_idle_health(
+                    [frame(0.0, 0), tail(0.0, 0), probe], 0.0, 10.0
+                )
+                self.assertEqual(report["status"], "fail")
+                self.assertEqual(report["metrics"]["input_events"], 1)
+                self.assertTrue(any("input event" in f for f in report["failures"]))
+
+    def test_contradictory_or_malformed_heartbeat_is_idle_input(self) -> None:
+        probes = [
+            modifier_probe(keys=["ArrowRight:down"]),
+            modifier_probe(wheel=True),
+            modifier_probe(keys=None),
+            modifier_probe(keys=""),
+            modifier_probe(keys={}),
+            modifier_probe(keys=()),
+            modifier_probe(keys=False),
+            modifier_probe(wheel=None),
+            modifier_probe(wheel=0),
+            modifier_probe(wheel="false"),
+            modifier_probe(trigger="unknown"),
+            modifier_probe(trigger=None),
+        ]
+        for field in ("kind", "trigger", "keys", "wheel"):
+            probe = modifier_probe()
+            del probe[field]
+            probes.append(probe)
+        for probe in probes:
+            with self.subTest(probe=probe):
+                report = analyze_idle_health(
+                    [frame(0.0, 0), tail(0.0, 0), probe], 0.0, 10.0
+                )
+                self.assertEqual(report["status"], "fail")
+                self.assertEqual(report["metrics"]["input_events"], 1)
+                self.assertTrue(any("input event" in f for f in report["failures"]))
+
+    def test_heartbeat_exclusion_preserves_work_and_repaint_failures(self) -> None:
+        for cause in ("work", "repaint"):
+            events = [frame(0.0, 0), tail(0.0, 0), modifier_probe()]
+            if cause == "work":
+                for n in range(4):
+                    events.append(
+                        {
+                            "t": 1.0 + n * 0.01,
+                            "cat": "thumb",
+                            "kind": "enqueue",
+                            "key": "dir::C:/books/uncached",
+                            "idx": 7,
+                            "items_gen": 42,
+                            "request_id": n,
+                        }
+                    )
+            else:
+                for n in range(5):
+                    t = 1.0 + n * 0.7
+                    events.append(frame(t, n + 1))
+                    events.append(tail(t, n + 1, ["requested_nonempty"]))
+            with self.subTest(cause=cause):
+                report = analyze_idle_health(events, 0.0, 10.0)
+                self.assertEqual(report["status"], "fail")
+                self.assertEqual(report["metrics"]["input_events"], 0)
+                self.assertEqual(report["metrics"]["events"], len(events))
+                self.assertFalse(any("input event" in f for f in report["failures"]))
+                if cause == "work":
+                    self.assertEqual(report["metrics"]["max_same_work"], 4)
+                    self.assertTrue(any("thumbnail work" in f for f in report["failures"]))
+                else:
+                    self.assertGreater(
+                        report["max_reason_streaks_secs"]["requested_nonempty"], 2.0
+                    )
+                    self.assertTrue(any("repaint reason" in f for f in report["failures"]))
 
     def test_low_frequency_repaint_loop_still_fails_reason_streak(self) -> None:
         events = [session(42)]

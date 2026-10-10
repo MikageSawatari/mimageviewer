@@ -50,15 +50,17 @@ impl App {
                 .or_else(|| match item { GridItem::Image(p)|GridItem::Video(p) => p.file_name().map(|p|p.to_string_lossy().into_owned()), _=>None })?;
             Some(json!({"key":item.perf_key(),"idx":i,"items_gen":self.items_generation,"cache_base_key":base}))
         }).collect();
+        // Match the grid's ordinary-work projection: video waits are accounted for
+        // by keep thumbnails, and archive-judgement demand is not worker activity.
         let complete = !keep.is_empty()
             && loaded == keep.len()
-            && self.requested.is_empty()
+            && !self.requested.blocks_idle_upgrade()
             && !snapshot.startup_open_pending;
         Observation {
             value: json!({"pid":std::process::id(),"root_hwnd":self.main_hwnd.map(|h|h as u64),"perf_t":crate::perf::program_start().map(|s|s.elapsed().as_secs_f64()),
                 "window_visible":self.window_visible,"focused":snapshot.focused,
                 "current_folder_path":snapshot.current_folder_path,"items_generation":self.items_generation,
-                "items_len":self.items.len(),"requested_count":self.requested.len(),
+                "items_len":self.items.len(),"requested_count":self.requested.legacy_len(),
                 "keep_count":keep.len(),"loaded_keep_count":loaded,
                 "requested_px":self.display_px_shared.load(std::sync::atomic::Ordering::Relaxed),
                 "loading_complete":complete,"index_settled":!self.initial_scan_settled_pending,
@@ -146,7 +148,7 @@ pub(crate) fn record_close_accept(app: &App) {
                 .get(i)
                 .is_some_and(ThumbnailState::is_terminal)
         })
-        && app.requested.is_empty();
+        && !app.requested.blocks_idle_upgrade();
     let mut targets = s.cache_proof["targets"]
         .as_array()
         .cloned()

@@ -59,6 +59,7 @@
 - 規模 / 優先度: Medium / P2 (次の版以降)。
 
 ### 1.360 トレイ常駐中に、キャッシュの無いフォルダのサムネイルを作り直し続け CPU を使う — v4.5.0 の idle health で検出 (2026-10-09)
+- **進捗 (2026-10-10)**: [寿命計画](thumbnail-request-lifecycle-plan.md)の独立設計再レビューACCEPT後、`next-tray`で実装・指定自動ゲート・確認build成功。全libは11457成功/0失敗/52既存ignore。修正前回帰は4成功/5失敗を確認。提供ログ再解析はinput=0 / 同一work最大116回 / FAIL維持。実機tray両ケースの検収は未実施で、完了扱いにしない。
 - **次の版の決定 (利用者 2026-10-09)**: v4.4.0 から入った退行ではないため、v4.5.0 はこのまま出荷し、次の版で優先して直す。
 - 観測 (利用者が配布ビルドの core で `check-idle-health.ps1 -Scenario tray-residency` を実施、`G:\home\comfyui`): 窓を全部隠した 15 秒間で CPU 1 コア比 0.44、描画 9.5 回/秒、`requested_nonempty` / `texture_backlog_nonempty` が 14.7 秒継続。フォルダのタイル idx 138 / 139 を heavy queue へ各 116 回 enqueue (decode_end は毎回 from_cache=false、保存省略)、他のタイルも idle_upgrade_enqueue 13 回。利用者の見立て: よく開かないフォルダで、サブフォルダ内の画像から作るフォルダサムネイルのキャッシュが無かった。v4.4.0 の同シナリオは別フォルダ (`H:\home\mimageviewer_old\testimage` が多い) で PASS。perf ログの写し: worktree mimageviewer-nextview の `target/trayloop/`。
 - 原因 (Codex 調査、コードの参照・未修正): トレイ格納時の `release_gpu_resources()` が `Loaded → Evicted` にし (`src/tray_integration.rs:450`)、隠れていても通常の再投入が続く (`src/app.rs:50774`)。worker は画像の後に `Finalized` を送るが、UI は 1 フレーム 8 枚までしかテクスチャ化せず残りは `texture_backlog` に残る (`src/app.rs:49567` / `49896`)。`Finalized` の `Evicted` 分岐が backlog に同じ要求の画像があるのを見ずに `requested` を解除し (`src/app.rs:49702`、由来 `ade512de84` 2026-04-21)、次のフレームで再投入される。idle upgrade も同型 (`Loaded` 分岐、`src/app.rs:49703` / `51377`)。隠れているときは 100ms 間隔の処理 (`20fb2db4b`) で排水が遅く、重複画像が積み上がる (backlog 最大 4,812 件)。見えているときも 8 枚の予算を超える再ロード / 高画質化で起こり得る (未確認)。
