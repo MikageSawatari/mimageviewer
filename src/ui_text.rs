@@ -10419,7 +10419,6 @@ mod tests {
     }
 
     fn bubble_body_rendered_width(fill: Option<Rgba>) -> f32 {
-        use egui_kittest::Harness;
         use std::sync::{Arc, Mutex};
 
         let measured = Arc::new(Mutex::new(0.0));
@@ -10435,7 +10434,7 @@ mod tests {
             auto_size: false,
             ..BubbleObject::default()
         };
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(PANEL_W + 32.0, 720.0))
             .build(move |ctx| {
                 if !fonts_ready {
@@ -10477,8 +10476,6 @@ mod tests {
 
     #[test]
     fn bubble_body_panel_frame_preserves_out_of_range_round_rect_half_width() {
-        use egui_kittest::Harness;
-
         let bubble = BubbleObject {
             shape: BubbleShape::RoundRect {
                 half_w: 950.0,
@@ -10488,7 +10485,7 @@ mod tests {
             auto_size: false,
             ..BubbleObject::default()
         };
-        let harness = Harness::builder()
+        let harness = crate::test_ui::builder()
             .with_size(egui::vec2(PANEL_W, 720.0))
             .build_ui_state(
                 |ui, state: &mut (BubbleObject, bool)| {
@@ -10513,8 +10510,6 @@ mod tests {
 
     #[test]
     fn marker_body_panel_frame_preserves_out_of_range_half_width() {
-        use egui_kittest::Harness;
-
         let marker = BubbleObject {
             shape: BubbleShape::RoundRect {
                 half_w: 950.0,
@@ -10525,7 +10520,7 @@ mod tests {
             auto_size: false,
             ..BubbleObject::default()
         };
-        let harness = Harness::builder()
+        let harness = crate::test_ui::builder()
             .with_size(egui::vec2(PANEL_W, 360.0))
             .build_ui_state(
                 |ui, state: &mut (BubbleObject, bool)| {
@@ -10550,8 +10545,6 @@ mod tests {
 
     #[test]
     fn annotation_arrow_panel_frame_preserves_out_of_range_half_width() {
-        use egui_kittest::Harness;
-
         let arrow = BubbleObject {
             shape: BubbleShape::Arrow {
                 half_w: 1200.0,
@@ -10563,7 +10556,7 @@ mod tests {
             auto_size: false,
             ..BubbleObject::default()
         };
-        let harness = Harness::builder()
+        let harness = crate::test_ui::builder()
             .with_size(egui::vec2(PANEL_W, 420.0))
             .build_ui_state(
                 |ui, state: &mut (BubbleObject, bool)| {
@@ -10588,15 +10581,13 @@ mod tests {
 
     #[test]
     fn annotation_add_dialog_snapshot_dark() {
-        use egui_kittest::Harness;
-
         let mut fonts_ready = false;
         let mut preset = AnnotationPreset::Rect;
         let mut shape_color = ANNOTATION_DEFAULT_COLOR;
         let mut marker_color = ANNOTATION_MARKER_DEFAULT_COLOR;
         let mut stroke = AnnotationStrokePreset::Standard;
         let mut cursor_thumbs = HashMap::new();
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(620.0, 460.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);

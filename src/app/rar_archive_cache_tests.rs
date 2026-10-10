@@ -17,6 +17,7 @@ const WORKER_TIMEOUT: Duration = Duration::from_secs(30);
 impl App {
     /// Shared headless adapter for archive-dialog tests outside App's private module boundary.
     pub(crate) fn poll_rar_archive_navigation_for_test(&mut self, ctx: &egui::Context) {
+        self.poll_sidecar_restore(ctx);
         self.settle_open_path_classification_for_test();
         self.poll_collection_history_transition(ctx);
     }
@@ -106,10 +107,28 @@ fn record_cache(app: &App, first: &Path, cached: &Path) {
         .unwrap();
 }
 
+fn load_settled_folder(app: &mut App, folder: PathBuf) {
+    app.load_folder(folder);
+    let ctx = egui::Context::default();
+    let deadline = Instant::now() + WORKER_TIMEOUT;
+    // The ordinary UI finishes identity preparation/first display before exposing the next
+    // handler action. Drive that existing owner instead of bypassing its admission barrier.
+    while app.sidecar_restore_active() {
+        app.poll_sidecar_restore(&ctx);
+        assert!(
+            Instant::now() < deadline,
+            "fixture first display did not settle"
+        );
+        std::thread::yield_now();
+    }
+}
+
 fn tick(app: &mut App, ctx: &egui::Context) {
+    app.poll_sidecar_restore(ctx);
     app.settle_open_path_classification_for_test();
     app.poll_collection_history_transition(ctx);
     app.poll_smart_folder(ctx);
+    app.poll_rating_view();
     let _ = ctx.run(egui::RawInput::default(), |ctx| {
         app.show_archive_convert_dialog(ctx);
     });
@@ -280,7 +299,9 @@ fn open_entry(app: &mut App, source: &Path, entry: Entry) {
                 || app.smart_folder_transition.is_some()
                 || app.smart_folder_pending.is_some()
                 || app.smart_folder_prepare_pending.is_some()
+                || app.sidecar_restore_active()
             {
+                app.poll_sidecar_restore(&ctx);
                 app.poll_smart_folder(&ctx);
                 assert!(Instant::now() < deadline, "Smart root did not settle");
                 std::thread::yield_now();
@@ -313,8 +334,10 @@ fn open_entry(app: &mut App, source: &Path, entry: Entry) {
                 )
                 .unwrap();
             app.enter_rating_view_from_menu(4);
+            let ctx = egui::Context::default();
             let deadline = Instant::now() + WORKER_TIMEOUT;
-            while app.rating_view_pending.is_some() {
+            while app.rating_view_pending.is_some() || app.sidecar_restore_active() {
+                app.poll_sidecar_restore(&ctx);
                 app.poll_rating_view();
                 assert!(Instant::now() < deadline, "Rating root did not settle");
                 std::thread::yield_now();
@@ -435,7 +458,7 @@ fn retained_reader_cache_hit(entry: Entry) {
     // Deterministically fail any attempted conversion even if sharing differs on this host.
     // Cache reuse must not create a .part writer or replace the existing ZIP.
     std::fs::create_dir(cached.with_extension("zip.part")).unwrap();
-    app.load_folder(first.parent().unwrap().to_path_buf());
+    load_settled_folder(&mut app, first.parent().unwrap().to_path_buf());
     open_entry(&mut app, &first, entry);
     wait_for_book(&mut app, &cached);
     assert_eq!(
@@ -557,7 +580,7 @@ fn rar_archive_cache_first_conversion_delete_reconvert_resume_meter_keep_first_k
     let (first, later) = fixture(&app, true);
     let cached = crate::archive_cache::cache_zip_path_for_data_dir(app.tmp.path(), &first);
     assert!(!cached.exists());
-    app.load_folder(first.parent().unwrap().to_path_buf());
+    load_settled_folder(&mut app, first.parent().unwrap().to_path_buf());
     open_normal(&mut app, &first);
     wait_for_book(&mut app, &cached);
     assert_eq!(app.try_archive_cache_lookup(&first), Some(cached.clone()));
@@ -572,7 +595,7 @@ fn rar_archive_cache_first_conversion_delete_reconvert_resume_meter_keep_first_k
     );
     settle_resume(&mut app);
     let expected = crate::book_resume_db::ReadingMeterValue::new(1, 1);
-    app.load_folder(first.parent().unwrap().to_path_buf());
+    load_settled_folder(&mut app, first.parent().unwrap().to_path_buf());
     refresh_meter(&mut app, &first);
     assert_eq!(app.thumbnail_book_resume_meter(0), expected);
 
@@ -605,7 +628,7 @@ fn rar_archive_cache_first_conversion_delete_reconvert_resume_meter_keep_first_k
     assert_eq!(app.resume_page_for_container(), Some(0));
     assert_eq!(app.try_archive_cache_lookup(&first), Some(cached.clone()));
     assert!(app.try_archive_cache_lookup(&later).is_none());
-    app.load_folder(first.parent().unwrap().to_path_buf());
+    load_settled_folder(&mut app, first.parent().unwrap().to_path_buf());
     refresh_meter(&mut app, &first);
     assert_eq!(app.thumbnail_book_resume_meter(0), expected);
 }
@@ -622,7 +645,7 @@ fn rar_archive_cache_direct_first_volume_has_priority_over_old_conversion_cache(
         .reserve_cache_zip_path(&first)
         .unwrap();
     record_cache(&app, &first, &cached);
-    app.load_folder(first.parent().unwrap().to_path_buf());
+    load_settled_folder(&mut app, first.parent().unwrap().to_path_buf());
     open_normal(&mut app, &first);
     wait_for_book(&mut app, &first);
     // Direct reads and saves at the opened first RAR despite an old conversion cache.
@@ -632,7 +655,7 @@ fn rar_archive_cache_direct_first_volume_has_priority_over_old_conversion_cache(
     );
     app.record_book_resume(0);
     assert_eq!(
-        app.last_book_resume.as_ref().map(|(key, _, _)| key),
+        app.last_book_resume.as_ref().map(|(key, _, _, _)| key),
         Some(&first)
     );
     assert_eq!(app.try_archive_cache_lookup(&first), Some(cached));
@@ -650,7 +673,7 @@ fn rar_archive_cache_completed_probe_cancelled_before_adoption_keeps_new_folder(
         .reserve_cache_zip_path(&first)
         .unwrap();
     record_cache(&app, &first, &cached);
-    app.load_folder(first.parent().unwrap().to_path_buf());
+    load_settled_folder(&mut app, first.parent().unwrap().to_path_buf());
     open_normal(&mut app, &first);
     // Hold the actual worker result between completion and UI adoption. Requeue that exact
     // message so the test does not construct a synthetic summary/cache outcome.
@@ -698,7 +721,7 @@ fn later_volume_refused_with_cache(entry: Entry, solid: bool, install_cache: boo
         None
     };
     let _reader = install_cache.then(|| crate::zip_loader::open_archive(&cached).unwrap());
-    app.load_folder(first.parent().unwrap().to_path_buf());
+    load_settled_folder(&mut app, first.parent().unwrap().to_path_buf());
     open_entry(&mut app, &later, entry);
     let ctx = egui::Context::default();
     let deadline = Instant::now() + WORKER_TIMEOUT;
@@ -842,13 +865,13 @@ fn rar_archive_cache_single_volume_with_later_looking_filename_still_opens_direc
         })
         .unwrap();
     std::fs::copy(fixture, &single).unwrap();
-    app.load_folder(root);
+    load_settled_folder(&mut app, root);
     open_normal(&mut app, &single);
     wait_for_book(&mut app, &single);
     assert!(app.try_archive_cache_lookup(&single).is_none());
     app.record_book_resume(0);
     assert_eq!(
-        app.last_book_resume.as_ref().map(|(key, _, _)| key),
+        app.last_book_resume.as_ref().map(|(key, _, _, _)| key),
         Some(&single)
     );
 }

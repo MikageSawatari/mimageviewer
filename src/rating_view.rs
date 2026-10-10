@@ -70,6 +70,7 @@ pub struct RatingViewBuildResult {
     pub stars: u8,
     pub rows: Vec<RatingViewRow>,
     pub skipped: usize,
+    pub(crate) visibility_notice: Option<crate::archive_visibility::ArchiveVisibilityNotice>,
     pub(crate) prepared: Option<RatingViewPreparedItems>,
 }
 
@@ -90,6 +91,7 @@ pub(crate) struct RatingViewPreparedItems {
 
 pub(crate) struct RatingViewPrepareOptions {
     pub(crate) sort: RatingViewSort,
+    pub(crate) visibility: crate::file_type_visibility::FileTypeVisibility,
     pub(crate) include_epub: bool,
     pub(crate) intent: RatingViewBuildIntent,
     pub(crate) display_order: crate::settings::GridDisplayOrder,
@@ -196,6 +198,7 @@ fn build_rating_view_rows(
         stars,
         rows: out,
         skipped,
+        visibility_notice: None,
         prepared: None,
     })
 }
@@ -216,6 +219,12 @@ fn prepare_rating_view(
             !matches!(&row.item, GridItem::PdfFile(path) if path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("epub")))
         });
     }
+    // Project whole rows before sorting/materialization so source keys, rating times and
+    // display metadata stay aligned. The rating database remains the full stored catalog.
+    let mut visibility =
+        crate::archive_visibility::ArchiveVisibilityProjection::new(&options.visibility, cancel);
+    result.rows.retain(|row| visibility.allows_item(&row.item));
+    result.visibility_notice = visibility.notice();
     if cancel.load(Ordering::Relaxed) {
         return Err("cancelled".into());
     }
@@ -287,7 +296,7 @@ fn prepare_rating_view(
         .iter()
         .zip(image_metas.iter())
         .flat_map(|(item, meta)| {
-            crate::app::folder_thumb_existing_keys_for(
+            crate::app::folder_thumb_existing_keys_for_with_visibility(
                 item,
                 *meta,
                 &pin_map,
@@ -295,6 +304,7 @@ fn prepare_rating_view(
                 Some(options.folder_thumb_sort),
                 options.folder_thumb_depth,
                 true,
+                &options.visibility,
             )
         })
         .collect();
@@ -399,6 +409,16 @@ pub fn sort_and_materialize_rows(
     sort: RatingViewSort,
     display_order: &crate::settings::GridDisplayOrder,
 ) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
+    sort_and_materialize_rows_with_visibility(rows, sort, display_order, &Default::default())
+}
+
+pub fn sort_and_materialize_rows_with_visibility(
+    rows: &mut Vec<RatingViewRow>,
+    sort: RatingViewSort,
+    display_order: &crate::settings::GridDisplayOrder,
+    visibility: &crate::file_type_visibility::FileTypeVisibility,
+) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
+    rows.retain(|row| visibility.allows_grid_item(&row.item));
     sort_rows(rows, sort);
     crate::grid_item::materialize_view_rows(
         rows,
@@ -705,6 +725,92 @@ mod tests {
     use super::*;
     use crate::rating_db::{RatingItemKind, RatingRow};
     use std::io::Write;
+
+    #[test]
+    fn visibility_rating_worker_preserves_cache_proof_and_ratings_without_current_source() {
+        for missing_source in [false, true] {
+            let _epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+            let guard = crate::data_dir::TestDataDirGuard::new();
+            let (source, cached) =
+                crate::archive_visibility::legacy_conversion_fixture(guard.path());
+            let source_bytes = std::fs::read(&source).unwrap();
+            let db_path = guard.path().join("rating.db");
+            let db = crate::rating_db::RatingDb::open_at(&db_path).unwrap();
+            for member in [
+                "root.jpg",
+                "chapter.zip/page.jpg",
+                "notes.zip/page.jpg",
+                "missing.jpg",
+            ] {
+                let mut meta =
+                    crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::ZipImage)
+                        .with_source_path(&cached);
+                meta.entry_name = Some(member.into());
+                db.set_user_rating(
+                    &format!("{}::{member}", cached.to_string_lossy()),
+                    4,
+                    Some(&meta),
+                )
+                .unwrap();
+            }
+            let stored = db.list_by_stars(4).unwrap();
+            let invalidate_source = || {
+                if missing_source {
+                    std::fs::remove_file(&source).unwrap();
+                } else {
+                    std::fs::write(&source, b"changed original archive").unwrap();
+                }
+            };
+            let options = || RatingViewPrepareOptions {
+                sort: RatingViewSort::default(),
+                include_epub: true,
+                intent: RatingViewBuildIntent::Reorder,
+                visibility: crate::file_type_visibility::FileTypeVisibility {
+                    excluded_categories: [crate::file_type_visibility::FileTypeCategory::Zip]
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                },
+                display_order: Default::default(),
+                pin_db: None,
+                folder_thumb_sort: crate::settings::SortOrder::FileName,
+                folder_thumb_depth: 0,
+                edits: Default::default(),
+                tags_db_path: None,
+                sidecar_settings: crate::settings::Settings::default(),
+            };
+            invalidate_source();
+            let legacy =
+                prepare_rating_view(db_path.clone(), 4, options(), &AtomicBool::new(false))
+                    .unwrap();
+            assert_eq!(legacy.rows.len(), 1);
+            assert!(
+                matches!(&legacy.rows[0].item, GridItem::ZipImage { entry_name, .. } if entry_name == "missing.jpg")
+            );
+            assert_eq!(legacy.prepared.unwrap().items.len(), 1);
+            assert_eq!(
+                legacy.visibility_notice,
+                Some(crate::archive_visibility::ArchiveVisibilityNotice::LegacyConvertedCache)
+            );
+            assert_eq!(stored, db.list_by_stars(4).unwrap());
+            std::fs::write(&source, &source_bytes).unwrap();
+            crate::archive_visibility::regenerate_conversion_fixture(&source, &cached);
+            let restored =
+                prepare_rating_view(db_path.clone(), 4, options(), &AtomicBool::new(false))
+                    .unwrap();
+            assert_eq!(restored.rows.len(), 3);
+            assert_eq!(restored.prepared.unwrap().items.len(), 3);
+            assert_eq!(restored.visibility_notice, None);
+            invalidate_source();
+            let direct =
+                prepare_rating_view(db_path, 4, options(), &AtomicBool::new(false)).unwrap();
+            assert_eq!(direct.rows.len(), 3);
+            assert!(direct.rows.iter().all(|row| !matches!(&row.item, GridItem::ZipImage { entry_name, .. } if entry_name == "chapter.zip/page.jpg")));
+            assert_eq!(direct.prepared.unwrap().items.len(), 3);
+            assert_eq!(direct.visibility_notice, None);
+            assert_eq!(stored, db.list_by_stars(4).unwrap());
+        }
+    }
 
     #[test]
     fn rating_view_normalizes_its_selected_rating_sort_only() {
@@ -1116,13 +1222,51 @@ mod tests {
         assert_eq!(rows[2].rated_at_ms, None);
     }
     #[test]
-    fn audio_sidecar_is_prepared_by_rating_worker_with_released_setting_off_preserved() {
+    fn rating_visibility_projects_rows_metadata_and_preserves_database_membership() {
+        let temp = tempfile::tempdir().unwrap();
+        let hidden = temp.path().join("hidden.png");
+        let visible = temp.path().join("visible.jpg");
+        std::fs::write(&hidden, b"png").unwrap();
+        std::fs::write(&visible, b"jpeg").unwrap();
+        let db_path = temp.path().join("rating.db");
+        let db = crate::rating_db::RatingDb::open_at(&db_path).unwrap();
+        db.set(&hidden.to_string_lossy(), 4).unwrap();
+        db.set(&visible.to_string_lossy(), 4).unwrap();
+        drop(db);
+        let mut result =
+            build_rating_view_rows(db_path.clone(), 4, &AtomicBool::new(false)).unwrap();
+        assert_eq!(result.rows.len(), 2);
+        let mut visibility = crate::file_type_visibility::FileTypeVisibility::default();
+        visibility.excluded_extensions.insert("png".into());
+        let (items, metadata) = sort_and_materialize_rows_with_visibility(
+            &mut result.rows,
+            RatingViewSort::RatedAtDesc,
+            &Default::default(),
+            &visibility,
+        );
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(items, vec![result.rows[0].item.clone()]);
+        assert_eq!(metadata, vec![result.rows[0].image_meta]);
+        assert_eq!(metadata[0].unwrap().1, 4);
+        assert_eq!(
+            crate::rating_db::RatingDb::open_readonly(&db_path)
+                .unwrap()
+                .list_by_stars(4)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn rating_worker_keeps_selected_sidecar_when_only_its_image_kind_is_hidden() {
         let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
-        let audio = temp.path().join("song.flac");
-        let cover = temp.path().join("song.png");
-        std::fs::write(&audio, b"flac").unwrap();
-        std::fs::write(&cover, b"image").unwrap();
+        let audio = temp.path().join("song.mp3");
+        let png = audio.with_extension("png");
+        for path in [&audio, &audio.with_extension("jpg"), &png] {
+            std::fs::write(path, b"fixture").unwrap();
+        }
         let db_path = temp.path().join("rating.db");
         let db = crate::rating_db::RatingDb::open_at(&db_path).unwrap();
         let key = crate::path_key::normalize_keep_drive(&audio);
@@ -1130,14 +1274,30 @@ mod tests {
             crate::rating_db::RatingMeta::new(RatingItemKind::Audio).with_source_path(&audio);
         db.set_user_rating(&key, 3, Some(&meta)).unwrap();
         drop(db);
-        for enabled in [true, false] {
+        let mut adopted: Option<PathBuf> = None;
+        for hide_adopted in [false, true] {
             let mut settings = crate::settings::Settings::default();
-            settings.video_thumb_use_sidecar_image = enabled;
+            settings.sort_order = crate::settings::SortOrder::FileName;
+            settings.skip_image_if_video_exists = true;
+            settings.video_thumb_use_sidecar_image = true;
+            if hide_adopted {
+                settings.file_type_visibility.excluded_extensions.insert(
+                    adopted
+                        .as_ref()
+                        .unwrap()
+                        .extension()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_owned(),
+                );
+            }
             let result = prepare_rating_view(
                 db_path.clone(),
                 3,
                 RatingViewPrepareOptions {
                     sort: RatingViewSort::default(),
+                    visibility: settings.file_type_visibility.clone(),
                     include_epub: true,
                     intent: RatingViewBuildIntent::Reorder,
                     display_order: settings.grid_display_order.clone(),
@@ -1152,10 +1312,76 @@ mod tests {
             )
             .unwrap();
             let prepared = result.prepared.unwrap();
-            assert!(matches!(&prepared.items[..], [GridItem::Audio(path)] if path == &audio));
+            assert_eq!(prepared.items, vec![GridItem::Audio(audio.clone())]);
+            let selected = prepared.video_thumb_overrides.get(&key).unwrap();
+            if let Some(adopted) = &adopted {
+                assert_eq!(selected, adopted);
+            } else {
+                assert!([audio.with_extension("jpg"), png.clone()].contains(selected));
+                adopted = Some(selected.clone());
+            }
+        }
+    }
+
+    #[test]
+    fn audio_sidecar_is_prepared_by_rating_worker_with_released_setting_off_preserved() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let audio = temp.path().join("song.flac");
+        let cover = temp.path().join("song.png");
+        std::fs::write(&audio, b"flac").unwrap();
+        std::fs::write(&cover, b"image").unwrap();
+        let db_path = temp.path().join("rating.db");
+        let db = crate::rating_db::RatingDb::open_at(&db_path).unwrap();
+        let key = crate::path_key::normalize_keep_drive(&audio);
+        let meta =
+            crate::rating_db::RatingMeta::new(RatingItemKind::Audio).with_source_path(&audio);
+        db.set_user_rating(&key, 3, Some(&meta)).unwrap();
+        drop(db);
+        for (enabled, hide_audio) in [(true, false), (false, false), (true, true)] {
+            let mut settings = crate::settings::Settings::default();
+            settings.video_thumb_use_sidecar_image = enabled;
+            // Sidecar images are metadata resources even when ordinary images are excluded.
+            settings
+                .file_type_visibility
+                .excluded_categories
+                .insert(crate::file_type_visibility::FileTypeCategory::Image);
+            if hide_audio {
+                settings
+                    .file_type_visibility
+                    .excluded_categories
+                    .insert(crate::file_type_visibility::FileTypeCategory::Audio);
+            }
+            let result = prepare_rating_view(
+                db_path.clone(),
+                3,
+                RatingViewPrepareOptions {
+                    sort: RatingViewSort::default(),
+                    visibility: settings.file_type_visibility.clone(),
+                    include_epub: true,
+                    intent: RatingViewBuildIntent::Reorder,
+                    display_order: settings.grid_display_order.clone(),
+                    pin_db: None,
+                    folder_thumb_sort: settings.folder_thumb_sort,
+                    folder_thumb_depth: settings.folder_thumb_depth,
+                    edits: Default::default(),
+                    tags_db_path: None,
+                    sidecar_settings: settings.thumbnail_source_discovery_snapshot(),
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            let prepared = result.prepared.unwrap();
+            if hide_audio {
+                assert!(prepared.items.is_empty());
+                assert!(prepared.image_metas.is_empty());
+                assert!(result.rows.is_empty());
+            } else {
+                assert!(matches!(&prepared.items[..], [GridItem::Audio(path)] if path == &audio));
+            }
             assert_eq!(
                 prepared.video_thumb_overrides.get(&key),
-                enabled.then_some(&cover)
+                (enabled && !hide_audio).then_some(&cover)
             );
         }
     }

@@ -601,6 +601,28 @@ impl SearchIndexDb {
         mode: crate::search_query::MatchMode,
         include_epub: bool,
     ) -> rusqlite::Result<Vec<IndexEntry>> {
+        self.search_with_visibility(
+            query,
+            favorite_roots,
+            kind,
+            mode,
+            include_epub,
+            &Default::default(),
+        )
+    }
+
+    /// Apply the shared list policy before the visible result cap without removing stored
+    /// index rows. Restricted policies stream the sorted query until enough visible rows are
+    /// found; the all-visible policy retains the released SQLite LIMIT fast path.
+    pub fn search_with_visibility(
+        &self,
+        query: &str,
+        favorite_roots: &[PathBuf],
+        kind: Option<IndexKind>,
+        mode: crate::search_query::MatchMode,
+        include_epub: bool,
+        visibility: &crate::file_type_visibility::FileTypeVisibility,
+    ) -> rusqlite::Result<Vec<IndexEntry>> {
         let tokens = crate::search_query::parse(query);
 
         let conn = self.conn.lock().unwrap();
@@ -662,12 +684,16 @@ impl SearchIndexDb {
             where_clauses.join(" AND ")
         };
 
+        let limit_sql = if visibility.is_all_visible() {
+            format!(" LIMIT {SEARCH_RESULT_LIMIT}")
+        } else {
+            String::new()
+        };
         let sql = format!(
             "SELECT display_path, display_name, kind, mtime \
              FROM entries \
              WHERE {where_sql} \
-             ORDER BY display_name COLLATE NOCASE \
-             LIMIT {SEARCH_RESULT_LIMIT}"
+             ORDER BY display_name COLLATE NOCASE{limit_sql}"
         );
 
         let mut stmt = conn.prepare(&sql)?;
@@ -701,7 +727,32 @@ impl SearchIndexDb {
             })
         })?;
 
-        Ok(rows.flatten().collect())
+        if visibility.is_all_visible() {
+            Ok(rows.flatten().collect())
+        } else {
+            use crate::file_type_visibility::FileTypeCategory as C;
+            Ok(rows
+                .flatten()
+                .filter(|entry| match entry.kind {
+                    IndexKind::Folder => true,
+                    IndexKind::ZipFile => visibility.allows_path(C::Zip, &entry.path),
+                    IndexKind::VideoFile => visibility.allows_path(C::Video, &entry.path),
+                    IndexKind::PdfFile => visibility.allows_path(
+                        if entry
+                            .path
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+                        {
+                            C::Epub
+                        } else {
+                            C::Pdf
+                        },
+                        &entry.path,
+                    ),
+                })
+                .take(SEARCH_RESULT_LIMIT)
+                .collect())
+        }
     }
 
     /// DB 内の総エントリ数を返す (UI 表示用)。
@@ -1015,6 +1066,63 @@ mod tests {
             kind,
             mtime: 0,
         }
+    }
+
+    #[test]
+    fn search_visibility_filters_before_visible_limit_and_preserves_full_index() {
+        use crate::file_type_visibility::{FileTypeCategory, FileTypeVisibility};
+        use crate::search_query::MatchMode;
+
+        let db = open_mem();
+        let root = Path::new("C:/fav");
+        let mut indexed = (0..SEARCH_RESULT_LIMIT + 1)
+            .map(|n| {
+                entry(
+                    &format!("C:/fav/aaa-book-{n:05}.zip"),
+                    &format!("aaa-book-{n:05}.zip"),
+                    IndexKind::ZipFile,
+                )
+            })
+            .collect::<Vec<_>>();
+        indexed.push(entry(
+            "C:/fav/yyy-book.zip",
+            "yyy-book.zip",
+            IndexKind::Folder,
+        ));
+        indexed.push(entry(
+            "C:/fav/zzz-book.pdf",
+            "zzz-book.pdf",
+            IndexKind::PdfFile,
+        ));
+        db.upsert_children(root, root, &indexed).unwrap();
+
+        let mut policy = FileTypeVisibility::default();
+        policy.excluded_categories.insert(FileTypeCategory::Zip);
+        let visible = db
+            .search_with_visibility("book", &[root.into()], None, MatchMode::And, true, &policy)
+            .unwrap();
+        assert_eq!(visible.len(), 2);
+        assert_eq!(visible[0].kind, IndexKind::Folder);
+        assert_eq!(visible[1].path, Path::new("C:/fav/zzz-book.pdf"));
+        assert_eq!(db.total_count().unwrap(), indexed.len() as u64);
+
+        let all_visible = db
+            .search("book", &[root.into()], None, MatchMode::And)
+            .unwrap();
+        assert_eq!(all_visible.len(), SEARCH_RESULT_LIMIT);
+        assert!(
+            all_visible
+                .iter()
+                .all(|entry| entry.kind == IndexKind::ZipFile)
+        );
+
+        policy.excluded_categories.clear();
+        policy.excluded_extensions.insert("zip".into());
+        let extension_filtered = db
+            .search_with_visibility("book", &[root.into()], None, MatchMode::And, true, &policy)
+            .unwrap();
+        assert_eq!(extension_filtered.len(), 2);
+        assert_eq!(extension_filtered[0].kind, IndexKind::Folder);
     }
 
     #[test]

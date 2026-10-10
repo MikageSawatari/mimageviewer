@@ -61,6 +61,7 @@ fn settle_book(app: &mut App) {
         );
         std::thread::yield_now();
     }
+    app.finish_page_identity_preparation_for_test();
 }
 
 fn open_zip(app: &mut App, path: &Path, direct: bool) {
@@ -110,6 +111,7 @@ fn book_env() -> (phase_c_support::AppTestEnv, PathBuf, PathBuf) {
     env.settings.auto_fullscreen_zip_pdf = true;
     env.settings.restore_last_cursor = true;
     env.load_folder(parent.clone());
+    env.finish_page_identity_preparation_for_test();
     assert_physical(&env, &parent, None);
     (env, parent, book)
 }
@@ -210,8 +212,10 @@ fn section1335_nested_zip_previous_rebuilds_effective_prefix_and_back_stack() {
     );
     open_zip(&mut env, &book, false);
     env.zip_nav_enter("shelf/");
+    env.finish_page_identity_preparation_for_test();
     assert_physical(&env, &book, Some("shelf/"));
     env.zip_nav_enter("shelf/book/");
+    env.finish_page_identity_preparation_for_test();
     assert_eq!(
         env.zip_nav.as_ref().unwrap().current(),
         &["shelf", "book", "only"]
@@ -225,6 +229,7 @@ fn section1335_nested_zip_previous_rebuilds_effective_prefix_and_back_stack() {
         &["shelf", "book", "only"]
     );
     assert!(env.zip_nav_back());
+    env.finish_page_identity_preparation_for_test();
     assert_eq!(env.zip_nav.as_ref().unwrap().current(), &["shelf"]);
     assert_physical(&env, &book, Some("shelf/"));
     let selected = env.selected.unwrap();
@@ -232,6 +237,7 @@ fn section1335_nested_zip_previous_rebuilds_effective_prefix_and_back_stack() {
         matches!(&env.items[selected], GridItem::ZipDir { dir_prefix, .. } if dir_prefix == "shelf/book/")
     );
     assert!(env.zip_nav_back());
+    env.finish_page_identity_preparation_for_test();
     assert_physical(&env, &book, Some(""));
 }
 
@@ -241,10 +247,12 @@ fn section1335_reading_zip_dfs_preserves_last_explicit_prefix() {
     write_zip(&book, &["first/a.png", "second/b.png"]);
     open_zip(&mut env, &book, false);
     env.zip_nav_enter("first/");
+    env.finish_page_identity_preparation_for_test();
     assert_physical(&env, &book, Some("first/"));
     env.open_fullscreen(0, HistoryTrigger::UserChosen);
     let before = env.settings.startup_list_restore.clone();
     assert!(env.zip_nav_dfs_fullscreen(None, 0, true));
+    env.finish_page_identity_preparation_for_test();
     assert_eq!(env.zip_nav.as_ref().unwrap().current(), &["second"]);
     assert!(env.fullscreen_idx.is_some());
     assert_eq!(env.settings.startup_list_restore, before);
@@ -408,6 +416,7 @@ fn section1335_single_image_startup_and_required_page_scan_do_not_adopt_parent_l
                 OpenRequestOwner::Navigation,
                 StartupListIntent::PageContinuation
             ));
+            env.finish_page_identity_preparation_for_test();
             env.open_fullscreen(0, HistoryTrigger::UserChosen);
             env.open_required_fullscreen_location(
                 &ctx,
@@ -485,6 +494,7 @@ fn section1335_snapshot_and_reading_history_direct_pages_keep_physical_restore_r
         let before = env.settings.startup_list_restore.clone();
         if snapshot {
             env.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+            env.finish_page_identity_preparation_for_test();
             assert!(env.is_snapshot_active());
             env.open_fullscreen(0, HistoryTrigger::UserChosen);
         } else {
@@ -509,6 +519,7 @@ fn section1335_subfolder_scan_reinstall_and_read_close_preserve_parent_cursor() 
     let page = child.join("aggregate.png");
     std::fs::write(&page, png_bytes()).unwrap();
     env.load_folder(parent.clone());
+    env.finish_page_identity_preparation_for_test();
     env.selected = env
         .items
         .iter()
@@ -669,6 +680,7 @@ fn section1335_prepared_pdf_adoption_keeps_direct_and_explicit_list_intents() {
         supply_prepared_pdf(&mut env, 2);
         assert_eq!(env.settings.startup_list_restore, before);
         env.poll_collection_history_transition(&egui::Context::default());
+        env.finish_page_identity_preparation_for_test();
         assert_eq!(env.current_folder.as_ref(), Some(&pdf));
         assert_eq!(env.items.len(), 2);
         assert!(env.pdf_enumerate_pending.is_none());
@@ -712,6 +724,7 @@ fn section1335_warm_pdf_verification_does_not_reinterpret_original_presentation_
             ),
             FolderOpenOutcome::Loaded
         );
+        env.finish_page_identity_preparation_for_test();
         assert_eq!(env.items.len(), 2);
         assert!(matches!(
             env.pdf_enumerate_pending.as_ref().map(|pending| &pending.5),
@@ -741,6 +754,7 @@ fn section1335_warm_pdf_verification_does_not_reinterpret_original_presentation_
                 }),
             );
         env.poll_pdf_enumerate();
+        env.finish_page_identity_preparation_for_test();
         assert!(env.pdf_enumerate_pending.is_none());
         assert_eq!(env.items.len(), actual_count as usize);
         assert_eq!(
@@ -755,6 +769,7 @@ fn wait_smart(app: &mut App) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         app.poll_smart_folder(&ctx);
+        app.finish_page_identity_preparation_for_test();
         if app.smart_folder_transition.is_none()
             && app.smart_folder_pending.is_none()
             && app.smart_folder_prepare_pending.is_none()
@@ -868,6 +883,7 @@ fn section1335_collection_root_child_and_descendant_use_adopted_physical_locatio
                 StartupListIntent::ExplicitList
             }
         ));
+        env.finish_page_identity_preparation_for_test();
         assert_eq!(env.effective_folder().as_ref(), Some(&child));
         if direct {
             assert_physical(&env, &parent, None);
@@ -889,6 +905,7 @@ fn section1335_collection_root_child_and_descendant_use_adopted_physical_locatio
             OpenRequestOwner::CollectionGridPhysical(owner),
             StartupListIntent::ExplicitList
         ));
+        env.finish_page_identity_preparation_for_test();
         assert_eq!(env.effective_folder().as_ref(), Some(&descendant));
         assert_physical(&env, &descendant, None);
     }
@@ -972,6 +989,7 @@ fn wait_stack(app: &mut App, ctx: &egui::Context) {
         );
         std::thread::yield_now();
     }
+    app.finish_page_identity_preparation_for_test();
 }
 
 #[test]
@@ -990,6 +1008,7 @@ fn section1335_flat_filename_stack_acceptance_never_persists_member_name_as_aggr
         OpenRequestOwner::Navigation,
         StartupListIntent::PageContinuation
     ));
+    env.finish_page_identity_preparation_for_test();
     assert_physical(&env, &parent, None);
     let view = std::sync::Arc::new(StackView::build(
         folder.clone(),
@@ -1010,6 +1029,7 @@ fn section1335_flat_filename_stack_acceptance_never_persists_member_name_as_aggr
     let (items, metas) = view.materialize_aggregated();
     assert!(matches!(items.first(), Some(GridItem::Stack { .. })));
     env.install_new_items(items, metas);
+    env.finish_page_identity_preparation_for_test();
     env.stack_mode_requested = true;
     env.stack_view = Some(view);
     env.selected = Some(0);
@@ -1066,6 +1086,7 @@ fn section1335_tray_persistence_and_restore_keep_reading_session_and_parent_list
         OpenRequestOwner::Navigation,
         StartupListIntent::PageContinuation
     ));
+    env.finish_page_identity_preparation_for_test();
     let index = env
         .items
         .iter()
@@ -1151,6 +1172,7 @@ fn direct_tray_book_env() -> (phase_c_support::AppTestEnv, PathBuf, PathBuf) {
     env.settings.detached_viewer_open_images_in_window = false;
     env.settings.book_open_resume = crate::settings::ResumeMode::Resume;
     env.load_folder(parent.clone());
+    env.finish_page_identity_preparation_for_test();
     let index = env
         .items
         .iter()
@@ -1387,6 +1409,7 @@ fn section1335_pane_scan_is_explicit_even_with_image_book_auto_open_enabled() {
         .unwrap();
     assert_eq!(env.settings.startup_list_restore, before);
     env.load_folder_with_scan(resolved.path, Some(resolved.scan));
+    env.finish_page_identity_preparation_for_test();
     assert_physical(&env, &child, None);
     assert!(env.fullscreen_idx.is_none());
 }
@@ -1403,6 +1426,7 @@ fn section1335_grid_folder_candidate_classifies_mixed_and_image_only_without_mai
             std::fs::create_dir_all(child.join("nested")).unwrap();
         }
         env.load_folder(parent.clone());
+        env.finish_page_identity_preparation_for_test();
         env.settings.detached_viewer_open_images_in_window = true;
         env.settings.auto_fullscreen_image_folders = true;
         // Direct children of book_root are compiled books even with subfolders.
@@ -1430,6 +1454,7 @@ fn section1335_grid_folder_candidate_classifies_mixed_and_image_only_without_mai
         if mixed {
             let resolved = resolved.expect("mixed folder becomes a main list");
             env.load_folder_with_scan(resolved.path, Some(resolved.scan));
+            env.finish_page_identity_preparation_for_test();
             assert!(env.fullscreen_idx.is_none());
             assert_physical(&env, &child, None);
         } else {
@@ -1439,6 +1464,7 @@ fn section1335_grid_folder_candidate_classifies_mixed_and_image_only_without_mai
             );
             assert_eq!(env.current_folder.as_ref(), Some(&parent));
             env.with_active_viewer_context(|viewer| {
+                viewer.finish_page_identity_preparation_for_test();
                 assert_eq!(viewer.effective_folder().as_ref(), Some(&child));
                 assert!(viewer.fullscreen_idx.is_some());
                 viewer.close_fullscreen_to_page_list();
@@ -1534,6 +1560,7 @@ fn section1335_native_back_to_list_caller_rejects_repeat_and_accepts_explicit_pr
         OpenRequestOwner::Navigation,
         StartupListIntent::PageContinuation
     ));
+    env.finish_page_identity_preparation_for_test();
     let index = env
         .items
         .iter()
@@ -1660,6 +1687,7 @@ fn section1335_required_virtual_zip_exact_page_success_and_missing_page_keep_par
             OpenRequestOwner::Navigation,
             StartupListIntent::PageContinuation
         ));
+        env.finish_page_identity_preparation_for_test();
         env.open_fullscreen(0, HistoryTrigger::UserChosen);
         let before = env.settings.startup_list_restore.clone();
         env.open_required_fullscreen_location(
@@ -1700,6 +1728,7 @@ fn section1335_previous_zip_missing_or_recapsed_prefix_rejects_old_same_name_cur
         write_zip(&book, &["a.png", "b.png", "chapter/a.png", "chapter/b.png"]);
         open_zip(&mut env, &book, false);
         env.zip_nav_enter("chapter/");
+        env.finish_page_identity_preparation_for_test();
         env.selected = env.items.iter().position(|item| item.name() == "b.png");
         env.capture_main_list_restore_cursor();
         assert_eq!(restore_cursor(&env).unwrap().name, "b.png");
@@ -1885,6 +1914,7 @@ fn section1335_pending_grid_candidate_setting_change_uses_completed_scan_main_in
         std::fs::create_dir_all(&child).unwrap();
         std::fs::write(child.join("page.png"), png_bytes()).unwrap();
         env.load_folder(parent.clone());
+        env.finish_page_identity_preparation_for_test();
         env.settings.detached_viewer_open_images_in_window = true;
         env.settings.auto_fullscreen_image_folders = true;
         let index = env
@@ -1922,6 +1952,7 @@ fn section1335_pending_grid_candidate_setting_change_uses_completed_scan_main_in
             OpenRequestOwner::Navigation,
             resolved.restore_intent
         ));
+        env.finish_page_identity_preparation_for_test();
         if disable_image_book {
             assert!(env.fullscreen_idx.is_none());
             assert_physical(&env, &child, None);
@@ -2004,6 +2035,7 @@ fn section1335_departing_same_items_page_open_captures_list_cursor_before_page_n
                 std::fs::write(folder.join(name), png_bytes()).unwrap();
             }
             env.load_folder(folder.clone());
+            env.finish_page_identity_preparation_for_test();
             folder
         };
         env.last_grid_cols = 3;
@@ -2118,6 +2150,7 @@ fn section1335_synthetic_install_captures_changed_physical_departure_without_man
             std::fs::write(folder.join(format!("page-{index:02}.png")), png_bytes()).unwrap();
         }
         env.load_folder(folder.clone());
+        env.finish_page_identity_preparation_for_test();
         let selected = env
             .items
             .iter()
@@ -2234,6 +2267,7 @@ fn section1335_similar_exact_page_move_preserves_accepted_departure_before_physi
     std::fs::write(&requested, png_bytes()).unwrap();
     std::fs::write(target.join("other.png"), png_bytes()).unwrap();
     env.load_folder(source.clone());
+    env.finish_page_identity_preparation_for_test();
     env.selected = Some(12);
     env.last_grid_cols = 3;
     env.last_cell_h = 40.0;
@@ -2276,6 +2310,7 @@ fn section1335_similar_exact_page_move_preserves_accepted_departure_before_physi
     env.open_similar_hit_for_test(&ctx, &hit);
     let ready = mutation_refresh_wait_for_order_scan(&mut env);
     assert!(env.resolve_main_folder_open_ready(&ctx, ready).is_none());
+    env.finish_page_identity_preparation_for_test();
     assert_eq!(env.current_folder.as_ref(), Some(&target));
     assert!(
         matches!(env.fullscreen_idx.and_then(|index| env.items.get(index)), Some(GridItem::Image(path)) if path == &requested)
@@ -2294,6 +2329,7 @@ fn section1335_favorite_reading_sibling_fallbacks_preserve_last_accepted_physica
         let departing_page = parent.join("departing.png");
         std::fs::write(&departing_page, png_bytes()).unwrap();
         env.load_folder(parent.clone());
+        env.finish_page_identity_preparation_for_test();
         env.selected = env
             .items
             .iter()
@@ -2381,6 +2417,7 @@ fn section1335_collection_root_return_from_page_b_retains_departing_list_page_a(
         OpenRequestOwner::CollectionGridPhysical(owner),
         StartupListIntent::ExplicitList,
     ));
+    env.finish_page_identity_preparation_for_test();
     env.selected = env.items.iter().position(|item| item.name() == "a.png");
     assert!(
         env.handle_gamepad_grid_accept(&egui::Context::default())
@@ -2568,6 +2605,7 @@ fn section1335_bookshelf_compiled_folder_direct_read_and_explicit_list_restart_d
         env.settings.auto_fullscreen_zip_pdf = true;
         env.settings.auto_fullscreen_image_folders = direct;
         env.open_books_root();
+        env.finish_page_identity_preparation_for_test();
         assert_eq!(env.current_folder.as_ref(), Some(&root));
         assert!(env.fullscreen_idx.is_none());
         assert_physical(&env, &root, None);
@@ -2952,6 +2990,7 @@ fn section1335_video_ring_close_accepts_current_folder_list_for_exit_and_restart
         OpenRequestOwner::Navigation,
         StartupListIntent::PageContinuation,
     ));
+    env.finish_page_identity_preparation_for_test();
     let index = env
         .items
         .iter()
@@ -3019,6 +3058,7 @@ fn extra_video_close_env() -> (phase_c_support::AppTestEnv, PathBuf, PathBuf, us
         OpenRequestOwner::Navigation,
         StartupListIntent::PageContinuation,
     ));
+    env.finish_page_identity_preparation_for_test();
     let index = env
         .items
         .iter()
@@ -3231,6 +3271,7 @@ fn section1335_tray_converted_book_returns_logical_source_parent_and_preserves_r
         )
         .unwrap();
     env.load_folder(parent.clone());
+    env.finish_page_identity_preparation_for_test();
     env.selected = env
         .items
         .iter()
@@ -3278,6 +3319,7 @@ fn section1335_tray_direct_book_with_unrelated_saved_parent_keeps_book_list_and_
     let unrelated = env.tmp.path().join("unrelated-parent");
     std::fs::create_dir_all(&unrelated).unwrap();
     env.load_folder(unrelated.clone());
+    env.finish_page_identity_preparation_for_test();
     let before = env.settings.startup_list_restore.clone();
     open_zip(&mut env, &book, true);
     assert_physical(&env, &unrelated, None);
@@ -3357,6 +3399,7 @@ fn section1335_tray_smart_book_with_matching_physical_parent_keeps_book_list_and
 
 #[cfg(windows)]
 fn open_selected_image_folder_book(app: &mut App, book: &Path) {
+    app.finish_page_identity_preparation_for_test();
     let Some(crate::ui_main::AddressBarNav::Direct(path, intent)) =
         app.handle_gamepad_grid_accept(&egui::Context::default())
     else {
@@ -3400,6 +3443,7 @@ fn direct_tray_image_folder_book_env() -> (phase_c_support::AppTestEnv, PathBuf,
     env.settings.video_in_window_mode = false;
     env.settings.sort_order = crate::settings::SortOrder::FileName;
     env.load_folder(parent.clone());
+    env.finish_page_identity_preparation_for_test();
     let index = env
         .items
         .iter()

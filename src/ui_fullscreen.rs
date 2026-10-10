@@ -28413,6 +28413,8 @@ impl App {
                     crate::key_input::SyntheticNavigationKey::Backspace => KeyName::Backspace,
                     crate::key_input::SyntheticNavigationKey::Escape => KeyName::Esc,
                     crate::key_input::SyntheticNavigationKey::F12 => KeyName::F12,
+                    #[cfg(any(test, feature = "test-script"))]
+                    crate::key_input::SyntheticNavigationKey::G => KeyName::G,
                 };
                 crate::test_script::KeymapLevelObservation {
                     frame_nr: observation.frame_nr,
@@ -54950,10 +54952,8 @@ mod tests {
     }
 
     fn snapshot_fullscreen_overflow_panel(name: &str, state: FsOverflowPanelState) {
-        use egui_kittest::Harness;
-
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(720.0, 440.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -59607,10 +59607,8 @@ mod tests {
 
     #[test]
     fn similar_preview_navigator_snapshot_dark() {
-        use egui_kittest::Harness;
-
         let mut texture: Option<egui::TextureHandle> = None;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(640.0, 360.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -68700,7 +68698,7 @@ mod tests {
 
     fn still_seek_strip_handler_harness()
     -> egui_kittest::Harness<'static, StillSeekStripHarnessState> {
-        egui_kittest::Harness::builder()
+        crate::test_ui::builder()
             .with_size(egui::vec2(420.0, 180.0))
             .build_ui_state(
                 |ui, state: &mut StillSeekStripHarnessState| {
@@ -68850,7 +68848,7 @@ mod tests {
 
     fn mixed_aspect_strip_handler_harness()
     -> egui_kittest::Harness<'static, MixedAspectStripHarnessState> {
-        egui_kittest::Harness::builder()
+        crate::test_ui::builder()
             .with_size(egui::vec2(420.0, 180.0))
             .build_ui_state(
                 |ui, state: &mut MixedAspectStripHarnessState| {
@@ -69123,7 +69121,7 @@ mod tests {
 
     fn still_seek_track_handler_harness()
     -> egui_kittest::Harness<'static, StillSeekTrackHarnessState> {
-        egui_kittest::Harness::builder()
+        crate::test_ui::builder()
             .with_size(egui::vec2(420.0, 180.0))
             .build_ui_state(
                 |ui, state: &mut StillSeekTrackHarnessState| {
@@ -70893,7 +70891,7 @@ mod tests {
                 app.items[9] = GridItem::Video(PathBuf::from("c:/seek/movie.mp4"));
             }
             let mut texture: Option<egui::TextureHandle> = None;
-            let mut harness = egui_kittest::Harness::builder()
+            let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(640.0, 360.0))
                 .build(|ctx| {
                     crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -72555,7 +72553,7 @@ mod tests {
             app.settings.fullscreen_page_number_overlay = true;
             app.fs_seek_overlay_visible = false;
             let mut textures_ready = false;
-            let mut harness = egui_kittest::Harness::builder()
+            let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(720.0, 420.0))
                 .build(|ctx| {
                     crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);

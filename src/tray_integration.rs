@@ -246,7 +246,11 @@ impl App {
             ));
             return false;
         }
+        #[cfg(all(windows, feature = "test-script"))]
+        crate::app::release_checks::record_close_accept(self);
         self.hide_to_tray(ctx);
+        #[cfg(all(windows, feature = "test-script"))]
+        crate::app::release_checks::record_tray_hide(self);
         true
     }
 

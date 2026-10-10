@@ -71,6 +71,16 @@ pub(super) fn force_startup_open_resolve_spawn_failure_for_test(force: bool) {
     FORCE_STARTUP_OPEN_RESOLVE_SPAWN_FAILURE.with(|slot| slot.set(force));
 }
 
+#[derive(Clone)]
+pub(super) struct DirectMediaPrepared {
+    item: GridItem,
+    metadata: Option<(i64, i64)>,
+    rating: crate::rating_sort::RatingSortKey,
+    rating_generation: u64,
+    rotation: crate::rotation_db::Rotation,
+    tags: HashMap<String, Vec<String>>,
+}
+
 impl App {
     pub(crate) fn set_startup_open_path(&mut self, path: PathBuf) {
         self.startup_open_path = Some(path);
@@ -334,7 +344,12 @@ impl App {
             .flatten();
         let worker_bookmark = bookmark.clone();
         let repaint_ctx = ctx.clone();
+        #[cfg(test)]
+        let test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::capture();
         let worker = move || {
+            #[cfg(test)]
+            let _test_epoch_scope =
+                test_epoch_scope.map(crate::page_edit_write_epoch::TestEpochScope::enter);
             if cancel_w.load(Ordering::Relaxed) {
                 return;
             }
@@ -1381,7 +1396,23 @@ impl App {
             self.begin_bookmark_page_wait(bookmark_owner);
         }
         if select_requested_file && matches!(outcome, FolderOpenOutcome::Loaded) {
-            self.open_startup_file_if_visible(&result.requested);
+            if let Some(prepared) = result.direct_media
+                && !self
+                    .settings
+                    .file_type_visibility
+                    .allows_physical_file(&result.requested)
+            {
+                let action = MainListAfterHydration::DirectMedia(prepared);
+                let action = match self.sidecar_restore.as_mut() {
+                    Some(state) => state.defer_main_list_action(action).err(),
+                    None => Some(action),
+                };
+                if let Some(action) = action {
+                    self.finish_main_list_after_hydration(action);
+                }
+            } else {
+                self.open_startup_file_if_visible(&result.requested);
+            }
         }
         StartupOpenApplyOutcome::Opened
     }
@@ -1612,12 +1643,22 @@ impl App {
             return false;
         }
 
-        let built =
-            self.build_viewer_context("bookmark_media_detached_context", |app, reserved| {
-                app.reset_active_detached_viewport_runtime_for_new_window(
-                    reserved.serial(),
-                    "bookmark_media_detached_context",
-                );
+        let source = if requested
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                crate::folder_tree::is_audio_ext(&extension.to_ascii_lowercase())
+            }) {
+            DetachedSource::Audio
+        } else {
+            DetachedSource::Video
+        };
+        let built = self.start_active_detached_loading_context(
+            ctx,
+            None,
+            source,
+            requested.to_path_buf(),
+            |app, _window_id| {
                 app.bookmark_open_pending =
                     Some(crate::bookmark_browser::PendingBookmarkOpen::Media(pending));
                 app.bookmark_view_state = Some(BookmarkViewState::Detached { target });
@@ -1633,6 +1674,7 @@ impl App {
                 let opened_target = matches!(outcome, FolderOpenOutcome::Loaded)
                     && app
                         .fullscreen_idx
+                        .or_else(|| app.sidecar_restore_deferred_media_target(requested))
                         .and_then(|idx| app.items.get(idx))
                         .is_some_and(|item| match item {
                             GridItem::Video(path) | GridItem::Audio(path) => {
@@ -1642,30 +1684,12 @@ impl App {
                         });
 
                 if !opened_target {
-                    let session_window_id =
-                        app.active_detached_session.map(|session| session.window_id);
-                    let closing_window_id = session_window_id.or(app.detached_viewer_window_id());
-                    app.begin_active_detached_session_close("bookmark_media_detached_open_failed");
-                    app.finish_active_detached_session_close("bookmark_media_detached_open_failed");
                     app.close_fullscreen();
-                    if session_window_id.is_none()
-                        && let Some(window_id) = closing_window_id
-                    {
-                        app.remove_detached_window_runtime(
-                            window_id,
-                            "bookmark_media_detached_open_failed",
-                        );
-                    }
-                    return BuildOutcome::Abort("target_not_opened");
+                    return DetachedLoadingContextInit::Abort("target_not_opened");
                 }
-                let window_id = app
-                    .active_detached_session
-                    .map(|session| session.window_id)
-                    .or(app.detached_viewer_window_id())
-                    .expect("opened detached bookmark media must own a window");
-                app.reserve_window_binding_for_build(window_id);
-                BuildOutcome::Commit
-            });
+                DetachedLoadingContextInit::Continue
+            },
+        );
         if built.is_none() {
             return false;
         }
@@ -1766,6 +1790,220 @@ impl App {
         Outcome::Ok
     }
 
+    /// Reuse the transient snapshot owner: the base grid remains projected, while the exact
+    /// externally requested page lives in the reader beside the projected sibling order.
+    pub(super) fn install_direct_media_reader(
+        &mut self,
+        mut prepared: DirectMediaPrepared,
+    ) -> Option<crate::snapshot::SnapshotTarget> {
+        let origin_path = self.current_folder.clone()?;
+        let requested = match &prepared.item {
+            GridItem::Image(path) | GridItem::Video(path) | GridItem::Audio(path) => path.clone(),
+            _ => return None,
+        };
+        if startup_file_idx(&self.items, &requested).is_some() {
+            return Some(crate::snapshot::SnapshotTarget::Fs(requested));
+        }
+        let return_origin = self.current_top_level_restore_snapshot().map(|restore| {
+            top_level_grid_view::TopLevelGridOrigin {
+                restore,
+                route: self.facet_navigation.route().clone(),
+            }
+        });
+        let policy = self.page_identity_index.policy.clone();
+        let saved_page_identity_index = self.page_identity_index.clone();
+        let saved_items = self.items.clone();
+        let saved_thumbnails = self.thumbnails.clone();
+        let saved_image_metas = self.image_metas.clone();
+        let saved_visible_indices = self.visible_indices.clone();
+        let mut reader_order = self.current_reader_order().to_vec();
+        let saved_scroll_offset_y = self.scroll_offset_y;
+        let saved_selected = self.selected;
+        let saved_zip_nav = self.zip_nav.clone();
+        let mut reader_items = saved_items.clone();
+        let mut reader_metas = saved_image_metas.clone();
+        self.sync_current_context_rating_session_writes();
+        if let Some(write) = crate::rating_sort::physical_item_key(&prepared.item)
+            .and_then(|key| self.rating_session_writes.get(&key))
+            .filter(|write| write.generation > prepared.rating_generation)
+        {
+            prepared.rating = crate::rating_sort::RatingSortKey::supported(write.stars)
+                .expect("published ratings are validated");
+        }
+        let insert_at = direct_media_insertion_index(
+            &saved_items,
+            &saved_image_metas,
+            &self.rating_cache,
+            &self.settings,
+            &prepared,
+        );
+        let details_sort = self.details_header_sort_active().then_some((
+            self.settings.details_sort_key,
+            self.settings.details_sort_ascending,
+        ));
+        let target_idx = reader_items.len();
+        let reader_position = reader_order
+            .iter()
+            .position(|idx| *idx >= insert_at)
+            .unwrap_or(reader_order.len());
+        reader_items.push(prepared.item);
+        reader_metas.push(prepared.metadata);
+        let entries: Vec<_> = reader_items
+            .iter()
+            .filter_map(crate::snapshot::snapshot_entry_from_grid_item)
+            .collect();
+        let membership = entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.key.clone(), index))
+            .collect();
+        let previous_ratings = self.rating_cache.clone();
+        let previous_rotations = self.rotation_cache.clone();
+        let target_rating = match prepared.rating {
+            crate::rating_sort::RatingSortKey::Supported(stars) => Some(stars as u8),
+            crate::rating_sort::RatingSortKey::Unsupported => None,
+        };
+        self.items = reader_items;
+        self.image_metas = reader_metas;
+        if let Some(stars) = target_rating {
+            self.rating_cache.insert(target_idx, stars);
+        }
+        self.tags_cache.extend(prepared.tags.clone());
+        self.rotation_cache.insert(target_idx, prepared.rotation);
+        reader_order.insert(reader_position, target_idx);
+        self.thumbnails.push(ThumbnailState::Pending);
+        self.bump_items_generation();
+        self.invalidate_idx_state_and_queues();
+        self.rating_cache = previous_ratings;
+        self.rotation_cache = previous_rotations;
+        if let Some(stars) = target_rating {
+            self.rating_cache.insert(target_idx, stars);
+        }
+        self.tags_cache.extend(prepared.tags);
+        self.rotation_cache.insert(target_idx, prepared.rotation);
+        self.page_identity_index = Default::default();
+        let generation_id = self.snapshot_next_generation_id;
+        self.snapshot_next_generation_id = generation_id.saturating_add(1);
+        self.snapshot = Some(crate::snapshot::SnapshotState {
+            page_edit_source: crate::snapshot::SnapshotPageEditSource::PhysicalPrefix,
+            items: entries,
+            membership,
+            origin: origin_path,
+            filter_at_capture: self.current_filter_state(),
+            source_label: crate::snapshot::SnapshotSourceLabel::DirectMedia {
+                target: requested.clone(),
+                policy,
+                reader_order,
+                details_sort,
+            },
+            generation_id,
+            saved_items: saved_items.clone(),
+            saved_page_identity_index: saved_page_identity_index.clone(),
+            saved_thumbnails: saved_thumbnails.clone(),
+            saved_image_metas: saved_image_metas.clone(),
+            saved_visible_indices,
+            saved_scroll_offset_y,
+            saved_selected,
+            saved_zip_nav,
+            list_view_items: saved_items,
+            list_view_thumbnails: saved_thumbnails,
+            list_view_image_metas: saved_image_metas,
+            list_view_page_identity_index: saved_page_identity_index.clone(),
+            pre_snapshot_search_origin: None,
+        });
+        self.top_level_grid_view.begin_with_origin(
+            top_level_grid_view::TopLevelGridSurface::Snapshot,
+            return_origin,
+        );
+        self.rebuild_visible_indices();
+        Some(crate::snapshot::SnapshotTarget::Fs(requested))
+    }
+
+    /// Finalize only the explicit page after the original combined hydration has
+    /// installed its edit badges. Captured siblings keep their accepted permutation.
+    pub(super) fn finalize_direct_media_reader_order(&mut self) {
+        let Some((target, mut order, Some((key, ascending)))) =
+            self.snapshot
+                .as_ref()
+                .and_then(|snapshot| match &snapshot.source_label {
+                    crate::snapshot::SnapshotSourceLabel::DirectMedia {
+                        target,
+                        reader_order,
+                        details_sort,
+                        ..
+                    } => Some((target.clone(), reader_order.clone(), *details_sort)),
+                    _ => None,
+                })
+        else {
+            return;
+        };
+        let Some(target_idx) = startup_file_idx(&self.items, &target) else {
+            return;
+        };
+        order.retain(|idx| *idx != target_idx);
+        for &idx in &order {
+            if self
+                .items
+                .get(idx)
+                .is_some_and(|item| crate::rating_sort::physical_item_key(item).is_some())
+            {
+                self.rating_cache.entry(idx).or_insert(0);
+            }
+        }
+        let target_row = self.details_sort_row(target_idx, key);
+        let position = order
+            .iter()
+            .position(|&idx| {
+                let sibling = self.details_sort_row(idx, key);
+                Self::compare_details_sort_rows(&target_row, &sibling, key, ascending).is_lt()
+            })
+            .unwrap_or(order.len());
+        order.insert(position, target_idx);
+        if let Some(snapshot) = self.snapshot.as_mut() {
+            if let crate::snapshot::SnapshotSourceLabel::DirectMedia { reader_order, .. } =
+                &mut snapshot.source_label
+            {
+                *reader_order = order;
+            }
+        }
+        self.viewer_navigation_caches.invalidate();
+    }
+
+    pub(super) fn retire_direct_media_reader_for_source_adoption(&mut self) {
+        if self.direct_media_reader_active() {
+            self.snapshot = None;
+            self.top_level_grid_view.take_return_origin();
+            self.top_level_grid_view
+                .replace_surface(top_level_grid_view::TopLevelGridSurface::Folder);
+        }
+    }
+
+    pub(super) fn restore_direct_media_reader_origin(&mut self) {
+        if !self.snapshot.as_ref().is_some_and(|snapshot| {
+            matches!(
+                snapshot.source_label,
+                crate::snapshot::SnapshotSourceLabel::DirectMedia { .. }
+            )
+        }) {
+            return;
+        }
+        let detached_owner = self.navigation_scope == ViewerNavigationScope::DetachedPhysical;
+        #[cfg(windows)]
+        let detached_owner =
+            detached_owner || self.projected_viewer_context_id() != self.viewer_context_main();
+        if detached_owner {
+            self.snapshot = None;
+            self.top_level_grid_view.take_return_origin();
+            self.top_level_grid_view
+                .replace_surface(top_level_grid_view::TopLevelGridSurface::Folder);
+            return;
+        }
+        if let Some(origin) = self.dismiss_snapshot_with_origin() {
+            self.pending_reload = false;
+            self.restore_view_return_origin(origin);
+        }
+    }
+
     fn open_startup_file_if_visible(&mut self, requested: &Path) {
         if let Err(error) = self.open_loaded_file_fullscreen(requested, "startup_open_file") {
             crate::logger::log(format!("startup open: {error}"));
@@ -1802,6 +2040,66 @@ impl App {
         self.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
         Ok(idx)
     }
+}
+
+/// The accepted siblings keep their exact prepared permutation; only the explicit initial
+/// page is inserted. All target metadata and rating facts came from the resolver worker.
+fn direct_media_insertion_index(
+    items: &[GridItem],
+    metadata: &[Option<(i64, i64)>],
+    ratings: &HashMap<usize, u8>,
+    settings: &crate::settings::Settings,
+    target: &DirectMediaPrepared,
+) -> usize {
+    use crate::settings::GridItemDisplayKind as K;
+    let row = |item: &GridItem| {
+        settings.grid_display_order.row_for(match item {
+            GridItem::Folder(_) => K::Folder,
+            GridItem::ZipFile(_)
+            | GridItem::PdfFile(_)
+            | GridItem::ConvertibleArchive { .. }
+            | GridItem::ZipDir { .. } => K::Archive,
+            GridItem::Video(_) | GridItem::Audio(_) => K::VideoAudio,
+            _ => K::Image,
+        })
+    };
+    let target_row = row(&target.item);
+    let sort = crate::rating_sort::ListingOrderRequest::from_settings(settings);
+    let target_name = sort.standard_fallback().name_key(&target.item.name());
+    let listing_meta = |meta: Option<(i64, i64)>| match meta {
+        Some((mtime, size)) => crate::settings::ListingSortMetadata::new(mtime, Some(size)),
+        None => crate::settings::ListingSortMetadata::new(0, None),
+    };
+    items
+        .iter()
+        .enumerate()
+        .position(|(index, item)| {
+            let item_row = row(item);
+            if item_row != target_row {
+                return item_row > target_row;
+            }
+            let name = sort.standard_fallback().name_key(&item.name());
+            let comparison = match sort {
+                crate::rating_sort::ListingOrderRequest::Standard(sort) => sort
+                    .compare_listing_keys(
+                        &target_name,
+                        listing_meta(target.metadata),
+                        &name,
+                        listing_meta(metadata.get(index).copied().flatten()),
+                    ),
+                crate::rating_sort::ListingOrderRequest::Rating(spec) => spec.compare(
+                    target.rating,
+                    &target_name,
+                    crate::rating_sort::physical_item_key(item)
+                        .map(|_| ratings.get(&index).copied().unwrap_or(0))
+                        .and_then(crate::rating_sort::RatingSortKey::supported)
+                        .unwrap_or(crate::rating_sort::RatingSortKey::Unsupported),
+                    &name,
+                ),
+            };
+            comparison.is_lt()
+        })
+        .unwrap_or(items.len())
 }
 
 fn startup_file_idx(items: &[GridItem], requested: &Path) -> Option<usize> {
@@ -1873,6 +2171,57 @@ fn resolve_startup_open_path(
         ))
     });
     let resolved = crate::folder_tree::resolve_openable_path_detailed(&requested);
+    let direct_media = (!matches!(source, StartupOpenPathSource::Bookmark))
+        .then(|| {
+            resolved
+                .as_ref()
+                .filter(|resolution| resolution.requested_is_file)
+        })
+        .flatten()
+        .and_then(|_| {
+            use crate::file_type_visibility::FileTypeCategory as C;
+            let extension = requested.extension()?.to_str()?;
+            let item = match crate::file_type_visibility::category_for_extension(extension)? {
+                C::Image | C::Raw => GridItem::Image(requested.clone()),
+                C::Video => GridItem::Video(requested.clone()),
+                C::Audio => GridItem::Audio(requested.clone()),
+                _ => return None,
+            };
+            let metadata = std::fs::metadata(&requested).ok().map(|metadata| {
+                (
+                    crate::ui_helpers::mtime_secs(&metadata),
+                    metadata.len() as i64,
+                )
+            });
+            let rating_generation = crate::rating_db::RATING_WRITES.sample().completed_writes;
+            let rating = crate::rating_sort::physical_item_key(&item)
+                .and_then(|key| {
+                    crate::rating_db::RatingDb::open_readonly(crate::rating_db::RatingDb::db_path())
+                        .ok()
+                        .and_then(|db| db.get_many_complete(&[key.clone()], rating_generation).ok())
+                        .map(|facts| facts.key_for_requested(&key))
+                })
+                .unwrap_or(crate::rating_sort::RatingSortKey::Unsupported);
+            let tags = crate::rating_sort::physical_item_key(&item)
+                .map(|key| {
+                    crate::tags_db::TagsDb::open_readonly(&crate::tags_db::TagsDb::db_path())
+                        .map(|db| db.get_many_display_tags(&[key]))
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+            let rotation = crate::rotation_db::RotationDb::open_readonly()
+                .ok()
+                .and_then(|db| db.get(&requested))
+                .unwrap_or(crate::rotation_db::Rotation::None);
+            Some(DirectMediaPrepared {
+                rotation,
+                item,
+                metadata,
+                rating,
+                rating_generation,
+                tags,
+            })
+        });
     let rar_volume_proof = probe_rar
         .then(|| {
             resolved.as_ref().and_then(|resolution| {
@@ -1903,6 +2252,7 @@ fn resolve_startup_open_path(
         bookmark_relative_page_openable,
         rar_volume_proof,
         elapsed_ms,
+        direct_media,
     }
 }
 
@@ -1935,6 +2285,642 @@ mod tests {
             startup_file_idx(&items, Path::new("c:/media/track.flac")),
             Some(1)
         );
+    }
+
+    #[test]
+    fn excluded_external_media_startup_and_activation_keep_projected_parent_and_siblings() {
+        for source in [
+            StartupOpenPathSource::InitialStartup,
+            StartupOpenPathSource::Activation,
+        ] {
+            let mut app = setup_app_for_test();
+            app.settings.detached_viewer_open_images_in_window = false;
+            let parent = app.tmp.path().join("direct-media-parent");
+            std::fs::create_dir_all(&parent).unwrap();
+            let requested = parent.join("2.png");
+            let hidden_sibling = parent.join("4.png");
+            let visible_siblings = [parent.join("1.jpg"), parent.join("3.jpg")];
+            for path in [
+                &requested,
+                &hidden_sibling,
+                &visible_siblings[0],
+                &visible_siblings[1],
+            ] {
+                image::RgbImage::from_pixel(2, 2, image::Rgb([30, 40, 50]))
+                    .save(path)
+                    .unwrap();
+            }
+            app.settings
+                .file_type_visibility
+                .excluded_extensions
+                .insert("png".into());
+            let result = resolve_startup_open_path(requested.clone(), source, None, true);
+            assert!(result.direct_media.is_some());
+            let ctx = egui::Context::default();
+            let owner = match source {
+                StartupOpenPathSource::InitialStartup => StartupOpenPathOwner::InitialStartup,
+                StartupOpenPathSource::Activation => StartupOpenPathOwner::Activation,
+                StartupOpenPathSource::Bookmark => unreachable!(),
+            };
+            app.finish_startup_open_path_resolve(owner, result, &ctx);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while app.sidecar_restore_active() {
+                assert!(std::time::Instant::now() < deadline);
+                app.poll_sidecar_restore(&ctx);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            let index = app.fullscreen_idx.expect("exact explicit target must open");
+            assert!(matches!(&app.items[index], GridItem::Image(path) if path == &requested));
+            assert!(
+                app.items
+                    .iter()
+                    .all(|item| !matches!(item, GridItem::Image(path) if path == &hidden_sibling))
+            );
+            assert_eq!(app.visible_indices.len(), 2);
+            assert!(!app.visible_indices.contains(&index));
+            assert!(
+                !app.is_snapshot_active(),
+                "external transient reader never takes the fixed-snapshot lock"
+            );
+            assert!(app.snapshot_count().is_none());
+            assert_eq!(app.current_reader_order().len(), 3);
+            assert_eq!(app.get_still_image_indices().len(), 3);
+            let next = crate::ui_helpers::adjacent_navigable_idx(
+                &app.items,
+                app.current_reader_order(),
+                index,
+                1,
+            )
+            .unwrap();
+            let previous = crate::ui_helpers::adjacent_navigable_idx(
+                &app.items,
+                app.current_reader_order(),
+                index,
+                -1,
+            )
+            .unwrap();
+            assert!(
+                matches!(&app.items[next], GridItem::Image(path) if path == &visible_siblings[1])
+            );
+            assert!(
+                matches!(&app.items[previous], GridItem::Image(path) if path == &visible_siblings[0])
+            );
+            assert_eq!(app.facet_candidate_indices(FacetField::Rating).len(), 2);
+            assert!(app.snapshot_scope_allows_open(
+                &parent.with_extension("other"),
+                &OpenRequestOwner::Navigation
+            ));
+
+            let snapshot = app
+                .snapshot
+                .as_ref()
+                .expect("transient reader has one typed owner");
+            assert_eq!(snapshot.saved_items.len(), 2);
+            assert!(
+                snapshot
+                    .saved_items
+                    .iter()
+                    .all(|item| !matches!(item, GridItem::Image(path) if path == &requested))
+            );
+            assert_eq!(
+                app.items
+                    .iter()
+                    .filter(|item| startup_file_should_open_fullscreen(item))
+                    .count(),
+                3
+            );
+            app.settings
+                .file_type_visibility
+                .excluded_extensions
+                .insert("jpg".into());
+            app.close_fullscreen();
+            while app
+                .top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+                || app.sidecar_restore_active()
+            {
+                assert!(std::time::Instant::now() < deadline);
+                app.poll_collection_history_transition(&ctx);
+                app.poll_sidecar_restore(&ctx);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert!(app.snapshot.is_none());
+            assert!(app.fullscreen_idx.is_none());
+            assert!(
+                app.items.is_empty(),
+                "close restores parent under latest policy"
+            );
+            assert_eq!(app.current_folder.as_ref(), Some(&parent));
+        }
+    }
+
+    #[test]
+    fn external_media_prepare_is_worker_validated_and_bookmark_never_gets_exemption() {
+        // The normal App fixture owns the data-dir lease and its TestEpochScope.
+        let _app = setup_app_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        for extension in ["png", "cr2", "mp4", "flac"] {
+            let path = temp.path().join(format!("target.{extension}"));
+            std::fs::write(&path, b"worker validation fixture").unwrap();
+            for source in [
+                StartupOpenPathSource::InitialStartup,
+                StartupOpenPathSource::Activation,
+            ] {
+                let result = resolve_startup_open_path(path.clone(), source, None, true);
+                assert!(result.direct_media.is_some(), "{extension}");
+            }
+            assert!(
+                resolve_startup_open_path(path, StartupOpenPathSource::Bookmark, None, true)
+                    .direct_media
+                    .is_none()
+            );
+        }
+        assert!(
+            resolve_startup_open_path(
+                temp.path().join("missing.png"),
+                StartupOpenPathSource::InitialStartup,
+                None,
+                true,
+            )
+            .direct_media
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn direct_media_insertion_preserves_rating_order_and_all_media_navigation() {
+        let mut settings = crate::settings::Settings::default();
+        settings.sort_order = crate::settings::SortOrder::RatingDesc;
+        let siblings = vec![
+            GridItem::Image("z-first.jpg".into()),
+            GridItem::Image("a-last.jpg".into()),
+        ];
+        let ratings = HashMap::from([(0, 5), (1, 1)]);
+        let prepared = DirectMediaPrepared {
+            item: GridItem::Image("m-hidden.png".into()),
+            metadata: Some((1, 1)),
+            rating: crate::rating_sort::RatingSortKey::supported(3).unwrap(),
+            rating_generation: 0,
+            rotation: crate::rotation_db::Rotation::None,
+            tags: Default::default(),
+        };
+        assert_eq!(
+            direct_media_insertion_index(&siblings, &[None, None], &ratings, &settings, &prepared),
+            1
+        );
+        assert_eq!(siblings[0].name(), "z-first.jpg");
+        assert_eq!(siblings[1].name(), "a-last.jpg");
+        let unrated = DirectMediaPrepared {
+            item: GridItem::Image("m-unrated.png".into()),
+            metadata: None,
+            rating: crate::rating_sort::RatingSortKey::supported(0).unwrap(),
+            rating_generation: 0,
+            rotation: crate::rotation_db::Rotation::None,
+            tags: Default::default(),
+        };
+        assert_eq!(
+            direct_media_insertion_index(
+                &[
+                    GridItem::Image("a.jpg".into()),
+                    GridItem::Image("z.jpg".into())
+                ],
+                &[None, None],
+                &HashMap::new(),
+                &settings,
+                &unrated,
+            ),
+            1,
+            "ratable cache absence retains supported zero and the name tie-break"
+        );
+        settings.sort_order = crate::settings::SortOrder::FileName;
+        for target in [
+            GridItem::Image("2.cr2".into()),
+            GridItem::Video("2.mp4".into()),
+            GridItem::Audio("2.flac".into()),
+        ] {
+            let neighbors = match target {
+                GridItem::Image(_) => vec![
+                    GridItem::Image("1.jpg".into()),
+                    GridItem::Image("3.jpg".into()),
+                ],
+                _ => vec![
+                    GridItem::Video("1.mp4".into()),
+                    GridItem::Audio("3.flac".into()),
+                ],
+            };
+            let prepared = DirectMediaPrepared {
+                item: target,
+                metadata: None,
+                rating: crate::rating_sort::RatingSortKey::Unsupported,
+                rating_generation: 0,
+                rotation: crate::rotation_db::Rotation::None,
+                tags: Default::default(),
+            };
+            assert_eq!(
+                direct_media_insertion_index(
+                    &neighbors,
+                    &[None, None],
+                    &Default::default(),
+                    &settings,
+                    &prepared
+                ),
+                1
+            );
+            let mut reader = neighbors.clone();
+            reader.insert(1, prepared.item);
+            assert_eq!(
+                crate::ui_helpers::adjacent_navigable_idx(&reader, &[0, 1, 2], 1, 1),
+                Some(2)
+            );
+            assert_eq!(
+                crate::ui_helpers::adjacent_navigable_idx(&reader, &[0, 1, 2], 1, -1),
+                Some(0)
+            );
+        }
+        let mut app = setup_app_for_test();
+        app.items = vec![GridItem::Audio("track.flac".into())];
+        app.fullscreen_idx = Some(0);
+        assert_eq!(
+            app.snapshot_current_fullscreen_path(),
+            Some(PathBuf::from("track.flac"))
+        );
+    }
+
+    #[test]
+    fn direct_media_activation_can_supersede_other_folder_and_fixed_snapshot_keeps_lock() {
+        let mut app = setup_app_for_test();
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("png".into());
+        let ctx = egui::Context::default();
+        let mut last_parent = None;
+        for name in ["first", "second"] {
+            let parent = app.tmp.path().join(name);
+            std::fs::create_dir_all(&parent).unwrap();
+            let target = parent.join("2.png");
+            image::RgbImage::from_pixel(2, 2, image::Rgb([10, 20, 30]))
+                .save(&target)
+                .unwrap();
+            image::RgbImage::from_pixel(2, 2, image::Rgb([10, 20, 30]))
+                .save(parent.join("1.jpg"))
+                .unwrap();
+            let result = resolve_startup_open_path(
+                target.clone(),
+                StartupOpenPathSource::Activation,
+                None,
+                true,
+            );
+            app.finish_startup_open_path_resolve(StartupOpenPathOwner::Activation, result, &ctx);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while app.sidecar_restore_active() {
+                assert!(std::time::Instant::now() < deadline);
+                app.poll_sidecar_restore(&ctx);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert_eq!(app.current_folder.as_ref(), Some(&parent));
+            let opened = app
+                .fullscreen_idx
+                .expect("superseding external target opens");
+            assert!(matches!(&app.items[opened], GridItem::Image(path) if path == &target));
+            last_parent = Some(parent);
+        }
+        app.close_fullscreen();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app
+            .top_level_grid_view
+            .history_navigation_transition()
+            .is_some()
+            || app.sidecar_restore_active()
+        {
+            assert!(std::time::Instant::now() < deadline);
+            app.poll_collection_history_transition(&ctx);
+            app.poll_sidecar_restore(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(app.current_folder, last_parent);
+        assert_eq!(app.items.len(), 1);
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        assert!(app.is_snapshot_active());
+        assert!(!app.snapshot_scope_allows_open(
+            &app.tmp.path().join("outside"),
+            &OpenRequestOwner::Navigation
+        ));
+    }
+
+    fn direct_reader_fixture() -> crate::app::AppTestEnvForTest {
+        let mut app = setup_app_for_test();
+        let parent = app.tmp.path().join("direct-owner-fixture");
+        std::fs::create_dir_all(&parent).unwrap();
+        app.current_folder = Some(parent.clone());
+        app.items = vec![
+            GridItem::Image(parent.join("a.jpg")),
+            GridItem::Image(parent.join("z.jpg")),
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending; 2];
+        app.image_metas = vec![Some((1, 20)), Some((2, 30))];
+        app.visible_indices = vec![0, 1];
+        app.settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("png".into());
+        app.page_identity_index = Arc::new(
+            super::super::file_type_resume::PreparedPageIdentityIndex::prepare(
+                &app.items,
+                None,
+                app.settings.file_type_visibility.clone(),
+            ),
+        );
+        app
+    }
+
+    fn direct_fixture_target(app: &App, name: &str) -> DirectMediaPrepared {
+        DirectMediaPrepared {
+            item: GridItem::Image(app.current_folder.as_ref().unwrap().join(name)),
+            metadata: Some((3, 25)),
+            rating: crate::rating_sort::RatingSortKey::supported(3).unwrap(),
+            rating_generation: 0,
+            rotation: crate::rotation_db::Rotation::None,
+            tags: Default::default(),
+        }
+    }
+
+    #[test]
+    fn visibility_direct_media_details_order_keeps_nonmonotonic_siblings_and_facet_basis() {
+        let mut app = direct_reader_fixture();
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+        app.settings.details_sort_key = crate::settings::DetailsSortKey::Name;
+        app.settings.details_sort_ascending = false;
+        app.details_order = vec![1, 0];
+        let target = direct_fixture_target(&app, "m.png");
+        app.install_direct_media_reader(target).unwrap();
+        app.finalize_direct_media_reader_order();
+        assert_eq!(app.current_reader_order(), &[1, 2, 0]);
+        assert_eq!(app.smart_folder_rule_total(), 2);
+        assert_eq!(app.visible_indices, vec![0, 1]);
+        drop(app);
+
+        let mut app = direct_reader_fixture();
+        app.rating_cache = HashMap::from([(0, 5)]);
+        app.settings.rating_filter = [false, false, false, false, false, true];
+        app.rebuild_visible_indices();
+        assert_eq!(app.visible_indices, vec![0]);
+        let target = direct_fixture_target(&app, "m.png");
+        app.install_direct_media_reader(target).unwrap();
+        assert_eq!(app.current_reader_order(), &[0, 2]);
+        assert_eq!(app.visible_indices, vec![0]);
+        assert_eq!(
+            app.facet_candidate_indices(super::super::FacetField::Rating),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn visibility_direct_media_refused_and_admitted_pending_opens_keep_reader_until_adoption() {
+        let mut app = direct_reader_fixture();
+        let target = direct_fixture_target(&app, "m.png");
+        app.install_direct_media_reader(target).unwrap();
+        let generation = app.items_generation;
+        let stale = OpenRequestOwner::Bookmark(crate::bookmark_browser::BookmarkOpenRequestOwner {
+            request_id: crate::bookmark_browser::BookmarkOpenRequestId(80001),
+            target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(PathBuf::from(
+                "stale.zip",
+            )),
+            #[cfg(windows)]
+            detached_lease: None,
+        });
+        assert!(!app.claim_open_request_owner(Path::new("stale.zip"), &stale));
+        assert!(app.direct_media_reader_active());
+        assert!(
+            app.claim_open_request_owner(Path::new("pending.zip"), &OpenRequestOwner::Navigation)
+        );
+        assert!(app.direct_media_reader_active());
+        assert_eq!(app.current_reader_order(), &[0, 2, 1]);
+        assert_eq!(app.items_generation, generation);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn visibility_direct_media_other_destination_admission_keeps_main_owner() {
+        let mut app = direct_reader_fixture();
+        let target = direct_fixture_target(&app, "m.png");
+        app.install_direct_media_reader(target).unwrap();
+        app.detached_grid_archive_open_request_seq = 77;
+        let owner = OpenRequestOwner::DetachedGridArchive(DetachedGridArchiveOpenRequestOwner {
+            request_id: 77,
+            lease: DetachedSessionLease { window_id: 80002 },
+            source_path: PathBuf::from("other-context.zip"),
+            collection_restore: None,
+        });
+        assert!(app.claim_open_request_owner(Path::new("other-context.zip"), &owner));
+        assert!(app.direct_media_reader_active());
+        assert_eq!(app.current_reader_order(), &[0, 2, 1]);
+    }
+
+    #[test]
+    fn visibility_direct_media_empty_fixed_snapshot_refusal_keeps_exact_reader_owner() {
+        let mut app = direct_reader_fixture();
+        let target = direct_fixture_target(&app, "m.png");
+        app.install_direct_media_reader(target).unwrap();
+        app.fullscreen_idx = Some(2);
+        app.visible_indices.clear();
+        let index = app.page_identity_index.clone();
+        let generation = app.items_generation;
+        let owner_generation = app.snapshot.as_ref().unwrap().generation_id;
+        let order = app.current_reader_order().to_vec();
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        assert!(app.direct_media_reader_active());
+        assert!(!app.is_snapshot_active());
+        assert_eq!(app.fullscreen_idx, Some(2));
+        assert_eq!(app.items.len(), 3);
+        assert_eq!(app.items_generation, generation);
+        assert_eq!(
+            app.snapshot.as_ref().unwrap().generation_id,
+            owner_generation
+        );
+        assert_eq!(app.current_reader_order(), order);
+        assert!(Arc::ptr_eq(&app.page_identity_index, &index));
+        assert!(app.folder_pane_open_pending.is_none());
+        assert!(!app.sidecar_restore_active());
+    }
+
+    #[test]
+    fn visibility_direct_media_composes_with_fixed_snapshot_without_hidden_basis_or_return_reload()
+    {
+        for initial_target_open in [true, false] {
+            let mut app = direct_reader_fixture();
+            let basis_index = app.page_identity_index.clone();
+            let target = direct_fixture_target(&app, "m.png");
+            app.install_direct_media_reader(target).unwrap();
+            app.visible_indices = vec![1];
+            app.fullscreen_idx = Some(if initial_target_open { 2 } else { 1 });
+            let parent = app.current_folder.clone();
+            app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+            assert!(app.is_snapshot_active());
+            assert!(!app.direct_media_reader_active());
+            assert_eq!(app.items.len(), 1);
+            assert_eq!(app.snapshot.as_ref().unwrap().saved_items.len(), 2);
+            assert!(Arc::ptr_eq(
+                &app.snapshot.as_ref().unwrap().saved_page_identity_index,
+                &basis_index
+            ));
+            assert_eq!(
+                app.fullscreen_idx,
+                if initial_target_open { None } else { Some(0) }
+            );
+            assert_eq!(app.current_folder, parent);
+            assert!(app.folder_pane_open_pending.is_none());
+            assert!(app.folder_nav_pending.is_none());
+            let ctx = egui::Context::default();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while app.sidecar_restore_active() {
+                assert!(std::time::Instant::now() < deadline);
+                app.poll_sidecar_restore(&ctx);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            let identity =
+                crate::book_resume_db::PageIdentity::for_item(&app.items[0], None).unwrap();
+            let position = crate::book_resume_db::ReadingPosition {
+                page: 1,
+                identity: Some(identity),
+            };
+            assert_eq!(
+                app.page_identity_index.resolve(&position),
+                super::super::file_type_resume::PositionResolution::Restored(0)
+            );
+            app.deactivate_snapshot();
+            assert_eq!(app.items.len(), 2);
+            assert!(app.items.iter().all(|item| !item.name().ends_with(".png")));
+            assert!(Arc::ptr_eq(&app.page_identity_index, &basis_index));
+            assert_eq!(
+                app.page_identity_index.resolve(&position),
+                super::super::file_type_resume::PositionResolution::Restored(1)
+            );
+            let hidden = crate::book_resume_db::PageIdentity::for_item(
+                &GridItem::Image(app.current_folder.as_ref().unwrap().join("m.png")),
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                app.page_identity_index
+                    .resolve(&crate::book_resume_db::ReadingPosition {
+                        page: 2,
+                        identity: Some(hidden)
+                    }),
+                super::super::file_type_resume::PositionResolution::HiddenIdentity
+            );
+            assert!(!app.sidecar_restore_active());
+            assert!(app.folder_pane_open_pending.is_none());
+            assert!(app.folder_nav_pending.is_none());
+            assert_eq!(
+                app.fullscreen_idx,
+                if initial_target_open { None } else { Some(1) }
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn visibility_direct_video_audio_pdf_adoption_preserves_actual_parked_reader_owner() {
+        for audio in [false, true] {
+            let mut app = direct_reader_fixture();
+            let mut target = direct_fixture_target(&app, if audio { "m.flac" } else { "m.mp4" });
+            let path = match target.item {
+                GridItem::Image(path) => path,
+                _ => unreachable!(),
+            };
+            target.item = if audio {
+                GridItem::Audio(path)
+            } else {
+                GridItem::Video(path)
+            };
+            app.install_direct_media_reader(target).unwrap();
+            app.page_identity_index = Arc::new(
+                super::super::file_type_resume::PreparedPageIdentityIndex::prepare(
+                    &app.items,
+                    None,
+                    app.settings.file_type_visibility.clone(),
+                ),
+            );
+            app.fullscreen_idx = Some(2);
+            let accepted = app.page_identity_index.clone();
+            let order = app.current_reader_order().to_vec();
+            let window = app.ensure_detached_viewer_window_id();
+            app.become_mounted_independent_detached_viewer(window, 2);
+            assert!(app.should_promote_active_detached_video_for_main_context_change());
+            let pdf = crate::pdf_loader::LeasedEpubPath::try_new(app.tmp.path().join("next.pdf"))
+                .unwrap();
+            app.prepare_pdf_visible_adoption(&pdf);
+            assert!(!app.direct_media_reader_active());
+            assert!(
+                app.items.is_empty(),
+                "adopted main source starts in the established fresh context"
+            );
+            let main = app.projected_viewer_context_id();
+            let main_generation = app.items_generation;
+            app.with_window_viewer_context(window, |parked| {
+                assert!(parked.direct_media_reader_active());
+                assert_eq!(parked.current_reader_order(), order);
+                assert!(Arc::ptr_eq(&parked.page_identity_index, &accepted));
+                parked.restore_direct_media_reader_origin();
+                assert!(!parked.direct_media_reader_active());
+                assert!(
+                    !parked.sidecar_restore_active(),
+                    "owning detached close consumes the origin without rescanning"
+                );
+            })
+            .unwrap();
+            assert_eq!(app.projected_viewer_context_id(), main);
+            assert_eq!(app.items_generation, main_generation);
+            assert!(app.items.is_empty());
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn visibility_direct_media_successful_fork_moves_owner_and_preserves_main_basis() {
+        for live in [false, true] {
+            let mut app = direct_reader_fixture();
+            let basis_index = app.page_identity_index.clone();
+            let parent = app.current_folder.clone().unwrap();
+            let target = direct_fixture_target(&app, "m.png");
+            app.install_direct_media_reader(target).unwrap();
+            app.page_identity_index = Arc::new(
+                super::super::file_type_resume::PreparedPageIdentityIndex::prepare(
+                    &app.items,
+                    None,
+                    app.settings.file_type_visibility.clone(),
+                ),
+            );
+            app.fullscreen_idx = Some(2);
+            let generation = app.items_generation;
+            let mut detached = if live {
+                app.split_current_context_preserving_main_grid()
+            } else {
+                app.split_materialized_physical_context_for_detached_scope(&parent, 2, generation)
+            };
+            assert!(!app.direct_media_reader_active());
+            assert_eq!(app.items.len(), 2);
+            assert_eq!(app.visible_indices, vec![0, 1]);
+            assert!(Arc::ptr_eq(&app.page_identity_index, &basis_index));
+            let main_generation = app.items_generation;
+            app.swap_viewer_context_bundle(&mut detached);
+            assert!(matches!(
+                app.top_level_grid_view.surface(),
+                top_level_grid_view::TopLevelGridSurface::Snapshot
+            ));
+            app.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+            assert!(app.direct_media_reader_active());
+            assert_eq!(app.current_reader_order(), &[0, 2, 1]);
+            app.restore_direct_media_reader_origin();
+            assert!(!app.direct_media_reader_active());
+            app.swap_viewer_context_bundle(&mut detached);
+            assert_eq!(app.items.len(), 2);
+            assert_eq!(app.items_generation, main_generation);
+            assert!(Arc::ptr_eq(&app.page_identity_index, &basis_index));
+        }
     }
 
     fn arm_section1339_bookmark(

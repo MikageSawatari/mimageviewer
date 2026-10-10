@@ -175,13 +175,23 @@ impl App {
         idx: usize,
         value: Option<ReadingMeterValue>,
     ) {
+        self.persist_book_resume_with_identity(path, idx, value, None);
+    }
+
+    pub(crate) fn persist_book_resume_with_identity(
+        &mut self,
+        path: PathBuf,
+        idx: usize,
+        value: Option<ReadingMeterValue>,
+        identity: Option<crate::book_resume_db::PageIdentity>,
+    ) {
         let value = value.and_then(|v| ReadingMeterValue::new(v.ordinal, v.total));
-        let record = (path, idx, value);
+        let record = (path, idx, value, identity);
         if self.last_book_resume.as_ref() == Some(&record) {
             return;
         }
         if let Some(writer) = &self.book_resume_writer
-            && writer.record(&record.0, idx, value)
+            && writer.record_identity(&record.0, idx, value, record.3.clone())
         {
             self.book_resume_meters.record(&record.0, value);
         }

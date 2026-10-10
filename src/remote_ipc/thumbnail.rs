@@ -99,6 +99,7 @@ struct RequestKey {
     address: RemoteAddress,
     source_address: Option<RemoteAddress>,
     target_px: u32,
+    policy_fingerprint: u64,
     session: (String, String),
     admission: crate::catalog::CatalogAdmission,
 }
@@ -108,6 +109,7 @@ impl PartialEq for RequestKey {
         self.address == other.address
             && self.source_address == other.source_address
             && self.target_px == other.target_px
+            && self.policy_fingerprint == other.policy_fingerprint
             && self.session == other.session
             && self.admission == other.admission
     }
@@ -118,6 +120,7 @@ impl Hash for RequestKey {
         self.address.hash(state);
         self.source_address.hash(state);
         self.target_px.hash(state);
+        self.policy_fingerprint.hash(state);
         self.session.hash(state);
         self.admission.hash(state);
     }
@@ -158,6 +161,15 @@ impl ThumbnailEngine {
         owner: &mimageviewer_ipc::RemoteSessionIdentity,
         cancellation: &super::session::RemoteOperationCancellation,
     ) -> ThumbnailResponse {
+        let settings = match container_engine.settings_for_listing() {
+            Ok(settings) => settings,
+            Err(_) => {
+                return error_response(
+                    ThumbnailErrorCode::Internal,
+                    "現在の表示設定を取得できませんでした",
+                );
+            }
+        };
         let admission =
             crate::catalog::CatalogAccess::for_cache_dir(&crate::catalog::default_cache_dir())
                 .admit();
@@ -165,6 +177,7 @@ impl ThumbnailEngine {
             address: request.address.clone(),
             source_address: request.source_address.clone(),
             target_px: request.target_px,
+            policy_fingerprint: settings.file_type_visibility.fingerprint(),
             session: (owner.client_id.clone(), owner.session_id.clone()),
             admission,
         };
@@ -200,7 +213,14 @@ impl ThumbnailEngine {
         }
 
         let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.generate(&request, context, container_engine, admission, cancellation)
+            self.generate(
+                &request,
+                context,
+                container_engine,
+                &settings,
+                admission,
+                cancellation,
+            )
         }))
         .unwrap_or_else(|_| {
             error_response(
@@ -228,6 +248,7 @@ impl ThumbnailEngine {
         request: &ThumbnailRequest,
         context: &WorkerContext,
         container_engine: &ContainerEngine,
+        settings: &crate::settings::Settings,
         admission: crate::catalog::CatalogAdmission,
         cancellation: &super::session::RemoteOperationCancellation,
     ) -> ThumbnailResponse {
@@ -257,21 +278,12 @@ impl ThumbnailEngine {
             Ok(path) => path,
             Err(error) => return resolve_error_response(error),
         };
-        let settings = match container_engine.settings_for_listing() {
-            Ok(settings) => settings,
-            Err(_) => {
-                return error_response(
-                    ThumbnailErrorCode::Internal,
-                    "現在の表示設定を取得できませんでした",
-                );
-            }
-        };
         match self.generate_resolved(
             &resolved,
             request.source_address.as_ref(),
             request.target_px,
             context,
-            &settings,
+            settings,
             admission,
             container_engine.raw_develop_executor(),
             cancellation,
@@ -292,6 +304,18 @@ impl ThumbnailEngine {
         raw_executor: &crate::raw::RawDevelopExecutor,
         cancellation: &super::session::RemoteOperationCancellation,
     ) -> Result<Vec<u8>, ThumbnailResponse> {
+        let is_directory =
+            std::fs::metadata(&resolved.canonical).is_ok_and(|metadata| metadata.is_dir());
+        if !is_directory
+            && !settings
+                .file_type_visibility
+                .allows_physical_file(&resolved.logical)
+        {
+            return Err(error_response(
+                ThumbnailErrorCode::Unsupported,
+                "表示するファイル種類の設定で、このファイルは非表示になっています",
+            ));
+        }
         if is_supported_audio(&resolved.canonical) {
             return self.generate_audio_resolved(
                 resolved,
@@ -325,6 +349,7 @@ impl ThumbnailEngine {
             resolved,
             target_px,
             context,
+            &settings.file_type_visibility,
             admission,
             &cancellation.flag(),
         )
@@ -344,6 +369,7 @@ impl ThumbnailEngine {
             resolved,
             target_px,
             context,
+            &self.settings.file_type_visibility,
             admission,
             &Arc::new(AtomicBool::new(false)),
         )
@@ -354,6 +380,7 @@ impl ThumbnailEngine {
         resolved: &ResolvedPath,
         target_px: u32,
         context: &WorkerContext,
+        policy: &crate::file_type_visibility::FileTypeVisibility,
         admission: crate::catalog::CatalogAdmission,
         cancellation: &Arc<AtomicBool>,
     ) -> Result<Vec<u8>, ThumbnailResponse> {
@@ -402,6 +429,7 @@ impl ThumbnailEngine {
             // decode は検証済みの logical path を使う。catalog key、pin DB、回転 DB が
             // 本体 UI と同じ spelling になり、canonical path は境界判定専用に保つ。
             path: resolved.logical.clone(),
+            file_type_visibility: policy.clone(),
             mtime,
             file_size,
             priority: true,
@@ -616,6 +644,7 @@ impl ThumbnailEngine {
                 sidecar,
                 target_px,
                 context,
+                &settings.file_type_visibility,
                 admission,
                 &cancel_flag,
             );
@@ -809,6 +838,7 @@ impl ThumbnailEngine {
                 &sidecar,
                 target_px,
                 context,
+                &settings.file_type_visibility,
                 admission,
                 cancellation,
             );
@@ -966,6 +996,9 @@ fn apply_supported_folder_pin(
     ) else {
         return;
     };
+    if !crate::thumb_loader::resolved_pin_allowed(&resolved, &request.file_type_visibility) {
+        return;
+    }
     use crate::folder_thumb_pins::ResolvedKind;
     use crate::thumb_loader::ResolveStrategy;
     let strategy = match resolved.kind {
@@ -1394,6 +1427,46 @@ mod tests {
             .unwrap();
         let decoded = image::load_from_memory(&bytes).unwrap();
         assert_eq!((decoded.width(), decoded.height()), (12, 8));
+        let mut hidden_audio = settings.clone();
+        hidden_audio
+            .file_type_visibility
+            .excluded_categories
+            .insert(crate::file_type_visibility::FileTypeCategory::Audio);
+        assert!(matches!(
+            engine.generate_resolved(
+                &resolved,
+                Some(&hint),
+                64,
+                &context,
+                &hidden_audio,
+                admission,
+                &raw_executor,
+                &cancel,
+            ),
+            Err(ThumbnailResponse::Error(ThumbnailError {
+                code: ThumbnailErrorCode::Unsupported,
+                ..
+            }))
+        ));
+        let mut hidden_image = settings.clone();
+        hidden_image
+            .file_type_visibility
+            .excluded_categories
+            .insert(crate::file_type_visibility::FileTypeCategory::Image);
+        assert!(
+            engine
+                .generate_resolved(
+                    &resolved,
+                    Some(&hint),
+                    64,
+                    &context,
+                    &hidden_image,
+                    admission,
+                    &raw_executor,
+                    &cancel,
+                )
+                .is_ok()
+        );
         let mut disabled = settings.clone();
         disabled.video_thumb_use_sidecar_image = false;
         let result = engine.generate_audio_resolved(
@@ -1635,15 +1708,24 @@ mod tests {
     }
 
     #[test]
-    fn flights_do_not_merge_session_or_catalog_admission_epochs() {
+    fn flights_do_not_merge_visibility_policy_session_or_catalog_admission_epochs() {
         let first = RequestKey {
             address: RemoteAddress::file("C:/Music/song.mp3"),
             source_address: None,
             target_px: 128,
+            policy_fingerprint: crate::file_type_visibility::FileTypeVisibility::default()
+                .fingerprint(),
             session: ("client".into(), "session-a".into()),
             admission: crate::catalog::CatalogAdmission::Admitted(1),
         };
+        let mut policy = crate::file_type_visibility::FileTypeVisibility::default();
+        policy
+            .excluded_categories
+            .insert(crate::file_type_visibility::FileTypeCategory::Audio);
         let mut second = first.clone();
+        second.policy_fingerprint = policy.fingerprint();
+        assert!(first != second);
+        second = first.clone();
         second.session.1 = "session-b".into();
         assert!(first != second);
         second = first.clone();
@@ -1659,6 +1741,8 @@ mod tests {
             address: RemoteAddress::file("C:/Pictures/b.jpg"),
             source_address: None,
             target_px: 128,
+            policy_fingerprint: crate::file_type_visibility::FileTypeVisibility::default()
+                .fingerprint(),
             session: ("client".into(), "session".into()),
             admission: crate::catalog::CatalogAdmission::Admitted(0),
         };

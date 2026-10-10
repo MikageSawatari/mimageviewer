@@ -139,6 +139,12 @@ const ALLOWLIST_ENTRIES: &[AllowlistEntry] = &[
 // implemented. A6 is therefore deliberately defined against the implementation that exists:
 // cfg(test)-gated App methods/functions ending in _for_test, plus their call sites.
 const PUBLIC_API_ALLOWLIST: &[&str] = &[
+    // 1.345 keeps bookmark projection, pending request and title draft in the owning bundle.
+    // ContextRef only reads mounted/at-rest owners; it cannot mutate or replace sibling state.
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn book_bookmarks_request (self) -> Option < & 'a CurrentBookBookmarksRequest >",
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn book_bookmarks_key (self) -> Option < & 'a BookBookmarkProjectionKey >",
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn book_bookmarks (self) -> & 'a [crate :: book_bookmarks :: BookBookmark]",
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn book_bookmark_title_editing (self) -> bool",
     // 1.350 cache deletion invalidates shared source owners without mounting parked contexts.
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn invalidate_converted_archive_sources_in_parked_contexts (& mut self)",
     // 1.347 explicit cache maintenance resets only terminal audio art in living owners.
