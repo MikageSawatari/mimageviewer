@@ -33,7 +33,7 @@
 ## 1. 優先候補
 
 ### 1.366 `/` 区切りで開いたフォルダから Ctrl+↓ で次のフォルダへ進めない (無反応) — 利用者の実機報告 (2026-10-10)
-- **対応中 (実装担当 2026-10-10)**: A の比較統一・入力表記統一と回帰テストを `1183e4714` に記録。利用者が伝えたレビュー P2 のお気に入り入力迂回に対し、通常の direct-navigation 受理時のコピー正規化と実入力経路の回帰テストを追加 (追補は未コミット)。入力と保存キーの境界は [virtual-folders.md](virtual-folders.md)「実パスの比較と入力表記」に記録。追補の再レビューと利用者の実機確認は未実施。
+- **対応中 (実装担当 2026-10-10)**: A の比較統一・入力表記統一と回帰テストを `1183e4714` に記録。お気に入り入力迂回の受理位置修正は `4a8577f42` に記録。利用者が伝えた再レビューは ACCEPT、P3 は分類経路の検証記述の過大評価。追補で `.epub`／`.7z` の分類要求生成と worker 完了後の採用をテストし、即時ロードの `.zip`／`.pdf` と区別した (テスト・文書のみ、未コミット)。入力と保存キーの境界は [virtual-folders.md](virtual-folders.md)「実パスの比較と入力表記」に記録。利用者の実機確認は未記録。
 - **次の版の決定 (利用者 2026-10-10)**: 次の版に入れる。下の A だけを行う (一覧での境界トースト B は今回は行わない)。ライン C (worktree mimageviewer-nextsmall) で §1.365 を master へ取り込んだ後に扱う。
 - 観測 (利用者): `g:/home/comfyui/genshin_random\yaoyao_truepencil` で Ctrl+↓ を押しても次のフォルダへ進まず、トーストも出ない。perf ログ (利用者の通常データ、2026-10-10 19:2x): `nav/dfs_begin start="g:/home/comfyui/genshin_random\yaoyao_truepencil"` → `dfs_end found=false ms=0.73` → `apply_end reason=dfs_empty` を 4 回。設定 `folder_tree_sort_order = name_asc` で、名前順なら次は `g:\home\comfyui\test` (画像 1,460 件) のはず。
 - 原因 (修正前のコードの参照): 小文字ドライブと `/` を含むパス (アドレスバーへの手入力と推定) を開いたまま DFS が親へ上がる。`next_sibling_or_ancestor_sibling` (`src/folder_tree.rs:865`) は親の `read_dir` 結果 (`g:/home/comfyui\genshin_random`) の中から現在位置を `path_eq` (`src/folder_tree.rs:1283`、小文字化した文字列の完全一致) で探すが、探す側は `g:/home/comfyui/genshin_random` なので一致せず、`position(..)?` で None になり探索全体が「次はない」で終わる。一覧の `FolderNavMode::Grid` の dfs_empty は何も表示しない (`src/app.rs` の `FolderNavMode::Grid => {}`) ため無反応に見える。リリース済みの既存動作。

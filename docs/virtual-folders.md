@@ -132,8 +132,12 @@ verbatim/device namespace の表記を維持し、I/O や保存キーの変更�
 お気に入りの新規登録と通常 open、物理履歴／A・B の復帰要求で適用する。
 既存のお気に入り／履歴／復元設定を一括書換えせず、open 要求として受け取ったコピーを揃える。
 メニュー／ツールバー／ゲームパッドのお気に入り要求は `open_direct_navigation_target` の
-受理時にコピーを揃える。通常フォルダの即時ロードと ZIP/PDF 等の分類 worker の両方より前に適用し、
+受理時にコピーを揃える。即時ロードと EPUB・変換書庫 (`.7z` 等) の分類 worker の両方より前に適用し、
 `_owned` ロード入口を迂回する通常入力でも現在地とアドレス表示へ混在表記を持ち込まない。
+お気に入りの回帰テストは、通常名／`.zip`／`.pdf` の実フォルダで即時ロードを確認する。
+`.epub`／`.7z` の実フォルダでは `path_needs_open_classification` が true であること、
+正規化済みパスを持つ分類要求の生成と worker 完了後のフォルダ採用を確認する。
+対象は拡張子付き実フォルダの入力受理・Directory 分類・採用。
 
 Remote の実パスは既存の検証・canonicalize owner で解決し、通常の logical path を標準表記にする。
 変換書庫の公開 source address は既存の完全一致対応表の identity として維持し、

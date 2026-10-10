@@ -8302,7 +8302,13 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn mixed_path_favorite_picker_direct_navigation_preserves_saved_record() {
-        for folder_name in ["mixed-input", "mixed-input.zip", "mixed-input.pdf"] {
+        for folder_name in [
+            "mixed-input",
+            "mixed-input.zip",
+            "mixed-input.pdf",
+            "mixed-input.epub",
+            "mixed-input.7z",
+        ] {
             crate::app::tests::assert_mixed_path_favorite_direct_navigation(
                 folder_name,
                 "gamepad-picker",

@@ -8,7 +8,13 @@ mod thumbnail_request_lifecycle;
 #[cfg(windows)]
 #[test]
 fn mixed_path_favorite_direct_navigation_standardizes_input_without_rewriting_saved_record() {
-    for folder_name in ["mixed-input", "mixed-input.zip", "mixed-input.pdf"] {
+    for folder_name in [
+        "mixed-input",
+        "mixed-input.zip",
+        "mixed-input.pdf",
+        "mixed-input.epub",
+        "mixed-input.7z",
+    ] {
         for source in ["menu-toolbar", "gamepad-ring"] {
             assert_mixed_path_favorite_direct_navigation(folder_name, source, |app, ctx| {
                 if source == "menu-toolbar" {
@@ -63,6 +69,12 @@ pub(super) fn assert_mixed_path_favorite_direct_navigation(
     let ctx = egui::Context::default();
     let (path, restore_intent) = favorite_input(&mut app, &ctx);
     assert_eq!(path.as_os_str(), stored.as_os_str());
+    let requires_classification = matches!(folder_name, "mixed-input.epub" | "mixed-input.7z");
+    assert_eq!(
+        App::path_needs_open_classification(&path),
+        requires_classification,
+        "{source}: {folder_name}"
+    );
     // The same acceptance call as App::update's menu/toolbar/input_nav merge.
     app.open_direct_navigation_target(
         path,
@@ -72,6 +84,19 @@ pub(super) fn assert_mixed_path_favorite_direct_navigation(
         None,
         restore_intent,
     );
+    let classification = app.top_level_grid_view.open_path_classification();
+    assert_eq!(
+        classification.is_some(),
+        requires_classification,
+        "{source}: {folder_name}"
+    );
+    if let Some(classification) = classification {
+        assert_eq!(classification.path.as_os_str(), expected.as_os_str());
+        assert!(matches!(
+            classification.continuation.as_deref(),
+            Some(ClassifiedOpenContinuation::DirectNavigation { .. })
+        ));
+    }
     app.settle_open_path_classification_for_test();
     app.finish_page_identity_preparation_for_test();
     assert_eq!(
