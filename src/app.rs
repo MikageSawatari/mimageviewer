@@ -533,6 +533,7 @@ pub(crate) mod file_type_resume;
 #[cfg(test)]
 mod rar_archive_cache_tests;
 pub(crate) use facet_navigation::{FacetNavigationState, FacetRoute, FacetScope};
+pub(crate) mod book_materialization;
 pub(crate) mod folder_scan;
 #[cfg(test)]
 mod media_resume_meter_tests;
@@ -4573,6 +4574,9 @@ pub(crate) enum GridAspectLayout {
 /// cloneable, while the Smart adoption permit owns a potentially large offscreen root payload.
 enum VisibleInstallAuthority<'a> {
     Ordinary,
+    Projection {
+        recipe: book_materialization::ProjectionRecipe,
+    },
     Rating {
         stars: u8,
     },
@@ -14885,6 +14889,7 @@ pub struct App {
     pub(crate) normal_folder_omitted_entries: Option<NormalFolderOmittedEntries>,
     pub(crate) navigation_scope: ViewerNavigationScope,
     pub(crate) items: Vec<GridItem>,
+    pub(crate) projection_recipe: book_materialization::ProjectionRecipe,
     pub(crate) page_identity_index: Arc<file_type_resume::PreparedPageIdentityIndex>,
     /// Hands out content identities. Process-wide on purpose: it maps content to identity and
     /// holds no per-viewer state, so sharing it lets the same page keep one id across every
@@ -19294,6 +19299,7 @@ impl App {
             normal_folder_omitted_entries: None,
             navigation_scope: ViewerNavigationScope::Main,
             items: Vec::new(),
+            projection_recipe: Default::default(),
             page_identity_index: Default::default(),
             item_id_interner: std::cell::RefCell::default(),
             texture_identity: std::cell::RefCell::default(),
@@ -25715,6 +25721,9 @@ impl App {
     pub(crate) fn spread_container_key_with_fallback(
         &self,
     ) -> Option<crate::spread_db::SpreadContainerKey> {
+        if self.extracted_result_surface().is_some() {
+            return None;
+        }
         if let Some(nav) = self.zip_nav.as_ref() {
             Some(crate::spread_db::container_key_with_fallback(
                 &nav.tree.zip_path,
@@ -25731,6 +25740,9 @@ impl App {
     }
 
     pub(crate) fn final_cover_spread_enabled_for_current_book(&self) -> bool {
+        if self.extracted_result_surface().is_some() {
+            return false;
+        }
         self.final_cover_spread_preference
             .effective(self.settings.final_cover_spread_enabled)
     }
@@ -25738,6 +25750,12 @@ impl App {
     pub(crate) fn singleton_spread_placement_enabled_for_current_book(
         &self,
     ) -> crate::settings::SingletonSpreadEndpointSettings {
+        if self.extracted_result_surface().is_some() {
+            return crate::settings::SingletonSpreadEndpointSettings {
+                first: false,
+                last: false,
+            };
+        }
         self.singleton_spread_endpoint_preferences.effective(
             crate::settings::SingletonSpreadEndpointSettings {
                 first: self.settings.singleton_spread_first_enabled,
@@ -25747,6 +25765,12 @@ impl App {
     }
 
     pub(crate) fn page_alone_enabled_for_current_book(&self) -> crate::settings::PageAloneSettings {
+        if self.extracted_result_surface().is_some() {
+            return crate::settings::PageAloneSettings {
+                after_cover: false,
+                last: false,
+            };
+        }
         self.page_alone_preferences
             .effective(crate::settings::PageAloneSettings {
                 after_cover: self.settings.page_after_cover_alone_enabled,
@@ -25825,6 +25849,10 @@ impl App {
         defaults: SpreadRestoreDefaults,
         document_direction: Option<crate::pdf_loader::PdfReadingDirection>,
     ) -> Result<(), String> {
+        if self.extracted_result_surface().is_some() {
+            self.begin_extracted_result_view();
+            return Ok(());
+        }
         let db = self.spread_db.as_ref().map_err(Clone::clone)?;
         let stored = db.get_state_with_fallback(key, fallback);
         let final_cover_preference =
@@ -30709,7 +30737,10 @@ impl App {
         {
             self.tag_view_subfolder_restore = Some(restore_state);
         }
-        self.start_loading_items(
+        self.start_loading_extracted_items(
+            book_materialization::ExtractedSurface::Search(
+                top_level_grid_view::TopLevelSearchView::Tag,
+            ),
             search_results_synthetic_path(),
             items,
             image_metas,
@@ -31068,7 +31099,10 @@ impl App {
         {
             self.favsearch_subfolder_restore = Some(restore_state);
         }
-        self.start_loading_items(
+        self.start_loading_extracted_items(
+            book_materialization::ExtractedSurface::Search(
+                top_level_grid_view::TopLevelSearchView::Favorite,
+            ),
             synthetic,
             items,
             image_metas,
@@ -33601,7 +33635,7 @@ impl App {
                     }
                 };
                 let (items, image_metas, existing_keys) =
-                    Self::build_pdf_page_rows(&path, &pages.pages);
+                    book_materialization::materialize_document_rows(&path, &pages.pages);
                 PreparedPhysicalListing::Pdf {
                     path: path.clone(),
                     source,
@@ -35366,12 +35400,11 @@ impl App {
                 }))
         {
             prepared.nav.enter(&pending.dir_prefix);
-            let (mut items, mut metas) = prepared.nav.materialize_current(BOOK_READING_PAGE_ORDER);
-            crate::grid_item::arrange_grid_items(
-                &mut items,
-                &mut metas,
-                &self.settings.grid_display_order,
-                Some(BOOK_READING_PAGE_ORDER),
+            let (items, metas) = book_materialization::materialize_archive_level(
+                &prepared.nav.tree,
+                prepared.nav.current(),
+                BOOK_READING_PAGE_ORDER,
+                Some(&self.settings.grid_display_order),
             );
             prepared.items = items;
             prepared.image_metas = metas;
@@ -35404,12 +35437,11 @@ impl App {
                 .unwrap_or_else(|| crate::zip_tree::ZipNavState::new(tree)),
             _ => crate::zip_tree::ZipNavState::new(tree),
         };
-        let (mut items, mut image_metas) = nav.materialize_current(sort);
-        crate::grid_item::arrange_grid_items(
-            &mut items,
-            &mut image_metas,
-            grid_display_order,
-            Some(sort),
+        let (items, image_metas) = book_materialization::materialize_archive_level(
+            &nav.tree,
+            nav.current(),
+            sort,
+            Some(grid_display_order),
         );
         PreparedZipGrid {
             nav,
@@ -35575,6 +35607,7 @@ impl App {
         }
         // start_loading_items が zip_nav を None にした後で、新しいツリーナビを設定する。
         self.zip_nav = Some(nav);
+        self.adopt_archive_recipe();
         // アドレス欄をパンくず表示に更新 (単一ラッパー ZIP は collapse 済み実効 prefix を反映)。
         self.update_zip_nav_address();
         // ルート本の見開き設定を本ごとのキー (zip_path + 実効 prefix) で読み直す。
@@ -35785,12 +35818,11 @@ impl App {
             let Some(nav) = self.zip_nav.as_ref() else {
                 return;
             };
-            let (mut items, mut metas) = nav.materialize_current(sort);
-            crate::grid_item::arrange_grid_items(
-                &mut items,
-                &mut metas,
-                &display_order,
-                Some(sort),
+            let (items, metas) = book_materialization::materialize_archive_level(
+                &nav.tree,
+                nav.current(),
+                sort,
+                Some(&display_order),
             );
             (items, metas, nav.tree.zip_path.clone())
         };
@@ -35910,6 +35942,7 @@ impl App {
             .collect();
         // items / image_metas / thumbnails 差し替え + items_generation bump。
         self.install_new_items(items, metas);
+        self.adopt_archive_recipe();
         // idx ベース状態 + in-flight キューを破棄 (replace_search_view_items / snapshot と同じ)。
         self.invalidate_idx_state_and_queues();
         if self.color_filter.enabled {
@@ -36938,7 +36971,9 @@ impl App {
                 .as_mut()
                 .and_then(|restore| restore.adoption.take());
             let (items, image_metas, existing_keys) =
-                Self::build_pdf_meta_placeholder_rows(&pdf_path, page_count, mtime, file_size);
+                book_materialization::materialize_cached_document_rows(
+                    &pdf_path, page_count, mtime, file_size,
+                );
             if !self.adopt_direct_pdf_rows(
                 &pdf_path,
                 &owner,
@@ -37224,55 +37259,6 @@ impl App {
         Some((page_count, mtime, file_size))
     }
 
-    fn build_pdf_meta_placeholder_rows(
-        pdf_path: &Path,
-        page_count: u32,
-        mtime: i64,
-        file_size: u64,
-    ) -> (
-        Vec<GridItem>,
-        Vec<Option<(i64, i64)>>,
-        std::collections::HashSet<String>,
-    ) {
-        let mut items: Vec<GridItem> = Vec::with_capacity(page_count as usize);
-        let mut image_metas: Vec<Option<(i64, i64)>> = Vec::with_capacity(page_count as usize);
-        let mut existing_keys: std::collections::HashSet<String> =
-            std::collections::HashSet::with_capacity(page_count as usize);
-        for i in 0..page_count {
-            items.push(GridItem::PdfPage {
-                pdf_path: pdf_path.to_path_buf(),
-                page_num: i,
-                content_type: None, // 実際の render 時に解析
-            });
-            image_metas.push(Some((mtime, file_size as i64)));
-            existing_keys.insert(crate::grid_item::pdf_page_cache_key(i));
-        }
-        (items, image_metas, existing_keys)
-    }
-
-    fn build_pdf_page_rows(
-        pdf_path: &Path,
-        pages: &[crate::pdf_loader::PdfPageEntry],
-    ) -> (
-        Vec<GridItem>,
-        Vec<Option<(i64, i64)>>,
-        std::collections::HashSet<String>,
-    ) {
-        let mut items = Vec::with_capacity(pages.len());
-        let mut image_metas = Vec::with_capacity(pages.len());
-        let mut existing_keys = std::collections::HashSet::with_capacity(pages.len());
-        for page in pages {
-            existing_keys.insert(crate::grid_item::pdf_page_cache_key(page.page_num));
-            items.push(GridItem::PdfPage {
-                pdf_path: pdf_path.to_path_buf(),
-                page_num: page.page_num,
-                content_type: None,
-            });
-            image_metas.push(Some((page.mtime, page.file_size as i64)));
-        }
-        (items, image_metas, existing_keys)
-    }
-
     /// Apply a proven PDF/EPUB enumeration at the visible adoption boundary.
     /// Staged history passes its worker result here without creating a second pending owner.
     fn finish_pdf_enumerate_success(
@@ -37423,7 +37409,7 @@ impl App {
 
         if need_rebuild {
             let (items, image_metas, existing_keys) =
-                Self::build_pdf_page_rows(&pdf_path, &pages.pages);
+                book_materialization::materialize_document_rows(&pdf_path, &pages.pages);
 
             self.start_loading_items(
                 pdf_path.clone(),
@@ -37607,7 +37593,7 @@ impl App {
                         .as_mut()
                         .and_then(|restore| restore.adoption.take());
                     let (items, image_metas, existing_keys) =
-                        Self::build_pdf_page_rows(&pdf_path, &pages.pages);
+                        book_materialization::materialize_document_rows(&pdf_path, &pages.pages);
                     if !self.adopt_direct_pdf_rows(
                         &pdf_path,
                         &owner,
@@ -38371,11 +38357,40 @@ impl App {
         );
     }
 
+    pub(crate) fn start_loading_extracted_items(
+        &mut self,
+        surface: book_materialization::ExtractedSurface,
+        source_path: PathBuf,
+        items: Vec<GridItem>,
+        image_metas: Vec<Option<(i64, i64)>>,
+        catalog_existing_keys: std::collections::HashSet<String>,
+        video_items: Vec<(usize, PathBuf, u64)>,
+        folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
+    ) {
+        self.start_loading_items_inner(
+            source_path,
+            items,
+            image_metas,
+            catalog_existing_keys,
+            video_items,
+            folder_signature,
+            None,
+            None,
+            None,
+            None,
+            None,
+            VisibleInstallAuthority::Projection {
+                recipe: book_materialization::ProjectionRecipe::ExtractedResult(surface),
+            },
+        );
+    }
+
     /// Stack grouping has already prepared its candidate order and all bulk display lookups on
     /// the worker. Keep the normal loader's video/thumbnail lifecycle without cold UI reads.
     pub(crate) fn start_loading_stack_items(
         &mut self,
         source_path: PathBuf,
+        recipe: book_materialization::ProjectionRecipe,
         prepared: crate::filename_stack_ui::StackPreparedItems,
         existing_keys: std::collections::HashSet<String>,
         folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
@@ -38410,7 +38425,7 @@ impl App {
             Some(pin_map),
             Some((rating_cache, tags_cache)),
             None,
-            VisibleInstallAuthority::Ordinary,
+            VisibleInstallAuthority::Projection { recipe },
             prepared_visible,
         );
         if let Some((continuation, _)) = hydration.as_mut() {
@@ -38422,6 +38437,7 @@ impl App {
 
     pub(crate) fn start_loading_subfolder_items(
         &mut self,
+        surface: book_materialization::ExtractedSurface,
         source_path: PathBuf,
         items: Vec<GridItem>,
         image_metas: Vec<Option<(i64, i64)>>,
@@ -38440,7 +38456,9 @@ impl App {
             None,
             None,
             None,
-            VisibleInstallAuthority::Ordinary,
+            VisibleInstallAuthority::Projection {
+                recipe: book_materialization::ProjectionRecipe::ExtractedResult(surface),
+            },
         );
     }
 
@@ -38673,7 +38691,9 @@ impl App {
     ) -> MainListHydration {
         let detached_physical = self.navigation_scope.is_detached_physical();
         let smart_open_path = match &authority {
-            VisibleInstallAuthority::Ordinary | VisibleInstallAuthority::Rating { .. } => None,
+            VisibleInstallAuthority::Ordinary
+            | VisibleInstallAuthority::Projection { .. }
+            | VisibleInstallAuthority::Rating { .. } => None,
             VisibleInstallAuthority::StagedArchive { logical_source } => {
                 Some((*logical_source).to_path_buf())
             }
@@ -38686,6 +38706,7 @@ impl App {
         } = prepared_visible;
         let preserve_smart_folder_session = match &authority {
             VisibleInstallAuthority::Ordinary
+            | VisibleInstallAuthority::Projection { .. }
             | VisibleInstallAuthority::Rating { .. }
             | VisibleInstallAuthority::StagedArchive { .. } => {
                 !detached_physical
@@ -39001,7 +39022,22 @@ impl App {
         let has_prepared_aggregate = prepared_subfolder
             .as_ref()
             .is_some_and(|metadata| metadata.aggregate.is_some());
+        let projection_recipe = match &authority {
+            VisibleInstallAuthority::Projection { recipe } => recipe.clone(),
+            VisibleInstallAuthority::Rating { .. } => {
+                book_materialization::ProjectionRecipe::ExtractedResult(
+                    book_materialization::ExtractedSurface::Rating,
+                )
+            }
+            _ => book_materialization::ProjectionRecipe::for_physical(
+                &self.settings,
+                &source_path,
+                smart_open_path.as_deref().unwrap_or(&source_path),
+                &items,
+            ),
+        };
         self.install_new_items_inner(items, image_metas, !has_prepared_aggregate);
+        self.projection_recipe = projection_recipe;
         if let Some(pin_map) = prepared_pin_map {
             self.folder_pin_map = pin_map;
         }
@@ -40078,11 +40114,13 @@ impl App {
     /// the UI thread. The aggregate owner supplies the aligned metadata and refresh lifecycle.
     pub(crate) fn install_prepared_aggregate_items(
         &mut self,
+        recipe: book_materialization::ProjectionRecipe,
         items: Vec<GridItem>,
         image_metas: Vec<Option<(i64, i64)>>,
         page_identity_index: Arc<file_type_resume::PreparedPageIdentityIndex>,
     ) {
         self.install_new_items_inner(items, image_metas, false);
+        self.projection_recipe = recipe;
         let previous = std::mem::replace(&mut self.page_identity_index, page_identity_index);
         self.retire_smart_folder_payloads([
             Box::new(previous) as smart_folder::RetiredSmartFolderPayload
@@ -40102,6 +40140,7 @@ impl App {
         }
         self.persist_pending_view_trim_state();
         self.items = items;
+        self.projection_recipe = Default::default();
         self.image_metas = image_metas;
         self.thumb_edit_preview_keys.clear();
         self.idle_upgrade_cache_bypass_ineligible.clear();
@@ -47434,11 +47473,7 @@ impl App {
         if !crate::path_key::eq_keep_drive(&nav.tree.zip_path, &bookmark.container_path) {
             return None;
         }
-        crate::book_bookmarks::resolve_archive_bookmark_target(
-            &nav.tree,
-            entry_name,
-            &self.settings.grid_display_order,
-        )
+        crate::book_bookmarks::resolve_archive_bookmark_target(&nav.tree, entry_name)
     }
 
     pub(crate) fn book_bookmark_panel_resolution(
@@ -47447,8 +47482,13 @@ impl App {
     ) -> BookBookmarkPanelResolution {
         let current_item_index = self.book_bookmark_item_idx(bookmark);
         let target_item_index = current_item_index.or_else(|| {
-            self.resolve_current_archive_bookmark_target(bookmark)
-                .map(|target| target.item_index)
+            let target = self.resolve_current_archive_bookmark_target(bookmark)?;
+            let nav = self.zip_nav.as_ref()?;
+            book_materialization::resolve_archive_target_index(
+                &nav.tree,
+                &target,
+                &self.settings.grid_display_order,
+            )
         });
         BookBookmarkPanelResolution {
             current_item_index,
@@ -60647,6 +60687,9 @@ impl App {
                     .map(|entry| entry.display_meta)
                     .collect();
                 app.install_prepared_aggregate_items(
+                    crate::app::book_materialization::ProjectionRecipe::ExtractedResult(
+                        crate::app::book_materialization::ExtractedSurface::Collection,
+                    ),
                     items,
                     image_metas,
                     Arc::clone(&plan.page_identity_index),
@@ -65320,6 +65363,9 @@ impl App {
             .filter(|&previous_idx| previous_idx != idx)
         {
             self.cleanup_normalize_state_for_fs_idx(previous_idx);
+        }
+        if self.fullscreen_idx.is_none() && self.extracted_result_surface().is_some() {
+            self.begin_extracted_result_view();
         }
         self.fullscreen_idx = Some(idx);
         #[cfg(windows)]

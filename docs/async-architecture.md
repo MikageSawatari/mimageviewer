@@ -1,5 +1,24 @@
 # 非同期・並列アーキテクチャ
 
+## 本の列生成の共通境界（§1.242 G1）
+
+`app/book_materialization`は既存のsource準備結果からZIP/PDF/EPUB/folder行を投影する。
+folder rating lookupは従来の準備worker経路を保ち、新しい列挙・待機・UI-thread I/Oは追加しない。
+cached documentの早期adoption、password/EPUB取消、policy/generationによるstale reply拒否は
+既存request ownerが担う。raw ZIP manifestと採用済みpolicyの表示列を混同しない。
+
+完成itemsと`ProjectionRecipe`を同じ採用境界で公開し、以後は同じViewerContextBundleで所有する。
+固定snapshotは元一覧と固定一覧それぞれのrecipeを保存し、子の物理本を離れた復帰で対応する
+保存列と同時に戻す。Smart rootも既存準備済みrootの復帰境界でExtractedResultを採用する。
+read-only mount/fork/closeから兄弟のgeneration/queue/cancel/cacheを変更しない。
+A2のmode切替は既存表示owner内のsession操作であり、新しいworker/store/失効通知は持たない。
+元の本の列を保存する既存SnapshotStateは閲覧状態（mode/方向/flow/shift index/補助設定）も
+一緒に保持し、固定解除の同じadoption内で復元する。BSで固定列へ戻る場合はA2のまま。
+検索のback/BS・履歴の本への復帰は既存Book設定adoption、F12はcontext内snapshot/bundle、
+Remoteは本の通常responseから復元し、A2のSingle/一時Spreadを本へ保存しない。
+
+
+
 「どの処理がどのスレッド/プロセスで走るか」「どうやってキャンセルするか」「キャッシュ競合をどう避けるか」
 の一覧。並列処理を追加・変更するときの設計テンプレートとして使う。
 

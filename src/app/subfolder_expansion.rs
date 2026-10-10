@@ -2651,7 +2651,11 @@ impl App {
             None,
             None,
             None,
-            VisibleInstallAuthority::Ordinary,
+            VisibleInstallAuthority::Projection {
+                recipe: super::book_materialization::ProjectionRecipe::ExtractedResult(
+                    super::book_materialization::ExtractedSurface::SubfolderExpansion,
+                ),
+            },
             token,
         );
         if let Some(generation) = rating_write_generation {

@@ -216,6 +216,28 @@ impl App {
         self.mouse_ring_suppress_context_menu_once = false;
     }
 
+    pub(super) fn capture_snapshot_viewing_state(&self) -> crate::snapshot::SnapshotViewingState {
+        crate::snapshot::SnapshotViewingState {
+            mode: self.spread_mode,
+            direction: self.reading_direction,
+            flow: self.reading_flow,
+            shift_anchor: self.spread_shift_anchor_idx,
+            final_cover: self.final_cover_spread_preference,
+            endpoints: self.singleton_spread_endpoint_preferences,
+            page_alone: self.page_alone_preferences,
+        }
+    }
+
+    fn restore_snapshot_viewing_state(&mut self, state: crate::snapshot::SnapshotViewingState) {
+        self.spread_mode = state.mode;
+        self.reading_direction = state.direction;
+        self.reading_flow = state.flow;
+        self.spread_shift_anchor_idx = state.shift_anchor;
+        self.final_cover_spread_preference = state.final_cover;
+        self.singleton_spread_endpoint_preferences = state.endpoints;
+        self.page_alone_preferences = state.page_alone;
+    }
+
     fn finish_snapshot_viewer_index_swap(&mut self, swap: Option<SnapshotViewerIndexSwap>) {
         let Some(mut swap) = swap else {
             self.clear_snapshot_index_space_derived_state();
@@ -737,6 +759,7 @@ impl App {
         self.thumbnails.truncate(parent_len);
         self.image_metas.truncate(parent_len);
         self.page_identity_index = direct.saved_page_identity_index;
+        self.projection_recipe = direct.saved_projection_recipe;
         self.visible_indices.retain(|idx| *idx < parent_len);
         self.details_order.retain(|idx| *idx < parent_len);
         self.checked.retain(|idx| *idx < parent_len);
@@ -884,6 +907,13 @@ impl App {
         let list_view_thumbnails = captured_thumbnails.clone();
         let list_view_image_metas = captured_image_metas.clone();
         let saved_page_identity_index = self.page_identity_index.clone();
+        let saved_viewing_state = self.capture_snapshot_viewing_state();
+        let saved_projection_recipe = std::mem::replace(
+            &mut self.projection_recipe,
+            super::book_materialization::ProjectionRecipe::ExtractedResult(
+                super::book_materialization::ExtractedSurface::Snapshot,
+            ),
+        );
         let saved_items = std::mem::replace(&mut self.items, captured_items_grid);
         let saved_thumbnails = std::mem::replace(&mut self.thumbnails, captured_thumbnails);
         let saved_image_metas = std::mem::replace(&mut self.image_metas, captured_image_metas);
@@ -929,6 +959,8 @@ impl App {
             generation_id,
             saved_items,
             saved_page_identity_index,
+            saved_projection_recipe,
+            saved_viewing_state,
             saved_thumbnails,
             saved_image_metas,
             saved_visible_indices,
@@ -936,6 +968,7 @@ impl App {
             saved_selected,
             saved_zip_nav,
             list_view_items,
+            list_view_projection_recipe: self.projection_recipe.clone(),
             list_view_thumbnails,
             list_view_image_metas,
             list_view_page_identity_index: Default::default(),
@@ -965,6 +998,7 @@ impl App {
         self.bump_items_generation();
         self.invalidate_idx_state_and_queues();
         self.invalidate_snapshot_details_index_state();
+        self.begin_extracted_result_view();
         self.finish_snapshot_viewer_index_swap(viewer_index_swap);
         self.page_identity_index = Default::default();
         self.prepare_snapshot_page_identity_index(accepted_policy);
@@ -1281,6 +1315,7 @@ impl App {
             }
             self.items = snap.saved_items;
             self.page_identity_index = snap.saved_page_identity_index;
+            self.projection_recipe = snap.saved_projection_recipe;
             self.thumbnails = merged_thumbnails;
             self.image_metas = snap.saved_image_metas;
             self.visible_indices = snap.saved_visible_indices;
@@ -1299,6 +1334,12 @@ impl App {
             self.invalidate_idx_state_and_queues();
             self.invalidate_snapshot_details_index_state();
             self.finish_snapshot_viewer_index_swap(viewer_index_swap);
+            // Complete this same retained-list adoption with the saved presentation. Its
+            // shift index already belongs to saved_items and must not be subset-remapped.
+            // DirectMedia is an ordinary reader, so retain its existing return behavior.
+            if !matches!(snap.source_label, SnapshotSourceLabel::DirectMedia { .. }) {
+                self.restore_snapshot_viewing_state(snap.saved_viewing_state);
+            }
             self.clear_tags_cache();
             // items を saved (元フォルダ) に戻したので、ページ編集状態も元 idx で hydrate
             // し直す (= activate の subset hydrate と対称、Codex P1)。snapshot 中に編集した分は
@@ -1349,6 +1390,7 @@ impl App {
             list_thumbs,
             list_image_metas,
             list_identity_index,
+            list_recipe,
             exact_page_edits,
         ) = {
             let Some(snap) = self.snapshot.as_ref() else {
@@ -1360,6 +1402,7 @@ impl App {
                 snap.list_view_thumbnails.clone(),
                 snap.list_view_image_metas.clone(),
                 snap.list_view_page_identity_index.clone(),
+                snap.list_view_projection_recipe.clone(),
                 // 検索 view 由来 snapshot は origin が cross-folder prefix なので rehydrate せず
                 // clear のみ (= activate と同じ判定。pre_snapshot_search_origin Some が search 由来)。
                 snap.page_edit_source == crate::snapshot::SnapshotPageEditSource::PreparedExact,
@@ -1405,6 +1448,7 @@ impl App {
         // items 入れ替え (= 保存したサムネ付き state を復帰)
         self.items = list_items;
         self.page_identity_index = list_identity_index;
+        self.projection_recipe = list_recipe;
         self.thumbnails = list_thumbs;
         self.image_metas = list_image_metas;
         self.visible_indices = (0..n).collect();
@@ -2260,11 +2304,8 @@ impl App {
             if !direct && !converted_alias {
                 return None;
             }
-            let target = crate::book_bookmarks::resolve_archive_bookmark_target(
-                &nav.tree,
-                requested_entry,
-                &self.settings.grid_display_order,
-            )?;
+            let target =
+                crate::book_bookmarks::resolve_archive_bookmark_target(&nav.tree, requested_entry)?;
             (tree_path, target)
         };
         let already_materialized = self.zip_nav.as_ref().is_some_and(|nav| {
@@ -3223,6 +3264,123 @@ mod tests {
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
         // SearchContainer は除外されて 2 件。
         assert_eq!(app.snapshot_count(), Some(2));
+    }
+
+    #[test]
+    fn g1_snapshot_a2_deactivation_preserves_source_book_presentation() {
+        use crate::app::book_materialization::{BookScope, ProjectionRecipe};
+        let mut app = test_app_with_items(vec![
+            GridItem::Image(PathBuf::from(r"E:\test\01.png")),
+            GridItem::Image(PathBuf::from(r"E:\test\02.png")),
+        ]);
+        app.projection_recipe =
+            ProjectionRecipe::Book(BookScope::ImageFolder(PathBuf::from(r"E:\test")));
+        app.spread_mode = crate::settings::SpreadMode::RtlCover;
+        app.reading_direction = crate::settings::ReadingDirection::Rtl;
+        app.settings.default_reading_direction = crate::settings::ReadingDirection::Ltr;
+        app.reading_flow = crate::settings::ReadingFlow::Vertical;
+        app.spread_shift_anchor_idx = Some(1);
+        let before = app.capture_snapshot_viewing_state();
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Single);
+        app.apply_fullscreen_spread_mode(
+            &egui::Context::default(),
+            0,
+            crate::settings::SpreadMode::Ltr,
+        );
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Ltr);
+        app.deactivate_snapshot();
+        assert_eq!(app.capture_snapshot_viewing_state(), before);
+        assert!(matches!(app.projection_recipe, ProjectionRecipe::Book(_)));
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::RtlCover);
+        assert_eq!(
+            app.reading_direction,
+            crate::settings::ReadingDirection::Rtl
+        );
+    }
+
+    #[test]
+    fn g1_snapshot_child_return_and_deactivation_restore_accepted_recipes() {
+        use crate::app::book_materialization::{BookScope, ExtractedSurface, ProjectionRecipe};
+        let items = vec![GridItem::Image(PathBuf::from(r"E:\test\page.png"))];
+        let mut app = test_app_with_items(items.clone());
+        let original = ProjectionRecipe::Book(BookScope::ImageFolder(PathBuf::from(r"E:\test")));
+        app.projection_recipe = original.clone();
+        app.spread_mode = crate::settings::SpreadMode::RtlCover;
+        app.spread_shift_anchor_idx = Some(0);
+        let before = app.capture_snapshot_viewing_state();
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
+        let fixed = ProjectionRecipe::ExtractedResult(ExtractedSurface::Snapshot);
+        assert_eq!(app.projection_recipe, fixed);
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Single);
+        app.current_folder = Some(PathBuf::from(r"E:\test\child.pdf"));
+        app.projection_recipe =
+            ProjectionRecipe::Book(BookScope::Document(app.current_folder.clone().unwrap()));
+        app.items = vec![GridItem::PdfPage {
+            pdf_path: app.current_folder.clone().unwrap(),
+            page_num: 8,
+            content_type: None,
+        }];
+        let ctx = egui::Context::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                focused: true,
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Backspace,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                assert!(app.handle_keyboard(ctx).is_none());
+            },
+        );
+        assert_eq!(app.projection_recipe, fixed);
+        assert_eq!(app.items, items);
+        app.deactivate_snapshot();
+        assert_eq!(app.projection_recipe, original);
+        assert_eq!(app.items, items);
+        assert_eq!(app.capture_snapshot_viewing_state(), before);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn g1_f12_snapshot_fork_return_keeps_original_book_state_and_main_unchanged() {
+        use crate::app::book_materialization::{BookScope, ProjectionRecipe};
+        let mut app = test_app_with_items(vec![GridItem::Image(PathBuf::from(r"E:\test\01.png"))]);
+        app.projection_recipe =
+            ProjectionRecipe::Book(BookScope::ImageFolder(PathBuf::from(r"E:\test")));
+        app.spread_mode = crate::settings::SpreadMode::RtlCover;
+        app.spread_shift_anchor_idx = Some(0);
+        let book_state = app.capture_snapshot_viewing_state();
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        app.apply_fullscreen_spread_mode(
+            &egui::Context::default(),
+            0,
+            crate::settings::SpreadMode::Ltr,
+        );
+        let main_state = app.capture_snapshot_viewing_state();
+        let main_generation = app.items_generation;
+        let mut fork = app.split_current_context_preserving_main_grid();
+        app.swap_viewer_context_bundle(&mut fork);
+        assert_eq!(
+            app.snapshot.as_ref().unwrap().saved_viewing_state,
+            book_state
+        );
+        app.deactivate_snapshot();
+        assert_eq!(app.capture_snapshot_viewing_state(), book_state);
+        assert!(matches!(app.projection_recipe, ProjectionRecipe::Book(_)));
+        app.swap_viewer_context_bundle(&mut fork);
+        drop(fork);
+        assert_eq!(app.capture_snapshot_viewing_state(), main_state);
+        assert_eq!(app.items_generation, main_generation);
+        assert!(app.is_snapshot_active());
+        app.deactivate_snapshot();
+        assert_eq!(app.capture_snapshot_viewing_state(), book_state);
     }
 
     #[test]

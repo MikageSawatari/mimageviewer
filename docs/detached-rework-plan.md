@@ -4500,3 +4500,16 @@ window predicate/HWND同定/placement/focus/viewport生成やrect一致捕捉を
 detached専用bool・repaint/retry/時間窓による症状修復を追加しない。
 検証はG0 source照合のみ。実装後はcontext後着・兄弟不変・取得順反転・退避復帰・cached Hidden新入場・
 mode新相方・E指定サイズ/前面wheelの自動回帰を実施し、実行証拠を別途記録する。
+
+### §11 追補: §1.242 G1 recipeのcontext所有（2026-10-10、実装記録）
+
+既存G0接点記録に基づき、itemsに付随するProjectionRecipeをViewerContextBundleの生成・
+mount/swap・forkへ登録した。snapshotの元一覧／固定一覧にもそれぞれ保持し、元一覧への
+F12復帰を含め、itemsと同時に対応するrecipeを戻す。Bookと抽出一覧の帰路をsurface名や
+anchorから推定しないための所有境界変更であり、detached述語/viewport/placementへの症状patchではない。
+A2の新規openはSingle、表示中forkはcapture-time modeを保持する。既存context退役/取消を使い、
+兄弟へのmutation invalidationは追加しない。独立レビューや実機観測の結果をこの記録では主張しない。
+
+2026-10-10 coordinator採択のA2帰還契約: 元の本の閲覧状態も既存snapshotに列と一緒に保存し、
+固定解除の同じadoption内で戻す。F12 forkのsnapshotはこの退避値を運び、fork内の解除はmainや
+兄弟の閲覧状態/列/workerを変更しない。DirectMediaの通常帰還は従来どおり。

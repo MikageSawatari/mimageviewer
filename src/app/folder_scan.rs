@@ -99,7 +99,7 @@ pub(crate) struct ScannedDir {
 
 #[derive(Default)]
 pub(crate) struct AuxiliaryMediaCandidates {
-    entries: Vec<ScannedMediaEntry>,
+    pub(super) entries: Vec<ScannedMediaEntry>,
 }
 
 impl AuxiliaryMediaCandidates {
@@ -254,281 +254,9 @@ pub(crate) fn discover_aggregate_video_sidecars_while(
     keep_running().then_some(result)
 }
 
-pub(crate) fn materialize_local_folder_listing(
-    path: &std::path::Path,
-    scan: ScannedDir,
-    settings: &crate::settings::Settings,
-) -> MaterializedFolderListing {
-    materialize_local_folder_listing_with_order(
-        path,
-        scan,
-        settings,
-        crate::rating_sort::ListingOrderRequest::from_settings(settings),
-        |keys| {
-            crate::rating_db::RatingDb::open_readonly(crate::rating_db::RatingDb::db_path())
-                .map_err(|error| error.to_string())?
-                .get_many_complete(keys, 0)
-                .map_err(|error| error.to_string())
-        },
-    )
-}
-
-pub(crate) fn materialize_local_folder_listing_with_order(
-    path: &std::path::Path,
-    scan: ScannedDir,
-    settings: &crate::settings::Settings,
-    request: crate::rating_sort::ListingOrderRequest,
-    read_rating: impl FnOnce(&[String]) -> Result<crate::rating_db::CompleteRatingFacts, String>,
-) -> MaterializedFolderListing {
-    let mut scan = scan;
-    project_scanned_directory(&mut scan, &settings.file_type_visibility);
-    let mut auxiliary_media = scan.auxiliary_media;
-    let mut omitted = scan.omitted;
-    let mut folders = Vec::with_capacity(scan.folders.len());
-    let mut metas = Vec::with_capacity(scan.folders.len());
-    let mut sort_metas = Vec::with_capacity(scan.folders.len() + scan.all_media.len());
-    for entry in scan.folders {
-        folders.push(entry.item);
-        metas.push(entry.display_meta);
-        sort_metas.push(entry.sort_meta);
-    }
-    let mut all_media = scan.all_media;
-    let compiled = crate::books::is_direct_book_folder(&settings.books_root_path(), path);
-    if compiled {
-        folders.clear();
-        metas.clear();
-        sort_metas.clear();
-        all_media.retain(|entry| entry.kind == ScanMediaKind::Image);
-    }
-    let folder_count = folders.len();
-    let media_count = all_media.len();
-
-    let sort_started = std::time::Instant::now();
-    let folder_sort = if compiled {
-        crate::settings::SortOrder::Numeric
-    } else {
-        match request {
-            crate::rating_sort::ListingOrderRequest::Standard(sort) => sort,
-            crate::rating_sort::ListingOrderRequest::Rating(_) => {
-                crate::settings::SortOrder::FileName
-            }
-        }
-    };
-    let media_sort = super::folder_media_sort_order(
-        folder_sort,
-        compiled,
-        folders.is_empty(),
-        all_media
-            .iter()
-            .all(|entry| entry.kind == ScanMediaKind::Image),
-        settings.auto_fullscreen_image_folders_enabled(),
-    );
-    crate::grid_item::sort_folder_block_with_metadata(
-        &mut folders,
-        &mut metas,
-        &mut sort_metas,
-        folder_sort,
-    );
-    let mut keyed_media = all_media
-        .into_iter()
-        .map(|entry| {
-            let name = entry
-                .path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or("");
-            let key = media_sort.name_key(name);
-            (entry, key)
-        })
-        .collect::<Vec<_>>();
-    keyed_media.sort_by(|(left, left_key), (right, right_key)| {
-        media_sort.compare_listing_keys(left_key, left.sort_meta, right_key, right.sort_meta)
-    });
-    let mut all_media = keyed_media
-        .into_iter()
-        .map(|(entry, _)| entry)
-        .collect::<Vec<_>>();
-    let mut keyed_auxiliary = auxiliary_media
-        .entries
-        .into_iter()
-        .map(|entry| {
-            let name = entry
-                .path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or("");
-            let key = media_sort.name_key(name);
-            (entry, key)
-        })
-        .collect::<Vec<_>>();
-    keyed_auxiliary.sort_by(|(left, left_key), (right, right_key)| {
-        media_sort.compare_listing_keys(left_key, left.sort_meta, right_key, right.sort_meta)
-    });
-    auxiliary_media.entries = keyed_auxiliary
-        .into_iter()
-        .map(|(entry, _)| entry)
-        .collect();
-    let sort_ms = sort_started.elapsed().as_secs_f64() * 1000.0;
-
-    let duplicate_started = std::time::Instant::now();
-    let mut same_name = 0usize;
-    if settings.skip_zip_if_folder_exists {
-        same_name = same_name.saturating_add(filter_virtual_folder_duplicates_with_sort_metadata(
-            &mut folders,
-            &mut metas,
-            &mut sort_metas,
-        ));
-    }
-    if settings.skip_archive_if_zip_exists {
-        same_name =
-            same_name.saturating_add(filter_convertible_archive_duplicates_with_sort_metadata(
-                &mut folders,
-                &mut metas,
-                &mut sort_metas,
-            ));
-    }
-    if settings.skip_epub_if_pdf_exists {
-        same_name = same_name.saturating_add(filter_epub_pdf_duplicates_with_sort_metadata(
-            &mut folders,
-            &mut metas,
-            &mut sort_metas,
-        ));
-    }
-    let video_thumb_overrides =
-        if settings.skip_image_if_video_exists && settings.video_thumb_use_sidecar_image {
-            let surviving_sources = all_media
-                .iter()
-                .filter(|entry| matches!(entry.kind, ScanMediaKind::Video | ScanMediaKind::Audio))
-                .map(|entry| &entry.path)
-                .collect::<std::collections::HashSet<_>>();
-            auxiliary_media
-                .sidecars()
-                .into_iter()
-                .filter(|(source, _)| surviving_sources.contains(source))
-                .collect()
-        } else {
-            Vec::new()
-        };
-    if settings.skip_image_if_video_exists {
-        let filtered = filter_video_image_duplicates(&mut all_media, false);
-        same_name = same_name.saturating_add(filtered.omitted);
-    }
-    if settings.skip_duplicate_images {
-        same_name = same_name.saturating_add(filter_image_ext_duplicates(
-            &mut all_media,
-            &settings.image_ext_priority,
-        ));
-    }
-    omitted.same_name = same_name;
-    let duplicate_filter_ms = duplicate_started.elapsed().as_secs_f64() * 1000.0;
-
-    let mut items = folders;
-    for entry in all_media {
-        items.push(match entry.kind {
-            ScanMediaKind::Image => GridItem::Image(entry.path),
-            ScanMediaKind::Video => GridItem::Video(entry.path),
-            ScanMediaKind::Audio => GridItem::Audio(entry.path),
-        });
-        metas.push(Some((entry.mtime, entry.file_size)));
-        sort_metas.push(entry.sort_meta);
-    }
-    // Candidate exclusion is complete. Rating facts are read once here, before
-    // the final arrangement and before any index (including video indices) is derived.
-    let rating_order = if let crate::rating_sort::ListingOrderRequest::Rating(spec) = request {
-        if compiled || media_sort != folder_sort {
-            crate::grid_item::arrange_grid_items_with_sort_metadata(
-                &mut items,
-                &mut metas,
-                &mut sort_metas,
-                &settings.grid_display_order,
-                Some(media_sort),
-            );
-            FolderRatingOrder::Standard
-        } else {
-            let item_keys = items
-                .iter()
-                .map(crate::rating_sort::physical_item_key)
-                .collect::<Vec<_>>();
-            let requested = item_keys
-                .iter()
-                .filter_map(Clone::clone)
-                .collect::<Vec<_>>();
-            let read_started = std::time::Instant::now();
-            let read_result = read_rating(&requested);
-            let read_ms = read_started.elapsed().as_secs_f64() * 1000.0;
-            match read_result {
-                Ok(facts) => {
-                    let mut rating_keys = item_keys
-                        .iter()
-                        .map(|key| match key {
-                            Some(key) => facts.key_for_requested(key),
-                            None => crate::rating_sort::RatingSortKey::Unsupported,
-                        })
-                        .collect::<Vec<_>>();
-                    crate::grid_item::arrange_grid_items_with_rating_keys(
-                        &mut items,
-                        &mut metas,
-                        &mut sort_metas,
-                        &mut rating_keys,
-                        &settings.grid_display_order,
-                        spec,
-                    );
-                    let values = facts
-                        .iter_requested_ratings()
-                        .map(|(key, stars)| (key.to_owned(), stars))
-                        .collect::<std::collections::HashMap<_, _>>();
-                    let cache = items
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(idx, item)| {
-                            crate::rating_sort::physical_item_key(item)
-                                .map(|key| (idx, values[&key]))
-                        })
-                        .collect();
-                    FolderRatingOrder::Prepared {
-                        cache,
-                        write_generation: facts.write_generation(),
-                        requested_count: requested.len(),
-                        read_ms,
-                    }
-                }
-                Err(_) => {
-                    crate::grid_item::arrange_grid_items_with_sort_metadata(
-                        &mut items,
-                        &mut metas,
-                        &mut sort_metas,
-                        &settings.grid_display_order,
-                        Some(crate::settings::SortOrder::FileName),
-                    );
-                    FolderRatingOrder::Failed
-                }
-            }
-        }
-    } else {
-        crate::grid_item::arrange_grid_items_with_sort_metadata(
-            &mut items,
-            &mut metas,
-            &mut sort_metas,
-            &settings.grid_display_order,
-            Some(media_sort),
-        );
-        FolderRatingOrder::Standard
-    };
-
-    MaterializedFolderListing {
-        items,
-        metas,
-        sort_metas,
-        omitted,
-        video_thumb_overrides,
-        folder_count,
-        media_count,
-        folder_sort,
-        sort_ms,
-        duplicate_filter_ms,
-        rating_order,
-    }
-}
+pub(crate) use super::book_materialization::{
+    materialize_local_folder_listing, materialize_local_folder_listing_with_order,
+};
 
 #[derive(Clone, Debug)]
 pub(crate) struct ImageFolderPageCountOptions {
@@ -1092,7 +820,7 @@ pub(crate) fn filter_virtual_folder_duplicates(
     keep.iter().filter(|keep| !**keep).count()
 }
 
-fn filter_virtual_folder_duplicates_with_sort_metadata(
+pub(super) fn filter_virtual_folder_duplicates_with_sort_metadata(
     folders: &mut Vec<GridItem>,
     folder_metas: &mut Vec<Option<(i64, i64)>>,
     sort_metas: &mut Vec<crate::settings::ListingSortMetadata>,
@@ -1160,7 +888,7 @@ pub(crate) fn filter_convertible_archive_duplicates(
     keep.iter().filter(|keep| !**keep).count()
 }
 
-fn filter_convertible_archive_duplicates_with_sort_metadata(
+pub(super) fn filter_convertible_archive_duplicates_with_sort_metadata(
     folders: &mut Vec<GridItem>,
     folder_metas: &mut Vec<Option<(i64, i64)>>,
     sort_metas: &mut Vec<crate::settings::ListingSortMetadata>,
@@ -1205,7 +933,7 @@ pub(crate) fn filter_epub_pdf_duplicates(
 }
 
 /// 通常一覧では整列用 metadata も同じ位置で間引く。
-fn filter_epub_pdf_duplicates_with_sort_metadata(
+pub(super) fn filter_epub_pdf_duplicates_with_sort_metadata(
     folders: &mut Vec<GridItem>,
     folder_metas: &mut Vec<Option<(i64, i64)>>,
     sort_metas: &mut Vec<crate::settings::ListingSortMetadata>,

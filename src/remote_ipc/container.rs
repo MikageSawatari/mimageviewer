@@ -3532,11 +3532,11 @@ impl ContainerEngine {
                     let target = match &bookmark.page_identity {
                         crate::book_bookmarks::PageIdentity::ArchiveEntry(entry_name) => {
                             crate::book_bookmarks::resolve_archive_bookmark_target(
-                                &tree,
+                                tree,
                                 entry_name,
-                                &self.settings.grid_display_order,
                             )
                             .and_then(|target| {
+                                let item_index = crate::app::book_materialization::resolve_archive_target_index(tree, &target, &self.settings.grid_display_order)?;
                                 let address =
                                     zip_entry_address(&container_address, &target.entry_name);
                                 address.validate_syntax().ok()?;
@@ -3553,7 +3553,7 @@ impl ContainerEngine {
                                 Some(RemoteBookBookmarkTarget {
                                     address,
                                     context_address,
-                                    item_index: u32::try_from(target.item_index).ok()?,
+                                    item_index: u32::try_from(item_index).ok()?,
                                 })
                             })
                         }
@@ -4019,13 +4019,11 @@ impl ContainerEngine {
         }
         let effective_segments = tree.collapse_redundant(&requested_segments);
         let root_segments = tree.collapse_redundant(&[]);
-        let (mut items, mut metas) =
-            tree.materialize_level(&effective_segments, crate::app::BOOK_READING_PAGE_ORDER);
-        crate::grid_item::arrange_grid_items(
-            &mut items,
-            &mut metas,
-            &self.settings.grid_display_order,
-            Some(crate::app::BOOK_READING_PAGE_ORDER),
+        let (items, _) = crate::app::book_materialization::materialize_archive_level(
+            tree,
+            &effective_segments,
+            crate::app::BOOK_READING_PAGE_ORDER,
+            Some(&self.settings.grid_display_order),
         );
         let index = items
             .iter()
@@ -5875,11 +5873,10 @@ impl ContainerEngine {
         let mut entries = Vec::new();
         let mut byte_truncated = false;
         for page_number in (0..page_count).take(CONTAINER_ENTRY_LIMIT) {
-            let item = crate::grid_item::GridItem::PdfPage {
-                pdf_path: resolved.logical.clone(),
-                page_num: page_number,
-                content_type: None,
-            };
+            let item = crate::app::book_materialization::document_page_item(
+                &resolved.logical,
+                page_number,
+            );
             let entry = ContainerEntry {
                 address: RemoteAddress {
                     path: address.path.clone(),
@@ -8491,6 +8488,34 @@ fn remote_reading_direction_name(direction: RemoteReadingDirection) -> &'static 
     }
 }
 
+/// Result lists use a session direction, with no cover or per-book state.
+pub(super) fn resolve_extracted_spread_state(
+    requested: Option<RemoteSpreadMode>,
+    session_direction: Option<RemoteReadingDirection>,
+    default_direction: crate::settings::ReadingDirection,
+    force_single_page: bool,
+) -> (RemoteSpreadMode, RemoteSpreadMode, RemoteReadingDirection) {
+    let direction =
+        session_direction.unwrap_or_else(|| remote_reading_direction(default_direction));
+    let core_direction = match direction {
+        RemoteReadingDirection::Ltr => crate::settings::ReadingDirection::Ltr,
+        RemoteReadingDirection::Rtl => crate::settings::ReadingDirection::Rtl,
+    };
+    let configured = remote_spread_mode(crate::app::book_materialization::extracted_view_mode(
+        core_spread_mode(requested.unwrap_or(RemoteSpreadMode::Single)),
+        core_direction,
+    ));
+    resolve_spread_state(
+        Some(configured),
+        Some(direction),
+        None,
+        None,
+        crate::settings::SpreadMode::Single,
+        core_direction,
+        force_single_page,
+    )
+}
+
 pub(super) fn resolve_spread_state(
     requested: Option<RemoteSpreadMode>,
     requested_direction: Option<RemoteReadingDirection>,
@@ -8986,6 +9011,52 @@ mod tests {
         drop(crate::conceal_db::ConcealDb::open().unwrap());
         drop(crate::comic_db::ComicDb::open().unwrap());
         drop(crate::export_crop::CropDb::open().unwrap());
+    }
+
+    #[test]
+    fn g1_extracted_remote_view_request_uses_session_direction_without_cover_or_store() {
+        use crate::settings::ReadingDirection;
+        assert_eq!(
+            resolve_extracted_spread_state(None, None, ReadingDirection::Rtl, false),
+            (
+                RemoteSpreadMode::Single,
+                RemoteSpreadMode::Single,
+                RemoteReadingDirection::Rtl
+            )
+        );
+        for requested in [
+            RemoteSpreadMode::Ltr,
+            RemoteSpreadMode::LtrCover,
+            RemoteSpreadMode::Rtl,
+            RemoteSpreadMode::RtlCover,
+        ] {
+            assert_eq!(
+                resolve_extracted_spread_state(
+                    Some(requested),
+                    Some(RemoteReadingDirection::Rtl),
+                    ReadingDirection::Ltr,
+                    false
+                ),
+                (
+                    RemoteSpreadMode::Rtl,
+                    RemoteSpreadMode::Rtl,
+                    RemoteReadingDirection::Rtl
+                )
+            );
+        }
+        assert_eq!(
+            resolve_extracted_spread_state(
+                Some(RemoteSpreadMode::SplitLtr),
+                Some(RemoteReadingDirection::Rtl),
+                ReadingDirection::Ltr,
+                true
+            ),
+            (
+                RemoteSpreadMode::SplitRtl,
+                RemoteSpreadMode::SplitRtl,
+                RemoteReadingDirection::Rtl
+            )
+        );
     }
 
     #[test]
@@ -15664,6 +15735,86 @@ mod tests {
             .map(|group| group.indices)
             .collect::<Vec<_>>(),
             vec![vec![0], vec![1], vec![2], vec![3], vec![4]]
+        );
+    }
+
+    #[test]
+    fn g1_remote_book_return_after_a2_uses_unchanged_book_state() {
+        use crate::settings::{ReadingDirection, ReadingFlow, SpreadMode};
+        let data = crate::data_dir::TestDataDirGuard::new();
+        let _ratings =
+            crate::rating_db::RatingDb::open_at(&crate::rating_db::RatingDb::db_path()).unwrap();
+        let root = data.path().join("favorite");
+        let book = root.join("book");
+        std::fs::create_dir_all(&book).unwrap();
+        std::fs::write(book.join("01.jpg"), b"page").unwrap();
+        let favorite = FavoriteEntry::new("test".into(), root);
+        let settings = crate::settings::Settings {
+            favorites: vec![favorite.clone()],
+            default_reading_direction: ReadingDirection::Ltr,
+            ..Default::default()
+        };
+        let engine = ContainerEngine::new(settings.clone());
+        let db_path = data.path().join("return-spread.db");
+        let db = crate::spread_db::SpreadDb::open_at(&db_path).unwrap();
+        db.set(
+            &book,
+            SpreadMode::RtlCover,
+            SpreadMode::Single,
+            ReadingFlow::Paged,
+            ReadingDirection::Rtl,
+        )
+        .unwrap();
+        *engine.spread_db.lock().unwrap() = Ok(Some(db));
+        let open_book = || {
+            let ContainerResponse::Success(payload) = engine.container(ContainerRequest {
+                address: favorite_address(&favorite, "book"),
+                spread_mode: None,
+                reading_direction: None,
+                force_single_page: false,
+            }) else {
+                panic!("book return failed")
+            };
+            (
+                payload.configured_spread_mode,
+                payload.reading_direction,
+                payload.page_groups,
+            )
+        };
+        let before = open_book();
+        assert_eq!(before.0, RemoteSpreadMode::RtlCover);
+        let collections = super::super::collections::CollectionEngine::new(settings);
+        for requested in [None, Some(RemoteSpreadMode::RtlCover)] {
+            let response = collections.collection(mimageviewer_ipc::CollectionRequest {
+                kind: mimageviewer_ipc::CollectionKind::Rating { stars: 4 },
+                spread_mode: requested,
+                reading_direction: None,
+                force_single_page: false,
+            });
+            let mimageviewer_ipc::CollectionResponse::Success(payload) = response else {
+                panic!("A2 failed")
+            };
+            assert_eq!(
+                payload.configured_spread_mode,
+                if requested.is_some() {
+                    RemoteSpreadMode::Ltr
+                } else {
+                    RemoteSpreadMode::Single
+                }
+            );
+        }
+        assert_eq!(open_book(), before);
+        assert_eq!(
+            engine
+                .spread_db
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .get(&book),
+            Some(SpreadMode::RtlCover)
         );
     }
 

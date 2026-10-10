@@ -253,62 +253,7 @@ impl ZipTree {
         prefix: &[String],
         sort: SortOrder,
     ) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
-        let mut items: Vec<GridItem> = Vec::new();
-        let mut metas: Vec<Option<(i64, i64)>> = Vec::new();
-        let Some(node) = self.node_at(prefix) else {
-            return (items, metas);
-        };
-
-        // 現在階層までの prefix 文字列 ("chapters/" や ""、末尾 '/' 付き)。
-        let prefix_str = if prefix.is_empty() {
-            String::new()
-        } else {
-            format!("{}/", prefix.join("/"))
-        };
-
-        // 1) 子コンテナ (ZipDir)。セグメント名で sort。
-        let mut dirs: Vec<_> = node
-            .dirs
-            .iter()
-            .map(|(seg, child)| (seg, child, sort.name_key(seg)))
-            .collect();
-        dirs.sort_by(|(_, _, ak), (_, _, bk)| sort.compare_name_keys(ak, 0, bk, 0));
-        for (seg, child, _) in dirs {
-            // 代表画像。build() は画像エントリの経路上にしかノードを作らないので、
-            // 任意の子ノードは部分木に必ず 1 枚以上画像を持つ → rep は実質的に常に Some。
-            let rep = representative_image(child, sort);
-            items.push(GridItem::ZipDir {
-                zip_path: self.zip_path.clone(),
-                dir_prefix: format!("{prefix_str}{seg}/"),
-                is_archive: segment_is_archive(seg),
-                representative: rep.map(|e| e.entry_name.clone()),
-            });
-            // 代表画像の mtime/size を meta に載せる。これがないと enqueue 経路
-            // (image_metas[i]==None を skip) が ZipDir のサムネ要求を出さず、セルが
-            // 永久 Pending → 毎フレーム repaint になる (Phase 2 Codex P2)。size 列に
-            // 代表画像サイズが出るのは許容 (date 列は details_created_time_path で None)。
-            metas.push(rep.map(|e| (e.mtime, e.uncompressed_size as i64)));
-        }
-
-        // 2) 直下画像 (ZipImage)。basename + mtime で sort。
-        let mut imgs: Vec<_> = node
-            .images
-            .iter()
-            .map(|entry| {
-                let key = sort.name_key(entry_basename(&entry.entry_name));
-                (entry, key)
-            })
-            .collect();
-        imgs.sort_by(|(a, ak), (b, bk)| sort.compare_name_keys(ak, a.mtime, bk, b.mtime));
-        for (e, _) in imgs {
-            items.push(GridItem::ZipImage {
-                zip_path: self.zip_path.clone(),
-                entry_name: e.entry_name.clone(),
-            });
-            metas.push(Some((e.mtime, e.uncompressed_size as i64)));
-        }
-
-        (items, metas)
+        crate::app::book_materialization::materialize_archive_level(self, prefix, sort, None)
     }
 
     /// ツリー全階層の catalog cache キーを集める (Phase 3 の `existing_keys` 用)。
@@ -593,7 +538,7 @@ fn split_prefix(dir_prefix: &str) -> Vec<String> {
 
 /// セグメント名 (entry_name の一区切り) が内側アーカイブ (.zip / .cbz) か。
 /// `ZipDir.is_archive` バッジ用の suffix 推定 (accepted ambiguity、計画書 §9)。
-fn segment_is_archive(seg: &str) -> bool {
+pub(crate) fn segment_is_archive(seg: &str) -> bool {
     let lower = seg.to_ascii_lowercase();
     // .rar 以下は変換キャッシュ ZIP のフラットパス ("inner.rar/p01.jpg") 由来の
     // セグメント (v1.3.0 入れ子展開)。実 ZIP 内の生 RAR は列挙されないので、
@@ -610,7 +555,7 @@ fn segment_is_archive(seg: &str) -> bool {
 /// この階層に直下画像があれば sort 先頭を返す。無ければ sort 先頭の子ディレクトリへ
 /// 再帰する (= 「最初の本の 1 ページ目」を表紙にする)。`ZipTreeNode::first_image_in_subtree`
 /// (列挙順 fallback) と違い、表示順の先頭ページを選ぶ (Codex P3 対応)。
-fn representative_image(node: &ZipTreeNode, sort: SortOrder) -> Option<&ZipImageEntry> {
+pub(crate) fn representative_image(node: &ZipTreeNode, sort: SortOrder) -> Option<&ZipImageEntry> {
     if !node.images.is_empty() {
         return node
             .images

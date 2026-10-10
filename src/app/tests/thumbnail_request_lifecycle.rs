@@ -1174,6 +1174,9 @@ fn lifecycle_sibling_mount_hide_restore_and_retire_preserve_owned_resources() {
                         app.settings.file_type_visibility.clone(),
                     ));
                 app.install_prepared_aggregate_items(
+                    crate::app::book_materialization::ProjectionRecipe::ExtractedResult(
+                        crate::app::book_materialization::ExtractedSurface::Collection,
+                    ),
                     items,
                     vec![Some((10, 20))],
                     page_identity_index,

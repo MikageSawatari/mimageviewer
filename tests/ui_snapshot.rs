@@ -3551,3 +3551,29 @@ fn diagnostics_export_error_light() {
 fn diagnostics_export_error_dark() {
     diagnostics_export_snapshot("error", "dark", mimageviewer::os_theme::ResolvedTheme::Dark);
 }
+
+#[test]
+fn g1_extracted_result_view_light() {
+    g1_extracted_result_view_snapshot(
+        "g1_extracted_result_view_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+    );
+}
+
+#[test]
+fn g1_extracted_result_view_dark() {
+    g1_extracted_result_view_snapshot(
+        "g1_extracted_result_view_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+    );
+}
+
+fn g1_extracted_result_view_snapshot(name: &str, theme: mimageviewer::os_theme::ResolvedTheme) {
+    snapshot_with_theme_at_size(
+        name,
+        theme,
+        egui::vec2(270.0, 185.0),
+        None,
+        mimageviewer::draw_fs_extracted_result_view_snapshot_fixture,
+    );
+}

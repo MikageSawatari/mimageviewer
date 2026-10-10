@@ -131,11 +131,24 @@ impl CollectionEngine {
                 ));
             }
         };
-        let spread_request = CollectionSpreadRequest {
+        let mut spread_request = CollectionSpreadRequest {
             spread_mode: request.spread_mode,
             reading_direction: request.reading_direction,
             force_single_page: request.force_single_page,
         };
+        if matches!(
+            &request.kind,
+            CollectionKind::Rating { .. } | CollectionKind::SmartFolder { .. }
+        ) {
+            let (mode, _, direction) = super::container::resolve_extracted_spread_state(
+                spread_request.spread_mode,
+                spread_request.reading_direction,
+                settings.default_reading_direction,
+                spread_request.force_single_page,
+            );
+            spread_request.spread_mode = Some(mode);
+            spread_request.reading_direction = Some(direction);
+        }
         let result = match request.kind {
             CollectionKind::DriveList => self.drive_list(&settings, sort_order, spread_request),
             CollectionKind::ReadingHistory => {
@@ -1680,6 +1693,43 @@ fn collection_settings_error(
 mod tests {
     use super::*;
     use crate::settings::FavoriteEntry;
+
+    #[test]
+    fn g1_rating_and_smart_handlers_start_single_and_accept_only_temporary_mode() {
+        let _data = crate::data_dir::TestDataDirGuard::new();
+        let _ratings =
+            crate::rating_db::RatingDb::open_at(&crate::rating_db::RatingDb::db_path()).unwrap();
+        let definition = crate::settings::SmartFolderDefinition::new("empty");
+        let settings = Settings {
+            default_spread_mode: crate::settings::SpreadMode::RtlCover,
+            default_reading_direction: crate::settings::ReadingDirection::Rtl,
+            smart_folders: vec![definition.clone()],
+            ..Default::default()
+        };
+        let engine = CollectionEngine::new(settings);
+        for kind in [
+            CollectionKind::Rating { stars: 4 },
+            CollectionKind::SmartFolder {
+                definition_id: definition.id.to_string(),
+            },
+        ] {
+            for (requested, expected) in [
+                (None, RemoteSpreadMode::Single),
+                (Some(RemoteSpreadMode::LtrCover), RemoteSpreadMode::Rtl),
+                (Some(RemoteSpreadMode::SplitLtr), RemoteSpreadMode::SplitRtl),
+            ] {
+                let payload = collection_success(engine.collection(CollectionRequest {
+                    kind: kind.clone(),
+                    spread_mode: requested,
+                    reading_direction: None,
+                    force_single_page: false,
+                }));
+                assert_eq!(payload.configured_spread_mode, expected);
+                assert_eq!(payload.effective_spread_mode, expected);
+                assert_eq!(payload.reading_direction, RemoteReadingDirection::Rtl);
+            }
+        }
+    }
 
     #[test]
     fn remote_rating_visibility_filters_nested_origins_before_container_payloads() {

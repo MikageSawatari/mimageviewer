@@ -1890,6 +1890,12 @@ impl App {
         // これ以降に届く旧ワーカーの ThumbMsg は poll_thumbnails の
         // 世代不一致チェックで破棄される。
         self.install_new_items(items, image_metas);
+        self.projection_recipe =
+            crate::app::book_materialization::ProjectionRecipe::ExtractedResult(
+                crate::app::book_materialization::ExtractedSurface::Search(
+                    crate::app::top_level_grid_view::TopLevelSearchView::Global,
+                ),
+            );
         if let Some(index) = page_identity_index {
             let previous = std::mem::replace(&mut self.page_identity_index, index);
             self.retire_smart_folder_payloads([

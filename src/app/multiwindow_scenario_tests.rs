@@ -3181,7 +3181,14 @@ fn multiwindow_scenario_collection_parked_live_eof_owner_poll() {
         let source = first.clone();
         app.push_window_context_for_test(&ctx, window_id, move |owner| {
             owner.top_level_grid_view = grid;
-            owner.install_prepared_aggregate_items(items, metas, page_identity_index);
+            owner.install_prepared_aggregate_items(
+                crate::app::book_materialization::ProjectionRecipe::ExtractedResult(
+                    crate::app::book_materialization::ExtractedSurface::Collection,
+                ),
+                items,
+                metas,
+                page_identity_index,
+            );
             owner
                 .top_level_grid_view
                 .collection_session_mut()

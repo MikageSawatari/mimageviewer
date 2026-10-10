@@ -821,6 +821,7 @@ pub(in crate::app) struct ViewerContextBundle {
     stack_selection_target: Option<crate::filename_stack_ui::StackSelectionTarget>,
     items: Vec<GridItem>,
     page_identity_index: Arc<super::file_type_resume::PreparedPageIdentityIndex>,
+    projection_recipe: super::book_materialization::ProjectionRecipe,
     current_book_bookmarks: Vec<crate::book_bookmarks::BookBookmark>,
     current_book_bookmarks_key: Option<BookBookmarkProjectionKey>,
     current_book_bookmarks_request: Option<CurrentBookBookmarksRequest>,
@@ -1865,6 +1866,7 @@ impl ViewerContextBundle {
             stack_selection_target: None,
             items: Vec::new(),
             page_identity_index: Default::default(),
+            projection_recipe: Default::default(),
             current_book_bookmarks: Vec::new(),
             current_book_bookmarks_key: None,
             current_book_bookmarks_request: None,
@@ -2239,6 +2241,7 @@ impl App {
             stack_selection_target,
             items,
             page_identity_index,
+            projection_recipe,
             current_book_bookmarks,
             current_book_bookmarks_key,
             current_book_bookmarks_request,
@@ -2513,6 +2516,7 @@ impl App {
         swap_field!(stack_selection_target);
         swap_field!(items);
         swap_field!(page_identity_index);
+        swap_field!(projection_recipe);
         swap_field!(current_book_bookmarks);
         swap_field!(current_book_bookmarks_key);
         swap_field!(current_book_bookmarks_request);
@@ -2856,6 +2860,7 @@ impl App {
             stack_selection_target,
             items,
             page_identity_index,
+            projection_recipe,
             current_book_bookmarks,
             current_book_bookmarks_key,
             current_book_bookmarks_request,
@@ -3135,6 +3140,7 @@ impl App {
             stack_selection_target,
             items,
             page_identity_index,
+            projection_recipe,
             bookmark_view_registered_total,
             items_generation,
             visible_indices,
@@ -3420,6 +3426,7 @@ impl App {
             self.image_metas = std::mem::take(&mut snapshot.saved_image_metas);
             self.visible_indices = std::mem::take(&mut snapshot.saved_visible_indices);
             self.page_identity_index = snapshot.saved_page_identity_index.clone();
+            self.projection_recipe = snapshot.saved_projection_recipe.clone();
             self.scroll_offset_y = snapshot.saved_scroll_offset_y;
             self.selected = snapshot.saved_selected;
             self.zip_nav = snapshot.saved_zip_nav.take();
@@ -4487,6 +4494,71 @@ mod tests {
     use std::cell::RefCell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::rc::Rc;
+
+    #[cfg(windows)]
+    #[test]
+    fn g1_recipe_mount_fork_close_preserves_sibling_items_workers_and_cache() {
+        use super::super::book_materialization::{BookScope, ExtractedSurface, ProjectionRecipe};
+        let mut app = crate::app::setup_app_for_test();
+        let recipe = ProjectionRecipe::ExtractedResult(ExtractedSurface::Collection);
+        app.projection_recipe = recipe.clone();
+        app.spread_mode = crate::settings::SpreadMode::Rtl;
+        app.items = vec![GridItem::Image(PathBuf::from("C:/result/a.png"))];
+        let generation = app.items_generation;
+        let cancel = app.cancel_token.clone();
+        let sibling = app.build_window_context_for_test(9914, |owner| {
+            owner.projection_recipe =
+                ProjectionRecipe::Book(BookScope::Document(PathBuf::from("C:/sibling.pdf")));
+            owner.items = vec![GridItem::PdfPage {
+                pdf_path: PathBuf::from("C:/sibling.pdf"),
+                page_num: 80,
+                content_type: None,
+            }];
+            owner.fs_early_dims.insert(0, [123, 456]);
+            owner.reload_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+        });
+        let sibling_before = app
+            .with_viewer_context(sibling, |owner| {
+                (
+                    owner.projection_recipe.clone(),
+                    owner.items.clone(),
+                    owner.items_generation,
+                    owner.cancel_token.clone(),
+                    owner.reload_queue.clone(),
+                    owner.fs_early_dims.get(&0).copied(),
+                )
+            })
+            .unwrap();
+        let mut fork = app.split_current_context_preserving_main_grid();
+        assert_eq!(fork.projection_recipe, recipe);
+        app.swap_viewer_context_bundle(&mut fork);
+        app.begin_extracted_result_view();
+        app.swap_viewer_context_bundle(&mut fork);
+        drop(fork);
+        assert_eq!(app.projection_recipe, recipe);
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Rtl);
+        assert_eq!(app.items_generation, generation);
+        assert!(Arc::ptr_eq(&app.cancel_token, &cancel));
+        assert!(!cancel.load(Ordering::Relaxed));
+        app.with_viewer_context(sibling, |owner| {
+            assert_eq!(owner.projection_recipe, sibling_before.0);
+            assert_eq!(owner.items, sibling_before.1);
+            assert_eq!(owner.items_generation, sibling_before.2);
+            assert!(Arc::ptr_eq(&owner.cancel_token, &sibling_before.3));
+            assert!(!owner.cancel_token.load(Ordering::Relaxed));
+            assert!(Arc::ptr_eq(
+                owner.reload_queue.as_ref().unwrap(),
+                sibling_before.4.as_ref().unwrap()
+            ));
+            assert_eq!(
+                owner.reload_queue.as_ref().unwrap().0.lock().unwrap().len(),
+                0
+            );
+            assert_eq!(owner.fs_early_dims.get(&0).copied(), sibling_before.5);
+            assert_eq!(owner.fs_early_dims.len(), 1);
+        })
+        .unwrap();
+    }
 
     #[cfg(windows)]
     #[test]

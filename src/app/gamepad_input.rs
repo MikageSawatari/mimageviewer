@@ -6743,7 +6743,15 @@ impl App {
         if !self.vertical_reading_supported_idx(fs_idx) {
             return None;
         }
-        let next = self.spread_mode.next_in_spread_cycle();
+        let next = if self.extracted_result_surface().is_some() {
+            if self.spread_mode.is_spread() {
+                crate::settings::SpreadMode::Single
+            } else {
+                crate::settings::SpreadMode::Ltr.with_reading_direction(self.reading_direction)
+            }
+        } else {
+            self.spread_mode.next_in_spread_cycle()
+        };
         self.apply_fullscreen_spread_mode(ctx, fs_idx, next);
         // Report only the state actually applied: a rejected write keeps the old mode.
         if self.spread_mode == next {

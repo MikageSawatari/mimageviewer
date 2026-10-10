@@ -1519,13 +1519,11 @@ pub fn container_key(path: &Path) -> String {
 pub(crate) struct ResolvedArchiveBookmarkTarget {
     pub entry_name: String,
     pub effective_prefix: String,
-    pub item_index: usize,
 }
 
 pub(crate) fn resolve_archive_bookmark_target(
     tree: &crate::zip_tree::ZipTree,
     entry_name: &str,
-    display_order: &crate::settings::GridDisplayOrder,
 ) -> Option<ResolvedArchiveBookmarkTarget> {
     fn find_entry(node: &crate::zip_tree::ZipTreeNode, wanted: &str) -> Option<String> {
         if let Some(entry) = node
@@ -1551,23 +1549,6 @@ pub(crate) fn resolve_archive_bookmark_target(
         .map(str::to_owned)
         .collect::<Vec<_>>();
     let effective_segments = tree.collapse_redundant(&parent_segments);
-    let (mut items, mut metas) =
-        tree.materialize_level(&effective_segments, crate::app::BOOK_READING_PAGE_ORDER);
-    crate::grid_item::arrange_grid_items(
-        &mut items,
-        &mut metas,
-        display_order,
-        Some(crate::app::BOOK_READING_PAGE_ORDER),
-    );
-    let item_index = items.iter().position(|item| {
-        matches!(
-            item,
-            crate::grid_item::GridItem::ZipImage {
-                entry_name: candidate,
-                ..
-            } if normalize_page_path(candidate) == normalize_page_path(&actual_entry_name)
-        )
-    })?;
     let effective_prefix = if effective_segments.is_empty() {
         String::new()
     } else {
@@ -1576,7 +1557,6 @@ pub(crate) fn resolve_archive_bookmark_target(
     Some(ResolvedArchiveBookmarkTarget {
         entry_name: actual_entry_name,
         effective_prefix,
-        item_index,
     })
 }
 
@@ -1829,7 +1809,7 @@ fn canonical_path_is_within(path: &Path, container: &Path) -> bool {
     path_key.starts_with(&prefix)
 }
 
-fn normalize_page_path(value: &str) -> String {
+pub(crate) fn normalize_page_path(value: &str) -> String {
     value.replace('\\', "/").to_lowercase()
 }
 
@@ -2156,23 +2136,10 @@ mod tests {
             },
         ];
         let tree = crate::zip_tree::ZipTree::build(PathBuf::from("C:/Books/all.zip"), entries);
-        let target = resolve_archive_bookmark_target(
-            &tree,
-            r"BOOK-B\WRAPPER\020.JPG",
-            &crate::settings::GridDisplayOrder::default(),
-        )
-        .unwrap();
+        let target = resolve_archive_bookmark_target(&tree, r"BOOK-B\WRAPPER\020.JPG").unwrap();
         assert_eq!(target.entry_name, "book-b/wrapper/020.jpg");
         assert_eq!(target.effective_prefix, "book-b/wrapper/");
-        assert_eq!(target.item_index, 1);
-        assert!(
-            resolve_archive_bookmark_target(
-                &tree,
-                "book-b/wrapper/missing.jpg",
-                &crate::settings::GridDisplayOrder::default(),
-            )
-            .is_none()
-        );
+        assert!(resolve_archive_bookmark_target(&tree, "book-b/wrapper/missing.jpg",).is_none());
     }
 
     #[test]

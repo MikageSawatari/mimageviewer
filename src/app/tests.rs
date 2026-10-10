@@ -1599,7 +1599,14 @@ fn mutation_refresh_navigation_retires_pin_materialization_owner_and_keeps_sibli
             None,
             mounted.settings.file_type_visibility.clone(),
         ));
-        mounted.install_prepared_aggregate_items(items, vec![None], page_identity_index);
+        mounted.install_prepared_aggregate_items(
+            crate::app::book_materialization::ProjectionRecipe::ExtractedResult(
+                crate::app::book_materialization::ExtractedSurface::Collection,
+            ),
+            items,
+            vec![None],
+            page_identity_index,
+        );
         assert!(sibling_cancel.load(Ordering::Relaxed));
         assert!(!mounted.current_view_pin_refreshes.contains_key(&sibling));
         assert!(!successor_cancel.load(Ordering::Relaxed));
@@ -20214,6 +20221,47 @@ mod phase_c_folder_nav_history_tests {
                 .history
                 .forward_stack,
             vec![a_child]
+        );
+    }
+
+    #[test]
+    fn g1_history_back_from_a2_adopts_original_book_view_without_writing_a2() {
+        use crate::app::book_materialization::{ExtractedSurface, ProjectionRecipe};
+        use crate::settings::{ReadingDirection, ReadingFlow, SpreadMode};
+        let mut app = setup_app();
+        let book = app.tmp.path().join("g1-return-book");
+        std::fs::create_dir_all(&book).unwrap();
+        std::fs::write(book.join("01.jpg"), []).unwrap();
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.settings.auto_fullscreen_image_folders = true;
+        app.active_quick_folder_slot = None;
+        let db_path = app.tmp.path().join("g1-return-spread.db");
+        app.spread_db = Ok(crate::spread_db::SpreadDb::open_at(&db_path).unwrap());
+        app.spread_db
+            .as_ref()
+            .unwrap()
+            .set(
+                &book,
+                SpreadMode::RtlCover,
+                SpreadMode::Single,
+                ReadingFlow::Paged,
+                ReadingDirection::Rtl,
+            )
+            .unwrap();
+        app.current_folder = Some(super::rating_view_synthetic_path());
+        app.projection_recipe = ProjectionRecipe::ExtractedResult(ExtractedSurface::Rating);
+        app.begin_extracted_result_view();
+        app.apply_fullscreen_spread_mode(&egui::Context::default(), 0, SpreadMode::Ltr);
+        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(book.clone()).into()];
+        app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
+        finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(app.current_folder.as_ref(), Some(&book));
+        assert!(matches!(app.projection_recipe, ProjectionRecipe::Book(_)));
+        assert_eq!(app.spread_mode, SpreadMode::RtlCover);
+        assert_eq!(app.reading_direction, ReadingDirection::Rtl);
+        assert_eq!(
+            app.spread_db.as_ref().unwrap().get(&book),
+            Some(SpreadMode::RtlCover)
         );
     }
 
@@ -98683,6 +98731,7 @@ fn prepared_aggregate_installs_exact_per_item_edit_state() {
     };
 
     app.start_loading_subfolder_items(
+        crate::app::book_materialization::ExtractedSurface::SubfolderExpansion,
         PathBuf::from("__smart_folder__\\test"),
         vec![GridItem::Image(path)],
         vec![Some((1, 5))],

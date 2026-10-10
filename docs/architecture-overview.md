@@ -1,5 +1,23 @@
 # アーキテクチャ概観
 
+## 本のitems生成境界（§1.242 G1）
+
+`app/book_materialization`に既存ZIP階層、PDF/EPUB page row、folder listingの生成を集約する。
+source enumeration、policy、raw manifest、cache/lease、既存PreparedPageIdentityIndexとadoptionは
+従来のownerを保つ。ZIPは直下ページblockだけがsurface間で一致し、子containerの位置は従来どおり。
+本の構成modelや永続storeはこの段階で導入しない。
+
+itemsの採用時に排他的な`ProjectionRecipe`を確定する。抽出結果かどうかを現在のanchorや
+synthetic pathから推定しない。recipeはViewerContextBundleのmount/forkとsnapshot保存列へ登録し、
+物理本へのdrillと抽出rootへの復帰を区別する。A2の表示種別は既存spread/continuous ownerが担い、
+新規openはSingle、一時表示の方向はsession snapshot、表示設定DBには結果用keyを生成しない。
+元の本の列を保存する既存SnapshotStateは閲覧状態（mode/方向/flow/shift index/補助設定）も
+一緒に保持し、固定解除の同じadoption内で復元する。BSで固定列へ戻る場合はA2のまま。
+検索のback/BS・履歴の本への復帰は既存Book設定adoption、F12はcontext内snapshot/bundle、
+Remoteは本の通常responseから復元し、A2のSingle/一時Spreadを本へ保存しない。
+
+
+
 mimageviewer 全体の構造を俯瞰するための入口ドキュメント。**修正作業の前に必ず目を通すこと**。
 個別の詳細は下の「関連ドキュメント」にある専用ページに任せる。
 

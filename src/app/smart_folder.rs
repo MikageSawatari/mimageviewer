@@ -3632,20 +3632,22 @@ impl App {
             return false;
         }
         let rows = match &child {
-            SmartPhysicalReady::PdfPages { pages, .. } => {
-                Some(Self::build_pdf_page_rows(&path, pages))
-            }
+            SmartPhysicalReady::PdfPages { pages, .. } => Some(
+                super::book_materialization::materialize_document_rows(&path, pages),
+            ),
             SmartPhysicalReady::PdfWarm {
                 page_count,
                 mtime,
                 file_size,
                 ..
-            } => Some(Self::build_pdf_meta_placeholder_rows(
-                &path,
-                *page_count,
-                *mtime,
-                *file_size,
-            )),
+            } => Some(
+                super::book_materialization::materialize_cached_document_rows(
+                    &path,
+                    *page_count,
+                    *mtime,
+                    *file_size,
+                ),
+            ),
             _ => None,
         };
         let items = match &child {
@@ -8385,6 +8387,9 @@ impl App {
         self.current_folder_last_mtime = None;
         self.current_folder_signature = None;
         self.items = items;
+        self.projection_recipe = super::book_materialization::ProjectionRecipe::ExtractedResult(
+            super::book_materialization::ExtractedSurface::SmartFolder,
+        );
         let retired_index = std::mem::replace(&mut self.page_identity_index, page_identity_index);
         self.retire_smart_folder_payloads([Box::new(retired_index) as RetiredSmartFolderPayload]);
         self.thumbnails = thumbnails;
@@ -9222,6 +9227,7 @@ impl App {
         self.video_thumb_overrides
             .extend(snapshot.video_thumb_overrides.clone());
         self.start_loading_subfolder_items(
+            super::book_materialization::ExtractedSurface::SmartFolder,
             synthetic_path,
             items,
             image_metas,

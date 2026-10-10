@@ -481,6 +481,19 @@ impl Default for FilterState {
     }
 }
 
+/// Runtime presentation paired with the original rows in the existing snapshot owner.
+/// The shift index uses the saved row basis, rather than the extracted subset basis.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SnapshotViewingState {
+    pub mode: crate::settings::SpreadMode,
+    pub direction: crate::settings::ReadingDirection,
+    pub flow: crate::settings::ReadingFlow,
+    pub shift_anchor: Option<usize>,
+    pub final_cover: crate::settings::FinalCoverSpreadPreference,
+    pub endpoints: crate::settings::SingletonSpreadEndpointPreferences,
+    pub page_alone: crate::settings::PageAlonePreferences,
+}
+
 /// `App` が snapshot active 中に保持する state。`App.snapshot: Option<SnapshotState>` で
 /// active/inactive を表現する (= `is_some()` で判定)。
 ///
@@ -516,6 +529,8 @@ pub struct SnapshotState {
     // ── 退避 state (= snapshot OFF 時に復元) ──
     /// snapshot ON 時点の `App.items` (= 通常フォルダの GridItem 一覧)
     pub saved_items: Vec<crate::grid_item::GridItem>,
+    pub(crate) saved_viewing_state: SnapshotViewingState,
+    pub(crate) saved_projection_recipe: crate::app::book_materialization::ProjectionRecipe,
     /// Immutable prepared identities stay paired with the saved basis rows.
     pub(crate) saved_page_identity_index:
         std::sync::Arc<crate::app::file_type_resume::PreparedPageIdentityIndex>,
@@ -544,6 +559,7 @@ pub struct SnapshotState {
     /// `reconstruct_grid_item` での再構築だと ZipImage/PdfPage の細部 (= content_type 等)
     /// が失われるため、初回 activate 時の clone を保持する。
     pub list_view_items: Vec<crate::grid_item::GridItem>,
+    pub(crate) list_view_projection_recipe: crate::app::book_materialization::ProjectionRecipe,
     /// 同上、サムネイル状態 (= GPU texture 含む、ロード済みフォルダ代表サムネ保持)。
     /// 子フォルダから BS で戻った際にサムネが Pending に戻らないために必要。
     pub list_view_thumbnails: Vec<crate::grid_item::ThumbnailState>,

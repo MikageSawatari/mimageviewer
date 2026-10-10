@@ -1,5 +1,28 @@
 # 仮想フォルダ (ZIP / RAR / PDF / EPUB) 処理
 
+## 本の列生成と抽出一覧（§1.242 G1）
+
+`app/book_materialization` が、安全性・種類policy・同名除去後の本の行を生成する。
+ZIPのroot、enter/back、DFS、評価履歴、しおりとRemoteは同じ直下ページ投影を使う。
+子folder/nested archiveのカテゴリ位置は各surfaceの従来規則を保持する。
+PDF/EPUBのcached countと完了manifestは同じ論理source/page_numから行を作り、cached
+adoptionを完了待ちへ変えない。folder走査・metadata/rating sort・製本のnumeric順も従来どおり。
+しおりのmember検索はscopeとidentityだけを返し、表示indexは生成済み順へ解決する。
+
+採用済み`ProjectionRecipe::Book | OrdinaryList | ExtractedResult`はitemsと同じcontextで保持する。
+検索・評価・Smart root・Collection root・固定snapshot・サブ展開の直接閲覧は、一冊分の結果でも
+ExtractedResult。本を列挙し直して入った子階層はBook、通常のmixed/本扱いOFF/スタックはOrdinaryList。
+固定snapshotのmembership、★一致による直接open、帰路は維持し、保存列復帰ではrecipeも復元する。
+抽出一覧は新規fullscreen openでSingle、全体の読む方向をsessionへsnapshotする。一時見開きは
+全結果順で隣接ページを組み、cover/shift/末尾補助/端配置/強制単独を使わず、spread keyを作らない。
+F12の表示中forkだけはcapture-time modeを保持できる。構成model/storeは後続G2以降。
+元の本の列を保存する既存SnapshotStateは閲覧状態（mode/方向/flow/shift index/補助設定）も
+一緒に保持し、固定解除の同じadoption内で復元する。BSで固定列へ戻る場合はA2のまま。
+検索のback/BS・履歴の本への復帰は既存Book設定adoption、F12はcontext内snapshot/bundle、
+Remoteは本の通常responseから復元し、A2のSingle/一時Spreadを本へ保存しない。
+
+
+
 ## 本への再入場とfacetの帰路（§1.339）
 
 通常open、履歴←/→、親移動/BSはtyped場所と`FacetRoute`を保持した要求を成功時だけ採用する。

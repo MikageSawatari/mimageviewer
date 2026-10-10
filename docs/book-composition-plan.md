@@ -1318,6 +1318,11 @@ G1の完了条件へG2以降の構成fixtureを先取りしない。G4F未実装
 ### G1: items列生成の統一・抽出一覧A2の境界 (構成なし)
 
 所有: app/book_materialization、ZIP/PDF/EPUB/しおり/snapshot/Remote producer、列種別分類。
+
+**2026-10-10 coordinator決定**: order一致は、構成が適用される各本階層の直下ページblock内に限定する。子階層（subfolder/nested archive）のカテゴリ位置はRemote通常一覧・評価履歴経路を含む各surfaceの現行順を維持し、released順序を変更しない。構成は一階層のページだけを並べ替えるため、子階層の位置までsurface間で統一する必要はない。
+
+**2026-10-10 coordinator決定**: A2から元の本へ戻るときは、変更前と同じ本の閲覧状態を復元する。元列と閲覧状態を既存snapshot ownerへ一緒に退避し、同じreturn adoption内で両方を戻す。別owner/第二commit点は作らず、A2のSingle/一時Spreadを本へ書き戻さない（A2「記憶しない」の復帰契約）。BSで固定列へ戻る場合はA2、新規openはSingle。検索のback/BS・履歴の本への復帰は既存Book設定adoption、F12はcontext内snapshot/bundleの復帰、Remoteは本の通常response復帰へ同じ契約を適用し、各境界を回帰testする。
+
 受入:
 
 - 数字名/日付/評価sort、通常folder/製本、PDF/EPUB、wrapper/nested/直接RAR/変換cacheで元manifest順一致。

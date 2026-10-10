@@ -325,13 +325,10 @@ impl PersistentCollectionEngine {
         deadline: Instant,
     ) -> Result<Arc<PersistentCollectionViewFacts>, PersistentCollectionError> {
         let mut current = || request_is_current(lease, cancellation, deadline);
-        let (configured, effective, direction) = super::container::resolve_spread_state(
+        let (configured, effective, direction) = super::container::resolve_extracted_spread_state(
             spread.mode,
             spread.direction,
-            None,
-            None,
-            crate::app::SpreadRestoreDefaults::NON_BOOK.spread_mode(),
-            crate::app::SpreadRestoreDefaults::NON_BOOK.reading_direction(),
+            settings.default_reading_direction,
             spread.force_single,
         );
         let landscape = if effective == RemoteSpreadMode::Single {

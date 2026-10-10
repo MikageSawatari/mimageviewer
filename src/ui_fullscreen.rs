@@ -7360,6 +7360,111 @@ const PANORAMA_PROJECTION_POPUP_TEXT_LEFT: f32 = 48.0;
 /// 上バーのポップアップ余白 (画面端との最小距離)。
 const BAR_POPUP_SCREEN_MARGIN: f32 = 8.0;
 
+fn draw_spread_mode_rows(
+    scroll_ui: &mut egui::Ui,
+    keymap: &Keymap,
+    spread_mode: &mut SpreadMode,
+    reading_direction: &mut ReadingDirection,
+    spread_popup_open: &mut bool,
+    extracted_result: bool,
+) {
+    let result_modes = [
+        SpreadMode::Single,
+        SpreadMode::Ltr.with_reading_direction(*reading_direction),
+        SpreadMode::SplitLtr.with_reading_direction(*reading_direction),
+    ];
+    let modes = if extracted_result {
+        result_modes.as_slice()
+    } else {
+        SpreadMode::all()
+    };
+    for &mode in modes {
+        let item_rect = allocate_spread_popup_row(scroll_ui);
+        let item_resp = scroll_ui.interact(
+            item_rect,
+            egui::Id::new(format!("spread_popup_{}", mode.to_int())),
+            egui::Sense::click(),
+        );
+        let is_current = *spread_mode == mode;
+        let bg = if is_current {
+            egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
+        } else if item_resp.hovered() {
+            egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200)
+        } else {
+            egui::Color32::TRANSPARENT
+        };
+        scroll_ui.painter().rect_filled(item_rect, 4.0, bg);
+
+        // アイコン (左側)
+        let icon_center = egui::pos2(item_rect.min.x + 20.0, item_rect.center().y);
+        draw_spread_icon(scroll_ui.painter(), icon_center, 7.0, mode);
+
+        // ラベル (右側)
+        scroll_ui.painter().text(
+            egui::pos2(item_rect.min.x + 44.0, item_rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            if extracted_result && mode.is_spread() {
+                "見開き"
+            } else if extracted_result && mode.is_split() {
+                "横長分割"
+            } else {
+                mode.label()
+            },
+            egui::FontId::proportional(13.0),
+            egui::Color32::from_gray(220),
+        );
+
+        if let Some(shortcut_label) =
+            spread_mode_key_action(mode).and_then(|action| keymap.first_chord_label(action))
+        {
+            scroll_ui.painter().text(
+                egui::pos2(item_rect.max.x - 8.0, item_rect.center().y),
+                egui::Align2::RIGHT_CENTER,
+                format!("[{shortcut_label}]"),
+                egui::FontId::proportional(11.0),
+                egui::Color32::from_gray(140),
+            );
+        }
+
+        if item_resp.clicked() {
+            *spread_mode = mode;
+            if mode.is_rtl() {
+                *reading_direction = ReadingDirection::Rtl;
+            } else if matches!(mode, SpreadMode::Ltr | SpreadMode::LtrCover) {
+                *reading_direction = ReadingDirection::Ltr;
+            }
+            *spread_popup_open = false;
+        }
+    }
+}
+
+fn draw_extracted_result_view_notice(ui: &mut egui::Ui) {
+    ui.label(
+        egui::RichText::new("抽出一覧の表示は記憶しません").color(egui::Color32::from_gray(220)),
+    );
+}
+
+#[doc(hidden)]
+pub fn draw_fs_extracted_result_view_snapshot_fixture(ui: &mut egui::Ui) {
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgba_unmultiplied(30, 30, 30, 240))
+        .inner_margin(4.0)
+        .show(ui, |ui| {
+            ui.set_width(230.0);
+            ui.spacing_mut().item_spacing.y = 0.0;
+            draw_spread_popup_heading(ui, "ページ構成");
+            draw_spread_mode_rows(
+                ui,
+                &Keymap::default(),
+                &mut SpreadMode::Rtl,
+                &mut ReadingDirection::Rtl,
+                &mut true,
+                true,
+            );
+            draw_extracted_result_view_notice(ui);
+        });
+}
+
 fn draw_spread_popup_heading(ui: &mut egui::Ui, label: &str) {
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::hover());
@@ -25097,6 +25202,7 @@ impl App {
                             if let Some(wheel) = hud_popup_wheel.as_mut() {
                                 wheel.restore_at(ctx, FsHudPopupWheelTarget::TopBar);
                             }
+                            let extracted_result = self.extracted_result_surface().is_some();
                             Self::draw_fs_hover_bar(
                                 ui,
                                 ctx,
@@ -25122,6 +25228,7 @@ impl App {
                                 panorama_projection,
                                 &mut self.panorama_projection_popup_open,
                                 &mut panorama_projection_choice,
+                                extracted_result,
                                 &mut self.spread_mode,
                                 &mut self.reading_flow,
                                 &mut self.reading_direction,
@@ -25407,6 +25514,11 @@ impl App {
                             || requested_flow != reading_flow_before
                             || requested_direction != reading_direction_before
                         {
+                            let extracted = self.extracted_result_surface().is_some();
+                            let requested_spread = if extracted {
+                                crate::app::book_materialization::extracted_view_mode(requested_spread, reading_direction_before)
+                            } else { requested_spread };
+                            let requested_direction = if extracted { reading_direction_before } else { requested_direction };
                             let stored_mode = if requested_direction != reading_direction_before {
                                 requested_spread.with_reading_direction(requested_direction)
                             } else {
@@ -28401,6 +28513,9 @@ impl App {
             return;
         }
         if self.spread_mode.is_spread() {
+            if self.extracted_result_surface().is_some() {
+                return;
+            }
             if let Some((new_idx, anchor_idx)) = self.compute_spread_offset_nudge(fs_idx, dir) {
                 self.spread_shift_anchor_idx = Some(anchor_idx);
                 self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
@@ -37455,6 +37570,9 @@ impl App {
         ctx: &egui::Context,
         preference: crate::settings::FinalCoverSpreadPreference,
     ) {
+        if self.extracted_result_surface().is_some() {
+            return;
+        }
         if self.final_cover_spread_preference == preference {
             return;
         }
@@ -37504,6 +37622,9 @@ impl App {
         ctx: &egui::Context,
         preference: crate::settings::SingletonSpreadEndpointPreferences,
     ) {
+        if self.extracted_result_surface().is_some() {
+            return;
+        }
         if self.singleton_spread_endpoint_preferences == preference {
             return;
         }
@@ -37522,6 +37643,9 @@ impl App {
         ctx: &egui::Context,
         preferences: crate::settings::PageAlonePreferences,
     ) {
+        if self.extracted_result_surface().is_some() {
+            return;
+        }
         if self.page_alone_preferences == preferences {
             return;
         }
@@ -37801,6 +37925,11 @@ impl App {
         fs_idx: usize,
         mode: SpreadMode,
     ) {
+        let mode = if self.extracted_result_surface().is_some() {
+            crate::app::book_materialization::extracted_view_mode(mode, self.reading_direction)
+        } else {
+            mode
+        };
         if mode == self.spread_mode {
             if self.spread_shift_anchor_idx.take().is_some() {
                 self.normalize_spread_position(ctx);
@@ -37814,7 +37943,9 @@ impl App {
         }
         self.invalidate_similar_preview();
         self.spread_mode = mode;
-        self.settings.update_active_favorite_spread_mode(mode);
+        if self.extracted_result_surface().is_none() {
+            self.settings.update_active_favorite_spread_mode(mode);
+        }
         self.spread_shift_anchor_idx = None;
         self.update_reading_direction_from_spread_mode(mode);
         self.spread_popup_open = false;
@@ -37850,7 +37981,9 @@ impl App {
         }
         self.invalidate_similar_preview();
         self.reading_flow = flow;
-        self.settings.update_active_favorite_reading_flow(flow);
+        if self.extracted_result_surface().is_none() {
+            self.settings.update_active_favorite_reading_flow(flow);
+        }
         self.spread_shift_anchor_idx = None;
         self.reset_continuous_reading_transform();
         self.set_default_fullscreen_fit_for_flow(ctx, fs_idx, flow);
@@ -37874,7 +38007,9 @@ impl App {
             return false;
         }
         self.spread_mode = new_mode;
-        self.settings.update_active_favorite_spread_mode(new_mode);
+        if self.extracted_result_surface().is_none() {
+            self.settings.update_active_favorite_spread_mode(new_mode);
+        }
         self.spread_shift_anchor_idx = None;
         self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
         true
@@ -37886,6 +38021,9 @@ impl App {
         fs_idx: usize,
         direction: ReadingDirection,
     ) {
+        if self.extracted_result_surface().is_some() {
+            return;
+        }
         let direction_changed = direction != self.reading_direction;
         let proposed_mode = self.spread_mode.with_reading_direction(direction);
         if !direction_changed && proposed_mode == self.spread_mode {
@@ -42554,6 +42692,7 @@ impl App {
         panorama_projection: crate::panorama::PanoProjection,
         panorama_projection_popup_open: &mut bool,
         panorama_projection_choice: &mut Option<crate::panorama::PanoProjection>,
+        extracted_result: bool,
         spread_mode: &mut SpreadMode,
         reading_flow: &mut ReadingFlow,
         reading_direction: &mut ReadingDirection,
@@ -43478,113 +43617,75 @@ impl App {
                     popup_ui.set_width(popup_inner.width());
                     popup_ui.set_height(popup_inner.height());
                     popup_ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
-                    let scroll_output = egui::ScrollArea::vertical()
-                        .id_salt("fs_spread_popup_scroll")
-                        .auto_shrink([false, false])
-                        .show_viewport(popup_ui, |scroll_ui, _viewport| {
-                            scroll_ui.spacing_mut().item_spacing.y = 0.0;
-                            draw_spread_popup_heading(scroll_ui, "ページ構成");
-                            for &mode in SpreadMode::all() {
-                                let item_rect = allocate_spread_popup_row(scroll_ui);
-                                let item_resp = scroll_ui.interact(
-                                    item_rect,
-                                    egui::Id::new(format!("spread_popup_{}", mode.to_int())),
-                                    egui::Sense::click(),
-                                );
-                                let is_current = *spread_mode == mode;
-                                let bg = if is_current {
-                                    egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
-                                } else if item_resp.hovered() {
-                                    egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200)
-                                } else {
-                                    egui::Color32::TRANSPARENT
-                                };
-                                scroll_ui.painter().rect_filled(item_rect, 4.0, bg);
-
-                                // アイコン (左側)
-                                let icon_center =
-                                    egui::pos2(item_rect.min.x + 20.0, item_rect.center().y);
-                                draw_spread_icon(scroll_ui.painter(), icon_center, 7.0, mode);
-
-                                // ラベル (右側)
-                                scroll_ui.painter().text(
-                                    egui::pos2(item_rect.min.x + 44.0, item_rect.center().y),
-                                    egui::Align2::LEFT_CENTER,
-                                    mode.label(),
-                                    egui::FontId::proportional(13.0),
-                                    egui::Color32::from_gray(220),
+                    let scroll_output =
+                        egui::ScrollArea::vertical()
+                            .id_salt("fs_spread_popup_scroll")
+                            .auto_shrink([false, false])
+                            .show_viewport(popup_ui, |scroll_ui, _viewport| {
+                                scroll_ui.spacing_mut().item_spacing.y = 0.0;
+                                draw_spread_popup_heading(scroll_ui, "ページ構成");
+                                draw_spread_mode_rows(
+                                    scroll_ui,
+                                    keymap,
+                                    spread_mode,
+                                    reading_direction,
+                                    spread_popup_open,
+                                    extracted_result,
                                 );
 
-                                if let Some(shortcut_label) = spread_mode_key_action(mode)
-                                    .and_then(|action| keymap.first_chord_label(action))
-                                {
-                                    scroll_ui.painter().text(
-                                        egui::pos2(item_rect.max.x - 8.0, item_rect.center().y),
-                                        egui::Align2::RIGHT_CENTER,
-                                        format!("[{shortcut_label}]"),
-                                        egui::FontId::proportional(11.0),
-                                        egui::Color32::from_gray(140),
+                                draw_spread_popup_heading(scroll_ui, "連結方式");
+                                for &flow in ReadingFlow::all() {
+                                    let item_rect = allocate_spread_popup_row(scroll_ui);
+                                    let item_resp = scroll_ui.interact(
+                                        item_rect,
+                                        egui::Id::new(format!(
+                                            "reading_flow_popup_{}",
+                                            flow.to_int()
+                                        )),
+                                        egui::Sense::click(),
                                     );
-                                }
-
-                                if item_resp.clicked() {
-                                    *spread_mode = mode;
-                                    if mode.is_rtl() {
-                                        *reading_direction = ReadingDirection::Rtl;
-                                    } else if matches!(mode, SpreadMode::Ltr | SpreadMode::LtrCover)
-                                    {
-                                        *reading_direction = ReadingDirection::Ltr;
-                                    }
-                                    *spread_popup_open = false;
-                                }
-                            }
-
-                            draw_spread_popup_heading(scroll_ui, "連結方式");
-                            for &flow in ReadingFlow::all() {
-                                let item_rect = allocate_spread_popup_row(scroll_ui);
-                                let item_resp = scroll_ui.interact(
-                                    item_rect,
-                                    egui::Id::new(format!("reading_flow_popup_{}", flow.to_int())),
-                                    egui::Sense::click(),
-                                );
-                                let is_current = *reading_flow == flow;
-                                let bg = if is_current {
-                                    egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
-                                } else if item_resp.hovered() {
-                                    egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200)
-                                } else {
-                                    egui::Color32::TRANSPARENT
-                                };
-                                scroll_ui.painter().rect_filled(item_rect, 4.0, bg);
-                                scroll_ui.painter().text(
-                                    egui::pos2(item_rect.min.x + 16.0, item_rect.center().y),
-                                    egui::Align2::LEFT_CENTER,
-                                    flow.label(),
-                                    egui::FontId::proportional(13.0),
-                                    egui::Color32::from_gray(220),
-                                );
-                                if let Some(shortcut_label) =
-                                    keymap.first_chord_label(KeyAction::FsReadingFlowCycle)
-                                {
-                                    let suffix = if flow == ReadingFlow::Paged {
-                                        ""
+                                    let is_current = *reading_flow == flow;
+                                    let bg = if is_current {
+                                        egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
+                                    } else if item_resp.hovered() {
+                                        egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200)
                                     } else {
-                                        "循環"
+                                        egui::Color32::TRANSPARENT
                                     };
+                                    scroll_ui.painter().rect_filled(item_rect, 4.0, bg);
                                     scroll_ui.painter().text(
-                                        egui::pos2(item_rect.max.x - 8.0, item_rect.center().y),
-                                        egui::Align2::RIGHT_CENTER,
-                                        format!("[{shortcut_label}{suffix}]"),
-                                        egui::FontId::proportional(11.0),
-                                        egui::Color32::from_gray(140),
+                                        egui::pos2(item_rect.min.x + 16.0, item_rect.center().y),
+                                        egui::Align2::LEFT_CENTER,
+                                        flow.label(),
+                                        egui::FontId::proportional(13.0),
+                                        egui::Color32::from_gray(220),
                                     );
+                                    if let Some(shortcut_label) =
+                                        keymap.first_chord_label(KeyAction::FsReadingFlowCycle)
+                                    {
+                                        let suffix = if flow == ReadingFlow::Paged {
+                                            ""
+                                        } else {
+                                            "循環"
+                                        };
+                                        scroll_ui.painter().text(
+                                            egui::pos2(item_rect.max.x - 8.0, item_rect.center().y),
+                                            egui::Align2::RIGHT_CENTER,
+                                            format!("[{shortcut_label}{suffix}]"),
+                                            egui::FontId::proportional(11.0),
+                                            egui::Color32::from_gray(140),
+                                        );
+                                    }
+                                    if item_resp.clicked() {
+                                        *reading_flow = flow;
+                                        *spread_popup_open = false;
+                                    }
                                 }
-                                if item_resp.clicked() {
-                                    *reading_flow = flow;
-                                    *spread_popup_open = false;
-                                }
-                            }
 
+                                if extracted_result {
+                                    draw_extracted_result_view_notice(scroll_ui);
+                                }
+                                scroll_ui.add_enabled_ui(!extracted_result, |scroll_ui| {
                             draw_spread_popup_heading(scroll_ui, "横方向");
                             for &direction in &[ReadingDirection::Ltr, ReadingDirection::Rtl] {
                                 let item_rect = allocate_spread_popup_row(scroll_ui);
@@ -43763,7 +43864,8 @@ impl App {
                                     }
                                 }
                             }
-                        });
+                            });
+                            });
                     #[cfg(not(test))]
                     let _ = &scroll_output;
                     #[cfg(test)]
@@ -55639,6 +55741,7 @@ mod tests {
                         crate::panorama::PanoProjection::Perspective,
                         &mut panorama_projection_popup_open,
                         &mut panorama_projection_choice,
+                        false,
                         &mut spread_mode,
                         &mut reading_flow,
                         &mut reading_direction,
@@ -55786,6 +55889,7 @@ mod tests {
                         crate::panorama::PanoProjection::Perspective,
                         &mut panorama_projection_popup_open,
                         &mut panorama_projection_choice,
+                        false,
                         &mut spread_mode,
                         &mut reading_flow,
                         &mut reading_direction,
@@ -73548,6 +73652,139 @@ mod tests {
         );
     }
 
+    #[test]
+    fn g1_extracted_key_handlers_ignore_old_db_rows_and_never_persist() {
+        use crate::app::book_materialization::{ExtractedSurface, ProjectionRecipe};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("spread.db");
+        let mut app = final_cover_local_test_app(4);
+        let key = PathBuf::from("C:/__search_results__");
+        app.current_folder = Some(key.clone());
+        app.spread_db = Ok(crate::spread_db::SpreadDb::open_at(&path).unwrap());
+        app.spread_db
+            .as_ref()
+            .unwrap()
+            .set(
+                &key,
+                SpreadMode::LtrCover,
+                SpreadMode::Single,
+                ReadingFlow::Paged,
+                ReadingDirection::Ltr,
+            )
+            .unwrap();
+        let monitor = rusqlite::Connection::open(&path).unwrap();
+        monitor
+            .execute_batch(
+                "CREATE TABLE g1_writes (count INTEGER); INSERT INTO g1_writes VALUES (0);",
+            )
+            .unwrap();
+        let tables = monitor.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name != 'g1_writes' AND name NOT LIKE 'sqlite_%'").unwrap()
+            .query_map([],|row| row.get::<_,String>(0)).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
+        for table in tables {
+            for op in ["INSERT", "UPDATE", "DELETE"] {
+                monitor.execute_batch(&format!("CREATE TRIGGER g1_{table}_{op} AFTER {op} ON {table} BEGIN UPDATE g1_writes SET count=count+1; END;")).unwrap();
+            }
+        }
+        app.projection_recipe = ProjectionRecipe::ExtractedResult(ExtractedSurface::Search(
+            crate::app::top_level_grid_view::TopLevelSearchView::Global,
+        ));
+        app.settings.default_spread_mode = SpreadMode::RtlCover;
+        app.settings.default_reading_direction = ReadingDirection::Rtl;
+        let defaults = crate::app::SpreadRestoreDefaults::for_book(&app.settings);
+        app.apply_spread_for_key_with_fallback(&key, None, defaults)
+            .unwrap();
+        assert_eq!(app.spread_mode, SpreadMode::Single);
+        assert_eq!(app.reading_direction, ReadingDirection::Rtl);
+        assert_eq!(app.spread_container_key(), None);
+        app.fullscreen_idx = Some(0);
+        let ctx = egui::Context::default();
+        for (key, expected) in [
+            (egui::Key::Num3, SpreadMode::Rtl),
+            (egui::Key::Num7, SpreadMode::Rtl),
+            (egui::Key::Num1, SpreadMode::Single),
+        ] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    focused: true,
+                    events: vec![egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |ctx| {
+                    app.handle_fs_key_input(ctx, 0, false);
+                },
+            );
+            assert_eq!(app.spread_mode, expected);
+            assert_eq!(app.reading_direction, ReadingDirection::Rtl);
+        }
+        app.apply_fullscreen_spread_mode(&ctx, 0, SpreadMode::SplitLtr);
+        assert_eq!(app.spread_mode, SpreadMode::SplitRtl);
+        app.set_reading_direction_for_fullscreen(&ctx, 0, ReadingDirection::Ltr);
+        assert_eq!(app.reading_direction, ReadingDirection::Rtl);
+        app.apply_spread_for_key_with_fallback(&key, None, defaults)
+            .unwrap();
+        assert_eq!(app.spread_mode, SpreadMode::Single);
+        let writes: i64 = monitor
+            .query_row("SELECT count FROM g1_writes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(writes, 0);
+        assert_eq!(
+            app.spread_db.as_ref().unwrap().get(&key),
+            Some(SpreadMode::LtrCover)
+        );
+    }
+
+    #[test]
+    fn g1_extracted_whole_list_pairing_disables_helpers_shift_and_preserves_fallback() {
+        use crate::app::book_materialization::{ExtractedSurface, ProjectionRecipe};
+        let mut app = final_cover_local_test_app(5);
+        app.items[1] = GridItem::ZipImage {
+            zip_path: PathBuf::from("C:/other.zip"),
+            entry_name: "01.jpg".to_owned(),
+        };
+        app.projection_recipe = ProjectionRecipe::ExtractedResult(ExtractedSurface::Rating);
+        app.settings.singleton_spread_first_enabled = true;
+        app.settings.singleton_spread_last_enabled = true;
+        app.settings.page_after_cover_alone_enabled = true;
+        app.settings.last_page_alone_enabled = true;
+        app.begin_extracted_result_view();
+        app.spread_mode = SpreadMode::Ltr;
+        let units = app.build_spread_display_units_for_nav(&[0, 1, 2, 3, 4]);
+        assert_eq!(
+            units
+                .iter()
+                .map(|unit| unit.pages.as_slice())
+                .collect::<Vec<_>>(),
+            vec![&[0, 1][..], &[2, 3], &[4]]
+        );
+        assert!(!app.final_cover_spread_enabled_for_current_book());
+        assert_eq!(
+            app.singleton_spread_placement_enabled_for_current_book(),
+            crate::settings::SingletonSpreadEndpointSettings::default()
+        );
+        assert_eq!(
+            app.page_alone_enabled_for_current_book(),
+            crate::settings::PageAloneSettings::default()
+        );
+        let mut action = FsKeyAction::default();
+        app.queue_spread_shift_action(0, 1, &mut action);
+        assert!(action.page_nav.is_none());
+        assert_eq!(app.spread_shift_anchor_idx, None);
+        app.spread_mode = SpreadMode::Single;
+        app.queue_spread_shift_action(0, 1, &mut action);
+        assert_eq!(action.page_nav, FsPageNav::Delta(1));
+        app.fullscreen_idx = None;
+        app.spread_mode = SpreadMode::RtlCover;
+        app.open_fullscreen(1, crate::app::HistoryTrigger::UserChosen);
+        assert_eq!(app.spread_mode, SpreadMode::Single);
+        assert_eq!(app.fullscreen_idx, Some(1));
+    }
+
     fn final_cover_local_test_app(item_count: usize) -> crate::app::AppTestEnvForTest {
         let mut app = crate::app::setup_app_for_test();
         app.current_folder = Some(PathBuf::from("c:/book"));
@@ -79338,6 +79575,7 @@ mod specified_scale_consumer_tests {
                         crate::panorama::PanoProjection::Perspective,
                         &mut panorama_projection_popup_open,
                         &mut panorama_projection_choice,
+                        false,
                         &mut spread_mode,
                         &mut reading_flow,
                         &mut reading_direction,

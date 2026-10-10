@@ -1,5 +1,17 @@
 # リモート閲覧 (Web) 機能 計画書
 
+## 抽出一覧の一時表示（§1.242 G1）
+
+評価・スマートフォルダ・保存コレクションの直接閲覧はA2の抽出一覧として扱う。
+新規閲覧はSingle、directionは全体既定を閲覧sessionへ取り込み、一時Spread/Splitはその方向で
+coverなしに投影する。本を開いた後のcontainerは従来の本別表示を使う。
+Webの既存方向/表紙付きキーは抽出一覧では表示種別だけへroutingし、表示メニューは
+単ページ・見開き・横長分割の三択。一時表示要求は既存collection取得/navigation経路へ送り、
+`SetSpread`の書込みを起動しない。保存コレクションの新規route取得では前sessionのmodeを送らない。
+件数/byte上限、policy、navigationのexact snapshot proofは保持する。通常ZIP一覧の子container位置も維持する。
+構成本の`SetViewMode`/binding拒否契約はbook-composition-plan §9.2 / G3以降の範囲であり、G1で構成APIは追加しない。
+
+
 v3.0.0 の目玉として、外出先のスマートフォン / タブレット / PC のブラウザから
 自宅 PC の mIV ライブラリを閲覧できるようにする。本書がこの機能の正本。
 

@@ -1124,6 +1124,16 @@ impl crate::app::App {
         }
         self.apply_stack_group_ready(
             pending.source.folder.clone(),
+            match &pending.source.listing {
+                StackListingSource::Normal(_, _) => {
+                    crate::app::book_materialization::ProjectionRecipe::OrdinaryList
+                }
+                StackListingSource::Subfolder(_, _) => {
+                    crate::app::book_materialization::ProjectionRecipe::ExtractedResult(
+                        crate::app::book_materialization::ExtractedSurface::SubfolderExpansion,
+                    )
+                }
+            },
             pending.existing_keys,
             pending.folder_signature,
             view,
@@ -1140,6 +1150,7 @@ impl crate::app::App {
     fn apply_stack_group_ready(
         &mut self,
         folder: PathBuf,
+        recipe: crate::app::book_materialization::ProjectionRecipe,
         existing_keys: std::collections::HashSet<String>,
         folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
         view: Arc<StackView>,
@@ -1165,6 +1176,7 @@ impl crate::app::App {
             });
         self.start_loading_stack_items(
             folder,
+            recipe,
             prepared,
             existing_keys,
             folder_signature,
@@ -1957,7 +1969,13 @@ impl crate::app::App {
             page_identity_index,
             ..
         } = prepared;
-        self.install_prepared_aggregate_items(items, metas, page_identity_index);
+        let recipe = match self.projection_recipe.extracted_surface() {
+            Some(surface) => {
+                crate::app::book_materialization::ProjectionRecipe::ExtractedResult(surface)
+            }
+            None => crate::app::book_materialization::ProjectionRecipe::OrdinaryList,
+        };
+        self.install_prepared_aggregate_items(recipe, items, metas, page_identity_index);
         if crate::folder_tree::path_eq(folder, &crate::app::subfolder_expansion_synthetic_path()) {
             self.restore_subfolder_expansion_view_state_after_items_install();
         }
@@ -2117,6 +2135,12 @@ mod tests {
         }
         let view = app.stack_view.as_ref().expect("subfolder stack prepared");
         assert_eq!(
+            app.projection_recipe,
+            crate::app::book_materialization::ProjectionRecipe::ExtractedResult(
+                crate::app::book_materialization::ExtractedSurface::SubfolderExpansion
+            )
+        );
+        assert_eq!(
             view.groups
                 .iter()
                 .map(|group| group
@@ -2143,6 +2167,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(app.stack_showing_flat);
+        assert!(app.extracted_result_surface().is_some());
         assert_eq!(app.items[1].name(), "b_2.jpg");
     }
 
@@ -2371,6 +2396,10 @@ mod tests {
             app.fs_feedback_toast.as_ref().map(|toast| &toast.0)
         ));
         assert_eq!(view.groups.len(), 2);
+        assert_eq!(
+            app.projection_recipe,
+            crate::app::book_materialization::ProjectionRecipe::OrdinaryList
+        );
         assert_eq!(view.index_map_builds, 2, "Rating installs a retained order");
         assert_eq!(
             view.groups[0].representative().path.file_name().unwrap(),

@@ -3647,7 +3647,14 @@ impl App {
         self.stack_mode_requested = false;
         self.stack_showing_flat = false;
         self.cancel_stack_script_pending();
-        self.install_prepared_aggregate_items(items, image_metas, page_identity_index);
+        self.install_prepared_aggregate_items(
+            crate::app::book_materialization::ProjectionRecipe::ExtractedResult(
+                crate::app::book_materialization::ExtractedSurface::Collection,
+            ),
+            items,
+            image_metas,
+            page_identity_index,
+        );
         self.invalidate_idx_state_and_queues();
         self.clear_page_edit_state();
         if let Some((snapshot, mut projection)) = page_edits {
