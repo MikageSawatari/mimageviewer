@@ -1938,6 +1938,7 @@ fn fullscreen_fit_hud_popup_snapshots() {
         ("dark", mimageviewer::os_theme::ResolvedTheme::Dark),
     ] {
         for (size_name, size) in [
+            ("tall", egui::vec2(1200.0, 1000.0)),
             ("normal1093", egui::vec2(1093.0, 614.0)),
             ("narrow", egui::vec2(280.0, 320.0)),
         ] {

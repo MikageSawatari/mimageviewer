@@ -24712,6 +24712,12 @@ impl App {
                             self.draw_continuous_adjust_target_outline(ui, image_rect);
                         }
 
+                        // Panels precede the HUD in draw order. Reserve its wheel input now,
+                        // so a foreground popup and a backing ScrollArea cannot both use it.
+                        let mut hud_popup_wheel = (self.fullscreen_top_bar_chrome_allowed(fs_idx)
+                            && (self.fit_popup_open || self.spread_popup_open || self.slideshow_popup_open))
+                            .then(|| FsHudPopupWheelInput::take(ctx));
+
                         // ── 分析パネル（分析モード時、見開き中は無効）──
                         let panels_t0 = std::time::Instant::now();
                         let mut side_panel_visible = false;
@@ -25075,6 +25081,9 @@ impl App {
                             };
                             let cursor_hidden = self.cursor_hidden();
                             let effective_top_bar_locked = self.resolved_still_chrome().top_locked;
+                            if let Some(wheel) = hud_popup_wheel.as_mut() {
+                                wheel.restore(ctx);
+                            }
                             Self::draw_fs_hover_bar(
                                 ui,
                                 ctx,
@@ -25147,6 +25156,10 @@ impl App {
                                 touch_chrome_latched,
                                 self.frame_counter,
                             );
+                            if hud_popup_wheel.is_some() {
+                                // The reserved frame remains owned even if a popup closed while drawing.
+                                consume_fs_hud_popup_wheel(ctx);
+                            }
                             if top_bar_lock_pressed {
                                 self.settings.fullscreen_top_bar_locked =
                                     !self.settings.fullscreen_top_bar_locked;
@@ -42507,6 +42520,7 @@ impl App {
         touch_chrome_latched: bool,
         touch_target_frame: u64,
     ) {
+        let popup_wheel_owned = *fit_popup_open || *spread_popup_open || *slideshow_popup_open;
         let hover_in_top = ctx.input(|i| {
             !cursor_hidden
                 && i.pointer
@@ -43737,13 +43751,11 @@ impl App {
         if *fit_popup_open && !is_video && !panorama_mode_active {
             let bounds = ui.ctx().content_rect().shrink(4.0);
             let width = 320.0_f32.min(bounds.width());
-            let height = 480.0_f32.min(bounds.height());
             let origin = egui::pos2(
                 fit_btn_x.clamp(bounds.left(), (bounds.right() - width).max(bounds.left())),
-                (bar_rect.bottom() + 4.0)
-                    .min(bounds.bottom() - height)
-                    .max(bounds.top()),
+                (bar_rect.bottom() + 4.0).clamp(bounds.top(), bounds.bottom()),
             );
+            let height = (bounds.bottom() - origin.y).max(1.0);
             let popup_rect = egui::Rect::from_min_size(origin, egui::vec2(width, height));
             let popup = ui
                 .scope_builder(
@@ -43785,6 +43797,10 @@ impl App {
             {
                 *fit_popup_open = false;
             }
+        }
+
+        if popup_wheel_owned || *fit_popup_open || *spread_popup_open || *slideshow_popup_open {
+            consume_fs_hud_popup_wheel(ctx);
         }
 
         // ── 左側: フォルダ + ファイル名 (または archive > entry) ──
@@ -44085,6 +44101,52 @@ fn draw_fs_prefetch_status_row(ui: &mut egui::Ui, indicator: &FsPrefetchIndicato
     });
 }
 
+/// Reserve wheel input while backing fullscreen panels render, then hand it to the HUD.
+struct FsHudPopupWheelInput {
+    raw: egui::Vec2,
+    smooth: egui::Vec2,
+    events: Vec<egui::Event>,
+}
+
+impl FsHudPopupWheelInput {
+    fn take(ctx: &egui::Context) -> Self {
+        ctx.input_mut(|input| {
+            let mut events = Vec::new();
+            input.events.retain(|event| {
+                if matches!(event, egui::Event::MouseWheel { .. }) {
+                    events.push(event.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            Self {
+                raw: std::mem::take(&mut input.raw_scroll_delta),
+                smooth: std::mem::take(&mut input.smooth_scroll_delta),
+                events,
+            }
+        })
+    }
+
+    fn restore(&mut self, ctx: &egui::Context) {
+        ctx.input_mut(|input| {
+            input.raw_scroll_delta = std::mem::take(&mut self.raw);
+            input.smooth_scroll_delta = std::mem::take(&mut self.smooth);
+            input.events.append(&mut self.events);
+        });
+    }
+}
+
+fn consume_fs_hud_popup_wheel(ctx: &egui::Context) {
+    ctx.input_mut(|input| {
+        input.raw_scroll_delta = egui::Vec2::ZERO;
+        input.smooth_scroll_delta = egui::Vec2::ZERO;
+        input
+            .events
+            .retain(|event| !matches!(event, egui::Event::MouseWheel { .. }));
+    });
+}
+
 fn fs_fit_popup_frame() -> egui::Frame {
     egui::Frame::new()
         .inner_margin(4.0)
@@ -44295,7 +44357,9 @@ fn draw_fs_fit_popup(
     favorite: bool,
     size: egui::Vec2,
 ) -> egui::InnerResponse<FsFitPopupChoice> {
-    fs_fit_popup_frame().show(ui, |ui| {
+    let frame = fs_fit_popup_frame();
+    let body_size = (size - frame.total_margin().sum()).max(egui::Vec2::splat(1.0));
+    frame.show(ui, |ui| {
         crate::os_theme::apply_dark_ui(ui);
         ui.spacing_mut().item_spacing.y = 4.0;
         // The shared floating style reserves zero width. Reserve the full
@@ -44305,49 +44369,67 @@ fn draw_fs_fit_popup(
         scroll.floating_allocated_width = scroll
             .floating_allocated_width
             .max(scroll.bar_inner_margin + scroll.bar_width);
-        ui.set_width((size.x - 8.0).max(1.0));
+        ui.set_width(body_size.x);
         #[cfg(test)]
         let (scroll_right, scroll_style) =
             (ui.available_rect_before_wrap().right(), ui.spacing().scroll);
-        let scroll_output = egui::ScrollArea::vertical()
-            .id_salt("fs_fit_popup_scroll")
-            .max_height((size.y - 8.0).max(1.0))
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
-                let mut choice = FsFitPopupChoice::default();
-                let header = keymap
-                    .first_chord_label(KeyAction::FsFitModeCycle)
-                    .map(|label| format!("ズーム/フィット  [{label}で循環]"))
-                    .unwrap_or_else(|| "ズーム/フィット".to_owned());
-                fs_fit_popup_header(ui, &header);
-                for &candidate in FullscreenFitMode::selectable_for_flow(flow) {
-                    if fs_fit_popup_row(
-                        ui,
-                        candidate.cycle_id(),
-                        candidate.label(),
-                        candidate == mode,
-                        false,
-                    )
-                    .clicked()
-                    {
-                        choice.mode = Some(candidate);
-                    }
-                }
-                fs_fit_popup_separator(ui);
-                fs_fit_popup_header(ui, "倍率制限");
-                if fs_fit_popup_row(ui, "no_upscale", "拡大しない", no_upscale, true).clicked()
-                {
-                    choice.no_upscale = Some(!no_upscale);
-                }
-                if fs_fit_popup_row(ui, "no_downscale", "縮小しない", no_downscale, true).clicked()
-                {
-                    choice.no_downscale = Some(!no_downscale);
-                }
-                fs_fit_popup_separator(ui);
-                choice.specified_changed =
-                    fs_fit_popup_specified_editor(ui, value, max_tenths, favorite);
-                choice
-            });
+        let body_height = body_size.y;
+        let scroll_output = ui
+            .allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), body_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("fs_fit_popup_scroll")
+                        .min_scrolled_height(1.0)
+                        .max_height(body_height)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            let mut choice = FsFitPopupChoice::default();
+                            let header = keymap
+                                .first_chord_label(KeyAction::FsFitModeCycle)
+                                .map(|label| format!("ズーム/フィット  [{label}で循環]"))
+                                .unwrap_or_else(|| "ズーム/フィット".to_owned());
+                            fs_fit_popup_header(ui, &header);
+                            for &candidate in FullscreenFitMode::selectable_for_flow(flow) {
+                                if fs_fit_popup_row(
+                                    ui,
+                                    candidate.cycle_id(),
+                                    candidate.label(),
+                                    candidate == mode,
+                                    false,
+                                )
+                                .clicked()
+                                {
+                                    choice.mode = Some(candidate);
+                                }
+                            }
+                            fs_fit_popup_separator(ui);
+                            fs_fit_popup_header(ui, "倍率制限");
+                            if fs_fit_popup_row(ui, "no_upscale", "拡大しない", no_upscale, true)
+                                .clicked()
+                            {
+                                choice.no_upscale = Some(!no_upscale);
+                            }
+                            if fs_fit_popup_row(
+                                ui,
+                                "no_downscale",
+                                "縮小しない",
+                                no_downscale,
+                                true,
+                            )
+                            .clicked()
+                            {
+                                choice.no_downscale = Some(!no_downscale);
+                            }
+                            fs_fit_popup_separator(ui);
+                            choice.specified_changed =
+                                fs_fit_popup_specified_editor(ui, value, max_tenths, favorite);
+                            choice
+                        })
+                },
+            )
+            .inner;
         #[cfg(test)]
         ui.ctx().data_mut(|data| {
             let bar = egui::Rect::from_min_max(
@@ -44364,6 +44446,10 @@ fn draw_fs_fit_popup(
                 egui::Id::new("fs_fit_popup_scroll_layout"),
                 (scroll_output.inner_rect, bar, scroll_output.content_size),
             );
+            data.insert_temp(
+                egui::Id::new("fs_fit_popup_scroll_offset"),
+                scroll_output.state.offset,
+            );
         });
         scroll_output.inner
     })
@@ -44373,10 +44459,7 @@ fn draw_fs_fit_popup(
 pub fn draw_fs_fit_popup_snapshot_fixture(ui: &mut egui::Ui, favorite: bool) {
     let mut value = crate::settings::FullscreenSpecifiedScale::default();
     let mut max_tenths = crate::settings::FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS;
-    let size = egui::vec2(
-        ui.available_width().min(320.0),
-        ui.available_height().min(480.0),
-    );
+    let size = egui::vec2(ui.available_width().min(320.0), ui.available_height());
     draw_fs_fit_popup(
         ui,
         &Keymap::default(),
@@ -80126,6 +80209,238 @@ mod specified_scale_consumer_tests {
                 crate::settings::Settings::load().fullscreen_specified_scale_max_tenths,
                 app.settings.fullscreen_specified_scale_max_tenths
             );
+        }
+    }
+
+    #[test]
+    fn specified_scale_popup_uses_available_height_and_scrolls_only_when_needed() {
+        for (size, should_scroll) in [
+            (egui::vec2(1200.0, 1000.0), false),
+            (egui::vec2(1093.0, 614.0), false),
+            (egui::vec2(280.0, 320.0), true),
+            (egui::vec2(280.0, 120.0), true),
+        ] {
+            let ctx = egui::Context::default();
+            crate::ui_fonts::configure_fonts(&ctx);
+            let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            let mut open = true;
+            let mut value = FullscreenSpecifiedScale::default();
+            let mut output = fit_popup_frame(&ctx, viewport, vec![], &mut open, &mut value);
+            for _ in 0..4 {
+                output = fit_popup_frame(&ctx, viewport, vec![], &mut open, &mut value);
+            }
+            let (inner, _, content) = ctx.data(|data| {
+                data.get_temp::<(egui::Rect, egui::Rect, egui::Vec2)>(egui::Id::new(
+                    "fs_fit_popup_scroll_layout",
+                ))
+                .unwrap()
+            });
+            assert!(viewport.contains_rect(inner));
+            assert_eq!(
+                content.y > inner.height() + 0.5,
+                should_scroll,
+                "available space must determine scrolling: size={size:?}, inner={inner:?}, content={content:?}"
+            );
+            assert!(painted_label(&output, "最大倍率（共通）").is_some() || should_scroll);
+            fn popup_rect(shape: &egui::epaint::Shape) -> Option<egui::Rect> {
+                match shape {
+                    egui::epaint::Shape::Vec(shapes) => shapes.iter().find_map(popup_rect),
+                    egui::epaint::Shape::Rect(rect) if rect.fill == fs_fit_popup_frame().fill => {
+                        Some(rect.rect)
+                    }
+                    _ => None,
+                }
+            }
+            // ScrollAreaOutput.inner_rect is the pre-shrink viewport in egui 0.33.
+            // Check the real painted Frame, including margin and stroke, at every height.
+            let painted = output
+                .shapes
+                .iter()
+                .find_map(|shape| popup_rect(&shape.shape))
+                .unwrap();
+            assert!(
+                viewport.shrink(4.0).contains_rect(painted),
+                "painted={painted:?} viewport={viewport:?}"
+            );
+            if !should_scroll {
+                assert!(
+                    painted.height() >= content.y
+                        && painted.height()
+                            <= content.y + fs_fit_popup_frame().total_margin().sum().y + 0.5,
+                    "the painted popup keeps its natural content height"
+                );
+            } else {
+                for frame in 0..40 {
+                    let events = if frame == 0 {
+                        vec![
+                            egui::Event::PointerMoved(inner.center()),
+                            egui::Event::MouseWheel {
+                                unit: egui::MouseWheelUnit::Point,
+                                delta: egui::vec2(0.0, -2000.0),
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ]
+                    } else {
+                        vec![]
+                    };
+                    output = fit_popup_frame(&ctx, viewport, events, &mut open, &mut value);
+                }
+                if size.y >= 320.0 {
+                    assert!(
+                        painted_label(&output, "最大倍率（共通）").is_some(),
+                        "short-window scroll reaches the bottom editors"
+                    );
+                }
+                assert!(
+                    ctx.data(|data| data
+                        .get_temp::<egui::Vec2>(egui::Id::new("fs_fit_popup_scroll_offset")))
+                        .unwrap()
+                        .y
+                        > 0.0
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn specified_scale_popup_wheel_does_not_scroll_the_real_metadata_panel() {
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        install_fs_navigator_input_tracking(&ctx);
+        let mut app = pdf_app(&ctx, 1);
+        app.items[0] = GridItem::Image(app.tmp.path().join("wheel.png"));
+        app.settings.fullscreen_specified_scale = FullscreenSpecifiedScale::default();
+        app.settings.fullscreen_top_bar_locked = true;
+        app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::Hover;
+        app.fs_info_panel.locked = true;
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        app.native_video_in_window_active = true;
+        app.settings.still_seek_strip_visible = false;
+        let key = app.metadata_cache_key(0).unwrap();
+        app.exif_cache.insert(
+            key,
+            Some(crate::exif_reader::ExifInfo {
+                sections: vec![(
+                    crate::exif_reader::TagGroup::Camera,
+                    (0..80)
+                        .map(|i| (format!("fixture {i}"), format!("metadata value {i}")))
+                        .collect(),
+                )],
+            }),
+        );
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(820.0, 400.0));
+        let mut frame = 0;
+        let mut draw = |app: &mut App, events| {
+            frame += 1;
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(viewport),
+                    time: Some(frame as f64 / 60.0),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.render_fullscreen_viewport(ctx),
+            )
+        };
+        let metadata = || {
+            ctx.data(|data| {
+                data.get_temp::<(egui::Rect, egui::Vec2, egui::Vec2)>(egui::Id::new(
+                    "metadata_scroll_test_layout",
+                ))
+            })
+            .unwrap()
+        };
+        for _ in 0..5 {
+            let _ = draw(&mut app, vec![]);
+        }
+        let (panel, content, initial) = metadata();
+        assert!(
+            content.y > panel.height(),
+            "the real metadata panel must be scrollable"
+        );
+        let wheel = |pos| {
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -100.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        let _ = draw(&mut app, vec![egui::Event::PointerMoved(panel.center())]);
+        let _ = draw(&mut app, wheel(panel.center()));
+        for _ in 0..30 {
+            let _ = draw(&mut app, vec![]);
+        }
+        assert!(
+            metadata().2.y > initial.y,
+            "baseline without a popup really scrolls"
+        );
+        for popup in 0..3 {
+            app.fit_popup_open = popup == 0;
+            app.spread_popup_open = popup == 1;
+            app.slideshow_popup_open = popup == 2;
+            for _ in 0..5 {
+                let _ = draw(&mut app, vec![]);
+            }
+            let point = if popup == 0 {
+                let inner = ctx
+                    .data(|data| {
+                        data.get_temp::<(egui::Rect, egui::Rect, egui::Vec2)>(egui::Id::new(
+                            "fs_fit_popup_scroll_layout",
+                        ))
+                    })
+                    .unwrap()
+                    .0;
+                let overlap = inner.intersect(panel);
+                assert!(
+                    overlap.is_positive(),
+                    "pointer must be over popup and panel"
+                );
+                overlap.center()
+            } else {
+                panel.center()
+            };
+            let _ = draw(&mut app, vec![egui::Event::PointerMoved(point)]);
+            let before = metadata().2;
+            let _ = draw(&mut app, wheel(point));
+            assert!(
+                ctx.input(|i| i.raw_scroll_delta == egui::Vec2::ZERO
+                    && i.smooth_scroll_delta == egui::Vec2::ZERO
+                    && !i
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, egui::Event::MouseWheel { .. }))),
+                "the popup's wheel frame must leave nothing for a later grid/panel consumer"
+            );
+            for _ in 0..30 {
+                let _ = draw(&mut app, vec![]);
+            }
+            assert_eq!(
+                metadata().2,
+                before,
+                "HUD popup {popup} owns wheel ahead of the right panel"
+            );
+            assert!(ctx.input(|i| {
+                i.raw_scroll_delta == egui::Vec2::ZERO
+                    && i.smooth_scroll_delta == egui::Vec2::ZERO
+                    && !i
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, egui::Event::MouseWheel { .. }))
+            }));
+            if popup == 0 {
+                assert!(
+                    ctx.data(|data| data
+                        .get_temp::<egui::Vec2>(egui::Id::new("fs_fit_popup_scroll_offset")))
+                        .unwrap()
+                        .y
+                        > 0.0,
+                    "the front popup still receives and uses the wheel"
+                );
+            }
         }
     }
 

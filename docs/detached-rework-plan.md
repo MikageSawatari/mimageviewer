@@ -4429,3 +4429,14 @@ context epoch・優先度を継承し、元contextへ一度だけ画像とworker
 QAのcache-read witnessは相関済み画像の受理時に記録し、進捗は既存の通常要求projectionとkeep内画像から導出する。
 detached述語・viewport生成・placement・focus・registry protocolは変更しない。
 これは両側の既存ownerを保持する統合であり、新しい待機状態・retry・時間窓を追加しない。
+
+### 2026-10-10 §1.342 HUD fit popup の利用可能高・入力所有修正
+
+§2を読んだ上で、利用者指定の構造修正としてui_fullscreen.rsの共通HUD popup描画境界を変更する。
+現在viewportの余白・HUD位置から本文の親領域を明示確保し、内容が収まる場合は自然高へ縮める。
+背面panel描画前に既存fit / spread / slideshow popupのwheelを退避し、同じHUDの描画にだけ戻して
+残りも消費する。ui_metadata_panel.rsは実ScrollAreaのoffsetを観測するtest-onlyの接続を追加する。
+tests/ui_snapshot.rsは既存の共通GPU harness・fixtureで通常 / 狭窓 / 縦長のfit popupだけを検証する。
+新しいdetached predicate、host identity、placement / focus / recreate、context bundle状態は作らない。
+描画・入力の既存ownerで利用可能領域と配送順を揃えるため、症状guard・待機・repaintによる修正ではない。
+利用者の構造修正指示を根拠とし、本差分の独立レビュー合格を先取りしない。

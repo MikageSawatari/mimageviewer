@@ -1068,3 +1068,26 @@ settings分類は455 field（142対象 / 313除外）、wire項目140。幅・�
 最大倍率が対象field一つの追加である。対象popup／prefs snapshotだけを意図して更新・目視確認する。
 今回の新しい独立レビュー合格を意味する記録ではない。製品起動・build-dev・commitは行わず、
 実機確認中のtarget/dev-runtimeには書き込まない。
+
+## 22. HUDポップアップの利用可能高とホイール所有（2026-10-10）
+
+利用者の14:45 build実機確認で、画面に余裕がある場合もfit popupが縮み、ホイールが背面の
+右情報パネルへ通ることを確認した。固定480pointと自動サイズの親UiではScrollAreaの利用可能高を
+保証できず、右パネルをHUDより先に描く順序で同じ入力を受け取っていた。
+
+fit popupは現在のviewportの4point余白とHUD下端＋4pointから利用可能高を求め、frameの内余白を
+引いた本文領域を明示確保する（frameの線幅もtotal_marginで含める）。ScrollAreaの縦auto_shrinkで短い内容は自然高、収まらない窓だけ
+上限とスクロールを使う。eguiの既定最小スクロール高64pointも利用可能高を超えないよう、このpopupだけ
+1pointへ下げる。高さ120pointの窓でも枠線を含む描画が4point余白内へ収まることを検証する。固定本文高・追加repaint・遅延・前frameのcontent高を保存する状態は作らない。
+浮動scrollbarの予約、RGBA(30,30,30,240)、32point行、IME・0キー・live保存境界は維持する。
+
+同じ上部HUDのfit / 見開き / スライドショーpopupが開いているframeでは、既存open状態から
+raw_scroll_delta / smooth_scroll_delta / MouseWheelイベントを背面描画前に退避する。
+HUDの描画境界だけで戻し、描画後に残りも消費する。右パネル・シーク・一覧が先に読むことを
+許さない。別のpopup / menuや音楽HUDの経路は変更しない。frame内の受渡しだけで、Appの新状態・
+独立owner・viewport生成・host判定を増やさない。
+
+実回帰はtall / 1093×614 / 狭いF12相当のfit popup描画で自然高とスクロール・末尾到達を確認し、
+render_fullscreen_viewportと実metadata ScrollAreaでpopupなしなら動くoffsetがpopup中は不変であること、
+前面popup自身はスクロールすることを確認する。同じHUDの見開き・スライドショーも背面入力を
+消費する。snapshotはfit popupの意図した画像だけを更新・目視する。
