@@ -32,7 +32,11 @@ class PreflightTests(unittest.TestCase):
             for path in paths:
                 path.mkdir(parents=True)
             perf[mode] = {"many_folders": str(paths[0]), "navigation_order": list(map(str, paths[1:]))}
-        self.manifest.write_text(json.dumps({"perf": perf}))
+        tray = {name: str(self.fixture / name) for name in ("tray-while", "tray-after")}
+        for path in tray.values():
+            Path(path).mkdir()
+        self.manifest.write_text(json.dumps({"perf": perf, "paths": tray}))
+        self.tray_roots = list(map(Path, tray.values()))
         self.folder = Path(perf["cached"]["many_folders"])
 
     def check(self, **kwargs):
@@ -46,9 +50,33 @@ class PreflightTests(unittest.TestCase):
 
     def test_missing_catalog_is_absent_without_creation(self):
         result = self.check(stopped=True)
-        self.assertEqual(len(result["opens"]), 14)
+        self.assertEqual(len(result["opens"]), 16)
         self.assertTrue(all(o["pre_open_absent"] for o in result["opens"]))
+        self.assertEqual([entry["folder_path"] for entry in result["opens"][-2:]],
+                         list(map(str, self.tray_roots)))
         self.assertFalse((self.data / "cache").exists())
+
+    def test_tray_parent_catalog_owns_all_tile_keys_and_nonempty_wal_refuses_proof(self):
+        for root in self.tray_roots:
+            db = catalog_path(self.data, root)
+            db.parent.mkdir(parents=True, exist_ok=True)
+            with closing(sqlite3.connect(db)) as conn:
+                conn.execute("CREATE TABLE thumbnails(filename TEXT)")
+                conn.executemany("INSERT INTO thumbnails VALUES (?)",
+                                 [(f"folder-{number:04d}",) for number in range(1, 601)])
+                conn.commit()
+            before = hashlib.sha256(db.read_bytes()).hexdigest()
+            proof = next(entry for entry in self.check(stopped=True)["opens"]
+                         if entry["folder_path"] == str(root))
+            self.assertFalse(proof["pre_open_absent"])
+            self.assertEqual(set(proof["catalog_keys"]),
+                             {f"folder-{number:04d}" for number in range(1, 601)})
+            self.assertEqual(hashlib.sha256(db.read_bytes()).hexdigest(), before)
+            wal = db.with_name(db.name + "-wal")
+            wal.write_bytes(b"pending tray thumbnail write")
+            with self.subTest(root=root), self.assertRaisesRegex(ValueError, "nonempty stopped catalog WAL"):
+                self.check(stopped=True)
+            wal.unlink()
 
     def test_reads_saved_keys_without_changing_db(self):
         db = catalog_path(self.data, self.folder)
