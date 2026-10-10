@@ -89,7 +89,8 @@ Originalは引き続き物理1:1。指定値を消さず往復できる。Margin
 
 ### 4.1 軸・単位・基準
 
-各軸は「指定なし」「％」「px」。幅％＋高さpxなどの混在を認める。
+各軸はenabledと％ / pxの保持値を持つ。OFFは制約へ参加しないだけで、数値・単位を保持する。
+幅％＋高さpxなどの混在を認める。
 ％の100は**その表示先の現在の画像表示領域**の同じ軸の長さ（Q1）。
 既存media rect / image_rectを使い、OSタイトルバー・固定HUD・固定右パネルの予約分は含めない。
 hover HUD / popup等の重なりは新たに差し引かない。§1.344で予約が抑制されれば％の基準も広がる。
@@ -107,8 +108,8 @@ effective pppで物理表示寸法へ変換される。main Contextのpppを別�
   画像表示領域の幅・高さとも80％の枠へ内接し、周囲に余白を残す設定例とする。
   利用者が用途に合わせて変更する前提。原寸制限・手動zoomで指定枠を超える場合は下記の契約に従う。
   未編集でも循環へ参加し、動的に候補を減らさない。
-  極小領域のgap補正は§5による。両Noneはその補正も行わず既存Page基準を使う。
-  両NoneのPage相当はfit式に限る。selected modeはSpecifiedScaleで、原寸入力と上限の契約は
+  極小領域のgap補正は§5による。両軸OFFはその補正も行わず既存Page基準を使う。
+  両軸OFFのPage相当はfit式に限る。selected modeはSpecifiedScaleで、原寸入力と上限の契約は
   §4.3 / 下記のまま。trimは§5.1の既存経路別規則を使う。
 
 初期値の例: image rectが1000×800pointなら枠は800×640point。
@@ -216,7 +217,7 @@ canonicalの1/1000 pointをそのまま`1/P`と比較しない。
 
 **AI到着時の不変保証（決定）**: アスペクト基準・bbox・構成・rect / ppp・指定値・操作が同じなら、
 AI差替えだけでpaint / hit / capture / navigatorの表示geometryと連結の配置長・scroll範囲を変えない。
-no_up / no_downの4通り、5倍上限の有無、単ページ / 見開き / 連結のいずれも対象。
+no_up / no_downの4通り、共通最大倍率の適用前後、単ページ / 見開き / 連結のいずれも対象。
 例: P=1・trim後O=400px・高さ800px・拡大禁止では、4倍AI到着前も後も400px表示。
 800pxへ拡大するr2 / r3案は、今回の利用者決定により撤回する。AI出力の画素丸めはsampling側で
 扱い、A / O・fitの外枠を解き直す理由にしない。画質だけを更新する。
@@ -516,8 +517,8 @@ favorite別へ広げない。手動zoom / pan、連結の基準unit、viewport /
   `FavoriteViewState::from_settings / apply_to_settings`、overlay.common、save時のoverlay解除、
   context mount / deposit、reset / OFF / favorite削除に新フィールドを含める。既存fieldやUUIDを失わない。
 - **既存state_jsonの欠落互換**: 新フィールド欠落で行全体を拒否しない。favoriteのwire adapterでは
-  追加値の欠落を表せるserde defaultを使い、適用時は共通値へ継承する。これは「幅 / 高さを両Noneに
-  指定した」という保存値とは異なる。明示変更を確定した指定値は有効な構造体を保存する。既存行の強制一括書換え、
+  追加値の欠落を表せるserde defaultを使い、適用時は共通値へ継承する。これは「幅 / 高さを両軸OFFに
+  した」という保存値とは異なる。明示変更を確定した指定値は有効な構造体を保存する。既存行の強制一括書換え、
   migration、DDL、schema version変更は不要。単なる読込でfavorite行や共通値を書き換えない。
 - **継承解決は変更ではない（r5 P2対応）**: 既存のcapture / reconcile ownerで、実効指定サイズ値と
   保存済みfavorite stateを比較するとき、欠落した指定値を共通値へ解決したことだけによる差分を
@@ -527,7 +528,7 @@ favorite別へ広げない。手動zoom / pan、連結の基準unit、viewport /
   favorite専用値を作る。現在地の指定値編集を既存setterで確定する境界から同じstate ownerへ渡し、
   継承後の値を`from_settings`で採っただけで明示変更と判定しない。共通値の変更もfavoriteへの
   明示変更ではない。他の既存8項目の正当な変更でstateを保存する場合も、指定値への明示変更が
-  なければ欠落を保持する。明示両Noneと欠落を混同せず、専用の書込みworker / 同期boolは追加しない。
+  なければ欠落を保持する。明示両軸OFFと欠落を混同せず、専用の書込みworker / 同期boolは追加しない。
   根拠は現行[app.rs:83269](../src/app.rs#L83269)の実効state比較と:83274の予約、:83299の離脱capture、
   :83422のidle reconcile、:83557の終了時reconcile。継承解決だけの比較差をここで除外しなければ、
   共通値を具体値として固定して次の入場で新しい共通値を継承できなくなる。
@@ -535,7 +536,7 @@ favorite別へ広げない。手動zoom / pan、連結の基準unit、viewport /
   通常のprefs draftは標準snapshotだが、export helper単体もoverlay.commonから共通値を取るgetterに
   接続する（capture_export:185のplain getterが有効値を直接取る前提はこのfieldに使わない）。
   importは標準値へ適用するrouteを使い、既存favorite行へコピー・上書きしない。旧転送に新キーが
-  なければ転送先の共通値を保持。キーがあれば両Noneを含め検証済みの値をそのまま適用する。
+  なければ転送先の共通値を保持。キーがあれば両軸OFFを含め検証済みの値をそのまま適用する。
 
 初期共通値は幅80％ / 高さ80％。既存favorite行の追加値欠落はその時点の共通値を使い、
 共通値を利用者が変更済みでも固定の両軸80％へ戻さない。既存favorite表示stateのJSONを破棄する案、
@@ -546,7 +547,8 @@ favorite別へ広げない。手動zoom / pan、連結の基準unit、viewport /
 [CLAUDE.mdの簡素化規則](../CLAUDE.md)と[detached計画 §2](detached-rework-plan.md#2-憲法-全ステージ共通の不変条件禁止事項-最重要)を読んだ。
 
 - modeは既存enumのみ。指定ON bool、cycle index、窓別override、包含集合、変更済みflagを追加しない。
-  軸はNone / ％ / pxの型で、不正な「有効だが単位なし」をなくす。
+  軸はenabled＋％ / pxの型付き保持値で、不正な「有効だが単位なし」をなくす。
+  OFF値の別backupは持たず、同じvalueを保存・転送する。
 - モーダルで割り込みを消す案: 編集は既存prefs draftに閉じOK / import適用で一括確定する。
   fitは純粋描画計算なので、閲覧・resizeを止める長期modalは不要。
 - 設定変更で窓を閉じて作り直す案: 表示領域の値からfitするだけで済み、余計な閲覧手順とownership変更になるため採らない。
@@ -565,7 +567,7 @@ favorite別へ広げない。手動zoom / pan、連結の基準unit、viewport /
   §5.3の一つの型付き基準だけをcontext-localに保持し、scale cache / 更新bool / 別pendingを増やさない。
   可視上限では既存の描画対象制限を使い、倍率を変更する組合せを新方式から除く。
 - favoriteは既存overlay / UUID / DB workerへ加える。別の指定値テーブルや同期ownerを作らない。
-  wire上の新field欠落と、明示両Noneを区別するための欠落互換は保存データ保護のみに使う。
+  wire上の新field欠落と、明示両軸OFFを区別するための欠落互換は保存データ保護のみに使う。
 - Z専用の保存target・別pendingを増やす案は採らない。§5.2の絶対px需要と既存request gateの
   型付き置換で、通常fitのtargetを保存・上書き・復元する組合せを除去する。
 
@@ -588,19 +590,19 @@ viewer_context_registryの同じcontext-local fieldの型・移送境界、必�
 
 ## 9. 実装時の検証・文書更新
 
-1. **純粋計算**: 片軸 / 両軸 / 両None、％ / px / mixed、縦横比、各範囲端、大小画像、
-   no_up / no_downの4通り、5倍上限の直前 / 一致 / 超過、manual zoom、P=1 / 1.25 / 1.5 / 2とUI倍率。
+1. **純粋計算**: 片軸 / 両軸 / 両軸OFF、％ / px / mixed、縦横比、各範囲端、大小画像、
+   no_up / no_downの4通り、共通最大倍率（1.0 / 5.0 / 20.0倍等）の直前 / 一致 / 超過、manual zoom、P=1 / 1.25 / 1.5 / 2とUI倍率。
    Q2決定の指定800px=800point、物理幅 / 高さはP倍になること、Originalは物理1:1を固定。
-   default幅80％ / 高さ80％の内接、両None fallback、既存4方式の幾何不変。
-   初期値と大きい表示領域の組合せでも自動fitがAI前原寸の5.0倍を超えず、no_upは1倍、
-   手動zoom / Zは5倍超を許すことを確認する。
+   default幅80％ / 高さ80％の内接、両軸OFF fallback、既存4方式の幾何不変。
+   初期値と大きい表示領域の組合せでも自動fitがAI前原寸の共通最大倍率（既定5.0倍）を超えず、
+   no_upは1倍、手動zoom / Zは設定した上限超を許すことを確認する。
 2. **表示単位**: 高さ違い見開き、左右読み、指定幅とgap境界、virtual slot / 中央単独表紙、
    trim / 分割・90° / 270°・RAW preview→full / AI差替え。paint / hit / UV / navigator / Zとscaleの一致。
    アスペクト基準Aとpixel原寸Oを別入力で検証。PDF page box（1/1000 point）の倍率を変えても
    同じ比率とcontent typeなら固定Oが同じこと、比率変更ならOの比率だけが追従することを確認。
    Vectorの長辺4096、Rasterのnative cap優先、任意の現在raster寸法がOへ混入しないことを固定する。
    no_upありのtrim後O=400px→4倍AI・高さ800px・P=1は400px→400pxを固定。
-   no_up OFF / no_down / 両ON、5倍上限、denoise→upscale→final / comic / retained AI、GPU clampを通し、
+   no_up OFF / no_down / 両ON、共通最大倍率、denoise→upscale→final / comic / retained AI、GPU clampを通し、
    AI後textureを原寸へ戻せば失敗する採用→次frame回帰にする。paint / hit / capture枠、連結長・scroll範囲を比較。
    AI画素丸めをAの変更として扱わず、明示的なcanvas / bbox変更とRAW寸法判明は別境界で検証。
 3. **連結**: 縦 / 横とも幅のみ / 高さのみ / 両軸で中央pair基準を解く。サイズの違うunitへscroll / reanchorしても
@@ -612,9 +614,9 @@ viewer_context_registryの同じcontext-local fieldの型・移送境界、必�
 4. **handler**: key / ring / gesture / mouse3ボタン / padが同じownerを通る。
    除外なし / 明示指定方式除外 / 1候補 / 現在対象外 / 全5除外 / 未知ID保持 / 従来4だけ除外。
    直接pickerには5方式。動画 / 音楽 / 編集では循環しない。
-5. **保存・prefs・転送**: Settingsの新設定欠落は両軸80％、mixed / None / 範囲のround-trip、無効単位・数値拒否、
+5. **保存・prefs・転送**: Settingsの新設定欠落は両軸80％、mixed / 片軸OFF / 両軸OFF / 保持値・範囲のround-trip、無効単位・数値拒否、
    全field分類、旧転送文書でdestination維持、OK / Cancel / import、IME Enter / Esc、狭幅widget到達。
-   remember OFF / ON、新規favorite継承、既存state_jsonのfield欠落（全既存項目保持）、両Noneとの差、
+   remember OFF / ON、新規favorite継承、既存state_jsonのfield欠落（全既存項目保持）、両軸OFFとの差、
    最長一致、行先projection、標準prefsとlive専用値のroute、reset / 削除 / context切替・500ms書込 / dropを通す。
    **欠落継承のlifecycle回帰**: 指定サイズfieldを持たないlegacy JSONを読み、favoriteへ入場
    →複数idle frameの実reconcile→離脱 / 終了の実capture / flushをそれぞれ通す。
@@ -622,7 +624,7 @@ viewer_context_registryの同じcontext-local fieldの型・移送境界、必�
    store commandも送られないことを確認する。その後共通指定値を変更→再入場し、変更後の共通値を
    継承することを確認する（終了経路は永続JSONを再読込して再入場）。予約後に取消しただけでは合格にしない。
    次に現在地で指定値を明示変更し、その操作だけが専用値を作って既存ownerへ保存予約すること、
-   明示両Noneを保持することを確認する。他の8項目だけを変更して保存した場合も指定値の欠落を保持し、
+   明示両軸OFFを保持することを確認する。他の8項目だけを変更して保存した場合も指定値の欠落を保持し、
    後の共通値変更を継承できることを固定する。解決済み値のbool比較だけでなく実handler / lifecycleを通す。
    共通値のsave / exportにfavorite専用値・UUID・pathが漏れず、importが専用行を上書きしないことを固定。
 6. **context / lifecycle**: main / F12 / F11 / 異DPI、実効HUD / 右予約と抑制ON/OFF。
@@ -659,7 +661,7 @@ viewer_context_registryの同じcontext-local fieldの型・移送境界、必�
     metadataの真正な変更以外でA / Oが変わらず、別contextの結果が混ざらないことを確認する。
 
 snapshotは純粋な設定描画helperをtests/ui_snapshotへ渡す（App全体のsnapshotにしない）。
-循環5checkbox、指定2行、初期の幅80％ / 高さ80％（両軸ON）、片軸のみ / mixed / None、ライト / ダーク、通常 / 狭幅、説明折返し、限界値を撮る。
+循環5checkbox、指定2行、初期の幅80％ / 高さ80％（両軸ON）、片軸のみ / mixed / 両軸OFF、ライト / ダーク、通常 / 狭幅、説明折返し、限界値を撮る。
 同じhelperのlive fit popupも標準 / favoriteの表示と幅・高さ・上限説明を撮る。
 必要なら単ページ・見開き幾何fixtureも追加。PNGを目視し、widget欠け・scrollbar重なり・説明の読みやすさを確認。
 入力routingの証明にはhandler testを使う。
@@ -673,7 +675,7 @@ snapshotは純粋な設定描画helperをtests/ui_snapshotへ渡す（App全体�
 実装時co-update: display-pipeline、keymap-specの5方式順、必要なkey-customization / ring文書、
 backlog、prefs検索、manual fullscreen / settings、detached §11。実装・検証・実機結果を本計画へ集約。
 manualには「初期は幅・高さ80％の枠へ内接して余白を残す設定例。用途に合わせて変更できる」、
-表示寸法pxのDPI / UI倍率への追従、AI前原寸の自動fit上限5.0倍と手動zoom / Zの例外を記す。
+表示寸法pxのDPI / UI倍率への追従、AI前原寸の自動fit用共通最大倍率（既定5.0倍）と手動zoom / Zの例外、OFF中の値保持を記す。
 動画 / Remoteの仕様変更が必要なら、今回の範囲へ黙って追加しない。
 
 ## 10. 利用者決定（2026-10-09、全質問決定済み）
@@ -779,10 +781,11 @@ r4基準からの`ui_fullscreen.rs`差分はseek stripのNoArt扱い、`pdf_load
 `settings.rs`の追加設定もfit循環・FavoriteViewStateの既存ownerを変更していない。
 出荷済みHUDの変更を本ラウンドで再評価・変更しない。
 
-**残る利用者回答の反映（2026-10-09）**: Q2は表示寸法pxのlogical point基準、Q4-aは
+**残る利用者回答の反映（2026-10-09、当時の仕様）**: Q2は表示寸法pxのlogical point基準、Q4-aは
 幅80％・高さ80％の初期内接、Q4-bは自動fitだけAI前原寸の固定5.0倍上限へ決定した。
 §10.1へ記録し、未決質問節を削除した。初期設定・例・欠落default・snapshot / 回帰・
-実装時のmanual説明を両軸80％へ揃えた。片軸None / 両Noneの明示設定は引き続き有効。
+実装時のmanual説明を両軸80％へ揃えた。当時は片軸None / 両Noneを明示設定として扱った。
+固定上限と軸Option形式は2026-10-10の§21で共通最大倍率・enabled＋保持値へ置き換えた。
 本節のv4.5.0後のコード照合と所有境界は維持する。
 独立設計レビュー承認・構造判定への合意は、通知されていないため記録しない。
 実装はレビュー合意後に着手し、detached §11は実際に触った境界を記録する。
@@ -797,6 +800,9 @@ r4基準からの`ui_fullscreen.rs`差分はseek stripのNoArt扱い、`pdf_load
 実装差分の独立レビュー・実機確認は未実施。製品はエージェントが起動していない。
 
 ### 接続する所有境界
+
+以下の表と検証件数は2026-10-09時点の実装記録。固定5倍・軸Noneの記述は当時の仕様で、
+現在は§21の共通最大倍率snapshotとenabled＋保持値に置き換わる。
 
 | 境界 | 実装接続・現時点の記録 |
 | --- | --- |
@@ -911,7 +917,7 @@ snapshot画像を変更せず、指定サイズの狭幅表示を目視確認し
 | 左右分割・見開き構成 | `apply_fullscreen_spread_mode` が既存連結ownerを終端し、`build_presentation_steps_for_nav / continuous_reading_units_and_pos` が新しいhalf / pairを作る。新構成の現在の中央unitからfitを解く |
 | 見開き端のslot・白slot設定 | `invalidate_singleton_spread_placement_display` の既存resetとcompositionを使い、実ページ＋仮想slotの新構成で中央unitを選び直す |
 | 指定値・原寸制限・fit方式の明示編集 | 既存live setter／fit設定入口とpolicy比較が中央unitを選び直す。古いunit・指定値のgeometryを使わない。§16のlive共通値の保存境界は維持する |
-| viewport resize / DPI / UI倍率・gap | 同じ参照unitの元寸法へ現在のimage rect、ppp、実効gap、5倍上限を適用する。resizeだけでは参照unitを選び直さず、手動zoomを保持する |
+| viewport resize / DPI / UI倍率・gap | 同じ参照unitの元寸法へ現在のimage rect、ppp、実効gap、共通最大倍率（§21、既定5倍）を適用する。resizeだけでは参照unitを選び直さず、手動zoomを保持する |
 | index remap / source交換・削除 | 同じsourceを保つ純粋なindex remapは元寸法とpresentation順を保持し、occurrenceを対応付け直す。sourceの削除・交換は既存source失効ownerで参照を終端する |
 
 未確定の新しいunitは既存どおり元寸法到着を待つ。構成／policy編集で新しい中央unitを選ぶ場合に、
@@ -1046,6 +1052,7 @@ Q4-b / Q10の上記改訂が旧固定5倍・OFF→100％の記録に優先する
 capは既存fit descriptorへsnapshotとして含め、capture / holdover / frozen / navigator replayに
 新しいlive capを後から混ぜない。PDFはそのgeometryから需要を作り、O / Aをraster到着で変えない。
 連結の参照texture退去後も保持sourceで解決したgeometryへ現在の共通capを掛ける。
+capだけの編集では参照unitを選び直さず、同じunitの保持sourceを使う。
 
 状態簡素化: OFF用の別backup値、pending保存、新しいvisibility bool / workerを作る案を除外。
 軸は常に一つのvalueを持ち、enabledだけで制約の参加を選ぶ。capは常に有効な共通数値一つ。
