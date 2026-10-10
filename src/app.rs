@@ -26883,6 +26883,9 @@ impl App {
 
         restore_intent: crate::app::StartupListIntent,
     ) {
+        // Favorites and other direct inputs bypass the _owned load admissions below.
+        // Normalize the accepted copy before classification; keep saved records intact.
+        let path = crate::path_key::normalize_input_path(&path);
         if Self::path_needs_open_classification(&path) {
             let continuation = ClassifiedOpenContinuation::DirectNavigation {
                 restore_intent: restore_intent.clone(),

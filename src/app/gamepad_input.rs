@@ -8299,6 +8299,44 @@ fn cycle_video_playback_speed(current: f64, delta: i32) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn mixed_path_favorite_picker_direct_navigation_preserves_saved_record() {
+        for folder_name in ["mixed-input", "mixed-input.zip", "mixed-input.pdf"] {
+            crate::app::tests::assert_mixed_path_favorite_direct_navigation(
+                folder_name,
+                "gamepad-picker",
+                |app, ctx| {
+                    use super::{PadAction, PadActionKind};
+                    use crate::ring_shortcut::{
+                        GamepadFavoritePickerState, GamepadFavoritePickerTab, GamepadListCursor,
+                    };
+                    app.gamepad_favorite_picker = Some(GamepadFavoritePickerState {
+                        tab: GamepadFavoritePickerTab::Favorites,
+                        favorites: GamepadListCursor::new(0),
+                        smart_folders: GamepadListCursor::new(0),
+                    });
+                    // The real South-press handler, without the native foreground-window
+                    // gate in dispatch_gamepad_batch (this is a headless regression).
+                    let nav = app
+                        .dispatch_gamepad_favorite_picker_button(
+                            ctx,
+                            PadAction {
+                                button: crate::gamepad::PadButton::South,
+                                kind: PadActionKind::Press,
+                            },
+                        )
+                        .unwrap();
+                    let crate::ui_main::AddressBarNav::Direct(path, intent) = nav else {
+                        panic!("favorite confirmation must produce a direct navigation");
+                    };
+                    assert!(app.gamepad_favorite_picker.is_none());
+                    (path, intent)
+                },
+            );
+        }
+    }
+
     #[test]
     fn bookmark_picker_opens_on_its_supported_active_sort() {
         let mut app = crate::app::setup_app_for_test();
