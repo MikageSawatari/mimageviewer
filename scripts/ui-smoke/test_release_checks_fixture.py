@@ -161,6 +161,27 @@ class ReleaseChecksFixtureTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "settings overlay"):
             self.verify_small()
 
+    def test_perf_seed_matches_runtime_geometry_and_seeds_each_distinct_load(self):
+        manifest = self.generate_small()
+        sessions = manifest["seed_requirements"]["sessions"]
+        self.assertEqual([s["case_id"] for s in sessions], ["seed-profile", "seed-perf-cached"])
+        self.assertEqual(sessions[0]["cache_paths"], [manifest["paths"]["static"]])
+        seed = json.loads(Path(manifest["overlays"][sessions[1]["overlay"]]).read_text(encoding="utf-8"))
+        for mode in ("cached", "uncached"):
+            runtime = json.loads(Path(manifest["overlays"][f"perf-{mode}"]).read_text(encoding="utf-8"))
+            for field in ("window_size", "grid_cols", "thumb_aspect", "thumb_aspect_auto", "sort_order"):
+                self.assertEqual(seed[field], runtime[field])
+            loads = manifest["perf"][mode]["load_order"]
+            self.assertEqual(len(loads), len(set(loads)))
+            self.assertTrue(all(Path(p).parent == Path(manifest["paths"][mode]) for p in loads))
+        self.assertEqual(sessions[1]["cache_paths"], [manifest["paths"]["cached"],
+                         *manifest["perf"]["cached"]["navigation_order"], *manifest["perf"]["cached"]["load_order"]])
+        self.assertTrue(all("uncached" not in p and "tray-" not in p for p in sessions[1]["cache_paths"]))
+        manifest["seed_requirements"]["sessions"][1]["overlay"] = "seed-static"
+        (self.output / "fixture-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "seed session layout"):
+            self.verify_small()
+
     def test_full_topology_keeps_perf_shape_and_known_tray_regression_shape(self):
         # The encoder is covered separately; substitute tiny bytes to cheaply
         # exercise the production counts and uniqueness across all 5,366 PNGs.

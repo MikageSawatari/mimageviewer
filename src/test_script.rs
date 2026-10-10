@@ -6865,6 +6865,7 @@ mod tests {
             .replace("__SEARCH_HITS__", "[]")
             .replace("__CACHE_PATHS__", "[]")
             .replace("__NAVIGATION_PATHS__", "[]")
+            .replace("__LOAD_PATHS__", "[]")
             .replace("__INCLUDE_FIRST_AI__", "false")
             .replace("__RUNNER_PID__", "202");
         engine.compile(source).expect("release recipe syntax");
@@ -6931,6 +6932,7 @@ mod tests {
             .replace("__SEARCH_HITS__", "[]")
             .replace("__CACHE_PATHS__", "[\"C:/fixture/cache\"]")
             .replace("__NAVIGATION_PATHS__", "[]")
+            .replace("__LOAD_PATHS__", "[]")
             .replace("__INCLUDE_FIRST_AI__", "false")
             .replace("__RUNNER_PID__", "202");
         let helpers = source.split("\nrelease_check_begin(").next().unwrap();
@@ -6953,6 +6955,116 @@ mod tests {
 
     #[cfg(feature = "test-script")]
     #[test]
+    fn release_checks_perf_recipe_runs_distinct_loads_then_five_chords_and_search() {
+        // Evaluate the actual recipe, using deterministic consumer observations.
+        // Neither an app nor a window/process/input API is run by this test.
+        for mode in ["cached", "uncached"] {
+            let many = format!("C:/fixture/{mode}");
+            let loads: Vec<_> = (1..=256).map(|i| format!("{many}/folder-{i:04}")).collect();
+            let navigation: Vec<_> = (1..=6)
+                .map(|i| format!("C:/fixture/{mode}-navigation/navigation-{i:02}"))
+                .collect();
+            let state = Arc::new(Mutex::new((
+                many.clone(),
+                1_i64,
+                1.0_f64,
+                0_usize,
+                Vec::<String>::new(),
+            )));
+            let evidence = Arc::new(Mutex::new(Map::new()));
+            let (bridge, _, _) = runner_bridge(ready_snapshot());
+            let mut engine = build_engine(bridge);
+            engine.register_fn("sleep", |_: rhai::INT| {
+                panic!("ready consumers must not sleep")
+            });
+            let s = Arc::clone(&state);
+            engine.register_fn("release_check_observe", move || {
+                let mut s = s.lock().unwrap();
+                s.2 += 0.01;
+                super::release_checks::to_dynamic(&serde_json::json!({"pid":1,
+                    "current_folder_path":s.0,"items_generation":s.1,"perf_t":s.2,
+                    "loading_complete":true,"index_settled":true,"interaction_ready":true,"focused":true,
+                    "search_active":true,"search_focused":true,"search_query":"needle",
+                    "search_done":true,"search_searching":false,"search_hits":[]}))
+            });
+            let s = Arc::clone(&state);
+            engine.register_fn("release_check_open", move |path: ImmutableString| {
+                let mut s = s.lock().unwrap();
+                s.0 = path.to_string();
+                s.1 += 1;
+                s.4.push(format!("open:{path}"));
+            });
+            let s = Arc::clone(&state);
+            let nav = navigation.clone();
+            engine.register_fn(
+                "tap_key",
+                move |key: ImmutableString, modifiers: ImmutableString| {
+                    assert_eq!(modifiers.as_str(), "ctrl");
+                    let mut s = s.lock().unwrap();
+                    match key.as_str() {
+                        "Down" => {
+                            s.3 += 1;
+                            s.0 = nav[s.3].clone();
+                            s.1 += 1;
+                        }
+                        "G" => assert_eq!(s.3, 5),
+                        _ => panic!("unexpected recipe key"),
+                    }
+                    s.4.push(format!("key:{key}"));
+                },
+            );
+            let s = Arc::clone(&state);
+            engine.register_fn("release_check_text", move |text: ImmutableString| {
+                assert_eq!(text.as_str(), "needle");
+                s.lock().unwrap().4.push("text:needle".into());
+            });
+            let e = Arc::clone(&evidence);
+            engine.register_fn(
+                "release_check_evidence",
+                move |_: ImmutableString, value: Map| {
+                    *e.lock().unwrap() = value;
+                },
+            );
+            engine.register_fn("release_check_quit", || {});
+            let source = include_str!("../scripts/ui-smoke/release-checks.rhai")
+                .replace("__CASE_ID__", &format!("perf-{mode}"))
+                .replace("__MANY_PATH__", &many)
+                .replace("__SEARCH_TERM__", "needle")
+                .replace("__SEARCH_HITS__", "[]")
+                .replace("__CACHE_PATHS__", "[]")
+                .replace(
+                    "__NAVIGATION_PATHS__",
+                    &serde_json::to_string(&navigation).unwrap(),
+                )
+                .replace("__LOAD_PATHS__", &serde_json::to_string(&loads).unwrap())
+                .replace("__INCLUDE_FIRST_AI__", "false")
+                .replace("__RUNNER_PID__", "202");
+            let helpers = source.split("\nrelease_check_begin(").next().unwrap();
+            let branch = source.split("let evidence =").nth(1).unwrap();
+            engine
+                .eval::<()>(&format!("{helpers}\nlet evidence ={branch}"))
+                .unwrap();
+            let expected: Vec<_> = loads
+                .iter()
+                .chain(&navigation[..1])
+                .map(|p| format!("open:{p}"))
+                .chain((0..5).map(|_| "key:Down".into()))
+                .chain(["key:G".into(), "text:needle".into()])
+                .collect();
+            assert_eq!(state.lock().unwrap().4, expected);
+            let e = evidence.lock().unwrap();
+            assert_eq!(e["folder_loads"].clone().cast::<rhai::Array>().len(), 256);
+            assert_eq!(e["navigation"].clone().cast::<rhai::Array>().len(), 5);
+            assert!(
+                e["search"].clone().cast::<Map>()["completed"]
+                    .clone()
+                    .cast::<bool>()
+            );
+        }
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
     fn release_checks_root_readiness_uses_the_serialized_selection_identity() {
         let (bridge, _, _) = runner_bridge(ready_snapshot());
         let engine = build_engine(bridge);
@@ -6960,6 +7072,7 @@ mod tests {
             .replace("__SEARCH_HITS__", "[]")
             .replace("__CACHE_PATHS__", "[]")
             .replace("__NAVIGATION_PATHS__", "[]")
+            .replace("__LOAD_PATHS__", "[]")
             .replace("__INCLUDE_FIRST_AI__", "false")
             .replace("__RUNNER_PID__", "202");
         let ast = engine.compile(source).unwrap().clone_functions_only();
@@ -7018,6 +7131,7 @@ mod tests {
             .replace("__SEARCH_HITS__", "[]")
             .replace("__CACHE_PATHS__", "[]")
             .replace("__NAVIGATION_PATHS__", "[]")
+            .replace("__LOAD_PATHS__", "[]")
             .replace("__INCLUDE_FIRST_AI__", "false")
             .replace("__RUNNER_PID__", "202");
         let bootstrap = source.split("\nfor attempt in 0..1800 {").next().unwrap();

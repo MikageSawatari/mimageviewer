@@ -41,7 +41,8 @@ def preflight(manifest_path, data, case_id, *, stopped=False, repo=REPO):
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     folders = []
     for mode in ("cached", "uncached"):
-        folders += [manifest["perf"][mode]["many_folders"], *manifest["perf"][mode]["navigation_order"]]
+        folders += [manifest["perf"][mode]["many_folders"], *manifest["perf"][mode]["navigation_order"],
+                    *manifest["perf"][mode]["load_order"]]
     # Folder representative thumbnails persist in the displayed parent catalog,
     # so each tray root owns all 600 tile keys; child catalogs are not the proof.
     folders += [manifest["paths"][name] for name in TRAY_NAMES]

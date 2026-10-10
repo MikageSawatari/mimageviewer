@@ -201,7 +201,8 @@ suite の証拠不足を保留し、採用時にこの文書差も統一する�
 ## 5. perf smoke の操作・自動判定
 
 cached / uncached を別 session で同じ台本で測る。起動の初期 many-folders load もログに含める。
-画像 folder を開く → **Ctrl+Down を 5 回、各入力の receipt / 世代・場所の変化を待つ** →
+many-folders subtree 内の **256個の異なる画像 folder を各1回開き、世代・場所・keep 完了を待つ** →
+画像 navigation folder を開く → **Ctrl+Down を 5 回、各入力の receipt / 世代・場所の変化を待つ** →
 Ctrl+G を開き固定語を入力 → debounce / 検索終了と期待 hit 集合を確認 → 通常終了。
 hold repeat の回数を 5 回と見なさない。default keymap を seed に固定して通常 keymap consumer を通す。
 現在 `hold_key` は Down + ctrl を扱えるが、synthetic key enum に G がなく、汎用検索文字入力 API も未整備。
@@ -235,7 +236,9 @@ tail=`none` を理由に長い UI update を捨てない。`diagnostic_dropped`�
 | `pre_grid.total_ms` | session 全サンプルの **p95 ≤0.3ms を必須**、超過は FAIL。p50 / p95 / max、遅い段と frame を出す。既知 startup を含む raw 値を保存し、除外して閾値を通さない |
 
 分母 0 / 有効サンプル不足は PASS にしない。暫定で描画 n≥200 を目安にし、Phase 2 で fixture と
-台本の自然なサンプル数を確認して固定する。足りないから idle に repaint を足して水増ししない。
+台本の自然なサンプル数を確認して固定する。Phase 4 の実行では従来台本が44個に留まったため、
+fixture v4 は上記256個の実 folder-load を cached / uncached に追加する。200の最低数、
+厳密な tail 分母、初期 startup・全 raw pre_grid は維持する。idle に repaint を足して水増ししない。
 AI は基本台本に含まれないため `known-first-ai=0 / AI未実施` を明記する。
 利用者決定により、AI / GPU 経路を変更する版だけ同じ入口の明示オプション（案: `-IncludeFirstAi`）で、
 生成静止画の初回 AI を追加する。
@@ -563,3 +566,34 @@ native権限引渡しはready/sleepより前だけに行い、測定中のObserv
 非対話fakeでgrant/owner/activation/実foregroundの拒否、およびwindow失敗と時計証拠の独立保存を検査する。
 検証とRust変更に伴う診断portable再buildは `target/F-phase4-fix5-msg.txt` に記録する。
 アプリ／ui-smokeは実行しない。修正後の実suite完走は利用者実行待ち。
+
+### Phase 4 perf workload と cache seed layout 修正（2026-10-11）
+
+利用者実行 `release-checks-20261010-180259-2c6143fc` は seed と5 idle全件 PASS。
+perf-cached は実行約2.4秒で、Ctrl+Down x5の各 press/release・`input/grid_ctrl_nav`・DFS/apply、
+Ctrl+G と固定検索語の Text 配送、期待hit集合・通常on_exit は成立していた。操作省略ではない。
+
+- 初期 cached parent の generation=1 は245 target、cache_read=105、source=140。
+  全 cache を Portrait3x4 の seed-static 一つで準備したため、横長 perf の keep 範囲を満たさなかった。
+  fixture v4 の seed は `seed-profile`（Portrait/static、pin、index/search）と `seed-perf-cached`
+  （Landscape、cached parent・navigation・追加load全フォルダー）に分ける。同じ隔離dataを引き継ぎ、
+  各sessionの通常終了・flush・全意図folderのdurable seedを検査する。後者の停止済みcopyだけをcaseに復元する。
+  static runtime は引き続きPortrait、video/perfはAuto、trayはOffを明示し、uncached/trayをseedで開かない。
+- 既存512 child folderのうち先頭256個を各1回開く workload を両perf sessionに追加する。
+  新しいダミーmedia、待ち時間による水増し、強制repaint、key repeatは使わない。
+  各Openは既存通常load consumerを通し、read-only世代・場所・keep終端を待つ。
+  stopped preflight に全load catalogを含め、cache/sourceをfull key・generation・request beginで各folder証明する。
+  cachedは最初のproducerが実cache_readであることを要求し、後のwarm readで最初のsource missを隠さない。
+  uncachedは別subtree・復元profileで各folderを一度だけ開き、warm再openへ変質させない。
+  Ctrl+Down x5とCtrl+G/Text/期待hit集合・通常終了の要求は維持する。analyzerは256個の経路・世代・区間と
+  全folder provenanceを追加検査し、描画n≥200、厳密な分母、raw pre_grid、全startup frameのgateを維持する。
+- frame 1→2 の gap は丸め済みJSONL時刻で127ms（frame_gap計装126.666ms）、
+  outer update 1.169ms、outside 126.197ms。最初のframeはindexer startup overlayの早期return、
+  次frameは通常updateへ進んでいた。eframeの初回paint/native visibility確定・次frame配送を含む区間だが、
+  この証拠だけではrenderer/OS待ちの内訳や根本原因を特定できない。`lf_scan`主成分や初回AIの証明が無く、
+  既知分類には移さない。追加workloadで希釈・切り捨てず、再現すれば引き続き製品／性能FAILとする。
+- perf-cachedが通常終了した後の性能判定FAIL（exit 1）でも、独立した復元profileでperf-uncachedの証拠を採る。
+  cachedのFAILはcasesとsuite verdictに残す。環境だけのSKIPPED、異常process終了、先行idleの失敗は従来どおり停止する。
+
+非対話検証・診断portable再buildの記録は `target/F-phase4-fix6-msg.txt` と
+`target/F-phase4-fix6-evidence/`。アプリ／ui-smokeは実行せず、修正台本の自然な描画数と実suite完走は利用者実行待ち。

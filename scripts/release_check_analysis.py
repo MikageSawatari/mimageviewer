@@ -261,7 +261,12 @@ def cache_errors(events: list[dict], evidence: dict, case_id: str) -> list[str]:
         if (not isinstance(many, str) or not many or not isinstance(order, list) or len(order) != 6
                 or not all(isinstance(p, str) and p for p in order)):
             return ["verified perf fixture manifest many-folder/navigation recipe missing"]
-        intended = [many, *order]
+        loads = recipe.get("load_order")
+        if (not isinstance(loads, list) or len(loads) != 256
+                or not all(isinstance(p, str) and p for p in loads)
+                or len({normalize_search_path(p) for p in loads}) != 256):
+            return ["verified perf fixture manifest distinct-folder load recipe missing"]
+        intended = [many, *loads, *order]
         for i, nav in enumerate(evidence.get("navigation", [])):
             if (i >= 5 or not isinstance(nav, dict)
                     or normalize_search_path(nav.get("before_path", "")) != normalize_search_path(order[i])
@@ -287,13 +292,26 @@ def cache_errors(events: list[dict], evidence: dict, case_id: str) -> list[str]:
             generation_field = "before_generation" if position == 0 else "after_generation"
             if len(navs) <= nav_index or navs[nav_index].get(generation_field) != generation:
                 continue
+        if case_id.startswith("perf-") and folder in [normalize_search_path(p) for p in recipe.get("load_order", [])]:
+            loads = evidence.get("folder_loads", [])
+            if not any(isinstance(load, dict) and normalize_search_path(load.get("after_path", "")) == folder
+                       and load.get("after_generation") == generation for load in loads):
+                continue
         if case_id == "video-pin-background" and evidence.get("target_key") not in keys:
             continue
         if mode == "cached":
             required_keys = [evidence["target_key"]] if case_id == "video-pin-background" else keys
-            if all(any(e.get("cat") == "qa" and e.get("kind") == "cache_read"
-                       and e.get("key") == key and e.get("items_gen") == generation
-                       and correlated_producer(e, begins) is not None for e in events) for key in required_keys):
+            first_reads = []
+            for key in required_keys:
+                producers = [e for e in events if e.get("cat") == "qa" and e.get("kind") in ("source", "cache_read")
+                             and e.get("key") == key and e.get("items_gen") == generation]
+                if any(correlated_producer(e, begins) is None for e in producers):
+                    first_reads.append(False)
+                    continue
+                producers.sort(key=lambda e: (begins[request_identity(e)]["t"], e["t"]))
+                first_reads.append(bool(producers and producers[0].get("kind") == "cache_read"
+                                        and producers[0].get("from_cache") is True))
+            if all(first_reads):
                 valid_folders.add(folder)
         elif opened.get("pre_open_absent") is True:
             first_sources = []
@@ -380,6 +398,38 @@ def static_request_errors(events: list[dict], evidence: dict, case_id: str) -> l
     return []
 
 
+def folder_load_errors(evidence: dict, case_id: str) -> list[str]:
+    """A fixed fresh-folder workload, with ordinary opens and observed outcomes."""
+    mode = "uncached" if case_id == "perf-uncached" else "cached"
+    recipe = evidence.get("fixture_manifest", {}).get("perf", {}).get(mode, {})
+    order, loads = recipe.get("load_order"), evidence.get("folder_loads")
+    if (not isinstance(order, list) or len(order) != 256
+            or not all(isinstance(p, str) and p for p in order)
+            or len({normalize_search_path(p) for p in order}) != 256
+            or not isinstance(loads, list) or len(loads) != 256):
+        return ["256 distinct fixture folder-load operations required"]
+    previous_path, previous_generation, previous_end = recipe.get("many_folders"), None, None
+    errors = []
+    for i, (path, load) in enumerate(zip(order, loads), 1):
+        span = interval(load) if isinstance(load, dict) else None
+        if (span is None or span[0] >= span[1] or previous_end is not None and span[0] < previous_end
+                or any(not isinstance(load.get(f), int) or isinstance(load[f], bool)
+                       for f in ("before_generation", "after_generation"))
+                or load["after_generation"] <= load["before_generation"]
+                or previous_generation is not None and load["before_generation"] != previous_generation
+                or not isinstance(load.get("before_path"), str) or not isinstance(load.get("after_path"), str)
+                or normalize_search_path(load["before_path"]) != normalize_search_path(previous_path or "")
+                or normalize_search_path(load["after_path"]) != normalize_search_path(path)):
+            errors.append(f"folder-load {i} invalid fixture route/generation/interval")
+            continue
+        previous_path, previous_generation, previous_end = path, load["after_generation"], span[1]
+    navs = evidence.get("navigation", [])
+    nav_start = number(navs[0].get("start_t")) if isinstance(navs, list) and navs and isinstance(navs[0], dict) else None
+    if previous_end is None or nav_start is None or previous_end > nav_start:
+        errors.append("folder-load workload must complete before the five Ctrl+Down operations")
+    return errors
+
+
 def analyze_perf_smoke(events: list[dict], *, expected_pid: int | None = None,
                        case_id: str = "perf-smoke", evidence: dict | None = None,
                        load_errors: list[str] | None = None) -> dict:
@@ -415,6 +465,8 @@ def analyze_perf_smoke(events: list[dict], *, expected_pid: int | None = None,
     errors.extend(cache_errors(events, evidence, case_id))
     if case_id != "first-ai":
         errors.extend(chord_errors(events, evidence))
+    if case_id in ("perf-cached", "perf-uncached"):
+        errors.extend(folder_load_errors(evidence, case_id))
     if not any(e.get("cat") == "qa" and e.get("kind") == "on_exit" and e.get("case_id") == case_id
                and e.get("flush_complete") is True for e in events):
         errors.append("normal on_exit/flush diagnostic witness missing")
@@ -677,6 +729,14 @@ def analyze_case_evidence(events: list[dict], evidence: dict, expected_pid: int 
                 if not any(f"dir::{Path(pin['key']).parent}" in target_keys(c.get("targets", []))
                            for pin in pinned for c in cache_seeds):
                     errors.append("normal video pin save plus parent-tile durable cache seed not proven")
+        if seed_kind == "cache" and "seed_cache_paths" in evidence:
+            saved = {normalize_search_path(e["folder_path"]) for e in seeds
+                     if isinstance(e.get("folder_path"), str) and e.get("saved_cache") is True
+                     and target_keys(e.get("targets", []))}
+            intended = evidence["seed_cache_paths"]
+            if (not isinstance(intended, list) or not intended
+                    or any(not isinstance(p, str) or normalize_search_path(p) not in saved for p in intended)):
+                errors.append("normal cache seed missing intended folder durable save witness")
         if seed_kind == "search":
             if not any(e.get("cat") == "index" and e.get("kind") == "initial_scan_settled" for e in events):
                 errors.append("seed index initial scan did not settle")
@@ -938,6 +998,11 @@ def release_record(result: dict) -> str:
         evidence = case.get("evidence") if isinstance(case.get("evidence"), dict) else {}
         if "drawn" in metrics:
             draw, pg = metrics["drawn"], metrics["pre_grid"]
+            operations = evidence.get("operations", {})
+            if case.get("case_id") in ("perf-cached", "perf-uncached"):
+                lines.append(f"  distinct image-folder loads {len(operations.get('folder_loads', []))}/256、"
+                             f"Ctrl+Down {len(operations.get('navigation', []))}/5、"
+                             f"fixture search completed={operations.get('search', {}).get('completed', False)}。")
             ratio = draw.get("below_16ms_ratio")
             percent = f"{ratio * 100:.2f}%" if ratio is not None else "n/a"
             lines.append(f"  total frames {metrics['total_frames']}、drawn <16ms "

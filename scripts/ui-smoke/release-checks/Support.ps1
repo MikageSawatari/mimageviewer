@@ -1,4 +1,12 @@
 # Function-only support. Dot-sourcing this file has no filesystem/process/UI effects.
+function Test-ReleaseCheckContinueAfterAnalysis {
+    param([string]$CaseId,[int]$ExitCode)
+    # Called only after normal process completion. Collect the independent
+    # uncached performance evidence even if cached has a real performance FAIL.
+    # Its recorded failure still determines the suite verdict.
+    return $ExitCode -eq 0 -or ($CaseId -eq 'perf-cached' -and $ExitCode -eq 1)
+}
+
 function Invoke-ReleaseCheckPreflight {
     param([scriptblock]$Action)
     try { return [pscustomobject]@{exit_code=0;value=(& $Action);environment_error=$null} }

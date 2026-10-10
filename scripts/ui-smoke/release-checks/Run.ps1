@@ -125,13 +125,16 @@ function Invoke-ReleaseSession {
         $template=$template.Replace($token.Key,([string]$token.Value).Replace('\','/'))
     }
     $template=$template.Replace('__SEARCH_HITS__',(@($m.search.expected_hits)|ConvertTo-Json -Compress))
-    $template=$template.Replace('__CACHE_PATHS__',(@($m.seed_requirements.cache.prepare)|ConvertTo-Json -Compress))
+    $seedRecipe=@($m.seed_requirements.sessions | Where-Object {$_.case_id -eq $CaseId})
+    $cachePaths=if($seedRecipe.Count -eq 1){@($seedRecipe[0].cache_paths)}else{@($m.seed_requirements.cache.prepare)}
+    $template=$template.Replace('__CACHE_PATHS__',(ConvertTo-Json -InputObject @($cachePaths) -Compress))
     $template=$template.Replace('__NAVIGATION_PATHS__',(@($m.perf.$mode.navigation_order)|ConvertTo-Json -Compress))
+    $template=$template.Replace('__LOAD_PATHS__',(ConvertTo-Json -InputObject @($m.perf.$mode.load_order) -Compress))
     [IO.File]::WriteAllText($scriptPath,$template,(New-Object Text.UTF8Encoding($false)))
     $sessionOverlay=Get-Content -LiteralPath $Overlay -Encoding UTF8 -Raw | ConvertFrom-Json
     # Perf measures the real initial many-folder startup shape. Other roots
     # remain untouched until the recipe opens them after indexing settles.
-    $sessionOverlay.startup_folder_path=if($CaseId -like 'perf-*'){$many}else{$m.paths.static}
+    $sessionOverlay.startup_folder_path=if($seedRecipe.Count -eq 1){$seedRecipe[0].startup_path}elseif($CaseId -like 'perf-*'){$many}else{$m.paths.static}
     Write-ReleaseCheckJson (Join-Path $dir 'settings-override.json') $sessionOverlay
     $arguments=@('--data-dir',$data,'--perf-log','--test-script',$scriptPath,'--test-evidence-dir',$dir,'--settings-override',(Join-Path $dir 'settings-override.json'),'--window-size','1328x900')
     $script:owned=Start-Process -FilePath $exe -ArgumentList (Join-NativeArguments $arguments) -WorkingDirectory $smoke -PassThru
@@ -215,25 +218,31 @@ try {
     $m=Get-Content -LiteralPath $fixtureManifest -Encoding UTF8 -Raw | ConvertFrom-Json
     $metadata.fixture_manifest=$fixtureManifest
     $metadata.fixture_version=$m.recipe_version
-    # Seed is one normal session; stop/flush before snapshot, preserve fixed paths.
-    $seedSession=Invoke-ReleaseSession 'seed-profile' $m.overlays.'seed-static' $false
-    if($null -ne $seedSession.exit_result){throw 'Seed session did not complete successfully; process verdict retained.'}
-    $seedEvents=@(Get-Content -LiteralPath (Join-Path $seedSession.directory 'perf_events.jsonl') -Encoding UTF8 | ForEach-Object {try{$_|ConvertFrom-Json}catch{}})
-    if(-not @($seedEvents|Where-Object {$_.cat -eq 'qa' -and $_.kind -eq 'on_exit'}).Count){throw 'Seed normal on_exit/flush proof missing.'}
-    $seed=Join-Path $run 'seed-profile-stopped'
-    Assert-NoSmokeProcess
-    Assert-NoReparseTree $data 'release-seed-source'
-    Copy-Item -LiteralPath $data -Destination $seed -Recurse
-    $seedEvidencePath=Join-Path $seedSession.directory 'case-evidence.json'
-    $seedEvidence=Get-Content -LiteralPath $seedEvidencePath -Encoding UTF8 -Raw | ConvertFrom-Json
-    $seedEvidence|Add-Member -MemberType NoteProperty -Name seed_phase -Value 'preparation' -Force
-    $seedEvidence|Add-Member -MemberType NoteProperty -Name seed_kinds -Value @('cache','video-pin','search') -Force
-    $seedEvidence|Add-Member -MemberType NoteProperty -Name copied_after_process_exit -Value $true -Force
-    Write-ReleaseCheckJson $seedEvidencePath $seedEvidence
-    & python (Join-Path $scripts 'release_check_analysis.py') evidence $seedEvidencePath --jsonl (Join-Path $seedSession.directory 'perf_events.jsonl') --expected-pid $seedSession.pid --json-out (Join-Path $seedSession.directory 'seed-check.json')
-    $seedExit=$LASTEXITCODE
-    $cases.Add((Join-Path $seedSession.directory 'seed-check.json'))
-    if($seedExit -ne 0){throw 'Normal seed cache/pin/index persistence was not proven.'}
+    # Seed each geometry in a normal session, retaining the same isolated data.
+    # No case clone is made until both sessions have exited and flushed.
+    foreach($seedRecipe in $m.seed_requirements.sessions){
+        $seedSession=Invoke-ReleaseSession $seedRecipe.case_id $m.overlays.($seedRecipe.overlay) $false
+        if($null -ne $seedSession.exit_result){throw 'Seed session did not complete successfully; process verdict retained.'}
+        $seedEvents=@(Get-Content -LiteralPath (Join-Path $seedSession.directory 'perf_events.jsonl') -Encoding UTF8 | ForEach-Object {try{$_|ConvertFrom-Json}catch{}})
+        if(-not @($seedEvents|Where-Object {$_.cat -eq 'qa' -and $_.kind -eq 'on_exit'}).Count){throw 'Seed normal on_exit/flush proof missing.'}
+        Assert-NoSmokeProcess
+        Assert-NoReparseTree $data 'release-seed-source'
+        $seedEvidencePath=Join-Path $seedSession.directory 'case-evidence.json'
+        $seedEvidence=Get-Content -LiteralPath $seedEvidencePath -Encoding UTF8 -Raw | ConvertFrom-Json
+        $seedEvidence|Add-Member -MemberType NoteProperty -Name seed_phase -Value 'preparation' -Force
+        $seedEvidence|Add-Member -MemberType NoteProperty -Name seed_kinds -Value @($seedRecipe.seed_kinds) -Force
+        $seedEvidence|Add-Member -MemberType NoteProperty -Name seed_cache_paths -Value @($seedRecipe.cache_paths) -Force
+        # Mark only after the stopped profile has actually been copied.
+        $seedCheckpoint=Join-Path $run ($seedRecipe.case_id+'-stopped')
+        Copy-Item -LiteralPath $data -Destination $seedCheckpoint -Recurse
+        $seedEvidence|Add-Member -MemberType NoteProperty -Name copied_after_process_exit -Value $true -Force
+        Write-ReleaseCheckJson $seedEvidencePath $seedEvidence
+        & python (Join-Path $scripts 'release_check_analysis.py') evidence $seedEvidencePath --jsonl (Join-Path $seedSession.directory 'perf_events.jsonl') --expected-pid $seedSession.pid --json-out (Join-Path $seedSession.directory 'seed-check.json')
+        $seedExit=$LASTEXITCODE
+        $cases.Add((Join-Path $seedSession.directory 'seed-check.json'))
+        if($seedExit -ne 0){throw 'Normal seed cache/pin/index persistence was not proven.'}
+    }
+    $seed=Join-Path $run 'seed-perf-cached-stopped'
     $caseIds=@('static-foreground','static-background','video-pin-background','tray-close-while-loading','tray-close-after-loading','perf-cached','perf-uncached')
     if($IncludeFirstAi){$caseIds+='first-ai';$metadata.approval_scope+=' + isolated first AI'}
     foreach($id in $caseIds){
@@ -250,7 +259,7 @@ try {
         $verdictExit=$LASTEXITCODE
         if(-not (Test-Path -LiteralPath $resultPath)){throw "$id analysis did not produce evidence."}
         $cases.Add($resultPath)
-        if($verdictExit -ne 0){break}
+        if(-not (Test-ReleaseCheckContinueAfterAnalysis $id $verdictExit)){break}
     }
 }catch{
     $cases.Add([ordered]@{case_id='suite-preparation';verdict='SKIPPED';exit_code=2;environment_errors=@($_.Exception.Message);failures=@();warnings=@()})

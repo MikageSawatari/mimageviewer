@@ -15,6 +15,46 @@ function Get-TestAst {
     return $ast
 }
 $repo=Split-Path $PSScriptRoot -Parent
+Assert-True (Test-ReleaseCheckContinueAfterAnalysis 'perf-cached' 1) 'Cached performance FAIL prevented independent uncached evidence.'
+Assert-True (Test-ReleaseCheckContinueAfterAnalysis 'perf-uncached' 0) 'Successful case prevented continuation.'
+foreach($case in @('static-foreground','tray-close-after-loading','perf-uncached')){
+    Assert-True (-not (Test-ReleaseCheckContinueAfterAnalysis $case 1)) 'Unrelated failure bypassed the stop condition.'
+}
+Assert-True (-not (Test-ReleaseCheckContinueAfterAnalysis 'perf-cached' 2)) 'Environment-only cached SKIPPED bypassed the stop condition.'
+& {
+    # Exercise the actual per-session substitutions without invoking the runner.
+    # In PS5 a pipeline ConvertTo-Json unwraps a one-element path list.
+    $ast=Get-TestAst (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Run.ps1')
+    $statements=$ast.FindAll({param($n)
+        $n -is [Management.Automation.Language.AssignmentStatementAst] -and (
+            $n.Left.Extent.Text -eq '$seedRecipe' -or $n.Left.Extent.Text -eq '$cachePaths' -or (
+                $n.Left.Extent.Text -eq '$template' -and (
+                    $n.Right.Extent.Text.Contains("'__CACHE_PATHS__'") -or
+                    $n.Right.Extent.Text.Contains("'__LOAD_PATHS__'"))))
+    },$true)
+    Assert-True ($statements.Count -eq 4) 'Seed/load template substitution statements missing.'
+    $m=[pscustomobject]@{
+        seed_requirements=[pscustomobject]@{
+            sessions=@([pscustomobject]@{case_id='seed-profile';cache_paths=@('C:\fixture\static')},
+                       [pscustomobject]@{case_id='seed-perf-cached';cache_paths=@('C:\fixture\cached','C:\fixture\cached\folder-0001')})
+            cache=[pscustomobject]@{prepare=@('C:\fixture\static','C:\fixture\cached')}
+        }
+        perf=[pscustomobject]@{cached=[pscustomobject]@{load_order=@('C:\fixture\cached\folder-0001')}}
+    }
+    $mode='cached'
+    foreach($CaseId in @('seed-profile','seed-perf-cached')){
+        $template='__CACHE_PATHS__|__LOAD_PATHS__'
+        foreach($statement in $statements){. ([scriptblock]::Create($statement.Extent.Text))}
+        $parts=$template.Split('|')
+        Assert-True ($parts[0].StartsWith('[') -and $parts[1].StartsWith('[')) 'One-path seed/load list became a Rhai scalar.'
+        $paths=ConvertFrom-Json -InputObject $parts[0]
+        if($CaseId -eq 'seed-profile'){
+            Assert-True ($paths.Count -eq 1 -and $paths[0] -eq 'C:\fixture\static') 'Static seed received perf cache paths.'
+        }else{
+            Assert-True ($paths.Count -eq 2 -and $paths[0] -eq 'C:\fixture\cached') ('Perf seed received wrong cache paths: '+$parts[0])
+        }
+    }
+}
 Import-ReleaseCheckFunctions (Join-Path $PSScriptRoot 'ui-smoke.ps1') @('Get-NormalizedPath','Assert-ExactPath','Assert-NoReparsePath','Assert-NoReparseTree')
 Assert-Throws {Assert-ReleaseCheckApproval $false} 'Missing approval was accepted.'
 foreach($reason in @('path refused','desktop unavailable','runner lock busy')){

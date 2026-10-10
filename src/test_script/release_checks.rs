@@ -566,7 +566,7 @@ pub(super) fn register(engine: &mut Engine, bridge: RunnerBridge) {
                 let proof = cache_probe(&o).map_err(rhai_error)?;
                 let targets=proof["targets"].as_array().unwrap();
                 if targets.is_empty() || targets.iter().any(|t|t["catalog_absent"] != false) { return Err(rhai_error("environment: normal cache seed missing kept target")); }
-                trace("seed",json!({"seed_kind":"cache","normal_producer":true,"saved_cache":true,"targets":targets,"key":targets[0]["key"]}));
+                trace("seed",json!({"seed_kind":"cache","normal_producer":true,"saved_cache":true,"folder_path":o.value["current_folder_path"],"targets":targets,"key":targets[0]["key"]}));
             }
             "search" if o.value["search_done"] == true && o.value["search_searching"] == false => trace("seed",json!({"seed_kind":"search","normal_producer":true,"completed":true,"actual_hits":o.value["search_hits"]})),
             _ => return Err(rhai_error("environment: unknown or unprepared seed")),

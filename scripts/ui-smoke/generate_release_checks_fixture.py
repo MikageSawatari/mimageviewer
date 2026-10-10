@@ -23,7 +23,7 @@ from pathlib import Path
 from generate_rating_sort_fixture import png
 
 
-RECIPE_VERSION = "release-checks-v3"
+RECIPE_VERSION = "release-checks-v4"
 SCHEMA_VERSION = 1
 WIDTH, HEIGHT = 884, 444
 STATIC_COUNT = 16
@@ -37,7 +37,20 @@ TRAY_GRID_COLS = 10
 NAVIGATION_COUNT = 6
 SEARCH_TERM = "mivreleasefixtureorchid"
 SEARCH_HIT_NUMBERS = (1, 3, 6)
+PERF_FOLDER_LOAD_COUNT = 256
 DEFAULT_ALLOWED_ROOT = Path(__file__).resolve().parents[2] / "target" / "ui-smoke" / "runs"
+
+
+def cache_seed_sessions(paths: dict, perf: dict) -> list[dict]:
+    return [
+        {"case_id": "seed-profile", "overlay": "seed-static", "startup_path": paths["static"],
+         "cache_paths": [paths["static"]], "seed_kinds": ["cache", "video-pin", "search"]},
+        {"case_id": "seed-perf-cached", "overlay": "seed-perf-cached", "startup_path": paths["cached"],
+         "cache_paths": [paths["cached"], *perf["cached"]["navigation_order"],
+                         *perf["cached"]["load_order"]], "seed_kinds": ["cache"]},
+    ]
+
+
 MANY_NAMES = ("cached", "uncached")
 TRAY_NAMES = ("tray-while", "tray-after")
 CASE_PATHS = {
@@ -222,7 +235,8 @@ def generate(output: Path, ffmpeg: Path, *, allowed_root: Path = DEFAULT_ALLOWED
                 image(child / f"image-{number:02d}.png")
         perf[mode] = {"many_folders": paths[mode], "start_folder": order[0],
                       "navigation_order": order, "ctrl_down_count": 5,
-                      "cache_prepared": False}
+                      "cache_prepared": False, "load_order": [str(Path(paths[mode]) / f"folder-{i:04d}")
+                                     for i in range(1, min(FOLDER_COUNT, PERF_FOLDER_LOAD_COUNT) + 1)]}
     paths["navigation"] = paths["perf-cached-navigation"]
     hits, non_hits = [], []
     for number in range(1, 7):
@@ -294,8 +308,9 @@ def generate(output: Path, ffmpeg: Path, *, allowed_root: Path = DEFAULT_ALLOWED
             "write_owner": "normal_app_apis", "app_launch_requires_interactive_approval": True,
             "profile_copy_requires_clean_process_exit": True,
             "same_absolute_paths_after_restore": True,
+            "sessions": cache_seed_sessions(paths, perf),
             "cache": {"prepare": [paths["static"], paths["cached"],
-                                   *perf["cached"]["navigation_order"]],
+                                   *perf["cached"]["navigation_order"], *perf["cached"]["load_order"]],
                       "read_after_restart": True,
                       "must_remain_unread": [paths["uncached"], paths["tray-while"],
                                              paths["tray-after"],
@@ -404,11 +419,16 @@ def verify_fixture(output: Path, *, allowed_root: Path = DEFAULT_ALLOWED_ROOT) -
                  for folder in range(1, NAVIGATION_COUNT + 1)]
         if manifest["perf"][mode] != {
                 "many_folders": expected_paths[mode], "start_folder": order[0],
-                "navigation_order": order, "ctrl_down_count": 5, "cache_prepared": False}:
+                "navigation_order": order, "ctrl_down_count": 5, "cache_prepared": False,
+                "load_order": [str(Path(expected_paths[mode]) / f"folder-{i:04d}")
+                               for i in range(1, min(FOLDER_COUNT, PERF_FOLDER_LOAD_COUNT) + 1)]}:
             raise ValueError("perf preparation recipe is invalid")
+    if manifest["seed_requirements"].get("sessions") != cache_seed_sessions(expected_paths, manifest["perf"]):
+        raise ValueError("seed session layout/isolation recipe is invalid")
     if manifest["seed_requirements"]["cache"] != {
             "prepare": [expected_paths["static"], expected_paths["cached"],
-                        *manifest["perf"]["cached"]["navigation_order"]],
+                        *manifest["perf"]["cached"]["navigation_order"],
+                        *manifest["perf"]["cached"]["load_order"]],
             "read_after_restart": True,
             "must_remain_unread": [expected_paths["uncached"], expected_paths["tray-while"],
                                    expected_paths["tray-after"],

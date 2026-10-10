@@ -52,21 +52,31 @@ def cached_request(key: str, generation: int, request_id: int, *, t: float = 5.6
              "origin": "upgradeable_cache", **identity}]
 
 
+def folder_loads() -> list[dict]:
+    return [{"before_path": "fixture" if i == 0 else f"fixture/folder-{i:04d}",
+             "after_path": f"fixture/folder-{i + 1:04d}", "before_generation": 3 + i, "after_generation": 4 + i,
+             "start_t": 5.8 + i * .009, "end_t": 5.807 + i * .009} for i in range(256)]
+
+
 def operations() -> dict:
     return {"pid": PID, "folder_open": {"completed": True},
-            "navigation": [{"receipt": True, "before_generation": n + 10, "after_generation": n + 11,
+            "navigation": [{"receipt": True, "before_generation": n + 260, "after_generation": n + 261,
                             "before_path": f"folder{n}", "after_path": f"folder{n + 1}",
-                            "start_t": 5.3 + n * .02, "end_t": 5.31 + n * .02} for n in range(5)],
+                            "start_t": 8.3 + n * .02, "end_t": 8.31 + n * .02} for n in range(5)],
             "search": {"ctrl_g_receipt": True, "text_receipt": True, "completed": True,
                        "expected_hits": ["a", "b"], "actual_hits": ["b", "a"],
-                       "start_t": 5.4, "end_t": 5.5, "expected_query": "fixture-query", "actual_query": "fixture-query"},
+                       "start_t": 8.4, "end_t": 8.5, "expected_query": "fixture-query", "actual_query": "fixture-query"},
+            "folder_loads": folder_loads(),
             "observation": {"root_hwnd": 123},
             "exit": {"on_exit": True, "flush_complete": True, "process_exited": True, "forced": False},
             "cache": {"mode": "cached", "opens": [{"folder_path": "fixture", "items_gen": 3,
                                                      "target_keys": ["dir::fixture/child"]},
-                                                    *[{"folder_path": f"folder{n}", "items_gen": n + 10,
+                                                    *[{"folder_path": p["after_path"], "items_gen": p["after_generation"],
+                                                       "target_keys": [p["after_path"] + "/image.png"]} for p in folder_loads()],
+                                                    *[{"folder_path": f"folder{n}", "items_gen": n + 260,
                                                        "target_keys": [f"folder{n}/image.png"]} for n in range(6)]]},
-            "fixture_manifest": {"perf": {mode: {"many_folders": "fixture",
+            "fixture_manifest": {"perf": {mode: {"many_folders": "fixture", "start_folder": "folder0",
+                                                     "load_order": [f"fixture/folder-{i:04d}" for i in range(1, 257)],
                                                      "navigation_order": [f"folder{n}" for n in range(6)]}
                                            for mode in ("cached", "uncached")}}}
 
@@ -82,15 +92,18 @@ def perf_events(gaps: dict[int, float] | None = None, actions: dict[int, str] | 
     gaps, actions = gaps or {}, actions or {}
     events, t = [session(), *cached_request("dir::fixture/child", 3, 1)], 6.0
     for n in range(5):
-        events.append({"cat": "qa", "kind": "key_materialized", "t": 5.305 + n * .02,
+        events.append({"cat": "qa", "kind": "key_materialized", "t": 8.305 + n * .02,
                        "key": "Down", "ctrl": True, "shift": False, "alt": False,
                        "pressed": True, "repeat": False, "target_viewport": "ROOT", "target_hwnd": 123})
     for n in range(6):
-        events.extend(cached_request(f"folder{n}/image.png", n + 10, n + 2))
-    events.extend([{"cat": "qa", "kind": "key_materialized", "t": 5.42,
+        events.extend(cached_request(f"folder{n}/image.png", n + 260, n + 2))
+    events.extend([{"cat": "qa", "kind": "key_materialized", "t": 8.42,
                     "key": "G", "ctrl": True, "shift": False, "alt": False,
                     "pressed": True, "repeat": False, "target_viewport": "ROOT", "target_hwnd": 123},
-                   {"cat": "qa", "kind": "text", "t": 5.43, "text": "fixture-query", "root_hwnd": 123}])
+                   {"cat": "qa", "kind": "text", "t": 8.43, "text": "fixture-query", "root_hwnd": 123}])
+    for load in folder_loads():
+        events.extend(cached_request(load["after_path"] + "/image.png", load["after_generation"],
+                                     load["after_generation"] + 1000))
     for n in range(frame_count):
         frame = {"cat": "frame", "kind": "begin", "t": t, "n": n + 1}
         if n:
@@ -101,7 +114,7 @@ def perf_events(gaps: dict[int, float] | None = None, actions: dict[int, str] | 
                        {"cat": "ui", "kind": "pre_grid_breakdown", "n": n + 1,
                         "t": t + .001, "total_ms": pre_grid_ms, "poll_ms": pre_grid_ms}])
         previous_t, t = t, t + gaps.get(n, .005)
-    events.append({"cat": "qa", "kind": "on_exit", "case_id": "perf-cached", "t": t + 1,
+    events.append({"cat": "qa", "kind": "on_exit", "case_id": "perf-cached", "t": max(t + 1, 8.6),
                    "flush_complete": True})
     return seal(events)
 
@@ -358,6 +371,46 @@ class PerfTests(unittest.TestCase):
                 next(e for e in events if e.get("kind") == "key_materialized")[field] = value
                 self.assertEqual(perf(events)["verdict"], "SKIPPED")
 
+    def test_workload_requires_distinct_folders_changed_generations_and_cache_proof(self):
+        self.assertEqual(perf(perf_events())["verdict"], "PASS")
+        for field, value in (("after_path", "wrong-folder"), ("after_generation", 3),
+                             ("before_path", "wrong-folder"), ("start_t", 9)):
+            with self.subTest(field=field):
+                evidence = operations()
+                evidence["folder_loads"][0][field] = value
+                self.assertTrue(any("folder-load" in e for e in perf(perf_events(), evidence)["environment_errors"]))
+        evidence = operations()
+        evidence["folder_loads"].pop()
+        self.assertEqual(perf(perf_events(), evidence)["verdict"], "SKIPPED")
+        evidence = operations()
+        evidence["fixture_manifest"]["perf"]["cached"]["load_order"][1] = "fixture/folder-0001"
+        self.assertEqual(perf(perf_events(), evidence)["verdict"], "SKIPPED")
+        events = [e for e in perf_events() if e.get("key") != "fixture/folder-0017/image.png"]
+        self.assertEqual(perf(events)["verdict"], "SKIPPED")
+
+    def test_first_frame_outside_update_stall_is_not_waived_by_folder_workload(self):
+        result = perf(perf_events(gaps={0: .127}))
+        self.assertEqual(result["verdict"], "FAIL")
+        self.assertEqual(result["metrics"]["drawn"]["n"], 201)
+        self.assertIn("frames [1]", result["failures"][0])
+
+    def test_cached_parent_requires_all_245_runtime_targets_not_105_seed_targets(self):
+        events, evidence = perf_events(), operations()
+        keys = [f"dir::fixture/folder-{i:04d}" for i in range(1, 246)]
+        evidence["cache"]["opens"][0]["target_keys"] = keys
+        for i, key in enumerate(keys):
+            rows = cached_request(key, 3, 12000 + i)
+            if i >= 105:
+                rows[1].update(kind="source", from_cache=False, origin="source_generated")
+            events.extend(rows)
+        result = perf(events, evidence)
+        self.assertEqual(result["verdict"], "SKIPPED")
+        self.assertTrue(any("cache/source provenance not proven" in e for e in result["environment_errors"]))
+        # A later warm read cannot relabel initially generated data as cached.
+        for i, key in enumerate(keys[105:]):
+            events.extend(cached_request(key, 3, 13000 + i, t=5.8))
+        self.assertEqual(perf(events, evidence)["verdict"], "SKIPPED")
+
     def test_uncached_requires_initial_source_and_pre_open_absence_not_later_no_cache_rule(self):
         events, evidence = perf_events(), operations()
         evidence["cache"]["mode"] = "uncached"
@@ -366,7 +419,7 @@ class PerfTests(unittest.TestCase):
         for index, e in enumerate([e for e in events if e.get("kind") == "cache_read"]):
             e.update(kind="source", from_cache=False, origin="source_generated")
             next(b for b in events if b.get("kind") == "request_begin"
-                 and b.get("request_id") == e["request_id"])["t"] = 5.55 + index * .001
+                 and b.get("request_id") == e["request_id"])["t"] = 5.55 + index * .00001
         for e in events:
             if e.get("kind") == "on_exit":
                 e["case_id"] = "perf-uncached"
@@ -433,7 +486,7 @@ class PerfTests(unittest.TestCase):
         evidence["cache"]["opens"][0]["folder_path"] = "unrelated-folder"
         self.assertEqual(perf(perf_events(), evidence)["verdict"], "SKIPPED")
         evidence = operations()
-        evidence["cache"]["opens"][4]["items_gen"] += 1
+        next(o for o in evidence["cache"]["opens"] if o["folder_path"] == "folder3")["items_gen"] += 1
         self.assertEqual(perf(perf_events(), evidence)["verdict"], "SKIPPED")
 
 
@@ -665,6 +718,20 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(analyze_case_evidence(seal(events), evidence, PID)["verdict"], "PASS")
         evidence["seed_phase"] = "reload"
         self.assertEqual(analyze_case_evidence(events, evidence, PID)["verdict"], "SKIPPED")
+
+
+    def test_perf_seed_requires_durable_save_for_every_intended_folder(self):
+        case = "seed-perf-cached"
+        events = [session(), {"cat": "qa", "kind": "seed", "case_id": case, "t": 6,
+                             "seed_kind": "cache", "normal_producer": True, "saved_cache": True,
+                             "folder_path": "fixture/cached", "targets": ["dir::fixture/cached/child"]},
+                  {"cat": "qa", "kind": "on_exit", "case_id": case, "t": 7, "flush_complete": True}]
+        evidence = {"case_id": case, "pid": PID, "seed_phase": "preparation", "seed_kinds": ["cache"],
+                    "seed_cache_paths": ["fixture/cached"], "copied_after_process_exit": True,
+                    "exit": {"process_exited": True, "forced": False}}
+        self.assertEqual(analyze_case_evidence(seal(events), evidence, PID)["verdict"], "PASS")
+        evidence["seed_cache_paths"].append("fixture/cached/child")
+        self.assertEqual(analyze_case_evidence(seal(events), evidence, PID)["verdict"], "SKIPPED")
 
 
 class IdleTests(unittest.TestCase):

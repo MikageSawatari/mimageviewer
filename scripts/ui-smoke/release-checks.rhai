@@ -11,6 +11,7 @@ const SEARCH_TERM = "__SEARCH_TERM__";
 const SEARCH_HITS = __SEARCH_HITS__;
 const CACHE_PATHS = __CACHE_PATHS__;
 const NAVIGATION_PATHS = __NAVIGATION_PATHS__;
+const LOAD_PATHS = __LOAD_PATHS__;
 const INCLUDE_FIRST_AI = __INCLUDE_FIRST_AI__;
 
 fn root_selectable(s) {
@@ -73,6 +74,7 @@ fn search(term, expected_hits) {
     fail("environment: fixture search did not settle");
 }
 
+
 release_check_begin(CASE_ID, CASE_DIRECTORY);
 // host_ready joins the real context/HWND/backend identity used by select_root.
 // host_incarnation belongs to detached hosts and is always absent on root.
@@ -86,23 +88,25 @@ for attempt in 0..1800 {
     sleep(100);
 }
 let evidence = #{ case_id: CASE_ID, pid: release_check_observe().pid };
-if CASE_ID == "seed-profile" {
+if CASE_ID == "seed-profile" || CASE_ID == "seed-perf-cached" {
     for path in CACHE_PATHS {
         release_check_open(path);
         settled(path);
         release_check_seed("cache");
     }
-    release_check_open(VIDEO_CHILD);
-    settled(VIDEO_CHILD);
-    release_check_pin(VIDEO_SOURCE);
-    // DB persistence precedes the ordinary pin-triggered child reload. Wait for
-    // its dirty/classification/sidecar owners before admitting another open.
-    settled(VIDEO_CHILD);
-    release_check_open(VIDEO_PARENT);
-    settled(VIDEO_PARENT);
-    release_check_seed("cache");
-    evidence.search = search(SEARCH_TERM, SEARCH_HITS);
-    release_check_seed("search");
+    if CASE_ID == "seed-profile" {
+        release_check_open(VIDEO_CHILD);
+        settled(VIDEO_CHILD);
+        release_check_pin(VIDEO_SOURCE);
+        // DB persistence precedes the ordinary pin-triggered child reload. Wait for
+        // its dirty/classification/sidecar owners before admitting another open.
+        settled(VIDEO_CHILD);
+        release_check_open(VIDEO_PARENT);
+        settled(VIDEO_PARENT);
+        release_check_seed("cache");
+        evidence.search = search(SEARCH_TERM, SEARCH_HITS);
+        release_check_seed("search");
+    }
 } else if CASE_ID == "first-ai" {
     release_check_open(STATIC_PATH);
     settled(STATIC_PATH);
@@ -115,6 +119,19 @@ if CASE_ID == "seed-profile" {
     }
     settled(MANY_PATH);
     evidence.folder_open = #{ completed: true };
+    // Distinct image folders exercise ordinary load/thumbnail work. Reopening
+    // uncached folders would turn this measurement into a warm-cache workload.
+    let loads = [];
+    for path in LOAD_PATHS {
+        focused();
+        let before = release_check_observe();
+        release_check_open(path);
+        let after = settled(path);
+        loads.push(#{ before_path: before.current_folder_path, after_path: after.current_folder_path,
+            before_generation: before.items_generation, after_generation: after.items_generation,
+            start_t: before.perf_t, end_t: after.perf_t });
+    }
+    evidence.folder_loads = loads;
     release_check_open(NAVIGATION_PATHS[0]);
     settled(NAVIGATION_PATHS[0]);
     let navigation = [];

@@ -31,7 +31,11 @@ class PreflightTests(unittest.TestCase):
             paths = [self.fixture / mode / str(i) for i in range(7)]
             for path in paths:
                 path.mkdir(parents=True)
-            perf[mode] = {"many_folders": str(paths[0]), "navigation_order": list(map(str, paths[1:]))}
+            loads = [paths[0] / f"folder-{i:04d}" for i in range(1, 4)]
+            for path in loads:
+                path.mkdir()
+            perf[mode] = {"many_folders": str(paths[0]), "navigation_order": list(map(str, paths[1:])),
+                          "load_order": list(map(str, loads))}
         tray = {name: str(self.fixture / name) for name in ("tray-while", "tray-after")}
         for path in tray.values():
             Path(path).mkdir()
@@ -50,11 +54,18 @@ class PreflightTests(unittest.TestCase):
 
     def test_missing_catalog_is_absent_without_creation(self):
         result = self.check(stopped=True)
-        self.assertEqual(len(result["opens"]), 16)
+        self.assertEqual(len(result["opens"]), 22)
         self.assertTrue(all(o["pre_open_absent"] for o in result["opens"]))
         self.assertEqual([entry["folder_path"] for entry in result["opens"][-2:]],
                          list(map(str, self.tray_roots)))
         self.assertFalse((self.data / "cache").exists())
+
+    def test_each_workload_folder_has_stopped_cache_absence_proof(self):
+        manifest = json.loads(self.manifest.read_text())
+        opens = {o["folder_path"]: o for o in self.check(stopped=True)["opens"]}
+        for mode in ("cached", "uncached"):
+            for path in manifest["perf"][mode]["load_order"]:
+                self.assertTrue(opens[path]["pre_open_absent"])
 
     def test_tray_parent_catalog_owns_all_tile_keys_and_nonempty_wal_refuses_proof(self):
         for root in self.tray_roots:
