@@ -26,6 +26,7 @@ use crate::keymap::{CommandScope, KeyAction, KeyTrigger, command_catalog};
 mod capture;
 #[cfg(feature = "test-script")]
 mod clipboard_capture;
+mod evidence_path;
 #[cfg(feature = "test-script")]
 pub(crate) mod grid_observation;
 #[cfg(feature = "test-script")]

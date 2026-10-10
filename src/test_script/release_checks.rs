@@ -167,27 +167,14 @@ fn validate_layout(exe: &Path, data: &Path, directory: &Path) -> Result<PathBuf,
         );
     }
     let target = sandbox.parent().unwrap();
-    let run_root = target.join("ui-smoke").join("runs");
-    if !directory.starts_with(&run_root) || directory == run_root {
-        return Err(
-            "environment: release check output must be a descendant of target/ui-smoke/runs".into(),
-        );
-    }
-    // Each case lives under its run; fixture lives at that run's fixed fixture path.
-    let relative = directory.strip_prefix(run_root).unwrap();
-    let run_name = relative
-        .components()
-        .next()
-        .ok_or("environment: missing run ID")?;
-    Ok(target
-        .join("ui-smoke")
-        .join("runs")
-        .join(run_name)
-        .join("fixture"))
+    super::evidence_path::release_fixture(target, directory)
+        .map_err(|error| format!("environment: {error}"))
 }
 fn isolated_context(directory: &Path) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf), String> {
     let exe = plain_path(&std::env::current_exe().map_err(|e| e.to_string())?)?;
     let data = plain_path(&crate::data_dir::get())?;
+    let directory =
+        super::evidence_path::validate_directory(Path::new(env!("CARGO_MANIFEST_DIR")), directory)?;
     let directory = plain_path(&directory)?;
     let fixture = validate_layout(&exe, &data, &directory)?;
     let fixture = plain_path(&fixture)?;
@@ -803,7 +790,7 @@ mod tests {
     #[test]
     fn release_layout_refuses_real_data_and_other_binaries() {
         let root = Path::new(r"C:\repo\target\portable-smoke");
-        let output = Path::new(r"C:\repo\target\ui-smoke\runs\run1\cases\static");
+        let output = Path::new(r"C:\repo\target\ui-smoke\runs\run1\static");
         let exe = root.join("mimageviewer.exe");
         let data = root.join("data");
         assert!(validate_layout(&exe, &data, output).is_ok());

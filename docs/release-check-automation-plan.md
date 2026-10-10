@@ -250,6 +250,11 @@ AI は基本台本に含まれないため `known-first-ai=0 / AI未実施` を�
 
 `target/ui-smoke/runs/<run-id>/` の既存 evidence 保存に、fixture / seed recipe、設定 overlay、
 各 session の perf / app log、sampler JSON、case JSON、`summary.json` と `release-record.md` を追加する。
+App の session evidence は厳密に `target/ui-smoke/runs/<run-id>/<case>/` とし、
+Rust の `test_script/evidence_path.rs` が screenshot と release fixture のパス契約を所有する。
+既存の単独 scenario は `target/ui-smoke-runs/<run-id>/` を維持する。いずれも repository ごとの
+固定 root・固定階層数を要求し、traversal と全祖先の reparse point を canonicalize 前に拒否する。
+canonicalize 後も同じ root・階層数を照合し、Win32 の末尾 dot／space 等による別階層への alias を許可しない。
 run-id と case、対象 SHA / dirty fingerprint、exe hash / feature / profile、OS / CPU / GPU / DPI、窓サイズ、
 閾値 version、操作証跡、tray の保存省略 / cache 不在 / source再生成 / Finalized-backlog 相関、
 外部 / perf 時刻と sleep 包含結果を残す。再起動の log rotation 前に保存する。release-record は正本文書へ自動追記しない。
@@ -396,3 +401,19 @@ Rust の diagnostic / recipe / payload 焦点テストと feature 有無の chec
 feature 有無の Rust 焦点テスト、normal / portable check、full lib、fmt / diff check。
 引き継ぎ先は `target/F-1361-3b-msg.txt`。新規ファイルは test-only の
 `src/test_script/release_checks/tray_witness.rs`。アプリ起動・Phase 4・commit はこの接続作業に含めない。
+
+### Phase 4 初回起動の blocker 修正（2026-10-11）
+
+- 了承済みの初回隔離 run `release-checks-20261010-151540-f99fc454` は seed 起動で停止。
+  Run の `<run-id>/<case>` と screenshot の旧 `ui-smoke-runs` 直下 guard が不一致だった。
+  上記の固定パス契約に集約し、ReleaseChecks の階層は維持する。任意の descendant は許可しない。
+- Run の既存 process handle 保持修正は維持。`ui-smoke.ps1` の準備／解析 helper、初回起動
+  （button-helper 起動を含む）、AlwaysOnTop 再起動にも終了前の handle 保持を適用する。
+  再起動の null ExitCode を整数 0 へ変換して成功と扱わない。
+- 常駐版と共有する Remote pipe の起動拒否は環境注記として
+  [検証記録](release-verification-records.md) に残す。
+  この suite の入力・証拠は Remote IPC に依存しない。pipe 変更、retry、常駐版停止は追加しない。
+- 今回は非対話の safety fake、Python analyzer／fixture／preflight、焦点 Rust、fmt、
+  normal／portable check のみ。アプリ起動、ui-smoke、commit、独立レビューは行わない。
+  初回 run を成功へ読み替えず、修正後の Phase 4 実測・採用確認は未実施。
+  修正差分と検証証拠の引き継ぎ先は `target/F-phase4-fix-msg.txt`。

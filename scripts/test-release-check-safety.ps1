@@ -119,6 +119,32 @@ $owned=[pscustomobject]@{Id=101;ExitCode=1}
 $owned|Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {}
 Assert-Throws {Complete-ReleaseSession 'perf-cached' 'C:\fake\run\case'} 'Fake archive error did not exercise the environment catch.'
 Assert-True ($cases.Count -eq 1 -and $cases[0].verdict -eq 'FAIL' -and $cases[0].failures -like '*exit code 1*') 'Environment archive error erased an already observed application FAIL.'
+# Exercise the prepare/analyzer helper with the uncached ExitCode=null behavior.
+& {
+    Import-ReleaseCheckFunctions (Join-Path $PSScriptRoot 'ui-smoke.ps1') @('Invoke-UiSmokeCapturedProcess','Join-NativeArguments','Quote-NativeArgument')
+    function Start-Process {
+        param($FilePath,$ArgumentList,$WorkingDirectory,$RedirectStandardOutput,$RedirectStandardError,$WindowStyle,[switch]$PassThru,[switch]$Wait)
+        Assert-True (-not $Wait) 'Captured helper waits inside Start-Process before caching the handle.'
+        $script:fakeSequence.Add('start')
+        return $script:fakeProcess
+    }
+    foreach($code in @(0,17)) {
+        $script:fakeSequence=New-Object 'Collections.Generic.List[string]'
+        $script:fakeProcess=[pscustomobject]@{Id=101;Cached=$false;ExitCode=$null;ExpectedCode=$code}
+        $script:fakeProcess|Add-Member -MemberType ScriptProperty -Name Handle -Value {
+            $script:fakeSequence.Add('handle');$this.Cached=$true;[IntPtr]101
+        }
+        $script:fakeProcess|Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {
+            $script:fakeSequence.Add('wait');if($this.Cached){$this.ExitCode=$this.ExpectedCode}
+        }
+        $result=Invoke-UiSmokeCapturedProcess 'fake.exe' @('fake argument') 'fake-dir' 'fake-out' 'fake-err'
+        Assert-True ($result.ExitCode -is [int] -and $result.ExitCode -eq $code) 'Captured helper lost the actual integer exit code.'
+        Assert-True (($script:fakeSequence -join ',') -eq 'start,handle,wait') 'Handle was not cached before the exit wait.'
+    }
+}
+$runnerText=Get-Content -LiteralPath (Join-Path $PSScriptRoot 'ui-smoke.ps1') -Encoding UTF8 -Raw
+Assert-True ($runnerText.Contains('$null = $script:process.Handle # retain for both normal and button-helper launches')) 'Primary/helper app launch does not retain its handle.'
+Assert-True ($runnerText.Contains('$null = $script:process.Handle # retain before the restart can exit')) 'Restart app launch does not retain its handle.'
 foreach($relative in @('ui-smoke.ps1','check-idle-health.ps1','ui-smoke\release-checks\Run.ps1','ui-smoke\release-checks\Sampler.ps1')){
     $path=Join-Path $PSScriptRoot $relative
     $ast=Get-TestAst $path
