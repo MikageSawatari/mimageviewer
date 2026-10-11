@@ -1,10 +1,12 @@
 # 全文索引の欠落・取り込み失敗対策 (§1.367)
 
-2026-10-11 設計 r2。コード調査基点: `next-prefs` = `master`、
-`0f6ad9f191d5a5d25f175d9b5f49611afbfc1489`。利用者がr1を`a0927b26e`でcommitした。
-r1の独立設計レビューはREVISE (P1なし、P2 3件、P3 1件)。r2はその全指摘を反映した設計案。
+2026-10-11 設計 r3。製品コード調査基点: `next-prefs` = `master`、
+`0f6ad9f191d5a5d25f175d9b5f49611afbfc1489`。利用者がr1を`a0927b26e`、r2を`4c86015de`でcommitした。
+r1の独立設計レビューはREVISE (P1なし、P2 3件、P3 1件)。r2の再レビューでは前回指摘を解消し、
+正常終了による未実行merge taskの打切りを通知/再構築から除外する新規P2 1件でREVISEとなった。
+r3はその境界と回帰を明記し、名前索引の別件をバックログ§1.369へ採録した設計案。
 本改訂では製品コードの変更・commit・製品ビルド・mIV起動を行っていない。
-r2の独立再レビュー・実装・検収は未完了。§6.1/6.2、§7.4、§8、§10.1を改訂した。
+r3の独立再レビュー・実装・検収は未完了。本改訂の対象は§6.1/6.2、§10.1。
 
 ## 1. 範囲と守る条件
 
@@ -284,11 +286,36 @@ callerの存在や次のcommitを待つ通知では漏れる。
 
 vendor patchに**IndexWriterごとの最終merge failure hook**を用意し、mIVはraw writerを
 dispatcherへ渡す前に同じ共通reporterを登録する。process-global callbackは使わない。
-`start_merge`のworkerが返すmerge/writeまたはend_merge/save_metasの最終Errを、
+`start_merge`のworkerが返すmerge/writeまたは**実行された**end_merge/save_metasの最終Errを、
 Futureへ送る前・そのconsumerの有無に関係なくhookへ1回報告する。
 既存のpersist最大4回を使い切ったerrorと、persist以外の書込errorを含める。
 merge候補が開始前に無効になっただけの`segment_manager.start_merge`失敗は書込失敗として扱わない。
 同期commit/save_metasはdispatcherから報告し、このhookと二重報告しない。
+
+**終了による未実行taskの打切りを、書込失敗から除外する。** コード上の事実として、
+`index_writer.rs:807`の正常Dropも`:809`で`segment_updater.kill()`を呼ぶ。
+merge自体が進行中でも、その後の`end_merge` (`segment_updater.rs:615,624`) が
+`schedule_task`へ来た時にupdaterがkilledなら、`:335–336`はtaskを実行せず
+`SystemError("Segment updater killed")`を返す。このErrで通知/pendingを立てない。
+開始前の無効なmerge候補とは別の、merge開始後に起こる正常な打切りである。
+
+識別に依存するのは**schedulerが当該taskを受理しなかった分岐の構造化した原因**。
+Tantivy 0.26.1の`TantivyError` (`error.rs:57,102`)には専用のcancel/killed variantが無く、
+現在は汎用SystemErrorの文字列へ潰される。vendor patchではprivateなscheduler入口を
+`Result<FutureResult<T>, UpdaterKilledBeforeSchedule>`として、このtyped admission signalを
+同じ`:335`の判定で生成する。既存`schedule_task`は必要なら従来Resultへのadapterとし、
+`end_merge`からmerge workerまではこの未実行原因と実行後のResultをflattenせず渡す。
+hookは`UpdaterKilledBeforeSchedule`だけを除外し、その後で既存Future consumer向けの
+Resultへ変換する。mIVへ新しい終了stateやfailure分類を追加するための型ではない。
+messageの一致/部分一致、汎用SystemErrorの一括除外、事前の別`is_alive()`チェック、
+hook実行時のkilled/shutdown flagには依存しない。schedulerの判定と別チェックの間のraceを作らない。
+
+merge本体のI/O失敗、受理/実行されたend_mergeのadvance_deletes/save_metas等の最終Errは、
+その後にwriterがdropされた場合も既存log+通知+durable pendingへ渡す。
+未実行taskの打切りと、終了中に実際のI/Oが返したerrorを混同しない。
+`save_metas` (`:388`) が既存のis_alive分岐で書込みを省きOkを返す場合は元からfailureではないが、
+書込み開始後のerrorまで終了理由で抑止しない。他のSystemErrorもこの除外には含めない。
+merge完了待ち、追加retry、打切りからの復旧処理は増やさない。
 
 hookはmergeまたは`end_merge` (内部のtask.waitを含む) が**戻った後**に呼ぶ。
 atomic_write内、ManagedDirectoryの登録lock内、segment updaterのtask内でDB/reportingを呼ばない。
@@ -327,8 +354,9 @@ FTS対策で名前索引も全て閉じたとは記録しない。
 名前索引の別件は既存`SearchIndexDb::request_rebuild_on_next_start` (`search_index_db.rs:472`) と
 次回writable openの`rebuild_names_if_requested` (`:944`) を使う方針で引き継ぐ。
 新しいretry/途中state保持を要求しない。marker設定や回復そのものの失敗は既定のlog+通知で閉じる。
-短いbacklog起案文を`target/I-1367-design-r2-msg.txt`に載せる。番号付けとリリース優先度は
-管理担当の別backlog採録時に決める。本件のFTS修正の受入条件へ名前索引の全failure対応を混ぜない。
+別件は[次リリース検討バックログ](next-release-backlog.md)の**§1.369**へ採録した。
+着手/リリース優先度は管理担当が別件として決める。本件のFTS修正の受入条件へ
+名前索引の全failure対応を混ぜない。
 
 類似索引はSQLite正本から`similar_search_array::load_or_rebuild` / `rebuild_from_sqlite`
 (`src/similar_search_array.rs:166,195`)で派生検索配列を再生成できる。
@@ -417,7 +445,7 @@ Rustのコピーfixture計測を先に行う。live起動A/Bは隔離portableの
 **いずれかの条件で悪化した場合、または計測未実施/ばらつきで判断できない場合は、
 このリリースで起動点検を採用しない。** §5/§6/§8の修正と文書訂正は点検なしでも進める。
 起動barrier、全件照会、新index/migrationを足して無理に残さない。
-本r2は計画の改訂であり、A/B実施・起動無影響の証明・点検の採用を主張しない。
+本r3は計画の改訂であり、A/B実施・起動無影響の証明・点検の採用を主張しない。
 
 ## 8. 再構築順序を1つにする
 
@@ -477,7 +505,7 @@ wipe/create/pending clearの失敗はlog+通知で終え、markerを残す既存
 設計owner/実装owner/独立reviewerはAGENTS.mdの分担で手配する。
 この調査はdesigner/investigatorのbounded handoffで、追加のcoordination teamは作っていない。
 重要なstartup/runtime所有境界、非同期merge hookの寿命/lock境界とatomic例外は
-実装前の独立レビュー対象。r2ではr1のREVISEを受けてこれらの設計を改訂し、再レビューへ渡す。
+実装前の独立レビュー対象。r3ではr2のREVISEを受けて未実行taskの打切り境界を改訂し、再レビューへ渡す。
 
 ### 10.1 必須の回帰
 
@@ -499,6 +527,16 @@ wipe/create/pending clearの失敗はlog+通知で終え、markerを残す既存
    Future consumerを持たず後続commitも呼ばない条件で、最大4 attempts後の最終Errが
    共通reporterへ1回届き、通知+durable pendingが残ること。DB/view/Directory lockの
    reentrancyやArc cycleが無いこと。通常mmap snapshot保持中のGC削除拒否では通知/pending無し。
+   **自動merge開始後にwriterをdropする回帰**をpatched Tantivy経由で追加する。
+   自動mergeの開始をtest gateで確認し、end_mergeのscheduler受理前でmerge workerを留める。
+   writerをdropしてkillを完了させた後gateを解放し、未実行原因が
+   UpdaterKilledBeforeScheduleとして返ること、通知0件・pending無しを確認する。
+   Future consumer/後続commit無しでも同じ結果であること。worker終了を観測する待ちはtest内だけで、
+   製品Dropへmerge完了待ちを追加しない。初期fixtureのpendingは無しとし、別failureを混ぜない。
+   対になる回帰として、mergeの実I/Oまたは受理されたend_mergeのpersistが開始済みの状態で
+   test gateに留め、writer drop後にそのI/Oを最終失敗させる (persistなら既存4 attempts)。
+   killedでも実行由来Errはlog+通知1件+durable pendingへ届くこと。
+   文字列だけ同じSystemErrorを実行由来Errとして注入する場合も除外されないことを確認する。
 4. UI: Failed Fullを「初回作成完了」にしない。trayでtoastを見逃しても編集画面にpending表示。
    正常完走と正常監視のsnapshotは維持。UIがDBを直接読まない。
    同じ表示入口を使う名前索引も既存NameFullScanOutcome::Failed/Cancelledを渡すhandler/snapshot回帰。
@@ -535,7 +573,7 @@ missing-meta/wipe-retry/migration系を拡張する。
 `search_metadata_e2e`を先に実行。UI変更のsnapshotとglyph lintを実行し、
 共有writer/startup変更なので最終`scripts/test-full.ps1`、fmt/check、`scripts/build-dev.ps1`まで担当する。
 独立reviewerは同じ結果を再実行せず証拠を確認し、残る重要経路を追加確認する。
-本r2は設計のみのため製品test/build gateの成功や利用者確認用binaryを成果として主張しない。
+本r3は設計のみのため製品test/build gateの成功や利用者確認用binaryを成果として主張しない。
 
 liveの承認をこの調査から推定しない。実装後の大規模再取込/起動A/Bは、別途具体的なscenario・時間・
 desktop入力・使い捨てportable範囲を提示して承認を得るか、利用者自身の手動確認へ渡す。

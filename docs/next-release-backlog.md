@@ -32,6 +32,14 @@
 
 ## 1. 優先候補
 
+### 1.369 名前/コンテナ索引 (Ctrl+S) の書込失敗が通知・再構築へ揃っていない — §1.367からの引き継ぎ・コード調査 (2026-10-11)
+
+- 現状: FullのDB更新/削除失敗はFailed結果になるが、通知と名前索引の既存rebuild markerへ接続されない。watcherのdelete_subtree、parent refresh、subtree upsert/prune失敗もlog等のみで、削除失敗でもupdates_appliedが増える入口がある。実機再現を主張する項目ではなく、コードで確認した同型経路の残件。
+- 境界: §1.367では共通UIのFull失敗表示だけを合わせる。本件は`search_index.db`の書込failureを扱い、FTS reporterや`fts_meta.db`のpendingを流用しない。入口/出口の棚卸しとcode refsは[fts-integrity-plan.md §6.2](fts-integrity-plan.md)を参照。
+- 対応: DB書込failureをlog+通知+既存`SearchIndexDb::request_rebuild_on_next_start` (`src/search_index_db.rs:472`)へ揃え、次回writable openの`rebuild_names_if_requested` (`:944`)を再利用する。watcherの成功件数を訂正し、Full完走印のwrite失敗 (`src/name_index_supervisor.rs:553`) も通知を棚卸しする (それだけで再構築が必要とは決めない)。
+- 維持する条件: FS観測不完全/cancelとDB書込failureを区別し、不完全観測時のprune抑止と既存clear失敗のmarker経路を維持する。追加retry/回復workerや回復失敗の再回復は作らない。類似索引はSQLite正本から派生配列を再生成し、Failed/Degradedも表示するため、このFTSの破棄順序対策を機械的に適用しない。
+- 回帰: Full DB failure、watcher削除/upsert/prune failureの通知・名前索引marker・成功件数、正常Full/watchと不完全FS観測時のprune抑止。着手/リリース優先度は別件として管理担当が決める。
+
 ### 1.367 アイテム検索 (Ctrl+G) の全文索引が空になっても「登録済み」のまま直らない — 利用者報告・調査 (2026-10-10)
 - **次の版の決定 (利用者 2026-10-10)**: 次の版に入れる。ただし起動時の点検は**起動時間を延ばさないこと**が条件。「終了中の変更を起動時に確認しない」設定の利用者には起動時間が重要なので、点検の処理時間が起動に影響するなら点検の実装は見送り、下の (2)(3) だけ行う。
 - 観測 (利用者): 以前は `klee` で 10,000 件の上限まで出ていた Ctrl+G 検索が、インストール版 v4.5.0 でも 0 件。検索結果に存在しないファイルが並ぶことがある (nextbook の確認用ビルドで観測、未調査)。
