@@ -5,6 +5,8 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 mod barrier;
+#[cfg(test)]
+mod input_regression_tests;
 use barrier::{FlatCompletion, ResolvedPageTurnNavigation};
 
 static NEXT_OPERATION_BATCH: AtomicU64 = AtomicU64::new(1);
@@ -29,6 +31,9 @@ pub(crate) enum ViewerOperationId {
         ordinal: u32,
     },
     Slideshow(u64),
+    /// Diagnostic identity at an accepted handler boundary with missing ingress.
+    /// Never eligible to start an effect or invent a physical input edge.
+    UnattributedNavigation(u64),
 }
 
 pub(crate) fn next_operation_batch() -> u64 {
@@ -1008,6 +1013,8 @@ fn emit(
     reason: &'static str,
     extra: &[(&str, serde_json::Value)],
 ) {
+    #[cfg(test)]
+    TEST_EVENTS.with(|events| events.borrow_mut().push((*fact, kind, reason)));
     if !crate::perf::is_enabled() {
         return;
     }
@@ -1040,6 +1047,16 @@ fn emit(
     );
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_EVENTS: std::cell::RefCell<Vec<(ViewerOperationFact, &'static str, &'static str)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_test_events() -> Vec<(ViewerOperationFact, &'static str, &'static str)> {
+    TEST_EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()))
+}
+
 impl App {
     /// Preferences and HUD adopt the same global setting before any next turn.
     pub(crate) fn adopt_page_turn_animation_settings(&mut self, enabled: bool, duration_ms: u32) {
@@ -1064,6 +1081,10 @@ impl App {
             return;
         }
         ctx.data_mut(|d| d.insert_temp(egui::Id::new("page_turn_input_enabled"), true));
+        // The ordinary key handler resolves this same pass owner. Resolve it
+        // before observing its immutable edges too: an absent cached owner is
+        // deliberately fail-closed, not evidence that this pass blocks keys.
+        let keyboard_owner = self.keyboard_owner_for_pass(ctx);
         observe_pointer_transaction(ctx);
         if ctx.viewport_id() == self.page_turn_destination().viewport
             && ctx.input(|i| {
@@ -1097,7 +1118,7 @@ impl App {
             })
             .collect::<Vec<_>>();
         let key_admission_blocked =
-            !facts.is_empty() && crate::keyboard_input::keymap_owner_blocks_shortcuts(ctx);
+            !facts.is_empty() && keyboard_owner.blocks_legacy_keymap_shortcuts();
         if key_admission_blocked {
             facts.clear();
         }
@@ -1237,24 +1258,83 @@ impl App {
         ctx: &egui::Context,
         reason: &'static str,
     ) {
+        self.page_turn_excluded_navigation_with_operation(ctx, reason, None);
+    }
+
+    pub(super) fn page_turn_excluded_navigation_with_operation(
+        &mut self,
+        ctx: &egui::Context,
+        reason: &'static str,
+        operation: Option<ViewerOperationId>,
+    ) {
         if !self.settings.page_turn_animation_enabled {
             return;
         }
+        let destination = self.page_turn_destination();
         let transaction = &mut self.page_turn_presentation.transaction;
+        // A resolved handler is the authority that navigation was accepted.
+        // Its diagnostic must survive missing/ambiguous ingress, rather than
+        // silently returning because an animation candidate could not be made.
+        if transaction.observed_frame != Some(ctx.cumulative_frame_nr()) {
+            if operation.is_some_and(|id| transaction.facts.iter().any(|f| f.operation_id == id))
+                && matches!(
+                    transaction.disposition,
+                    OperationDisposition::Claimed | OperationDisposition::Excluded
+                )
+            {
+                return;
+            }
+            *transaction = OperationTransaction {
+                observed_frame: Some(ctx.cumulative_frame_nr()),
+                ..Default::default()
+            };
+        }
         if !matches!(
             transaction.disposition,
             OperationDisposition::Available | OperationDisposition::Cancelled
-        ) || transaction.observed_frame != Some(ctx.cumulative_frame_nr())
-            || transaction.facts.len() != 1
-        {
+        ) {
             return;
         }
-        let fact = transaction.facts[0];
-        if fact.destination != self.page_turn_destination() {
-            return;
+        let observed = transaction
+            .facts
+            .iter()
+            .find(|f| {
+                f.destination == destination
+                    && operation.map_or(transaction.facts.len() == 1, |id| f.operation_id == id)
+            })
+            .copied();
+        let fact = observed.unwrap_or_else(|| ViewerOperationFact {
+            destination,
+            operation_id: operation.unwrap_or_else(|| {
+                ViewerOperationId::UnattributedNavigation(next_operation_batch())
+            }),
+            source: ctx.viewport_id(),
+            phase: OperationPhase::Press,
+            cause: match operation {
+                Some(ViewerOperationId::Key(_)) => "key",
+                Some(ViewerOperationId::Pointer { .. }) => "pointer",
+                Some(ViewerOperationId::Pad { .. }) => "pad",
+                Some(ViewerOperationId::Slideshow(_)) => "slideshow",
+                None | Some(ViewerOperationId::UnattributedNavigation(_)) => {
+                    "unidentified_navigation"
+                }
+            },
+            diagnostic_input_seq: self.input_seq,
+        });
+        let sub_check = if transaction.facts.len() > 1 {
+            "multiple_operation_edges"
+        } else if observed.is_none() {
+            "missing_operation_fact"
+        } else {
+            "accepted_navigation"
+        };
+        if observed.is_none() {
+            // Retain the accepted diagnostic identity for replay dedup. The
+            // Excluded disposition prevents it from becoming an input offer.
+            transaction.facts.push(fact);
         }
         self.page_turn_presentation.transaction.disposition = OperationDisposition::Excluded;
-        emit(&fact, "skip", reason, &[]);
+        emit(&fact, "skip", reason, &[("sub_check", sub_check.into())]);
     }
 
     /// Only resident complete normal output is an opportunity. This never runs
@@ -1294,7 +1374,32 @@ impl App {
 
     /// Called only at accepted Sequential navigation, before opening/mutating the target.
     pub(super) fn offer_page_turn(&mut self, ctx: &egui::Context, target: usize, forward: bool) {
+        self.offer_page_turn_with_operation(ctx, target, forward, None);
+    }
+
+    pub(super) fn offer_page_turn_with_operation(
+        &mut self,
+        ctx: &egui::Context,
+        target: usize,
+        forward: bool,
+        operation: Option<ViewerOperationId>,
+    ) {
         if !self.settings.page_turn_animation_enabled {
+            return;
+        }
+        if operation.is_some_and(|id| {
+            !self
+                .page_turn_presentation
+                .transaction
+                .facts
+                .iter()
+                .any(|f| f.operation_id == id)
+        }) {
+            self.page_turn_excluded_navigation_with_operation(
+                ctx,
+                "missing_operation_fact",
+                operation,
+            );
             return;
         }
         let Some(fact) = self.page_turn_presentation.take_candidate() else {
@@ -1303,12 +1408,12 @@ impl App {
                 .transaction
                 .facts
                 .first()
-                .map_or("superseded_animation", |fact| match fact.phase {
+                .map_or("missing_operation_fact", |fact| match fact.phase {
                     OperationPhase::Press => "superseded_animation",
                     OperationPhase::Repeat => "repeat_operation",
                     OperationPhase::Continuous => "continuous_operation",
                 });
-            self.page_turn_excluded_navigation(ctx, reason);
+            self.page_turn_excluded_navigation_with_operation(ctx, reason, operation);
             return;
         };
         if self
@@ -2899,7 +3004,7 @@ mod tests {
             app.page_turn_excluded_navigation(ctx, "ambiguous");
             assert!(
                 app.page_turn_presentation.transaction.disposition
-                    == OperationDisposition::Available
+                    == OperationDisposition::Excluded
             );
         });
     }

@@ -165,6 +165,9 @@ impl App {
                             ViewerOperationId::Pointer { .. } => "pointer",
                             ViewerOperationId::Pad { .. } => "pad",
                             ViewerOperationId::Slideshow(_) => "slideshow",
+                            ViewerOperationId::UnattributedNavigation(_) => {
+                                "unidentified_navigation"
+                            }
                         },
                         diagnostic_input_seq: self.input_seq,
                     })

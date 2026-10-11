@@ -2660,6 +2660,36 @@ impl App {
         ctx: &egui::Context,
         batch: GamepadFrameBatch,
     ) -> GamepadDispatchOutcome {
+        self.dispatch_gamepad_batch_with_admission(ctx, batch, Self::gamepad_dispatch_allowed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dispatch_neutral_gamepad_poll_for_test(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> GamepadDispatchOutcome {
+        self.dispatch_gamepad_poll_for_test(ctx, false)
+    }
+
+    #[cfg(test)]
+    fn dispatch_gamepad_poll_for_test(
+        &mut self,
+        ctx: &egui::Context,
+        analog_operation: bool,
+    ) -> GamepadDispatchOutcome {
+        let mut batch = GamepadFrameBatch::empty_for_test();
+        batch.analog_operation = analog_operation;
+        // Headless fixtures supply the input owner's admission proof, without
+        // consulting or changing the desktop's foreground window.
+        self.dispatch_gamepad_batch_with_admission(ctx, batch, |_, _| true)
+    }
+
+    fn dispatch_gamepad_batch_with_admission(
+        &mut self,
+        ctx: &egui::Context,
+        batch: GamepadFrameBatch,
+        admission: impl FnOnce(&Self, &egui::Context) -> bool,
+    ) -> GamepadDispatchOutcome {
         let operations = if self.page_turn_operation_tracking_needed() {
             batch.presentation_operations()
         } else {
@@ -2668,6 +2698,7 @@ impl App {
         let GamepadFrameBatch {
             operation_batch,
             delivery,
+            analog_operation,
             now,
             actions,
             saw_input_event,
@@ -2698,7 +2729,7 @@ impl App {
         if session_ended && delivery == PadBatchDelivery::Fresh {
             self.commit_ring_picker(ctx);
         }
-        let dispatch_allowed = self.gamepad_dispatch_allowed(ctx);
+        let dispatch_allowed = admission(self, ctx);
         let mut nav = None;
         let mut dispatched = false;
         if dispatch_allowed {
@@ -2728,14 +2759,20 @@ impl App {
                 }
                 dispatched = true;
             }
-            let _operation_scope = self.gamepad_navigation_dispatch_scope(
-                ctx,
-                ViewerOperationId::Pad {
-                    batch: operation_batch,
-                    ordinal: analog_ordinal,
-                },
-                OperationPhase::Continuous,
-            );
+            // A neutral poll is not input. Preserve the sampled analog fact;
+            // merely entering the analog handler must not cancel a page turn.
+            let _operation_scope = analog_operation
+                .then(|| {
+                    self.gamepad_navigation_dispatch_scope(
+                        ctx,
+                        ViewerOperationId::Pad {
+                            batch: operation_batch,
+                            ordinal: analog_ordinal,
+                        },
+                        OperationPhase::Continuous,
+                    )
+                })
+                .flatten();
             if self.dispatch_gamepad_analog(ctx, now) {
                 dispatched = true;
             }
@@ -2758,17 +2795,21 @@ impl App {
         ctx: &egui::Context,
         action: PadAction,
     ) -> Option<AddressBarNav> {
-        let _operation_scope = self.gamepad_navigation_dispatch_scope(
-            ctx,
-            ViewerOperationId::Pad {
-                batch: action.operation_id.batch,
-                ordinal: action.operation_id.ordinal,
-            },
-            match action.kind {
-                PadActionKind::Press | PadActionKind::Release => OperationPhase::Press,
-                PadActionKind::Repeat => OperationPhase::Repeat,
-            },
-        );
+        let _operation_scope = (action.kind != PadActionKind::Release)
+            .then(|| {
+                self.gamepad_navigation_dispatch_scope(
+                    ctx,
+                    ViewerOperationId::Pad {
+                        batch: action.operation_id.batch,
+                        ordinal: action.operation_id.ordinal,
+                    },
+                    match action.kind {
+                        PadActionKind::Press | PadActionKind::Release => OperationPhase::Press,
+                        PadActionKind::Repeat => OperationPhase::Repeat,
+                    },
+                )
+            })
+            .flatten();
         self.dispatch_gamepad_button(ctx, action)
     }
 
@@ -2778,7 +2819,7 @@ impl App {
         operation_id: ViewerOperationId,
         phase: OperationPhase,
     ) -> Option<PadNavigationDispatchScope> {
-        if !self.page_turn_barrier_active() {
+        if !self.settings.page_turn_animation_enabled && !self.page_turn_barrier_active() {
             return None;
         }
         self.page_turn_external_operation(ctx, operation_id, phase, "gamepad_dispatch");
@@ -2803,7 +2844,7 @@ impl App {
         &self,
         ctx: &egui::Context,
     ) -> Option<ViewerOperationId> {
-        if !self.page_turn_barrier_active() {
+        if !self.settings.page_turn_animation_enabled && !self.page_turn_barrier_active() {
             return None;
         }
         ctx.data(|data| {
@@ -9937,6 +9978,97 @@ mod next_input_tests {
     use crate::grid_item::GridItem;
     use crate::settings::{FullscreenFitMode, ReadingFlow};
     use crate::ui_dialogs::file_organize::FileOrganizeRequest;
+
+    #[test]
+    fn page_turn_first_gamepad_navigation_skip_keeps_the_dispatched_id() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::lock_test_input();
+        use crate::ui_fullscreen::page_turn_submission_tests::{frame, ready_app};
+        use crate::ui_fullscreen::take_page_turn_test_events as take_test_events;
+        take_test_events();
+        let ctx = egui::Context::default();
+        let mut app = ready_app(&ctx, SpreadMode::Single);
+        app.settings.page_turn_animation_enabled = true;
+        assert!(!app.page_turn_barrier_active());
+        let batch = next_pad_operation_batch();
+        let accepted = ViewerOperationId::Pad { batch, ordinal: 0 };
+        frame(&ctx, |_, ctx| {
+            app.page_turn_external_operations(
+                ctx,
+                &[
+                    (accepted, OperationPhase::Press, "gamepad"),
+                    (
+                        ViewerOperationId::Pad { batch, ordinal: 1 },
+                        OperationPhase::Press,
+                        "gamepad",
+                    ),
+                ],
+            );
+            app.dispatch_gamepad_button_with_operation(
+                ctx,
+                PadAction {
+                    operation_id: PadOperationId { batch, ordinal: 0 },
+                    button: PadButton::DPadRight,
+                    kind: PadActionKind::Press,
+                },
+            );
+            assert_eq!(app.fullscreen_idx, Some(1));
+            assert_eq!(app.gamepad_operation_for_navigation(ctx), None);
+        });
+        let events = take_test_events();
+        assert_eq!(events.len(), 1, "one accepted navigation: {events:?}");
+        assert_eq!(events[0].0.operation_id, accepted);
+        assert_eq!((events[0].1, events[0].2), ("skip", "superseded_animation"));
+        #[cfg(windows)]
+        crate::key_input::clear_test_frame();
+    }
+
+    #[test]
+    fn page_turn_gamepad_neutral_poll_preserves_curl_and_sampled_analog_cancels() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::lock_test_input();
+        use crate::ui_fullscreen::page_turn_submission_tests::{frame, ready_app, seed_leaf};
+        let ctx = egui::Context::default();
+        let mut app = ready_app(&ctx, SpreadMode::Single);
+        seed_leaf(&ctx, &mut app);
+        frame(&ctx, |_, ctx| {
+            app.page_turn_pre_draw(ctx);
+            let outcome = app.dispatch_neutral_gamepad_poll_for_test(ctx);
+            assert!(outcome.dispatch_allowed);
+            assert!(!outcome.dispatched);
+            assert!(app.page_turn_barrier_active());
+            assert!(!app.page_turn_completion_active());
+        });
+        frame(&ctx, |_, ctx| {
+            // A directional key-up is not a new press either. The sampled
+            // batch excludes Release, so dispatch must keep that same rule.
+            app.dispatch_gamepad_button_with_operation(
+                ctx,
+                PadAction {
+                    operation_id: PadOperationId {
+                        batch: next_pad_operation_batch(),
+                        ordinal: 0,
+                    },
+                    button: PadButton::DPadRight,
+                    kind: PadActionKind::Release,
+                },
+            );
+            assert!(app.page_turn_barrier_active());
+            assert!(!app.page_turn_completion_active());
+        });
+        frame(&ctx, |_, ctx| {
+            app.page_turn_pre_draw(ctx);
+            // An axis can return to neutral during this poll. Its sampled
+            // operation still cancels even though the final level cannot move.
+            let outcome = app.dispatch_gamepad_poll_for_test(ctx, true);
+            assert!(outcome.dispatch_allowed);
+            assert!(!outcome.dispatched);
+            assert!(app.page_turn_completion_active());
+            assert_eq!(app.fullscreen_idx, Some(1));
+        });
+        #[cfg(windows)]
+        crate::key_input::clear_test_frame();
+    }
 
     #[test]
     fn page_turn_gamepad_dispatch_keeps_the_first_consumed_id_and_removes_its_scope() {

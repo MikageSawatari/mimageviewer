@@ -2618,6 +2618,10 @@ leafのvisible receiptは一部のincoming頁がまだ裏にあるため、通�
 割込みでも同じflat採用を先に行い、close→継続commit→fresh drawing/input snapshotを共有する。
 normal layoutのH/gと各頁のprepared rect/UVをprojectionへ渡し、異寸法のscanを同じrectへ揃えない。
 効果専用decode/upload・UI thread I/Oを追加せず、設定OFFの通常flat経路は維持する。
+演出の入力観測も通常key handlerと同じpassのkeyboard ownerを先に選択する。
+gamepadのneutral pollは操作factを発行せず、sampled analog factだけが演出を取り消す。
+設定ONの受理済み移動は、候補欠落/複数入力やinstant経路でも既存transactionで一回の理由付きskipを記録する
+（[page-turn-animation-plan.md §20](page-turn-animation-plan.md)）。
 
 通過 rendition の外側の**ページ矩形**は、低解像度 texture の整数寸法ではなく source/header 寸法
 から求める。PDF は thumbnail / fullscreen の各 raster 寸法が別々に整数丸めされるため、PDFium が

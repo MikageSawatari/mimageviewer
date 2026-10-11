@@ -1597,7 +1597,7 @@ R6-aのprojection/split/外周clipに変更はなく、R6-b/cへroute再判定�
 
 R7 `fa5119c19`は独立設計レビューACCEPT（利用者からの引継ぎ）。利用者指定により段階実装する。
 この節は実装範囲と検証証拠の台帳であり、製品差分の独立レビュー合格・実機motion品質の受入れを表さない。
-Stage 1の自動検証とnormal確認用buildは完了し、利用者によるmotion評価待ち。
+Stage 1の自動検証とnormal確認用build後、利用者の実機確認で演出が開始・継続しない入力接続の不具合が判明した（§20）。motion品質の受入れは未了。
 次の次の版へ延期、既定OFF、PC/F12限定、final-only readiness、仮時間100〜600ms/既定200ms、slideshow条件を維持する。
 
 ### 19.1 今回の投影・素材・geometry
@@ -1672,3 +1672,61 @@ continuationのperfは元operation/contextにflat receipt frame、commit frame�
 
 自動検証結果・新goldenの目視確認・verification buildの証拠は本stageのhandoff
 `target/A-1341-stage1-msg.txt`へ記録する。実機での開始率（全navigation分母、split別集計）とmotion評価は利用者確認待ち。
+
+## 20. Stage 1入力接続の実機不具合（2026-10-11）
+
+利用者が`0d1b1f99f`のnormal確認用buildで演出を見られなかった。pid 82140のログは読取り時点で
+`%APPDATA%\mimageviewer\logs\perf_events.1.jsonl`へrotate済みだった。利用者報告に対応する冒頭約61秒には
+key trigger 21件、keyのanimation event 0件、pointerのstart 2件とその次frameの`cancel/new_operation` 2件がある。
+その後の同sessionにも入力が続くため、この区間の数をsession全体の数として扱わない。元ログ・normal profileは変更しない。
+
+### 20.1 キー候補だけが消えていた所有境界
+
+初回turnの`begin_page_turn_viewer_frame`は、通常key handlerがpassのkeyboard ownerを選択する前に
+`page_turn_pre_draw`を呼んでいた。後者が使うcached-only `keymap_owner_blocks_shortcuts`はowner不在を
+fail-closedとし、immutable key factsを消した。後段の実key handlerはownerを選択して移動を受理するが、
+offerの`take_candidate`と旧excluded helperは空factsで黙ってreturnする。renderer/projection/readinessの拒否ではない。
+
+修正は`page_turn_pre_draw`自身が同じApp/pass/viewportの`keyboard_owner_for_pass`を確定してから
+key admissionを行うこと。generic keymapのfail-closed契約、modal/TextInput/IME抑止、native source identityを緩めない。
+root、専用fullscreen、embedded/F12の同じ観測入口へ適用する。設定OFFの早期returnより後でのみ実行する。
+
+### 20.2 クリックを取り消したのは入力ゼロのgamepad poll
+
+raw mouse releaseはpress deliveryのID/destinationを継承していた。取消直前のfresh ingressも無い。
+違反は`dispatch_gamepad_batch`のanalog handler前に毎回作る`gamepad_navigation_dispatch_scope(Continuous)`だった。
+sampleの`analog_operation=false`、actions空でもこのscopeがfactを発行し、開始後の次root pollで
+presentationの`observe`が別operationとして取り消す。Offered時はbarrierがないためscopeを作らず、
+最初のcurlが採用されてTurningになった次frameだけ取消になる、という実ログの順序と一致する。
+
+既存batchが捕捉した`analog_operation`がtrueの場合だけscopeを作る。通常analog handlerは毎回呼び、
+neutral/切断時の既存終了・reset処理は維持する。実analog操作（poll内に動きがあり最終levelだけneutralの場合も含む）と
+別key/clickは従来どおり取消・flat-first完了を行う。時間窓、release無視、取消禁止、別bool/pendingは加えない。
+
+### 20.3 受理済み移動の省略を一回記録する
+
+設定ONのanimation診断では、resolved navigation handlerが渡す実operation IDをoffer/exclusionへ渡す。
+空facts・複数facts・repeat/continuousで演出候補を作れなくても、受理済み移動には一回の`skip`を残す。
+同batchの余剰入力はnavigationとして受理していないので、それぞれを別のskipへ数えない。
+既存transactionのClaimed/Excludedがoffer・skip・replayの一回性を所有し、新しいqueue/履歴setは作らない。
+`sub_check=missing_operation_fact` / `multiple_operation_edges` / `accepted_navigation`を付ける。
+実ID自体が欠落した場合は診断専用`UnattributedNavigation`をExcluded状態で保持し、physical inputを捏造して演出しない。
+通常jump、collection受付、stack jump、非隣接slideshow、split/境界とcontext切替のinstantも同じ診断へ接続する。
+key/padの実ID取得も「既にturn中」だけでなく設定ONの初回送りから行う。gamepad Releaseはsampleとdispatchで同じく
+新Pressへ変換せず、通常release handlerだけを実行する。
+gamepadから通常navigationへ渡すwrapperも初回ON時の実IDを保持する。二つのpad factが同batchにある
+初回button handlerでも、受理した一つのIDへskipを結び、scope退出時には通常どおりIDを外す。
+final-only readiness、既定OFF、OFF時の入力診断なし・flat直行、geometry/perf/VRAM契約は維持する。
+
+### 20.4 回帰と検証の範囲
+
+初回の実egui/native key、ROOT/専用viewer、Single/Pair、および実canvas clickのpress→小move→releaseから
+通常navigation、curl receiptのoutput採用、Started、通常canonical flat採用、Finishedまで通す。
+直接offerやslideshow seedを初回開始の代用にしない。ROOT/子の異なるframe counterを同一Contextで交互に進め、
+毎frameの実neutral gamepad batch配送がturnを維持することを確認する。
+headlessではOS foreground gateだけをadmission seamで供給し、通常batch consumerの処理順を変えない。
+mixed key/wheel・ingress欠落は即時の通常移動とskip一回を確認し、実analog factは取消になる負の回帰を置く。
+既存interruption・F12・媒体・projection/golden回帰も維持する。実窓/実GPU・motion品質の受入れをheadlessで代用しない。
+
+今回の検証結果、build、利用者向け手順は`target/A-1341-stage1-fix-msg.txt`へ記録する。
+製品差分の独立完了レビューと、修正後の実機motion品質/性能受入れは未了。

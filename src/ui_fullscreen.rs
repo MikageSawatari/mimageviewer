@@ -19,6 +19,8 @@
 //! しまう」誤認を避けるため明示。
 
 mod page_turn;
+#[cfg(test)]
+pub(crate) use page_turn::take_test_events as take_page_turn_test_events;
 pub(crate) use page_turn::{
     OperationPhase, PageTurnLeaseInventory, PageTurnPresentation, PresentationDestination,
     ViewerOperationId, next_operation_batch,
@@ -30040,7 +30042,7 @@ impl App {
         ctx: &egui::Context,
         action: KeyAction,
     ) -> Option<ViewerOperationId> {
-        if !self.page_turn_barrier_active() {
+        if !self.settings.page_turn_animation_enabled && !self.page_turn_barrier_active() {
             return None;
         }
         crate::key_input::operation_key_edges(ctx, ctx.viewport_id())
@@ -30072,7 +30074,7 @@ impl App {
         ctx: &egui::Context,
         key_name: KeyName,
     ) -> Option<ViewerOperationId> {
-        if !self.page_turn_barrier_active() {
+        if !self.settings.page_turn_animation_enabled && !self.page_turn_barrier_active() {
             return None;
         }
         crate::key_input::operation_key_edges(ctx, ctx.viewport_id())
@@ -32338,7 +32340,27 @@ impl App {
                     );
                 }
             } else {
-                self.stack_jump(ctx, stack_jump_next);
+                if self.stack_jump(ctx, stack_jump_next) {
+                    let operation = self
+                        .settings
+                        .page_turn_animation_enabled
+                        .then(|| {
+                            self.page_turn_navigation_key_operation(
+                                ctx,
+                                if stack_jump_next {
+                                    KeyAction::FsStackJumpNext
+                                } else {
+                                    KeyAction::FsStackJumpPrev
+                                },
+                            )
+                        })
+                        .flatten();
+                    self.page_turn_excluded_navigation_with_operation(
+                        ctx,
+                        "nonadjacent_stack_jump",
+                        operation,
+                    );
+                }
             }
         }
         // Ctrl+←/→: 見開きモードでは「1 ページずらし」(現在の表示ユニット先頭を
@@ -36864,11 +36886,18 @@ impl App {
             {
                 return;
             }
-            if self.settings.page_turn_animation_enabled
-                && let Some(current) = self.fullscreen_idx
-                && let Some(forward) = self.adjacent_page_turn_direction(current, idx)
-            {
-                self.offer_page_turn(ctx, idx, forward);
+            if self.settings.page_turn_animation_enabled {
+                if let Some(current) = self.fullscreen_idx
+                    && let Some(forward) = self.adjacent_page_turn_direction(current, idx)
+                {
+                    self.offer_page_turn_with_operation(ctx, idx, forward, Some(operation));
+                } else {
+                    self.page_turn_excluded_navigation_with_operation(
+                        ctx,
+                        "nonadjacent_slideshow",
+                        Some(operation),
+                    );
+                }
             }
         }
         // Timer-driven slideshow advances are fullscreen-internal navigation too, so
@@ -37451,10 +37480,7 @@ impl App {
         fs_idx: usize,
     ) {
         #[cfg(windows)]
-        let operation = self
-            .page_turn_barrier_active()
-            .then(|| self.gamepad_operation_for_navigation(ctx))
-            .flatten();
+        let operation = self.gamepad_operation_for_navigation(ctx);
         #[cfg(not(windows))]
         let operation = None;
         self.handle_fs_navigation_with_operation(
@@ -37675,6 +37701,13 @@ impl App {
         // `apply_folder_nav_result` (FolderNavMode::Fullscreen ブランチ) に任せる。
         if let Some(delta) = ctrl_nav {
             let context_nav_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
+            if delta != 0 {
+                self.page_turn_excluded_navigation_with_operation(
+                    ctx,
+                    "context_navigation",
+                    operation,
+                );
+            }
             for _ in 0..delta.unsigned_abs() {
                 self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, delta > 0, false);
             }
@@ -37685,6 +37718,13 @@ impl App {
             );
         } else if let Some(delta) = sibling_nav {
             let context_nav_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
+            if delta != 0 {
+                self.page_turn_excluded_navigation_with_operation(
+                    ctx,
+                    "sibling_context_navigation",
+                    operation,
+                );
+            }
             for _ in 0..delta.unsigned_abs() {
                 self.handle_fullscreen_sibling_nav_context(ctx, fs_idx, delta > 0, false);
             }
@@ -37695,6 +37735,11 @@ impl App {
             );
         } else if let Some(nav) = mouse_nav {
             let context_nav_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
+            self.page_turn_excluded_navigation_with_operation(
+                ctx,
+                "mouse_context_navigation",
+                operation,
+            );
             self.mouse_ring_nav = Some(nav);
             finish_fs_navigation_perf_span(
                 &mut fs_navigation_perf,
@@ -37732,6 +37777,11 @@ impl App {
                     crate::app::ManualMediaNavigationLanding::Fullscreen,
                 )
             {
+                self.page_turn_excluded_navigation_with_operation(
+                    ctx,
+                    "collection_navigation",
+                    operation,
+                );
                 finish_fs_navigation_perf_span(
                     &mut fs_navigation_perf,
                     FsNavigationPerfSpan::Page,
@@ -37744,6 +37794,11 @@ impl App {
             // wheel 由来のページ移動等で別項目を開き直さないようガードする。
             if let Some(new_idx) = jump_to {
                 if !self.fs_navigation_sequence_blocks_new_target() {
+                    self.page_turn_excluded_navigation_with_operation(
+                        ctx,
+                        "nonsequential_navigation",
+                        operation,
+                    );
                     let land_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
                     self.land_still_page_navigation_target(
                         ctx,
@@ -37763,7 +37818,11 @@ impl App {
                     // 同じページの反対側。テクスチャも読み込みも同じものなので、
                     // ページ遷移の機構を通さない。通すと再読込と表示確定が余計に走る。
                     if self.settings.page_turn_animation_enabled {
-                        self.page_turn_excluded_navigation(ctx, "stage1_split_step");
+                        self.page_turn_excluded_navigation_with_operation(
+                            ctx,
+                            "stage1_split_step",
+                            operation,
+                        );
                     }
                     self.set_fullscreen_page_slice_for_display_unit(step.slice);
                     self.update_fs_page_turn_burst_after_navigation(ctx, fs_idx, None);
@@ -37788,7 +37847,11 @@ impl App {
                     );
                     if sequence_started {
                         if self.settings.page_turn_animation_enabled {
-                            self.page_turn_excluded_navigation(ctx, "stage1_split_step");
+                            self.page_turn_excluded_navigation_with_operation(
+                                ctx,
+                                "stage1_split_step",
+                                operation,
+                            );
                         }
                         let land_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
                         self.land_still_page_navigation_target(
@@ -37820,6 +37883,11 @@ impl App {
                     if let Some(delta) =
                         navigable_delta_between(&self.items, &display_order, fs_idx, new_idx)
                     {
+                        self.page_turn_excluded_navigation_with_operation(
+                            ctx,
+                            "stage1_media_source",
+                            operation,
+                        );
                         self.start_manual_media_navigation(
                             ctx,
                             &display_order,
@@ -37854,18 +37922,29 @@ impl App {
                         } {
                             if self.settings.page_turn_animation_enabled {
                                 if !moved {
-                                    self.page_turn_excluded_navigation(
+                                    self.page_turn_excluded_navigation_with_operation(
                                         ctx,
                                         "navigation_no_movement",
+                                        operation,
                                     );
                                 } else if accept_rendition {
-                                    self.page_turn_excluded_navigation(ctx, "rendition_or_burst");
+                                    self.page_turn_excluded_navigation_with_operation(
+                                        ctx,
+                                        "rendition_or_burst",
+                                        operation,
+                                    );
                                 } else if let Some(forward) =
                                     self.adjacent_page_turn_direction(fs_idx, new_idx)
                                 {
-                                    self.offer_page_turn(ctx, new_idx, forward);
+                                    self.offer_page_turn_with_operation(
+                                        ctx, new_idx, forward, operation,
+                                    );
                                 } else {
-                                    self.page_turn_excluded_navigation(ctx, "nonadjacent_jump");
+                                    self.page_turn_excluded_navigation_with_operation(
+                                        ctx,
+                                        "nonadjacent_jump",
+                                        operation,
+                                    );
                                 }
                             }
                             let land_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
@@ -37886,7 +37965,11 @@ impl App {
                 }
             } else if let FsPageNav::Boundary { at_end } = page_nav {
                 if self.settings.page_turn_animation_enabled {
-                    self.page_turn_excluded_navigation(ctx, "navigation_boundary");
+                    self.page_turn_excluded_navigation_with_operation(
+                        ctx,
+                        "navigation_boundary",
+                        operation,
+                    );
                 }
                 self.update_fs_page_turn_burst_after_navigation(ctx, fs_idx, None);
                 self.fs_boundary_hint = Some(FsBoundaryHint::Edge {
@@ -37907,6 +37990,11 @@ impl App {
                     Some(GridItem::Video(_) | GridItem::Audio(_))
                 );
                 if current_is_media {
+                    self.page_turn_excluded_navigation_with_operation(
+                        ctx,
+                        "stage1_media_source",
+                        operation,
+                    );
                     self.start_manual_media_navigation(
                         ctx,
                         &display_order,
@@ -37951,18 +38039,29 @@ impl App {
                         } {
                             if self.settings.page_turn_animation_enabled {
                                 if !moved {
-                                    self.page_turn_excluded_navigation(
+                                    self.page_turn_excluded_navigation_with_operation(
                                         ctx,
                                         "navigation_no_movement",
+                                        operation,
                                     );
                                 } else if accept_rendition {
-                                    self.page_turn_excluded_navigation(ctx, "rendition_or_burst");
+                                    self.page_turn_excluded_navigation_with_operation(
+                                        ctx,
+                                        "rendition_or_burst",
+                                        operation,
+                                    );
                                 } else if let Some(forward) =
                                     self.adjacent_page_turn_direction(fs_idx, new_idx)
                                 {
-                                    self.offer_page_turn(ctx, new_idx, forward);
+                                    self.offer_page_turn_with_operation(
+                                        ctx, new_idx, forward, operation,
+                                    );
                                 } else {
-                                    self.page_turn_excluded_navigation(ctx, "nonadjacent_jump");
+                                    self.page_turn_excluded_navigation_with_operation(
+                                        ctx,
+                                        "nonadjacent_jump",
+                                        operation,
+                                    );
                                 }
                             }
                             let land_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
@@ -37981,6 +38080,11 @@ impl App {
                         }
                     }
                 } else {
+                    self.page_turn_excluded_navigation_with_operation(
+                        ctx,
+                        "navigation_boundary",
+                        operation,
+                    );
                     self.update_fs_page_turn_burst_after_navigation(ctx, fs_idx, None);
                     // 境界到達: 中央にヒントを出す (nav_delta > 0 なら末尾)
                     self.fs_boundary_hint = Some(FsBoundaryHint::Edge {

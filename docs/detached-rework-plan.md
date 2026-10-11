@@ -4561,6 +4561,20 @@ R7の独立設計ACCEPTを根拠とし、この実装差分の独立完了レビ
 検証証拠は[page-turn-animation-plan.md §19](page-turn-animation-plan.md#19-stage-1--通常頁の実装と早期motion評価2026-10-11)と
 `target/A-1341-stage1-msg.txt`へ記録する。
 
+### 2026-10-11 §1.341 Stage 1実機追補: 入力factと受理診断の所有境界（確認待ち）
+
+§2を再確認した。fullscreen/F12共通の`page_turn_pre_draw`で同じpassのkeyboard ownerを先に確定し、
+owner不在を抑止と誤認してkey factだけ捨てる順序を修正する。rootに限らず同じ観測入口へ適用する。
+gamepadは既存mounted destinationとsampled batchを維持し、入力ゼロpollからContinuous factを作る処理を除く。
+通常analog終了/reset、normal mount/deposit/fork、兄弟context、viewport/HWND/placementは変更しない。
+受理済みnavigationのoffer/exclusionは実producerのIDを受け、既存transactionで理由付きskipを一回記録する。
+診断用の欠落IDはExcluded状態に留め、新input/pending/queueやfreshness時間窓へ使わない。
+
+これは入力所有と受理の同じ境界に戻す構造修正であり、release無視・取消抑止・追加waitによる症状パッチではない。
+変更範囲は`src/ui_fullscreen/page_turn.rs`/`barrier.rs`、`src/ui_fullscreen.rs`、`src/app/gamepad_input.rs`と実handler回帰。
+利用者指定のbug fixとして実装し、独立完了レビューによる構造確認は未了とする。
+詳細・実機反証は[page-turn-animation-plan.md §20](page-turn-animation-plan.md)、検証は`target/A-1341-stage1-fix-msg.txt`。
+
 ### 2026-10-11 §1.364 D2f: import取消の失効を既存maintenance ownerへ集約
 
 利用者指定の構造修正として、import workerがすべてのErrからglobal失効を作る経路を撤去する。
