@@ -865,7 +865,7 @@ pub(crate) struct PhysicalHistoryTransition {
     dfs_continuation: Option<PhysicalHistoryDfsContinuation>,
     favsearch_origin: bool,
     tag_view_origin: bool,
-    global_search_origin: bool,
+    global_search_origin: Option<crate::global_search_ui::SearchOpenOrigin>,
     grid_open_effects: Option<GridVirtualOpenEffects>,
 }
 
@@ -22102,6 +22102,24 @@ impl App {
         self.modal_dialog_block_reason().is_some()
     }
 
+    pub(crate) fn everything_main_grid_available(&self) -> bool {
+        if !self.main_folder_history_available() || self.fullscreen_idx.is_some() {
+            return false;
+        }
+        #[cfg(windows)]
+        if self.native_video_fullscreen_active_for_main_backdrop() {
+            return false;
+        }
+        true
+    }
+
+    pub(crate) fn finish_everything_edit_boundary(&mut self) {
+        self.finish_rating_membership_edit_boundary();
+        if self.fullscreen_idx.is_some() {
+            self.close_fullscreen_for_rating_membership();
+        }
+    }
+
     /// Which of those states is holding input, by name.
     ///
     /// This was a bare `||` chain of sixty flags. When one of them stayed set with nothing drawn
@@ -22120,6 +22138,7 @@ impl App {
             };
         }
         first![
+            self.everything_search_progress_visible() => "everything_search",
             self.capture_selection_open() => "clipboard_capture_selection",
             self.sidecar_restore_active() => "sidecar_restore",
             self.remote_session_blocks_local_control() => "remote_session",
@@ -28457,7 +28476,7 @@ impl App {
         let search_origin = (
             self.favsearch.active,
             self.tag_view.active,
-            self.global_search.active,
+            self.capture_search_open_origin(),
         );
         let book_prefix = grid_effects
             .as_ref()
@@ -32433,7 +32452,7 @@ impl App {
             dfs_continuation,
             favsearch_origin: self.favsearch.active,
             tag_view_origin: self.tag_view.active,
-            global_search_origin: self.global_search.active,
+            global_search_origin: self.capture_search_open_origin(),
             grid_open_effects: None,
 
             restore_intent: restore_intent.clone(),
@@ -32708,7 +32727,7 @@ impl App {
             dfs_continuation: None,
             favsearch_origin: self.favsearch.active,
             tag_view_origin: self.tag_view.active,
-            global_search_origin: self.global_search.active,
+            global_search_origin: self.capture_search_open_origin(),
             grid_open_effects: None,
         };
         self.replace_history_navigation_transition(None);
@@ -32717,6 +32736,12 @@ impl App {
     }
 
     fn physical_history_source_is_current(&self, request: &PhysicalHistoryTransition) -> bool {
+        if request
+            .global_search_origin
+            .is_some_and(|origin| !self.search_open_origin_is_current(origin))
+        {
+            return false;
+        }
         if !self.main_list_navigation_is_current(&request.navigation) {
             return false;
         }
@@ -34235,7 +34260,7 @@ impl App {
         path: &Path,
         favsearch_origin: bool,
         tag_view_origin: bool,
-        global_search_origin: bool,
+        global_search_origin: Option<crate::global_search_ui::SearchOpenOrigin>,
     ) {
         if favsearch_origin && self.favsearch.active {
             self.favsearch.nav_stack.push(path.to_path_buf());
@@ -34245,7 +34270,7 @@ impl App {
             self.record_tag_view_nav_open(path);
             self.update_tag_view_address();
         }
-        if global_search_origin && self.global_search.active {
+        if global_search_origin.is_some_and(|origin| self.search_open_origin_is_current(origin)) {
             self.advance_drilled_current_path(path);
         }
     }
@@ -36221,7 +36246,7 @@ impl App {
                 dfs_continuation: None,
                 favsearch_origin: self.favsearch.active,
                 tag_view_origin: self.tag_view.active,
-                global_search_origin: self.global_search.active,
+                global_search_origin: self.capture_search_open_origin(),
                 grid_open_effects: auto_fullscreen.then(|| GridVirtualOpenEffects {
                     reading_history_return_from: self.reading_history_return_from.clone(),
                     suppress_rating_filter: false,
@@ -36947,7 +36972,7 @@ impl App {
                     dfs_continuation: None,
                     favsearch_origin: self.favsearch.active,
                     tag_view_origin: self.tag_view.active,
-                    global_search_origin: self.global_search.active,
+                    global_search_origin: self.capture_search_open_origin(),
                     grid_open_effects: None,
 
                     restore_intent: crate::app::StartupListIntent::ExplicitList,
@@ -37131,7 +37156,7 @@ impl App {
         let search_origin = (
             self.favsearch.active,
             self.tag_view.active,
-            self.global_search.active,
+            self.capture_search_open_origin(),
         );
         let install = move |app: &mut Self| {
             app.finish_direct_pdf_visible_adoption(path, owner);
@@ -53099,7 +53124,7 @@ impl App {
         // Ctrl+G 絞り込みビュー中なら 1 段上げる (current_path != container_root) か、
         // Aggregated に戻る。自由な fs 遡行は許さない (docs §10.3)。
         if self.global_search.active {
-            if self.global_search.drill.is_some() {
+            if self.global_search.drill.is_some() || self.everything_has_physical_child() {
                 self.drill_back_one_level();
                 return None;
             }
@@ -60263,6 +60288,7 @@ impl App {
     /// Retire local viewer-open intentions admitted before Remote began acquiring ownership.
     /// A late PDF/ZIP completion may still install list data, but it cannot reopen a viewer.
     pub(crate) fn invalidate_local_viewer_open_intents_for_remote(&mut self) {
+        self.cancel_everything_search();
         self.cancel_unresolved_open_for_remote_session();
         self.cancel_archive_view_open_for_remote_session();
         self.cancel_saved_group_open_for_other_nav();
@@ -93031,6 +93057,8 @@ impl App {
         }
 
         // ── Ctrl+G: グローバルメタ検索バー表示 (docs §10.3) ──────────
+        self.dispatch_everything_search_shortcut(ctx);
+
         if !self.address_has_focus
             && !main_viewer_blocked
             && !self.any_dialog_open()

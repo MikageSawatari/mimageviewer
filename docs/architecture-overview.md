@@ -1,5 +1,19 @@
 # アーキテクチャ概観
 
+Everything ファイル名検索（§1.374、実装中・検証待ち）は `everything_ipc`
+（pure codec / Windows不可視reply-window transport）と`everything_results`
+（対応形式/pathの検査とworker stat）を追加し、一覧のownerは既存 `GlobalSearchState` と
+`TopLevelGridView::Search` に置く。`SearchSource`、排他的pending `SearchProducer`、
+accepted `SearchAccepted` / `EverythingPosition` がdraft・取得中・表示中の位置を区別する。
+`SearchPageEditPrepare` がimmutable datasetからsort/★/tag/編集情報を準備し、既存adoptionへ渡す。
+通常thumbnail・物理本open/back・F12 fork/park/promoteを利用し、検索専用の第二items/cache/worker群を作らない。
+Everything本体/SDK DLLは同梱せず、同PCで起動中の既定clientへ直接IPCする。
+raw10,000件・明示送信・完了後一括採用・mainの取消可能modalを使う。
+新設定field/DB/schema/検索履歴/Remote APIは追加せず、query/result一覧は永続化・診断ログへ保存しない。
+PDF共有poolの失効は先行改修 `4510346f5` / master `c1e66f589` のviewer-context ownerを使う。
+最新実装の独立レビューと自動/実機検証の受入は未完了。
+[仕様・履歴・検証台帳](everything-search-plan.md#14-実装記録2026-10-12検証待ち)。
+
 未リリースPDF-EPOCH-OWNERSHIP: PDF renderの失効権限は非Cloneの
 `PdfRenderEpochOwner` としてApp投影/ViewerContextBundleが一つずつ所有する。
 worker/Jobはimmutable ticketだけを持ち、失効とViewer優先昇格はそのowner/要求世代に限定する。
@@ -342,7 +356,7 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 
 | モジュール | 役割 |
 | --- | --- |
-| `search_query.rs` | 検索クエリのトークナイザ + マッチャ (AND / OR / NOT / `"..."` フレーズ、`MatchMode`)。3 モード共通 |
+| `search_query.rs` | 検索クエリのトークナイザ + マッチャ (AND / OR / NOT / `"..."` フレーズ、`MatchMode`)。Ctrl+S/F/G共通、Everythingは通さない |
 | `search_norm.rs` | `normalize_for_match` — ingest / クエリ / post-filter で共有する唯一の正規化関数 (lowercase) |
 | `search_index_db.rs` | Ctrl+S 用 `search_index.db` (お気に入り配下のフォルダ / ZIP / PDF / 動画名) |
 | `fts_index.rs` | Tantivy 0.26 ラッパ。`IndexDoc` / `Fields` / `QueryFilters` / `build_bigram_and_query` / `search_page`。bigram tokenizer + lower_caser |

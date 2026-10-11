@@ -8,6 +8,7 @@ const EGUI_LICENSE_APACHE: &str = include_str!("../../vendor/egui-wgpu/LICENSE-A
 const LIBRAW_LICENSE: &str = include_str!("../../LIBRAW-LICENSE.txt");
 const ZLIB_LICENSE: &str = include_str!("../../ZLIB-LICENSE.txt");
 const RUST_DEFLATE_NOTICES: &str = include_str!("../../RUST-DEFLATE-NOTICES.txt");
+const EVERYTHING_IPC_NOTICE: &str = include_str!("../../EVERYTHING-IPC-NOTICE.txt");
 const LIBJPEG_TURBO_LICENSE: &str = include_str!("../../LIBJPEG-TURBO-LICENSE.txt");
 const IJG_ATTRIBUTION: &str =
     "This software is based in part on the work of the Independent JPEG Group.";
@@ -222,6 +223,12 @@ impl App {
 
                 ui.add_space(8.0);
                 draw_raw_license_snapshot_fixture(ui);
+                draw_license_text(
+                    ui,
+                    "Everything IPC 定義 (MIT) 全文",
+                    "about_everything_ipc_notice",
+                    EVERYTHING_IPC_NOTICE,
+                );
 
                 ui.add_space(6.0);
                 draw_license_text(

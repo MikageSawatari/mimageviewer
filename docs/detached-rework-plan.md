@@ -1455,6 +1455,32 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-12 §1.374 Everything の共通Search接続（未コミット・独立実装レビュー待ち）
+
+利用者の実装指示と承認済みEverything計画、先行PDF ownershipの独立ACCEPT実装
+`4510346f5`（master `c1e66f589`）に基づく変更。Stage1の限定ACCEPTやPDF受入を、
+今回のEverything製品実装に対する独立ACCEPTへ読み替えない。追加実装の独立レビューは未完了。
+
+変更caller familyは `global_search_ui.rs` / `global_search_ui/everything.rs` のSearch source/prepare/adopt、
+物理本openの成功採用とRoot/PhysicalChild帰路、共通main modal/input受付、既存物理open/enumerate/return接続。
+実ファイル一覧を既存Search ownerへ採用するための構造接続で、detachedのrect/focus/placement/HWND/recreate
+症状に条件を足す変更ではない。`SearchProducer` と `SearchAccepted` が未採用/採用済みsourceを型で所有し、
+兄弟contextの状態を推測する新しいbool/Option、時間窓、reset、retryを追加しない。
+
+modalはmainのみ、Everything検索起動はmain Gridのみ。detachedから検索を転送しない。
+F12 open/fork/park/promoteは既存物理viewer ownerを使い、mainの検索dataset/return originを複製しない。
+main Searchの一覧交換は同ownerのPDF ticketだけを進め、同pathを読む兄弟queue/cache/requested/編集状態を変更しない。
+Remote source/query/result API、viewport/placement/HWND owner/focus/z-order述語は追加しない。
+取得/帰路のproducerだけがRemote sessionのlocal-modal leaseを持ち、acquireの受付と排他にする。
+既存Search installのpin/タグDB照会をEverythingの共通prepareへ渡し、UIは完成mapを採用する。
+新datasetは同一一覧のrating membership移譲対象にせず、保持datasetのsort/facetは移譲を維持する。
+共通neighbor集合交差のHashSet化は選択規則を変えずUIの二乗探索を除く。
+cross-context/物理本open-back/cancel/failed/stale回帰はfakeで成功した。大きい送信時policyを
+同producer内のBoxへ移してAppサイズを105,400に戻し、App/bundleのstack所有を既存上限内に保つ。
+full libは12,206成功・既知EOF timing failure一件（単独成功）、full UI snapshotは162成功。
+独立実装レビューと実機確認は未完了で、
+証拠は [Everything計画 §14](everything-search-plan.md#14-実装記録2026-10-12)へ集約する。
+
 ### 2026-10-12 PDF-EPOCH-OWNERSHIP: R2受入後の実装記録（未コミット）
 
 利用者からR2（`b5b3f06be`）の独立ACCEPTとPDF先行実装指示を取得した。

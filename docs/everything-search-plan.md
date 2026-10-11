@@ -1,6 +1,10 @@
-# Everything ファイル名検索 (§1.374) — Stage 1 設計案
+# Everything ファイル名検索 (§1.374) — Stage 1 設計と実装台帳
 
 作成: 2026-10-11。対象: v4.6.0 より後。`next-effetune`、基点 `31ac80b9c`。
+**最新状態（2026-10-12）: 利用者の実装指示とPDF prerequisiteの独立ACCEPT/実装に基づく未コミット製品実装済み。
+§14を現行の実装台帳とし、以下の「設計のみ」「製品コード未実装」「PDF未解消」はStage1時点の履歴として保持する。
+最新の検証結果は§14.4。全libは完走して既知のEOF timing failure一件（単独再確認成功）。
+確認build作成済み・未起動。Everythingの独立実装レビュー・利用者の実機確認は未完了。**
 **設計のみ。実装開始・master への統合は未指示。** 初版 scope と既定キーは §12 の利用者決定を反映した。製品コードは未実装。2026-10-12: PDF owner の独立 subdesign と Ctrl+R の context 調査を追記。
 
 ## 1. 要求と調査の出どころ
@@ -308,3 +312,108 @@ fake Win32 server が必要な adapter integration は、専用 thread のテス
 共有 PDF epoch の owner 境界 P1 は **未解消**。§7.2 にコード根拠と統合前の停止条件を記録した。追記確認後の reviewer 最終判定は「Stage 1 調査案に限定して ACCEPT」。統合実装 ready／full design ACCEPT ではない。PDF owner の具体設計合意・必要改修・回帰確認が揃うまで chunk B を開始しない。Stage 1 完了は実装開始や master 統合を意味しない。
 
 2026-10-12: Stage 1 計画は利用者が `78e5f09ad` として commit。§12 の回答を反映し、[PDF ownership の独立設計案](pdf-render-epoch-ownership-plan.md)を追加。**今回の新設計・追記に対する内部／独立レビューは行っていない。** 先の限定 ACCEPT は Stage 1 の履歴であり、今回の subdesign の ACCEPT ではない。製品コード・.git は未変更、tests/build/launch/download なし。
+
+## 14. 実装記録（2026-10-12）
+
+### 14.1 開始条件と一次資料
+
+利用者から製品実装の開始指示を取得した。PDF ownership prerequisiteは独立レビューACCEPT済みの
+実装 `4510346f5`、master統合 `c1e66f589` として提供され、§7.2のchunk B停止条件を満たす。
+Stage1の限定ACCEPTをEverything製品実装の独立受入へ読み替えない。今回の実装は完了後に別の独立レビューを受ける。
+
+IPCの未確認定数で一度安全checkpointを取り停止した後、公式[CLI案内](https://www.voidtools.com/support/everything/command_line_interface/)が
+リンクする作者の[ES公開header](https://github.com/voidtools/ES/blob/main/src/everything_ipc.h)により、
+`IS_DB_LOADED=401`、`QUERY2W=18`、FULL_PATH request flag、folder/drive/root flag、query/replyのDWORD幅を確認した。
+DRIVEとROOTは同値2で、folderは1。SDK ZIP/DLL/headerをdownloadしていない。
+定義の出典と[ESのMIT licence](https://github.com/voidtools/ES/blob/main/LICENSE)のnoticeを配布noticeへ載せる。
+Everything本体を同梱しない。実client/process/索引への検索は自動gateの前提にしない。
+
+### 14.2 実装の所有境界
+
+- `everything_ipc.rs` / `everything_ipc/native.rs`: pure codecとworker-only QUERY2 transport。
+  不可視reply HWND、callback copy、bounded send/deadline、request ID相関、drop/cancelを一つのownerへ閉じる。
+  fake endpoint/注入HWNDの検証は実Everythingをdiscoverせず、foreground/inputも使わない。
+- `everything_results.rs`: 通常の対応拡張子/利用可能Susie形式と送信時visibility/EPUB/変換設定を使い、
+  pathを正規化/重複除去して対応候補だけstatする。mtime/size/sort metadataとraw/除外/読取不能/重複/上限件数を
+  immutable `EverythingDataset` に持つ。画像decode、内部archive probe、DB書込み、同名collapse/sidecar探索は行わない。
+- `GlobalSearchState`: draftの `SearchSource`、排他的pending `SearchProducer`、accepted `SearchAccepted` を持つ。
+  MetadataとEverythingは共通 `SearchPageEditPrepare` / `SearchViewWish` / adoption closureを使う。
+  request run/query/context/items generation/policyを照合し、完成後だけitems/metas/source map/件数/★の副作用を一括採用する。
+  大きい送信時Settings snapshotは同producer内のBoxで所有し、App/bundleのstackへインライン展開しない。
+  query/sourceのdraft変更・取消・失敗は既存accepted datasetの出所を上書きしない。
+- mainの取得/prepareを取消可能modalにして、open/navigation/query切替の組合せを制限する。
+  producerはRemote sessionの非Clone local-modal leaseを保持し、acquireと同じmutex/typed ownerで排他にする。
+  公開Remote phase/schema/APIは変更しない。終了後の通常Remote操作を妨げない。
+  UIには同期IPC/FS/DB/worker joinを増やさない。希少失敗はlog＋通知で扱い、retry/recovery state/DB再作成を追加しない。
+  pin/タグ照会と変換書庫のPending登録は共通prepareで完成させ、UIはprepared aggregate installとmap交換を使う。
+  初期化済みDB handle/pathだけをworkerへ渡し、TAG_WRITES/pin mutation stampの通常変更は既存freshnessへ戻す。
+  同datasetのsort/facetだけがrating membershipを移譲する。新query候補は新sourceとして採用し、
+  ★のneighbor判定もHashSetの集合交差にして大量disjoint結果のUI二乗探索を避ける。
+- accepted Everythingは `EverythingPosition::Root` / `PhysicalChild { logical_source, return_anchor, route }`。
+  childへは通常物理openの成功採用境界だけで遷移する。ZIP内部親移動は既存navを維持し、外側の戻りは保持datasetを
+  共通prepareで再投影する。IPCを再送しない。sort/★/tag変更も保持datasetと取得時stampから準備する。
+- 既存thumbnail/context所有とPDF prerequisiteを再利用し、F12のopen/fork/park/promoteを維持する。
+  mainのdataset/return originをdetachedへ複製しない。兄弟items/queue/cache/PDF ticket/編集状態を変更しない。
+  変更caller familyは物理本open採用・検索帰路・main modal受付であり、detached predicateの症状パッチではない。
+  [detached計画 §11](detached-rework-plan.md#11-リワーク外からの変更記録)にも変更範囲を記録する。
+
+### 14.3 UI、保存、文書
+
+`GlobalEverythingSearch` はGrid/Press/Ctrl+R。`MenuCommandId::GlobalEverythingSearch` をファイルmenuに追加し、
+captionは実効キーから生成する。main一覧/text/IME/focus recovery/modal/Remote gateを共通受付へ接続する。
+fullscreen/native/detachedからの検索起動を増やさず、Rの検出probeをdispatchへ読み替えない。
+IME確定後Enter/検索ボタンで明示送信し、raw先頭10,000件の後で形式/表示条件を適用する。
+paging/追加取得、自動ext追記、Ctrl+Gの自動集約/hit-count sort/全文対象filterは追加しない。
+
+新しいSettings field/schema/DB/索引/検索履歴/Remote APIは追加せず、settings-transfer項目数を変更しない。
+query/result一覧はmIVの永続データや診断ログに残さない。Everything自身のquery history設定は変更しない。
+結果からの通常open/tag/★/cacheは既存の保存契約に従う。
+keymap spec/default/実装計画、検索/shortcut manual、privacy、製品ページ、関連architecture/virtual/top-level/spec/READMEを同期する。
+
+### 14.4 検証の状態
+
+parentが未コミット差分の検証を集約する。全件数は各filterの実行件数で、重複を含む。
+新規テストはfake IPC endpoint/注入HWND・immutable dataset・一時DBを使い、実Everythingへ問い合わせない。
+自動検証の成功を最新実装の独立ACCEPTや実Everything互換性の受入へ読み替えない。
+
+| 検証 | 結果とログ（`target/`） |
+| --- | --- |
+| `cargo fmt --all -- --check` | exit 0、`EV-1374-fmt.log` |
+| normal / portable core check | policy heap化後も両方exit 0、`EV-1374-check-normal-final.log` / `EV-1374-check-portable-final.log` |
+| `--lib everything` | 59 passed、`EV-1374-focused-everything.log` |
+| `--lib global_search_ui` / `keymap` | 80 / 165 passed、`EV-1374-focused-global_search_ui.log` / `EV-1374-focused-keymap.log` |
+| `--lib remote_ipc::session` / `viewer_context_registry` | 52 / 84 passed、`EV-1374-focused-remote_ipc-session.log` / `EV-1374-focused-viewer_context_registry.log` |
+| `--lib thumbnail_request` / `pdf_loader` | 48 / 105 passed、同名の`EV-1374-focused-*.log` |
+| `--lib settings_transfer` / `keyboard_input` / `ime_focus` / `rating_membership` | 24 / 16 / 23 / 80 passed、同名の`EV-1374-focused-*.log` |
+| new `ui_snapshot everything_search_` | 5 passed、`EV-1374-ui-snapshot.log`。light/dark/narrow、100%/200%進捗。新PNG5枚だけを追加 |
+| full `ui_snapshot` | 162 passed、`EV-1374-full-gate.log`。描画を変えないpolicy heap化後も有効 |
+| `python scripts/check_ui_glyphs.py` | exit 0、`EV-1374-glyphs.log` |
+| 10,000行の単独synthetic回帰 | heap化後も1 passed、drain最大6.853ms、初回採用5.863ms、置換採用18.549ms、`EV-1374-performance-final.log` |
+| full workspace gate初回 | exit 101。Appサイズ113,256が既存110,000上限を超え、capture-region testのstack overflowでlibが途中終了。`EV-1374-full-gate.log`。UI snapshotは162 passed、他workspace targetは成功。完走済みfull libとして扱わない |
+| policy heap化の再確認 | Appサイズ105,400で既存上限内、capture-regionも1 passed。`EV-1374-stack-final.log` / `EV-1374-capture-stack-final.log`。上記全焦点filterも修正後に成功 |
+| final full lib | 修正後に完走、12,206 passed / 1 failed / 56 ignored、exit 101、1106.75秒、`EV-1374-full-lib-final.log`。`cargo test -p mimageviewer --lib --features pack-build-tools`。process内のcrash dialogだけを抑える |
+| EOF単独再確認 | 同featureで完全名`--exact --nocapture`、1 passed、exit 0、74.87秒、`EV-1374-eof-recheck.log` |
+| workspaceでスキップされたvendor gate | egui 25 / egui-wgpu 11 / eframe 18 passed、全てexit 0、`EV-1374-vendor-summary.txt`と各`EV-1374-vendor-*.log` |
+| `scripts/build-dev.ps1` | exit 0、core / Remote companion / EPUB workerとruntime DLLを準備、`EV-1374-build-dev.log`。normal feature / dev-runtime profile、未起動 |
+
+初回のfresh dataset回帰でShift anchorをNoneとした期待値は、既存のfirst-visible選択が
+新世代のanchorも先頭へ設定する仕様に合わせた。keymap既存menu順テストも新commandを追加した。
+製品の選択規則やassertを弱めて通していない。両方の再検証は成功。
+10,000行の置換で約296msだった旧/新集合の二乗探索を、source境界とHashSet交差へ修正した。
+測定はdebug/fake endpointの同一工程であり、実Everything/PDFium/実アプリの性能受入ではない。
+pin/タグを書き換えてからheld Readyを解放する回帰は、古いmapを公開せず共通workerで再準備し、
+新mapだけ採用することとUIの同期タグprewarmを通らないことを確認した。
+
+final full libの失敗は`video::tests::real_decoder_eof_full_loop_preserves_single_tail_burst_per_epoch`、
+`src/video/mod.rs:13261`の`try_send_native_first_frame_ready(...)` assert。対象ソースは今回無変更で、
+利用者がPDF段階の同じ失敗を既存load-timing flakeと判定したものに一致する。単独再確認は成功した。
+その成功を全lib gate成功へ読み替えず、対象外の修正・assert緩和・全libの再実行は行わない。
+初回のAppサイズ／capture-region overflowは今回の変更による不具合として修正し、
+影響する焦点回帰とfinal full libで両方成功した。UI snapshotや他workspace targetの成功は、
+描画・protocolを変えないpolicy heap化の後も有効なので再利用する。
+OS error 1455なし。実装者による追加の独立レビューは行っていない。
+最終`git --no-optional-locks diff --check`もexit 0（`EV-1374-diff-check.log`）。
+利用者向け手順と通常APPDATAの注意はUTF-8 BOM付き`target/EV-1374-impl-msg.txt`へ記録した。
+
+実Everything compatibility/性能/日本語query/本open-back/F12は、利用者が通常profile確認binaryを
+起動する別証拠とする。agentは通常profile binaryを起動しない。確認build後に独立reviewへ渡す。

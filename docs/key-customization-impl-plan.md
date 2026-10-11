@@ -13,6 +13,13 @@
 
 > §1.250: `ToggleAlwaysOnTop` は Global / Press / 既定 `none`。main、egui fullscreen、native video の各入力経路へ配線し、native presenter 用の allowlist と chord snapshot にも含める。
 
+> §1.374: `GlobalEverythingSearch` は検索範囲を表す名前だが **Grid / Press / Ctrl+R**。
+> main の一覧だけから起動し、IME/text focus/focus recovery、modal、Remote lock 中は発火しない。
+> fullscreen / detached viewer / native 動画へ起動を転送しない。`ALL_ACTIONS`、生成default、
+> menu metadata、inventory と同時に更新する。keymap のscope解決・再割当/none・競合警告と
+> native転送除外をpure/fake-inputテストで確認し、main/IME/detachedの受付はApp-levelで確認する。
+> `Ctrl+G/S/E` は維持し、固定R/VK probeだけを根拠に新actionをdispatchしない。
+
 関連: [keymap-spec.md](keymap-spec.md) (現行キー仕様 = アクション洗い出しの元ネタ)、
 [archive/ui-input/key-customization-plan.md](archive/ui-input/key-customization-plan.md) §8 (簡易版の設計確定事項)。
 
@@ -494,6 +501,9 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 `(固定)` は本計画では keymap.ini 対象外。
 
 ### MainWindow / Grid chrome (fullscreen 外)
+- GlobalEverythingSearch `Ctrl+R` (P): Grid文脈、main一覧専用。操作カスタマイズでは
+  サムネイル一覧に表示。Everything検索バーのIME確定後Enter/検索ボタンが明示送信を行う。
+  名前だけでGlobalに分類せず、fullscreen active scopes/native転送へ追加しない。
 - GlobalLocalSearch `Ctrl+F` (P) / GlobalFavSearch `Ctrl+S` (P) /
   GlobalMetadataSearch `Ctrl+G` (P) / GlobalOpenFolder `Ctrl+O` (P) /
   ToggleDetachedViewerMode `F12` (P) / HelpShowContextShortcuts `?` (P)

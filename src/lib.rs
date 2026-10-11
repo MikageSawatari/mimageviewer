@@ -152,6 +152,8 @@ pub mod filename_stack;
 pub mod filename_stack_script;
 mod final_composite;
 // filename_stack_ui は private な App へ impl を追加する library-internal module。
+mod everything_ipc;
+mod everything_results;
 mod filename_stack_ui;
 pub mod folder_pane;
 pub mod folder_rating_counter;
@@ -168,6 +170,9 @@ pub mod fts_writer_dispatcher;
 pub mod gamepad;
 pub mod global_search;
 mod global_search_ui;
+pub use global_search_ui::{
+    draw_everything_progress_snapshot_fixture, draw_everything_search_snapshot_fixture,
+};
 pub mod gpu_info;
 #[cfg(any(test, feature = "dev-tools"))]
 pub mod gpu_lanczos_spike;

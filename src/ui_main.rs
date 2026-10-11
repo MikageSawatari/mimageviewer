@@ -7442,6 +7442,13 @@ impl App {
                                                 self.request_application_quit(ctx);
                                             }
                                         }
+                                        MenuCommandId::GlobalEverythingSearch => {
+                                            let label = self.keymap.menu_command_label(MenuCommandId::GlobalEverythingSearch);
+                                            if ui.add_enabled(self.everything_search_entry_allowed(), egui::Button::new(label)).clicked() {
+                                                self.open_everything_search();
+                                                ui.close();
+                                            }
+                                        }
                                         _ => {}
                                     }
                                 }
@@ -7513,6 +7520,13 @@ impl App {
                                             if ui.button(&metadata_search_menu_label).clicked() {
                                                 // 相互排他は toggle_global_search 内で
                                                 self.toggle_global_search();
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::GlobalEverythingSearch => {
+                                            let label = self.keymap.menu_command_label(MenuCommandId::GlobalEverythingSearch);
+                                            if ui.add_enabled(self.everything_search_entry_allowed(), egui::Button::new(label)).clicked() {
+                                                self.open_everything_search();
                                                 ui.close();
                                             }
                                         }
@@ -14396,7 +14410,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             self.show_search_bar || self.search_filter.is_some() || self.search_pending.is_some();
         // 検索の仮想階層でドリルイン中か (= ⬆ で 1 段戻れる / ▲▼ で前後ヒットへ
         // 動ける状態。最上位ではこれらを disabled にする条件)。
-        let search_drilled_in = (self.global_search.active && self.global_search.drill.is_some())
+        let search_drilled_in = (self.global_search.active
+            && (self.global_search.drill.is_some() || self.everything_has_physical_child()))
             || (self.favsearch.active && !self.favsearch.nav_stack.is_empty())
             || (self.tag_view.active && !self.tag_view.nav_stack.is_empty());
         let search_tree_drilled_in = (self.global_search.active

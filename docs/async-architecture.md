@@ -5,6 +5,48 @@
 
 ---
 
+## Everything の取得と共通Search採用（§1.374、未リリース）
+
+`GlobalSearchState.pending` の `SearchProducer` がMetadata/Everythingを排他に所有し、
+Everythingのrun/query/context/items generation/送信時policyと取消tokenを保持する。
+送信時policyは同producer内の`Box<Settings>`に置き、未実行時のApp/bundleへ大きいSettingsを
+インラインで持ち込まない。immutable snapshotの所有・移譲・freshness契約は同じである。
+取得中はmain contextの取消可能modalに集約し、open/navigation/別queryの組合せを増やさない。
+送信/本からの帰路のproducerは `SessionHandle::try_local_modal_lease()` の非Clone leaseも所有する。
+Remote acquireと同じsession mutex・typed ownerで受付を排他にするため、事前のUI bool検査後に
+Remoteが割り込む隙間を残さない。取消/失敗/採用/dropでleaseを解放する。
+公開phaseはLocalのままで兄弟窓を止めず、Remote wire schema/APIに検索を追加しない。
+送信と結果待ちは `SearchPageEditPrepare` のworkerから `everything_ipc` を呼ぶ。
+専用不可視reply windowとmessage pumpはtransportのRAII ownerが持ち、egui/HWNDを流用しない。
+
+送信は1秒、reply待ちは送信開始から30秒まで。`WM_COPYDATA` callbackは16MiBの上限とrequest IDを
+確認してowned bytesへコピーし、UTF-16/table/offset解釈と候補stat/DB準備はcallback外のworkerで行う。
+queryは終端を含む32,768 UTF-16 unitsまで、raw件数は10,000、offsetは0でpagingしない。
+取消/close/source切替/context retireは同じdrop/cancel境界へ通す。UIはworkerをjoinしない。
+取消時は同じreply HWNDへ`nothing:`を一度だけbounded送信して破棄し、応答や相手の停止を待たない。
+
+validated replyは `EverythingDataset` に分類・statし、`SearchProjection::Everything` から既存prepareへ
+渡す。sort/facet/編集metadataと完成items/metasを準備してから一回のadoptionで公開する。
+古いrun/context/generation/policyの完了は副作用を公開しない。sortや本からの帰路では保持datasetを
+同じprepare workerで再利用し、Everythingへ問い合わせない。UIに新しいFS/DB/IPC待機を追加しない。
+旧dataset/準備済みpayload/receiverの退役は既存smart-folder payload退役workerへ渡し、
+10,000行の最終解放やworker joinをUIで行わない。I/O permit数も送信時settings snapshotに保持する。
+IPCのversion/readiness/send/reply-copy/wait/parseは既存perf sinkへ件数・byte・時間だけを記録する。
+classify/prepare/adoptはrun/context/件数・時間を記録し、queryや全結果pathは記録しない。
+Everythingのprepareは初期化済みpin DB handleとtags DBの実pathを取得し、pin/タグ/変換書庫Pending状態を
+workerで準備する。UIは既存prepared aggregate installとmap交換だけを行い、通常installの
+`refresh_folder_pin_map` / `prewarm_grid_tags` の同期DB照会を通らない。TAG_WRITESとpin handle/revisionが
+準備後に変われば、既存の通常write freshness再投影に戻す。新しい失敗回復やworker ownerは作らない。
+同一datasetのsort/facetだけがrating membershipを移譲し、新queryの候補は新sourceとして採用する。
+共通neighbor判定の旧/新集合交差はHashSetで行い、大量のdisjoint集合でUIの二乗探索をしない。
+
+thumbnail channel/queue/cancel/generationは既存context ownerを維持し、一覧交換はmainのPDF ticketだけを
+失効する。PDF prerequisiteは `4510346f5`（master `c1e66f589`、独立ACCEPT）であり、同pathのdetached兄弟へ
+無関係な失効を出さない。Remoteへsource/query/listを公開せず、既存local-control lockを守る。
+まれな失敗はlog＋通知、採用前の一覧保持で扱い、retry/recovery state/DB再作成は増やさない。
+自動検証と既知のEOF timing failureの再確認は台帳に記録する。独立実装レビュー・実機確認は未完了。
+[設計・検証台帳](everything-search-plan.md#14-実装記録2026-10-12)。
+
 ## PDF render の viewer-context 所有（PDF-EPOCH-OWNERSHIP、未リリース）
 
 `App` のmounted投影と `ViewerContextBundle` が非Cloneの `PdfRenderEpochOwner` を
