@@ -417,3 +417,57 @@ OS error 1455なし。実装者による追加の独立レビューは行って�
 
 実Everything compatibility/性能/日本語query/本open-back/F12は、利用者が通常profile確認binaryを
 起動する別証拠とする。agentは通常profile binaryを起動しない。確認build後に独立reviewへ渡す。
+
+## 15. 実Everything SendFailed調査（2026-10-12）
+
+利用者はHEAD `3ce0040d3` のdev buildを隔離`--data-dir`で起動し、
+Everything 1.4.1.1032（利用者申告）の`genshin_random yaoyao`でSendFailedを観測した。
+利用者ログ`target/ev-try/data/logs/mimageviewer.log`は読取のみとし、agentはmIVを起動していない。
+
+`everything_ipc::native::adapter_tests::real_everything_diagnostic_probe`は明示実行専用の
+ignored test executableであり、製品のdiscovery/encode/send/pump/parserを呼ぶ。
+自動gateは常にskipし、実Everythingをテストの依存先にしない。queryは明示環境変数からだけ読む。
+Codex実行環境の専用desktopではFindWindowがUnavailableだったため、このprobeのthreadだけを
+入力desktopへ割り当てて測定した。表示desktopの切替・mIV起動・Everythingの再起動や設定変更はしない。
+desktop操作は`cfg(test)`内のこのignored probeに限定し、製品のtransportに追加していない。
+
+現在の観測（`target/EV-1374-real-probe-final.log`）:
+
+- FindWindow class=`EVERYTHING_TASKBAR_NOTIFICATION`、title=NULL、target HWND=`0x47e21d8`、
+  PID=91556、thread=79152。`IsHungAppWindow=true`。
+- 返信用message-only HWNDは同じprobe workerで生成・破棄。最初のWM_USER/major照会で
+  `SendMessageTimeoutW`が0、response=0、直前にクリアしたGetLastErrorも0。約0.01秒で失敗する。
+  minor/revision/build/DB-loaded/admin照会も失敗し、版・索引準備状態をIPCでは取得できなかった。
+- SMTO_NORMALまたはERRORONEXITだけの補助送信でも1秒timeout、error=1460。
+  ABORTIFHUNG入りでは即座にgeneric failure、error=0。延長やflag変更を製品へ採用していない。
+- QUERY2Wはid=18、packed header=28、今回のpacket=72 bytes。
+  QUERY1Wはid=2、header=20、packet=64 bytes。両方とも同じ送信失敗でcallbackに到達しない。
+  x64 native COPYDATASTRUCTは24 bytes、dwData/cbData/lpDataのoffset=0/8/16。
+- process tokenの補助読取ではprobe/Everythingとも非昇格、integrity RID=8192（medium）。
+  返信HWNDだけのChangeWindowMessageFilterEx(WM_COPYDATA, ALLOW)は成功したが、送信失敗は変わらない。
+  これを権限差や返信filter不足の修正根拠にせず、製品のmessage filterは変更しない。
+
+要求形式は[作者の公開header](https://github.com/voidtools/ES/blob/main/src/everything_ipc.h)と一致する。
+error=0も失敗として扱い、事前クリアする方法は
+[Microsoft SendMessageTimeoutW](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendmessagetimeoutw)に従う。
+[ChangeWindowMessageFilterEx](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-changewindowmessagefilterex)
+は受信windowのfilterだけに作用し、相手threadの応答停止を解決しない。
+公開textを閲覧しただけで、SDK/header/DLL等のdownloadは行っていない。
+
+この時点で確認した失敗地点はEverything通知windowの応答停止であり、検索packetを送る前である。
+Everything内部の停止理由と、応答するclientでの互換性は未確定。利用者へ直接検索の応答確認を依頼した。
+wire/layout/filterの欠陥と断定して修正を作らない。製品側の変更は失敗したmessage/status番号と
+Win32 errorの非blocking診断を加えること。query/result pathは記録せず、既定のlog＋通知と明示再検索を保つ。
+fake HWNDのversion handlerを停止させる回帰で、bounded failure・query/cancel/retry未送信・
+reply HWND破棄を検証する。既存fake codec/再入callback/cancel回帰は維持する。
+検索・adoption・UI・keymap・Remote・viewer-context ownershipは変更しない。
+
+この差分の検証はIPC 14 passed / 1 ignored、関連`--lib everything` 60 passed / 1 ignored。
+normal/portable core check、fmt、UI glyph（危険文字0）、diff --checkは成功。
+source/UI/ownerの無変更部分の先行検証は§14.4を再利用し、full lib/UI snapshotを再実行していない。
+`scripts/build-dev.ps1 -PreserveRuntime`はexit 0。実行直前にこのworktreeのcoreなしを確認した
+（`target/EV-1374-ipc-fix-process-check.txt`、global core数も0）。
+新coreは2026-10-12 04:29:59、325,150,208 bytes。agentによるmIV起動なし。
+詳細ログは`target/EV-1374-ipc-fix-{tests,everything,check-normal,check-portable,build-dev}.log`。
+manual real probeのexit 101は上記の外部client応答停止の観測であり、fake自動gateの失敗に数えない。
+実検索成功・Everything内部の停止理由・必要な製品修正の特定は残る。結果を「IPC修正済み」と扱わない。

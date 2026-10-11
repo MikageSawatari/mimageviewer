@@ -21,6 +21,18 @@ const GET_MINOR: usize = 1;
 const GET_REVISION: usize = 2;
 const IS_DB_LOADED: usize = 401;
 
+// Opt-in, ignored test executable only; ordinary tests never discover Everything.
+#[cfg(test)]
+thread_local! { static PROBE_TRACE: Cell<bool> = const { Cell::new(false) }; }
+macro_rules! probe_trace {
+    ($($arg:tt)*) => {
+        #[cfg(test)]
+        PROBE_TRACE.with(|enabled| {
+            if enabled.get() { eprintln!($($arg)*); }
+        });
+    };
+}
+
 struct CallbackState {
     active_id: Cell<Option<u32>>,
     packet: RefCell<Option<Result<EndpointReply, EverythingError>>>,
@@ -45,6 +57,11 @@ unsafe extern "system" fn reply_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: L
         }
         let state = unsafe { &*state };
         let cds = unsafe { &*(lp.0 as *const COPYDATASTRUCT) };
+        probe_trace!(
+            "reply WM_COPYDATA: hwnd={hwnd:?}, sender={wp:?}, id={}, bytes={}",
+            cds.dwData,
+            cds.cbData
+        );
         let Some(active_id) = state.active_id.get() else {
             return LRESULT(0);
         };
@@ -123,8 +140,10 @@ pub(super) struct WindowsEndpoint {
 
 impl WindowsEndpoint {
     pub(super) fn discover() -> Result<Self, EverythingError> {
+        probe_trace!("FindWindowW: class=EVERYTHING_TASKBAR_NOTIFICATION, title=NULL");
         let target = unsafe { FindWindowW(w!("EVERYTHING_TASKBAR_NOTIFICATION"), None) }
             .map_err(|_| EverythingError::Unavailable)?;
+        probe_trace!("FindWindowW: target={target:?}");
         Self::for_window(target)
     }
 
@@ -165,6 +184,10 @@ impl WindowsEndpoint {
                 (&*callback as *const CallbackState) as isize,
             )
         };
+        probe_trace!(
+            "reply HWND created: {reply:?}, parent=HWND_MESSAGE, worker thread={}",
+            unsafe { GetCurrentThreadId() }
+        );
         Ok(Self {
             target,
             reply,
@@ -182,6 +205,9 @@ impl WindowsEndpoint {
         timeout: Duration,
     ) -> Result<usize, EverythingError> {
         let mut response = 0usize;
+        unsafe {
+            windows::Win32::Foundation::SetLastError(windows::Win32::Foundation::WIN32_ERROR(0))
+        };
         // No SMTO_BLOCK: sent-message callbacks must remain dispatchable during send.
         // No NOTIMEOUTIFNOTHUNG: each send remains bounded even when the peer pumps.
         let sent = unsafe {
@@ -195,7 +221,20 @@ impl WindowsEndpoint {
                 Some(&mut response),
             )
         };
+        let last_error = unsafe { windows::Win32::Foundation::GetLastError() };
+        probe_trace!(
+            "SendMessageTimeoutW: message={message:#x}, wp={}, sent={}, response={response}, last_error={}, timeout_ms={}",
+            wp.0,
+            sent.0,
+            last_error.0,
+            timeout.as_millis()
+        );
         if sent.0 == 0 {
+            crate::logger::log(format!(
+                "everything IPC send failed: message={message:#x}, status_code={}, win32_error={}",
+                if message == WM_USER { wp.0 } else { 0 },
+                last_error.0
+            ));
             Err(EverythingError::SendFailed)
         } else {
             Ok(response)
@@ -250,6 +289,16 @@ impl EverythingEndpoint for WindowsEndpoint {
             cbData: u32::try_from(bytes.len()).map_err(|_| EverythingError::QueryTooLong)?,
             lpData: bytes.as_ptr().cast_mut().cast(),
         };
+        probe_trace!(
+            "query v2: COPYDATA id={}, native sizeof={} offsets=({}, {}, {}), packed header={}, packet={}",
+            cds.dwData,
+            std::mem::size_of::<COPYDATASTRUCT>(),
+            std::mem::offset_of!(COPYDATASTRUCT, dwData),
+            std::mem::offset_of!(COPYDATASTRUCT, cbData),
+            std::mem::offset_of!(COPYDATASTRUCT, lpData),
+            QUERY_HEADER_BYTES,
+            bytes.len()
+        );
         let accepted = self.send_message(
             WM_COPYDATA,
             WPARAM(self.reply.0 as usize),
@@ -270,6 +319,9 @@ impl EverythingEndpoint for WindowsEndpoint {
         cancel: &CancelHandle,
         deadline: Duration,
     ) -> Result<EndpointReply, EverythingError> {
+        probe_trace!(
+            "message pump: PeekMessageW/DispatchMessageW + MsgWaitForMultipleObjectsEx, deadline={deadline:?}"
+        );
         loop {
             cancelled(cancel)?;
             if self.elapsed() >= deadline {
@@ -333,12 +385,143 @@ mod adapter_tests {
 
     const STOP: u32 = WM_APP + 291;
 
+    // This test executable may start on Codex's isolated desktop. Bind only its
+    // probe thread to the input desktop before creating any HWND. This does not
+    // switch the visible desktop, launch mIV, or modify Everything's windows.
+    // Win32 OpenInputDesktop/SetThreadDesktop/CloseDesktop documented contracts.
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn OpenInputDesktop(flags: u32, inherit: i32, access: u32) -> *mut std::ffi::c_void;
+        fn SetThreadDesktop(desktop: *mut std::ffi::c_void) -> i32;
+        fn CloseDesktop(desktop: *mut std::ffi::c_void) -> i32;
+        fn GetThreadDesktop(thread: u32) -> *mut std::ffi::c_void;
+    }
+    struct ProbeDesktop(*mut std::ffi::c_void, *mut std::ffi::c_void);
+    impl Drop for ProbeDesktop {
+        fn drop(&mut self) {
+            unsafe {
+                SetThreadDesktop(self.1);
+                CloseDesktop(self.0);
+            }
+        }
+    }
+
+    /// Manual standalone probe, explicitly excluded from every automated gate.
+    /// Runs the product discovery/codec/send/pump/parser without starting mIV.
+    #[test]
+    #[ignore = "manual real Everything probe; requires explicit authorization"]
+    fn real_everything_diagnostic_probe() {
+        PROBE_TRACE.with(|enabled| enabled.set(true));
+        // DESKTOP_READOBJECTS | DESKTOP_CREATEWINDOW | DESKTOP_WRITEOBJECTS.
+        let desktop = ProbeDesktop(unsafe { OpenInputDesktop(0, 0, 0x83) }, unsafe {
+            GetThreadDesktop(GetCurrentThreadId())
+        });
+        assert!(!desktop.0.is_null(), "OpenInputDesktop: {:?}", unsafe {
+            windows::Win32::Foundation::GetLastError()
+        });
+        assert_ne!(
+            unsafe { SetThreadDesktop(desktop.0) },
+            0,
+            "SetThreadDesktop: {:?}",
+            unsafe { windows::Win32::Foundation::GetLastError() }
+        );
+        eprintln!("probe thread bound to input desktop (no visible desktop switch)");
+        eprintln!(
+            "native COPYDATASTRUCT: size={}, offsets dwData={}, cbData={}, lpData={}",
+            std::mem::size_of::<COPYDATASTRUCT>(),
+            std::mem::offset_of!(COPYDATASTRUCT, dwData),
+            std::mem::offset_of!(COPYDATASTRUCT, cbData),
+            std::mem::offset_of!(COPYDATASTRUCT, lpData)
+        );
+        let query = std::env::var("MIV_EVERYTHING_PROBE_QUERY")
+            .expect("set MIV_EVERYTHING_PROBE_QUERY explicitly");
+        let cancel = CancelHandle::new().unwrap();
+        let mut endpoint = WindowsEndpoint::discover().unwrap();
+        let mut pid = 0;
+        let tid = unsafe { GetWindowThreadProcessId(endpoint.target, Some(&mut pid)) };
+        eprintln!(
+            "target pid={pid}, thread={tid}, hung={}",
+            unsafe { IsHungAppWindow(endpoint.target) }.as_bool()
+        );
+        let result = query_with_endpoint(&query, &cancel, &mut endpoint);
+        eprintln!(
+            "product result: {:?}",
+            result
+                .as_ref()
+                .map(|r| (r.rows.len(), r.total_items, r.actual_sort))
+        );
+        for code in [GET_MINOR, GET_REVISION, 3, IS_DB_LOADED, 403] {
+            eprintln!(
+                "additional read-only status {code}: {:?}",
+                endpoint.status(code)
+            );
+        }
+        let mut filter = CHANGEFILTERSTRUCT {
+            cbSize: std::mem::size_of::<CHANGEFILTERSTRUCT>() as u32,
+            ..Default::default()
+        };
+        let allowed = unsafe {
+            ChangeWindowMessageFilterEx(
+                endpoint.reply,
+                WM_COPYDATA,
+                MSGFLT_ALLOW,
+                Some(&mut filter),
+            )
+        };
+        eprintln!(
+            "reply-only WM_COPYDATA filter allow: {allowed:?}, ExtStatus={:?}",
+            filter.ExtStatus
+        );
+        for v2 in [true, false] {
+            let id = if v2 { 0x137402 } else { 0x137401 };
+            let packet = encode_query(&query, endpoint.reply_hwnd(), id).unwrap();
+            let v1;
+            let bytes = if v2 {
+                &packet
+            } else {
+                v1 = [&packet[..20], &packet[28..]].concat();
+                &v1
+            };
+            endpoint.activate(id);
+            let cds = COPYDATASTRUCT {
+                dwData: if v2 { 18 } else { 2 },
+                cbData: bytes.len() as u32,
+                lpData: bytes.as_ptr().cast_mut().cast(),
+            };
+            eprintln!(
+                "diagnostic query v{}: COPYDATA id={}, header={}, packet={}",
+                if v2 { 2 } else { 1 },
+                cds.dwData,
+                if v2 { 28 } else { 20 },
+                bytes.len()
+            );
+            let sent = endpoint.send_message(
+                WM_COPYDATA,
+                WPARAM(endpoint.reply.0 as usize),
+                LPARAM((&cds as *const COPYDATASTRUCT) as isize),
+                SEND_TIMEOUT,
+            );
+            eprintln!("diagnostic query send: {sent:?}");
+            if matches!(sent, Ok(1)) {
+                let deadline = endpoint.elapsed() + REPLY_TIMEOUT;
+                let reply = endpoint.wait(&cancel, deadline);
+                eprintln!(
+                    "diagnostic reply: {:?}",
+                    reply.as_ref().map(|r| r.bytes.len())
+                );
+            }
+            endpoint.deactivate();
+        }
+        assert!(result.is_ok(), "product IPC path failed: {result:?}");
+    }
+
     enum Mode {
         Immediate,
         WrongThenImmediate,
         Malformed,
         Reject,
         Cancel(CancelHandle),
+        StallStatus(CancelHandle),
     }
 
     struct ServerState {
@@ -358,6 +541,20 @@ mod adapter_tests {
             return LRESULT(0);
         }
         if message == WM_USER {
+            let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const ServerState;
+            if !ptr.is_null() && wp.0 == GET_MAJOR {
+                if let Mode::StallStatus(release) = &unsafe { &*ptr }.mode {
+                    // Fake client stops pumping at the first version request. The
+                    // test releases it after observing the bounded send failure.
+                    // A safety deadline lets teardown finish even after a panic.
+                    unsafe {
+                        windows::Win32::System::Threading::WaitForSingleObject(
+                            HANDLE(release.inner.event.as_raw_handle()),
+                            5000,
+                        );
+                    }
+                }
+            }
             return LRESULT(match wp.0 {
                 GET_MAJOR => 1,
                 GET_MINOR => 4,
@@ -499,6 +696,24 @@ mod adapter_tests {
             let _ = unsafe { PostMessageW(Some(self.hwnd), STOP, WPARAM(0), LPARAM(0)) };
             self.thread.take().unwrap().join().unwrap();
         }
+    }
+
+    #[test]
+    fn fake_hwnd_stalled_version_is_bounded_and_does_not_send_query() {
+        let release = CancelHandle::new().unwrap();
+        let server = FakeServer::new(Mode::StallStatus(release.clone()));
+        let mut endpoint = WindowsEndpoint::for_window(server.hwnd).unwrap();
+        let result = query_with_endpoint("a", &CancelHandle::new().unwrap(), &mut endpoint);
+        // Unblock fake client before asserting, including on failure paths.
+        release.cancel();
+        assert_eq!(result, Err(EverythingError::SendFailed));
+        assert!(
+            server.requests.try_recv().is_err(),
+            "no query/cancel/retry after failed version send"
+        );
+        let reply_hwnd = endpoint.reply;
+        drop(endpoint);
+        assert!(!unsafe { IsWindow(Some(reply_hwnd)) }.as_bool());
     }
 
     #[test]

@@ -19,6 +19,12 @@ Remoteが割り込む隙間を残さない。取消/失敗/採用/dropでlease�
 送信と結果待ちは `SearchPageEditPrepare` のworkerから `everything_ipc` を呼ぶ。
 専用不可視reply windowとmessage pumpはtransportのRAII ownerが持ち、egui/HWNDを流用しない。
 
+Win32送信失敗はworker内で、`SendMessageTimeoutW`直前にlast-errorを0へクリアし、
+戻り値直後の`GetLastError`とmessage/status番号だけを通常の非blocking loggerへ記録する。
+応答停止したclientへのversion照会失敗ではqueryを送らず、reply HWNDをRAIIで破棄する。
+retry・送信期限の延長・IPC versionのfallbackは行わない。実clientの応答停止を調べる
+手動のignored probeとfake HWND回帰は[調査記録](everything-search-plan.md#15-実everything-sendfailed調査2026-10-12)を参照。
+
 送信は1秒、reply待ちは送信開始から30秒まで。`WM_COPYDATA` callbackは16MiBの上限とrequest IDを
 確認してowned bytesへコピーし、UTF-16/table/offset解釈と候補stat/DB準備はcallback外のworkerで行う。
 queryは終端を含む32,768 UTF-16 unitsまで、raw件数は10,000、offsetは0でpagingしない。
