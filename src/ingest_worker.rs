@@ -13,8 +13,8 @@
 //!    物理削除。
 //!
 //! 順序不変条件: SQLite の書き込みは Tantivy commit が成功したフレームのみ実施する
-//! (Tantivy First)。途中でクラッシュした場合は次回起動時の reconciliation / walker
-//! 3-way diff (FS / Tantivy / SQLite) で復旧する。
+//! (Tantivy First)。FS/SQLite の走査は Tantivy の欠落を証明・補修しない。
+//! 書込/reload失敗は共通reporterのログ+通知+durable pendingから次回起動の再構築へ渡す。
 //!
 //! ## バッチサイズ
 //!
@@ -29,7 +29,7 @@
 //! ## キャンセル
 //!
 //! `Arc<AtomicBool>` でいつでも中断可能。Tantivy commit 前に中断された分は SQLite に
-//! 反映していないので、次回起動時の walker 3-way diff で「FS にあるが SQLite に無い」
+//! 反映していないので、次回起動時の walker で「FS にあるが SQLite に無い」
 //! として再 `to_ingest` 候補に拾われる。
 //!
 //! ## v1 スコープ
@@ -132,7 +132,7 @@ impl<'a> IngestSession<'a> {
         let mut batch_deletes: Vec<String> = Vec::new();
         // ingest 候補のメタ情報。Tantivy commit が成功した後に upsert_meta_ok で
         // SQLite に書く (Tantivy First 順序)。クラッシュ時は SQLite に行が無いので
-        // walker の 3-way diff で再 ingest 候補に拾われる。
+        // walker の FS/SQLite 比較で再 ingest 候補に拾われる。
         let mut pending_ok_meta: Vec<(String, IndexKind, i64, i64)> = Vec::new();
         let mut last_flush = Instant::now();
         let ingest_total = to_ingest.len();
@@ -141,10 +141,8 @@ impl<'a> IngestSession<'a> {
         // sub-batch を dispatcher に投げて Tantivy commit 後に SQLite を更新するヘルパ。
         // ingest: Tantivy commit → SQLite upsert_meta_ok (status=Ok)
         // delete: Tantivy commit → SQLite delete_paths
-        // どちらも Tantivy First で書き、commit が失敗 / クラッシュした場合は次回起動の
-        // walker / reconciliation で復旧する (Tantivy にあるが SQLite に無い doc も
-        // 「FS にあるけど DB に無い」 / 「FS に無いし DB に無い」のいずれかとして
-        // 検出可能)。
+        // commit/reload failure は dispatcher が返信前に報告する。
+        // SQLite failure はここがorigin。一度だけ報告し、runtimeでwipe/retryしない。
         let flush_batch = |batch_upserts: &mut Vec<IndexDoc>,
                            batch_deletes: &mut Vec<String>,
                            pending_ok_meta: &mut Vec<(String, IndexKind, i64, i64)>|
@@ -186,6 +184,10 @@ impl<'a> IngestSession<'a> {
                         *file_size,
                     )
                     .map_err(|e| {
+                        writer.report_failure(
+                            &format!("ingest favorite={} upsert_meta_ok({key})", self.favorite_id),
+                            &e,
+                        );
                         tantivy::TantivyError::SystemError(format!(
                             "ingest: upsert_meta_ok({key}) failed: {e}"
                         ))
@@ -195,6 +197,14 @@ impl<'a> IngestSession<'a> {
                 self.meta_db
                     .delete_paths(&deletes_for_sqlite)
                     .map_err(|e| {
+                        writer.report_failure(
+                            &format!(
+                                "ingest favorite={} delete_paths batch={}",
+                                self.favorite_id,
+                                deletes_for_sqlite.len()
+                            ),
+                            &e,
+                        );
                         tantivy::TantivyError::SystemError(format!(
                             "ingest: delete_paths failed: {e}"
                         ))
@@ -266,7 +276,7 @@ impl<'a> IngestSession<'a> {
             match built {
                 Ok(doc) => {
                     // fts_meta には **差分用** 署名 (画像 + サイドカーを織り込んだ diff_mtime/
-                    // diff_size) を保存する。walker の 3-way diff がこれと比較してサイドカーの
+                    // diff_size) を保存する。walker の FS/SQLite comparison がこれと比較してサイドカーの
                     // 追加/編集/削除を検出する。Tantivy doc 側 (`doc.mtime`) は画像本体の mtime の
                     // ままで、日付ソートはサイドカー編集時刻に引きずられない (docs §14-4)。
                     pending_ok_meta.push((
@@ -530,9 +540,12 @@ mod tests {
     #[test]
     fn sqlite_failure_is_reported_and_allows_later_success() {
         let (tmp, meta, fts) = setup();
-        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(
+        let meta = std::sync::Arc::new(meta);
+        let reporter = crate::fts_integrity::FailureReporter::new(meta.clone());
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start_with_reporter(
             fts.writer().unwrap(),
             fts.clone(),
+            reporter.clone(),
         );
         let db = rusqlite::Connection::open(tmp.path().join("meta.db")).unwrap();
         db.execute_batch("CREATE TRIGGER fail_ingest BEFORE INSERT ON files BEGIN SELECT RAISE(FAIL, 'injected SQLite failure'); END;").unwrap();
@@ -555,6 +568,11 @@ mod tests {
                 .is_err()
         );
         assert!(meta.get(&failed_key).unwrap().is_none());
+        assert!(meta.tantivy_rebuild_pending().unwrap());
+        assert_eq!(
+            reporter.take_notifications(),
+            vec![crate::fts_integrity::UPDATE_FAILURE_NOTICE]
+        );
         db.execute_batch("DROP TRIGGER fail_ingest;").unwrap();
         session
             .apply(
@@ -567,14 +585,87 @@ mod tests {
                 None,
             )
             .unwrap();
+        assert!(
+            meta.tantivy_rebuild_pending().unwrap(),
+            "later success is not a consistency proof"
+        );
+        assert!(reporter.take_notifications().is_empty());
+    }
+
+    #[test]
+    fn delete_failures_can_leave_old_ok_without_document_but_never_without_pending() {
+        for fail_sqlite in [false, true] {
+            let (tmp, meta, fts) = setup();
+            let meta = std::sync::Arc::new(meta);
+            let reporter = crate::fts_integrity::FailureReporter::new(meta.clone());
+            let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start_with_reporter(
+                fts.writer().unwrap(),
+                fts.clone(),
+                reporter.clone(),
+            );
+            let session = IngestSession::new(Uuid::new_v4(), tmp.path().to_path_buf(), &meta, &fts);
+            let cancel = AtomicBool::new(false);
+            let sem = GlobalIoSemaphore::new(2);
+            let file = make_image_file(tmp.path(), "old.jpg");
+            let key = file.key.clone();
+            session
+                .apply(
+                    vec![file],
+                    Vec::new(),
+                    &writer,
+                    &sem,
+                    IoPriority::Low,
+                    &cancel,
+                    None,
+                )
+                .unwrap();
+            let observer = rusqlite::Connection::open(tmp.path().join("meta.db")).unwrap();
+            if fail_sqlite {
+                observer.execute_batch("CREATE TRIGGER fail_delete BEFORE DELETE ON files BEGIN SELECT RAISE(FAIL, 'injected delete failure'); END;").unwrap();
+            } else {
+                writer.test_set_reload_failure(true);
+            }
+            assert!(
+                session
+                    .apply(
+                        Vec::new(),
+                        vec![key.clone()],
+                        &writer,
+                        &sem,
+                        IoPriority::Low,
+                        &cancel,
+                        None
+                    )
+                    .is_err()
+            );
+            fts.reload_reader().unwrap();
+            assert!(
+                fts_index::find_doc_by_path(&fts.searcher(), fts.fields(), &key)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                meta.get(&key).unwrap().is_some(),
+                "the old Ok can survive either boundary error"
+            );
+            assert!(meta.tantivy_rebuild_pending().unwrap());
+            assert_eq!(
+                reporter.take_notifications(),
+                vec![crate::fts_integrity::UPDATE_FAILURE_NOTICE]
+            );
+            writer.test_set_reload_failure(false);
+        }
     }
 
     #[test]
     fn reader_reload_failure_prevents_sqlite_publication() {
         let (tmp, meta, fts) = setup();
-        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(
+        let meta = std::sync::Arc::new(meta);
+        let reporter = crate::fts_integrity::FailureReporter::new(meta.clone());
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start_with_reporter(
             fts.writer().unwrap(),
             fts.clone(),
+            reporter.clone(),
         );
         let cancel = AtomicBool::new(false);
         let session = IngestSession::new(Uuid::new_v4(), tmp.path().to_path_buf(), &meta, &fts);
@@ -596,6 +687,11 @@ mod tests {
                 .is_err()
         );
         assert!(meta.get(&key).unwrap().is_none());
+        assert!(meta.tantivy_rebuild_pending().unwrap());
+        assert_eq!(
+            reporter.take_notifications(),
+            vec![crate::fts_integrity::UPDATE_FAILURE_NOTICE]
+        );
         writer.test_set_reload_failure(false);
         session
             .apply(
@@ -608,6 +704,104 @@ mod tests {
                 None,
             )
             .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn actual_commit_persist_failure_prevents_sqlite_ok_and_reserves_rebuild_once() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let (tmp, meta, fts) = setup();
+        let meta = std::sync::Arc::new(meta);
+        let reporter = crate::fts_integrity::FailureReporter::new(meta.clone());
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start_with_reporter(
+            fts.writer().unwrap(),
+            fts.clone(),
+            reporter.clone(),
+        );
+        assert!(!meta.tantivy_rebuild_pending().unwrap());
+        let meta_path = tmp.path().join("fts_index/meta.json");
+        let old_meta = fs::read(&meta_path).unwrap();
+        // FILE_SHARE_READ | FILE_SHARE_WRITE without FILE_SHARE_DELETE. This
+        // exercises the patched Tantivy commit, not a mocked Result or hook.
+        let blocker = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1 | 2)
+            .open(&meta_path)
+            .unwrap();
+        let cancel = AtomicBool::new(false);
+        let session = IngestSession::new(Uuid::new_v4(), tmp.path().to_path_buf(), &meta, &fts);
+        let sem = GlobalIoSemaphore::new(2);
+        let failed = make_image_file(tmp.path(), "commit_denied.jpg");
+        let failed_key = failed.key.clone();
+        // Call apply once and keep the blocker throughout all four atomic
+        // persist attempts. The product does not retry the whole commit/apply.
+        let error = session
+            .apply(
+                vec![failed],
+                vec![],
+                &writer,
+                &sem,
+                IoPriority::Low,
+                &cancel,
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, tantivy::TantivyError::IoError(ref io_error)
+                if matches!(io_error.raw_os_error(), Some(5 | 32 | 33))),
+            "expected an actual Windows persist error: {error:?}"
+        );
+        assert!(meta.get(&failed_key).unwrap().is_none());
+        assert_eq!(fs::read(&meta_path).unwrap(), old_meta);
+        assert_eq!(
+            reporter.take_notifications(),
+            vec![crate::fts_integrity::UPDATE_FAILURE_NOTICE]
+        );
+        assert_eq!(
+            reporter.snapshot(),
+            crate::fts_integrity::MaintenanceState::RebuildOnRestart
+        );
+        let observer = rusqlite::Connection::open_with_flags(
+            tmp.path().join("meta.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let pending: i64 = observer
+            .query_row(
+                "SELECT value FROM index_state WHERE key='tantivy_rebuild_pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 1, "rebuild request must already be durable");
+
+        drop(blocker);
+        let recovered = make_image_file(tmp.path(), "later_success.jpg");
+        let recovered_key = recovered.key.clone();
+        let stats = session
+            .apply(
+                vec![recovered],
+                vec![],
+                &writer,
+                &sem,
+                IoPriority::Low,
+                &cancel,
+                None,
+            )
+            .unwrap();
+        assert_eq!(stats.ingested_ok, 1);
+        assert_eq!(
+            meta.get(&recovered_key).unwrap().unwrap().status,
+            FileStatus::Ok
+        );
+        assert!(meta.get(&failed_key).unwrap().is_none());
+        assert!(meta.tantivy_rebuild_pending().unwrap());
+        assert_eq!(
+            reporter.snapshot(),
+            crate::fts_integrity::MaintenanceState::RebuildOnRestart
+        );
+        assert!(reporter.take_notifications().is_empty());
     }
 
     #[test]

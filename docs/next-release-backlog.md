@@ -41,6 +41,7 @@
 - 回帰: Full DB failure、watcher削除/upsert/prune failureの通知・名前索引marker・成功件数、正常Full/watchと不完全FS観測時のprune抑止。着手/リリース優先度は別件として管理担当が決める。
 
 ### 1.367 アイテム検索 (Ctrl+G) の全文索引が空になっても「登録済み」のまま直らない — 利用者報告・調査 (2026-10-10)
+- **実装済み・通常構成の検証 PASS (2026-10-11、未コミット)**: 正本は [FTS 整合計画 R3・実装記録](fts-integrity-plan.md)。Windows persist 限定の有界再試行、同期/非同期 publication failure の log+通知+durable pending、破棄前の SQLite reset、pending 時の旧索引 probe 省略、Full の型付き失敗/共有 maintenance 表示と文書訂正を実装した。独立実装レビュー、fmt/core/portable check、narrow回帰、patched Tantivyの11件、最終full gateと通常featureの確認用buildは PASS。起動点検は feature opt-in・既定 OFFで、feature付き追加検証は一時directoryのACLによる環境blockが残る ([実装記録§12](fts-integrity-plan.md#12-実装記録-2026-10-11受理済み-r3-本文は維持))。[隔離 A/B 手順と解析器](fts-startup-ab-measurement.md) と840,464件の非対話 fixture 計測を用意したが、全条件の起動計測・遅延なしの証明・点検採用は未実施。原事故の根本原因は未特定のまま。名前索引の実書込 failure 対応は §1.369 に残す。
 - **次の版の決定 (利用者 2026-10-10)**: 次の版に入れる。ただし起動時の点検は**起動時間を延ばさないこと**が条件。「終了中の変更を起動時に確認しない」設定の利用者には起動時間が重要なので、点検の処理時間が起動に影響するなら点検の実装は見送り、下の (2)(3) だけ行う。
 - 観測 (利用者): 以前は `klee` で 10,000 件の上限まで出ていた Ctrl+G 検索が、インストール版 v4.5.0 でも 0 件。検索結果に存在しないファイルが並ぶことがある (nextbook の確認用ビルドで観測、未調査)。
 - 調査 (ClaudeCode と Codex 読み取り調査、証拠は `target/fts-incident-2026-10-10/` の写し): `fts_meta.db` は 840,464 行がすべて status=Ok (Tantivy commit 済みの意味、`src/fts_meta.rs:7`)、一方 Tantivy (`fts_index/`) の生存文書は 399 件。399 件は 2026-10-10 18:04:55 以降に更新された行と完全一致し、古い文書だけが欠けた状態。消えた時期と原因は未特定 (perf ログは当日 19:55 以降しか残っていない)。各ブランチの FTS コードと schema は同一で、隔離 `--data-dir` は通常データを使わないため、今日の確認用ビルドが原因という説は支持されない。

@@ -18,7 +18,7 @@ use std::time::Duration;
 use eframe::egui;
 
 use crate::app::App;
-use crate::indexer_supervisor::SupervisorStats;
+use crate::indexer_supervisor::{FullScanOutcome, SupervisorStats};
 use crate::ui_helpers::{format_bytes, format_count, truncate_name};
 
 /// 全文検索インデックスの on-disk サイズ (bytes) を集計する。
@@ -57,7 +57,7 @@ pub(crate) struct IndexFileCounts {
 mod ownership_count_tests {
     use super::*;
 
-    fn progress_favorite(id: u128, path: &str) -> crate::settings::FavoriteEntry {
+    pub(super) fn progress_favorite(id: u128, path: &str) -> crate::settings::FavoriteEntry {
         crate::settings::FavoriteEntry {
             id: uuid::Uuid::from_u128(id),
             name: String::new(),
@@ -90,7 +90,7 @@ mod ownership_count_tests {
         );
         assert_eq!(
             metadata_progress_flags(&ownership, favorites[1].id, &stats),
-            Some((true, false))
+            Some(IndexScanState::Scanning)
         );
         stats.insert(
             favorites[0].id,
@@ -101,7 +101,7 @@ mod ownership_count_tests {
         );
         assert_eq!(
             metadata_progress_flags(&ownership, favorites[1].id, &stats),
-            Some((false, true))
+            Some(IndexScanState::Monitoring)
         );
     }
 
@@ -136,12 +136,12 @@ mod ownership_count_tests {
         stats.insert(favorites[1].id, SupervisorStats::default());
         assert_eq!(
             metadata_progress_flags(&ownership, favorites[0].id, &stats),
-            Some((false, false))
+            Some(IndexScanState::Preparing)
         );
         stats.get_mut(&favorites[1].id).unwrap().in_full_scan = true;
         assert_eq!(
             metadata_progress_flags(&ownership, favorites[0].id, &stats),
-            Some((true, false))
+            Some(IndexScanState::Scanning)
         );
         stats.insert(
             favorites[1].id,
@@ -152,7 +152,7 @@ mod ownership_count_tests {
         );
         assert_eq!(
             metadata_progress_flags(&ownership, favorites[0].id, &stats),
-            Some((false, true))
+            Some(IndexScanState::Monitoring)
         );
     }
 
@@ -234,7 +234,7 @@ fn metadata_progress_flags(
     ownership: &crate::metadata_ownership::MetadataOwnership,
     favorite_id: uuid::Uuid,
     stats: &std::collections::HashMap<uuid::Uuid, SupervisorStats>,
-) -> Option<(bool, bool)> {
+) -> Option<IndexScanState> {
     let owners = ownership.filter_set(favorite_id);
     if owners.is_empty() {
         return None;
@@ -242,13 +242,66 @@ fn metadata_progress_flags(
     let in_full_scan = owners
         .iter()
         .any(|id| stats.get(id).is_some_and(|s| s.in_full_scan));
-    let initial_scan_done = owners
+    if in_full_scan {
+        return Some(IndexScanState::Scanning);
+    }
+    let states: Option<Vec<_>> = owners
         .iter()
-        .all(|id| stats.get(id).is_some_and(|s| s.initial_scan_done));
-    if in_full_scan || owners.iter().all(|id| stats.contains_key(id)) {
-        Some((in_full_scan, initial_scan_done))
-    } else {
-        None
+        .map(|id| stats.get(id).map(metadata_scan_state))
+        .collect();
+    states.map(|states| {
+        // An outer favorite covers all owners: one unsuccessful Full must not
+        // be hidden by another owner's successful scan or active watcher.
+        for state in [
+            IndexScanState::Failed,
+            IndexScanState::Incomplete,
+            IndexScanState::Stopped,
+        ] {
+            if states.contains(&state) {
+                return state;
+            }
+        }
+        if states.iter().all(|s| *s == IndexScanState::Monitoring) {
+            IndexScanState::Monitoring
+        } else {
+            IndexScanState::Preparing
+        }
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IndexScanState {
+    Scanning,
+    Preparing,
+    Monitoring,
+    Failed,
+    Incomplete,
+    Stopped,
+}
+
+fn metadata_scan_state(stats: &SupervisorStats) -> IndexScanState {
+    if stats.in_full_scan {
+        return IndexScanState::Scanning;
+    }
+    match stats.last_full_outcome {
+        Some(FullScanOutcome::Failed) => IndexScanState::Failed,
+        Some(FullScanOutcome::Incomplete) => IndexScanState::Incomplete,
+        Some(FullScanOutcome::Stopped) => IndexScanState::Stopped,
+        _ if stats.initial_scan_done => IndexScanState::Monitoring,
+        _ => IndexScanState::Preparing,
+    }
+}
+
+fn name_scan_state(stats: &crate::name_index_supervisor::NameIndexStats) -> IndexScanState {
+    use crate::name_index_supervisor::NameFullScanOutcome;
+    if stats.in_full_scan {
+        return IndexScanState::Scanning;
+    }
+    match stats.last_full_scan {
+        Some(NameFullScanOutcome::Failed) => IndexScanState::Failed,
+        Some(NameFullScanOutcome::Cancelled) => IndexScanState::Stopped,
+        _ if stats.initial_scan_done => IndexScanState::Monitoring,
+        _ => IndexScanState::Preparing,
     }
 }
 
@@ -456,6 +509,7 @@ impl App {
             .indexer_init
             .as_ref()
             .is_some_and(|m| m.is_reconciling());
+        let maintenance = self.indexer_init.as_ref().map(|m| m.maintenance_state());
         let stats_by_id: std::collections::HashMap<uuid::Uuid, SupervisorStats> = self
             .indexer_init
             .as_ref()
@@ -660,6 +714,9 @@ impl App {
                 if crate::ui_helpers::draw_index_full_check_button(ui).clicked() {
                     self.request_index_full_check();
                 }
+                if let Some(maintenance) = maintenance {
+                    draw_fts_maintenance_state(ui, maintenance);
+                }
                 ui.add_space(4.0);
 
                 if self.settings.favorites.is_empty() {
@@ -708,13 +765,15 @@ impl App {
                                     ui.label(egui::RichText::new("コンテナ索引 (Ctrl+S)").strong())
                                         .on_hover_text(
                                             "フォルダ / ZIP / PDF を名前で横断検索\n\
-                                         ✅ = 索引あり / ⏳ = バルク作成中",
+                                         ✅ 監視中 = Full 完了または確認省略後の監視\n\
+                                         ⚠ 作成失敗 = 最後の Full が失敗 / ⏳ = 作成中",
                                         );
                                     ui.label(egui::RichText::new("アイテム索引 (Ctrl+G)").strong())
                                         .on_hover_text(
                                             "画像 / PDF / 動画をファイル名・タグ・EXIF・\n\
                                          AI プロンプト等で横断検索\n\
-                                         ✅ 監視中 = 初期スキャン完了 + ファイルの変更を追従\n\
+                                         ✅ 監視中 = Full 完了または確認省略後の監視\n\
+                                         ⚠ 作成失敗 = 最後の Full が失敗\n\
                                          ⏳ スキャン中 = アクティブスキャン実行中",
                                         );
                                     if similar_feature_enabled {
@@ -816,7 +875,7 @@ impl App {
                                                 name_on,
                                                 name_stats_by_id
                                                     .get(&fav_id)
-                                                    .map(|s| (s.in_full_scan, s.initial_scan_done)),
+                                                    .map(name_scan_state),
                                                 row_counts[i].0,
                                             );
                                         });
@@ -1548,17 +1607,12 @@ fn aggregate_total_eta(etas: &[crate::indexer_progress::EtaSnapshot]) -> Option<
 
 /// 名前索引・メタ索引共通の状態表示。
 ///
-/// `flags` は supervisor から得た `(in_full_scan, initial_scan_done)`。
+/// Typed Full outcome takes precedence over the startup/display completion flag.
+/// A watcher starting does not prove that the last Full succeeded.
 /// `None` = supervisor 未登録 (= 起動直後)。
 ///
-/// - `on=false`: —
-/// - flags=None: ⏳ 起動中
-/// - in_full_scan: ⏳ スキャン中
-/// - initial_scan_done: ✅ 監視中
-/// - else: ⏳ 準備中 (supervisor 起動済みだが scan 未着手)
-///
 /// `file_count > 0` のときは末尾に `(123,456件)` を付ける。
-fn draw_state_inline(ui: &mut egui::Ui, on: bool, flags: Option<(bool, bool)>, file_count: u64) {
+fn draw_state_inline(ui: &mut egui::Ui, on: bool, state: Option<IndexScanState>, file_count: u64) {
     if !on {
         ui.label(
             egui::RichText::new("—")
@@ -1569,11 +1623,14 @@ fn draw_state_inline(ui: &mut egui::Ui, on: bool, flags: Option<(bool, bool)>, f
     }
     const YELLOW: egui::Color32 = egui::Color32::from_rgb(200, 170, 60);
     const GREEN: egui::Color32 = egui::Color32::from_rgb(100, 170, 100);
-    let (label, color) = match flags {
+    let (label, color) = match state {
         None => ("⏳ 起動中", YELLOW),
-        Some((true, _)) => ("⏳ スキャン中", YELLOW),
-        Some((false, true)) => ("✅ 監視中", GREEN),
-        Some((false, false)) => ("⏳ 準備中", YELLOW),
+        Some(IndexScanState::Scanning) => ("⏳ スキャン中", YELLOW),
+        Some(IndexScanState::Monitoring) => ("✅ 監視中", GREEN),
+        Some(IndexScanState::Preparing) => ("⏳ 準備中", YELLOW),
+        Some(IndexScanState::Failed) => ("⚠ 作成失敗", ui.visuals().error_fg_color),
+        Some(IndexScanState::Incomplete) => ("⚠ 確認未完了", ui.visuals().warn_fg_color),
+        Some(IndexScanState::Stopped) => ("確認中止", YELLOW),
     };
     let text = if file_count == 0 {
         label.to_string()
@@ -1581,6 +1638,20 @@ fn draw_state_inline(ui: &mut egui::Ui, on: bool, flags: Option<(bool, bool)>, f
         format!("{label} ({}件)", format_count(file_count))
     };
     ui.label(egui::RichText::new(text).size(11.0).color(color));
+}
+
+fn draw_fts_maintenance_state(ui: &mut egui::Ui, state: crate::fts_integrity::MaintenanceState) {
+    use crate::fts_integrity::MaintenanceState;
+    let message = match state {
+        MaintenanceState::Ready => return,
+        MaintenanceState::RebuildOnRestart => {
+            "⚠ アイテム索引の更新に失敗しました。次回起動時に索引を作り直します。"
+        }
+        MaintenanceState::RebuildRequestFailed => {
+            "⚠ アイテム索引の更新と再構築予約に失敗しました。診断ログを確認してください。"
+        }
+    };
+    ui.label(egui::RichText::new(message).color(ui.visuals().error_fg_color));
 }
 
 fn draw_similar_state_inline(
@@ -1611,6 +1682,131 @@ mod tests {
         draw_background_indexer_activity_row, draw_similar_state_inline,
         favorites_editor_dialog_geometry, similar_index_progress_presentation,
     };
+
+    #[test]
+    fn full_outcomes_override_display_completion_for_both_indexes() {
+        use super::{IndexScanState, metadata_scan_state, name_scan_state};
+        use crate::indexer_supervisor::{FullScanOutcome, SupervisorStats};
+        use crate::name_index_supervisor::{NameFullScanOutcome, NameIndexStats};
+        for (outcome, expected) in [
+            (FullScanOutcome::Complete, IndexScanState::Monitoring),
+            (FullScanOutcome::Failed, IndexScanState::Failed),
+            (FullScanOutcome::Incomplete, IndexScanState::Incomplete),
+            (FullScanOutcome::Stopped, IndexScanState::Stopped),
+        ] {
+            let mut stats = SupervisorStats {
+                initial_scan_done: true,
+                last_full_outcome: Some(outcome),
+                ..SupervisorStats::default()
+            };
+            assert_eq!(metadata_scan_state(&stats), expected);
+            stats.in_full_scan = true;
+            assert_eq!(metadata_scan_state(&stats), IndexScanState::Scanning);
+        }
+        for (outcome, expected) in [
+            (NameFullScanOutcome::Complete, IndexScanState::Monitoring),
+            (NameFullScanOutcome::Failed, IndexScanState::Failed),
+            (NameFullScanOutcome::Cancelled, IndexScanState::Stopped),
+        ] {
+            let mut stats = NameIndexStats {
+                initial_scan_done: true,
+                last_full_scan: Some(outcome),
+                ..NameIndexStats::default()
+            };
+            assert_eq!(name_scan_state(&stats), expected);
+            stats.in_full_scan = true;
+            assert_eq!(name_scan_state(&stats), IndexScanState::Scanning);
+        }
+        assert_eq!(
+            metadata_scan_state(&SupervisorStats {
+                initial_scan_done: true,
+                initial_scan_skipped: true,
+                ..SupervisorStats::default()
+            }),
+            IndexScanState::Monitoring
+        );
+        assert_eq!(
+            name_scan_state(&NameIndexStats {
+                initial_scan_done: true,
+                ..NameIndexStats::default()
+            }),
+            IndexScanState::Monitoring
+        );
+    }
+
+    #[test]
+    fn failed_nested_full_is_visible_in_outer_and_duplicate_favorites() {
+        use super::{IndexScanState, metadata_progress_flags};
+        let favorites = vec![
+            super::ownership_count_tests::progress_favorite(1, "c:/photos"),
+            super::ownership_count_tests::progress_favorite(2, "c:/photos/inner"),
+            super::ownership_count_tests::progress_favorite(3, "C:/PHOTOS"),
+        ];
+        let ownership = crate::metadata_ownership::metadata_ownership(&favorites, &[]);
+        let stats = std::collections::HashMap::from([
+            (
+                favorites[0].id,
+                crate::indexer_supervisor::SupervisorStats {
+                    initial_scan_done: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                favorites[1].id,
+                crate::indexer_supervisor::SupervisorStats {
+                    initial_scan_done: true,
+                    last_full_outcome: Some(crate::indexer_supervisor::FullScanOutcome::Failed),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        for favorite in &favorites {
+            assert_eq!(
+                metadata_progress_flags(&ownership, favorite.id, &stats),
+                Some(IndexScanState::Failed)
+            );
+        }
+    }
+
+    #[test]
+    fn favorites_full_outcomes_and_maintenance_snapshot_dark() {
+        use super::{IndexScanState, draw_fts_maintenance_state, draw_state_inline};
+        use crate::fts_integrity::MaintenanceState;
+        let mut fonts_ready = false;
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(760.0, 360.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.heading("お気に入りの Full 結果");
+                    for (label, state) in [
+                        ("Full 完了 / 起動時確認省略", IndexScanState::Monitoring),
+                        ("新しい Full を開始", IndexScanState::Scanning),
+                        ("アイテム索引 Full 失敗", IndexScanState::Failed),
+                        ("コンテナ索引 Full 失敗", IndexScanState::Failed),
+                        ("観測未完了", IndexScanState::Incomplete),
+                        ("Full 取消", IndexScanState::Stopped),
+                    ] {
+                        ui.horizontal(|ui| {
+                            ui.label(label);
+                            draw_state_inline(ui, true, Some(state), 12345);
+                        });
+                    }
+                    ui.separator();
+                    draw_fts_maintenance_state(ui, MaintenanceState::Ready);
+                    draw_fts_maintenance_state(ui, MaintenanceState::RebuildOnRestart);
+                    draw_fts_maintenance_state(ui, MaintenanceState::RebuildRequestFailed);
+                });
+            });
+        harness.run();
+        harness.snapshot("favorites_full_outcomes_and_maintenance_dark");
+    }
 
     #[test]
     fn favorites_editor_dialog_geometry_stays_inside_small_window() {

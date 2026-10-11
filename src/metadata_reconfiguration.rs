@@ -53,7 +53,6 @@ pub(crate) struct View {
     pub must_scan_roots: HashSet<String>,
     pub reconciliation_ms: u64,
     pub failed_cleaned: usize,
-    pub notifications: Vec<&'static str>,
     full_check_pending: bool,
     #[cfg(test)]
     pub(crate) full_check_dispatched: usize,
@@ -85,6 +84,7 @@ pub(crate) struct Stores {
     pub meta: Arc<crate::fts_meta::FtsMetaDb>,
     pub fts: Arc<crate::fts_index::FtsIndex>,
     pub writer: Arc<crate::fts_writer_dispatcher::FtsWriterDispatcher>,
+    pub reporter: Arc<crate::fts_integrity::FailureReporter>,
     pub io: Arc<crate::io_semaphore::GlobalIoSemaphore>,
     pub gate: Arc<crate::activity_gate::ActivityGate>,
     pub similar: Option<crate::similar_index::SimilarIndexNotifier>,
@@ -117,7 +117,6 @@ impl Runtime {
                 must_scan_roots: HashSet::new(),
                 reconciliation_ms: 0,
                 failed_cleaned: 0,
-                notifications: Vec::new(),
                 full_check_pending: false,
                 #[cfg(test)]
                 full_check_dispatched: 0,
@@ -194,17 +193,8 @@ impl Runtime {
     }
 }
 
-pub(crate) fn cleanup_failure(stores: &Stores, shared: &Shared, error: impl std::fmt::Display) {
-    crate::logger::log(format!("metadata cleanup failed: {error}"));
-    if let Err(e) = stores.meta.request_item_index_rebuild() {
-        crate::logger::log(format!("metadata rebuild marker failed: {e}"));
-    }
-    shared
-        .state
-        .lock()
-        .unwrap()
-        .notifications
-        .push("索引の更新に失敗しました。mIV を再起動すると索引を作り直します。");
+pub(crate) fn cleanup_failure(stores: &Stores, error: &(impl std::fmt::Display + std::fmt::Debug)) {
+    stores.reporter.report("metadata cleanup", error);
 }
 
 /// Background FIFO puts cleanup behind batches whose cancelled caller abandoned the reply.
@@ -229,7 +219,10 @@ fn delete_paths(
     stores
         .meta
         .delete_paths_and_invalidate_scans(&paths, affected_roots)
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| {
+            cleanup_failure(stores, &error);
+            error.to_string()
+        })?;
     Ok(())
 }
 
@@ -237,6 +230,91 @@ struct StartupCleanupTargets {
     paths: Vec<String>,
     roots: HashSet<String>,
     owner_rows: usize,
+}
+
+#[cfg(any(test, feature = "fts-startup-integrity"))]
+#[derive(Debug, PartialEq, Eq)]
+struct IntegrityCounts {
+    owner_rows: u64,
+    not_ok_rows: u64,
+    ok_rows: u64,
+    segments: usize,
+    live_docs: u64,
+}
+
+#[cfg(any(test, feature = "fts-startup-integrity"))]
+impl IntegrityCounts {
+    fn new(
+        owner_rows: usize,
+        not_ok_rows: u64,
+        searcher: &tantivy::Searcher,
+    ) -> Result<Self, String> {
+        let owner_rows = owner_rows as u64;
+        let ok_rows = owner_rows.checked_sub(not_ok_rows).ok_or_else(|| {
+            "startup integrity: Failed rows exceed pre-cleanup ownership rows".to_owned()
+        })?;
+        Ok(Self {
+            owner_rows,
+            not_ok_rows,
+            ok_rows,
+            segments: searcher.segment_readers().len(),
+            live_docs: searcher.num_docs(),
+        })
+    }
+    fn missing_suspected(&self) -> bool {
+        self.live_docs < self.ok_rows
+    }
+}
+
+/// Experiment only: the existing worker, ownership count and loaded reader are reused.
+/// A shortage reserves the next startup; it never wipes a reader already published by manager.
+#[cfg(any(test, feature = "fts-startup-integrity"))]
+fn startup_integrity_check(stores: &Stores, owner_rows: usize) -> Result<IntegrityCounts, String> {
+    let started = Instant::now();
+    let not_ok_rows = stores
+        .meta
+        .count_not_ok()
+        .map_err(|error| error.to_string())?;
+    let searcher = stores.fts.searcher();
+    let counts = IntegrityCounts::new(owner_rows, not_ok_rows, &searcher)?;
+    let integrity_check_ms = started.elapsed().as_secs_f64() * 1000.0;
+    if crate::perf::is_enabled() {
+        crate::perf::event(
+            "startup",
+            "fts_integrity_check",
+            None,
+            0,
+            &[
+                ("feature_enabled", true.into()),
+                ("owner_rows", counts.owner_rows.into()),
+                ("not_ok_rows", counts.not_ok_rows.into()),
+                ("ok_rows", counts.ok_rows.into()),
+                ("segments", counts.segments.into()),
+                ("live_docs", counts.live_docs.into()),
+                ("integrity_check_ms", integrity_check_ms.into()),
+                ("missing_suspected", counts.missing_suspected().into()),
+            ],
+        );
+    }
+    crate::logger::log(format!(
+        "fts startup integrity: owner_rows={}, not_ok_rows={}, ok_rows={}, segments={}, live_docs={}, integrity_check_ms={integrity_check_ms:.3}, missing_suspected={} (count only, not path integrity)",
+        counts.owner_rows,
+        counts.not_ok_rows,
+        counts.ok_rows,
+        counts.segments,
+        counts.live_docs,
+        counts.missing_suspected()
+    ));
+    if counts.missing_suspected() {
+        stores.reporter.report(
+            "startup integrity",
+            &format!(
+                "live_docs={} < ok_rows={}; rebuild reserved for next startup",
+                counts.live_docs, counts.ok_rows
+            ),
+        );
+    }
+    Ok(counts)
 }
 
 /// Retain only invalid rows; the visitor must not re-enter the locked metadata DB.
@@ -279,29 +357,45 @@ pub(crate) fn startup_cleanup(
         paths,
         roots,
         owner_rows,
-    } = collect_startup_cleanup_targets(&stores.meta, config)?;
+    } = collect_startup_cleanup_targets(&stores.meta, config).map_err(|error| {
+        cleanup_failure(stores, &error);
+        error
+    })?;
     // Includes the ownership check. Rows and the DB lock are released before deleting.
     let query_ms = query_started.elapsed().as_secs_f64() * 1000.0;
+    // The experiment has no production call/SQL cost unless explicitly opted in.
+    // Compare this same pre-cleanup reader snapshot before any delete or reconciliation.
+    #[cfg(feature = "fts-startup-integrity")]
+    if let Err(error) = startup_integrity_check(stores, owner_rows) {
+        cleanup_failure(stores, &error);
+        return Err(error);
+    }
     let count = paths.len();
     let result = delete_paths(stores, paths, &roots.iter().cloned().collect::<Vec<_>>());
-    crate::perf::event(
-        "startup",
-        "metadata_out_of_range_cleanup",
-        None,
-        0,
-        &[
-            ("rows", count.into()),
-            ("owner_rows", owner_rows.into()),
-            ("query_ms", query_ms.into()),
-            // The streaming collector only grows, so its final size is its peak.
-            ("peak_collected_rows", count.into()),
-            (
-                "ms",
-                started.elapsed().as_secs_f64().mul_add(1000.0, 0.0).into(),
-            ),
-            ("success", result.is_ok().into()),
-        ],
-    );
+    if crate::perf::is_enabled() {
+        crate::perf::event(
+            "startup",
+            "metadata_out_of_range_cleanup",
+            None,
+            0,
+            &[
+                ("rows", count.into()),
+                ("owner_rows", owner_rows.into()),
+                (
+                    "integrity_feature_enabled",
+                    cfg!(feature = "fts-startup-integrity").into(),
+                ),
+                ("query_ms", query_ms.into()),
+                // The streaming collector only grows, so its final size is its peak.
+                ("peak_collected_rows", count.into()),
+                (
+                    "ms",
+                    started.elapsed().as_secs_f64().mul_add(1000.0, 0.0).into(),
+                ),
+                ("success", result.is_ok().into()),
+            ],
+        );
+    }
     result?;
     Ok(roots)
 }
@@ -356,7 +450,7 @@ fn run(stores: Stores, shared: Arc<Shared>, startup_skip_offline_change_scan: bo
             });
             match cleanup_result {
                 Ok(roots) => shared.state.lock().unwrap().must_scan_roots.extend(roots),
-                Err(e) => cleanup_failure(&stores, &shared, e),
+                Err(e) => crate::logger::log(format!("metadata startup cleanup failed: {e}")),
             }
             let reconciliation = span(Lane::Metadata, Stage::MetadataReconciliation);
             let reconciliation_result = crate::indexer_manager::run_reconciliation_via_dispatcher(
@@ -372,7 +466,7 @@ fn run(stores: Stores, shared: Arc<Shared>, startup_skip_offline_change_scan: bo
             });
             match reconciliation_result {
                 Ok(report) => shared.state.lock().unwrap().failed_cleaned = report.failed_cleaned,
-                Err(e) => cleanup_failure(&stores, &shared, e),
+                Err(e) => crate::logger::log(format!("metadata reconciliation failed: {e}")),
             }
             shared.state.lock().unwrap().reconciliation_ms = t.elapsed().as_millis() as u64;
             crate::perf::emit_ms("startup", "fts_reconciliation", 0, t);
@@ -467,10 +561,13 @@ fn run(stores: Stores, shared: Arc<Shared>, startup_skip_offline_change_scan: bo
                         .meta
                         .delete_path_ranges_and_invalidate_scans(&newly_excluded, &affected_roots)
                         .map(|_| ())
-                        .map_err(|e| e.to_string())
+                        .map_err(|error| {
+                            cleanup_failure(&stores, &error);
+                            error.to_string()
+                        })
                 });
             if let Err(e) = result {
-                cleanup_failure(&stores, &shared, e);
+                crate::logger::log(format!("metadata range cleanup failed: {e}"));
             }
         }
         for id in &group {
@@ -499,17 +596,23 @@ fn run(stores: Stores, shared: Arc<Shared>, startup_skip_offline_change_scan: bo
                             .meta
                             .delete_all_for_favorite_and_invalidate_scans(*id, &affected_roots)
                             .map(|_| ())
-                            .map_err(|e| e.to_string())
+                            .map_err(|error| {
+                                cleanup_failure(&stores, &error);
+                                error.to_string()
+                            })
                     })
             } else {
                 stores
                     .meta
                     .list_paths_outside_range(*id, current.and_then(|c| c.owned_range.as_ref()))
-                    .map_err(|e| e.to_string())
+                    .map_err(|error| {
+                        cleanup_failure(&stores, &error);
+                        error.to_string()
+                    })
                     .and_then(|paths| delete_paths(&stores, paths, &affected_roots))
             };
             if let Err(e) = result {
-                cleanup_failure(&stores, &shared, e);
+                crate::logger::log(format!("metadata favorite cleanup failed: {e}"));
             }
             if shared.state.lock().unwrap().shutdown.is_some() {
                 break;
@@ -575,6 +678,21 @@ fn run(stores: Stores, shared: Arc<Shared>, startup_skip_offline_change_scan: bo
         view.busy = false;
         shared.changed.notify_all();
         if initial_configuration {
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "startup",
+                    "metadata_supervisors_started",
+                    None,
+                    0,
+                    &[
+                        ("supervisors", handles.len().into()),
+                        (
+                            "integrity_feature_enabled",
+                            cfg!(feature = "fts-startup-integrity").into(),
+                        ),
+                    ],
+                );
+            }
             // Orchestration idle is this worker's checkpoint, not watcher readiness.
             let idle = span(Lane::Metadata, Stage::MetadataOrchestrationIdle);
             idle.finish(Outcome::Ok);
@@ -610,16 +728,25 @@ mod tests {
         }
     }
     fn stores(tmp: &std::path::Path) -> Stores {
+        stores_with_writer(tmp, |fts| fts.writer().unwrap())
+    }
+    fn stores_with_writer(
+        tmp: &std::path::Path,
+        make_writer: impl FnOnce(&crate::fts_index::FtsIndex) -> tantivy::IndexWriter,
+    ) -> Stores {
         let meta = Arc::new(crate::fts_meta::FtsMetaDb::open_at(&tmp.join("meta.db")).unwrap());
         let fts = Arc::new(crate::fts_index::FtsIndex::open_at(&tmp.join("fts")).unwrap());
-        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(
-            fts.writer().unwrap(),
+        let reporter = crate::fts_integrity::FailureReporter::new(Arc::clone(&meta));
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start_with_reporter(
+            make_writer(&fts),
             Arc::clone(&fts),
+            Arc::clone(&reporter),
         );
         Stores {
             meta,
             fts,
             writer,
+            reporter,
             io: Arc::new(crate::io_semaphore::GlobalIoSemaphore::new(1)),
             gate: Arc::new(crate::activity_gate::ActivityGate::new(0)),
             similar: None,
@@ -660,6 +787,310 @@ mod tests {
         crate::fts_index::find_doc_by_path(&stores.fts.searcher(), stores.fts.fields(), path)
             .unwrap()
             .is_some()
+    }
+
+    #[test]
+    fn startup_integrity_counts_empty_equal_failed_orphan_and_deleted_alive_docs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stores = stores_with_writer(tmp.path(), |fts| {
+            // One indexing thread puts all three documents in one segment. Keeping
+            // merging disabled then retains the deleted slot for the alive-count check.
+            let writer = fts
+                .index()
+                .writer_with_num_threads(1, 64 * 1024 * 1024)
+                .unwrap();
+            writer.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+            writer
+        });
+        assert_eq!(startup_integrity_check(&stores, 0).unwrap().live_docs, 0);
+        let id = Uuid::new_v4();
+        let mut docs = Vec::new();
+        for path in ["c:/ok.jpg", "c:/failed.jpg", "c:/deleted.jpg"] {
+            stores
+                .meta
+                .upsert_meta_ok(
+                    path,
+                    id,
+                    std::path::Path::new("c:/"),
+                    crate::fts_index::IndexKind::Image,
+                    1,
+                    1,
+                )
+                .unwrap();
+            docs.push(crate::fts_index::IndexDoc {
+                path: path.into(),
+                container: crate::fts_index::Container::Fs,
+                zip_entry: String::new(),
+                favorite_id: id,
+                kind: crate::fts_index::IndexKind::Image,
+                mtime: 1,
+                file_size: 1,
+                norms: Default::default(),
+            });
+        }
+        stores
+            .writer
+            .batch(
+                docs,
+                Vec::new(),
+                true,
+                true,
+                crate::fts_writer_dispatcher::WriterPriority::Background,
+            )
+            .unwrap();
+        let equal = startup_integrity_check(&stores, 3).unwrap();
+        assert_eq!((equal.ok_rows, equal.live_docs), (3, 3));
+        assert!(!equal.missing_suspected());
+        stores.meta.mark_failed("c:/failed.jpg").unwrap();
+        stores
+            .writer
+            .batch(
+                Vec::new(),
+                vec!["c:/deleted.jpg".into()],
+                true,
+                true,
+                crate::fts_writer_dispatcher::WriterPriority::Background,
+            )
+            .unwrap();
+        stores
+            .meta
+            .delete_paths_and_invalidate_scans(&["c:/deleted.jpg".into()], &[])
+            .unwrap();
+        let snapshot = stores.fts.searcher();
+        assert_eq!(snapshot.num_docs(), 2);
+        assert!(
+            snapshot
+                .segment_readers()
+                .iter()
+                .map(|segment| segment.max_doc() as u64)
+                .sum::<u64>()
+                > snapshot.num_docs(),
+            "fixture must retain a deleted slot; max_doc is not the alive count"
+        );
+        let owner_rows = stores.meta.for_each_path_owner(|_, _| {}).unwrap();
+        let counts = startup_integrity_check(&stores, owner_rows).unwrap();
+        assert_eq!(
+            (
+                counts.owner_rows,
+                counts.not_ok_rows,
+                counts.ok_rows,
+                counts.live_docs
+            ),
+            (2, 1, 1, 2)
+        );
+        assert!(!counts.missing_suspected());
+        // No settings favorite is passed: even orphan Ok rows count across the whole store.
+        stores
+            .meta
+            .upsert_meta_ok(
+                "c:/orphan.jpg",
+                Uuid::new_v4(),
+                std::path::Path::new("c:/"),
+                crate::fts_index::IndexKind::Image,
+                1,
+                1,
+            )
+            .unwrap();
+        let counts = startup_integrity_check(&stores, 3).unwrap();
+        assert_eq!((counts.ok_rows, counts.live_docs), (2, 2));
+        assert!(
+            !counts.missing_suspected(),
+            "extra Failed document can mask a missing orphan; count is not integrity proof"
+        );
+        stores
+            .meta
+            .upsert_meta_ok(
+                "c:/another-missing.jpg",
+                id,
+                std::path::Path::new("c:/"),
+                crate::fts_index::IndexKind::Image,
+                1,
+                1,
+            )
+            .unwrap();
+        assert!(
+            startup_integrity_check(&stores, 4)
+                .unwrap()
+                .missing_suspected()
+        );
+        assert!(stores.meta.tantivy_rebuild_pending().unwrap());
+        assert_eq!(
+            stores.fts.searcher().num_docs(),
+            2,
+            "current published reader is never wiped"
+        );
+        assert!(stores.meta.get("c:/another-missing.jpg").unwrap().is_some());
+        assert_eq!(stores.reporter.take_notifications().len(), 1);
+    }
+
+    #[test]
+    fn startup_integrity_large_shortage_and_excess_do_not_claim_path_integrity() {
+        let mut counts = IntegrityCounts {
+            owner_rows: 840_464,
+            not_ok_rows: 0,
+            ok_rows: 840_464,
+            segments: 2,
+            live_docs: 399,
+        };
+        assert!(counts.missing_suspected());
+        counts.live_docs = counts.ok_rows;
+        assert!(!counts.missing_suspected());
+        counts.live_docs += 1;
+        assert!(!counts.missing_suspected());
+    }
+
+    #[test]
+    fn startup_integrity_duplicate_documents_can_mask_a_missing_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let meta = crate::fts_meta::FtsMetaDb::open_at(&tmp.path().join("meta.db")).unwrap();
+        let fts = crate::fts_index::FtsIndex::open_at(&tmp.path().join("fts")).unwrap();
+        let id = Uuid::new_v4();
+        for path in ["c:/a.jpg", "c:/missing.jpg"] {
+            meta.upsert_meta_ok(
+                path,
+                id,
+                std::path::Path::new("c:/"),
+                crate::fts_index::IndexKind::Image,
+                1,
+                1,
+            )
+            .unwrap();
+        }
+        let mut writer = fts.writer().unwrap();
+        for _ in 0..2 {
+            // Deliberately bypass the application's delete+add upsert invariant to
+            // demonstrate why an equal count cannot certify persisted path integrity.
+            writer
+                .add_document(tantivy::doc!(fts.fields().path => "c:/a.jpg"))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+        fts.reload_reader().unwrap();
+        let snapshot = fts.searcher();
+        let counts = IntegrityCounts::new(
+            meta.for_each_path_owner(|_, _| {}).unwrap(),
+            meta.count_not_ok().unwrap(),
+            &snapshot,
+        )
+        .unwrap();
+        assert_eq!((counts.ok_rows, counts.live_docs), (2, 2));
+        assert!(!counts.missing_suspected());
+        assert!(
+            crate::fts_index::find_doc_by_path(&snapshot, fts.fields(), "c:/missing.jpg")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// SQL/Rust microbenchmark only. This cannot satisfy the cold/warm, UI-ready,
+    /// skip-setting and I/O-contention adoption gate; the experiment stays OFF.
+    #[test]
+    #[ignore = "generates an isolated 840,464-row SQLite+Tantivy fixture; run explicitly"]
+    fn startup_integrity_large_copy_fixture_cost() {
+        let tmp = tempfile::tempdir().unwrap();
+        let meta_path = tmp.path().join("fts_meta.db");
+        let meta = crate::fts_meta::FtsMetaDb::open_at(&meta_path).unwrap();
+        let fts = crate::fts_index::FtsIndex::open_at(&tmp.path().join("fts")).unwrap();
+        let id = Uuid::new_v4();
+        let mut writer = fts.writer().unwrap();
+        let mut conn = rusqlite::Connection::open(&meta_path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL")
+            .unwrap();
+        let tx = conn.transaction().unwrap();
+        {
+            let mut insert = tx.prepare("INSERT INTO files(path,favorite_id,favorite_root,kind,mtime,file_size,indexed_at,index_version,index_generation,status) VALUES(?1,?2,'c:/fixture','image',1,1,1,?3,0,0)").unwrap();
+            for row in 0..840_464 {
+                let path = format!("c:/fixture/{row:07}.jpg");
+                insert
+                    .execute(rusqlite::params![
+                        path,
+                        id.to_string(),
+                        crate::fts_meta::INDEX_VERSION
+                    ])
+                    .unwrap();
+                crate::fts_index::upsert_doc(
+                    &writer,
+                    fts.fields(),
+                    &crate::fts_index::IndexDoc {
+                        path,
+                        container: crate::fts_index::Container::Fs,
+                        zip_entry: String::new(),
+                        favorite_id: id,
+                        kind: crate::fts_index::IndexKind::Image,
+                        mtime: 1,
+                        file_size: 1,
+                        norms: Default::default(),
+                    },
+                )
+                .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        writer.commit().unwrap();
+        fts.reload_reader().unwrap();
+        assert_eq!(fts.searcher().num_docs(), 840_464);
+        // Keep each fixture exactly aligned: every Ok row has a live document,
+        // and Failed rows have none. Fixture mutation/commit/reload is outside
+        // the ownership/count timing, with a fresh snapshot for each population.
+        let mut previous_failed = 0;
+        for failed in [0, 84, 756_418] {
+            conn.execute(
+                "UPDATE files SET status=CASE WHEN path < ?1 THEN 2 ELSE 0 END",
+                [format!("c:/fixture/{failed:07}.jpg")],
+            )
+            .unwrap();
+            for row in previous_failed..failed {
+                crate::fts_index::delete_doc(
+                    &writer,
+                    fts.fields(),
+                    &format!("c:/fixture/{row:07}.jpg"),
+                );
+            }
+            writer.commit().unwrap();
+            fts.reload_reader().unwrap();
+            let searcher = fts.searcher();
+            assert_eq!(searcher.num_docs(), 840_464 - failed as u64);
+            previous_failed = failed;
+            let owner_start = Instant::now();
+            let owner_rows = meta.for_each_path_owner(|_, _| {}).unwrap();
+            let ownership_ms = owner_start.elapsed().as_secs_f64() * 1000.0;
+            let count_start = Instant::now();
+            let not_ok_rows = meta.count_not_ok().unwrap();
+            let counts = IntegrityCounts::new(owner_rows, not_ok_rows, &searcher).unwrap();
+            let integrity_check_ms = count_start.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(counts.not_ok_rows, failed as u64);
+            assert_eq!(counts.live_docs, counts.ok_rows);
+            assert!(!counts.missing_suspected());
+            eprintln!(
+                "isolated Rust count fixture: owner_rows={owner_rows} not_ok_rows={not_ok_rows} segments={} live_docs={} ownership_ms={ownership_ms:.3} integrity_check_ms={integrity_check_ms:.3}; microbenchmark only",
+                counts.segments, counts.live_docs
+            );
+        }
+    }
+
+    #[cfg(feature = "fts-startup-integrity")]
+    #[test]
+    fn startup_integrity_compares_before_orphan_cleanup_deletes_inventory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stores = stores(tmp.path());
+        stores
+            .meta
+            .upsert_meta_ok(
+                "c:/orphan.jpg",
+                Uuid::new_v4(),
+                std::path::Path::new("c:/"),
+                crate::fts_index::IndexKind::Image,
+                1,
+                1,
+            )
+            .unwrap();
+        startup_cleanup(&stores, &Configuration::new(&[], Vec::new())).unwrap();
+        assert!(stores.meta.get("c:/orphan.jpg").unwrap().is_none());
+        assert!(
+            stores.meta.tantivy_rebuild_pending().unwrap(),
+            "post-cleanup empty counts would have missed the missing orphan"
+        );
+        assert_eq!(stores.reporter.take_notifications().len(), 1);
     }
     #[test]
     fn startup_skip_policy_survives_latest_configuration_coalescing() {
@@ -1265,9 +1696,11 @@ mod tests {
                 .unwrap(),
             2
         );
+        assert_eq!(stores.meta.scanned_once("c:/x").unwrap(), None);
+        assert!(stores.meta.tantivy_rebuild_pending().unwrap());
         assert_eq!(
-            stores.meta.scanned_once("c:/x").unwrap().as_deref(),
-            Some("complete")
+            stores.reporter.take_notifications(),
+            vec![crate::fts_integrity::UPDATE_FAILURE_NOTICE]
         );
     }
     #[test]
@@ -1299,10 +1732,10 @@ mod tests {
                 1,
             )
             .unwrap();
-        cleanup_failure(&stores, &runtime.shared, "injected cleanup failure");
+        cleanup_failure(&stores, &"injected cleanup failure");
         assert!(stores.meta.tantivy_rebuild_pending().unwrap());
         assert!(stores.meta.get("c:/retained.jpg").unwrap().is_some());
-        assert_eq!(runtime.shared.state.lock().unwrap().notifications.len(), 1);
+        assert_eq!(stores.reporter.take_notifications().len(), 1);
         runtime.shutdown();
     }
     #[test]
@@ -1419,15 +1852,7 @@ mod tests {
                 .controls
                 .contains_key(&on.id)
         );
-        assert!(
-            !runtime
-                .shared
-                .state
-                .lock()
-                .unwrap()
-                .notifications
-                .is_empty()
-        );
+        assert!(!stores.reporter.take_notifications().is_empty());
         assert!(stores.meta.tantivy_rebuild_pending().unwrap());
         runtime.shutdown();
     }

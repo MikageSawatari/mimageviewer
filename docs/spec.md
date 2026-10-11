@@ -2438,7 +2438,7 @@ typed event の送信だけを行い、前面化しない。受付できない�
 | `vst3_panel_pos` | Option<[f32; 2]> | None | 動画再生中 VST3 パネルの保存位置。表示時に現在の viewport/native overlay 内へクランプ |
 | `minimize_to_tray_on_close` | bool | false | ON のとき [×] で終了せずタスクトレイに常駐する。main の静止画読書（画像のみフォルダ本を含む）を閉じる際、明示一覧 record が現在の本の親一覧なら既存の親戻りでそこへ戻し、record と読書位置を保持する。判定は採用済みの一覧に基づき、読書中の画像フォルダ自動オープン設定変更には依存しない。本一覧を明示済みならその一覧に留まる。tray 復帰は起動復元を実行しない。通常 fullscreen / in-window / F12 別窓 / ParkedLive の viewport と native presenter は同じ identity のまま hidden にし、動画、動画→音声モード、単体音楽の running / paused / EOF transport state を変更しない。hidden presenter は decode queue を drain して最新 frame を保持し、復帰で viewport と presenter を visible に戻すため再生中ならそのまま映像が再開する。detached / switching session と typed placement request は維持し、復帰時の外部フォルダ変更でも context を退避してから一覧へ反映する。復帰の `ShowWindow` で main focus が一時的に戻っても session は閉じない。mounted context の非 media texture とアイドル GPU 動画プールは解放するが、detached active viewer cache、稼働中 decoder / presenter / GPU frame、VST3 プラグインチェーンは保持するため、常駐中も動画 decode の CPU/GPU/電力コストを負う |
 | `network_data_dir_notice_dismissed_for` | Option\<String\> | None | ネットワーク上の data_dir に関する起動案内を「この保存先では今後表示しない」で抑止したパス。Windows の区切り・大文字小文字・通常 UNC / verbatim UNC の同値表記を正規化して比較し、別の保存先なら再案内する |
-| `skip_offline_change_scan` | bool | false | 起動時に mIV を終了していた間の変更を確認しない。完全に作成した索引と対象条件が同じ場合だけ初回確認を省く。終了中の追加・削除・移動や途中終了による未反映は [今すぐ確認] で反映する。お気に入り編集とライブラリ > 検索インデックスページが同じ値を編集し、次回起動から有効 |
+| `skip_offline_change_scan` | bool | false | 起動時に mIV を終了していた間の変更を確認しない。完全に作成した索引と対象条件が同じ場合だけ初回確認を省く。終了中の追加・削除・移動等は [今すぐ確認] の差分確認で反映する。ただし SQLite の署名が変わらない Ok に対応する全文文書の欠落は Full で検出できない。お気に入り編集とライブラリ > 検索インデックスページが同じ値を編集し、次回起動から有効 |
 | `pause_indexer_while_minimized` | bool | false | タスクトレイ常駐中にファイル監視 / インデックス更新を一時停止する。OFF でも常駐中は I/O 並列度を絞る |
 | `folder_thumb_sort` | SortOrder | FileName | フォルダ代表画像の自動選定順。通常一覧の `sort_order` とは独立して設定できる。FileName / Numeric / DateAsc / DateDesc |
 | `folder_thumb_depth` | u32 | 3 | フォルダ代表画像の探索最大階層数（0 で直接の子のみ） |
@@ -2569,6 +2569,18 @@ Ctrl+F (ローカル検索) はこれらの制約を受けない。
 mIV Remote のホーム「検索」タブは Ctrl+S と同じコンテナ索引を読み取り専用で使い、
 お気に入り全体のフォルダ / ZIP / PDF を名前と種類で検索する。画像単体・動画は対象外。
 コンテナ索引が無効な場合と、索引が未作成または一時的に読めない場合は、0 件とは別の状態として表示する。
+
+お気に入り編集のコンテナ索引/アイテム索引は、監視開始と最後の Full の成功を区別する。
+Full の型付き結果が Failed なら「作成失敗」、FTS の不完全観測は「確認未完了」、取消は
+「確認中止」、新しい Full 実行中は「スキャン中」。正常完走・正常な確認省略は「監視中」を維持する。
+FTS の commit/reload/SQLite apply/cleanup と実行由来の自動 merge 永続化失敗は通知し、
+共有 maintenance snapshot に次回起動の索引再構築予約 (予約自体の失敗も) を表示する。
+今の session で wipe/reopen せず、次回起動に SQLite inventory/scan印の reset と pending を先に
+durable commit してから Tantivy を作り直す。ユーザー作成のタグ/評価等の別 DB は変更しない。
+名前索引の Full 失敗表示も訂正するが、名前 DB の書込失敗を通知/既存 rebuild marker へ揃える
+対応は [§1.369](next-release-backlog.md) の別件。FTS の marker を名前索引へ適用しない。
+起動 count 点検は `fts-startup-integrity` opt-in、既定 OFF。全条件 A/B による遅延なしの証拠が
+なければ採用しない。詳細は [FTS 整合計画](fts-integrity-plan.md) と [計測手順](fts-startup-ab-measurement.md)。
 
 mIV Remote のドライブ一覧 / 閲覧履歴 / ブックマーク / 本棚 / レーティング / スマートフォルダで
 通常画像を開いた場合は、実親フォルダへ移動せず元のフラット一覧全体を読み順として維持する。
@@ -3030,7 +3042,7 @@ SourceURL と画像候補のある HTML を検出して小窓へ通知する。�
 - [x] `FavoriteEntry` に `id: Uuid` + `auto_index_{structure,metadata,thumbs}` 3 フラグ追加
 - [x] お気に入り編集 / 追加ダイアログに 3 つのチェックボックス + 一括 ON/OFF
 - [x] FsWatcher (notify-rs ReadDirectoryChangesW) + 500ms debounce
-- [x] Walker (3-way diff) + IngestSession (Tantivy First 書き込み) + IndexerSupervisor (統括)
+- [x] Walker (FS ↔ SQLite を追加・変更・削除へ分類) + IngestSession (Tantivy First 書き込み) + IndexerSupervisor (統括)
 - [x] 起動時 reconciliation (status != ok の残留行を整理)
 - [x] `GlobalIoSemaphore` で UI 優先度制御 (Low/Normal/High)
 - [x] PDFium document info (Title / Author / Subject / Keywords) 取り込み

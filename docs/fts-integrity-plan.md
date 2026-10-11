@@ -4,9 +4,9 @@
 `0f6ad9f191d5a5d25f175d9b5f49611afbfc1489`。利用者がr1を`a0927b26e`、r2を`4c86015de`でcommitした。
 r1の独立設計レビューはREVISE (P1なし、P2 3件、P3 1件)。r2の再レビューでは前回指摘を解消し、
 正常終了による未実行merge taskの打切りを通知/再構築から除外する新規P2 1件でREVISEとなった。
-r3はその境界と回帰を明記し、名前索引の別件をバックログ§1.369へ採録した設計案。
-本改訂では製品コードの変更・commit・製品ビルド・mIV起動を行っていない。
-r3の独立再レビュー・実装・検収は未完了。本改訂の対象は§6.1/6.2、§10.1。
+r3はその境界と回帰を明記し、名前索引の別件をバックログ§1.369へ採録した。
+利用者がr3を`02c2b4c4b`でcommitし、独立再レビューのACCEPTを伝えた。設計改訂自体は
+製品コードの変更・製品ビルド・mIV起動を含まない。受理後の実装と検証は§12へ追記する。
 
 ## 1. 範囲と守る条件
 
@@ -587,3 +587,73 @@ normal profileの実行は利用者だけ。既存事故copyはread-only、通�
 検証で正常起動が遅くなれば決定済み条件に従い点検を見送る。
 通常の機能制限やuser-created dataの破棄が必要と判明した場合だけ、該当項目ごとに
 推奨案・失われる挙動/データ・費用を示して別途判断を求める。
+
+## 12. 実装記録 (2026-10-11、受理済み R3 本文は維持)
+
+実装対象は `02c2b4c4b` からの未コミット差分。ローカル Tantivy 0.26.1 は実ファイルとして
+`vendor/tantivy` へ固定し、完成済み TempPath の Windows persist だけを最大4回まで再実行する。
+上位の document/delete/commit は再実行しない。由来・原版 checksum・変更箇所は
+`vendor/tantivy/MIV-PATCH.md` に記録した。通常 build は `miv-test-hooks` を含まない。
+
+同期 dispatcher job、SQL 更新、非同期 merge/end_merge の最終失敗は、manager-owned
+`FailureReporter` の log + 通知 + 既存 durable pending へ接続した。後続成功では pending を
+解除せず、実行中の索引を消さない。正常 cancel は typed `ScanError::Cancelled`、正常終了で
+未実行 end_merge が拒否された場合は patched scheduler の private typed
+`UpdaterKilledBeforeSchedule` で区別する。文字列や「終了中」の一括判定を使わず、終了中に
+実行された I/O/同文言 SystemError は報告する。GC の削除拒否もこの報告対象に含めない。
+
+再作成は `open_stores_with_rebuild_sync` へ集約し、SQLite inventory/scan印 reset + pending を
+FULL synchronous transaction で先に確定する。旧 handle の drop、wipe/create/open、pending clear
+はその後に行う。既存 pending なら旧 meta.json/.managed.json の probe を省く。
+wipe/create/clear の失敗に再回復を追加せず、marker と既存の起動 error を維持する。
+
+お気に入り編集は FTS/名前索引の既存 typed Full outcome を表示へ射影し、Failed を正常な
+監視開始フラグで隠さない。FTS の共有 maintenance snapshot をダイアログ全体へ表示し、
+SQL/I/O/待機を UI へ追加しない。正常完走/正常省略/再 Full開始を維持する。
+名前索引の実書込 failure 通知/marker 接続は §1.369 の別件として残す。
+`search-architecture.md`、`async-architecture.md`、`ui-responsiveness.md`、仕様/検索マニュアルの
+FS ↔ SQLite 差分の限界、再構築の durable 順序、非同期境界と通知の説明も訂正した。
+
+点検は `fts-startup-integrity` opt-in・既定 OFF。既存 ownership scan の件数と loaded reader を
+再利用する worker 上の実装で、OFF build に追加 COUNT/比較の呼出しはない。
+[起動 A/B 手順](fts-startup-ab-measurement.md) と `scripts/analyze_fts_startup_ab.py` は、隔離 data-dir、
+24条件、交互反復、保存 checkpoint、全 endpoint と count 診断を確認する。
+未測定/欠落/ノイズ/判断不能/悪化は不採用。起動 A/B、遅延なしの証明、点検採用、原事故の
+原因確定は未実施であり、非対話 fixture の費用測定を採用証拠へ読み替えない。
+
+独立実装レビューと追加の実 persist 拒否 ingest 回帰レビューは PASS。
+UI snapshot は baseline 生成後の目視確認まで実施し、文字欠け/切れなし。解析器の Python
+unit test 8件と UI glyph lint zero は成功。Rust/full/build と fixture の最終検証結果は
+`target/I-1367-impl-msg.txt` にコマンド、件数、ログとともに記録する。
+
+通常構成の fmt、core check、`cargo check --features portable`、narrow lib/integration と
+最終 `test-full.ps1` は成功。全体ログは13,274 passed/0 failed/63 ignoredで、子 process の
+同じ test 再実行2件を含む。workspace外 vendor も25/11/18件成功。`build-dev.ps1 -PreserveRuntime`
+は通常 feature の core/remote/EPUB worker とPE検査まで成功し、実アプリは起動していない。
+先行失敗と最終実行条件も引き継ぎ記録へ残し、全体 gate を起動性能の証拠に使わない。
+
+**起動点検 feature 付きの追加検証は環境 block のため未完了。** 解析器の初期テストで作成した
+`scripts/tmp26xigyp9` を Cargo が列挙できず、OS access denied で compile 前に止まった。
+agent 側のACL照会/修復・非再帰削除も失敗し、通常 PowerShell での対象だけの環境整理を依頼済み。
+現在の解析器テストは在メモリ fixture で、この directory を新たに作らない。
+Cargo 設定で拒否を隠さず、解消後に feature 付き `startup_integrity` filter を完了する。
+正常構成の helper/fixture の成功を、この feature 入口の成功へ読み替えない。
+点検は未採用・既定 OFF のままで、A/B前にもこの検証を完了する。
+
+### 12.1 非対話 fixture の費用 (採用判定ではない)
+
+正常構成の lib test 実行体から ignored test
+`metadata_reconfiguration::tests::startup_integrity_large_copy_fixture_cost` を直接実行し、1件成功。
+`cfg(test)` でコンパイルされた同じ COUNT/num_docs helper と840,464行の正常対応を使った。
+各 Failed population は1回、全体ゲートと同時実行であり、idle/cold/warm は固定していない。
+`target/I-1367-startup-fixture-cost.log` に原記録を保存した。
+
+| Failed 行 | 生存文書 | segments | ownership SQL scan (ms) | 追加 COUNT + num_docs (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 840,464 | 6 | 204.676 | 1.788 |
+| 84 | 840,380 | 6 | 207.897 | 0.221 |
+| 756,418 | 84,046 | 4 | 206.575 | 15.141 |
+
+ownership SQL scan は空 callback の streaming 読取で、実製品の UUID/所有範囲判定全体の時間ではない。
+追加時間はこの fixture/実行時の実測値であり、壁時計上限や起動 ready の無影響を保証しない。
+feature付き実行経路の検証とも区別し、§7.4の起動 A/B 条件はそのまま維持する。

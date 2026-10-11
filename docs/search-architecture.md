@@ -96,7 +96,7 @@ Ctrl+S / Ctrl+F の UI は [ui_main.rs](../src/ui_main.rs) の
 | [indexer_manager.rs](../src/indexer_manager.rs) | 全お気に入りの `SupervisorHandle` を束ね、Ctrl+G ワーカー spawn・進捗 snapshot・`sync_with_favorites`・App 終了時の停止を統括 |
 | [indexer_supervisor.rs](../src/indexer_supervisor.rs) | **1 お気に入り 1 本**。初期スキャン + notify-rs 監視 + 差分 ingest を統括 (メタ索引側) |
 | [indexer_progress.rs](../src/indexer_progress.rs) | Supervisor → UI 用の `ProgressReporter` (Mutex で包まれた短文 `current_activity`) |
-| [search_walker.rs](../src/search_walker.rs) | 起動時の再帰 walk + 3-way diff (FS / `fts_meta.db` の突き合わせ) |
+| [search_walker.rs](../src/search_walker.rs) | 起動時の再帰 walk + FS / `fts_meta.db` の差分を追加・変更・削除へ分類。Tantivy の path 集合は照合しない |
 | [search_watcher.rs](../src/search_watcher.rs) | notify-rs `ReadDirectoryChangesW` ラッパ + 500ms debounce |
 | [ingest_worker.rs](../src/ingest_worker.rs) | メタ抽出 + Tantivy buffer + バッチ commit + fts_meta 状態遷移 |
 | [ingest_text.rs](../src/ingest_text.rs) | `PerSourceText` (filename / exif / xmp_tweet / png_prompt / pdf_meta / video_meta / sidecar、旧 tags はschema互換用) ビルダー |
@@ -132,7 +132,7 @@ Ctrl+S / Ctrl+F の UI は [ui_main.rs](../src/ui_main.rs) の
 | --- | --- | --- | --- |
 | `settings.json` | `FavoriteEntry { id, name, path, auto_index_{structure,metadata,thumbs} }` + `tags: Vec<TagDef>` | [settings.rs](../src/settings.rs) | UUID が欠けている行は起動時に発行し書き戻し |
 | `search_index.db` | Ctrl+S 用フォルダ/ZIP/PDF/動画名 index (SQLite LIKE で引く) | `search_index_db.rs` | `indexed_by_auto` 列で手動/自動エントリを区別 |
-| `fts_index/` | Tantivy index ディレクトリ (複数 segment ファイル + meta.json)。**INDEX_VERSION=5 以降は per-source `*_text` フィールドが STORED で原文を保持** | `fts_index.rs` → IngestSession | schema 変更は `schema_is_stale` (STORED 必須含む) で検出し全消去 + 再構築。semantic version 移行は `fts_meta.db` の durable marker に従い、旧 directory を消してから開く。`tags` フィールドはschema互換用で検索/移行対象外 |
+| `fts_index/` | Tantivy index ディレクトリ (複数 segment ファイル + meta.json)。**INDEX_VERSION=5 以降は per-source `*_text` フィールドが STORED で原文を保持** | `fts_index.rs` → IngestSession | schema mismatch/missing/pending/semantic version 移行は共通 owner が SQLite inventory/scan印 reset + pending を durable commit してから旧 directory を wipe/create/open。新 reader まで成功後だけ pending clear。`tags` フィールドはschema互換用で検索/移行対象外 |
 | `fts_meta.db` | `files(path PK, favorite_id, kind, mtime, size, indexed_at, index_version, index_generation, status)` + `index_state` — INDEX_VERSION=5 で `*_norm` 列群を撤去し管理メタ専用に縮小 | `fts_meta.rs` | v9→v10 では files 再作成・version bump・`tantivy_rebuild_pending=1` を同じ transaction で確定。新 Tantivy index の open 成功後だけ marker を消す |
 | `tags.db` | `item_tags(item_key, tag, tag_key, applied_at)` / `tag_item_state` / `tag_meta`。mIV タグの正本 | `tags_db.rs` / `tag_write_worker.rs` | `tag_key` は NFKC + lowercase + `#` なし。Tantivy/XMP移行の既存marker/source行は歴史値として保持。任意のタグsidecar backup import同期状態もここに置く |
 
@@ -190,15 +190,17 @@ EPUB 内のタイトル・著者も索引しない。取込失敗として記録
 App 起動
   └─ IndexerManager::new
        ├─ FtsMetaDb を open
-       ├─ durable rebuild pending なら旧 fts_index を wipe (失敗時は旧 index を開かない)
-       ├─ FtsIndex を openし、成功後だけ rebuild pending を clear
+       ├─ pending 無しの場合だけ旧 Tantivy を非破壊 probe (read/parse error は missing と扱わない)
+       ├─ pending / missing / stale なら SQLite の files reset + scanned_once clear + pending=1 を先に durable commit
+       ├─ probe handle を drop、旧 fts_index を wipe、新 index/reader を create/open
+       ├─ 成功後だけ rebuild pending を clear (pending 有りでは旧 index の probe/open をしない)
        ├─ manager worker で起動時 reconciliation (§4.3) と所有範囲外 cleanup
        └─ cleanup 完了後、実効 metadata / similar が有効なお気に入りごとに
             IndexerSupervisor::spawn  (1 お気に入り 1 本、以降ずっと常駐)
 
 IndexerSupervisor (スレッド 1 本):
   1. FsWatcher 起動 (notify-rs + 500ms debounce)
-  2. search_walker::scan  …… 初期スキャン (3-way diff)
+  2. search_walker::scan  …… 初期スキャン (FS ↔ SQLite の3分類)
          FS にあり DB になし → ingest queue
          DB にあり FS になし → delete queue
          両方あり mtime/size 差、または UUID/root の所有者不一致 → 再 ingest queue
@@ -217,10 +219,22 @@ entry error、file_type / 特殊エントリ分類 / metadata 取得失敗、深
 Incomplete とし、その走査では削除候補を生成しない。観測できた新規・変更ファイルの
 取り込みは継続する。存在しない root も read_dir 失敗なので、読めなかった既存行を保持する。
 診断には `entry_errors` と `classification_errors` も残し、supervisor のログに完全性を出す。
-取消は結果を成功として返さず、既存の取消経路で終了する。
+通常の取消は `ScanError::Cancelled` で終了し、成功や再構築予約へ進まない。
+SQLite の inventory 読取失敗は `ScanError::Metadata` として区別し、共通 reporter の
+log/通知/pendingへ進む。実際の SQL エラーを、その後に立った cancel フラグや文字列判定で
+通常取消へ置き換えない。
 この型は観測の完全性だけを表し、書き込みの成功や Full 全体の成功を保証しない。
 Full 全体の `FullScanOutcome::Complete` でだけ起動省略の印を立てる
 (詳細・検証は [起動スキャン計画](startup-index-scan-plan.md) §11)。
+
+お気に入り編集は、FTS の `FullScanOutcome` と名前索引の `NameFullScanOutcome` を表示する。
+監視開始/初回表示の完了フラグが true でも、最後の Full が Failed なら「作成失敗」、
+FTS の Incomplete は「確認未完了」、Stopped/Cancelled は「確認中止」と表示する。
+新しい Full の実行中は「スキャン中」、正常完走と正常な起動確認省略は従来の「監視中」。
+外側/重複のお気に入りも実効所有者集合の失敗を表示する。FTS の共有 maintenance snapshot は
+次回起動再構築の予約、または予約自体の失敗をダイアログ全体に残す。UI は SQL/I/O/待機をしない。
+名前索引の Full 表示訂正は、DB 書込失敗の通知/marker 接続を直したという意味ではない。
+その対応は [バックログ §1.369](next-release-backlog.md#1369-名前コンテナ索引-ctrls-の書込失敗が通知再構築へ揃っていない--1367からの引き継ぎコード調査-2026-10-11) に残る。
 
 metadata の所有範囲は `metadata_ownership` が純関数で決める。最深 root が所有し、
 同じ正規化 root は UUID 文字列順の最小値で決着する。共通除外と内側の所有 root を
@@ -266,19 +280,21 @@ writer dispatcherのreply待ちが無期限だったため、cancelを観測で�
 
 v2.3.0第12弾では次を不変条件とする。
 
-- walk entryと3-way diff、delete / ingest loopにcancel checkpointを置く。
+- walk entryとFS ↔ SQLite差分、delete / ingest loopにcancel checkpointを置く。
 - I/O permitとdispatcher replyは50ms timeoutでcancelを再確認する。cancel後は未flush batchを
   submitせず、受信済みを含むwatcher queueも捨てる。
 - IndexerManager dropはmanager-wide 4秒 deadlineでjoinし、未完了handleはdetachする。
   final commitとdispatcherの最終Dropはbackground finalizerがbest-effortで担当する。
 - submit済みbatchがcancel後にTantivyだけへ反映されても、SQLiteを先行更新しない
-  Tantivy Firstを維持する。次回起動時のFS / Tantivy / fts_meta 3-way diffが再投入・再削除する。
-  `skip_offline_change_scan` ON で省略した起動ではこの補修を行わず、[今すぐ確認] で確認する。
+  Tantivy Firstを維持する。Full の FS ↔ SQLite 差分は追加・変更・削除候補を再投入するが、
+  SQLite の署名が変わらない Ok 行に対応する全文文書の欠落は検出できない。
+  `skip_offline_change_scan` ON で省略した起動では Full 自体を省く。[今すぐ確認] も
+  同じ差分経路であり、Tantivy の全欠落を補修する保証はない。
 
 ### 4.2 書き込みプロトコル (Tantivy First, INDEX_VERSION=6)
 
 `fts_meta.db` (SQLite) と Tantivy index は別ストレージ。INDEX_VERSION=6 から
-**Tantivy First** に統一: Tantivy commit が成功したフレームでのみ SQLite を
+**Tantivy First** に統一: Tantivy commit と reader reload が成功した後にだけ SQLite を
 更新する。SQLite の `status` は `Ok` / `Failed` の 2 値だけで、Pending / Tombstone
 の中継状態は廃止した。検索 post-filter (`fts_meta` への SQLite SELECT) も廃止。
 
@@ -288,8 +304,8 @@ v2.3.0第12弾では次を不変条件とする。
 (1) IndexDoc を構築 (メタ抽出 + norms 生成、SQLite には触れない)
 (2) Tantivy writer に delete(path) + add_document を push (バッファに積む)
 (3) バッチ境界 (100 件 or 5 秒) で IndexWriter::commit() + reader reload
-(4) commit 成功後に fts_meta.db UPSERT status=Ok, index_generation += 1
-    (ここで失敗してもログだけ。次回起動の walker 3-way diff で再 ingest される)
+(4) commit + reload 成功後に fts_meta.db UPSERT status=Ok, index_generation += 1
+    (失敗は共通 reporter の log + 通知 + durable rebuild pending へ)
 ```
 
 #### Delete
@@ -297,37 +313,45 @@ v2.3.0第12弾では次を不変条件とする。
 ```
 (1) Tantivy writer に delete_term(path) を push
 (2) バッチ境界で commit + reader reload
-(3) commit 成功後に fts_meta.db DELETE
-    (失敗時は SQLite に行残る → 次回 walker が「FS なし + DB あり」で再 delete)
+(3) commit + reload 成功後に fts_meta.db DELETE
+    (失敗は共通 reporter へ。次回起動に両ストアを共通順序で再構築)
 ```
 
 #### クラッシュからの復旧
 
 | クラッシュ位置 | Tantivy | SQLite | 復旧経路 |
 |---|---|---|---|
-| (1) 前 / (2) 前 | 古い | 古い | walker は何も拾わない |
-| (3) commit 中 | 古い or 新 | 古い | walker が「FS あり + DB 古い」→ 再 ingest |
-| (3) と (4) の間 | 新 | 古い | walker が「FS あり + DB 古い」→ 再 ingest (Tantivy 上書き) |
+| (1) 前 / (2) 前 | 古い | 古い | FS/SQLite 署名に差があれば Full が候補化 |
+| (3) commit 中 | 古い or 新 | 古い | FS/SQLite 署名に差があれば再 ingest。捕捉した永続化失敗は pending へ |
+| (3) と (4) の間 | 新 | 古い | 署名に差があれば再 ingest。同じ署名の既存 Ok との不一致は Full だけで検出できない |
 | (4) 後 | 新 | 新 | OK |
 
 中間状態 (Tantivy だけ新) で検索結果が一瞬古い text を返し得るが、削除直後の
 削除済みファイルが結果に出るのと同じ "短い窓" として許容する (実害はサムネイル
 読み込み失敗で気付ける)。
 
-上記の「次回起動で補修」は初回 Full を実行する場合の説明である。
-`skip_offline_change_scan` ON で印を再利用した場合、クラッシュや書き込み途中終了で残った
-両ストアの不一致も自動では確認しない。これは設定の許容範囲で、[今すぐ確認] で照合する。
+Full は FS ↔ SQLite を照合し、Tantivy 全 path を照合しない。「3-way diff」は追加・変更・削除の
+3分類を指した旧呼称で、3ストアの整合保証ではない。既存 Ok の更新時に delete だけが可視化され、
+commit/reload に失敗すると、SQLite の古い Ok が残って Full で欠落を検出できない場合がある。
+捕捉した commit/reload/SQLite apply/cleanup と実行由来の自動 merge 永続化失敗は共通 reporter へ
+集約し、log + 通知 + 次回起動再構築を予約する。この session で wipe/reopen や自動 Full retry はしない。
+build failure、取消、writer kill による未実行 task は永続化失敗と区別する。
+プロセスの abrupt termination は通知や marker の完了を保証しない。count 点検も全整合の証明ではない。
 
 ### 4.3 起動時 reconciliation
 
-`IndexerManager::new` が supervisor spawn 前に同期実行する:
+`IndexerManager::new` のストア open と、非同期 manager worker の startup cleanup を区別する。
+worker は `Runtime::start` で spawn され、manager constructor / IndexerInit result送信 / overlay解除は
+worker 完了を待たない。worker の supervisor spawn 前に次を実行する:
 
 - `status=Failed` の行 → Tantivy delete_term + SQLite delete_paths
   (legacy v5 DB から migrate された Pending/Tombstone もここに集約される)
-- `index_version` 不一致 → SQLite transaction で `files` 再作成と durable rebuild marker を確定し、
-  旧 `fts_index/` を wipe してから新 index を開く。wipe / open / marker clear の失敗時は旧 index を
-  公開せず、marker を残して次回起動で再試行する
-- `fts_index/` schema 不一致 → Tantivy の既存 schema 判定で全再構築
+- pending/版移行/missing/schema mismatch の再構築は worker 開始前の
+  `open_stores_with_rebuild_sync` が所有する。先に SQLite transaction で `files` と全 scan 印を
+  reset、pending=1 を durable commit し、旧 handle を dropしてから wipe/create/openする。
+  pending があれば旧 meta.json/.managed.json が壊れていても probe せずこの経路へ進む。
+  NotFound 以外の wipe error では create/open せず終了し、open 成功後だけ marker を消す。
+  SQLite read/parse error を missing に倒したり、保存 DB を消したりしない。
 
 所有範囲外の掃除も含め、manager worker 内で reconciliation の完了後に supervisor を
 起動する。UI は待たず、Tantivy の書き込みは単一 dispatcher が所有する。
@@ -350,6 +374,16 @@ schema 再構築・rebuild pending でも全印を消し、同じ起動で古い
 
 VACUUM 等の housekeeping は起動経路から外し、全 supervisor が初期 scan を完了して
 idle になった最初のフレームで `spawn_housekeeping` から別スレッドで走らせる。
+
+起動 count 点検は Cargo feature `fts-startup-integrity` の opt-in、既定 OFF。
+既存 owner covering scan の行数を再利用し、全 files の `status != 0` を部分 index で数え、
+`ok_rows = owner_rows - not_ok_rows` と loaded Searcher の `num_docs()` (生存文書数) を比較する。
+worker 内の固定構成、cleanup delete/commit・Failed reconciliation・supervisor spawn 前の snapshot を使う。
+追加全件走査/index/migration/commit/reload、UI の SQL や completion barrier はない。
+`live_docs < ok_rows` は欠落疑いで通知/pendingへ進む。逆は「件数不足を検出しなかった」だけで、
+Tantivy-only/重複が欠落を相殺できる。Failed が大量なら count の費用も増える。
+[起動 A/B 計測手順](fts-startup-ab-measurement.md) の全条件で遅延なしの証拠を得るまで採用しない。
+未計測/欠落/ノイズ/悪化なら本リリースで点検を採用せず、他の修正は点検 OFF で進める。
 
 ### 4.4 コンテナ索引 (Ctrl+S 用)
 
@@ -435,7 +469,8 @@ clear 失敗を放置すると古い結果が出る。失敗時は名前 DB の�
      フォルダを fav の行として誤投入する事故になる)
    - **`Err(e)`** → アクセス拒否 / 一時ロック / NAS 切断などの曖昧状態。
      `crate::logger::log` に warn を残し、**破壊的 cleanup も再帰 upsert も
-     一切走らせない**。次回 watcher イベント / 次回起動時 walker 3-way diff が拾い直す。
+     一切走らせない**。次回 watcher イベント / Full の FS ↔ SQLite 差分で候補に戻る場合がある。
+     同じ署名の Ok に対応する全文欠落は保証しない。捕捉した永続化失敗は pending へ進む。
      `skip_offline_change_scan` ON で初回 Full を省略した起動は拾い直さず、[今すぐ確認] で確認する
 
 3. **subtree scan の不完全観測時は post-scan prune を skip**:
@@ -463,7 +498,7 @@ SMB / NAS では `ReadDirectoryChangesW` が発火しないケースがあるの
 
 - ZIP ファイル自体: アイテム索引には登録しない。`search_walker` は ZIP を
   `fs_map` に入れない (`CandidateKind::Zip` を作らない) ので、過去バージョンが
-  登録した ZIP doc は 3-way diff で「FS になし + DB あり」と判定され `to_delete`
+  登録した ZIP doc は FS ↔ SQLite 差分で「FS になし + DB あり」と判定され `to_delete`
   に落ちて Tantivy から消える (docs/search-container-item-redesign.md §3.2 / task#1)。
 - ZIP 内画像: **どのモードでもメタ検索しない**。アイテム索引は ingest せず、
   Ctrl+F も ZIP 表示中はファイル名フィルタのみ (§5.2、同 §4.1.2)。ZIP は seek
@@ -497,7 +532,7 @@ SMB / NAS では `ReadDirectoryChangesW` が発火しないケースがあるの
   ファイル名だけを `name` へ登録する。ID3 等の曲名・アーティスト・アルバム情報は将来機能。
 - `kind` は既存の Tantivy `STRING | STORED` フィールドへ `audio` を追加するだけで、schema は
   変わらない。`INDEX_VERSION` は bump せず、既存ユーザーの音声は次回 supervisor 初期 scan の
-  FS/DB 3-way diff で「FS にあり DB になし」として自然に追加される。
+  FS ↔ SQLite 差分で「FS にあり DB になし」として自然に追加される。
 - watcher 差分も同じ共通拡張子判定を使い、新規追加・rename・更新を `CandidateKind::Audio` として
   ingest する。結果は Flat / DrilledInto の共通 materialize で `GridItem::Audio` へ変換する。
 
@@ -536,7 +571,7 @@ catalogは保持し、v1.0〜v1.3から直接更新する旧タグは取り込�
   `diff_mtime = max(画像 mtime, サイドカー mtime)` と
   `diff_size = 画像 size + サイドカー fingerprint` (ファイル名 + size の安定ハッシュ、無しは 0) を
   織り込む (`CandidateFile.diff_mtime` / `diff_size`)。これでサイドカーの追加・編集・削除に加え、
-  優先順位プローブの結果が別ファイルに変わったケース (同 mtime/size でも) も 3-way diff で検出される。
+  優先順位プローブの結果が別ファイルに変わったケース (同 mtime/size でも) も FS ↔ SQLite 差分で検出される。
   Tantivy doc の `mtime` は画像本体のまま (日付ソートがサイドカー編集時刻に引きずられない)。
 - **監視追従**: `.json`/`.txt` の変更イベントは `indexer_supervisor::apply_single_change` が
   `external_metadata::images_for_sidecar` で兄弟画像へ逆引きして再 ingest に変換する
@@ -752,21 +787,22 @@ Tantivy に渡すと position=0 由来で誤判定するため **post-filter 側
 | --- | --- | --- |
 | `search_index.db` | Ctrl+S (フォルダ/ZIP/PDF/動画名) | 既存の手動 index 生成と互換。粒度が荒く SQLite LIKE で十分。書き込み先が SQLite 単独なので 複数 supervisor が真並列で動ける |
 | `fts_index/` (Tantivy) | bigram 候補絞り込み + 検索原文 (`*_text` STORED) | Lucene 系 segment 構造。bigram 索引 + post-filter 用原文を集約することでクエリ経路から SQLite を外している |
-| `fts_meta.db` (SQLite) | ファイル管理メタ (path / mtime / size / status=Ok\|Failed / index_generation) | 差分検出 (walker) の高速 IN 句 lookup、Tantivy に「どの doc が最新か」の真実の源、起動時 reconciliation で Failed 行を再 ingest 候補に集める |
+| `fts_meta.db` (SQLite) | ファイル管理メタ (path / mtime / size / status=Ok\|Failed / index_generation) | FS ↔ SQLite 差分の lookup と inventory。Ok は全文文書の現存証明ではない。起動時 reconciliation で Failed 行を整理し、該当 root の Full を要求する |
 
 検索原文を Tantivy に集約しているのは、Ctrl+G の post-filter ループから SQLite SELECT を
 外して Mutex contention を消すため (INDEX_VERSION=6)。`fts_meta.db` を完全廃止しないのは、
-ファイル単位の差分検出 (walker の 3-way diff) と起動時 reconciliation で SQL の集合演算を
+ファイル単位の差分検出 (walker の FS ↔ SQLite 照合) と起動時 reconciliation で SQL の集合演算を
 使えると実装が単純になるから。
 
 ### 6.3 なぜ Tantivy First 書き込み順序 (§4.2) か
 
 fts_meta.db と Tantivy の書き込みは別ストレージなので、片方だけ成功してクラッシュ
 すると検索結果に古い doc が残る or 正しい doc が出ないケースが発生する。
-INDEX_VERSION=6 は **Tantivy commit 成功フレームでのみ SQLite を更新する**
-(Tantivy First) ことで、SQLite=Ok かつ Tantivy 未反映という状態を作らない。
-中断は walker の 3-way diff (FS / Tantivy / SQLite) で「FS あり + DB なし」
-として再 ingest される。Tantivy commit は fsync を伴い高コストなので、
+INDEX_VERSION=6 は **Tantivy commit + reader reload 成功後にだけ SQLite を更新する**
+(Tantivy First) ことで、新規 Ok の先行公開を防ぐ。既存 Ok の更新・削除時に古い行と全文文書が
+不一致になる failure window は残るため、捕捉した永続化失敗は共通 reporter の pending へ進む。
+walker は「FS あり + DB なし」や署名差を再 ingest するが、同じ署名の Ok に対応する全文欠落を
+保証付きで検出する経路ではない。Tantivy commit は fsync を伴い高コストなので、
 100 件 / 5 秒のバッチ境界で commit し、その境界で SQLite を upsert / delete する。
 
 ### 6.4 なぜ Searcher snapshot を固定するか
@@ -956,14 +992,15 @@ Ctrl+Fだけは一覧内filterなので、移譲されたcontextを復元し、�
    を通す (大文字小文字 / 区切り文字 / ZIP エントリ形式)。`normalize_for_match`
    (テキスト側) も同様。
 2. **Tantivy writer は 1 本**: 新しい書き込み経路 (別 worker) を足すなら
-   `IndexerManager.writer` を共有する。独自に `fts.writer()` を呼ぶと `LockBusy`
+   `FtsWriterDispatcher` を共有する。独自に `fts.writer()` を呼ぶと `LockBusy`
    で全 upsert が無効化される。
 3. **Supervisor の drop 順序**: App drop 時は supervisor → FsWatcher → tempdir
    の順で閉じる。Windows で「使用中のファイルを削除できない」エラーを避ける。
 4. **Tantivy First の書き込み順序を崩さない**: ingest の順序 (IndexDoc 構築 →
-   Tantivy batch commit → SQLite upsert_meta_ok / delete_paths) は順番入替・
-   削減しない。failure はキャッシュせず次回起動時の walker 3-way diff で補修
-   する前提。`skip_offline_change_scan` ON で初回 Full を省略した起動では補修しない。
+   Tantivy batch commit + reader reload → SQLite upsert_meta_ok / delete_paths) は順番入替・
+   削減しない。永続化 failure は共通 reporter の log/通知/pendingへ接続する。
+   Full は FS ↔ SQLite 差分なので全文欠落の万能修復ではない。runtime で wipe/reopen しない。
+   再構築は SQLite reset/scan印 clear/pending durable → handle drop → wipe/create/open → pending clear の順。
 5. **新しい SourceKind / IndexKind を追加するなら**: `fts_index::Fields` /
    `IndexDoc` / `fts_meta::files` テーブル / `PerSourceText` / UI の
    `TargetChoice` / `KIND_CHOICES` / `search_page` のすべてに反映する。

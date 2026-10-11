@@ -29135,7 +29135,20 @@ impl App {
                     miv_startup::Lane::Indexer,
                     miv_startup::Stage::IndexerResultSend,
                 );
+                let ready = matches!(
+                    &outcome,
+                    crate::indexer_manager::StartupInitOutcome::Ready(_)
+                );
                 let accepted = tx.send(outcome).is_ok();
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "startup",
+                        "indexer_init_result_send",
+                        None,
+                        0,
+                        &[("accepted", accepted.into()), ("ready", ready.into())],
+                    );
+                }
                 sent.finish(if accepted {
                     miv_startup::Outcome::Ok
                 } else {
@@ -30084,6 +30097,15 @@ impl App {
             previous
         });
         if overlay_was_visible && !overlay_now {
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "startup",
+                    "indexer_overlay_cleared",
+                    None,
+                    0,
+                    &[("ready", self.indexer_init.is_some().into())],
+                );
+            }
             self.consume_input_during_startup(ctx);
         }
         if self.indexer_init.pending().is_some() {
@@ -30121,6 +30143,9 @@ impl App {
             crate::indexer_manager::StartupInitOutcome::Ready(manager) => {
                 // Current SW_HIDE state, not a snapshot taken when the worker began.
                 manager.set_io_throttled(!self.window_visible);
+                if crate::perf::is_enabled() {
+                    crate::perf::event("startup", "metadata_search_ready", None, 0, &[]);
+                }
                 IndexerInit::Ready(manager)
             }
             crate::indexer_manager::StartupInitOutcome::Unavailable => {
