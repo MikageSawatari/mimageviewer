@@ -1731,7 +1731,7 @@ Ctrl+ホイールなど固定扱いの入力は従来どおり。
 HUD/任意キーの保存は既存overflowのナビゲータ設定と同じ同期 `Settings::save()` を再利用する（2026-10-11設計担当ClaudeCodeの判断）。専用async保存や別のdirty stateは追加しない。
 `FsPageTurnAnimationToggle` は `FsImage` / Press、既定キーなし。操作カスタマイズで割り当てるとHUDに先頭chordを表示する。
 overflowの表示項目カスタマイズや別のtoolbar/HUD設定は追加しない。
-評価用Stage 1では、通常単ページと二実頁の見開きの一枚を背から回し、perspective・頁の明暗・柔らかい影を付ける。LTR/RTL・進む/戻るに対応し、頁ごとの通常rect/UVを維持する。異寸法・scanの数px差だけでは省略せず、背の移動による静止面のclip/support欠損は各2%の仮品質上限で判定する。紙の未知の裏はneutral paperで、画面背景を流用しない。
+評価用Stage 1では、通常単ページと二実頁の見開きの一枚を背から回し、perspective・頁の明暗・柔らかい影を付ける。LTR/RTL・進む/戻るに対応し、頁ごとの通常rect/UVを維持する。異寸法Pairはleafと同じprogressで背と各静止頁を平行移動し、incomingの通常配置へsnap無しで着地する。通常scanの背差だけで省略しない（2026-10-11利用者option A、page-turn plan §23）。紙の未知の裏はneutral paperで、画面背景を流用しない。有限pin枠はfullscreen予算10%（固定128 MiB cap撤去）、VRAM無制限時は1 GiBで、全資源のdedup/lease・memory_pressure省略は維持する。
 cover/補助表紙・相方白紙・見開き内の中央単頁・splitのstepはStage 1では理由付きinstant。受理時の表示可能なresident素材（非AI通常画像・preview・thumbnailを含む）で開始し、final-onlyは撤回する。無素材・faithful表示制約・ROI不足・予算不足は理由付き瞬時切替。演出と着地flat採用までは同じ素材・geometryを保持し、その後通常表示のAI/高品質更新へ戻る。追加decode/uploadや品質待ちは行わない。新under-pageの外周は同じ時計の拡張clipで連続的に露出する。
 部分leafの採用は各頁のfirst-visible計測だけでnavigationを完了しない。自然終了/割込みはtarget全頁のcanonical flat採用後に完了し、割込みの一件は次の有効frameでinstant navigationする。通常一〜二frameの費用を持ち、turn完走待ちやOFF時の新queueは作らない。終了入力を先に解決し、commit後の正本から描画/入力情報と描画ownerを捕捉する。動画継続は旧canvas/footerを終了して既存媒体切替へ戻し、F12 independent stillの動画拒否を維持する。
 

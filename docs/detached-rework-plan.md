@@ -1455,6 +1455,11 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-11 §1.341 Pairの移動背とpin枠（構造確認待ち）
+
+利用者option Aによりprojectionのframe-local H/static poseを共通progressで移す。canonical destination clipは既存transform viewportとpainter clipの交差から捕捉する。context resource、normal mount/deposit/fork、native viewport dispatch/placementは変更しない。pin gateを共通helperへまとめ、測定に基づき固定128 MiB capを撤去（有限fullscreen10%、無制限1 GiB）。shared weak inventory/dedup/batch leaseとcontext別退役を維持し、兄弟contextを消さない。これはprojectionと既存pin admissionの構造変更であり、独立確認・実機受入れは未了。
+
+
 ### 2026-10-11 §1.341 resident素材でのturn開始（構造確認待ち）
 
 利用者決定のfinal-only撤回に従い、contextのAcceptedOfferがincoming typed resident resourceとlogical content bindingを所有する。共有weak inventoryへaccept source pinを加え、通常prepare後のnative ROIもdedup会計する。turnとcanonical flat採用までは保持素材・最初のplacementを使い、通常producer/upgradeは止めない。source品質publicationのinput epoch更新と実編集を分け、当該contextのitem/edit/params/comic/view/layout bindingを維持する。既存close→continuation commit→captureとflat-firstで保持を解く。fork、park/mount/deposit、兄弟cancel、F12動画拒否、viewport/native生成経路は変更しない。変更範囲はui_fullscreen.rsの通常selector/prepare済素材束縛、page_turn.rs/barrier.rsのowner/lease/採用照合、回帰fixture。新pending・queue・wait・producerを作らない。詳細はpage-turn plan §22。独立構造確認・完了レビューや実窓受入れの合格は主張しない。

@@ -9,6 +9,8 @@ mod barrier;
 mod input_regression_tests;
 #[cfg(test)]
 mod nonfinal_tests;
+#[cfg(test)]
+mod spine_budget_tests;
 use barrier::{FlatCompletion, ResolvedPageTurnNavigation};
 
 static NEXT_OPERATION_BATCH: AtomicU64 = AtomicU64::new(1);
@@ -726,6 +728,16 @@ fn same_fit_policy(a: FullscreenFitInput, b: FullscreenFitInput) -> bool {
         ) => a == b && am == bm,
         _ => a.mode() == b.mode(),
     }
+}
+
+// Reservations are globally deduplicated and include both normal sources and
+// prepared ROI outputs. The old 128 MiB ceiling rejected resident 8K comics even
+// with ample configured VRAM (2026-10-11: 737 MiB measured, 756 MiB with
+// the incoming ROI estimate from previous ordinary prepares).
+fn page_turn_pin_limit(budget: crate::vram_budget::VramPoolBudget) -> u64 {
+    budget
+        .fullscreen_bytes
+        .map_or(1024 * 1024 * 1024, |bytes| bytes / 10)
 }
 
 fn same_underlay(a: &FsBgStyle, b: &FsBgStyle) -> bool {
@@ -1736,9 +1748,7 @@ impl App {
             ready_sources.account(&mut accountant);
             accountant.finish().total_bytes()
         };
-        let limit = budget
-            .fullscreen_bytes
-            .map_or(128 * 1024 * 1024, |b| (b / 10).min(128 * 1024 * 1024));
+        let limit = page_turn_pin_limit(budget);
         if budget.pool_bytes.is_some_and(|cap| resident_bytes > cap) {
             emit(
                 &fact,
@@ -1762,6 +1772,15 @@ impl App {
                     ("resident_bytes", resident_bytes.into()),
                     ("pin_bytes", pin_bytes.into()),
                     ("pin_limit_bytes", limit.into()),
+                    (
+                        "fullscreen_budget_bytes",
+                        serde_json::json!(budget.fullscreen_bytes),
+                    ),
+                    ("pool_budget_bytes", serde_json::json!(budget.pool_bytes)),
+                    (
+                        "pin_limit_policy",
+                        "fullscreen_tenth_or_unlimited_1gib".into(),
+                    ),
                 ],
             );
             self.page_turn_presentation.state = PresentationState::Flat(outgoing);
@@ -1783,6 +1802,9 @@ impl App {
                 ("resident_bytes", resident_bytes.into()),
                 ("pin_bytes", pin_bytes.into()),
                 ("pin_limit_bytes", limit.into()),
+                ("fullscreen_budget_bytes", serde_json::json!(budget.fullscreen_bytes)),
+                ("pool_budget_bytes", serde_json::json!(budget.pool_bytes)),
+                ("pin_limit_policy", "fullscreen_tenth_or_unlimited_1gib".into()),
                 ("accepted_quality", serde_json::json!(ready_sources.0.iter().map(|s| serde_json::json!({"idx":s.occurrence.idx,"quality":s.quality,"size":s.resource.size()})).collect::<Vec<_>>())),
             ],
         );
@@ -1925,10 +1947,8 @@ impl App {
                             // Include the ordinary prepared native ROI as well as
                             // the accepted source, globally deduplicated.
                             let pin_bytes = self.page_turn_leases.reservation_bytes_with(&unit);
-                            let limit = self
-                                .vram_pool_budget()
-                                .fullscreen_bytes
-                                .map_or(128 * 1024 * 1024, |b| (b / 10).min(128 * 1024 * 1024));
+                            let budget = self.vram_pool_budget();
+                            let limit = page_turn_pin_limit(budget);
                             if pin_bytes > limit {
                                 offer.submission.end();
                                 emit(
@@ -1939,6 +1959,15 @@ impl App {
                                         ("sub_check", "prepared_incoming_roi".into()),
                                         ("pin_bytes", pin_bytes.into()),
                                         ("pin_limit_bytes", limit.into()),
+                                        (
+                                            "fullscreen_budget_bytes",
+                                            serde_json::json!(budget.fullscreen_bytes),
+                                        ),
+                                        ("pool_budget_bytes", serde_json::json!(budget.pool_bytes)),
+                                        (
+                                            "pin_limit_policy",
+                                            "fullscreen_tenth_or_unlimited_1gib".into(),
+                                        ),
                                     ],
                                 );
                                 PresentationState::Flat(unit.clone())
@@ -2501,6 +2530,7 @@ fn unit_diagnostics(unit: &PaintedUnit, offer: &AcceptedOffer) -> serde_json::Va
                 "source_generation":resource.source_generation().map(|g|serde_json::json!({"items":g.items,"input":g.input})),
                 "visible_source_roi":resource.visible_source_uv_rect().map(rect_diagnostics),
                 "canonical_rect":rect_diagnostics(page.transform.paint_rect),"clip_rect":rect_diagnostics(page.painter.clip_rect()),
+                "effective_projection_clip":rect_diagnostics(page.painter.clip_rect().intersect(page.transform.viewport_rect)),
                 "normal_layout_spine":page.spine.map(|(h, g)|serde_json::json!({"hinge_x":h,"gutter_width":g})),
                 "viewport_rect":rect_diagnostics(page.transform.viewport_rect),"pixels_per_point":page.transform.pixels_per_point,
                 "uv":uv.map(|p|[p.x,p.y]),"quality":"normal_selected_processed_resource"
@@ -2623,7 +2653,14 @@ fn canonical_unit(
         pages.push(CanonicalPage {
             occurrence: Some(i as u64),
             rect: page.transform.paint_rect,
-            clip_rect: page.painter.clip_rect(),
+            // Painter scissor depends on whether this page has trim. The actual
+            // image destination remains the transform viewport for both pages.
+            // Intersect them before comparing/projecting destinations, rather
+            // than mistaking optional trim clipping for a viewport change.
+            clip_rect: page
+                .painter
+                .clip_rect()
+                .intersect(page.transform.viewport_rect),
             material,
             underlay: Some(underlay),
         });
@@ -2750,6 +2787,43 @@ mod tests {
             evidence: AcceptanceEvidence::Immediate,
             content: Vec::new(),
         })
+    }
+
+    #[test]
+    fn page_turn_destination_clip_is_the_canvas_not_the_optional_trim_scissor() {
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "clip-policy",
+            egui::ColorImage::filled([32, 32], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let mut outgoing = unit(&ctx, texture.clone(), 1);
+        let mut incoming = unit(&ctx, texture, 1);
+        let viewport = outgoing.pages[0].transform.viewport_rect;
+        Arc::get_mut(&mut outgoing).unwrap().pages[0].painter =
+            ctx.debug_painter().with_clip_rect(viewport.expand(20.0));
+        Arc::get_mut(&mut incoming).unwrap().pages[0].painter =
+            ctx.debug_painter().with_clip_rect(viewport);
+        let old = canonical_unit(&outgoing).unwrap();
+        let new = canonical_unit(&incoming).unwrap();
+        assert_eq!(old.pages[0].clip_rect, viewport);
+        assert_eq!(old.pages[0].clip_rect, new.pages[0].clip_rect);
+        let direction = crate::page_turn_animation::TurnDirection {
+            reading_rtl: false,
+            forward: true,
+        };
+        assert!(crate::page_turn_animation::prepare_turn(&old, &new, direction).is_ok());
+        // An actually narrower destination is still not the same canvas.
+        Arc::get_mut(&mut incoming).unwrap().pages[0].painter = ctx.debug_painter().with_clip_rect(
+            egui::Rect::from_min_max(viewport.min, viewport.max - egui::vec2(1.0, 0.0)),
+        );
+        let different = canonical_unit(&incoming).unwrap();
+        assert_eq!(
+            crate::page_turn_animation::prepare_turn(&old, &different, direction)
+                .unwrap_err()
+                .sub_check(),
+            "destination_clip_changed"
+        );
     }
 
     #[test]

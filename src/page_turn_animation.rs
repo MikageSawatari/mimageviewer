@@ -1,4 +1,4 @@
-//! Pure book-leaf projection. Materials and per-page placements are immutable;
+//! Pure book-leaf projection. Materials and canonical placements are immutable;
 //! this module performs no source resolution, decoding, upload or I/O.
 use egui::{Color32, Mesh, Pos2, Rect, TextureId, pos2};
 
@@ -138,6 +138,9 @@ enum FaceOwner {
 }
 struct Surface<'a> {
     page: &'a CanonicalPage,
+    /// Destination placement of this immutable page, independent of the
+    /// revealed polygon. Translation preserves its size and printed UV basis.
+    rect: Rect,
     polygon: Vec<Pos2>,
     owner: FaceOwner,
     alpha: f32,
@@ -236,9 +239,18 @@ pub(crate) fn prepare_turn(
                 break;
             }
         }
-        accepted.ok_or(ProjectionFailure::IncomingNotVisible(
-            "initial_target_visibility",
-        ))?
+        if old.layout == UnitLayout::Spread {
+            // Canonical flat adoption alone completes navigation. A narrow
+            // incoming under-page may initially be hidden by a wider leaf;
+            // start the compatible turn without inventing visible area or
+            // forcing a dramatic initial tilt. Its real first-visible receipt
+            // arrives later as the leaf clears it.
+            accepted.unwrap_or(30.0_f32.to_radians())
+        } else {
+            accepted.ok_or(ProjectionFailure::IncomingNotVisible(
+                "initial_target_visibility",
+            ))?
+        }
     };
     let grid = if mesh_error_bound(old, new, 16, 4) <= 0.5 {
         (16, 4)
@@ -274,7 +286,7 @@ pub(crate) fn project_prepared(
         cost.outer_mask_cpu_ms = start.elapsed().as_secs_f64() * 1000.0;
     }
     let receipt = visibility(&scene, new, old);
-    if progress == 0.0 && !meaningful(&receipt) {
+    if progress == 0.0 && old.layout == UnitLayout::Single && !meaningful(&receipt) {
         return Err(ProjectionFailure::IncomingNotVisible(
             "initial_target_visibility",
         ));
@@ -477,7 +489,7 @@ fn scene<'a>(
     let h0 = spine(old, sign);
     let h1 = spine(new, sign);
     let hinge = if pair {
-        h0 + (h1 - h0) * morph
+        h0 + (h1 - h0) * smooth(p)
     } else if d.forward {
         h0
     } else {
@@ -489,23 +501,31 @@ fn scene<'a>(
     }
     if pair {
         let under = &new.pages[s];
-        let rect = slot(
-            under.rect.intersect(outer_gate(front.rect, under.rect, p)),
-            hinge,
-            gutter(old),
-            sign,
-        );
-        surfaces.push(surface(under, rect, incoming_owner(under), 1.0));
+        // Both floor pages follow the same binding. Their own canonical
+        // dimensions and UVs stay intact; only their destination placement
+        // moves. In particular, never clip a fixed page against a moving H.
+        let old_shift = egui::vec2(hinge - h0, 0.0);
+        let new_shift = egui::vec2(hinge - h1, 0.0);
+        let under_rect = under.rect.translate(new_shift);
+        let rect = under_rect.intersect(outer_gate(front.rect.translate(old_shift), under_rect, p));
+        surfaces.push(placed_surface(
+            under,
+            under_rect,
+            rect,
+            incoming_owner(under),
+            1.0,
+        ));
         let rest = &old.pages[1 - s];
-        let rest_rect = slot(rest.rect, hinge, gutter(old), -sign);
+        let rest_rect = rest.rect.translate(old_shift);
+        let back_rect = back.rect.translate(new_shift);
         // Only canonical-footprint remnants retire in the final tenth.
-        let hit = rest_rect.intersect(back.rect);
+        let hit = rest_rect.intersect(back_rect);
         if valid_rect(hit) {
-            surfaces.push(surface(rest, hit, FaceOwner::Other, 1.0));
+            surfaces.push(placed_surface(rest, rest_rect, hit, FaceOwner::Other, 1.0));
         }
         let alpha = 1.0 - smooth((p - 0.9) / 0.1);
-        for r in subtract_rect(rest_rect, back.rect) {
-            surfaces.push(surface(rest, r, FaceOwner::Other, alpha));
+        for r in subtract_rect(rest_rect, back_rect) {
+            surfaces.push(placed_surface(rest, rest_rect, r, FaceOwner::Other, alpha));
         }
     } else if d.forward {
         surfaces.push(surface(
@@ -593,9 +613,19 @@ fn scene<'a>(
     }
 }
 fn surface(page: &CanonicalPage, rect: Rect, owner: FaceOwner, alpha: f32) -> Surface<'_> {
+    placed_surface(page, page.rect, rect, owner, alpha)
+}
+fn placed_surface(
+    page: &CanonicalPage,
+    rect: Rect,
+    visible: Rect,
+    owner: FaceOwner,
+    alpha: f32,
+) -> Surface<'_> {
     Surface {
         page,
-        polygon: rectangle(rect.intersect(page.clip_rect)),
+        rect,
+        polygon: rectangle(visible.intersect(page.clip_rect)),
         owner,
         alpha,
     }
@@ -640,6 +670,18 @@ fn preflight(old: &CanonicalUnit, new: &CanonicalUnit) -> Result<(), ProjectionF
         if count == 2 && unit.pages[0].rect.right() > unit.pages[1].rect.left() {
             return Err(ProjectionFailure::UnsupportedGeometry("spread_overlap"));
         }
+        // Normal layout's spine belongs to the gap. Independently rounded
+        // paint edges may differ by at most one destination physical pixel.
+        if count == 2 {
+            let h = spine(unit, 1.0);
+            let rounding = 1.0 / unit.pixels_per_point;
+            if h < unit.pages[0].rect.right() - rounding || h > unit.pages[1].rect.left() + rounding
+            {
+                return Err(ProjectionFailure::UnsupportedGeometry(
+                    "spread_spine_outside_gap",
+                ));
+            }
+        }
         if count == 2 && unit.pages[0].clip_rect != unit.pages[1].clip_rect {
             return Err(ProjectionFailure::UnsupportedGeometry("spread_slot_clip"));
         }
@@ -682,9 +724,8 @@ fn preflight(old: &CanonicalUnit, new: &CanonicalUnit) -> Result<(), ProjectionF
     }
     Ok(())
 }
-/// The spine moves monotonically. Half-plane clip and extra support-gap losses
-/// are monotone in H; their maximum is therefore at one of the two endpoints,
-/// independent of how many intermediate mesh frames will be painted.
+/// Floor pages move with H; a canonical gap/gutter change is still a distinct
+/// layout change, rather than a scan-size difference to conceal in projection.
 fn admission(
     old: &CanonicalUnit,
     new: &CanonicalUnit,
@@ -697,78 +738,20 @@ fn admission(
             "spread_gutter_changed",
         ));
     }
-    let cost = static_surface_loss(old, new, d);
-    if cost.static_clip_loss_fraction > 0.02 + 0.00001 {
-        return Err(ProjectionFailure::UnsupportedGeometry(
-            "spine_static_surface_loss_clip",
-        ));
-    }
-    if cost.static_support_loss_fraction > 0.02 + 0.00001 {
-        return Err(ProjectionFailure::UnsupportedGeometry(
-            "spine_static_surface_loss_support",
-        ));
-    }
-    Ok(cost)
+    Ok(static_surface_loss(old, new, d))
 }
-/// Perf-only caller may ask for rejected trajectory maxima without building a
-/// mesh or weakening the admission. Monotone endpoint proof is shared.
+/// Kept for the existing perf schema. With a translated floor surface, its
+/// inner edge and binding both gain H(t)-Hcanonical, so their difference is
+/// invariant throughout the trajectory. No moving half-plane cuts printed
+/// content, and no extra support gap is created. Destination clipping and
+/// intentional outer reveal/retirement remain actual visibility operations,
+/// not the old fixed-surface spine losses.
 pub(crate) fn static_surface_loss(
-    old: &CanonicalUnit,
-    new: &CanonicalUnit,
-    d: TurnDirection,
+    _old: &CanonicalUnit,
+    _new: &CanonicalUnit,
+    _d: TurnDirection,
 ) -> ProjectionCost {
-    let mut cost = ProjectionCost::default();
-    if old.layout == UnitLayout::Single || old.pages.len() != 2 || new.pages.len() != 2 {
-        return cost;
-    }
-    let sign = if d.turns_right_slot() { 1.0 } else { -1.0 };
-    let s = usize::from(sign > 0.0);
-    let h0 = spine(old, sign);
-    let h1 = spine(new, sign);
-    let gap = gutter(old);
-    for (page, side, normal_h, name) in [
-        (&new.pages[s], sign, h1, "incoming_under"),
-        (&old.pages[1 - s], -sign, h0, "outgoing_rest"),
-    ] {
-        let normal = page.rect.intersect(page.clip_rect);
-        let denominator = area(normal);
-        if denominator <= 0.0 {
-            continue;
-        }
-        let normal_edge = if side > 0.0 {
-            normal_h + gap * 0.5
-        } else {
-            normal_h - gap * 0.5
-        };
-        let inner = if side > 0.0 {
-            page.rect.left()
-        } else {
-            page.rect.right()
-        };
-        let normal_gap = ((inner - normal_edge) * side).max(0.0);
-        for h in [h0, h1] {
-            let masked = slot(normal, h, gap, side);
-            let fraction = (1.0 - area(masked) / denominator).max(0.0);
-            if fraction > cost.static_clip_loss_fraction {
-                cost.static_clip_loss_fraction = fraction;
-                cost.static_clip_loss_surface = name;
-                cost.static_clip_loss_hinge = h;
-            }
-            let edge = if side > 0.0 {
-                h + gap * 0.5
-            } else {
-                h - gap * 0.5
-            };
-            let extra = ((inner - edge) * side - normal_gap).max(0.0);
-            let fraction = extra * normal.height() / denominator;
-            if fraction > cost.static_support_loss_fraction {
-                cost.static_support_loss_fraction = fraction;
-                cost.static_support_loss_surface = name;
-                cost.static_support_loss_hinge = h;
-            }
-        }
-    }
-    cost
+    ProjectionCost::default()
 }
 fn visibility(scene: &Scene<'_>, new: &CanonicalUnit, old: &CanonicalUnit) -> VisibilityReceipt {
     let mut faces: Vec<(Vec<Pos2>, FaceOwner)> = scene
@@ -860,8 +843,8 @@ fn flat_surface(meshes: &mut Vec<ProjectedMesh>, surface: &Surface<'_>) {
         let mut mesh = Mesh::with_texture(texture);
         for p in &surface.polygon {
             let display = pos2(
-                (p.x - surface.page.rect.left()) / surface.page.rect.width(),
-                (p.y - surface.page.rect.top()) / surface.page.rect.height(),
+                (p.x - surface.rect.left()) / surface.rect.width(),
+                (p.y - surface.rect.top()) / surface.rect.height(),
             );
             mesh.vertices.push(egui::epaint::Vertex {
                 pos: *p,
@@ -1392,7 +1375,7 @@ mod tests {
         }
     }
     #[test]
-    fn unequal_scan_and_height_are_admitted_but_large_spine_shift_is_not() {
+    fn unequal_scan_and_height_are_admitted_but_a_spine_outside_its_gap_is_not() {
         let d = TurnDirection {
             reading_rtl: true,
             forward: true,
@@ -1404,11 +1387,9 @@ mod tests {
         new.pages[0].rect.max.y += 100.0;
         assert!(project_turn(&old, &new, d, 0.0).is_ok());
         new.spine_x = Some(350.0);
-        assert!(
-            project_turn(&old, &new, d, 0.0)
-                .unwrap_err()
-                .sub_check()
-                .starts_with("spine_static_surface_loss")
+        assert_eq!(
+            project_turn(&old, &new, d, 0.0).unwrap_err().sub_check(),
+            "spread_spine_outside_gap"
         );
     }
     #[test]
@@ -1698,7 +1679,7 @@ mod tests {
         }
     }
     #[test]
-    fn width_swap_and_two_percent_boundary_have_structural_reasons() {
+    fn width_swap_moves_floor_pages_without_clipping_print_or_creating_support_gaps() {
         let (mut old, mut new) = fixture(true);
         old.gutter_width = 0.0;
         new.gutter_width = 0.0;
@@ -1715,28 +1696,348 @@ mod tests {
                     forward,
                 };
                 let cost = static_surface_loss(&old, &new, d);
+                assert_eq!(cost.static_clip_loss_fraction, 0.0);
+                assert_eq!(cost.static_support_loss_fraction, 0.0);
+                let recipe = prepare_turn(&old, &new, d).unwrap();
+                let s = usize::from(d.turns_right_slot());
+                let initial = project_prepared(&old, &new, d, recipe, 0.0, false).unwrap();
+                if s == 0 {
+                    assert_eq!(recipe.lift, 30.0_f32.to_radians());
+                    assert!(
+                        initial
+                            .visibility
+                            .incoming
+                            .iter()
+                            .all(|page| page.visible_area == 0.0)
+                    );
+                    assert!(!initial.finished);
+                    assert!(initial.visibility.outgoing_front_area > 0.0);
+                }
+                let revealed = project_prepared(&old, &new, d, recipe, 0.75, false).unwrap();
                 assert!(
-                    cost.static_clip_loss_fraction
-                        .max(cost.static_support_loss_fraction)
-                        >= 0.5
+                    revealed
+                        .visibility
+                        .incoming
+                        .iter()
+                        .all(|page| page.visible_area > 0.0)
                 );
+                // Even both visible faces are still only partial curl proof;
+                // navigation's canonical flat completion is a later receipt.
+                assert!(!revealed.finished);
+                let mut previous_h = spine(&old, 1.0);
+                for step in 0..200 {
+                    let p = step as f32 / 200.0;
+                    let pose = scene(&old, &new, d, p, recipe.lift);
+                    let h = pose.leaf.as_ref().unwrap().hinge;
+                    assert_eq!(h, 650.0 - 300.0 * smooth(p));
+                    assert!(h <= previous_h);
+                    assert!((h - previous_h).abs() < 3.0);
+                    previous_h = h;
+                    let under = &pose.surfaces[0];
+                    assert!(std::ptr::eq(under.page, &new.pages[s]));
+                    assert!((under.rect.size() - new.pages[s].rect.size()).length() < 0.001);
+                    assert!(
+                        (under.rect.left() - h - (new.pages[s].rect.left() - 350.0)).abs() < 0.001
+                    );
+                    for rest in &pose.surfaces[1..] {
+                        assert!(std::ptr::eq(rest.page, &old.pages[1 - s]));
+                        assert!((rest.rect.size() - old.pages[1 - s].rect.size()).length() < 0.001);
+                        assert!(
+                            (rest.rect.right() - h - (old.pages[1 - s].rect.right() - 650.0)).abs()
+                                < 0.001
+                        );
+                        // Floor ownership remains on opposite sides of the
+                        // common spine, even in the former 50% loss example.
+                        // These are rectangular floor placements. Compare
+                        // their exact separating edges, rather than clipping
+                        // touching polygons: f32 line intersections can move
+                        // a boundary point one ulp and shoelace cancellation
+                        // then reports a spurious microscopic triangle area.
+                        assert!(if s == 0 {
+                            under.rect.right() <= rest.rect.left()
+                        } else {
+                            rest.rect.right() <= under.rect.left()
+                        });
+                    }
+                    project_prepared(&old, &new, d, recipe, p, false).unwrap();
+                }
+                let landed = scene(&old, &new, d, 0.9999, recipe.lift);
+                let leaf = landed.leaf.unwrap();
+                let back = new.pages[1 - s].rect;
+                let left_u = if leaf.sign > 0.0 { 1.0 } else { 0.0 };
+                assert!((leaf.position(left_u, 0.0) - back.min).length() < 0.001);
+                assert!((leaf.position(1.0 - left_u, 1.0) - back.max).length() < 0.001);
+                let end = project_prepared(&old, &new, d, recipe, 1.0, false).unwrap();
+                assert_eq!(end.hinge_x, 350.0);
                 assert!(
-                    prepare_turn(&old, &new, d)
-                        .unwrap_err()
-                        .sub_check()
-                        .starts_with("spine_static_surface_loss")
+                    end.visibility
+                        .incoming
+                        .iter()
+                        .all(|page| (page.fraction() - 1.0).abs() < 0.0001)
                 );
             }
         }
-        let (old, mut new) = fixture(true);
-        let d = TurnDirection {
+    }
+
+    #[test]
+    fn moving_spine_reveal_and_print_coordinates_use_the_same_translated_placement() {
+        let (mut old, mut new) = fixture(true);
+        old.gutter_width = 0.0;
+        new.gutter_width = 0.0;
+        old.spine_x = Some(450.0);
+        new.spine_x = Some(500.0);
+        old.pages[0].rect = Rect::from_min_max(pos2(150.0, 200.0), pos2(450.0, 800.0));
+        old.pages[1].rect = Rect::from_min_max(pos2(450.0, 200.0), pos2(750.0, 800.0));
+        new.pages[0].rect = Rect::from_min_max(pos2(100.0, 50.0), pos2(500.0, 950.0));
+        new.pages[1].rect = Rect::from_min_max(pos2(500.0, 50.0), pos2(850.0, 950.0));
+        for reading_rtl in [false, true] {
+            for forward in [false, true] {
+                let direction = TurnDirection {
+                    reading_rtl,
+                    forward,
+                };
+                let s = usize::from(direction.turns_right_slot());
+                let recipe = prepare_turn(&old, &new, direction).unwrap();
+                let pose = |p| scene(&old, &new, direction, p, recipe.lift);
+                let first = pose(0.0);
+                let under = &first.surfaces[0];
+                assert_eq!(under.rect.size(), new.pages[s].rect.size());
+                assert_eq!(under.polygon, rectangle(old.pages[s].rect));
+                let extra =
+                    |p| polygon_area(&pose(p).surfaces[0].polygon) - area(old.pages[s].rect);
+                assert!(extra(0.002) > extra(0.001));
+                assert!(extra(0.001) < 10.0);
+                let halfway = pose(0.5);
+                let under = &halfway.surfaces[0];
+                assert_eq!(under.polygon, rectangle(under.rect));
+                assert_eq!(
+                    under.rect,
+                    new.pages[s].rect.translate(egui::vec2(-25.0, 0.0))
+                );
+                let mut meshes = Vec::new();
+                flat_surface(&mut meshes, under);
+                let image = meshes.last().unwrap();
+                let expected_uv = [
+                    pos2(0.0, 0.0),
+                    pos2(1.0, 0.0),
+                    pos2(1.0, 1.0),
+                    pos2(0.0, 1.0),
+                ];
+                for ((vertex, position), uv) in image
+                    .mesh
+                    .vertices
+                    .iter()
+                    .zip(rectangle(under.rect))
+                    .zip(expected_uv)
+                {
+                    assert_eq!(vertex.pos, position);
+                    assert_eq!(vertex.uv, uv);
+                }
+                let near_end = pose(0.9999);
+                let under = &near_end.surfaces[0];
+                assert!((under.rect.min - new.pages[s].rect.min).length() < 0.001);
+                assert!(
+                    near_end
+                        .surfaces
+                        .iter()
+                        .skip(1)
+                        .filter(|rest| rest.alpha < 1.0)
+                        .all(|rest| rest.alpha < 0.0001)
+                );
+            }
+        }
+    }
+    #[test]
+    fn destination_clip_crops_translated_print_without_refitting_uv_or_accepting_a_new_clip() {
+        let (mut old, mut new) = fixture(true);
+        new.spine_x = Some(508.0);
+        for page in &mut new.pages {
+            page.rect = page.rect.translate(egui::vec2(40.0, 0.0));
+        }
+        let clip = Rect::from_min_max(pos2(150.0, 100.0), pos2(800.0, 580.0));
+        for page in old.pages.iter_mut().chain(&mut new.pages) {
+            page.clip_rect = clip;
+        }
+        let direction = TurnDirection {
+            reading_rtl: true,
+            forward: true,
+        };
+        let recipe = prepare_turn(&old, &new, direction).unwrap();
+        let pose = scene(&old, &new, direction, 0.5, recipe.lift);
+        let under = &pose.surfaces[0];
+        assert_eq!(
+            under.rect,
+            old.pages[0].rect.translate(egui::vec2(20.0, 0.0))
+        );
+        assert_eq!(under.polygon, rectangle(under.rect.intersect(clip)));
+        let mut meshes = Vec::new();
+        flat_surface(&mut meshes, under);
+        let image = meshes.last().unwrap();
+        assert_eq!(image.clip_rect, clip);
+        for vertex in &image.mesh.vertices {
+            assert!(clip.contains(vertex.pos));
+            let expected = pos2(
+                (vertex.pos.x - under.rect.left()) / under.rect.width(),
+                (vertex.pos.y - under.rect.top()) / under.rect.height(),
+            );
+            assert!((vertex.uv - expected).length() < 0.00001);
+            assert!(unit_uv().contains(vertex.uv));
+        }
+        for page in &mut new.pages {
+            page.clip_rect.max.y += 10.0;
+        }
+        assert_eq!(
+            prepare_turn(&old, &new, direction).unwrap_err().sub_check(),
+            "destination_clip_changed"
+        );
+    }
+    #[test]
+    fn a_hidden_initial_pair_does_not_relax_single_visibility_admission() {
+        let (old, mut new) = fixture(false);
+        new.pages[0].rect.max.x = new.pages[0].rect.min.x + 1.0;
+        let direction = TurnDirection {
             reading_rtl: false,
             forward: true,
         };
-        new.spine_x = old.spine_x.map(|h| h + old.pages[0].rect.width() * 0.019);
-        assert!(admission(&old, &new, d).is_ok());
-        new.spine_x = old.spine_x.map(|h| h + old.pages[0].rect.width() * 0.021);
-        assert!(admission(&old, &new, d).is_err());
+        assert_eq!(
+            prepare_turn(&old, &new, direction).unwrap_err().sub_check(),
+            "initial_target_visibility"
+        );
+    }
+    #[test]
+    fn thirteen_reported_scan_pairs_use_exact_trim_uv_and_effective_destination_clip() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("page_turn_animation/real_scan_geometry.json"))
+                .unwrap();
+        let cases = fixture["cases"].as_array().unwrap();
+        assert_eq!(cases.len(), 13);
+        let number = |value: &serde_json::Value| value.as_f64().unwrap() as f32;
+        let rect = |value: &serde_json::Value| {
+            Rect::from_min_max(
+                pos2(number(&value[0]), number(&value[1])),
+                pos2(number(&value[2]), number(&value[3])),
+            )
+        };
+        let unit = |metadata: &serde_json::Value, first_id| {
+            let pages = metadata.as_array().unwrap();
+            let canonical = pages
+                .iter()
+                .enumerate()
+                .map(|(i, metadata)| {
+                    assert!(metadata["visible_source_roi"].is_null());
+                    for size in ["source_size", "native_size"] {
+                        assert!(
+                            metadata[size]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .all(|edge| number(edge) > 0.0)
+                        );
+                    }
+                    let mut page = page(first_id + i as u64, rect(&metadata["canonical_rect"]));
+                    // Match the production owner fix: painter ancestry may
+                    // alternate full-window/content scissors, while the
+                    // transform's media destination has remained unchanged.
+                    page.clip_rect =
+                        rect(&metadata["clip_rect"]).intersect(rect(&metadata["viewport_rect"]));
+                    if let PageMaterial::Texture { uv, .. } = &mut page.material {
+                        *uv = std::array::from_fn(|corner| {
+                            pos2(
+                                number(&metadata["uv"][corner][0]),
+                                number(&metadata["uv"][corner][1]),
+                            )
+                        });
+                    }
+                    page
+                })
+                .collect();
+            CanonicalUnit {
+                layout: UnitLayout::Spread,
+                pixels_per_point: number(&pages[0]["pixels_per_point"]),
+                spine_x: Some(number(&pages[0]["normal_layout_spine"]["hinge_x"])),
+                gutter_width: number(&pages[0]["normal_layout_spine"]["gutter_width"]),
+                pages: canonical,
+            }
+        };
+        let mut raw_clip_changes = 0;
+        let mut trimmed_pages = 0;
+        for case in cases {
+            let old = unit(&case["outgoing"], 1);
+            let new = unit(&case["incoming"], 11);
+            raw_clip_changes +=
+                usize::from(case["outgoing"][0]["clip_rect"] != case["incoming"][0]["clip_rect"]);
+            trimmed_pages += old
+                .pages
+                .iter()
+                .chain(&new.pages)
+                .filter(|page| match &page.material {
+                    PageMaterial::Texture { uv, .. } => {
+                        *uv != [
+                            pos2(0.0, 0.0),
+                            pos2(1.0, 0.0),
+                            pos2(1.0, 1.0),
+                            pos2(0.0, 1.0),
+                        ]
+                    }
+                    PageMaterial::Blank { .. } => false,
+                })
+                .count();
+            assert_eq!(old.pages[0].clip_rect, new.pages[0].clip_rect);
+            for reading_rtl in [false, true] {
+                for forward in [false, true] {
+                    let direction = TurnDirection {
+                        reading_rtl,
+                        forward,
+                    };
+                    let recipe = prepare_turn(&old, &new, direction).unwrap_or_else(|failure| {
+                        panic!("sequence {}: {failure:?}", case["sequence"])
+                    });
+                    let s = usize::from(direction.turns_right_slot());
+                    for step in 0..=200 {
+                        let progress = step as f32 / 200.0;
+                        let projected =
+                            project_prepared(&old, &new, direction, recipe, progress, false)
+                                .unwrap();
+                        let expected_h = spine(&old, 1.0)
+                            + (spine(&new, 1.0) - spine(&old, 1.0)) * smooth(progress);
+                        assert!((projected.hinge_x - expected_h).abs() < 0.001);
+                        assert_eq!(projected.finished, step == 200);
+                        assert!(
+                            projected
+                                .visibility
+                                .incoming
+                                .iter()
+                                .all(|page| page.visible_area.is_finite()
+                                    && page.visible_area >= 0.0)
+                        );
+                        if step == 200 {
+                            assert!(
+                                projected
+                                    .visibility
+                                    .incoming
+                                    .iter()
+                                    .all(|page| (page.fraction() - 1.0).abs() < 0.0001)
+                            );
+                        } else {
+                            let pose = scene(&old, &new, direction, progress, recipe.lift);
+                            let under = &pose.surfaces[0];
+                            assert!(
+                                (under.rect.size() - new.pages[s].rect.size()).length() < 0.001
+                            );
+                            assert!(
+                                (under.rect.left()
+                                    - expected_h
+                                    - (new.pages[s].rect.left() - spine(&new, 1.0)))
+                                .abs()
+                                    < 0.001
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(raw_clip_changes, 6);
+        assert!(trimmed_pages > 0);
     }
     #[test]
     fn feasibility_silhouette_visibility_and_tessellation_are_measured_separately() {

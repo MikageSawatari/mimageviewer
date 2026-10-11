@@ -495,6 +495,166 @@ fn snapshot_scene(
     harness.take_snapshot_results()
 }
 
+fn moving_spine_units(textures: &SceneTextures, cell: Rect) -> (CanonicalUnit, CanonicalUnit) {
+    // Two portrait scans exchange their wide/narrow physical slots. Normal
+    // layout centers each total width independently, so the spine moves by
+    // 38 points rather than remaining at the viewport center. Heights also
+    // differ independently; none of these sizes come from texture resolution.
+    let unit = |incoming: bool| {
+        let sizes = if incoming {
+            [vec2(104.0, 180.0), vec2(66.0, 164.0)]
+        } else {
+            [vec2(68.0, 170.0), vec2(106.0, 182.0)]
+        };
+        let gutter = 8.0;
+        let left = cell.center().x - (sizes[0].x + gutter + sizes[1].x) * 0.5;
+        CanonicalUnit {
+            pixels_per_point: 1.0,
+            spine_x: Some(left + sizes[0].x + gutter * 0.5),
+            gutter_width: gutter,
+            layout: UnitLayout::Spread,
+            pages: sizes
+                .into_iter()
+                .enumerate()
+                .map(|(slot, size)| CanonicalPage {
+                    occurrence: Some(if incoming { 3 } else { 1 } + slot as u64),
+                    rect: Rect::from_min_size(
+                        pos2(
+                            left + if slot == 0 { 0.0 } else { sizes[0].x + gutter },
+                            cell.center().y - size.y * 0.5,
+                        ),
+                        size,
+                    ),
+                    clip_rect: cell,
+                    material: material(if incoming {
+                        &textures.new[slot]
+                    } else {
+                        &textures.old[slot]
+                    }),
+                    underlay: Some(material(&textures.checker)),
+                })
+                .collect(),
+        }
+    };
+    (unit(false), unit(true))
+}
+
+fn snapshot_moving_spine(reading_rtl: bool, forward: bool) -> egui_kittest::SnapshotResults {
+    const MOVING_POSES: [f32; 9] = [0.0, 0.0001, 0.2, 0.49, 0.5, 0.51, 0.8, 0.9999, 1.0];
+    // Keep the widest translated resting page inside its destination. A
+    // viewport crop must not hide loss of support at the moving spine.
+    const MOVING_CELL_WIDTH: f32 = 260.0;
+    let name = format!(
+        "page_turn_projection_moving_spine_spread_{}_{}",
+        if reading_rtl { "rtl" } else { "ltr" },
+        if forward { "forward" } else { "back" }
+    );
+    let canonical_endpoint = Arc::new(AtomicBool::new(false));
+    let endpoint_flag = canonical_endpoint.clone();
+    let mut textures = None;
+    let mut harness = crate::test_ui::builder()
+        .with_size(vec2(1324.0, 520.0))
+        .build(move |ctx| {
+            if textures.is_none() {
+                crate::ui_fonts::configure_fonts(ctx);
+                textures = Some(load_textures(ctx, false, false));
+                ctx.request_repaint();
+                return;
+            }
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            painter.rect_filled(ctx.content_rect(), 0.0, Color32::from_rgb(29, 35, 46));
+            painter.text(
+                pos2(12.0, 16.0),
+                egui::Align2::LEFT_TOP,
+                format!(
+                    "MOVING SPREAD SPINE / {} / {}   old=A1,B2  new=C3,D4  > reads right",
+                    if reading_rtl { "RTL" } else { "LTR" },
+                    if forward { "FORWARD" } else { "BACK" }
+                ),
+                egui::FontId::monospace(14.0),
+                Color32::WHITE,
+            );
+            for index in 0..10 {
+                let row = index / 5;
+                let cell = Rect::from_min_size(
+                    pos2(12.0 + (index % 5) as f32 * MOVING_CELL_WIDTH, 64.0 + row as f32 * 212.0),
+                    vec2(MOVING_CELL_WIDTH, 208.0),
+                );
+                let (old, new) = moving_spine_units(textures.as_ref().unwrap(), cell);
+                let label = if index == 0 {
+                    "canonical old".to_owned()
+                } else {
+                    format!("{:.4}", MOVING_POSES[index - 1])
+                };
+                painter.text(
+                    pos2(cell.center().x, cell.top() - 16.0),
+                    egui::Align2::CENTER_TOP,
+                    label,
+                    egui::FontId::monospace(14.0),
+                    Color32::WHITE,
+                );
+                if index == 0 {
+                    paint_canonical(&painter, &old);
+                } else if index == 9 && endpoint_flag.load(Ordering::Relaxed) {
+                    paint_canonical(&painter, &new);
+                } else {
+                    let projection = project_turn(
+                        &old,
+                        &new,
+                        TurnDirection { reading_rtl, forward },
+                        MOVING_POSES[index - 1],
+                    )
+                    .expect("portrait width swap must animate at every sampled pose");
+                    for projected in projection.meshes {
+                        painter
+                            .with_clip_rect(projected.clip_rect)
+                            .add(egui::Shape::mesh(projected.mesh));
+                    }
+                }
+            }
+            painter.text(
+                pos2(12.0, 490.0),
+                egui::Align2::LEFT_TOP,
+                "Portrait widths 68/106 -> 104/66; heights 170/182 -> 180/164; moving spine and full printed support. Last = canonical incoming.",
+                egui::FontId::monospace(12.0),
+                Color32::from_rgb(206, 216, 228),
+            );
+        });
+    harness.run();
+    harness.snapshot(&name);
+    let projected = harness.render().unwrap();
+    canonical_endpoint.store(true, Ordering::Relaxed);
+    harness.step();
+    harness.run();
+    let canonical = harness.render().unwrap();
+    if projected != canonical {
+        let evidence = std::path::Path::new("target/page-turn-endpoint-debug");
+        std::fs::create_dir_all(evidence).unwrap();
+        projected
+            .save(evidence.join(format!("{name}-projected.png")))
+            .unwrap();
+        canonical
+            .save(evidence.join(format!("{name}-canonical.png")))
+            .unwrap();
+    }
+    assert!(
+        projected == canonical,
+        "moving-spine endpoint must render exactly like canonical incoming: {name}"
+    );
+    harness.take_snapshot_results()
+}
+
+#[test]
+fn page_turn_projection_snapshot_moving_spine_four_routes() {
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    for reading_rtl in [false, true] {
+        for forward in [false, true] {
+            snapshots.extend(snapshot_moving_spine(reading_rtl, forward));
+        }
+    }
+    snapshots.unwrap();
+}
+
 #[test]
 fn page_turn_projection_snapshot_pdf_letterbox_single_ltr() {
     snapshot_scene(false, false, true, SceneGeometry::PortraitPdf).unwrap();

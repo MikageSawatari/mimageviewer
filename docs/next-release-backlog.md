@@ -245,6 +245,7 @@
 - **Stage 1実機追補（2026-10-11）**: `0d1b1f99f`では利用者が演出を確認できなかった。初回key観測のkeyboard owner未確定による候補消失と、入力ゼロgamepad pollが作る偽Continuousによる初回描画後取消を修正した。実handlerで初回key/click→開始→完了、neutral poll保持、理由付きskip一回の回帰を追加（[plan §20](page-turn-animation-plan.md)）。focused回帰・normal/portable check・ui_snapshot・normal確認用build済。修正後の実機motion評価と独立完了レビューは未了。
 - **Stage 1評価追補（2026-10-11）**: `52cd5a15f`の見開き・単頁motionは利用者から良いとの評価。単頁の固定背（LTR左／RTL右、戻りは前頁のarrival）を再確認し、固定端を明示した4枚のgoldenと連続pose回帰を追加する。実機ログの背は既に往復で同じ位置のため、見え方の症状は未再現。missing fact 18件はchild→ROOT受理時に別viewportのframe counterを比較して元factを消した問題で、元ID/source/phaseを保持する構造修正を行う。取消3件は終了直前の別native矢印入力で既存flat-first規則に従っていた（[plan §21](page-turn-animation-plan.md)）。最終受入れ・独立レビューは未了。
 - **2026-10-11 利用者決定（readiness）**: final-onlyを撤回。受理時のresident非AI画像・preview・thumbnailなど表示可能素材で即演出し、演出後は通常品質更新へ戻す。無素材は理由付き省略、受理時の待機・追加decode/uploadは禁止。[plan §22](page-turn-animation-plan.md)に素材・pin・取消・回帰を記録。実機と独立完了レビューは未了。
+- **2026-10-11 利用者評価とoption A**: `49e2b0911`で開始率が改善し単頁の背も良好。異寸法Pairは背と静止頁を同じleaf progressで平行移動し、canonical incomingへsnap無しで着地させる（[plan §23](page-turn-animation-plan.md)）。trim有無のpainter clip差は同canvasとして扱う。pin_budget 11件はbyte合計に余剰無しで固定128 MiB capが原因、実測737.47 MiB/準備後推計756.02 MiBに基づき有限fullscreen10%枠を維持してcapを撤去。独立完了レビュー・実機評価は未了。
 - PC/F12限定・Remote不要、既定OFF、slideshow、Preferencesとfullscreen HUD overflowの同じ全体設定は維持。時間は実際の動きを見てから利用者が決めるため、100〜600ms・既定200msは引き続き仮設定。過去の自動検証成功はmotion品質の合格を意味しない。最終時間・実機/性能受入れは未了。
 - 旧予定（利用者2026-10-07）: 次版ラインE（3番目）。2026-10-11の延期決定で置換済み。他アプリでも対応が多いので実装したい、という要求は維持。
 

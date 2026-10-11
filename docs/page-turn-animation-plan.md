@@ -1,6 +1,6 @@
 # ページめくりアニメーション設計案 — backlog §1.341
 
-2026-10-11 / **R7設計ACCEPT（`fa5119c19`、Stage 1自動検証・確認用build済、実機評価待ち・§19）**。採択済みR7に従い、まず通常単頁と二実頁Pairのleaf・陰影・per-page geometryを既存A0へ接続し、利用者のmotion評価用buildを作った。cover/中央単頁/split等の対応は後段に残す。R3統合後のA0は利用者の実機評価で不合格。R4 `afc474d8d`・R5 `c73f0d857`・R6 `29291d496`はREVISE、R7の独立設計レビューACCEPTは利用者から伝達された。§1〜17は履歴で、衝突箇所は§18、段階実装の範囲は§19を優先する。既定OFF・仮時間・F12所有・VRAM会計を維持。readinessは2026-10-11利用者決定の§22でresident displayableへ置換する。実装の独立完了レビュー・実機motion/性能受入れ・最終時間は未了。利用者の2026-10-11決定でリリースは次の次の版。
+2026-10-11 / **R7設計ACCEPT（`fa5119c19`、Stage 1自動検証・確認用build済、実機評価待ち・§19）**。採択済みR7に従い、まず通常単頁と二実頁Pairのleaf・陰影・per-page geometryを既存A0へ接続し、利用者のmotion評価用buildを作った。cover/中央単頁/split等の対応は後段に残す。R3統合後のA0は利用者の実機評価で不合格。R4 `afc474d8d`・R5 `c73f0d857`・R6 `29291d496`はREVISE、R7の独立設計レビューACCEPTは利用者から伝達された。§1〜17は履歴で、衝突箇所は§18、段階実装の範囲は§19を優先する。既定OFF・仮時間・F12所有・VRAM会計を維持。readinessは2026-10-11利用者決定の§22でresident displayableへ置換し、Pairの移動背とpin上限は§23を正本とする。実装の独立完了レビュー・実機motion/性能受入れ・最終時間は未了。利用者の2026-10-11決定でリリースは次の次の版。
 
 R3設計時の参照treeは `next-prefs` / `1ee3e178288f2eff119da16b672d546cc3c9992c`（R2文書commit、開始時clean）。当時の製品コードはmaster `cb00930011323cacd7088ae70c37835141aad58a` と同じだった。
 既存の `file:line` は各設計/追補時のsource inspection位置。A0は§1.364統合後の`0f6ad9f19`を基点に具体化した（§12）。A0は`532635fdd`、golden補完は`e0f323d24`、HUDは`bf3b2fae0`、PDF追補は`ea5f6624a`、保存判断の来歴訂正は`e3a328ff6`でコミットされた。§15はこのHEADと利用者提示の実機結果を基点とする。既存の自動検証成功は動きの品質合格を意味しない。
@@ -1604,6 +1604,8 @@ Stage 1の自動検証とnormal確認用build後、利用者の実機確認で�
 
 ### 19.1 今回の投影・素材・geometry
 
+**2026-10-11追補: 固定静止面のloss admissionは§23の利用者option Aで置換。以下の2%省略は当時のStage 1履歴。**
+
 通常Single→SingleはforwardのSingleDeparture、backwardのSingleArrival、通常Pair→PairはBookLeafを使う。
 reading directionは現在のnormal layoutの正本から捕捉し、RTL forwardは旧左頁だけ、LTR forwardは旧右頁だけを返す。
 Pairの裏面は新しい反対側頁、下頁は新しい同側頁、静止面は旧反対側頁。各素材は自身のnormal prepared rect/UV/clipを保つ。
@@ -1793,3 +1795,81 @@ new inputの取消は保持incomingでflat-first完了し、そのreceipt採用�
 resident Static／thumbnail／incomplete finalのaccept→通常draw→curl開始、thumb replacementのDirect保持、品質publicationとinput epoch更新中のcurl維持、canonical flatまで同素材でその後通常upgrade、取消flat-first、実編集取消、無素材とfaithful gateの理由付きskipを検査する。accept前後のpending/upload queueを照合し新仕事なしを保証する。Single四方向とPairの低解像度素材goldenを追加し、full-sizeと同じmesh/spine、紙・陰影・影、文字の向きを比較する。golden目視はmotion品質・実GPU性能の受入れを代替しない。
 
 fmt、normal/portable check、focused、ui_snapshot、未起動確認後のnormal buildと手順は`target/A-1341-nonfinal-msg.txt`へ記録する。独立完了レビューと実機開始率／GPU性能の受入れは未了。
+
+## 23. Pairの移動背とresident pin予算（2026-10-11利用者option A）
+
+`49e2b0911`の実機評価ではresident素材により開始率が改善し、単頁の固定背も問題なしとの評価。
+残る通常scanのPair省略を、利用者が選んだ**option A: 背と静止頁を連続移動し、incoming canonicalへ正確に着地**で置換する。
+§16.3/§19の「静止rectのまま移動slotで切り、2%超なら省略」は本節より古い契約。
+単頁、resident品質固定、default OFF/仮duration、入力identity、canonical-flat採用、F12所有・mount/deposit/forkは維持する。
+
+### 23.1 一本の時計、各頁の自身の寸法
+
+正規化progressをp、leafが既に使うeasingを`q=p*p*(3-2*p)`とする。
+`H(p)=H0+(H1-H0)*q`。leaf角も同じqでinitial liftから180度へ進む。背だけを60〜120度で移す旧式は撤回する。
+leafのfront/back寸法のmorphは従来の60〜120度のsmoothstepを使い、端点は旧S/frontと新T/backのcanonical位置へ一致させる。
+
+- 旧T静止頁: 自身のcanonical rectを`(H(p)-H0,0)`平行移動。
+- 新S下頁: 自身のcanonical rectを`(H(p)-H1,0)`平行移動。
+- leafの旧front、新back、および各静止面は自身のimmutable resource/UV/寸法を保つ。静止頁の文字を他頁の縦横比へ伸縮しない。
+- 一定gutterとinner gapは同じ背に付いて移る。静止したrectを別位置のhalf-planeで切らないため、旧式のspine clip/support lossは構造上発生しない。
+- shadowは移動後のreceiver polygonにclipし、image/underlay/影/visibilityは同じposed rectを使う。
+
+異高さ・大きい新下頁の外周は、**移動後の旧S footprintから、移動後の旧Sと新Sのunionへ**既存` smooth(2*p) `のrect gateを連続拡張する。
+p=0で旧leaf外の新下頁余剰はゼロ、直後の差もゼロへ収束する。静止面のUVはgateで切られても自身の全rectをbasisにし、gateへ画像全体を詰めない。
+旧Tの新T footprint外は最後10%だけ連続退役する。その差分は新Tを`H(p)-H1`移動したfootprintから求める。
+p→1で新Sは新canonical、leaf backは新T canonical、旧T余剰alphaは0へ収束し、p=1の通常incoming flatとの位置/画素のsnapを作らない。
+終端で旧spread全体を移したまま消す方式や、二頁をまとめてslide/fadeする方式ではない。
+
+極端な600/300→300/600の幅交換では、初期60度以内で新下頁が旧leafに全部隠れる方向がある。
+通常の30/45/60度の初期lift選択は維持し、その範囲でincoming可視性が得られないvalid Pairだけは30度で開始する。
+**開始とfirst_visibleを分離**し、不可視のincoming面積は0として記録し、実際に現れたposeで初出を通知する。
+角度を85度等へ跳ね上げて初出を偽らず、不可視頁の存在だけでnavigationを解放しない。
+R5以降のsole completionは全incoming実頁のcanonical flat採用であり、この保証は撤回しない。単頁の初期可視性規則は変更しない。
+
+### 23.2 destination clipの正本とinstant境界
+
+実ログsession `143364-1791718409783`の6件はviewport `[0,44,2560,1298]`、ppp=1.5が双方で同じ。
+一方painter clipはcontent rectとfull viewport `[0,0,2560,1440]`が交互だった。
+通常spreadのpainterはcontent trimがあるとimage_rectでclipし、trimがないPage fitでは親painterを使う。
+これはscan/layoutに伴うpaint policyの差で、描画destinationの変更ではない。
+canonical captureで`effective clip = painter.clip_rect ∩ transform.viewport_rect`とし、同じcanvasを比較・使用する。
+raw painter clipも診断に残す。実際のcanvas縮小/resize/DPI/clip変更は補間せず既存失効・通常表示へ戻す。
+
+普通のportrait scanの幅・高さ・背の差、同一Pairの幅交換はshapeの省略理由にしない。
+geometry不整合は明示理由で維持する: overlap、背が通常左右gap外（paint rounding一physical pxを超す）、invalid/empty rect、異なるlayout/slot数、混合clip/pixel scale、素材ROI未充足等。
+Stage 1のcover/side/CenteredSingle/split/media/continuation等の既存未対応unit recipeは理由付きinstantのまま。
+resident無し・効果faithful gate・repeat/burst・実メモリ圧力・pin予算はgeometryとは別の省略理由であり、待機や追加decode/uploadに置換しない。
+
+### 23.3 pin_budget 11件の測定と上限変更
+
+同sessionの11件すべてで、`pin_bytes = 旧source mip + 旧native RGBA8 + 新source mip`がbyte単位で一致し、余剰は0。
+このサンプルのskipは残留pinや二重計上でなく、固定128 MiBの小さすぎるcapが原因。
+8192px finalの5628×8192はmip込み245,885,644 B（約234.5 MiB）で、一頁だけでも旧capを超す。
+実測accept最大773,292,152 B（737.47 MiB）。そのincoming頁の過去の通常native出力寸法から19,454,240 Bを加えた準備後推計は792,746,392 B（756.02 MiB）。
+skip時はnativeを新prepareしていないため、後者をその操作の実測とは表記しない。
+実resident最大1,254,059,108 B、poolは12,655,263,744 B、fullscreen枠10,124,210,995 B。
+
+有限設定は従来の**fullscreen枠の10%**を維持し、128 MiBの固定capだけ撤去する。
+この実機で上限1,012,421,099 B（965.52 MiB）となり、測定4頁+nativeを収める。pool/fullscreen設定、source品質、会計方法を拡張しない。
+VRAM無制限設定だけは独立bounded capを1 GiBとし、この測定を収める余裕を持たせる。低VRAM有限枠は10%のままで、予算不足は引き続きinstant。
+acceptとnative ROI準備後の両gateは同じhelperを使う。全context reservation、source/native/checker、batch leaseのTextureId dedupを保持し、普通にresidentだったからpinが無料とは扱わない。
+perfへpin_limit_policy/fullscreen_budget_bytes/pool_budget_bytesを追加し、次回はどの枠が抑制したか判別できるようにする。
+詳細算術と原寸はread-only logからの`target/A-1341-spine-pin-audit.txt`。この11件の整合を全lifecycleにleakが無い証明とはしない。
+
+### 23.4 回帰・簡素化・検証
+
+四方向のmoving-spine Pair golden（幅交換/異高さ、canonical旧参照、初回直後/中間/着地直前/終端）を追加し目視する。
+200poseのH/translation/各面UV/静止面非overlap、0と直後の外周連続、p→1の収束、canonical終端のGPU一致、incoming初回0→後着初出→全flat、実canvasとoptional trim clipの区別を検査する。
+予算はログの実寸をfake ID会計へ入れ、cache/context/batch重複参照のdedup、旧128 MiB超から10%枠内、低VRAM拒否、無制限1 GiBを検査する。
+既存cross-context/cancel/flat-first/品質upgradeの回帰は継続する。R5-aのsilhouette/visibilityとtessellationの分離計測を維持する。
+
+新pending、settle、spine owner、surfaceごとの時計、source縮小/upload、待機は作らない。単一recipeのframe-local poseだけを変更する。
+固定静止面の閾値緩和や大きいscanを一括除外する案を不採用とし、資源とgeometryのownershipは既存contextに残す。
+今回の自動結果・normal build・利用者確認手順は`target/A-1341-spine-msg.txt`へ記録する。
+実装独立レビュー、実機motion/開始率/CPU・GPU受入れは未了で、自動greenだけを受入れとは扱わない。
+
+
+2026-10-11自動検証の参考値: page-turn focused 144件、projection golden限定19件、normal/portable check、ui_snapshot157件が成功。
+R5-aのcached debug CPU各300poseではportrait PDF scan Pairのsilhouette/visibility p95=0.0153ms、outer mask p95=0.0013ms（前者の内数）、tessellation p95=0.0706ms、合計p95=0.0844ms。
+これは単独headless fixtureの参考値で、UI全frame/実GPU/実機motion受入れではない。詳細は`target/A-1341-spine-feasibility.log`。

@@ -3026,3 +3026,13 @@ projected contextのwindow bindingとexact active hostのapplied borderlessか�
 通常content・holdover・navigation gapは同じresolverで上・下・右の予約を解放する。
 strip表示選択とresource ownerは変更せず、一時表示のrectだけをhit / sinkへ渡す。
 [設計](fullscreen-locked-chrome-suppression-plan.md) §4・5を参照。
+
+
+### §1.341 Pairの移動背（2026-10-11利用者option A）
+
+[page-turn plan §23](page-turn-animation-plan.md)が固定静止面の2%loss省略を置換する。
+leafと同じsmooth progressで背をold→newへ移し、旧Tは旧背から、新Sは新背からのdeltaを自身のrectへ平行移動する。
+UV/寸法は保持し、reveal gate・終端の差分退役・shadow/visibilityは移動後のgeometryを消費する。
+projectionのdestination clipはpainter scissorとtransform viewportの交差で、任意のtrim有無をcanvas変更と誤認しない。
+初回incomingが不可視でもvalid Pairを開始し、first_visibleは実面積、完了は全canonical flat採用で保証する。
+有限pin枠はfullscreenの10%（固定128 MiB cap撤去）、VRAM無制限時は1 GiB。実測737.47 MiB/準備後推計756.02 MiBが根拠で、会計/dedup/leaseと低VRAM・memory_pressure gateを維持する。
