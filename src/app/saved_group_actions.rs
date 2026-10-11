@@ -362,7 +362,7 @@ impl App {
             || action.book_slot_number().is_some()
         {
             if self.book_op_pending.as_ref().is_some_and(|pending| {
-                !matches!(pending.intent, crate::books::BookOpIntent::List { .. })
+                !matches!(&pending.intent, crate::books::BookOpIntent::List { .. })
             }) {
                 self.show_feedback_toast("本棚の更新処理が進行中です".into());
                 return None;
@@ -512,9 +512,9 @@ impl App {
             SavedGroupOpenPhase::WaitingBookList => {
                 if self.book_op_pending.as_ref().is_some_and(|pending| {
                     matches!(
-                        pending.intent,
+                        &pending.intent,
                         crate::books::BookOpIntent::List { navigation: Some(id) }
-                            if id == request.id
+                            if *id == request.id
                     )
                 }) {
                     if let Some(delay) = request.lease.completion_poll_delay() {
@@ -941,10 +941,10 @@ mod tests {
         let id = app.saved_group_open.as_ref().unwrap().id;
         assert!(app.saved_group_open_modal_visible());
         assert!(matches!(
-            app.book_op_pending.as_ref().unwrap().intent,
+            &app.book_op_pending.as_ref().unwrap().intent,
             crate::books::BookOpIntent::List {
                 navigation: Some(owner)
-            } if owner == id
+            } if *owner == id
         ));
         for _ in 0..100 {
             app.poll_book_op_pending(&ctx);
@@ -1092,7 +1092,7 @@ mod tests {
         let id = app.saved_group_open.as_ref().unwrap().id;
         assert!(app.cancel_saved_group_open_request(id));
         assert!(matches!(
-            app.book_op_pending.as_ref().unwrap().intent,
+            &app.book_op_pending.as_ref().unwrap().intent,
             crate::books::BookOpIntent::List { navigation: None }
         ));
         for _ in 0..100 {

@@ -332,6 +332,7 @@ preferences_policy! {
         reading_history_enabled: bool => ("閲覧履歴を記録", |_, _| true, plain, plain);
         default_spread_mode: SpreadMode => ("標準の見開き設定", |v, _| SpreadMode::all().contains(v), plain, plain);
         follow_document_reading_direction: bool => ("文書の綴じ方向に従う", |_, _| true, plain, plain);
+        remember_spread_shift_per_book: bool => ("見開きの調整を本ごとに記憶する", |_, _| true, plain, plain);
         default_reading_flow: ReadingFlow => ("標準の読書フロー", |_, _| true, plain, plain);
         default_reading_direction: ReadingDirection => ("標準の読み方向", |_, _| true, plain, plain);
         final_cover_spread_enabled: bool => ("裏表紙の見開き", |_, _| true, plain, plain);
@@ -1138,6 +1139,7 @@ mod tests {
             ],
         );
         settings.follow_document_reading_direction = !settings.follow_document_reading_direction;
+        settings.remember_spread_shift_per_book = !settings.remember_spread_shift_per_book;
         settings.default_reading_flow = different_enum(
             &settings.default_reading_flow,
             &[
@@ -1821,15 +1823,50 @@ mod tests {
     }
 
     #[test]
+    fn spread_shift_memory_transfer_preserves_policy_and_rejects_wrong_type() {
+        let mut settings = Settings::default();
+        let parsed =
+            parse_preferences(&document(json!({"remember_spread_shift_per_book": false}))).unwrap();
+        assert!(parsed.apply_to(&mut settings).issues.is_empty());
+        assert!(!settings.remember_spread_shift_per_book);
+        let exported = export_preferences(&settings).unwrap();
+        let mut restored = Settings::default();
+        assert!(
+            parse_preferences(&exported.json)
+                .unwrap()
+                .apply_to(&mut restored)
+                .issues
+                .is_empty()
+        );
+        assert!(!restored.remember_spread_shift_per_book);
+        let missing = parse_preferences(&document(json!({}))).unwrap();
+        missing.apply_to(&mut settings);
+        assert!(!settings.remember_spread_shift_per_book);
+        let invalid = parse_preferences(&document(
+            json!({"remember_spread_shift_per_book": "invalid_boolean"}),
+        ))
+        .unwrap();
+        assert_eq!(invalid.apply_to(&mut settings).issues.len(), 1);
+        assert!(!settings.remember_spread_shift_per_book);
+        let value: Value = serde_json::from_str(&exported.json).unwrap();
+        assert_eq!(
+            value["preferences"]["remember_spread_shift_per_book"],
+            false
+        );
+        assert!(value["preferences"].get("spread_shift_anchor").is_none());
+        assert!(value["preferences"].get("spread_shifts").is_none());
+    }
+
+    #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 456);
+        assert_eq!(entries.len(), 457);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            143
+            144
         );
         assert_eq!(
             entries
@@ -1846,7 +1883,7 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 141);
+        assert_eq!(wire.len(), 142);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);

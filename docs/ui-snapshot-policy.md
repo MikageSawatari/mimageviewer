@@ -27,6 +27,12 @@ UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot
 更新後は `tests/snapshots/*.png` の差分を必ず目視確認してからコミットする。
 git diff のバイナリ比較では変化の意図 (改善なのか回帰なのか) は判断できない。
 
+本別見開き調整 (§1.364 D2) は`spread_shift_hud_{resolved,unresolved}_{normal,narrow}_{light,dark}`の
+8ケースを定義する。normalは720×500、narrowは320×480。実HUDの調整submenuと調整の印を
+使い、resolvedの基点jump・解除・全体checkboxの到達性を確認する。unresolvedはjumpのみ無効にし、
+保存済み調整の明示解除を維持する。fixtureの操作は保存や製品起動を行わない。
+基準PNGの生成・目視確認・実行結果の記録は検証ownerの担当で、テスト定義の追加だけで完了扱いにしない。
+
 詳細一覧の名前色 (§1.346) は `details_name_colors_*` と `details_name_color_settings_*` の
 Light／Dark × 標準／強い、計8枚を保持する。前者は六分類・長い日本語名・hover・選択・チェック・
 切り取り・選択情報バー・カスタム・OFF、後者は本体と共通の環境設定表・比・警告・強い固定色を描く。

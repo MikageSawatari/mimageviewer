@@ -1076,7 +1076,7 @@ pub(in crate::app) struct ViewerContextBundle {
     final_cover_spread_preference: crate::settings::FinalCoverSpreadPreference,
     singleton_spread_endpoint_preferences: crate::settings::SingletonSpreadEndpointPreferences,
     page_alone_preferences: crate::settings::PageAlonePreferences,
-    spread_shift_anchor_idx: Option<usize>,
+    pub(super) spread_shift: super::spread_shift_owner::ViewerSpreadShift,
     reading_flow: crate::settings::ReadingFlow,
     reading_direction: crate::settings::ReadingDirection,
     slideshow_playing: bool,
@@ -1179,6 +1179,7 @@ pub(in crate::app) struct ContextRef<'a> {
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::app) enum ContextAsyncOwner {
+    RetainedSpreadShift,
     PathClassification,
     HistoryTransition,
     CollectionGrid,
@@ -1209,7 +1210,8 @@ pub(in crate::app) enum ContextAsyncServicePhase {
 
 #[cfg(windows)]
 impl ContextAsyncOwner {
-    pub(in crate::app) const ALL: [Self; 19] = [
+    pub(in crate::app) const ALL: [Self; 20] = [
+        Self::RetainedSpreadShift,
         Self::EpubConversion,
         Self::PdfPassword,
         Self::PathClassification,
@@ -1235,6 +1237,7 @@ impl ContextAsyncOwner {
         macro_rules! pending {
             ($owner:ident) => {
                 match self {
+                    Self::RetainedSpreadShift => $owner.spread_shift.retained_readoption_pending(),
                     Self::PathClassification => $owner
                         .top_level_grid_view
                         .open_path_classification()
@@ -1315,6 +1318,7 @@ impl ContextAsyncOwner {
             return;
         }
         match self {
+            Self::RetainedSpreadShift => app.poll_retained_shift_readoption(ctx),
             Self::PathClassification => app.poll_open_path_classification(ctx),
             Self::HistoryTransition => app.poll_collection_history_transition(ctx),
             Self::CollectionGrid => app.poll_collection_grid(ctx),
@@ -1453,6 +1457,7 @@ impl ContextAsyncOwner {
                 }
             }
             Self::SimilarPreview => app.similar_panel.preview.terminate_on_park(),
+            Self::RetainedSpreadShift => app.spread_shift.cancel_retained_readoption(),
         }
     }
 }
@@ -2056,7 +2061,7 @@ impl ViewerContextBundle {
             singleton_spread_endpoint_preferences:
                 crate::settings::SingletonSpreadEndpointPreferences::default(),
             page_alone_preferences: crate::settings::PageAlonePreferences::default(),
-            spread_shift_anchor_idx: None,
+            spread_shift: Default::default(),
             reading_flow: crate::settings::ReadingFlow::default(),
             reading_direction: crate::settings::ReadingDirection::default(),
             slideshow_playing: false,
@@ -2423,7 +2428,7 @@ impl App {
             final_cover_spread_preference,
             singleton_spread_endpoint_preferences,
             page_alone_preferences,
-            spread_shift_anchor_idx,
+            spread_shift,
             reading_flow,
             reading_direction,
             slideshow_playing,
@@ -2708,7 +2713,7 @@ impl App {
         swap_field!(final_cover_spread_preference);
         swap_field!(singleton_spread_endpoint_preferences);
         swap_field!(page_alone_preferences);
-        swap_field!(spread_shift_anchor_idx);
+        swap_field!(spread_shift);
         swap_field!(reading_flow);
         swap_field!(reading_direction);
         swap_field!(slideshow_playing);
@@ -3040,7 +3045,7 @@ impl App {
             final_cover_spread_preference,
             singleton_spread_endpoint_preferences,
             page_alone_preferences,
-            spread_shift_anchor_idx,
+            spread_shift,
             reading_flow,
             reading_direction,
             slideshow_playing,
@@ -3364,7 +3369,7 @@ impl App {
             final_cover_spread_preference,
             singleton_spread_endpoint_preferences,
             page_alone_preferences,
-            spread_shift_anchor_idx,
+            spread_shift,
             reading_flow,
             reading_direction,
             pdf_enumerate_pending,
@@ -3463,7 +3468,7 @@ impl App {
         detached.final_cover_spread_preference = self.final_cover_spread_preference;
         detached.singleton_spread_endpoint_preferences = self.singleton_spread_endpoint_preferences;
         detached.page_alone_preferences = self.page_alone_preferences;
-        detached.spread_shift_anchor_idx = self.spread_shift_anchor_idx;
+        detached.spread_shift = self.spread_shift.fork_accepted();
         detached.reading_flow = self.reading_flow;
         detached.reading_direction = self.reading_direction;
 
@@ -3688,6 +3693,50 @@ impl App {
 
     pub(in crate::app) fn viewer_context_residence(&self, id: ViewerContextId) -> ContextResidence {
         self.viewer_contexts.table.residence(id)
+    }
+
+    pub(in crate::app) fn deliver_spread_shift_reply_at_rest(
+        &mut self,
+        reply: &crate::spread_shift::ShiftWriteReply,
+    ) -> Option<bool> {
+        self.viewer_contexts
+            .table
+            .at_rest_mut(reply.operation.context_id)
+            .and_then(|bundle| {
+                bundle
+                    .spread_shift
+                    .accept_write_reply(reply, self.settings.remember_spread_shift_per_book)
+            })
+    }
+
+    pub(in crate::app) fn make_at_rest_spread_shifts_session_only(&mut self) {
+        for slot in self.viewer_contexts.table.slots.values_mut() {
+            let bundle = match slot {
+                Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
+            };
+            bundle.spread_shift.session_only();
+        }
+    }
+
+    /// Page mappings update retained pairing identities. A book-root rename follows the
+    /// released reload behavior and leaves every accepted context payload at its old source.
+    pub(in crate::app) fn migrate_at_rest_spread_shifts(
+        &mut self,
+        mappings: &[crate::books::BookPathMapping],
+        root_move: Option<(&std::path::Path, &std::path::Path)>,
+    ) {
+        if root_move.is_some() {
+            return;
+        }
+        for slot in self.viewer_contexts.table.slots.values_mut() {
+            let bundle = match slot {
+                Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
+            };
+            if super::spread_shift_live_mappings::migrate(&mut bundle.spread_shift, mappings) {
+                bundle.fullscreen_navigator_interaction.invalidate();
+                bundle.similar_panel.preview.invalidate();
+            }
+        }
     }
 
     pub(crate) fn locate_window_context(
@@ -4393,7 +4442,7 @@ impl App {
         self.with_viewer_context(id, f)
             .expect("test window viewer context must mount")
     }
-    pub(in crate::app) fn push_window_context_for_test(
+    pub(crate) fn push_window_context_for_test(
         &mut self,
         ctx: &egui::Context,
         window_id: u64,
@@ -4487,6 +4536,176 @@ mod tests {
     use std::cell::RefCell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::rc::Rc;
+
+    #[cfg(windows)]
+    #[test]
+    fn book_root_rename_preserves_mounted_and_parked_context_payloads() {
+        use super::super::spread_shift_owner::ViewerShift;
+        use crate::spread_shift::{
+            ShiftPersistence, ShiftResolution, SpreadShiftPageRef, SpreadShiftState,
+        };
+        let mut app = crate::app::setup_app_for_test();
+        let seed = |owner: &mut App, root: &str| {
+            owner.current_folder = Some(PathBuf::from(root));
+            owner.address = root.into();
+            owner.archive_source_override = Some(PathBuf::from(root).join("Book.rar"));
+            owner.items = (0..4)
+                .map(|idx| GridItem::Image(PathBuf::from(format!("{root}/{idx}.jpg"))))
+                .collect();
+            owner.thumbnails = vec![ThumbnailState::Pending; 4];
+            owner.visible_indices = vec![0, 1, 2, 3];
+            owner.fullscreen_idx = Some(3);
+            owner.page_identity_index = Arc::new(
+                super::super::file_type_resume::PreparedPageIdentityIndex::prepare(
+                    &owner.items,
+                    None,
+                    Default::default(),
+                ),
+            );
+            owner.spread_shift.scope = Some(crate::book_scope::BookScopeKey::folder(root).unwrap());
+            owner.spread_shift.state = ViewerShift::Book(SpreadShiftState::Adjusted {
+                anchor_ref: SpreadShiftPageRef::RelativePath("3.jpg".into()),
+                resolution: ShiftResolution::Resolved(3),
+                persistence: ShiftPersistence::SessionOnly,
+            });
+            let entries = ["cover.jpg", "chapter/1.jpg", "chapter/2.jpg"].map(|entry_name| {
+                crate::zip_loader::ZipImageEntry {
+                    entry_name: entry_name.into(),
+                    uncompressed_size: 1,
+                    mtime: 0,
+                    container_ancestry: Vec::new(),
+                }
+            });
+            let mut nav =
+                crate::zip_tree::ZipNavState::new(Arc::new(crate::zip_tree::ZipTree::build(
+                    PathBuf::from(root).join("Book.zip"),
+                    entries.into(),
+                )));
+            nav.enter("chapter/");
+            owner.zip_nav = Some(nav);
+            owner.viewer_navigation_caches.all_items_are_images(
+                owner.items_generation,
+                crate::settings::ReadingFlow::Paged,
+                &owner.items,
+            );
+            owner.fs_cache.insert(0, FsCacheEntry::Failed);
+            let (_tx, rx) = mpsc::channel();
+            owner.fs_pending.insert(
+                1,
+                FsPendingValue::new(
+                    Arc::new(AtomicBool::new(false)),
+                    rx,
+                    owner.input_seq,
+                    FsLoadPurpose::Prefetch,
+                ),
+            );
+            owner.fs_upload_backlog.push(FsUploadResult::new(
+                2,
+                FsLoadResult::Failed,
+                owner.input_seq,
+                FsLoadPurpose::Prefetch,
+            ));
+        };
+        // Both an accepted main book and a matching F12 book retain their old source.
+        seed(&mut app, "C:/Books/Book");
+        let main = app.viewer_context_main();
+        let matching =
+            app.build_window_context_for_test(9821, |owner| seed(owner, "C:/Books/Book"));
+        let sibling = app.build_window_context_for_test(9822, |owner| seed(owner, "D:/Books/Book"));
+        macro_rules! payload {
+            ($owner:expr) => {{
+                let owner = $owner;
+                let nav = owner.zip_nav.as_ref().unwrap();
+                let pending = owner.fs_pending.get(&1).unwrap();
+                (
+                    (
+                        owner.current_folder.clone(),
+                        owner.address.clone(),
+                        owner.archive_source_override.clone(),
+                        owner.items.clone(),
+                        Arc::as_ptr(&owner.page_identity_index) as usize,
+                        owner.spread_shift.clone(),
+                    ),
+                    (
+                        nav.tree.zip_path.clone(),
+                        Arc::as_ptr(&nav.tree) as usize,
+                        nav.current().to_vec(),
+                        nav.current_parent_zipdir_prefix(),
+                        nav.at_root(),
+                    ),
+                    (
+                        owner.items_generation,
+                        owner.visible_indices.clone(),
+                        owner.fullscreen_idx,
+                        Arc::as_ptr(&owner.cancel_token) as usize,
+                        owner.cancel_token.load(Ordering::Relaxed),
+                        owner.viewer_navigation_caches.has_entries_for_test(),
+                    ),
+                    (
+                        owner.fs_pending.len(),
+                        Arc::as_ptr(&pending.cancel) as usize,
+                        pending.cancel.load(Ordering::Relaxed),
+                        pending.load_seq,
+                        owner.fs_cache.len(),
+                        matches!(owner.fs_cache.get(&0), Some(FsCacheEntry::Failed)),
+                        owner.fs_upload_backlog.current_items_generation(),
+                        owner
+                            .fs_upload_backlog
+                            .iter()
+                            .map(|upload| {
+                                (
+                                    upload.idx,
+                                    upload.load_seq,
+                                    matches!(upload.result, FsLoadResult::Failed),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                )
+            }};
+        }
+        let main_before = payload!(&app);
+        let matching_before = payload!(app.viewer_contexts.table.at_rest(matching).unwrap());
+        let sibling_before = payload!(app.viewer_contexts.table.at_rest(sibling).unwrap());
+        let source = Path::new("c:/books/book");
+        let target = Path::new("C:/Books/Renamed");
+        let mappings = [crate::books::BookPathMapping {
+            from: source.join("3.jpg"),
+            to: target.join("renamed.jpg"),
+        }];
+        app.migrate_at_rest_spread_shifts(&mappings, Some((source, target)));
+        assert_eq!(payload!(&app), main_before);
+        assert_eq!(
+            payload!(app.viewer_contexts.table.at_rest(matching).unwrap()),
+            matching_before,
+        );
+        assert_eq!(
+            payload!(app.viewer_contexts.table.at_rest(sibling).unwrap()),
+            sibling_before,
+        );
+        assert_eq!(app.projected_viewer_context_id(), main);
+        // While F12 owns the mounted projection, the parked main payload stays intact too.
+        app.with_window_viewer_context(9821, |owner| {
+            assert_eq!(payload!(&*owner), matching_before);
+            owner.migrate_at_rest_spread_shifts(&mappings, Some((source, target)));
+            assert_eq!(payload!(&*owner), matching_before);
+            assert_eq!(
+                payload!(owner.viewer_contexts.table.at_rest(main).unwrap()),
+                main_before,
+            );
+            assert_eq!(
+                payload!(owner.viewer_contexts.table.at_rest(sibling).unwrap()),
+                sibling_before,
+            );
+        })
+        .unwrap();
+        assert_eq!(payload!(&app), main_before);
+        assert_eq!(
+            payload!(app.viewer_contexts.table.at_rest(matching).unwrap()),
+            matching_before,
+        );
+        assert_eq!(app.projected_viewer_context_id(), main);
+    }
 
     #[cfg(windows)]
     #[test]

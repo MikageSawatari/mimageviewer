@@ -1230,6 +1230,7 @@ pub(crate) struct SessionHandle {
     archive_jobs: Arc<Mutex<Weak<super::archive_job::RemoteArchiveJobRegistry>>>,
     page_jobs: Arc<Mutex<Weak<super::page_jobs::PageJobRegistry>>>,
     archive_cache_db: Arc<Mutex<Option<Arc<crate::archive_cache::ArchiveCacheDb>>>>,
+    spread_shift_service: Arc<Mutex<Option<crate::spread_shift::SpreadShiftService>>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1422,6 +1423,7 @@ impl SessionHandle {
             archive_jobs: Arc::new(Mutex::new(Weak::new())),
             page_jobs: Arc::new(Mutex::new(Weak::new())),
             archive_cache_db: Arc::new(Mutex::new(None)),
+            spread_shift_service: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1507,6 +1509,19 @@ impl SessionHandle {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone()
+    }
+
+    /// App remains the only writer owner. Container workers borrow its fenced
+    /// immutable read path; installing this handle never opens a DB connection.
+    pub(crate) fn install_spread_shift_service(
+        &self,
+        service: Option<crate::spread_shift::SpreadShiftService>,
+    ) {
+        *self.spread_shift_service.lock().unwrap() = service;
+    }
+
+    pub(crate) fn spread_shift_service(&self) -> Option<crate::spread_shift::SpreadShiftService> {
+        self.spread_shift_service.lock().unwrap().clone()
     }
 
     fn has_nonterminal_long_jobs(&self) -> bool {

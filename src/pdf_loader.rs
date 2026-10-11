@@ -574,7 +574,7 @@ pub(crate) fn with_epub_pin_ranges<T>(
     action()
 }
 
-fn acquire_epub_pin_ranges(coverage: &[EpubPinCoverage]) -> EpubRangeLease {
+pub(crate) fn acquire_epub_pin_ranges(coverage: &[EpubPinCoverage]) -> EpubRangeLease {
     let mut range = Vec::new();
     for item in coverage {
         item.append_matches(&mut range);

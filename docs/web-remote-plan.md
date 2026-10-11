@@ -46,6 +46,10 @@ SQLite は DB ごとに journal 設定が異なる。特に `spread.db` は WAL 
 remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去した。settings / catalog の writer は
 引き続き本体だけであり、remote-web はこれらへ書き込まない。
 
+§1.364 Remote D3接続でもD1/D2のApp所有`SpreadShiftService`の単一workerがwriterである。
+Appが`SessionHandle`へ登録したread handleをContainerEngine workerへcloneし、完了証明付き
+snapshot/FIFO読取を使う。Remote専用の`spread_shift.db`接続やPC viewer-local stateの借用はしない。
+
 ### 2.2 セッションと排他
 
 本体に単一の remote session owner を置く。ブラウザは認証後に
@@ -55,6 +59,10 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
 取得を失敗として Local に戻す。AcquiringRemote 中は閉鎖の途中であり得るが、RemoteActive / DrainingRemote
 にはローカルの閲覧窓と player は残らない。操作者は常に
 1 人であり、2 台目やローカルとの競合は**後から操作した側が勝つ**。表示フォルダ等の状態同期はしない。
+
+§1.364 D3の取得continuationは、閉鎖前に受理済みのshift/resume writeの完了とread snapshot公開も
+FinishAcquireの前提に含める。viewer close自体はshift保存を発生させない。完了readinessをpollし、
+UI threadのDB待機やjoinを追加しない。Remote返却後は既存一覧reloadと次のBook openで保存値を解く。
 
 - ダイアログには `tailscale status --json` の `Peer.TailscaleIPs` と接続元 IP の照合結果から
   direct / relay と対向端末名を表示する。CLI 失敗・未照合時は「取得できません」と明示する
@@ -1047,6 +1055,38 @@ fullscreen と同じく非横長として扱う。応答の `page_groups` はグ
 読み進める順に並べ、各 `pages` は画面上の左→右順、`anchor` はそのグループの読み順先頭とする。
 remote-web は受信した各 address を組み直さず、独自 sort もしない。
 
+#### 本別の1ページずらしの復元（§1.364 D3、2026-10-11）
+
+本節はD3の所有境界と受入範囲を記録する。saved shiftはfull本scopeで解決し、完全応答では
+同じrules・列のPC unitとgroup/anchor/相方/slot/roleを共有する。bounded応答は既存group生成・
+cap・ページアクセスを保つ。切詰め境界の差はmasterのshiftなしにも存在し、D3の範囲外とする。
+省略ページの全寸法走査や境界group削除は追加しない。
+
+master `dd511eea5cd397bf922328afc6be1c3b2d169852`から抽出したRemote builderと、source一致を
+確認した六つのcanonical helperを実行し、shiftなしでもLtrCoverのfull prefixが
+`[[0],[1],[2,3]]`、boundedが`[[0],[1,2],[3]]`、Ltrのfull4が`[[0,1],[2,3]]`、
+bounded3が`[[0,1],[2]]`となる既存制限を確認した（exit 0、
+`target/D-1364-d3-master-source-proof.log`、`target/D-1364-d3-master-budget.log`）。
+これはmaster比較の証拠であり、D3全体のgate・独立完了レビュー・実機受入の証拠ではない。
+D3検証記録は設計§11.10と`target/D-1364-d3-msg.txt`へ集約する。
+
+記憶ONでは本のlogical `BookScopeKey`と保存PageRefを同じ本のidentity/navへ解決し、
+共通Automatic builderへoptional shiftとして渡す。shiftには親章/root fallbackを設けず、
+既存base spreadのfallbackは維持する。変換書庫ではshiftを元書庫のlogical scopeで扱う。
+現行Remoteのbase spreadも元書庫のlogical keyを保持する。PCのcache側baseとは異なり、
+この既存境界はD3で変更・移行しない。PCのfullscreen_idxやlive session anchorを読み取らない。
+保存基点の解決はresponse budgetによる切詰め前のfull本で行い、応答外の基点をMissingや本の末尾と誤判定しない。
+PageGroupは既存budgetの応答列と共通builderから生成し、Webでoffsetを再実装しない。
+記憶OFFの新規openには保存値を適用せず、force_single_page/端末orientationはread-onlyな投影で
+保存行をClear/Setしない。基点が本当にMissing/filteredなら保存refを保持し、別indexへ代用しない。
+resumeは既存UI request ownerからBookResumeWriterのReadPositionAfterへ接続し、固定読取点の
+完了結果で再開する。shiftもserviceの先行保存完了を満たす結果でgroupを作り、古い組を先に公開しない。
+
+Remoteの新しいnudge操作・記憶ON/OFFの設定画面は追加しない。設定と調整はPCで行う。
+wireの形・address・slot/roleの契約を変えないためIPC v69・Web asset tokenを維持する。
+本体とremote serviceの確認buildは同じsource treeから作る。G3は未統合で、C1–C12の共有fixture供給をG consumerの
+統合・検収とみなさない。D3の検証結果は[実装計画](spread-shift-memory-plan.md)へ別に記録する。
+
 モードと固定キーは本体既定に合わせる。
 
 | キー | モード |
@@ -1121,6 +1161,13 @@ UI が2秒以内に要求を claim しなければ pending→cancelled の原子
 適用せず `UiTimeout` (HTTP 504) を返す。期限内に UI が claim 済みなら曖昧な timeout 応答にはせず、
 短い DB transaction の確定結果を待つ。session owner は IPC worker の投入前と UI drain 時の
 両方で照合し、未取得 client は `NotAcquired`、別 client は `Superseded` として拒否する。
+
+§1.364 D3では、記憶ONのSetSpreadが現在の調整resetを行う場合に保存shiftもClearする（Q3）。
+base setterの同期保存契約はそのまま維持し、Clearだけを同request/sequence-ownedなcontinuationで
+待つ。成功応答、既存write-success invalidation、remote_state_generation更新とcontainer group cache
+失効は実Clear commit成功後に行う。エラーは既存失敗応答へ返し、成功と偽らない。記憶OFFは
+session resetだけで保存rowを保持する。force_single_page/向き変更はこの明示write経路を通らない。
+
 書き込みは畳み込まず単一 worker の FIFO で全要求へ個別応答する。Web は重複適用を避けるため
 write の transport retry も行わない。連打時は全書き込みを順番に適用し、表示再取得だけを最後の
 要求へまとめる。
@@ -1940,6 +1987,8 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 
 `crates/remote-ipc` の protocol version を上げた増分では、**本体と remote-web の両方を
 再ビルドして再起動する**必要がある。片方だけだとハンドシェイクで弾かれる。
+§1.364 D3はwireの形・address・slot/roleの契約を変えず、v69・Web asset tokenを維持する。
+本体とremote serviceの確認buildは両方作る。検証結果は`target/D-1364-d3-msg.txt`を参照する。
 現行版は **v69**。v69 は §1.345 の v68 と出荷済み v4.5.0 master の v67 を統合した版（共通base v66、両側が独立に版を上げたため max+1）。種類投影・最新policyでの読出し制限と音声サムネイルpresentationを両方保持し、本体とserviceを同時に更新する。v67 は §1.347 の音声サムネイル生成と共通一覧 presentation の audio indicator を追加する。同名 sidecar は動画・音声の共通 discovery を使い、永続コレクションの snapshot / navigation replacement にも出所を含む。Web の無画像・失敗終端は一覧 owner が保持し、明示再取得で artEpoch とともに破棄する。v66 は場所一覧の本体 materializer の統一 (§12.15) を含む。v65 は表示位置の RAW 先読み窓の宣言と ack を追加した (§14.24)。v64 は RAW ブランチの v62 と master の v63 を統合し、RAW ページの `RawPrefetchSkipped` / `RawCapacity`、サムネイルの `NoThumbnail` と、EPUB・音声トラック選択・再生位置書き戻しをすべて含む。本体と service を同時に更新する。v63 は audio-tracks ブランチの追加を統合し、Remote 動画の音声トラック列挙・選択状態、start の選択指定、世代照合付き切り替え control と、端末で見た再生位置の PC への書き戻し (`RecordVideoProgress`、所有世代と連番の照合) を含む。audio-tracks ブランチでは音声トラック追加時に v62、再生位置追加時に v63 としていた。master の v62 は EPUB 対応で、wire の形と enum 値は変えず、既存の `RemoteEntryKind::Pdf` / `ContainerKind::Pdf` が元 `.epub` の論理パスも表すようになった。旧 remote-web は EPUB を PDF 本として再検証できないため版を上げた。統合後の v63 では EPUB と音声トラック・再生位置の追加をすべて含み、本体と service を同時に更新する。v61 は物理フォルダの評価順読み取り失敗を一覧へ通知する任意の `sort_notice` を追加した。v60 は表紙直後・最終ページの強制単独表示、白い表示側、二つの本別値と Remote write を追加した。v59 は見開き先頭・末尾の単ページ配置を別々の保存値と Remote write に分けた。v58 は永続コレクションの着地位置を実媒体別の
 `{ kind, ordinal, count }` にし、v57 はコレクションの shuffle order、v56 は永続コレクションの
 catalog / snapshot / navigation を追加した。collection の session spread request と

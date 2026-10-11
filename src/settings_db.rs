@@ -326,6 +326,7 @@ pub(crate) struct RemoteListingSettings {
 /// spread defaults or page gap.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RemoteReadingSettings {
+    pub(crate) remember_spread_shift_per_book: bool,
     pub(crate) default_spread_mode: crate::settings::SpreadMode,
     pub(crate) default_reading_direction: crate::settings::ReadingDirection,
     pub(crate) follow_document_reading_direction: bool,
@@ -340,6 +341,7 @@ pub(crate) struct RemoteReadingSettings {
 impl RemoteReadingSettings {
     pub(crate) fn from_settings(settings: &Settings) -> Self {
         Self {
+            remember_spread_shift_per_book: settings.remember_spread_shift_per_book,
             default_spread_mode: settings.default_spread_mode,
             default_reading_direction: settings.default_reading_direction,
             follow_document_reading_direction: settings.follow_document_reading_direction,
@@ -886,6 +888,11 @@ impl SettingsDb {
         let inner = self.inner.lock().map_err(|_| SettingsDbError::Poisoned)?;
         let endpoints = read_singleton_endpoint_settings(&inner.conn)?;
         Ok(RemoteReadingSettings {
+            remember_spread_shift_per_book: read_settings_kv_typed(
+                &inner.conn,
+                "remember_spread_shift_per_book",
+                || fallback.remember_spread_shift_per_book,
+            )?,
             default_spread_mode: read_settings_kv_typed(
                 &inner.conn,
                 "default_spread_mode",

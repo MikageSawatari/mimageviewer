@@ -571,7 +571,10 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
   `Shift+↑/↓` は従来どおりプレーン `↑/↓` エイリアスとして固定扱い。
 - FsContinuousScrollForward/Back `PageDown/PageUp` (P)(連続読み時のみ) /
   FsFixedJumpPrevNoRtl/NextNoRtl `PageUp/PageDown` (P)(通常ページ単位表示のみ、RTL で反転しない)
-- FsSpreadShiftLeft/Right `Ctrl+←/→` (P)
+- FsSpreadShiftLeft/Right `Ctrl+←/→` (P): §1.364の共通受付で、適格な本の実内部anchorを
+  全体記憶設定に従って保存する。通常一覧/記憶OFFはsession調整、Single/Splitは従来移動。
+  リング/マウス/パッドの前/次版も同じ受付を使う。HUDの基点jump/解除/記憶checkboxは
+  既存popupから同ownerを呼び、新KeyActionや既定キーを追加しない。
 - FsSlideshow `S` ★ / FsSpaceCheck `Space` (スライドショー停止またはチェックトグル) ★
 - FsRotateCw `R` ★ / FsRotateCcw `L` ★ / FsImageAnalysis `Shift+Z` ★ / FsPanorama `V` ★ / FsPixelGrid `G` ★ (旧 `FsAnalysis = Z` を v2.0.0 で改名・既定変更)
 - FsNavigatorToggle `Alt+N` (P) / FsNavigatorHold `Alt` (MH。修飾↔修飾のみ)

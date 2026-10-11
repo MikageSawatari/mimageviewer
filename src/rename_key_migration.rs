@@ -184,24 +184,10 @@ fn with_identity_epub_coverage<T>(
     {
         let ranges = coverage
             .iter()
-            .filter_map(|(path, shape)| match shape {
-                IdentityCoverageShape::Exact
-                    if !path
-                        .extension()
-                        .and_then(|ext| ext.to_str())
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("epub")) =>
-                {
-                    None
+            .map(|(path, shape)| match shape {
+                IdentityCoverageShape::PathAndDescendants => {
+                    crate::pdf_loader::EpubPinCoverage::PathAndDescendants(path.clone())
                 }
-                IdentityCoverageShape::Exact => {
-                    Some(crate::pdf_loader::EpubPinCoverage::Exact(path.clone()))
-                }
-                IdentityCoverageShape::PathAndDescendants => Some(
-                    crate::pdf_loader::EpubPinCoverage::PathAndDescendants(path.clone()),
-                ),
-                IdentityCoverageShape::VirtualDescendants => Some(
-                    crate::pdf_loader::EpubPinCoverage::VirtualDescendants(path.clone()),
-                ),
             })
             .collect::<Vec<_>>();
         crate::pdf_loader::with_epub_pin_ranges(&ranges, action)
@@ -212,9 +198,7 @@ fn with_identity_epub_coverage<T>(
 
 #[derive(Clone, Copy)]
 enum IdentityCoverageShape {
-    Exact,
     PathAndDescendants,
-    VirtualDescendants,
 }
 
 /// 移行結果。`rows` = 書き換えた行数合計 (sidecar / パスワードは 1 件 = 1)。
@@ -866,6 +850,21 @@ enum StoreTableAvailability {
     OptionalInLegacySchema,
 }
 
+/// Only logical book stores expand a root restore to slash-separated chapter scopes.
+/// Ordinary page stores retain their existing exact / virtual-page restore contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StoreRestoreFamily {
+    VirtualPages,
+    LogicalBookFamily,
+}
+
+fn restore_family_prefix(root: &str, family: StoreRestoreFamily) -> String {
+    match family {
+        StoreRestoreFamily::VirtualPages => format!("{root}::"),
+        StoreRestoreFamily::LogicalBookFamily => format!("{root}/"),
+    }
+}
+
 /// リネームと mIV 内削除成功時 hard purge が共有する path-keyed SQLite 記述子。
 ///
 /// `unique` は rename の衝突処理と content-identity v1 copy の可否に使う。
@@ -881,10 +880,15 @@ pub(crate) struct StoreDescriptor {
     pub(crate) unique: bool,
     pub(crate) normalization: StoreKeyNormalization,
     pub(crate) rename_generic: bool,
+    pub(crate) restore_family: StoreRestoreFamily,
     table_availability: StoreTableAvailability,
 }
 
 impl StoreDescriptor {
+    const fn logical_book_family(mut self) -> Self {
+        self.restore_family = StoreRestoreFamily::LogicalBookFamily;
+        self
+    }
     /// このストア自身が宣言する規則で物理 path を永続キーへ正規化する。
     /// copy / rename / purge の呼び出し側がキー方式を推測しないための単一境界。
     fn normalize_path(self, path: &Path) -> String {
@@ -909,6 +913,7 @@ const fn store(
         unique,
         normalization,
         rename_generic: true,
+        restore_family: StoreRestoreFamily::VirtualPages,
         table_availability: StoreTableAvailability::Required,
     }
 }
@@ -927,6 +932,7 @@ const fn optional_legacy_store(
         unique,
         normalization,
         rename_generic: true,
+        restore_family: StoreRestoreFamily::VirtualPages,
         table_availability: StoreTableAvailability::OptionalInLegacySchema,
     }
 }
@@ -937,6 +943,14 @@ const fn optional_legacy_store(
 /// hard purge も走査するため、rename と purge の対象が将来ずれない。PDF パスワードだけは
 /// JSON の SHA-256 キーなので、この表と並ぶ専用処理を両経路が共有する。
 pub(crate) const STORES: &[StoreDescriptor] = &[
+    optional_legacy_store(
+        "spread_shift.db",
+        "spread_shifts",
+        "path",
+        true,
+        StoreKeyNormalization::KeepDrive,
+    )
+    .logical_book_family(),
     // Added after the original settings schema; an unopened legacy DB has no watched table yet.
     optional_legacy_store(
         "settings.db",
@@ -1128,6 +1142,7 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         unique: true,
         normalization: StoreKeyNormalization::KeepDrive,
         rename_generic: false,
+        restore_family: StoreRestoreFamily::VirtualPages,
         table_availability: StoreTableAvailability::Required,
     },
 ];
@@ -1207,11 +1222,21 @@ pub(crate) fn copy_stores_at_with_progress(
     mappings: &[StoreCopyPathMapping],
     on_progress: impl FnMut(usize, usize),
 ) -> StoreCopyReport {
-    copy_stores_impl(data_dir, mappings, true, on_progress)
+    copy_stores_acquire_maintenance(data_dir, mappings, true, on_progress)
 }
 
-/// EPUB restore promotes its ledger row under the book guard after copying.
-/// Copying edit_origin here would recursively enter the EPUB range guard.
+/// Borrow the operation's EPUB-before-shift owner; never acquire recursively.
+pub(crate) fn copy_stores_at_with_maintenance(
+    data_dir: &Path,
+    mappings: &[StoreCopyPathMapping],
+    maintenance: &StoreMaintenanceLease,
+    on_progress: impl FnMut(usize, usize),
+) -> StoreCopyReport {
+    copy_stores_impl(data_dir, mappings, true, maintenance, on_progress)
+}
+
+/// The caller protects its EPUB book; this copy excludes the identity ledger and
+/// only takes short shift maintenance after the existing book protection.
 pub(crate) fn copy_restore_stores_without_identity_at(
     data_dir: &Path,
     mappings: &[StoreCopyPathMapping],
@@ -1224,13 +1249,87 @@ pub(crate) fn copy_restore_stores_without_identity_at_with_progress(
     mappings: &[StoreCopyPathMapping],
     on_progress: impl FnMut(usize, usize),
 ) -> StoreCopyReport {
-    copy_stores_impl(data_dir, mappings, false, on_progress)
+    copy_stores_acquire_maintenance(data_dir, mappings, false, on_progress)
+}
+
+pub(crate) fn copy_restore_stores_without_identity_with_maintenance(
+    data_dir: &Path,
+    mappings: &[StoreCopyPathMapping],
+    maintenance: &StoreMaintenanceLease,
+    on_progress: impl FnMut(usize, usize),
+) -> StoreCopyReport {
+    copy_stores_impl(data_dir, mappings, false, maintenance, on_progress)
+}
+
+/// Match the identity copy's exact EPUB keys and virtual key families. Normal
+/// files do not acquire book coverage; a virtual family never includes its root.
+pub(crate) fn store_copy_epub_coverage(
+    mappings: &[StoreCopyPathMapping],
+) -> Vec<crate::pdf_loader::EpubPinCoverage> {
+    let mut coverage = Vec::new();
+    for mapping in mappings {
+        let (old_path, new_path) = match mapping {
+            StoreCopyPathMapping::Exact { old_path, new_path }
+            | StoreCopyPathMapping::VirtualPrefix { old_path, new_path } => (old_path, new_path),
+        };
+        if crate::path_key::normalize_keep_drive(old_path)
+            == crate::path_key::normalize_keep_drive(new_path)
+        {
+            continue;
+        }
+        for path in [old_path, new_path] {
+            match mapping {
+                StoreCopyPathMapping::Exact { .. }
+                    if path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("epub")) =>
+                {
+                    coverage.push(crate::pdf_loader::EpubPinCoverage::Exact(path.clone()));
+                }
+                StoreCopyPathMapping::Exact { .. } => {}
+                StoreCopyPathMapping::VirtualPrefix { .. } => coverage.push(
+                    crate::pdf_loader::EpubPinCoverage::VirtualDescendants(path.clone()),
+                ),
+            }
+        }
+    }
+    coverage
+}
+
+fn copy_stores_acquire_maintenance(
+    data_dir: &Path,
+    mappings: &[StoreCopyPathMapping],
+    include_identity: bool,
+    on_progress: impl FnMut(usize, usize),
+) -> StoreCopyReport {
+    let mut report = StoreCopyReport::default();
+    let coverage = if include_identity {
+        store_copy_epub_coverage(mappings)
+    } else {
+        Vec::new()
+    };
+    let maintenance = match acquire_store_maintenance(data_dir, &coverage) {
+        Ok(lease) => lease,
+        Err(error) => {
+            report.errors.push(format!("spread_shift: {error}"));
+            return report;
+        }
+    };
+    copy_stores_impl(
+        data_dir,
+        mappings,
+        include_identity,
+        &maintenance,
+        on_progress,
+    )
 }
 
 fn copy_stores_impl(
     data_dir: &Path,
     mappings: &[StoreCopyPathMapping],
     include_identity: bool,
+    maintenance: &StoreMaintenanceLease,
     mut on_progress: impl FnMut(usize, usize),
 ) -> StoreCopyReport {
     let mut report = StoreCopyReport::default();
@@ -1262,11 +1361,20 @@ fn copy_stores_impl(
                     })
                 }
                 StoreCopyPathMapping::VirtualPrefix { old_path, new_path } => {
+                    if descriptor.restore_family == StoreRestoreFamily::LogicalBookFamily {
+                        return None;
+                    }
                     let old_key = descriptor.normalize_path(old_path);
                     let new_key = descriptor.normalize_path(new_path);
                     (old_key != new_key).then(|| NormalizedStoreCopyMapping::Prefix {
-                        old_prefix: format!("{old_key}::"),
-                        new_prefix: format!("{new_key}::"),
+                        old_prefix: restore_family_prefix(
+                            &old_key,
+                            StoreRestoreFamily::VirtualPages,
+                        ),
+                        new_prefix: restore_family_prefix(
+                            &new_key,
+                            StoreRestoreFamily::VirtualPages,
+                        ),
                     })
                 }
             })
@@ -1277,6 +1385,7 @@ fn copy_stores_impl(
             continue;
         }
         let descriptor_start = processed;
+        let previous_errors = report.errors.len();
         copy_store(
             &data_dir.join(descriptor.file),
             descriptor,
@@ -1287,6 +1396,9 @@ fn copy_stores_impl(
                 on_progress(processed, total);
             },
         );
+        if descriptor.file == "spread_shift.db" && report.errors.len() != previous_errors {
+            maintenance.maintenance.invalidate_unknown_failure();
+        }
         // Missing databases and failed transactions still finish this descriptor's work.
         processed = descriptor_start + normalized.len();
         on_progress(processed, total);
@@ -1344,7 +1456,7 @@ pub(crate) fn ledger_keys_with_restorable_rows_at(
     backed
 }
 
-/// 1 つの store に、指定 key 本体または `key::` 配下 (ZIP/PDF ページ) の行があるか。
+/// Exact root plus the descriptor's restore family (virtual pages or logical chapters).
 fn store_keys_with_rows(
     db_path: &Path,
     descriptor: StoreDescriptor,
@@ -1368,8 +1480,10 @@ fn store_keys_with_rows(
     if !columns.iter().any(|column| column == descriptor.column) {
         return Err(rusqlite::Error::InvalidColumnName(descriptor.column.to_string()).to_string());
     }
-    // 仮想ページのキーは `<container>::<entry>`。`LIKE` はパスに現れる `_` と `%` を
-    // ワイルドカードとして拾ってしまうので、半開区間で引く (`::` の次は `:;`)。
+    if descriptor.file == "spread_shift.db" {
+        crate::spread_shift::validate_database_rows(&conn)?;
+    }
+    // Copy and probe use the same delimiter and BINARY half-open range, without LIKE.
     let sql = format!(
         "SELECT 1 FROM {table} WHERE {column} = ?1 OR ({column} >= ?2 AND {column} < ?3) LIMIT 1",
         table = descriptor.table,
@@ -1379,12 +1493,10 @@ fn store_keys_with_rows(
     let mut found = Vec::new();
     for file_key in file_keys {
         let store_key = descriptor.normalize_path(Path::new(file_key));
+        let prefix = restore_family_prefix(&store_key, descriptor.restore_family);
+        let upper = prefix_upper_bound(&prefix).expect("ASCII family delimiter has an upper bound");
         let exists = statement
-            .exists(rusqlite::params![
-                store_key,
-                format!("{store_key}::"),
-                format!("{store_key}:;"),
-            ])
+            .exists(rusqlite::params![store_key, prefix, upper,])
             .map_err(|error| error.to_string())?;
         if exists {
             found.push(file_key.clone());
@@ -1406,6 +1518,15 @@ fn open_store_for_write(
         let conn = rusqlite::Connection::open(db_path).map_err(|error| error.to_string())?;
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|error| error.to_string())?;
+        if descriptor.file == "spread_shift.db" {
+            let present: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'spread_shifts')",
+                [], |row| row.get(0),
+            ).map_err(|error| error.to_string())?;
+            if present {
+                crate::spread_shift::validate_database_rows(&conn)?;
+            }
+        }
         Ok(conn)
     }
 }
@@ -1429,12 +1550,36 @@ pub(crate) fn run_at_with_shape(
     new_path: &Path,
     _tree: bool,
 ) -> RenameMigrationReport {
+    let coverage = [
+        crate::pdf_loader::EpubPinCoverage::PathAndDescendants(old_path.to_path_buf()),
+        crate::pdf_loader::EpubPinCoverage::PathAndDescendants(new_path.to_path_buf()),
+    ];
+    run_at_with_epub_acquisition(data_dir, old_path, new_path, || {
+        crate::pdf_loader::acquire_epub_pin_ranges(&coverage)
+    })
+}
+
+fn run_at_with_epub_acquisition(
+    data_dir: &Path,
+    old_path: &Path,
+    new_path: &Path,
+    acquire_epub: impl FnOnce() -> crate::pdf_loader::EpubRangeLease,
+) -> RenameMigrationReport {
     let mut report = RenameMigrationReport {
         rows: 0,
         errors: Vec::new(),
         store_mutations: StoreMutationEffects::default(),
         panicked: false,
     };
+    let maintenance = match acquire_store_maintenance_with_epub(data_dir, acquire_epub) {
+        Ok(lease) => lease,
+        Err(error) => {
+            report.errors.push(format!("spread_shift: {error}"));
+            return report;
+        }
+    };
+    maintenance.maintenance.invalidate_root_family(old_path);
+    maintenance.maintenance.invalidate_root_family(new_path);
 
     // 1. 動画/音声の .xmp サイドカー (タグ・★の実体) をファイルごと改名する。
     //    フォルダ改名では中のサイドカーがフォルダと一緒に移動しているので対象外。
@@ -1461,6 +1606,7 @@ pub(crate) fn run_at_with_shape(
         if old_key == new_key {
             continue;
         }
+        let previous_errors = report.errors.len();
         migrate_store(
             &data_dir.join(descriptor.file),
             descriptor,
@@ -1468,6 +1614,9 @@ pub(crate) fn run_at_with_shape(
             new_key,
             &mut report,
         );
+        if descriptor.file == "spread_shift.db" && report.errors.len() != previous_errors {
+            maintenance.maintenance.invalidate_unknown_failure();
+        }
     }
     drop(rating_write);
     drop(tag_write);
@@ -1478,6 +1627,16 @@ pub(crate) fn run_at_with_shape(
     // また missing 行を保持する仕様上、STORES と共有される delete hard purge の対象にも
     // してはならない。専用 transaction で case-only rename も含めて追従させる。
     migrate_book_bookmarks(data_dir, old_path, new_path, &mut report);
+    match crate::spread_shift::migrate_page_paths_at(
+        data_dir,
+        &[(old_path.to_path_buf(), new_path.to_path_buf())],
+    ) {
+        Ok(rows) => report.rows += rows,
+        Err(error) => {
+            maintenance.maintenance.invalidate_unknown_failure();
+            report.errors.push(format!("spread_shift: {error}"));
+        }
+    }
 
     // 5. 閲覧履歴 (exact のみ。raw path 列も更新する)。記述子自体は STORES にあり、
     //    purge は exact + prefix で同じ行を削除する。
@@ -1542,7 +1701,7 @@ pub(crate) fn purge_removed_paths_guarded_at(
     data_dir: &Path,
     removed: &[PathBuf],
     pdf_paths: &[PathBuf],
-    guard: &crate::pdf_loader::EpubRangeLease,
+    guard: &DeleteMaintenanceLease,
 ) -> PurgeReport {
     let scopes = removed
         .iter()
@@ -1552,18 +1711,49 @@ pub(crate) fn purge_removed_paths_guarded_at(
     purge_removed_scopes_guarded_at(data_dir, &scopes, pdf_paths, guard)
 }
 
-/// Acquire once before Shell, then pass this guard through every purge attempt.
+/// All maintenance takes EPUB protection before shift. Release shift first so
+/// its writer reload finishes while ledger/pin protection still belongs to us.
+pub(crate) struct StoreMaintenanceLease {
+    maintenance: crate::spread_shift::SpreadShiftMaintenanceLease,
+    epub: crate::pdf_loader::EpubRangeLease,
+}
+
+pub(crate) type DeleteMaintenanceLease = StoreMaintenanceLease;
+
+pub(crate) fn acquire_store_maintenance(
+    data_dir: &Path,
+    coverage: &[crate::pdf_loader::EpubPinCoverage],
+) -> Result<StoreMaintenanceLease, String> {
+    acquire_store_maintenance_with_epub(data_dir, || {
+        crate::pdf_loader::acquire_epub_pin_ranges(coverage)
+    })
+}
+
+fn acquire_store_maintenance_with_epub(
+    data_dir: &Path,
+    acquire_epub: impl FnOnce() -> crate::pdf_loader::EpubRangeLease,
+) -> Result<StoreMaintenanceLease, String> {
+    let epub = acquire_epub();
+    let maintenance = crate::spread_shift::maintenance_at(data_dir)?;
+    Ok(StoreMaintenanceLease { maintenance, epub })
+}
+
+/// Acquire EPUB coverage then shift, once before Shell. Borrow the same owner
+/// through every purge attempt without reacquiring either protection.
 pub(crate) fn acquire_delete_epub_guard(
+    data_dir: &Path,
     scopes: &[crate::delete_worker::DeleteSourceScope],
-) -> crate::pdf_loader::EpubRangeLease {
-    let paths = scopes
+) -> Result<DeleteMaintenanceLease, String> {
+    let coverage = scopes
         .iter()
         .map(|scope| match scope {
             crate::delete_worker::DeleteSourceScope::Exact(path)
-            | crate::delete_worker::DeleteSourceScope::Tree(path) => path.clone(),
+            | crate::delete_worker::DeleteSourceScope::Tree(path) => {
+                crate::pdf_loader::EpubPinCoverage::PathAndDescendants(path.clone())
+            }
         })
         .collect::<Vec<_>>();
-    crate::pdf_loader::acquire_epub_pin_coverage(&paths)
+    acquire_store_maintenance(data_dir, &coverage)
 }
 
 /// The SQL uses exact, slash-descendant and virtual-descendant keys for both
@@ -1574,16 +1764,48 @@ pub(crate) fn purge_removed_scopes_at(
     scopes: &[crate::delete_worker::DeleteSourceScope],
     pdf_paths: &[PathBuf],
 ) -> PurgeReport {
-    purge_removed_scopes_impl(data_dir, scopes, pdf_paths, None)
+    purge_removed_scopes_acquire_maintenance(data_dir, scopes, pdf_paths)
 }
 
 pub(crate) fn purge_removed_scopes_guarded_at(
     data_dir: &Path,
     scopes: &[crate::delete_worker::DeleteSourceScope],
     pdf_paths: &[PathBuf],
-    guard: &crate::pdf_loader::EpubRangeLease,
+    guard: &DeleteMaintenanceLease,
 ) -> PurgeReport {
-    purge_removed_scopes_impl(data_dir, scopes, pdf_paths, Some(guard))
+    purge_removed_scopes_impl(
+        data_dir,
+        scopes,
+        pdf_paths,
+        Some(&guard.epub),
+        &guard.maintenance,
+    )
+}
+
+#[cfg(test)]
+fn purge_removed_scopes_acquire_maintenance(
+    data_dir: &Path,
+    scopes: &[crate::delete_worker::DeleteSourceScope],
+    pdf_paths: &[PathBuf],
+) -> PurgeReport {
+    let mut report = PurgeReport::default();
+    if scopes.is_empty() {
+        return report;
+    }
+    let maintenance = match acquire_delete_epub_guard(data_dir, scopes) {
+        Ok(lease) => lease,
+        Err(error) => {
+            report.errors.push(format!("spread_shift: {error}"));
+            return report;
+        }
+    };
+    purge_removed_scopes_impl(
+        data_dir,
+        scopes,
+        pdf_paths,
+        Some(&maintenance.epub),
+        &maintenance.maintenance,
+    )
 }
 
 fn purge_removed_scopes_impl(
@@ -1591,6 +1813,7 @@ fn purge_removed_scopes_impl(
     scopes: &[crate::delete_worker::DeleteSourceScope],
     pdf_paths: &[PathBuf],
     guard: Option<&crate::pdf_loader::EpubRangeLease>,
+    maintenance: &crate::spread_shift::SpreadShiftMaintenanceLease,
 ) -> PurgeReport {
     let mut report = PurgeReport::default();
     if scopes.is_empty() {
@@ -1604,6 +1827,9 @@ fn purge_removed_scopes_impl(
             | crate::delete_worker::DeleteSourceScope::Tree(path) => path.clone(),
         })
         .collect::<Vec<_>>();
+    for root in &removed {
+        maintenance.invalidate_root_family(root);
+    }
     assert!(
         guard.is_none_or(|guard| guard.covers_paths_and_descendants(&removed)),
         "delete purge must keep the Shell range guard"
@@ -1627,7 +1853,11 @@ fn purge_removed_scopes_impl(
             StoreKeyNormalization::KeepDrive => &keep_drive_coverage,
             StoreKeyNormalization::DriveStripped => &drive_stripped_coverage,
         };
+        let previous_errors = report.errors.len();
         purge_store(data_dir, descriptor, keys, coverage, guard, &mut report);
+        if descriptor.file == "spread_shift.db" && report.errors.len() != previous_errors {
+            maintenance.invalidate_unknown_failure();
+        }
     }
     drop(rating_write);
     drop(tag_write);
@@ -1898,74 +2128,62 @@ fn migrate_store(
     if !db_path.exists() {
         return;
     }
-    // The SQL below migrates exact, slash descendants and virtual entries for
-    // both files and folders, so the guard must cover those same key families.
-    let shape = IdentityCoverageShape::PathAndDescendants;
-    let coverage = [
-        (PathBuf::from(old_key), shape),
-        (PathBuf::from(new_key), shape),
-    ];
-    let result = with_identity_epub_coverage(descriptor, &coverage, || {
-        (|| -> Result<usize, Box<dyn std::error::Error>> {
-            let mut conn =
-                open_store_for_write(db_path, descriptor).map_err(std::io::Error::other)?;
-            let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
-            let _rating_write =
-                (descriptor.table == "ratings").then(|| crate::rating_db::RATING_WRITES.begin());
-            let _tag_write =
-                (descriptor.file == "tags.db").then(|| crate::tags_db::TAG_WRITES.begin());
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let columns = table_columns(&tx, descriptor.table)?;
-            if columns.is_empty()
-                && descriptor.table_availability == StoreTableAvailability::OptionalInLegacySchema
-            {
-                return Ok(0);
-            }
-            if !columns.iter().any(|column| column == descriptor.column) {
-                return Err(
-                    rusqlite::Error::InvalidColumnName(descriptor.column.to_string()).into(),
-                );
-            }
-            let mut changed = 0usize;
-            changed += move_exact(
-                &tx,
-                descriptor.table,
-                descriptor.column,
-                descriptor.unique,
-                old_key,
-                new_key,
+    // The operation already owns the union EPUB coverage before shift maintenance.
+    let result = (|| -> Result<usize, Box<dyn std::error::Error>> {
+        let mut conn = open_store_for_write(db_path, descriptor).map_err(std::io::Error::other)?;
+        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+        let _rating_write =
+            (descriptor.table == "ratings").then(|| crate::rating_db::RATING_WRITES.begin());
+        let _tag_write = (descriptor.file == "tags.db").then(|| crate::tags_db::TAG_WRITES.begin());
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let columns = table_columns(&tx, descriptor.table)?;
+        if columns.is_empty()
+            && descriptor.table_availability == StoreTableAvailability::OptionalInLegacySchema
+        {
+            return Ok(0);
+        }
+        if !columns.iter().any(|column| column == descriptor.column) {
+            return Err(rusqlite::Error::InvalidColumnName(descriptor.column.to_string()).into());
+        }
+        let mut changed = 0usize;
+        changed += move_exact(
+            &tx,
+            descriptor.table,
+            descriptor.column,
+            descriptor.unique,
+            old_key,
+            new_key,
+        )?;
+        changed += move_prefix(
+            &tx,
+            descriptor.table,
+            descriptor.column,
+            descriptor.unique,
+            &format!("{old_key}/"),
+            &format!("{new_key}/"),
+        )?;
+        changed += move_prefix(
+            &tx,
+            descriptor.table,
+            descriptor.column,
+            descriptor.unique,
+            &format!("{old_key}::"),
+            &format!("{new_key}::"),
+        )?;
+        // rating.db はキーから導出される source_path 列 (一覧ビューがコンテナを開くのに
+        // 使う) も新キーに合わせる (`RatingDb::copy_entry_key` と同じ導出規則 =
+        // "::" より前、無ければキー自身)。
+        if descriptor.table == "ratings" && changed > 0 {
+            tx.execute(
+                &format!("{RATING_SOURCE_PATH_UPDATE} WHERE path = ?1"),
+                [new_key],
             )?;
-            changed += move_prefix(
-                &tx,
-                descriptor.table,
-                descriptor.column,
-                descriptor.unique,
-                &format!("{old_key}/"),
-                &format!("{new_key}/"),
-            )?;
-            changed += move_prefix(
-                &tx,
-                descriptor.table,
-                descriptor.column,
-                descriptor.unique,
-                &format!("{old_key}::"),
-                &format!("{new_key}::"),
-            )?;
-            // rating.db はキーから導出される source_path 列 (一覧ビューがコンテナを開くのに
-            // 使う) も新キーに合わせる (`RatingDb::copy_entry_key` と同じ導出規則 =
-            // "::" より前、無ければキー自身)。
-            if descriptor.table == "ratings" && changed > 0 {
-                tx.execute(
-                    &format!("{RATING_SOURCE_PATH_UPDATE} WHERE path = ?1"),
-                    [new_key],
-                )?;
-                update_rating_source_paths_for_prefix(&tx, &format!("{new_key}/"))?;
-                update_rating_source_paths_for_prefix(&tx, &format!("{new_key}::"))?;
-            }
-            tx.commit()?;
-            Ok(changed)
-        })()
-    });
+            update_rating_source_paths_for_prefix(&tx, &format!("{new_key}/"))?;
+            update_rating_source_paths_for_prefix(&tx, &format!("{new_key}::"))?;
+        }
+        tx.commit()?;
+        Ok(changed)
+    })();
 
     match result {
         Ok(n) => {
@@ -2074,33 +2292,9 @@ fn copy_store(
         return;
     }
     report.database_opens += 1;
-    let coverage = mappings
-        .iter()
-        .flat_map(|mapping| match mapping {
-            NormalizedStoreCopyMapping::Exact {
-                old_key, new_key, ..
-            } => [
-                (PathBuf::from(old_key), IdentityCoverageShape::Exact),
-                (PathBuf::from(new_key), IdentityCoverageShape::Exact),
-            ],
-            NormalizedStoreCopyMapping::Prefix {
-                old_prefix,
-                new_prefix,
-            } => [
-                (
-                    PathBuf::from(old_prefix.trim_end_matches("::")),
-                    IdentityCoverageShape::VirtualDescendants,
-                ),
-                (
-                    PathBuf::from(new_prefix.trim_end_matches("::")),
-                    IdentityCoverageShape::VirtualDescendants,
-                ),
-            ],
-        })
-        .collect::<Vec<_>>();
-    let result = with_identity_epub_coverage(&descriptor, &coverage, || {
-        copy_store_transaction(db_path, descriptor, mappings, on_mapping)
-    });
+    // Full copies hold their union EPUB coverage at the operation boundary;
+    // without-identity copies have no ledger mutation requiring a nested guard.
+    let result = copy_store_transaction(db_path, descriptor, mappings, on_mapping);
 
     match result {
         Ok(rows) => {
@@ -2212,13 +2406,27 @@ fn copy_store_mapping(
                 )
                 .map_err(|error| error.to_string())?;
             }
-            GenericCopyOutcome {
+            let mut outcome = GenericCopyOutcome {
                 rows: copied,
                 copied_keys: (copied > 0)
                     .then(|| (old_key.clone(), new_key.clone()))
                     .into_iter()
                     .collect(),
+            };
+            if descriptor.restore_family == StoreRestoreFamily::LogicalBookFamily {
+                let family = copy_prefix(
+                    tx,
+                    descriptor.table,
+                    descriptor.column,
+                    columns,
+                    &restore_family_prefix(old_key, descriptor.restore_family),
+                    &restore_family_prefix(new_key, descriptor.restore_family),
+                )
+                .map_err(|error| error.to_string())?;
+                outcome.rows += family.rows;
+                outcome.copied_keys.extend(family.copied_keys);
             }
+            outcome
         }
         NormalizedStoreCopyMapping::Prefix {
             old_prefix,
@@ -2479,6 +2687,91 @@ mod tests {
     use rusqlite::OptionalExtension;
     use sha2::{Digest, Sha256};
     use std::path::PathBuf;
+
+    #[test]
+    fn rename_waiting_for_epub_does_not_block_sibling_save_metadata_copy() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let data = tempfile::tempdir().unwrap();
+        let source = data.path().join("source.epub");
+        let renamed = data.path().join("renamed.epub");
+        let sibling = data.path().join("source.zip");
+        let source_key = crate::path_key::normalize_keep_drive(&source);
+        let sibling_key = crate::path_key::normalize_keep_drive(&sibling);
+        let renamed_key = crate::path_key::normalize_keep_drive(&renamed);
+        let connection = rusqlite::Connection::open(data.path().join("rotation.db")).unwrap();
+        connection
+            .execute_batch("CREATE TABLE rotations(path TEXT PRIMARY KEY, angle INTEGER NOT NULL)")
+            .unwrap();
+        connection
+            .execute("INSERT INTO rotations VALUES (?1, 90)", [&source_key])
+            .unwrap();
+        drop(connection);
+
+        // Save keeps this source protection throughout conversion. Global shift
+        // maintenance must remain available when rename needs this same book.
+        let book = crate::pdf_loader::acquire_epub_book_lease(&source);
+        let (epub_stage_tx, epub_stage_rx) = mpsc::channel();
+        let (release_stage_tx, release_stage_rx) = mpsc::channel();
+        let (renamed_tx, renamed_rx) = mpsc::channel();
+        let rename_data = data.path().to_path_buf();
+        let rename_source = source.clone();
+        let rename = std::thread::spawn(move || {
+            let coverage = [
+                crate::pdf_loader::EpubPinCoverage::PathAndDescendants(rename_source.clone()),
+                crate::pdf_loader::EpubPinCoverage::PathAndDescendants(renamed.clone()),
+            ];
+            let report =
+                run_at_with_epub_acquisition(&rename_data, &rename_source, &renamed, || {
+                    // Hold the EPUB-acquisition stage deterministically. Taking
+                    // shift before invoking this stage would deadlock the copy.
+                    epub_stage_tx.send(()).unwrap();
+                    release_stage_rx.recv().unwrap();
+                    crate::pdf_loader::acquire_epub_pin_ranges(&coverage)
+                });
+            renamed_tx.send(report).unwrap();
+        });
+        epub_stage_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        let (copied_tx, copied_rx) = mpsc::channel();
+        let copy_data = data.path().to_path_buf();
+        let copy = std::thread::spawn(move || {
+            copied_tx
+                .send(copy_restore_stores_without_identity_at(
+                    &copy_data,
+                    &[
+                        StoreCopyPathMapping::exact(&source, &sibling),
+                        StoreCopyPathMapping::virtual_prefix(&source, &sibling),
+                    ],
+                ))
+                .unwrap();
+        });
+        let copied = copied_rx.recv_timeout(Duration::from_secs(10));
+        // Release even on failure, so a failed regression cannot strand workers.
+        drop(book);
+        release_stage_tx.send(()).unwrap();
+        let migrated = renamed_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        rename.join().unwrap();
+        copy.join().unwrap();
+        let copied = copied.expect("rename took shift while waiting for EPUB acquisition");
+        assert!(copied.errors.is_empty(), "{:?}", copied.errors);
+        assert!(migrated.errors.is_empty(), "{:?}", migrated.errors);
+        assert_eq!(copied.rows, 1);
+        let connection = rusqlite::Connection::open(data.path().join("rotation.db")).unwrap();
+        for key in [sibling_key, renamed_key] {
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT angle FROM rotations WHERE path = ?1",
+                        [key],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                90
+            );
+        }
+    }
 
     #[test]
     fn pdf_and_image_store_copy_does_not_wait_for_nonoverlapping_epub_range() {
@@ -2827,6 +3120,14 @@ mod tests {
 
     fn setup_copy_store_rows(dir: &Path, old: &Path) {
         for descriptor in STORES {
+            if descriptor.file == "spread_shift.db" {
+                crate::spread_shift::initialize_database_at(&dir.join(descriptor.file)).unwrap();
+                let connection = open(dir, descriptor.file);
+                let old_key = descriptor.normalize_path(old);
+                insert_shift_fixture(&connection, &old_key, "exact");
+                insert_shift_fixture(&connection, &format!("{old_key}/ページ/001.jpg"), "prefix");
+                continue;
+            }
             if descriptor.file == crate::content_identity::LEDGER_DB_FILE {
                 let connection =
                     crate::content_identity::open_ledger_connection_at(&dir.join(descriptor.file))
@@ -2888,7 +3189,13 @@ mod tests {
                 let old_key = descriptor.normalize_path(old);
                 for (key, payload) in [
                     (old_key.clone(), "exact"),
-                    (format!("{old_key}::ページ/001.jpg"), "prefix"),
+                    (
+                        format!(
+                            "{}ページ/001.jpg",
+                            restore_family_prefix(&old_key, descriptor.restore_family)
+                        ),
+                        "prefix",
+                    ),
                 ] {
                     if descriptor.table == "ratings" {
                         connection
@@ -2939,6 +3246,16 @@ mod tests {
         }
     }
 
+    fn insert_shift_fixture(connection: &rusqlite::Connection, key: &str, payload: &str) {
+        let reference = crate::spread_shift::SpreadShiftPageRef::ArchiveEntry(payload.into());
+        connection
+            .execute(
+                "INSERT INTO spread_shifts(path, anchor_ref) VALUES (?1, ?2)",
+                rusqlite::params![key, serde_json::to_string(&reference).unwrap()],
+            )
+            .unwrap();
+    }
+
     fn assert_copy_across_stores(old: &Path, new: &Path) {
         let dir = tempfile::tempdir().unwrap();
         setup_copy_store_rows(dir.path(), old);
@@ -2953,10 +3270,10 @@ mod tests {
         let covered = STORES.iter().filter(|descriptor| descriptor.unique).count();
         assert_eq!(
             STORES.len(),
-            27,
-            "watched と endpoint / page-alone preference を含む現行 descriptor 数"
+            28,
+            "watched、endpoint / page-alone preference と logical shift を含む現行 descriptor 数"
         );
-        assert_eq!(covered, 26);
+        assert_eq!(covered, 27);
         assert_eq!(report.rows, covered * 2);
         assert_eq!(report.committed_thumbnail_pins, 4);
 
@@ -2967,18 +3284,39 @@ mod tests {
             if descriptor.unique {
                 for (key, payload) in [
                     (new_key.clone(), "exact"),
-                    (format!("{new_key}::ページ/001.jpg"), "prefix"),
+                    (
+                        format!(
+                            "{}ページ/001.jpg",
+                            restore_family_prefix(&new_key, descriptor.restore_family)
+                        ),
+                        "prefix",
+                    ),
                 ] {
+                    let payload_column = if descriptor.file == "spread_shift.db" {
+                        "anchor_ref"
+                    } else {
+                        "payload"
+                    };
                     let copied: String = connection
                         .query_row(
                             &format!(
-                                "SELECT payload FROM {} WHERE {} = ?1",
+                                "SELECT {payload_column} FROM {} WHERE {} = ?1",
                                 descriptor.table, descriptor.column
                             ),
                             [key],
                             |row| row.get(0),
                         )
                         .unwrap();
+                    let copied = if descriptor.file == "spread_shift.db" {
+                        let crate::spread_shift::SpreadShiftPageRef::ArchiveEntry(value) =
+                            serde_json::from_str(&copied).unwrap()
+                        else {
+                            panic!("unexpected fixture reference");
+                        };
+                        value
+                    } else {
+                        copied
+                    };
                     assert_eq!(copied, payload, "{}.{}", descriptor.file, descriptor.table);
                 }
                 let source_rows: i64 = connection
@@ -2989,8 +3327,10 @@ mod tests {
                         ),
                         rusqlite::params![
                             old_key,
-                            format!("{old_key}::").chars().count() as i64,
-                            format!("{old_key}::"),
+                            restore_family_prefix(&old_key, descriptor.restore_family)
+                                .chars()
+                                .count() as i64,
+                            restore_family_prefix(&old_key, descriptor.restore_family),
                         ],
                         |row| row.get(0),
                     )
@@ -3698,6 +4038,7 @@ mod tests {
             unique: true,
             normalization: StoreKeyNormalization::KeepDrive,
             rename_generic: true,
+            restore_family: StoreRestoreFamily::VirtualPages,
             table_availability: StoreTableAvailability::Required,
         };
         let mut report = PurgeReport::default();
@@ -3769,6 +4110,7 @@ mod tests {
             unique: true,
             normalization: StoreKeyNormalization::KeepDrive,
             rename_generic: true,
+            restore_family: StoreRestoreFamily::VirtualPages,
             table_availability: StoreTableAvailability::Required,
         };
         let started = std::time::Instant::now();
@@ -3806,7 +4148,12 @@ mod tests {
         let removed = PathBuf::from(r"C:\Root\Gone");
         for descriptor in STORES {
             let identity = descriptor.file == crate::content_identity::LEDGER_DB_FILE;
-            let conn = if identity {
+            let shift = descriptor.file == "spread_shift.db";
+            let conn = if shift {
+                crate::spread_shift::initialize_database_at(&dir.path().join(descriptor.file))
+                    .unwrap();
+                open(dir.path(), descriptor.file)
+            } else if identity {
                 crate::content_identity::open_ledger_connection_at(
                     &dir.path().join(descriptor.file),
                 )
@@ -3827,10 +4174,16 @@ mod tests {
             for key in [
                 base.clone(),
                 format!("{base}/child.jpg"),
-                format!("{base}::page_1"),
+                if shift {
+                    format!("{base}/chapter/page_1")
+                } else {
+                    format!("{base}::page_1")
+                },
                 format!("{base}2/keep.jpg"),
             ] {
-                if identity {
+                if shift {
+                    insert_shift_fixture(&conn, &key, "fixture.jpg");
+                } else if identity {
                     conn.execute(
                         "INSERT INTO edit_origin
                             (file_key, size, head_hash, hashed_mtime, kind, last_edit_at)
@@ -5193,6 +5546,292 @@ mod tests {
 
         let backed = ledger_keys_with_restorable_rows_at(data_dir, &[container.clone()]);
         assert!(backed.contains(&container));
+    }
+
+    #[test]
+    fn nested_shift_only_is_restorable_and_copy_preserves_destination_priority() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = Path::new("C:/books/100%_book.zip");
+        let new = Path::new("D:/books/100%_book.zip");
+        let source = crate::path_key::normalize_keep_drive(old);
+        let destination = crate::path_key::normalize_keep_drive(new);
+        let connection = open(dir.path(), "spread_shift.db");
+        connection
+            .execute_batch(
+                "CREATE TABLE spread_shifts (path TEXT PRIMARY KEY, anchor_ref TEXT NOT NULL); PRAGMA user_version=1;",
+            )
+            .unwrap();
+        for (key, anchor) in [
+            (format!("{source}/chapter/a"), "source-a"),
+            (format!("{source}/chapter/b"), "source-b"),
+            (format!("{destination}/chapter/a"), "destination-a"),
+            (format!("{source}2/chapter/c"), "adjacent"),
+            (
+                "c:/books/100x_book.zip/chapter/c".into(),
+                "wildcard-neighbor",
+            ),
+        ] {
+            insert_shift_fixture(&connection, &key, anchor);
+        }
+        drop(connection);
+        let candidates = vec![source.clone(), "e:/books/100%_book.zip".into()];
+        assert_eq!(
+            ledger_keys_with_restorable_rows_at(dir.path(), &candidates),
+            BTreeSet::from([source.clone()]),
+            "nested-only source is retained; another drive has no inherited row",
+        );
+        let report = copy_stores_at(
+            dir.path(),
+            &[
+                StoreCopyPathMapping::exact(old, new),
+                StoreCopyPathMapping::virtual_prefix(old, new),
+            ],
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.rows, 1);
+        let connection = open(dir.path(), "spread_shift.db");
+        for (key, expected) in [
+            (format!("{destination}/chapter/a"), "destination-a"),
+            (format!("{destination}/chapter/b"), "source-b"),
+            (format!("{source}/chapter/b"), "source-b"),
+        ] {
+            let wire = connection
+                .query_row(
+                    "SELECT anchor_ref FROM spread_shifts WHERE path = ?1",
+                    [&key],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<crate::spread_shift::SpreadShiftPageRef>(&wire).unwrap(),
+                crate::spread_shift::SpreadShiftPageRef::ArchiveEntry(expected.into())
+            );
+        }
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM spread_shifts WHERE path = ?1 OR path = ?2",
+                    rusqlite::params![
+                        format!("{destination}2/chapter/c"),
+                        "d:/books/100x_book.zip/chapter/c"
+                    ],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            copy_stores_at(dir.path(), &[StoreCopyPathMapping::exact(old, new)]).rows,
+            0
+        );
+    }
+
+    #[test]
+    fn slash_restore_is_limited_to_logical_book_descriptors() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = "c:/books/book.zip";
+        let rating = crate::rating_db::RatingDb::open_at(dir.path().join("rating.db")).unwrap();
+        rating
+            .set(&format!("{source}/chapter/page.jpg"), 5)
+            .unwrap();
+        drop(rating);
+        assert!(ledger_keys_with_restorable_rows_at(dir.path(), &[source.into()]).is_empty());
+        let report = copy_stores_at(
+            dir.path(),
+            &[
+                StoreCopyPathMapping::exact(source, "d:/books/new.zip"),
+                StoreCopyPathMapping::virtual_prefix(source, "d:/books/new.zip"),
+            ],
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(
+            report.rows, 0,
+            "ordinary page-store slash keys are not broadened"
+        );
+    }
+
+    #[test]
+    fn generic_shift_maintenance_preserves_unreadable_original_and_accepts_missing_table() {
+        let old = PathBuf::from("C:/books/old.zip");
+        let new = PathBuf::from("D:/books/new.zip");
+        let old_key = crate::path_key::normalize_keep_drive(&old);
+        for (version, wire) in [
+            (
+                2,
+                serde_json::to_string(&crate::spread_shift::SpreadShiftPageRef::ArchiveEntry(
+                    "page.jpg".into(),
+                ))
+                .unwrap(),
+            ),
+            (1, "not-json".to_string()),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("spread_shift.db");
+            crate::spread_shift::initialize_database_at(&path).unwrap();
+            let connection = open(dir.path(), "spread_shift.db");
+            connection
+                .pragma_update(None, "user_version", version)
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO spread_shifts VALUES (?1, ?2)",
+                    rusqlite::params![old_key, wire],
+                )
+                .unwrap();
+            drop(connection);
+            assert!(
+                !copy_stores_at(dir.path(), &[StoreCopyPathMapping::exact(&old, &new)])
+                    .errors
+                    .is_empty()
+            );
+            assert!(!run_at(dir.path(), &old, &new).errors.is_empty());
+            assert!(
+                !purge_removed_paths_at(dir.path(), std::slice::from_ref(&old), &[])
+                    .errors
+                    .is_empty()
+            );
+            let connection = open(dir.path(), "spread_shift.db");
+            let original: (String, String) = connection
+                .query_row("SELECT path, anchor_ref FROM spread_shifts", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .unwrap();
+            assert_eq!(original, (old_key.clone(), wire));
+            assert_eq!(
+                connection
+                    .query_row("SELECT COUNT(*) FROM spread_shifts", [], |row| row
+                        .get::<_, usize>(0))
+                    .unwrap(),
+                1
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        open(dir.path(), "spread_shift.db")
+            .execute_batch("CREATE TABLE unrelated(value TEXT)")
+            .unwrap();
+        assert!(ledger_keys_with_restorable_rows_at(dir.path(), &[old_key]).is_empty());
+        assert!(
+            copy_stores_at(dir.path(), &[StoreCopyPathMapping::exact(&old, &new)])
+                .errors
+                .is_empty()
+        );
+        assert!(run_at(dir.path(), &old, &new).errors.is_empty());
+        assert!(
+            purge_removed_paths_at(dir.path(), &[old], &[])
+                .errors
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn shift_page_mappings_use_original_to_final_paths_and_retain_outside_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = PathBuf::from("C:/books/folder");
+        let key = crate::path_key::normalize_keep_drive(&root);
+        let reference = crate::spread_shift::SpreadShiftPageRef::RelativePath("001.jpg".into());
+        let connection = open(dir.path(), "spread_shift.db");
+        connection
+            .execute_batch(
+                "CREATE TABLE spread_shifts (path TEXT PRIMARY KEY, anchor_ref TEXT NOT NULL); PRAGMA user_version=1;",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO spread_shifts VALUES (?1, ?2)",
+                rusqlite::params![key, serde_json::to_string(&reference).unwrap()],
+            )
+            .unwrap();
+        drop(connection);
+        let mappings = [
+            (root.join("001.jpg"), root.join("002.jpg")),
+            (root.join("002.jpg"), root.join("001.jpg")),
+        ];
+        assert_eq!(
+            crate::spread_shift::migrate_page_paths_at(dir.path(), &mappings).unwrap(),
+            1
+        );
+        let connection = open(dir.path(), "spread_shift.db");
+        let read_ref = || {
+            connection
+                .query_row(
+                    "SELECT anchor_ref FROM spread_shifts WHERE path = ?1",
+                    [&key],
+                    |row| row.get::<_, String>(0),
+                )
+                .map(|wire| {
+                    serde_json::from_str::<crate::spread_shift::SpreadShiftPageRef>(&wire).unwrap()
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            read_ref(),
+            crate::spread_shift::SpreadShiftPageRef::RelativePath("002.jpg".into())
+        );
+        assert_eq!(
+            crate::spread_shift::migrate_page_paths_at(
+                dir.path(),
+                &[(
+                    root.join("002.jpg"),
+                    PathBuf::from("C:/books/other/002.jpg")
+                ),]
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            read_ref(),
+            crate::spread_shift::SpreadShiftPageRef::RelativePath("002.jpg".into())
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM spread_shifts", [], |row| row
+                    .get::<_, usize>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn shift_root_rename_keeps_relative_payload_and_page_purge_keeps_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = PathBuf::from("C:/books/old");
+        let new = PathBuf::from("D:/books/new");
+        let old_key = crate::path_key::normalize_keep_drive(&old);
+        let new_key = crate::path_key::normalize_keep_drive(&new);
+        let reference = crate::spread_shift::SpreadShiftPageRef::RelativePath("page.jpg".into());
+        let wire = serde_json::to_string(&reference).unwrap();
+        let connection = open(dir.path(), "spread_shift.db");
+        connection
+            .execute_batch(
+                "CREATE TABLE spread_shifts (path TEXT PRIMARY KEY, anchor_ref TEXT NOT NULL); PRAGMA user_version=1;",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO spread_shifts VALUES (?1, ?2)",
+                rusqlite::params![old_key, wire],
+            )
+            .unwrap();
+        drop(connection);
+        let report = run_at(dir.path(), &old, &new);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let report = purge_removed_paths_at(dir.path(), &[new.join("page.jpg")], &[]);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let connection = open(dir.path(), "spread_shift.db");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT anchor_ref FROM spread_shifts WHERE path = ?1",
+                    [&new_key],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            wire
+        );
+        drop(connection);
+        let report = purge_removed_paths_at(dir.path(), &[new], &[]);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.rows, 1);
     }
 
     /// `_` と `%` はパスに普通に現れる。`LIKE` で引くと別ファイルの行を自分のものと

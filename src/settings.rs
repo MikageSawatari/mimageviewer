@@ -886,6 +886,7 @@ impl FullscreenNavigatorCorner {
 /// このパネルだけ表示項目を変更できるのは不自然で過剰なため、並びは固定する。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FullscreenOverflowItemId {
+    SpreadAdjustment,
     NavigatorToggle,
     NavigatorPosition,
     ImageAnalysis,
@@ -896,6 +897,7 @@ pub enum FullscreenOverflowItemId {
 impl FullscreenOverflowItemId {
     pub fn fixed_order() -> &'static [Self] {
         &[
+            Self::SpreadAdjustment,
             Self::NavigatorToggle,
             Self::NavigatorPosition,
             Self::ImageAnalysis,
@@ -906,6 +908,7 @@ impl FullscreenOverflowItemId {
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::SpreadAdjustment => "見開きの調整",
             Self::NavigatorToggle => "ナビゲータ",
             Self::NavigatorPosition => "ナビゲータ位置",
             Self::ImageAnalysis => "分析ツール",
@@ -5134,6 +5137,9 @@ pub struct Settings {
     /// 本に保存した見開きモードがない場合、PDF / EPUB の右開き指定に従う。
     #[serde(default)]
     pub follow_document_reading_direction: bool,
+    /// 本ごとの見開き1ページずらしを記憶する。OFFでも保存済み調整は保持する。
+    #[serde(default = "default_true")]
+    pub remember_spread_shift_per_book: bool,
     /// デフォルトの連結方式
     #[serde(default)]
     pub default_reading_flow: ReadingFlow,
@@ -7677,6 +7683,7 @@ impl Default for Settings {
             pinned_books: Vec::new(),
             default_spread_mode: SpreadMode::default(),
             follow_document_reading_direction: false,
+            remember_spread_shift_per_book: true,
             default_reading_flow: ReadingFlow::default(),
             default_reading_direction: ReadingDirection::default(),
             final_cover_spread_enabled: true,
@@ -14659,6 +14666,19 @@ mod tests {
             SpreadMode::Vertical.next_in_spread_cycle(),
             SpreadMode::Single
         );
+    }
+
+    #[test]
+    fn spread_shift_memory_defaults_on_and_preserves_explicit_off() {
+        assert!(Settings::default().remember_spread_shift_per_book);
+        let legacy: Settings = serde_json::from_str("{}").unwrap();
+        assert!(legacy.remember_spread_shift_per_book);
+        let disabled: Settings =
+            serde_json::from_str(r#"{"remember_spread_shift_per_book":false}"#).unwrap();
+        assert!(!disabled.remember_spread_shift_per_book);
+        let restored: Settings =
+            serde_json::from_value(serde_json::to_value(disabled).unwrap()).unwrap();
+        assert!(!restored.remember_spread_shift_per_book);
     }
 
     #[test]

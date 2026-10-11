@@ -10110,6 +10110,13 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
         );
         ui.small("本ごとに保存した見開き設定がある場合は、その設定を優先します。");
     });
+    anchored(ui, state, "spread/remember-adjustment", |ui, state| {
+        ui.checkbox(
+            &mut state.settings.remember_spread_shift_per_book,
+            "見開きの調整を本ごとに記憶する",
+        );
+        ui.small("Ctrl+左右で合わせ直した組み合わせを記憶します。OFFにしても今の表示と保存済み調整は残り、新しく開く本には適用しません。");
+    });
     anchored(ui, state, "spread/final-cover", |ui, state| {
         draw_final_cover_spread_setting(ui, &mut state.settings.final_cover_spread_enabled);
     });

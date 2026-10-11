@@ -1623,6 +1623,25 @@ impl TopLevelGridView {
         self.collection_navigation_pending.is_some()
     }
 
+    /// Only password phases have selected a physical book before the normal open handoff.
+    /// Earlier Collection preparation still has an unknown destination; inspecting its
+    /// receiver or treating every registered book as selected would change navigation.
+    pub(in crate::app) fn has_pending_collection_book_open(&self, root: &Path) -> bool {
+        use super::collection_navigation::CollectionNavigationPending;
+        match self.collection_navigation_pending.as_deref() {
+            Some(CollectionNavigationPending::AwaitingPdfPassword { target, .. }) => {
+                crate::path_key::physical_path_is_within(&target.source_path, root)
+            }
+            Some(CollectionNavigationPending::PdfPasswordPreflighting {
+                target, cancel, ..
+            }) => {
+                !cancel.load(std::sync::atomic::Ordering::Relaxed)
+                    && crate::path_key::physical_path_is_within(&target.source_path, root)
+            }
+            _ => false,
+        }
+    }
+
     #[cfg(test)]
     pub(in crate::app) fn collection_navigation_pending_for_test(
         &self,

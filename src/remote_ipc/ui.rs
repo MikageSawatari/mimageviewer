@@ -97,6 +97,8 @@ pub(crate) struct RemoteSessionUiState {
     pending_fullscreen_restore: Option<PendingFullscreenRestore>,
     paused_animation_restore_key: Option<String>,
     pending_bookmark_writes: std::collections::HashMap<u64, PendingRemoteBookmarkWrite>,
+    pending_shift_resets: std::collections::HashMap<u64, ClaimedRemoteWrite>,
+    pending_resume_reads: Vec<PendingRemoteResumeRead>,
     connection_dialog: Option<RemoteConnectionDialogState>,
     // Unlike the dialog-owned PIN and tailscale receivers, logout completion must outlive the
     // window because a successful secret rotation still has to disconnect local control.
@@ -121,6 +123,8 @@ impl Drop for RemoteSessionUiState {
             video_stream: self.video_stream.take(),
             pending_bookmark_writes: std::mem::take(&mut self.pending_bookmark_writes),
             pending_fullscreen_restore: self.pending_fullscreen_restore.take(),
+            pending_shift_resets: std::mem::take(&mut self.pending_shift_resets),
+            pending_resume_reads: std::mem::take(&mut self.pending_resume_reads),
             handle,
             generation,
         });
@@ -741,6 +745,14 @@ struct RemoteAppDrainLease {
     video_stream: Option<AppRemoteVideoStreamState>,
     pending_bookmark_writes: std::collections::HashMap<u64, PendingRemoteBookmarkWrite>,
     pending_fullscreen_restore: Option<PendingFullscreenRestore>,
+    pending_shift_resets: std::collections::HashMap<u64, ClaimedRemoteWrite>,
+    pending_resume_reads: Vec<PendingRemoteResumeRead>,
+}
+
+struct PendingRemoteResumeRead {
+    claimed: super::session::ClaimedBookResumeRead,
+    cutoff: u64,
+    receiver: std::sync::mpsc::Receiver<crate::book_resume_db::PositionReadReply>,
 }
 
 impl Drop for RemoteAppDrainLease {
@@ -753,6 +765,15 @@ impl Drop for RemoteAppDrainLease {
                 RemoteWriteErrorCode::UiTimeout,
                 "アプリを終了しています",
             )));
+        }
+        for (_, pending) in self.pending_shift_resets.drain() {
+            pending.complete(UiWriteOutcome::Write(write_error(
+                RemoteWriteErrorCode::UiTimeout,
+                "アプリを終了しています",
+            )));
+        }
+        for pending in self.pending_resume_reads.drain(..) {
+            pending.claimed.complete_position(None);
         }
         if let Some(video) = self.video_stream.take() {
             match video {
@@ -881,6 +902,7 @@ impl crate::app::App {
             self.fs_transparent_bg_mode,
         ));
         handle.install_archive_cache_db(self.archive_cache_db.clone());
+        handle.install_spread_shift_service(self.spread_shift_service.clone());
         #[cfg(windows)]
         self.effetune
             .set_remote_session_source(Some(handle.clone()));
@@ -910,6 +932,8 @@ impl crate::app::App {
                 &mut self.remote_session_ui.pending_bookmark_writes,
             ),
             pending_fullscreen_restore: self.remote_session_ui.pending_fullscreen_restore.take(),
+            pending_shift_resets: std::mem::take(&mut self.remote_session_ui.pending_shift_resets),
+            pending_resume_reads: std::mem::take(&mut self.remote_session_ui.pending_resume_reads),
             handle,
             generation,
         };
@@ -1119,7 +1143,21 @@ impl crate::app::App {
                 .active
                 .as_ref()
                 .map_or(std::time::Duration::ZERO, |active| active.elapsed);
-            match remote_acquire_barrier_decision(close_state, barrier.is_quiesced(), elapsed) {
+            // Close is read-only for shift. Its final resume Record and all
+            // previously admitted shifts must publish before FinishAcquire.
+            let book_io_ready = self
+                .spread_shift_service
+                .as_ref()
+                .is_none_or(|service| service.is_ready() && !service.is_busy())
+                && self.book_resume_writer.as_ref().is_none_or(|writer| {
+                    let watermarks = writer.watermarks();
+                    watermarks.admitted == watermarks.completed_through
+                });
+            match remote_acquire_barrier_decision(
+                close_state,
+                barrier.is_quiesced() && book_io_ready,
+                elapsed,
+            ) {
                 RemoteAcquireBarrierDecision::Finish => {
                     handle.finish_acquire(snapshot.generation);
                 }
@@ -1170,6 +1208,7 @@ impl crate::app::App {
         if let Some(handle) = handle.as_ref() {
             self.apply_pending_remote_ui_requests(handle, ctx);
         }
+        self.poll_remote_resume_reads(ctx);
         if remote_phase == super::session::RemoteControlPhase::Local {
             self.poll_remote_fullscreen_restore();
         }
@@ -1184,7 +1223,11 @@ impl crate::app::App {
             }
             self.reload_after_remote_session_release();
         }
-        if matches!(
+        // The App frame poll drains Clear replies. Keep the existing Remote
+        // tick prompt until its claimed request consumes the completion.
+        if !self.remote_session_ui.pending_shift_resets.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        } else if matches!(
             self.remote_session_ui.video_stream.as_ref(),
             Some(AppRemoteVideoStreamState::Opening(_) | AppRemoteVideoStreamState::Starting(_))
         ) {
@@ -1927,6 +1970,21 @@ impl crate::app::App {
                     }
                 }
                 ClaimedRemoteUiRequest::BookResumeRead(pending) => {
+                    if let Some(writer) = self.book_resume_writer.as_ref() {
+                        let cutoff = writer.watermarks().admitted;
+                        let receiver = writer.read_position_after(
+                            &crate::path_key::normalize(pending.path()),
+                            cutoff,
+                        );
+                        self.remote_session_ui
+                            .pending_resume_reads
+                            .push(PendingRemoteResumeRead {
+                                claimed: pending,
+                                cutoff,
+                                receiver,
+                            });
+                        continue;
+                    }
                     let latest =
                         self.last_book_resume
                             .as_ref()
@@ -1957,6 +2015,65 @@ impl crate::app::App {
                 }
             }
         }
+    }
+
+    fn poll_remote_resume_reads(&mut self, ctx: &egui::Context) {
+        let mut waiting = Vec::new();
+        for pending in std::mem::take(&mut self.remote_session_ui.pending_resume_reads) {
+            match pending.receiver.try_recv() {
+                Ok(reply)
+                    if reply.cutoff == pending.cutoff
+                        && reply.completed_through >= pending.cutoff
+                        && reply.status.is_ok() =>
+                {
+                    pending.claimed.complete_position(reply.position)
+                }
+                Ok(reply) => {
+                    crate::logger::log(format!(
+                        "remote_ipc: fenced resume read failed: {:?}",
+                        reply.status
+                    ));
+                    pending.claimed.complete_position(None);
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    pending.claimed.complete_position(None)
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => waiting.push(pending),
+            }
+        }
+        self.remote_session_ui.pending_resume_reads = waiting;
+        if !self.remote_session_ui.pending_resume_reads.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+    }
+
+    pub(crate) fn complete_remote_shift_reset(
+        &mut self,
+        reply: &crate::spread_shift::ShiftWriteReply,
+    ) -> bool {
+        let Some(pending) = self
+            .remote_session_ui
+            .pending_shift_resets
+            .remove(&reply.sequence)
+        else {
+            return false;
+        };
+        let response = match &reply.status {
+            Ok(()) => {
+                self.show_feedback_toast("見開き調整を解除しました".into());
+                RemoteWriteResponse::Success(RemoteWriteResult::applied())
+            }
+            Err(error) => {
+                crate::logger::log(format!("remote_ipc: shift reset failed: {error}"));
+                self.show_feedback_toast(format!("見開き調整を保存できませんでした: {error}"));
+                write_error(
+                    RemoteWriteErrorCode::PersistenceFailed,
+                    "見開き調整の解除を保存できませんでした",
+                )
+            }
+        };
+        pending.complete(UiWriteOutcome::Write(response));
+        true
     }
 
     fn apply_remote_video_stream_request(&mut self, pending: ClaimedVideoStreamUiRequest) {
@@ -2350,6 +2467,47 @@ impl crate::app::App {
             return;
         }
         let response = self.apply_remote_write(pending.request());
+        if matches!(response, RemoteWriteResponse::Success(_))
+            && self.settings.remember_spread_shift_per_book
+            && let RemoteWriteRequest::SetSpread { address, .. } = pending.request()
+        {
+            // The validated effective address owns the logical shift key.
+            // The existing base setter remains synchronous; only its Q3 Clear
+            // completion extends this same claimed request.
+            let scope = remote_shift_scope(address);
+            let result = scope.and_then(|scope| {
+                let service = self
+                    .spread_shift_service
+                    .as_ref()
+                    .ok_or_else(|| "shift service unavailable".to_owned())?;
+                service.clear_shift(
+                    scope,
+                    crate::spread_shift::ShiftOperation {
+                        context_id: self.spread_shift_context_id(),
+                        items_generation: self.items_generation,
+                        operation_sequence: pending.generation(),
+                    },
+                )
+            });
+            match result {
+                Ok(sequence) => {
+                    self.remote_session_ui
+                        .pending_shift_resets
+                        .insert(sequence, pending);
+                }
+                Err(error) => {
+                    crate::logger::log(format!(
+                        "remote_ipc: shift reset admission failed: {error}"
+                    ));
+                    pending.complete(UiWriteOutcome::Write(write_error(
+                        RemoteWriteErrorCode::PersistenceFailed,
+                        "見開き調整の解除を保存できませんでした",
+                    )));
+                }
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            return;
+        }
         pending.complete(UiWriteOutcome::Write(response));
         ctx.request_repaint();
     }
@@ -4196,6 +4354,20 @@ fn remote_spread_key(
     ))
 }
 
+fn remote_shift_scope(
+    address: &mimageviewer_ipc::RemoteAddress,
+) -> Result<crate::book_scope::BookScopeKey, String> {
+    let root = std::path::Path::new(&address.path);
+    match &address.subresource {
+        RemoteSubresource::ZipDirectory { prefix } => crate::book_scope::BookScopeKey::archive(
+            root,
+            &super::container::zip_prefix_segments(prefix),
+        ),
+        RemoteSubresource::File => crate::book_scope::BookScopeKey::folder(root),
+        _ => Err("a page is not a book shift scope".into()),
+    }
+}
+
 struct RemoteRatingTarget {
     key: String,
     meta: crate::rating_db::RatingMeta,
@@ -4740,6 +4912,8 @@ fn format_elapsed(elapsed: std::time::Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    include!("spread_shift_ui_tests.rs");
 
     fn ready_unharvested_remote_audio_stream() -> (
         crate::app::AppTestEnvForTest,
@@ -5298,6 +5472,8 @@ mod tests {
                 dsp_admission_deadline: std::time::Instant::now(),
             })),
             pending_bookmark_writes,
+            pending_shift_resets: Default::default(),
+            pending_resume_reads: Default::default(),
             pending_fullscreen_restore: Some(PendingFullscreenRestore {
                 item_key: "resume".to_owned(),
                 view: ReloadedView::Other,

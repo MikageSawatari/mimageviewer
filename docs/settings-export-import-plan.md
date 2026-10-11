@@ -122,7 +122,7 @@ import 専用の live rebuild や detached 述語・viewport 経路を新設し�
 §1.365 (2026-10-10): `preferences_restore_position` を plain / plain の bool として追加。
 環境設定の前回位置を復元するかどうかの選択だけを転送し、ページ・スクロール座標は
 Settings に持たず転送しない。既定 ON、欠落は現在の draft 値を保持する。形式 v1 のまま、
-DB migration は追加しない。全456フィールドのうち対象143・除外313、転送141項目。
+DB migration は追加しない。全457フィールドのうち対象144・除外313、転送142項目。
 
 `src/settings_transfer.rs` に、全フィールドを一度ずつ記す policy macro を置く。
 各行は `export(field, wire_key, validator)` または `exclude(field, reason)`。
@@ -815,4 +815,4 @@ core check / settings_restore / ui_snapshot / glyph の成功を再利用した�
 転送キー欠落は転送先保持、不正・小数・範囲外はfield拒否。共通一値でfavoriteにはコピーしない。
 `fullscreen_specified_scale`の各軸はenabledとvalue（単位・数値）を必須とし、OFF中も検証・転送する。
 未リリースOption形を破壊的に改訂しmigrationなし。favorite外側の欠落は継承のまま保持する。
-§1.365結合後の現行分類は456 / 143 / 313、互換項目をまとめたwireは141。共通値転送と専用値保持の回帰を追加する。
+§1.365・§1.364結合後の現行分類は457 / 144 / 313、互換項目をまとめたwireは142。共通値転送と専用値保持の回帰を追加する。

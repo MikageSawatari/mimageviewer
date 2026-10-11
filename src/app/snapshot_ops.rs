@@ -264,7 +264,6 @@ impl App {
             .collect();
 
         self.slideshow_anchor_idx = self.slideshow_anchor_idx.and_then(&remap);
-        self.spread_shift_anchor_idx = self.spread_shift_anchor_idx.and_then(&remap);
         self.fs_pdf_rerender_demand.remap_indices(&remap);
         self.fs_continuous_fit_reference.remap_indices(&remap);
 
@@ -416,6 +415,12 @@ impl App {
         self.cancel_media_navigation_pending_for_current_context("snapshot_items_swap");
         self.cancel_pending_folder_nav();
 
+        // The list owns the pairing anchor even after Esc closes its reader. Remap
+        // at the items-swap boundary for every outcome, exactly once.
+        let old_to_new = self.snapshot_exact_idx_map(target_membership);
+        self.spread_shift
+            .remap_with(&|idx| old_to_new.get(&idx).copied());
+
         let Some(old_fullscreen_idx) = self.fullscreen_idx else {
             crate::logger::log(format!(
                 "[snapshot] {phase}: no open reader to reconcile (items={})",
@@ -456,7 +461,6 @@ impl App {
             target_membership.len()
         ));
 
-        let old_to_new = self.snapshot_exact_idx_map(target_membership);
         let opened_media_path = self
             .items
             .get(old_fullscreen_idx)
@@ -941,6 +945,8 @@ impl App {
             list_view_page_identity_index: Default::default(),
             pre_snapshot_search_origin,
         });
+        // A fixed/synthetic list keeps today's live pairing but has no durable Book scope.
+        self.spread_shift.detach_book_scope_for_ordinary_list();
         let return_origin = top_level_return.map(|restore| {
             let route = self
                 .top_level_grid_view
@@ -3252,6 +3258,47 @@ mod tests {
         assert_eq!(app.items.len(), 2);
         assert_eq!(app.scroll_offset_y, 123.0);
         assert_eq!(app.selected, Some(1));
+    }
+
+    #[test]
+    fn snapshot_remaps_book_pairing_from_list_and_reader_exactly_once() {
+        use super::super::spread_shift_owner::ViewerShift;
+        use crate::spread_shift::{
+            ShiftPersistence, ShiftResolution, SpreadShiftPageRef, SpreadShiftState,
+        };
+
+        for reader_open in [false, true] {
+            let mut app = setup_app_for_test();
+            app.current_folder = Some(PathBuf::from("c:/books/book"));
+            app.items = (0..6)
+                .map(|idx| GridItem::Image(PathBuf::from(format!("c:/books/book/{idx}.jpg"))))
+                .collect();
+            app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending; 6];
+            app.visible_indices = vec![1, 3, 5];
+            app.page_identity_index = std::sync::Arc::new(
+                super::super::file_type_resume::PreparedPageIdentityIndex::prepare(
+                    &app.items,
+                    None,
+                    Default::default(),
+                ),
+            );
+            app.spread_shift.scope =
+                Some(crate::book_scope::BookScopeKey::folder("c:/books/book").unwrap());
+            app.spread_shift.state = ViewerShift::Book(SpreadShiftState::Adjusted {
+                anchor_ref: SpreadShiftPageRef::RelativePath("3.jpg".into()),
+                resolution: ShiftResolution::Resolved(3),
+                persistence: ShiftPersistence::SessionOnly,
+            });
+            app.fullscreen_idx = reader_open.then_some(3);
+            app.activate_snapshot(SnapshotSourceLabel::Mixed);
+            assert_eq!(app.spread_shift.scope, None);
+            assert_eq!(app.spread_shift.state, ViewerShift::Ordinary(1));
+            assert_eq!(app.fullscreen_idx, reader_open.then_some(1));
+            drain_snapshot_identity_preparation(&mut app);
+            app.deactivate_snapshot();
+            assert_eq!(app.spread_shift.state, ViewerShift::Ordinary(3));
+            assert_eq!(app.fullscreen_idx, reader_open.then_some(3));
+        }
     }
 
     #[test]

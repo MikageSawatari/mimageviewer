@@ -5,6 +5,120 @@
 
 ---
 
+## 本別見開き調整の永続化基盤とviewer/Remote接続（§1.364 D1–D3、2026-10-11）
+
+`SpreadShiftService`のUI handleは送信・immutable snapshot lookup・結果pollだけを行い、
+一つのworkerが`spread_shift.db`の接続とSet/Clear/読取を所有する。受付sequenceはownerのFIFOへの受理後、
+完了sequenceはtransaction終端後に公開する。通常warm読取にはDB round-tripを足さない。
+`RestoreReceipt`はcontext/scope/items/settings世代とshift/resumeのadmitted cutoffを捕捉し、
+pureな`RestoreReadDependencies`が両writerの固定した読取点の完了証明を照合して一回だけ返す。
+基盤だけのD1に続き、D2の接続差分では`App::begin_book_shift_restore`が
+`ViewerBookRestore { receipt, reads, resume_key, memory, cause }`を既存sidecar continuationへ渡す。
+`poll_book_shift_restore`はcontext/scope/items/settings世代とmaintenance epochを照合し、
+両writerの先行要求が完了した結果だけを一回採用する。保存済みPageRefを最終identity/navへ解決し、
+位置はownerの`FencedResume`に保持して既存のresume consumerへ渡す。
+epoch進行はshift recipeだけを不採用にする。独立resumeの元receiver・取得結果は保持して
+同じCommonの完了境界で調整なしの初回採用を完了し、非fence SELECTや後着Recordの再読取へ戻さない。
+完了結果は`CompletedShiftRead::Unrequested | Captured | Expired`で由来を保持する。
+現epochのCapturedだけが保存rowの有無を証明し、既存viewer状態を更新する。
+Expiredは初回captureの調整なし、retainedの受入済み調整・projection・commandをそのまま保つ。
+再解決は次の通常retained再入場に任せ、失効をrow不在として採用しない。
+root改名は永続storeだけを移し、受付済みopenの捕捉source/scope、receiver、continuationを変更しない。
+同一本の未完了openを待つquery・製本管理の待機wrapperは設けない。open側にlive移行境界がなく、
+shiftの受理済みwrite/read/root操作の順序はD1の単一FIFOが所有する（最新決定は設計§11.6）。
+同open continuationの初回採用が終わった時点で`finish_fenced_book_resume`が依存を終了する。
+後のsession内resume参照に初回の位置を使い続けず、従来の現在位置参照へ戻す。
+新しい表示後restore callbackやDB待ちloopを作らず、既存warm PDF準備とbase setterの同期契約を保持する。
+
+明示nudge/Clearはscopeと`ShiftOperation { context_id, items_generation, operation_sequence }`を
+捕捉してserviceへ送り、`ViewerSpreadShift`の現在操作だけが同sequenceのreplyを採用する。
+保存完了は`ShiftPersistence`の更新と通知だけで、ページ移動や兄弟窓のlive再解決を起こさない。
+Appの一つのpollからmounted ownerまたはregistry内のat-rest bundleへ配送し、元ownerが
+retiredでも保存済みの元scopeを別本へ読み替えない。OFFへ切り替えた後も送信済みwriteは完了させる。
+ON/OFF時は既存live調整をsession扱いにし、ON化元のBookだけを保存する。
+`session_only`はretainedのpending receiverを取り消して受入済みsessionを保持するため、
+表示済みsiblingsへ旧保存値を後から適用しない。fresh-openのCommon依存は元のresume fenceを
+捨てず、明示設定変更時だけ`refresh_pending_book_shift_memory_policy`で読取依存を再受付する。
+捕捉済みtarget/context/items/open/scope・元のresume cutoffを維持し、settings世代とshift受付cutoff
+だけを現値へ更新する。通常のpolicy遷移であり、retry・まれな失敗の復旧機構ではない。
+この更新はshift依存だけを差し替え、初回resumeのreceiver・取得済み値を保持する。
+resumeの資格とキーは記録producerの`at_root()`・`current_folder`を共用する。
+保守lease中の通常Set/Clearも既存の保守後FIFOへ受理し、兄弟窓の操作を拒否しない。
+maintenance資格はownerのimmutable scope stampとしてsnapshotと同時公開し、通常writeの
+一時的なsnapshot移送でも保持する。診断用の保守回数と分離し、通常writeや変更なしleaseでは進めない。
+root改名/purgeは明示された旧・新root family、外部更新は実変更scopeだけを失効させる。
+ClearAllと影響不明のshift保守失敗はglobal fallback。scope lookupは対象keyの区切り境界だけを調べ、
+map構築・COW・旧Arc解放はworkerでadmission lock外に置く。別本改名は無関係なreadを失効させない。
+write replyはSet/Clear種別も保持し、元contextを閉じた後も対応した成功通知を出す。
+
+新規openの`ViewerBookRestore`は従来どおりglobal `Common` continuationが所有する。
+retained ONの`begin_retained_shift_readoption`は受入済みidentity indexを再利用し、
+待機receiverをbundle内の`ViewerSpreadShift.retained: RetainedReadoption::Idle | Reading`へ入れる。
+global Commonと別contextのretained readは併存できる。既存のtarget-context semantic gate
+(`sidecar_restore_blocks_projected_context`)と`show_sidecar_restore_dialog`で対象窓だけを停止し、
+無関係な兄弟窓の操作は維持する。全窓modalはreleased sibling input契約を削るため採らない。
+既存async inventoryの`ContextAsyncOwner::RetainedSpreadShift`がpollとcancel-on-parkを持つ。
+parkでreceiverをdropしてaccepted sessionを保ち、次のreadoptionはfresh cutoffを捕捉する。
+forkは`fork_accepted`でaccepted layoutだけを複製し、receiver・元contextのwrite受付は引き継がない。
+保存待ち/失敗の調整は新contextではsession扱いにし、元contextだけがwrite完了を受け取る。
+OFFは何も再読取せずlive調整を保つ。retained/import採用は
+`adopt_shift_layout_without_navigation`で現在の実ページを含むunitへ正規化し、
+共有resume/historyへのbackground writeを作らない。
+metadata importのContextRequestは受付時にscopeとFIFO読取を捕捉する。既存refresh workerが
+その結果を待ち、context/items世代の採用後にcurrent scope + ON + Automaticを照合する。
+shift未変更の区分は捕捉読取を待たず、OFFではshift結果を無視する。
+成功済みページ改名のmappingはpure helperで同じ本のlive PageRefへ反映する。
+root改名ではmounted/at-restの参照元・items・identity index・pending load・addressとshift scopeを
+旧rootのまま保持する。永続側のroot移行・相対payload移行はD1のworker/FIFOが所有し、
+新rootはそこから改めて開いたcontextが使う。旧contextの後続Set/Clearも捕捉済み旧keyへ送る。
+旧keyを再作成・解除し得る点は利用者了承済みの割り切りとし、retryや新しい待機契約を追加しない。
+本節は現在の実装差分の説明で、自動検証・独立完了レビュー合格を表すものではない。
+Remote D3接続はApp serviceのread handleをSessionHandleへ登録する。
+ContainerEngine workerはcloneしたhandleの完了証明付きsnapshot/FIFO読取を使い、専用DB接続を増やさない。
+logical scopeとfull本のidentityで保存PageRefを解く。完全応答では同じrulesと列のPC Automatic unitに一致する。
+response budgetの切詰め時も保存基点をfull scopeで解くが、bounded group生成とcap・ページアクセスは維持する。
+shiftなしのmasterにもある切詰め境界差はD3の範囲外とし、追加の省略ページ寸法I/Oや境界group削除は行わない。
+acquireは先行shift writeとresume writeの完了・snapshot公開を同じ取得continuationへ合流し、
+UI threadで待たずreadyになってからFinishAcquireへ進む。Remoteのresume読取は既存UI request ownerから
+BookResumeWriterのReadPositionAfterへ送り、同request continuationが固定読取点の結果を所有する。
+既存SetSpreadのbase setterは同期のまま、記憶ONでQ3 Clearが必要ならrequest/sequence-ownedな
+continuationがそのClear replyを待つ。実commit成功後にだけ成功応答・generation更新・group cache失効を行い、
+元requestが終了しても送信済みwriteはserviceが所有する。memory OFF・forceSingle/orientationの投影はwriteを作らない。
+G3は未統合で、C1–C12共有fixtureの供給はG側consumerの完了を表さない。
+master比較とD3検証結果は設計§11.10および`target/D-1364-d3-msg.txt`で別に記録する。
+
+既存`BookResumeWriter`に`ReadPositionAfter`と位置snapshotを追加した。外部準備workerの位置SELECTは、
+transaction開始前にcutoffが完了し、前後の受付/完了watermarkが同一の時だけ証明可能。
+証明できない時は同writerのFIFO読取を使う契約とし、Record/schema/meterの意味は保持する。
+既存maintenance後のmeter Readも受付sequenceを進め、位置snapshotと完了sequenceを一体公開する。
+未完了の再読込がある間はwarm/proven経路を使わず、保持済みの旧Arcも後続receiptを満たせない。
+
+rename/copy/purge/cleanup/metadata workerは`maintenance_at(data_dir)`を一回取得する。
+両保護が必要な共通取得順はEPUB guard/range → shift maintenance。対象範囲を先に確保し、
+取得済みownerを内側のcopy/purgeへ渡して保護を再取得しない。解放はshift → EPUBの順。
+EPUBの同階層PDF保存は既存の本leaseを維持し、末尾のmetadata copyだけshift leaseを取得する。
+長い変換中にshift保守を占有しない。
+Begin ACKは先行保存・成功Setの内容ID送信と接続closeの後。Endは再読込とepoch公開の後に待機readを返す。
+待機readをEndより前のworker queueへ入れて相互待ちにしない。実変更scopeだけ通知する。
+明示importは`Err`を一括失効へ変換しない。manifest/preflightの取消・エラーは書込み前で、
+正常に再読込できる変更なしsnapshotのstampを維持する。確定batchを伴う取消・部分失敗も
+Endの実変更scope差分へ集約し、読めず影響を確定できないsnapshotだけに既存global fallbackを使う。
+phase追跡や新しい失敗分類は追加しない（設計§11.9）。
+Setとimportのcommit済追加/置換は捕捉logical rootを既存recorderへEditとして送る。
+取消importの確定batchもworkerが送るため、UI receiverの破棄で観測集合を失わない。
+
+App終了は既存metadata workerを回収し、最終resumeをenqueueしてshift受付を閉じる。
+`SpreadShiftProcessOwner`が`run_native`外で末尾までdrain/joinし、成功結果の内容ID送信までrecorderを保持する。
+recorderの既存終了時hash取消契約は変えない。shift UI callbackにjoin/DB待機はない。
+まれな失敗はlog＋通知＋原本保持。retry、再作成、多段回復を追加しない。
+
+本管理のrename成功は捕捉source/target folderを専用workerのroot migrationへ、delete成功は
+捕捉rootをhard purgeへ登録する。lease中もroot操作を同一ownerのread/countと共有する待機FIFOへ
+受理して受付sequenceを進める。End/再読込後に順番に実行し、後続readは先行root操作の完了を待つ。
+正常exitの受付closeは保守/起動待ちの位相とleaseの終了送信経路を保持し、受理済依存をdrainする。
+root migrationは相対payload表記とdestination優先を維持する。ページ一枚の削除では親scopeを消さない。
+
+
 §1.241 Phase A: `crates/startup-diagnostics` の常時timelineはlauncher/coreの共通QPC基準と
 run ID/PIDを持つ。呼出元は固定サイズeventとstage atomicsをpublishし、独立writerがJSONLを
 保存する（UIからファイルwrite/flush/joinしない）。通常保存先は
@@ -362,7 +476,7 @@ file-local fallback する。close / 動画切替 / fullscreen 終了の cancel 
 
 通常 PDF と固定済み EPUB の列挙は呼出元で合流登録し、新しい実行要求だけ `pdf-enumerate-nav` スレッドを起こす。未固定 EPUB の admission は専用の背景スレッドで source stat・DB 照合・登録・エンコードを行う。固定表 mutex はメモリ検索・挿入だけを保護し、stat・DB 照合中は保持しない。同じ実読込パスへの追加 waiter はスレッドを増やさない。
 
-EPUB の最初の固定と内容同定台帳への書込は、本ごとの固定ロックで直列化する。backfill / stage-0 は worker 上で来歴確認から SQLite 更新まで保持する。復元は候補分岐時の未固定元状態を保持し、本ロック内でコピー前に再照合して、編集行コピーと台帳昇格まで保持する。別の本の固定は待たせない。rename / purge / restore copy の共通 STORES 更新は EPUB キーを含み得る対象パス範囲だけ lease を保持し、PDF・画像の exact key は待たせない。UI のピン要求作成では EPUB の stat をせず、worker で世代 stamp を解決する。元 EPUB が消えたピン要求は worker で通常のフォルダ代表要求へ戻る。ドライブ一覧の cache-only worker は seed の EPUB 出所と世代を比較する。
+EPUB の最初の固定と内容同定台帳への書込は、本ごとの固定ロックで直列化する。backfill / stage-0 は worker 上で来歴確認から SQLite 更新まで保持する。復元は候補分岐時の未固定元状態を保持し、対象範囲lease内でコピー前に再照合して、編集行コピーと台帳昇格まで保持する。範囲外の本の固定は待たせない。rename / purge / restore copy の共通 STORES 更新は EPUB キーを含み得る対象パス範囲だけ lease を保持し、PDF・画像の exact key は待たせない。UI のピン要求作成では EPUB の stat をせず、worker で世代 stamp を解決する。元 EPUB が消えたピン要求は worker で通常のフォルダ代表要求へ戻る。ドライブ一覧の cache-only worker は seed の EPUB 出所と世代を比較する。
 
 ### サムネイルの動画・音声長さ取得
 
