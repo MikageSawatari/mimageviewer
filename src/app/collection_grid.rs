@@ -3987,12 +3987,15 @@ mod tests {
                     session.observed_catalog_revision >= deleted.catalog_revision
                         && matches!(session.load, CollectionGridLoadState::Deleted { .. })
                 })
+                // The deleted surface and the ready catalog arrive independently.
+                // Snapshot history only after its legitimate deletion notice has applied.
+                && app
+                    .folder_nav_back_stack
+                    .iter()
+                    .chain(&app.folder_nav_forward_stack)
+                    .all(|entry| entry.collection_id() != Some(collection.collection_id()))
         });
-        // The catalog delete notice and history-prune notice may arrive in adjacent polls.
-        // Settle both before comparing the parked display with its resumed owner.
         let ctx = egui::Context::default();
-        app.poll_collection_ui(&ctx);
-        app.poll_collection_grid(&ctx);
         // The physical child has an asynchronous page-identity preparation phase.
         // Complete that accepted listing before parking it and testing keyboard navigation.
         let preparation_deadline = Instant::now() + Duration::from_secs(5);

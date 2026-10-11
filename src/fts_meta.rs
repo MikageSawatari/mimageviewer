@@ -675,7 +675,6 @@ impl FtsMetaDb {
 
     /// Uses the existing partial Failed index, across every owner including orphans.
     /// No additional Ok/table scan is needed: the startup ownership visitor counted all rows.
-    #[cfg(any(test, feature = "fts-startup-integrity"))]
     pub(crate) fn count_not_ok(&self) -> rusqlite::Result<u64> {
         self.conn.lock().unwrap().query_row(
             "SELECT COUNT(*) FROM files WHERE status != 0",

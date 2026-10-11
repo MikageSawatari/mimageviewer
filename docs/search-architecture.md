@@ -375,15 +375,16 @@ schema 再構築・rebuild pending でも全印を消し、同じ起動で古い
 VACUUM 等の housekeeping は起動経路から外し、全 supervisor が初期 scan を完了して
 idle になった最初のフレームで `spawn_housekeeping` から別スレッドで走らせる。
 
-起動 count 点検は Cargo feature `fts-startup-integrity` の opt-in、既定 OFF。
+起動 count 点検は既存 metadata manager worker で常時実行する。feature gate は無い。
 既存 owner covering scan の行数を再利用し、全 files の `status != 0` を部分 index で数え、
 `ok_rows = owner_rows - not_ok_rows` と loaded Searcher の `num_docs()` (生存文書数) を比較する。
 worker 内の固定構成、cleanup delete/commit・Failed reconciliation・supervisor spawn 前の snapshot を使う。
 追加全件走査/index/migration/commit/reload、UI の SQL や completion barrier はない。
 `live_docs < ok_rows` は欠落疑いで通知/pendingへ進む。逆は「件数不足を検出しなかった」だけで、
 Tantivy-only/重複が欠落を相殺できる。Failed が大量なら count の費用も増える。
-[起動 A/B 計測手順](fts-startup-ab-measurement.md) の全条件で遅延なしの証拠を得るまで採用しない。
-未計測/欠落/ノイズ/悪化なら本リリースで点検を採用せず、他の修正は点検 OFF で進める。
+2026-10-11、利用者承認の軽量A/Bを設計リードが実施し、起動費用の差をノイズと判断して採用した。
+条件・原記録・限界は [FTS 整合計画 §7.4](fts-integrity-plan.md#74-起動点検の採用判断-2026-10-11)。
+perf の `fts_integrity_check` と既存起動 event は維持し、旧 feature 判別属性は常に true とする。
 
 ### 4.4 コンテナ索引 (Ctrl+S 用)
 

@@ -232,7 +232,6 @@ struct StartupCleanupTargets {
     owner_rows: usize,
 }
 
-#[cfg(any(test, feature = "fts-startup-integrity"))]
 #[derive(Debug, PartialEq, Eq)]
 struct IntegrityCounts {
     owner_rows: u64,
@@ -242,7 +241,6 @@ struct IntegrityCounts {
     live_docs: u64,
 }
 
-#[cfg(any(test, feature = "fts-startup-integrity"))]
 impl IntegrityCounts {
     fn new(
         owner_rows: usize,
@@ -266,9 +264,8 @@ impl IntegrityCounts {
     }
 }
 
-/// Experiment only: the existing worker, ownership count and loaded reader are reused.
+/// Reuse the existing worker, ownership count and loaded reader without a UI barrier.
 /// A shortage reserves the next startup; it never wipes a reader already published by manager.
-#[cfg(any(test, feature = "fts-startup-integrity"))]
 fn startup_integrity_check(stores: &Stores, owner_rows: usize) -> Result<IntegrityCounts, String> {
     let started = Instant::now();
     let not_ok_rows = stores
@@ -363,9 +360,7 @@ pub(crate) fn startup_cleanup(
     })?;
     // Includes the ownership check. Rows and the DB lock are released before deleting.
     let query_ms = query_started.elapsed().as_secs_f64() * 1000.0;
-    // The experiment has no production call/SQL cost unless explicitly opted in.
     // Compare this same pre-cleanup reader snapshot before any delete or reconciliation.
-    #[cfg(feature = "fts-startup-integrity")]
     if let Err(error) = startup_integrity_check(stores, owner_rows) {
         cleanup_failure(stores, &error);
         return Err(error);
@@ -381,10 +376,7 @@ pub(crate) fn startup_cleanup(
             &[
                 ("rows", count.into()),
                 ("owner_rows", owner_rows.into()),
-                (
-                    "integrity_feature_enabled",
-                    cfg!(feature = "fts-startup-integrity").into(),
-                ),
+                ("integrity_feature_enabled", true.into()),
                 ("query_ms", query_ms.into()),
                 // The streaming collector only grows, so its final size is its peak.
                 ("peak_collected_rows", count.into()),
@@ -686,10 +678,7 @@ fn run(stores: Stores, shared: Arc<Shared>, startup_skip_offline_change_scan: bo
                     0,
                     &[
                         ("supervisors", handles.len().into()),
-                        (
-                            "integrity_feature_enabled",
-                            cfg!(feature = "fts-startup-integrity").into(),
-                        ),
+                        ("integrity_feature_enabled", true.into()),
                     ],
                 );
             }
@@ -1096,7 +1085,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "fts-startup-integrity")]
     #[test]
     fn startup_integrity_compares_before_orphan_cleanup_deletes_inventory() {
         let tmp = tempfile::tempdir().unwrap();

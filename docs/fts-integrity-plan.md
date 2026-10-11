@@ -384,7 +384,7 @@ tableの初回readに真のcold cacheは保証できない。結果は`incident-
 
 ### 7.2 推奨する位置と集計
 
-`metadata_reconfiguration::startup_cleanup` (`src/metadata_reconfiguration.rs:273`) の
+`metadata_reconfiguration::startup_cleanup` (`src/metadata_reconfiguration.rs`) の
 既存所有走査が返す`owner_rows`を再利用する。`FtsMetaDb::for_each_path_owner`
 (`src/fts_meta.rs:735`) のSELECTは変えない。
 別途、全favoriteの`COUNT(*) WHERE status != 0`を部分indexで取得し、
@@ -423,29 +423,41 @@ ownership cleanup 186.2317ms (840,461行) が別threadで完了した記録が�
 - `skip_offline_change_scan`を使う正常利用者へ新しいFullを強制しない。
   異常検出時だけ既存pendingの規則へ進む。点検のためにINDEX_VERSIONを上げない。
 
-### 7.4 起動点検の明示的な採用条件 (未達なら見送り)
+### 7.4 起動点検の採用判断 (2026-10-11)
 
-**A/B計測で起動を遅くしないと判断できることが、点検を製品へ採用する条件。**
-既存workerを使うというコード確認やFailed=0のmicrobenchmarkだけでは採用しない。
-比較Aは点検なし、Bは点検あり。両者で§5/§6/§8の修正・build条件・fixtureを同じにし、
-点検の差だけを測る。以下を全て含む:
+当初の R3 は cold/warm × skip ON/OFF × Failed 0/少数/大量 × idle/I/O競合の24条件で、
+各3 pair以上の A/B を採用条件としていた。**2026-10-11、利用者が軽量手順 option 1 を承認し、
+設計リードがその手順で測定して採用を決定した。** 旧24条件 gate の完了とは区別する。
+実装者が独自に条件を緩めたり、microbenchmark だけで採用したりしたものではない。
 
-- cold/warm、skip_offline_change_scan ON/OFF。
-- 84万行以上のコピーfixtureでFailed=0、少数、大量 (Failedが大半) の各状態。
-  正常な両ストアの対応を作り、点検による異常再構築の費用と正常起動の追加費用を混同しない。
-- idleとI/O競合。I/O競合は使い捨てfixture側への再現可能な背景read/write負荷で作り、
-  cache状態・負荷条件・観測の順番を記録する。通常profileのDBを試験に使わない。
-- IndexerInit/result-send、overlay解除/UI-ready、Ctrl+G準備完了、metadata supervisor開始の
-  経過時間と分布。worker間のCPU/I/O競合による遅延も対象にする。
-  `integrity_check_ms`、owner_rows/not_ok_rows、segments/live_docsも記録する。
+測定 source は `63aa26dbd771af43ad8f99497925844f59fc6386`、profile は `dev-runtime`。
+A は default build (点検 OFF)、B は当時の `--features fts-startup-integrity` build (点検 ON)。
+exe の SHA256 は A=`388aa2351ce0dbe1a56e52f05de169b31d4263f4dd550523ace943292352b80c`、
+B=`72b2942dc050f66ca00a2df85705e5df81371cc8aaf3fb03ab475d010138112c`。
+agent 作成データから用意した隔離 seed に4お気に入り (item index ON、
+`skip_offline_change_scan=false`)、SQLite Ok 16,385行と一致するTantivy生存文書を持たせ、
+各 run 前に seed を新しくコピーした。warm cache、idle、AB → BA → AB → BA → AB の10起動
+(各arm5回)。通常 profile/事故原本は使っていない。起動・測定は設計リードが実施し、
+今回の実装者は保存済み記録を読み取り照合しただけで、mIV を起動していない。
 
-Rustのコピーfixture計測を先に行う。live起動A/Bは隔離portableの承認済みsuite、または
-利用者の手動実施の証拠を使う。複数回・順序を交互にした比較でばらつきと測定分解能を記録し、
-再現性のある起動遅延が無いことを確認する。許容遅延を勝手に何msと設定しない。
-**いずれかの条件で悪化した場合、または計測未実施/ばらつきで判断できない場合は、
-このリリースで起動点検を採用しない。** §5/§6/§8の修正と文書訂正は点検なしでも進める。
-起動barrier、全件照会、新index/migrationを足して無理に残さない。
-本r3は計画の改訂であり、A/B実施・起動無影響の証明・点検の採用を主張しない。
+| perf session 起点からの時刻/区間の中央値 (秒) | A: 点検 OFF | B: 点検 ON |
+| --- | ---: | ---: |
+| `first_frame` | 0.619 | 0.602 |
+| `metadata_supervisors_started` | 0.631 | 0.617 |
+| `indexer_overlay_cleared` (UI-ready) | 0.774 | 0.729 |
+| supervisor開始 − first_frame | 0.012 | 0.014 |
+
+B の `integrity_check_ms` は 0.0479–0.2105ms、全5回で `missing_suspected=false`、
+owner/Ok/live件数は16,385、not_ok=0。全10ログの保存診断は既存 `validate_delivery` で complete。
+原記録は `target/fts-ab/ab-results.json` と `target/fts-ab/run-XX-*/logs/perf_events.jsonl`。
+中央値・hash・件数・保存診断の照合は `target/I-1367-adoption-measurement-verification.json`。
+
+設計リードは差をノイズと判断し、測定可能な起動費用の増加はないとの結論と、§12.1/§12.2の
+大量Failed fixture (追加COUNT+num_docs約0.1–15ms、UI待ちへ入れない配置) を合わせて採用した。
+**製品では点検を常時実行し、feature gate を撤去して一つの経路にする。** perf event は維持する。
+これはこの測定条件での採用判断であり、cold、skip ON、大量Failed、I/O競合のlive A/Bや
+release profile の計測、全環境での数学的な追加時間ゼロの証明ではない。worker間競合の可能性、
+Failed件数による集計費用、件数照合の限界は残る。起動barrier、全件照会、新index/migrationは追加しない。
 
 ## 8. 再構築順序を1つにする
 
@@ -557,8 +569,8 @@ wipe/create/pending clearの失敗はlog+通知で終え、markerを残す既存
    正常favorite ownership cleanup・root変更・OFF→ON・skip印・pause/cancel/shutdownを維持。
 8. cost: 84万行以上のコピーfixtureでSQL plan/時間とRust worker追加時間を記録。
    UI-ready/result-sendへcompletion barrierを入れない。
-   **§7.4のcold/warm・skip ON/OFF・Failed大量・I/O競合を含むA/Bを点検の採用gateとする。**
-   未計測/判断不能/悪化なら点検をこのリリースから落とす。
+   当初の24条件採用gateは、利用者承認の軽量手順と設計リードの採用判断へ変更した。
+   測定範囲と未測定条件を区別し、§7.4の記録を正本とする。
 
 既存回帰は`ingest_worker::reader_reload_failure_prevents_sqlite_publication`、
 `sqlite_failure_is_reported_and_allows_later_success`、
@@ -585,10 +597,14 @@ normal profileの実行は利用者だけ。既存事故copyはread-only、通�
 まれな書込failureの通知+次回再構築、retryをatomic操作に限定する技術判断、
 点検のSQL/worker配置について利用者へ稀なfailure別の選択質問を作らない。
 検証で正常起動が遅くなれば決定済み条件に従い点検を見送る。
+この採用条件の変更と採用決定は§7.4に記録した。以後の製品点検は常時実行する。
 通常の機能制限やuser-created dataの破棄が必要と判明した場合だけ、該当項目ごとに
 推奨案・失われる挙動/データ・費用を示して別途判断を求める。
 
 ## 12. 実装記録 (2026-10-11、受理済み R3 本文は維持)
+
+以下の§12冒頭〜§12.2は初回実装・追加検証時の記録。**最新の採用状態は§7.4と§12.3**。
+当初の opt-in/default OFF と24条件手順は、利用者承認の軽量A/B後の採用判断で更新した。
 
 初回実装対象は `02c2b4c4b` からの差分で、利用者が `bee3d4aa0` にコミット済み。
 ローカル Tantivy 0.26.1 は実ファイルとして
@@ -707,5 +723,69 @@ feature ON の Cargo lib test 実行体から同じ ignored test を直接実行
 
 §12.1 と同じく SQL scan は空 callback の streaming 読取。これを起動時間の上限、A/B、
 UI-readyへの無影響と読み替えない。点検は未採用・既定 OFF。利用者の隔離 A/B は
-[計測手順](fts-startup-ab-measurement.md) に従う。未計測/欠落/ノイズ/判断不能/悪化なら
-不採用とする §7.4 の条件に変更はない。
+[計測手順](fts-startup-ab-measurement.md) に従う、という追加検証時点の判断だった。
+その後の利用者承認の手順変更・採用は§7.4と§12.3に記録する。
+
+### 12.3 起動点検の採用とfeature撤去 (2026-10-11)
+
+利用者承認の軽量A/Bを設計リードが実施し、§7.4の証拠とfixture費用を確認して製品への採用を
+決定した。実装者はその決定に従い、`63aa26dbd` を基点に `fts-startup-integrity` を
+Cargo feature一覧から削除し、`IntegrityCounts`、`FtsMetaDb::count_not_ok`、startup呼出しと
+cleanup前比較の回帰を通常buildの単一経路にした。runtime toggle/設定は追加していない。
+
+既存worker、所有行数、同じloaded Searcher、reporterのlog+通知+既存pendingを維持する。
+UI待ち、追加全件走査、索引作成、commit/reload、回復worker/retryは追加しない。
+perfの `fts_integrity_check`、`metadata_out_of_range_cleanup`、`metadata_supervisors_started` と
+件数・費用を維持し、既存のfeature判別属性 (`feature_enabled` / `integrity_feature_enabled`) は
+過去ログとの比較用に常にtrueを出す。異常時の通知文そのものは既存reporterの文面を使う。
+通常のmmap GC拒否・正常shutdown取消の扱いを変えず、patched Tantivyの回帰も確認する。
+
+旧24条件向け専用解析器 `scripts/analyze_fts_startup_ab.py` とそのunit testを削除した。
+`docs/fts-startup-ab-measurement.md` は採用記録へ案内する短い参照ページに置き換えた。
+過去の検証台帳と `target/fts-ab/` の原証拠は保持し、旧解析器が軽量手順をACCEPTしたとは
+主張しない。architecture/async/UI応答性/仕様とマニュアルを常時点検へ合わせた。
+`docs/next-release-backlog.md` は利用者指示で今回編集しない。
+
+今回の検証結果、件数、条件、原ログは `target/I-1367-impl-msg.txt` の採用追補へ記録する。
+実アプリは起動せず、変更は未コミット。測定による採用判断と非対話コード検証は区別する。
+
+| 通常buildでの採用後検証 | 結果 | 原ログ (`target/` 内) |
+| --- | --- | --- |
+| `--lib startup_integrity` | 4 passed / 0 failed / 1 ignored | `I-1367-adoption-startup-tests.log` |
+| `--lib metadata_reconfiguration` | 23 passed / 0 failed / 1 ignored | `I-1367-adoption-metadata-tests.log` |
+| `--lib indexer_manager` | 21 passed / 0 failed | `I-1367-adoption-manager-tests.log` |
+| `--lib fts_` | 87 passed / 0 failed | `I-1367-adoption-fts-tests.log` |
+| `--test fts_tantivy_integrity` | 11 passed / 0 failed (両shutdown回帰を含む) | `I-1367-adoption-tantivy-tests.log` |
+| `--test search_metadata_e2e` | 16 passed / 0 failed | `I-1367-adoption-search-e2e.log` |
+| core check / `cargo check --features portable` | exit 0 / exit 0 | `I-1367-adoption-core-check.log` / `I-1367-adoption-portable-check.log` |
+| fmt / UI glyph lint | exit 0 / zero | `I-1367-adoption-fmt.log` / `I-1367-adoption-glyphs.log` |
+
+狭いfilterと全体gateの重複は合計しない。ignored は大規模fixtureの任意実行であり、
+同じ集計実装の先行費用測定 (§12.1/§12.2) は保持する。今回のコード検証を追加の起動A/Bと
+読み替えない。
+
+先行full gateの本体libは12,006 passed / 1 failed / 56 ignored。失敗は既存collectionの
+`deleted_collection_child_stays_physical_through_park_resume_and_backspace` で、park前の履歴に
+残った削除済みcollectionがresume時に正しくpruneされ、snapshot比較が `[] != [Collection]`
+になった。削除表示の完了とready catalogによる履歴pruneは別通知であり、fixtureが固定回数の
+pollで両者の完了を仮定していた。`ui_dialogs::collections::prune_collection_folder_history_from_ready_catalog`
+の製品動作は変更せず、既存5秒の `poll_until` で削除表示とback/forward履歴のprune両方を
+確認してからsnapshotするよう、`src/app/collection_grid.rs` のtest moduleだけを修正した。
+park/resume/Backspaceのassertionとtimeoutは維持し、履歴を手動clearして失敗を隠していない。
+先行ログは `I-1367-adoption-full-before.log`、製品source不変の照合は
+`I-1367-adoption-collection-scope.log`。修正前の同じ実行体による単独1件成功も記録するが、
+先行full失敗を成功と読み替えない。修正後に単独回帰と全体gateを確認する。
+
+修正後の単独回帰は1 passed / 0 failed、最終 `test-full.ps1 -SuppressCrashDialogs` はPASS/exit 0。
+全result recordの集計は13,275 passed / 0 failed / 63 ignored (子processの同じtest再実行2件を含む)、
+本体libは12,007 passed / 0 failed / 56 ignored、UI snapshot integrationは157件成功。
+workspace外vendor egui/egui-wgpu/eframeは25/11/18件成功。原ログ/集計は
+`I-1367-adoption-full.log` / `I-1367-adoption-full-results.json`。
+条件はjobs=1、threads=4、専用 `target/i1367-adoption-tmp`、assertion/timeout/全target保持。
+修正したcollection回帰の成功後に確認用buildも並行した。実行条件は
+`I-1367-adoption-full-conditions.txt`。これを起動性能の追加証拠にしない。
+
+`build-dev.ps1 -PreserveRuntime` は通常featureのcore/remote/EPUB worker配置まで成功、exit 0。
+core buildは10m13s、core SHA256は `2783ce2d661a0a8a9bee11b73a7124ca711e0c2885093eec3ef6296beefb6518`。
+原ログとexe/DLL identityは `I-1367-adoption-build-dev.log` / `I-1367-adoption-dev-runtime-artifacts.json`。
+portable/test hookは有効にせず、startup点検は通常コードとして含む。アプリは起動していない。

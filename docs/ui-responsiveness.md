@@ -176,10 +176,11 @@ metadata manager worker の所有範囲 cleanup/Failed reconciliation は superv
 だけで失敗/次回再構築を表示する。描画・toast確認のために SQLite pending の読取、SQL、I/O、
 wait/retry を追加しない。トレイで toast を見逃してもお気に入り編集で予約状態を確認できる。
 
-`fts-startup-integrity` は既定 OFF の計測用 opt-in。worker配置だけを根拠に「追加起動費用ゼロ」と
-扱わず、他 worker と CPU/I/O を競合する場合も測る。[A/B 手順](fts-startup-ab-measurement.md) は
-cold/warm・skip ON/OFF・Failed 0/少数/大量・idle/I/O競合の反復交互比較を要求する。
-未測定・欠落・ノイズ・悪化なら点検を採用しない。これを回避するために起動 barrier を足さない。
+起動 count 点検は常時実行し、feature gate は撤去した。利用者承認の軽量A/Bを設計リードが
+実施し、観測した起動費用の差はノイズと判断して採用した。[採用記録 §7.4](fts-integrity-plan.md#74-起動点検の採用判断-2026-10-11)
+に条件・結果・未測定範囲を残す。worker配置や単発fixtureだけで全環境の「追加費用ゼロ」とは
+扱わない。他 workerとのCPU/I/O競合やFailed大量時の費用は残り、perf eventで追跡する。
+点検completionを待つ起動 barrier を足さない。
 
 EPUB の事前確認と変換もこの境界を使う。`EpubConvertState` が取消 token と結果 receiver を持ち、
 UI は `try_recv` で確認・進捗・完了を受け取る。`inspect` と `convert` の起動、元 EPUB の読み込み、

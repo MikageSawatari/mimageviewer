@@ -2579,8 +2579,9 @@ FTS の commit/reload/SQLite apply/cleanup と実行由来の自動 merge 永続
 durable commit してから Tantivy を作り直す。ユーザー作成のタグ/評価等の別 DB は変更しない。
 名前索引の Full 失敗表示も訂正するが、名前 DB の書込失敗を通知/既存 rebuild marker へ揃える
 対応は [§1.369](next-release-backlog.md) の別件。FTS の marker を名前索引へ適用しない。
-起動 count 点検は `fts-startup-integrity` opt-in、既定 OFF。全条件 A/B による遅延なしの証拠が
-なければ採用しない。詳細は [FTS 整合計画](fts-integrity-plan.md) と [計測手順](fts-startup-ab-measurement.md)。
+起動 count 点検は既存 worker で常時実行する。管理情報の Ok 件数より生存全文文書が少ない場合は
+同じ通知・次回再構築予約へ進む。今の session で索引を消さず、件数一致を完全整合の保証にしない。
+利用者承認の軽量A/Bによる採用判断と測定範囲は [FTS 整合計画 §7.4](fts-integrity-plan.md#74-起動点検の採用判断-2026-10-11) を参照。
 
 mIV Remote のドライブ一覧 / 閲覧履歴 / ブックマーク / 本棚 / レーティング / スマートフォルダで
 通常画像を開いた場合は、実親フォルダへ移動せず元のフラット一覧全体を読み順として維持する。
