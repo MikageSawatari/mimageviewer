@@ -489,6 +489,7 @@ pub(crate) struct SnapshotViewingState {
     pub direction: crate::settings::ReadingDirection,
     pub flow: crate::settings::ReadingFlow,
     pub shift: crate::app::spread_shift_owner::ViewerSpreadShift,
+    pub composition: crate::app::book_composition_runtime::ViewerBookComposition,
     pub final_cover: crate::settings::FinalCoverSpreadPreference,
     pub endpoints: crate::settings::SingletonSpreadEndpointPreferences,
     pub page_alone: crate::settings::PageAlonePreferences,
@@ -502,6 +503,7 @@ impl Clone for SnapshotViewingState {
             flow: self.flow,
             // Snapshot forks follow the same accepted-session boundary as live viewers.
             shift: self.shift.fork_accepted(),
+            composition: self.composition.clone(),
             final_cover: self.final_cover,
             endpoints: self.endpoints,
             page_alone: self.page_alone,

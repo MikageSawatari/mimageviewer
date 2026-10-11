@@ -1078,6 +1078,7 @@ pub(in crate::app) struct ViewerContextBundle {
     singleton_spread_endpoint_preferences: crate::settings::SingletonSpreadEndpointPreferences,
     page_alone_preferences: crate::settings::PageAlonePreferences,
     pub(super) spread_shift: super::spread_shift_owner::ViewerSpreadShift,
+    pub(super) book_composition: super::book_composition_runtime::ViewerBookComposition,
     reading_flow: crate::settings::ReadingFlow,
     reading_direction: crate::settings::ReadingDirection,
     slideshow_playing: bool,
@@ -1180,6 +1181,7 @@ pub(in crate::app) struct ContextRef<'a> {
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::app) enum ContextAsyncOwner {
+    BookCompositionRead,
     RetainedSpreadShift,
     PathClassification,
     HistoryTransition,
@@ -1211,7 +1213,8 @@ pub(in crate::app) enum ContextAsyncServicePhase {
 
 #[cfg(windows)]
 impl ContextAsyncOwner {
-    pub(in crate::app) const ALL: [Self; 20] = [
+    pub(in crate::app) const ALL: [Self; 21] = [
+        Self::BookCompositionRead,
         Self::RetainedSpreadShift,
         Self::EpubConversion,
         Self::PdfPassword,
@@ -1238,6 +1241,10 @@ impl ContextAsyncOwner {
         macro_rules! pending {
             ($owner:ident) => {
                 match self {
+                    Self::BookCompositionRead => matches!(
+                        $owner.book_composition,
+                        super::book_composition_runtime::ViewerBookComposition::Preparing { .. }
+                    ),
                     Self::RetainedSpreadShift => $owner.spread_shift.retained_readoption_pending(),
                     Self::PathClassification => $owner
                         .top_level_grid_view
@@ -1319,6 +1326,7 @@ impl ContextAsyncOwner {
             return;
         }
         match self {
+            Self::BookCompositionRead => app.poll_book_composition_read(),
             Self::RetainedSpreadShift => app.poll_retained_shift_readoption(ctx),
             Self::PathClassification => app.poll_open_path_classification(ctx),
             Self::HistoryTransition => app.poll_collection_history_transition(ctx),
@@ -1458,6 +1466,14 @@ impl ContextAsyncOwner {
                 }
             }
             Self::SimilarPreview => app.similar_panel.preview.terminate_on_park(),
+            Self::BookCompositionRead => {
+                if matches!(
+                    app.book_composition,
+                    super::book_composition_runtime::ViewerBookComposition::Preparing { .. }
+                ) {
+                    app.book_composition = Default::default();
+                }
+            }
             Self::RetainedSpreadShift => app.spread_shift.cancel_retained_readoption(),
         }
     }
@@ -2064,6 +2080,7 @@ impl ViewerContextBundle {
                 crate::settings::SingletonSpreadEndpointPreferences::default(),
             page_alone_preferences: crate::settings::PageAlonePreferences::default(),
             spread_shift: Default::default(),
+            book_composition: Default::default(),
             reading_flow: crate::settings::ReadingFlow::default(),
             reading_direction: crate::settings::ReadingDirection::default(),
             slideshow_playing: false,
@@ -2432,6 +2449,7 @@ impl App {
             singleton_spread_endpoint_preferences,
             page_alone_preferences,
             spread_shift,
+            book_composition,
             reading_flow,
             reading_direction,
             slideshow_playing,
@@ -2718,6 +2736,7 @@ impl App {
         swap_field!(singleton_spread_endpoint_preferences);
         swap_field!(page_alone_preferences);
         swap_field!(spread_shift);
+        swap_field!(book_composition);
         swap_field!(reading_flow);
         swap_field!(reading_direction);
         swap_field!(slideshow_playing);
@@ -3051,6 +3070,7 @@ impl App {
             singleton_spread_endpoint_preferences,
             page_alone_preferences,
             spread_shift,
+            book_composition,
             reading_flow,
             reading_direction,
             slideshow_playing,
@@ -3376,6 +3396,7 @@ impl App {
             singleton_spread_endpoint_preferences,
             page_alone_preferences,
             spread_shift,
+            book_composition,
             reading_flow,
             reading_direction,
             pdf_enumerate_pending,
@@ -3476,6 +3497,7 @@ impl App {
         detached.singleton_spread_endpoint_preferences = self.singleton_spread_endpoint_preferences;
         detached.page_alone_preferences = self.page_alone_preferences;
         detached.spread_shift = self.spread_shift.fork_accepted();
+        detached.book_composition = self.book_composition.clone();
         detached.reading_flow = self.reading_flow;
         detached.reading_direction = self.reading_direction;
 
@@ -3700,6 +3722,30 @@ impl App {
 
     pub(in crate::app) fn viewer_context_residence(&self, id: ViewerContextId) -> ContextResidence {
         self.viewer_contexts.table.residence(id)
+    }
+
+    pub(in crate::app) fn book_composition_contexts_to_poll(
+        &self,
+        changed: &[String],
+    ) -> Vec<ViewerContextId> {
+        self.viewer_contexts
+            .table
+            .slots
+            .iter()
+            .filter_map(|(id, slot)| {
+                let Slot::AtRest(bundle) = slot else {
+                    return None;
+                };
+                let needs_read = matches!(
+                    bundle.book_composition,
+                    super::book_composition_runtime::ViewerBookComposition::Preparing { .. }
+                ) || bundle
+                    .book_composition
+                    .scope()
+                    .is_some_and(|scope| changed.contains(&scope.storage_key()));
+                needs_read.then_some(*id)
+            })
+            .collect()
     }
 
     pub(in crate::app) fn deliver_spread_shift_reply_at_rest(

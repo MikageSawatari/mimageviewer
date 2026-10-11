@@ -222,6 +222,7 @@ impl App {
             direction: self.reading_direction,
             flow: self.reading_flow,
             shift: self.spread_shift.fork_accepted(),
+            composition: self.book_composition.clone(),
             final_cover: self.final_cover_spread_preference,
             endpoints: self.singleton_spread_endpoint_preferences,
             page_alone: self.page_alone_preferences,
@@ -233,6 +234,7 @@ impl App {
         self.reading_direction = state.direction;
         self.reading_flow = state.flow;
         self.spread_shift = state.shift;
+        self.book_composition = state.composition;
         self.final_cover_spread_preference = state.final_cover;
         self.singleton_spread_endpoint_preferences = state.endpoints;
         self.page_alone_preferences = state.page_alone;
@@ -887,6 +889,7 @@ impl App {
         // Its book anchor stays on saved_items, even when the subset drops preceding rows.
         let mut saved_viewing_state = self.capture_snapshot_viewing_state();
         saved_viewing_state.shift = std::mem::take(&mut self.spread_shift);
+        saved_viewing_state.composition = std::mem::take(&mut self.book_composition);
         saved_viewing_state.shift.cancel_retained_readoption();
         // Preserve or close the open viewer while the old index space and player are alive.
         let viewer_index_swap = self.prepare_snapshot_viewer_index_swap("activate", &membership);

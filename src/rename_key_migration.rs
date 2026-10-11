@@ -221,12 +221,14 @@ pub struct RenameMigrationReport {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StoreMutationEffects {
     content_identity_index_stale: bool,
+    book_composition_changed: bool,
 }
 
 impl StoreMutationEffects {
     pub(crate) fn for_content_identity_index_stale() -> Self {
         Self {
             content_identity_index_stale: true,
+            book_composition_changed: false,
         }
     }
 
@@ -239,8 +241,18 @@ impl StoreMutationEffects {
         }
     }
 
+    pub(crate) fn record_rows_changed(&mut self, descriptor: &StoreDescriptor, rows: usize) {
+        self.record_completed(descriptor);
+        self.book_composition_changed |= descriptor.file == "book_composition.db" && rows > 0;
+    }
+
+    pub(crate) fn book_composition_changed(self) -> bool {
+        self.book_composition_changed
+    }
+
     pub(crate) fn merge(&mut self, other: Self) {
         self.content_identity_index_stale |= other.content_identity_index_stale;
+        self.book_composition_changed |= other.book_composition_changed;
     }
 
     pub(crate) fn content_identity_index_stale(self) -> bool {
@@ -943,6 +955,14 @@ const fn optional_legacy_store(
 /// hard purge も走査するため、rename と purge の対象が将来ずれない。PDF パスワードだけは
 /// JSON の SHA-256 キーなので、この表と並ぶ専用処理を両経路が共有する。
 pub(crate) const STORES: &[StoreDescriptor] = &[
+    store(
+        "book_composition.db",
+        "book_compositions",
+        "book_key",
+        true,
+        StoreKeyNormalization::KeepDrive,
+    )
+    .logical_book_family(),
     optional_legacy_store(
         "spread_shift.db",
         "spread_shifts",
@@ -1188,6 +1208,7 @@ pub(crate) struct StoreCopyReport {
     /// Only rows from successfully committed pin-store transactions.
     pub(crate) committed_thumbnail_pins: usize,
     pub(crate) database_opens: usize,
+    pub(crate) store_mutations: StoreMutationEffects,
     pub(crate) errors: Vec<String>,
 }
 
@@ -1312,7 +1333,7 @@ fn copy_stores_acquire_maintenance(
     let maintenance = match acquire_store_maintenance(data_dir, &coverage) {
         Ok(lease) => lease,
         Err(error) => {
-            report.errors.push(format!("spread_shift: {error}"));
+            report.errors.push(format!("store maintenance: {error}"));
             return report;
         }
     };
@@ -1483,6 +1504,10 @@ fn store_keys_with_rows(
     if descriptor.file == "spread_shift.db" {
         crate::spread_shift::validate_database_rows(&conn)?;
     }
+    if descriptor.file == "book_composition.db" {
+        crate::book_composition::validate_database_schema(&conn)?;
+        crate::book_composition::validate_database_rows(&conn)?;
+    }
     // Copy and probe use the same delimiter and BINARY half-open range, without LIKE.
     let sql = format!(
         "SELECT 1 FROM {table} WHERE {column} = ?1 OR ({column} >= ?2 AND {column} < ?3) LIMIT 1",
@@ -1526,6 +1551,9 @@ fn open_store_for_write(
             if present {
                 crate::spread_shift::validate_database_rows(&conn)?;
             }
+        }
+        if descriptor.file == "book_composition.db" {
+            crate::book_composition::validate_database_rows(&conn)?;
         }
         Ok(conn)
     }
@@ -1574,7 +1602,7 @@ fn run_at_with_epub_acquisition(
     let maintenance = match acquire_store_maintenance_with_epub(data_dir, acquire_epub) {
         Ok(lease) => lease,
         Err(error) => {
-            report.errors.push(format!("spread_shift: {error}"));
+            report.errors.push(format!("store maintenance: {error}"));
             return report;
         }
     };
@@ -1627,6 +1655,18 @@ fn run_at_with_epub_acquisition(
     // また missing 行を保持する仕様上、STORES と共有される delete hard purge の対象にも
     // してはならない。専用 transaction で case-only rename も含めて追従させる。
     migrate_book_bookmarks(data_dir, old_path, new_path, &mut report);
+    match crate::book_composition::migrate_page_paths_at(
+        data_dir,
+        &[(old_path.to_path_buf(), new_path.to_path_buf())],
+    ) {
+        Ok(rows) => {
+            report.rows += rows;
+            report.store_mutations.book_composition_changed |= rows > 0;
+        }
+        Err(error) => report
+            .errors
+            .push(format!("book_composition pages: {error}")),
+    }
     match crate::spread_shift::migrate_page_paths_at(
         data_dir,
         &[(old_path.to_path_buf(), new_path.to_path_buf())],
@@ -1711,9 +1751,11 @@ pub(crate) fn purge_removed_paths_guarded_at(
     purge_removed_scopes_guarded_at(data_dir, &scopes, pdf_paths, guard)
 }
 
-/// All maintenance takes EPUB protection before shift. Release shift first so
-/// its writer reload finishes while ledger/pin protection still belongs to us.
+/// Maintenance takes EPUB protection, shift, then composition. Reload the
+/// composition snapshot before releasing shift and the ledger/pin coverage.
 pub(crate) struct StoreMaintenanceLease {
+    // Fields drop in declaration order: reload composition before shift/EPUB release.
+    _composition: crate::book_composition::BookCompositionMaintenanceLease,
     maintenance: crate::spread_shift::SpreadShiftMaintenanceLease,
     epub: crate::pdf_loader::EpubRangeLease,
 }
@@ -1735,7 +1777,12 @@ fn acquire_store_maintenance_with_epub(
 ) -> Result<StoreMaintenanceLease, String> {
     let epub = acquire_epub();
     let maintenance = crate::spread_shift::maintenance_at(data_dir)?;
-    Ok(StoreMaintenanceLease { maintenance, epub })
+    let composition = crate::book_composition::maintenance_at(data_dir)?;
+    Ok(StoreMaintenanceLease {
+        _composition: composition,
+        maintenance,
+        epub,
+    })
 }
 
 /// Acquire EPUB coverage then shift, once before Shell. Borrow the same owner
@@ -1795,7 +1842,7 @@ fn purge_removed_scopes_acquire_maintenance(
     let maintenance = match acquire_delete_epub_guard(data_dir, scopes) {
         Ok(lease) => lease,
         Err(error) => {
-            report.errors.push(format!("spread_shift: {error}"));
+            report.errors.push(format!("store maintenance: {error}"));
             return report;
         }
     };
@@ -2080,7 +2127,7 @@ fn purge_store_with_before_sql(
     match result {
         Ok(rows) => {
             report.rows += rows;
-            report.store_mutations.record_completed(descriptor);
+            report.store_mutations.record_rows_changed(descriptor, rows);
         }
         Err(error) => report.errors.push(format!(
             "{}: {}.{}: {error}",
@@ -2188,7 +2235,7 @@ fn migrate_store(
     match result {
         Ok(n) => {
             report.rows += n;
-            report.store_mutations.record_completed(descriptor);
+            report.store_mutations.record_rows_changed(descriptor, n);
         }
         Err(e) => report.errors.push(format!(
             "{}: {}.{}: {e}",
@@ -2220,8 +2267,14 @@ fn move_exact(
             &format!("UPDATE OR IGNORE {table} SET {col} = ?1 WHERE {col} = ?2"),
             rusqlite::params![new_key, old_key],
         )?;
-        tx.execute(&format!("DELETE FROM {table} WHERE {col} = ?1"), [old_key])?;
-        n
+        let deleted = tx.execute(&format!("DELETE FROM {table} WHERE {col} = ?1"), [old_key])?;
+        // A composition source discarded in favor of an existing destination is
+        // still a real scope mutation; keep the other stores' historical counts.
+        n + if table == "book_compositions" {
+            deleted
+        } else {
+            0
+        }
     } else {
         tx.execute(
             &format!("UPDATE {table} SET {col} = ?1 WHERE {col} = ?2"),
@@ -2299,6 +2352,9 @@ fn copy_store(
     match result {
         Ok(rows) => {
             report.rows += rows;
+            report
+                .store_mutations
+                .record_rows_changed(&descriptor, rows);
             if matches!(descriptor.table, "folder_thumb_pins" | "video_pins") {
                 report.committed_thumbnail_pins += rows;
             }
@@ -3118,8 +3174,41 @@ mod tests {
             .unwrap();
     }
 
+    fn insert_composition_fixture(connection: &rusqlite::Connection, key: &str, payload: &str) {
+        use crate::book_composition::{
+            BookComposition, CompositionPageRef, CompositionUnit, PageDomain, ReadingDirection,
+            SingleCompanion, SinglePlacement,
+        };
+        let page_num = if payload == "prefix" { 1 } else { 0 };
+        let composition = BookComposition::new(
+            ReadingDirection::Ltr,
+            vec![CompositionUnit::Single {
+                page: CompositionPageRef::PdfPage { page_num },
+                placement: SinglePlacement::Center,
+                companion: SingleCompanion::Vacant,
+            }],
+        );
+        crate::book_composition::store::replace_row_in(
+            connection,
+            "book_compositions",
+            key,
+            &PageDomain::Document,
+            &composition,
+        )
+        .unwrap();
+    }
+
     fn setup_copy_store_rows(dir: &Path, old: &Path) {
         for descriptor in STORES {
+            if descriptor.file == "book_composition.db" {
+                crate::book_composition::initialize_database_at(&dir.join(descriptor.file))
+                    .unwrap();
+                let connection = open(dir, descriptor.file);
+                let key = descriptor.normalize_path(old);
+                insert_composition_fixture(&connection, &key, "exact");
+                insert_composition_fixture(&connection, &format!("{key}/ページ/001.jpg"), "prefix");
+                continue;
+            }
             if descriptor.file == "spread_shift.db" {
                 crate::spread_shift::initialize_database_at(&dir.join(descriptor.file)).unwrap();
                 let connection = open(dir, descriptor.file);
@@ -3270,10 +3359,10 @@ mod tests {
         let covered = STORES.iter().filter(|descriptor| descriptor.unique).count();
         assert_eq!(
             STORES.len(),
-            28,
+            29,
             "watched、endpoint / page-alone preference と logical shift を含む現行 descriptor 数"
         );
-        assert_eq!(covered, 27);
+        assert_eq!(covered, 28);
         assert_eq!(report.rows, covered * 2);
         assert_eq!(report.committed_thumbnail_pins, 4);
 
@@ -3292,7 +3381,9 @@ mod tests {
                         "prefix",
                     ),
                 ] {
-                    let payload_column = if descriptor.file == "spread_shift.db" {
+                    let payload_column = if descriptor.file == "book_composition.db" {
+                        "composition_json"
+                    } else if descriptor.file == "spread_shift.db" {
                         "anchor_ref"
                     } else {
                         "payload"
@@ -3307,7 +3398,14 @@ mod tests {
                             |row| row.get(0),
                         )
                         .unwrap();
-                    let copied = if descriptor.file == "spread_shift.db" {
+                    let copied = if descriptor.file == "book_composition.db" {
+                        let value: serde_json::Value = serde_json::from_str(&copied).unwrap();
+                        if value["composition"]["units"][0]["page"]["page_num"] == 1 {
+                            "prefix".to_owned()
+                        } else {
+                            "exact".to_owned()
+                        }
+                    } else if descriptor.file == "spread_shift.db" {
                         let crate::spread_shift::SpreadShiftPageRef::ArchiveEntry(value) =
                             serde_json::from_str(&copied).unwrap()
                         else {
@@ -4149,7 +4247,12 @@ mod tests {
         for descriptor in STORES {
             let identity = descriptor.file == crate::content_identity::LEDGER_DB_FILE;
             let shift = descriptor.file == "spread_shift.db";
-            let conn = if shift {
+            let composition = descriptor.file == "book_composition.db";
+            let conn = if composition {
+                crate::book_composition::initialize_database_at(&dir.path().join(descriptor.file))
+                    .unwrap();
+                open(dir.path(), descriptor.file)
+            } else if shift {
                 crate::spread_shift::initialize_database_at(&dir.path().join(descriptor.file))
                     .unwrap();
                 open(dir.path(), descriptor.file)
@@ -4174,14 +4277,16 @@ mod tests {
             for key in [
                 base.clone(),
                 format!("{base}/child.jpg"),
-                if shift {
+                if shift || composition {
                     format!("{base}/chapter/page_1")
                 } else {
                     format!("{base}::page_1")
                 },
                 format!("{base}2/keep.jpg"),
             ] {
-                if shift {
+                if composition {
+                    insert_composition_fixture(&conn, &key, "exact");
+                } else if shift {
                     insert_shift_fixture(&conn, &key, "fixture.jpg");
                 } else if identity {
                     conn.execute(
@@ -5866,5 +5971,120 @@ mod tests {
             backed.contains(&key),
             "読めない store があるときは安全側に倒す"
         );
+    }
+    #[test]
+    fn composition_lifecycle_keeps_relative_payload_drive_and_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::book_composition::initialize_database_at(&dir.path().join("book_composition.db"))
+            .unwrap();
+        let connection = open(dir.path(), "book_composition.db");
+        let old = Path::new(r"C:\Books\source.zip");
+        let new = Path::new(r"D:\Books\source.zip");
+        let old_key = crate::book_scope::BookScopeKey::new(old, "")
+            .unwrap()
+            .storage_key();
+        let new_key = crate::book_scope::BookScopeKey::new(new, "")
+            .unwrap()
+            .storage_key();
+        insert_composition_fixture(&connection, &old_key, "exact");
+        insert_composition_fixture(&connection, &format!("{old_key}/chapter"), "prefix");
+        insert_composition_fixture(&connection, &new_key, "prefix");
+        let original = crate::book_composition::store::load_rows(&connection).unwrap();
+        let probe = ledger_keys_with_restorable_rows_at(dir.path(), std::slice::from_ref(&old_key));
+        assert!(
+            probe.contains(&old_key),
+            "composition-only data is restorable"
+        );
+        let copied = copy_stores_at(
+            dir.path(),
+            &[
+                StoreCopyPathMapping::exact(old, new),
+                StoreCopyPathMapping::virtual_prefix(old, new),
+            ],
+        );
+        assert!(copied.errors.is_empty(), "{:?}", copied.errors);
+        assert_eq!(copied.rows, 1);
+        assert!(copied.store_mutations.book_composition_changed());
+        let rows = crate::book_composition::store::load_rows(&connection).unwrap();
+        assert_eq!(rows[&new_key], original[&new_key], "destination wins");
+        assert_eq!(
+            rows[&format!("{new_key}/chapter")],
+            original[&format!("{old_key}/chapter")]
+        );
+        assert_eq!(rows[&old_key], original[&old_key], "copy keeps source");
+        let renamed = run_at(dir.path(), old, Path::new(r"E:\Moved\source.zip"));
+        assert!(renamed.errors.is_empty(), "{:?}", renamed.errors);
+        assert!(renamed.store_mutations.book_composition_changed());
+        let moved_key = crate::path_key::normalize_keep_drive(Path::new(r"E:\Moved\source.zip"));
+        let rows = crate::book_composition::store::load_rows(&connection).unwrap();
+        assert!(!rows.contains_key(&old_key));
+        assert_eq!(rows[&moved_key], original[&old_key]);
+        assert_eq!(
+            rows[&format!("{moved_key}/chapter")],
+            original[&format!("{old_key}/chapter")]
+        );
+    }
+
+    #[test]
+    fn composition_page_delete_keeps_parent_and_book_delete_purges_family() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::book_composition::initialize_database_at(&dir.path().join("book_composition.db"))
+            .unwrap();
+        let connection = open(dir.path(), "book_composition.db");
+        let book = PathBuf::from(r"C:\Books\book.zip");
+        let key = crate::path_key::normalize_keep_drive(&book);
+        insert_composition_fixture(&connection, &key, "exact");
+        insert_composition_fixture(&connection, &format!("{key}/chapter"), "prefix");
+        insert_composition_fixture(&connection, &format!("{key}2"), "exact");
+        let before = crate::book_composition::store::load_rows(&connection).unwrap();
+        let page =
+            purge_removed_paths_at(dir.path(), &[PathBuf::from(format!("{key}::001.jpg"))], &[]);
+        assert!(page.errors.is_empty(), "{:?}", page.errors);
+        assert!(!page.store_mutations.book_composition_changed());
+        assert_eq!(
+            crate::book_composition::store::load_rows(&connection).unwrap(),
+            before
+        );
+        let purged = purge_removed_paths_at(dir.path(), &[book], &[]);
+        assert!(purged.errors.is_empty(), "{:?}", purged.errors);
+        assert_eq!(purged.rows, 2);
+        assert!(purged.store_mutations.book_composition_changed());
+        let rows = crate::book_composition::store::load_rows(&connection).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows.contains_key(&format!("{key}2")));
+    }
+
+    #[test]
+    fn composition_corrupt_payload_blocks_rename_copy_and_purge_without_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::book_composition::initialize_database_at(&dir.path().join("book_composition.db"))
+            .unwrap();
+        let connection = open(dir.path(), "book_composition.db");
+        let old = Path::new(r"C:\Books\bad.pdf");
+        let key = crate::path_key::normalize_keep_drive(old);
+        insert_composition_fixture(&connection, &key, "exact");
+        connection
+            .execute(
+                "UPDATE book_compositions SET composition_json='not-json'",
+                [],
+            )
+            .unwrap();
+        let copied = copy_stores_at(
+            dir.path(),
+            &[StoreCopyPathMapping::exact(old, r"D:\Books\bad.pdf")],
+        );
+        assert!(!copied.errors.is_empty());
+        let renamed = run_at(dir.path(), old, Path::new(r"D:\Books\bad.pdf"));
+        assert!(!renamed.errors.is_empty());
+        let purged = purge_removed_paths_at(dir.path(), &[old.to_path_buf()], &[]);
+        assert!(!purged.errors.is_empty());
+        let raw: (String, String) = connection
+            .query_row(
+                "SELECT book_key,composition_json FROM book_compositions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(raw, (key, "not-json".into()));
     }
 }

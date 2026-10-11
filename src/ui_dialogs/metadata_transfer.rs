@@ -888,6 +888,12 @@ fn draw_dialog(
                     preview.spread_shift_replacements,
                     preview.spread_shift_removals,
                 ));
+                ui.label(format!(
+                    "本の構成: 追加 {} / 置換 {} / 解除 {}",
+                    preview.composition_additions,
+                    preview.composition_replacements,
+                    preview.composition_removals,
+                ));
                 if preview.missing_entries > 0 {
                     ui.label(format!(
                         "見つからないためスキップ: {} 件",
@@ -914,6 +920,7 @@ fn draw_dialog(
                 ui.small(
                     "評価・タグ・ブックマーク・見開き・表示トリム・回転・ページ編集・代表サムネを含みます。",
                 );
+                ui.small("構成なしと記録された本では、取り込み先の構成を解除します。");
                 ui.small("このメタ情報に記載がない項目の既存メタ情報は保持します。");
                 ui.small("見開きの調整は搬送範囲を上書きし、範囲内の未記載の本・章は解除します。旧形式で調整の記載がない場合は保持します。");
                 ui.add_space(10.0);
@@ -1066,7 +1073,7 @@ fn draw_result(ui: &mut egui::Ui, result: &ResultState, recursive: bool) {
                 "このフォルダ直下のみ"
             };
             ui.label(format!(
-                "{} 項目（走査範囲: {scope}） / 評価 {} / タグ付き {} / 時刻ブックマーク {} / 本ブックマーク {} / ページ設定 {} / 本・フォルダ設定 {} / 見開き調整 {} / サムネピン {}",
+                "{} 項目（走査範囲: {scope}） / 評価 {} / タグ付き {} / 時刻ブックマーク {} / 本ブックマーク {} / ページ設定 {} / 本・フォルダ設定 {} / 見開き調整 {} / 本の構成 {} / サムネピン {}",
                 summary.entries,
                 summary.ratings,
                 summary.tagged_items,
@@ -1075,6 +1082,7 @@ fn draw_result(ui: &mut egui::Ui, result: &ResultState, recursive: bool) {
                 summary.page_states,
                 summary.container_states,
                 summary.spread_shifts,
+                summary.compositions,
                 summary.thumbnail_pins,
             ));
             if summary.skipped_reparse_directories > 0 {
@@ -1121,6 +1129,12 @@ fn draw_result(ui: &mut egui::Ui, result: &ResultState, recursive: bool) {
                 summary.committed.spread_shift_replacements,
                 summary.committed.spread_shift_removals,
             ));
+            ui.label(format!(
+                "本の構成: 追加 {} / 置換 {} / 解除 {}",
+                summary.committed.composition_additions,
+                summary.committed.composition_replacements,
+                summary.committed.composition_removals,
+            ));
             if summary.skipped_kind_mismatch > 0 {
                 ui.colored_label(
                     ui.visuals().warn_fg_color,
@@ -1166,7 +1180,9 @@ fn start_preview_worker(state: &mut MetadataTransferState) {
         .spawn(move || {
             let mut progress_relay = ProgressRelay::new(tx.clone());
             let lease = crate::spread_shift::maintenance_at(&data_dir);
+            let composition_lease = crate::book_composition::maintenance_at(&data_dir);
             let result = lease.as_ref().map_err(Clone::clone).and_then(|_| {
+                composition_lease.as_ref().map_err(Clone::clone)?;
                 crate::metadata_transfer::inspect_import_with_data_at(
                     &data_dir,
                     &root,
@@ -1177,6 +1193,7 @@ fn start_preview_worker(state: &mut MetadataTransferState) {
                 )
                 .map_err(|error| error.to_string())
             });
+            drop(composition_lease);
             drop(lease);
             let _ = tx.send(WorkerMessage::Preview(result));
         });
@@ -1206,9 +1223,11 @@ fn start_export_worker(
         .spawn(move || {
             let mut progress_relay = ProgressRelay::new(tx.clone());
             let lease = crate::spread_shift::maintenance_at(&data_dir);
+            let composition_lease = crate::book_composition::maintenance_at(&data_dir);
             let preparation = lease
                 .as_ref()
                 .map_err(Clone::clone)
+                .and_then(|_| composition_lease.as_ref().map(|_| ()).map_err(Clone::clone))
                 .and_then(|_| flush_view_trim_batch(&data_dir, view_trim_batch.as_ref(), "export"));
             let view_trim_saved = preparation.is_ok();
             let result = preparation.and_then(|()| {
@@ -1223,6 +1242,7 @@ fn start_export_worker(
                 )
                 .map_err(|error| error.to_string())
             });
+            drop(composition_lease);
             drop(lease);
             let _ = tx.send(WorkerMessage::Export {
                 result,
@@ -1289,9 +1309,11 @@ fn start_import_worker_with_progress(
             let mut progress_relay = ProgressRelay::new(tx.clone());
             let preparation_started = std::time::Instant::now();
             let lease = crate::spread_shift::maintenance_at(&data_dir);
+            let composition_lease = crate::book_composition::maintenance_at(&data_dir);
             let view_trim_result = lease
                 .as_ref()
                 .map_err(Clone::clone)
+                .and_then(|_| composition_lease.as_ref().map(|_| ()).map_err(Clone::clone))
                 .and_then(|_| flush_view_trim_batch(&data_dir, view_trim_batch.as_ref(), "import"));
             let view_trim_saved = view_trim_result.is_ok();
             let flush_result = view_trim_result.and_then(|()| flush_import_sidecars(&resources));
@@ -1340,7 +1362,11 @@ fn start_import_worker_with_progress(
                 );
             }
             if let (Some(observer), Ok(summary)) = (&observer, &result) {
-                for root in &summary.committed.spread_shift_observation_roots {
+                for root in summary
+                    .committed
+                    .spread_shift_observation_roots
+                    .union(&summary.committed.composition_observation_roots)
+                {
                     observer.record_for_path(
                         root,
                         crate::content_identity::ContentIdentityTrigger::Edit,
@@ -1353,6 +1379,7 @@ fn start_import_worker_with_progress(
             // and validation errors precede writes. Lease release reloads the
             // actual committed rows, stamps only their changed scopes, and uses
             // the owner's global fallback only if that snapshot is unreadable.
+            drop(composition_lease);
             drop(lease);
             let _ = tx.send(WorkerMessage::Import {
                 result,
@@ -1521,7 +1548,7 @@ mod tests {
     use egui_kittest::kittest::Queryable;
 
     #[test]
-    fn import_shift_confirmation_keeps_counts_and_actions_reachable() {
+    fn import_shift_and_composition_confirmation_keeps_counts_and_actions_reachable() {
         let state = std::rc::Rc::new(std::cell::RefCell::new(MetadataTransferState::import(
             PathBuf::from("C:/Pictures"),
         )));
@@ -1534,6 +1561,9 @@ mod tests {
             spread_shift_additions: 2,
             spread_shift_replacements: 3,
             spread_shift_removals: 4,
+            composition_additions: 5,
+            composition_replacements: 6,
+            composition_removals: 7,
             ..ImportPreview::default()
         });
         let render_state = std::rc::Rc::clone(&state);
@@ -1544,6 +1574,8 @@ mod tests {
             });
         harness.run();
         harness.get_by_label("見開きの調整: 追加 2 / 置換 3 / 解除 4");
+        harness.get_by_label("本の構成: 追加 5 / 置換 6 / 解除 7");
+        harness.get_by_label("構成なしと記録された本では、取り込み先の構成を解除します。");
         for label in ["インポート", "キャンセル"] {
             let rect = harness.get_by_label(label).rect();
             assert!(

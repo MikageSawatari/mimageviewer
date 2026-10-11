@@ -16,11 +16,20 @@ ExtractedResult。本を列挙し直して入った子階層はBook、通常のm
 抽出一覧は新規fullscreen openでSingle、全体の読む方向をsessionへsnapshotする。一時見開きは
 全結果順で隣接ページを組み、cover/shift/末尾補助/端配置/強制単独を使わず、spread keyを作らない。
 F12の表示中forkだけはcapture-time modeを保持できる。
-G2 part Aの`book_composition`はpure model/resolverだけを追加し、これらのproduction経路へは未接続。
+G2 part Aの`book_composition`はpure model/resolverを提供する。G2 part Bはその検証を共通storeへ接続する。
 PageRefは書庫の完全entry名、PDF/EPUBの物理0-based番号、画像folderの直下file名を区別し、
 bookmarkのcase/slash照合を共有する。EPUBのedit-key adapterは既存`edit_source::page_key_for_pdf`
 を使い、元EPUB+番号の同値をpure testで検査する。変換cache世代・内容reflowの対応表は作らない。
-store・ライフサイクル・転送の接続はG2 part B以降。
+G2 part Bの保存は`book_composition.db`一つ、共有`book_scope::BookScopeKey`のKeepDriveキー。
+Appは単一worker handleだけを持ち、SQLite/FS処理・maintenance待機はworkerで行う。
+保存成功時のEdit観測は捕捉済みlogical outer rootへ送る。閲覧/履歴なしのPDF/EPUB/ZIP/変換元書庫も内容ID復元へ参加し、Folder ledgerは増やさない。
+個別ページ削除では構成をpurgeせず、再解決時にMissingを保つ。本/root削除はfamilyをpurgeする。
+F12/固定snapshotはimmutableなaccepted recordを各context内へ運ぶ。RemoteのSessionHandleへ同じread serviceを登録し、構成write入口は作らない。
+一覧順・明示unit・hidden提示・Remote payloadの投影はG3。画像folder sidecarのwriter/schemaはG4Fまで変更しない。
+metadata v11の`composition_family { coverage, scopes }`はlogical folder/書庫/document entryが所有する。
+既存のcache DriveStripped spread/trim familyと別にsource KeepDrive構成を運ぶ。
+旧v7–v10/字段なしは保持、新版空はcoverage内だけ解除、非空はscope単位の置換。skip/coverage外は保持する。
+追加/置換/解除のpreviewは既存の確認一回へ載せ、実適用数はbatch/SAVEPOINT後のcommit結果から表示する。
 連結方式（flow）はA2のpairing初期化と分離し、各入口の従来の採用規則を維持する。タグ・お気に入り・評価・サブ展開・Smart新規rootは既存の保存flow（旧Vertical表現を含む）または従来の分類に対応するdefaults（通常はNON_BOOKのPaged）を採用し、GlobalSearch・Smart保存root復帰・Collection root・固定snapshotの直接列差し替えは既存flowを維持する。単ページ化・再openだけを理由にflowを変更せず、連結読みの操作を維持する。旧Vertical mode行はflow列に別値が残っていても従来どおり縦連結へ復元し、旧行は変更しない。
 元の本の列を保存する既存SnapshotStateは閲覧状態（mode/方向/flow/shift index/補助設定）も
 一緒に保持し、固定解除の同じadoption内で復元する。BSで固定列へ戻る場合はA2のまま。

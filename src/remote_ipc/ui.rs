@@ -903,6 +903,7 @@ impl crate::app::App {
         ));
         handle.install_archive_cache_db(self.archive_cache_db.clone());
         handle.install_spread_shift_service(self.spread_shift_service.clone());
+        handle.install_book_composition_service(self.book_composition_service.clone());
         #[cfg(windows)]
         self.effetune
             .set_remote_session_source(Some(handle.clone()));

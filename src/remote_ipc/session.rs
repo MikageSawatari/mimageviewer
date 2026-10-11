@@ -1231,6 +1231,7 @@ pub(crate) struct SessionHandle {
     page_jobs: Arc<Mutex<Weak<super::page_jobs::PageJobRegistry>>>,
     archive_cache_db: Arc<Mutex<Option<Arc<crate::archive_cache::ArchiveCacheDb>>>>,
     spread_shift_service: Arc<Mutex<Option<crate::spread_shift::SpreadShiftService>>>,
+    book_composition_service: Arc<Mutex<Option<crate::book_composition::BookCompositionService>>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1424,6 +1425,7 @@ impl SessionHandle {
             page_jobs: Arc::new(Mutex::new(Weak::new())),
             archive_cache_db: Arc::new(Mutex::new(None)),
             spread_shift_service: Arc::new(Mutex::new(None)),
+            book_composition_service: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1522,6 +1524,20 @@ impl SessionHandle {
 
     pub(crate) fn spread_shift_service(&self) -> Option<crate::spread_shift::SpreadShiftService> {
         self.spread_shift_service.lock().unwrap().clone()
+    }
+
+    /// Read-only registration for ContainerEngine workers. Remote exposes no composition write request.
+    pub(crate) fn install_book_composition_service(
+        &self,
+        service: Option<crate::book_composition::BookCompositionService>,
+    ) {
+        *self.book_composition_service.lock().unwrap() = service;
+    }
+
+    pub(crate) fn book_composition_service(
+        &self,
+    ) -> Option<crate::book_composition::BookCompositionService> {
+        self.book_composition_service.lock().unwrap().clone()
     }
 
     fn has_nonterminal_long_jobs(&self) -> bool {

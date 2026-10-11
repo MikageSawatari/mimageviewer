@@ -816,3 +816,11 @@ core check / settings_restore / ui_snapshot / glyph の成功を再利用した�
 `fullscreen_specified_scale`の各軸はenabledとvalue（単位・数値）を必須とし、OFF中も検証・転送する。
 未リリースOption形を破壊的に改訂しmigrationなし。favorite外側の欠落は継承のまま保持する。
 §1.365・§1.364結合後の現行分類は457 / 144 / 313、互換項目をまとめたwireは142。共通値転送と専用値保持の回帰を追加する。
+
+### §1.242 G2 part B結合時の再確認（2026-10-11）
+
+本の構成はmetadata転送v11の独立familyで運び、preferences専用のsettings転送には追加しない。
+`cargo test -p mimageviewer --lib settings_transfer -j1`は24件成功（exit 0）。
+実際の分類gateは全457 / 対象144 / 除外313、wireキー142のassertionを通過した。
+過去の15件という検証記録はその時点の証拠として残す。
+ログは`target/G-1242-g2b-settings_transfer-final.log`、全gateの結果は`target/G-1242-g2b-msg.txt`。

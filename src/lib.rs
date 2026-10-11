@@ -1727,6 +1727,10 @@ pub fn run() -> eframe::Result {
         None::<spread_shift::SpreadShiftProcessOwner>,
     ));
     let creator_spread_shift_owner = Arc::clone(&spread_shift_owner);
+    let book_composition_owner = Arc::new(std::sync::Mutex::new(
+        None::<book_composition::BookCompositionProcessOwner>,
+    ));
+    let creator_book_composition_owner = Arc::clone(&book_composition_owner);
     let run_result = eframe::run_native(
         "mimageviewer",
         options,
@@ -1809,6 +1813,23 @@ pub fn run() -> eframe::Result {
                     logger::log(format!("spread_shift: worker startup failed: {error}"));
                     app.show_feedback_toast(format!(
                         "見開き調整の保存を開始できませんでした: {error}"
+                    ));
+                }
+            }
+            match book_composition::BookCompositionService::spawn_at(
+                data_dir::get(),
+                app.content_identity_recorder
+                    .as_ref()
+                    .map(|recorder| recorder.producer()),
+            ) {
+                Ok((service, owner)) => {
+                    *creator_book_composition_owner.lock().unwrap() = Some(owner);
+                    app.install_book_composition_runtime(service);
+                }
+                Err(error) => {
+                    logger::log(format!("book_composition: worker startup failed: {error}"));
+                    app.show_feedback_toast(format!(
+                        "本の構成の保存を開始できませんでした: {error}"
                     ));
                 }
             }
@@ -1941,6 +1962,9 @@ pub fn run() -> eframe::Result {
     }
     if let Ok(runtime) = collection_runtime {
         runtime.shutdown_and_join();
+    }
+    if let Some(owner) = book_composition_owner.lock().unwrap().take() {
+        owner.shutdown_and_join();
     }
     if let Some(owner) = spread_shift_owner.lock().unwrap().take() {
         for result in owner.shutdown_and_join() {

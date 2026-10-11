@@ -1378,6 +1378,35 @@ G2A REVISEの境界修正・fixture・G1入力テストの共有native frame所�
 再検証結果は`target/G-1242-g2a2-msg.txt`へ記録する。最初のfull-lib失敗はstartup restoreと
 G1 extracted key handlerであり、video EOF/saved-group modalの失敗として扱わない。
 
+**2026-10-11 G2 part B実装記録（未commit／独立検収前）**:
+
+- `book_scope::BookScopeKey`を共用し、新DB一つ・schema 1の提案四列を使用する。JSONは`{ domain, composition }`。
+  empty構成にも種類/実効prefixの検証を持たせ、root/cache pathはpayloadへ入れない。revisionは受入先writerが実変更時だけ進める。
+  書庫domainのprefixは同じ`book_scope::normalize_level_prefix`で比較用に正規化する。
+  大文字/区切り表記だけが違うPrepare/Saveは同じscopeで、実memberのraw spellingは保存・読取とも保持する。
+  有効なraw表記の保存行も無書込で読め、同値Saveでrevision/token/通知を進めない。
+- `BookCompositionService`のPrepare/Save/Remove/root rename/purge/page移行は単一FIFO worker。
+  `Arc<CompositionSnapshot>`とscope別`(service_epoch, publication_sequence)`、実変更keyだけの通知を公開する。
+  service再起動・解除再作成もtokenを区別し、read/noop/open/closeではDB writeやscope通知を出さない。
+- 既存maintenanceはEPUB→shift→compositionの順でquiesceする。UIはjoin/DB/FS/maintenance待ちを行わない。
+  long-running import等は既存modalを使用し、新しい割込みrollback機構を作らない。
+  まれな失敗はログ＋通知。保存transaction失敗は旧record保持、読めないstoreは保持・書込停止、commit後reload失敗はDBを保持して通知する。
+  editor draft/今回だけ無視/実投影の失効はG3/G4のownerへ接続する境界であり、G2にeditorを作らない。
+- `STORES`へKeepDrive/unique/logical family登録。generic root/prefix rename/copy/probe/purge/cleanup、内容IDcopy、
+  個別page相対ref移行、明示settings完全resetへ接続する。resetは既存一回の確認へ構成解除の説明を追加し、
+  workerで検証済み構成DBの退避snapshotを作ってから解除する。未知storeはsettingsを含め変更前に拒否する。
+- 成功Saveは要求時に捕捉したlogical outer rootへEdit観測。兄弟mount/current_folderに依存しない。
+  PDF/EPUB/ZIP/変換元書庫の構成だけの保存でも観測し、Folderは除外する。importはcommit済み捕捉rootの集合を同じobserverへ渡す。
+- metadata出力は統合時v10→v11。composition専用familyをsource KeepDriveのlogical entryへ置き、cache由来の従来spread/trim originを変更しない。
+  v7–v10/section不在は保持、v11の空はcoverage内解除、非空はlocal revisionで置換。coverage外/skipは保持。
+  previewの追加/置換/解除と注意文は既存ImportConfirm一回へ追加。cancel/項目失敗は従来batch/SAVEPOINT規則を維持する。
+- runtime readのaccepted recordはviewer bundle/mount/fork/park/snapshotへ所属させ、Remote SessionHandleへ同じserviceを登録する。
+  Bookだけ新recordを読む。A2はlookup/write/refreshしない。retained snapshotは復帰時に新tokenを照合する。
+  G2はstorage adoptionまでで、G3の構成順rows/builder/hidden admission/Remote wire payloadを実装済みとはしない。
+- §7.4の画像folder sidecarはG4F限定。G2では既存sidecarのversion/items/writer/receiptを変更しない。
+  storeは現在のdata-dirへ固定し、次の起動で指定data-dirから開く。保存先一式を運ぶ際は新DBも同じ場所に含める。
+- command/count/exit/logと実際のfull-lib失敗は`target/G-1242-g2b-msg.txt`。settings transferはpreferences専用で構成を含めず、実テスト件数を同handoffと関連docへ記録する。
+
 受入:
 
 - Pair/Single/Blank companion/補助/hidden round-trip、unsafe/重複/未知schema/上限拒否、transaction rollback。

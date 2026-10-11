@@ -507,6 +507,7 @@ impl super::App {
         self.reading_direction = self.settings.default_reading_direction;
         // Detach the preceding book's session without issuing a durable Clear.
         self.spread_shift = Default::default();
+        self.book_composition = Default::default();
     }
 }
 

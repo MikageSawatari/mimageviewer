@@ -956,6 +956,19 @@ pub(crate) struct ContentIdentityRecorder {
 }
 
 impl ContentIdentityRecorder {
+    #[cfg(test)]
+    pub(crate) fn spawn_at_for_test(db_path: PathBuf) -> Option<Self> {
+        Self::spawn_at(db_path)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recv_update_for_test(
+        &self,
+        timeout: Duration,
+    ) -> Result<LedgerEntry, mpsc::RecvTimeoutError> {
+        self.update_rx.recv_timeout(timeout)
+    }
+
     pub(crate) fn spawn() -> Option<Self> {
         Self::spawn_at(crate::data_dir::get().join("content_identity.db"))
     }
@@ -2516,6 +2529,192 @@ mod tests {
             serde_json::from_str::<crate::spread_shift::SpreadShiftPageRef>(&restored).unwrap(),
             reference
         );
+    }
+
+    #[test]
+    fn composition_only_save_external_move_detection_and_copy_preserve_scope_refs() {
+        use crate::book_composition::{
+            BookComposition, BookCompositionService, CompositionPageRef, CompositionUnit,
+            PageDomain, ReadingDirection, SingleCompanion, SinglePlacement,
+        };
+        use crate::book_scope::BookScopeKey;
+        use std::time::Duration;
+
+        let _serial = lock_record_sequence();
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let books = temp.path().join("books");
+        std::fs::create_dir_all(&books).unwrap();
+        let ledger_path = data_dir.join("content_identity.db");
+        let recorder = ContentIdentityRecorder::spawn_at(ledger_path.clone()).unwrap();
+        let (service, owner) =
+            BookCompositionService::spawn_at(data_dir.clone(), Some(recorder.producer())).unwrap();
+        let cancel = AtomicBool::new(false);
+        let io = crate::io_semaphore::GlobalIoSemaphore::new(1);
+
+        // No opening/viewing/history observation precedes these composition saves.
+        // Each source has distinct bytes; only its own full hash can match after moving.
+        for (index, extension) in ["pdf", "epub", "zip", "rar"].into_iter().enumerate() {
+            let source = books.join(format!("original.{extension}"));
+            let moved = books.join(format!("moved.{extension}"));
+            let bytes = format!(
+                "{extension} unviewed composition-only external move fixture {}",
+                "x".repeat(index * 13)
+            );
+            std::fs::write(&source, bytes.as_bytes()).unwrap();
+            let (scope, moved_scope, domain, mut composition) =
+                if matches!(extension, "zip" | "rar") {
+                    let prefix = "Wrapper/Chapter.zip";
+                    let cover = CompositionPageRef::ArchiveEntry {
+                        entry_name: format!("{prefix}/Cover.JPG"),
+                    };
+                    let page = CompositionPageRef::ArchiveEntry {
+                        entry_name: format!("{prefix}/Page.JPG"),
+                    };
+                    let mut composition = BookComposition::new(
+                        ReadingDirection::Rtl,
+                        vec![
+                            CompositionUnit::Single {
+                                page: cover.clone(),
+                                placement: SinglePlacement::Center,
+                                companion: SingleCompanion::Vacant,
+                            },
+                            CompositionUnit::Single {
+                                page: page.clone(),
+                                placement: SinglePlacement::Trailing,
+                                companion: SingleCompanion::FrontCoverSupplement {
+                                    page: cover.clone(),
+                                },
+                            },
+                        ],
+                    );
+                    composition.cover = Some(cover);
+                    composition.hidden_pages = vec![page];
+                    (
+                        BookScopeKey::new(&source, prefix).unwrap(),
+                        BookScopeKey::new(&moved, prefix).unwrap(),
+                        PageDomain::ArchiveLevel {
+                            prefix: prefix.into(),
+                        },
+                        composition,
+                    )
+                } else {
+                    let composition =
+                        crate::book_composition::fixtures::editor_unit_edits(ReadingDirection::Rtl)
+                            .with_cover_helper;
+                    (
+                        BookScopeKey::document(&source).unwrap(),
+                        BookScopeKey::document(&moved).unwrap(),
+                        PageDomain::Document,
+                        composition,
+                    )
+                };
+            if domain == PageDomain::Document {
+                composition.hidden_pages = vec![CompositionPageRef::PdfPage { page_num: 1 }];
+            }
+            let saved = service
+                .save(scope.clone(), domain.clone(), composition)
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            assert!(saved.changed);
+            assert!(saved.status.is_ok(), "{:?}", saved.status);
+            // ACK from the real recorder proves the captured outer logical root
+            // reached a restorable Edit ledger before its filesystem name changes.
+            let observed = recorder
+                .update_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            assert_eq!(
+                observed.file_key,
+                crate::path_key::normalize_keep_drive(&source)
+            );
+            assert!(observed.last_edit_at > 0 && observed.has_restorable_content);
+            let original = service.snapshot().rows[&scope.storage_key()]
+                .as_ref()
+                .clone();
+            std::fs::rename(&source, &moved).unwrap();
+
+            let db = ContentIdentityDb::open_at(&ledger_path).unwrap();
+            let ledger_index = db.load_index(&cancel).unwrap().unwrap();
+            let target = stage0_target(
+                &ledger_index,
+                ContentIdentitySource::from_path(&moved).unwrap(),
+                bytes.len() as u64,
+            )
+            .unwrap();
+            drop(db);
+            let detected = run_detection_at(
+                &ledger_path,
+                vec![target],
+                index as u64 + 1,
+                crate::path_key::normalize_keep_drive(&books),
+                &cancel,
+                &io,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(detected.candidates.len(), 1, "{extension}");
+            let candidate = &detected.candidates[0];
+            assert_eq!(candidate.target_path, moved);
+            assert_eq!(candidate.sources.len(), 1);
+            assert_eq!(
+                candidate.sources[0].file_key,
+                scope.logical_root.to_string_lossy()
+            );
+            assert!(!candidate.sources[0].source_exists);
+            assert!(candidate.sources[0].last_edit_at > 0);
+
+            // Use the production generic copy and its shared maintenance lease,
+            // then read through the actor's refreshed snapshot. Nested scopes
+            // remain nested; relative member refs/page numbers never become cache paths.
+            let copied = crate::rename_key_migration::copy_stores_at(
+                &data_dir,
+                &[crate::rename_key_migration::StoreCopyPathMapping::exact(
+                    &source, &moved,
+                )],
+            );
+            assert!(copied.errors.is_empty(), "{:?}", copied.errors);
+            let restored = service
+                .prepare(moved_scope.clone(), domain)
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .status
+                .unwrap()
+                .unwrap();
+            assert_eq!(restored, original, "{extension}");
+            assert_eq!(
+                service.snapshot().rows[&scope.storage_key()].as_ref(),
+                &original
+            );
+            assert!(
+                service
+                    .drain_changed_scope_keys()
+                    .contains(&moved_scope.storage_key())
+            );
+        }
+
+        // Even an image-folder name ending in .zip is outside the container ledger.
+        let folder = books.join("folder.zip");
+        std::fs::create_dir(&folder).unwrap();
+        let saved = service
+            .save(
+                BookScopeKey::folder(&folder).unwrap(),
+                PageDomain::ImageFolder,
+                BookComposition::new(ReadingDirection::Ltr, Vec::new()),
+            )
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        assert!(saved.changed && saved.status.is_ok());
+        owner.shutdown_and_join();
+        assert!(recorder.update_rx.try_recv().is_err());
+        let db = ContentIdentityDb::open_at(&ledger_path).unwrap();
+        assert!(
+            db.ledger_entry(&crate::path_key::normalize_keep_drive(&folder))
+                .unwrap()
+                .is_none()
+        );
+        assert!(!data_dir.join("history.db").exists());
+        assert!(!data_dir.join("resume.db").exists());
     }
 
     #[test]

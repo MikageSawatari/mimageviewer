@@ -566,6 +566,7 @@ use presentation_transition::{
 };
 #[cfg(all(windows, test))]
 use presentation_transition::{PreparingProgress, PresentationTransitionState};
+pub(crate) mod book_composition_runtime;
 pub(crate) mod normalize;
 pub(crate) mod page_edit_snapshot;
 mod prefetch_policy;
@@ -15309,6 +15310,7 @@ pub struct App {
     pub(crate) content_identity_recorder: Option<crate::content_identity::ContentIdentityRecorder>,
     pub(crate) spread_shift_settings_generation: u64,
     pub(crate) spread_shift_service: Option<crate::spread_shift::SpreadShiftService>,
+    pub(crate) book_composition_service: Option<crate::book_composition::BookCompositionService>,
     spread_shift_process_owner:
         Option<Arc<std::sync::Mutex<Option<crate::spread_shift::SpreadShiftProcessOwner>>>>,
     pub(crate) content_identity_index_load_pending:
@@ -16566,6 +16568,7 @@ pub struct App {
     /// この viewer の見開き調整と、保存・復元に対する受付済み依存。
     /// 描画用 index は identity/nav 投影から取得し、durable rows は共有 service が所有する。
     pub(crate) spread_shift: ViewerSpreadShift,
+    pub(crate) book_composition: book_composition_runtime::ViewerBookComposition,
     /// 現在の連結方式（ページ単位 / 縦連結 / 横連結）。
     pub(crate) reading_flow: crate::settings::ReadingFlow,
     /// 横連結時の読書方向。
@@ -18593,6 +18596,9 @@ impl App {
     }
 
     fn transfer_spread_shift_exit_ownership(&mut self) {
+        if let Some(service) = &self.book_composition_service {
+            service.close_admission();
+        }
         if let Some(service) = &self.spread_shift_service {
             service.close_admission();
         }
@@ -19550,6 +19556,7 @@ impl App {
             content_identity_recorder,
             spread_shift_settings_generation: 0,
             spread_shift_service: None,
+            book_composition_service: None,
             spread_shift_process_owner: None,
             content_identity_index_load_pending,
             content_identity_index: crate::content_identity::ContentIdentityIndex::default(),
@@ -20023,6 +20030,7 @@ impl App {
                 crate::settings::SingletonSpreadEndpointPreferences::default(),
             page_alone_preferences: crate::settings::PageAlonePreferences::default(),
             spread_shift: Default::default(),
+            book_composition: Default::default(),
             reading_flow: crate::settings::ReadingFlow::default(),
             reading_direction: crate::settings::ReadingDirection::default(),
             spread_popup_open: false,
@@ -49391,6 +49399,26 @@ impl App {
                 ));
             }
         }
+        if let Some(service) = &self.book_composition_service {
+            let admission = if let Some((source, target)) = collection_tree_migration {
+                service.rename_book_root(source, target)
+            } else {
+                service.migrate_page_paths(
+                    mappings
+                        .iter()
+                        .map(|mapping| (mapping.from.clone(), mapping.to.clone()))
+                        .collect(),
+                )
+            };
+            if let Err(error) = admission {
+                crate::logger::log(format!(
+                    "book_composition: page mapping admission failed: {error}"
+                ));
+                self.show_feedback_toast(format!(
+                    "本の構成のページ移動を反映できませんでした: {error}"
+                ));
+            }
+        }
         // Book-root rename preserves the released stale-view behavior. Its saved
         // rows move in the service FIFO above; accepted context scopes stay old.
         if collection_tree_migration.is_none() {
@@ -49839,6 +49867,16 @@ impl App {
                     ));
                     self.show_feedback_toast(format!(
                         "削除した本の見開き調整を消去できませんでした: {error}"
+                    ));
+                }
+                if let Some(service) = &self.book_composition_service
+                    && let Err(error) = service.purge_book_root(&path)
+                {
+                    crate::logger::log(format!(
+                        "book_composition: book purge admission failed: {error}"
+                    ));
+                    self.show_feedback_toast(format!(
+                        "削除した本の構成を消去できませんでした: {error}"
                     ));
                 }
                 if self.settings.active_book_name == name {
@@ -92212,6 +92250,7 @@ impl App {
         self.show_cache_manager_dialog(ctx);
         self.show_metadata_cleanup_dialog(ctx);
         self.poll_spread_shift_service();
+        self.poll_book_composition_service();
         self.show_metadata_transfer_dialog(ctx);
         self.show_sidecar_restore_dialog(ctx);
         self.show_archive_cache_manager_dialog(ctx);
@@ -97601,3 +97640,6 @@ mod specified_scale_contract_tests {
         assert_eq!(app.pdf_specified_basis_for_idx(0), previous_basis);
     }
 }
+
+#[cfg(test)]
+mod book_composition_runtime_tests;

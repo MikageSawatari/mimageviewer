@@ -4634,3 +4634,12 @@ A2の新規openはSingle、表示中forkはcapture-time modeを保持する。�
 2026-10-10 coordinator採択のA2帰還契約: 元の本の閲覧状態も既存snapshotに列と一緒に保存し、
 固定解除の同じadoption内で戻す。F12 forkのsnapshotはこの退避値を運び、fork内の解除はmainや
 兄弟の閲覧状態/列/workerを変更しない。DirectMediaの通常帰還は従来どおり。
+
+### §11 追補: §1.242 G2B immutable構成readのcontext所有（2026-10-11、実装記録）
+
+採択済みbook plan §7/§10の登録接点として、ViewerContextBundleへaccepted構成recordとscope/tokenを登録した。
+new/default/destructure/swap/mount/fork/park/drop、元一覧のSnapshotViewingStateで同じownerを運ぶ。
+forkはaccepted Arcを共有し、Prepare receiverは共有しない。読取PrepareはContextAsyncOwnerへ登録し、
+parkの終端とretained contextでの完了を既存routerへ通す。実変更scopeだけ再照合し、無関係な本のitems/cache/recordを失効させない。
+これは保存read payloadの構造的な所有拡張であり、detached述語/viewport/geometry/placementへの症状patchではない。
+G3の表示投影とeditorは未接続。独立レビュー・利用者実機観測の結果は主張しない。

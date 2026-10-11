@@ -6,7 +6,8 @@
 source enumeration、policy、raw manifest、cache/lease、既存PreparedPageIdentityIndexとadoptionは
 従来のownerを保つ。ZIPは直下ページblockだけがsurface間で一致し、子containerの位置は従来どおり。
 G2 part Aの`book_composition`はApp/UI/I/Oを持たないpure model・resolver・unit編集を提供する。
-現在の列生成・表示には未接続で、永続storeは未導入。保存キー`BookScopeKey`はラインEの所有であり、
+G2 part Bは単一workerの`book_composition.db`、lifecycle、metadata v11転送とread登録を追加する。
+構成順・明示unit・hidden提示のproduction投影はG3。保存キー`BookScopeKey`はラインEの所有であり、
 このmodelはキーを定義せず、参照種類/直下階層の検証用`PageDomain`だけを受け取る。
 
 itemsの採用時に排他的な`ProjectionRecipe`を確定する。抽出結果かどうかを現在のanchorや
@@ -461,6 +462,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `comic_user_stamps.db` | Ctrl+T スタンプピッカーのユーザー画像履歴。配置時の長辺 1024px 上限 PNG を再利用用 MRU として保持する。履歴から選んでも配置先には `Embedded` をコピーするため、履歴削除は既存注釈に影響しない | `comic_user_stamps.rs` + `ui_text.rs` |
 | `spread.db` | フォルダ別表示モード (ページ構成、連結方式、綴じ方向、末尾表紙補助、見開き端の単ページ配置) | `spread_db.rs` |
 | `spread_shift.db`（§1.364 D1–D3、未リリース） | 論理本scopeごとの相対PageRef。KeepDriveのroot＋実効ZIP prefix、一冊一行。schema v1。新規storeのためmigrationなし、不正schema/JSONは原本を保って書込停止。既存spread設定・resumeとは独立 | `book_scope.rs`、`spread_shift/{model,service,store}.rs`、`app/spread_shift_owner.rs` |
+| `book_composition.db`（§1.242 G2、未リリース） | `book_compositions(book_key PRIMARY KEY, revision, schema_version, composition_json)`、schema 1。一行のJSONに検証domainと構成を持つ。KeepDrive共有BookScopeKey、local revision、単一writer・immutable snapshot・worker-only maintenance。新storeのmigrationなし。未知/破損は原本保持・書込停止。STORESのrename/purge/copy/probe/cleanup、内容ID Edit観測、明示metadata v11専用family、確認済み完全resetへ登録。Folder sidecarはG4F | `book_composition/{store,service}.rs` |
 | `book_resume.db` | コンテナpathとraw items indexで位置を復元。記録時のHUD読み順ordinal/totalをnullable列に保存し、通常Folder/ZIP/PDF一覧の下端メーターに常に左から右へ表示。旧2列DBへのALTERと一覧全行読込は既存writerで実行。App共通メモリmapを記録受付時にも更新し、描画はmap参照のみ。動画/音声の同じ帯は既存video_resume_positionsと取得済みvideo_metaを読み、別の位置map/DB列は作らない。Remoteは補助列NULL (IPC不変) | `book_resume_db.rs`, `app/book_resume_meter.rs`, [設計・割り切り](book-resume-meter-plan.md) |
 | `reading_history.db` | ユーザー操作で開いた画像フォルダ / ZIP / PDF / 変換アーカイブと動画・音声ファイルの MRU。既存 kind 文字列を維持し、`video` / `audio` と専用の `media_position_ms` / `media_duration_ms` を追加する。未知 kind は行ごと読み飛ばす。保持件数は 1..=1000 | `reading_history_db.rs` + `App::record_reading_history` |
 | `folder_thumb_pins.db` | 親コンテナ (Folder/ZipFile/PdfFile/ConvertibleArchive) の代表サムネ手動ピン。container_key 主キー (= normalize_keep_drive 済みパス) で 1 行 1 コンテナ、source は kind + container 相対 rel + (zipentry の) entry / (pdfpage の) page。`apply_folder_thumb_pin` と変換アーカイブの `archivethumb:*#pin:*` が cache key suffix `#pin:{source_id}` で identity を表現し、cascade 時は途中コンテナを含む経路 hash を source_id に加える | `folder_thumb_pins.rs` |
