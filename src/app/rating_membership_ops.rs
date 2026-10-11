@@ -354,13 +354,11 @@ impl App {
             .unwrap_or_default()
     }
 
-    /// §1.370 integration seam: replace the selected/anchor assignments with
-    /// move_grid_cursor(target), retaining this caller's scroll policy.
+    /// Apply the set owner's destination through §1.370's cursor owner,
+    /// retaining this caller's scroll policy.
     /// Destination ownership stays here; a Move always rebases Shift, even at the same raw index.
     fn apply_rating_membership_cursor(&mut self, target: Option<usize>) {
-        self.selected = target;
-        self.grid_click_selection_anchor =
-            target.map(|index| GridClickSelectionAnchor::new(index, self.items_generation));
+        self.move_grid_cursor(target);
         self.scroll_to_selected = target.is_some();
     }
 

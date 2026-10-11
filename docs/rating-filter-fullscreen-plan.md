@@ -195,7 +195,7 @@ Stage 2の候補所有ファイル: `app.rs` (save/publication/rebuild/open/clos
 ### Stage 2 の接続箇所
 
 - 集合の唯一決定は `src/app/rating_membership_ops.rs::adopt_rating_membership`。同 identity の再配置は selected/Shift起点をそれぞれ key で remap し、移動・Empty は `apply_rating_membership_cursor` へ渡す。
-- §1.370 の実装・最新追補handoff (`C:/home/mimageviewer-nexteffetune`、読取りのみ、HEAD `4330c9480` と未コミット追補) と照合した。統合時は同 helper の selected/Shift起点代入を既存 `move_grid_cursor(target)` 呼出しへ置き換え、続く `scroll_to_selected = target.is_some()` はこのcallerの既存方針として残す。近傍決定や二度目の補正を cursor owner に追加しない。
+- §1.370 の実装・最新追補handoff (`C:/home/mimageviewer-nexteffetune`、読取りのみ、HEAD `4330c9480` と未コミット追補) と照合した。master統合 `74651f494` 後、同 helper を既存 `move_grid_cursor(target)` 呼出しへ接続した。続く `scroll_to_selected = target.is_some()` はこのcallerの既存方針として残す。近傍決定や二度目の補正を cursor owner に追加せず、Keep/reindexではselectedとShift起点の独立したidentity remapを維持する。thumbnail/Detailsの評価移動・最後のページからの一覧復帰・実Ctrl+Z復帰後のShift+クリックをhandlerで検証する。
 - 明示filter採用は非表示だった entrant を含む同じ canonical/Details comparator の順で判断する。rating publication/picker終端は変更前の表示順を基準にし、旧 survivor が無いときだけ full basis で entrant の位置を求める。
 - Rating/Search の slot 交換はreaderの既存 snapshot exact identity transferに接続し、同identityの読書位置とselected/Shift起点のpaired remapを保つ。編集の扱いは下記の利用者決定へ限定し、loaded/global editorやidx-only Undoを新たに保持/remapしない。
 - Searchの同一覧採用は、items・page-edit投影の交換→readerのexact identity transfer完了→visible集合の再計算→集合ownerの一度だけの行先適用の順とする。新しい非表示containerが旧readerの数値slotへ入っても、その行をreaderとして非評価離脱判定しない。交換途中でvisible再計算を先行させず、Drilled/Detailsの新hit・sort・ring終端の固定順序テストで確認する。

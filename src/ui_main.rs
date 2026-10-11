@@ -26503,8 +26503,27 @@ mod grid_reclick_open_tests {
         harness
     }
 
+    fn ctrl_z_rating_origin(app: &mut AppTestEnvForTest) {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            modifiers: egui::Modifiers::CTRL,
+            events: vec![egui::Event::Key {
+                key: egui::Key::Z,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL,
+            }],
+            ..Default::default()
+        });
+        app.keyboard_owner_for_pass(&ctx);
+        app.handle_meta_undo_keys(&ctx);
+        let _ = ctx.end_pass();
+    }
+
     #[test]
-    fn shift_click_handler_uses_rating_next_previous_and_undo_landing_in_both_views() {
+    fn grid_cursor_rating_next_previous_and_ctrl_z_rebase_shift_click_in_both_views() {
+        let _input_guard = crate::key_input::lock_test_input();
         for view in [
             crate::settings::GridViewMode::Thumbnail,
             crate::settings::GridViewMode::Details,
@@ -26515,14 +26534,27 @@ mod grid_reclick_open_tests {
             app.scroll_to_selected = false;
             assert!(app.set_rating(1, 4));
             assert_eq!(app.fullscreen_idx, Some(2));
+            assert_eq!(app.selected, Some(2));
+            assert_eq!(
+                app.grid_click_selection_anchor,
+                Some(GridClickSelectionAnchor::new(2, app.items_generation))
+            );
             assert_eq!(app.checked, HashSet::from([0]));
             assert!(app.scroll_to_selected);
             click_cell(&mut harness, 0, egui::Modifiers::SHIFT);
             assert_eq!(harness.state().app.checked, HashSet::from([0, 2]));
             assert_eq!(harness.state().activations, 0);
 
-            harness.state_mut().app.apply_meta_undo();
+            ctrl_z_rating_origin(&mut harness.state_mut().app);
             assert_eq!(harness.state().app.fullscreen_idx, Some(1));
+            assert_eq!(harness.state().app.selected, Some(1));
+            assert_eq!(
+                harness.state().app.grid_click_selection_anchor,
+                Some(GridClickSelectionAnchor::new(
+                    1,
+                    harness.state().app.items_generation
+                ))
+            );
             harness.run_steps(40);
             click_cell(&mut harness, 0, egui::Modifiers::SHIFT);
             assert_eq!(harness.state().app.checked, HashSet::from([0, 1]));
@@ -26538,7 +26570,8 @@ mod grid_reclick_open_tests {
     }
 
     #[test]
-    fn shift_click_handler_uses_grid_container_return_and_rating_undo_origin_in_both_views() {
+    fn grid_cursor_rating_last_page_return_and_ctrl_z_rebase_shift_click_in_both_views() {
+        let _input_guard = crate::key_input::lock_test_input();
         for view in [
             crate::settings::GridViewMode::Thumbnail,
             crate::settings::GridViewMode::Details,
@@ -26557,11 +26590,16 @@ mod grid_reclick_open_tests {
             assert!(app.set_rating(0, 4));
             assert_eq!(app.fullscreen_idx, None);
             assert_eq!(app.selected, Some(1));
+            assert_eq!(
+                app.grid_click_selection_anchor,
+                Some(GridClickSelectionAnchor::new(1, app.items_generation))
+            );
+            assert!(app.scroll_to_selected);
             click_cell(&mut harness, 1, egui::Modifiers::SHIFT);
             assert_eq!(harness.state().app.checked, HashSet::from([1]));
             assert_eq!(harness.state().activations, 0);
 
-            harness.state_mut().app.apply_meta_undo();
+            ctrl_z_rating_origin(&mut harness.state_mut().app);
             assert_eq!(harness.state().app.fullscreen_idx, Some(0));
             harness.run_steps(40);
             click_cell(&mut harness, 1, egui::Modifiers::SHIFT);
@@ -26571,6 +26609,44 @@ mod grid_reclick_open_tests {
                 harness.state().app.settings.rating_filter,
                 [false, false, false, true, false, false]
             );
+        }
+    }
+
+    #[test]
+    fn grid_cursor_rating_grid_move_then_shift_click_uses_display_order_in_both_views() {
+        for view in [
+            crate::settings::GridViewMode::Thumbnail,
+            crate::settings::GridViewMode::Details,
+        ] {
+            let mut harness = rating_selection_harness(view);
+            let app = &mut harness.state_mut().app;
+            app.fullscreen_idx = None;
+            app.selected = Some(1);
+            let (target, click) = if view == crate::settings::GridViewMode::Details {
+                app.settings.details_sort_ascending = false;
+                app.details_order = vec![2, 1, 0];
+                (0, 2)
+            } else {
+                (2, 0)
+            };
+            app.grid_click_selection_anchor =
+                Some(GridClickSelectionAnchor::new(click, app.items_generation));
+            app.scroll_to_selected = false;
+            app.pending_grid_scroll = Some(GridScrollIntent::Bottom);
+            app.scroll_selected_to_rows_above = Some(3);
+            assert!(app.set_rating(1, 4));
+            assert_eq!(app.fullscreen_idx, None);
+            assert_eq!(app.selected, Some(target));
+            assert_eq!(
+                app.grid_click_selection_anchor,
+                Some(GridClickSelectionAnchor::new(target, app.items_generation))
+            );
+            assert!(app.scroll_to_selected);
+            assert_eq!(app.pending_grid_scroll, Some(GridScrollIntent::Bottom));
+            assert_eq!(app.scroll_selected_to_rows_above, Some(3));
+            click_cell(&mut harness, click, egui::Modifiers::SHIFT);
+            assert_eq!(harness.state().app.checked, HashSet::from([0, 2]));
+            assert_eq!(harness.state().activations, 0);
         }
     }
 

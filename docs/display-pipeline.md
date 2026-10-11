@@ -689,7 +689,8 @@ context の共有表示集合へ残す。全画面専用の例外ページ列は
 即時採用し、保留行を含む集合から可視件数と読書ページ数を毎回計算する。source 削除・非評価条件の離脱を
 復活させず、通常終端で保留だけを外して最終成功値から一度調停する。集合決定・非同期結果の採用前検証・
 Undo 復帰の取消は [評価変更と絞り込みの計画](rating-filter-fullscreen-plan.md) を参照。
-grid cursor の適用と Shift+クリック起点の paired remap は別件 §1.370 の owner に接続する。
+grid cursor の移動・解除は §1.370 の `App::move_grid_cursor` に適用し、scroll intent は集合採用callerが保持する。
+同identityの再配置は移動とせず、selectedとShift+クリック起点をそれぞれpaired remapする。
 Searchの同一覧items交換では、readerのexact identity transferを完了してからvisible集合を再計算し、
 集合ownerが行先を一度適用する。交換前のreader idxを交換後のslotへ解釈してpickerのsource離脱を判定しない。
 ページidentity/sidecar準備でopenを待つ場合は、既存の遅延open要求にrating/Manualのmetadata境界を保持し、
