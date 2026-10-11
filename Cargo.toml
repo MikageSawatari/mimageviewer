@@ -26,12 +26,14 @@ exclude = [
     "vendor/eframe",
     "vendor/egui",
     "vendor/egui-wgpu",
+    "vendor/tantivy",
 ]
 
 [patch.crates-io]
 eframe = { path = "vendor/eframe" }
 egui = { path = "vendor/egui" }
 egui-wgpu = { path = "vendor/egui-wgpu" }
+tantivy = { path = "vendor/tantivy" }
 ort = { path = "crates/ort-patched" }
 
 # 配布バイナリ (本体 = `mimageviewer-core.exe` + remote service +
@@ -412,6 +414,7 @@ unrar = { path = "crates/unrar-patched", version = "0.5.8" }
 # アーカイブ変換の入れ子展開で、内側アーカイブを一時ファイル化するのに使用
 # (unrar / sevenz / delharc はファイルパス前提のため)。dev-dependencies にも別掲あり。
 tempfile = "3"
+log = "0.4"
 turbojpeg = { version = "1", features = ["image"] }
 pdfium-render = { version = "0.8", features = ["thread_safe"] }
 windows-dpapi = "0.2"
@@ -473,6 +476,7 @@ regex = "1"
 mimalloc = { version = "0.1.52", default-features = false }
 
 [dev-dependencies]
+tantivy = { version = "0.26", default-features = false, features = ["mmap", "lz4-compression", "miv-test-hooks"] }
 tempfile = "3"
 eframe = { version = "0.33", features = ["miv-test-script-window-witness"] }
 # `examples/bench_pdf_count.rs` (PDFium vs lopdf 比較ベンチマーク) でのみ使用。

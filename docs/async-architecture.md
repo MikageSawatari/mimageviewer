@@ -430,9 +430,10 @@ session 取消で通知・未開始仕事を失効させ、最後の fetch / sav
 
 | EPUB のページ数メタ保存 | `epub-pdf-meta` | 列挙完了ごとに短命 1 本 | 非同期列挙が返した世代 stamp とページ数を親 catalog へ保存する。既存の warm catalog があれば共有し、cold open は worker が行う。旧世代の遅れた書込も stamp 不一致で再利用されない。通常 PDF の保存経路は従来どおり |
 | Ctrl+F メタデータフィルター | `std::thread` (`metadata-search`) + request 専用 `rayon::ThreadPool` | 外側 1 本 + Pass 2 最大 8 本 | Pass 1 の構造項目は逐次、画像 / 動画の on-demand メタ読みだけ 8 並列。前面検索なので `ActivityGate` は使わない。cancel 後は未開始 item を止め、開始済み item の結果までを部分結果として返す。XMP cache miss は正規化 path ごとの `OnceLock` で重複排除 |
-| メタ索引 supervisor (Ctrl+G 用) | `std::thread` (常駐) | お気に入りごとに 1 本 (`auto_index_metadata=true`) | 初期スキャン + notify-rs 監視 + ingest を統括。共有 `Arc<Mutex<IndexWriter>>` 経由で Tantivy writer を直列化 (Tantivy は Index あたり writer 1 本制約) |
-| メタ ingest worker | `std::thread` (supervisor 内部) | 速度プロファイルで 1 / 2 / 4 | メタ抽出 + Tantivy buffer + バッチ commit (100 件 or 5 秒) + commit 成功後に fts_meta upsert_meta_ok / delete_paths (Tantivy First) |
-| メタ walker | `std::thread` (supervisor 内部、1 回) | 1 | 起動時 3-way diff (FS vs fts_meta.db) |
+| メタ索引 supervisor (Ctrl+G 用) | `std::thread` (常駐) | 実効 ownership のお気に入りごとに 1 本 | 初期スキャン + notify-rs 監視 + supervisor 内の逐次 ingest/apply を統括。Tantivy writer は単一 `FtsWriterDispatcher` が所有し、commit/reload reply 成功後に SQLite を apply する。caller が reply を放棄しても永続化失敗は共有 reporter へ届く |
+| メタ ingest/apply | supervisor スレッド内の逐次処理 | 各 supervisor に 1。速度プロファイルは共有 I/O permit を調整 | メタ抽出 + dispatcher への batch (100 件 or 5 秒) + commit/reload 成功後に fts_meta upsert_meta_ok / delete_paths (Tantivy First)。独立した 1/2/4 ingest worker は作らない |
+| メタ構成/startup cleanup | `metadata_reconfiguration::Runtime` worker | manager に 1 | 固定構成の ownership cleanup/Failed reconciliation→supervisor spawn、構成変更の cancel/join/cleanup/spawn を所有。constructor/result送信/overlay解除は完了を待たない。起動 count 点検は常時実行し、cleanup 前の snapshot を使い、欠落疑いは log/通知/pending。UI は共有 maintenance view だけを読む |
+| メタ walker | supervisor スレッド内の逐次処理 | 各 Full ごとに 1 | FS ↔ fts_meta.db を追加・変更・削除へ分類。Tantivy の path 全集合は照合しない |
 | メタ FsWatcher | `std::thread` (notify-rs 内部) | お気に入りごとに 1 本 | `ReadDirectoryChangesW` + 500ms debounce → `DebouncedChange` 送信 |
 | 名前索引 supervisor (Ctrl+S 用) | `std::thread` (常駐) | 有効な正規化 root ごとに 1 本 (`auto_index_structure=true`) | manager が stop/join/clear/start を直列化し、完走印も同じ root の所有。印一致の起動は watcher 開始後の初回 Full だけ省く。手動 Full は owner mailbox で構成採用後・pause 再開後に実行 |
 | Ctrl+G クエリワーカー | `std::thread` (使い捨て) | 1 入力ごとに spawn | Tantivy ページング (Searcher snapshot 固定) + token matching (post-filter で Tantivy STORED 原文を引く) + streaming 送信 |
@@ -573,7 +574,7 @@ ZIP 自動/pin 代表を `process_load_request` の `RawThumbHandoff::DedicatedW
 | `SimilarIndexNotifier` | 既存 favorite supervisor → 別バージョン索引 scheduler | 同じ `FsWatcher` の追加・変更・削除通知を軽量な再照合要求へ変換する。進行中なら revision だけ進め、終了後の 1 回へ coalesce するため watcher を追加しない。coalesce された中間 pass では Complete 済みの検索 snapshot を保持し、最終 pass の全 in-flight 回収後だけ再読込する。検索用メモリ表は起動時 configure と索引 worker の DB open 時に専用 `similar-index-load` worker で先行ロードし、パネルは実行中に未ロードでも新たなロードを開始しない。`similar.compact` が DB store ID・内容世代・行数・hash/proxy version・SHA-256 と一致すれば順次読込し、不一致なら SQLite snapshot へ戻して sidecar を作り直す。更新中の右パネルは変更が完了後に反映されることを明示する |
 | `similar_index` bounded work queue | 別バージョン索引 coordinator → 16 scan worker | ルーズ画像 1 枚または本 1 冊を単位に、全体 16・ドライブ文字または UNC server/share ごと 8 まで実行する。操作中は既存 `ActivityGate` で 1 / 1 へ縮退し、cancel 時は未開始を捨てても in-flight 全件の終了を待ってから Cancelled を返す。本のページ処理と generation publish は 1 worker 内に閉じる |
 | `local_adjust_write_handle` の job / result | UI ↔ 補正レイヤー書き込みワーカー | job = `LocalAdjustWriteJob { key, generation, layers }` (`layers` は `Arc` 共有なので積んでも複製しない)。result = `LocalAdjustWriteCompletion`: `Settled { key, generation, layers, outcome }` / `Superseded { key, generation }`。**`layers` を結果にも載せる**のは、UI がミラーする文書を「worker が実際に書いたもの」に固定するため (メモリから取り直すと、積んでから完了までの間に入った編集を写す)。`Superseded` は成功でも失敗でもないので、ミラーもトーストも出さない |
-| `IndexerManager.writer` | 全書き込み経路で共有 | `Arc<FtsWriterDispatcher>` — Tantivy は Index あたり writer 1 本制約。専用ディスパッチャースレッドが優先度キュー (Interactive > Background) でジョブを直列処理する。 ingest worker (Background) と tag_write_worker (Interactive) は `WriterJob::Upsert` / `Delete` / `Commit` / `Batch` を `submit` するだけで、writer に直接触らない (§5.5)。 |
+| `IndexerManager.writer` | 全 FTS 書き込み経路で共有 | `Arc<FtsWriterDispatcher>` — Tantivy は Index あたり writer 1 本制約。専用ディスパッチャースレッドが優先度キュー (Interactive > Background) でジョブを直列処理する。ingest と purge/cleanup は dispatcher に job を `submit` し、writer に直接触らない (§5.5)。通常の tag_write_worker は tags.db のみを更新し、この writer を使わない。 |
 
 ### 2.3 ワーカーキュー
 
@@ -1062,17 +1063,19 @@ upload待ち画像があるEvicted / Loaded-upgradeを再投入する。両終�
 | walker / ingest (supervisor 内部) | supervisor cancel | 各ループ checkpoint で `Ordering::Relaxed` read。大ファイル走査中も数百 ms 以内に抜ける |
 | tag_write_worker | App drop | `None` 送信 + cancel フラグ。commit 後のループ先頭で check |
 
-**Tantivy writer 共有ルール**: `IndexerManager.writer: Arc<Mutex<IndexWriter>>` を
-ingest worker と tag_write_worker が共有する。独自に `fts.writer()` を呼ぶと
-`LockBusy` で **全 upsert が無効化される**。新しい書き込み経路を足すなら必ず
-共有 writer を使う。
+**Tantivy writer 共有ルール**: `IndexerManager.writer: Arc<FtsWriterDispatcher>` が
+唯一の `IndexWriter` を所有する。ingest と purge/cleanup は共有 dispatcher へ submit する。
+同じ Index に独自の writer を開くと `LockBusy` になるため、新しい FTS 書き込み経路も
+dispatcher を使う。通常の tag_write_worker は tags.db のみを更新し、FTS を書き換えない。
 
 #### Indexer shutdown の有界化 (v2.3.0 第12弾)
 
 walker の Full 観測は `ObservationCompleteness` で Complete / Incomplete を返す。
 列挙・属性取得の失敗や深さ制限を `ScanDiag` から集約し、Incomplete では削除候補を
-生成せず、観測できた新規・変更候補だけを既存 ingest 経路へ渡す。取消は既存の Err 終端で
-あり、Complete として返さない。この型は FS 観測だけの結果で、Full 全体の typed な
+生成せず、観測できた新規・変更候補だけを既存 ingest 経路へ渡す。通常の取消は
+`ScanError::Cancelled` の終端であり、Complete や再構築予約として扱わない。
+inventory の SQL 読取失敗は `ScanError::Metadata` のまま共通 reporter へ進め、後着の
+cancel フラグやエラー文字列で通常取消へ変換しない。この型は FS 観測だけの結果で、Full 全体の typed な
 完了結果とは分離する。S2 の停止は既存 cancel のまま。metadata manager worker が
 重複グループの cancel・join・cleanup・spawn を固定 snapshot で直列化し、後続要求は
 最新の1つに集約する。UI は軽量 control/view のみを持ち、再構成 worker が join handle
@@ -1087,13 +1090,16 @@ transaction で消す。起動設定は最初の構成でだけ採用し、実�
 - App drop は全 supervisor に cancel を先行送信し、全 supervisor 合計 4 秒の
   manager-wide deadline までだけ join する。期限を超えた JoinHandle は detach し、
   プロセス終了を将来追加される長時間処理でも塞がない。
-- walker は entry / 3-way diff の各ループ、ingest は delete / ingest の各ループで cancel を見る。
+- walker は entry / FS ↔ SQLite 差分の各ループ、ingest は delete / ingest の各ループで cancel を見る。
   GlobalIoSemaphore の permit 待ちと FtsWriterDispatcher の reply 待ちは50ms timeoutで再確認する。
   cancel 後の未flush batchはsubmitせず、受信済みを含む watcher queue も処理しない。
 - final commit と dispatcher の最終所有は indexer-writer-finalizer へ移し、main thread は
   commit / queue drain / dispatcher join を待たない。submit済みbatchの応答をcancelで放棄しても、
-  Tantivy First により SQLite側を先行更新しない。次回起動時の FS / Tantivy / fts_meta
-  3-way diff が未反映・片側反映を再照合するため、detachは索引整合性を犠牲にしない。
+  Tantivy First により SQLite側を先行更新しない。Full は FS ↔ SQLite の差分を再投入するが、
+  同じ署名の既存 Ok に対応する全文文書の欠落は検出しない。捕捉した commit/reload/SQLite apply、
+  cleanup と実行由来の自動 merge failure は共通 reporter の log+通知+durable pending へ進む。
+  writer kill による未実行 merge task は実 I/O failure と区別する。detach/abrupt termination が
+  全整合や marker 完了を保証するとはしない。runtime wipe/reopen、自動 Full retry は追加しない。
 
 ### 3.5 新ワーカー追加時のテンプレ
 

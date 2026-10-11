@@ -1,0 +1,51 @@
+# mImageViewer local Tantivy patch
+
+Baseline: crates.io `tantivy` 0.26.1, upstream commit
+`d8f4c0b703120ed98f06297724dc1522df6019b9` (the packaged
+`.cargo_vcs_info.json`). The original crate archive SHA-256 is
+`edde6a10743fff00a4e1a8c9ef020bf5f3cbad301b7d2d39f2b07f123c4eac07`,
+matching the pre-patch Cargo.lock checksum. This directory is a real copy of
+that package, not a junction/symlink; the registry copy is never modified.
+Upstream's MIT license is retained in [LICENSE](LICENSE), with AUTHORS and
+the original package/source files.
+
+Local changes, designed in `docs/fts-integrity-plan.md` r3 §§5/6.1:
+
+- `src/directory/mmap_directory/mod.rs`: retry only a completed TempPath's
+  persist on Windows raw errors 5/32/33; at most four attempts, separated by
+  10/25/50 ms. Temp create/write/flush/sync run once. No target removal,
+  truncation, whole-commit retry or non-Windows retry. Failure diagnostics
+  include stage, destination, raw error and attempt; recovered persist has
+  one summary record.
+- `src/directory/atomic_write_diagnostics.rs` / `directory/mod.rs`: scoped
+  diagnostic origin for merge-worker and end-merge task I/O, without using
+  diagnostic state to decide retries or reporting.
+- `src/indexer/segment_updater.rs` / `index_writer.rs`: per-writer terminal
+  merge failure observer outside task/Directory/segment locks, independent
+  of Future consumers. A private typed scheduler admission refusal excludes
+  normal shutdown of an unexecuted end-merge task. Executed errors during
+  shutdown still report. GC deletion refusals and synchronous commits are
+  outside this observer. The observer follows the writer across its existing
+  rollback replacement of the SegmentUpdater; rollback behavior is otherwise
+  unchanged.
+- `Cargo.toml`: opt-in `miv-test-hooks` provides per-directory atomic-stage
+  injection and per-writer before-end/terminal observations plus an executed
+  end-merge task error injection. The application
+  enables it only as a dev dependency; runtime builds exclude those hooks.
+
+The root Cargo patch fixes the package to this local 0.26.1 source; it does
+not update Tantivy's dependencies. Focused on-disk and shutdown regressions
+are in `tests/fts_tantivy_integrity.rs`. When updating upstream, compare these
+listed source files against the original crate and port/review each local
+change. The bounded persist retry is local mitigation, not an upstream fix
+or proof of the original incident's cause.
+
+Verification on Windows, 2026-10-11: `cargo test -p mimageviewer --test
+fts_tantivy_integrity` passed all 11 tests (Cargo exit 0). The local log is
+`target/I-1367-tantivy-tests.log`; a baseline-relative source patch is recorded
+in `target/I-1367-tantivy-local.patch`. `cargo tree -p mimageviewer -e
+features,normal,build -i tantivy --locked` confirms runtime dependency features
+exclude `miv-test-hooks` (recorded in `target/I-1367-tantivy-normal-features.txt`).
+The GC regression holds an old mmap searcher plus a deliberate no-delete-sharing
+read handle, since this Windows/Rust version can otherwise delete mapped files;
+it verifies actual GC deletion refusal does not reserve a rebuild or notify.

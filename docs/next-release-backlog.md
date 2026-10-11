@@ -62,7 +62,16 @@
 - 直し方の検討事項: 組を意識した区切りか、省いた相方を表す / 取りに行く契約。いま開けるページを減らさず、省いたページの寸法を全部読む走査を避ける。上限の意味、開く・操作のコスト、Web の正規化と描画キー、IPC / アセットの版。ずらし有無、左右開き、表紙、強制単独、横長の境界を試験する。§1.364 の上限や変換書庫の base キーはこの項目では変えない。
 - 規模 / 優先度: Medium / P3。
 
+### 1.369 名前/コンテナ索引 (Ctrl+S) の書込失敗が通知・再構築へ揃っていない — §1.367からの引き継ぎ・コード調査 (2026-10-11)
+
+- 現状: FullのDB更新/削除失敗はFailed結果になるが、通知と名前索引の既存rebuild markerへ接続されない。watcherのdelete_subtree、parent refresh、subtree upsert/prune失敗もlog等のみで、削除失敗でもupdates_appliedが増える入口がある。実機再現を主張する項目ではなく、コードで確認した同型経路の残件。
+- 境界: §1.367では共通UIのFull失敗表示だけを合わせる。本件は`search_index.db`の書込failureを扱い、FTS reporterや`fts_meta.db`のpendingを流用しない。入口/出口の棚卸しとcode refsは[fts-integrity-plan.md §6.2](fts-integrity-plan.md)を参照。
+- 対応: DB書込failureをlog+通知+既存`SearchIndexDb::request_rebuild_on_next_start` (`src/search_index_db.rs:472`)へ揃え、次回writable openの`rebuild_names_if_requested` (`:944`)を再利用する。watcherの成功件数を訂正し、Full完走印のwrite失敗 (`src/name_index_supervisor.rs:553`) も通知を棚卸しする (それだけで再構築が必要とは決めない)。
+- 維持する条件: FS観測不完全/cancelとDB書込failureを区別し、不完全観測時のprune抑止と既存clear失敗のmarker経路を維持する。追加retry/回復workerや回復失敗の再回復は作らない。類似索引はSQLite正本から派生配列を再生成し、Failed/Degradedも表示するため、このFTSの破棄順序対策を機械的に適用しない。
+- 回帰: Full DB failure、watcher削除/upsert/prune failureの通知・名前索引marker・成功件数、正常Full/watchと不完全FS観測時のprune抑止。着手/リリース優先度は別件として管理担当が決める。
+
 ### 1.367 アイテム検索 (Ctrl+G) の全文索引が空になっても「登録済み」のまま直らない — 利用者報告・調査 (2026-10-10)
+- **master へ取り込み済み (2026-10-11)**: 正本は [FTS 整合計画 R3・実装記録](fts-integrity-plan.md)。Windows persist 限定の有界再試行 (Tantivy 0.26.1 を `vendor/tantivy` に固定)、取り込み・統合の書き込み失敗をログ + 通知 + 次回起動の作り直し予約へ統一 (通常終了の打ち切りは除外)、作り直しの順序 (SQLite reset + 予約 → Tantivy 破棄)、お気に入り編集の「作成失敗 / 確認未完了」表示。**起動時点検は常時有効**: 利用者承認の軽量 A/B (隔離、10 回交互起動) で検索可能になるまでの中央値 A 0.774 秒 / B 0.729 秒、点検 0.05〜0.21 ms (設計担当が採用)。独立レビュー ACCEPT (設計 R3・実装・採用差分)。ClaudeCode の隔離実機確認: Tantivy 7,750 件 / SQLite 16,385 件の欠落を起動時に検出 → 通知「索引の更新に失敗しました。mIV を再起動すると索引を作り直します。」→ 次回起動で作り直し → 3 回目で一致 (`nextsmall target/I-1367-agent-hwcheck.md`)。元の欠落の根本原因は未特定のまま。名前索引の書き込み失敗は §1.369。
 - **次の版の決定 (利用者 2026-10-10)**: 次の版に入れる。ただし起動時の点検は**起動時間を延ばさないこと**が条件。「終了中の変更を起動時に確認しない」設定の利用者には起動時間が重要なので、点検の処理時間が起動に影響するなら点検の実装は見送り、下の (2)(3) だけ行う。
 - 観測 (利用者): 以前は `klee` で 10,000 件の上限まで出ていた Ctrl+G 検索が、インストール版 v4.5.0 でも 0 件。検索結果に存在しないファイルが並ぶことがある (nextbook の確認用ビルドで観測、未調査)。
 - 調査 (ClaudeCode と Codex 読み取り調査、証拠は `target/fts-incident-2026-10-10/` の写し): `fts_meta.db` は 840,464 行がすべて status=Ok (Tantivy commit 済みの意味、`src/fts_meta.rs:7`)、一方 Tantivy (`fts_index/`) の生存文書は 399 件。399 件は 2026-10-10 18:04:55 以降に更新された行と完全一致し、古い文書だけが欠けた状態。消えた時期と原因は未特定 (perf ログは当日 19:55 以降しか残っていない)。各ブランチの FTS コードと schema は同一で、隔離 `--data-dir` は通常データを使わないため、今日の確認用ビルドが原因という説は支持されない。
