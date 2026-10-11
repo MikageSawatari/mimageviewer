@@ -1,4 +1,5 @@
-//! Win32 ownership adapter. All windows, sends, callbacks and waits stay on one worker.
+//! Win32 ownership adapter. HWNDs, sends and callbacks stay on one IPC worker;
+//! its caller can stop waiting through cancellation without joining a native send.
 //! Microsoft API contracts: WM_COPYDATA, SendMessageTimeoutW, and
 //! MsgWaitForMultipleObjectsEx; callback buffers are copied before returning.
 
@@ -8,7 +9,7 @@ use std::os::windows::io::AsRawHandle;
 use std::sync::OnceLock;
 use std::time::Instant;
 use windows::Win32::Foundation::{
-    HANDLE, HWND, LPARAM, LRESULT, WAIT_FAILED, WAIT_TIMEOUT, WPARAM,
+    ERROR_TIMEOUT, HANDLE, HWND, LPARAM, LRESULT, WAIT_FAILED, WAIT_TIMEOUT, WPARAM,
 };
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -20,6 +21,55 @@ const GET_MAJOR: usize = 0;
 const GET_MINOR: usize = 1;
 const GET_REVISION: usize = 2;
 const IS_DB_LOADED: usize = 401;
+
+/// The search/prepare worker waits on two events, not the synchronous native send.
+/// The detached IPC run owns its entire packet, HWND and callback lifetime until
+/// its bounded send returns. Its caller thread stays alive through reply parsing
+/// (Everything may watch that thread). No HWND or borrowed packet crosses threads.
+pub(super) fn run_cancellable<T: Send + 'static>(
+    cancel: &CancelHandle,
+    run: impl FnOnce() -> Result<T, EverythingError> + Send + 'static,
+) -> Result<T, EverythingError> {
+    use std::os::windows::io::FromRawHandle;
+    use windows::Win32::Foundation::WAIT_OBJECT_0;
+    use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects};
+
+    cancelled(cancel)?;
+    let completion = unsafe { CreateEventW(None, true, false, None) }
+        .map_err(|e| EverythingError::Native(e.code().0 as u32))?;
+    // SAFETY: sole ownership of the fresh event transfers to OwnedHandle. Both
+    // wait and signal hold an Arc, even when cancellation drops the receiver.
+    let completion =
+        Arc::new(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(completion.0) });
+    let signal = Arc::clone(&completion);
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let _ipc_run = std::thread::Builder::new()
+        .name("everything-ipc".into())
+        .spawn(move || {
+            let result = run();
+            let _ = tx.send(result);
+            if let Err(error) = unsafe { SetEvent(HANDLE(signal.as_raw_handle())) } {
+                crate::logger::log(format!("everything IPC completion signal failed: {error}"));
+            }
+        })
+        .map_err(|e| EverythingError::Native(e.raw_os_error().unwrap_or(0) as u32))?;
+    let handles = [
+        HANDLE(cancel.inner.event.as_raw_handle()),
+        HANDLE(completion.as_raw_handle()),
+    ];
+    // Four status sends (<=1s each), one 60s send+reply budget, 100ms cleanup.
+    // Also bounds a rare IPC-worker panic/signal failure; no recovery wait/retry.
+    let wait = unsafe { WaitForMultipleObjects(&handles, false, 65_000) };
+    let wait_error = unsafe { windows::Win32::Foundation::GetLastError().0 };
+    cancelled(cancel)?;
+    if wait.0 == WAIT_OBJECT_0.0 + 1 {
+        rx.try_recv().map_err(|_| EverythingError::Disconnected)?
+    } else if wait == WAIT_TIMEOUT {
+        Err(EverythingError::Timeout)
+    } else {
+        Err(EverythingError::Native(wait_error))
+    }
+}
 
 // Opt-in, ignored test executable only; ordinary tests never discover Everything.
 #[cfg(test)]
@@ -204,20 +254,40 @@ impl WindowsEndpoint {
         lp: LPARAM,
         timeout: Duration,
     ) -> Result<usize, EverythingError> {
+        let flags = if message == WM_COPYDATA && timeout > STATUS_TIMEOUT {
+            // A healthy 1.4 handler can stay busy without pumping for >5s.
+            // Cancellation is handled by run_cancellable, not by declaring that
+            // thread hung. Still bounded: never use NOTIMEOUTIFNOTHUNG or BLOCK.
+            SMTO_ERRORONEXIT
+        } else {
+            SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT
+        };
+        self.send_message_with_flags(message, wp, lp, timeout, flags)
+    }
+
+    fn send_message_with_flags(
+        &self,
+        message: u32,
+        wp: WPARAM,
+        lp: LPARAM,
+        timeout: Duration,
+        flags: SEND_MESSAGE_TIMEOUT_FLAGS,
+    ) -> Result<usize, EverythingError> {
         let mut response = 0usize;
         unsafe {
             windows::Win32::Foundation::SetLastError(windows::Win32::Foundation::WIN32_ERROR(0))
         };
         // No SMTO_BLOCK: sent-message callbacks must remain dispatchable during send.
         // No NOTIMEOUTIFNOTHUNG: each send remains bounded even when the peer pumps.
+        let send_started = Instant::now();
         let sent = unsafe {
             SendMessageTimeoutW(
                 self.target,
                 message,
                 wp,
                 lp,
-                SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
-                timeout.as_millis().clamp(1, SEND_TIMEOUT.as_millis()) as u32,
+                flags,
+                timeout.as_millis().clamp(1, u32::MAX as u128) as u32,
                 Some(&mut response),
             )
         };
@@ -231,18 +301,26 @@ impl WindowsEndpoint {
         );
         if sent.0 == 0 {
             crate::logger::log(format!(
-                "everything IPC send failed: message={message:#x}, status_code={}, win32_error={}",
+                "everything IPC send failed: message={message:#x}, status_code={}, win32_error={}, timeout_ms={}, elapsed_ms={:.3}",
                 if message == WM_USER { wp.0 } else { 0 },
-                last_error.0
+                last_error.0,
+                timeout.as_millis(),
+                send_started.elapsed().as_secs_f64() * 1000.0
             ));
-            Err(EverythingError::SendFailed)
+            if last_error == ERROR_TIMEOUT
+                || (last_error.0 == 0 && unsafe { IsHungAppWindow(self.target) }.as_bool())
+            {
+                Err(EverythingError::Busy)
+            } else {
+                Err(EverythingError::SendFailed)
+            }
         } else {
             Ok(response)
         }
     }
 
     fn status(&self, code: usize) -> Result<u32, EverythingError> {
-        let response = self.send_message(WM_USER, WPARAM(code), LPARAM(0), SEND_TIMEOUT)?;
+        let response = self.send_message(WM_USER, WPARAM(code), LPARAM(0), STATUS_TIMEOUT)?;
         u32::try_from(response).map_err(|_| EverythingError::UnsupportedVersion)
     }
 }
@@ -443,76 +521,54 @@ mod adapter_tests {
             "target pid={pid}, thread={tid}, hung={}",
             unsafe { IsHungAppWindow(endpoint.target) }.as_bool()
         );
-        let result = query_with_endpoint(&query, &cancel, &mut endpoint);
-        eprintln!(
-            "product result: {:?}",
-            result
-                .as_ref()
-                .map(|r| (r.rows.len(), r.total_items, r.actual_sort))
-        );
-        for code in [GET_MINOR, GET_REVISION, 3, IS_DB_LOADED, 403] {
-            eprintln!(
-                "additional read-only status {code}: {:?}",
-                endpoint.status(code)
-            );
-        }
-        let mut filter = CHANGEFILTERSTRUCT {
-            cbSize: std::mem::size_of::<CHANGEFILTERSTRUCT>() as u32,
-            ..Default::default()
+        eprintln!("version: {:?}", endpoint.version(&cancel));
+        eprintln!("database loaded: {:?}", endpoint.database_loaded());
+        let id = next_reply_id().unwrap();
+        let packet = encode_query(&query, endpoint.reply_hwnd(), id).unwrap();
+        endpoint.activate(id);
+        let budget = Duration::from_secs(60);
+        let started = Instant::now();
+        eprintln!("one QUERY2W send, budget_ms={}", budget.as_millis());
+        let cds = COPYDATASTRUCT {
+            dwData: QUERY2W,
+            cbData: packet.len() as u32,
+            lpData: packet.as_ptr().cast_mut().cast(),
         };
-        let allowed = unsafe {
-            ChangeWindowMessageFilterEx(
-                endpoint.reply,
-                WM_COPYDATA,
-                MSGFLT_ALLOW,
-                Some(&mut filter),
-            )
-        };
-        eprintln!(
-            "reply-only WM_COPYDATA filter allow: {allowed:?}, ExtStatus={:?}",
-            filter.ExtStatus
-        );
-        for v2 in [true, false] {
-            let id = if v2 { 0x137402 } else { 0x137401 };
-            let packet = encode_query(&query, endpoint.reply_hwnd(), id).unwrap();
-            let v1;
-            let bytes = if v2 {
-                &packet
-            } else {
-                v1 = [&packet[..20], &packet[28..]].concat();
-                &v1
-            };
-            endpoint.activate(id);
-            let cds = COPYDATASTRUCT {
-                dwData: if v2 { 18 } else { 2 },
-                cbData: bytes.len() as u32,
-                lpData: bytes.as_ptr().cast_mut().cast(),
-            };
-            eprintln!(
-                "diagnostic query v{}: COPYDATA id={}, header={}, packet={}",
-                if v2 { 2 } else { 1 },
-                cds.dwData,
-                if v2 { 28 } else { 20 },
-                bytes.len()
-            );
-            let sent = endpoint.send_message(
+        // Diagnose one busy handler without ABORTIFHUNG's early cutoff. This
+        // manual probe does not change the product flags or Everything settings.
+        let sent = endpoint
+            .send_message_with_flags(
                 WM_COPYDATA,
                 WPARAM(endpoint.reply.0 as usize),
                 LPARAM((&cds as *const COPYDATASTRUCT) as isize),
-                SEND_TIMEOUT,
-            );
-            eprintln!("diagnostic query send: {sent:?}");
-            if matches!(sent, Ok(1)) {
-                let deadline = endpoint.elapsed() + REPLY_TIMEOUT;
-                let reply = endpoint.wait(&cancel, deadline);
-                eprintln!(
-                    "diagnostic reply: {:?}",
-                    reply.as_ref().map(|r| r.bytes.len())
-                );
-            }
-            endpoint.deactivate();
-        }
-        assert!(result.is_ok(), "product IPC path failed: {result:?}");
+                budget,
+                SMTO_ERRORONEXIT,
+            )
+            .and_then(|accepted| {
+                if accepted != 0 {
+                    Ok(())
+                } else {
+                    Err(EverythingError::Rejected)
+                }
+            });
+        eprintln!(
+            "query send result={sent:?}, elapsed_ms={:.3}, reply_already_copied={}",
+            started.elapsed().as_secs_f64() * 1000.0,
+            endpoint.callback.packet.borrow().is_some()
+        );
+        let result = sent.and_then(|()| {
+            let reply = endpoint.wait(&cancel, endpoint.elapsed() + REPLY_TIMEOUT)?;
+            parse_reply(&reply.bytes)
+        });
+        eprintln!(
+            "final result={:?}, total_elapsed_ms={:.3}",
+            result
+                .as_ref()
+                .map(|r| (r.rows.len(), r.total_items, r.actual_sort)),
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+        endpoint.deactivate();
+        assert!(result.is_ok(), "real IPC path failed: {result:?}");
     }
 
     enum Mode {
@@ -522,6 +578,8 @@ mod adapter_tests {
         Reject,
         Cancel(CancelHandle),
         StallStatus(CancelHandle),
+        SlowQuery(Duration),
+        StallQuery(CancelHandle),
     }
 
     struct ServerState {
@@ -579,6 +637,16 @@ mod adapter_tests {
             let query =
                 unsafe { std::slice::from_raw_parts(cds.lpData.cast::<u8>(), cds.cbData as usize) };
             let _ = state.requests.send(query.to_vec());
+            match &state.mode {
+                Mode::SlowQuery(delay) => std::thread::sleep(*delay),
+                Mode::StallQuery(release) => unsafe {
+                    windows::Win32::System::Threading::WaitForSingleObject(
+                        HANDLE(release.inner.event.as_raw_handle()),
+                        10_000,
+                    );
+                },
+                _ => {}
+            }
             if matches!(state.mode, Mode::Reject) {
                 return LRESULT(0);
             }
@@ -706,7 +774,7 @@ mod adapter_tests {
         let result = query_with_endpoint("a", &CancelHandle::new().unwrap(), &mut endpoint);
         // Unblock fake client before asserting, including on failure paths.
         release.cancel();
-        assert_eq!(result, Err(EverythingError::SendFailed));
+        assert_eq!(result, Err(EverythingError::Busy));
         assert!(
             server.requests.try_recv().is_err(),
             "no query/cancel/retry after failed version send"
@@ -746,6 +814,70 @@ mod adapter_tests {
                 "one query, no fallback/paging"
             );
         }
+    }
+
+    #[test]
+    fn fake_hwnd_slow_handler_outlives_old_one_second_send_budget() {
+        let server = FakeServer::new(Mode::SlowQuery(Duration::from_millis(1200)));
+        let target = server.hwnd.0 as usize;
+        let cancel = CancelHandle::new().unwrap();
+        let run_cancel = cancel.clone();
+        let result = run_cancellable(&cancel, move || {
+            let mut endpoint = WindowsEndpoint::for_window(HWND(target as *mut _))?;
+            query_with_endpoint("slow", &run_cancel, &mut endpoint)
+        })
+        .unwrap();
+        assert_eq!(result.rows[0].full_path, "C:\\日本語🖼.jpg");
+        assert!(server.requests.try_recv().is_ok());
+        assert!(
+            server.requests.try_recv().is_err(),
+            "no retry or cancel after success"
+        );
+    }
+
+    #[test]
+    fn fake_hwnd_cancel_returns_before_slow_send_and_worker_keeps_hwnd_until_retirement() {
+        let release = CancelHandle::new().unwrap();
+        let server = FakeServer::new(Mode::StallQuery(release.clone()));
+        let target = server.hwnd.0 as usize;
+        let cancel = CancelHandle::new().unwrap();
+        let waiter_cancel = cancel.clone();
+        let (window_tx, window_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let (retired_tx, retired_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let run_cancel = waiter_cancel.clone();
+            let result = run_cancellable(&waiter_cancel, move || {
+                let mut endpoint = WindowsEndpoint::for_window(HWND(target as *mut _))?;
+                window_tx.send(endpoint.reply.0 as usize).unwrap();
+                let result = query_with_endpoint("slow", &run_cancel, &mut endpoint);
+                drop(endpoint);
+                retired_tx.send(()).unwrap();
+                result
+            });
+            done_tx.send(result).unwrap();
+        });
+        let reply = HWND(window_rx.recv_timeout(Duration::from_secs(5)).unwrap() as *mut _);
+        server
+            .requests
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        cancel.cancel();
+        let result = done_rx.recv_timeout(Duration::from_secs(2));
+        let kept_hwnd = unsafe { IsWindow(Some(reply)) }.as_bool();
+        let prematurely_retired = retired_rx.try_recv().is_ok();
+        // Release even if the observations fail, so fake teardown never waits
+        // for the product's long send deadline merely to report an assertion.
+        release.cancel();
+        waiter.join().unwrap();
+        retired_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(result.unwrap(), Err(EverythingError::Cancelled));
+        assert!(
+            kept_hwnd,
+            "native send still owns its callback/packet lifetime"
+        );
+        assert!(!prematurely_retired);
+        assert!(!unsafe { IsWindow(Some(reply)) }.as_bool());
     }
 
     #[test]

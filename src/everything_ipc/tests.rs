@@ -40,6 +40,7 @@ struct FakeEverythingEndpoint {
     cancel_send_error: bool,
     cancel_on_send: Option<CancelHandle>,
     time: Duration,
+    send_duration: Duration,
     events: VecDeque<FakeEvent>,
 }
 
@@ -58,6 +59,7 @@ impl Default for FakeEverythingEndpoint {
             cancel_send_error: false,
             cancel_on_send: None,
             time: Duration::ZERO,
+            send_duration: Duration::ZERO,
             events: VecDeque::new(),
         }
     }
@@ -80,9 +82,20 @@ impl EverythingEndpoint for FakeEverythingEndpoint {
         self.active = None;
     }
     fn send(&mut self, bytes: &[u8], timeout: Duration) -> Result<(), EverythingError> {
-        assert_eq!(timeout, SEND_TIMEOUT);
+        assert_eq!(
+            timeout,
+            if self.sends.is_empty() {
+                SEND_TIMEOUT
+            } else {
+                CANCEL_SEND_TIMEOUT
+            }
+        );
         self.sends.push(bytes.to_vec());
         if self.sends.len() == 1 {
+            self.time += self.send_duration;
+            if self.send_duration > timeout {
+                return Err(EverythingError::Busy);
+            }
             assert_eq!(
                 self.active,
                 Some(dword(bytes, 4).unwrap()),
@@ -281,6 +294,18 @@ fn fake_unavailable_unsupported_unloaded_and_rejection_have_no_fallback() {
         Err(EverythingError::Unavailable)
     );
     assert!(absent.sends.is_empty());
+    let mut busy = FakeEverythingEndpoint {
+        version: Err(EverythingError::Busy),
+        ..Default::default()
+    };
+    assert_eq!(
+        query_with_endpoint("a", &cancel, &mut busy),
+        Err(EverythingError::Busy)
+    );
+    assert!(
+        busy.sends.is_empty(),
+        "failed status must not send query/cancel/retry"
+    );
     for version in [
         EverythingVersion {
             major: 1,
@@ -357,8 +382,63 @@ fn fake_immediate_reply_and_syntax_passthrough() {
 }
 
 #[test]
+fn fake_slow_handler_shares_one_send_and_reply_budget() {
+    let mut endpoint = FakeEverythingEndpoint {
+        send_duration: Duration::from_secs(2),
+        ..Default::default()
+    };
+    endpoint.events.push_back(FakeEvent::Reply {
+        at: Duration::from_secs(3),
+        id: None,
+        bytes: reply_bytes(&[("C:\\slow.jpg", 0)], 1, 1),
+    });
+    assert_eq!(
+        query_with_endpoint("slow", &CancelHandle::new().unwrap(), &mut endpoint)
+            .unwrap()
+            .rows
+            .len(),
+        1
+    );
+    assert_eq!(endpoint.sends.len(), 1);
+    let mut endpoint = FakeEverythingEndpoint {
+        send_duration: REPLY_TIMEOUT - Duration::from_secs(1),
+        ..Default::default()
+    };
+    endpoint.events.push_back(FakeEvent::Reply {
+        at: REPLY_TIMEOUT + Duration::from_secs(1),
+        id: None,
+        bytes: reply_bytes(&[], 0, 1),
+    });
+    assert_eq!(
+        query_with_endpoint("slow", &CancelHandle::new().unwrap(), &mut endpoint),
+        Err(EverythingError::Timeout)
+    );
+    assert_eq!(endpoint.time, REPLY_TIMEOUT);
+    assert_eq!(endpoint.sends.len(), 2);
+    assert_eq!(query_text(&endpoint.sends[1]), "nothing:");
+}
+
+#[test]
+fn busy_and_timeout_messages_are_distinct_from_client_not_running() {
+    assert_eq!(
+        EverythingError::Busy.user_message(),
+        EverythingError::Timeout.user_message()
+    );
+    assert_ne!(
+        EverythingError::Busy.user_message(),
+        EverythingError::Unavailable.user_message()
+    );
+    assert!(EverythingError::Busy.user_message().contains("処理が遅い"));
+    assert!(
+        EverythingError::Unavailable
+            .user_message()
+            .contains("クライアントを起動")
+    );
+}
+
+#[test]
 fn fake_timeout_disconnect_and_send_failure_send_one_cancel_and_do_not_wait() {
-    for mode in 0..3 {
+    for mode in 0..4 {
         let mut endpoint = FakeEverythingEndpoint {
             cancel_send_error: true,
             ..Default::default()
@@ -371,9 +451,13 @@ fn fake_timeout_disconnect_and_send_failure_send_one_cancel_and_do_not_wait() {
                     .push_back(FakeEvent::Disconnect(Duration::from_secs(1)));
                 EverythingError::Disconnected
             }
-            _ => {
+            2 => {
                 endpoint.send_error = Some(EverythingError::SendFailed);
                 EverythingError::SendFailed
+            }
+            _ => {
+                endpoint.send_error = Some(EverythingError::Busy);
+                EverythingError::Busy
             }
         };
         assert_eq!(

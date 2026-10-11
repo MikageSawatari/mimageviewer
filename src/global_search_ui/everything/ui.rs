@@ -131,9 +131,7 @@ pub fn draw_everything_search_snapshot_fixture(ui: &mut egui::Ui) {
             unreadable: 12,
             limit_reached: true,
             query_changed: true,
-            error: Some(
-                "Everything から結果を取得できませんでした。起動状態・権限を確認して再検索してください。検索語を絞ってもう一度検索できます。",
-            ),
+            error: Some(crate::everything_ipc::EverythingError::Busy.user_message()),
         },
     );
 }

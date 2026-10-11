@@ -24,8 +24,10 @@ mod tests;
 pub const MAX_RESULTS: u32 = 10_000;
 pub const MAX_REPLY_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_QUERY_UNITS: usize = 32_768;
-pub const SEND_TIMEOUT: Duration = Duration::from_secs(1);
-pub const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+pub const SEND_TIMEOUT: Duration = Duration::from_secs(60);
+pub const REPLY_TIMEOUT: Duration = Duration::from_secs(60);
+const STATUS_TIMEOUT: Duration = Duration::from_secs(1);
+const CANCEL_SEND_TIMEOUT: Duration = Duration::from_millis(100);
 const QUERY2W: usize = 18;
 const FULL_PATH: u32 = 4;
 const NAME_ASCENDING: u32 = 1;
@@ -65,6 +67,7 @@ pub enum EverythingError {
     UnsupportedVersion,
     DatabaseNotLoaded,
     Rejected,
+    Busy,
     SendFailed,
     Timeout,
     Disconnected,
@@ -95,6 +98,9 @@ impl EverythingError {
                 "Everything の検索結果が大きすぎます。検索条件を絞ってください。"
             }
             Self::Cancelled => "検索を取り消しました。",
+            Self::Busy | Self::Timeout => {
+                "Everything の処理が遅いか、混雑しています。しばらく待つか、検索条件を絞って再検索してください。"
+            }
             _ => {
                 "Everything から結果を取得できませんでした。起動状態・権限を確認して再検索してください。"
             }
@@ -231,8 +237,12 @@ pub fn query(query: &str, cancel: &CancelHandle) -> Result<EverythingReply, Ever
     cancelled(cancel)?;
     #[cfg(windows)]
     {
-        let mut endpoint = native::WindowsEndpoint::discover()?;
-        query_with_endpoint(query, cancel, &mut endpoint)
+        let query = query.to_owned();
+        let run_cancel = cancel.clone();
+        native::run_cancellable(cancel, move || {
+            let mut endpoint = native::WindowsEndpoint::discover()?;
+            query_with_endpoint(&query, &run_cancel, &mut endpoint)
+        })
     }
     #[cfg(not(windows))]
     Err(EverythingError::Unavailable)
@@ -269,7 +279,12 @@ pub fn query_with_endpoint(
     let result = (|| {
         cancelled(cancel)?;
         let send_started = Instant::now();
-        let sent = endpoint.send(&bytes, SEND_TIMEOUT);
+        let sent = endpoint.send(
+            &bytes,
+            deadline
+                .saturating_sub(endpoint.elapsed())
+                .min(SEND_TIMEOUT),
+        );
         cancelled(cancel)?;
         sent?;
         let send_elapsed = send_started.elapsed();
@@ -333,11 +348,12 @@ pub fn query_with_endpoint(
         Err(EverythingError::Cancelled
             | EverythingError::Timeout
             | EverythingError::Disconnected
+            | EverythingError::Busy
             | EverythingError::SendFailed)
     ) {
         let cancellation = encode_query("nothing:", endpoint.reply_hwnd(), cancel_id)?;
         // Exactly one bounded replacement query; never wait for its reply or retry it.
-        let _ = endpoint.send(&cancellation, SEND_TIMEOUT);
+        let _ = endpoint.send(&cancellation, CANCEL_SEND_TIMEOUT);
     }
     result
 }

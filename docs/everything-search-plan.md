@@ -72,9 +72,14 @@ SDK DLL 案は MIT notice を原文で同梱できるが、DLL／import lib の�
 
 ### 4.2 timeout、cancel、drop
 
-worker 内の送信は `SendMessageTimeoutW`、送信ごとに上限 1 秒、応答全体は送信開始から 30 秒を推奨。`SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT` を使い、`SMTO_NOTIMEOUTIFNOTHUNG` は使わない。callback の再入を妨げる `SMTO_BLOCK` は使わない。API return と receiver acceptance を別に検査する。
+Stage1の送信1秒/reply30秒は、実機timeoutの調査で§17の方針へ更新した。
+statusは1秒（`SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT`）、queryのsend＋replyは合計60秒。
+query sendは`SMTO_ERRORONEXIT`でbusy handlerを待ち、`SMTO_NOTIMEOUTIFNOTHUNG`と
+callback再入を妨げる`SMTO_BLOCK`は使わない。API returnとreceiver acceptanceを別に検査する。
+専用IPC runがHWND/send/pump/packetを一括所有し、検索prepare workerは完了/取消eventを待つ。
+取消はnative sendの終了を待たず返し、旧runはdeadline付きのsendから戻って自然退役する。
 
-待機は OS event／message pump と deadline で行い、`try_lock + sleep` や UI の `recv`／join を使わない。UI の cancel は token と wake event を立て、receiver を手放して即座に main 入力を戻す。worker は同じ reply HWND に `nothing:` の取消 query を一度だけ bounded send し、返却を待たず window を破棄して自然終了する。取消 query の成功は UI の取消完了条件にしない。旧 request の処理が Everything 側で即時停止する保証はしない。
+待機は OS event／message pump と deadline で行い、`try_lock + sleep` や UI の `recv`／join を使わない。UI の cancel は token と wake event を立て、receiver を手放して即座に main 入力を戻す。IPC workerはnative send終了後に同じ reply HWND へ `nothing:` を一度だけ最大100msで送信し、返信を待たずwindowを破棄する。取消 query の成功は UI の取消完了条件にしない。旧 request の処理が Everything 側で即時停止する保証はしない。
 
 close、再送信、別検索への移行、main の別一覧への移行、context retire、App 終了はいずれも同じ request drop／cancel 境界を通る。新 query は別の run として開始し、旧 HWND 再利用でも旧 reply ID を受理しない。reply ID の使い回しによる alias を許さない。UI は worker 終了を待たない。送信 buffer と callback state の寿命は worker が RAII で持ち、timeout／callback 再入中にも dangling pointer を作らない。
 
@@ -243,7 +248,8 @@ BS／親移動は Everything position を経由し、book 内の既存 prefix pa
 | Lite／IPC 無効／QUERY2 拒否／古い版 | 「この Everything では IPC 検索を利用できません。通常版の 1.4.1 以降と IPC 設定を確認してください」。lite 検出を version だけで断定しない |
 | DB 未ロード／再構築中 | 成功の 0 件を採用しない。「Everything の索引を準備中です。準備後にもう一度検索してください」。自動 wait/retry はしない |
 | DB loaded だが folder index が更新途中 | 得られた時点の snapshot を表示。全ドライブ／全 folder の完走や最新性を保証しない。loaded は全索引更新完了の証明ではない |
-| 応答 deadline／hung／終了／UIPI 拒否 | log＋「Everything から結果を取得できませんでした。起動状態・権限を確認して再検索してください」。mIV を勝手に elevate しない |
+| 応答 deadline／hung | log＋「Everything の処理が遅いか、混雑しています。しばらく待つか、検索条件を絞って再検索してください」。未起動案内にまとめない |
+| 終了／UIPI 拒否等 | log＋「Everything から結果を取得できませんでした。起動状態・権限を確認して再検索してください」。mIV を勝手に elevate しない |
 | malformed／byte limit／互換 wire 不一致 | その reply を全体で拒否。log＋通知／条件を絞る案内。QUERY1／SDK／FS 全走査への silent fallback なし |
 | worker spawn／prepare／DB read のまれな失敗 | log＋通知。未採用一覧を公開せず、元の accepted view を保持。新 recovery state／retry loop／DB 再作成を設計しない |
 | 取消 | 未採用 request を破棄し、旧 accepted view を保持。エラー toast／部分結果は出さない |
@@ -527,3 +533,86 @@ freshness回帰も追加する。実Everythingを自動テストの依存先に�
   EPUB workerをbuild/stageした。coreは2026-10-12 05:17:48、325,190,144 bytes。
   `target/EV-1374-P2-build-dev.log`。起動/Everything設定変更/downloadなし。
 - `git diff --check`成功 (`target/EV-1374-P2-diff-check.log`)。OS error 1455なし。差分は未コミット。
+
+## 17. WM_COPYDATAの遅い送信と取消（2026-10-12）
+
+§16のP2修正は利用者/独立reviewがACCEPTし、`5a0d92e21`へcommitされた。
+今回、利用者の実機再試行はversion照会を通過したが、query送信が1秒でERROR_TIMEOUTになった。
+ログのWM_COPYDATA失敗2回はqueryとbest-effort `nothing:`の取消であり、自動query retryではない。
+
+### 17.1 実機観測と公開根拠
+
+- readonlyの`target/ev-try/data/logs/mimageviewer.log`で、約1秒ずつのWM_COPYDATA/error1460を確認。
+- standalone ignored probeのみ実行。対象は通知window `0x47e21d8`、PID91556/thread79152。
+  Process.Responding=Trueでも`IsHungAppWindow`はtrue。version/DB-loadedもprobe時点では送信失敗した。
+  ABORTIFHUNG付き60秒budgetではqueryが約0.205msで早期失敗（Win32 error0）した。
+- 診断用に一回だけABORTIFHUNGを外した同じQUERY2W送信は**59,999.845msでerror1460、返信なし**。
+  これは「sendが60秒以内に戻らなかった」という下限であり、実検索の完了時間は測れていない。
+  messageのqueue待ちとhandler内のどの処理で止まったかを、この観測だけでは区別できない。
+  ログ: `target/EV-1374-slow-real-probe.log` / `EV-1374-slow-real-probe-no-abort.log`。
+- 05:39:29→05:42:08のreadonly thread観測で、通知threadのCPUは21.90625秒のまま/Wait状態。
+  Process CPUは22,965.328125→23,119.359375秒。別threadの処理を待つ状況と整合するが、
+  内部の関数/lock/停止理由の特定ではない。`target/EV-1374-slow-thread-sample-{1,2}.json`。
+- [公式SDK Query](https://www.voidtools.com/support/everything/sdk/everything_query/)はFALSE時の
+  非同期結果受信を提供する。一方、[作者の説明](https://www.voidtools.com/forum/viewtopic.php?t=8282)では
+  別IPCがDB完了を待つこと、replyの組立/送信が取消できないことを明示している。
+  非公開のEverything 1.4内部で「全検索がWM_COPYDATA handler上で実行される」と断定しない。
+  transport契約として**query send自体がDB処理/応答準備を待ち、長く戻らない可能性**を扱う。
+- [作者公開header](https://github.com/voidtools/ES/blob/main/src/everything_ipc.h)のQUERY2順序
+  （request_flags→sort_type）、raw cap、full-path flag、名前昇順を再確認。wire変更なし。
+  [Microsoft SendMessageTimeoutW](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendmessagetimeoutw)
+  のbounded timeout/ABORTIFHUNG/再入契約に従う。SDK/DLL/header等のdownloadは行わない。
+
+### 17.2 待機と所有境界
+
+1秒のSendMessageTimeout上限では普通の遅いhandlerも失敗するため、statusの1秒とqueryの
+send＋reply合計60秒を分ける。60秒以内の検索完了を保証する値ではなく、長い処理を許容する
+有限の待機上限である。今回の実clientの検索成功は未確認。deadline延長retry/無期限waitは行わない。
+queryはERRORONEXITだけで待ち、5秒以上pumpしない計算/DB待ちをABORTIFHUNGで早期打切りしない。
+statusと100msのbest-effort取消はABORTIFHUNG付き。NOTIMEOUTIFNOTHUNG/BLOCKは使わない。
+native送信引数は呼出し側budgetを尊重し、旧1秒への再clampを取り除いた。
+
+長いSendMessageTimeoutだけでは検索workerも取消を観測するまで止まるため、その案だけでは済ませない。
+検索prepare workerが開始する`everything-ipc` runは、query/取消token/一件用結果channelを所有する。
+IPC runのthread一つが不可視reply HWND、callback Box、packet、sendとpumpを一括所有し、
+handler完了前の返信をコピーし、parse/終端処理まで同threadを生かす。Everythingのcaller-thread監視も考慮する。
+thread-affine WindowsEndpointや借用bufferを別threadへ渡さない。
+
+検索workerは`WaitForMultipleObjects`で取消eventと完了eventを待つ。取消はnative sendを待たず戻り、
+receiverを手放す。IPC runはOSのbounded sendから戻って取消を観測し、active IDを失効して
+`nothing:`を最大100msで一回送信し、返信を待たずRAIIでHWNDを破棄する。旧callback/packet/送信bufferは
+send終了まで保持し、遅い完了は廃棄する。UI/検索workerでjoinせず、Everything側の処理停止は保証しない。
+callerにもstatus4回＋query60秒＋cleanupを含む65秒の上限を置く。caller側timeout/errorは
+利用者の取消flagを立てず、既存失敗経路へ通知する（取消との混同で失敗通知を消さない）。
+run/channel/eventは作成した検索だけが持ち、一覧、App/bundle field、Remote API、PDF epoch ownerは増やさない。
+元のrun/context/generationによる旧完了棄却とcontext退役の契約を保持する。
+
+timeout/ERROR_TIMEOUTと実hungは`Busy`/`Timeout`として同じ「処理が遅いか、混雑しています」案内へ接続。
+HWND不在のclient起動案内、索引未ロード、拒否/権限等の案内とは区別する。
+失敗logはmessage/status/errorにbudget/elapsedだけを追加し、queryやpathを出さない。
+まれなspawn/event/native失敗はlog＋既存通知。partial結果/回復owner/retry loopを追加しない。
+Everythingの設定、service/clientの起動・終了、mIV起動、downloadは行っていない。
+
+### 17.3 回帰と確認範囲
+
+fake HWNDがquery handler内で1.2秒停止してから再入返信する回帰で、旧1秒capを超えて成功することを確認する。
+別のfake handlerをeventで停止し、cancel後に検索workerの結果が先にCancelledとなり、
+旧HWNDはsend終了までIPC workerに保持され、handler解放後に破棄される順序を確認する。
+fake elapsed endpointではsend/replyが一つの60秒deadlineを共有し、timeout後の取消は一回/100msであること、
+status Busyではquery/取消/retryを送らないこと、Busy/Timeout文言が未起動と異なることも確認する。
+fake codec/reentrant/cancel/correlation回帰を維持し、実Everything probeは自動gateから除外する。
+Busy文言を検索barのsnapshot fixtureへ反映し、明暗/狭い幅の3 PNGを更新する。
+
+### 17.4 検証記録（2026-10-12）
+
+fmt check、normal/portable core check、UI glyph（危険文字0）が成功。
+Everything関連libは65 passed / 1 ignored（実client probe）、global_search_uiは81 passed。
+Everything UI snapshotは更新5 passed、更新flagなしの確認も5 passed。変更した3 PNGを目視確認した。
+今回のprivate transport/案内の変更ではfull libを再実行せず、共有一覧/pin/PDF/decoder等は
+先行ACCEPTed `5a0d92e21` の12,209 passed / 0 failed / 57 ignoredを再利用した。
+今回差分全体のfull-lib成功を主張するものではない。
+
+worktree内coreプロセス0を確認し、`scripts/build-dev.ps1 -PreserveRuntime` が成功。
+normal featureのdev-runtime core、Remote service、EPUB PDF workerとVCRT確認を完了した。
+core更新日時は2026-10-12 05:50:41、サイズ325,166,592 bytes。mIVの起動は行わず、未コミットで引き渡す。
+ログ、実probeの失敗観測、隔離data-dirの利用者確認手順は`target/EV-1374-impl-msg.txt`へ記録した。

@@ -8,6 +8,9 @@ accepted `SearchAccepted` / `EverythingPosition` がdraft・取得中・表示�
 `SearchPageEditPrepare` がimmutable datasetからsort/★/tag/編集情報を準備し、既存adoptionへ渡す。
 通常thumbnail・物理本open/back・F12 fork/park/promoteを利用し、検索専用の第二items/cache/worker群を作らない。
 Everything本体/SDK DLLは同梱せず、同PCで起動中の既定clientへ直接IPCする。
+IPCのHWND/send/pump/packetは検索ごとの`everything-ipc` runが一括所有し、検索prepare workerは
+完了event/取消eventで待つ。native sendが遅くても取消は先に返し、旧runは有限deadlineで自然退役する。
+[遅いsendと取消の契約](everything-search-plan.md#17-wm_copydataの遅い送信と取消2026-10-12)。
 raw10,000件・明示送信・完了後一括採用・mainの取消可能modalを使う。
 新設定field/DB/schema/検索履歴/Remote APIは追加せず、query/result一覧は永続化・診断ログへ保存しない。
 PDF共有poolの失効は先行改修 `4510346f5` / master `c1e66f589` のviewer-context ownerを使う。

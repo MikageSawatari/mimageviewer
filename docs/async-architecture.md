@@ -16,20 +16,29 @@ Everythingのrun/query/context/items generation/送信時policyと取消tokenを
 Remote acquireと同じsession mutex・typed ownerで受付を排他にするため、事前のUI bool検査後に
 Remoteが割り込む隙間を残さない。取消/失敗/採用/dropでleaseを解放する。
 公開phaseはLocalのままで兄弟窓を止めず、Remote wire schema/APIに検索を追加しない。
-送信と結果待ちは `SearchPageEditPrepare` のworkerから `everything_ipc` を呼ぶ。
-専用不可視reply windowとmessage pumpはtransportのRAII ownerが持ち、egui/HWNDを流用しない。
+`SearchPageEditPrepare` のworkerが `everything_ipc` を呼び、検索ごとのIPC runを開始する。
+専用不可視reply window/send/packet/message pumpはIPC run一つのthread-affine RAII ownerが持ち、
+egui/HWNDを流用しない。検索workerは完了event/取消eventをOSで待ち、取消時はnative sendやjoinを
+待たず戻る。IPC runはそのbounded sendが終わるまでHWND/callback/送信bufferを保持して自然退役する。
+caller threadを検索終了まで生かし、Everythingのcaller-thread監視と衝突しない。
+完了は一件用channelで移譲し、取消済みcallerの遅い完了はIPC worker内で破棄する。第二の一覧ownerは作らない。
 
 Win32送信失敗はworker内で、`SendMessageTimeoutW`直前にlast-errorを0へクリアし、
 戻り値直後の`GetLastError`とmessage/status番号だけを通常の非blocking loggerへ記録する。
 応答停止したclientへのversion照会失敗ではqueryを送らず、reply HWNDをRAIIで破棄する。
-retry・送信期限の延長・IPC versionのfallbackは行わない。実clientの応答停止を調べる
+retry・IPC versionのfallbackは行わない。実clientの応答停止を調べる
 手動のignored probeとfake HWND回帰は[調査記録](everything-search-plan.md#15-実everything-sendfailed調査2026-10-12)を参照。
 
-送信は1秒、reply待ちは送信開始から30秒まで。`WM_COPYDATA` callbackは16MiBの上限とrequest IDを
+statusは1秒/ABORTIFHUNG、queryはsend＋replyで合計60秒まで。
+query sendはERRORONEXITで待ち、CPU/DB処理中にmessage pumpが止まることだけでは失敗にしない。
+NOTIMEOUTIFNOTHUNG/BLOCKは使わない。caller全体にも65秒の上限（status4回＋query60秒＋cleanup）を置く。
+timeout/hungはBusy案内、IPC HWND不在はclient起動案内へ分ける。Process.RespondingはIPC windowの応答証明にしない。
+詳細と実機観測は[§17](everything-search-plan.md#17-wm_copydataの遅い送信と取消2026-10-12)を参照。
+`WM_COPYDATA` callbackは16MiBの上限とrequest IDを
 確認してowned bytesへコピーし、UTF-16/table/offset解釈と候補stat/DB準備はcallback外のworkerで行う。
 queryは終端を含む32,768 UTF-16 unitsまで、raw件数は10,000、offsetは0でpagingしない。
 取消/close/source切替/context retireは同じdrop/cancel境界へ通す。UIはworkerをjoinしない。
-取消時は同じreply HWNDへ`nothing:`を一度だけbounded送信して破棄し、応答や相手の停止を待たない。
+IPC runは取消を観測後、同じreply HWNDへ`nothing:`を一度だけ最大100msで送信して破棄し、返信や相手の停止を待たない。
 
 validated replyは `EverythingDataset` に分類・statし、`SearchProjection::Everything` から既存prepareへ
 渡す。sort/facet/編集metadataと完成items/metasを準備してから一回のadoptionで公開する。
