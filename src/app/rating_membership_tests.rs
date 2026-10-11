@@ -2465,6 +2465,97 @@ fn rating_deferred_warm_pdf_verification_keeps_chosen_endpoint_after_close_or_re
 }
 
 #[test]
+fn rating_grid_automatic_search_bar_close_without_events_keeps_return_authority() {
+    use crate::rating_membership::RatingOriginTarget;
+    use crate::settings::GridViewMode;
+    use crate::undo_stack::UndoEntry;
+
+    for view in [GridViewMode::Thumbnail, GridViewMode::Details] {
+        for extension in ["pdf", "epub"] {
+            for redo in [false, true] {
+                let mut app = setup_app();
+                let source = app.tmp.path().join(format!("pages.{extension}"));
+                std::fs::write(&source, b"test paged document").unwrap();
+                install(
+                    &mut app,
+                    (0..3)
+                        .map(|page_num| GridItem::PdfPage {
+                            pdf_path: source.clone(),
+                            page_num,
+                            content_type: None,
+                        })
+                        .collect(),
+                );
+                app.current_folder = Some(source);
+                app.fullscreen_idx = None;
+                app.settings.grid_view_mode = view;
+                app.settings.rating_filter = ONLY_THREE;
+                app.move_grid_cursor(Some(1), GridCursorIntent::Automatic);
+                assert!(app.set_rating(1, 4));
+                assert_eq!(app.selected, Some(2));
+                if redo {
+                    app.apply_meta_undo();
+                    assert_eq!(app.selected, Some(1));
+                }
+                let entry = if redo {
+                    app.meta_undo.peek_redo()
+                } else {
+                    app.meta_undo.peek_undo()
+                };
+                let Some(UndoEntry::Rating {
+                    origin: Some(origin),
+                    ..
+                }) = entry
+                else {
+                    panic!("rating history must own the grid return");
+                };
+                let origin = origin.clone();
+                assert!(matches!(origin.target, RatingOriginTarget::Grid(_)));
+                let intent = RatingAdoptionIntent::RestoreOrigin(origin.clone());
+                let _sender = controlled_rating_request(&mut app, intent.clone());
+                let selected = app.selected;
+                let shift_anchor = anchor(&app);
+                let history_lengths = (app.meta_undo.undo_len(), app.meta_undo.redo_len());
+                app.show_search_bar = true;
+                app.search_query = "leftover query".into();
+                app.search_has_focus = true;
+                assert!(app.grid_is_pdf_pages());
+
+                let ctx = egui::Context::default();
+                ctx.begin_pass(egui::RawInput::default());
+                assert!(ctx.input(|input| input.events.is_empty()));
+                app.render_search_bar(&ctx);
+                let _ = ctx.end_pass();
+
+                assert!(!app.show_search_bar);
+                assert!(app.search_query.is_empty());
+                assert!(!app.search_has_focus);
+                assert_eq!(app.selected, selected);
+                assert_eq!(anchor(&app), shift_anchor);
+                assert_eq!(
+                    (app.meta_undo.undo_len(), app.meta_undo.redo_len()),
+                    history_lengths
+                );
+                let entry = if redo {
+                    app.meta_undo.peek_redo()
+                } else {
+                    app.meta_undo.peek_undo()
+                };
+                assert!(matches!(
+                    entry,
+                    Some(UndoEntry::Rating { origin: Some(kept), .. }) if kept == &origin
+                ));
+                assert_eq!(
+                    app.rating_view_pending.as_ref().unwrap().rating_adoption,
+                    intent,
+                    "automatic close must keep the pending return ({view:?}, {extension}, redo={redo})"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn rating_grid_explicit_scope_and_search_acceptance_cancel_return_but_auto_keeps_it() {
     use crate::settings::GridViewMode;
     for view in [GridViewMode::Thumbnail, GridViewMode::Details] {

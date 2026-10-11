@@ -340,3 +340,13 @@ Automaticの全production呼出function (同function内の複数landingもすべ
 pickerの開始時刻だけをテストで制御し、長押し後の中央releaseがCancelledとなり
 context menuを開かないこともassertする。短い右クリックのmenu選択による別の取消で
 開始境界の欠落が隠れる再現を避ける。実時間sleep／native inputは使わない。
+
+### 自動検索バー整理の分類訂正 (2026-10-11、P3)
+
+`render_search_bar` がPDF／EPUBのページ一覧への遷移後に残ったバーを閉じる分岐は、
+入力イベントがなくても通る自動整理であり、Explicitの入口ではない。検索状態のclear、
+local search workerのcancel、既存可視集合の再投影だけを行い、明示cursor操作を発行しない。
+同contextのGrid Undo/Redo originと保留RestoreOriginを失効させない。
+×／Esc等の利用者による検索解除は従来どおりExplicitKeepとする。
+サムネイル／Details・PDF／EPUB・Undo／Redoの各組合せで、イベントなしの描画による
+自動終了後も履歴origin・pending intent・cursor／Shift起点を保持する回帰を追加する。

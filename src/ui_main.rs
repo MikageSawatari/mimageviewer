@@ -15437,7 +15437,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             self.search_filter_origin_folder = None;
             self.search_has_focus = false;
             self.search_tag_bridge.clear();
-            self.move_grid_cursor(self.selected, crate::app::GridCursorIntent::ExplicitKeep);
+            // Automatic cleanup after a source transition is not an explicit selection.
+            // Keep the context's rating history and pending return authority intact.
             self.cancel_search_pending();
             self.rebuild_visible_indices();
             return;
