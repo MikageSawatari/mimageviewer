@@ -4674,3 +4674,9 @@ G3 REVISE追補（2026-10-11）: required Hiddenの初回open拒否も、Missing
 loading shellがActiveとなった場合も同経路でClosing→context退去→session/runtime終了へ進む。
 main/兄弟のitems・generation・選択・composition・cancel tokenは不変としてconsumer fixtureで検査する。
 新しいdetached state、keep-alive guard、時間窓、HWND/placement操作は追加しない。
+
+G3 文書方向追補（2026-10-11）: 構成解除・PC再入場・Remoteのbinding/方向解決を共有resolverへ集約する。
+contextと共に保持する`BookCompositionSource::Document`に元EPUBのReadTarget/世代leaseを載せ、
+解除投影workerがその世代の方向を使う。別viewerの新世代公開へ読み直さず、既存bundle/snapshotの
+clone・swap・dropによるsource所有を維持する。PDF列挙は投影workerで行いUIで待機しない。
+新しいdetached state/述語/viewport/keep-alive機構は追加せず、元世代の保持をconsumer fixtureで検査する。

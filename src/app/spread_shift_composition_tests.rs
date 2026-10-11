@@ -68,6 +68,7 @@ fn composed(app: &mut App, root: &Path) {
             count: 4,
             metadata: None,
             physical_source: root.to_path_buf(),
+            read_target: None,
         },
         generation: app.items_generation,
         cause: ProjectionAdoptionCause::Normal,

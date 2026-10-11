@@ -1891,7 +1891,7 @@ impl App {
             } => {
                 let has_saved_spread = self.spread_db.as_ref().is_ok_and(|db| {
                     let stored = db.get_state_with_fallback(&path, None);
-                    stored.mode.is_some() || stored.view_mode.is_some()
+                    !stored.needs_document_direction(true)
                 });
                 let want_direction =
                     self.settings.follow_document_reading_direction && !has_saved_spread;
@@ -4100,9 +4100,7 @@ impl App {
                     || {
                         self.spread_db.as_ref().is_ok_and(|db| {
                             let stored = db.get_state_with_fallback(&path, None);
-                            stored.mode.is_some()
-                                || stored.view_mode.is_some()
-                                || stored.direction.is_some()
+                            !stored.needs_document_direction(true)
                         })
                     },
                 );

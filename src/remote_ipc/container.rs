@@ -6233,10 +6233,8 @@ impl ContainerEngine {
         };
         let (stored, final_cover_preference, singleton_placement_preference, page_alone_preference) =
             self.stored_spread_state(&key.exact, key.fallback.as_deref())?;
-        let stored_mode = stored.mode;
-        let stored_direction = stored.direction;
         let source_items = source_items.unwrap_or(items);
-        let (mut default_mode, mut default_direction) = if use_book_defaults {
+        let (default_mode, default_direction) = if use_book_defaults {
             (
                 reading_settings.default_spread_mode,
                 reading_settings.default_reading_direction,
@@ -6247,18 +6245,12 @@ impl ContainerEngine {
                 crate::settings::ReadingDirection::Ltr,
             )
         };
-        // A saved direction without a saved mode rotates the default mode, as on PC.
-        if let (None, Some(direction)) = (stored_mode, stored_direction) {
-            default_mode = default_mode.with_reading_direction(direction);
-        }
         // The open operation owns the target used for count, direction and dimensions.
-        // Only an enabled D10 without a saved book value reads a plain PDF's direction.
-        if reading_settings.follow_document_reading_direction
-            && stored_mode.is_none()
-            && stored.view_mode.is_none()
-            && stored_direction.is_none()
+        // A viewing classification does not override an inherited document direction.
+        let document_direction = if stored
+            .needs_document_direction(reading_settings.follow_document_reading_direction)
         {
-            let document_direction = if is_epub_path(&resolved.logical) {
+            if is_epub_path(&resolved.logical) {
                 read.and_then(|target| target.epub_direction)
             } else if is_pdf_path(&resolved.logical) {
                 read.map(|target| {
@@ -6278,27 +6270,23 @@ impl ContainerEngine {
                 .flatten()
             } else {
                 None
-            };
-            if let Some(direction) = document_direction {
-                default_direction = match direction {
-                    crate::pdf_loader::PdfReadingDirection::L2R => {
-                        crate::settings::ReadingDirection::Ltr
-                    }
-                    crate::pdf_loader::PdfReadingDirection::R2L => {
-                        crate::settings::ReadingDirection::Rtl
-                    }
-                };
-                default_mode = default_mode.with_reading_direction(default_direction);
             }
-        }
+        } else {
+            None
+        };
+        let reading = stored.resolve_reading(
+            default_mode,
+            default_direction,
+            reading_settings.follow_document_reading_direction,
+            document_direction,
+        );
         let (configured, effective, reading_direction) = resolve_spread_state(
             request.spread_mode,
             request.reading_direction,
-            (stored.mode.is_some() || stored.view_mode.is_some())
-                .then(|| stored.resolve_mode(default_mode, default_direction)),
-            stored_direction,
-            default_mode,
-            default_direction,
+            None,
+            None,
+            reading.mode,
+            reading.direction,
             request.force_single_page,
         );
         // ZIP has always reported media counts for the bounded response. Its
@@ -11380,6 +11368,80 @@ mod tests {
         };
         assert_eq!(payload.configured_spread_mode, RemoteSpreadMode::Ltr);
         assert_eq!(payload.reading_direction, RemoteReadingDirection::Ltr);
+    }
+
+    #[test]
+    fn remote_epub_mode_only_without_binding_keeps_document_direction() {
+        use crate::settings::{ReadingDirection, SpreadMode};
+        use crate::spread_db::StoredViewMode;
+
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        let epub = root.path().join("rtl-mode-only.epub");
+        std::fs::write(&epub, b"epub").unwrap();
+        open_parent_catalog(&epub)
+            .unwrap()
+            .set_pdf_meta_safe("rtl-mode-only.epub", 707, 400, 1)
+            .unwrap();
+        let _pin = crate::pdf_loader::pin_epub_with_direction_for_test(
+            &epub,
+            707,
+            400,
+            crate::pdf_loader::PdfReadingDirection::R2L,
+        );
+        let db = crate::spread_db::SpreadDb::open().unwrap();
+        for (saved_mode, view_mode, rtl_mode, ltr_mode) in [
+            (
+                SpreadMode::Single,
+                StoredViewMode::Single,
+                RemoteSpreadMode::Single,
+                RemoteSpreadMode::Single,
+            ),
+            (
+                SpreadMode::Ltr,
+                StoredViewMode::Spread,
+                RemoteSpreadMode::RtlCover,
+                RemoteSpreadMode::LtrCover,
+            ),
+            (
+                SpreadMode::SplitLtr,
+                StoredViewMode::LandscapeSplit,
+                RemoteSpreadMode::SplitRtl,
+                RemoteSpreadMode::SplitLtr,
+            ),
+        ] {
+            db.set_mode_only(&epub, saved_mode).unwrap();
+            let stored = db.get_state_with_fallback(&epub, None);
+            assert_eq!((stored.mode, stored.direction), (None, None));
+            assert_eq!(stored.view_mode, Some(view_mode));
+            for (follow, expected_mode, expected_direction) in [
+                (true, rtl_mode, RemoteReadingDirection::Rtl),
+                (false, ltr_mode, RemoteReadingDirection::Ltr),
+            ] {
+                let engine = ContainerEngine::new(crate::settings::Settings {
+                    default_spread_mode: SpreadMode::LtrCover,
+                    default_reading_direction: ReadingDirection::Ltr,
+                    follow_document_reading_direction: follow,
+                    ..Default::default()
+                });
+                let ContainerResponse::Success(payload) =
+                    engine.container(remote_epub_request(&epub))
+                else {
+                    panic!("mode-only EPUB open failed: {view_mode:?}, follow={follow}");
+                };
+                assert_eq!(
+                    (
+                        payload.configured_spread_mode,
+                        payload.effective_spread_mode,
+                        payload.reading_direction,
+                    ),
+                    (expected_mode, expected_mode, expected_direction),
+                    "{view_mode:?}, follow={follow}",
+                );
+                assert!(!payload.composition_managed);
+                assert_eq!(db.get_state_with_fallback(&epub, None), stored);
+            }
+        }
     }
 
     #[test]

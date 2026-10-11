@@ -77,7 +77,61 @@ pub(crate) struct StoredSpreadState {
     pub(crate) direction: Option<ReadingDirection>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ResolvedSpreadReading {
+    pub(crate) mode: SpreadMode,
+    pub(crate) direction: ReadingDirection,
+}
+
 impl StoredSpreadState {
+    /// A viewing classification does not specify binding or reading direction.
+    pub(crate) fn needs_document_direction(self, follow: bool) -> bool {
+        follow && self.mode.is_none() && self.direction.is_none()
+    }
+
+    /// Resolve the book's binding/direction before projecting its viewing class.
+    /// Single keeps the resolved direction even though its mode has no direction.
+    pub(crate) fn resolve_reading(
+        self,
+        default_mode: SpreadMode,
+        default_direction: ReadingDirection,
+        follow_document_direction: bool,
+        document_direction: Option<crate::pdf_loader::PdfReadingDirection>,
+    ) -> ResolvedSpreadReading {
+        let document_direction = self
+            .needs_document_direction(follow_document_direction)
+            .then_some(document_direction)
+            .flatten()
+            .map(|direction| match direction {
+                crate::pdf_loader::PdfReadingDirection::L2R => ReadingDirection::Ltr,
+                crate::pdf_loader::PdfReadingDirection::R2L => ReadingDirection::Rtl,
+            });
+        let preferred_direction = self.direction.or(document_direction);
+        let binding = self.mode.unwrap_or_else(|| {
+            preferred_direction
+                .map(|direction| default_mode.with_reading_direction(direction))
+                .unwrap_or(default_mode)
+        });
+        let direction = binding
+            .reading_direction()
+            .or(preferred_direction)
+            .unwrap_or(default_direction);
+        let mode = match self.view_mode {
+            None => binding,
+            Some(StoredViewMode::Single) => SpreadMode::Single,
+            Some(StoredViewMode::Spread) => if binding.has_cover() {
+                SpreadMode::LtrCover
+            } else {
+                SpreadMode::Ltr
+            }
+            .with_reading_direction(direction),
+            Some(StoredViewMode::LandscapeSplit) => {
+                SpreadMode::SplitLtr.with_reading_direction(direction)
+            }
+        };
+        ResolvedSpreadReading { mode, direction }
+    }
+
     /// Combine the viewing choice only after exact/fallback/default binding resolution.
     /// Single/Vertical bindings have no embedded direction; their direction column
     /// still controls Spread/Split. A missing binding keeps inherited cover settings.
@@ -86,28 +140,8 @@ impl StoredSpreadState {
         default_mode: SpreadMode,
         preferred_direction: ReadingDirection,
     ) -> SpreadMode {
-        let binding = self.mode.unwrap_or(default_mode);
-        let Some(view_mode) = self.view_mode else {
-            return binding;
-        };
-        let direction = self
+        self.resolve_reading(default_mode, preferred_direction, false, None)
             .mode
-            .and_then(SpreadMode::reading_direction)
-            .or(self.direction)
-            .or(default_mode.reading_direction())
-            .unwrap_or(preferred_direction);
-        match view_mode {
-            StoredViewMode::Single => SpreadMode::Single,
-            StoredViewMode::Spread => if binding.has_cover() {
-                SpreadMode::LtrCover
-            } else {
-                SpreadMode::Ltr
-            }
-            .with_reading_direction(direction),
-            StoredViewMode::LandscapeSplit => {
-                SpreadMode::SplitLtr.with_reading_direction(direction)
-            }
-        }
     }
 }
 

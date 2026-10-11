@@ -13,7 +13,9 @@ Webの既存方向/表紙付きキーは抽出一覧では表示種別だけへr
 2026-10-11 G3でstrict protocolを**v70**へ更新し、`SetViewMode`とderived `composition_managed`を追加した。
 構成あり本の結合`SetSpread`はworkerの最新snapshotで拒否し、Webは表示分類だけ切り替える。
 mode-onlyの本別保存は既存spread.db worker、抽出結果は非永続の表示投影。構成/shift writerを呼ばない。
-mode-onlyの読取は休眠bindingと閲覧分類を分離し、親/全体の方向・表紙を解決してから分類を適用する。
+mode-onlyの読取は休眠bindingと閲覧分類を分離し、親/全体と文書由来の既定方向・表紙を解決してから分類を適用する。
+表示分類は文書方向の読取を止めず、Single/Spread/Splitとも同じ解決済み方向を使う。
+文書情報は要求が所有するReadTargetから取得し、PDFの方向列挙は既存worker経路に留める。
 PCの解除・再入場と同じ純粋resolverを使う内部読取修正で、wire字段とprotocol v70は変更しない。
 非対応ページ名では構成を使わず従来の操作を維持し、通知とlogを出す。書庫や保存構成を変更しない。
 この段でRemote構成editorやG5の表示/export全体を実装済みとはしない。

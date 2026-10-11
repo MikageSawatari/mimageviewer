@@ -1,5 +1,13 @@
 # 仮想フォルダ (ZIP / RAR / PDF / EPUB) 処理
 
+### G3 mode-onlyと文書方向（2026-10-11）
+
+表示分類だけの保存は本別binding/方向の指定とは扱わない。文書方向追従ONで両方未設定なら、
+既存のPDF/EPUB open workerが方向を取得し、共通resolverがその既定を解決してからSingle/Spread/Splitを適用する。
+PDFのwarm placeholder/collection/smart-folder preflightも同じ取得要否を使う。構成解除は元EPUB世代を保持し、
+必要なPDF方向列挙を投影workerへ載せる。追従OFFと保存済みbinding/方向の優先は維持する。
+公開v4.5.0ではこのbinding未設定mode-only保存形式は存在しない（調査記録はbook-composition-plan G3）。
+
 ## 本の列生成と抽出一覧（§1.242 G1）
 
 `app/book_materialization` が、安全性・種類policy・同名除去後の本の行を生成する。

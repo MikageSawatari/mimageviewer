@@ -49,6 +49,7 @@ fn install(app: &mut App, root: &std::path::Path, book: &BookComposition) {
             count: 4,
             metadata: None,
             physical_source: root.to_path_buf(),
+            read_target: None,
         },
         generation: app.items_generation,
         cause: crate::app::book_composition_runtime::ProjectionAdoptionCause::Normal,

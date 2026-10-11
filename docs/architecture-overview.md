@@ -12,7 +12,9 @@ G3はraw manifestと保存構成からworkerで共通projectionを作り、items
 列挙待ちの再開要求はsource完了境界が所有し、完了後の構成待ちだけ提示許可ownerへ移す。
 構成pollは未完成のsource要求を消費せず、採用時にscope/context/旧世代を照合して継続する。
 required HiddenもMissingと同じ所有context限定の初回open終端へ通し、detached session/runtimeを終了する。
-mode-onlyは休眠bindingと表示分類を分離して読取り、方向列・親表紙を解決した後で分類を適用する。
+mode-onlyは休眠bindingと表示分類を分離して読取り、方向列・親表紙・文書由来の既定を解決した後で分類を適用する。
+構成解除・PC再入場・Remote再入場は同じ純粋resolverからmodeと方向を受け取り、Singleにも方向を保持する。
+EPUBの解除はsourceが保持するReadTarget/世代leaseの方向、PDFは投影workerの列挙結果を使う。
 通常のAutomatic再採用は構成解除causeを発行せず、snapshot復帰のsession shiftを保持する。
 Checking/Hiddenはcached textureも描画に使わず、抽出結果の行生成/thumbnailに構成lookupを追加しない。
 類似候補の長押しプレビューは既存preview ownerで候補のidentityをservice FIFOへ渡し、

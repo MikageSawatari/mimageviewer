@@ -21,6 +21,8 @@ pub(crate) enum BookCompositionSource {
         count: u32,
         metadata: Option<(i64, i64)>,
         physical_source: std::path::PathBuf,
+        /// Retain the immutable EPUB generation used for the installed source.
+        read_target: Option<crate::pdf_loader::ReadTarget>,
     },
 }
 
@@ -46,9 +48,14 @@ pub(crate) struct BookProjectionReply {
     pub(crate) rows: super::book_materialization::MaterializedBookRows,
     pub(crate) landing: Option<usize>,
     pub(crate) edits: Option<super::page_edit_snapshot::StablePageEditProjection>,
-    pub(crate) automatic_preferences: Option<crate::spread_db::StoredSpreadState>,
+    pub(crate) automatic_preferences: Option<AutomaticBookPreferences>,
     pub(crate) refresh_landings: std::collections::HashMap<usize, Option<usize>>,
     pub(crate) saved_trim: Option<crate::view_trim_db::ViewTrimWriteBatch>,
+}
+
+pub(crate) struct AutomaticBookPreferences {
+    stored: crate::spread_db::StoredSpreadState,
+    document_direction: Option<crate::pdf_loader::PdfReadingDirection>,
 }
 
 #[derive(Default)]
@@ -549,6 +556,7 @@ impl App {
             .map(|(count, physical_source)| BookCompositionSource::Document {
                 count,
                 metadata: self.image_metas.first().copied().flatten(),
+                read_target: crate::pdf_loader::pinned_epub_target(&physical_source),
                 physical_source,
             })
             .unwrap_or_default()
@@ -933,6 +941,8 @@ impl App {
         let worker_record = record.clone();
         let worker_origin = origin.clone();
         let data_dir = crate::data_dir::get();
+        let follow_document_direction = self.settings.follow_document_reading_direction;
+        let document_password = self.pdf_open_password(&scope.logical_root);
         let pending_trim = self.pending_composition_trim_batch();
         // Submit through the existing FIFO before starting projection work.
         // Superseded workers must not write older edits after newer requests.
@@ -965,6 +975,8 @@ impl App {
                     &data_dir,
                     pending_trim,
                     trim_receipt,
+                    follow_document_direction,
+                    document_password.as_deref(),
                 );
                 // The existing ROOT pending-wake contract collects this completion without input.
                 let _ = sender.send(result);
@@ -1214,13 +1226,21 @@ impl App {
         self.spread_shift.availability = self.pairing_edit_availability();
         if removing {
             let defaults = super::SpreadRestoreDefaults::for_book(&self.settings);
-            let stored = reply.automatic_preferences.unwrap_or_default();
-            let direction = stored.direction.unwrap_or(defaults.reading_direction);
-            let mode = stored.resolve_mode(
-                defaults.spread_mode.with_reading_direction(direction),
-                direction,
+            let preferences = reply
+                .automatic_preferences
+                .unwrap_or(AutomaticBookPreferences {
+                    stored: Default::default(),
+                    document_direction: None,
+                });
+            let stored = preferences.stored;
+            let resolved = stored.resolve_reading(
+                defaults.spread_mode,
+                defaults.reading_direction,
+                self.settings.follow_document_reading_direction,
+                preferences.document_direction,
             );
-            self.reading_direction = mode.reading_direction().unwrap_or(direction);
+            let mode = resolved.mode;
+            self.reading_direction = resolved.direction;
             self.reading_flow = stored.flow.unwrap_or(defaults.reading_flow);
             self.spread_mode = if mode == crate::settings::SpreadMode::Vertical {
                 self.reading_flow = crate::settings::ReadingFlow::Vertical;
@@ -1309,6 +1329,8 @@ fn prepare_book_projection(
     data_dir: &std::path::Path,
     pending_trim: Option<crate::view_trim_db::ViewTrimWriteBatch>,
     trim_receipt: Option<mpsc::Receiver<Result<(), String>>>,
+    follow_document_direction: bool,
+    document_password: Option<&str>,
 ) -> Result<BookProjectionReply, String> {
     use super::book_materialization::*;
     let composition = record.map(|record| &record.composition);
@@ -1346,6 +1368,7 @@ fn prepare_book_projection(
             count,
             metadata,
             physical_source,
+            ..
         } => {
             let (mtime, size) = metadata.unwrap_or_default();
             let (items, metas, _) = materialize_cached_document_rows(
@@ -1493,9 +1516,43 @@ fn prepare_book_projection(
             _ => &[],
         };
         let key = crate::spread_db::container_key_with_fallback(&scope.logical_root, segments);
-        crate::spread_db::SpreadDb::open_existing_read_only_at(&data_dir.join("spread.db"))
-            .map_err(|error| error.to_string())?
-            .map(|db| db.get_state_with_fallback(&key.exact, key.fallback.as_deref()))
+        let stored =
+            crate::spread_db::SpreadDb::open_existing_read_only_at(&data_dir.join("spread.db"))
+                .map_err(|error| error.to_string())?
+                .map(|db| db.get_state_with_fallback(&key.exact, key.fallback.as_deref()))
+                .unwrap_or_default();
+        let document_direction = if stored.needs_document_direction(follow_document_direction) {
+            match source {
+                BookCompositionSource::Document {
+                    read_target: Some(read),
+                    ..
+                } => read.epub_direction,
+                BookCompositionSource::Document {
+                    physical_source, ..
+                } => {
+                    let read = crate::pdf_loader::resolve_read_target(physical_source)
+                        .map_err(|error| error.to_string())?;
+                    crate::pdf_loader::enumerate_pages_with_read_target(
+                        physical_source,
+                        &read,
+                        document_password,
+                        None,
+                        crate::pdf_loader::EnumerateOptions {
+                            want_direction: true,
+                        },
+                    )
+                    .map_err(|error| error.to_string())?
+                    .direction
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        Some(AutomaticBookPreferences {
+            stored,
+            document_direction,
+        })
     } else {
         None
     };

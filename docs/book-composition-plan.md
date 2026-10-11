@@ -1555,6 +1555,25 @@ mode-onlyは既存spread.dbのmode整数に表示分類を載せ、元の結合b
 binding未設定は専用値で表し、mode行作成だけでLTR/Pagedを作らない。direction/flow/端配置/補助/shiftを変更しない。
 読取値は休眠bindingと表示分類を分け、exact→fallback→既定のbinding/方向/表紙を解決してから分類を適用する。
 旧Single/Verticalの方向列、binding未設定時の親RtlCoverも解除・再入場・metadata復元・Remoteで共通に維持する。
+文書方向追従ONでbinding/方向が未設定なら、文書由来の既定も解決してから表示分類を適用する。
+Singleにも解決済み方向を保持し、Spreadは既定の表紙指定、Splitは同じ方向を使う。
+構成解除・PC再入場・Remote再入場は`StoredSpreadState::resolve_reading`を共有し、
+文書方向の取得要否も`needs_document_direction`で決める。表示分類だけの保存は取得を止めない。
+構成解除ではaccepted sourceが元EPUBの`ReadTarget`/世代leaseを保持し、その世代の方向を使う。
+PDFの方向が必要なら投影workerで既存read-target列挙を行い、所有contextのpasswordを渡す。
+UIに文書/DB/FS読取や待機を追加しない。解決を一箇所に集約し、追加の復元stateは作らない。
+
+2026-10-11 P2-3再修正の公開版調査（ソース確認、製品起動による観測ではない）:
+v4.5.0 tag `1ff9d07df`には`StoredViewMode`/binding未設定codecがなく、通常のPC/Remote保存は
+結合modeと方向を保存する。PC/Remoteとも保存mode・方向がなければ文書方向を採用する。
+従って「binding未設定＋mode-only保存」の今回の不一致は公開版では成立せず、G3で導入した保存状態の不具合。
+旧`SpreadDb::set`のmode列だけの更新も、方向/表紙を含む結合bindingを保存するため、新mode-onlyとは異なる。
+公開版の根拠は`spread_db.rs`の旧読取型/NOT NULL schemaと`set_presentation_state`、
+`ui_fullscreen.rs::persist_spread_presentation`、`remote_ipc/ui.rs::persist_remote_spread`、両再入場の方向採用条件。
+回帰fixtureはbinding/方向未設定・全体LTR表紙あり・RTL EPUBに対するSingle/Spread/Splitで、
+実際の解除・PC再入場とRemote応答のmode/方向、追従OFF、保存行不変を検査する。
+別のEPUB世代が公開されても、構成解除は元のaccepted世代の方向を維持する。
+
 解除用shift復元causeは実際のComposed→Automatic採用にだけ与える。構成なしのgeneration再照合や★固定解除は
 通常の保持列復帰であり、snapshot ownerが復元した記憶OFFのsession shiftを保持する。
 required Hidden初回openはMissingと同じcontext限定の既存終端処理へ渡し、Preparing sessionとloading runtimeを終了する。

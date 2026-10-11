@@ -12709,23 +12709,20 @@ impl SpreadRestoreDefaults {
     }
 }
 
+#[cfg(test)]
 fn default_spread_for_document_direction(
     mode: crate::settings::SpreadMode,
     follow: bool,
     direction: Option<crate::pdf_loader::PdfReadingDirection>,
 ) -> crate::settings::SpreadMode {
-    if !follow {
-        return mode;
-    }
-    match direction {
-        Some(crate::pdf_loader::PdfReadingDirection::R2L) => {
-            mode.with_reading_direction(crate::settings::ReadingDirection::Rtl)
-        }
-        Some(crate::pdf_loader::PdfReadingDirection::L2R) => {
-            mode.with_reading_direction(crate::settings::ReadingDirection::Ltr)
-        }
-        None => mode,
-    }
+    crate::spread_db::StoredSpreadState::default()
+        .resolve_reading(
+            mode,
+            crate::settings::ReadingDirection::Ltr,
+            follow,
+            direction,
+        )
+        .mode
 }
 
 pub(crate) fn pdf_meta_placeholder_allowed(
@@ -26003,44 +26000,15 @@ impl App {
         self.final_cover_spread_preference = final_cover_preference;
         self.singleton_spread_endpoint_preferences = endpoint_preferences;
         self.page_alone_preferences = page_alone_preferences;
-        let applied_document_direction = if self.settings.follow_document_reading_direction
-            && stored.mode.is_none()
-            && stored.view_mode.is_none()
-            && stored.direction.is_none()
-        {
-            document_direction.map(|direction| match direction {
-                crate::pdf_loader::PdfReadingDirection::R2L => {
-                    crate::settings::ReadingDirection::Rtl
-                }
-                crate::pdf_loader::PdfReadingDirection::L2R => {
-                    crate::settings::ReadingDirection::Ltr
-                }
-            })
-        } else {
-            None
-        };
-        // A saved mode fixes its own direction. A direction-only row rotates the default mode.
-        // Single has no embedded direction and keeps the saved/document/default direction.
-        let preferred_direction = stored
-            .direction
-            .or(applied_document_direction)
-            .unwrap_or(defaults.reading_direction);
-        let default_spread = if stored.direction.is_some() {
-            defaults
-                .spread_mode
-                .with_reading_direction(preferred_direction)
-        } else {
-            default_spread_for_document_direction(
-                defaults.spread_mode,
-                self.settings.follow_document_reading_direction,
-                document_direction,
-            )
-        };
-        let stored_spread = stored.resolve_mode(default_spread, preferred_direction);
+        let resolved = stored.resolve_reading(
+            defaults.spread_mode,
+            defaults.reading_direction,
+            self.settings.follow_document_reading_direction,
+            document_direction,
+        );
+        let stored_spread = resolved.mode;
         self.reading_flow = stored.flow.unwrap_or(defaults.reading_flow);
-        self.reading_direction = stored_spread
-            .reading_direction()
-            .unwrap_or(preferred_direction);
+        self.reading_direction = resolved.direction;
         if stored_spread == crate::settings::SpreadMode::Vertical {
             self.spread_mode = crate::settings::SpreadMode::Single;
             self.reading_flow = crate::settings::ReadingFlow::Vertical;
@@ -37286,9 +37254,7 @@ impl App {
             || {
                 self.spread_db.as_ref().is_ok_and(|db| {
                     let stored = db.get_state_with_fallback(&pdf_path, None);
-                    stored.mode.is_some()
-                        || stored.view_mode.is_some()
-                        || stored.direction.is_some()
+                    !stored.needs_document_direction(true)
                 })
             },
         );
