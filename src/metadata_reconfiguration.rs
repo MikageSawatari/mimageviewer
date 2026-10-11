@@ -789,6 +789,34 @@ mod tests {
             .is_some()
     }
 
+    /// Ownership/cleanup fixtures must have one live document per SQLite Ok row.
+    /// Deliberate missing-document fixtures do not call this helper.
+    fn seed_documents(stores: &Stores, paths: impl IntoIterator<Item = (String, Uuid)>) {
+        let docs = paths
+            .into_iter()
+            .map(|(path, favorite_id)| crate::fts_index::IndexDoc {
+                path,
+                container: crate::fts_index::Container::Fs,
+                zip_entry: String::new(),
+                favorite_id,
+                kind: crate::fts_index::IndexKind::Image,
+                mtime: 1,
+                file_size: 1,
+                norms: Default::default(),
+            })
+            .collect();
+        stores
+            .writer
+            .batch(
+                docs,
+                Vec::new(),
+                true,
+                true,
+                crate::fts_writer_dispatcher::WriterPriority::Background,
+            )
+            .unwrap();
+    }
+
     #[test]
     fn startup_integrity_counts_empty_equal_failed_orphan_and_deleted_alive_docs() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1535,6 +1563,7 @@ mod tests {
         let stores = stores(tmp.path());
         let outer = favorite(1, PathBuf::from("c:/photos"), true);
         let inner = favorite(2, PathBuf::from("c:/photos/inner"), true);
+        let mut documents = Vec::new();
         for (p, id) in [
             ("c:/photos/inner/x.jpg", outer.id),
             ("d:/orphan.jpg", Uuid::new_v4()),
@@ -1550,13 +1579,18 @@ mod tests {
                     1,
                 )
                 .unwrap();
+            documents.push((p.into(), id));
         }
+        seed_documents(&stores, documents);
         let config = Configuration::new(&[outer, inner], Vec::new());
         assert_eq!(
             startup_cleanup(&stores, &config).unwrap(),
             HashSet::from(["c:/photos/inner".into()])
         );
         assert!(stores.meta.list_path_owners().unwrap().is_empty());
+        assert_eq!(stores.fts.searcher().num_docs(), 0);
+        assert!(!stores.meta.tantivy_rebuild_pending().unwrap());
+        assert!(stores.reporter.take_notifications().is_empty());
     }
     #[test]
     fn startup_cleanup_streams_valid_rows_without_collecting_them() {
@@ -1576,6 +1610,10 @@ mod tests {
                 )
                 .unwrap();
         }
+        seed_documents(
+            &stores,
+            (0..1000).map(|i| (format!("c:/photos/{i}.jpg"), f.id)),
+        );
         stores
             .meta
             .mark_scanned_once("c:/photos", "complete")
@@ -1603,6 +1641,9 @@ mod tests {
             stores.meta.scanned_once("c:/photos").unwrap().as_deref(),
             Some("complete")
         );
+        assert_eq!(stores.fts.searcher().num_docs(), 1000);
+        assert!(!stores.meta.tantivy_rebuild_pending().unwrap());
+        assert!(stores.reporter.take_notifications().is_empty());
     }
 
     #[test]
@@ -1620,6 +1661,7 @@ mod tests {
             "d:/off/x.jpg",
             "e:/orphan.jpg",
         ];
+        let mut documents = Vec::new();
         for (path, id, root) in valid
             .iter()
             .map(|p| (*p, outer.id, &outer.path))
@@ -1638,7 +1680,9 @@ mod tests {
                 .meta
                 .upsert_meta_ok(path, id, root, crate::fts_index::IndexKind::Image, 1, 1)
                 .unwrap();
+            documents.push((path.into(), id));
         }
+        seed_documents(&stores, documents);
         rusqlite::Connection::open(tmp.path().join("meta.db"))
             .unwrap()
             .execute(
@@ -1663,6 +1707,9 @@ mod tests {
         );
         assert_eq!(startup_cleanup(&stores, &config).unwrap(), targets.roots);
         assert_eq!(stores.meta.list_path_owners().unwrap().len(), 3);
+        assert_eq!(stores.fts.searcher().num_docs(), 3);
+        assert!(!stores.meta.tantivy_rebuild_pending().unwrap());
+        assert!(stores.reporter.take_notifications().is_empty());
     }
     #[test]
     fn startup_cleanup_read_failure_does_not_delete_collected_paths() {
@@ -1682,6 +1729,10 @@ mod tests {
                 )
                 .unwrap();
         }
+        seed_documents(
+            &stores,
+            ["c:/x/orphan.jpg", "c:/x/invalid-text.jpg"].map(|path| (path.into(), id)),
+        );
         let conn = rusqlite::Connection::open(tmp.path().join("meta.db")).unwrap();
         // TEXT sorts before BLOB in the covering index: an orphan is collected before failure.
         conn.execute(
@@ -1696,6 +1747,8 @@ mod tests {
                 .unwrap(),
             2
         );
+        assert!(has_doc(&stores, "c:/x/orphan.jpg"));
+        assert!(has_doc(&stores, "c:/x/invalid-text.jpg"));
         assert_eq!(stores.meta.scanned_once("c:/x").unwrap(), None);
         assert!(stores.meta.tantivy_rebuild_pending().unwrap());
         assert_eq!(
@@ -1707,34 +1760,40 @@ mod tests {
     fn cleanup_failure_sets_rebuild_pending_and_notifies_without_runtime_wipe() {
         let tmp = tempfile::tempdir().unwrap();
         let stores = stores(tmp.path());
+        let id = Uuid::new_v4();
         stores
             .meta
             .upsert_meta_ok(
                 "c:/x.jpg",
-                Uuid::new_v4(),
+                id,
                 std::path::Path::new("c:/"),
                 crate::fts_index::IndexKind::Image,
                 1,
                 1,
             )
             .unwrap();
+        seed_documents(&stores, [("c:/x.jpg".into(), id)]);
         let mut runtime =
             Runtime::start(stores.clone(), Configuration::new(&[], Vec::new())).unwrap();
         settled(&runtime);
+        assert!(!stores.meta.tantivy_rebuild_pending().unwrap());
+        assert!(stores.reporter.take_notifications().is_empty());
         stores
             .meta
             .upsert_meta_ok(
                 "c:/retained.jpg",
-                Uuid::new_v4(),
+                id,
                 std::path::Path::new("c:/"),
                 crate::fts_index::IndexKind::Image,
                 1,
                 1,
             )
             .unwrap();
+        seed_documents(&stores, [("c:/retained.jpg".into(), id)]);
         cleanup_failure(&stores, &"injected cleanup failure");
         assert!(stores.meta.tantivy_rebuild_pending().unwrap());
         assert!(stores.meta.get("c:/retained.jpg").unwrap().is_some());
+        assert!(has_doc(&stores, "c:/retained.jpg"));
         assert_eq!(stores.reporter.take_notifications().len(), 1);
         runtime.shutdown();
     }

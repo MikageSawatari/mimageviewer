@@ -22,8 +22,11 @@ agent に実行を依頼する場合は別途、具体的な条件・時間・de
    標準の検証用 exe はそのままにし、手順末尾で既定 OFF の build に戻す。
    測定前に `cargo test -p mimageviewer --lib --features fts-startup-integrity startup_integrity`
    で feature 付き入口 (cleanupより先の比較を含む) の回帰を完了する。実装時の通常構成の
-   helper/fixture の成功をこの入口の成功へ読み替えない。実装時に残った一時 directory のACLによる
-   環境 block は [実装記録 §12](fts-integrity-plan.md) と `target/I-1367-impl-msg.txt` を参照。
+   helper/fixture の成功をこの入口の成功へ読み替えない。`bee3d4aa0` の実装後、ACL block を
+   解消した環境でこの入口、feature 付き core check、cleanup/manager 回帰を確認済み。
+   正常 fixture の両ストア対応と解析器の不正 manifest 対応の追補差分は未コミット。
+   コマンド・件数・ログは [実装記録 §12.2](fts-integrity-plan.md#122-起動点検-feature-の検証追補-2026-10-11)
+   と `target/I-1367-impl-msg.txt` を参照。採用 A/B は未実施。
 2. 新規の使い捨て profile にテスト対象の root のみを登録し、840,000 行以上の正常な両ストアを
    準備する。ユーザーの settings.db をコピーしない。FS ↔ SQLite の署名、所有 UUID、scan 印と
    設定を一致させ、live Tantivy 文書は各 Ok 行に一つずつ対応させる。tag/rating/bookmark 等は不要。
@@ -53,6 +56,10 @@ Failed=0/84/756,418 の追加 COUNT+num_docs は 1.788/0.221/15.141ms だった�
 件数・segments・ownership SQL scan と原ログは
 [実装記録 §12.1](fts-integrity-plan.md#121-非対話-fixture-の費用-採用判定ではない) を参照。
 これを理由に feature を採用しない。
+
+追補では feature ON の lib test 実行体でも同じ ignored test が成功し、追加 COUNT+num_docs は
+0.093/0.082/11.625ms だった。各1回・通常構成の test compile と同時実行で、起動 A/B ではない。
+詳細は [実装記録 §12.2](fts-integrity-plan.md#122-起動点検-feature-の検証追補-2026-10-11) を参照。
 
 ## 手動測定の条件と起動
 
@@ -104,6 +111,7 @@ A/B で起点を揃え、duration の `ms` と混同しない。
 
 manifest の `runs` は実施順。以下の1行を24条件×3 pair×2 armへ拡張する。
 pair 内は A/B 同じ fixture、次の pair は BA、次は AB。ログ path は manifest の相対 path。
+`runs` は配列で指定する。`null` 等の異なる型は理由付きの `not_adopt` (exit 1) として出力する。
 
 ```json
 {

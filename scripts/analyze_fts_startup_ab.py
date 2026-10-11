@@ -100,6 +100,9 @@ def analyze(manifest, base):
     reasons, groups, diagnostics = [], {}, []
     if not isinstance(manifest, dict):
         return {"status": "not_adopt", "reasons": ["manifest must be an object"]}
+    runs = manifest.get("runs", [])
+    if not isinstance(runs, list):
+        return {"status": "not_adopt", "reasons": ["manifest runs must be an array"]}
     if manifest.get("schema") != 1:
         reasons.append("manifest schema must be 1")
     for name in ("source_revision", "build_profile", "common_build_options", "fixture_preparation", "cache_protocol", "contention_protocol"):
@@ -108,7 +111,7 @@ def analyze(manifest, base):
     resolution = manifest.get("measurement_resolution_ms")
     if not finite_number(resolution) or resolution < 1:
         reasons.append("record measurement_resolution_ms >= 1 (perf t is rounded to milliseconds; not a delay allowance)")
-    for index, run in enumerate(manifest.get("runs", [])):
+    for index, run in enumerate(runs):
         try:
             condition = (run["cache"], run["skip_offline_change_scan"], run["failed_population"], run["io"])
             if condition not in CONDITIONS or type(run["skip_offline_change_scan"]) is not bool:

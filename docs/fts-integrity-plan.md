@@ -590,7 +590,8 @@ normal profileの実行は利用者だけ。既存事故copyはread-only、通�
 
 ## 12. 実装記録 (2026-10-11、受理済み R3 本文は維持)
 
-実装対象は `02c2b4c4b` からの未コミット差分。ローカル Tantivy 0.26.1 は実ファイルとして
+初回実装対象は `02c2b4c4b` からの差分で、利用者が `bee3d4aa0` にコミット済み。
+ローカル Tantivy 0.26.1 は実ファイルとして
 `vendor/tantivy` へ固定し、完成済み TempPath の Windows persist だけを最大4回まで再実行する。
 上位の document/delete/commit は再実行しない。由来・原版 checksum・変更箇所は
 `vendor/tantivy/MIV-PATCH.md` に記録した。通常 build は `miv-test-hooks` を含まない。
@@ -632,13 +633,14 @@ unit test 8件と UI glyph lint zero は成功。Rust/full/build と fixture の
 は通常 feature の core/remote/EPUB worker とPE検査まで成功し、実アプリは起動していない。
 先行失敗と最終実行条件も引き継ぎ記録へ残し、全体 gate を起動性能の証拠に使わない。
 
-**起動点検 feature 付きの追加検証は環境 block のため未完了。** 解析器の初期テストで作成した
+初回引き継ぎでは、起動点検 feature 付きの追加検証が環境 block のため未完了だった。
+解析器の初期テストで作成した
 `scripts/tmp26xigyp9` を Cargo が列挙できず、OS access denied で compile 前に止まった。
-agent 側のACL照会/修復・非再帰削除も失敗し、通常 PowerShell での対象だけの環境整理を依頼済み。
+agent 側のACL照会/修復・非再帰削除も失敗し、通常 PowerShell での対象だけの環境整理を依頼した。
 現在の解析器テストは在メモリ fixture で、この directory を新たに作らない。
-Cargo 設定で拒否を隠さず、解消後に feature 付き `startup_integrity` filter を完了する。
+Cargo 設定で拒否を隠さず、利用者の対象 directory 整理後に §12.2 の検証を完了した。
 正常構成の helper/fixture の成功を、この feature 入口の成功へ読み替えない。
-点検は未採用・既定 OFF のままで、A/B前にもこの検証を完了する。
+点検は未採用・既定 OFF のまま。初回の block 記録は引き継ぎファイルに保持する。
 
 ### 12.1 非対話 fixture の費用 (採用判定ではない)
 
@@ -657,3 +659,53 @@ Cargo 設定で拒否を隠さず、解消後に feature 付き `startup_integri
 ownership SQL scan は空 callback の streaming 読取で、実製品の UUID/所有範囲判定全体の時間ではない。
 追加時間はこの fixture/実行時の実測値であり、壁時計上限や起動 ready の無影響を保証しない。
 feature付き実行経路の検証とも区別し、§7.4の起動 A/B 条件はそのまま維持する。
+
+### 12.2 起動点検 feature の検証追補 (2026-10-11)
+
+利用者が `scripts/tmp26xigyp9` の ACL reset/削除と実装の `bee3d4aa0` へのコミットを完了した後、
+残っていた feature ON の検証を完了した。以下の追補差分は未コミット。
+新しい一時 directory は system temp または `target/` だけを使い、実アプリは起動していない。
+
+最初の feature ON cleanup 回帰では2件失敗した。正常 fixture が SQLite Ok 行だけを作り、
+対応する Tantivy 文書を作っていなかったため、点検が正しく欠落を報告し、scan 印と通知数の
+前提を変えたもの。正常な ownership/cleanup fixture を両ストアが一致する状態へ修正し、
+通知無し/pending無しと文書保持・削除も確認した。意図的な欠落 fixture、期待値、timeout、
+製品の検出条件は緩めていない。`metadata_reconfiguration.rs` の変更は `#[cfg(test)]` module
+内のみで、module より前の製品 source が HEAD と同一であることも照合した。
+
+解析器の CLI 確認では `runs: null` が未捕捉 TypeError になったため、配列でない `runs` を
+理由付き `not_adopt` (exit 1) にする入力検証と回帰を追加した。実ファイルの合成 perf log
+144本/24条件を CLI へ渡し、正常同時間・B遅延・checkpoint欠落・不正runsの4ケースを確認した。
+stdout と `--output` の JSON も一致した。これは解析器の確認であり、起動計測の証拠ではない。
+
+| 検証 | 結果 | 原ログ (`target/` 内) |
+| --- | --- | --- |
+| feature ON `--lib startup_integrity` | 4 passed / 0 failed / 1 ignored | `I-1367-startup-feature-verification.log` |
+| feature ON core check (test hook無し) | exit 0 | `I-1367-startup-feature-core-check.log` |
+| feature ON `--lib metadata_reconfiguration` (修正後) | 23 passed / 0 failed / 1 ignored | `I-1367-startup-feature-reconfiguration.log` |
+| feature ON `--lib indexer_manager` | 21 passed / 0 failed | `I-1367-startup-feature-manager.log` |
+| feature OFF `--lib metadata_reconfiguration` (修正後) | 22 passed / 0 failed / 1 ignored | `I-1367-followup-default-reconfiguration.log` |
+| feature ON ignored 840,464行 fixture | 1 passed / 0 failed | `I-1367-startup-feature-fixture-cost.log` |
+| 解析器 Python unit test | 9 passed | `I-1367-ab-analyzer-reverification.log` |
+| 合成ログでの解析器 CLI | 4ケース成功 (採用証拠ではない) | `I-1367-ab-cli-smoke.log` |
+| fmt / diff whitespace check | exit 0 | `I-1367-followup-fmt.log` / `I-1367-followup-diff-check.log` |
+
+filter 同士の重複は合計しない。先行の cleanup 21 passed / 2 failed / 1 ignored は
+`I-1367-startup-feature-reconfiguration-before.log` に保存した。先行の不正runs CLI の traceback は
+`I-1367-ab-invalid-runs-before.log`、修正後の拒否結果は `I-1367-ab-invalid-runs-after.log` に保存した。
+変更がテスト・解析器・文書のみのため、製品 runtime が変わっていない通常構成の full/portable/
+確認用 build は §12 の有効な結果を再利用し、今回の追加成功を全体 gate へ加算しない。
+
+feature ON の Cargo lib test 実行体から同じ ignored test を直接実行した費用は次の通り。
+各1回、feature OFF の test compile と同時実行で、idle/cold/warm の統制はない。
+
+| Failed 行 | 生存文書 | segments | ownership SQL scan (ms) | 追加 COUNT + num_docs (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 840,464 | 7 | 189.411 | 0.093 |
+| 84 | 840,380 | 7 | 185.937 | 0.082 |
+| 756,418 | 84,046 | 5 | 174.818 | 11.625 |
+
+§12.1 と同じく SQL scan は空 callback の streaming 読取。これを起動時間の上限、A/B、
+UI-readyへの無影響と読み替えない。点検は未採用・既定 OFF。利用者の隔離 A/B は
+[計測手順](fts-startup-ab-measurement.md) に従う。未計測/欠落/ノイズ/判断不能/悪化なら
+不採用とする §7.4 の条件に変更はない。

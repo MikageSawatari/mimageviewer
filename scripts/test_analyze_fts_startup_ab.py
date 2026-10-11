@@ -28,6 +28,15 @@ class StartupAbTests(unittest.TestCase):
         with patch.object(ab, "read_run", side_effect=self.measured):
             self.assertEqual(ab.analyze(self.manifest(), Path("."))["status"], "evidence_ready_for_review")
 
+    def test_runs_must_be_an_array_and_invalid_manifest_is_not_adopt(self):
+        for invalid in (None, False, 1, "runs", {}):
+            with self.subTest(runs=invalid):
+                manifest = self.manifest()
+                manifest["runs"] = invalid
+                report = ab.analyze(manifest, Path("."))
+                self.assertEqual(report["status"], "not_adopt")
+                self.assertIn("manifest runs must be an array", report["reasons"])
+
     def test_any_positive_delta_is_not_adopt_even_below_resolution(self):
         def measured(run, base):
             values, diagnostic = self.measured(run, base)
