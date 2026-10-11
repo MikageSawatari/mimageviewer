@@ -19,6 +19,7 @@ REQUIRED_CASES = (
     "tray-close-while-loading", "tray-close-after-loading", "perf-cached", "perf-uncached",
 )
 HITCH_MS = 100.0
+STARTUP_FIRST_FRAME_MAX_GAP_MS = 500.0
 MIN_DRAWN_SAMPLES = 200
 U64_MAX = (1 << 64) - 1
 SOURCE_ORIGINS = {"source_generated", "source_intrinsic"}
@@ -610,6 +611,40 @@ def analyze_perf_smoke(events: list[dict], *, expected_pid: int | None = None,
     slow_updates = [classify_update(row) for row in sorted(updates.values(), key=lambda r: (r["start_t"], r["n"]))
                     if row["total_ms"] > HITCH_MS]
     slow_by_n = {row["n"]: row for row in slow_updates}
+    # Use the earliest operation interval, not a small startup timestamp. The
+    # initial command-line folder load is startup; the explicit workload starts
+    # with folder_loads (or first_ai in the optional independent session).
+    operation_windows = [evidence.get("search"), evidence.get("first_ai"), evidence.get("folder_open")]
+    for field in ("folder_loads", "navigation"):
+        windows = evidence.get(field)
+        if isinstance(windows, list):
+            operation_windows.extend(windows)
+    operation_starts = [span[0] for window in operation_windows if isinstance(window, dict)
+                        and (span := interval(window)) is not None]
+    first_operation_t = min(operation_starts, default=None)
+    startup_first_frames = [e for e in events if (e.get("cat"), e.get("kind")) == ("startup", "first_frame")]
+    init_completions = [e for e in events if (e.get("cat"), e.get("kind")) == ("startup", "indexer_manager_new")]
+
+    def startup_first_frame_gap(gap: dict, tail: dict) -> bool:
+        update = updates[gap["n"]]
+        # early_return alone also describes fullscreen/navigation exits. Prove
+        # that the startup init worker was still pending after this update, so
+        # the earlier startup-overlay guard owned the return. Perf event t is
+        # rounded to milliseconds; require a full 1ms margin for that witness.
+        return (gap["n"] == 1 and gap["next_n"] == 2
+                and gap["gap_ms"] <= STARTUP_FIRST_FRAME_MAX_GAP_MS + 1e-9
+                and tail.get("early_return") is True and tail.get("action") == "request_repaint"
+                and number(tail.get("delay_ms")) == 0 and 1 not in pre_grid_numbers
+                and update["outer_measured"] and update["total_ms"] <= HITCH_MS
+                and gap["start_t"] - .001 <= tail["t"] <= update["end_t"] + .001
+                and first_operation_t is not None and gap["end_t"] < first_operation_t
+                and len(startup_first_frames) == 1
+                and abs(startup_first_frames[0]["t"] - gap["start_t"]) <= .001
+                and len(init_completions) == 1
+                and (init_span := interval(init_completions[0], "ms")) is not None
+                and update["start_t"] - .001 <= init_span[0] <= update["end_t"]
+                and init_completions[0]["t"] > update["end_t"] + .001)
+
     for gap in gaps:
         n, tail = gap["n"], tails.get(gap["n"], {})
         if n not in updates or not tail:
@@ -620,6 +655,10 @@ def analyze_perf_smoke(events: list[dict], *, expected_pid: int | None = None,
             if (any(c.startswith("known-") for c in gap["categories"]) and tail.get("action") != "none"
                     and outside_ms > HITCH_MS and "unexplained" not in gap["categories"]):
                 gap["categories"].append("unexplained")
+        elif startup_first_frame_gap(gap, tail):
+            gap["categories"] = ["known-startup-first-frame"]
+            gap["first_operation_t"] = first_operation_t
+            gap["upper_bound_ms"] = STARTUP_FIRST_FRAME_MAX_GAP_MS
         elif tail.get("action") == "none":
             gap["categories"] = ["normal-sleep"]
         elif tail.get("action") == "request_repaint_after_idle_upgrade":
@@ -637,6 +676,8 @@ def analyze_perf_smoke(events: list[dict], *, expected_pid: int | None = None,
         result["failures"].append(f"unexplained >100ms gap/update in frames {unexplained_frames}")
     if any(any(c.startswith("known-") for c in r["categories"]) for r in slow_updates):
         result["warnings"].append("known startup/initial AI stalls retained; not a shipping waiver")
+    if any("known-startup-first-frame" in g["categories"] for g in gaps):
+        result["warnings"].append("known-startup-first-frame gap retained (user accepted 2026-10-11; maximum 500ms)")
     drawn_stats = stats(drawn)
     below = sum(ms < 16 - 1e-9 for ms in drawn)
     ratio = below / len(drawn) if drawn else None
@@ -657,7 +698,8 @@ def analyze_perf_smoke(events: list[dict], *, expected_pid: int | None = None,
                                 "stages_ms": {k: v for k, v in e.items() if k.endswith("_ms") and k != "total_ms"}}
                                for e in pre_grid if e["total_ms"] > .3]
     classification_stats = {}
-    for category in ("normal-sleep", "normal-idle-upgrade-wake", "known-startup-scan", "known-first-ai", "unexplained"):
+    for category in ("normal-sleep", "normal-idle-upgrade-wake", "known-startup-first-frame",
+                     "known-startup-scan", "known-first-ai", "unexplained"):
         matching_gaps = [g for g in gaps if category in g["categories"]]
         matching_updates = [u for u in slow_updates if category in u["categories"]]
         classification_stats[category] = {
@@ -1016,6 +1058,16 @@ def release_record(result: dict) -> str:
             lines.append("  known形の最大値 / scan / viewport " + json.dumps(
                 {k: v for k, v in metrics.get("classifications", {}).items() if k.startswith("known-")},
                 ensure_ascii=False) + "。")
+            for gap in evidence.get("gaps", []):
+                if "known-startup-first-frame" in gap.get("categories", []):
+                    lines.append(f"  known-startup-first-frame: frame 1→2、{gap['gap_ms']:.3f}ms "
+                                 f"(t={gap['start_t']}→{gap['end_t']}、上限 {gap['upper_bound_ms']}ms、"
+                                 f"最初の測定操作 t={gap['first_operation_t']} より前、利用者了承2026-10-11)。")
+            for update in evidence.get("slow_updates", []):
+                reason = f"slow update {update['n']} lacks stage breakdown"
+                if reason in case.get("environment_errors", []):
+                    lines.append(f"  環境注記: {reason}、{update['total_ms']:.3f}ms "
+                                 f"(t={update['start_t']}→{update['end_t']})。段別証拠不足の環境不成立を維持。")
         if metrics and "drawn" not in metrics:
             lines.append("  metrics " + json.dumps(metrics, ensure_ascii=False) + "。")
         clock = evidence.get("clock")

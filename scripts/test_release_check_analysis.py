@@ -151,6 +151,113 @@ def test_directory():
 
 
 class PerfTests(unittest.TestCase):
+    def startup_overlay_gap(self, seconds=.2, frame=1):
+        events = perf_events({frame - 1: seconds})
+        # Actual startup precedes the first folder_loads interval, unlike the
+        # generic fixture whose frame stream starts during the workload.
+        for event in events:
+            if event.get("cat") in ("frame", "ui"):
+                for field in ("t", "prev_update_start_t", "prev_update_end_t"):
+                    value = event.get(field)
+                    if value is not None:
+                        event[field] = value - 1
+            if event.get("kind") == "tail_repaint" and event.get("n") == frame:
+                event.update(early_return=True, delay_ms=0)
+        events = [e for e in events if not (e.get("kind") == "pre_grid_breakdown" and e.get("n") == frame)]
+        events.extend([{"cat": "startup", "kind": "first_frame", "t": 5},
+                       {"cat": "startup", "kind": "indexer_manager_new", "t": 5.006, "ms": 6}])
+        return events
+
+    def test_known_startup_first_frame_is_bounded_and_reported_separately(self):
+        for seconds in (.2, .5):
+            with self.subTest(seconds=seconds):
+                events = self.startup_overlay_gap(seconds)
+                result = perf(events)
+                self.assertEqual(result["verdict"], "PASS_WITH_WARNINGS", result)
+                self.assertEqual(result["metrics"]["gap_categories"], {"known-startup-first-frame": 1})
+                self.assertEqual(result["metrics"]["drawn"]["n"], 201)
+                self.assertAlmostEqual(result["metrics"]["drawn"]["max_ms"], seconds * 1000)
+                self.assertAlmostEqual(result["evidence"]["gaps"][0]["gap_ms"], seconds * 1000)
+                text = release_record({"verdict": result["verdict"], "cases": [result]})
+                self.assertIn(f"frame 1→2、{seconds * 1000:.3f}ms", text)
+                self.assertIn("上限 500.0ms", text)
+                self.assertEqual(result, perf(list(reversed(events))))
+
+    def test_startup_first_frame_over_500ms_stays_fail(self):
+        result = perf(self.startup_overlay_gap(.500001))
+        self.assertEqual(result["verdict"], "FAIL")
+        self.assertEqual(result["metrics"]["gap_categories"], {"unexplained": 1})
+
+    def test_startup_early_return_on_later_frame_stays_fail(self):
+        result = perf(self.startup_overlay_gap(frame=2))
+        self.assertEqual(result["verdict"], "FAIL")
+        self.assertEqual(result["metrics"]["gap_categories"], {"unexplained": 1})
+
+    def test_startup_first_frame_cannot_overlap_or_follow_measured_operation(self):
+        for start in (4.9, 5.1, 5.2):
+            with self.subTest(start=start):
+                evidence = operations()
+                evidence["folder_loads"][0].update(start_t=start, end_t=5.807)
+                self.assertEqual(perf(self.startup_overlay_gap(), evidence)["verdict"], "FAIL")
+
+    def test_startup_first_frame_requires_overlay_and_startup_witnesses(self):
+        for mutation in ("ordinary-tail", "delayed-tail", "grid", "missing-startup", "init-already-done",
+                         "init-started-later", "init-started-before-first-update"):
+            with self.subTest(mutation=mutation):
+                events = self.startup_overlay_gap()
+                tail = next(e for e in events if e.get("kind") == "tail_repaint" and e.get("n") == 1)
+                init = next(e for e in events if e.get("kind") == "indexer_manager_new")
+                if mutation == "ordinary-tail":
+                    tail["early_return"] = False
+                elif mutation == "delayed-tail":
+                    tail.update(action="request_repaint_after_observed", delay_ms=16)
+                elif mutation == "grid":
+                    events.append({"cat": "ui", "kind": "pre_grid_breakdown", "n": 1, "t": 5.001, "total_ms": .2})
+                elif mutation == "missing-startup":
+                    events.remove(next(e for e in events if e.get("kind") == "first_frame"))
+                elif mutation == "init-already-done":
+                    init["t"] = 4.999
+                elif mutation == "init-started-later":
+                    init["ms"] = 1
+                else:
+                    init["ms"] = 1000
+                self.assertEqual(perf(events)["verdict"], "FAIL")
+
+    def test_startup_gap_without_operation_boundary_is_not_waived(self):
+        evidence = operations()
+        evidence.pop("folder_loads")
+        evidence.pop("navigation")
+        evidence["search"].pop("start_t")
+        result = perf(self.startup_overlay_gap(), evidence)
+        self.assertEqual(result["verdict"], "FAIL")
+        self.assertEqual(result["metrics"]["gap_categories"], {"unexplained": 1})
+
+    def test_startup_category_does_not_waive_slow_update_or_other_gap(self):
+        events = self.startup_overlay_gap()
+        slow_update(events, 0, 150, grid_ms=140)
+        self.assertEqual(perf(events)["metrics"]["gap_categories"], {"unexplained": 1})
+        events = self.startup_overlay_gap()
+        # A second stop is ordinary request_repaint even with the known gap.
+        for event in events:
+            if event.get("cat") in ("frame", "ui") and event.get("n", 0) >= 3:
+                for field in ("t", "prev_update_start_t", "prev_update_end_t"):
+                    if event.get(field) is not None:
+                        event[field] += .2
+        result = perf(events)
+        self.assertEqual(result["verdict"], "FAIL")
+        self.assertEqual(result["metrics"]["gap_categories"], {"known-startup-first-frame": 1, "unexplained": 1})
+
+    def test_slow_update_without_stage_breakdown_remains_environment_note(self):
+        events = self.startup_overlay_gap()
+        slow_update(events, 3, 150, grid_ms=140)
+        events = [e for e in events if not (e.get("kind") == "update_breakdown" and e.get("n") == 4)]
+        result = perf(events)
+        self.assertEqual(result["verdict"], "SKIPPED", result)
+        self.assertIn("slow update 4 lacks stage breakdown", result["environment_errors"])
+        text = release_record({"verdict": result["verdict"], "cases": [result]})
+        self.assertIn("環境注記: slow update 4 lacks stage breakdown、150.000ms", text)
+        self.assertIn("environment_errors: slow update 4 lacks stage breakdown", text)
+
     def test_complete_natural_drawn_samples_pass(self):
         result = perf(perf_events())
         self.assertEqual(result["verdict"], "PASS", result)

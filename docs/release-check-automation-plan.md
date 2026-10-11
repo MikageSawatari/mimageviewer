@@ -216,10 +216,27 @@ egui / key_input 注入は通常 handler を検査するが、実 OS キーボ�
 
 | 分類（上から優先） | 根拠と扱い |
 | --- | --- |
+| `known-startup-first-frame` | **frame 1→2 の gap だけ、100ms超かつ500ms以下**。frame 1 の startup-overlay early-return を下記証跡で確認し、gap 全体が最初の測定操作より前にある場合だけ認定する。update 自体の100ms超は免除しない。利用者了承2026-10-11、実時間・区間・上限を release-record に別記 |
 | `known-startup-scan` | 最初の起動 folder-load 区間の同 frame で `lf_scan >100ms` が update の主成分。t が小さいだけでは認定しない。v4.5.0 の tail=`none` / scan 572ms も拾う。件数・gap / update 最大・scan 内訳を別記 |
 | `known-first-ai` | 明示した初回 AI 操作区間で `request_repaint_after_ai_upscale` と同 frame の fullscreen viewport >100ms が主成分で、初回 AI 開始の証拠が揃うもの。後続 AI、証拠不足、同期 I/O の別段は対象外。GPU 競合という原因までは断定しない |
 | `normal-sleep` / `normal-idle-upgrade-wake` | 上記 / 遅い update がなく、直前 frame の tail が `none`、または idle upgrade の予定遅延 wake。gap は sleep 込みなので正常。tail を結合できない場合は正常にしない |
 | `unexplained` | それ以外の 100ms 超 gap / update。`request_repaint` 中の停止、未知の遅延 wake、同型でも通常操作中の scan、AI の反復停止を含め FAIL |
+
+**利用者決定2026-10-11**: Phase 4 の frame 1→2 に共通する約130–230msの停止は、
+最初の startup-overlay update の後、測定操作の前にある既知の起動停止として許容する。
+調査記録は `nv/F4h` と `target/F-phase4-results-2026-10-11.md`。原因の断定や一般の起動免除にはしない。
+`known-startup-first-frame` の上限は余裕を持たせた **500ms** とし、超過は `unexplained` / FAIL に残す。
+既存ログの frame 1 tail が `early_return=true` / `request_repaint` / `delay_ms=0`、pre-grid がなく、
+outer update が100ms以下であること、同区間に一意の `startup.first_frame` があることを確認する。
+他の early-return と区別するため、一意の `startup.indexer_manager_new` の計測開始が
+frame 1 update 内（開始側のms丸め許容1ms）にあり、その完了 t が update 終了より1ms超後であることも要求する
+（perf event t のms丸めを考慮し、overlay guard 時点で init worker が未完了だったことを確認）。
+最初の測定操作は folder-load / navigation / search / 明示 first-AI の有効区間の最小 start_t とし、
+gap 終了がそれより厳密に前であることを要求する。初期 command-line folder load は起動区間。
+証跡が欠ける場合、frame 2以降、測定操作開始以降、更新自体の停止には新カテゴリを適用しない。
+既存の分類、drawn分母、全 raw pre-grid、100ms超更新の判定は変更しない。
+`slow update <n> lacks stage breakdown` が再発した場合は、frame・更新時間・区間を
+release-record の環境注記に明記し、従来の証拠不足／環境不成立と PASS 禁止を維持する。
 
 主成分は遅い update の計測時間の過半を占める段とする。既知形の中に別の100ms超の段がある場合は
 unexplained も残す。既知形自体も warning とし、増悪は最大値と旧 run 比較で責任者へ報告する。
@@ -277,8 +294,10 @@ run-id と case、対象 SHA / dirty fingerprint、exe hash / feature / profile�
 - **perf smoke cached / uncached**: <各判定>、folder open / Ctrl+Down x5 / Ctrl+G結果 / exit <証跡>。
   各 total frames <n>、drawn <16ms <k>/<n> (<%>) / p95 <ms> / max <ms>、
   pre_grid total p50 / p95 / max <ms>。100ms超 gaps <n> / updates <n>、
-  normal-sleep <n>、idle-upgrade wake <n>、known-startup <n / 最大 / lf_scan>、
+  normal-sleep <n>、idle-upgrade wake <n>、known-startup-first-frame <frame 1→2 / gap実時間 / 区間 / 上限500ms / 最初の操作t>、
+  known-startup-scan <n / 最大 / lf_scan>、
   known-first-ai <n / 最大 / viewport / backend、または未実施>、unexplained <n / 詳細パス>。
+  環境注記 <slow update lacks stage breakdown があれば frame / 更新時間 / 区間、環境不成立を維持>。
 - **手動確認**: 実データ規模 <未実施 / 利用者の結果>、実[×] / tray復帰 <結果>、
   当該版のnative描画・IME・DPI等 <必要な経路 / 結果>。診断portableを配布coreの実測とは扱わない。
 ```
