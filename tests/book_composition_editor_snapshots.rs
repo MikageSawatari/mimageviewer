@@ -384,3 +384,41 @@ fn composition_editor_accepts_only_ime_filtered_dialog_keys() {
     });
     assert!(actions.contains(&EditorUiAction::Cancel));
 }
+
+#[test]
+fn composition_editor_folder_name_snapshot_and_footer_at_200_percent() {
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    for (theme, name) in [
+        (mimageviewer::os_theme::ResolvedTheme::Light, "light"),
+        (mimageviewer::os_theme::ResolvedTheme::Dark, "dark"),
+    ] {
+        let mut view = fixture(EditorPhase::Editing);
+        view.book_name = "\u{753b}\u{50cf}\u{30d5}\u{30a9}\u{30eb}\u{30c0}_\u{9577}\u{3044}\u{65e5}\u{672c}\u{8a9e}\u{540d}_\u{672c}\u{306e}\u{69cb}\u{6210}\u{3068}\u{30da}\u{30fc}\u{30b8}\u{9806}".into();
+        view.saved = false;
+        view.can_remove = false;
+        view.error = None;
+        let title = view.book_name.clone();
+        let mut h = view_harness(
+            egui::vec2(1093.0, 614.0),
+            2.0,
+            theme,
+            view,
+            EditorUiState::default(),
+        );
+        h.run();
+        assert!(h.get_by_label(&title).rect().is_positive());
+        for label in [
+            "\u{4fdd}\u{5b58}",
+            "\u{30ad}\u{30e3}\u{30f3}\u{30bb}\u{30eb}",
+        ] {
+            assert_control_inside(&h, label, name);
+        }
+        assert!(
+            h.get_by_label("\u{69cb}\u{6210}\u{3092}\u{89e3}\u{9664}")
+                .accesskit_node()
+                .is_disabled()
+        );
+        h.snapshot(format!("composition_editor_folder_1093_614_200_{name}"));
+        snapshots.extend(h.take_snapshot_results());
+    }
+}

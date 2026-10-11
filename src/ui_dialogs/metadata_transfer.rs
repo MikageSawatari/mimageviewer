@@ -97,6 +97,7 @@ impl WorkerMessage {
 }
 
 struct ImportWorkerResources {
+    folder_backup_enabled: bool,
     sidecars: HashMap<PathBuf, crate::sidecar::SidecarFile>,
     tags_db: Option<crate::tags_db::TagsDb>,
 }
@@ -404,6 +405,7 @@ impl App {
                     // handoff are part of the worker preparation stage.  Move their
                     // ownership instead of doing file I/O on the UI thread.
                     let resources = ImportWorkerResources {
+                        folder_backup_enabled: self.settings.sidecar_backup_enabled,
                         sidecars: std::mem::take(&mut self.sidecars),
                         tags_db: self.tags_db.take(),
                     };
@@ -1135,6 +1137,9 @@ fn draw_result(ui: &mut egui::Ui, result: &ResultState, recursive: bool) {
                 summary.committed.composition_replacements,
                 summary.committed.composition_removals,
             ));
+            for warning in &summary.folder_backup_warnings {
+                ui.colored_label(ui.visuals().warn_fg_color, warning);
+            }
             if summary.skipped_kind_mismatch > 0 {
                 ui.colored_label(
                     ui.visuals().warn_fg_color,
@@ -1288,6 +1293,7 @@ fn start_import_worker_with_progress(
     let (tx, rx) = mpsc::sync_channel(WORKER_CHANNEL_CAPACITY);
     state.rx = Some(rx);
     state.stage = Stage::Running;
+    let folder_backup_enabled = resources.folder_backup_enabled;
     let resources = Arc::new(Mutex::new(resources));
     state.import_resources = Some(Arc::clone(&resources));
     let spawn = std::thread::Builder::new()
@@ -1319,13 +1325,17 @@ fn start_import_worker_with_progress(
             let flush_result = view_trim_result.and_then(|()| flush_import_sidecars(&resources));
             let preparation_ms = preparation_started.elapsed().as_secs_f64() * 1000.0;
             let result = match flush_result {
-                Ok(()) => {
-                    crate::metadata_transfer::import_at(&data_dir, &root, &cancel, move |value| {
+                Ok(()) => crate::metadata_transfer::import_at_with_folder_backup(
+                    &data_dir,
+                    &root,
+                    &cancel,
+                    folder_backup_enabled,
+                    move |value| {
                         on_progress(&value);
                         progress_relay.send(value);
-                    })
-                    .map_err(|error| error.to_string())
-                }
+                    },
+                )
+                .map_err(|error| error.to_string()),
                 Err(error) => Err(error),
             };
 
@@ -1342,6 +1352,18 @@ fn start_import_worker_with_progress(
                     Ok(resources) => resources,
                     Err(poisoned) => poisoned.into_inner(),
                 };
+                if let Ok(summary) = &result {
+                    // Modal import owns these cache values until this terminal.
+                    // Retire clean pre-import roots after mirroring, including
+                    // an empty/no-op family. Dirty/write-disabled owners remain.
+                    resources.sidecars.retain(|folder, sidecar| {
+                        sidecar.is_dirty()
+                            || !summary
+                                .committed
+                                .folder_composition_backups
+                                .contains(folder)
+                    });
+                }
                 resources.tags_db = tags_db;
             }
             let worker_ms = worker_started.elapsed().as_secs_f64() * 1000.0;
@@ -1410,6 +1432,7 @@ pub(crate) fn run_import_worker_for_test(
     assert!(start_import_worker_with_progress(
         &mut state,
         ImportWorkerResources {
+            folder_backup_enabled: false,
             sidecars: HashMap::new(),
             tags_db: None
         },
@@ -1624,6 +1647,7 @@ mod tests {
         let mut sidecar = crate::sidecar::SidecarFile::new(folder.clone());
         sidecar.set_adjust("page.jpg", crate::adjustment::AdjustParams::default());
         let resources = Arc::new(Mutex::new(ImportWorkerResources {
+            folder_backup_enabled: false,
             sidecars: HashMap::from([(folder.clone(), sidecar)]),
             tags_db: None,
         }));
@@ -1648,6 +1672,7 @@ mod tests {
         let mut sidecar = crate::sidecar::SidecarFile::new(missing_folder.clone());
         sidecar.set_adjust("page.jpg", crate::adjustment::AdjustParams::default());
         let resources = Arc::new(Mutex::new(ImportWorkerResources {
+            folder_backup_enabled: false,
             sidecars: HashMap::from([(missing_folder, sidecar)]),
             tags_db: None,
         }));

@@ -824,3 +824,12 @@ core check / settings_restore / ui_snapshot / glyph の成功を再利用した�
 実際の分類gateは全457 / 対象144 / 除外313、wireキー142のassertionを通過した。
 過去の15件という検証記録はその時点の証拠として残す。
 ログは`target/G-1242-g2b-settings_transfer-final.log`、全gateの結果は`target/G-1242-g2b-msg.txt`。
+
+### §1.242 G4F結合時の再確認（2026-10-12）
+
+画像folderの構成と消費receiptはmetadata/sidecar側のfamilyで扱い、settings転送項目は
+増やさない。`cargo test -p mimageviewer --lib settings_transfer`は24件成功（exit 0）。
+現行の分類assertionは全457 / 対象144 / 除外313、wireキー142を通過した。
+ログは`target/G-1242-g4f-focused-settings_transfer.log`。metadata転送の焦点試験は105件成功
+（`target/G-1242-g4f-focused-metadata_transfer.log`）。他のgateの実数は
+`target/G-1242-g4f-msg.txt`に記録し、独立レビュー/実機確認の証拠とは扱わない。

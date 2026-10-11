@@ -11,6 +11,75 @@ use crate::book_scope::BookScopeKey;
 
 pub(crate) const DB_FILE: &str = "book_composition.db";
 
+/// Consumption belongs to the physical folder, independently of any saved row.
+/// Pending snapshots carry a root witness but never a process sequence as a marker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FolderReceipt {
+    pub(crate) disk_sync_marker: Option<i64>,
+    pub(crate) consumed_root_digest: [u8; 32],
+}
+
+pub(crate) fn ensure_folder_receipts(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS folder_composition_receipts (
+        folder_key TEXT PRIMARY KEY, disk_sync_marker INTEGER,
+        consumed_root_digest BLOB NOT NULL CHECK(length(consumed_root_digest)=32));",
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn receipt_table(table: &str) -> Result<&str, String> {
+    match table {
+        "book_compositions" | "main.book_compositions" => Ok("main.folder_composition_receipts"),
+        "book_composition.book_compositions" => Ok("book_composition.folder_composition_receipts"),
+        _ => Err("invalid composition SQL table".into()),
+    }
+}
+
+pub(crate) fn folder_receipt_in(
+    connection: &Connection,
+    table: &str,
+    key: &str,
+) -> Result<Option<FolderReceipt>, String> {
+    validate_key_domain(key, &PageDomain::ImageFolder)?;
+    let table = receipt_table(table)?;
+    let raw: Option<(Option<i64>, Vec<u8>)> = connection
+        .query_row(
+            &format!(
+                "SELECT disk_sync_marker,consumed_root_digest FROM {table} WHERE folder_key=?1"
+            ),
+            [key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    raw.map(|(disk_sync_marker, bytes)| {
+        Ok(FolderReceipt {
+            disk_sync_marker,
+            consumed_root_digest: bytes
+                .try_into()
+                .map_err(|_| "invalid folder composition receipt digest".to_owned())?,
+        })
+    })
+    .transpose()
+}
+
+pub(crate) fn consume_folder_root_in(
+    connection: &Connection,
+    table: &str,
+    key: &str,
+    digest: [u8; 32],
+    disk_marker: Option<i64>,
+) -> Result<(), String> {
+    let previous = folder_receipt_in(connection, table, key)?;
+    let table = receipt_table(table)?;
+    let marker = disk_marker.or_else(|| previous.and_then(|receipt| receipt.disk_sync_marker));
+    connection.execute(&format!("INSERT INTO {table}(folder_key,disk_sync_marker,consumed_root_digest) VALUES (?1,?2,?3) ON CONFLICT(folder_key) DO UPDATE SET disk_sync_marker=excluded.disk_sync_marker,consumed_root_digest=excluded.consumed_root_digest"),
+        rusqlite::params![key, marker, digest.as_slice()]).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StoredComposition {
     pub(crate) domain: PageDomain,
@@ -162,7 +231,10 @@ pub(crate) fn decode_row(
 
 pub(crate) fn initialize_database_at(path: &Path) -> Result<(), String> {
     if path.try_exists().map_err(|error| error.to_string())? {
-        return validate_backup(path);
+        validate_backup(path)?;
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(|error| error.to_string())?;
+        return ensure_folder_receipts(&connection);
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -179,6 +251,7 @@ pub(crate) fn initialize_database_at(path: &Path) -> Result<(), String> {
         PRAGMA user_version = 1;",
         )
         .map_err(|error| error.to_string())?;
+    ensure_folder_receipts(&transaction)?;
     transaction.commit().map_err(|error| error.to_string())
 }
 
@@ -248,7 +321,54 @@ pub(crate) fn load_rows(
 }
 
 pub(crate) fn validate_database_rows(connection: &Connection) -> Result<(), String> {
-    load_rows(connection).map(|_| ())
+    load_rows(connection)?;
+    let present: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='folder_composition_receipts')", [], |row| row.get(0)).map_err(|error| error.to_string())?;
+    if present {
+        let mut schema = connection
+            .prepare("PRAGMA table_info(folder_composition_receipts)")
+            .map_err(|error| error.to_string())?;
+        let columns = schema
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        let expected = [
+            ("folder_key", "TEXT", false, 1),
+            ("disk_sync_marker", "INTEGER", false, 0),
+            ("consumed_root_digest", "BLOB", true, 0),
+        ];
+        if columns.len() != expected.len()
+            || columns.iter().zip(expected).any(|(actual, expected)| {
+                actual.0 != expected.0
+                    || !actual.1.eq_ignore_ascii_case(expected.1)
+                    || actual.2 != expected.2
+                    || actual.3 != expected.3
+            })
+        {
+            return Err("invalid folder composition receipt schema".into());
+        }
+        let mut statement = connection
+            .prepare("SELECT folder_key FROM folder_composition_receipts")
+            .map_err(|error| error.to_string())?;
+        let keys = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        for key in keys {
+            folder_receipt_in(
+                connection,
+                "book_compositions",
+                &key.map_err(|error| error.to_string())?,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_backup(path: &Path) -> Result<(), String> {
@@ -267,6 +387,7 @@ pub(crate) fn open_existing(path: &Path) -> Result<Option<Connection>, String> {
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
         .map_err(|error| error.to_string())?;
     validate_database_rows(&connection)?;
+    ensure_folder_receipts(&connection)?;
     Ok(Some(connection))
 }
 
@@ -279,7 +400,7 @@ fn table_name(table: &str) -> Result<&str, String> {
     }
 }
 
-fn row_in(
+pub(crate) fn row_in(
     connection: &Connection,
     table: &str,
     key: &str,
@@ -394,8 +515,66 @@ pub(crate) fn rename_book_root(
             .execute("DELETE FROM book_compositions WHERE book_key=?1", [key])
             .map_err(|error| error.to_string())?;
     }
+    rename_folder_receipts_in(&transaction, source, target)?;
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(changed)
+}
+
+pub(crate) fn rename_folder_receipts_in(
+    connection: &Connection,
+    source: &str,
+    target: &str,
+) -> Result<(), String> {
+    let prefix = format!("{}/", source.trim_end_matches('/'));
+    // A receipt is a local consumption proof, so a filesystem move alone is
+    // insufficient. Bind its destination key to the actual moved disk bytes.
+    let receipt_keys = {
+        let mut statement = connection
+            .prepare("SELECT folder_key FROM folder_composition_receipts ORDER BY folder_key")
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+    };
+    for key in receipt_keys
+        .into_iter()
+        .filter(|key| key == source || key.starts_with(&prefix))
+    {
+        let destination = if key == source {
+            target.to_owned()
+        } else {
+            format!(
+                "{}/{}",
+                target.trim_end_matches('/'),
+                key.strip_prefix(&prefix).unwrap()
+            )
+        };
+        let receipt = folder_receipt_in(connection, "book_compositions", &key)?.unwrap();
+        if let Ok(super::folder_sidecar::FolderSource::Loaded(loaded)) =
+            super::folder_sidecar::prepare_source(Path::new(&destination))
+            && let crate::sidecar::SidecarImportSource::Disk(token) = loaded.source()
+            && loaded.sidecar().folder_composition_digest() == receipt.consumed_root_digest
+            && crate::sidecar::revalidate_import_source(loaded.sidecar(), loaded.source()).is_ok()
+            && folder_receipt_in(connection, "book_compositions", &destination)?.is_none()
+        {
+            consume_folder_root_in(
+                connection,
+                "book_compositions",
+                &destination,
+                receipt.consumed_root_digest,
+                Some(token.sync_marker()),
+            )?;
+            connection
+                .execute(
+                    "DELETE FROM folder_composition_receipts WHERE folder_key=?1",
+                    [&key],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn purge_book_root(connection: &mut Connection, root: &str) -> Result<usize, String> {
@@ -417,6 +596,7 @@ pub(crate) fn purge_book_root(connection: &mut Connection, root: &str) -> Result
             .execute("DELETE FROM book_compositions WHERE book_key=?1", [key])
             .map_err(|error| error.to_string())?;
     }
+    transaction.execute("DELETE FROM folder_composition_receipts WHERE folder_key=?1 OR substr(folder_key,1,length(?2))=?2", rusqlite::params![root, prefix]).map_err(|error| error.to_string())?;
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(changed)
 }
@@ -427,17 +607,26 @@ pub(crate) fn migrate_page_paths_at(
     data_dir: &Path,
     mappings: &[(PathBuf, PathBuf)],
 ) -> Result<usize, String> {
+    migrate_page_paths_with_backup_at(data_dir, mappings, false).map(|(changed, _)| changed)
+}
+
+pub(crate) fn migrate_page_paths_with_backup_at(
+    data_dir: &Path,
+    mappings: &[(PathBuf, PathBuf)],
+    backup_enabled: bool,
+) -> Result<(usize, Vec<String>), String> {
     if mappings.is_empty() {
-        return Ok(0);
+        return Ok((0, Vec::new()));
     }
     let Some(mut connection) = open_existing(&data_dir.join(DB_FILE))? else {
-        return Ok(0);
+        return Ok((0, Vec::new()));
     };
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
     let original = load_rows(&transaction)?;
     let mut changed = 0;
+    let mut mirrors = Vec::new();
     for (key, row) in original {
         if row.domain != PageDomain::ImageFolder {
             continue;
@@ -482,14 +671,30 @@ pub(crate) fn migrate_page_paths_at(
         for page in &mut composition.hidden_pages {
             rewrite(page);
         }
-        changed += usize::from(replace_row_in(
+        let row_changed = replace_row_in(
             &transaction,
             "book_compositions",
             &key,
             &row.domain,
             &composition,
-        )?);
+        )?;
+        if row_changed {
+            let source = super::folder_sidecar::prepare_source(Path::new(&key))?;
+            source.revalidate()?;
+            source.consume_in(&transaction, "book_compositions", &key)?;
+            if backup_enabled {
+                mirrors.push((key, composition));
+            }
+            changed += 1;
+        }
     }
     transaction.commit().map_err(|error| error.to_string())?;
-    Ok(changed)
+    let mut warnings = Vec::new();
+    for (key, composition) in mirrors {
+        if let Err(error) = super::folder_sidecar::mirror(Path::new(&key), Some(composition)) {
+            crate::logger::log(format!("composition page rename backup failed: {error}"));
+            warnings.push(error);
+        }
+    }
+    Ok((changed, warnings))
 }

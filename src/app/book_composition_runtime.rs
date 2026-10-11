@@ -12,6 +12,9 @@ use std::sync::{Arc, mpsc};
 pub(crate) enum BookCompositionSource {
     #[default]
     Unavailable,
+    Folder {
+        root: std::path::PathBuf,
+    },
     Archive {
         tree: Arc<crate::zip_tree::ZipTree>,
         prefix: Vec<String>,
@@ -249,6 +252,13 @@ impl App {
             return false;
         };
         let (root, page) = match target {
+            crate::snapshot::SnapshotTarget::Fs(path) => {
+                let Ok(page) = super::book_composition_folder::page_ref(&scope.logical_root, path)
+                else {
+                    return false;
+                };
+                (&scope.logical_root, page)
+            }
             crate::snapshot::SnapshotTarget::PdfPage { pdf_path, page_num } => (
                 pdf_path,
                 crate::book_composition::CompositionPageRef::PdfPage {
@@ -304,7 +314,11 @@ impl App {
                     page_num: *page_num as usize,
                 }
             }
-            crate::book_bookmarks::PageIdentity::RelativePath(_) => return false,
+            crate::book_bookmarks::PageIdentity::RelativePath(path) => {
+                crate::book_resume_db::PageIdentity::Image {
+                    path: crate::path_key::normalize_keep_drive(&scope.logical_root.join(path)),
+                }
+            }
         };
         projection.resolve_position(&crate::book_resume_db::ReadingPosition {
             page: bookmark.page_index_hint,
@@ -499,6 +513,23 @@ impl App {
             return A::ExtractedResult;
         }
         let Some((scope, _)) = self.composition_scope_domain() else {
+            // A physical folder's durable binding remains composition-owned when
+            // its accepted listing becomes OFF/mixed. This is one owner lookup,
+            // never a scan of ordinary-list leaves or a layout adoption.
+            if let Some(scope) = self.ordinary_folder_composition_scope()
+                && let Some(snapshot) = self
+                    .book_composition_service
+                    .as_ref()
+                    .map(|service| service.snapshot())
+            {
+                return if snapshot.status.is_err() {
+                    A::Unreadable
+                } else if snapshot.rows.contains_key(&scope.storage_key()) {
+                    A::Composed
+                } else {
+                    A::Automatic
+                };
+            }
             return A::Automatic;
         };
         match &self.book_composition {
@@ -528,6 +559,24 @@ impl App {
                 _ => A::Automatic,
             },
         }
+    }
+
+    fn ordinary_folder_composition_scope(&self) -> Option<BookScopeKey> {
+        if !matches!(
+            self.projection_recipe,
+            super::book_materialization::ProjectionRecipe::OrdinaryList
+        ) || self.zip_nav.is_some()
+            || self.items_are_drive_list
+        {
+            return None;
+        }
+        let root = self.current_folder.as_deref()?;
+        if crate::folder_tree::is_open_as_container(root)
+            || crate::books::is_direct_book_folder(&self.settings.books_root_path(), root)
+        {
+            return None;
+        }
+        BookScopeKey::folder(root).ok()
     }
 
     pub(crate) fn persist_fullscreen_view_mode(
@@ -565,6 +614,12 @@ impl App {
     }
 
     pub(super) fn composition_source(&self) -> BookCompositionSource {
+        if let super::book_materialization::ProjectionRecipe::Book(
+            super::book_materialization::BookScope::ImageFolder(root),
+        ) = &self.projection_recipe
+        {
+            return BookCompositionSource::Folder { root: root.clone() };
+        }
         if let Some(nav) = &self.zip_nav {
             return BookCompositionSource::Archive {
                 tree: nav.tree.clone(),
@@ -679,6 +734,30 @@ impl App {
             ctx.request_repaint();
         }
         let changed = service.drain_changed_scope_keys();
+        if self.settings.sidecar_backup_enabled && !changed.is_empty() {
+            let snapshot = service.snapshot();
+            if snapshot.status.is_ok() {
+                for (folder, sidecar) in &mut self.sidecars {
+                    let Ok(scope) = BookScopeKey::folder(folder) else {
+                        continue;
+                    };
+                    if !changed.contains(&scope.storage_key()) {
+                        continue;
+                    }
+                    let root = match snapshot.rows.get(&scope.storage_key()) {
+                        Some(row) if row.domain == PageDomain::ImageFolder => {
+                            snapshot.folder_roots.get(&scope.storage_key()).cloned()
+                        }
+                        Some(_) => continue,
+                        None => None,
+                    };
+                    // DB/mirror completion precedes this publication. Keep the
+                    // process-wide page writer's cached root in that same snapshot
+                    // without creating a second writer or consuming item dirtiness.
+                    sidecar.adopt_mirrored_folder_composition_arc(root);
+                }
+            }
+        }
         // Read-only visits never invalidate a sibling. G3 attaches Book reload to this exact set.
         #[cfg(windows)]
         {
@@ -715,6 +794,19 @@ impl App {
     }
 
     fn poll_book_composition_projection(&mut self, ctx: &egui::Context) {
+        // Folder restoration publishes the authoritative DB record before any
+        // composition classification can admit an absent/old source snapshot.
+        // Resuming releases this dependency so Common's independent shift/resume
+        // fence can finish classification without waiting on its own hydration.
+        if matches!(
+            self.projection_recipe,
+            super::book_materialization::ProjectionRecipe::Book(
+                super::book_materialization::BookScope::ImageFolder(_)
+            )
+        ) && self.folder_composition_restore_source_pending()
+        {
+            return;
+        }
         if let super::book_materialization::ProjectionRecipe::Book(
             super::book_materialization::BookScope::Archive { logical_root, .. },
         ) = &self.projection_recipe
@@ -777,7 +869,18 @@ impl App {
         ) {
             // Hydration completes its independent resume read against the original
             // generation; a qualified open is retained by the permission owner.
-            if self.sidecar_restore_active() {
+            let hydration_pending = if matches!(
+                &self.book_composition,
+                ViewerBookComposition::Projecting {
+                    source: BookCompositionSource::Folder { .. },
+                    ..
+                }
+            ) {
+                self.sidecar_restore_blocks_projected_context()
+            } else {
+                self.sidecar_restore_active()
+            };
+            if hydration_pending {
                 self.schedule_composition_wake(ctx);
                 return;
             }
@@ -1013,6 +1116,8 @@ impl App {
         let data_dir = crate::data_dir::get();
         let follow_document_direction = self.settings.follow_document_reading_direction;
         let document_password = self.pdf_open_password(&scope.logical_root);
+        let folder_settings =
+            matches!(source, BookCompositionSource::Folder { .. }).then(|| self.settings.clone());
         let pending_trim = self.pending_composition_trim_batch();
         // Submit through the existing FIFO before starting projection work.
         // Superseded workers must not write older edits after newer requests.
@@ -1038,6 +1143,7 @@ impl App {
                     token,
                     worker_record.as_deref(),
                     &source_for_worker,
+                    folder_settings.as_ref(),
                     &worker_origin,
                     &placement,
                     policy,
@@ -1395,6 +1501,7 @@ fn prepare_book_projection(
     token: CompositionToken,
     record: Option<&StoredComposition>,
     source: &BookCompositionSource,
+    folder_settings: Option<&crate::settings::Settings>,
     origin: &ProjectionOrigin,
     placement: &crate::settings::GridDisplayOrder,
     policy: crate::file_type_visibility::FileTypeVisibility,
@@ -1408,6 +1515,26 @@ fn prepare_book_projection(
     use super::book_materialization::*;
     let composition = record.map(|record| &record.composition);
     let rows = match source {
+        BookCompositionSource::Folder { root } => {
+            if BookScopeKey::folder(root)? != *scope {
+                return Err("本の元フォルダが一致しません".into());
+            }
+            let settings = folder_settings.ok_or("本のフォルダ設定を取得できません")?;
+            let source = super::book_composition_folder::prepare_folder_source(root, settings)?;
+            if source.recipe != ProjectionRecipe::Book(BookScope::ImageFolder(root.clone())) {
+                return Err(
+                    "このフォルダは画像だけの本ではありません。開き直してください。".into(),
+                );
+            }
+            super::book_composition_folder::project_folder_composition(
+                root,
+                &source.raw_pages,
+                source.rows,
+                policy,
+                token,
+                composition,
+            )
+        }
         BookCompositionSource::Archive {
             tree,
             prefix,
@@ -1496,7 +1623,8 @@ fn prepare_book_projection(
         _ => rows.items.iter().position(|item| {
             matches!(
                 item,
-                crate::grid_item::GridItem::ZipImage { .. }
+                crate::grid_item::GridItem::Image(_)
+                    | crate::grid_item::GridItem::ZipImage { .. }
                     | crate::grid_item::GridItem::PdfPage { .. }
             )
         }),

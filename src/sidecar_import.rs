@@ -20,6 +20,7 @@ use crate::sidecar::{
     SidecarImportSource, SidecarMask, classify_rel_key,
 };
 
+mod folder_composition;
 mod probe_reuse;
 pub(crate) use probe_reuse::{
     MAX_PROOF_BYTES, SidecarProbeProof, SidecarProbeReuseMissReason, SidecarProbeReuseOutcome,
@@ -30,12 +31,15 @@ const MAX_MASK_PIXELS: usize = 128 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ImportFamilies {
+    /// Folder composition is independent of the edit/tag synchronization markers.
+    pub composition: bool,
     pub edits: bool,
     pub tags: bool,
 }
 
 impl ImportFamilies {
     pub const ALL: Self = Self {
+        composition: false,
         edits: true,
         tags: true,
     };
@@ -54,6 +58,7 @@ pub enum SidecarProbeFamilyOutcome {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SidecarProbeResult {
+    pub composition: SidecarProbeFamilyOutcome,
     pub edits: SidecarProbeFamilyOutcome,
     pub tags: SidecarProbeFamilyOutcome,
     /// Present only when the sidecar content itself failed semantic validation.
@@ -179,6 +184,7 @@ pub enum ImportFamilyOutcome<T> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SidecarImportResult {
+    pub composition: ImportFamilyOutcome<bool>,
     pub edits: ImportFamilyOutcome<EditImportReport>,
     pub tags: ImportFamilyOutcome<TagImportReport>,
     /// Present only when the sidecar content itself failed semantic validation.
@@ -215,6 +221,7 @@ enum PreparedFamily<T> {
 }
 
 pub struct PreparedSidecarImport {
+    composition_requested: bool,
     folder_key: String,
     sidecar: SidecarFile,
     source: SidecarImportSource,
@@ -373,6 +380,7 @@ pub fn prepare(
     }
 
     Ok(PreparedSidecarImport {
+        composition_requested: families.composition,
         folder_key,
         sidecar,
         source,
@@ -449,13 +457,24 @@ pub(crate) fn probe(
     families: ImportFamilies,
     cancel: &AtomicBool,
 ) -> SidecarImportProbe {
+    probe_with_progress(folder, data_dir, families, cancel, || {})
+}
+
+fn probe_with_progress(
+    folder: &Path,
+    data_dir: &Path,
+    families: ImportFamilies,
+    cancel: &AtomicBool,
+    mut before_source_check: impl FnMut(),
+) -> SidecarImportProbe {
     let started = Instant::now();
     if cancel.load(Ordering::Relaxed) {
         return SidecarImportProbe::Cancelled {
-            result: probe_result(
+            result: probe_result_with_composition(
                 started,
                 Duration::ZERO,
                 Duration::ZERO,
+                requested_probe_cancelled(families.composition),
                 requested_probe_cancelled(families.edits),
                 requested_probe_cancelled(families.tags),
             ),
@@ -472,10 +491,11 @@ pub(crate) fn probe(
                 Err(error) => {
                     return SidecarImportProbe::Failed {
                         error: error.clone(),
-                        result: probe_result(
+                        result: probe_result_with_composition(
                             started,
                             load_elapsed,
                             Duration::ZERO,
+                            requested_probe_failed(families.composition, &error),
                             requested_probe_failed(families.edits, &error),
                             requested_probe_failed(families.tags, &error),
                         ),
@@ -483,6 +503,7 @@ pub(crate) fn probe(
                 }
             };
             let PreparedSidecarImport {
+                composition_requested,
                 folder_key,
                 sidecar,
                 source,
@@ -500,6 +521,10 @@ pub(crate) fn probe(
                         started,
                         load_elapsed,
                         prepare_elapsed,
+                        match &source_validation_error {
+                            Some(error) => requested_probe_failed(composition_requested, error),
+                            None => requested_probe_cancelled(composition_requested),
+                        },
                         reject_probe_cancelled(edits),
                         reject_probe_cancelled(tags),
                         source_validation_error,
@@ -514,6 +539,13 @@ pub(crate) fn probe(
                 probe_prepared_family(edits, data_dir, &folder_key, marker, MarkerStore::Edits);
             let mut tag_outcome =
                 probe_prepared_family(tags, data_dir, &folder_key, marker, MarkerStore::Tags);
+            let composition_outcome = match &source_validation_error {
+                Some(error) => requested_probe_failed(composition_requested, error),
+                None => {
+                    folder_composition::probe(data_dir, &sidecar, &source, composition_requested)
+                }
+            };
+            before_source_check();
             if cancel.load(Ordering::Relaxed) {
                 edit_outcome = reject_probe_outcome_cancelled(edit_outcome);
                 tag_outcome = reject_probe_outcome_cancelled(tag_outcome);
@@ -522,6 +554,7 @@ pub(crate) fn probe(
                         started,
                         load_elapsed,
                         prepare_elapsed,
+                        reject_probe_outcome_cancelled(composition_outcome),
                         edit_outcome,
                         tag_outcome,
                         source_validation_error,
@@ -532,11 +565,12 @@ pub(crate) fn probe(
                 edit_outcome = reject_probe_outcome_source_changed(edit_outcome, &error);
                 tag_outcome = reject_probe_outcome_source_changed(tag_outcome, &error);
                 return SidecarImportProbe::SourceChanged {
-                    error,
+                    error: error.clone(),
                     result: probe_result_with_validation(
                         started,
                         load_elapsed,
                         prepare_elapsed,
+                        reject_probe_outcome_source_changed(composition_outcome, &error),
                         edit_outcome,
                         tag_outcome,
                         source_validation_error,
@@ -547,6 +581,7 @@ pub(crate) fn probe(
                 started,
                 load_elapsed,
                 prepare_elapsed,
+                composition_outcome,
                 edit_outcome,
                 tag_outcome,
                 source_validation_error,
@@ -570,14 +605,21 @@ pub(crate) fn probe(
                 probe_missing_family(families.edits, data_dir, &folder_key, MarkerStore::Edits);
             let mut tag_outcome =
                 probe_missing_family(families.tags, data_dir, &folder_key, MarkerStore::Tags);
+            let composition_outcome = if families.composition {
+                SidecarProbeFamilyOutcome::AlreadySynchronized
+            } else {
+                SidecarProbeFamilyOutcome::NotRequested
+            };
+            before_source_check();
             if cancel.load(Ordering::Relaxed) {
                 edit_outcome = reject_probe_outcome_cancelled(edit_outcome);
                 tag_outcome = reject_probe_outcome_cancelled(tag_outcome);
                 return SidecarImportProbe::Cancelled {
-                    result: probe_result(
+                    result: probe_result_with_composition(
                         started,
                         load_elapsed,
                         Duration::ZERO,
+                        reject_probe_outcome_cancelled(composition_outcome),
                         edit_outcome,
                         tag_outcome,
                     ),
@@ -587,20 +629,22 @@ pub(crate) fn probe(
                 edit_outcome = reject_probe_outcome_source_changed(edit_outcome, &error);
                 tag_outcome = reject_probe_outcome_source_changed(tag_outcome, &error);
                 return SidecarImportProbe::SourceChanged {
-                    error,
-                    result: probe_result(
+                    error: error.clone(),
+                    result: probe_result_with_composition(
                         started,
                         load_elapsed,
                         Duration::ZERO,
+                        reject_probe_outcome_source_changed(composition_outcome, &error),
                         edit_outcome,
                         tag_outcome,
                     ),
                 };
             }
-            let result = probe_result(
+            let result = probe_result_with_composition(
                 started,
                 load_elapsed,
                 Duration::ZERO,
+                composition_outcome,
                 edit_outcome,
                 tag_outcome,
             );
@@ -638,10 +682,11 @@ pub(crate) fn probe(
             let error = "sidecar changed while its import snapshot was being read".to_string();
             SidecarImportProbe::SourceChanged {
                 error: error.clone(),
-                result: probe_result(
+                result: probe_result_with_composition(
                     started,
                     load_elapsed,
                     Duration::ZERO,
+                    requested_probe_source_changed(families.composition, &error),
                     requested_probe_source_changed(families.edits, &error),
                     requested_probe_source_changed(families.tags, &error),
                 ),
@@ -680,6 +725,7 @@ fn probe_result(
     tags: SidecarProbeFamilyOutcome,
 ) -> SidecarProbeResult {
     SidecarProbeResult {
+        composition: SidecarProbeFamilyOutcome::NotRequested,
         edits,
         tags,
         source_validation_error: None,
@@ -689,15 +735,36 @@ fn probe_result(
     }
 }
 
+fn probe_result_with_composition(
+    started: Instant,
+    load_elapsed: Duration,
+    prepare_elapsed: Duration,
+    composition: SidecarProbeFamilyOutcome,
+    edits: SidecarProbeFamilyOutcome,
+    tags: SidecarProbeFamilyOutcome,
+) -> SidecarProbeResult {
+    let mut result = probe_result(started, load_elapsed, prepare_elapsed, edits, tags);
+    result.composition = composition;
+    result
+}
+
 fn probe_result_with_validation(
     started: Instant,
     load_elapsed: Duration,
     prepare_elapsed: Duration,
+    composition: SidecarProbeFamilyOutcome,
     edits: SidecarProbeFamilyOutcome,
     tags: SidecarProbeFamilyOutcome,
     source_validation_error: Option<String>,
 ) -> SidecarProbeResult {
-    let mut result = probe_result(started, load_elapsed, prepare_elapsed, edits, tags);
+    let mut result = probe_result_with_composition(
+        started,
+        load_elapsed,
+        prepare_elapsed,
+        composition,
+        edits,
+        tags,
+    );
     result.source_validation_error = source_validation_error;
     result
 }
@@ -711,10 +778,11 @@ fn terminal_probe(
 ) -> SidecarImportProbe {
     SidecarImportProbe::Current {
         sidecar,
-        result: probe_result(
+        result: probe_result_with_composition(
             started,
             load_elapsed,
             Duration::ZERO,
+            requested_probe_failed(families.composition, &error),
             requested_probe_failed(families.edits, &error),
             requested_probe_failed(families.tags, &error),
         ),
@@ -855,7 +923,10 @@ fn read_marker(
 }
 
 fn probe_requires_import(result: &SidecarProbeResult) -> bool {
-    matches!(&result.edits, SidecarProbeFamilyOutcome::ImportRequired)
+    matches!(
+        &result.composition,
+        SidecarProbeFamilyOutcome::ImportRequired
+    ) || matches!(&result.edits, SidecarProbeFamilyOutcome::ImportRequired)
         || matches!(&result.tags, SidecarProbeFamilyOutcome::ImportRequired)
 }
 
@@ -1167,6 +1238,7 @@ fn commit_with_progress(
 ) -> SidecarImportCompletion {
     let commit_started = Instant::now();
     let PreparedSidecarImport {
+        composition_requested,
         folder_key,
         sidecar,
         source,
@@ -1185,6 +1257,7 @@ fn commit_with_progress(
     {
         return SidecarImportCompletion::Cancelled {
             result: SidecarImportResult {
+                composition: requested_import_cancelled(composition_requested),
                 edits: reject_cancelled(edits),
                 tags: reject_cancelled(tags),
                 source_validation_error,
@@ -1197,6 +1270,7 @@ fn commit_with_progress(
         return SidecarImportCompletion::SourceChanged {
             error: error.clone(),
             result: SidecarImportResult {
+                composition: requested_import_source_changed(composition_requested, &error),
                 edits: reject_source_changed(edits, &error),
                 tags: reject_source_changed(tags, &error),
                 source_validation_error,
@@ -1266,14 +1340,26 @@ fn commit_with_progress(
         }
     };
 
+    let composition = folder_composition::commit(
+        data_dir,
+        &sidecar,
+        &source,
+        composition_requested,
+        source_validation_error.as_deref(),
+        cancel,
+    );
     let result = SidecarImportResult {
+        composition,
         edits,
         tags,
         source_validation_error,
         prepare_elapsed,
         commit_elapsed: commit_started.elapsed(),
     };
-    if family_cancelled(&result.edits) || family_cancelled(&result.tags) {
+    if family_cancelled(&result.edits)
+        || family_cancelled(&result.tags)
+        || family_cancelled(&result.composition)
+    {
         SidecarImportCompletion::Cancelled { result }
     } else {
         SidecarImportCompletion::Current { sidecar, result }
@@ -1824,6 +1910,300 @@ mod tests {
         assert!(matches!(result.tags, ImportFamilyOutcome::Applied(_)));
     }
 
+    const COMPOSITION_ONLY: ImportFamilies = ImportFamilies {
+        composition: true,
+        edits: false,
+        tags: false,
+    };
+
+    fn folder_root_wire() -> Vec<u8> {
+        use crate::book_composition::*;
+        let root = BookComposition::new(
+            ReadingDirection::Rtl,
+            vec![CompositionUnit::Single {
+                page: CompositionPageRef::RelativePath {
+                    path: "page.jpg".into(),
+                },
+                placement: SinglePlacement::Center,
+                companion: SingleCompanion::Vacant,
+            }],
+        );
+        serde_json::to_vec(
+            &serde_json::json!({"version": 2, "items": {}, "folder_composition": root}),
+        )
+        .unwrap()
+    }
+
+    fn assert_only_composition(result: &SidecarProbeResult) {
+        assert_eq!(result.edits, SidecarProbeFamilyOutcome::NotRequested);
+        assert_eq!(result.tags, SidecarProbeFamilyOutcome::NotRequested);
+        assert_ne!(result.composition, SidecarProbeFamilyOutcome::NotRequested);
+    }
+
+    #[test]
+    fn composition_only_probe_pre_cancel_reports_requested_family_without_io() {
+        let temp = tempfile::tempdir().unwrap();
+        let media = temp.path().join("missing-media");
+        let data = temp.path().join("missing-data");
+        let cancel = AtomicBool::new(true);
+        let probe = probe_with_progress(&media, &data, COMPOSITION_ONLY, &cancel, || {
+            panic!("pre-cancel must do no load or source check")
+        });
+        assert!(matches!(probe, SidecarImportProbe::Cancelled { .. }));
+        assert_only_composition(probe.result());
+        assert_eq!(
+            probe.result().composition,
+            SidecarProbeFamilyOutcome::Cancelled
+        );
+        assert!(!media.exists() && !data.exists());
+    }
+
+    #[test]
+    fn composition_only_probe_terminal_load_failures_preserve_failed_request_and_originals() {
+        for bytes in [
+            b"{ invalid sidecar".to_vec(),
+            br#"{"version":999,"items":{},"folder_composition":123}"#.to_vec(),
+        ] {
+            let media = tempfile::tempdir().unwrap();
+            let data = media.path().join("no-database");
+            let path = media.path().join(crate::sidecar::SIDECAR_FILENAME);
+            std::fs::write(&path, &bytes).unwrap();
+            let checked = probe(
+                media.path(),
+                &data,
+                COMPOSITION_ONLY,
+                &AtomicBool::new(false),
+            );
+            assert_only_composition(checked.result());
+            assert!(matches!(
+                &checked.result().composition,
+                SidecarProbeFamilyOutcome::Failed(_)
+            ));
+            let SidecarImportProbe::Current {
+                mut sidecar,
+                source,
+                ..
+            } = checked
+            else {
+                panic!("historical terminal cache contract must remain Current");
+            };
+            assert!(source.is_none());
+            assert!(sidecar.set_folder_composition(None).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert!(!data.exists());
+        }
+        let media = tempfile::tempdir().unwrap();
+        let data = media.path().join("no-database");
+        let path = media.path().join(crate::sidecar::SIDECAR_FILENAME);
+        std::fs::create_dir(&path).unwrap();
+        let checked = probe(
+            media.path(),
+            &data,
+            COMPOSITION_ONLY,
+            &AtomicBool::new(false),
+        );
+        assert_only_composition(checked.result());
+        assert!(matches!(
+            &checked.result().composition,
+            SidecarProbeFamilyOutcome::Failed(_)
+        ));
+        assert!(path.is_dir());
+        assert!(!data.exists());
+    }
+
+    #[test]
+    fn composition_only_probe_semantic_source_error_does_not_request_restore_or_open_store() {
+        let media = tempfile::tempdir().unwrap();
+        let data = media.path().join("no-database");
+        let mut wire: serde_json::Value = serde_json::from_slice(&folder_root_wire()).unwrap();
+        wire["items"] = serde_json::json!({"../escape.jpg": {"tags": ["#unsafe"]}});
+        let path = media.path().join(crate::sidecar::SIDECAR_FILENAME);
+        let bytes = serde_json::to_vec(&wire).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let checked = probe(
+            media.path(),
+            &data,
+            COMPOSITION_ONLY,
+            &AtomicBool::new(false),
+        );
+        assert_only_composition(checked.result());
+        assert!(
+            matches!(&checked.result().composition, SidecarProbeFamilyOutcome::Failed(error) if error.contains("writes are disabled"))
+        );
+        assert!(checked.result().source_validation_error.is_some());
+        assert!(matches!(checked, SidecarImportProbe::Current { .. }));
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        assert!(!data.exists());
+    }
+
+    #[test]
+    fn composition_only_probe_cancel_and_source_change_after_receipt_read_reject_the_root() {
+        for cancelled in [false, true] {
+            let media = tempfile::tempdir().unwrap();
+            let data = tempfile::tempdir().unwrap();
+            let path = media.path().join(crate::sidecar::SIDECAR_FILENAME);
+            std::fs::write(&path, folder_root_wire()).unwrap();
+            let (service, owner) =
+                crate::book_composition::BookCompositionService::spawn_at(data.path().into(), None)
+                    .unwrap();
+            let scope = crate::book_scope::BookScopeKey::folder(media.path()).unwrap();
+            service
+                .prepare(
+                    scope.clone(),
+                    crate::book_composition::PageDomain::ImageFolder,
+                )
+                .recv_timeout(Duration::from_secs(15))
+                .unwrap()
+                .status
+                .unwrap();
+            let cancel = AtomicBool::new(false);
+            let checked =
+                probe_with_progress(media.path(), data.path(), COMPOSITION_ONLY, &cancel, || {
+                    if cancelled {
+                        cancel.store(true, Ordering::Relaxed);
+                    } else {
+                        std::fs::remove_file(&path).unwrap();
+                    }
+                });
+            assert_only_composition(checked.result());
+            if cancelled {
+                assert!(matches!(checked, SidecarImportProbe::Cancelled { .. }));
+                assert_eq!(
+                    checked.result().composition,
+                    SidecarProbeFamilyOutcome::Cancelled
+                );
+            } else {
+                assert!(matches!(checked, SidecarImportProbe::SourceChanged { .. }));
+                assert!(matches!(
+                    &checked.result().composition,
+                    SidecarProbeFamilyOutcome::SourceChanged(_)
+                ));
+            }
+            assert!(
+                service
+                    .receipt(scope)
+                    .recv_timeout(Duration::from_secs(15))
+                    .unwrap()
+                    .unwrap()
+                    .is_none(),
+                "a read-only rejected probe cannot publish a composition receipt"
+            );
+            owner.shutdown_and_join();
+        }
+    }
+
+    #[test]
+    fn composition_only_probe_missing_is_current_without_restore_receipt_or_database() {
+        let media = tempfile::tempdir().unwrap();
+        let data = media.path().join("no-database");
+        let checked = probe(
+            media.path(),
+            &data,
+            COMPOSITION_ONLY,
+            &AtomicBool::new(false),
+        );
+        assert_only_composition(checked.result());
+        assert_eq!(
+            checked.result().composition,
+            SidecarProbeFamilyOutcome::AlreadySynchronized
+        );
+        let SidecarImportProbe::Current {
+            sidecar, source, ..
+        } = checked
+        else {
+            panic!("Missing has no composition work");
+        };
+        assert!(sidecar.folder_composition().is_none());
+        assert!(source.is_none());
+        assert!(!data.exists());
+    }
+
+    #[test]
+    fn composition_only_probe_missing_cancel_and_created_source_keep_requested_terminal_status() {
+        for cancelled in [false, true] {
+            let media = tempfile::tempdir().unwrap();
+            let data = media.path().join("no-database");
+            let cancel = AtomicBool::new(false);
+            let checked =
+                probe_with_progress(media.path(), &data, COMPOSITION_ONLY, &cancel, || {
+                    if cancelled {
+                        cancel.store(true, Ordering::Relaxed);
+                    } else {
+                        std::fs::write(
+                            media.path().join(crate::sidecar::SIDECAR_FILENAME),
+                            folder_root_wire(),
+                        )
+                        .unwrap();
+                    }
+                });
+            assert_only_composition(checked.result());
+            if cancelled {
+                assert!(matches!(checked, SidecarImportProbe::Cancelled { .. }));
+                assert_eq!(
+                    checked.result().composition,
+                    SidecarProbeFamilyOutcome::Cancelled
+                );
+            } else {
+                assert!(matches!(checked, SidecarImportProbe::SourceChanged { .. }));
+                assert!(matches!(
+                    &checked.result().composition,
+                    SidecarProbeFamilyOutcome::SourceChanged(_)
+                ));
+            }
+            assert!(!data.exists());
+        }
+    }
+
+    #[test]
+    fn missing_composition_request_keeps_marker_clear_limited_to_edit_and_tag_families() {
+        let media = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        init_all_stores(data.path());
+        let cancel = AtomicBool::new(false);
+        import_sample_sidecar(media.path(), data.path(), &cancel);
+        std::fs::remove_file(media.path().join(crate::sidecar::SIDECAR_FILENAME)).unwrap();
+        let families = ImportFamilies {
+            composition: true,
+            ..ImportFamilies::ALL
+        };
+        let checked = probe(media.path(), data.path(), families, &cancel);
+        assert!(matches!(
+            checked,
+            SidecarImportProbe::MarkerClearRequired { .. }
+        ));
+        assert_eq!(
+            checked.result().composition,
+            SidecarProbeFamilyOutcome::AlreadySynchronized
+        );
+        assert_eq!(
+            checked.result().edits,
+            SidecarProbeFamilyOutcome::MarkerClearRequired
+        );
+        assert_eq!(
+            checked.result().tags,
+            SidecarProbeFamilyOutcome::MarkerClearRequired
+        );
+        assert!(matches!(
+            clear_missing_markers(media.path(), data.path(), families, &cancel),
+            MissingMarkerClearCompletion::Current { .. }
+        ));
+        assert!(!data.path().join("book_composition.db").exists());
+        let checked = probe(media.path(), data.path(), families, &cancel);
+        assert!(matches!(checked, SidecarImportProbe::Current { .. }));
+        assert_eq!(
+            checked.result().composition,
+            SidecarProbeFamilyOutcome::AlreadySynchronized
+        );
+        assert_eq!(
+            checked.result().edits,
+            SidecarProbeFamilyOutcome::AlreadySynchronized
+        );
+        assert_eq!(
+            checked.result().tags,
+            SidecarProbeFamilyOutcome::AlreadySynchronized
+        );
+    }
+
     #[test]
     fn checked_keys_reject_folder_escape() {
         let folder = Path::new("C:/pictures");
@@ -1852,6 +2232,7 @@ mod tests {
             ImportFamilies {
                 edits: true,
                 tags: false,
+                composition: false,
             },
             &cancel,
         )
@@ -1900,6 +2281,7 @@ mod tests {
             ImportFamilies {
                 edits: true,
                 tags: false,
+                composition: false,
             },
             &cancel,
         )
@@ -1941,6 +2323,7 @@ mod tests {
             ImportFamilies {
                 edits: true,
                 tags: false,
+                composition: false,
             },
             &cancel,
         )
@@ -1983,6 +2366,7 @@ mod tests {
             ImportFamilies {
                 edits: true,
                 tags: false,
+                composition: false,
             },
             &cancel,
         )
@@ -2038,6 +2422,7 @@ mod tests {
             ImportFamilies {
                 edits: true,
                 tags: false,
+                composition: false,
             },
             &cancel,
         )
@@ -2100,6 +2485,7 @@ mod tests {
             ImportFamilies {
                 edits: true,
                 tags: false,
+                composition: false,
             },
             &cancel,
         )
@@ -2124,6 +2510,7 @@ mod tests {
             ImportFamilies {
                 edits: true,
                 tags: false,
+                composition: false,
             },
             &cancel,
         )
@@ -2184,6 +2571,7 @@ mod tests {
             ImportFamilies {
                 edits: true,
                 tags: false,
+                composition: false,
             },
             &cancel,
         )
@@ -2223,6 +2611,7 @@ mod tests {
             ImportFamilies {
                 edits: true,
                 tags: false,
+                composition: false,
             },
             &cancel,
         )
@@ -2259,6 +2648,7 @@ mod tests {
             ImportFamilies {
                 edits: false,
                 tags: true,
+                composition: false,
             },
             &cancel,
         )
@@ -2300,6 +2690,7 @@ mod tests {
             ImportFamilies {
                 edits: false,
                 tags: true,
+                composition: false,
             },
             &cancel,
         )
@@ -2982,6 +3373,7 @@ mod tests {
             ImportFamilies {
                 edits: true,
                 tags: false,
+                composition: false,
             },
             &AtomicBool::new(false),
             None,
@@ -3065,6 +3457,7 @@ mod tests {
             ImportFamilies {
                 edits: true,
                 tags: false,
+                composition: false,
             },
             &cancel,
             Some(&proof),

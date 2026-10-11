@@ -124,6 +124,8 @@ pub struct ImportSummary {
     /// preflight後の2回目の走査、または終端cache再取得で失敗した場合の終端エラー。
     /// それ以前にcommitしたbatchは保持される。
     pub incomplete_error: Option<String>,
+    /// DB commits are retained if a folder backup mirror fails afterwards.
+    pub folder_backup_warnings: Vec<String>,
     pub changed: ImportChangedSections,
     /// Changes that were durably committed by the import writer.  This is kept
     /// separate from `changed`, which describes sections present in the bundle.
@@ -148,6 +150,8 @@ pub struct ImportCommittedChanges {
     pub composition_removals: usize,
     pub composition_scopes: BTreeSet<String>,
     pub composition_observation_roots: BTreeSet<PathBuf>,
+    /// Root mirrors attempted after commit, including explicit empty/no-op roots.
+    pub folder_composition_backups: BTreeSet<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -821,11 +825,24 @@ pub fn import_at<F>(
 where
     F: FnMut(TransferProgress),
 {
+    import_at_with_folder_backup(data_dir, root, cancel, false, progress)
+}
+
+pub fn import_at_with_folder_backup<F>(
+    data_dir: &Path,
+    root: &Path,
+    cancel: &AtomicBool,
+    backup_enabled: bool,
+    progress: F,
+) -> Result<ImportSummary, TransferError>
+where
+    F: FnMut(TransferProgress),
+{
     let started = std::time::Instant::now();
     if crate::perf::is_enabled() {
         crate::perf::event("metadata_import", "begin", None, 0, &[]);
     }
-    let result = import_at_batched(data_dir, root, cancel, progress);
+    let result = import_at_batched(data_dir, root, cancel, backup_enabled, progress);
     let outcome = match &result {
         Ok(summary) if summary.cancelled => "cancelled",
         Ok(summary) if summary.incomplete_error.is_some() || summary.failed_entries > 0 => {
@@ -862,6 +879,7 @@ fn import_at_batched<F>(
     data_dir: &Path,
     root: &Path,
     cancel: &AtomicBool,
+    backup_enabled: bool,
     mut progress: F,
 ) -> Result<ImportSummary, TransferError>
 where
@@ -1068,6 +1086,11 @@ where
             {
                 let commit_started = std::time::Instant::now();
                 commit_import_batch(&conn)?;
+                mirror_committed_folder_compositions(
+                    &mut batch_composition_changes,
+                    backup_enabled,
+                    &mut summary,
+                );
                 drop(page_edit_write.take());
                 drop(rating_write.take());
                 drop(tag_write.take());
@@ -1162,6 +1185,11 @@ where
         Ok(())
     };
     if commit_result.is_ok() {
+        mirror_committed_folder_compositions(
+            &mut batch_composition_changes,
+            backup_enabled,
+            &mut summary,
+        );
         summary.applied_entries = summary.applied_entries.saturating_add(batch_applied);
         summary.committed.video_pins = summary
             .committed
@@ -2661,6 +2689,8 @@ struct CompositionFamilyChanges {
     removals: usize,
     scopes: BTreeSet<String>,
     observation_roots: BTreeSet<PathBuf>,
+    folder_mirrors:
+        std::collections::BTreeMap<PathBuf, Option<crate::book_composition::BookComposition>>,
 }
 
 impl CompositionFamilyChanges {
@@ -2670,6 +2700,31 @@ impl CompositionFamilyChanges {
         self.removals += other.removals;
         self.scopes.extend(other.scopes);
         self.observation_roots.extend(other.observation_roots);
+        self.folder_mirrors.extend(other.folder_mirrors);
+    }
+}
+
+fn mirror_committed_folder_compositions(
+    changes: &mut CompositionFamilyChanges,
+    backup_enabled: bool,
+    summary: &mut ImportSummary,
+) {
+    let mirrors = std::mem::take(&mut changes.folder_mirrors);
+    if !backup_enabled {
+        return;
+    }
+    for (folder, root) in mirrors {
+        summary
+            .committed
+            .folder_composition_backups
+            .insert(folder.clone());
+        if let Err(error) = crate::book_composition::folder_sidecar::mirror(&folder, root) {
+            crate::logger::log(format!(
+                "metadata composition backup failed: {}: {error}",
+                folder.display()
+            ));
+            summary.folder_backup_warnings.push(error);
+        }
     }
 }
 
@@ -2743,7 +2798,25 @@ fn apply_composition_family(
         root,
         &family.coverage,
     )?;
-    let changes = composition_family_changes(root, media_kind, family, &previous)?;
+    let mut changes = composition_family_changes(root, media_kind, family, &previous)?;
+    let folder_source =
+        if media_kind == PortableMediaKind::Directory && family.coverage.contains("") {
+            Some(
+                crate::book_composition::folder_sidecar::prepare_source(root)
+                    .map_err(TransferError::Database)?,
+            )
+        } else {
+            None
+        };
+    if let Some(source) = &folder_source {
+        source.revalidate().map_err(TransferError::Database)?;
+        let key = crate::book_scope::BookScopeKey::folder(root)
+            .map_err(TransferError::Invalid)?
+            .storage_key();
+        source
+            .consume_in(tx, "book_composition.book_compositions", &key)
+            .map_err(TransferError::Database)?;
+    }
     let desired: HashSet<_> = family
         .scopes
         .iter()
@@ -2775,6 +2848,16 @@ fn apply_composition_family(
             )
             .map_err(TransferError::Database)?;
         }
+    }
+    if folder_source.is_some() {
+        let key = crate::book_scope::BookScopeKey::folder(root)
+            .map_err(TransferError::Invalid)?
+            .storage_key();
+        let mirrored =
+            crate::book_composition::store::row_in(tx, "book_composition.book_compositions", &key)
+                .map_err(TransferError::Database)?
+                .map(|row| row.composition);
+        changes.folder_mirrors.insert(root.to_owned(), mirrored);
     }
     Ok(changes)
 }
@@ -7401,6 +7484,160 @@ mod tests {
         transfer_composition(crate::book_composition::CompositionPageRef::ArchiveEntry {
             entry_name: member.into(),
         })
+    }
+
+    #[test]
+    fn folder_empty_bundle_consumes_each_destination_backup_even_without_db_row() {
+        use crate::book_composition::{CompositionPageRef, store};
+        for backup_enabled in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source");
+            let destination = temp.path().join("destination");
+            let source_data = temp.path().join("source-data");
+            let data = temp.path().join("data");
+            fs::create_dir_all(&source).unwrap();
+            fs::create_dir_all(&destination).unwrap();
+            init_data_dir(&source_data);
+            init_data_dir(&data);
+            let composition = transfer_composition(CompositionPageRef::RelativePath {
+                path: "page.jpg".into(),
+            });
+            for name in ["one", "two"] {
+                fs::create_dir(source.join(name)).unwrap();
+                let folder = destination.join(name);
+                fs::create_dir(&folder).unwrap();
+                fs::write(source.join(name).join("page.jpg"), b"image").unwrap();
+                fs::write(folder.join("page.jpg"), b"image").unwrap();
+                fs::write(folder.join(crate::sidecar::SIDECAR_FILENAME), serde_json::to_vec(&serde_json::json!({
+                    "version": 2, "items": {"page.jpg": {"tags": ["preserved"]}}, "folder_composition": composition,
+                })).unwrap()).unwrap();
+                if name == "one" {
+                    set_composition(
+                        &data,
+                        &folder,
+                        "",
+                        PortableMediaKind::Directory,
+                        &composition,
+                    );
+                }
+            }
+            let cancel = AtomicBool::new(false);
+            export_at(&source_data, &source, true, &cancel, no_progress).unwrap();
+            copy_sidecar_bundle(&source, &destination);
+            let summary = import_at_with_folder_backup(
+                &data,
+                &destination,
+                &cancel,
+                backup_enabled,
+                no_progress,
+            )
+            .unwrap();
+            assert_eq!(summary.failed_entries, 0);
+            assert_eq!(summary.committed.composition_removals, 1);
+            assert!(summary.folder_backup_warnings.is_empty());
+            let mut connection = store::open_existing(&data.join("book_composition.db"))
+                .unwrap()
+                .unwrap();
+            for name in ["one", "two"] {
+                let folder = destination.join(name);
+                let key = crate::book_scope::BookScopeKey::folder(&folder)
+                    .unwrap()
+                    .storage_key();
+                let receipt = store::folder_receipt_in(&connection, "book_compositions", &key)
+                    .unwrap()
+                    .unwrap();
+                assert!(receipt.disk_sync_marker.is_some());
+                let crate::sidecar::SidecarImportLoad::Loaded(loaded) =
+                    crate::sidecar::SidecarFile::load_for_import(&folder)
+                else {
+                    panic!()
+                };
+                assert_eq!(
+                    loaded.sidecar().folder_composition().is_none(),
+                    backup_enabled
+                );
+                assert_eq!(
+                    loaded.sidecar().items()["page.jpg"].tags.as_ref().unwrap(),
+                    &["preserved"]
+                );
+                let (sidecar, source) = loaded.into_parts();
+                let tx = connection.transaction().unwrap();
+                assert!(
+                    !crate::book_composition::folder_sidecar::restore_in(
+                        &tx,
+                        "book_compositions",
+                        &key,
+                        &sidecar,
+                        &source
+                    )
+                    .unwrap()
+                );
+                tx.commit().unwrap();
+                assert!(
+                    store::row_in(&connection, "book_compositions", &key)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn folder_import_savepoint_rolls_back_consumption_when_composition_delete_fails() {
+        use crate::book_composition::{CompositionPageRef, store};
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("book");
+        let data = temp.path().join("data");
+        fs::create_dir(&folder).unwrap();
+        init_data_dir(&data);
+        let composition = transfer_composition(CompositionPageRef::RelativePath {
+            path: "page.jpg".into(),
+        });
+        set_composition(
+            &data,
+            &folder,
+            "",
+            PortableMediaKind::Directory,
+            &composition,
+        );
+        fs::write(
+            folder.join(crate::sidecar::SIDECAR_FILENAME),
+            serde_json::to_vec(
+                &serde_json::json!({"version":2, "items":{}, "folder_composition":composition}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "ATTACH DATABASE ?1 AS book_composition",
+            [data.join("book_composition.db").to_str().unwrap()],
+        )
+        .unwrap();
+        conn.execute_batch("CREATE TRIGGER book_composition.refuse_remove BEFORE DELETE ON book_compositions BEGIN SELECT RAISE(ABORT,'injected delete failure'); END; SAVEPOINT item").unwrap();
+        let family = PortableCompositionFamily {
+            coverage: crate::book_scope::BookScopeCoverage::Root,
+            scopes: vec![],
+        };
+        assert!(
+            apply_composition_family(&conn, &folder, PortableMediaKind::Directory, &family)
+                .is_err()
+        );
+        conn.execute_batch("ROLLBACK TO item; RELEASE item")
+            .unwrap();
+        let key = crate::book_scope::BookScopeKey::folder(&folder)
+            .unwrap()
+            .storage_key();
+        assert!(
+            store::folder_receipt_in(&conn, "book_composition.book_compositions", &key)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store::row_in(&conn, "book_composition.book_compositions", &key)
+                .unwrap()
+                .is_some()
+        );
     }
 
     fn set_composition(

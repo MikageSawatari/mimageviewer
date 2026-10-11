@@ -569,6 +569,7 @@ use presentation_transition::{PreparingProgress, PresentationTransitionState};
 pub(crate) mod book_composition_editor;
 mod book_composition_editor_prepare;
 mod book_composition_editor_thumbnails;
+mod book_composition_folder;
 pub(crate) mod book_composition_permission;
 mod book_composition_remap;
 pub(crate) mod book_composition_runtime;
@@ -40290,7 +40291,8 @@ impl App {
         if matches!(
             first_display_action,
             sidecar_restore::FirstDisplayAction::AutoFullscreenFolder
-        ) {
+        ) && !self.start_folder_composition_first_display()
+        {
             let resume_rejected =
                 self.settings.book_open_resume.resumes() && self.saved_resume_is_unresolvable();
             let new_idx = if self.settings.book_open_resume.resumes() {
@@ -45978,15 +45980,17 @@ impl App {
             let worker_old = old_path;
             let worker_new = new_path;
             let worker_tree = job.mappings[0].tree;
+            let folder_backup_enabled = self.settings.sidecar_backup_enabled;
             match std::thread::Builder::new()
                 .name("rename-key-migration".into())
                 .spawn(move || {
                     let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        crate::rename_key_migration::run_at_with_shape(
+                        crate::rename_key_migration::run_at_with_shape_and_folder_backup(
                             &data_dir,
                             &worker_old,
                             &worker_new,
                             worker_tree,
+                            folder_backup_enabled,
                         )
                     }))
                     .unwrap_or_else(|_| {
@@ -49630,11 +49634,12 @@ impl App {
             let admission = if let Some((source, target)) = collection_tree_migration {
                 service.rename_book_root(source, target)
             } else {
-                service.migrate_page_paths(
+                service.migrate_page_paths_with_backup(
                     mappings
                         .iter()
                         .map(|mapping| (mapping.from.clone(), mapping.to.clone()))
                         .collect(),
+                    self.settings.sidecar_backup_enabled,
                 )
             };
             if let Err(error) = admission {
@@ -77258,7 +77263,14 @@ impl App {
     /// **戻った時点ではまだ書けていない。**終了時など、書けたことが必要な経路は
     /// このあと [`crate::sidecar::wait_for_pending_writes`] を呼ぶこと。
     pub(crate) fn flush_all_sidecars(&mut self) {
+        let owned = self.composition_editor_sidecar_flush_roots();
         for sidecar in self.sidecars.values_mut() {
+            if owned
+                .iter()
+                .any(|root| crate::folder_tree::path_eq(sidecar.folder(), root))
+            {
+                continue;
+            }
             sidecar.queue_flush();
         }
     }
@@ -83467,7 +83479,14 @@ impl App {
             return;
         }
         let now = std::time::Instant::now();
+        let owned = self.composition_editor_sidecar_flush_roots();
         for sidecar in self.sidecars.values_mut() {
+            if owned
+                .iter()
+                .any(|root| crate::folder_tree::path_eq(sidecar.folder(), root))
+            {
+                continue;
+            }
             if !sidecar.is_dirty() {
                 continue;
             }

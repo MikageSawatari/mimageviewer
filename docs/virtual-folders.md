@@ -40,7 +40,11 @@ G3の共通projectionはraw sourceを保持し、直下の実ページblockだ�
 元行を置き換えるworkerは未保存trimを既存page keyで保存してから個別編集を投影し、UI同期I/Oを追加しない。
 unsafe/case衝突を含む階層は構成だけ拒否し、書庫と保存構成は変更せず従来表示を使う。
 通知は「この本のページ名では本の構成を使えません。構成を使わずに開きます。」。
-画像folder sidecarのwriter/schemaはG4Fまで変更しない。
+G4Fは画像だけのphysical Book folderへ相対page refのadapterを加える。OFF/混在は従来列、
+再適格化は保存構成を再採用する。compiled folderと抽出全leafへの自動restoreは対象外。
+sidecar v2のroot構成と個別itemsは一つのimmutable snapshot/既存writerで保存する。
+不足行restore/解除の消費receiptは構成DBの同transactionへ記録し、旧backupの同場所復活を防ぐ。
+source restore完了を既存continuationが所有し、同contextのprojection/初回表示へ引き継ぐ。
 metadata v11の`composition_family { coverage, scopes }`はlogical folder/書庫/document entryが所有する。
 既存のcache DriveStripped spread/trim familyと別にsource KeepDrive構成を運ぶ。
 旧v7–v10/字段なしは保持、新版空はcoverage内だけ解除、非空はscope単位の置換。skip/coverage外は保持する。

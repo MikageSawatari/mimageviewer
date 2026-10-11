@@ -1716,6 +1716,47 @@ G4Fのbounded設計/実装レビューで、同じ画像folder ownership/分類/
 採択時はfolder adapter/editor/sidecar新字段とその専用testsを外せばよく、A2/Q16/書庫等の共通型/ownerを再設計しない。
 既存folder閲覧/個別編集/既存sidecar/metadata transfer機能は撤去しない。未リリースfolder構成はmigration不要。
 
+#### G4F 実装記録（2026-10-12、next-book）
+
+`app/book_composition_folder`を画像folder専用adapterとし、既存physical分類/列挙/重複除外を
+再利用する。BookImageFolderだけが構成projection/editorへ参加し、画像本設定OFFと混在folderは
+従来列を保つ。OFFでも明示folder openの不足行restoreは行い、再適格化で保存構成を適用する。
+compiled folderと抽出結果の全leaf列挙へrestoreを拡げない。相対page refの個別rename、rootの
+rename/purgeは共有BookScopeKeyと既存maintenanceへ接続し、Folder内容ID ledgerは追加しない。
+
+sidecar v2は`folder_composition`を任意root値として持ち、v1 readerは維持する。rootとitemsは
+一つのimmutable SidecarSnapshotであり、各ArcをCOWで共有する。既存writerのFIFOとfull-snapshot
+identityが予約/完了/失効を所有し、構成専用writerやroot dirty flagを足さない。
+構成保存はG4のmodal ownerとsave ticketを再利用し、同folderの既存sidecar flushをworkerで
+完了させてからDB保存/ミラーを行う。終了時も同じwriterを使う。タグだけのwriteは既存rootを
+保持し、構成DB値を取得して差し替えない。UIはworkerが公開したroot Arcを採用するだけで、
+sidecar read/write/hashや大きなrootのcloneを行わない。
+保存票があるfolderの通常/定期flushは、その票の完了採用まで同ownerへ委ねる。
+遅いtag完了はcacheのitemsを変更できるが、workerの新rootを旧snapshotで上書きしない。
+採用後はdirty itemsを維持して新rootと共に既存writerへ送る。他folderのflushは続ける。
+
+自動restoreは既存sidecar import ownerの独立composition familyへ載せる。strict tokenの
+SHA-256/metadata照合とfull-snapshot PendingWriter照合を再利用し、root witnessと実disk markerを
+構成DBの消費receiptへ保存する。receiptは不足行restore/明示解除と同じtransactionで更新し、
+commit時に現行行を再確認する。receiptは転送しない。root renameは移動先sidecar照合後、
+purge/resetはreceipt-only行も扱う。表示開始は同contextのsource restore終端後に既存projectionへ
+進み、Resumingが依存するBook準備を止めない。兄弟窓のrestore ownerや行は変更しない。
+画像Bookの自動fullscreenは既存の本用deferred-open ownerへ渡し、構成採用前の元indexを
+明示page identityとして固定しない。「最初から」は採用した構成の先頭、「続きから」は
+同じresume/target resolverで解決する。画像Book以外のfolderは従来入口を維持する。
+
+明示metadata importは既存の一回summary確認と項目SAVEPOINTを使い、新形式空もroot消費を
+記録する。backup OFFではDB/receiptのみ、ONではcommit後に既存writerへミラーする。
+backupだけ失敗した場合はDB成功/receiptを保持し、
+「フォルダのバックアップを更新できませんでした」と通知する。古いbackupが残るため、
+移動前に保存し直すか明示メタ情報exportを使う案内を付ける。自動retry/DB-file rollbackはしない。
+
+検討した簡素化は、folder専用restore/editor待機を追加せず既存modal/FIFO/import ownerを使うこと。
+その構造を採用した。切り離し時はfolder adapter、folder source分岐、sidecar root/receipt/familyと
+専用fixtureを除けばよく、共通model/unit/提示許可、書庫/PDF/EPUBのsource ownerは維持できる。
+Remote wireは変更していない。G5と実機確認は別工程であり、本節は受入/レビュー成功の主張ではない。
+自動検証の実数と失敗は`target/G-1242-g4f-msg.txt`へ記録する。
+
 ### G5: Remote / 出力 / 最終gateと文書
 
 所有: ContainerEngine/IPC/Web、export/製本入口、docs/manual。

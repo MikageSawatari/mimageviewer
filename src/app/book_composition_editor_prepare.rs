@@ -19,6 +19,8 @@ use crate::{
 
 #[derive(Clone)]
 pub(crate) struct EditorSourceInput {
+    /// Captured folder listing policy; all enumeration stays on workers.
+    pub(crate) folder_settings: std::sync::Arc<crate::settings::Settings>,
     pub(crate) scope: BookScopeKey,
     pub(crate) domain: PageDomain,
     pub(crate) source: BookCompositionSource,
@@ -91,6 +93,26 @@ impl std::fmt::Debug for EditorSourceInput {
 }
 
 fn source_files(input: &EditorSourceInput) -> Result<Vec<FileWitness>, String> {
+    if let BookCompositionSource::Folder { root } = &input.source {
+        let prepared =
+            super::book_composition_folder::prepare_folder_source(root, &input.folder_settings)?;
+        return prepared
+            .raw_pages
+            .into_iter()
+            .map(|raw| {
+                let CompositionPageRef::RelativePath { path } = raw.page else {
+                    unreachable!()
+                };
+                let path = root.join(path);
+                let metadata = std::fs::metadata(&path).map_err(|error| error.to_string())?;
+                Ok(FileWitness {
+                    path,
+                    size: metadata.len(),
+                    modified: metadata.modified().map_err(|error| error.to_string())?,
+                })
+            })
+            .collect();
+    }
     let physical = match &input.source {
         BookCompositionSource::Archive { tree, .. } => tree.zip_path.as_path(),
         BookCompositionSource::Document {
@@ -101,6 +123,7 @@ fn source_files(input: &EditorSourceInput) -> Result<Vec<FileWitness>, String> {
             .as_ref()
             .map_or(physical_source.as_path(), |read| read.read_path.as_path()),
         BookCompositionSource::Unavailable => return Err("本の元ページを取得できません".into()),
+        BookCompositionSource::Folder { .. } => unreachable!("folder files handled above"),
     };
     let mut paths = vec![input.scope.logical_root.clone()];
     if crate::path_key::normalize_keep_drive(physical)
@@ -127,6 +150,9 @@ fn source_files(input: &EditorSourceInput) -> Result<Vec<FileWitness>, String> {
 
 fn page_for_item(item: &GridItem) -> Option<CompositionPageRef> {
     match item {
+        GridItem::Image(path) => Some(CompositionPageRef::RelativePath {
+            path: path.file_name()?.to_str()?.to_owned(),
+        }),
         GridItem::ZipImage { entry_name, .. } => Some(CompositionPageRef::ArchiveEntry {
             entry_name: entry_name.clone(),
         }),
@@ -142,6 +168,19 @@ fn source_rows(
 ) -> Result<(Vec<CanonicalRawPage>, Vec<ManifestPage>, PageRows), String> {
     crate::book_composition::store::validate_scope_domain(&input.scope, &input.domain)?;
     let (raw_items, rows) = match &input.source {
+        BookCompositionSource::Folder { root } => {
+            let prepared = super::book_composition_folder::prepare_folder_source(
+                root,
+                &input.folder_settings,
+            )?;
+            if !matches!(
+                prepared.recipe,
+                ProjectionRecipe::Book(BookScope::ImageFolder(_))
+            ) {
+                return Err(SOURCE_CHANGED.into());
+            }
+            return Ok((prepared.raw_pages, prepared.manifest, prepared.rows));
+        }
         BookCompositionSource::Archive { tree, prefix, .. } => {
             if BookScopeKey::archive(&input.scope.logical_root, prefix)? != input.scope {
                 return Err("本の元階層が一致しません".into());
@@ -226,6 +265,20 @@ fn project_source_rows(
         publication_sequence: 0,
     };
     let result = match &input.source {
+        BookCompositionSource::Folder { root } => {
+            let prepared = super::book_composition_folder::prepare_folder_source(
+                root,
+                &input.folder_settings,
+            )?;
+            super::book_composition_folder::project_folder_composition(
+                root,
+                &prepared.raw_pages,
+                rows,
+                input.policy.clone(),
+                token,
+                record,
+            )
+        }
         BookCompositionSource::Archive { tree, prefix, .. } => project_archive_composition(
             tree,
             &input.scope.logical_root,
@@ -381,6 +434,19 @@ pub(crate) fn verify_source(
         return Err(SOURCE_CHANGED.into());
     }
     let actual = match &input.source {
+        BookCompositionSource::Folder { root } => {
+            let prepared = super::book_composition_folder::prepare_folder_source(
+                root,
+                &input.folder_settings,
+            )?;
+            if !matches!(
+                prepared.recipe,
+                ProjectionRecipe::Book(BookScope::ImageFolder(_))
+            ) {
+                return Err(SOURCE_CHANGED.into());
+            }
+            prepared.raw_pages.into_iter().map(|raw| raw.page).collect()
+        }
         BookCompositionSource::Archive { tree, prefix, .. } => {
             // Re-enumerate through the existing read-only loader, not the retained
             // display tree. Converted cache origins retain their existing adapter.
@@ -626,6 +692,7 @@ mod tests {
         source: BookCompositionSource,
     ) -> EditorSourceInput {
         EditorSourceInput {
+            folder_settings: std::sync::Arc::new(Default::default()),
             scope,
             domain,
             source,
@@ -1258,6 +1325,20 @@ fn read_landscape(input: &EditorSourceInput, items: &[GridItem]) -> Result<Vec<b
         .collect();
     let mut dims = HashMap::new();
     match &input.source {
+        BookCompositionSource::Folder { root } => {
+            for item in items {
+                let GridItem::Image(path) = item else {
+                    continue;
+                };
+                let page = super::book_composition_folder::page_ref(root, path)?;
+                let [width, height] = crate::fast_resize::probe_dims(path)
+                    .ok_or_else(|| format!("ページ寸法を読み取れません ({})", path.display()))?;
+                if width == 0 || height == 0 {
+                    return Err(format!("ページ寸法が不正です ({})", path.display()));
+                }
+                dims.insert(page, (width as u32, height as u32));
+            }
+        }
         BookCompositionSource::Archive { tree, .. } => {
             let mut archive = if items
                 .iter()

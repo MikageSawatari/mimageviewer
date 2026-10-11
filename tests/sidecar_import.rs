@@ -582,6 +582,7 @@ fn atomic_import_430_mixed_fields_commits_once_and_records_marker() {
         ImportFamilies {
             edits: true,
             tags: false,
+            composition: false,
         },
         &cancel,
     )
@@ -660,6 +661,7 @@ fn invalid_mask_fails_prepare_without_writing_rows_or_marker() {
         ImportFamilies {
             edits: true,
             tags: false,
+            composition: false,
         },
         &cancel,
     )

@@ -880,3 +880,640 @@ fn composition_only_save_observes_captured_pdf_epub_zip_and_converted_outer_root
             .all(|entry| entry.last_edit_at > 0 && entry.has_restorable_content)
     );
 }
+
+fn folder_book() -> BookComposition {
+    BookComposition::new(
+        ReadingDirection::Rtl,
+        vec![CompositionUnit::Single {
+            page: CompositionPageRef::RelativePath {
+                path: "page.jpg".into(),
+            },
+            placement: SinglePlacement::Center,
+            companion: SingleCompanion::Vacant,
+        }],
+    )
+}
+
+fn write_folder_backup(folder: &Path, composition: &BookComposition, tag: &str) {
+    std::fs::write(
+        folder.join(crate::sidecar::SIDECAR_FILENAME),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 2, "items": {"page.jpg": {"tags": [tag]}}, "folder_composition": composition,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+fn restore_folder_backup(service: &BookCompositionService, folder: &Path) -> CompositionWriteReply {
+    let crate::sidecar::SidecarImportLoad::Loaded(loaded) =
+        crate::sidecar::SidecarFile::load_for_import(folder)
+    else {
+        panic!("strict loaded backup expected")
+    };
+    let (sidecar, source) = loaded.into_parts();
+    service
+        .restore_folder(BookScopeKey::folder(folder).unwrap(), sidecar, source)
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap()
+}
+
+#[test]
+fn folder_off_removal_consumes_root_across_tag_rewrites_restart_and_copy() {
+    let temp = tempfile::tempdir().unwrap();
+    let folder = temp.path().join("book");
+    std::fs::create_dir(&folder).unwrap();
+    let scope = BookScopeKey::folder(&folder).unwrap();
+    let composition = folder_book();
+    write_folder_backup(&folder, &composition, "old tag");
+    let (service, owner) =
+        BookCompositionService::spawn_at(temp.path().join("data"), None).unwrap();
+    prepare(&service, scope.clone(), PageDomain::ImageFolder);
+    assert!(restore_folder_backup(&service, &folder).changed);
+    let original_marker = service
+        .receipt(scope.clone())
+        .recv()
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .disk_sync_marker;
+    assert!(
+        service
+            .remove_folder(scope.clone(), false)
+            .recv()
+            .unwrap()
+            .status
+            .is_ok()
+    );
+    assert!(!restore_folder_backup(&service, &folder).changed);
+    // A different family rewrites the whole disk token, preserving the consumed root.
+    write_folder_backup(&folder, &composition, "new tag");
+    assert!(!restore_folder_backup(&service, &folder).changed);
+    let new_receipt = service
+        .receipt(scope.clone())
+        .recv()
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_ne!(new_receipt.disk_sync_marker, original_marker);
+    assert_eq!(
+        prepare(&service, scope.clone(), PageDomain::ImageFolder).status,
+        Ok(None)
+    );
+    owner.shutdown_and_join();
+    let (service, owner) =
+        BookCompositionService::spawn_at(temp.path().join("data"), None).unwrap();
+    prepare(&service, scope.clone(), PageDomain::ImageFolder);
+    assert!(!restore_folder_backup(&service, &folder).changed);
+    let copied = temp.path().join("copied");
+    std::fs::create_dir(&copied).unwrap();
+    std::fs::copy(
+        folder.join(crate::sidecar::SIDECAR_FILENAME),
+        copied.join(crate::sidecar::SIDECAR_FILENAME),
+    )
+    .unwrap();
+    assert!(restore_folder_backup(&service, &copied).changed);
+    let mut changed_root = composition;
+    changed_root.direction = ReadingDirection::Ltr;
+    write_folder_backup(&folder, &changed_root, "new tag");
+    assert!(restore_folder_backup(&service, &folder).changed);
+    owner.shutdown_and_join();
+}
+
+#[test]
+fn folder_restore_transaction_rechecks_consumption_and_preserves_existing_record() {
+    let (temp, mut connection) = database();
+    let folder = temp.path().join("book");
+    std::fs::create_dir(&folder).unwrap();
+    let key = BookScopeKey::folder(&folder).unwrap().storage_key();
+    write_folder_backup(&folder, &folder_book(), "tag");
+    let crate::sidecar::SidecarImportLoad::Loaded(loaded) =
+        crate::sidecar::SidecarFile::load_for_import(&folder)
+    else {
+        panic!()
+    };
+    let (sidecar, source) = loaded.into_parts();
+    // Prepare preceded a later explicit remove; commit must use the current receipt.
+    let digest = sidecar.folder_composition_digest();
+    consume_folder_root_in(&connection, "book_compositions", &key, digest, Some(123)).unwrap();
+    let tx = connection.transaction().unwrap();
+    assert!(
+        !super::folder_sidecar::restore_in(&tx, "book_compositions", &key, &sidecar, &source)
+            .unwrap()
+    );
+    tx.commit().unwrap();
+    assert!(load_rows(&connection).unwrap().is_empty());
+    let mut local = folder_book();
+    local.direction = ReadingDirection::Ltr;
+    set(&mut connection, &key, &PageDomain::ImageFolder, &local);
+    let before = load_rows(&connection).unwrap();
+    let tx = connection.transaction().unwrap();
+    assert!(
+        !super::folder_sidecar::restore_in(&tx, "book_compositions", &key, &sidecar, &source)
+            .unwrap()
+    );
+    tx.commit().unwrap();
+    assert_eq!(load_rows(&connection).unwrap(), before);
+}
+
+#[test]
+fn folder_pending_receipt_never_persists_process_sequence_and_rollback_is_atomic() {
+    let (_temp, mut connection) = database();
+    let key = "c:/books/folder";
+    consume_folder_root_in(&connection, "book_compositions", key, [1; 32], Some(41)).unwrap();
+    let tx = connection.transaction().unwrap();
+    consume_folder_root_in(&tx, "book_compositions", key, [2; 32], None).unwrap();
+    replace_row_in(
+        &tx,
+        "book_compositions",
+        key,
+        &PageDomain::ImageFolder,
+        &folder_book(),
+    )
+    .unwrap();
+    drop(tx);
+    assert!(load_rows(&connection).unwrap().is_empty());
+    assert_eq!(
+        folder_receipt_in(&connection, "book_compositions", key)
+            .unwrap()
+            .unwrap(),
+        FolderReceipt {
+            disk_sync_marker: Some(41),
+            consumed_root_digest: [1; 32]
+        }
+    );
+    consume_folder_root_in(&connection, "book_compositions", key, [2; 32], None).unwrap();
+    assert_eq!(
+        folder_receipt_in(&connection, "book_compositions", key)
+            .unwrap()
+            .unwrap()
+            .disk_sync_marker,
+        Some(41)
+    );
+    let fresh = "c:/books/new";
+    consume_folder_root_in(&connection, "book_compositions", fresh, [3; 32], None).unwrap();
+    assert_eq!(
+        folder_receipt_in(&connection, "book_compositions", fresh)
+            .unwrap()
+            .unwrap()
+            .disk_sync_marker,
+        None
+    );
+    purge_book_root(&mut connection, "c:/books").unwrap();
+    assert!(
+        folder_receipt_in(&connection, "book_compositions", key)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn folder_corrupt_source_prevents_off_removal_and_preserves_original_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let folder = temp.path().join("book");
+    std::fs::create_dir(&folder).unwrap();
+    let scope = BookScopeKey::folder(&folder).unwrap();
+    let (service, owner) =
+        BookCompositionService::spawn_at(temp.path().join("data"), None).unwrap();
+    prepare(&service, scope.clone(), PageDomain::ImageFolder);
+    assert!(
+        service
+            .save_folder(scope.clone(), folder_book(), false)
+            .recv()
+            .unwrap()
+            .changed
+    );
+    let path = folder.join(crate::sidecar::SIDECAR_FILENAME);
+    std::fs::write(&path, b"broken backup").unwrap();
+    assert!(
+        service
+            .remove_folder(scope.clone(), false)
+            .recv()
+            .unwrap()
+            .status
+            .is_err()
+    );
+    assert!(
+        prepare(&service, scope, PageDomain::ImageFolder)
+            .status
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(std::fs::read(path).unwrap(), b"broken backup");
+    owner.shutdown_and_join();
+}
+
+#[test]
+fn folder_receipt_rename_requires_destination_disk_witness_and_copy_does_not_transfer() {
+    let (temp, mut connection) = database();
+    let source = temp.path().join("source");
+    let target = temp.path().join("target");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::create_dir(&target).unwrap();
+    let source_key = BookScopeKey::folder(&source).unwrap().storage_key();
+    let target_key = BookScopeKey::folder(&target).unwrap().storage_key();
+    let composition = folder_book();
+    write_folder_backup(&source, &composition, "tag");
+    let source_snapshot = super::folder_sidecar::prepare_source(&source).unwrap();
+    source_snapshot
+        .consume_in(&connection, "book_compositions", &source_key)
+        .unwrap();
+    let mut other = composition.clone();
+    other.direction = ReadingDirection::Ltr;
+    write_folder_backup(&target, &other, "tag");
+    rename_book_root(&mut connection, &source_key, &target_key).unwrap();
+    assert!(
+        folder_receipt_in(&connection, "book_compositions", &source_key)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        folder_receipt_in(&connection, "book_compositions", &target_key)
+            .unwrap()
+            .is_none()
+    );
+    std::fs::copy(
+        source.join(crate::sidecar::SIDECAR_FILENAME),
+        target.join(crate::sidecar::SIDECAR_FILENAME),
+    )
+    .unwrap();
+    rename_book_root(&mut connection, &source_key, &target_key).unwrap();
+    assert!(
+        folder_receipt_in(&connection, "book_compositions", &source_key)
+            .unwrap()
+            .is_none()
+    );
+    let receipt = folder_receipt_in(&connection, "book_compositions", &target_key)
+        .unwrap()
+        .unwrap();
+    let crate::sidecar::SidecarImportLoad::Loaded(loaded) =
+        crate::sidecar::SidecarFile::load_for_import(&target)
+    else {
+        panic!()
+    };
+    let crate::sidecar::SidecarImportSource::Disk(token) = loaded.source() else {
+        panic!()
+    };
+    assert_eq!(receipt.disk_sync_marker, Some(token.sync_marker()));
+    assert!(load_rows(&connection).unwrap().is_empty());
+}
+
+#[test]
+fn folder_backup_only_failure_keeps_committed_removal_and_consumes_retained_backup() {
+    let temp = tempfile::tempdir().unwrap();
+    let folder = temp.path().join("book");
+    let data = temp.path().join("data");
+    std::fs::create_dir(&folder).unwrap();
+    let scope = BookScopeKey::folder(&folder).unwrap();
+    write_folder_backup(&folder, &folder_book(), "preserved");
+    let (service, owner) = BookCompositionService::spawn_at(data, None).unwrap();
+    prepare(&service, scope.clone(), PageDomain::ImageFolder);
+    assert!(restore_folder_backup(&service, &folder).changed);
+    service.drain_changed_scope_keys();
+    let receipt = service
+        .receipt(scope.clone())
+        .recv()
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let sidecar_path = folder.join(crate::sidecar::SIDECAR_FILENAME);
+    let retained_path = folder.join("retained-backup.dat");
+    let original = std::fs::read(&sidecar_path).unwrap();
+    let fault_path = sidecar_path.clone();
+    let retained_for_fault = retained_path.clone();
+    let result = service
+        .remove_folder_with_before_mirror_for_test(scope.clone(), move || {
+            // This executes after DB commit. A directory at the file path makes the
+            // mirror source write-disabled while preserving the exact old bytes.
+            std::fs::rename(&fault_path, retained_for_fault).unwrap();
+            std::fs::create_dir(&fault_path).unwrap();
+        })
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap();
+    assert!(result.changed && result.status.is_ok());
+    assert_eq!(
+        prepare(&service, scope.clone(), PageDomain::ImageFolder).status,
+        Ok(None)
+    );
+    let warnings = service.drain_errors();
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].starts_with("フォルダのバックアップを更新できませんでした"));
+    assert_eq!(
+        service
+            .receipt(scope.clone())
+            .recv()
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        receipt
+    );
+    assert_eq!(std::fs::read(&retained_path).unwrap(), original);
+    // Querying and idle processing did not retry or roll back the backup failure.
+    assert!(sidecar_path.is_dir());
+    std::fs::remove_dir(&sidecar_path).unwrap();
+    std::fs::rename(retained_path, &sidecar_path).unwrap();
+    assert!(!restore_folder_backup(&service, &folder).changed);
+    assert_eq!(
+        prepare(&service, scope, PageDomain::ImageFolder).status,
+        Ok(None)
+    );
+    assert_eq!(std::fs::read(sidecar_path).unwrap(), original);
+    owner.shutdown_and_join();
+}
+
+#[test]
+fn folder_receipt_only_generic_purge_preserves_parent_on_page_delete_and_neighbor() {
+    let (temp, connection) = database();
+    let folder = temp.path().join("book");
+    let sibling = temp.path().join("book-keep");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::create_dir(&sibling).unwrap();
+    let key = BookScopeKey::folder(&folder).unwrap().storage_key();
+    let sibling_key = BookScopeKey::folder(&sibling).unwrap().storage_key();
+    consume_folder_root_in(&connection, "book_compositions", &key, [1; 32], Some(21)).unwrap();
+    consume_folder_root_in(
+        &connection,
+        "book_compositions",
+        &sibling_key,
+        [2; 32],
+        Some(22),
+    )
+    .unwrap();
+    assert!(load_rows(&connection).unwrap().is_empty());
+    drop(connection);
+    let page = folder.join("page.jpg");
+    std::fs::write(&page, b"disposable page").unwrap();
+    std::fs::remove_file(&page).unwrap();
+    let report = crate::rename_key_migration::purge_removed_paths_at(temp.path(), &[page], &[]);
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let connection = open_existing(&temp.path().join(DB_FILE)).unwrap().unwrap();
+    assert!(
+        folder_receipt_in(&connection, "book_compositions", &key)
+            .unwrap()
+            .is_some()
+    );
+    drop(connection);
+    std::fs::remove_dir(&folder).unwrap();
+    let report = crate::rename_key_migration::purge_removed_scopes_at(
+        temp.path(),
+        &[crate::delete_worker::DeleteSourceScope::Tree(folder)],
+        &[],
+    );
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let connection = open_existing(&temp.path().join(DB_FILE)).unwrap().unwrap();
+    assert!(
+        folder_receipt_in(&connection, "book_compositions", &key)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        folder_receipt_in(&connection, "book_compositions", &sibling_key)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn folder_auto_restore_preserves_unknown_and_corrupt_existing_database_bytes() {
+    for corruption in ["row_schema", "row_json", "database_version"] {
+        let (temp, mut connection) = database();
+        let folder = temp.path().join("book");
+        std::fs::create_dir(&folder).unwrap();
+        let scope = BookScopeKey::folder(&folder).unwrap();
+        set(
+            &mut connection,
+            &scope.storage_key(),
+            &PageDomain::ImageFolder,
+            &folder_book(),
+        );
+        match corruption {
+            "row_schema" => connection
+                .execute_batch("UPDATE book_compositions SET schema_version=999")
+                .unwrap(),
+            "row_json" => connection
+                .execute_batch("UPDATE book_compositions SET composition_json='broken'")
+                .unwrap(),
+            _ => connection.execute_batch("PRAGMA user_version=999").unwrap(),
+        }
+        drop(connection);
+        write_folder_backup(&folder, &folder_book(), "retained");
+        let db_path = temp.path().join(DB_FILE);
+        let original = std::fs::read(&db_path).unwrap();
+        let backup_path = folder.join(crate::sidecar::SIDECAR_FILENAME);
+        let original_backup = std::fs::read(&backup_path).unwrap();
+        let (service, owner) = BookCompositionService::spawn_at(temp.path().into(), None).unwrap();
+        assert!(
+            prepare(&service, scope, PageDomain::ImageFolder)
+                .status
+                .is_err()
+        );
+        let restored = restore_folder_backup(&service, &folder);
+        assert!(!restored.changed && restored.status.is_err());
+        assert!(service.snapshot().status.is_err());
+        owner.shutdown_and_join();
+        assert_eq!(std::fs::read(db_path).unwrap(), original);
+        assert_eq!(std::fs::read(backup_path).unwrap(), original_backup);
+    }
+}
+
+fn assert_folder_page_filesystem_migration(backup_enabled: bool) {
+    let (temp, mut connection) = database();
+    let folder = temp.path().join("book");
+    let outside = temp.path().join("outside");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    let old_page = folder.join("A.JPG");
+    let renamed_page = folder.join("Renamed.JPG");
+    let other_page = folder.join("B.JPG");
+    std::fs::write(&old_page, b"disposable A page").unwrap();
+    std::fs::write(&other_page, b"disposable B page").unwrap();
+    let key = BookScopeKey::folder(&folder).unwrap().storage_key();
+    let page = |name: &str| CompositionPageRef::RelativePath { path: name.into() };
+    let mut composition = BookComposition::new(
+        ReadingDirection::Rtl,
+        vec![
+            CompositionUnit::Single {
+                page: page("A.JPG"),
+                placement: SinglePlacement::Center,
+                companion: SingleCompanion::Vacant,
+            },
+            CompositionUnit::Single {
+                page: page("B.JPG"),
+                placement: SinglePlacement::Leading,
+                companion: SingleCompanion::FrontCoverSupplement {
+                    page: page("A.JPG"),
+                },
+            },
+        ],
+    );
+    composition.cover = Some(page("A.JPG"));
+    composition.hidden_pages = vec![page("A.JPG")];
+    set(
+        &mut connection,
+        &key,
+        &PageDomain::ImageFolder,
+        &composition,
+    );
+    let mut sidecar = crate::sidecar::SidecarFile::new(folder.clone());
+    sidecar
+        .set_folder_composition(Some(composition.clone()))
+        .unwrap();
+    sidecar.set_tags("A.JPG", &["preserved"]);
+    let adjustment = crate::adjustment::AdjustParams {
+        brightness: 12.0,
+        ..Default::default()
+    };
+    sidecar.set_adjust("B.JPG", adjustment.clone());
+    assert!(sidecar.flush_blocking());
+    let backup_path = folder.join(crate::sidecar::SIDECAR_FILENAME);
+    let original_backup = std::fs::read(&backup_path).unwrap();
+    let original_digest = sidecar.folder_composition_digest();
+    drop(connection);
+
+    // A real same-parent rename must rewrite every saved occurrence once.
+    std::fs::rename(&old_page, &renamed_page).unwrap();
+    let (changed, warnings) = migrate_page_paths_with_backup_at(
+        temp.path(),
+        &[(old_page, renamed_page.clone())],
+        backup_enabled,
+    )
+    .unwrap();
+    assert_eq!(changed, 1);
+    assert!(warnings.is_empty());
+    let connection = open_existing(&temp.path().join(DB_FILE)).unwrap().unwrap();
+    let renamed_record = row_in(&connection, "book_compositions", &key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(renamed_record.composition.cover, Some(page("Renamed.JPG")));
+    assert_eq!(
+        renamed_record.composition.hidden_pages,
+        [page("Renamed.JPG")]
+    );
+    assert_eq!(
+        renamed_record.composition.units[0].pages().next(),
+        Some(&page("Renamed.JPG"))
+    );
+    assert!(
+        matches!(&renamed_record.composition.units[1], CompositionUnit::Single { companion: SingleCompanion::FrontCoverSupplement { page: cover }, .. } if *cover == page("Renamed.JPG"))
+    );
+    let receipt = folder_receipt_in(&connection, "book_compositions", &key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.consumed_root_digest, original_digest);
+    assert!(receipt.disk_sync_marker.is_some());
+    let loaded = crate::sidecar::SidecarFile::load(&folder);
+    assert_eq!(
+        loaded.items()["A.JPG"].tags.as_ref().unwrap(),
+        &["#preserved"]
+    );
+    assert_eq!(
+        loaded.items()["B.JPG"].adjust.as_ref().unwrap(),
+        &adjustment
+    );
+    if backup_enabled {
+        let root = loaded.folder_composition().unwrap();
+        assert_eq!(root.cover, Some(page("Renamed.JPG")));
+        assert_eq!(root.hidden_pages, [page("Renamed.JPG")]);
+    } else {
+        assert_eq!(std::fs::read(&backup_path).unwrap(), original_backup);
+        assert_eq!(loaded.folder_composition().unwrap(), &composition);
+    }
+    drop(connection);
+
+    // An outside move keeps the stored identity; actual folder facts resolve Missing.
+    let moved_page = outside.join("Moved.JPG");
+    std::fs::rename(&other_page, &moved_page).unwrap();
+    let (changed, warnings) =
+        migrate_page_paths_with_backup_at(temp.path(), &[(other_page, moved_page)], backup_enabled)
+            .unwrap();
+    assert_eq!(changed, 0);
+    assert!(warnings.is_empty());
+    let connection = open_existing(&temp.path().join(DB_FILE)).unwrap().unwrap();
+    assert_eq!(
+        row_in(&connection, "book_compositions", &key)
+            .unwrap()
+            .unwrap(),
+        renamed_record
+    );
+    let manifest = ["Renamed.JPG", "B.JPG"]
+        .into_iter()
+        .filter(|name| folder.join(name).is_file())
+        .enumerate()
+        .map(|(item_index, name)| ManifestPage {
+            page: page(name),
+            availability: ManifestAvailability::Present { item_index },
+        })
+        .collect::<Vec<_>>();
+    let projection = resolve_composition(
+        &renamed_record.composition,
+        &PageDomain::ImageFolder,
+        &manifest,
+    )
+    .unwrap();
+    assert_eq!(projection.page_status(&page("B.JPG")), PageStatus::Missing);
+    assert_eq!(
+        projection.page_status(&page("Renamed.JPG")),
+        PageStatus::HiddenByComposition
+    );
+    drop(connection);
+
+    // Page deletion purges page metadata without erasing the parent composition.
+    std::fs::remove_file(&renamed_page).unwrap();
+    let report =
+        crate::rename_key_migration::purge_removed_paths_at(temp.path(), &[renamed_page], &[]);
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let mut connection = open_existing(&temp.path().join(DB_FILE)).unwrap().unwrap();
+    assert_eq!(
+        row_in(&connection, "book_compositions", &key)
+            .unwrap()
+            .unwrap(),
+        renamed_record
+    );
+    let projection =
+        resolve_composition(&renamed_record.composition, &PageDomain::ImageFolder, &[]).unwrap();
+    assert_eq!(
+        projection.page_status(&page("Renamed.JPG")),
+        PageStatus::Missing
+    );
+    if !backup_enabled {
+        // Prove the rename's consumption itself survives row removal: no later
+        // explicit remove consumer is used to create this receipt for the test.
+        let transaction = connection.transaction().unwrap();
+        assert!(remove_row_in(&transaction, "book_compositions", &key).unwrap());
+        transaction.commit().unwrap();
+        let crate::sidecar::SidecarImportLoad::Loaded(loaded) =
+            crate::sidecar::SidecarFile::load_for_import(&folder)
+        else {
+            panic!("retained original backup")
+        };
+        let (sidecar, source) = loaded.into_parts();
+        let transaction = connection.transaction().unwrap();
+        assert!(
+            !super::folder_sidecar::restore_in(
+                &transaction,
+                "book_compositions",
+                &key,
+                &sidecar,
+                &source
+            )
+            .unwrap()
+        );
+        transaction.commit().unwrap();
+        assert!(
+            row_in(&connection, "book_compositions", &key)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(std::fs::read(backup_path).unwrap(), original_backup);
+    }
+}
+
+#[test]
+fn folder_real_page_rename_backup_on_preserves_items_and_outside_move_is_missing() {
+    assert_folder_page_filesystem_migration(true);
+}
+
+#[test]
+fn folder_real_page_rename_backup_off_consumes_old_root_and_page_delete_keeps_folder() {
+    assert_folder_page_filesystem_migration(false);
+}

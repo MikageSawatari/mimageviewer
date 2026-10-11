@@ -15,7 +15,10 @@ virtualized一覧と固定操作行を担当する。source準備/保存前照�
 独立worker/channel/cancelへ分け、背景viewerのitems/cache/queueを編集プレビュー用に変更しない。
 main「製本」menuとHUD overflowの入口は同じ開始受付へ通す。後者はキーより前のroot surface受付と
 Eのframe-local wheel ownerを使う。保存完了ownerは各窓のreloadと共有resume intentの一回writeを分ける。
-§1.242はnext-bookで開発中、利用者決定の次々回release向け。G4Fのfolder sidecarとG5は別stage。
+G4Fの画像folder adapterは既存分類・列挙と共通projectionを接続し、folder専用sourceをworkerで準備する。
+sidecar不足行restoreは既存import ownerの独立familyへ載せ、同contextのsource restore終端後に投影する。
+editorはG4のmodal/save ticketを再利用し、同folderの既存flushをworkerで終えてからDB保存・ミラーする。
+§1.242はnext-bookで開発中、利用者決定の次々回release向け。G5は別stage。
 明示targetは番号の採用前にidentityを捕捉し、表示候補だけをcontext所有の非同期permission ownerへ渡す。
 列挙待ちの再開要求はsource完了境界が所有し、完了後の構成待ちだけ提示許可ownerへ移す。
 構成pollは未完成のsource要求を消費せず、採用時にscope/context/旧世代を照合して継続する。
@@ -594,6 +597,13 @@ strict IPC v70のmode-only入口を追加した。構成editor固有のC7/C9はG
 
 この自動 sidecar は日常的な編集バックアップであり、明示的な持ち運び用 manifest ではない。
 設定が OFF でも `mimageviewer.meta.miv` の export / import は独立して動作する。
+
+next-bookのG4Fではsidecar v2の任意root `folder_composition`を追加する。items/rootは単一の
+immutable snapshotを共有し、既存FIFO writerのfull Arc identityでdirty完了・予約を照合する。
+構成だけのfileも保持し、両方が空の時だけ削除する。旧v1を読めるがv2は旧版互換ではない。
+自動復元は明示画像folder openの不足DB行だけで、既存/破損行を上書きしない。消費receiptは
+book_composition.dbの同transaction内に置き、実disk markerとroot digestで解除済みrootの復活を防ぐ。
+receiptは転送対象外。ミラーだけの失敗はDB/receiptを維持して通知し、rollback/retryは追加しない。
 
 ### 明示メタ情報転送 (`mimageviewer.meta.miv`)
 

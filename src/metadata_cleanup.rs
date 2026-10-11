@@ -928,6 +928,10 @@ fn delete_descriptor<F>(
             report.errors.push(format!("{}: {error}", descriptor.file));
             return;
         }
+        if let Err(error) = crate::book_composition::store::ensure_folder_receipts(&connection) {
+            report.errors.push(format!("{}: {error}", descriptor.file));
+            return;
+        }
     }
     let _rating_write =
         (descriptor.file == "rating.db").then(|| crate::rating_db::RATING_WRITES.begin());
@@ -972,6 +976,16 @@ fn delete_descriptor<F>(
         } else {
             match transaction.execute(&sql, [&candidate.key]) {
                 Ok(rows) if rows > 0 => {
+                    if descriptor.table == "book_compositions" {
+                        if let Err(error) = transaction.execute(
+                            "DELETE FROM folder_composition_receipts WHERE folder_key=?1",
+                            [&candidate.key],
+                        ) {
+                            report.errors.push(format!("{}: {error}", descriptor.file));
+                            failed = true;
+                            break;
+                        }
+                    }
                     committed.push((candidate.key.clone(), rows, candidate.store.clone()))
                 }
                 Ok(_) => {}

@@ -1554,6 +1554,7 @@ fn open_store_for_write(
         }
         if descriptor.file == "book_composition.db" {
             crate::book_composition::validate_database_rows(&conn)?;
+            crate::book_composition::store::ensure_folder_receipts(&conn)?;
         }
         Ok(conn)
     }
@@ -1578,19 +1579,49 @@ pub(crate) fn run_at_with_shape(
     new_path: &Path,
     _tree: bool,
 ) -> RenameMigrationReport {
+    run_at_with_shape_and_folder_backup(data_dir, old_path, new_path, _tree, false)
+}
+
+pub(crate) fn run_at_with_shape_and_folder_backup(
+    data_dir: &Path,
+    old_path: &Path,
+    new_path: &Path,
+    _tree: bool,
+    backup_enabled: bool,
+) -> RenameMigrationReport {
     let coverage = [
         crate::pdf_loader::EpubPinCoverage::PathAndDescendants(old_path.to_path_buf()),
         crate::pdf_loader::EpubPinCoverage::PathAndDescendants(new_path.to_path_buf()),
     ];
-    run_at_with_epub_acquisition(data_dir, old_path, new_path, || {
-        crate::pdf_loader::acquire_epub_pin_ranges(&coverage)
-    })
+    run_at_with_epub_acquisition_and_folder_backup(
+        data_dir,
+        old_path,
+        new_path,
+        backup_enabled,
+        || crate::pdf_loader::acquire_epub_pin_ranges(&coverage),
+    )
 }
 
 fn run_at_with_epub_acquisition(
     data_dir: &Path,
     old_path: &Path,
     new_path: &Path,
+    acquire_epub: impl FnOnce() -> crate::pdf_loader::EpubRangeLease,
+) -> RenameMigrationReport {
+    run_at_with_epub_acquisition_and_folder_backup(
+        data_dir,
+        old_path,
+        new_path,
+        false,
+        acquire_epub,
+    )
+}
+
+fn run_at_with_epub_acquisition_and_folder_backup(
+    data_dir: &Path,
+    old_path: &Path,
+    new_path: &Path,
+    backup_enabled: bool,
     acquire_epub: impl FnOnce() -> crate::pdf_loader::EpubRangeLease,
 ) -> RenameMigrationReport {
     let mut report = RenameMigrationReport {
@@ -1655,13 +1686,15 @@ fn run_at_with_epub_acquisition(
     // また missing 行を保持する仕様上、STORES と共有される delete hard purge の対象にも
     // してはならない。専用 transaction で case-only rename も含めて追従させる。
     migrate_book_bookmarks(data_dir, old_path, new_path, &mut report);
-    match crate::book_composition::migrate_page_paths_at(
+    match crate::book_composition::store::migrate_page_paths_with_backup_at(
         data_dir,
         &[(old_path.to_path_buf(), new_path.to_path_buf())],
+        backup_enabled,
     ) {
-        Ok(rows) => {
+        Ok((rows, warnings)) => {
             report.rows += rows;
             report.store_mutations.book_composition_changed |= rows > 0;
+            report.errors.extend(warnings);
         }
         Err(error) => report
             .errors
@@ -2115,6 +2148,12 @@ fn purge_store_with_before_sql(
                     }
                 }
             }
+            if descriptor.table == "book_compositions" {
+                for key in removed_keys {
+                    let prefix = format!("{}/", key.trim_end_matches('/'));
+                    tx.execute("DELETE FROM folder_composition_receipts WHERE folder_key=?1 OR (folder_key >= ?2 AND folder_key < ?3)", rusqlite::params![key, prefix, prefix_upper_bound(&prefix).unwrap()])?;
+                }
+            }
             tx.commit()?;
             Ok(changed)
         })()
@@ -2217,6 +2256,10 @@ fn migrate_store(
             &format!("{old_key}::"),
             &format!("{new_key}::"),
         )?;
+        if descriptor.table == "book_compositions" {
+            crate::book_composition::store::rename_folder_receipts_in(&tx, old_key, new_key)
+                .map_err(std::io::Error::other)?;
+        }
         // rating.db はキーから導出される source_path 列 (一覧ビューがコンテナを開くのに
         // 使う) も新キーに合わせる (`RatingDb::copy_entry_key` と同じ導出規則 =
         // "::" より前、無ければキー自身)。

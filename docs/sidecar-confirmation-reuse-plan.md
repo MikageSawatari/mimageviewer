@@ -14,6 +14,15 @@ SmartFolder／Collection の `Ctrl+↑/↓` から実フォルダ・PDF を開�
 
 ## 3. 提案する限定 fast path
 
+G4F追補（2026-10-12、next-book）: sidecar v2の画像folder構成を独立した要求familyとして
+同じprobe/prepare/commitへ接続する。保持identityはitems単独でなくitemsとrootを含む
+immutable SidecarSnapshot全体である。構成familyの再利用は既存writer fenceと全bytes SHA-256に
+加え、構成DBの実disk marker/root digest消費receiptをworkerで再読して照合する。
+itemsの編集/タグ同期だけでは構成同期としない。family差、root変更/消去、Pending/Failed、
+同len/mtimeのbytes変更はstrict probeへ戻す。Missingは構成の不足行を作らず、既存edit/tag
+marker解除だけを扱う。全snapshotのCOWはroot-only変更で大きなitems mapを複製しない。
+詳しい解除後の旧root抑止・同transaction再判定は[本の構成計画 §7.4](book-composition-plan.md)を参照。
+
 ### 3.1 証明と所有
 
 通常の `Checking` が成功した際、要求 family の outcome が**すべて `AlreadySynchronized`**、`source_validation_error=None`、flush／strict writer fence 成功、source が `Disk`、かつ sidecar が **clean (`!is_dirty()`)** である場合だけ、前回の「検証済み読取」証明候補を worker の typed result に載せる。旧 mask の decode で `load_for_import` が dirty にした sidecar は marker が一致しても対象外であり、必要な flush を飛ばさない。`SidecarImportProbe::Current` 自体は family `Failed` を含み得るため、Current だけを証明にしない（`src/sidecar_import.rs:425-584`）。UI は同一 restore request の採用と matching cache owner の install 成功後にだけ候補を有効にする。既存の write-disabled dirty owner との衝突 warning、target 消失、cancel では候補を捨てる。証明は正規化 folder key、正確な disk token、要求 family、前回検証した immutable parsed `SidecarFile` の items `Arc` と semantic-validity を含む。表示／編集に使う `App.sidecars` owner とは分離し、これを writable owner にしてはならない。A→B→A の実フォルダ再訪にも対応できるよう小数の folder-keyed LRU とし、**最大 4 件／推定展開後 heap 合計 256 MiB／単体 192 MiB** の固定上限を設け、超過時は従来 probe に戻す。実fixtureの JSON は 666 KB でも local-adjust の 9 raster alpha だけで約 148 MB あるため、64 MiB では対象そのものを除外する。上限計算は worker で `SidecarEntry` の mask data・vector、local-adjust alpha/labels・layers、comic、tag 等の可変長 payload を保守的に加算する。初回証明作成時と再訪 hit 時には、Checking worker 内で可視 owner 用の外側 `BTreeMap` を一度 clone し、owner の items `Arc` を単独所有にする。通常編集時の UI thread 上の全 entry copy-on-write を避けつつ、内側の大きな raster `Arc` は共有する。可視 owner の追加 outer map は proof cache の定常予算とは別の表示所有量として扱う。証明の更新で同じ folder の旧 entry を置換し、参照中の Arc は worker／owner の寿命まで保持する。候補と LRU が同時に保持する一時的な数も bounded とし、大きい snapshot の最後の Arc を UI で drop しないよう、既存の worker drop/ACK pattern を使う。
