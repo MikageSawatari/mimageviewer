@@ -92,6 +92,7 @@ add_executable(mimageviewer-vst3-host
     src/audio_pipe.cpp
     src/protocol.cpp
     src/vcrt_preload.cpp
+    src/now_playing_notify.cpp
 )
 
 target_include_directories(mimageviewer-vst3-host PRIVATE
@@ -202,7 +203,24 @@ target_include_directories(vst3-path-tests PRIVATE include)
 add_dependencies(vst3-path-tests vst3-loader-path-fixture)
 add_test(NAME vst3-path-boundaries
     COMMAND vst3-path-tests "$<TARGET_FILE:vst3-loader-path-fixture>")
+add_executable(vst3-now-playing-tests tests/now_playing.cpp src/now_playing_notify.cpp
+    "${VST3_SDK_ROOT}/public.sdk/source/vst/utility/stringconvert.cpp"
+    "${VST3_SDK_ROOT}/public.sdk/source/common/commonstringconvert.cpp"
+    "${VST3_SDK_ROOT}/pluginterfaces/base/coreiids.cpp"
+    "${VST3_SDK_ROOT}/pluginterfaces/base/funknown.cpp"
+    "${VST3_SDK_ROOT}/public.sdk/source/vst/hosting/hostclasses.cpp"
+    "${VST3_SDK_ROOT}/public.sdk/source/vst/hosting/pluginterfacesupport.cpp"
+    "${VST3_SDK_ROOT}/public.sdk/source/vst/vstinitiids.cpp")
+target_include_directories(vst3-now-playing-tests PRIVATE include)
+add_test(NAME vst3-now-playing-boundaries COMMAND vst3-now-playing-tests)
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME vst3-now-playing-headless
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/now_playing_headless.py" "$<TARGET_FILE:vst3-now-playing-tests>")
+set_tests_properties(vst3-now-playing-headless PROPERTIES TIMEOUT 60)
 if(MSVC)
+    target_compile_options(vst3-now-playing-tests PRIVATE /utf-8 /W4 /permissive- /wd4100)
+    target_compile_definitions(vst3-now-playing-tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+    set_property(TARGET vst3-now-playing-tests PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     target_compile_options(vst3-loader-path-fixture PRIVATE /W4 /permissive-)
     set_property(TARGET vst3-loader-path-fixture PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     target_compile_options(vst3-path-tests PRIVATE /utf-8 /W4 /permissive-)

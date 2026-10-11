@@ -5,20 +5,20 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>プライバシーポリシー | mImageViewer</title>
   <!-- meta:begin (generated) -->
-  <meta name="description" content="mImageViewer のプライバシーポリシー。mImageViewer はローカルで動作するデスクトップアプリで、開発者が個人情報を収集・送信・販売することはありません。">
+  <meta name="description" content="mImageViewer のプライバシーポリシー。開発者が個人情報を収集・送信・販売することはありません。通信とデータの保存先について説明します。">
   <link rel="canonical" href="https://mikage.to/mimageviewer/privacy.html">
   <meta property="og:type" content="article">
   <meta property="og:site_name" content="mImageViewer">
   <meta property="og:locale" content="ja_JP">
   <meta property="og:url" content="https://mikage.to/mimageviewer/privacy.html">
   <meta property="og:title" content="プライバシーポリシー｜mImageViewer">
-  <meta property="og:description" content="mImageViewer のプライバシーポリシー。mImageViewer はローカルで動作するデスクトップアプリで、開発者が個人情報を収集・送信・販売することはありません。">
+  <meta property="og:description" content="mImageViewer のプライバシーポリシー。開発者が個人情報を収集・送信・販売することはありません。通信とデータの保存先について説明します。">
   <meta property="og:image" content="https://mikage.to/mimageviewer/ogp.jpg">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="プライバシーポリシー｜mImageViewer">
-  <meta name="twitter:description" content="mImageViewer のプライバシーポリシー。mImageViewer はローカルで動作するデスクトップアプリで、開発者が個人情報を収集・送信・販売することはありません。">
+  <meta name="twitter:description" content="mImageViewer のプライバシーポリシー。開発者が個人情報を収集・送信・販売することはありません。通信とデータの保存先について説明します。">
   <meta name="twitter:image" content="https://mikage.to/mimageviewer/ogp.jpg">
   <!-- meta:end -->
   
@@ -116,10 +116,10 @@
   <section>
     <p class="lead">
       mImageViewer（以下「本アプリ」）は、利用者のプライバシーを尊重します。
-      本アプリは利用者の PC 上でローカルに動作するデスクトップアプリケーションであり、
-      <strong>開発者が利用者の個人情報を収集・送信・販売することは一切ありません。</strong>
+      本アプリは利用者の PC 上で動作するデスクトップアプリケーションです。
+      <strong>開発者が利用者の個人情報を収集・送信・販売することはありません。</strong>
     </p>
-    <p style="font-size:0.85rem; color:#888;">最終更新日: 2026年10月7日</p>
+    <p style="font-size:0.85rem; color:#888;">最終更新日: 2026年10月10日</p>
   </section>
 
   <section>
@@ -133,10 +133,15 @@
 
   <section>
     <h2>端末内に保存されるデータ</h2>
+    <p>音響調整を使用中は、再生中の曲名・アルバム名・アーティスト名と代表画像を、PC内の EffeTune に渡します。
+      絶対パスや URL は渡しません。この曲情報はプラグイン内の一時表示に使い、プリセットや履歴へ保存しません。</p>
+    <p>音声予測 (Adaptive Prediction) の学習内容はメモリ内で使い、ファイルには保存しません。</p>
     <p>本アプリは、動作に必要な次のデータを利用者の PC に保存します。リモート閲覧を有効にした場合、再生位置などは利用者の端末から PC へ送られます。開発者のサーバーへ送信されることはありません。外出先との暗号化された通信は Tailscale の中継サーバーを経由することがあります。</p>
     <ul class="pink-list">
       <li>アプリの設定・表示状態、動画・音声の再生位置とファイルごとに選んだ音声トラック</li>
+      <li>本ごとの見開き1ページずらしの調整（記憶をOFFにしても保存済み調整は保持し、明示的に解除できます。メタ情報の移行で持ち運べます）</li>
       <li>音響調整 (EffeTune) の調整状態、プリセット、設定、取り込んだ IR ファイル・測定データ、ビジュアライザーのレイアウト・背景画像</li>
+      <li>登録した SFZ 音源の名前と保存場所。サンプルファイルはコピーしません</li>
       <li>サムネイルキャッシュ（動画・音声の長さ、解像度、形式、読取可否の情報、動画の場面と音声波形の解析結果を含みます）</li>
       <li>EPUB を変換した閲覧用 PDF（キャッシュ管理画面でその場で削除できます。表示中など使用中の本は削除されず、理由が表示されます）</li>
       <li>タグ・レーティング・回転情報・読み込み履歴</li>
@@ -166,6 +171,8 @@
       音響調整 (EffeTune) のプリセット・設定は、別の <code>%APPDATA%\effetune\</code> または
       <code>%APPDATA%\Frieve\EffeTunePlugin\</code> に保存されます。取り込んだ IR ファイル・測定データ、ビジュアライザーのレイアウト・背景画像は
       <code>%APPDATA%\mimageviewer-vst3-host.exe\</code> に置かれます。
+      SFZ 音源の登録は <code>%APPDATA%\Frieve\EffeTunePlugin\sfz-references.json</code> に名前と保存場所を記録します。
+      サンプルは元のフォルダから読み取り、コピーしません。Remove は登録だけを削除し、元のファイルは削除しません。
       mImageViewer のデータフォルダーを変更しても、これらの保存先は変わりません。
       EffeTune 自身の保存データは mImageViewer のアンインストール時にも残ります。
       プリセット・設定は他の EffeTune 製品とも共有されるため、自動では削除しません。
@@ -211,10 +218,11 @@
 
   <section>
     <h2>ネットワーク通信</h2>
-    <p>本アプリが外部と通信するのは、次の場合に限られます。</p>
+    <p>本アプリでは、次のような通信が発生します。</p>
     <ul class="pink-list">
       <li><strong>更新確認</strong>: 新しいバージョンの有無を確認するため、配布元（GitHub）の公開リリース情報を取得します。通常の HTTP リクエストのみで、個人を特定する情報は送信しません。</li>
       <li><strong>任意コンポーネントのダウンロード</strong>: 利用者が自ら選択した場合に限り、AI 高速化用コンポーネント等を配布元から取得します。</li>
+      <li><strong>音響調整の画面表示</strong>: 音響調整を開いている間、画面表示に使う Windows の機能 (WebView2) が、Microsoft に自身の更新を確認することがあります。曲名や画像は送信しません。</li>
       <li><strong>クリップボード取り込み</strong>: クリップボードの取り込み監視は、環境設定のチェックを ON にしたときだけ動きます。コピーしたページの画像は、選択ダイアログを開いたときに、画像の URL へ GET を送って取得します。User-Agent は <code>mImageViewer/&lt;版&gt;</code> です。<br>
         参照元はブラウザの既定と同じ規則（strict-origin-when-cross-origin）で送ります。同じオリジン（通信方式・ホスト名・ポート）にはページの URL、別のオリジンにはオリジンだけを送り、HTTPS から HTTP へは送りません。ページの URL から認証情報と「#」以降を除きます。Cookie やブラウザのログイン情報は使わず、送信もしません。この機能では、画像取得のための通信以外に、コピー内容や画像を送信・収集しません。<a href="manual/clipboard-capture.html">使い方を見る</a></li>
       <li><strong>リモート閲覧（既定では無効）</strong>: 利用者が自ら有効にした場合に限り、
@@ -229,9 +237,9 @@
         中継サーバーでは画像やライブラリの内容を読み取れません。
         <strong>画像やライブラリの内容が、開発者のサーバーへ送られることはありません。</strong></li>
     </ul>
-    <p>EPUB の変換も通信を増やしません。本の外部サイトへの要求はすべて遮断し、PC 内で PDF に変換します。Windows または Edge WebView2 に管理者や利用者がポリシーを設定している場合は、その設定に従います。</p>
+    <p>EPUB は PC 内で PDF に変換し、本に含まれる外部サイトへの要求を遮断します。Windows または Edge WebView2 に管理者や利用者がポリシーを設定している場合は、その設定に従います。</p>
     <p>
-      これらの通信先（GitHub / mikage.to、リモート閲覧を使う場合の Tailscale、クリップボード取り込みで画像を取得するサイト等）は、各社のプライバシーポリシーに従って
+      これらの通信先（GitHub / mikage.to、Microsoft、リモート閲覧を使う場合の Tailscale、クリップボード取り込みで画像を取得するサイト等）は、各社のプライバシーポリシーに従って
       通常のアクセスログ（IP アドレス等）を記録する場合がありますが、
       <strong>開発者がそれらの情報を取得・利用することはありません。</strong>
     </p>
@@ -240,7 +248,7 @@
   <section>
     <h2>AI 機能について</h2>
     <p>
-      AI によるアップスケール・ノイズ除去・補完・自動判別などの処理は、
+      mImageViewer 本体の画像 AI によるアップスケール・ノイズ除去・補完・自動判別などの処理は、
       <strong>すべて利用者の PC 内（GPU）で実行</strong>されます。
       AI 処理のために画像を外部のサーバーへアップロードすることはありません。
     </p>
@@ -249,7 +257,7 @@
   <section>
     <h2>解析・広告</h2>
     <p>
-      本アプリは、アクセス解析ツール・広告を<strong>一切含みません</strong>。
+      <strong>広告・アクセス解析ツール・利用状況の送信はありません</strong>。
       利用状況やクラッシュ情報を開発者へ自動送信することもありません。
     </p>
     <p>
@@ -260,7 +268,7 @@
 
   <section>
     <h2>第三者への提供</h2>
-    <p>開発者は利用者の情報を取得しないため、第三者へ提供する情報はありません。</p>
+    <p>開発者は利用者の情報を取得しないため、その情報を第三者へ提供することはありません。</p>
     <p>
       リモート閲覧を外出先から使う場合に必要な Tailscale は、本アプリとは別の会社が提供する
       ソフトウェアとサービスで、利用者自身が契約・設定します。その利用は
@@ -291,10 +299,9 @@
   <section style="margin-top:2.5rem;">
     <p class="lead">
       mImageViewer ("the App") respects your privacy. The App is a desktop application that
-      runs locally on your PC. <strong>The developer does not collect, transmit, or sell any of
-      your personal information.</strong>
+      runs on your PC. <strong>The developer does not collect, transmit, or sell your personal information.</strong>
     </p>
-    <p style="font-size:0.85rem; color:#888;">Last updated: October 7, 2026</p>
+    <p style="font-size:0.85rem; color:#888;">Last updated: October 10, 2026</p>
   </section>
 
   <section>
@@ -310,10 +317,15 @@
 
   <section>
     <h2>Data stored on your device</h2>
+    <p>While audio adjustment is in use, the App passes the current title, album, artist, and representative artwork to EffeTune on your PC.
+      It does not pass absolute paths or URLs. The plug-in uses this information for temporary display and does not save it in presets or history.</p>
+    <p>Adaptive Prediction keeps learned data in memory and does not save it to files.</p>
     <p>The App stores the following data on your PC. When you enable remote viewing, playback progress and related information travel from your device to your PC. They are not sent to the developer's server. Encrypted traffic may pass through a Tailscale relay server when you connect from outside your home.</p>
     <ul class="pink-list">
       <li>Application settings and view state, video and audio playback positions, and the audio track selected for each file</li>
+      <li>Per-book spread-pairing adjustments (saved adjustments remain when remembering is turned off and can be explicitly cleared or moved using metadata transfer)</li>
       <li>EffeTune adjustment state, presets, configuration, imported IR files and measurements, and visualizer layouts and background images</li>
+      <li>Registered SFZ instrument names and locations. Sample files are not copied</li>
       <li>Thumbnail cache (including video frames and audio waveform analysis)</li>
       <li>PDFs converted from EPUBs for reading (you can delete them in the cache manager immediately; books in use remain and the App shows why they could not be deleted)</li>
       <li>Tags, ratings, rotation info, and reading history</li>
@@ -338,7 +350,10 @@
     <div class="info-box">
       EffeTune stores its presets and configuration separately in <code>%APPDATA%\effetune\</code> or
       <code>%APPDATA%\Frieve\EffeTunePlugin\</code>. Imported IR files, measurements, and visualizer layouts and background images are stored in
-      <code>%APPDATA%\mimageviewer-vst3-host.exe\</code>, regardless of mImageViewer's data folder. EffeTune's own data remains when
+      <code>%APPDATA%\mimageviewer-vst3-host.exe\</code>, regardless of mImageViewer's data folder.
+      SFZ registration records instrument names and locations in <code>%APPDATA%\Frieve\EffeTunePlugin\sfz-references.json</code>.
+      Samples are read from their original folder and are not copied. Remove deletes only the reference, leaving the source files untouched.
+      EffeTune's own data remains when
       mImageViewer is uninstalled. Presets and configuration are shared with other EffeTune products,
       so they are not deleted automatically. Delete them manually only after checking that other products
       no longer need them and closing the related apps. The portable edition does not provide EffeTune.
@@ -379,10 +394,11 @@
 
   <section>
     <h2>Network communication</h2>
-    <p>The App connects to the internet only in the following cases:</p>
+    <p>Network activity includes the following:</p>
     <ul class="pink-list">
       <li><strong>Update check</strong>: to see whether a newer version exists, the App retrieves the public release information from the distribution source (GitHub). This is an ordinary HTTP request and includes no personally identifying information.</li>
       <li><strong>Optional component download</strong>: only when you choose to, the App downloads optional components (such as AI acceleration packs) from the distribution source.</li>
+      <li><strong>Audio adjustment display</strong>: while audio adjustment is open, the Windows feature used to display it (WebView2) may contact Microsoft to check for its own updates. It does not send song titles or artwork.</li>
       <li><strong>Clipboard capture</strong>: capture monitoring runs only when you turn on its checkboxes in Preferences. When you open the image selection dialog for a copied page, the App fetches its images by sending GET requests to the image URLs. Its User-Agent is <code>mImageViewer/&lt;version&gt;</code>.<br>
         Referrers follow the browser's default rule (strict-origin-when-cross-origin): the page URL for the same origin (scheme, host, and port), only the origin for a different origin, and no referrer when going from HTTPS to HTTP. Credentials and the fragment after "#" are removed from the page URL. Cookies and browser login information are neither used nor sent. This feature does not send or collect clipboard contents or images beyond the requests needed to fetch the images. <a href="manual/clipboard-capture.html">Read the manual</a></li>
       <li><strong>Remote viewing (off by default)</strong>: only when you turn it on, the App
@@ -396,9 +412,9 @@
         Tailscale relay server, which cannot read your images or library content.
         <strong>Your images and library content are never sent to the developer's server.</strong></li>
     </ul>
-    <p>EPUB conversion is not another network case. The App blocks every request the book makes to an external site and converts the book to PDF on your PC. If an administrator or user has configured Windows or Edge WebView2 policies, conversion follows those settings.</p>
+    <p>The App converts EPUB to PDF on your PC and blocks requests to external sites included in the book. If an administrator or user has configured Windows or Edge WebView2 policies, conversion follows those settings.</p>
     <p>
-      These endpoints (GitHub / mikage.to, Tailscale when you use remote viewing, the sites that serve images fetched by clipboard capture, etc.) may record standard access logs (such as IP
+      These endpoints (GitHub / mikage.to, Microsoft, Tailscale when you use remote viewing, the sites that serve images fetched by clipboard capture, etc.) may record standard access logs (such as IP
       addresses) under their own privacy policies, but <strong>the developer does not obtain or
       use that information.</strong>
     </p>
@@ -407,7 +423,7 @@
   <section>
     <h2>AI features</h2>
     <p>
-      Upscaling, denoising, inpainting, and automatic classification are performed
+      Image upscaling, denoising, inpainting, and automatic classification in mImageViewer itself are performed
       <strong>entirely on your PC (GPU)</strong>. The App does not upload images to an external
       server for AI processing.
     </p>
@@ -416,7 +432,7 @@
   <section>
     <h2>Analytics and advertising</h2>
     <p>
-      The App contains <strong>no analytics tools and no advertising</strong>, and does
+      The App contains <strong>no advertising, analytics tools or usage reporting</strong> and does
       not automatically send usage or crash data to the developer.
     </p>
     <p>
@@ -427,7 +443,7 @@
 
   <section>
     <h2>Sharing with third parties</h2>
-    <p>Because the developer does not obtain your information, there is nothing to share with third parties.</p>
+    <p>The developer does not obtain your information and therefore does not share that information with third parties.</p>
     <p>
       Tailscale, which you need in order to use remote viewing away from home, is software and
       a service from a different company; you sign up for it and configure it yourself. Your use

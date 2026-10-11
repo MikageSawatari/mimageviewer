@@ -1878,7 +1878,7 @@ Spread モード (見開き) の場合は、`draw_fs_spread` が `resolve_spread
 `Video` / `Audio` はナビゲーション列に含まれる場合も必ず単独表示ユニットにし、静止画との混在でもペア化しない。
 
 組んだ `Vec<SpreadDisplayUnit>` は viewer context ごとの `SpreadDisplayUnitsCache` で再利用する。
-token は `items_generation`、`spread_mode`、`spread_shift_anchor_idx`、`landscape_epoch` と、
+token は `items_generation`、`spread_mode`、`spread_shift_anchor_idx()`で得るlive解決済みanchor、`landscape_epoch` と、
 **nav index 列そのもの**である。nav の完全一致を使うため、同じ items 世代でも絞り込み・並べ替え・
 ページ読みと連結読みの列切替を混同しない。
 
@@ -1899,12 +1899,64 @@ items 世代と連結方式は owner の source key でも照合する。owner �
 `FsPageNav::Boundary` として解決する。見開き末尾から次へ進む入力を raw page delta に戻さないため、
 内部 index が同じ見開きの片側へ移ることはなく、最初の入力で末尾ヒントを表示する。キー、ホイール、
 画面クリック、ゲームパッド、スライドショーはこの契約を共有する。
-Ctrl+←/→ の「1 ページずらし」は `spread_mode` を保存し直さず、セッション中の
-`spread_shift_anchor_idx` で一時的なペアリング開始位置を持つ。アンカーは単純な移動先ページではなく、
+Ctrl+←/→ の「1 ページずらし」は `spread_mode` を保存し直さず、
+`ViewerSpreadShift`が現在のペアリング開始位置を所有する。§1.364 D2の接続差分では、
+通常一覧は`ViewerShift::Ordinary(index)`のsession調整、本は
+`ViewerShift::Book(SpreadShiftState)`のPageRef・解決状態・保存状態に分ける。
+描画用indexは`spread_shift_anchor_idx()`の投影であり、独立に代入するraw fieldではない。
+記憶ONの適格なBookで明示ずらしを受けると、その実anchorのPageRefを専用serviceへ送る。
+保存replyは元操作の状態表示を更新するだけで、その後の現在ページや別窓の組を変えない。
+OFFはliveをsession扱いで保持し、新規入場で保存済み調整を使わない。明示解除はOFFでも保存値を消す。
+アンカーは単純な移動先ページではなく、
 移動先から前方向へ見て直近の横長ページ直後、または先頭まで戻した同じ偶奇の位置にする。
 これにより、表紙ありの本で一度ずらした後に前ページへ戻っても、アンカー直前のページだけが
 単独表示へ吸われず、先頭または横長ページ境界から一貫した見開き列として戻れる。
-横長ページ自体は単独ユニットのまま境界として扱い、自動的な表紙扱いにはしない:
+横長ページ自体は単独ユニットのまま境界として扱い、自動的な表紙扱いにはしない。
+
+Bookのitems/nav投影は`PreparedPageIdentityIndex`とnavのArcを対で保持し、変更時にPageRefを
+実ページへ解き直す。基点が欠落・filteredなら`NotInView`として保存refを保持し、描画へはNoneを渡す。
+slot削除やsnapshotのindex変換はowner内のlive resolutionだけをremapする。別の同indexページへ
+保存基点を置き換えない。解決済みanchorの変化は既存unit/cache失効点へ接続する。
+snapshot化はdurable scopeを切り離し、その時点のnumeric pairingをOrdinary sessionとして保持する。
+成功済みページ改名のmappingは同じ本のlive PageRefへpureに反映し、追加saveやmountを行わない。
+root改名の永続移行はD1が所有し、開いているcontextの参照元・items・prepared identity・pending load・
+addressとshift scopeは旧rootのまま保持する。mainの旧path再読込・F12の旧items保持を維持し、
+live追従や自動reopenを追加しない。新rootの保存値はそこから改めて開くときに使う（設計§11.6）。
+case/slash衝突のshift identityはD1と同じく受入列の先頭slotを決定的に選ぶ。
+snapshotのanchor remapはitems交換で行い、一覧から固定してもfullscreen時と同じ対応付けを使う。
+新規Restoreはsidecar continuation内で先行shift/resumeの完了証明を満たしてから同じ最終列へ
+解決し、位置復元・unit正規化・first-displayへ進む。retained ONの再採用は受入済みidentity indexを使い、
+待機をbundle内の`RetainedReadoption::Idle | Reading`に持たせる。global Commonの別context依存と
+併存させ、既存target-context semantic gate/dialogで対象窓だけを止める。兄弟窓を一括modalにしない。
+`ContextAsyncOwner::RetainedSpreadShift`でpoll/cancel-on-parkを登録し、parkではreceiverだけを
+dropしてaccepted sessionを保つ。再採用はfresh cutoffを捕捉し、forkはreceiverと元contextのwrite受付を複製しない。
+forkの保存待ち/失敗の調整はsession扱いとし、元contextだけがwrite完了を採用する。
+初回位置の`FencedResume`はopen continuationの初回採用完了時に終了し、後のresume参照へ持ち越さない。
+maintenanceで失効したshift readはrow不在の証明ではない。retainedのaccepted調整・projection・
+commandを保ち、unit/cache失効と現在ページの再正規化を起こさない。初回Commonはcapture時の
+調整なしと独立resumeを採用する。別本改名はscope stampを変えず、元のreadをそのまま採用できる。
+明示ON/OFFではretained待機を取り消してaccepted sessionを保ち、表示済みsiblingsへ旧保存値を
+適用しない。fresh-openは元のresume cutoffと捕捉済みopen scopeを保ったまま、新settings世代・
+現在のshift受付cutoffで依存を再受付する。世代不一致を理由にresume fenceまで破棄しない。
+OFFではlive調整を変更しない。retained/import採用は
+`adopt_shift_layout_without_navigation`で現在の実ページを含むunitへ正規化するだけで、
+resume/historyを書かない。metadata importはContextRequest workerの捕捉FIFO読取結果を
+context/items世代の採用後、current scope + ON + Automaticが一致するときだけ使う。
+HUDの`… → 見開きの調整`と見開きcontrol近くの印はこのownerの状態から作り、jumpは実re-pairing anchor、
+Clearと全体記憶設定は同じ操作ownerへ戻す。構成等の資格は`PairingEditAvailability`を共通受付へ渡す。
+RemoteのD3接続も、App serviceから登録されたread handleを通して保存PageRefを解決し、
+この共通Automatic resolverへoptional shiftを渡す。PCのlive indexを流用しない。
+scope/identityはresponse budgetで切り詰める前のfull本を使い、その後の応答で保存基点が
+見えなくてもMissingや本の末尾とみなさない。完全応答のgroupは同じrules・列のPC unitから
+anchor/画面順/slot/roleを派生する。bounded応答は既存のgroup生成・cap・ページアクセスを維持する。
+切詰め境界差はshiftなしのmasterにもある既存制限であり、省略ページの全寸法走査や境界group削除で
+変更しない。master証明とD3の検証結果は設計§11.10および`target/D-1364-d3-msg.txt`を参照する。
+記憶OFFのopenはshiftなし、force_single_pageとorientationは表示投影だけで保存値を変えない。
+Q3 SetSpreadの成功公開・group cache失効はshift Clearのcommit結果を同requestで受け取ってから行う。
+新しいWeb nudge/記憶UIは追加せず、G3構成consumerは未統合のまま共有C1–C12 fixtureだけを供給する。
+本記述は接続の実装箇所を記録し、完了検証・レビュー合格を主張しない。
+
+実際の配置は従来の次の手順を使う。
 
 1. フィット方式を先に解決し、`Original` なら各ページの固有寸法、それ以外なら高いページへ
    揃えた geometry を選ぶ
@@ -1917,7 +1969,7 @@ Ctrl+←/→ の「1 ページずらし」は `spread_mode` を保存し直さ�
 
 ページ単位表示のカラー化遷移も、この `SpreadDisplayUnit` / `resolve_spread_pair` と同じ境界を
 使う。表紙、末尾端数、横長ページは 1 ページ unit、通常見開きは画面順 2 ページ unit として
-旧表示を保持する。1 ページずらしの `spread_shift_anchor_idx` と LTR/RTL の画面順も同じ resolver
+旧表示を保持する。1 ページずらしのlive解決済みanchorと LTR/RTL の画面順も同じ resolver
 から得るため、遷移状態だけが別のペアを作ることはない。
 
 見開きのページ間隔は環境設定から変更でき、既定 4px、0px で左右ページを隙間なく接続する。

@@ -16,7 +16,9 @@ use crate::video::dsp::{DspBridge, GuiFailure, GuiOwnerPolicy, LatencyPolicy};
 pub(crate) mod bundle_location;
 pub mod composition;
 pub(crate) mod gui_gate;
+pub(crate) mod now_playing;
 mod window;
+pub(crate) use now_playing::{NowPlayingArtworkSource, NowPlayingInput, NowPlayingOwner};
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum GuiButtonAction {
@@ -324,6 +326,7 @@ pub struct ExitCaptureFence {
 }
 
 enum HostCommand {
+    RefreshNowPlaying,
     RegisterBridge(std::sync::Weak<DspBridge>),
     ReconcileVisibility,
     Disable(Arc<DspBridge>),
@@ -954,6 +957,7 @@ fn complete_load(
 }
 
 pub struct EffetuneController {
+    now_playing: now_playing::NowPlaying,
     auto_open: Arc<AutoOpenSession>,
     main_window: Arc<window::MainWindowObserver>,
     remote_session: Arc<Mutex<Option<crate::remote_ipc::session::SessionHandle>>>,
@@ -1010,6 +1014,12 @@ impl EffetuneController {
         let host_main_window = Arc::downgrade(&main_window);
         let host_remote_session = Arc::downgrade(&remote_session);
         let host_repaint = Arc::clone(&repaint_context);
+        let now_playing = now_playing::NowPlaying::new(
+            !cfg!(feature = "portable"),
+            host_tx.clone(),
+            Arc::clone(&repaint_context),
+        );
+        let host_now_playing = Arc::downgrade(&now_playing.core);
         let host_failure_tx = failure_tx.clone();
         let auto_open = Arc::new(AutoOpenSession::default());
         let host_auto_open = Arc::clone(&auto_open);
@@ -1017,9 +1027,18 @@ impl EffetuneController {
             .name("effetune-host-control".into())
             .spawn(move || {
                 let mut presentation_bridge = std::sync::Weak::<DspBridge>::new();
+                let mut now_playing_revision = None;
                 while let Ok(command) = host_rx.recv() {
                     match command {
-                        HostCommand::RegisterBridge(bridge) => presentation_bridge = bridge,
+                        HostCommand::RegisterBridge(bridge) => {
+                            presentation_bridge = bridge;
+                            now_playing_revision = None;
+                            if let Some(core) = host_now_playing.upgrade() { send_latest_now_playing(&core, &presentation_bridge, &mut now_playing_revision); }
+                        }
+                        HostCommand::RefreshNowPlaying => {
+                            if let Some(core) = host_now_playing.upgrade() {core.refresh_consumed();}
+                            if let Some(core) = host_now_playing.upgrade() { send_latest_now_playing(&core, &presentation_bridge, &mut now_playing_revision); }
+                        }
                         HostCommand::ReconcileVisibility => {
                             if let Some(bridge) = presentation_bridge.upgrade() { bridge.sync_main_window_visibility(); }
                         }
@@ -1078,6 +1097,7 @@ impl EffetuneController {
             Err(reason) => EffetuneRuntime::Unavailable(reason.clone()),
         };
         Self {
+            now_playing,
             auto_open,
             main_window,
             remote_session,
@@ -1106,6 +1126,49 @@ impl EffetuneController {
             pending_hide: None,
             repaint_context,
         }
+    }
+
+    pub(crate) fn publish_now_playing(&mut self, owner: NowPlayingOwner, input: NowPlayingInput) {
+        self.now_playing.publish(owner, input);
+    }
+    pub(crate) fn refresh_now_playing(&mut self, owner: NowPlayingOwner, input: NowPlayingInput) {
+        self.now_playing.refresh_input(owner, input);
+    }
+    pub(crate) fn clear_now_playing(&mut self, owner: NowPlayingOwner) {
+        self.now_playing.clear(owner);
+    }
+    pub(crate) fn now_playing_owner(&self) -> Option<NowPlayingOwner> {
+        self.now_playing.owner()
+    }
+    pub(crate) fn now_playing_metadata_matches(
+        &self,
+        owner: NowPlayingOwner,
+        path: &Path,
+        title: Option<&str>,
+        album: Option<&str>,
+        artist: Option<&str>,
+    ) -> bool {
+        self.now_playing
+            .metadata_matches(owner, path, title, album, artist)
+    }
+    pub(crate) fn now_playing_artwork_source_matches(
+        &self,
+        owner: NowPlayingOwner,
+        sidecar: Option<&Path>,
+        settings: &crate::settings::Settings,
+    ) -> bool {
+        self.now_playing.source_matches(owner, sidecar, settings)
+    }
+    #[cfg(test)]
+    pub(crate) fn set_now_playing_warning_for_test(&self, message: &str) {
+        self.now_playing.core.warn(message.to_owned());
+    }
+    #[cfg(test)]
+    pub(crate) fn now_playing_snapshot_for_test(&self) -> Arc<now_playing::NowPlayingSnapshot> {
+        self.now_playing.core.snapshot()
+    }
+    pub(crate) fn take_now_playing_warning(&mut self) -> Option<String> {
+        self.now_playing.take_warning()
     }
 
     pub fn set_main_hwnd(&self, hwnd: u64) {
@@ -1520,6 +1583,7 @@ impl EffetuneController {
     }
 
     fn publish_running(&mut self, bridge: Arc<DspBridge>) {
+        self.now_playing.set_active(true);
         if let Ok(gate) = self.main_window.gate() {
             bridge.set_gui_gate(gate);
         }
@@ -1581,6 +1645,7 @@ impl EffetuneController {
         }
         crate::logger::log(format!("[EffeTune] failed: {failure:?}"));
         self.slot.clear();
+        self.now_playing.set_active(false);
         self.pending_load = None;
         self.pending_capture = None;
         self.pending_hide = None;
@@ -1605,6 +1670,30 @@ impl EffetuneController {
             CaptureQueue::wait_final_capture(fence);
         }
     }
+}
+
+fn send_latest_now_playing(
+    core: &now_playing::Core,
+    destination: &std::sync::Weak<DspBridge>,
+    sent_revision: &mut Option<u64>,
+) {
+    if !core.active() {
+        return;
+    }
+    let Some(bridge) = destination.upgrade() else {
+        return;
+    };
+    let snapshot = core.snapshot();
+    if *sent_revision == Some(snapshot.revision) || !core.is_current(snapshot.revision) {
+        return;
+    }
+    // A failed ordinary write is not an audio failure and is not retried by a timer.
+    *sent_revision = Some(snapshot.revision);
+    if let Err(error) = bridge.send_now_playing(&snapshot) {
+        core.warn(format!("曲情報を送信できませんでした: {error}"));
+    }
+    // Start decoding only after the text snapshot crossed the ordered transport boundary.
+    core.start_artwork();
 }
 
 pub(crate) fn new_bridge() -> Arc<DspBridge> {

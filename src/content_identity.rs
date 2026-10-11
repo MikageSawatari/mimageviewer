@@ -918,6 +918,35 @@ impl Drop for ContentIdentityIndexLoadPending {
     }
 }
 
+/// A worker may publish an accepted edit without borrowing the UI recorder owner.
+#[derive(Clone)]
+pub(crate) struct ContentIdentityProducer {
+    tx: Option<mpsc::Sender<RecordRequest>>,
+}
+
+impl ContentIdentityProducer {
+    pub(crate) fn record_for_path(&self, path: &Path, trigger: ContentIdentityTrigger) {
+        if let Some(source) = ContentIdentitySource::from_path(path) {
+            self.record(source, trigger);
+        }
+    }
+
+    pub(crate) fn record(&self, source: ContentIdentitySource, trigger: ContentIdentityTrigger) {
+        RECORD_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let display = source.path.display().to_string();
+        let request = RecordRequest {
+            source,
+            trigger,
+            recorded_at: unix_time_millis(),
+        };
+        if self.tx.as_ref().is_none_or(|tx| tx.send(request).is_err()) {
+            crate::logger::log(format!(
+                "content_identity: recorder unavailable for {display}"
+            ));
+        }
+    }
+}
+
 pub(crate) struct ContentIdentityRecorder {
     tx: Option<mpsc::Sender<RecordRequest>>,
     update_tx: mpsc::Sender<LedgerEntry>,
@@ -959,19 +988,12 @@ impl ContentIdentityRecorder {
 
     /// UI thread では channel 送信だけを行う。metadata 取得を含む I/O は worker 側。
     pub(crate) fn record(&self, source: ContentIdentitySource, trigger: ContentIdentityTrigger) {
-        // 台帳の UPDATE は worker 側で遅れて起きる。掃除側が「今まさに編集された」ことを
-        // 知る手がかりはここしかないので、送信より前に上げる ([`RECORD_SEQUENCE`])。
-        RECORD_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let display = source.path.display().to_string();
-        let request = RecordRequest {
-            source,
-            trigger,
-            recorded_at: unix_time_millis(),
-        };
-        if self.tx.as_ref().is_none_or(|tx| tx.send(request).is_err()) {
-            crate::logger::log(format!(
-                "content_identity: recorder unavailable for {display}"
-            ));
+        self.producer().record(source, trigger);
+    }
+
+    pub(crate) fn producer(&self) -> ContentIdentityProducer {
+        ContentIdentityProducer {
+            tx: self.tx.clone(),
         }
     }
 
@@ -1525,8 +1547,8 @@ fn drop_sources_with_nothing_to_restore(
     }
 }
 
-/// 編集の記録要求を投げた回数。`ContentIdentityRecorder::record` が **UI スレッドで、
-/// channel へ送る前に** 上げる。
+/// 編集の記録要求を投げた回数。UI recorderまたはshift/import workerのproducerが、
+/// **channel へ送る前に** 上げる。
 ///
 /// 台帳の `last_edit_at` は worker が後から書くので、「行はもうあるが台帳はまだ古い」
 /// 瞬間が必ずある。その瞬間に CAS を撃つと期待値が一致してしまい、編集したばかりの
@@ -2299,6 +2321,252 @@ mod tests {
             1,
             "行が見つかったのに候補から落とした: {candidates:?}"
         );
+    }
+
+    #[test]
+    fn nested_shift_only_origin_survives_detection_flag_probe_copy_and_readoption() {
+        let _serial = lock_record_sequence();
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("origin.zip");
+        let target_path = temp.path().join("moved.zip");
+        let bytes = b"stable archive bytes for content-identity fixture";
+        std::fs::write(&source_path, bytes).unwrap();
+        let file_key = crate::path_key::normalize_keep_drive(&source_path);
+        let db = ContentIdentityDb::open_at(&temp.path().join("content_identity.db")).unwrap();
+        db.upsert(
+            &ContentIdentitySource::new(&source_path, ContentKind::Zip),
+            &RecordedFileState {
+                file_key: file_key.clone(),
+                size: bytes.len() as u64,
+                hashed_mtime: 1,
+            },
+            &stage1_head_hash(&mut Cursor::new(bytes), bytes.len() as u64).unwrap(),
+            &stage2_full_hash(&mut Cursor::new(bytes)).unwrap(),
+            100,
+            ObservationRole::RestorableContent,
+        )
+        .unwrap();
+        crate::spread_shift::initialize_database_at(&temp.path().join("spread_shift.db")).unwrap();
+        let original_scope =
+            crate::book_scope::BookScopeKey::archive(&source_path, &["wrapper/ch.zip".into()])
+                .unwrap();
+        let reference =
+            crate::spread_shift::SpreadShiftPageRef::ArchiveEntry("wrapper/ch.zip/001.jpg".into());
+        let connection = rusqlite::Connection::open(temp.path().join("spread_shift.db")).unwrap();
+        connection
+            .execute(
+                "INSERT INTO spread_shifts VALUES (?1, ?2)",
+                rusqlite::params![
+                    original_scope.storage_key(),
+                    serde_json::to_string(&reference).unwrap()
+                ],
+            )
+            .unwrap();
+        drop(connection);
+        std::fs::rename(&source_path, &target_path).unwrap();
+        let cancel = AtomicBool::new(false);
+        let index = db.load_index(&cancel).unwrap().unwrap();
+        let target = stage0_target(
+            &index,
+            ContentIdentitySource::new(&target_path, ContentKind::Zip),
+            bytes.len() as u64,
+        )
+        .unwrap();
+        let (candidate, _) = detect_target(&db, target, &cancel).unwrap().unwrap();
+        let mut candidates = vec![candidate.unwrap()];
+        drop_sources_with_nothing_to_restore(&db, temp.path(), &mut candidates);
+        assert_eq!(candidates.len(), 1);
+        assert!(
+            db.ledger_entry(&file_key)
+                .unwrap()
+                .unwrap()
+                .has_restorable_content
+        );
+        let copied = crate::rename_key_migration::copy_stores_at(
+            temp.path(),
+            &[crate::rename_key_migration::StoreCopyPathMapping::exact(
+                &source_path,
+                &target_path,
+            )],
+        );
+        assert!(copied.errors.is_empty(), "{:?}", copied.errors);
+        let new_scope =
+            crate::book_scope::BookScopeKey::archive(&target_path, &["wrapper/ch.zip".into()])
+                .unwrap();
+        let connection = rusqlite::Connection::open(temp.path().join("spread_shift.db")).unwrap();
+        let wire: String = connection
+            .query_row(
+                "SELECT anchor_ref FROM spread_shifts WHERE path = ?1",
+                [new_scope.storage_key()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let restored: crate::spread_shift::SpreadShiftPageRef =
+            serde_json::from_str(&wire).unwrap();
+        assert_eq!(restored, reference);
+        let identities = crate::spread_shift::ShiftIdentityIndex::prepare(
+            &new_scope,
+            [(
+                crate::book_resume_db::PageIdentity::Archive {
+                    container: crate::path_key::normalize_keep_drive(&target_path),
+                    entry_name: "wrapper/ch.zip/001.jpg".into(),
+                },
+                3,
+            )],
+        )
+        .unwrap();
+        assert_eq!(identities.resolve(&restored), Some(3));
+        assert!(
+            !temp.path().join("spread.db").exists(),
+            "no physical spread rows back this origin"
+        );
+    }
+
+    #[test]
+    fn unviewed_shift_import_observation_allows_external_move_and_restore() {
+        let _serial = lock_record_sequence();
+        let temp = tempfile::tempdir().unwrap();
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        let books = temp.path().join("books");
+        std::fs::create_dir_all(&books).unwrap();
+        let source = books.join("imported.zip");
+        let moved = books.join("moved.zip");
+        let bytes = b"small unviewed archive identity fixture";
+        std::fs::write(&source, bytes).unwrap();
+        crate::spread_shift::initialize_database_at(&source_data.join("spread_shift.db")).unwrap();
+        let scope = crate::book_scope::BookScopeKey::archive(&source, &["chapter".into()]).unwrap();
+        let reference =
+            crate::spread_shift::SpreadShiftPageRef::ArchiveEntry("chapter/001.jpg".into());
+        let conn = rusqlite::Connection::open(source_data.join("spread_shift.db")).unwrap();
+        conn.execute(
+            "INSERT INTO spread_shifts VALUES (?1, ?2)",
+            rusqlite::params![
+                scope.storage_key(),
+                serde_json::to_string(&reference).unwrap()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        let cancel = AtomicBool::new(false);
+        crate::metadata_transfer::export_at(&source_data, &books, false, &cancel, |_| {}).unwrap();
+        let imported =
+            crate::metadata_transfer::import_at(&destination_data, &books, &cancel, |_| {})
+                .unwrap();
+        assert_eq!(imported.committed.spread_shift_additions, 1);
+        assert_eq!(imported.committed.spread_shift_observation_roots.len(), 1);
+        let recorder =
+            ContentIdentityRecorder::spawn_at(destination_data.join("content_identity.db"))
+                .unwrap();
+        for root in &imported.committed.spread_shift_observation_roots {
+            recorder
+                .producer()
+                .record_for_path(root, ContentIdentityTrigger::Edit);
+        }
+        let observed = recorder
+            .update_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(
+            observed.file_key,
+            crate::path_key::normalize_keep_drive(&source)
+        );
+        assert!(observed.has_restorable_content);
+        drop(recorder);
+        std::fs::rename(&source, &moved).unwrap();
+        let ledger_path = destination_data.join("content_identity.db");
+        let db = ContentIdentityDb::open_at(&ledger_path).unwrap();
+        let index = db.load_index(&cancel).unwrap().unwrap();
+        let target = stage0_target(
+            &index,
+            ContentIdentitySource::new(&moved, ContentKind::Zip),
+            bytes.len() as u64,
+        )
+        .unwrap();
+        drop(db);
+        let detected = run_detection_at(
+            &ledger_path,
+            vec![target],
+            1,
+            crate::path_key::normalize_keep_drive(&books),
+            &cancel,
+            &crate::io_semaphore::GlobalIoSemaphore::new(1),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(detected.candidates.len(), 1);
+        let copied = crate::rename_key_migration::copy_stores_at(
+            &destination_data,
+            &[crate::rename_key_migration::StoreCopyPathMapping::exact(
+                &source, &moved,
+            )],
+        );
+        assert!(copied.errors.is_empty(), "{:?}", copied.errors);
+        let new_scope =
+            crate::book_scope::BookScopeKey::archive(&moved, &["chapter".into()]).unwrap();
+        let conn = rusqlite::Connection::open(destination_data.join("spread_shift.db")).unwrap();
+        let restored: String = conn
+            .query_row(
+                "SELECT anchor_ref FROM spread_shifts WHERE path = ?1",
+                [new_scope.storage_key()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<crate::spread_shift::SpreadShiftPageRef>(&restored).unwrap(),
+            reference
+        );
+    }
+
+    #[test]
+    fn shift_service_observes_actual_set_once_and_never_clear_or_noop() {
+        let _serial = lock_record_sequence();
+        let temp = tempfile::tempdir().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let observer = ContentIdentityProducer { tx: Some(tx) };
+        let (service, owner) = crate::spread_shift::SpreadShiftService::spawn_at(
+            temp.path().to_path_buf(),
+            Some(observer),
+        )
+        .unwrap();
+        let root = temp.path().join("logical.rar");
+        let scope = crate::book_scope::BookScopeKey::archive(&root, &["chapter".into()]).unwrap();
+        let operation = crate::spread_shift::ShiftOperation {
+            context_id: crate::app::ViewerContextId::for_test(1),
+            items_generation: 2,
+            operation_sequence: 3,
+        };
+        let reference =
+            crate::spread_shift::SpreadShiftPageRef::ArchiveEntry("chapter/001.jpg".into());
+        service
+            .set_shift(scope.clone(), reference.clone(), operation.clone())
+            .unwrap();
+        service
+            .set_shift(scope.clone(), reference, operation.clone())
+            .unwrap();
+        service.clear_shift(scope, operation).unwrap();
+        // A real image-folder name may have an archive extension. It remains
+        // outside content identity, as classified by its accepted PageRef domain.
+        service
+            .set_shift(
+                crate::book_scope::BookScopeKey::folder(temp.path().join("folder.zip")).unwrap(),
+                crate::spread_shift::SpreadShiftPageRef::RelativePath("page.jpg".into()),
+                crate::spread_shift::ShiftOperation {
+                    context_id: crate::app::ViewerContextId::for_test(1),
+                    items_generation: 2,
+                    operation_sequence: 4,
+                },
+            )
+            .unwrap();
+        let results = owner.shutdown_and_join();
+        assert!(results.iter().all(|result| result.status.is_ok()));
+        let requests: Vec<_> = rx.try_iter().collect();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            crate::path_key::normalize_keep_drive(&requests[0].source.path),
+            crate::path_key::normalize_keep_drive(&root)
+        );
+        assert_eq!(requests[0].trigger, ContentIdentityTrigger::Edit);
     }
 
     /// 記録要求はこちらの観測より前に出ていて、worker の台帳 UPDATE だけが probe 中に

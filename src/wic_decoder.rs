@@ -127,7 +127,7 @@ pub fn decode_to_dynamic_image(path: &Path) -> Option<image::DynamicImage> {
                 )
                 .ok()?;
 
-            decode_first_frame(&factory, &decoder)
+            decode_first_frame(&factory, &decoder, None)
         }
     }
 }
@@ -184,8 +184,42 @@ pub fn decode_to_dynamic_image_from_bytes(
                 .CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnDemand)
                 .ok()?;
 
-            decode_first_frame(&factory, &decoder)
+            decode_first_frame(&factory, &decoder, None)
         }
+    }
+}
+
+/// Worker-only first-frame decoder with a caller-owned preallocation budget.
+/// WIC metadata stays on-demand; pixel conversion is admitted before allocation.
+pub(crate) fn decode_to_dynamic_image_from_bytes_bounded(
+    bytes: &[u8],
+    extension: &str,
+    max_alloc: u64,
+) -> Option<image::DynamicImage> {
+    if crate::raw_format::is_raw_ext(extension) {
+        return None;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (bytes, max_alloc);
+        None
+    }
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::Graphics::Imaging::{
+            CLSID_WICImagingFactory, IWICImagingFactory, WICDecodeMetadataCacheOnDemand,
+        };
+        use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+        use windows::Win32::UI::Shell::SHCreateMemStream;
+        let _com = ComScope::init();
+        let factory: IWICImagingFactory =
+            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()?;
+        let _: u32 = bytes.len().try_into().ok()?;
+        let stream = SHCreateMemStream(Some(bytes))?;
+        let decoder = factory
+            .CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnDemand)
+            .ok()?;
+        decode_first_frame(&factory, &decoder, Some(max_alloc))
     }
 }
 
@@ -198,6 +232,7 @@ pub fn decode_to_dynamic_image_from_bytes(
 unsafe fn decode_first_frame(
     factory: &windows::Win32::Graphics::Imaging::IWICImagingFactory,
     decoder: &windows::Win32::Graphics::Imaging::IWICBitmapDecoder,
+    max_alloc: Option<u64>,
 ) -> Option<image::DynamicImage> {
     use windows::Win32::Graphics::Imaging::{
         GUID_WICPixelFormat32bppBGRA, IWICBitmapFrameDecode, IWICBitmapSource, IWICFormatConverter,
@@ -226,14 +261,7 @@ unsafe fn decode_first_frame(
     let mut width = 0u32;
     let mut height = 0u32;
     converter.GetSize(&mut width, &mut height).ok()?;
-    const MAX_WIC_DIMENSION: u32 = 32768;
-    if width == 0 || height == 0 || width > MAX_WIC_DIMENSION || height > MAX_WIC_DIMENSION {
-        return None;
-    }
-
-    // ピクセル列を読む
-    let stride = width.checked_mul(4)?.min(u32::MAX);
-    let buffer_size = (stride as usize).checked_mul(height as usize)?;
+    let (stride, buffer_size) = bounded_wic_buffer_layout(width, height, max_alloc)?;
     let mut pixels = vec![0u8; buffer_size];
     converter
         .CopyPixels(std::ptr::null(), stride, &mut pixels)
@@ -246,7 +274,78 @@ unsafe fn decode_first_frame(
 
     // image::DynamicImage に組み立て
     let rgba = image::RgbaImage::from_raw(width, height, pixels)?;
-    Some(image::DynamicImage::ImageRgba8(rgba))
+    let image = image::DynamicImage::ImageRgba8(rgba);
+    if max_alloc.is_some() {
+        // Query only the scalar orientation, never expand EXIF into owned tag objects.
+        let orientation = wic_frame_orientation(&frame).unwrap_or(1);
+        Some(crate::thumb_loader::apply_orientation(image, orientation))
+    } else {
+        Some(image)
+    }
+}
+
+#[cfg(windows)]
+unsafe fn wic_frame_orientation(
+    frame: &windows::Win32::Graphics::Imaging::IWICBitmapFrameDecode,
+) -> Option<u16> {
+    use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+    use windows::core::PCWSTR;
+    let reader = unsafe { frame.GetMetadataQueryReader() }.ok()?;
+    for query in [
+        "/app1/ifd/{ushort=274}",
+        "/ifd/{ushort=274}",
+        "System.Photo.Orientation",
+    ] {
+        let wide: Vec<u16> = query.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut value = PROPVARIANT::default();
+        if unsafe { reader.GetMetadataByName(PCWSTR(wide.as_ptr()), &mut value) }.is_ok() {
+            if let Ok(n) = u16::try_from(&value)
+                && (1..=8).contains(&n)
+            {
+                return Some(n);
+            }
+            if let Ok(n) = u32::try_from(&value)
+                && (1..=8).contains(&n)
+            {
+                return Some(n as u16);
+            }
+        }
+    }
+    None
+}
+
+fn bounded_wic_buffer_layout(
+    width: u32,
+    height: u32,
+    max_alloc: Option<u64>,
+) -> Option<(u32, usize)> {
+    const MAX_WIC_DIMENSION: u32 = 32768;
+    if width == 0 || height == 0 || width > MAX_WIC_DIMENSION || height > MAX_WIC_DIMENSION {
+        return None;
+    }
+    let stride = width.checked_mul(4)?;
+    let len = (stride as usize).checked_mul(height as usize)?;
+    if max_alloc.is_some_and(|budget| len as u64 > budget) {
+        None
+    } else {
+        Some((stride, len))
+    }
+}
+#[cfg(test)]
+mod bounded_wic_tests {
+    #[test]
+    fn now_playing_wic_budget_is_checked_before_heic_jxl_pixels() {
+        use super::bounded_wic_buffer_layout as layout;
+        assert_eq!(
+            layout(1024, 1024, Some(4 * 1024 * 1024)),
+            Some((4096, 4 * 1024 * 1024))
+        );
+        assert_eq!(layout(1025, 1024, Some(4 * 1024 * 1024)), None);
+        assert_eq!(layout(32768, 32768, Some(160 * 1024 * 1024)), None);
+        assert_eq!(layout(0, 1, None), None);
+        assert!(super::is_wic_supported_extension("heic"));
+        assert!(super::is_wic_supported_extension("jxl"));
+    }
 }
 
 /// WIC メタデータから EXIF Orientation 値を読み取る。

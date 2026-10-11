@@ -1931,6 +1931,108 @@ fn fullscreen_specified_scale_live_popup_snapshots() {
 }
 
 #[test]
+fn spread_shift_hud_snapshots() {
+    use egui_kittest::kittest::NodeT;
+    use std::{cell::RefCell, collections::HashSet, rc::Rc};
+
+    #[derive(Default)]
+    struct Actions {
+        watched: Vec<egui::Id>,
+        clicked: HashSet<egui::Id>,
+    }
+
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    for (theme_name, theme) in [
+        ("light", mimageviewer::os_theme::ResolvedTheme::Light),
+        ("dark", mimageviewer::os_theme::ResolvedTheme::Dark),
+    ] {
+        for (size_name, size) in [
+            ("normal", egui::vec2(720.0, 500.0)),
+            ("narrow", egui::vec2(320.0, 480.0)),
+        ] {
+            for (state_name, unresolved) in [("resolved", false), ("unresolved", true)] {
+                let name = format!("spread_shift_hud_{state_name}_{size_name}_{theme_name}");
+                let actions = Rc::new(RefCell::new(Actions::default()));
+                let drawn_actions = Rc::clone(&actions);
+                snapshots.extend(snapshot_with_theme_options_collect(
+                    &name,
+                    theme,
+                    mimageviewer::settings::TextContrast::Standard,
+                    size,
+                    None,
+                    move |ui| {
+                        mimageviewer::draw_spread_shift_hud_snapshot_fixture(ui, unresolved);
+                        let mut actions = drawn_actions.borrow_mut();
+                        let watched = actions.watched.clone();
+                        for id in watched {
+                            if ui.ctx().read_response(id).is_some_and(|r| r.clicked()) {
+                                actions.clicked.insert(id);
+                            }
+                        }
+                    },
+                    |harness| {
+                        let viewport = harness.ctx.content_rect();
+                        let mut targets = Vec::new();
+                        for (label, actionable) in [
+                            ("基点のページへ移動", !unresolved),
+                            // Missing/filtered saved adjustments must still be clearable.
+                            ("調整を解除", true),
+                            ("見開きの調整を本ごとに記憶する", true),
+                        ] {
+                            let node = harness.get_by_label(label);
+                            let id = unsafe {
+                                egui::Id::from_high_entropy_bits(node.accesskit_node().id().0)
+                            };
+                            let response = harness.ctx.read_response(id).unwrap();
+                            assert!(
+                                viewport.contains_rect(response.rect),
+                                "{name} {label}: outside viewport"
+                            );
+                            assert!(
+                                response.interact_rect.contains_rect(response.rect),
+                                "{name} {label}: clipped"
+                            );
+                            assert_eq!(
+                                response.sense.senses_click(),
+                                actionable,
+                                "{name} {label}: actionability"
+                            );
+                            harness.hover_at(response.rect.center());
+                            harness.run_steps(3);
+                            let response = harness.ctx.read_response(id).unwrap();
+                            assert!(response.contains_pointer(), "{name} {label}: covered");
+                            targets.push((label, id, actionable));
+                        }
+                        actions.borrow_mut().watched =
+                            targets.iter().map(|(_, id, _)| *id).collect();
+                        for (label, id, actionable) in targets {
+                            let pos = harness.ctx.read_response(id).unwrap().rect.center();
+                            harness.hover_at(pos);
+                            for pressed in [true, false] {
+                                harness.event(egui::Event::PointerButton {
+                                    pos,
+                                    button: egui::PointerButton::Primary,
+                                    pressed,
+                                    modifiers: egui::Modifiers::NONE,
+                                });
+                            }
+                            harness.run_steps(3);
+                            assert_eq!(
+                                actions.borrow().clicked.contains(&id),
+                                actionable,
+                                "{name} {label}: click"
+                            );
+                        }
+                        harness.hover_at(egui::Pos2::ZERO);
+                        harness.run_steps(3);
+                    },
+                ));
+            }
+        }
+    }
+}
+
+#[test]
 fn fullscreen_fit_hud_popup_snapshots() {
     let mut snapshots = egui_kittest::SnapshotResults::default();
     for (theme_name, theme) in [
@@ -1995,6 +2097,28 @@ fn preferences_favorite_view_state_dark() {
                 mimageviewer::draw_favorite_view_state_settings_snapshot_fixture(ui);
             });
         },
+    );
+}
+
+#[test]
+fn preferences_restore_position_light_on() {
+    snapshot_with_theme_at_size(
+        "preferences_restore_position_light_on",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(480.0, 80.0),
+        None,
+        |ui| mimageviewer::draw_preferences_restore_position_snapshot_fixture(ui, true),
+    );
+}
+
+#[test]
+fn preferences_restore_position_dark_off_narrow() {
+    snapshot_with_theme_at_size(
+        "preferences_restore_position_dark_off_narrow",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(260.0, 80.0),
+        None,
+        |ui| mimageviewer::draw_preferences_restore_position_snapshot_fixture(ui, false),
     );
 }
 

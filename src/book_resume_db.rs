@@ -15,13 +15,13 @@
 //! 同名の実 directory とネスト書庫の衝突は非対応 (2026-10-08 利用者決定)。
 //!
 //! ページ送りのたびに書き込みが走るため、**書き込みは [`BookResumeWriter`] の専用
-//! スレッドへ逃がして UI スレッドの同期 SQLite I/O を避ける**。読み出し
-//! ([`BookResumeDb::get`]) は本を開くときに 1 回だけなので UI スレッド同期のまま。
+//! スレッドへ逃がして UI スレッドの同期 SQLite I/O を避ける**。復元用位置読取も
+//! 同じ FIFO と完了証明付き immutable snapshot を使い、先行記録を追い越さない。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
     mpsc,
 };
@@ -103,6 +103,84 @@ pub(crate) struct MeterSnapshot {
 }
 
 pub(crate) type MeterReadResult = Result<MeterSnapshot, String>;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ResumeWatermarks {
+    pub admitted: u64,
+    pub completed_through: u64,
+}
+
+/// An external transaction may only certify a read which began after completion
+/// and saw no admission/completion change through the end of that transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ResumeReadProof {
+    pub cutoff: u64,
+    pub completed_through: u64,
+}
+
+impl ResumeReadProof {
+    pub(crate) fn for_transaction(
+        cutoff: u64,
+        before: ResumeWatermarks,
+        after: ResumeWatermarks,
+    ) -> Option<Self> {
+        (before == after
+            && before.admitted == before.completed_through
+            && before.completed_through >= cutoff)
+            .then_some(Self {
+                cutoff,
+                completed_through: before.completed_through,
+            })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PositionReadReply {
+    pub cutoff: u64,
+    pub completed_through: u64,
+    pub position: Option<ReadingPosition>,
+    pub status: Result<(), String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PositionSnapshot {
+    pub completed_through: u64,
+    pub values: HashMap<String, ReadingPosition>,
+    pub status: Result<(), String>,
+}
+
+impl PositionSnapshot {
+    pub(crate) fn read_after(&self, resume_key: &str, cutoff: u64) -> Option<PositionReadReply> {
+        (self.completed_through >= cutoff).then(|| PositionReadReply {
+            cutoff,
+            completed_through: self.completed_through,
+            position: self.values.get(resume_key).cloned(),
+            status: self.status.clone(),
+        })
+    }
+}
+
+#[derive(Default)]
+struct WriterState {
+    watermarks: ResumeWatermarks,
+    snapshot: Option<Arc<PositionSnapshot>>,
+}
+
+/// Cloneable, I/O-free observations for row-preparation workers. Capture before
+/// BEGIN/first SELECT and after the read transaction ends, then validate proof.
+#[derive(Clone)]
+pub(crate) struct ResumeWatermarkReader(Arc<Mutex<WriterState>>);
+
+impl ResumeWatermarkReader {
+    pub(crate) fn watermarks(&self) -> ResumeWatermarks {
+        self.0.lock().unwrap().watermarks
+    }
+
+    fn observation(&self) -> Option<(ResumeWatermarks, Result<(), String>)> {
+        let state = self.0.lock().unwrap();
+        Some((state.watermarks, state.snapshot.as_ref()?.status.clone()))
+    }
+}
 
 /// 読書位置 DB ハンドル
 pub struct BookResumeDb {
@@ -186,6 +264,102 @@ impl BookResumeDb {
                 },
             )
             .ok()
+    }
+
+    /// Exact released resume key; errors remain distinct from a missing row.
+    pub(crate) fn read_position(
+        &self,
+        resume_key: &str,
+    ) -> Result<Option<ReadingPosition>, String> {
+        use rusqlite::OptionalExtension;
+        self.conn
+            .query_row(
+                "SELECT page,page_identity FROM book_resume WHERE path=?1",
+                [resume_key],
+                |row| {
+                    let page: i64 = row.get(0)?;
+                    let encoded: Option<String> = row.get(1)?;
+                    Ok((page, encoded))
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .map(|(page, encoded)| {
+                Ok(ReadingPosition {
+                    page: page.max(0) as usize,
+                    identity: encoded
+                        .map(|value| serde_json::from_str(&value).map_err(|e| e.to_string()))
+                        .transpose()?,
+                })
+            })
+            .transpose()
+    }
+
+    /// Row-preparation worker fast path. `None` means the external transaction
+    /// could not be certified; enqueue ReadPositionAfter instead. This method
+    /// owns BEGIN/end so the before/after observations bracket the actual read.
+    /// Call only on a worker: opening/reading the DB is never UI work.
+    pub(crate) fn read_position_proven(
+        &self,
+        resume_key: &str,
+        cutoff: u64,
+        reader: &ResumeWatermarkReader,
+    ) -> Option<PositionReadReply> {
+        let (before, writer_status) = reader.observation()?;
+        ResumeReadProof::for_transaction(cutoff, before, before)?;
+        let result = (|| {
+            let tx = self
+                .conn
+                .unchecked_transaction()
+                .map_err(|e| e.to_string())?;
+            let position = self.read_position(resume_key)?;
+            tx.commit().map_err(|e| e.to_string())?;
+            Ok(position)
+        })();
+        let (after, _) = reader.observation()?;
+        let proof = ResumeReadProof::for_transaction(cutoff, before, after)?;
+        let (position, status) = match result {
+            Ok(position) => (position, writer_status),
+            Err(e) => {
+                crate::logger::log(format!("book-resume: proven position read failed: {e}"));
+                (None, Err(e))
+            }
+        };
+        Some(PositionReadReply {
+            cutoff: proof.cutoff,
+            completed_through: proof.completed_through,
+            position,
+            status,
+        })
+    }
+
+    fn read_positions(&self) -> Result<HashMap<String, ReadingPosition>, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path,page,page_identity FROM book_resume")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.map(|row| {
+            let (key, page, encoded) = row.map_err(|e| e.to_string())?;
+            Ok((
+                key,
+                ReadingPosition {
+                    page: page.max(0) as usize,
+                    identity: encoded
+                        .map(|value| serde_json::from_str(&value).map_err(|e| e.to_string()))
+                        .transpose()?,
+                },
+            ))
+        })
+        .collect()
     }
 
     fn set_position(
@@ -323,7 +497,7 @@ fn normalize_path(path: &Path) -> String {
 /// Connection を持つ専用スレッドへ `(path, page, meter)` を送って upsert する。ページ送りの
 /// たびに走る書き込みで UI が引っかからないようにするのが目的 ([docs/ui-responsiveness.md]
 /// の「UI スレッドの同期 I/O は worker 化」)。メーターの移行/全行読込/clearも同じFIFO。
-/// 従来のraw位置復元の読み出しは `BookResumeDb` 側に維持する。
+/// Released raw/meter APIs remain available; new restores use the fenced read.
 enum Command {
     Record(
         PathBuf,
@@ -332,17 +506,26 @@ enum Command {
         Option<PageIdentity>,
     ),
     Read(mpsc::Sender<MeterReadResult>),
+    ReadPositionAfter(String, u64, mpsc::Sender<PositionReadReply>),
     Clear(mpsc::Sender<Result<usize, String>>),
     #[cfg(test)]
     Pause(mpsc::Sender<()>, mpsc::Receiver<()>),
 }
 
+struct QueuedCommand {
+    position_fence_seq: Option<u64>,
+    command: Command,
+}
+
 pub struct BookResumeWriter {
     /// `Option` なのは `Drop` で先に Sender を落として writer スレッドの recv ループを
     /// 終了させてから join するため。
-    tx: Option<mpsc::Sender<Command>>,
+    tx: Option<mpsc::Sender<QueuedCommand>>,
     handle: Option<std::thread::JoinHandle<()>>,
     pending: Arc<AtomicUsize>,
+    /// This short lock is the admission order for every &self command, not a DB
+    /// lock. No I/O, recv, or join runs while held.
+    state: Arc<Mutex<WriterState>>,
 }
 
 impl BookResumeWriter {
@@ -352,9 +535,11 @@ impl BookResumeWriter {
     }
 
     pub(crate) fn spawn_at(path: PathBuf) -> Option<Self> {
-        let (tx, rx) = mpsc::channel::<Command>();
+        let (tx, rx) = mpsc::channel::<QueuedCommand>();
         let pending = Arc::new(AtomicUsize::new(0));
         let worker_pending = Arc::clone(&pending);
+        let state = Arc::new(Mutex::new(WriterState::default()));
+        let worker_state = Arc::clone(&state);
         let spawned = std::thread::Builder::new()
             .name("book-resume-writer".into())
             .spawn(move || {
@@ -375,16 +560,57 @@ impl BookResumeWriter {
                         false
                     }
                 };
+                let (values, status) = match db.read_positions() {
+                    Ok(values) => (values, Ok(())),
+                    Err(e) => {
+                        crate::logger::log(format!(
+                            "book-resume writer: positions read failed: {e}"
+                        ));
+                        (HashMap::new(), Err(e))
+                    }
+                };
+                worker_state.lock().unwrap().snapshot = Some(Arc::new(PositionSnapshot {
+                    completed_through: 0,
+                    values,
+                    status,
+                }));
                 // tx が全て drop されるまで (= App 終了まで) 受信し続ける。channel に
                 // 溜まっている分は Disconnected 前に drain されるので取りこぼしは無い。
-                while let Ok(command) = rx.recv() {
+                while let Ok(QueuedCommand {
+                    position_fence_seq,
+                    command,
+                }) = rx.recv()
+                {
                     match command {
                         Command::Record(path, page, value, identity) => {
                             let result =
                                 db.set_position(&path, page, value, identity.as_ref(), meter_ready);
-                            if let Err(e) = result {
+                            if let Err(e) = &result {
                                 crate::logger::log(format!("book-resume writer: set failed: {e}"));
                             }
+                            let seq =
+                                position_fence_seq.expect("Record advances the position fence");
+                            // Move the publication out briefly so COW of a held
+                            // snapshot never blocks UI admission on a full-map clone.
+                            let mut publication =
+                                worker_state.lock().unwrap().snapshot.take().unwrap();
+                            let snapshot = Arc::make_mut(&mut publication);
+                            match result {
+                                Ok(()) => {
+                                    snapshot.values.insert(
+                                        normalize_path(&path),
+                                        ReadingPosition {
+                                            page: (page as i64).max(0) as usize,
+                                            identity,
+                                        },
+                                    );
+                                }
+                                Err(e) => snapshot.status = Err(e.to_string()),
+                            }
+                            snapshot.completed_through = seq;
+                            let mut state = worker_state.lock().unwrap();
+                            state.snapshot = Some(publication);
+                            state.watermarks.completed_through = seq;
                         }
                         Command::Read(tx) => {
                             let result = if meter_ready {
@@ -392,10 +618,79 @@ impl BookResumeWriter {
                             } else {
                                 Err("meter schema unavailable".into())
                             };
+                            // Shared maintenance paths already reload the meter
+                            // after changing resume rows. Publish positions through
+                            // that same FIFO completion rather than retaining old keys.
+                            let positions = db.read_positions();
+                            let mut publication =
+                                worker_state.lock().unwrap().snapshot.take().unwrap();
+                            let snapshot = Arc::make_mut(&mut publication);
+                            match positions {
+                                Ok(values) => snapshot.values = values,
+                                Err(e) => {
+                                    crate::logger::log(format!(
+                                        "book-resume writer: positions refresh failed: {e}"
+                                    ));
+                                    snapshot.status = Err(e);
+                                }
+                            }
+                            let seq = position_fence_seq.expect("Read advances the position fence");
+                            snapshot.completed_through = seq;
+                            {
+                                let mut state = worker_state.lock().unwrap();
+                                state.snapshot = Some(publication);
+                                state.watermarks.completed_through = seq;
+                            }
                             let _ = tx.send(result);
                         }
+                        Command::ReadPositionAfter(key, cutoff, tx) => {
+                            let (completed_through, mut status) = {
+                                let state = worker_state.lock().unwrap();
+                                (
+                                    state.watermarks.completed_through,
+                                    state.snapshot.as_ref().unwrap().status.clone(),
+                                )
+                            };
+                            let position = match db.read_position(&key) {
+                                Ok(position) => position,
+                                Err(e) => {
+                                    crate::logger::log(format!(
+                                        "book-resume writer: position read failed: {e}"
+                                    ));
+                                    status = Err(e);
+                                    None
+                                }
+                            };
+                            let _ = tx.send(PositionReadReply {
+                                cutoff,
+                                completed_through,
+                                position,
+                                status,
+                            });
+                        }
                         Command::Clear(tx) => {
-                            let _ = tx.send(db.clear_all().map_err(|e| e.to_string()));
+                            let result = db.clear_all().map_err(|e| e.to_string());
+                            if let Err(e) = &result {
+                                crate::logger::log(format!(
+                                    "book-resume writer: clear failed: {e}"
+                                ));
+                            }
+                            {
+                                let seq =
+                                    position_fence_seq.expect("Clear advances the position fence");
+                                let mut publication =
+                                    worker_state.lock().unwrap().snapshot.take().unwrap();
+                                let snapshot = Arc::make_mut(&mut publication);
+                                match &result {
+                                    Ok(_) => snapshot.values.clear(),
+                                    Err(e) => snapshot.status = Err(e.clone()),
+                                }
+                                snapshot.completed_through = seq;
+                                let mut state = worker_state.lock().unwrap();
+                                state.snapshot = Some(publication);
+                                state.watermarks.completed_through = seq;
+                            }
+                            let _ = tx.send(result);
                         }
                         #[cfg(test)]
                         Command::Pause(entered, resume) => {
@@ -411,6 +706,7 @@ impl BookResumeWriter {
                 tx: Some(tx),
                 handle: Some(handle),
                 pending,
+                state,
             }),
             Err(e) => {
                 crate::logger::log(format!("book-resume writer: thread spawn failed: {e}"));
@@ -421,13 +717,90 @@ impl BookResumeWriter {
 
     /// 読書位置を非同期で記録する (送るだけ・UI スレッドはブロックしない)。
     fn send(&self, command: Command) -> bool {
+        let mut state = self.state.lock().unwrap();
+        self.send_locked(command, &mut state)
+    }
+
+    fn send_locked(&self, command: Command, state: &mut WriterState) -> bool {
+        // A maintenance reread changes the published position view, so it must
+        // fence later receipts just like Record/Clear, even though it writes no DB row.
+        let position_fence_seq = matches!(
+            command,
+            Command::Record(..) | Command::Read(..) | Command::Clear(..)
+        )
+        .then(|| {
+            state
+                .watermarks
+                .admitted
+                .checked_add(1)
+                .expect("resume sequence exhausted")
+        });
         self.pending.fetch_add(1, Ordering::AcqRel);
-        if self.tx.as_ref().is_some_and(|tx| tx.send(command).is_ok()) {
+        if self.tx.as_ref().is_some_and(|tx| {
+            tx.send(QueuedCommand {
+                position_fence_seq,
+                command,
+            })
+            .is_ok()
+        }) {
+            if let Some(seq) = position_fence_seq {
+                state.watermarks.admitted = seq;
+            }
             true
         } else {
             self.pending.fetch_sub(1, Ordering::Release);
             false
         }
+    }
+
+    pub(crate) fn watermarks(&self) -> ResumeWatermarks {
+        self.state.lock().unwrap().watermarks
+    }
+
+    pub(crate) fn watermark_reader(&self) -> ResumeWatermarkReader {
+        ResumeWatermarkReader(Arc::clone(&self.state))
+    }
+
+    /// Only offer a warm snapshot when it covers every admitted write and reload.
+    /// A retained older Arc still cannot cover a later receipt's larger cutoff.
+    pub(crate) fn position_snapshot(&self) -> Option<Arc<PositionSnapshot>> {
+        let state = self.state.lock().unwrap();
+        (state.watermarks.admitted == state.watermarks.completed_through)
+            .then(|| state.snapshot.clone())
+            .flatten()
+    }
+
+    pub(crate) fn read_position_after(
+        &self,
+        resume_key: &str,
+        cutoff: u64,
+    ) -> mpsc::Receiver<PositionReadReply> {
+        let (tx, rx) = mpsc::channel();
+        let mut state = self.state.lock().unwrap();
+        if cutoff <= state.watermarks.admitted {
+            if state.watermarks.admitted == state.watermarks.completed_through
+                && let Some(reply) = state
+                    .snapshot
+                    .as_ref()
+                    .and_then(|s| s.read_after(resume_key, cutoff))
+            {
+                let _ = tx.send(reply);
+                return rx;
+            }
+            if self.send_locked(
+                Command::ReadPositionAfter(resume_key.into(), cutoff, tx.clone()),
+                &mut state,
+            ) {
+                return rx;
+            }
+        }
+        let _ = tx.send(PositionReadReply {
+            cutoff,
+            completed_through: state.watermarks.completed_through,
+            position: None,
+            status: Err("resume writer unavailable or cutoff was not admitted".into()),
+        });
+        rx
     }
 
     pub fn record(&self, path: &Path, page: usize, value: Option<ReadingMeterValue>) -> bool {
@@ -488,6 +861,185 @@ impl Drop for BookResumeWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn position_reply(writer: &BookResumeWriter, book: &Path, cutoff: u64) -> PositionReadReply {
+        writer
+            .read_position_after(&normalize_path(book), cutoff)
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+    }
+
+    #[test]
+    fn position_read_waits_for_pending_record_and_freezes_fifo_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = BookResumeWriter::spawn_at(tmp.path().join("resume.db")).unwrap();
+        let book = Path::new("C:/books/a.zip");
+        assert!(writer.record(book, 1, None));
+        assert_eq!(position_reply(&writer, book, 1).position.unwrap().page, 1);
+        let old = writer.position_snapshot().unwrap();
+        let release = writer.pause_for_test();
+        let identity = PageIdentity::Archive {
+            container: path_key::normalize_keep_drive(book),
+            entry_name: "page9.png".into(),
+        };
+        assert!(writer.record_identity(book, 9, None, Some(identity.clone())));
+        let cutoff = writer.watermarks().admitted;
+        assert_eq!(cutoff, 2);
+        assert_eq!(writer.watermarks().completed_through, 1);
+        assert!(writer.position_snapshot().is_none());
+        assert!(old.read_after(&normalize_path(book), cutoff).is_none());
+        let read = writer.read_position_after(&normalize_path(book), cutoff);
+        assert!(matches!(read.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        // A later sibling action cannot replace the already enqueued read.
+        assert!(writer.record(book, 14, None));
+        release.send(()).unwrap();
+        assert_eq!(
+            read.recv_timeout(Duration::from_secs(10)).unwrap(),
+            PositionReadReply {
+                cutoff: 2,
+                completed_through: 2,
+                position: Some(ReadingPosition {
+                    page: 9,
+                    identity: Some(identity)
+                }),
+                status: Ok(()),
+            }
+        );
+        assert_eq!(position_reply(&writer, book, 3).position.unwrap().page, 14);
+        let snapshot = writer.position_snapshot().unwrap();
+        assert_eq!(snapshot.completed_through, 3);
+        assert_eq!(snapshot.values[&normalize_path(book)].page, 14);
+        assert_eq!(old.values[&normalize_path(book)].page, 1);
+    }
+
+    #[test]
+    fn position_read_waits_for_pending_clear_and_external_read_cannot_bypass_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("resume.db");
+        let writer = BookResumeWriter::spawn_at(db_path.clone()).unwrap();
+        let book = Path::new("C:/books/a.zip");
+        assert!(writer.record(book, 7, None));
+        assert!(position_reply(&writer, book, 1).status.is_ok());
+        let db = BookResumeDb::open_at(&db_path).unwrap();
+        let observer = writer.watermark_reader();
+        assert_eq!(
+            db.read_position_proven(&normalize_path(book), 1, &observer)
+                .unwrap()
+                .position
+                .unwrap()
+                .page,
+            7
+        );
+        let old = writer.position_snapshot().unwrap();
+        let release = writer.pause_for_test();
+        let cleared = writer.clear();
+        assert_eq!(writer.watermarks().admitted, 2);
+        assert!(writer.position_snapshot().is_none());
+        assert!(old.read_after(&normalize_path(book), 2).is_none());
+        assert!(
+            db.read_position_proven(&normalize_path(book), 2, &observer)
+                .is_none()
+        );
+        let read = writer.read_position_after(&normalize_path(book), 2);
+        assert!(matches!(read.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        release.send(()).unwrap();
+        assert_eq!(
+            cleared.recv_timeout(Duration::from_secs(10)).unwrap(),
+            Ok(1)
+        );
+        assert_eq!(
+            read.recv_timeout(Duration::from_secs(10)).unwrap(),
+            PositionReadReply {
+                cutoff: 2,
+                completed_through: 2,
+                position: None,
+                status: Ok(())
+            }
+        );
+    }
+
+    #[test]
+    fn external_position_read_requires_stable_completed_watermarks() {
+        let stable = ResumeWatermarks {
+            admitted: 4,
+            completed_through: 4,
+        };
+        assert!(ResumeReadProof::for_transaction(4, stable, stable).is_some());
+        assert!(ResumeReadProof::for_transaction(5, stable, stable).is_none());
+        let pending = ResumeWatermarks {
+            admitted: 4,
+            completed_through: 3,
+        };
+        // Unchanging admissions do not prove an outstanding Record is complete.
+        assert!(ResumeReadProof::for_transaction(3, pending, pending).is_none());
+        assert!(ResumeReadProof::for_transaction(4, pending, stable).is_none());
+        let newer = ResumeWatermarks {
+            admitted: 5,
+            completed_through: 5,
+        };
+        assert!(ResumeReadProof::for_transaction(4, stable, newer).is_none());
+    }
+
+    #[test]
+    fn admission_only_counts_successful_send() {
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+        let writer = BookResumeWriter {
+            tx: Some(tx),
+            handle: None,
+            pending: Arc::new(AtomicUsize::new(0)),
+            state: Arc::new(Mutex::new(WriterState::default())),
+        };
+        assert!(!writer.record(Path::new("C:/book.zip"), 2, None));
+        assert_eq!(writer.watermarks(), ResumeWatermarks::default());
+        assert_eq!(writer.pending.load(Ordering::Acquire), 0);
+        assert!(matches!(
+            writer.read_all().try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        assert_eq!(writer.watermarks(), ResumeWatermarks::default());
+        assert_eq!(writer.pending.load(Ordering::Acquire), 0);
+        let reply = position_reply(&writer, Path::new("C:/book.zip"), 0);
+        assert!(reply.status.is_err());
+    }
+
+    #[test]
+    fn normal_drop_drains_record_clear_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("resume.db");
+        let writer = BookResumeWriter::spawn_at(db_path.clone()).unwrap();
+        let book = Path::new("C:/books/a.zip");
+        let release = writer.pause_for_test();
+        assert!(writer.record(book, 2, None));
+        let clear = writer.clear();
+        assert!(writer.record(book, 18, None));
+        release.send(()).unwrap();
+        drop(writer);
+        assert_eq!(clear.recv().unwrap(), Ok(1));
+        assert_eq!(BookResumeDb::open_at(&db_path).unwrap().get(book), Some(18));
+    }
+
+    #[test]
+    fn failed_record_is_terminal_but_position_reply_is_not_successful_absence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("resume.db");
+        let writer = BookResumeWriter::spawn_at(db_path.clone()).unwrap();
+        let book = Path::new("C:/books/a.zip");
+        let release = writer.pause_for_test();
+        let db = BookResumeDb::open_at(&db_path).unwrap();
+        db.conn.execute_batch("CREATE TRIGGER reject_record BEFORE INSERT ON book_resume BEGIN SELECT RAISE(FAIL,'test write failure'); END").unwrap();
+        assert!(writer.record(book, 2, None));
+        let read = writer.read_position_after(&normalize_path(book), 1);
+        release.send(()).unwrap();
+        let reply = read.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(reply.completed_through, 1);
+        assert!(reply.position.is_none());
+        assert!(reply.status.unwrap_err().contains("test write failure"));
+        let external = db
+            .read_position_proven(&normalize_path(book), 1, &writer.watermark_reader())
+            .unwrap();
+        assert!(external.status.is_err());
+    }
 
     #[test]
     fn page_identity_new_old_new_and_same_raw_invalidation() {
@@ -562,6 +1114,125 @@ mod tests {
                 identity: None
             }
         );
+    }
+
+    #[test]
+    fn shared_writer_admission_orders_record_and_clear_across_threads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = Arc::new(BookResumeWriter::spawn_at(tmp.path().join("resume.db")).unwrap());
+        let release = writer.pause_for_test();
+        let (recorded_tx, recorded_rx) = mpsc::channel();
+        let record_writer = Arc::clone(&writer);
+        let record = std::thread::spawn(move || {
+            assert!(record_writer.record(Path::new("C:/book.zip"), 2, None));
+            recorded_tx.send(()).unwrap();
+        });
+        let clear_writer = Arc::clone(&writer);
+        let clear = std::thread::spawn(move || {
+            recorded_rx.recv().unwrap();
+            clear_writer.clear()
+        });
+        record.join().unwrap();
+        let clear_reply = clear.join().unwrap();
+        assert_eq!(
+            writer.watermarks(),
+            ResumeWatermarks {
+                admitted: 2,
+                completed_through: 0
+            }
+        );
+        let read = writer.read_position_after(&normalize_path(Path::new("C:/book.zip")), 2);
+        release.send(()).unwrap();
+        assert_eq!(
+            clear_reply.recv_timeout(Duration::from_secs(10)).unwrap(),
+            Ok(1)
+        );
+        let reply = read.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(reply.completed_through, 2);
+        assert_eq!(reply.position, None);
+        assert_eq!(reply.status, Ok(()));
+    }
+
+    #[test]
+    fn existing_meter_reload_refreshes_externally_changed_positions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("resume.db");
+        let writer = BookResumeWriter::spawn_at(db_path.clone()).unwrap();
+        let book = Path::new("C:/book.zip");
+        assert!(writer.record(book, 2, None));
+        assert!(position_reply(&writer, book, 1).status.is_ok());
+        let db = BookResumeDb::open_at(&db_path).unwrap();
+        db.set(book, 17).unwrap();
+        writer
+            .read_all()
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(position_reply(&writer, book, 1).position.unwrap().page, 17);
+        db.remove(book).unwrap();
+        writer
+            .read_all()
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert!(position_reply(&writer, book, 1).position.is_none());
+    }
+
+    #[test]
+    fn pending_reload_fences_warm_retained_snapshot_and_external_transaction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("resume.db");
+        let writer = BookResumeWriter::spawn_at(db_path.clone()).unwrap();
+        let book = Path::new("C:/book.zip");
+        let key = normalize_path(book);
+        assert!(writer.record(book, 2, None));
+        assert_eq!(position_reply(&writer, book, 1).position.unwrap().page, 2);
+        let before_reload = writer.position_snapshot().unwrap();
+        let db = BookResumeDb::open_at(&db_path).unwrap();
+        let observer = writer.watermark_reader();
+        let release = writer.pause_for_test();
+        // Existing maintenance updates rows externally, then accepts this reread.
+        db.set(book, 17).unwrap();
+        let reloaded = writer.read_all();
+        let cutoff = writer.watermarks().admitted;
+        assert_eq!(cutoff, 2);
+        assert_eq!(writer.watermarks().completed_through, 1);
+        assert_eq!(db.read_position(&key).unwrap().unwrap().page, 17);
+        assert!(writer.position_snapshot().is_none());
+        assert!(before_reload.read_after(&key, cutoff).is_none());
+        // Even an external transaction which could already see the changed DB
+        // cannot prove completion of the accepted, still unfinished reread.
+        assert!(db.read_position_proven(&key, cutoff, &observer).is_none());
+        assert!(db.read_position_proven(&key, 1, &observer).is_none());
+        let restored = writer.read_position_after(&key, cutoff);
+        assert!(matches!(
+            restored.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            reloaded.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        release.send(()).unwrap();
+        let meter = reloaded
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(meter.values[&key], None);
+        let reply = restored.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(reply.cutoff, cutoff);
+        assert_eq!(reply.completed_through, cutoff);
+        assert_eq!(reply.position.unwrap().page, 17);
+        assert_eq!(reply.status, Ok(()));
+        let after_reload = writer.position_snapshot().unwrap();
+        assert_eq!(after_reload.completed_through, cutoff);
+        assert_eq!(after_reload.values[&key].page, 17);
+        assert_eq!(before_reload.values[&key].page, 2);
+        assert!(before_reload.read_after(&key, cutoff).is_none());
+        let proven = db.read_position_proven(&key, cutoff, &observer).unwrap();
+        assert_eq!(proven.completed_through, cutoff);
+        assert_eq!(proven.position.unwrap().page, 17);
+        assert_eq!(proven.status, Ok(()));
     }
 
     #[test]

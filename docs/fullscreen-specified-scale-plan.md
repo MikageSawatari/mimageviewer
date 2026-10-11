@@ -1064,7 +1064,7 @@ captureのcap保持、連結退去後の同じ基準unitを検証する。実HUD
 value / unitの復元とcap dragの同期saveなし・favorite専用値非変更・既存保存境界後の再読込を確認する。
 実prefs数値編集、IME、draft commit、JSON／DB再読込、transfer round tripと不正field拒否も通す。
 通常1093×614と狭いF12の全row / editor / helpの到達性・scrollbar非交差回帰を維持する。
-settings分類は455 field（142対象 / 313除外）、wire項目140。幅・高さは一つのfieldの型変更、
+§1.365結合後のsettings分類は456 field（143対象 / 313除外）、wire項目141。幅・高さは一つのfieldの型変更、
 最大倍率が対象field一つの追加である。対象popup／prefs snapshotだけを意図して更新・目視確認する。
 今回の新しい独立レビュー合格を意味する記録ではない。製品起動・build-dev・commitは行わず、
 実機確認中のtarget/dev-runtimeには書き込まない。

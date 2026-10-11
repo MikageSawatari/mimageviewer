@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>mImageViewer｜Windows の高速画像ビューア（ZIP・PDF・動画も一覧）</title>
-  <meta name="description" content="フォルダを開くだけで、数十万枚でもサムネイルで一覧。ZIP・PDF はディスクに展開せずそのまま閲覧。長い動画はタイル表示で全体を見渡し、見たい場面から再生できます。RAW・HEIC も表示できる Windows 用の無料画像ビューアです。AI 処理はすべて PC 内で完結します。">
+  <meta name="description" content="フォルダを開くだけで、数十万枚でもサムネイルで一覧。ZIP・PDF はディスクに展開せずそのまま閲覧。長い動画はタイル表示で全体を見渡し、見たい場面から再生できます。RAW・HEIC も表示できる Windows 用の無料画像ビューアです。mImageViewer 本体の画像 AI 処理は PC 内で完結します。">
   <link rel="canonical" href="https://mikage.to/mimageviewer/">
 
   <meta property="og:type" content="website">
@@ -34,7 +34,7 @@
     "softwareVersion": "4.5.0",
     "dateModified": "2026-10-09",
     "inLanguage": "ja",
-    "description": "フォルダを開くだけで、数十万枚でもサムネイルで一覧できる Windows 用の画像ビューア。ZIP・PDF はディスクに展開せずに中のページを閲覧でき、長い動画はタイル表示で全体を見渡せます。RAW・HEIC・AVIF に対応し、AI アップスケールと非破壊編集を内蔵します。AI 処理はすべて利用者の PC 内で完結します。",
+    "description": "フォルダを開くだけで、数十万枚でもサムネイルで一覧できる Windows 用の画像ビューア。ZIP・PDF はディスクに展開せずに中のページを閲覧でき、長い動画はタイル表示で全体を見渡せます。RAW・HEIC・AVIF に対応し、AI アップスケールと非破壊編集を内蔵します。mImageViewer 本体の画像 AI 処理は利用者の PC 内で完結します。",
     "screenshot": "https://mikage.to/mimageviewer/ogp.jpg",
     "downloadUrl": "https://mikage.to/mimageviewer/#download",
     "softwareHelp": "https://mikage.to/mimageviewer/manual/",
@@ -1039,7 +1039,8 @@
       <div class="feature-card">
         <div class="icon">📖</div>
         <h3>見開き表示</h3>
-        <p>2 ページを並べて表示。左→右 / 右→左の読み方向や表紙単独表示、縦横の連続スクロール読みに対応し、漫画・コミックを快適に読み進められます。1 枚に 2 ページ分が入った横長の画像を左右に分けて 1 ページずつ読む「横長分割」も選べます。検索や抽出した一覧は単ページから始まり、一覧全体を一時的な見開きでも読めます。</p>
+        <p>2 ページを並べて表示。左→右 / 右→左の読み方向や表紙単独表示、縦横の連続スクロール読みに対応し、漫画・コミックを快適に読み進められます。Ctrl+左右で合わせ直した見開きは本ごとに記憶し、開き直しても復元します。1 枚に 2 ページ分が入った横長の画像を左右に分けて 1 ページずつ読む「横長分割」も選べます。検索や抽出した一覧は単ページから始まり、一覧全体を一時的な見開きでも読めます。</p>
+        <p>保存した見開き調整はリモート閲覧にも反映されます。</p>
       </div>
       <div class="feature-card">
         <div class="icon">🗃️</div>
@@ -1210,18 +1211,19 @@
     <h2>安心して使えます</h2>
     <div class="trust-grid">
       <div class="trust-item">
-        <h3>🔒 AI 処理はすべて PC の中で</h3>
-        <p>AI アップスケール・ノイズ除去・消しゴムの補完・画像タイプの自動判別は、
+        <h3>🔒 本体の画像 AI 処理は PC の中で</h3>
+        <p>mImageViewer 本体の AI アップスケール・ノイズ除去・消しゴムの補完・画像タイプの自動判別は、
           <strong>すべてお使いの PC の GPU で実行</strong>されます。AI 処理のために画像を
           外部のサーバーへアップロードすることはありません。</p>
       </div>
       <div class="trust-item">
-        <h3>🌐 通信するのは 4 つの場面だけ</h3>
+        <h3>🌐 通信が発生する場面</h3>
         <p>①新しいバージョンの有無を確認するとき（<strong>設定でオフにできます</strong>）②追加コンポーネント（AI の高速化、編集用のフォント・モデルなど）を、
           ご自分で選んでダウンロードするとき③外出先から見るリモート閲覧を、
-          ご自分で有効にしたとき④コピーしたページの画像を選んで保存する画面を、ご自分で開いたとき。この 4 つ以外に通信しません。</p>
+          ご自分で有効にしたとき④コピーしたページの画像を選んで保存する画面を、ご自分で開いたときなどに通信が発生します。</p>
+        <p style="margin-top:0.5rem;">音響調整を開いている間、画面表示に使う Windows の機能 (WebView2) が、Microsoft に自身の更新を確認することがあります。曲名や画像は送信しません。</p>
         <p style="margin-top:0.5rem;">クリップボードの取り込み監視は、環境設定のチェックを ON にしたときだけ動きます。④では、選択画面を開くとページの画像候補を取得します (最小サイズで隠れるものも含みます)。取得では画像の URL と、ブラウザと同じ規則の参照元を送ります。ブラウザの Cookie やログイン情報は使わず、コピーした内容や画像をアップロードすることもありません。参照元の規則などの詳細は<a href="privacy.html">プライバシーポリシー</a>をご覧ください。</p>
-        <p style="margin-top:0.5rem;">EPUB の変換も PC の中だけで行い、通信は増えません。</p>
+        <p style="margin-top:0.5rem;">EPUB は PC 内で PDF に変換し、本に含まれる外部サイトへの要求を遮断します。</p>
         <p style="margin-top:0.5rem;">リモート閲覧は<strong>初期状態ではオフ</strong>で、接続には
           <strong>PIN が必須</strong>です。外出先との通信は暗号化され、接続状況によっては暗号化されたまま
           Tailscale の中継サーバーを通ることがありますが、中継サーバーは内容を読めません。
@@ -1235,12 +1237,13 @@
       </div>
       <div class="trust-item">
         <h3>🚫 広告・解析・アカウント不要</h3>
-        <p>広告、アクセス解析ツール、利用状況の送信を<strong>一切含みません</strong>。
+        <p><strong>広告・アクセス解析ツール・利用状況の送信はありません</strong>。
           アカウント登録もログインも不要で、そのまま使い始められます。</p>
           <p>診断ログはPC内へ背景保存します。診断ZIPは保存完了を確認して作成し、記録の欠落があれば画面とZIP内で知らせます。外部への自動送信はありません。</p>
       </div>
       <div class="trust-item">
         <h3>💾 設定や履歴はあなたの PC に保存</h3>
+        <p>本ごとに合わせ直した見開きの調整もPC内に保存します。記憶をOFFにしても保存済み調整は残り、明示的に解除できます。メタ情報の移行で別のフォルダやPCへ持ち運べます。</p>
         <p>設定・動画や音声の再生位置・選んだ音声トラック・サムネイルキャッシュ（動画・音声の長さ、解像度、形式、読取可否の情報、動画の場面と音声波形の解析結果を含みます）・タグ・★評価・閲覧履歴・コレクションの名前と登録先・別バージョンを探すための索引は、PC に保存されます。リモート閲覧では端末から届いた動画の再生位置と音声トラックの選択も PC に記録されます。
           アンインストール時にまとめて削除できます。</p>
         <p style="margin-top:0.5rem;">EPUB を変換した PDF も通常は PC 内に保存されます。元の EPUB と同じ場所に PDF を書き出すのは、利用者が PDF ファイルへの保存・変換を選んだときだけです。</p>
@@ -1454,8 +1457,8 @@
       単体exe版・インストーラ版の音響調整には EffeTune Mixwright（MIT License、
       Copyright (c) 2025-2026 Yoshiyuki Kobayashi）を同梱しています。
       VST3 対応には Steinberg VST3 SDK（MIT License、Steinberg Media Technologies GmbH）を使用しています。
-      EffeTune の同梱コンポーネント（VST3 SDK、JSZip と内包される lie / immediate / setImmediate / pako (zlib)、CHOC、および通知に記載されたその他のライブラリ）には、それぞれのライセンスが適用されます。
-      通知全文は、アプリの「ソフトウェア情報」（バージョン情報）の EffeTune THIRD-PARTY-NOTICES / DSP NOTICE / 補足通知で確認できます。
+      EffeTune の同梱コンポーネント（VST3 SDK、JSZip と内包される lie / immediate / setImmediate / pako (zlib)、CHOC、Emscripten / musl、および通知に記載されたその他のライブラリ）には、それぞれのライセンスが適用されます。
+      通知全文は、アプリの「ソフトウェア情報」（バージョン情報）の EffeTune THIRD-PARTY-NOTICES / DSP NOTICE で確認できます。
       ポータブル版は EffeTune と VST3 ホストを同梱しません。
     </p>
     <h3 style="margin-top:1.6rem;">サードパーティ ソフトウェア（FFmpeg / LGPL）</h3>

@@ -17,6 +17,7 @@ pub(crate) struct PreparedPageIdentityIndex {
     // Logical paths never need cloning during UI deletion. Original slots remain stable
     // while the small integer projection changes with the same row-removal rule.
     identities: Arc<HashMap<PageIdentity, usize>>,
+    shift_identities: Arc<HashMap<PageIdentity, usize>>,
     current_slots: Vec<Option<usize>>,
     readable_indices: HashSet<usize>,
 }
@@ -45,9 +46,11 @@ impl PreparedPageIdentityIndex {
                 readable_indices.insert(index);
             }
         }
+        let shift_identities = prepare_shift_identities(&identities);
         Self {
             policy,
             identities: Arc::new(identities),
+            shift_identities: Arc::new(shift_identities),
             current_slots: (0..items.len()).map(Some).collect(),
             readable_indices,
         }
@@ -72,6 +75,7 @@ impl PreparedPageIdentityIndex {
         Self {
             policy: self.policy.clone(),
             identities: Arc::clone(&self.identities),
+            shift_identities: Arc::clone(&self.shift_identities),
             current_slots: self
                 .current_slots
                 .iter()
@@ -124,9 +128,11 @@ impl PreparedPageIdentityIndex {
                     .map_or(0, |max| max + 1),
             )
             .max(slots.iter().flatten().max().map_or(0, |max| max + 1));
+        let shift_identities = prepare_shift_identities(&identities);
         Self {
             policy: self.policy.clone(),
             identities: Arc::new(identities),
+            shift_identities: Arc::new(shift_identities),
             current_slots: (0..len).map(Some).collect(),
             readable_indices,
         }
@@ -149,6 +155,50 @@ impl PreparedPageIdentityIndex {
         } else {
             PositionResolution::InvalidRaw
         }
+    }
+
+    /// Shift lookup shares the accepted row slots, with its own specified slash/case rule.
+    /// It never invokes the legacy resume raw-index fallback.
+    pub(crate) fn resolve_shift_identity(&self, identity: &PageIdentity) -> Option<usize> {
+        self.shift_identities
+            .get(&shift_identity_key(identity))
+            .and_then(|slot| self.current_slots.get(*slot).copied().flatten())
+    }
+}
+
+/// D1 admits the first row in accepted order for a slash/case collision. These
+/// inputs are HashMaps, so choose that row explicitly rather than their iteration order.
+fn prepare_shift_identities(
+    identities: &HashMap<PageIdentity, usize>,
+) -> HashMap<PageIdentity, usize> {
+    let mut result = HashMap::new();
+    for (identity, index) in identities {
+        result
+            .entry(shift_identity_key(identity))
+            .and_modify(|first: &mut usize| *first = (*first).min(*index))
+            .or_insert(*index);
+    }
+    result
+}
+
+fn shift_identity_key(identity: &PageIdentity) -> PageIdentity {
+    let path = |value: &str| value.replace('\\', "/").to_lowercase();
+    match identity {
+        PageIdentity::Image { path: value } => PageIdentity::Image { path: path(value) },
+        PageIdentity::Archive {
+            container,
+            entry_name,
+        } => PageIdentity::Archive {
+            container: path(container),
+            entry_name: path(entry_name),
+        },
+        PageIdentity::Document {
+            container,
+            page_num,
+        } => PageIdentity::Document {
+            container: path(container),
+            page_num: *page_num,
+        },
     }
 }
 
@@ -235,6 +285,43 @@ mod remap_tests {
             identity: PageIdentity::for_item(item, None),
         }
     }
+    #[test]
+    fn shift_case_collisions_choose_first_accepted_row_in_both_preparation_paths() {
+        for archive in [false, true] {
+            let item = |name: &str| {
+                if archive {
+                    GridItem::ZipImage {
+                        zip_path: "book.zip".into(),
+                        entry_name: name.into(),
+                    }
+                } else {
+                    GridItem::Image(name.into())
+                }
+            };
+            let rows = [item("A.jpg"), item("a.jpg")];
+            let lookup = PageIdentity::for_item(&rows[1], None).unwrap();
+            // Repeat to exercise independently seeded maps; either spelling must use
+            // the deterministic row-order choice without altering resume matching.
+            for _ in 0..32 {
+                let prepared = PreparedPageIdentityIndex::prepare(&rows, None, Default::default());
+                assert_eq!(prepared.resolve_shift_identity(&lookup), Some(0));
+                assert_eq!(
+                    prepared.resolve(&position(&rows[1])),
+                    PositionResolution::Restored(usize::from(archive))
+                );
+                let first =
+                    PreparedPageIdentityIndex::prepare(&rows[..1], None, Default::default());
+                let second =
+                    PreparedPageIdentityIndex::prepare(&rows[1..], None, Default::default());
+                let merged = first.with_mapped_additions(&second, &[Some(1)]);
+                assert_eq!(merged.resolve_shift_identity(&lookup), Some(0));
+                // The first row is the smallest final slot, even if it comes from additions.
+                let reversed = second.with_mapped_additions(&first, &[Some(1)]);
+                assert_eq!(reversed.resolve_shift_identity(&lookup), Some(0));
+            }
+        }
+    }
+
     #[test]
     fn visibility_deletion_remaps_repeated_current_slots_and_preserves_saved_arc() {
         let rows = ["a.jpg", "b.jpg", "c.jpg", "d.jpg"].map(|p| GridItem::Image(p.into()));

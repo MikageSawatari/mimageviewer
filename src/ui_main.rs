@@ -307,10 +307,10 @@ fn normalize_folder_bar_input_path(path: &Path) -> PathBuf {
     if trimmed.len() == 2 {
         let bytes = trimmed.as_bytes();
         if bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-            return PathBuf::from(format!("{}\\", trimmed));
+            return crate::path_key::normalize_input_path(Path::new(&format!("{}\\", trimmed)));
         }
     }
-    path.to_path_buf()
+    crate::path_key::normalize_input_path(path)
 }
 
 fn checked_selection_overlay_label(checked_count: usize) -> Option<String> {
@@ -21598,7 +21598,7 @@ mod rating_filter_op_tests {
         );
         assert_eq!(
             normalize_folder_bar_input_path(Path::new(" d: ")),
-            PathBuf::from(r"d:\")
+            PathBuf::from(if cfg!(windows) { r"D:\" } else { r"d:\" })
         );
     }
 
@@ -21611,6 +21611,16 @@ mod rating_filter_op_tests {
         assert_eq!(
             normalize_folder_bar_input_path(Path::new(r"D:books")),
             PathBuf::from(r"D:books")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn folder_bar_mixed_path_input_uses_standard_spelling() {
+        assert_eq!(
+            normalize_folder_bar_input_path(Path::new(r"g:/home/comfyui\genshin_random"))
+                .as_os_str(),
+            std::ffi::OsStr::new(r"G:\home\comfyui\genshin_random")
         );
     }
 

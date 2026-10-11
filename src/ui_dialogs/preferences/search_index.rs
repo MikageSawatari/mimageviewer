@@ -59,6 +59,21 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["文字色", "見やすさ", "contrast"]
     ),
     entry!(
+        "general/restore-position",
+        General,
+        "環境設定を開き直したときに前回の位置を復元する",
+        [
+            "再表示",
+            "記憶",
+            "スクロール",
+            "ページ",
+            "選択",
+            "折りたたみ",
+            "絞り込み",
+            "restore"
+        ]
+    ),
+    entry!(
         "general/ai-processing",
         General,
         "表示時の AI 処理 (アップスケール / ノイズ除去)",
@@ -784,6 +799,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         SpreadMode,
         "PDF / EPUB の右開き指定に従う",
         ["PDF", "EPUB", "右開き", "綴じ方向"]
+    ),
+    entry!(
+        "spread/remember-adjustment",
+        SpreadMode,
+        "見開きの調整を本ごとに記憶する",
+        ["見開き", "1ページずらし", "Ctrl", "保存", "復元", "記憶"]
     ),
     entry!(
         "spread/final-cover",

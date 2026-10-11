@@ -134,6 +134,7 @@ function Invoke-ReleaseSession {
     Write-ReleaseCheckJson (Join-Path $dir 'settings-override.json') $sessionOverlay
     $arguments=@('--data-dir',$data,'--perf-log','--test-script',$scriptPath,'--test-evidence-dir',$dir,'--settings-override',(Join-Path $dir 'settings-override.json'),'--window-size','1328x900')
     $script:owned=Start-Process -FilePath $exe -ArgumentList (Join-NativeArguments $arguments) -WorkingDirectory $smoke -PassThru
+    $null=$script:owned.Handle  # cache the handle so ExitCode is available after exit
     $script:ownedStart=$script:owned.StartTime.ToUniversalTime()
     Write-ReleaseCheckJson (Join-Path $dir 'process.json') @{pid=$script:owned.Id;start_time_utc=$script:ownedStart.ToString('o');exe=$exe;data_dir=$data}
     $timer=[Diagnostics.Stopwatch]::StartNew(); $focusTimer=[Diagnostics.Stopwatch]::StartNew(); $ready=Join-Path $dir 'ready.json';$focusAcquired=$false
@@ -170,6 +171,7 @@ function Invoke-ReleaseSession {
             # Separate host preserves the suite even when the sampler exits.
             $hostExe=[Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
             $sampler=Start-Process -FilePath $hostExe -ArgumentList (Join-NativeArguments $samplerArgs) -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $dir 'sampler.stdout.log') -RedirectStandardError (Join-Path $dir 'sampler.stderr.log')
+            $null=$sampler.Handle  # cache the handle so ExitCode is available after exit
             while(-not $sampler.HasExited){
                 if($script:background){[Windows.Forms.Application]::DoEvents()}
                 if($timer.Elapsed.TotalSeconds -gt $TimeoutSeconds){Stop-Process -Id $sampler.Id -Force;throw 'Sampler deadline exceeded.'}
@@ -191,6 +193,7 @@ try {
     $prepare=@('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(Join-Path $scripts 'prepare-portable-smoke.ps1'),'-TestScript')
     if($SkipBuild){$prepare+='-SkipBuild'}
     $prepareProcess=Start-Process -FilePath ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) -ArgumentList (Join-NativeArguments $prepare) -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $run 'prepare.stdout.log') -RedirectStandardError (Join-Path $run 'prepare.stderr.log')
+    $null=$prepareProcess.Handle  # cache the handle so ExitCode is available after exit
     $prepareProcess.WaitForExit()
     if($prepareProcess.ExitCode -ne 0){throw 'Portable preparation failed.'}
     Assert-ReleaseCheckArtifact $repo

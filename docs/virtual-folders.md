@@ -26,7 +26,39 @@ store・ライフサイクル・転送の接続はG2 part B以降。
 一緒に保持し、固定解除の同じadoption内で復元する。BSで固定列へ戻る場合はA2のまま。
 検索のback/BS・履歴の本への復帰は既存Book設定adoption、F12はcontext内snapshot/bundle、
 Remoteは本の通常responseから復元し、A2のSingle/一時Spreadを本へ保存しない。
+§1.364統合後は、固定一覧の元列と一緒にshift ownerのscope・identity・保存状態を退避する。
+保存完了・記憶policy・ページ改名は同contextの退避ownerにも届け、一覧のmode変更で元本をClearしない。
+F12の複製はaccepted sessionだけを受け取り、保存要求・復元receiverを共有しない。
 
+## 本別見開き調整のscope/転送とRemote（§1.364 D1–D3、未リリース）
+
+永続scopeは`book_scope::BookScopeKey`。元書庫/PDF/EPUBの論理rootをKeepDrive正規化し、
+ZIPはcollapse後に受け入れたraw実効prefixをconstructorへ渡す。root/親章へのfallbackはしない。
+基点は画像本の相対path、書庫のouterからの完全entry chain、文書の物理page identityで、
+cache ZIP/PDF pathやHUD ordinal/raw items indexを保存しない。Missing/種類除外でも行を保持する。
+PageRefの保存表記は変更せず、identity索引への照合で`book_scope::normalize_relative_reference`の
+case/slash keyを使う。ページ改名の元表記やimportのbackslash表記も同じidentityへ解く。
+
+明示metadata v10は`spread_shift_family { coverage, scopes }`をlogical entryに所有させる。
+元RARのshiftとcache ZIPの既存spread/trimは独立originのまま共存する。
+画像本はfolder entryがownerで子Imageには載せない。旧v7/v8/v9の字段不在は保存値を保持し、
+新coverage内の未記載scopeは空familyと同様に解除、coverage外は保持する。
+familyのdelete/insertは既存item SAVEPOINTとbatch commitに参加する。
+外部folder移動は従来どおり内容ID非対応で、明示metadata転送を使う。
+書庫/PDF/EPUBは内容IDcopy/probeのlogical slash-familyでnested-onlyの調整も搬送する。
+D1のstore基盤にD2のRestore/一覧再解決/F12/HUD、D3のRemote保存基点解決を接続する。
+Remoteのlogical scopeは元書庫とcollapse後の実効prefixを使う。
+現行Remoteのbase spreadも元書庫のlogical keyを保持する。PCのphysical cache側baseとは異なり、
+この既存境界はD3で変更・移行しない。
+App serviceのread handleで先行保存完了を満たしたrefを読み、full本のidentity/navへ解いてから
+応答budgetで切り詰める。応答外のanchorをMissingとみなさず、共通Automatic builderへ渡す。
+完全応答では同じrulesと列のPC unitに一致する。bounded応答は既存group生成・cap・ページアクセスを保ち、
+shiftなしのmasterにもある切詰め境界差を変更しない。省略ページの全寸法走査や境界group削除は追加しない。
+master証明とD3検証記録は設計§11.10および`target/D-1364-d3-msg.txt`を参照する。
+OFFのopenとforceSingle/orientationの投影は保存行を変えない。G3構成consumerの統合は別工程。
+2026-10-11のD2c決定では、root改名の永続移行だけを維持し、開いているcontextの論理/物理参照元・
+items・shift scopeは旧rootを保つ。新rootへのlive追従・自動reopen・同本pending-open直列化は行わない。
+ページ改名の相対参照移行は維持する。最新契約は[spread-shift-memory-plan.md §11.6](spread-shift-memory-plan.md#116-d2c-root追従と同本pending-open直列化の撤去2026-10-11利用者決定)。
 
 
 ## 本への再入場とfacetの帰路（§1.339）
@@ -146,6 +178,33 @@ placeholder は採用後も同じ enumerate handle で検証する。取消・�
 ---
 
 ## 1. GridItem バリアント
+
+### 実パスの比較と入力表記 (§1.366)
+
+`folder_tree::path_eq` は既存の `path_key::eq_keep_drive` を再公開し、ドライブを保持した
+小文字化・`\` → `/` の規則で比較する。DFS が親の `read_dir` 結果から現在位置を探す際も、
+入力の `g:/home/comfyui/genshin_random\child` と列挙結果の区切り差で探索を終わらせない。
+ZIP/PDF 本体も同じ比較を使う。ZIP 内 entry/prefix の identity にはこの実パス helper を使わない。
+
+入力表記は `path_key::normalize_input_path` で、Windows では `/` → `\` とドライブ文字の
+大文字化だけを行う。ファイル名の大小文字、相対パス、`.` / `..`、junction/symlink の論理経路、
+verbatim/device namespace の表記を維持し、I/O や保存キーの変更は行わない。
+アドレスバー、フォルダを開くダイアログ、起動引数／既存インスタンス転送、D&D、
+お気に入りの新規登録と通常 open、物理履歴／A・B の復帰要求で適用する。
+既存のお気に入り／履歴／復元設定を一括書換えせず、open 要求として受け取ったコピーを揃える。
+メニュー／ツールバー／ゲームパッドのお気に入り要求は `open_direct_navigation_target` の
+受理時にコピーを揃える。即時ロードと EPUB・変換書庫 (`.7z` 等) の分類 worker の両方より前に適用し、
+`_owned` ロード入口を迂回する通常入力でも現在地とアドレス表示へ混在表記を持ち込まない。
+お気に入りの回帰テストは、通常名／`.zip`／`.pdf` の実フォルダで即時ロードを確認する。
+`.epub`／`.7z` の実フォルダでは `path_needs_open_classification` が true であること、
+正規化済みパスを持つ分類要求の生成と worker 完了後のフォルダ採用を確認する。
+対象は拡張子付き実フォルダの入力受理・Directory 分類・採用。
+
+Remote の実パスは既存の検証・canonicalize owner で解決し、通常の logical path を標準表記にする。
+変換書庫の公開 source address は既存の完全一致対応表の identity として維持し、
+canonical source/backing と区別する。動画進捗の直接入力も受理時に表記を揃える。
+DB キー、catalog の保存先 hash、元書庫と cache ZIP の identity、ZIP entry/prefix は変更しない。
+一覧で移動先がない場合の新しい境界トーストは追加しない。
 
 `grid_item.rs` の `GridItem` 列挙型は以下の 12 バリアント:
 

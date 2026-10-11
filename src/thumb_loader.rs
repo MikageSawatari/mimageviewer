@@ -933,20 +933,45 @@ pub(crate) fn decode_raw_thumbnail_on_worker(
     decode_raw_thumbnail_on_cancellable_worker(source, display_px, executor, None)
 }
 
-fn decode_raw_thumbnail_on_cancellable_worker(
+pub(crate) fn decode_raw_thumbnail_on_cancellable_worker(
     source: crate::raw::RawOwnedSource,
     display_px: u32,
     executor: &crate::raw::RawDevelopExecutor,
     cancel: Option<&Arc<AtomicBool>>,
 ) -> Result<RawThumbnailRaster, crate::raw::RawError> {
+    decode_raw_thumbnail_worker_inner(source, display_px, executor, cancel, None)
+}
+
+pub(crate) fn decode_raw_thumbnail_on_bounded_worker(
+    source: crate::raw::RawOwnedSource,
+    display_px: u32,
+    executor: &crate::raw::RawDevelopExecutor,
+    cancel: &Arc<AtomicBool>,
+    max_alloc: u64,
+) -> Result<RawThumbnailRaster, crate::raw::RawError> {
+    decode_raw_thumbnail_worker_inner(source, display_px, executor, Some(cancel), Some(max_alloc))
+}
+fn decode_raw_thumbnail_worker_inner(
+    source: crate::raw::RawOwnedSource,
+    display_px: u32,
+    executor: &crate::raw::RawDevelopExecutor,
+    cancel: Option<&Arc<AtomicBool>>,
+    max_alloc: Option<u64>,
+) -> Result<RawThumbnailRaster, crate::raw::RawError> {
     let cancelled = || cancel.is_some_and(|flag| flag.load(Ordering::Acquire));
     if cancelled() {
         return Err(crate::raw::RawError::Cancelled);
     }
-    let info = crate::raw::raw_decoder::info(source.as_source())?;
+    let info = match max_alloc {
+        Some(budget) => crate::raw::raw_decoder::info_bounded(source.as_source(), budget),
+        None => crate::raw::raw_decoder::info(source.as_source()),
+    }?;
     let dims = (info.developed_dims[0], info.developed_dims[1]);
     let threshold = display_px.min(dims.0.max(dims.1));
-    match crate::raw::raw_decoder::preview(source.as_source()) {
+    match match max_alloc {
+        Some(budget) => crate::raw::raw_decoder::preview_bounded(source.as_source(), budget),
+        None => crate::raw::raw_decoder::preview(source.as_source()),
+    } {
         Ok(preview) if preview.image.width().max(preview.image.height()) >= threshold => {
             return Ok(RawThumbnailRaster {
                 image: preview.image,
@@ -954,18 +979,30 @@ fn decode_raw_thumbnail_on_cancellable_worker(
             });
         }
         Ok(_) | Err(crate::raw::RawError::NoUsablePreview(_)) => {}
+        Err(crate::raw::RawError::TooLarge) if max_alloc.is_some() => {}
         Err(error) => return Err(error),
     }
     if let crate::raw::RawDevelopSupport::Unsupported(reason) = info.develop_support {
         return Err(crate::raw::RawError::Unsupported(reason));
     }
     let (tx, rx) = mpsc::channel();
-    let ticket = executor.submit_thumbnail_half_with_cancel_flag(
-        source,
-        crate::raw::RawPriority::Background,
-        tx,
-        cancel.cloned(),
-    );
+    let ticket = if let (Some(budget), Some(cancel)) = (max_alloc, cancel) {
+        crate::raw::raw_decoder::bounded_thumbnail_raster(info.developed_dims, budget)?;
+        executor.submit_thumbnail_half_bounded(
+            source,
+            crate::raw::RawPriority::Background,
+            tx,
+            Arc::clone(cancel),
+            budget,
+        )
+    } else {
+        executor.submit_thumbnail_half_with_cancel_flag(
+            source,
+            crate::raw::RawPriority::Background,
+            tx,
+            cancel.cloned(),
+        )
+    };
     let output = if cancel.is_some() {
         // A flag alone does not remove a queued executor job. Retire our ticket
         // without waiting for Background admission, or joining running native work.

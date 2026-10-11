@@ -573,7 +573,12 @@ mod recursive_snapshot_scan;
 mod runtime_ops;
 mod saved_group_actions;
 mod sidecar_restore;
+mod spread_shift_live_mappings;
+pub(crate) mod spread_shift_owner;
+#[cfg(test)]
+mod spread_shift_owner_tests;
 pub(crate) use sidecar_restore::SidecarRestorePresentation;
+use spread_shift_owner::ViewerSpreadShift;
 pub(crate) mod collection_grid;
 pub(crate) mod collection_navigation;
 pub(crate) mod raw_page_store;
@@ -14820,6 +14825,7 @@ pub(crate) enum FsOverflowPanelState {
     Closed,
     Root,
     NavigatorPosition,
+    SpreadAdjustment,
 }
 
 impl FsOverflowPanelState {
@@ -15301,6 +15307,10 @@ pub struct App {
     /// 編集・表示状態・★・タグの commit 後に、対象の物理ファイルを ledger worker へ渡す。
     /// この handle 自体は I/O を行わず、全ファイル読み出しは worker 側に閉じる。
     pub(crate) content_identity_recorder: Option<crate::content_identity::ContentIdentityRecorder>,
+    pub(crate) spread_shift_settings_generation: u64,
+    pub(crate) spread_shift_service: Option<crate::spread_shift::SpreadShiftService>,
+    spread_shift_process_owner:
+        Option<Arc<std::sync::Mutex<Option<crate::spread_shift::SpreadShiftProcessOwner>>>>,
     pub(crate) content_identity_index_load_pending:
         Option<crate::content_identity::ContentIdentityIndexLoadPending>,
     pub(crate) content_identity_index: crate::content_identity::ContentIdentityIndex,
@@ -15606,8 +15616,8 @@ pub struct App {
     // ── 統合環境設定ダイアログ ─────────────────────────────────────
     pub(crate) show_preferences: bool,
     pub(crate) diagnostics_export: crate::diagnostics::ExportOwner,
-    /// 前フレームの環境設定可視フラグ。false -> true の open edge だけを検出する。
-    pub(crate) preferences_open_last_frame: bool,
+    /// 編集の保存・破棄とは独立した、プロセス内だけの環境設定表示位置。
+    pub(crate) preferences_view_position: crate::ui_dialogs::preferences::PreferencesViewPosition,
     /// 右ペイン ScrollArea の id に使う、ダイアログを閉じても保持する単調増加値。
     pub(crate) preferences_right_panel_scroll_sequence: u64,
     /// 一覧内の導線などから、環境設定を特定ページで開く one-shot request。
@@ -16553,9 +16563,9 @@ pub struct App {
     pub(crate) singleton_spread_endpoint_preferences:
         crate::settings::SingletonSpreadEndpointPreferences,
     pub(crate) page_alone_preferences: crate::settings::PageAlonePreferences,
-    /// Ctrl+←/→ の「1 ページずらし」用セッション内アンカー。
-    /// 保存はせず、この idx から先だけ見開きの組み始めを一時的にずらす。
-    pub(crate) spread_shift_anchor_idx: Option<usize>,
+    /// この viewer の見開き調整と、保存・復元に対する受付済み依存。
+    /// 描画用 index は identity/nav 投影から取得し、durable rows は共有 service が所有する。
+    pub(crate) spread_shift: ViewerSpreadShift,
     /// 現在の連結方式（ページ単位 / 縦連結 / 横連結）。
     pub(crate) reading_flow: crate::settings::ReadingFlow,
     /// 横連結時の読書方向。
@@ -18476,6 +18486,7 @@ pub struct App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        self.transfer_spread_shift_exit_ownership();
         self.diagnostics_export.retire();
         self.retire_pending_startup_result();
         crate::thumb_loader::cancel_raw_thumb_tickets(&self.raw_thumb_develop);
@@ -18493,6 +18504,103 @@ impl Default for App {
     /// 走らない** (= boot race の元にならない)。
     fn default() -> Self {
         Self::new_from_settings(crate::settings::Settings::load())
+    }
+}
+
+impl App {
+    pub(crate) fn install_spread_shift_runtime(
+        &mut self,
+        service: crate::spread_shift::SpreadShiftService,
+        owner: Arc<std::sync::Mutex<Option<crate::spread_shift::SpreadShiftProcessOwner>>>,
+    ) {
+        if let Some(handle) = self.remote_session_handle() {
+            handle.install_spread_shift_service(Some(service.clone()));
+        }
+        self.spread_shift_service = Some(service);
+        self.spread_shift_process_owner = Some(owner);
+    }
+
+    fn poll_spread_shift_service(&mut self) {
+        let Some(service) = &self.spread_shift_service else {
+            return;
+        };
+        let results = service.drain_results();
+        let clear_results = service.drain_clear_results();
+        let errors = service.drain_errors();
+        let _changed_scopes = service.drain_changed_scope_keys();
+        for result in results {
+            if self.complete_remote_shift_reset(&result) {
+                continue;
+            }
+            let accepted = if result.operation.context_id == self.spread_shift_context_id() {
+                self.spread_shift
+                    .accept_write_reply(&result, self.settings.remember_spread_shift_per_book)
+                    .or_else(|| {
+                        self.snapshot
+                            .as_mut()?
+                            .saved_viewing_state
+                            .shift
+                            .accept_write_reply(
+                                &result,
+                                self.settings.remember_spread_shift_per_book,
+                            )
+                    })
+            } else {
+                #[cfg(windows)]
+                {
+                    self.deliver_spread_shift_reply_at_rest(&result)
+                }
+                #[cfg(not(windows))]
+                {
+                    None
+                }
+            };
+            // Save completion never moves a page, rebuilds units, or updates a sibling's live shift.
+            if let Err(error) = &result.status {
+                self.show_feedback_toast(format!("見開き調整を保存できませんでした: {error}"));
+            } else if let Some(clear) = accepted {
+                self.show_feedback_toast(
+                    if clear {
+                        "見開き調整を解除しました"
+                    } else {
+                        "見開き調整を保存しました"
+                    }
+                    .into(),
+                );
+            } else if matches!(
+                self.viewer_context_residence(result.operation.context_id),
+                viewer_context_registry::ContextResidence::Retired
+            ) {
+                self.show_feedback_toast(
+                    match result.kind {
+                        crate::spread_shift::ShiftWriteKind::Set => "見開き調整を保存しました",
+                        crate::spread_shift::ShiftWriteKind::Clear => "見開き調整を解除しました",
+                    }
+                    .into(),
+                );
+            }
+        }
+        for error in errors {
+            self.show_feedback_toast(format!(
+                "見開き調整の保存データを処理できませんでした: {error}"
+            ));
+        }
+        for result in clear_results {
+            if let Err(error) = result.status {
+                self.show_feedback_toast(format!("見開き調整を削除できませんでした: {error}"));
+            }
+        }
+    }
+
+    fn transfer_spread_shift_exit_ownership(&mut self) {
+        if let Some(service) = &self.spread_shift_service {
+            service.close_admission();
+        }
+        if let Some(owner) = &self.spread_shift_process_owner
+            && let Some(owner) = owner.lock().unwrap().as_mut()
+        {
+            owner.retain_recorder_for_exit(self.content_identity_recorder.take());
+        }
     }
 }
 
@@ -19440,6 +19548,9 @@ impl App {
             view_trim_save_pending: false,
             view_trim_db,
             content_identity_recorder,
+            spread_shift_settings_generation: 0,
+            spread_shift_service: None,
+            spread_shift_process_owner: None,
             content_identity_index_load_pending,
             content_identity_index: crate::content_identity::ContentIdentityIndex::default(),
             content_identity_ledger_state,
@@ -19553,7 +19664,7 @@ impl App {
             rename_migration_data_dir_override: None,
             show_preferences: false,
             diagnostics_export: crate::diagnostics::ExportOwner::Idle,
-            preferences_open_last_frame: false,
+            preferences_view_position: Default::default(),
             preferences_right_panel_scroll_sequence: 0,
             preferences_requested_page: None,
             show_preferences_discard_confirm: false,
@@ -19911,7 +20022,7 @@ impl App {
             singleton_spread_endpoint_preferences:
                 crate::settings::SingletonSpreadEndpointPreferences::default(),
             page_alone_preferences: crate::settings::PageAlonePreferences::default(),
-            spread_shift_anchor_idx: None,
+            spread_shift: Default::default(),
             reading_flow: crate::settings::ReadingFlow::default(),
             reading_direction: crate::settings::ReadingDirection::default(),
             spread_popup_open: false,
@@ -24477,6 +24588,7 @@ impl App {
         restore_intent: StartupListIntent,
         navigation: MainListNavigation,
     ) -> bool {
+        let path = crate::path_key::normalize_input_path(&path);
         if Self::path_needs_open_classification(&path) {
             return matches!(
                 self.start_open_path_classification_with_navigation(
@@ -25354,6 +25466,7 @@ impl App {
             current_rating_key: None,
             spread_container_path: None,
             spread_container_fallback: None,
+            shift_read: None,
             // The producer has already removed an unpinned key from the mounted map. Include
             // the visible container keys so removal also invalidates its previous materialization.
             old_folder_pin_keys: paths
@@ -25919,7 +26032,7 @@ impl App {
         } else {
             self.spread_mode = stored_spread;
         }
-        self.spread_shift_anchor_idx = None;
+        // Base-rule hydration preserves the accepted shift owner; open adoption resolves it.
         Ok(())
     }
 
@@ -26919,6 +27032,9 @@ impl App {
 
         restore_intent: crate::app::StartupListIntent,
     ) {
+        // Favorites and other direct inputs bypass the _owned load admissions below.
+        // Normalize the accepted copy before classification; keep saved records intact.
+        let path = crate::path_key::normalize_input_path(&path);
         if Self::path_needs_open_classification(&path) {
             let continuation = ClassifiedOpenContinuation::DirectNavigation {
                 restore_intent: restore_intent.clone(),
@@ -27123,6 +27239,7 @@ impl App {
 
         restore_intent: crate::app::StartupListIntent,
     ) -> FolderOpenOutcome {
+        let path = crate::path_key::normalize_input_path(&path);
         if restore_intent.captures_list_departure() {
             self.capture_main_list_restore_cursor();
         }
@@ -27503,6 +27620,7 @@ impl App {
 
         restore_intent: crate::app::StartupListIntent,
     ) -> FolderOpenOutcome {
+        let path = crate::path_key::normalize_input_path(&path);
         if restore_intent.captures_list_departure() {
             self.capture_main_list_restore_cursor();
         }
@@ -29424,9 +29542,141 @@ impl App {
         }
     }
 
+    /// Snapshot the owning context's source proof without touching disk or GPU images.
+    #[cfg(windows)]
+    pub(crate) fn now_playing_input_for_player(
+        &self,
+        player: &crate::video::VideoPlayer,
+        sidecar: Option<PathBuf>,
+    ) -> crate::effetune::NowPlayingInput {
+        use crate::effetune::NowPlayingArtworkSource;
+        let settings = Arc::new(self.settings.thumbnail_source_discovery_snapshot());
+        let raw_executor = Arc::clone(&self.raw_develop_executor);
+        let io_semaphore = Arc::clone(&self.content_identity_fallback_io_sem);
+        let audio = player
+            .path()
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| {
+                crate::folder_tree::SUPPORTED_AUDIO_EXTENSIONS
+                    .contains(&ext.to_ascii_lowercase().as_str())
+            });
+        let artwork = if audio {
+            NowPlayingArtworkSource::Audio {
+                sidecar,
+                settings,
+                raw_executor,
+                io_semaphore,
+            }
+        } else {
+            NowPlayingArtworkSource::Video {
+                pinned_webp: None,
+                sidecar,
+                settings,
+                raw_executor,
+                io_semaphore,
+            }
+        };
+        let info = player.info();
+        let clone_prefix =
+            |text: &str| crate::effetune::now_playing::bounded_text_prefix(text).to_owned();
+        crate::effetune::NowPlayingInput {
+            path: player.path().clone(),
+            title: info
+                .and_then(|info| info.title.as_deref())
+                .map(clone_prefix),
+            album: info
+                .and_then(|info| info.album.as_deref())
+                .map(clone_prefix),
+            artist: info
+                .and_then(|info| info.artist.as_deref())
+                .map(clone_prefix),
+            artwork,
+        }
+    }
+
+    /// Only the current Local owner is inspected; focus and context mounting cannot adopt it.
+    #[cfg(windows)]
+    fn reconcile_local_now_playing(&mut self) {
+        let Some(owner @ crate::effetune::NowPlayingOwner::Local(identity)) =
+            self.effetune.now_playing_owner()
+        else {
+            return;
+        };
+        let live = self.viewer_context_ids().into_iter().any(|id| {
+            self.with_viewer_context_ref(id, |context| {
+                context.fullscreen_idx().and_then(|idx| context.fs_cache().get(&idx))
+                    .is_some_and(|entry| matches!(entry, FsCacheEntry::Video { player, .. }
+                        if player.media_identity() == identity && !player.local_now_playing_finished()))
+            }).unwrap_or(false)
+        });
+        if !live {
+            self.effetune.clear_now_playing(owner);
+        }
+    }
+
+    /// Called after this mounted player's tick and native input/close processing.
+    #[cfg(windows)]
+    fn publish_mounted_local_now_playing(
+        &mut self,
+        successes: &[(usize, u64, crate::video::PlaybackSuccess)],
+    ) {
+        let Some(idx) = self.fullscreen_idx else {
+            return;
+        };
+        let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) else {
+            return;
+        };
+        if !matches!(self.items.get(idx), Some(GridItem::Video(path) | GridItem::Audio(path)) if path == player.path())
+        {
+            return;
+        }
+        let owner = crate::effetune::NowPlayingOwner::Local(player.media_identity());
+        if player.local_now_playing_finished() {
+            self.effetune.clear_now_playing(owner);
+            return;
+        }
+        // Actual Playing is historical proof for metadata. A same-tick Pause may revoke
+        // the GUI auto-open permit below, but still keeps this adopted track's metadata.
+        let adopted_start = successes.iter().any(|(success_idx, identity, success)| {
+            *success_idx == idx
+                && *identity == player.media_identity()
+                && success.viewer_context == Some(self.projected_viewer_context_id().serial())
+        });
+        if !adopted_start && self.effetune.now_playing_owner() != Some(owner) {
+            return;
+        }
+        let Some(info) = player.info() else {
+            return;
+        };
+        let sidecar = self
+            .video_thumb_overrides
+            .get(&crate::path_key::normalize_keep_drive(player.path()));
+        if self.effetune.now_playing_metadata_matches(
+            owner,
+            player.path(),
+            info.title.as_deref(),
+            info.album.as_deref(),
+            info.artist.as_deref(),
+        ) && self.effetune.now_playing_artwork_source_matches(
+            owner,
+            sidecar.map(PathBuf::as_path),
+            &self.settings,
+        ) {
+            return;
+        }
+        let input = self.now_playing_input_for_player(player, sidecar.cloned());
+        self.effetune.publish_now_playing(owner, input);
+    }
+
     #[cfg(windows)]
     pub(crate) fn poll_effetune(&mut self, ctx: &egui::Context) {
+        self.reconcile_local_now_playing();
         self.effetune.set_repaint_context(ctx);
+        let was_failed = matches!(
+            self.effetune.runtime,
+            crate::effetune::EffetuneRuntime::Failed(_)
+        );
         let startup_pending = self.effetune.startup_pending();
         let open_gui_when_ready = match self.effetune.runtime {
             crate::effetune::EffetuneRuntime::Loading {
@@ -29465,6 +29715,24 @@ impl App {
                     .fail(crate::effetune::EffetuneFailure::ProcessFailed(
                         "unexpected editor bypass event".into(),
                     ));
+            }
+        }
+        if !was_failed
+            && matches!(
+                self.effetune.runtime,
+                crate::effetune::EffetuneRuntime::Failed(_)
+            )
+        {
+            self.show_feedback_toast(
+                "音響調整を停止しました。音声はそのまま再生を続けます。".to_owned(),
+            );
+        }
+        if let Some(warning) = self.effetune.take_now_playing_warning() {
+            if !matches!(
+                self.effetune.runtime,
+                crate::effetune::EffetuneRuntime::Failed(_)
+            ) {
+                self.show_feedback_toast(warning);
             }
         }
     }
@@ -31867,6 +32135,7 @@ impl App {
 
         restore_intent: crate::app::StartupListIntent,
     ) -> bool {
+        let path = crate::path_key::normalize_input_path(&path);
         let restore_intent = if matches!(intent, PhysicalHistoryIntent::RequiredFullscreen { .. })
             || dfs_continuation
                 .as_ref()
@@ -41965,6 +42234,23 @@ impl App {
             return;
         }
         let dirty = std::mem::take(&mut self.video_thumb_overrides_dirty_paths);
+        #[cfg(windows)]
+        if let Some(FsCacheEntry::Video { player, .. }) =
+            self.fullscreen_idx.and_then(|idx| self.fs_cache.get(&idx))
+            && dirty.contains(player.path())
+            && self.effetune.now_playing_owner()
+                == Some(crate::effetune::NowPlayingOwner::Local(
+                    player.media_identity(),
+                ))
+        {
+            let owner = crate::effetune::NowPlayingOwner::Local(player.media_identity());
+            let sidecar = self
+                .video_thumb_overrides
+                .get(&crate::path_key::normalize_keep_drive(player.path()))
+                .cloned();
+            let input = self.now_playing_input_for_player(player, sidecar);
+            self.effetune.refresh_now_playing(owner, input);
+        }
         if !self.video_pin_dirty_visible_in_items(&dirty) {
             return;
         }
@@ -43128,6 +43414,7 @@ impl App {
             self.page_identity_index
                 .without_removed_indices(&sorted_asc),
         );
+        self.spread_shift.remap(&sorted_asc);
         let previous_index = std::mem::replace(&mut self.page_identity_index, remapped_index);
         self.retire_smart_folder_payloads([
             Box::new(previous_index) as smart_folder::RetiredSmartFolderPayload
@@ -44076,11 +44363,16 @@ impl App {
     pub(crate) fn take_metadata_import_refresh_requests(
         &mut self,
         changed: crate::metadata_transfer::ImportChangedSections,
+        committed: &crate::metadata_transfer::ImportCommittedChanges,
     ) -> Vec<metadata_import_refresh::ContextRequest> {
         fn take_current(
             index: &mut Option<MetadataImportRefreshIndex>,
             context_id: ViewerContextId,
             spread_container_key: Option<crate::spread_db::SpreadContainerKey>,
+            shift_read: Option<(
+                crate::book_scope::BookScopeKey,
+                std::sync::mpsc::Receiver<crate::spread_shift::ShiftReadReply>,
+            )>,
             old_folder_pin_keys: std::collections::HashSet<String>,
         ) -> Option<metadata_import_refresh::ContextRequest> {
             let index = index.take()?;
@@ -44095,6 +44387,7 @@ impl App {
                 current_rating_key: index.current_rating_key,
                 spread_container_path,
                 spread_container_fallback,
+                shift_read,
                 old_folder_pin_keys,
                 folder_pin_paths: index.folder_pin_paths,
                 folder_pin_aliases: index.folder_pin_aliases,
@@ -44111,10 +44404,15 @@ impl App {
                 if let Err(error) = self.with_viewer_context(context_id, |app| {
                     let spread_key = app.spread_container_key_with_fallback();
                     let old_folder_pin_keys = app.folder_pin_map.keys().cloned().collect();
+                    let shift_changed = app.spread_shift.scope.as_ref().is_some_and(|scope| {
+                        committed.spread_shift_scopes.contains(&scope.storage_key())
+                    });
+                    let shift_read = app.admit_imported_shift_read(shift_changed);
                     if let Some(request) = take_current(
                         &mut app.metadata_import_refresh_index,
                         context_id,
                         spread_key,
+                        shift_read,
                         old_folder_pin_keys,
                     ) {
                         requests.push(request);
@@ -44131,10 +44429,16 @@ impl App {
             let context_id = ViewerContextId::single_context();
             let spread_key = self.spread_container_key_with_fallback();
             let old_folder_pin_keys = self.folder_pin_map.keys().cloned().collect();
+            let shift_changed =
+                self.spread_shift.scope.as_ref().is_some_and(|scope| {
+                    committed.spread_shift_scopes.contains(&scope.storage_key())
+                });
+            let shift_read = self.admit_imported_shift_read(shift_changed);
             if let Some(request) = take_current(
                 &mut self.metadata_import_refresh_index,
                 context_id,
                 spread_key,
+                shift_read,
                 old_folder_pin_keys,
             ) {
                 requests.push(request);
@@ -44608,7 +44912,7 @@ impl App {
             }
             // 読み順の対応表は `SpreadMode::reading_direction` が正本 (上と同じ理由)。
             self.update_reading_direction_from_spread_mode(self.spread_mode);
-            self.spread_shift_anchor_idx = None;
+            // Base-rule hydration preserves the accepted shift owner; open adoption resolves it.
             self.final_cover_spread_preference = container.final_cover_spread_preference;
             self.singleton_spread_endpoint_preferences =
                 container.singleton_spread_endpoint_preferences;
@@ -44623,6 +44927,9 @@ impl App {
             self.view_trim_book_settings = trim.book_settings;
             self.view_trim_page_apply_root_idx = None;
             self.view_trim_page_spread_separate = self.view_trim_book_settings.spread_separate;
+        }
+        if let Some((scope, read)) = result.shift_read.take() {
+            self.adopt_imported_shift_read(scope, read);
         }
         let folder_pin_reset_indices =
             if let Some(prepared) = result.folder_pin_materializations.take() {
@@ -45488,6 +45795,10 @@ impl App {
             .is_some_and(|handle| handle.has_unfinished_work())
             || !self.local_adjust_write_pending.is_empty();
         tag_busy
+            || self
+                .spread_shift_service
+                .as_ref()
+                .is_some_and(|service| service.is_busy())
             || book_resume_busy
             || rating_busy
             || edit_preview_busy
@@ -46337,6 +46648,10 @@ impl App {
     ///
     /// 完了時のフォルダ再読み込みは `poll_file_drop_pending` が `pending_reload` を立てて行う。
     pub(crate) fn handle_external_file_drop(&mut self, paths: Vec<PathBuf>) {
+        let paths: Vec<_> = paths
+            .iter()
+            .map(|path| crate::path_key::normalize_input_path(path))
+            .collect();
         if paths.is_empty() {
             return;
         }
@@ -49054,6 +49369,43 @@ impl App {
         collection_tree_migration: Option<(&Path, &Path)>,
     ) {
         self.migrate_book_page_bookmarks(mappings, bookmark_migration_journal_id);
+        // Capture the final filesystem map once; SQLite and snapshot publication
+        // stay in the shift FIFO, before subsequent opens or maintenance.
+        if let Some(service) = &self.spread_shift_service {
+            let admission = if let Some((source, target)) = collection_tree_migration {
+                // Book rename is a root operation; its relative anchors remain unchanged.
+                service.rename_book_root(source, target)
+            } else {
+                let moves = mappings
+                    .iter()
+                    .map(|mapping| (mapping.from.clone(), mapping.to.clone()))
+                    .collect();
+                service.migrate_page_paths(moves)
+            };
+            if let Err(error) = admission {
+                crate::logger::log(format!(
+                    "spread_shift: page mapping admission failed: {error}"
+                ));
+                self.show_feedback_toast(format!(
+                    "見開き調整のページ移動を反映できませんでした: {error}"
+                ));
+            }
+        }
+        // Book-root rename preserves the released stale-view behavior. Its saved
+        // rows move in the service FIFO above; accepted context scopes stay old.
+        if collection_tree_migration.is_none() {
+            if spread_shift_live_mappings::migrate(&mut self.spread_shift, mappings) {
+                self.invalidate_fullscreen_display_unit_owners();
+            }
+            if let Some(snapshot) = self.snapshot.as_mut() {
+                spread_shift_live_mappings::migrate(
+                    &mut snapshot.saved_viewing_state.shift,
+                    mappings,
+                );
+            }
+            #[cfg(windows)]
+            self.migrate_at_rest_spread_shifts(mappings, collection_tree_migration);
+        }
         let collection_mappings =
             book_collection_source_mappings(mappings, collection_tree_migration);
         self.enqueue_collection_source_migration_batch(collection_mappings);
@@ -49340,11 +49692,11 @@ impl App {
                 Err("製本処理が中断されました".to_string())
             }
         };
-        let intent = self
+        let pending = self
             .book_op_pending
             .take()
-            .expect("book pending is present")
-            .intent;
+            .expect("book pending is present");
+        let intent = pending.intent;
         match result {
             Ok(crate::books::BookOpResult::Append(summary)) => {
                 self.apply_book_page_edit_copies(&summary.edit_copies);
@@ -49479,6 +49831,16 @@ impl App {
                     ));
                 }
                 self.invalidate_rename_migrations_for_removed_paths(std::slice::from_ref(&path));
+                if let Some(service) = &self.spread_shift_service
+                    && let Err(error) = service.purge_book_root(&path)
+                {
+                    crate::logger::log(format!(
+                        "spread_shift: book purge admission failed: {error}"
+                    ));
+                    self.show_feedback_toast(format!(
+                        "削除した本の見開き調整を消去できませんでした: {error}"
+                    ));
+                }
                 if self.settings.active_book_name == name {
                     self.settings.active_book_name = crate::books::DEFAULT_BOOK_NAME.to_string();
                     self.settings.save();
@@ -56858,6 +57220,14 @@ impl App {
         )
     }
 
+    /// The producer and fresh-open fence share the same root eligibility and physical key.
+    pub(super) fn book_resume_recording_folder(&self) -> Option<&Path> {
+        if self.zip_nav.as_ref().is_some_and(|nav| !nav.at_root()) {
+            return None;
+        }
+        self.current_folder.as_deref()
+    }
+
     /// 現在のフルスクリーンページを「最後に読んだページ」として永続記録する。
     /// 画像本のページのみ対象。dedup 付きで連続ページ送り中の重複書き込みを抑える。
     pub(crate) fn record_book_resume(&mut self, idx: usize) {
@@ -56870,10 +57240,7 @@ impl App {
         // 「続きから」着地し得る (レビュー P3)。ルート表示 (フラット ZIP / collapse 済み
         // 単一ラッパー) は再オープン時と同じ階層が materialize されるので従来どおり記録する。
         // 深い階層への cross-book resume は将来課題 (docs/nested-zip-tree-plan.md §14)。
-        if self.zip_nav.as_ref().is_some_and(|n| !n.at_root()) {
-            return;
-        }
-        let Some(folder) = self.current_folder.clone() else {
+        let Some(folder) = self.book_resume_recording_folder().map(Path::to_path_buf) else {
             return;
         };
         let indices = self.get_still_image_indices();
@@ -57070,7 +57437,13 @@ impl App {
     fn saved_resume_is_unresolvable(&self) -> bool {
         self.current_folder
             .as_deref()
-            .and_then(|folder| self.book_resume_db.as_ref()?.get_position(folder))
+            .and_then(|folder| {
+                self.fenced_book_resume(folder).unwrap_or_else(|| {
+                    self.book_resume_db
+                        .as_ref()
+                        .and_then(|db| db.get_position(folder))
+                })
+            })
             .is_some_and(|position| {
                 matches!(
                     self.page_identity_index.resolve(&position),
@@ -57086,7 +57459,11 @@ impl App {
     }
 
     fn resume_page_for_path(&mut self, folder: &Path) -> Option<usize> {
-        let position = self.book_resume_db.as_ref()?.get_position(folder)?;
+        let position = self.fenced_book_resume(folder).unwrap_or_else(|| {
+            self.book_resume_db
+                .as_ref()
+                .and_then(|db| db.get_position(folder))
+        })?;
         match self.page_identity_index.resolve(&position) {
             file_type_resume::PositionResolution::Restored(index)
                 if self.is_readable_page_idx(index) =>
@@ -61788,6 +62165,7 @@ impl App {
             let activation = self.with_viewer_context(context_id, |app| {
                 app.activate_mounted_as_independent_detached(snapshot.id);
                 app.adopt_active_detached_viewport_runtime_from_passive("resume_viewer_context");
+                app.begin_retained_shift_readoption(ctx);
                 app.rearm_final_ai_prefetch_after_detached_resume();
                 Self::viewer_context_bundle_detached_source(ContextRef::mounted(app))
             });
@@ -62092,6 +62470,7 @@ impl App {
                 let close_viewport_id = (app.fs_viewport_shown
                     && app.fs_viewport_presentation == Some(ViewerPresentation::DetachedWindow))
                 .then(|| app.fullscreen_viewport_id());
+                app.poll_retained_shift_readoption(ctx);
                 // 前面の viewer への入力は、この context の polling / 描画より前に配る。
                 // ここは mount 済みなので、`fullscreen_idx` も items も**この viewer のもの**
                 // (2026-08-29 レビュー R-02)。
@@ -89736,6 +90115,8 @@ impl App {
         #[cfg(windows)]
         let mut auto_video_successes = Vec::new();
         #[cfg(windows)]
+        let mut now_playing_successes = Vec::new();
+        #[cfg(windows)]
         let mut anime4k_info_ready_indices: Vec<usize> = Vec::new();
         // 連続再生 EOF の振り分け種別 (Inc 7):
         //   - AudioFile     = 純粋な音声ファイル (`GridItem::Audio`) → 次の音声へ。
@@ -89831,6 +90212,12 @@ impl App {
                 }
                 #[cfg(windows)]
                 if let Some(success) = player.take_playback_success() {
+                    if success.viewer_context == Some(playback_viewer_context)
+                        && self.fullscreen_idx == Some(*idx)
+                        && matches!(self.items.get(*idx), Some(GridItem::Video(path) | GridItem::Audio(path)) if path == player.path())
+                    {
+                        now_playing_successes.push((*idx, player.media_identity(), success));
+                    }
                     // fs_cache is bound to this mounted context; only its current real-file
                     // video is adopted, never an audio-mode or unadopted cached player.
                     if success.viewer_context == Some(playback_viewer_context)
@@ -90171,6 +90558,8 @@ impl App {
             }
             return;
         }
+        #[cfg(windows)]
+        self.publish_mounted_local_now_playing(&now_playing_successes);
         // Sole automatic decision boundary: adopted playback facts survive all native
         // pause/close/source-result processing above, or are discarded in this frame.
         #[cfg(all(windows, not(feature = "portable")))]
@@ -91822,6 +92211,7 @@ impl App {
         self.draw_collection_reorder(ctx);
         self.show_cache_manager_dialog(ctx);
         self.show_metadata_cleanup_dialog(ctx);
+        self.poll_spread_shift_service();
         self.show_metadata_transfer_dialog(ctx);
         self.show_sidecar_restore_dialog(ctx);
         self.show_archive_cache_manager_dialog(ctx);
@@ -95529,6 +95919,8 @@ mod similar_navigation_tests;
 #[cfg(all(test, windows))]
 mod similar_preview_context_tests;
 #[cfg(test)]
+mod spread_shift_lifecycle_tests;
+#[cfg(test)]
 pub(crate) mod tests;
 
 #[cfg(test)]
@@ -95544,6 +95936,314 @@ mod still_seek_thumbnail_ownership;
 pub(crate) use tests::phase_c_support::{
     AppTestEnv as AppTestEnvForTest, setup_app as setup_app_for_test,
 };
+
+#[cfg(all(test, windows))]
+mod now_playing_lifecycle_tests {
+    use super::*;
+    use crate::effetune::NowPlayingOwner;
+
+    #[test]
+    fn now_playing_app_descriptor_clones_bounded_unicode_and_nul_prefixes() {
+        let app = setup_app_for_test();
+        let path = app.tmp.path().join("large-tags.mp3");
+        let mut player = crate::video::VideoPlayer::local_ready_disconnected_for_test(path);
+        let huge_suffix = "suffix".repeat(350_000);
+        let title_prefix = "\u{1f600}".repeat(2048);
+        let album_prefix = "a".repeat(4095);
+        let title = format!("{title_prefix}{huge_suffix}");
+        let album = format!("{album_prefix}\u{1f600}{huge_suffix}");
+        let artist = format!("Artist\0{huge_suffix}");
+        player.set_now_playing_metadata_for_test(Some(&title), Some(&album), Some(&artist));
+
+        let input = app.now_playing_input_for_player(&player, None);
+        assert_eq!(input.title.as_deref(), Some(title_prefix.as_str()));
+        assert_eq!(input.album.as_deref(), Some(album_prefix.as_str()));
+        assert_eq!(input.artist.as_deref(), Some("Artist"));
+        for text in [&input.title, &input.album, &input.artist] {
+            let text = text.as_ref().unwrap();
+            assert!(text.encode_utf16().count() <= 4096);
+            assert!(text.len() <= 3 * 4096);
+            assert!(!text.contains('\0'));
+        }
+        let info = player.info().unwrap();
+        assert_eq!(info.title.as_deref(), Some(title.as_str()));
+        assert_eq!(info.album.as_deref(), Some(album.as_str()));
+        assert_eq!(info.artist.as_deref(), Some(artist.as_str()));
+    }
+
+    #[test]
+    fn now_playing_host_failed_transition_notifies_once_from_canonical_runtime() {
+        let mut app = setup_app_for_test();
+        app.effetune.runtime = crate::effetune::EffetuneRuntime::Loading {
+            origin: crate::effetune::LoadOrigin::Startup,
+            open_gui_when_ready: None,
+        };
+        app.effetune
+            .set_test_startup_completion(Err(crate::effetune::EffetuneFailure::HostLost(
+                "fixture".to_owned(),
+            )));
+        let ctx = egui::Context::default();
+        app.poll_effetune(&ctx);
+        let toast = app.fs_feedback_toast.clone().expect("failure must notify");
+        app.poll_effetune(&ctx);
+        assert_eq!(app.fs_feedback_toast.as_ref(), Some(&toast));
+    }
+
+    #[test]
+    fn now_playing_send_warning_during_host_loss_keeps_canonical_notice() {
+        let mut app = setup_app_for_test();
+        app.effetune.runtime = crate::effetune::EffetuneRuntime::Loading {
+            origin: crate::effetune::LoadOrigin::Startup,
+            open_gui_when_ready: None,
+        };
+        app.effetune
+            .set_test_startup_completion(Err(crate::effetune::EffetuneFailure::HostLost(
+                "fixture".to_owned(),
+            )));
+        app.effetune
+            .set_now_playing_warning_for_test("曲情報を送信できませんでした: BrokenPipe");
+        app.poll_effetune(&egui::Context::default());
+        assert_eq!(
+            app.fs_feedback_toast
+                .as_ref()
+                .map(|(message, _, _)| message.as_str()),
+            Some("音響調整を停止しました。音声はそのまま再生を続けます。")
+        );
+        assert!(app.effetune.take_now_playing_warning().is_none());
+    }
+
+    #[test]
+    fn now_playing_late_send_warning_after_host_loss_is_drained_without_notice() {
+        let mut app = setup_app_for_test();
+        app.effetune.runtime = crate::effetune::EffetuneRuntime::Failed(
+            crate::effetune::EffetuneFailure::HostLost("fixture".to_owned()),
+        );
+        app.fs_feedback_toast = None;
+        app.effetune
+            .set_now_playing_warning_for_test("曲情報を送信できませんでした: BrokenPipe");
+        app.poll_effetune(&egui::Context::default());
+        assert!(app.fs_feedback_toast.is_none());
+        assert!(app.effetune.take_now_playing_warning().is_none());
+    }
+
+    fn install_player(app: &mut App, path: PathBuf) -> u64 {
+        let player = crate::video::VideoPlayer::local_ready_disconnected_for_test(path.clone());
+        let identity = player.media_identity();
+        player.bind_playback_viewer_context(app.projected_viewer_context_id().serial());
+        app.items = vec![GridItem::Audio(path)];
+        app.fullscreen_idx = Some(0);
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        identity
+    }
+
+    fn adopt(app: &mut App) -> u64 {
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+            panic!()
+        };
+        player.confirm_playback_start_for_test(crate::video::PlaybackStartOrigin::NewSource);
+        let identity = player.media_identity();
+        let success = player.take_playback_success().unwrap();
+        app.publish_mounted_local_now_playing(&[(0, identity, success)]);
+        assert_eq!(
+            app.effetune.now_playing_owner(),
+            Some(NowPlayingOwner::Local(identity))
+        );
+        identity
+    }
+
+    #[test]
+    fn now_playing_local_adopts_start_and_keeps_pause_seek_buffer_loop() {
+        let mut app = setup_app_for_test();
+        let path = app.tmp.path().join("song.mp3");
+        install_player(&mut app, path.clone());
+        let identity = adopt(&mut app);
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+            panic!()
+        };
+        player.set_playing_with_origin(false, crate::video::PlaybackStartOrigin::UserPlay);
+        player.seek_paused(4.0);
+        app.publish_mounted_local_now_playing(&[]);
+        app.reconcile_local_now_playing();
+        assert_eq!(
+            app.effetune.now_playing_owner(),
+            Some(NowPlayingOwner::Local(identity))
+        );
+        install_player(&mut app, path);
+        let identity = adopt(&mut app);
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+            panic!()
+        };
+        player.set_loop_enabled(true);
+        player.mark_eof_for_test(30.0);
+        assert!(player.is_at_eof());
+        app.reconcile_local_now_playing();
+        assert_eq!(
+            app.effetune.now_playing_owner(),
+            Some(NowPlayingOwner::Local(identity))
+        );
+    }
+
+    #[test]
+    fn now_playing_local_natural_end_and_shutdown_clear_only_current_owner() {
+        let mut app = setup_app_for_test();
+        let path = app.tmp.path().join("song.mp3");
+        install_player(&mut app, path.clone());
+        adopt(&mut app);
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+            panic!()
+        };
+        player.set_loop_enabled(false);
+        player.mark_eof_for_test(30.0);
+        app.reconcile_local_now_playing();
+        assert_eq!(app.effetune.now_playing_owner(), None);
+        install_player(&mut app, path);
+        adopt(&mut app);
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get_mut(&0).unwrap() else {
+            panic!()
+        };
+        player.shutdown();
+        app.reconcile_local_now_playing();
+        assert_eq!(app.effetune.now_playing_owner(), None);
+    }
+
+    #[test]
+    fn now_playing_local_mount_pause_and_stale_metadata_cannot_take_remote_owner() {
+        let mut app = setup_app_for_test();
+        let path = app.tmp.path().join("old.mp3");
+        install_player(&mut app, path.clone());
+        adopt(&mut app);
+        let remote = NowPlayingOwner::Remote {
+            session: 12,
+            registration: 34,
+        };
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+            panic!()
+        };
+        let input = app.now_playing_input_for_player(player, None);
+        app.effetune.publish_now_playing(remote, input);
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get_mut(&0).unwrap() else {
+            panic!()
+        };
+        player.set_now_playing_metadata_for_test(
+            Some("late old title"),
+            Some("old album"),
+            Some("old artist"),
+        );
+        app.publish_mounted_local_now_playing(&[]);
+        app.reconcile_local_now_playing();
+        assert_eq!(app.effetune.now_playing_owner(), Some(remote));
+    }
+
+    #[test]
+    fn now_playing_local_metadata_readiness_updates_current_owner() {
+        let mut app = setup_app_for_test();
+        let path = app.tmp.path().join("song.mp3");
+        install_player(&mut app, path.clone());
+        let identity = adopt(&mut app);
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get_mut(&0).unwrap() else {
+            panic!()
+        };
+        player.set_now_playing_metadata_for_test(Some("Title"), Some("Album"), Some("Artist"));
+        app.publish_mounted_local_now_playing(&[]);
+        assert!(app.effetune.now_playing_metadata_matches(
+            NowPlayingOwner::Local(identity),
+            &path,
+            Some("Title"),
+            Some("Album"),
+            Some("Artist")
+        ));
+        app.settings.video_thumb_use_sidecar_image = !app.settings.video_thumb_use_sidecar_image;
+        let cover = app.tmp.path().join("song-cover.png");
+        app.video_thumb_overrides
+            .insert(crate::path_key::normalize_keep_drive(&path), cover.clone());
+        assert!(!app.effetune.now_playing_artwork_source_matches(
+            NowPlayingOwner::Local(identity),
+            Some(&cover),
+            &app.settings,
+        ));
+        app.publish_mounted_local_now_playing(&[]);
+        assert!(app.effetune.now_playing_artwork_source_matches(
+            NowPlayingOwner::Local(identity),
+            Some(&cover),
+            &app.settings,
+        ));
+    }
+
+    #[test]
+    fn now_playing_local_same_tick_pause_keeps_actual_start_adoption() {
+        let mut app = setup_app_for_test();
+        let path = app.tmp.path().join("paused-new.mp3");
+        let identity = install_player(&mut app, path);
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+            panic!()
+        };
+        player.confirm_playback_start_for_test(crate::video::PlaybackStartOrigin::NewSource);
+        let success = player.take_playback_success().unwrap();
+        player.set_playing_with_origin(false, crate::video::PlaybackStartOrigin::UserPlay);
+        assert!(!player.playback_success_is_current(success.id));
+        app.publish_mounted_local_now_playing(&[(0, identity, success)]);
+        app.reconcile_local_now_playing();
+        assert_eq!(
+            app.effetune.now_playing_owner(),
+            Some(NowPlayingOwner::Local(identity))
+        );
+    }
+
+    #[test]
+    fn now_playing_local_cancelled_start_fact_cannot_adopt() {
+        let mut app = setup_app_for_test();
+        let path = app.tmp.path().join("cancelled-new.mp3");
+        let identity = install_player(&mut app, path);
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get_mut(&0).unwrap() else {
+            panic!()
+        };
+        player.confirm_playback_start_for_test(crate::video::PlaybackStartOrigin::NewSource);
+        let success = player.take_playback_success().unwrap();
+        player.shutdown();
+        assert!(player.local_now_playing_finished());
+        app.publish_mounted_local_now_playing(&[(0, identity, success)]);
+        assert_eq!(app.effetune.now_playing_owner(), None);
+    }
+
+    #[test]
+    fn now_playing_local_context_move_and_sibling_close_preserve_identity() {
+        let mut app = setup_app_for_test();
+        let path = app.tmp.path().join("parked.mp3");
+        let cover = app.tmp.path().join("parked.png");
+        app.video_thumb_overrides
+            .insert(crate::path_key::normalize_keep_drive(&path), cover.clone());
+        install_player(&mut app, path);
+        let identity = adopt(&mut app);
+        let parked = app.stash_mounted_as_active_for_test(907);
+        let sibling = app.tmp.path().join("sibling.mp3");
+        install_player(&mut app, sibling);
+        app.publish_mounted_local_now_playing(&[]);
+        app.close_fullscreen();
+        app.reconcile_local_now_playing();
+        assert_eq!(
+            app.effetune.now_playing_owner(),
+            Some(NowPlayingOwner::Local(identity))
+        );
+        assert!(app.effetune.now_playing_artwork_source_matches(
+            NowPlayingOwner::Local(identity),
+            Some(&cover),
+            &app.settings,
+        ));
+        app.with_window_context_for_test(parked, |app| {
+            app.publish_mounted_local_now_playing(&[]);
+            assert!(matches!(app.fs_cache.get(&0), Some(FsCacheEntry::Video { player, .. }) if player.media_identity() == identity));
+            app.close_fullscreen();
+        });
+        app.reconcile_local_now_playing();
+        assert_eq!(app.effetune.now_playing_owner(), None);
+    }
+}
 
 #[cfg(test)]
 #[path = "app/tests/g1_extracted_handlers.rs"]

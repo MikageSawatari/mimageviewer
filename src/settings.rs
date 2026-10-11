@@ -886,6 +886,7 @@ impl FullscreenNavigatorCorner {
 /// このパネルだけ表示項目を変更できるのは不自然で過剰なため、並びは固定する。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FullscreenOverflowItemId {
+    SpreadAdjustment,
     NavigatorToggle,
     NavigatorPosition,
     ImageAnalysis,
@@ -896,6 +897,7 @@ pub enum FullscreenOverflowItemId {
 impl FullscreenOverflowItemId {
     pub fn fixed_order() -> &'static [Self] {
         &[
+            Self::SpreadAdjustment,
             Self::NavigatorToggle,
             Self::NavigatorPosition,
             Self::ImageAnalysis,
@@ -906,6 +908,7 @@ impl FullscreenOverflowItemId {
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::SpreadAdjustment => "見開きの調整",
             Self::NavigatorToggle => "ナビゲータ",
             Self::NavigatorPosition => "ナビゲータ位置",
             Self::ImageAnalysis => "分析ツール",
@@ -5134,6 +5137,9 @@ pub struct Settings {
     /// 本に保存した見開きモードがない場合、PDF / EPUB の右開き指定に従う。
     #[serde(default)]
     pub follow_document_reading_direction: bool,
+    /// 本ごとの見開き1ページずらしを記憶する。OFFでも保存済み調整は保持する。
+    #[serde(default = "default_true")]
+    pub remember_spread_shift_per_book: bool,
     /// デフォルトの連結方式
     #[serde(default)]
     pub default_reading_flow: ReadingFlow,
@@ -5340,6 +5346,10 @@ pub struct Settings {
     /// 背景色テーマ (System / Light / Dark)。デフォルト `System` で Windows のアプリ用色に追従。
     #[serde(default)]
     pub ui_theme: UiTheme,
+
+    /// 環境設定を開き直したときに、プロセス内で覚えたページとスクロール位置を復元する。
+    #[serde(default = "default_true")]
+    pub preferences_restore_position: bool,
 
     /// ラベル、ボタン、メニュー、ダイアログ、フルスクリーン HUD の文字コントラスト。
     #[serde(default)]
@@ -7673,6 +7683,7 @@ impl Default for Settings {
             pinned_books: Vec::new(),
             default_spread_mode: SpreadMode::default(),
             follow_document_reading_direction: false,
+            remember_spread_shift_per_book: true,
             default_reading_flow: ReadingFlow::default(),
             default_reading_direction: ReadingDirection::default(),
             final_cover_spread_enabled: true,
@@ -7734,6 +7745,7 @@ impl Default for Settings {
             auto_fullscreen_image_folders: false,
             margin_fit_enabled: false,
             ui_theme: UiTheme::default(),
+            preferences_restore_position: true,
             text_contrast: TextContrast::default(),
             ui_scale_factor: default_ui_scale_factor(),
             ui_font: UiFontSettings::default(),
@@ -10610,6 +10622,40 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn preferences_restore_position_defaults_on_and_sqlite_roundtrip() {
+        assert!(Settings::default().preferences_restore_position);
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert!(missing.preferences_restore_position);
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::settings_db::SettingsDb::create_new(tmp.path()).unwrap();
+        for enabled in [false, true] {
+            let mut settings = Settings::default();
+            settings.preferences_restore_position = enabled;
+            db.save_full(&settings).unwrap();
+            assert_eq!(
+                db.load_into_settings()
+                    .unwrap()
+                    .preferences_restore_position,
+                enabled
+            );
+        }
+        drop(db);
+        let conn = rusqlite::Connection::open(tmp.path().join("settings.db")).unwrap();
+        conn.execute(
+            "DELETE FROM settings_kv WHERE key = 'preferences_restore_position'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let db = crate::settings_db::SettingsDb::open(tmp.path()).unwrap();
+        assert!(
+            db.load_into_settings()
+                .unwrap()
+                .preferences_restore_position
+        );
+    }
+
     #[test]
     fn details_name_colors_legacy_missing_and_sqlite_roundtrip() {
         use crate::details_name_colors::{DetailsNameColor, DetailsNameColors};
@@ -14620,6 +14666,19 @@ mod tests {
             SpreadMode::Vertical.next_in_spread_cycle(),
             SpreadMode::Single
         );
+    }
+
+    #[test]
+    fn spread_shift_memory_defaults_on_and_preserves_explicit_off() {
+        assert!(Settings::default().remember_spread_shift_per_book);
+        let legacy: Settings = serde_json::from_str("{}").unwrap();
+        assert!(legacy.remember_spread_shift_per_book);
+        let disabled: Settings =
+            serde_json::from_str(r#"{"remember_spread_shift_per_book":false}"#).unwrap();
+        assert!(!disabled.remember_spread_shift_per_book);
+        let restored: Settings =
+            serde_json::from_value(serde_json::to_value(disabled).unwrap()).unwrap();
+        assert!(!restored.remember_spread_shift_per_book);
     }
 
     #[test]

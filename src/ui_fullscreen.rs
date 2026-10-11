@@ -5367,6 +5367,37 @@ struct FsOverflowPanelView {
     state: FsOverflowPanelState,
     root_rows: Vec<FsOverflowPanelRow>,
     navigator_corner: FullscreenNavigatorCorner,
+    shift: SpreadShiftHudView,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SpreadShiftHudView {
+    status: String,
+    anchor: String,
+    jump_idx: Option<usize>,
+    clear_enabled: bool,
+    enabled: bool,
+    memory: bool,
+    marker: Option<bool>, // true: resolved, false: reference currently outside this view
+}
+
+fn draw_spread_shift_marker(ui: &mut egui::Ui, rect: egui::Rect, view: &SpreadShiftHudView) {
+    if let Some(resolved) = view.marker {
+        let center = egui::pos2(rect.right() - 5.0, rect.top() + 5.0);
+        let color = ui.visuals().weak_text_color();
+        if resolved {
+            ui.painter().circle_filled(center, 2.5, color);
+        } else {
+            ui.painter()
+                .circle_stroke(center, 2.5, egui::Stroke::new(1.0, color));
+        }
+        ui.interact(
+            egui::Rect::from_center_size(center, egui::vec2(12.0, 12.0)),
+            egui::Id::new("spread_shift_marker"),
+            egui::Sense::hover(),
+        )
+        .on_hover_text(format!("{}\n{}", view.status, view.anchor));
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5375,6 +5406,9 @@ enum FsOverflowPanelAction {
     Back,
     Activate(FullscreenOverflowItemId),
     SetNavigatorCorner(FullscreenNavigatorCorner),
+    JumpShiftAnchor(usize),
+    ClearShift,
+    SetShiftMemory(bool),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5387,6 +5421,7 @@ fn fs_overflow_panel_body_row_count(state: FsOverflowPanelState) -> usize {
         FsOverflowPanelState::Closed => 0,
         FsOverflowPanelState::Root => FullscreenOverflowItemId::fixed_order().len(),
         FsOverflowPanelState::NavigatorPosition => 1 + FullscreenNavigatorCorner::ALL.len(),
+        FsOverflowPanelState::SpreadAdjustment => 6,
     }
 }
 
@@ -5443,6 +5478,7 @@ fn draw_fs_overflow_panel_row(
         egui::vec2(ui.available_width(), FS_OVERFLOW_PANEL_ROW_HEIGHT),
         sense,
     );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
     let background = if selected {
         egui::Color32::from_rgb(54, 93, 142)
     } else if enabled && response.hovered() {
@@ -5545,6 +5581,7 @@ fn draw_fs_overflow_panel_surface(
     let title = match view.state {
         FsOverflowPanelState::Root => "その他の機能",
         FsOverflowPanelState::NavigatorPosition => "ナビゲータ位置",
+        FsOverflowPanelState::SpreadAdjustment => "見開きの調整",
         FsOverflowPanelState::Closed => return None,
     };
     child.painter().text(
@@ -5651,6 +5688,26 @@ fn draw_fs_overflow_panel_surface(
                             {
                                 action = Some(FsOverflowPanelAction::SetNavigatorCorner(corner));
                             }
+                        }
+                    }
+                    FsOverflowPanelState::SpreadAdjustment => {
+                        if draw_fs_overflow_panel_row(ui, "shift_back", "<  戻る", "", false, true, None).clicked() {
+                            action = Some(FsOverflowPanelAction::Back);
+                        }
+                        ui.label(&view.shift.status);
+                        ui.label(&view.shift.anchor);
+                        if draw_fs_overflow_panel_row(ui, "shift_jump", "基点のページへ移動", "", false,
+                            view.shift.enabled && view.shift.jump_idx.is_some(), Some("基点が一覧にない場合は絞り込みを解除してください")).clicked() {
+                            action = view.shift.jump_idx.map(FsOverflowPanelAction::JumpShiftAnchor);
+                        }
+                        if draw_fs_overflow_panel_row(ui, "shift_clear", "調整を解除", "", false,
+                            view.shift.enabled && view.shift.clear_enabled, None).on_hover_text("この本の保存済み調整も解除します").clicked() {
+                            action = Some(FsOverflowPanelAction::ClearShift);
+                        }
+                        let mut memory = view.shift.memory;
+                        if ui.add_enabled(view.shift.enabled, egui::Checkbox::new(&mut memory, "見開きの調整を本ごとに記憶する"))
+                            .on_hover_text("全冊に効く設定です。OFFでも保存済み調整は保持し、次回ONの再入場で使います").changed() {
+                            action = Some(FsOverflowPanelAction::SetShiftMemory(memory));
                         }
                     }
                     FsOverflowPanelState::Closed => {}
@@ -10451,7 +10508,10 @@ impl App {
         self.rebind_fs_navigation_sequence_to_demand(anchor_idx, demand)
     }
 
-    fn reconcile_fs_navigation_sequence_to_canonical_unit(&mut self, anchor_idx: usize) -> bool {
+    pub(crate) fn reconcile_fs_navigation_sequence_to_canonical_unit(
+        &mut self,
+        anchor_idx: usize,
+    ) -> bool {
         let tracks_anchor = self
             .fs_holdover_tex
             .as_ref()
@@ -15348,6 +15408,29 @@ pub(crate) fn build_remote_spread_page_groups_with_page_alone(
     page_alone: crate::settings::PageAloneSettings,
     complete_book_eligible: bool,
 ) -> Vec<RemotePageGroupSpec> {
+    build_remote_spread_page_groups_with_shift(
+        items,
+        spread_mode,
+        is_landscape,
+        final_cover_enabled,
+        singleton_placement_enabled,
+        page_alone,
+        complete_book_eligible,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_remote_spread_page_groups_with_shift(
+    items: &[GridItem],
+    spread_mode: SpreadMode,
+    is_landscape: &[bool],
+    final_cover_enabled: bool,
+    singleton_placement_enabled: impl Into<crate::settings::SingletonSpreadEndpointSettings>,
+    page_alone: crate::settings::PageAloneSettings,
+    complete_book_eligible: bool,
+    shift_anchor_idx: Option<usize>,
+) -> Vec<RemotePageGroupSpec> {
     let singleton_placement_enabled = singleton_placement_enabled.into();
     let visible = (0..items.len()).collect::<Vec<_>>();
     let nav = build_image_reading_indices(items, &visible);
@@ -15375,7 +15458,7 @@ pub(crate) fn build_remote_spread_page_groups_with_page_alone(
     let units = build_spread_display_units_with_page_alone(
         &nav,
         spread_mode,
-        None,
+        shift_anchor_idx,
         if complete_book_eligible {
             page_alone
         } else {
@@ -16598,6 +16681,41 @@ fn paint_still_touch_first_run_help_overlay(
     }
 }
 
+/// D2 fixtures reuse the real adjustment submenu and marker painting without a live application.
+#[doc(hidden)]
+pub fn draw_spread_shift_hud_snapshot_fixture(ui: &mut egui::Ui, unresolved: bool) {
+    let shift = SpreadShiftHudView {
+        status: if unresolved {
+            "保存した基点が現在の一覧にありません"
+        } else {
+            "調整あり（記憶済み）"
+        }
+        .into(),
+        anchor: if unresolved {
+            "基点: chapter/003.jpg（現在の一覧外）"
+        } else {
+            "基点: 3ページ目 / chapter/003.jpg"
+        }
+        .into(),
+        jump_idx: (!unresolved).then_some(2),
+        clear_enabled: true,
+        enabled: true,
+        memory: true,
+        marker: Some(!unresolved),
+    };
+    let response = ui.button("見開き [V]");
+    draw_spread_shift_marker(ui, response.rect, &shift);
+    let view = FsOverflowPanelView {
+        state: FsOverflowPanelState::SpreadAdjustment,
+        root_rows: Vec::new(),
+        navigator_corner: FullscreenNavigatorCorner::BottomRight,
+        shift,
+    };
+    if let Some(rect) = fs_overflow_panel_rect(ui.max_rect(), view.state) {
+        let _ = draw_fs_overflow_panel_surface(ui, rect, &view);
+    }
+}
+
 /// Visual-only fixture for first-run touch-help snapshots.
 #[doc(hidden)]
 pub fn draw_still_touch_first_run_help_snapshot_fixture(
@@ -17060,7 +17178,7 @@ impl App {
             nav,
             self.items_generation,
             self.spread_mode,
-            self.spread_shift_anchor_idx,
+            self.spread_shift_anchor_idx(),
             page_alone,
         ) {
             return units;
@@ -17085,7 +17203,7 @@ impl App {
         let units = build_spread_display_units_with_page_alone(
             nav,
             self.spread_mode,
-            self.spread_shift_anchor_idx,
+            self.spread_shift_anchor_idx(),
             page_alone,
             |nav_pos, _| landscape_flags.get(nav_pos).copied().unwrap_or(false),
             |idx| is_spread_pairable_item(self.items.get(idx)),
@@ -17096,7 +17214,7 @@ impl App {
             nav,
             self.items_generation,
             self.spread_mode,
-            self.spread_shift_anchor_idx,
+            self.spread_shift_anchor_idx(),
             page_alone,
             &landscape_flags,
             units,
@@ -17110,7 +17228,7 @@ impl App {
                 nav,
                 self.items_generation,
                 self.spread_mode,
-                self.spread_shift_anchor_idx,
+                self.spread_shift_anchor_idx(),
                 page_alone,
             )
             .expect("installed spread unit token")
@@ -17205,7 +17323,7 @@ impl App {
     /// navigation. The shared pure resolver keeps the unit's canonical anchor for Remote;
     /// local display rebinds occurrences to the accepted fullscreen anchor without changing
     /// the Navigation projection.
-    fn spread_display_composition_for_anchor(
+    pub(crate) fn spread_display_composition_for_anchor(
         &mut self,
         anchor_idx: usize,
     ) -> SpreadDisplayComposition {
@@ -17482,7 +17600,7 @@ impl App {
         build_spread_display_units_with_predicates(
             nav,
             self.spread_mode,
-            self.spread_shift_anchor_idx,
+            self.spread_shift_anchor_idx(),
             |nav_pos, idx| {
                 self.page_is_landscape(
                     idx,
@@ -17961,7 +18079,7 @@ impl App {
         self.fs_lanczos_cache.retain_similar_preview_resource(None);
     }
 
-    fn invalidate_fullscreen_display_unit_owners(&mut self) {
+    pub(crate) fn invalidate_fullscreen_display_unit_owners(&mut self) {
         self.invalidate_similar_preview();
         self.fullscreen_navigator_interaction.invalidate();
     }
@@ -21747,7 +21865,7 @@ impl App {
                     &nav,
                     self.items_generation,
                     self.spread_mode,
-                    self.spread_shift_anchor_idx,
+                    self.spread_shift_anchor_idx(),
                     if self.spread_complete_book_context_eligible() {
                         self.page_alone_enabled_for_current_book()
                     } else {
@@ -25203,6 +25321,7 @@ impl App {
                                 wheel.restore_at(ctx, FsHudPopupWheelTarget::TopBar);
                             }
                             let extracted_result = self.extracted_result_surface().is_some();
+                            let shift_view = self.spread_shift_hud_view();
                             Self::draw_fs_hover_bar(
                                 ui,
                                 ctx,
@@ -25275,6 +25394,7 @@ impl App {
                                 navigator_exclusion,
                                 touch_chrome_latched,
                                 self.frame_counter,
+                                (!extracted_result).then_some(&shift_view),
                             );
                             if top_bar_lock_pressed {
                                 self.settings.fullscreen_top_bar_locked =
@@ -25533,6 +25653,7 @@ impl App {
                                     "spread: failed to save popup presentation: {error}"
                                 ));
                             } else {
+                                self.reset_live_spread_shift(false);
                                 self.spread_mode = requested_spread;
                                 self.reading_flow = requested_flow;
                                 self.reading_direction = requested_direction;
@@ -25543,7 +25664,6 @@ impl App {
                                     if !spread_changed_from_direction {
                                         self.update_reading_direction_from_spread_mode(self.spread_mode);
                                     }
-                                    self.spread_shift_anchor_idx = None;
                                     if !self.reading_flow.is_paged() {
                                         self.reset_continuous_reading_transform();
                                         self.disable_non_paged_fullscreen_modes(fs_idx);
@@ -28266,31 +28386,44 @@ impl App {
     // ── 見開きペアリング ────────────────────────────────────────────────
 
     /// build_nav_indices の結果をキャッシュして返す。
-    fn get_nav_indices(&mut self) -> Arc<Vec<usize>> {
-        crate::app::measure_nav_helper(crate::app::NavHelperPerfKind::GetNavIndices, || {
-            self.viewer_navigation_caches
-                .ensure_source(self.items_generation, self.reading_flow);
-            if let Some(cached) = self.viewer_navigation_caches.nav_indices() {
-                return cached;
-            }
-            let nav = build_nav_indices(&self.items, self.current_reader_order());
-            self.viewer_navigation_caches.install_nav_indices(nav)
-        })
+    pub(crate) fn get_nav_indices(&mut self) -> Arc<Vec<usize>> {
+        let nav =
+            crate::app::measure_nav_helper(crate::app::NavHelperPerfKind::GetNavIndices, || {
+                self.viewer_navigation_caches
+                    .ensure_source(self.items_generation, self.reading_flow);
+                if let Some(cached) = self.viewer_navigation_caches.nav_indices() {
+                    return cached;
+                }
+                let nav = build_nav_indices(&self.items, self.current_reader_order());
+                self.viewer_navigation_caches.install_nav_indices(nav)
+            });
+        if self.spread_shift.resolve(&self.page_identity_index, &nav) {
+            self.invalidate_fullscreen_display_unit_owners();
+        }
+        nav
     }
 
     /// 連結読み・先読み用の静止画一覧を viewer context 内で共有する。
     pub(crate) fn get_still_image_indices(&mut self) -> Arc<Vec<usize>> {
         self.viewer_navigation_caches
             .ensure_source(self.items_generation, self.reading_flow);
-        if let Some(cached) = self.viewer_navigation_caches.still_image_indices() {
-            return cached;
+        let indices = if let Some(cached) = self.viewer_navigation_caches.still_image_indices() {
+            cached
+        } else {
+            let indices = crate::ui_helpers::still_image_display_indices(
+                &self.items,
+                self.current_reader_order(),
+            );
+            self.viewer_navigation_caches
+                .install_still_image_indices(indices)
+        };
+        if self
+            .spread_shift
+            .resolve(&self.page_identity_index, &indices)
+        {
+            self.invalidate_fullscreen_display_unit_owners();
         }
-        let indices = crate::ui_helpers::still_image_display_indices(
-            &self.items,
-            self.current_reader_order(),
-        );
-        self.viewer_navigation_caches
-            .install_still_image_indices(indices)
+        indices
     }
 
     pub(crate) fn fullscreen_large_jump_target(
@@ -28466,11 +28599,12 @@ impl App {
         } else {
             self.get_nav_indices()
         };
+        self.spread_shift.resolve(&self.page_identity_index, &nav);
         let rotations = self.get_rotations_for_indices(&nav);
         let units = build_spread_display_units_with_predicates(
             &nav,
             self.spread_mode,
-            self.spread_shift_anchor_idx,
+            self.spread_shift_anchor_idx(),
             |nav_pos, idx| {
                 self.page_is_landscape(
                     idx,
@@ -28512,19 +28646,47 @@ impl App {
         {
             return;
         }
+        let rules = self.accepted_spread_shift_rules();
+        if let crate::spread_shift::PairingAdmission::Rejected(reason) =
+            crate::spread_shift::admit_pairing_action(
+                crate::spread_shift::PairingContextToken {
+                    rules: &rules,
+                    availability: self.spread_shift.availability,
+                },
+                crate::spread_shift::PairingAction::Nudge,
+            )
+        {
+            self.show_feedback_toast(reason.into());
+            return;
+        }
         if self.spread_mode.is_spread() {
             if self.extracted_result_surface().is_some() {
                 return;
             }
             if let Some((new_idx, anchor_idx)) = self.compute_spread_offset_nudge(fs_idx, dir) {
-                self.spread_shift_anchor_idx = Some(anchor_idx);
+                if !self.set_live_spread_shift(anchor_idx) {
+                    return;
+                }
                 self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
                 action.page_nav = FsPageNav::Target(new_idx);
-                self.show_feedback_toast("見開きを1ページずらしました".to_string());
             }
         } else {
             // Single モード: 1 ページ移動にフォールバック (ユーザー要望)
             action.page_nav = FsPageNav::Delta(dir);
+        }
+    }
+
+    pub(crate) fn accepted_spread_shift_rules(
+        &self,
+    ) -> crate::spread_shift::ResolvedAutomaticRules {
+        crate::spread_shift::ResolvedAutomaticRules {
+            mode: self.spread_mode,
+            flow: self.reading_flow,
+            direction: self.reading_direction,
+            final_cover: self.final_cover_spread_enabled_for_current_book(),
+            page_alone: self.page_alone_enabled_for_current_book(),
+            singleton_endpoints: self.singleton_spread_placement_enabled_for_current_book(),
+            landscape_epoch: self.spread_display_units_cache.landscape_epoch,
         }
     }
 
@@ -28615,6 +28777,25 @@ impl App {
     }
 
     /// 見開きモード切替後、fullscreen_idx をペアの先頭に正規化する。
+    /// Restore adoption retains the live real page without writing background resume/history.
+    pub(crate) fn adopt_shift_layout_without_navigation(&mut self) {
+        let Some(idx) = self.fullscreen_idx else {
+            return;
+        };
+        let nav = self.get_nav_indices();
+        let units = self.build_spread_display_units_for_nav(&nav);
+        if self.spread_mode.is_spread()
+            && let Some((_, unit)) = find_spread_display_unit(&units, idx)
+        {
+            self.fullscreen_idx = Some(unit.anchor_idx());
+            self.selected = self.fullscreen_idx;
+        }
+        self.fullscreen_page_layout.clear();
+        if let Some(idx) = self.fullscreen_idx {
+            self.reconcile_fs_navigation_sequence_to_canonical_unit(idx);
+        }
+    }
+
     pub(crate) fn normalize_spread_position(&mut self, ctx: &egui::Context) {
         if !self.spread_mode.is_spread() {
             return;
@@ -31732,6 +31913,17 @@ impl App {
         let mut root_rows = Vec::new();
         for &item in FullscreenOverflowItemId::fixed_order() {
             let (label, status, enabled, disabled_reason) = match item {
+                FullscreenOverflowItemId::SpreadAdjustment => (
+                    item.label().into(),
+                    if self.spread_shift_anchor_idx().is_some() {
+                        "調整あり  >"
+                    } else {
+                        "確認  >"
+                    }
+                    .into(),
+                    true,
+                    None,
+                ),
                 FullscreenOverflowItemId::NavigatorToggle => (
                     self.keymap
                         .first_chord_bracket_label(item.label(), KeyAction::FsNavigatorToggle),
@@ -31806,6 +31998,106 @@ impl App {
             state: self.fs_overflow_panel_state,
             root_rows,
             navigator_corner: self.settings.fullscreen_navigator_corner.normalized(),
+            shift: self.spread_shift_hud_view(),
+        }
+    }
+
+    fn spread_shift_hud_view(&self) -> SpreadShiftHudView {
+        use crate::{app::spread_shift_owner::ViewerShift, spread_shift::*};
+        let enabled = self.spread_shift.availability == PairingEditAvailability::Automatic;
+        let saved = self
+            .spread_shift
+            .scope
+            .as_ref()
+            .and_then(|scope| self.spread_shift_service.as_ref()?.observed_row(scope));
+        let (status, reference, resolved, marker) = match &self.spread_shift.state {
+            ViewerShift::Book(SpreadShiftState::Adjusted {
+                anchor_ref,
+                resolution,
+                persistence,
+            }) => {
+                let resolved = match resolution {
+                    ShiftResolution::Resolved(idx) => Some(*idx),
+                    _ => None,
+                };
+                let status = if resolved.is_none() {
+                    "保存した基点が現在の一覧にありません"
+                } else {
+                    match persistence {
+                        ShiftPersistence::SessionOnly => "調整あり（この閲覧中のみ）",
+                        ShiftPersistence::Saving(_) => "調整あり（保存中）",
+                        ShiftPersistence::Saved(_) => "調整あり（記憶済み）",
+                        ShiftPersistence::SaveFailed => "保存できませんでした",
+                    }
+                };
+                (
+                    status.to_owned(),
+                    Some(anchor_ref.clone()),
+                    resolved,
+                    enabled.then_some(resolved.is_some()),
+                )
+            }
+            ViewerShift::Ordinary(idx) => (
+                "調整あり（この閲覧中のみ）".into(),
+                None,
+                Some(*idx),
+                enabled.then_some(true),
+            ),
+            _ => (
+                if !enabled {
+                    "本の構成で設定されています。組を変えるには本の構成を編集してください"
+                } else if !self.settings.remember_spread_shift_per_book && saved.is_some() {
+                    "保存済み調整あり（記憶 OFF・現在は未適用）"
+                } else {
+                    "調整なし"
+                }
+                .into(),
+                saved.clone(),
+                None,
+                None,
+            ),
+        };
+        let name = reference
+            .as_ref()
+            .map(|reference| match reference {
+                SpreadShiftPageRef::RelativePath(path) | SpreadShiftPageRef::ArchiveEntry(path) => {
+                    path.clone()
+                }
+                SpreadShiftPageRef::DocumentPageIdentity(page) => {
+                    format!("文書の {} ページ目", *page as u64 + 1)
+                }
+            })
+            .or_else(|| {
+                resolved.and_then(|idx| self.items.get(idx).map(|item| item.display_path()))
+            })
+            .unwrap_or_default();
+        let ordinal = (self.fs_overflow_panel_state == FsOverflowPanelState::SpreadAdjustment)
+            .then(|| {
+                resolved.and_then(|idx| {
+                    self.current_reader_order()
+                        .iter()
+                        .position(|slot| *slot == idx)
+                })
+            })
+            .flatten();
+        let anchor = ordinal.map_or_else(
+            || {
+                if name.is_empty() {
+                    String::new()
+                } else {
+                    format!("基点: {name}")
+                }
+            },
+            |ordinal| format!("基点: {} ページ目 / {name}", ordinal + 1),
+        );
+        SpreadShiftHudView {
+            status,
+            anchor,
+            jump_idx: resolved,
+            clear_enabled: !matches!(self.spread_shift.state, ViewerShift::None) || saved.is_some(),
+            enabled,
+            memory: self.settings.remember_spread_shift_per_book,
+            marker,
         }
     }
 
@@ -31867,6 +32159,8 @@ impl App {
         full_rect: egui::Rect,
         is_spread_double: bool,
     ) {
+        let nav = self.get_nav_indices();
+        self.spread_shift.resolve(&self.page_identity_index, &nav);
         let Some(panel_rect) = fs_overflow_panel_rect(full_rect, self.fs_overflow_panel_state)
         else {
             return;
@@ -31883,6 +32177,9 @@ impl App {
                 self.fs_overflow_panel_state = FsOverflowPanelState::Root;
             }
             FsOverflowPanelAction::Activate(item) => match item {
+                FullscreenOverflowItemId::SpreadAdjustment => {
+                    self.fs_overflow_panel_state = FsOverflowPanelState::SpreadAdjustment;
+                }
                 FullscreenOverflowItemId::NavigatorToggle => {
                     self.set_fullscreen_navigator_visible(
                         !self.settings.fullscreen_navigator_visible,
@@ -31905,6 +32202,37 @@ impl App {
             FsOverflowPanelAction::SetNavigatorCorner(corner) => {
                 self.set_fullscreen_navigator_corner(corner);
                 self.fs_overflow_panel_state = FsOverflowPanelState::Root;
+            }
+            FsOverflowPanelAction::JumpShiftAnchor(target) => {
+                if view.shift.enabled
+                    && let Some(fs_idx) = self.fullscreen_idx
+                {
+                    self.bump_input_seq("fs_shift_anchor_jump", None);
+                    self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+                    self.handle_fs_navigation(
+                        ctx,
+                        false,
+                        false,
+                        None,
+                        None,
+                        None,
+                        FsPageNav::None,
+                        Some(target),
+                        fs_idx,
+                    );
+                }
+            }
+            FsOverflowPanelAction::ClearShift => {
+                if view.shift.enabled {
+                    self.reset_live_spread_shift(true);
+                    self.normalize_spread_position(ctx);
+                }
+            }
+            FsOverflowPanelAction::SetShiftMemory(enabled) => {
+                if view.shift.enabled {
+                    self.spread_shift_memory_setting_changed(enabled);
+                    self.settings.save();
+                }
             }
         }
         ctx.request_repaint();
@@ -37931,7 +38259,7 @@ impl App {
             mode
         };
         if mode == self.spread_mode {
-            if self.spread_shift_anchor_idx.take().is_some() {
+            if self.reset_live_spread_shift(false) {
                 self.normalize_spread_position(ctx);
             }
             return;
@@ -37946,7 +38274,7 @@ impl App {
         if self.extracted_result_surface().is_none() {
             self.settings.update_active_favorite_spread_mode(mode);
         }
-        self.spread_shift_anchor_idx = None;
+        self.reset_live_spread_shift(false);
         self.update_reading_direction_from_spread_mode(mode);
         self.spread_popup_open = false;
         self.slideshow_popup_open = false;
@@ -37984,7 +38312,7 @@ impl App {
         if self.extracted_result_surface().is_none() {
             self.settings.update_active_favorite_reading_flow(flow);
         }
-        self.spread_shift_anchor_idx = None;
+        self.reset_live_spread_shift(false);
         self.reset_continuous_reading_transform();
         self.set_default_fullscreen_fit_for_flow(ctx, fs_idx, flow);
         if !flow.is_paged() {
@@ -38010,7 +38338,6 @@ impl App {
         if self.extracted_result_surface().is_none() {
             self.settings.update_active_favorite_spread_mode(new_mode);
         }
-        self.spread_shift_anchor_idx = None;
         self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
         true
     }
@@ -38035,6 +38362,7 @@ impl App {
             crate::logger::log(format!("spread: failed to save reading direction: {error}"));
             return;
         }
+        self.reset_live_spread_shift(false);
         self.reading_direction = direction;
         let spread_changed = self.sync_spread_mode_from_reading_direction();
         debug_assert!(direction_changed || spread_changed);
@@ -42753,6 +43081,7 @@ impl App {
         navigator_exclusion: Option<egui::Rect>,
         touch_chrome_latched: bool,
         touch_target_frame: u64,
+        shift_view: Option<&SpreadShiftHudView>,
     ) {
         let popup_wheel_owned = *fit_popup_open
             || *spread_popup_open
@@ -43560,6 +43889,9 @@ impl App {
             }
             let spread_resp = spread_resp.hover_tip_dark(spread_tip_parts.join(" / "));
             spread_resp_rect = spread_resp.rect;
+            if let Some(view) = shift_view {
+                draw_spread_shift_marker(ui, spread_resp.rect, view);
+            }
             if spread_resp.clicked() {
                 *spread_popup_open = !*spread_popup_open;
                 *fit_popup_open = false;
@@ -55788,6 +56120,7 @@ mod tests {
                         None,
                         false,
                         1,
+                        None,
                     );
                     positions = test_current_bar_button_targets(ctx)
                         .into_iter()
@@ -55952,6 +56285,7 @@ mod tests {
                         None,
                         false,
                         1,
+                        None,
                     );
                 });
         });
@@ -56399,7 +56733,14 @@ mod tests {
             full_rect.top() + TOP_BAR_HEIGHT + FS_OVERFLOW_PANEL_MARGIN
         );
         assert_eq!(root.right(), full_rect.right() - FS_OVERFLOW_PANEL_MARGIN);
-        assert_eq!(submenu, root);
+        assert_eq!(submenu.min, root.min);
+        assert_eq!(submenu.width(), root.width());
+        assert_eq!(
+            root.height() - submenu.height(),
+            FS_OVERFLOW_PANEL_ROW_HEIGHT
+        );
+        assert_eq!(root.height(), 348.0);
+        assert_eq!(submenu.height(), 300.0);
         assert_eq!(root.width(), FS_OVERFLOW_PANEL_WIDTH);
 
         let narrow = egui::Rect::from_min_size(egui::pos2(20.0, 30.0), egui::vec2(300.0, 180.0));
@@ -56457,6 +56798,13 @@ mod tests {
                     .show(ctx, |ui| {
                         let root_rows = vec![
                             FsOverflowPanelRow {
+                                item: FullscreenOverflowItemId::SpreadAdjustment,
+                                label: "見開きの調整".into(),
+                                status: "調整なし  >".into(),
+                                enabled: true,
+                                disabled_reason: None,
+                            },
+                            FsOverflowPanelRow {
                                 item: FullscreenOverflowItemId::NavigatorToggle,
                                 label: "ナビゲータ [Alt+N]".to_string(),
                                 status: "ON".to_string(),
@@ -56498,6 +56846,7 @@ mod tests {
                             state,
                             root_rows,
                             navigator_corner: FullscreenNavigatorCorner::BottomRight,
+                            shift: Default::default(),
                         };
                         let panel_rect = fs_overflow_panel_rect(ui.max_rect(), state).unwrap();
                         let _ = draw_fs_overflow_panel_surface(ui, panel_rect, &view);
@@ -57723,7 +58072,7 @@ mod tests {
 
             // The shift mutates the canonical unit before navigation capture. The holdover must
             // still use the unit that was actually painted, including its supplement role.
-            app.spread_shift_anchor_idx = Some(2);
+            app.set_spread_shift_anchor_for_test(Some(2));
             assert_ne!(
                 app.spread_display_composition_for_anchor(3)
                     .pages_in_screen_order(mode),
@@ -74029,7 +74378,7 @@ mod tests {
         let mut action = FsKeyAction::default();
         app.queue_spread_shift_action(0, 1, &mut action);
         assert!(action.page_nav.is_none());
-        assert_eq!(app.spread_shift_anchor_idx, None);
+        assert_eq!(app.spread_shift_anchor_idx(), None);
         app.spread_mode = SpreadMode::Single;
         app.queue_spread_shift_action(0, 1, &mut action);
         assert_eq!(action.page_nav, FsPageNav::Delta(1));
@@ -79877,6 +80226,7 @@ mod specified_scale_consumer_tests {
                         None,
                         false,
                         1,
+                        None,
                     );
                     *open = fit_popup_open;
                 });

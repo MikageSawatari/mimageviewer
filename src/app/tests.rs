@@ -4,6 +4,153 @@ use super::*;
 
 #[path = "tests/thumbnail_request_lifecycle.rs"]
 mod thumbnail_request_lifecycle;
+
+#[cfg(windows)]
+#[test]
+fn mixed_path_favorite_direct_navigation_standardizes_input_without_rewriting_saved_record() {
+    for folder_name in [
+        "mixed-input",
+        "mixed-input.zip",
+        "mixed-input.pdf",
+        "mixed-input.epub",
+        "mixed-input.7z",
+    ] {
+        for source in ["menu-toolbar", "gamepad-ring"] {
+            assert_mixed_path_favorite_direct_navigation(folder_name, source, |app, ctx| {
+                if source == "menu-toolbar" {
+                    // render_menubar / render_toolbar return this saved copy. App::update
+                    // sends it directly to open_direct_navigation_target, bypassing _owned.
+                    (
+                        app.settings.favorites[0].path.clone(),
+                        StartupListIntent::ExplicitList,
+                    )
+                } else {
+                    let nav = app
+                        .apply_ring_action(
+                            ctx,
+                            crate::ring_shortcut::RingShortcutContext::Grid,
+                            crate::ring_shortcut::RingActionId::favorite_slot_action(1).unwrap(),
+                            "mixed_favorite_regression",
+                        )
+                        .unwrap();
+                    let crate::ui_main::AddressBarNav::Direct(path, intent) = nav else {
+                        panic!("favorite input must produce a direct navigation");
+                    };
+                    (path, intent)
+                }
+            });
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(super) fn assert_mixed_path_favorite_direct_navigation(
+    folder_name: &str,
+    source: &str,
+    favorite_input: impl FnOnce(&mut App, &egui::Context) -> (PathBuf, StartupListIntent),
+) {
+    let mut app = phase_c_support::setup_app();
+    app.active_quick_folder_slot = None;
+    let folder = app.tmp.path().join(folder_name);
+    std::fs::create_dir(&folder).unwrap();
+    let origin = app.tmp.path().to_path_buf();
+    app.load_folder(origin);
+    app.finish_page_identity_preparation_for_test();
+    let spelling = folder.to_str().unwrap().replace('\\', "/").to_lowercase();
+    let spelling = spelling.replacen(&format!("/{folder_name}"), &format!("\\{folder_name}"), 1);
+    let stored = PathBuf::from(&spelling);
+    app.settings
+        .favorites
+        .push(crate::settings::FavoriteEntry::new(
+            "legacy spelling".to_owned(),
+            stored.clone(),
+        ));
+    let expected = crate::path_key::normalize_input_path(&stored);
+    let ctx = egui::Context::default();
+    let (path, restore_intent) = favorite_input(&mut app, &ctx);
+    assert_eq!(path.as_os_str(), stored.as_os_str());
+    let requires_classification = matches!(folder_name, "mixed-input.epub" | "mixed-input.7z");
+    assert_eq!(
+        App::path_needs_open_classification(&path),
+        requires_classification,
+        "{source}: {folder_name}"
+    );
+    // The same acceptance call as App::update's menu/toolbar/input_nav merge.
+    app.open_direct_navigation_target(
+        path,
+        None,
+        OpenRequestOwner::Navigation,
+        None,
+        None,
+        restore_intent,
+    );
+    let classification = app.top_level_grid_view.open_path_classification();
+    assert_eq!(
+        classification.is_some(),
+        requires_classification,
+        "{source}: {folder_name}"
+    );
+    if let Some(classification) = classification {
+        assert_eq!(classification.path.as_os_str(), expected.as_os_str());
+        assert!(matches!(
+            classification.continuation.as_deref(),
+            Some(ClassifiedOpenContinuation::DirectNavigation { .. })
+        ));
+    }
+    app.settle_open_path_classification_for_test();
+    app.finish_page_identity_preparation_for_test();
+    assert_eq!(
+        app.current_folder.as_ref().unwrap().as_os_str(),
+        expected.as_os_str(),
+        "{source}: {folder_name}"
+    );
+    assert_eq!(
+        app.address,
+        expected.to_string_lossy(),
+        "{source}: {folder_name}"
+    );
+    assert_eq!(
+        app.settings.favorites[0].path.as_os_str(),
+        stored.as_os_str()
+    );
+    app.set_startup_open_path(stored);
+    assert_eq!(
+        app.startup_open_path.as_ref().unwrap().as_os_str(),
+        expected.as_os_str()
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn mixed_path_history_replay_accepts_old_spelling_and_restores_the_same_folder() {
+    let mut app = phase_c_support::setup_app();
+    app.active_quick_folder_slot = None;
+    let origin = app.tmp.path().join("origin");
+    let destination = app.tmp.path().join("destination");
+    std::fs::create_dir(&origin).unwrap();
+    std::fs::create_dir(&destination).unwrap();
+    app.load_folder(origin.clone());
+    app.finish_page_identity_preparation_for_test();
+    assert!(
+        app.apply_fullscreen_close_nav_immediate(crate::ui_main::AddressBarNav::Direct(
+            destination,
+            StartupListIntent::ExplicitList,
+        ))
+    );
+    app.finish_page_identity_preparation_for_test();
+    let old = PathBuf::from(origin.to_str().unwrap().replace('\\', "/").to_lowercase());
+    let mut snapshot = app.folder_nav_history_snapshot();
+    snapshot.back_stack.last_mut().unwrap().location = FolderNavHistoryTarget::Path(old.clone());
+    app.restore_folder_nav_history(snapshot);
+    app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
+    app.finish_history_restore_preparation_for_test();
+    assert_eq!(
+        app.current_folder.as_ref().unwrap().as_os_str(),
+        crate::path_key::normalize_input_path(&old).as_os_str()
+    );
+    assert!(app.folder_nav_history_snapshot().back_stack.is_empty());
+}
+
 impl App {
     pub(crate) fn folder_order_refresh_pending_for_test(&self) -> bool {
         self.folder_pane_open_pending
@@ -1218,6 +1365,7 @@ fn mutation_refresh_synthetic_materialization_rejects_changed_cache_owner() {
         video_pin_blobs: None,
         video_items: None,
         container_state: None,
+        shift_read: None,
     };
     let new_map = Arc::new(std::sync::RwLock::new(Default::default()));
     app.current_color_cache_map = Some(new_map.clone());
@@ -1663,6 +1811,7 @@ fn mutation_refresh_import_pin_snapshot_retires_only_superseded_materialization_
             ratings: true,
             ..Default::default()
         },
+        &Default::default(),
     );
     assert_eq!(ratings_only.len(), 1);
     assert_eq!(ratings_only[0].context_id, main_id);
@@ -1676,6 +1825,7 @@ fn mutation_refresh_import_pin_snapshot_retires_only_superseded_materialization_
             thumbnail_pins: true,
             ..Default::default()
         },
+        &Default::default(),
     );
     assert_eq!(pin_requests.len(), 1);
     assert_eq!(pin_requests[0].context_id, main_id);
@@ -4349,6 +4499,7 @@ fn metadata_import_keeps_unaffected_thumb_adjustment() {
         video_pin_blobs: None,
         video_items: None,
         container_state: None,
+        shift_read: None,
     };
     assert!(app.apply_current_metadata_import_terminal_result(
         result,
@@ -4403,6 +4554,7 @@ fn phase_a2_metadata_import_updates_virtual_keyed_owner() {
         video_pin_blobs: None,
         video_items: None,
         container_state: None,
+        shift_read: None,
     };
     let changed = crate::metadata_transfer::ImportChangedSections {
         page_state: true,
@@ -6695,7 +6847,7 @@ fn spread_page_dims_survive_fs_cache_and_thumbnail_eviction() {
         .collect();
     app.items_generation = 7;
     app.spread_mode = crate::settings::SpreadMode::Rtl;
-    app.spread_shift_anchor_idx = None;
+    app.set_spread_shift_anchor_for_test(None);
 
     let portrait_tex = ctx.load_texture(
         "spread_portrait_thumb",
@@ -6974,7 +7126,7 @@ fn spread_cache_token_tracks_every_pairing_input() {
         2
     );
 
-    app.spread_shift_anchor_idx = Some(2);
+    app.set_spread_shift_anchor_for_test(Some(2));
     app.spread_display_unit_pages_for_test(&nav);
     assert_eq!(
         crate::ui_fullscreen::spread_display_units_build_count_for_test(),
@@ -7375,6 +7527,7 @@ fn metadata_context_result(
         video_pin_blobs: None,
         video_items: None,
         container_state: None,
+        shift_read: None,
     }
 }
 
@@ -7787,7 +7940,7 @@ fn metadata_refresh_context_identity_survives_closing_an_earlier_window() {
     app.begin_metadata_import_terminal_refresh();
     while !app.advance_metadata_import_terminal_refresh(&import_root, false) {}
     let request = app
-        .take_metadata_import_refresh_requests(Default::default())
+        .take_metadata_import_refresh_requests(Default::default(), &Default::default())
         .into_iter()
         .find(|request| request.context_id == target_context_id)
         .expect("the target window must have a refresh request before the earlier close");
@@ -7853,7 +8006,7 @@ fn metadata_refresh_context_identity_survives_main_promotion() {
     app.begin_metadata_import_terminal_refresh();
     while !app.advance_metadata_import_terminal_refresh(&import_root, false) {}
     let request = app
-        .take_metadata_import_refresh_requests(Default::default())
+        .take_metadata_import_refresh_requests(Default::default(), &Default::default())
         .into_iter()
         .find(|request| request.context_id == requested_context_id)
         .expect("the context bound as main at request time must have a refresh request");
@@ -7920,7 +8073,8 @@ fn metadata_request_bakes_context_identity_across_bundleless_window() {
 
     app.begin_metadata_import_terminal_refresh();
     while !app.advance_metadata_import_terminal_refresh(&import_root, false) {}
-    let requests = app.take_metadata_import_refresh_requests(Default::default());
+    let requests =
+        app.take_metadata_import_refresh_requests(Default::default(), &Default::default());
 
     assert!(
         requests
@@ -9060,7 +9214,8 @@ fn metadata_import_terminal_index_build_is_split_and_compact() {
     assert!((1..=2_048).contains(&first_frame_items));
 
     while !app.advance_metadata_import_terminal_refresh(&root, false) {}
-    let requests = app.take_metadata_import_refresh_requests(Default::default());
+    let requests =
+        app.take_metadata_import_refresh_requests(Default::default(), &Default::default());
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].items.len(), 5_000);
     assert_eq!(requests[0].folder_pin_paths, vec![root]);
@@ -9171,6 +9326,7 @@ fn metadata_import_terminal_refresh_reaches_main_and_detached_context_for_same_b
         video_pin_blobs: None,
         video_items: None,
         container_state: None,
+        shift_read: None,
     };
     let result = crate::app::metadata_import_refresh::RefreshResult {
         contexts: vec![context(main_id), context(detached_id)],
@@ -9317,7 +9473,8 @@ fn parked_pdf_metadata_request_includes_container_rating_key() {
 
     app.begin_metadata_import_terminal_refresh();
     while !app.advance_metadata_import_terminal_refresh(&root, false) {}
-    let requests = app.take_metadata_import_refresh_requests(Default::default());
+    let requests =
+        app.take_metadata_import_refresh_requests(Default::default(), &Default::default());
     let request = requests
         .iter()
         .find(|request| request.context_id == parked_id)
@@ -10032,6 +10189,7 @@ fn metadata_import_terminal_refresh_rejects_stale_items_generation() {
             video_pin_blobs: None,
             video_items: None,
             container_state: None,
+            shift_read: None,
         }],
         page_snapshot: None,
         errors: Vec::new(),
@@ -10167,6 +10325,7 @@ fn metadata_import_terminal_refresh_keeps_untagged_loaded_and_restarts_rating_re
         video_pin_blobs: None,
         video_items: None,
         container_state: None,
+        shift_read: None,
     };
     let result = crate::app::metadata_import_refresh::RefreshResult {
         contexts: vec![context(main_id), context(active_id), context(paused_id)],
@@ -38562,7 +38721,7 @@ mod favorite_adjustment_defaults_tests {
             app.visible_indices = (0..5).collect();
             app.viewer_navigation_caches.invalidate();
             app.spread_mode = mode;
-            app.spread_shift_anchor_idx = anchor;
+            app.set_spread_shift_anchor_for_test(anchor);
             app.fullscreen_idx = Some(final_unit_start);
 
             assert_eq!(
@@ -38624,7 +38783,7 @@ mod favorite_adjustment_defaults_tests {
             .compute_spread_offset_nudge(0, 1)
             .expect("前方ずらしは範囲内");
         assert_eq!(new_idx, 1);
-        app.spread_shift_anchor_idx = Some(anchor_idx);
+        app.set_spread_shift_anchor_for_test(Some(anchor_idx));
         app.fullscreen_idx = Some(new_idx);
         assert_eq!(
             app.resolve_spread_pair(new_idx),
@@ -38637,7 +38796,7 @@ mod favorite_adjustment_defaults_tests {
             .compute_spread_offset_nudge(1, 1)
             .expect("前方ずらしは範囲内");
         assert_eq!(new_idx, 2);
-        app.spread_shift_anchor_idx = Some(anchor_idx);
+        app.set_spread_shift_anchor_for_test(Some(anchor_idx));
         app.fullscreen_idx = Some(new_idx);
         assert_eq!(
             app.resolve_spread_pair(new_idx),
@@ -38679,7 +38838,7 @@ mod favorite_adjustment_defaults_tests {
             anchor_idx, 0,
             "表紙ありでは先頭から組み直し、直前ページの孤立を避ける"
         );
-        app.spread_shift_anchor_idx = Some(anchor_idx);
+        app.set_spread_shift_anchor_for_test(Some(anchor_idx));
         app.fullscreen_idx = Some(new_idx);
         assert_eq!(
             app.resolve_spread_pair(new_idx),
@@ -38739,7 +38898,7 @@ mod favorite_adjustment_defaults_tests {
             .compute_spread_offset_nudge(1, -1)
             .expect("後方ずらしは範囲内");
         assert_eq!(new_idx, 0);
-        app.spread_shift_anchor_idx = Some(anchor_idx);
+        app.set_spread_shift_anchor_for_test(Some(anchor_idx));
         assert_eq!(
             app.resolve_spread_pair(new_idx),
             SpreadPair::Double { left: 0, right: 1 }
@@ -38774,7 +38933,7 @@ mod favorite_adjustment_defaults_tests {
             .compute_spread_offset_nudge(0, 1)
             .expect("ずらしは範囲内");
         assert_eq!(new_idx, 1);
-        app.spread_shift_anchor_idx = Some(anchor_idx);
+        app.set_spread_shift_anchor_for_test(Some(anchor_idx));
         assert_eq!(
             app.resolve_spread_pair(1),
             SpreadPair::Double { left: 2, right: 1 },
@@ -38804,7 +38963,7 @@ mod favorite_adjustment_defaults_tests {
             .compute_spread_offset_nudge(0, 1)
             .expect("2ページ見開きから末尾単独表示へのずらしは有効");
         assert_eq!(new_idx, 1);
-        app.spread_shift_anchor_idx = Some(anchor_idx);
+        app.set_spread_shift_anchor_for_test(Some(anchor_idx));
         app.fullscreen_idx = Some(new_idx);
 
         assert!(
@@ -45510,7 +45669,8 @@ mod favorite_adjustment_defaults_tests {
 
         app.begin_metadata_import_terminal_refresh();
         while !app.advance_metadata_import_terminal_refresh(Path::new(r"C:\test"), false) {}
-        let requests = app.take_metadata_import_refresh_requests(Default::default());
+        let requests =
+            app.take_metadata_import_refresh_requests(Default::default(), &Default::default());
         assert_eq!(requests.len(), 1);
         let request = &requests[0];
         let effective = crate::path_key::normalize_keep_drive(&zip_path.join("bookB").join("only"));
@@ -51281,7 +51441,7 @@ mod pipeline_cache_refactor_tests {
         assert_eq!(app.fs_display_unit_page_indices(1), vec![2, 1]);
 
         app.spread_mode = crate::settings::SpreadMode::LtrCover;
-        app.spread_shift_anchor_idx = Some(5);
+        app.set_spread_shift_anchor_for_test(Some(5));
         assert_eq!(app.fs_display_unit_page_indices(4), vec![4]);
         assert_eq!(app.fs_display_unit_page_indices(5), vec![5, 6]);
         assert_eq!(app.fs_display_unit_page_indices(7), vec![7]);
@@ -83861,7 +84021,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         }));
 
         app.slideshow_anchor_idx = Some(before);
-        app.spread_shift_anchor_idx = Some(excluded);
+        app.set_spread_shift_anchor_for_test(Some(excluded));
         app.fs_pdf_rerender_demand.note_legacy(video, 1.0);
         app.slideshow_scroll_range_cache = Some((video, 1.0, 2.0));
         let _ = app.collect_image_indices();
@@ -83881,7 +84041,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert!(app.fs_nav_locked_gen.is_none());
         assert!(app.fs_holdover_tex.is_none());
         assert_eq!(app.slideshow_anchor_idx, Some(2));
-        assert_eq!(app.spread_shift_anchor_idx, None);
+        assert_eq!(app.spread_shift_anchor_idx(), None);
         assert_eq!(app.fs_pdf_rerender_demand.legacy_idx(), Some(1));
         assert!(app.slideshow_scroll_range_cache.is_none());
         assert!(!app.viewer_navigation_caches.has_entries_for_test());

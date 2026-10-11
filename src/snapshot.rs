@@ -482,16 +482,31 @@ impl Default for FilterState {
 }
 
 /// Runtime presentation paired with the original rows in the existing snapshot owner.
-/// The shift index uses the saved row basis, rather than the extracted subset basis.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// The shift owner uses the saved book/row basis, rather than the extracted subset basis.
+#[derive(Debug, PartialEq)]
 pub(crate) struct SnapshotViewingState {
     pub mode: crate::settings::SpreadMode,
     pub direction: crate::settings::ReadingDirection,
     pub flow: crate::settings::ReadingFlow,
-    pub shift_anchor: Option<usize>,
+    pub shift: crate::app::spread_shift_owner::ViewerSpreadShift,
     pub final_cover: crate::settings::FinalCoverSpreadPreference,
     pub endpoints: crate::settings::SingletonSpreadEndpointPreferences,
     pub page_alone: crate::settings::PageAlonePreferences,
+}
+
+impl Clone for SnapshotViewingState {
+    fn clone(&self) -> Self {
+        Self {
+            mode: self.mode,
+            direction: self.direction,
+            flow: self.flow,
+            // Snapshot forks follow the same accepted-session boundary as live viewers.
+            shift: self.shift.fork_accepted(),
+            final_cover: self.final_cover,
+            endpoints: self.endpoints,
+            page_alone: self.page_alone,
+        }
+    }
 }
 
 /// `App` が snapshot active 中に保持する state。`App.snapshot: Option<SnapshotState>` で

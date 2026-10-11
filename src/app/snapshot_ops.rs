@@ -221,7 +221,7 @@ impl App {
             mode: self.spread_mode,
             direction: self.reading_direction,
             flow: self.reading_flow,
-            shift_anchor: self.spread_shift_anchor_idx,
+            shift: self.spread_shift.fork_accepted(),
             final_cover: self.final_cover_spread_preference,
             endpoints: self.singleton_spread_endpoint_preferences,
             page_alone: self.page_alone_preferences,
@@ -232,7 +232,7 @@ impl App {
         self.spread_mode = state.mode;
         self.reading_direction = state.direction;
         self.reading_flow = state.flow;
-        self.spread_shift_anchor_idx = state.shift_anchor;
+        self.spread_shift = state.shift;
         self.final_cover_spread_preference = state.final_cover;
         self.singleton_spread_endpoint_preferences = state.endpoints;
         self.page_alone_preferences = state.page_alone;
@@ -286,7 +286,6 @@ impl App {
             .collect();
 
         self.slideshow_anchor_idx = self.slideshow_anchor_idx.and_then(&remap);
-        self.spread_shift_anchor_idx = self.spread_shift_anchor_idx.and_then(&remap);
         self.fs_pdf_rerender_demand.remap_indices(&remap);
         self.fs_continuous_fit_reference.remap_indices(&remap);
 
@@ -438,6 +437,12 @@ impl App {
         self.cancel_media_navigation_pending_for_current_context("snapshot_items_swap");
         self.cancel_pending_folder_nav();
 
+        // The list owns the pairing anchor even after Esc closes its reader. Remap
+        // at the items-swap boundary for every outcome, exactly once.
+        let old_to_new = self.snapshot_exact_idx_map(target_membership);
+        self.spread_shift
+            .remap_with(&|idx| old_to_new.get(&idx).copied());
+
         let Some(old_fullscreen_idx) = self.fullscreen_idx else {
             crate::logger::log(format!(
                 "[snapshot] {phase}: no open reader to reconcile (items={})",
@@ -478,7 +483,6 @@ impl App {
             target_membership.len()
         ));
 
-        let old_to_new = self.snapshot_exact_idx_map(target_membership);
         let opened_media_path = self
             .items
             .get(old_fullscreen_idx)
@@ -879,6 +883,11 @@ impl App {
             membership.insert(entry.key.clone(), idx);
         }
 
+        // Park the original presentation before the index-swap helper remaps live state.
+        // Its book anchor stays on saved_items, even when the subset drops preceding rows.
+        let mut saved_viewing_state = self.capture_snapshot_viewing_state();
+        saved_viewing_state.shift = std::mem::take(&mut self.spread_shift);
+        saved_viewing_state.shift.cancel_retained_readoption();
         // Preserve or close the open viewer while the old index space and player are alive.
         let viewer_index_swap = self.prepare_snapshot_viewer_index_swap("activate", &membership);
 
@@ -907,7 +916,6 @@ impl App {
         let list_view_thumbnails = captured_thumbnails.clone();
         let list_view_image_metas = captured_image_metas.clone();
         let saved_page_identity_index = self.page_identity_index.clone();
-        let saved_viewing_state = self.capture_snapshot_viewing_state();
         let saved_projection_recipe = std::mem::replace(
             &mut self.projection_recipe,
             super::book_materialization::ProjectionRecipe::ExtractedResult(
@@ -974,6 +982,8 @@ impl App {
             list_view_page_identity_index: Default::default(),
             pre_snapshot_search_origin,
         });
+        // The original shift owner is parked above; the extracted list has no Book scope.
+        self.spread_shift.detach_book_scope_for_ordinary_list();
         let return_origin = top_level_return.map(|restore| {
             let route = self
                 .top_level_grid_view
@@ -1335,7 +1345,7 @@ impl App {
             self.invalidate_snapshot_details_index_state();
             self.finish_snapshot_viewer_index_swap(viewer_index_swap);
             // Complete this same retained-list adoption with the saved presentation. Its
-            // shift index already belongs to saved_items and must not be subset-remapped.
+            // shift owner already belongs to saved_items and must not be subset-remapped.
             // DirectMedia is an ordinary reader, so retain its existing return behavior.
             if !matches!(snap.source_label, SnapshotSourceLabel::DirectMedia { .. }) {
                 self.restore_snapshot_viewing_state(snap.saved_viewing_state);
@@ -3303,7 +3313,7 @@ mod tests {
         app.finish_page_identity_preparation_for_test();
         let original_recipe = ProjectionRecipe::Book(BookScope::ImageFolder(book));
         assert_eq!(app.projection_recipe, original_recipe);
-        app.spread_shift_anchor_idx = Some(1);
+        app.set_spread_shift_anchor_for_test(Some(1));
         let source_items = app.items.clone();
         let before = app.capture_snapshot_viewing_state();
         let observer = rusqlite::Connection::open(&db_path).unwrap();
@@ -3395,7 +3405,7 @@ mod tests {
         let original = ProjectionRecipe::Book(BookScope::ImageFolder(PathBuf::from(r"E:\test")));
         app.projection_recipe = original.clone();
         app.spread_mode = crate::settings::SpreadMode::RtlCover;
-        app.spread_shift_anchor_idx = Some(0);
+        app.set_spread_shift_anchor_for_test(Some(0));
         let before = app.capture_snapshot_viewing_state();
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
         drain_snapshot_identity_preparation(&mut app);
@@ -3443,7 +3453,7 @@ mod tests {
         app.projection_recipe =
             ProjectionRecipe::Book(BookScope::ImageFolder(PathBuf::from(r"E:\test")));
         app.spread_mode = crate::settings::SpreadMode::RtlCover;
-        app.spread_shift_anchor_idx = Some(0);
+        app.set_spread_shift_anchor_for_test(Some(0));
         let book_state = app.capture_snapshot_viewing_state();
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
         app.apply_fullscreen_spread_mode(
@@ -3498,6 +3508,64 @@ mod tests {
         assert_eq!(app.items.len(), 2);
         assert_eq!(app.scroll_offset_y, 123.0);
         assert_eq!(app.selected, Some(1));
+    }
+
+    #[test]
+    fn g1_snapshot_restores_book_pairing_and_remaps_reader_target_exactly_once() {
+        use super::super::spread_shift_owner::ViewerShift;
+        use crate::spread_shift::{
+            ShiftPersistence, ShiftResolution, SpreadShiftPageRef, SpreadShiftState,
+        };
+
+        for reader_open in [false, true] {
+            let mut app = setup_app_for_test();
+            app.current_folder = Some(PathBuf::from("c:/books/book"));
+            app.projection_recipe = super::super::book_materialization::ProjectionRecipe::Book(
+                super::super::book_materialization::BookScope::ImageFolder(
+                    app.current_folder.clone().unwrap(),
+                ),
+            );
+            app.items = (0..6)
+                .map(|idx| GridItem::Image(PathBuf::from(format!("c:/books/book/{idx}.jpg"))))
+                .collect();
+            app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending; 6];
+            app.visible_indices = vec![1, 3, 5];
+            app.page_identity_index = std::sync::Arc::new(
+                super::super::file_type_resume::PreparedPageIdentityIndex::prepare(
+                    &app.items,
+                    None,
+                    Default::default(),
+                ),
+            );
+            app.spread_shift.scope =
+                Some(crate::book_scope::BookScopeKey::folder("c:/books/book").unwrap());
+            app.spread_shift.state = ViewerShift::Book(SpreadShiftState::Adjusted {
+                anchor_ref: SpreadShiftPageRef::RelativePath("3.jpg".into()),
+                resolution: ShiftResolution::Resolved(3),
+                persistence: ShiftPersistence::SessionOnly,
+            });
+            let original_shift = app.spread_shift.clone();
+            app.fullscreen_idx = reader_open.then_some(3);
+            app.activate_snapshot(SnapshotSourceLabel::Mixed);
+            assert!(app.extracted_result_surface().is_some());
+            assert_eq!(app.spread_mode, crate::settings::SpreadMode::Single);
+            assert_eq!(app.spread_shift.scope, None);
+            assert_eq!(app.spread_shift.state, ViewerShift::None);
+            assert_eq!(
+                app.snapshot.as_ref().unwrap().saved_viewing_state.shift,
+                original_shift,
+                "the book identity stays on the original row basis, outside A2",
+            );
+            assert_eq!(app.fullscreen_idx, reader_open.then_some(1));
+            drain_snapshot_identity_preparation(&mut app);
+            app.deactivate_snapshot();
+            assert_eq!(app.spread_shift, original_shift);
+            assert!(matches!(
+                app.projection_recipe,
+                super::super::book_materialization::ProjectionRecipe::Book(_)
+            ));
+            assert_eq!(app.fullscreen_idx, reader_open.then_some(3));
+        }
     }
 
     #[test]

@@ -33,6 +33,7 @@ enum Stage {
     WaitingForWriters,
     Running,
     WaitingForEditPreviewClear(Receiver<Result<(), String>>),
+    WaitingForSpreadShiftReload,
     RefreshPreparing,
     Refreshing,
     Result(ResultState),
@@ -154,6 +155,7 @@ impl MetadataTransferState {
                 | Stage::WaitingForWriters
                 | Stage::Running
                 | Stage::WaitingForEditPreviewClear(_)
+                | Stage::WaitingForSpreadShiftReload
                 | Stage::RefreshPreparing
                 | Stage::Refreshing
         )
@@ -315,7 +317,11 @@ impl App {
             || self.book_op_pending.is_some()
             || self.capture_pending.is_some()
             || self.export_pending.is_some()
-            || self.batch_convert.is_some())
+            || self.batch_convert.is_some()
+            || self
+                .spread_shift_service
+                .as_ref()
+                .is_some_and(|service| service.is_busy()))
     }
 
     fn metadata_transfer_writers_busy(
@@ -323,6 +329,24 @@ impl App {
         release_tag_db_for_import: bool,
     ) -> Result<bool, String> {
         self.metadata_transfer_writers_busy_for_sidecar_restore(release_tag_db_for_import)
+    }
+
+    // Move the existing transfer owner locally while admitting context reads. This
+    // retains the committed scope set without cloning it or deriving it from manifest flags.
+    fn start_ready_metadata_import_refresh(&mut self) {
+        let Some(mut state) = self.metadata_transfer.take() else {
+            return;
+        };
+        let requests = match state.pending_import_result.as_ref() {
+            Some(Ok(summary)) => {
+                self.take_metadata_import_refresh_requests(summary.changed, &summary.committed)
+            }
+            _ => {
+                self.take_metadata_import_refresh_requests(Default::default(), &Default::default())
+            }
+        };
+        start_metadata_import_refresh_worker(&mut state, requests);
+        self.metadata_transfer = Some(state);
     }
 
     pub(crate) fn show_metadata_transfer_dialog(&mut self, ctx: &egui::Context) {
@@ -383,13 +407,17 @@ impl App {
                         sidecars: std::mem::take(&mut self.sidecars),
                         tags_db: self.tags_db.take(),
                     };
+                    let observer = self
+                        .content_identity_recorder
+                        .as_ref()
+                        .map(|recorder| recorder.producer());
                     if let Some(state) = self.metadata_transfer.as_mut() {
                         state.pending_view_trim = pending_view_trim;
                         let batch = state
                             .pending_view_trim
                             .as_ref()
                             .map(|pending| pending.batch.clone());
-                        if !start_import_worker(state, resources, batch) {
+                        if !start_import_worker(state, resources, batch, observer) {
                             restore_view_trim = state.pending_view_trim.take();
                             import_start_failed = true;
                         }
@@ -407,21 +435,16 @@ impl App {
             matches!(state.stage, Stage::RefreshPreparing)
                 .then(|| (state.root.clone(), state.recursive))
         });
-        let refresh_ready = refresh_target.as_ref().is_some_and(|(root, recursive)| {
-            self.advance_metadata_import_terminal_refresh(root, *recursive)
-        });
+        let shift_ready = self
+            .spread_shift_service
+            .as_ref()
+            .is_none_or(|service| service.is_ready());
+        let refresh_ready = shift_ready
+            && refresh_target.as_ref().is_some_and(|(root, recursive)| {
+                self.advance_metadata_import_terminal_refresh(root, *recursive)
+            });
         if refresh_ready {
-            let changed = self
-                .metadata_transfer
-                .as_ref()
-                .and_then(|state| state.pending_import_result.as_ref())
-                .and_then(|result| result.as_ref().ok())
-                .map(|summary| summary.changed)
-                .unwrap_or_default();
-            let requests = self.take_metadata_import_refresh_requests(changed);
-            if let Some(state) = self.metadata_transfer.as_mut() {
-                start_metadata_import_refresh_worker(state, requests);
-            }
+            self.start_ready_metadata_import_refresh();
         }
         // Thread creation failure reaches Result without a receiver message, so
         // return the moved DB/sidecar ownership in the same frame as well.
@@ -488,6 +511,7 @@ impl App {
                     | Stage::WaitingForWriters
                     | Stage::Running
                     | Stage::WaitingForEditPreviewClear(_)
+                    | Stage::WaitingForSpreadShiftReload
                     | Stage::RefreshPreparing
                     | Stage::Refreshing
             )
@@ -518,6 +542,19 @@ impl App {
         let mut restore_view_trim = None;
         let mut terminal_refresh = None;
         let mut begin_terminal_refresh = false;
+        if self
+            .metadata_transfer
+            .as_ref()
+            .is_some_and(|state| matches!(state.stage, Stage::WaitingForSpreadShiftReload))
+            && self
+                .spread_shift_service
+                .as_ref()
+                .is_none_or(|service| service.is_ready())
+            && let Some(state) = self.metadata_transfer.as_mut()
+        {
+            state.stage = Stage::RefreshPreparing;
+            begin_terminal_refresh = true;
+        }
         let mut request_edit_preview_clear = false;
         let mut restart_terminal_refresh = false;
         let mut committed_thumbnail_pin_changes = 0usize;
@@ -682,7 +719,17 @@ impl App {
             }
         }
         if begin_terminal_refresh {
-            self.begin_metadata_import_terminal_refresh();
+            if self
+                .spread_shift_service
+                .as_ref()
+                .is_some_and(|service| !service.is_ready())
+            {
+                if let Some(state) = self.metadata_transfer.as_mut() {
+                    state.stage = Stage::WaitingForSpreadShiftReload;
+                }
+            } else {
+                self.begin_metadata_import_terminal_refresh();
+            }
         }
         self.restore_metadata_import_resources();
         if let Some(refresh) = terminal_refresh {
@@ -739,6 +786,7 @@ impl App {
                 && matches!(
                     state.stage,
                     Stage::WaitingForEditPreviewClear(_)
+                        | Stage::WaitingForSpreadShiftReload
                         | Stage::RefreshPreparing
                         | Stage::Refreshing
                         | Stage::Result(ResultState::Import(_))
@@ -834,6 +882,12 @@ fn draw_dialog(
                 });
                 ui.label(format!("記載項目: {} 件", preview.entries));
                 ui.label(format!("適用可能: {} 件", preview.existing_entries));
+                ui.label(format!(
+                    "見開きの調整: 追加 {} / 置換 {} / 解除 {}",
+                    preview.spread_shift_additions,
+                    preview.spread_shift_replacements,
+                    preview.spread_shift_removals,
+                ));
                 if preview.missing_entries > 0 {
                     ui.label(format!(
                         "見つからないためスキップ: {} 件",
@@ -861,6 +915,7 @@ fn draw_dialog(
                     "評価・タグ・ブックマーク・見開き・表示トリム・回転・ページ編集・代表サムネを含みます。",
                 );
                 ui.small("このメタ情報に記載がない項目の既存メタ情報は保持します。");
+                ui.small("見開きの調整は搬送範囲を上書きし、範囲内の未記載の本・章は解除します。旧形式で調整の記載がない場合は保持します。");
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     if ui.button("インポート").clicked() {
@@ -896,6 +951,7 @@ fn draw_dialog(
                 }
             }
             Stage::WaitingForEditPreviewClear(_)
+            | Stage::WaitingForSpreadShiftReload
             | Stage::RefreshPreparing
             | Stage::Refreshing => {
                 ui.label("表示用メタ情報を更新しています…");
@@ -1010,7 +1066,7 @@ fn draw_result(ui: &mut egui::Ui, result: &ResultState, recursive: bool) {
                 "このフォルダ直下のみ"
             };
             ui.label(format!(
-                "{} 項目（走査範囲: {scope}） / 評価 {} / タグ付き {} / 時刻ブックマーク {} / 本ブックマーク {} / ページ設定 {} / 本・フォルダ設定 {} / サムネピン {}",
+                "{} 項目（走査範囲: {scope}） / 評価 {} / タグ付き {} / 時刻ブックマーク {} / 本ブックマーク {} / ページ設定 {} / 本・フォルダ設定 {} / 見開き調整 {} / サムネピン {}",
                 summary.entries,
                 summary.ratings,
                 summary.tagged_items,
@@ -1018,6 +1074,7 @@ fn draw_result(ui: &mut egui::Ui, result: &ResultState, recursive: bool) {
                 summary.book_bookmarks,
                 summary.page_states,
                 summary.container_states,
+                summary.spread_shifts,
                 summary.thumbnail_pins,
             ));
             if summary.skipped_reparse_directories > 0 {
@@ -1058,6 +1115,12 @@ fn draw_result(ui: &mut egui::Ui, result: &ResultState, recursive: bool) {
                 summary.failed_entries,
                 summary.total_entries
             ));
+            ui.label(format!(
+                "見開きの調整: 追加 {} / 置換 {} / 解除 {}",
+                summary.committed.spread_shift_additions,
+                summary.committed.spread_shift_replacements,
+                summary.committed.spread_shift_removals,
+            ));
             if summary.skipped_kind_mismatch > 0 {
                 ui.colored_label(
                     ui.visuals().warn_fg_color,
@@ -1093,6 +1156,7 @@ fn draw_result(ui: &mut egui::Ui, result: &ResultState, recursive: bool) {
 
 fn start_preview_worker(state: &mut MetadataTransferState) {
     let root = state.root.clone();
+    let data_dir = crate::data_dir::get();
     let cancel = Arc::clone(&state.cancel);
     let (tx, rx) = mpsc::sync_channel(WORKER_CHANNEL_CAPACITY);
     state.rx = Some(rx);
@@ -1101,11 +1165,19 @@ fn start_preview_worker(state: &mut MetadataTransferState) {
         .name("metadata-import-preview".to_string())
         .spawn(move || {
             let mut progress_relay = ProgressRelay::new(tx.clone());
-            let result =
-                crate::metadata_transfer::inspect_import_at(&root, &cancel, move |value| {
-                    progress_relay.send(value);
-                })
-                .map_err(|error| error.to_string());
+            let lease = crate::spread_shift::maintenance_at(&data_dir);
+            let result = lease.as_ref().map_err(Clone::clone).and_then(|_| {
+                crate::metadata_transfer::inspect_import_with_data_at(
+                    &data_dir,
+                    &root,
+                    &cancel,
+                    move |value| {
+                        progress_relay.send(value);
+                    },
+                )
+                .map_err(|error| error.to_string())
+            });
+            drop(lease);
             let _ = tx.send(WorkerMessage::Preview(result));
         });
     match spawn {
@@ -1133,7 +1205,11 @@ fn start_export_worker(
         .name("metadata-export".to_string())
         .spawn(move || {
             let mut progress_relay = ProgressRelay::new(tx.clone());
-            let preparation = flush_view_trim_batch(&data_dir, view_trim_batch.as_ref(), "export");
+            let lease = crate::spread_shift::maintenance_at(&data_dir);
+            let preparation = lease
+                .as_ref()
+                .map_err(Clone::clone)
+                .and_then(|_| flush_view_trim_batch(&data_dir, view_trim_batch.as_ref(), "export"));
             let view_trim_saved = preparation.is_ok();
             let result = preparation.and_then(|()| {
                 crate::metadata_transfer::export_at(
@@ -1147,6 +1223,7 @@ fn start_export_worker(
                 )
                 .map_err(|error| error.to_string())
             });
+            drop(lease);
             let _ = tx.send(WorkerMessage::Export {
                 result,
                 view_trim_saved,
@@ -1169,6 +1246,17 @@ fn start_import_worker(
     state: &mut MetadataTransferState,
     resources: ImportWorkerResources,
     view_trim_batch: Option<crate::view_trim_db::ViewTrimWriteBatch>,
+    observer: Option<crate::content_identity::ContentIdentityProducer>,
+) -> bool {
+    start_import_worker_with_progress(state, resources, view_trim_batch, observer, |_| {})
+}
+
+fn start_import_worker_with_progress(
+    state: &mut MetadataTransferState,
+    resources: ImportWorkerResources,
+    view_trim_batch: Option<crate::view_trim_db::ViewTrimWriteBatch>,
+    observer: Option<crate::content_identity::ContentIdentityProducer>,
+    mut on_progress: impl FnMut(&TransferProgress) + Send + 'static,
 ) -> bool {
     if let Some(preview_handle) = state.handle.take() {
         let _ = preview_handle.join();
@@ -1200,14 +1288,18 @@ fn start_import_worker(
 
             let mut progress_relay = ProgressRelay::new(tx.clone());
             let preparation_started = std::time::Instant::now();
-            let view_trim_result =
-                flush_view_trim_batch(&data_dir, view_trim_batch.as_ref(), "import");
+            let lease = crate::spread_shift::maintenance_at(&data_dir);
+            let view_trim_result = lease
+                .as_ref()
+                .map_err(Clone::clone)
+                .and_then(|_| flush_view_trim_batch(&data_dir, view_trim_batch.as_ref(), "import"));
             let view_trim_saved = view_trim_result.is_ok();
             let flush_result = view_trim_result.and_then(|()| flush_import_sidecars(&resources));
             let preparation_ms = preparation_started.elapsed().as_secs_f64() * 1000.0;
             let result = match flush_result {
                 Ok(()) => {
                     crate::metadata_transfer::import_at(&data_dir, &root, &cancel, move |value| {
+                        on_progress(&value);
                         progress_relay.send(value);
                     })
                     .map_err(|error| error.to_string())
@@ -1247,6 +1339,21 @@ fn start_import_worker(
                     ],
                 );
             }
+            if let (Some(observer), Ok(summary)) = (&observer, &result) {
+                for root in &summary.committed.spread_shift_observation_roots {
+                    observer.record_for_path(
+                        root,
+                        crate::content_identity::ContentIdentityTrigger::Edit,
+                    );
+                }
+            }
+            // The worker owns observation even if cancel/exit drops the receiver.
+            // Release the writer before UI terminal handling starts snapshot refresh.
+            // An Err alone does not prove impact: manifest/preflight cancel
+            // and validation errors precede writes. Lease release reloads the
+            // actual committed rows, stamps only their changed scopes, and uses
+            // the owner's global fallback only if that snapshot is unreadable.
+            drop(lease);
             let _ = tx.send(WorkerMessage::Import {
                 result,
                 resource_error,
@@ -1262,6 +1369,41 @@ fn start_import_worker(
             state.rx = None;
             state.stage = Stage::Result(ResultState::Import(Err(error.to_string())));
             false
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn run_import_worker_for_test(
+    root: PathBuf,
+    mut on_progress: impl FnMut(&TransferProgress, &AtomicBool) + Send + 'static,
+) -> Result<ImportSummary, String> {
+    let mut state = MetadataTransferState::import(root);
+    let cancel = Arc::clone(&state.cancel);
+    assert!(start_import_worker_with_progress(
+        &mut state,
+        ImportWorkerResources {
+            sidecars: HashMap::new(),
+            tags_db: None
+        },
+        None,
+        None,
+        move |value| on_progress(value, &cancel),
+    ));
+    loop {
+        match state
+            .rx
+            .as_ref()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+        {
+            WorkerMessage::Progress(_) => {}
+            WorkerMessage::Import { result, .. } => {
+                state.handle.take().unwrap().join().unwrap();
+                return result;
+            }
+            _ => panic!("unexpected import worker message"),
         }
     }
 }
@@ -1376,6 +1518,40 @@ fn flush_import_sidecars(resources: &Arc<Mutex<ImportWorkerResources>>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui_kittest::kittest::Queryable;
+
+    #[test]
+    fn import_shift_confirmation_keeps_counts_and_actions_reachable() {
+        let state = std::rc::Rc::new(std::cell::RefCell::new(MetadataTransferState::import(
+            PathBuf::from("C:/Pictures"),
+        )));
+        state.borrow_mut().stage = Stage::ImportConfirm(ImportPreview {
+            entries: 12,
+            existing_entries: 9,
+            missing_entries: 1,
+            kind_mismatch_entries: 1,
+            changed_files: 1,
+            spread_shift_additions: 2,
+            spread_shift_replacements: 3,
+            spread_shift_removals: 4,
+            ..ImportPreview::default()
+        });
+        let render_state = std::rc::Rc::clone(&state);
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(1093.0, 614.0))
+            .build(move |ctx| {
+                let _ = draw_dialog(ctx, &mut render_state.borrow_mut(), false);
+            });
+        harness.run();
+        harness.get_by_label("見開きの調整: 追加 2 / 置換 3 / 解除 4");
+        for label in ["インポート", "キャンセル"] {
+            let rect = harness.get_by_label(label).rect();
+            assert!(
+                rect.top() >= 0.0 && rect.bottom() <= 614.0,
+                "{label}: {rect:?}"
+            );
+        }
+    }
 
     #[test]
     fn export_state_initializes_recursive_from_settings() {
@@ -1532,6 +1708,154 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn spread_shift_import_dispatcher_refreshes_only_committed_scopes() {
+        use crate::app::{ViewerContextId, file_type_resume, tests::phase_c_support};
+        use crate::book_scope::BookScopeKey;
+        use crate::grid_item::{GridItem, ThumbnailState};
+        use crate::spread_shift::{ShiftOperation, SpreadShiftPageRef, SpreadShiftService};
+        use std::time::{Duration, Instant};
+
+        fn install(app: &mut App, root: &std::path::Path, anchor: usize) {
+            app.current_folder = Some(root.to_path_buf());
+            app.items = (0..6)
+                .map(|page| GridItem::Image(root.join(format!("{page}.png"))))
+                .collect();
+            app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+            app.image_metas = vec![None; app.items.len()];
+            app.visible_indices = (0..app.items.len()).collect();
+            app.page_identity_index =
+                Arc::new(file_type_resume::PreparedPageIdentityIndex::prepare(
+                    &app.items,
+                    Some(root),
+                    app.settings.file_type_visibility.clone(),
+                ));
+            app.viewer_navigation_caches.invalidate();
+            app.spread_mode = crate::settings::SpreadMode::Ltr;
+            app.settings.remember_spread_shift_per_book = false;
+            assert!(app.set_live_spread_shift(anchor));
+            app.settings.remember_spread_shift_per_book = true;
+        }
+
+        // The manifest always contains shift data. No-op, other-scope commit,
+        // Set commit, and covered Clear commit must have different live effects.
+        for (changed_scope, cleared) in [(0, false), (1, false), (2, false), (2, true)] {
+            let mut env = phase_c_support::setup_app();
+            let books = env.tmp.path().join("books");
+            let root = books.join("book");
+            let other = books.join("other");
+            let scope = BookScopeKey::folder(&root).unwrap();
+            let other_scope = BookScopeKey::folder(&other).unwrap();
+            install(&mut env, &root, 1);
+            let ctx = egui::Context::default();
+            let sibling =
+                env.push_window_context_for_test(&ctx, 136_420, |app| install(app, &root, 3));
+            let unrelated =
+                env.push_window_context_for_test(&ctx, 136_421, |app| install(app, &other, 2));
+            let (service, owner) =
+                SpreadShiftService::spawn_at(env.tmp.path().join("shift-data"), None).unwrap();
+            env.spread_shift_service = Some(service.clone());
+            service
+                .set_shift(
+                    scope.clone(),
+                    SpreadShiftPageRef::RelativePath("5.png".into()),
+                    ShiftOperation {
+                        context_id: ViewerContextId::for_test(136_499),
+                        items_generation: 1,
+                        operation_sequence: 1,
+                    },
+                )
+                .unwrap();
+            if cleared {
+                service
+                    .clear_shift(
+                        scope.clone(),
+                        ShiftOperation {
+                            context_id: ViewerContextId::for_test(136_499),
+                            items_generation: 1,
+                            operation_sequence: 2,
+                        },
+                    )
+                    .unwrap();
+            }
+            service
+                .read_after(scope.clone(), service.watermarks().admitted)
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            let before = env.spread_shift.clone();
+            let unrelated_before =
+                env.with_window_context_for_test(unrelated, |app| app.spread_shift.clone());
+            env.begin_metadata_import_terminal_refresh();
+            while !env.advance_metadata_import_terminal_refresh(&books, true) {}
+            let mut summary = ImportSummary::default();
+            summary.changed.spread_shift = true;
+            // A cancelled import still refreshes scopes committed before cancellation.
+            summary.cancelled = changed_scope == 2;
+            if changed_scope != 0 {
+                summary.committed.spread_shift_scopes.insert(
+                    if changed_scope == 2 {
+                        &scope
+                    } else {
+                        &other_scope
+                    }
+                    .storage_key(),
+                );
+            }
+            let expected_committed = summary.committed.clone();
+            let mut state = MetadataTransferState::import(books.clone());
+            state.stage = Stage::RefreshPreparing;
+            state.pending_import_result = Some(Ok(summary));
+            env.metadata_transfer = Some(state);
+            env.start_ready_metadata_import_refresh();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while env
+                .metadata_transfer
+                .as_ref()
+                .is_some_and(|state| matches!(state.stage, Stage::Refreshing))
+            {
+                assert!(Instant::now() < deadline, "import refresh did not complete");
+                env.poll_metadata_transfer_worker();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let expected = if changed_scope == 2 {
+                (!cleared).then_some(5)
+            } else {
+                Some(1)
+            };
+            assert_eq!(env.spread_shift_anchor_idx(), expected);
+            env.with_window_context_for_test(sibling, |app| {
+                assert_eq!(
+                    app.spread_shift_anchor_idx(),
+                    if changed_scope == 2 {
+                        expected
+                    } else {
+                        Some(3)
+                    }
+                );
+            });
+            if changed_scope != 2 {
+                assert_eq!(
+                    env.spread_shift, before,
+                    "unchanged book keeps its live session"
+                );
+            }
+            if changed_scope != 1 {
+                assert_eq!(
+                    env.with_window_context_for_test(unrelated, |app| app.spread_shift.clone()),
+                    unrelated_before
+                );
+            }
+            let state = env.metadata_transfer.as_ref().unwrap();
+            let Stage::Result(ResultState::Import(Ok(summary))) = &state.stage else {
+                panic!("refresh did not finish successfully");
+            };
+            assert_eq!(summary.committed, expected_committed);
+            assert!(summary.incomplete_error.is_none());
+            owner.shutdown_and_join();
+        }
+    }
+
     #[test]
     fn sidecar_restore_waits_only_for_transfer_stages_with_active_work() {
         let settings = crate::settings::Settings::default();
@@ -1545,6 +1869,8 @@ mod tests {
         state.stage = Stage::Running;
         assert!(state.has_active_worker_or_refresh());
         state.stage = Stage::RefreshPreparing;
+        assert!(state.has_active_worker_or_refresh());
+        state.stage = Stage::WaitingForSpreadShiftReload;
         assert!(state.has_active_worker_or_refresh());
         state.stage = Stage::Refreshing;
         assert!(state.has_active_worker_or_refresh());

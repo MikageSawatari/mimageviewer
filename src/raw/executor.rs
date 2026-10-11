@@ -631,6 +631,32 @@ impl RawDevelopExecutor {
         )
     }
 
+    /// Caller-specific returned-raster budget; existing thumbnail jobs keep their limits.
+    pub(crate) fn submit_thumbnail_half_bounded(
+        &self,
+        source: RawOwnedSource,
+        priority: RawPriority,
+        result: mpsc::Sender<ProductResult>,
+        cancel_flag: Arc<AtomicBool>,
+        max_alloc: u64,
+    ) -> RawTicket {
+        self.submit_action(
+            priority,
+            JobAction::Product {
+                result,
+                work: Box::new(move |cancel, progress| {
+                    super::raw_decoder::develop_thumbnail_half_bounded(
+                        source.as_source(),
+                        cancel,
+                        progress,
+                        max_alloc,
+                    )
+                }),
+            },
+            Some(cancel_flag),
+        )
+    }
+
     pub fn submit_thumbnail_half_with_completion(
         &self,
         source: RawOwnedSource,

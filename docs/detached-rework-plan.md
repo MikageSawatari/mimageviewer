@@ -1455,6 +1455,91 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+2026-10-10 §1.364 D2 本別見開き調整のcontext接続（独立確認・検証待ち）:
+以下は履歴。root操作のlive反映は2026-10-11 D2cの記録とspread-shift設計§11.6で撤回する。
+`src/app/spread_shift_owner.rs::ViewerSpreadShift`を`ViewerContextBundle`へ持たせ、
+Appとregistryの既存swap/fork/park/mountの境界でlive調整・PageRef解決・操作receiptを移送する。
+forkは`fork_accepted`で実効layoutだけを複製し、保存rowの再読取やSet/Clearを副作用にしない。
+元contextのwrite受付・receiverは引き継がず、保存待ち/失敗の調整は新contextでsession扱いにする。
+write完了はcontext/items/operation sequence/scopeが一致するmountedまたはat-rest ownerへ
+配送する。兄弟のlive組は更新せず、retired元の完了を新本へ適用しない。
+OFF/ONは既存ownerをsession扱いにし、ON化の操作元Bookだけを保存する。
+
+触れる範囲は`app.rs`のlive field/service poll、`viewer_context_registry.rs`のbundle交換・
+clone・at-rest配送、`sidecar_restore.rs`のfirst-display依存、items/snapshot remap、
+`ui_fullscreen.rs`の共通unit consumer・入力受付・HUD。fresh-openはglobal Common内の
+`ViewerBookRestore`、retained ONはbundle内の`RetainedReadoption::Idle | Reading`が待機を所有する。
+既存async inventoryへ`ContextAsyncOwner::RetainedSpreadShift`を登録してpoll/cancel-on-parkを担わせる。
+parkはreceiverをdropしてaccepted sessionを保ち、再採用はfresh cutoffを捕捉、forkはaccepted stateだけを
+複製する。fresh-openの`FencedResume`は同open continuationの初回採用完了で終了し、後のsession内
+resume参照を固定しない。global Commonと別contextのretained待機は併存し、既存のtarget-context semantic gate
+(`sidecar_restore_blocks_projected_context`)と復元dialogで対象窓だけを止める。
+他窓を一括modalにする案はreleased sibling input契約を損なうため不採用とした。
+新しいdetached専用predicateやgeometry推測ではなく、既存意味gateがqueryするcontext-owned依存の追加である。
+明示global policy変更では`session_only`がretained receiverを取り消してaccepted stateを保つ。
+表示済みsiblingsへ旧保存値を適用せず、fresh-openのCommon依存は捕捉済みtarget/context/items/open/scopeと
+元resume cutoffを保持して、新settings世代・現在のshift受付cutoffへ再受付する。
+通常の設定変更遷移であり、retryやまれな失敗の回復機構を追加するものではない。
+retainedは受入済みidentity indexを使い、OFFはlive調整を維持する。retained/import採用は
+現在の実ページを含むunitへ正規化するだけで、共有resume/historyを書かない。
+metadataの捕捉FIFO読取はContextRequest workerが待ち、context/items世代の採用後に
+current scope + ON + Automaticを照合する。OFFではshift結果を使わない。
+成功済みroot/page操作のmappingをpure helperでmounted/at-restへ反映し、追加save/mountは行わない。
+snapshotはdurable scopeを切り離して現在のnumeric session pairingを保持する。
+viewport生成/登録、HWND同定、geometry/placement/focus、
+recreate判定へ新しい推測経路を加える変更ではない。
+一つのviewer ownerと受理済みreceiptを既存lifecycleに載せる構造修正として記録し、
+追加guard・delay・retry・repaint・兄弟一括resetによる症状修正として扱わない。
+これは実装範囲と判断理由の追記であり、ClaudeCode/独立reviewerの今回の構造確認・完了レビュー合格や
+自動検証・利用者の実機受入済みを表すものではない。確認結果は取得後に別途記録する。
+正本は[spread-shift-memory-plan.md §11.4](spread-shift-memory-plan.md#114-d2実装接続記録2026-10-10検証完了レビュー待ち)。
+
+2026-10-10 §1.364 D2b レビュー指摘の構造補正（基点`8bc7efc87`、修正の独立確認待ち）:
+
+以下は履歴。rootのcontext/shift scope移行と同本pending-open直列化は、
+2026-10-11 D2cの記録とspread-shift設計§11.6で撤回する。他の補正・当時の検証記録は保持する。
+
+root改名の既存移行境界で、mounted/at-rest bundleのscopeだけでなく`current_folder`、
+archive source、ZIP tree、items、prepared identity indexも同じsource→target対応へ移す。
+別窓をmountして直す経路や一括reloadを作らず、変更したcontextの既存unit投影を失効する。
+snapshot固定はfullscreen成功分岐からanchor対応付けを外し、items交換で一度だけremapする。
+fresh-openのpolicy変更はshift依存だけを更新し、元resume receiver/取得済み結果を維持する。
+resume資格/キーは記録producerと共用し、保守中の兄弟Set/ClearもD1の既存FIFOへ受理する。
+import後の再採用は実際のcommit変更scopeだけを対象にし、無変更の兄弟sessionを保つ。
+epochとwrite種別はservice/replyのowner事実として保持し、snapshotの一時的有無や元窓の存否から推測しない。
+context参照元・投影・receipt・commitの既存所有境界を一致させる構造補正であり、
+viewport/geometry/placement/focusの推測、delay/retry/repaint、detached bool、pending-openの新しい所有は追加しない。
+ここは実装者の変更範囲・判断理由の記録で、D2bの独立完了レビューや実機受入合格を表さない。
+root改名と未完了Live Common/candidate openの競合は、利用者が選択肢1の直列化を採択した。
+製本管理の改名だけ、全contextとglobal Commonにある同一本の未完了openを既存source targetの
+read-only照合で待つ。別本・通常改名には追加待機を設けない。既存pending ownerを
+`BookManagerPending::{WaitingRename(captured_request), Running(BookOpPending)}`へ集約し、
+旧keyでのopen採用後に既存の改名workerとsettled移行境界へ進み、参照元・index・scopeを一緒に移す。
+open continuation全体の移行と比較して組合せを除去する簡素化であり、部分的取消・App-global reload・
+retry・pending-open ownerの追加は行わない。2026-10-11に全lib・UI snapshot・通常／portable check・
+fmt・glyph検査とnormal-profile確認用buildを完了した。製品起動・修正後の独立合格は主張しない。
+検証結果は[spread-shift-memory-plan.md §11.5](spread-shift-memory-plan.md#115-d2bレビュー指摘補正)と
+`target/D-1364-d2b-msg.txt`へ記録する。
+
+2026-10-11 §1.364 D2c root追従・同本pending-open直列化の構造的撤去（利用者決定、確認待ち）:
+
+利用者は名前変更後のlive追従を§1.364で採用しないと決定した。master `02079f95d`の
+main旧path再読込・F12旧path/旧items保持へ戻し、D1の永続root/相対payload移行を維持する。
+触れる範囲はregistryのmounted/at-rest bundle、`spread_shift_live_mappings`、shift owner、
+既存open/改名入口のroot移行・pending-open照合/待機分岐。参照元・items・prepared identity index・
+pending load・addressとshift scopeを同じ旧rootに留める。shift scopeだけを新rootへ移すと、
+旧contextの後続操作が新rowを変更するため、両者のroot移行を一緒に撤去する。
+受付済みopenの捕捉source/scopeと既存receiver/continuationも旧contextのまま保ち、
+同本pending-open query・製本管理の待機wrapperを撤去する。live移行境界がなくなるので、
+その境界のための直列化も不要になる。受理済みshift write/read/root操作はD1の単一FIFOが整列する。
+
+構造的な理由は、不要と決定したlive追従のproducerと、そのための待機を所有境界で撤去すること。
+新しいguard、delay、retry、repaint、reload、reopen、detached bool、HWND/geometry/placement/
+focus推測を足さない。ページ改名・通常Restore・retained/import・snapshot remapの接続は維持する。
+旧contextのSet/Clearが旧keyを再作成・解除し得る点は利用者了承済みの割り切りで、新rowへ転送しない。
+最新契約・回帰範囲の正本は[spread-shift-memory-plan.md §11.6](spread-shift-memory-plan.md#116-d2c-root追従と同本pending-open直列化の撤去2026-10-11利用者決定)。
+ここは撤去範囲と判断理由の記録で、独立構造合意・完了レビュー・自動検証・実機受入の完了は主張しない。
+
 2026-10-10 §1.342 最大倍率・保持軸モデル: 利用者承認の共通capを既存fit descriptorへ
 snapshotとして接続し、ui_fullscreenの単ページ／見開き／連結・capture／navigator consumerが
 同じpolicyを使う。共通cap編集はfavorite専用値を作らず、live編集はメモリだけを変える。
@@ -4429,6 +4514,42 @@ context epoch・優先度を継承し、元contextへ一度だけ画像とworker
 QAのcache-read witnessは相関済み画像の受理時に記録し、進捗は既存の通常要求projectionとkeep内画像から導出する。
 detached述語・viewport生成・placement・focus・registry protocolは変更しない。
 これは両側の既存ownerを保持する統合であり、新しい待機状態・retry・時間窓を追加しない。
+
+### 2026-10-11 §1.364 D2f: import取消の失効を既存maintenance ownerへ集約
+
+利用者指定の構造修正として、import workerがすべてのErrからglobal失効を作る経路を撤去する。
+manifest/preflight取消・エラーは変更なしleaseとして扱い、実変更scopeの公開と読めないsnapshotの
+既存global fallbackをserviceのEnd境界が所有する。phase状態や失敗分類を増やさない。
+別F12のfresh Common捕捉→mainの別フォルダimport取消/エラー→元Common終端を通す回帰を追加し、
+saved調整の採用とmain owner/items/indexの不変性を確認する。確定item後の取消も対象scopeだけを更新する。
+製品コードの変更はimport producerだけで、detached述語/viewport/registry/採用ownerは変更しない。
+失効通知の責務を既存ownerへ集約して不要な組合せを除く構造修正であり、症状guardではない。
+詳細は[spread-shift-memory-plan.md §11.9](spread-shift-memory-plan.md#119-d2f-書込み前のimport取消と変更なしlease2026-10-11)。
+本記録は独立構造合意・完了レビューや製品起動・実機受入を表さない。
+
+### 2026-10-11 §1.364 D2e: retained読取由来とscope資格の所有
+
+利用者指定の構造修正として、依存完了のCaptured/Expiredを型で分離し、現epochのCapturedだけを
+viewer採用境界へ通す。F12のretained ownerは失効時にaccepted調整・projection・commandを保ち、
+初回Commonはcapture時の調整なしと元のresume fenceを保つ。cause別の解除guardは追加しない。
+maintenance資格も既存service/FIFO/leaseに集約し、対象scope/root familyだけを更新する。
+別本の改名ではretained readを失効させず、実handler回帰で調整済みF12と無関係なmainの不変性を確認する。
+同本改名の失効でもaccepted ownerを保ち、次の通常再入場で得た現epochの不在だけが解除できる。
+detached述語/viewport/registry、改名待機、live-follow、新しいcontext状態やretryは追加しない。
+失効とrow不在の組合せを採用ownerの型とscope所有で除く構造修正であり、症状パッチではない。
+詳細は[spread-shift-memory-plan.md §11.8](spread-shift-memory-plan.md#118-d2e-retained保持とscope単位のmaintenance資格2026-10-11)。
+本記録は独立構造合意・完了レビュー、製品起動や実機受入を表さない。
+
+### 2026-10-11 §1.364 D2d: Commonの独立resume依存保持
+
+利用者指定の構造修正として`spread_shift::RestoreReadDependencies`の完了境界を変更する。
+maintenance epochで失効したshift recipeだけを除き、元のresume receiver/取得結果を保持する。
+Common全体を破棄せず元の固定読取点で初回採用を終えるため、別窓の後着Recordを混入させない。
+三つの受信順と、同本/別本openと改名の実handlerからCommon終端までの回帰を追加する。
+改名待機・live-follow・再要求・新しいcontext状態、detached述語/viewport/registryは追加しない。
+失効の責務を独立依存へ限定する所有境界の修正であり、症状guardや待機による修正ではない。
+設計の説明は[spread-shift-memory-plan.md §11.7](spread-shift-memory-plan.md#117-d2d-epoch失効と独立resume完了の分離2026-10-11)。
+本記録は独立構造合意・完了レビュー、製品起動や実機受入を表さない。
 
 ### 2026-10-10 §1.342 HUD fit popup の利用可能高・入力所有修正
 

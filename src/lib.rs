@@ -48,6 +48,7 @@ pub use ui_dialogs::preferences::draw_file_organize_destinations_settings_snapsh
 #[doc(hidden)]
 pub use ui_dialogs::preferences::draw_fullscreen_fit_cycle_settings_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_grid_background_double_click_settings_snapshot_fixture;
+pub use ui_dialogs::preferences::draw_preferences_restore_position_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_preferences_transfer_explanation_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_preferences_transfer_settings_snapshot_fixture;
 pub use ui_dialogs::settings_restore::draw_preferences_transfer_disabled_entry_snapshot_fixture;
@@ -66,6 +67,7 @@ pub mod book_bookmarks;
 pub mod book_composition;
 mod book_fs_journal;
 pub mod book_resume_db;
+pub(crate) mod book_scope;
 pub mod bookmark_browser;
 pub mod books;
 pub mod cache_maintenance;
@@ -111,6 +113,7 @@ mod gpu_lanczos;
 pub mod metadata_transfer;
 #[cfg(windows)]
 pub(crate) mod presentation_observer;
+pub(crate) mod spread_shift;
 mod startup_window_geometry;
 #[cfg(windows)]
 mod startup_windows_diag;
@@ -344,8 +347,8 @@ pub use ui_fullscreen::{
     draw_fs_extracted_result_view_snapshot_fixture, draw_fs_fit_popup_snapshot_fixture,
     draw_fs_page_wait_indicator_snapshot_fixture, draw_fs_prefetch_indicator_snapshot_fixture,
     draw_music_locked_panel_snapshot_fixture, draw_music_panel_reach_snapshot_fixture,
-    draw_still_panel_reach_snapshot_fixture, draw_still_seek_strip_snapshot_fixture,
-    draw_still_touch_first_run_help_snapshot_fixture,
+    draw_spread_shift_hud_snapshot_fixture, draw_still_panel_reach_snapshot_fixture,
+    draw_still_seek_strip_snapshot_fixture, draw_still_touch_first_run_help_snapshot_fixture,
 };
 mod ui_details_icon;
 pub mod ui_helpers;
@@ -1719,6 +1722,11 @@ pub fn run() -> eframe::Result {
 
     entry_trace.finish(miv_startup::Outcome::Ok);
     let native_trace = miv_startup::span(miv_startup::Lane::Core, miv_startup::Stage::RunNative);
+    // Join authority lives beyond App/eframe. UI callbacks only close admission.
+    let spread_shift_owner = Arc::new(std::sync::Mutex::new(
+        None::<spread_shift::SpreadShiftProcessOwner>,
+    ));
+    let creator_spread_shift_owner = Arc::clone(&spread_shift_owner);
     let run_result = eframe::run_native(
         "mimageviewer",
         options,
@@ -1783,6 +1791,26 @@ pub fn run() -> eframe::Result {
                     app.install_process_owned_collection_runtime(client, events)
                 }
                 Err(error) => app.install_collection_runtime_failure(error),
+            }
+            match spread_shift::SpreadShiftService::spawn_at(
+                data_dir::get(),
+                app.content_identity_recorder
+                    .as_ref()
+                    .map(|recorder| recorder.producer()),
+            ) {
+                Ok((service, owner)) => {
+                    *creator_spread_shift_owner.lock().unwrap() = Some(owner);
+                    app.install_spread_shift_runtime(
+                        service,
+                        Arc::clone(&creator_spread_shift_owner),
+                    );
+                }
+                Err(error) => {
+                    logger::log(format!("spread_shift: worker startup failed: {error}"));
+                    app.show_feedback_toast(format!(
+                        "見開き調整の保存を開始できませんでした: {error}"
+                    ));
+                }
             }
             #[cfg(windows)]
             {
@@ -1913,6 +1941,13 @@ pub fn run() -> eframe::Result {
     }
     if let Ok(runtime) = collection_runtime {
         runtime.shutdown_and_join();
+    }
+    if let Some(owner) = spread_shift_owner.lock().unwrap().take() {
+        for result in owner.shutdown_and_join() {
+            if let Err(error) = result.status {
+                logger::log(format!("spread_shift: exit save failed: {error}"));
+            }
+        }
     }
     // Rendering and normal shutdown are complete. Preserve the buffered tail for
     // every perf category without adding another periodic log write on the UI.
@@ -2099,12 +2134,14 @@ fn parse_startup_open_path_arg_from(args: &[std::ffi::OsString]) -> Option<std::
 }
 
 fn absolutize_startup_open_path(path: std::path::PathBuf) -> std::path::PathBuf {
+    let path = crate::path_key::normalize_input_path(&path);
     if path.is_absolute() {
         return path;
     }
-    std::env::current_dir()
+    let absolute = std::env::current_dir()
         .map(|cwd| cwd.join(&path))
-        .unwrap_or(path)
+        .unwrap_or(path);
+    crate::path_key::normalize_input_path(&absolute)
 }
 
 fn cli_flag_takes_value(flag: &str) -> bool {
@@ -2276,6 +2313,17 @@ mod tests {
         let path = absolutize_startup_open_path(PathBuf::from("book.zip"));
         assert!(path.is_absolute());
         assert!(path.ends_with("book.zip"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn startup_open_path_standardizes_mixed_absolute_path() {
+        let args = os_args(&["mimageviewer.exe", r"g:/home/comfyui\genshin_random"]);
+        let path = absolutize_startup_open_path(parse_startup_open_path_arg_from(&args).unwrap());
+        assert_eq!(
+            path.as_os_str(),
+            std::ffi::OsStr::new(r"G:\home\comfyui\genshin_random")
+        );
     }
 }
 

@@ -343,6 +343,27 @@ mod windows {
     }
 
     fn extract(handle: &Handle<'_>, index: u32) -> Result<(ffi::MivRawBuffer, Vec<u8>), RawError> {
+        extract_bounded(handle, index, MAX_PREVIEW_BYTES as u64)
+    }
+    fn extract_bounded(
+        handle: &Handle<'_>,
+        index: u32,
+        max_alloc: u64,
+    ) -> Result<(ffi::MivRawBuffer, Vec<u8>), RawError> {
+        let mut meta = ffi::MivRawPreviewInfo {
+            format: 0,
+            width: 0,
+            height: 0,
+            tflip: 0xffff,
+            length: 0,
+        };
+        let code = unsafe { ffi::miv_raw_preview_info(handle.raw, index, &mut meta) };
+        if code != 0 {
+            return Err(map_error(code));
+        }
+        if u64::from(meta.length) > max_alloc {
+            return Err(RawError::TooLarge);
+        }
         let mut result = ffi::MivRawBuffer {
             data: std::ptr::null_mut(),
             length: 0,
@@ -359,7 +380,7 @@ mod windows {
         if result.0.data.is_null() || result.0.length == 0 {
             return Err(RawError::Corrupt("Invalid preview buffer".into()));
         }
-        if result.0.length > MAX_PREVIEW_BYTES {
+        if result.0.length as u64 > max_alloc.min(MAX_PREVIEW_BYTES as u64) {
             return Err(RawError::TooLarge);
         }
         let mut bytes = Vec::new();
@@ -452,6 +473,9 @@ mod windows {
     }
 
     pub fn info(source: RawSource<'_>) -> Result<RawInfo, RawError> {
+        info_bounded(source, MAX_PREVIEW_BYTES as u64)
+    }
+    pub fn info_bounded(source: RawSource<'_>, max_alloc: u64) -> Result<RawInfo, RawError> {
         let handle = Handle::open(source)?;
         let mut data = ffi::MivRawInfo {
             width: 0,
@@ -489,12 +513,12 @@ mod windows {
                 _ => continue,
             };
             let dims = match format {
-                RawPreviewFormat::Jpeg => extract(&preview_handle, index)
+                RawPreviewFormat::Jpeg => extract_bounded(&preview_handle, index, max_alloc)
                     .ok()
                     .and_then(|(_, bytes)| turbojpeg::read_header(&bytes).ok())
                     .map(|header| [header.width as u32, header.height as u32])
                     .unwrap_or([0, 0]),
-                RawPreviewFormat::Bitmap => extract(&preview_handle, index)
+                RawPreviewFormat::Bitmap => extract_bounded(&preview_handle, index, max_alloc)
                     .map(|(buffer, _)| [buffer.width, buffer.height])
                     .unwrap_or([0, 0]),
             };
@@ -568,11 +592,19 @@ mod windows {
     }
 
     pub fn preview(source: RawSource<'_>) -> Result<RawPreview, RawError> {
-        preview_impl(source, false)
+        preview_impl(source, false, MAX_PREVIEW_BYTES as u64)
     }
 
-    fn preview_impl(source: RawSource<'_>, statistic: bool) -> Result<RawPreview, RawError> {
-        let raw_info = info(source)?;
+    pub fn preview_bounded(source: RawSource<'_>, max_alloc: u64) -> Result<RawPreview, RawError> {
+        preview_impl(source, false, max_alloc)
+    }
+
+    fn preview_impl(
+        source: RawSource<'_>,
+        statistic: bool,
+        max_alloc: u64,
+    ) -> Result<RawPreview, RawError> {
+        let raw_info = info_bounded(source, max_alloc)?;
         let mut candidates = raw_info.previews;
         let had_candidate = !candidates.is_empty();
         let mut orientation_mismatched = false;
@@ -581,12 +613,12 @@ mod windows {
             std::cmp::Reverse(u64::from(preview.dims[0]) * u64::from(preview.dims[1]))
         });
         for meta in candidates {
-            if usize::try_from(meta.length).unwrap_or(usize::MAX) > MAX_PREVIEW_BYTES {
+            if u64::from(meta.length) > max_alloc.min(MAX_PREVIEW_BYTES as u64) {
                 rejected_too_large = true;
                 continue;
             }
             let handle = Handle::open(source)?;
-            let (buffer, bytes) = match extract(&handle, meta.index) {
+            let (buffer, bytes) = match extract_bounded(&handle, meta.index, max_alloc) {
                 Ok(value) => value,
                 Err(RawError::TooLarge) => {
                     rejected_too_large = true;
@@ -597,7 +629,11 @@ mod windows {
             let image = match meta.format {
                 RawPreviewFormat::Jpeg => {
                     let layout = match jpeg_preview_layout(&bytes, statistic) {
-                        Ok(layout) => layout,
+                        Ok(layout) if layout.length as u64 <= max_alloc => layout,
+                        Ok(_) => {
+                            rejected_too_large = true;
+                            continue;
+                        }
                         Err(RawError::TooLarge) => {
                             rejected_too_large = true;
                             continue;
@@ -634,7 +670,11 @@ mod windows {
                 }
                 RawPreviewFormat::Bitmap => {
                     match check_preview_bytes(buffer.width, buffer.height, buffer.colors as usize) {
-                        Ok(_) => {}
+                        Ok(n) if n as u64 <= max_alloc => {}
+                        Ok(_) => {
+                            rejected_too_large = true;
+                            continue;
+                        }
                         Err(RawError::TooLarge) => {
                             rejected_too_large = true;
                             continue;
@@ -739,9 +779,20 @@ mod windows {
         cancel: &RawCancellation,
         progress: &AtomicU8,
     ) -> Result<(), RawError> {
+        process_bounded(handle, scale, bright_mode, cancel, progress, u64::MAX)
+    }
+
+    fn process_bounded(
+        handle: &Handle<'_>,
+        scale: RawDevelopScale,
+        bright_mode: i32,
+        cancel: &RawCancellation,
+        progress: &AtomicU8,
+        max_alloc: u64,
+    ) -> Result<(), RawError> {
         let callback_state = CallbackState { cancel, progress };
         let code = unsafe {
-            ffi::miv_raw_develop(
+            ffi::miv_raw_develop_bounded(
                 handle.raw,
                 i32::from(scale == RawDevelopScale::Half),
                 bright_mode,
@@ -749,6 +800,7 @@ mod windows {
                 (&callback_state as *const CallbackState<'_>)
                     .cast_mut()
                     .cast(),
+                max_alloc,
             )
         };
         if cancel.flag.load(Ordering::Acquire) {
@@ -825,7 +877,7 @@ mod windows {
             return Err(RawError::Cancelled);
         }
         let preview_median = if brightness == RawBrightness::MatchPreview {
-            match preview_impl(source, true) {
+            match preview_impl(source, true, MAX_PREVIEW_BYTES as u64) {
                 Ok(preview) => crate::raw::brightness::median_linear_luma(&preview.image),
                 Err(RawError::OutOfMemory) => return Err(RawError::OutOfMemory),
                 Err(_) => None,
@@ -878,13 +930,38 @@ mod windows {
         cancel: &RawCancellation,
         progress: &AtomicU8,
     ) -> Result<RawDevelopOutput, RawError> {
+        develop_thumbnail_half_bounded(source, cancel, progress, u64::MAX)
+    }
+    pub(in crate::raw) fn develop_thumbnail_half_bounded(
+        source: RawSource<'_>,
+        cancel: &RawCancellation,
+        progress: &AtomicU8,
+        max_alloc: u64,
+    ) -> Result<RawDevelopOutput, RawError> {
+        if cancel.flag.load(Ordering::Acquire) {
+            return Err(RawError::Cancelled);
+        }
+        if max_alloc != u64::MAX {
+            let info = info_bounded(source, max_alloc)?;
+            super::bounded_thumbnail_raster(info.developed_dims, max_alloc)?;
+        }
         if cancel.flag.load(Ordering::Acquire) {
             return Err(RawError::Cancelled);
         }
         let handle = Handle::open(source)?;
         let _binding = cancel.bind(handle.raw);
-        process(&handle, RawDevelopScale::Half, 1, cancel, progress)?;
+        process_bounded(
+            &handle,
+            RawDevelopScale::Half,
+            1,
+            cancel,
+            progress,
+            max_alloc,
+        )?;
         let (width, height, length) = dimensions(&handle)?;
+        if length as u64 > max_alloc {
+            return Err(RawError::TooLarge);
+        }
         let image = copy_image(&handle, width, height, length, None, cancel)?;
         progress.store(100, Ordering::Release);
         Ok(RawDevelopOutput {
@@ -1042,6 +1119,43 @@ mod windows {
 
     #[cfg(test)]
     #[test]
+    fn bounded_thumbnail_native_unpack_rejects_oversized_bayer_before_output() {
+        let mut bytes = std::fs::read("vendor/raw-samples/2756.dng")
+            .expect("Run .\\scripts\\setup-raw-samples.ps1");
+        // Ricoh GXR's RAW SubIFD is big endian, with LONG width/height tags.
+        // Preserve its small DefaultCrop so the half-output raster guard passes.
+        for (tag, old, oversized) in [(256u16, 3672u32, 12000u32), (257, 2748, 9000)] {
+            let mut entry = Vec::new();
+            entry.extend_from_slice(&tag.to_be_bytes());
+            entry.extend_from_slice(&4u16.to_be_bytes());
+            entry.extend_from_slice(&1u32.to_be_bytes());
+            entry.extend_from_slice(&old.to_be_bytes());
+            let offset = bytes
+                .windows(entry.len())
+                .position(|part| part == entry)
+                .expect("sample RAW dimension tag");
+            bytes[offset + 8..offset + 12].copy_from_slice(&oversized.to_be_bytes());
+        }
+        let max_alloc = 160 * 1024 * 1024;
+        let source = RawSource::Bytes(&bytes);
+        let info = info_bounded(source, max_alloc).expect("patched DNG should still open");
+        super::bounded_thumbnail_raster(info.developed_dims, max_alloc)
+            .expect("half-output dimensions must not reject this native allocation regression");
+        let cancel = RawCancellation::new();
+        let progress = AtomicU8::new(0);
+        assert!(matches!(
+            develop_thumbnail_half_bounded(source, &cancel, &progress, max_alloc),
+            Err(RawError::TooLarge)
+        ));
+        assert_eq!(
+            progress.load(Ordering::Acquire),
+            5,
+            "LOAD_RAW began but native unpack must reject before its completion callback"
+        );
+    }
+
+    #[cfg(test)]
+    #[test]
     fn cancelled_copy_returns_before_rgb_allocation() {
         let path = Path::new("vendor/raw-samples/1018.cr2");
         assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
@@ -1062,9 +1176,9 @@ pub(in crate::raw) use windows::develop_bench;
 #[cfg(all(windows, any(test, feature = "dev-tools")))]
 pub(in crate::raw) use windows::develop_match_preview;
 #[cfg(windows)]
-pub(in crate::raw) use windows::develop_thumbnail_half;
+pub(in crate::raw) use windows::{develop_thumbnail_half, develop_thumbnail_half_bounded};
 #[cfg(windows)]
-pub use windows::{info, preview};
+pub use windows::{info, info_bounded, preview, preview_bounded};
 
 #[cfg(not(windows))]
 pub fn info(_source: RawSource<'_>) -> Result<RawInfo, RawError> {
@@ -1116,4 +1230,49 @@ pub(in crate::raw) fn develop_match_preview(
     _progress: &AtomicU8,
 ) -> Result<RawMatchPreviewOutput, RawError> {
     Err(RawError::Unsupported(RawUnsupportedReason::Platform))
+}
+
+/// Preflight the largest RGBA half-development raster before entering the executor.
+pub(crate) fn bounded_thumbnail_raster(dims: [u32; 2], max_alloc: u64) -> Result<(), RawError> {
+    let width = u64::from(dims[0]).div_ceil(2);
+    let height = u64::from(dims[1]).div_ceil(2);
+    if width == 0
+        || height == 0
+        || width
+            .checked_mul(height)
+            .and_then(|n| n.checked_mul(4))
+            .is_none_or(|n| n > max_alloc)
+    {
+        Err(RawError::TooLarge)
+    } else {
+        Ok(())
+    }
+}
+#[cfg(not(windows))]
+pub fn info_bounded(source: RawSource<'_>, _max_alloc: u64) -> Result<RawInfo, RawError> {
+    info(source)
+}
+#[cfg(not(windows))]
+pub fn preview_bounded(source: RawSource<'_>, _max_alloc: u64) -> Result<RawPreview, RawError> {
+    preview(source)
+}
+#[cfg(not(windows))]
+pub(in crate::raw) fn develop_thumbnail_half_bounded(
+    source: RawSource<'_>,
+    cancel: &RawCancellation,
+    progress: &AtomicU8,
+    _max_alloc: u64,
+) -> Result<RawDevelopOutput, RawError> {
+    develop_thumbnail_half(source, cancel, progress)
+}
+#[cfg(test)]
+mod bounded_thumbnail_tests {
+    #[test]
+    fn bounded_thumbnail_raster_rejects_before_processing() {
+        use super::bounded_thumbnail_raster as guard;
+        assert!(guard([2048, 2048], 4 * 1024 * 1024).is_ok());
+        assert!(guard([2049, 2048], 4 * 1024 * 1024).is_err());
+        assert!(guard([0, 1], u64::MAX).is_err());
+        assert!(guard([u32::MAX, u32::MAX], 160 * 1024 * 1024).is_err());
+    }
 }

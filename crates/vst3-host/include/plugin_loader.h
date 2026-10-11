@@ -26,6 +26,7 @@
 #include "public.sdk/source/vst/hosting/module.h"
 
 namespace miv {
+class NowPlayingMailbox;
 
 class HostApplication;
 class ComponentHandler;
@@ -232,6 +233,9 @@ public:
     void query_state_concurrent(
         std::function<bool()> begin,
         std::function<void(bool, std::vector<uint8_t>)> complete);
+
+    void post_now_playing(std::shared_ptr<NowPlayingMailbox> mailbox,
+                          std::function<void(std::shared_ptr<NowPlayingMailbox>)> wake);
 
     /// プラグイン内部状態をバイト列から復元する (`IComponent::setState`)。
     /// `IEditController::setComponentState` も同期で呼んで UI 表示を合わせる。

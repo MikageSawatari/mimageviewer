@@ -97,6 +97,8 @@ pub(crate) struct RemoteSessionUiState {
     pending_fullscreen_restore: Option<PendingFullscreenRestore>,
     paused_animation_restore_key: Option<String>,
     pending_bookmark_writes: std::collections::HashMap<u64, PendingRemoteBookmarkWrite>,
+    pending_shift_resets: std::collections::HashMap<u64, ClaimedRemoteWrite>,
+    pending_resume_reads: Vec<PendingRemoteResumeRead>,
     connection_dialog: Option<RemoteConnectionDialogState>,
     // Unlike the dialog-owned PIN and tailscale receivers, logout completion must outlive the
     // window because a successful secret rotation still has to disconnect local control.
@@ -121,6 +123,8 @@ impl Drop for RemoteSessionUiState {
             video_stream: self.video_stream.take(),
             pending_bookmark_writes: std::mem::take(&mut self.pending_bookmark_writes),
             pending_fullscreen_restore: self.pending_fullscreen_restore.take(),
+            pending_shift_resets: std::mem::take(&mut self.pending_shift_resets),
+            pending_resume_reads: std::mem::take(&mut self.pending_resume_reads),
             handle,
             generation,
         });
@@ -572,6 +576,14 @@ struct AppRemoteVideoStreaming {
 }
 
 impl AppRemoteVideoStreaming {
+    #[cfg(windows)]
+    fn now_playing_owner(&self) -> crate::effetune::NowPlayingOwner {
+        crate::effetune::NowPlayingOwner::Remote {
+            session: self.session.id().0,
+            registration: self.player.media_identity(),
+        }
+    }
+
     fn published(&self) -> PublishedVideoStream {
         PublishedVideoStream {
             session: self.session.id(),
@@ -733,6 +745,14 @@ struct RemoteAppDrainLease {
     video_stream: Option<AppRemoteVideoStreamState>,
     pending_bookmark_writes: std::collections::HashMap<u64, PendingRemoteBookmarkWrite>,
     pending_fullscreen_restore: Option<PendingFullscreenRestore>,
+    pending_shift_resets: std::collections::HashMap<u64, ClaimedRemoteWrite>,
+    pending_resume_reads: Vec<PendingRemoteResumeRead>,
+}
+
+struct PendingRemoteResumeRead {
+    claimed: super::session::ClaimedBookResumeRead,
+    cutoff: u64,
+    receiver: std::sync::mpsc::Receiver<crate::book_resume_db::PositionReadReply>,
 }
 
 impl Drop for RemoteAppDrainLease {
@@ -745,6 +765,15 @@ impl Drop for RemoteAppDrainLease {
                 RemoteWriteErrorCode::UiTimeout,
                 "アプリを終了しています",
             )));
+        }
+        for (_, pending) in self.pending_shift_resets.drain() {
+            pending.complete(UiWriteOutcome::Write(write_error(
+                RemoteWriteErrorCode::UiTimeout,
+                "アプリを終了しています",
+            )));
+        }
+        for pending in self.pending_resume_reads.drain(..) {
+            pending.claimed.complete_position(None);
         }
         if let Some(video) = self.video_stream.take() {
             match video {
@@ -873,6 +902,7 @@ impl crate::app::App {
             self.fs_transparent_bg_mode,
         ));
         handle.install_archive_cache_db(self.archive_cache_db.clone());
+        handle.install_spread_shift_service(self.spread_shift_service.clone());
         #[cfg(windows)]
         self.effetune
             .set_remote_session_source(Some(handle.clone()));
@@ -902,6 +932,8 @@ impl crate::app::App {
                 &mut self.remote_session_ui.pending_bookmark_writes,
             ),
             pending_fullscreen_restore: self.remote_session_ui.pending_fullscreen_restore.take(),
+            pending_shift_resets: std::mem::take(&mut self.remote_session_ui.pending_shift_resets),
+            pending_resume_reads: std::mem::take(&mut self.remote_session_ui.pending_resume_reads),
             handle,
             generation,
         };
@@ -1111,7 +1143,21 @@ impl crate::app::App {
                 .active
                 .as_ref()
                 .map_or(std::time::Duration::ZERO, |active| active.elapsed);
-            match remote_acquire_barrier_decision(close_state, barrier.is_quiesced(), elapsed) {
+            // Close is read-only for shift. Its final resume Record and all
+            // previously admitted shifts must publish before FinishAcquire.
+            let book_io_ready = self
+                .spread_shift_service
+                .as_ref()
+                .is_none_or(|service| service.is_ready() && !service.is_busy())
+                && self.book_resume_writer.as_ref().is_none_or(|writer| {
+                    let watermarks = writer.watermarks();
+                    watermarks.admitted == watermarks.completed_through
+                });
+            match remote_acquire_barrier_decision(
+                close_state,
+                barrier.is_quiesced() && book_io_ready,
+                elapsed,
+            ) {
                 RemoteAcquireBarrierDecision::Finish => {
                     handle.finish_acquire(snapshot.generation);
                 }
@@ -1162,6 +1208,7 @@ impl crate::app::App {
         if let Some(handle) = handle.as_ref() {
             self.apply_pending_remote_ui_requests(handle, ctx);
         }
+        self.poll_remote_resume_reads(ctx);
         if remote_phase == super::session::RemoteControlPhase::Local {
             self.poll_remote_fullscreen_restore();
         }
@@ -1176,7 +1223,11 @@ impl crate::app::App {
             }
             self.reload_after_remote_session_release();
         }
-        if matches!(
+        // The App frame poll drains Clear replies. Keep the existing Remote
+        // tick prompt until its claimed request consumes the completion.
+        if !self.remote_session_ui.pending_shift_resets.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        } else if matches!(
             self.remote_session_ui.video_stream.as_ref(),
             Some(AppRemoteVideoStreamState::Opening(_) | AppRemoteVideoStreamState::Starting(_))
         ) {
@@ -1454,6 +1505,25 @@ impl crate::app::App {
             AppRemoteVideoStreamState::Streaming(streaming) => streaming,
         };
         streaming.player.tick(ctx);
+        #[cfg(windows)]
+        if self.effetune.now_playing_owner() == Some(streaming.now_playing_owner())
+            && let Some(info) = streaming.player.info()
+            && (!self.effetune.now_playing_metadata_matches(
+                streaming.now_playing_owner(),
+                streaming.player.path(),
+                info.title.as_deref(),
+                info.album.as_deref(),
+                info.artist.as_deref(),
+            ) || !self.effetune.now_playing_artwork_source_matches(
+                streaming.now_playing_owner(),
+                None,
+                &self.settings,
+            ))
+        {
+            let input = self.now_playing_input_for_player(&streaming.player, None);
+            self.effetune
+                .publish_now_playing(streaming.now_playing_owner(), input);
+        }
         self.remember_confirmed_remote_audio_track(&mut streaming);
         let snapshot = streaming.playback.snapshot();
         streaming.playback.update(
@@ -1484,6 +1554,9 @@ impl crate::app::App {
     }
 
     fn retire_remote_audio_stream(&mut self, streaming: &mut AppRemoteVideoStreaming) {
+        #[cfg(windows)]
+        self.effetune
+            .clear_now_playing(streaming.now_playing_owner());
         let stream_index = streaming.session.retire();
         self.remember_remote_audio_track_index(streaming, stream_index);
     }
@@ -1563,6 +1636,13 @@ impl crate::app::App {
                     return;
                 }
                 self.remember_confirmed_remote_audio_track(&mut starting.streaming);
+                #[cfg(windows)]
+                {
+                    // The metadata player is intentionally paused/headless; Stable is adoption.
+                    let owner = starting.streaming.now_playing_owner();
+                    let input = self.now_playing_input_for_player(&starting.streaming.player, None);
+                    self.effetune.publish_now_playing(owner, input);
+                }
                 let path = starting.streaming.requested_path.clone();
                 let kind = if path
                     .extension()
@@ -1890,6 +1970,21 @@ impl crate::app::App {
                     }
                 }
                 ClaimedRemoteUiRequest::BookResumeRead(pending) => {
+                    if let Some(writer) = self.book_resume_writer.as_ref() {
+                        let cutoff = writer.watermarks().admitted;
+                        let receiver = writer.read_position_after(
+                            &crate::path_key::normalize(pending.path()),
+                            cutoff,
+                        );
+                        self.remote_session_ui
+                            .pending_resume_reads
+                            .push(PendingRemoteResumeRead {
+                                claimed: pending,
+                                cutoff,
+                                receiver,
+                            });
+                        continue;
+                    }
                     let latest =
                         self.last_book_resume
                             .as_ref()
@@ -1920,6 +2015,65 @@ impl crate::app::App {
                 }
             }
         }
+    }
+
+    fn poll_remote_resume_reads(&mut self, ctx: &egui::Context) {
+        let mut waiting = Vec::new();
+        for pending in std::mem::take(&mut self.remote_session_ui.pending_resume_reads) {
+            match pending.receiver.try_recv() {
+                Ok(reply)
+                    if reply.cutoff == pending.cutoff
+                        && reply.completed_through >= pending.cutoff
+                        && reply.status.is_ok() =>
+                {
+                    pending.claimed.complete_position(reply.position)
+                }
+                Ok(reply) => {
+                    crate::logger::log(format!(
+                        "remote_ipc: fenced resume read failed: {:?}",
+                        reply.status
+                    ));
+                    pending.claimed.complete_position(None);
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    pending.claimed.complete_position(None)
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => waiting.push(pending),
+            }
+        }
+        self.remote_session_ui.pending_resume_reads = waiting;
+        if !self.remote_session_ui.pending_resume_reads.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+    }
+
+    pub(crate) fn complete_remote_shift_reset(
+        &mut self,
+        reply: &crate::spread_shift::ShiftWriteReply,
+    ) -> bool {
+        let Some(pending) = self
+            .remote_session_ui
+            .pending_shift_resets
+            .remove(&reply.sequence)
+        else {
+            return false;
+        };
+        let response = match &reply.status {
+            Ok(()) => {
+                self.show_feedback_toast("見開き調整を解除しました".into());
+                RemoteWriteResponse::Success(RemoteWriteResult::applied())
+            }
+            Err(error) => {
+                crate::logger::log(format!("remote_ipc: shift reset failed: {error}"));
+                self.show_feedback_toast(format!("見開き調整を保存できませんでした: {error}"));
+                write_error(
+                    RemoteWriteErrorCode::PersistenceFailed,
+                    "見開き調整の解除を保存できませんでした",
+                )
+            }
+        };
+        pending.complete(UiWriteOutcome::Write(response));
+        true
     }
 
     fn apply_remote_video_stream_request(&mut self, pending: ClaimedVideoStreamUiRequest) {
@@ -2313,6 +2467,47 @@ impl crate::app::App {
             return;
         }
         let response = self.apply_remote_write(pending.request());
+        if matches!(response, RemoteWriteResponse::Success(_))
+            && self.settings.remember_spread_shift_per_book
+            && let RemoteWriteRequest::SetSpread { address, .. } = pending.request()
+        {
+            // The validated effective address owns the logical shift key.
+            // The existing base setter remains synchronous; only its Q3 Clear
+            // completion extends this same claimed request.
+            let scope = remote_shift_scope(address);
+            let result = scope.and_then(|scope| {
+                let service = self
+                    .spread_shift_service
+                    .as_ref()
+                    .ok_or_else(|| "shift service unavailable".to_owned())?;
+                service.clear_shift(
+                    scope,
+                    crate::spread_shift::ShiftOperation {
+                        context_id: self.spread_shift_context_id(),
+                        items_generation: self.items_generation,
+                        operation_sequence: pending.generation(),
+                    },
+                )
+            });
+            match result {
+                Ok(sequence) => {
+                    self.remote_session_ui
+                        .pending_shift_resets
+                        .insert(sequence, pending);
+                }
+                Err(error) => {
+                    crate::logger::log(format!(
+                        "remote_ipc: shift reset admission failed: {error}"
+                    ));
+                    pending.complete(UiWriteOutcome::Write(write_error(
+                        RemoteWriteErrorCode::PersistenceFailed,
+                        "見開き調整の解除を保存できませんでした",
+                    )));
+                }
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            return;
+        }
         pending.complete(UiWriteOutcome::Write(response));
         ctx.request_repaint();
     }
@@ -2375,7 +2570,7 @@ impl crate::app::App {
                 ..
             } => {
                 self.apply_remote_media_resume_update(
-                    std::path::PathBuf::from(&address.path),
+                    crate::path_key::normalize_input_path(std::path::Path::new(&address.path)),
                     *position_secs,
                     *duration_secs,
                     *ended,
@@ -4159,6 +4354,20 @@ fn remote_spread_key(
     ))
 }
 
+fn remote_shift_scope(
+    address: &mimageviewer_ipc::RemoteAddress,
+) -> Result<crate::book_scope::BookScopeKey, String> {
+    let root = std::path::Path::new(&address.path);
+    match &address.subresource {
+        RemoteSubresource::ZipDirectory { prefix } => crate::book_scope::BookScopeKey::archive(
+            root,
+            &super::container::zip_prefix_segments(prefix),
+        ),
+        RemoteSubresource::File => crate::book_scope::BookScopeKey::folder(root),
+        _ => Err("a page is not a book shift scope".into()),
+    }
+}
+
 struct RemoteRatingTarget {
     key: String,
     meta: crate::rating_db::RatingMeta,
@@ -4704,6 +4913,8 @@ fn format_elapsed(elapsed: std::time::Duration) -> String {
 mod tests {
     use super::*;
 
+    include!("spread_shift_ui_tests.rs");
+
     fn ready_unharvested_remote_audio_stream() -> (
         crate::app::AppTestEnvForTest,
         SessionHandle,
@@ -4765,6 +4976,186 @@ mod tests {
         }
         assert!(app.settings.video_audio_track_choices.is_empty());
         (app, handle, path, session, generation)
+    }
+
+    #[cfg(windows)]
+    fn now_playing_starting_from_streaming(
+        handle: &SessionHandle,
+        streaming: AppRemoteVideoStreaming,
+    ) -> AppRemoteVideoStarting {
+        let owner = handle.owner_for_test("audio-boundary-test");
+        let request = VideoStreamUiRequest::start_for_test(
+            owner.clone(),
+            streaming.requested_path.clone(),
+            mimageviewer_ipc::VideoStreamQuality::Standard,
+        );
+        let operation = handle
+            .begin_operation(&owner, "now playing start".to_owned())
+            .unwrap();
+        let (claimed, _response) = ClaimedVideoStreamUiRequest::for_test(operation, request);
+        AppRemoteVideoStarting {
+            claimed,
+            streaming,
+            budget: VideoStreamStartBudget::from_enqueued_at(std::time::Instant::now()),
+            waiting_stage: VideoStreamStartStage::Encoder,
+        }
+    }
+
+    #[cfg(windows)]
+    fn now_playing_next_streaming(
+        app: &mut crate::app::App,
+        handle: &SessionHandle,
+        path: &std::path::Path,
+    ) -> AppRemoteVideoStreaming {
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.to_path_buf());
+        player.set_opened_audio_stream_for_test(0, 1);
+        let inputs = player.remote_stream_start_inputs().unwrap();
+        app.create_remote_video_streaming(
+            &handle.owner_for_test("audio-boundary-test"),
+            path,
+            crate::video::stream::quality::QualityPreset::Standard,
+            Some(0),
+            inputs,
+            Box::new(player),
+        )
+        .unwrap()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn now_playing_remote_stable_adopts_paused_headless_and_keeps_pause_ended() {
+        let (mut app, handle, _path, session, _generation) =
+            ready_unharvested_remote_audio_stream();
+        let streaming = app.take_remote_video_streaming().unwrap();
+        assert!(!streaming.player.is_playing());
+        let owner = streaming.now_playing_owner();
+        let starting = now_playing_starting_from_streaming(&handle, streaming);
+        app.finish_stable_remote_video_start(
+            starting,
+            Ok((StreamReconcile::Active, RemoteVideoStartReadiness::Stable)),
+        );
+        assert_eq!(app.effetune.now_playing_owner(), Some(owner));
+        assert!(matches!(
+            app.apply_remote_video_control(session, VideoStreamControlAction::Pause),
+            VideoStreamUiOutcome::Controlled(_)
+        ));
+        assert_eq!(app.effetune.now_playing_owner(), Some(owner));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            match app.remote_video_streaming_status().unwrap() {
+                StreamGenerationStatus::Ended(_) => break,
+                StreamGenerationStatus::Ready(_) | StreamGenerationStatus::Opening => {
+                    assert!(std::time::Instant::now() < deadline, "fixture did not end");
+                    std::thread::yield_now();
+                }
+                status => panic!("remote fixture failed before Ended: {status:?}"),
+            }
+        }
+        app.poll_remote_video_streaming(&egui::Context::default());
+        assert_eq!(
+            app.effetune.now_playing_owner(),
+            Some(owner),
+            "Pause / encoder Ended retain metadata"
+        );
+        app.apply_remote_video_stop(session);
+        assert_eq!(app.effetune.now_playing_owner(), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn now_playing_remote_next_waiting_failure_and_delayed_old_stop_leave_blank() {
+        let (mut app, handle, path, old_session, _) = ready_unharvested_remote_audio_stream();
+        let streaming = app.take_remote_video_streaming().unwrap();
+        let starting = now_playing_starting_from_streaming(&handle, streaming);
+        app.finish_stable_remote_video_start(
+            starting,
+            Ok((StreamReconcile::Active, RemoteVideoStartReadiness::Stable)),
+        );
+        app.cancel_remote_video_stream_state(VideoStreamErrorCode::Failed, "next media");
+        assert_eq!(app.effetune.now_playing_owner(), None);
+        let owner = handle.owner_for_test("audio-boundary-test");
+        let request = VideoStreamUiRequest::start_for_test(
+            owner.clone(),
+            path.clone(),
+            mimageviewer_ipc::VideoStreamQuality::Standard,
+        );
+        let operation = handle
+            .begin_operation(&owner, "now playing opening".to_owned())
+            .unwrap();
+        let (claimed, _response) = ClaimedVideoStreamUiRequest::for_test(operation, request);
+        app.remote_session_ui.video_stream =
+            Some(AppRemoteVideoStreamState::Opening(AppRemoteVideoOpening {
+                claimed,
+                owner,
+                requested_path: path.clone(),
+                quality: crate::video::stream::quality::QualityPreset::Standard,
+                audio_track: None,
+                player: None,
+                budget: VideoStreamStartBudget::from_enqueued_at(std::time::Instant::now()),
+                dsp_admission_deadline: std::time::Instant::now(),
+            }));
+        app.apply_remote_video_stop(old_session);
+        assert!(matches!(
+            app.remote_session_ui.video_stream,
+            Some(AppRemoteVideoStreamState::Opening(_))
+        ));
+        assert_eq!(app.effetune.now_playing_owner(), None);
+        app.cancel_remote_video_stream_state(VideoStreamErrorCode::Failed, "opening failed");
+        assert_eq!(app.effetune.now_playing_owner(), None);
+        let next = now_playing_next_streaming(&mut app, &handle, &path);
+        let starting = now_playing_starting_from_streaming(&handle, next);
+        app.finish_stable_remote_video_start(
+            starting,
+            Ok((
+                StreamReconcile::Active,
+                RemoteVideoStartReadiness::WaitingForEncoder,
+            )),
+        );
+        assert_eq!(app.effetune.now_playing_owner(), None);
+        app.apply_remote_video_stop(old_session);
+        assert!(
+            app.remote_video_starting_for_test(),
+            "old stop cannot cancel new Starting"
+        );
+        let Some(AppRemoteVideoStreamState::Starting(starting)) =
+            app.remote_session_ui.video_stream.take()
+        else {
+            panic!()
+        };
+        app.finish_stable_remote_video_start(starting, Err("next start failed".to_owned()));
+        assert_eq!(app.effetune.now_playing_owner(), None);
+        assert!(app.remote_session_ui.video_stream.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn now_playing_remote_delayed_old_retirement_cannot_clear_new_or_local_owner() {
+        let (mut app, handle, path, old_session, _) = ready_unharvested_remote_audio_stream();
+        let mut old = app.take_remote_video_streaming().unwrap();
+        let old_input = app.now_playing_input_for_player(&old.player, None);
+        app.effetune
+            .publish_now_playing(old.now_playing_owner(), old_input);
+        app.retire_remote_audio_stream(&mut old);
+        assert_eq!(app.effetune.now_playing_owner(), None);
+        let next = now_playing_next_streaming(&mut app, &handle, &path);
+        let next_owner = next.now_playing_owner();
+        let starting = now_playing_starting_from_streaming(&handle, next);
+        app.finish_stable_remote_video_start(
+            starting,
+            Ok((StreamReconcile::Active, RemoteVideoStartReadiness::Stable)),
+        );
+        app.apply_remote_video_stop(old_session);
+        app.retire_remote_audio_stream(&mut old);
+        assert_eq!(app.effetune.now_playing_owner(), Some(next_owner));
+        let local = crate::effetune::NowPlayingOwner::Local(999_359);
+        let input = app.now_playing_input_for_player(&old.player, None);
+        app.effetune.publish_now_playing(local, input);
+        app.cancel_remote_video_stream_state(
+            VideoStreamErrorCode::SessionMismatch,
+            "control returned",
+        );
+        assert_eq!(app.effetune.now_playing_owner(), Some(local));
     }
 
     fn saved_remote_audio_index(app: &crate::app::App, path: &std::path::Path) -> Option<usize> {
@@ -5081,6 +5472,8 @@ mod tests {
                 dsp_admission_deadline: std::time::Instant::now(),
             })),
             pending_bookmark_writes,
+            pending_shift_resets: Default::default(),
+            pending_resume_reads: Default::default(),
             pending_fullscreen_restore: Some(PendingFullscreenRestore {
                 item_key: "resume".to_owned(),
                 view: ReloadedView::Other,

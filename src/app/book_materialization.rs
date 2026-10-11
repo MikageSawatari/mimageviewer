@@ -505,7 +505,8 @@ impl super::App {
     pub(crate) fn begin_extracted_result_view(&mut self) {
         self.spread_mode = crate::settings::SpreadMode::Single;
         self.reading_direction = self.settings.default_reading_direction;
-        self.spread_shift_anchor_idx = None;
+        // Detach the preceding book's session without issuing a durable Clear.
+        self.spread_shift = Default::default();
     }
 }
 

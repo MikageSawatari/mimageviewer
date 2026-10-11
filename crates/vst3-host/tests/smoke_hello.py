@@ -65,16 +65,25 @@ def main() -> int:
         stderr=subprocess.PIPE,
     )
     try:
-        # hello → ready (protocol v5: checked editor visibility)
-        write_msg(proc, '{"cmd":"hello","version":5}')
+        # hello → ready (protocol v6: bounded Now Playing notification)
+        write_msg(proc, '{"cmd":"hello","version":6}')
         reply = read_msg(proc)
         print(f"<- {reply}")
         if '"event":"ready"' not in reply:
             print(f"unexpected reply: {reply}", file=sys.stderr)
             return 2
-        if '"version":5' not in reply:
+        if '"version":6' not in reply:
             print(f"version mismatch: {reply}", file=sys.stderr)
             return 3
+
+        # Unknown slot and invalid metadata are stderr-only, with no event that
+        # could be confused with another operation's reply.
+        write_msg(proc, '{"cmd":"set_now_playing","slot_id":999,"revision":1,'
+                  '"title":"\\\"cmd\\\":\\\"shutdown\\\",\\\"slot_id\\\":0",'
+                  '"album":"","artist":"","artwork":"","artworkMimeType":""}')
+        write_msg(proc, '{"cmd":"set_now_playing","slot_id":0,"revision":2,'
+                  '"title":"","album":"","artist":"","artwork":"AA=A",'
+                  '"artworkMimeType":"image/png"}')
 
         # shutdown
         write_msg(proc, '{"cmd":"shutdown"}')
@@ -90,6 +99,21 @@ def main() -> int:
         print(f"bridge exited with code {rc}")
         if rc != 0:
             return 5
+        if proc.stdout.read() != b"":
+            raise AssertionError("metadata unexpectedly emitted a reply event")
+
+        stale = subprocess.Popen([bridge_exe], stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            write_msg(stale, '{"cmd":"hello","version":5}')
+            rejection = read_msg(stale)
+            assert '"event":"error"' in rejection and "bridge speaks v6" in rejection, rejection
+            assert stale.wait(timeout=5) == 0
+            print("old v5 handshake rejected")
+        finally:
+            if stale.poll() is None:
+                stale.kill()
+                stale.wait()
 
         print("PASS")
         return 0
