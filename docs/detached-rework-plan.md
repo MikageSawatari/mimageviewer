@@ -4643,3 +4643,9 @@ forkはaccepted Arcを共有し、Prepare receiverは共有しない。読取Pre
 parkの終端とretained contextでの完了を既存routerへ通す。実変更scopeだけ再照合し、無関係な本のitems/cache/recordを失効させない。
 これは保存read payloadの構造的な所有拡張であり、detached述語/viewport/geometry/placementへの症状patchではない。
 G3の表示投影とeditorは未接続。独立レビュー・利用者実機観測の結果は主張しない。
+
+2026-10-11 G2B REVISE: 同じread ownerの応答採用で最新scope tokenを確認し、旧応答を最新Preparingへ
+置換する。既存mounted async serviceは初回/別scope/更新も照合し、service drainは表示pass後の
+共通更新境界へ移した。PreparingはROOTの既存遅延repaint契約へ接続し、退避ownerの完了を入力に
+依存させない。既存context residence/mount/park/retireとreceiver所有を維持し、detached述語・viewport
+生成・geometry・placement・新しいpending状態は変更していない。回帰と検証結果はG2B fix handoffに記録する。

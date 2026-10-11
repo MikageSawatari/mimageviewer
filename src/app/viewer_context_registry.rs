@@ -1293,7 +1293,7 @@ impl ContextAsyncOwner {
         }
     }
 
-    /// Collection/rating/bookmark polls also create or retire work from their visible surface.
+    /// Composition/collection/rating/bookmark polls also admit work from their current scope.
     /// All other owners need a live request before a mounted frame calls their worker service.
     pub(in crate::app) fn needs_mounted_service(self, context: ContextRef<'_>) -> bool {
         if matches!(self, Self::FullscreenDecode | Self::RawPages) {
@@ -1303,7 +1303,10 @@ impl ContextAsyncOwner {
         }
         matches!(
             self,
-            Self::CollectionGrid | Self::CollectionNavigation | Self::RatingNavigation
+            Self::BookCompositionRead
+                | Self::CollectionGrid
+                | Self::CollectionNavigation
+                | Self::RatingNavigation
         ) || self.is_pending(context)
     }
 
@@ -1326,7 +1329,7 @@ impl ContextAsyncOwner {
             return;
         }
         match self {
-            Self::BookCompositionRead => app.poll_book_composition_read(),
+            Self::BookCompositionRead => app.poll_book_composition_read(ctx),
             Self::RetainedSpreadShift => app.poll_retained_shift_readoption(ctx),
             Self::PathClassification => app.poll_open_path_classification(ctx),
             Self::HistoryTransition => app.poll_collection_history_transition(ctx),

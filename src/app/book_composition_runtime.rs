@@ -143,7 +143,7 @@ impl App {
         Some((scope, domain))
     }
 
-    pub(super) fn poll_book_composition_service(&mut self) {
+    pub(super) fn poll_book_composition_service(&mut self, ctx: &egui::Context) {
         let Some(service) = self.book_composition_service.clone() else {
             return;
         };
@@ -152,6 +152,7 @@ impl App {
             self.show_feedback_toast(format!(
                 "本の構成の保存データを処理できませんでした: {error}"
             ));
+            ctx.request_repaint();
         }
         let changed = service.drain_changed_scope_keys();
         // Read-only visits never invalidate a sibling. G3 attaches Book reload to this exact set.
@@ -168,15 +169,15 @@ impl App {
                         .is_some_and(|scope| changed.contains(&scope.storage_key())))
                         && app.extracted_result_surface().is_none()
                     {
-                        app.poll_book_composition_read();
+                        app.poll_book_composition_read(ctx);
                     }
                 });
             }
         }
-        self.poll_book_composition_read();
+        self.poll_book_composition_read(ctx);
     }
 
-    pub(super) fn poll_book_composition_read(&mut self) {
+    pub(super) fn poll_book_composition_read(&mut self, ctx: &egui::Context) {
         let Some((scope, domain)) = self.composition_scope_domain() else {
             self.book_composition = ViewerBookComposition::Automatic;
             return;
@@ -202,7 +203,7 @@ impl App {
             _ => {
                 self.book_composition = ViewerBookComposition::Preparing {
                     scope: scope.clone(),
-                    receiver: service.prepare(scope.clone(), domain),
+                    receiver: service.prepare(scope.clone(), domain.clone()),
                 };
             }
         }
@@ -211,28 +212,42 @@ impl App {
         };
         match receiver.try_recv() {
             Ok(reply) if reply.scope == scope => {
-                self.book_composition = match reply.status {
-                    Ok(record) => ViewerBookComposition::Accepted {
+                // Publication may have advanced after Prepare replied and its change
+                // notification may already have been drained. Compare at adoption,
+                // including absent/blocked records and at-rest viewers. Keep the new
+                // read in Preparing so the owning context remains eligible for polling.
+                if reply.token != service.snapshot().token_for(&scope) {
+                    self.book_composition = ViewerBookComposition::Preparing {
+                        receiver: service.prepare(scope.clone(), domain),
                         scope,
-                        token: reply.token,
-                        record: record.map(Arc::new),
-                    },
-                    Err(error) => {
-                        // Store-wide errors are notified once by the service drain above.
-                        // A scope/domain rejection is local to this read and still needs notice.
-                        if service.snapshot().status.is_ok() {
-                            crate::logger::log(format!("book_composition: read failed: {error}"));
-                            self.show_feedback_toast(format!(
-                                "本の構成を読み込めませんでした: {error}"
-                            ));
-                        }
-                        ViewerBookComposition::Blocked {
+                    };
+                } else {
+                    self.book_composition = match reply.status {
+                        Ok(record) => ViewerBookComposition::Accepted {
                             scope,
                             token: reply.token,
-                            error,
+                            record: record.map(Arc::new),
+                        },
+                        Err(error) => {
+                            // Store-wide errors are notified once by the service drain above.
+                            // A scope/domain rejection is local to this read and still needs notice.
+                            if service.snapshot().status.is_ok() {
+                                crate::logger::log(format!(
+                                    "book_composition: read failed: {error}"
+                                ));
+                                self.show_feedback_toast(format!(
+                                    "本の構成を読み込めませんでした: {error}"
+                                ));
+                            }
+                            ViewerBookComposition::Blocked {
+                                scope,
+                                token: reply.token,
+                                error,
+                            }
                         }
-                    }
-                };
+                    };
+                    ctx.request_repaint();
+                }
             }
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => {
@@ -244,8 +259,21 @@ impl App {
                     token,
                     error,
                 };
+                ctx.request_repaint();
             }
             Ok(_) => self.book_composition = ViewerBookComposition::Automatic,
+        }
+        // Match the existing worker-pending delayed repaint contract, outside the
+        // grid tail. A dedicated/parked viewer must wake ROOT, which owns the
+        // process service drain, even when its own viewport is idle or not drawn.
+        if matches!(
+            self.book_composition,
+            ViewerBookComposition::Preparing { .. }
+        ) {
+            ctx.request_repaint_after_for(
+                std::time::Duration::from_millis(50),
+                egui::ViewportId::ROOT,
+            );
         }
     }
 }

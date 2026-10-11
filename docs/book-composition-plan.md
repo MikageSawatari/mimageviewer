@@ -1378,7 +1378,7 @@ G2A REVISEの境界修正・fixture・G1入力テストの共有native frame所�
 再検証結果は`target/G-1242-g2a2-msg.txt`へ記録する。最初のfull-lib失敗はstartup restoreと
 G1 extracted key handlerであり、video EOF/saved-group modalの失敗として扱わない。
 
-**2026-10-11 G2 part B実装記録（未commit／独立検収前）**:
+**2026-10-11 G2 part B初回実装記録（249dc75a0。REVISE修正は下記）**:
 
 - `book_scope::BookScopeKey`を共用し、新DB一つ・schema 1の提案四列を使用する。JSONは`{ domain, composition }`。
   empty構成にも種類/実効prefixの検証を持たせ、root/cache pathはpayloadへ入れない。revisionは受入先writerが実変更時だけ進める。
@@ -1422,6 +1422,20 @@ G1 extracted key handlerであり、video EOF/saved-group modalの失敗とし�
   部分coverageは他prefixを消さない。複数本追加/置換/解除のpreviewは一括確認一回、本別promptゼロ。
   cancel/項目失敗の既存batch/SAVEPOINT規則を維持し、resume/履歴を転送しない。
 - readでDB writeなし、cleanup/reset/保存先/F12 bundle/Remote登録、実変更scopeだけ通知。
+
+**2026-10-11 G2B REVISEのread境界修正**:
+
+Prepare応答のscopeだけでなく採用直前の最新snapshot tokenを照合する。旧応答は最新Prepareに置換し、
+通知消化済みの退避contextもPreparingの既存poll対象へ残す。構成serviceのdrainは描画pass後の
+display-independent更新境界へ移し、mounted async ownerはAutomaticからの読取とAcceptedのscope照合も行う。
+fullscreen中の新規open/本切替/同scope保存でも読取を止めない。
+Preparing中だけ既存pendingの遅延repaint契約でROOTを起こし、応答採用時は一度repaintする。
+retained contextの完了も入力なしで回収する。タイマーはworker完了のpoll用であり、競合の時間窓やretryではない。
+新しいApp状態・worker側UI owner・DB/FSの同期処理は追加しない。G3のunit/hidden投影はこの修正に含めない。
+簡素化は既存のasync境界・Preparing状態・pending起床に一本化する形を採用した。
+背景readのためにopen/本切替をmodalで停止する案や窓を閉じる案は、通常閲覧の動作を変えるため採用しない。
+旧Prepare完了→保存→通知drain→退避応答採用の順、fullscreenのscope lifecycle、入力なしの完了と
+pending終端後の起床停止を回帰fixtureで固定する。検証実数/exit/ログは`target/G-1242-g2b-fix-msg.txt`に記録する。
 
 ### G3: 構成適用・spread/位置・§1.364・遅延非表示
 

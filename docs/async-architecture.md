@@ -1839,6 +1839,14 @@ visibility lifecycle、worker 数、owner=0 を維持する。
 front handleはPrepare/Save/Remove/root rename/purge/page移行をFIFOへ送るだけで、I/Oやjoinをしない。
 読み取りはimmutable Arc snapshotとscope token。viewerのAccepted recordはcontext bundle/snapshotへ所属し、
 Prepare receiverはそのcontextだけが回収する。Remote SessionHandleは同じserviceのread経路を登録する。
+構成serviceの通知drain/retained readは`eframe::App::update`の描画pass後、早期returnの外で処理する。
+mounted `ContextAsyncOwner::BookCompositionRead`はPreparingだけでなくAutomatic/Acceptedのscopeも照合し、
+専用fullscreenでも初回open・本切替・同scope更新の読取を開始する。
+Prepare応答は採用直前のscope tokenと一致した時だけAccepted/Blockedへ移す。不一致なら最新Prepareへ
+置換し、Preparingのまま既存context pollへ残す。変更通知を先に消化しても旧応答を採用しない。
+Preparing中は既存pending workerと同じ50ms遅延repaintをROOTへ予約する。rootは退避contextの完了も
+回収するため、専用viewportや一覧が静止していても利用者入力に依存しない。採用時は一度repaintし、
+Accepted/Blockedの同token読取は起床を予約しない。新しいpending fieldやworker側UI ownerは作らない。
 既存maintenance workerはEPUB→spread_shift→book_compositionの順でquiesceし、DB接続を解放してから共通rename/import/restore/cleanupを行う。
 lease終了時のwriter再読込が実変更scopeだけを公開する。UI側でmaintenance待ちやDB/FS読取を追加しない。
 終了時はcomposition writerをjoinしてから、保持されたcontent-identity recorderを所有するshift ownerを終了し、捕捉済みEdit観測を落とさない。

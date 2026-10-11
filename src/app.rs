@@ -92250,7 +92250,6 @@ impl App {
         self.show_cache_manager_dialog(ctx);
         self.show_metadata_cleanup_dialog(ctx);
         self.poll_spread_shift_service();
-        self.poll_book_composition_service();
         self.show_metadata_transfer_dialog(ctx);
         self.show_sidecar_restore_dialog(ctx);
         self.show_archive_cache_manager_dialog(ctx);
@@ -93707,6 +93706,11 @@ impl eframe::App for App {
             self.similar_panel.preview.poll_background(ctx, &passwords);
         }
         self.update_frame(ctx, frame);
+        // Composition publications and Prepare completions belong to the
+        // display-independent async boundary. Run after the presentation pass
+        // so a newly adopted book also starts its read in an early-return frame.
+        // Dedicated viewers additionally admit reads through their mounted owner.
+        self.poll_book_composition_service(ctx);
         #[cfg(windows)]
         self.sync_clipboard_capture(ctx);
         self.show_capture_selection_dialog(ctx);

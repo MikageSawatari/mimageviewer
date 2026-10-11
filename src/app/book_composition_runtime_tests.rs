@@ -56,9 +56,9 @@ fn barrier(service: &BookCompositionService, scope: &BookScopeKey) {
 }
 
 fn adopt(app: &mut App, service: &BookCompositionService, scope: &BookScopeKey) {
-    app.poll_book_composition_read();
+    app.poll_book_composition_read(&egui::Context::default());
     barrier(service, scope);
-    app.poll_book_composition_read();
+    app.poll_book_composition_read(&egui::Context::default());
     assert!(
         matches!(&app.book_composition, ViewerBookComposition::Accepted { scope: accepted, .. }
         if accepted == scope)
@@ -107,6 +107,45 @@ fn database_bytes(data: &Path) -> Vec<(String, Vec<u8>)> {
     .collect()
 }
 
+fn assert_accepted_token(app: &App, service: &BookCompositionService, scope: &BookScopeKey) {
+    let ViewerBookComposition::Accepted {
+        scope: accepted,
+        token,
+        ..
+    } = &app.book_composition
+    else {
+        panic!("expected Accepted, got {:?}", app.book_composition);
+    };
+    assert_eq!(accepted, scope);
+    assert_eq!(*token, service.snapshot().token_for(scope));
+}
+
+fn root_repaint_delay(output: &egui::FullOutput) -> Duration {
+    output
+        .viewport_output
+        .get(&egui::ViewportId::ROOT)
+        .expect("headless pass emits the root viewport")
+        .repaint_delay
+}
+
+fn idle_repaint_context() -> egui::Context {
+    let ctx = egui::Context::default();
+    // Fixed empty passes consume egui's initial immediate repaint, independently
+    // of worker timing. These are neither worker polls nor completion retries.
+    let _ = ctx.run(egui::RawInput::default(), |_| {});
+    let _ = ctx.run(egui::RawInput::default(), |_| {});
+    assert_eq!(
+        root_repaint_delay(&ctx.run(egui::RawInput::default(), |_| {})),
+        Duration::MAX
+    );
+    ctx
+}
+
+fn assert_pending_root_wake(output: &egui::FullOutput) {
+    let delay = root_repaint_delay(output);
+    assert!(delay > Duration::ZERO && delay <= Duration::from_millis(50));
+}
+
 #[test]
 fn g2_runtime_read_adopts_absence_without_creating_database_or_changing_layout() {
     let mut env = setup_app();
@@ -121,7 +160,7 @@ fn g2_runtime_read_adopts_absence_without_creating_database_or_changing_layout()
         ViewerBookComposition::Accepted { record: None, .. }
     ));
     assert!(!data.join("book_composition.db").exists());
-    env.poll_book_composition_service();
+    env.poll_book_composition_service(&egui::Context::default());
     assert_eq!(
         env.items, before_items,
         "G2 accepts records; G3 owns page projection"
@@ -165,7 +204,7 @@ fn g2_snapshot_parks_accepted_record_and_a2_read_leaves_saved_database_unchanged
         panic!("snapshot must retain the accepted book record");
     };
     assert!(Arc::ptr_eq(parked, &accepted));
-    env.poll_book_composition_service();
+    env.poll_book_composition_service(&egui::Context::default());
     assert!(matches!(
         env.book_composition,
         ViewerBookComposition::Automatic
@@ -280,7 +319,7 @@ fn g2_changed_scope_refreshes_same_book_contexts_and_preserves_other_book_arc() 
     save(&service, &scope_a, ReadingDirection::Ltr);
     // First poll admits the changed contexts' reads. A later FIFO reply is the
     // explicit completion fence, including a parked context's pending request.
-    env.poll_book_composition_service();
+    env.poll_book_composition_service(&egui::Context::default());
     // Hold the at-rest owner in Preparing explicitly so this exercises its
     // completion with the changed notification already consumed. The channel
     // belongs to the real service and the request uses the production API.
@@ -291,7 +330,7 @@ fn g2_changed_scope_refreshes_same_book_contexts_and_preserves_other_book_arc() 
         };
     });
     barrier(&service, &scope_a);
-    env.poll_book_composition_service();
+    env.poll_book_composition_service(&egui::Context::default());
     let main_after = record(&env);
     assert_eq!(
         main_after.composition.revision,
@@ -341,9 +380,9 @@ fn g2_snapshot_retains_record_during_result_view_and_refreshes_after_return() {
     assert!(env.snapshot.is_some());
     save(&service, &scope, ReadingDirection::Ltr);
     let after_save = database_bytes(&data);
-    env.poll_book_composition_service();
+    env.poll_book_composition_service(&egui::Context::default());
     barrier(&service, &scope);
-    env.poll_book_composition_service();
+    env.poll_book_composition_service(&egui::Context::default());
     assert!(matches!(
         env.book_composition,
         ViewerBookComposition::Automatic
@@ -399,7 +438,7 @@ fn g2_scope_read_rejection_notifies_once_and_keeps_saved_record() {
         .unwrap();
     let before = database_bytes(&data);
     env.fs_feedback_toast = None;
-    env.poll_book_composition_read();
+    env.poll_book_composition_read(&egui::Context::default());
     service
         .prepare(
             scope.clone(),
@@ -411,19 +450,239 @@ fn g2_scope_read_rejection_notifies_once_and_keeps_saved_record() {
         .unwrap()
         .status
         .unwrap();
-    env.poll_book_composition_read();
+    env.poll_book_composition_read(&egui::Context::default());
     assert!(matches!(
         env.book_composition,
         ViewerBookComposition::Blocked { .. }
     ));
     assert!(env.fs_feedback_toast.is_some());
     env.fs_feedback_toast = None;
-    env.poll_book_composition_read();
+    env.poll_book_composition_read(&egui::Context::default());
     assert!(
         env.fs_feedback_toast.is_none(),
         "same rejected token does not notify every frame"
     );
     assert_eq!(database_bytes(&data), before);
     assert!(service.snapshot().rows.contains_key(&scope.storage_key()));
+    owner.shutdown_and_join();
+}
+
+#[cfg(windows)]
+#[test]
+fn g2_at_rest_stale_prepare_after_drained_change_reprepares_without_accepting_old_record() {
+    let mut env = setup_app();
+    let root_a = env.tmp.path().join("stale-parked-a.pdf");
+    let root_b = env.tmp.path().join("stable-mounted-b.pdf");
+    let data = env.tmp.path().join("composition-stale-parked");
+    let scope_a = install_document(&mut env, &root_a);
+    let scope_b = BookScopeKey::document(&root_b).unwrap();
+    let (service, owner) = runtime(&mut env, &data);
+    save(&service, &scope_a, ReadingDirection::Rtl);
+    save(&service, &scope_b, ReadingDirection::Rtl);
+    service.drain_changed_scope_keys();
+    adopt(&mut env, &service, &scope_a);
+    let old_record = record(&env);
+    let old_token = service.snapshot().token_for(&scope_a);
+    let parked = env.fork_materialized_still_context(&root_a, 1);
+
+    // Fence the real old Prepare reply before the write. Its receiver remains
+    // undrained, so the next adoption observes precisely the stale publication.
+    let old_receiver = service.prepare(scope_a.clone(), PageDomain::Document);
+    barrier(&service, &scope_a);
+    env.with_window_context_for_test(parked, |app| {
+        app.book_composition = ViewerBookComposition::Preparing {
+            scope: scope_a.clone(),
+            receiver: old_receiver,
+        };
+    });
+    install_document(&mut env, &root_b);
+    adopt(&mut env, &service, &scope_b);
+    let sibling_record = record(&env);
+    let sibling_state = env.book_composition.clone();
+    let sibling_items = env.items.clone();
+    let sibling_generation = env.items_generation;
+    save(&service, &scope_a, ReadingDirection::Ltr);
+    let latest_token = service.snapshot().token_for(&scope_a);
+    assert_ne!(latest_token, old_token);
+    assert_eq!(
+        service.drain_changed_scope_keys(),
+        vec![scope_a.storage_key()]
+    );
+    let after_save = database_bytes(&data);
+
+    let ctx = idle_repaint_context();
+    let pending_output = ctx.run(egui::RawInput::default(), |ctx| {
+        env.poll_book_composition_service(ctx);
+    });
+    env.with_window_context_for_test(parked, |app| {
+        assert!(matches!(
+            &app.book_composition,
+            ViewerBookComposition::Preparing { scope, .. } if scope == &scope_a
+        ));
+    });
+    assert_pending_root_wake(&pending_output);
+    assert!(Arc::ptr_eq(&record(&env), &sibling_record));
+    assert_eq!(env.book_composition, sibling_state);
+
+    // The new Prepare is complete before the second global poll, with no
+    // remaining change notification and no mounted frame for the parked owner.
+    barrier(&service, &scope_a);
+    assert!(service.drain_changed_scope_keys().is_empty());
+    env.poll_book_composition_service(&ctx);
+    env.with_window_context_for_test(parked, |app| {
+        assert_accepted_token(app, &service, &scope_a);
+        let latest = record(app);
+        assert_eq!(
+            latest.composition.revision,
+            old_record.composition.revision + 1
+        );
+        assert_eq!(latest.composition.direction, ReadingDirection::Ltr);
+    });
+    assert!(Arc::ptr_eq(&record(&env), &sibling_record));
+    assert_eq!(env.book_composition, sibling_state);
+    assert_eq!(env.items, sibling_items);
+    assert_eq!(env.items_generation, sibling_generation);
+    assert_eq!(database_bytes(&data), after_save);
+    env.retire_context(parked, "composition_stale_parked_test", |_| ())
+        .unwrap();
+    owner.shutdown_and_join();
+}
+
+#[cfg(windows)]
+#[test]
+fn g2_fullscreen_mounted_boundary_admits_open_switch_and_same_scope_update() {
+    let mut env = setup_app();
+    let root_a = env.tmp.path().join("fullscreen-a.pdf");
+    let root_b = env.tmp.path().join("fullscreen-b.pdf");
+    let data = env.tmp.path().join("composition-fullscreen-boundary");
+    let scope_a = install_document(&mut env, &root_a);
+    let scope_b = BookScopeKey::document(&root_b).unwrap();
+    env.fullscreen_idx = Some(0);
+    let (service, owner) = runtime(&mut env, &data);
+    save(&service, &scope_a, ReadingDirection::Rtl);
+    save(&service, &scope_b, ReadingDirection::Rtl);
+    service.drain_changed_scope_keys();
+    let ctx = egui::Context::default();
+
+    // This is the production mounted-document async dispatch used before the
+    // fullscreen frame. No grid tail or direct composition-read call admits it.
+    assert!(matches!(
+        env.book_composition,
+        ViewerBookComposition::Automatic
+    ));
+    env.poll_mounted_document_open_owners(&ctx);
+    barrier(&service, &scope_a);
+    env.poll_mounted_document_open_owners(&ctx);
+    assert_accepted_token(&env, &service, &scope_a);
+    let accepted_a = env.book_composition.clone();
+
+    install_document(&mut env, &root_b);
+    // A book switch may retain the prior adopted state until this boundary.
+    env.book_composition = accepted_a;
+    assert_eq!(env.fullscreen_idx, Some(0));
+    env.poll_mounted_document_open_owners(&ctx);
+    barrier(&service, &scope_b);
+    env.poll_mounted_document_open_owners(&ctx);
+    assert_accepted_token(&env, &service, &scope_b);
+    let before = record(&env);
+    let before_items = env.items.clone();
+    let before_generation = env.items_generation;
+
+    save(&service, &scope_b, ReadingDirection::Ltr);
+    assert_eq!(
+        service.drain_changed_scope_keys(),
+        vec![scope_b.storage_key()]
+    );
+    let after_save = database_bytes(&data);
+    env.poll_mounted_document_open_owners(&ctx);
+    barrier(&service, &scope_b);
+    env.poll_mounted_document_open_owners(&ctx);
+    assert_accepted_token(&env, &service, &scope_b);
+    assert_eq!(
+        record(&env).composition.revision,
+        before.composition.revision + 1
+    );
+    assert_eq!(record(&env).composition.direction, ReadingDirection::Ltr);
+    assert_eq!(env.fullscreen_idx, Some(0));
+    assert_eq!(
+        env.items, before_items,
+        "G3 layout is not wired by G2 reads"
+    );
+    assert_eq!(env.items_generation, before_generation);
+    assert_eq!(database_bytes(&data), after_save);
+    owner.shutdown_and_join();
+}
+
+#[cfg(windows)]
+#[test]
+fn g2_input_free_pending_read_wakes_root_until_fifo_reply_is_adopted() {
+    let mut env = setup_app();
+    let root = env.tmp.path().join("input-free-fullscreen.pdf");
+    let data = env.tmp.path().join("composition-input-free");
+    let scope = install_document(&mut env, &root);
+    env.fullscreen_idx = Some(0);
+    let (service, owner) = runtime(&mut env, &data);
+    save(&service, &scope, ReadingDirection::Rtl);
+    service.drain_changed_scope_keys();
+    let before_items = env.items.clone();
+    let before_database = database_bytes(&data);
+
+    // A real FIFO worker reply is held behind an explicit channel delivery gate.
+    // Holding delivery makes Empty deterministic without worker sleeps, retries,
+    // synthetic tokens, or a race against SQLite completing a tiny read.
+    let receiver = service.prepare(scope.clone(), PageDomain::Document);
+    barrier(&service, &scope);
+    let reply = receiver.recv_timeout(WAIT).unwrap();
+    assert!(reply.status.is_ok());
+    let (deliver, pending) = std::sync::mpsc::channel();
+    env.book_composition = ViewerBookComposition::Preparing {
+        scope: scope.clone(),
+        receiver: pending,
+    };
+    let ctx = idle_repaint_context();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::<egui::RequestRepaintInfo>::new()));
+    let requests_callback = Arc::clone(&requests);
+    ctx.set_request_repaint_callback(move |info| {
+        requests_callback.lock().unwrap().push(info);
+    });
+
+    let first = ctx.run(egui::RawInput::default(), |ctx| {
+        env.poll_mounted_document_open_owners(ctx);
+    });
+    assert_pending_root_wake(&first);
+    let second = ctx.run(egui::RawInput::default(), |ctx| {
+        env.poll_mounted_document_open_owners(ctx);
+    });
+    assert_pending_root_wake(&second);
+    assert!(matches!(
+        env.book_composition,
+        ViewerBookComposition::Preparing { .. }
+    ));
+    assert!(requests.lock().unwrap().iter().any(|request| {
+        request.viewport_id == egui::ViewportId::ROOT
+            && request.delay > Duration::ZERO
+            && request.delay <= Duration::from_millis(50)
+    }));
+
+    deliver.send(reply).unwrap();
+    let accepted = ctx.run(egui::RawInput::default(), |ctx| {
+        env.poll_mounted_document_open_owners(ctx);
+    });
+    assert_accepted_token(&env, &service, &scope);
+    assert_eq!(root_repaint_delay(&accepted), Duration::ZERO);
+    let accepted_record = record(&env);
+    // egui deliberately carries an immediate request over one more pass.
+    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        env.poll_mounted_document_open_owners(ctx);
+    });
+    requests.lock().unwrap().clear();
+    let idle = ctx.run(egui::RawInput::default(), |ctx| {
+        env.poll_mounted_document_open_owners(ctx);
+    });
+    assert_eq!(root_repaint_delay(&idle), Duration::MAX);
+    assert!(requests.lock().unwrap().is_empty());
+    assert!(Arc::ptr_eq(&record(&env), &accepted_record));
+    assert_eq!(env.items, before_items, "G2 adopts records only");
+    assert_eq!(database_bytes(&data), before_database);
     owner.shutdown_and_join();
 }
