@@ -1455,6 +1455,31 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-11 §1.371: 評価集合の公開を安定context境界へ移す構造合意（設計段階）
+
+利用者が提示した独立再レビュー（対象 `94bc236d1`、rating-filter-fullscreen-plan R2）は、
+「F12の境界修正には、症状パッチではなく構造修正として同意します」と明示した。
+本設計もこの方針を採用し、利用者のR3指示に従って対象・理由をここへ記録する。
+詳細は [rating-filter-fullscreen-plan.md §3.1/§3.2/§8](rating-filter-fullscreen-plan.md#31-contexttableの安定境界-レビューp1-1)。
+
+対象は `viewer_context_registry.rs` のswap内rating publicationを退避前のplan前と、
+incomingのfinish_mount・favorite/effective設定投影完了後へ移すこと、およびbuild/commit/abort/
+fork/promote/retireの同じ安定境界の照合である。swap primitiveはpayload交換だけを担い、
+新しいnavigation・publication・context取得による配送・再mountを開始しない。
+集合の採用出口でcontext自身のreader/cursorを調停し、既存fullscreen landing/teardownと
+§1.370のcursor-move/paired identity remapへ渡す。Main scopeだけに実効filterを適用し、
+DetachedPhysical/CollectionRootの独立membershipと兄弟のitems・cache・channel・queue・世代・tokenを保つ。
+
+理由は、ContextTableのpending遷移内の再入と、集合外anchor/誤配送を作る公開境界を除き、
+完成したowner/settings/集合でreaderとの整合を確立するため。pending guard、時間窓、repaint、
+新しいdetached bool/Option、viewport/geometry/host同定、placement/focus/recreate機構は追加しない。
+未公開ratingを持つoutgoing/incoming mountと元context復帰、build/fork等のtrace、main/F12/A/Bの
+資源分離、Shift+click起点を実装時の回帰対象とする（同planの必須test 6/7/8）。
+
+この同意は **F12の公開境界修正に限定**する。再レビューはringの独立検索更新まで保留する
+新規P2により全体REVISEであり、R3のring採用policyや製品コード着手を承認したものではない。
+今回は文書のみで、製品実装・test/build・mIV起動・実機受入は未実施。
+
 2026-10-10 §1.364 D2 本別見開き調整のcontext接続（独立確認・検証待ち）:
 以下は履歴。root操作のlive反映は2026-10-11 D2cの記録とspread-shift設計§11.6で撤回する。
 `src/app/spread_shift_owner.rs::ViewerSpreadShift`を`ViewerContextBundle`へ持たせ、
