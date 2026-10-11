@@ -1,7 +1,7 @@
 # Everything ファイル名検索 (§1.374) — Stage 1 設計案
 
 作成: 2026-10-11。対象: v4.6.0 より後。`next-effetune`、基点 `31ac80b9c`。
-**設計のみ。採用・実装開始・master への統合は未承認。** 本文の「採用案」は設計担当の推奨であり、実装済みの仕様ではない。
+**設計のみ。実装開始・master への統合は未指示。** 初版 scope と既定キーは §12 の利用者決定を反映した。製品コードは未実装。2026-10-12: PDF owner の独立 subdesign と Ctrl+R の context 調査を追記。
 
 ## 1. 要求と調査の出どころ
 
@@ -198,6 +198,8 @@ BS／親移動は Everything position を経由し、book 内の既存 prefix pa
 
 **chunk B 開始前の必須条件:** PDF thumbnail render の enqueue・派生 request への継承・pool prune／pop 判定・cancel／drop を、所有 viewer context に限定する bounded subdesign を作り、設計担当と独立 reviewer が合意する。通常 folder load、Search replace、priority／upgrade／seek、background／fullscreen の epoch=0、registry の park／fork／promote／retire を producer／consumer 一覧に含める。同じ path を main と detached が同時に読む試験で、main の旧 jobs は失効し sibling の jobs／requested は残ることを示す。owner の世代は既存 bundle とともに移譲し、fork が他 context の失効権限を複製しない設計が必要である。
 
+2026-10-12: [PDF render epoch ownership の独立設計案](pdf-render-epoch-ownership-plan.md)を作成した。既存 Ctrl+G／通常一覧にもある不具合を `PDF-EPOCH-OWNERSHIP` として単独で適用できる scope に分離する。bundle の非 Clone writer、immutable request ticket、typed Unscoped、pool prune/pop、registry 全移譲、同 path main+detached 回帰を同案に定義した。独立レビューは利用者が依頼するため、今回内部レビュー／別 agent review を行っていない。設計を書いただけでは P1 解消とせず、同 stage の合意・改修・gate・必要な利用者確認まで B の停止条件を維持する。
+
 これは Everything request の cancel/generation と異なる既存 PDF pool の所有境界で、現在の設計書では具体的な改修方式を最終承認していない。統合実装前に止める条件であり、まれな失敗として割り切らない。global bump を Everything だけ省く guard、全 render の epoch=0 化、F12／seek の無効化では代替しない。F12 の機能制限は利用者の明示了承なしに選ばない。分離した先行設計・改修の範囲と費用を提示してから統合へ進む。
 
 実装で predicates／viewport／registry transfer を触る場合は `detached-rework-plan.md` §2 に沿う構造変更として独立レビューと設計担当の合意を得て、§11 に範囲・理由・試験を記録する。今回 §11 は編集していない。症状 guard・追加時間窓・HWND geometry capture・placement 保存先を作らない。
@@ -210,11 +212,24 @@ BS／親移動は Everything position を経由し、book 内の既存 prefix pa
 
 ## 8. KeyAction とメニュー
 
-提案: `GlobalEverythingSearch`、日本語説明「Everything でファイル名を検索する」、`Press`、main grid からだけ実行。**既定キーの推奨は Ctrl+Shift+G**。`docs/keymap.ini.default`、`docs/keymap-spec.md`、`src/keymap.rs` の読取確認で、この chord の既定割り当ては見つからなかった。Ctrl+G は item search、Ctrl+S は container search／fullscreen capture、Ctrl+E は export なので流用しない。利用者の個別割り当てと OS／他アプリの global hotkey は未検査。
+提案 action: `GlobalEverythingSearch`、日本語説明「Everything でファイル名を検索する」、`Press`、main grid からだけ実行。**既定キーは Ctrl+R（利用者決定 2026-10-11/12）**。一修飾・左手で操作する意図を反映する。初稿の Ctrl+Shift+G 推奨は置き換えた。Ctrl+G/S/E の現行操作は維持する。
 
-`KeyContext::Grid` とし、caller 側でも main grid・IME／text focus・modal／Remote lock の適格性を保証する（helper の chord 判定だけで context enforcement されたと思わない）。既存 Global 検索 action と同じ context にすると native video の全 Global-action forwarding に入り得るため、名前の Global は検索範囲を示すものとし発火 context を Global にしない。fullscreen に新しい検索転送を追加しない。操作カスタマイズの候補にも実行 scope を示す。
+2026-10-12 の context／fixed-key 調査（`78e5f09ad`）:
 
-`ini_name`／description／context／trigger／default_chords／ALL_ACTIONS と同梱 default を一緒に更新する。menu の「Everything ファイル名検索…」と key は同じ entry transaction に接続し、caption は現在の keymap から表示する。初版にリング／gesture 専用 action は増やさない。キーは利用者決定後に確定する。
+| 発火面／リスト | 調査結果と実装契約 |
+| --- | --- |
+| main grid | `docs/keymap.ini.default` と `src/keymap.rs` の default chords に Ctrl+R はない。`GRID_ACTIVE_SCOPES` (`keymap.rs:6988`) は Global/Grid/Rating。Grid action として追加し、caller は main の実一覧を確認する |
+| fixed/reserved keys | `RESERVED_BINDINGS` (`keymap.rs:7143`) に Ctrl+R はない。`src` の R key／VK 0x52 の直接参照に固定 Ctrl+R handler は見つからなかった |
+| 画像 fullscreen | `FS_IMAGE_ACTIVE_SCOPES` に Grid はない。`ui_fullscreen.rs:7967–7988` の R は `is_fullscreen_shortcut_probe_key` の検出用集合。handler 起動の可否を決めるだけで consume／action 割当ではなく、Ctrl+R 競合とはしない |
+| text／IME／focus recovery | `keyboard_input.rs:223` の `shortcut_permit` は TextInput 全 phase と Modal を拒否する。新 shortcut は text 入力を奪わず、IME preedit／commit／検索バー focus 中に起動しない。`preferences/pages.rs` の R は key chooser の候補で固定操作ではない |
+| egui 動画／音声 fullscreen | `FS_VIDEO_ACTIVE_SCOPES` (`keymap.rs:6998`) に Grid はない。`handle_video_input`／fullscreen handler に固定 Ctrl+R は見つからなかった。新 action は送らない |
+| native 動画／音声 | `app/native_video.rs:12296` の key routing／fixed VK branches に Ctrl+R 操作は見つからなかった。`video/native_presenter/render_core.rs:16152` の 0x52→R は key 変換であり割当ではない。native dispatch に新 Grid action を追加しない |
+
+確認した repository の default／固定経路では **競合なし**。利用者の独自 keymap と OS／他アプリの hotkey は未検査であり、現在の customization conflict warning を維持する。実装時の再棚卸しで新たな競合が見つかったら利用者へ報告し、別キーへ勝手に変更しない。
+
+`KeyContext::Grid` とし、caller 側でも main grid・IME／text focus・modal／Remote lock の適格性を保証する（helper の chord 判定だけで context enforcement されたと思わない）。名前の Global は検索範囲を示し、発火 context を Global にしない。fullscreen の active scopes は Global を含むが Grid を含まない。fullscreen／native video／detached から検索バーを出す転送を追加しない。操作カスタマイズの候補にも実行 scope を示す。
+
+実装時に `ini_name`／description／context／trigger／default_chords／ALL_ACTIONS と同梱 default を一緒に更新する。menu の「Everything ファイル名検索…」と key は同じ entry transaction に接続し、caption は現在の keymap から表示する。初版にリング／gesture 専用 action は増やさない。今回 keymap の product/default file は未編集。
 
 ## 9. 利用不能・失敗の案内
 
@@ -259,7 +274,7 @@ pure codec と `FakeEverythingEndpoint` を Windows transport と同じ safe int
 | open/back | image/video/audio、ZIP/PDF/EPUB/convertible、本内 BS と変換/password cancel、exact selection、元 synthetic／smart child／Collection 復帰、JumpToPhysicalFolder、履歴不変更 |
 | editing | Ready で開いて補正→戻る→sort／再検索／source 切替。旧 idx の Undo/draft が新行へ書かれない。Metadata の既存テストを弱めない。§1.372 の一般修正と混同しない |
 | context／F12／Remote | worker を fork しない。main 検索 cancel/close/requery で sibling の rows/cache/queues/generation 不変。main の Search採用／通常loadで旧main PDF jobsだけがpruneされ、同じpathのdetached seek jobs/requestedは不変。modal は main だけ。Ready 後 F12 と park/promote/return。Remote に source/query/collection enum を増やさず既存 lock を維持 |
-| keys／UI | inventory／generated default、変更した key の発火、無効化、Ctrl+G/S/E 非競合、IME preedit/commit/Esc/Tab、日本語 pasted query、Window ×取消、長い通知、small screen／100%・200% snapshot、progress 消失後の入力復帰 |
+| keys／UI | inventory／generated default、Ctrl+R の main Grid 発火・無効化・任意再割当、Ctrl+G/S/E 非競合、画像fullscreen／egui動画／native動画／detached／text focusでの非発火、R検出probeがあるだけでは新actionをdispatchしない、IME preedit/commit/Esc/Tab、日本語 pasted query、Window ×取消、長い通知、small screen／100%・200% snapshot、progress 消失後の入力復帰 |
 
 fake Win32 server が必要な adapter integration は、専用 thread のテスト用 class を **注入した HWND** として使う。default Everything class を検索しない、実 client を終了・操作しない、foreground/input を使わない。実 transport の wire／callback lifetime／SendMessageTimeout と Win32 parser をここで検査する。real Everything の compatibility 確認は別の承認済み実機工程であり、自動 suite の必須依存にしない。
 
@@ -277,10 +292,12 @@ fake Win32 server が必要な adapter integration は、専用 thread のテス
 
 実装を始める前に独立 design review と下記利用者回答を反映する。実装の coherent chunk は (A) pure codec／transport＋fake、(B) common source／single adoption＋classification＋open/back/context、(C) UI/keymap/manual＋gates。B は §7.2 の PDF owner 境界の先行設計合意・必要な改修と回帰確認が揃うまで開始しない。A も今回の Stage 1 では実装しない。共有ファイルは各 chunk で実装者一人が所有し、独立 reviewer は読取だけ。Stage 1 の今回の writer は設計書と handoff message のみ。
 
-## 12. 利用者への質問（この二点だけ）
+## 12. 利用者決定（2026-10-11/12、回答済み）
 
-1. **既定キーは Ctrl+Shift+G でよいか。** 代案は Ctrl+Alt+G、または既定なし（メニュー＋任意割り当て）。いずれも確認した既定 map には割り当てがなかった。利用者が最終決定する。
-2. **初版を明示送信・raw 先頭 10,000 件・paging なし・完了後一括採用・main から検索・Remote 追加なしで進めてよいか。** 非対応 file/folder も raw 上限を消費するため、すべての対応形式ヒットを保証しない。対応候補への worker stat が必要で、cold HDD／UNC では一覧採用まで待つ費用がある（取消可能）。全対応ヒット取得や stat 前の段階表示が必須なら、実装前に prefilter／snapshot paging／thumbnail stamp owner の別設計へ広げる。
+1. **既定キーは Ctrl+R。** context と固定リストの調査を §8 に記録した。repository default／fixed-key の競合は見つからず、この決定を設計へ採用する。
+2. **初版 scope は提案どおり承認。** 明示送信・raw 先頭 10,000 件・paging なし・完了後一括採用・main から検索・Remote 追加なし。非対応 file/folder も raw 上限を消費し、対応候補への worker stat の待ち費用がある前提を維持する。
+
+同じ質問を再要求しない。PDF ownership の独立設計は利用者の今回の指示で作成し、独立レビューは利用者の依頼待ち。追加の利用者質問はない。scope 決定は実装開始や独立レビューの代わりにはしない。
 
 ## 13. Stage 1 の結果と未確認事項
 
@@ -289,3 +306,5 @@ fake Win32 server が必要な adapter integration は、専用 thread のテス
 独立レビュー: 別コンテキストの GPT-6.1 Sol / xhigh。初稿で見つかった (1) metadata 未取得行では thumbnail enqueue が成立しない前提、(2) physical 本の既存帰路が DrillState に依存する前提は、対応候補の worker stat と typed Root/PhysicalChild の accepted boundary に改訂した。reviewer は両修正を設計上解消と判断した。
 
 共有 PDF epoch の owner 境界 P1 は **未解消**。§7.2 にコード根拠と統合前の停止条件を記録した。追記確認後の reviewer 最終判定は「Stage 1 調査案に限定して ACCEPT」。統合実装 ready／full design ACCEPT ではない。PDF owner の具体設計合意・必要改修・回帰確認が揃うまで chunk B を開始しない。Stage 1 完了は実装開始や master 統合を意味しない。
+
+2026-10-12: Stage 1 計画は利用者が `78e5f09ad` として commit。§12 の回答を反映し、[PDF ownership の独立設計案](pdf-render-epoch-ownership-plan.md)を追加。**今回の新設計・追記に対する内部／独立レビューは行っていない。** 先の限定 ACCEPT は Stage 1 の履歴であり、今回の subdesign の ACCEPT ではない。製品コード・.git は未変更、tests/build/launch/download なし。
