@@ -1047,7 +1047,6 @@ impl App {
                     cause: ProjectionAdoptionCause::Normal,
                 };
                 self.spread_shift.availability = self.pairing_edit_availability();
-                self.start_composition_removed_shift_restore(self.frame_counter.wrapping_add(1));
                 return;
             }
             CompositionProjectionOutcome::Unreadable { reason } => {
@@ -1081,7 +1080,6 @@ impl App {
                 cause: ProjectionAdoptionCause::Normal,
             };
             self.spread_shift.availability = self.pairing_edit_availability();
-            self.start_composition_removed_shift_restore(self.frame_counter.wrapping_add(1));
             return;
         }
         if reply.saved_trim.is_some() {
@@ -1218,9 +1216,10 @@ impl App {
             let defaults = super::SpreadRestoreDefaults::for_book(&self.settings);
             let stored = reply.automatic_preferences.unwrap_or_default();
             let direction = stored.direction.unwrap_or(defaults.reading_direction);
-            let mode = stored
-                .mode
-                .unwrap_or(defaults.spread_mode.with_reading_direction(direction));
+            let mode = stored.resolve_mode(
+                defaults.spread_mode.with_reading_direction(direction),
+                direction,
+            );
             self.reading_direction = mode.reading_direction().unwrap_or(direction);
             self.reading_flow = stored.flow.unwrap_or(defaults.reading_flow);
             self.spread_mode = if mode == crate::settings::SpreadMode::Vertical {

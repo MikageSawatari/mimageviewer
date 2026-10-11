@@ -40,22 +40,15 @@ fn stored_binding(value: i32) -> Option<SpreadMode> {
     }
 }
 
-fn stored_view_mode(value: i32) -> SpreadMode {
+fn stored_view_mode(value: i32) -> Option<StoredViewMode> {
     if value & VIEW_ONLY == 0 {
-        return SpreadMode::from_int(value);
+        return None;
     }
-    let binding = stored_binding(value).unwrap_or_default();
-    let direction = binding.reading_direction().unwrap_or(ReadingDirection::Ltr);
-    match (value >> 8) & 3 {
-        2 => if binding.has_cover() {
-            SpreadMode::LtrCover
-        } else {
-            SpreadMode::Ltr
-        }
-        .with_reading_direction(direction),
-        3 => SpreadMode::SplitLtr.with_reading_direction(direction),
-        _ => SpreadMode::Single,
-    }
+    Some(match (value >> 8) & 3 {
+        2 => StoredViewMode::Spread,
+        3 => StoredViewMode::LandscapeSplit,
+        _ => StoredViewMode::Single,
+    })
 }
 
 fn view_class(mode: SpreadMode) -> i32 {
@@ -68,11 +61,54 @@ fn view_class(mode: SpreadMode) -> i32 {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum StoredViewMode {
+    Single,
+    Spread,
+    LandscapeSplit,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct StoredSpreadState {
+    /// Released binding, resolved independently of a mode-only viewing choice.
     pub(crate) mode: Option<SpreadMode>,
+    pub(crate) view_mode: Option<StoredViewMode>,
     pub(crate) flow: Option<ReadingFlow>,
     pub(crate) direction: Option<ReadingDirection>,
+}
+
+impl StoredSpreadState {
+    /// Combine the viewing choice only after exact/fallback/default binding resolution.
+    /// Single/Vertical bindings have no embedded direction; their direction column
+    /// still controls Spread/Split. A missing binding keeps inherited cover settings.
+    pub(crate) fn resolve_mode(
+        self,
+        default_mode: SpreadMode,
+        preferred_direction: ReadingDirection,
+    ) -> SpreadMode {
+        let binding = self.mode.unwrap_or(default_mode);
+        let Some(view_mode) = self.view_mode else {
+            return binding;
+        };
+        let direction = self
+            .mode
+            .and_then(SpreadMode::reading_direction)
+            .or(self.direction)
+            .or(default_mode.reading_direction())
+            .unwrap_or(preferred_direction);
+        match view_mode {
+            StoredViewMode::Single => SpreadMode::Single,
+            StoredViewMode::Spread => if binding.has_cover() {
+                SpreadMode::LtrCover
+            } else {
+                SpreadMode::Ltr
+            }
+            .with_reading_direction(direction),
+            StoredViewMode::LandscapeSplit => {
+                SpreadMode::SplitLtr.with_reading_direction(direction)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -188,16 +224,20 @@ impl SpreadDb {
 
     /// フォルダの表示モードを取得。未登録なら None。
     pub fn get(&self, path: &Path) -> Option<SpreadMode> {
+        self.get_stored_mode(path)?;
+        Some(
+            self.get_state_with_fallback(path, None)
+                .resolve_mode(SpreadMode::default(), ReadingDirection::Ltr),
+        )
+    }
+
+    fn get_stored_mode(&self, path: &Path) -> Option<i32> {
         let key = normalize_path(path);
         let mut stmt = self
             .conn
             .prepare_cached("SELECT mode FROM spreads WHERE path = ?1")
             .ok()?;
-        stmt.query_row([&key], |row| {
-            let v: i32 = row.get(0)?;
-            Ok(stored_view_mode(v))
-        })
-        .ok()
+        stmt.query_row([&key], |row| row.get(0)).ok()
     }
 
     /// フォルダの連結方式を取得。旧 `mode=5` は縦連結として扱う。
@@ -257,10 +297,13 @@ impl SpreadDb {
         key: &Path,
         fallback: Option<&Path>,
     ) -> StoredSpreadState {
+        let exact_mode = self.get_stored_mode(key);
+        let fallback_mode = fallback.and_then(|fallback| self.get_stored_mode(fallback));
         StoredSpreadState {
-            mode: self
-                .get(key)
-                .or_else(|| fallback.and_then(|fallback| self.get(fallback))),
+            mode: exact_mode
+                .and_then(stored_binding)
+                .or_else(|| fallback_mode.and_then(stored_binding)),
+            view_mode: exact_mode.or(fallback_mode).and_then(stored_view_mode),
             flow: self
                 .get_flow(key)
                 .or_else(|| fallback.and_then(|fallback| self.get_flow(fallback))),
@@ -557,12 +600,10 @@ impl SpreadDb {
     ) -> Result<(), rusqlite::Error> {
         let key = normalize_path(path);
         let mode = self
-            .conn
-            .query_row("SELECT mode FROM spreads WHERE path = ?1", [&key], |row| {
-                row.get::<_, i32>(0)
-            })
-            .map(|value| {
-                stored_view_mode(value)
+            .get_stored_mode(path)
+            .map(|_| {
+                self.get_state_with_fallback(path, None)
+                    .resolve_mode(default_mode, direction)
                     .with_reading_direction(direction)
                     .to_int()
             })
@@ -915,8 +956,17 @@ mod tests {
             let state = db.get_state_with_fallback(&child, Some(root));
             assert_eq!(state.flow, db.get_flow(root));
             assert_eq!(state.direction, db.get_direction(root));
-            assert_eq!(state.mode.unwrap().is_spread(), mode.is_spread());
-            assert_eq!(state.mode.unwrap().is_split(), mode.is_split());
+            let resolved = state.resolve_mode(
+                crate::settings::SpreadMode::Single,
+                crate::settings::ReadingDirection::Ltr,
+            );
+            assert_eq!(resolved.is_spread(), mode.is_spread());
+            assert_eq!(resolved.is_split(), mode.is_split());
+            if mode.is_spread() {
+                assert_eq!(resolved, crate::settings::SpreadMode::RtlCover);
+            } else if mode.is_split() {
+                assert_eq!(resolved, crate::settings::SpreadMode::SplitRtl);
+            }
             assert_eq!(db.get(root), Some(crate::settings::SpreadMode::RtlCover));
         }
         db.set_flow_only(
@@ -933,6 +983,114 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn composition_mode_only_resolves_direction_and_cover_after_binding_inheritance() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = SpreadDb::open_at(&temp.path().join("spread.db")).unwrap();
+        let root = Path::new("C:/books/binding.zip");
+        db.set_presentation_state(
+            root,
+            SpreadMode::RtlCover,
+            ReadingFlow::Horizontal,
+            ReadingDirection::Rtl,
+            (
+                SpreadMode::Single,
+                ReadingFlow::Paged,
+                ReadingDirection::Ltr,
+            ),
+        )
+        .unwrap();
+        for (name, legacy) in [
+            ("single", Some(SpreadMode::Single)),
+            ("vertical", Some(SpreadMode::Vertical)),
+            ("inherited", None),
+        ] {
+            let child = root.join(name);
+            if let Some(legacy) = legacy {
+                db.set_presentation_state(
+                    &child,
+                    legacy,
+                    ReadingFlow::Paged,
+                    ReadingDirection::Rtl,
+                    (
+                        SpreadMode::Single,
+                        ReadingFlow::Paged,
+                        ReadingDirection::Ltr,
+                    ),
+                )
+                .unwrap();
+            }
+            for (view, expected) in [
+                (SpreadMode::Single, SpreadMode::Single),
+                (
+                    SpreadMode::Ltr,
+                    if legacy.is_none() {
+                        SpreadMode::RtlCover
+                    } else {
+                        SpreadMode::Rtl
+                    },
+                ),
+                (SpreadMode::SplitLtr, SpreadMode::SplitRtl),
+            ] {
+                db.set_mode_only(&child, view).unwrap();
+                let stored = db.get_state_with_fallback(&child, Some(root));
+                assert_eq!(stored.mode, legacy.or(Some(SpreadMode::RtlCover)));
+                assert_eq!(stored.direction, Some(ReadingDirection::Rtl));
+                assert_eq!(
+                    stored.resolve_mode(SpreadMode::Ltr, ReadingDirection::Ltr),
+                    expected,
+                    "{name}: {view:?}"
+                );
+            }
+        }
+        let global = Path::new("C:/books/global.pdf");
+        db.set_mode_only(global, SpreadMode::Ltr).unwrap();
+        let stored = db.get_state_with_fallback(global, None);
+        assert_eq!(stored.mode, None);
+        assert_eq!(stored.direction, None);
+        assert_eq!(
+            stored.resolve_mode(SpreadMode::RtlCover, ReadingDirection::Rtl),
+            SpreadMode::RtlCover
+        );
+    }
+
+    #[test]
+    fn composition_mode_only_preserves_canonical_binding_over_conflicting_direction_column() {
+        // The released combined-mode consumer gives its embedded direction
+        // priority. Orthogonal viewing choices must preserve that same rule.
+        for binding in [
+            SpreadMode::LtrCover,
+            SpreadMode::RtlCover,
+            SpreadMode::SplitLtr,
+            SpreadMode::SplitRtl,
+        ] {
+            let canonical = binding.reading_direction().unwrap();
+            let conflicting = if canonical == ReadingDirection::Ltr {
+                ReadingDirection::Rtl
+            } else {
+                ReadingDirection::Ltr
+            };
+            let stored = StoredSpreadState {
+                mode: Some(binding),
+                view_mode: Some(StoredViewMode::Spread),
+                direction: Some(conflicting),
+                ..Default::default()
+            };
+            assert_eq!(
+                stored
+                    .resolve_mode(SpreadMode::Single, conflicting)
+                    .reading_direction(),
+                Some(canonical)
+            );
+            assert_eq!(
+                stored
+                    .resolve_mode(SpreadMode::Single, conflicting)
+                    .has_cover(),
+                binding.has_cover()
+            );
+        }
+    }
 
     #[test]
     fn spread_mode_roundtrip() {
@@ -1065,6 +1223,7 @@ mod tests {
             db.get_state_with_fallback(&key, Some(root)),
             StoredSpreadState {
                 mode: Some(SpreadMode::RtlCover),
+                view_mode: None,
                 flow: Some(ReadingFlow::Horizontal),
                 direction: Some(ReadingDirection::Rtl),
             }

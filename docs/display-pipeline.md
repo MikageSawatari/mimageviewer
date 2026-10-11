@@ -7,6 +7,8 @@ Blankはsource/readinessを持たず、補助はNavigation/resume/exportの実�
 提示候補はcontext/世代/source/role/slot/sliceをworkerで確認し、相方はunit内でatomicに採用する。
 Checking/Hiddenはcached processed/raw/thumbnail/holdoverからもtexture選択・paint・transform/hit・読了traceへ渡さない。
 連結の測定extentと画像許可を分離し、bounded cacheの既知寸法だけで未許可画像を復活させない。
+scroll/reanchor/resizeで探索を更新しても、画面に残るoccurrenceの許可とChecking要求は保持する。
+測定された可視要求との差分だけで退出を破棄・新入場を照合し、cached画像も継続描画する。
 類似候補の長押しプレビューは、Single/Spread/連結それぞれの許可済み表示を一時的に置き換える。
 連結では通常の可視unit受付を共有し、Checking/Hiddenの元occurrenceをプレビューで迂回しない。
 候補自身のidentityも既存preview workerで共通resolverへ渡し、完了採用時に最新scope tokenを照合する。

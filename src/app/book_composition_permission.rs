@@ -495,10 +495,28 @@ impl App {
         })
     }
 
-    pub(crate) fn retain_book_presentation_demand(&mut self, demand: &[PresentationOccurrence]) {
+    /// Hidden occurrences were skipped, never presented. A new viewport search
+    /// retires those exclusions, while overlapping visible/pending occurrences
+    /// keep their requests until the measured visible-demand diff retires them.
+    pub(crate) fn retire_hidden_book_presentation_demand(&mut self) {
+        self.book_composition_permission
+            .occurrences
+            .retain(|_, state| {
+                !matches!(
+                    state,
+                    OccurrencePermission::Complete(CandidatePermission::Hidden(_))
+                )
+            });
+    }
+
+    pub(crate) fn bind_book_presentation_demand(&mut self) {
         let context = self.spread_shift_context_id().serial();
         self.book_composition_permission
             .bind(context, self.items_generation);
+    }
+
+    pub(crate) fn retain_book_presentation_demand(&mut self, demand: &[PresentationOccurrence]) {
+        self.bind_book_presentation_demand();
         self.book_composition_permission
             .occurrences
             .retain(|key, _| demand.contains(key));
@@ -958,7 +976,9 @@ impl App {
                 self.begin_qualified_book_unit(intent, demand);
             }
             PageStatus::HiddenByComposition if intent.purpose == BookTargetPurpose::Explicit => {
-                self.show_feedback_toast("本の構成で非表示に設定されています".into())
+                self.handle_deferred_fs_open_outcome(
+                    super::DeferredFsOpenOutcome::RequiredTargetHidden,
+                )
             }
             PageStatus::HiddenByComposition => {
                 let survivor = candidates
@@ -1446,9 +1466,9 @@ impl App {
         });
         if !target_allowed {
             match intent.purpose {
-                BookTargetPurpose::Explicit => {
-                    self.show_feedback_toast("本の構成で非表示に設定されています".into())
-                }
+                BookTargetPurpose::Explicit => self.handle_deferred_fs_open_outcome(
+                    super::DeferredFsOpenOutcome::RequiredTargetHidden,
+                ),
                 BookTargetPurpose::Next
                 | BookTargetPurpose::Previous
                 | BookTargetPurpose::FirstInBook => {

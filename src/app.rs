@@ -26005,6 +26005,7 @@ impl App {
         self.page_alone_preferences = page_alone_preferences;
         let applied_document_direction = if self.settings.follow_document_reading_direction
             && stored.mode.is_none()
+            && stored.view_mode.is_none()
             && stored.direction.is_none()
         {
             document_direction.map(|direction| match direction {
@@ -26024,19 +26025,18 @@ impl App {
             .direction
             .or(applied_document_direction)
             .unwrap_or(defaults.reading_direction);
-        let stored_spread = stored.mode.unwrap_or_else(|| {
-            if stored.direction.is_some() {
-                defaults
-                    .spread_mode
-                    .with_reading_direction(preferred_direction)
-            } else {
-                default_spread_for_document_direction(
-                    defaults.spread_mode,
-                    self.settings.follow_document_reading_direction,
-                    document_direction,
-                )
-            }
-        });
+        let default_spread = if stored.direction.is_some() {
+            defaults
+                .spread_mode
+                .with_reading_direction(preferred_direction)
+        } else {
+            default_spread_for_document_direction(
+                defaults.spread_mode,
+                self.settings.follow_document_reading_direction,
+                document_direction,
+            )
+        };
+        let stored_spread = stored.resolve_mode(default_spread, preferred_direction);
         self.reading_flow = stored.flow.unwrap_or(defaults.reading_flow);
         self.reading_direction = stored_spread
             .reading_direction()
@@ -37286,7 +37286,9 @@ impl App {
             || {
                 self.spread_db.as_ref().is_ok_and(|db| {
                     let stored = db.get_state_with_fallback(&pdf_path, None);
-                    stored.mode.is_some() || stored.direction.is_some()
+                    stored.mode.is_some()
+                        || stored.view_mode.is_some()
+                        || stored.direction.is_some()
                 })
             },
         );
@@ -37566,6 +37568,10 @@ impl App {
             DeferredFsOpenOutcome::RequiredTargetHidden => {
                 self.finish_visible_container_fs_nav_failed();
                 self.show_feedback_toast("このページは本の構成で非表示になっています".into());
+                #[cfg(windows)]
+                self.terminate_active_detached_open_before_viewport(
+                    "deferred_open_required_target_hidden",
+                );
             }
         }
     }
@@ -45012,15 +45018,21 @@ impl App {
             self.reprepare_page_edits_for_existing_virtual_order();
         }
         if let Some(container) = result.container_state.take() {
-            let stored_spread = container
-                .spread_mode
-                .unwrap_or(self.settings.default_spread_mode);
-            self.reading_flow = container
-                .reading_flow
-                .unwrap_or(self.settings.default_reading_flow);
-            self.reading_direction = container
-                .reading_direction
+            let preferred_direction = container
+                .spread
+                .direction
                 .unwrap_or(self.settings.default_reading_direction);
+            let stored_spread = container.spread.resolve_mode(
+                self.settings
+                    .default_spread_mode
+                    .with_reading_direction(preferred_direction),
+                preferred_direction,
+            );
+            self.reading_flow = container
+                .spread
+                .flow
+                .unwrap_or(self.settings.default_reading_flow);
+            self.reading_direction = preferred_direction;
             if stored_spread == crate::settings::SpreadMode::Vertical {
                 self.spread_mode = crate::settings::SpreadMode::Single;
                 self.reading_flow = crate::settings::ReadingFlow::Vertical;

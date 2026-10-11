@@ -6231,13 +6231,10 @@ impl ContainerEngine {
         } else {
             crate::spread_db::container_key_with_fallback(&resolved.logical, &[])
         };
-        let (
-            stored_mode,
-            stored_direction,
-            final_cover_preference,
-            singleton_placement_preference,
-            page_alone_preference,
-        ) = self.stored_spread_state(&key.exact, key.fallback.as_deref())?;
+        let (stored, final_cover_preference, singleton_placement_preference, page_alone_preference) =
+            self.stored_spread_state(&key.exact, key.fallback.as_deref())?;
+        let stored_mode = stored.mode;
+        let stored_direction = stored.direction;
         let source_items = source_items.unwrap_or(items);
         let (mut default_mode, mut default_direction) = if use_book_defaults {
             (
@@ -6258,6 +6255,7 @@ impl ContainerEngine {
         // Only an enabled D10 without a saved book value reads a plain PDF's direction.
         if reading_settings.follow_document_reading_direction
             && stored_mode.is_none()
+            && stored.view_mode.is_none()
             && stored_direction.is_none()
         {
             let document_direction = if is_epub_path(&resolved.logical) {
@@ -6296,7 +6294,8 @@ impl ContainerEngine {
         let (configured, effective, reading_direction) = resolve_spread_state(
             request.spread_mode,
             request.reading_direction,
-            stored_mode,
+            (stored.mode.is_some() || stored.view_mode.is_some())
+                .then(|| stored.resolve_mode(default_mode, default_direction)),
             stored_direction,
             default_mode,
             default_direction,
@@ -6506,8 +6505,7 @@ impl ContainerEngine {
         fallback: Option<&Path>,
     ) -> Result<
         (
-            Option<crate::settings::SpreadMode>,
-            Option<crate::settings::ReadingDirection>,
+            crate::spread_db::StoredSpreadState,
             crate::settings::FinalCoverSpreadPreference,
             crate::settings::SingletonSpreadEndpointPreferences,
             crate::settings::PageAlonePreferences,
@@ -6557,8 +6555,7 @@ impl ContainerEngine {
             })?
             .unwrap_or_default();
         Ok((
-            stored.mode,
-            stored.direction,
+            stored,
             final_cover_preference,
             singleton_placement_preference,
             page_alone_preference,

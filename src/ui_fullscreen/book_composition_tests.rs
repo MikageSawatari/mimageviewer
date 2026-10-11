@@ -1713,6 +1713,160 @@ fn continuous_actual_paint_never_uses_checking_or_hidden_cached_resources() {
 }
 
 #[test]
+fn g3_continuous_visible_occurrences_keep_permission_through_scroll_reanchor_and_resize() {
+    let data = tempfile::tempdir().unwrap();
+    let (service, owner) =
+        BookCompositionService::spawn_at(data.path().to_path_buf(), None).unwrap();
+    service
+        .prepare(
+            crate::book_scope::BookScopeKey::document("c:/g3-display.pdf").unwrap(),
+            PageDomain::Document,
+        )
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap()
+        .status
+        .unwrap();
+    let (worker_entered, paused_worker) = service.hold_worker_for_test();
+    worker_entered
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap();
+    let mut app = composed_app(&fixtures::four_page_book(CompositionDirection::Ltr));
+    app.install_book_composition_runtime(service);
+    app.spread_mode = SpreadMode::Single;
+    app.fullscreen_idx = Some(0);
+    app.reading_flow = ReadingFlow::Vertical;
+    app.settings.fullscreen_fit_mode = FullscreenFitMode::Original;
+    app.settings.continuous_reading_gap_px = 0;
+    let ctx = egui::Context::default();
+    let mut ids = Vec::new();
+    for idx in 0..4 {
+        let pixels = Arc::new(egui::ColorImage::filled([400, 600], egui::Color32::GREEN));
+        let tex = ctx.load_texture(
+            format!("g3-retained-{idx}"),
+            pixels.clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        ids.push(tex.id());
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                tex,
+                pixels,
+                source_dims: Some([400, 600]),
+                load_seq: 1,
+                animation: crate::fs_animation::StaticAnimationState::Still,
+            },
+        );
+        app.record_page_layout_dims_for_spread(idx, (400, 600));
+        app.rotation_cache
+            .insert(idx, crate::rotation_db::Rotation::None);
+    }
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+    let (units, _) = app.continuous_reading_units_and_pos(0).unwrap();
+    let a = units[0].presentation_demand();
+    let b = units[1].presentation_demand();
+    app.install_allowed_presentation_for_test(&a);
+    let held_b = app.install_checking_presentation_for_test(&b);
+    let b_correlation = app.checking_presentation_correlations_for_test(&b);
+    let draw = |app: &mut crate::app::App, rect: egui::Rect| {
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        app.draw_fs_continuous_reading(
+                            ui,
+                            ctx,
+                            rect,
+                            app.fullscreen_idx.unwrap(),
+                            true,
+                            FsPageTurnDecision::normal(),
+                        );
+                    });
+            },
+        );
+        painted_texture_ids(&ctx, output)
+    };
+    app.fs_vertical_scroll = 1.0;
+    assert!(draw(&mut app, rect).contains(&ids[0]));
+    for step in [0.05, 0.25, 0.5] {
+        app.fs_vertical_scroll += step;
+        let painted = draw(&mut app, rect);
+        assert!(
+            painted.contains(&ids[0]),
+            "micro scroll retains cached A while B waits"
+        );
+        assert!(
+            !painted.contains(&ids[1]),
+            "cached newly presented B has no permission"
+        );
+        assert!(matches!(
+            app.book_presentation_allowed(&a),
+            PresentationDecision::Allowed(_)
+        ));
+        assert_eq!(
+            app.checking_presentation_correlations_for_test(&b),
+            b_correlation
+        );
+    }
+    let (_, _, _, offsets, _) = app
+        .permitted_continuous_reading_layout(&ctx, rect, &units, 0, false)
+        .unwrap();
+    app.reanchor_continuous_reading_viewer(
+        &ctx,
+        &offsets,
+        1,
+        1,
+        crate::page_split::PageSlice::Full,
+        crate::app::HistoryTrigger::UserChosen,
+    );
+    for size in [egui::vec2(810.0, 620.0), egui::vec2(820.0, 610.0)] {
+        let resized = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        let painted = draw(&mut app, resized);
+        assert!(
+            painted.contains(&ids[0]),
+            "reanchor/resize preserves still visible A"
+        );
+        assert!(!painted.contains(&ids[1]));
+        assert!(matches!(
+            app.book_presentation_allowed(&a),
+            PresentationDecision::Allowed(_)
+        ));
+        assert_eq!(
+            app.checking_presentation_correlations_for_test(&b),
+            b_correlation
+        );
+    }
+    // Actual viewport exit retires the grant. Cached A must wait on a fresh
+    // request when it enters again, unlike the overlapping cases above.
+    app.fs_vertical_scroll = 650.0;
+    draw(&mut app, rect);
+    assert!(
+        !app.book_presentation_demand_snapshot()
+            .iter()
+            .any(|occ| a.contains(occ))
+    );
+    app.fs_vertical_scroll = -599.0;
+    let painted = draw(&mut app, rect);
+    assert!(!painted.contains(&ids[0]));
+    assert!(matches!(
+        app.book_presentation_allowed(&a),
+        PresentationDecision::Checking
+    ));
+    assert!(
+        !app.checking_presentation_correlations_for_test(&a)
+            .is_empty()
+    );
+    drop(held_b);
+    paused_worker.send(()).unwrap();
+    owner.shutdown_and_join();
+}
+
+#[test]
 fn composed_continuous_geometry_and_pdf_demand_match_the_real_e_consumer() {
     use crate::app::PdfRerenderRequestProbe;
     for flow in [ReadingFlow::Vertical, ReadingFlow::Horizontal] {

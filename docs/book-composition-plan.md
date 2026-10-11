@@ -654,6 +654,8 @@ App共通bool、anchor専用許可、texture cacheに付ける許可の別owner�
    描けたNavigationから既存reanchorを行う。全Hiddenで候補を使い切った時だけ一覧へ戻る。
    base items/nav順は変えず、他unitから相方を借りない。明示openのHiddenはtoast拒否、連結の隣候補はskip。
 5. 画面に残る同じoccurrenceは現在の提示episodeの許可を保持して継続描画できる。
+   scroll値・reanchor・viewport寸法の変更だけでは退出としない。探索cursorを作り直す場合も、
+   既存の可視/Checking occurrenceを保持し、測定後の可視要求との差分で退出をretireし新入場だけを照合する。
    同episodeでskipした候補も要求内だけに持ち、毎frame同じHiddenを問い直すloopを作らない。
    画面から退出/要求retire/closeで提示許可を破棄し、再入場は新要求。Hidden除外は当該可視要求内だけで、
    全列skip cacheや永続非表示bitmapへ昇格させない。
@@ -1551,6 +1553,12 @@ slideshowも同じtyped permission intentへsliceと継続を載せ、許可後�
 失敗への自動retryやrollback ownerは追加しない。
 mode-onlyは既存spread.dbのmode整数に表示分類を載せ、元の結合binding値を下位部分に保持する。
 binding未設定は専用値で表し、mode行作成だけでLTR/Pagedを作らない。direction/flow/端配置/補助/shiftを変更しない。
+読取値は休眠bindingと表示分類を分け、exact→fallback→既定のbinding/方向/表紙を解決してから分類を適用する。
+旧Single/Verticalの方向列、binding未設定時の親RtlCoverも解除・再入場・metadata復元・Remoteで共通に維持する。
+解除用shift復元causeは実際のComposed→Automatic採用にだけ与える。構成なしのgeneration再照合や★固定解除は
+通常の保持列復帰であり、snapshot ownerが復元した記憶OFFのsession shiftを保持する。
+required Hidden初回openはMissingと同じcontext限定の既存終端処理へ渡し、Preparing sessionとloading runtimeを終了する。
+兄弟contextのitems/worker/選択やmain一覧は変更しない。
 専用store/column/migrationは追加せず、metadata transferもmode値を検証・保持する。
 `FsViewSpread` / `FsViewLandscapeSplit`は既定キーなしの通常登録Action。
 Remoteはstrict IPC **v70**で`SetViewMode`とderived `composition_managed`を追加し、Composedの結合`SetSpread`を拒否する。

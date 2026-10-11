@@ -41180,6 +41180,9 @@ impl App {
         (f32, f32),
     )> {
         use crate::book_composition::PresentationDecision;
+        // Scope/generation binding retires another owner's grants before they
+        // can influence geometry; the visible-demand diff retains this owner's.
+        self.bind_book_presentation_demand();
         let binding = ContinuousAdmissionBinding {
             items_generation: self.items_generation,
             mode: self.spread_mode,
@@ -41217,9 +41220,10 @@ impl App {
                 ContinuousAdmissionEpisode::Idle
             )
         {
-            // A viewport exit/reentry starts a fresh presentation episode. Source
-            // measurements remain usable, but the old Hidden/Allowed permits do not.
-            self.retain_book_presentation_demand(&[]);
+            // Scroll/reanchor/resize restarts the bounded exclusion search, not
+            // presentation of every page. Retain overlapping visible occurrences;
+            // the measured demand below retires exits and admits only new entries.
+            self.retire_hidden_book_presentation_demand();
         }
         let (mut skipped, mut hidden_ranges) =
             existing.unwrap_or((base_current_pos..base_current_pos, Vec::new()));

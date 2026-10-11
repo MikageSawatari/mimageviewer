@@ -1145,7 +1145,9 @@ impl App {
             || {
                 self.spread_db.as_ref().is_ok_and(|db| {
                     let stored = db.get_state_with_fallback(&path, None);
-                    stored.mode.is_some() || stored.direction.is_some()
+                    stored.mode.is_some()
+                        || stored.view_mode.is_some()
+                        || stored.direction.is_some()
                 })
             },
         );
@@ -2082,9 +2084,8 @@ impl App {
         let worker_password = password.clone();
         let want_direction = self.settings.follow_document_reading_direction
             && self.spread_db.as_ref().is_ok_and(|db| {
-                db.get_state_with_fallback(&worker_path, None)
-                    .mode
-                    .is_none()
+                let stored = db.get_state_with_fallback(&worker_path, None);
+                stored.mode.is_none() && stored.view_mode.is_none()
             });
         let (sender, receiver) = std::sync::mpsc::channel();
         let spawn = std::thread::Builder::new()
@@ -2353,9 +2354,8 @@ impl App {
                 want_direction: target.resolved_kind == CollectionResolvedKind::Pdf
                     && self.settings.follow_document_reading_direction
                     && self.spread_db.as_ref().is_ok_and(|db| {
-                        db.get_state_with_fallback(&target.source_path, None)
-                            .mode
-                            .is_none()
+                        let stored = db.get_state_with_fallback(&target.source_path, None);
+                        stored.mode.is_none() && stored.view_mode.is_none()
                     }),
                 target,
             })

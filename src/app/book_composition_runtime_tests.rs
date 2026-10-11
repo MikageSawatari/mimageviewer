@@ -1573,3 +1573,245 @@ fn g3_completed_projection_reprepares_after_newer_persisted_app_trim_edit() {
     assert!(!env.view_trim_save_pending);
     owner.shutdown_and_join();
 }
+
+#[test]
+fn g3_mode_only_removal_and_document_reentry_preserve_saved_rtl_direction() {
+    use crate::settings::{ReadingDirection as Direction, ReadingFlow, SpreadMode};
+    use crate::ui_fullscreen::FullscreenViewMode;
+
+    for legacy in [SpreadMode::Single, SpreadMode::Vertical] {
+        let mut env = setup_app();
+        let root = env.tmp.path().join("dormant-direction.pdf");
+        let scope = install_document(&mut env, &root);
+        let data = crate::data_dir::get();
+        assert!(data.starts_with(env.tmp.path()));
+        env.spread_db = Ok(crate::spread_db::SpreadDb::open_at(&data.join("spread.db")).unwrap());
+        env.spread_db
+            .as_ref()
+            .unwrap()
+            .set_presentation_state(
+                &root,
+                legacy,
+                ReadingFlow::Paged,
+                Direction::Rtl,
+                (SpreadMode::Single, ReadingFlow::Paged, Direction::Ltr),
+            )
+            .unwrap();
+        let (service, owner) = runtime(&mut env, &data);
+        save(&service, &scope, ReadingDirection::Ltr);
+        admit_projection(&mut env, &service, &scope);
+        settle_projection(&mut env);
+        assert!(env.composed_book_layout().is_some());
+
+        // Both changes use the actual mode-only producer while the composition
+        // deliberately has the opposite direction from the dormant binding.
+        env.apply_fullscreen_view_mode(&egui::Context::default(), 0, FullscreenViewMode::Single);
+        env.apply_fullscreen_view_mode(&egui::Context::default(), 0, FullscreenViewMode::Spread);
+        barrier(&service, &scope);
+        assert_eq!(env.reading_direction, Direction::Ltr);
+        assert_eq!(env.spread_mode, SpreadMode::Ltr);
+        service
+            .remove(scope.clone(), PageDomain::Document)
+            .recv_timeout(WAIT)
+            .unwrap()
+            .status
+            .unwrap();
+        admit_projection(&mut env, &service, &scope);
+        settle_projection(&mut env);
+        assert!(env.composed_book_layout().is_none());
+        assert_eq!(env.spread_mode, SpreadMode::Rtl, "{legacy:?}");
+        assert_eq!(env.reading_direction, Direction::Rtl, "{legacy:?}");
+        let flow = if legacy == SpreadMode::Vertical {
+            ReadingFlow::Vertical
+        } else {
+            ReadingFlow::Paged
+        };
+        assert_eq!(env.reading_flow, flow);
+        let stored = env
+            .spread_db
+            .as_ref()
+            .unwrap()
+            .get_state_with_fallback(&root, None);
+        assert_eq!(stored.mode, Some(legacy));
+        assert_eq!(stored.direction, Some(Direction::Rtl));
+
+        // Fresh entry passes through the same production restore as a new open,
+        // and must agree with the actual composition-removal adoption.
+        install_document(&mut env, &root);
+        let defaults = SpreadRestoreDefaults::for_book(&env.settings);
+        env.apply_spread_for_key(&root, defaults).unwrap();
+        adopt(&mut env, &service, &scope);
+        assert_eq!(env.spread_mode, SpreadMode::Rtl, "{legacy:?}");
+        assert_eq!(env.reading_direction, Direction::Rtl);
+        assert_eq!(env.reading_flow, flow);
+        assert_eq!(
+            env.spread_db
+                .as_ref()
+                .unwrap()
+                .get_state_with_fallback(&root, None),
+            stored,
+            "read-only removal/reentry must retain dormant binding columns"
+        );
+        owner.shutdown_and_join();
+    }
+}
+
+#[test]
+fn g3_mode_only_archive_removal_and_reentry_preserve_inherited_rtl_cover() {
+    use crate::book_composition::{BookComposition, CompositionPageRef, CompositionUnit};
+    use crate::settings::{ReadingDirection as Direction, ReadingFlow, SpreadMode};
+    use crate::ui_fullscreen::FullscreenViewMode;
+    use std::io::Write;
+
+    let mut env = setup_app();
+    let root = env.tmp.path().join("inherited-cover.zip");
+    let mut writer = zip::ZipWriter::new(std::fs::File::create(&root).unwrap());
+    for page in 0..4 {
+        writer
+            .start_file(
+                format!("chapter/{page}.jpg"),
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        writer.write_all(b"source payload").unwrap();
+    }
+    writer.finish().unwrap();
+    let tree = Arc::new(crate::zip_tree::ZipTree::build(
+        root.clone(),
+        crate::zip_loader::enumerate_image_entries(&root).unwrap(),
+    ));
+    let nav = crate::zip_tree::ZipNavState::new(tree);
+    let prefix = nav.current_raw().to_vec();
+    assert_eq!(prefix, vec!["chapter"]);
+    let (items, metas) = nav.materialize_current(crate::settings::SortOrder::FileName);
+    env.current_folder = Some(root.clone());
+    env.items = items;
+    env.image_metas = metas;
+    env.thumbnails = vec![ThumbnailState::Pending; env.items.len()];
+    env.visible_indices = (0..env.items.len()).collect();
+    env.page_identity_index = Arc::new(file_type_resume::PreparedPageIdentityIndex::prepare(
+        &env.items,
+        Some(&root),
+        env.settings.file_type_visibility.clone(),
+    ));
+    env.projection_recipe =
+        book_materialization::ProjectionRecipe::Book(book_materialization::BookScope::Archive {
+            logical_root: root.clone(),
+            prefix: prefix.clone(),
+        });
+    env.zip_nav = Some(nav);
+    env.book_composition = ViewerBookComposition::Automatic;
+    env.spread_mode = SpreadMode::Ltr;
+    let scope = BookScopeKey::archive(&root, &prefix).unwrap();
+    let domain = PageDomain::ArchiveLevel {
+        prefix: scope.level_prefix.clone(),
+    };
+    let data = crate::data_dir::get();
+    assert!(data.starts_with(env.tmp.path()));
+    env.spread_db = Ok(crate::spread_db::SpreadDb::open_at(&data.join("spread.db")).unwrap());
+    env.spread_db
+        .as_ref()
+        .unwrap()
+        .set_presentation_state(
+            &root,
+            SpreadMode::RtlCover,
+            ReadingFlow::Horizontal,
+            Direction::Rtl,
+            (SpreadMode::Single, ReadingFlow::Paged, Direction::Ltr),
+        )
+        .unwrap();
+    let (service, owner) = runtime(&mut env, &data);
+    let composition = BookComposition::new(
+        ReadingDirection::Ltr,
+        (0..2)
+            .map(|pair| CompositionUnit::Pair {
+                first: CompositionPageRef::ArchiveEntry {
+                    entry_name: format!("chapter/{}.jpg", pair * 2),
+                },
+                second: CompositionPageRef::ArchiveEntry {
+                    entry_name: format!("chapter/{}.jpg", pair * 2 + 1),
+                },
+            })
+            .collect(),
+    );
+    service
+        .save(scope.clone(), domain.clone(), composition)
+        .recv_timeout(WAIT)
+        .unwrap()
+        .status
+        .unwrap();
+    env.poll_book_composition_read(&egui::Context::default());
+    service
+        .prepare(scope.clone(), domain.clone())
+        .recv_timeout(WAIT)
+        .unwrap()
+        .status
+        .unwrap();
+    env.poll_book_composition_read(&egui::Context::default());
+    settle_projection(&mut env);
+    assert!(env.composed_book_layout().is_some());
+    env.apply_fullscreen_view_mode(&egui::Context::default(), 0, FullscreenViewMode::Single);
+    env.apply_fullscreen_view_mode(&egui::Context::default(), 0, FullscreenViewMode::Spread);
+    service
+        .remove(scope.clone(), domain.clone())
+        .recv_timeout(WAIT)
+        .unwrap()
+        .status
+        .unwrap();
+    env.poll_book_composition_read(&egui::Context::default());
+    service
+        .prepare(scope.clone(), domain.clone())
+        .recv_timeout(WAIT)
+        .unwrap()
+        .status
+        .unwrap();
+    env.poll_book_composition_read(&egui::Context::default());
+    settle_projection(&mut env);
+    assert!(env.composed_book_layout().is_none());
+    assert_eq!(env.spread_mode, SpreadMode::RtlCover);
+    assert_eq!(env.reading_direction, Direction::Rtl);
+    assert_eq!(env.reading_flow, ReadingFlow::Horizontal);
+
+    let key = crate::spread_db::container_key(&root, &prefix);
+    let db = env.spread_db.as_ref().unwrap();
+    assert_eq!(db.get_direction(&key), None);
+    assert_eq!(db.get_flow(&key), None);
+    let stored = db.get_state_with_fallback(&key, Some(&root));
+    assert_eq!(stored.mode, Some(SpreadMode::RtlCover));
+    assert_eq!(
+        stored.view_mode,
+        Some(crate::spread_db::StoredViewMode::Spread)
+    );
+    env.book_composition = ViewerBookComposition::Automatic;
+    env.spread_mode = SpreadMode::Single;
+    env.reading_direction = Direction::Ltr;
+    let defaults = SpreadRestoreDefaults::for_book(&env.settings);
+    env.apply_spread_for_key_with_fallback(&key, Some(&root), defaults)
+        .unwrap();
+    env.poll_book_composition_read(&egui::Context::default());
+    service
+        .prepare(scope, domain)
+        .recv_timeout(WAIT)
+        .unwrap()
+        .status
+        .unwrap();
+    env.poll_book_composition_read(&egui::Context::default());
+    settle_projection(&mut env);
+    assert_eq!(env.spread_mode, SpreadMode::RtlCover);
+    assert_eq!(env.reading_direction, Direction::Rtl);
+    assert_eq!(env.reading_flow, ReadingFlow::Horizontal);
+    assert_eq!(
+        env.spread_db.as_ref().unwrap().get(&root),
+        Some(SpreadMode::RtlCover)
+    );
+    assert_eq!(
+        env.spread_db
+            .as_ref()
+            .unwrap()
+            .get_state_with_fallback(&key, Some(&root)),
+        stored
+    );
+    owner.shutdown_and_join();
+}
+
+include!("book_composition_revision_tests.rs");

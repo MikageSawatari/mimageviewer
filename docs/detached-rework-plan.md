@@ -4667,3 +4667,10 @@ Composed/Automaticの採用でscope/contextと世代を一括更新し、取消�
 これはG0で記録したcontext所有の実装であり、detached述語/HWND/viewport/placement/focusを変更しない。
 窓専用pending bool、時間窓による回復、兄弟窓の一括resetは追加しない。
 G4のeditor modal/save intentは未実装。独立レビューや実機観測の結果は主張しない。
+
+G3 REVISE追補（2026-10-11）: required Hiddenの初回open拒否も、Missing/空列と同じ
+`terminate_active_detached_open_before_viewport`へ渡す。通知だけでPreparingを残していたproducerの
+終端漏れを補完する変更（BA-7）であり、既存context bindingとsession content phaseだけを所有証明にする。
+loading shellがActiveとなった場合も同経路でClosing→context退去→session/runtime終了へ進む。
+main/兄弟のitems・generation・選択・composition・cancel tokenは不変としてconsumer fixtureで検査する。
+新しいdetached state、keep-alive guard、時間窓、HWND/placement操作は追加しない。
