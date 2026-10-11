@@ -222,7 +222,8 @@ impl ContextMenuItemId {
             MenuCommand::RemoveFromCollection => Self::RemoveFromCollection,
             MenuCommand::Deselect => Self::Deselect,
             MenuCommand::RemoveReadingHistory => Self::RemoveReadingHistory,
-            MenuCommand::ConvertEpubToPdf
+            MenuCommand::EditBookComposition
+            | MenuCommand::ConvertEpubToPdf
             | MenuCommand::ExternalTool(_)
             | MenuCommand::OpenWithAssociation { .. } => return None,
         })
@@ -700,6 +701,8 @@ pub enum MenuNode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuCommand {
+    /// Dynamic current-book operation; it has no application key binding.
+    EditBookComposition,
     ConvertEpubToPdf,
     NewFolder,
     Paste,

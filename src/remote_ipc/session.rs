@@ -1560,6 +1560,25 @@ impl SessionHandle {
         self.origin.elapsed()
     }
 
+    /// Linearize Local editor start/save admission with BeginAcquire. The callback may only
+    /// adopt App-owned operation state and enqueue nonblocking work; it must not reenter the
+    /// session or acquire service/registry/UI locks. Worker execution stays outside this lock.
+    pub(crate) fn with_local_composition_admission<F, R>(
+        &self,
+        admit: F,
+    ) -> Result<R, RemoteControlPhase>
+    where
+        F: FnOnce() -> R,
+    {
+        let state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        if state.lifecycle.phase != RemoteControlPhase::Local {
+            return Err(state.lifecycle.phase);
+        }
+        let admitted = admit();
+        drop(state);
+        Ok(admitted)
+    }
+
     pub(crate) fn acquire(&self, request: SessionAcquireRequest) -> SessionResponse {
         let peer_kind = request.peer.connection_kind;
         let peer_name = request
@@ -2933,6 +2952,79 @@ mod tests {
             connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
             device_name: Some("phone".to_owned()),
         }
+    }
+
+    #[test]
+    fn local_composition_admission_adopts_before_later_acquire_under_the_same_mutex() {
+        let handle = SessionHandle::new();
+        let mut owner = None;
+        let admitted = handle.with_local_composition_admission(|| {
+            assert!(matches!(
+                handle.inner.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            owner = Some(7);
+            "prepared"
+        });
+        assert_eq!(admitted, Ok("prepared"));
+        assert_eq!(owner, Some(7));
+        assert_eq!(
+            handle
+                .acquire(SessionAcquireRequest {
+                    client_id: "client".to_owned(),
+                    peer: peer(),
+                })
+                .status,
+            SessionStatus::Active
+        );
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::AcquiringRemote);
+        // BeginAcquire remains allowed. The UI close coordinator owns terminal editor close.
+        assert_eq!(owner, Some(7));
+    }
+
+    #[test]
+    fn local_composition_admission_rejects_without_callback_after_acquire_or_abort() {
+        let handle = SessionHandle::new();
+        handle.acquire(SessionAcquireRequest {
+            client_id: "client".to_owned(),
+            peer: peer(),
+        });
+        let mut admissions = 0;
+        assert_eq!(
+            handle.with_local_composition_admission(|| admissions += 1),
+            Err(RemoteControlPhase::AcquiringRemote)
+        );
+        assert!(handle.abort_acquire_barrier(handle.snapshot().generation));
+        assert_eq!(
+            handle.with_local_composition_admission(|| admissions += 1),
+            Err(RemoteControlPhase::DrainingRemote)
+        );
+        assert_eq!(admissions, 0);
+    }
+
+    #[test]
+    fn local_composition_admission_registers_save_before_nonblocking_send_and_acquire() {
+        let handle = SessionHandle::new();
+        let (tx, rx) = mpsc::sync_channel(1);
+        let mut tickets = Vec::new();
+        assert_eq!(
+            handle.with_local_composition_admission(|| {
+                tickets.push(11);
+                tx.try_send(11).unwrap();
+            }),
+            Ok(())
+        );
+        handle.acquire(SessionAcquireRequest {
+            client_id: "client".to_owned(),
+            peer: peer(),
+        });
+        assert_eq!(tickets, vec![11]);
+        assert_eq!(rx.try_recv(), Ok(11));
+        assert_eq!(
+            handle.with_local_composition_admission(|| tickets.push(12)),
+            Err(RemoteControlPhase::AcquiringRemote)
+        );
+        assert_eq!(tickets, vec![11]);
     }
 
     #[test]

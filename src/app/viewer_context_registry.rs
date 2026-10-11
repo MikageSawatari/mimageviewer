@@ -1079,6 +1079,7 @@ pub(in crate::app) struct ViewerContextBundle {
     page_alone_preferences: crate::settings::PageAlonePreferences,
     pub(super) spread_shift: super::spread_shift_owner::ViewerSpreadShift,
     pub(super) book_composition: super::book_composition_runtime::ViewerBookComposition,
+    pub(super) composition_editor: super::book_composition_editor::CompositionEditorState,
     pub(super) book_composition_permission:
         super::book_composition_permission::ViewerPresentationPermission,
     reading_flow: crate::settings::ReadingFlow,
@@ -2090,6 +2091,7 @@ impl ViewerContextBundle {
             page_alone_preferences: crate::settings::PageAlonePreferences::default(),
             spread_shift: Default::default(),
             book_composition: Default::default(),
+            composition_editor: Default::default(),
             book_composition_permission: Default::default(),
             reading_flow: crate::settings::ReadingFlow::default(),
             reading_direction: crate::settings::ReadingDirection::default(),
@@ -2216,6 +2218,9 @@ impl App {
         window_id: u64,
         idx: usize,
     ) {
+        if self.composition_editor_modal_active() {
+            return;
+        }
         match self.try_own_fullscreen_epub_at(idx) {
             super::OpenAdmission::Accepted => {}
             super::OpenAdmission::NotApplicable => return,
@@ -2460,6 +2465,7 @@ impl App {
             page_alone_preferences,
             spread_shift,
             book_composition,
+            composition_editor,
             book_composition_permission,
             reading_flow,
             reading_direction,
@@ -2748,6 +2754,7 @@ impl App {
         swap_field!(page_alone_preferences);
         swap_field!(spread_shift);
         swap_field!(book_composition);
+        swap_field!(composition_editor);
         swap_field!(book_composition_permission);
         swap_field!(reading_flow);
         swap_field!(reading_direction);
@@ -3083,6 +3090,7 @@ impl App {
             page_alone_preferences,
             spread_shift,
             book_composition,
+            composition_editor,
             book_composition_permission,
             reading_flow,
             reading_direction,
@@ -3410,6 +3418,9 @@ impl App {
             page_alone_preferences,
             spread_shift,
             book_composition,
+            // A fork keeps the exact editor request with its original context. Its new
+            // sibling starts Closed; the mount-independent operation owner never changes.
+            composition_editor,
             book_composition_permission,
             reading_flow,
             reading_direction,
@@ -3512,6 +3523,7 @@ impl App {
         detached.page_alone_preferences = self.page_alone_preferences;
         detached.spread_shift = self.spread_shift.fork_accepted();
         detached.book_composition = self.book_composition.clone();
+        detached.composition_editor = Default::default();
         detached.book_composition_permission = self.book_composition_permission.clone();
         detached.reading_flow = self.reading_flow;
         detached.reading_direction = self.reading_direction;
@@ -4387,6 +4399,7 @@ impl App {
     ) -> Result<D, RetireError> {
         let reason = _reason;
         let retiring_window = self.viewer_contexts.table.window_for_context(id);
+        self.close_composition_editor_for_context(id);
         self.viewer_contexts.table.begin_retire(id)?;
         if retiring_window == self.active_detached_window_id() {
             self.begin_active_detached_session_close(reason);

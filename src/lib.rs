@@ -117,6 +117,7 @@ pub(crate) mod spread_shift;
 mod startup_window_geometry;
 #[cfg(windows)]
 mod startup_windows_diag;
+pub mod ui_composition_editor;
 mod window_activation;
 /// 非 Windows stub: DWM (Desktop Window Manager) は Windows 専用。HWND を取らず
 /// クロスプラットフォーム経路から呼ばれる helper だけ no-op を提供する
@@ -341,6 +342,8 @@ mod ui_folder_pane;
 pub mod ui_font_catalog;
 pub mod ui_fonts;
 mod ui_fullscreen;
+#[doc(hidden)]
+pub use ui_fullscreen::draw_composition_editor_hud_snapshot_fixture;
 pub mod ui_startup;
 #[doc(hidden)]
 pub use ui_fullscreen::{

@@ -458,6 +458,12 @@ impl App {
     }
 
     pub(crate) fn presentation_candidate(&self, idx: usize) -> Option<CandidatePage> {
+        if matches!(
+            self.book_composition,
+            super::book_composition_runtime::ViewerBookComposition::Ignored { .. }
+        ) {
+            return None;
+        }
         let item = self.items.get(idx)?;
         let logical = match item {
             crate::grid_item::GridItem::ZipImage { zip_path, .. }
@@ -761,6 +767,23 @@ impl App {
         operation_id: u64,
         candidate: CandidatePage,
     ) -> BookIdentityPermission {
+        if let super::book_composition_runtime::ViewerBookComposition::Ignored { scope, .. } =
+            &self.book_composition
+            && composition_page_from_identity(scope, &candidate.identity).is_some_and(|page| {
+                let domain = if scope.level_prefix.is_empty()
+                    && matches!(page, CompositionPageRef::PdfPage { .. })
+                {
+                    PageDomain::Document
+                } else {
+                    PageDomain::ArchiveLevel {
+                        prefix: scope.level_prefix.clone(),
+                    }
+                };
+                domain.validate_page(&page).is_ok()
+            })
+        {
+            return BookIdentityPermission::Allowed;
+        }
         let context_id = self.spread_shift_context_id().serial();
         self.book_composition_permission
             .bind(context_id, self.items_generation);

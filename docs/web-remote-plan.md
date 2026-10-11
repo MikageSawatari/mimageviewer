@@ -85,6 +85,19 @@ snapshot/FIFO読取を使う。Remote専用の`spread_shift.db`接続やPC viewe
 FinishAcquireの前提に含める。viewer close自体はshift保存を発生させない。完了readinessをpollし、
 UI threadのDB待機やjoinを追加しない。Remote返却後は既存一覧reloadと次のBook openで保存値を解く。
 
+§1.242 G4のPC構成editor開始/保存は、`SessionHandle::with_local_composition_admission`で
+既存BeginAcquireと同じ`session.inner` mutexへ入り、Local確認とApp共通owner/ticketの採用を
+短い処理で確定する。session側へeditor状態や第二ownerを追加しない。lock内はowner登録と
+非blocking送信だけとし、service状態lock・DB・context mount・worker完了待ちは置かない。
+後のBeginAcquireはeditor中でも受け付け、AcquiringRemoteの全窓closeはfullscreenの有無や
+一時mount先に依存せずglobal editor ownerを閉じる。Preparing/Editingの未保存draftは破棄し、
+Savingの送信済ticketはApp共通の完了管理へ残す。既存UI pollで保存成功/失敗を収穫した後、
+editor ownerとticketがともに終端であることをFinishAcquireの条件へ加える。
+Remoteの最初のread/writeは既存`wait_until_active`でこの終端まで待つ。30秒watchdogと
+取得abort後の既存drainを保ち、旧replyからeditorを復活させない。詳細は
+[本の構成計画 §8.1 / §10.2](book-composition-plan.md#81-開始の確定境界と終了のowner)。
+この接続はcore内部の受付/完了境界だけを変更し、IPC wireとstrict protocol v70は維持する。
+
 - ダイアログには `tailscale status --json` の `Peer.TailscaleIPs` と接続元 IP の照合結果から
   direct / relay と対向端末名を表示する。CLI 失敗・未照合時は「取得できません」と明示する
 - 接続時刻、経過時間、IPC lifecycle が持つ現在処理、要求/完了/失敗/実行中/待機件数を表示する

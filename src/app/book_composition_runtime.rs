@@ -37,10 +37,14 @@ pub(crate) enum ProjectionAdoptionCause {
 pub(crate) enum ProjectionOrigin {
     #[default]
     Fresh,
+    IgnoreThisOpen {
+        source: BookCompositionSource,
+    },
     Refresh {
         source: BookCompositionSource,
         previous: Option<Arc<AcceptedCompositionProjection>>,
         anchor: Option<crate::book_resume_db::PageIdentity>,
+        previous_order: Arc<[(usize, crate::book_resume_db::PageIdentity)]>,
     },
 }
 
@@ -62,6 +66,11 @@ pub(crate) struct AutomaticBookPreferences {
 pub(crate) enum ViewerBookComposition {
     #[default]
     Automatic,
+    Ignored {
+        scope: BookScopeKey,
+        source: BookCompositionSource,
+        generation: u64,
+    },
     Preparing {
         scope: BookScopeKey,
         receiver: mpsc::Receiver<CompositionPrepareReply>,
@@ -95,6 +104,8 @@ pub(crate) enum ViewerBookComposition {
 impl Clone for ViewerBookComposition {
     fn clone(&self) -> Self {
         match self {
+            // A decision for this open/window is never copied into a sibling.
+            Self::Ignored { .. } => Self::Automatic,
             Self::Automatic | Self::Preparing { .. } | Self::Projecting { .. } => Self::Automatic,
             Self::Accepted {
                 scope,
@@ -128,6 +139,7 @@ impl Clone for ViewerBookComposition {
 impl std::fmt::Debug for ViewerBookComposition {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Ignored { scope, .. } => f.debug_tuple("Ignored").field(scope).finish(),
             Self::Automatic => f.write_str("Automatic"),
             Self::Preparing { scope, .. } => f.debug_tuple("Preparing").field(scope).finish(),
             Self::Projecting { scope, .. } => f.debug_tuple("Projecting").field(scope).finish(),
@@ -158,6 +170,18 @@ impl std::fmt::Debug for ViewerBookComposition {
 impl PartialEq for ViewerBookComposition {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
+            (
+                Self::Ignored {
+                    scope: a,
+                    generation: b,
+                    ..
+                },
+                Self::Ignored {
+                    scope: x,
+                    generation: y,
+                    ..
+                },
+            ) => (a, b) == (x, y),
             (Self::Automatic, Self::Automatic) => true,
             (
                 Self::Accepted {
@@ -383,7 +407,7 @@ impl App {
         self.book_composition_service = Some(service);
     }
 
-    fn composition_scope_domain(&self) -> Option<(BookScopeKey, PageDomain)> {
+    pub(super) fn composition_scope_domain(&self) -> Option<(BookScopeKey, PageDomain)> {
         use super::book_materialization::{BookScope, ProjectionRecipe};
         let ProjectionRecipe::Book(book) = &self.projection_recipe else {
             return None;
@@ -463,6 +487,7 @@ impl App {
             return A::Automatic;
         };
         match &self.book_composition {
+            ViewerBookComposition::Ignored { .. } => A::Automatic,
             ViewerBookComposition::Accepted {
                 scope: accepted,
                 layout,
@@ -524,7 +549,7 @@ impl App {
         }
     }
 
-    fn composition_source(&self) -> BookCompositionSource {
+    pub(super) fn composition_source(&self) -> BookCompositionSource {
         if let Some(nav) = &self.zip_nav {
             return BookCompositionSource::Archive {
                 tree: nav.tree.clone(),
@@ -603,12 +628,31 @@ impl App {
                 source,
                 previous,
                 anchor,
+                previous_order: self
+                    .items
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, item)| {
+                        crate::book_resume_db::PageIdentity::for_item(
+                            item,
+                            self.archive_source_override.as_deref(),
+                        )
+                        .map(|identity| (index, identity))
+                    })
+                    .collect::<Vec<_>>()
+                    .into(),
             };
         }
         ProjectionOrigin::Fresh
     }
 
     pub(super) fn poll_book_composition_service(&mut self, ctx: &egui::Context) {
+        // A save completion owns the sole shared-resume write. Publication can
+        // precede its receipt; do not start any affected reload before harvesting it.
+        if self.composition_editor_writes_pending() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            return;
+        }
         let Some(service) = self.book_composition_service.clone() else {
             return;
         };
@@ -642,6 +686,9 @@ impl App {
     }
 
     pub(super) fn poll_book_composition_read(&mut self, ctx: &egui::Context) {
+        if self.composition_editor_scope_write_pending(self.book_composition.scope()) {
+            return;
+        }
         self.poll_book_composition_projection(ctx);
         self.poll_book_presentation_permission(ctx);
         self.schedule_composition_wake(ctx);
@@ -701,6 +748,10 @@ impl App {
             self.spread_shift.availability = self.pairing_edit_availability();
             return;
         };
+        if matches!(&self.book_composition, ViewerBookComposition::Ignored { scope:ignored, generation,.. } if ignored==&scope && *generation==self.items_generation)
+        {
+            return;
+        }
         let Some(service) = self.book_composition_service.clone() else {
             return;
         };
@@ -731,7 +782,9 @@ impl App {
             if requested != scope || generation != self.items_generation {
                 // A new accepted source owns its own preparation; never apply old rows to it.
                 self.book_composition = ViewerBookComposition::Automatic;
-            } else if requested_token != token {
+            } else if requested_token != token
+                && !matches!(origin, ProjectionOrigin::IgnoreThisOpen { .. })
+            {
                 self.book_composition = ViewerBookComposition::Preparing {
                     scope: scope.clone(),
                     receiver: service.prepare(scope.clone(), domain.clone()),
@@ -897,7 +950,7 @@ impl App {
         self.spread_shift.availability = crate::spread_shift::PairingEditAvailability::Unreadable;
     }
 
-    fn begin_book_projection(
+    pub(super) fn begin_book_projection(
         &mut self,
         scope: BookScopeKey,
         token: CompositionToken,
@@ -906,6 +959,7 @@ impl App {
         ctx: &egui::Context,
     ) {
         let source = match &origin {
+            ProjectionOrigin::IgnoreThisOpen { source } => source.clone(),
             ProjectionOrigin::Refresh { source, .. } => source.clone(),
             ProjectionOrigin::Fresh => self.composition_source(),
         };
@@ -919,6 +973,7 @@ impl App {
             );
         if record.is_none()
             && !restores_automatic
+            && !matches!(origin, ProjectionOrigin::IgnoreThisOpen { .. })
             && !matches!(source, BookCompositionSource::Archive { .. })
         {
             self.book_composition = ViewerBookComposition::Accepted {
@@ -1011,19 +1066,21 @@ impl App {
         // A worker saves pending trim by its stable page keys before filtering rows.
         // If another ordinary edit arrived meanwhile, prepare that newer batch
         // before adopting. A failed write leaves the original rows and dirty edits.
-        let replaces_rows = matches!(
-            &reply.rows.composition,
-            CompositionProjectionOutcome::Composed(_)
-        ) || (matches!(
-            &reply.rows.composition,
-            CompositionProjectionOutcome::Automatic
-        ) && matches!(
-            &origin,
-            ProjectionOrigin::Refresh {
-                previous: Some(_),
-                ..
-            }
-        ));
+        let replaces_rows = matches!(&origin, ProjectionOrigin::IgnoreThisOpen { .. })
+            || matches!(
+                &reply.rows.composition,
+                CompositionProjectionOutcome::Composed(_)
+            )
+            || (matches!(
+                &reply.rows.composition,
+                CompositionProjectionOutcome::Automatic
+            ) && matches!(
+                &origin,
+                ProjectionOrigin::Refresh {
+                    previous: Some(_),
+                    ..
+                }
+            ));
         if replaces_rows
             && (reply.saved_trim != self.pending_composition_trim_batch()
                 || reply.edits.as_ref().is_some_and(|prepared| {
@@ -1081,7 +1138,10 @@ impl App {
                 ..
             }
         ) && matches!(composition, CompositionProjectionOutcome::Automatic);
-        if !removing && matches!(composition, CompositionProjectionOutcome::Automatic) {
+        if !removing
+            && matches!(composition, CompositionProjectionOutcome::Automatic)
+            && !matches!(origin, ProjectionOrigin::IgnoreThisOpen { .. })
+        {
             self.book_composition = ViewerBookComposition::Accepted {
                 scope,
                 token,
@@ -1210,18 +1270,26 @@ impl App {
                 self.items_generation,
             );
         }
-        self.book_composition = ViewerBookComposition::Accepted {
-            scope,
-            token,
-            record,
-            layout: composition,
-            source,
-            generation: self.items_generation,
-            cause: if refresh {
-                ProjectionAdoptionCause::ProjectionRefresh
-            } else {
-                ProjectionAdoptionCause::Normal
-            },
+        self.book_composition = if matches!(origin, ProjectionOrigin::IgnoreThisOpen { .. }) {
+            ViewerBookComposition::Ignored {
+                scope,
+                source,
+                generation: self.items_generation,
+            }
+        } else {
+            ViewerBookComposition::Accepted {
+                scope,
+                token,
+                record,
+                layout: composition,
+                source,
+                generation: self.items_generation,
+                cause: if refresh {
+                    ProjectionAdoptionCause::ProjectionRefresh
+                } else {
+                    ProjectionAdoptionCause::Normal
+                },
+            }
         };
         self.spread_shift.availability = self.pairing_edit_availability();
         if removing {
@@ -1308,7 +1376,8 @@ impl ViewerBookComposition {
     pub(crate) fn scope(&self) -> Option<&BookScopeKey> {
         match self {
             Self::Automatic => None,
-            Self::Preparing { scope, .. }
+            Self::Ignored { scope, .. }
+            | Self::Preparing { scope, .. }
             | Self::Projecting { scope, .. }
             | Self::Accepted { scope, .. }
             | Self::Blocked { scope, .. } => Some(scope),
@@ -1429,28 +1498,22 @@ fn prepare_book_projection(
         }),
     };
     let landing = match origin {
-        ProjectionOrigin::Fresh => first_page(),
+        ProjectionOrigin::Fresh | ProjectionOrigin::IgnoreThisOpen { .. } => first_page(),
         ProjectionOrigin::Refresh {
-            anchor, previous, ..
+            anchor,
+            previous_order,
+            ..
         } => anchor
             .as_ref()
             .and_then(find)
             .or_else(|| {
-                let previous = previous.as_ref()?;
                 let anchor = anchor.as_ref()?;
-                let page = crate::book_composition::composition_page_from_identity(scope, anchor)?;
-                let position = previous
-                    .resolved
-                    .visible_pages
-                    .iter()
-                    .position(|old| old.page.matching_key() == page.matching_key())?;
-                previous
-                    .resolved
-                    .visible_pages
+                let position = previous_order.iter().position(|(_, old)| old == anchor)?;
+                previous_order
                     .iter()
                     .skip(position + 1)
-                    .chain(previous.resolved.visible_pages[..position].iter().rev())
-                    .find_map(|old| find(&old.page.resume_identity(&scope.logical_root)))
+                    .chain(previous_order[..position].iter().rev())
+                    .find_map(|(_, identity)| find(identity))
             })
             .or_else(first_page),
     };
@@ -1458,15 +1521,11 @@ fn prepare_book_projection(
     // context anchor in O(1), so a legitimate navigation during preparation is
     // not undone by the earlier captured anchor.
     let mut refresh_landings = std::collections::HashMap::new();
-    if let ProjectionOrigin::Refresh {
-        previous: Some(previous),
-        ..
-    } = origin
-    {
-        let old = &previous.resolved.visible_pages;
+    if let ProjectionOrigin::Refresh { previous_order, .. } = origin {
+        let old = previous_order;
         let resolved = old
             .iter()
-            .map(|page| find(&page.page.resume_identity(&scope.logical_root)))
+            .map(|(_, identity)| find(identity))
             .collect::<Vec<_>>();
         let mut next = vec![None; old.len()];
         let mut following = None;
@@ -1475,9 +1534,9 @@ fn prepare_book_projection(
             following = resolved[index].or(following);
         }
         let mut preceding = None;
-        for (index, page) in old.iter().enumerate() {
+        for (index, (item_index, _)) in old.iter().enumerate() {
             refresh_landings.insert(
-                page.item_index,
+                *item_index,
                 resolved[index]
                     .or(next[index])
                     .or(preceding)
@@ -1486,7 +1545,8 @@ fn prepare_book_projection(
             preceding = resolved[index].or(preceding);
         }
     }
-    let is_replacement = matches!(&rows.composition, CompositionProjectionOutcome::Composed(_))
+    let is_replacement = matches!(origin, ProjectionOrigin::IgnoreThisOpen { .. })
+        || matches!(&rows.composition, CompositionProjectionOutcome::Composed(_))
         || matches!(
             origin,
             ProjectionOrigin::Refresh {

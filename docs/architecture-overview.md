@@ -8,6 +8,14 @@ source enumeration、policy、raw manifest、cache/lease、既存PreparedPageIde
 G2 part Aの`book_composition`はApp/UI/I/Oを持たないpure model・resolver・unit編集を提供する。
 G2 part Bは単一workerの`book_composition.db`、lifecycle、metadata v11転送とread登録を追加する。
 G3はraw manifestと保存構成からworkerで共通projectionを作り、items・identity index・閲覧unitを同じ採用境界で更新する。
+G4の`app/book_composition_editor`はprocess共通の操作ownerと送信済みsave ticketを持ち、
+draft/phase/viewは一つのViewerContextBundleに所属する。一時mount/兄弟描画ではownerを移さない。
+`book_composition/editor`は純粋draft・undo/redo・変更preview、`ui_composition_editor`はI/Oなしの
+virtualized一覧と固定操作行を担当する。source準備/保存前照合は専用worker、thumbnailはeditor寿命の
+独立worker/channel/cancelへ分け、背景viewerのitems/cache/queueを編集プレビュー用に変更しない。
+main「製本」menuとHUD overflowの入口は同じ開始受付へ通す。後者はキーより前のroot surface受付と
+Eのframe-local wheel ownerを使う。保存完了ownerは各窓のreloadと共有resume intentの一回writeを分ける。
+§1.242はnext-bookで開発中、利用者決定の次々回release向け。G4Fのfolder sidecarとG5は別stage。
 明示targetは番号の採用前にidentityを捕捉し、表示候補だけをcontext所有の非同期permission ownerへ渡す。
 列挙待ちの再開要求はsource完了境界が所有し、完了後の構成待ちだけ提示許可ownerへ移す。
 構成pollは未完成のsource要求を消費せず、採用時にscope/context/旧世代を照合して継続する。

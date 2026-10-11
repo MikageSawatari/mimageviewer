@@ -1851,3 +1851,23 @@ Accepted/Blockedの同token読取は起床を予約しない。新しいpending 
 lease終了時のwriter再読込が実変更scopeだけを公開する。UI側でmaintenance待ちやDB/FS読取を追加しない。
 終了時はcomposition writerをjoinしてから、保持されたcontent-identity recorderを所有するshift ownerを終了し、捕捉済みEdit観測を落とさない。
 まれな失敗はログ＋通知。未知/破損は利用者作成recordを保持して書込停止し、新DBのmigration/recreate/自動retryを作らない。
+
+### G4 editorの非同期owner（next-book、2026-10-11）
+
+`CompositionEditorOperations`の単一ownerはcontext/scope/requestを相関し、
+そのcontextの`CompositionEditorState`だけがPreparing/Editing/Saving/Reloadingを保持する。
+sessionのLocal phase確認とowner/ticketの採用は既存lifecycle mutex内の短い受付で行う。
+prepareのsource列挙、保存前fingerprint照合、writerの応答待ちは専用workerが担い、UI側はchannelを収穫する。
+長い操作をmodalにすることで、別open/history/context切替や複数draftとのsupersessionを作らない。
+
+Remote取得/窓closeが後から来ても、すでに送信したsave ticketの受取ownerはprocess側へ残す。
+その一回の終端を既存Remote close barrierへ含め、draft dropだけで完了を捨てない。
+DB成功後のreloadは保存済みrecordを使用する。reload失敗の再操作は利用者へ案内し、DB成功を巻き戻さない。
+捕捉した編集元のresume intentは保存完了ownerだけが一回記録し、兄弟/退避のreloadはresumeを追加記録しない。
+
+`EditorThumbnails`はeditorのsource/policyを固定した独立worker。一回の可視要求は24件まで、
+request/result channelは有界で、UIからの送信は非blocking。decode/回転DB読取はworkerで行い、
+結果とtextureはeditorにだけ返す。policy除外・Missingはdecodeせず、editor closeでcancel/dropする。
+元ページを表示するために、通常viewerのthumbnail queueをresetしたりhidden許可を書き換えたりしない。
+viewのページ名/状態/unitの投影はdraft変更時に更新し、静止中のUI frameではcacheを読む。
+詳細な受入条件・未実施の確認は[本の構成計画 G4](book-composition-plan.md)に記録する。

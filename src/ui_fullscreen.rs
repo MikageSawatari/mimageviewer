@@ -5371,6 +5371,8 @@ struct FsOverflowPanelView {
     root_rows: Vec<FsOverflowPanelRow>,
     navigator_corner: FullscreenNavigatorCorner,
     shift: SpreadShiftHudView,
+    composition_available: bool,
+    composition_managed: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -5412,6 +5414,16 @@ enum FsOverflowPanelAction {
     JumpShiftAnchor(usize),
     ClearShift,
     SetShiftMemory(bool),
+    EditComposition,
+}
+
+/// One frame's root-menu input boundary. An editor adoption retires the
+/// remaining backing input; this is never stored in a viewer context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FsRootOverflowFrame {
+    Absent,
+    Drawn,
+    EditorAdopted,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5422,7 +5434,7 @@ enum FsOverflowOpenRequest {
 fn fs_overflow_panel_body_row_count(state: FsOverflowPanelState) -> usize {
     match state {
         FsOverflowPanelState::Closed => 0,
-        FsOverflowPanelState::Root => FullscreenOverflowItemId::fixed_order().len(),
+        FsOverflowPanelState::Root => FullscreenOverflowItemId::fixed_order().len() + 1,
         FsOverflowPanelState::NavigatorPosition => 1 + FullscreenNavigatorCorner::ALL.len(),
         FsOverflowPanelState::SpreadAdjustment => 6,
     }
@@ -5647,6 +5659,18 @@ fn draw_fs_overflow_panel_surface(
                 ui.set_width(ui.available_width());
                 match view.state {
                     FsOverflowPanelState::Root => {
+                        let response = draw_fs_overflow_panel_row(
+                            ui,
+                            "fs_overflow_composition_editor",
+                            "本の構成を編集",
+                            if view.composition_managed { "構成あり" } else { "" },
+                            false,
+                            view.composition_available,
+                            (!view.composition_available).then_some("書庫・PDF・EPUB の本で使えます"),
+                        );
+                        #[cfg(test)]
+                        ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("fs_composition_editor_entry_test_rect"), response.rect));
+                        if response.clicked() { action = Some(FsOverflowPanelAction::EditComposition); }
                         for row in &view.root_rows {
                             let response = draw_fs_overflow_panel_row(
                                 ui,
@@ -17070,10 +17094,37 @@ pub fn draw_spread_shift_hud_snapshot_fixture(ui: &mut egui::Ui, unresolved: boo
         root_rows: Vec::new(),
         navigator_corner: FullscreenNavigatorCorner::BottomRight,
         shift,
+        composition_available: false,
+        composition_managed: false,
     };
     if let Some(rect) = fs_overflow_panel_rect(ui.max_rect(), view.state) {
         let _ = draw_fs_overflow_panel_surface(ui, rect, &view);
     }
+}
+
+/// The production overflow surface, with no App or persistence dependencies.
+#[doc(hidden)]
+pub fn draw_composition_editor_hud_snapshot_fixture(
+    ui: &mut egui::Ui,
+    available: bool,
+    managed: bool,
+) -> bool {
+    let view = FsOverflowPanelView {
+        state: FsOverflowPanelState::Root,
+        root_rows: Vec::new(),
+        navigator_corner: FullscreenNavigatorCorner::BottomRight,
+        shift: SpreadShiftHudView::default(),
+        composition_available: available,
+        composition_managed: managed,
+    };
+    let rect = egui::Rect::from_min_size(
+        ui.max_rect().min,
+        egui::vec2(
+            ui.available_width().min(FS_OVERFLOW_PANEL_WIDTH),
+            FS_OVERFLOW_PANEL_HEADER_HEIGHT + FS_OVERFLOW_PANEL_ROW_HEIGHT + 24.0,
+        ),
+    );
+    draw_fs_overflow_panel_surface(ui, rect, &view) == Some(FsOverflowPanelAction::EditComposition)
 }
 
 /// Visual-only fixture for first-run touch-help snapshots.
@@ -24627,12 +24678,35 @@ impl App {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(canvas_color))
                     .show(ctx, |ui| {
+                        if self.composition_editor_modal_active() { ui.disable(); }
                         let full_rect = ui.max_rect();
                         // Determine this frame's front owner before keys can close it and before
                         // any backing raw-input consumer or ScrollArea handles its wheel.
                         let mut hud_popup_wheel = self
                             .fullscreen_front_popup_wheel_target(ctx, full_rect, fs_idx)
                             .map(|target| FsHudPopupWheelInput::take(ctx, target));
+                        // Root-menu actions precede backing keys. A click that opens
+                        // the editor owns even an Escape delivered in that same frame.
+                        // Draw on the existing popup's foreground layer so later image
+                        // paint cannot cover this early presentation.
+                        let root_overflow_frame = if self.fs_overflow_panel_state == FsOverflowPanelState::Root
+                            && !state.is_video && !self.fs_music_view_active(fs_idx)
+                            && !self.is_panorama_mode_active(fs_idx)
+                            && self.fullscreen_top_bar_chrome_allowed(fs_idx)
+                        {
+                            if let Some(wheel) = hud_popup_wheel.as_mut() {
+                                wheel.restore_at(ctx, FsHudPopupWheelTarget::Overflow);
+                            }
+                            self.draw_fs_overflow_panel_foreground(ui, ctx, full_rect, is_spread_double);
+                            if hud_popup_wheel.as_ref().is_some_and(|wheel| wheel.target == FsHudPopupWheelTarget::Overflow) {
+                                consume_fs_hud_popup_wheel(ctx);
+                                if self.fs_overflow_panel_state == FsOverflowPanelState::Closed {
+                                    ctx.input_mut(|input| input.discard_pending_scroll());
+                                }
+                            }
+                            if self.composition_editor_modal_active() { FsRootOverflowFrame::EditorAdopted }
+                            else { FsRootOverflowFrame::Drawn }
+                        } else { FsRootOverflowFrame::Absent };
                         let still_seek_geometry =
                             self.still_seek_geometry_for_idx(full_rect, fs_idx, state.is_video);
                         let resolved_fullscreen_media_rect = self
@@ -24812,7 +24886,11 @@ impl App {
                                 keys
                             ));
                         }
-                        let key_action = self.handle_fs_key_input(ctx, fs_idx, is_spread_double);
+                        let key_action = if root_overflow_frame == FsRootOverflowFrame::EditorAdopted {
+                            FsKeyAction::default()
+                        } else {
+                            self.handle_fs_key_input(ctx, fs_idx, is_spread_double)
+                        };
                         #[cfg(all(windows, feature = "test-script"))]
                         if !embedded {
                             crate::test_script::finish_action_pass(ctx);
@@ -26180,13 +26258,13 @@ impl App {
                         if let Some(wheel) = hud_popup_wheel.as_mut() {
                             wheel.restore_at(ctx, FsHudPopupWheelTarget::Overflow);
                         }
-                        if self.fs_overflow_panel_state.is_open() {
+                        if self.fs_overflow_panel_state.is_open() && root_overflow_frame == FsRootOverflowFrame::Absent {
                             let overflow_available = !state.is_video
                                 && !is_music_view
                                 && !panorama_mode_active_now
                                 && self.fullscreen_top_bar_chrome_allowed(fs_idx);
                             if overflow_available {
-                                self.draw_fs_overflow_panel(ui, ctx, full_rect, is_spread_double);
+                                self.draw_fs_overflow_panel_foreground(ui, ctx, full_rect, is_spread_double);
                             } else {
                                 self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
                             }
@@ -26532,6 +26610,7 @@ impl App {
                     self.show_remote_session_dialog(ctx);
                 }
                 self.show_sidecar_restore_dialog(ctx);
+                self.show_local_composition_editor(ctx);
 
                 // The open owner is the mounted viewer bundle. A detached viewport must draw
                 // and drain its conversion here; the root update only sees the main bundle.
@@ -32827,6 +32906,9 @@ impl App {
             root_rows,
             navigator_corner: self.settings.fullscreen_navigator_corner.normalized(),
             shift: self.spread_shift_hud_view(),
+            composition_available: self.composition_editor_available(),
+            composition_managed: self.pairing_edit_availability()
+                == crate::spread_shift::PairingEditAvailability::Composed,
         }
     }
 
@@ -32980,6 +33062,32 @@ impl App {
         }
     }
 
+    fn draw_fs_overflow_panel_foreground(
+        &mut self,
+        _ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        is_spread_double: bool,
+    ) {
+        let Some(panel_rect) = fs_overflow_panel_rect(full_rect, self.fs_overflow_panel_state)
+        else {
+            return;
+        };
+        // A foreground child Ui changes paint order but does not register an
+        // area in egui's layer hit-test. ScrollArea therefore cannot own wheel
+        // input there. Register exactly the popup rectangle, leaving outside
+        // input with the existing backing owner.
+        egui::Area::new(egui::Id::new("fs_overflow_panel_foreground"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(panel_rect.min)
+            .movable(false)
+            .enabled(!self.composition_editor_modal_active())
+            .show(ctx, |front| {
+                front.set_min_size(panel_rect.size());
+                self.draw_fs_overflow_panel(front, ctx, full_rect, is_spread_double);
+            });
+    }
+
     fn draw_fs_overflow_panel(
         &mut self,
         ui: &mut egui::Ui,
@@ -32998,6 +33106,11 @@ impl App {
             return;
         };
         match action {
+            FsOverflowPanelAction::EditComposition => {
+                self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+                self.spread_popup_open = false;
+                self.start_local_composition_editor(ctx);
+            }
             FsOverflowPanelAction::Close => {
                 self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
             }
@@ -36240,7 +36353,7 @@ impl App {
     /// フォルダ末尾に到達したら `slideshow_end_action` 設定に従って
     /// ループ / 次フォルダ / 停止する。
     pub(crate) fn advance_slideshow(&mut self, ctx: &egui::Context, cur: usize) {
-        if self.has_book_slideshow_continuation() {
+        if self.composition_editor_modal_active() || self.has_book_slideshow_continuation() {
             return;
         }
         let image_indices = self.get_still_image_indices();
@@ -37611,6 +37724,9 @@ impl App {
         fs_idx: usize,
         fs_render_perf: &mut Option<FsRenderPerfRecorder>,
     ) {
+        if self.composition_editor_modal_active() {
+            return;
+        }
         let mut fs_navigation_perf = fs_render_perf
             .as_ref()
             .map(|_| FsNavigationPerfRecorder::default());
@@ -38016,6 +38132,7 @@ impl App {
         // フォルダを変えた場合は close_fullscreen が slideshow_playing=false にする。
         let slideshow_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
         if self.slideshow_playing
+            && !self.composition_editor_modal_active()
             && !close_fs
             && !self.fs_nav_is_locked()
             && !self.top_level_grid_view.collection_navigation_pending()
@@ -38722,7 +38839,8 @@ impl App {
         fs_idx: usize,
         now: std::time::Instant,
     ) -> bool {
-        if !self.continuous_reading_active_for_idx(fs_idx) {
+        if self.composition_editor_modal_active() || !self.continuous_reading_active_for_idx(fs_idx)
+        {
             return false;
         }
         let cached_range = self
@@ -41123,7 +41241,7 @@ impl App {
         new_slice: crate::page_split::PageSlice,
         history_trigger: crate::app::HistoryTrigger,
     ) {
-        if self.items.get(new_idx).is_none() {
+        if self.composition_editor_modal_active() || self.items.get(new_idx).is_none() {
             return;
         }
         match self.try_own_fullscreen_epub_at(new_idx) {
@@ -58635,9 +58753,9 @@ mod tests {
         assert_eq!(submenu.width(), root.width());
         assert_eq!(
             root.height() - submenu.height(),
-            FS_OVERFLOW_PANEL_ROW_HEIGHT
+            FS_OVERFLOW_PANEL_ROW_HEIGHT * 2.0
         );
-        assert_eq!(root.height(), 348.0);
+        assert_eq!(root.height(), 396.0);
         assert_eq!(submenu.height(), 300.0);
         assert_eq!(root.width(), FS_OVERFLOW_PANEL_WIDTH);
 
@@ -58745,6 +58863,8 @@ mod tests {
                             root_rows,
                             navigator_corner: FullscreenNavigatorCorner::BottomRight,
                             shift: Default::default(),
+                            composition_available: true,
+                            composition_managed: false,
                         };
                         let panel_rect = fs_overflow_panel_rect(ui.max_rect(), state).unwrap();
                         let _ = draw_fs_overflow_panel_surface(ui, panel_rect, &view);
@@ -83598,6 +83718,140 @@ mod specified_scale_consumer_tests {
             metadata_scroll_state(&ctx).2.y > before.y,
             "fresh wheel reaches metadata again"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn composition_editor_hud_entry_owns_same_frame_escape_wheel_and_navigator_c9() {
+        use crate::app::book_materialization::{BookScope, ProjectionRecipe};
+        use crate::book_composition::{BookCompositionService, PageDomain};
+        let (ctx, mut app, viewport) = specified_popup_metadata_fixture(egui::vec2(820.0, 600.0));
+        let root = app.tmp.path().join("consumer.pdf");
+        app.current_folder = Some(root.clone());
+        app.pdf_placeholder_count = Some(1);
+        app.projection_recipe = ProjectionRecipe::Book(BookScope::Document(root.clone()));
+        app.book_composition =
+            crate::app::book_composition_runtime::ViewerBookComposition::Automatic;
+        let (service, service_owner) =
+            BookCompositionService::spawn_at(app.tmp.path().join("editor-hud-data"), None).unwrap();
+        let scope = crate::book_scope::BookScopeKey::document(&root).unwrap();
+        assert!(
+            service
+                .prepare(scope, PageDomain::Document)
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap()
+                .status
+                .is_ok()
+        );
+        app.book_composition_service = Some(service);
+        app.settings.fullscreen_navigator_visible = true;
+        app.settings.fullscreen_navigator_corner = FullscreenNavigatorCorner::TopRight;
+        app.settings.fullscreen_navigator_size = 240.0;
+        app.fs_zoom = 2.0;
+        assert!(app.composition_editor_available());
+        let mut frame = 0;
+        let mut draw = |app: &mut App, events| {
+            frame += 1;
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(viewport),
+                    time: Some(frame as f64 / 60.0),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.render_fullscreen_viewport(ctx),
+            )
+        };
+        for _ in 0..5 {
+            let _ = draw(&mut app, vec![]);
+        }
+        let button = ctx
+            .read_response(egui::Id::new("fs_overflow_btn"))
+            .unwrap()
+            .rect;
+        let _ = draw(&mut app, click(button.center()));
+        for _ in 0..5 {
+            let _ = draw(&mut app, vec![]);
+        }
+        let entry: egui::Rect = ctx
+            .data(|data| data.get_temp(egui::Id::new("fs_composition_editor_entry_test_rect")))
+            .unwrap();
+        assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Root);
+        let _ = draw(&mut app, vec![egui::Event::PointerMoved(entry.center())]);
+        let before_metadata = metadata_scroll_state(&ctx).2;
+        let before_zoom = app.fs_zoom;
+        let before_pan = app.fs_pan;
+        let before_size = app.settings.fullscreen_navigator_size;
+        let before_generation = app.items_generation;
+        let mut events = click(entry.center());
+        events.extend(popup_wheel_events(entry.center()));
+        for pressed in [true, false] {
+            events.push(egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: Some(egui::Key::Escape),
+                pressed,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        let _ = draw(&mut app, events);
+        assert!(
+            app.composition_editor_modal_active(),
+            "pointer adoption precedes the old menu's dismissing Escape"
+        );
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(0),
+            "the old Escape cannot close or navigate the backing viewer"
+        );
+        assert_eq!(app.items_generation, before_generation);
+        assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+        assert_eq!(app.fs_zoom, before_zoom);
+        assert_eq!(app.fs_pan, before_pan);
+        assert_eq!(app.settings.fullscreen_navigator_size, before_size);
+        assert_eq!(metadata_scroll_state(&ctx).2, before_metadata);
+        assert_popup_wheel_consumed(&ctx);
+        // No worker polling is needed: the phase owner, including Preparing,
+        // must shield the background and retire the old popup smoothing tail.
+        for _ in 0..30 {
+            let _ = draw(&mut app, vec![]);
+        }
+        assert!(app.composition_editor_modal_active());
+        assert_eq!(metadata_scroll_state(&ctx).2, before_metadata);
+        assert_eq!(app.fs_pan, before_pan);
+        assert_eq!(app.settings.fullscreen_navigator_size, before_size);
+        let point = metadata_scroll_state(&ctx).0.center();
+        let _ = draw(&mut app, popup_wheel_events(point));
+        for _ in 0..30 {
+            let _ = draw(&mut app, vec![]);
+        }
+        assert_eq!(
+            metadata_scroll_state(&ctx).2,
+            before_metadata,
+            "Preparing owns new background wheel too"
+        );
+        assert_eq!(app.fs_pan, before_pan);
+        assert_eq!(app.settings.fullscreen_navigator_size, before_size);
+        app.close_local_composition_editor(crate::app::CompositionEditorCloseReason::Cancel);
+        for _ in 0..5 {
+            let _ = draw(&mut app, vec![]);
+        }
+        assert_eq!(
+            metadata_scroll_state(&ctx).2,
+            before_metadata,
+            "modal end does not replay the old popup's input"
+        );
+        let point = metadata_scroll_state(&ctx).0.center();
+        let _ = draw(&mut app, vec![egui::Event::PointerMoved(point)]);
+        let _ = draw(&mut app, popup_wheel_events(point));
+        for _ in 0..30 {
+            let _ = draw(&mut app, vec![]);
+        }
+        assert!(
+            metadata_scroll_state(&ctx).2.y > before_metadata.y,
+            "fresh input reaches the background after modal end"
+        );
+        service_owner.shutdown_and_join();
     }
 
     #[cfg(windows)]

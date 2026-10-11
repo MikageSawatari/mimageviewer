@@ -1613,6 +1613,58 @@ G4のeditor/save modal/resume intent、G4Fのfolder sidecar、G5の構成editor/
   背景metadata/nav/固定navigatorは不変。旧popupのwheel平滑化残りを次frameのmodalへ流さず、
   modal終了後の新入力は従来のownerへ戻る。IME確定/取消はhelperで、表示mode/fitの維持を確認。
 
+#### G4実装の接点・UI判断（2026-10-11、next-book）
+
+保存後の各窓の着地は、ComposedだけでなくAutomaticからの初回適用でも旧実ページ順を
+Refresh要求に保持し、同じ次→前→新先頭のresolverへ渡す。完了順による共有位置の変更はしない。
+共有resumeは既存writerのdrive-stripped keyと同値dedupを使い、seedが元manifestにない時はKeep。
+「今回は構成を使わず開く」は選択contextで元列をworker準備し、ページ編集も同じ採用で戻す。
+通常Automaticの早期採用とは分け、Ignoredの選択を保存データや兄弟窓へ公開しない。
+
+実装は `app/book_composition_editor` のprocess共通owner/ticket受付と、
+context bundleが保持する `CompositionEditorState` に分ける。Preparing→Editing→Saving→Reloadingを
+単一phaseとして扱い、兄弟の一時mountはownerを変更しない。大きなprepare入力・draft/sessionは
+context所有のBoxに置き、ClosedのAppやbundleへその全サイズを埋め込まない。
+開始/保存は既存session lifecycle mutexの
+短いLocal admissionで採用し、workerの列挙・fingerprint・構成writer待ちをそのlock内へ置かない。
+送信済み保存ticketはeditor/window closeで破棄せず、共通完了ownerが一回回収してRemote取得barrierへ渡す。
+各窓のreload着地と、編集元の捕捉したresume intentの一回受付は別の責任として扱う。
+
+`book_composition/editor` のdraftは明示unitを保ち、操作previewを経て方向/表紙/Pair/Single/空き側を
+変更する。既存Pairを壊す操作、方向・表紙で組を作り直す操作は変更される組を確認してから適用する。
+「編集中の条件で組を作り直す」はdraftのページ順/方向/表紙で隣接Pairを作り直す。
+全体既定を書き換えず、横長判定・末尾・単独・ずらしなどの自動規則を再適用しない。
+確認中は別編集を止める簡素化を採用し、複数previewの同時進行・自動merge・割込み復帰を作らない。
+元のmanifestが変わった場合はdraftを保持して保存を拒否し、明示的な読み直しだけで新draftを用意する。
+
+`ui_composition_editor` はview/actionのみを受けるI/Oなしの共通描画。
+幅に余裕があれば元ページとunitを二列、狭い画面では同じ二一覧をタブで表示する。
+元ページ・unit・変更される組の確認一覧はvirtualized、可視thumbnail要求は一frame最大24ページ。
+thumbnail worker/texture/channel/cancelはeditorの寿命だけが所有し、背景viewerのqueueやcacheを流用しない。
+policy除外は名前と理由だけを表示してdecodeせず、Missingは参照を保持して表示する。
+Windowはdefault_posを使って移動/resize可能とし、本文だけをscrollして保存/キャンセル/解除を下端へ残す。
+通常文字・補足・errorは共通themeの色を使い、白紙は独立した画像/選択/drag対象にしない。
+Enter/EscapeはAppのIME helperで得た値だけを渡し、raw key eventから保存/取消を決めない。
+共通ownerがある間は背面のmenu・toolbar・検索等を無効にし、foregroundのmodal layerへ入力を限定する。
+兄弟の一時mountでも同じownerを参照し、そこで別のeditorを生成しない。
+slideshow・連結の自動reanchor・一覧watcherの反映も既存処理の入口で保留し、
+再生設定やzoom/pan/flowは保持する。modal終了後は通常の入力・更新経路へ戻す。
+
+入口は本HUDの既存overflow、本一覧右クリック、main「製本」menu。
+右クリックは `context_menu_nodes` の一つの定義をnative/egui fallbackへ渡し、別メニュー定義を作らない。
+main/一覧背景の入口は選択行やページ数を資格にしないため空/全非表示本でも残る。
+HUD root surfaceは同じpopup layerでキーより前に描画/受付し、editorを採用したframeの旧Escapeは背景へ渡さない。
+前面popupは描画順だけを変えるchild Uiではなく、実際のpopup範囲だけのAreaとしてhit-testへ登録する。
+内側のwheelはそのScrollAreaへ、外側のwheelは従来の背面ownerへ配送する。
+Eのframe開始時wheel ownerを保持し、旧overflowのwheelと平滑化残りを終端してからeditorを描く。
+editorへ入らない通常overflowのキー終了・既存操作は維持する。追加アプリshortcutは設けない。
+
+純粋UI/snapshot定義は `tests/book_composition_editor_snapshots.rs`、実HUDの同frame入力と
+通常overflowの回帰は `ui_fullscreen`、C7の実保存/取消/失敗・ownerの試験はApp editor側が所有する。
+PNG生成・目視、最終共有gate・確認build・独立レビューの実行証拠は検証ownerが別途記録する。
+この実装記述をテスト成功や実機確認の証拠とは扱わない。出荷は利用者決定どおり**次々回release**、
+今回のmasterには統合しない。画像folder/sidecarはG4F、Remote/出力の残る契約はG5を維持する。
+
 ### G4F: 画像だけの本フォルダ (独立・切り離し可能)
 
 所有: folder資格/adoption、RelativePath PageRef migration、sidecar全snapshot/構成family/消費receipt、folder用editor入口。

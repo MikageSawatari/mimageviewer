@@ -61,12 +61,15 @@ enum RemoteAcquireBarrierDecision {
 fn remote_acquire_barrier_decision(
     close_state: crate::app::LocalViewerCloseState,
     ai_quiesced: bool,
+    composition_editor_quiesced: bool,
     elapsed: std::time::Duration,
 ) -> RemoteAcquireBarrierDecision {
     use crate::app::LocalViewerCloseState;
     match close_state {
         LocalViewerCloseState::Failed(_) => RemoteAcquireBarrierDecision::AbortCloseFailure,
-        LocalViewerCloseState::Closed if ai_quiesced => RemoteAcquireBarrierDecision::Finish,
+        LocalViewerCloseState::Closed if ai_quiesced && composition_editor_quiesced => {
+            RemoteAcquireBarrierDecision::Finish
+        }
         _ if elapsed >= REMOTE_ACQUIRE_BARRIER_ABORT_AFTER => {
             RemoteAcquireBarrierDecision::AbortTimeout
         }
@@ -1141,6 +1144,11 @@ impl crate::app::App {
         if remote_phase == super::session::RemoteControlPhase::AcquiringRemote
             && let (Some(handle), Some(snapshot)) = (handle.as_ref(), snapshot.as_ref())
         {
+            // The editor belongs to its global operation owner, independently of whichever
+            // context is mounted and whether any fullscreen/detached viewer surface exists.
+            self.close_local_composition_editor(
+                crate::app::CompositionEditorCloseReason::RemoteAcquire,
+            );
             self.remote_session_ui.pending_fullscreen_restore = None;
             self.remote_session_ui.paused_animation_restore_key = None;
             self.invalidate_local_viewer_open_intents_for_remote();
@@ -1181,9 +1189,13 @@ impl crate::app::App {
                     let watermarks = writer.watermarks();
                     watermarks.admitted == watermarks.completed_through
                 });
+            // Sent saves outlive terminal editor close. The existing composition completion
+            // poll must harvest success/failure before the global ticket owner reports ready.
+            let composition_editor_ready = self.composition_editor_acquire_ready();
             match remote_acquire_barrier_decision(
                 close_state,
                 barrier.is_quiesced() && book_io_ready,
+                composition_editor_ready,
                 elapsed,
             ) {
                 RemoteAcquireBarrierDecision::Finish => {
@@ -1198,7 +1210,7 @@ impl crate::app::App {
                 }
                 RemoteAcquireBarrierDecision::AbortTimeout => {
                     crate::logger::log(format!(
-                        "remote_ipc: acquire_barrier_timeout generation={} elapsed_ms={} blockers={} close_state={close_state:?}",
+                        "remote_ipc: acquire_barrier_timeout generation={} elapsed_ms={} blockers={} close_state={close_state:?} composition_editor_ready={composition_editor_ready}",
                         snapshot.generation,
                         elapsed.as_millis(),
                         barrier.blocker_summary()
@@ -1212,7 +1224,7 @@ impl crate::app::App {
                         .should_log(snapshot.generation, elapsed) =>
                 {
                     crate::logger::log(format!(
-                        "remote_ipc: acquire_barrier_wait generation={} elapsed_ms={} blockers={} close_state={close_state:?}",
+                        "remote_ipc: acquire_barrier_wait generation={} elapsed_ms={} blockers={} close_state={close_state:?} composition_editor_ready={composition_editor_ready}",
                         snapshot.generation,
                         elapsed.as_millis(),
                         barrier.blocker_summary()
@@ -5880,20 +5892,21 @@ mod tests {
 
         let before = REMOTE_ACQUIRE_BARRIER_ABORT_AFTER - std::time::Duration::from_millis(1);
         assert_eq!(
-            remote_acquire_barrier_decision(LocalViewerCloseState::Closed, true, before),
+            remote_acquire_barrier_decision(LocalViewerCloseState::Closed, true, true, before),
             Finish
         );
         assert_eq!(
-            remote_acquire_barrier_decision(LocalViewerCloseState::Closed, false, before),
+            remote_acquire_barrier_decision(LocalViewerCloseState::Closed, false, true, before),
             Wait
         );
         assert_eq!(
-            remote_acquire_barrier_decision(LocalViewerCloseState::InProgress, true, before),
+            remote_acquire_barrier_decision(LocalViewerCloseState::InProgress, true, true, before),
             Wait
         );
         assert_eq!(
             remote_acquire_barrier_decision(
                 LocalViewerCloseState::Failed(LocalViewerCloseFailure::PassiveContextRetire),
+                true,
                 true,
                 before,
             ),
@@ -5903,6 +5916,7 @@ mod tests {
             remote_acquire_barrier_decision(
                 LocalViewerCloseState::InProgress,
                 true,
+                true,
                 REMOTE_ACQUIRE_BARRIER_ABORT_AFTER,
             ),
             AbortTimeout
@@ -5910,6 +5924,33 @@ mod tests {
         assert_eq!(
             remote_acquire_barrier_decision(
                 LocalViewerCloseState::Closed,
+                false,
+                true,
+                REMOTE_ACQUIRE_BARRIER_ABORT_AFTER,
+            ),
+            AbortTimeout
+        );
+    }
+
+    #[test]
+    fn acquire_decision_waits_for_composition_editor_and_harvested_save_terminal() {
+        use crate::app::LocalViewerCloseState;
+        use RemoteAcquireBarrierDecision::{AbortTimeout, Finish, Wait};
+
+        let before = REMOTE_ACQUIRE_BARRIER_ABORT_AFTER - std::time::Duration::from_millis(1);
+        // Closed viewer surfaces and idle AI do not imply a terminal editor/save operation.
+        assert_eq!(
+            remote_acquire_barrier_decision(LocalViewerCloseState::Closed, true, false, before),
+            Wait
+        );
+        assert_eq!(
+            remote_acquire_barrier_decision(LocalViewerCloseState::Closed, true, true, before),
+            Finish
+        );
+        assert_eq!(
+            remote_acquire_barrier_decision(
+                LocalViewerCloseState::Closed,
+                true,
                 false,
                 REMOTE_ACQUIRE_BARRIER_ABORT_AFTER,
             ),

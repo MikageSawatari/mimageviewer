@@ -870,6 +870,16 @@ fn admit_projection(app: &mut App, service: &BookCompositionService, scope: &Boo
                 .fullscreen_idx
                 .and_then(|index| app.items.get(index))
                 .and_then(|item| crate::book_resume_db::PageIdentity::for_item(item, None)),
+            previous_order: app
+                .items
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item)| {
+                    crate::book_resume_db::PageIdentity::for_item(item, None)
+                        .map(|identity| (index, identity))
+                })
+                .collect::<Vec<_>>()
+                .into(),
         },
         _ => ProjectionOrigin::Fresh,
     };

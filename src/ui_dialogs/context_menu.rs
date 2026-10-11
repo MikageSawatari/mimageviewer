@@ -1450,7 +1450,30 @@ impl crate::app::App {
             },
             layout: self.settings.context_menu_layout.clone(),
         };
-        crate::context_menu_model::build_context_menu(&input)
+        let mut nodes = crate::context_menu_model::build_context_menu(&input);
+        // Native and fallback menus share this current-book operation. Checked
+        // rows and page count do not determine whether an empty book can edit.
+        if target.surface == ContextMenuSurface::Grid
+            && (target.is_folder_context
+                || matches!(
+                    &target.item,
+                    GridItem::ZipImage { .. } | GridItem::PdfPage { .. }
+                ))
+        {
+            let enabled = self.composition_editor_available();
+            nodes.insert(0, MenuNode::Separator);
+            nodes.insert(
+                0,
+                MenuNode::Item {
+                    command: MenuCommand::EditBookComposition,
+                    label: "本の構成を編集".to_owned(),
+                    enabled,
+                    disabled_reason: (!enabled)
+                        .then(|| "現在開いている書庫・PDF・EPUB の本で使えます".to_owned()),
+                },
+            );
+        }
+        nodes
     }
 
     fn context_menu_associated_apps(&mut self, item: &GridItem) -> Vec<AssociatedAppMenuEntry> {
@@ -1581,6 +1604,7 @@ impl crate::app::App {
                 && matches!(
                     &command,
                     MenuCommand::NewFolder
+                        | MenuCommand::EditBookComposition
                         | MenuCommand::Paste
                         | MenuCommand::OpenFolderInExplorer
                         | MenuCommand::OpenExternalToolSettings
@@ -1589,6 +1613,12 @@ impl crate::app::App {
             return None;
         }
         match command {
+            MenuCommand::EditBookComposition => {
+                if target.surface == ContextMenuSurface::Grid {
+                    self.start_local_composition_editor(ctx);
+                }
+                None
+            }
             MenuCommand::ConvertEpubToPdf => {
                 self.start_batch_convert_to_pdf_at(target.item_index);
                 None
@@ -3270,6 +3300,42 @@ mod delete_confirm_tests {
                 ContextMenuSurface::Grid,
             )
             .contains(&MenuCommand::ConvertEpubToPdf)
+        );
+    }
+
+    #[test]
+    fn composition_editor_context_entry_survives_empty_current_book_and_explains_unavailable() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items.clear();
+        app.current_folder = Some(PathBuf::from("C:/books/empty.pdf"));
+        let mut background = target(
+            &app,
+            GridItem::Folder(app.current_folder.clone().unwrap()),
+            ContextMenuSurface::Grid,
+        );
+        background.is_folder_context = true;
+        background.item_index = None;
+        let nodes = app.context_menu_nodes(&background, false);
+        assert!(matches!(
+            nodes.first(),
+            Some(MenuNode::Item {
+                command: MenuCommand::EditBookComposition,
+                enabled: false,
+                disabled_reason: Some(_),
+                ..
+            })
+        ));
+        background.surface = ContextMenuSurface::Fullscreen;
+        assert!(
+            !app.context_menu_nodes(&background, false)
+                .iter()
+                .any(|node| matches!(
+                    node,
+                    MenuNode::Item {
+                        command: MenuCommand::EditBookComposition,
+                        ..
+                    }
+                ))
         );
     }
 

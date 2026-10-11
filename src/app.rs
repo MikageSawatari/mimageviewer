@@ -566,9 +566,13 @@ use presentation_transition::{
 };
 #[cfg(all(windows, test))]
 use presentation_transition::{PreparingProgress, PresentationTransitionState};
+pub(crate) mod book_composition_editor;
+mod book_composition_editor_prepare;
+mod book_composition_editor_thumbnails;
 pub(crate) mod book_composition_permission;
 mod book_composition_remap;
 pub(crate) mod book_composition_runtime;
+pub(crate) use book_composition_editor::CompositionEditorCloseReason;
 pub(crate) mod normalize;
 pub(crate) mod page_edit_snapshot;
 mod prefetch_policy;
@@ -15312,6 +15316,7 @@ pub struct App {
     pub(crate) spread_shift_settings_generation: u64,
     pub(crate) spread_shift_service: Option<crate::spread_shift::SpreadShiftService>,
     pub(crate) book_composition_service: Option<crate::book_composition::BookCompositionService>,
+    pub(crate) composition_editor_operations: book_composition_editor::CompositionEditorOperations,
     spread_shift_process_owner:
         Option<Arc<std::sync::Mutex<Option<crate::spread_shift::SpreadShiftProcessOwner>>>>,
     pub(crate) content_identity_index_load_pending:
@@ -16570,6 +16575,7 @@ pub struct App {
     /// 描画用 index は identity/nav 投影から取得し、durable rows は共有 service が所有する。
     pub(crate) spread_shift: ViewerSpreadShift,
     pub(crate) book_composition: book_composition_runtime::ViewerBookComposition,
+    pub(crate) composition_editor: book_composition_editor::CompositionEditorState,
     pub(crate) book_composition_permission:
         book_composition_permission::ViewerPresentationPermission,
     /// 現在の連結方式（ページ単位 / 縦連結 / 横連結）。
@@ -18492,6 +18498,7 @@ pub struct App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        self.close_local_composition_editor(CompositionEditorCloseReason::Shutdown);
         self.transfer_spread_shift_exit_ownership();
         self.diagnostics_export.retire();
         self.retire_pending_startup_result();
@@ -19560,6 +19567,7 @@ impl App {
             spread_shift_settings_generation: 0,
             spread_shift_service: None,
             book_composition_service: None,
+            composition_editor_operations: Default::default(),
             spread_shift_process_owner: None,
             content_identity_index_load_pending,
             content_identity_index: crate::content_identity::ContentIdentityIndex::default(),
@@ -20034,6 +20042,7 @@ impl App {
             page_alone_preferences: crate::settings::PageAlonePreferences::default(),
             spread_shift: Default::default(),
             book_composition: Default::default(),
+            composition_editor: Default::default(),
             book_composition_permission: Default::default(),
             reading_flow: crate::settings::ReadingFlow::default(),
             reading_direction: crate::settings::ReadingDirection::default(),
@@ -22045,6 +22054,7 @@ impl App {
             };
         }
         first![
+            self.composition_editor_modal_active() => "book_composition_editor",
             self.capture_selection_open() => "clipboard_capture_selection",
             self.sidecar_restore_active() => "sidecar_restore",
             self.remote_session_blocks_local_control() => "remote_session",
@@ -38205,7 +38215,8 @@ impl App {
     }
 
     pub(crate) fn document_open_modal_admission_blocked(&self) -> bool {
-        self.capture_selection_open()
+        self.composition_editor_modal_active()
+            || self.capture_selection_open()
             || self.epub_convert_pending_in_any_context()
             || self.pdf_password_request_pending_in_any_context()
             || self.smart_pdf_password_dialog_path().is_some()
@@ -45724,6 +45735,9 @@ impl App {
 
     /// Called only at mIV-owned filesystem mutation producers, before a worker or viewer release.
     pub(crate) fn admit_rename_migration_source_change(&mut self, ctx: &egui::Context) -> bool {
+        if self.composition_editor_modal_active() {
+            return false;
+        }
         if self.ensure_rename_migration_journal_loaded() {
             return true;
         }
@@ -46743,6 +46757,11 @@ impl App {
     ///
     /// 完了時のフォルダ再読み込みは `poll_file_drop_pending` が `pending_reload` を立てて行う。
     pub(crate) fn handle_external_file_drop(&mut self, paths: Vec<PathBuf>) {
+        if self.composition_editor_modal_active() {
+            crate::logger::log("composition editor: rejected external file drop");
+            self.show_feedback_toast("本の構成を編集中のため、ファイルを操作できません".into());
+            return;
+        }
         let paths: Vec<_> = paths
             .iter()
             .map(|path| crate::path_key::normalize_input_path(path))
@@ -54186,6 +54205,9 @@ impl App {
         forward: bool,
         mode: FolderNavMode,
     ) {
+        if self.composition_editor_modal_active() {
+            return;
+        }
         // Repeated Ctrl traversal extends the staged request's virtual step count. No second
         // DFS may start from the still-visible previous folder before the first child lands.
         if self.accumulate_staged_smart_folder_dfs_step(forward, &mode) {
@@ -57434,6 +57456,9 @@ impl App {
             PathBuf,
         ),
     ) {
+        if self.composition_editor_modal_active() {
+            return;
+        }
         let on_search_results = self.items_are_global_search_view
             || self.favsearch.on_results_grid()
             || self.items_are_tag_view
@@ -57478,6 +57503,9 @@ impl App {
     /// 現在のフルスクリーンページを「最後に読んだページ」として永続記録する。
     /// 画像本のページのみ対象。dedup 付きで連続ページ送り中の重複書き込みを抑える。
     pub(crate) fn record_book_resume(&mut self, idx: usize) {
+        if self.composition_editor_modal_active() {
+            return;
+        }
         if matches!(
             self.book_composition,
             book_composition_runtime::ViewerBookComposition::Accepted {
@@ -59035,6 +59063,7 @@ impl App {
         &mut self,
         ctx: &egui::Context,
     ) -> Result<bool, LocalViewerCloseFailure> {
+        self.close_local_composition_editor(CompositionEditorCloseReason::OwnerClosed);
         let had_detached = self.active_detached_context_is_at_rest()
             || !self.other_viewer_context_ids().is_empty()
             || self.active_detached_session.is_some()
@@ -74612,6 +74641,9 @@ impl App {
     /// 通常のナビ (load → 内部で close_fullscreen) を発行する。BS は階層を 1 段だけ戻す
     /// (= 常に L2) ので本関数を通さず `close_fullscreen` を直接呼ぶ (ui_fullscreen 側)。
     pub(crate) fn handle_fullscreen_close_request(&mut self) {
+        if self.composition_editor_modal_active() {
+            return;
+        }
         self.finish_fullscreen_navigation_for_true_close();
         // Detached bookmark viewers never navigate their own bundle to the bookmark surface: the
         // origin grid is still mounted in main. Embedded viewers instead use the normal Bookmarks
@@ -74872,7 +74904,8 @@ impl App {
         if let Some(failure) = failure {
             return LocalViewerCloseState::Failed(failure);
         }
-        if self.viewer_context_ids().len() > 1
+        if !self.composition_editor_acquire_ready()
+            || self.viewer_context_ids().len() > 1
             || self.fullscreen_idx.is_some()
             || self
                 .fs_cache
@@ -74901,7 +74934,8 @@ impl App {
         if let Some(failure) = failure {
             return LocalViewerCloseState::Failed(failure);
         }
-        if self.fullscreen_idx.is_some()
+        if !self.composition_editor_acquire_ready()
+            || self.fullscreen_idx.is_some()
             || self
                 .fs_cache
                 .values()
@@ -92481,7 +92515,8 @@ impl App {
         self.poll_rating_write_results();
         self.poll_video_upscale_queue(ctx);
 
-        let main_viewer_blocked = self.viewer_session_blocks_main_window();
+        let main_viewer_blocked =
+            self.viewer_session_blocks_main_window() || self.composition_editor_modal_active();
 
         // ── ダイアログ群 ─────────────────────────────────────────────
         self.show_favorites_editor_dialog(ctx);
@@ -93952,6 +93987,7 @@ impl eframe::App for App {
         // process-exit root close until that exact worker reaches terminal; ordinary tray-hide
         // remains under the established close policy.
         self.defer_settings_family_root_close(ctx);
+        self.defer_composition_editor_root_close(ctx);
         #[cfg(not(windows))]
         {
             // Non-Windows builds have one mounted viewer context and therefore no
@@ -93967,7 +94003,11 @@ impl eframe::App for App {
         // display-independent async boundary. Run after the presentation pass
         // so a newly adopted book also starts its read in an early-return frame.
         // Dedicated viewers additionally admit reads through their mounted owner.
+        self.poll_composition_editor_operations(ctx);
         self.poll_book_composition_service(ctx);
+        if self.fullscreen_idx.is_none() || self.fullscreen_embedded_still_active() {
+            self.show_local_composition_editor(ctx);
+        }
         #[cfg(windows)]
         self.sync_clipboard_capture(ctx);
         self.show_capture_selection_dialog(ctx);
@@ -94058,6 +94098,7 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.close_local_composition_editor(CompositionEditorCloseReason::Shutdown);
         self.diagnostics_export.retire();
         self.retire_pending_startup_result();
         self.epub_convert = None;

@@ -2435,6 +2435,9 @@ impl App {
     }
 
     pub(crate) fn open_preferences_request(&mut self, request: PreferencesOpenRequest) {
+        if self.composition_editor_modal_active() {
+            return;
+        }
         if self.preferences_transfer_busy() || self.collection_reorder_open() {
             return;
         }

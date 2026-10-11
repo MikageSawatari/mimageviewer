@@ -7192,6 +7192,7 @@ impl App {
         let help_about_menu_label = self.keymap.menu_command_label(MenuCommandId::HelpAbout);
 
         egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
+            if self.composition_editor_modal_active() { ui.disable(); }
             egui::MenuBar::new().ui(ui, |ui| {
                 let mut top_menu_responses = Vec::with_capacity(9);
 
@@ -7478,6 +7479,17 @@ impl App {
                             let response = ui.menu_button(TopMenuId::Books.label(), |ui| {
                                 let active_name = self.active_book_name();
                                 ui.label(format!("追加先の本: {active_name}"));
+                                // Current reader scope, independent of selection and page
+                                // count: an empty/all-hidden book still has this entrance.
+                                let can_edit_composition = self.composition_editor_available();
+                                if ui.add_enabled(can_edit_composition, egui::Button::new("本の構成を編集"))
+                                    .on_disabled_hover_text("現在開いている書庫・PDF・EPUB の本で使えます")
+                                    .clicked()
+                                {
+                                    self.start_local_composition_editor(ctx);
+                                    ui.close();
+                                }
+                                ui.separator();
                                 let has_selection = self.grid_item_input_allowed()
                                     && (self.selected.is_some() || !self.checked.is_empty());
                                 for &command in books_menu_commands {
@@ -10023,6 +10035,7 @@ impl App {
             Vec::new();
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+            if self.composition_editor_modal_active() { ui.disable(); }
             if toolbar_section_order.first() != Some(&crate::settings::ToolbarSectionId::Folder) {
                 ui.add_space(2.0);
             }
@@ -12338,6 +12351,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let mut sort_reload_requested = false;
         let mut sort_popup_open = false;
         egui::TopBottomPanel::top("facet_filter_bar").show(ctx, |ui| {
+            if self.composition_editor_modal_active() { ui.disable(); }
             ui.add_space(1.0);
             ui.horizontal_wrapped(|ui| {
                 let filter_label = egui::Label::new(egui::RichText::new("絞り込み:").small())
@@ -15295,6 +15309,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             .keymap
             .first_chord_action_label("現在地フィルタ", KeyAction::GlobalLocalSearch);
         egui::TopBottomPanel::top("search_bar").show(ctx, |ui| {
+            if self.composition_editor_modal_active() {
+                ui.disable();
+            }
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.label("検索:").on_hover_text(format!(
@@ -15477,6 +15494,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let mut query_changed = false;
 
         egui::TopBottomPanel::top("favsearch_bar").show(ctx, |ui| {
+            if self.composition_editor_modal_active() {
+                ui.disable();
+            }
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.label("コンテナ検索:");
@@ -15640,6 +15660,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let mut clicked_tag: Option<String> = None;
 
         egui::TopBottomPanel::top("tag_view_bar").show(ctx, |ui| {
+            if self.composition_editor_modal_active() {
+                ui.disable();
+            }
             ui.add_space(2.0);
             ui.horizontal_wrapped(|ui| {
                 ui.label("タグビュー:");

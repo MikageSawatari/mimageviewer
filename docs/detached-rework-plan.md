@@ -4680,3 +4680,19 @@ contextと共に保持する`BookCompositionSource::Document`に元EPUBのReadTa
 解除投影workerがその世代の方向を使う。別viewerの新世代公開へ読み直さず、既存bundle/snapshotの
 clone・swap・dropによるsource所有を維持する。PDF列挙は投影workerで行いUIで待機しない。
 新しいdetached state/述語/viewport/keep-alive機構は追加せず、元世代の保持をconsumer fixtureで検査する。
+
+### §11 追補: §1.242 G4 modal editorのcontext所有（2026-10-11、実装記録）
+
+採択済みbook plan §8.1/§10.1/§10.2に従い、構成editorのdraft/phaseを既存ViewerContextBundleの
+`composition_editor`へ登録する。new/default/destructure/swap/mountは一つのcontext所有stateを運び、
+App共通のtyped operation ownerだけがrequest/contextの所在を保持する。兄弟描画の
+`with_window_viewer_context`と既存async serviceの一時mountは許可し、global ownerを変更しない。
+forkは元contextのeditorを保持し、新しい兄弟はClosedから始める。draft/requestの複製や移植はしない。
+実際のindependent viewer開始はglobal modal ownerで受付を止め、owner contextのretireは
+`close_composition_editor_for_context`で同じterminal closeを呼んでからregistryを退去する。
+Remoteはeditor中でも後の取得を受け付け、mainのみ/fullscreenなしを含めglobal ownerを閉じる。
+送信済save ticketはApp共通完了管理へ残し、既存AcquiringRemote barrierが終端を待つ。
+
+これはBA-7のcontext状態所有と操作受付境界を採択済み構造へ揃えるG4の実装であり、
+detached専用bool/Option、geometry/placement/HWND/viewport生成、時間窓や回復guardは追加しない。
+独立レビュー・自動gate・利用者実機観測の完了は本記録では主張しない。

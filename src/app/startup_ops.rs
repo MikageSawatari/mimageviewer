@@ -105,6 +105,16 @@ impl App {
             self.reject_activation_open_paths_for_remote(ctx);
             return;
         }
+        if self.composition_editor_modal_active() {
+            let rejected = self.activation_open_path_rx.try_iter().count();
+            if rejected != 0 {
+                crate::logger::log(format!(
+                    "composition editor: rejected {rejected} activation request(s)"
+                ));
+                self.show_feedback_toast("本の構成を編集中のため、別の本を開けません".into());
+            }
+            return;
+        }
         // Keep the channel queued while a document dialog owns local admission. Draining it
         // after terminal naturally applies the existing last-activation-wins rule.
         if self.document_open_modal_admission_blocked() {
@@ -207,6 +217,11 @@ impl App {
                     "リモート閲覧中のため、二重起動で渡されたパスを開けません".to_string(),
                 );
             }
+            return;
+        }
+        if self.composition_editor_modal_active() {
+            crate::logger::log("composition editor: rejected path open");
+            self.show_feedback_toast("本の構成を編集中のため、別の本を開けません".into());
             return;
         }
         if self.document_open_modal_admission_blocked() {
