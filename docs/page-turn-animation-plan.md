@@ -1,6 +1,6 @@
 # ページめくりアニメーション設計案 — backlog §1.341
 
-2026-10-11 / **R5設計案（§16、未実装・再レビュー/採択待ち）**。R3はACCEPT後に統合され、A0と追補もコミット済みだが、利用者の実機評価で動きは不合格となった。R4（§15、`afc474d8d`）の独立設計レビューはREVISE。R5では背を軸に一枚のleafを返す方針を維持し、取消targetのflat提示を次navigationより先に保証し、異幅Pair・中央単頁の逆送り・分割読みの境界を具体化する。既定OFF・仮時間・final-only・F12所有・VRAM会計は維持する。§1〜15は履歴を含み、衝突箇所は§16の置換表を優先する。R5の独立レビュー・実装/実機/性能受入れは未了。利用者の2026-10-11決定で、リリースは次の次の版へ延期済み。
+2026-10-11 / **R6設計案（§17、未実装・再レビュー/採択待ち）**。R3はACCEPT後に統合され、A0と追補もコミット済みだが、利用者の実機評価で動きは不合格となった。R4（§15、`afc474d8d`）・R5（§16、`c73f0d857`）の独立設計レビューはREVISE。R5のcanonical flatによる提示保証と台帳訂正は再レビューで解消と伝達された。R6ではclose解決→continuation commit→ページ情報捕捉の共通境界、異高さunder-pageの連続露出、別sourceのHalf/Fullを一頁窓として返す最小split対応を定義する。既定OFF・仮時間・final-only・F12所有・VRAM会計は維持する。§1〜16は履歴を含み、衝突箇所は§17の置換表を優先する。R6の独立レビュー・実装/実機/性能受入れは未了。利用者の2026-10-11決定で、リリースは次の次の版へ延期済み。
 
 R3設計時の参照treeは `next-prefs` / `1ee3e178288f2eff119da16b672d546cc3c9992c`（R2文書commit、開始時clean）。当時の製品コードはmaster `cb00930011323cacd7088ae70c37835141aad58a` と同じだった。
 既存の `file:line` は各設計/追補時のsource inspection位置。A0は§1.364統合後の`0f6ad9f19`を基点に具体化した（§12）。A0は`532635fdd`、golden補完は`e0f323d24`、HUDは`bf3b2fae0`、PDF追補は`ea5f6624a`、保存判断の来歴訂正は`e3a328ff6`でコミットされた。§15はこのHEADと利用者提示の実機結果を基点とする。既存の自動検証成功は動きの品質合格を意味しない。
@@ -675,6 +675,7 @@ frontの透明部分は従来のunderlay/checker/alphaをそのまま使い、fr
 ### 15.3 leafのgeometry・perspective・陰影
 
 **R5注記: Pairでも通常の背は移動する。静止面とgutterの契約・admissionは§16.3で置換する。**
+**R6注記: 新under-pageの旧footprint外は§17.3の連続clipで露出させ、最初から全rectを描かない。**
 
 素材と通常geometryは分離する。各面は自身のoccurrence、prepared resource、rotation/trim UV、canonical paint/layout rectをimmutableに持つ。
 新Sと旧Tの平面は各々の通常rectのまま。leafのfront endpointは旧S、back endpointは新Tの実rectへ正確に一致させる。
@@ -939,6 +940,8 @@ batch leaseとVRAM dedup/旧素材予算は維持する。Remoteに新state/leas
 
 ### 16.2 P1 — flatを一frame採用してから次navigationを解放する
 
+**R6注記: canonical flat採用の完了条件は維持。pre-drawでのcontinuation実行は撤回し、§17.2のclose解決後・ページ情報捕捉前の共通境界へ移す。**
+
 #### 確認した違反と完了条件
 
 現`page_turn_pre_draw`は前回receiptをflushした後にinput factで演出を取消し、rootは描画前に
@@ -1001,6 +1004,8 @@ target1の新S/T双方のnormal receipt、operation IDの不変、一度だけ�
 target1 flatなしでtarget2が提出される反例を失敗にする。自然終了にもflat完了frameを必須とする。
 
 ### 16.3 P2 — 異幅Pairの背と静止面
+
+**R6注記: rect/UVを動かさないslot契約は維持。新Sの外周露出には§17.3の追加clipを適用する。**
 
 #### 一つの背、排他的なslot、静止した画素
 
@@ -1081,6 +1086,8 @@ Pair P0→中央横長L→Pair P1のfixtureは、前進P0→L instant / L→P1 d
 
 ### 16.5 P2 — landscape splitは通常表示stepとして数える
 
+**R6注記: 以下のhalf全除外と100%省略案は棄却。別sourceのHalf→Half/Half↔Fullは§17.4のSingleWindow、同一sourceの左右移動だけinstantとする。**
+
 `PageSlice::{Full,Left,Right}` / `PresentationStep { source_idx, slice }`は既存`page_split.rs`の正本。
 同一source内の半頁移動は`StepMove::WithinPage`でnavigation sequenceを通らず、別sourceの`FsPageNav::Split`も
 現コードではnormal landing後にsliceを変更するがpage-turn offerへ入らない。
@@ -1127,6 +1134,8 @@ R5の一leaf/通常prepared素材だけで対応済みとしない。
 
 ### 16.6 perfと回帰・成立性gate
 
+**R6注記: continuationの実行位置・異高さ・split fixture/率は§17.2〜17.5で置換・追加する。**
+
 §15.7の実scan/16:9 letterbox、単頁/Pair、LTR/RTL、DPI/非zero origin、UV/trim/alpha/ROI、
 黒背景・四方向A/B/C/D、soft shadow/gradient、canonical endpoint、F12/batch/VRAM回帰は維持する。
 次を追加・置換する。
@@ -1156,6 +1165,8 @@ real scan portrait Pair、single、cover/forced/中央横長、landscape-split/m
 実機/OS presentと「本をめくる見え方」、最終durationは利用者による今後の評価。設計文書やheadless fixtureだけで受入れ済みとしない。
 
 ### 16.7 状態削減・不採用案・更新見積り
+
+**R6注記: 別sourceのhalfを一頁窓として回す案を採用。旧「halfを偽の紙とする」一括拒否とhalf対応見積り外の記述は§17.4/§17.6で置換する。**
 
 最も単純に保証を守る規則として、部分curlからnavigationを解放する案を撤回し、unit完了を一種類のcanonical flatへ集約した。
 「各頁が見えたbit集合によって早期解放する」「90度到達まで入力lock」「turn完走待ち」「取消をresumeする」案は採らない。
@@ -1193,3 +1204,270 @@ HUDにON/OFFを追加する利用者要求と区別し、detached-rework-plan §
 R5-bはdetached §2のcontext所有境界を触るため、実装前に設計担当と独立reviewerの構造確認が必要。
 その実装時に§11へCompleting/receipt/handoffの実変更を記録し、本revisionで未実施の合意/実装確認を追記しない。
 R5のfallback範囲、特にsplit漫画の100%省略、品質2%仮上限とON割込みの一flat frame費用をレビューへ明示して再提出する。
+
+## 17. R6 — frame入口・外周露出・split一頁窓（2026-10-11）
+
+**状態: 設計改訂のみ、未実装・独立再レビュー待ち。** 対象は`next-viewer` / R5 `c73f0d857`。
+設計担当から伝達された再レビューはREVISE。前回P1のcanonical flat完了条件、幅入替えの反例、中央単頁の逆送り省略、
+split分類/分母、P3の台帳と判断者訂正は確認済みとの指摘を記録する。R6自体の独立確認を実施したとは扱わない。
+
+### 17.1 現行契約と置換範囲
+
+| 残るP2 | R6の契約 | 置換する記述 |
+| --- | --- | --- |
+| continuationで捕捉済みidx/stateが古くなる、closeに先行する | §17.2: owning viewportの終了入力解決→採用flat通知/continuation commit→描画・通常入力用snapshot捕捉 | §16.2のpre-draw内dispatch。flat frame Nより後に実行する条件は維持 |
+| 高い新Sの上下が開始直後に全量現れる | §17.3: 旧footprint外を同じclockからの連続拡張clipで露出 | §15.3/§16.3の新Sを最初から全rectで静止描画する規則 |
+| 半頁の全省略に技術的必然性がない | §17.4: 同source左右はinstant、別sourceはHalf/FullのSingleDeparture/SingleArrival | §16.5のhalf全除外・開始0%・将来別chunk扱い、§16.6の対応候補ゼロのsplit fixture |
+
+§16.2の**取消targetを一canonical flat採用frame提示してから次navigation**という保証、Completingの単一context所有、
+一件だけのcontinuation、stable operation/destination identity、破棄pass非採用は維持する。
+default OFF、仮100〜600ms/既定200ms（最終時間は利用者評価後）、PC/F12/Remote除外、slideshow deadline、
+final-only、通常prepare各一回・同pass排他的flat/leaf、通常mount/deposit非取消、fork初期化、batch lease/VRAM dedup、
+追加decode/upload/resample禁止は変更しない。黒帯の根因とA/B/C/D四方向対応も§15.1/15.2のまま。
+
+### 17.2 frame共通境界 — closeを先に解決してからcommit/captureする
+
+#### コードで確認した境界違反
+
+root `handle_fullscreen_root_key_input`は入口で`fs_idx`を捕捉し、その後に`page_turn_pre_draw`を呼び、
+さらにその古いidxで`handle_fs_key_input`/`handle_fs_navigation`を実行する（`ui_fullscreen.rs:28969`以降）。
+`render_fullscreen_viewport`は冒頭のidxからcomposition/load decisionを作り、`prepare_fullscreen_state`を呼んでから、
+`render_fs_body`の中でpre-drawに到達する（同:23302/23453/23783）。
+本のBは`handle_fs_key_input`内で`add_current_book_bookmark(fs_idx)`へ直結する（同:30728/31411）。
+そのためR5の位置へcommitを追加すると、現idx・描画material・HUD・Bの書込先が別targetになる。
+viewport closeは同:24005、Esc/FsCloseは同:30313/31325、HUD ×は`draw_fs_hover_bar`内の同:43624以降で解決しており、
+pre-drawからcommitするとこれらのterminal優先にも先行する。
+
+#### 一つのframe入口と順序
+
+共通境界を仮称`begin_viewer_frame`とし、**当該contextをmountしたowning viewportのinputが読める位置**へ置く。
+page-turn helper単独のpre-drawはnavigationを実行しない。receiptの採用証拠をledgerへpublishする既存output hookもdispatchしない。
+以下のA〜Dは**continuationを消費し得るCompleting frame**の順序である。
+それ以外は入口で通常経路へ戻り、従来のshortcut/closeの処理順を保つ。OFFへ切り替えた直後のON由来Completingだけは完了処理を残す。
+OFFのB+Esc等の既存副作用順までこのfeatureで一括変更しない。
+必要な構造変更は`render_fullscreen_viewport`のpage依存precomputeをviewport body内の入口後へ移すこと。
+show/reuseするviewport identity/placement、embedded判定、IME/input owner、現在のモードに対する終了権限は入口前に解決できるが、
+その段階のold idxを描画/通常shortcutの正本として保持しない。
+
+| phase | ownerと処理 | その時点で禁止すること |
+| --- | --- | --- |
+| A. 終了入力 | 同じviewport/contextの既存input owner/IME/modal/popups/submode規則でEsc/FsClose/BS、native `close_requested`、HUD ×を解決。結果はframe-localな`ExitViewer` / `OwnedElsewhere` / `Continue`。closeは既存close/親一覧復帰経路へ一回渡し、continuationを退役 | pageを替える、page-bound B/rotation等を先に実行する、既存ownerを無視してEscを奪う |
+| B. 継続commit | Continueの場合だけ前frame以前のmatching canonical flat receiptを採用通知し、旧sequenceを完了。Completingの一件を一度取り出し、元operation IDで既存navigation handlerへ渡す。frame Nでflat採用ならcommitはN+1以降、instant・一操作予算を消費 | 同frame replayで再commit、close解決前の次load/history/sequence、fresh keyより先にcloseまで消費する |
+| C. 捕捉 | commit後のcurrent source idx、PresentationStep/slice、composition/unit token、spread pair/occurrence、page-dependent load decisionを捕捉し、通常prepareを一回行って`FsFrameState`、HUD page_infos/selection、描画materialを作る | A以前に作った`fs_idx`/pair/stateを再使用、古いstateへ一部fieldだけpatchする |
+| D. 通常入力/描画 | root/viewportの残りのpage-bound shortcutはCのsnapshotを使う。Bはこの新sourceに一回追加。描画/receiptも同じsnapshotから作る。追加navigationはR5の既存一操作予算/dropに従う | Bと画面番号が違う、snapshot作成後にcontinuationだけ割り込む、rootとviewportで同じキーを二回処理する |
+
+Aの終了判定用に必要なcurrent item kind/モード/ownershipの参照は短命のguard入力とする。
+それをCの描画snapshotの代わりに使わず、commitによって媒体/idxが変わればCは正本から全部作る。
+ExitViewerではcontinuationをcommitせず、既存close処理へ戻ってpage prepare/drawを行わない。
+Escで比較overlay・click panel・編集・popupだけを閉じる場合は既存の局所処理であり、viewer closeへ格上げしない。
+OwnedElsewhereのframeではcontinuationを実行せず、同じCompletingの一件を保持する。ownerが通常readerへ戻った有効frameで同じ入口を通す。
+modalの背面dispatch/自動resume worker/新操作queue/周期repaintを作らない。close/別本/retire時は一件を破棄する。
+
+#### rootとF12の接続、HUD ×の実interaction
+
+- embeddedはroot wrapperの既存委譲を維持し、そのmain ctxのviewport body入口でA〜Dを一回実行する。
+- 専用fullscreenへ配送されるroot入力は、継続可能なCompletingがあるframeでは**page-bound handlerをまだ呼ばず**、
+  そのframeのroot入力をowning viewportのframe入口へ渡す。root wrapperは従来どおりgrid shortcutを抑止する。
+  frame-localなinput参照/解決済みactionは同じframe内だけ使い、Bへold idxを付けず、raw keyを次frameへ再配送しない。
+  owning viewportのAがroot由来の終了入力とviewport自身の終了入力を集めてからBを行い、Dで許可されたroot handlerの残りを新snapshotで処理する。
+  したがってrootでB、viewportで×が同frameでも×が先で、次targetのload/ブックマークを作らない。
+- F12はmountされたreaderのviewport入口で同じA〜Dを実行する。現在root→detachedを拒否するroutingは変えず、
+  main/root入力を兄弟F12へ渡さない。root/viewport/gamepadのcontinuationはその配送先contextのCompletingだけから消費する。
+
+このframe-local ingressはCompletingと別のnavigation待機ownerではなく、通常入力を**処理する場所を同frameの入口へ合わせる**ための引数。
+rootの全shortcutに新しい永続queueを作らない。continuationがない/OFFの入力admission・順序・仕事量は既存どおりで、
+描画precomputeの一回を移すだけとする。処理を二回呼んで古い副作用を取り消す案は不採用。
+具体的には`app.rs:91666`のroot handler結果をframe-localなtyped result（handledと必要なroot input参照/配送binding）として受け、
+`update_frame`のstackから同frameの`render_fullscreen_viewport`へ渡す。handledは既存の
+`reconcile_fullscreen_after_main_focus`/grid抑止に渡す同じ意味を保ち、委譲を「未処理root」と誤って扱わない。
+frame終了時に使われなかったingressは捨て、Appに永続pending root fieldを足さない。
+F12の`with_window_viewer_context`描画にも入口を置き、ingressの配送bindingに一致しないmountへ渡さない。
+このcall-chain変更とroot handlerの既存回帰はR6-bの所有範囲に含める。
+
+HUD ×は前frame rectへの生pointer hit-testで代用しない。
+既存hover/lock/suppressionとtop-barのgeometry/IDを共用し、**現在frameの実widget interactionをAで一回解決**する。
+page_infosを要しないclose controlのinteractionをpage依存表示から分離し、後のHUD描画はその同じResponseを使用する。
+×を二度instantiate/consumeせず、絵は従来のHUD前面layerへ描く。hover途中のclick/releaseやreplayもeguiの一つのwidgetが所有する。
+panorama時の×は従来の360解除でありviewer closeに変えない。embedded mainのnative ×はapp終了要求のままで、fullscreen解除へ変換しない。
+close resolverも既存owner/Enter suppress/IME/Esc局所処理を抽出・共有し、独自のraw Esc判定や第二のKeyActionを追加しない。
+
+採用frame/入口のcommit済みidentityは既存context ledgerに置き、同frameのroot委譲・viewport再passで二重commitしない。
+viewport callback外から捕捉済み`FsFrameState`を渡す旧順序を残してidxだけ再読込する修正は禁止。
+draw/input snapshotのsource/step/token一致をhandler-levelで検査し、batch/native receiptはその同じsnapshotへ結び付ける。
+viewport body後の`handle_fs_navigation_with_render_perf`（現`ui_fullscreen.rs:26111`）やhint/statusのfooterも対象にする。
+callbackからframe-localな結果（終了、またはCのsnapshotと入力結果）を返し、footerはそのsnapshotのsource/stepを使用する。
+closure内だけfresh idxへ変えて外側tailに旧`fs_idx`を残す接続は禁止。終了結果では通常navigation footerを再実行しない。
+replayで更新された最終passのsnapshotを使い、旧passの入力結果を二重commitしない。
+遅い入力で取消target flatを次frameへ送るR5の規則は維持するが、継続frameでもAが常に先になる。
+
+#### 実handler回帰
+
+rootの実wrapperとF12の実viewport bodyを通し、accepted flat(N)とcontinuationを準備してN+1に以下を入力する。
+pure state helperだけのテストを本gateの代用にしない。headless/fake inputで可能な範囲を検査し、native OS入力は将来の承認済み実機枠へ残す。
+描画一致の基本fixtureはtarget1/target2双方resident finalとし、stale snapshotをholdoverと誤認させない。
+target2未readyの別fixtureでは通常holdoverを維持し、request snapshot/Bの書込先とholdover provenanceを別に検査する。
+Bをholdover元のidxへ戻す補正や、continuationのためのready待ちは足さない。
+
+| 継続frameの入力 | 必須結果 |
+| --- | --- |
+| Bのみ、または継続とBが同frame | target1完了後target2を一回commit。描画source、HUD番号、FsFrameState、selection、Bのsource keyがtarget2で一致。target1へBなし |
+| Esc / FsClose / BSによる終了 | close/一覧復帰が先。continuation/target2 load/offer/history/Bなし、二重closeなし |
+| native viewport × / fullscreen HUD × | 同じくclose先。現在frame widget Responseを使うHUD hit-testも実行し、root Bとviewport ×の同frame組合せも閉じるだけ |
+| popup/IME/編集がEscを所有 | 現ownerの局所処理のみ。readerを閉じず、背面continuation/Bを実行しない。owner解除後の有効frameで入口から再検証 |
+| replay / root+viewport / gamepad edge | 同frame二重commit/二重prepare/Bなし。元operation ID、採用flat frame、commit frame、fresh snapshot identityを相関。F12 A操作がB readerのidx/state/receiptを変えない |
+
+### 17.3 異高さunder-page — 新外周を連続clipで開く
+
+新Sを通常rectのまま最初から全描画すると、旧leafが小さい場合、その外周の新内容が回転より先に現れる。
+slot lossがゼロでもこのjumpは起きる。R6ではrect/UV/寸法を動かさず、**旧S footprint外への露出apertureだけ**を連続拡張する。
+BookLeafの新S underとSingleDepartureのincoming underに同じ規則を適用する。
+SingleArrivalは既存outgoingがunderで、新incomingは回転するleaf自体なので、この「新under外周」のgateは不要。
+同じclockからの旧下地外周の終端退役（§15.3）は維持する。
+
+旧Sのcanonical surface boundsをO、新under自身のcanonical boundsをNとする。通常destination clip前の同一座標系で定義し、
+実描画ではdestination clip/slot/準備済みUV域と交差する。accept時刻からの同じ`p=clamp(elapsed/D)`だけを用い、
+`r(p)=smoothstep(clamp(p/0.5))`で最初の半durationに拡張を完了する。別clock/待機phase/settle boolを作らない。
+
+- `K.min = O.min + r * (min(O.min,N.min) - O.min)`（各軸）。
+- `K.max = O.max + r * (max(O.max,N.max) - O.max)`（各軸）。
+- underの実surfaceは`N ∩ K(p) ∩ destination clip ∩ S slot`。leafに遮蔽された領域をvisibilityから差し引く。
+  underlayとimageの双方、shadowのreceiverもこの同じsurfaceを使う。切り抜きによるUVを自身のcanonical transformから求め、再fitしない。
+
+p=0ではK=Oなので、Nのうち旧leafのfootprint外にある部分は全く現れない。
+p→0+では増える外周帯の面積もゼロへ収束し、拡張辺の速度もsmoothstepでゼロから始まる。
+p≥0.5ではKがNを包含するため、その後/終端のnew underは通常rect全体になり、finishで残りを突然出さない。
+newが小さい場合はNの全rectが初めからO内にあり、通常のleaf silhouetteによる露出を使う。
+slot spine移動によるclip/support lossは§16.3で別検査し、この拡張clipで品質lossを隠してadmissionしない。
+surfaceの透明画素は通常underlay/alphaを使用し、leafのsurface遮蔽domainとmaterialの透明性を混同して裏の頁を提示済みにしない。
+
+このclipは新Sの全頁alpha fadeではなく、**新旧footprintの差だけを徐々に提示する幾何**。
+旧S/新Sをscale/translateして高さを合わせず、余剰領域を別imageに焼いたりtextureを追加したりしない。
+first-visibleの面積はgate/slot/leaf遮蔽後の実polygonから計算し、まだ閉じた外周は数えない。
+初回poseのincoming露出判定（§15.5）はこのclipを含めて行い、旧footprint内でも意味ある露出がない場合は`initial_target_visibility`で同pass flat。
+面積が後で増えるのを待ってから開始する規則にはしない。
+
+§15.5の初期lift候補30/45/60度は維持するが、**p=0の新外周は初期lift角に関係なくゼロ**。
+θを30度から始めることを口実に外周gateも30度相当まで飛ばさない。初回で見えるincomingは旧footprint内の露出だけ。
+analyticなθ=0/p=0 endpointに加え、実際の初期lift/p=0と次clock poseの外周連続性も検査する。
+cancelによるinstant canonical flatは利用者の割込み規則であり、連続motionの自然終了とは区別する。
+
+必須fixtureは幅/背が同じ、中心Y=500で旧高さ600（y=200…800）、新高さ900（y=50…950）。
+p=0は外周0、p=0.25ではr=0.5でK.y=125…875、p=0.5以後K.y=50…950となる。
+θ=0とθ→0+（εとε/2、対応するp→0+）のmask/面積/pixel差がゼロへ収束することを検査し、
+「0度だけflat、次poseで上下計300pxが全量出る」実装を負例にする。
+fake clockのp=0/微小値/0.1/0.25/0.5/1、実初期lift→次pose、逆の高さ900→600、上下offset、横幅差、
+black/white/checker、透明image、DPI/viewport origin、single/spread/LTR/RTLを含む連続pose fixtureにする。
+featherを入れるなら既存上限内のごく狭いedgeに限定し、continuityのproofをalphaの見た目だけで代用しない。
+
+### 17.4 split最小対応 — 表示halfをSingleWindowとして扱う
+
+**再レビューの最小案を採用する。具体的な技術blockerは確認できていない。**
+未知の半面が不要なSingleWindow/neutral reverseを既に設計している以上、完全な紙の素材不足を理由に
+別sourceのhalfまで全除外したR5の推論は不適切だった。表示halfを一頁窓のmaterial domainとして回すことと、
+同sourceの左右を別の物理leafに捏造することを区別する。
+
+| 通常step遷移 | forward / backward | identity・通常動作 |
+| --- | --- | --- |
+| 同source Left↔Right | instant `split_same_source_step` | 同じ紙のview移動。既存WithinPageを実行し、新navigation sequence/load/historyを作らない |
+| 別source Half→Half | SingleDeparture / SingleArrival | 各half自身の通常rect/UVを一頁窓として使用。departureは旧half front、arrivalは新half front、未知reverseはneutral paper |
+| 別source Half→Full / Full→Half | 同じSingleDeparture / SingleArrival | half側は通常half、Full側は通常全頁。それぞれのrectが独立、under外周は§17.3。元source単位の履歴/保存を維持 |
+| 別source Full→Full（split mode） | 同じSingleDeparture / SingleArrival | R5の対応を維持、splitと別のmotion/stateを作らない |
+| 同source Full↔Half | 設定/寸法adoptionならcancel/通常表示 | 普通の固定step列では隣接しない。通常stepとして来る別経路も同sourceのview変更としてinstant。理由は構成変更なら`split_configuration_changed`、通常stepなら`split_same_source_step` |
+
+spineはSplitLtr/SplitRtlの既存`reading_direction()`と受理された前後方向からSingleWindowの規則を使う。
+source原画像の中央を物理spineと推測せず、**表示窓の内側edge**を支点にする。
+neutral paperは未知reverse専用で、black/checker underlayを裏面へ使わない。印字のUVを鏡映せず、残りhalfを参照しない。
+これは本の片側を見るSingleWindow表現の適用であり、原画像に本の二頁が印刷されているかを推測する処理ではない。
+
+#### 受理・素材・receiptの接続
+
+既存`FsPageNav::Split`のsource変更経路は、sequence受理成功→normal landing→target slice確定の後に共通offerへ接続する。
+WithinPageはofferしない。sequence拒否/着地失敗時はsliceを変えず、offerもしない既存契約を維持する。
+通常Final source readinessは受理時点の同じkey/generationで検査し、着地後に素材が来たから遅延開始する経路を作らない。
+準備済みsource/outputがhalf/Fullの全poseに必要なROIを満たすかは通常unit prepare後に検査する。
+partial ROIが覆えなければ既存`leaf_roi_not_covered`で同pass flat。演出目的でfull-page decode/upload/ROI拡張を要求しない。
+
+direction/adjacencyは受理済みPresentationStep列とStepMoveから捕捉する。
+現`adjacent_page_turn_direction`はTarget/Deltaしか認めないため、Splitをそのhelperへ渡してnullをskipする接続は不可。
+受理済みSplit factも同じoffer入口で消費し、slideshow等の既存source送りはその実際のtarget slice/方向を捕捉する。
+本項のためにtimerが同source halfの新navigationを生成するようには変えない。
+
+prepared unit signatureには既にsliceがある一方、現`SubmittedUnitReceipt`と`same_submitted_pages`は
+occurrence/source/native texture中心で、sliceを照合しない（`ui_fullscreen/page_turn.rs:205/477`）。
+R6では既存unit/ledger内の**PresentationStep identity（source occurrence/role + PageSlice + canonical UV/geometry signature）**を
+offer、immutable recipe、canonical/curl receipt、matching/dedup、Completing、observer/per-page計測へ一貫して渡す。
+Left/Rightは同source/native IDでも同じ提示証拠ではない。異なるstepのreceiptをcopyしてflat採用/完了済みにしない。
+navigation source idxの永続identityと一時表示sliceを分離し、sliceをDB/履歴/しおり/タグの新保存keyにしない。
+
+old sliceとnew sliceが異なるのはrecipe入力として許す。現prepared unitのcross-unit `outgoing.slice == incoming.slice`による
+除外は撤回し、**演出開始後の同じtarget slice変更**の検査は維持する。
+PageSliceのUVを通常transformから一回消費し、rotation/trimとの順序を通常描画に揃える。
+`uv_rect()`をtextureとtransformへ二重適用して四分の一へcropする実装は不可。
+native texture/leaseは共有でき、same-source Left/Rightの観測identityが異なることをVRAM二重計上へ変換しない。
+
+新inputがhalfのturn中に来た場合も、次source/次sliceを変更する前に§16.2/17.2のflat-firstを通す。
+ターゲットhalfを一flat frame提示してから同sourceの反対halfへinstantで進むので、未提示halfを飛ばさない。
+単発が続けば別sourceの操作は毎回候補となる。held/burst/renditionやreadinessで省略する条件は従来どおりで、候補率と開始率を混同しない。
+
+#### 計数と追加費用
+
+静止画N source、L split landscapeならM=N+L step、全通常操作はM−1=N+L−1。
+same-source instantはL、別sourceの**構造上の候補はN−1**で、候補率は`(N−1)/(N+L−1)`。
+すべてlandscape（N>1）では`(N−1)/(2N−1)`、大きい本で約50%（N=3なら2/5=40%、N=100なら99/199≈49.75%）。
+残るN回の左右view移動を紙めくりにしない理由は同一紙だからであり、素材不足ではない。
+Portrait→Landscape→Portraitは3操作中、別sourceの2操作が候補、同sourcehalf移動1操作がinstant。
+すべてportraitなら25/25等の別source操作が候補。対象PDFのmetadata26 portraitの参考値は25/25だが、実app final-ready/ROI/開始率の証明ではない。
+directionを反転してもこの列計数は同じ。slideshowのsource単位送りは実際に受理した操作だけを別分母で数える。
+
+実開始数は候補数からfinal-only未ready・burst/held・ROI/visibility/予算等のskipを引いた値であり、
+全landscapeで約50%「開始する」とは未測定のまま言わない。全通常step分母と候補内分母、skip sub_checkの全報告はR5から維持する。
+R5の100%省略/開始0%の仕様制限は撤回し、実landscape/mixed comicのwarm率は実装後の必須測定・未取得と記録する。
+
+費用は一頁窓projectionの再利用、Split offer/direction接続、sliceを含むreceipt/observer照合、ROI/回帰が中心。
+R5見積りへの追加は**1〜2作業日**、製品Rust約100〜200行・tests/解析fixture約150〜300行の目安。
+新decode/upload、texture、永続設定/KeyAction/DB migration、二葉motion、split専用clockは不要。
+
+### 17.5 R6の回帰・計測gate
+
+R5のflat-first保証・幅swap/2%仮品質admission、中央単頁reverseのinstant、F12/VRAM/ROI/endpointを維持し、
+以下をR6-a/bの完成条件へ加える。CPU p95追加0.5ms/context、GPU追加2ms/4Kは未検証の仮予算のまま。
+
+| 対象 | 必須fixture/計測 |
+| --- | --- |
+| common frame boundary | §17.2のroot実handler/F12 body。継続frame B/Esc/native ×/HUD ×、root B + viewport ×、IME/popup/submode、replay。terminal outcome→commit→captureのstamp順、snapshot idx/slice/token、bookmark source、load/history/sequence回数、兄弟context不変 |
+| under outer continuity | 600→900高さ、逆/offset/幅差、θ=0/ε/ε÷2、actual initial lift + p=0/次clock、0.25/0.5/終端。外周面積/境界座標・pixel差の収束、平面UV不動、gate後first-visible、shadow receiver。0度専用flat分岐では通らない負例 |
+| split material/identity | Half→Half別source/Half↔FullのLTR/RTL前後、corner番号/非対称文字/90度rotation/alpha/neutral back。全pose half UV内、extra prepare/decode/uploadなし。同native ID/異sliceのwrong receipt拒否、source単位の履歴/保存、flat-first後WithinPageが一回だけ進む |
+| split率 | all-landscape/mixed/portrait列のforward/backward、same/across-source分母、候補N−1、実ready/start/finish/sub_check、slideshowは実source操作を別集計。N=3,L=3で5操作/2候補/3 same-source instantの計数fixture |
+
+silhouette/visibilityはtessellationから分離し、§17.3のclipを含む実surfaceのpolygonで求める。
+外周露出maskの作成CPUも別に計測し、mesh細分化と独立したproof/予算をR6-aで先に確認する。
+perfの新fieldは`outer_reveal_progress`/gate後visible area、`step_before/step_after`（slice含む）、
+`terminal_resolution`、`continuation_commit_frame`、`snapshot_step/token`を既存operation/context/receipt相関へ付ける。
+wrong receiptは`presentation_step_mismatch`として該当source/slice/geometryを示し、ROI欠けは既存理由を使う。
+実機profileの通常scan省略率・motion品質・最終durationは未実証。headless snapshotをOS presentや利用者合格の代用にしない。
+
+### 17.6 簡素化・更新見積り・今回の記録
+
+採用する簡素化は「一つのframe入口」「終了判定を既存ownerから共有」「commit後にsnapshotを一回作る」
+「同じclockからの外周clip」「halfも同じSingleWindow」。old/new idxを両方正本として持つ案、
+古いFsFrameStateの一部patch、旧頁Bを後から取り消す案、前frame ×rectへの推測hit-test、
+終了より先のcommit、全頁fade/scale、half専用shader/producer/state、half全除外を不採用とする。
+modal化/turn完走wait/多操作queueを足さず、まれなGPU/保存失敗は既存log/通知/通常表示への終了に留める。
+
+| chunk | R6で更新する完成境界 | 概算 |
+| --- | --- | --- |
+| R6-a | R5-aのpure leaf/spine/visibility/tessellationに外周拡張clip・0度直後の連続pose・half UV単頁fixtureを追加 | 4〜6作業日 |
+| R6-b | R5-bのCompleting/flat receiptに共通frame入口・close実interaction・root委譲・precompute移動、`app.rs` update/render call-chain、slice identityとSplit offerを接続 | 6〜9作業日 |
+| R6-c | R5-cのcontext/lease/ROI/input/perf/profile gatesとR6実handler回帰・split候補率。実装時のdocs/spec/manual/detached §11追補、確認build、利用者motion評価 | 3〜5作業日 + 実機待ち |
+
+合計**13〜20作業日（約3〜4週）+ 独立設計/完了レビュー・修正・実機枠**。
+R5比で外周clip/fixture約1日、frame入口の捕捉順整理約1日、split約1〜2日を見込む（chunk間で共通作業を含む概算）。
+製品Rust置換/追加約1,100〜1,900行、tests/fixtures約1,100〜1,700行、解析器/tests約200〜400行、golden約30〜50枚の目安。
+shader bridgeが必要な場合の別判断/追加費用はR5同様。halfの最小対応を本見積りに含め、完全な紙/未表示halfを扱う別の大拡張は先取りしない。
+
+利用者の2026-10-11次々回延期・A0実機不合格・book-like要求と、HUD保存経路は設計担当ClaudeCodeの判断という来歴は維持する。
+backlogはR6の現状に合わせ、R5のhalf全省略を現行仕様として残さない。
+今回の変更は本plan、backlogの現行要約、`target/A-1341-r6-design-msg.txt`だけ。
+製品code/tests/golden/.git/dev-runtime/normal profileへの書込、build/test/launchは行わない。
+共通frame入口はviewport/context所有境界に触れる構造変更として再レビューへ出す。
+実装前の構造確認と実装時detached §11の範囲記録が必要であり、今回未実施の合意や実装確認を追記しない。

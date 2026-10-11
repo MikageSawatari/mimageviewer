@@ -241,13 +241,13 @@
 
 ### 1.341 ページめくりのアニメーションを追加する — mIV スレ >>520 (2026-10-07)
 - **2026-10-11 利用者決定: 次の次の版へ回す（v4.5.0の次の版には入れない）**。A0（`next-viewer` / `532635fdd`〜`e3a328ff6`）は利用者のnormal profile実機評価で不合格。PDF scanの数px差で`page_placement_changed`となる、画像では黒い帯に見える、spread全体を一枚として動かすように見える、という評価を受けた。本のように一枚の頁を背から返す動きが必要（RTL forwardは旧左頁だけを右へ返す）。
-- **設計改訂（2026-10-11）**: R4 `afc474d8d`の独立設計レビューはREVISE。現在は[page-turn-animation-plan.md §16](page-turn-animation-plan.md#16-r5--取消後の提示順序とbook-geometryの契約2026-10-11)のR5案を作成し、再レビュー待ち・未実装。取消targetを一canonical flat frame採用してから次navigationを実行する順序、異幅Pairの背/静止面、中央単頁の逆送り、landscape splitの対応と省略率を明示する。半頁を含む遷移は演出のみinstantで、全landscape split漫画は100%省略という制限が採択対象。通常scanでfallbackが稀かは未実証。
+- **設計改訂（2026-10-11）**: R4 `afc474d8d`、R5 `c73f0d857`の独立設計レビューはREVISE。現在は[page-turn-animation-plan.md §17](page-turn-animation-plan.md#17-r6--frame入口外周露出split一頁窓2026-10-11)のR6案を作成し、再レビュー待ち・未実装。取消targetのcanonical flat採用を次navigationの条件とする保証は維持し、close解決→継続commit→描画/入力snapshot捕捉の共通境界と、異高さの新下頁外周の連続clipを定義。splitは同source内の左右移動だけinstant、別source Half/FullはSingleDeparture/SingleArrivalとする。全landscape N頁では2N−1操作中N−1が構造上の演出候補（大きい本で約50%）。R5の全省略案は撤回し、実開始率・通常scanでfallbackが稀かは未実証。
 - PC/F12限定・Remote不要、既定OFF、slideshow、Preferencesとfullscreen HUD overflowの同じ全体設定は維持。時間は実際の動きを見てから利用者が決めるため、100〜600ms・既定200msは引き続き仮設定。過去の自動検証成功はmotion品質の合格を意味しない。最終時間・実機/性能受入れは未了。
 - 旧予定（利用者2026-10-07）: 次版ラインE（3番目）。2026-10-11の延期決定で置換済み。他アプリでも対応が多いので実装したい、という要求は維持。
 
 - 返信済み: まずはシンプルなアニメーションから実装を試す。方式・長さ・ON/OFF は設計時に決める。
 - 連続ページ送り、見開き、連結表示、複数ウィンドウで既存の表示速度や入力応答を落とさないことを先に確認する。
-- 規模 / 優先度: R5再実装概算10〜17作業日（約2〜4週）+独立レビュー・修正・実機枠、半頁対応の将来拡張は含まない / P3。
+- 規模 / 優先度: R6再実装概算13〜20作業日（約3〜4週）+独立レビュー・修正・実機枠、別sourceの最小half対応を含む / P3。
 
 ### 1.342 指定スケールを％・pxの両方で設定できるようにする — mIV スレ >>510、>>521 (2026-10-07)
 - **次の版の決定 (利用者 2026-10-07)**: ライン E (2 番目)。
