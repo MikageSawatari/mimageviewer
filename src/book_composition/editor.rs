@@ -17,7 +17,13 @@ pub(crate) enum DraftSelection {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DraftConfirmation {
     CoverChanged,
-    CompanionRemoved { page: CompositionPageRef },
+    PairBroken {
+        first: CompositionPageRef,
+        second: CompositionPageRef,
+    },
+    CompanionRemoved {
+        page: CompositionPageRef,
+    },
     RebuildAutomatic,
 }
 
@@ -197,6 +203,26 @@ impl CompositionDraft {
 
     fn make_preview(&self, record: BookComposition, rebuild: bool) -> DraftEditPreview {
         let mut confirmations = Vec::new();
+        let pairs: HashSet<_> = record
+            .units
+            .iter()
+            .filter_map(|unit| match unit {
+                CompositionUnit::Pair { first, second } => {
+                    Some((first.matching_key(), second.matching_key()))
+                }
+                _ => None,
+            })
+            .collect();
+        for unit in &self.record().units {
+            if let CompositionUnit::Pair { first, second } = unit
+                && !pairs.contains(&(first.matching_key(), second.matching_key()))
+            {
+                confirmations.push(DraftConfirmation::PairBroken {
+                    first: first.clone(),
+                    second: second.clone(),
+                });
+            }
+        }
         if self
             .record()
             .cover

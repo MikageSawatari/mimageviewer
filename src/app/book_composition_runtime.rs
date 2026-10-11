@@ -48,6 +48,21 @@ pub(crate) enum ProjectionOrigin {
     },
 }
 
+impl ProjectionOrigin {
+    /// The FIFO write, worker read and adoption use the same row-replacement contract.
+    fn replaces_rows(&self, composed: bool) -> bool {
+        composed
+            || matches!(self, Self::IgnoreThisOpen { .. })
+            || matches!(
+                self,
+                Self::Refresh {
+                    previous: Some(_),
+                    ..
+                }
+            )
+    }
+}
+
 pub(crate) struct BookProjectionReply {
     pub(crate) rows: super::book_materialization::MaterializedBookRows,
     pub(crate) landing: Option<usize>,
@@ -1003,7 +1018,7 @@ impl App {
         // Superseded workers must not write older edits after newer requests.
         let trim_receipt = pending_trim
             .as_ref()
-            .filter(|_| record.is_some() || restores_automatic)
+            .filter(|_| origin.replaces_rows(record.is_some()))
             .and_then(|batch| {
                 self.book_composition_service
                     .as_ref()
@@ -1066,21 +1081,10 @@ impl App {
         // A worker saves pending trim by its stable page keys before filtering rows.
         // If another ordinary edit arrived meanwhile, prepare that newer batch
         // before adopting. A failed write leaves the original rows and dirty edits.
-        let replaces_rows = matches!(&origin, ProjectionOrigin::IgnoreThisOpen { .. })
-            || matches!(
-                &reply.rows.composition,
-                CompositionProjectionOutcome::Composed(_)
-            )
-            || (matches!(
-                &reply.rows.composition,
-                CompositionProjectionOutcome::Automatic
-            ) && matches!(
-                &origin,
-                ProjectionOrigin::Refresh {
-                    previous: Some(_),
-                    ..
-                }
-            ));
+        let replaces_rows = origin.replaces_rows(matches!(
+            &reply.rows.composition,
+            CompositionProjectionOutcome::Composed(_)
+        ));
         if replaces_rows
             && (reply.saved_trim != self.pending_composition_trim_batch()
                 || reply.edits.as_ref().is_some_and(|prepared| {
@@ -1545,15 +1549,10 @@ fn prepare_book_projection(
             preceding = resolved[index].or(preceding);
         }
     }
-    let is_replacement = matches!(origin, ProjectionOrigin::IgnoreThisOpen { .. })
-        || matches!(&rows.composition, CompositionProjectionOutcome::Composed(_))
-        || matches!(
-            origin,
-            ProjectionOrigin::Refresh {
-                previous: Some(_),
-                ..
-            }
-        );
+    let is_replacement = origin.replaces_rows(matches!(
+        &rows.composition,
+        CompositionProjectionOutcome::Composed(_)
+    ));
     let saved_trim = if is_replacement { pending_trim } else { None };
     if saved_trim.is_some() {
         trim_receipt

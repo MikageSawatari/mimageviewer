@@ -196,6 +196,8 @@ pub fn show_window(
     if (!open || keys.escape) && can_close {
         if state.confirmation != EditorConfirmation::None {
             state.confirmation = EditorConfirmation::None;
+        } else if keys.escape && view.pending_preview.is_some() {
+            actions.push(EditorUiAction::DiscardEdit);
         } else if !actions.contains(&EditorUiAction::Cancel) {
             actions.push(EditorUiAction::Cancel);
         }

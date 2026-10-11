@@ -1620,6 +1620,8 @@ Refresh要求に保持し、同じ次→前→新先頭のresolverへ渡す。�
 共有resumeは既存writerのdrive-stripped keyと同値dedupを使い、seedが元manifestにない時はKeep。
 「今回は構成を使わず開く」は選択contextで元列をworker準備し、ページ編集も同じ採用で戻す。
 通常Automaticの早期採用とは分け、Ignoredの選択を保存データや兄弟窓へ公開しない。
+Ignoreを含む列置換の判定は保存票の発行・worker・採用で共通化する。未保存の余白は
+既存FIFOへ先に提出し、その保存完了後に同じ実ページキーの編集を読み、元列を採用する。
 
 実装は `app/book_composition_editor` のprocess共通owner/ticket受付と、
 context bundleが保持する `CompositionEditorState` に分ける。Preparing→Editing→Saving→Reloadingを
@@ -1632,6 +1634,8 @@ context所有のBoxに置き、ClosedのAppやbundleへその全サイズを埋�
 
 `book_composition/editor` のdraftは明示unitを保ち、操作previewを経て方向/表紙/Pair/Single/空き側を
 変更する。既存Pairを壊す操作、方向・表紙で組を作り直す操作は変更される組を確認してから適用する。
+確認要否は操作名ではなく変更前と候補の最終Pairを比較する。B/Cの組み替え等の複数操作も
+候補だけを用意し、取消ではdraft/historyを変更せず、確定後は一回のundoで元へ戻す。
 「編集中の条件で組を作り直す」はdraftのページ順/方向/表紙で隣接Pairを作り直す。
 全体既定を書き換えず、横長判定・末尾・単独・ずらしなどの自動規則を再適用しない。
 確認中は別編集を止める簡素化を採用し、複数previewの同時進行・自動merge・割込み復帰を作らない。
@@ -1645,6 +1649,8 @@ policy除外は名前と理由だけを表示してdecodeせず、Missingは参�
 Windowはdefault_posを使って移動/resize可能とし、本文だけをscrollして保存/キャンセル/解除を下端へ残す。
 通常文字・補足・errorは共通themeの色を使い、白紙は独立した画像/選択/drag対象にしない。
 Enter/EscapeはAppのIME helperで得た値だけを渡し、raw key eventから保存/取消を決めない。
+Escapeは解除/作り直しの確認、変更previewの順に先に閉じる。previewの取消は候補だけを
+破棄し、それまでのdraftとundo履歴を保持する。確認がない時だけ編集全体をキャンセルする。
 共通ownerがある間は背面のmenu・toolbar・検索等を無効にし、foregroundのmodal layerへ入力を限定する。
 兄弟の一時mountでも同じownerを参照し、そこで別のeditorを生成しない。
 slideshow・連結の自動reanchor・一覧watcherの反映も既存処理の入口で保留し、

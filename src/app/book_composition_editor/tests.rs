@@ -6,6 +6,192 @@ use std::{io::Write, sync::Arc, time::Duration};
 
 const WAIT: Duration = Duration::from_secs(15);
 
+fn editor_harness(
+    f: Fixture,
+) -> (
+    std::rc::Rc<std::cell::RefCell<Fixture>>,
+    egui_kittest::Harness<'static>,
+) {
+    let fixture = std::rc::Rc::new(std::cell::RefCell::new(f));
+    let renderer = fixture.clone();
+    let mut fonts_ready = false;
+    let h = crate::test_ui::builder()
+        .with_size(egui::vec2(1093.0, 614.0))
+        .build(move |ctx| {
+            ctx.style_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
+            if !fonts_ready {
+                crate::ui_fonts::configure_fonts(ctx);
+                crate::ime_focus::install_ime_input_policy(ctx);
+                fonts_ready = true;
+                ctx.request_repaint();
+                return;
+            }
+            let mut f = renderer.borrow_mut();
+            f.app.update_ime_state(ctx);
+            f.app.show_local_composition_editor(ctx);
+        });
+    (fixture, h)
+}
+
+fn draft_record(f: &Fixture) -> BookComposition {
+    let CompositionEditorState::Editing(session) = &f.app.composition_editor else {
+        panic!("Editing");
+    };
+    session.prepared.as_ref().unwrap().draft.record().clone()
+}
+
+#[test]
+fn real_pair_button_requires_preview_cancel_and_one_undo_preserves_prior_draft() {
+    use egui_kittest::kittest::Queryable;
+    let mut f = fixture();
+    let ctx = egui::Context::default();
+    start_editing(&mut f.app, &ctx);
+    let CompositionEditorState::Editing(session) = &mut f.app.composition_editor else {
+        panic!("Editing");
+    };
+    let pages = session.pages.clone();
+    let record = BookComposition::new(
+        ReadingDirection::Ltr,
+        vec![
+            CompositionUnit::Pair {
+                first: pages[0].clone(),
+                second: pages[1].clone(),
+            },
+            CompositionUnit::Pair {
+                first: pages[2].clone(),
+                second: pages[3].clone(),
+            },
+        ],
+    );
+    let prepared = session.prepared.as_mut().unwrap();
+    prepared.draft =
+        CompositionDraft::new(record, f.domain.clone(), prepared.draft.manifest().to_vec())
+            .unwrap();
+    session.ui.selected_pages = vec![1, 2];
+    session.refresh_view();
+    f.app.apply_editor_ui_action(
+        &ctx,
+        ui::EditorUiAction::SetDirection(ReadingDirection::Rtl),
+    );
+    let before = draft_record(&f);
+    let (f, mut h) = editor_harness(f);
+    h.run();
+    h.get_by_label("2: b.png").click();
+    h.run();
+    h.get_by_label("3: c.png")
+        .click_modifiers(egui::Modifiers::CTRL);
+    h.run();
+    h.get_by_label("この2枚を組にする").click();
+    h.run();
+    assert_eq!(draft_record(&f.borrow()), before);
+    assert!(
+        matches!(&f.borrow().app.composition_editor, CompositionEditorState::Editing(session) if session.preview.is_some())
+    );
+    h.get_by_label("変更しない").click();
+    h.run();
+    assert_eq!(draft_record(&f.borrow()), before);
+    h.get_by_label("2: b.png").click();
+    h.run();
+    h.get_by_label("3: c.png")
+        .click_modifiers(egui::Modifiers::CTRL);
+    h.run();
+    h.get_by_label("この2枚を組にする").click();
+    h.run();
+    h.get_by_label("変更する").click();
+    h.run();
+    assert_eq!(
+        draft_record(&f.borrow()).units,
+        vec![
+            CompositionUnit::Single {
+                page: pages[0].clone(),
+                placement: SinglePlacement::Leading,
+                companion: SingleCompanion::Vacant
+            },
+            CompositionUnit::Pair {
+                first: pages[1].clone(),
+                second: pages[2].clone()
+            },
+            CompositionUnit::Single {
+                page: pages[3].clone(),
+                placement: SinglePlacement::Trailing,
+                companion: SingleCompanion::Vacant
+            },
+        ]
+    );
+    h.get_by_label("元に戻す").click();
+    h.run();
+    assert_eq!(
+        draft_record(&f.borrow()),
+        before,
+        "the whole confirmed pairing is one undo"
+    );
+    assert!(
+        matches!(&f.borrow().app.composition_editor, CompositionEditorState::Editing(session) if session.prepared.as_ref().unwrap().draft.can_undo())
+    );
+}
+
+#[test]
+fn real_escape_discards_blank_removal_preview_without_discarding_prior_draft() {
+    use egui_kittest::kittest::Queryable;
+    let mut f = fixture();
+    let ctx = egui::Context::default();
+    start_editing(&mut f.app, &ctx);
+    let original = draft_record(&f);
+    f.app.apply_editor_ui_action(
+        &ctx,
+        ui::EditorUiAction::InsertBlank {
+            page: 1,
+            placement: SinglePlacement::Leading,
+        },
+    );
+    f.app
+        .apply_editor_ui_action(&ctx, ui::EditorUiAction::ConfirmEdit);
+    let before = draft_record(&f);
+    let CompositionEditorState::Editing(session) = &mut f.app.composition_editor else {
+        panic!("Editing");
+    };
+    session.ui.selected_pages.clear();
+    session.ui.selected_unit = Some(
+        before
+            .units
+            .iter()
+            .position(|unit| {
+                matches!(
+                    unit,
+                    CompositionUnit::Single {
+                        companion: SingleCompanion::Blank,
+                        ..
+                    }
+                )
+            })
+            .unwrap(),
+    );
+    let (f, mut h) = editor_harness(f);
+    h.run();
+    h.get_by_label("白紙を取り除く").click();
+    // The preview keeps requesting its ScrollArea anchor. Process the actual
+    // queued press/release, rather than requiring the whole UI to stop repainting.
+    h.step();
+    assert!(
+        matches!(&f.borrow().app.composition_editor, CompositionEditorState::Editing(session) if session.preview.is_some())
+    );
+    h.key_press(egui::Key::Escape);
+    h.step();
+    assert_eq!(draft_record(&f.borrow()), before);
+    assert!(
+        matches!(&f.borrow().app.composition_editor, CompositionEditorState::Editing(session) if session.preview.is_none() && session.prepared.as_ref().unwrap().draft.can_undo())
+    );
+    assert!(f.borrow().app.composition_editor_modal_active());
+    f.borrow_mut()
+        .app
+        .apply_editor_ui_action(&ctx, ui::EditorUiAction::Undo);
+    assert_eq!(
+        draft_record(&f.borrow()),
+        original,
+        "Escape did not add an undo checkpoint"
+    );
+}
+
 #[test]
 fn modal_editor_disables_real_backing_menus_and_pauses_slideshow_handlers() {
     use egui_kittest::kittest::{NodeT, Queryable};
@@ -543,6 +729,7 @@ fn source_changed_save_retains_draft_and_record_without_writing_shift() {
 
 #[test]
 fn corrupt_saved_record_blocks_save_remove_and_ignore_is_this_open_only() {
+    use egui_kittest::kittest::Queryable;
     let mut f = fixture();
     let ctx = egui::Context::default();
     start_editing(&mut f.app, &ctx);
@@ -609,13 +796,62 @@ fn corrupt_saved_record_blocks_save_remove_and_ignore_is_this_open_only() {
         assert!(!f.app.composition_editor_writes_pending());
         assert!(f.app.composition_editor_modal_active());
     }
-    f.app
-        .apply_editor_ui_action(&ctx, ui::EditorUiAction::IgnoreComposition);
+    let trim_path = f.app.tmp.path().join("view_trim.db");
+    f.app.view_trim_db = Some(crate::view_trim_db::ViewTrimDb::open_at(&trim_path).unwrap());
+    let page_key = f.app.page_path_key(1).unwrap();
+    let trim =
+        crate::view_trim::ViewTrimPageOverride::from_margins(crate::view_trim::ViewTrimMargins {
+            left: 0.1,
+            ..Default::default()
+        });
+    f.app.view_trim_page_overrides.insert(1, trim);
+    f.app.view_trim_dirty_page_overrides.insert(1);
+    f.app.view_trim_save_pending = true;
+    let old_order: Vec<_> = f
+        .app
+        .items
+        .iter()
+        .map(|item| PageIdentity::for_item(item, None).unwrap())
+        .collect();
+    {
+        let mut fonts_ready = false;
+        let mut h = crate::test_ui::builder()
+            .with_size(egui::vec2(1093.0, 614.0))
+            .build(|ctx| {
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                f.app.update_ime_state(ctx);
+                f.app.show_local_composition_editor(ctx);
+            });
+        h.run();
+        h.get_by_label("今回は構成を使わず開く").click();
+        h.run();
+    }
     assert!(!f.app.composition_editor_modal_active());
     assert!(matches!(&f.app.book_composition,
         ViewerBookComposition::Projecting { scope, origin: ProjectionOrigin::IgnoreThisOpen { .. }, .. }
         if scope == &f.scope));
     finish_projection(&mut f.app, &ctx);
+    assert_eq!(
+        f.app
+            .items
+            .iter()
+            .map(|item| PageIdentity::for_item(item, None).unwrap())
+            .collect::<Vec<_>>(),
+        old_order
+    );
+    assert_eq!(
+        crate::view_trim_db::ViewTrimDb::open_at(&trim_path)
+            .unwrap()
+            .get_page_override(&page_key),
+        Some(trim)
+    );
+    assert!(!f.app.view_trim_save_pending);
+    assert!(f.app.view_trim_dirty_page_overrides.is_empty());
     assert!(
         matches!(&f.app.book_composition, ViewerBookComposition::Ignored { scope, generation, .. }
         if scope == &f.scope && *generation == f.app.items_generation)

@@ -317,3 +317,61 @@ fn draft_multi_edit_is_atomic_and_undoes_as_one_checkpoint() {
     assert_eq!(value.record(), &original);
     assert!(!value.can_undo());
 }
+
+#[test]
+fn draft_pair_break_confirmation_compares_final_topology_and_preserves_history() {
+    let mut value = draft(four_page_book(ReadingDirection::Ltr));
+    edit(&mut value, UnitEdit::SetDirection(ReadingDirection::Rtl));
+    let before = value.record().clone();
+    let preview = value
+        .preview_edits([
+            UnitEdit::SplitPair { unit: 0 },
+            UnitEdit::SplitPair { unit: 2 },
+            UnitEdit::PairSingles {
+                first_unit: 1,
+                clear_cover: false,
+            },
+        ])
+        .unwrap();
+    assert_eq!(
+        preview.confirmations(),
+        &[
+            DraftConfirmation::PairBroken {
+                first: document_page(0),
+                second: document_page(1)
+            },
+            DraftConfirmation::PairBroken {
+                first: document_page(2),
+                second: document_page(3)
+            },
+        ]
+    );
+    assert_eq!(value.record(), &before);
+    assert!(value.apply(preview.clone(), false).is_err());
+    assert_eq!(value.record(), &before);
+    // Discarding a candidate leaves the earlier direction edit and its undo intact.
+    drop(preview.clone());
+    value.apply(preview, true).unwrap();
+    assert_eq!(value.record().units[1], pair(1, 2));
+    assert!(value.undo());
+    assert_eq!(value.record(), &before);
+    assert!(value.undo());
+    assert_eq!(value.record(), &four_page_book(ReadingDirection::Ltr));
+    assert!(!value.can_undo());
+
+    // Moving intact units, changing direction, or temporarily splitting then
+    // reconstructing the same pair does not destroy the final pair topology.
+    for edits in [
+        vec![UnitEdit::MoveUnit { from: 1, to: 0 }],
+        vec![UnitEdit::SetDirection(ReadingDirection::Rtl)],
+        vec![
+            UnitEdit::SplitPair { unit: 0 },
+            UnitEdit::PairSingles {
+                first_unit: 0,
+                clear_cover: false,
+            },
+        ],
+    ] {
+        assert!(!value.preview_edits(edits).unwrap().requires_confirmation());
+    }
+}
