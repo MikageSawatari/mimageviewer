@@ -1455,6 +1455,10 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-11 §1.341 resident素材でのturn開始（構造確認待ち）
+
+利用者決定のfinal-only撤回に従い、contextのAcceptedOfferがincoming typed resident resourceとlogical content bindingを所有する。共有weak inventoryへaccept source pinを加え、通常prepare後のnative ROIもdedup会計する。turnとcanonical flat採用までは保持素材・最初のplacementを使い、通常producer/upgradeは止めない。source品質publicationのinput epoch更新と実編集を分け、当該contextのitem/edit/params/comic/view/layout bindingを維持する。既存close→continuation commit→captureとflat-firstで保持を解く。fork、park/mount/deposit、兄弟cancel、F12動画拒否、viewport/native生成経路は変更しない。変更範囲はui_fullscreen.rsの通常selector/prepare済素材束縛、page_turn.rs/barrier.rsのowner/lease/採用照合、回帰fixture。新pending・queue・wait・producerを作らない。詳細はpage-turn plan §22。独立構造確認・完了レビューや実窓受入れの合格は主張しない。
+
 ### 2026-10-11 §1.341 A0: context単位の紙めくりpresentationと共有会計（確認待ち）
 
 2026-10-11 HUD追補（`bf3b2fae0`）: 既存PC静止画HUDに全体設定のON/OFF行を追加し、Preferencesのadoption処理へ合流する。既存`deactivate_all_page_turn_presentations`を設定変更時に再利用するだけで、detached述語・viewport routing・bundle/workerの所有契約は変更しない。F12からの変更が全体設定と各presentationに反映し、兄弟のitems/idx/input sequenceを変えないことを既存context test内で検査する。設計担当ClaudeCodeの判断で既存overflowの`Settings::save()`へ保存を接続し、DB再読込を同testへ追加する（判断者の訂正は`e3a328ff6`。HUDへON/OFFを追加する利用者要求とは別の保存経路判断）。projection追補は描画先transformのeffective pppをpure geometryへ渡し、独立に丸められたpaint矩形の比較を物理1px以内へ定義する。viewport origin/clipの正本、destination binding、resource/context所有者は変更しない。構造的なgeometryの比較単位修正として記録し、独立構造合意・実機確認を主張しない。詳細と範囲はpage-turn plan §14。

@@ -158,6 +158,10 @@ fn install_native_press(viewport: egui::ViewportId) {
 }
 
 fn first_keyboard_turn_reaches_started_and_finished(route: InputRoute, mode: SpreadMode) {
+    keyboard_turn_with_resident_quality(route, mode, false);
+}
+
+fn keyboard_turn_with_resident_quality(route: InputRoute, mode: SpreadMode, thumbnail: bool) {
     take_test_events();
     let ctx = egui::Context::default();
     install(&ctx);
@@ -192,6 +196,30 @@ fn first_keyboard_turn_reaches_started_and_finished(route: InputRoute, mode: Spr
         PresentationState::Flat(_)
     ));
     assert!(!app.page_turn_barrier_active());
+    if thumbnail {
+        app.thumbnails = (0..app.items.len())
+            .map(|_| ThumbnailState::Pending)
+            .collect();
+        app.final_composite_cache
+            .retain(|key, _| key.edit_key.idx < target);
+        app.comic_cache.retain(|idx, _| *idx < target);
+        app.edit_result_cache.retain(|key, _| key.idx < target);
+        for idx in target..target + if mode.is_spread() { 2 } else { 1 } {
+            app.fs_cache.remove(&idx);
+            app.thumbnails[idx] = ThumbnailState::Loaded {
+                tex: ctx.load_texture(
+                    format!("input-resident-thumb-{idx}"),
+                    egui::ColorImage::filled([8, 12], egui::Color32::WHITE),
+                    egui::TextureOptions::LINEAR,
+                ),
+                origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+                from_edit_preview: false,
+                rendered_at_px: 12,
+                source_dims: Some((80, 120)),
+                layout_dims: None,
+            };
+        }
+    }
 
     let mut curl_receipt = None;
     let mut ingress_operation = None;
@@ -243,6 +271,12 @@ fn first_keyboard_turn_reaches_started_and_finished(route: InputRoute, mode: Spr
                 );
             }
             assert_eq!(app.fullscreen_idx, Some(target));
+            if thumbnail {
+                // Production pre-draw readiness must allow the captured
+                // thumbnail, rather than covering it with the old stop page.
+                app.resolve_fs_navigation_sequence_target(ctx, target, false);
+                assert!(app.fs_nav_holdover_for_draw().is_none());
+            }
             let (_, sources) = draw_current(&mut app, ui, ctx);
             let FsDisplayUnitSubmission::Paged(receipt) = sources.submission else {
                 panic!("paged output")
@@ -951,4 +985,17 @@ fn actual_navigation_without_ingress_fact_skips_once_without_delaying_the_target
     );
     assert_eq!(events[0].0.cause, "unidentified_navigation");
     assert_eq!(app.fullscreen_idx, Some(1));
+}
+
+#[test]
+fn real_root_and_viewer_keyboard_handlers_start_and_complete_thumbnail_turns() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    #[cfg(windows)]
+    crate::key_input::clear_test_frame();
+    for mode in [SpreadMode::Single, SpreadMode::Ltr] {
+        for route in [InputRoute::RootEgui, InputRoute::ViewerEgui] {
+            keyboard_turn_with_resident_quality(route, mode, true);
+        }
+    }
 }

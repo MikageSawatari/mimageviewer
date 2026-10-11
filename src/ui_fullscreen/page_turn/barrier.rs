@@ -242,17 +242,13 @@ impl App {
                     || continuation
                         .as_ref()
                         .is_some_and(|command| self.fullscreen_idx != Some(command.from_idx))
-                    || incoming.pages.iter().any(|page| {
-                        page.resource.source_generation().is_some_and(|generation| {
-                            generation.items != self.items_generation
-                                || generation.input
-                                    != self
-                                        .input_generation
-                                        .get(&page.occurrence.idx)
-                                        .copied()
-                                        .unwrap_or(0)
+                    || incoming
+                        .pages
+                        .iter()
+                        .zip(&incoming.content)
+                        .any(|(page, content)| {
+                            *content != self.page_turn_content(page.occurrence.idx)
                         })
-                    })
             }
             _ => false,
         };
@@ -311,6 +307,7 @@ impl App {
         else {
             unreachable!("validated the same exclusively owned state")
         };
+        incoming.reserved_bytes.store(0, Ordering::Relaxed);
         self.page_turn_presentation.state = PresentationState::Flat(incoming);
         let command = continuation?;
         if command.fact.destination != destination

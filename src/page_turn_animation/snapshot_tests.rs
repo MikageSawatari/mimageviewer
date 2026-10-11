@@ -25,6 +25,7 @@ enum SceneGeometry {
     OpaqueBlack,
     SpineEdge,
     FixedSingleSpine,
+    ResidentQuality,
 }
 
 impl SceneGeometry {
@@ -37,6 +38,7 @@ impl SceneGeometry {
             Self::OpaqueBlack => "opaque_black_",
             Self::SpineEdge => "spine_edge_",
             Self::FixedSingleSpine => "fixed_spine_",
+            Self::ResidentQuality => "resident_quality_",
         }
     }
 
@@ -117,7 +119,7 @@ fn page_image(letter: char, number: char, base: Color32) -> egui::ColorImage {
     image
 }
 
-fn load_textures(ctx: &egui::Context, opaque: bool) -> SceneTextures {
+fn load_textures(ctx: &egui::Context, opaque: bool, resident_quality: bool) -> SceneTextures {
     let mut checker = egui::ColorImage::filled([112, 168], Color32::WHITE);
     for y in 0..168 {
         for x in 0..112 {
@@ -128,7 +130,7 @@ fn load_textures(ctx: &egui::Context, opaque: bool) -> SceneTextures {
             };
         }
     }
-    let page = |name: &str, letter, number, base| {
+    let page = |name: &str, letter, number, base, divisor: usize| {
         let mut image = page_image(letter, number, base);
         if opaque {
             for pixel in &mut image.pixels {
@@ -137,19 +139,97 @@ fn load_textures(ctx: &egui::Context, opaque: bool) -> SceneTextures {
                 }
             }
         }
+        if divisor > 1 {
+            // Sample the same repo-native print at preview/thumbnail size.
+            // Its lower texel count must never become canonical page geometry.
+            let size = [image.size[0] / divisor, image.size[1] / divisor];
+            let mut reduced = egui::ColorImage::filled(size, Color32::TRANSPARENT);
+            for y in 0..size[1] {
+                for x in 0..size[0] {
+                    reduced[(x, y)] = image[(x * divisor, y * divisor)];
+                }
+            }
+            image = reduced;
+        }
         ctx.load_texture(name, image, TextureOptions::NEAREST)
     };
+    let preview = if resident_quality { 2 } else { 1 };
+    let thumbnail = if resident_quality { 4 } else { 1 };
     SceneTextures {
         old: [
-            page("turn-old-A1", 'A', '1', Color32::from_rgb(140, 203, 246)),
-            page("turn-old-B2", 'B', '2', Color32::from_rgb(201, 174, 242)),
+            page(
+                "turn-old-A1",
+                'A',
+                '1',
+                Color32::from_rgb(140, 203, 246),
+                preview,
+            ),
+            page(
+                "turn-old-B2",
+                'B',
+                '2',
+                Color32::from_rgb(201, 174, 242),
+                preview,
+            ),
         ],
         new: [
-            page("turn-new-C3", 'C', '3', Color32::from_rgb(254, 226, 142)),
-            page("turn-new-D4", 'D', '4', Color32::from_rgb(154, 235, 183)),
+            page(
+                "turn-new-C3",
+                'C',
+                '3',
+                Color32::from_rgb(254, 226, 142),
+                thumbnail,
+            ),
+            page(
+                "turn-new-D4",
+                'D',
+                '4',
+                Color32::from_rgb(154, 235, 183),
+                preview,
+            ),
         ],
         checker: ctx.load_texture("turn-underlay", checker, TextureOptions::NEAREST),
     }
+}
+
+fn assert_same_projection_geometry(resident: &TurnProjection, normal: &TurnProjection) {
+    assert_eq!(resident.hinge_x, normal.hinge_x);
+    assert_eq!(resident.angle_degrees, normal.angle_degrees);
+    assert_eq!(resident.showing_back, normal.showing_back);
+    assert_eq!(resident.finished, normal.finished);
+    assert_eq!(resident.meshes.len(), normal.meshes.len());
+    for (resident, normal) in resident.meshes.iter().zip(&normal.meshes) {
+        assert_eq!(resident.clip_rect, normal.clip_rect);
+        assert_eq!(resident.mesh.indices, normal.mesh.indices);
+        assert_eq!(resident.mesh.vertices.len(), normal.mesh.vertices.len());
+        for (resident, normal) in resident.mesh.vertices.iter().zip(&normal.mesh.vertices) {
+            assert_eq!(resident.pos, normal.pos);
+            assert_eq!(resident.uv, normal.uv);
+            assert_eq!(resident.color, normal.color);
+        }
+    }
+    assert_eq!(
+        resident.visibility.incoming.len(),
+        normal.visibility.incoming.len()
+    );
+    for (resident, normal) in resident
+        .visibility
+        .incoming
+        .iter()
+        .zip(&normal.visibility.incoming)
+    {
+        assert_eq!(resident.occurrence, normal.occurrence);
+        assert_eq!(resident.visible_area, normal.visible_area);
+        assert_eq!(
+            resident.canonical_visible_area,
+            normal.canonical_visible_area
+        );
+        assert_eq!(resident.short_edge, normal.short_edge);
+    }
+    assert_eq!(
+        resident.visibility.outgoing_front_area,
+        normal.visibility.outgoing_front_area
+    );
 }
 
 fn material(texture: &TextureHandle) -> PageMaterial {
@@ -263,10 +343,16 @@ fn snapshot_scene(
     // Keep every TextureHandle in the render closure until both GPU images
     // have been consumed. No texture lifetime is inferred from a texture id.
     let mut textures = None;
+    let mut normal_textures = None;
     let mut harness = crate::test_ui::builder().with_size(SIZE).build(move |ctx| {
         if textures.is_none() {
             crate::ui_fonts::configure_fonts(ctx);
-            textures = Some(load_textures(ctx, matches!(geometry, SceneGeometry::OpaqueBlack | SceneGeometry::FixedSingleSpine)));
+            let opaque = matches!(geometry, SceneGeometry::OpaqueBlack | SceneGeometry::FixedSingleSpine);
+            let resident_quality = matches!(geometry, SceneGeometry::ResidentQuality);
+            textures = Some(load_textures(ctx, opaque, resident_quality));
+            if resident_quality {
+                normal_textures = Some(load_textures(ctx, opaque, false));
+            }
             ctx.request_repaint();
             return;
         }
@@ -325,7 +411,7 @@ fn snapshot_scene(
                         page.rect = Rect::from_center_size(center, vec2(page.rect.width(), 184.0));
                     }
                 }
-                SceneGeometry::Equal | SceneGeometry::PortraitPdf | SceneGeometry::OpaqueBlack | SceneGeometry::SpineEdge | SceneGeometry::FixedSingleSpine => {}
+                SceneGeometry::Equal | SceneGeometry::PortraitPdf | SceneGeometry::OpaqueBlack | SceneGeometry::SpineEdge | SceneGeometry::FixedSingleSpine | SceneGeometry::ResidentQuality => {}
             }
             let mut old = old;
             if matches!(geometry, SceneGeometry::TallerIncoming) {
@@ -340,7 +426,7 @@ fn snapshot_scene(
                     }
                 }
             }
-            if matches!(geometry, SceneGeometry::FixedSingleSpine) {
+            if matches!(geometry, SceneGeometry::FixedSingleSpine | SceneGeometry::ResidentQuality) && !spread {
                 let moving = if forward { &old.pages[0] } else { &new.pages[0] };
                 let hinge = if reading_rtl { moving.rect.right() } else { moving.rect.left() };
                 painter.line_segment([pos2(hinge, 64.0), pos2(hinge, 248.0)], egui::Stroke::new(1.0, Color32::from_rgb(241, 92, 104)));
@@ -352,13 +438,21 @@ fn snapshot_scene(
             } else {
                 let projection = project_turn(&old, &new, TurnDirection { reading_rtl, forward }, progress)
                     .expect("fixed supported scene must project at every sampled pose");
+                if let Some(normal_textures) = &normal_textures {
+                    let (normal_old, normal_new) = units(normal_textures, spread, cell);
+                    let normal = project_turn(&normal_old, &normal_new, TurnDirection { reading_rtl, forward }, progress)
+                        .expect("normal-resolution comparison must project at the same pose");
+                    assert_same_projection_geometry(&projection, &normal);
+                }
                 for projected in projection.meshes {
                     painter.with_clip_rect(projected.clip_rect).add(egui::Shape::mesh(projected.mesh));
                 }
             }
         }
         painter.text(pos2(12.0, 270.0), egui::Align2::LEFT_TOP,
-            if matches!(geometry, SceneGeometry::FixedSingleSpine) {
+            if matches!(geometry, SceneGeometry::ResidentQuality) {
+                "Resident A1/B2/D4 preview 56x84; C3 thumbnail 28x42. Normal 112x168: identical mesh/UV/spine; last = canonical incoming."
+            } else if matches!(geometry, SceneGeometry::FixedSingleSpine) {
                 if reading_rtl {
                     "Fixed RIGHT spine in both directions: current departs / previous arrives. Printed > never mirrors. Last = canonical incoming."
                 } else {
@@ -486,6 +580,31 @@ fn page_turn_projection_snapshot_fixed_single_spine_four_routes() {
                 SceneGeometry::FixedSingleSpine,
             ));
         }
+    }
+    snapshots.unwrap();
+}
+
+#[test]
+fn page_turn_projection_snapshot_resident_quality() {
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    // All single routes exercise fixed-spine outgoing departure and incoming
+    // arrival with visibly different resident resolutions. Two spreads expose
+    // both moving slots, including low-resolution front/back/revealed faces.
+    for reading_rtl in [false, true] {
+        for forward in [false, true] {
+            snapshots.extend(snapshot_scene(
+                false,
+                reading_rtl,
+                forward,
+                SceneGeometry::ResidentQuality,
+            ));
+        }
+        snapshots.extend(snapshot_scene(
+            true,
+            reading_rtl,
+            true,
+            SceneGeometry::ResidentQuality,
+        ));
     }
     snapshots.unwrap();
 }

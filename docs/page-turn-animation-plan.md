@@ -1,6 +1,6 @@
 # ページめくりアニメーション設計案 — backlog §1.341
 
-2026-10-11 / **R7設計ACCEPT（`fa5119c19`、Stage 1自動検証・確認用build済、実機評価待ち・§19）**。採択済みR7に従い、まず通常単頁と二実頁Pairのleaf・陰影・per-page geometryを既存A0へ接続し、利用者のmotion評価用buildを作った。cover/中央単頁/split等の対応は後段に残す。R3統合後のA0は利用者の実機評価で不合格。R4 `afc474d8d`・R5 `c73f0d857`・R6 `29291d496`はREVISE、R7の独立設計レビューACCEPTは利用者から伝達された。§1〜17は履歴で、衝突箇所は§18、段階実装の範囲は§19を優先する。既定OFF・仮時間・final-only・F12所有・VRAM会計を維持。実装の独立完了レビュー・実機motion/性能受入れ・最終時間は未了。利用者の2026-10-11決定でリリースは次の次の版。
+2026-10-11 / **R7設計ACCEPT（`fa5119c19`、Stage 1自動検証・確認用build済、実機評価待ち・§19）**。採択済みR7に従い、まず通常単頁と二実頁Pairのleaf・陰影・per-page geometryを既存A0へ接続し、利用者のmotion評価用buildを作った。cover/中央単頁/split等の対応は後段に残す。R3統合後のA0は利用者の実機評価で不合格。R4 `afc474d8d`・R5 `c73f0d857`・R6 `29291d496`はREVISE、R7の独立設計レビューACCEPTは利用者から伝達された。§1〜17は履歴で、衝突箇所は§18、段階実装の範囲は§19を優先する。既定OFF・仮時間・F12所有・VRAM会計を維持。readinessは2026-10-11利用者決定の§22でresident displayableへ置換する。実装の独立完了レビュー・実機motion/性能受入れ・最終時間は未了。利用者の2026-10-11決定でリリースは次の次の版。
 
 R3設計時の参照treeは `next-prefs` / `1ee3e178288f2eff119da16b672d546cc3c9992c`（R2文書commit、開始時clean）。当時の製品コードはmaster `cb00930011323cacd7088ae70c37835141aad58a` と同じだった。
 既存の `file:line` は各設計/追補時のsource inspection位置。A0は§1.364統合後の`0f6ad9f19`を基点に具体化した（§12）。A0は`532635fdd`、golden補完は`e0f323d24`、HUDは`bf3b2fae0`、PDF追補は`ea5f6624a`、保存判断の来歴訂正は`e3a328ff6`でコミットされた。§15はこのHEADと利用者提示の実機結果を基点とする。既存の自動検証成功は動きの品質合格を意味しない。
@@ -441,6 +441,8 @@ interactiveはscenario・時間・desktop使用・disposable dataを提示した
 必要なbuild/portable-smoke/build-dev handoffは実装時に行う。**R3設計作業は文書のみだった。A0の製品差分と未完了gateは§12で別に記録する。**
 
 ## 10. 利用者決定と残る時間評価（2026-10-11）
+
+readiness追補（2026-10-11利用者決定）: final-onlyを撤回し、受理時のresident displayable素材で開始する。新しい正本は§22。過去のfinal-only記録は当時の判断の履歴として残す。
 
 Q1は2026-10-10にC方向・旧/新が見える実際のpage-turnとして採択し、2026-10-11に再確認した。Q5も2026-10-11にPC viewer限定・F12含む・Remote不要と再確認した。両項は再質問しない。
 
@@ -1598,7 +1600,7 @@ R6-aのprojection/split/外周clipに変更はなく、R6-b/cへroute再判定�
 R7 `fa5119c19`は独立設計レビューACCEPT（利用者からの引継ぎ）。利用者指定により段階実装する。
 この節は実装範囲と検証証拠の台帳であり、製品差分の独立レビュー合格・実機motion品質の受入れを表さない。
 Stage 1の自動検証とnormal確認用build後、利用者の実機確認で演出が開始・継続しない入力接続の不具合が判明した（§20）。motion品質の受入れは未了。
-次の次の版へ延期、既定OFF、PC/F12限定、final-only readiness、仮時間100〜600ms/既定200ms、slideshow条件を維持する。
+次の次の版へ延期、既定OFF、PC/F12限定、仮時間100〜600ms/既定200ms、slideshow条件を維持する。readinessは§22の2026-10-11決定でresident displayableへ置換する。
 
 ### 19.1 今回の投影・素材・geometry
 
@@ -1752,3 +1754,42 @@ child（viewport 2615）の`observed_frame`をROOTの`cumulative_frame_nr`と裸
 `new_operation`の3件はneutral pollや同clickのreleaseではなく、演出終了直前の新しいnative矢印Pressだった。旧batch 47→51 Left（199.426ms）、55→59 Left（184.189ms）、75→79 Right（193.172ms）で、既定仮時間200msのturnへ割り込んでいる。対応するegui duplicateはbatch 52/60/80だが、継続操作のIDは元native 51/59/79。全件`target_reached=true`で、childのcanonical flat採用frame 830/868/950の次frame 831/869/951で継続をcommitした。既存flat-first保証と取消規則は変更しない。
 
 childの実key／wheel handler→callback外ROOT受付を異なるcounterで再現し、通常single-stepがStarted→Finishedになること、Repeat／boundaryが元ID・source・phaseで一回のskipになることを検査する。既存handler、interruption、F12、projection、ui_snapshotを維持する。自動検証とbuildの証拠・短い利用者手順は`target/A-1341-stage1-fb-msg.txt`へ記録する。独立レビュー合格、実機での見え方修正、final-readyの開始率やGPU性能の受入れを先取りしない。
+
+
+## 22. Residentの表示可能素材で即開始する（2026-10-11利用者決定）
+
+`eefb9b370`後の利用者判断でfinal-onlyを撤回する。普通のページ送りが非AI画像からAI結果へ更新するのと同じく、受理時に表示可能な通常画像・preview・thumbnailが各incoming実頁にあれば、それを使う。§1〜21のfinal-only／complete必須記述より本節を優先する。設定OFF、仮時間、単頁LTR左／RTL右の固定背、Stage 1のshape/media/split/continuous/repeat省略、F12 ownership、flat-first保証は変更しない。表示素材が一切ない場合は待たずinstant。
+
+### 22.1 素材選択と各面
+
+acceptのresident-only lookupは通常表示の品質順序・identity・既存のRAW表示許可を守る。現在EditResultKeyとFinalCompositeKeyに一致するresident final compositeは`complete=false`でも表示可能。現在final pixelsをbaseにするcomic compositeがあればその合成を選び、未residentのcomic metadataを読まず通常finalへ戻る。finalがない場合、既存のカラー化／Creative LUTのfaithful-display gateを守り、residentの小さいfaithful renditionがあれば使う。それ以外はRAW preview／Static元画像、最後に通常表示で許されたthumbnailへ進む。旧document・旧edit keyのbest-effort finalを採用しない。lookupはhandle cloneと最大二頁の設定比較だけで、producer、decode、upload、metadata I/Oを呼ばない。通常navigationのprepare／producer／pollは従来どおり一回実行し、演出の仕事は追加しない。
+
+| 面 | 素材の正本 |
+| --- | --- |
+| forward leaf front / outgoing rest | 最後に提出・採用されたoutgoing各頁のimmutable prepared resource。品質を引き戻さない |
+| spread leaf back / incoming revealed | 対応するincoming各頁がaccept時に選んだresource。二頁の品質は異なってよい。backとrevealedは独立したoccurrenceとUVを持つ |
+| single departure back | 既存neutral paper。未知の裏を生成・decodeしない |
+| single backward arrival front / current rest | frontはaccept時のprevious incoming、restは提出済みcurrent outgoing。固定背とfront/back/reveal対応は既存recipeを保つ |
+| 着地flat / interruption flat | 同じaccepted incomingを全頁canonical flatとして一度提示し、採用を完了条件にする |
+
+TextureIdだけでなくtyped `FullscreenPaintResource`を保持する。thumbnailはDirectのままで、cache eviction／replacement後もResampleableへ再分類しない。final/provisional/normal/preview/thumbnail/faithful_preview/comicの各品質とsource sizeをoffered perfへ記録する。無素材は`skip=no_displayable_source_at_accept`、`sub_check=no_resident_texture`または`faithful_effect_not_resident`とidxを一回記録する。既存ready_at_acceptイベント名は解析互換のため残し、意味をfinal-readyからdisplayable-readyへ更新する。
+
+### 22.2 品質固定と通常upgradeへの復帰
+
+最初の通常prepareでaccepted素材のtransform／per-page placement／ROI／spineを決定し、turnとcanonical flat採用までは同じresourceとgeometryを使う。通常処理は続け、新しいAI結果・PDF raster・RAW現像結果は普通のcacheへ届く。途中でleafの画素や寸法を替えると別のpopと投影不連続が生じるので、そのframeではpresentationだけを保持素材へ束縛する。fresh painterを使い、actual layout・navigator・receiptを実際の保持transformとsource/native IDで組み立てる。通常navigation sequenceのreadinessは、ON-originのbound held resourceがある各頁を表示可能として採用し、thumbnail/previewを旧stop-page holdoverで隠さない。これは既存sequenceの素材判定への接続で、新しいready stateや後着startは作らない。別のquality queue、fade、upgrade timer、producer pauseは作らない。
+
+canonical提出時に採用を進める一回のrepaintを要求し、採用の次frameに既存close→commit→capture境界が保持を解き、通常selector／geometryへ復帰する。高品質がresidentならそのframeから使い、未着なら既存経路で後に更新する。演出専用の二重swapと途中のgeometry popは加えない。ただし通常表示自体の低品質→高品質更新に伴う画質・丸め・metadata差は残る。「全品質で画素が同じ」とは保証しない。ON時だけupgradeの可視化が最大仮duration＋flat採用まで後ろへ移る。OFFの選択・処理・速度を変えない。
+
+source publication epochはimmutable resourceの旧generationとして保持し、新epochに偽装しない。PDF／RAWの高品質publicationによるinput generation更新だけではcancelしない。代わりにitem identity/items、source_genを除いたedit revision、effective AdjustParams、comic generation、gap、context/window/viewport、layout/mode/sliceがcontent bindingを所有する。実編集・設定変更・resize/DPI・rotation/trim/fit-policy/clip変更は既存取消またはcanonical再prepareへ戻す。元画像previewの明示要求は通常selectorを優先し、ineligibleな編集・分析・ズーム表示やlive=falseのprepared pageへ保持素材を押し付けない。通常publicationのsource_size・canonical basis・Pair spine変化だけは最初のplacementを維持する。close／binding無効化は当該contextだけを退役させる。
+
+### 22.3 Pin／VRAM／割込み
+
+accept時からincoming sourceもoutgoing prepared source/native/checkerと共にpin予算へ入れる。共有weak inventoryはaccepted sourcesとprepared unitsを列挙し、VramAccountantがTextureId／native IDでdedupする。incomingの通常prepareによるnative ROI outputも開始前に同じbudgetへ加え、超過は`pin_budget`＋`prepared_incoming_roi`でinstant。予算拡大・animation用prefetch・新uploadは追加しない。park/mount/depositはcontext ownerを移すだけで、forkはInactive。batch leaseは実提出unitを保持し、effect退役後もin-flight textureを会計する。
+
+new inputの取消は保持incomingでflat-first完了し、そのreceipt採用後に一件の既存continuationをcommitする。品質更新を待たず、古い品質でも全頁の提示を保証する。設定OFFも同じ対象のflat完了を経て通常表示へ戻す。新targetのqualityを前targetへ混ぜない。close/context失効は既存退役。採用済みflatのeffect reservationを解除し、batchが消えるまで実resident会計を続ける。
+
+### 22.4 回帰と確認
+
+resident Static／thumbnail／incomplete finalのaccept→通常draw→curl開始、thumb replacementのDirect保持、品質publicationとinput epoch更新中のcurl維持、canonical flatまで同素材でその後通常upgrade、取消flat-first、実編集取消、無素材とfaithful gateの理由付きskipを検査する。accept前後のpending/upload queueを照合し新仕事なしを保証する。Single四方向とPairの低解像度素材goldenを追加し、full-sizeと同じmesh/spine、紙・陰影・影、文字の向きを比較する。golden目視はmotion品質・実GPU性能の受入れを代替しない。
+
+fmt、normal/portable check、focused、ui_snapshot、未起動確認後のnormal buildと手順は`target/A-1341-nonfinal-msg.txt`へ記録する。独立完了レビューと実機開始率／GPU性能の受入れは未了。

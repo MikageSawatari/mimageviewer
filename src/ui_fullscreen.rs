@@ -10041,6 +10041,12 @@ impl App {
         idx: usize,
         texture: egui::TextureHandle,
     ) -> crate::gpu_lanczos::FullscreenPaintResource {
+        if let Some(resource) = self
+            .page_turn_held_resource(idx)
+            .filter(|resource| resource.source_texture_id() == texture.id())
+        {
+            return resource;
+        }
         let is_thumbnail = self.thumbnails.get(idx).is_some_and(|thumbnail| {
             matches!(thumbnail, ThumbnailState::Loaded { tex, .. } if tex.id() == texture.id())
         });
@@ -11233,10 +11239,16 @@ impl App {
         idx: usize,
         original_preview_active: bool,
     ) -> Option<egui::TextureHandle> {
-        let texture =
-            self.resolve_fs_processed_texture_from_caches(ctx, idx, original_preview_active)?;
-        self.display_texture_matches_page(&texture, idx)
-            .then_some(texture)
+        // Keep ordinary production/polling running. Only presentation is frozen.
+        let ordinary = self
+            .resolve_fs_processed_texture_from_caches(ctx, idx, original_preview_active)
+            .filter(|texture| self.display_texture_matches_page(texture, idx));
+        if self.fs_display_bypasses_final_pipeline(original_preview_active) {
+            return ordinary;
+        }
+        self.page_turn_held_resource(idx)
+            .map(|resource| resource.source_texture().clone())
+            .or(ordinary)
     }
 
     fn resolve_fs_processed_texture_from_caches(
@@ -11815,6 +11827,12 @@ impl App {
         let bypasses_final_pipeline =
             self.fs_display_bypasses_final_pipeline(original_preview_active);
         let materialized_ready = target_pages.iter().all(|idx| {
+            // An ON-origin offer already owns a displayable, identity-bound
+            // source. Do not hide its thumbnail/preview behind the decode-wait
+            // holdover; completion still requires its adopted canonical flat.
+            if self.page_turn_held_resource(*idx).is_some() {
+                return true;
+            }
             if let Some(ready) = self.raw_navigation_display_ready(*idx, original_preview_active) {
                 return ready;
             }
@@ -27301,20 +27319,28 @@ impl App {
                     )
                 }))
             || pending.sources.pages.iter().any(|page| {
-                let generation_matches = match page.resource.source_generation() {
-                    Some(generation) => {
-                        generation.items == self.items_generation
-                            && generation.input
-                                == self.input_generation.get(&page.idx()).copied().unwrap_or(0)
-                    }
-                    // Legacy Direct thumbnails/animations have no producer generation.
-                    // Their owning source resolver below still checks the current identity.
-                    None => matches!(&page.resource, FullscreenPaintResource::Direct { .. }),
-                };
+                let held = matches!(pending.source_policy, FsSubmittedSourcePolicy::Normal)
+                    .then(|| self.page_turn_held_resource(page.idx()))
+                    .flatten()
+                    .filter(|resource| {
+                        resource.source_texture_id() == page.resource.source_texture_id()
+                            && resource.source_generation() == page.resource.source_generation()
+                    });
+                let generation_matches = held.is_some()
+                    || match page.resource.source_generation() {
+                        Some(generation) => {
+                            generation.items == self.items_generation
+                                && generation.input
+                                    == self.input_generation.get(&page.idx()).copied().unwrap_or(0)
+                        }
+                        // Legacy Direct thumbnails/animations have no producer generation.
+                        // Their owning source resolver below still checks the current identity.
+                        None => matches!(&page.resource, FullscreenPaintResource::Direct { .. }),
+                    };
                 let current_source = match pending.source_policy {
-                    FsSubmittedSourcePolicy::Normal => {
-                        self.resolve_fs_display_tex(page.idx(), true)
-                    }
+                    FsSubmittedSourcePolicy::Normal => held
+                        .map(|resource| resource.source_texture().clone())
+                        .or_else(|| self.resolve_fs_display_tex(page.idx(), true)),
                     FsSubmittedSourcePolicy::Original => self
                         .resolve_original_preview_tex(page.idx())
                         .or_else(|| self.fs_thumbnail_texture_for_display(page.idx())),
@@ -38566,8 +38592,6 @@ impl App {
             if matches!(layout_source, FsPageLayoutSource::CurrentItem) {
                 self.observe_raw_presentation(page_idx);
             }
-            let img_rect = transform.full_image_rect;
-            let total_scale = transform.total_scale;
             let needs_clip = zoom_pan.is_some()
                 || free_rotation_rad.abs() > TRANSFORM_EPSILON
                 || fit_bbox.is_some()
@@ -38612,6 +38636,14 @@ impl App {
                     && using_full_texture
                     && matches!(layout_source, FsPageLayoutSource::CurrentItem),
             };
+            let page = if submitted.is_some() {
+                self.page_turn_bind_prepared(page)
+            } else {
+                page
+            };
+            let transform = page.transform;
+            let img_rect = transform.full_image_rect;
+            let total_scale = transform.total_scale;
             if let Some(submitted) = submitted {
                 submitted.pages.clear();
                 submitted.pages.push(FsNavigatorTextureSource {
@@ -43778,6 +43810,9 @@ impl App {
                         && self.settings.page_turn_animation_enabled
                         && self.page_turn_view_eligible(idx);
                     page.spine = Some(spread_rects.spine);
+                    if submit_final {
+                        page = self.page_turn_bind_prepared(page);
+                    }
                     self.fullscreen_page_layout
                         .push_occurrence(page.transform, page.occurrence);
                     prepared_pages[usize::from(idx == right_idx)] = Some(page);
@@ -84354,7 +84389,7 @@ pub(crate) mod page_turn_submission_tests {
         }
     }
     #[test]
-    fn paged_cold_raw_spread_still_materializes_normal_source_without_curl() {
+    fn paged_resident_raw_spread_animates_while_normal_pipeline_materializes() {
         let ctx = egui::Context::default();
         page_turn::install(&ctx);
         let mut app = ready_app(&ctx, SpreadMode::Ltr);
@@ -84384,8 +84419,8 @@ pub(crate) mod page_turn_submission_tests {
                 panic!("ordinary target needs real proof")
             };
             assert!(
-                !receipt.curl,
-                "cold raw source is not an already-ready normal unit"
+                receipt.curl,
+                "resident raw pages are immediately displayable even before final materialization"
             );
             assert_eq!(receipt.pages().len(), 2);
             assert_eq!(composition.pages_in_reading_order().len(), 2);
@@ -84394,7 +84429,7 @@ pub(crate) mod page_turn_submission_tests {
                     .pages
                     .iter()
                     .zip(raw)
-                    .all(|(page, raw)| page.resource.source_texture_id() != raw)
+                    .all(|(page, raw)| page.resource.source_texture_id() == raw)
             );
             assert!(app.current_final_composite_is_complete(2));
             assert!(app.current_final_composite_is_complete(3));

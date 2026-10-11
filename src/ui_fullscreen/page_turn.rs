@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 mod barrier;
 #[cfg(test)]
 mod input_regression_tests;
+#[cfg(test)]
+mod nonfinal_tests;
 use barrier::{FlatCompletion, ResolvedPageTurnNavigation};
 
 static NEXT_OPERATION_BATCH: AtomicU64 = AtomicU64::new(1);
@@ -610,6 +612,38 @@ struct PaintedUnit {
     white: Option<(egui::Rect, egui::Rect)>,
     reserved_bytes: Arc<AtomicU64>,
     evidence: AcceptanceEvidence,
+    content: Vec<PageTurnContent>,
+}
+
+/// Quality publication changes source_gen, not the document edits or viewing policy.
+#[derive(Clone, PartialEq)]
+struct PageTurnContent {
+    edit: crate::app::EditResultKey,
+    params: crate::adjustment::AdjustParams,
+    comic_generation: u64,
+    gap: u32,
+}
+
+#[derive(Clone)]
+struct AcceptedSource {
+    occurrence: SpreadPageOccurrence,
+    resource: crate::gpu_lanczos::FullscreenPaintResource,
+    quality: &'static str,
+    content: PageTurnContent,
+}
+
+struct AcceptedSources(Vec<AcceptedSource>);
+
+impl AcceptedSources {
+    fn account(&self, accountant: &mut crate::vram_budget::VramAccountant) {
+        for source in &self.0 {
+            accountant.add_texture(
+                crate::vram_budget::VramSubsystem::PageTurnPresentation,
+                source.resource.source_texture(),
+                true,
+            );
+        }
+    }
 }
 
 impl PaintedUnit {
@@ -676,6 +710,24 @@ impl PaintedUnit {
     }
 }
 
+fn same_fit_policy(a: FullscreenFitInput, b: FullscreenFitInput) -> bool {
+    match (a, b) {
+        (
+            FullscreenFitInput::SpecifiedScale {
+                size: a,
+                max_tenths: am,
+                ..
+            },
+            FullscreenFitInput::SpecifiedScale {
+                size: b,
+                max_tenths: bm,
+                ..
+            },
+        ) => a == b && am == bm,
+        _ => a.mode() == b.mode(),
+    }
+}
+
 fn same_underlay(a: &FsBgStyle, b: &FsBgStyle) -> bool {
     match (a, b) {
         (FsBgStyle::Solid(a), FsBgStyle::Solid(b)) => a == b,
@@ -688,6 +740,7 @@ fn same_underlay(a: &FsBgStyle, b: &FsBgStyle) -> bool {
 #[derive(Default)]
 pub(crate) struct PageTurnLeaseInventory {
     units: Vec<Weak<PaintedUnit>>,
+    sources: Vec<Weak<AcceptedSources>>,
 }
 
 impl PageTurnLeaseInventory {
@@ -702,6 +755,9 @@ impl PageTurnLeaseInventory {
         for unit in self.units.iter().filter_map(Weak::upgrade) {
             unit.account(accountant);
         }
+        for sources in self.sources.iter().filter_map(Weak::upgrade) {
+            sources.account(accountant);
+        }
     }
     fn reserved_bytes(&self) -> u64 {
         let mut accountant = crate::vram_budget::VramAccountant::default();
@@ -714,6 +770,9 @@ impl PageTurnLeaseInventory {
                 unit.account(accountant);
             }
         }
+        for sources in self.sources.iter().filter_map(Weak::upgrade) {
+            sources.account(accountant);
+        }
     }
     fn reservation_bytes_with(&self, unit: &PaintedUnit) -> u64 {
         let mut accountant = crate::vram_budget::VramAccountant::default();
@@ -725,11 +784,7 @@ impl PageTurnLeaseInventory {
 
 struct AcceptedOffer {
     fact: ViewerOperationFact,
-    ready_sources: Vec<(
-        SpreadPageOccurrence,
-        egui::TextureId,
-        crate::gpu_lanczos::FullscreenPaintSourceGeneration,
-    )>,
+    ready_sources: Arc<AcceptedSources>,
     resident_bytes: u64,
     pin_bytes: u64,
     accepted_at: Instant,
@@ -1228,11 +1283,6 @@ impl App {
             && self.reading_flow.is_paged()
             && !self.fs_entry_is_animated(page_idx)
             && !self.is_panorama_mode_active(page_idx)
-            && (!self.is_raw_page(page_idx)
-                || matches!(
-                    self.fs_cache.get(&page_idx),
-                    Some(FsCacheEntry::Static { .. })
-                ))
             && !self.is_overlay_edit_mode_active()
             && !self.analysis_mode
             && !self.adjustment_mode.is_open()
@@ -1343,39 +1393,183 @@ impl App {
         emit(&fact, "skip", reason, &[("sub_check", sub_check.into())]);
     }
 
-    /// Only resident complete normal output is an opportunity. This never runs
-    /// producers, metadata I/O, or the raw/preview/thumbnail fallback chain.
-    fn page_turn_normal_ready_texture(&self, idx: usize) -> Option<egui::TextureHandle> {
+    fn page_turn_content(&self, idx: usize) -> PageTurnContent {
+        let mut edit = self.current_edit_result_key(idx);
+        // PDF/RAW/AI quality publication may replace the source raster. Edits,
+        // item identity, effective adjustments and comic content stay binding.
+        edit.source_gen = 0;
+        PageTurnContent {
+            edit,
+            params: self.effective_params(idx).clone(),
+            comic_generation: self.comic_generation,
+            gap: self.settings.spread_page_gap_px,
+        }
+    }
+
+    /// Resident-only counterpart of ordinary processed + fallback selection.
+    /// Incomplete final output is displayable; this never invokes a producer.
+    fn page_turn_resident_source(&self, idx: usize) -> Option<(egui::TextureHandle, &'static str)> {
         let edit_key = self.current_edit_result_key(idx);
-        let (_, final_entry) = self.final_composite_cache.iter().find(|(key, entry)| {
-            key.edit_key == edit_key
-                && entry.complete
-                && **key
-                    == self.final_composite_key_for_pixels(
-                        edit_key,
-                        entry.source_size,
-                        self.effective_params(idx),
-                    )
-        })?;
-        // Unknown annotation metadata cannot prove what ordinary preparation
-        // will select; leave its existing loading/production path untouched.
-        let key = self.page_path_key(idx)?;
-        let objects = self.comic_docs.get(&key)?;
-        let texture = if !objects.is_empty() || self.comic_demo_enabled {
-            let entry = self.comic_cache.get(&idx)?;
-            if entry.comic_gen != self.comic_generation
-                || entry.preview_scale != 1
-                || entry.dims != final_entry.pixels.size
-                || !Arc::ptr_eq(&entry.base, &final_entry.pixels)
-            {
-                return None;
+        let final_entry = self
+            .final_composite_cache
+            .iter()
+            .find(|(key, entry)| {
+                key.edit_key == edit_key
+                    && **key
+                        == self.final_composite_key_for_pixels(
+                            edit_key,
+                            entry.source_size,
+                            self.effective_params(idx),
+                        )
+            })
+            .map(|(_, entry)| entry);
+        let selected = if self.raw_development_blocked(idx) {
+            self.resolve_original_preview_tex(idx)
+                .map(|t| (t, "preview"))
+        } else if let Some(entry) = final_entry {
+            let comic = self.comic_cache.get(&idx).filter(|comic| {
+                comic.comic_gen == self.comic_generation
+                    && comic.preview_scale == 1
+                    && comic.dims == entry.pixels.size
+                    && Arc::ptr_eq(&comic.base, &entry.pixels)
+            });
+            if let Some(comic) = comic {
+                Some((comic.texture.clone(), "comic"))
+            } else {
+                Some((
+                    entry.texture.clone(),
+                    if entry.complete {
+                        "final"
+                    } else {
+                        "provisional"
+                    },
+                ))
             }
-            entry.texture.clone()
+        } else if self.colorize_display_requires_final_effect(idx) {
+            // Ordinary waiting display also uses a faithful catalog rendition.
+            // Never create the rendition at acceptance.
+            self.cached_passthrough_rendition(idx)
+                .map(|t| (t, "faithful_preview"))
         } else {
-            final_entry.texture.clone()
+            self.resolve_original_preview_tex(idx)
+                .map(|t| {
+                    let quality = if matches!(
+                        self.fs_cache.get(&idx),
+                        Some(FsCacheEntry::RawPreview { .. })
+                    ) {
+                        "preview"
+                    } else {
+                        "normal"
+                    };
+                    (t, quality)
+                })
+                .or_else(|| {
+                    self.fs_thumbnail_texture_for_display(idx)
+                        .map(|t| (t, "thumbnail"))
+                })
+        }?;
+        self.display_texture_matches_page(&selected.0, idx)
+            .then_some(selected)
+    }
+
+    #[cfg(test)]
+    fn page_turn_normal_ready_texture(&self, idx: usize) -> Option<egui::TextureHandle> {
+        self.page_turn_resident_source(idx)
+            .map(|(texture, _)| texture)
+    }
+
+    /// The immutable accepted source owns the turn until its canonical flat is
+    /// adopted. Ordinary producers still run; their upgrades become visible next.
+    pub(super) fn page_turn_held_resource(
+        &self,
+        idx: usize,
+    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
+        if self.settings.page_turn_animation_enabled && !self.page_turn_view_eligible(idx) {
+            return None;
+        }
+        if !self.settings.page_turn_animation_enabled
+            && !matches!(
+                self.page_turn_presentation.state,
+                PresentationState::Completing { .. }
+            )
+        {
+            return None;
+        }
+        match &self.page_turn_presentation.state {
+            PresentationState::Offered { offer, .. }
+                if offer.fact.destination == self.page_turn_destination() =>
+            {
+                offer
+                    .ready_sources
+                    .0
+                    .iter()
+                    .find(|source| {
+                        source.occurrence.idx == idx
+                            && source.content == self.page_turn_content(idx)
+                    })
+                    .map(|source| source.resource.clone())
+            }
+            PresentationState::Turning { incoming, .. }
+            | PresentationState::Completing { incoming, .. }
+                if incoming.destination == self.page_turn_destination()
+                    && incoming.items == self.items_generation
+                    && incoming.mode == self.spread_mode
+                    && incoming.slice == self.fullscreen_page_slice
+                    && Arc::ptr_eq(&incoming.layout, &self.spread_display_units_cache.units) =>
+            {
+                incoming
+                    .pages
+                    .iter()
+                    .zip(&incoming.content)
+                    .find(|(page, content)| {
+                        page.occurrence.idx == idx && **content == self.page_turn_content(idx)
+                    })
+                    .map(|(page, _)| page.resource.clone())
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn page_turn_bind_prepared(&self, page: PreparedPagedPage) -> PreparedPagedPage {
+        if self.settings.page_turn_animation_enabled && !page.live {
+            return page;
+        }
+        let incoming = match &self.page_turn_presentation.state {
+            PresentationState::Turning { incoming, .. }
+            | PresentationState::Completing { incoming, .. } => incoming,
+            _ => return page,
         };
-        self.display_texture_matches_page(&texture, idx)
-            .then_some(texture)
+        if self.page_turn_held_resource(page.occurrence.idx).is_none() {
+            return page;
+        }
+        let Some(old) = incoming
+            .pages
+            .iter()
+            .find(|old| old.occurrence == page.occurrence)
+        else {
+            return page;
+        };
+        let a = &old.transform;
+        let b = &page.transform;
+        // Only raster quality/layout metadata may change during the frozen turn.
+        // A real viewport/view change remains ordinary cancellation/rebinding.
+        if a.viewport_rect != b.viewport_rect
+            || a.pixels_per_point != b.pixels_per_point
+            || a.rotation != b.rotation
+            || a.free_rotation_rad != b.free_rotation_rad
+            || a.content_bbox != b.content_bbox
+            || a.fit_mode != b.fit_mode
+            || a.fit_scale_limits != b.fit_scale_limits
+            || old.painter.clip_rect() != page.painter.clip_rect()
+            || !same_underlay(&old.underlay, &page.underlay)
+            || !same_fit_policy(a.fit_input, b.fit_input)
+        {
+            return page;
+        }
+        PreparedPagedPage {
+            painter: page.painter,
+            ..old.clone()
+        }
     }
 
     /// Called only at accepted Sequential navigation, before opening/mutating the target.
@@ -1475,23 +1669,35 @@ impl App {
                 emit(&fact, "skip", "ineligible_companion", &[]);
                 return;
             }
-            let Some(texture) = self.page_turn_normal_ready_texture(occurrence.idx) else {
-                emit(&fact, "skip", "not_final_ready_at_accept", &[]);
+            let Some((texture, quality)) = self.page_turn_resident_source(occurrence.idx) else {
+                emit(
+                    &fact,
+                    "skip",
+                    "no_displayable_source_at_accept",
+                    &[
+                        ("idx", occurrence.idx.into()),
+                        (
+                            "sub_check",
+                            if self.colorize_display_requires_final_effect(occurrence.idx) {
+                                "faithful_effect_not_resident"
+                            } else {
+                                "no_resident_texture"
+                            }
+                            .into(),
+                        ),
+                    ],
+                );
                 return;
             };
-            ready_sources.push((
+            let resource = self.fullscreen_paint_resource_for_texture(occurrence.idx, texture);
+            ready_sources.push(AcceptedSource {
                 occurrence,
-                texture.id(),
-                crate::gpu_lanczos::FullscreenPaintSourceGeneration {
-                    items: self.items_generation,
-                    input: self
-                        .input_generation
-                        .get(&occurrence.idx)
-                        .copied()
-                        .unwrap_or(0),
-                },
-            ));
+                resource,
+                quality,
+                content: self.page_turn_content(occurrence.idx),
+            });
         }
+        let ready_sources = Arc::new(AcceptedSources(ready_sources));
         emit(
             &fact,
             "opportunity",
@@ -1523,7 +1729,13 @@ impl App {
         let bytes = outgoing.retained_bytes();
         let budget = self.vram_pool_budget();
         let resident_bytes = self.vram_accounting_snapshot().total_bytes();
-        let pin_bytes = self.page_turn_leases.reservation_bytes_with(&outgoing);
+        let pin_bytes = {
+            let mut accountant = crate::vram_budget::VramAccountant::default();
+            self.page_turn_leases.account_reserved(&mut accountant);
+            outgoing.account(&mut accountant);
+            ready_sources.account(&mut accountant);
+            accountant.finish().total_bytes()
+        };
         let limit = budget
             .fullscreen_bytes
             .map_or(128 * 1024 * 1024, |b| (b / 10).min(128 * 1024 * 1024));
@@ -1556,6 +1768,12 @@ impl App {
             return;
         }
         outgoing.reserved_bytes.store(bytes, Ordering::Relaxed);
+        self.page_turn_leases
+            .sources
+            .retain(|sources| sources.strong_count() != 0);
+        self.page_turn_leases
+            .sources
+            .push(Arc::downgrade(&ready_sources));
         emit(
             &fact,
             "offered",
@@ -1565,6 +1783,7 @@ impl App {
                 ("resident_bytes", resident_bytes.into()),
                 ("pin_bytes", pin_bytes.into()),
                 ("pin_limit_bytes", limit.into()),
+                ("accepted_quality", serde_json::json!(ready_sources.0.iter().map(|s| serde_json::json!({"idx":s.occurrence.idx,"quality":s.quality,"size":s.resource.size()})).collect::<Vec<_>>())),
             ],
         );
         self.page_turn_presentation.state = PresentationState::Offered {
@@ -1651,6 +1870,10 @@ impl App {
             white,
             reserved_bytes: Arc::new(AtomicU64::new(0)),
             evidence: receipt.accepted.clone(),
+            content: pages
+                .iter()
+                .map(|p| self.page_turn_content(p.occurrence.idx))
+                .collect(),
         });
         let old = std::mem::replace(
             &mut self.page_turn_presentation.state,
@@ -1673,14 +1896,20 @@ impl App {
                         .iter()
                         .zip(&unit.pages)
                         .all(|(old, new)| old.occurrence.role == new.occurrence.role)
-                    && offer.ready_sources.len() == unit.pages.len()
-                    && offer.ready_sources.iter().zip(&unit.pages).all(
-                        |((o, id, generation), p)| {
-                            *o == p.occurrence
-                                && *id == p.resource.source_texture_id()
-                                && p.resource.source_generation() == Some(*generation)
-                        },
-                    );
+                    && offer.ready_sources.0.len() == unit.pages.len()
+                    && offer
+                        .ready_sources
+                        .0
+                        .iter()
+                        .zip(&unit.pages)
+                        .all(|(source, p)| {
+                            source.occurrence == p.occurrence
+                                && source.resource.source_texture_id()
+                                    == p.resource.source_texture_id()
+                                && source.resource.source_generation()
+                                    == p.resource.source_generation()
+                                && source.content == self.page_turn_content(p.occurrence.idx)
+                        });
                 let deadline_allows = !self.slideshow_playing
                     || slideshow_deadline_allows_turn(
                         offer.accepted_at,
@@ -1692,12 +1921,39 @@ impl App {
                     && now.saturating_duration_since(offer.accepted_at) < offer.duration
                 {
                     match prepare_leaf(&outgoing, &unit, offer.forward) {
-                        Ok(projection) => PresentationState::Turning {
-                            outgoing,
-                            incoming: unit.clone(),
-                            offer,
-                            projection,
-                        },
+                        Ok(projection) => {
+                            // Include the ordinary prepared native ROI as well as
+                            // the accepted source, globally deduplicated.
+                            let pin_bytes = self.page_turn_leases.reservation_bytes_with(&unit);
+                            let limit = self
+                                .vram_pool_budget()
+                                .fullscreen_bytes
+                                .map_or(128 * 1024 * 1024, |b| (b / 10).min(128 * 1024 * 1024));
+                            if pin_bytes > limit {
+                                offer.submission.end();
+                                emit(
+                                    &offer.fact,
+                                    "skip",
+                                    "pin_budget",
+                                    &[
+                                        ("sub_check", "prepared_incoming_roi".into()),
+                                        ("pin_bytes", pin_bytes.into()),
+                                        ("pin_limit_bytes", limit.into()),
+                                    ],
+                                );
+                                PresentationState::Flat(unit.clone())
+                            } else {
+                                unit.reserved_bytes
+                                    .store(unit.retained_bytes(), Ordering::Relaxed);
+                                self.page_turn_leases.register(&unit);
+                                PresentationState::Turning {
+                                    outgoing,
+                                    incoming: unit.clone(),
+                                    offer,
+                                    projection,
+                                }
+                            }
+                        }
                         Err(reason) => {
                             offer.submission.end();
                             emit_projection_failure(&offer, &outgoing, &unit, "skip", reason);
@@ -1725,7 +1981,7 @@ impl App {
                 offer,
                 projection,
             } => {
-                if incoming.same_material_and_geometry(&unit) {
+                if incoming.content == unit.content && incoming.same_material_and_geometry(&unit) {
                     PresentationState::Turning {
                         outgoing,
                         incoming,
@@ -1914,6 +2170,10 @@ impl App {
                     }
                 }
             } else {
+                // The completion owner retains the incoming pin until its flat
+                // receipt is adopted, including when another context offers.
+                unit.reserved_bytes
+                    .store(unit.retained_bytes(), Ordering::Relaxed);
                 submission_event = Some(SubmissionEvent {
                     tracker: offer.submission.clone(),
                     fact: offer.fact,
@@ -1936,6 +2196,9 @@ impl App {
                     continuation: None,
                     diagnostics: CompletionDiagnostics::from_offer(offer),
                 };
+                // The next owning frame adopts this flat and releases the
+                // presentation freeze, even if the upgrade already arrived.
+                ctx.request_repaint();
             }
         }
         if !curl {
@@ -2222,7 +2485,7 @@ fn unit_diagnostics(unit: &PaintedUnit, offer: &AcceptedOffer) -> serde_json::Va
         "items_generation":unit.items,
         "resident_bytes_at_accept":offer.resident_bytes,
         "global_pin_bytes_at_accept":offer.pin_bytes,
-        "expected_sources":offer.ready_sources.iter().map(|(o,id,g)|serde_json::json!({"idx":o.idx,"source_texture_id":format!("{id:?}"),"source_generation":{"items":g.items,"input":g.input}})).collect::<Vec<_>>(),
+        "expected_sources":offer.ready_sources.0.iter().map(|s|serde_json::json!({"idx":s.occurrence.idx,"source_texture_id":format!("{:?}",s.resource.source_texture_id()),"quality":s.quality,"source_generation":s.resource.source_generation().map(|g|serde_json::json!({"items":g.items,"input":g.input}))})).collect::<Vec<_>>(),
         "reading_rtl":unit.reading_rtl,
         "forward":offer.forward,
         "duration_ms":offer.duration.as_millis() as u64,
@@ -2485,6 +2748,7 @@ mod tests {
             white: None,
             reserved_bytes: Arc::new(AtomicU64::new(0)),
             evidence: AcceptanceEvidence::Immediate,
+            content: Vec::new(),
         })
     }
 
@@ -2817,7 +3081,7 @@ mod tests {
             outgoing: outgoing.clone(),
             offer: AcceptedOffer {
                 fact: fact(1),
-                ready_sources: Vec::new(),
+                ready_sources: Arc::new(AcceptedSources(Vec::new())),
                 resident_bytes: bytes,
                 pin_bytes: bytes,
                 accepted_at: Instant::now(),
@@ -2906,7 +3170,7 @@ mod tests {
         }
     }
     #[test]
-    fn raw_cache_is_not_final_ready_and_offer_never_starts_processing() {
+    fn raw_cache_is_displayable_and_offer_never_starts_processing() {
         let ctx = egui::Context::default();
         let mut app = crate::app::setup_app_for_test();
         app.items = vec![GridItem::Image(std::path::PathBuf::from(
@@ -2929,7 +3193,7 @@ mod tests {
             },
         );
         assert!(app.resolve_fs_display_tex(0, false).is_some());
-        assert!(app.page_turn_normal_ready_texture(0).is_none());
+        assert!(app.page_turn_normal_ready_texture(0).is_some());
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             app.page_turn_external_operation(
                 ctx,
@@ -3046,7 +3310,7 @@ mod tests {
                 incoming: incoming.clone(),
                 offer: AcceptedOffer {
                     fact: old_fact,
-                    ready_sources: Vec::new(),
+                    ready_sources: Arc::new(AcceptedSources(Vec::new())),
                     resident_bytes: 0,
                     pin_bytes: 0,
                     accepted_at: Instant::now(),

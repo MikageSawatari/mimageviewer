@@ -34,8 +34,10 @@ skipは`sub_check`と両unitのpaint/clip/viewport/ppp/ROIをperf有効時だけ
 実機ログと既存goldenは既にこの向きで、新goldenは固定端を明示する。終端RTLの背座標診断だけを訂正し、未再現の見え方を修正済みとは扱わない。
 子viewportで捕捉しcallback外ROOTで受理するnavigationは、明示operation IDと現在destinationを照合して元factを保持する。
 ambient frame stampは既存fieldの(ViewportId, frame_nr)で、viewportの違うcounterを比較して消さない。
-固定矢印／FsPageNext/Prevはtyped consumerのIDを直接渡す。Repeat・境界のinstant規則、設定OFF、final-onlyは維持する。
+固定矢印／FsPageNext/Prevはtyped consumerのIDを直接渡す。Repeat・境界のinstant規則、設定OFFは維持する。final-onlyは2026-10-11利用者決定で撤回（page-turn plan §22）。
 根因・実機取消3件・回帰の詳細は[page-turn-animation-plan.md §21](page-turn-animation-plan.md)を正本とする。
+
+2026-10-11 resident readiness追補: acceptは現在keyのresident complete/incomplete final、対応comic、既存faithful rendition、通常元画像/RAW preview、許可thumbnailを品質順に選ぶ。acceptでproducer/I/O/uploadは呼ばない。incomingもtyped resourceとしてpin会計へ入り、thumbnailのDirect属性をcache失効後も保持する。通常producer/poll/prepareは継続し、turnとcanonical flatは最初の素材・geometryに固定する。source品質publicationのinput epoch更新はcancelしないが、item/edit/params/comic/view/context bindingの失効は維持する。実素材のIDでnavigator/receiptを作り、flat採用後は通常selectorへ戻る。§22を過去のfinal-only記録より優先する。
 
 ### 音声セルの代表画像 (§1.347、2026-10-08)
 
