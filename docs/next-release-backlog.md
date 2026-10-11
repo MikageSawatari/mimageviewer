@@ -241,7 +241,7 @@
 
 ### 1.341 ページめくりのアニメーションを追加する — mIV スレ >>520 (2026-10-07)
 - **2026-10-11 利用者決定: 次の次の版へ回す（v4.5.0の次の版には入れない）**。A0（`next-viewer` / `532635fdd`〜`e3a328ff6`）は利用者のnormal profile実機評価で不合格。PDF scanの数px差で`page_placement_changed`となる、画像では黒い帯に見える、spread全体を一枚として動かすように見える、という評価を受けた。本のように一枚の頁を背から返す動きが必要（RTL forwardは旧左頁だけを右へ返す）。
-- **設計改訂（2026-10-11）**: R4 `afc474d8d`、R5 `c73f0d857`、R6 `29291d496`の独立設計レビューはREVISE。現在は[page-turn-animation-plan.md §18](page-turn-animation-plan.md)のR7案を作成し、再レビュー待ち・未実装。取消targetのcanonical flat採用を次navigationの条件とする保証、close→継続commit→fresh snapshot、異高さの外周連続clip、split最小対応は維持。R7はcommit後の描画owner/経路を再判定し、動画等へ変わったら旧canvas/footerを終了して既存media-switchへ引き継ぐ。新pending/waitや同viewport IDへの再入を作らず、F12 independent stillの既存動画拒否を維持する。splitは同source左右のみinstant、別source Half/FullはSingleWindow。全landscape N頁の候補は2N−1操作中N−1（大きい本で約50%）。実開始率・通常scanでfallbackが稀かは未実証。
+- **設計改訂（2026-10-11）**: R4 `afc474d8d`、R5 `c73f0d857`、R6 `29291d496`の独立設計レビューはREVISE、R7 `fa5119c19`はACCEPT。[page-turn-animation-plan.md §19](page-turn-animation-plan.md)のStage 1は実装・自動検証・normal確認用build済、利用者の実機motion評価待ち。通常単頁・Pair間の背回転、頁ごとの異寸法、紙・陰影・影を先に評価できる形へ接続した。取消targetのcanonical flat採用、close→継続commit→fresh snapshot、commit後の描画owner再判定を維持する。cover/中央単頁/横長splitはこの段階では理由付きinstant、継続操作もflat採用後instant。F12 independent stillの既存動画拒否を維持する。R7の別source Half/Full最小対応（全landscape N頁で2N−1操作中N−1が候補）は後続stage。Stage 1ではsplit候補率0%であり、通常scanの実開始率・motion品質・性能受入れは未了。
 - PC/F12限定・Remote不要、既定OFF、slideshow、Preferencesとfullscreen HUD overflowの同じ全体設定は維持。時間は実際の動きを見てから利用者が決めるため、100〜600ms・既定200msは引き続き仮設定。過去の自動検証成功はmotion品質の合格を意味しない。最終時間・実機/性能受入れは未了。
 - 旧予定（利用者2026-10-07）: 次版ラインE（3番目）。2026-10-11の延期決定で置換済み。他アプリでも対応が多いので実装したい、という要求は維持。
 

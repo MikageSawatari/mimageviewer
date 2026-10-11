@@ -16,6 +16,40 @@ const POSES: [f32; 5] = [0.0, 0.25, 0.5, 0.75, 1.0];
 const CELL_WIDTH: f32 = 224.0;
 const SIZE: egui::Vec2 = vec2(1144.0, 292.0);
 
+#[derive(Clone, Copy)]
+enum SceneGeometry {
+    Equal,
+    PortraitPdf,
+    UnequalScan,
+    TallerIncoming,
+    OpaqueBlack,
+    SpineEdge,
+}
+
+impl SceneGeometry {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Equal => "",
+            Self::PortraitPdf => "pdf_letterbox_",
+            Self::UnequalScan => "unequal_scan_",
+            Self::TallerIncoming => "height_continuity_",
+            Self::OpaqueBlack => "opaque_black_",
+            Self::SpineEdge => "spine_edge_",
+        }
+    }
+
+    fn poses(self) -> [f32; 5] {
+        match self {
+            // The first two cells deliberately expose a discontinuity that
+            // endpoint-only visual tests cannot find. The later cells show
+            // the growing outer footprint and the canonical destination.
+            Self::TallerIncoming => [0.0, 0.0001, 0.1, 0.25, 1.0],
+            Self::SpineEdge => [0.0, 0.425, 0.433, 0.44, 1.0],
+            _ => POSES,
+        }
+    }
+}
+
 struct SceneTextures {
     old: [TextureHandle; 2],
     new: [TextureHandle; 2],
@@ -80,7 +114,7 @@ fn page_image(letter: char, number: char, base: Color32) -> egui::ColorImage {
     image
 }
 
-fn load_textures(ctx: &egui::Context) -> SceneTextures {
+fn load_textures(ctx: &egui::Context, opaque: bool) -> SceneTextures {
     let mut checker = egui::ColorImage::filled([112, 168], Color32::WHITE);
     for y in 0..168 {
         for x in 0..112 {
@@ -92,11 +126,15 @@ fn load_textures(ctx: &egui::Context) -> SceneTextures {
         }
     }
     let page = |name: &str, letter, number, base| {
-        ctx.load_texture(
-            name,
-            page_image(letter, number, base),
-            TextureOptions::NEAREST,
-        )
+        let mut image = page_image(letter, number, base);
+        if opaque {
+            for pixel in &mut image.pixels {
+                if pixel.a() == 0 {
+                    *pixel = base;
+                }
+            }
+        }
+        ctx.load_texture(name, image, TextureOptions::NEAREST)
     };
     SceneTextures {
         old: [
@@ -148,6 +186,8 @@ fn units(textures: &SceneTextures, spread: bool, cell: Rect) -> (CanonicalUnit, 
     };
     let unit = |incoming| CanonicalUnit {
         pixels_per_point: 1.0,
+        spine_x: spread.then_some(cell.center().x),
+        gutter_width: if spread { 8.0 } else { 0.0 },
         layout: if spread {
             UnitLayout::Spread
         } else {
@@ -199,13 +239,18 @@ fn paint_canonical(painter: &egui::Painter, unit: &CanonicalUnit) {
 }
 
 fn snapshot_route(spread: bool, reading_rtl: bool, forward: bool) {
-    snapshot_scene(spread, reading_rtl, forward, false);
+    snapshot_scene(spread, reading_rtl, forward, SceneGeometry::Equal).unwrap();
 }
 
-fn snapshot_scene(spread: bool, reading_rtl: bool, forward: bool, portrait_pdf: bool) {
+fn snapshot_scene(
+    spread: bool,
+    reading_rtl: bool,
+    forward: bool,
+    geometry: SceneGeometry,
+) -> egui_kittest::SnapshotResults {
     let name = format!(
         "page_turn_projection_{}{}_{}_{}",
-        if portrait_pdf { "pdf_letterbox_" } else { "" },
+        geometry.name(),
         if spread { "spread" } else { "single" },
         if reading_rtl { "rtl" } else { "ltr" },
         if forward { "forward" } else { "back" }
@@ -218,30 +263,33 @@ fn snapshot_scene(spread: bool, reading_rtl: bool, forward: bool, portrait_pdf: 
     let mut harness = crate::test_ui::builder().with_size(SIZE).build(move |ctx| {
         if textures.is_none() {
             crate::ui_fonts::configure_fonts(ctx);
-            textures = Some(load_textures(ctx));
+            textures = Some(load_textures(ctx, matches!(geometry, SceneGeometry::OpaqueBlack)));
             ctx.request_repaint();
             return;
         }
         let painter = ctx.layer_painter(egui::LayerId::background());
-        painter.rect_filled(ctx.content_rect(), 0.0, Color32::from_rgb(29, 35, 46));
+        painter.rect_filled(ctx.content_rect(), 0.0,
+            if matches!(geometry, SceneGeometry::OpaqueBlack) { Color32::BLACK } else { Color32::from_rgb(29, 35, 46) });
         painter.text(pos2(12.0, 16.0), egui::Align2::LEFT_TOP,
             format!("{} / {} / {}   old=A1,B2  new=C3,D4  > reads right", if spread { "SPREAD" } else { "SINGLE" },
                 if reading_rtl { "RTL" } else { "LTR" }, if forward { "FORWARD" } else { "BACK" }),
             egui::FontId::monospace(14.0), Color32::WHITE);
-        for (index, progress) in POSES.into_iter().enumerate() {
+        for (index, progress) in geometry.poses().into_iter().enumerate() {
             let cell = Rect::from_min_size(pos2(12.0 + index as f32 * CELL_WIDTH, 48.0), vec2(CELL_WIDTH, 208.0));
-            if portrait_pdf {
+            if matches!(geometry, SceneGeometry::PortraitPdf) {
                 let viewport = Rect::from_min_size(pos2(cell.left(), 72.0), vec2(CELL_WIDTH, CELL_WIDTH * 9.0 / 16.0));
                 painter.rect_stroke(viewport, 0.0, egui::Stroke::new(1.0, Color32::from_gray(100)), egui::StrokeKind::Outside);
             }
-            painter.text(pos2(cell.center().x, 48.0), egui::Align2::CENTER_TOP, format!("{progress:.2}"),
+            painter.text(pos2(cell.center().x, if matches!(geometry, SceneGeometry::TallerIncoming) { 36.0 } else { 48.0 }), egui::Align2::CENTER_TOP, format!("{progress:.4}"),
                 egui::FontId::monospace(14.0), Color32::WHITE);
-            let (old, new) = if portrait_pdf {
+            let (old, mut new) = if matches!(geometry, SceneGeometry::PortraitPdf) {
                 let (mut old, mut new) = super::tests::portrait_pdf_fixture(spread);
                 let scale = CELL_WIDTH / 2560.0;
                 let origin = pos2(cell.left(), 72.0);
                 for (unit, incoming) in [(&mut old, false), (&mut new, true)] {
                     unit.pixels_per_point /= scale;
+                    unit.spine_x = unit.spine_x.map(|x| origin.x + x * scale);
+                    unit.gutter_width *= scale;
                     for (slot, page) in unit.pages.iter_mut().enumerate() {
                         let map = |r: Rect| Rect::from_min_max(origin + r.min.to_vec2() * scale, origin + r.max.to_vec2() * scale);
                         page.rect = map(page.rect);
@@ -254,6 +302,41 @@ fn snapshot_scene(spread: bool, reading_rtl: bool, forward: bool, portrait_pdf: 
             } else {
                 units(textures.as_ref().unwrap(), spread, cell)
             };
+            match geometry {
+                SceneGeometry::UnequalScan => {
+                    // Ordinary independently rounded scan fits: the two
+                    // pages keep their own dimensions and tiny offsets.
+                    new.pages[0].rect.min.x += 0.35;
+                    new.pages[0].rect.max.y -= 0.55;
+                    if spread {
+                        new.pages[1].rect.max.x -= 0.2;
+                        new.pages[1].rect.min.y += 0.4;
+                        new.spine_x = new.spine_x.map(|x| x + 0.15);
+                    }
+                }
+                SceneGeometry::TallerIncoming => {
+                    // Ratio 600→900 at a fixed spine/width, with the old
+                    // rect vertically centered in the incoming footprint.
+                    for page in &mut new.pages {
+                        let center = page.rect.center();
+                        page.rect = Rect::from_center_size(center, vec2(page.rect.width(), 184.0));
+                    }
+                }
+                SceneGeometry::Equal | SceneGeometry::PortraitPdf | SceneGeometry::OpaqueBlack | SceneGeometry::SpineEdge => {}
+            }
+            let mut old = old;
+            if matches!(geometry, SceneGeometry::TallerIncoming) {
+                for page in &mut old.pages {
+                    page.rect = Rect::from_center_size(page.rect.center(), vec2(page.rect.width(), 184.0 / 1.5));
+                }
+            }
+            if matches!(geometry, SceneGeometry::OpaqueBlack) {
+                for unit in [&mut old, &mut new] {
+                    for page in &mut unit.pages {
+                        page.underlay = None;
+                    }
+                }
+            }
             if index == 4 && endpoint_flag.load(Ordering::Relaxed) {
                 paint_canonical(&painter, &new);
             } else {
@@ -265,10 +348,16 @@ fn snapshot_scene(spread: bool, reading_rtl: bool, forward: bool, portrait_pdf: 
             }
         }
         painter.text(pos2(12.0, 270.0), egui::Align2::LEFT_TOP,
-            if portrait_pdf {
+            if matches!(geometry, SceneGeometry::PortraitPdf) {
                 "Portrait PDF fit in outlined 16:9 fullscreen; letterbox and real paint-grid gap. Last pose = canonical incoming."
+            } else if matches!(geometry, SceneGeometry::TallerIncoming) {
+                "Height 600 -> 900: p=0 and next clock pose; outer footprint grows continuously. Last = canonical incoming."
+            } else if matches!(geometry, SceneGeometry::SpineEdge) {
+                "Near 90 degrees: front -> thin paper edge -> printed back; the resting page never turns. Last = canonical incoming."
+            } else if matches!(geometry, SceneGeometry::OpaqueBlack) {
+                "Opaque printed pages on black: shading stays readable, with no background band used as paper. Last = canonical incoming."
             } else {
-                "Checker = transparent page underlay; dark spread gutter stays 8px. Last pose = canonical incoming."
+                "One leaf rotates at the spine; checker stays under transparent print. Last pose = canonical incoming."
             },
             egui::FontId::monospace(12.0), Color32::from_rgb(206, 216, 228));
     });
@@ -293,26 +382,80 @@ fn snapshot_scene(spread: bool, reading_rtl: bool, forward: bool, portrait_pdf: 
         projected == canonical,
         "finished projected endpoint must render exactly like canonical incoming: {name}"
     );
+    harness.take_snapshot_results()
 }
 
 #[test]
 fn page_turn_projection_snapshot_pdf_letterbox_single_ltr() {
-    snapshot_scene(false, false, true, true);
+    snapshot_scene(false, false, true, SceneGeometry::PortraitPdf).unwrap();
 }
 
 #[test]
 fn page_turn_projection_snapshot_pdf_letterbox_single_rtl() {
-    snapshot_scene(false, true, true, true);
+    snapshot_scene(false, true, true, SceneGeometry::PortraitPdf).unwrap();
 }
 
 #[test]
 fn page_turn_projection_snapshot_pdf_letterbox_spread_ltr() {
-    snapshot_scene(true, false, true, true);
+    snapshot_scene(true, false, true, SceneGeometry::PortraitPdf).unwrap();
 }
 
 #[test]
 fn page_turn_projection_snapshot_pdf_letterbox_spread_rtl() {
-    snapshot_scene(true, true, true, true);
+    snapshot_scene(true, true, true, SceneGeometry::PortraitPdf).unwrap();
+}
+
+#[test]
+fn page_turn_projection_snapshot_unequal_scans() {
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    for reading_rtl in [false, true] {
+        for forward in [false, true] {
+            snapshots.extend(snapshot_scene(
+                true,
+                reading_rtl,
+                forward,
+                SceneGeometry::UnequalScan,
+            ));
+        }
+    }
+    snapshots.unwrap();
+}
+
+#[test]
+fn page_turn_projection_snapshot_different_height_continuity() {
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    for spread in [false, true] {
+        for (reading_rtl, forward) in [(false, true), (true, false)] {
+            snapshots.extend(snapshot_scene(
+                spread,
+                reading_rtl,
+                forward,
+                SceneGeometry::TallerIncoming,
+            ));
+        }
+    }
+    snapshots.unwrap();
+}
+
+#[test]
+fn page_turn_projection_snapshot_opaque_black() {
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    snapshots.extend(snapshot_scene(true, true, true, SceneGeometry::OpaqueBlack));
+    snapshots.extend(snapshot_scene(
+        false,
+        false,
+        false,
+        SceneGeometry::OpaqueBlack,
+    ));
+    snapshots.unwrap();
+}
+
+#[test]
+fn page_turn_projection_snapshot_spine_edge() {
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    snapshots.extend(snapshot_scene(true, false, true, SceneGeometry::SpineEdge));
+    snapshots.extend(snapshot_scene(true, true, true, SceneGeometry::SpineEdge));
+    snapshots.unwrap();
 }
 
 macro_rules! route_test {

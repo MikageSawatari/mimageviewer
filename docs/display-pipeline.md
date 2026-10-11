@@ -2612,6 +2612,13 @@ raw source を選ぶ frame で元画像も無ければ `Awaiting` を維持す�
 一度だけ sample し、producer gate / readiness / draw が同じ値を共有する。ページ送りの物理レベルも
 `(frame_nr, viewport)` 単位で一度だけ sample し、元画像判定と page-turn burst 判定が共有する。
 
+§1.341のbook leaf（[page-turn-animation-plan.md §19](page-turn-animation-plan.md)）も、このnormal prepare/source選択を一回だけ使用する。
+leafのvisible receiptは一部のincoming頁がまだ裏にあるため、通常`page_turn_ready`/navigation sequenceの完了証拠にはしない。
+各頁の初出はpolygon可視面積で記録し、全実頁のcanonical flatがoutput hookで採用された後のowning frameで完了する。
+割込みでも同じflat採用を先に行い、close→継続commit→fresh drawing/input snapshotを共有する。
+normal layoutのH/gと各頁のprepared rect/UVをprojectionへ渡し、異寸法のscanを同じrectへ揃えない。
+効果専用decode/upload・UI thread I/Oを追加せず、設定OFFの通常flat経路は維持する。
+
 通過 rendition の外側の**ページ矩形**は、低解像度 texture の整数寸法ではなく source/header 寸法
 から求める。PDF は thumbnail / fullscreen の各 raster 寸法が別々に整数丸めされるため、PDFium が
 読む page box を `layout_width/layout_height` に 1/1000 point の固定小数点レイアウト寸法として

@@ -1,6 +1,6 @@
 # ページめくりアニメーション設計案 — backlog §1.341
 
-2026-10-11 / **R7設計案（§18、未実装・再レビュー/採択待ち）**。R3はACCEPT後に統合され、A0と追補もコミット済みだが、利用者の実機評価で動きは不合格となった。R4（§15、`afc474d8d`）・R5（§16、`c73f0d857`）・R6（§17、`29291d496`）の独立設計レビューはREVISE。R6のframe境界・外周連続性・split最小対応は再レビューで解消と伝達された。R7ではcontinuation commit後の描画owner/経路再判定と、媒体が変わった場合の旧canvas終了・既存media経路への引継ぎを補う。既定OFF・仮時間・final-only・F12所有・VRAM会計は維持する。§1〜17は履歴を含み、衝突箇所は§18を優先する。R7の独立レビュー・実装/実機/性能受入れは未了。利用者の2026-10-11決定で、リリースは次の次の版へ延期済み。
+2026-10-11 / **R7設計ACCEPT（`fa5119c19`、Stage 1自動検証・確認用build済、実機評価待ち・§19）**。採択済みR7に従い、まず通常単頁と二実頁Pairのleaf・陰影・per-page geometryを既存A0へ接続し、利用者のmotion評価用buildを作った。cover/中央単頁/split等の対応は後段に残す。R3統合後のA0は利用者の実機評価で不合格。R4 `afc474d8d`・R5 `c73f0d857`・R6 `29291d496`はREVISE、R7の独立設計レビューACCEPTは利用者から伝達された。§1〜17は履歴で、衝突箇所は§18、段階実装の範囲は§19を優先する。既定OFF・仮時間・final-only・F12所有・VRAM会計を維持。実装の独立完了レビュー・実機motion/性能受入れ・最終時間は未了。利用者の2026-10-11決定でリリースは次の次の版。
 
 R3設計時の参照treeは `next-prefs` / `1ee3e178288f2eff119da16b672d546cc3c9992c`（R2文書commit、開始時clean）。当時の製品コードはmaster `cb00930011323cacd7088ae70c37835141aad58a` と同じだった。
 既存の `file:line` は各設計/追補時のsource inspection位置。A0は§1.364統合後の`0f6ad9f19`を基点に具体化した（§12）。A0は`532635fdd`、golden補完は`e0f323d24`、HUDは`bf3b2fae0`、PDF追補は`ea5f6624a`、保存判断の来歴訂正は`e3a328ff6`でコミットされた。§15はこのHEADと利用者提示の実機結果を基点とする。既存の自動検証成功は動きの品質合格を意味しない。
@@ -1592,3 +1592,83 @@ R6-aのprojection/split/外周clipに変更はなく、R6-b/cへroute再判定�
 製品code/tests/golden/.git/dev-runtime/normal profileへ書き込まず、build/test/launchは行わない。
 既存媒体切替とF12/context境界を保つ構造変更として再レビューへ提出し、実装前の確認と実装時detached §11記録を継承する。
 今回未実施の独立合意・実装・実機・性能確認を記録しない。
+
+## 19. Stage 1 — 通常頁の実装と早期motion評価（2026-10-11）
+
+R7 `fa5119c19`は独立設計レビューACCEPT（利用者からの引継ぎ）。利用者指定により段階実装する。
+この節は実装範囲と検証証拠の台帳であり、製品差分の独立レビュー合格・実機motion品質の受入れを表さない。
+Stage 1の自動検証とnormal確認用buildは完了し、利用者によるmotion評価待ち。
+次の次の版へ延期、既定OFF、PC/F12限定、final-only readiness、仮時間100〜600ms/既定200ms、slideshow条件を維持する。
+
+### 19.1 今回の投影・素材・geometry
+
+通常Single→SingleはforwardのSingleDeparture、backwardのSingleArrival、通常Pair→PairはBookLeafを使う。
+reading directionは現在のnormal layoutの正本から捕捉し、RTL forwardは旧左頁だけ、LTR forwardは旧右頁だけを返す。
+Pairの裏面は新しい反対側頁、下頁は新しい同側頁、静止面は旧反対側頁。各素材は自身のnormal prepared rect/UV/clipを保つ。
+単頁の未知の紙面にはneutral paperを使い、黒い背景を頁裏として使わない。
+
+normal layoutが確定した背Hとgutterをprepared unitへ載せ、paintの丸め後rectから別の背を推測しない。
+60〜120度のsmoothstepでleafのH/寸法を移し、全trajectoryのslot clip/support lossが2%を越すgeometryは
+`spine_static_surface_loss_clip` / `spine_static_surface_loss_support`としてinstantにする。数pxのscan差を一致guardで退けない。
+新下頁の外周clipは旧rectから両rectの和へ同じ時計で連続拡張し、異高さの開始直後の跳ねを避ける。
+旧静止面の新canonical footprint外は最後10%で退役する。寸法入替えで大きく背が移動する反例は明示的quality fallback。
+
+leafはrational perspectiveの背回転で、表/裏UVのcanonical corner順を保持する。淡い紙面・紙端、leafの陰影gradient、
+receiver面にclipしたsoft shadowを同じmesh passへ提出する。16×4または32×8 gridを最初に選び、
+全trajectoryで0.5 physical pixel以下のaffine近似誤差を保証できなければ`perspective_mesh_error`で省略する。
+prepareはnormal pipelineの一回のみ、projection recipe/canonical unitsはoffer採用時に一回確定して再利用する。
+追加decode/upload/素材再解決はしない。元のsource generation/ROI確認、batch lease、VRAM dedup/accountingを維持する。
+
+### 19.2 この段階のinstant範囲と完了境界
+
+| 範囲 | Stage 1の扱い・perf理由 |
+| --- | --- |
+| 通常単頁、同寸法/異寸法Pair間、LTR/RTL・forward/backward | quality admissionとfinal-readyを満たす時にleaf |
+| cover境界・side single・supplement/白頁 | `stage1_cover_or_side_single` / `stage1_cover_or_single_companion` |
+| spreadのCenteredSingle | `stage1_centered_single` |
+| landscape split（同source/別source、Half/Fullとも） | `stage1_split_step`。このstageでは開始率0%、R7の最小対応は後続stage |
+| native動画/音声target | `stage1_media_target`、通常媒体navigationを維持 |
+| turn中の次navigation | 取消targetのcanonical flat採用後、`stage1_continuation_instant`で通常handlerへ一回commit |
+
+部分leaf receiptは頁ごとの初出だけを証明し、fs ready/navigation完了の証拠に使わない。
+incomingの各実頁は面積5%以上・connected short edge 8pt以上で`first_visible`を一回記録する。
+全実頁のcanonical flatのaccepted receiptが後のowning frameで確認されて初めて旧sequenceを完了する。
+割込みはcontext所有の`Completing { incoming, flat receipt, one resolved continuation }`へ移り、outgoing effect pinを退役する。
+終了入力→continuation commit→fresh page/composition/frame snapshotの共通境界をroot/F12で通す。
+媒体/描画経路が変われば旧callbackのcanvas/footerを終了し、既存media-switchへ戻す。新pending/wait/再帰renderは作らない。
+F12の既存動画拒否、normal context mount/deposit/fork、設定ownerと既存保存pathは変更しない。
+設定OFFはflat描画へ直行し、clock/geometry/lease inventory/入力診断を実行しない（既に開始済みturnのflat完了とその入力identityだけ保持）。
+未採用のflatは同じlogical target/sourceの最新normal prepared geometryへbindingを更新し、resize/fitで変わるnative出力IDを旧poseに固定しない。
+既に採用されたreceiptは保存して後のframeで通知する。source/configuration失効は通常navigation observerへ戻し、別targetのcontinuationを持ち越さない。
+key/wheel/touch/pad/slideshowの継続は実producerが解決したoperation IDを渡す。touch EndはStartのcontact/bindingを継承し、
+padは同期dispatch内だけのdestination/frame/ID witnessを既存egui temp ownerへ置き、return/unwindで元に戻す。
+一つのtyped intentで通常頁・spread shift・slideshowの着地を区別し、shift-anchorやAutoAdvance履歴を通常handlerの規則で採用する。
+
+### 19.3 R5-aの測定と検証
+
+可視性は四隅の凸silhouetteとpolygon clip/subtractionで求め、tessellationのtriangle列・bounding box面積を提示証拠にしない。
+同一poseの16×4/32×8 gridでreceiptが不変となる回帰を置く。perf有効時だけ時計を読む。
+`recipe_prepare_cpu_ms`、`silhouette_visibility_cpu_ms`、その内数`outer_mask_cpu_ms`、
+`tessellation_cpu_ms`、既存`mesh_cpu_ms`を分ける。skipには`sub_check`と旧/新のnormal geometry・H/gを載せ、
+loss guardには最大損失率・面・Hも記録する。frameの`unit.mesh`にはvertices/triangles/drawsと
+vertex/index payload bytesを載せる（renderer/driverの実GPU allocation量ではない）。
+cached recipeの300 pose測定を単頁・equal Pair・portrait PDF/scan Pairで行う。
+CPU 0.5ms/GPU 2msは仮予算のまま。headless/debug CPU測定や静止snapshotは実機GPU時間・motion品質の受入れを代用しない。
+
+2026-10-11のnormal Cargo test profile、単独test/thread（warmup 20、各300 pose、cached recipe）の限定測定:
+
+| fixture | silhouette/visibility p50 / p95 ms | outer mask p95 ms（内数） | tessellation p50 / p95 ms | 合計p95 ms |
+| --- | --- | --- | --- | --- |
+| SingleDeparture | 0.0074 / 0.0082 | 0.0007 | 0.0304 / 0.0335 | 0.0423 |
+| SingleArrival | 0.0075 / 0.0082 | 0.0010 | 0.0304 / 0.0320 | 0.0400 |
+| equal Pair | 0.0150 / 0.0165 | 0.0017 | 0.0355 / 0.0419 | 0.0579 |
+| portrait PDF/scan Pair | 0.0140 / 0.0200 | 0.0024 | 0.0688 / 0.0816 | 0.1078 |
+
+計算分離の成立性の証拠であり、初回recipe・normal prepare・perf JSON・renderer CPU/GPUを含む
+製品frameの予算合格ではない。ログは`target/A-1341-stage1-feasibility.log`。
+実報告の1153×1671→1151×1670と異寸法の相方を、非zero origin・16:9 letterbox・150% DPIへfitし、
+通常centeringで移動する背と頁rectを四方向の連続poseで検査する回帰も追加した。
+continuationのperfは元operation/contextにflat receipt frame、commit frame、commit前後のdrawing pathと変更有無を相関させる。
+
+自動検証結果・新goldenの目視確認・verification buildの証拠は本stageのhandoff
+`target/A-1341-stage1-msg.txt`へ記録する。実機での開始率（全navigation分母、split別集計）とmotion評価は利用者確認待ち。

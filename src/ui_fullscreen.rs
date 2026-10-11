@@ -8236,6 +8236,7 @@ impl AdjustScope {
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(not(test), allow(dead_code))]
 struct SpreadPageDrawRects {
+    spine: (f32, f32),
     left_rect: egui::Rect,
     left_hit_rect: egui::Rect,
     right_rect: egui::Rect,
@@ -9214,6 +9215,11 @@ fn layout_spread_page_rects(
     };
 
     SpreadPageDrawRects {
+        spine: (
+            (visible_start_x_px + scaled_left_visible_w * pixels_per_point + spread_gap_px * 0.5)
+                / pixels_per_point,
+            spread_gap_px / pixels_per_point,
+        ),
         left_rect,
         left_hit_rect,
         right_rect,
@@ -16363,6 +16369,20 @@ pub(crate) enum FsPageNav {
     Split(crate::page_split::PresentationStep),
 }
 
+pub(crate) struct FullscreenRootFrameInput {
+    context: egui::Context,
+    destination: PresentationDestination,
+}
+
+enum PageTurnFrameEntry {
+    Continue {
+        close_response: Option<BarButtonResponse>,
+        committed: bool,
+    },
+    ExitViewer,
+    DrawingPathChanged,
+}
+
 impl FsPageNav {
     pub(crate) fn is_none(self) -> bool {
         self == Self::None
@@ -23300,6 +23320,14 @@ impl App {
     }
 
     pub(crate) fn render_fullscreen_viewport(&mut self, ctx: &egui::Context) {
+        self.render_fullscreen_viewport_with_root_input(ctx, None);
+    }
+
+    pub(crate) fn render_fullscreen_viewport_with_root_input(
+        &mut self,
+        ctx: &egui::Context,
+        root_input: Option<FullscreenRootFrameInput>,
+    ) {
         let mut fs_render_perf = fs_render_perf_start_with(
             crate::perf::is_enabled(),
             std::time::Instant::now,
@@ -23326,46 +23354,6 @@ impl App {
         };
         mark_fs_render_perf(&mut fs_render_perf, FsRenderPerfStage::FrameStart);
 
-        self.harvest_page_dims();
-        if self.effective_fullscreen_fit_mode() == FullscreenFitMode::SpecifiedScale {
-            self.adopt_retained_pdf_page_metadata(fs_idx);
-        }
-        mark_fs_render_perf(&mut fs_render_perf, FsRenderPerfStage::HarvestPageDims);
-        self.reconcile_fullscreen_page_slice(fs_idx);
-        mark_fs_render_perf(
-            &mut fs_render_perf,
-            FsRenderPerfStage::ReconcileFullscreenPageSlice,
-        );
-
-        let mut page_turn_decision = self.fs_page_turn_decision_for_frame(ctx, fs_idx);
-        let stop_page_needs_load =
-            matches!(self.fs_page_load_state(fs_idx), FsPageLoadState::NeedsLoad);
-        mark_fs_render_perf(
-            &mut fs_render_perf,
-            FsRenderPerfStage::FsPageTurnDecisionForFrame,
-        );
-        if self
-            .ensure_fs_page_turn_target_load(page_turn_decision, fs_idx)
-            .is_some()
-        {
-            // A pass-through open intentionally did not start the full-resolution producer.
-            // Materialized paint re-asserts it here, including while the navigation sequence is
-            // still waiting for a rendition that may never arrive.
-            if stop_page_needs_load && self.reading_flow.is_paged() {
-                self.update_prefetch_window(fs_idx);
-            }
-        }
-        mark_fs_render_perf(
-            &mut fs_render_perf,
-            FsRenderPerfStage::PageTurnTargetLoadAndPrefetchWindow,
-        );
-
-        // ── pending の PDF 再レンダリング結果を取り込む ──
-        // show_viewport_immediate 内では &mut self が使えるので、
-        // メインの update() を待たずにここで直接 poll する。
-        self.poll_prefetch(ctx, PollPrefetchOrigin::FullscreenViewport);
-        mark_fs_render_perf(&mut fs_render_perf, FsRenderPerfStage::PollPrefetch);
-
         // ── 状態の事前計算 ──
         // 動画フルスクリーンの黒 backdrop は **presenter HWND が未確定の起動中だけ**
         // 出す純粋な「起動カバー」。fresh open で presenter が立ち上がるまでの黒画面を
@@ -23381,6 +23369,7 @@ impl App {
         if self.native_video_backdrop_target_for_fs(fs_idx)
             && !self.viewer_session_is_detached_or_switching()
         {
+            self.prepare_viewer_target_for_frame(ctx, fs_idx, &mut fs_render_perf);
             self.similar_panel.retain_book_query();
             let hwnd_ready = self.native_video_presenter_hwnd_for_fs(fs_idx).is_some();
             let startup_cover = matches!(self.viewer_presentation, ViewerPresentation::Fullscreen)
@@ -23402,55 +23391,16 @@ impl App {
         }
         mark_fs_render_perf(&mut fs_render_perf, FsRenderPerfStage::NativeVideoBackdrop);
 
-        self.advance_animation(ctx, fs_idx);
-        // Navigation topology and the role-aware visible composition come from the same cached
-        // unit token. The latter may add a non-navigation cover occurrence to the final unit.
-        let display_composition = self.spread_display_composition_for_anchor(fs_idx);
-        let spread_pair = display_composition.spread_pair(self.spread_mode);
-        if let Some(rebound_decision) = self
-            .revalidate_fs_page_turn_decision_for_display_composition(
-                ctx,
-                fs_idx,
-                &display_composition,
-            )
-        {
-            page_turn_decision = rebound_decision;
-        }
-        let is_spread_double = matches!(spread_pair, SpreadPair::Double { .. });
-        // 比較は単ページ表示だけが所有する。ページ移動や表示モード変更で見開きが
-        // 確定したフレームでは、比較用の準備・描画へ進む前に状態を終了する。
-        self.end_comparison_for_spread_mode_if_needed();
-        // 見開きパートナーの事前読み込み + アニメーション進行
-        if let SpreadPair::Double { left, right } = spread_pair {
-            let partner = if left == fs_idx { right } else { left };
-            self.advance_animation(ctx, partner);
-            if self
-                .ensure_fs_page_turn_target_load(page_turn_decision, partner)
-                .is_some()
-            {
-                self.refresh_fullscreen_pdf_promotion();
-            }
-        }
-        // in-window モード中は静止画を専用 viewport ではなくメインウィンドウの
-        // egui ctx に直接描画する (embedded)。本関数冒頭で動画は early-return
-        // 済みなので、ここに来る fs_idx は常に非動画。
         #[cfg(windows)]
         let embedded = self.fullscreen_embedded_still_active();
         #[cfg(not(windows))]
         let embedded = false;
 
-        // 隠蔽パネルは画像の後に描かれるため、パネル内で preview 状態を更新するだけでは
-        // 当該フレームの processed texture 解決に間に合わない。前フレームで確定した
-        // 目アイコン矩形と現在 pointer 状態から、必ずパイプライン解決前に同期する。
-        // `show_viewport_immediate` の子 viewport は独立した入力キューを持つため、
-        // 専用 fullscreen / detached では ROOT ではなく描画先の ViewportId を読む。
-        let preview_viewport_id = if embedded {
-            ctx.viewport_id()
-        } else {
-            self.fullscreen_viewport_id()
-        };
-        self.sync_conceal_preview_before_pipeline(ctx, preview_viewport_id);
-        let state = self.prepare_fullscreen_state(ctx, fs_idx, page_turn_decision);
+        let mut frame_snapshot: Option<(usize, bool)> = None;
+        let mut frame_path_changed = false;
+        let mut frame_exited = false;
+        let fs_state_is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
+            && !self.fs_music_view_active(fs_idx);
 
         let mut close_fs = false;
         let mut close_to_page_list = false;
@@ -23459,6 +23409,7 @@ impl App {
         let mut sibling_nav: Option<i32> = None;
         let mut mouse_nav: Option<crate::ui_main::AddressBarNav> = None;
         let mut jump_to: Option<usize> = None;
+        let mut navigation_operation: Option<ViewerOperationId> = None;
         // 境界ヒント即時消去のため、フレーム先頭の状態を捕捉する。
         // handle_fs_navigation 実行後に、ヒントが同じ start_time のまま残って
         // いれば「このフレームで再設定されていない」= 打ち切ってよい、と判定する。
@@ -23640,7 +23591,7 @@ impl App {
                 let _ = (detached_seed_placement, detached_builder_placement);
                 self.build_fullscreen_viewport_builder()
             }
-        } else if state.is_video && !self.fs_music_view_active(fs_idx) {
+        } else if fs_state_is_video && !self.fs_music_view_active(fs_idx) {
             self.build_fullscreen_viewport_builder()
         } else {
             // 音声ファイルおよび音声モードにトグルした動画 (Inc 7) は still/audio 側の viewport
@@ -23692,7 +23643,6 @@ impl App {
         let mut fs_vp_galleys = 0usize;
         let mut fs_vp_size = [0.0_f32; 2];
         let mut fs_vp_max_tex = 0usize;
-        let fs_state_is_video = state.is_video;
         // 動画は native presenter が独立 HWND に描画するので、egui 側 viewport は
         // 黒 backdrop のみ。ここで GPU 経路かどうかを区別する必要は無い。
         let fs_state_gpu_video = false;
@@ -23780,7 +23730,83 @@ impl App {
                     self.update_ime_state(ctx);
                     crate::touch_debug::log_egui_touch_events(ctx, self.frame_counter);
                 }
-                self.page_turn_pre_draw(ctx);
+                let entry = self.begin_page_turn_viewer_frame(ctx, embedded, root_input.as_ref());
+                let (mut frame_close_response, continuation_committed) = match entry {
+                    PageTurnFrameEntry::Continue {
+                        close_response,
+                        committed,
+                    } => (close_response, committed),
+                    PageTurnFrameEntry::ExitViewer => {
+                        frame_exited = true;
+                        return;
+                    }
+                    PageTurnFrameEntry::DrawingPathChanged => {
+                        frame_path_changed = true;
+                        return;
+                    }
+                };
+                let Some(input_idx) = self.fullscreen_idx else {
+                    frame_exited = true;
+                    return;
+                };
+                if let Some(root) = root_input.as_ref()
+                    && root.destination == self.page_turn_destination()
+                    && root.context.viewport_id() != ctx.viewport_id()
+                {
+                    let input_spread_double = matches!(
+                        self.spread_display_composition_for_anchor(input_idx)
+                            .spread_pair(self.spread_mode),
+                        SpreadPair::Double { .. }
+                    );
+                    let mut root_operation = None;
+                    let root_action = self.handle_fs_key_input_with_operation(
+                        &root.context,
+                        input_idx,
+                        input_spread_double,
+                        &mut root_operation,
+                    );
+                    self.handle_fs_navigation_with_operation(
+                        &root.context,
+                        root_action.close,
+                        root_action.close_to_page_list,
+                        root_action.ctrl_nav,
+                        root_action.sibling_nav,
+                        root_action.mouse_nav,
+                        if continuation_committed {
+                            FsPageNav::None
+                        } else {
+                            root_action.page_nav
+                        },
+                        if continuation_committed {
+                            None
+                        } else {
+                            root_action.jump_to
+                        },
+                        input_idx,
+                        root_operation,
+                    );
+                    #[cfg(windows)]
+                    if self
+                        .fullscreen_idx
+                        .is_some_and(|idx| self.native_video_backdrop_target_for_fs(idx))
+                        || self.fullscreen_embedded_still_active() != embedded
+                    {
+                        frame_path_changed = true;
+                        return;
+                    }
+                }
+                let Some(fs_idx) = self.fullscreen_idx else {
+                    frame_exited = true;
+                    return;
+                };
+                let (
+                    state,
+                    _page_turn_decision,
+                    display_composition,
+                    spread_pair,
+                    is_spread_double,
+                ) = self.prepare_paged_viewer_frame(ctx, fs_idx, embedded, &mut fs_render_perf);
+                frame_snapshot = Some((fs_idx, state.is_video));
                 #[cfg(windows)]
                 if !embedded {
                     let (outer_rect, pixels_per_point, minimized) = ctx.input(|i| {
@@ -23865,7 +23891,7 @@ impl App {
                     }
                 }
                 #[cfg(windows)]
-                if !embedded && !detached && !fs_state_is_video {
+                if !embedded && !detached && !state.is_video {
                     let (outer_rect, pixels_per_point, minimized) = ctx.input(|i| {
                         let vp = i.viewport();
                         (
@@ -24203,7 +24229,7 @@ impl App {
                                 keys
                             ));
                         }
-                        let key_action = self.handle_fs_key_input(ctx, fs_idx, is_spread_double);
+                        let key_action = self.handle_fs_key_input_with_operation(ctx, fs_idx, is_spread_double, &mut navigation_operation);
                         #[cfg(all(windows, feature = "test-script"))]
                         if !embedded {
                             crate::test_script::finish_action_pass(ctx);
@@ -24214,11 +24240,11 @@ impl App {
                         if key_action.close_to_page_list {
                             close_to_page_list = true;
                         }
-                        page_nav = key_action.page_nav;
+                        page_nav = if continuation_committed { FsPageNav::None } else { key_action.page_nav };
                         ctrl_nav = key_action.ctrl_nav;
                         sibling_nav = key_action.sibling_nav;
                         mouse_nav = key_action.mouse_nav;
-                        jump_to = key_action.jump_to;
+                        jump_to = if continuation_committed { None } else { key_action.jump_to };
                         // perf: キー起因のナビはここで input_seq を進める
                         if !page_nav.is_none() {
                             self.bump_input_seq("fs_key", Some(&format!("page_nav={page_nav:?}")));
@@ -24236,7 +24262,7 @@ impl App {
 
                         // ── ホイール & クリック ──
                         let mut similar_preview_navigator_input = None;
-                        let (wheel_nav, click_close) = self.handle_fs_wheel_and_click_with_geometry(
+                        let (wheel_nav, click_close) = self.handle_fs_wheel_and_click_with_geometry_and_operation(
                             ui,
                             ctx,
                             full_rect,
@@ -24246,8 +24272,9 @@ impl App {
                             prev_foreground_hwnd,
                             &mut similar_preview_navigator_input,
                             hud_popup_wheel.as_ref(),
+                            &mut navigation_operation,
                         );
-                        if !wheel_nav.is_none() {
+                        if !continuation_committed && !wheel_nav.is_none() {
                             page_nav = wheel_nav;
                         }
                         if click_close {
@@ -25162,7 +25189,10 @@ impl App {
                                 touch_chrome_latched,
                             )
                         {
-                            jump_to = Some(seek_target);
+                            if !continuation_committed {
+                                jump_to = Some(seek_target);
+                                navigation_operation = self.page_turn_pointer_navigation_operation(ctx, "drag").or_else(|| self.page_turn_pointer_navigation_operation(ctx, "pointer"));
+                            }
                         }
                         if !state.is_video {
                             let page_label_idx = self.fullscreen_idx.unwrap_or(fs_idx);
@@ -25406,6 +25436,7 @@ impl App {
                                 touch_chrome_latched,
                                 self.frame_counter,
                                 Some(&shift_view),
+                                frame_close_response.take(),
                             );
                             if top_bar_lock_pressed {
                                 self.settings.fullscreen_top_bar_locked =
@@ -25905,7 +25936,7 @@ impl App {
                 // in-window 静止画: メインウィンドウの egui ctx に直接描画する。
                 render_fs_body(main_ctx, true);
                 #[cfg(windows)]
-                if hide_viewport_after_embedded_paint {
+                if hide_viewport_after_embedded_paint && !frame_path_changed && !frame_exited {
                     // 先に main 側へ画像を描いてから古い専用 viewport を隠す。
                     // これで背面の一覧が DWM に露出する隙間を作らない。
                     self.hide_embedded_still_viewport_if_shown(main_ctx);
@@ -25930,6 +25961,18 @@ impl App {
             fs_body_ms = fs_body_t0.elapsed().as_secs_f64() * 1000.0;
             fs_body_cycles = Self::thread_cycles_now().saturating_sub(fs_body_cycles_t0);
         }
+        if frame_path_changed || frame_exited {
+            finish_fs_render_perf(
+                &mut fs_render_perf,
+                self.frame_counter,
+                self.input_seq,
+                self.fullscreen_idx,
+            );
+            return;
+        }
+        let Some((fs_idx, fs_state_is_video)) = frame_snapshot else {
+            return;
+        };
         #[cfg(windows)]
         if let Some(window_id) = active_render_window_id {
             self.register_detached_window_hwnd_after_show(
@@ -26118,6 +26161,7 @@ impl App {
             page_nav,
             jump_to,
             fs_idx,
+            navigation_operation,
             &mut fs_render_perf,
         );
         #[cfg(all(windows, feature = "test-script"))]
@@ -26137,7 +26181,7 @@ impl App {
             }
         }
         mark_fs_render_perf(&mut fs_render_perf, FsRenderPerfStage::FsBoundaryHint);
-        self.handle_fs_repaint(ctx, fs_idx, state.is_video);
+        self.handle_fs_repaint(ctx, fs_idx, fs_state_is_video);
         mark_fs_render_perf(&mut fs_render_perf, FsRenderPerfStage::HandleFsRepaint);
         mark_fs_render_perf(&mut fs_render_perf, FsRenderPerfStage::Tail);
         finish_fs_render_perf(
@@ -28777,6 +28821,55 @@ impl App {
         spread_offset_nudge_from_units(&nav, &units, fs_idx, dir, &landscape_flags)
     }
 
+    pub(crate) fn queue_spread_shift_action_for_frame(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        dir: i32,
+        action: &mut FsKeyAction,
+        operation: Option<ViewerOperationId>,
+    ) {
+        if !self.page_turn_barrier_active() {
+            self.queue_spread_shift_action(fs_idx, dir, action);
+            return;
+        }
+        if dir == 0 || !action.page_nav.is_none() || action.jump_to.is_some() {
+            return;
+        }
+        let rules = self.accepted_spread_shift_rules();
+        if let crate::spread_shift::PairingAdmission::Rejected(reason) =
+            crate::spread_shift::admit_pairing_action(
+                crate::spread_shift::PairingContextToken {
+                    rules: &rules,
+                    availability: self.spread_shift.availability,
+                },
+                crate::spread_shift::PairingAction::Nudge,
+            )
+        {
+            self.show_feedback_toast(reason.into());
+            return;
+        }
+        if self.spread_mode.is_spread() {
+            if let Some((target, anchor)) = self.compute_spread_offset_nudge(fs_idx, dir) {
+                self.page_turn_defer_spread_shift(ctx, target, operation, anchor);
+            }
+        } else if let Some(target) = crate::ui_helpers::adjacent_page_navigation_idx(
+            &self.items,
+            self.current_reader_order(),
+            fs_idx,
+            dir.signum(),
+            false,
+        ) {
+            self.page_turn_defer_navigation(
+                ctx,
+                target,
+                None,
+                crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                operation,
+            );
+        }
+    }
+
     pub(crate) fn queue_spread_shift_action(
         &mut self,
         fs_idx: usize,
@@ -28965,6 +29058,29 @@ impl App {
     /// VST editor の owner 切り替えや cross-process focus handoff のタイミングによっては、
     /// マウスイベントは fullscreen viewport に届く一方で、キーだけ main viewport に届くことがある。
     /// main 側の通常ショートカットは fullscreen 中にブロックされるため、ここで同じ key handler に通す。
+    pub(crate) fn fullscreen_root_input_for_frame(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> (bool, Option<FullscreenRootFrameInput>) {
+        if self.fullscreen_idx.is_some()
+            && !self.viewer_session_is_detached()
+            && self.page_turn_barrier_active()
+        {
+            #[cfg(windows)]
+            if self.fullscreen_embedded_still_active() {
+                return (!self.pending_return_to_parent, None);
+            }
+            return (
+                true,
+                Some(FullscreenRootFrameInput {
+                    context: ctx.clone(),
+                    destination: self.page_turn_destination(),
+                }),
+            );
+        }
+        (self.handle_fullscreen_root_key_input(ctx), None)
+    }
+
     pub(crate) fn handle_fullscreen_root_key_input(&mut self, ctx: &egui::Context) -> bool {
         let Some(fs_idx) = self.fullscreen_idx else {
             return false;
@@ -29037,7 +29153,13 @@ impl App {
 
         let spread_pair = self.resolve_visible_spread_pair(fs_idx);
         let is_spread_double = matches!(spread_pair, SpreadPair::Double { .. });
-        let key_action = self.handle_fs_key_input(ctx, fs_idx, is_spread_double);
+        let mut navigation_operation = None;
+        let key_action = self.handle_fs_key_input_with_operation(
+            ctx,
+            fs_idx,
+            is_spread_double,
+            &mut navigation_operation,
+        );
 
         if !key_action.page_nav.is_none() {
             self.bump_input_seq(
@@ -29056,7 +29178,7 @@ impl App {
             self.bump_input_seq("fs_root_close_key", None);
         }
 
-        self.handle_fs_navigation(
+        self.handle_fs_navigation_with_operation(
             ctx,
             key_action.close,
             key_action.close_to_page_list,
@@ -29066,6 +29188,7 @@ impl App {
             key_action.page_nav,
             key_action.jump_to,
             fs_idx,
+            navigation_operation,
         );
         true
     }
@@ -29481,12 +29604,511 @@ impl App {
         }
     }
 
-    /// フルスクリーンのキー入力を処理し、アクションを返す。
+    /// Preserve the normal target preparation shared by still and native media.
+    fn prepare_viewer_target_for_frame(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        fs_render_perf: &mut Option<FsRenderPerfRecorder>,
+    ) -> FsPageTurnDecision {
+        self.harvest_page_dims();
+        if self.effective_fullscreen_fit_mode() == FullscreenFitMode::SpecifiedScale {
+            self.adopt_retained_pdf_page_metadata(fs_idx);
+        }
+        mark_fs_render_perf(fs_render_perf, FsRenderPerfStage::HarvestPageDims);
+        self.reconcile_fullscreen_page_slice(fs_idx);
+        mark_fs_render_perf(
+            fs_render_perf,
+            FsRenderPerfStage::ReconcileFullscreenPageSlice,
+        );
+
+        let page_turn_decision = self.fs_page_turn_decision_for_frame(ctx, fs_idx);
+        let stop_page_needs_load =
+            matches!(self.fs_page_load_state(fs_idx), FsPageLoadState::NeedsLoad);
+        mark_fs_render_perf(
+            fs_render_perf,
+            FsRenderPerfStage::FsPageTurnDecisionForFrame,
+        );
+        if self
+            .ensure_fs_page_turn_target_load(page_turn_decision, fs_idx)
+            .is_some()
+        {
+            // A pass-through open intentionally did not start the full-resolution producer.
+            // Materialized paint re-asserts it here, including while the navigation sequence is
+            // still waiting for a rendition that may never arrive.
+            if stop_page_needs_load && self.reading_flow.is_paged() {
+                self.update_prefetch_window(fs_idx);
+            }
+        }
+        mark_fs_render_perf(
+            fs_render_perf,
+            FsRenderPerfStage::PageTurnTargetLoadAndPrefetchWindow,
+        );
+
+        // ── pending の PDF 再レンダリング結果を取り込む ──
+        // show_viewport_immediate 内では &mut self が使えるので、
+        // メインの update() を待たずにここで直接 poll する。
+        self.poll_prefetch(ctx, PollPrefetchOrigin::FullscreenViewport);
+        mark_fs_render_perf(fs_render_perf, FsRenderPerfStage::PollPrefetch);
+
+        page_turn_decision
+    }
+
+    fn prepare_paged_viewer_frame(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        embedded: bool,
+        fs_render_perf: &mut Option<FsRenderPerfRecorder>,
+    ) -> (
+        FsFrameState,
+        FsPageTurnDecision,
+        SpreadDisplayComposition,
+        SpreadPair,
+        bool,
+    ) {
+        let mut page_turn_decision =
+            self.prepare_viewer_target_for_frame(ctx, fs_idx, fs_render_perf);
+        self.advance_animation(ctx, fs_idx);
+        // Navigation topology and the role-aware visible composition come from the same cached
+        // unit token. The latter may add a non-navigation cover occurrence to the final unit.
+        let display_composition = self.spread_display_composition_for_anchor(fs_idx);
+        let spread_pair = display_composition.spread_pair(self.spread_mode);
+        if let Some(rebound_decision) = self
+            .revalidate_fs_page_turn_decision_for_display_composition(
+                ctx,
+                fs_idx,
+                &display_composition,
+            )
+        {
+            page_turn_decision = rebound_decision;
+        }
+        let is_spread_double = matches!(spread_pair, SpreadPair::Double { .. });
+        // 比較は単ページ表示だけが所有する。ページ移動や表示モード変更で見開きが
+        // 確定したフレームでは、比較用の準備・描画へ進む前に状態を終了する。
+        self.end_comparison_for_spread_mode_if_needed();
+        // 見開きパートナーの事前読み込み + アニメーション進行
+        if let SpreadPair::Double { left, right } = spread_pair {
+            let partner = if left == fs_idx { right } else { left };
+            self.advance_animation(ctx, partner);
+            if self
+                .ensure_fs_page_turn_target_load(page_turn_decision, partner)
+                .is_some()
+            {
+                self.refresh_fullscreen_pdf_promotion();
+            }
+        }
+        // in-window モード中は静止画を専用 viewport ではなくメインウィンドウの
+        // egui ctx に直接描画する (embedded)。本関数冒頭で動画は early-return
+        // 済みなので、ここに来る fs_idx は常に非動画。
+
+        // 隠蔽パネルは画像の後に描かれるため、パネル内で preview 状態を更新するだけでは
+        // 当該フレームの processed texture 解決に間に合わない。前フレームで確定した
+        // 目アイコン矩形と現在 pointer 状態から、必ずパイプライン解決前に同期する。
+        // `show_viewport_immediate` の子 viewport は独立した入力キューを持つため、
+        // 専用 fullscreen / detached では ROOT ではなく描画先の ViewportId を読む。
+        let preview_viewport_id = if embedded {
+            ctx.viewport_id()
+        } else {
+            self.fullscreen_viewport_id()
+        };
+        self.sync_conceal_preview_before_pipeline(ctx, preview_viewport_id);
+        let state = self.prepare_fullscreen_state(ctx, fs_idx, page_turn_decision);
+
+        (
+            state,
+            page_turn_decision,
+            display_composition,
+            spread_pair,
+            is_spread_double,
+        )
+    }
+
+    fn consume_still_reader_close_key(&mut self, ctx: &egui::Context, fs_idx: usize) -> bool {
+        let fullscreen_raw_key_permit = self
+            .keyboard_owner_for_pass(ctx)
+            .fullscreen_raw_key_permit();
+        let input_permits = crate::keyboard_input::keyboard_input_permits(ctx);
+        let escape_close = fullscreen_raw_key_permit.is_some_and(|permit| {
+            crate::keyboard_input::consume_fullscreen_raw_key(
+                ctx,
+                permit,
+                egui::Modifiers::NONE,
+                egui::Key::Escape,
+            )
+        });
+        // 静止画フルスクリーンでは FsClose (既定: Enter) も Esc と同等に
+        // 「フルスクリーン解除」トリガー。
+        // グリッドで Enter (Double click 相当) → 開く、フルスクリーンで Enter → 戻る、
+        // のトグル動作を成立させる。判定は副作用ゼロの
+        // `should_close_fullscreen_on_enter` に集約 (= unit test 可能)。
+        //
+        // suppress ガード解除: Enter が現在押下されていなければ
+        // `fs_suppress_enter_close_until_release` を false にリセット (= 次の新規押下から
+        // close が有効化される)。「Enter で open → 同フレームで close」を防ぐ仕組み。
+        let enter_currently_down = input_permits
+            .current_level
+            .is_some_and(|_| ctx.input(|i| i.key_down(egui::Key::Enter)));
+        if input_permits.current_level.is_some() && !enter_currently_down {
+            self.fs_suppress_enter_close_until_release = false;
+        }
+        // 動画・音声は Enter を再生/一時停止 (VideoPlayPause) に使うので image 用 FsClose
+        // 経路で閉じさせない (音声も current_item_is_audio で除外、Codex P2 / 「映像なし動画」)。
+        let is_media_item = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
+            || matches!(self.items.get(fs_idx), Some(GridItem::Audio(_)))
+            || self.fs_entry_is_animated(fs_idx);
+        let enter_consume_ok = should_close_fullscreen_on_enter(
+            is_media_item,
+            self.ime_input_active(ctx),
+            self.fs_context_menu_idx.is_some(),
+            self.fs_suppress_enter_close_until_release,
+        );
+        let fs_close_key = !escape_close
+            && enter_consume_ok
+            && self.keymap.consume_action(ctx, KeyAction::FsClose);
+        if escape_close {
+            crate::modifier_probe::record_modified_action(ctx, "FsClose", "escape");
+        }
+        if fs_close_key {
+            crate::modifier_probe::record_modified_action(ctx, "FsClose", "keymap");
+        }
+        escape_close || fs_close_key
+    }
+
+    fn apply_still_reader_escape(&mut self, ctx: &egui::Context, fs_idx: usize) -> bool {
+        let adjustment_open_before_escape = self.adjustment_mode.is_open();
+        if self.compare_view_mode.is_overlay() {
+            self.deactivate_compare_view();
+            self.show_feedback_toast("[比較: Normal]".to_string());
+        } else if !self.is_panorama_mode_active(fs_idx) && self.close_click_side_panels() {
+            // ClickToShow の明示オープンは Esc で先に閉じる。
+            if adjustment_open_before_escape {
+                crate::ime_focus::record_side_panel_close(
+                    ctx,
+                    "ui_fullscreen::handle_fs_key_input:close_click_side_panels",
+                );
+            }
+        } else {
+            return true;
+        }
+        false
+    }
+
+    fn paint_fs_close_button(painter: &egui::Painter, rect: egui::Rect, hovered: bool) {
+        let painter = painter.with_clip_rect(rect);
+        painter.rect_filled(
+            rect,
+            4.0,
+            if hovered {
+                egui::Color32::from_rgba_unmultiplied(220, 50, 50, 230)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(70, 70, 70, 200)
+            },
+        );
+        draw_close_icon(
+            &painter,
+            rect.center(),
+            rect.width().min(rect.height()) * 0.28,
+        );
+    }
+
+    fn resolve_page_turn_frame_close_control(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+    ) -> Option<BarButtonResponse> {
+        let full_rect = ctx.available_rect();
+        if !self.fullscreen_top_bar_chrome_allowed(fs_idx) {
+            return None;
+        }
+        let navigator_exclusion = self.fullscreen_navigator_edge_exclusion(ctx, full_rect);
+        let hover_in_top = ctx.input(|i| {
+            !self.cursor_hidden()
+                && i.pointer.hover_pos().is_some_and(|p| {
+                    p.y < TOP_BAR_HOVER_Y && fullscreen_edge_hover_allowed(p, navigator_exclusion)
+                })
+        });
+        let mut panel_state = self.fs_info_panel;
+        panel_state.locked = self.still_info_panel_lock_effective_for_idx(fs_idx, false);
+        let side_panel_visible = self.adjustment_mode.is_open()
+            || panel_state.visible(
+                self.settings.fullscreen_side_panel_mode,
+                self.fullscreen_tag_picker_open,
+            );
+        if !still_top_bar_visible_from_inputs(StillTopBarVisibilityInputs {
+            locked: self.resolved_still_chrome().top_locked,
+            hover_in_top,
+            side_panel_visible,
+            spread_popup_open: self.spread_popup_open,
+            fit_popup_open: self.fit_popup_open,
+            slideshow_popup_open: self.slideshow_popup_open,
+            rotation_popup_open: fs_rotation_popup_open(ctx),
+            panorama_projection_popup_open: self.panorama_projection_popup_open,
+            overflow_panel_open: self.fs_overflow_panel_state.is_open(),
+            view_trim_mode: self.view_trim_mode,
+            touch_chrome_latched: still_touch_chrome_latched(
+                ctx,
+                fs_idx,
+                self.fullscreen_opened_at(),
+            ),
+        }) {
+            return None;
+        }
+        let bar_rect = fullscreen_top_bar_rect(full_rect);
+        record_bar_button_touch_frame(ctx, self.frame_counter, bar_rect);
+        let mut ui = egui::Ui::new(
+            ctx.clone(),
+            egui::Id::new("fs_frame_close_owner"),
+            egui::UiBuilder::new()
+                .layer_id(egui::LayerId::background())
+                .max_rect(full_rect),
+        );
+        ui.set_opacity(0.0);
+        Some(draw_bar_button(
+            &mut ui,
+            bar_rect.max.x - BAR_BUTTON_SIZE - BAR_BUTTON_MARGIN,
+            bar_rect.min.y + BAR_BUTTON_MARGIN,
+            "fs_close_btn",
+            |_| egui::Color32::TRANSPARENT,
+            false,
+            |_, _, _| {},
+        ))
+    }
+
+    fn begin_page_turn_viewer_frame(
+        &mut self,
+        ctx: &egui::Context,
+        embedded: bool,
+        root_input: Option<&FullscreenRootFrameInput>,
+    ) -> PageTurnFrameEntry {
+        if !self.page_turn_barrier_active() {
+            self.page_turn_pre_draw(ctx);
+            return PageTurnFrameEntry::Continue {
+                close_response: None,
+                committed: false,
+            };
+        }
+        let Some(fs_idx) = self.fullscreen_idx else {
+            return PageTurnFrameEntry::ExitViewer;
+        };
+        if !embedded && ctx.input(|i| i.viewport().close_requested()) {
+            self.handle_fs_navigation(
+                ctx,
+                true,
+                false,
+                None,
+                None,
+                None,
+                FsPageNav::None,
+                None,
+                fs_idx,
+            );
+            return PageTurnFrameEntry::ExitViewer;
+        }
+        let root = root_input.filter(|root| root.destination == self.page_turn_destination());
+        let permits = crate::keyboard_input::keyboard_input_permits(ctx);
+        let root_permitted = root.is_some_and(|root| {
+            crate::keyboard_input::keyboard_input_permits(&root.context)
+                .discrete
+                .is_some()
+                && !self
+                    .keyboard_owner_for_pass(&root.context)
+                    .blocks_legacy_keymap_shortcuts()
+        });
+        let owned_elsewhere = self.any_modal_dialog_open_for_fullscreen_keys()
+            || self.sidecar_restore_blocks_projected_context()
+            || self.is_overlay_edit_mode_active()
+            || self.capture_region_selection.is_some()
+            || self.ime_input_active(ctx)
+            || fs_still_seek_strip_popup_open(ctx)
+            || (self
+                .keyboard_owner_for_pass(ctx)
+                .blocks_legacy_keymap_shortcuts()
+                && !root_permitted);
+        if owned_elsewhere {
+            return PageTurnFrameEntry::Continue {
+                close_response: None,
+                committed: false,
+            };
+        }
+        let close_response = self.resolve_page_turn_frame_close_control(ctx, fs_idx);
+        let close_clicked = close_response
+            .as_ref()
+            .is_some_and(BarButtonResponse::clicked);
+        if close_clicked && self.is_panorama_mode_active(fs_idx) {
+            self.toggle_panorama_mode(fs_idx);
+            return PageTurnFrameEntry::Continue {
+                close_response,
+                committed: false,
+            };
+        }
+        if close_clicked {
+            self.handle_fs_navigation(
+                ctx,
+                true,
+                false,
+                None,
+                None,
+                None,
+                FsPageNav::None,
+                None,
+                fs_idx,
+            );
+            return PageTurnFrameEntry::ExitViewer;
+        }
+        for input in root
+            .map(|root| &root.context)
+            .into_iter()
+            .chain(std::iter::once(ctx))
+        {
+            if crate::keyboard_input::keyboard_input_permits(input)
+                .discrete
+                .is_none()
+            {
+                continue;
+            }
+            if self.consume_still_reader_close_key(input, fs_idx) {
+                if self.apply_still_reader_escape(input, fs_idx) {
+                    self.handle_fs_navigation(
+                        input,
+                        true,
+                        false,
+                        None,
+                        None,
+                        None,
+                        FsPageNav::None,
+                        None,
+                        fs_idx,
+                    );
+                    return PageTurnFrameEntry::ExitViewer;
+                }
+                return PageTurnFrameEntry::Continue {
+                    close_response,
+                    committed: false,
+                };
+            }
+            if self.keymap.consume_action(input, KeyAction::FsBackToList) {
+                let container = self
+                    .current_folder
+                    .as_deref()
+                    .is_some_and(crate::folder_tree::is_open_as_container)
+                    || self.auto_open_for_current_container();
+                self.handle_fs_navigation(
+                    input,
+                    !container,
+                    container,
+                    None,
+                    None,
+                    None,
+                    FsPageNav::None,
+                    None,
+                    fs_idx,
+                );
+                return PageTurnFrameEntry::ExitViewer;
+            }
+        }
+        if let Some(root) = root {
+            self.page_turn_pre_draw(&root.context);
+        }
+        self.page_turn_pre_draw(ctx);
+        let committed =
+            (permits.discrete.is_some() || root_permitted || permits.current_level.is_some())
+                && self.commit_page_turn_continuation(ctx);
+        if committed {
+            let current_idx = self.fullscreen_idx;
+            #[cfg(windows)]
+            let path_changed = current_idx
+                .is_some_and(|idx| self.native_video_backdrop_target_for_fs(idx))
+                || self.fullscreen_embedded_still_active() != embedded;
+            #[cfg(not(windows))]
+            let path_changed = false;
+            if current_idx.is_none() {
+                return PageTurnFrameEntry::ExitViewer;
+            }
+            if path_changed {
+                return PageTurnFrameEntry::DrawingPathChanged;
+            }
+        }
+        PageTurnFrameEntry::Continue {
+            close_response,
+            committed,
+        }
+    }
+
+    fn page_turn_navigation_key_operation(
+        &self,
+        ctx: &egui::Context,
+        action: KeyAction,
+    ) -> Option<ViewerOperationId> {
+        if !self.page_turn_barrier_active() {
+            return None;
+        }
+        crate::key_input::operation_key_edges(ctx, ctx.viewport_id())
+            .into_iter()
+            .find(|edge| {
+                edge.pressed()
+                    && match edge {
+                        crate::key_input::KeyOperationEdge::Native(edge) => {
+                            self.keymap.matches_vk_action_parts(
+                                action,
+                                edge.virtual_key,
+                                edge.ctrl,
+                                edge.shift,
+                                edge.alt,
+                            )
+                        }
+                        crate::key_input::KeyOperationEdge::Egui { key, modifiers, .. } => self
+                            .keymap
+                            .effective_chords(action)
+                            .iter()
+                            .any(|chord| chord.matches_egui(*key, *modifiers)),
+                    }
+            })
+            .map(|edge| ViewerOperationId::Key(edge.operation_id()))
+    }
+
+    fn page_turn_fixed_navigation_key_operation(
+        &self,
+        ctx: &egui::Context,
+        key_name: KeyName,
+    ) -> Option<ViewerOperationId> {
+        if !self.page_turn_barrier_active() {
+            return None;
+        }
+        crate::key_input::operation_key_edges(ctx, ctx.viewport_id())
+            .into_iter()
+            .find(|edge| {
+                edge.pressed()
+                    && match edge {
+                        crate::key_input::KeyOperationEdge::Native(edge) => {
+                            key_name.matches_win32(edge.virtual_key, edge.scan_code, edge.extended)
+                                && !edge.ctrl
+                                && !edge.alt
+                        }
+                        crate::key_input::KeyOperationEdge::Egui { key, modifiers, .. } => {
+                            Chord::key(key_name).matches_egui(*key, *modifiers)
+                                || Chord::shift(key_name).matches_egui(*key, *modifiers)
+                        }
+                    }
+            })
+            .map(|edge| ViewerOperationId::Key(edge.operation_id()))
+    }
+
     pub(crate) fn handle_fs_key_input(
         &mut self,
         ctx: &egui::Context,
         fs_idx: usize,
         is_spread_double: bool,
+    ) -> FsKeyAction {
+        self.handle_fs_key_input_with_operation(ctx, fs_idx, is_spread_double, &mut None)
+    }
+
+    fn handle_fs_key_input_with_operation(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        is_spread_double: bool,
+        navigation_operation: &mut Option<ViewerOperationId>,
     ) -> FsKeyAction {
         // マウスドライバ / AHK 経由で積まれた進む/戻る pending は **early-return より前に
         // drain** する。フォーカス無し / モーダル表示中で早期 return すると pending が
@@ -30309,50 +30931,7 @@ impl App {
 
         // ナビゲーションキーは input_mut で消費して、パネル内ウィジェット（スライダー等）に
         // 奪われないようにする
-        let escape_close = fullscreen_raw_key_permit.is_some_and(|permit| {
-            crate::keyboard_input::consume_fullscreen_raw_key(
-                ctx,
-                permit,
-                egui::Modifiers::NONE,
-                egui::Key::Escape,
-            )
-        });
-        // 静止画フルスクリーンでは FsClose (既定: Enter) も Esc と同等に
-        // 「フルスクリーン解除」トリガー。
-        // グリッドで Enter (Double click 相当) → 開く、フルスクリーンで Enter → 戻る、
-        // のトグル動作を成立させる。判定は副作用ゼロの
-        // `should_close_fullscreen_on_enter` に集約 (= unit test 可能)。
-        //
-        // suppress ガード解除: Enter が現在押下されていなければ
-        // `fs_suppress_enter_close_until_release` を false にリセット (= 次の新規押下から
-        // close が有効化される)。「Enter で open → 同フレームで close」を防ぐ仕組み。
-        let enter_currently_down = input_permits
-            .current_level
-            .is_some_and(|_| ctx.input(|i| i.key_down(egui::Key::Enter)));
-        if input_permits.current_level.is_some() && !enter_currently_down {
-            self.fs_suppress_enter_close_until_release = false;
-        }
-        // 動画・音声は Enter を再生/一時停止 (VideoPlayPause) に使うので image 用 FsClose
-        // 経路で閉じさせない (音声も current_item_is_audio で除外、Codex P2 / 「映像なし動画」)。
-        let is_media_item = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
-            || current_item_is_audio
-            || animated_playback_active;
-        let enter_consume_ok = should_close_fullscreen_on_enter(
-            is_media_item,
-            self.ime_input_active(ctx),
-            self.fs_context_menu_idx.is_some(),
-            self.fs_suppress_enter_close_until_release,
-        );
-        let fs_close_key = !escape_close
-            && enter_consume_ok
-            && self.keymap.consume_action(ctx, KeyAction::FsClose);
-        if escape_close {
-            crate::modifier_probe::record_modified_action(ctx, "FsClose", "escape");
-        }
-        if fs_close_key {
-            crate::modifier_probe::record_modified_action(ctx, "FsClose", "keymap");
-        }
-        let esc = escape_close || fs_close_key;
+        let esc = self.consume_still_reader_close_key(ctx, fs_idx);
         // 左右キーは上下と分離して処理（RTL 反転のため）
         let ctrl_d_count = self
             .keymap
@@ -31321,19 +31900,7 @@ impl App {
             self.toggle_compare_diff_mode(ctx, fs_idx);
         }
 
-        let adjustment_open_before_escape = self.adjustment_mode.is_open();
-        if esc && self.compare_view_mode.is_overlay() {
-            self.deactivate_compare_view();
-            self.show_feedback_toast("[比較: Normal]".to_string());
-        } else if esc && !pano_active_now && self.close_click_side_panels() {
-            // ClickToShow の明示オープンは Esc で先に閉じる。
-            if adjustment_open_before_escape {
-                crate::ime_focus::record_side_panel_close(
-                    ctx,
-                    "ui_fullscreen::handle_fs_key_input:close_click_side_panels",
-                );
-            }
-        } else if esc {
+        if esc && self.apply_still_reader_escape(ctx, fs_idx) {
             action.close = true;
         }
         // BS = 階層を 1 段だけ戻す。ZIP/PDF ページ、または「ページを直接開く」対象の
@@ -31720,18 +32287,59 @@ impl App {
         // S / Space / Esc は従来どおり停止する。
         if nav_next && !ctrl_d {
             action.page_nav = self.spread_page_nav(1);
+            *navigation_operation = self.page_turn_fixed_navigation_key_operation(
+                ctx,
+                if arrow_down {
+                    KeyName::Down
+                } else if arrow_left {
+                    KeyName::Left
+                } else {
+                    KeyName::Right
+                },
+            );
         }
         if nav_prev && !ctrl_u {
             action.page_nav = self.spread_page_nav(-1);
+            *navigation_operation = self.page_turn_fixed_navigation_key_operation(
+                ctx,
+                if arrow_up {
+                    KeyName::Up
+                } else if arrow_right {
+                    KeyName::Right
+                } else {
+                    KeyName::Left
+                },
+            );
         }
         // ファイル名スタック: Shift+↓↑ で次/前のスタックの先頭画像へ絶対ジャンプ
         // (フラット読書ビューのときのみ。端では no-op で消費)。Shift キーは上で
         // stack_jump_next/prev として既に consume 済みなので plain 矢印 nav とは排他。
-        if stack_jump_next {
-            self.stack_jump(ctx, true);
-        }
-        if stack_jump_prev {
-            self.stack_jump(ctx, false);
+        if stack_jump_next || stack_jump_prev {
+            if self.page_turn_barrier_active() {
+                if let Some(target) = self
+                    .stack_view
+                    .as_ref()
+                    .and_then(|view| view.stack_jump_target(fs_idx, stack_jump_next))
+                {
+                    let operation = self.page_turn_navigation_key_operation(
+                        ctx,
+                        if stack_jump_next {
+                            KeyAction::FsStackJumpNext
+                        } else {
+                            KeyAction::FsStackJumpPrev
+                        },
+                    );
+                    self.page_turn_defer_navigation(
+                        ctx,
+                        target,
+                        None,
+                        crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                        operation,
+                    );
+                }
+            } else {
+                self.stack_jump(ctx, stack_jump_next);
+            }
         }
         // Ctrl+←/→: 見開きモードでは「1 ページずらし」(現在の表示ユニット先頭を
         // 1 ページぶんずらす)、Single モードでは 1 ページ移動。RTL は左右の意味を反転 (plain 矢印と同じ)。
@@ -31742,7 +32350,20 @@ impl App {
             spread_shift_next,
             page_rtl,
         ) {
-            self.queue_spread_shift_action(fs_idx, dir, &mut action);
+            let operation = self.page_turn_navigation_key_operation(
+                ctx,
+                if spread_shift_prev {
+                    KeyAction::FsSpreadShiftPrev
+                } else if spread_shift_next {
+                    KeyAction::FsSpreadShiftNext
+                } else if ctrl_right {
+                    KeyAction::FsSpreadShiftRight
+                } else {
+                    KeyAction::FsSpreadShiftLeft
+                },
+            );
+            self.queue_spread_shift_action_for_frame(ctx, fs_idx, dir, &mut action, operation);
+            *navigation_operation = operation;
         }
         let mouse_nav_forward = mouse_forward || browser_forward;
         let mouse_nav_back = mouse_back || browser_back;
@@ -31787,11 +32408,23 @@ impl App {
         }
         if page_next {
             action.page_nav = self.spread_page_nav(1);
+            *navigation_operation =
+                self.page_turn_navigation_key_operation(ctx, KeyAction::FsPageNext);
         }
         if page_prev {
             action.page_nav = self.spread_page_nav(-1);
+            *navigation_operation =
+                self.page_turn_navigation_key_operation(ctx, KeyAction::FsPagePrev);
         }
         if fixed_jump_next || fixed_jump_prev {
+            *navigation_operation = self.page_turn_navigation_key_operation(
+                ctx,
+                if fixed_jump_next {
+                    KeyAction::FsFixedJumpNext
+                } else {
+                    KeyAction::FsFixedJumpPrev
+                },
+            );
             let forward = if fixed_jump_next { !page_rtl } else { page_rtl };
             if let Some(new_idx) = self.fullscreen_large_jump_target(fs_idx, forward) {
                 action.jump_to = Some(new_idx);
@@ -31803,6 +32436,14 @@ impl App {
             }
         }
         if fixed_jump_next_no_rtl || fixed_jump_prev_no_rtl {
+            *navigation_operation = self.page_turn_navigation_key_operation(
+                ctx,
+                if fixed_jump_next_no_rtl {
+                    KeyAction::FsFixedJumpNextNoRtl
+                } else {
+                    KeyAction::FsFixedJumpPrevNoRtl
+                },
+            );
             let forward = fixed_jump_next_no_rtl;
             if let Some(new_idx) = self.fullscreen_large_jump_target(fs_idx, forward) {
                 action.jump_to = Some(new_idx);
@@ -31815,10 +32456,14 @@ impl App {
         }
 
         if key_home {
+            *navigation_operation =
+                self.page_turn_navigation_key_operation(ctx, KeyAction::FsJumpFirst);
             // Home もフォルダ内移動なのでスライドショーは止めない。
             action.jump_to = self.fullscreen_boundary_jump_target(fs_idx, false);
         }
         if key_end {
+            *navigation_operation =
+                self.page_turn_navigation_key_operation(ctx, KeyAction::FsJumpLast);
             // End もフォルダ内移動なのでスライドショーは止めない。
             action.jump_to = self.fullscreen_boundary_jump_target(fs_idx, true);
         }
@@ -32402,7 +33047,7 @@ impl App {
                 {
                     self.bump_input_seq("fs_shift_anchor_jump", None);
                     self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
-                    self.handle_fs_navigation(
+                    self.handle_fs_navigation_with_operation(
                         ctx,
                         false,
                         false,
@@ -32412,6 +33057,7 @@ impl App {
                         FsPageNav::None,
                         Some(target),
                         fs_idx,
+                        self.page_turn_pointer_navigation_operation(ctx, "pointer"),
                     );
                 }
             }
@@ -33859,6 +34505,33 @@ impl App {
         navigator_reservation: &mut Option<FsNavigatorInputReservation>,
         front_wheel_owner: Option<&FsHudPopupWheelInput>,
     ) -> (FsPageNav, bool) {
+        self.handle_fs_wheel_and_click_with_geometry_and_operation(
+            ui,
+            ctx,
+            full_rect,
+            state,
+            seek_geometry,
+            is_spread_double,
+            prev_foreground_hwnd,
+            navigator_reservation,
+            front_wheel_owner,
+            &mut None,
+        )
+    }
+
+    fn handle_fs_wheel_and_click_with_geometry_and_operation(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        state: &FsFrameState,
+        seek_geometry: StillSeekGeometry,
+        is_spread_double: bool,
+        prev_foreground_hwnd: usize,
+        navigator_reservation: &mut Option<FsNavigatorInputReservation>,
+        front_wheel_owner: Option<&FsHudPopupWheelInput>,
+        navigation_operation: &mut Option<ViewerOperationId>,
+    ) -> (FsPageNav, bool) {
         *navigator_reservation = None;
         let mut navigator_frame_input = FsNavigatorFrameInput::for_current_pass(ctx);
         if front_wheel_owner.is_some() {
@@ -34647,6 +35320,11 @@ impl App {
                             self.spread_mode.advances_right_to_left(),
                         );
                         page_nav = self.spread_page_nav(base);
+                        *navigation_operation = self
+                            .page_turn_pointer_navigation_operation(ctx, "touch")
+                            .or_else(|| {
+                                self.page_turn_pointer_navigation_operation(ctx, "pointer")
+                            });
                     }
                     crate::touch_input::TouchCommand::Zoom { factor, pivot } => {
                         // 書き先は `fs_zoom_owner` が決める。ここで新しい分岐を足さない。
@@ -34927,6 +35605,7 @@ impl App {
                 // ZipPla 準拠: ズーム確定中の修飾なしホイールは通常どおり前後ページ移動。
                 let base = if wheel_y < 0.0 { 1 } else { -1 };
                 page_nav = self.spread_page_nav(base);
+                *navigation_operation = self.page_turn_pointer_navigation_operation(ctx, "wheel");
             } else if self.analysis_mode {
                 // 分析モード: ホイールでズーム
                 crate::modifier_probe::record_modified_action(ctx, "FsWheelZoom", "analysis");
@@ -35014,6 +35693,8 @@ impl App {
                         None => {
                             let base = if wheel_y < 0.0 { 1 } else { -1 };
                             page_nav = self.spread_page_nav(base);
+                            *navigation_operation =
+                                self.page_turn_pointer_navigation_operation(ctx, "wheel");
                         }
                     }
                 }
@@ -35263,6 +35944,8 @@ impl App {
                                         self.spread_mode.advances_right_to_left(),
                                     );
                                     page_nav = self.spread_page_nav(base);
+                                    *navigation_operation =
+                                        self.page_turn_pointer_navigation_operation(ctx, "pointer");
                                 }
                             }
                         }
@@ -36167,14 +36850,22 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) {
-        if self.settings.page_turn_animation_enabled {
-            self.page_turn_external_operation(
-                ctx,
-                ViewerOperationId::Slideshow(next_operation_batch()),
-                OperationPhase::Press,
-                "slideshow",
-            );
-            if let Some(current) = self.fullscreen_idx
+        if self.settings.page_turn_animation_enabled || self.page_turn_barrier_active() {
+            let operation = ViewerOperationId::Slideshow(next_operation_batch());
+            self.page_turn_external_operation(ctx, operation, OperationPhase::Press, "slideshow");
+            if self.fullscreen_idx.is_some()
+                && self.page_turn_defer_navigation(
+                    ctx,
+                    idx,
+                    None,
+                    crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                    Some(operation),
+                )
+            {
+                return;
+            }
+            if self.settings.page_turn_animation_enabled
+                && let Some(current) = self.fullscreen_idx
                 && let Some(forward) = self.adjacent_page_turn_direction(current, idx)
             {
                 self.offer_page_turn(ctx, idx, forward);
@@ -36759,6 +37450,40 @@ impl App {
         jump_to: Option<usize>,
         fs_idx: usize,
     ) {
+        #[cfg(windows)]
+        let operation = self
+            .page_turn_barrier_active()
+            .then(|| self.gamepad_operation_for_navigation(ctx))
+            .flatten();
+        #[cfg(not(windows))]
+        let operation = None;
+        self.handle_fs_navigation_with_operation(
+            ctx,
+            close_fs,
+            close_to_page_list,
+            ctrl_nav,
+            sibling_nav,
+            mouse_nav,
+            page_nav,
+            jump_to,
+            fs_idx,
+            operation,
+        );
+    }
+
+    pub(crate) fn handle_fs_navigation_with_operation(
+        &mut self,
+        ctx: &egui::Context,
+        close_fs: bool,
+        close_to_page_list: bool,
+        ctrl_nav: Option<i32>,
+        sibling_nav: Option<i32>,
+        mouse_nav: Option<crate::ui_main::AddressBarNav>,
+        page_nav: FsPageNav,
+        jump_to: Option<usize>,
+        fs_idx: usize,
+        operation: Option<ViewerOperationId>,
+    ) {
         let mut fs_render_perf = None;
         self.handle_fs_navigation_with_render_perf(
             ctx,
@@ -36770,6 +37495,7 @@ impl App {
             page_nav,
             jump_to,
             fs_idx,
+            operation,
             &mut fs_render_perf,
         );
     }
@@ -36785,8 +37511,67 @@ impl App {
         page_nav: FsPageNav,
         jump_to: Option<usize>,
         fs_idx: usize,
+        operation: Option<ViewerOperationId>,
         fs_render_perf: &mut Option<FsRenderPerfRecorder>,
     ) {
+        if !close_fs
+            && !close_to_page_list
+            && ctrl_nav.is_none()
+            && sibling_nav.is_none()
+            && mouse_nav.is_none()
+            && (self.settings.page_turn_animation_enabled || self.page_turn_completion_active())
+        {
+            let resolved = if let Some(target) = jump_to {
+                Some((
+                    target,
+                    None,
+                    crate::fs_page_load_scheduler::FsPageLoadContract::LatestSeek,
+                ))
+            } else {
+                match page_nav {
+                    FsPageNav::Target(target) => Some((
+                        target,
+                        None,
+                        crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                    )),
+                    FsPageNav::Split(step) => Some((
+                        step.source_idx,
+                        Some(step.slice),
+                        crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                    )),
+                    FsPageNav::Delta(delta) if delta != 0 => {
+                        let target = if self.continuous_reading_active_for_idx(fs_idx) {
+                            crate::ui_helpers::adjacent_idx_in_order(
+                                &self.get_still_image_indices(),
+                                fs_idx,
+                                delta.signum(),
+                            )
+                        } else {
+                            crate::ui_helpers::adjacent_page_navigation_idx(
+                                &self.items,
+                                self.current_reader_order(),
+                                fs_idx,
+                                delta.signum(),
+                                false,
+                            )
+                        };
+                        target.map(|target| {
+                            (
+                                target,
+                                None,
+                                crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                            )
+                        })
+                    }
+                    _ => None,
+                }
+            };
+            if let Some((target, slice, contract)) = resolved
+                && self.page_turn_defer_navigation(ctx, target, slice, contract, operation)
+            {
+                return;
+            }
+        }
         let mut fs_navigation_perf = fs_render_perf
             .as_ref()
             .map(|_| FsNavigationPerfRecorder::default());
@@ -36977,6 +37762,9 @@ impl App {
                 if step.source_idx == fs_idx {
                     // 同じページの反対側。テクスチャも読み込みも同じものなので、
                     // ページ遷移の機構を通さない。通すと再読込と表示確定が余計に走る。
+                    if self.settings.page_turn_animation_enabled {
+                        self.page_turn_excluded_navigation(ctx, "stage1_split_step");
+                    }
                     self.set_fullscreen_page_slice_for_display_unit(step.slice);
                     self.update_fs_page_turn_burst_after_navigation(ctx, fs_idx, None);
                     ctx.request_repaint();
@@ -36999,6 +37787,9 @@ impl App {
                         begin_perf_t0,
                     );
                     if sequence_started {
+                        if self.settings.page_turn_animation_enabled {
+                            self.page_turn_excluded_navigation(ctx, "stage1_split_step");
+                        }
                         let land_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
                         self.land_still_page_navigation_target(
                             ctx,
@@ -37765,6 +38556,7 @@ impl App {
                 resource: paint_resource,
                 painter: painter.clone(),
                 underlay: bg_style.clone(),
+                spine: None,
                 live: live_eligible
                     && using_full_texture
                     && matches!(layout_source, FsPageLayoutSource::CurrentItem),
@@ -42934,6 +43726,7 @@ impl App {
                         && !color_faithful_rendition_unit
                         && self.settings.page_turn_animation_enabled
                         && self.page_turn_view_eligible(idx);
+                    page.spine = Some(spread_rects.spine);
                     self.fullscreen_page_layout
                         .push_occurrence(page.transform, page.occurrence);
                     prepared_pages[usize::from(idx == right_idx)] = Some(page);
@@ -43392,6 +44185,7 @@ impl App {
                 resource: paint_resource,
                 painter: painter.clone(),
                 underlay: bg_style.clone(),
+                spine: None,
                 live: display_tex.is_some()
                     && matches!(layout_source, FsPageLayoutSource::CurrentItem),
             });
@@ -43558,6 +44352,7 @@ impl App {
         touch_chrome_latched: bool,
         touch_target_frame: u64,
         shift_view: Option<&SpreadShiftHudView>,
+        pre_resolved_close: Option<BarButtonResponse>,
     ) {
         let popup_wheel_owned = *fit_popup_open
             || *spread_popup_open
@@ -43617,21 +44412,30 @@ impl App {
         // 360 モード中はクリックで「360 モード OFF」(= toggle_panorama_mode で
         // panorama_state を None に) に転用 (2026-05 ユーザー要望)。
         // フルスクリーン全体を閉じたい場合は Esc を使う。
-        let close_resp = draw_bar_button(
-            ui,
-            next_x,
-            bar_rect.min.y + BAR_BUTTON_MARGIN,
-            "fs_close_btn",
-            |hovered| {
-                if hovered {
-                    egui::Color32::from_rgba_unmultiplied(220, 50, 50, 230)
-                } else {
-                    egui::Color32::from_rgba_unmultiplied(70, 70, 70, 200)
-                }
-            },
-            false, // active 状態なし
-            |p, c, r| draw_close_icon(p, c, r),
-        );
+        let close_resp = if let Some(response) = pre_resolved_close {
+            let close_rect = egui::Rect::from_min_size(
+                egui::pos2(next_x, bar_rect.min.y + BAR_BUTTON_MARGIN),
+                egui::Vec2::splat(BAR_BUTTON_SIZE),
+            );
+            Self::paint_fs_close_button(ui.painter(), close_rect, response.hovered());
+            response
+        } else {
+            draw_bar_button(
+                ui,
+                next_x,
+                bar_rect.min.y + BAR_BUTTON_MARGIN,
+                "fs_close_btn",
+                |hovered| {
+                    if hovered {
+                        egui::Color32::from_rgba_unmultiplied(220, 50, 50, 230)
+                    } else {
+                        egui::Color32::from_rgba_unmultiplied(70, 70, 70, 200)
+                    }
+                },
+                false, // active 状態なし
+                |p, c, r| draw_close_icon(p, c, r),
+            )
+        };
         let close_tooltip = if panorama_active {
             "360° モードを抜ける (フルスクリーンを閉じるには Esc)"
         } else {
@@ -56633,6 +57437,7 @@ mod tests {
                         false,
                         1,
                         None,
+                        None,
                     );
                     positions = test_current_bar_button_targets(ctx)
                         .into_iter()
@@ -56780,6 +57585,7 @@ mod tests {
                         None,
                         false,
                         1,
+                        None,
                         None,
                     );
                 });
@@ -80438,6 +81244,7 @@ mod specified_scale_consumer_tests {
                         false,
                         1,
                         None,
+                        None,
                     );
                     *open = fit_popup_open;
                 });
@@ -82752,10 +83559,13 @@ mod specified_scale_consumer_tests {
 }
 
 #[cfg(test)]
-mod page_turn_submission_tests {
+pub(crate) mod page_turn_submission_tests {
     use super::*;
 
-    fn ready_app(ctx: &egui::Context, mode: SpreadMode) -> crate::app::AppTestEnvForTest {
+    pub(crate) fn ready_app(
+        ctx: &egui::Context,
+        mode: SpreadMode,
+    ) -> crate::app::AppTestEnvForTest {
         let mut app = crate::app::setup_app_for_test();
         app.items = (0..4)
             .map(|idx| GridItem::Image(PathBuf::from(format!("c:/page-turn/{idx}.png"))))
@@ -82791,12 +83601,18 @@ mod page_turn_submission_tests {
         app
     }
 
-    fn draw_current(
+    pub(crate) fn draw_current(
         app: &mut App,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
     ) -> (SpreadDisplayComposition, FsNavigatorTextureSources) {
         let anchor = app.fullscreen_idx.unwrap();
+        // Exercise the normal prepared-target phase, not merely its texture.
+        let decision = app.fs_page_turn_decision_for_frame(ctx, anchor);
+        assert!(
+            app.fs_nav_holdover_for_draw().is_none(),
+            "the fixture must paint the ready target through the normal presentation latch"
+        );
         let composition = app.spread_display_composition_for_anchor(anchor);
         let screen = composition.pages_in_screen_order(app.spread_mode);
         let rect = ui.max_rect();
@@ -82848,7 +83664,7 @@ mod page_turn_submission_tests {
                 left.idx,
                 right.idx,
                 false,
-                FsPageTurnDecision::normal(),
+                decision,
                 None,
                 StillSeekGeometry::bar_only(),
                 true,
@@ -82859,7 +83675,7 @@ mod page_turn_submission_tests {
         (composition, sources)
     }
 
-    fn frame(
+    pub(crate) fn frame(
         ctx: &egui::Context,
         run: impl FnMut(&mut egui::Ui, &egui::Context),
     ) -> egui::FullOutput {
@@ -82878,6 +83694,479 @@ mod page_turn_submission_tests {
                     .show(ctx, |ui| run(ui, ctx));
             },
         )
+    }
+
+    pub(crate) fn seed_leaf(ctx: &egui::Context, app: &mut App) {
+        page_turn::install(ctx);
+        install_fs_navigator_input_tracking(ctx);
+        app.settings.page_turn_animation_enabled = true;
+        app.settings.page_turn_animation_duration_ms = 600;
+        app.thumbnails = (0..4).map(|_| ThumbnailState::Pending).collect();
+        for idx in [1, 0] {
+            app.fullscreen_idx = Some(idx);
+            frame(ctx, |ui, ctx| {
+                draw_current(app, ui, ctx);
+            });
+        }
+        frame(ctx, |ui, ctx| {
+            app.page_turn_external_operation(
+                ctx,
+                ViewerOperationId::Slideshow(next_operation_batch()),
+                OperationPhase::Press,
+                "slideshow",
+            );
+            app.offer_page_turn(ctx, 1, true);
+            assert!(app.begin_fs_page_navigation_sequence(ctx, 0, 1, false));
+            app.fullscreen_idx = Some(1);
+            let (_, sources) = draw_current(app, ui, ctx);
+            let FsDisplayUnitSubmission::Paged(receipt) = sources.submission else {
+                panic!()
+            };
+            assert!(receipt.curl);
+        });
+    }
+
+    fn seed_interrupted_leaf(ctx: &egui::Context, app: &mut App, next: usize) {
+        seed_leaf(ctx, app);
+        frame(ctx, |_, ctx| {
+            let operation = ViewerOperationId::Slideshow(next_operation_batch());
+            app.page_turn_external_operation(ctx, operation, OperationPhase::Press, "slideshow");
+            app.handle_fs_navigation_with_operation(
+                ctx,
+                false,
+                false,
+                None,
+                None,
+                None,
+                FsPageNav::Target(next),
+                None,
+                1,
+                Some(operation),
+            );
+            assert_eq!(app.fullscreen_idx, Some(1));
+            assert!(app.page_turn_completion_active());
+        });
+    }
+
+    impl App {
+        fn begin_current_page_turn_frame_for_test(
+            &mut self,
+            ctx: &egui::Context,
+        ) -> PageTurnFrameEntry {
+            let embedded = self.fullscreen_embedded_still_active();
+            self.begin_page_turn_viewer_frame(ctx, embedded, None)
+        }
+    }
+
+    pub(crate) fn adopt_interrupted_target(ctx: &egui::Context, app: &mut App) {
+        frame(ctx, |ui, ctx| {
+            assert!(matches!(
+                app.begin_current_page_turn_frame_for_test(ctx),
+                PageTurnFrameEntry::Continue {
+                    committed: false,
+                    ..
+                }
+            ));
+            assert_eq!(app.fullscreen_idx, Some(1));
+            let (composition, sources) = draw_current(app, ui, ctx);
+            let FsDisplayUnitSubmission::Paged(receipt) = &sources.submission else {
+                panic!()
+            };
+            assert!(!receipt.curl);
+            app.emit_fs_page_turn_ready_for_display_unit(
+                ctx,
+                &composition,
+                FsPageTurnDecision::normal(),
+                &sources,
+            );
+            assert!(
+                !app.commit_page_turn_continuation(ctx),
+                "output adoption and a later frame are required"
+            );
+        });
+    }
+
+    fn frame_with_events(
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        mut run: impl FnMut(&egui::Context),
+    ) {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(600.0, 400.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| run(ctx),
+        );
+    }
+
+    fn pressed(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn page_turn_actual_navigation_waits_for_adopted_flat_then_bookmark_uses_new_page() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::lock_test_input();
+        let ctx = egui::Context::default();
+        let mut app = ready_app(&ctx, SpreadMode::Single);
+        seed_interrupted_leaf(&ctx, &mut app, 2);
+        adopt_interrupted_target(&ctx, &mut app);
+        app.items[2] = GridItem::PdfPage {
+            pdf_path: PathBuf::from("c:/page-turn/next.pdf"),
+            page_num: 2,
+            content_type: Some(PdfPageContentType::Raster { w: 80, h: 120 }),
+        };
+        let requests = app.book_bookmark_request_seq;
+        frame_with_events(&ctx, vec![pressed(egui::Key::B)], |ctx| {
+            assert!(matches!(
+                app.begin_current_page_turn_frame_for_test(ctx),
+                PageTurnFrameEntry::Continue {
+                    committed: true,
+                    ..
+                }
+            ));
+            let fresh_idx = app.fullscreen_idx.unwrap();
+            assert_eq!(fresh_idx, 2);
+            app.handle_fs_key_input(ctx, fresh_idx, false);
+            assert!(
+                app.book_bookmark_request_seq > requests,
+                "B must use the committed PDF, not the previous image"
+            );
+        });
+        #[cfg(windows)]
+        crate::key_input::clear_test_frame();
+    }
+
+    #[test]
+    fn page_turn_actual_completion_escape_wins_over_next_target_and_bookmark() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::lock_test_input();
+        let ctx = egui::Context::default();
+        let mut app = ready_app(&ctx, SpreadMode::Single);
+        seed_interrupted_leaf(&ctx, &mut app, 2);
+        adopt_interrupted_target(&ctx, &mut app);
+        let requests = app.book_bookmark_request_seq;
+        frame_with_events(
+            &ctx,
+            vec![pressed(egui::Key::B), pressed(egui::Key::Escape)],
+            |ctx| {
+                assert!(matches!(
+                    app.begin_current_page_turn_frame_for_test(ctx),
+                    PageTurnFrameEntry::ExitViewer
+                ));
+                assert_eq!(app.fullscreen_idx, None);
+                assert_eq!(app.book_bookmark_request_seq, requests);
+            },
+        );
+        #[cfg(windows)]
+        crate::key_input::clear_test_frame();
+    }
+
+    #[test]
+    fn page_turn_actual_root_close_is_resolved_before_continuation_capture() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::lock_test_input();
+        let owner = egui::Context::default();
+        let root = egui::Context::default();
+        let mut app = ready_app(&owner, SpreadMode::Single);
+        seed_interrupted_leaf(&owner, &mut app, 2);
+        adopt_interrupted_target(&owner, &mut app);
+        frame_with_events(&root, vec![pressed(egui::Key::Escape)], |root| {
+            let (handled, forwarded) = app.fullscreen_root_input_for_frame(root);
+            assert!(handled);
+            let forwarded = forwarded.expect("root ingress delegates the immutable frame input");
+            frame_with_events(&owner, vec![], |ctx| {
+                assert!(matches!(
+                    app.begin_page_turn_viewer_frame(ctx, false, Some(&forwarded)),
+                    PageTurnFrameEntry::ExitViewer
+                ));
+                assert_eq!(app.fullscreen_idx, None);
+            });
+        });
+        #[cfg(windows)]
+        crate::key_input::clear_test_frame();
+    }
+
+    #[test]
+    fn page_turn_actual_close_widget_release_wins_before_continuation() {
+        let ctx = egui::Context::default();
+        let mut app = ready_app(&ctx, SpreadMode::Single);
+        app.settings.fullscreen_top_bar_locked = true;
+        seed_interrupted_leaf(&ctx, &mut app, 2);
+        // The real HUD already owns this widget in the preceding frame.
+        // Prime that hit-test map before injecting its press/release pair.
+        frame_with_events(&ctx, vec![], |ctx| {
+            let PageTurnFrameEntry::Continue {
+                close_response,
+                committed,
+            } = app.begin_current_page_turn_frame_for_test(ctx)
+            else {
+                panic!()
+            };
+            assert!(!committed);
+            assert!(close_response.is_some());
+        });
+        let close_pos = egui::pos2(
+            600.0 - BAR_BUTTON_MARGIN - BAR_BUTTON_SIZE * 0.5,
+            BAR_BUTTON_MARGIN + BAR_BUTTON_SIZE * 0.5,
+        );
+        // Press while submitting B's mandatory flat. Release is the next frame's
+        // real widget action, so close must win over the now-adopted continuation.
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(600.0, 400.0),
+                )),
+                events: vec![
+                    egui::Event::PointerMoved(close_pos),
+                    egui::Event::PointerButton {
+                        pos: close_pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                assert!(matches!(
+                    app.begin_current_page_turn_frame_for_test(ctx),
+                    PageTurnFrameEntry::Continue {
+                        committed: false,
+                        ..
+                    }
+                ));
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        let (composition, sources) = draw_current(&mut app, ui, ctx);
+                        app.emit_fs_page_turn_ready_for_display_unit(
+                            ctx,
+                            &composition,
+                            FsPageTurnDecision::normal(),
+                            &sources,
+                        );
+                    });
+            },
+        );
+        frame_with_events(
+            &ctx,
+            vec![egui::Event::PointerButton {
+                pos: close_pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            |ctx| {
+                assert!(matches!(
+                    app.begin_current_page_turn_frame_for_test(ctx),
+                    PageTurnFrameEntry::ExitViewer
+                ));
+                assert_eq!(app.fullscreen_idx, None);
+            },
+        );
+    }
+
+    #[test]
+    fn page_turn_actual_completion_rebinds_resized_geometry_before_flat_adoption() {
+        let ctx = egui::Context::default();
+        let mut app = ready_app(&ctx, SpreadMode::Single);
+        seed_interrupted_leaf(&ctx, &mut app, 2);
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        assert!(matches!(
+                            app.begin_current_page_turn_frame_for_test(ctx),
+                            PageTurnFrameEntry::Continue {
+                                committed: false,
+                                ..
+                            }
+                        ));
+                        let (composition, sources) = draw_current(&mut app, ui, ctx);
+                        app.emit_fs_page_turn_ready_for_display_unit(
+                            ctx,
+                            &composition,
+                            FsPageTurnDecision::normal(),
+                            &sources,
+                        );
+                    });
+            },
+        );
+        frame_with_events(&ctx, vec![], |ctx| {
+            assert!(app.commit_page_turn_continuation(ctx));
+            assert_eq!(app.fullscreen_idx, Some(2));
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn page_turn_actual_completion_video_hands_off_both_still_routes() {
+        for embedded in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = ready_app(&ctx, SpreadMode::Single);
+            app.native_video_in_window_active = embedded;
+            seed_interrupted_leaf(&ctx, &mut app, 2);
+            adopt_interrupted_target(&ctx, &mut app);
+            app.items[2] = GridItem::Video(PathBuf::from("c:/page-turn/next.mp4"));
+            frame_with_events(&ctx, vec![], |ctx| {
+                assert!(matches!(
+                    app.begin_page_turn_viewer_frame(ctx, embedded, None),
+                    PageTurnFrameEntry::DrawingPathChanged
+                ));
+                assert_eq!(app.fullscreen_idx, Some(2));
+                assert!(!app.page_turn_barrier_active());
+                assert!(
+                    !app.commit_page_turn_continuation(ctx),
+                    "media commit is consumed once"
+                );
+            });
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn page_turn_actual_f12_continuation_keeps_existing_video_refusal() {
+        let ctx = egui::Context::default();
+        let mut app = ready_app(&ctx, SpreadMode::Single);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = true;
+        seed_interrupted_leaf(&ctx, &mut app, 2);
+        adopt_interrupted_target(&ctx, &mut app);
+        app.items[2] = GridItem::Video(PathBuf::from("c:/page-turn/next.mp4"));
+        frame_with_events(&ctx, vec![], |ctx| {
+            assert!(app.should_block_detached_independent_still_navigation_to_video(2));
+            assert!(matches!(
+                app.begin_page_turn_viewer_frame(ctx, false, None),
+                PageTurnFrameEntry::Continue {
+                    committed: true,
+                    ..
+                }
+            ));
+            assert_eq!(app.fullscreen_idx, Some(1));
+            assert!(app.should_block_detached_independent_still_navigation_to_video(2));
+        });
+    }
+
+    #[test]
+    fn page_turn_actual_key_producer_carries_original_consumed_edge_identity() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::lock_test_input();
+        let ctx = egui::Context::default();
+        let mut app = ready_app(&ctx, SpreadMode::Single);
+        seed_interrupted_leaf(&ctx, &mut app, 2);
+        frame_with_events(
+            &ctx,
+            vec![pressed(egui::Key::ArrowLeft), pressed(egui::Key::B)],
+            |ctx| {
+                app.page_turn_pre_draw(ctx);
+                let original = crate::key_input::operation_key_edges(ctx, ctx.viewport_id())
+                    .into_iter()
+                    .find(|edge| {
+                        matches!(
+                            edge,
+                            crate::key_input::KeyOperationEdge::Egui {
+                                key: egui::Key::ArrowLeft,
+                                ..
+                            }
+                        )
+                    })
+                    .unwrap()
+                    .operation_id();
+                let mut operation = None;
+                let action = app.handle_fs_key_input_with_operation(ctx, 1, false, &mut operation);
+                assert!(!action.page_nav.is_none());
+                assert_eq!(
+                    operation,
+                    Some(ViewerOperationId::Key(original)),
+                    "the unrelated B edge cannot own navigation"
+                );
+            },
+        );
+        #[cfg(windows)]
+        crate::key_input::clear_test_frame();
+    }
+
+    #[test]
+    fn page_turn_actual_wheel_producer_overrides_unrelated_key_identity() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::lock_test_input();
+        let ctx = egui::Context::default();
+        let mut app = ready_app(&ctx, SpreadMode::Single);
+        seed_interrupted_leaf(&ctx, &mut app, 2);
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(600.0, 400.0),
+                )),
+                events: vec![
+                    pressed(egui::Key::ArrowRight),
+                    egui::Event::PointerMoved(egui::pos2(300.0, 200.0)),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, 120.0),
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                app.page_turn_pre_draw(ctx);
+                let mut operation = None;
+                let key = app.handle_fs_key_input_with_operation(ctx, 1, false, &mut operation);
+                assert!(!key.page_nav.is_none());
+                assert!(matches!(operation, Some(ViewerOperationId::Key(_))));
+                let wheel_operation = app
+                    .page_turn_pointer_navigation_operation(ctx, "wheel")
+                    .expect("immutable wheel ingress");
+                let state = app.prepare_fullscreen_state(ctx, 1, FsPageTurnDecision::normal());
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        let (wheel, _) = app.handle_fs_wheel_and_click_with_geometry_and_operation(
+                            ui,
+                            ctx,
+                            ui.max_rect(),
+                            &state,
+                            StillSeekGeometry::bar_only(),
+                            false,
+                            0,
+                            &mut None,
+                            None,
+                            &mut operation,
+                        );
+                        assert!(!wheel.is_none());
+                    });
+                assert_eq!(
+                    operation,
+                    Some(wheel_operation),
+                    "only the winning wheel owns its command"
+                );
+            },
+        );
+        #[cfg(windows)]
+        crate::key_input::clear_test_frame();
     }
 
     #[test]
@@ -82997,7 +84286,10 @@ mod page_turn_submission_tests {
                     &sources,
                 );
             });
-            assert!(app.pending_fs_page_turn_ready.as_ref().is_some_and(|pending| matches!(&pending.sources.submission,FsDisplayUnitSubmission::Paged(receipt) if receipt.was_accepted())));
+            assert!(
+                app.pending_fs_page_turn_ready.is_none(),
+                "a partially visible leaf never completes navigation"
+            );
             app.settings.page_turn_animation_enabled = false;
             frame(&ctx, |ui, ctx| {
                 app.flush_submitted_page_turn_ready(ctx);
@@ -83260,6 +84552,12 @@ mod page_turn_submission_tests {
                                 let make = |incoming: bool| CanonicalUnit {
                                     layout,
                                     pixels_per_point: 1.0,
+                                    spine_x: (layout != UnitLayout::Single).then_some(309.0),
+                                    gutter_width: if layout == UnitLayout::Single {
+                                        0.0
+                                    } else {
+                                        10.0
+                                    },
                                     pages: (0..if layout == UnitLayout::Single { 1 } else { 2 })
                                         .map(|slot| {
                                             let x = if layout == UnitLayout::Single {

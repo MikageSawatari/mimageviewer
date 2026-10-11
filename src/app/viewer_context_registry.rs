@@ -7874,6 +7874,18 @@ impl crate::app::App {
 }
 
 impl App {
+    /// Only an ON-origin mandatory flat can keep operation tracking alive after
+    /// OFF. Read the same context owners without allocating an inventory.
+    pub(crate) fn page_turn_operation_tracking_needed(&self) -> bool {
+        if self.settings.page_turn_animation_enabled || self.page_turn_barrier_active() {
+            return true;
+        }
+        #[cfg(windows)]
+        return self.viewer_contexts.table.slots.values().any(|slot| matches!(slot, Slot::AtRest(bundle) if bundle.page_turn_presentation.has_flat_completion()));
+        #[cfg(not(windows))]
+        false
+    }
+
     /// A setting change or tray hide targets every affected presentation explicitly.
     /// Ordinary context mounting never calls this or invalidates a sibling.
     pub(crate) fn deactivate_all_page_turn_presentations(&mut self, reason: &'static str) {
@@ -7884,6 +7896,18 @@ impl App {
             if let Some(bundle) = self.viewer_contexts.table.at_rest_mut(id) {
                 bundle.pending_fs_page_turn_ready = None;
                 bundle.page_turn_presentation.deactivate(reason);
+            }
+        }
+    }
+
+    /// A setting change ends the effect, but cannot discard an ON-origin flat
+    /// completion and its one already-resolved continuation.
+    pub(crate) fn cancel_all_page_turn_effects_for_settings(&mut self) {
+        self.page_turn_presentation.cancel_for_settings();
+        #[cfg(windows)]
+        for id in self.viewer_contexts.table.other_ids() {
+            if let Some(bundle) = self.viewer_contexts.table.at_rest_mut(id) {
+                bundle.page_turn_presentation.cancel_for_settings();
             }
         }
     }

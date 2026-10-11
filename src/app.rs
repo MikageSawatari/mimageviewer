@@ -91663,7 +91663,8 @@ impl App {
                 .iter()
                 .any(main_viewport_event_is_explicit_input)
         });
-        let fullscreen_root_key_handled = self.handle_fullscreen_root_key_input(ctx);
+        let (fullscreen_root_key_handled, fullscreen_root_input) =
+            self.fullscreen_root_input_for_frame(ctx);
 
         // ── フルスクリーン中にメインウィンドウへフォーカスが来たら閉じる ──
         // ボーダーレスウィンドウなので Alt-Tab 等でメインに戻れるが、
@@ -91850,7 +91851,7 @@ impl App {
             ),
         );
         if should_render_main_fullscreen_viewport {
-            self.render_fullscreen_viewport(ctx);
+            self.render_fullscreen_viewport_with_root_input(ctx, fullscreen_root_input);
         }
         // This span is the whole of `pre_grid` while a video plays in a detached
         // window (backlog 1.122). Name the call that owns it.

@@ -1728,10 +1728,12 @@ Ctrl+ホイールなど固定扱いの入力は従来どおり。
 
 ページめくりアニメーションのON/OFFも「その他の機能」の固定順に表示する。
 環境設定と同じ `Settings.page_turn_animation_enabled` が唯一の設定ownerで、通常/F12から即反映・保存する。
-HUD/任意キーの保存は既存overflowのナビゲータ設定と同じ同期 `Settings::save()` を再利用する（2026-10-11利用者決定）。専用async保存や別のdirty stateは追加しない。
+HUD/任意キーの保存は既存overflowのナビゲータ設定と同じ同期 `Settings::save()` を再利用する（2026-10-11設計担当ClaudeCodeの判断）。専用async保存や別のdirty stateは追加しない。
 `FsPageTurnAnimationToggle` は `FsImage` / Press、既定キーなし。操作カスタマイズで割り当てるとHUDに先頭chordを表示する。
 overflowの表示項目カスタマイズや別のtoolbar/HUD設定は追加しない。
-紙めくりのstable geometryは描画先の物理px単位で判定し、fit矩形の独立丸めによる1px以内の差を許容する。実際の配置/寸法変更やROI/可視条件不足は同passの通常表示を保つ。
+評価用Stage 1では、通常単ページと二実頁の見開きの一枚を背から回し、perspective・頁の明暗・柔らかい影を付ける。LTR/RTL・進む/戻るに対応し、頁ごとの通常rect/UVを維持する。異寸法・scanの数px差だけでは省略せず、背の移動による静止面のclip/support欠損は各2%の仮品質上限で判定する。紙の未知の裏はneutral paperで、画面背景を流用しない。
+cover/補助表紙・相方白紙・見開き内の中央単頁・splitのstepはStage 1では理由付きinstant。未ready/final-only条件、ROI不足・予算不足の瞬時切替は維持する。新under-pageの外周は同じ時計の拡張clipで連続的に露出する。
+部分leafの採用は各頁のfirst-visible計測だけでnavigationを完了しない。自然終了/割込みはtarget全頁のcanonical flat採用後に完了し、割込みの一件は次の有効frameでinstant navigationする。通常一〜二frameの費用を持ち、turn完走待ちやOFF時の新queueは作らない。終了入力を先に解決し、commit後の正本から描画/入力情報と描画ownerを捕捉する。動画継続は旧canvas/footerを終了して既存媒体切替へ戻し、F12 independent stillの動画拒否を維持する。
 
 サムネイル一覧、通常の画像フルスクリーン、動画フルスクリーン、消しゴム / 隠蔽加工 / 切り取り / テキスト注釈 / 補正レイヤーモードでは、既定 `?` の `HelpShowContextShortcuts` で現在の文脈のショートカット一覧を
 表示する。keymap 化済み操作は現在の実割り当てで表示し、Esc / 矢印など当面固定扱いの

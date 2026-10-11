@@ -4539,6 +4539,28 @@ QAのcache-read witnessは相関済み画像の受理時に記録し、進捗は
 detached述語・viewport生成・placement・focus・registry protocolは変更しない。
 これは両側の既存ownerを保持する統合であり、新しい待機状態・retry・時間窓を追加しない。
 
+### 2026-10-11 §1.341 Stage 1: book leafとcanonical flat完了のcontext所有
+
+§2を確認し、利用者指定の段階実装としてR7 `fa5119c19`（独立設計ACCEPT）の通常Single/Pair投影を接続する。
+各頁のnormal prepared geometry/素材とlayoutのH/gを同じpassへ提出し、leafのpartial receiptは全頁navigation完了に使わない。
+割込み/自然終端は既存context所有presenterの`Completing`へ移り、取消targetのcanonical flat accepted receiptを採用してから
+一つの解決済み通常navigationをcommitする。root入力はframe-localにowning callbackへ委譲し、
+終了入力→commit→fresh page snapshotを共有する。媒体/host経路が変われば旧canvas/footerを終了して既存media-switchへ戻す。
+F12 independent stillの既存動画拒否を通し、callbackから同viewportを再showしない。
+
+create/mutate/adopt/cancel/dropはmounted presenterと同じViewerContext bundleに留める。
+normal mount/depositでは取消せず、forkは新しいInactive presenterを作る。兄弟窓のread-only open/closeは元contextを失効させない。
+全体設定変更時のeffect取消は各contextを回る既存ownerで行い、既に必要なflat完了を残す。
+outputのbatch lease/VRAM dedupを保ち、normal cacheの素材を追加decode/uploadしない。
+cover/中央単頁/splitと継続操作はStage 1では理由付きinstant、native/navigation機能は通常handlerを維持する。
+
+この変更はcontextの提示証拠と入力・描画捕捉の順序を揃える構造修正であり、症状guard・sleep・別pending queueによる修正ではない。
+変更範囲は`src/page_turn_animation.rs`、`src/ui_fullscreen/page_turn.rs`と同`barrier.rs`、`src/ui_fullscreen.rs`、
+`src/app.rs`、`src/app/gamepad_input.rs`、`src/app/viewer_context_registry.rs`と関連tests/goldens/docs。
+R7の独立設計ACCEPTを根拠とし、この実装差分の独立完了レビュー・実機motion/性能受入れは未了。
+検証証拠は[page-turn-animation-plan.md §19](page-turn-animation-plan.md#19-stage-1--通常頁の実装と早期motion評価2026-10-11)と
+`target/A-1341-stage1-msg.txt`へ記録する。
+
 ### 2026-10-11 §1.364 D2f: import取消の失効を既存maintenance ownerへ集約
 
 利用者指定の構造修正として、import workerがすべてのErrからglobal失効を作る経路を撤去する。

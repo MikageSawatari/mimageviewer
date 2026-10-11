@@ -4,6 +4,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+mod barrier;
+use barrier::{FlatCompletion, ResolvedPageTurnNavigation};
+
 static NEXT_OPERATION_BATCH: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +87,7 @@ impl PointerDelivery {
 #[derive(Clone, Default)]
 struct PointerPresses {
     buttons: [PointerDelivery; 5],
+    touches: Vec<((egui::TouchDeviceId, egui::TouchId), PointerDelivery)>,
 }
 
 fn observe_pointer_transaction(ctx: &egui::Context) {
@@ -133,13 +137,47 @@ fn observe_pointer_transaction(ctx: &egui::Context) {
                     Some((delivery, OperationPhase::Continuous, "drag"))
                 }
                 egui::Event::Touch {
+                    device_id,
+                    id,
                     phase: egui::TouchPhase::Start,
                     ..
-                } => Some((delivery, OperationPhase::Press, "touch")),
+                } => {
+                    presses
+                        .touches
+                        .retain(|(contact, _)| *contact != (*device_id, *id));
+                    presses.touches.push(((*device_id, *id), delivery));
+                    Some((delivery, OperationPhase::Press, "touch"))
+                }
                 egui::Event::Touch {
                     phase: egui::TouchPhase::Move,
                     ..
                 } => Some((delivery, OperationPhase::Continuous, "drag")),
+                egui::Event::Touch {
+                    device_id,
+                    id,
+                    phase: egui::TouchPhase::End | egui::TouchPhase::Cancel,
+                    ..
+                } => {
+                    let contact = presses
+                        .touches
+                        .iter()
+                        .position(|(contact, _)| *contact == (*device_id, *id));
+                    contact.and_then(|index| {
+                        let (_, original) = presses.touches.remove(index);
+                        matches!(
+                            event,
+                            egui::Event::Touch {
+                                phase: egui::TouchPhase::End,
+                                ..
+                            }
+                        )
+                        .then_some((
+                            original,
+                            OperationPhase::Press,
+                            "touch",
+                        ))
+                    })
+                }
                 _ => None,
             };
             if let Some(fact) = fact {
@@ -199,6 +237,8 @@ pub(super) struct PreparedPagedPage {
     pub(super) painter: egui::Painter,
     pub(super) underlay: FsBgStyle,
     pub(super) live: bool,
+    /// Normal spread layout's resolved spine and gutter, before texture paint rounding.
+    pub(super) spine: Option<(f32, f32)>,
 }
 
 #[derive(Clone)]
@@ -268,7 +308,8 @@ impl SubmittedUnitReceipt {
         destination: PresentationDestination,
         sources: &FsNavigatorTextureSources,
     ) -> bool {
-        self.destination == destination
+        !self.curl
+            && self.destination == destination
             && self.pages.as_slice().len() == sources.pages.len()
             && self
                 .pages
@@ -325,22 +366,32 @@ enum SubmissionStatus {
 }
 
 struct SubmissionTracker {
-    status: Mutex<SubmissionStatus>,
+    ledger: Mutex<SubmissionLedger>,
+}
+
+struct SubmissionLedger {
+    status: SubmissionStatus,
+    visible_pages: u8,
+    canonical_visible: bool,
 }
 
 impl SubmissionTracker {
     fn new() -> Self {
         Self {
-            status: Mutex::new(SubmissionStatus::Offered),
+            ledger: Mutex::new(SubmissionLedger {
+                status: SubmissionStatus::Offered,
+                visible_pages: 0,
+                canonical_visible: false,
+            }),
         }
     }
     fn status(&self) -> SubmissionStatus {
-        *self.status.lock().unwrap_or_else(|p| p.into_inner())
+        self.ledger.lock().unwrap_or_else(|p| p.into_inner()).status
     }
     fn end(&self) -> SubmissionStatus {
-        let mut state = self.status.lock().unwrap_or_else(|p| p.into_inner());
-        let previous = *state;
-        *state = SubmissionStatus::Cancelled;
+        let mut state = self.ledger.lock().unwrap_or_else(|p| p.into_inner());
+        let previous = state.status;
+        state.status = SubmissionStatus::Cancelled;
         previous
     }
 }
@@ -359,6 +410,10 @@ struct SubmissionEvent {
     elapsed_ms: f64,
     retained_bytes: u64,
     mesh_ms: f64,
+    silhouette_visibility_ms: f64,
+    tessellation_ms: f64,
+    outer_mask_ms: f64,
+    visible_pages: u8,
     proof: Option<serde_json::Value>,
 }
 
@@ -430,9 +485,9 @@ impl egui::Plugin for SubmissionPlugin {
         let Some(event) = pending.event else {
             return;
         };
-        let mut status = event
+        let mut ledger = event
             .tracker
-            .status
+            .ledger
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         let mut fields = Vec::new();
@@ -441,6 +496,12 @@ impl egui::Plugin for SubmissionPlugin {
                 ("elapsed_ms", event.elapsed_ms.into()),
                 ("retain_bytes", event.retained_bytes.into()),
                 ("mesh_cpu_ms", event.mesh_ms.into()),
+                (
+                    "silhouette_visibility_cpu_ms",
+                    event.silhouette_visibility_ms.into(),
+                ),
+                ("tessellation_cpu_ms", event.tessellation_ms.into()),
+                ("outer_mask_cpu_ms", event.outer_mask_ms.into()),
                 ("frame", pending.receipt.frame.into()),
                 ("pass", pending.receipt.pass.into()),
                 ("clock_origin", "accepted_navigation".into()),
@@ -450,26 +511,65 @@ impl egui::Plugin for SubmissionPlugin {
             }
             fields.push(("submitted_pages",serde_json::Value::Array(pending.receipt.pages().iter().map(|(occurrence,source,native,area)|serde_json::json!({"idx":occurrence.idx,"role":format!("{:?}",occurrence.role),"navigation_anchor_idx":occurrence.navigation_anchor_idx,"source_texture_id":format!("{source:?}"),"native_texture_id":format!("{native:?}"),"visible_area":area})).collect())));
         }
-        match (event.kind, *status) {
+        match (event.kind, ledger.status) {
             (SubmissionKind::Curl, SubmissionStatus::Offered) => {
-                *status = SubmissionStatus::Started;
+                ledger.status = SubmissionStatus::Started;
                 emit(&event.fact, "start", "curl_submitted", &fields);
-                emit(&event.fact, "first_visible", "curl_submitted", &fields);
                 emit(&event.fact, "frame", "curl_submitted", &fields);
             }
             (SubmissionKind::Curl, SubmissionStatus::Started) => {
                 emit(&event.fact, "frame", "curl_submitted", &fields);
             }
             (SubmissionKind::Canonical, SubmissionStatus::Started) => {
-                *status = SubmissionStatus::Finished;
+                ledger.status = SubmissionStatus::Finished;
+                ledger.canonical_visible = true;
                 emit(&event.fact, "finish", "canonical_submitted", &fields);
                 emit(&event.fact, "fully_visible", "canonical_submitted", &fields);
             }
+            (SubmissionKind::Canonical, SubmissionStatus::Cancelled)
+                if !ledger.canonical_visible =>
+            {
+                ledger.canonical_visible = true;
+                emit(
+                    &event.fact,
+                    "fully_visible",
+                    "canonical_after_cancel",
+                    &fields,
+                );
+            }
             (SubmissionKind::Canonical, SubmissionStatus::Offered) => {
-                *status = SubmissionStatus::Cancelled;
+                ledger.status = SubmissionStatus::Cancelled;
                 emit(&event.fact, "skip", "expired_before_accepted_curl", &[]);
             }
             _ => {}
+        }
+        if matches!(
+            ledger.status,
+            SubmissionStatus::Started | SubmissionStatus::Finished
+        ) || matches!(event.kind, SubmissionKind::Canonical) && ledger.canonical_visible
+        {
+            for (i, (occurrence, _, _, area)) in pending.receipt.pages().iter().enumerate() {
+                let bit = 1 << i;
+                if event.visible_pages & bit != 0 && ledger.visible_pages & bit == 0 {
+                    ledger.visible_pages |= bit;
+                    let mut page_fields = fields.clone();
+                    page_fields.extend([
+                        ("idx", occurrence.idx.into()),
+                        ("role", format!("{:?}", occurrence.role).into()),
+                        ("visible_area", (*area).into()),
+                    ]);
+                    emit(
+                        &event.fact,
+                        "first_visible",
+                        if pending.receipt.curl {
+                            "curl_page_submitted"
+                        } else {
+                            "canonical_page_submitted"
+                        },
+                        &page_fields,
+                    );
+                }
+            }
         }
     }
 }
@@ -499,6 +599,7 @@ struct PaintedUnit {
     items: u64,
     layout: Arc<Vec<SpreadDisplayUnit>>,
     mode: SpreadMode,
+    reading_rtl: bool,
     slice: crate::page_split::PageSlice,
     pages: Vec<PreparedPagedPage>,
     white: Option<(egui::Rect, egui::Rect)>,
@@ -519,6 +620,7 @@ impl PaintedUnit {
             && self.items == other.items
             && Arc::ptr_eq(&self.layout, &other.layout)
             && self.mode == other.mode
+            && self.reading_rtl == other.reading_rtl
             && self.slice == other.slice
             && self.white == other.white
             && self.pages.len() == other.pages.len()
@@ -533,6 +635,7 @@ impl PaintedUnit {
                     && a.transform.fit_input == b.transform.fit_input
                     && a.transform.fit_scale_limits == b.transform.fit_scale_limits
                     && a.transform.pixels_per_point == b.transform.pixels_per_point
+                    && a.spine == b.spine
                     && a.painter.clip_rect() == b.painter.clip_rect()
                     && same_underlay(&a.underlay, &b.underlay)
             })
@@ -630,6 +733,37 @@ struct AcceptedOffer {
     submission: Arc<SubmissionTracker>,
 }
 
+struct PreparedLeaf {
+    outgoing: crate::page_turn_animation::CanonicalUnit,
+    incoming: crate::page_turn_animation::CanonicalUnit,
+    direction: crate::page_turn_animation::TurnDirection,
+    recipe: crate::page_turn_animation::TurnRecipe,
+    prepare_cpu_ms: f64,
+}
+
+fn prepare_leaf(
+    outgoing: &PaintedUnit,
+    incoming: &PaintedUnit,
+    forward: bool,
+) -> Result<PreparedLeaf, &'static str> {
+    let start = crate::perf::is_enabled().then(Instant::now);
+    let outgoing = canonical_unit(outgoing)?;
+    let input = canonical_unit(incoming)?;
+    let direction = crate::page_turn_animation::TurnDirection {
+        reading_rtl: incoming.reading_rtl,
+        forward,
+    };
+    let recipe = crate::page_turn_animation::prepare_turn(&outgoing, &input, direction)
+        .map_err(|e| e.sub_check())?;
+    Ok(PreparedLeaf {
+        outgoing,
+        incoming: input,
+        direction,
+        recipe,
+        prepare_cpu_ms: start.map_or(0.0, |s| s.elapsed().as_secs_f64() * 1000.0),
+    })
+}
+
 enum PresentationState {
     Inactive,
     Flat(Arc<PaintedUnit>),
@@ -641,7 +775,32 @@ enum PresentationState {
         outgoing: Arc<PaintedUnit>,
         incoming: Arc<PaintedUnit>,
         offer: AcceptedOffer,
+        projection: PreparedLeaf,
     },
+    Completing {
+        incoming: Arc<PaintedUnit>,
+        completion: FlatCompletion,
+        continuation: Option<ResolvedPageTurnNavigation>,
+        diagnostics: CompletionDiagnostics,
+    },
+}
+
+/// Correlates the mandatory flat with the original turn without keeping its
+/// outgoing resources or an effect clock alive.
+struct CompletionDiagnostics {
+    fact: ViewerOperationFact,
+    tracker: Arc<SubmissionTracker>,
+    accepted_at: Instant,
+}
+
+impl CompletionDiagnostics {
+    fn from_offer(offer: &AcceptedOffer) -> Self {
+        Self {
+            fact: offer.fact,
+            tracker: offer.submission.clone(),
+            accepted_at: offer.accepted_at,
+        }
+    }
 }
 
 /// Input observation is a transaction projection, never a navigation request or queue.
@@ -683,6 +842,15 @@ impl Default for PageTurnPresentation {
 }
 
 impl PageTurnPresentation {
+    pub(crate) fn has_flat_completion(&self) -> bool {
+        matches!(self.state, PresentationState::Completing { .. })
+    }
+    pub(crate) fn cancel_for_settings(&mut self) {
+        self.cancel("settings_changed");
+        // A continuation has its own immutable fact. Old raw input is not
+        // eligible for a new offer when the setting is turned on again.
+        self.transaction = OperationTransaction::default();
+    }
     pub(crate) fn cancel(&mut self, reason: &'static str) {
         let old = std::mem::replace(&mut self.state, PresentationState::Inactive);
         match old {
@@ -705,7 +873,12 @@ impl PageTurnPresentation {
                         &[("retain_bytes", incoming.retained_bytes().into())],
                     );
                 }
-                self.state = PresentationState::Flat(incoming);
+                self.state = PresentationState::Completing {
+                    incoming,
+                    completion: FlatCompletion::NeedFlat,
+                    continuation: None,
+                    diagnostics: CompletionDiagnostics::from_offer(&offer),
+                };
                 self.transaction.disposition = OperationDisposition::Cancelled;
             }
             PresentationState::Offered { outgoing, offer } => {
@@ -791,6 +964,17 @@ impl PageTurnPresentation {
     }
 
     #[cfg(test)]
+    pub(crate) fn continuation_operation_for_test(&self) -> Option<(ViewerOperationId, usize)> {
+        match &self.state {
+            PresentationState::Completing {
+                continuation: Some(command),
+                ..
+            } => Some((command.fact.operation_id, command.target_idx)),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn seed_operation_for_test(
         &mut self,
         destination: PresentationDestination,
@@ -862,7 +1046,7 @@ impl App {
         if self.settings.page_turn_animation_enabled
             && (!enabled || self.settings.page_turn_animation_duration_ms != duration_ms)
         {
-            self.deactivate_all_page_turn_presentations("settings_changed");
+            self.cancel_all_page_turn_effects_for_settings();
         }
         crate::key_input::set_page_turn_ingress_instrumentation_enabled(enabled);
         self.settings.page_turn_animation_enabled = enabled;
@@ -871,7 +1055,7 @@ impl App {
 
     pub(crate) fn page_turn_pre_draw(&mut self, ctx: &egui::Context) {
         self.flush_submitted_page_turn_ready(ctx);
-        if !self.settings.page_turn_animation_enabled {
+        if !self.settings.page_turn_animation_enabled && !self.page_turn_completion_active() {
             let enabled_id = egui::Id::new("page_turn_input_enabled");
             if ctx.data(|d| d.get_temp::<bool>(enabled_id)) == Some(true) {
                 ctx.data_mut(|d| d.insert_temp(enabled_id, false));
@@ -886,12 +1070,11 @@ impl App {
                 i.viewport().minimized.unwrap_or(false) || !i.viewport().focused.unwrap_or(true)
             })
         {
-            self.page_turn_presentation
-                .deactivate("hidden_or_focus_lost");
+            self.page_turn_presentation.cancel("hidden_or_focus_lost");
             return;
         }
         if self.fs_loupe_locked || self.page_turn_loupe_hold(ctx) {
-            self.page_turn_presentation.deactivate("loupe");
+            self.page_turn_presentation.cancel("loupe");
             self.page_turn_presentation.transaction.disposition = OperationDisposition::Cancelled;
             return;
         }
@@ -935,6 +1118,11 @@ impl App {
                         *active = routed;
                     }
                 }
+                for (_, active) in &mut presses.touches {
+                    if active.id() == Some(operation_id) {
+                        *active = routed;
+                    }
+                }
                 facts.push(ViewerOperationFact {
                     destination,
                     operation_id,
@@ -968,7 +1156,7 @@ impl App {
         ctx: &egui::Context,
         operations: &[(ViewerOperationId, OperationPhase, &'static str)],
     ) {
-        if !self.settings.page_turn_animation_enabled {
+        if !self.settings.page_turn_animation_enabled && !self.page_turn_barrier_active() {
             return;
         }
         let destination = self.page_turn_destination();
@@ -1123,6 +1311,20 @@ impl App {
             self.page_turn_excluded_navigation(ctx, reason);
             return;
         };
+        if self
+            .items
+            .get(target)
+            .is_some_and(|item| matches!(item, GridItem::Video { .. } | GridItem::Audio { .. }))
+        {
+            emit(&fact, "skip", "stage1_media_target", &[]);
+            return;
+        }
+        if self.spread_mode.is_split()
+            || self.fullscreen_page_slice != crate::page_split::PageSlice::Full
+        {
+            emit(&fact, "skip", "stage1_split_step", &[]);
+            return;
+        }
         if !self.page_turn_view_eligible(target) || self.page_turn_loupe_hold(ctx) {
             emit(&fact, "skip", "ineligible_view", &[]);
             return;
@@ -1145,6 +1347,17 @@ impl App {
         }
         let composition = self.spread_display_composition_for_anchor(target);
         let occurrences = composition.pages_in_screen_order(self.spread_mode);
+        if let Some(reason) = stage_one_shape_reason(
+            self.spread_mode,
+            occurrences.len(),
+            occurrences
+                .iter()
+                .any(|o| o.role != SpreadPageRole::Navigation),
+            false,
+        ) {
+            emit(&fact, "skip", reason, &[]);
+            return;
+        }
         let mut ready_sources = Vec::with_capacity(occurrences.len());
         for occurrence in occurrences {
             if !self.page_turn_view_eligible(occurrence.idx) {
@@ -1183,6 +1396,19 @@ impl App {
             emit(&fact, "skip", "no_outgoing_paint", &[]);
             return;
         };
+        if let Some(reason) = stage_one_shape_reason(
+            outgoing.mode,
+            outgoing.pages.len(),
+            outgoing
+                .pages
+                .iter()
+                .any(|p| p.occurrence.role != SpreadPageRole::Navigation),
+            outgoing.white.is_some(),
+        ) {
+            emit(&fact, "skip", reason, &[]);
+            self.page_turn_presentation.state = PresentationState::Flat(outgoing);
+            return;
+        }
         let bytes = outgoing.retained_bytes();
         let budget = self.vram_pool_budget();
         let resident_bytes = self.vram_accounting_snapshot().total_bytes();
@@ -1260,6 +1486,7 @@ impl App {
             pages.len() <= 2,
             "normal paged units have at most two real occurrences"
         );
+        self.refresh_page_turn_completion_pages(pages, white);
         // OFF does no effect clock, snapshot/inventory work, geometry projection or input diagnostics.
         if !self.settings.page_turn_animation_enabled {
             for page in pages {
@@ -1268,7 +1495,14 @@ impl App {
             if let Some((rect, clip)) = white {
                 paint_white_companion(&pages[0].painter, rect, clip);
             }
-            return Some(flat_receipt(self.page_turn_destination(), ctx, pages, true));
+            let completing = self.page_turn_completion_active();
+            let receipt = flat_receipt(self.page_turn_destination(), ctx, pages, !completing);
+            let event = self.page_turn_completion_event(&receipt);
+            self.record_page_turn_completion_flat(&receipt);
+            if completing {
+                queue_submission(ctx, receipt.clone(), event);
+            }
+            return Some(receipt);
         }
         // `live` comes from the normal unit/source selector. Do not re-resolve,
         // prepare or mutate holdover readiness while deciding presentation.
@@ -1277,7 +1511,7 @@ impl App {
             .all(|p| p.live && self.page_turn_view_eligible(p.occurrence.idx))
             && !self.page_turn_loupe_hold(ctx);
         if !eligible {
-            self.page_turn_presentation.deactivate("ineligible_view");
+            self.page_turn_presentation.cancel("ineligible_view");
             for page in pages {
                 paint_flat_page(page);
             }
@@ -1285,7 +1519,9 @@ impl App {
                 paint_white_companion(&pages[0].painter, rect, clip);
             }
             let receipt = flat_receipt(self.page_turn_destination(), ctx, pages, false);
-            queue_submission(ctx, receipt.clone(), None);
+            let event = self.page_turn_completion_event(&receipt);
+            self.record_page_turn_completion_flat(&receipt);
+            queue_submission(ctx, receipt.clone(), event);
             return Some(receipt);
         }
         let mut receipt = flat_receipt(self.page_turn_destination(), ctx, pages, false);
@@ -1294,6 +1530,11 @@ impl App {
             items: self.items_generation,
             layout: Arc::clone(&self.spread_display_units_cache.units),
             mode: self.spread_mode,
+            reading_rtl: self
+                .spread_mode
+                .canonical_reading_direction()
+                .unwrap_or(self.reading_direction)
+                == ReadingDirection::Rtl,
             slice: self.fullscreen_page_slice,
             pages: pages.to_vec(),
             white,
@@ -1311,6 +1552,7 @@ impl App {
                     && offer.fact.destination == unit.destination
                     && outgoing.items == unit.items
                     && outgoing.mode == unit.mode
+                    && outgoing.reading_rtl == unit.reading_rtl
                     && outgoing.slice == unit.slice
                     && Arc::ptr_eq(&outgoing.layout, &unit.layout)
                     && outgoing.pages.len() == unit.pages.len()
@@ -1338,10 +1580,18 @@ impl App {
                     && deadline_allows
                     && now.saturating_duration_since(offer.accepted_at) < offer.duration
                 {
-                    PresentationState::Turning {
-                        outgoing,
-                        incoming: unit.clone(),
-                        offer,
+                    match prepare_leaf(&outgoing, &unit, offer.forward) {
+                        Ok(projection) => PresentationState::Turning {
+                            outgoing,
+                            incoming: unit.clone(),
+                            offer,
+                            projection,
+                        },
+                        Err(reason) => {
+                            offer.submission.end();
+                            emit_projection_failure(&offer, &outgoing, &unit, "skip", reason);
+                            PresentationState::Flat(unit.clone())
+                        }
                     }
                 } else {
                     offer.submission.end();
@@ -1362,12 +1612,14 @@ impl App {
                 outgoing,
                 incoming,
                 offer,
+                projection,
             } => {
                 if incoming.same_material_and_geometry(&unit) {
                     PresentationState::Turning {
                         outgoing,
                         incoming,
                         offer,
+                        projection,
                     }
                 } else {
                     let previous = offer.submission.end();
@@ -1392,6 +1644,17 @@ impl App {
             PresentationState::Flat(previous) => {
                 PresentationState::Flat(PaintedUnit::select_flat(previous, &unit))
             }
+            PresentationState::Completing {
+                incoming,
+                completion,
+                continuation,
+                diagnostics,
+            } => PresentationState::Completing {
+                incoming,
+                completion,
+                continuation,
+                diagnostics,
+            },
             _ => PresentationState::Flat(unit.clone()),
         };
         let mut final_state = selected;
@@ -1401,6 +1664,7 @@ impl App {
             outgoing,
             incoming,
             offer,
+            projection: prepared,
         } = &final_state
         {
             let progress = now
@@ -1409,22 +1673,36 @@ impl App {
                 / offer.duration.as_secs_f32();
             if progress < 1.0 {
                 let t0 = crate::perf::is_enabled().then(Instant::now);
-                let projection = canonical_unit(outgoing).and_then(|out| {
-                    canonical_unit(incoming).and_then(|input| {
-                        crate::page_turn_animation::project_turn(
-                            &out,
-                            &input,
-                            crate::page_turn_animation::TurnDirection {
-                                reading_rtl: unit.mode.advances_right_to_left(),
-                                forward: offer.forward,
-                            },
-                            progress,
-                        )
-                        .map_err(|failure| failure.sub_check())
-                    })
-                });
+                let projection = crate::page_turn_animation::project_prepared(
+                    &prepared.outgoing,
+                    &prepared.incoming,
+                    prepared.direction,
+                    prepared.recipe,
+                    progress,
+                    crate::perf::is_enabled(),
+                )
+                .map_err(|failure| failure.sub_check());
                 match projection {
                     Ok(projection) => {
+                        let mesh_stats = crate::perf::is_enabled().then(|| {
+                            let vertices: usize = projection
+                                .meshes
+                                .iter()
+                                .map(|draw| draw.mesh.vertices.len())
+                                .sum();
+                            let indices: usize = projection
+                                .meshes
+                                .iter()
+                                .map(|draw| draw.mesh.indices.len())
+                                .sum();
+                            serde_json::json!({
+                                "vertices": vertices,
+                                "triangles": indices / 3,
+                                "draws": projection.meshes.len(),
+                                "vertex_bytes": vertices * std::mem::size_of::<egui::epaint::Vertex>(),
+                                "index_bytes": indices * std::mem::size_of::<u32>()
+                            })
+                        });
                         for draw in projection.meshes {
                             let painter = unit.pages[0].painter.with_clip_rect(draw.clip_rect);
                             #[cfg(any(test, all(windows, feature = "test-script")))]
@@ -1483,8 +1761,12 @@ impl App {
                                 * 1000.0,
                             retained_bytes: outgoing.reserved_bytes.load(Ordering::Relaxed),
                             mesh_ms: t0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0),
+                            silhouette_visibility_ms: projection.cost.silhouette_visibility_ms,
+                            tessellation_ms: projection.cost.tessellation_ms,
+                            outer_mask_ms: projection.cost.outer_mask_cpu_ms,
+                            visible_pages: projection.visibility.incoming.iter().fold(0, |mask, v| if v.fraction() >= 0.05 && v.short_edge >= 8.0 { mask | (1 << v.occurrence) } else { mask }),
                             proof: crate::perf::is_enabled()
-                                .then(||serde_json::json!({"incoming":unit_diagnostics(incoming,offer),"outgoing":unit_diagnostics(outgoing,offer)})),
+                                .then(||serde_json::json!({"recipe":if unit.mode.is_spread() { "BookLeaf" } else if offer.forward { "SingleDeparture" } else { "SingleArrival" },"angle_degrees":projection.angle_degrees,"hinge_x":projection.hinge_x,"face":if projection.showing_back {"back"} else {"front"},"recipe_prepare_cpu_ms":prepared.prepare_cpu_ms,"mesh":mesh_stats,"static_clip_loss_fraction":projection.cost.static_clip_loss_fraction,"static_support_loss_fraction":projection.cost.static_support_loss_fraction,"visible":projection.visibility.incoming.iter().map(|v|serde_json::json!({"occurrence":v.occurrence,"area":v.visible_area,"fraction":v.fraction(),"short_edge":v.short_edge})).collect::<Vec<_>>(),"incoming":unit_diagnostics(incoming,offer),"outgoing":unit_diagnostics(outgoing,offer)})),
                         });
                         curl = true;
                         ctx.request_repaint();
@@ -1531,9 +1813,18 @@ impl App {
                         * 1000.0,
                     retained_bytes: 0,
                     mesh_ms: 0.0,
+                    silhouette_visibility_ms: 0.0,
+                    tessellation_ms: 0.0,
+                    outer_mask_ms: 0.0,
+                    visible_pages: (1 << unit.pages.len()) - 1,
                     proof: crate::perf::is_enabled().then(|| unit_diagnostics(incoming, offer)),
                 });
-                final_state = PresentationState::Flat(unit.clone());
+                final_state = PresentationState::Completing {
+                    incoming: unit.clone(),
+                    completion: FlatCompletion::NeedFlat,
+                    continuation: None,
+                    diagnostics: CompletionDiagnostics::from_offer(offer),
+                };
             }
         }
         if !curl {
@@ -1556,8 +1847,113 @@ impl App {
             );
         }
         self.page_turn_presentation.state = final_state;
+        if !curl {
+            if submission_event.is_none() {
+                submission_event = self.page_turn_completion_event(&receipt);
+            }
+            self.record_page_turn_completion_flat(&receipt);
+        }
         queue_submission(ctx, receipt.clone(), submission_event);
         Some(receipt)
+    }
+
+    fn page_turn_completion_event(
+        &self,
+        receipt: &SubmittedUnitReceipt,
+    ) -> Option<SubmissionEvent> {
+        let PresentationState::Completing {
+            incoming,
+            diagnostics,
+            ..
+        } = &self.page_turn_presentation.state
+        else {
+            return None;
+        };
+        if receipt.curl
+            || receipt.destination != incoming.destination
+            || receipt.pages().len() != incoming.pages.len()
+            || !incoming.pages.iter().all(|page| {
+                receipt.pages().iter().any(|(o, source, paint, area)| {
+                    *o == page.occurrence
+                        && *source == page.resource.source_texture_id()
+                        && *paint == page.resource.paint_texture_id()
+                        && *area > 0.0
+                })
+            })
+        {
+            return None;
+        }
+        Some(SubmissionEvent {
+            tracker: diagnostics.tracker.clone(),
+            fact: diagnostics.fact,
+            kind: SubmissionKind::Canonical,
+            elapsed_ms: if crate::perf::is_enabled() {
+                diagnostics.accepted_at.elapsed().as_secs_f64() * 1000.0
+            } else {
+                0.0
+            },
+            retained_bytes: 0,
+            mesh_ms: 0.0,
+            silhouette_visibility_ms: 0.0,
+            tessellation_ms: 0.0,
+            outer_mask_ms: 0.0,
+            visible_pages: (1 << incoming.pages.len()) - 1,
+            proof: None,
+        })
+    }
+
+    /// The receipt binds the actual normal output, not a stale native ROI from
+    /// the canceled pose. A resize/fit change can replace that output while the
+    /// logical target and immutable source are unchanged.
+    fn refresh_page_turn_completion_pages(
+        &mut self,
+        pages: &[PreparedPagedPage],
+        white: Option<(egui::Rect, egui::Rect)>,
+    ) {
+        let PresentationState::Completing {
+            incoming,
+            completion,
+            ..
+        } = &self.page_turn_presentation.state
+        else {
+            return;
+        };
+        if matches!(completion, FlatCompletion::Submitted(receipt) if receipt.was_accepted()) {
+            return;
+        }
+        if incoming.destination != self.page_turn_destination()
+            || incoming.items != self.items_generation
+            || incoming.mode != self.spread_mode
+            || incoming.slice != self.fullscreen_page_slice
+            || !Arc::ptr_eq(&incoming.layout, &self.spread_display_units_cache.units)
+            || incoming.pages.len() != pages.len()
+            || !incoming.pages.iter().zip(pages).all(|(old, new)| {
+                old.occurrence == new.occurrence
+                    && old.resource.source_texture_id() == new.resource.source_texture_id()
+                    && old.resource.source_generation() == new.resource.source_generation()
+            })
+        {
+            self.page_turn_presentation
+                .deactivate("completion_source_or_configuration_changed");
+            return;
+        }
+        let fresh = Arc::new(PaintedUnit {
+            pages: pages.to_vec(),
+            white,
+            ..(**incoming).clone()
+        });
+        if incoming.same_material_and_geometry(&fresh) {
+            return;
+        }
+        if let PresentationState::Completing {
+            incoming,
+            completion,
+            ..
+        } = &mut self.page_turn_presentation.state
+        {
+            *incoming = fresh;
+            *completion = FlatCompletion::NeedFlat;
+        }
     }
 }
 
@@ -1671,6 +2067,31 @@ fn visible_rect_area(rect: egui::Rect) -> f32 {
 fn slideshow_interval_allows_turn(duration: Duration, interval: Duration) -> bool {
     duration <= interval
 }
+
+/// Stage 1 supports ordinary full-page windows and two real navigation pages.
+/// This boundary is about composition, never a guess from fitted aspect ratios.
+fn stage_one_shape_reason(
+    mode: SpreadMode,
+    real_pages: usize,
+    supplement: bool,
+    white: bool,
+) -> Option<&'static str> {
+    if mode.is_split() {
+        Some("stage1_split_step")
+    } else if supplement || white {
+        Some("stage1_cover_or_single_companion")
+    } else if mode.is_spread() && real_pages != 2 {
+        Some(if mode.has_cover() {
+            "stage1_cover_or_side_single"
+        } else {
+            "stage1_centered_single"
+        })
+    } else if !mode.is_spread() && mode != SpreadMode::Single {
+        Some("stage1_unsupported_flow")
+    } else {
+        None
+    }
+}
 fn slideshow_deadline_allows_turn(
     accepted_at: Instant,
     duration: Duration,
@@ -1691,7 +2112,7 @@ fn unit_diagnostics(unit: &PaintedUnit, offer: &AcceptedOffer) -> serde_json::Va
         "resident_bytes_at_accept":offer.resident_bytes,
         "global_pin_bytes_at_accept":offer.pin_bytes,
         "expected_sources":offer.ready_sources.iter().map(|(o,id,g)|serde_json::json!({"idx":o.idx,"source_texture_id":format!("{id:?}"),"source_generation":{"items":g.items,"input":g.input}})).collect::<Vec<_>>(),
-        "reading_rtl":unit.mode.advances_right_to_left(),
+        "reading_rtl":unit.reading_rtl,
         "forward":offer.forward,
         "duration_ms":offer.duration.as_millis() as u64,
         "mode":format!("{:?}",unit.mode),
@@ -1706,11 +2127,49 @@ fn unit_diagnostics(unit: &PaintedUnit, offer: &AcceptedOffer) -> serde_json::Va
                 "source_generation":resource.source_generation().map(|g|serde_json::json!({"items":g.items,"input":g.input})),
                 "visible_source_roi":resource.visible_source_uv_rect().map(rect_diagnostics),
                 "canonical_rect":rect_diagnostics(page.transform.paint_rect),"clip_rect":rect_diagnostics(page.painter.clip_rect()),
+                "normal_layout_spine":page.spine.map(|(h, g)|serde_json::json!({"hinge_x":h,"gutter_width":g})),
                 "viewport_rect":rect_diagnostics(page.transform.viewport_rect),"pixels_per_point":page.transform.pixels_per_point,
                 "uv":uv.map(|p|[p.x,p.y]),"quality":"normal_selected_processed_resource"
             })
         }).collect::<Vec<_>>()
     })
+}
+
+fn emit_projection_failure(
+    offer: &AcceptedOffer,
+    outgoing: &PaintedUnit,
+    incoming: &PaintedUnit,
+    kind: &'static str,
+    reason: &'static str,
+) {
+    if !crate::perf::is_enabled() {
+        return;
+    }
+    let loss = canonical_unit(outgoing)
+        .ok()
+        .zip(canonical_unit(incoming).ok())
+        .map(|(old, new)| {
+            crate::page_turn_animation::static_surface_loss(
+                &old,
+                &new,
+                crate::page_turn_animation::TurnDirection {
+                    reading_rtl: incoming.reading_rtl,
+                    forward: offer.forward,
+                },
+            )
+        });
+    emit(
+        &offer.fact,
+        kind,
+        "geometry_visibility_or_roi",
+        &[
+            ("sub_check", reason.into()),
+            (
+                "geometry",
+                serde_json::json!({"outgoing":unit_diagnostics(outgoing, offer),"incoming":unit_diagnostics(incoming, offer),"max_static_clip_loss_fraction":loss.map(|l|l.static_clip_loss_fraction),"max_static_support_loss_fraction":loss.map(|l|l.static_support_loss_fraction),"static_clip_loss_surface":loss.map(|l|l.static_clip_loss_surface),"static_clip_loss_hinge":loss.map(|l|l.static_clip_loss_hinge),"static_support_loss_surface":loss.map(|l|l.static_support_loss_surface),"static_support_loss_hinge":loss.map(|l|l.static_support_loss_hinge)}),
+            ),
+        ],
+    );
 }
 
 fn queue_submission(
@@ -1741,6 +2200,9 @@ fn canonical_unit(
     use crate::page_turn_animation::*;
     let mut pages = Vec::new();
     for (i, page) in unit.pages.iter().enumerate() {
+        if page.spine != unit.pages[0].spine {
+            return Err("mixed_normal_layout_spine");
+        }
         if page.transform.pixels_per_point != unit.pages[0].transform.pixels_per_point {
             return Err("mixed_destination_pixel_scale");
         }
@@ -1805,6 +2267,8 @@ fn canonical_unit(
         pages.sort_by(|a, b| a.rect.left().total_cmp(&b.rect.left()));
     }
     Ok(CanonicalUnit {
+        spine_x: unit.pages[0].spine.map(|(spine, _)| spine),
+        gutter_width: unit.pages[0].spine.map_or(0.0, |(_, gap)| gap),
         pixels_per_point: unit.pages[0].transform.pixels_per_point,
         layout: if pages.len() == 2 {
             UnitLayout::Spread
@@ -1859,6 +2323,10 @@ mod tests {
             elapsed_ms: 0.0,
             retained_bytes: 0,
             mesh_ms: 0.0,
+            silhouette_visibility_ms: 0.0,
+            tessellation_ms: 0.0,
+            outer_mask_ms: 0.0,
+            visible_pages: 1,
             proof: None,
         }
     }
@@ -1888,6 +2356,7 @@ mod tests {
             items: 1,
             layout: Arc::new(Vec::new()),
             mode: SpreadMode::Single,
+            reading_rtl: false,
             slice: crate::page_split::PageSlice::Full,
             pages: vec![PreparedPagedPage {
                 occurrence: SpreadPageOccurrence::navigation(0, 0),
@@ -1900,6 +2369,7 @@ mod tests {
                 painter: ctx.debug_painter().with_clip_rect(rect),
                 underlay: FsBgStyle::Solid(egui::Color32::BLACK),
                 live: true,
+                spine: None,
             }],
             white: None,
             reserved_bytes: Arc::new(AtomicU64::new(0)),
@@ -1936,6 +2406,67 @@ mod tests {
         presentation.deactivate("disabled");
         assert!(presentation.transaction.facts.is_empty());
     }
+    #[test]
+    fn touch_end_inherits_start_identity_and_original_destination() {
+        let ctx = egui::Context::default();
+        install(&ctx);
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.page_turn_animation_enabled = true;
+        let touch = |phase| egui::Event::Touch {
+            device_id: egui::TouchDeviceId(1),
+            id: egui::TouchId(9),
+            phase,
+            pos: egui::pos2(30.0, 40.0),
+            force: None,
+        };
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![touch(egui::TouchPhase::Start)],
+                ..Default::default()
+            },
+            |ctx| app.page_turn_pre_draw(ctx),
+        );
+        let start = app
+            .page_turn_presentation
+            .transaction
+            .facts
+            .iter()
+            .find(|f| f.cause == "touch")
+            .copied()
+            .unwrap();
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![touch(egui::TouchPhase::End)],
+                ..Default::default()
+            },
+            |ctx| app.page_turn_pre_draw(ctx),
+        );
+        let end = app
+            .page_turn_presentation
+            .transaction
+            .facts
+            .iter()
+            .find(|f| f.cause == "touch")
+            .copied()
+            .unwrap();
+        assert!(same_operation(&start, &end));
+        assert_eq!(start.destination, end.destination);
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![touch(egui::TouchPhase::End)],
+                ..Default::default()
+            },
+            |ctx| app.page_turn_pre_draw(ctx),
+        );
+        assert!(
+            !app.page_turn_presentation
+                .transaction
+                .facts
+                .iter()
+                .any(|f| f.cause == "touch")
+        );
+    }
+
     #[test]
     fn pointer_delivery_preserves_original_binding_on_release() {
         let id = ViewerOperationId::Pointer {
@@ -1993,7 +2524,7 @@ mod tests {
             let ctx = egui::Context::default();
             install(&ctx);
             let tracker = Arc::new(SubmissionTracker::new());
-            *tracker.status.lock().unwrap() = SubmissionStatus::Started;
+            tracker.ledger.lock().unwrap().status = SubmissionStatus::Started;
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
                 if ctx.current_pass_index() == 0 {
                     queue_submission(
@@ -2016,6 +2547,35 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn canceled_leaf_credits_unseen_pages_only_after_canonical_output_is_adopted() {
+        let ctx = egui::Context::default();
+        install(&ctx);
+        let tracker = Arc::new(SubmissionTracker::new());
+        tracker.ledger.lock().unwrap().status = SubmissionStatus::Started;
+        tracker.end();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            if ctx.current_pass_index() == 0 {
+                queue_submission(
+                    ctx,
+                    receipt(ctx, 1),
+                    Some(event(&tracker, SubmissionKind::Canonical)),
+                );
+                ctx.request_discard("cancel flat replay");
+            } else {
+                let ledger = tracker.ledger.lock().unwrap();
+                assert!(!ledger.canonical_visible);
+                assert_eq!(ledger.visible_pages, 0);
+                drop(ledger);
+                queue_submission(ctx, receipt(ctx, 1), None);
+            }
+        });
+        let ledger = tracker.ledger.lock().unwrap();
+        assert!(ledger.canonical_visible);
+        assert_eq!(ledger.visible_pages, 1);
+        assert_eq!(ledger.status, SubmissionStatus::Cancelled);
+    }
+
     #[test]
     fn weak_inventory_deduplicates_shared_sources_and_releases_after_last_real_batch() {
         let ctx = egui::Context::default();
@@ -2357,7 +2917,7 @@ mod tests {
         let outgoing = unit(&ctx, texture.clone(), 1);
         let incoming = unit(&ctx, texture, 1);
         let tracker = Arc::new(SubmissionTracker::new());
-        *tracker.status.lock().unwrap() = SubmissionStatus::Started;
+        tracker.ledger.lock().unwrap().status = SubmissionStatus::Started;
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             app.page_turn_external_operation(
                 ctx,
@@ -2370,6 +2930,7 @@ mod tests {
             );
             let old_fact = app.page_turn_presentation.take_candidate().unwrap();
             app.page_turn_presentation.state = PresentationState::Turning {
+                projection: prepare_leaf(&outgoing, &incoming, true).unwrap(),
                 outgoing: outgoing.clone(),
                 incoming: incoming.clone(),
                 offer: AcceptedOffer {
@@ -2398,7 +2959,7 @@ mod tests {
             );
             assert!(matches!(
                 app.page_turn_presentation.state,
-                PresentationState::Flat(_)
+                PresentationState::Completing { .. }
             ));
             assert!(
                 app.page_turn_presentation.transaction.disposition
@@ -2464,5 +3025,58 @@ mod tests {
             duration,
             now + Duration::from_millis(199)
         ));
+    }
+
+    #[test]
+    fn stage_one_shape_scope_keeps_pairs_in_cover_books_and_logs_other_shapes() {
+        for mode in [
+            SpreadMode::Ltr,
+            SpreadMode::Rtl,
+            SpreadMode::LtrCover,
+            SpreadMode::RtlCover,
+        ] {
+            assert_eq!(stage_one_shape_reason(mode, 2, false, false), None);
+            assert!(stage_one_shape_reason(mode, 1, false, false).is_some());
+            assert_eq!(
+                stage_one_shape_reason(mode, 2, true, false),
+                Some("stage1_cover_or_single_companion")
+            );
+        }
+        assert_eq!(
+            stage_one_shape_reason(SpreadMode::Single, 1, false, false),
+            None
+        );
+        assert_eq!(
+            stage_one_shape_reason(SpreadMode::SplitRtl, 1, false, false),
+            Some("stage1_split_step")
+        );
+        assert_eq!(
+            stage_one_shape_reason(SpreadMode::Ltr, 1, false, true),
+            Some("stage1_cover_or_single_companion")
+        );
+    }
+
+    #[test]
+    fn partial_leaf_receipt_cannot_complete_navigation_even_with_every_source_resident() {
+        let ctx = egui::Context::default();
+        let tex = ctx.load_texture(
+            "partial-navigation-proof",
+            egui::ColorImage::filled([4, 4], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let painted = unit(&ctx, tex, 1);
+        let page = &painted.pages[0];
+        let sources = FsNavigatorTextureSources {
+            pages: vec![FsNavigatorTextureSource {
+                occurrence: page.occurrence,
+                resource: page.resource.clone(),
+                provenance: FsDisplayUnitPageProvenance::Live,
+            }],
+            submission: FsDisplayUnitSubmission::Unsubmitted,
+        };
+        let mut proof = flat_receipt(destination(1), &ctx, &painted.pages, true);
+        assert!(proof.matches_sources(destination(1), &sources));
+        proof.curl = true;
+        assert!(!proof.matches_sources(destination(1), &sources));
     }
 }
