@@ -6695,6 +6695,7 @@ impl App {
         edge: GridSelectionEdge,
         source: &'static str,
     ) {
+        self.cancel_rating_membership_restore();
         let target = match edge {
             GridSelectionEdge::First => self.current_grid_order().first(),
             GridSelectionEdge::Last => self.current_grid_order().last(),
@@ -7042,6 +7043,9 @@ impl App {
         if !self.grid_item_input_allowed() {
             return;
         }
+        // Accepted manual input wins over a pending Undo landing, including
+        // empty sets and edge no-ops. Automatic moves do not pass this boundary.
+        self.cancel_rating_membership_restore();
         let display_order = self.current_grid_order().to_vec();
         let vi_len = display_order.len();
         if vi_len == 0 {
@@ -8540,6 +8544,94 @@ fn cycle_video_playback_speed(current: f64, delta: i32) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rating_undo_grid_pad_moves_edges_and_empty_sets_cancel_held_restore() {
+        use crate::app::rating_membership_tests::rating_undo_grid_input_case;
+        use crate::settings::GridViewMode;
+        for view in [GridViewMode::Thumbnail, GridViewMode::Details] {
+            for (dir, start, target) in [
+                (PadDir::Right, 0, 1),
+                (PadDir::Right, 2, 2),
+                (PadDir::Left, 1, 0),
+                (PadDir::Left, 0, 0),
+                (PadDir::Down, 0, 1),
+                (PadDir::Down, 2, 2),
+                (PadDir::Up, 1, 0),
+                (PadDir::Up, 0, 0),
+            ] {
+                rating_undo_grid_input_case(view, Some(start), Some(target), true, |app| {
+                    app.handle_gamepad_direction_for_grid(dir);
+                });
+            }
+            for dir in [PadDir::Right, PadDir::Left, PadDir::Down, PadDir::Up] {
+                rating_undo_grid_input_case(view, None, None, true, |app| {
+                    app.handle_gamepad_direction_for_grid(dir);
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn rating_undo_grid_ring_edge_moves_and_noops_cancel_held_restore() {
+        use crate::app::rating_membership_tests::rating_undo_grid_input_case;
+        use crate::ring_shortcut::{RingActionId, RingShortcutContext};
+        use crate::settings::GridViewMode;
+        for view in [GridViewMode::Thumbnail, GridViewMode::Details] {
+            for (action, start, target) in [
+                (RingActionId::GridMoveFirst, Some(1), Some(0)),
+                (RingActionId::GridMoveFirst, Some(0), Some(0)),
+                (RingActionId::GridMoveLast, Some(1), Some(2)),
+                (RingActionId::GridMoveLast, Some(2), Some(2)),
+                (RingActionId::GridMoveFirst, None, None),
+                (RingActionId::GridMoveLast, None, None),
+            ] {
+                rating_undo_grid_input_case(view, start, target, true, |app| {
+                    let _ = app.apply_ring_action(
+                        &egui::Context::default(),
+                        RingShortcutContext::Grid,
+                        action,
+                        "rating-undo-grid-edge-test",
+                    );
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn rating_undo_grid_blocked_pad_and_ring_moves_keep_held_restore() {
+        use crate::app::rating_membership_tests::rating_undo_grid_input_case;
+        use crate::filename_stack::StackView;
+        use crate::filename_stack_ui::StackReturnState;
+        use crate::ring_shortcut::{RingActionId, RingShortcutContext};
+        use crate::settings::GridViewMode;
+        for ring in [false, true] {
+            rating_undo_grid_input_case(GridViewMode::Thumbnail, Some(1), Some(1), false, |app| {
+                let view = std::sync::Arc::new(StackView::build(
+                    std::path::PathBuf::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    app.settings.stack_separator,
+                    app.settings.sort_order,
+                ));
+                app.stack_view = Some(std::sync::Arc::clone(&view));
+                app.stack_return_state = Some(StackReturnState::Refreshing { view });
+                if ring {
+                    let _ = app.apply_ring_action(
+                        &egui::Context::default(),
+                        RingShortcutContext::Grid,
+                        RingActionId::GridMoveFirst,
+                        "rating-undo-blocked-grid-test",
+                    );
+                } else {
+                    app.handle_gamepad_direction_for_grid(PadDir::Right);
+                }
+                app.stack_return_state = None;
+                app.stack_view = None;
+            });
+        }
+    }
+
     #[test]
     fn rating_membership_ring_success_receipt_precedes_publication_and_final_noop() {
         use super::*;

@@ -53471,6 +53471,25 @@ impl App {
         let vi = display_order.as_slice();
         let vi_len = vi.len();
 
+        // Explicit grid navigation supersedes a pending rating Undo landing even
+        // when the cursor is clamped at an edge or the current set is empty.
+        // Keep this at input acceptance, outside the automatic cursor owner.
+        // Ctrl+矢印はフォルダ移動に使うので、通常カーソル移動から除外。
+        let cursor_direction = if right && !ctrl_held && !alt_held {
+            Some(GridCursorDirection::Right)
+        } else if left && !ctrl_held && !alt_held {
+            Some(GridCursorDirection::Left)
+        } else if down && !ctrl_held && !alt_held {
+            Some(GridCursorDirection::Down)
+        } else if up && !ctrl_held && !alt_held {
+            Some(GridCursorDirection::Up)
+        } else {
+            None
+        };
+        if cursor_direction.is_some() || home || end || ((page_down || page_up) && !ctrl_held) {
+            self.cancel_rating_membership_restore();
+        }
+
         if vi_len > 0 {
             let sel = self
                 .selected
@@ -53504,18 +53523,6 @@ impl App {
             let cursor_wrap = self.settings.grid_cursor_wrap && !shift;
 
             // 画面上の表示順で移動し、raw index に変換する。
-            // Ctrl+矢印はフォルダ移動に使うので、通常カーソル移動から除外
-            let cursor_direction = if right && !ctrl_held && !alt_held {
-                Some(GridCursorDirection::Right)
-            } else if left && !ctrl_held && !alt_held {
-                Some(GridCursorDirection::Left)
-            } else if down && !ctrl_held && !alt_held {
-                Some(GridCursorDirection::Down)
-            } else if up && !ctrl_held && !alt_held {
-                Some(GridCursorDirection::Up)
-            } else {
-                None
-            };
             let new_vis_pos = if let Some(direction) = cursor_direction {
                 grid_cursor_nav_target_pos(vis_pos, vi_len, nav_cols, direction, cursor_wrap)
             } else if home {

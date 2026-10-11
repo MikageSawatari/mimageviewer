@@ -1111,8 +1111,8 @@ fn ready_with_current_rating_facts(
     ready.rows = items
         .iter()
         .map(|item| {
-            let GridItem::Image(path) = item else {
-                panic!("controlled Rating fixture requires physical image keys");
+            let (GridItem::Image(path) | GridItem::Folder(path)) = item else {
+                panic!("controlled Rating fixture requires physical path keys");
             };
             crate::rating_view::RatingViewRow {
                 key: crate::adjustment_db::normalize_path(path),
@@ -1167,6 +1167,194 @@ fn rating_view_with_absent_undo_origin() -> (AppTestEnv, Vec<GridItem>) {
         RatingAdoptionIntent::RestoreOrigin(_)
     ));
     (app, all)
+}
+
+/// Hold the real Rating Undo's Ready after the last reader leaves and its slot
+/// is removed. Shared by keyboard and pad handler regressions; no native input.
+pub(super) fn rating_undo_grid_input_case(
+    view: crate::settings::GridViewMode,
+    selected: Option<usize>,
+    expected: Option<usize>,
+    accepted: bool,
+    input: impl FnOnce(&mut App),
+) {
+    let mut app = images(&["origin"]);
+    let mut all = app.items.clone();
+    if selected.is_some() {
+        for name in ["b", "c", "d"] {
+            let path = app.current_folder.as_ref().unwrap().join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            all.push(GridItem::Folder(path));
+        }
+    }
+    install(&mut app, all.clone());
+    app.items_are_rating_view = true;
+    app.rating_view_stars = 3;
+    app.settings.grid_view_mode = view;
+    app.settings.grid_cols = 1;
+    app.settings.grid_cursor_wrap = false;
+    app.last_cell_h = 10.0;
+    app.last_viewport_h = 10.0;
+    assert!(app.set_rating(0, 4));
+    assert_eq!(app.fullscreen_idx, None, "last reader returns to grid");
+    let sender = controlled_rating_request(&mut app, RatingAdoptionIntent::Reconcile);
+    sender
+        .send(Ok(ready_with_current_rating_facts(&app, all[1..].to_vec())))
+        .unwrap();
+    app.poll_rating_view();
+    app.finish_page_identity_preparation_for_test();
+    assert!(!app.items.contains(&all[0]), "origin slot is gone");
+    app.move_grid_cursor(selected);
+    app.apply_meta_undo();
+    let intent = app
+        .rating_view_pending
+        .as_ref()
+        .unwrap()
+        .rating_adoption
+        .clone();
+    assert!(matches!(intent, RatingAdoptionIntent::RestoreOrigin(_)));
+    let sender = controlled_rating_request(&mut app, intent.clone());
+    sender
+        .send(Ok(ready_with_current_rating_facts(&app, all.clone())))
+        .unwrap();
+
+    input(&mut app);
+
+    assert_eq!(app.selected, expected, "manual input result");
+    assert_eq!(
+        app.rating_view_pending.as_ref().unwrap().rating_adoption,
+        if accepted {
+            RatingAdoptionIntent::Reconcile
+        } else {
+            intent
+        },
+        "only accepted manual navigation cancels the live intent"
+    );
+    let manual_key = app.selected.and_then(|idx| app.rating_path_key(idx));
+    let manual_anchor = anchor(&app).and_then(|idx| app.rating_path_key(idx));
+
+    app.poll_rating_view();
+    assert!(
+        app.rating_view_pending.is_none(),
+        "Ready still adopts the set"
+    );
+    app.finish_page_identity_preparation_for_test();
+    assert_eq!(app.items, all);
+    if accepted {
+        assert_eq!(
+            app.fullscreen_idx, None,
+            "Ready must not reopen Undo origin"
+        );
+        if manual_key.is_some() {
+            assert_eq!(
+                app.selected.and_then(|idx| app.rating_path_key(idx)),
+                manual_key
+            );
+            assert_eq!(
+                anchor(&app).and_then(|idx| app.rating_path_key(idx)),
+                manual_anchor
+            );
+        }
+    } else {
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(0),
+            "unaccepted input keeps Undo restore"
+        );
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(anchor(&app), Some(0));
+    }
+    assert_eq!(app.settings.rating_filter, ONLY_THREE);
+    assert_eq!(app.meta_undo.redo_len(), 1);
+}
+
+#[test]
+fn rating_undo_grid_keys_cancel_held_restore_on_moves_edges_and_empty_sets() {
+    let _input_guard = crate::key_input::lock_test_input();
+    use crate::settings::GridViewMode;
+    use egui::Key::*;
+    for view in [GridViewMode::Thumbnail, GridViewMode::Details] {
+        for (pressed, start, target) in [
+            (ArrowRight, 0, 1),
+            (ArrowRight, 2, 2),
+            (ArrowLeft, 1, 0),
+            (ArrowLeft, 0, 0),
+            (ArrowDown, 0, 1),
+            (ArrowDown, 2, 2),
+            (ArrowUp, 1, 0),
+            (ArrowUp, 0, 0),
+            (Home, 1, 0),
+            (Home, 0, 0),
+            (End, 1, 2),
+            (End, 2, 2),
+            (PageDown, 1, 2),
+            (PageDown, 2, 2),
+            (PageUp, 1, 0),
+            (PageUp, 0, 0),
+        ] {
+            rating_undo_grid_input_case(view, Some(start), Some(target), true, |app| {
+                press_grid_key(app, pressed, egui::Modifiers::NONE);
+            });
+        }
+        for pressed in [
+            ArrowRight, ArrowLeft, ArrowDown, ArrowUp, Home, End, PageDown, PageUp,
+        ] {
+            rating_undo_grid_input_case(view, None, None, true, |app| {
+                press_grid_key(app, pressed, egui::Modifiers::NONE);
+            });
+        }
+    }
+}
+
+fn press_grid_key(app: &mut App, key: egui::Key, modifiers: egui::Modifiers) {
+    let ctx = egui::Context::default();
+    ctx.begin_pass(egui::RawInput {
+        modifiers,
+        events: vec![egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }],
+        ..Default::default()
+    });
+    app.keyboard_owner_for_pass(&ctx);
+    let _ = app.handle_keyboard(&ctx);
+    let _ = ctx.end_pass();
+}
+
+#[test]
+fn rating_undo_grid_unadmitted_keys_and_automatic_cursor_moves_keep_held_restore() {
+    let _input_guard = crate::key_input::lock_test_input();
+    use crate::settings::GridViewMode;
+    for view in [GridViewMode::Thumbnail, GridViewMode::Details] {
+        for pressed in [
+            egui::Key::Home,
+            egui::Key::End,
+            egui::Key::PageUp,
+            egui::Key::PageDown,
+        ] {
+            rating_undo_grid_input_case(view, Some(1), Some(1), false, |app| {
+                press_grid_key(app, pressed, egui::Modifiers::SHIFT);
+            });
+        }
+        rating_undo_grid_input_case(view, Some(1), Some(1), false, |app| {
+            app.search_has_focus = true;
+            press_grid_key(app, egui::Key::ArrowRight, egui::Modifiers::NONE);
+            app.search_has_focus = false;
+        });
+        rating_undo_grid_input_case(view, Some(1), Some(2), false, |app| {
+            app.move_grid_cursor(Some(2));
+        });
+        rating_undo_grid_input_case(view, Some(1), Some(2), true, |app| {
+            press_grid_key(app, egui::Key::ArrowRight, egui::Modifiers::SHIFT);
+        });
+        rating_undo_grid_input_case(view, Some(1), Some(0), true, |app| {
+            app.keymap = crate::keymap::Keymap::from_ini_str("[Grid]\nGridMoveFirst = F13\n");
+            press_grid_key(app, egui::Key::F13, egui::Modifiers::NONE);
+        });
+    }
 }
 
 #[test]
