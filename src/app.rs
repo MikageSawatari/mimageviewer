@@ -16746,6 +16746,11 @@ pub struct App {
     pub(crate) fs_seek_overlay_visible: bool,
     /// 連結読み描画で最後に計算した raw/final/comic cache の保持対象。
     pub(crate) fs_vertical_cache_keep_set: std::collections::HashSet<usize>,
+    /// Accepted-output proof to notify the existing observer, owned by this context.
+    pub(crate) pending_fs_page_turn_ready: Option<crate::ui_fullscreen::PendingFsPageTurnReady>,
+    pub(crate) page_turn_presentation: crate::ui_fullscreen::PageTurnPresentation,
+    /// Process-wide weak resource inventory; never swapped with a viewer payload.
+    pub(crate) page_turn_leases: crate::ui_fullscreen::PageTurnLeaseInventory,
     /// 連結読みのページ別更新中表示。raw source 再読込や incomplete → complete の
     /// 再合成で live final が一時的に消えても、完成済みの差し替え先が届くまで保持する。
     pub(crate) continuous_page_transitions:
@@ -18793,6 +18798,9 @@ impl App {
         load_meta: crate::settings::SettingsLoadMeta,
         notify_book_query_change: impl Fn() + Send + Sync + 'static,
     ) -> Self {
+        crate::key_input::set_page_turn_ingress_instrumentation_enabled(
+            settings.page_turn_animation_enabled,
+        );
         let executor = Arc::new(
             crate::raw::RawDevelopExecutor::new(
                 settings.raw_develop_parallelism.clamp(1, 10) as usize
@@ -20083,6 +20091,9 @@ impl App {
             fs_seek_gesture: crate::ui_fullscreen::StillSeekGesture::Idle,
             fs_seek_overlay_visible: false,
             fs_vertical_cache_keep_set: std::collections::HashSet::new(),
+            pending_fs_page_turn_ready: None,
+            page_turn_presentation: Default::default(),
+            page_turn_leases: Default::default(),
             continuous_page_transitions: std::collections::HashMap::new(),
             fs_free_rotation: 0.0,
             fs_rotation_drag_start: None,
@@ -74551,6 +74562,8 @@ impl App {
     }
 
     fn close_fullscreen_now(&mut self) {
+        self.pending_fs_page_turn_ready = None;
+        self.page_turn_presentation.deactivate("closed");
         // 閉じる間 UI スレッドが止まっていると、その分だけ**誰も描かない**フレームが並び、
         // 画面のちらつきとして見える (利用者報告 2026-08-27、実測 9 フレーム / 約 300ms)。
         // どの段で止まっているかを 1 行で出す。ログ行の時刻と合わせれば、presenter 停止や
@@ -81053,7 +81066,7 @@ impl App {
         }
     }
 
-    fn final_composite_key_for_pixels(
+    pub(crate) fn final_composite_key_for_pixels(
         &self,
         edit_key: EditResultKey,
         size: [usize; 2],
@@ -90887,7 +90900,10 @@ impl App {
         }
 
         #[cfg(windows)]
-        crate::key_input::begin_frame();
+        crate::key_input::begin_frame_for_context_with_tracking(
+            ctx,
+            self.settings.page_turn_animation_enabled,
+        );
 
         // タスクトレイ関連の毎フレーム処理は、設定 ON のときのみ走らせる。
         // 既定 OFF のユーザーには IsWindowVisible の syscall やイベント polling を

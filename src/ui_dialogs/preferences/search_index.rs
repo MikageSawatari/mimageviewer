@@ -813,6 +813,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["表紙", "末尾", "見開き", "本ごとの設定"]
     ),
     entry!(
+        "spread/page-turn-animation",
+        SpreadMode,
+        "ページめくりアニメーション",
+        ["紙めくり", "スライドショー", "時間", "演出", "animation"]
+    ),
+    entry!(
         "spread/singleton-placement",
         SpreadMode,
         "見開き先頭の単ページを片側に配置",

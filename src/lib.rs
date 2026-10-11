@@ -110,6 +110,7 @@ mod fullscreen_specified_scale;
 mod gpu_anime4k;
 mod gpu_lanczos;
 pub mod metadata_transfer;
+mod page_turn_animation;
 #[cfg(windows)]
 pub(crate) mod presentation_observer;
 pub(crate) mod spread_shift;
@@ -1751,6 +1752,7 @@ pub fn run() -> eframe::Result {
             modifier_probe::install(&cc.egui_ctx);
             ime_focus::install_ime_input_policy(&cc.egui_ctx);
             egui_focus_policy::install_tab_shortcut_focus_policy(&cc.egui_ctx);
+            crate::key_input::install_operation_input_plugin(&cc.egui_ctx);
             ui_fullscreen::install_fs_navigator_input_tracking(&cc.egui_ctx);
             double_click_time::configure_context(&cc.egui_ctx);
             let t = Instant::now();

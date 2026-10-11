@@ -818,7 +818,7 @@ impl KeySlot {
     /// 実害 (2026-08-05): フルスクリーン中の NumpadEnter は fullscreen viewport の Win32 edge
     /// になる一方、egui イベントは main viewport にも届く。main 側には対応する edge が無いので
     /// egui へ落ち、`Key::Enter` を `FsClose` (既定 Enter) が拾って表示が閉じていた。
-    fn egui_event_cannot_identify_slot(self) -> bool {
+    pub(crate) fn egui_event_cannot_identify_slot(self) -> bool {
         matches!(
             self,
             KeyName::Enter
@@ -6857,6 +6857,7 @@ pub(crate) enum PageTurnPressKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PageTurnKeyInput {
+    pub operation_id: crate::key_input::KeyOperationId,
     pub kind: PageTurnPressKind,
     pub chord: Chord,
     pub still_held: bool,
@@ -7896,6 +7897,13 @@ impl Keymap {
         if outcome == "no_match" {
             return;
         }
+        let operation_id = match result {
+            PageTurnConsumeResult::Trigger(input)
+            | PageTurnConsumeResult::DroppedReleasedRepeat(input) => {
+                format!("Key({:?})", input.operation_id).into()
+            }
+            _ => serde_json::Value::Null,
+        };
         crate::perf::event(
             "input",
             "page_turn_consume",
@@ -7904,6 +7912,7 @@ impl Keymap {
             &[
                 ("action", serde_json::Value::from(action.ini_name())),
                 ("outcome", serde_json::Value::from(outcome)),
+                ("operation_id", operation_id),
                 (
                     "kind",
                     match kind {
@@ -8621,6 +8630,9 @@ impl Keymap {
                 let os_held = self.page_turn_chord_held(ctx, level_permit, chord);
                 let still_held = !edges.released_after_match && os_held;
                 let result = Self::classify_page_turn_input(PageTurnKeyInput {
+                    operation_id: edges
+                        .operation_id
+                        .expect("matching press has ingress identity"),
                     kind,
                     chord,
                     still_held,
@@ -8717,7 +8729,15 @@ impl Keymap {
         };
         let os_held = self.page_turn_chord_held(ctx, level_permit, chord);
         let still_held = !released_after_match && os_held;
+        let operation_id = crate::key_input::egui_operation_key_id(ctx, viewport, |edge| {
+            let crate::key_input::KeyOperationEdge::Egui { key, modifiers, .. } = edge else {
+                return false;
+            };
+            chord.matches_egui(key, modifiers)
+        })
+        .expect("matching egui press has ingress identity");
         let result = Self::classify_page_turn_input(PageTurnKeyInput {
+            operation_id,
             kind,
             chord,
             still_held,
@@ -9794,6 +9814,7 @@ mod tests {
     #[cfg(windows)]
     fn tab_edge(repeat: bool) -> crate::key_input::KeyEdge {
         crate::key_input::KeyEdge {
+            operation_id: crate::key_input::KeyOperationId::unassigned(),
             source_hwnd: 1,
             source_viewport: egui::ViewportId::ROOT,
             virtual_key: 0x09,
@@ -9821,6 +9842,7 @@ mod tests {
         repeat: bool,
     ) -> crate::key_input::KeyEdge {
         crate::key_input::KeyEdge {
+            operation_id: crate::key_input::KeyOperationId::unassigned(),
             source_hwnd: 1,
             source_viewport: egui::ViewportId::ROOT,
             virtual_key,
@@ -9959,6 +9981,7 @@ mod tests {
         crate::key_input::set_test_frame_for_viewport(
             fullscreen_viewport,
             vec![crate::key_input::KeyEdge {
+                operation_id: crate::key_input::KeyOperationId::unassigned(),
                 source_hwnd: 2,
                 source_viewport: fullscreen_viewport,
                 virtual_key: 0x0D,
@@ -10002,6 +10025,7 @@ mod tests {
         let ctx = egui::Context::default();
         let viewport = ctx.viewport_id();
         let numpad_press = crate::key_input::KeyEdge {
+            operation_id: crate::key_input::KeyOperationId::unassigned(),
             source_hwnd: 1,
             source_viewport: viewport,
             virtual_key: 0x0D,
@@ -12631,6 +12655,55 @@ mod tests {
     }
 
     #[cfg(windows)]
+    #[test]
+    fn page_turn_egui_operation_id_survives_repeat_normalization_on_replay() {
+        struct ReplayedPress;
+        impl egui::Plugin for ReplayedPress {
+            fn debug_name(&self) -> &'static str {
+                "replayed_page_press"
+            }
+            fn input_hook(&mut self, input: &mut egui::RawInput) {
+                input.events.push(egui::Event::Key {
+                    key: egui::Key::ArrowRight,
+                    physical_key: Some(egui::Key::ArrowRight),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+        }
+        let _serial = crate::key_input::lock_test_input();
+        let keymap = page_turn_keymap_for_test();
+        let ctx = egui::Context::default();
+        ctx.add_plugin(ReplayedPress);
+        crate::key_input::install_operation_input_plugin(&ctx);
+        let mut identities = Vec::new();
+        let _ = ctx.run(Default::default(), |ctx| {
+            cache_test_keyboard_owner(ctx);
+            let result = keymap.consume_page_turn_action(ctx, None, KeyAction::FsPageNext);
+            let input = match result {
+                PageTurnConsumeResult::Trigger(input) if ctx.current_pass_index() == 0 => input,
+                PageTurnConsumeResult::DroppedReleasedRepeat(input)
+                    if ctx.current_pass_index() > 0 =>
+                {
+                    input
+                }
+                unexpected => panic!("unexpected replay result: {unexpected:?}"),
+            };
+            // The OFF plugin performs no eager observation. The actual
+            // matched fallback consumer creates generic provenance lazily.
+            let snapshot = crate::key_input::egui_operation_key_edges(ctx, ctx.viewport_id());
+            assert_eq!(input.operation_id, snapshot[0].operation_id());
+            identities.push(input.operation_id);
+            if ctx.current_pass_index() == 0 {
+                ctx.request_discard("page turn id replay");
+            }
+        });
+        assert_eq!(identities.len(), 2);
+        assert_eq!(identities[0], identities[1]);
+    }
+
+    #[cfg(windows)]
     fn arm_held_right_for_test(viewport: egui::ViewportId) {
         let now = std::time::Instant::now();
         crate::key_input::arm_test_synthetic_input(1, viewport);
@@ -12686,6 +12759,8 @@ mod tests {
         assert_eq!(
             keymap.consume_page_turn_action(&ctx, None, KeyAction::FsPageNext),
             PageTurnConsumeResult::Trigger(PageTurnKeyInput {
+                operation_id: crate::key_input::native_operation_key_edges(viewport)[0]
+                    .operation_id,
                 kind: PageTurnPressKind::InitialPress,
                 chord: Chord::key(KeyName::Right),
                 still_held: false,
@@ -12711,6 +12786,8 @@ mod tests {
         assert_eq!(
             keymap.consume_page_turn_action(&ctx, None, KeyAction::FsPageNext),
             PageTurnConsumeResult::DroppedReleasedRepeat(PageTurnKeyInput {
+                operation_id: crate::key_input::native_operation_key_edges(viewport)[0]
+                    .operation_id,
                 kind: PageTurnPressKind::AutoRepeat,
                 chord: Chord::key(KeyName::Right),
                 still_held: false,
@@ -12763,6 +12840,8 @@ mod tests {
                 KeyAction::FsPageNext,
             ),
             PageTurnConsumeResult::Trigger(PageTurnKeyInput {
+                operation_id: crate::key_input::native_operation_key_edges(viewport)[0]
+                    .operation_id,
                 kind: PageTurnPressKind::InitialPress,
                 chord: Chord::key(KeyName::Right),
                 still_held: true,
@@ -12793,6 +12872,8 @@ mod tests {
                 KeyAction::FsPageNext,
             ),
             PageTurnConsumeResult::Trigger(PageTurnKeyInput {
+                operation_id: crate::key_input::native_operation_key_edges(viewport)[0]
+                    .operation_id,
                 kind: PageTurnPressKind::AutoRepeat,
                 chord: Chord::key(KeyName::Right),
                 still_held: true,
@@ -12823,6 +12904,8 @@ mod tests {
                 KeyAction::FsPageNext,
             ),
             PageTurnConsumeResult::DroppedReleasedRepeat(PageTurnKeyInput {
+                operation_id: crate::key_input::native_operation_key_edges(viewport)[0]
+                    .operation_id,
                 kind: PageTurnPressKind::AutoRepeat,
                 chord: Chord::key(KeyName::Right),
                 still_held: false,
@@ -12854,6 +12937,8 @@ mod tests {
                 KeyAction::FsPageNext,
             ),
             PageTurnConsumeResult::Trigger(PageTurnKeyInput {
+                operation_id: crate::key_input::native_operation_key_edges(viewport)[0]
+                    .operation_id,
                 kind: PageTurnPressKind::InitialPress,
                 chord: Chord::key(KeyName::Right),
                 still_held: false,
@@ -13551,6 +13636,7 @@ mod tests {
     #[test]
     fn key_hold_slot_matching_distinguishes_both_enter_directions() {
         let edge = |extended| crate::key_input::KeyEdge {
+            operation_id: crate::key_input::KeyOperationId::unassigned(),
             source_hwnd: 1,
             source_viewport: egui::ViewportId::ROOT,
             virtual_key: 0x0D,

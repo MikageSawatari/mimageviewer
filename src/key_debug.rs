@@ -115,6 +115,7 @@ pub fn record_native_video_key(
     record_raw_edge(
         KeyDebugSource::NativeVideo,
         KeyEdge {
+            operation_id: crate::key_input::KeyOperationId::unassigned(),
             source_hwnd: 0,
             source_viewport: egui::ViewportId::ROOT,
             virtual_key: key.virtual_key,

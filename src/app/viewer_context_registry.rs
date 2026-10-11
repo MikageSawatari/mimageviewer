@@ -1056,6 +1056,8 @@ pub(in crate::app) struct ViewerContextBundle {
     fs_seek_gesture: crate::ui_fullscreen::StillSeekGesture,
     fs_seek_overlay_visible: bool,
     fs_vertical_cache_keep_set: std::collections::HashSet<usize>,
+    pending_fs_page_turn_ready: Option<crate::ui_fullscreen::PendingFsPageTurnReady>,
+    page_turn_presentation: crate::ui_fullscreen::PageTurnPresentation,
     continuous_page_transitions: std::collections::HashMap<usize, ContinuousPageTransition>,
     fs_free_rotation: f32,
     fs_rotation_drag_start: Option<(egui::Pos2, f32)>,
@@ -1604,6 +1606,15 @@ impl<'a> ContextRef<'a> {
         }
     }
 
+    pub(in crate::app) fn pending_fs_page_turn_ready(
+        self,
+    ) -> Option<&'a crate::ui_fullscreen::PendingFsPageTurnReady> {
+        match self.source {
+            ContextRefSource::Mounted(app) => app.pending_fs_page_turn_ready.as_ref(),
+            ContextRefSource::AtRest(bundle) => bundle.pending_fs_page_turn_ready.as_ref(),
+        }
+    }
+
     pub(in crate::app) fn fs_lanczos_cache(self) -> &'a crate::gpu_lanczos::GpuLanczosCache {
         match self.source {
             ContextRefSource::Mounted(app) => &app.fs_lanczos_cache,
@@ -2047,6 +2058,8 @@ impl ViewerContextBundle {
             fs_seek_gesture: crate::ui_fullscreen::StillSeekGesture::Idle,
             fs_seek_overlay_visible: false,
             fs_vertical_cache_keep_set: std::collections::HashSet::new(),
+            pending_fs_page_turn_ready: None,
+            page_turn_presentation: Default::default(),
             continuous_page_transitions: std::collections::HashMap::new(),
             fs_free_rotation: 0.0,
             fs_rotation_drag_start: None,
@@ -2415,6 +2428,8 @@ impl App {
             fs_seek_gesture,
             fs_seek_overlay_visible,
             fs_vertical_cache_keep_set,
+            pending_fs_page_turn_ready,
+            page_turn_presentation,
             continuous_page_transitions,
             fs_free_rotation,
             fs_rotation_drag_start,
@@ -2700,6 +2715,8 @@ impl App {
         swap_field!(fs_seek_gesture);
         swap_field!(fs_seek_overlay_visible);
         swap_field!(fs_vertical_cache_keep_set);
+        swap_field!(pending_fs_page_turn_ready);
+        swap_field!(page_turn_presentation);
         swap_field!(continuous_page_transitions);
         swap_field!(fs_free_rotation);
         swap_field!(fs_rotation_drag_start);
@@ -3032,6 +3049,8 @@ impl App {
             fs_seek_gesture,
             fs_seek_overlay_visible,
             fs_vertical_cache_keep_set,
+            pending_fs_page_turn_ready,
+            page_turn_presentation,
             continuous_page_transitions,
             fs_free_rotation,
             fs_rotation_drag_start,
@@ -3251,6 +3270,8 @@ impl App {
             fs_seek_gesture,
             fs_seek_overlay_visible,
             fs_vertical_cache_keep_set,
+            pending_fs_page_turn_ready,
+            page_turn_presentation,
             continuous_page_transitions,
             fs_free_rotation,
             fs_rotation_drag_start,
@@ -4307,6 +4328,8 @@ impl App {
         }
         let value = {
             let payload = self.viewer_contexts.table.retiring_slot_mut(id).unwrap();
+            payload.pending_fs_page_turn_ready = None;
+            payload.page_turn_presentation.deactivate("retired");
             digest(ContextMut { bundle: payload })
         };
         if let Some(window_id) = retiring_window {
@@ -4536,6 +4559,96 @@ mod tests {
     use std::cell::RefCell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::rc::Rc;
+
+    #[cfg(windows)]
+    #[test]
+    fn page_turn_operations_remain_with_their_context_across_mounts() {
+        let mut app = crate::app::setup_app_for_test();
+        let main = app.page_turn_destination();
+        app.page_turn_presentation.seed_operation_for_test(main, 41);
+        let sibling = app.build_window_context_for_test(91341, |_| {});
+        // Delivery happens after the new context acquires its real window binding.
+        app.with_viewer_context(sibling, |owner| {
+            assert_eq!(owner.page_turn_presentation.operation_for_test(), None);
+            let destination = owner.page_turn_destination();
+            owner
+                .page_turn_presentation
+                .seed_operation_for_test(destination, 72);
+        })
+        .unwrap();
+        assert_eq!(
+            app.page_turn_presentation.operation_for_test(),
+            Some((main, 41))
+        );
+        app.with_viewer_context(sibling, |owner| {
+            let destination = owner.page_turn_destination();
+            assert_eq!(destination.context, sibling);
+            assert_eq!(destination.window, Some(91341));
+            assert_eq!(
+                owner.page_turn_presentation.operation_for_test(),
+                Some((destination, 72))
+            );
+            // Global diagnostics and a sibling's new operation cannot invalidate main's facts.
+            owner.input_seq += 1;
+            owner
+                .page_turn_presentation
+                .seed_operation_for_test(destination, 73);
+            owner.pause_mounted_background_work_keep_current_frame();
+            assert_eq!(
+                owner.page_turn_presentation.operation_for_test(),
+                Some((destination, 73))
+            );
+        })
+        .unwrap();
+        assert_eq!(
+            app.page_turn_presentation.operation_for_test(),
+            Some((main, 41))
+        );
+        app.with_viewer_context(sibling, |owner| {
+            assert_eq!(
+                owner.page_turn_presentation.operation_for_test().unwrap().1,
+                73
+            );
+        })
+        .unwrap();
+        assert_eq!(
+            app.page_turn_presentation.operation_for_test(),
+            Some((main, 41))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn page_turn_setting_disable_clears_only_presentations_in_all_contexts() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.page_turn_animation_enabled = true;
+        let main = app.page_turn_destination();
+        app.page_turn_presentation.seed_operation_for_test(main, 41);
+        let sibling = app.build_window_context_for_test(91342, |owner| {
+            owner.items = vec![GridItem::Image(PathBuf::from("c:/fixtures/retained.jpg"))];
+        });
+        app.with_viewer_context(sibling, |owner| {
+            let destination = owner.page_turn_destination();
+            owner
+                .page_turn_presentation
+                .seed_operation_for_test(destination, 72);
+        })
+        .unwrap();
+        let mut edited = app.settings.clone();
+        edited.page_turn_animation_enabled = false;
+        app.install_preferences_settings(edited);
+        assert_eq!(app.page_turn_presentation.operation_for_test(), None);
+        app.with_viewer_context(sibling, |owner| {
+            assert_eq!(owner.page_turn_presentation.operation_for_test(), None);
+            assert_eq!(owner.items.len(), 1);
+            assert_eq!(
+                owner.items[0],
+                GridItem::Image(PathBuf::from("c:/fixtures/retained.jpg"))
+            );
+        })
+        .unwrap();
+        assert_eq!(app.page_turn_destination(), main);
+    }
 
     #[cfg(windows)]
     #[test]
@@ -7687,4 +7800,41 @@ fn parked_direct_media_owner(bundle: &ViewerContextBundle) -> bool {
             crate::snapshot::SnapshotSourceLabel::DirectMedia { .. }
         )
     })
+}
+
+impl crate::app::App {
+    pub(crate) fn page_turn_destination(&self) -> crate::ui_fullscreen::PresentationDestination {
+        #[cfg(windows)]
+        let window = self.detached_viewer_window_id();
+        #[cfg(not(windows))]
+        let window = None;
+        let viewport = match self.viewer_chrome_surface() {
+            crate::ui_helpers::ViewerChromeSurface::MainEmbedded => egui::ViewportId::ROOT,
+            crate::ui_helpers::ViewerChromeSurface::Fullscreen => self.fullscreen_viewport_id(),
+            crate::ui_helpers::ViewerChromeSurface::Detached { window_id, .. } => {
+                egui::ViewportId::from_hash_of(("detached_image_window", window_id))
+            }
+        };
+        crate::ui_fullscreen::PresentationDestination {
+            context: self.projected_viewer_context_id(),
+            window,
+            viewport,
+        }
+    }
+}
+
+impl App {
+    /// A setting change or tray hide targets every affected presentation explicitly.
+    /// Ordinary context mounting never calls this or invalidates a sibling.
+    pub(crate) fn deactivate_all_page_turn_presentations(&mut self, reason: &'static str) {
+        self.pending_fs_page_turn_ready = None;
+        self.page_turn_presentation.deactivate(reason);
+        #[cfg(windows)]
+        for id in self.viewer_contexts.table.other_ids() {
+            if let Some(bundle) = self.viewer_contexts.table.at_rest_mut(id) {
+                bundle.pending_fs_page_turn_ready = None;
+                bundle.page_turn_presentation.deactivate(reason);
+            }
+        }
+    }
 }

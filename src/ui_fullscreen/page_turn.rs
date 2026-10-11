@@ -1,0 +1,2440 @@
+//! Paged presentation owns neither navigation nor producers. A prepared unit is submitted once.
+use super::*;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
+
+static NEXT_OPERATION_BATCH: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PresentationDestination {
+    pub(crate) context: crate::app::ViewerContextId,
+    pub(crate) window: Option<u64>,
+    pub(crate) viewport: egui::ViewportId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ViewerOperationId {
+    Key(crate::key_input::KeyOperationId),
+    Pointer {
+        batch: u64,
+        source: egui::ViewportId,
+        ordinal: u32,
+    },
+    Pad {
+        batch: u64,
+        ordinal: u32,
+    },
+    Slideshow(u64),
+}
+
+pub(crate) fn next_operation_batch() -> u64 {
+    NEXT_OPERATION_BATCH.fetch_add(1, Ordering::Relaxed)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OperationPhase {
+    Press,
+    Repeat,
+    Continuous,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ViewerOperationFact {
+    pub(crate) destination: PresentationDestination,
+    pub(crate) operation_id: ViewerOperationId,
+    pub(crate) source: egui::ViewportId,
+    pub(crate) phase: OperationPhase,
+    pub(crate) cause: &'static str,
+    pub(crate) diagnostic_input_seq: u64,
+}
+
+/// The original transaction survives consumers and egui replay; passive input creates no fact.
+#[derive(Clone, Default)]
+struct PointerTransaction {
+    frame: u64,
+    facts: Vec<(PointerDelivery, OperationPhase, &'static str)>,
+}
+
+#[derive(Clone, Copy, Default)]
+enum PointerDelivery {
+    #[default]
+    Empty,
+    Unrouted(ViewerOperationId),
+    Routed(ViewerOperationId, PresentationDestination),
+}
+
+impl PointerDelivery {
+    fn id(self) -> Option<ViewerOperationId> {
+        match self {
+            Self::Empty => None,
+            Self::Unrouted(id) | Self::Routed(id, _) => Some(id),
+        }
+    }
+    fn route(self, destination: PresentationDestination) -> Option<Self> {
+        match self {
+            Self::Empty => None,
+            Self::Unrouted(id) => Some(Self::Routed(id, destination)),
+            Self::Routed(_, original) if original != destination => None,
+            already => Some(already),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct PointerPresses {
+    buttons: [PointerDelivery; 5],
+}
+
+fn observe_pointer_transaction(ctx: &egui::Context) {
+    let viewport = ctx.viewport_id();
+    let id = egui::Id::new(("page_turn_pointer_transaction", viewport));
+    let frame = ctx.cumulative_frame_nr();
+    if ctx
+        .data(|d| d.get_temp::<PointerTransaction>(id))
+        .is_some_and(|t| t.frame == frame)
+    {
+        return;
+    }
+    let mut facts = Vec::new();
+    let batch = next_operation_batch();
+    let press_id = egui::Id::new(("page_turn_pointer_presses", viewport));
+    let mut presses = ctx
+        .data(|d| d.get_temp::<PointerPresses>(press_id))
+        .unwrap_or_default();
+    ctx.input(|i| {
+        for (ordinal, event) in i.raw.events.iter().enumerate() {
+            let operation_id = ViewerOperationId::Pointer {
+                batch,
+                source: viewport,
+                ordinal: ordinal as u32,
+            };
+            let delivery = PointerDelivery::Unrouted(operation_id);
+            let fact = match event {
+                egui::Event::PointerButton {
+                    button, pressed, ..
+                } => {
+                    let slot = &mut presses.buttons[*button as usize];
+                    if *pressed {
+                        *slot = delivery;
+                        Some((delivery, OperationPhase::Press, "pointer"))
+                    } else {
+                        // Click navigation occurs on release; it inherits the
+                        // exact press delivery and cannot cancel as a new edge.
+                        let original = *slot;
+                        *slot = PointerDelivery::Empty;
+                        original
+                            .id()
+                            .map(|_| (original, OperationPhase::Press, "pointer"))
+                    }
+                }
+                egui::Event::MouseWheel { .. } => Some((delivery, OperationPhase::Press, "wheel")),
+                egui::Event::PointerMoved(_) if i.pointer.any_down() => {
+                    Some((delivery, OperationPhase::Continuous, "drag"))
+                }
+                egui::Event::Touch {
+                    phase: egui::TouchPhase::Start,
+                    ..
+                } => Some((delivery, OperationPhase::Press, "touch")),
+                egui::Event::Touch {
+                    phase: egui::TouchPhase::Move,
+                    ..
+                } => Some((delivery, OperationPhase::Continuous, "drag")),
+                _ => None,
+            };
+            if let Some(fact) = fact {
+                if fact.0.id() == Some(operation_id) {
+                    crate::key_input::trace_page_turn_operation_ingress(
+                        || format!("{operation_id:?}"),
+                        viewport,
+                        None,
+                        match fact.1 {
+                            OperationPhase::Press => "Press",
+                            OperationPhase::Repeat => "Repeat",
+                            OperationPhase::Continuous => "Continuous",
+                        },
+                        "pointer_raw_transaction",
+                    );
+                }
+                if !facts
+                    .iter()
+                    .any(|(previous, _, _)| PointerDelivery::id(*previous) == fact.0.id())
+                {
+                    facts.push(fact);
+                }
+            }
+        }
+    });
+    ctx.data_mut(|d| {
+        d.insert_temp(id, PointerTransaction { frame, facts });
+        d.insert_temp(press_id, presses);
+    });
+}
+
+pub(crate) fn install(ctx: &egui::Context) {
+    let id = egui::Id::new("page_turn_pointer_tracking_installed");
+    if ctx.data(|d| d.get_temp::<bool>(id)).unwrap_or(false) {
+        return;
+    }
+    ctx.data_mut(|d| d.insert_temp(id, true));
+    ctx.add_plugin(SubmissionPlugin::default());
+    ctx.on_begin_pass(
+        "page_turn_pointer_tracking",
+        Arc::new(|ctx| {
+            if ctx
+                .data(|d| d.get_temp::<bool>(egui::Id::new("page_turn_input_enabled")))
+                .unwrap_or(false)
+            {
+                observe_pointer_transaction(ctx);
+            }
+        }),
+    );
+}
+
+#[derive(Clone)]
+pub(super) struct PreparedPagedPage {
+    pub(super) occurrence: SpreadPageOccurrence,
+    pub(super) transform: DisplayedImageTransform,
+    pub(super) resource: FullscreenPaintResource,
+    pub(super) painter: egui::Painter,
+    pub(super) underlay: FsBgStyle,
+    pub(super) live: bool,
+}
+
+#[derive(Clone)]
+pub(super) struct SubmittedUnitReceipt {
+    destination: PresentationDestination,
+    frame: u64,
+    pass: u64,
+    pages: ReceiptPages,
+    accepted: AcceptanceEvidence,
+    pub(super) curl: bool,
+}
+
+type ReceiptPage = (SpreadPageOccurrence, egui::TextureId, egui::TextureId, f32);
+
+#[derive(Clone, Copy)]
+enum ReceiptPages {
+    Single(ReceiptPage),
+    Spread([ReceiptPage; 2]),
+}
+
+impl ReceiptPages {
+    fn as_slice(&self) -> &[ReceiptPage] {
+        match self {
+            Self::Single(p) => std::slice::from_ref(p),
+            Self::Spread(p) => p,
+        }
+    }
+    fn as_mut_slice(&mut self) -> &mut [ReceiptPage] {
+        match self {
+            Self::Single(p) => std::slice::from_mut(p),
+            Self::Spread(p) => p,
+        }
+    }
+}
+
+#[derive(Clone)]
+enum AcceptanceEvidence {
+    Immediate,
+    Deferred(Arc<AtomicBool>),
+}
+
+impl AcceptanceEvidence {
+    fn accept(&self) {
+        if let Self::Deferred(accepted) = self {
+            accepted.store(true, Ordering::Release);
+        }
+    }
+    fn was_accepted(&self) -> bool {
+        match self {
+            Self::Immediate => true,
+            Self::Deferred(accepted) => accepted.load(Ordering::Acquire),
+        }
+    }
+}
+
+impl SubmittedUnitReceipt {
+    pub(super) fn matches(
+        &self,
+        destination: PresentationDestination,
+        frame: u64,
+        sources: &FsNavigatorTextureSources,
+    ) -> bool {
+        self.frame == frame && self.matches_sources(destination, sources)
+    }
+    pub(super) fn matches_sources(
+        &self,
+        destination: PresentationDestination,
+        sources: &FsNavigatorTextureSources,
+    ) -> bool {
+        self.destination == destination
+            && self.pages.as_slice().len() == sources.pages.len()
+            && self
+                .pages
+                .as_slice()
+                .iter()
+                .all(|(occurrence, source, native, area)| {
+                    *area > 0.0
+                        && sources.pages.iter().any(|p| {
+                            p.occurrence == *occurrence
+                                && p.resource.source_texture_id() == *source
+                                && p.resource.paint_texture_id() == *native
+                        })
+                })
+    }
+    pub(super) fn was_accepted(&self) -> bool {
+        self.accepted.was_accepted()
+    }
+    pub(super) fn frame(&self) -> u64 {
+        self.frame
+    }
+    pub(super) fn pass(&self) -> u64 {
+        self.pass
+    }
+    pub(super) fn destination(&self) -> PresentationDestination {
+        self.destination
+    }
+    pub(super) fn pages(&self) -> &[(SpreadPageOccurrence, egui::TextureId, egui::TextureId, f32)] {
+        self.pages.as_slice()
+    }
+    pub(super) fn accepted_ledger(&self) -> Option<Arc<AtomicBool>> {
+        match &self.accepted {
+            AcceptanceEvidence::Immediate => None,
+            AcceptanceEvidence::Deferred(accepted) => Some(accepted.clone()),
+        }
+    }
+    pub(super) fn rebind(&mut self, occurrences: &[SpreadPageOccurrence]) {
+        for (page, _, _, _) in self.pages.as_mut_slice() {
+            if let Some(occurrence) = occurrences
+                .iter()
+                .find(|o| o.idx == page.idx && o.role == page.role)
+            {
+                *page = *occurrence;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubmissionStatus {
+    Offered,
+    Started,
+    Finished,
+    Cancelled,
+}
+
+struct SubmissionTracker {
+    status: Mutex<SubmissionStatus>,
+}
+
+impl SubmissionTracker {
+    fn new() -> Self {
+        Self {
+            status: Mutex::new(SubmissionStatus::Offered),
+        }
+    }
+    fn status(&self) -> SubmissionStatus {
+        *self.status.lock().unwrap_or_else(|p| p.into_inner())
+    }
+    fn end(&self) -> SubmissionStatus {
+        let mut state = self.status.lock().unwrap_or_else(|p| p.into_inner());
+        let previous = *state;
+        *state = SubmissionStatus::Cancelled;
+        previous
+    }
+}
+
+#[derive(Clone)]
+struct PendingSubmission {
+    receipt: SubmittedUnitReceipt,
+    event: Option<SubmissionEvent>,
+}
+
+#[derive(Clone)]
+struct SubmissionEvent {
+    tracker: Arc<SubmissionTracker>,
+    fact: ViewerOperationFact,
+    kind: SubmissionKind,
+    elapsed_ms: f64,
+    retained_bytes: u64,
+    mesh_ms: f64,
+    proof: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Copy)]
+enum SubmissionKind {
+    Curl,
+    Canonical,
+}
+
+/// Finalizes after all UI widgets and egui end-pass work. Discarded projection
+/// passes have leases but never become first-visible/start/finish evidence.
+#[derive(Default)]
+struct SubmissionPlugin {
+    pending: std::collections::HashMap<egui::ViewportId, PendingSubmission>,
+    output: Option<(egui::ViewportId, Option<PendingSubmission>, usize)>,
+    // A deadline drops effect resources immediately. Only its diagnostic
+    // completion receipt survives a discarded pass, until the next output.
+    canonical: std::collections::HashMap<egui::ViewportId, PendingSubmission>,
+}
+
+impl egui::Plugin for SubmissionPlugin {
+    fn debug_name(&self) -> &'static str {
+        "page_turn_submitted_output"
+    }
+    fn on_begin_pass(&mut self, ctx: &egui::Context) {
+        self.pending.remove(&ctx.viewport_id());
+    }
+    fn on_end_pass(&mut self, ctx: &egui::Context) {
+        let viewport = ctx.viewport_id();
+        self.output = Some((
+            viewport,
+            self.pending.remove(&viewport),
+            ctx.options(|o| o.max_passes.get()),
+        ));
+    }
+    fn output_hook(&mut self, output: &mut egui::FullOutput) {
+        let Some((viewport, pending, max_passes)) = self.output.take() else {
+            return;
+        };
+        if output.platform_output.requested_discard()
+            && output.platform_output.num_completed_passes < max_passes
+        {
+            if let Some(pending) = pending
+                && matches!(
+                    pending.event.as_ref().map(|e| e.kind),
+                    Some(SubmissionKind::Canonical)
+                )
+            {
+                self.canonical.insert(viewport, pending);
+            }
+            return;
+        }
+        let Some(mut pending) = pending else {
+            if let Some(completion) = self.canonical.remove(&viewport) {
+                cancel_pending_submission(completion, "canonical_submission_missing");
+            }
+            return;
+        };
+        if let Some(completion) = self.canonical.remove(&viewport) {
+            if pending.event.is_none()
+                && same_submitted_pages(&completion.receipt, &pending.receipt)
+            {
+                pending.event = completion.event;
+            } else if !same_submitted_pages(&completion.receipt, &pending.receipt) {
+                cancel_pending_submission(completion, "canonical_source_changed");
+            }
+        }
+        pending.receipt.accepted.accept();
+        let Some(event) = pending.event else {
+            return;
+        };
+        let mut status = event
+            .tracker
+            .status
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut fields = Vec::new();
+        if crate::perf::is_enabled() {
+            fields.extend([
+                ("elapsed_ms", event.elapsed_ms.into()),
+                ("retain_bytes", event.retained_bytes.into()),
+                ("mesh_cpu_ms", event.mesh_ms.into()),
+                ("frame", pending.receipt.frame.into()),
+                ("pass", pending.receipt.pass.into()),
+                ("clock_origin", "accepted_navigation".into()),
+            ]);
+            if let Some(proof) = event.proof {
+                fields.push(("unit", proof));
+            }
+            fields.push(("submitted_pages",serde_json::Value::Array(pending.receipt.pages().iter().map(|(occurrence,source,native,area)|serde_json::json!({"idx":occurrence.idx,"role":format!("{:?}",occurrence.role),"navigation_anchor_idx":occurrence.navigation_anchor_idx,"source_texture_id":format!("{source:?}"),"native_texture_id":format!("{native:?}"),"visible_area":area})).collect())));
+        }
+        match (event.kind, *status) {
+            (SubmissionKind::Curl, SubmissionStatus::Offered) => {
+                *status = SubmissionStatus::Started;
+                emit(&event.fact, "start", "curl_submitted", &fields);
+                emit(&event.fact, "first_visible", "curl_submitted", &fields);
+                emit(&event.fact, "frame", "curl_submitted", &fields);
+            }
+            (SubmissionKind::Curl, SubmissionStatus::Started) => {
+                emit(&event.fact, "frame", "curl_submitted", &fields);
+            }
+            (SubmissionKind::Canonical, SubmissionStatus::Started) => {
+                *status = SubmissionStatus::Finished;
+                emit(&event.fact, "finish", "canonical_submitted", &fields);
+                emit(&event.fact, "fully_visible", "canonical_submitted", &fields);
+            }
+            (SubmissionKind::Canonical, SubmissionStatus::Offered) => {
+                *status = SubmissionStatus::Cancelled;
+                emit(&event.fact, "skip", "expired_before_accepted_curl", &[]);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn same_submitted_pages(a: &SubmittedUnitReceipt, b: &SubmittedUnitReceipt) -> bool {
+    a.destination == b.destination
+        && a.pages.as_slice().len() == b.pages.as_slice().len()
+        && a.pages.as_slice().iter().zip(b.pages.as_slice()).all(
+            |((oa, sa, na, _), (ob, sb, nb, area))| oa == ob && sa == sb && na == nb && *area > 0.0,
+        )
+}
+
+fn cancel_pending_submission(pending: PendingSubmission, reason: &'static str) {
+    if let Some(event) = pending.event {
+        let status = event.tracker.end();
+        if status == SubmissionStatus::Started {
+            emit(&event.fact, "cancel", reason, &[]);
+        } else if status == SubmissionStatus::Offered {
+            emit(&event.fact, "skip", reason, &[]);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PaintedUnit {
+    destination: PresentationDestination,
+    items: u64,
+    layout: Arc<Vec<SpreadDisplayUnit>>,
+    mode: SpreadMode,
+    slice: crate::page_split::PageSlice,
+    pages: Vec<PreparedPagedPage>,
+    white: Option<(egui::Rect, egui::Rect)>,
+    reserved_bytes: Arc<AtomicU64>,
+    evidence: AcceptanceEvidence,
+}
+
+impl PaintedUnit {
+    fn select_flat(previous: Arc<Self>, current: &Arc<Self>) -> Arc<Self> {
+        if previous.evidence.was_accepted() && previous.same_material_and_geometry(current) {
+            previous
+        } else {
+            current.clone()
+        }
+    }
+    fn same_material_and_geometry(&self, other: &Self) -> bool {
+        self.destination == other.destination
+            && self.items == other.items
+            && Arc::ptr_eq(&self.layout, &other.layout)
+            && self.mode == other.mode
+            && self.slice == other.slice
+            && self.white == other.white
+            && self.pages.len() == other.pages.len()
+            && self.pages.iter().zip(&other.pages).all(|(a, b)| {
+                a.occurrence == b.occurrence
+                    && a.resource.source_texture_id() == b.resource.source_texture_id()
+                    && a.resource.paint_texture_id() == b.resource.paint_texture_id()
+                    && a.resource.source_generation() == b.resource.source_generation()
+                    && a.resource.visible_source_uv_rect() == b.resource.visible_source_uv_rect()
+                    && a.transform.paint_quad() == b.transform.paint_quad()
+                    && a.transform.uv_rect == b.transform.uv_rect
+                    && a.transform.fit_input == b.transform.fit_input
+                    && a.transform.fit_scale_limits == b.transform.fit_scale_limits
+                    && a.transform.pixels_per_point == b.transform.pixels_per_point
+                    && a.painter.clip_rect() == b.painter.clip_rect()
+                    && same_underlay(&a.underlay, &b.underlay)
+            })
+    }
+    fn retained_bytes(&self) -> u64 {
+        let mut accountant = crate::vram_budget::VramAccountant::default();
+        self.account(&mut accountant);
+        accountant.finish().total_bytes()
+    }
+    fn account(&self, accountant: &mut crate::vram_budget::VramAccountant) {
+        for page in &self.pages {
+            accountant.add_texture(
+                crate::vram_budget::VramSubsystem::PageTurnPresentation,
+                page.resource.source_texture(),
+                true,
+            );
+            if let Some(output) = page.resource.lanczos_output() {
+                accountant.add_texture_id(
+                    crate::vram_budget::VramSubsystem::PageTurnPresentation,
+                    output.texture_id(),
+                    output.size(),
+                    false,
+                );
+            }
+            if let FsBgStyle::Checker(texture) = &page.underlay {
+                accountant.add_texture(
+                    crate::vram_budget::VramSubsystem::PageTurnPresentation,
+                    texture,
+                    false,
+                );
+            }
+        }
+    }
+}
+
+fn same_underlay(a: &FsBgStyle, b: &FsBgStyle) -> bool {
+    match (a, b) {
+        (FsBgStyle::Solid(a), FsBgStyle::Solid(b)) => a == b,
+        (FsBgStyle::Checker(a), FsBgStyle::Checker(b)) => a.id() == b.id(),
+        _ => false,
+    }
+}
+
+/// Weak inventory includes mounted, parked and in-flight batches without owning texels.
+#[derive(Default)]
+pub(crate) struct PageTurnLeaseInventory {
+    units: Vec<Weak<PaintedUnit>>,
+}
+
+impl PageTurnLeaseInventory {
+    fn register(&mut self, unit: &Arc<PaintedUnit>) {
+        self.units.retain(|u| u.strong_count() != 0);
+        let weak = Arc::downgrade(unit);
+        if !self.units.iter().any(|u| Weak::ptr_eq(u, &weak)) {
+            self.units.push(weak);
+        }
+    }
+    pub(crate) fn account(&self, accountant: &mut crate::vram_budget::VramAccountant) {
+        for unit in self.units.iter().filter_map(Weak::upgrade) {
+            unit.account(accountant);
+        }
+    }
+    fn reserved_bytes(&self) -> u64 {
+        let mut accountant = crate::vram_budget::VramAccountant::default();
+        self.account_reserved(&mut accountant);
+        accountant.finish().total_bytes()
+    }
+    fn account_reserved(&self, accountant: &mut crate::vram_budget::VramAccountant) {
+        for unit in self.units.iter().filter_map(Weak::upgrade) {
+            if unit.reserved_bytes.load(Ordering::Relaxed) != 0 {
+                unit.account(accountant);
+            }
+        }
+    }
+    fn reservation_bytes_with(&self, unit: &PaintedUnit) -> u64 {
+        let mut accountant = crate::vram_budget::VramAccountant::default();
+        self.account_reserved(&mut accountant);
+        unit.account(&mut accountant);
+        accountant.finish().total_bytes()
+    }
+}
+
+struct AcceptedOffer {
+    fact: ViewerOperationFact,
+    ready_sources: Vec<(
+        SpreadPageOccurrence,
+        egui::TextureId,
+        crate::gpu_lanczos::FullscreenPaintSourceGeneration,
+    )>,
+    resident_bytes: u64,
+    pin_bytes: u64,
+    accepted_at: Instant,
+    duration: Duration,
+    forward: bool,
+    submission: Arc<SubmissionTracker>,
+}
+
+enum PresentationState {
+    Inactive,
+    Flat(Arc<PaintedUnit>),
+    Offered {
+        outgoing: Arc<PaintedUnit>,
+        offer: AcceptedOffer,
+    },
+    Turning {
+        outgoing: Arc<PaintedUnit>,
+        incoming: Arc<PaintedUnit>,
+        offer: AcceptedOffer,
+    },
+}
+
+/// Input observation is a transaction projection, never a navigation request or queue.
+#[derive(Default)]
+struct OperationTransaction {
+    facts: Vec<ViewerOperationFact>,
+    disposition: OperationDisposition,
+    observed_frame: Option<u64>,
+}
+
+#[derive(Default, PartialEq, Eq)]
+enum OperationDisposition {
+    #[default]
+    Available,
+    Claimed,
+    Cancelled,
+    Excluded,
+}
+
+fn same_operation(a: &ViewerOperationFact, b: &ViewerOperationFact) -> bool {
+    a.destination == b.destination
+        && a.operation_id == b.operation_id
+        && a.source == b.source
+        && a.phase == b.phase
+}
+
+pub(crate) struct PageTurnPresentation {
+    state: PresentationState,
+    transaction: OperationTransaction,
+}
+
+impl Default for PageTurnPresentation {
+    fn default() -> Self {
+        Self {
+            state: PresentationState::Inactive,
+            transaction: OperationTransaction::default(),
+        }
+    }
+}
+
+impl PageTurnPresentation {
+    pub(crate) fn cancel(&mut self, reason: &'static str) {
+        let old = std::mem::replace(&mut self.state, PresentationState::Inactive);
+        match old {
+            PresentationState::Turning {
+                incoming, offer, ..
+            } => {
+                let previous = offer.submission.end();
+                if matches!(
+                    previous,
+                    SubmissionStatus::Offered | SubmissionStatus::Started
+                ) {
+                    emit(
+                        &offer.fact,
+                        if previous == SubmissionStatus::Started {
+                            "cancel"
+                        } else {
+                            "skip"
+                        },
+                        reason,
+                        &[("retain_bytes", incoming.retained_bytes().into())],
+                    );
+                }
+                self.state = PresentationState::Flat(incoming);
+                self.transaction.disposition = OperationDisposition::Cancelled;
+            }
+            PresentationState::Offered { outgoing, offer } => {
+                emit(&offer.fact, "skip", reason, &[]);
+                offer.submission.end();
+                // No projected batch existed; ordinary flat leases remain accounted.
+                outgoing.reserved_bytes.store(0, Ordering::Relaxed);
+                self.state = PresentationState::Flat(outgoing);
+                self.transaction.disposition = OperationDisposition::Cancelled;
+            }
+            other => self.state = other,
+        }
+    }
+    pub(crate) fn deactivate(&mut self, reason: &'static str) {
+        self.cancel(reason);
+        self.state = PresentationState::Inactive;
+        self.transaction = OperationTransaction::default();
+    }
+    pub(crate) fn observe(&mut self, facts: Vec<ViewerOperationFact>) {
+        // Empty/poll observations cannot erase a claimed transaction and make
+        // the same immutable batch eligible again during a replay pass.
+        if facts.is_empty() {
+            return;
+        }
+        if self.transaction.facts.len() == facts.len()
+            && self
+                .transaction
+                .facts
+                .iter()
+                .all(|a| facts.iter().any(|b| same_operation(a, b)))
+        {
+            return;
+        }
+        let observed_frame = self.transaction.observed_frame;
+        self.transaction = OperationTransaction {
+            facts,
+            disposition: OperationDisposition::Available,
+            observed_frame,
+        };
+        let started = match &self.state {
+            PresentationState::Offered { offer, .. } | PresentationState::Turning { offer, .. } => {
+                Some(offer.fact)
+            }
+            _ => None,
+        };
+        if let Some(started) = started
+            && self.transaction.facts.iter().any(|f| {
+                f.destination == started.destination
+                    && (f.operation_id != started.operation_id
+                        || f.phase == OperationPhase::Continuous)
+            })
+        {
+            self.cancel("new_operation");
+        }
+    }
+    fn observe_for_frame(&mut self, frame: u64, mut facts: Vec<ViewerOperationFact>) {
+        if facts.is_empty() {
+            if self.transaction.observed_frame != Some(frame)
+                && self.transaction.disposition == OperationDisposition::Available
+            {
+                self.transaction.facts.clear();
+                self.transaction.observed_frame = Some(frame);
+            }
+            return;
+        }
+        if self.transaction.observed_frame == Some(frame) {
+            for previous in &self.transaction.facts {
+                if !facts.iter().any(|f| same_operation(f, previous)) {
+                    facts.push(*previous);
+                }
+            }
+        }
+        self.observe(facts);
+        self.transaction.observed_frame = Some(frame);
+    }
+    fn take_candidate(&mut self) -> Option<ViewerOperationFact> {
+        let fact = (self.transaction.disposition == OperationDisposition::Available
+            && self.transaction.facts.len() == 1)
+            .then(|| self.transaction.facts[0])
+            .filter(|f| f.phase == OperationPhase::Press)?;
+        self.transaction.disposition = OperationDisposition::Claimed;
+        Some(fact)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_operation_for_test(
+        &mut self,
+        destination: PresentationDestination,
+        batch: u64,
+    ) {
+        self.observe(vec![ViewerOperationFact {
+            destination,
+            operation_id: ViewerOperationId::Pad { batch, ordinal: 0 },
+            source: destination.viewport,
+            phase: OperationPhase::Press,
+            cause: "test",
+            diagnostic_input_seq: 0,
+        }]);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn operation_for_test(&self) -> Option<(PresentationDestination, u64)> {
+        self.transaction.facts.first().and_then(|f| {
+            if let ViewerOperationId::Pad { batch, .. } = f.operation_id {
+                Some((f.destination, batch))
+            } else {
+                None
+            }
+        })
+    }
+}
+
+fn emit(
+    fact: &ViewerOperationFact,
+    kind: &'static str,
+    reason: &'static str,
+    extra: &[(&str, serde_json::Value)],
+) {
+    if !crate::perf::is_enabled() {
+        return;
+    }
+    let mut fields = vec![
+        ("context", format!("{:?}", fact.destination.context).into()),
+        (
+            "window",
+            fact.destination
+                .window
+                .map_or_else(|| "main".into(), |id| id.to_string())
+                .into(),
+        ),
+        (
+            "viewport",
+            format!("{:?}", fact.destination.viewport).into(),
+        ),
+        ("source_viewport", format!("{:?}", fact.source).into()),
+        ("operation_id", format!("{:?}", fact.operation_id).into()),
+        ("phase", format!("{:?}", fact.phase).into()),
+        ("cause", fact.cause.into()),
+        ("reason", reason.into()),
+    ];
+    fields.extend_from_slice(extra);
+    crate::perf::event(
+        "page_turn_animation",
+        kind,
+        None,
+        fact.diagnostic_input_seq,
+        &fields,
+    );
+}
+
+impl App {
+    pub(crate) fn page_turn_pre_draw(&mut self, ctx: &egui::Context) {
+        self.flush_submitted_page_turn_ready(ctx);
+        if !self.settings.page_turn_animation_enabled {
+            let enabled_id = egui::Id::new("page_turn_input_enabled");
+            if ctx.data(|d| d.get_temp::<bool>(enabled_id)) == Some(true) {
+                ctx.data_mut(|d| d.insert_temp(enabled_id, false));
+            }
+            self.page_turn_presentation.deactivate("disabled");
+            return;
+        }
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new("page_turn_input_enabled"), true));
+        observe_pointer_transaction(ctx);
+        if ctx.viewport_id() == self.page_turn_destination().viewport
+            && ctx.input(|i| {
+                i.viewport().minimized.unwrap_or(false) || !i.viewport().focused.unwrap_or(true)
+            })
+        {
+            self.page_turn_presentation
+                .deactivate("hidden_or_focus_lost");
+            return;
+        }
+        if self.fs_loupe_locked || self.page_turn_loupe_hold(ctx) {
+            self.page_turn_presentation.deactivate("loupe");
+            self.page_turn_presentation.transaction.disposition = OperationDisposition::Cancelled;
+            return;
+        }
+        let destination = self.page_turn_destination();
+        let source = ctx.viewport_id();
+        let mut facts = crate::key_input::operation_key_edges(ctx, source)
+            .into_iter()
+            .filter(|e| e.pressed())
+            .map(|e| ViewerOperationFact {
+                destination,
+                operation_id: ViewerOperationId::Key(e.operation_id()),
+                source,
+                phase: if e.repeat() {
+                    OperationPhase::Repeat
+                } else {
+                    OperationPhase::Press
+                },
+                cause: "key",
+                diagnostic_input_seq: self.input_seq,
+            })
+            .collect::<Vec<_>>();
+        let key_admission_blocked =
+            !facts.is_empty() && crate::keyboard_input::keymap_owner_blocks_shortcuts(ctx);
+        if key_admission_blocked {
+            facts.clear();
+        }
+        let id = egui::Id::new(("page_turn_pointer_transaction", source));
+        if let Some(mut transaction) = ctx.data(|d| d.get_temp::<PointerTransaction>(id)) {
+            let press_id = egui::Id::new(("page_turn_pointer_presses", source));
+            let mut presses = ctx
+                .data(|d| d.get_temp::<PointerPresses>(press_id))
+                .unwrap_or_default();
+            for (delivery, phase, cause) in &mut transaction.facts {
+                let Some(routed) = delivery.route(destination) else {
+                    continue;
+                };
+                *delivery = routed;
+                let operation_id = routed.id().expect("routed pointer delivery has identity");
+                for active in &mut presses.buttons {
+                    if active.id() == Some(operation_id) {
+                        *active = routed;
+                    }
+                }
+                facts.push(ViewerOperationFact {
+                    destination,
+                    operation_id,
+                    source,
+                    phase: *phase,
+                    cause,
+                    diagnostic_input_seq: self.input_seq,
+                });
+            }
+            ctx.data_mut(|d| {
+                d.insert_temp(id, transaction);
+                d.insert_temp(press_id, presses);
+            });
+        }
+        self.page_turn_presentation
+            .observe_for_frame(ctx.cumulative_frame_nr(), facts);
+    }
+
+    pub(crate) fn page_turn_external_operation(
+        &mut self,
+        ctx: &egui::Context,
+        operation_id: ViewerOperationId,
+        phase: OperationPhase,
+        cause: &'static str,
+    ) {
+        self.page_turn_external_operations(ctx, &[(operation_id, phase, cause)]);
+    }
+
+    pub(crate) fn page_turn_external_operations(
+        &mut self,
+        ctx: &egui::Context,
+        operations: &[(ViewerOperationId, OperationPhase, &'static str)],
+    ) {
+        if !self.settings.page_turn_animation_enabled {
+            return;
+        }
+        let destination = self.page_turn_destination();
+        let mut facts = Vec::with_capacity(operations.len());
+        for &(operation_id, phase, cause) in operations {
+            if let ViewerOperationId::Pad { batch, .. } = operation_id {
+                let id = egui::Id::new("page_turn_pad_destination");
+                let original = ctx.data(|d| d.get_temp::<(u64, PresentationDestination)>(id));
+                if original.is_some_and(|(old_batch, d)| old_batch == batch && d != destination) {
+                    continue;
+                }
+                if original.is_none_or(|(old_batch, _)| old_batch != batch) {
+                    ctx.data_mut(|d| d.insert_temp(id, (batch, destination)));
+                }
+            }
+            if let ViewerOperationId::Slideshow(batch) = operation_id {
+                let id = egui::Id::new("page_turn_slideshow_ingress");
+                if ctx.data(|d| d.get_temp::<u64>(id)) != Some(batch) {
+                    crate::key_input::trace_page_turn_operation_ingress(
+                        || format!("{operation_id:?}"),
+                        ctx.viewport_id(),
+                        None,
+                        "Press",
+                        "slideshow_activation",
+                    );
+                    ctx.data_mut(|d| d.insert_temp(id, batch));
+                }
+            }
+            facts.push(ViewerOperationFact {
+                destination,
+                operation_id,
+                source: ctx.viewport_id(),
+                phase,
+                cause,
+                diagnostic_input_seq: self.input_seq,
+            });
+        }
+        self.page_turn_presentation
+            .observe_for_frame(ctx.cumulative_frame_nr(), facts);
+    }
+
+    pub(super) fn page_turn_view_eligible(&self, page_idx: usize) -> bool {
+        self.settings.page_turn_animation_enabled
+            && self.reading_flow.is_paged()
+            && !self.fs_entry_is_animated(page_idx)
+            && !self.is_panorama_mode_active(page_idx)
+            && (!self.is_raw_page(page_idx)
+                || matches!(
+                    self.fs_cache.get(&page_idx),
+                    Some(FsCacheEntry::Static { .. })
+                ))
+            && !self.is_overlay_edit_mode_active()
+            && !self.analysis_mode
+            && !self.adjustment_mode.is_open()
+            && !self.fs_zoom_mode_engaged()
+            && self.fs_zoom_pan().is_none()
+            && self.fs_free_rotation.abs() <= TRANSFORM_EPSILON
+            && self.sns_split.is_none()
+            && self.capture_region_selection.is_none()
+            && matches!(self.compare_view_mode, crate::app::CompareViewMode::Off)
+            && !self.fs_loupe_locked
+            && self
+                .items
+                .get(page_idx)
+                .is_some_and(GridItem::has_page_data)
+    }
+
+    fn page_turn_loupe_hold(&self, ctx: &egui::Context) -> bool {
+        crate::keyboard_input::focused_key_state_permit(ctx).is_some_and(|permit| {
+            self.keymap
+                .modifier_held_action(ctx, permit, KeyAction::FsLoupeHold)
+        })
+    }
+
+    /// Called only after ordinary navigation accepted this operation.
+    pub(super) fn page_turn_excluded_navigation(
+        &mut self,
+        ctx: &egui::Context,
+        reason: &'static str,
+    ) {
+        if !self.settings.page_turn_animation_enabled {
+            return;
+        }
+        let transaction = &mut self.page_turn_presentation.transaction;
+        if !matches!(
+            transaction.disposition,
+            OperationDisposition::Available | OperationDisposition::Cancelled
+        ) || transaction.observed_frame != Some(ctx.cumulative_frame_nr())
+            || transaction.facts.len() != 1
+        {
+            return;
+        }
+        let fact = transaction.facts[0];
+        if fact.destination != self.page_turn_destination() {
+            return;
+        }
+        self.page_turn_presentation.transaction.disposition = OperationDisposition::Excluded;
+        emit(&fact, "skip", reason, &[]);
+    }
+
+    /// Only resident complete normal output is an opportunity. This never runs
+    /// producers, metadata I/O, or the raw/preview/thumbnail fallback chain.
+    fn page_turn_normal_ready_texture(&self, idx: usize) -> Option<egui::TextureHandle> {
+        let edit_key = self.current_edit_result_key(idx);
+        let (_, final_entry) = self.final_composite_cache.iter().find(|(key, entry)| {
+            key.edit_key == edit_key
+                && entry.complete
+                && **key
+                    == self.final_composite_key_for_pixels(
+                        edit_key,
+                        entry.source_size,
+                        self.effective_params(idx),
+                    )
+        })?;
+        // Unknown annotation metadata cannot prove what ordinary preparation
+        // will select; leave its existing loading/production path untouched.
+        let key = self.page_path_key(idx)?;
+        let objects = self.comic_docs.get(&key)?;
+        let texture = if !objects.is_empty() || self.comic_demo_enabled {
+            let entry = self.comic_cache.get(&idx)?;
+            if entry.comic_gen != self.comic_generation
+                || entry.preview_scale != 1
+                || entry.dims != final_entry.pixels.size
+                || !Arc::ptr_eq(&entry.base, &final_entry.pixels)
+            {
+                return None;
+            }
+            entry.texture.clone()
+        } else {
+            final_entry.texture.clone()
+        };
+        self.display_texture_matches_page(&texture, idx)
+            .then_some(texture)
+    }
+
+    /// Called only at accepted Sequential navigation, before opening/mutating the target.
+    pub(super) fn offer_page_turn(&mut self, ctx: &egui::Context, target: usize, forward: bool) {
+        if !self.settings.page_turn_animation_enabled {
+            return;
+        }
+        let Some(fact) = self.page_turn_presentation.take_candidate() else {
+            let reason = self
+                .page_turn_presentation
+                .transaction
+                .facts
+                .first()
+                .map_or("superseded_animation", |fact| match fact.phase {
+                    OperationPhase::Press => "superseded_animation",
+                    OperationPhase::Repeat => "repeat_operation",
+                    OperationPhase::Continuous => "continuous_operation",
+                });
+            self.page_turn_excluded_navigation(ctx, reason);
+            return;
+        };
+        if !self.page_turn_view_eligible(target) || self.page_turn_loupe_hold(ctx) {
+            emit(&fact, "skip", "ineligible_view", &[]);
+            return;
+        }
+        let duration = Duration::from_millis(
+            self.settings
+                .page_turn_animation_duration_ms
+                .clamp(100, 600) as u64,
+        );
+        if matches!(fact.operation_id, ViewerOperationId::Slideshow(_))
+            && !slideshow_interval_allows_turn(duration, self.slideshow_interval_duration())
+        {
+            emit(
+                &fact,
+                "skip",
+                "slideshow_interval_shorter_than_duration",
+                &[],
+            );
+            return;
+        }
+        let composition = self.spread_display_composition_for_anchor(target);
+        let occurrences = composition.pages_in_screen_order(self.spread_mode);
+        let mut ready_sources = Vec::with_capacity(occurrences.len());
+        for occurrence in occurrences {
+            if !self.page_turn_view_eligible(occurrence.idx) {
+                emit(&fact, "skip", "ineligible_companion", &[]);
+                return;
+            }
+            let Some(texture) = self.page_turn_normal_ready_texture(occurrence.idx) else {
+                emit(&fact, "skip", "not_final_ready_at_accept", &[]);
+                return;
+            };
+            ready_sources.push((
+                occurrence,
+                texture.id(),
+                crate::gpu_lanczos::FullscreenPaintSourceGeneration {
+                    items: self.items_generation,
+                    input: self
+                        .input_generation
+                        .get(&occurrence.idx)
+                        .copied()
+                        .unwrap_or(0),
+                },
+            ));
+        }
+        emit(
+            &fact,
+            "opportunity",
+            "ready_at_accept",
+            &[("target", target.into())],
+        );
+        let old = std::mem::replace(
+            &mut self.page_turn_presentation.state,
+            PresentationState::Inactive,
+        );
+        let PresentationState::Flat(outgoing) = old else {
+            self.page_turn_presentation.state = old;
+            emit(&fact, "skip", "no_outgoing_paint", &[]);
+            return;
+        };
+        let bytes = outgoing.retained_bytes();
+        let budget = self.vram_pool_budget();
+        let resident_bytes = self.vram_accounting_snapshot().total_bytes();
+        let pin_bytes = self.page_turn_leases.reservation_bytes_with(&outgoing);
+        let limit = budget
+            .fullscreen_bytes
+            .map_or(128 * 1024 * 1024, |b| (b / 10).min(128 * 1024 * 1024));
+        if budget.pool_bytes.is_some_and(|cap| resident_bytes > cap) {
+            emit(
+                &fact,
+                "skip",
+                "memory_pressure",
+                &[
+                    ("resident_bytes", resident_bytes.into()),
+                    ("pin_bytes", pin_bytes.into()),
+                ],
+            );
+            self.page_turn_presentation.state = PresentationState::Flat(outgoing);
+            return;
+        }
+        if pin_bytes > limit {
+            emit(
+                &fact,
+                "skip",
+                "pin_budget",
+                &[
+                    ("retain_bytes", bytes.into()),
+                    ("resident_bytes", resident_bytes.into()),
+                    ("pin_bytes", pin_bytes.into()),
+                    ("pin_limit_bytes", limit.into()),
+                ],
+            );
+            self.page_turn_presentation.state = PresentationState::Flat(outgoing);
+            return;
+        }
+        outgoing.reserved_bytes.store(bytes, Ordering::Relaxed);
+        emit(
+            &fact,
+            "offered",
+            "ready_at_accept",
+            &[
+                ("retain_bytes", bytes.into()),
+                ("resident_bytes", resident_bytes.into()),
+                ("pin_bytes", pin_bytes.into()),
+                ("pin_limit_bytes", limit.into()),
+            ],
+        );
+        self.page_turn_presentation.state = PresentationState::Offered {
+            outgoing,
+            offer: AcceptedOffer {
+                fact,
+                ready_sources,
+                resident_bytes,
+                pin_bytes,
+                accepted_at: Instant::now(),
+                duration,
+                forward,
+                submission: Arc::new(SubmissionTracker::new()),
+            },
+        };
+        let _ = ctx;
+    }
+
+    pub(super) fn submit_paged_display_unit(
+        &mut self,
+        ctx: &egui::Context,
+        pages: &[PreparedPagedPage],
+        white: Option<(egui::Rect, egui::Rect)>,
+    ) -> Option<SubmittedUnitReceipt> {
+        if pages.is_empty() {
+            self.page_turn_presentation.deactivate("no_page");
+            return None;
+        }
+        assert!(
+            pages.len() <= 2,
+            "normal paged units have at most two real occurrences"
+        );
+        // OFF does no effect clock, snapshot/inventory work, geometry projection or input diagnostics.
+        if !self.settings.page_turn_animation_enabled {
+            for page in pages {
+                paint_flat_page(page);
+            }
+            if let Some((rect, clip)) = white {
+                paint_white_companion(&pages[0].painter, rect, clip);
+            }
+            return Some(flat_receipt(self.page_turn_destination(), ctx, pages, true));
+        }
+        // `live` comes from the normal unit/source selector. Do not re-resolve,
+        // prepare or mutate holdover readiness while deciding presentation.
+        let eligible = pages
+            .iter()
+            .all(|p| p.live && self.page_turn_view_eligible(p.occurrence.idx))
+            && !self.page_turn_loupe_hold(ctx);
+        if !eligible {
+            self.page_turn_presentation.deactivate("ineligible_view");
+            for page in pages {
+                paint_flat_page(page);
+            }
+            if let Some((rect, clip)) = white {
+                paint_white_companion(&pages[0].painter, rect, clip);
+            }
+            let receipt = flat_receipt(self.page_turn_destination(), ctx, pages, false);
+            queue_submission(ctx, receipt.clone(), None);
+            return Some(receipt);
+        }
+        let mut receipt = flat_receipt(self.page_turn_destination(), ctx, pages, false);
+        let unit = Arc::new(PaintedUnit {
+            destination: self.page_turn_destination(),
+            items: self.items_generation,
+            layout: Arc::clone(&self.spread_display_units_cache.units),
+            mode: self.spread_mode,
+            slice: self.fullscreen_page_slice,
+            pages: pages.to_vec(),
+            white,
+            reserved_bytes: Arc::new(AtomicU64::new(0)),
+            evidence: receipt.accepted.clone(),
+        });
+        let old = std::mem::replace(
+            &mut self.page_turn_presentation.state,
+            PresentationState::Inactive,
+        );
+        let now = Instant::now();
+        let selected = match old {
+            PresentationState::Offered { outgoing, offer } => {
+                let matching = outgoing.evidence.was_accepted()
+                    && offer.fact.destination == unit.destination
+                    && outgoing.items == unit.items
+                    && outgoing.mode == unit.mode
+                    && outgoing.slice == unit.slice
+                    && Arc::ptr_eq(&outgoing.layout, &unit.layout)
+                    && outgoing.pages.len() == unit.pages.len()
+                    && outgoing.white.is_some() == unit.white.is_some()
+                    && outgoing
+                        .pages
+                        .iter()
+                        .zip(&unit.pages)
+                        .all(|(old, new)| old.occurrence.role == new.occurrence.role)
+                    && offer.ready_sources.len() == unit.pages.len()
+                    && offer.ready_sources.iter().zip(&unit.pages).all(
+                        |((o, id, generation), p)| {
+                            *o == p.occurrence
+                                && *id == p.resource.source_texture_id()
+                                && p.resource.source_generation() == Some(*generation)
+                        },
+                    );
+                let deadline_allows = !self.slideshow_playing
+                    || slideshow_deadline_allows_turn(
+                        offer.accepted_at,
+                        offer.duration,
+                        self.slideshow_next_at,
+                    );
+                if matching
+                    && deadline_allows
+                    && now.saturating_duration_since(offer.accepted_at) < offer.duration
+                {
+                    PresentationState::Turning {
+                        outgoing,
+                        incoming: unit.clone(),
+                        offer,
+                    }
+                } else {
+                    offer.submission.end();
+                    emit(
+                        &offer.fact,
+                        "skip",
+                        if deadline_allows {
+                            "offer_mismatch_or_expired"
+                        } else {
+                            "slideshow_deadline_shorter_than_turn"
+                        },
+                        &[],
+                    );
+                    PresentationState::Flat(unit.clone())
+                }
+            }
+            PresentationState::Turning {
+                outgoing,
+                incoming,
+                offer,
+            } => {
+                if incoming.same_material_and_geometry(&unit) {
+                    PresentationState::Turning {
+                        outgoing,
+                        incoming,
+                        offer,
+                    }
+                } else {
+                    let previous = offer.submission.end();
+                    if matches!(
+                        previous,
+                        SubmissionStatus::Offered | SubmissionStatus::Started
+                    ) {
+                        emit(
+                            &offer.fact,
+                            if previous == SubmissionStatus::Started {
+                                "cancel"
+                            } else {
+                                "skip"
+                            },
+                            "source_geometry_or_binding_changed",
+                            &[],
+                        );
+                    }
+                    PresentationState::Flat(unit.clone())
+                }
+            }
+            PresentationState::Flat(previous) => {
+                PresentationState::Flat(PaintedUnit::select_flat(previous, &unit))
+            }
+            _ => PresentationState::Flat(unit.clone()),
+        };
+        let mut final_state = selected;
+        let mut curl = false;
+        let mut submission_event = None;
+        if let PresentationState::Turning {
+            outgoing,
+            incoming,
+            offer,
+        } = &final_state
+        {
+            let progress = now
+                .saturating_duration_since(offer.accepted_at)
+                .as_secs_f32()
+                / offer.duration.as_secs_f32();
+            if progress < 1.0 {
+                let t0 = crate::perf::is_enabled().then(Instant::now);
+                let projection = canonical_unit(outgoing).and_then(|out| {
+                    canonical_unit(incoming).and_then(|input| {
+                        crate::page_turn_animation::project_turn(
+                            &out,
+                            &input,
+                            crate::page_turn_animation::TurnDirection {
+                                reading_rtl: unit.mode.advances_right_to_left(),
+                                forward: offer.forward,
+                            },
+                            progress,
+                        )
+                        .map_err(|_| "geometry_visibility_or_roi")
+                    })
+                });
+                match projection {
+                    Ok(projection) => {
+                        for draw in projection.meshes {
+                            let painter = unit.pages[0].painter.with_clip_rect(draw.clip_rect);
+                            #[cfg(any(test, all(windows, feature = "test-script")))]
+                            let page =
+                                incoming
+                                    .pages
+                                    .iter()
+                                    .chain(outgoing.pages.iter())
+                                    .find(|page| {
+                                        page.resource.paint_texture_id() == draw.mesh.texture_id
+                                    });
+                            #[cfg(test)]
+                            if let Some(page) = page {
+                                crate::app::paint_record_test_support::record_selected_paint_resource(&painter,&page.resource);
+                            }
+                            painter.add(egui::Shape::mesh(draw.mesh));
+                            #[cfg(all(windows, feature = "test-script"))]
+                            if let Some(page) = page {
+                                crate::test_script::record_drawn_paint(
+                                    &painter,
+                                    &page.resource,
+                                    format!("{:?}", page.transform.placement),
+                                );
+                            }
+                        }
+                        crate::gpu_lanczos::retain_owner_for_fullscreen_paint_batch(
+                            &unit.pages[0].painter,
+                            Arc::clone(outgoing),
+                        );
+                        crate::gpu_lanczos::retain_owner_for_fullscreen_paint_batch(
+                            &unit.pages[0].painter,
+                            Arc::clone(incoming),
+                        );
+                        self.page_turn_leases.register(outgoing);
+                        self.page_turn_leases.register(incoming);
+                        receipt.curl = true;
+                        // Canonical geometry uses bounded caller-local indices;
+                        // Blank never enters this actual-occurrence receipt.
+                        for (i, (_, _, _, area)) in
+                            receipt.pages.as_mut_slice().iter_mut().enumerate()
+                        {
+                            *area = projection
+                                .visibility
+                                .incoming
+                                .iter()
+                                .find(|v| v.occurrence == i as u64)
+                                .map_or(0.0, |v| v.visible_area);
+                        }
+                        submission_event = Some(SubmissionEvent {
+                            tracker: offer.submission.clone(),
+                            fact: offer.fact,
+                            kind: SubmissionKind::Curl,
+                            elapsed_ms: now
+                                .saturating_duration_since(offer.accepted_at)
+                                .as_secs_f64()
+                                * 1000.0,
+                            retained_bytes: outgoing.reserved_bytes.load(Ordering::Relaxed),
+                            mesh_ms: t0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0),
+                            proof: crate::perf::is_enabled()
+                                .then(||serde_json::json!({"incoming":unit_diagnostics(incoming,offer),"outgoing":unit_diagnostics(outgoing,offer)})),
+                        });
+                        curl = true;
+                        ctx.request_repaint();
+                    }
+                    Err(reason) => {
+                        let previous = offer.submission.end();
+                        if matches!(
+                            previous,
+                            SubmissionStatus::Offered | SubmissionStatus::Started
+                        ) {
+                            emit(
+                                &offer.fact,
+                                if previous == SubmissionStatus::Started {
+                                    "cancel"
+                                } else {
+                                    "skip"
+                                },
+                                reason,
+                                &[],
+                            );
+                        }
+                        final_state = PresentationState::Flat(unit.clone());
+                    }
+                }
+            } else {
+                submission_event = Some(SubmissionEvent {
+                    tracker: offer.submission.clone(),
+                    fact: offer.fact,
+                    kind: SubmissionKind::Canonical,
+                    elapsed_ms: now
+                        .saturating_duration_since(offer.accepted_at)
+                        .as_secs_f64()
+                        * 1000.0,
+                    retained_bytes: 0,
+                    mesh_ms: 0.0,
+                    proof: crate::perf::is_enabled().then(|| unit_diagnostics(incoming, offer)),
+                });
+                final_state = PresentationState::Flat(unit.clone());
+            }
+        }
+        if !curl {
+            for page in &unit.pages {
+                paint_flat_page(page);
+            }
+            if let Some((rect, clip)) = white {
+                paint_white_companion(&unit.pages[0].painter, rect, clip);
+            }
+        }
+        if !curl {
+            let retained = match &final_state {
+                PresentationState::Flat(unit) => unit.clone(),
+                _ => unit.clone(),
+            };
+            self.page_turn_leases.register(&retained);
+            crate::gpu_lanczos::retain_owner_for_fullscreen_paint_batch(
+                &unit.pages[0].painter,
+                retained,
+            );
+        }
+        self.page_turn_presentation.state = final_state;
+        queue_submission(ctx, receipt.clone(), submission_event);
+        Some(receipt)
+    }
+}
+
+fn paint_white_companion(painter: &egui::Painter, rect: egui::Rect, clip: egui::Rect) {
+    let painter = painter.with_clip_rect(clip);
+    #[cfg(test)]
+    crate::app::paint_record_test_support::record_white_companion_paint(&painter, rect);
+    painter.rect_filled(rect, 0.0, egui::Color32::WHITE);
+}
+
+pub(super) fn paint_flat_page(page: &PreparedPagedPage) {
+    paint_image_underlay(&page.painter, page.transform.paint_quad(), &page.underlay);
+    #[cfg(test)]
+    crate::app::paint_record_test_support::record_selected_paint_resource(
+        &page.painter,
+        &page.resource,
+    );
+    if let Some(roi) = page.resource.visible_source_uv_rect() {
+        page.transform.paint_texture_source_region(
+            &page.painter,
+            page.resource.paint_texture_id(),
+            roi,
+            egui::Color32::WHITE,
+        );
+    } else {
+        page.transform.paint_texture(
+            &page.painter,
+            page.resource.paint_texture_id(),
+            egui::Color32::WHITE,
+        );
+    }
+    #[cfg(all(windows, feature = "test-script"))]
+    crate::test_script::record_drawn_paint(
+        &page.painter,
+        &page.resource,
+        format!("{:?}", page.transform.placement),
+    );
+    page.resource.retain_native_output_for_paint(&page.painter);
+}
+
+fn paint_projection_meshes(
+    painter: &egui::Painter,
+    meshes: Vec<crate::page_turn_animation::ProjectedMesh>,
+) {
+    for draw in meshes {
+        painter
+            .with_clip_rect(draw.clip_rect)
+            .add(egui::Shape::mesh(draw.mesh));
+    }
+}
+
+#[cfg(test)]
+pub(super) fn paint_projection_for_test(
+    painter: &egui::Painter,
+    outgoing: &crate::page_turn_animation::CanonicalUnit,
+    incoming: &crate::page_turn_animation::CanonicalUnit,
+    direction: crate::page_turn_animation::TurnDirection,
+    progress: f32,
+) -> Result<
+    crate::page_turn_animation::VisibilityReceipt,
+    crate::page_turn_animation::ProjectionFailure,
+> {
+    let projection =
+        crate::page_turn_animation::project_turn(outgoing, incoming, direction, progress)?;
+    paint_projection_meshes(painter, projection.meshes);
+    Ok(projection.visibility)
+}
+
+fn flat_receipt(
+    destination: PresentationDestination,
+    ctx: &egui::Context,
+    pages: &[PreparedPagedPage],
+    accepted: bool,
+) -> SubmittedUnitReceipt {
+    SubmittedUnitReceipt {
+        destination,
+        frame: ctx.cumulative_frame_nr(),
+        pass: ctx.cumulative_pass_nr(),
+        accepted: if accepted {
+            AcceptanceEvidence::Immediate
+        } else {
+            AcceptanceEvidence::Deferred(Arc::new(AtomicBool::new(false)))
+        },
+        curl: false,
+        pages: {
+            let entry = |p: &PreparedPagedPage| {
+                (
+                    p.occurrence,
+                    p.resource.source_texture_id(),
+                    p.resource.paint_texture_id(),
+                    visible_rect_area(p.transform.paint_rect.intersect(p.painter.clip_rect())),
+                )
+            };
+            match pages {
+                [page] => ReceiptPages::Single(entry(page)),
+                [left, right] => ReceiptPages::Spread([entry(left), entry(right)]),
+                _ => unreachable!("normal paged units have one or two actual occurrences"),
+            }
+        },
+    }
+}
+
+fn visible_rect_area(rect: egui::Rect) -> f32 {
+    if rect.width() > 0.0 && rect.height() > 0.0 && rect.is_finite() {
+        rect.area()
+    } else {
+        0.0
+    }
+}
+
+fn slideshow_interval_allows_turn(duration: Duration, interval: Duration) -> bool {
+    duration <= interval
+}
+fn slideshow_deadline_allows_turn(
+    accepted_at: Instant,
+    duration: Duration,
+    deadline: Instant,
+) -> bool {
+    accepted_at
+        .checked_add(duration)
+        .is_some_and(|end| end <= deadline)
+}
+
+fn rect_diagnostics(rect: egui::Rect) -> [f32; 4] {
+    [rect.min.x, rect.min.y, rect.max.x, rect.max.y]
+}
+
+fn unit_diagnostics(unit: &PaintedUnit, offer: &AcceptedOffer) -> serde_json::Value {
+    serde_json::json!({
+        "items_generation":unit.items,
+        "resident_bytes_at_accept":offer.resident_bytes,
+        "global_pin_bytes_at_accept":offer.pin_bytes,
+        "expected_sources":offer.ready_sources.iter().map(|(o,id,g)|serde_json::json!({"idx":o.idx,"source_texture_id":format!("{id:?}"),"source_generation":{"items":g.items,"input":g.input}})).collect::<Vec<_>>(),
+        "reading_rtl":unit.mode.advances_right_to_left(),
+        "forward":offer.forward,
+        "duration_ms":offer.duration.as_millis() as u64,
+        "mode":format!("{:?}",unit.mode),
+        "slice":format!("{:?}",unit.slice),
+        "pages":unit.pages.iter().map(|page|{
+            let resource=&page.resource;
+            let uv=canonical_source_uv(&page.transform);
+            serde_json::json!({
+                "idx":page.occurrence.idx,"role":format!("{:?}",page.occurrence.role),"navigation_anchor_idx":page.occurrence.navigation_anchor_idx,
+                "source_texture_id":format!("{:?}",resource.source_texture_id()),"native_texture_id":format!("{:?}",resource.paint_texture_id()),
+                "source_size":resource.size(),"native_size":resource.lanczos_output().map_or(resource.size(),|o|o.size()),
+                "source_generation":resource.source_generation().map(|g|serde_json::json!({"items":g.items,"input":g.input})),
+                "visible_source_roi":resource.visible_source_uv_rect().map(rect_diagnostics),
+                "canonical_rect":rect_diagnostics(page.transform.paint_rect),"clip_rect":rect_diagnostics(page.painter.clip_rect()),
+                "uv":uv.map(|p|[p.x,p.y]),"quality":"normal_selected_processed_resource"
+            })
+        }).collect::<Vec<_>>()
+    })
+}
+
+fn queue_submission(
+    ctx: &egui::Context,
+    receipt: SubmittedUnitReceipt,
+    event: Option<SubmissionEvent>,
+) {
+    ctx.with_plugin(|plugin: &mut SubmissionPlugin| {
+        plugin
+            .pending
+            .insert(ctx.viewport_id(), PendingSubmission { receipt, event });
+    });
+}
+
+fn canonical_source_uv(transform: &DisplayedImageTransform) -> [egui::Pos2; 4] {
+    [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)].map(|(u, v)| {
+        let (s, t) = crate::displayed_image_transform::inverse_uv(transform.rotation, u, v);
+        egui::pos2(
+            transform.uv_rect.left() + s * transform.uv_rect.width(),
+            transform.uv_rect.top() + t * transform.uv_rect.height(),
+        )
+    })
+}
+
+fn canonical_unit(
+    unit: &PaintedUnit,
+) -> Result<crate::page_turn_animation::CanonicalUnit, &'static str> {
+    use crate::page_turn_animation::*;
+    let mut pages = Vec::new();
+    for (i, page) in unit.pages.iter().enumerate() {
+        if page.transform.free_rotation_rad.abs() > TRANSFORM_EPSILON {
+            return Err("free_rotation");
+        }
+        let quad = page.transform.paint_quad();
+        let uv = canonical_source_uv(&page.transform);
+        let material = if let Some(roi) = page.resource.visible_source_uv_rect() {
+            if uv.iter().any(|p| !roi.contains(*p)) {
+                return Err("partial_roi");
+            }
+            PageMaterial::Texture {
+                texture_id: page.resource.paint_texture_id(),
+                uv: uv.map(|p| {
+                    egui::pos2(
+                        (p.x - roi.min.x) / roi.width(),
+                        (p.y - roi.min.y) / roi.height(),
+                    )
+                }),
+                available_uv: egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            }
+        } else {
+            PageMaterial::Texture {
+                texture_id: page.resource.paint_texture_id(),
+                uv,
+                available_uv: egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            }
+        };
+        let underlay = match &page.underlay {
+            FsBgStyle::Solid(color) => PageMaterial::Blank { color: *color },
+            FsBgStyle::Checker(tex) => PageMaterial::Texture {
+                texture_id: tex.id(),
+                uv: checker_quad_uvs(quad.local_size),
+                available_uv: egui::Rect::from_min_max(
+                    egui::Pos2::ZERO,
+                    egui::pos2(
+                        quad.local_size.x / CHECKER_TILE_PX,
+                        quad.local_size.y / CHECKER_TILE_PX,
+                    ),
+                ),
+            },
+        };
+        pages.push(CanonicalPage {
+            occurrence: Some(i as u64),
+            rect: page.transform.paint_rect,
+            clip_rect: page.painter.clip_rect(),
+            material,
+            underlay: Some(underlay),
+        });
+    }
+    if let Some((rect, clip_rect)) = unit.white {
+        pages.push(CanonicalPage {
+            occurrence: None,
+            rect,
+            clip_rect,
+            material: PageMaterial::Blank {
+                color: egui::Color32::WHITE,
+            },
+            underlay: None,
+        });
+        pages.sort_by(|a, b| a.rect.left().total_cmp(&b.rect.left()));
+    }
+    Ok(CanonicalUnit {
+        layout: if pages.len() == 2 {
+            UnitLayout::Spread
+        } else {
+            UnitLayout::Single
+        },
+        pages,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn destination(serial: u64) -> PresentationDestination {
+        PresentationDestination {
+            context: crate::app::ViewerContextId::for_test(serial),
+            window: None,
+            viewport: egui::ViewportId::ROOT,
+        }
+    }
+    fn fact(batch: u64) -> ViewerOperationFact {
+        ViewerOperationFact {
+            destination: destination(1),
+            operation_id: ViewerOperationId::Pad { batch, ordinal: 0 },
+            source: egui::ViewportId::ROOT,
+            phase: OperationPhase::Press,
+            cause: "test",
+            diagnostic_input_seq: 1,
+        }
+    }
+    fn receipt(ctx: &egui::Context, idx: usize) -> SubmittedUnitReceipt {
+        SubmittedUnitReceipt {
+            destination: destination(1),
+            frame: ctx.cumulative_frame_nr(),
+            pass: ctx.cumulative_pass_nr(),
+            pages: ReceiptPages::Single((
+                SpreadPageOccurrence::navigation(idx, idx),
+                egui::TextureId::Managed(idx as u64),
+                egui::TextureId::User(idx as u64),
+                100.0,
+            )),
+            accepted: AcceptanceEvidence::Deferred(Arc::new(AtomicBool::new(false))),
+            curl: false,
+        }
+    }
+    fn event(tracker: &Arc<SubmissionTracker>, kind: SubmissionKind) -> SubmissionEvent {
+        SubmissionEvent {
+            tracker: tracker.clone(),
+            fact: fact(1),
+            kind,
+            elapsed_ms: 0.0,
+            retained_bytes: 0,
+            mesh_ms: 0.0,
+            proof: None,
+        }
+    }
+    fn unit(ctx: &egui::Context, texture: egui::TextureHandle, serial: u64) -> Arc<PaintedUnit> {
+        use crate::displayed_image_transform::*;
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(32.0, 32.0));
+        let transform = DisplayedImageTransform::from_resolved_rect(
+            DisplayedImageTransformInput {
+                page_idx: 0,
+                viewport_rect: rect,
+                source_size: rect.size(),
+                texture_size: rect.size(),
+                rotation: crate::rotation_db::Rotation::None,
+                free_rotation_rad: 0.0,
+                content_bbox: None,
+                fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
+                fit_scale_limits: FullscreenFitScaleLimits::default(),
+                pixels_per_point: 1.0,
+                placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                pixel_fit: RectPixelFit::Texels,
+            },
+            rect,
+        )
+        .unwrap();
+        Arc::new(PaintedUnit {
+            destination: destination(serial),
+            items: 1,
+            layout: Arc::new(Vec::new()),
+            mode: SpreadMode::Single,
+            slice: crate::page_split::PageSlice::Full,
+            pages: vec![PreparedPagedPage {
+                occurrence: SpreadPageOccurrence::navigation(0, 0),
+                transform,
+                resource: FullscreenPaintResource::resampleable(
+                    0,
+                    texture,
+                    crate::gpu_lanczos::FullscreenPaintSourceGeneration { items: 1, input: 0 },
+                ),
+                painter: ctx.debug_painter().with_clip_rect(rect),
+                underlay: FsBgStyle::Solid(egui::Color32::BLACK),
+                live: true,
+            }],
+            white: None,
+            reserved_bytes: Arc::new(AtomicU64::new(0)),
+            evidence: AcceptanceEvidence::Immediate,
+        })
+    }
+
+    #[test]
+    fn immutable_operation_replay_ignores_diagnostic_sequence_and_claims_once() {
+        let mut presentation = PageTurnPresentation::default();
+        presentation.observe_for_frame(1, vec![fact(1)]);
+        assert!(presentation.take_candidate().is_some());
+        let mut replay = fact(1);
+        replay.diagnostic_input_seq = 999;
+        replay.cause = "replay_metadata";
+        presentation.observe_for_frame(1, vec![replay]);
+        assert!(presentation.take_candidate().is_none());
+        presentation.observe_for_frame(1, vec![]);
+        assert!(presentation.take_candidate().is_none());
+    }
+    #[test]
+    fn batch_merge_suppresses_multiple_edges_and_unclaimed_facts_expire() {
+        let mut presentation = PageTurnPresentation::default();
+        presentation.observe_for_frame(1, vec![fact(1)]);
+        presentation.observe_for_frame(1, vec![fact(2)]);
+        assert_eq!(presentation.transaction.facts.len(), 2);
+        assert!(presentation.take_candidate().is_none());
+        presentation.observe_for_frame(2, vec![]);
+        assert!(presentation.transaction.facts.is_empty());
+        let mut continuous = fact(3);
+        continuous.phase = OperationPhase::Continuous;
+        presentation.observe_for_frame(3, vec![continuous]);
+        assert!(presentation.take_candidate().is_none());
+        presentation.deactivate("disabled");
+        assert!(presentation.transaction.facts.is_empty());
+    }
+    #[test]
+    fn pointer_delivery_preserves_original_binding_on_release() {
+        let id = ViewerOperationId::Pointer {
+            batch: 2,
+            source: egui::ViewportId::ROOT,
+            ordinal: 0,
+        };
+        let routed = PointerDelivery::Unrouted(id).route(destination(1)).unwrap();
+        assert_eq!(routed.id(), Some(id));
+        assert!(routed.route(destination(2)).is_none());
+        assert_eq!(routed.route(destination(1)).unwrap().id(), Some(id));
+    }
+    #[test]
+    fn output_plugin_accepts_only_last_actual_submission() {
+        let ctx = egui::Context::default();
+        install(&ctx);
+        let tracker = Arc::new(SubmissionTracker::new());
+        let mut receipts = Vec::new();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let proof = receipt(ctx, 1);
+            queue_submission(
+                ctx,
+                proof.clone(),
+                Some(event(&tracker, SubmissionKind::Curl)),
+            );
+            receipts.push(proof);
+            if ctx.current_pass_index() == 0 {
+                ctx.request_discard("test replay");
+            }
+        });
+        assert_eq!(receipts.len(), 2);
+        assert!(!receipts[0].was_accepted());
+        assert!(receipts[1].was_accepted());
+        assert_eq!(tracker.status(), SubmissionStatus::Started);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            queue_submission(
+                ctx,
+                receipt(ctx, 1),
+                Some(event(&tracker, SubmissionKind::Canonical)),
+            )
+        });
+        assert_eq!(tracker.status(), SubmissionStatus::Finished);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            queue_submission(
+                ctx,
+                receipt(ctx, 1),
+                Some(event(&tracker, SubmissionKind::Curl)),
+            )
+        });
+        assert_eq!(tracker.status(), SubmissionStatus::Finished);
+    }
+    #[test]
+    fn discarded_canonical_completion_requires_same_actual_next_flat_output() {
+        for matching in [true, false] {
+            let ctx = egui::Context::default();
+            install(&ctx);
+            let tracker = Arc::new(SubmissionTracker::new());
+            *tracker.status.lock().unwrap() = SubmissionStatus::Started;
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                if ctx.current_pass_index() == 0 {
+                    queue_submission(
+                        ctx,
+                        receipt(ctx, 1),
+                        Some(event(&tracker, SubmissionKind::Canonical)),
+                    );
+                    ctx.request_discard("canonical replay");
+                } else {
+                    queue_submission(ctx, receipt(ctx, if matching { 1 } else { 2 }), None);
+                }
+            });
+            assert_eq!(
+                tracker.status(),
+                if matching {
+                    SubmissionStatus::Finished
+                } else {
+                    SubmissionStatus::Cancelled
+                }
+            );
+        }
+    }
+    #[test]
+    fn weak_inventory_deduplicates_shared_sources_and_releases_after_last_real_batch() {
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "lease",
+            egui::ColorImage::filled([4, 4], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let old = unit(&ctx, texture.clone(), 1);
+        let sibling = unit(&ctx, texture, 2);
+        let mut inventory = PageTurnLeaseInventory::default();
+        inventory.register(&old);
+        inventory.register(&old);
+        inventory.register(&sibling);
+        assert_eq!(inventory.units.len(), 2);
+        let bytes = old.retained_bytes();
+        old.reserved_bytes.store(bytes, Ordering::Relaxed);
+        sibling.reserved_bytes.store(bytes, Ordering::Relaxed);
+        assert_eq!(inventory.reserved_bytes(), bytes);
+        assert_eq!(inventory.reservation_bytes_with(&sibling), bytes);
+        let mut accountant = crate::vram_budget::VramAccountant::default();
+        accountant.add_texture(
+            crate::vram_budget::VramSubsystem::FsCache,
+            old.pages[0].resource.source_texture(),
+            true,
+        );
+        inventory.account(&mut accountant);
+        assert_eq!(accountant.finish().total_bytes(), bytes);
+        let weak = Arc::downgrade(&old);
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(64.0, 64.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                let painter = ctx.debug_painter();
+                paint_flat_page(&old.pages[0]);
+                crate::gpu_lanczos::retain_owner_for_fullscreen_paint_batch(&painter, old.clone());
+            },
+        );
+        drop(old);
+        assert!(weak.upgrade().is_some());
+        let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+        assert!(weak.upgrade().is_some());
+        drop(primitives);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(inventory.reserved_bytes(), bytes); // sibling reservation remains
+        drop(sibling);
+        assert_eq!(inventory.reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn discarded_flat_unit_is_unadopted_until_its_actual_receipt_is_accepted() {
+        let ctx = egui::Context::default();
+        install(&ctx);
+        let texture = ctx.load_texture(
+            "discarded-flat",
+            egui::ColorImage::filled([4, 4], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let mut outgoing = unit(&ctx, texture, 1);
+        let proof = receipt(&ctx, 0);
+        Arc::make_mut(&mut outgoing).evidence = proof.accepted.clone();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            if ctx.current_pass_index() == 0 {
+                queue_submission(ctx, proof.clone(), None);
+                ctx.request_discard("never shown outgoing");
+            }
+        });
+        assert!(!outgoing.evidence.was_accepted());
+        // The runtime Offered -> Turning guard reads this exact shared proof.
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            queue_submission(ctx, proof.clone(), None)
+        });
+        assert!(outgoing.evidence.was_accepted());
+    }
+
+    #[test]
+    fn same_material_flat_replay_replaces_unaccepted_outgoing_proof() {
+        let ctx = egui::Context::default();
+        install(&ctx);
+        let texture = ctx.load_texture(
+            "replay-adoption",
+            egui::ColorImage::filled([4, 4], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let mut previous = unit(&ctx, texture, 1);
+        let discarded = receipt(&ctx, 0);
+        Arc::make_mut(&mut previous).evidence = discarded.accepted.clone();
+        let mut next = Arc::new((*previous).clone());
+        let adopted = receipt(&ctx, 0);
+        Arc::make_mut(&mut next).evidence = adopted.accepted.clone();
+        assert!(previous.same_material_and_geometry(&next));
+        let selected = PaintedUnit::select_flat(previous, &next);
+        assert!(Arc::ptr_eq(&selected, &next));
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            queue_submission(ctx, adopted.clone(), None)
+        });
+        assert!(selected.evidence.was_accepted());
+        assert!(!discarded.was_accepted());
+        assert!(Arc::ptr_eq(
+            &PaintedUnit::select_flat(selected.clone(), &next),
+            &selected
+        ));
+    }
+
+    #[test]
+    fn offered_cancel_releases_reservation_but_preserves_flat_and_sibling_leases() {
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "cancel",
+            egui::ColorImage::filled([4, 4], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let outgoing = unit(&ctx, texture.clone(), 1);
+        let sibling = unit(&ctx, texture, 2);
+        let bytes = outgoing.retained_bytes();
+        outgoing.reserved_bytes.store(bytes, Ordering::Relaxed);
+        sibling.reserved_bytes.store(bytes, Ordering::Relaxed);
+        let mut inventory = PageTurnLeaseInventory::default();
+        inventory.register(&outgoing);
+        inventory.register(&sibling);
+        let mut presentation = PageTurnPresentation::default();
+        presentation.state = PresentationState::Offered {
+            outgoing: outgoing.clone(),
+            offer: AcceptedOffer {
+                fact: fact(1),
+                ready_sources: Vec::new(),
+                resident_bytes: bytes,
+                pin_bytes: bytes,
+                accepted_at: Instant::now(),
+                duration: Duration::from_millis(200),
+                forward: true,
+                submission: Arc::new(SubmissionTracker::new()),
+            },
+        };
+        presentation.cancel("new_operation");
+        assert!(matches!(presentation.state, PresentationState::Flat(_)));
+        assert_eq!(outgoing.reserved_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(inventory.reserved_bytes(), bytes);
+        drop(sibling);
+        assert_eq!(inventory.reserved_bytes(), 0);
+        let mut accountant = crate::vram_budget::VramAccountant::default();
+        inventory.account(&mut accountant);
+        assert_eq!(accountant.finish().total_bytes(), bytes);
+    }
+
+    #[test]
+    fn canonical_uv_matches_normal_paint_for_rounded_trimmed_and_rotated_rects() {
+        use crate::displayed_image_transform::*;
+        let ctx = egui::Context::default();
+        for rotation in [
+            crate::rotation_db::Rotation::None,
+            crate::rotation_db::Rotation::Cw90,
+            crate::rotation_db::Rotation::Cw180,
+            crate::rotation_db::Rotation::Cw270,
+        ] {
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(27.333334, 11.125),
+                egui::vec2(266.66666, 400.0),
+            );
+            let transform = DisplayedImageTransform::from_resolved_rect(
+                DisplayedImageTransformInput {
+                    page_idx: 0,
+                    viewport_rect: egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(600.0, 600.0),
+                    ),
+                    source_size: egui::vec2(80.0, 120.0),
+                    texture_size: egui::vec2(80.0, 120.0),
+                    rotation,
+                    free_rotation_rad: 0.0,
+                    content_bbox: Some(egui::Rect::from_min_max(
+                        egui::pos2(0.1, 0.2),
+                        egui::pos2(0.9, 0.8),
+                    )),
+                    fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
+                    fit_scale_limits: FullscreenFitScaleLimits::default(),
+                    pixels_per_point: 1.0,
+                    placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                    pixel_fit: RectPixelFit::Texels,
+                },
+                rect,
+            )
+            .unwrap();
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                transform.paint_texture(
+                    &ctx.debug_painter(),
+                    egui::TextureId::User(19),
+                    egui::Color32::WHITE,
+                )
+            });
+            let mesh = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Mesh(mesh) if mesh.texture_id == egui::TextureId::User(19) => {
+                        Some(mesh)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(
+                canonical_source_uv(&transform),
+                mesh.vertices
+                    .iter()
+                    .map(|v| v.uv)
+                    .collect::<Vec<_>>()
+                    .as_slice()
+            );
+            assert!(canonical_source_uv(&transform).iter().all(|uv| {
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)).contains(*uv)
+            }));
+        }
+    }
+    #[test]
+    fn raw_cache_is_not_final_ready_and_offer_never_starts_processing() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![GridItem::Image(std::path::PathBuf::from(
+            "c:/page-turn/cold.png",
+        ))];
+        app.items_generation = 41;
+        app.fullscreen_idx = Some(0);
+        app.reading_flow = crate::settings::ReadingFlow::Paged;
+        app.settings.page_turn_animation_enabled = true;
+        let image = egui::ColorImage::filled([4, 4], egui::Color32::WHITE);
+        let tex = ctx.load_texture("cold", image.clone(), egui::TextureOptions::LINEAR);
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Static {
+                tex,
+                pixels: Arc::new(image),
+                source_dims: Some([4, 4]),
+                load_seq: 1,
+                animation: crate::fs_animation::StaticAnimationState::Still,
+            },
+        );
+        assert!(app.resolve_fs_display_tex(0, false).is_some());
+        assert!(app.page_turn_normal_ready_texture(0).is_none());
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.page_turn_external_operation(
+                ctx,
+                ViewerOperationId::Pad {
+                    batch: 73,
+                    ordinal: 0,
+                },
+                OperationPhase::Press,
+                "test",
+            );
+            app.offer_page_turn(ctx, 0, true);
+        });
+        assert!(matches!(
+            app.page_turn_presentation.state,
+            PresentationState::Inactive
+        ));
+        assert!(app.final_composite_cache.is_empty());
+        assert!(app.edit_result_cache.is_empty());
+        assert!(app.comic_docs.is_empty());
+    }
+    #[test]
+    fn accepted_exclusion_claims_single_repeat_once_and_does_not_attribute_multi_edges() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.page_turn_animation_enabled = true;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.page_turn_external_operation(
+                ctx,
+                ViewerOperationId::Pad {
+                    batch: 91,
+                    ordinal: 0,
+                },
+                OperationPhase::Repeat,
+                "test",
+            );
+            app.page_turn_excluded_navigation(ctx, "repeat_operation");
+            assert!(
+                app.page_turn_presentation.transaction.disposition
+                    == OperationDisposition::Excluded
+            );
+            app.page_turn_external_operation(
+                ctx,
+                ViewerOperationId::Pad {
+                    batch: 91,
+                    ordinal: 0,
+                },
+                OperationPhase::Repeat,
+                "replay_metadata",
+            );
+            app.page_turn_excluded_navigation(ctx, "repeat_operation");
+            assert!(
+                app.page_turn_presentation.transaction.disposition
+                    == OperationDisposition::Excluded
+            );
+        });
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.page_turn_external_operations(
+                ctx,
+                &[
+                    (
+                        ViewerOperationId::Pad {
+                            batch: 92,
+                            ordinal: 0,
+                        },
+                        OperationPhase::Press,
+                        "test",
+                    ),
+                    (
+                        ViewerOperationId::Pad {
+                            batch: 92,
+                            ordinal: 1,
+                        },
+                        OperationPhase::Press,
+                        "test",
+                    ),
+                ],
+            );
+            app.page_turn_excluded_navigation(ctx, "ambiguous");
+            assert!(
+                app.page_turn_presentation.transaction.disposition
+                    == OperationDisposition::Available
+            );
+        });
+    }
+
+    #[test]
+    fn accepted_new_operation_that_cancels_turn_is_excluded_once_without_readmission() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.page_turn_animation_enabled = true;
+        let texture = ctx.load_texture(
+            "supersession",
+            egui::ColorImage::filled([4, 4], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let outgoing = unit(&ctx, texture.clone(), 1);
+        let incoming = unit(&ctx, texture, 1);
+        let tracker = Arc::new(SubmissionTracker::new());
+        *tracker.status.lock().unwrap() = SubmissionStatus::Started;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.page_turn_external_operation(
+                ctx,
+                ViewerOperationId::Pad {
+                    batch: 110,
+                    ordinal: 0,
+                },
+                OperationPhase::Press,
+                "test",
+            );
+            let old_fact = app.page_turn_presentation.take_candidate().unwrap();
+            app.page_turn_presentation.state = PresentationState::Turning {
+                outgoing: outgoing.clone(),
+                incoming: incoming.clone(),
+                offer: AcceptedOffer {
+                    fact: old_fact,
+                    ready_sources: Vec::new(),
+                    resident_bytes: 0,
+                    pin_bytes: 0,
+                    accepted_at: Instant::now(),
+                    duration: Duration::from_millis(200),
+                    forward: true,
+                    submission: tracker.clone(),
+                },
+            };
+        });
+        // The active turn originated in a previous frame. Distinct operations
+        // in one physical frame are intentionally an ambiguous transaction.
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.page_turn_external_operation(
+                ctx,
+                ViewerOperationId::Pad {
+                    batch: 111,
+                    ordinal: 0,
+                },
+                OperationPhase::Repeat,
+                "test",
+            );
+            assert!(matches!(
+                app.page_turn_presentation.state,
+                PresentationState::Flat(_)
+            ));
+            assert!(
+                app.page_turn_presentation.transaction.disposition
+                    == OperationDisposition::Cancelled
+            );
+            assert_eq!(tracker.status(), SubmissionStatus::Cancelled);
+            app.page_turn_excluded_navigation(ctx, "repeat_operation");
+            assert!(
+                app.page_turn_presentation.transaction.disposition
+                    == OperationDisposition::Excluded
+            );
+            assert!(app.page_turn_presentation.take_candidate().is_none());
+            app.page_turn_external_operation(
+                ctx,
+                ViewerOperationId::Pad {
+                    batch: 111,
+                    ordinal: 0,
+                },
+                OperationPhase::Repeat,
+                "replay_metadata",
+            );
+            app.page_turn_excluded_navigation(ctx, "repeat_operation");
+            assert!(
+                app.page_turn_presentation.transaction.disposition
+                    == OperationDisposition::Excluded
+            );
+            assert!(app.page_turn_presentation.take_candidate().is_none());
+        });
+        assert!(app.fullscreen_idx.is_none()); // Observer never navigates or queues a target.
+    }
+
+    #[test]
+    fn off_receipt_has_stack_pages_and_immediate_evidence() {
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "off",
+            egui::ColorImage::filled([4, 4], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let unit = unit(&ctx, texture, 1);
+        let proof = flat_receipt(destination(1), &ctx, &unit.pages, true);
+        assert!(proof.was_accepted());
+        assert!(proof.accepted_ledger().is_none());
+        assert!(matches!(proof.pages, ReceiptPages::Single(_)));
+    }
+    #[test]
+    fn slideshow_policy_uses_adopted_interval_and_incoming_anchor_deadline() {
+        let now = Instant::now();
+        let duration = Duration::from_millis(200);
+        assert!(!slideshow_interval_allows_turn(
+            duration,
+            Duration::from_millis(199)
+        ));
+        assert!(slideshow_interval_allows_turn(duration, duration));
+        assert!(!slideshow_deadline_allows_turn(now, duration, now));
+        assert!(slideshow_deadline_allows_turn(
+            now,
+            duration,
+            now + duration
+        ));
+        assert!(!slideshow_deadline_allows_turn(
+            now,
+            duration,
+            now + Duration::from_millis(199)
+        ));
+    }
+}

@@ -18,6 +18,13 @@
 //! v0.9.0 で native presenter に移行済。新規追加 / 移植時に「ui_fullscreen.rs を見て
 //! しまう」誤認を避けるため明示。
 
+mod page_turn;
+pub(crate) use page_turn::{
+    OperationPhase, PageTurnLeaseInventory, PageTurnPresentation, PresentationDestination,
+    ViewerOperationId, next_operation_batch,
+};
+use page_turn::{PreparedPagedPage, SubmittedUnitReceipt};
+
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -2110,6 +2117,7 @@ enum FsDisplayUnitPageProvenance {
     Holdover,
 }
 
+#[derive(Clone)]
 struct FsNavigatorTextureSource {
     occurrence: SpreadPageOccurrence,
     resource: FullscreenPaintResource,
@@ -2122,9 +2130,71 @@ impl FsNavigatorTextureSource {
     }
 }
 
-#[derive(Default)]
+/// The ordinary stage preserves current-page preparation beneath an existing holdover.
+/// Only the final selected unit is admitted to paged presentation.
+enum FsFrameDisplayUnitSelection {
+    Current,
+    Holdover(FsDisplayUnitHoldover, &'static str),
+}
+
+impl FsFrameDisplayUnitSelection {
+    fn is_current(&self) -> bool {
+        matches!(self, Self::Current)
+    }
+}
+
+#[derive(Clone, Default)]
+enum FsDisplayUnitSubmission {
+    #[default]
+    Unsubmitted,
+    LegacyRendered,
+    Paged(SubmittedUnitReceipt),
+}
+
+#[derive(Clone, Default)]
 struct FsNavigatorTextureSources {
     pages: Vec<FsNavigatorTextureSource>,
+    submission: FsDisplayUnitSubmission,
+}
+
+/// The cached source policy of the accepted draw, independent of animation eligibility.
+#[derive(Clone, Copy)]
+enum FsSubmittedSourcePolicy {
+    Normal,
+    Original,
+    Passthrough,
+}
+
+pub(crate) struct PendingFsPageTurnReady {
+    items_generation: u64,
+    units: Arc<Vec<SpreadDisplayUnit>>,
+    mode: SpreadMode,
+    slice: crate::page_split::PageSlice,
+    composition: SpreadDisplayComposition,
+    layout: FullscreenPageLayout,
+    decision: FsPageTurnDecision,
+    source_policy: FsSubmittedSourcePolicy,
+    sources: FsNavigatorTextureSources,
+}
+
+impl PendingFsPageTurnReady {
+    pub(crate) fn account(&self, accountant: &mut crate::vram_budget::VramAccountant) {
+        for page in &self.sources.pages {
+            accountant.add_texture(
+                crate::vram_budget::VramSubsystem::PageTurnPresentation,
+                page.resource.source_texture(),
+                true,
+            );
+            if let Some(output) = page.resource.lanczos_output() {
+                accountant.add_texture_id(
+                    crate::vram_budget::VramSubsystem::PageTurnPresentation,
+                    output.texture_id(),
+                    output.size(),
+                    false,
+                );
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2152,6 +2222,7 @@ impl FsNavigatorTextureSources {
                     provenance: FsDisplayUnitPageProvenance::Live,
                 })
                 .collect(),
+            submission: FsDisplayUnitSubmission::Unsubmitted,
         }
     }
 
@@ -2184,12 +2255,37 @@ impl FsNavigatorTextureSources {
                 provenance: FsDisplayUnitPageProvenance::Live,
             });
         }
-        Self { pages }
+        Self {
+            pages,
+            submission: FsDisplayUnitSubmission::Unsubmitted,
+        }
+    }
+
+    fn from_prepared(pages: &[PreparedPagedPage], receipt: Option<SubmittedUnitReceipt>) -> Self {
+        Self {
+            pages: pages
+                .iter()
+                .map(|page| FsNavigatorTextureSource {
+                    occurrence: page.occurrence,
+                    resource: page.resource.clone(),
+                    provenance: if page.live {
+                        FsDisplayUnitPageProvenance::Live
+                    } else {
+                        FsDisplayUnitPageProvenance::Holdover
+                    },
+                })
+                .collect(),
+            submission: receipt.map_or(
+                FsDisplayUnitSubmission::Unsubmitted,
+                FsDisplayUnitSubmission::Paged,
+            ),
+        }
     }
 
     /// A display-unit holdover is painted after the live pages, so its resources must replace
     /// the live map as a unit even when the capture-time idx equals the new page idx.
     fn replace_with_display_unit(&mut self, unit: &FsDisplayUnitHoldover) {
+        self.submission = FsDisplayUnitSubmission::Unsubmitted;
         self.pages = unit
             .pages
             .iter()
@@ -2223,8 +2319,20 @@ impl FsNavigatorTextureSources {
         {
             return false;
         }
+        if matches!(self.submission, FsDisplayUnitSubmission::Paged(_))
+            && self
+                .pages
+                .iter()
+                .zip(occurrences)
+                .any(|(page, occurrence)| page.occurrence.role != occurrence.role)
+        {
+            return false;
+        }
         for (page, occurrence) in self.pages.iter_mut().zip(occurrences) {
             page.occurrence = *occurrence;
+        }
+        if let FsDisplayUnitSubmission::Paged(receipt) = &mut self.submission {
+            receipt.rebind(occurrences);
         }
         true
     }
@@ -2696,6 +2804,7 @@ fn fs_navigator_frame_input_cache_id() -> egui::Id {
 }
 
 pub(crate) fn install_fs_navigator_input_tracking(ctx: &egui::Context) {
+    page_turn::install(ctx);
     let installation_id = egui::Id::new("miv_fs_navigator_input_tracking_installed");
     let already_installed = ctx.data_mut(|data| {
         if data.get_temp::<bool>(installation_id).unwrap_or(false) {
@@ -9184,6 +9293,7 @@ fn choose_continuous_page_layout_size(
 /// そのため余白色を変えても透過画像の見え方は変わらない。以前はテーマの反対色を
 /// 計算していたが、Light テーマ時に 2 モード連続で視覚変化なしになるバグがあったため
 /// 撤去した (v0.7.0 フィードバック)。
+#[derive(Clone)]
 pub(crate) enum FsBgStyle {
     /// 単色で塗りつぶす (0 = 黒、1 = 白)
     Solid(egui::Color32),
@@ -12614,6 +12724,29 @@ impl App {
         state: &FsFrameState,
         seek_geometry: StillSeekGeometry,
     ) -> Option<DisplayedImageTransform> {
+        self.draw_fs_zoom_mode_with_receipt(
+            ui,
+            ctx,
+            image_rect,
+            fs_idx,
+            singleton_placement,
+            state,
+            seek_geometry,
+            None,
+        )
+    }
+
+    fn draw_fs_zoom_mode_with_receipt(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        image_rect: egui::Rect,
+        fs_idx: usize,
+        singleton_placement: SingletonSpreadPlacement,
+        state: &FsFrameState,
+        seek_geometry: StillSeekGeometry,
+        submitted: Option<&mut FsNavigatorTextureSources>,
+    ) -> Option<DisplayedImageTransform> {
         let rotation = self.get_rotation(fs_idx);
         let paint_resource = state
             .tex
@@ -12636,7 +12769,7 @@ impl App {
         let Some(tex_size) = tex_size else {
             // テクスチャ未ロード: 通常のプレースホルダ描画へ委ねる。
             let bg_style = self.fs_bg_style(ctx);
-            return self.draw_fs_image(
+            return self.draw_fs_image_with_receipt(
                 ui,
                 image_rect,
                 fs_idx,
@@ -12659,6 +12792,8 @@ impl App {
                 FullscreenFitMode::Page,
                 no_limits,
                 None,
+                submitted,
+                false,
             );
         };
         // 表示トリムが有効ならズーム対象をトリム後 bbox に絞る (切り落とした余白を見せない)。
@@ -12734,8 +12869,8 @@ impl App {
         // **返すのは実際に描いた transform。** `draw_fs_image` は渡した矩形をテクスチャに
         // 合わせ直してから貼るので、ここで自分の中間枠を返すと、当たり判定・ナビゲータ・
         // カーソル写像が「画面に出ていない矩形」を基準にする (backlog §1.0h)。
-        // 通常表示の枝 (`single_transform = self.draw_fs_image(...)`) は元からこうなっている。
-        let painted = self.draw_fs_image(
+        // 通常表示の枝 (`single_transform = self.draw_fs_image_with_receipt(...)`) は元からこうなっている。
+        let painted = self.draw_fs_image_with_receipt(
             ui,
             image_rect,
             fs_idx,
@@ -12758,6 +12893,8 @@ impl App {
             FullscreenFitMode::Page,
             no_limits,
             trim_bbox,
+            submitted,
+            false,
         );
         if active {
             // Phase C: PDF ページはズーム後の実効倍率で高解像度へ再レンダ (鮮明化)。毎フレ呼ぶと
@@ -23643,6 +23780,7 @@ impl App {
                     self.update_ime_state(ctx);
                     crate::touch_debug::log_egui_touch_events(ctx, self.frame_counter);
                 }
+                self.page_turn_pre_draw(ctx);
                 #[cfg(windows)]
                 if !embedded {
                     let (outer_rect, pixels_per_point, minimized) = ctx.input(|i| {
@@ -24218,6 +24356,17 @@ impl App {
                                 let bg_style = self.fs_bg_style(ctx);
                                 self.draw_similar_preview_asset(ui, image_rect, asset, &bg_style)
                             });
+                        let selected_display_unit = if similar_preview_presentation.is_none() {
+                            let reload = matches!(state.page_turn_decision.paint_source(), FsPageTurnPaintSource::Materialized)
+                                .then(|| self.final_effect_source_reload_holdover_for_draw(fs_idx, spread_pair, state.original_preview_active))
+                                .flatten();
+                            self.fs_nav_holdover_for_draw()
+                                .map(|unit| FsFrameDisplayUnitSelection::Holdover(unit, "nav_holdover"))
+                                .or_else(|| reload.map(|unit| FsFrameDisplayUnitSelection::Holdover(unit, "final_effect_source_reload_holdover")))
+                                .unwrap_or(FsFrameDisplayUnitSelection::Current)
+                        } else {
+                            FsFrameDisplayUnitSelection::Current
+                        };
                         if let Some(asset) = similar_preview_asset.as_ref() {
                             asset.log_first_body_draw(
                                 similar_preview_presentation.is_some(),
@@ -24236,6 +24385,7 @@ impl App {
                                 state.original_preview_active,
                                 state.page_turn_decision,
                             );
+                            navigator_texture_sources.submission = FsDisplayUnitSubmission::LegacyRendered;
                         } else {
                             match spread_pair {
                                 SpreadPair::Single => {
@@ -24279,6 +24429,7 @@ impl App {
                                             close_fs = true;
                                         }
                                     } else if panorama_painted {
+                                        navigator_texture_sources.submission = FsDisplayUnitSubmission::LegacyRendered;
                                     } else if self.fs_zoom_mode_engaged()
                                         && !state.is_video
                                         && !analysis_active
@@ -24286,7 +24437,7 @@ impl App {
                                         // ZipPla 風全画面ズーム (Z): 専用描画へ分岐。
                                         // 通常のズーム/パン/比較/フィット経路はスキップする。
                                         single_transform = self
-                                            .draw_fs_zoom_mode(
+                                            .draw_fs_zoom_mode_with_receipt(
                                                 ui,
                                                 ctx,
                                                 image_rect,
@@ -24294,6 +24445,7 @@ impl App {
                                                 display_composition.singleton_placement(),
                                                 &state,
                                                 still_seek_geometry,
+                                                selected_display_unit.is_current().then_some(&mut navigator_texture_sources),
                                             );
                                     } else {
                                         let fs_rotation = self.get_rotation(fs_idx);
@@ -24329,6 +24481,7 @@ impl App {
                                                     state.original_preview_active,
                                                     state.page_turn_decision,
                                                 );
+                                            navigator_texture_sources.submission = FsDisplayUnitSubmission::LegacyRendered;
                                         } else {
                                             if compare_requested {
                                                 self.ensure_compare_prepared_pair(ctx, fs_idx);
@@ -24348,6 +24501,7 @@ impl App {
                                                     zp,
                                                 );
                                             if prepared_compare_drawn {
+                                                navigator_texture_sources.submission = FsDisplayUnitSubmission::LegacyRendered;
                                                 primary_draw =
                                                     CompareFramePrimaryDraw::PreparedCompareOnly;
                                             }
@@ -24391,7 +24545,7 @@ impl App {
                                                             ),
                                                         )
                                                     });
-                                                let painted = self.draw_fs_image(
+                                                let painted = self.draw_fs_image_with_receipt(
                                                     ui,
                                                     image_rect,
                                                     fs_idx,
@@ -24414,6 +24568,8 @@ impl App {
                                                     fit_mode,
                                                     fit_scale_limits,
                                                     content_bbox,
+                                                    selected_display_unit.is_current().then_some(&mut navigator_texture_sources),
+                                                    self.settings.page_turn_animation_enabled && !state.original_preview_active && self.page_turn_view_eligible(fs_idx),
                                                 );
                                                 #[cfg(all(windows, feature = "test-script"))]
                                                 if painted.is_some() {
@@ -24433,7 +24589,7 @@ impl App {
                                     } // else (= !panorama_painted) ブロック終端
                                 }
                                 SpreadPair::Double { left, right } => {
-                                    navigator_texture_sources = self.draw_fs_spread_with_geometry(
+                                    navigator_texture_sources = self.draw_fs_spread_with_submission(
                                         ui,
                                         ctx,
                                         image_rect,
@@ -24443,6 +24599,8 @@ impl App {
                                         state.page_turn_decision,
                                         None,
                                         still_seek_geometry,
+                                        selected_display_unit.is_current(),
+                                        Some(&display_composition),
                                     );
                                 }
                             }
@@ -24679,55 +24837,15 @@ impl App {
                         // 静止画 canvas 背景ごと重ねる。見開きは新しい左右が両方揃ったフレームだけ
                         // typed state を解放するため、新旧ページの混在も片側の黒も出ない。
                         if primary_draw.draws_ordinary()
-                            && matches!(
-                                state.page_turn_decision.paint_source(),
-                                FsPageTurnPaintSource::Materialized
-                            )
-                            && let Some(unit) = self.final_effect_source_reload_holdover_for_draw(
-                                fs_idx,
-                                spread_pair,
-                                state.original_preview_active,
-                            )
+                            && let FsFrameDisplayUnitSelection::Holdover(unit, trace_source) = &selected_display_unit
                         {
                             for page in &unit.pages {
-                                self.trace_fs_texture_choice(
-                                    "fullscreen_overlay",
-                                    "final_effect_source_reload_holdover",
-                                    Some(page.idx()),
-                                    page.texture.source_texture(),
-                                );
+                                self.trace_fs_texture_choice("fullscreen_overlay", trace_source,
+                                    Some(page.idx()), page.texture.source_texture());
                             }
-                            self.draw_fs_display_unit_holdover_with_geometry(
-                                ui,
-                                ctx,
-                                image_rect,
-                                &unit,
-                                still_seek_geometry,
+                            navigator_texture_sources = self.draw_fs_display_unit_holdover_with_geometry(
+                                ui, ctx, image_rect, unit, still_seek_geometry,
                             );
-                            navigator_texture_sources.replace_with_display_unit(&unit);
-                        }
-
-                        // ページ単位の編集オーバーレイより後に描く。holdover はビュー単位の状態なので、
-                        // 移動先ページの矩形を旧ビューの上に重ねない。
-                        if primary_draw.draws_ordinary()
-                            && let Some(unit) = self.fs_nav_holdover_for_draw()
-                        {
-                            for page in &unit.pages {
-                                self.trace_fs_texture_choice(
-                                    "fullscreen_overlay",
-                                    "nav_holdover",
-                                    Some(page.idx()),
-                                    page.texture.source_texture(),
-                                );
-                            }
-                            self.draw_fs_display_unit_holdover_with_geometry(
-                                ui,
-                                ctx,
-                                image_rect,
-                                &unit,
-                                still_seek_geometry,
-                            );
-                            navigator_texture_sources.replace_with_display_unit(&unit);
                         }
 
                         self.emit_fs_page_turn_ready_for_display_unit(
@@ -27094,7 +27212,145 @@ impl App {
     /// Emit readiness only after the final visible display-unit source has been
     /// selected (including holdovers). Spread pages are accepted only as a complete
     /// unit, so the trace cannot report a half-painted pair as ready.
+    pub(crate) fn flush_submitted_page_turn_ready(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending_fs_page_turn_ready.take() else {
+            return;
+        };
+        let FsDisplayUnitSubmission::Paged(receipt) = &pending.sources.submission else {
+            return;
+        };
+        if !receipt.was_accepted()
+            || pending.items_generation != self.items_generation
+            || pending.mode != self.spread_mode
+            || pending.slice != self.fullscreen_page_slice
+            || !Arc::ptr_eq(&pending.units, &self.spread_display_units_cache.units)
+            || self.fullscreen_idx != Some(pending.composition.navigation_anchor_idx())
+            || !receipt.matches_sources(self.page_turn_destination(), &pending.sources)
+        {
+            return;
+        }
+        let current =
+            self.spread_display_composition_for_anchor(pending.composition.navigation_anchor_idx());
+        if current != pending.composition
+            || pending.layout.kind() != self.fullscreen_page_layout.kind()
+            || !pending
+                .layout
+                .displayed_pages()
+                .map(|page| {
+                    (
+                        page.occurrence(),
+                        page.transform.viewport_rect,
+                        page.transform.paint_rect,
+                        page.transform.layout_full_image_rect,
+                        page.transform.uv_rect,
+                    )
+                })
+                .eq(self.fullscreen_page_layout.displayed_pages().map(|page| {
+                    (
+                        page.occurrence(),
+                        page.transform.viewport_rect,
+                        page.transform.paint_rect,
+                        page.transform.layout_full_image_rect,
+                        page.transform.uv_rect,
+                    )
+                }))
+            || pending.sources.pages.iter().any(|page| {
+                let generation_matches = match page.resource.source_generation() {
+                    Some(generation) => {
+                        generation.items == self.items_generation
+                            && generation.input
+                                == self.input_generation.get(&page.idx()).copied().unwrap_or(0)
+                    }
+                    // Legacy Direct thumbnails/animations have no producer generation.
+                    // Their owning source resolver below still checks the current identity.
+                    None => matches!(&page.resource, FullscreenPaintResource::Direct { .. }),
+                };
+                let current_source = match pending.source_policy {
+                    FsSubmittedSourcePolicy::Normal => {
+                        self.resolve_fs_display_tex(page.idx(), true)
+                    }
+                    FsSubmittedSourcePolicy::Original => self
+                        .resolve_original_preview_tex(page.idx())
+                        .or_else(|| self.fs_thumbnail_texture_for_display(page.idx())),
+                    FsSubmittedSourcePolicy::Passthrough => {
+                        self.cached_passthrough_rendition(page.idx())
+                    }
+                };
+                !generation_matches
+                    || (page.provenance == FsDisplayUnitPageProvenance::Live
+                        && !current_source.is_some_and(|texture| {
+                            texture.id() == page.resource.source_texture_id()
+                        }))
+            })
+        {
+            return;
+        }
+        self.emit_fs_page_turn_ready_for_submitted_display_unit(
+            ctx,
+            &pending.composition,
+            pending.decision,
+            &pending.sources,
+        );
+    }
+
     fn emit_fs_page_turn_ready_for_display_unit(
+        &mut self,
+        ctx: &egui::Context,
+        composition: &SpreadDisplayComposition,
+        decision: FsPageTurnDecision,
+        sources: &FsNavigatorTextureSources,
+    ) {
+        match &sources.submission {
+            FsDisplayUnitSubmission::Unsubmitted => return,
+            FsDisplayUnitSubmission::LegacyRendered => {}
+            FsDisplayUnitSubmission::Paged(receipt) => {
+                if !receipt.matches(
+                    self.page_turn_destination(),
+                    ctx.cumulative_frame_nr(),
+                    sources,
+                ) || receipt.pass() != ctx.cumulative_pass_nr()
+                {
+                    return;
+                }
+                if !receipt.was_accepted() {
+                    self.pending_fs_page_turn_ready = Some(PendingFsPageTurnReady {
+                        items_generation: self.items_generation,
+                        units: Arc::clone(&self.spread_display_units_cache.units),
+                        mode: self.spread_mode,
+                        slice: self.fullscreen_page_slice,
+                        composition: composition.clone(),
+                        layout: self.fullscreen_page_layout.clone(),
+                        decision,
+                        source_policy: if matches!(
+                            decision.paint_source(),
+                            FsPageTurnPaintSource::PassThrough
+                        ) {
+                            FsSubmittedSourcePolicy::Passthrough
+                        } else if self.fs_display_bypasses_final_pipeline(
+                            self.original_preview_active_for_frame(
+                                ctx,
+                                composition.navigation_anchor_idx(),
+                            ),
+                        ) {
+                            FsSubmittedSourcePolicy::Original
+                        } else {
+                            FsSubmittedSourcePolicy::Normal
+                        },
+                        sources: sources.clone(),
+                    });
+                    return;
+                }
+            }
+        }
+        self.emit_fs_page_turn_ready_for_submitted_display_unit(
+            ctx,
+            composition,
+            decision,
+            sources,
+        );
+    }
+
+    fn emit_fs_page_turn_ready_for_submitted_display_unit(
         &mut self,
         ctx: &egui::Context,
         composition: &SpreadDisplayComposition,
@@ -28733,6 +28989,9 @@ impl App {
         // モーダル表示中に main/root 側へ漏れたキーは背面操作へ流さず捨てる。
         if self.any_modal_dialog_open_for_fullscreen_keys() {
             return true;
+        }
+        if !_owner.blocks_legacy_keymap_shortcuts() {
+            self.page_turn_pre_draw(ctx);
         }
         if !self.ime_input_active(ctx)
             && !self.is_overlay_edit_mode_active()
@@ -35843,11 +36102,35 @@ impl App {
         }
     }
 
+    fn adjacent_page_turn_direction(&mut self, current: usize, target: usize) -> Option<bool> {
+        let nav = self.get_nav_indices();
+        let delta = navigable_delta_between(&self.items, &nav, current, target)?;
+        let direction = delta.signum();
+        match self.spread_page_nav_for_indices(&nav, current, direction) {
+            FsPageNav::Target(expected) if expected == target => Some(direction > 0),
+            FsPageNav::Delta(_) if delta.abs() == 1 => Some(direction > 0),
+            _ => None,
+        }
+    }
+
     pub(crate) fn open_fullscreen_from_slideshow_navigation(
         &mut self,
         ctx: &egui::Context,
         idx: usize,
     ) {
+        if self.settings.page_turn_animation_enabled {
+            self.page_turn_external_operation(
+                ctx,
+                ViewerOperationId::Slideshow(next_operation_batch()),
+                OperationPhase::Press,
+                "slideshow",
+            );
+            if let Some(current) = self.fullscreen_idx
+                && let Some(forward) = self.adjacent_page_turn_direction(current, idx)
+            {
+                self.offer_page_turn(ctx, idx, forward);
+            }
+        }
         // Timer-driven slideshow advances are fullscreen-internal navigation too, so
         // use the same cursor-state carry path as keyboard/mouse page turns.
         self.open_fullscreen_from_fs_navigation(ctx, idx, slideshow_history_trigger());
@@ -36729,6 +37012,22 @@ impl App {
                             );
                             sequence_started
                         } {
+                            if self.settings.page_turn_animation_enabled {
+                                if !moved {
+                                    self.page_turn_excluded_navigation(
+                                        ctx,
+                                        "navigation_no_movement",
+                                    );
+                                } else if accept_rendition {
+                                    self.page_turn_excluded_navigation(ctx, "rendition_or_burst");
+                                } else if let Some(forward) =
+                                    self.adjacent_page_turn_direction(fs_idx, new_idx)
+                                {
+                                    self.offer_page_turn(ctx, new_idx, forward);
+                                } else {
+                                    self.page_turn_excluded_navigation(ctx, "nonadjacent_jump");
+                                }
+                            }
                             let land_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
                             self.land_still_page_navigation_target(
                                 ctx,
@@ -36746,6 +37045,9 @@ impl App {
                     }
                 }
             } else if let FsPageNav::Boundary { at_end } = page_nav {
+                if self.settings.page_turn_animation_enabled {
+                    self.page_turn_excluded_navigation(ctx, "navigation_boundary");
+                }
                 self.update_fs_page_turn_burst_after_navigation(ctx, fs_idx, None);
                 self.fs_boundary_hint = Some(FsBoundaryHint::Edge {
                     at_end,
@@ -36807,6 +37109,22 @@ impl App {
                             );
                             sequence_started
                         } {
+                            if self.settings.page_turn_animation_enabled {
+                                if !moved {
+                                    self.page_turn_excluded_navigation(
+                                        ctx,
+                                        "navigation_no_movement",
+                                    );
+                                } else if accept_rendition {
+                                    self.page_turn_excluded_navigation(ctx, "rendition_or_burst");
+                                } else if let Some(forward) =
+                                    self.adjacent_page_turn_direction(fs_idx, new_idx)
+                                {
+                                    self.offer_page_turn(ctx, new_idx, forward);
+                                } else {
+                                    self.page_turn_excluded_navigation(ctx, "nonadjacent_jump");
+                                }
+                            }
                             let land_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
                             self.land_still_page_navigation_target(
                                 ctx,
@@ -37199,6 +37517,65 @@ impl App {
         // 分割中にどちらの半分を描くかは、この関数が自分で解決する (下記)。
         content_bbox: Option<egui::Rect>,
     ) -> Option<DisplayedImageTransform> {
+        self.draw_fs_image_with_receipt(
+            ui,
+            full_rect,
+            page_idx,
+            source_size,
+            layout_source,
+            resolved_transform,
+            white_companion_override,
+            singleton_placement,
+            tex,
+            thumb_tex,
+            is_video,
+            vst3_waiting_for_video,
+            fs_load_failed,
+            rotation,
+            zoom_pan,
+            free_rotation_rad,
+            bg_style,
+            location_display,
+            pixel_grid_enabled,
+            fit_mode,
+            fit_scale_limits,
+            content_bbox,
+            None,
+            false,
+        )
+    }
+
+    fn draw_fs_image_with_receipt(
+        &mut self,
+        ui: &mut egui::Ui,
+        full_rect: egui::Rect,
+        page_idx: usize,
+        source_size: Option<egui::Vec2>,
+        layout_source: FsPageLayoutSource,
+        resolved_transform: Option<DisplayedImageTransform>,
+        white_companion_override: Option<(egui::Rect, egui::Rect)>,
+        singleton_placement: SingletonSpreadPlacement,
+        tex: Option<&crate::gpu_lanczos::FullscreenPaintResource>,
+        thumb_tex: Option<&egui::TextureHandle>,
+        is_video: bool,
+        vst3_waiting_for_video: bool,
+        fs_load_failed: bool,
+        rotation: crate::rotation_db::Rotation,
+        zoom_pan: Option<(f32, egui::Vec2)>,
+        free_rotation_rad: f32,
+        bg_style: &FsBgStyle,
+        // 読込中プレースホルダ直下に出す対象パス (`location_display_for` 参照)。
+        // 空ならラベル描画をスキップ。
+        location_display: &str,
+        pixel_grid_enabled: bool,
+        fit_mode: FullscreenFitMode,
+        fit_scale_limits: FullscreenFitScaleLimits,
+        // 余白カットフィット用の中身 bbox (正規化 0..1)。**表示トリムの値をそのまま渡す。**
+        // 分割中にどちらの半分を描くかは、この関数が自分で解決する (下記)。
+        content_bbox: Option<egui::Rect>,
+        submitted: Option<&mut FsNavigatorTextureSources>,
+        live_eligible: bool,
+    ) -> Option<DisplayedImageTransform> {
         // Current items resolve the active split here. A captured holdover keeps
         // its capture-time crop even if the replacement item or mode changes.
         let content_bbox = match layout_source {
@@ -37312,18 +37689,6 @@ impl App {
             };
             let white = white_companion_override
                 .or_else(|| white_companion_rect(&transform).map(|rect| (rect, full_rect)));
-            if let Some((white_rect, white_clip)) = white {
-                let white_painter = painter.with_clip_rect(white_clip.intersect(full_rect));
-                #[cfg(test)]
-                crate::app::paint_record_test_support::record_white_companion_paint(
-                    &white_painter,
-                    white_rect,
-                );
-                white_painter.rect_filled(white_rect, 0.0, egui::Color32::WHITE);
-            }
-            // 透過画像用の画像ローカル下地 (Shift+B で切替)。最終画像 quad を使うため、
-            // saved/free rotation と表示トリムでも画像の外へはみ出さない。
-            paint_image_underlay(&painter, transform.paint_quad(), bg_style);
             let paint_resource = match layout_source {
                 FsPageLayoutSource::Captured { post_filter, .. } => self
                     .prepare_fullscreen_paint_resource_with_filter(
@@ -37341,37 +37706,49 @@ impl App {
                     transform.visible_region_request(painter.clip_rect()),
                 ),
             };
-            if let Some(source_uv_rect) = paint_resource.visible_source_uv_rect() {
-                #[cfg(test)]
-                crate::app::paint_record_test_support::record_selected_paint_resource(
-                    &painter,
-                    &paint_resource,
-                );
-                transform.paint_texture_source_region(
-                    &painter,
-                    paint_resource.paint_texture_id(),
-                    source_uv_rect,
-                    egui::Color32::WHITE,
+            let page = PreparedPagedPage {
+                occurrence: SpreadPageOccurrence {
+                    idx: page_idx,
+                    role: SpreadPageRole::Navigation,
+                    navigation_anchor_idx: page_idx,
+                },
+                transform,
+                resource: paint_resource,
+                painter: painter.clone(),
+                underlay: bg_style.clone(),
+                live: live_eligible
+                    && using_full_texture
+                    && matches!(layout_source, FsPageLayoutSource::CurrentItem),
+            };
+            if let Some(submitted) = submitted {
+                submitted.pages.clear();
+                submitted.pages.push(FsNavigatorTextureSource {
+                    occurrence: page.occurrence,
+                    resource: page.resource.clone(),
+                    provenance: if matches!(layout_source, FsPageLayoutSource::Captured { .. }) {
+                        FsDisplayUnitPageProvenance::Holdover
+                    } else {
+                        FsDisplayUnitPageProvenance::Live
+                    },
+                });
+                let receipt =
+                    self.submit_paged_display_unit(ui.ctx(), std::slice::from_ref(&page), white);
+                submitted.submission = receipt.map_or(
+                    FsDisplayUnitSubmission::Unsubmitted,
+                    FsDisplayUnitSubmission::Paged,
                 );
             } else {
-                #[cfg(test)]
-                crate::app::paint_record_test_support::record_selected_paint_resource(
-                    &painter,
-                    &paint_resource,
-                );
-                transform.paint_texture(
-                    &painter,
-                    paint_resource.paint_texture_id(),
-                    egui::Color32::WHITE,
-                );
+                if let Some((white_rect, white_clip)) = white {
+                    let white_painter = painter.with_clip_rect(white_clip.intersect(full_rect));
+                    #[cfg(test)]
+                    crate::app::paint_record_test_support::record_white_companion_paint(
+                        &white_painter,
+                        white_rect,
+                    );
+                    white_painter.rect_filled(white_rect, 0.0, egui::Color32::WHITE);
+                }
+                page_turn::paint_flat_page(&page);
             }
-            #[cfg(all(windows, feature = "test-script"))]
-            crate::test_script::record_drawn_paint(
-                &painter,
-                &paint_resource,
-                format!("{:?}", transform.placement),
-            );
-            paint_resource.retain_native_output_for_paint(&painter);
             if fit_bbox.is_none()
                 && should_draw_fs_pixel_grid(pixel_grid_enabled, using_full_texture, zoom_pan)
             {
@@ -39826,6 +40203,7 @@ impl App {
         } else if self.raw_current_developing(fs_idx) {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
+        painted_sources.submission = FsDisplayUnitSubmission::LegacyRendered;
         painted_sources
     }
 
@@ -41744,7 +42122,8 @@ impl App {
         image_rect: egui::Rect,
         unit: &FsDisplayUnitHoldover,
         seek_geometry: StillSeekGeometry,
-    ) {
+    ) -> FsNavigatorTextureSources {
+        let mut sources = FsNavigatorTextureSources::default();
         ui.painter().rect_filled(
             image_rect,
             0.0,
@@ -41800,7 +42179,7 @@ impl App {
                     .begin(FullscreenPageLayoutKind::Single);
                 let transform = {
                     let bg_style = self.fs_bg_style(ctx);
-                    self.draw_fs_image(
+                    self.draw_fs_image_with_receipt(
                         ui,
                         image_rect,
                         page.idx(),
@@ -41827,6 +42206,8 @@ impl App {
                         fit_mode,
                         fit_scale_limits,
                         page.content_bbox,
+                        Some(&mut sources),
+                        false,
                     )
                 };
                 if let Some(transform) = transform {
@@ -41835,7 +42216,7 @@ impl App {
                 }
             }
             [left, right] => {
-                let _ = self.draw_fs_spread_with_geometry(
+                sources = self.draw_fs_spread_with_geometry(
                     ui,
                     ctx,
                     image_rect,
@@ -41848,9 +42229,14 @@ impl App {
                 );
                 let occurrences = [left.occurrence, right.occurrence];
                 debug_assert!(self.fullscreen_page_layout.rebind_occurrences(&occurrences));
+                debug_assert!(sources.rebind_occurrences(&occurrences));
             }
             _ => debug_assert!(false, "display unit must contain one or two pages"),
         }
+        if let [page] = unit.pages.as_slice() {
+            let _ = sources.rebind_occurrences(&[page.occurrence]);
+        }
+        sources
     }
 
     /// 見開きモードの2ページ描画。
@@ -41880,6 +42266,51 @@ impl App {
         )
     }
 
+    fn submit_fs_spread_prepared(
+        &mut self,
+        ctx: &egui::Context,
+        pages: [Option<PreparedPagedPage>; 2],
+        captured: bool,
+        submit_final: bool,
+    ) -> FsNavigatorTextureSources {
+        let mut submit = |pages: &[PreparedPagedPage]| {
+            let mut sources = FsNavigatorTextureSources::from_prepared(pages, None);
+            for source in &mut sources.pages {
+                source.provenance = if captured {
+                    FsDisplayUnitPageProvenance::Holdover
+                } else {
+                    FsDisplayUnitPageProvenance::Live
+                };
+            }
+            let receipt = if submit_final {
+                self.submit_paged_display_unit(ctx, pages, None)
+            } else {
+                for page in pages {
+                    page_turn::paint_flat_page(page);
+                }
+                None
+            };
+            sources.submission = receipt.map_or(
+                FsDisplayUnitSubmission::Unsubmitted,
+                FsDisplayUnitSubmission::Paged,
+            );
+            sources
+        };
+        match pages {
+            [Some(left), Some(right)] => submit(&[left, right]),
+            [Some(mut page), None] | [None, Some(mut page)] => {
+                page.live = false;
+                submit(std::slice::from_ref(&page))
+            }
+            [None, None] => {
+                if submit_final {
+                    self.submit_paged_display_unit(ctx, &[], None);
+                }
+                FsNavigatorTextureSources::default()
+            }
+        }
+    }
+
     fn draw_fs_spread_with_geometry(
         &mut self,
         ui: &mut egui::Ui,
@@ -41892,7 +42323,64 @@ impl App {
         display_override: Option<(&FsDisplayUnitHoldoverPage, &FsDisplayUnitHoldoverPage)>,
         seek_geometry: StillSeekGeometry,
     ) -> FsNavigatorTextureSources {
+        self.draw_fs_spread_with_submission(
+            ui,
+            ctx,
+            image_rect,
+            left_idx,
+            right_idx,
+            original_preview_active,
+            page_turn_decision,
+            display_override,
+            seek_geometry,
+            true,
+            None,
+        )
+    }
+
+    fn draw_fs_spread_with_submission(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        image_rect: egui::Rect,
+        left_idx: usize,
+        right_idx: usize,
+        original_preview_active: bool,
+        page_turn_decision: FsPageTurnDecision,
+        display_override: Option<(&FsDisplayUnitHoldoverPage, &FsDisplayUnitHoldoverPage)>,
+        seek_geometry: StillSeekGeometry,
+        submit_final: bool,
+        composition: Option<&SpreadDisplayComposition>,
+    ) -> FsNavigatorTextureSources {
         self.fullscreen_page_layout.clear();
+        let mut prepared_pages: [Option<PreparedPagedPage>; 2] = [None, None];
+        let mut missing_pages = [None, None];
+        let submitted_sources;
+        let occurrences = display_override
+            .map(|(left, right)| [left.occurrence, right.occurrence])
+            .unwrap_or_else(|| {
+                let anchor = self.fullscreen_idx.unwrap_or(left_idx);
+                let owned_composition;
+                let composition = if let Some(composition) = composition {
+                    composition
+                } else {
+                    owned_composition = self.spread_display_composition_for_anchor(anchor);
+                    &owned_composition
+                };
+                let occurrence_for = |idx| {
+                    composition
+                        .pages_in_reading_order()
+                        .iter()
+                        .find(|page| page.idx == idx)
+                        .copied()
+                        .unwrap_or(SpreadPageOccurrence {
+                            idx,
+                            role: SpreadPageRole::Navigation,
+                            navigation_anchor_idx: anchor,
+                        })
+                };
+                [occurrence_for(left_idx), occurrence_for(right_idx)]
+            });
         let zoom_pan = self.fs_zoom_pan();
         let fit_mode = display_override
             .map(|(left, _)| self.captured_fit_input_for_replay(left.fit_input).mode())
@@ -42371,7 +42859,7 @@ impl App {
                     content_right,
                 ),
             ] {
-                if let Some(transform) = self.draw_fs_spread_page(
+                if let Some(mut page) = self.prepare_fs_spread_page(
                     &painter,
                     image_rect,
                     rect,
@@ -42388,8 +42876,31 @@ impl App {
                     resolved_placement,
                     page_offset,
                 ) {
-                    self.fullscreen_page_layout.push(transform);
+                    if let Some(occurrence) =
+                        occurrences.iter().find(|occurrence| occurrence.idx == idx)
+                    {
+                        page.occurrence = *occurrence;
+                    }
+                    page.live &= !original_preview_active
+                        && !color_faithful_rendition_unit
+                        && self.settings.page_turn_animation_enabled
+                        && self.page_turn_view_eligible(idx);
+                    self.fullscreen_page_layout
+                        .push_occurrence(page.transform, page.occurrence);
+                    prepared_pages[usize::from(idx == right_idx)] = Some(page);
+                } else {
+                    missing_pages[usize::from(idx == right_idx)] =
+                        Some((idx, rect, location.as_str()));
                 }
+            }
+            submitted_sources = self.submit_fs_spread_prepared(
+                ctx,
+                prepared_pages,
+                display_override.is_some(),
+                submit_final,
+            );
+            for (idx, rect, location) in missing_pages.into_iter().flatten() {
+                self.paint_fs_spread_loading(&painter, rect, idx, &location);
             }
 
             // ZipPla ズーム照準中の枠 (見開き)。離すと枠の範囲が全画面化する。
@@ -42454,7 +42965,7 @@ impl App {
                     content_right,
                 ),
             ] {
-                self.draw_fs_spread_page(
+                if let Some(mut page) = self.prepare_fs_spread_page(
                     &painter,
                     image_rect,
                     rect,
@@ -42472,14 +42983,34 @@ impl App {
                     // 寸法未確定のフォールバック。間隔合わせの前提 (最終幅が分かって
                     // いること) が成り立たないので、ここでは合わせない。
                     egui::Vec2::ZERO,
-                );
+                ) {
+                    if let Some(occurrence) =
+                        occurrences.iter().find(|occurrence| occurrence.idx == idx)
+                    {
+                        page.occurrence = *occurrence;
+                    }
+                    page.live = false;
+                    prepared_pages[usize::from(idx == right_idx)] = Some(page);
+                } else {
+                    missing_pages[usize::from(idx == right_idx)] =
+                        Some((idx, rect, location.as_str()));
+                }
+            }
+            submitted_sources = self.submit_fs_spread_prepared(
+                ctx,
+                prepared_pages,
+                display_override.is_some(),
+                submit_final,
+            );
+            for (idx, rect, location) in missing_pages.into_iter().flatten() {
+                self.paint_fs_spread_loading(&painter, rect, idx, &location);
             }
             // フォールバック分岐: サイズ未確定でアスペクト比が崩れる可能性があるため、
             // ルーペ用レイアウトには書かない (ルーペは非見開きパスのロジックで描画しない)。
             self.fullscreen_page_layout.clear();
         }
 
-        FsNavigatorTextureSources::spread(left_idx, left_display_tex, right_idx, right_display_tex)
+        submitted_sources
     }
 
     /// テクスチャの表示サイズ（回転考慮）を返す。テクスチャ未取得なら None。
@@ -42696,6 +43227,75 @@ impl App {
         // `translate`: 左右を一体で置き直すための平行移動 (§1.154)。物理ピクセルの整数倍。
         translate: egui::Vec2,
     ) -> Option<DisplayedImageTransform> {
+        match self.prepare_fs_spread_page(
+            painter,
+            viewport_rect,
+            rect,
+            idx,
+            source_size,
+            layout_source,
+            rotation,
+            bg_style,
+            location_display,
+            display_tex,
+            allow_thumbnail,
+            content_bbox,
+            pixels_per_point,
+            placement,
+            translate,
+        ) {
+            Some(page) => {
+                page_turn::paint_flat_page(&page);
+                Some(page.transform)
+            }
+            None => {
+                self.paint_fs_spread_loading(painter, rect, idx, location_display);
+                None
+            }
+        }
+    }
+
+    fn paint_fs_spread_loading(
+        &self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        idx: usize,
+        location_display: &str,
+    ) {
+        let label = self
+            .raw_loading_label(idx)
+            .unwrap_or_else(|| "読込中...".into());
+        crate::ui_raw::paint_loading_label(painter, rect, &label);
+        crate::ui_helpers::draw_centered_elided_label(
+            painter,
+            rect,
+            location_display,
+            12.0,
+            egui::Color32::from_gray(150),
+            rect.center().y + 18.0,
+            12.0,
+        );
+    }
+
+    fn prepare_fs_spread_page(
+        &mut self,
+        painter: &egui::Painter,
+        viewport_rect: egui::Rect,
+        rect: egui::Rect,
+        idx: usize,
+        source_size: Option<egui::Vec2>,
+        layout_source: FsPageLayoutSource,
+        rotation: crate::rotation_db::Rotation,
+        bg_style: &FsBgStyle,
+        _location_display: &str,
+        display_tex: Option<&crate::gpu_lanczos::FullscreenPaintResource>,
+        allow_thumbnail: bool,
+        content_bbox: Option<egui::Rect>,
+        pixels_per_point: f32,
+        placement: ResolvedDisplayPlacement,
+        // `translate`: 左右を一体で置き直すための平行移動 (§1.154)。物理ピクセルの整数倍。
+        translate: egui::Vec2,
+    ) -> Option<PreparedPagedPage> {
         let handle = self.fs_spread_page_paint_resource(idx, display_tex, allow_thumbnail);
         if let Some(handle) = handle {
             let handle = &handle;
@@ -42713,7 +43313,6 @@ impl App {
                     placement,
                 )?
                 .translated_by(translate);
-            paint_image_underlay(painter, transform.paint_quad(), bg_style);
             let paint_resource = match layout_source {
                 FsPageLayoutSource::Captured { post_filter, .. } => self
                     .prepare_fullscreen_paint_resource_with_filter(
@@ -42731,55 +43330,22 @@ impl App {
                     transform.visible_region_request(painter.clip_rect()),
                 ),
             };
-            if let Some(source_uv_rect) = paint_resource.visible_source_uv_rect() {
-                #[cfg(test)]
-                crate::app::paint_record_test_support::record_selected_paint_resource(
-                    painter,
-                    &paint_resource,
-                );
-                transform.paint_texture_source_region(
-                    painter,
-                    paint_resource.paint_texture_id(),
-                    source_uv_rect,
-                    egui::Color32::WHITE,
-                );
-            } else {
-                #[cfg(test)]
-                crate::app::paint_record_test_support::record_selected_paint_resource(
-                    painter,
-                    &paint_resource,
-                );
-                transform.paint_texture(
-                    painter,
-                    paint_resource.paint_texture_id(),
-                    egui::Color32::WHITE,
-                );
-            }
-            #[cfg(all(windows, feature = "test-script"))]
-            crate::test_script::record_drawn_paint(
-                painter,
-                &paint_resource,
-                format!("{:?}", transform.placement),
-            );
-            paint_resource.retain_native_output_for_paint(painter);
             if matches!(layout_source, FsPageLayoutSource::CurrentItem) {
                 self.observe_raw_presentation(idx);
             }
-            return Some(transform);
-        } else {
-            let label = self
-                .raw_loading_label(idx)
-                .unwrap_or_else(|| "読込中...".into());
-            crate::ui_raw::paint_loading_label(painter, rect, &label);
-            crate::ui_helpers::draw_centered_elided_label(
-                painter,
-                rect,
-                location_display,
-                12.0,
-                egui::Color32::from_gray(150),
-                rect.center().y + 18.0,
-                12.0,
-            );
+            return Some(PreparedPagedPage {
+                occurrence: SpreadPageOccurrence {
+                    idx,
+                    role: SpreadPageRole::Navigation,
+                    navigation_anchor_idx: idx,
+                },
+                transform,
+                resource: paint_resource,
+                painter: painter.clone(),
+                underlay: bg_style.clone(),
+                live: display_tex.is_some()
+                    && matches!(layout_source, FsPageLayoutSource::CurrentItem),
+            });
         }
         None
     }
@@ -57500,6 +58066,7 @@ mod tests {
                     provenance: FsDisplayUnitPageProvenance::Live,
                 },
             ],
+            submission: FsDisplayUnitSubmission::Unsubmitted,
         };
         let composition = SpreadDisplayComposition::from_navigation_pages(3, &[3, 4]).unwrap();
         let trace = app
@@ -76100,6 +76667,7 @@ mod tests {
         #[cfg(windows)]
         {
             crate::key_input::set_test_frame(vec![crate::key_input::KeyEdge {
+                operation_id: crate::key_input::KeyOperationId::unassigned(),
                 source_hwnd: 1,
                 source_viewport: egui::ViewportId::ROOT,
                 virtual_key: 0x1b,
@@ -79279,7 +79847,7 @@ mod specified_scale_consumer_tests {
                 rect,
                 &unit,
                 StillSeekGeometry::bar_only(),
-            )
+            );
         });
         let single = app.fullscreen_page_layout.page_by_idx(0).unwrap().transform;
         close(single.layout_full_image_rect.height(), 4096.0);
@@ -82044,5 +82612,572 @@ mod specified_scale_consumer_tests {
                 seed(owner);
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod page_turn_submission_tests {
+    use super::*;
+
+    fn ready_app(ctx: &egui::Context, mode: SpreadMode) -> crate::app::AppTestEnvForTest {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = (0..4)
+            .map(|idx| GridItem::Image(PathBuf::from(format!("c:/page-turn/{idx}.png"))))
+            .collect();
+        app.visible_indices = vec![0, 1, 2, 3];
+        app.fullscreen_idx = Some(0);
+        app.items_generation = 41;
+        app.spread_mode = mode;
+        app.reading_flow = ReadingFlow::Paged;
+        app.settings.spread_page_gap_px = 12;
+        for idx in 0..4 {
+            let image = egui::ColorImage::filled(
+                [80, 120],
+                egui::Color32::from_rgb(40 + idx as u8 * 40, 100, 160),
+            );
+            let tex = ctx.load_texture(
+                format!("submitted-page-{idx}"),
+                image.clone(),
+                egui::TextureOptions::LINEAR,
+            );
+            app.fs_cache.insert(
+                idx,
+                FsCacheEntry::Static {
+                    tex,
+                    pixels: Arc::new(image),
+                    source_dims: Some([80, 120]),
+                    load_seq: 1,
+                    animation: crate::fs_animation::StaticAnimationState::Still,
+                },
+            );
+            app.record_page_dims_for_spread(idx, (80, 120));
+        }
+        app
+    }
+
+    fn draw_current(
+        app: &mut App,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+    ) -> (SpreadDisplayComposition, FsNavigatorTextureSources) {
+        let anchor = app.fullscreen_idx.unwrap();
+        let composition = app.spread_display_composition_for_anchor(anchor);
+        let screen = composition.pages_in_screen_order(app.spread_mode);
+        let rect = ui.max_rect();
+        let sources = match screen.as_slice() {
+            [page] => {
+                let texture = app
+                    .resolve_fs_processed_texture(ctx, page.idx, false)
+                    .unwrap();
+                let resource = app.fullscreen_paint_resource_for_texture(page.idx, texture);
+                let mut sources = FsNavigatorTextureSources::default();
+                app.fullscreen_page_layout
+                    .begin(FullscreenPageLayoutKind::Single);
+                let transform = app
+                    .draw_fs_image_with_receipt(
+                        ui,
+                        rect,
+                        page.idx,
+                        Some(egui::vec2(80.0, 120.0)),
+                        FsPageLayoutSource::CurrentItem,
+                        None,
+                        None,
+                        composition.singleton_placement(),
+                        Some(&resource),
+                        None,
+                        false,
+                        false,
+                        false,
+                        crate::rotation_db::Rotation::None,
+                        None,
+                        0.0,
+                        &FsBgStyle::Solid(egui::Color32::WHITE),
+                        "",
+                        false,
+                        FullscreenFitMode::Page,
+                        FullscreenFitScaleLimits::default(),
+                        None,
+                        Some(&mut sources),
+                        app.settings.page_turn_animation_enabled,
+                    )
+                    .unwrap();
+                app.fullscreen_page_layout.push_occurrence(transform, *page);
+                assert!(sources.rebind_occurrences(&screen));
+                sources
+            }
+            [left, right] => app.draw_fs_spread_with_submission(
+                ui,
+                ctx,
+                rect,
+                left.idx,
+                right.idx,
+                false,
+                FsPageTurnDecision::normal(),
+                None,
+                StillSeekGeometry::bar_only(),
+                true,
+                Some(&composition),
+            ),
+            _ => panic!("bounded paged composition"),
+        };
+        (composition, sources)
+    }
+
+    fn frame(
+        ctx: &egui::Context,
+        run: impl FnMut(&mut egui::Ui, &egui::Context),
+    ) -> egui::FullOutput {
+        let mut run = run;
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(600.0, 400.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| run(ui, ctx));
+            },
+        )
+    }
+
+    #[test]
+    fn paged_actual_single_and_spread_submit_complete_immediate_off_receipts() {
+        for mode in [SpreadMode::Single, SpreadMode::Ltr, SpreadMode::Rtl] {
+            let ctx = egui::Context::default();
+            let mut app = ready_app(&ctx, mode);
+            frame(&ctx, |ui, ctx| {
+                let (composition, sources) = draw_current(&mut app, ui, ctx);
+                let FsDisplayUnitSubmission::Paged(receipt) = &sources.submission else {
+                    panic!("actual draw needs proof")
+                };
+                assert!(receipt.was_accepted());
+                assert!(receipt.matches(
+                    app.page_turn_destination(),
+                    ctx.cumulative_frame_nr(),
+                    &sources
+                ));
+                assert_eq!(
+                    receipt.pages().len(),
+                    composition.pages_in_reading_order().len()
+                );
+                assert!(!receipt.curl);
+                assert_eq!(receipt.pass(), ctx.cumulative_pass_nr());
+            });
+        }
+    }
+
+    #[test]
+    fn paged_actual_draw_rejects_source_substitution_for_readiness() {
+        let ctx = egui::Context::default();
+        let mut app = ready_app(&ctx, SpreadMode::Single);
+        app.fs_nav_locked_gen = Some(app.items_generation);
+        app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
+            previous: None,
+            chrome: FsNavigationChromeContinuation::None,
+            purpose: FsNavigationPurpose::Ordinary,
+            opened_at: std::time::Instant::now(),
+            target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+                items_generation: app.items_generation,
+                anchor_idx: 0,
+                accept_rendition: false,
+                phase: FsNavigationTargetPhase::Presenting {
+                    demand: crate::app::FsNavigationDisplayDemand::navigation_only(0, vec![0]),
+                    presentation: FsNavigationPresentation::Materialized,
+                },
+            }),
+        }));
+        frame(&ctx, |ui, ctx| {
+            let (composition, mut sources) = draw_current(&mut app, ui, ctx);
+            sources.pages[0].resource =
+                FullscreenPaintResource::direct(app.resolve_fs_display_tex(1, false).unwrap());
+            app.emit_fs_page_turn_ready_for_display_unit(
+                ctx,
+                &composition,
+                FsPageTurnDecision::normal(),
+                &sources,
+            );
+            assert!(app.fs_navigation_sequence_blocks_new_target());
+            let (_, actual) = draw_current(&mut app, ui, ctx);
+            app.emit_fs_page_turn_ready_for_display_unit(
+                ctx,
+                &composition,
+                FsPageTurnDecision::normal(),
+                &actual,
+            );
+            assert!(!app.fs_navigation_sequence_blocks_new_target());
+        });
+    }
+
+    #[test]
+    fn paged_actual_single_and_spread_animate_then_flat_without_partial_unit_receipts() {
+        for mode in [SpreadMode::Single, SpreadMode::Ltr, SpreadMode::Rtl] {
+            let ctx = egui::Context::default();
+            page_turn::install(&ctx);
+            let mut app = ready_app(&ctx, mode);
+            app.settings.page_turn_animation_enabled = true;
+            let target = if mode.is_spread() { 2 } else { 1 };
+            app.fullscreen_idx = Some(target);
+            frame(&ctx, |ui, ctx| {
+                draw_current(&mut app, ui, ctx);
+            });
+            app.fullscreen_idx = Some(0);
+            let mut outgoing_layout = FullscreenPageLayout::default();
+            frame(&ctx, |ui, ctx| {
+                draw_current(&mut app, ui, ctx);
+                outgoing_layout = app.fullscreen_page_layout.clone();
+            });
+            frame(&ctx, |ui, ctx| {
+                app.page_turn_external_operation(
+                    ctx,
+                    ViewerOperationId::Slideshow(next_operation_batch()),
+                    OperationPhase::Press,
+                    "slideshow",
+                );
+                assert_eq!(app.adjacent_page_turn_direction(0, target), Some(true));
+                app.offer_page_turn(ctx, target, true);
+                app.fullscreen_idx = Some(target);
+                let (composition, sources) = draw_current(&mut app, ui, ctx);
+                let FsDisplayUnitSubmission::Paged(receipt) = &sources.submission else {
+                    panic!("actual draw needs proof")
+                };
+                assert!(
+                    receipt.curl,
+                    "eligible complete ready unit curls: {mode:?}; outgoing={outgoing_layout:?}; incoming={:?}",
+                    app.fullscreen_page_layout
+                );
+                assert_eq!(
+                    receipt.pages().len(),
+                    composition.pages_in_reading_order().len()
+                );
+                assert!(!receipt.was_accepted(), "ON waits for output acceptance");
+                app.emit_fs_page_turn_ready_for_display_unit(
+                    ctx,
+                    &composition,
+                    FsPageTurnDecision::normal(),
+                    &sources,
+                );
+            });
+            assert!(app.pending_fs_page_turn_ready.as_ref().is_some_and(|pending| matches!(&pending.sources.submission,FsDisplayUnitSubmission::Paged(receipt) if receipt.was_accepted())));
+            app.settings.page_turn_animation_enabled = false;
+            frame(&ctx, |ui, ctx| {
+                app.flush_submitted_page_turn_ready(ctx);
+                let (_, sources) = draw_current(&mut app, ui, ctx);
+                let FsDisplayUnitSubmission::Paged(receipt) = &sources.submission else {
+                    panic!("actual draw needs proof")
+                };
+                assert!(receipt.was_accepted());
+                assert!(!receipt.curl);
+            });
+        }
+    }
+    #[test]
+    fn paged_cold_raw_spread_still_materializes_normal_source_without_curl() {
+        let ctx = egui::Context::default();
+        page_turn::install(&ctx);
+        let mut app = ready_app(&ctx, SpreadMode::Ltr);
+        app.settings.page_turn_animation_enabled = true;
+        frame(&ctx, |ui, ctx| {
+            draw_current(&mut app, ui, ctx);
+        });
+        let raw = [2, 3].map(|idx| app.resolve_fs_display_tex(idx, false).unwrap().id());
+        assert!(!app.current_final_composite_is_complete(2));
+        assert!(!app.current_final_composite_is_complete(3));
+        frame(&ctx, |ui, ctx| {
+            app.page_turn_external_operation(
+                ctx,
+                ViewerOperationId::Slideshow(next_operation_batch()),
+                OperationPhase::Press,
+                "slideshow",
+            );
+            app.offer_page_turn(ctx, 2, true);
+            assert!(
+                !app.current_final_composite_is_complete(2),
+                "acceptance cannot build/upload the target pipeline"
+            );
+            assert!(!app.current_final_composite_is_complete(3));
+            app.fullscreen_idx = Some(2);
+            let (composition, sources) = draw_current(&mut app, ui, ctx);
+            let FsDisplayUnitSubmission::Paged(receipt) = &sources.submission else {
+                panic!("ordinary target needs real proof")
+            };
+            assert!(
+                !receipt.curl,
+                "cold raw source is not an already-ready normal unit"
+            );
+            assert_eq!(receipt.pages().len(), 2);
+            assert_eq!(composition.pages_in_reading_order().len(), 2);
+            assert!(
+                sources
+                    .pages
+                    .iter()
+                    .zip(raw)
+                    .all(|(page, raw)| page.resource.source_texture_id() != raw)
+            );
+            assert!(app.current_final_composite_is_complete(2));
+            assert!(app.current_final_composite_is_complete(3));
+        });
+    }
+
+    #[test]
+    fn paged_deferred_proof_rejects_changed_input_generation() {
+        let ctx = egui::Context::default();
+        page_turn::install(&ctx);
+        let mut app = ready_app(&ctx, SpreadMode::Single);
+        app.settings.page_turn_animation_enabled = true;
+        frame(&ctx, |ui, ctx| {
+            let (composition, sources) = draw_current(&mut app, ui, ctx);
+            assert!(sources.pages[0].resource.source_generation().is_some());
+            app.emit_fs_page_turn_ready_for_display_unit(
+                ctx,
+                &composition,
+                FsPageTurnDecision::normal(),
+                &sources,
+            );
+        });
+        assert!(app.pending_fs_page_turn_ready.is_some());
+        app.input_generation.insert(0, 1);
+        app.fs_nav_locked_gen = Some(app.items_generation);
+        app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
+            previous: None,
+            chrome: FsNavigationChromeContinuation::None,
+            purpose: FsNavigationPurpose::Ordinary,
+            opened_at: std::time::Instant::now(),
+            target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+                items_generation: app.items_generation,
+                anchor_idx: 0,
+                accept_rendition: false,
+                phase: FsNavigationTargetPhase::Presenting {
+                    demand: crate::app::FsNavigationDisplayDemand::navigation_only(0, vec![0]),
+                    presentation: FsNavigationPresentation::Materialized,
+                },
+            }),
+        }));
+        frame(&ctx, |_, ctx| app.flush_submitted_page_turn_ready(ctx));
+        assert!(
+            app.fs_navigation_sequence_blocks_new_target(),
+            "older producer generation cannot release the current target"
+        );
+        assert!(app.pending_fs_page_turn_ready.is_none());
+    }
+
+    #[test]
+    fn paged_discarded_outgoing_pass_cannot_become_replayed_curl() {
+        let ctx = egui::Context::default();
+        page_turn::install(&ctx);
+        let mut app = ready_app(&ctx, SpreadMode::Single);
+        app.settings.page_turn_animation_enabled = true;
+        app.fullscreen_idx = Some(1);
+        frame(&ctx, |ui, ctx| {
+            draw_current(&mut app, ui, ctx);
+        });
+        app.fullscreen_idx = Some(0);
+        assert!(app.current_final_composite_is_complete(1));
+        let operation = ViewerOperationId::Slideshow(next_operation_batch());
+        let mut proofs = Vec::new();
+        frame(&ctx, |ui, ctx| {
+            if ctx.current_pass_index() == 0 {
+                let (_, sources) = draw_current(&mut app, ui, ctx);
+                let FsDisplayUnitSubmission::Paged(receipt) = sources.submission else {
+                    panic!("actual proof")
+                };
+                proofs.push(receipt);
+                ctx.request_discard("outgoing unit discarded");
+            } else {
+                app.page_turn_external_operation(
+                    ctx,
+                    operation,
+                    OperationPhase::Press,
+                    "slideshow",
+                );
+                app.offer_page_turn(ctx, 1, true);
+                app.fullscreen_idx = Some(1);
+                let (_, sources) = draw_current(&mut app, ui, ctx);
+                let FsDisplayUnitSubmission::Paged(receipt) = sources.submission else {
+                    panic!("actual proof")
+                };
+                assert!(
+                    !receipt.curl,
+                    "discarded outgoing output has never been visible"
+                );
+                proofs.push(receipt);
+            }
+        });
+        assert_eq!(proofs.len(), 2);
+        assert!(!proofs[0].was_accepted());
+        assert!(proofs[1].was_accepted());
+    }
+
+    #[test]
+    fn paged_actual_supplement_role_is_bound_before_submission() {
+        let ctx = egui::Context::default();
+        let mut app = ready_app(&ctx, SpreadMode::LtrCover);
+        app.current_folder = Some(PathBuf::from("c:/page-turn"));
+        app.top_level_grid_view
+            .replace_surface(crate::app::top_level_grid_view::TopLevelGridSurface::Folder);
+        app.details_order = vec![0, 1, 2, 3];
+        app.settings.final_cover_spread_enabled = true;
+        app.final_cover_spread_preference =
+            crate::settings::FinalCoverSpreadPreference::FollowGlobal;
+        app.fullscreen_idx = Some(3);
+        frame(&ctx, |ui, ctx| {
+            let (composition, mut sources) = draw_current(&mut app, ui, ctx);
+            assert!(
+                composition
+                    .pages_in_reading_order()
+                    .iter()
+                    .any(|p| p.role == SpreadPageRole::FrontCoverSupplement)
+            );
+            let FsDisplayUnitSubmission::Paged(receipt) = &sources.submission else {
+                panic!("actual draw needs proof")
+            };
+            assert!(receipt.matches_sources(app.page_turn_destination(), &sources));
+            assert!(receipt.pages().iter().any(|(p, _, _, _)| p.idx == 0
+                && p.role == SpreadPageRole::FrontCoverSupplement
+                && p.navigation_anchor_idx == 3));
+            let wrong_roles: Vec<_> = sources
+                .pages
+                .iter()
+                .map(|p| SpreadPageOccurrence::navigation(p.idx(), 3))
+                .collect();
+            assert!(
+                !sources.rebind_occurrences(&wrong_roles),
+                "proof cannot invent navigation roles after submission"
+            );
+        });
+    }
+
+    #[test]
+    fn page_turn_animation_mesh_visual_snapshots() {
+        use crate::page_turn_animation::{
+            CanonicalPage, CanonicalUnit, PageMaterial, TurnDirection, UnitLayout,
+        };
+        let mut snapshots = egui_kittest::SnapshotResults::new();
+        for (layout_name, layout, rtl) in [
+            ("single", UnitLayout::Single, false),
+            ("spread_ltr", UnitLayout::Spread, false),
+            ("spread_rtl", UnitLayout::Spread, true),
+        ] {
+            for (pose, progress) in [("pre", 0.0), ("mid", 0.5), ("end", 1.0)] {
+                let mut textures = None;
+                let mut harness = crate::test_ui::builder()
+                    .with_size(egui::vec2(620.0, 400.0))
+                    .build(|ctx| {
+                        if textures.is_none() {
+                            let glyphs = [
+                                [14u8, 17, 17, 31, 17, 17, 17],
+                                [30, 17, 17, 30, 17, 17, 30],
+                                [14, 17, 16, 16, 16, 17, 14],
+                                [30, 17, 17, 17, 17, 17, 30],
+                            ];
+                            let loaded: Vec<_> = glyphs
+                                .into_iter()
+                                .enumerate()
+                                .map(|(idx, glyph)| {
+                                    let mut image =
+                                        egui::ColorImage::filled([100, 150], egui::Color32::WHITE);
+                                    let accent = [
+                                        egui::Color32::from_rgb(40, 80, 190),
+                                        egui::Color32::from_rgb(200, 65, 60),
+                                        egui::Color32::from_rgb(25, 150, 100),
+                                        egui::Color32::from_rgb(150, 70, 180),
+                                    ][idx];
+                                    for y in 0..150 {
+                                        for x in 0..100 {
+                                            image[(x, y)] = if (x / 10 + y / 10) % 2 == 0 {
+                                                egui::Color32::from_gray(235)
+                                            } else {
+                                                egui::Color32::from_gray(205)
+                                            };
+                                            if x < 5 || x >= 95 || y < 5 || y >= 145 {
+                                                image[(x, y)] = accent;
+                                            }
+                                        }
+                                    }
+                                    for (row, bits) in glyph.into_iter().enumerate() {
+                                        for col in 0..5 {
+                                            if bits & (1 << (4 - col)) != 0 {
+                                                for y in 30 + row * 10..40 + row * 10 {
+                                                    for x in 25 + col * 10..35 + col * 10 {
+                                                        image[(x, y)] = accent;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    ctx.load_texture(
+                                        format!("curl-visual-{idx}"),
+                                        image,
+                                        egui::TextureOptions::LINEAR,
+                                    )
+                                })
+                                .collect();
+                            textures = Some(loaded);
+                            ctx.request_repaint();
+                        }
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE.fill(egui::Color32::from_gray(25)))
+                            .show(ctx, |ui| {
+                                let make = |incoming: bool| CanonicalUnit {
+                                    layout,
+                                    pages: (0..if layout == UnitLayout::Single { 1 } else { 2 })
+                                        .map(|slot| {
+                                            let x = if layout == UnitLayout::Single {
+                                                190.0
+                                            } else {
+                                                64.0 + slot as f32 * 250.0
+                                            };
+                                            let rect = egui::Rect::from_min_size(
+                                                egui::pos2(x, 20.0),
+                                                egui::vec2(240.0, 360.0),
+                                            );
+                                            let idx = slot + if incoming { 2 } else { 0 };
+                                            CanonicalPage {
+                                                occurrence: Some(slot as u64),
+                                                rect,
+                                                clip_rect: ui.max_rect(),
+                                                material: PageMaterial::Texture {
+                                                    texture_id: textures.as_ref().unwrap()[idx]
+                                                        .id(),
+                                                    uv: [
+                                                        egui::pos2(0.0, 0.0),
+                                                        egui::pos2(1.0, 0.0),
+                                                        egui::pos2(1.0, 1.0),
+                                                        egui::pos2(0.0, 1.0),
+                                                    ],
+                                                    available_uv: egui::Rect::from_min_max(
+                                                        egui::Pos2::ZERO,
+                                                        egui::pos2(1.0, 1.0),
+                                                    ),
+                                                },
+                                                underlay: Some(PageMaterial::Blank {
+                                                    color: egui::Color32::WHITE,
+                                                }),
+                                            }
+                                        })
+                                        .collect(),
+                                };
+                                page_turn::paint_projection_for_test(
+                                    ui.painter(),
+                                    &make(false),
+                                    &make(true),
+                                    TurnDirection {
+                                        reading_rtl: rtl,
+                                        forward: true,
+                                    },
+                                    progress,
+                                )
+                                .expect("supported visible mesh pose");
+                            });
+                    });
+                harness.run();
+                harness.snapshot(format!("page_turn_animation_{layout_name}_{pose}"));
+                snapshots.extend_harness(&mut harness);
+            }
+        }
+        snapshots.unwrap();
     }
 }

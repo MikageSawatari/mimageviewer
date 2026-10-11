@@ -106,6 +106,15 @@ fit 基準へ戻さない。連結の基準 unit と PDF の絶対需要比較�
 移送する。共通指定値と favorite 専用値は既存 overlay / 保存 worker を使い、欠落継承だけで
 専用値を書き込まない。実装・検証状況は [指定サイズfit計画 §15](fullscreen-specified-scale-plan.md#15-実装接続と検証結果2026-10-09) を参照。
 
+紙めくり（§1.341 A0、2026-10-11、受入れ待ち）は `ui_fullscreen/page_turn.rs` の
+`PageTurnPresentation` を既存 viewer bundleで所有し、pure projectionを
+`page_turn_animation.rs`へ渡す。navigation/load admissionは既存ownerのまま、配送先と
+stable operation IDで取消しを判断する。通常prepareの全unitをflat/curlのどちらか一度だけ
+提出し、採用されたegui outputのreceiptを既存ready observerへ配送する。旧素材のleaseは
+実draw batchまで保持し、App共有のweak一覧はparked/in-flightを含むVRAM会計だけを担う。
+既定OFF、時間は利用者評価用の仮値。独立レビュー・実機/性能受入れは別gateであり、
+実装と検証の正本は [紙めくり計画 §12](page-turn-animation-plan.md#12-a0実装差分検証状況2026-10-11)。
+
 ---
 
 ## 2. モジュールマップ

@@ -283,6 +283,7 @@ impl App {
         if !self.window_visible {
             return;
         }
+        self.deactivate_all_page_turn_presentations("hidden_to_tray");
         // Preserve the media session and transport. Native presenters enter their existing
         // consume-and-hold state; egui hosts remain registered but become explicitly hidden.
         let routed_presenters = self.prepare_media_session_for_tray_residency();

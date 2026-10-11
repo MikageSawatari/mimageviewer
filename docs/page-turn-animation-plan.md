@@ -1,10 +1,10 @@
 # ページめくりアニメーション設計案 — backlog §1.341
 
-2026-10-11 / r3 / **初回独立レビューREVISEへの設計修正案。Q1・Q5採択済み、Q2〜Q4回答・A0具体化と再レビュー待ち。製品コードの変更なし。**
+2026-10-11 / r3 + A0実装追補 / **利用者からR3 ACCEPTと伝達され、`0f6ad9f19`でmasterへ統合済み。既定OFF・slideshow適用を採択し、時間は実機評価用の仮設定。A0の未コミット製品差分と自動検証を記録。実装の独立完了レビュー・実機確認・性能/実用性受入れは未完了。**
 
-参照treeは `next-prefs` / `1ee3e178288f2eff119da16b672d546cc3c9992c`（R2文書commit、開始時clean）。製品コードはmaster `cb00930011323cacd7088ae70c37835141aad58a` と同じ。
-本書の `file:line` はこのtreeでsource inspectionした位置。実行時の確認・新しい性能測定は行っていない。
-§1.364は別worktreeで実装中であり、**そのmaster統合後に本項を実装する**。行番号と契約を統合後に再照合する。
+R3設計時の参照treeは `next-prefs` / `1ee3e178288f2eff119da16b672d546cc3c9992c`（R2文書commit、開始時clean）。当時の製品コードはmaster `cb00930011323cacd7088ae70c37835141aad58a` と同じだった。
+既存の `file:line` は設計時のsource inspection位置。A0は§1.364統合後の`0f6ad9f19`を基点とする未コミット差分で具体化した（§12）。新しい実機性能測定はまだ行っていない。
+実装開始の前提は**§1.364のmaster統合後**。そのowner/unit/token契約を消費し、同機能を再実装しない。
 後続ラインGの本構成は相互作用だけを扱い、本項でbuilder・保存仕様を先取りしない。
 
 ## 1. 要求・読む文書・比較調査
@@ -46,7 +46,7 @@ Remoteはweb-remote-plan.mdの独立所有、snapshotはui-snapshot-policy.mdを
 `docs/display-pipeline.md:2138` の2026-08-11記録は24MP JPEGのUIコスト28.2msがほぼupload、`docs/display-pipeline.md:2446` 以降は
 2026-08-12のFHD ZIP / 4K 165Hz環境で約100ページ/秒という旧測定。ただし`docs/display-pipeline.md:2096` 以降の
 2026-08-14規則が優先し、受理unitを必ず一frame提示する。旧100ページ/秒を現HEADの保証・新効果の目標にはしない。
-本turnはコードと既存記録の確認だけであり、実装前の現HEAD baseline測定は§9の未実施gateである。
+この節はR3設計時のコードと既存記録の確認であり、現HEADのbaseline測定は§9の未実施gateである。
 
 ### 2.1 既存transitionは何を再利用できるか
 
@@ -67,7 +67,7 @@ parallelなdecode/prefetch/cacheは作らない。R3でも必要な旧unitの短
 
 **利用者決定（Q1、2026-10-10）: C方向。旧ページをめくっている面と、下から現れる次ページの両方が見え、紙をめくると読める効果にする。細い端帯だけでは不可。**
 長くかかる場合は次々回releaseへ延期可能。R1のA推奨・80ms・旧resource保持なしは採用しない。
-Q5は利用者の今回の指示で **PC viewer限定（F12を含む）、Remote不要** と確定。Q2〜Q4だけが未回答。本書の200ms・OFF・手動だけは推奨案で、採択済みではない。
+Q5は **PC viewer限定（F12を含む）、Remote不要** と確定。2026-10-11にQ3の**既定OFF**、Q4の**slideshowにも同じ効果**を採択した。Q2の最終時間は動きを見てから決めるため、評価用に100〜600ms・既定200msの仮設定を使う（§7・§10）。
 
 | 方式 | R3での扱い・費用 |
 | --- | --- |
@@ -306,14 +306,14 @@ blank/shadow meshはtextureを作らない。mesh/batchのCPU/GPU bufferも別�
 
 ## 6. 操作・表示機能・多窓
 
-| 操作/状況 | R3の規則（Q2〜Q4回答待ち、Q5確定） |
+| 操作/状況 | R3と2026-10-11の利用者決定による規則 |
 | --- | --- |
 | 単発キー・click/tap/ring | 受理済み隣接・即readyの通常静止unitだけ開始。Action/入力基数を変えず、effectの入力ロックなし |
 | 連打・held / 方向反転 | 次入力で即取消、その移動は通常表示。既存burst Active・repeatは常に効果なし。最初のPressはheld levelだけで排除しない |
 | gamepad | Pressは単発と同じ。Repeat/analog連続は取消+通常表示。`src/app/gamepad_input.rs:6776` のrepeat factを静止画経路にも明示的に渡す。独自hold timerなし。nudgeは組変更で取消 |
 | wheel | pageへrouteされた単発1notchだけ候補。複数notch/burst/演出中は通常表示。accumulator・popup/panel/seekの所有は維持 |
 | seek / jump | seek/strip、Home/End、割合、しおり/履歴/検索、類似本・フォルダ移動は取消+通常表示。たまたま隣でもjump原因で除外。LatestSeekとSequentialを維持 |
-| slideshow | 推奨は手動だけ。ON対象を広げる回答なら同じrecipe/即ready条件を使用。自動入力も既存effectを取消し、interval/deadline/readinessをeffect終了へ連動しない。採択durationをDとしてinterval < Dなら省略し、slideshowを遅くしない。開始時の既存next deadlineまでの残り時間がD未満なら同様に省略し、deadlineを延長しない |
+| slideshow | **同じrecipe/即ready条件を適用する採択済み対象**。追加toggleは作らない。自動入力も既存effectを取消し、interval/deadline/readinessをeffect終了へ連動しない。評価中は選択した仮時間をDとしてinterval < Dなら省略する。開始時の既存next deadlineまでの残り時間がD未満なら同様に省略し、deadlineを延長しない |
 | 縦横の連結読み | 新curlなし。既存scroll transition・reanchor・wheel/gamepad・slideshow scrollは維持。連結へのmode switchは取消 |
 | §1.342指定サイズ | canonical fit/limits/physical pxをsnapshotへ保持。指定％/pxを演出poseから逆算しない。end/cancel frameは同じresolver結果へ戻す。指定scaleでpageがcanvas外へ大きくはみ出す場合、必要ROIが揃わなければcurlだけskip |
 | zoom/pan / free rotation・trim / original hold / 編集・比較・分析 | 操作開始で取消、これらがactiveなviewには新curlを重ねない。機能は従来どおり。固定rotation済み素材のUVは通常と同じ。新操作中に古いsheetをhit-testに使わない |
@@ -332,7 +332,7 @@ default/destructure/swap（`:2203`）/fork/park/mount/retireを揃える。通�
 
 detached述語/viewport経路に触れる実装前には `docs/detached-rework-plan.md:29` の§2に従い、設計担当と独立reviewerで
 「presentation所有の構造的拡張で、症状パッチではない」と明示合意し、範囲を同plan §11（`:1456`）へ記録する。
-本turnでは同planを編集しない。Appへdetached用bool/rect捕捉/grace/debounce/追加hidden viewportを足さない。
+A0の接続範囲は同plan §11へ記録する。Appへdetached用bool/rect捕捉/grace/debounce/追加hidden viewportを足さない。
 採択時間は演出の長さで、event freshness・競合解決の時間窓ではない。
 
 ## 7. §1.364・Gの接点、設定・keymap
@@ -349,12 +349,12 @@ Gのdirectionはscreen slotのみを反転しlogical orderを変えない（`:35
 構成save/reload/解除・adoption・membership/role/slice変更で取消。LayoutSource/明示Pair/Single/companion/hidden許可を受け取り、idx±1や自動pairingを前提にしない。
 Gのmode-onlyとbindingの分離、modal入力所有、hidden提示許可を迂回しない。本構成store/projection builderの変更は範囲外。
 
-初版の設定は `page_turn_animation_enabled: bool` 一つ、表示名「ページめくりアニメーション」。
-方式は採択されたfold/curl一つ、時間もQ2採択値で固定。slider/方式picker/本別値/新DBを作らない。
-説明は「単発のページ送りで紙をめくる効果。連打・読込待ち・連結読みでは瞬時切替」（対象は回答後確定）。
-既定 **OFF推奨、未採択**。既存preferences draft/save worker/settings transfer round-tripを使い、欠落fieldの初期値も採択値へ合わせる。
+有効設定は `page_turn_animation_enabled: bool`、表示名「ページめくりアニメーション」、**既定OFF採択済み**。
+方式は採択されたfold/curl一つ。Q2の最終時間を実機評価後に決めるため、`page_turn_animation_duration_ms: u32`を仮に追加し、100〜600ms・既定200ms、「時間（仮）」スライダーで調整する。最終の時間仕様は評価後に再決定し、この仮範囲を出荷仕様の採択と扱わない。方式picker・本別値・新DBは作らない。
+説明は「単発のページ送りとスライドショーで紙をめくる効果。連打・読込待ち・連結読みには適用しません。」。読込待ちの既存loading/holdoverまで瞬時化する約束ではない。
+既存preferences draft/save worker/settings transfer round-tripを使い、欠落fieldはOFF/200msへ補完する。通常設定の時間は100〜600msへ補正し、設定転送は型違い・範囲外を拒否して現在のdraftを保つ。
 ON→OFFは即取消、OFF→ONは次の適格な操作から。設定確定に本reloadを足さない。
-Q4がslideshowを含めても追加toggleを自動的に増やさず、仕様採択後に必要性を再確認する。Q5のPC限定は決定済み。
+slideshowは同じ有効設定と時間を使い、追加toggleは作らない。Q5のPC限定は決定済み。
 
 新KeyAction/shortcutは不要。取消は非消費のpresentation処理で、既存page Action・SinglePerFrameを維持。
 既存typed consume結果/PadActionKindに操作原因を接続し、キーコード直書き・OS level再分類をしない。
@@ -377,12 +377,12 @@ A1は品質gateを満たした場合に早期出荷できる**同じfeatureの�
 その場合もunit変更時は瞬時切替、ズーム・連結・Remoteは既存表示というscopeを明記する。A2は同じ設定を引き継ぐ。
 Gを先取りしてbuilderを書き換える工程、全unit morph、Remote curlはこの見積り外。
 
-## 9. テスト・性能gate（実装時、今回は未実施）
+## 9. テスト・性能gate（実機/性能受入れ未実施）
 
 A0で **E統合後・effect未導入のbaselineを先に取得**。同commit系・fixture・settings・窓配置・refresh rateでOFF/ONを交互に3回以上。
 warm/coldを分け、FHD/24MP、ZIP、uncached PDF、AI/LUT/カラー化、single/spread/Blank/landscape、LTR/RTL、指定％/px、二F12窓を含める。
 30/60Hzのdown/up連打、held repeat、gamepad、wheel burst、seek、連結scroll、短interval slideshowを別々に測る。
-既存記録（§2）を現HEAD測定の代わりにしない。--perf-logを有効にするための製品起動も今回は行わない。
+既存記録（§2）を現HEAD測定の代わりにしない。製品起動は別の明示承認interactive枠で行い、実装中の非対話検査と区別する。
 
 | 層 | 必須の検査 |
 | --- | --- |
@@ -420,6 +420,7 @@ OFF時はeffect診断用の時計・extrasを作らず即return。ログ欠落�
 
 ```powershell
 python scripts/analyze_perf.py <log> page-turn --check
+python scripts/analyze_perf.py <log> page-turn-animation --check --profile single --run-id run-1
 python scripts/analyze_perf.py <log> latency
 python scripts/analyze_perf.py <log> hitches --ms 16
 python scripts/analyze_perf.py <log> idle-health
@@ -434,15 +435,15 @@ max VRAM/pin量、warm/cold、GPU/refresh rate、runばらつきを添える。�
 
 狭いstate/handler/paint→snapshot→fmt/glyph→共有変更のscripts/test-full.ps1、独立完了reviewが実装時のgate。
 interactiveはscenario・時間・desktop使用・disposable dataを提示した別の明示承認suite。normal-profile起動は利用者だけ。
-必要なbuild/portable-smoke/build-dev handoffは実装時に行う。**本R3作業は文書のみ、製品code/test/build/launch/commitなし。**
+必要なbuild/portable-smoke/build-dev handoffは実装時に行う。**R3設計作業は文書のみだった。A0の製品差分と未完了gateは§12で別に記録する。**
 
-## 10. 利用者への残りの質問（各項一問、Q2〜Q4回答待ち）
+## 10. 利用者決定と残る時間評価（2026-10-11）
 
-Q1は2026-10-10にC方向・旧/新が見える実際のpage-turnとして採択。Q5は今回の指示でPC viewer限定・F12含む・Remote不要と確定。両項は再質問しない。
+Q1は2026-10-10にC方向・旧/新が見える実際のpage-turnとして採択し、2026-10-11に再確認した。Q5も2026-10-11にPC viewer限定・F12含む・Remote不要と再確認した。両項は再質問しない。
 
-1. **Q2: 紙めくりの時間は何msにしますか？** 推奨: **200ms固定**。代案150ms（素早い）/300ms（曲面を見やすい）。新内容は最初のready frameから見え、全面表示はこの時間内。新入力/held/seekで即終了します。
-2. **Q3: 初期設定はOFFとONのどちらにしますか？** 推奨: **OFF**。従来の瞬時切替を初期値に保ち、希望する方がONにできます。ONでも読込待ち・連打には演出を付けません。
-3. **Q4: 初版は手動の単発ページ送りだけでよいですか？** 推奨: **手動だけ**。slideshowの既存動作を維持します。自動にも必要なら同じeffectを即ready時だけ使い、intervalや次ページ提示を遅くしません。
+1. **Q2: 最終時間は動きを見てから決める。** 評価用の仮スライダーは100〜600ms・既定200ms。新内容は最初のready frameから見え、全面表示は選択した時間内。新入力/held/seekで即終了する。
+2. **Q3: 既定OFF採択済み。** 2026-10-11の利用者判断は「速度が売り」。従来の瞬時切替を初期値に保ち、希望する方がONにできる。ONでも読込待ち・連打には演出を付けない。
+3. **Q4: slideshowにも同じ効果を適用する。** 即ready条件と§6のduration/deadline条件を使い、intervalや次ページ提示を遅くしない。個別toggleは追加しない。
 
 次々回への延期許容は品質と正しさのための工程判断であり、通常の入力を遅くする、既存機能を外す、ready提示を停止する許可ではない。
 そのような変更が必要と判明したら実装前に費用と選択肢を提示して相談する。
@@ -472,5 +473,52 @@ R2の三項目は以下の**設計担当の自己点検**であり、独立レ�
 
 初回reviewerはimmutable lease/会計/入力取消/canonical geometry/連結分離/A0と延期方針を妥当とし、bundle presentation owner方向をdetached症状パッチではないと判断した。
 **この方向への所見を、接続境界の設計承認・構造合意完了とは記録しない。** 初回結果はREVISEのまま。
-R3は指摘への設計修正案で、解消判定・再レビューは未実施。E統合後のA0具体化、detached §11への範囲記録と必要な構造合意、geometry/visibility・native lifetime・GPU/実present・性能/実用性gatesを経てA1へ進む。
-Q2〜Q4は未回答。R3作業は設計担当のsource inspectionと文書整合確認のみで、新しい独立レビューを実施したとは主張しない。
+上の初回REVISE記録は履歴として保つ。その後、利用者からR3 ACCEPTと伝達され、masterの`0f6ad9f19`（merge題名: `1.341 page-turn animation design R3, ACCEPTed`）へ統合された。ここで新しい独立レビューを実施したとの主張や、そのレビュー本文・検証証拠を補作しない。
+Q3/Q4の採択とQ2の仮評価設定は§10のとおり。R3の設計採択はA0実装の完了レビューや実機受入れを代替しない。E統合後のA0接続、detachedの具体的範囲への構造確認、geometry/visibility・native lifetime・GPU/実present・性能/実用性gatesは別に閉じる。
+
+## 12. A0実装差分・検証状況（2026-10-11）
+
+基点は`0f6ad9f19`、対象は未コミットのA0差分。以下は追加した実装の境界であり、完成・出荷の証明ではない。
+
+- `src/page_turn_animation.rs`はcanonical unitを受け取る純粋projection、可視面のreceipt、ROI/clip/layoutのpreflightを持つ。texture/addressの存在だけを可視提示の証拠にしない。実GPU/実presentの品質証明は別gate。
+- `src/ui_fullscreen/page_turn.rs`は`PresentationState::{Inactive, Flat, Offered, Turning}`を所有し、最後に提出したunitからimmutable paint resourceを保持する。`ViewerOperationFact`は配送先context/window/viewport、stable operation ID、source viewport、Press/Repeat/Continuous/causeを持ち、診断input_seqだけで兄弟contextを相関しない。
+- `PageTurnPresentation`を既存`ViewerContextBundle`でswap/deposit/mountし、forkはInactive、通常のpause/parkは状態を保持する。実際のclose/非表示/配送先変更/取消は当該ownerで処理する。Appの共有`PageTurnLeaseInventory`はweak参照の会計用一覧であり、contextのpresentation状態やnavigationを所有しない。source/outputの既存VRAM会計へ接続し、parked/in-flightも含めた保持量とadmissionを扱う。native lifetime・複数窓での実解放は未検証。
+- 単ページと見開きの通常prepareから同じpass内で全unitのflat/curlを排他的に提出する。holdoverを採用する場合はそのunitだけをeffectの判断へ渡し、表示しなかったcurrent候補を提示証拠にしない。最終のegui output hookで破棄passを除き、実occurrence/source/nativeと正のvisible areaを持つreceiptだけを採用する。
+- 受理時のready判定は、現在のedit/final keyに一致する完成済みnormal textureと、読込済み注釈のresident合成結果だけを参照する。raw cache/preview/thumbnailをnormal finalの代用にしない。未準備時は`not_final_ready_at_accept`で機会外を記録し、従来の通常producerと瞬時表示へ進む。後着から演出を開始せず、accept側で処理・metadata読込・uploadを増やさない。単ページ/見開きの正例fixtureは通常producerで素材を準備し、cold rawの見開きは別回帰で確認する。
+- UVは通常描画と同じinverse rotation・trim変換から作る。cursor座標の逆変換を描画素材のUVとして流用しない。終端PNGは製品の通常`paint_texture` helperで別描画したcanonical画素と完全一致させる。
+- ONの既存ready observerへの通知は`PendingFsPageTurnReady`で当該contextへ保持し、次のpre-drawで新しい入力/target操作より前に採用済みreceiptを検査して行う。これは既存observerへの出力証拠の配送であり、新たなnavigation要求・待機・load admissionを作らない。元画像/通常final/passthroughの既存source選択、items/input generation、unit/layout/配送先を照合する。OFFはstack上の即時flat receiptで従来の同pass observer経路を使う。pendingのactual paint resourceもVRAM会計へ含める。
+- §7のOFF/仮時間を既存Settings、preferences draft/OK、SQLite KV、settings transferへ追加した。UIは既存「閲覧表示」ページと検索索引を使う。新DB・本別設定・slideshow専用toggle・KeyActionは追加しない。
+- OFFではeffect用のraw-input観測、native edgeのeagerコピー、pad batch/replay観測、隣接unit判定、projection・pin・effect診断を行わない。generic egui consumerが実際に一致した入力のprovenanceだけはlazy保持して安定IDを守る。OFFの割当があらゆる入力でゼロ、または実測で速度差ゼロという主張ではない。ON時の新操作がactive turnを取り消した場合も、受理済みrepeat/jump等の機会外理由をtyped dispositionで一度だけ記録する。
+
+**解析器**: `python scripts/analyze_perf.py <log> page-turn-animation --check`を追加し、従来の`page-turn --check`のI1〜I5とは別に集計する。`context/window/operation_id`の文字列でreceiptを相関し、replayを重複計上しない。profile/context/windowごとに機会・offer・start・finish・cancel・skip、開始率/完走率、理由別skip率、mesh CPU時間・保持bytes、ready→first/fully visibleを出す。入力時刻は実際のWin32 enqueue / egui raw delivery / pad sample / pointer delivery / slideshow activationに付けた`input/key_edge_ingress`と同じoperation IDで結ぶ。受理時刻や診断input_seqから入力時刻を補作しない。これはアプリ内への配送時刻であり、物理入力・OS queue到着時刻ではない。可視receiptも採用されたegui出力の提出証拠であり、OSの実presentを証明しない。後者は別承認の実機枠で検証する。
+
+ログに測定ラベルがなければ`--profile single --run-id run-1`で補える。既定の必須warm profileは`single/spread_ltr/spread_rtl/f12_single/f12_spread_ltr/f12_spread_rtl`、F12は二readerを必要とする。各contextに3run×30機会を要求し、一つのcaptureを3runとみなさない。`--required-profile`で評価範囲を明示できるが、範囲外profileの受入れを意味しない。全件skip・未収束start・矛盾した終端・終端後のanimation frameはFail、機会ゼロ・coverage/receipt/metric不足はCannotJudge。既存stored delivery checkpoint/ACK/manifestによるログ配送検証も使い、証拠不完全ならCannotJudge。`--json-out`で集計を保存できる。
+
+**実施済みの限定証拠**: 基点`0f6ad9f19`からの本A0差分で以下を実行した。Cargoは`MSBUILDDISABLENODEREUSE=1`。合成ログ・fake input/stateとheadless GPUによる回帰であり、製品の描画速度・実present・実VRAM計測ではない。
+
+| コマンド/対象 | 結果 | 記録 |
+| --- | --- | --- |
+| `cargo fmt --all`、`cargo fmt --all --check` | exit 0 | agent command結果 |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険glyph 0 | agent command結果 |
+| `python -m unittest discover -s scripts -p test_analyze_perf.py` | exit 0、101件成功 | `target/A-1341-a0-python.log` |
+| 新preferences PNG生成: `UPDATE_SNAPSHOTS=1 cargo test -p mimageviewer --lib page_turn_animation_settings` | exit 0、2件成功。最終文言は非適用条件のみ説明し、既存loading/holdoverの変化を約束しない | `target/A-1341-a0-pref-snapshots-3.log` |
+| `cargo test -p mimageviewer --lib page_turn`（最終文言/素材復旧後、snapshot更新なし） | exit 0、75件成功 | `target/A-1341-a0-focused-final-3.log` |
+| `cargo test -p mimageviewer --test ui_snapshot` | exit 0、157件成功 | `target/A-1341-a0-ui-snapshot.log` |
+| `cargo test -p mimageviewer --lib`（指定どおり無filterは1回） | exit 101、12,035成功・55 ignored・6失敗。下記のfixture/golden/vendor環境を整備して対象を再検証 | `target/A-1341-a0-lib.log` |
+| `cargo test -p mimageviewer --lib app::tests::still_window_mode_key_tests` | exit 0、548件成功。root Key fixtureを使う入力/held/方向/F12を含む群 | `target/A-1341-a0-root-key-regression.log` |
+| `cargo test -p mimageviewer --lib effetune_host_handler_tests` | exit 0、3件成功。復旧したsource-compatible hostでheadless IPCを検査 | `target/A-1341-a0-host-regression.log` |
+| `cargo test -p mimageviewer --lib effetune_notice_texts` | exit 0、1件成功。復旧したv0.13.0とtracked notice一致 | `target/A-1341-a0-notice-regression.log` |
+| `cargo test -p mimageviewer --lib preferences_viewer_notice_visibility_snapshot`（更新後、UPDATEなし） | exit 0、1件成功 | `target/A-1341-a0-viewer-golden-check.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0 | `target/A-1341-a0-normal-check.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core --features portable` | exit 0 | `target/A-1341-a0-portable-check.log` |
+| `.\scripts\build-dev.ps1 -PreserveRuntime` | exit 0。通常profileのcore/remote/EPUB worker、VCRT/PE検査（runtime 4、PE 3）成功。起動なし | `target/A-1341-a0-build-dev.log`、`target/vcrt-pe-reports/dev-runtime.json` |
+
+新goldenは19枚（設定2枚、五時点×8routeのstrip 8枚、実mesh提出helperの単ページ/LTR・RTL見開きのpre/mid/end 9枚）。全19枚を目視し、向き・文字の非鏡像・透明部/underlay・gutter・設定数値欄を確認した。既存`preferences_viewer_notice_visibility.png`は、新設定でscroll contentが増えたscrollbar thumb終端の10 pixel差分だけを目視して更新した。8routeの終端は通常paint helperで別描画したcanonical PNGと完全一致する。実アプリを起動した検査や動きの受入れではない。初期の単ページreferenceのtriangle対角差、raw sourceをnormal finalと誤認した正例fixture/受理判定、同frameで複数操作を作った取消fixtureの失敗は修正後の焦点結果で解消した。raw sourceは受理側でnormal素材を作らず、通常producerを使うcold回帰を別に通した。
+
+無filterで出た6失敗の内訳は、backendと異なりpass開始後にKeyを足す既存root-input fixture 1件、上記scrollbar golden 1件、vendor環境4件（EffeTune v0.12.0と要求v0.13.0の不一致1件、古いhostのIPC Ready version不一致3件）。root-input helperはRawInputへの投入とrepeat用の事前keys_down設定へ直し、製品consumerのidentity条件を緩めていない。productionのnative/synthetic/IME/native overlay ingressはすべてRawInputまたはnative delivery batchに入ることを読み取り確認した。
+
+このworktreeのignored vendorは旧素材だった。master worktreeのv0.13.0を本基点の承認済みmanifestと全SHA256で検証し、host PEも本基点のCMake/include/src/testsから求めたsource identity `2899e71293f96a8ffe5852b1a991b0a6d6aabe67a9c7f61e5e6ca3cd13f52541`との一致を確認して実ファイルで復旧した。元のplugin/hostは`target/A1341-E12`、`target/A1341-VH-old`へ保存した。APPDATAやhost cacheから取り込まず、bridge source/protocolを変更していない。復旧後の全hash/identity照合はexit 0（`target/A-1341-a0-assets.log`）。6件は上表の対象群の再実行で解消し、未変更の経路の全体実行結果を再利用する。無filter全体がgreenだったと扱わず、指定に従い無filterを繰り返していない。
+
+**確認build handoff**: ビルド直前にこのworktreeのcoreが動いていないことを確認し、`-PreserveRuntime`で正常終了した。`target/dev-runtime/mimageviewer-core.exe`はportableではなく、既定で通常の`%APPDATA%\mimageviewer`を使う。実settings/dataを更新し得るため、利用者はインストール済み・tray常駐のmImageViewerを先に閉じてから、`Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`で起動する。実装者は起動していない。`target/A-1341-a0-msg.txt`に単ページ/見開きLTR・RTL、F12、取消、slideshowと仮時間の確認手順を記録した。コミットしていない。
+
+**未完了**: 出荷向け`test-full.ps1`、A0実装の独立完了レビュー、detached接続の具体的構造確認、別承認interactive、OFF/ON baseline・§9.1のwarm/追加profile実測、利用者による時間/動きの評価と最終時間採択は別gate。製品起動禁止の本handoffではbaseline/実機計測を行っていない。実装側の今後の結果はその時点の対象差分・command・exit/count・logとともに追記し、予定を実績にしない。

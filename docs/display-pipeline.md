@@ -5,6 +5,25 @@
 
 ---
 
+### 紙めくりpresentationのA0実装 (§1.341、2026-10-11、受入れ待ち)
+
+ページ間の紙めくりは`ui_fullscreen/page_turn.rs`のcontext単位presentationと、
+`page_turn_animation.rs`のcanonical unit projectionへ分離する。既存navigation target、
+ready判定、captureのfit/UV/occurrenceを正本にし、unit全体の通常prepare後にflat/curlを選ぶ。
+保持する旧画素は提出済みimmutable paint resourceで、別のdecode/upload/resample経路を作らない。
+共有weak lease inventoryはsource/outputのVRAM会計を担い、兄弟readerの状態を所有しない。
+ONはeguiの最終output hookで破棄passを除外して実occurrence/source/nativeの提示receiptを採用し、
+当該contextの次のpre-drawで既存ready observerへ届ける。配送時には元画像/通常final/passthroughの
+既存選択、unit/layout、items/input generationを照合する。OFFは従来の同pass通知を保つ。
+OFFは従来の瞬時切替、ONは単発手動/slideshowの即ready時を対象にする。連打・読込待ち・
+連結・媒体境界は通常切替を保つ。時間は評価用100〜600ms・既定200msで、最終採択は未了。
+
+この記録はA0差分の接続方針であり、実GPU提示・画質・速度・native lease・多窓受入れの証明ではない。
+実装の独立完了レビュー、実機とOFF/ON性能比較は未完了。
+正本は[page-turn-animation-plan.md](page-turn-animation-plan.md)、detached範囲は同rework plan §11。
+既存`analyze_perf.py page-turn --check`のI1〜I5は維持し、専用`page-turn-animation --check`で
+機会・開始/完走・skip率と可視提示/保持量を別集計する。合成ログの成功を製品性能受入れと扱わない。
+
 ### 音声セルの代表画像 (§1.347、2026-10-08)
 
 同名補助画像の採用は表示行の種類投影から独立している。画像種類を隠しても既存の候補順で

@@ -140,7 +140,7 @@ impl egui_wgpu::CallbackTrait for FullscreenPaintBatchLifetime {
     }
 }
 
-fn retain_owner_for_fullscreen_paint_batch<T>(painter: &egui::Painter, owner: Arc<T>)
+pub(crate) fn retain_owner_for_fullscreen_paint_batch<T>(painter: &egui::Painter, owner: Arc<T>)
 where
     T: Send + Sync + 'static,
 {
@@ -302,6 +302,15 @@ impl FullscreenPaintResource {
         match self {
             Self::Resampleable { source_id, .. } | Self::Lanczos { source_id, .. } => {
                 Some(*source_id)
+            }
+            Self::Direct { .. } => None,
+        }
+    }
+
+    pub(crate) fn source_generation(&self) -> Option<FullscreenPaintSourceGeneration> {
+        match self {
+            Self::Resampleable { generation, .. } | Self::Lanczos { generation, .. } => {
+                Some(*generation)
             }
             Self::Direct { .. } => None,
         }

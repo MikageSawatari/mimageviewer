@@ -17172,6 +17172,7 @@ mod phase_c_key_tests {
     #[cfg(windows)]
     fn root_right_edge(pressed: bool) -> crate::key_input::KeyEdge {
         crate::key_input::KeyEdge {
+            operation_id: crate::key_input::KeyOperationId::unassigned(),
             source_hwnd: 1,
             source_viewport: egui::ViewportId::ROOT,
             virtual_key: 0x27,
@@ -49423,6 +49424,7 @@ mod favorite_adjustment_defaults_tests {
         let _owner = app.keyboard_owner_for_pass(&ctx);
         crate::key_input::set_test_frame(vec![
             crate::key_input::KeyEdge {
+                operation_id: crate::key_input::KeyOperationId::unassigned(),
                 source_hwnd: 1,
                 source_viewport: egui::ViewportId::ROOT,
                 virtual_key: 0x28,
@@ -49435,6 +49437,7 @@ mod favorite_adjustment_defaults_tests {
                 alt: false,
             },
             crate::key_input::KeyEdge {
+                operation_id: crate::key_input::KeyOperationId::unassigned(),
                 source_hwnd: 1,
                 source_viewport: egui::ViewportId::ROOT,
                 virtual_key: 0x28,
@@ -65012,18 +65015,24 @@ mod still_window_mode_key_tests {
         repeat: bool,
         modifiers: egui::Modifiers,
     ) {
+        // Backend delivery enters RawInput before egui begins the pass. Seed
+        // the existing level for explicit-repeat fixtures; egui normalizes
+        // repeat from that level rather than trusting the event flag.
+        if repeat {
+            ctx.input_mut(|input| {
+                input.keys_down.insert(key);
+            });
+        }
         ctx.begin_pass(egui::RawInput {
             modifiers,
-            ..Default::default()
-        });
-        ctx.input_mut(|i| {
-            i.events.push(egui::Event::Key {
+            events: vec![egui::Event::Key {
                 key,
                 physical_key: None,
                 pressed: true,
                 repeat,
                 modifiers,
-            });
+            }],
+            ..Default::default()
         });
     }
 
@@ -96877,6 +96886,7 @@ fn fullscreen_test_key_edge(
     repeat: bool,
 ) -> crate::key_input::KeyEdge {
     crate::key_input::KeyEdge {
+        operation_id: crate::key_input::KeyOperationId::unassigned(),
         source_hwnd: 1,
         source_viewport: egui::ViewportId::ROOT,
         virtual_key,

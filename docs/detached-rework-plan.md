@@ -1455,6 +1455,28 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-11 §1.341 A0: context単位の紙めくりpresentationと共有会計（確認待ち）
+
+R3は利用者からACCEPTと伝達され`0f6ad9f19`へ統合済み。今回のA0未コミット差分は、
+`src/ui_fullscreen/page_turn.rs`のtyped `PageTurnPresentation`を既存`ViewerContextBundle`へ接続する。
+Inactive/Flat/Offered/Turningは当該contextの提出済みunitとimmutable paint resourceを所有し、
+operation factは配送先context/window/viewportとstable operation IDを保持する。
+通常swap/deposit/mount/pause/parkで兄弟のpresentationを取り消さず、forkはInactive、実際のclose/非表示/取消は
+対象ownerだけを退役させる。共有input_seqを操作identityや配送先の代用にしない。
+
+Appの`PageTurnLeaseInventory`はweak参照の共有VRAM会計一覧で、保持textureのownerではない。
+既存`vram_accounting`/`vram_budget`へsource/outputの保持量を接続し、parked/in-flightも会計する。
+共有予算は新しいeffectのadmissionだけを制約し、兄弟のnavigation・load/cache/workerを止めない。
+触れる範囲は`app.rs`、`app/viewer_context_registry.rs`、`app/vram_accounting.rs`、`vram_budget.rs`、
+`ui_fullscreen.rs`とその`page_turn`moduleのpresentation・入力・提出境界。
+新しいdetached述語、rect捕捉、HWND/viewport生成、placement/focus再生成、grace/debounceは追加しない。
+
+これは既存context所有へpresentationを追加し、会計をweak inventoryへ分離する構造的拡張という
+実装方針の記録であり、症状guardや待機による修正ではない。
+R3採択からA0具体的接続の独立構造合意・完了レビューを推定しない。
+複数窓の取消・park/mount・native batch lifetime/実解放、GPU/実present、性能/実用性の受入れは確認待ち。
+詳細と実績/未完了gateは[page-turn-animation-plan.md §12](page-turn-animation-plan.md#12-a0実装差分検証状況2026-10-11)。
+
 2026-10-10 §1.364 D2 本別見開き調整のcontext接続（独立確認・検証待ち）:
 以下は履歴。root操作のlive反映は2026-10-11 D2cの記録とspread-shift設計§11.6で撤回する。
 `src/app/spread_shift_owner.rs::ViewerSpreadShift`を`ViewerContextBundle`へ持たせ、

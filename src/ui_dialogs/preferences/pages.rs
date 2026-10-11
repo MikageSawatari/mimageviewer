@@ -10120,6 +10120,13 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     anchored(ui, state, "spread/final-cover", |ui, state| {
         draw_final_cover_spread_setting(ui, &mut state.settings.final_cover_spread_enabled);
     });
+    anchored(ui, state, "spread/page-turn-animation", |ui, state| {
+        draw_page_turn_animation_setting(
+            ui,
+            &mut state.settings.page_turn_animation_enabled,
+            &mut state.settings.page_turn_animation_duration_ms,
+        );
+    });
     anchored(ui, state, "spread/singleton-placement", |ui, state| {
         draw_singleton_spread_placement_setting(
             ui,
@@ -10461,6 +10468,73 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
 pub(super) fn draw_final_cover_spread_setting(ui: &mut egui::Ui, enabled: &mut bool) {
     ui.checkbox(enabled, "末尾に表紙を添える");
     ui.small("表紙あり見開きで末尾が単ページになる本に適用します。本ごとの設定が優先されます。");
+}
+
+pub(super) fn draw_page_turn_animation_setting(
+    ui: &mut egui::Ui,
+    enabled: &mut bool,
+    duration_ms: &mut u32,
+) {
+    ui.checkbox(enabled, "ページめくりアニメーション");
+    ui.small("単発のページ送りとスライドショーで紙をめくる効果。連打・読込待ち・連結読みには適用しません。");
+    ui.add_enabled_ui(*enabled, |ui| {
+        let row_width = ui.available_width();
+        ui.horizontal_wrapped(|ui| {
+            let label = ui.label("時間（仮）");
+            // A wrapped row reports its full width even after the label. Reserve
+            // the label, spacing, editable value and ms suffix explicitly.
+            ui.spacing_mut().slider_width =
+                (row_width - label.rect.width() - ui.spacing().item_spacing.x - 80.0)
+                    .clamp(40.0, 200.0);
+            ui.add(egui::Slider::new(duration_ms, 100..=600).suffix(" ms"));
+        });
+    });
+    ui.small("時間は動きを確認してから決定します。");
+}
+
+#[cfg(test)]
+mod page_turn_animation_settings_tests {
+    use super::*;
+
+    fn snapshot(name: &str, theme: crate::os_theme::ResolvedTheme, enabled: bool) {
+        let mut fonts_ready = false;
+        let mut enabled = enabled;
+        let mut duration_ms = 200;
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(320.0, 210.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, theme);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    draw_page_turn_animation_setting(ui, &mut enabled, &mut duration_ms);
+                });
+            });
+        harness.run();
+        harness.snapshot(name);
+    }
+
+    #[test]
+    fn page_turn_animation_settings_snapshot_light_on() {
+        snapshot(
+            "page_turn_animation_settings_light_on",
+            crate::os_theme::ResolvedTheme::Light,
+            true,
+        );
+    }
+
+    #[test]
+    fn page_turn_animation_settings_snapshot_dark_off() {
+        snapshot(
+            "page_turn_animation_settings_dark_off",
+            crate::os_theme::ResolvedTheme::Dark,
+            false,
+        );
+    }
 }
 
 enum ContextMenuLayoutEdit {
