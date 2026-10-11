@@ -683,7 +683,11 @@ pub(crate) fn migrate_page_paths_with_backup_at(
             source.revalidate()?;
             source.consume_in(&transaction, "book_compositions", &key)?;
             if backup_enabled {
-                mirrors.push((key, composition));
+                // replace_row_in assigns the local revision. Mirror that exact
+                // stored value, not the input carrying the previous revision.
+                let stored = row_in(&transaction, "book_compositions", &key)?
+                    .ok_or("renamed composition row disappeared")?;
+                mirrors.push((key, stored.composition));
             }
             changed += 1;
         }

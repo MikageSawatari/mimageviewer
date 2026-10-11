@@ -169,16 +169,21 @@ impl App {
     pub(crate) fn composition_editor_writes_pending(&self) -> bool {
         !self.composition_editor_operations.tickets.is_empty()
     }
-    /// A folder save owns its complete sidecar snapshot until receipt adoption.
+    /// Folder saves and migrations own their complete sidecar through adoption.
     /// Late tag completions may keep editing the cache, but a normal flush must
-    /// not publish its old root between the worker mirror and UI adoption.
-    pub(super) fn composition_editor_sidecar_flush_roots(&self) -> Vec<PathBuf> {
-        self.composition_editor_operations
+    /// not publish its old root between the worker mirror and UI adoption. All
+    /// flush producers, including another source's Checking reservation, consult
+    /// these same existing owners.
+    pub(super) fn composition_sidecar_flush_roots(&self) -> Vec<PathBuf> {
+        let mut roots: Vec<_> = self
+            .composition_editor_operations
             .tickets
             .iter()
             .filter(|ticket| ticket.owner.scope.level_prefix.is_empty())
             .map(|ticket| ticket.owner.scope.logical_root.clone())
-            .collect()
+            .collect();
+        roots.extend(self.rename_migration_sidecar_flush_roots());
+        roots
     }
     pub(crate) fn composition_editor_acquire_ready(&self) -> bool {
         !self.composition_editor_modal_active() && !self.composition_editor_writes_pending()
@@ -465,14 +470,36 @@ impl App {
         }
     }
     pub(super) fn defer_composition_editor_root_close(&mut self, ctx: &egui::Context) {
+        // The existing root-close barrier also covers a migration's mirrored
+        // folder cache. Retiring the App before adoption would drop dirty items.
+        let writes_pending = self.composition_editor_writes_pending()
+            || self
+                .rename_migration_sidecar_flush_roots()
+                .iter()
+                .any(|root| {
+                    self.sidecars
+                        .get(root)
+                        .is_some_and(|sidecar| sidecar.folder_composition().is_some())
+                        || self
+                            .book_composition_service
+                            .as_ref()
+                            .is_some_and(|service| {
+                                BookScopeKey::folder(root).is_ok_and(|scope| {
+                                    service
+                                        .snapshot()
+                                        .folder_roots
+                                        .contains_key(&scope.storage_key())
+                                })
+                            })
+                });
         if ctx.input(|input| input.viewport().close_requested()) {
             self.close_local_composition_editor(CompositionEditorCloseReason::Shutdown);
-            if self.composition_editor_writes_pending() {
+            if writes_pending {
                 self.composition_editor_operations.exit = EditorExitRequest::RootClose;
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             }
         }
-        if !self.composition_editor_writes_pending()
+        if !writes_pending
             && matches!(
                 self.composition_editor_operations.exit,
                 EditorExitRequest::RootClose

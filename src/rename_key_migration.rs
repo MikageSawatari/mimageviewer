@@ -52,18 +52,66 @@ pub(crate) struct PathMigrationMapping {
     pub(crate) tree: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PathMigrationStage {
+    Generic,
+    BookComposition { backup_enabled: bool },
+    Collection,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "PathMigrationJobWire", into = "PathMigrationJobWire")]
 pub(crate) struct PathMigrationJob {
-    /// The legacy path-keyed stores have not completed yet. Collection-only book moves start
-    /// with this false; normal Shell rename starts true.
-    pub(crate) generic_pending: bool,
+    pub(crate) stage: PathMigrationStage,
     pub(crate) mappings: Vec<PathMigrationMapping>,
+}
+
+/// Preserve the released journal representation for Generic and Collection.
+/// Only a book-page composition stage adds its captured backup policy.
+#[derive(Serialize, Deserialize)]
+struct PathMigrationJobWire {
+    generic_pending: bool,
+    mappings: Vec<PathMigrationMapping>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    book_composition_backup: Option<bool>,
+}
+
+impl TryFrom<PathMigrationJobWire> for PathMigrationJob {
+    type Error = String;
+
+    fn try_from(wire: PathMigrationJobWire) -> Result<Self, Self::Error> {
+        let stage = match (wire.generic_pending, wire.book_composition_backup) {
+            (true, None) => PathMigrationStage::Generic,
+            (false, None) => PathMigrationStage::Collection,
+            (false, Some(backup_enabled)) => PathMigrationStage::BookComposition { backup_enabled },
+            (true, Some(_)) => {
+                return Err("generic and book composition migration stages overlap".into());
+            }
+        };
+        Ok(Self {
+            stage,
+            mappings: wire.mappings,
+        })
+    }
+}
+
+impl From<PathMigrationJob> for PathMigrationJobWire {
+    fn from(job: PathMigrationJob) -> Self {
+        Self {
+            generic_pending: job.stage == PathMigrationStage::Generic,
+            mappings: job.mappings,
+            book_composition_backup: match job.stage {
+                PathMigrationStage::BookComposition { backup_enabled } => Some(backup_enabled),
+                PathMigrationStage::Generic | PathMigrationStage::Collection => None,
+            },
+        }
+    }
 }
 
 impl PathMigrationJob {
     pub(crate) fn shell_rename(old_path: PathBuf, new_path: PathBuf, tree: bool) -> Self {
         Self {
-            generic_pending: true,
+            stage: PathMigrationStage::Generic,
             mappings: vec![PathMigrationMapping {
                 old_path,
                 new_path,
@@ -74,13 +122,23 @@ impl PathMigrationJob {
 
     pub(crate) fn collection_only(mappings: Vec<PathMigrationMapping>) -> Option<Self> {
         (!mappings.is_empty()).then_some(Self {
-            generic_pending: false,
+            stage: PathMigrationStage::Collection,
+            mappings,
+        })
+    }
+
+    pub(crate) fn book_page_moves(
+        mappings: Vec<PathMigrationMapping>,
+        backup_enabled: bool,
+    ) -> Option<Self> {
+        (!mappings.is_empty()).then_some(Self {
+            stage: PathMigrationStage::BookComposition { backup_enabled },
             mappings,
         })
     }
 
     pub(crate) fn generic_pair(&self) -> Option<(&Path, &Path)> {
-        if !self.generic_pending || self.mappings.len() != 1 {
+        if self.stage != PathMigrationStage::Generic || self.mappings.len() != 1 {
             return None;
         }
         let mapping = &self.mappings[0];
@@ -211,6 +269,52 @@ pub struct RenameMigrationReport {
     /// per-store エラー (全ストア試行済み・best-effort 確定) と違い、ジャーナルに残して
     /// 次回起動で冪等に再実行する (Sol 角度⑤検収)。
     pub panicked: bool,
+}
+
+/// The existing migration worker owns a completed book filesystem mapping until
+/// its composition mirror and immutable service publication are both complete.
+pub(crate) fn run_book_page_composition_at(
+    data_dir: &Path,
+    mappings: &[PathMigrationMapping],
+    backup_enabled: bool,
+) -> RenameMigrationReport {
+    let mut report = RenameMigrationReport {
+        rows: 0,
+        errors: Vec::new(),
+        store_mutations: StoreMutationEffects::default(),
+        panicked: false,
+    };
+    let maintenance = match crate::book_composition::maintenance_at(data_dir) {
+        Ok(lease) => lease,
+        Err(error) => {
+            report
+                .errors
+                .push(format!("book_composition maintenance: {error}"));
+            return report;
+        }
+    };
+    let pages = mappings
+        .iter()
+        .map(|mapping| (mapping.old_path.clone(), mapping.new_path.clone()))
+        .collect::<Vec<_>>();
+    match crate::book_composition::store::migrate_page_paths_with_backup_at(
+        data_dir,
+        &pages,
+        backup_enabled,
+    ) {
+        Ok((rows, warnings)) => {
+            report.rows += rows;
+            report.store_mutations.book_composition_changed |= rows > 0;
+            report.errors.extend(warnings);
+        }
+        Err(error) => report
+            .errors
+            .push(format!("book_composition pages: {error}")),
+    }
+    // Lease release synchronously reloads and publishes the immutable roots.
+    // The App can adopt those Arcs before releasing the job's flush claim.
+    drop(maintenance);
+    report
 }
 
 /// worker が共通 [`STORES`] を直接更新した後、App-owned snapshot へ伝える失効情報。
@@ -4477,6 +4581,55 @@ mod tests {
             .unwrap();
         drop(writer);
         assert_eq!(journal_load(dir.path()).unwrap(), entries);
+    }
+
+    #[test]
+    fn journal_stages_preserve_old_wire_and_captured_book_backup_policy() {
+        for (wire, stage) in [
+            (
+                r#"{"generic_pending":true,"mappings":[{"old_path":"old","new_path":"new","tree":false}]}"#,
+                PathMigrationStage::Generic,
+            ),
+            (
+                r#"{"generic_pending":false,"mappings":[{"old_path":"old","new_path":"new","tree":false}]}"#,
+                PathMigrationStage::Collection,
+            ),
+        ] {
+            let job: PathMigrationJob = serde_json::from_str(wire).unwrap();
+            assert_eq!(job.stage, stage);
+            assert_eq!(serde_json::to_string(&job).unwrap(), wire);
+        }
+        for backup_enabled in [false, true] {
+            let job = PathMigrationJob::book_page_moves(
+                vec![PathMigrationMapping {
+                    old_path: "old".into(),
+                    new_path: "new".into(),
+                    tree: false,
+                }],
+                backup_enabled,
+            )
+            .unwrap();
+            let entries = vec![job];
+            let wire = serde_json::to_vec(&entries).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+            assert_eq!(value[0]["generic_pending"], false);
+            assert_eq!(value[0]["book_composition_backup"], backup_enabled);
+            assert_eq!(parse_journal_bytes(&wire).unwrap(), entries);
+        }
+        assert!(PathMigrationJob::book_page_moves(Vec::new(), true).is_none());
+    }
+
+    #[test]
+    fn journal_rejects_overlapping_generic_and_book_composition_stages_without_changing_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = br#"[{"generic_pending":true,"mappings":[{"old_path":"old","new_path":"new","tree":false}],"book_composition_backup":false}]"#;
+        let path = dir.path().join(JOURNAL_FILE);
+        std::fs::write(&path, bytes).unwrap();
+        assert!(matches!(
+            journal_load(dir.path()),
+            Err(JournalLoadError::Parse { .. })
+        ));
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
     }
 
     /// ジャーナルの往復と消し込み。壊れた記録は旧 bytes を保持する。

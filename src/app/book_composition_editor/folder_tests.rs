@@ -280,6 +280,157 @@ fn harvest_save(
     assert!(!f.app.composition_editor_writes_pending());
 }
 
+#[test]
+fn retired_folder_editor_save_excludes_old_snapshot_from_other_folder_checking_flush() {
+    let mut f = fixture();
+    let ctx = egui::Context::default();
+    let root = f.app.current_folder.clone().unwrap();
+    let service = f.service.clone();
+    let owner = f
+        .app
+        .build_window_context_for_test(720, |viewer| install_folder(viewer, &root, &service));
+    f.app
+        .with_viewer_context(owner, |viewer| start(viewer, &ctx))
+        .unwrap();
+    let (entered, release) = service.hold_worker_for_test();
+    entered.recv_timeout(WAIT).unwrap();
+    let edited = f
+        .app
+        .with_viewer_context(owner, |viewer| {
+            viewer.apply_editor_ui_action(
+                &ctx,
+                ui::EditorUiAction::SetHidden {
+                    page: 1,
+                    hidden: true,
+                },
+            );
+            let edited = draft(viewer);
+            viewer.save_local_composition_editor(&ctx, false);
+            edited
+        })
+        .unwrap();
+    assert!(f.app.composition_editor_writes_pending());
+    f.app
+        .retire_context(owner, "retire_folder_save_before_other_restore", |_| ())
+        .unwrap();
+    assert!(!f.app.composition_editor_modal_active());
+    assert!(f.app.composition_editor_writes_pending());
+    release.send(()).unwrap();
+    let completion = f.app.composition_editor_operations.tickets[0]
+        .receiver
+        .recv_timeout(WAIT)
+        .unwrap();
+    assert!(
+        completion.status.is_ok(),
+        "{:?}",
+        completion.status.as_ref().err()
+    );
+    let saved = f
+        .service
+        .prepare(f.scope.clone(), PageDomain::ImageFolder)
+        .recv_timeout(WAIT)
+        .unwrap()
+        .status
+        .unwrap()
+        .unwrap()
+        .composition;
+    assert_eq!(saved.units, edited.units);
+    assert_eq!(saved.hidden_pages, edited.hidden_pages);
+    let edited = saved;
+    // The worker has committed and mirrored, but the surviving ticket has not
+    // delivered its receipt. A later tag completion still owns the old root.
+    let mirrored = crate::sidecar::SidecarFile::load(&root);
+    assert_eq!(mirrored.folder_composition(), Some(&edited));
+    let before = std::fs::read(root.join(crate::sidecar::SIDECAR_FILENAME)).unwrap();
+    let cached = f.app.sidecars.get_mut(&root).unwrap();
+    assert!(cached.folder_composition().is_none());
+    cached.set_tags("c.png", ["late-after-owner-close"]);
+
+    let neighbor = f.app.tmp.path().join("checking-neighbor");
+    std::fs::create_dir(&neighbor).unwrap();
+    image::RgbaImage::new(8, 16)
+        .save(neighbor.join("neighbor.png"))
+        .unwrap();
+    let mut independent = crate::sidecar::SidecarFile::new(neighbor.clone());
+    independent.set_tags("neighbor.png", ["before-checking"]);
+    assert!(independent.flush_blocking());
+    independent.set_tags("neighbor.png", ["independent-checking"]);
+    f.app.sidecars.insert(neighbor.clone(), independent);
+    install_folder(&mut f.app, &neighbor, &service);
+    let (thumb_tx, _thumb_rx) = mpsc::channel();
+    let now = std::time::Instant::now();
+    let continuation = super::super::sidecar_restore::SidecarLoadContinuation {
+        navigation_after_hydration: None,
+        audio_art_prune: None,
+        first_display_action: super::super::sidecar_restore::FirstDisplayAction::None,
+        restore_intent: super::super::StartupListIntent::PreservePresentation,
+        auto_aspect_seed: None,
+        source_path: neighbor.clone(),
+        source_is_directory: true,
+        prepared_subfolder: None,
+        prepared_page_edits: None,
+        prepared_aggregate: None,
+        catalog_existing_keys: Default::default(),
+        video_items: Vec::new(),
+        sli_seq: 0,
+        sli_t0: now,
+        items_len: f.app.items.len(),
+        detached_physical: false,
+        tx: thumb_tx,
+        cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        restore_started_at: now,
+    };
+    assert!(f.app.begin_sidecar_restore(continuation, false).is_ok());
+    // Each step advances a distinct admitted owner: page index, quiescence,
+    // then the real Checking worker. No empty polling or elapsed-time guesses.
+    f.app.advance_sidecar_restore_worker_for_test();
+    f.app.advance_sidecar_restore_worker_for_test();
+    assert!(f.app.sidecar_restore_checking_for_test());
+    f.app.advance_sidecar_restore_worker_for_test();
+    assert!(f.app.composition_editor_writes_pending());
+    assert_eq!(
+        std::fs::read(root.join(crate::sidecar::SIDECAR_FILENAME)).unwrap(),
+        before,
+        "Checking must not republish the saved folder's old cached root"
+    );
+    assert_eq!(
+        crate::sidecar::SidecarFile::load(&neighbor).items()["neighbor.png"]
+            .tags
+            .as_ref()
+            .unwrap(),
+        &["#independent-checking"],
+        "Checking must continue flushing unrelated folders"
+    );
+    let cached = &f.app.sidecars[&root];
+    assert!(cached.is_dirty());
+    assert!(cached.folder_composition().is_none());
+    assert_eq!(
+        cached.items()["c.png"].tags.as_ref().unwrap(),
+        &["#late-after-owner-close"]
+    );
+    f.app.resolve_sidecar_restore_for_exit();
+    let (tx, rx) = mpsc::channel();
+    tx.send(completion).unwrap();
+    f.app.composition_editor_operations.tickets[0].receiver = rx;
+    f.app.poll_composition_editor_operations(&ctx);
+    f.app.poll_book_composition_service_for_test(&ctx);
+    assert!(!f.app.composition_editor_writes_pending());
+    assert!(!f.app.composition_editor_modal_active());
+    assert!(f.app.sidecars[&root].is_dirty());
+    f.app.flush_all_sidecars();
+    crate::sidecar::wait_for_pending_writes();
+    let after = crate::sidecar::SidecarFile::load(&root);
+    assert_eq!(after.folder_composition(), Some(&edited));
+    assert_eq!(
+        after.items()["a.png"].tags.as_ref().unwrap(),
+        &["#preserved"]
+    );
+    assert_eq!(
+        after.items()["c.png"].tags.as_ref().unwrap(),
+        &["#late-after-owner-close"]
+    );
+}
+
 fn harness(f: FolderFixture) -> (Rc<RefCell<FolderFixture>>, egui_kittest::Harness<'static>) {
     let f = Rc::new(RefCell::new(f));
     let render = f.clone();

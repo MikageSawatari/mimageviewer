@@ -18,6 +18,9 @@ Eのframe-local wheel ownerを使う。保存完了ownerは各窓のreloadと共
 G4Fの画像folder adapterは既存分類・列挙と共通projectionを接続し、folder専用sourceをworkerで準備する。
 sidecar不足行restoreは既存import ownerの独立familyへ載せ、同contextのsource restore終端後に投影する。
 editorはG4のmodal/save ticketを再利用し、同folderの既存flushをworkerで終えてからDB保存・ミラーする。
+同folderの書込権は送信済save ticket/既存migration ownerがキャッシュroot採用まで保持する。
+通常/定期flushと別folderのChecking予約は同じowner集合を使い、窓の退役で書込権を解放しない。
+製本page移動も既存migration queueの構成移行→Arc採用→collection更新へ通す。
 §1.242はnext-bookで開発中、利用者決定の次々回release向け。G5は別stage。
 明示targetは番号の採用前にidentityを捕捉し、表示候補だけをcontext所有の非同期permission ownerへ渡す。
 列挙待ちの再開要求はsource完了境界が所有し、完了後の構成待ちだけ提示許可ownerへ移す。

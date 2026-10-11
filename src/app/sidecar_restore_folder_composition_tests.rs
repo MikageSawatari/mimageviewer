@@ -116,7 +116,7 @@ fn ready<T>(receiver: &mut Receiver<T>) {
 
 /// Await the exact current worker, then let the production coordinator consume it once.
 /// The native thread handle wait supplies the Checking owner's join-finished proof.
-fn advance_source_step(app: &mut App) {
+pub(super) fn advance_source_step(app: &mut App) {
     let mut state = app.sidecar_restore.take().expect("source continuation");
     match &mut state.phase {
         Phase::PreparingPageIndex(preparing) => ready(&mut preparing.rx),

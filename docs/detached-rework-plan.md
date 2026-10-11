@@ -4713,6 +4713,11 @@ parked兄弟のasync routerは別contextのmain restoreを待たず、それぞ�
 保存時は同folderの既存sidecar予約をG4のsave ticketへ載せ、workerのFIFO完了後にDB保存/ミラーし、
 正確な予約ownerの完了を回収する。兄弟のdirty itemsや異なるsnapshotを消去しない。
 
+G4F REVISEでは、所有contextを閉じた後も残るApp共通save ticketを、別folderのChecking
+workerがflushを予約する境界にも適用する。ticketを退役contextへ戻さず、旧rootのdisk上書きを
+予約時に防ぐ。個別page改名/製本page移動の既存migration ownerも、ミラー完了からキャッシュroot採用まで
+同folderの書込権を保持する。dirty tags/他folderのflushを維持し、viewport/sessionの状態は増やさない。
+
 この変更はBA-7のsource/保存/復元の所有境界を再利用するfolder adapterであり、detached専用
 bool/例外phase、HWND/focus/placement/viewport、時間窓や再試行は追加しない。
 同folder兄弟の保存完了順、restore中のparked採用、初回fullscreenまでのcontinuationを

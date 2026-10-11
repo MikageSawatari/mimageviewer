@@ -197,6 +197,8 @@ pub enum BookBookmarkEvent {
 }
 
 enum BookBookmarkRequest {
+    #[cfg(test)]
+    Fence(mpsc::Sender<()>),
     Add(u64, NewBookBookmark),
     Remove(u64, i64),
     RemoveInContainer(u64, i64, PathBuf),
@@ -232,6 +234,11 @@ impl BookBookmarkService {
                         // UI は通常の event 経路で失敗を表示し、読み込み spinner も解除できる。
                         while let Ok(request) = request_rx.recv() {
                             let event = match request {
+                                #[cfg(test)]
+                                BookBookmarkRequest::Fence(reply) => {
+                                    let _ = reply.send(());
+                                    continue;
+                                }
                                 BookBookmarkRequest::Add(request_id, _) => {
                                     BookBookmarkEvent::Added {
                                         request_id,
@@ -306,6 +313,11 @@ impl BookBookmarkService {
                 db.recover_path_migration_journal();
                 while let Ok(request) = request_rx.recv() {
                     let event = match request {
+                        #[cfg(test)]
+                        BookBookmarkRequest::Fence(reply) => {
+                            let _ = reply.send(());
+                            continue;
+                        }
                         BookBookmarkRequest::Add(request_id, entry) => BookBookmarkEvent::Added {
                             request_id,
                             result: db.add(&entry).map_err(|err| err.to_string()),
@@ -487,6 +499,17 @@ impl BookBookmarkService {
 
     pub fn try_recv(&self) -> Result<BookBookmarkEvent, mpsc::TryRecvError> {
         self.rx.try_recv()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fence_for_test(&self) -> mpsc::Receiver<()> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .as_ref()
+            .unwrap()
+            .send(BookBookmarkRequest::Fence(tx))
+            .unwrap();
+        rx
     }
 }
 

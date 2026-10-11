@@ -8,6 +8,10 @@ use crate::book_composition::{
 use crate::book_scope::BookScopeKey;
 use std::sync::{Arc, mpsc};
 
+#[cfg(test)]
+#[path = "book_composition_folder_migration_tests.rs"]
+mod folder_migration_tests;
+
 #[derive(Clone, Debug, Default)]
 pub(crate) enum BookCompositionSource {
     #[default]
@@ -239,6 +243,37 @@ impl PartialEq for ViewerBookComposition {
 }
 
 impl App {
+    /// Worker-published roots are the cache adoption boundary for both editor
+    /// saves and path migrations. This performs no I/O and preserves dirty items.
+    pub(super) fn adopt_mirrored_folder_composition_roots(&mut self, roots: &[std::path::PathBuf]) {
+        let Some(service) = &self.book_composition_service else {
+            return;
+        };
+        let snapshot = service.snapshot();
+        if snapshot.status.is_err() {
+            return;
+        }
+        for (folder, sidecar) in &mut self.sidecars {
+            if !roots
+                .iter()
+                .any(|root| crate::folder_tree::path_eq(folder, root))
+            {
+                continue;
+            }
+            let Ok(scope) = BookScopeKey::folder(folder) else {
+                continue;
+            };
+            let key = scope.storage_key();
+            let root = match snapshot.rows.get(&key) {
+                Some(row) if row.domain == PageDomain::ImageFolder => {
+                    snapshot.folder_roots.get(&key).cloned()
+                }
+                Some(_) => continue,
+                None => None,
+            };
+            sidecar.adopt_mirrored_folder_composition_arc(root);
+        }
+    }
     pub(crate) fn composition_hides_snapshot_target(
         &self,
         target: &crate::snapshot::SnapshotTarget,
@@ -735,28 +770,16 @@ impl App {
         }
         let changed = service.drain_changed_scope_keys();
         if self.settings.sidecar_backup_enabled && !changed.is_empty() {
-            let snapshot = service.snapshot();
-            if snapshot.status.is_ok() {
-                for (folder, sidecar) in &mut self.sidecars {
-                    let Ok(scope) = BookScopeKey::folder(folder) else {
-                        continue;
-                    };
-                    if !changed.contains(&scope.storage_key()) {
-                        continue;
-                    }
-                    let root = match snapshot.rows.get(&scope.storage_key()) {
-                        Some(row) if row.domain == PageDomain::ImageFolder => {
-                            snapshot.folder_roots.get(&scope.storage_key()).cloned()
-                        }
-                        Some(_) => continue,
-                        None => None,
-                    };
-                    // DB/mirror completion precedes this publication. Keep the
-                    // process-wide page writer's cached root in that same snapshot
-                    // without creating a second writer or consuming item dirtiness.
-                    sidecar.adopt_mirrored_folder_composition_arc(root);
-                }
-            }
+            let roots: Vec<_> = self
+                .sidecars
+                .keys()
+                .filter(|folder| {
+                    BookScopeKey::folder(folder)
+                        .is_ok_and(|scope| changed.contains(&scope.storage_key()))
+                })
+                .cloned()
+                .collect();
+            self.adopt_mirrored_folder_composition_roots(&roots);
         }
         // Read-only visits never invalidate a sibling. G3 attaches Book reload to this exact set.
         #[cfg(windows)]

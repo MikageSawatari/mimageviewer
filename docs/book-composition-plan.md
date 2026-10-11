@@ -1731,9 +1731,31 @@ identityが予約/完了/失効を所有し、構成専用writerやroot dirty fl
 完了させてからDB保存/ミラーを行う。終了時も同じwriterを使う。タグだけのwriteは既存rootを
 保持し、構成DB値を取得して差し替えない。UIはworkerが公開したroot Arcを採用するだけで、
 sidecar read/write/hashや大きなrootのcloneを行わない。
-保存票があるfolderの通常/定期flushは、その票の完了採用まで同ownerへ委ねる。
+保存票があるfolderの通常/定期flushと、別folderを開くChecking workerのflush予約は、
+その票の完了採用まで同ownerへ委ねる。所有viewerを閉じてもApp共通の送信済票は残り、
+旧snapshotをCheckingへ予約しない。予約後のArc照合だけでdisk上書きを防ごうとしない。
+個別page改名は既存migration ownerがworkerへ渡したbackup設定を保持し、同folderの
+書込権をミラーからUIキャッシュ採用まで持つ。workerのmaintenance解除によるroot Arc公開を
+完了応答が証明し、応答の消費内でdirty itemsを維持したままrootを採用してから書込権を返す。
+通常service pollの順序へ採用を委ねない。backup OFFの改名ではタグだけのbackup rootを維持する。
+改名ミラーはtransactionが割り当てた現revisionを含む保存値を使用し、DB/ミラー/公開Arcを一致させる。
 遅いtag完了はcacheのitemsを変更できるが、workerの新rootを旧snapshotで上書きしない。
 採用後はdirty itemsを維持して新rootと共に既存writerへ送る。他folderのflushは続ける。
+列切替でキャッシュを退役する入口も書込ownerのsnapshotを保持し、既存root-close barrierは
+構成ミラー中のmigrationを同じ完了境界まで待つ。構成を持たない従来改名はこの終了待ちの対象外。
+
+同型の製本page並べ替え/移動も既存migration queueの型付き段階
+`BookComposition → Collection`へ載せる。既存の個別改名は`Generic → Collection`を維持する。
+構成移行を直接fire-and-forgetしてからcollection-onlyへ進めない。backup設定は受付時に捕捉し、
+queued/in-flightとも同じ書込権を持つ。既存journalのGeneric/Collection JSONは変更せず、
+新しい構成段階だけoptionalなbackup設定を記録する。既存journalの変換/再作成は行わない。
+runtimeの段階は排他的enumであり、二つのpending flagへ分散しない。
+
+G4F REVISEの完了順fixtureは「保存受付→所有detached contextを閉じる→実workerのミラー完了→
+別folderのChecking」と「dirty tags→個別page改名/製本page移動の実worker完了→採用前flush→応答採用」を固定する。
+経過時間のsleep/retryで順序を作らず、既存worker/channelの完了を待つ。書込claim専用ownerや
+root dirty flagは追加しない。全体openを新たにmodal化するより、既存save ticket/migration ownerの
+書込権を全予約入口へ揃える方が、他folderの閲覧/flushを維持したまま状態の組合せを減らせる。
 
 自動restoreは既存sidecar import ownerの独立composition familyへ載せる。strict tokenの
 SHA-256/metadata照合とfull-snapshot PendingWriter照合を再利用し、root witnessと実disk markerを

@@ -1456,8 +1456,17 @@ impl App {
     }
 
     fn sidecar_restore_start_checking(&mut self, state: &mut SidecarRestoreState) -> Phase {
-        let (reservations, batch) =
-            crate::sidecar::prepare_worker_flush_in_place(self.sidecars.values());
+        // A reservation is a future disk write, just like a normal flush. Save
+        // tickets and migration owners retain that right until cache adoption,
+        // including when their original viewer has already been closed.
+        let owned = self.composition_sidecar_flush_roots();
+        let (reservations, batch) = crate::sidecar::prepare_worker_flush_in_place(
+            self.sidecars.values().filter(|sidecar| {
+                !owned
+                    .iter()
+                    .any(|root| crate::folder_tree::path_eq(sidecar.folder(), root))
+            }),
+        );
         let (tx, rx) = mpsc::channel();
         let folder = state.common.folder.clone();
         let data_dir = state.common.data_dir.clone();
@@ -1509,6 +1518,18 @@ impl App {
                 terminal: None,
             }),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn advance_sidecar_restore_worker_for_test(&mut self) {
+        folder_composition_tests::advance_source_step(self);
+    }
+
+    #[cfg(test)]
+    pub(super) fn sidecar_restore_checking_for_test(&self) -> bool {
+        self.sidecar_restore
+            .as_ref()
+            .is_some_and(|state| matches!(state.phase, Phase::Checking(_)))
     }
 
     fn sidecar_restore_start_running(

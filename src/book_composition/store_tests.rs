@@ -1412,6 +1412,10 @@ fn assert_folder_page_filesystem_migration(backup_enabled: bool) {
     );
     if backup_enabled {
         let root = loaded.folder_composition().unwrap();
+        assert_eq!(
+            root, &renamed_record.composition,
+            "mirror uses the committed local revision"
+        );
         assert_eq!(root.cover, Some(page("Renamed.JPG")));
         assert_eq!(root.hidden_pages, [page("Renamed.JPG")]);
     } else {

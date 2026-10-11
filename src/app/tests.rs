@@ -40442,7 +40442,10 @@ mod favorite_adjustment_defaults_tests {
         ); // Simulate a completion already admitted before failure detection.
         app.invalidate_rename_migrations_for_removed_paths(std::slice::from_ref(&new));
         assert_eq!(app.rename_migration_queue.len(), 1);
-        assert!(app.rename_migration_queue[0].generic_pending);
+        assert!(matches!(
+            app.rename_migration_queue[0].stage,
+            crate::rename_key_migration::PathMigrationStage::Generic
+        ));
         assert!(app.rename_migration_in_flight.is_none());
 
         app.start_rename_item_after_confirmation(
@@ -40741,6 +40744,7 @@ mod favorite_adjustment_defaults_tests {
         );
         let (_in_flight_tx, in_flight_rx) = std::sync::mpsc::channel();
         app.rename_migration_in_flight = Some(RenameMigrationInFlight::Generic {
+            folder_backup_enabled: false,
             job: in_flight.clone(),
             rx: in_flight_rx,
         });
@@ -40780,7 +40784,10 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(saved.len(), 3);
         assert_eq!(saved[0], in_flight);
         assert_eq!(saved[1].mappings, queued.mappings);
-        assert!(!saved[1].generic_pending);
+        assert!(!matches!(
+            saved[1].stage,
+            crate::rename_key_migration::PathMigrationStage::Generic
+        ));
         assert_eq!(saved[2], boot_retry);
         assert!(app.rename_migration_journal_allows_start());
         assert!(matches!(
@@ -41025,7 +41032,10 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(app.rename_migration_queue.len(), 2);
         assert_eq!(app.rename_migration_queue[0], old);
         assert_eq!(app.rename_migration_queue[1].mappings, late.mappings);
-        assert!(!app.rename_migration_queue[1].generic_pending);
+        assert!(!matches!(
+            app.rename_migration_queue[1].stage,
+            crate::rename_key_migration::PathMigrationStage::Generic
+        ));
         app.flush_rename_migration_journal().unwrap();
         assert_eq!(
             crate::rename_key_migration::journal_load(&data_dir).unwrap(),
@@ -41085,6 +41095,7 @@ mod favorite_adjustment_defaults_tests {
         );
         let (tx, rx) = std::sync::mpsc::channel();
         app.rename_migration_in_flight = Some(RenameMigrationInFlight::Generic {
+            folder_backup_enabled: false,
             job: job.clone(),
             rx,
         });
@@ -41225,9 +41236,15 @@ mod favorite_adjustment_defaults_tests {
         tx.send(Ok(result)).unwrap();
 
         app.poll_book_op_pending(&ctx);
-        assert!(!app.rename_migration_queue[0].generic_pending);
+        assert!(!matches!(
+            app.rename_migration_queue[0].stage,
+            crate::rename_key_migration::PathMigrationStage::Generic
+        ));
         app.flush_rename_migration_journal().unwrap();
-        assert!(!crate::rename_key_migration::journal_load(&data_dir).unwrap()[0].generic_pending);
+        assert!(!matches!(
+            crate::rename_key_migration::journal_load(&data_dir).unwrap()[0].stage,
+            crate::rename_key_migration::PathMigrationStage::Generic
+        ));
     }
 
     #[test]
@@ -74562,6 +74579,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             false,
         );
         app.rename_migration_in_flight = Some(RenameMigrationInFlight::Generic {
+            folder_backup_enabled: false,
             job: in_flight.clone(),
             rx,
         });
@@ -74702,7 +74720,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             .cloned()
             .collect::<Vec<_>>();
         assert_eq!(retained.len(), 2);
-        assert!(!retained[0].generic_pending);
+        assert!(!matches!(
+            retained[0].stage,
+            crate::rename_key_migration::PathMigrationStage::Generic
+        ));
         assert_eq!(retained[0].mappings[0].old_path, a);
         assert_eq!(retained[0].mappings[0].new_path, b);
         assert_eq!(retained[1], keep_job);
@@ -74730,6 +74751,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         let (tx, rx) = std::sync::mpsc::channel();
         app.rename_migration_in_flight = Some(RenameMigrationInFlight::Generic {
+            folder_backup_enabled: false,
             job: crate::rename_key_migration::PathMigrationJob::shell_rename(
                 std::path::PathBuf::from(r"D:\pics\a.jpg"),
                 std::path::PathBuf::from(r"D:\pics\b.jpg"),
@@ -74772,6 +74794,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         let (tx, rx) = std::sync::mpsc::channel();
         app.rename_migration_in_flight = Some(RenameMigrationInFlight::Generic {
+            folder_backup_enabled: false,
             job: crate::rename_key_migration::PathMigrationJob::shell_rename(
                 std::path::PathBuf::from(r"D:\pics\a.jpg"),
                 std::path::PathBuf::from(r"D:\pics\b.jpg"),
@@ -74843,6 +74866,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         let (tx, rx) = std::sync::mpsc::channel();
         app.rename_migration_in_flight = Some(RenameMigrationInFlight::Generic {
+            folder_backup_enabled: false,
             job: crate::rename_key_migration::PathMigrationJob::shell_rename(
                 std::path::PathBuf::from(r"D:\pics\a.jpg"),
                 std::path::PathBuf::from(r"D:\pics\b.jpg"),
@@ -74887,6 +74911,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             false,
         );
         app.rename_migration_in_flight = Some(RenameMigrationInFlight::Generic {
+            folder_backup_enabled: false,
             job: panic_job.clone(),
             rx,
         });

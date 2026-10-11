@@ -833,3 +833,8 @@ core check / settings_restore / ui_snapshot / glyph の成功を再利用した�
 ログは`target/G-1242-g4f-focused-settings_transfer.log`。metadata転送の焦点試験は105件成功
 （`target/G-1242-g4f-focused-metadata_transfer.log`）。他のgateの実数は
 `target/G-1242-g4f-msg.txt`に記録し、独立レビュー/実機確認の証拠とは扱わない。
+
+G4F REVISEの保存/改名owner修正後もsettings転送は24件、metadata転送は105件成功（exit 0）。
+分類assertionは全457 / 対象144 / 除外313、wireキー142を維持する。今回の実行ログは
+`target/G-1242-g4f-fix-focused-settings_transfer.log`と
+`target/G-1242-g4f-fix-focused-metadata_transfer.log`。旧実装時のログとは区別する。

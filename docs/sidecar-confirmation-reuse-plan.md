@@ -59,6 +59,11 @@ token／family／marker の不一致、missing、pending／failed writer、読�
 
 ## 7. 再レビュー S2 修正（2026-09-21）
 
+§1.242 G4F（2026-10-12）のfolder構成ミラーでは、Checking workerへ渡すflush予約も
+App共通save ticket/既存migration ownerの書込権を尊重する。同ownerがroot採用前のfolderを
+予約から除外し、別folderのflushとglobal writer idle確認は維持する。旧snapshotのdisk上書きは
+予約時に防ぎ、完了時のArc照合に依存しない。所有viewerを閉じた後の別folder openも同じ境界を使う。
+
 raw folder path 完全一致を proof hit 条件へ追加し、alias は strict probe へ戻すことで
 `App.sidecars` の owner key を要求 path に統一した。hit/miss の worker 判定と App の exact request
 採用・proof publish は別 perf event とし、遅着 hit を採用として記録しない。cache は正規化 folder slot の
