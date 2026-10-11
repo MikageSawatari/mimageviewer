@@ -1,7 +1,7 @@
 # PDF render epoch の viewer-context 所有 — 独立修正ステージ設計案
 
 作成: 2026-10-12。調査基点: `next-effetune` / `78e5f09ad`（Everything Stage 1 設計のコミット）。
-状態: **設計のみ、独立レビュー未実施、実装 ready 未判定**。利用者が別途レビューを依頼する。本工程では製品コード、.git、build、launch、download を変更・実行しない。
+状態: **設計のみ、独立レビュー REVISE の P2 を改訂、再確認待ち**。利用者提示の独立レビュー対象は `efe965453`。Everything 計画は ACCEPT、本計画は優先昇格の scope 不足一件で REVISE。本工程では製品コード、.git、build、launch、download を変更・実行しない。
 
 ## 1. 独立した目的と問題の根拠
 
@@ -16,6 +16,7 @@ Everything 設計 [§7.2](everything-search-plan.md#72-f12) の P1 を、Everyth
 3. 通常／priority／idle upgrade thumbnail は、各 viewer から同じ global 値を焼き付ける (`app.rs:51643 / :52153 / :52789`)。
 4. detached PDF の静止画シークも `ui_fullscreen.rs:22367` → `ensure_still_seek_thumbnail_requests` → `enqueue_priority_thumbnail` を使う。fullscreen 本体 render の epoch=0 (`app.rs:73304`) だけではシーク thumbnail を保護できない。
 5. PDF Interrupted は thumbnail owner の Canceled 終端となり、requested の解除／Evicted 化へ入る。したがってこれは無駄な計算だけの問題ではなく、別 viewer の要求を取り消す所有違反である。
+6. 独立レビュー P2: `pdf_loader.rs:3811 / :3826` の priority promotion は `perf_key`（path/page）だけで match／found を判定し、`app.rs:52518` 等は `not_found_keys` で再試行を終える。B の同 key が先にあると、pool に未到着の A を found と誤認し、B の priority を変更して A の遅着 Normal job の昇格を逃せる。失効だけでなく昇格／found の判定も同じ owner と要求世代へ限定する必要がある。
 
 参考正本: AGENTS.md、CLAUDE.md（必読・簡素化・まれな失敗・PDF pool・応答性）、docs/README.md、architecture-overview、async-architecture §3.4、ui-responsiveness、display-pipeline、virtual-folders、thumbnail-request-lifecycle-plan、[旧 PDF epoch 計画](pdf-pool-context-epoch-plan.md)、detached-rework-plan §2。旧計画の global 整数と epoch=0 の記録は履歴として残し、本設計が何を置き換えるか明記する。
 
@@ -29,11 +30,11 @@ process 全体の世代比較、path ごとの失効、window ID ごとの失効
 
 - global render epoch API の置換と全 producer／consumer の移行。
 - 通常 thumbnail、priority／seek／hover、upgrade、色分類要求、pin／EPUB／RAW の派生要求で ticket を保持。
-- pool queued prune／pop、既存 request cancel と completion の整合。
+- pool queued prune／pop、owner／要求世代に限定した priority promotion と found 統計、既存 request cancel と completion の整合。
 - registry fresh／build／swap／park／fork／promote／retire／drop の owner 移譲。
 - 同じ PDF を main と detached が読む自動回帰、UI の失効処理費用、関連 docs の更新。
 
-対象外: Everything 実装、§1.372 の Search idx-only Undo 一般修正、PDFium／DLL／wire protocol 更新、enumerate の別世代、catchup の global epoch 改修、pool lane cap／open admission／priority の変更、Remote API、cache schema、fullscreen 本体の取消方式。調査で別の所有違反が判明した場合は記録し、本ステージに必要かを設計担当へ返す。
+対象外: Everything 実装、§1.372 の Search idx-only Undo 一般修正、PDFium／DLL／wire protocol 更新、enumerate の別世代、catchup の global epoch 改修、pool lane cap／open admission／priority 方針の変更、Remote API、cache schema、fullscreen 本体の取消方式。promotion の照合対象限定は本 scope に含め、lane/cap の方針は変えない。調査で別の所有違反が判明した場合は記録し、本ステージに必要かを設計担当へ返す。
 
 ## 3. 型と唯一の変更権限
 
@@ -91,6 +92,15 @@ Owner の Drop は自身の state を retire する。ticket の Drop は参照�
 
 共通 UI enqueue helper は input_seq／items_gen／request ID と render ticket を装着し、通常／priority／upgrade が同じ契約を使う。UI-bound request が Unscoped のまま pool へ流れることを handler-level test で検出する。pure builder の Default は Unscoped でよいが、それを UI の最終 admission の代わりにはしない。
 
+priority promotion の producer／consumer は次も含める（本体契約は §5.4）:
+
+| 現行箇所／経路 | 昇格 target／移行 |
+| --- | --- |
+| `app.rs:51489` 前面ページ要求、`:51550` still-seek、`:52518` grid visible | `Viewer(projected owner.snapshot())` と既存 key 集合。enqueue した要求と同じ owner／要求世代。detached seek でも main の ticket を使わない |
+| `app.rs:18182–18188` `last_promoted_visible_keys` / `promote_retry_pending` | 既存追跡値を対象 ticket を含む型付き state へ置換し、bundle と swap/park/retire。owner／世代変更では同じ key でも再評価する。第二の追跡 map／bool を追加しない |
+| `app.rs:81038 / :81060` fullscreen current display promotion | 明示 `Unscoped` target。既存 `FullscreenPdfPromotionState` は bundle-owned のまま。Viewer thumbnail の job を found／昇格対象にしない |
+| `pdf_loader.rs:1220 / :1237 / :3777` promotion API／queue matching／`PromoteStats` | 共通 selector が target＋key を検査。HighNormal の再配置、Normal の lane 移動、found／already_high の集計すべてへ同じ selector を適用 |
+
 ### 4.3 Unscoped の維持と追加の確認点
 
 | 経路 | 初版の扱い |
@@ -133,6 +143,28 @@ Queued stale の Interrupted は既存 PDF 限定の Canceled thumbnail terminal
 
 in-flight の `AbortOnCancel / HarvestOnCancel`、cache-savable result の保存、SourcePixels／Finalized 両終端を維持する。epoch stale だけを理由に harvest 保存を禁止しない。届いた画像の UI 採用は既存 ID／generation／keep checks が担当し、render ticket を新しい画像 owner に置き換えない。cache key／mtime/size／EPUB generation lease は source の契約であり、この owner identity を cache key に追加しない。同一 source cache を読む兄弟の再生成や purge を誘発しない。
 
+### 5.4 priority promotion の owner／要求世代照合（独立レビュー P2 改訂）
+
+promotion API に target を明示し、**`target + 既存 perf_key 集合`**を一つの照合入力にする。target は `Viewer(ticket) | Unscoped`（`PdfRenderValidity` と同じ区別を使える）。既存の `PromoteScope::{GridVisible, FullscreenCurrent}` は eligible lane／Critical の found 方針を所有し、owner target の代わりにはしない。
+
+Viewer 向け match は次をすべて満たす job だけ:
+
+1. target／job ともに Viewer ticket を持つ。
+2. ticket state は `Arc::ptr_eq` で同じ owner、snapshot generation が同じであり、その世代が current（retired/stale でない）。
+3. job の既存 `perf_key` が要求 key 集合に含まれる。
+
+この predicate を、Normal→HighNormal の priority 書換え、既存 HighNormal の「現対象」としての再配置、`found_keys`／`already_high` の集計すべてで共用する。兄弟、同 owner の旧世代、Unscoped は key が同じでも数えず、priority／lane を変更しない。対象外 HighNormal jobs は従来の非対象群として相対順を保つ。対象 jobs の既存「current→promoted→non-target」再配置による共有 lane 上の位置変化は維持し、全 job の絶対位置を不変にする方針変更はしない。
+
+`not_found_keys` は **要求 key 集合のうち、その target に一致する eligible queued job がなかった distinct key 数**。B／旧世代だけが存在すると 1 のままであり、A の再試行を終えない。`promoted`／`already_high` は従来どおり一致する job の件数、found は distinct key 数。GridVisible は HighNormal/Normal を対象とし、Critical を found と数えない。in-flight／completed を found と数えない規則も維持する。pool 未初期化では target を問わず全 key を not_found とし、pool を起動しない。
+
+caller の既存 `last_promoted_visible_keys`／`promote_retry_pending` は `Idle | Tracking { ticket, keys, retry_needed }` の一つの typed state に置換する案とする。これは既存追跡の owner/snapshot を明確にする置換であり、追加の pending／retry bool 群ではない。通常/前面/seek の三 producer は同じ context-local state を使う。dedup は **owner＋要求世代＋key 集合**を比較し、同じ key でも owner.advance 後は新対象として再評価する。旧 stats を新対象の retry 判定へ持ち越さない。state は App 投影／bundle とともに swap/park/promote/retire、fork 先は Idle で始め、進行中昇格追跡を Clone しない。現行追跡値が App field のみであるため、bundle 全 field 分類へこの置換 field を追加する。
+
+遅着 A は既存の `not_found_keys > 0` による再評価で昇格する。新しい timer／retry loop／promotion pending map／完了 ACK を追加しない。これは通常の enqueue 順序を扱う既存 retry で、まれな失敗の回復機構ではない。検索結果交換／retire で target が替われば旧 tracking を終了し、new enqueue の ticket をその時点で取得する。pool 内の job ticket を fresh 化してはならない。
+
+**fullscreen Unscoped 契約:** `promote_fullscreen_to_high_normal` の target は Unscoped 固定。`validity == Unscoped` と key 一致だけを match とし、Viewer(A/B) の job は同 key でも found／already_high／再配置／昇格へ含めない。Unscoped の Normal は HighNormal へ、HighNormal は already_high、Critical は already_high/found のみで lane／priority を変更しない。既存 `FullscreenPdfPromotionState` の Retry/Settled と current-display/pending key 契約を維持する。
+
+Unscoped は viewer owner/generation を持たないため、同 source/page の **Unscoped 同士**を viewer ごとに分離する約束はしない。この API はその source の既存共有 queued work を前面化する契約であり、複数 fullscreen／background の一致 Unscoped jobs が対象になり得る。target を wildcard にして Viewer jobs へ広げない。seek／hover thumbnail を fullscreen 描画中だから Unscoped 昇格へ流すことも禁止し、§4.2 の Viewer promotion 経路へ渡す。lane cap／Critical reservation／open admission／Abort/Harvest は変更しない。
+
 ## 6. registry の移譲・fork・終端
 
 registry は `ViewerContextId` と window binding を分離した ContextTable を持つ。owner field を既存 bundle 全 field の分類に加え、TableOp の admission／publication 順を変更しない。
@@ -154,7 +186,9 @@ registry は `ViewerContextId` と window binding を分離した ContextTable �
 
 `duplicate_for_parked!`／`move_to_parked!`／main に残す分類に writer を明示し、pending work の別 context への暗黙 transfer を作らない。legacy main-only epoch guard を撤去するだけの修正ではなく、**mutation capability 自体を payload と共に移譲する**構造変更である。
 
-detached-rework-plan §2 の BA-7（状態・所有）、時間窓なし、viewport/placement 症状パッチなしの規則に沿う。registry fields／transfer を変更する実装前に設計担当と利用者が依頼する独立 reviewer が構造修正として合意し、実装時に §11 に対象範囲・理由・証拠を記録する。今回その文書は編集していない。
+Viewer 向け promotion tracking も同じ分類へ入れる。同一 context の mount/park/promote では ticket/keys/retry を保持し、terminal/drop と一覧世代変更では旧 tracking を終了、fork 先は Idle。fullscreen Unscoped の既存 tracking は従来どおり bundle と移譲する。
+
+detached-rework-plan §2 の BA-7（状態・所有）、時間窓なし、viewport/placement 症状パッチなしの規則に沿う。利用者提示の `efe965453` 独立レビューは、非Clone writer を bundle と移譲し immutable ticket で失効を判断する案を **BA-7 の所有境界を直す構造修正であり症状パッチではない**と明示合意した。設計担当も同じ理由で合意し、今回 [detached-rework-plan §11](detached-rework-plan.md#11-リワーク外からの変更記録) に設計段階の対象・理由・P2 改訂 scope を記録した。優先昇格の今回改訂への reviewer 再確認は未取得で、実装承認／検証成功を先取りしない。
 
 ## 7. 簡素化・却下・まれな失敗
 
@@ -177,6 +211,9 @@ prune の UI 同期走査は避け、pool 内一つの容量1 wake-only maintena
 | owner / ticket | A/B が同じ generation=1 でも別 owner。A advance で A旧だけ stale、A新とB旧はcurrent。retire後のticketはstale、ticket clone/dropはownerを失効させない。writer非Clone |
 | queued prune | 同じ path/page/target の A/B Normal・HighNormal、Unscoped、Critical を混在。Aだけadvance→A旧だけInterrupted一回、Bの順序・reply・countは不変。Bだけadvanceの逆方向も検証 |
 | pop race | A snapshot→A advance→maintenance sweep→旧A enqueue。popでIPC実行0・Interrupted。新Aと旧Bは正常。popが先に取ったケースのin-flight count解放も一回 |
+| promotion ordering（P2） | B同key jobがNormal/HighNormalに存在→A Viewer昇格要求（Aはpool未着）→found=0/not_found=1・B priority/lane不変・A retry継続→A Normal遅着→既存再評価でAだけHighNormal、not_found=0。B ticket/priority不変。同owner旧世代、同generation別owner、Unscoped同keyもA foundへ含めない |
+| promotion target変更 | Aの同keyを昇格・settle→A advance→同keyで新A要求が未着。keysだけのdedupでskipせず新世代not_found→遅着新Aを昇格。trackingのswap/park/promote保持とfork Idle、旧statsが新targetへ適用されないこと |
+| fullscreen promotion | Viewer同keyだけではUnscoped fullscreen not_found=1、Viewer priority不変。Unscoped Normal/HighNormal/Criticalを追加し、Normalのみ昇格・High/Critical found、Critical降格なし。Unscoped同士の共有source照合とViewer seek専用経路、既存Retry/Settledの遅着regressionを維持 |
 | wake 合流 | 連続 A/B advance・retire、容量1 full、maintenance実行中の追加wake。最新stateで全stale対象を除去。UIはACK待ち・queue lock・pool spawnを行わない |
 | Search regression（Everything不要） | mainとdetachedが同じPDFを持ち、detached seek thumbnailがqueued/Pending。mainの実`replace_search_view_items`境界を通す。旧main PDF jobだけ取消、B job正常終端。B items_gen/request ID/keep/queue/cancel/owner epoch不変、Failed/Evictedへ勝手に落ちない |
 | 通常一覧の sibling route | A通常 folder reload／archive open／Collection child／Smart child、Aがdetachedにmountされる逆方向。別contextのownerとPDF要求に作用しない |
@@ -193,9 +230,9 @@ prune の UI 同期走査は避け、pool 内一つの容量1 wake-only maintena
 
 ## 9. 独立実装ステージの区切りと文書
 
-独立レビューを利用者が依頼し、設計担当との合意を得てから着手する。本設計の自前内部レビュー／別agentレビューは実行していない。
+利用者提示の `efe965453` 独立レビューは本計画 REVISE（P2 一件、P1/P3 なし）、Everything 計画 ACCEPT。writer/ticket／registry の構造修正には明示合意があり、設計担当も同意した。今回 P2 を §4.2/§5.4/§6/§8 の contract／tracking／回帰へ反映し、detached §11 に設計記録を追加した。**利用者の commit と reviewer の改訂確認後に、PDF ownership を独立 stage として先に実装する。今回の改訂を full ACCEPT／実装開始と扱わない。** 自前内部レビュー／別agentレビューは実行していない。
 
-一つの独立した修正ステージ **PDF-EPOCH-OWNERSHIP** として、型／pool／caller／registry／回帰を完成させる。Everything query／source UI を同じdiffへ入れない。作業は (1) owner/validity＋fake tests、(2) pool prune/pop＋全caller/registry migration、(3) App same-path regression＋docs/gates の順。検証中の中間差分は許すが、旧global APIと新owner APIが共存した状態やUI要求を仮Unscopedにした状態を完成commit／統合物として出さない。
+一つの独立した修正ステージ **PDF-EPOCH-OWNERSHIP** として、型／pool／caller／registry／回帰を完成させる。Everything query／source UI を同じdiffへ入れない。作業は (1) owner/validity＋fake tests、(2) pool prune/pop/promotion＋全caller/registry/tracking migration、(3) App same-path/ordering regression＋docs/gates の順。検証中の中間差分は許すが、旧global APIと新owner APIが共存した状態やUI要求を仮Unscopedにした状態を完成commit／統合物として出さない。
 
 想定所有ファイル: `src/pdf_loader.rs`（または型用private submodule）、`src/thumb_loader.rs`、`src/app.rs`、`src/global_search_ui.rs`、`src/app/viewer_context_registry.rs`、`src/app/color_filter.rs`、`collection_grid.rs`、`smart_folder.rs`、`similar_preview.rs`／`ui_metadata_panel.rs`、全 explicit render caller（cache_ops/books/Remote/bins）、関連 tests。caller のsignature移行はproducer表の契約変更だけ。共有ファイルのwriterは実装者一人。detached reworkとの同時編集を避ける。
 
@@ -203,8 +240,14 @@ prune の UI 同期走査は避け、pool 内一つの容量1 wake-only maintena
 
 1. productionの`CURRENT_CONTEXT_EPOCH`／`current_render_context_epoch`／global `bump_render_context_epoch`／整数`context_epoch`依存が消え、全UI enqueueと派生ticket、全Unscoped callerが表と一致する。
 2. owner変更権限がApp投影／bundleだけにあり、jobs／workersからadvance/retireできない。registry全分類で同一context保持・fork独立が確認済み。
-3. main+detached同pathのSearch replaceと逆方向、lateenqueue/retire、Canceled終端、Abort/Harvestの回帰がgreen。Critical/lane/open/caches/Remote既存testsを弱めない。
+3. main+detached同pathのSearch replaceと逆方向、lateenqueue/retire、B同key→A昇格→A遅着、owner/世代別foundとtracking、fullscreen Unscoped昇格、Canceled終端、Abort/Harvestの回帰がgreen。Critical/lane/open/caches/Remote既存testsを弱めない。
 4. UI側epoch変更に同期queue走査・IPC/FS/DB・joinなし。prune/cancel/idle性能gateを満たす。通常機能を制限してpassさせない。
 5. matching docs（async-architecture、architecture-overview、display-pipelineのscope、thumbnail-request-lifecycle-plan、旧pdf-pool-context-epoch-planの後継記録、CLAUDE PDF節）と detached-rework-plan §11をコードと同時更新。user-visible新操作はないためmanualに新shortcutは足さない。Everything manual/keymapは後続feature stage。
 
 独立修正だけを統合可能なrollback点にする（今回commit/mergeなし）。このstageの独立review・gate・必要な利用者確認の証拠が揃ってから、Everything plan §7.2のP1を解消済みへ更新する。設計書を書いた時点ではP1を解消済みにしない。
+
+### 2026-10-12 独立レビュー指摘の反映記録
+
+- 対象 HEAD: `efe965453`。P2 は path/page-only priority promotion と found による A の遅着昇格取り落とし。設計担当は指摘に同意し、owner＋要求世代＋既存keyの selector、context-local tracking、Unscoped fullscreen selector、ordering回帰を追加した。
+- reviewer が提示した構造修正合意を detached §11 に記録。新たな owner map／retry loop／lane/cap 方針変更は追加していない。
+- 設計への反映済みを報告する段階であり、P2 の独立再確認、製品修正・test成功・実機受入は未取得。今回自前review、製品コード/.git変更、build/launch/downloadなし。

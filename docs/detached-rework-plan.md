@@ -1455,6 +1455,40 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-12 PDF-EPOCH-OWNERSHIP: render失効と優先昇格のcontext所有（設計段階）
+
+利用者が提示した独立設計レビュー（対象 `efe965453`）は、非Clone writerをbundleと移譲し、
+immutable ticketで失効を判断する案について、
+「BA-7の所有境界を直す構造修正であり、症状パッチではないことに同意します」と明示した。
+設計担当（Codex）も、共有global render epochによる兄弟jobsの失効を、既存context payloadの
+変更権限と要求時点の証明へ移す根本修正であることに同意する。
+詳細は [pdf-render-epoch-ownership-plan.md](pdf-render-epoch-ownership-plan.md) §3–§6/§8/§9。
+
+予定範囲はApp投影/ViewerContextBundleの`PdfRenderEpochOwner`、enqueueと派生要求のread-only
+ticket継承、poolのowner-local prune/pop/cancel/drop、registryのfresh/build/swap/park/fork/
+promote/retire移譲。同じpath/pageのmain+detachedでも、一覧を替えたcontextの旧PDF thumbnail
+jobsだけを失効させる。writerは移動し、fork先はfresh owner、in-flight thumbnail要求は複製しない。
+既存Ctrl+G/通常一覧にもある不具合の独立stageで、EverythingのIPC/UI/新shortcutを含めない。
+
+レビュー唯一のP2は、現行priority promotionがpath/pageだけで兄弟をfoundと数え、未到着Aの
+昇格再試行を終える点。今回の設計改訂はViewer promotionをowner/要求世代/既存keyに限定し、
+found/already_high・Normal昇格・HighNormal対象再配置へ同じselectorを使う。
+既存の昇格追跡値も同じbundle所有のtyped stateへ置換し、forkで複製しない。
+fullscreen本体は明示Unscoped promotionでViewer thumbnailを対象にせず、Unscoped同士の
+共有source/page照合とCritical found契約を維持する。B同key存在→A昇格要求→A遅着の順序、
+同owner旧世代・同generation別owner、main/detached逆方向を回帰条件とする。
+
+viewport/placement/HWND/focus/recreate述語、lane/cap/open-admission方針は変更しない。
+全窓停止、global bump省略guard、時間窓、F12/seek制限、追加retry stateで症状を隠さない。
+UI失効はatomic publishと非blocking wakeまで、prune/reply/freeは既定のpool内maintenance
+worker案。まれな失敗は既定のログ＋通知とし、回復機構/DB再作成を追加しない。
+
+本項は**構造修正への双方の設計合意と予定範囲**の記録。
+独立判定はPDF計画REVISE（P2一件、P1/P3なし）、Everything計画ACCEPT。
+今回のP2改訂へのreviewer再確認・full ACCEPTは未取得。利用者のcommitとreviewer確認後に
+PDF ownershipを独立stageとして先に実装する。実装済み・test成功・製品起動・実機受入を意味しない。
+今回の変更はPDF計画、本§11、引き継ぎTXTのみで、製品コード/.git/build/launchは未変更・未実行。
+
 ### 2026-10-11 §1.371: 評価集合の公開を安定context境界へ移す構造合意（設計段階）
 
 利用者が提示した独立再レビュー（対象 `94bc236d1`、rating-filter-fullscreen-plan R2）は、
