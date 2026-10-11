@@ -1308,13 +1308,17 @@ impl App {
             return None;
         }
         let masks = session.item_rating_masks.as_ref()?;
+        let preview = self.rating_preview_recipe();
         Some(
             self.items
                 .iter()
                 .enumerate()
                 .map(|(index, _)| {
                     let stars = self.rating_cache.get(&index).copied().unwrap_or(0).min(5);
-                    masks.get(index).is_none_or(|mask| mask[stars as usize])
+                    masks.get(index).is_none_or(|mask| {
+                        self.rating_path_key(index)
+                            .is_some_and(|key| preview.allows(&key, stars, mask))
+                    })
                 })
                 .collect(),
         )
@@ -9275,7 +9279,7 @@ impl App {
         self.smart_folder_progress = None;
         self.address = format!("スマートフォルダ: {definition_name}");
         if let Some(&index) = self.visible_indices.first() {
-            self.move_grid_cursor(Some(index));
+            self.move_grid_cursor(Some(index), crate::app::GridCursorIntent::Automatic);
             self.scroll_to_selected = true;
         }
         if let Some(SmartFolderOpenOrigin::ReturnReprepare {
@@ -9345,7 +9349,7 @@ impl App {
         if self.search_query.trim().is_empty() {
             self.rebuild_visible_indices();
         } else {
-            self.execute_search(ctx);
+            self.reexecute_search_for_installed_list(ctx);
         }
     }
 

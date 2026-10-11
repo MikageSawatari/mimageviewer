@@ -1455,6 +1455,53 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-11 §1.371: 評価集合の公開を安定context境界へ移す構造合意（設計段階）
+
+利用者が提示した独立再レビュー（対象 `94bc236d1`、rating-filter-fullscreen-plan R2）は、
+「F12の境界修正には、症状パッチではなく構造修正として同意します」と明示した。
+本設計もこの方針を採用し、利用者のR3指示に従って対象・理由をここへ記録する。
+詳細は [rating-filter-fullscreen-plan.md §3.1/§3.2/§8](rating-filter-fullscreen-plan.md#31-contexttableの安定境界-レビューp1-1)。
+
+対象は `viewer_context_registry.rs` のswap内rating publicationを退避前のplan前と、
+incomingのfinish_mount・favorite/effective設定投影完了後へ移すこと、およびbuild/commit/abort/
+fork/promote/retireの同じ安定境界の照合である。swap primitiveはpayload交換だけを担い、
+新しいnavigation・publication・context取得による配送・再mountを開始しない。
+集合の採用出口でcontext自身のreader/cursorを調停し、既存fullscreen landing/teardownと
+§1.370のcursor-move/paired identity remapへ渡す。Main scopeだけに実効filterを適用し、
+DetachedPhysical/CollectionRootの独立membershipと兄弟のitems・cache・channel・queue・世代・tokenを保つ。
+
+理由は、ContextTableのpending遷移内の再入と、集合外anchor/誤配送を作る公開境界を除き、
+完成したowner/settings/集合でreaderとの整合を確立するため。pending guard、時間窓、repaint、
+新しいdetached bool/Option、viewport/geometry/host同定、placement/focus/recreate機構は追加しない。
+未公開ratingを持つoutgoing/incoming mountと元context復帰、build/fork等のtrace、main/F12/A/Bの
+資源分離、Shift+click起点を実装時の回帰対象とする（同planの必須test 6/7/8）。
+
+この同意は **F12の公開境界修正に限定**する。その後、利用者が提示した独立レビューで
+R3 `57b7e320b` 全体が ACCEPT され、Stage 2 の実装を指示した。実装は上記の安定した
+publication 境界と exact identity transfer、既存 landing/teardown/cursor 経路への接続に限定する。
+同identityのRating/Search slot交換ではreaderとselected/Shift起点のpaired remapを保つ。
+編集は下記の2026-10-11利用者決定に従い、出荷済みの終了/clear/cancel境界を再利用する。
+readerのtransfer mapをidx-owned編集/Undoの新しい所有証明に使わず、兄弟contextへ適用しない。
+実装・自動検証結果は `target/K-1371-impl-msg.txt` へ記録する。設計 ACCEPT とこの記録は
+実機受入を意味しない。agent による mIV 起動は行わない。
+
+Stage 2 の独立確認で、idx-only local-adjust Undo と途中編集が App-global のままで、
+一時mount先のexact mapを適用できないowner不足を確認した。2026-10-11に利用者は、
+capture provenance追加やeditorのbundle移設へ広げず、既存編集boundaryを再利用する限定案を選んだ。
+Rating再採用では出荷済みの境界で編集を終了し、非rating Undoを落としてrating Undoだけを保持する。
+Searchは既存clear/cancel方針を維持する。loaded/global editorやidx-only Undoの保持/remapは新設しない。
+**F12の構造合意は引き続き安定publication境界とreader/cursor接続に限定し、一般editor ownerの拡張を含めない**。
+新しいbundle field、context状態、focus/mountによるeditor owner推測を加えず、既存終了boundaryの再利用に留める。
+回帰範囲もreader同identity・paired cursor・rating Undo保持と既存編集終了方針に限定し、
+一般的なcross-context編集/historyの保持・誤配送解消を検証済みと主張しない。
+v4.5.0 tag `1ff9d07df` のSearch streamingにもidx-only誤配送の既存経路があるが、今回の対象外とし、
+利用者が別途バックログへ記載する。根拠・scopeは
+[rating plan の利用者決定](rating-filter-fullscreen-plan.md#stage-2-の編集範囲限定--利用者決定-2026-10-11) に記録する。
+Stage 2の独立ソース完了レビューは、限定編集境界と安定publication、reader/cursor採用、
+既存遅延open ownerのcause/endpoint保持と取消（WarmPdf後続検証を含む）までACCEPT。
+遅延要求の受理時に古いopenを消費し、swap途中やresumeで二度目の行先決定を始めない。
+このscope決定と構造合意は自動gate成功・実機受入を表さない。最終自動結果は上記handoffを参照する。
+
 ### 2026-10-11 §1.370: カーソル / 範囲選択起点の共通遷移
 
 実装範囲は `App::move_grid_cursor` / `apply_grid_cursor_move` と既存の selected 更新入口。

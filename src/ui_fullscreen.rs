@@ -134,6 +134,26 @@ impl FullscreenSecondaryPress {
         *self = Self::Idle;
     }
 
+    /// Reinstalling the same page identity changes its slot and generation,
+    /// while the held physical sequence remains owned by that page.
+    pub(crate) fn remap_owner(
+        &mut self,
+        viewer_context: crate::app::ViewerContextId,
+        old_generation: u64,
+        old_idx: usize,
+        new_generation: u64,
+        new_idx: usize,
+    ) {
+        if let Self::Armed { owner, .. } = self
+            && owner.viewer_context == viewer_context
+            && owner.items_generation == old_generation
+            && owner.fs_idx == old_idx
+        {
+            owner.items_generation = new_generation;
+            owner.fs_idx = new_idx;
+        }
+    }
+
     fn start_pos(self) -> Option<egui::Pos2> {
         match self {
             Self::Idle => None,
@@ -16233,8 +16253,19 @@ impl FsPageNav {
 }
 
 /// フルスクリーンのキー入力結果。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum FsKeyPageTransition {
+    #[default]
+    Unchanged,
+    Rebased {
+        idx: usize,
+    },
+    Closed,
+}
+
 #[derive(Default)]
 pub(crate) struct FsKeyAction {
+    pub(crate) page_transition: FsKeyPageTransition,
     /// Esc / Enter / 右クリック相当。`handle_fullscreen_close_request` を通す
     /// (= 「ページを直接開く」設定 ON のコンテナページなら L1、それ以外は 1 段 close)。
     pub(crate) close: bool,
@@ -21448,6 +21479,8 @@ impl App {
         target_idx: usize,
         load_contract: crate::fs_page_load_scheduler::FsPageLoadContract,
     ) {
+        self.finish_rating_picker_for_manual_navigation();
+        self.cancel_rating_membership_restore();
         match self.try_own_fullscreen_epub_at(target_idx) {
             crate::app::OpenAdmission::Accepted => {}
             crate::app::OpenAdmission::NotApplicable => return,
@@ -21470,7 +21503,7 @@ impl App {
             self.finish_stale_fs_navigation_diagnostic_for_target(target_idx);
         }
         self.fullscreen_idx = Some(target_idx);
-        self.move_grid_cursor(Some(target_idx));
+        self.move_grid_cursor(Some(target_idx), crate::app::GridCursorIntent::Automatic);
         self.scroll_to_selected = true;
         self.fs_vertical_scroll = 0.0;
         self.update_last_selected_image();
@@ -23168,7 +23201,7 @@ impl App {
             std::time::Instant::now,
             Self::thread_cycles_now,
         );
-        let Some(fs_idx) = self.fullscreen_idx else {
+        let Some(mut fs_idx) = self.fullscreen_idx else {
             // in-window 静止画モードで PDF/ZIP enumerate defer 中:
             // grid (= 白 CentralPanel) が露出するのを防ぐため、メインウィンドウに
             // 直接現在の静止画余白色 + holdover を描く。詳細は `render_embedded_fs_nav_holdover`
@@ -23268,8 +23301,8 @@ impl App {
         self.advance_animation(ctx, fs_idx);
         // Navigation topology and the role-aware visible composition come from the same cached
         // unit token. The latter may add a non-navigation cover occurrence to the final unit.
-        let display_composition = self.spread_display_composition_for_anchor(fs_idx);
-        let spread_pair = display_composition.spread_pair(self.spread_mode);
+        let mut display_composition = self.spread_display_composition_for_anchor(fs_idx);
+        let mut spread_pair = display_composition.spread_pair(self.spread_mode);
         if let Some(rebound_decision) = self
             .revalidate_fs_page_turn_decision_for_display_composition(
                 ctx,
@@ -23279,7 +23312,7 @@ impl App {
         {
             page_turn_decision = rebound_decision;
         }
-        let is_spread_double = matches!(spread_pair, SpreadPair::Double { .. });
+        let mut is_spread_double = matches!(spread_pair, SpreadPair::Double { .. });
         // 比較は単ページ表示だけが所有する。ページ移動や表示モード変更で見開きが
         // 確定したフレームでは、比較用の準備・描画へ進む前に状態を終了する。
         self.end_comparison_for_spread_mode_if_needed();
@@ -23313,7 +23346,8 @@ impl App {
             self.fullscreen_viewport_id()
         };
         self.sync_conceal_preview_before_pipeline(ctx, preview_viewport_id);
-        let state = self.prepare_fullscreen_state(ctx, fs_idx, page_turn_decision);
+        let mut state = self.prepare_fullscreen_state(ctx, fs_idx, page_turn_decision);
+        let mut key_page_transition = FsKeyPageTransition::Unchanged;
 
         let mut close_fs = false;
         let mut close_to_page_list = false;
@@ -24070,6 +24104,24 @@ impl App {
                         if !embedded {
                             crate::test_script::finish_action_pass(ctx);
                         }
+                        key_page_transition = key_action.page_transition;
+                        match key_page_transition {
+                            FsKeyPageTransition::Unchanged => {}
+                            FsKeyPageTransition::Closed => return,
+                            FsKeyPageTransition::Rebased { idx } => {
+                                fs_idx = idx;
+                                display_composition = self.spread_display_composition_for_anchor(idx);
+                                spread_pair = display_composition.spread_pair(self.spread_mode);
+                                is_spread_double = matches!(spread_pair, SpreadPair::Double { .. });
+                                page_turn_decision = self.fs_page_turn_decision_for_frame(ctx, idx);
+                                state = self.prepare_fullscreen_state(ctx, idx, page_turn_decision);
+                            }
+                        }
+                        let still_seek_geometry =
+                            self.still_seek_geometry_for_idx(full_rect, fs_idx, state.is_video);
+                        let resolved_fullscreen_media_rect = self.fullscreen_media_rect_with_geometry(
+                            full_rect, fs_idx, state.is_video, still_seek_geometry,
+                        );
                         if key_action.close {
                             close_fs = true;
                         }
@@ -25615,6 +25667,9 @@ impl App {
                         fs_tail_ms = tail_t0.elapsed().as_secs_f64() * 1000.0;
                     });
                 fs_central_ms = central_t0.elapsed().as_secs_f64() * 1000.0;
+                if key_page_transition == FsKeyPageTransition::Closed {
+                    return;
+                }
 
                 #[cfg(windows)]
                 if (need_show || detached_host_needs_create) && !embedded && self.window_visible {
@@ -25811,6 +25866,15 @@ impl App {
             }
             fs_body_ms = fs_body_t0.elapsed().as_secs_f64() * 1000.0;
             fs_body_cycles = Self::thread_cycles_now().saturating_sub(fs_body_cycles_t0);
+        }
+        if key_page_transition == FsKeyPageTransition::Closed {
+            finish_fs_render_perf(
+                &mut fs_render_perf,
+                self.frame_counter,
+                self.input_seq,
+                None,
+            );
+            return;
         }
         #[cfg(windows)]
         if let Some(window_id) = active_render_window_id {
@@ -28675,7 +28739,7 @@ impl App {
             let new_idx = unit.anchor_idx();
             if new_idx != idx {
                 self.fullscreen_idx = Some(new_idx);
-                self.move_grid_cursor(Some(new_idx));
+                self.move_grid_cursor(Some(new_idx), crate::app::GridCursorIntent::Automatic);
             }
             // Re-adopting the same page is a layout update, not a cursor move:
             // preserve any range-selection origin established by Shift input.
@@ -28703,7 +28767,7 @@ impl App {
             let cursor_state = self.fullscreen_cursor_state();
             self.open_fullscreen(new_idx, crate::app::HistoryTrigger::UserChosen);
             self.restore_fullscreen_cursor_state(ctx, cursor_state);
-            self.move_grid_cursor(Some(new_idx));
+            self.move_grid_cursor(Some(new_idx), crate::app::GridCursorIntent::Automatic);
         }
     }
 
@@ -28784,6 +28848,11 @@ impl App {
         let spread_pair = self.resolve_visible_spread_pair(fs_idx);
         let is_spread_double = matches!(spread_pair, SpreadPair::Double { .. });
         let key_action = self.handle_fs_key_input(ctx, fs_idx, is_spread_double);
+        let fs_idx = match key_action.page_transition {
+            FsKeyPageTransition::Unchanged => fs_idx,
+            FsKeyPageTransition::Rebased { idx } => idx,
+            FsKeyPageTransition::Closed => return true,
+        };
 
         if !key_action.page_nav.is_none() {
             self.bump_input_seq(
@@ -29234,6 +29303,9 @@ impl App {
         fs_idx: usize,
         is_spread_double: bool,
     ) -> FsKeyAction {
+        let initial_page_key = self
+            .page_path_key(fs_idx)
+            .or_else(|| self.rating_path_key(fs_idx));
         // マウスドライバ / AHK 経由で積まれた進む/戻る pending は **early-return より前に
         // drain** する。フォーカス無し / モーダル表示中で早期 return すると pending が
         // 次フレームに持ち越されて誤発火するため (Codex P2)。ブロック中は count を捨てる。
@@ -29262,6 +29334,7 @@ impl App {
                 || fs_still_seek_strip_popup_open(ctx),
         );
         let mut action = FsKeyAction {
+            page_transition: FsKeyPageTransition::Unchanged,
             close: false,
             close_to_page_list: false,
             page_nav: FsPageNav::None,
@@ -30607,8 +30680,43 @@ impl App {
         // レーティング 1〜5 / 解除 (既定: F1〜F6)
         let rating_key = self.keymap.consume_rating_action(ctx, false);
         if let Some(edit) = rating_key {
-            self.apply_rating_edit_to_fullscreen_item(fs_idx, edit);
+            let rating_idx = initial_page_key
+                .as_ref()
+                .and_then(|key| {
+                    (0..self.items.len()).find(|&idx| {
+                        self.page_path_key(idx)
+                            .or_else(|| self.rating_path_key(idx))
+                            .as_ref()
+                            == Some(key)
+                    })
+                })
+                .or_else(|| initial_page_key.is_none().then_some(fs_idx));
+            if let Some(rating_idx) = rating_idx {
+                self.apply_rating_edit_to_fullscreen_item(rating_idx, edit);
+            }
         }
+        // Publication can move/reorder the page or return to the grid. Continue this accepted
+        // key pass from its new owner; callers also use this outcome before painting old state.
+        let Some(current_idx) = self.fullscreen_idx else {
+            action.page_transition = FsKeyPageTransition::Closed;
+            return action;
+        };
+        if current_idx != fs_idx
+            || self
+                .page_path_key(current_idx)
+                .or_else(|| self.rating_path_key(current_idx))
+                != initial_page_key
+        {
+            action.page_transition = FsKeyPageTransition::Rebased { idx: current_idx };
+        }
+        let fs_idx = current_idx;
+        let is_spread_double = matches!(
+            self.resolve_visible_spread_pair(fs_idx),
+            SpreadPair::Double { .. }
+        );
+        let current_item_is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
+        let fs_music_view_active = self.fs_music_view_active(fs_idx);
+        let pano_active_now = self.is_panorama_mode_active(fs_idx);
         if key_p_pin {
             self.toggle_folder_pin_for_idx(fs_idx);
         }
@@ -35346,7 +35454,7 @@ impl App {
             {
                 self.set_fullscreen_page_slice_for_display_unit(step.slice);
             }
-            self.move_grid_cursor(Some(idx));
+            self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
             self.scroll_to_selected = true;
             return;
         }
@@ -35404,7 +35512,7 @@ impl App {
         {
             self.slideshow_anchor_idx = None;
             self.open_fullscreen_from_slideshow_navigation(ctx, idx);
-            self.move_grid_cursor(Some(idx));
+            self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
             self.scroll_to_selected = true;
         } else {
             self.slideshow_playing = false;
@@ -36460,6 +36568,16 @@ impl App {
         fs_idx: usize,
         fs_render_perf: &mut Option<FsRenderPerfRecorder>,
     ) {
+        if close_fs
+            || close_to_page_list
+            || ctrl_nav.is_some()
+            || sibling_nav.is_some()
+            || mouse_nav.is_some()
+            || jump_to.is_some()
+            || !page_nav.is_none()
+        {
+            self.cancel_rating_membership_restore();
+        }
         let mut fs_navigation_perf = fs_render_perf
             .as_ref()
             .map(|_| FsNavigationPerfRecorder::default());

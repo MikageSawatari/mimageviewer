@@ -14,7 +14,7 @@ fn grid(view: GridViewMode) -> AppTestEnvForTest {
     app.settings.grid_cols = 2;
     app.settings.grid_click_selection_mode = GridClickSelectionMode::Explorer;
     app.rebuild_visible_indices();
-    app.move_grid_cursor(Some(1));
+    app.move_grid_cursor(Some(1), crate::app::GridCursorIntent::Automatic);
     app
 }
 
@@ -191,7 +191,7 @@ fn page_home_end_moves_rebase_and_keep_existing_modifier_admission() {
     ] {
         for shift in [false, true] {
             let mut app = grid(GridViewMode::Thumbnail);
-            app.move_grid_cursor(Some(3));
+            app.move_grid_cursor(Some(3), crate::app::GridCursorIntent::Automatic);
             app.last_cell_h = 10.0;
             app.last_viewport_h = 10.0;
             let ctx = egui::Context::default();
@@ -219,7 +219,7 @@ fn generation_change_drops_old_range_origin_even_when_index_exists() {
     click(&mut app, 5, false, true);
     assert_eq!(app.checked, HashSet::from([3, 4, 5]));
     assert_eq!(anchor(&app), Some(3));
-    app.move_grid_cursor(Some(2));
+    app.move_grid_cursor(Some(2), crate::app::GridCursorIntent::Automatic);
     assert_eq!(anchor(&app), Some(2));
 }
 
@@ -282,7 +282,7 @@ fn mounted_context_cursor_moves_leave_sibling_anchor_and_selection_unchanged() {
     click(&mut app, 3, false, true);
     let mut sibling = app.split_current_context_preserving_main_grid();
     app.swap_viewer_context_bundle(&mut sibling);
-    app.move_grid_cursor(Some(4));
+    app.move_grid_cursor(Some(4), crate::app::GridCursorIntent::Automatic);
     app.swap_viewer_context_bundle(&mut sibling);
     assert_eq!(app.selected, Some(3));
     assert_eq!(anchor(&app), Some(1));
@@ -290,4 +290,63 @@ fn mounted_context_cursor_moves_leave_sibling_anchor_and_selection_unchanged() {
     app.swap_viewer_context_bundle(&mut sibling);
     assert_eq!(app.selected, Some(4));
     assert_eq!(anchor(&app), Some(4));
+}
+
+#[test]
+fn grid_cursor_live_selection_writes_are_owned_not_input_helpers() {
+    // Required intent prevents omission at the API; this source guard also
+    // rejects direct field writes/borrows in a new input helper. Identity remap,
+    // saved-grid state and test fixtures are explicit exceptions by function.
+    let function = regex::Regex::new(r"\bfn\s+(\w+)\s*[<(]").unwrap();
+    let mutation = regex::Regex::new(
+        r"&\s*mut\s*(?:self|app)\s*\.\s*(?:selected|grid_click_selection_anchor)\b|self\s*\.\s*(?:selected|grid_click_selection_anchor)\s*=\s*[^=]"
+    ).unwrap();
+    fn visit(dir: &std::path::Path, function: &regex::Regex, mutation: &regex::Regex) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(&path, function, mutation);
+                continue;
+            }
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).unwrap();
+            for site in mutation.find_iter(&source) {
+                let caller = function
+                    .captures_iter(&source[..site.start()])
+                    .last()
+                    .unwrap();
+                let name = caller.get(1).unwrap().as_str();
+                let allowed = match path.file_name().unwrap().to_str().unwrap() {
+                    "app.rs" => matches!(
+                        name,
+                        "move_grid_cursor" | "install_new_items_inner" | "remove_items_batch"
+                    ),
+                    "snapshot_ops.rs" => name == "activate_snapshot",
+                    "smart_folder.rs" => matches!(
+                        name,
+                        "remove_paths"
+                            | "install_adopted_smart_root_payload"
+                            | "grid_cursor_saved_smart_root_deleted_cursor_rebases_before_restore"
+                    ),
+                    "global_search_ui.rs" => name == "replace_search_view_items_with_ratings",
+                    "rating_membership_ops.rs" => name == "adopt_rating_membership",
+                    "grid_cursor_tests.rs" => name == "click",
+                    _ => false,
+                };
+                assert!(
+                    allowed,
+                    "live cursor write bypasses owner: {}::{name}: {}",
+                    path.display(),
+                    site.as_str()
+                );
+            }
+        }
+    }
+    visit(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &function,
+        &mutation,
+    );
 }

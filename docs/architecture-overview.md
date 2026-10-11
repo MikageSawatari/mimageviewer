@@ -36,6 +36,13 @@ UI は snapshot 提出と進捗参照を行い、停止・join・DB cleanup は�
 `scanned_once` を使う。fts/name は root 単位、similar は有効 root 集合全体で1つの完走印を持ち、
 永続ストアの追加や保存先の変更はない。
 
+live一覧のcursor／Shift起点は `App::move_grid_cursor(target, GridCursorIntent)` が所有する。
+入力callerは明示Move/Extendまたは受理no-opのExplicitKeep、自動採用callerはAutomaticを
+必ず指定する。明示入力は同context・一覧のrating履歴、pending復帰、ring内Grid originの
+復帰権限を失効させてからcursorを公開する。クリックpolicyはローカルコピーから行先を
+計算し、このownerへ渡す。identity remap／contextの値転送は対を保つ既存非navigation経路。
+詳細と全caller分類は [評価filterのfullscreen整合](rating-filter-fullscreen-plan.md)。
+
 ---
 
 ### 音声サムネイル (§1.347、2026-10-08)

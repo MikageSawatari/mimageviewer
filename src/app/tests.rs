@@ -6147,23 +6147,22 @@ fn rating_search_departure_is_hidden_before_first_paint_and_entrant_appends_late
         assert!(app.search_ready_is_held_for_test());
         app.write_user_ratings_shared(&[(keys[0].clone(), 4, None), (keys[2].clone(), 5, None)])
             .unwrap();
-        let before_install = app.items_generation;
-        app.release_search_ready_for_test();
-        while app.items_generation == before_install && std::time::Instant::now() < deadline {
-            app.poll_global_search_events(&ctx);
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
         let visible = |app: &App| {
             app.visible_indices
                 .iter()
                 .map(|&index| app.items[index].name().into_owned())
                 .collect::<Vec<_>>()
         };
+        // Publication hides the departing row before any worker result is installed.
         assert_eq!(visible(&app), ["r3-filter-b.jpg"]);
-        while visible(&app).len() != 2 && std::time::Instant::now() < deadline {
+        let before_install = app.items_generation;
+        app.release_search_ready_for_test();
+        while app.items_generation == before_install && std::time::Instant::now() < deadline {
             app.poll_global_search_events(&ctx);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        // The stale held Ready is rejected; the first accepted set includes the entrant.
+        assert_eq!(app.items_generation, before_install.wrapping_add(1));
         assert_eq!(visible(&app), ["r3-filter-b.jpg", "r3-filter-c.jpg"]);
     });
 }
@@ -9589,7 +9588,9 @@ fn metadata_panel_page_star_records_undo_and_ctrl_z_restores_previous_rating() {
     assert!(app.set_rating(0, 5));
     assert_eq!(app.meta_undo.undo_len(), 1);
     match app.meta_undo.peek_undo().expect("page-star undo") {
-        crate::undo_stack::UndoEntry::Rating { changes, summary } => {
+        crate::undo_stack::UndoEntry::Rating {
+            changes, summary, ..
+        } => {
             assert_eq!(summary, "★5");
             assert_eq!(changes.len(), 1);
             assert_eq!(changes[0].path_key, page_key);
@@ -9617,14 +9618,20 @@ fn viewer_rating_noop_does_not_record_undo() {
     app.rating_db.as_ref().unwrap().set(&key, 3).unwrap();
     app.rating_cache.insert(0, 3);
 
-    assert!(app.set_rating(0, 3));
+    let generation = app.rating_session_write_generation;
+    let published = app.rating_session_write_seen_generation;
+    assert!(!app.set_rating(0, 3));
+    assert_eq!(app.rating_session_write_generation, generation);
+    assert_eq!(app.rating_session_write_seen_generation, published);
 
     assert_eq!(app.meta_undo.undo_len(), 0);
     assert_eq!(app.meta_undo.redo_len(), 0);
 
     assert!(app.set_rating(0, 0));
     match app.meta_undo.peek_undo().expect("rating-clear undo") {
-        crate::undo_stack::UndoEntry::Rating { changes, summary } => {
+        crate::undo_stack::UndoEntry::Rating {
+            changes, summary, ..
+        } => {
             assert_eq!(summary, "★解除");
             assert_eq!(changes.len(), 1);
             assert_eq!((changes[0].before, changes[0].after), (3, 0));
@@ -9655,7 +9662,9 @@ fn grid_selection_rating_records_one_batched_undo_entry() {
     assert_eq!(app.rating_publication_count, 1);
     assert_eq!(app.meta_undo.undo_len(), 1);
     match app.meta_undo.peek_undo().expect("batched grid undo") {
-        crate::undo_stack::UndoEntry::Rating { changes, summary } => {
+        crate::undo_stack::UndoEntry::Rating {
+            changes, summary, ..
+        } => {
             assert_eq!(summary, "★4 を 2 件に付与");
             assert_eq!(changes.len(), 2);
             let mut transitions = changes
@@ -28154,7 +28163,7 @@ mod phase_c_drill_nav_tests {
     }
 
     #[test]
-    fn rating_view_accepts_after_read_write_once_then_appends_membership() {
+    fn rating_view_rejects_pre_write_ready_then_adopts_latest_membership() {
         let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = setup_app();
         let mut keys = Vec::new();
@@ -28195,22 +28204,21 @@ mod phase_c_drill_nav_tests {
         ])
         .unwrap();
         let before_install = app.items_generation;
+        let source_keys = app.items.iter().map(GridItem::perf_key).collect::<Vec<_>>();
         app.poll_rating_view();
         app.poll_sidecar_restore(&egui::Context::default());
-        assert!(app.items_are_rating_view);
-        assert_eq!(app.items_generation, before_install.wrapping_add(1));
+        assert!(!app.items_are_rating_view);
+        assert_eq!(app.items_generation, before_install);
         assert_eq!(
-            app.rating_view_rows
-                .iter()
-                .map(|row| row.key.clone())
-                .collect::<Vec<_>>(),
-            initial_keys
+            app.items.iter().map(GridItem::perf_key).collect::<Vec<_>>(),
+            source_keys
         );
-        assert_eq!(app.visible_indices.len(), 2);
-        assert!(
-            app.visible_indices
-                .iter()
-                .all(|&index| app.rating_view_rows[index].key != removed)
+        assert_eq!(
+            app.rating_view_pending
+                .as_ref()
+                .unwrap()
+                .rating_write_generation,
+            app.rating_session_write_generation
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
@@ -28227,12 +28235,15 @@ mod phase_c_drill_nav_tests {
             .into_iter()
             .filter(|key| key != &removed)
             .chain(std::iter::once(keys[3].0.clone()))
-            .collect::<Vec<_>>();
+            .collect::<std::collections::HashSet<_>>();
+        assert!(app.items_are_rating_view);
+        assert_eq!(app.items_generation, before_install.wrapping_add(1));
+        assert_eq!(app.visible_indices.len(), 3);
         assert_eq!(
             app.rating_view_rows
                 .iter()
                 .map(|row| row.key.clone())
-                .collect::<Vec<_>>(),
+                .collect::<std::collections::HashSet<_>>(),
             expected
         );
     }
@@ -50501,7 +50512,7 @@ mod favorite_adjustment_defaults_tests {
 
         // Keep the cursor on surviving A: this tests identity remapping rather
         // than the non-extending first selection of an unselected listing.
-        app.move_grid_cursor(Some(a));
+        app.move_grid_cursor(Some(a), crate::app::GridCursorIntent::Automatic);
         app.grid_click_selection_anchor = Some(crate::app::GridClickSelectionAnchor::new(
             d,
             app.items_generation,
@@ -99176,9 +99187,10 @@ mod rating_write_failure_tests {
             .push(crate::ring_shortcut::RingPickerRowId::ItemRating);
         picker.item_rating = 4;
 
-        // A successful live preview already writes 4. Finalization writes the
-        // same value again but must derive one original->durable transition.
-        assert!(app.set_rating_result(0, 4).unwrap());
+        // A successful live preview carries the operation's durable receipt.
+        // Final confirmation must not submit a second unchanged write.
+        app.ring_picker = Some(picker.clone());
+        app.preview_picker_item_rating(&picker, 4);
         let (records, container) = app.finalize_live_picker_ratings(&picker);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].path_key, key);
@@ -99221,6 +99233,7 @@ mod rating_write_failure_tests {
         app.set_current_folder_rating(1).unwrap();
         let undo_before = app.meta_undo.undo_len();
 
+        app.ring_picker = Some(picker.clone());
         let (items, container) = app.finalize_live_picker_ratings(&picker);
         assert!(items.is_empty());
         app.commit_live_picker_undo(items, container);
@@ -99306,9 +99319,10 @@ mod rating_write_failure_tests {
             .dirty_rows
             .push(crate::ring_shortcut::RingPickerRowId::ItemRating);
         picker.item_rating = 4;
-        app.ring_picker = Some(picker);
-        // プレビューが既に DB へ書いている。
-        assert!(app.set_rating_result(0, 4).unwrap());
+        app.ring_picker = Some(picker.clone());
+        // 通常のプレビュー保存により picker 所有の成功 receipt を作る。
+        app.preview_picker_item_rating(&picker, 4);
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 4);
         assert_eq!(app.meta_undo.undo_len(), 0);
 
         // パッドが切れる (= 設定 OFF と同じ終端)。sample は物理側だけを終わらせ、
@@ -99391,6 +99405,7 @@ mod rating_write_failure_tests {
         app.rating_cache.insert(1, 1);
         app.selected = Some(1);
 
+        app.ring_picker = Some(picker.clone());
         app.preview_picker_item_rating(&picker, 4);
         assert_eq!(app.rating_db.as_ref().unwrap().get(&key_a), 4);
         assert_eq!(app.rating_db.as_ref().unwrap().get(&key_b), 2);
