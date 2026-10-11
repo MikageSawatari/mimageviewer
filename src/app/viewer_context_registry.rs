@@ -4619,6 +4619,52 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn page_turn_animation_overflow_f12_updates_one_setting_without_reloading_content() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![GridItem::Image(app.tmp.path().join("main.png"))];
+        app.fullscreen_idx = Some(0);
+        app.adopt_page_turn_animation_settings(true, 400);
+        let main = app.page_turn_destination();
+        app.page_turn_presentation.seed_operation_for_test(main, 41);
+        let sibling = app.build_window_context_for_test(91343, |owner| {
+            owner.items = vec![GridItem::Image(PathBuf::from("c:/fixtures/sibling.png"))];
+            owner.fullscreen_idx = Some(0);
+        });
+        app.with_viewer_context(sibling, |owner| {
+            let destination = owner.page_turn_destination();
+            owner
+                .page_turn_presentation
+                .seed_operation_for_test(destination, 73);
+            owner.fs_overflow_panel_state = FsOverflowPanelState::Root;
+            let before_items = owner.items.clone();
+            let before_input = owner.input_seq;
+            owner.toggle_page_turn_animation();
+            assert!(!owner.settings.page_turn_animation_enabled);
+            assert_eq!(owner.settings.page_turn_animation_duration_ms, 400);
+            assert_eq!(owner.page_turn_presentation.operation_for_test(), None);
+            assert_eq!(owner.items, before_items);
+            assert_eq!(owner.fullscreen_idx, Some(0));
+            assert_eq!(owner.input_seq, before_input);
+            assert_eq!(owner.fs_overflow_panel_state, FsOverflowPanelState::Root);
+        })
+        .unwrap();
+        assert!(!app.settings.page_turn_animation_enabled);
+        assert_eq!(app.page_turn_presentation.operation_for_test(), None);
+        assert_eq!(app.page_turn_destination(), main);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        let mut preferences = app.settings.clone();
+        preferences.page_turn_animation_enabled = true;
+        app.install_preferences_settings(preferences);
+        app.with_viewer_context(sibling, |owner| {
+            assert!(owner.settings.page_turn_animation_enabled);
+            assert_eq!(owner.items.len(), 1);
+            assert_eq!(owner.fullscreen_idx, Some(0));
+        })
+        .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn page_turn_setting_disable_clears_only_presentations_in_all_contexts() {
         let mut app = crate::app::setup_app_for_test();
         app.settings.page_turn_animation_enabled = true;

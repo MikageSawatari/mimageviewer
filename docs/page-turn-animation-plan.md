@@ -352,11 +352,14 @@ Gのmode-onlyとbindingの分離、modal入力所有、hidden提示許可を迂�
 有効設定は `page_turn_animation_enabled: bool`、表示名「ページめくりアニメーション」、**既定OFF採択済み**。
 方式は採択されたfold/curl一つ。Q2の最終時間を実機評価後に決めるため、`page_turn_animation_duration_ms: u32`を仮に追加し、100〜600ms・既定200ms、「時間（仮）」スライダーで調整する。最終の時間仕様は評価後に再決定し、この仮範囲を出荷仕様の採択と扱わない。方式picker・本別値・新DBは作らない。
 説明は「単発のページ送りとスライドショーで紙をめくる効果。連打・読込待ち・連結読みには適用しません。」。読込待ちの既存loading/holdoverまで瞬時化する約束ではない。
-既存preferences draft/save worker/settings transfer round-tripを使い、欠落fieldはOFF/200msへ補完する。通常設定の時間は100〜600msへ補正し、設定転送は型違い・範囲外を拒否して現在のdraftを保つ。
+既存preferences draft/save API/settings transfer round-tripを使い、欠落fieldはOFF/200msへ補完する。通常設定の時間は100〜600msへ補正し、設定転送は型違い・範囲外を拒否して現在のdraftを保つ。2026-10-11 HUD調査でsave workerという当初の記述を訂正した。既存の保存は同期APIであり、HUD接続の方式確認は§13に記録する。
 ON→OFFは即取消、OFF→ONは次の適格な操作から。設定確定に本reloadを足さない。
 slideshowは同じ有効設定と時間を使い、追加toggleは作らない。Q5のPC限定は決定済み。
 
-新KeyAction/shortcutは不要。取消は非消費のpresentation処理で、既存page Action・SinglePerFrameを維持。
+当初のPreferences-only A0では新KeyAction/shortcutは不要。取消は非消費のpresentation処理で、既存page Action・SinglePerFrameを維持。
+2026-10-11追加利用者要求（`target/A-1341-user-answers.txt`）で「その他の機能」にON/OFF行も追加する。
+既存overflowのON/OFF行はKeyActionと実割り当て表示を持つため、`FsPageTurnAnimationToggle`（FsImage/Press、既定なし）を同じ方式で追加する。
+固定並びのため表示項目カスタマイズは追加しない。Settingsの同じboolと時間を使用し、PreferencesとHUDは共通のadoption処理で取消とinput observation policyを更新する。別のbool、窓別値、reloadは作らない。
 既存typed consume結果/PadActionKindに操作原因を接続し、キーコード直書き・OS level再分類をしない。
 将来toggleをkeyboard/ringへ公開するならKeyAction/helper/ALL_ACTIONS/ini_name/context/default_chords/操作カスタマイズ・default keymapを一緒に追加。
 IME/TextInput/前面popupの所有は維持し、そこで消費されたキーを背面viewerへ再注入しない（`docs/key-customization-impl-plan.md:443`）。
@@ -522,3 +525,29 @@ Q3/Q4の採択とQ2の仮評価設定は§10のとおり。R3の設計採択はA
 **確認build handoff**: ビルド直前にこのworktreeのcoreが動いていないことを確認し、`-PreserveRuntime`で正常終了した。`target/dev-runtime/mimageviewer-core.exe`はportableではなく、既定で通常の`%APPDATA%\mimageviewer`を使う。実settings/dataを更新し得るため、利用者はインストール済み・tray常駐のmImageViewerを先に閉じてから、`Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`で起動する。実装者は起動していない。`target/A-1341-a0-msg.txt`に単ページ/見開きLTR・RTL、F12、取消、slideshowと仮時間の確認手順を記録した。コミットしていない。
 
 **未完了**: 出荷向け`test-full.ps1`、A0実装の独立完了レビュー、detached接続の具体的構造確認、別承認interactive、OFF/ON baseline・§9.1のwarm/追加profile実測、利用者による時間/動きの評価と最終時間採択は別gate。製品起動禁止の本handoffではbaseline/実機計測を行っていない。実装側の今後の結果はその時点の対象差分・command・exit/count・logとともに追記し、予定を実績にしない。
+
+## 13. HUD追加要求（2026-10-11）
+
+A0は利用者が`532635fdd`、projection golden補完を`e0f323d24`でコミットした。本追補は`e0f323d24`を基点とする未コミット差分。
+`target/A-1341-user-answers.txt`の追加要求に従い、PC静止画上部の「その他の機能」に同名のON/OFF行を追加する。固定順のナビゲータ位置の後へ置き、既定OFFと仮時間は維持する。
+既存toggleのKeyAction/実割り当て表示の方式を使い、既定キーなしの`FsPageTurnAnimationToggle`を追加する。固定順はカスタマイズ一覧ではないため、toolbar/HUD用の別設定やring Actionは作らない。
+
+PreferencesとHUDは`adopt_page_turn_animation_settings`に設定採用を集約する。全体Settingsの同じbool/時間、既存の全presentation退役とingress policy更新だけを使用し、window/contextの別設定、reload、pending stateや保存の待機は追加しない。既存ownerの採用経路へ合流する簡素化を選び、専用のlive rebuildや非同期保存の後着を扱う機構は導入しない。
+
+**保存方式は確認待ち**。sourceではPreferencesの保存も`Settings::save_checked()`による同期SQLite保存であり、設計§7の「save worker」という前提は成立していなかった。新しいHUD入口へ同期I/Oを接続することはAGENTS.mdのUI-thread規則と衝突するため、既存保存経路の再利用を認めるか、Settings writer全体の非同期化まで範囲を広げるかを利用者へ確認中。単独workerで古い全Settings snapshotを後着保存する実装は行わない。現在のHUD差分はメモリ反映までで、保存は未接続。manual/specの保存記述は要求仕様であり、この差分の完了・受入れを示さない。
+
+利用者が現在のA0 dev buildを確認中のため、`build-dev.ps1`や`target/dev-runtime`への書込み、製品起動は行わない。検証は`target/debug`のcheckとheadless testsに限定する。検証結果と残件は`target/A-1341-hud-msg.txt`へ記録する。独立レビュー・実機受入れの実績を追加しない。
+
+HUD差分の実施済み検証は次のとおり。保存の未接続を解消した証拠ではなく、現時点のメモリ反映/既存presentation owner/入力・描画を検証した結果である。Cargoは`MSBUILDDISABLENODEREUSE=1`。
+
+| コマンド/対象 | 結果 | 記録 |
+| --- | --- | --- |
+| `cargo fmt --all --check`、glyph lint、`git diff --check` | exit 0、危険glyph 0 | agent command結果 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0 | `target/A-1341-hud-normal-check-final.log` |
+| `cargo check --features portable` | exit 0 | `target/A-1341-hud-portable-check-final.log` |
+| `cargo test -p mimageviewer --lib page_turn` | exit 0、80成功 | `target/A-1341-hud-focused-2.log` |
+| `cargo test -p mimageviewer --lib keymap::tests` | exit 0、153成功 | `target/A-1341-hud-keymap.log` |
+| `cargo test -p mimageviewer --lib fullscreen_overflow` | exit 0、6成功 | `target/A-1341-hud-overflow.log` |
+| `cargo test -p mimageviewer --test ui_snapshot` | exit 0、157成功 | `target/A-1341-hud-ui-snapshot.log` |
+
+HUD rootの既存PNGを更新し、ON代表PNGを1枚追加して両方を目視した。Navigator submenu PNGは未変更。UPDATEなしの通常検査も成功した。初回lib compileのprivate context API参照は検査を既存context moduleへ移して解消し、APIの公開範囲を広げていない。新keymap fixtureの失敗は既存のkeyboard-owner cache/input guardへ揃えて解消し、製品側の入力条件を緩めていない。現coreのsize/mtimeはA0の325133312 bytes / LastWriteTimeUtc 2026-10-11 02:18:42のままである。

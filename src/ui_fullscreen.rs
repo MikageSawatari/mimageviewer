@@ -30710,6 +30710,11 @@ impl App {
             && self
                 .keymap
                 .consume_action(ctx, KeyAction::FsNavigatorToggle);
+        let key_page_turn_animation = !is_video_fs
+            && !fs_music_view_active
+            && self
+                .keymap
+                .consume_action(ctx, KeyAction::FsPageTurnAnimationToggle);
         let key_g =
             !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsPixelGrid);
         let key_m = !fs_music_view_active
@@ -31374,6 +31379,9 @@ impl App {
         if key_n_navigator {
             self.set_fullscreen_navigator_visible(!self.settings.fullscreen_navigator_visible);
         }
+        if key_page_turn_animation {
+            self.toggle_page_turn_animation();
+        }
         if key_z && !is_spread_double {
             if !self.analysis_mode && self.adjustment_mode.is_open() {
                 crate::ime_focus::record_side_panel_close(
@@ -32035,6 +32043,19 @@ impl App {
         }
     }
 
+    pub(crate) fn toggle_page_turn_animation(&mut self) {
+        // Persistence awaits the UI-thread save decision recorded in plan §13.
+        let enabled = !self.settings.page_turn_animation_enabled;
+        self.adopt_page_turn_animation_settings(
+            enabled,
+            self.settings.page_turn_animation_duration_ms,
+        );
+        self.show_feedback_toast(format!(
+            "[ページめくりアニメーション {}]",
+            if enabled { "ON" } else { "OFF" }
+        ));
+    }
+
     fn toggle_fs_pixel_grid(&mut self) {
         self.fs_pixel_grid_enabled = !self.fs_pixel_grid_enabled;
         self.show_feedback_toast(if self.fs_pixel_grid_enabled {
@@ -32082,6 +32103,20 @@ impl App {
                 FullscreenOverflowItemId::NavigatorPosition => (
                     item.label().to_string(),
                     format!("{}  >", self.settings.fullscreen_navigator_corner.label()),
+                    true,
+                    None,
+                ),
+                FullscreenOverflowItemId::PageTurnAnimationToggle => (
+                    self.keymap.first_chord_bracket_label(
+                        item.label(),
+                        KeyAction::FsPageTurnAnimationToggle,
+                    ),
+                    if self.settings.page_turn_animation_enabled {
+                        "ON"
+                    } else {
+                        "OFF"
+                    }
+                    .into(),
                     true,
                     None,
                 ),
@@ -32313,6 +32348,16 @@ impl App {
         let Some(action) = draw_fs_overflow_panel_surface(ui, panel_rect, &view) else {
             return;
         };
+        self.apply_fs_overflow_panel_action(ctx, &view, is_spread_double, action);
+    }
+
+    fn apply_fs_overflow_panel_action(
+        &mut self,
+        ctx: &egui::Context,
+        view: &FsOverflowPanelView,
+        is_spread_double: bool,
+        action: FsOverflowPanelAction,
+    ) {
         match action {
             FsOverflowPanelAction::Close => {
                 self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
@@ -32331,6 +32376,9 @@ impl App {
                 }
                 FullscreenOverflowItemId::NavigatorPosition => {
                     self.fs_overflow_panel_state = FsOverflowPanelState::NavigatorPosition;
+                }
+                FullscreenOverflowItemId::PageTurnAnimationToggle => {
+                    self.toggle_page_turn_animation()
                 }
                 FullscreenOverflowItemId::ImageAnalysis => {
                     let available =
@@ -57007,9 +57055,9 @@ mod tests {
         assert_eq!(submenu.width(), root.width());
         assert_eq!(
             root.height() - submenu.height(),
-            FS_OVERFLOW_PANEL_ROW_HEIGHT
+            2.0 * FS_OVERFLOW_PANEL_ROW_HEIGHT
         );
-        assert_eq!(root.height(), 348.0);
+        assert_eq!(root.height(), 396.0);
         assert_eq!(submenu.height(), 300.0);
         assert_eq!(root.width(), FS_OVERFLOW_PANEL_WIDTH);
 
@@ -57051,7 +57099,20 @@ mod tests {
         );
     }
 
-    fn snapshot_fullscreen_overflow_panel(name: &str, state: FsOverflowPanelState) {
+    fn snapshot_fullscreen_overflow_panel(
+        name: &str,
+        state: FsOverflowPanelState,
+        animation_enabled: bool,
+    ) {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.page_turn_animation_enabled = animation_enabled;
+        let animation_row = app
+            .fullscreen_overflow_panel_view(false)
+            .root_rows
+            .into_iter()
+            .find(|row| row.item == FullscreenOverflowItemId::PageTurnAnimationToggle)
+            .unwrap();
+        drop(app);
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(720.0, 440.0))
@@ -57112,6 +57173,8 @@ mod tests {
                                 disabled_reason: None,
                             },
                         ];
+                        let mut root_rows = root_rows;
+                        root_rows.insert(3, animation_row.clone());
                         let view = FsOverflowPanelView {
                             state,
                             root_rows,
@@ -57131,6 +57194,7 @@ mod tests {
         snapshot_fullscreen_overflow_panel(
             "fullscreen_overflow_panel_root",
             FsOverflowPanelState::Root,
+            false,
         );
     }
 
@@ -57139,7 +57203,75 @@ mod tests {
         snapshot_fullscreen_overflow_panel(
             "fullscreen_overflow_panel_navigator_submenu",
             FsOverflowPanelState::NavigatorPosition,
+            false,
         );
+    }
+
+    #[test]
+    fn fullscreen_overflow_panel_snapshot_page_turn_on() {
+        snapshot_fullscreen_overflow_panel(
+            "fullscreen_overflow_panel_page_turn_on",
+            FsOverflowPanelState::Root,
+            true,
+        );
+    }
+
+    #[test]
+    fn page_turn_animation_overflow_row_follows_shared_setting_and_keymap() {
+        let mut app = crate::app::setup_app_for_test();
+        assert!(!app.settings.page_turn_animation_enabled);
+        let row = |app: &App| {
+            app.fullscreen_overflow_panel_view(false)
+                .root_rows
+                .into_iter()
+                .find(|row| row.item == FullscreenOverflowItemId::PageTurnAnimationToggle)
+                .unwrap()
+        };
+        assert_eq!(row(&app).label, "ページめくりアニメーション");
+        assert_eq!(row(&app).status, "OFF");
+        app.keymap = Keymap::from_ini_str("[FsImage]\nFsPageTurnAnimationToggle = Ctrl+Shift+A\n");
+        let mut settings = app.settings.clone();
+        settings.page_turn_animation_enabled = true;
+        app.install_preferences_settings(settings);
+        assert_eq!(row(&app).status, "ON");
+        assert_eq!(
+            row(&app).label,
+            app.keymap.first_chord_bracket_label(
+                "ページめくりアニメーション",
+                KeyAction::FsPageTurnAnimationToggle
+            )
+        );
+        assert!(row(&app).enabled);
+        app.reading_flow = ReadingFlow::Vertical;
+        assert!(
+            row(&app).enabled,
+            "the global preference remains accessible in an unsupported flow"
+        );
+    }
+
+    #[test]
+    fn page_turn_animation_overflow_click_uses_the_production_row_and_handler() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = crate::app::setup_app_for_test();
+        app.fs_overflow_panel_state = FsOverflowPanelState::Root;
+        let duration = app.settings.page_turn_animation_duration_ms;
+        for enabled in [true, false] {
+            {
+                let mut harness = crate::test_ui::builder()
+                    .with_size(egui::vec2(800.0, 600.0))
+                    .build(|ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            app.draw_fs_overflow_panel(ui, ctx, ui.max_rect(), false);
+                        });
+                    });
+                harness.run();
+                harness.get_by_label("ページめくりアニメーション").click();
+                harness.run();
+            }
+            assert_eq!(app.settings.page_turn_animation_enabled, enabled);
+            assert_eq!(app.settings.page_turn_animation_duration_ms, duration);
+            assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Root);
+        }
     }
 
     fn assert_loupe_scale(mapping: LoupeSampleMapping, texture_size: egui::Vec2, expected: f32) {

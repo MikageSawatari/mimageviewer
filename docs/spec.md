@@ -1725,6 +1725,12 @@ jump panel / seek hover thumbnail も、KeyAction 由来の shortcut 表記は�
 keymap 対象にする。最近開いたフォルダ履歴と A/B の記憶した場所 + 一覧位置のクリア、および
 ピン留めタグ 1〜20 番の付与/解除も、標準キーなしのサムネイル一覧コマンドとして割り当てできる。`Esc` / 修飾なし矢印ナビゲーション、Ctrl+Shift+←/→、
 Ctrl+ホイールなど固定扱いの入力は従来どおり。
+
+ページめくりアニメーションのON/OFFも「その他の機能」の固定順に表示する。
+環境設定と同じ `Settings.page_turn_animation_enabled` が唯一の設定ownerで、通常/F12から即反映・保存する。
+`FsPageTurnAnimationToggle` は `FsImage` / Press、既定キーなし。操作カスタマイズで割り当てるとHUDに先頭chordを表示する。
+overflowの表示項目カスタマイズや別のtoolbar/HUD設定は追加しない。
+
 サムネイル一覧、通常の画像フルスクリーン、動画フルスクリーン、消しゴム / 隠蔽加工 / 切り取り / テキスト注釈 / 補正レイヤーモードでは、既定 `?` の `HelpShowContextShortcuts` で現在の文脈のショートカット一覧を
 表示する。keymap 化済み操作は現在の実割り当てで表示し、Esc / 矢印など当面固定扱いの
 操作は固定キーとして補助表示する。キー未設定または明示無効化中の割り当て可能操作は、
@@ -2309,6 +2315,8 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 先読み枚数の設定上限が前後とも 10 枚なので、上限まで増やしても行が伸び続けない。ホバー時は全対象の状態別件数を表示する。OFF にしても先読み処理は続ける。処理状況も OFF のとき、表示する行も点表示もなければ左下の枠自体を描画しない |
 | `downscale_smoothing_percent` | u32 | 0 | 通常静止画の「縮小時のなめらかさ」。0〜100・10刻みに正規化し、Lanczos3 の blur 1.00〜1.30 へ対応させる。全画像・全ウィンドウ共通 |
 | `anime_upscale_source_limit` | AnimeUpscaleSourceLimit | Px4096 | 「アニメ塗り拡大」を適用する可視元領域の長辺上限。2048px / 4096px / 制限なし。上限ちょうどは処理し、超過時は標準拡大へフォールバックする |
+| `page_turn_animation_enabled` | bool | false | 評価中のPC静止画ページめくり。環境設定 → 表示 → 閲覧表示と上部HUDの「その他の機能」で同じ値を変更する。通常/F12共通で即反映・保存。単発の準備済み隣接単ページ/LTR・RTL見開きとslideshowが対象。連打・読込待ち・連結読み、動画・音楽・Remoteには適用しない |
+| `page_turn_animation_duration_ms` | u32 | 200 | 評価用の「時間（仮）」、100〜600ms。最終時間は動きを見てから採択する。HUDのON/OFFはこの値を変更しない。slideshowのintervalまたはdeadline残時間が選択時間より短ければ演出を省略し、intervalを延長しない |
 | `fullscreen_seek_bar_locked` | bool | false | 静止画フルスクリーンの下部ページシークバーを固定表示する。ON のときは下端のバー領域を画像フィット範囲から除外する |
 | `still_seek_strip_locked` | bool | false | 静止画のサムネイル列を固定表示する。ON は下部ページシークバー固定を含意し、列表示中はバーと列を画像フィット範囲から除外する。列を閉じると OFF になる |
 | `still_seek_strip_visible` | bool | false | 静止画ページシークバーの source page サムネイル列を表示する |

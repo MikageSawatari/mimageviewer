@@ -857,6 +857,18 @@ fn emit(
 }
 
 impl App {
+    /// Preferences and HUD adopt the same global setting before any next turn.
+    pub(crate) fn adopt_page_turn_animation_settings(&mut self, enabled: bool, duration_ms: u32) {
+        if self.settings.page_turn_animation_enabled
+            && (!enabled || self.settings.page_turn_animation_duration_ms != duration_ms)
+        {
+            self.deactivate_all_page_turn_presentations("settings_changed");
+        }
+        crate::key_input::set_page_turn_ingress_instrumentation_enabled(enabled);
+        self.settings.page_turn_animation_enabled = enabled;
+        self.settings.page_turn_animation_duration_ms = duration_ms;
+    }
+
     pub(crate) fn page_turn_pre_draw(&mut self, ctx: &egui::Context) {
         self.flush_submitted_page_turn_ready(ctx);
         if !self.settings.page_turn_animation_enabled {

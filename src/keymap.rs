@@ -1713,6 +1713,7 @@ pub enum KeyAction {
     FsPanorama,
     FsPanoramaProjection,
     FsNavigatorToggle,
+    FsPageTurnAnimationToggle,
     FsNavigatorHold,
     FsPixelGrid,
     FsLoupeLockToggle,
@@ -2278,6 +2279,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsPanorama,
     KeyAction::FsPanoramaProjection,
     KeyAction::FsNavigatorToggle,
+    KeyAction::FsPageTurnAnimationToggle,
     KeyAction::FsNavigatorHold,
     KeyAction::FsPixelGrid,
     KeyAction::FsLoupeLockToggle,
@@ -4277,6 +4279,7 @@ impl KeyAction {
             FsPanorama => "FsPanorama",
             FsPanoramaProjection => "FsPanoramaProjection",
             FsNavigatorToggle => "FsNavigatorToggle",
+            FsPageTurnAnimationToggle => "FsPageTurnAnimationToggle",
             FsNavigatorHold => "FsNavigatorHold",
             FsPixelGrid => "FsPixelGrid",
             FsLoupeLockToggle => "FsLoupeLockToggle",
@@ -5007,6 +5010,7 @@ impl KeyAction {
             FsPanorama => "360度表示または通常動画の拡大表示を切り替える",
             FsPanoramaProjection => "360度パノラマの投影方式を切り替える",
             FsNavigatorToggle => "ナビゲータの表示を切り替える",
+            FsPageTurnAnimationToggle => "ページめくりアニメーションを切り替える",
             FsNavigatorHold => "押している間だけナビゲータを表示する",
             FsPixelGrid => "ピクセルグリッド表示を切り替える",
             FsLoupeLockToggle => "ルーペの固定表示を切り替える",
@@ -5547,6 +5551,7 @@ impl KeyAction {
             | FsImageAnalysis
             | FsZoomMode
             | FsNavigatorToggle
+            | FsPageTurnAnimationToggle
             | FsNavigatorHold
             | FsPixelGrid
             | FsLoupeLockToggle
@@ -6058,6 +6063,7 @@ impl KeyAction {
             | FsPanorama
             | FsPanoramaProjection
             | FsNavigatorToggle
+            | FsPageTurnAnimationToggle
             | FsPixelGrid
             | FsLoupeLockToggle
             | FsEraseMode
@@ -6596,6 +6602,7 @@ impl KeyAction {
             FsPanorama => ChordList::one(Chord::key(V)),
             FsPanoramaProjection => ChordList::one(Chord::shift(V)),
             FsNavigatorToggle => ChordList::one(Chord::alt(N)),
+            FsPageTurnAnimationToggle => ChordList::EMPTY,
             FsNavigatorHold => ChordList::one(Chord::modifier(ModKind::Alt)),
             FsPixelGrid => ChordList::one(Chord::key(G)),
             FsLoupeLockToggle => ChordList::one(Chord::key(M)),
@@ -12463,6 +12470,34 @@ mod tests {
                     .iter()
                     .any(|candidate| candidate == chord))
         );
+    }
+
+    #[test]
+    fn page_turn_animation_toggle_is_unbound_image_fullscreen_press() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::lock_test_input();
+        #[cfg(windows)]
+        let _clear = ClearTestKeyFrame;
+        let action = KeyAction::FsPageTurnAnimationToggle;
+        assert_eq!(action.context(), KeyContext::FsImage);
+        assert_eq!(action.trigger(), KeyTrigger::Press);
+        assert_eq!(action.default_chords().iter().count(), 0);
+        let keymap = Keymap::from_ini_str("[FsImage]\nFsPageTurnAnimationToggle = Ctrl+Shift+A\n");
+        assert_eq!(keymap.effective_chords(action).iter().count(), 1);
+        let ctx = egui::Context::default();
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+        begin_key_pass(&ctx, egui::Key::A, modifiers);
+        assert!(!Keymap::default().consume_action(&ctx, action));
+        assert!(keymap.consume_action(&ctx, action));
+        assert!(
+            !keymap.consume_action(&ctx, action),
+            "one press cannot toggle twice"
+        );
+        let _ = ctx.end_pass();
     }
 
     #[test]

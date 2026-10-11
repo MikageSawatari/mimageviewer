@@ -1457,6 +1457,8 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ### 2026-10-11 §1.341 A0: context単位の紙めくりpresentationと共有会計（確認待ち）
 
+2026-10-11 HUD追補（`e0f323d24`後、未コミット）: 既存PC静止画HUDに全体設定のON/OFF行を追加し、Preferencesのadoption処理へ合流する。既存`deactivate_all_page_turn_presentations`を設定変更時に再利用するだけで、detached述語・viewport routing・bundle/workerの所有契約は変更しない。F12からの変更が全体設定と各presentationに反映し、兄弟のitems/idx/input sequenceを変えないことを既存context test内で検査する。保存方式はpage-turn plan §13の確認待ちであり、独立構造合意・実機確認を主張しない。
+
 R3は利用者からACCEPTと伝達され`0f6ad9f19`へ統合済み。今回のA0未コミット差分は、
 `src/ui_fullscreen/page_turn.rs`のtyped `PageTurnPresentation`を既存`ViewerContextBundle`へ接続する。
 Inactive/Flat/Offered/Turningは当該contextの提出済みunitとimmutable paint resourceを所有し、

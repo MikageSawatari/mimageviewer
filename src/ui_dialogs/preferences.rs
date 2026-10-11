@@ -2404,15 +2404,9 @@ impl App {
         if self.settings.remember_spread_shift_per_book != settings.remember_spread_shift_per_book {
             self.spread_shift_memory_setting_changed(settings.remember_spread_shift_per_book);
         }
-        if self.settings.page_turn_animation_enabled
-            && (!settings.page_turn_animation_enabled
-                || self.settings.page_turn_animation_duration_ms
-                    != settings.page_turn_animation_duration_ms)
-        {
-            self.deactivate_all_page_turn_presentations("settings_changed");
-        }
-        crate::key_input::set_page_turn_ingress_instrumentation_enabled(
+        self.adopt_page_turn_animation_settings(
             settings.page_turn_animation_enabled,
+            settings.page_turn_animation_duration_ms,
         );
         self.settings = settings;
         if !self.settings.preferences_restore_position {
