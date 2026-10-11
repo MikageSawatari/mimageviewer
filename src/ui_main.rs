@@ -26651,6 +26651,62 @@ mod grid_reclick_open_tests {
     }
 
     #[test]
+    fn grid_cursor_rating_grid_undo_restores_shift_origin_in_thumbnail_and_details() {
+        let _input_guard = crate::key_input::lock_test_input();
+        for view in [
+            crate::settings::GridViewMode::Thumbnail,
+            crate::settings::GridViewMode::Details,
+        ] {
+            let mut harness = rating_selection_harness(view);
+            let app = &mut harness.state_mut().app;
+            app.fullscreen_idx = None;
+            app.move_grid_cursor(Some(1));
+            assert!(app.set_rating(1, 2));
+            assert_eq!(app.selected, Some(2));
+            ctrl_z_rating_origin(app);
+            assert_eq!(app.fullscreen_idx, None);
+            assert_eq!(app.selected, Some(1));
+            assert_eq!(
+                app.grid_click_selection_anchor,
+                Some(GridClickSelectionAnchor::new(1, app.items_generation))
+            );
+            click_cell(&mut harness, 0, egui::Modifiers::SHIFT);
+            assert_eq!(harness.state().app.checked, HashSet::from([0, 1]));
+            assert_eq!(harness.state().activations, 0);
+        }
+    }
+
+    #[test]
+    fn grid_cursor_rating_grid_explicit_click_cancels_later_undo_and_redo_landing() {
+        let _input_guard = crate::key_input::lock_test_input();
+        for view in [
+            crate::settings::GridViewMode::Thumbnail,
+            crate::settings::GridViewMode::Details,
+        ] {
+            let mut harness = rating_selection_harness(view);
+            let app = &mut harness.state_mut().app;
+            app.fullscreen_idx = None;
+            app.move_grid_cursor(Some(1));
+            assert!(app.set_rating(1, 2));
+            click_cell(&mut harness, 0, egui::Modifiers::NONE);
+            ctrl_z_rating_origin(&mut harness.state_mut().app);
+            assert_eq!(harness.state().app.selected, Some(0));
+            assert_eq!(
+                harness.state().app.grid_click_selection_anchor,
+                Some(GridClickSelectionAnchor::new(
+                    0,
+                    harness.state().app.items_generation
+                ))
+            );
+            harness.state_mut().app.apply_meta_redo();
+            assert_eq!(harness.state().app.selected, Some(0));
+            assert_eq!(harness.state().app.fullscreen_idx, None);
+            click_cell(&mut harness, 2, egui::Modifiers::SHIFT);
+            assert_eq!(harness.state().app.checked, HashSet::from([0, 2]));
+        }
+    }
+
+    #[test]
     fn paired_identity_remap_keeps_checks_and_scroll_then_shift_click_uses_remapped_anchor() {
         for view in [
             crate::settings::GridViewMode::Thumbnail,

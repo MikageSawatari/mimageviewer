@@ -8545,6 +8545,21 @@ fn cycle_video_playback_speed(current: f64, delta: i32) -> f64 {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn rating_grid_undo_and_redo_manual_pad_choice_wins_before_replay_in_both_views() {
+        use crate::app::rating_membership_tests::rating_grid_history_manual_input_case;
+        use crate::settings::GridViewMode;
+        for view in [GridViewMode::Thumbnail, GridViewMode::Details] {
+            for redo in [false, true] {
+                for dir in [PadDir::Left, PadDir::Right] {
+                    rating_grid_history_manual_input_case(view, redo, |app| {
+                        app.handle_gamepad_direction_for_grid(dir);
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
     fn rating_undo_grid_pad_moves_edges_and_empty_sets_cancel_held_restore() {
         use crate::app::rating_membership_tests::rating_undo_grid_input_case;
         use crate::settings::GridViewMode;

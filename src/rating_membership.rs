@@ -42,8 +42,41 @@ impl RatingPreviewRecipe {
 pub struct RatingOrigin {
     pub(crate) owner: u64,
     pub(crate) listing_identity: String,
-    pub(crate) page_key: Option<String>,
-    pub(crate) presentation: ViewerPresentation,
+    pub(crate) target: RatingOriginTarget,
+}
+
+/// A history entry owns its landing permission. Explicit grid navigation turns
+/// Grid into ValueOnly without losing the durable rating edit or its context.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RatingOriginTarget {
+    ValueOnly,
+    Grid(String),
+    Viewer {
+        key: String,
+        presentation: ViewerPresentation,
+    },
+}
+
+impl RatingOriginTarget {
+    pub(crate) fn key(&self) -> Option<&String> {
+        match self {
+            Self::ValueOnly => None,
+            Self::Grid(key) | Self::Viewer { key, .. } => Some(key),
+        }
+    }
+
+    fn viewer_key(&self) -> Option<&String> {
+        match self {
+            Self::Viewer { key, .. } => Some(key),
+            _ => None,
+        }
+    }
+}
+
+impl RatingOrigin {
+    pub(crate) fn viewer_key(&self) -> Option<&String> {
+        self.target.viewer_key()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

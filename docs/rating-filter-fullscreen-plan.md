@@ -86,6 +86,9 @@ R2の前回5件とR3のring独立検索更新の指摘は解消。F12公開境�
 
 ## 4. Undoの所有・復帰intentの終端 (レビューP2-3)
 
+- **2026-10-11実機確認後の利用者決定**: gridで評価により隠れた項目は、Undoで現在一覧に再び表示されるなら元項目へcursorを戻す。Redoもafter値で対象が表示される場合は対称に適用する。集合ownerがこの行先を一度決定し、§1.370の`move_grid_cursor`に渡すためShift+click起点も追随する。対象が非表示のままなら通常の集合調停だけを行い、復帰のために条件を解除しない。Grid originからreaderを開かない。
+- originは同じ履歴owner内の`Grid(key) / Viewer { key, presentation } / ValueOnly`へ整理する。評価後にclick/key/pad等の明示選択を受理したら、同owner/listingのUndo/Redo履歴内のGrid originをValueOnlyに変更し、既存のlive RestoreOriginもReconcileへ取消す。端no-op/空一覧も含む。別context/listingのoriginと値のUndo/Redo自体は保持する。新しいApp-global navigation世代やpending復帰状態は増やさない。Undo/Redoによるrequest置換はpending取消だけとし、entry自身のGrid復帰権限を消さない。自動移動/identity reindexも消さない。
+- 追加受入: thumbnail/Details（Name降順も含む）でF2→次項目→Ctrl+Z→元項目・Shift起点→Redoを固定する。明示click/key/padがUndo/Redo前に入るケース、端no-op、復帰Ready前の操作、非表示のままのUndo/Redo、Redoで再表示、slot再配置後の一度だけの復帰を検査する。履歴のGrid権限失効は同owner/listingの両stackだけとし、兄弟・別一覧・Viewer origin・before/after値・stack順は保つ。組合せを減らすため、履歴owner自身のtargetをValueOnlyへ失効させ、App-global bool/追加世代/別の取消台帳は採用しない。
 - `UndoEntry::Rating` に一つのtyped origin (`Grid / Viewer { context_id, listing_identity, page_key, presentation }`、仮称) を持たせる。RatingChangeのstable keyと同じ操作を所有し、別の「最後のratingページ」やpending reopenを足さない。grid/Remote/container-only変更から無条件にreaderを開かない。
 - 自動所属移動・最後の一枚の一覧復帰は既存open/closeへ内部causeとして渡し、**ratingのUndo/Redoだけ保持**する。clearの必要なidx-only adjustment/layer Undoや保留drag/tagを丸ごと `take` して戻さない。通常の手動open/close・scope変更・context破棄のclear方針は維持し、同時に以下のrequest intentも終了する。
 - Ctrl+ZはDB transaction成功後、同じ集合採用へ `RestoreOrigin` を渡す。有効な元keyが同context/listingで対象へ戻れば通常近傍より優先して一回着地する。最後の一枚の自動退出後も、同一覧のUndoなら元presentationで元画像を開く。非評価filterを解除しない。元keyが現在条件に合わない/消失している場合は値を書き戻すだけとし、復帰不可を通知する。旧窓/旧scopeを再作成しない。
@@ -97,7 +100,7 @@ R2の前回5件とR3のring独立検索更新の指摘は解消。F12公開境�
 | Undo待ち中の別Undo | 後のUndoのorigin/世代へ置換する。古いReadyは採用検証で失効し、二つの復帰を予約しない。 |
 | 同じ一覧内の手動next/prev、seek、page指定、grid click/open、矢印・Home/End・Pageキー・パッドのgrid選択移動 | **操作受理境界で**live ownerのRestoreOriginをReconcileへ置換する。ページ送り・grid選択の境界no-opと空一覧でも明示移動意思を優先する。ring/gesture/mouseのGridMoveFirst/Lastも同じ受理境界へ接続する。必要なmembership refresh自体は残し、完了時は最新anchorで調停する。入力制限で受理されない操作は取消さない。自動移動も使う`move_grid_cursor` / `apply_grid_cursor_move`には取消を置かず、input_seq全体で無関係な入力まで取消しない。 |
 | Esc/通常reader close、別scope/open/history、context retire、request cancel | close/変更前にintentを終了する。membershipだけが後から採用されてもreaderを再openしない。Undoスタックclearだけに取消を依存させない。F12の内部mount/元contextへ戻るswapは手動navigationと扱わない。 |
-| Redo受理 (Ctrl+Y / Ctrl+Shift+Z) | 先行RestoreOriginを取消す。成功したafter値の最新requestはReconcileとなり、現anchorから次/前/一覧を一度決定する。保存失敗時も古いUndo復帰intentを再生せず、既存のログ/通知・Redo entry保持に従う。 |
+| Redo受理 (Ctrl+Y / Ctrl+Shift+Z) | 先行requestのRestoreOriginを取消す。entryの未取消Grid originならafter値の最新requestへ対称なRestoreOriginを渡し、表示対象へ戻ればその項目を優先する。Viewer originは従来どおりReconcileで現anchorから次/前/一覧を一度決定する。保存失敗時も古いUndo復帰intentを再生せず、既存のログ/通知・Redo entry保持に従う。 |
 | latestへの通常reprepare | live ownerに残るintentだけを移す。cancel済みintentをworker結果から復活させない。 |
 | 有効なsetの採用 | originが対象へ戻り着地できる採用でintentを `take` して**着地前に一度だけ消費**する。既存media landing/close終端へ渡したらrequestから消す。最新の確定結果で復帰不可なら通知して終了。stale結果はconsumeしない。 |
 

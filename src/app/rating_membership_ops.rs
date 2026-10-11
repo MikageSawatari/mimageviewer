@@ -1,8 +1,8 @@
 //! One destination decision at the context-owned set adoption boundary (§1.371).
 use super::*;
 use crate::rating_membership::{
-    RatingAdoptionIntent, RatingNeighborDecision, RatingOrigin, RatingPreviewRecipe,
-    reconcile_rating_neighbor_with_basis,
+    RatingAdoptionIntent, RatingNeighborDecision, RatingOrigin, RatingOriginTarget,
+    RatingPreviewRecipe, reconcile_rating_neighbor_with_basis,
 };
 
 pub(crate) struct RatingMembershipSnapshot {
@@ -273,11 +273,20 @@ impl App {
         Some(RatingOrigin {
             owner: self.projected_viewer_context_id().serial(),
             listing_identity: self.rating_listing_identity(),
-            page_key: self
+            target: self
                 .sidecar_restore_rating_deferred_target()
                 .or(self.fullscreen_idx)
-                .and_then(|idx| self.rating_membership_key(idx)),
-            presentation: self.viewer_presentation,
+                .and_then(|idx| self.rating_membership_key(idx))
+                .map(|key| RatingOriginTarget::Viewer {
+                    key,
+                    presentation: self.viewer_presentation,
+                })
+                .or_else(|| {
+                    self.selected
+                        .and_then(|idx| self.rating_membership_key(idx))
+                        .map(RatingOriginTarget::Grid)
+                })
+                .unwrap_or(RatingOriginTarget::ValueOnly),
         })
     }
 
@@ -377,7 +386,7 @@ impl App {
             .collect::<HashMap<_, _>>();
         let grid = self.rating_membership_keys(self.current_grid_order());
         let media = old.media
-            || matches!(&intent, RatingAdoptionIntent::RestoreOrigin(origin) if origin.page_key.as_ref().and_then(|key| positions.get(key)).is_some_and(|&idx| self.viewer_item_is_media(idx)));
+            || matches!(&intent, RatingAdoptionIntent::RestoreOrigin(origin) if origin.viewer_key().and_then(|key| positions.get(key)).is_some_and(|&idx| self.viewer_item_is_media(idx)));
         let reader_indices = self
             .current_reader_order()
             .iter()
@@ -398,7 +407,7 @@ impl App {
             RatingAdoptionIntent::RestoreOrigin(origin)
                 if origin.owner == old.owner && origin.listing_identity == old.listing =>
             {
-                origin.page_key.as_ref().filter(|key| reader.contains(key))
+                origin.viewer_key().filter(|key| reader.contains(key))
             }
             _ => None,
         };
@@ -418,13 +427,34 @@ impl App {
         } else {
             None
         };
-        let mut cursor =
-            self.decide_rating_neighbor(&old.grid, old.selected.as_deref(), &grid, None);
+        let mut cursor = match &intent {
+            RatingAdoptionIntent::RestoreOrigin(origin)
+                if origin.owner == old.owner
+                    && origin.listing_identity == old.listing
+                    && old.page.is_none() =>
+            {
+                match &origin.target {
+                    RatingOriginTarget::Grid(key)
+                        if grid.contains(key) && old.selected.as_ref() != Some(key) =>
+                    {
+                        RatingNeighborDecision::Move(key.clone())
+                    }
+                    _ => {
+                        self.decide_rating_neighbor(&old.grid, old.selected.as_deref(), &grid, None)
+                    }
+                }
+            }
+            _ => self.decide_rating_neighbor(&old.grid, old.selected.as_deref(), &grid, None),
+        };
         match &page {
             Some(RatingNeighborDecision::Move(key)) => {
                 let idx = positions[key];
-                if let RatingAdoptionIntent::RestoreOrigin(origin) = &intent {
-                    self.viewer_presentation = origin.presentation;
+                if let RatingAdoptionIntent::RestoreOrigin(RatingOrigin {
+                    target: RatingOriginTarget::Viewer { presentation, .. },
+                    ..
+                }) = &intent
+                {
+                    self.viewer_presentation = *presentation;
                 }
                 self.open_fullscreen_for_rating_membership(idx);
                 cursor = RatingNeighborDecision::Move(key.clone());
@@ -463,10 +493,11 @@ impl App {
         }
         if let RatingAdoptionIntent::RestoreOrigin(origin) = intent {
             if origin
-                .page_key
-                .as_ref()
+                .target
+                .key()
                 .is_some_and(|key| !positions.contains_key(key))
             {
+                let restore_viewer = origin.viewer_key().is_some();
                 let pending_intent = RatingAdoptionIntent::RestoreOrigin(origin);
                 let mut preparing = false;
                 if let Some(pending) = self.rating_view_pending.as_mut() {
@@ -474,16 +505,12 @@ impl App {
                     preparing = true;
                 }
                 preparing |= self.set_search_rating_adoption_intent(pending_intent);
-                if !preparing {
+                if !preparing && restore_viewer {
                     self.show_feedback_toast(
                         "評価は戻しましたが、元のページは現在の一覧にありません".into(),
                     );
                 }
-            } else if origin
-                .page_key
-                .as_ref()
-                .is_some_and(|key| !reader.contains(key))
-            {
+            } else if origin.viewer_key().is_some_and(|key| !reader.contains(key)) {
                 self.show_feedback_toast(
                     "評価は戻しましたが、元のページは現在の表示条件に含まれません".into(),
                 );
@@ -496,6 +523,16 @@ impl App {
     }
 
     pub(crate) fn cancel_rating_membership_restore(&mut self) {
+        self.meta_undo.cancel_grid_rating_origins(
+            self.projected_viewer_context_id().serial(),
+            &self.rating_listing_identity(),
+        );
+        self.cancel_pending_rating_membership_restore();
+    }
+
+    // Undo/Redo replace the pending request, but are not manual navigation and
+    // must leave the history entry's symmetric Grid landing permission intact.
+    pub(crate) fn cancel_pending_rating_membership_restore(&mut self) {
         self.cancel_sidecar_restore_rating_deferred_target();
         if let Some(pending) = self.rating_view_pending.as_mut() {
             pending.rating_adoption = RatingAdoptionIntent::Reconcile;
@@ -517,7 +554,11 @@ impl App {
         origin: Option<&RatingOrigin>,
     ) -> Result<Option<String>, String> {
         let intent = origin
-            .filter(|_| use_before)
+            .filter(|origin| match origin.target {
+                RatingOriginTarget::Grid(_) => true,
+                RatingOriginTarget::Viewer { .. } => use_before,
+                RatingOriginTarget::ValueOnly => false,
+            })
             .cloned()
             .map(RatingAdoptionIntent::RestoreOrigin)
             .unwrap_or(RatingAdoptionIntent::Reconcile);
@@ -538,10 +579,10 @@ impl App {
                 } else {
                     RatingAdoptionIntent::Reconcile
                 };
-                app.cancel_rating_membership_restore();
+                app.cancel_pending_rating_membership_restore();
                 app.apply_rating_changes_to_app(changes, use_before, intent)?;
                 let unavailable = use_before
-                    && origin.page_key.as_ref().is_some_and(|key| {
+                    && origin.viewer_key().is_some_and(|key| {
                         !same_listing
                             || ((0..app.items.len())
                                 .any(|idx| app.rating_membership_key(idx).as_ref() == Some(key))

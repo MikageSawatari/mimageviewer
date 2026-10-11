@@ -270,7 +270,7 @@ impl App {
     pub(crate) fn apply_meta_redo(&mut self) {
         // An accepted Redo replaces any outstanding Undo restoration, including
         // when the after-value write fails or there is no entry left to replay.
-        self.cancel_rating_membership_restore();
+        self.cancel_pending_rating_membership_restore();
         let Some(mut entry) = self.meta_undo.pop_redo() else {
             return;
         };
@@ -973,7 +973,7 @@ impl App {
             format!("コンテナを★{after}")
         };
         let origin = self.capture_rating_origin().map(|mut origin| {
-            origin.page_key = None;
+            origin.target = crate::rating_membership::RatingOriginTarget::ValueOnly;
             origin
         });
         self.push_rating_undo_entry_with_origin(

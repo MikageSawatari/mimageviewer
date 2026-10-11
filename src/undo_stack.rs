@@ -250,6 +250,23 @@ impl UndoStack {
             .retain(|entry| matches!(entry, UndoEntry::Rating { .. }));
     }
 
+    /// Manual selection wins over both later Undo and Redo in the same grid.
+    pub(crate) fn cancel_grid_rating_origins(&mut self, owner: u64, listing: &str) {
+        use crate::rating_membership::RatingOriginTarget;
+        for entry in self.undo.iter_mut().chain(self.redo.iter_mut()) {
+            if let UndoEntry::Rating {
+                origin: Some(origin),
+                ..
+            } = entry
+                && origin.owner == owner
+                && origin.listing_identity == listing
+                && matches!(origin.target, RatingOriginTarget::Grid(_))
+            {
+                origin.target = RatingOriginTarget::ValueOnly;
+            }
+        }
+    }
+
     /// 貼り付け / リセットで外部から置き換えたページについて、古い編集 Undo/Redo だけを
     /// 両スタックから除く。Rating / Tag、別ページ、Favorite / Global の補正履歴は残す。
     ///
@@ -512,12 +529,75 @@ mod tests {
     }
 
     #[test]
+    fn rating_grid_origin_cancellation_is_scoped_and_keeps_both_value_histories() {
+        use crate::rating_membership::{RatingOrigin, RatingOriginTarget};
+        let entry = |owner, listing: &str, target| {
+            let mut entry = rating_entry("c:/a.jpg", 3, 4);
+            let UndoEntry::Rating { origin, .. } = &mut entry else {
+                unreachable!()
+            };
+            *origin = Some(RatingOrigin {
+                owner,
+                listing_identity: listing.into(),
+                target,
+            });
+            entry
+        };
+        let grid = || RatingOriginTarget::Grid("a".into());
+        let viewer = RatingOriginTarget::Viewer {
+            key: "a".into(),
+            presentation: crate::app::ViewerPresentation::Fullscreen,
+        };
+        let mut stack = UndoStack::new();
+        stack.push(entry(17, "list", grid()));
+        stack.push(entry(18, "list", grid()));
+        stack.push(entry(17, "other", grid()));
+        stack.push(entry(17, "list", viewer.clone()));
+        stack.push(entry(17, "list", grid()));
+        let redo = stack.pop_undo().unwrap();
+        stack.push_redo(redo);
+        stack.cancel_grid_rating_origins(17, "list");
+        let targets = stack
+            .undo
+            .iter()
+            .chain(stack.redo.iter())
+            .map(|entry| {
+                let UndoEntry::Rating {
+                    origin: Some(origin),
+                    changes,
+                    ..
+                } = entry
+                else {
+                    unreachable!()
+                };
+                assert_eq!(changes[0].before, 3);
+                assert_eq!(changes[0].after, 4);
+                origin.target.clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            targets,
+            vec![
+                RatingOriginTarget::ValueOnly,
+                grid(),
+                grid(),
+                viewer,
+                RatingOriginTarget::ValueOnly
+            ]
+        );
+        assert_eq!(stack.undo_len(), 4);
+        assert_eq!(stack.redo_len(), 1);
+    }
+
+    #[test]
     fn retain_rating_keeps_both_stack_orders_and_stable_origins() {
         let origin = crate::rating_membership::RatingOrigin {
             owner: 17,
             listing_identity: "listing".into(),
-            page_key: Some("origin-page".into()),
-            presentation: crate::app::ViewerPresentation::Fullscreen,
+            target: crate::rating_membership::RatingOriginTarget::Viewer {
+                key: "origin-page".into(),
+                presentation: crate::app::ViewerPresentation::Fullscreen,
+            },
         };
         let mut with_origin = rating_entry("c:/a.jpg", 3, 4);
         let UndoEntry::Rating { origin: stored, .. } = &mut with_origin else {

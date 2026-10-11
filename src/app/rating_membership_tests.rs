@@ -1139,11 +1139,19 @@ fn reader_key(app: &App) -> Option<String> {
 }
 
 fn rating_view_with_absent_undo_origin() -> (AppTestEnv, Vec<GridItem>) {
+    rating_view_with_absent_origin(false)
+}
+
+pub(super) fn rating_view_with_absent_grid_undo_origin() -> (AppTestEnv, Vec<GridItem>) {
+    rating_view_with_absent_origin(true)
+}
+
+fn rating_view_with_absent_origin(grid: bool) -> (AppTestEnv, Vec<GridItem>) {
     let mut app = images(&["b", "a", "c", "d"]);
     app.items_are_rating_view = true;
     app.rating_view_stars = 3;
     app.rating_view_sort = Default::default();
-    app.fullscreen_idx = Some(1);
+    app.fullscreen_idx = if grid { None } else { Some(1) };
     app.selected = Some(1);
     let all = app.items.clone();
     assert!(app.set_rating(1, 4));
@@ -1157,7 +1165,7 @@ fn rating_view_with_absent_undo_origin() -> (AppTestEnv, Vec<GridItem>) {
     // The accepted Rating Ready starts a separate real IndexOnly owner. Finish that
     // prerequisite before Undo/manual input; only the later Rating result is held.
     app.finish_page_identity_preparation_for_test();
-    assert_eq!(app.fullscreen_idx, Some(1));
+    assert_eq!(app.fullscreen_idx, if grid { None } else { Some(1) });
     assert_eq!(app.items[1], all[2]);
     assert_eq!(app.meta_undo.undo_len(), 1);
     app.apply_meta_undo();
@@ -1167,6 +1175,228 @@ fn rating_view_with_absent_undo_origin() -> (AppTestEnv, Vec<GridItem>) {
         RatingAdoptionIntent::RestoreOrigin(_)
     ));
     (app, all)
+}
+
+#[test]
+fn rating_grid_undo_returns_f2_item_and_redo_excludes_it_in_both_orders() {
+    let _input_guard = crate::key_input::lock_test_input();
+    for view in [
+        crate::settings::GridViewMode::Thumbnail,
+        crate::settings::GridViewMode::Details,
+    ] {
+        let mut app = images(&["a", "b", "c"]);
+        app.fullscreen_idx = None;
+        app.settings.grid_view_mode = view;
+        let next = if view == crate::settings::GridViewMode::Details {
+            app.settings.details_sort_key = crate::settings::DetailsSortKey::Name;
+            app.settings.details_sort_ascending = false;
+            app.details_order = vec![2, 1, 0];
+            0
+        } else {
+            2
+        };
+        app.move_grid_cursor(Some(1));
+        press_grid_key(&mut app, egui::Key::F2, egui::Modifiers::NONE);
+        assert_eq!(app.selected, Some(next));
+        assert_eq!(anchor(&app), Some(next));
+        press_grid_key(&mut app, egui::Key::Z, egui::Modifiers::CTRL);
+        assert_eq!(app.selected, Some(1));
+        assert_eq!(anchor(&app), Some(1));
+        assert!(app.scroll_to_selected);
+        assert_eq!(app.fullscreen_idx, None);
+        press_grid_key(&mut app, egui::Key::Y, egui::Modifiers::CTRL);
+        assert_eq!(app.selected, Some(next));
+        assert_eq!(anchor(&app), Some(next));
+        assert_eq!(app.fullscreen_idx, None);
+    }
+}
+
+#[test]
+fn rating_grid_undo_manual_key_choice_before_undo_or_redo_wins_even_at_edge() {
+    let _input_guard = crate::key_input::lock_test_input();
+    for view in [
+        crate::settings::GridViewMode::Thumbnail,
+        crate::settings::GridViewMode::Details,
+    ] {
+        for redo in [false, true] {
+            for pressed in [egui::Key::Home, egui::Key::ArrowLeft, egui::Key::ArrowRight] {
+                let mut app = images(&["a", "b", "c"]);
+                app.fullscreen_idx = None;
+                app.settings.grid_view_mode = view;
+                app.settings.grid_cols = 1;
+                app.settings.grid_cursor_wrap = false;
+                app.move_grid_cursor(Some(1));
+                assert!(app.set_rating(1, 4));
+                if redo {
+                    app.apply_meta_undo();
+                }
+                press_grid_key(&mut app, pressed, egui::Modifiers::NONE);
+                let manual = app.selected;
+                let shift = anchor(&app);
+                if redo {
+                    app.apply_meta_redo();
+                } else {
+                    app.apply_meta_undo();
+                }
+                assert_eq!(app.selected, manual);
+                assert_eq!(anchor(&app), shift);
+                assert_eq!(app.fullscreen_idx, None);
+                if !redo {
+                    app.apply_meta_redo();
+                    app.apply_meta_undo();
+                    assert_eq!(
+                        app.selected, manual,
+                        "cancel survives the entry's round trip"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn rating_grid_undo_empty_grid_restores_cursor_without_opening_reader() {
+    for view in [
+        crate::settings::GridViewMode::Thumbnail,
+        crate::settings::GridViewMode::Details,
+    ] {
+        let mut app = images(&["only"]);
+        app.fullscreen_idx = None;
+        app.settings.grid_view_mode = view;
+        assert!(app.set_rating(0, 2));
+        assert_eq!(app.selected, None);
+        assert_eq!(anchor(&app), None);
+        app.apply_meta_undo();
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(anchor(&app), Some(0));
+        assert_eq!(app.fullscreen_idx, None);
+        app.apply_meta_redo();
+        assert_eq!(app.selected, None);
+        assert_eq!(anchor(&app), None);
+        assert_eq!(app.fullscreen_idx, None);
+    }
+}
+
+pub(super) fn rating_grid_history_manual_input_case(
+    view: crate::settings::GridViewMode,
+    redo: bool,
+    input: impl FnOnce(&mut App),
+) {
+    let mut app = images(&["a", "b", "c"]);
+    app.fullscreen_idx = None;
+    app.settings.grid_view_mode = view;
+    app.settings.grid_cols = 1;
+    app.settings.grid_cursor_wrap = false;
+    app.move_grid_cursor(Some(1));
+    assert!(app.set_rating(1, 4));
+    if redo {
+        app.apply_meta_undo();
+    }
+    input(&mut app);
+    let manual = app.selected;
+    let shift = anchor(&app);
+    if redo {
+        app.apply_meta_redo();
+    } else {
+        app.apply_meta_undo();
+    }
+    assert_eq!(app.selected, manual);
+    assert_eq!(anchor(&app), shift);
+    assert_eq!(app.fullscreen_idx, None);
+}
+
+#[test]
+fn rating_grid_undo_hidden_origin_keeps_cursor_and_redo_visible_origin_rebases_it() {
+    for view in [
+        crate::settings::GridViewMode::Thumbnail,
+        crate::settings::GridViewMode::Details,
+    ] {
+        let mut app = images(&["a", "b", "c"]);
+        app.fullscreen_idx = None;
+        app.settings.grid_view_mode = view;
+        app.settings.rating_filter[4] = true;
+        app.move_grid_cursor(Some(1));
+        assert!(app.set_rating(1, 4));
+        // Settings projection (not a manual cursor move) hides the before-value.
+        app.settings.rating_filter = [false, false, false, false, true, false];
+        for idx in [0, 2] {
+            let key = key(&app, idx);
+            app.rating_db.as_ref().unwrap().set(&key, 4).unwrap();
+            app.rating_cache.insert(idx, 4);
+        }
+        app.release_rating_preview_membership(RatingAdoptionIntent::Reconcile);
+        app.apply_meta_undo();
+        let manual = app.selected;
+        let shift = anchor(&app);
+        assert_ne!(manual, Some(1));
+        assert!(!app.visible_indices.contains(&1));
+        // A second Undo write cannot resurrect an item excluded by another condition.
+        app.search_filter = Some([0, 2].into_iter().collect());
+        app.apply_meta_redo();
+        assert_eq!(app.selected, manual);
+        assert_eq!(anchor(&app), shift);
+        assert!(!app.visible_indices.contains(&1));
+        app.apply_meta_undo();
+        app.search_filter = None;
+        app.apply_meta_redo();
+        assert_eq!(
+            app.selected,
+            Some(1),
+            "Redo's after-value returns the original row"
+        );
+        assert_eq!(anchor(&app), Some(1));
+        assert_eq!(app.fullscreen_idx, None);
+    }
+}
+
+#[test]
+fn rating_grid_undo_held_ready_restores_reindexed_item_once_or_keeps_manual_choice() {
+    let _input_guard = crate::key_input::lock_test_input();
+    for view in [
+        crate::settings::GridViewMode::Thumbnail,
+        crate::settings::GridViewMode::Details,
+    ] {
+        for manual in [false, true] {
+            let (mut app, all) = rating_view_with_absent_grid_undo_origin();
+            app.settings.grid_view_mode = view;
+            let intent = app
+                .rating_view_pending
+                .as_ref()
+                .unwrap()
+                .rating_adoption
+                .clone();
+            let sender = controlled_rating_request(&mut app, intent);
+            sender
+                .send(Ok(ready_with_current_rating_facts(&app, all.clone())))
+                .unwrap();
+            if manual {
+                press_grid_key(&mut app, egui::Key::Home, egui::Modifiers::NONE);
+            }
+            let selected = app.selected.and_then(|idx| app.rating_path_key(idx));
+            app.poll_rating_view();
+            app.finish_page_identity_preparation_for_test();
+            assert_eq!(app.fullscreen_idx, None);
+            assert_eq!(app.items, all);
+            if manual {
+                assert_eq!(
+                    app.selected.and_then(|idx| app.rating_path_key(idx)),
+                    selected
+                );
+                assert_eq!(anchor(&app), app.selected);
+            } else {
+                assert_eq!(app.selected, Some(1));
+                assert_eq!(anchor(&app), Some(1));
+            }
+            let sender = controlled_rating_request(&mut app, RatingAdoptionIntent::Reconcile);
+            sender
+                .send(Ok(ready_with_current_rating_facts(&app, all.clone())))
+                .unwrap();
+            app.poll_rating_view();
+            app.finish_page_identity_preparation_for_test();
+            assert_eq!(app.fullscreen_idx, None);
+            assert_eq!(app.selected, if manual { Some(0) } else { Some(1) });
+        }
+    }
 }
 
 /// Hold the real Rating Undo's Ready after the last reader leaves and its slot
