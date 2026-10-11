@@ -1,9 +1,9 @@
 # ページめくりアニメーション設計案 — backlog §1.341
 
-2026-10-11 / r3 + A0実装追補 / **利用者からR3 ACCEPTと伝達され、`0f6ad9f19`でmasterへ統合済み。既定OFF・slideshow適用を採択し、時間は実機評価用の仮設定。A0の未コミット製品差分と自動検証を記録。実装の独立完了レビュー・実機確認・性能/実用性受入れは未完了。**
+2026-10-11 / **R4設計案（§15、未実装・レビュー/採択待ち）**。R3はACCEPT後に統合され、A0と追補もコミット済みだが、利用者の実機評価で動きは不合格となった。R4では背を軸に一枚のleafを返す方式へ改める。既定OFF・仮時間・final-only・入力取消・F12所有・VRAM会計は維持する。§1〜14はR3/A0の設計・検証履歴であり、§15で明示した置換対象をR4の現行要件として併用しない。独立レビュー・R4の実装/実機/性能受入れは未了。
 
 R3設計時の参照treeは `next-prefs` / `1ee3e178288f2eff119da16b672d546cc3c9992c`（R2文書commit、開始時clean）。当時の製品コードはmaster `cb00930011323cacd7088ae70c37835141aad58a` と同じだった。
-既存の `file:line` は設計時のsource inspection位置。A0は§1.364統合後の`0f6ad9f19`を基点とする未コミット差分で具体化した（§12）。新しい実機性能測定はまだ行っていない。
+既存の `file:line` は各設計/追補時のsource inspection位置。A0は§1.364統合後の`0f6ad9f19`を基点に具体化した（§12）。A0は`532635fdd`、golden補完は`e0f323d24`、HUDは`bf3b2fae0`、PDF追補は`ea5f6624a`、保存判断の来歴訂正は`e3a328ff6`でコミットされた。§15はこのHEADと利用者提示の実機結果を基点とする。既存の自動検証成功は動きの品質合格を意味しない。
 実装開始の前提は**§1.364のmaster統合後**。そのowner/unit/token契約を消費し、同機能を再実装しない。
 後続ラインGの本構成は相互作用だけを扱い、本項でbuilder・保存仕様を先取りしない。
 
@@ -447,6 +447,7 @@ Q1は2026-10-10にC方向・旧/新が見える実際のpage-turnとして採択
 1. **Q2: 最終時間は動きを見てから決める。** 評価用の仮スライダーは100〜600ms・既定200ms。新内容は最初のready frameから見え、全面表示は選択した時間内。新入力/held/seekで即終了する。
 2. **Q3: 既定OFF採択済み。** 2026-10-11の利用者判断は「速度が売り」。従来の瞬時切替を初期値に保ち、希望する方がONにできる。ONでも読込待ち・連打には演出を付けない。
 3. **Q4: slideshowにも同じ効果を適用する。** 即ready条件と§6のduration/deadline条件を使い、intervalや次ページ提示を遅くしない。個別toggleは追加しない。
+4. **2026-10-11の実機再評価: A0の動きは不合格。** 利用者は「本のページをめくるように見えること」を要求し、RTL forwardでは旧左頁だけを持ち上げて右へ返すこと、普通のscanの寸法/配置差で省略しないことを明示した。新しいmotionのR4案を§15へ記録する。§15の通知契約・数値・instant範囲まで採択されたとは扱わない。
 
 次々回への延期許容は品質と正しさのための工程判断であり、通常の入力を遅くする、既存機能を外す、ready提示を停止する許可ではない。
 そのような変更が必要と判明したら実装前に費用と選択肢を提示して相談する。
@@ -586,7 +587,7 @@ ready lookupは現edit/params keyのresidentかつcompleteなfinal composite、�
 
 ### 14.3 保存・簡素化・検証
 
-§13の利用者決定に従い、HUDと任意KeyActionの共通toggleは既存overflowの`Settings::save()`を呼ぶ。Preferencesと同じSettings owner/adoptionを使い、F12の変更でitems/idx/input sequenceを変えない。headless実行でON→OFF各clickとF12 OFFの後、隔離DBを再読込してboolと仮時間を確認する。
+§13の設計担当ClaudeCodeの決定（既存overflow経路の踏襲）に従い、HUDと任意KeyActionの共通toggleは`Settings::save()`を呼ぶ。これは利用者による保存方式の決定ではない。Preferencesと同じSettings owner/adoptionを使い、F12の変更でitems/idx/input sequenceを変えない。headless実行でON→OFF各clickとF12 OFFの後、隔離DBを再読込してboolと仮時間を確認する。
 
 非同期保存や追加pendingの組合せを作らず、既存同期保存の出口へ揃える簡素化を採用する。geometryは一つのpure比較境界で補正し、viewport reloadやreader別の丸め状態は作らない。まれな保存失敗は既存経路を継承し、新たなretry/recoveryは追加しない。
 
@@ -603,3 +604,298 @@ ready lookupは現edit/params keyのresidentかつcompleteなfinal composite、�
 | `build-dev.ps1 -PreserveRuntime`（通常profile） | exit 0、core/remote/EPUB成功、VCRT/PE runtime=4・pe=3。起動なし | `target/A-1341-fix-build-dev.log` |
 
 初回の小型spread goldenは幅の引き算に必要な座標丸め誤差を検出し、計算境界を修正してから上の最終gateを通した。閾値を大きくして通したものではない。unfiltered lib/workspace検査を成功したと主張しない。確認用buildはcore process不在を直前に確認して`build-dev.ps1 -PreserveRuntime`で行い、結果をhandoffとbuild logへ記録する。製品起動は利用者のみ。
+
+## 15. R4 — 背を軸に一枚のleafを返す再設計（2026-10-11）
+
+**状態: 設計案のみ。製品code・golden・設定・実行binaryは変更しない。build/起動/独立レビューも行っていない。**
+設計担当から伝達された利用者の実機評価は「本のページをめくるように見えること」であり、A0の帯状の動きは不合格。
+R4はこの要求を具体化する案で、以下の数値・shape対応・可視提示契約の改訂まで利用者が採択したと扱わない。
+
+### 15.1 実機で反証された前提と黒い帯の原因
+
+| 証拠 | 確認できる原因・限界 |
+| --- | --- |
+| 利用者報告: scanned PDF / spread / RtlCover、8/8が`page_placement_changed` | 読み取り専用の現perfログでも8件を確認。最初の旧左rectは`[2.0,44,699.33331,1056]`、新左は`[0.66667,44,699.33337,1056]`（min/max、point単位）、ppp=1.5。sourceは旧1151×1670、新1153×1671。左端差1.33333pt=2物理pxは実際のfit差であり、1pxの丸め誤差ではない。`preflight`のold/new配置一致条件が、普通のscanを非対応にしている。閾値を2px、5pxへ増やす修正では解決しない |
+| 利用者報告: 20 curls / 1455 framesだが黒い帯にしか見えない | `canonical_unit`は`FsBgStyle::Solid(BLACK)`をpage underlayへ変換し、`project_turn`のsingle reverseは`old.underlay.clone()`を**裏面materialそのもの**に使う。通常初期値`fs_transparent_bg_mode=0`はBLACKなので、背面の幅広いflat stripと細いcurve stripが黒くなる。画像textureの裏面を参照し忘れたのではなく、「画面背景を紙の裏とみなす」明示的な素材選択の誤り。通常のimage underlayは維持するが、紙のreverse materialと別概念にする |
+| 現投影の`screen_rect` / `fold` / `radius` | 全faceは旧頁のtop/bottomを持つ軸平行矩形。foldは幅方向を移動し、radiusは頁幅の2.5%だけ。depth、perspective、広いleafの回転、revealed pageへのcast shadowがない。既存shadeは細帯ごとの一様tintで、黒いmaterialはtintを変えても黒い。この形と素材の組合せが「帯が横へ移動する」見え方を直接作る |
+| 利用者報告: spread全体が一枚に見える | コードは`turning_slot`を選び、旧反対頁を静止描画している。したがって「二頁全体を一つのmeshで回した」とは断定しない。しかし裏面の新反対頁を旧頁側の`screen_rect`へ貼り、折り線を動かして露出させるため、背を支点として反対slotへ回る一枚のleafになっていない。既存RTL forward goldenも途中の旧左頁側にD4が現れる帯状投影を示す |
+| 実提出・UV/clipの切り分け | 現ログではstartにsource/native texture IDと正のareaがあり、finishまで続く。spread backは`incoming.pages[1-turning_slot]`のtextureを明示使用する。mesh UVの欠落、全裏面のtexture未登録、黒いunderlayだけの描画漏れを示す証拠はない。現`Builder::face`は参照pageのaxis-aligned clipを移動面にも使うため、対応範囲を広げる際はdestination clipとの分離も必要だが、今回の黒色はsingleのmaterial選択で説明できる |
+
+参照ownerは`src/page_turn_animation.rs::{project_turn,preflight,Builder::face}`、
+`src/ui_fullscreen/page_turn.rs::canonical_unit`、`src/ui_fullscreen.rs::{transparent_bg_style,fs_bg_style}`、
+`src/app.rs`の初期background mode。既存single-mid goldenも紙ではなく高さ一定の中央帯であることを目視した。
+ログにbackground mode自体はないので、各captureのBキー選択状態まで復元したとは言わない。
+黒背景経路が実装上必ず黒いreverseを作ることと、実機の「黒い帯」という観測が整合する、という原因の特定である。
+
+今回読み取ったログ全体は24 start/24 finish/1731 frame（single 20 start、Rtl spread 4 start）を含む。
+これは利用者が提示した20/1455の集計範囲と区別し、後の追加試行を同じ実験とみなさない。
+8件のgeometry拒否と、成立した提出でも品質不合格という二つの問題を別に閉じる。start/finish数だけでは合格にならない。
+
+### 15.2 book model — 紙一枚、表裏二面、固定された下の頁
+
+既存compositionが返すscreen-left/right、occurrence/role、singletonの形成理由・配置を正本とする。
+`idx±1`、paint rectの左端だけ、`pages.len()==2`だけから物理slotやcoverを推測しない。
+綴じ方向は既存の`mode.reading_direction().unwrap_or(context.reading_direction)`から一度捕捉する。
+現callerの`mode.advances_right_to_left()`はSingleで常にfalseになり、保持しているRTL方向を表さない。
+R4ではpresentationの背/回転に既存contextの方向を使い、forward/backwardは受理済みnavigation causeをそのまま使う。
+矢印キー、tap、seekの既存方向や入力基数を変更せず、animation用の第二の綴じ設定を足さない。
+**一回のturnで動くleafは一枚だけ**。静止する相方まで同じsheetに入れず、leafのfront/backは同じ頂点位置に別materialを持つ。
+front/backをcross-fadeして一面に貼る方式は使わない。viewerに向いた面を法線で選び、隠れた面は描かない。
+
+旧左=A、旧右=B、新左=C、新右=D。Sは持ち上げる側、Tは着地側。
+
+| direction | S→T | leaf front | leaf back | leafの下に置く新頁 | 閉じるまで残す旧相方 |
+| --- | --- | --- | --- | --- | --- |
+| LTR forward | 右→左 | B | C | D（右） | A（左） |
+| RTL forward | **左→右** | **A** | **D** | **C（左）** | **B（右）** |
+| LTR backward | 左→右 | A | D | C（左） | B（右） |
+| RTL backward | 右→左 | B | C | D（右） | A（左） |
+
+frontはSで平らな旧頁から持ち上がる。角度が90度未満では表が見え、下の新S頁が自由端側から現れる。
+90度付近では紙は薄いedgeになり、旧T頁がそのまま見える。90度を越えると新T頁を印刷したbackが見え、Tへ倒れて旧T頁を覆う。
+最後は新S/Tの通常描画になる。RTLは位置・回転の向きだけを反転し、文字のUVを鏡映しない。
+reverseでも同じS/T対応を使う。slideshowはforwardの同じrecipeで、別motionや専用状態を作らない。
+
+描画順は、通常canvas背景 → 新S頁 → 旧T頁 → 受ける面にclipしたsoft shadow → 浮くleaf。
+Tの新頁を初めから平面にも二重描画しない。backがTへ入るまでは新T頁は不可視であり、存在だけで提示済みにしない。
+gutterは通常の空間として固定し、leafが浮いた投影だけが背を跨ぐ。HUD/navigator/seekは通常の前面に置く。
+
+**single-page表示は本の片側だけを見る窓として定義する。** LTRの背は頁左端、RTLは頁右端（reading-forwardの自由端の反対）。
+forwardは現在頁のfrontをこの背から起こし、次頁を通常の自身のrectで下に置く。背の反対側へ回った部分はsingleのbook apertureでclipし、
+90度を越えて隠れた旧leafを画面端へslideしたり、200ms後に突然消したりしない。横長頁も一枚で、中央を分割しない。
+backwardはその時間反転で、**前の頁（incoming）一枚が同じ背から戻って、現在頁（outgoing）の上へ着地する**。
+LTR backwardは左側から、RTL backwardは右側から入る。逆操作だけ背を反対端へ移す「旧頁をもう一度捨てる」方式は採らない。
+incoming frontは自身のrectへ着地し、outgoingはその下で静止する。incomingの見える部分が初回poseからあるよう、窓外の不可視の半回転は演出時間に含めない。
+
+singleのreverse印刷はデータにない。必要なedge/backの演出素材は控えめなneutral paper（例: RGB 238/236/230）と陰影であり、
+黒背景・checkerを紙の裏へ流用しない。知らない別頁、鏡像の旧頁、仮のoccurrenceを作らない。
+frontの透明部分は従来のunderlay/checker/alphaをそのまま使い、frontの透明性を紙色で塗り潰さない。
+このneutral paperは一時的なreverse surfaceだけで、通常表示・capture/export・保存画素を変更しない。
+
+### 15.3 leafのgeometry・perspective・陰影
+
+素材と通常geometryは分離する。各面は自身のoccurrence、prepared resource、rotation/trim UV、canonical paint/layout rectをimmutableに持つ。
+新Sと旧Tの平面は各々の通常rectのまま。leafのfront endpointは旧S、back endpointは新Tの実rectへ正確に一致させる。
+**old/new rect同士の一致・左右頁の等幅/同じ高さをadmission条件にしない。** 普通のscan差、portrait/landscapeの非対称Pairも対象にする。
+同じ紙の二面が異なるscan boxを持つことはpresentationの問題として扱い、sourceのfit/scale・PDF demandを作り直さない。
+
+背は通常layoutのslot/gutterを解決した位置から捕捉する。trim後paint端の微差を「新しい背」と誤認しない。
+通常Pairでは同じvirtual spreadの背が支点となる。coverの中央表示から開いたspread等でcanonicalな背の位置が変わる場合は、
+旧背→新背を一回のrecipeの中で連続補間する。これは**同じleafが付く一本の背の移動**で、独立して頁幅を横断するfold線ではない。
+window移動/resize/DPI/zoom/pan操作による背の変更は補間対象にせず、従来どおりcancel+通常表示。
+normal layout ownerの既存slot/placement情報をprepared unitへ添えるだけとし、projectionに第二のfit resolverや端判定を作らない。
+
+純粋projectionの座標は次を基準にする（製品codeではなくgeometry契約）:
+
+- u=0は背側、u=1は自由端。vは上下。Sの左右符号をσとし、leafの距離d(u)、高さy(v)、背Hを持つ。
+- leafは`x=H+σ*d(u)*cos(θ)`、`z=d(u)*sin(θ)`で背の周りに回る。zはviewer側が正。
+  initial/finalの隙間を含むdとyは各面の通常rectから作り、端点のgap・top/bottomも一致させる。
+- 異寸法のfront/backは、θ=60〜120度の狭く見える区間でd/y/必要ならHをsmoothstep補間する。
+  0〜60度のfrontは旧寸法、120〜180度のbackは新寸法。UVは各面の自身の通常UV basisで、隣頁への引伸ばしや再fitをしない。
+  これはscanの違いを表示上吸収する一枚のvirtual leafであり、scan寸法から実物の紙寸法を推測したとは言わない。
+- perspectiveは背の中央を基準に`F/(F-z)`でx/yを投影する。Fはleaf envelopeの最大寸法の8倍以上とし、near planeを跨がせない。
+  浮く自由端で上下の広がりが変わる台形、幅のforeshortening、背に留まる辺が見える。x幅だけ縮める軸平行quadは不可。
+- 基本は自己交差しない一枚の3D leaf。必要な紙らしい小さい反りは同じu/θ関数に限定し、背で変位ゼロ、平らな端点で反りゼロ。
+  折返し帯や自己交差する円筒、別のspring/物理simulation/途中resume状態を復活させない。
+
+egui meshを第一候補にする。perspectiveでprojectしたvertexへcanonical UVを付け、screen上のaffine UV近似誤差をsubdivisionで抑える。
+recipe作成時に最大poseの誤差を見積もってgridを選び、目安16×4、上限32×8、境界で0.5物理px以内を検査する。
+texture/underlay/shadowを合わせて既存§5の4096 vertices / 8192 triangles上限内。buffer再利用、page画素のCPU合成・新upload・毎frame全items走査なし。
+back UVは「θ=180度の各投影cornerが新Tの同じcanonical cornerになる」対応から作る。uのmin/maxをsortして向きを失わず、
+非対称の文字・角番号で前後/LTR/RTLを検査する。固定回転・trimも通常UVを消費し、印字を逆転させない。
+
+leafは床面z=0より前にあり、基本形は自分自身と交差しないので、front/back選択とstatic surfaceとの遮蔽を解析できる。
+leafのsilhouetteとdestination clipをpolygonで処理し、visibilityは投影polygonの面積から遮蔽を差し引く。
+現Builderの「軸平行rectの面積」やunion bounding boxをperspectiveのproofとして転用しない。underlayとimageを二面として面積に加算しない。
+単なる頂点色shadeやshadowはincoming内容の可視面積に数えない。
+
+**陰影は必須で、あとで足す飾りではない。** 固定の柔らかい光に対する法線の明暗に、背側→自由端の弱いgradientをvertex colorで掛ける。
+読める表面を残すため暗さの下限を設ける（初期案: content tint 0.72以上、紙edgeは別）。LUT/AI/色管理を再適用しない。
+投影leafから床面へ落とすshadowは、受ける新S/旧Tの実面にclipした数段のalpha gradient polygon。
+浮き始めは近く細く、持ち上がると柔らかく広がり、着地で縮んで消える。不透明な黒い長方形を影と呼ばない。
+shadowはpageを覆い隠す主役にせず、平らな端点ではゼロにする。
+
+異寸法の新Tが旧Tより小さい場合、backで覆えない旧T外周を最後に突然消す問題も扱う。
+旧Tの座標は動かさず、閉じる最後の10%で **旧T rectのうち新Tの通常surface外に残る部分だけ**を通常背景へ連続的に退役させる。
+single arrivalでも同じ規則で、incomingの通常surface外に残るoutgoing下地だけを退役させる。
+新Tの印刷面・新S・全spreadをfadeさせず、時間から求める差分polygonのalphaとclipで処理する。別のsettle owner/待機stateは作らない。
+通常の微小scan差では数pxの外周整合であり、大きいサイズ差もfixtureで確認する。これは異なるcanonical footprintをつなぐ明示的なpresentation処理で、
+文字を隣頁へ伸ばす案や、二頁全体をslide/fadeする代替案ではない。終端/cancelは通常helperでflat提出し、通常画素と完全一致することを検査する。
+
+### 15.4 unit shapeごとのrecipeとinstantの境界
+
+frame-localなshape入力は既存composition/formation/placementから一回作る。
+`Pair(left,right)`、`SideSingle(side,real,companion=Blank|Vacant)`、`CenteredSingle(real)`を区別する。
+SideSingleは強制単頁、端配置の単頁、coverの論理sideを持つ。coverが設定により中央へ置かれていても、既存unit位置/cover位相でsideが確定するなら
+pageのcanonical rectはその中央配置のままSideSingleのendpointとして使う。根拠のないsingletonはCenteredSingle。
+Blankは既存の明示白いsurface、Vacantはsurfaceなし。どちらにも新occurrence/address/readinessを作らない。
+末尾の表紙補助は既存の`FrontCoverSupplement`を持つ実materialで、同じidxのNavigation occurrenceと混同しない。
+recipe選択は、まず以下のSingleWindow対象を解決し、残りをBookLeafのS/T対応へ渡す。
+SideSingle同士の一頁窓では、背はそのphysical sideのinner edge（Leftなら右辺、Rightなら左辺）を使う。
+中央の一頁窓の背は§15.2の綴じ方向から取る。これは同じnormal placement入力の消費で、画像を別sideへ置き直す処理ではない。
+
+| 旧→新（隣接、同じ本・表示設定） | R4の動き |
+| --- | --- |
+| Pair→Pair | §15.2の一枚のleaf。頁の寸法・位置差だけではskipしない。左右どちらの頁もportrait/landscapeでよく、固定gutter・fitを消費する |
+| Single mode→Single mode（横長含む） | forwardは旧頁のdeparture、backwardは前頁のarrival。両頁のrectは独立。viewport内で見えるcanonical domainとROIが満たされればaspect差も対応 |
+| CenteredSingle→CenteredSingle（同じspread設定で中央横長頁が続く等） | SingleWindowのdeparture/arrival。同じ設定内の一頁unitとして各rectを消費し、仮の左/右実slotを作らない |
+| SideSingle→Pair、cover→最初のspread | 旧Sが実頁/明示Blankならその一枚がfront、新Tがback、新Sが下の頁。旧TがVacantなら通常背景のまま。中央配置coverは旧rectから開いた新back rectへ接続し、白紙相方や隠しcover textureを作らない |
+| Pair→SideSingle、Pair→強制単頁+Blank | 新Sに実頁があり、新Tが明示Blankならその白紙をback、新Sを下に露出させる。旧Tは閉じるまで静止し、終端の白紙は通常のBlankと一致。新TがVacantなら`vacant_landing_surface`でinstant（紙を着地させてから突然消したり、空きslotを白紙に変えたりしない） |
+| SideSingle→SideSingle / 強制単頁を含む隣接境界 | 同じslot対応で一枚のleafを組めるものはBookLeaf。旧/新とも一実頁だけの同じ側の窓、相方VacantならSingleWindowを使う。単独表示を二実頁に数えず、明示Blankのleafはtexture不要で同じclockを使う。空き側へ着地するBookLeafを無理に構成せず、上/下のinstant条件を適用 |
+| 最終spread+表紙補助 | 既存screen orderとroleに従うPairとして同じBookLeaf。補助のdecode、readiness、native leaseも通常の採用素材だけ。補助を別navigation targetにしない |
+| BookLeafで新unitの唯一の実頁がT側（閉じるcover、末尾の片側単頁等） | 前半に実incomingが一枚も見えず、first-visibleを待たせる。R4初版は`landing_only_target`でinstant。最初から100度以上回したposeへ飛ぶ案、Vacantへ架空の新頁を置く案は採らない。端に限定された既知の省略で、普通のPair間turnを省略しない |
+| BookLeafで旧SがVacant、動かす実leaf/Blankがない | `no_turning_leaf`でinstant。旧Tの頁をSへ移してめくる、存在しない白紙を作ることは禁止。通常のcover→Pairは旧coverがSにあるのでこの理由にはならない |
+| CenteredSingle→Pair（単頁表示設定のswitchではなく横長等のunit境界） | 一枚の旧頁をSingleWindowのdepartureで返し、新Pair全体を自身の配置で下に露出させる。旧画像を左右に割らず、新Pairの片頁を偽のreverseにしない。BookLeafの表裏対応と区別したrecipe名を記録 |
+| Pair→CenteredSingle（中央横長頁、相方を持たない中央単頁等） | 一枚の新画像が両slotを跨ぐため、二枚の旧頁から一leafの表裏を対応できない。`centered_target_spans_spine`でinstant。新画像を二分、duplicate、勝手にsideへ縮小しない |
+| 中央coverで論理sideを証明できない／その他の不整合 | 既存sideの根拠がないcoverはCenteredSingle扱い。compositionのrole/occurrence対応が不正なら具体的sub-checkを付けてinstant。frame geometryだけからcoverを推測しない |
+
+unitの一頁/二頁への**通常の隣接遷移**は、cache内の同じunit列/tokenに属する別unit間のshape変更であり、上表でrecipeを選べる。
+寸法の後着によるunit列の再構成、shift/設定/本構成adoption、slice変更などの**列/token自体の変更**は従来どおりcancel/instant。
+これを混同して全Single↔Pairを一括除外する旧§3.3の条件は撤回する。Gのbuilder/storeは改変せず、将来の明示Pair/Blank/Vacant契約を消費する。
+
+通常fitの連続Pair comicは、scan寸法差を含め原則対応。instantは端のlanding-only、中央横長への遷移、存在しないleafなど構造上の境界へ絞る。
+cover/landscape/forced-singleが多い本では省略率を別集計し、稀だと推測だけで済ませない。これらの省略も利用者評価の対象として開示する。
+
+### 15.5 final readinessと実際の可視提示を分ける（R3の矛盾を解消する提案）
+
+**final-onlyは一切変更しない。** 受理時に全incomingの現在key/generationに一致するcomplete finalと必要annotation/comic合成がresidentである条件、
+all-or-none、通常source選択、後着から開始しない条件は§4/§14.2のまま。
+raw prefetch/CPU AI prefetchをfinal-readyと数えない。今回は`not_final_ready_at_accept`の条件・cache保持・producerを変更しない。
+
+一方、R3の「最初のframeで新S/T両頁が5%以上/短辺8pt」「50%で旧frontと各incomingが20%以上」は、
+opaque leafを背から回すと満たせない。新Tはθ>90度まで紙の裏に隠れ、θ=90度ではfront/backの面積がほぼゼロになる。
+このgateを維持したまま本のように見せるために、新TをSの帯へ先に貼ったり、同じ頁を平面へ重複表示したりしてはならない。
+**§3.2・§4(3〜4)・§4.1・§9の「全incoming初回可視/中点20%」はR4で置換する提案**。
+素材のready条件を緩める話ではなく、紙に隠れている素材を不可視として正しく扱う表示契約の改訂である。
+
+first frameには「実incomingの少なくとも一つ」の意味ある露出を要求する（仮基準: そのcanonical可視面積の5%以上、connected短辺8pt以上）。
+BookLeaf/Single forwardは初期liftの仮角度30度を第一候補とし、通常の終端180度（single窓は90度まで）へ補間する。
+F≥8×最大寸法なら同寸法の通常頁で30度の自由端は幅の約92.4%以内となり、perspectiveの拡大を含めても下の頁を露出できる。
+不等寸法ではrecipe作成時だけ30/45/60度を順に検査し、閾値を満たす最小角を固定する。60度を越える初期poseで旧frontを細帯にすることはしない。
+single backwardはincomingが初回から見える仮角度80度から0度へ戻す。これらの角度はdurationと独立した品質定数で、追加preferenceにはしない。
+角度は受理時刻からの`elapsed/D`をclampしてsmoothstep補間し、paint時に時計をリセットしない。
+純粋なθ=0/180のendpointは通常frameとの照合に使うが、初回ready passに「まだ新頁が何も見えない準備frame」は挟まない。
+上の有限候補で有効なincoming露出がない場合は具体的`initial_target_visibility`で同pass flat。
+初期角の選択と通常のθ補間もrecipeに含め、毎frame姿勢を探して待つ、geometryのためにphaseを先送りする、後から開始する処理はない。
+
+atomic submission/visible receiptは以下へ改訂する。
+
+1. 全incomingを通常どおり各一回prepareし、全resource/ROI・recipe・pin予算・初期の実incoming露出を先に検査する。
+   同passの一ownerが`Flat`か`BookLeaf/SingleWindow`を排他的に一度提出する。途中で片頁だけ提出しない。
+2. receiptは、**unitの全final素材とidentityが採用された証拠**と、**各occurrenceの投影/遮蔽後可視area（ゼロも含む）**を別に保持する。
+   source存在を面積に変換しない。新Tのarea=0は正しい結果であり、source照合失敗とは区別する。
+3. navigationには、同じaccepted target unitの全素材がfinal-readyで、一つ以上の実incomingが上の閾値で見えた採用passを
+   unit presentationとして通知する。sequenceをleafの裏やfinishまで保持しない。これがR4の**ON時unit提示の意味の改訂**であり、
+   `SubmittedUnitReceipt::matches_sources`の現「全page area>0」と`observe_fs_navigation_sequence_presented`へのall-pages trace依存をそのまま流用できない。
+   typed unit submission証拠をobserverへ渡し、まだ見えない新Tをper-page提示済みと偽らない。
+4. per-occurrenceの`fs/page_turn_ready`/first-visibleは実際に見えたpageだけへ通知し、新Tはbackが露出した採用passで初めて通知する。
+   unitのidentity/source照合と可視集合を分け、既存ready signatureのunit丸ごとdedupで新Tの後の初出を捨てない。
+   観測済み集合は同じaccepted-operationのsubmission ledgerで持ち、第二のnavigation queue/ready ownerや待機boolを作らない。
+5. 破棄egui passのreceiptは採用せず、再passは同じoperation/source identityでdedupする。通常OFFの通知は従来の全unit平面の即時経路のまま。
+   新入力で取消したpassは通常canonical targetを描き、既存受理/drop/orderを変えない。取消を用いて未提示targetを飛ばすことも禁止。
+
+この改訂では`input→全素材ready`、`ready→unit first target visible`、`ready→各page first visible`、`ready→canonical fully visible`を別計測する。
+新Tの初出が回転の後半になることはreal book modelの演出費用として記録し、初回から両頁visibleと報告しない。
+採択duration内の全面表示は維持する。held/repeat/seekは次の通常paintへ即取消で、finishまで操作を止めない。
+既存page-turn perf解析のI1〜I5はOFFで維持し、ONではこのunit/per-page区別を明示した検査にする。ログの意味だけを黙って変えない。
+**表示通知・入力との接点が変わるため、R4実装前に設計担当と独立reviewerがこの契約を確認する。未確認のまま実装へ進まない。**
+
+### 15.6 維持するowner・ROI・VRAM・OFFの契約
+
+`PresentationState::{Inactive,Flat,Offered,Turning}`、context/window/viewport binding、stable operation identityを再利用する。
+immutable recipeは`Turning`に一つだけ入り、front/back/under/restは既存unit素材への面参照。
+BookLeaf/SingleWindow departure/arrivalというrecipeの選択を時間stateや別boolで重複表現しない。
+受理時の時計/deadline、expiry、interruption、F12 fork/park/mount/deposit/retire、shared-input-seqを取消identityにしない規則は§4/§6のまま。
+同じincoming snapshotが演出中に変わったら取消す安定性検査は維持する。
+綴じ方向もrecipe/signatureへ同じcontextから捕捉し、方向変更のadoptionで当該effectを終了する。共有/兄弟contextの方向から再導出しない。
+**開始前のold/new頁同士が異寸法であること**と、**開始後の同じincomingがviewport/処理/source変更で変わること**を区別する。
+前者はrecipeの入力、後者は取消factであり、両方を「placement_changed」で扱わない。
+
+geometryのclipは三つを分ける: (a)正本canonical page domain、(b)prepared resourceが実際に覆うUV/ROI、(c)描画先のviewport/HUDを除くclip。
+浮くleafを参照pageの旧slot矩形でclipして隣側へ渡れなくしない。destination clipで投影を切り、UVは各materialのavailable domain内だけ。
+必要な全poseのUV coverageを開始前に保守的に証明する。通常fitの全頁素材なら成立し、指定scale/pan等でpartial ROIをめくると
+未prepared画素を露出する場合は`leaf_roi_not_covered`で同pass instant。全pose保証を数枚のsnapshot検査だけで代用しない。
+OFF/通常描画のROI policy、prepare/resample/upload回数を変更せず、旧素材再prepare・effect目的の拡大ROI・readback・offscreen captureは禁止。
+
+outgoing retentionは§5の実paintしたprepared source/output/native leaseのまま、全使用faceとaccepted/in-flight batchへ寿命を渡す。
+新Tをbackと終端で使ってもtextureは一つ、Blank/paper/shadowは新textureなし。
+dedup VRAM会計、mounted/at-rest/parked/batch、effect-only retained bytes、global旧素材pin予算`min(128MiB,fullscreen high-waterの10%)`を維持する。
+予算不足時は通常target優先でskip/cancelし、cache縮小、target decode抑制、admission待ちやretryを足さない。
+material参照追加による会計漏れと、同じsource/outputをfront/back/平面で二重計上しないことを回帰検査する。
+
+default OFF、「ページめくりアニメーション」のPreferences/HUD/既存KeyAction、単一Settings owner、即時adoption・既存保存経路は維持。
+時間100〜600ms・既定200msは引き続き**評価用の仮設定**。Q2は利用者の実際の動きの評価後に決める。
+HUDの同期`Settings::save()`は設計担当ClaudeCodeが既存overflow経路に合わせた判断（§13、`e3a328ff6`）で、利用者決定と再記録しない。
+R4のpaint/turnに同期保存・I/O・decode・GPU upload・blocking waitを加えない。
+slideshowは同じDを使い、intervalまたは次deadline残時間がD未満なら省略、期限延長なし。Remoteへeffect/state/leaseを送らない。
+OFFでは新geometry/recipe/receipt診断/時計/pinの作成をしないfast pathを維持する。
+
+F12は同じprojectionとcontext-owned presentationで実行する。viewportの捕捉/生成/focus条件や新しいgraceを追加しない。
+具体的receipt/context ownerへ触れる実装時にdetached-rework-plan §11へR4の範囲を追記し、§2に従う構造確認を受ける。
+本設計作業では同planに未実施の実装/確認を追記しない。
+
+### 15.7 perf・品質・回帰gate
+
+既存`opportunity/offered/start/first_visible/frame/finish/fully_visible/skip/cancel`とbinding/operation/source/native相関を維持する。
+`recipe`にBookLeaf/SingleDeparture/SingleArrival、S/T、shape、θ、背、face（front/back/edge）を付ける。
+visibilityは各occurrenceのarea/fraction/connected spanと、hidden理由（back-facing/occluded/outside-clip）を付け、0を失敗扱いしない。
+初回unit-visibleと各pageの初出・fully-visibleを別に集計する。degreeにかかわらず毎frameを新page提示に数えない。
+
+skip/cancelはgeneric reasonと`sub_check`を維持し、少なくとも`landing_only_target`、`vacant_landing_surface`、`no_turning_leaf`、
+`centered_target_spans_spine`、`shape_role_mismatch`、`invalid_page_rect`、`leaf_roi_not_covered`、
+`initial_target_visibility`、`destination_clip_changed`、`destination_pixel_scale`、`projection_budget`を区別する。
+old/newのsource寸法・canonical rect・layout/slot/背・clip/viewport・ppp・UV/ROI、選んだS/T、material種別をperf有効時だけ添える。
+演出中のsource/geometry変更には変わった対象と項目を付け、ordinary scan差を示す旧`page_placement_changed`をadmission理由から除く。
+mesh/visibility CPU、vertices/triangles、draw数、pin/resident/effect-only bytesとGPU追加時間を報告する。
+
+| 検査 | R4で満たすもの |
+| --- | --- |
+| real-scan regression | §15.1の実rect・1153×1671対1151×1670・ppp=1.5を読み取り結果からfixture化。旧1px負例を「異寸法対応」の正例に変更し、2px/大きい差をthresholdで通すテストにしない。16:9 letterbox singleとspread、非zero origin、100/125/150/200% DPI、LTR/RTL前後を含む |
+| slot/material | A/B/C/Dの非対称文字と角番号で4方向。RTL forwardでは旧左だけが持ち上がり、旧右は静止し、新左は下、新右はback。θ<90で新右visible=0、θ>90で新右初出、終端の文字鏡像なし。単頁backwardのincoming arrivalも専用確認 |
+| shape matrix | Pair/SideSingle/CenteredSingle、forced after-cover/last/Boundary、cover中央/片側、明示BlankとVacant、FrontCoverSupplementの各正例と明示instant理由。隣接shape変更と列/token変更を別検査。全実idx一意、Blankにreadiness/selectionなし |
+| motion snapshots | fake clockの0/15/30/45/50/55/70/85/100%と90度近傍。静止goldenだけでなく同じfixtureの連続poseを順に目視。広い画像面が回り、自由端のperspective、spine固定、柔らかいshadow、leaf gradientが分かる。黒背景のopaque imageを必須にし、checker/white fixtureだけで裏面素材の誤りを隠さない |
+| 見える面の品質 | 90度付近の一瞬の薄いedgeは自然な頁の挙動として許容。前半には旧front+revealed新S、後半には新back+新Sが識別できる広い面。初期案としてθ=45/135度で、それぞれ可視になる実面がcanonicalの20%以上（clipされた小窓は別profile）。中点で全face20%を強制しない。shadowをpage areaに数えない |
+| canonical/integration | 開始前・終端/cancel画素を通常helperと比較。不等寸法で旧Tの外周残像/終端jumpなし。UV/ROI、opaque/transparent alpha、黒/白/checker、指定％/px、small F12、trim/固定rotation。geometry不正時は全unit同pass flat、各page prepare一回、submission/採用通知一回 |
+| observer/input/context | 各source final-readyだが新T不可視のreceiptを正しく区別。first-visible unit通知がfinish待ちにならず、per-page traceは隠れた新Tを含まない。pre-draw cancel、sameframe down/up/複数edge/replay、repeat/wheel/gamepad/seek/no-op、F12 Aの操作がBを変えない、OFFとtarget数/順序/drop/work admission一致 |
+| lifetime/VRAM/perf | eviction/cancel/close後batchまでlease生存、最後のbatch後pin解放、parked accounting、二窓独立。OFF追加仕事ゼロ、ON追加decode/upload/resampleゼロ、idle heartbeatゼロ。CPU p95追加0.5ms/context、GPU追加2ms/4Kの仮gateは実測で検証 |
+
+§9.1のwarm 3run×30機会、開始率90%以上/完走率95%以上の仮gate、機会外理由とskip分母、速度/実用性/品質の別判定は維持する。
+real-scan spreadを必須warm profileに加え、cover/forced/landscapeの対応率も別報告。8/8拒否や帯状の動きを「性能合格」で閉じない。
+R4の回転角・visible面のproofを解析器へ反映してから測定し、R3ログとの比較では通知の意味の違いを添える。
+実機確認ではこのPDFと通常画像のsingle/spread、LTR/RTL前後、F12、仮200/440/600msを利用者が判断する。
+判断点は「一枚の紙を背から返している」「新しいbackが正しい側へ着地」「旧相方が動かない」「黒い帯にならない」「通常送りの速さが保たれる」。
+最終durationとR4の品質は未採択。headless snapshotだけで実GPU/OS presentの動きや利用者受入れを主張しない。
+
+### 15.8 組合せの削減・不採用案・実装見積り
+
+採用する簡素化は「final-readyの隣接turnのみ」「一枚のleaf」「一つのimmutable recipe」「新操作で通常表示へ終了」。
+形状をframe-localに解決し、開始後にunit構成を追い掛けない。front/back/under/restを一つのrecipeにまとめ、両頁別のclock/phase/ownerを作らない。
+single arrival/departureはrecipe内の変換で、navigation/history/readiness ownerは既存一つ。設定変更にreader reloadや専用live rebuildを足さず、既存adoptionでcancelする。
+front/backを同一の固定寸法へ矯正する案も退ける。実scanのcanonical boxを変えるか、未知の紙余白/透明域を新設する必要があるため、
+狭く見える角度でvirtual leafを補間し、各面の通常端点を守る案を選ぶ。実物の紙寸法を再現することと、既存表示のgeometryを維持することを混同しない。
+
+不採用: geometry tolerance増量、全頁同じrectへ矯正、spread全体の一枚化、slide/fadeへの置換、黒背景をreverse paperに流用、
+新Tの初期帯/二重描画、mirror文字、架空Blank/裏頁、scan差を理由に全件skip、modal入力ロック、finish待ちnavigation、
+遅延開始/queue/retry/resume、独自prefetch/cache、新しい保存writer、物理simulation/depth専用engineの先行導入。
+modal化は既存高速閲覧を遅くするため使えない。source/geometry変更は通常表示へ戻ることで組合せを削る。
+まれなGPU/保存失敗は既存のlog/通知と通常表示への終了を継承し、多段回復を新設しない。
+
+これは旧projectionの数行修正ではなく、**projection/shape対応/visibility契約の置換**。準備・取消・lease/会計・設定は再利用する。
+R4は設計revision名で、detached R4と別。実装chunkは以下の順を提案する。
+
+| chunk | 完成境界・主なfile owner | 一人の実装工数の概算 |
+| --- | --- | --- |
+| R4-a | 純粋BookLeaf/SingleWindow projection、spine/不等寸法/UV/clip/visibility、soft shadow/gradient、real-scan/4方向/黒背景golden。`src/page_turn_animation.rs`とそのsnapshot testsが中心 | 3〜5作業日 |
+| R4-b | 既存normal compositionからshape/slot/背をprepared unitへ接続、recipe選択、atomic unitとper-page visibility receipt、accepted-pass observer/trace/解析器、F12/context回帰。`src/ui_fullscreen/page_turn.rs`、`src/ui_fullscreen.rs`、`scripts/analyze_perf.py`。新所有fieldが必要なら既存bundle/ledger内で確認 | 3〜5作業日 |
+| R4-c | shape境界/partial ROI/不等外周settle/二窓leaseの回帰、既存入力/設定/VRAMの退行検証、required gate、確認build、利用者の動き評価、docs/spec/manual/detached §11の実装追補 | 2〜4作業日 + 実機待ち |
+
+製品Rust置換/追加は約800〜1,400行、tests/fixtures約600〜1,000行、解析器/そのtests約150〜300行、goldenは約20〜35枚を目安とする。
+現在のstrip/矩形可視性コードを削除して置換するため、これはnet増分の保証ではない。Settings/DB migration、新KeyAction、Remote変更は不要。
+合計 **8〜14作業日（約2〜3週）+ 独立設計/完了レビューと修正・実機枠**。
+egui subdivisionでperspective UV誤差/CPU予算を満たせない場合だけ、同native texture/leaseを借りるshader bridgeを別判断する（追加3〜7日以上）。
+その場合もCPU copy/readbackやOFF経路の遅延で帳尻を合わせず、範囲と費用を設計担当へ返す。
+
+実装前の確認点は、(1) §15.5のunit提示/per-page可視性改訂、(2) §15.4の端/中央横長のinstant範囲、
+(3) 異canonical寸法のleaf補間と最後の外周整合をこの方式で扱うこと。
+利用者の本のmotion要求をすでに満たしたと記録せず、設計担当の確認と独立レビュー後に実装する。
+今回は本planと`target/A-1341-r4-design-msg.txt`だけを書き、製品code/.git/dev-runtime/normal profileを変更しない。
