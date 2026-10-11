@@ -2195,7 +2195,7 @@ impl App {
                 return;
             }
         }
-        self.selected = Some(idx);
+        self.move_grid_cursor(Some(idx));
         self.fullscreen_idx = Some(idx);
         // 新しく開くページは分割方向の最初の半分から。ここで残すと前のページの
         // 「右半分を見ていた」が別のページへ引き継がれる。
@@ -3426,12 +3426,12 @@ impl App {
             self.visible_indices = std::mem::take(&mut snapshot.saved_visible_indices);
             self.page_identity_index = snapshot.saved_page_identity_index.clone();
             self.scroll_offset_y = snapshot.saved_scroll_offset_y;
-            self.selected = snapshot.saved_selected;
             self.zip_nav = snapshot.saved_zip_nav.take();
             self.top_level_grid_view = top_level_grid_view::TopLevelGridView::default();
             // Appended target removal leaves every basis index stable. Retain its
             // metadata/edit caches and invalidate only generation-bound main work.
             self.bump_items_generation();
+            self.move_grid_cursor(snapshot.saved_selected);
             self.viewer_navigation_caches.invalidate();
             // The generation setter retires requests and owned CPU images together.
             let basis_len = self.items.len();
@@ -3525,7 +3525,13 @@ impl App {
         detached.details_thumb_suppression_applied = false;
         detached.details_order.clear();
         detached.viewer_navigation_caches.invalidate();
-        detached.selected = Some(idx);
+        super::apply_grid_cursor_move(
+            &mut detached.selected,
+            &mut detached.grid_click_selection_anchor,
+            detached.items_generation,
+            Some(idx),
+            super::GridCursorMove::Move,
+        );
 
         detached
     }

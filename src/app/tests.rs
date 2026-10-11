@@ -20054,7 +20054,11 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.selected, Some(1));
         assert!(!app.scroll_to_selected);
         assert_eq!(app.pending_grid_scroll, None);
-        assert_eq!(app.grid_click_selection_anchor, None);
+        assert_eq!(
+            app.grid_click_selection_anchor
+                .and_then(|anchor| anchor.index_for_generation(app.items_generation)),
+            Some(1)
+        );
 
         // 場所の記憶以外はこの操作の対象外。
         assert_eq!(app.checked, HashSet::from([1, 3]));
@@ -50495,6 +50499,9 @@ mod favorite_adjustment_defaults_tests {
         let d = push_image(&mut app, "C:/p/d.jpg");
         assert_eq!((a, b, c, d), (0, 1, 2, 3));
 
+        // Keep the cursor on surviving A: this tests identity remapping rather
+        // than the non-extending first selection of an unselected listing.
+        app.move_grid_cursor(Some(a));
         app.grid_click_selection_anchor = Some(crate::app::GridClickSelectionAnchor::new(
             d,
             app.items_generation,

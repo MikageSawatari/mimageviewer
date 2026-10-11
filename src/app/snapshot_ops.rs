@@ -1291,8 +1291,6 @@ impl App {
             self.image_metas = snap.saved_image_metas;
             self.visible_indices = snap.saved_visible_indices;
             self.scroll_offset_y = snap.saved_scroll_offset_y;
-            self.selected = snap.saved_selected;
-            self.grid_click_selection_anchor = None;
             // ネスト ZIP 由来の snapshot: saved_items (= ZIP 階層の items) と対で
             // ナビ状態も復元する。これをしないと「ZIP items なのに nav なし」になり、
             // BS が階層を戻らず ZIP ごと抜ける / ZipDir セルの Enter が無反応になる。
@@ -1303,6 +1301,7 @@ impl App {
             // invalidate 後も保持される (= thumbnails 自体は invalidate 対象外)。
             self.bump_items_generation();
             self.invalidate_idx_state_and_queues();
+            self.move_grid_cursor(snap.saved_selected);
             self.invalidate_snapshot_details_index_state();
             self.finish_snapshot_viewer_index_swap(viewer_index_swap);
             self.clear_tags_cache();
@@ -1419,8 +1418,7 @@ impl App {
         self.address = snap_origin.display().to_string();
         self.scroll_offset_y = 0.0;
         self.pending_grid_scroll = None;
-        self.selected = None;
-        self.grid_click_selection_anchor = None;
+        self.move_grid_cursor(None);
         // items_generation bump + invalidate (= Codex P1-1)
         self.bump_items_generation();
         self.invalidate_idx_state_and_queues();
@@ -2104,7 +2102,7 @@ impl App {
             return;
         };
         self.open_fullscreen(idx, history_trigger);
-        self.selected = Some(idx);
+        self.move_grid_cursor(Some(idx));
         self.scroll_to_selected = true;
         self.update_last_selected_image();
     }

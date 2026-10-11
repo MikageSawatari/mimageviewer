@@ -21470,7 +21470,7 @@ impl App {
             self.finish_stale_fs_navigation_diagnostic_for_target(target_idx);
         }
         self.fullscreen_idx = Some(target_idx);
-        self.selected = Some(target_idx);
+        self.move_grid_cursor(Some(target_idx));
         self.scroll_to_selected = true;
         self.fs_vertical_scroll = 0.0;
         self.update_last_selected_image();
@@ -28673,7 +28673,7 @@ impl App {
             && let Some((_, unit)) = find_spread_display_unit(&units, idx)
         {
             self.fullscreen_idx = Some(unit.anchor_idx());
-            self.selected = self.fullscreen_idx;
+            self.move_grid_cursor(self.fullscreen_idx);
         }
         self.fullscreen_page_layout.clear();
         if let Some(idx) = self.fullscreen_idx {
@@ -28698,7 +28698,7 @@ impl App {
             let cursor_state = self.fullscreen_cursor_state();
             self.open_fullscreen(new_idx, crate::app::HistoryTrigger::UserChosen);
             self.restore_fullscreen_cursor_state(ctx, cursor_state);
-            self.selected = Some(new_idx);
+            self.move_grid_cursor(Some(new_idx));
         }
     }
 
@@ -35341,7 +35341,7 @@ impl App {
             {
                 self.set_fullscreen_page_slice_for_display_unit(step.slice);
             }
-            self.selected = Some(idx);
+            self.move_grid_cursor(Some(idx));
             self.scroll_to_selected = true;
             return;
         }
@@ -35399,7 +35399,7 @@ impl App {
         {
             self.slideshow_anchor_idx = None;
             self.open_fullscreen_from_slideshow_navigation(ctx, idx);
-            self.selected = Some(idx);
+            self.move_grid_cursor(Some(idx));
             self.scroll_to_selected = true;
         } else {
             self.slideshow_playing = false;

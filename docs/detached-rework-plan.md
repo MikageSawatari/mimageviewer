@@ -1455,6 +1455,20 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-11 §1.370: カーソル / 範囲選択起点の共通遷移
+
+実装範囲は `App::move_grid_cursor` / `apply_grid_cursor_move` と既存の selected 更新入口。
+`viewer_context_registry` の独立 viewer 初期選択・物理 context fork・main 復元も同じ遷移へ接続する。
+bundle の交換・同一 identity の再マップでは対の selected / 起点を保持し、linked viewer の
+同じ selected の同期で Shift 起点を上書きしない。新しい detached 述語・viewport・placement・
+待機・状態フィールドは追加しない。起点を残す誤ったカーソル遷移そのものを直す構造修正であり、
+症状パッチではない。実装指示（通常移動の単一 owner と context 所有）に従い、Codex 実装者と
+独立 GPT-6.1 Sol / xhigh の事前設計レビューがこの判断に合意。ClaudeCode の最終検収と実機は未実施。
+同 reviewer の実装レビューで、退避 smart-folder root のカーソル削除後も旧起点が残る同型漏れを
+修正し、snapshot / main 復元の起点確立を世代更新後へ移動。追補レビューは追加指摘なしで ACCEPT。
+仕様・入口棚卸しは [spec.md の範囲選択](spec.md#範囲選択の起点-13702026-10-11)、
+回帰は `app::grid_cursor_tests`（linked 同期と mounted sibling 不変を含む）。§1.371 の動作は変更しない。
+
 2026-10-10 §1.364 D2 本別見開き調整のcontext接続（独立確認・検証待ち）:
 以下は履歴。root操作のlive反映は2026-10-11 D2cの記録とspread-shift設計§11.6で撤回する。
 `src/app/spread_shift_owner.rs::ViewerSpreadShift`を`ViewerContextBundle`へ持たせ、
