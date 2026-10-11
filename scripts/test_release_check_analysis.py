@@ -52,21 +52,31 @@ def cached_request(key: str, generation: int, request_id: int, *, t: float = 5.6
              "origin": "upgradeable_cache", **identity}]
 
 
+def folder_loads() -> list[dict]:
+    return [{"before_path": "fixture" if i == 0 else f"fixture/folder-{i:04d}",
+             "after_path": f"fixture/folder-{i + 1:04d}", "before_generation": 3 + i, "after_generation": 4 + i,
+             "start_t": 5.8 + i * .009, "end_t": 5.807 + i * .009} for i in range(256)]
+
+
 def operations() -> dict:
     return {"pid": PID, "folder_open": {"completed": True},
-            "navigation": [{"receipt": True, "before_generation": n + 10, "after_generation": n + 11,
+            "navigation": [{"receipt": True, "before_generation": n + 260, "after_generation": n + 261,
                             "before_path": f"folder{n}", "after_path": f"folder{n + 1}",
-                            "start_t": 5.3 + n * .02, "end_t": 5.31 + n * .02} for n in range(5)],
+                            "start_t": 8.3 + n * .02, "end_t": 8.31 + n * .02} for n in range(5)],
             "search": {"ctrl_g_receipt": True, "text_receipt": True, "completed": True,
                        "expected_hits": ["a", "b"], "actual_hits": ["b", "a"],
-                       "start_t": 5.4, "end_t": 5.5, "expected_query": "fixture-query", "actual_query": "fixture-query"},
+                       "start_t": 8.4, "end_t": 8.5, "expected_query": "fixture-query", "actual_query": "fixture-query"},
+            "folder_loads": folder_loads(),
             "observation": {"root_hwnd": 123},
             "exit": {"on_exit": True, "flush_complete": True, "process_exited": True, "forced": False},
             "cache": {"mode": "cached", "opens": [{"folder_path": "fixture", "items_gen": 3,
                                                      "target_keys": ["dir::fixture/child"]},
-                                                    *[{"folder_path": f"folder{n}", "items_gen": n + 10,
+                                                    *[{"folder_path": p["after_path"], "items_gen": p["after_generation"],
+                                                       "target_keys": [p["after_path"] + "/image.png"]} for p in folder_loads()],
+                                                    *[{"folder_path": f"folder{n}", "items_gen": n + 260,
                                                        "target_keys": [f"folder{n}/image.png"]} for n in range(6)]]},
-            "fixture_manifest": {"perf": {mode: {"many_folders": "fixture",
+            "fixture_manifest": {"perf": {mode: {"many_folders": "fixture", "start_folder": "folder0",
+                                                     "load_order": [f"fixture/folder-{i:04d}" for i in range(1, 257)],
                                                      "navigation_order": [f"folder{n}" for n in range(6)]}
                                            for mode in ("cached", "uncached")}}}
 
@@ -82,15 +92,18 @@ def perf_events(gaps: dict[int, float] | None = None, actions: dict[int, str] | 
     gaps, actions = gaps or {}, actions or {}
     events, t = [session(), *cached_request("dir::fixture/child", 3, 1)], 6.0
     for n in range(5):
-        events.append({"cat": "qa", "kind": "key_materialized", "t": 5.305 + n * .02,
+        events.append({"cat": "qa", "kind": "key_materialized", "t": 8.305 + n * .02,
                        "key": "Down", "ctrl": True, "shift": False, "alt": False,
                        "pressed": True, "repeat": False, "target_viewport": "ROOT", "target_hwnd": 123})
     for n in range(6):
-        events.extend(cached_request(f"folder{n}/image.png", n + 10, n + 2))
-    events.extend([{"cat": "qa", "kind": "key_materialized", "t": 5.42,
+        events.extend(cached_request(f"folder{n}/image.png", n + 260, n + 2))
+    events.extend([{"cat": "qa", "kind": "key_materialized", "t": 8.42,
                     "key": "G", "ctrl": True, "shift": False, "alt": False,
                     "pressed": True, "repeat": False, "target_viewport": "ROOT", "target_hwnd": 123},
-                   {"cat": "qa", "kind": "text", "t": 5.43, "text": "fixture-query", "root_hwnd": 123}])
+                   {"cat": "qa", "kind": "text", "t": 8.43, "text": "fixture-query", "root_hwnd": 123}])
+    for load in folder_loads():
+        events.extend(cached_request(load["after_path"] + "/image.png", load["after_generation"],
+                                     load["after_generation"] + 1000))
     for n in range(frame_count):
         frame = {"cat": "frame", "kind": "begin", "t": t, "n": n + 1}
         if n:
@@ -101,7 +114,7 @@ def perf_events(gaps: dict[int, float] | None = None, actions: dict[int, str] | 
                        {"cat": "ui", "kind": "pre_grid_breakdown", "n": n + 1,
                         "t": t + .001, "total_ms": pre_grid_ms, "poll_ms": pre_grid_ms}])
         previous_t, t = t, t + gaps.get(n, .005)
-    events.append({"cat": "qa", "kind": "on_exit", "case_id": "perf-cached", "t": t + 1,
+    events.append({"cat": "qa", "kind": "on_exit", "case_id": "perf-cached", "t": max(t + 1, 8.6),
                    "flush_complete": True})
     return seal(events)
 
@@ -138,6 +151,113 @@ def test_directory():
 
 
 class PerfTests(unittest.TestCase):
+    def startup_overlay_gap(self, seconds=.2, frame=1):
+        events = perf_events({frame - 1: seconds})
+        # Actual startup precedes the first folder_loads interval, unlike the
+        # generic fixture whose frame stream starts during the workload.
+        for event in events:
+            if event.get("cat") in ("frame", "ui"):
+                for field in ("t", "prev_update_start_t", "prev_update_end_t"):
+                    value = event.get(field)
+                    if value is not None:
+                        event[field] = value - 1
+            if event.get("kind") == "tail_repaint" and event.get("n") == frame:
+                event.update(early_return=True, delay_ms=0)
+        events = [e for e in events if not (e.get("kind") == "pre_grid_breakdown" and e.get("n") == frame)]
+        events.extend([{"cat": "startup", "kind": "first_frame", "t": 5},
+                       {"cat": "startup", "kind": "indexer_manager_new", "t": 5.006, "ms": 6}])
+        return events
+
+    def test_known_startup_first_frame_is_bounded_and_reported_separately(self):
+        for seconds in (.2, .5):
+            with self.subTest(seconds=seconds):
+                events = self.startup_overlay_gap(seconds)
+                result = perf(events)
+                self.assertEqual(result["verdict"], "PASS_WITH_WARNINGS", result)
+                self.assertEqual(result["metrics"]["gap_categories"], {"known-startup-first-frame": 1})
+                self.assertEqual(result["metrics"]["drawn"]["n"], 201)
+                self.assertAlmostEqual(result["metrics"]["drawn"]["max_ms"], seconds * 1000)
+                self.assertAlmostEqual(result["evidence"]["gaps"][0]["gap_ms"], seconds * 1000)
+                text = release_record({"verdict": result["verdict"], "cases": [result]})
+                self.assertIn(f"frame 1→2、{seconds * 1000:.3f}ms", text)
+                self.assertIn("上限 500.0ms", text)
+                self.assertEqual(result, perf(list(reversed(events))))
+
+    def test_startup_first_frame_over_500ms_stays_fail(self):
+        result = perf(self.startup_overlay_gap(.500001))
+        self.assertEqual(result["verdict"], "FAIL")
+        self.assertEqual(result["metrics"]["gap_categories"], {"unexplained": 1})
+
+    def test_startup_early_return_on_later_frame_stays_fail(self):
+        result = perf(self.startup_overlay_gap(frame=2))
+        self.assertEqual(result["verdict"], "FAIL")
+        self.assertEqual(result["metrics"]["gap_categories"], {"unexplained": 1})
+
+    def test_startup_first_frame_cannot_overlap_or_follow_measured_operation(self):
+        for start in (4.9, 5.1, 5.2):
+            with self.subTest(start=start):
+                evidence = operations()
+                evidence["folder_loads"][0].update(start_t=start, end_t=5.807)
+                self.assertEqual(perf(self.startup_overlay_gap(), evidence)["verdict"], "FAIL")
+
+    def test_startup_first_frame_requires_overlay_and_startup_witnesses(self):
+        for mutation in ("ordinary-tail", "delayed-tail", "grid", "missing-startup", "init-already-done",
+                         "init-started-later", "init-started-before-first-update"):
+            with self.subTest(mutation=mutation):
+                events = self.startup_overlay_gap()
+                tail = next(e for e in events if e.get("kind") == "tail_repaint" and e.get("n") == 1)
+                init = next(e for e in events if e.get("kind") == "indexer_manager_new")
+                if mutation == "ordinary-tail":
+                    tail["early_return"] = False
+                elif mutation == "delayed-tail":
+                    tail.update(action="request_repaint_after_observed", delay_ms=16)
+                elif mutation == "grid":
+                    events.append({"cat": "ui", "kind": "pre_grid_breakdown", "n": 1, "t": 5.001, "total_ms": .2})
+                elif mutation == "missing-startup":
+                    events.remove(next(e for e in events if e.get("kind") == "first_frame"))
+                elif mutation == "init-already-done":
+                    init["t"] = 4.999
+                elif mutation == "init-started-later":
+                    init["ms"] = 1
+                else:
+                    init["ms"] = 1000
+                self.assertEqual(perf(events)["verdict"], "FAIL")
+
+    def test_startup_gap_without_operation_boundary_is_not_waived(self):
+        evidence = operations()
+        evidence.pop("folder_loads")
+        evidence.pop("navigation")
+        evidence["search"].pop("start_t")
+        result = perf(self.startup_overlay_gap(), evidence)
+        self.assertEqual(result["verdict"], "FAIL")
+        self.assertEqual(result["metrics"]["gap_categories"], {"unexplained": 1})
+
+    def test_startup_category_does_not_waive_slow_update_or_other_gap(self):
+        events = self.startup_overlay_gap()
+        slow_update(events, 0, 150, grid_ms=140)
+        self.assertEqual(perf(events)["metrics"]["gap_categories"], {"unexplained": 1})
+        events = self.startup_overlay_gap()
+        # A second stop is ordinary request_repaint even with the known gap.
+        for event in events:
+            if event.get("cat") in ("frame", "ui") and event.get("n", 0) >= 3:
+                for field in ("t", "prev_update_start_t", "prev_update_end_t"):
+                    if event.get(field) is not None:
+                        event[field] += .2
+        result = perf(events)
+        self.assertEqual(result["verdict"], "FAIL")
+        self.assertEqual(result["metrics"]["gap_categories"], {"known-startup-first-frame": 1, "unexplained": 1})
+
+    def test_slow_update_without_stage_breakdown_remains_environment_note(self):
+        events = self.startup_overlay_gap()
+        slow_update(events, 3, 150, grid_ms=140)
+        events = [e for e in events if not (e.get("kind") == "update_breakdown" and e.get("n") == 4)]
+        result = perf(events)
+        self.assertEqual(result["verdict"], "SKIPPED", result)
+        self.assertIn("slow update 4 lacks stage breakdown", result["environment_errors"])
+        text = release_record({"verdict": result["verdict"], "cases": [result]})
+        self.assertIn("環境注記: slow update 4 lacks stage breakdown、150.000ms", text)
+        self.assertIn("environment_errors: slow update 4 lacks stage breakdown", text)
+
     def test_complete_natural_drawn_samples_pass(self):
         result = perf(perf_events())
         self.assertEqual(result["verdict"], "PASS", result)
@@ -358,6 +478,46 @@ class PerfTests(unittest.TestCase):
                 next(e for e in events if e.get("kind") == "key_materialized")[field] = value
                 self.assertEqual(perf(events)["verdict"], "SKIPPED")
 
+    def test_workload_requires_distinct_folders_changed_generations_and_cache_proof(self):
+        self.assertEqual(perf(perf_events())["verdict"], "PASS")
+        for field, value in (("after_path", "wrong-folder"), ("after_generation", 3),
+                             ("before_path", "wrong-folder"), ("start_t", 9)):
+            with self.subTest(field=field):
+                evidence = operations()
+                evidence["folder_loads"][0][field] = value
+                self.assertTrue(any("folder-load" in e for e in perf(perf_events(), evidence)["environment_errors"]))
+        evidence = operations()
+        evidence["folder_loads"].pop()
+        self.assertEqual(perf(perf_events(), evidence)["verdict"], "SKIPPED")
+        evidence = operations()
+        evidence["fixture_manifest"]["perf"]["cached"]["load_order"][1] = "fixture/folder-0001"
+        self.assertEqual(perf(perf_events(), evidence)["verdict"], "SKIPPED")
+        events = [e for e in perf_events() if e.get("key") != "fixture/folder-0017/image.png"]
+        self.assertEqual(perf(events)["verdict"], "SKIPPED")
+
+    def test_first_frame_outside_update_stall_is_not_waived_by_folder_workload(self):
+        result = perf(perf_events(gaps={0: .127}))
+        self.assertEqual(result["verdict"], "FAIL")
+        self.assertEqual(result["metrics"]["drawn"]["n"], 201)
+        self.assertIn("frames [1]", result["failures"][0])
+
+    def test_cached_parent_requires_all_245_runtime_targets_not_105_seed_targets(self):
+        events, evidence = perf_events(), operations()
+        keys = [f"dir::fixture/folder-{i:04d}" for i in range(1, 246)]
+        evidence["cache"]["opens"][0]["target_keys"] = keys
+        for i, key in enumerate(keys):
+            rows = cached_request(key, 3, 12000 + i)
+            if i >= 105:
+                rows[1].update(kind="source", from_cache=False, origin="source_generated")
+            events.extend(rows)
+        result = perf(events, evidence)
+        self.assertEqual(result["verdict"], "SKIPPED")
+        self.assertTrue(any("cache/source provenance not proven" in e for e in result["environment_errors"]))
+        # A later warm read cannot relabel initially generated data as cached.
+        for i, key in enumerate(keys[105:]):
+            events.extend(cached_request(key, 3, 13000 + i, t=5.8))
+        self.assertEqual(perf(events, evidence)["verdict"], "SKIPPED")
+
     def test_uncached_requires_initial_source_and_pre_open_absence_not_later_no_cache_rule(self):
         events, evidence = perf_events(), operations()
         evidence["cache"]["mode"] = "uncached"
@@ -366,7 +526,7 @@ class PerfTests(unittest.TestCase):
         for index, e in enumerate([e for e in events if e.get("kind") == "cache_read"]):
             e.update(kind="source", from_cache=False, origin="source_generated")
             next(b for b in events if b.get("kind") == "request_begin"
-                 and b.get("request_id") == e["request_id"])["t"] = 5.55 + index * .001
+                 and b.get("request_id") == e["request_id"])["t"] = 5.55 + index * .00001
         for e in events:
             if e.get("kind") == "on_exit":
                 e["case_id"] = "perf-uncached"
@@ -433,7 +593,7 @@ class PerfTests(unittest.TestCase):
         evidence["cache"]["opens"][0]["folder_path"] = "unrelated-folder"
         self.assertEqual(perf(perf_events(), evidence)["verdict"], "SKIPPED")
         evidence = operations()
-        evidence["cache"]["opens"][4]["items_gen"] += 1
+        next(o for o in evidence["cache"]["opens"] if o["folder_path"] == "folder3")["items_gen"] += 1
         self.assertEqual(perf(perf_events(), evidence)["verdict"], "SKIPPED")
 
 
@@ -667,6 +827,20 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(analyze_case_evidence(events, evidence, PID)["verdict"], "SKIPPED")
 
 
+    def test_perf_seed_requires_durable_save_for_every_intended_folder(self):
+        case = "seed-perf-cached"
+        events = [session(), {"cat": "qa", "kind": "seed", "case_id": case, "t": 6,
+                             "seed_kind": "cache", "normal_producer": True, "saved_cache": True,
+                             "folder_path": "fixture/cached", "targets": ["dir::fixture/cached/child"]},
+                  {"cat": "qa", "kind": "on_exit", "case_id": case, "t": 7, "flush_complete": True}]
+        evidence = {"case_id": case, "pid": PID, "seed_phase": "preparation", "seed_kinds": ["cache"],
+                    "seed_cache_paths": ["fixture/cached"], "copied_after_process_exit": True,
+                    "exit": {"process_exited": True, "forced": False}}
+        self.assertEqual(analyze_case_evidence(seal(events), evidence, PID)["verdict"], "PASS")
+        evidence["seed_cache_paths"].append("fixture/cached/child")
+        self.assertEqual(analyze_case_evidence(seal(events), evidence, PID)["verdict"], "SKIPPED")
+
+
 class IdleTests(unittest.TestCase):
     def setup_case(self):
         case = "static-foreground"
@@ -690,6 +864,28 @@ class IdleTests(unittest.TestCase):
         self.assertEqual(analyze_idle_case(events, sampler, evidence, thresholds, PID)["verdict"], "PASS_WITH_WARNINGS")
         sampler["window_samples"][7]["foreground_pid"] = 99
         self.assertEqual(analyze_idle_case(events, sampler, evidence, thresholds, PID)["verdict"], "SKIPPED")
+
+    def test_lifetime_gap_diagnostic_does_not_relax_coverage(self):
+        for gap, expected in ((1100, "PASS_WITH_WARNINGS"), (1101, "SKIPPED"),
+                              (1367, "SKIPPED")):
+            with self.subTest(gap=gap):
+                events, sampler, evidence, thresholds = self.setup_case()
+                sampler["window_samples"][1]["unix_ms"] = sampler["window_samples"][0]["unix_ms"] + gap
+                result = analyze_idle_case(events, sampler, evidence, thresholds, PID)
+                self.assertEqual(result["verdict"], expected)
+                self.assertEqual(result["metrics"]["window_sample_max_gap_ms"], gap)
+                self.assertEqual(any("sample gap" in error for error in result["environment_errors"]), gap > 1100)
+                self.assertFalse(any("complete measurement window" in error for error in result["environment_errors"]))
+
+    def test_lifetime_endpoints_still_require_complete_measurement_window(self):
+        for endpoint, delta in ((0, 100), (0, 101), (-1, -100), (-1, -101)):
+            with self.subTest(endpoint=endpoint, delta=delta):
+                events, sampler, evidence, thresholds = self.setup_case()
+                sampler["window_samples"][endpoint]["unix_ms"] += delta
+                result = analyze_idle_case(events, sampler, evidence, thresholds, PID)
+                self.assertEqual(result["verdict"], "SKIPPED" if abs(delta) > 100 else "PASS_WITH_WARNINGS")
+                self.assertEqual(any("complete measurement window" in error for error in result["environment_errors"]),
+                                 abs(delta) > 100)
 
     def test_tray_reproduction_complete_by_converted_start_not_measurement_or_sleep_end(self):
         for completed in (False, True):
@@ -760,9 +956,26 @@ class IdleTests(unittest.TestCase):
         sampler["window_samples"][6]["foreground_pid"] = 100
         self.assertEqual(analyze_idle_case(events, sampler, evidence, thresholds, PID)["verdict"], "SKIPPED")
 
+    def test_background_failure_preserves_clock_and_external_measurement_verdict(self):
+        for cpu, expected in ((.01, "SKIPPED"), (.2, "FAIL")):
+            with self.subTest(cpu=cpu):
+                events, sampler, evidence, thresholds = self.setup_case()
+                evidence["case_id"] = sampler["case_id"] = "static-background"
+                next(e for e in events if e.get("kind") == "on_exit")["case_id"] = "static-background"
+                # Reproduce the real run: all native samples still name the app,
+                # but the independent sleep/clock evidence has been preserved.
+                sampler.update(background_hwnd=456, background_process_id=99,
+                               cpu_core_ratio=cpu, verdict="SKIPPED",
+                               environment_errors=["Runner-owned background window condition was not maintained."])
+                result = analyze_idle_case(events, sampler, evidence, thresholds, PID)
+                self.assertEqual(result["verdict"], expected)
+                self.assertTrue(result["evidence"]["clock"]["included"])
+                self.assertTrue(any("background" in error for error in result["environment_errors"]))
+                self.assertFalse(any("boundaries" in error for error in result["environment_errors"]))
+
     def test_static_requested_pixel_boundaries_and_real_worker_match(self):
         for pixels, expected in ((366, "PASS_WITH_WARNINGS"), (382, "PASS_WITH_WARNINGS"),
-                                 (365, "SKIPPED"), (383, "SKIPPED")):
+                                 (281, "SKIPPED"), (365, "SKIPPED"), (383, "SKIPPED")):
             with self.subTest(pixels=pixels):
                 events, sampler, evidence, thresholds = self.setup_case()
                 evidence["requested_px"] = pixels

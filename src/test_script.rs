@@ -26,6 +26,7 @@ use crate::keymap::{CommandScope, KeyAction, KeyTrigger, command_catalog};
 mod capture;
 #[cfg(feature = "test-script")]
 mod clipboard_capture;
+mod evidence_path;
 #[cfg(feature = "test-script")]
 pub(crate) mod grid_observation;
 #[cfg(feature = "test-script")]
@@ -6864,13 +6865,306 @@ mod tests {
             .replace("__SEARCH_HITS__", "[]")
             .replace("__CACHE_PATHS__", "[]")
             .replace("__NAVIGATION_PATHS__", "[]")
-            .replace("__INCLUDE_FIRST_AI__", "false");
+            .replace("__LOAD_PATHS__", "[]")
+            .replace("__INCLUDE_FIRST_AI__", "false")
+            .replace("__RUNNER_PID__", "202");
         engine.compile(source).expect("release recipe syntax");
         assert_eq!(
             parse_navigation_key("G").unwrap(),
             SyntheticNavigationKey::G
         );
         // This check compiles a recipe; it never evaluates begin or accesses a window.
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn release_checks_seed_waits_for_pin_refresh_before_opening_parent() {
+        // Execute the real seed branch/helpers with deterministic observations.
+        // No capture, DB, window, input or measured idle interval is involved.
+        let state = Arc::new(Mutex::new((String::new(), 0_u32, Vec::<String>::new())));
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let mut engine = build_engine(bridge);
+        engine.register_fn("sleep", |_: rhai::INT| {});
+        engine.register_fn(
+            "fail",
+            |message: ImmutableString| -> Result<(), Box<EvalAltResult>> {
+                Err(rhai_error(message.to_string()))
+            },
+        );
+        let s = Arc::clone(&state);
+        engine.register_fn("release_check_observe", move || {
+            let mut s = s.lock().unwrap();
+            let ready = s.1 == 0;
+            if !ready {
+                s.1 -= 1;
+                s.2.push("pin-refresh-pending".into());
+            }
+            let value = serde_json::json!({"pid":1,"current_folder_path":s.0,
+                "items_generation":1,"loading_complete":true,"index_settled":true,
+                "interaction_ready":ready,"focused":true,"perf_t":1.0,
+                "search_active":true,"search_focused":true,"search_query":"needle",
+                "search_done":true,"search_searching":false,"search_hits":[]});
+            super::release_checks::to_dynamic(&value)
+        });
+        let s = Arc::clone(&state);
+        engine.register_fn("release_check_open", move |path: ImmutableString| {
+            let mut s = s.lock().unwrap();
+            assert_eq!(s.1, 0, "open must wait for the existing pin refresh owner");
+            s.0 = path.to_string();
+            s.2.push(format!("open:{path}"));
+        });
+        let s = Arc::clone(&state);
+        engine.register_fn("release_check_pin", move |_: ImmutableString| {
+            let mut s = s.lock().unwrap();
+            s.1 = 2;
+            s.2.push("pin-persisted".into());
+        });
+        engine.register_fn("release_check_seed", |_: ImmutableString| {});
+        engine.register_fn("tap_key", |_: ImmutableString, _: ImmutableString| {});
+        engine.register_fn("release_check_text", |_: ImmutableString| {});
+        engine.register_fn("release_check_evidence", |_: ImmutableString, _: Map| {});
+        engine.register_fn("release_check_quit", || {});
+        let source = include_str!("../scripts/ui-smoke/release-checks.rhai")
+            .replace("__CASE_ID__", "seed-profile")
+            .replace("__VIDEO_CHILD__", "C:/fixture/video-child")
+            .replace("__VIDEO_PARENT__", "C:/fixture/video-parent")
+            .replace("__SEARCH_TERM__", "needle")
+            .replace("__SEARCH_HITS__", "[]")
+            .replace("__CACHE_PATHS__", "[\"C:/fixture/cache\"]")
+            .replace("__NAVIGATION_PATHS__", "[]")
+            .replace("__LOAD_PATHS__", "[]")
+            .replace("__INCLUDE_FIRST_AI__", "false")
+            .replace("__RUNNER_PID__", "202");
+        let helpers = source.split("\nrelease_check_begin(").next().unwrap();
+        let branch = source.split("let evidence =").nth(1).unwrap();
+        engine
+            .eval::<()>(&format!("{helpers}\nlet evidence ={branch}"))
+            .unwrap();
+        assert_eq!(
+            state.lock().unwrap().2,
+            vec![
+                "open:C:/fixture/cache",
+                "open:C:/fixture/video-child",
+                "pin-persisted",
+                "pin-refresh-pending",
+                "pin-refresh-pending",
+                "open:C:/fixture/video-parent",
+            ]
+        );
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn release_checks_perf_recipe_runs_distinct_loads_then_five_chords_and_search() {
+        // Evaluate the actual recipe, using deterministic consumer observations.
+        // Neither an app nor a window/process/input API is run by this test.
+        for mode in ["cached", "uncached"] {
+            let many = format!("C:/fixture/{mode}");
+            let loads: Vec<_> = (1..=256).map(|i| format!("{many}/folder-{i:04}")).collect();
+            let navigation: Vec<_> = (1..=6)
+                .map(|i| format!("C:/fixture/{mode}-navigation/navigation-{i:02}"))
+                .collect();
+            let state = Arc::new(Mutex::new((
+                many.clone(),
+                1_i64,
+                1.0_f64,
+                0_usize,
+                Vec::<String>::new(),
+            )));
+            let evidence = Arc::new(Mutex::new(Map::new()));
+            let (bridge, _, _) = runner_bridge(ready_snapshot());
+            let mut engine = build_engine(bridge);
+            engine.register_fn("sleep", |_: rhai::INT| {
+                panic!("ready consumers must not sleep")
+            });
+            let s = Arc::clone(&state);
+            engine.register_fn("release_check_observe", move || {
+                let mut s = s.lock().unwrap();
+                s.2 += 0.01;
+                super::release_checks::to_dynamic(&serde_json::json!({"pid":1,
+                    "current_folder_path":s.0,"items_generation":s.1,"perf_t":s.2,
+                    "loading_complete":true,"index_settled":true,"interaction_ready":true,"focused":true,
+                    "search_active":true,"search_focused":true,"search_query":"needle",
+                    "search_done":true,"search_searching":false,"search_hits":[]}))
+            });
+            let s = Arc::clone(&state);
+            engine.register_fn("release_check_open", move |path: ImmutableString| {
+                let mut s = s.lock().unwrap();
+                s.0 = path.to_string();
+                s.1 += 1;
+                s.4.push(format!("open:{path}"));
+            });
+            let s = Arc::clone(&state);
+            let nav = navigation.clone();
+            engine.register_fn(
+                "tap_key",
+                move |key: ImmutableString, modifiers: ImmutableString| {
+                    assert_eq!(modifiers.as_str(), "ctrl");
+                    let mut s = s.lock().unwrap();
+                    match key.as_str() {
+                        "Down" => {
+                            s.3 += 1;
+                            s.0 = nav[s.3].clone();
+                            s.1 += 1;
+                        }
+                        "G" => assert_eq!(s.3, 5),
+                        _ => panic!("unexpected recipe key"),
+                    }
+                    s.4.push(format!("key:{key}"));
+                },
+            );
+            let s = Arc::clone(&state);
+            engine.register_fn("release_check_text", move |text: ImmutableString| {
+                assert_eq!(text.as_str(), "needle");
+                s.lock().unwrap().4.push("text:needle".into());
+            });
+            let e = Arc::clone(&evidence);
+            engine.register_fn(
+                "release_check_evidence",
+                move |_: ImmutableString, value: Map| {
+                    *e.lock().unwrap() = value;
+                },
+            );
+            engine.register_fn("release_check_quit", || {});
+            let source = include_str!("../scripts/ui-smoke/release-checks.rhai")
+                .replace("__CASE_ID__", &format!("perf-{mode}"))
+                .replace("__MANY_PATH__", &many)
+                .replace("__SEARCH_TERM__", "needle")
+                .replace("__SEARCH_HITS__", "[]")
+                .replace("__CACHE_PATHS__", "[]")
+                .replace(
+                    "__NAVIGATION_PATHS__",
+                    &serde_json::to_string(&navigation).unwrap(),
+                )
+                .replace("__LOAD_PATHS__", &serde_json::to_string(&loads).unwrap())
+                .replace("__INCLUDE_FIRST_AI__", "false")
+                .replace("__RUNNER_PID__", "202");
+            let helpers = source.split("\nrelease_check_begin(").next().unwrap();
+            let branch = source.split("let evidence =").nth(1).unwrap();
+            engine
+                .eval::<()>(&format!("{helpers}\nlet evidence ={branch}"))
+                .unwrap();
+            let expected: Vec<_> = loads
+                .iter()
+                .chain(&navigation[..1])
+                .map(|p| format!("open:{p}"))
+                .chain((0..5).map(|_| "key:Down".into()))
+                .chain(["key:G".into(), "text:needle".into()])
+                .collect();
+            assert_eq!(state.lock().unwrap().4, expected);
+            let e = evidence.lock().unwrap();
+            assert_eq!(e["folder_loads"].clone().cast::<rhai::Array>().len(), 256);
+            assert_eq!(e["navigation"].clone().cast::<rhai::Array>().len(), 5);
+            assert!(
+                e["search"].clone().cast::<Map>()["completed"]
+                    .clone()
+                    .cast::<bool>()
+            );
+        }
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn release_checks_root_readiness_uses_the_serialized_selection_identity() {
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let engine = build_engine(bridge);
+        let source = include_str!("../scripts/ui-smoke/release-checks.rhai")
+            .replace("__SEARCH_HITS__", "[]")
+            .replace("__CACHE_PATHS__", "[]")
+            .replace("__NAVIGATION_PATHS__", "[]")
+            .replace("__LOAD_PATHS__", "[]")
+            .replace("__INCLUDE_FIRST_AI__", "false")
+            .replace("__RUNNER_PID__", "202");
+        let ast = engine.compile(source).unwrap().clone_functions_only();
+        let selectable = |windows| {
+            let snapshot = TestScriptSnapshot {
+                windows,
+                ..Default::default()
+            };
+            engine
+                .call_fn::<bool>(
+                    &mut rhai::Scope::new(),
+                    &ast,
+                    "root_selectable",
+                    (snapshot.to_rhai_map(),),
+                )
+                .unwrap()
+        };
+        assert!(!selectable(vec![]));
+        let owner = root_identity(0, 0x4a11);
+        let mut root = window_snapshot(owner, 1, 0, "static.png");
+        assert!(root.to_rhai_map()["host_incarnation"].is_unit());
+        assert!(selectable(vec![root.clone()]));
+        root.identity = None;
+        // Even stale scalar HWND/backend fields cannot authorize selection.
+        assert!(!selectable(vec![root]));
+        assert!(!selectable(vec![window_snapshot(
+            window_identity(7, 11, 13),
+            1,
+            0,
+            "detached.png",
+        )]));
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn release_checks_bootstrap_waits_for_published_root_without_waking_it() {
+        let owner = root_identity(0, 0x4a11);
+        let root = window_snapshot(owner.clone(), 1, 0, "static.png");
+        let mut unready = root.clone();
+        unready.identity = None;
+        let (bridge, rx, wakes) = runner_bridge(TestScriptSnapshot {
+            windows: vec![unready],
+            ..Default::default()
+        });
+        let published = Arc::clone(&bridge.snapshot);
+        let selection = Arc::clone(&bridge.action_selection);
+        let wake_count = Arc::clone(&wakes);
+        let mut engine = build_engine(bridge);
+        // Stub only the isolated-filesystem setup. The actual recipe wait,
+        // serializer and select_root execute; no native window is created.
+        engine.register_fn(
+            "release_check_begin",
+            |_: ImmutableString, _: ImmutableString| {},
+        );
+        let source = include_str!("../scripts/ui-smoke/release-checks.rhai")
+            .replace("__SEARCH_HITS__", "[]")
+            .replace("__CACHE_PATHS__", "[]")
+            .replace("__NAVIGATION_PATHS__", "[]")
+            .replace("__LOAD_PATHS__", "[]")
+            .replace("__INCLUDE_FIRST_AI__", "false")
+            .replace("__RUNNER_PID__", "202");
+        let bootstrap = source.split("\nfor attempt in 0..1800 {").next().unwrap();
+        let publisher = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(wake_count.load(AtomicOrdering::Relaxed), 0);
+            published.write().unwrap().windows = vec![root];
+        });
+        let selected = engine
+            .eval::<Map>(bootstrap)
+            .expect("release root bootstrap");
+        assert_eq!(
+            selected["target_mode"]
+                .clone_cast::<ImmutableString>()
+                .as_str(),
+            "targeted"
+        );
+        assert!(selected["current"].clone_cast::<bool>());
+        publisher.join().unwrap();
+        assert_eq!(
+            *selection.lock().unwrap(),
+            TestScriptActionSelection::Targeted(owner.clone())
+        );
+        assert!(
+            matches!(rx.try_recv().unwrap(), UiCommand::Precondition(trace)
+            if trace.name == "wait_until" && trace.satisfied)
+        );
+        assert!(matches!(rx.try_recv().unwrap(), UiCommand::Log(message)
+            if message.contains(&owner.describe())));
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        // Completion publishes one precondition trace, then selection logs the
+        // owner. Both happen after readiness, before any measured idle window.
+        assert_eq!(wakes.load(AtomicOrdering::Relaxed), 2);
     }
 
     fn receive_through_finished(rx: &mpsc::Receiver<UiCommand>) -> Vec<UiCommand> {
