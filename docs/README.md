@@ -160,7 +160,8 @@
 | [similar-image-search-research.md](similar-image-search-research.md) | 上の前段の調査メモ。類似画像検索 / 重複検出。他ツール (hydrus / digiKam / XnView MP / Eagle / Komga / Immich) の機能と用途、perceptual hash と埋め込みのアルゴリズム比較、100 万件規模の実測 (索引不要という結論)、mIV へ載せる場合の保存先・スコープ・UI 案 |
 | [dpi-multimonitor-issue.md](dpi-multimonitor-issue.md) | マルチモニター DPI 問題の調査記録 |
 | [pdf-issues.md](pdf-issues.md) | PDF サポートの既知問題 |
-| [pdf-pool-context-epoch-plan.md](pdf-pool-context-epoch-plan.md) | PDF レンダ pool の 3 段階優先度と、ナビゲーションで stale 化したジョブを除去する context epoch |
+| [pdf-render-epoch-ownership-plan.md](pdf-render-epoch-ownership-plan.md) | PDF render失効・優先昇格のviewer-context所有。非Clone writer、immutable ticket、非同期prune、registry移譲、同path/pageの兄弟回帰（未リリース） |
+| [pdf-pool-context-epoch-plan.md](pdf-pool-context-epoch-plan.md) | 旧global整数context epoch導入時の履歴。現行契約はviewer-context所有計画 |
 | [pdf-pool-harvest-on-cancel-plan.md](pdf-pool-harvest-on-cancel-plan.md) | cancel 時に in-flight の PDF レンダ結果を回収してキャッシュ保存する `CancelWaitPolicy` |
 | [screenshot-howto.md](screenshot-howto.md) | 製品ページ用スクリーンショット手順 |
 | [e2e-smoke-test.md](e2e-smoke-test.md) | E2E スモークテストのチェックリスト |

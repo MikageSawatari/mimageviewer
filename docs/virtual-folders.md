@@ -1,5 +1,16 @@
 # 仮想フォルダ (ZIP / RAR / PDF / EPUB) 処理
 
+## PDF render失効の所有（未リリース）
+
+PDF/EPUB thumbnail要求は、pathやmain/windowの役割ではなく、要求を採用したviewerの
+`PdfRenderEpochOwner` に従う。read-only ticketをpin/fallback/RAW等の派生要求まで継承し、
+一覧交換で失効するのは同ownerの旧世代だけ。同じPDF/pageを読むdetached兄弟は継続する。
+writerとViewer昇格追跡は既存bundleと移譲、fork先はfresh、retire/dropは自身だけ終端する。
+pruneはpool maintenance worker、late enqueueはdispatcher popで検査し、UIはatomic＋wakeだけ。
+Viewer昇格/foundもowner/世代/keyを照合する。fullscreen本体・neighbor/bulk・Similar・Remote・
+列挙は明示Unscopedで、既存cancel/Abort/Harvest/cache identityを維持する。
+[所有設計](pdf-render-epoch-ownership-plan.md)が旧global整数epoch計画の後継正本。
+
 ## 本別見開き調整のscope/転送とRemote（§1.364 D1–D3、未リリース）
 
 永続scopeは`book_scope::BookScopeKey`。元書庫/PDF/EPUBの論理rootをKeepDrive正規化し、

@@ -5,6 +5,9 @@ use super::*;
 #[path = "tests/thumbnail_request_lifecycle.rs"]
 mod thumbnail_request_lifecycle;
 
+#[path = "tests/pdf_render_epoch.rs"]
+mod pdf_render_epoch;
+
 #[cfg(windows)]
 #[test]
 fn mixed_path_favorite_direct_navigation_standardizes_input_without_rewriting_saved_record() {
@@ -10824,9 +10827,11 @@ fn fullscreen_pdf_loads_are_not_pruned_by_grid_epoch() {
         crate::pdf_loader::JobPriority::HighNormal,
         crate::pdf_loader::JobPriority::Normal,
     ] {
-        assert_eq!(
-            App::fs_pdf_render_context_epoch(priority),
-            0,
+        assert!(
+            matches!(
+                App::fs_pdf_render_validity(priority),
+                crate::pdf_loader::PdfRenderValidity::Unscoped
+            ),
             "fullscreen fs_load PDF renders must be owned by fs_pending, not the main-grid epoch"
         );
     }

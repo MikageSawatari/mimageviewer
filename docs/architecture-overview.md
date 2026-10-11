@@ -1,5 +1,12 @@
 # アーキテクチャ概観
 
+未リリースPDF-EPOCH-OWNERSHIP: PDF renderの失効権限は非Cloneの
+`PdfRenderEpochOwner` としてApp投影/ViewerContextBundleが一つずつ所有する。
+worker/Jobはimmutable ticketだけを持ち、失効とViewer優先昇格はそのowner/要求世代に限定する。
+registryの値移譲はidentityを保持し、forkはfresh owner。共有pool内maintenanceがpruneを担当し、
+UIはatomic＋非blocking wakeだけ。fullscreen本体・独立backgroundは明示Unscoped。
+[後継設計](pdf-render-epoch-ownership-plan.md)。
+
 mimageviewer 全体の構造を俯瞰するための入口ドキュメント。**修正作業の前に必ず目を通すこと**。
 個別の詳細は下の「関連ドキュメント」にある専用ページに任せる。
 

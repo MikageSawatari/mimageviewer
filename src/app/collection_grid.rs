@@ -2569,9 +2569,11 @@ impl App {
             {
                 app.reading_history_return_from = None;
             }
-            if folder_changes && !app.navigation_scope.is_detached_physical() {
-                crate::thumb_loader::bump_catchup_epoch();
-                let _ = crate::pdf_loader::bump_render_context_epoch();
+            if folder_changes {
+                if !app.navigation_scope.is_detached_physical() {
+                    crate::thumb_loader::bump_catchup_epoch();
+                }
+                app.bump_render_epoch_only();
             }
             if folder {
                 app.transition_favorite_view_for_path(Some(&path));

@@ -1,7 +1,10 @@
 # PDF render epoch の viewer-context 所有 — 独立修正ステージ設計案
 
 作成: 2026-10-12。調査基点: `next-effetune` / `78e5f09ad`（Everything Stage 1 設計のコミット）。
-状態: **設計のみ、独立レビュー REVISE の P2 を改訂、再確認待ち**。利用者提示の独立レビュー対象は `efe965453`。Everything 計画は ACCEPT、本計画は優先昇格の scope 不足一件で REVISE。本工程では製品コード、.git、build、launch、download を変更・実行しない。
+状態: **R2独立レビュー ACCEPT（利用者報告、対象 `b5b3f06be`）、PDF独立実装と指定自動検証を実施済み、未コミット**。
+`efe965453` への唯一のP2（優先昇格scope）をR2で改訂し、再確認を取得した。
+Everything実装を含めず、未コミット差分として指定自動検証まで行う。build-dev/launchは利用者指示で実行しない。
+以下の設計時点の「再確認待ち／実装前／今回buildなし」はR2記録の履歴であり、現工程の状態は本行と末尾の実装記録による。全libとsnapshotの非ゼロ結果を記録し、全gate成功／独立実装レビュー受入とは扱わない。
 
 ## 1. 独立した目的と問題の根拠
 
@@ -251,3 +254,41 @@ prune の UI 同期走査は避け、pool 内一つの容量1 wake-only maintena
 - 対象 HEAD: `efe965453`。P2 は path/page-only priority promotion と found による A の遅着昇格取り落とし。設計担当は指摘に同意し、owner＋要求世代＋既存keyの selector、context-local tracking、Unscoped fullscreen selector、ordering回帰を追加した。
 - reviewer が提示した構造修正合意を detached §11 に記録。新たな owner map／retry loop／lane/cap 方針変更は追加していない。
 - 設計への反映済みを報告する段階であり、P2 の独立再確認、製品修正・test成功・実機受入は未取得。今回自前review、製品コード/.git変更、build/launch/downloadなし。
+
+### 2026-10-12 R2受入後の独立実装・検証記録（未コミット）
+
+利用者から `b5b3f06be` のR2独立ACCEPTと実装開始指示を取得し、Everythingに依存しない
+PDF-EPOCH-OWNERSHIPとして実装した。型はprivate `Arc<AtomicU64>` を保持する非Clone writerと
+immutable ticket、Viewer/Unscoped validity。全producer継承、queued prune/pop、owner/世代/key昇格、
+App/bundleのtyped promotion tracking、registry移譲/fork/retireを完成した。
+UI失効はatomic＋初期化済みpoolへの容量1wake、prune/reply/freeはpool内maintenance。
+まれなspawn/切断はログ＋既存toast、再試行・多段回復なし。lane/cap/open admission、
+Abort/Harvest、cache key、items generation/request ID、Remote IPC schemaは維持する。
+
+新回帰は同path/page/targetのmain＋detachedで実seek admission→Search replace→fake PDF queue→
+context固有ThumbMsg受理を逆方向も確認する。B同key先着→A昇格未着→A遅着、旧世代/別owner除外、
+fullscreen Unscoped/Critical、park/fork/build commit/abort/promote/retire、通常/priority/color/upgradeと
+pin/RAW/EPUBのticket継承、late enqueue/IPC受理後advance/count一回解放も含む。
+10,000 fake jobsと実maintenanceのbarrierでqueue contention、wake合流、idleのsweepなしを確認した。
+synthetic測定でprune lock保持1,339 us、publication数〜十数us、reply/freeはlock外。
+実機性能・実PDFium・実Everything・実window受入を表す結果ではない。
+
+指定検証: fmt、通常/portable core check、変更したdev-tools benchmark caller check、glyph 0、
+PDF pool 105・新handler 5・global_search_ui 54・registry 84・thumbnail owner 6・lifecycle 38・
+thumb_loader 95・color_filter 17・fullscreen_pdf 5の焦点テストは成功。
+最後の全libは一回実行し、**12,150 passed / 2 failed / 56 ignored**（exit 101）。
+失敗は `metadata_transfer::tests::committed_video_pin_changes_survive_a_later_cancelled_batch_only_after_commit`
+（transaction_batchesが2、期待1、metadata_transfer.rs:10475）と
+`video::tests::real_decoder_eof_full_loop_preserves_single_tail_burst_per_epoch`
+（first-frame ready送信assert、video/mod.rs:13261）。両対象ソースは今回無変更。
+両失敗の単独再確認は各1 passed / 0 failed。全体実行時の原因は未確定で、全体成功へ読み替えない。
+詳細・ログは `target/EV-pdf-epoch-impl-msg.txt` に集約した。
+
+ui_snapshotは156 passed / 1 failed。`startup_dialogs_small_viewport` の
+`startup_whats_new_1093x614` / `startup_whats_new_1366x728` が単独でも不一致。
+基準はv4.5.0先頭、現行tableはv4.6.0先頭。table/fixture/harness/基準PNGは今回無変更で、
+内容差を実画像で確認した。基準を更新していない。詳細差分数・全ログは同TXTを参照。
+
+§11に実装scopeと構造合意を記録した。独立実装レビュー／実機受入は未取得。
+利用者指示でbuild-dev/application launch/commit/mergeなし。EverythingのP1を受入済みに
+進めるのは、この独立stageのreview/gateに対する判断後とする。

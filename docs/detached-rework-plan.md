@@ -1455,6 +1455,29 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-12 PDF-EPOCH-OWNERSHIP: R2受入後の実装記録（未コミット）
+
+利用者からR2（`b5b3f06be`）の独立ACCEPTとPDF先行実装指示を取得した。
+以下の設計段階で記録した双方の「BA-7の所有境界を直す構造修正、症状パッチではない」
+合意の範囲で、App/bundleの非Clone writer、immutable ticketの全producer継承、
+共有poolの非同期prune/pop、owner/要求世代/key昇格、fullscreen Unscopedを実装した。
+registryはfresh/build/swap/park/fork/promote/retireでwriterとViewer昇格追跡を分類して移譲する。
+direct-readerからmainのphysical basisを実際に復元する場合だけmain旧要求を失効させる。
+
+回帰は同path/page/targetのmain＋detached Search replace（逆方向も）、
+B同key→A昇格要求→A遅着、旧世代/別owner除外、fullscreen Unscoped/Critical、
+park/fork/build commit/abort/promote/retire、ticket派生、maintenance wake合流を含む。
+viewport/placement/HWND/focus/recreate述語、lane/cap/open-admission、Remote protocol、
+Abort/Harvest/cache keyは変更しない。Everything製品コードは含めない。
+まれなmaintenance切断は既存toastへのログ＋通知のみで、再起動worker/回復stateは追加しない。
+
+指定自動検証の件数・失敗名・ログは `target/EV-pdf-epoch-impl-msg.txt` に集約する。
+fmt、通常/portable check、PDF/context/thumbnail/継承の焦点テストは成功。
+全libは一回で12,150成功・2失敗・56 ignored（未変更のmetadata batch数とvideo first-frame通知）。
+ui_snapshotは156成功・1失敗（変更履歴の基準画像はv4.5.0先頭、現行v4.6.0先頭で未追随）。
+全gate成功とは扱わず、失敗を記録して独立判断へ渡す。
+実装完了の独立レビューと実機受入は未取得。利用者指示に従いbuild-dev/launch/commit/mergeなし。
+
 ### 2026-10-12 PDF-EPOCH-OWNERSHIP: render失効と優先昇格のcontext所有（設計段階）
 
 利用者が提示した独立設計レビュー（対象 `efe965453`）は、非Clone writerをbundleと移譲し、

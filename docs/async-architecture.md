@@ -5,6 +5,29 @@
 
 ---
 
+## PDF render の viewer-context 所有（PDF-EPOCH-OWNERSHIP、未リリース）
+
+`App` のmounted投影と `ViewerContextBundle` が非Cloneの `PdfRenderEpochOwner` を
+移譲する。通常・priority/seek・upgrade・色分類のUI admissionは
+`LoadRequest.pdf_render_validity = Viewer(owner.snapshot())` を設定し、pin/RAW/EPUB等の
+派生workerはimmutable ticketをcloneする。workerが現在の世代を取り直す経路はない。
+一覧採用はそのcontextだけadvance、terminal/dropはそのownerだけretireする。
+park/mount/promoteはwriterを保持し、fork先はfresh ownerとIdleの昇格追跡を持つ。
+
+共有poolのNormal/HighNormal pruneは各job自身のticketを検査する。一覧失効のUI処理は
+atomic publishと容量1の非blocking wakeだけで、pool初期化・queue lock・走査・reply・joinは
+しない。pool内の一つのmaintenance workerがprune/reply/freeを行い、dispatcherはIPC前にも
+同じpredicateを検査する。late enqueue/retireはInterrupted→既存Canceled終端になる。
+in-flightのAbort/Harvest、request ID/items generationによる採用、共通source cache keyは維持する。
+
+Viewerの優先昇格/foundはowner identity＋要求世代＋既存keyで照合する。
+`PdfVisiblePromotionState` はticket/keys/retryを一つに保持してbundleと移譲する。
+兄弟同keyでretryを終えず、同keyの新世代でも再評価する。fullscreen本体/独立background/
+Similar/Remote/enumerateは明示Unscoped。fullscreen昇格もUnscoped同士だけを照合し、
+Viewer seek thumbnailを含めない。lane cap/open admission/Remote IPC schemaは変更しない。
+まれな失敗はログ＋通知、再試行・多段回復を追加しない。
+[設計と回帰条件](pdf-render-epoch-ownership-plan.md)。
+
 ## 本別見開き調整の永続化基盤とviewer/Remote接続（§1.364 D1–D3、2026-10-11）
 
 `SpreadShiftService`のUI handleは送信・immutable snapshot lookup・結果pollだけを行い、
@@ -583,7 +606,7 @@ ZIP 自動/pin 代表を `process_load_request` の `RawThumbHandoff::DedicatedW
 | `reload_queue` | `Arc<Mutex<Vec<LoadRequest>>>` | 通常サムネイル要求 (Image/ZipImage/PdfPage に加え、PdfFile のフォルダ代表画も IPC 待ちのためここに振る)。**スクロール中 / visible 待ち中は `prefetch_allowed_now` gate で `req.priority=false` の prefetch enqueue が抑制され、queue 内の既存 prefetch も `q.retain` で prune される** (= PDF pool に prefetch が流れる前に止めて in-flight 占有を防ぐ、docs/prefetch-suppression-during-scroll-plan.md) |
 | RAW half handoff (`raw_thumb_develop`) | viewer context ごとの `ItemsGenerationMap<RawThumbPending>` と既存 `reload_queue` | thumbnail worker は half を submit して `ThumbMsg` を送らず次の要求へ進む。executor は現像枠を返してから画像付き `LoadRequest::RawHalfDeveloped` を queue へ戻し、thumbnail worker が縮小、cache、画像と finalized の 2 通、`gen_done` を担当する。同 idx の新旧 submission ID を照合し、旧完了が新 ticket を外さない。keep 範囲外、items generation、folder 変更、mounted context の pause/park、drop は ticket を cancel し canceled `ThumbMsg` を送る。queue 済み follow-up が keep 外で skip されても `gen_done` を進める |
 | `heavy_io_queue` | `Arc<Mutex<Vec<LoadRequest>>>` | Folder/ZipFile/ConvertibleArchive/ZipDir 要求 (本物の同期 I/O または ZIP 内 prefix の代表解決)。Folder の再帰 pin 伝播で行う既存 catalog の read-only open / exact-row WebP lookup もここで実行し、UI スレッドへ SQLite cold open を持ち込まない。reload_queue と同じ prefetch suppression gate を共有 |
-| `pdf_pool.queue` | `Arc<(Mutex<JobQueue>, Condvar)>` | PDF ワーカーへのレンダ/列挙要求。`critical` / `high_normal` / `normal` VecDeque + `normal_in_flight` + `workers_busy` + `in_flight_started_at: Vec<Option<Instant>>` (起動時の設定数で固定、worker_id index) を同一 Mutex で保護。起動失敗した worker_id は詰めないため、実際に起動した数ではなく設定数で Vec を確保する。dispatcher は `critical → high_normal → normal` の順で pop する。Critical は従来どおり lane cap の影響を受けない。**`CRITICAL_RESERVATION_ACTIVE` (v1.0.0 から常時 ON)** のとき HighNormal + Normal の in-flight は `max(worker_count - 1, 1)`、Normal の開始だけは `max(worker_count - 2, 1)` までに制限する。これにより最低 1 ワーカーを Critical 用に予約しつつ、Normal 先読みが積まれても HighNormal 用にさらに 1 枠を残す。正式 pool の設定範囲は 3〜10 で、3 / 4 / 10 worker 時も同じ式から HighNormal / Normal cap がそれぞれ 2 / 1、3 / 2、9 / 8 になる。1〜2 の clamp は純関数の防御性と旧構成の回帰テスト用で、初期化結果としては公開しない。HighNormal は `req.priority=true` の可視セルと、`promote_fullscreen_to_high_normal` で昇格した現在 PDF ページ用 (= 画面外先読みより先に処理)。**Context epoch (`CURRENT_CONTEXT_EPOCH`)** で UI ナビゲーション (フォルダ移動 / Ctrl+G 結果差替え) ごとに HighNormal/Normal ジョブを世代管理し、bump で stale を一括 prune + dispatcher pop 時にも stale 判定。Critical と epoch=0 (background) はプルーン対象外。**`CancelWaitPolicy::HarvestOnCancel`** (thumbnail PDF render の cache-savable 経路のみ) では cancel が立っても in-flight IPC の reply を待ち、PDFium が既に処理した render 結果を harvest して cache 保存に進ませる (= 再エントリ時の再 render 地獄を防ぐ)。`promote_to_high_normal` はスクロール後の現可視 PDF サムネを同じ HighNormal lane へ昇格する。 **Open admission gate (2026-08-21)**: lane cap とは別に、**同時に走る文書 open を 3 件 (うち背景 HighNormal/Normal が使えるのは 2 件) に制限する**。open はディスク律速、render は CPU 律速で性質が正反対なため、1 つの並列度で両方を縛らない。ワーカーが既に保持している文書への要求は open を必要としないので **枠を消費せず常に通る** (= ページ送りの定常状態は影響を受けない)。親は `worker_documents: Vec<Option<PdfDocumentIdentity>>` で各ワーカーの保持文書を追跡し、open が要る job は `MSG_OPEN` を 1 往復送ってから本要求を送る。**枠は MSG_OPEN の往復だけを覆い、render 中は保持しない**。さらに上位 lane に「どのワーカーも保持していない文書」の job が待っている間、下位 lane の open は開始しない (前面優先)。判定は `decide_open_admission` / `higher_priority_open_pending` / `decide_lane_dispatch` の純関数で、実行時の待ち時間やストレージ種別には適応させない。 |
+| `pdf_pool.queue` | `Arc<(Mutex<JobQueue>, Condvar)>` | PDF ワーカーへのレンダ/列挙要求。`critical` / `high_normal` / `normal` VecDeque + `normal_in_flight` + `workers_busy` + `in_flight_started_at: Vec<Option<Instant>>` (起動時の設定数で固定、worker_id index) を同一 Mutex で保護。起動失敗した worker_id は詰めないため、実際に起動した数ではなく設定数で Vec を確保する。dispatcher は `critical → high_normal → normal` の順で pop する。Critical は従来どおり lane cap の影響を受けない。**`CRITICAL_RESERVATION_ACTIVE` (v1.0.0 から常時 ON)** のとき HighNormal + Normal の in-flight は `max(worker_count - 1, 1)`、Normal の開始だけは `max(worker_count - 2, 1)` までに制限する。これにより最低 1 ワーカーを Critical 用に予約しつつ、Normal 先読みが積まれても HighNormal 用にさらに 1 枠を残す。正式 pool の設定範囲は 3〜10 で、3 / 4 / 10 worker 時も同じ式から HighNormal / Normal cap がそれぞれ 2 / 1、3 / 2、9 / 8 になる。1〜2 の clamp は純関数の防御性と旧構成の回帰テスト用で、初期化結果としては公開しない。HighNormal は `req.priority=true` の可視セルと、`promote_fullscreen_to_high_normal` で昇格した現在 PDF ページ用 (= 画面外先読みより先に処理)。**Viewer-context epoch**: App/bundleの非Clone writerがpublishし、各jobはimmutable owner/generation ticketに従う。UIはatomic＋容量1wakeだけ、pool内maintenanceがNormal/HighNormalをpruneし、popも同じstale predicateを使う。UnscopedとCritical laneはqueued prune対象外。**`CancelWaitPolicy::HarvestOnCancel`** (thumbnail PDF render の cache-savable 経路のみ) では cancel が立っても in-flight IPC の reply を待ち、PDFium が既に処理した render 結果を harvest して cache 保存に進ませる (= 再エントリ時の再 render 地獄を防ぐ)。`promote_to_high_normal` はスクロール後の現可視 PDF サムネを同じ HighNormal lane へ昇格する。 **Open admission gate (2026-08-21)**: lane cap とは別に、**同時に走る文書 open を 3 件 (うち背景 HighNormal/Normal が使えるのは 2 件) に制限する**。open はディスク律速、render は CPU 律速で性質が正反対なため、1 つの並列度で両方を縛らない。ワーカーが既に保持している文書への要求は open を必要としないので **枠を消費せず常に通る** (= ページ送りの定常状態は影響を受けない)。親は `worker_documents: Vec<Option<PdfDocumentIdentity>>` で各ワーカーの保持文書を追跡し、open が要る job は `MSG_OPEN` を 1 往復送ってから本要求を送る。**枠は MSG_OPEN の往復だけを覆い、render 中は保持しない**。さらに上位 lane に「どのワーカーも保持していない文書」の job が待っている間、下位 lane の open は開始しない (前面優先)。判定は `decide_open_admission` / `higher_priority_open_pending` / `decide_lane_dispatch` の純関数で、実行時の待ち時間やストレージ種別には適応させない。 |
 | `CatchupQueue` (`thumb_loader.rs`) | `Arc<(Mutex<CatchupQueueState>, Condvar)>` | `pdf_meta` 背景書き込みキュー (v1.0.0)。`high: VecDeque<NeighborPrefetch>` (cap 16) + `low: VecDeque<MetaOnly>` (cap 256) + `pending: HashSet<PathBuf>` を同一 Mutex で保護。worker は high → low の順で pop。同 path が low にいる時に高優先が後から来ると **`high` 空き確認後に `low` から remove → `high` に push** で昇格する (lane が満杯のときだけ drop、lane 間は独立)。詳細は [docs/pdf-page-count-cache-plan.md の「最終形」セクション](pdf-page-count-cache-plan.md) |
 | `AiJobQueue` (`app.rs`) | `Arc<(Mutex<AiJobQueueState>, Condvar)>` | final AI (upscale/denoise) ジョブ。`display: VecDeque` (表示中ページ, push_front=LIFO) + `prefetch: VecDeque` (先読み, push_back=FIFO) + `shutdown` を同一 Mutex で保護。`final-ai-worker` が `display → prefetch` の順で pop。enqueue 重複は呼び出し側 `final_ai_pending.contains_key` で dedup。cancel は `final_ai_pending[key].cancel` (Drop でも立つ) を worker が pop 時に確認し、立っていれば推論せず `Cancelled` を返す (= 高速ページ送りで keep_set 外になったジョブは GPU 推論が始まる前に止まる)。PDF の表示中 final AI だけは、保持 LRU に入れる価値が高いので session close / keep-set evict 時に最大 1 件まで `retained_final_ai_orphans` へ移し、live pending から外したまま完走を許可する |
 | `texture_backlog` | ローカル Vec (App) | GPU アップロード未完の ColorImage。MAX_TEXTURES_PER_FRAME=8 超過分 |
@@ -1029,7 +1052,7 @@ keep外動画retryでupgrade・repaint・進捗を増減させない。VideoBatc
 
 STALE checkpointは従来どおりworker pop直後、ZIP/Folder heavy I/O resolve後、PDF render前。
 取消は同request IDのCanceledを送り、ただのcontinueで予約を残さない。
-RAW deferred callback/follow-upとEPUB fallbackも元のID・世代・操作sequence・context epochを保つ。
+RAW deferred callback/follow-upとEPUB fallbackも元のID・世代・操作sequence・immutable PDF render ticketを保つ。
 [寿命計画・回帰・検証証拠](thumbnail-request-lifecycle-plan.md)。
 
 静止画ページシークのサムネイル列 / hover preview はグリッド保持帯から遠いページを

@@ -623,21 +623,22 @@ egui::Window::new("...").show(ctx, |ui| {
 - 実例: `src/pdf_loader.rs` の `PdfWorkerPool` / `JobQueue` / `run_dispatcher`
 - `try_lock` 自体は「取れなければ今回は諦める」best-effort 用途のみ OK
 
-### PDF レンダ pool の context epoch (2026-05)
+### PDF レンダ pool の viewer-context epoch (2026-10-12、未リリース)
 
-`PdfWorkerPool` は **3 段階優先度** (`Critical / HighNormal / Normal`) + **context epoch**
-で管理されている。UI ナビゲーション (フォルダ移動 / Ctrl+G) で
-`pdf_loader::bump_render_context_epoch()` が呼ばれると、それ以前に enqueue された
-HighNormal/Normal ジョブが pool 内で stale 化 → bump 時の一括 prune + dispatcher pop 時の
-個別 stale 判定で skip される。これで PDF 多数フォルダを Ctrl+↑↓ で高速にめくっても、
-旧 PDF のページレンダリングが queue に溜まって新 PDF の cover を遅らせる事象を防ぐ。
+`PdfWorkerPool` は **3 段階優先度** (`Critical / HighNormal / Normal`) を維持し、
+PDF render失効はviewerごとの非Clone `PdfRenderEpochOwner` が所有する。
+App投影/bundleとwriterを移譲し、一覧採用で自身だけadvance、retire/dropで自身だけ終端する。
+UIはatomic publish＋容量1の非blocking wakeだけ。pool内の一つのmaintenance workerが
+HighNormal/Normalをpruneし、dispatcher popも各job ticketのstaleを検査する。
+同じPDF/pageを読む兄弟contextのjobsを失効させない。
 
-- `LoadRequest.context_epoch` を **UI スレッドの enqueue 時点で** 焼き付ける (TOCTOU 防止、
-  worker から `current_render_context_epoch()` を呼ばない)
-- `context_epoch=0` は background / Critical 用 sentinel (= プルーン対象外)
+- `LoadRequest.pdf_render_validity` のViewer ticketを **UI enqueue時点で** 捕捉し、派生要求は
+  immutable ticketをcloneする。workerはfresh化しない。
+- fullscreen本体/background/Remote/Similar/enumerateは明示 `Unscoped`（旧epoch=0）。
 - background 経路 (CatchupQueue / NeighborPrefetch / build_and_save_one_pdf / cache creator /
-  `get_document_info` / `enumerate_pages_with_cancel`) は全て epoch=0
-- 詳細: [docs/pdf-pool-context-epoch-plan.md](docs/pdf-pool-context-epoch-plan.md)
+  `get_document_info` / `enumerate_pages_with_cancel`) は全てUnscoped。
+- 詳細: [docs/pdf-render-epoch-ownership-plan.md](docs/pdf-render-epoch-ownership-plan.md)。
+  旧global整数epoch導入計画は履歴として残す。
 
 ### PDF レンダ pool の HarvestOnCancel (2026-05)
 
@@ -662,9 +663,10 @@ perf イベント: `pool_cancel_harvest_wait` (待ち開始時) / `pdf_thumb_cac
 `reload_queue` は毎フレーム re-tag されるが、**既に pdf_pool.normal に積まれたものは
 priority=False のまま居座る**。可視範囲到達後も Normal lane で処理されて 3 秒以上待たされる。
 
-対策: `pdf_loader::promote_to_high_normal(visible_keys)` を毎フレーム呼び、現可視 PDF の
-perf_key と match するジョブを Normal → HighNormal lane に移す。dedup は
-`last_promoted_visible_keys` で行い、lock 取得を最小化。
+対策: `pdf_loader::promote_to_high_normal(visible_keys, viewer_target)` がowner/要求世代/perf_keyを
+照合してNormal→HighNormalへ移す。dedup/retryはbundle-owned `PdfVisiblePromotionState` に集約する。
+兄弟の同keyをfoundと数えず、遅着した対象要求は既存frame再評価で昇格する。
+fullscreenの昇格targetはUnscoped固定で、Viewer seek thumbnailはその対象に含めない。
 
 新 perf イベント:
 - `ui/scroll_settle`: スクロール停止 (300ms) 検出。pool snapshot + target_count + already_loaded

@@ -827,6 +827,8 @@ pub(in crate::app) struct ViewerContextBundle {
     book_bookmark_title_edit: Option<BookBookmarkTitleEdit>,
     bookmark_view_registered_total: usize,
     items_generation: u64,
+    pdf_render_epoch: crate::pdf_loader::PdfRenderEpochOwner,
+    pdf_visible_promotion: super::PdfVisiblePromotionState,
     visible_indices: Vec<usize>,
     /// `items` と同じ添字の正規化済み basename と、その worker lifecycle。
     /// query / tokens / debounce は App 全体で同じ絞り込み条件を使うため swap しないが、
@@ -1743,6 +1745,8 @@ impl ViewerContextBundle {
     /// one-shot worker だが、owner の消滅後に CPU / GPU / AI 処理を続ける理由がないので、
     /// 各 worker が既に監視している cancel token を立てる。
     fn cancel_all_context_work(&mut self) {
+        self.pdf_render_epoch.retire();
+        self.pdf_visible_promotion = super::PdfVisiblePromotionState::Idle;
         self.current_book_bookmarks_request = None;
         crate::thumb_loader::cancel_raw_thumb_tickets(&self.raw_thumb_develop);
         self.cancel_token.store(true, Ordering::Relaxed);
@@ -1876,6 +1880,8 @@ impl ViewerContextBundle {
             book_bookmark_title_edit: None,
             bookmark_view_registered_total: 0,
             items_generation: 0,
+            pdf_render_epoch: crate::pdf_loader::PdfRenderEpochOwner::fresh(),
+            pdf_visible_promotion: super::PdfVisiblePromotionState::default(),
             visible_indices: Vec::new(),
             facet_name_cache: Vec::new(),
             facet_name_cache_generation: None,
@@ -2249,6 +2255,8 @@ impl App {
             book_bookmark_title_edit,
             bookmark_view_registered_total,
             items_generation,
+            pdf_render_epoch,
+            pdf_visible_promotion,
             visible_indices,
             facet_name_cache,
             facet_name_cache_generation,
@@ -2523,6 +2531,8 @@ impl App {
         swap_field!(book_bookmark_title_edit);
         swap_field!(bookmark_view_registered_total);
         swap_field!(items_generation);
+        swap_field!(pdf_render_epoch);
+        swap_field!(pdf_visible_promotion);
         swap_field!(visible_indices);
         swap_field!(facet_name_cache);
         swap_field!(facet_name_cache_generation);
@@ -2865,6 +2875,8 @@ impl App {
             book_bookmark_title_edit,
             bookmark_view_registered_total,
             items_generation,
+            pdf_render_epoch,
+            pdf_visible_promotion,
             visible_indices,
             facet_name_cache,
             facet_name_cache_generation,
@@ -3312,6 +3324,8 @@ impl App {
             // receiver だけは複製できないため、元の main context に残す。
             stack_script_pending,
             facet_name_cache_pending,
+            pdf_render_epoch,
+            pdf_visible_promotion,
             requested,
             raw_thumb_develop,
             metadata_import_refresh_index,
@@ -3429,6 +3443,7 @@ impl App {
             // Appended target removal leaves every basis index stable. Retain its
             // metadata/edit caches and invalidate only generation-bound main work.
             self.bump_items_generation();
+            self.bump_render_epoch_only();
             self.move_grid_cursor(
                 snapshot.saved_selected,
                 crate::app::GridCursorIntent::Automatic,
@@ -4625,6 +4640,342 @@ mod tests {
     use std::cell::RefCell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::rc::Rc;
+
+    #[cfg(windows)]
+    fn pdf_promotion_for_test(
+        ticket: &crate::pdf_loader::PdfRenderEpochTicket,
+        retry_needed: bool,
+    ) -> super::super::PdfVisiblePromotionState {
+        super::super::PdfVisiblePromotionState::Tracking {
+            ticket: ticket.clone(),
+            keys: std::collections::HashSet::from(["same.pdf:p:0@256".to_owned()]),
+            retry_needed,
+        }
+    }
+
+    #[cfg(windows)]
+    fn assert_pdf_promotion_for_test(
+        state: &super::super::PdfVisiblePromotionState,
+        expected: &crate::pdf_loader::PdfRenderEpochTicket,
+        expected_retry: bool,
+    ) {
+        let super::super::PdfVisiblePromotionState::Tracking {
+            ticket,
+            keys,
+            retry_needed,
+        } = state
+        else {
+            panic!("promotion tracking must travel with its viewer");
+        };
+        assert!(ticket.same_request(expected));
+        assert_eq!(
+            keys,
+            &std::collections::HashSet::from(["same.pdf:p:0@256".to_owned()])
+        );
+        assert_eq!(*retry_needed, expected_retry);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pdf_epoch_registry_empty_drop_and_swap_keep_only_their_own_writer() {
+        let mut app = crate::app::setup_app_for_test();
+        let main = app.pdf_render_epoch.snapshot();
+        app.pdf_visible_promotion = pdf_promotion_for_test(&main, false);
+        let empty = ViewerContextBundle::empty();
+        let empty_ticket = empty.pdf_render_epoch.snapshot();
+        assert!(!empty_ticket.same_request(&main));
+        drop(empty);
+        assert!(empty_ticket.is_stale());
+        assert!(!main.is_stale());
+
+        let mut sibling = ViewerContextBundle::empty();
+        let other = sibling.pdf_render_epoch.snapshot();
+        sibling.pdf_visible_promotion = pdf_promotion_for_test(&other, true);
+        app.swap_viewer_context_bundle(&mut sibling);
+        assert!(app.pdf_render_epoch.snapshot().same_request(&other));
+        assert_pdf_promotion_for_test(&app.pdf_visible_promotion, &other, true);
+        assert_pdf_promotion_for_test(&sibling.pdf_visible_promotion, &main, false);
+        assert!(!main.is_stale());
+        assert!(!other.is_stale());
+        app.swap_viewer_context_bundle(&mut sibling);
+        assert!(app.pdf_render_epoch.snapshot().same_request(&main));
+        assert_pdf_promotion_for_test(&app.pdf_visible_promotion, &main, false);
+        sibling.cancel_all_context_work();
+        sibling.cancel_all_context_work();
+        assert!(matches!(
+            sibling.pdf_visible_promotion,
+            super::super::PdfVisiblePromotionState::Idle
+        ));
+        drop(sibling);
+        assert!(other.is_stale());
+        assert!(!main.is_stale());
+        drop(app);
+        assert!(main.is_stale());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pdf_epoch_registry_build_commit_abort_promote_and_retire_are_context_local() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let main = app.pdf_render_epoch.snapshot();
+        app.pdf_visible_promotion = pdf_promotion_for_test(&main, false);
+        let mut committed_ticket = None;
+        let committed = app
+            .build_viewer_context("pdf_epoch_commit", |owner, _| {
+                let ticket = owner.pdf_render_epoch.snapshot();
+                assert!(!ticket.same_request(&main));
+                assert!(matches!(
+                    owner.pdf_visible_promotion,
+                    super::super::PdfVisiblePromotionState::Idle
+                ));
+                owner.pdf_visible_promotion = pdf_promotion_for_test(&ticket, true);
+                committed_ticket = Some(ticket);
+                BuildOutcome::Commit
+            })
+            .unwrap();
+        let committed_ticket = committed_ticket.unwrap();
+        assert!(app.pdf_render_epoch.snapshot().same_request(&main));
+        assert_pdf_promotion_for_test(&app.pdf_visible_promotion, &main, false);
+        app.with_viewer_context(committed, |owner| {
+            assert!(
+                owner
+                    .pdf_render_epoch
+                    .snapshot()
+                    .same_request(&committed_ticket)
+            );
+            assert_pdf_promotion_for_test(&owner.pdf_visible_promotion, &committed_ticket, true);
+        })
+        .unwrap();
+
+        let mut aborted_ticket = None;
+        assert_eq!(
+            app.build_viewer_context("pdf_epoch_abort", |owner, _| {
+                let ticket = owner.pdf_render_epoch.snapshot();
+                owner.pdf_visible_promotion = pdf_promotion_for_test(&ticket, true);
+                aborted_ticket = Some(ticket);
+                BuildOutcome::Abort("test")
+            }),
+            None
+        );
+        assert!(aborted_ticket.unwrap().is_stale());
+        assert!(!main.is_stale());
+        assert!(!committed_ticket.is_stale());
+        assert_pdf_promotion_for_test(&app.pdf_visible_promotion, &main, false);
+
+        let old_main = app.stash_mounted_and_start_fresh("pdf_epoch_promote");
+        let fresh = app.pdf_render_epoch.snapshot();
+        assert!(!fresh.same_request(&main));
+        assert!(matches!(
+            app.pdf_visible_promotion,
+            super::super::PdfVisiblePromotionState::Idle
+        ));
+        app.with_viewer_context(old_main, |owner| {
+            assert!(owner.pdf_render_epoch.snapshot().same_request(&main));
+            assert_pdf_promotion_for_test(&owner.pdf_visible_promotion, &main, false);
+        })
+        .unwrap();
+        app.retire_context(committed, "pdf_epoch_retire", |_| ())
+            .unwrap();
+        assert!(committed_ticket.is_stale());
+        assert!(!main.is_stale());
+        assert!(!fresh.is_stale());
+        app.retire_context(old_main, "pdf_epoch_old_main_retire", |_| ())
+            .unwrap();
+        assert!(main.is_stale());
+        assert!(!fresh.is_stale());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pdf_epoch_registry_ordinary_park_resume_preserves_ticket_and_same_key_tracking() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let mut ticket = None;
+        let parked = app
+            .build_viewer_context("pdf_epoch_park", |owner, _| {
+                let current = owner.pdf_render_epoch.snapshot();
+                owner.pdf_visible_promotion = pdf_promotion_for_test(&current, true);
+                ticket = Some(current);
+                BuildOutcome::Commit
+            })
+            .unwrap();
+        let ticket = ticket.unwrap();
+        let main = app.pdf_render_epoch.snapshot();
+        app.with_viewer_context(parked, |owner| {
+            owner.pause_mounted_background_work_keep_current_frame();
+            assert!(owner.pdf_render_epoch.snapshot().same_request(&ticket));
+            assert_pdf_promotion_for_test(&owner.pdf_visible_promotion, &ticket, true);
+        })
+        .unwrap();
+        assert!(!ticket.is_stale());
+        app.bump_render_epoch_only();
+        assert!(main.is_stale());
+        assert!(!ticket.is_stale());
+        let new_main = app.pdf_render_epoch.snapshot();
+        app.with_viewer_context(parked, |owner| {
+            assert!(owner.pdf_render_epoch.snapshot().same_request(&ticket));
+            assert_pdf_promotion_for_test(&owner.pdf_visible_promotion, &ticket, true);
+            owner.bump_render_epoch_only();
+            assert!(ticket.is_stale());
+            assert!(!new_main.is_stale());
+            assert!(matches!(
+                owner.pdf_visible_promotion,
+                super::super::PdfVisiblePromotionState::Idle
+            ));
+        })
+        .unwrap();
+        assert!(app.pdf_render_epoch.snapshot().same_request(&new_main));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pdf_epoch_registry_both_fork_policies_keep_source_writer_and_fork_fresh_idle() {
+        for live in [false, true] {
+            let mut app = crate::app::tests::phase_c_support::setup_app();
+            let root = app.tmp.path().join("pdf-epoch-fork");
+            app.current_folder = Some(root.clone());
+            app.items = vec![GridItem::PdfPage {
+                pdf_path: root.join("same.pdf"),
+                page_num: 0,
+                content_type: None,
+            }];
+            app.thumbnails = vec![ThumbnailState::Pending];
+            app.image_metas = vec![None];
+            app.visible_indices = vec![0];
+            app.fullscreen_idx = Some(0);
+            let main = app.pdf_render_epoch.snapshot();
+            app.pdf_visible_promotion = pdf_promotion_for_test(&main, true);
+            let generation = app.items_generation;
+            let request_id = app
+                .requested
+                .begin(
+                    0,
+                    generation,
+                    super::super::ThumbnailRequestKind::Normal,
+                    None,
+                )
+                .unwrap();
+            let queued = LoadRequest {
+                idx: 0,
+                pdf_render_validity: crate::pdf_loader::PdfRenderValidity::Viewer(main.clone()),
+                ..Default::default()
+            };
+            let queue = Arc::new((Mutex::new(vec![queued]), Condvar::new()));
+            app.reload_queue = Some(queue.clone());
+            let cancel = app.cancel_token.clone();
+            let fork = if live {
+                let main = app.viewer_context_main();
+                app.bind_window(main, 8131).unwrap();
+                app.fork_mounted_live_media_context(8131)
+            } else {
+                app.fork_materialized_still_context(&root, 0)
+            };
+            assert!(app.pdf_render_epoch.snapshot().same_request(&main));
+            assert_pdf_promotion_for_test(&app.pdf_visible_promotion, &main, true);
+            assert_eq!(app.requested.id(0), Some(request_id));
+            assert!(Arc::ptr_eq(app.reload_queue.as_ref().unwrap(), &queue));
+            assert!(Arc::ptr_eq(&app.cancel_token, &cancel));
+            assert!(!cancel.load(Ordering::Relaxed));
+            assert_eq!(queue.0.lock().unwrap().len(), 1);
+            let fork_ticket = app
+                .with_viewer_context(fork, |owner| {
+                    let ticket = owner.pdf_render_epoch.snapshot();
+                    assert!(!ticket.same_request(&main));
+                    assert!(matches!(
+                        owner.pdf_visible_promotion,
+                        super::super::PdfVisiblePromotionState::Idle
+                    ));
+                    assert!(owner.requested.is_empty());
+                    assert!(owner.reload_queue.is_none());
+                    assert!(owner.heavy_io_queue.is_none());
+                    ticket
+                })
+                .unwrap();
+            assert!(!main.is_stale());
+            app.retire_context(fork, "pdf_epoch_fork_retire", |_| ())
+                .unwrap();
+            assert!(fork_ticket.is_stale());
+            assert!(!main.is_stale());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pdf_epoch_registry_direct_reader_basis_restore_advances_only_main() {
+        for materialized in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let root = app.tmp.path().join("pdf-epoch-direct");
+            let basis = GridItem::PdfPage {
+                pdf_path: root.join("same.pdf"),
+                page_num: 0,
+                content_type: None,
+            };
+            let direct = GridItem::Image(root.join("direct.png"));
+            app.current_folder = Some(root.clone());
+            app.items = vec![basis.clone(), direct.clone()];
+            app.thumbnails = vec![ThumbnailState::Pending; 2];
+            app.image_metas = vec![None; 2];
+            app.visible_indices = vec![0, 1];
+            app.fullscreen_idx = Some(1);
+            app.snapshot = Some(crate::snapshot::SnapshotState {
+                page_edit_source: crate::snapshot::SnapshotPageEditSource::PhysicalPrefix,
+                items: Vec::new(),
+                membership: Default::default(),
+                origin: root.clone(),
+                filter_at_capture: crate::snapshot::FilterState::from_rating([true; 6]),
+                source_label: crate::snapshot::SnapshotSourceLabel::DirectMedia {
+                    target: root.join("direct.png"),
+                    policy: app.settings.file_type_visibility.clone(),
+                    reader_order: vec![0, 1],
+                    details_sort: None,
+                },
+                generation_id: app.items_generation,
+                saved_items: vec![basis.clone()],
+                saved_page_identity_index: app.page_identity_index.clone(),
+                saved_thumbnails: vec![ThumbnailState::Pending],
+                saved_image_metas: vec![None],
+                saved_visible_indices: vec![0],
+                saved_scroll_offset_y: 0.0,
+                saved_selected: Some(0),
+                saved_zip_nav: None,
+                list_view_items: vec![basis.clone(), direct],
+                list_view_thumbnails: vec![ThumbnailState::Pending; 2],
+                list_view_image_metas: vec![None; 2],
+                list_view_page_identity_index: app.page_identity_index.clone(),
+                pre_snapshot_search_origin: None,
+            });
+            let main = app.pdf_render_epoch.snapshot();
+            app.pdf_visible_promotion = pdf_promotion_for_test(&main, true);
+            let sibling = ViewerContextBundle::empty();
+            let sibling_ticket = sibling.pdf_render_epoch.snapshot();
+            let fork = if materialized {
+                app.split_materialized_physical_context_for_detached_scope(&root, 1, 991)
+            } else {
+                app.split_current_context_preserving_main_grid()
+            };
+            assert_eq!(app.items, vec![basis]);
+            assert!(!app.direct_media_reader_active());
+            assert!(
+                main.is_stale(),
+                "restoring the physical idx basis invalidates old main work"
+            );
+            assert!(!app.pdf_render_epoch.snapshot().is_stale());
+            assert!(matches!(
+                app.pdf_visible_promotion,
+                super::super::PdfVisiblePromotionState::Idle
+            ));
+            assert!(!sibling_ticket.is_stale());
+            let fork_ticket = fork.pdf_render_epoch.snapshot();
+            assert!(!fork_ticket.is_stale());
+            assert!(!fork_ticket.same_request(&app.pdf_render_epoch.snapshot()));
+            assert!(matches!(
+                fork.pdf_visible_promotion,
+                super::super::PdfVisiblePromotionState::Idle
+            ));
+            app.bump_render_epoch_only();
+            assert!(!fork_ticket.is_stale());
+            assert!(!sibling_ticket.is_stale());
+        }
+    }
 
     #[cfg(windows)]
     struct RatingBoundaryTrace;
