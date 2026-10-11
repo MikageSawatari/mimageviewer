@@ -28672,8 +28672,13 @@ impl App {
         if self.spread_mode.is_spread()
             && let Some((_, unit)) = find_spread_display_unit(&units, idx)
         {
-            self.fullscreen_idx = Some(unit.anchor_idx());
-            self.move_grid_cursor(self.fullscreen_idx);
+            let new_idx = unit.anchor_idx();
+            if new_idx != idx {
+                self.fullscreen_idx = Some(new_idx);
+                self.move_grid_cursor(Some(new_idx));
+            }
+            // Re-adopting the same page is a layout update, not a cursor move:
+            // preserve any range-selection origin established by Shift input.
         }
         self.fullscreen_page_layout.clear();
         if let Some(idx) = self.fullscreen_idx {

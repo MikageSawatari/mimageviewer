@@ -1,6 +1,6 @@
 //! State/handler regressions for the shared cursor/anchor owner (§1.370).
 use super::*;
-use crate::settings::{GridClickSelectionMode, GridViewMode};
+use crate::settings::{GridClickSelectionMode, GridViewMode, SpreadMode};
 use crate::ui_fullscreen::FsPageNav;
 
 fn grid(view: GridViewMode) -> AppTestEnvForTest {
@@ -97,6 +97,51 @@ fn fullscreen_page_then_escape_then_shift_click_starts_at_returned_cursor() {
         click(&mut app, 6, false, true);
         assert_eq!(app.checked, HashSet::from([4, 5, 6]));
         assert_eq!(anchor(&app), Some(4));
+    }
+}
+
+#[test]
+fn spread_layout_readoption_same_page_keeps_shift_click_origin() {
+    for view in [GridViewMode::Thumbnail, GridViewMode::Details] {
+        for mode in [SpreadMode::LtrCover, SpreadMode::RtlCover] {
+            let mut app = grid(view);
+            click(&mut app, 3, false, true);
+            app.fullscreen_idx = Some(3);
+            app.spread_mode = mode;
+            // Both metadata adoption and retained re-adoption use this entry.
+            for _ in 0..2 {
+                app.adopt_shift_layout_without_navigation();
+                assert_eq!(app.fullscreen_idx, Some(3));
+                assert_eq!(app.selected, Some(3));
+                assert_eq!(anchor(&app), Some(1));
+                assert_eq!(app.checked, HashSet::from([1, 2, 3]));
+            }
+            click(&mut app, 5, false, true);
+            assert_eq!(app.checked, HashSet::from([1, 2, 3, 4, 5]));
+            assert_eq!(anchor(&app), Some(1));
+        }
+    }
+}
+
+#[test]
+fn spread_layout_readoption_normalization_moves_shift_click_origin() {
+    for view in [GridViewMode::Thumbnail, GridViewMode::Details] {
+        for mode in [SpreadMode::LtrCover, SpreadMode::RtlCover] {
+            let mut app = grid(view);
+            click(&mut app, 4, false, true);
+            app.fullscreen_idx = Some(4);
+            app.spread_mode = mode;
+            // Page 4 becomes the second page of [3, 4], so normalization
+            // actually moves the cursor and must notify the shared owner.
+            app.adopt_shift_layout_without_navigation();
+            assert_eq!(app.fullscreen_idx, Some(3));
+            assert_eq!(app.selected, Some(3));
+            assert_eq!(anchor(&app), Some(3));
+            assert_eq!(app.checked, HashSet::from([1, 2, 3, 4]));
+            click(&mut app, 6, false, true);
+            assert_eq!(app.checked, HashSet::from([3, 4, 5, 6]));
+            assert_eq!(anchor(&app), Some(3));
+        }
     }
 }
 
