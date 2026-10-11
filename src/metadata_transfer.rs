@@ -4491,7 +4491,7 @@ fn validate_container_state(
     entry_path: &str,
 ) -> Result<(), TransferError> {
     if let Some(spread) = state.spread {
-        if !(0..=5).contains(&spread.mode)
+        if !crate::spread_db::valid_stored_mode(spread.mode)
             || !(0..=2).contains(&spread.flow)
             || !(0..=1).contains(&spread.direction)
         {
@@ -6814,6 +6814,59 @@ impl<W: Write> Write for CancelWriter<'_, W> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn composition_view_mode_transfer_preserves_exact_codec_and_dormant_binding() {
+        use super::*;
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("ATTACH DATABASE ':memory:' AS spread;
+            CREATE TABLE spread.spreads(path TEXT PRIMARY KEY,mode INTEGER,flow INTEGER,direction INTEGER);").unwrap();
+        let mut modes = (0..=7).collect::<Vec<_>>();
+        for class in 1..=3 {
+            for binding in (0..=7).chain(std::iter::once(255)) {
+                for explicit_flow in [0, 8192] {
+                    modes.push(4096 | explicit_flow | (class << 8) | binding);
+                }
+            }
+        }
+        for mode in modes {
+            let source = PortableContainerState {
+                spread: Some(PortableSpreadState {
+                    mode,
+                    flow: 2,
+                    direction: 1,
+                }),
+                ..Default::default()
+            };
+            let json = serde_json::to_vec(&source).unwrap();
+            let restored: PortableContainerState = serde_json::from_slice(&json).unwrap();
+            validate_container_state(&restored, "book.pdf").unwrap();
+            let key = format!("book-{mode}.pdf");
+            insert_container_state(&conn, &key, &restored).unwrap();
+            let stored: (i32, i32, i32) = conn
+                .query_row(
+                    "SELECT mode,flow,direction FROM spread.spreads WHERE path=?1",
+                    [&key],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(stored, (mode, 2, 1));
+        }
+        for mode in [-1, 8, 4096, 4096 | 256 | 8, 4096 | 256 | 16384, 8192 | 256] {
+            let state = PortableContainerState {
+                spread: Some(PortableSpreadState {
+                    mode,
+                    flow: 0,
+                    direction: 0,
+                }),
+                ..Default::default()
+            };
+            assert!(
+                validate_container_state(&state, "book.pdf").is_err(),
+                "accepted invalid mode {mode}"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

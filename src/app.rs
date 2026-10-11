@@ -566,6 +566,8 @@ use presentation_transition::{
 };
 #[cfg(all(windows, test))]
 use presentation_transition::{PreparingProgress, PresentationTransitionState};
+pub(crate) mod book_composition_permission;
+mod book_composition_remap;
 pub(crate) mod book_composition_runtime;
 pub(crate) mod normalize;
 pub(crate) mod page_edit_snapshot;
@@ -4337,7 +4339,7 @@ pub(crate) enum FolderNavMode {
 /// `target` は未展開 ZIP/PDF 内の特定 leaf を開きに行く場合に使う。★固定 navigation は
 /// `Preferred`、detached の明示 leaf open は `Required` とし、後者だけ target 消失時に
 /// 別ページへ fallback しない。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DeferredFsReopen {
     pub history_trigger: HistoryTrigger,
     /// true なら reopen 後にスライドショーを再開する (SlideshowNext 由来のときだけ)。
@@ -4370,8 +4372,10 @@ pub(crate) enum DeferredFsTarget {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DeferredFsOpenOutcome {
     Opened,
+    WaitingComposition,
     NoPlayableItem,
     RequiredTargetMissing,
+    RequiredTargetHidden,
 }
 
 pub(crate) struct PdfPasswordRequest {
@@ -16569,6 +16573,8 @@ pub struct App {
     /// 描画用 index は identity/nav 投影から取得し、durable rows は共有 service が所有する。
     pub(crate) spread_shift: ViewerSpreadShift,
     pub(crate) book_composition: book_composition_runtime::ViewerBookComposition,
+    pub(crate) book_composition_permission:
+        book_composition_permission::ViewerPresentationPermission,
     /// 現在の連結方式（ページ単位 / 縦連結 / 横連結）。
     pub(crate) reading_flow: crate::settings::ReadingFlow,
     /// 横連結時の読書方向。
@@ -20031,6 +20037,7 @@ impl App {
             page_alone_preferences: crate::settings::PageAlonePreferences::default(),
             spread_shift: Default::default(),
             book_composition: Default::default(),
+            book_composition_permission: Default::default(),
             reading_flow: crate::settings::ReadingFlow::default(),
             reading_direction: crate::settings::ReadingDirection::default(),
             spread_popup_open: false,
@@ -26092,7 +26099,12 @@ impl App {
                     apply_mode: self.view_trim_apply_mode,
                     book_settings: self.view_trim_book_settings,
                 };
-                if let Err(err) = db.set_book_state(key, migrated) {
+                if let Some(service) = &self.book_composition_service {
+                    let _ = service.save_view_trim(crate::view_trim_db::ViewTrimWriteBatch {
+                        book: Some((key.to_owned(), migrated)),
+                        pages: vec![],
+                    });
+                } else if let Err(err) = db.set_book_state(key, migrated) {
                     crate::logger::log(format!(
                         "view_trim: failed to migrate legacy margin fit for book: {err}"
                     ));
@@ -26114,6 +26126,20 @@ impl App {
             },
             book_settings: self.view_trim_book_settings,
         };
+        if let Some(service) = &self.book_composition_service {
+            let receipt = service.save_view_trim(crate::view_trim_db::ViewTrimWriteBatch {
+                book: Some((key, state)),
+                pages: vec![],
+            });
+            if let Ok(Err(error)) = receipt.try_recv() {
+                crate::logger::log(format!("view_trim: failed to enqueue book state: {error}"));
+            } else {
+                self.record_current_container_content_identity(
+                    crate::content_identity::ContentIdentityTrigger::Edit,
+                );
+            }
+            return;
+        }
         if let Err(err) = db.set_book_state(&key, state) {
             crate::logger::log(format!("view_trim: failed to save book state: {err}"));
         } else {
@@ -26131,6 +26157,24 @@ impl App {
         let (Some(db), Some(key)) = (&self.view_trim_db, self.page_path_key(idx)) else {
             return;
         };
+        if let Some(service) = &self.book_composition_service {
+            let receipt = service.save_view_trim(crate::view_trim_db::ViewTrimWriteBatch {
+                book: None,
+                pages: vec![(key, page_override)],
+            });
+            if let Ok(Err(error)) = receipt.try_recv() {
+                crate::logger::log(format!(
+                    "view_trim: failed to enqueue page override idx={idx}: {error}"
+                ));
+            } else {
+                self.record_content_identity_for_idx(
+                    idx,
+                    crate::content_identity::ContentIdentityTrigger::Edit,
+                );
+            }
+            self.invalidate_smart_folder_resort_metadata();
+            return;
+        }
         if let Err(err) = db.set_page_override(&key, page_override) {
             crate::logger::log(format!(
                 "view_trim: failed to save page override idx={idx}: {err}"
@@ -26148,6 +26192,21 @@ impl App {
         let (Some(db), Some(key)) = (&self.view_trim_db, self.page_path_key(idx)) else {
             return;
         };
+        if let Some(service) = &self.book_composition_service {
+            let receipt = service.remove_view_trim_page(key);
+            if let Ok(Err(error)) = receipt.try_recv() {
+                crate::logger::log(format!(
+                    "view_trim: failed to enqueue page override removal idx={idx}: {error}"
+                ));
+            } else {
+                self.record_content_identity_for_idx(
+                    idx,
+                    crate::content_identity::ContentIdentityTrigger::Edit,
+                );
+            }
+            self.invalidate_smart_folder_resort_metadata();
+            return;
+        }
         if let Err(err) = db.remove_page_override(&key) {
             crate::logger::log(format!(
                 "view_trim: failed to remove page override idx={idx}: {err}"
@@ -26336,6 +26395,7 @@ impl App {
         self.zip_enumerate_pending = None;
         self.fs_nav_after_pdf_enumerate = None;
         self.virtual_folder_writeback = None;
+        self.retire_book_deferred_open();
         self.pdf_prefetch_grace_until = None;
 
         let items: Vec<GridItem> = crate::known_folders::available_drives()
@@ -27947,6 +28007,7 @@ impl App {
                 _ => Some(self.projected_viewer_context_id()),
             };
             if owner_context == Some(self.projected_viewer_context_id()) {
+                self.retire_book_deferred_open();
                 self.top_level_grid_view.set_open_path_classification(None);
                 let retire_cold = self.pdf_enumerate_pending.as_ref().is_some_and(|pending| {
                     matches!(pending.5, PdfOpenPhase::ColdCandidate { .. })
@@ -32098,6 +32159,7 @@ impl App {
     /// An accepted staged request inherits the location before any unfinished direct book open.
     /// Retire an unfinished direct owner before admitting a staged request from its visible source.
     fn retire_direct_document_open_for_history_admission(&mut self) {
+        self.retire_book_deferred_open();
         let Some(mut pending) = self.pdf_enumerate_pending.take() else {
             return;
         };
@@ -35301,6 +35363,7 @@ impl App {
         self.zip_enumerate_pending = None;
         self.pdf_enumerate_pending = None;
         self.fs_nav_after_pdf_enumerate = None;
+        self.retire_book_deferred_open();
         self.archive_auto_fs_paint_trace = None;
         // 自動 1 ページ目フルスクリーン (環境設定 ON で grid から ZIP を開いた) の予約を、
         // enumerate 完了で先頭ページを開く既存 deferred 機構へ載せ替える。
@@ -36530,10 +36593,13 @@ impl App {
         self.zip_nav_show_current_level(StartupListIntent::PageContinuation);
         // 新しい本の先頭画像をフルスクリーンで開く (Ctrl+↑↓ 慣習: 常に先頭着地)。
         if let Some(new_idx) = self.find_fullscreen_nav_target_filtered(true) {
-            self.open_fullscreen(new_idx, crate::app::HistoryTrigger::UserChosen);
-            self.selected = Some(new_idx);
-            self.scroll_to_selected = true;
-            self.update_last_selected_image();
+            let continuation = if sequence_ctx.is_some() {
+                book_composition_permission::BookDfsContinuation::Navigation { forward }
+            } else {
+                book_composition_permission::BookDfsContinuation::Slideshow
+            };
+            let ctx = sequence_ctx.cloned().unwrap_or_default();
+            self.complete_book_zip_dfs_target(&ctx, new_idx, continuation);
         } else {
             // 直下画像はあるがレーティングフィルタで全 hidden のケース。
             // open_fullscreen に到達しないまま放置すると、
@@ -37091,6 +37157,7 @@ impl App {
         {
             return FolderOpenOutcome::Ignored;
         }
+        self.retire_book_deferred_open();
         let mut previous_pdf_enumerate = self.pdf_enumerate_pending.take();
         let mut retained_source = None;
         if let Some(previous) = previous_pdf_enumerate.as_mut() {
@@ -37399,6 +37466,12 @@ impl App {
         &mut self,
         deferred: DeferredFsReopen,
     ) -> DeferredFsOpenOutcome {
+        let ctx = self.edit_preview_repaint_ctx.clone().unwrap_or_default();
+        self.poll_book_composition_read(&ctx);
+        if self.book_composition.is_pending() {
+            self.defer_book_projection_open(deferred);
+            return DeferredFsOpenOutcome::WaitingComposition;
+        }
         let collection_continuation = match &deferred.target {
             DeferredFsTarget::CollectionNavigation(continuation) => Some(continuation.clone()),
             _ => None,
@@ -37412,6 +37485,9 @@ impl App {
             DeferredFsTarget::Required(target) => {
                 let resolved = self.resolve_required_snapshot_target_idx(target);
                 if resolved.is_none() {
+                    if self.composition_hides_snapshot_target(target) {
+                        return DeferredFsOpenOutcome::RequiredTargetHidden;
+                    }
                     crate::logger::log(format!("detached deferred target missing: {target:?}"));
                     return DeferredFsOpenOutcome::RequiredTargetMissing;
                 }
@@ -37428,9 +37504,22 @@ impl App {
             }
         }
         if new_idx.is_none() {
-            new_idx = self.find_fullscreen_nav_target_filtered(!deferred.resume_slideshow);
+            new_idx = match self.composed_book_layout() {
+                Some(layout) => layout.visible_pages.first().map(|page| page.item_index),
+                None => self.find_fullscreen_nav_target_filtered(!deferred.resume_slideshow),
+            };
         }
         if let Some(new_idx) = new_idx {
+            let purpose = if matches!(deferred.target, DeferredFsTarget::None)
+                && !deferred.resume_to_last_page
+            {
+                book_composition_permission::BookTargetPurpose::FirstInBook
+            } else {
+                book_composition_permission::BookTargetPurpose::Explicit
+            };
+            if self.defer_book_composition_deferred_open(new_idx, deferred.clone(), purpose) {
+                return DeferredFsOpenOutcome::WaitingComposition;
+            }
             if deferred.from_explicit_open {
                 self.fs_open_intent_from_grid = true;
             }
@@ -37451,9 +37540,14 @@ impl App {
         }
     }
 
+    pub(crate) fn complete_deferred_book_composition_open(&mut self, deferred: DeferredFsReopen) {
+        let outcome = self.open_deferred_fullscreen_after_enumerate(deferred);
+        self.handle_deferred_fs_open_outcome(outcome);
+    }
+
     fn handle_deferred_fs_open_outcome(&mut self, outcome: DeferredFsOpenOutcome) {
         match outcome {
-            DeferredFsOpenOutcome::Opened => {}
+            DeferredFsOpenOutcome::Opened | DeferredFsOpenOutcome::WaitingComposition => {}
             DeferredFsOpenOutcome::NoPlayableItem => {
                 self.finish_visible_container_fs_nav_failed();
                 #[cfg(windows)]
@@ -37468,6 +37562,10 @@ impl App {
                 self.terminate_active_detached_open_before_viewport(
                     "deferred_open_required_target_missing",
                 );
+            }
+            DeferredFsOpenOutcome::RequiredTargetHidden => {
+                self.finish_visible_container_fs_nav_failed();
+                self.show_feedback_toast("このページは本の構成で非表示になっています".into());
             }
         }
     }
@@ -43411,6 +43509,16 @@ impl App {
         // 各残存 old_idx に対する new_idx を partition_point で O(log K) 算出。
         let mut sorted_asc: Vec<usize> = sorted_desc_idxs.to_vec();
         sorted_asc.sort_unstable();
+        let composition_remap = match self.prepare_book_composition_item_removal(&sorted_asc) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                crate::logger::log(format!("book_composition: item removal refused: {error}"));
+                self.show_feedback_toast(
+                    "ページの削除に合わせて本の構成を更新できませんでした".into(),
+                );
+                return;
+            }
+        };
         let shift = |old: usize| -> Option<usize> {
             let p = sorted_asc.partition_point(|&x| x < old);
             if sorted_asc.get(p) == Some(&old) {
@@ -43451,6 +43559,7 @@ impl App {
             }
         }
         self.bump_items_generation();
+        self.adopt_book_composition_item_removal(composition_remap);
         self.remove_paths_from_subfolder_expansion_snapshot(&removed_snapshot_paths);
         self.remove_paths_from_smart_folder_snapshots(&removed_snapshot_paths);
 
@@ -47144,6 +47253,12 @@ impl App {
 
     /// 現在のビュー用ラッパー。判定本体は読み込み前にも使える items 引数付き述語へ集約する。
     pub(crate) fn page_order_locked_for_current_view(&self) -> bool {
+        if self.extracted_result_surface().is_some() {
+            return false;
+        }
+        if self.composed_book_layout().is_some() {
+            return true;
+        }
         if self.items_are_reading_history_view && self.current_folder.is_none() {
             return true;
         }
@@ -47253,7 +47368,7 @@ impl App {
             container_path,
             container_kind,
             page_identity,
-            page_index_hint: idx,
+            page_index_hint: self.canonical_raw_book_page(idx),
         })
     }
 
@@ -47812,6 +47927,12 @@ impl App {
         &self,
         bookmark: &crate::book_bookmarks::BookBookmark,
     ) -> BookBookmarkPanelResolution {
+        if self.composition_hides_bookmark(bookmark) {
+            return BookBookmarkPanelResolution {
+                current_item_index: None,
+                target_item_index: None,
+            };
+        }
         let current_item_index = self.book_bookmark_item_idx(bookmark);
         let target_item_index = current_item_index.or_else(|| {
             let target = self.resolve_current_archive_bookmark_target(bookmark)?;
@@ -47833,6 +47954,11 @@ impl App {
         ctx: &egui::Context,
         bookmark: &crate::book_bookmarks::BookBookmark,
     ) {
+        self.poll_book_composition_read(ctx);
+        if self.composition_hides_bookmark(bookmark) {
+            self.show_feedback_toast("このページは本の構成で非表示になっています".into());
+            return;
+        }
         let mut item_idx = self.book_bookmark_item_idx(bookmark);
         if item_idx.is_none() && self.enter_book_bookmark_archive_prefix(bookmark) {
             item_idx = self.book_bookmark_item_idx(bookmark);
@@ -48629,61 +48755,95 @@ impl App {
                         return;
                     }
                 };
-                let target = crate::bookmark_browser::BookmarkViewReturnTarget::Book(
-                    bookmark.container_path.clone(),
-                );
-                self.bookmark_view_state = Some(BookmarkViewState::Opening {
-                    target: target.clone(),
-                    grid: return_grid,
-                });
-                crate::logger::log(format!(
-                    "[bookmark-open] request book container={} page={} presentation={:?}",
-                    bookmark.container_path.display(),
-                    bookmark.page_identity.display_name(),
-                    self.viewer_presentation
-                ));
-                let pending = crate::bookmark_browser::PendingBookmarkOpen::Book(
-                    crate::bookmark_browser::PendingBookOpen {
-                        request_id,
-                        bookmark: bookmark.clone(),
-                        bookmark_source,
-                        relative_page_provenance: row.relative_page_provenance.clone(),
-                        started_at: std::time::Instant::now(),
-                        stage: crate::bookmark_browser::PendingBookOpenStage::Resolving,
-                    },
-                );
-                #[cfg(windows)]
-                if self.settings.detached_viewer_open_images_in_window {
-                    if !self.start_detached_bookmark_loading_context(
+                let pending = crate::bookmark_browser::PendingBookOpen {
+                    request_id,
+                    bookmark: bookmark.clone(),
+                    bookmark_source,
+                    relative_page_provenance: row.relative_page_provenance.clone(),
+                    started_at: std::time::Instant::now(),
+                    stage: crate::bookmark_browser::PendingBookOpenStage::Resolving,
+                };
+                if self.book_composition_service.is_some()
+                    && matches!(
+                        bookmark.container_kind,
+                        crate::book_bookmarks::BookContainerKind::Zip
+                            | crate::book_bookmarks::BookContainerKind::Pdf
+                    )
+                {
+                    let mut pending = pending;
+                    pending.stage = crate::bookmark_browser::PendingBookOpenStage::Qualifying(
+                        Box::new(crate::bookmark_browser::BookOpenQualification {
+                            navigation,
+                            return_grid,
+                        }),
+                    );
+                    self.bookmark_open_pending =
+                        Some(crate::bookmark_browser::PendingBookmarkOpen::Book(pending));
+                    self.poll_bookmark_book_open(ctx);
+                } else {
+                    self.start_qualified_bookmark_book_request(
                         ctx,
                         pending,
-                        target,
-                        DetachedSource::Book,
-                        bookmark.container_path.clone(),
-                    ) {
-                        self.clear_bookmark_view_return_state();
-                    }
-                    return;
+                        return_grid,
+                        navigation,
+                    );
                 }
-                self.bookmark_open_pending = Some(pending);
-                let navigation = navigation.map(|mut navigation| {
-                    let StartupOpenPathOwner::Bookmark(owner) = self
-                        .startup_open_path_owner(StartupOpenPathSource::Bookmark)
-                        .expect("accepted bookmark request")
-                    else {
-                        unreachable!()
-                    };
-                    navigation.source_proof = MainListSourceProof::Bookmark(owner);
-                    navigation
-                });
-                self.start_startup_open_path_resolution_owned_with_navigation(
-                    bookmark.container_path.clone(),
-                    StartupOpenPathSource::Bookmark,
-                    ctx,
-                    navigation,
-                );
             }
         }
+    }
+
+    fn start_qualified_bookmark_book_request(
+        &mut self,
+        ctx: &egui::Context,
+        pending: crate::bookmark_browser::PendingBookOpen,
+        return_grid: BookmarkViewReturnGridState,
+        navigation: Option<MainListNavigation>,
+    ) {
+        let bookmark = pending.bookmark.clone();
+        let target = crate::bookmark_browser::BookmarkViewReturnTarget::Book(
+            bookmark.container_path.clone(),
+        );
+        self.bookmark_view_state = Some(BookmarkViewState::Opening {
+            target: target.clone(),
+            grid: return_grid,
+        });
+        crate::logger::log(format!(
+            "[bookmark-open] request book container={} page={} presentation={:?}",
+            bookmark.container_path.display(),
+            bookmark.page_identity.display_name(),
+            self.viewer_presentation
+        ));
+        let pending = crate::bookmark_browser::PendingBookmarkOpen::Book(pending);
+        #[cfg(windows)]
+        if self.settings.detached_viewer_open_images_in_window {
+            if !self.start_detached_bookmark_loading_context(
+                ctx,
+                pending,
+                target,
+                DetachedSource::Book,
+                bookmark.container_path.clone(),
+            ) {
+                self.clear_bookmark_view_return_state();
+            }
+            return;
+        }
+        self.bookmark_open_pending = Some(pending);
+        let navigation = navigation.map(|mut navigation| {
+            let StartupOpenPathOwner::Bookmark(owner) = self
+                .startup_open_path_owner(StartupOpenPathSource::Bookmark)
+                .expect("accepted bookmark request")
+            else {
+                unreachable!()
+            };
+            navigation.source_proof = MainListSourceProof::Bookmark(owner);
+            navigation
+        });
+        self.start_startup_open_path_resolution_owned_with_navigation(
+            bookmark.container_path.clone(),
+            StartupOpenPathSource::Bookmark,
+            ctx,
+            navigation,
+        );
     }
 
     pub(crate) fn poll_bookmark_browser(&mut self, ctx: &egui::Context) {
@@ -49002,6 +49162,67 @@ impl App {
         }
 
         let (started_at, mut entered_archive_prefix) = match &pending.stage {
+            crate::bookmark_browser::PendingBookOpenStage::Qualifying(continuation) => {
+                if continuation
+                    .navigation
+                    .as_ref()
+                    .is_some_and(|nav| !self.main_list_navigation_is_current(nav))
+                {
+                    self.cancel_bookmark_open_request(
+                        pending.request_id,
+                        "book_identity_source_changed",
+                    );
+                    return;
+                }
+                let container =
+                    crate::path_key::normalize_keep_drive(&pending.bookmark.container_path);
+                let (identity, physical_archive) = match &pending.bookmark.page_identity {
+                    crate::book_bookmarks::PageIdentity::ArchiveEntry(entry_name) => (
+                        crate::book_resume_db::PageIdentity::Archive {
+                            container,
+                            entry_name: entry_name.clone(),
+                        },
+                        Some(pending.bookmark.container_path.clone()),
+                    ),
+                    crate::book_bookmarks::PageIdentity::PdfPage(page_num) => (
+                        crate::book_resume_db::PageIdentity::Document {
+                            container,
+                            page_num: *page_num as usize,
+                        },
+                        None,
+                    ),
+                    _ => return,
+                };
+                let candidate = crate::book_composition::CandidatePage {
+                    identity,
+                    physical_archive,
+                    raw_tree: None,
+                };
+                match self.qualify_book_identity_permission(ctx, pending.request_id.0, candidate) {
+                    book_composition_permission::BookIdentityPermission::Checking => return,
+                    book_composition_permission::BookIdentityPermission::Hidden
+                    | book_composition_permission::BookIdentityPermission::Refused => {
+                        self.cancel_bookmark_open_request(
+                            pending.request_id,
+                            "book_identity_refused",
+                        );
+                        return;
+                    }
+                    book_composition_permission::BookIdentityPermission::Allowed => {
+                        let continuation = continuation.clone();
+                        pending.stage = crate::bookmark_browser::PendingBookOpenStage::Resolving;
+                        self.bookmark_open_pending = None;
+                        self.retire_book_presentation_permission();
+                        self.start_qualified_bookmark_book_request(
+                            ctx,
+                            pending,
+                            continuation.return_grid,
+                            continuation.navigation,
+                        );
+                        return;
+                    }
+                }
+            }
             crate::bookmark_browser::PendingBookOpenStage::AwaitingPage {
                 started_at,
                 entered_archive_prefix,
@@ -49040,6 +49261,15 @@ impl App {
             crate::folder_tree::path_eq(&path, &pending.bookmark.container_path)
         });
         if !same_container {
+            return;
+        }
+        self.poll_book_composition_read(ctx);
+        if self.book_composition.is_pending() {
+            return;
+        }
+        if self.composition_hides_bookmark(&pending.bookmark) {
+            self.cancel_bookmark_open_request(pending.request_id, "book_page_composition_hidden");
+            self.show_feedback_toast("このページは本の構成で非表示になっています".into());
             return;
         }
         if let Some(idx) = self.book_bookmark_item_idx(&pending.bookmark) {
@@ -53944,6 +54174,7 @@ impl App {
     }
 
     pub(crate) fn cancel_pending_folder_nav(&mut self) {
+        self.retire_book_deferred_open();
         if let Some(pending) = self.folder_nav_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
@@ -57269,6 +57500,15 @@ impl App {
     /// 現在のフルスクリーンページを「最後に読んだページ」として永続記録する。
     /// 画像本のページのみ対象。dedup 付きで連続ページ送り中の重複書き込みを抑える。
     pub(crate) fn record_book_resume(&mut self, idx: usize) {
+        if matches!(
+            self.book_composition,
+            book_composition_runtime::ViewerBookComposition::Accepted {
+                cause: book_composition_runtime::ProjectionAdoptionCause::ProjectionRefresh,
+                ..
+            }
+        ) {
+            return;
+        }
         if !self.is_readable_page_idx(idx) {
             return;
         }
@@ -57292,11 +57532,22 @@ impl App {
                 self.archive_source_override.as_deref(),
             )
         });
-        if self.last_book_resume.as_ref() == Some(&(folder.clone(), idx, meter, identity.clone())) {
+        let writer_available = self.book_resume_writer.is_some();
+        let raw_index = match &self.book_composition {
+            book_composition_runtime::ViewerBookComposition::Accepted {
+                layout: crate::book_composition::CompositionProjectionOutcome::Composed(projection),
+                ..
+            } => projection
+                .canonical_raw_index_for_projected(idx)
+                .unwrap_or(idx),
+            _ => idx,
+        };
+        if self.last_book_resume.as_ref()
+            == Some(&(folder.clone(), raw_index, meter, identity.clone()))
+        {
             return;
         }
-        let writer_available = self.book_resume_writer.is_some();
-        self.persist_book_resume_with_identity(folder, idx, meter, identity);
+        self.persist_book_resume_with_identity(folder, raw_index, meter, identity);
         if writer_available {
             self.record_current_container_content_identity(
                 crate::content_identity::ContentIdentityTrigger::ViewingState,
@@ -57402,6 +57653,16 @@ impl App {
     }
 
     fn current_reading_history_page_position(&self, idx: usize) -> Option<(i64, i64)> {
+        if let book_composition_runtime::ViewerBookComposition::Accepted {
+            layout: crate::book_composition::CompositionProjectionOutcome::Composed(projection),
+            ..
+        } = &self.book_composition
+        {
+            return Some((
+                projection.reading_ordinal(idx)? as i64,
+                projection.resolved.visible_pages.len() as i64,
+            ));
+        }
         let mut page_count = 0_i64;
         let mut page_pos = None;
         for &candidate in self.current_reader_order() {
@@ -57484,7 +57745,7 @@ impl App {
             })
             .is_some_and(|position| {
                 matches!(
-                    self.page_identity_index.resolve(&position),
+                    self.resolve_current_book_position(&position),
                     file_type_resume::PositionResolution::HiddenIdentity
                         | file_type_resume::PositionResolution::LegacyWithExclusions
                 )
@@ -57502,7 +57763,7 @@ impl App {
                 .as_ref()
                 .and_then(|db| db.get_position(folder))
         })?;
-        match self.page_identity_index.resolve(&position) {
+        match self.resolve_current_book_position(&position) {
             file_type_resume::PositionResolution::Restored(index)
                 if self.is_readable_page_idx(index) =>
             {
@@ -58193,6 +58454,7 @@ impl App {
         self.pdf_enumerate_pending = None;
         self.zip_enumerate_pending = None;
         self.fs_nav_after_pdf_enumerate = None;
+        self.retire_book_presentation_permission();
         self.archive_auto_fs_paint_trace = None;
 
         let bookmark_request = self
@@ -60064,6 +60326,7 @@ impl App {
     /// Retire local document opens at the same typed terminals used when their context is parked.
     /// Remote may acquire while classification, navigation, or a conversion modal is in flight.
     fn retire_local_document_open_intents_for_remote(&mut self) {
+        self.retire_book_deferred_open();
         #[cfg(windows)]
         for owner in [
             viewer_context_registry::ContextAsyncOwner::EpubConversion,
@@ -65633,6 +65896,19 @@ impl App {
         if !self.grid_item_input_allowed() {
             return;
         }
+        let composition_ctx = self.edit_preview_repaint_ctx.clone().unwrap_or_default();
+        let Some(idx) = self.poll_and_remap_book_target(&composition_ctx, idx) else {
+            return;
+        };
+        if self.defer_book_composition_fullscreen_open(
+            idx,
+            history_trigger,
+            requested_materialization,
+            load_contract,
+            book_composition_permission::BookTargetPurpose::Explicit,
+        ) {
+            return;
+        }
         if self.defer_sidecar_restore_fullscreen(
             idx,
             history_trigger,
@@ -69219,7 +69495,7 @@ impl App {
 
     pub(crate) fn details_header_sort_active(&self) -> bool {
         self.settings.grid_view_mode == crate::settings::GridViewMode::Details
-            && !self.current_folder_is_book_folder()
+            && (self.extracted_result_surface().is_some() || !self.current_folder_is_book_folder())
             && !self.items_are_reading_history_view
             && self.details_header_sort_lock_reason().is_none()
             && self.settings.details_sort_key != crate::settings::DetailsSortKey::Toolbar
@@ -74557,6 +74833,7 @@ impl App {
     /// `keep_fullscreen_viewport_alive` がこのフラグを見て Visible(false) を
     /// 送信し、その直後に false に落とす。ここで先に落とすと送信が抑止される。
     pub(crate) fn close_fullscreen(&mut self) {
+        self.retire_book_presentation_permission();
         // A staged Ctrl traversal still leaves the old fullscreen visible. If that fullscreen
         // is explicitly closed before adoption, it no longer authorizes a deferred reopen.
         self.retire_staged_smart_fullscreen_nav_for_close();
@@ -93703,7 +93980,9 @@ impl eframe::App for App {
             // ViewerContextRegistry. Keep polling that context's draining preview
             // worker so cancellation/late completion retains the Windows lifecycle.
             let passwords = self.pdf_passwords.clone();
-            self.similar_panel.preview.poll_background(ctx, &passwords);
+            if let Some(notice) = self.similar_panel.preview.poll_background(ctx, &passwords) {
+                self.show_feedback_toast(notice);
+            }
         }
         self.update_frame(ctx, frame);
         // Composition publications and Prepare completions belong to the

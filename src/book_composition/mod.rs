@@ -4,12 +4,16 @@
 //! key. `PageDomain` only validates the kind and direct membership of page references.
 mod edit;
 mod model;
+mod permission;
+mod projection;
 mod resolve;
 mod service;
 pub(crate) mod store;
 
 pub use edit::UnitEdit;
 pub use model::*;
+pub(crate) use permission::*;
+pub(crate) use projection::*;
 pub use resolve::*;
 pub(crate) use service::*;
 pub(crate) use store::{
@@ -19,6 +23,10 @@ pub(crate) use store::{
 
 #[cfg(test)]
 pub(crate) mod fixtures;
+#[cfg(test)]
+mod permission_tests;
+#[cfg(test)]
+mod projection_tests;
 #[cfg(test)]
 mod store_tests;
 #[cfg(test)]

@@ -97,7 +97,7 @@ pub(crate) struct RemoteSessionUiState {
     pending_fullscreen_restore: Option<PendingFullscreenRestore>,
     paused_animation_restore_key: Option<String>,
     pending_bookmark_writes: std::collections::HashMap<u64, PendingRemoteBookmarkWrite>,
-    pending_shift_resets: std::collections::HashMap<u64, ClaimedRemoteWrite>,
+    pending_reading_writes: Vec<PendingRemoteReadingWrite>,
     pending_resume_reads: Vec<PendingRemoteResumeRead>,
     connection_dialog: Option<RemoteConnectionDialogState>,
     // Unlike the dialog-owned PIN and tailscale receivers, logout completion must outlive the
@@ -123,7 +123,7 @@ impl Drop for RemoteSessionUiState {
             video_stream: self.video_stream.take(),
             pending_bookmark_writes: std::mem::take(&mut self.pending_bookmark_writes),
             pending_fullscreen_restore: self.pending_fullscreen_restore.take(),
-            pending_shift_resets: std::mem::take(&mut self.pending_shift_resets),
+            pending_reading_writes: std::mem::take(&mut self.pending_reading_writes),
             pending_resume_reads: std::mem::take(&mut self.pending_resume_reads),
             handle,
             generation,
@@ -745,8 +745,32 @@ struct RemoteAppDrainLease {
     video_stream: Option<AppRemoteVideoStreamState>,
     pending_bookmark_writes: std::collections::HashMap<u64, PendingRemoteBookmarkWrite>,
     pending_fullscreen_restore: Option<PendingFullscreenRestore>,
-    pending_shift_resets: std::collections::HashMap<u64, ClaimedRemoteWrite>,
+    pending_reading_writes: Vec<PendingRemoteReadingWrite>,
     pending_resume_reads: Vec<PendingRemoteResumeRead>,
+}
+
+enum PendingRemoteReadingWrite {
+    ShiftClear {
+        sequence: u64,
+        pending: ClaimedRemoteWrite,
+    },
+    ViewSetting {
+        pending: ClaimedRemoteWrite,
+        receiver: std::sync::mpsc::Receiver<Result<(), String>>,
+    },
+    ViewTrim {
+        pending: ClaimedRemoteWrite,
+        receiver: std::sync::mpsc::Receiver<Result<crate::view_trim::ViewTrimBookState, String>>,
+    },
+}
+impl PendingRemoteReadingWrite {
+    fn into_pending(self) -> ClaimedRemoteWrite {
+        match self {
+            Self::ShiftClear { pending, .. }
+            | Self::ViewSetting { pending, .. }
+            | Self::ViewTrim { pending, .. } => pending,
+        }
+    }
 }
 
 struct PendingRemoteResumeRead {
@@ -766,7 +790,8 @@ impl Drop for RemoteAppDrainLease {
                 "アプリを終了しています",
             )));
         }
-        for (_, pending) in self.pending_shift_resets.drain() {
+        for pending in self.pending_reading_writes.drain(..) {
+            let pending = pending.into_pending();
             pending.complete(UiWriteOutcome::Write(write_error(
                 RemoteWriteErrorCode::UiTimeout,
                 "アプリを終了しています",
@@ -933,7 +958,9 @@ impl crate::app::App {
                 &mut self.remote_session_ui.pending_bookmark_writes,
             ),
             pending_fullscreen_restore: self.remote_session_ui.pending_fullscreen_restore.take(),
-            pending_shift_resets: std::mem::take(&mut self.remote_session_ui.pending_shift_resets),
+            pending_reading_writes: std::mem::take(
+                &mut self.remote_session_ui.pending_reading_writes,
+            ),
             pending_resume_reads: std::mem::take(&mut self.remote_session_ui.pending_resume_reads),
             handle,
             generation,
@@ -1226,7 +1253,8 @@ impl crate::app::App {
         }
         // The App frame poll drains Clear replies. Keep the existing Remote
         // tick prompt until its claimed request consumes the completion.
-        if !self.remote_session_ui.pending_shift_resets.is_empty() {
+        self.poll_remote_reading_writes();
+        if !self.remote_session_ui.pending_reading_writes.is_empty() {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         } else if matches!(
             self.remote_session_ui.video_stream.as_ref(),
@@ -2048,17 +2076,68 @@ impl crate::app::App {
         }
     }
 
+    fn poll_remote_reading_writes(&mut self) {
+        let mut waiting = Vec::new();
+        for write in std::mem::take(&mut self.remote_session_ui.pending_reading_writes) {
+            match write {
+                PendingRemoteReadingWrite::ViewSetting { pending, receiver } => {
+                    let result = match receiver.try_recv() {
+                        Ok(result) => result,
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            waiting
+                                .push(PendingRemoteReadingWrite::ViewSetting { pending, receiver });
+                            continue;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            Err("表示設定の保存 worker が停止しました".into())
+                        }
+                    };
+                    let response = match result {
+                        Ok(()) => RemoteWriteResponse::Success(RemoteWriteResult::applied()),
+                        Err(error) => write_error(RemoteWriteErrorCode::PersistenceFailed, error),
+                    };
+                    pending.complete(UiWriteOutcome::Write(response));
+                }
+                PendingRemoteReadingWrite::ViewTrim { pending, receiver } => {
+                    let ownership = pending.ownership_response();
+                    if ownership.status != SessionStatus::Active {
+                        pending.complete(UiWriteOutcome::Session(ownership));
+                        continue;
+                    }
+                    let result = match receiver.try_recv() {
+                        Ok(result) => result,
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            waiting.push(PendingRemoteReadingWrite::ViewTrim { pending, receiver });
+                            continue;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            Err("view trim worker stopped".into())
+                        }
+                    };
+                    let response = match result {
+                        Ok(state) => self.complete_remote_view_trim_write(state),
+                        Err(error) => write_error(RemoteWriteErrorCode::PersistenceFailed, error),
+                    };
+                    pending.complete(UiWriteOutcome::Write(response));
+                }
+                other => waiting.push(other),
+            }
+        }
+        self.remote_session_ui.pending_reading_writes = waiting;
+    }
+
     pub(crate) fn complete_remote_shift_reset(
         &mut self,
         reply: &crate::spread_shift::ShiftWriteReply,
     ) -> bool {
-        let Some(pending) = self
-            .remote_session_ui
-            .pending_shift_resets
-            .remove(&reply.sequence)
-        else {
+        let Some(pos) = self.remote_session_ui.pending_reading_writes.iter().position(|write| matches!(write, PendingRemoteReadingWrite::ShiftClear { sequence, .. } if *sequence == reply.sequence)) else {
             return false;
         };
+        let pending = self
+            .remote_session_ui
+            .pending_reading_writes
+            .remove(pos)
+            .into_pending();
         let response = match &reply.status {
             Ok(()) => {
                 self.show_feedback_toast("見開き調整を解除しました".into());
@@ -2417,6 +2496,82 @@ impl crate::app::App {
             pending.complete(UiWriteOutcome::Session(ownership));
             return;
         }
+        if let Some(service) = &self.book_composition_service
+            && let Err(error) = pending
+                .composition_admission()
+                .validate(&service.snapshot())
+        {
+            pending.complete(UiWriteOutcome::Write(write_error(
+                RemoteWriteErrorCode::Unsupported,
+                error,
+            )));
+            return;
+        }
+        if let RemoteWriteRequest::SetViewMode { address, mode } = pending.request() {
+            let result = remote_shift_scope(address).and_then(|scope| {
+                let service = self
+                    .book_composition_service
+                    .as_ref()
+                    .ok_or("composition service unavailable")?;
+                let mode = match mode {
+                    mimageviewer_ipc::RemoteViewMode::Single => crate::settings::SpreadMode::Single,
+                    mimageviewer_ipc::RemoteViewMode::Spread => crate::settings::SpreadMode::Ltr,
+                    mimageviewer_ipc::RemoteViewMode::LandscapeSplit => {
+                        crate::settings::SpreadMode::SplitLtr
+                    }
+                };
+                service.set_view_mode(scope, mode)
+            });
+            match result {
+                Ok(receiver) => self
+                    .remote_session_ui
+                    .pending_reading_writes
+                    .push(PendingRemoteReadingWrite::ViewSetting { pending, receiver }),
+                Err(error) => pending.complete(UiWriteOutcome::Write(write_error(
+                    RemoteWriteErrorCode::PersistenceFailed,
+                    error,
+                ))),
+            }
+            ctx.request_repaint();
+            return;
+        }
+        if let Some(service) = self.book_composition_service.as_ref()
+            && let RemoteWriteRequest::SetViewTrim {
+                context_address,
+                state,
+                ..
+            } = pending.request()
+        {
+            let result = (|| {
+                let state =
+                    serde_json::from_value::<crate::view_trim::ViewTrimBookState>(state.clone())
+                        .map_err(|_| {
+                            RemoteWriteError::new(
+                                RemoteWriteErrorCode::BadRequest,
+                                "表示トリム設定が正しくありません",
+                            )
+                        })?;
+                let key = remote_spread_key(context_address)?;
+                if self.view_trim_db.is_none() {
+                    return Err(RemoteWriteError::new(
+                        RemoteWriteErrorCode::PersistenceFailed,
+                        "view_trim.db を利用できません",
+                    ));
+                }
+                Ok(service.set_view_trim_book(key, state, pending.composition_admission().clone()))
+            })();
+            match result {
+                Ok(receiver) => self
+                    .remote_session_ui
+                    .pending_reading_writes
+                    .push(PendingRemoteReadingWrite::ViewTrim { pending, receiver }),
+                Err(error) => {
+                    pending.complete(UiWriteOutcome::Write(RemoteWriteResponse::Error(error)))
+                }
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            return;
+        }
         let _settings_family_lease = if remote_write_uses_settings_family(pending.request()) {
             match crate::settings_db::acquire_settings_family_read_lease() {
                 Ok(lease) => Some(lease),
@@ -2467,7 +2622,10 @@ impl crate::app::App {
             )));
             return;
         }
-        let response = self.apply_remote_write(pending.request());
+        let response = self.apply_remote_write_with_composition_admission(
+            pending.request(),
+            Some(pending.composition_admission()),
+        );
         if matches!(response, RemoteWriteResponse::Success(_))
             && self.settings.remember_spread_shift_per_book
             && let RemoteWriteRequest::SetSpread { address, .. } = pending.request()
@@ -2493,8 +2651,8 @@ impl crate::app::App {
             match result {
                 Ok(sequence) => {
                     self.remote_session_ui
-                        .pending_shift_resets
-                        .insert(sequence, pending);
+                        .pending_reading_writes
+                        .push(PendingRemoteReadingWrite::ShiftClear { sequence, pending });
                 }
                 Err(error) => {
                     crate::logger::log(format!(
@@ -2514,7 +2672,46 @@ impl crate::app::App {
     }
 
     fn apply_remote_write(&mut self, request: &RemoteWriteRequest) -> RemoteWriteResponse {
+        self.apply_remote_write_with_composition_admission(request, None)
+    }
+
+    fn apply_remote_write_with_composition_admission(
+        &mut self,
+        request: &RemoteWriteRequest,
+        qualified: Option<&crate::book_composition::CompositionWriteAdmission>,
+    ) -> RemoteWriteResponse {
+        if matches!(
+            request,
+            RemoteWriteRequest::SetSpread { .. }
+                | RemoteWriteRequest::SetFinalCoverSpreadPreference { .. }
+                | RemoteWriteRequest::SetSingletonSpreadPlacementPreference { .. }
+                | RemoteWriteRequest::SetSingletonSpreadEndpointPreference { .. }
+                | RemoteWriteRequest::SetPageAlonePreference { .. }
+        ) {
+            if let (Some(address), Some(service)) =
+                (request.address(), self.book_composition_service.as_ref())
+            {
+                let scope = match remote_shift_scope(address) {
+                    Ok(scope) => scope,
+                    Err(error) => return write_error(RemoteWriteErrorCode::Unsupported, error),
+                };
+                let admission = qualified.cloned().unwrap_or_else(|| {
+                    crate::book_composition::CompositionWriteAdmission {
+                        targets: Vec::new(),
+                        binding_scope: Some(scope),
+                        ..Default::default()
+                    }
+                });
+                if let Err(error) = admission.validate(&service.snapshot()) {
+                    return write_error(RemoteWriteErrorCode::Unsupported, error);
+                }
+            }
+        }
         match request {
+            RemoteWriteRequest::SetViewMode { .. } => write_error(
+                RemoteWriteErrorCode::Internal,
+                "表示モードの非同期経路が使われませんでした",
+            ),
             RemoteWriteRequest::SetSpread {
                 address,
                 spread_mode,
@@ -3289,6 +3486,13 @@ impl crate::app::App {
                 "view_trim.db への保存に失敗しました",
             );
         }
+        self.complete_remote_view_trim_write(state)
+    }
+
+    fn complete_remote_view_trim_write(
+        &mut self,
+        state: crate::view_trim::ViewTrimBookState,
+    ) -> RemoteWriteResponse {
         if matches!(
             self.settings.fullscreen_fit_mode,
             crate::settings::FullscreenFitMode::MarginFit
@@ -4313,7 +4517,8 @@ fn remote_write_uses_settings_family(request: &RemoteWriteRequest) -> bool {
     match request {
         RemoteWriteRequest::SetSortOrder { .. }
         | RemoteWriteRequest::RecordVideoProgress { .. } => true,
-        RemoteWriteRequest::SetSpread { .. }
+        RemoteWriteRequest::SetViewMode { .. }
+        | RemoteWriteRequest::SetSpread { .. }
         | RemoteWriteRequest::SetFinalCoverSpreadPreference { .. }
         | RemoteWriteRequest::SetSingletonSpreadPlacementPreference { .. }
         | RemoteWriteRequest::SetSingletonSpreadEndpointPreference { .. }
@@ -4730,7 +4935,7 @@ pub(super) fn core_reading_direction(
     }
 }
 
-fn write_error(code: RemoteWriteErrorCode, message: &'static str) -> RemoteWriteResponse {
+fn write_error(code: RemoteWriteErrorCode, message: impl Into<String>) -> RemoteWriteResponse {
     RemoteWriteResponse::Error(RemoteWriteError::new(code, message))
 }
 
@@ -5473,7 +5678,7 @@ mod tests {
                 dsp_admission_deadline: std::time::Instant::now(),
             })),
             pending_bookmark_writes,
-            pending_shift_resets: Default::default(),
+            pending_reading_writes: Default::default(),
             pending_resume_reads: Default::default(),
             pending_fullscreen_restore: Some(PendingFullscreenRestore {
                 item_key: "resume".to_owned(),

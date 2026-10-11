@@ -40,6 +40,9 @@ pub struct ZipTree {
     pub root: ZipTreeNode,
     // Cleanup always sees the complete unprojected enumeration, including excluded rows.
     pub(crate) source_cache_keys: Option<Vec<String>>,
+    // Composition scope/membership must survive policy filtering and wrapper collapse.
+    // The retained source has no parent reference, so this never creates a cycle.
+    source_tree: Option<Arc<ZipTree>>,
 }
 
 /// ツリーの 1 階層。子ディレクトリ (内側アーカイブ含む) と、その階層直下の画像を持つ。
@@ -103,6 +106,7 @@ impl ZipTree {
             zip_path,
             root,
             source_cache_keys: None,
+            source_tree: None,
         }
     }
 
@@ -148,9 +152,19 @@ impl ZipTree {
         }
         Self {
             zip_path: self.zip_path.clone(),
-            root: project_node(&self.root, policy),
+            root: project_node(&self.raw_source().root, policy),
             source_cache_keys: Some(self.all_cache_keys()),
+            source_tree: Some(
+                self.source_tree
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(self.clone())),
+            ),
         }
+    }
+
+    /// Complete unprojected hierarchy. Pure access; never reopens the archive.
+    pub(crate) fn raw_source(&self) -> &Self {
+        self.source_tree.as_deref().unwrap_or(self)
     }
 
     /// `prefix` (セグメント列、空 = ルート) が指す階層ノードを返す。
@@ -304,13 +318,31 @@ pub struct ZipNavState {
     /// 開いている外側 ZIP のツリー (列挙完了時に構築、ナビ中は保持)。
     pub tree: Arc<ZipTree>,
     /// 実効 prefix のスタック。`stack[0]` = `collapse_redundant(&[])`。常に非空。
-    stack: Vec<Vec<String>>,
+    stack: Vec<ZipNavLevel>,
+}
+
+/// One accepted navigation level retains both released display collapse and the
+/// original structural book scope. A later policy change cannot reconstruct the
+/// latter from the former, so they travel as one value in the existing stack.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ZipNavLevel {
+    display: Vec<String>,
+    raw: Vec<String>,
+}
+
+impl ZipNavLevel {
+    fn for_requested(tree: &ZipTree, requested: &[String]) -> Self {
+        Self {
+            display: tree.collapse_redundant(requested),
+            raw: tree.raw_source().collapse_redundant(requested),
+        }
+    }
 }
 
 impl ZipNavState {
     /// ZIP を開いたときの初期状態。ルートを collapse した実効 prefix を底に積む。
     pub fn new(tree: Arc<ZipTree>) -> Self {
-        let root_effective = tree.collapse_redundant(&[]);
+        let root_effective = ZipNavLevel::for_requested(&tree, &[]);
         Self {
             tree,
             stack: vec![root_effective],
@@ -344,14 +376,27 @@ impl ZipNavState {
             if effective.len() <= current.len() || !target.starts_with(&effective) {
                 return None;
             }
-            nav.stack.push(effective);
+            nav.stack.push(ZipNavLevel::for_requested(&nav.tree, child));
         }
         Some(nav)
     }
 
     /// 現在描画すべき実効 prefix。
     pub fn current(&self) -> &[String] {
-        self.stack.last().expect("ZipNavState stack is never empty")
+        &self
+            .stack
+            .last()
+            .expect("ZipNavState stack is never empty")
+            .display
+    }
+
+    /// Canonical book level chosen before file-type policy collapse.
+    pub(crate) fn current_raw(&self) -> &[String] {
+        &self
+            .stack
+            .last()
+            .expect("ZipNavState stack is never empty")
+            .raw
     }
 
     /// 現在が ZIP のルート表示か (= スタック底)。Backspace で ZIP を抜けるか判定に使う。
@@ -369,7 +414,7 @@ impl ZipNavState {
         if self.stack.len() < 2 {
             return None;
         }
-        let parent = &self.stack[self.stack.len() - 2];
+        let parent = &self.stack[self.stack.len() - 2].display;
         let current = self.current();
         if current.len() <= parent.len() || !current.starts_with(parent) {
             return None;
@@ -384,8 +429,8 @@ impl ZipNavState {
     /// で算出してスタックに積む。
     pub fn enter(&mut self, dir_prefix: &str) {
         let segs = split_prefix(dir_prefix);
-        let effective = self.tree.collapse_redundant(&segs);
-        self.stack.push(effective);
+        self.stack
+            .push(ZipNavLevel::for_requested(&self.tree, &segs));
     }
 
     /// 1 段戻る。スタックを pop する。戻れたら `true`、既にルート (底) なら `false`
@@ -448,14 +493,14 @@ fn sorted_dirs(node: &ZipTreeNode, sort: SortOrder) -> Vec<&String> {
 /// は `parent.len()` 位置にある (実効 prefix は親の実効 prefix の真の延長のため)。
 fn parent_dirs_and_pos<'t>(
     tree: &'t ZipTree,
-    stack: &[Vec<String>],
+    stack: &[ZipNavLevel],
     sort: SortOrder,
 ) -> Option<(Vec<&'t String>, usize)> {
     if stack.len() < 2 {
         return None;
     }
-    let parent = &stack[stack.len() - 2];
-    let seg = stack.last()?.get(parent.len())?;
+    let parent = &stack[stack.len() - 2].display;
+    let seg = stack.last()?.display.get(parent.len())?;
     let parent_node = tree.node_at(parent)?;
     let dirs = sorted_dirs(parent_node, sort);
     let pos = dirs.iter().position(|d| *d == seg)?;
@@ -465,14 +510,18 @@ fn parent_dirs_and_pos<'t>(
 /// DFS 前順で次のノードへ。進めたら `true` (stack 更新済み)。ツリー末尾なら `false` —
 /// このとき stack は遡行 pop で壊れているので、**呼び出し側は必ずコピーに対して使う**
 /// (`ZipNavState::dfs_step` がその規約を担保する)。
-fn dfs_forward_step(tree: &ZipTree, stack: &mut Vec<Vec<String>>, sort: SortOrder) -> bool {
+fn dfs_forward_step(tree: &ZipTree, stack: &mut Vec<ZipNavLevel>, sort: SortOrder) -> bool {
     // 1) 子があれば sort 先頭の子へ降りる (ルートの本一覧からも最初の本へ降りる)。
-    let current = stack.last().expect("zip nav stack is never empty").clone();
+    let current = stack
+        .last()
+        .expect("zip nav stack is never empty")
+        .display
+        .clone();
     if let Some(node) = tree.node_at(&current) {
         if let Some(first) = sorted_dirs(node, sort).first() {
             let mut child = current;
             child.push((*first).clone());
-            stack.push(tree.collapse_redundant(&child));
+            stack.push(ZipNavLevel::for_requested(tree, &child));
             return true;
         }
     }
@@ -483,9 +532,9 @@ fn dfs_forward_step(tree: &ZipTree, stack: &mut Vec<Vec<String>>, sort: SortOrde
         };
         if let Some(next_seg) = dirs.get(pos + 1) {
             let next_seg = (*next_seg).clone();
-            let mut child = stack[stack.len() - 2].clone();
+            let mut child = stack[stack.len() - 2].display.clone();
             child.push(next_seg);
-            let effective = tree.collapse_redundant(&child);
+            let effective = ZipNavLevel::for_requested(tree, &child);
             stack.pop();
             stack.push(effective);
             return true;
@@ -496,7 +545,7 @@ fn dfs_forward_step(tree: &ZipTree, stack: &mut Vec<Vec<String>>, sort: SortOrde
 
 /// DFS 逆前順で前のノードへ: 前の兄弟が居ればその「最後の子孫」へ降り切り、居なければ
 /// 親へ上がる。ルート表示では `false` (stack 不変、= ZIP の前へ抜ける)。
-fn dfs_backward_step(tree: &ZipTree, stack: &mut Vec<Vec<String>>, sort: SortOrder) -> bool {
+fn dfs_backward_step(tree: &ZipTree, stack: &mut Vec<ZipNavLevel>, sort: SortOrder) -> bool {
     let Some((dirs, pos)) = parent_dirs_and_pos(tree, stack, sort) else {
         return false;
     };
@@ -506,11 +555,12 @@ fn dfs_backward_step(tree: &ZipTree, stack: &mut Vec<Vec<String>>, sort: SortOrd
         return true;
     };
     let prev_seg = dirs[prev_pos].clone();
-    let mut effective = stack[stack.len() - 2].clone();
+    let mut effective = stack[stack.len() - 2].display.clone();
     effective.push(prev_seg);
-    let mut effective = tree.collapse_redundant(&effective);
+    let level = ZipNavLevel::for_requested(tree, &effective);
+    let mut effective = level.display.clone();
     stack.pop();
-    stack.push(effective.clone());
+    stack.push(level);
     // 前の兄弟の「最後の子孫」へ、各段 stack に積みながら降り切る (enter と同じ形を
     // 保つので、着地後の BS が 1 段ずつ正しく戻れる)。
     loop {
@@ -521,8 +571,9 @@ fn dfs_backward_step(tree: &ZipTree, stack: &mut Vec<Vec<String>>, sort: SortOrd
             break;
         };
         effective.push(last);
-        effective = tree.collapse_redundant(&effective);
-        stack.push(effective.clone());
+        let level = ZipNavLevel::for_requested(tree, &effective);
+        effective = level.display.clone();
+        stack.push(level);
     }
     true
 }

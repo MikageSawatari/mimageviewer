@@ -2004,6 +2004,7 @@ impl App {
             strip_setting_visible,
             strip_active_previous_frame,
             spread.unwrap_or(crate::ui_fullscreen::SpreadPair::Single),
+            self.book_composition_service.clone(),
         );
     }
 

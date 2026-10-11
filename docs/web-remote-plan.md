@@ -9,7 +9,12 @@ Webの既存方向/表紙付きキーは抽出一覧では表示種別だけへr
 単ページ・見開き・横長分割の三択。一時表示要求は既存collection取得/navigation経路へ送り、
 `SetSpread`の書込みを起動しない。保存コレクションの新規route取得では前sessionのmodeを送らない。
 件数/byte上限、policy、navigationのexact snapshot proofは保持する。通常ZIP一覧の子container位置も維持する。
-構成本の`SetViewMode`/binding拒否契約はbook-composition-plan §9.2 / G3以降の範囲であり、G1で構成APIは追加しない。
+構成本の`SetViewMode`/binding拒否契約はbook-composition-plan §9.2を参照する。
+2026-10-11 G3でstrict protocolを**v70**へ更新し、`SetViewMode`とderived `composition_managed`を追加した。
+構成あり本の結合`SetSpread`はworkerの最新snapshotで拒否し、Webは表示分類だけ切り替える。
+mode-onlyの本別保存は既存spread.db worker、抽出結果は非永続の表示投影。構成/shift writerを呼ばない。
+非対応ページ名では構成を使わず従来の操作を維持し、通知とlogを出す。書庫や保存構成を変更しない。
+この段でRemote構成editorやG5の表示/export全体を実装済みとはしない。
 
 
 v3.0.0 の目玉として、外出先のスマートフォン / タブレット / PC のブラウザから

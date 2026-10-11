@@ -241,6 +241,48 @@ pub(crate) struct SimilarPreviewStamp {
 }
 
 impl SimilarPreviewStamp {
+    fn composition_candidate(&self) -> crate::book_composition::CandidatePage {
+        use crate::{book_resume_db::PageIdentity, similar_index::SimilarItemTarget};
+        let logical_root = self
+            .item_key
+            .split_once(crate::search_norm::ZIP_ENTRY_SEP)
+            .map(|(root, _)| root);
+        let (identity, physical_archive) = match &self.target {
+            SimilarItemTarget::File(_) => (
+                PageIdentity::Image {
+                    path: crate::path_key::normalize_keep_drive(Path::new(&self.item_key)),
+                },
+                None,
+            ),
+            SimilarItemTarget::ZipPage {
+                zip_path,
+                entry_name,
+            } => (
+                PageIdentity::Archive {
+                    container: logical_root
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| crate::path_key::normalize_keep_drive(zip_path)),
+                    entry_name: entry_name.clone(),
+                },
+                Some(zip_path.clone()),
+            ),
+            SimilarItemTarget::PdfPage { pdf_path, page_num } => (
+                PageIdentity::Document {
+                    container: logical_root
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| crate::path_key::normalize_keep_drive(pdf_path)),
+                    page_num: *page_num as usize,
+                },
+                None,
+            ),
+        };
+        crate::book_composition::CandidatePage {
+            identity,
+            physical_archive,
+            raw_tree: None,
+        }
+    }
+
     pub(crate) fn for_hit(
         hit: &crate::similar_index::QueryHit,
         passwords: &crate::pdf_passwords::PdfPasswordStore,
@@ -441,6 +483,22 @@ struct SimilarPreviewRequest {
     owner_generation: u64,
     press_id: u64,
     cached_source_version: Option<SimilarPreviewSourceVersion>,
+    composition: Option<crate::book_composition::BookCompositionService>,
+}
+
+#[derive(Clone)]
+struct SimilarPreviewCompositionProof {
+    service: crate::book_composition::BookCompositionService,
+    permission: crate::book_composition::CandidatePermission,
+}
+
+impl SimilarPreviewCompositionProof {
+    fn is_current(&self) -> bool {
+        matches!(
+            self.permission,
+            crate::book_composition::CandidatePermission::Allowed(_)
+        ) && self.permission.is_current(&self.service.snapshot())
+    }
 }
 
 struct SimilarPreviewPending {
@@ -451,6 +509,17 @@ struct SimilarPreviewPending {
 }
 
 enum SimilarPreviewWorkerResult {
+    Qualified {
+        permission: crate::book_composition::CandidatePermission,
+        notice: Option<String>,
+        image: SimilarPreviewImage,
+    },
+    Hidden {
+        proof: crate::book_composition::ScopePermissionToken,
+    },
+    Refused {
+        notice: String,
+    },
     Unchanged {
         source_version: SimilarPreviewSourceVersion,
     },
@@ -458,6 +527,30 @@ enum SimilarPreviewWorkerResult {
         source_version: SimilarPreviewSourceVersion,
         pixels: SimilarPreviewPixels,
     },
+}
+
+enum SimilarPreviewImage {
+    Unchanged {
+        source_version: SimilarPreviewSourceVersion,
+    },
+    Prepared {
+        source_version: SimilarPreviewSourceVersion,
+        pixels: SimilarPreviewPixels,
+    },
+}
+impl From<SimilarPreviewImage> for SimilarPreviewWorkerResult {
+    fn from(image: SimilarPreviewImage) -> Self {
+        match image {
+            SimilarPreviewImage::Unchanged { source_version } => Self::Unchanged { source_version },
+            SimilarPreviewImage::Prepared {
+                source_version,
+                pixels,
+            } => Self::Prepared {
+                source_version,
+                pixels,
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -524,10 +617,11 @@ enum SimilarPreviewGesture {
     },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct SimilarPreviewAuthorization {
     request_id: u64,
     body_observation_pending: bool,
+    composition: Option<SimilarPreviewCompositionProof>,
 }
 
 #[derive(Default)]
@@ -547,6 +641,7 @@ pub(crate) struct SimilarPreviewState {
 }
 
 impl SimilarPreviewState {
+    #[cfg(test)]
     pub(crate) fn begin_press(
         &mut self,
         ctx: &egui::Context,
@@ -562,6 +657,7 @@ impl SimilarPreviewState {
         true
     }
 
+    #[cfg(test)]
     pub(crate) fn begin_candidate_press(
         &mut self,
         ctx: &egui::Context,
@@ -570,7 +666,15 @@ impl SimilarPreviewState {
         pdf_viewport: crate::pdf_loader::PdfDisplayTarget,
         session: SimilarPreviewSession,
     ) -> u64 {
-        self.begin_candidate_press_inner(ctx, candidate, passwords, pdf_viewport, session, None)
+        self.begin_candidate_press_inner(
+            ctx,
+            candidate,
+            passwords,
+            pdf_viewport,
+            session,
+            None,
+            None,
+        )
     }
 
     pub(crate) fn begin_candidate_press_from_panel(
@@ -583,6 +687,7 @@ impl SimilarPreviewState {
         strip_setting_visible: bool,
         strip_active_previous_frame: bool,
         spread: crate::ui_fullscreen::SpreadPair,
+        composition_service: Option<crate::book_composition::BookCompositionService>,
     ) -> u64 {
         self.begin_candidate_press_inner(
             ctx,
@@ -591,6 +696,7 @@ impl SimilarPreviewState {
             pdf_viewport,
             session,
             Some((strip_setting_visible, strip_active_previous_frame, spread)),
+            composition_service,
         )
     }
 
@@ -602,6 +708,7 @@ impl SimilarPreviewState {
         pdf_viewport: crate::pdf_loader::PdfDisplayTarget,
         session: SimilarPreviewSession,
         panel_context: Option<(bool, bool, crate::ui_fullscreen::SpreadPair)>,
+        composition_service: Option<crate::book_composition::BookCompositionService>,
     ) -> u64 {
         let stamp = SimilarPreviewStamp::for_candidate(candidate, passwords, pdf_viewport);
         self.observe_session(session);
@@ -657,6 +764,7 @@ impl SimilarPreviewState {
                 owner_generation: self.owner_generation,
                 press_id,
                 cached_source_version,
+                composition: composition_service,
             },
         );
         press_id
@@ -721,6 +829,12 @@ impl SimilarPreviewState {
             self.end_gesture_with_reason("viewport_focus_lost");
         }
         let _ = self.poll_worker(ctx, passwords);
+        // The dispatcher drains completions and delivers any notice before this call.
+        if matches!(&self.gesture, SimilarPreviewGesture::Holding { authorization: Some(authorization), .. }
+            if authorization.composition.as_ref().is_some_and(|proof| !proof.is_current()))
+        {
+            self.end_gesture_with_reason("composition_changed");
+        }
         let (stamp, owner_session, owner_generation, press_id) = match &self.gesture {
             SimilarPreviewGesture::Holding {
                 stamp,
@@ -779,7 +893,9 @@ impl SimilarPreviewState {
             log_similar_preview_diagnostic(
                 "gesture_end",
                 Some(*press_id),
-                authorization.map(|authorization| authorization.request_id),
+                authorization
+                    .as_ref()
+                    .map(|authorization| authorization.request_id),
                 format!(
                     "reason={reason} target_kind={} target_token={}",
                     diagnostic_target_kind(&stamp.target),
@@ -816,12 +932,14 @@ impl SimilarPreviewState {
         &mut self,
         ctx: &egui::Context,
         passwords: &crate::pdf_passwords::PdfPasswordStore,
-    ) {
+    ) -> Option<String> {
         if matches!(
             self.preparation,
             SimilarPreviewPreparation::Running(_) | SimilarPreviewPreparation::Draining { .. }
         ) {
-            let _ = self.poll_worker(ctx, passwords);
+            self.poll_worker(ctx, passwords)
+        } else {
+            None
         }
     }
 
@@ -908,7 +1026,9 @@ impl SimilarPreviewState {
         };
         Some((
             *press_id,
-            authorization.map(|authorization| authorization.request_id),
+            authorization
+                .as_ref()
+                .map(|authorization| authorization.request_id),
         ))
     }
 
@@ -1068,6 +1188,9 @@ impl SimilarPreviewState {
                 }))
                 .unwrap_or_else(|_| Err("画像の準備に失敗しました".to_owned()));
                 let outcome = match &result {
+                    Ok(SimilarPreviewWorkerResult::Qualified { .. }) => "qualified",
+                    Ok(SimilarPreviewWorkerResult::Hidden { .. }) => "hidden",
+                    Ok(SimilarPreviewWorkerResult::Refused { .. }) => "refused",
                     Ok(SimilarPreviewWorkerResult::Unchanged { .. }) => "unchanged",
                     Ok(SimilarPreviewWorkerResult::Prepared { .. }) => "prepared",
                     Err(_) => "failed",
@@ -1111,7 +1234,7 @@ impl SimilarPreviewState {
         &mut self,
         ctx: &egui::Context,
         passwords: &crate::pdf_passwords::PdfPasswordStore,
-    ) -> Option<u64> {
+    ) -> Option<String> {
         match std::mem::take(&mut self.preparation) {
             SimilarPreviewPreparation::Idle => None,
             failed @ SimilarPreviewPreparation::Failed { .. } => {
@@ -1139,6 +1262,9 @@ impl SimilarPreviewState {
                 }
                 Ok(result) => {
                     let outcome = match &result {
+                        Ok(SimilarPreviewWorkerResult::Qualified { .. }) => "qualified",
+                        Ok(SimilarPreviewWorkerResult::Hidden { .. }) => "hidden",
+                        Ok(SimilarPreviewWorkerResult::Refused { .. }) => "refused",
                         Ok(SimilarPreviewWorkerResult::Unchanged { .. }) => "unchanged",
                         Ok(SimilarPreviewWorkerResult::Prepared { .. }) => "prepared",
                         Err(_) => "failed",
@@ -1202,7 +1328,7 @@ impl SimilarPreviewState {
         passwords: &crate::pdf_passwords::PdfPasswordStore,
         pending: SimilarPreviewPending,
         result: Result<SimilarPreviewWorkerResult, String>,
-    ) -> Option<u64> {
+    ) -> Option<String> {
         let request = pending.request;
         if let Some(reason) = self.request_rejection_reason(&request, passwords) {
             log_similar_preview_diagnostic(
@@ -1213,8 +1339,66 @@ impl SimilarPreviewState {
             );
             return None;
         }
+        let (result, composition, notice) =
+            match result {
+                Ok(SimilarPreviewWorkerResult::Qualified {
+                    permission,
+                    notice,
+                    image,
+                }) => {
+                    let proof = request.composition.as_ref().map(|binding| {
+                        SimilarPreviewCompositionProof {
+                            service: binding.clone(),
+                            permission,
+                        }
+                    });
+                    if proof.as_ref().is_none_or(|proof| !proof.is_current()) {
+                        (
+                            Err("本の構成が更新されました。もう一度操作してください".into()),
+                            None,
+                            None,
+                        )
+                    } else {
+                        (Ok(image), proof, notice)
+                    }
+                }
+                Ok(SimilarPreviewWorkerResult::Hidden { proof }) => {
+                    let permission = crate::book_composition::CandidatePermission::Hidden(proof);
+                    let current = request
+                        .composition
+                        .as_ref()
+                        .is_some_and(|binding| permission.is_current(&binding.snapshot()));
+                    let notice = if current {
+                        "本の構成で非表示に設定されています"
+                    } else {
+                        "本の構成が更新されました。もう一度操作してください"
+                    };
+                    (Err(notice.into()), None, None)
+                }
+                Ok(SimilarPreviewWorkerResult::Refused { notice }) => (Err(notice), None, None),
+                Ok(_) if request.composition.is_some() => {
+                    (Err("本の構成を確認できませんでした".into()), None, None)
+                }
+                Ok(SimilarPreviewWorkerResult::Unchanged { source_version }) => (
+                    Ok(SimilarPreviewImage::Unchanged { source_version }),
+                    None,
+                    None,
+                ),
+                Ok(SimilarPreviewWorkerResult::Prepared {
+                    source_version,
+                    pixels,
+                }) => (
+                    Ok(SimilarPreviewImage::Prepared {
+                        source_version,
+                        pixels,
+                    }),
+                    None,
+                    None,
+                ),
+                Err(error) => (Err(error), None, None),
+            };
         let accepted = match result {
-            Ok(SimilarPreviewWorkerResult::Unchanged { source_version }) => self
+            Ok(SimilarPreviewImage::Unchanged { source_version }) => self
                 .cached
                 .as_ref()
                 .filter(|asset| {
@@ -1225,7 +1409,7 @@ impl SimilarPreviewState {
                 })
                 .cloned()
                 .ok_or_else(|| "検証対象の画像キャッシュがありません".to_owned()),
-            Ok(SimilarPreviewWorkerResult::Prepared {
+            Ok(SimilarPreviewImage::Prepared {
                 source_version,
                 pixels,
             }) => {
@@ -1275,6 +1459,7 @@ impl SimilarPreviewState {
                     *authorization = Some(SimilarPreviewAuthorization {
                         request_id: pending.request_id,
                         body_observation_pending: true,
+                        composition,
                     });
                     true
                 } else {
@@ -1288,7 +1473,7 @@ impl SimilarPreviewState {
                 );
                 self.preparation = SimilarPreviewPreparation::Idle;
                 ctx.request_repaint();
-                authorized.then_some(pending.request_id)
+                notice
             }
             Err(error) => {
                 if self
@@ -1304,8 +1489,9 @@ impl SimilarPreviewState {
                     Some(pending.request_id),
                     "reason=worker_or_validation_error",
                 );
+                let notice = error.clone();
                 self.preparation = SimilarPreviewPreparation::Failed { request, error };
-                None
+                Some(notice)
             }
         }
     }
@@ -1384,21 +1570,94 @@ fn validate_or_prepare_similar_preview_with(
         Arc<AtomicBool>,
     ) -> Result<SimilarPreviewPixels, String>,
 ) -> Result<SimilarPreviewWorkerResult, String> {
+    let qualification = request.composition.as_ref().map(|service| {
+        use crate::book_composition::{
+            CandidateCorrelation, CandidateOccurrence, CandidatePermission,
+            CandidatePermissionError,
+        };
+        let candidate = request.stamp.composition_candidate();
+        let correlation = CandidateCorrelation {
+            context_id: request.press_id,
+            request_id: request.press_id,
+            items_generation: request.session.items_generation,
+            occurrence: CandidateOccurrence::IdentityOnly,
+            identity: candidate.identity.clone(),
+        };
+        // This private channel is awaited only on the existing preview worker.
+        // The shared service orders the check behind initialization/maintenance
+        // and already queued writes, rather than admitting from a press-time snapshot.
+        let permission = service
+            .check_candidate(correlation.clone(), candidate)
+            .recv()
+            .map_err(|_| {
+                CandidatePermissionError::Unavailable("preview permission worker stopped".into())
+            })
+            .and_then(|reply| {
+                if reply.correlation != correlation {
+                    Err(CandidatePermissionError::Unavailable(
+                        "preview permission correlation changed".into(),
+                    ))
+                } else {
+                    reply.status
+                }
+            });
+        match permission {
+            Ok(CandidatePermission::Allowed(proof)) => {
+                Ok((CandidatePermission::Allowed(proof), None))
+            }
+            Ok(CandidatePermission::Hidden(proof)) => {
+                return Err(SimilarPreviewWorkerResult::Hidden { proof });
+            }
+            Ok(CandidatePermission::Checking) => Err(SimilarPreviewWorkerResult::Refused {
+                notice: "本の構成を確認できませんでした".to_owned(),
+            }),
+            Err(CandidatePermissionError::UnsupportedSource(error)) => {
+                crate::logger::log(format!(
+                    "book_composition: unsupported preview source: {error}"
+                ));
+                Ok((
+                    CandidatePermission::Allowed(None),
+                    Some(crate::book_composition::UNSUPPORTED_COMPOSITION_NOTICE.into()),
+                ))
+            }
+            Err(CandidatePermissionError::Unavailable(error)) => {
+                crate::logger::log(format!(
+                    "book_composition: preview permission unavailable: {error}"
+                ));
+                Err(SimilarPreviewWorkerResult::Refused {
+                    notice: "本の構成を確認できませんでした".to_owned(),
+                })
+            }
+        }
+    });
+    let qualification = match qualification {
+        Some(Err(result)) => return Ok(result),
+        Some(Ok(qualification)) => Some(qualification),
+        None => None,
+    };
+    let qualify = |result| match qualification {
+        Some((permission, notice)) => SimilarPreviewWorkerResult::Qualified {
+            permission,
+            notice,
+            image: result,
+        },
+        None => result.into(),
+    };
     let before = source_version(&request.stamp)?;
     if request.cached_source_version.as_ref() == Some(&before) {
-        return Ok(SimilarPreviewWorkerResult::Unchanged {
+        return Ok(qualify(SimilarPreviewImage::Unchanged {
             source_version: before,
-        });
+        }));
     }
     let pixels = prepare(request, cancel)?;
     let after = source_version(&request.stamp)?;
     if before != after {
         return Err("画像が準備中に更新されました".to_owned());
     }
-    Ok(SimilarPreviewWorkerResult::Prepared {
+    Ok(qualify(SimilarPreviewImage::Prepared {
         source_version: after,
         pixels,
-    })
+    }))
 }
 
 pub(crate) fn load_similar_preview_pixels(
@@ -2287,6 +2546,7 @@ mod tests {
             owner_generation: 1,
             press_id: 1,
             cached_source_version,
+            composition: None,
         }
     }
 
@@ -2435,5 +2695,433 @@ mod tests {
                 .presentation_for_frame(&ctx, session(0), input(true), &passwords)
                 .is_some()
         );
+    }
+
+    fn bind_composition(
+        request: &mut SimilarPreviewRequest,
+        service: &crate::book_composition::BookCompositionService,
+    ) {
+        request.composition = Some(service.clone());
+    }
+
+    fn hide_file(service: &crate::book_composition::BookCompositionService, path: &Path) {
+        queue_hide_file(service, path)
+            .recv()
+            .unwrap()
+            .status
+            .unwrap();
+    }
+
+    fn queue_hide_file(
+        service: &crate::book_composition::BookCompositionService,
+        path: &Path,
+    ) -> mpsc::Receiver<crate::book_composition::CompositionWriteReply> {
+        use crate::book_composition::*;
+        let scope = crate::book_scope::BookScopeKey::folder(path.parent().unwrap()).unwrap();
+        let mut composition = BookComposition::new(
+            ReadingDirection::Ltr,
+            vec![
+                CompositionUnit::Single {
+                    page: CompositionPageRef::RelativePath {
+                        path: "other.png".into(),
+                    },
+                    placement: SinglePlacement::Center,
+                    companion: SingleCompanion::Vacant,
+                },
+                CompositionUnit::Single {
+                    page: CompositionPageRef::RelativePath {
+                        path: path.file_name().unwrap().to_string_lossy().into_owned(),
+                    },
+                    placement: SinglePlacement::Center,
+                    companion: SingleCompanion::Vacant,
+                },
+            ],
+        );
+        composition
+            .hidden_pages
+            .push(CompositionPageRef::RelativePath {
+                path: path.file_name().unwrap().to_string_lossy().into_owned(),
+            });
+        service.save(scope, PageDomain::ImageFolder, composition)
+    }
+
+    #[test]
+    fn similar_preview_candidate_hidden_refuses_before_source_validation_or_decode() {
+        let temp = tempfile::tempdir().unwrap();
+        let (service, owner) = crate::book_composition::BookCompositionService::spawn_at(
+            temp.path().join("data"),
+            None,
+        )
+        .unwrap();
+        let path = temp.path().join("candidate.png");
+        hide_file(&service, &path);
+        let mut request = request_for_file(&path, None);
+        bind_composition(&mut request, &service);
+        let result = validate_or_prepare_similar_preview_with(
+            &request,
+            Arc::new(AtomicBool::new(false)),
+            |_, _| panic!("hidden candidate must not decode"),
+        );
+        assert!(matches!(
+            result,
+            Ok(SimilarPreviewWorkerResult::Hidden { .. })
+        ));
+        assert!(
+            !path.exists(),
+            "hidden admission precedes filesystem validation"
+        );
+        owner.shutdown_and_join();
+    }
+
+    #[test]
+    fn similar_preview_stale_candidate_proof_rejects_gpu_adoption_and_next_gesture_rechecks() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("candidate.png");
+        image::RgbaImage::from_pixel(2, 1, image::Rgba([1, 2, 3, 255]))
+            .save(&path)
+            .unwrap();
+        let (service, owner) = crate::book_composition::BookCompositionService::spawn_at(
+            temp.path().join("data"),
+            None,
+        )
+        .unwrap();
+        let ctx = egui::Context::default();
+        let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+        let candidate = SimilarPreviewCandidate::for_hit(&hit(&path.to_string_lossy(), 0)).unwrap();
+        let mut state = SimilarPreviewState::default();
+        let sender = state.queue_test_worker();
+        state.begin_candidate_press_inner(
+            &ctx,
+            &candidate,
+            &passwords,
+            viewport(),
+            session(0),
+            None,
+            Some(service.clone()),
+        );
+        let SimilarPreviewPreparation::Running(pending) = &state.preparation else {
+            panic!("press owns preparation")
+        };
+        let completion =
+            validate_or_prepare_similar_preview(&pending.request, Arc::new(AtomicBool::new(false)))
+                .unwrap();
+        assert!(matches!(
+            completion,
+            SimilarPreviewWorkerResult::Qualified { .. }
+        ));
+        hide_file(&service, &path);
+        sender.send(Ok(completion)).unwrap();
+        assert!(state.poll_background(&ctx, &passwords).is_some());
+        assert!(
+            state.cached_texture().is_none(),
+            "stale permission must be rejected before GPU upload"
+        );
+        assert!(
+            state
+                .presentation_for_frame(&ctx, session(0), input(true), &passwords)
+                .is_none()
+        );
+
+        state.end_gesture();
+        let sender = state.queue_test_worker();
+        state.begin_candidate_press_inner(
+            &ctx,
+            &candidate,
+            &passwords,
+            viewport(),
+            session(0),
+            None,
+            Some(service.clone()),
+        );
+        let SimilarPreviewPreparation::Running(pending) = &state.preparation else {
+            panic!("new gesture owns fresh preparation")
+        };
+        let completion = validate_or_prepare_similar_preview_with(
+            &pending.request,
+            Arc::new(AtomicBool::new(false)),
+            |_, _| panic!("next gesture must see hidden"),
+        )
+        .unwrap();
+        assert!(matches!(
+            completion,
+            SimilarPreviewWorkerResult::Hidden { .. }
+        ));
+        sender.send(Ok(completion)).unwrap();
+        assert!(state.poll_background(&ctx, &passwords).is_some());
+        assert!(state.cached_texture().is_none());
+
+        let scope = crate::book_scope::BookScopeKey::folder(path.parent().unwrap()).unwrap();
+        service
+            .remove(scope, crate::book_composition::PageDomain::ImageFolder)
+            .recv()
+            .unwrap()
+            .status
+            .unwrap();
+        state.end_gesture();
+        let sender = state.queue_test_worker();
+        state.begin_candidate_press_inner(
+            &ctx,
+            &candidate,
+            &passwords,
+            viewport(),
+            session(0),
+            None,
+            Some(service.clone()),
+        );
+        let SimilarPreviewPreparation::Running(pending) = &state.preparation else {
+            panic!("allowed gesture owns fresh preparation")
+        };
+        let completion =
+            validate_or_prepare_similar_preview(&pending.request, Arc::new(AtomicBool::new(false)))
+                .unwrap();
+        sender.send(Ok(completion)).unwrap();
+        state.poll_background(&ctx, &passwords);
+        assert!(
+            state
+                .presentation_for_frame(&ctx, session(0), input(true), &passwords)
+                .is_some()
+        );
+        hide_file(&service, &path);
+        assert!(
+            state
+                .presentation_for_frame(&ctx, session(0), input(true), &passwords)
+                .is_none(),
+            "an already cached asset loses presentation when its proof changes"
+        );
+        owner.shutdown_and_join();
+    }
+
+    #[test]
+    fn similar_preview_candidate_mapping_keeps_indexed_logical_source_separate_from_physical_target()
+     {
+        let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+        let candidate = SimilarPreviewCandidate {
+            item_key: format!(
+                "c:/books/source.rar{}chapter/page.png",
+                crate::search_norm::ZIP_ENTRY_SEP
+            ),
+            target: crate::similar_index::SimilarItemTarget::ZipPage {
+                zip_path: "c:/cache/converted.zip".into(),
+                entry_name: "chapter/page.png".into(),
+            },
+            indexed_mtime: 0,
+            indexed_file_size: 0,
+        };
+        let page = SimilarPreviewStamp::for_candidate(&candidate, &passwords, viewport())
+            .composition_candidate();
+        assert!(
+            matches!(page.identity, crate::book_resume_db::PageIdentity::Archive { container, .. } if container == "c:/books/source.rar")
+        );
+        assert_eq!(page.physical_archive, Some("c:/cache/converted.zip".into()));
+        let image = SimilarPreviewCandidate {
+            item_key: "c:/logical/images/page.png".into(),
+            target: crate::similar_index::SimilarItemTarget::File(
+                "D:/Physical/Images/Page.PNG".into(),
+            ),
+            indexed_mtime: 0,
+            indexed_file_size: 0,
+        };
+        let page = SimilarPreviewStamp::for_candidate(&image, &passwords, viewport())
+            .composition_candidate();
+        assert_eq!(
+            page.identity,
+            crate::book_resume_db::PageIdentity::Image {
+                path: crate::path_key::normalize_keep_drive(Path::new(
+                    "c:/logical/images/page.png"
+                ))
+            }
+        );
+        assert!(page.physical_archive.is_none());
+        let document = SimilarPreviewCandidate {
+            item_key: format!(
+                "c:/books/source.epub{}pdf:2",
+                crate::search_norm::ZIP_ENTRY_SEP
+            ),
+            target: crate::similar_index::SimilarItemTarget::PdfPage {
+                pdf_path: "c:/cache/converted.pdf".into(),
+                page_num: 2,
+            },
+            indexed_mtime: 0,
+            indexed_file_size: 0,
+        };
+        let page = SimilarPreviewStamp::for_candidate(&document, &passwords, viewport())
+            .composition_candidate();
+        assert_eq!(
+            page.identity,
+            crate::book_resume_db::PageIdentity::Document {
+                container: "c:/books/source.epub".into(),
+                page_num: 2
+            }
+        );
+        assert!(page.physical_archive.is_none());
+    }
+
+    #[test]
+    fn similar_preview_unsupported_archive_keeps_legacy_admission_with_plain_notice() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("candidate.zip");
+        std::fs::write(&archive, b"source metadata fixture").unwrap();
+        let (service, owner) = crate::book_composition::BookCompositionService::spawn_at(
+            temp.path().join("data"),
+            None,
+        )
+        .unwrap();
+        let ctx = egui::Context::default();
+        let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+        let candidate = SimilarPreviewCandidate {
+            item_key: format!(
+                "{}{}../page.png",
+                archive.display(),
+                crate::search_norm::ZIP_ENTRY_SEP
+            ),
+            target: crate::similar_index::SimilarItemTarget::ZipPage {
+                zip_path: archive,
+                entry_name: "../page.png".into(),
+            },
+            indexed_mtime: 0,
+            indexed_file_size: 0,
+        };
+        let mut state = SimilarPreviewState::default();
+        let sender = state.queue_test_worker();
+        state.begin_candidate_press_inner(
+            &ctx,
+            &candidate,
+            &passwords,
+            viewport(),
+            session(0),
+            None,
+            Some(service),
+        );
+        let SimilarPreviewPreparation::Running(pending) = &state.preparation else {
+            panic!("press owns preparation")
+        };
+        let completion = validate_or_prepare_similar_preview_with(
+            &pending.request,
+            Arc::new(AtomicBool::new(false)),
+            |_, _| {
+                Ok(SimilarPreviewPixels {
+                    display_name: "legacy candidate".into(),
+                    pixels: Arc::new(egui::ColorImage::filled([2, 1], egui::Color32::WHITE)),
+                    source_dims: [20, 10],
+                    layout_dims: None,
+                })
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(&completion, SimilarPreviewWorkerResult::Qualified { permission: crate::book_composition::CandidatePermission::Allowed(None), notice: Some(notice), .. } if notice == crate::book_composition::UNSUPPORTED_COMPOSITION_NOTICE)
+        );
+        sender.send(Ok(completion)).unwrap();
+        assert_eq!(
+            state.poll_background(&ctx, &passwords).as_deref(),
+            Some(crate::book_composition::UNSUPPORTED_COMPOSITION_NOTICE)
+        );
+        assert!(
+            state
+                .presentation_for_frame(&ctx, session(0), input(true), &passwords)
+                .is_some(),
+            "unsupported composition cannot remove legacy preview"
+        );
+        owner.shutdown_and_join();
+    }
+
+    #[test]
+    fn similar_preview_stale_hidden_reply_after_unhide_is_not_current_hidden_notice() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("candidate.png");
+        let (service, owner) = crate::book_composition::BookCompositionService::spawn_at(
+            temp.path().join("data"),
+            None,
+        )
+        .unwrap();
+        hide_file(&service, &path);
+        let ctx = egui::Context::default();
+        let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+        let candidate = SimilarPreviewCandidate::for_hit(&hit(&path.to_string_lossy(), 0)).unwrap();
+        let mut state = SimilarPreviewState::default();
+        let sender = state.queue_test_worker();
+        state.begin_candidate_press_inner(
+            &ctx,
+            &candidate,
+            &passwords,
+            viewport(),
+            session(0),
+            None,
+            Some(service.clone()),
+        );
+        let SimilarPreviewPreparation::Running(pending) = &state.preparation else {
+            panic!("press owns preparation")
+        };
+        let completion = validate_or_prepare_similar_preview_with(
+            &pending.request,
+            Arc::new(AtomicBool::new(false)),
+            |_, _| panic!("hidden candidate cannot decode"),
+        )
+        .unwrap();
+        assert!(matches!(
+            completion,
+            SimilarPreviewWorkerResult::Hidden { .. }
+        ));
+        let scope = crate::book_scope::BookScopeKey::folder(path.parent().unwrap()).unwrap();
+        service
+            .remove(scope, crate::book_composition::PageDomain::ImageFolder)
+            .recv()
+            .unwrap()
+            .status
+            .unwrap();
+        sender.send(Ok(completion)).unwrap();
+        let notice = state.poll_background(&ctx, &passwords).unwrap();
+        assert!(
+            notice.contains("更新"),
+            "stale hidden reply reports changed composition"
+        );
+        assert!(state.cached_texture().is_none());
+        assert!(
+            state
+                .presentation_for_frame(&ctx, session(0), input(true), &passwords)
+                .is_none()
+        );
+        owner.shutdown_and_join();
+    }
+
+    #[test]
+    fn similar_preview_candidate_check_is_ordered_after_queued_composition_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("candidate.png");
+        let (service, owner) = crate::book_composition::BookCompositionService::spawn_at(
+            temp.path().join("data"),
+            None,
+        )
+        .unwrap();
+        let (entered, release) = service.hold_worker_for_test();
+        entered.recv().unwrap();
+        let mut request = request_for_file(&path, None);
+        bind_composition(&mut request, &service);
+        assert!(
+            matches!(
+                crate::book_composition::candidate_permission(
+                    &service.snapshot(),
+                    &request.stamp.composition_candidate()
+                )
+                .unwrap(),
+                crate::book_composition::CandidatePermission::Allowed(_)
+            ),
+            "old snapshot has not received the queued write"
+        );
+        let saved = queue_hide_file(&service, &path);
+        let worker = std::thread::spawn(move || {
+            validate_or_prepare_similar_preview_with(
+                &request,
+                Arc::new(AtomicBool::new(false)),
+                |_, _| panic!("queued hidden publication must precede preview decoding"),
+            )
+        });
+        release.send(()).unwrap();
+        saved.recv().unwrap().status.unwrap();
+        assert!(matches!(
+            worker.join().unwrap().unwrap(),
+            SimilarPreviewWorkerResult::Hidden { .. }
+        ));
+        owner.shutdown_and_join();
     }
 }

@@ -504,9 +504,49 @@ fn q3_failed_base_setter_does_not_clear_live_or_saved_shift() {
 #[test]
 fn pairing_gate_rejects_shift_and_clear_but_preserves_single_page_fallback() {
     let mut env = setup_app();
-    let root = env.tmp.path().join("books/qualification");
+    let root = env.tmp.path().join("books/qualification.pdf");
     let data = env.tmp.path().join("shift-data");
     install_book(&mut env, &root);
+    // Eligibility is derived from the accepted composition/recipe owner in G3;
+    // mutating a cached availability field no longer qualifies a real source.
+    env.items = (0..6)
+        .map(|page_num| GridItem::PdfPage {
+            pdf_path: root.clone(),
+            page_num,
+            content_type: None,
+        })
+        .collect();
+    env.page_identity_index = Arc::new(file_type_resume::PreparedPageIdentityIndex::prepare(
+        &env.items,
+        Some(&root),
+        env.settings.file_type_visibility.clone(),
+    ));
+    let book_recipe = book_materialization::ProjectionRecipe::Book(
+        book_materialization::BookScope::Document(root.clone()),
+    );
+    env.projection_recipe = book_recipe.clone();
+    let scope = env.current_spread_shift_scope().unwrap();
+    env.spread_shift.scope = Some(scope.clone());
+    let token = crate::book_composition::CompositionToken {
+        service_epoch: 1,
+        publication_sequence: 1,
+    };
+    let prepared = book_materialization::project_document_composition(
+        &root,
+        6,
+        (env.items.clone(), env.image_metas.clone()),
+        env.settings.file_type_visibility.clone(),
+        token,
+        Some(&crate::book_composition::fixtures::four_page_book(
+            crate::book_composition::ReadingDirection::Ltr,
+        )),
+    )
+    .unwrap();
+    let crate::book_composition::CompositionProjectionOutcome::Composed(projection) =
+        prepared.composition
+    else {
+        panic!("real composed source qualification");
+    };
     let (service, owner) = runtime(&mut env, &data);
     env.settings.remember_spread_shift_per_book = false;
     env.set_live_spread_shift(1);
@@ -515,7 +555,27 @@ fn pairing_gate_rejects_shift_and_clear_but_preserves_single_page_fallback() {
         PairingEditAvailability::Unreadable,
         PairingEditAvailability::ExtractedResult,
     ] {
+        env.projection_recipe = book_recipe.clone();
+        match availability {
+            PairingEditAvailability::Composed => {
+                env.install_composition_for_test(projection.clone())
+            }
+            PairingEditAvailability::Unreadable => {
+                env.book_composition = book_composition_runtime::ViewerBookComposition::Blocked {
+                    scope: scope.clone(),
+                    token,
+                    error: "fixture unreadable store".into(),
+                };
+            }
+            PairingEditAvailability::ExtractedResult => {
+                env.projection_recipe = book_materialization::ProjectionRecipe::ExtractedResult(
+                    book_materialization::ExtractedSurface::Rating,
+                );
+            }
+            _ => unreachable!(),
+        }
         env.spread_shift.availability = availability;
+        assert_eq!(env.pairing_edit_availability(), availability);
         env.spread_mode = crate::settings::SpreadMode::Ltr;
         let state = env.spread_shift.clone();
         let mut action = crate::ui_fullscreen::FsKeyAction::default();

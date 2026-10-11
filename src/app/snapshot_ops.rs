@@ -234,6 +234,7 @@ impl App {
         self.reading_direction = state.direction;
         self.reading_flow = state.flow;
         self.spread_shift = state.shift;
+        self.retire_book_presentation_permission();
         self.book_composition = state.composition;
         self.final_cover_spread_preference = state.final_cover;
         self.singleton_spread_endpoint_preferences = state.endpoints;
@@ -2147,17 +2148,14 @@ impl App {
             });
             return;
         }
-        let Some(idx) = self.resolve_required_snapshot_target_idx(&target) else {
-            self.finish_fs_navigation_sequence(
-                crate::app::FsNavigationSequenceFinish::RequestFailed,
-            );
-            self.show_feedback_toast("移動先の画像が見つかりません".to_string());
-            return;
-        };
-        self.open_fullscreen(idx, history_trigger);
-        self.selected = Some(idx);
-        self.scroll_to_selected = true;
-        self.update_last_selected_image();
+        self.complete_deferred_book_composition_open(crate::app::DeferredFsReopen {
+            history_trigger,
+            resume_slideshow: false,
+            target: crate::app::DeferredFsTarget::Required(target),
+            resume_to_last_page: false,
+            from_explicit_open: false,
+            preserve_after_password_prompt: true,
+        });
     }
 
     fn open_required_fullscreen_from_location_load(

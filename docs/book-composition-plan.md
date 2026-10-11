@@ -1,10 +1,14 @@
 # §1.242 本の構成 — 設計案
 
-更新: 2026-10-10、R6採択後のG0再照合。ライン G / `next-book`、照合tree `76488f0ec`。
-状態: R6は独立再レビューACCEPT、P3文言修正は `330e070f6`。E §1.342のmaster統合 `fa280d0d0` を取り込んだ。
-本更新は§2全参照とG0構造接点のソース再照合。統合後変更の次レビューと§1.364契約合意は未完了。
+更新: 2026-10-11、G3実装と安全でない書庫参照の扱いを追記。ライン G / `next-book`。
+設計履歴: R6は独立再レビューACCEPT、P3文言修正は `330e070f6`。G0照合treeは `76488f0ec`。
+Eの共有BookScopeKeyと§1.364はmerge `97c9b711d`で取り込み済み。G3の実装・検証結果は§13とhandoffへ記録し、受入とは区別する。
 
-本書の型名・新規ファイル名は提案であり、現行実装を表さない。実行時の観測はなく、以下の現状はソース調査による。
+設計節の型名・ファイル名には提案時の表記も残る。実装済み段階の所有境界は§13を参照する。
+§2とG0の現状記録は当時のソース調査であり、製品を起動して観測した記録ではない。
+
+**2026-10-11の開発・出荷判断**: G2 part B (`249dc75a0` + `77ca29b29`) は独立レビューでACCEPT。
+§1.242は次々回releaseへ送り、`next-book`でG3以降を開発する。今回masterへ統合しない。
 
 ## 1. 要件と範囲
 
@@ -185,6 +189,19 @@ pure投影は同worker、UIは完成結果を採用する。pending/resultは既
 構成なしは旧列生成をそのまま返す。キャッシュ済PDFの即時表示を全列挙完了待ちへ退行させない。
 安全なraw manifestのmember名/階層metadataはpolicy投影と別にworkerが保持し、scope同定・Missing判定・
 旧raw位置の照合に使う。除外画像を表示/decodeする許可や、重複除去済み行を再追加する入口にはしない。
+
+**既存ZIPの参照を構成で表せない場合 (2026-10-11設計担当決定)**:
+既存ZIP閲覧は`a//b.jpg`のような名前や、`page.jpg`/`PAGE.JPG`のような正規化後に衝突する名前も保持する。
+既存producerに構成用の安全性検証・重複除去が済んでいると仮定しない。
+構成の準備workerは、その階層のraw member全件を既存のPageDomain検証と参照の等価性規則で照合する。
+不正参照・重複identityなど、構成modelでは全ページを表せない場合は**その本の構成準備だけを拒否**する。
+元書庫・保存済み構成を変更せず、ページの除去・統合を行わず、構成を使わずに従来どおり開く。
+新機能の適用範囲の制限であり、既存ZIP閲覧を制限する変更ではない。
+通知は「この本のページ名では本の構成を使えません。構成を使わずに開きます。」とする。
+同じprepareの完了時に理由と対象の本をログへ記録し、frameごとの通知・再試行を行わない。
+構成の新規作成・保存も同じ検証に従い、保存済みrecordを消去・再作成しない。
+このsource準備の拒否は、§7.1の読めないstore/構成の原本保護と明示ignoreの契約とは区別する。
+raw scopeを通した全件検証をpolicy除外後の行だけで代用せず、曖昧な元ページからcomplete proofを作らない。
 
 投影は次を**同じ結果**として返す:
 
@@ -1049,7 +1066,13 @@ mode-only要求はBookでは構成snapshot、抽出列ではA2固定入力で表
 Remoteの端末単ページ強制も引き続きview projectionであり、PC/他端末の本設定を書き換えない。
 この分離は表示切替を維持するためのもの。表紙・方向や周辺操作の直接小編集APIは追加しない。
 
-### 9.3 §1.364との未確定契約 — ラインEの設計待ち
+### 9.3 §1.364との接続契約
+
+**2026-10-11 G3**: Eの採択済みC1–C12と共有`BookScopeKey`を取り込んだ。
+`docs/spread-shift-contract-fixtures.md`と`src/spread_shift/contract_fixtures.rs`を正本とし、
+Gは既存admission/restore ownerへ資格とidentityを渡す。Composed/Unreadable/A2ではshiftを休眠させ、
+解除時は既存記憶ON・OFFの規則へ戻す。C7/C9のeditor固有の作成取消・保存はG4で接続する。
+以下はG0時点の依存調査記録として保持する。
 
 **G0の保留項目。Gはshift store/schema/保存ON・OFF時の解決規則/復元fallbackを設計しない。**
 正本予定はラインE (`C:/home/mimageviewer-nextview`) の `docs/spread-shift-memory-plan.md`。
@@ -1454,7 +1477,7 @@ pending終端後の起床停止を回帰fixtureで固定する。検証実数/ex
   Single/Split/絞り込み/兄弟mount/同値要求もDB/revision/anchor/cache/resumeを変更しない。
   保存shift休眠、解除時は§1.364の記憶ON/OFF・identity規則。構成なしBook/OrdinaryListは既存操作維持。
   Ctrl左右等のSingle/Split fallbackは通常ページ移動として維持しhidden targetを照合。Spreadのずらしだけは拒否し、
-  fallback移動で方向/表紙/構成/shift storeを変更しない。§1.364の保存fixtureは§9.3採択待ち。
+  fallback移動で方向/表紙/構成/shift storeを変更しない。§1.364の採択済み保存fixtureを§9.3の境界で使う。
 - 結果生成/thumbnailに構成lookupゼロ、保存で結果reload/marker/依存token失効ゼロ。
   hidden画像も通常thumbnailで残る。クリック/required snapshot/しおり/評価/履歴の明示targetは直前lookup→toast拒否。
 - 単ページ/見開き/連結/slideshowの次候補だけhidden確認、相方も確認、片側Hidden→元slotSingle、
@@ -1478,6 +1501,62 @@ pending終端後の起床停止を回帰fixtureで固定する。検証実数/ex
 - Book詳細sortは構成順lock、抽出詳細sortは結果順、通常folder詳細sortは従来。
 - trim左右別/ページoverride/Blankの実slot/補助/RTL、Singleはsingle margin、既存非構成本は不変。
   Blank source/readinessなし、実Navigationだけをresume/export targetへ。
+
+**2026-10-11 G3実装の所有境界**:
+
+`book_composition/projection`はraw manifestの全直下参照を検証し、構成順rowsとresolved unitを同時に作る。
+ZIPはpolicy投影前のraw treeと従来のdisplay prefixを保持し、PDF/EPUBは物理ページ番号とsource spellingを保持する。
+未登録tailだけ中央Singleへ追加し、hidden/Missing/補助を別unitと組み直さない。
+Preparing→Projecting→Acceptedを既存context ownerに載せ、workerでrows・個別編集・raw位置表を準備する。
+採用直前のscope/token/items generationを照合し、準備中に動いた最新anchorもidentityで解決する。
+構成更新による着地はresumeを書かず、次の通常読書操作で既存writerへ戻る。
+未保存trimは既存page keyのbatchをcomposition serviceのFIFOへ受付し、workerの保存完了後にrowsを置き換える。
+通常のtrim保存・resetとRemoteのtrim変更も同じFIFOへ通し、古い投影workerが新しい編集を上書きしない。
+Remoteは既存要求ownerでreceiptを待ち、保存後にだけ正規化した設定値を返す。
+既存Edit ledgerの書込guardは受付時から完了まで保持し、キュー待ちの間に読取stampを成立させない。
+採用時にも編集stampを照合し、準備完了後の保存済み編集を古いsnapshotで置き換えない。
+準備中の新しい編集は次のprojectionへ引き継ぎ、失敗時は元列とdirty編集を保持してlog/通知する。
+root/key/storeは既存view_trim.dbのまま、UIでDB/FSを開かない。
+
+表示許可はcontext/items世代・source identity・role/slot/sliceごとの有限なownerであり、texture cacheを許可証にしない。
+相方・Split・補助は新occurrenceとして同じunit内でatomicに照合する。Checking/Hiddenではtexture選択、paint、
+transform/hit/読了trace、新しい指定サイズfit参照を採用しない。測定extentはbounded cacheで保つが画像許可を持たない。
+類似候補の長押しプレビューも既存のSingle/Spread/連結の表示経路を維持し、置換元の提示許可を共有する。
+連結の完了取得をpaged専用条件で止めず、通常の可視unit受付で許可されたoccurrenceだけを置き換える。
+候補そのものは既存preview request/worker/authorizationへ構成の証明を載せ、共通identity resolverで確認する。
+確認は既存serviceのFIFOで初期化・maintenance・先行保存の後に行い、preview workerの私有channelで受け取る。
+押下時snapshotの初期化待ちや未反映の保存を許可/拒否と解釈せず、UIで待機しない。
+完了時の最新token照合で古い許可を採用せず、次の長押しで再確認する。query/thumbnailへのlookupは追加しない。
+UnsupportedSourceは採択済みの通知・logと従来表示、読取失敗は通知・logで拒否し、別のpending/retry ownerを作らない。
+連結読みのskipは一つの要求の有限な候補とcursorだけを持ち、退出/close/source変更で破棄する。
+連続する非表示範囲はcursorへまとめ、離れた範囲は現在の画面要求に必要な最大20範囲へ限定する。
+退出した範囲を捨て、再入場では再照合する。長い全非表示列もanchorを先に動かさず有限に終端へ進む。
+SingleからSpreadへの切替は同じdisplay cacheのtyped phaseへ、許可済みの旧descriptorを一時保持する。
+新しい相方のChecking中は旧source/role/slot/sliceだけを再表示し、新unitの確定で一回置換する。
+旧descriptorの世代・source・scope tokenが変われば保持を終了し、textureだけから許可を復活させない。
+保存通知で抽出結果列やthumbnailをreloadせず、次に提示する候補だけworkerで照合する。
+明示targetは構成採用前にidentityを捕捉し、自動開始と区別する。初回列挙の継続はsource完了まで既存deferred ownerへ保持する。
+compositionの定期pollはsource待ちの継続を消費しない。列挙・hydration完了境界でだけ、
+構成待ちの継続を同contextの提示許可ownerの`AwaitingProjection`へ移す。
+Composed/Automaticどちらの採用でもscopeとcontextを照合し、新世代へ一括で引き継いでからtargetを解決する。
+取消・close・source置換で破棄し、forkへ未完了要求を複製しない。待機表示とnavigation lockもこのtyped要求を参照する。
+これは全libで観測したRAR/ZIP/CBRのmulti-window open/navigation失敗の根本修正であり、
+sourceの未完成rowsへ早期openする組合せをなくす。source pendingの有無によるguard、sleep/retryは加えない。
+slideshowも同じtyped permission intentへsliceと継続を載せ、許可後の着地だけ選択・timerへ採用する。
+同一ページの反対側は許可済みsliceだけを確定し、既存どおりsourceの再open・世代変更・history更新を行わない。
+待機中の旧timerは新しい要求を作らず、停止はその継続を破棄する。
+
+簡素化は既存のread/sidecar/permission ownerへ継続を載せ、未採用rowsを表示へ混ぜない形を採用した。
+全列の都度照合、全体modal化、設定保存のたびに抽出窓を閉じる案は、通常閲覧と結果保持を変えるため使わない。
+失敗への自動retryやrollback ownerは追加しない。
+mode-onlyは既存spread.dbのmode整数に表示分類を載せ、元の結合binding値を下位部分に保持する。
+binding未設定は専用値で表し、mode行作成だけでLTR/Pagedを作らない。direction/flow/端配置/補助/shiftを変更しない。
+専用store/column/migrationは追加せず、metadata transferもmode値を検証・保持する。
+`FsViewSpread` / `FsViewLandscapeSplit`は既定キーなしの通常登録Action。
+Remoteはstrict IPC **v70**で`SetViewMode`とderived `composition_managed`を追加し、Composedの結合`SetSpread`を拒否する。
+Webのmode切替は維持する。E C1–C12をproduction scope/admission/restore ownerへ接続し、保存規則をGで複製しない。
+G4のeditor/save modal/resume intent、G4Fのfolder sidecar、G5の構成editor/exportは次段。
+検証実数・exit・ログは`target/G-1242-g3-msg.txt`に記録する。
 
 ### G4: modal editor / 保存reload / 多窓 (書庫・PDF・EPUB)
 
@@ -1699,6 +1778,8 @@ Q14の以前の相談はA2で不要になった。質問の番号を振り直さ
 | Q17 末尾・端配置・単独・ずらし | Q2のlock。editorの明示unit編集だけ。初期化は現在の末尾/端/単独/shift後の組を取り込む | 2026-10-10 |
 | 画像folder対応の縮小候補 | G4Fで分離。二回連続の同領域P1/P2 REVISE、または共通部分へ例外状態が必要ならcoordinatorが利用者に切り離しを相談。採択時は書庫/PDF/EPUBだけ、画像folderはZIP圧縮で代替 | 2026-10-10 |
 | フォルダbackupだけの保存失敗 | 成功DB保存/解除を維持して通知。古いbackup/移動前の再保存またはメタ情報書き出しを案内。自動retry/DB-file同時rollbackなし。同じ場所の旧backup消費は§7.4.2で別途保証 | 2026-10-10 |
+| 構成で表せない既存ZIPのページ名 | 既存閲覧を維持。構成準備だけ通知＋ログで拒否し、原本・保存済み構成を保持して構成なしで従来どおり開く。不正参照や正規化後の重複を除去・統合しない | 2026-10-11 |
+| §1.242の出荷時期 | 次々回release。next-bookで開発を継続し、今回masterへ統合しない | 2026-10-11 |
 
 新しい利用者質問はない。R6の提示許可とsidecar同期receiptは採択済みのQ10/Q16を成立させる所有契約であり、
 連結読みの制限やbackup設定の追加を提案していない。R6のACCEPTは維持し、統合後G0差分には次レビュー/設計担当確認が必要。

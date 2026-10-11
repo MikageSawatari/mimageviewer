@@ -11,6 +11,295 @@ use std::path::Path;
 
 pub(crate) type PageRows = (Vec<GridItem>, Vec<Option<(i64, i64)>>);
 
+/// The worker publishes rows, resume identities and explicit topology together.
+#[derive(Clone, Debug)]
+pub(crate) struct MaterializedBookRows {
+    pub(crate) items: Vec<GridItem>,
+    pub(crate) metas: Vec<Option<(i64, i64)>>,
+    pub(crate) composition: crate::book_composition::CompositionProjectionOutcome,
+    pub(crate) page_identities: std::sync::Arc<super::file_type_resume::PreparedPageIdentityIndex>,
+}
+
+/// Semantic classification delegates key normalization to E's shared constructor.
+/// Image/compiled folders remain outside composition adoption until G4F.
+pub(crate) fn composition_scope_domain(
+    book: &BookScope,
+) -> Result<
+    Option<(
+        crate::book_scope::BookScopeKey,
+        crate::book_composition::PageDomain,
+    )>,
+    String,
+> {
+    use crate::{book_composition::PageDomain, book_scope::BookScopeKey};
+    Ok(match book {
+        BookScope::Archive {
+            logical_root,
+            prefix,
+        } => {
+            let scope = BookScopeKey::archive(logical_root, prefix)?;
+            let domain = PageDomain::ArchiveLevel {
+                prefix: scope.level_prefix.clone(),
+            };
+            Some((scope, domain))
+        }
+        BookScope::Document(root) => Some((BookScopeKey::document(root)?, PageDomain::Document)),
+        BookScope::ImageFolder(_) | BookScope::CompiledFolder(_) => None,
+    })
+}
+
+/// Collapse the original structure before consulting display policy. This result is the
+/// book's semantic scope and the prefix to materialize, even when its page block is empty.
+pub(crate) fn raw_archive_book_prefix(tree: &ZipTree, requested: &[String]) -> Vec<String> {
+    tree.raw_source().collapse_redundant(requested)
+}
+
+fn finish_book_rows(
+    logical: &Path,
+    rows: PageRows,
+    policy: crate::file_type_visibility::FileTypeVisibility,
+    prepared: crate::book_composition::PreparedCompositionProjection,
+) -> crate::book_composition::CompositionResult<MaterializedBookRows> {
+    let (items, metas) = rows;
+    if items.len() != metas.len() {
+        return Err(crate::book_composition::CompositionError::Invalid(
+            "book rows and metadata differ",
+        ));
+    }
+    // Passthrough retains the original allocations and every legacy row exactly.
+    let (items, metas) = if prepared.output_to_input.iter().copied().eq(0..items.len()) {
+        (items, metas)
+    } else {
+        let mut rows = items.into_iter().zip(metas).map(Some).collect::<Vec<_>>();
+        let mut items = Vec::with_capacity(prepared.output_to_input.len());
+        let mut metas = Vec::with_capacity(prepared.output_to_input.len());
+        for input in prepared.output_to_input {
+            let (item, meta) = rows.get_mut(input).and_then(Option::take).ok_or(
+                crate::book_composition::CompositionError::Invalid("invalid book row permutation"),
+            )?;
+            items.push(item);
+            metas.push(meta);
+        }
+        (items, metas)
+    };
+    let page_identities = std::sync::Arc::new(
+        super::file_type_resume::PreparedPageIdentityIndex::prepare(&items, Some(logical), policy),
+    );
+    Ok(MaterializedBookRows {
+        items,
+        metas,
+        composition: prepared.outcome,
+        page_identities,
+    })
+}
+
+/// Pure worker adapter. `prefix` is the canonical raw effective level, not a newly
+/// collapsed policy-tree prefix. Legacy child blocks and their metadata remain intact.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn project_archive_composition(
+    tree: &ZipTree,
+    logical: &Path,
+    prefix: &[String],
+    rows: PageRows,
+    sort: SortOrder,
+    placement: Option<&GridDisplayOrder>,
+    policy: crate::file_type_visibility::FileTypeVisibility,
+    token: crate::book_composition::CompositionToken,
+    record: Option<&crate::book_composition::BookComposition>,
+) -> crate::book_composition::CompositionResult<MaterializedBookRows> {
+    use crate::book_composition::*;
+    let mut source_node = &tree.raw_source().root;
+    for segment in prefix {
+        let normalized = crate::book_bookmarks::normalize_page_path(segment);
+        if source_node
+            .dirs
+            .keys()
+            .filter(|name| crate::book_bookmarks::normalize_page_path(name) == normalized)
+            .count()
+            > 1
+        {
+            let row_count = rows.0.len();
+            return finish_book_rows(
+                logical,
+                rows,
+                policy,
+                PreparedCompositionProjection {
+                    output_to_input: (0..row_count).collect(),
+                    outcome: CompositionProjectionOutcome::Unsupported {
+                        reason: "ambiguous normalized archive level".into(),
+                    },
+                },
+            );
+        }
+        let Some(next) = source_node.dirs.get(segment) else {
+            break;
+        };
+        source_node = next;
+    }
+    let scope = match crate::book_scope::BookScopeKey::archive(logical, prefix) {
+        Ok(scope) => scope,
+        Err(reason) => {
+            let prepared = PreparedCompositionProjection {
+                output_to_input: (0..rows.0.len()).collect(),
+                outcome: CompositionProjectionOutcome::Unsupported { reason },
+            };
+            return finish_book_rows(logical, rows, policy, prepared);
+        }
+    };
+    let domain = PageDomain::ArchiveLevel {
+        prefix: scope.level_prefix.clone(),
+    };
+    let raw = tree.raw_source();
+    let (raw_items, _) = materialize_archive_level(raw, prefix, sort, placement);
+    // Exact spelling map is important: normalized aliases are refused by the pure owner,
+    // while the unchanged legacy projection must retain every aliased source row.
+    let present = rows
+        .0
+        .iter()
+        .enumerate()
+        .filter_map(|(item_index, item)| match item {
+            GridItem::ZipImage { entry_name, .. } => Some((entry_name.as_str(), item_index)),
+            _ => None,
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut raw_pages = Vec::new();
+    let mut manifest = Vec::new();
+    let allowed_entries = raw
+        .node_at(prefix)
+        .into_iter()
+        .flat_map(|node| node.images.iter())
+        .map(|entry| {
+            (
+                entry.entry_name.as_str(),
+                policy.allows_physical_file(Path::new(&entry.entry_name))
+                    && entry
+                        .container_ancestry
+                        .iter()
+                        .all(|origin| origin.allows(&policy)),
+            )
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    for (raw_index, item) in raw_items.iter().enumerate() {
+        let GridItem::ZipImage { entry_name, .. } = item else {
+            continue;
+        };
+        let page = CompositionPageRef::ArchiveEntry {
+            entry_name: entry_name.clone(),
+        };
+        raw_pages.push(CanonicalRawPage {
+            page: page.clone(),
+            raw_index,
+        });
+        let allowed = allowed_entries
+            .get(entry_name.as_str())
+            .copied()
+            .unwrap_or(false);
+        let availability = if let Some(item_index) = present.get(entry_name.as_str()) {
+            ManifestAvailability::Present {
+                item_index: *item_index,
+            }
+        } else if !allowed {
+            ManifestAvailability::ExcludedByPolicy
+        } else {
+            ManifestAvailability::FilteredOut
+        };
+        manifest.push(ManifestPage { page, availability });
+    }
+    let prepared = project_composition(
+        scope,
+        &domain,
+        token,
+        record,
+        &raw_pages,
+        &manifest,
+        rows.0.len(),
+    )?;
+    finish_book_rows(logical, rows, policy, prepared)
+}
+
+pub(crate) fn project_document_composition(
+    logical: &Path,
+    raw_page_count: u32,
+    rows: PageRows,
+    policy: crate::file_type_visibility::FileTypeVisibility,
+    token: crate::book_composition::CompositionToken,
+    record: Option<&crate::book_composition::BookComposition>,
+) -> crate::book_composition::CompositionResult<MaterializedBookRows> {
+    use crate::book_composition::*;
+    if raw_page_count as usize > MAX_PAGES {
+        let row_count = rows.0.len();
+        return finish_book_rows(
+            logical,
+            rows,
+            policy,
+            PreparedCompositionProjection {
+                output_to_input: (0..row_count).collect(),
+                outcome: CompositionProjectionOutcome::Unsupported {
+                    reason: "composition exceeds manifest pages limit".into(),
+                },
+            },
+        );
+    }
+    let scope =
+        crate::book_scope::BookScopeKey::document(logical).map_err(CompositionError::Json)?;
+    let present = rows
+        .0
+        .iter()
+        .enumerate()
+        .filter_map(|(item_index, item)| match item {
+            GridItem::PdfPage { page_num, .. } => Some((*page_num, item_index)),
+            _ => None,
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    let allowed = policy.allows_physical_file(logical);
+    let raw_pages = (0..raw_page_count)
+        .map(|page_num| CanonicalRawPage {
+            page: CompositionPageRef::PdfPage { page_num },
+            raw_index: page_num as usize,
+        })
+        .collect::<Vec<_>>();
+    let manifest = raw_pages
+        .iter()
+        .map(|raw| {
+            let CompositionPageRef::PdfPage { page_num } = raw.page else {
+                unreachable!()
+            };
+            ManifestPage {
+                page: raw.page.clone(),
+                availability: match present.get(&page_num) {
+                    Some(item_index) => ManifestAvailability::Present {
+                        item_index: *item_index,
+                    },
+                    None if !allowed => ManifestAvailability::ExcludedByPolicy,
+                    None => ManifestAvailability::FilteredOut,
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+    let prepared = project_composition(
+        scope,
+        &PageDomain::Document,
+        token,
+        record,
+        &raw_pages,
+        &manifest,
+        rows.0.len(),
+    )?;
+    finish_book_rows(logical, rows, policy, prepared)
+}
+
+/// Only a preparation worker may wait here. The UI receives one completed result.
+pub(crate) fn read_composition_worker(
+    service: &crate::book_composition::BookCompositionService,
+    scope: crate::book_scope::BookScopeKey,
+    domain: crate::book_composition::PageDomain,
+) -> Result<crate::book_composition::CompositionPrepareReply, String> {
+    service
+        .prepare(scope, domain)
+        .recv()
+        .map_err(|error| error.to_string())
+}
+
 /// `None` preserves the legacy child-first order (Remote normal list and rating history).
 /// Other surfaces retain their existing configured category placement.
 pub(crate) fn materialize_archive_level(

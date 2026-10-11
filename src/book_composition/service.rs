@@ -88,6 +88,41 @@ enum MaintenanceAction {
     Pages(Vec<(PathBuf, PathBuf)>),
 }
 enum Command {
+    ViewTrim(
+        crate::view_trim_db::ViewTrimWriteBatch,
+        crate::page_edit_write_epoch::EditWriteGuard<'static>,
+        mpsc::Sender<Result<(), String>>,
+    ),
+    RemoveViewTrimPage(
+        String,
+        crate::page_edit_write_epoch::EditWriteGuard<'static>,
+        mpsc::Sender<Result<(), String>>,
+    ),
+    ViewTrimBook(
+        crate::spread_db::SpreadContainerKey,
+        crate::view_trim::ViewTrimBookState,
+        super::CompositionWriteAdmission,
+        crate::page_edit_write_epoch::EditWriteGuard<'static>,
+        mpsc::Sender<Result<crate::view_trim::ViewTrimBookState, String>>,
+    ),
+    #[cfg(test)]
+    HoldWorker(mpsc::Sender<()>, mpsc::Receiver<()>),
+    ViewMode(
+        BookScopeKey,
+        crate::settings::SpreadMode,
+        mpsc::Sender<Result<(), String>>,
+    ),
+    ViewFlow(
+        BookScopeKey,
+        crate::settings::SpreadMode,
+        crate::settings::ReadingFlow,
+        mpsc::Sender<Result<(), String>>,
+    ),
+    Candidate(
+        super::CandidateCorrelation,
+        super::CandidatePage,
+        mpsc::Sender<super::CandidatePermissionReply>,
+    ),
     Prepare(
         BookScopeKey,
         PageDomain,
@@ -186,9 +221,14 @@ impl BookCompositionService {
         };
         let worker_shared = Arc::clone(&shared);
         let worker_portal = Arc::clone(&portal);
+        #[cfg(test)]
+        let test_epoch = crate::page_edit_write_epoch::TestEpochScope::capture();
         let handle = std::thread::Builder::new()
             .name("book-composition-writer".into())
             .spawn(move || {
+                #[cfg(test)]
+                let _test_epoch =
+                    test_epoch.map(crate::page_edit_write_epoch::TestEpochScope::enter);
                 run_worker(
                     data_dir,
                     worker_shared,
@@ -247,6 +287,141 @@ impl BookCompositionService {
             });
         }
         rx
+    }
+
+    pub(crate) fn check_candidate(
+        &self,
+        correlation: super::CandidateCorrelation,
+        candidate: super::CandidatePage,
+    ) -> mpsc::Receiver<super::CandidatePermissionReply> {
+        let (reply, rx) = mpsc::channel();
+        let admission = self.shared.admission.lock().unwrap();
+        if admission.mode == Mode::Closed
+            || !admission.tx.as_ref().is_some_and(|tx| {
+                tx.send(Command::Candidate(
+                    correlation.clone(),
+                    candidate,
+                    reply.clone(),
+                ))
+                .is_ok()
+            })
+        {
+            let _ = reply.send(super::CandidatePermissionReply {
+                correlation,
+                status: Err(super::CandidatePermissionError::Unavailable(
+                    "composition service is closing".into(),
+                )),
+            });
+        }
+        rx
+    }
+
+    pub(crate) fn set_view_mode(
+        &self,
+        scope: BookScopeKey,
+        mode: crate::settings::SpreadMode,
+    ) -> Result<mpsc::Receiver<Result<(), String>>, String> {
+        let (reply, rx) = mpsc::channel();
+        self.send_view_command(Command::ViewMode(scope, mode, reply))?;
+        Ok(rx)
+    }
+    pub(crate) fn save_view_trim(
+        &self,
+        batch: crate::view_trim_db::ViewTrimWriteBatch,
+    ) -> mpsc::Receiver<Result<(), String>> {
+        let (reply, rx) = mpsc::channel();
+        let admission = self.shared.admission.lock().unwrap();
+        let sent = admission.mode == Mode::Running
+            && admission.tx.as_ref().is_some_and(|tx| {
+                let write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+                tx.send(Command::ViewTrim(batch, write, reply.clone()))
+                    .is_ok()
+            });
+        if !sent {
+            let _ = reply.send(Err(
+                "view trim writes unavailable during maintenance or exit".into(),
+            ));
+        }
+        rx
+    }
+    pub(crate) fn remove_view_trim_page(&self, key: String) -> mpsc::Receiver<Result<(), String>> {
+        let (reply, rx) = mpsc::channel();
+        let admission = self.shared.admission.lock().unwrap();
+        let sent = admission.mode == Mode::Running
+            && admission.tx.as_ref().is_some_and(|tx| {
+                let write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+                tx.send(Command::RemoveViewTrimPage(key, write, reply.clone()))
+                    .is_ok()
+            });
+        if !sent {
+            let _ = reply.send(Err(
+                "view trim writes unavailable during maintenance or exit".into(),
+            ));
+        }
+        rx
+    }
+    #[cfg(test)]
+    pub(crate) fn hold_worker_for_test(&self) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (entered, receiver) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        let admission = self.shared.admission.lock().unwrap();
+        assert!(admission.mode == Mode::Running);
+        admission
+            .tx
+            .as_ref()
+            .unwrap()
+            .send(Command::HoldWorker(entered, wait))
+            .unwrap();
+        (receiver, release)
+    }
+    pub(crate) fn set_view_trim_book(
+        &self,
+        key: crate::spread_db::SpreadContainerKey,
+        state: crate::view_trim::ViewTrimBookState,
+        admission_proof: super::CompositionWriteAdmission,
+    ) -> mpsc::Receiver<Result<crate::view_trim::ViewTrimBookState, String>> {
+        let (reply, rx) = mpsc::channel();
+        let admission = self.shared.admission.lock().unwrap();
+        let sent = admission.mode == Mode::Running
+            && admission.tx.as_ref().is_some_and(|tx| {
+                let write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+                tx.send(Command::ViewTrimBook(
+                    key,
+                    state,
+                    admission_proof,
+                    write,
+                    reply.clone(),
+                ))
+                .is_ok()
+            });
+        if !sent {
+            let _ = reply.send(Err(
+                "view trim writes unavailable during maintenance or exit".into(),
+            ));
+        }
+        rx
+    }
+    pub(crate) fn set_view_flow(
+        &self,
+        scope: BookScopeKey,
+        mode: crate::settings::SpreadMode,
+        flow: crate::settings::ReadingFlow,
+    ) -> Result<mpsc::Receiver<Result<(), String>>, String> {
+        let (reply, rx) = mpsc::channel();
+        self.send_view_command(Command::ViewFlow(scope, mode, flow, reply))?;
+        Ok(rx)
+    }
+    fn send_view_command(&self, command: Command) -> Result<(), String> {
+        let admission = self.shared.admission.lock().unwrap();
+        if admission.mode != Mode::Running {
+            return Err("view mode writes unavailable during maintenance or exit".into());
+        }
+        admission
+            .tx
+            .as_ref()
+            .ok_or("composition worker stopped")?
+            .send(command)
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn save(
@@ -534,6 +709,108 @@ fn run_worker(
             }
         };
         match command {
+            #[cfg(test)]
+            Command::HoldWorker(entered, wait) => {
+                let _ = entered.send(());
+                let _ = wait.recv();
+            }
+            Command::ViewTrim(batch, write, reply) => {
+                let result =
+                    crate::view_trim_db::ViewTrimDb::open_at(&data_dir.join("view_trim.db"))
+                        .and_then(|mut db| db.apply_write_batch(&batch))
+                        .map_err(|error| error.to_string());
+                drop(write);
+                if let Err(error) = &result {
+                    publish(&shared, &state, Vec::new(), Some(error.clone()));
+                }
+                let _ = reply.send(result);
+            }
+            Command::RemoveViewTrimPage(key, write, reply) => {
+                let result =
+                    crate::view_trim_db::ViewTrimDb::open_at(&data_dir.join("view_trim.db"))
+                        .and_then(|db| db.remove_page_override(&key))
+                        .map_err(|error| error.to_string());
+                drop(write);
+                if let Err(error) = &result {
+                    publish(&shared, &state, Vec::new(), Some(error.clone()));
+                }
+                let _ = reply.send(result);
+            }
+            Command::ViewTrimBook(key, mut value, admission, write, reply) => {
+                let result: Result<crate::view_trim::ViewTrimBookState, String> = (|| {
+                    admission.validate(&state)?;
+                    value.apply_mode =
+                        crate::view_trim::view_trim_base_apply_mode(value.apply_mode);
+                    value.book_settings = value.book_settings.clamped();
+                    let db =
+                        crate::view_trim_db::ViewTrimDb::open_at(&data_dir.join("view_trim.db"))
+                            .map_err(|error| error.to_string())?;
+                    let previous_separate = db
+                        .get_book_state(&key.exact)
+                        .or_else(|| {
+                            key.fallback
+                                .as_deref()
+                                .and_then(|fallback| db.get_book_state(fallback))
+                        })
+                        .unwrap_or_default()
+                        .book_settings
+                        .spread_separate;
+                    if previous_separate != value.book_settings.spread_separate {
+                        let separate = value.book_settings.spread_separate;
+                        value.book_settings.spread_separate = previous_separate;
+                        value.book_settings = value.book_settings.with_spread_separate(separate);
+                    }
+                    db.set_book_state(&key.exact, value)
+                        .map_err(|error| error.to_string())?;
+                    Ok(value)
+                })(
+                );
+                drop(write);
+                if let Err(error) = &result {
+                    publish(&shared, &state, Vec::new(), Some(error.clone()));
+                }
+                let _ = reply.send(result);
+            }
+            Command::ViewMode(scope, mode, reply) => {
+                let result = (|| {
+                    scope.validate()?;
+                    let segments: Vec<_> = scope
+                        .level_prefix
+                        .split('/')
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_owned)
+                        .collect();
+                    let key = crate::spread_db::container_key(&scope.logical_root, &segments);
+                    crate::spread_db::SpreadDb::open_at(&data_dir.join("spread.db"))
+                        .map_err(|error| error.to_string())?
+                        .set_mode_only(&key, mode)
+                        .map_err(|error| error.to_string())
+                })();
+                if let Err(error) = &result {
+                    publish(&shared, &state, Vec::new(), Some(error.clone()));
+                }
+                let _ = reply.send(result);
+            }
+            Command::ViewFlow(scope, mode, flow, reply) => {
+                let result = (|| {
+                    scope.validate()?;
+                    let segments: Vec<_> = scope
+                        .level_prefix
+                        .split('/')
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_owned)
+                        .collect();
+                    let key = crate::spread_db::container_key(&scope.logical_root, &segments);
+                    crate::spread_db::SpreadDb::open_at(&data_dir.join("spread.db"))
+                        .map_err(|error| error.to_string())?
+                        .set_flow_only(&key, mode, flow)
+                        .map_err(|error| error.to_string())
+                })();
+                if let Err(error) = &result {
+                    publish(&shared, &state, Vec::new(), Some(error.clone()));
+                }
+                let _ = reply.send(result);
+            }
             Command::Begin(reply) => {
                 connection = None;
                 maintenance = true;
@@ -559,6 +836,14 @@ fn run_worker(
                 let _ = reply.send(result.map(|_| ()));
             }
             command @ Command::Prepare(..) if maintenance => deferred.push_back(command),
+            command @ Command::Candidate(..) if maintenance => deferred.push_back(command),
+            Command::Candidate(correlation, candidate, reply) => {
+                let status = super::candidate_permission(&state, &candidate);
+                let _ = reply.send(super::CandidatePermissionReply {
+                    correlation,
+                    status,
+                });
+            }
             Command::Prepare(scope, mut domain, reply) => {
                 let status = (|| {
                     state.status.clone()?;

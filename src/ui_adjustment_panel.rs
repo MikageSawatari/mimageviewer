@@ -15273,9 +15273,15 @@ impl App {
                                 );
                                 if resolution.target_item_index.is_none() {
                                     ui.label(
-                                        egui::RichText::new("ページが見つかりません")
-                                            .small()
-                                            .color(egui::Color32::from_rgb(240, 170, 90)),
+                                        egui::RichText::new(
+                                            if self.composition_hides_bookmark(bookmark) {
+                                                "本の構成で非表示になっています"
+                                            } else {
+                                                "ページが見つかりません"
+                                            },
+                                        )
+                                        .small()
+                                        .color(egui::Color32::from_rgb(240, 170, 90)),
                                     );
                                 }
                                 if title_edit.as_ref().map(|edit| edit.id) != Some(bookmark.id) {

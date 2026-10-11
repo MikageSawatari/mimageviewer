@@ -961,6 +961,7 @@ impl App {
                     matches!(
                         pending.stage,
                         crate::bookmark_browser::PendingBookOpenStage::Resolving
+                            | crate::bookmark_browser::PendingBookOpenStage::Qualifying(_)
                     )
                 })
                 .map(|pending| pending.request_id),
@@ -1125,6 +1126,7 @@ impl App {
             || archive_matches
             || pending_matches;
         if pending_matches {
+            self.retire_book_identity_permission(request_id.0);
             crate::logger::log(format!(
                 "[bookmark-open] finish request id={} reason={reason}",
                 request_id.0

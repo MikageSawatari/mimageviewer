@@ -3197,7 +3197,11 @@ function dispatchCommand(requested, meta = {}) {
     } else if (requested.name === CommandName.SPREAD_CYCLE) {
       handled = requestSpreadMode(extractedResultViewerContext()
         ? (state.spreadMode === SpreadMode.SINGLE ? SpreadMode.LTR : SpreadMode.SINGLE)
-        : nextSpreadMode(state.spreadMode));
+        : state.container?.compositionManaged
+          ? (state.spreadMode === SpreadMode.SINGLE ? (state.readingDirection === ReadingDirection.RTL ? SpreadMode.RTL : SpreadMode.LTR)
+            : [SpreadMode.SPLIT_LTR, SpreadMode.SPLIT_RTL].includes(state.spreadMode) ? SpreadMode.SINGLE
+            : state.readingDirection === ReadingDirection.RTL ? SpreadMode.SPLIT_RTL : SpreadMode.SPLIT_LTR)
+          : nextSpreadMode(state.spreadMode), Boolean(state.container?.compositionManaged));
     } else if (requested.name === CommandName.SET_RATING) {
       const stars = Number(requested.payload.stars);
       if (Number.isInteger(stars) && stars >= 0 && stars <= 5) {
@@ -3274,7 +3278,7 @@ function dispatchCommand(requested, meta = {}) {
         [CommandName.SPREAD_SPLIT_LTR]: SpreadMode.SPLIT_LTR,
         [CommandName.SPREAD_SPLIT_RTL]: SpreadMode.SPLIT_RTL,
       };
-      handled = requestSpreadMode(spreadModes[requested.name]);
+      handled = requestSpreadMode(spreadModes[requested.name], Boolean(state.container?.compositionManaged) && [CommandName.SPREAD_SINGLE, CommandName.SPREAD_SPLIT_LTR, CommandName.SPREAD_SPLIT_RTL].includes(requested.name));
     } else {
       let fitMode = null;
       if (requested.name === CommandName.FIT_CYCLE) {
@@ -4684,6 +4688,7 @@ export function applyContainerData(address, data, forceSinglePage, options = {})
     title: data.title ?? "コンテナ",
     address: effectiveAddress,
     requestedAddress: address,
+    compositionManaged: Boolean(data.composition_managed),
     truncated: Boolean(data.truncated),
     entryLimit: Number(data.entry_limit) || 0,
     configuredSpreadMode: data.configured_spread_mode ?? SpreadMode.SINGLE,
@@ -6208,7 +6213,7 @@ export function extractedResultViewMode(mode, direction) {
   return SpreadMode.SINGLE;
 }
 
-function requestSpreadMode(mode) {
+function requestSpreadMode(mode, modeOnly = false) {
   const collectionRoute = refreshableCollectionRoute();
   const persistentContext = persistentDirectViewerContext();
   if (
@@ -6226,6 +6231,7 @@ function requestSpreadMode(mode) {
   const spreadIntent = planSpreadIntent({
     address,
     selectedMode: mode,
+    modeOnly,
     currentDirection: state.readingDirection,
     portraitSinglePage: state.localSettings.portraitSinglePage,
     viewportWidth: window.innerWidth,

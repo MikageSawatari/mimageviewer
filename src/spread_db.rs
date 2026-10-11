@@ -13,6 +13,61 @@ use crate::settings::{
 };
 use rusqlite::{OpenFlags, OptionalExtension};
 
+// A mode-only value keeps the released binding beneath the view classification.
+// Missing bindings keep inheriting: creating a mode row must not manufacture LTR/Paged.
+const VIEW_ONLY: i32 = 4096;
+const NO_BINDING: i32 = 255;
+const EXPLICIT_FLOW: i32 = 8192;
+
+pub(crate) fn valid_stored_mode(value: i32) -> bool {
+    if (0..=7).contains(&value) {
+        return true;
+    }
+    let known = VIEW_ONLY | EXPLICIT_FLOW | 0x300 | 255;
+    value >= 0
+        && value & VIEW_ONLY != 0
+        && value & !known == 0
+        && (1..=3).contains(&((value >> 8) & 3))
+        && ((0..=7).contains(&(value & 255)) || value & 255 == NO_BINDING)
+}
+
+fn stored_binding(value: i32) -> Option<SpreadMode> {
+    if value & VIEW_ONLY == 0 {
+        Some(SpreadMode::from_int(value))
+    } else {
+        let binding = value & 255;
+        (binding != NO_BINDING).then(|| SpreadMode::from_int(binding))
+    }
+}
+
+fn stored_view_mode(value: i32) -> SpreadMode {
+    if value & VIEW_ONLY == 0 {
+        return SpreadMode::from_int(value);
+    }
+    let binding = stored_binding(value).unwrap_or_default();
+    let direction = binding.reading_direction().unwrap_or(ReadingDirection::Ltr);
+    match (value >> 8) & 3 {
+        2 => if binding.has_cover() {
+            SpreadMode::LtrCover
+        } else {
+            SpreadMode::Ltr
+        }
+        .with_reading_direction(direction),
+        3 => SpreadMode::SplitLtr.with_reading_direction(direction),
+        _ => SpreadMode::Single,
+    }
+}
+
+fn view_class(mode: SpreadMode) -> i32 {
+    if mode.is_spread() {
+        2
+    } else if mode.is_split() {
+        3
+    } else {
+        1
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct StoredSpreadState {
     pub(crate) mode: Option<SpreadMode>,
@@ -140,7 +195,7 @@ impl SpreadDb {
             .ok()?;
         stmt.query_row([&key], |row| {
             let v: i32 = row.get(0)?;
-            Ok(SpreadMode::from_int(v))
+            Ok(stored_view_mode(v))
         })
         .ok()
     }
@@ -155,13 +210,19 @@ impl SpreadDb {
         stmt.query_row([&key], |row| {
             let mode: i32 = row.get(0)?;
             let flow: i32 = row.get(1)?;
-            if mode == SpreadMode::Vertical.to_int() && flow == ReadingFlow::Paged.to_int() {
-                Ok(ReadingFlow::Vertical)
+            if stored_binding(mode).is_none() && mode & EXPLICIT_FLOW == 0 {
+                Ok(None)
+            } else if stored_binding(mode) == Some(SpreadMode::Vertical)
+                && flow == ReadingFlow::Paged.to_int()
+                && mode & EXPLICIT_FLOW == 0
+            {
+                Ok(Some(ReadingFlow::Vertical))
             } else {
-                Ok(ReadingFlow::from_int(flow))
+                Ok(Some(ReadingFlow::from_int(flow)))
             }
         })
         .ok()
+        .flatten()
     }
 
     /// フォルダの横連結方向を取得。未登録なら None。
@@ -174,16 +235,19 @@ impl SpreadDb {
         stmt.query_row([&key], |row| {
             let mode: i32 = row.get(0)?;
             let direction: i32 = row.get(1)?;
-            let mode = SpreadMode::from_int(mode);
+            let Some(mode) = stored_binding(mode) else {
+                return Ok(None);
+            };
             if mode.is_rtl() {
-                Ok(ReadingDirection::Rtl)
+                Ok(Some(ReadingDirection::Rtl))
             } else if matches!(mode, SpreadMode::Ltr | SpreadMode::LtrCover) {
-                Ok(ReadingDirection::Ltr)
+                Ok(Some(ReadingDirection::Ltr))
             } else {
-                Ok(ReadingDirection::from_int(direction))
+                Ok(Some(ReadingDirection::from_int(direction)))
             }
         })
         .ok()
+        .flatten()
     }
 
     /// 各列を exact key、fallback key の順に解決する。
@@ -415,6 +479,38 @@ impl SpreadDb {
         persist_explicit_spread(&mut self.conn, path, fallback, mode, direction, defaults)
     }
 
+    /// Exact scope only. Neither binding columns nor adjacent preference rows are written.
+    /// The previous binding stays dormant beneath the mode-only view classification.
+    pub(crate) fn set_mode_only(
+        &self,
+        path: &Path,
+        mode: SpreadMode,
+    ) -> Result<(), rusqlite::Error> {
+        let class = view_class(mode) << 8;
+        self.conn.execute(
+            "INSERT INTO spreads(path, mode) VALUES (?1, ?2)
+             ON CONFLICT(path) DO UPDATE SET mode = (spreads.mode & 255) | (spreads.mode & 8192) | ?3",
+            rusqlite::params![normalize_path(path), VIEW_ONLY | NO_BINDING | class, VIEW_ONLY | class],
+        )?;
+        Ok(())
+    }
+
+    /// Flow is a viewing choice, independent of the composition and its dormant binding.
+    pub(crate) fn set_flow_only(
+        &self,
+        path: &Path,
+        mode: SpreadMode,
+        flow: ReadingFlow,
+    ) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "INSERT INTO spreads(path, mode, flow) VALUES (?1, ?2, ?3)
+             ON CONFLICT(path) DO UPDATE SET flow = ?3,
+             mode = CASE WHEN (spreads.mode & 4096) != 0 THEN spreads.mode | 8192 ELSE spreads.mode END",
+            rusqlite::params![normalize_path(path), VIEW_ONLY | NO_BINDING | EXPLICIT_FLOW | (view_class(mode) << 8), flow.to_int()],
+        )?;
+        Ok(())
+    }
+
     /// 表示モードを設定する。デフォルト値と同じ場合はレコードを削除する。
     pub fn set(
         &self,
@@ -465,6 +561,11 @@ impl SpreadDb {
             .query_row("SELECT mode FROM spreads WHERE path = ?1", [&key], |row| {
                 row.get::<_, i32>(0)
             })
+            .map(|value| {
+                stored_view_mode(value)
+                    .with_reading_direction(direction)
+                    .to_int()
+            })
             .unwrap_or(default_mode.to_int());
         if mode == default_mode.to_int() && flow == default_flow && direction == default_direction {
             self.conn
@@ -472,7 +573,7 @@ impl SpreadDb {
         } else {
             self.conn.execute(
                 "INSERT INTO spreads (path, mode, flow, direction) VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(path) DO UPDATE SET flow = ?3, direction = ?4",
+                 ON CONFLICT(path) DO UPDATE SET mode = ?2, flow = ?3, direction = ?4",
                 rusqlite::params![key, mode, flow.to_int(), direction.to_int()],
             )?;
         }
@@ -650,11 +751,24 @@ fn stored_flow(
     key: &str,
 ) -> Result<Option<ReadingFlow>, rusqlite::Error> {
     let value = transaction
-        .query_row("SELECT flow FROM spreads WHERE path = ?1", [key], |row| {
-            row.get::<_, i32>(0)
-        })
+        .query_row(
+            "SELECT mode, flow FROM spreads WHERE path = ?1",
+            [key],
+            |row| Ok((row.get::<_, i32>(0)?, row.get::<_, i32>(1)?)),
+        )
         .optional()?;
-    Ok(value.map(ReadingFlow::from_int))
+    Ok(value.and_then(|(mode, flow)| {
+        if stored_binding(mode).is_none() && mode & EXPLICIT_FLOW == 0 {
+            None
+        } else if stored_binding(mode) == Some(SpreadMode::Vertical)
+            && flow == 0
+            && mode & EXPLICIT_FLOW == 0
+        {
+            Some(ReadingFlow::Vertical)
+        } else {
+            Some(ReadingFlow::from_int(flow))
+        }
+    }))
 }
 
 fn persist_explicit_spread_row(
@@ -720,6 +834,104 @@ fn ensure_column(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn composition_mode_only_preserves_binding_columns_and_legacy_vertical() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = super::SpreadDb::open_at(&temp.path().join("spread.db")).unwrap();
+        let path = std::path::Path::new("C:/books/a.zip");
+        let key = super::normalize_path(path);
+        db.conn
+            .execute(
+                "INSERT INTO spreads(path,mode,flow,direction) VALUES(?1,5,0,1)",
+                [&key],
+            )
+            .unwrap();
+        for mode in [
+            crate::settings::SpreadMode::Rtl,
+            crate::settings::SpreadMode::Single,
+            crate::settings::SpreadMode::SplitLtr,
+        ] {
+            db.set_mode_only(path, mode).unwrap();
+            let binding: (i32, i32) = db
+                .conn
+                .query_row(
+                    "SELECT flow,direction FROM spreads WHERE path=?1",
+                    [&key],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(binding, (0, 1));
+            assert_eq!(
+                db.get_flow(path),
+                Some(crate::settings::ReadingFlow::Vertical)
+            );
+            assert_eq!(
+                db.get_direction(path),
+                Some(crate::settings::ReadingDirection::Rtl)
+            );
+            let current = db.get(path).unwrap();
+            assert_eq!(current.is_spread(), mode.is_spread());
+            assert_eq!(current.is_split(), mode.is_split());
+        }
+        assert_eq!(
+            db.conn
+                .query_row("SELECT count(*) FROM spreads", [], |r| r.get::<_, i32>(0))
+                .unwrap(),
+            1
+        );
+        db.set_flow_only(
+            path,
+            crate::settings::SpreadMode::Single,
+            crate::settings::ReadingFlow::Paged,
+        )
+        .unwrap();
+        assert_eq!(db.get_flow(path), Some(crate::settings::ReadingFlow::Paged));
+        assert_eq!(
+            db.get_direction(path),
+            Some(crate::settings::ReadingDirection::Rtl)
+        );
+    }
+
+    #[test]
+    fn composition_mode_only_missing_exact_row_preserves_parent_inheritance() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = super::SpreadDb::open_at(&temp.path().join("spread.db")).unwrap();
+        let root = std::path::Path::new("C:/books/a.zip");
+        let child = root.join("chapter");
+        db.conn
+            .execute(
+                "INSERT INTO spreads(path,mode,flow,direction) VALUES(?1,4,2,1)",
+                [super::normalize_path(root)],
+            )
+            .unwrap();
+        for mode in [
+            crate::settings::SpreadMode::Single,
+            crate::settings::SpreadMode::Ltr,
+            crate::settings::SpreadMode::SplitLtr,
+        ] {
+            db.set_mode_only(&child, mode).unwrap();
+            assert_eq!(db.get_flow(&child), None);
+            assert_eq!(db.get_direction(&child), None);
+            let state = db.get_state_with_fallback(&child, Some(root));
+            assert_eq!(state.flow, db.get_flow(root));
+            assert_eq!(state.direction, db.get_direction(root));
+            assert_eq!(state.mode.unwrap().is_spread(), mode.is_spread());
+            assert_eq!(state.mode.unwrap().is_split(), mode.is_split());
+            assert_eq!(db.get(root), Some(crate::settings::SpreadMode::RtlCover));
+        }
+        db.set_flow_only(
+            &child,
+            crate::settings::SpreadMode::SplitLtr,
+            crate::settings::ReadingFlow::Vertical,
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_flow(&child),
+            Some(crate::settings::ReadingFlow::Vertical)
+        );
+        assert_eq!(db.get_direction(&child), None);
+    }
+
     use super::*;
 
     #[test]

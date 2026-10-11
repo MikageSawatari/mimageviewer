@@ -1079,6 +1079,8 @@ pub(in crate::app) struct ViewerContextBundle {
     page_alone_preferences: crate::settings::PageAlonePreferences,
     pub(super) spread_shift: super::spread_shift_owner::ViewerSpreadShift,
     pub(super) book_composition: super::book_composition_runtime::ViewerBookComposition,
+    pub(super) book_composition_permission:
+        super::book_composition_permission::ViewerPresentationPermission,
     reading_flow: crate::settings::ReadingFlow,
     reading_direction: crate::settings::ReadingDirection,
     slideshow_playing: bool,
@@ -1241,10 +1243,10 @@ impl ContextAsyncOwner {
         macro_rules! pending {
             ($owner:ident) => {
                 match self {
-                    Self::BookCompositionRead => matches!(
-                        $owner.book_composition,
-                        super::book_composition_runtime::ViewerBookComposition::Preparing { .. }
-                    ),
+                    Self::BookCompositionRead => {
+                        ($owner.book_composition.is_pending()
+                            || $owner.book_composition_permission.pending())
+                    }
                     Self::RetainedSpreadShift => $owner.spread_shift.retained_readoption_pending(),
                     Self::PathClassification => $owner
                         .top_level_grid_view
@@ -1369,7 +1371,9 @@ impl ContextAsyncOwner {
             Self::EraseInpaint => app.poll_erase_inpaint(ctx),
             Self::SimilarPreview => {
                 let passwords = app.pdf_passwords.clone();
-                app.similar_panel.preview.poll_background(ctx, &passwords);
+                if let Some(notice) = app.similar_panel.preview.poll_background(ctx, &passwords) {
+                    app.show_feedback_toast(notice);
+                }
             }
             Self::FolderNavigation | Self::FolderPaneScan => {}
         }
@@ -1470,9 +1474,11 @@ impl ContextAsyncOwner {
             }
             Self::SimilarPreview => app.similar_panel.preview.terminate_on_park(),
             Self::BookCompositionRead => {
+                app.retire_book_presentation_permission();
                 if matches!(
                     app.book_composition,
                     super::book_composition_runtime::ViewerBookComposition::Preparing { .. }
+                        | super::book_composition_runtime::ViewerBookComposition::Projecting { .. }
                 ) {
                     app.book_composition = Default::default();
                 }
@@ -2084,6 +2090,7 @@ impl ViewerContextBundle {
             page_alone_preferences: crate::settings::PageAlonePreferences::default(),
             spread_shift: Default::default(),
             book_composition: Default::default(),
+            book_composition_permission: Default::default(),
             reading_flow: crate::settings::ReadingFlow::default(),
             reading_direction: crate::settings::ReadingDirection::default(),
             slideshow_playing: false,
@@ -2453,6 +2460,7 @@ impl App {
             page_alone_preferences,
             spread_shift,
             book_composition,
+            book_composition_permission,
             reading_flow,
             reading_direction,
             slideshow_playing,
@@ -2740,6 +2748,7 @@ impl App {
         swap_field!(page_alone_preferences);
         swap_field!(spread_shift);
         swap_field!(book_composition);
+        swap_field!(book_composition_permission);
         swap_field!(reading_flow);
         swap_field!(reading_direction);
         swap_field!(slideshow_playing);
@@ -3074,6 +3083,7 @@ impl App {
             page_alone_preferences,
             spread_shift,
             book_composition,
+            book_composition_permission,
             reading_flow,
             reading_direction,
             slideshow_playing,
@@ -3400,6 +3410,7 @@ impl App {
             page_alone_preferences,
             spread_shift,
             book_composition,
+            book_composition_permission,
             reading_flow,
             reading_direction,
             pdf_enumerate_pending,
@@ -3501,6 +3512,7 @@ impl App {
         detached.page_alone_preferences = self.page_alone_preferences;
         detached.spread_shift = self.spread_shift.fork_accepted();
         detached.book_composition = self.book_composition.clone();
+        detached.book_composition_permission = self.book_composition_permission.clone();
         detached.reading_flow = self.reading_flow;
         detached.reading_direction = self.reading_direction;
 
@@ -3742,10 +3754,12 @@ impl App {
                 let needs_read = matches!(
                     bundle.book_composition,
                     super::book_composition_runtime::ViewerBookComposition::Preparing { .. }
-                ) || bundle
-                    .book_composition
-                    .scope()
-                    .is_some_and(|scope| changed.contains(&scope.storage_key()));
+                        | super::book_composition_runtime::ViewerBookComposition::Projecting { .. }
+                ) || bundle.book_composition_permission.pending()
+                    || bundle
+                        .book_composition
+                        .scope()
+                        .is_some_and(|scope| changed.contains(&scope.storage_key()));
                 needs_read.then_some(*id)
             })
             .collect()

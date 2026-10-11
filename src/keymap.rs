@@ -1727,6 +1727,8 @@ pub enum KeyAction {
     FsBgCycle,
     FsPin,
     FsSpreadSingle,
+    FsViewSpread,
+    FsViewLandscapeSplit,
     FsSpreadLtr,
     FsSpreadLtrCover,
     FsSpreadRtl,
@@ -2292,6 +2294,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsBgCycle,
     KeyAction::FsPin,
     KeyAction::FsSpreadSingle,
+    KeyAction::FsViewSpread,
+    KeyAction::FsViewLandscapeSplit,
     KeyAction::FsSpreadLtr,
     KeyAction::FsSpreadLtrCover,
     KeyAction::FsSpreadRtl,
@@ -4291,6 +4295,8 @@ impl KeyAction {
             FsBgCycle => "FsBgCycle",
             FsPin => "FsPin",
             FsSpreadSingle => "FsSpreadSingle",
+            FsViewSpread => "FsViewSpread",
+            FsViewLandscapeSplit => "FsViewLandscapeSplit",
             FsSpreadLtr => "FsSpreadLtr",
             FsSpreadLtrCover => "FsSpreadLtrCover",
             FsSpreadRtl => "FsSpreadRtl",
@@ -5021,6 +5027,8 @@ impl KeyAction {
             FsBgCycle => "透過背景色を切り替える",
             FsPin => "現在の項目を代表サムネイルに固定または解除する",
             FsSpreadSingle => "単ページ表示に切り替える",
+            FsViewSpread => "本の読む方向で見開き表示に切り替える",
+            FsViewLandscapeSplit => "本の読む方向で横長ページを分割表示する",
             FsSpreadLtr => "左開き見開き表示に切り替える",
             FsSpreadLtrCover => "左開き表紙単独の見開き表示に切り替える",
             FsSpreadRtl => "右開き見開き表示に切り替える",
@@ -5561,6 +5569,8 @@ impl KeyAction {
             | FsBgCycle
             | FsPin
             | FsSpreadSingle
+            | FsViewSpread
+            | FsViewLandscapeSplit
             | FsSpreadLtr
             | FsSpreadLtrCover
             | FsSpreadRtl
@@ -6069,6 +6079,8 @@ impl KeyAction {
             | FsBgCycle
             | FsPin
             | FsSpreadSingle
+            | FsViewSpread
+            | FsViewLandscapeSplit
             | FsSpreadLtr
             | FsSpreadLtrCover
             | FsSpreadRtl
@@ -6610,6 +6622,7 @@ impl KeyAction {
             FsBgCycle => ChordList::one(Chord::shift(B)),
             FsPin => ChordList::one(Chord::key(P)),
             FsSpreadSingle => digit_pair(Num1, Numpad1),
+            FsViewSpread | FsViewLandscapeSplit => ChordList::EMPTY,
             FsSpreadLtr => digit_pair(Num2, Numpad2),
             FsSpreadLtrCover => digit_pair(Num3, Numpad3),
             FsSpreadRtl => digit_pair(Num4, Numpad4),
@@ -9692,6 +9705,33 @@ fn next_legacy_keymap_backup_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generic_book_view_actions_are_assignable_without_default_bindings() {
+        let mut settings = KeymapSettings::default();
+        for (action, key) in [
+            (KeyAction::FsViewSpread, KeyName::F13),
+            (KeyAction::FsViewLandscapeSplit, KeyName::F14),
+        ] {
+            assert_eq!(action.context(), KeyContext::FsImage);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert_eq!(KeyAction::parse_ini_name(action.ini_name()), Some(action));
+            assert!(Keymap::default().effective_chords(action).is_empty());
+            assert!(
+                Keymap::default_reference_ini()
+                    .contains(&format!("# {} = none", action.ini_name()))
+            );
+            settings.set_override_chords(action, vec![Chord::key(key)]);
+            assert_eq!(
+                Keymap::from_settings(&settings).effective_chords(action),
+                &[Chord::key(key)]
+            );
+        }
+        assert_eq!(
+            Keymap::default().effective_chords(KeyAction::FsSpreadLtr),
+            &[Chord::key(KeyName::Num2), Chord::key(KeyName::Numpad2)]
+        );
+    }
 
     #[test]
     fn hold_edge_keys_do_not_collapse_numpad_to_top_row() {

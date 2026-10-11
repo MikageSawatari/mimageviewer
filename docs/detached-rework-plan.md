@@ -4649,3 +4649,21 @@ G3の表示投影とeditorは未接続。独立レビュー・利用者実機観
 共通更新境界へ移した。PreparingはROOTの既存遅延repaint契約へ接続し、退避ownerの完了を入力に
 依存させない。既存context residence/mount/park/retireとreceiver所有を維持し、detached述語・viewport
 生成・geometry・placement・新しいpending状態は変更していない。回帰と検証結果はG2B fix handoffに記録する。
+
+### §11 追補: §1.242 G3 projectionと提示許可（2026-10-11、実装記録）
+
+採択済みbook planのcommon projectionを、既存composition read ownerのProjecting phaseへ載せた。
+receiverは一つのcontextに属し、scope/token/items世代が一致したreplyだけrows・identity index・unitへ一括採用する。
+retained contextも既存async routerから回収し、forkはaccepted immutable projectionだけを共有する。
+提示許可は別窓・別世代・別role/slot/sliceへ流用せず、forkでpending/Hiddenを共有しない。
+park/abandon/close/source置換は同ownerのreceiverと連結要求をretireする。構成保存で抽出結果列をreloadしない。
+snapshot復帰時は提示許可を新しく取り、保持rowsに対応するprojectionを戻してから最新scopeを照合する。
+初回表示は既存deferred reopen、しおりは既存PendingBookOpenの資格確認phaseに継続を保持する。
+source列挙待ちのdeferred reopenはsource完了境界だけが消費し、composition pollからは消費しない。
+列挙・hydration完了後に構成が未採用なら、同contextの提示許可ownerの`AwaitingProjection`へ移す。
+Composed/Automaticの採用でscope/contextと世代を一括更新し、取消・close・source置換は同ownerで破棄する。
+待機表示もこのtyped要求に従う。全libで発覚したRAR/ZIP/CBR navigation失敗は、未完成rowsへ
+再開していた所有境界の違反として直し、detached専用guardや時間窓で回避しない（BA-7の状態所有）。
+これはG0で記録したcontext所有の実装であり、detached述語/HWND/viewport/placement/focusを変更しない。
+窓専用pending bool、時間窓による回復、兄弟窓の一括resetは追加しない。
+G4のeditor modal/save intentは未実装。独立レビューや実機観測の結果は主張しない。

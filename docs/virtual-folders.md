@@ -25,7 +25,14 @@ Appは単一worker handleだけを持ち、SQLite/FS処理・maintenance待機�
 保存成功時のEdit観測は捕捉済みlogical outer rootへ送る。閲覧/履歴なしのPDF/EPUB/ZIP/変換元書庫も内容ID復元へ参加し、Folder ledgerは増やさない。
 個別ページ削除では構成をpurgeせず、再解決時にMissingを保つ。本/root削除はfamilyをpurgeする。
 F12/固定snapshotはimmutableなaccepted recordを各context内へ運ぶ。RemoteのSessionHandleへ同じread serviceを登録し、構成write入口は作らない。
-一覧順・明示unit・hidden提示・Remote payloadの投影はG3。画像folder sidecarのwriter/schemaはG4Fまで変更しない。
+G3の共通projectionはraw sourceを保持し、直下の実ページblockだけを構成順へ投影する。
+子containerの位置と、構成なしの従来表示prefixは維持する。resume/しおりhintはraw番号、履歴表示は実Navigationのordinal。
+構成で非表示のしおりは記録を残し、しおり欄にも「本の構成で非表示になっています」と表示する。
+その行への移動は提示直前に拒否し、raw番号を新しい表示列の別ページへ流用しない。
+元行を置き換えるworkerは未保存trimを既存page keyで保存してから個別編集を投影し、UI同期I/Oを追加しない。
+unsafe/case衝突を含む階層は構成だけ拒否し、書庫と保存構成は変更せず従来表示を使う。
+通知は「この本のページ名では本の構成を使えません。構成を使わずに開きます。」。
+画像folder sidecarのwriter/schemaはG4Fまで変更しない。
 metadata v11の`composition_family { coverage, scopes }`はlogical folder/書庫/document entryが所有する。
 既存のcache DriveStripped spread/trim familyと別にsource KeepDrive構成を運ぶ。
 旧v7–v10/字段なしは保持、新版空はcoverage内だけ解除、非空はscope単位の置換。skip/coverage外は保持する。

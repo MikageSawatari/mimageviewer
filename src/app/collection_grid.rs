@@ -6432,11 +6432,22 @@ mod tests {
             source_key: anchor.source_key,
             path: child.clone(),
         };
-        app.current_folder = Some(child);
+        app.current_folder = Some(child.clone());
         app.items = vec![
             GridItem::Image(temp.path().join("b.jpg")),
             GridItem::Image(temp.path().join("a.jpg")),
         ];
+        // Physical source adoption replaces the root's extracted recipe together with rows.
+        app.projection_recipe = super::super::book_materialization::ProjectionRecipe::for_physical(
+            &app.settings,
+            &child,
+            &child,
+            &app.items,
+        );
+        assert!(matches!(
+            app.projection_recipe,
+            super::super::book_materialization::ProjectionRecipe::Book(_)
+        ));
         app.visible_indices = vec![0, 1];
         app.settings.details_sort_key = DetailsSortKey::Name;
         app.rebuild_details_order();

@@ -7,7 +7,17 @@ source enumeration、policy、raw manifest、cache/lease、既存PreparedPageIde
 従来のownerを保つ。ZIPは直下ページblockだけがsurface間で一致し、子containerの位置は従来どおり。
 G2 part Aの`book_composition`はApp/UI/I/Oを持たないpure model・resolver・unit編集を提供する。
 G2 part Bは単一workerの`book_composition.db`、lifecycle、metadata v11転送とread登録を追加する。
-構成順・明示unit・hidden提示のproduction投影はG3。保存キー`BookScopeKey`はラインEの所有であり、
+G3はraw manifestと保存構成からworkerで共通projectionを作り、items・identity index・閲覧unitを同じ採用境界で更新する。
+明示targetは番号の採用前にidentityを捕捉し、表示候補だけをcontext所有の非同期permission ownerへ渡す。
+列挙待ちの再開要求はsource完了境界が所有し、完了後の構成待ちだけ提示許可ownerへ移す。
+構成pollは未完成のsource要求を消費せず、採用時にscope/context/旧世代を照合して継続する。
+Checking/Hiddenはcached textureも描画に使わず、抽出結果の行生成/thumbnailに構成lookupを追加しない。
+類似候補の長押しプレビューは既存preview ownerで候補のidentityをservice FIFOへ渡し、
+workerで受け取った許可tokenをtexture採用前に照合する。連結でも通常の可視unit受付を共有する。
+投影前の未保存trimと通常trim保存・reset、Remoteのtrim変更は同じservice FIFOへ送り、既存view_trim.dbへ保存する。
+Remoteは要求ownerがworkerの保存結果を受け取ってから成功を返し、既存の左右連動切替と応答値を維持する。
+キュー受付から完了まで既存Edit ledgerのguardを保持し、古い投影workerによる新しい編集の上書きを防ぐ。
+保存キー`BookScopeKey`はラインEの所有であり、
 このmodelはキーを定義せず、参照種類/直下階層の検証用`PageDomain`だけを受け取る。
 
 itemsの採用時に排他的な`ProjectionRecipe`を確定する。抽出結果かどうかを現在のanchorや
@@ -62,7 +72,7 @@ UI は snapshot 提出と進捗参照を行い、停止・join・DB cleanup は�
 
 ### 音声サムネイル (§1.347、2026-10-08)
 
-`audio_album_art` は先頭 ID3v2 タグ限定の bounded PIC/APIC reader、`audio_thumbnail` は worker stat・選定・decode・catalog を共通化する。動画の同名 sidecar discovery / 設定を Audio に拡張し、一覧出所は既存 `video_thumb_overrides` に統一する。Local / Remote は共通 I/O owner と catalog admission を使い、再生 decoder は変更しない。Remote IPC は統合版 v69（§1.345 v68＋master v67）、永続コレクションも snapshot / navigation 準備で thumbnail address を確定する。Web の NoArt / Failed は DOM 外の一覧 owner が持ち、明示 refresh で epoch と HTTP URL を更新する。[詳細設計](audio-album-art-plan.md)。
+`audio_album_art` は先頭 ID3v2 タグ限定の bounded PIC/APIC reader、`audio_thumbnail` は worker stat・選定・decode・catalog を共通化する。動画の同名 sidecar discovery / 設定を Audio に拡張し、一覧出所は既存 `video_thumb_overrides` に統一する。Local / Remote は共通 I/O owner と catalog admission を使い、再生 decoder は変更しない。Remote IPC は統合版 v70（§1.345 v68＋master v67）、永続コレクションも snapshot / navigation 準備で thumbnail address を確定する。Web の NoArt / Failed は DOM 外の一覧 owner が持ち、明示 refresh で epoch と HTTP URL を更新する。[詳細設計](audio-album-art-plan.md)。
 
 
 ## 1. レイヤー構造
@@ -330,7 +340,7 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 | --- | --- |
 | `ui_adjustment_panel.rs` | 画像フルスクリーン左パネル。`画像補正 / 表示トリム / ブックマーク` の 3 タブを持つ。画像補正はプリセット切替・AI 設定・保存スロットを扱い、ヘッダーの 消しゴム / 補正レイヤー / 隠蔽加工 / 切り取り アイコンからそれぞれ `×` 付き独立左パネルを開く。ブックマークは現在の本のサムネイル一覧、ページ移動、DB 行削除を扱う。エクスポートアイコンは `Ctrl+E` と同じダイアログへ合流する。補正レイヤーは `local_adjust_lab` と同じ左パネル + 右ツールパネル構成で、効果 UI、マスク編集、U²-Netp 被写体生成、クラシック領域分割生成を UI thread 外の worker 経由で扱う |
 | `ui_crop.rs` | 切り取り (crop) モードの独立左パネル。比率選択 / 有効化・解除 / 自動クロップ / X・Y・W・H 数値入力、crop 外暗転 overlay、ハンドルドラッグ、見開きから Single への pivot を扱う。実際の切り出しは capture / export の最終段 (`export_crop.rs`) |
-| `ui_view_trim.rs` / `view_trim.rs` / `view_trim_db.rs` | 表示トリム (読みながら使う表示専用の余白カット)。フルスクリーン左ホバーパネルの `画像補正 / 表示トリム / ブックマーク` タブから、`トリムなし / 自動余白カット（本全体） / 手動設定` をラジオで選ぶ。`手動設定` のときだけスライダーの直上に `適用範囲：[本全体][このページ]` を出し、enabled なページ個別行の有無から選択を導出する。手動設定では単ページ / 見開き連動 / 見開き左右別の 0〜20% トリムを調整する。`draw_fs_image` / `draw_fs_spread` の fit 基準 bbox と描画 UV を変え、bbox 外は背景に落とす。見開き中央側のトリムは左右の見える端を gap に合わせて再配置し、操作判定は見える rect を使う。モード / 本全体設定は本キー、ページ個別設定は `page_path_key` で `view_trim.db` に保存する。表示解決は `idx` ごとにページ個別設定を優先し、無ければ本全体へ戻す。トリムなし / 自動余白カットはページ個別設定を参照しない。mIV Remote の Page worker は DB を read-only で開き、container address・物理表示 slot・見開き相手から同じキーと `None` / `Book` / `Page` / `Auto` の bbox を解決して、端末用 JPEG の resize 前だけ crop する。Remote の変更要求は本体 UI thread が所有する `ViewTrimDb` へ正規の `ViewTrimBookState` のまま保存し、core の clamp と共通 generation 無効化を通す。Remote からページ個別設定は作らない。Auto の見開き相手は待たず raw decode し、上下を本体と同じ規則で調停する。保存 / エクスポート / crop DB には影響しない |
+| `ui_view_trim.rs` / `view_trim.rs` / `view_trim_db.rs` | 表示トリム (読みながら使う表示専用の余白カット)。フルスクリーン左ホバーパネルの `画像補正 / 表示トリム / ブックマーク` タブから、`トリムなし / 自動余白カット（本全体） / 手動設定` をラジオで選ぶ。`手動設定` のときだけスライダーの直上に `適用範囲：[本全体][このページ]` を出し、enabled なページ個別行の有無から選択を導出する。手動設定では単ページ / 見開き連動 / 見開き左右別の 0〜20% トリムを調整する。`draw_fs_image` / `draw_fs_spread` の fit 基準 bbox と描画 UV を変え、bbox 外は背景に落とす。見開き中央側のトリムは左右の見える端を gap に合わせて再配置し、操作判定は見える rect を使う。モード / 本全体設定は本キー、ページ個別設定は `page_path_key` で `view_trim.db` に保存する。表示解決は `idx` ごとにページ個別設定を優先し、無ければ本全体へ戻す。トリムなし / 自動余白カットはページ個別設定を参照しない。mIV Remote の Page worker は DB を read-only で開き、container address・物理表示 slot・見開き相手から同じキーと `None` / `Book` / `Page` / `Auto` の bbox を解決して、端末用 JPEG の resize 前だけ crop する。Remote の変更要求は既存要求ownerがreceiptを待ち、composition serviceのFIFO workerから既存 `ViewTrimDb` へ正規の `ViewTrimBookState` のまま保存し、core の clamp と共通 generation 無効化を通す。Remote からページ個別設定は作らない。Auto の見開き相手は待たず raw decode し、上下を本体と同じ規則で調停する。保存 / エクスポート / crop DB には影響しない |
 | `book_bookmarks.rs` / `bookmark_browser.rs` | 本ページの安定 identity を `book_bookmarks.db` へ非同期保存し、既存 `video_bookmarks.db` と合わせた全メディア横断 read model を構築する。アプリ内の本 / ページのリネーム、製本ページの並べ替え・別本移動は旧 path → 新 path mapping を専用 transaction で identity へ反映する（missing 行保持のため共通 hard-purge store には含めない）。横断一覧は専用ダイアログを持たず `TopLevelGridSurface::Bookmarks` として通常の `App.items` / facet / details 表示へ載せ、ID・位置・登録日時・欠落状態を sidecar row に保持する。SQLite、存在確認、動画 WebP decode、ZIP / PDF 列挙、削除は worker 側で、ZIP / PDF の missing inventory は一覧構築中にコンテナ単位で共有する。削除は DB 行だけを対象にし、元メディアへ filesystem 操作を行わない。横断一覧から開く要求は単調増加 request ID と target identity を path resolver、RAR / 7z / LZH の `ArchiveConvertState`、viewer 待機まで運ぶ。元アーカイブ → 直接 RAR / 変換キャッシュ ZIP は owner 付き内部遷移とし、navigation / activation / cancel / disconnect / timeout は一致する owner と変換 receiver だけを終了して stale completion を表示へ適用しない |
 | `ui_analysis_panel.rs` | 画像分析パネル (右端オーバーレイ)。色情報・ヒストグラム |
 | `ui_metadata_panel.rs` | 右情報パネル (AI メタデータ + EXIF + XMP ツイート情報 + 類似画像)。類似タブ・照会表示・サムネイル要求と完了channelは `ViewerContextBundle` が所有する。可視カードとhoverページ帯の需要だけを描画後に処理し、workerは4枠、GPU uploadは1フレーム1件、派生キャッシュは512件以内に保つ。要求IDと内容stampを照合して退避・取消後の古い完了を拒否する |
@@ -561,7 +571,8 @@ commit成功後にwrite success/generation/group cacheを公開する。UI threa
 Remoteのnudge/記憶設定UIは増やさない。wire/address/slot/roleの契約を変えないためIPC v69・Web asset tokenを維持する。
 変換書庫のRemote baseは元書庫のlogical keyを保持し、PCのcache側baseへの移行を行わない。
 この既存差と切詰め境界のmaster証明・D3検証記録は設計§11.10と`target/D-1364-d3-msg.txt`を参照する。
-G3は未統合で、C1–C12共有fixtureの供給だけを構成consumerの統合・検収証拠としない。
+D3時点ではG3は未統合だった。2026-10-11のG3は共有C1–C12を既存admission/restore ownerへ接続し、
+strict IPC v70のmode-only入口を追加した。構成editor固有のC7/C9はG4で接続する。
 本記述は実装の所有境界を示し、自動検証・独立完了レビュー・利用者確認の完了を主張しない。
 
 ### フォルダ側サイドカー (`mimageviewer.dat`)

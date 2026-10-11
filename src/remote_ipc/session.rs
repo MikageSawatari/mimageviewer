@@ -1097,6 +1097,7 @@ struct UiRequestDispatch {
 
 struct QueuedRemoteWrite {
     request: RemoteWriteRequest,
+    composition_admission: crate::book_composition::CompositionWriteAdmission,
     operation: SessionOperation,
     reply: mpsc::SyncSender<UiWriteOutcome>,
     dispatch: Arc<UiRequestDispatch>,
@@ -1123,6 +1124,7 @@ enum QueuedRemoteUiRequest {
 
 pub(crate) struct ClaimedRemoteWrite {
     request: RemoteWriteRequest,
+    composition_admission: crate::book_composition::CompositionWriteAdmission,
     operation: SessionOperation,
     reply: mpsc::SyncSender<UiWriteOutcome>,
 }
@@ -1280,6 +1282,11 @@ impl UiRequestDispatch {
 }
 
 impl ClaimedRemoteWrite {
+    pub(crate) fn composition_admission(
+        &self,
+    ) -> &crate::book_composition::CompositionWriteAdmission {
+        &self.composition_admission
+    }
     pub(crate) fn request(&self) -> &RemoteWriteRequest {
         &self.request
     }
@@ -1311,6 +1318,7 @@ impl ClaimedRemoteWrite {
         (
             Self {
                 request,
+                composition_admission: Default::default(),
                 operation,
                 reply,
             },
@@ -1942,10 +1950,33 @@ impl SessionHandle {
         self.submit_write_with_timeout(request, operation, UI_REQUEST_ACCEPT_TIMEOUT)
     }
 
+    pub(crate) fn submit_write_with_composition(
+        &self,
+        request: RemoteWriteRequest,
+        operation: SessionOperation,
+        admission: crate::book_composition::CompositionWriteAdmission,
+    ) -> UiWriteOutcome {
+        self.submit_qualified_write_with_timeout(
+            request,
+            operation,
+            admission,
+            UI_REQUEST_ACCEPT_TIMEOUT,
+        )
+    }
+
     fn submit_write_with_timeout(
         &self,
         request: RemoteWriteRequest,
         operation: SessionOperation,
+        timeout: Duration,
+    ) -> UiWriteOutcome {
+        self.submit_qualified_write_with_timeout(request, operation, Default::default(), timeout)
+    }
+    fn submit_qualified_write_with_timeout(
+        &self,
+        request: RemoteWriteRequest,
+        operation: SessionOperation,
+        composition_admission: crate::book_composition::CompositionWriteAdmission,
         timeout: Duration,
     ) -> UiWriteOutcome {
         let generation = operation.generation();
@@ -1953,6 +1984,7 @@ impl SessionHandle {
         let (reply, receiver) = mpsc::sync_channel(1);
         let queued = QueuedRemoteUiRequest::Write(QueuedRemoteWrite {
             request,
+            composition_admission,
             operation,
             reply,
             dispatch: Arc::clone(&dispatch),
@@ -2162,6 +2194,7 @@ impl SessionHandle {
                     queued.operation.started();
                     claimed.push(ClaimedRemoteUiRequest::Write(ClaimedRemoteWrite {
                         request: queued.request,
+                        composition_admission: queued.composition_admission,
                         operation: queued.operation,
                         reply: queued.reply,
                     }));
@@ -4046,6 +4079,7 @@ mod tests {
             .try_enqueue_ui_request(
                 QueuedRemoteUiRequest::Write(QueuedRemoteWrite {
                     request: write_request(),
+                    composition_admission: Default::default(),
                     operation: write_operation,
                     reply: write_tx,
                     dispatch: write_dispatch,
