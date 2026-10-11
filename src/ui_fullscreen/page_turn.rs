@@ -813,7 +813,7 @@ impl CompletionDiagnostics {
 struct OperationTransaction {
     facts: Vec<ViewerOperationFact>,
     disposition: OperationDisposition,
-    observed_frame: Option<u64>,
+    observed_frame: Option<(egui::ViewportId, u64)>,
 }
 
 #[derive(Default, PartialEq, Eq)]
@@ -939,7 +939,11 @@ impl PageTurnPresentation {
             self.cancel("new_operation");
         }
     }
-    fn observe_for_frame(&mut self, frame: u64, mut facts: Vec<ViewerOperationFact>) {
+    fn observe_for_frame(
+        &mut self,
+        frame: (egui::ViewportId, u64),
+        mut facts: Vec<ViewerOperationFact>,
+    ) {
         if facts.is_empty() {
             if self.transaction.observed_frame != Some(frame)
                 && self.transaction.disposition == OperationDisposition::Available
@@ -1159,7 +1163,7 @@ impl App {
             });
         }
         self.page_turn_presentation
-            .observe_for_frame(ctx.cumulative_frame_nr(), facts);
+            .observe_for_frame((ctx.viewport_id(), ctx.cumulative_frame_nr()), facts);
     }
 
     pub(crate) fn page_turn_external_operation(
@@ -1216,7 +1220,7 @@ impl App {
             });
         }
         self.page_turn_presentation
-            .observe_for_frame(ctx.cumulative_frame_nr(), facts);
+            .observe_for_frame((ctx.viewport_id(), ctx.cumulative_frame_nr()), facts);
     }
 
     pub(super) fn page_turn_view_eligible(&self, page_idx: usize) -> bool {
@@ -1275,17 +1279,19 @@ impl App {
         // A resolved handler is the authority that navigation was accepted.
         // Its diagnostic must survive missing/ambiguous ingress, rather than
         // silently returning because an animation candidate could not be made.
-        if transaction.observed_frame != Some(ctx.cumulative_frame_nr()) {
-            if operation.is_some_and(|id| transaction.facts.iter().any(|f| f.operation_id == id))
-                && matches!(
-                    transaction.disposition,
-                    OperationDisposition::Claimed | OperationDisposition::Excluded
-                )
-            {
-                return;
-            }
+        // The child callback hands its resolved identity to ROOT after returning.
+        // Their counters are unrelated: an explicit matching destination/identity
+        // is the authority, not the receiver's ambient frame number.
+        let matched_handoff = operation.is_some_and(|id| {
+            transaction
+                .facts
+                .iter()
+                .any(|f| f.operation_id == id && f.destination == destination)
+        });
+        let frame = (ctx.viewport_id(), ctx.cumulative_frame_nr());
+        if !matched_handoff && transaction.observed_frame != Some(frame) {
             *transaction = OperationTransaction {
-                observed_frame: Some(ctx.cumulative_frame_nr()),
+                observed_frame: Some(frame),
                 ..Default::default()
             };
         }
@@ -2485,28 +2491,28 @@ mod tests {
     #[test]
     fn immutable_operation_replay_ignores_diagnostic_sequence_and_claims_once() {
         let mut presentation = PageTurnPresentation::default();
-        presentation.observe_for_frame(1, vec![fact(1)]);
+        presentation.observe_for_frame((egui::ViewportId::ROOT, 1), vec![fact(1)]);
         assert!(presentation.take_candidate().is_some());
         let mut replay = fact(1);
         replay.diagnostic_input_seq = 999;
         replay.cause = "replay_metadata";
-        presentation.observe_for_frame(1, vec![replay]);
+        presentation.observe_for_frame((egui::ViewportId::ROOT, 1), vec![replay]);
         assert!(presentation.take_candidate().is_none());
-        presentation.observe_for_frame(1, vec![]);
+        presentation.observe_for_frame((egui::ViewportId::ROOT, 1), vec![]);
         assert!(presentation.take_candidate().is_none());
     }
     #[test]
     fn batch_merge_suppresses_multiple_edges_and_unclaimed_facts_expire() {
         let mut presentation = PageTurnPresentation::default();
-        presentation.observe_for_frame(1, vec![fact(1)]);
-        presentation.observe_for_frame(1, vec![fact(2)]);
+        presentation.observe_for_frame((egui::ViewportId::ROOT, 1), vec![fact(1)]);
+        presentation.observe_for_frame((egui::ViewportId::ROOT, 1), vec![fact(2)]);
         assert_eq!(presentation.transaction.facts.len(), 2);
         assert!(presentation.take_candidate().is_none());
-        presentation.observe_for_frame(2, vec![]);
+        presentation.observe_for_frame((egui::ViewportId::ROOT, 2), vec![]);
         assert!(presentation.transaction.facts.is_empty());
         let mut continuous = fact(3);
         continuous.phase = OperationPhase::Continuous;
-        presentation.observe_for_frame(3, vec![continuous]);
+        presentation.observe_for_frame((egui::ViewportId::ROOT, 3), vec![continuous]);
         assert!(presentation.take_candidate().is_none());
         presentation.deactivate("disabled");
         assert!(presentation.transaction.facts.is_empty());

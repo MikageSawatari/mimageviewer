@@ -30069,31 +30069,19 @@ impl App {
             .map(|edge| ViewerOperationId::Key(edge.operation_id()))
     }
 
-    fn page_turn_fixed_navigation_key_operation(
+    fn page_turn_consumed_key_operation(
         &self,
-        ctx: &egui::Context,
-        key_name: KeyName,
+        result: crate::keymap::PageTurnConsumeResult,
     ) -> Option<ViewerOperationId> {
         if !self.settings.page_turn_animation_enabled && !self.page_turn_barrier_active() {
             return None;
         }
-        crate::key_input::operation_key_edges(ctx, ctx.viewport_id())
-            .into_iter()
-            .find(|edge| {
-                edge.pressed()
-                    && match edge {
-                        crate::key_input::KeyOperationEdge::Native(edge) => {
-                            key_name.matches_win32(edge.virtual_key, edge.scan_code, edge.extended)
-                                && !edge.ctrl
-                                && !edge.alt
-                        }
-                        crate::key_input::KeyOperationEdge::Egui { key, modifiers, .. } => {
-                            Chord::key(key_name).matches_egui(*key, *modifiers)
-                                || Chord::shift(key_name).matches_egui(*key, *modifiers)
-                        }
-                    }
-            })
-            .map(|edge| ViewerOperationId::Key(edge.operation_id()))
+        match result {
+            crate::keymap::PageTurnConsumeResult::Trigger(input) => {
+                Some(ViewerOperationId::Key(input.operation_id))
+            }
+            _ => None,
+        }
     }
 
     pub(crate) fn handle_fs_key_input(
@@ -31025,16 +31013,26 @@ impl App {
             && self
                 .keymap
                 .consume_action(ctx, KeyAction::FsContinuousScrollBack);
-        let page_next = !is_video_fs
-            && self
-                .keymap
-                .consume_page_turn_action(ctx, input_permits.current_level, KeyAction::FsPageNext)
-                .should_navigate();
-        let page_prev = !is_video_fs
-            && self
-                .keymap
-                .consume_page_turn_action(ctx, input_permits.current_level, KeyAction::FsPagePrev)
-                .should_navigate();
+        let page_next_input = if !is_video_fs {
+            self.keymap.consume_page_turn_action(
+                ctx,
+                input_permits.current_level,
+                KeyAction::FsPageNext,
+            )
+        } else {
+            crate::keymap::PageTurnConsumeResult::NoMatch
+        };
+        let page_prev_input = if !is_video_fs {
+            self.keymap.consume_page_turn_action(
+                ctx,
+                input_permits.current_level,
+                KeyAction::FsPagePrev,
+            )
+        } else {
+            crate::keymap::PageTurnConsumeResult::NoMatch
+        };
+        let page_next = page_next_input.should_navigate();
+        let page_prev = page_prev_input.should_navigate();
         let fixed_jump_next =
             !is_video_fs && self.keymap.consume_action(ctx, KeyAction::FsFixedJumpNext);
         let fixed_jump_prev =
@@ -31073,48 +31071,41 @@ impl App {
         };
         // 音声は ←→ を上のシークブロックで消費済み (「映像なし動画」パリティ)。ここでは file-nav へ
         // 流さないよう明示的に除外する (残留 ←→ が前後ファイル移動を誤発火するのを防ぐ)。
-        let arrow_right = !fs_music_view_active
-            && !video_horizontal_arrow_key
-            && fullscreen_raw_key_permit.is_some_and(|permit| {
-                self.keymap
-                    .consume_fixed_page_turn_chord(
-                        ctx,
-                        permit,
-                        input_permits.current_level,
-                        Chord::key(KeyName::Right),
-                    )
-                    .should_navigate()
-                    || self
-                        .keymap
-                        .consume_fixed_page_turn_chord(
-                            ctx,
-                            permit,
-                            input_permits.current_level,
-                            Chord::shift(KeyName::Right),
-                        )
-                        .should_navigate()
-            });
-        let arrow_left = !fs_music_view_active
-            && !video_horizontal_arrow_key
-            && fullscreen_raw_key_permit.is_some_and(|permit| {
-                self.keymap
-                    .consume_fixed_page_turn_chord(
-                        ctx,
-                        permit,
-                        input_permits.current_level,
-                        Chord::key(KeyName::Left),
-                    )
-                    .should_navigate()
-                    || self
-                        .keymap
-                        .consume_fixed_page_turn_chord(
-                            ctx,
-                            permit,
-                            input_permits.current_level,
-                            Chord::shift(KeyName::Left),
-                        )
-                        .should_navigate()
-            });
+        // Preserve the identity selected by the consumer, whose initial press
+        // takes precedence over a repeat; do not re-search immutable ingress.
+        let consume_arrow = |key: KeyName, enabled: bool, allow_shift: bool| {
+            let Some(permit) = fullscreen_raw_key_permit.filter(|_| enabled) else {
+                return crate::keymap::PageTurnConsumeResult::NoMatch;
+            };
+            let plain = self.keymap.consume_fixed_page_turn_chord(
+                ctx,
+                permit,
+                input_permits.current_level,
+                Chord::key(key),
+            );
+            if plain.should_navigate() || !allow_shift {
+                plain
+            } else {
+                self.keymap.consume_fixed_page_turn_chord(
+                    ctx,
+                    permit,
+                    input_permits.current_level,
+                    Chord::shift(key),
+                )
+            }
+        };
+        let arrow_right_input = consume_arrow(
+            KeyName::Right,
+            !fs_music_view_active && !video_horizontal_arrow_key,
+            true,
+        );
+        let arrow_left_input = consume_arrow(
+            KeyName::Left,
+            !fs_music_view_active && !video_horizontal_arrow_key,
+            true,
+        );
+        let arrow_right = arrow_right_input.should_navigate();
+        let arrow_left = arrow_left_input.should_navigate();
         // ファイル名スタックのフラット読書中 (v2.0.0) は Shift+↓↑ を「次/前のスタックへ
         // ジャンプ」に割り当てる。動画再生中は Video* action (音量 / 前後ファイル) が優先。
         // 非スタック / 非フラットでは従来どおり Shift+↓↑ はプレーン ↓↑ のエイリアス (ページ送り)。
@@ -31145,58 +31136,22 @@ impl App {
         // ガードは残す: 音声は plain/Shift 矢印をこの image 経路では消費せず、plain ↓↑ は
         // video_file_nav 経由、Shift+↓↑ は音量 (VideoVolumeUp/Down) に振り分けるため
         // (二重発火防止、Inc 5c-B 実機FB 2026-07-03)。
+        // Drain before suppressing stack-shift navigation, preserving the
+        // existing order and video/audio routing.
+        let arrow_down_input = consume_arrow(
+            KeyName::Down,
+            !is_video_fs && !fs_music_view_active,
+            !stack_flat_nav,
+        );
+        let arrow_up_input = consume_arrow(
+            KeyName::Up,
+            !is_video_fs && !fs_music_view_active,
+            !stack_flat_nav,
+        );
         let arrow_down = video_file_nav == Some(KeyAction::VideoNextFile)
-            || (!is_video_fs
-                && !fs_music_view_active
-                && fullscreen_raw_key_permit.is_some_and(|permit| {
-                    // egui イベントは常に drain する (残すと後段ハンドラが拾う恐れ)。ただし
-                    // flat 読書中の Shift+↓ (= スタックジャンプ) はページ送りとしては扱わない。
-                    let consumed = self
-                        .keymap
-                        .consume_fixed_page_turn_chord(
-                            ctx,
-                            permit,
-                            input_permits.current_level,
-                            Chord::key(KeyName::Down),
-                        )
-                        .should_navigate()
-                        || (!stack_flat_nav
-                            && self
-                                .keymap
-                                .consume_fixed_page_turn_chord(
-                                    ctx,
-                                    permit,
-                                    input_permits.current_level,
-                                    Chord::shift(KeyName::Down),
-                                )
-                                .should_navigate());
-                    consumed && !stack_shift_arrow
-                }));
+            || (arrow_down_input.should_navigate() && !stack_shift_arrow);
         let arrow_up = video_file_nav == Some(KeyAction::VideoPrevFile)
-            || (!is_video_fs
-                && !fs_music_view_active
-                && fullscreen_raw_key_permit.is_some_and(|permit| {
-                    let consumed = self
-                        .keymap
-                        .consume_fixed_page_turn_chord(
-                            ctx,
-                            permit,
-                            input_permits.current_level,
-                            Chord::key(KeyName::Up),
-                        )
-                        .should_navigate()
-                        || (!stack_flat_nav
-                            && self
-                                .keymap
-                                .consume_fixed_page_turn_chord(
-                                    ctx,
-                                    permit,
-                                    input_permits.current_level,
-                                    Chord::shift(KeyName::Up),
-                                )
-                                .should_navigate());
-                    consumed && !stack_shift_arrow
-                }));
+            || (arrow_up_input.should_navigate() && !stack_shift_arrow);
         let key_home = self.keymap.consume_action(ctx, KeyAction::FsJumpFirst);
         let key_end = self.keymap.consume_action(ctx, KeyAction::FsJumpLast);
         let current_item_is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
@@ -32289,29 +32244,23 @@ impl App {
         // S / Space / Esc は従来どおり停止する。
         if nav_next && !ctrl_d {
             action.page_nav = self.spread_page_nav(1);
-            *navigation_operation = self.page_turn_fixed_navigation_key_operation(
-                ctx,
-                if arrow_down {
-                    KeyName::Down
-                } else if arrow_left {
-                    KeyName::Left
-                } else {
-                    KeyName::Right
-                },
-            );
+            *navigation_operation = self.page_turn_consumed_key_operation(if arrow_down {
+                arrow_down_input
+            } else if arrow_left {
+                arrow_left_input
+            } else {
+                arrow_right_input
+            });
         }
         if nav_prev && !ctrl_u {
             action.page_nav = self.spread_page_nav(-1);
-            *navigation_operation = self.page_turn_fixed_navigation_key_operation(
-                ctx,
-                if arrow_up {
-                    KeyName::Up
-                } else if arrow_right {
-                    KeyName::Right
-                } else {
-                    KeyName::Left
-                },
-            );
+            *navigation_operation = self.page_turn_consumed_key_operation(if arrow_up {
+                arrow_up_input
+            } else if arrow_right {
+                arrow_right_input
+            } else {
+                arrow_left_input
+            });
         }
         // ファイル名スタック: Shift+↓↑ で次/前のスタックの先頭画像へ絶対ジャンプ
         // (フラット読書ビューのときのみ。端では no-op で消費)。Shift キーは上で
@@ -32430,13 +32379,11 @@ impl App {
         }
         if page_next {
             action.page_nav = self.spread_page_nav(1);
-            *navigation_operation =
-                self.page_turn_navigation_key_operation(ctx, KeyAction::FsPageNext);
+            *navigation_operation = self.page_turn_consumed_key_operation(page_next_input);
         }
         if page_prev {
             action.page_nav = self.spread_page_nav(-1);
-            *navigation_operation =
-                self.page_turn_navigation_key_operation(ctx, KeyAction::FsPagePrev);
+            *navigation_operation = self.page_turn_consumed_key_operation(page_prev_input);
         }
         if fixed_jump_next || fixed_jump_prev {
             *navigation_operation = self.page_turn_navigation_key_operation(

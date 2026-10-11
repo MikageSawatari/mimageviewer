@@ -517,6 +517,332 @@ fn ready_single_viewer(ctx: &egui::Context) -> (crate::app::AppTestEnvForTest, e
     (app, viewport)
 }
 
+fn advance_outer_root_frames(ctx: &egui::Context) {
+    // Production accepts child input after show_viewport_immediate returns to ROOT.
+    // Its frame counter is independent of the child counter, even on the same Context.
+    for _ in 0..7 {
+        viewer_frame(ctx, egui::ViewportId::ROOT, Vec::new(), |_, _| {});
+    }
+}
+
+fn accept_key_action_on_outer_root(
+    app: &mut App,
+    ctx: &egui::Context,
+    from: usize,
+    action: &FsKeyAction,
+    operation: Option<ViewerOperationId>,
+) {
+    assert!(action.mouse_nav.is_none());
+    app.handle_fs_navigation_with_operation(
+        ctx,
+        action.close,
+        action.close_to_page_list,
+        action.ctrl_nav,
+        action.sibling_nav,
+        None,
+        action.page_nav,
+        action.jump_to,
+        from,
+        operation,
+    );
+}
+
+#[test]
+fn child_boundary_navigation_skips_once_with_original_fact_after_outer_root_handoff() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    take_test_events();
+    let ctx = egui::Context::default();
+    let (mut app, viewport) = ready_single_viewer(&ctx);
+    advance_outer_root_frames(&ctx);
+    let from = *app.get_nav_indices().last().unwrap();
+    app.fullscreen_idx = Some(from);
+    let mut handoff = None;
+    let mut child_frame = 0;
+    viewer_frame(
+        &ctx,
+        viewport,
+        vec![key_event(true), key_event(false)],
+        |_, ctx| {
+            app.begin_page_turn_viewer_frame(ctx, false, None);
+            let mut operation = None;
+            let action = app.handle_fs_key_input_with_operation(ctx, from, false, &mut operation);
+            assert!(!action.page_nav.is_none());
+            let fact = app.page_turn_presentation.transaction.facts[0];
+            assert_eq!(Some(fact.operation_id), operation);
+            child_frame = ctx.cumulative_frame_nr();
+            handoff = Some((action, fact));
+        },
+    );
+    let (action, original) = handoff.unwrap();
+    viewer_frame(&ctx, egui::ViewportId::ROOT, Vec::new(), |_, ctx| {
+        assert_ne!(ctx.cumulative_frame_nr(), child_frame);
+        accept_key_action_on_outer_root(&mut app, ctx, from, &action, Some(original.operation_id));
+        // Replaying the same accepted diagnostic must not consume a second budget.
+        app.page_turn_excluded_navigation_with_operation(
+            ctx,
+            "navigation_boundary",
+            Some(original.operation_id),
+        );
+    });
+    assert_eq!(app.fullscreen_idx, Some(from));
+    assert_eq!(original.source, viewport);
+    assert_eq!(original.phase, OperationPhase::Press);
+    let events = take_test_events();
+    assert_eq!(events.len(), 1, "one accepted boundary: {events:?}");
+    assert!(same_operation(&events[0].0, &original));
+    assert_eq!(
+        events[0].0.diagnostic_input_seq,
+        original.diagnostic_input_seq
+    );
+    assert_eq!((events[0].1, events[0].2), ("skip", "navigation_boundary"));
+}
+
+#[test]
+fn child_repeat_navigation_skips_once_with_original_repeat_fact_on_outer_root() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    take_test_events();
+    let ctx = egui::Context::default();
+    let (mut app, viewport) = ready_single_viewer(&ctx);
+    advance_outer_root_frames(&ctx);
+    #[cfg(windows)]
+    {
+        let now = Instant::now();
+        crate::key_input::arm_test_synthetic_input(1, viewport);
+        crate::key_input::enqueue_test_synthetic_command(
+            crate::key_input::SyntheticKeyCommand::down(
+                now,
+                crate::key_input::SyntheticNavigationKey::Right,
+                crate::key_input::SyntheticModifiers::default(),
+            ),
+        );
+        crate::key_input::advance_test_synthetic_input(now);
+    }
+    let mut repeat = key_event(true);
+    if let egui::Event::Key { repeat, .. } = &mut repeat {
+        *repeat = true;
+    }
+    let mut handoff = None;
+    let mut child_frame = 0;
+    viewer_frame(&ctx, viewport, vec![repeat], |_, ctx| {
+        #[cfg(windows)]
+        crate::key_input::set_test_frame_for_viewport(
+            viewport,
+            vec![crate::key_input::KeyEdge {
+                operation_id: crate::key_input::KeyOperationId::unassigned(),
+                source_hwnd: 0x341,
+                source_viewport: viewport,
+                virtual_key: 0x27,
+                scan_code: 0x4d,
+                extended: true,
+                pressed: true,
+                repeat: true,
+                ctrl: false,
+                shift: false,
+                alt: false,
+            }],
+        );
+        app.begin_page_turn_viewer_frame(ctx, false, None);
+        let mut operation = None;
+        let action = app.handle_fs_key_input_with_operation(ctx, 0, false, &mut operation);
+        assert!(
+            !action.page_nav.is_none(),
+            "a held repeat uses the real key handler"
+        );
+        let fact = app.page_turn_presentation.transaction.facts[0];
+        assert_eq!(Some(fact.operation_id), operation);
+        child_frame = ctx.cumulative_frame_nr();
+        handoff = Some((action, fact));
+    });
+    let (action, original) = handoff.unwrap();
+    viewer_frame(&ctx, egui::ViewportId::ROOT, Vec::new(), |_, ctx| {
+        assert_ne!(ctx.cumulative_frame_nr(), child_frame);
+        accept_key_action_on_outer_root(&mut app, ctx, 0, &action, Some(original.operation_id));
+        app.page_turn_excluded_navigation_with_operation(
+            ctx,
+            "repeat_operation",
+            Some(original.operation_id),
+        );
+    });
+    assert_eq!(app.fullscreen_idx, Some(1));
+    assert_eq!(original.source, viewport);
+    assert_eq!(original.phase, OperationPhase::Repeat);
+    let events = take_test_events();
+    assert_eq!(events.len(), 1, "one accepted repeat: {events:?}");
+    assert!(same_operation(&events[0].0, &original));
+    assert_eq!(
+        events[0].0.diagnostic_input_seq,
+        original.diagnostic_input_seq
+    );
+    assert_eq!(events[0].1, "skip");
+    assert_ne!(events[0].2, "missing_operation_fact");
+}
+
+#[cfg(windows)]
+#[test]
+fn child_key_handler_hands_off_fresh_press_id_after_same_batch_repeat_and_release() {
+    let _serial = crate::key_input::lock_test_input();
+    take_test_events();
+    let ctx = egui::Context::default();
+    let (mut app, viewport) = ready_single_viewer(&ctx);
+    advance_outer_root_frames(&ctx);
+    let mut repeat = key_event(true);
+    if let egui::Event::Key { repeat, .. } = &mut repeat {
+        *repeat = true;
+    }
+    let mut handoff = None;
+    viewer_frame(
+        &ctx,
+        viewport,
+        vec![repeat, key_event(false), key_event(true), key_event(false)],
+        |_, ctx| {
+            let edges = [(true, true), (false, false), (true, false), (false, false)]
+                .into_iter()
+                .map(|(pressed, repeat)| crate::key_input::KeyEdge {
+                    operation_id: crate::key_input::KeyOperationId::unassigned(),
+                    source_hwnd: 0x341,
+                    source_viewport: viewport,
+                    virtual_key: 0x27,
+                    scan_code: 0x4d,
+                    extended: true,
+                    pressed,
+                    repeat,
+                    ctrl: false,
+                    shift: false,
+                    alt: false,
+                })
+                .collect();
+            crate::key_input::set_test_frame_for_viewport(viewport, edges);
+            app.begin_page_turn_viewer_frame(ctx, false, None);
+            let snapshot = crate::key_input::native_operation_key_edges(viewport);
+            let initial = ViewerOperationId::Key(snapshot[2].operation_id);
+            let mut operation = None;
+            let action = app.handle_fs_key_input_with_operation(ctx, 0, false, &mut operation);
+            assert!(!action.page_nav.is_none());
+            assert_eq!(
+                operation,
+                Some(initial),
+                "the consumer selects the fresh press, not the earlier repeat"
+            );
+            let original = *app
+                .page_turn_presentation
+                .transaction
+                .facts
+                .iter()
+                .find(|fact| fact.operation_id == initial)
+                .unwrap();
+            handoff = Some((action, original, ctx.cumulative_frame_nr()));
+        },
+    );
+    let (action, original, child_frame) = handoff.unwrap();
+    viewer_frame(&ctx, egui::ViewportId::ROOT, Vec::new(), |_, ctx| {
+        assert_ne!(ctx.cumulative_frame_nr(), child_frame);
+        accept_key_action_on_outer_root(&mut app, ctx, 0, &action, Some(original.operation_id));
+    });
+    assert_eq!(app.fullscreen_idx, Some(1));
+    assert_eq!(original.phase, OperationPhase::Press);
+    let events = take_test_events();
+    assert_eq!(
+        events.len(),
+        1,
+        "the mixed batch accepts only one navigation: {events:?}"
+    );
+    assert!(same_operation(&events[0].0, &original));
+    assert_eq!(events[0].1, "skip");
+    assert_ne!(events[0].2, "missing_operation_fact");
+}
+
+#[test]
+fn child_key_and_wheel_navigation_start_and_complete_after_outer_root_acceptance() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    for wheel in [false, true] {
+        #[cfg(windows)]
+        crate::key_input::clear_test_frame();
+        take_test_events();
+        let ctx = egui::Context::default();
+        let (mut app, viewport) = ready_single_viewer(&ctx);
+        app.settings.page_turn_animation_duration_ms = 600;
+        advance_outer_root_frames(&ctx);
+        let input = if wheel {
+            vec![
+                egui::Event::PointerMoved(egui::pos2(300.0, 180.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -120.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        } else {
+            vec![key_event(true), key_event(false)]
+        };
+        let mut handoff = None;
+        let mut child_frame = 0;
+        viewer_frame(&ctx, viewport, input, |ui, ctx| {
+            app.begin_page_turn_viewer_frame(ctx, false, None);
+            let (nav, operation) = if wheel {
+                let (nav, close, operation) = actual_pointer_handler(&mut app, ui, ctx);
+                assert!(!close);
+                (nav, operation)
+            } else {
+                let mut operation = None;
+                let action = app.handle_fs_key_input_with_operation(ctx, 0, false, &mut operation);
+                (action.page_nav, operation)
+            };
+            assert!(!nav.is_none());
+            let fact = app.page_turn_presentation.transaction.facts[0];
+            assert_eq!(Some(fact.operation_id), operation);
+            child_frame = ctx.cumulative_frame_nr();
+            handoff = Some((nav, fact));
+        });
+        let (nav, original) = handoff.unwrap();
+        viewer_frame(&ctx, egui::ViewportId::ROOT, Vec::new(), |_, ctx| {
+            assert_ne!(ctx.cumulative_frame_nr(), child_frame);
+            app.handle_fs_navigation_with_operation(
+                ctx,
+                false,
+                false,
+                None,
+                None,
+                None,
+                nav,
+                None,
+                0,
+                Some(original.operation_id),
+            );
+        });
+        assert_eq!(app.fullscreen_idx, Some(1));
+        viewer_frame(&ctx, viewport, Vec::new(), |ui, ctx| {
+            app.begin_page_turn_viewer_frame(ctx, false, None);
+            let (_, sources) = draw_current(&mut app, ui, ctx);
+            let FsDisplayUnitSubmission::Paged(receipt) = sources.submission else {
+                panic!("paged output")
+            };
+            assert!(receipt.curl);
+        });
+        let tracker = match &mut app.page_turn_presentation.state {
+            PresentationState::Turning { offer, .. } => {
+                assert!(same_operation(&offer.fact, &original));
+                assert_eq!(offer.submission.status(), SubmissionStatus::Started);
+                offer.accepted_at -= offer.duration + Duration::from_millis(1);
+                offer.submission.clone()
+            }
+            _ => panic!("the child input must start its own turn after ROOT acceptance"),
+        };
+        viewer_frame(&ctx, viewport, Vec::new(), |ui, ctx| {
+            app.begin_page_turn_viewer_frame(ctx, false, None);
+            let (_, sources) = draw_current(&mut app, ui, ctx);
+            let FsDisplayUnitSubmission::Paged(receipt) = sources.submission else {
+                panic!("paged output")
+            };
+            assert!(!receipt.curl);
+        });
+        assert_eq!(tracker.status(), SubmissionStatus::Finished);
+        assert_completed_operation_events(original.operation_id);
+    }
+}
+
 #[test]
 fn mixed_key_and_wheel_batch_skips_once_for_the_actual_accepted_key_navigation() {
     #[cfg(windows)]

@@ -83,8 +83,8 @@ Q5は **PC viewer限定（F12を含む）、Remote不要** と確定。2026-10-1
 
 ### 3.1 単ページ・横長単ページ
 
-新ページを通常の完成位置に置き、その上の旧ページsheetを端からめくる。LTRの進む操作は右の自由端から左のhingeへ、戻る操作は逆。
-RTLは画面の左右だけを鏡映する。次ページが全体で現れるまでのsheetの投影を変えるが、画像UVや印字は鏡映しない。
+2026-10-11利用者決定: 背は読書方向ごとに固定する（LTRは頁左端、RTLは頁右端）。進む操作では現在頁がこの背から起きて次頁を現し、戻る操作では前の頁が同じ背から戻って現在頁の上へ着地する。操作方向で背を反対側へ替えない（§15.2・§21）。
+RTLは頁の配置と回転を左右対応させるが、画像UVや印字は鏡映しない。
 旧画像の実際の裏面は提供されていないため、裏は弱い紙色・陰影だけ。次の画像を「旧画像の真の裏」と偽って貼らない。
 横長でも単ページunitは一枚の横長sheet。中央で勝手に二分・再pairingしない。縦長画像との切替ではそれぞれの採用済みrectと背景を使う。
 
@@ -1730,3 +1730,25 @@ mixed key/wheel・ingress欠落は即時の通常移動とskip一回を確認し
 
 今回の検証結果、build、利用者向け手順は`target/A-1341-stage1-fix-msg.txt`へ記録する。
 製品差分の独立完了レビューと、修正後の実機motion品質/性能受入れは未了。
+
+## 21. Stage 1の実機評価追補（2026-10-11）
+
+利用者は`52cd5a15f`の見開き・単頁のmotionを良いと評価した。ただし単頁の背が往復で替わって見えることと、開始が不定に見えることを報告した。背の要求は§3.1・§15.2の固定背として再確認する。単頁departureはoutgoing、arrivalはincomingを動かし、どちらもLTR左／RTL右の背を使う。異寸法の頁は自身の通常rectを保つので背の絶対座標まで異頁間で固定する意味ではない。
+
+読取り専用で確認したnormal logのsession `95876-1791711361018`（pid 95876）では、Singleの635 curl frameは全てLTRで、forward/backwardの両方が`hinge_x=792.666687`、頁rect `[792.666687,44,1768,1298]`だった。既存投影と既存goldenも同じ背を使っていた。今回、方向依存のないsingle bindingを名前付きhelperで明示し、RTLのleaf退役後に左端を誤報告していた終端の`hinge_x`診断を修正した。これを実際の背交換の根因と扱わない。旧goldenの画素は変わらず、利用者が感じた実機の見え方はまだ再現できていない。
+
+前後・LTR/RTLの4枚の新goldenは固定端をLEFT/RIGHT文字で示し、departure/arrivalの頁所有、影、文字の向きと終端を比較する。同寸法／異寸法を各200 poseで検査し、同じ読書側の背、角度の連続性、UV非鏡映、通常paintとの終端画素一致を保証する。追加decode/upload、通常layoutの移動、影の推測調整によって未再現の症状を隠さない。
+
+### 21.1 `missing_operation_fact`の実際の発生経路
+
+同sessionの18件はnative held-key Repeatの16件（batch 97,99,…,127）と、native Pressのnavigation boundary 2件（batch 67,71）だった。wheel raw ingressはこのsessionには無い。リピートは既存規則どおりinstantで、境界では頁が変わらない。ここでfactが欠落した原因はinput producerではなく、child `render_fs_body`で観測した入力をcallback外のROOT navigation handlerで受理する際の所有境界だった。
+
+child（viewport 2615）の`observed_frame`をROOTの`cumulative_frame_nr`と裸の整数で比較し、Available/Cancelled transactionを消していた。明示的なoperation IDは渡っているのに元factが消え、skipがROOT/Pressの診断専用factで再構成された。readyなoffer経路にはこのresetが無いので28件の開始は可能だった。修正では現在destinationと一致する明示的operation IDを最初に照合し、そのresolved handoffをviewport/frame境界の後でも保持する。無関係・ID無しのambient観測は既存の失効規則を保ち、既存frame stampを`(ViewportId, frame_nr)`へ変更して別counterの偶然の一致も除く。Claimed/Excludedは同じIDの再配送を一回に抑える。
+
+固定矢印と`FsPageNext/Prev`は、typed key consumerが実際に選んだIDをnavigationへ直接渡す。immutable edge列を再検索しないので、repeat→release→fresh pressが一batchに来た際にもconsumerのinitial-press優先と一致する。wheel、click、touch、seek、spread shift、jump、pad、slideshowの既存ID producerも同じ受理境界を共有する。mouse side buttons／browser pendingは頁のsingle-stepではなく既存のcontext移動であり、その動作は変更しない。ID無しのcontext受付は従来の診断専用skipを使い、物理入力を捏造しない。新KeyAction、queue、pending、保存経路は追加しない。設定OFFの診断なし・flat直行とfinal-only判定を維持する。
+
+### 21.2 3件の取消と検証
+
+`new_operation`の3件はneutral pollや同clickのreleaseではなく、演出終了直前の新しいnative矢印Pressだった。旧batch 47→51 Left（199.426ms）、55→59 Left（184.189ms）、75→79 Right（193.172ms）で、既定仮時間200msのturnへ割り込んでいる。対応するegui duplicateはbatch 52/60/80だが、継続操作のIDは元native 51/59/79。全件`target_reached=true`で、childのcanonical flat採用frame 830/868/950の次frame 831/869/951で継続をcommitした。既存flat-first保証と取消規則は変更しない。
+
+childの実key／wheel handler→callback外ROOT受付を異なるcounterで再現し、通常single-stepがStarted→Finishedになること、Repeat／boundaryが元ID・source・phaseで一回のskipになることを検査する。既存handler、interruption、F12、projection、ui_snapshotを維持する。自動検証とbuildの証拠・短い利用者手順は`target/A-1341-stage1-fb-msg.txt`へ記録する。独立レビュー合格、実機での見え方修正、final-readyの開始率やGPU性能の受入れを先取りしない。

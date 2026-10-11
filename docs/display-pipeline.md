@@ -30,6 +30,13 @@ skipは`sub_check`と両unitのpaint/clip/viewport/ppp/ROIをperf有効時だけ
 既存`analyze_perf.py page-turn --check`のI1〜I5は維持し、専用`page-turn-animation --check`で
 機会・開始/完走・skip率と可視提示/保持量を別集計する。合成ログの成功を製品性能受入れと扱わない。
 
+2026-10-11 Stage 1実機追補: 単頁は読書方向で背を固定し（LTR左／RTL右）、forwardのoutgoing departureとbackwardのincoming arrivalを同じ側で描く。
+実機ログと既存goldenは既にこの向きで、新goldenは固定端を明示する。終端RTLの背座標診断だけを訂正し、未再現の見え方を修正済みとは扱わない。
+子viewportで捕捉しcallback外ROOTで受理するnavigationは、明示operation IDと現在destinationを照合して元factを保持する。
+ambient frame stampは既存fieldの(ViewportId, frame_nr)で、viewportの違うcounterを比較して消さない。
+固定矢印／FsPageNext/Prevはtyped consumerのIDを直接渡す。Repeat・境界のinstant規則、設定OFF、final-onlyは維持する。
+根因・実機取消3件・回帰の詳細は[page-turn-animation-plan.md §21](page-turn-animation-plan.md)を正本とする。
+
 ### 音声セルの代表画像 (§1.347、2026-10-08)
 
 同名補助画像の採用は表示行の種類投影から独立している。画像種類を隠しても既存の候補順で

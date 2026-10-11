@@ -4600,6 +4600,19 @@ detached述語/viewport/registry、改名待機、live-follow、新しいcontext
 詳細は[spread-shift-memory-plan.md §11.8](spread-shift-memory-plan.md#118-d2e-retained保持とscope単位のmaintenance資格2026-10-11)。
 本記録は独立構造合意・完了レビュー、製品起動や実機受入を表さない。
 
+### 2026-10-11 §1.341 Stage 1追補: resolved入力handoffのviewport/frame所有
+
+§2を再確認し、利用者指定の実機入力修正としてui_fullscreen/page_turn.rsの既存transaction境界を変更する。
+子callbackで捕捉したoperation IDと現在destinationが一致する場合は、callback外ROOTでの受理まで元factを保持する。
+裸のframe番号を別viewport間で比較せず、既存observed_frameを(ViewportId, frame_nr)にする。
+固定矢印とFsPageNext/Prevは実typed consumerが選択したIDをそのままhandoffする。
+新pending/queue/bool、detached述語、viewport生成・focus・配置・mount/deposit/fork、通常navigationを変更しない。
+単頁の固定背を明示し、終端RTLの背座標診断を直すが、既存の四方向投影goldenは不変。
+同じcontext所有の受付でsource/phaseを失っていた根因を除く構造修正であり、時間窓・待機・症状guardではない。
+child handler→ROOT受付→child提出と、元factを保持したskip一回の回帰を追加する。
+利用者の構造修正指示を根拠とする。本記録は独立レビュー合格や実機の見え方受入れを表さない。
+詳細は[page-turn-animation-plan.md §21](page-turn-animation-plan.md)、検証は`target/A-1341-stage1-fb-msg.txt`。
+
 ### 2026-10-11 §1.364 D2d: Commonの独立resume依存保持
 
 利用者指定の構造修正として`spread_shift::RestoreReadDependencies`の完了境界を変更する。

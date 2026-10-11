@@ -50,6 +50,12 @@ impl TurnDirection {
     fn turns_right_slot(self) -> bool {
         self.forward != self.reading_rtl
     }
+
+    /// A single-page window always shows the same side of the binding. Reverse
+    /// navigation changes which sheet arrives, never which edge is the spine.
+    fn single_leaf_sign(self) -> f32 {
+        if self.reading_rtl { -1.0 } else { 1.0 }
+    }
 }
 #[derive(Debug)]
 pub(crate) struct ProjectedMesh {
@@ -308,7 +314,14 @@ pub(crate) fn project_prepared(
             } else {
                 0.0
             },
-            new.spine_x.unwrap_or(new.pages[0].rect.left()),
+            if old.layout == UnitLayout::Single {
+                spine(
+                    if direction.forward { old } else { new },
+                    direction.single_leaf_sign(),
+                )
+            } else {
+                new.spine_x.unwrap_or(new.pages[0].rect.left())
+            },
             false,
         ),
         |leaf| (leaf.theta.to_degrees(), leaf.hinge, leaf.back),
@@ -436,14 +449,10 @@ fn scene<'a>(
         };
     }
     let pair = old.layout == UnitLayout::Spread;
-    let sign = if if pair {
-        d.turns_right_slot()
+    let sign = if pair {
+        if d.turns_right_slot() { 1.0 } else { -1.0 }
     } else {
-        !d.reading_rtl
-    } {
-        1.0
-    } else {
-        -1.0
+        d.single_leaf_sign()
     };
     let s = if pair && sign > 0.0 { 1 } else { 0 };
     let front = &old.pages[s];
@@ -1280,6 +1289,106 @@ mod tests {
                 }
             );
             assert!(project_turn(&old, &new, d, 0.0).is_ok());
+        }
+    }
+    #[test]
+    fn single_four_routes_keep_the_reading_spine_and_print_orientation_continuous() {
+        for unequal in [false, true] {
+            let (mut old, mut new) = fixture(false);
+            if unequal {
+                new.pages[0].rect = Rect::from_min_max(pos2(101.0, 59.0), pos2(459.0, 601.0));
+            }
+            let basis = [
+                pos2(0.17, 0.83),
+                pos2(0.17, 0.11),
+                pos2(0.91, 0.11),
+                pos2(0.91, 0.83),
+            ];
+            for page in old.pages.iter_mut().chain(&mut new.pages) {
+                if let PageMaterial::Texture { uv, .. } = &mut page.material {
+                    *uv = basis;
+                }
+            }
+            for reading_rtl in [false, true] {
+                for forward in [false, true] {
+                    let direction = TurnDirection {
+                        reading_rtl,
+                        forward,
+                    };
+                    let recipe = prepare_turn(&old, &new, direction).unwrap();
+                    let moving = if forward {
+                        &old.pages[0]
+                    } else {
+                        &new.pages[0]
+                    };
+                    let hinge = if reading_rtl {
+                        moving.rect.right()
+                    } else {
+                        moving.rect.left()
+                    };
+                    let mut previous_angle = if forward { 0.0 } else { 90.0 };
+                    let mut previous_free_x: Option<f32> = None;
+                    for step in 0..200 {
+                        let progress = step as f32 / 200.0;
+                        let pose = scene(&old, &new, direction, progress, recipe.lift);
+                        let leaf = pose.leaf.as_ref().unwrap();
+                        assert_eq!(leaf.hinge, hinge);
+                        assert_eq!(leaf.position(0.0, 0.0), pos2(hinge, moving.rect.top()));
+                        assert_eq!(leaf.position(0.0, 1.0), pos2(hinge, moving.rect.bottom()));
+                        assert!(!leaf.back);
+                        assert!(std::ptr::eq(leaf.page, moving));
+                        assert!(matches!(leaf.owner, FaceOwner::OutgoingFront) == forward);
+                        let angle = leaf.theta.to_degrees();
+                        assert!(if forward {
+                            angle >= previous_angle
+                        } else {
+                            angle <= previous_angle
+                        });
+                        previous_angle = angle;
+                        let free_x = leaf.position(1.0, 0.5).x;
+                        if let Some(previous) = previous_free_x {
+                            // Dense adjacent clock poses must move the same free
+                            // edge continuously, without swapping hinges or sheets.
+                            assert!((free_x - previous).abs() < moving.rect.width() * 0.025);
+                        }
+                        previous_free_x = Some(free_x);
+                        let screen_left_u = if reading_rtl { 1.0 } else { 0.0 };
+                        let screen_right_u = 1.0 - screen_left_u;
+                        assert!(
+                            leaf.position(screen_left_u, 0.0).x
+                                < leaf.position(screen_right_u, 0.0).x
+                        );
+                        for (u, v, expected) in [
+                            (screen_left_u, 0.0, basis[0]),
+                            (screen_right_u, 0.0, basis[1]),
+                            (screen_right_u, 1.0, basis[2]),
+                            (screen_left_u, 1.0, basis[3]),
+                        ] {
+                            assert_eq!(
+                                material_uv(&leaf.page.material, leaf.display(u, v)),
+                                expected
+                            );
+                        }
+                        let projected =
+                            project_prepared(&old, &new, direction, recipe, progress, false)
+                                .unwrap();
+                        assert_eq!(projected.hinge_x, hinge);
+                        if !forward {
+                            assert!(
+                                pose.surfaces
+                                    .iter()
+                                    .all(|surface| std::ptr::eq(surface.page, &old.pages[0]))
+                            );
+                        }
+                    }
+                    let finished =
+                        project_prepared(&old, &new, direction, recipe, 1.0, false).unwrap();
+                    assert_eq!(finished.hinge_x, hinge);
+                    assert!(finished.finished);
+                    assert!((finished.visibility.incoming[0].fraction() - 1.0).abs() < 0.0001);
+                    assert_eq!(finished.angle_degrees, if forward { 90.0 } else { 0.0 });
+                }
+            }
         }
     }
     #[test]

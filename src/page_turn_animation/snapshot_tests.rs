@@ -24,6 +24,7 @@ enum SceneGeometry {
     TallerIncoming,
     OpaqueBlack,
     SpineEdge,
+    FixedSingleSpine,
 }
 
 impl SceneGeometry {
@@ -35,6 +36,7 @@ impl SceneGeometry {
             Self::TallerIncoming => "height_continuity_",
             Self::OpaqueBlack => "opaque_black_",
             Self::SpineEdge => "spine_edge_",
+            Self::FixedSingleSpine => "fixed_spine_",
         }
     }
 
@@ -45,6 +47,7 @@ impl SceneGeometry {
             // the growing outer footprint and the canonical destination.
             Self::TallerIncoming => [0.0, 0.0001, 0.1, 0.25, 1.0],
             Self::SpineEdge => [0.0, 0.425, 0.433, 0.44, 1.0],
+            Self::FixedSingleSpine => [0.0, 0.15, 0.5, 0.85, 1.0],
             _ => POSES,
         }
     }
@@ -263,13 +266,13 @@ fn snapshot_scene(
     let mut harness = crate::test_ui::builder().with_size(SIZE).build(move |ctx| {
         if textures.is_none() {
             crate::ui_fonts::configure_fonts(ctx);
-            textures = Some(load_textures(ctx, matches!(geometry, SceneGeometry::OpaqueBlack)));
+            textures = Some(load_textures(ctx, matches!(geometry, SceneGeometry::OpaqueBlack | SceneGeometry::FixedSingleSpine)));
             ctx.request_repaint();
             return;
         }
         let painter = ctx.layer_painter(egui::LayerId::background());
         painter.rect_filled(ctx.content_rect(), 0.0,
-            if matches!(geometry, SceneGeometry::OpaqueBlack) { Color32::BLACK } else { Color32::from_rgb(29, 35, 46) });
+            if matches!(geometry, SceneGeometry::OpaqueBlack | SceneGeometry::FixedSingleSpine) { Color32::BLACK } else { Color32::from_rgb(29, 35, 46) });
         painter.text(pos2(12.0, 16.0), egui::Align2::LEFT_TOP,
             format!("{} / {} / {}   old=A1,B2  new=C3,D4  > reads right", if spread { "SPREAD" } else { "SINGLE" },
                 if reading_rtl { "RTL" } else { "LTR" }, if forward { "FORWARD" } else { "BACK" }),
@@ -322,7 +325,7 @@ fn snapshot_scene(
                         page.rect = Rect::from_center_size(center, vec2(page.rect.width(), 184.0));
                     }
                 }
-                SceneGeometry::Equal | SceneGeometry::PortraitPdf | SceneGeometry::OpaqueBlack | SceneGeometry::SpineEdge => {}
+                SceneGeometry::Equal | SceneGeometry::PortraitPdf | SceneGeometry::OpaqueBlack | SceneGeometry::SpineEdge | SceneGeometry::FixedSingleSpine => {}
             }
             let mut old = old;
             if matches!(geometry, SceneGeometry::TallerIncoming) {
@@ -330,12 +333,19 @@ fn snapshot_scene(
                     page.rect = Rect::from_center_size(page.rect.center(), vec2(page.rect.width(), 184.0 / 1.5));
                 }
             }
-            if matches!(geometry, SceneGeometry::OpaqueBlack) {
+            if matches!(geometry, SceneGeometry::OpaqueBlack | SceneGeometry::FixedSingleSpine) {
                 for unit in [&mut old, &mut new] {
                     for page in &mut unit.pages {
                         page.underlay = None;
                     }
                 }
+            }
+            if matches!(geometry, SceneGeometry::FixedSingleSpine) {
+                let moving = if forward { &old.pages[0] } else { &new.pages[0] };
+                let hinge = if reading_rtl { moving.rect.right() } else { moving.rect.left() };
+                painter.line_segment([pos2(hinge, 64.0), pos2(hinge, 248.0)], egui::Stroke::new(1.0, Color32::from_rgb(241, 92, 104)));
+                painter.text(pos2(hinge, 252.0), egui::Align2::CENTER_TOP, "SPINE",
+                    egui::FontId::monospace(10.0), Color32::from_rgb(241, 92, 104));
             }
             if index == 4 && endpoint_flag.load(Ordering::Relaxed) {
                 paint_canonical(&painter, &new);
@@ -348,7 +358,13 @@ fn snapshot_scene(
             }
         }
         painter.text(pos2(12.0, 270.0), egui::Align2::LEFT_TOP,
-            if matches!(geometry, SceneGeometry::PortraitPdf) {
+            if matches!(geometry, SceneGeometry::FixedSingleSpine) {
+                if reading_rtl {
+                    "Fixed RIGHT spine in both directions: current departs / previous arrives. Printed > never mirrors. Last = canonical incoming."
+                } else {
+                    "Fixed LEFT spine in both directions: current departs / previous arrives. Printed > never mirrors. Last = canonical incoming."
+                }
+            } else if matches!(geometry, SceneGeometry::PortraitPdf) {
                 "Portrait PDF fit in outlined 16:9 fullscreen; letterbox and real paint-grid gap. Last pose = canonical incoming."
             } else if matches!(geometry, SceneGeometry::TallerIncoming) {
                 "Height 600 -> 900: p=0 and next clock pose; outer footprint grows continuously. Last = canonical incoming."
@@ -455,6 +471,22 @@ fn page_turn_projection_snapshot_spine_edge() {
     let mut snapshots = egui_kittest::SnapshotResults::default();
     snapshots.extend(snapshot_scene(true, false, true, SceneGeometry::SpineEdge));
     snapshots.extend(snapshot_scene(true, true, true, SceneGeometry::SpineEdge));
+    snapshots.unwrap();
+}
+
+#[test]
+fn page_turn_projection_snapshot_fixed_single_spine_four_routes() {
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    for reading_rtl in [false, true] {
+        for forward in [false, true] {
+            snapshots.extend(snapshot_scene(
+                false,
+                reading_rtl,
+                forward,
+                SceneGeometry::FixedSingleSpine,
+            ));
+        }
+    }
     snapshots.unwrap();
 }
 
