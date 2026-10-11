@@ -1,8 +1,10 @@
 # 全文索引の欠落・取り込み失敗対策 (§1.367)
 
-2026-10-11 設計 r1。調査基点: `next-prefs` = `master`、
-`0f6ad9f191d5a5d25f175d9b5f49611afbfc1489`。製品コードの変更・commitは行っていない。
-本書は実装前の設計案であり、独立設計レビュー・実装・検収は未完了。
+2026-10-11 設計 r2。コード調査基点: `next-prefs` = `master`、
+`0f6ad9f191d5a5d25f175d9b5f49611afbfc1489`。利用者がr1を`a0927b26e`でcommitした。
+r1の独立設計レビューはREVISE (P1なし、P2 3件、P3 1件)。r2はその全指摘を反映した設計案。
+本改訂では製品コードの変更・commit・製品ビルド・mIV起動を行っていない。
+r2の独立再レビュー・実装・検収は未完了。§6.1/6.2、§7.4、§8、§10.1を改訂した。
 
 ## 1. 範囲と守る条件
 
@@ -116,7 +118,7 @@ commitと後続のreloadを事後に一意に識別できる情報は無い。
 | .managed.json公開 | `managed_directory.rs:51,205` save_managed_paths / register_file_as_managed。同じatomic_writeを使う。segment open_write経由なら`:286`でOpenWriteError (path付き) に包む | 単独の可能性はあるが、通常のsegment登録失敗なら今回と表示が異なる。meta登録済みならcommit時の再登録はno-op |
 | segment生成・delete bitsetの書込/flush/sync | prepare_commitのworker joinがworker errorを返す。`mmap_directory/mod.rs:334` SafeFileWriter::terminate_refのflush/sync_dataも生IO。schedule_commitはpurge_deletesのerrorを返す | commit errorの候補。segment open失敗はOpenRead/OpenWriteError、書込み終端の生IOは排除できない |
 | GCによるsegment削除 | `managed_directory.rs:164`でdelete失敗をfailed_to_delete_filesへ収集。Windowsのmmap削除失敗は想定済み。`segment_updater.rs:452`のGC Resultも無視する | **この削除失敗そのものが今回のapply errorを返す経路ではない**。GC内.managed公開errorもcommitでは無視される |
-| merge | `segment_updater.rs:659`でend_merge後にsave_metas。mergeは別worker/Resultで、commitは全merge完了を待たない | meta置換と同じ失敗はmergeでも起こり得るが、通常のmerge単体errorが今回のapply errorへ直結する根拠は無い |
+| merge | `segment_updater.rs:666`でend_mergeのtask内からsave_metas。mergeは別worker/Resultで、commitは全merge完了を待たない。`:610`の自動mergeはFutureResultをdropする | 今回のapply errorへの直結は未証明だが、**mergeの最終書込・公開失敗はdispatcherのjob Resultでは拾えない**。§6.1のper-writer通知hookで共通出口へ接続する |
 | 明示reader reload | `src/fts_index.rs:451`→`reader/mod.rs:241,287`。`:202`でMETA_LOCK、load_metas、segment reader open | dispatcherからは返る。ファイルopen/lockの拒否なら通常はpath/lock付きerror。内部での生IO可能性はphase計装で切り分ける |
 | watcher自身のopen/reload | `mmap_directory/file_watcher.rs:50,83`で500msごとFile::open→checksum。失敗はloop内で処理。`reader/mod.rs:82` callbackのreload失敗もlogだけ | **watcher error自身はapplyへ返らない**。間接的な共有妨害の有無は下記 |
 
@@ -240,8 +242,9 @@ IO errorを文字列だけへ変換せずraw codeを保持する。persist error
 
 1. 共通failure reporterをmanagerがdispatcher/runtimeの開始前に用意する。
    正本metaと同じ通知viewを参照し、独立したrecovery state/workerは持たない。
-   Tantivy書込み/reload errorは**dispatcherがreply送信前に**報告する。
+   dispatcher jobのTantivy書込み/reload errorは**dispatcherがreply送信前に**報告する。
    Batch/Commit/favorite purge/path-range purgeの全jobを通す。
+   jobと独立した自動mergeの最終書込・公開errorは§6.1のhookから同じreporterへ渡す。
    session.apply後のSQLite errorも同じreporterへ渡す。
    Full・watcher upsert/remove/fallback・sidecarでローカルlogだけへ戻さず、同じ出口を使う。
    メタ抽出で特定1ファイルを読めない場合のskip、明示cancelは全索引破損と混同しない。
@@ -271,6 +274,67 @@ Tantivyを共有するので再構築予約はfavorite単位ではなく索引�
 既存cleanupも同じ対象である。失敗時に新たなworker再起動/rollback、writer poisonの解除、
 全windowのモーダル化は追加しない。稀な書込failure後の途中stateは次回作り直しで解消する。
 既存の監視・検索・手動再確認を一律停止する機能制限は採用していない。
+
+### 6.1 自動merge・非同期save_metasの最終失敗
+
+自動mergeは`segment_updater.rs:610`で`drop(self.start_merge(...))`する。
+`start_merge`のmerge workerは`:550`で`end_merge`のResultをFutureへ送るだけであり、
+`:666`のsave_metas最終失敗もこのResultへ入る。dispatcherのcommit Resultと別なので、
+callerの存在や次のcommitを待つ通知では漏れる。
+
+vendor patchに**IndexWriterごとの最終merge failure hook**を用意し、mIVはraw writerを
+dispatcherへ渡す前に同じ共通reporterを登録する。process-global callbackは使わない。
+`start_merge`のworkerが返すmerge/writeまたはend_merge/save_metasの最終Errを、
+Futureへ送る前・そのconsumerの有無に関係なくhookへ1回報告する。
+既存のpersist最大4回を使い切ったerrorと、persist以外の書込errorを含める。
+merge候補が開始前に無効になっただけの`segment_manager.start_merge`失敗は書込失敗として扱わない。
+同期commit/save_metasはdispatcherから報告し、このhookと二重報告しない。
+
+hookはmergeまたは`end_merge` (内部のtask.waitを含む) が**戻った後**に呼ぶ。
+atomic_write内、ManagedDirectoryの登録lock内、segment updaterのtask内でDB/reportingを呼ばない。
+Directory/segment管理lockを解放したterminal Result境界から、共通reporterが
+log→durable request→短い通知viewへ進む。worker上の処理でありUIのDB待ちを増やさない。
+reporter内部もDB lockとview lockを同時保持せず、writer/merge完了を待たない。
+hookの保管lockはclone取得直後に解放し、callback実行中に保持しない。
+
+callbackはmetaと通知viewだけを保持し、Index/FtsIndex/IndexWriter/dispatcherやjoin handleを
+捕まえない。writer/merge jobの寿命に沿って利用でき、終了後のfailureも§6のfinalizer方針へ進む。
+通常UIを終了後の通知のために延命しない。merge再試行、次commit待ち、rollback/resume、
+別のfailure workerや回復queueは追加しない。
+
+**通常のmmap segmentのGC削除拒否はhookの対象外。**
+`managed_directory.rs:164`のfailed_to_delete_filesは使用中segmentの通常の回収保留であり、
+merge/writeまたはend_merge/save_metasのterminal Errとは別である。
+hookはGCのfailed_to_delete_filesの件数や通常GC logへ反応しない。
+§5.2のatomic診断はmerge originも記録し、最終errorの通知経路はこのhookが担当する。
+
+### 6.2 名前/コンテナ索引・類似索引の対応範囲
+
+同型経路をコードで棚卸しした。名前索引は`search_index.db`単独であり、FTS reporterの
+`fts_meta.db` markerでは復旧しない。本件のscopeを名前索引の全書込処理へ広げず、
+**共通UIのFull結果表示だけを今回合わせ、名前索引の通知/再構築接続は別件へ引き継ぐ**。
+FTS対策で名前索引も全て閉じたとは記録しない。
+
+| 名前索引の入口/出口 | 現行コードと問題 | 今回のリリースでの扱い |
+| --- | --- | --- |
+| initial Full、手動Full ([今すぐ確認])、watcher overflow Full | `name_index_supervisor.rs:429,327,351`→`:443` run_full_scan。`:513`はFailedでもinitial_scan_done=true、last_full_scanにはtyped outcomeを残す | **表示を修正する**。`favorites_editor.rs:814`が既存NameFullScanOutcomeを渡し、Failed/Cancelledを作成完了の「監視中」と表示しない。処理開始/終了というinitial_scan_doneの役割は保つ |
+| Fullのprepare_full_scan/child upsert/prune失敗 | `name_index_supervisor.rs:468`と`name_bulk_indexer.rs:224,251`。BulkSummary.had_errorにはFS観測失敗とDB書込失敗が混在し、Full outcomeはFailed | **別件**。今回は上行の表示を直すだけ。DB書込failureのlog+通知+名前索引marker接続は別backlog。全had_errorをDB破損とみなさない |
+| Full成功後の完走印write失敗 | `name_index_supervisor.rs:553` record_complete_scan失敗はlogのみ、次回Fullで再確認される | **別件**の通知棚卸しへ含める。本文書ではrebuildが必要と機械的に決めない |
+| watcherでmissing root/ancestor/subtreeの削除 | `name_index_supervisor.rs:665,668,689,725`のdelete_subtree失敗はlogのみ。apply側`:636`はupdates_appliedを増やす | **別件**。名前索引の共通failure出口と成功件数の訂正を引き継ぐ |
+| watcherのparent refresh、subtree upsert、post-scan prune | `name_index_supervisor.rs:874,973,790`の書込。FS観測失敗/DB失敗はlogやErroredへ進み、通知/markerへは揃っていない | **別件**。read不能とDB書込失敗を区別し、既存の不完全観測時prune抑止を維持して対応する |
+| OFF/削除/root変更時のclear | `name_index_manager.rs:143`はclear失敗で`:145`のrequest_rebuild_on_next_startを呼ぶ | **既存対応を維持**。今回FTS markerへ置換しない。名前索引の既存clear-failure回帰を再利用する |
+
+名前索引の別件は既存`SearchIndexDb::request_rebuild_on_next_start` (`search_index_db.rs:472`) と
+次回writable openの`rebuild_names_if_requested` (`:944`) を使う方針で引き継ぐ。
+新しいretry/途中state保持を要求しない。marker設定や回復そのものの失敗は既定のlog+通知で閉じる。
+短いbacklog起案文を`target/I-1367-design-r2-msg.txt`に載せる。番号付けとリリース優先度は
+管理担当の別backlog採録時に決める。本件のFTS修正の受入条件へ名前索引の全failure対応を混ぜない。
+
+類似索引はSQLite正本から`similar_search_array::load_or_rebuild` / `rebuild_from_sqlite`
+(`src/similar_search_array.rs:166,195`)で派生検索配列を再生成できる。
+お気に入りUIも`favorites_editor.rs:1329,1344`でFailed/Degradedを表示する。
+FTSの「inventory reset前にTantivyを破棄した」構造とは異なるため、SQLite正本の破棄や
+FTS rebuild順序を機械的に適用しない。今回の変更対象に含めない。
 
 ## 7. 起動時整合点検: 起動待ちへ入れない
 
@@ -331,13 +395,29 @@ ownership cleanup 186.2317ms (840,461行) が別threadで完了した記録が�
 - `skip_offline_change_scan`を使う正常利用者へ新しいFullを強制しない。
   異常検出時だけ既存pendingの規則へ進む。点検のためにINDEX_VERSIONを上げない。
 
-実装時にこのworkerの`integrity_check_ms`、owner_rows、not_ok_rows、segments、live_docsを計装する。
-normal pathのIndexerInit/result-send/overlay解除と、metadata supervisor開始時間のA/Bを、
-同条件のcold/warm・skip ON/OFFで比較する。Rustのコピーfixture試験を先に行い、
-live起動計測が必要なら隔離portableの承認済みsuiteで行う。
-**起動遅延が見える場合、利用者条件を優先し点検を見送る**。
-新たな起動barrier、全件照会、index migrationを足して無理に残さない。
-このr1で製品起動時間への無影響を検証済みとはしない。
+### 7.4 起動点検の明示的な採用条件 (未達なら見送り)
+
+**A/B計測で起動を遅くしないと判断できることが、点検を製品へ採用する条件。**
+既存workerを使うというコード確認やFailed=0のmicrobenchmarkだけでは採用しない。
+比較Aは点検なし、Bは点検あり。両者で§5/§6/§8の修正・build条件・fixtureを同じにし、
+点検の差だけを測る。以下を全て含む:
+
+- cold/warm、skip_offline_change_scan ON/OFF。
+- 84万行以上のコピーfixtureでFailed=0、少数、大量 (Failedが大半) の各状態。
+  正常な両ストアの対応を作り、点検による異常再構築の費用と正常起動の追加費用を混同しない。
+- idleとI/O競合。I/O競合は使い捨てfixture側への再現可能な背景read/write負荷で作り、
+  cache状態・負荷条件・観測の順番を記録する。通常profileのDBを試験に使わない。
+- IndexerInit/result-send、overlay解除/UI-ready、Ctrl+G準備完了、metadata supervisor開始の
+  経過時間と分布。worker間のCPU/I/O競合による遅延も対象にする。
+  `integrity_check_ms`、owner_rows/not_ok_rows、segments/live_docsも記録する。
+
+Rustのコピーfixture計測を先に行う。live起動A/Bは隔離portableの承認済みsuite、または
+利用者の手動実施の証拠を使う。複数回・順序を交互にした比較でばらつきと測定分解能を記録し、
+再現性のある起動遅延が無いことを確認する。許容遅延を勝手に何msと設定しない。
+**いずれかの条件で悪化した場合、または計測未実施/ばらつきで判断できない場合は、
+このリリースで起動点検を採用しない。** §5/§6/§8の修正と文書訂正は点検なしでも進める。
+起動barrier、全件照会、新index/migrationを足して無理に残さない。
+本r2は計画の改訂であり、A/B実施・起動無影響の証明・点検の採用を主張しない。
 
 ## 8. 再構築順序を1つにする
 
@@ -346,11 +426,15 @@ runtimeでのrequest (markerのみ) とstartupでの実行 (inventory reset+wipe
 `FtsIndex::open_at`単体が勝手に旧索引を破棄する契約を廃止する。
 
 1. SQLite open/migration。meta欠落+Tantivy残存、既存pendingも現在の検出を保つ。
-2. Tantivyを**非破壊でprobe**し、compatibleをそのまま再利用するかmissing/staleを返す。
-   probeのread errorはerrorであってmissingではない。read不能な保存DBを勝手に消さない。
+2. **SQLiteのdurable pendingがある場合は、旧Tantivyをprobe/open/parseせず手順3へ直行する。**
+   meta.jsonや.managed.jsonが読めない/壊れていても、その成功をwipeの前提にしない。
+   pendingが無い場合だけTantivyを非破壊でprobeし、compatibleをそのまま再利用するか
+   missing/staleを返す。そのprobeのread/parse errorはerrorであってmissingではない。
+   読めない保存SQLite DBを勝手に消さない。pendingの読取失敗も「pending無し」と扱わない。
 3. 作り直しが必要ならSQLite transactionでfiles reset、scanned_once clear、pending=1を一括commit。
    既存pending (旧実装がfilesをまだ消していない場合も含む) も必ずこの手順を通す。
-4. probeが持つ旧Index/directory handleをdropしてからTantivy dirをwipe。
+4. pending無しのprobeが持つ旧Index/directory handleがあればdropしてからTantivy dirをwipe。
+   pending有りでは旧索引を開くhandleを初めから作らない。
    NotFound以外のremove errorは中止する。残骸へcreateして続行しない。
 5. 新しいdirectory/index/readerをcreate/open。成功後だけpending clear。
 6. 通常のmanager worker cleanup/reconciliation→supervisor spawnへ渡す。
@@ -378,7 +462,8 @@ wipe/create/pending clearの失敗はlog+通知で終え、markerを残す既存
   同じ過大な復旧保証と現在のdispatcher所有に合わせる。
 - `async-architecture.md`のmetadata worker表: 現在のdispatcherとsupervisor内の逐次applyへ訂正。
 - お気に入り編集の説明/仕様/検索マニュアル:
-  監視開始とFull成功を区別し、再構築予約の通知・状態表示を説明する。
+  FTSと名前索引の両方で監視開始とFull成功を区別し、FTS再構築予約の通知・状態表示を説明する。
+  名前索引のDB書込failure通知/再構築は§6.2の別件が未実装だと明記し、修正済み扱いにしない。
 - §1.367へ本設計と検証結果をリンクし、原事故の原因未特定を残す。
   夜間の追加失敗を、原事故が同じ原因だったという記録へ書き換えない。
 
@@ -391,20 +476,33 @@ wipe/create/pending clearの失敗はlog+通知で終え、markerを残す既存
 
 設計owner/実装owner/独立reviewerはAGENTS.mdの分担で手配する。
 この調査はdesigner/investigatorのbounded handoffで、追加のcoordination teamは作っていない。
-重要なstartup/runtime所有境界とatomic例外は実装前の独立レビュー対象。
+重要なstartup/runtime所有境界、非同期merge hookの寿命/lock境界とatomic例外は
+実装前の独立レビュー対象。r2ではr1のREVISEを受けてこれらの設計を改訂し、再レビューへ渡す。
 
 ### 10.1 必須の回帰
 
 1. atomic persist: 削除共有なしhandleでos5、短時間解放後に成功、永久拒否で有界error・旧meta不変。
    write/sync等の他段errorは再試行しない。非Windows/正常系は単発。meta/.managedを区別するlog。
+   **実際にpatched Tantivyをリンクしたon-disk E2Eを必須にする。** 初回commitで旧文書群を作り、
+   次のcommitに新規追加・既存更新(delete+add)・明示削除・無変更文書を混在させる。
+   meta.jsonのpersist直前hookで削除共有なしhandleを開き、retry予算内に解放する。
+   上位commitを1回だけ呼んで成功を得る。全writer/readerをdropして再openし、
+   生存path集合、文書内容、削除結果、重複なしを期待集合と照合する。
+   atomic byte一致だけやstandaloneのpersist模倣では代用しない。
 2. commit/reload/SQLite delete/upsert各failure注入:
    commit+reload失敗で新規Okを公開しない。既存Ok + Tantivy delete成功 + reload失敗の形を作り、
    通知/pendingと次回再構築で復旧。一般のcommit再試行や自動Fullループが無いこと。
 3. Full initial/manual/overflow/watch回復、watcher upsert/remove/fallback、sidecarから
    同じfailure出口へ到達するhandler-level coverage。cancelや1ファイルのbuild failureは区別する。
    replyを放棄したcaller、finalizer commit、両purgeのerrorでもlog/pendingを残す。
+   自動mergeを実際に発生させ、そのmergeのmeta公開persistへ恒久妨害を注入する。
+   Future consumerを持たず後続commitも呼ばない条件で、最大4 attempts後の最終Errが
+   共通reporterへ1回届き、通知+durable pendingが残ること。DB/view/Directory lockの
+   reentrancyやArc cycleが無いこと。通常mmap snapshot保持中のGC削除拒否では通知/pending無し。
 4. UI: Failed Fullを「初回作成完了」にしない。trayでtoastを見逃しても編集画面にpending表示。
    正常完走と正常監視のsnapshotは維持。UIがDBを直接読まない。
+   同じ表示入口を使う名前索引も既存NameFullScanOutcome::Failed/Cancelledを渡すhandler/snapshot回帰。
+   完走・省略・再Full開始の表示を維持し、FTS markerを名前索引へ適用しない。
 5. startup count: 840k対399相当、全空、正常一致、Failed混在、orphan、delete済segmentのalive数。
    countは全files、Partial Failed index使用と既存owner covering scanをEXPLAINで固定。
    aggregateへ余分な全件scan/Vecを入れない。cleanup前のsnapshotを使用する。
@@ -413,10 +511,16 @@ wipe/create/pending clearの失敗はlog+通知で終え、markerを残す既存
    destructive-operation hook直前にfiles=0/scanned_once=0/pending=1がdurableであること。
    中断を各checkpointで注入し再openで完走。wipe拒否でcreate/openしない。
    最終create/open失敗とpending clear失敗も既存markerを保持する。
+   **pending + 読めない/壊れた旧meta.jsonまたは.managed.json**でprobeが0回、reset+pending確定→
+   wipe/createへ直接進む回帰を追加する。解析不能fixtureとprobeが呼ばれれば失敗するhookを使う。
+   file-read拒否の実handle試験では、wipeまで恒久妨害する条件とprobe不要の条件を区別する。
+   pending無しの同じread/parse errorはmissing扱いにせず、非破壊でerrorを返すこと。
 7. user data: tags/ratings/bookmarks等の別DB fixtureをhash比較し変更なし。
    正常favorite ownership cleanup・root変更・OFF→ON・skip印・pause/cancel/shutdownを維持。
 8. cost: 84万行以上のコピーfixtureでSQL plan/時間とRust worker追加時間を記録。
-   UI-ready/result-sendへcompletion barrierを入れない。起動A/Bが悪化なら§7点検を落とす。
+   UI-ready/result-sendへcompletion barrierを入れない。
+   **§7.4のcold/warm・skip ON/OFF・Failed大量・I/O競合を含むA/Bを点検の採用gateとする。**
+   未計測/判断不能/悪化なら点検をこのリリースから落とす。
 
 既存回帰は`ingest_worker::reader_reload_failure_prevents_sqlite_publication`、
 `sqlite_failure_is_reported_and_allows_later_success`、
@@ -431,7 +535,7 @@ missing-meta/wipe-retry/migration系を拡張する。
 `search_metadata_e2e`を先に実行。UI変更のsnapshotとglyph lintを実行し、
 共有writer/startup変更なので最終`scripts/test-full.ps1`、fmt/check、`scripts/build-dev.ps1`まで担当する。
 独立reviewerは同じ結果を再実行せず証拠を確認し、残る重要経路を追加確認する。
-本r1は設計のみのため製品test/build gateの成功や利用者確認用binaryを成果として主張しない。
+本r2は設計のみのため製品test/build gateの成功や利用者確認用binaryを成果として主張しない。
 
 liveの承認をこの調査から推定しない。実装後の大規模再取込/起動A/Bは、別途具体的なscenario・時間・
 desktop入力・使い捨てportable範囲を提示して承認を得るか、利用者自身の手動確認へ渡す。
