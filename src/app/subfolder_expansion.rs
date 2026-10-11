@@ -2709,7 +2709,7 @@ impl App {
             );
         }
         if let Some(&idx) = self.visible_indices.first() {
-            self.selected = Some(idx);
+            self.move_grid_cursor(Some(idx));
             self.scroll_to_selected = true;
         }
         if perf_on {
