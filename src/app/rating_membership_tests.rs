@@ -1195,7 +1195,7 @@ fn rating_grid_undo_returns_f2_item_and_redo_excludes_it_in_both_orders() {
         } else {
             2
         };
-        app.move_grid_cursor(Some(1));
+        app.move_grid_cursor(Some(1), crate::app::GridCursorIntent::Automatic);
         press_grid_key(&mut app, egui::Key::F2, egui::Modifiers::NONE);
         assert_eq!(app.selected, Some(next));
         assert_eq!(anchor(&app), Some(next));
@@ -1225,7 +1225,7 @@ fn rating_grid_undo_manual_key_choice_before_undo_or_redo_wins_even_at_edge() {
                 app.settings.grid_view_mode = view;
                 app.settings.grid_cols = 1;
                 app.settings.grid_cursor_wrap = false;
-                app.move_grid_cursor(Some(1));
+                app.move_grid_cursor(Some(1), crate::app::GridCursorIntent::Automatic);
                 assert!(app.set_rating(1, 4));
                 if redo {
                     app.apply_meta_undo();
@@ -1287,7 +1287,7 @@ pub(super) fn rating_grid_history_manual_input_case(
     app.settings.grid_view_mode = view;
     app.settings.grid_cols = 1;
     app.settings.grid_cursor_wrap = false;
-    app.move_grid_cursor(Some(1));
+    app.move_grid_cursor(Some(1), crate::app::GridCursorIntent::Automatic);
     assert!(app.set_rating(1, 4));
     if redo {
         app.apply_meta_undo();
@@ -1315,7 +1315,7 @@ fn rating_grid_undo_hidden_origin_keeps_cursor_and_redo_visible_origin_rebases_i
         app.fullscreen_idx = None;
         app.settings.grid_view_mode = view;
         app.settings.rating_filter[4] = true;
-        app.move_grid_cursor(Some(1));
+        app.move_grid_cursor(Some(1), crate::app::GridCursorIntent::Automatic);
         assert!(app.set_rating(1, 4));
         // Settings projection (not a manual cursor move) hides the before-value.
         app.settings.rating_filter = [false, false, false, false, true, false];
@@ -1401,7 +1401,7 @@ fn rating_grid_undo_held_ready_restores_reindexed_item_once_or_keeps_manual_choi
 
 /// Hold the real Rating Undo's Ready after the last reader leaves and its slot
 /// is removed. Shared by keyboard and pad handler regressions; no native input.
-pub(super) fn rating_undo_grid_input_case(
+pub(crate) fn rating_undo_grid_input_case(
     view: crate::settings::GridViewMode,
     selected: Option<usize>,
     expected: Option<usize>,
@@ -1434,7 +1434,7 @@ pub(super) fn rating_undo_grid_input_case(
     app.poll_rating_view();
     app.finish_page_identity_preparation_for_test();
     assert!(!app.items.contains(&all[0]), "origin slot is gone");
-    app.move_grid_cursor(selected);
+    app.move_grid_cursor(selected, crate::app::GridCursorIntent::Automatic);
     app.apply_meta_undo();
     let intent = app
         .rating_view_pending
@@ -1536,7 +1536,7 @@ fn rating_undo_grid_keys_cancel_held_restore_on_moves_edges_and_empty_sets() {
     }
 }
 
-fn press_grid_key(app: &mut App, key: egui::Key, modifiers: egui::Modifiers) {
+pub(super) fn press_grid_key(app: &mut App, key: egui::Key, modifiers: egui::Modifiers) {
     let ctx = egui::Context::default();
     ctx.begin_pass(egui::RawInput {
         modifiers,
@@ -1575,7 +1575,7 @@ fn rating_undo_grid_unadmitted_keys_and_automatic_cursor_moves_keep_held_restore
             app.search_has_focus = false;
         });
         rating_undo_grid_input_case(view, Some(1), Some(2), false, |app| {
-            app.move_grid_cursor(Some(2));
+            app.move_grid_cursor(Some(2), crate::app::GridCursorIntent::Automatic);
         });
         rating_undo_grid_input_case(view, Some(1), Some(2), true, |app| {
             press_grid_key(app, egui::Key::ArrowRight, egui::Modifiers::SHIFT);
@@ -2460,6 +2460,47 @@ fn rating_deferred_warm_pdf_verification_keeps_chosen_endpoint_after_close_or_re
         assert!(app.fs_nav_after_pdf_enumerate.is_none());
         if operation == "redo" {
             assert_eq!(app.rating_db.as_ref().unwrap().get(&key(&app, 1)), 5);
+        }
+    }
+}
+
+#[test]
+fn rating_grid_explicit_scope_and_search_acceptance_cancel_return_but_auto_keeps_it() {
+    use crate::settings::GridViewMode;
+    for view in [GridViewMode::Thumbnail, GridViewMode::Details] {
+        for action in [
+            "scope",
+            "search",
+            "explicit-noop",
+            "automatic",
+            "automatic-search",
+        ] {
+            let mut app = images(&["a", "b", "c"]);
+            app.fullscreen_idx = None;
+            app.settings.grid_view_mode = view;
+            app.move_grid_cursor(Some(1), GridCursorIntent::Automatic);
+            assert!(app.set_rating(1, 4));
+            let current = app.selected;
+            match action {
+                "scope" => app.retire_main_list_requests_for_surface_switch(),
+                "search" => app.execute_search(&egui::Context::default()),
+                "explicit-noop" => app.move_grid_cursor(current, GridCursorIntent::ExplicitKeep),
+                "automatic" => app.move_grid_cursor(Some(2), GridCursorIntent::Automatic),
+                "automatic-search" => {
+                    app.reexecute_search_for_installed_list(&egui::Context::default())
+                }
+                _ => unreachable!(),
+            }
+            app.apply_meta_undo();
+            assert_eq!(
+                app.selected,
+                Some(if matches!(action, "automatic" | "automatic-search") {
+                    1
+                } else {
+                    2
+                }),
+                "{action} {view:?}"
+            );
         }
     }
 }

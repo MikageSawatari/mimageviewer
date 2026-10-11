@@ -2195,7 +2195,7 @@ impl App {
                 return;
             }
         }
-        self.move_grid_cursor(Some(idx));
+        self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
         self.fullscreen_idx = Some(idx);
         // 新しく開くページは分割方向の最初の半分から。ここで残すと前のページの
         // 「右半分を見ていた」が別のページへ引き継がれる。
@@ -3429,7 +3429,10 @@ impl App {
             // Appended target removal leaves every basis index stable. Retain its
             // metadata/edit caches and invalidate only generation-bound main work.
             self.bump_items_generation();
-            self.move_grid_cursor(snapshot.saved_selected);
+            self.move_grid_cursor(
+                snapshot.saved_selected,
+                crate::app::GridCursorIntent::Automatic,
+            );
             self.viewer_navigation_caches.invalidate();
             // The generation setter retires requests and owned CPU images together.
             let basis_len = self.items.len();

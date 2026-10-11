@@ -5,8 +5,8 @@ use eframe::egui;
 #[cfg(windows)]
 use super::ViewerPresentation;
 use super::{
-    App, FolderNavMode, GridContainerOpenMode, GridCursorDirection, GridScrollIntent,
-    grid_cursor_nav_target_pos,
+    App, FolderNavMode, GridContainerOpenMode, GridCursorDirection, GridCursorMove,
+    GridScrollIntent, grid_cursor_nav_target_pos,
 };
 use crate::adjustment::{POST_FILTER_GROUPS, PostFilter};
 use crate::folder_pane::{FolderPaneCommand, FolderPaneTreeKey};
@@ -6695,17 +6695,22 @@ impl App {
         edge: GridSelectionEdge,
         source: &'static str,
     ) {
-        self.cancel_rating_membership_restore();
         let target = match edge {
             GridSelectionEdge::First => self.current_grid_order().first(),
             GridSelectionEdge::Last => self.current_grid_order().last(),
         }
         .copied();
-        let Some(target) = target else {
+        self.move_grid_cursor(
+            target,
+            if target.is_some() {
+                crate::app::GridCursorIntent::Explicit(GridCursorMove::Move)
+            } else {
+                crate::app::GridCursorIntent::ExplicitKeep
+            },
+        );
+        if target.is_none() {
             return;
-        };
-
-        self.move_grid_cursor(Some(target));
+        }
         self.scroll_to_selected = true;
         self.update_last_selected_image();
         self.bump_input_seq(
@@ -7045,7 +7050,7 @@ impl App {
         }
         // Accepted manual input wins over a pending Undo landing, including
         // empty sets and edge no-ops. Automatic moves do not pass this boundary.
-        self.cancel_rating_membership_restore();
+        self.move_grid_cursor(self.selected, crate::app::GridCursorIntent::ExplicitKeep);
         let display_order = self.current_grid_order().to_vec();
         let vi_len = display_order.len();
         if vi_len == 0 {
@@ -7075,7 +7080,10 @@ impl App {
             return;
         };
         if self.selected != Some(new_sel) {
-            self.move_grid_cursor(Some(new_sel));
+            self.move_grid_cursor(
+                Some(new_sel),
+                crate::app::GridCursorIntent::Explicit(GridCursorMove::Move),
+            );
             self.scroll_to_selected = true;
             self.update_last_selected_image();
             self.bump_input_seq("gamepad_grid_nav", Some(&format!("sel={new_sel}")));
@@ -8644,6 +8652,67 @@ mod tests {
                 app.stack_return_state = None;
                 app.stack_view = None;
             });
+        }
+    }
+
+    #[test]
+    fn rating_grid_ring_origin_is_cancelled_by_home_before_picker_commit_in_both_views() {
+        use super::*;
+        let _input_guard = crate::key_input::lock_test_input();
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        for view in [GridViewMode::Thumbnail, GridViewMode::Details] {
+            let mut app = crate::app::setup_app_for_test();
+            let paths = [app.tmp.path().join("a.png"), app.tmp.path().join("b.png")];
+            for path in &paths {
+                image::RgbaImage::from_pixel(4, 4, image::Rgba([90, 100, 110, 255]))
+                    .save(path)
+                    .unwrap();
+            }
+            app.items = paths.iter().cloned().map(GridItem::Image).collect();
+            app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending; 2];
+            app.visible_indices = vec![0, 1];
+            app.details_order = vec![0, 1];
+            app.settings.grid_view_mode = view;
+            app.settings.details_sort_key = crate::settings::DetailsSortKey::Name;
+            app.settings.rating_filter = [false, false, false, true, false, false];
+            app.move_grid_cursor(Some(1), crate::app::GridCursorIntent::Automatic);
+            for idx in 0..2 {
+                let key = app.rating_path_key(idx).unwrap();
+                app.rating_db.as_ref().unwrap().set(&key, 3).unwrap();
+                app.rating_cache.insert(idx, 3);
+            }
+            let mut picker = app.build_ring_picker_state(RingShortcutContext::Grid);
+            picker.item_rating = 0;
+            mark_picker_dirty(&mut picker, RingPickerRowId::ItemRating);
+            app.ring_picker = Some(picker.clone());
+            app.preview_picker_item_rating(&picker, 0);
+            assert_eq!(app.selected, Some(1));
+            assert_eq!(app.visible_indices, vec![0, 1]);
+            super::super::rating_membership_tests::press_grid_key(
+                &mut app,
+                egui::Key::Home,
+                egui::Modifiers::NONE,
+            );
+            assert_eq!(app.selected, Some(0));
+            assert!(matches!(
+                app.ring_picker
+                    .as_ref()
+                    .unwrap()
+                    .rating_origin
+                    .as_ref()
+                    .unwrap()
+                    .target,
+                crate::rating_membership::RatingOriginTarget::ValueOnly
+            ));
+            app.commit_ring_picker(&egui::Context::default());
+            assert_eq!(app.visible_indices, vec![0]);
+            app.apply_meta_undo();
+            assert_eq!(app.visible_indices, vec![0, 1]);
+            assert_eq!(app.selected, Some(0));
+            assert_eq!(app.grid_click_selection_anchor.unwrap().index, 0);
+            app.apply_meta_redo();
+            assert_eq!(app.selected, Some(0));
+            assert_eq!(app.grid_click_selection_anchor.unwrap().index, 0);
         }
     }
 

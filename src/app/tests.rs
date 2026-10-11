@@ -50512,7 +50512,7 @@ mod favorite_adjustment_defaults_tests {
 
         // Keep the cursor on surviving A: this tests identity remapping rather
         // than the non-extending first selection of an unselected listing.
-        app.move_grid_cursor(Some(a));
+        app.move_grid_cursor(Some(a), crate::app::GridCursorIntent::Automatic);
         app.grid_click_selection_anchor = Some(crate::app::GridClickSelectionAnchor::new(
             d,
             app.items_generation,

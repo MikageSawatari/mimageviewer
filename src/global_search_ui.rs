@@ -3145,7 +3145,7 @@ impl App {
                 .filter(|&index| self.idx_visible(index))
                 .or_else(|| self.visible_indices.first().copied());
             if let Some(index) = index {
-                self.move_grid_cursor(Some(index));
+                self.move_grid_cursor(Some(index), crate::app::GridCursorIntent::Automatic);
                 self.scroll_to_selected = true;
             }
         }
@@ -3433,7 +3433,7 @@ impl App {
                 .filter(|&idx| self.idx_visible(idx))
                 .or_else(|| self.visible_indices.first().copied());
             if let Some(idx) = resolved {
-                self.move_grid_cursor(Some(idx));
+                self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
                 self.scroll_to_selected = true;
             }
         }
@@ -3616,7 +3616,7 @@ impl App {
                     idx,
                     crate::app::HistoryTrigger::UserChosen,
                 );
-                self.move_grid_cursor(Some(idx));
+                self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
                 self.scroll_to_selected = true;
                 self.update_last_selected_image();
                 return true;
@@ -4106,6 +4106,7 @@ impl App {
             return;
         }
         if filter_changed {
+            self.move_grid_cursor(self.selected, crate::app::GridCursorIntent::ExplicitKeep);
             // ドロップダウン変更は debounce せず即座に再実行する
             // (ユーザーの操作は明示的なので待つ必要がない)
             if !self.global_search.query.trim().is_empty() {
@@ -4127,6 +4128,7 @@ impl App {
     }
 
     pub(crate) fn reset_global_search_for_query_change(&mut self, ctx: &egui::Context) {
+        self.move_grid_cursor(self.selected, crate::app::GridCursorIntent::ExplicitKeep);
         self.global_search.run_sequence = self.global_search.run_sequence.wrapping_add(1);
         self.retire_main_list_requests_for_surface_switch();
         self.global_search.last_change_at = Some(Instant::now());
@@ -4157,7 +4159,7 @@ impl App {
         // 落としてしまい、新クエリで 1000+ hit 時の自動切替が発火しない。
         // 旧クエリ結果から作った items は直後の rebuild で全て無効化されるので、
         // selected / scroll もここで「ユーザー未操作」状態へ戻す。
-        self.move_grid_cursor(None);
+        self.move_grid_cursor(None, crate::app::GridCursorIntent::Automatic);
         self.scroll_offset_y = 0.0;
         // query == last_executed でも debounce → spawn を必ず再走させる。
         // そうしないと、Enter 2 連打で旧検索が cancel されたあと

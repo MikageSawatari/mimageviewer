@@ -5991,6 +5991,113 @@ fn apply_grid_right_drag_start_selection(
     true
 }
 
+impl App {
+    /// Pure selection policy helpers calculate with local copies. Only the live
+    /// cursor owner publishes the result, after invalidating return authority.
+    fn apply_explicit_grid_selection(
+        &mut self,
+        update: impl FnOnce(
+            &mut Option<usize>,
+            &mut Option<GridClickSelectionAnchor>,
+            &mut HashSet<usize>,
+        ),
+    ) {
+        let mut target = self.selected;
+        let mut anchor = self.grid_click_selection_anchor;
+        update(&mut target, &mut anchor, &mut self.checked);
+        let intent = if target == self.selected && anchor == self.grid_click_selection_anchor {
+            crate::app::GridCursorIntent::ExplicitKeep
+        } else {
+            crate::app::GridCursorIntent::Explicit(
+                match anchor.and_then(|anchor| anchor.index_for_generation(self.items_generation)) {
+                    Some(anchor) if Some(anchor) != target => GridCursorMove::Extend { anchor },
+                    _ => GridCursorMove::Move,
+                },
+            )
+        };
+        self.move_grid_cursor(target, intent);
+    }
+
+    fn select_grid_cell(
+        &mut self,
+        idx: usize,
+        ctrl: bool,
+        shift: bool,
+        display_order: &[usize],
+        allow_folders: bool,
+    ) {
+        let mode = self.settings.grid_click_selection_mode;
+        let generation = self.items_generation;
+        // Policy only needs checkability; borrow items separately from the live cursor.
+        let mut target = self.selected;
+        let mut anchor = self.grid_click_selection_anchor;
+        apply_grid_click_selection(
+            mode,
+            &mut target,
+            &mut anchor,
+            generation,
+            &mut self.checked,
+            display_order,
+            &self.items,
+            allow_folders,
+            idx,
+            ctrl,
+            shift,
+        );
+        let movement = if shift {
+            GridCursorMove::Extend {
+                anchor: anchor
+                    .and_then(|anchor| anchor.index_for_generation(generation))
+                    .unwrap_or(idx),
+            }
+        } else {
+            GridCursorMove::Move
+        };
+        self.move_grid_cursor(target, crate::app::GridCursorIntent::Explicit(movement));
+    }
+
+    fn select_grid_secondary_cell(&mut self, idx: usize) {
+        let mode = self.settings.grid_click_selection_mode;
+        let generation = self.items_generation;
+        self.apply_explicit_grid_selection(|selected, anchor, checked| {
+            apply_grid_secondary_selection(mode, selected, anchor, generation, checked, idx);
+        });
+    }
+
+    fn clear_grid_background_selection(&mut self) {
+        let mode = self.settings.grid_click_selection_mode;
+        self.apply_explicit_grid_selection(|selected, anchor, checked| {
+            clear_grid_selection_for_background_click(mode, selected, anchor, checked);
+        });
+    }
+
+    fn select_grid_right_drag_start(
+        &mut self,
+        mode: &crate::ring_shortcut::RightDragMode,
+        idx: Option<usize>,
+    ) -> bool {
+        let mut target = self.selected;
+        let mut anchor = self.grid_click_selection_anchor;
+        if !apply_grid_right_drag_start_selection(
+            &mut target,
+            &mut anchor,
+            self.items_generation,
+            self.settings
+                .ring_shortcuts
+                .select_grid_item_on_right_drag_start,
+            mode,
+            idx,
+        ) {
+            return false;
+        }
+        self.move_grid_cursor(
+            target,
+            crate::app::GridCursorIntent::Explicit(GridCursorMove::Move),
+        );
+        true
+    }
+}
+
 #[cfg(test)]
 mod grid_right_drag_start_selection_tests {
     use super::*;
@@ -11251,7 +11358,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         // 直近の visible idx にリダイレクト (旧コードは None にクリアしていた)。
         if toolbar_rating_changed {
             self.finish_rating_picker_before_source_adoption();
-            self.cancel_rating_membership_restore();
+            self.move_grid_cursor(self.selected, crate::app::GridCursorIntent::ExplicitKeep);
             // ユーザーによる明示的な filter 操作 → suppression anchor を破棄する
             // (ユーザー意思を尊重して、BS しても以前の filter は復元しない)。
             self.drop_rating_filter_suppression_on_user_edit();
@@ -12700,7 +12807,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
         if rating_changed {
             self.finish_rating_picker_before_source_adoption();
-            self.cancel_rating_membership_restore();
+            self.move_grid_cursor(self.selected, crate::app::GridCursorIntent::ExplicitKeep);
             self.drop_rating_filter_suppression_on_user_edit();
         }
         let color_scope_changed =
@@ -12709,6 +12816,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             self.color_filter.applied_scope_signature = None;
         }
         if facet_changed || facet_name_changed || rating_changed {
+            self.move_grid_cursor(self.selected, crate::app::GridCursorIntent::ExplicitKeep);
             let preserve_place_counts =
                 place_changed && !non_place_facet_changed && !rating_changed;
             let place_counts_cache = preserve_place_counts
@@ -12725,6 +12833,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             }
         }
         if color_changed || color_scope_changed {
+            if color_changed {
+                self.move_grid_cursor(self.selected, crate::app::GridCursorIntent::ExplicitKeep);
+            }
             if self.color_filter.enabled {
                 self.ensure_color_scan_for_current_scope(ctx);
             } else {
@@ -12732,6 +12843,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             }
         }
         if bookmark_filter_changed || reading_history_filter_changed {
+            self.move_grid_cursor(self.selected, crate::app::GridCursorIntent::ExplicitKeep);
             self.rebuild_visible_indices();
         }
     }
@@ -15325,6 +15437,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             self.search_filter_origin_folder = None;
             self.search_has_focus = false;
             self.search_tag_bridge.clear();
+            self.move_grid_cursor(self.selected, crate::app::GridCursorIntent::ExplicitKeep);
             self.cancel_search_pending();
             self.rebuild_visible_indices();
             return;
@@ -15385,6 +15498,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     self.search_filter_origin_folder = None;
                     self.search_has_focus = false;
                     self.search_tag_bridge.clear();
+                    self.move_grid_cursor(
+                        self.selected,
+                        crate::app::GridCursorIntent::ExplicitKeep,
+                    );
                     self.cancel_search_pending();
                     self.rebuild_visible_indices();
                     self.refresh_color_filter_for_scope_change(ctx);
@@ -15437,6 +15554,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     self.search_filter_origin_folder = None;
                     self.search_has_focus = false;
                     self.search_tag_bridge.clear();
+                    self.move_grid_cursor(
+                        self.selected,
+                        crate::app::GridCursorIntent::ExplicitKeep,
+                    );
                     self.cancel_search_pending();
                     self.rebuild_visible_indices();
                     self.refresh_color_filter_for_scope_change(ctx);
@@ -16183,16 +16304,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 .settings
                 .ring_shortcuts
                 .right_drag_mode(crate::ring_shortcut::RightDragContext::Grid);
-            if apply_grid_right_drag_start_selection(
-                &mut self.selected,
-                &mut self.grid_click_selection_anchor,
-                self.items_generation,
-                self.settings
-                    .ring_shortcuts
-                    .select_grid_item_on_right_drag_start,
-                &mode,
-                Some(idx),
-            ) {
+            if self.select_grid_right_drag_start(&mode, Some(idx)) {
                 self.update_last_selected_image();
             }
             match mode {
@@ -16283,26 +16395,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let ctrl = ctx.input(|i| i.modifiers.ctrl);
         let shift = ctx.input(|i| i.modifiers.shift);
         if primary_clicked && !badge_clicked {
-            self.cancel_rating_membership_restore();
             let display_order = if ctrl || shift {
                 self.current_grid_order().to_vec()
             } else {
                 Vec::new()
             };
             let allow_folders = self.subfolder_expansion_available();
-            apply_grid_click_selection(
-                self.settings.grid_click_selection_mode,
-                &mut self.selected,
-                &mut self.grid_click_selection_anchor,
-                self.items_generation,
-                &mut self.checked,
-                &display_order,
-                &self.items,
-                allow_folders,
-                idx,
-                ctrl,
-                shift,
-            );
+            self.select_grid_cell(idx, ctrl, shift, &display_order, allow_folders);
             self.update_last_selected_image();
         }
         // egui remains the owner of whether this release is a click at all. Pairing is grid-local:
@@ -16662,15 +16761,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             && !self.selection_info_bar_contains_pointer(ctx)
             && !self.mouse_ring_context_menu_suppressed(ctx)
         {
-            self.cancel_rating_membership_restore();
-            apply_grid_secondary_selection(
-                self.settings.grid_click_selection_mode,
-                &mut self.selected,
-                &mut self.grid_click_selection_anchor,
-                self.items_generation,
-                &mut self.checked,
-                idx,
-            );
+            self.select_grid_secondary_cell(idx);
             self.update_last_selected_image();
             self.context_menu_idx = Some(self.capture_grid_context_menu_owner(idx));
             self.context_menu_pos = ctx.input(|i| i.pointer.interact_pos().unwrap_or_default());
@@ -16854,17 +16945,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             return None;
         };
         // Keep the released Explorer/Check selection semantics, including assignment None.
-        self.cancel_rating_membership_restore();
         if self.settings.grid_click_selection_mode.normalized() == GridClickSelectionMode::Explorer
         {
             self.folder_pane.set_focus_grid();
         }
-        clear_grid_selection_for_background_click(
-            self.settings.grid_click_selection_mode,
-            &mut self.selected,
-            &mut self.grid_click_selection_anchor,
-            &mut self.checked,
-        );
+        self.clear_grid_background_selection();
         let source = if touch.is_touch_primary(pos, false) {
             if !touch.accepts_grid_tap_release(pos) {
                 self.grid_click_pairing.end_activation();
@@ -17003,15 +17088,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             && idx < self.items.len()
             && !self.items_are_drive_list
         {
-            self.cancel_rating_membership_restore();
-            apply_grid_secondary_selection(
-                self.settings.grid_click_selection_mode,
-                &mut self.selected,
-                &mut self.grid_click_selection_anchor,
-                self.items_generation,
-                &mut self.checked,
-                idx,
-            );
+            self.select_grid_secondary_cell(idx);
             self.update_last_selected_image();
             self.context_menu_idx = Some(self.capture_grid_context_menu_owner(idx));
             self.context_menu_pos = pos;
@@ -26660,7 +26737,7 @@ mod grid_reclick_open_tests {
             let mut harness = rating_selection_harness(view);
             let app = &mut harness.state_mut().app;
             app.fullscreen_idx = None;
-            app.move_grid_cursor(Some(1));
+            app.move_grid_cursor(Some(1), crate::app::GridCursorIntent::Automatic);
             assert!(app.set_rating(1, 2));
             assert_eq!(app.selected, Some(2));
             ctrl_z_rating_origin(app);
@@ -26677,6 +26754,92 @@ mod grid_reclick_open_tests {
     }
 
     #[test]
+    fn rating_grid_right_drag_start_then_center_cancel_keeps_explicit_selection_for_undo_redo() {
+        let _input_guard = crate::key_input::lock_test_input();
+        for view in [GridViewMode::Thumbnail, GridViewMode::Details] {
+            let mut harness = rating_selection_harness(view);
+            let app = &mut harness.state_mut().app;
+            app.fullscreen_idx = None;
+            app.move_grid_cursor(Some(1), crate::app::GridCursorIntent::Automatic);
+            app.settings
+                .ring_shortcuts
+                .select_grid_item_on_right_drag_start = true;
+            app.settings.ring_shortcuts.set_right_drag_mode(
+                crate::ring_shortcut::RightDragContext::Grid,
+                crate::ring_shortcut::RightDragMode::RingShortcut,
+            );
+            assert!(app.set_rating(1, 2));
+            assert_eq!(app.selected, Some(2));
+            let center = cell_rect(0).center();
+            pointer_button(&mut harness, center, egui::PointerButton::Secondary, true);
+            assert_eq!(harness.state().app.selected, Some(0));
+            assert!(harness.state().app.mouse_ring_flick.is_some());
+            // Assert the press boundary itself; a short-tap context menu must
+            // not supply a later cancellation that masks the original defect.
+            let Some(crate::undo_stack::UndoEntry::Rating {
+                origin: Some(origin),
+                ..
+            }) = harness.state().app.meta_undo.peek_undo()
+            else {
+                panic!("rating origin missing");
+            };
+            assert!(matches!(
+                origin.target,
+                crate::rating_membership::RatingOriginTarget::ValueOnly
+            ));
+            // Controlled elapsed time makes release at the center Cancelled,
+            // rather than ShortTap. No sleep or real input is involved.
+            harness
+                .state_mut()
+                .app
+                .mouse_ring_flick
+                .as_mut()
+                .unwrap()
+                .start_time -= crate::ring_shortcut::mouse_flick_menu_delay()
+                + std::time::Duration::from_millis(1);
+            pointer_button(&mut harness, center, egui::PointerButton::Secondary, false);
+            assert!(harness.state().app.context_menu_idx.is_none());
+            assert!(harness.state().app.mouse_ring_flick.is_none());
+            assert_eq!(harness.state().activations, 0);
+            ctrl_z_rating_origin(&mut harness.state_mut().app);
+            assert_eq!(harness.state().app.selected, Some(0));
+            assert_eq!(
+                harness
+                    .state()
+                    .app
+                    .grid_click_selection_anchor
+                    .unwrap()
+                    .index_for_generation(harness.state().app.items_generation)
+                    .unwrap(),
+                0
+            );
+            harness.state_mut().app.apply_meta_redo();
+            assert_eq!(harness.state().app.selected, Some(0));
+        }
+    }
+
+    #[test]
+    fn rating_grid_right_drag_selection_boundary_cancels_held_ready_in_both_views() {
+        for view in [GridViewMode::Thumbnail, GridViewMode::Details] {
+            crate::app::rating_membership_tests::rating_undo_grid_input_case(
+                view,
+                Some(1),
+                Some(0),
+                true,
+                |app| {
+                    app.settings
+                        .ring_shortcuts
+                        .select_grid_item_on_right_drag_start = true;
+                    assert!(app.select_grid_right_drag_start(
+                        &crate::ring_shortcut::RightDragMode::RingShortcut,
+                        Some(0)
+                    ));
+                },
+            );
+        }
+    }
+
+    #[test]
     fn grid_cursor_rating_grid_explicit_click_cancels_later_undo_and_redo_landing() {
         let _input_guard = crate::key_input::lock_test_input();
         for view in [
@@ -26686,7 +26849,7 @@ mod grid_reclick_open_tests {
             let mut harness = rating_selection_harness(view);
             let app = &mut harness.state_mut().app;
             app.fullscreen_idx = None;
-            app.move_grid_cursor(Some(1));
+            app.move_grid_cursor(Some(1), crate::app::GridCursorIntent::Automatic);
             assert!(app.set_rating(1, 2));
             click_cell(&mut harness, 0, egui::Modifiers::NONE);
             ctrl_z_rating_origin(&mut harness.state_mut().app);

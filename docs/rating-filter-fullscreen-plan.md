@@ -238,3 +238,105 @@ idx-onlyの途中編集/Undoが現在のslotへ解釈される誤配送経路が
 - R2指示: リングは所属移動を終端まで保留する案を先に検討し、既存操作を制限せず組合せを減らせるなら優先する。集合ownerの一決定と§1.370 cursor ownerの適用を分ける。まれな失敗の既定方針を維持する。
 - R3指示: 保留は当該ringの評価由来の離脱だけ。独立検索/streamingの新hit・件数を即時採用し現在pageを維持する。二つの回帰条件と終端一決定を定義し、F12の限定構造合意をdetached plan §11へ記録する。
 - Stage 2の範囲決定: 編集は出荷済み終了boundaryの再利用へ限定する。Rating再採用では非rating Undoを落としてrating Undoだけを保持し、Searchは既存clear/cancelを維持する。loaded/global editorやidx-only Undoの新しい保持/remapは行わない。出荷済みSearch streamingのidx-only誤配送は利用者が別途バックログへ記載する。
+
+
+## 明示選択ownerの構造化 (2026-10-11、b06d72f86再レビュー)
+
+入力ごとに取消を追加する方針を撤回する。live contextの§1.370 owner
+`App::move_grid_cursor(target, GridCursorIntent)`では分類を必須にする。
+`Explicit(Move/Extend)`は、そのcontext・現在一覧のrating復帰権限を失効させてから
+cursorとShift起点を適用する。`ExplicitKeep`は受理した端no-op／空一覧／選択を
+維持する操作で、権限だけを失効させ、cursor・有効Shift起点を変更しない。
+`Automatic`は集合ownerの一決定や既存復元を適用し、取消しない。省略できる既定値は作らない。
+
+失効は既存の一つの取消処理に集約し、(1)同owner/listingのUndo/RedoのGrid origin、
+(2)そのownerのlive requestのRestoreOrigin、(3)現在のring pickerが同owner/listingで
+保持するGrid originを扱う。(1)(3)はValueOnlyへ変え、保存済み評価値、Undo/Redo順序、
+ring preview recipe・対象keyを保持する。別context/listing・Viewer履歴originは変更しない。
+Viewer履歴の明示Undoで元画像へ戻る既存仕様と、すでに発行した復帰requestの取消を区別する。
+ringを閉じて初めて履歴へ積む場合にも、先に失効したGrid復帰権限を復活させない。
+Undo/Redo自身はrequestの取消／置換を行い、履歴のGrid復帰権限を手動移動として失効させない。
+
+クリックのpure policyはローカルのselected/anchorコピーで移動先・範囲起点を計算する。
+UIのlive fieldをpolicyへ渡さず、結果を必ず同じownerへExplicitとして渡す。
+checked、scroll、last-selected、dialog/IME/refreshの入力許可条件は既存callerが所有する。
+右ドラッグ開始の選択は設定ONかつ有効mode・対象ありで受理した場合だけExplicitであり、
+中央でドラッグを取消しても選択の明示権限は取り戻さない。mode無効／設定OFFは取消しない。
+
+### 全callerの分類
+
+下表はlive owner、pure cursor transition、および選択helperの全production callerを分類する。
+テストfixtureの初期選択はAutomatic。identity remapとcontextの値交換はnavigationではなく、
+selected／Shift起点を対で転送する既存経路を維持する。
+
+| 分類 | caller／入口 | 適用 |
+| --- | --- | --- |
+| 明示 | app.rs `handle_keyboard`：矢印、Home/End、Page、Shift、custom key | 受理時ExplicitKeep、対象解決後Explicit Move/Extend。端・空も取消 |
+| 明示 | gamepad_input `handle_gamepad_direction_for_grid`：D-pad/左stick | 受理時ExplicitKeep、実移動Explicit。拒否入力は取消しない |
+| 明示 | gamepad_input `move_grid_selection_to_edge`：ring/gesture等のGridMoveFirst/Last | 空も含めExplicit |
+| 明示 | ui_main `select_grid_cell`、`select_grid_secondary_cell`、`clear_grid_background_selection` | primary/touch、secondary、short-tap context menu、background。pure policyの結果をExplicit適用 |
+| 明示 | ui_main `select_grid_right_drag_start` | 右ドラッグ開始時選択の受理後Explicit |
+| 明示 | app.rs `clear_quick_folder_slots` | 「場所を忘れる」の先頭選択Explicit |
+| 明示 | ui_main toolbar rating/facet/name/place、bookmark/history filter、local searchのclear／scope変更 | ExplicitKeep後、既存set producer／可視補正はAutomatic |
+| 明示 | app.rs `execute_search`、global_search_ui `reset_global_search_for_query_change` | 検索送信／query変更の受理はExplicitKeep。後着Batch/Readyでは取消しない |
+| 既存scope境界 | Tag/Favorite検索送信・source/context切替・manual reader open/close/navigation | 既存request retirement／編集clear／reader取消を維持。結果のcursor landingはAutomatic |
+| 自動 | rating_membership_ops `apply_rating_membership_cursor` | rating next/previous、Empty、Undo/Redo RestoreOriginの決定一回。取消しない |
+| 自動 | app.rs ZIP refresh、drive list install、playback-test completion、history hydrate、Rating prepared open/position、items install/reset、ZIP親復帰、history/resume/stack restore | `move_grid_cursor`へAutomaticを明記 |
+| 自動 | app.rs fullscreen/open/navigation completion、deleted cursor replacement、bookmark-list install/return、viewer/grid sync、detached materialize/close、fullscreen close | Automatic。manual intentは受理境界で扱い、後着landingで再取消しない |
+| 自動 | app.rs `select_item_after_load`、`redirect_selected_to_visible`、`ensure_selected_visible_or_first`、`poll_search` | 復元／operation output／一般可視補正／検索採用。前優先の一般補正は変更しない |
+| 自動 | collection_grid source removal/prepared install；snapshot_ops restore/list return/fullscreen completion；smart_folder prepared root；startup_ops requested-file completion；subfolder_expansion prepared install | Automatic |
+| 自動 | filename_stack_ui stack restore/items swap；global_search_ui prepare/restore/drill landing/query array reset；remote_ipc/ui local-viewer復帰；ui_fullscreen continuous seek/spread normalize/slideshow | Automatic |
+| 自動・値転送 | viewer_context_registry context create/split/main-grid復元、detached bundle初期選択のpure transition | live復元はAutomatic、未mount bundleの初期値はpure transition。swap内では新しいpublication／navigationをしない |
+| identity remap | app.rs削除reindex/anchor世代失効、global_search_ui paired remap、rating Keep paired remap、snapshot items exchange、smart_folder saved root remap/削除置換/root adopt | 移動分類の対象外。残存identityのselectedとShift起点を対で保持 |
+| 存在しない入口 | type-aheadによる直接cursor選択 | 現コードには該当する独立選択handlerなし。local検索入力／送信は上記検索境界。新設時はExplicit必須 |
+
+live selected／Shift起点のmutable borrow（self/app・空白差も検出）とselfへの直接代入が
+cursor owner以外の新しい入力helperに入ると失敗するsource regressionを加える。既存の
+identity remap／generation失効／非live owner／pure policyのテストfixtureだけをfile/function名で
+限定例外として列挙する。型の必須引数は新callerの分類省略をコンパイルで防ぐ。Automaticの
+誤分類まで機械的に証明するとは主張せず、この表とhandler回帰でレビューする。
+
+追加回帰：サムネイル／Detailsそれぞれで、Grid Bのring評価preview→HomeでA→ring終端→
+Undo/RedoでもA維持、右ドラッグ開始時A選択→中央取消→Undo/RedoでもA維持、
+右ドラッグ選択→保留Ready採用でも手動選択維持を固定する。既存のkey/pad/端no-op/空一覧、
+Shift起点、自動移動・streaming採用・context分離の回帰も再実行する。
+
+入力をモーダル化／ring操作制限する案は、既存操作を減らすので採用しない。追加の取消台帳、
+bool、epochや個別entryへの取消patchも採用せず、必須intentと既存originのValueOnly化で
+状態の組合せを減らす。まれな失敗は従来どおりログ＋通知で割り切る。
+
+
+Automaticの全production呼出function (同function内の複数landingもすべてAutomatic):
+
+| file | function |
+| --- | --- |
+| app.rs | refresh_current_zip_level_preserving_position / install_drive_list / poll_play_test / hydrate_reading_history_entries / install_prepared_reading_history_entries / select_rating_view_row_for_opened_path / finish_rating_view_install / load_zip_as_folder_with_prepared_enumeration / install_zip_current_level / zip_nav_back / zip_nav_dfs_fullscreen / open_deferred_fullscreen_after_enumerate / install_loading_items_inner / resume_loading_items_after_sidecar / finish_main_list_after_hydration / remove_items_batch / install_bookmark_view_rows_with_sources / restore_bookmark_view_grid / poll_detached_physical_folder_open / reopen_fullscreen_after_folder_nav_load / sync_main_selection_from_viewer_idx / start_active_detached_collection_root_image / reconcile_closed_bookmark_detached_context / select_item_after_load / redirect_selected_to_visible / ensure_selected_visible_or_first / poll_search / restore_grid_cursor_to_fullscreen_item |
+| app/collection_grid.rs | apply_collection_grid_remove_success_in_current_context / install_collection_grid_items_with_thumbnail_sources |
+| app/rating_membership_ops.rs | apply_rating_membership_cursor |
+| app/snapshot_ops.rs | deactivate_snapshot / snapshot_return_to_list_view / finish_required_fullscreen_load |
+| app/smart_folder.rs | install_current_prepared_smart_folder |
+| app/startup_ops.rs | open_loaded_file_fullscreen |
+| app/subfolder_expansion.rs | install_prepared_subfolder_expansion_memory |
+| app/viewer_context_registry.rs | become_mounted_independent_detached_viewer / split_current_context_preserving_main_grid |
+| filename_stack_ui.rs | toggle_subfolder_stack_mode / swap_stack_view_items |
+| global_search_ui.rs | restore_search_selection_after_prepare / request_search_view_build / global_search_ctrl_nav_fullscreen / reset_global_search_for_query_changeの一覧clear |
+| remote_ipc/ui.rs | poll_remote_fullscreen_restore |
+| ui_fullscreen.rs | seek_to_continuous_page_with_contract / adopt_shift_layout_without_navigation / normalize_spread_position / advance_slideshow / loop_slideshow_to_first |
+
+手動sort／ring sort・列数・aspect変更は選択identityを変えず、表示順／layoutを再投影する操作であり、
+復帰権限を失効させない。色filterと検索種別filterの明示変更はExplicitKeep。
+`retire_main_list_requests_for_surface_switch`はquery/sourceの明示切替の共有admissionであり、
+先にExplicitKeepを通す。streaming/同queryのReady採用からこのadmissionは呼ばれない。
+
+
+`execute_search`はUIの明示送信入口とし、共通worker提出へ渡す前にExplicitKeepを通す。
+既存queryを再適用する `reload_top_level_grid` / `reapply_local_search_after_smart_folder_prepare` /
+`install_prepared_subfolder_expansion_memory` は `reexecute_search_for_installed_list` を使う。
+同queryの自動再検索は復帰権限を取消さず、結果採用は既存Automatic。
+明示query/scope送信と自動再検索双方のUndo回帰を含める。
+
+
+右ドラッグ回帰はsecondary press直後（release前）に履歴originのValueOnly化をassertする。
+pickerの開始時刻だけをテストで制御し、長押し後の中央releaseがCancelledとなり
+context menuを開かないこともassertする。短い右クリックのmenu選択による別の取消で
+開始境界の欠落が隠れる再現を避ける。実時間sleep／native inputは使わない。

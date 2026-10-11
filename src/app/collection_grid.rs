@@ -943,7 +943,7 @@ impl App {
             .selected
             .is_some_and(|index| removed_indices.contains(&index))
         {
-            self.move_grid_cursor(None);
+            self.move_grid_cursor(None, crate::app::GridCursorIntent::Automatic);
         }
     }
 
@@ -3671,7 +3671,7 @@ impl App {
         self.search_filter = None;
         self.search_query.clear();
 
-        self.move_grid_cursor(selected);
+        self.move_grid_cursor(selected, crate::app::GridCursorIntent::Automatic);
         self.scroll_to_selected = selected.is_some();
         if selected.is_none() {
             self.scroll_offset_y = 0.0;

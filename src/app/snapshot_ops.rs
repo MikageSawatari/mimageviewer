@@ -1433,7 +1433,7 @@ impl App {
             // invalidate 後も保持される (= thumbnails 自体は invalidate 対象外)。
             self.bump_items_generation();
             self.invalidate_idx_state_and_queues();
-            self.move_grid_cursor(snap.saved_selected);
+            self.move_grid_cursor(snap.saved_selected, crate::app::GridCursorIntent::Automatic);
             self.invalidate_snapshot_details_index_state();
             self.finish_snapshot_viewer_index_swap(viewer_index_swap);
             self.clear_tags_cache();
@@ -1550,7 +1550,7 @@ impl App {
         self.address = snap_origin.display().to_string();
         self.scroll_offset_y = 0.0;
         self.pending_grid_scroll = None;
-        self.move_grid_cursor(None);
+        self.move_grid_cursor(None, crate::app::GridCursorIntent::Automatic);
         // items_generation bump + invalidate (= Codex P1-1)
         self.bump_items_generation();
         self.invalidate_idx_state_and_queues();
@@ -2234,7 +2234,7 @@ impl App {
             return;
         };
         self.open_fullscreen(idx, history_trigger);
-        self.move_grid_cursor(Some(idx));
+        self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
         self.scroll_to_selected = true;
         self.update_last_selected_image();
     }

@@ -367,7 +367,7 @@ impl App {
     /// retaining this caller's scroll policy.
     /// Destination ownership stays here; a Move always rebases Shift, even at the same raw index.
     fn apply_rating_membership_cursor(&mut self, target: Option<usize>) {
-        self.move_grid_cursor(target);
+        self.move_grid_cursor(target, crate::app::GridCursorIntent::Automatic);
         self.scroll_to_selected = target.is_some();
     }
 
@@ -523,10 +523,17 @@ impl App {
     }
 
     pub(crate) fn cancel_rating_membership_restore(&mut self) {
-        self.meta_undo.cancel_grid_rating_origins(
-            self.projected_viewer_context_id().serial(),
-            &self.rating_listing_identity(),
-        );
+        let owner = self.projected_viewer_context_id().serial();
+        let listing = self.rating_listing_identity();
+        self.meta_undo.cancel_grid_rating_origins(owner, &listing);
+        if let Some(picker) = self.ring_picker.as_mut()
+            && let Some(origin) = picker.rating_origin.as_mut()
+            && origin.owner == owner
+            && origin.listing_identity == listing
+            && matches!(origin.target, RatingOriginTarget::Grid(_))
+        {
+            origin.target = RatingOriginTarget::ValueOnly;
+        }
         self.cancel_pending_rating_membership_restore();
     }
 

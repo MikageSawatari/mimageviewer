@@ -1286,7 +1286,7 @@ impl super::App {
                 if let Some(query) = local_search {
                     self.show_search_bar = true;
                     self.search_query = query;
-                    self.execute_search(ctx);
+                    self.reexecute_search_for_installed_list(ctx);
                 }
             }
             TopLevelGridSurface::SmartFolder(state) => {

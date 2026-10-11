@@ -9279,7 +9279,7 @@ impl App {
         self.smart_folder_progress = None;
         self.address = format!("スマートフォルダ: {definition_name}");
         if let Some(&index) = self.visible_indices.first() {
-            self.move_grid_cursor(Some(index));
+            self.move_grid_cursor(Some(index), crate::app::GridCursorIntent::Automatic);
             self.scroll_to_selected = true;
         }
         if let Some(SmartFolderOpenOrigin::ReturnReprepare {
@@ -9349,7 +9349,7 @@ impl App {
         if self.search_query.trim().is_empty() {
             self.rebuild_visible_indices();
         } else {
-            self.execute_search(ctx);
+            self.reexecute_search_for_installed_list(ctx);
         }
     }
 
