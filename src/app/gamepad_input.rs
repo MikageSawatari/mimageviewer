@@ -30,6 +30,13 @@ use crate::settings::{
 };
 use crate::ui_main::AddressBarNav;
 
+enum RatingPickerTermination {
+    Release(crate::rating_membership::RatingAdoptionIntent),
+    /// A request owner is already preparing the replacement set. Ending the
+    /// recipe invalidates that Ready; only its latest request adopts afterward.
+    SourceAdoption,
+}
+
 /// この frame に発生した gamepad の操作。**配り先はまだ決まっていない。**
 ///
 /// 値として持ち回るのは、配り先が「root か、前面の別ウィンドウか」で変わるため。
@@ -2532,19 +2539,10 @@ impl App {
     /// previewed or commit-only; dropping the picker keeps the former and does not synthesize the
     /// latter. All physical holds and overlays become terminal, so nothing can replay on resume.
     pub(crate) fn finish_gamepad_input_for_sidecar_restore(&mut self, ctx: &egui::Context) {
-        let picker = self.ring_picker.take();
-        if let Some(picker) = picker {
-            let (item_changes, container_record) =
-                self.published_live_picker_rating_changes(&picker);
-            self.commit_live_picker_undo(item_changes, container_record);
-            let owner = picker.owner;
-            let context = picker.context;
-            let _ = self.with_owner_viewer_context(owner, |app| {
-                if context == RingShortcutContext::VideoFullscreen {
-                    app.clear_native_video_picker_overlay(ctx);
-                }
-            });
-        }
+        self.finish_rating_picker_without_commit(
+            crate::rating_membership::RatingAdoptionIntent::Reconcile,
+            Some(ctx),
+        );
         self.release_gamepad_input_holds(ctx);
         self.gamepad_state.clear();
         self.gamepad_state.require_directional_neutral();
@@ -3159,6 +3157,8 @@ impl App {
             anchor: self.current_ring_picker_anchor(context),
             grid_sort_target,
             original,
+            preview_recipe: Default::default(),
+            rating_origin: self.capture_rating_origin(),
             row: 0,
             dirty_rows: Vec::new(),
             x_close_armed: false,
@@ -3731,8 +3731,11 @@ impl App {
     }
 
     fn close_stale_ring_picker(&mut self, ctx: &egui::Context) {
-        if self.ring_picker.take().is_some() {
-            self.clear_native_video_picker_overlay(ctx);
+        if self.ring_picker.is_some() {
+            self.finish_rating_picker_without_commit(
+                crate::rating_membership::RatingAdoptionIntent::Reconcile,
+                Some(ctx),
+            );
             self.gamepad_state.cancel_west_ring();
             self.gamepad_state.require_directional_neutral();
             ctx.request_repaint();
@@ -4097,8 +4100,23 @@ impl App {
                 });
                 continue;
             };
+            // A bound/no-op and final confirmation of an already saved preview
+            // must not submit another DB/XMP write or invent a successful receipt.
+            if self.get_rating(idx) == stars.min(5) {
+                continue;
+            }
+            let item = self.items[idx].clone();
             match self.set_rating_result_deferred(idx, stars) {
-                Ok(true) => touched.push(idx),
+                Ok(true) => {
+                    touched.push(idx);
+                    self.record_picker_rating_preview(
+                        picker,
+                        &target.path_key,
+                        item,
+                        target.before,
+                        stars.min(5),
+                    );
+                }
                 Ok(false) => {
                     first_error.get_or_insert_with(|| {
                         format!(
@@ -4116,6 +4134,44 @@ impl App {
             self.publish_current_context_rating_writes();
         }
         (touched, first_error)
+    }
+
+    fn record_picker_rating_preview(
+        &mut self,
+        operation: &RingPickerState,
+        key: &str,
+        item: GridItem,
+        before: u8,
+        after: u8,
+    ) {
+        let generation = self.rating_session_generation_for_key(key);
+        let Some(picker) = self
+            .ring_picker
+            .as_mut()
+            .filter(|picker| picker.owner == operation.owner && picker.anchor == operation.anchor)
+        else {
+            return;
+        };
+        if let Some(entry) = picker
+            .preview_recipe
+            .entries
+            .iter_mut()
+            .find(|entry| entry.key == key)
+        {
+            entry.after = after;
+            entry.write_generation = generation;
+        } else {
+            picker
+                .preview_recipe
+                .entries
+                .push(crate::rating_membership::RatingPreviewLeave {
+                    key: key.to_owned(),
+                    item,
+                    before,
+                    after,
+                    write_generation: generation,
+                });
+        }
     }
 
     pub(crate) fn preview_picker_item_rating(&mut self, picker: &RingPickerState, stars: u8) {
@@ -4749,17 +4805,160 @@ impl App {
     }
 
     pub(crate) fn commit_ring_picker(&mut self, ctx: &egui::Context) {
-        let Some(picker) = self.ring_picker.take() else {
+        let Some(picker) = self.ring_picker.clone() else {
             return;
         };
         // 物理側は App-global。パッドはもう無いかもしれないので mount に依存させない。
         self.gamepad_state.cancel_west_ring();
         self.gamepad_state.require_directional_neutral();
-        let (item_rating_changes, container_rating_record) =
-            self.finalize_live_picker_ratings(&picker);
-        self.commit_live_picker_undo(item_rating_changes, container_rating_record);
-        self.apply_ring_picker_state(ctx, picker);
+        let owner = picker.owner;
+        let applied = self.with_owner_viewer_context(owner, |app| {
+            let (item_rating_changes, container_rating_record) =
+                app.finalize_live_picker_ratings(&picker);
+            app.commit_live_picker_undo_with_origin(
+                item_rating_changes,
+                container_rating_record,
+                picker.rating_origin.clone(),
+            );
+            // Keep the successful preview policy installed for every final row.
+            // Removing it is one explicit adoption after non-rating rows finish.
+            let finalized = app.ring_picker.clone().unwrap_or_else(|| picker.clone());
+            let toast = Self::picker_success_rating_toast(&finalized);
+            app.apply_ring_picker_state_in_owner(ctx, finalized);
+            app.ring_picker.take();
+            app.release_rating_preview_membership(
+                crate::rating_membership::RatingAdoptionIntent::Reconcile,
+            );
+            if let Some(toast) = toast {
+                app.show_feedback_toast(toast);
+            }
+        });
+        if applied.is_none() {
+            self.finish_rating_picker_without_commit(
+                crate::rating_membership::RatingAdoptionIntent::Manual,
+                Some(ctx),
+            );
+        }
         ctx.request_repaint();
+    }
+
+    /// End only the mounted owner's operation before explicit navigation. A
+    /// temporary sibling mount/focus change does not end the opening picker.
+    pub(crate) fn finish_rating_picker_for_manual_navigation(&mut self) {
+        if self
+            .ring_picker
+            .as_ref()
+            .is_some_and(|picker| picker.owner == self.projected_viewer_context_id())
+        {
+            self.finish_rating_picker_without_commit(
+                crate::rating_membership::RatingAdoptionIntent::Manual,
+                None,
+            );
+        }
+    }
+
+    fn finish_rating_picker_without_commit(
+        &mut self,
+        intent: crate::rating_membership::RatingAdoptionIntent,
+        ctx: Option<&egui::Context>,
+    ) {
+        self.terminate_rating_picker(RatingPickerTermination::Release(intent), ctx);
+    }
+
+    pub(crate) fn finish_rating_picker_before_source_adoption(&mut self) {
+        if self
+            .ring_picker
+            .as_ref()
+            .is_some_and(|picker| picker.owner == self.projected_viewer_context_id())
+        {
+            self.terminate_rating_picker(RatingPickerTermination::SourceAdoption, None);
+        }
+    }
+
+    fn terminate_rating_picker(
+        &mut self,
+        terminal: RatingPickerTermination,
+        ctx: Option<&egui::Context>,
+    ) {
+        let Some(picker) = self.ring_picker.take() else {
+            return;
+        };
+        let (items, container) = self.published_live_picker_rating_changes(&picker);
+        let RatingPickerTermination::Release(intent) = terminal else {
+            // This boundary is already mounted and its request owner may be
+            // temporarily local to poll. Do not mount, rebuild, or navigate here.
+            self.commit_live_picker_undo_with_origin(
+                items,
+                container,
+                picker.rating_origin.clone(),
+            );
+            if let Some(toast) = Self::picker_success_rating_toast(&picker) {
+                self.show_feedback_toast(toast);
+            }
+            #[cfg(windows)]
+            self.set_native_video_ring_picker_overlay(None);
+            self.gamepad_state.cancel_west_ring();
+            self.gamepad_state.require_directional_neutral();
+            return;
+        };
+        let owner = picker.owner;
+        let toast = (!matches!(
+            intent,
+            crate::rating_membership::RatingAdoptionIntent::Manual
+        ))
+        .then(|| Self::picker_success_rating_toast(&picker))
+        .flatten();
+        let mut records = Some((items, container));
+        let applied = self.with_owner_viewer_context(owner, |app| {
+            let (items, container) = records.take().unwrap();
+            app.commit_live_picker_undo_with_origin(items, container, picker.rating_origin.clone());
+            if let Some(ctx) = ctx {
+                app.clear_native_video_picker_overlay(ctx);
+            } else {
+                #[cfg(windows)]
+                app.set_native_video_ring_picker_overlay(None);
+            }
+            app.release_rating_preview_membership(intent);
+            if let Some(toast) = toast {
+                app.show_feedback_toast(toast);
+            }
+        });
+        if applied.is_none() {
+            let (items, container) = records.take().unwrap();
+            // A retired owner still has durable stable-key writes. Keep their
+            // Undo record without dispatching any reader work to a sibling.
+            self.commit_live_picker_undo_with_origin(
+                items,
+                container,
+                picker.rating_origin.clone(),
+            );
+        }
+        self.gamepad_state.cancel_west_ring();
+        self.gamepad_state.require_directional_neutral();
+    }
+
+    fn picker_success_rating_toast(picker: &RingPickerState) -> Option<String> {
+        let receipt = picker
+            .preview_recipe
+            .entries
+            .iter()
+            .max_by_key(|entry| entry.write_generation)?;
+        let container = picker
+            .original
+            .container_rating_target
+            .as_ref()
+            .is_some_and(|target| target.path_key == receipt.key)
+            && !picker
+                .original
+                .item_rating_records
+                .iter()
+                .any(|target| target.path_key == receipt.key);
+        Some(match (container, receipt.after) {
+            (true, 0) => "[フォルダ★解除]".to_owned(),
+            (true, stars) => format!("[フォルダ{}]", "★".repeat(stars as usize)),
+            (false, 0) => "[★解除]".to_owned(),
+            (false, stars) => format!("[{}]", "★".repeat(stars as usize)),
+        })
     }
 
     /// Re-apply the selected final value, then return only durable changes from
@@ -4775,13 +4974,31 @@ impl App {
         let Some(target) = picker.original.container_rating_target.clone() else {
             return Ok(false);
         };
-        self.write_container_rating_for_target(
+        let item = (0..self.items.len())
+            .find_map(|idx| {
+                (self.rating_path_key(idx).as_deref() == Some(target.path_key.as_str()))
+                    .then(|| self.items[idx].clone())
+            })
+            .unwrap_or_else(|| GridItem::Folder(target.source_path.clone()));
+        let written = self.write_container_rating_for_target_with_publication(
             &target.path_key,
             &target.source_path,
             &target.meta,
             picker.container_rating,
             false,
-        )
+            false,
+        )?;
+        if written {
+            self.record_picker_rating_preview(
+                picker,
+                &target.path_key,
+                item,
+                picker.original.container_rating,
+                picker.container_rating,
+            );
+            self.publish_current_context_rating_writes();
+        }
+        Ok(written)
     }
 
     pub(crate) fn finalize_live_picker_ratings(
@@ -4828,6 +5045,11 @@ impl App {
         Vec<RatingChange>,
         Option<(crate::ring_shortcut::RingPickerContainerTarget, u8, u8)>,
     ) {
+        let operation = self
+            .ring_picker
+            .as_ref()
+            .filter(|live| live.owner == picker.owner && live.anchor == picker.anchor)
+            .unwrap_or(picker);
         let item_changes = if picker.dirty_rows.contains(&RingPickerRowId::ItemRating) {
             picker
                 .original
@@ -4835,10 +5057,8 @@ impl App {
                 .iter()
                 .filter_map(|target| {
                     let actual = self
-                        .rating_session_writes
-                        .get(&target.path_key)
-                        .filter(|write| write.generation > target.session_generation)
-                        .map(|write| write.stars)
+                        .receipt_for_picker_key(operation, &target.path_key)
+                        .map(|receipt| receipt.after)
                         .unwrap_or(target.before);
                     (target.before != actual).then(|| RatingChange {
                         path_key: target.path_key.clone(),
@@ -4863,9 +5083,8 @@ impl App {
                 .as_ref()
                 .and_then(|target| {
                     let actual = self
-                        .rating_session_writes
-                        .get(&target.path_key)
-                        .map(|write| write.stars)
+                        .receipt_for_picker_key(operation, &target.path_key)
+                        .map(|receipt| receipt.after)
                         .unwrap_or(picker.original.container_rating);
                     (picker.original.container_rating != actual)
                         .then(|| (target.clone(), picker.original.container_rating, actual))
@@ -4876,10 +5095,32 @@ impl App {
         (item_changes, container_record)
     }
 
+    fn receipt_for_picker_key<'a>(
+        &self,
+        picker: &'a RingPickerState,
+        key: &str,
+    ) -> Option<&'a crate::rating_membership::RatingPreviewLeave> {
+        picker
+            .preview_recipe
+            .entries
+            .iter()
+            .find(|receipt| receipt.key == key)
+    }
+
     pub(crate) fn commit_live_picker_undo(
         &mut self,
         item_changes: Vec<RatingChange>,
         container_record: Option<(crate::ring_shortcut::RingPickerContainerTarget, u8, u8)>,
+    ) {
+        let origin = self.capture_rating_origin();
+        self.commit_live_picker_undo_with_origin(item_changes, container_record, origin);
+    }
+
+    fn commit_live_picker_undo_with_origin(
+        &mut self,
+        item_changes: Vec<RatingChange>,
+        container_record: Option<(crate::ring_shortcut::RingPickerContainerTarget, u8, u8)>,
+        origin: Option<crate::rating_membership::RatingOrigin>,
     ) {
         if !item_changes.is_empty() {
             let common_after = item_changes
@@ -4899,7 +5140,7 @@ impl App {
             } else {
                 format!("★{}", common_after.unwrap_or_default())
             };
-            self.push_rating_undo_entry(item_changes, summary);
+            self.push_rating_undo_entry_with_origin(item_changes, summary, origin);
         }
         if let Some((target, before, after)) = container_record {
             // **Undo も開いた時点の保存先へ。** ここで引き直すと、別の窓のフォルダ宛てに
@@ -8299,6 +8540,93 @@ fn cycle_video_playback_speed(current: f64, delta: i32) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rating_membership_ring_success_receipt_precedes_publication_and_final_noop() {
+        use super::*;
+        use crate::grid_item::ThumbnailState;
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let paths = [app.tmp.path().join("a.jpg"), app.tmp.path().join("b.jpg")];
+        for path in &paths {
+            std::fs::write(path, b"image").unwrap();
+        }
+        app.items = paths.iter().cloned().map(GridItem::Image).collect();
+        app.thumbnails = vec![ThumbnailState::Pending; 2];
+        app.visible_indices = vec![0, 1];
+        app.selected = Some(0);
+        app.settings.rating_filter = [false, false, false, true, false, false];
+        for idx in 0..2 {
+            let key = app.rating_path_key(idx).unwrap();
+            app.rating_db
+                .as_ref()
+                .unwrap()
+                .set_user_rating(&key, 3, app.rating_meta_for_idx(idx).as_ref())
+                .unwrap();
+            app.rating_cache.insert(idx, 3);
+        }
+        let mut picker = app.build_ring_picker_state(RingShortcutContext::Grid);
+        picker.item_rating = 0;
+        mark_picker_dirty(&mut picker, RingPickerRowId::ItemRating);
+        app.ring_picker = Some(picker.clone());
+        app.preview_picker_item_rating(&picker, 0);
+        assert_eq!(
+            app.visible_indices,
+            vec![0, 1],
+            "own receipt is installed before exclusion publication"
+        );
+        assert_eq!(app.rating_cache[&0], 0);
+        let generation = app.rating_session_write_generation;
+        let receipt = &app.ring_picker.as_ref().unwrap().preview_recipe.entries[0];
+        assert_eq!(
+            (receipt.before, receipt.after, receipt.write_generation),
+            (3, 0, generation)
+        );
+        app.commit_ring_picker(&egui::Context::default());
+        assert_eq!(
+            app.rating_session_write_generation, generation,
+            "confirm does not resave unchanged preview"
+        );
+        assert!(app.ring_picker.is_none());
+        assert_eq!(app.visible_indices, vec![1]);
+        assert_eq!(app.meta_undo.undo_len(), 1);
+    }
+
+    #[test]
+    fn rating_membership_forced_ring_end_records_only_own_success_after_external_write() {
+        use super::*;
+        use crate::grid_item::ThumbnailState;
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let path = app.tmp.path().join("a.jpg");
+        app.items = vec![GridItem::Image(path.clone())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        let key = crate::adjustment_db::normalize_path(&path);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&key, 3, None)
+            .unwrap();
+        app.rating_cache.insert(0, 3);
+        let mut picker = app.build_ring_picker_state(RingShortcutContext::Grid);
+        picker.item_rating = 0;
+        mark_picker_dirty(&mut picker, RingPickerRowId::ItemRating);
+        app.ring_picker = Some(picker.clone());
+        app.preview_picker_item_rating(&picker, 0);
+        app.write_user_rating_shared(&key, 2, None).unwrap();
+        let generation = app.rating_session_write_generation;
+        app.finish_rating_picker_for_manual_navigation();
+        assert_eq!(app.rating_session_write_generation, generation);
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 2);
+        let Some(crate::undo_stack::UndoEntry::Rating { changes, .. }) = app.meta_undo.peek_undo()
+        else {
+            panic!("own success needs Undo");
+        };
+        assert_eq!((changes[0].before, changes[0].after), (3, 0));
+        assert!(app.ring_picker.is_none());
+    }
+
     #[cfg(windows)]
     #[test]
     fn mixed_path_favorite_picker_direct_navigation_preserves_saved_record() {
@@ -8652,26 +8980,40 @@ mod tests {
     fn sidecar_restore_ends_gamepad_picker_without_replaying_its_live_write() {
         use crate::gamepad::{PadAxis, PadEvent};
 
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let ctx = egui::Context::default();
         let mut app = crate::app::setup_app_for_test();
-        let key = "C:/fixture/page.jpg".to_string();
+        let path = app.tmp.path().join("page.jpg");
+        std::fs::write(&path, b"image").unwrap();
+        app.items = vec![crate::grid_item::GridItem::Image(path)];
+        app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        let key = app.rating_path_key(0).unwrap();
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&key, 1, app.rating_meta_for_idx(0).as_ref())
+            .unwrap();
+        app.rating_cache.insert(0, 1);
         let mut picker = app.build_ring_picker_state(RingShortcutContext::Grid);
         picker.dirty_rows.push(RingPickerRowId::ItemRating);
-        picker
-            .original
-            .item_rating_records
-            .push(RingPickerRatingTarget {
-                path_key: key.clone(),
-                source_path: std::path::PathBuf::from(&key),
-                meta: None,
-                xmp_target: None,
-                before: 1,
-                session_generation: 0,
-            });
         picker.item_rating = 4;
-        app.record_rating_session_write(key, 4, true);
+        app.ring_picker = Some(picker.clone());
+        app.preview_picker_item_rating(&picker, 4);
         let published_generation = app.rating_session_write_generation;
-        app.ring_picker = Some(picker);
+        assert_eq!(app.get_rating(0), 4);
+        assert_eq!(
+            app.ring_picker
+                .as_ref()
+                .unwrap()
+                .preview_recipe
+                .entries
+                .len(),
+            1,
+            "the real successful preview belongs to this picker"
+        );
         app.settings.gamepad_enabled = true;
         app.gamepad
             .push_for_test(PadEvent::ButtonPressed(PadButton::DPadRight));
@@ -8708,6 +9050,7 @@ mod tests {
             app.meta_undo.can_undo(),
             "the already-published live preview remains undoable"
         );
+        assert_eq!(app.meta_undo.undo_len(), 1);
 
         app.sidecar_restore = None;
         let resumed = app.dispatch_gamepad_batch(&ctx, GamepadFrameBatch::empty_for_test());

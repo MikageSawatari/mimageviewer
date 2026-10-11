@@ -11209,6 +11209,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         // selected が filter から外れた場合の処理は `rebuild_visible_indices` が
         // 直近の visible idx にリダイレクト (旧コードは None にクリアしていた)。
         if toolbar_rating_changed {
+            self.finish_rating_picker_before_source_adoption();
+            self.cancel_rating_membership_restore();
             // ユーザーによる明示的な filter 操作 → suppression anchor を破棄する
             // (ユーザー意思を尊重して、BS しても以前の filter は復元しない)。
             self.drop_rating_filter_suppression_on_user_edit();
@@ -12656,6 +12658,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         }
 
         if rating_changed {
+            self.finish_rating_picker_before_source_adoption();
+            self.cancel_rating_membership_restore();
             self.drop_rating_filter_suppression_on_user_edit();
         }
         let color_scope_changed =
@@ -16238,6 +16242,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let ctrl = ctx.input(|i| i.modifiers.ctrl);
         let shift = ctx.input(|i| i.modifiers.shift);
         if primary_clicked && !badge_clicked {
+            self.cancel_rating_membership_restore();
             let display_order = if ctrl || shift {
                 self.current_grid_order().to_vec()
             } else {
@@ -16616,6 +16621,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             && !self.selection_info_bar_contains_pointer(ctx)
             && !self.mouse_ring_context_menu_suppressed(ctx)
         {
+            self.cancel_rating_membership_restore();
             apply_grid_secondary_selection(
                 self.settings.grid_click_selection_mode,
                 &mut self.selected,
@@ -16715,9 +16721,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
     ) -> Option<AddressBarNav> {
         use crate::app::{GridBackgroundClickContext, GridClickSource};
         let frame = ctx.cumulative_frame_nr();
+        let items_generation = self.items_generation;
+        let view_mode = self.settings.grid_view_mode;
         let context = |source| GridBackgroundClickContext {
-            items_generation: self.items_generation,
-            view_mode: self.settings.grid_view_mode,
+            items_generation,
+            view_mode,
             viewport: ctx.viewport_id(),
             source,
         };
@@ -16805,6 +16813,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             return None;
         };
         // Keep the released Explorer/Check selection semantics, including assignment None.
+        self.cancel_rating_membership_restore();
         if self.settings.grid_click_selection_mode.normalized() == GridClickSelectionMode::Explorer
         {
             self.folder_pane.set_focus_grid();
@@ -16953,6 +16962,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             && idx < self.items.len()
             && !self.items_are_drive_list
         {
+            self.cancel_rating_membership_restore();
             apply_grid_secondary_selection(
                 self.settings.grid_click_selection_mode,
                 &mut self.selected,
@@ -26405,6 +26415,242 @@ mod grid_reclick_open_tests {
             );
         }
         harness.run();
+    }
+
+    fn rating_selection_harness(
+        view: crate::settings::GridViewMode,
+    ) -> Harness<'static, HandlerState> {
+        let mut harness = handler_harness(
+            GridClickSelectionMode::Explorer,
+            false,
+            Some(0),
+            false,
+            false,
+        );
+        let app = &mut harness.state_mut().app;
+        let folder = app.tmp.path().join("rating-shift-pages");
+        std::fs::create_dir_all(&folder).unwrap();
+        app.items = ["a", "b", "c"]
+            .into_iter()
+            .map(|name| {
+                let path = folder.join(format!("{name}.png"));
+                image::RgbaImage::from_pixel(4, 4, image::Rgba([90, 100, 110, 255]))
+                    .save(&path)
+                    .unwrap();
+                GridItem::Image(path)
+            })
+            .collect();
+        app.thumbnails = vec![ThumbnailState::Pending; 3];
+        app.image_metas = vec![None; 3];
+        app.visible_indices = vec![0, 1, 2];
+        app.current_folder = Some(folder);
+        app.settings.grid_view_mode = view;
+        app.settings.details_sort_key = crate::settings::DetailsSortKey::Name;
+        app.settings.details_sort_ascending = true;
+        app.details_order = vec![0, 1, 2];
+        app.settings.rating_filter = [false, false, false, true, false, false];
+        app.rating_cache.clear();
+        for index in 0..3 {
+            let key = app.rating_path_key(index).unwrap();
+            app.rating_db.as_ref().unwrap().set(&key, 3).unwrap();
+            app.rating_cache.insert(index, 3);
+        }
+        app.fullscreen_idx = Some(1);
+        app.viewer_presentation = crate::app::ViewerPresentation::Fullscreen;
+        app.grid_click_selection_anchor =
+            Some(GridClickSelectionAnchor::new(0, app.items_generation));
+        harness
+    }
+
+    #[test]
+    fn shift_click_handler_uses_rating_next_previous_and_undo_landing_in_both_views() {
+        for view in [
+            crate::settings::GridViewMode::Thumbnail,
+            crate::settings::GridViewMode::Details,
+        ] {
+            let mut harness = rating_selection_harness(view);
+            let app = &mut harness.state_mut().app;
+            app.checked.insert(0);
+            app.scroll_to_selected = false;
+            assert!(app.set_rating(1, 4));
+            assert_eq!(app.fullscreen_idx, Some(2));
+            assert_eq!(app.checked, HashSet::from([0]));
+            assert!(app.scroll_to_selected);
+            click_cell(&mut harness, 0, egui::Modifiers::SHIFT);
+            assert_eq!(harness.state().app.checked, HashSet::from([0, 2]));
+            assert_eq!(harness.state().activations, 0);
+
+            harness.state_mut().app.apply_meta_undo();
+            assert_eq!(harness.state().app.fullscreen_idx, Some(1));
+            harness.run_steps(40);
+            click_cell(&mut harness, 0, egui::Modifiers::SHIFT);
+            assert_eq!(harness.state().app.checked, HashSet::from([0, 1]));
+            harness.state_mut().app.apply_meta_redo();
+            assert_eq!(harness.state().app.fullscreen_idx, Some(2));
+            assert!(harness.state_mut().app.set_rating(2, 4));
+            assert_eq!(harness.state().app.fullscreen_idx, Some(0));
+            harness.run_steps(40);
+            click_cell(&mut harness, 0, egui::Modifiers::SHIFT);
+            assert_eq!(harness.state().app.checked, HashSet::from([0]));
+            assert_eq!(harness.state().activations, 0);
+        }
+    }
+
+    #[test]
+    fn shift_click_handler_uses_grid_container_return_and_rating_undo_origin_in_both_views() {
+        for view in [
+            crate::settings::GridViewMode::Thumbnail,
+            crate::settings::GridViewMode::Details,
+        ] {
+            let mut harness = rating_selection_harness(view);
+            let app = &mut harness.state_mut().app;
+            app.items[1] = GridItem::ZipFile(app.tmp.path().join("container.zip"));
+            let container = app.rating_path_key(1).unwrap();
+            app.rating_db.as_ref().unwrap().set(&container, 3).unwrap();
+            app.fullscreen_idx = Some(0);
+            let hidden = app.rating_path_key(2).unwrap();
+            app.rating_db.as_ref().unwrap().set(&hidden, 4).unwrap();
+            app.rating_cache.insert(2, 4);
+            app.visible_indices = vec![0, 1];
+            app.details_order = vec![0, 1];
+            assert!(app.set_rating(0, 4));
+            assert_eq!(app.fullscreen_idx, None);
+            assert_eq!(app.selected, Some(1));
+            click_cell(&mut harness, 1, egui::Modifiers::SHIFT);
+            assert_eq!(harness.state().app.checked, HashSet::from([1]));
+            assert_eq!(harness.state().activations, 0);
+
+            harness.state_mut().app.apply_meta_undo();
+            assert_eq!(harness.state().app.fullscreen_idx, Some(0));
+            harness.run_steps(40);
+            click_cell(&mut harness, 1, egui::Modifiers::SHIFT);
+            assert_eq!(harness.state().app.checked, HashSet::from([0, 1]));
+            assert_eq!(harness.state().activations, 0);
+            assert_eq!(
+                harness.state().app.settings.rating_filter,
+                [false, false, false, true, false, false]
+            );
+        }
+    }
+
+    #[test]
+    fn paired_identity_remap_keeps_checks_and_scroll_then_shift_click_uses_remapped_anchor() {
+        for view in [
+            crate::settings::GridViewMode::Thumbnail,
+            crate::settings::GridViewMode::Details,
+        ] {
+            let mut harness = rating_selection_harness(view);
+            let app = &mut harness.state_mut().app;
+            app.selected = Some(2);
+            app.checked = HashSet::from([1]);
+            app.scroll_to_selected = false;
+            app.pending_grid_scroll = Some(GridScrollIntent::Bottom);
+            app.scroll_selected_to_rows_above = Some(3);
+            let before = app.capture_rating_membership();
+            app.items.swap(0, 2);
+            app.bump_items_generation();
+            app.visible_indices = vec![0, 1, 2];
+            app.details_order = vec![2, 1, 0];
+            app.adopt_rating_membership(
+                before,
+                crate::rating_membership::RatingAdoptionIntent::Reconcile,
+            );
+            assert_eq!(app.fullscreen_idx, Some(1));
+            assert_eq!(app.selected, Some(0));
+            assert_eq!(app.checked, HashSet::from([1]));
+            assert!(!app.scroll_to_selected);
+            assert_eq!(app.pending_grid_scroll, Some(GridScrollIntent::Bottom));
+            assert_eq!(app.scroll_selected_to_rows_above, Some(3));
+            click_cell(&mut harness, 1, egui::Modifiers::SHIFT);
+            assert_eq!(harness.state().app.checked, HashSet::from([1, 2]));
+            assert_eq!(harness.state().activations, 0);
+        }
+    }
+
+    #[test]
+    fn same_raw_slot_different_identity_rebases_actual_shift_range_in_both_views() {
+        for view in [
+            crate::settings::GridViewMode::Thumbnail,
+            crate::settings::GridViewMode::Details,
+        ] {
+            let mut harness = rating_selection_harness(view);
+            let app = &mut harness.state_mut().app;
+            app.fullscreen_idx = Some(0);
+            app.grid_click_selection_anchor =
+                Some(GridClickSelectionAnchor::new(2, app.items_generation));
+            let before = app.capture_rating_membership();
+            app.items = vec![app.items[1].clone()];
+            app.bump_items_generation();
+            app.visible_indices = vec![0];
+            app.details_order = vec![0];
+            app.adopt_rating_membership(
+                before,
+                crate::rating_membership::RatingAdoptionIntent::Reconcile,
+            );
+            assert_eq!(app.fullscreen_idx, Some(0));
+            assert_eq!(app.selected, Some(0));
+            assert!(app.scroll_to_selected);
+            click_cell(&mut harness, 0, egui::Modifiers::SHIFT);
+            assert_eq!(harness.state().app.checked, HashSet::from([0]));
+            assert_eq!(harness.state().activations, 0);
+        }
+    }
+
+    #[test]
+    fn accepted_grid_primary_and_secondary_clicks_cancel_rating_origin_restore() {
+        for secondary in [false, true] {
+            let mut harness = handler_harness(
+                GridClickSelectionMode::Explorer,
+                false,
+                Some(0),
+                false,
+                false,
+            );
+            let app = &mut harness.state_mut().app;
+            let (_, rx) = std::sync::mpsc::channel();
+            app.rating_view_pending = Some(crate::rating_view::RatingViewPending {
+                stars: 3,
+                sequence: 1,
+                source_generation: app.items_generation,
+                context: app.virtual_list_context_id(),
+                rating_write_generation: app.rating_session_write_generation,
+                rating_preview: Default::default(),
+                rating_adoption: crate::rating_membership::RatingAdoptionIntent::RestoreOrigin(
+                    app.capture_rating_origin().unwrap(),
+                ),
+                sort: Default::default(),
+                membership_only: true,
+                navigation: None,
+                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                rx,
+            });
+            if secondary {
+                let center = cell_rect(1).center();
+                harness.hover_at(center);
+                for pressed in [true, false] {
+                    harness.event(egui::Event::PointerButton {
+                        pos: center,
+                        button: egui::PointerButton::Secondary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
+                harness.run();
+            } else {
+                click_cell(&mut harness, 1, egui::Modifiers::NONE);
+            }
+            assert_eq!(harness.state().app.selected, Some(1));
+            assert_eq!(
+                harness
+                    .state()
+                    .app
+                    .rating_view_pending
+                    .as_ref()
+                    .unwrap()
+                    .rating_adoption,
+                crate::rating_membership::RatingAdoptionIntent::Reconcile
+            );
+        }
     }
 
     fn click_at(harness: &mut Harness<'static, HandlerState>, pos: egui::Pos2) {

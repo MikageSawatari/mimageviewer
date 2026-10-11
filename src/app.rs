@@ -598,6 +598,9 @@ pub(crate) use subfolder_expansion::{
 mod startup_list_restore;
 pub(crate) mod top_level_grid_view;
 pub(crate) use startup_list_restore::StartupListIntent;
+mod rating_membership_ops;
+#[cfg(test)]
+mod rating_membership_tests;
 mod viewer_context_registry;
 #[cfg(windows)]
 pub(crate) use viewer_context_registry::ContextResidence;
@@ -1693,6 +1696,18 @@ pub(crate) enum ViewerPresentation {
     Fullscreen,
     /// メインウィンドウとは独立した viewer session。
     DetachedWindow,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VisibleSelectionPolicy {
+    General,
+    RatingMembership,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FsMetadataBoundary {
+    Manual,
+    RatingMembership,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -34343,11 +34358,15 @@ impl App {
         match result {
             Ok(Ok(result)) => {
                 let read_generation = pending.rating_write_generation;
+                let preview_recipe = pending.rating_preview.clone();
                 self.rating_view_pending = None;
                 if result.prepared.as_ref().is_some_and(|prepared| {
                     crate::page_edit_write_epoch::PAGE_EDIT_WRITES
                         .accepts(prepared.page_edits.stamp)
                         && crate::tags_db::TAG_WRITES.accepts(prepared.tag_stamp)
+                        && crate::rating_db::RATING_WRITES.accepts(prepared.rating_stamp)
+                        && read_generation == self.rating_session_write_generation
+                        && preview_recipe == self.rating_preview_recipe()
                 }) {
                     self.rating_view_accepted_write_generation = result
                         .prepared
@@ -34369,6 +34388,7 @@ impl App {
                 self.rating_view_pending = None;
                 if msg == "page-edit read changed during rating prepare"
                     || msg == "tag read changed during rating prepare"
+                    || msg == "rating read changed during rating prepare"
                 {
                     self.start_rating_build(
                         transition.target_stars,
@@ -34522,7 +34542,9 @@ impl App {
         let stale = pending.sequence != self.rating_view_request_sequence
             || pending.sort != self.rating_view_sort
             || pending.stars != self.rating_view_stars
-            || pending.source_generation != self.items_generation;
+            || pending.source_generation != self.items_generation
+            || pending.rating_write_generation != self.rating_session_write_generation
+            || pending.rating_preview != self.rating_preview_recipe();
         if stale {
             self.request_rating_view_build();
             return;
@@ -34530,6 +34552,8 @@ impl App {
         match pending.rx.try_recv() {
             Ok(Ok(result)) => {
                 let read_generation = pending.rating_write_generation;
+                let adoption_intent = pending.rating_adoption.clone();
+                let preview_recipe = pending.rating_preview.clone();
                 let rating_header_survivors = (pending.membership_only
                     && self.settings.grid_view_mode == crate::settings::GridViewMode::Details
                     && self.settings.details_sort_key == crate::settings::DetailsSortKey::Rating)
@@ -34549,14 +34573,61 @@ impl App {
                     crate::page_edit_write_epoch::PAGE_EDIT_WRITES
                         .accepts(prepared.page_edits.stamp)
                         && crate::tags_db::TAG_WRITES.accepts(prepared.tag_stamp)
+                        && crate::rating_db::RATING_WRITES.accepts(prepared.rating_stamp)
+                        && read_generation == self.rating_session_write_generation
+                        && preview_recipe == self.rating_preview_recipe()
                 }) {
+                    if self
+                        .ring_picker
+                        .as_ref()
+                        .is_some_and(|picker| picker.owner == self.projected_viewer_context_id())
+                        && self
+                            .fullscreen_idx
+                            .and_then(|index| self.items.get(index))
+                            .is_some_and(|current| {
+                                result.prepared.as_ref().is_some_and(|prepared| {
+                                    !prepared
+                                        .items
+                                        .iter()
+                                        .any(|item| item.perf_key() == current.perf_key())
+                                })
+                            })
+                    {
+                        self.finish_rating_picker_before_source_adoption();
+                        self.request_rating_view_build();
+                        if let Some(pending) = self.rating_view_pending.as_mut() {
+                            pending.rating_adoption = adoption_intent;
+                        }
+                        return;
+                    }
+                    if self.items_are_rating_view {
+                        // Keep the released editor boundary even when the reader survives.
+                        // Finishing uses outgoing indices and can publish newer page edits.
+                        self.finish_rating_membership_edit_boundary();
+                        if !crate::page_edit_write_epoch::PAGE_EDIT_WRITES
+                            .accepts(result.prepared.as_ref().unwrap().page_edits.stamp)
+                        {
+                            crate::logger::log(format!(
+                                "[RATING] stale prepare after editor finish context={:?} prepared_edits={:?} current_edits={:?}",
+                                self.projected_viewer_context_id(),
+                                result.prepared.as_ref().unwrap().page_edits.stamp,
+                                crate::page_edit_write_epoch::PAGE_EDIT_WRITES.sample(),
+                            ));
+                            self.request_rating_view_build();
+                            if let Some(pending) = self.rating_view_pending.as_mut() {
+                                pending.rating_adoption = adoption_intent;
+                            }
+                            return;
+                        }
+                    }
+                    let membership = self.capture_rating_membership();
                     self.rating_view_accepted_write_generation = result
                         .prepared
                         .as_ref()
                         .unwrap()
                         .rating_stamp
                         .completed_writes;
-                    self.apply_rating_view_result(result);
+                    self.apply_rating_membership_view_result(result);
                     self.overlay_rating_session_writes_since(read_generation);
                     if let Some(keys) = rating_header_survivors {
                         let positions = self
@@ -34570,18 +34641,43 @@ impl App {
                             .filter_map(|key| positions.get(key.as_str()).copied())
                             .collect();
                     }
-                    self.rebuild_visible_indices_after_rating_publication();
+                    self.rebuild_visible_indices_for_rating_adoption();
+                    self.adopt_rating_membership(membership, adoption_intent);
                 } else {
+                    crate::logger::log(format!(
+                        "[RATING] stale prepare context={:?} facts={:?} current_facts={:?} prepared_session={} current_session={} preview_current={}",
+                        self.projected_viewer_context_id(),
+                        result
+                            .prepared
+                            .as_ref()
+                            .map(|prepared| prepared.rating_stamp),
+                        crate::rating_db::RATING_WRITES.sample(),
+                        read_generation,
+                        self.rating_session_write_generation,
+                        preview_recipe == self.rating_preview_recipe(),
+                    ));
                     self.request_rating_view_build();
+                    if let Some(pending) = self.rating_view_pending.as_mut() {
+                        pending.rating_adoption = adoption_intent;
+                    }
                 }
             }
             Ok(Err(msg)) => {
+                let adoption_intent = self
+                    .rating_view_pending
+                    .as_ref()
+                    .map(|pending| pending.rating_adoption.clone())
+                    .unwrap_or(crate::rating_membership::RatingAdoptionIntent::Reconcile);
                 self.rating_view_pending = None;
                 if msg == "page-edit read changed during rating prepare"
                     || msg == "tag read changed during rating prepare"
+                    || msg == "rating read changed during rating prepare"
                     || msg == "cancelled"
                 {
                     self.request_rating_view_build();
+                    if let Some(pending) = self.rating_view_pending.as_mut() {
+                        pending.rating_adoption = adoption_intent;
+                    }
                 } else {
                     self.rating_view_accepted_write_generation =
                         crate::rating_db::RATING_WRITES.sample().completed_writes;
@@ -34708,6 +34804,14 @@ impl App {
         intent: crate::rating_view::RatingViewBuildIntent,
         navigation: Option<RatingNavigationTransition>,
     ) {
+        let adoption_intent = if navigation.is_none() {
+            self.rating_view_pending
+                .as_ref()
+                .map(|pending| pending.rating_adoption.clone())
+                .unwrap_or(crate::rating_membership::RatingAdoptionIntent::Reconcile)
+        } else {
+            crate::rating_membership::RatingAdoptionIntent::Reconcile
+        };
         if let Some(pending) = self.rating_view_pending.take() {
             pending.cancel();
         }
@@ -34720,6 +34824,7 @@ impl App {
             self.projected_viewer_context_id(),
             self.rating_session_write_generation,
             crate::rating_view::RatingViewPrepareOptions {
+                rating_preview: self.rating_preview_recipe(),
                 visibility: self.settings.file_type_visibility.clone(),
                 sidecar_settings: self.settings.thumbnail_source_discovery_snapshot(),
                 intent,
@@ -34740,6 +34845,7 @@ impl App {
             },
         );
         pending.navigation = navigation;
+        pending.rating_adoption = adoption_intent;
         self.rating_view_pending = Some(pending);
     }
 
@@ -63123,6 +63229,9 @@ impl App {
             return false;
         }
 
+        let requested_page = self
+            .page_path_key(idx)
+            .expect("admitted physical page has an identity");
         let detached_id = self.fork_materialized_still_context(&physical_context, idx);
         self.log_detached_image_window_debug(format!(
             "materialized_physical_context_promoted idx={idx} main_items={} active_context=true",
@@ -63131,6 +63240,11 @@ impl App {
 
         let window_id = self
             .with_viewer_context(detached_id, |detached| {
+                let idx = (0..detached.items.len())
+                    .find(|&index| {
+                        detached.page_path_key(index).as_deref() == Some(requested_page.as_str())
+                    })
+                    .expect("fork retains requested page identity");
                 detached.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
                 detached
                     .active_detached_session
@@ -65518,7 +65632,47 @@ impl App {
         history_trigger: HistoryTrigger,
         requested_materialization: FsOpenMaterialization,
         load_contract: FsPageLoadContract,
+        perf: Option<&mut FsOpenPerfRecorder>,
+    ) {
+        self.open_fullscreen_with_metadata_boundary(
+            idx,
+            history_trigger,
+            requested_materialization,
+            load_contract,
+            perf,
+            FsMetadataBoundary::Manual,
+        );
+    }
+
+    fn open_fullscreen_for_rating_membership(&mut self, idx: usize) {
+        let toast = self.fs_feedback_toast.clone();
+        self.finish_rating_membership_edit_boundary();
+        self.open_fullscreen_with_metadata_boundary(
+            idx,
+            HistoryTrigger::UserChosen,
+            FsOpenMaterialization::NavigationTargetMaterializationOnly,
+            FsPageLoadContract::Sequential,
+            None,
+            FsMetadataBoundary::RatingMembership,
+        );
+        if let Some(toast) = toast {
+            self.fs_feedback_toast = Some(toast);
+            self.fs_feedback_toast_surface = Some(if self.fullscreen_idx.is_some() {
+                ActionSurface::Viewer
+            } else {
+                ActionSurface::MainWindow
+            });
+        }
+    }
+
+    fn open_fullscreen_with_metadata_boundary(
+        &mut self,
+        idx: usize,
+        history_trigger: HistoryTrigger,
+        requested_materialization: FsOpenMaterialization,
+        load_contract: FsPageLoadContract,
         mut perf: Option<&mut FsOpenPerfRecorder>,
+        boundary: FsMetadataBoundary,
     ) {
         if self.remote_session_blocks_local_control() {
             crate::logger::log("remote_ipc: rejected fullscreen open outside Local phase");
@@ -65527,11 +65681,16 @@ impl App {
         if !self.grid_item_input_allowed() {
             return;
         }
-        if self.defer_sidecar_restore_fullscreen(
+        if boundary == FsMetadataBoundary::Manual {
+            self.finish_rating_picker_for_manual_navigation();
+            self.cancel_rating_membership_restore();
+        }
+        if self.defer_sidecar_restore_fullscreen_with_metadata_boundary(
             idx,
             history_trigger,
             requested_materialization,
             load_contract,
+            boundary,
         ) {
             return;
         }
@@ -65539,8 +65698,8 @@ impl App {
         #[cfg(windows)]
         let route_materialized_perf_t0 = start_fs_open_perf_span(&perf);
         #[cfg(windows)]
-        let routed_materialized_physical_still =
-            self.route_materialized_physical_still_open_to_active_context(idx);
+        let routed_materialized_physical_still = boundary == FsMetadataBoundary::Manual
+            && self.route_materialized_physical_still_open_to_active_context(idx);
         #[cfg(windows)]
         finish_fs_open_perf_span(
             &mut perf,
@@ -65668,7 +65827,11 @@ impl App {
         // フルスクリーン側ではページ単位 (= 1 ファイル/1 ページ) 操作中心になるため、
         // グリッド側で積み上げた Undo は破棄する。フルスクリーン中の操作は新しい
         // スタックで管理する (画像移動でさらにクリアされる)。
-        self.clear_meta_undo();
+        if boundary == FsMetadataBoundary::RatingMembership {
+            self.clear_meta_undo_for_rating_move();
+        } else {
+            self.clear_meta_undo();
+        }
         self.capture_region_selection = None;
         if self.fullscreen_idx.is_none() {
             self.fs_pdf_display_target = None;
@@ -67932,20 +68095,57 @@ impl App {
     /// ページ単位 (Image / ZipImage / PdfPage) + コンテナ (Folder / ZipFile / PdfFile) の両方。
     /// 動画 / セパレータ / ConvertibleArchive などは常に通す。
     pub(crate) fn rebuild_visible_indices(&mut self) {
-        self.rebuild_visible_indices_impl(true, false);
+        let reader_open = self
+            .sidecar_restore_rating_deferred_target()
+            .or(self.fullscreen_idx)
+            .is_some();
+        let old = if reader_open {
+            self.capture_rating_membership_for_filter_change()
+        } else {
+            self.capture_rating_membership()
+        };
+        self.rebuild_visible_indices_impl(
+            true,
+            false,
+            if reader_open {
+                VisibleSelectionPolicy::RatingMembership
+            } else {
+                VisibleSelectionPolicy::General
+            },
+        );
+        if reader_open {
+            self.adopt_rating_membership(
+                old,
+                crate::rating_membership::RatingAdoptionIntent::Reconcile,
+            );
+        }
     }
 
     /// DB / bookmarkなど外部snapshotの更新で、現在mount中のcontext-owned表示集合だけを
     /// 再計算する。`facet_navigation`はAppのmain専用ownerなので、detached/pausedを
     /// 一時mountする経路ではnavigation扱いのscope同期を行わない。
     fn rebuild_visible_indices_preserving_facet_scope(&mut self) {
-        self.rebuild_visible_indices_impl(false, false);
+        let old = self.capture_rating_membership();
+        self.rebuild_visible_indices_impl(false, false, VisibleSelectionPolicy::RatingMembership);
+        self.adopt_rating_membership(
+            old,
+            crate::rating_membership::RatingAdoptionIntent::Reconcile,
+        );
     }
 
     /// A rating publication changes membership, but the rating header retains
     /// the order established by its last explicit sort or items install.
     pub(crate) fn rebuild_visible_indices_after_rating_publication(&mut self) {
-        self.rebuild_visible_indices_impl(false, true);
+        let old = self.capture_rating_membership();
+        self.rebuild_visible_indices_for_rating_adoption();
+        self.adopt_rating_membership(
+            old,
+            crate::rating_membership::RatingAdoptionIntent::Reconcile,
+        );
+    }
+
+    pub(crate) fn rebuild_visible_indices_for_rating_adoption(&mut self) {
+        self.rebuild_visible_indices_impl(false, true, VisibleSelectionPolicy::RatingMembership);
         self.refresh_smart_folder_rating_navigation_entries();
     }
 
@@ -67953,6 +68153,7 @@ impl App {
         &mut self,
         sync_facet_scope: bool,
         preserve_rating_details_order: bool,
+        selection_policy: VisibleSelectionPolicy,
     ) {
         if matches!(self.navigation_scope, ViewerNavigationScope::CollectionRoot) {
             // The root's installed prepared order is the navigation domain. App-global search,
@@ -67961,7 +68162,9 @@ impl App {
             self.details_thumb_suppression_applied = false;
             self.details_order.clear();
             self.viewer_navigation_caches.invalidate();
-            self.ensure_selected_visible_or_first();
+            if selection_policy == VisibleSelectionPolicy::General {
+                self.ensure_selected_visible_or_first();
+            }
             return;
         }
         if self.navigation_scope.is_detached_physical() {
@@ -67991,7 +68194,9 @@ impl App {
                 let vi = &self.visible_indices;
                 self.checked.retain(|idx| vi.binary_search(idx).is_ok());
             }
-            self.ensure_selected_visible_or_first();
+            if selection_policy == VisibleSelectionPolicy::General {
+                self.ensure_selected_visible_or_first();
+            }
             return;
         }
         self.ensure_bookmark_presence_loaded();
@@ -68029,6 +68234,7 @@ impl App {
             };
 
         let n = self.items.len();
+        let preview = self.rating_preview_recipe();
         let smart_rating_membership = self.smart_folder_rating_membership_flags();
         let mut smart_rule_total = 0;
         let mut smart_rule_search_matches = 0;
@@ -68057,13 +68263,25 @@ impl App {
                     continue;
                 }
             }
-            if self.items_are_rating_view && self.get_rating(i) != self.rating_view_stars {
-                continue;
+            if self.items_are_rating_view {
+                let stars = self.get_rating(i);
+                let mut filter = [false; 6];
+                filter[self.rating_view_stars.min(5) as usize] = true;
+                if !self
+                    .rating_path_key(i)
+                    .is_some_and(|key| preview.allows(&key, stars, &filter))
+                {
+                    continue;
+                }
             }
             if rating_filter_active {
                 let stars = self.get_rating(i);
                 if let Some(item) = self.items.get(i) {
-                    if !passes_rating_filter(item, stars, &rating_filter) {
+                    if !passes_rating_filter(item, stars, &rating_filter)
+                        && !self
+                            .rating_path_key(i)
+                            .is_some_and(|key| preview.allows(&key, stars, &rating_filter))
+                    {
                         continue;
                     }
                 }
@@ -68087,6 +68305,24 @@ impl App {
             session.rating_rule_search_match_count = smart_rule_search_matches;
         }
         self.visible_indices = result;
+        if self
+            .ring_picker
+            .as_ref()
+            .is_some_and(|picker| picker.owner == self.projected_viewer_context_id())
+            && self
+                .fullscreen_idx
+                .is_some_and(|idx| !self.visible_indices.contains(&idx))
+        {
+            // A non-rating predicate/source change ends the picker; only its own rating leaves
+            // are held. Adopt the normal projection in this same owner, without navigation here.
+            self.finish_rating_picker_before_source_adoption();
+            self.rebuild_visible_indices_impl(
+                sync_facet_scope,
+                preserve_rating_details_order,
+                selection_policy,
+            );
+            return;
+        }
         if let Some(t0) = facet_name_filter_t0 {
             crate::perf::event(
                 "facet_name",
@@ -68177,7 +68413,9 @@ impl App {
             let vi = &self.visible_indices;
             self.checked.retain(|idx| vi.binary_search(idx).is_ok());
         }
-        self.ensure_selected_visible_or_first();
+        if selection_policy == VisibleSelectionPolicy::General {
+            self.ensure_selected_visible_or_first();
+        }
     }
 
     pub(crate) fn facet_candidate_indices(&mut self, ignore: FacetField) -> Vec<usize> {
@@ -70367,6 +70605,30 @@ impl App {
         stars: u8,
         meta: Option<&crate::rating_db::RatingMeta>,
     ) -> Result<(), String> {
+        self.write_user_rating_shared_deferred_from(key, stars, meta, "user", None)
+    }
+
+    pub(crate) fn write_user_rating_shared_deferred_from(
+        &mut self,
+        key: &str,
+        stars: u8,
+        meta: Option<&crate::rating_db::RatingMeta>,
+        source: &str,
+        known: Option<(Option<usize>, u8)>,
+    ) -> Result<(), String> {
+        let (target, before) = if let Some((target, before)) = known {
+            (target, Some(before))
+        } else {
+            let target = (0..self.items.len())
+                .find(|&idx| self.rating_path_key(idx).as_deref() == Some(key));
+            let before = self
+                .rating_session_value_for_key(key)
+                .or_else(|| target.and_then(|idx| self.rating_cache.get(&idx).copied()));
+            (target, before)
+        };
+        let reader_member = self
+            .fullscreen_idx
+            .is_some_and(|idx| self.visible_indices.binary_search(&idx).is_ok());
         self.rating_db
             .as_ref()
             .ok_or_else(|| "レーティング DB を利用できません".to_string())?
@@ -70376,6 +70638,7 @@ impl App {
         // counter. Detached/main contexts may consume it only after SQLite is
         // the durable source of truth.
         self.record_rating_session_write(key.to_string(), stars, true);
+        self.log_successful_rating_save(source, key, before, stars, target, reader_member);
         Ok(())
     }
 
@@ -70386,6 +70649,23 @@ impl App {
     pub(crate) fn write_user_ratings_shared(
         &mut self,
         writes: &[(String, u8, Option<crate::rating_db::RatingMeta>)],
+    ) -> Result<(), String> {
+        self.write_user_ratings_shared_deferred(writes)?;
+        self.publish_current_context_rating_writes();
+        Ok(())
+    }
+
+    pub(crate) fn write_user_ratings_shared_deferred(
+        &mut self,
+        writes: &[(String, u8, Option<crate::rating_db::RatingMeta>)],
+    ) -> Result<(), String> {
+        self.write_user_ratings_shared_deferred_from(writes, "user")
+    }
+
+    pub(crate) fn write_user_ratings_shared_deferred_from(
+        &mut self,
+        writes: &[(String, u8, Option<crate::rating_db::RatingMeta>)],
+        source: &str,
     ) -> Result<(), String> {
         if writes.is_empty() {
             return Ok(());
@@ -70399,10 +70679,21 @@ impl App {
             .ok_or_else(|| "レーティング DB を利用できません".to_string())?
             .set_user_ratings(&db_writes)
             .map_err(|error| format!("レーティング DB への保存に失敗しました: {error}"))?;
+        // Resolve the installed slots once, rather than scanning the list for each row.
+        let slots = (0..self.items.len())
+            .filter_map(|idx| self.rating_path_key(idx).map(|key| (key, idx)))
+            .collect::<HashMap<_, _>>();
+        let reader_member = self
+            .fullscreen_idx
+            .is_some_and(|idx| self.visible_indices.binary_search(&idx).is_ok());
         for (key, stars, _) in writes {
+            let target = slots.get(key).copied();
+            let before = self
+                .rating_session_value_for_key(key)
+                .or_else(|| target.and_then(|idx| self.rating_cache.get(&idx).copied()));
             self.record_rating_session_write(key.clone(), *stars, true);
+            self.log_successful_rating_save(source, key, before, *stars, target, reader_member);
         }
-        self.publish_current_context_rating_writes();
         Ok(())
     }
 
@@ -70489,22 +70780,33 @@ impl App {
         if let Some(stars) = folder_update {
             changed |= self.current_folder_rating_cache.replace(stars) != Some(stars);
         }
-        self.rating_session_write_seen_generation = current;
         changed
     }
 
     /// Publish durable path-key writes into the mounted context's display state.
     /// Parked contexts run this same step on mount after their bundle is swapped in.
     pub(crate) fn publish_current_context_rating_writes(&mut self) {
+        self.publish_current_context_rating_writes_with_intent(
+            crate::rating_membership::RatingAdoptionIntent::Reconcile,
+        );
+    }
+
+    pub(crate) fn publish_current_context_rating_writes_with_intent(
+        &mut self,
+        intent: crate::rating_membership::RatingAdoptionIntent,
+    ) {
         let seen = self.rating_session_write_seen_generation;
-        if seen == self.rating_session_write_generation {
+        if seen == self.rating_session_write_generation
+            && matches!(
+                intent,
+                crate::rating_membership::RatingAdoptionIntent::Reconcile
+            )
+        {
             return;
         }
+        let old = self.capture_rating_membership();
         let updates = self.rating_session_writes_after(seen);
         self.sync_current_context_rating_session_writes();
-        if updates.is_empty() {
-            return;
-        }
         #[cfg(test)]
         {
             self.rating_publication_count += 1;
@@ -70515,7 +70817,9 @@ impl App {
             self.request_rating_view_membership_refresh();
         }
         self.schedule_smart_folder_rating_membership();
-        self.rebuild_visible_indices_after_rating_publication();
+        self.rebuild_visible_indices_for_rating_adoption();
+        self.adopt_rating_membership(old, intent);
+        self.rating_session_write_seen_generation = self.rating_session_write_generation;
     }
 
     pub(crate) fn rating_session_writes_after(&self, generation: u64) -> Vec<(String, u8)> {
@@ -70563,7 +70867,11 @@ impl App {
     /// フォルダ / ZIP / PDF ファイル本体も対象 (コンテナレーティング)。
     /// 非対象アイテムはキャッシュを汚さないように insert しない。
     pub(crate) fn get_rating(&mut self, idx: usize) -> u8 {
-        self.sync_current_context_rating_session_writes();
+        if let Some(key) = self.rating_path_key(idx)
+            && let Some(write) = self.rating_session_writes.get(&key)
+        {
+            self.rating_cache.insert(idx, write.stars);
+        }
         if let Some(&v) = self.rating_cache.get(&idx) {
             return v;
         }
@@ -70590,8 +70898,11 @@ impl App {
     /// フォルダ / ZIP / PDF ファイル本体も対象 (コンテナレーティング)。
     pub(crate) fn set_rating(&mut self, idx: usize, stars: u8) -> bool {
         let stars = stars.min(5);
-        let before = self.rating_cache.get(&idx).copied().unwrap_or(0);
-        match self.set_rating_result(idx, stars) {
+        let before = self.get_rating(idx);
+        if before == stars {
+            return false;
+        }
+        match self.set_rating_result_deferred(idx, stars) {
             Ok(true) => {
                 if before != stars {
                     let summary = if stars == 0 {
@@ -70601,6 +70912,7 @@ impl App {
                     };
                     self.capture_rating_undo(vec![(idx, before, stars)], summary);
                 }
+                self.publish_current_context_rating_writes();
                 true
             }
             Ok(false) => false,
@@ -70644,7 +70956,13 @@ impl App {
         // DB write と App-global path generation の記録を同じ ownership
         // boundary に通す。detached unmount 時は swap 境界が main / parked
         // cache へ同じ値を反映する。
-        self.write_user_rating_shared_deferred(&key, stars, meta.as_ref())?;
+        self.write_user_rating_shared_deferred_from(
+            &key,
+            stars,
+            meta.as_ref(),
+            "item",
+            Some((Some(idx), old_stars)),
+        )?;
         self.rating_cache.insert(idx, stars);
         self.invalidate_rating_counts_cache();
         // コンテナ自身の★は子孫集計と別軸なので、単一ファイルレーティング (画像 / 動画 /
@@ -71363,7 +71681,6 @@ impl App {
         if !self.set_rating(idx, stars) {
             return false;
         }
-        self.rebuild_visible_indices();
         if stars == 0 {
             self.show_feedback_toast("[★解除]".to_string());
         } else {
@@ -71418,6 +71735,25 @@ impl App {
         stars: u8,
         capture_undo: bool,
     ) -> Result<bool, String> {
+        self.write_container_rating_for_target_with_publication(
+            key,
+            source,
+            meta,
+            stars,
+            capture_undo,
+            true,
+        )
+    }
+
+    pub(crate) fn write_container_rating_for_target_with_publication(
+        &mut self,
+        key: &str,
+        source: &Path,
+        meta: &crate::rating_db::RatingMeta,
+        stars: u8,
+        capture_undo: bool,
+        publish: bool,
+    ) -> Result<bool, String> {
         let showing_this_container = self
             .current_container_rating_target()
             .is_some_and(|(current, _, _)| current == key);
@@ -71428,7 +71764,16 @@ impl App {
             .flatten()
             .or_else(|| self.rating_db.as_ref().map(|db| db.get(key)))
             .unwrap_or(0);
-        self.write_user_rating_shared(key, stars, Some(meta))?;
+        if before == stars {
+            return Ok(false);
+        }
+        self.write_user_rating_shared_deferred_from(
+            key,
+            stars,
+            Some(meta),
+            "container",
+            Some((None, before)),
+        )?;
         if capture_undo && before != stars {
             self.capture_container_rating_undo_for_target(key, source, meta, before, stars);
         }
@@ -71454,7 +71799,9 @@ impl App {
                 smart_folder::SmartFolderMetadataDependency::Rating,
             );
         }
-        self.rebuild_visible_indices();
+        if publish {
+            self.publish_current_context_rating_writes();
+        }
         self.record_content_identity_for_path(
             source,
             crate::content_identity::ContentIdentityTrigger::Edit,
@@ -71702,30 +72049,38 @@ impl App {
         if to_write.is_empty() {
             return;
         }
-        let write_keys: std::collections::HashSet<&String> =
-            to_write.iter().map(|(k, _, _)| k).collect();
-        // items の逆引き: path → idx (Image だけ)
-        for (idx, item) in self.items.iter().enumerate() {
-            if let GridItem::Image(p) = item {
-                let k = crate::adjustment_db::normalize_path(p);
-                if write_keys.contains(&k) {
-                    let stars = target[&k].0;
-                    self.rating_cache.insert(idx, stars);
-                }
-            }
-        }
         let mut rating_written = false;
         let mut imported_writes = Vec::new();
         for (key, stars, path) in &to_write {
             let meta = crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::Image)
                 .with_source_path(path);
-            if db.set_imported_rating(key, *stars, Some(&meta)).is_ok() {
-                rating_written = true;
-                imported_writes.push((key.clone(), *stars));
+            match db.set_imported_rating(key, *stars, Some(&meta)) {
+                Ok(()) => {
+                    rating_written = true;
+                    imported_writes.push((key.clone(), *stars));
+                }
+                Err(error) => crate::logger::log(format!(
+                    "[RATING] hydration write failed key={key:?}: {error}"
+                )),
             }
         }
+        let slots = (0..self.items.len())
+            .filter_map(|idx| self.rating_path_key(idx).map(|key| (key, idx)))
+            .collect::<HashMap<_, _>>();
+        let reader_member = self
+            .fullscreen_idx
+            .is_some_and(|idx| self.visible_indices.binary_search(&idx).is_ok());
         for (key, stars) in imported_writes {
-            self.record_rating_session_write(key, stars, false);
+            self.record_rating_session_write(key.clone(), stars, false);
+            self.log_successful_rating_save(
+                "xmp",
+                &key,
+                Some(0),
+                stars,
+                slots.get(&key).copied(),
+                reader_member,
+            );
+            self.apply_rating_delta_to_folder_counts(&key, 0, stars);
         }
         self.publish_current_context_rating_writes();
         if rating_written {
@@ -71734,12 +72089,6 @@ impl App {
             );
         }
         self.invalidate_rating_counts_cache();
-        // 子孫★集計バッジにも反映 (to_write は DB が 0 だった path のみ = old_stars=0)。
-        for (key, stars, _) in &to_write {
-            self.apply_rating_delta_to_folder_counts(key, 0, *stars);
-        }
-        // 実際に rating_cache が更新されたのでフィルタ影響あり
-        self.rebuild_visible_indices_preserving_facet_scope();
     }
 
     /// 指定 idx の grid cell に描くタグ列。`tags_cache` のみを引く (同期 I/O を避ける)。
@@ -72102,7 +72451,9 @@ impl App {
                 RatingEdit::Assign(stars) => Some(stars),
                 RatingEdit::Step(direction) => crate::keymap::step_rating(before, direction),
             };
-            if let Some(after) = after {
+            if let Some(after) = after
+                && before != after
+            {
                 pending_records.push((idx, before, after));
             }
         }
@@ -72151,9 +72502,6 @@ impl App {
             }
         };
         self.capture_rating_undo(undo_records, summary.clone());
-        if matches!(edit, RatingEdit::Step(_)) {
-            self.show_feedback_toast(format!("[{summary}]"));
-        }
         let bulk = successful_targets.len() > 1;
         if bulk {
             crate::logger::log(format!(
@@ -72173,6 +72521,9 @@ impl App {
             self.checked.clear();
         }
         self.publish_current_context_rating_writes();
+        if matches!(edit, RatingEdit::Step(_)) {
+            self.show_feedback_toast(format!("[{summary}]"));
+        }
     }
 
     /// 現在動画の mute を反転し、セッション状態と次回起動用の保存状態にも反映する。
@@ -74448,6 +74799,8 @@ impl App {
     /// `keep_fullscreen_viewport_alive` がこのフラグを見て Visible(false) を
     /// 送信し、その直後に false に落とす。ここで先に落とすと送信が抑止される。
     pub(crate) fn close_fullscreen(&mut self) {
+        self.finish_rating_picker_for_manual_navigation();
+        self.cancel_rating_membership_restore();
         // A staged Ctrl traversal still leaves the old fullscreen visible. If that fullscreen
         // is explicitly closed before adoption, it no longer authorizes a deferred reopen.
         self.retire_staged_smart_fullscreen_nav_for_close();
@@ -74551,6 +74904,81 @@ impl App {
     }
 
     fn close_fullscreen_now(&mut self) {
+        self.close_fullscreen_now_with_metadata_boundary(FsMetadataBoundary::Manual);
+    }
+
+    fn close_fullscreen_for_rating_membership(&mut self) {
+        self.cancel_sidecar_restore_rating_deferred_target();
+        let toast = self.fs_feedback_toast.clone();
+        #[cfg(windows)]
+        if self.video_presentation_transition.is_transitioning()
+            || self.video_presentation_transition.has_pending_effects()
+        {
+            self.video_presentation_transition
+                .dispatch(PresentationTransitionEvent::TerminalCloseForRatingMembership);
+            let ctx = self.edit_preview_repaint_ctx.clone().unwrap_or_default();
+            if self.execute_video_presentation_transition_effects(&ctx)
+                == PresentationEffectsOutcome::ClosedFullscreen
+            {
+                if let Some(toast) = toast {
+                    self.fs_feedback_toast = Some(toast);
+                    self.fs_feedback_toast_surface = Some(ActionSurface::MainWindow);
+                }
+                return;
+            }
+        }
+        self.close_fullscreen_now_with_metadata_boundary(FsMetadataBoundary::RatingMembership);
+        if let Some(toast) = toast {
+            self.fs_feedback_toast = Some(toast);
+            self.fs_feedback_toast_surface = Some(ActionSurface::MainWindow);
+        }
+    }
+
+    /// Existing foreground-editor exit boundary, shared by close and Rating re-adoption.
+    /// The caller finishes local gestures and chooses the metadata Undo policy first.
+    fn finish_fullscreen_edit_modes(&mut self) {
+        self.fold_local_adjust_edit_state();
+        self.reset_erase_mode();
+        self.reset_conceal_mode();
+        // テキストモードもフルスクリーン解除時に保存して閉じる (Codex P1: 閉じ経路で
+        // text_mode がリークすると次回フルスクリーンで通常ショートカットが効かなくなり、
+        // 編集も保存されない)。reset_conceal_mode と同じくこの時点では fullscreen_idx が
+        // まだ有効なので save_comic_objects が正しいページに効く。export_crop と同じ理由で
+        // spread_ctx は復元せず破棄する (close は fullscreen_idx=None を維持するため)。
+        self.text_spread_ctx = None;
+        self.reset_text_mode();
+        // close は fullscreen_idx=None を維持する。spread_ctx を残すと
+        // reset_export_crop_mode が fullscreen_idx を旧ページへ復元してしまい、
+        // フォルダロード経路 (start_loading_items→close_fullscreen) で stale な
+        // fullscreen idx を引き継ぐため、復元せず破棄する (Codex P1)。
+        self.export_crop_spread_ctx = None;
+        self.reset_export_crop_mode();
+        // SNS 分割も一度きりの foreground editor。close では旧ページを復元せず、
+        // layout / drag と一緒に pivot を破棄する。
+        self.sns_split_spread_ctx = None;
+        self.reset_sns_split_mode();
+        self.persist_pending_view_trim_state();
+        self.view_trim_mode = false;
+        self.view_trim_page_apply_root_idx = None;
+        self.view_trim_page_spread_separate = self.view_trim_book_settings.spread_separate;
+        self.local_adjust_mode = false;
+        self.local_adjust_repair_point_pick_active = None;
+        self.local_adjust_add_layer_dialog_open = false;
+        self.local_adjust_change_mask_dialog_open = false;
+        self.local_adjust_change_mask_keep_manual_override = true;
+        self.local_adjust_effect_picker_dialog_open = false;
+        self.local_adjust_segmentation_pending = None;
+    }
+
+    fn close_fullscreen_now_with_metadata_boundary(&mut self, boundary: FsMetadataBoundary) {
+        // A pending editor commit may push a discarded entry and clear Redo. Only stable
+        // rating history crosses an automatic close, before any fold/reset can touch it.
+        let rating_history = if boundary == FsMetadataBoundary::RatingMembership {
+            self.meta_undo.retain_rating();
+            Some(std::mem::take(&mut self.meta_undo))
+        } else {
+            None
+        };
         // 閉じる間 UI スレッドが止まっていると、その分だけ**誰も描かない**フレームが並び、
         // 画面のちらつきとして見える (利用者報告 2026-08-27、実測 9 フレーム / 約 300ms)。
         // どの段で止まっているかを 1 行で出す。ログ行の時刻と合わせれば、presenter 停止や
@@ -74647,7 +75075,9 @@ impl App {
                 self.cleanup_normalize_state_for_fs_idx(idx);
             }
         }
-        self.restore_grid_cursor_to_fullscreen_item();
+        if boundary == FsMetadataBoundary::Manual {
+            self.restore_grid_cursor_to_fullscreen_item();
+        }
         #[cfg(windows)]
         self.prepare_viewer_presentation_close();
         #[cfg(windows)]
@@ -74888,7 +75318,11 @@ impl App {
         //   `fs_nav_holdover_for_draw` が別途判定する。
         // PDF pool の Critical 予約は v1.0.0 から常時 ON 方針なので、ここで切替えない。
         // フルスクリーン中の Undo スタックはここで破棄。グリッドに戻ったら新しい操作を積む。
-        self.clear_meta_undo();
+        if boundary == FsMetadataBoundary::RatingMembership {
+            self.clear_meta_undo_for_rating_move();
+        } else {
+            self.clear_meta_undo();
+        }
         self.slideshow_playing = false;
         self.slideshow_anchor_idx = None;
         self.continuous_reading_scroll_transition = None;
@@ -74961,36 +75395,7 @@ impl App {
             // (review-v2.3.0 追補2 BA-7)。
             self.clear_mounted_native_video_pending();
         }
-        self.reset_erase_mode();
-        self.reset_conceal_mode();
-        // テキストモードもフルスクリーン解除時に保存して閉じる (Codex P1: 閉じ経路で
-        // text_mode がリークすると次回フルスクリーンで通常ショートカットが効かなくなり、
-        // 編集も保存されない)。reset_conceal_mode と同じくこの時点では fullscreen_idx が
-        // まだ有効なので save_comic_objects が正しいページに効く。export_crop と同じ理由で
-        // spread_ctx は復元せず破棄する (close は fullscreen_idx=None を維持するため)。
-        self.text_spread_ctx = None;
-        self.reset_text_mode();
-        // close は fullscreen_idx=None を維持する。spread_ctx を残すと
-        // reset_export_crop_mode が fullscreen_idx を旧ページへ復元してしまい、
-        // フォルダロード経路 (start_loading_items→close_fullscreen) で stale な
-        // fullscreen idx を引き継ぐため、復元せず破棄する (Codex P1)。
-        self.export_crop_spread_ctx = None;
-        self.reset_export_crop_mode();
-        // SNS 分割も一度きりの foreground editor。close では旧ページを復元せず、
-        // layout / drag と一緒に pivot を破棄する。
-        self.sns_split_spread_ctx = None;
-        self.reset_sns_split_mode();
-        self.persist_pending_view_trim_state();
-        self.view_trim_mode = false;
-        self.view_trim_page_apply_root_idx = None;
-        self.view_trim_page_spread_separate = self.view_trim_book_settings.spread_separate;
-        self.local_adjust_mode = false;
-        self.local_adjust_repair_point_pick_active = None;
-        self.local_adjust_add_layer_dialog_open = false;
-        self.local_adjust_change_mask_dialog_open = false;
-        self.local_adjust_change_mask_keep_manual_override = true;
-        self.local_adjust_effect_picker_dialog_open = false;
-        self.local_adjust_segmentation_pending = None;
+        self.finish_fullscreen_edit_modes();
         self.enqueue_edit_preview_close_update(edit_preview_close_update);
         self.erase_base_cache.clear();
         self.conceal_base_cache.clear();
@@ -75090,6 +75495,9 @@ impl App {
             ));
         }
         self.restore_direct_media_reader_origin();
+        if let Some(history) = rating_history {
+            self.meta_undo = history;
+        }
     }
 
     /// フルスクリーン終了後のグリッドカーソルを、最後に表示していた item に戻す。

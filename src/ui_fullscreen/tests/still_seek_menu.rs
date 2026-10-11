@@ -1,5 +1,75 @@
 use super::*;
 
+#[test]
+fn rating_membership_move_keeps_real_seek_strip_and_page_number_painted() {
+    let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+    for bar in [
+        crate::settings::StillSeekBarWithStrip::Show,
+        crate::settings::StillSeekBarWithStrip::Hide,
+    ] {
+        let mut app = still_seek_edge_test_app();
+        app.viewer_presentation = crate::app::ViewerPresentation::Fullscreen;
+        app.selected = Some(3);
+        app.settings.rating_filter = [false, false, false, true, false, false];
+        app.settings.still_seek_bar_with_strip = bar;
+        for idx in 0..app.items.len() {
+            let key = app.rating_path_key(idx).unwrap();
+            app.rating_db.as_ref().unwrap().set(&key, 3).unwrap();
+            app.rating_cache.insert(idx, 3);
+        }
+        assert_eq!(
+            app.fullscreen_page_number_label(3).as_deref(),
+            Some("4 / 10")
+        );
+        assert!(app.set_rating(3, 4));
+        assert_eq!(app.fullscreen_idx, Some(4));
+        assert!(!app.visible_indices.contains(&3));
+        let info = app
+            .fullscreen_seek_info(4)
+            .expect("new reader belongs to the adopted set");
+        assert_eq!(info.image_indices.len(), 9);
+        assert_eq!(
+            app.fullscreen_page_number_label(4).as_deref(),
+            Some("4 / 9")
+        );
+
+        let ctx = egui::Context::default();
+        let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
+        let mut strip = None;
+        let mut track = None;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(full),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.draw_fullscreen_seek_overlay(ui, ctx, full, 4, false, false);
+                    strip =
+                        ctx.read_response(ui.make_persistent_id("fullscreen_still_seek_strip_row"));
+                    track = ctx.read_response(ui.make_persistent_id("fullscreen_seek_track"));
+                    app.draw_fullscreen_page_number_overlay(ui, full, 4, false);
+                });
+            },
+        );
+        assert!(
+            strip.is_some(),
+            "rating move must keep the real thumbnail strip"
+        );
+        assert_eq!(
+            track.is_some(),
+            bar == crate::settings::StillSeekBarWithStrip::Show
+        );
+        assert!(
+            output.shapes.iter().any(|shape| matches!(
+                &shape.shape,
+                egui::Shape::Text(text) if text.galley.text() == "4 / 9"
+            )),
+            "the seek bar or standalone page-number overlay must paint the updated count"
+        );
+    }
+}
+
 struct MenuFrame {
     toggle: egui::Response,
     shapes: Vec<egui::epaint::ClippedShape>,
@@ -123,6 +193,7 @@ fn menu_key_frame(key: egui::Key) -> (FsKeyAction, bool) {
         egui::Id::new(FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID).with("popup"),
     );
     let mut action = FsKeyAction {
+        page_transition: Default::default(),
         close: false,
         close_to_page_list: false,
         page_nav: FsPageNav::None,

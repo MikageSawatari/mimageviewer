@@ -324,7 +324,12 @@ rebuild へ分ける。query、sort 変更、reload だけが通常の sorted re
    Ctrl+F の走査・進捗・ヒット件数、facet と色検索の候補、一括操作の対象も同じ条件を先に適用する。
    後で条件から外れた行を `items` に保持しても、現 root の列挙対象には戻さない。
 4. rating filter / Rated・Unrated facet と Details state を更新する。
-5. selected が非表示になった場合は既存の nearest-visible policy、checked は既存の WYSIWYG policy。
+5. selected が評価由来で非表示になった場合は、現在の表示順の次の残存行、なければ前へ移す
+   (§1.371 の次優先規則)。履歴復元等の一般的な nearest-visible policy、checked の WYSIWYG policy は維持する。
+   reader も同じ採用境界で現在の読書順の次 / 前へ一度調停し、ページがゼロなら現在の filtered grid へ戻す。
+   自動移動・一覧復帰後の評価通知 / Undo と元画像復帰、リング preview だけによる既存行の離脱保留は
+   [評価変更と絞り込み](rating-filter-fullscreen-plan.md) が所有する。リング中も独立検索 hit・件数・明示 sort を
+   採用するので、評価順 snapshot の survivor 順固定を「公開集合全体を固定する」と解釈しない。
 
 どの手順も survivor の相対順を保つ。現行の「active 側の編集経路だけが all_hits / Rating view を直す」
 二重実装はこの手続きへ寄せる。

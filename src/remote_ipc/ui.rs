@@ -3047,13 +3047,20 @@ impl crate::app::App {
             Ok(target) => target,
             Err(error) => return RemoteWriteResponse::Error(error),
         };
-        if let Err(error) = self.write_user_rating_shared(&target.key, stars, Some(&target.meta)) {
+        if let Err(error) = self.write_user_rating_shared_deferred_from(
+            &target.key,
+            stars,
+            Some(&target.meta),
+            "remote",
+            None,
+        ) {
             crate::logger::log(format!("remote_ipc: rating write failed: {error}"));
             return write_error(
                 RemoteWriteErrorCode::PersistenceFailed,
                 "rating.db への保存に失敗しました",
             );
         }
+        self.publish_current_context_rating_writes();
         self.invalidate_rating_counts_cache();
         self.schedule_current_smart_folder_metadata_refresh(
             crate::app::smart_folder::SmartFolderMetadataDependency::Rating,

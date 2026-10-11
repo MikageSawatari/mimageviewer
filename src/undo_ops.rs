@@ -18,6 +18,7 @@ use std::path::PathBuf;
 
 use crate::adjustment::AdjustParams;
 use crate::app::App;
+use crate::rating_membership::RatingAdoptionIntent;
 use crate::tag_write_worker::{TagJobKind, TagWriteJob};
 use crate::undo_stack::{
     AdjustUndoScope, AdjustmentChange, LocalAdjustmentChange, RatingChange, TagChange, UndoEntry,
@@ -29,6 +30,16 @@ impl App {
     /// 1 回のレーティング操作 (単発 / バルク / コンテナ) を Undo スタックに積む。
     /// `before == after` の変更はフィルタ済みで OK。空エントリは undo_stack 側で破棄される。
     pub(crate) fn push_rating_undo_entry(&mut self, changes: Vec<RatingChange>, summary: String) {
+        let origin = self.capture_rating_origin();
+        self.push_rating_undo_entry_with_origin(changes, summary, origin);
+    }
+
+    pub(crate) fn push_rating_undo_entry_with_origin(
+        &mut self,
+        changes: Vec<RatingChange>,
+        summary: String,
+        origin: Option<crate::rating_membership::RatingOrigin>,
+    ) {
         // 実質変化のないものは積まない (Ctrl+Z 1 回が "見た目変化なし" になるのを防ぐ)
         let filtered: Vec<RatingChange> = changes
             .into_iter()
@@ -40,6 +51,7 @@ impl App {
         self.meta_undo.push(UndoEntry::Rating {
             changes: filtered,
             summary,
+            origin,
         });
     }
 
@@ -101,6 +113,7 @@ impl App {
     /// Undo/Redo スタック両方を破棄。フォルダ移動・フルスクリーン遷移・フルスクリーン
     /// 中の画像移動など「コンテキストが切り替わる境界」で呼ぶ。
     pub(crate) fn clear_meta_undo(&mut self) {
+        self.cancel_rating_membership_restore();
         if self.meta_undo.can_undo() || self.meta_undo.can_redo() {
             crate::logger::log(format!(
                 "[UNDO] clear_meta_undo: drop {} undo, {} redo entries",
@@ -109,6 +122,18 @@ impl App {
             ));
             self.meta_undo.clear();
         }
+        self.finish_meta_undo_boundary_cleanup();
+    }
+
+    /// Automatic rating membership landing changes the page, but its rating
+    /// operation must remain undoable from the new page or the returned grid.
+    /// Index-scoped editing entries and unfinished drag/tag sessions still end.
+    pub(crate) fn clear_meta_undo_for_rating_move(&mut self) {
+        self.meta_undo.retain_rating();
+        self.finish_meta_undo_boundary_cleanup();
+    }
+
+    fn finish_meta_undo_boundary_cleanup(&mut self) {
         // ドラッグ中に境界を跨いだ場合 (フォルダ移動・フルスクリーン遷移・消しゴム遷移)、
         // 進行中のセッションを安全に終了させる。
         //
@@ -187,17 +212,25 @@ impl App {
         };
         let summary = entry.summary().to_string();
         crate::logger::log(format!("[UNDO] applying undo: {summary}"));
+        let mut notice = None;
         match &mut entry {
-            UndoEntry::Rating { changes, .. } => {
-                if let Err(error) =
-                    self.apply_rating_changes_to_app(changes, /* use_before */ true)
-                {
-                    crate::logger::log(format!("[UNDO] rating undo failed: {error}"));
-                    self.report_rating_write_error(&error);
-                    // The entry was only borrowed, not applied. Restore it to
-                    // the same side; Redo must remain untouched.
-                    self.meta_undo.push_undo_from_redo(entry);
-                    return;
+            UndoEntry::Rating {
+                changes, origin, ..
+            } => {
+                match self.apply_rating_undo_to_origin(
+                    changes,
+                    /* use_before */ true,
+                    origin.as_ref(),
+                ) {
+                    Ok(origin_notice) => notice = origin_notice,
+                    Err(error) => {
+                        crate::logger::log(format!("[UNDO] rating undo failed: {error}"));
+                        self.report_rating_write_error(&error);
+                        // The entry was only borrowed, not applied. Restore it to
+                        // the same side; Redo must remain untouched.
+                        self.meta_undo.push_undo_from_redo(entry);
+                        return;
+                    }
                 }
             }
             UndoEntry::Tag { changes, .. } => {
@@ -224,28 +257,43 @@ impl App {
                 }
             }
         }
-        self.show_feedback_toast(format!("元に戻す: {summary}"));
+        let mut feedback = format!("元に戻す: {summary}");
+        if let Some(notice) = notice {
+            feedback.push_str(&format!(" ({notice})"));
+        }
+        self.show_feedback_toast(feedback);
         self.meta_undo.push_redo(entry);
     }
 
     /// Ctrl+Y / Ctrl+Shift+Z ハンドラ。Redo スタック先頭を取り出し、`after` 状態を
     /// 再適用してから Undo スタックへ戻す。
     pub(crate) fn apply_meta_redo(&mut self) {
+        // An accepted Redo replaces any outstanding Undo restoration, including
+        // when the after-value write fails or there is no entry left to replay.
+        self.cancel_rating_membership_restore();
         let Some(mut entry) = self.meta_undo.pop_redo() else {
             return;
         };
         let summary = entry.summary().to_string();
         crate::logger::log(format!("[UNDO] applying redo: {summary}"));
+        let mut notice = None;
         match &mut entry {
-            UndoEntry::Rating { changes, .. } => {
-                if let Err(error) =
-                    self.apply_rating_changes_to_app(changes, /* use_before */ false)
-                {
-                    crate::logger::log(format!("[UNDO] rating redo failed: {error}"));
-                    self.report_rating_write_error(&error);
-                    // Keep the failed operation retryable on the Redo side.
-                    self.meta_undo.push_redo(entry);
-                    return;
+            UndoEntry::Rating {
+                changes, origin, ..
+            } => {
+                match self.apply_rating_undo_to_origin(
+                    changes,
+                    /* use_before */ false,
+                    origin.as_ref(),
+                ) {
+                    Ok(origin_notice) => notice = origin_notice,
+                    Err(error) => {
+                        crate::logger::log(format!("[UNDO] rating redo failed: {error}"));
+                        self.report_rating_write_error(&error);
+                        // Keep the failed operation retryable on the Redo side.
+                        self.meta_undo.push_redo(entry);
+                        return;
+                    }
                 }
             }
             UndoEntry::Tag { changes, .. } => {
@@ -270,7 +318,11 @@ impl App {
                 }
             }
         }
-        self.show_feedback_toast(format!("やり直し: {summary}"));
+        let mut feedback = format!("やり直し: {summary}");
+        if let Some(notice) = notice {
+            feedback.push_str(&format!(" ({notice})"));
+        }
+        self.show_feedback_toast(feedback);
         self.meta_undo.push_undo_from_redo(entry);
     }
 
@@ -318,10 +370,11 @@ impl App {
     /// Apply a rating Undo/Redo entry as one SQLite transaction. Durable DB
     /// success is the publication boundary for caches, generations, XMP jobs,
     /// and the caller's stack transition.
-    fn apply_rating_changes_to_app(
+    pub(crate) fn apply_rating_changes_to_app(
         &mut self,
         changes: &[RatingChange],
         use_before: bool,
+        intent: RatingAdoptionIntent,
     ) -> Result<(), String> {
         let mut writes = Vec::with_capacity(changes.len());
         let mut seen = std::collections::HashSet::with_capacity(changes.len());
@@ -339,7 +392,10 @@ impl App {
             });
             writes.push((change.path_key.clone(), target, meta));
         }
-        self.write_user_ratings_shared(&writes)?;
+        self.write_user_ratings_shared_deferred_from(
+            &writes,
+            if use_before { "undo" } else { "redo" },
+        )?;
         for change in changes {
             self.record_content_identity_for_path(
                 &change.source_path,
@@ -383,6 +439,7 @@ impl App {
                 crate::app::smart_folder::SmartFolderMetadataDependency::Rating,
             );
         }
+        self.publish_current_context_rating_writes_with_intent(intent);
         Ok(())
     }
 
@@ -747,6 +804,109 @@ fn adjust_scope_priority(scope: &AdjustUndoScope) -> u8 {
     }
 }
 
+#[cfg(test)]
+mod rating_origin_tests {
+    use super::*;
+
+    fn change(path: PathBuf) -> RatingChange {
+        RatingChange {
+            path_key: crate::adjustment_db::normalize_path(&path),
+            source_path: path,
+            meta: None,
+            xmp_target: None,
+            before: 3,
+            after: 4,
+        }
+    }
+
+    #[test]
+    fn rating_undo_captures_origin_before_reader_moves() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let path = app.tmp.path().join("origin.jpg");
+        app.items = vec![crate::grid_item::GridItem::Image(path.clone())];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = crate::app::ViewerPresentation::Fullscreen;
+        let expected = app.capture_rating_origin();
+        assert!(expected.is_some());
+        app.push_rating_undo_entry(vec![change(path)], "rating".into());
+        app.fullscreen_idx = None;
+        let UndoEntry::Rating { origin, .. } = app.meta_undo.peek_undo().unwrap() else {
+            panic!("rating entry expected");
+        };
+        assert_eq!(origin, &expected);
+    }
+
+    #[test]
+    fn automatic_rating_move_retains_rating_stacks_and_ends_tag_cleanup() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let path = app.tmp.path().join("retained.jpg");
+        app.push_rating_undo_entry(vec![change(path.clone())], "rating redo".into());
+        let redo = app.meta_undo.pop_undo().unwrap();
+        app.push_rating_undo_entry(vec![change(path.clone())], "rating undo".into());
+        app.push_tag_undo_entry(
+            vec![TagChange {
+                path,
+                tag_sidecar: None,
+                before: vec![],
+                after: vec!["tag".into()],
+            }],
+            "tag".into(),
+        );
+        app.meta_undo.push_redo(redo);
+        app.register_pending_tag_op(1, "pending tag".into(), 1);
+        app.clear_meta_undo_for_rating_move();
+        assert_eq!(app.meta_undo.undo_len(), 1);
+        assert_eq!(app.meta_undo.redo_len(), 1);
+        assert!(matches!(
+            app.meta_undo.peek_undo(),
+            Some(UndoEntry::Rating { .. })
+        ));
+        assert!(matches!(
+            app.meta_undo.peek_redo(),
+            Some(UndoEntry::Rating { .. })
+        ));
+        assert!(app.pending_tag_undos.is_empty());
+        app.clear_meta_undo();
+        assert_eq!(app.meta_undo.undo_len(), 0);
+        assert_eq!(app.meta_undo.redo_len(), 0);
+    }
+
+    #[test]
+    fn failed_rating_origin_dispatch_keeps_entry_on_same_stack() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let path = app.tmp.path().join("failed-origin.jpg");
+        app.items = vec![crate::grid_item::GridItem::Image(path.clone())];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = crate::app::ViewerPresentation::Fullscreen;
+        let expected = app.capture_rating_origin();
+        app.push_rating_undo_entry(vec![change(path)], "rating".into());
+        app.rating_db = None;
+        let generation = app.rating_session_write_generation;
+        app.apply_meta_undo();
+        assert_eq!(app.meta_undo.undo_len(), 1);
+        assert_eq!(app.meta_undo.redo_len(), 0);
+        let UndoEntry::Rating { origin, .. } = app.meta_undo.peek_undo().unwrap() else {
+            panic!("failed Undo must retain rating origin");
+        };
+        assert_eq!(origin, &expected);
+        let redo = app.meta_undo.pop_undo().unwrap();
+        app.meta_undo.push_redo(redo);
+        app.apply_meta_redo();
+        assert_eq!(app.meta_undo.undo_len(), 0);
+        assert_eq!(app.meta_undo.redo_len(), 1);
+        let UndoEntry::Rating { origin, .. } = app.meta_undo.peek_redo().unwrap() else {
+            panic!("failed Redo must retain rating origin");
+        };
+        assert_eq!(origin, &expected);
+        assert_eq!(app.rating_session_write_generation, generation);
+        assert_eq!(app.fullscreen_idx, Some(0));
+    }
+}
+
 // ── 操作キャプチャ ──────────────────────────────────────────────────
 //
 // レーティング/タグ操作の **直前** に呼ぶ snapshot ヘルパー。各操作のエントリポイント
@@ -812,7 +972,11 @@ impl App {
         } else {
             format!("コンテナを★{after}")
         };
-        self.push_rating_undo_entry(
+        let origin = self.capture_rating_origin().map(|mut origin| {
+            origin.page_key = None;
+            origin
+        });
+        self.push_rating_undo_entry_with_origin(
             vec![RatingChange {
                 path_key,
                 source_path,
@@ -822,6 +986,7 @@ impl App {
                 after,
             }],
             summary,
+            origin,
         );
     }
 

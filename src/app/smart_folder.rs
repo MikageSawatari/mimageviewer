@@ -1297,13 +1297,17 @@ impl App {
             return None;
         }
         let masks = session.item_rating_masks.as_ref()?;
+        let preview = self.rating_preview_recipe();
         Some(
             self.items
                 .iter()
                 .enumerate()
                 .map(|(index, _)| {
                     let stars = self.rating_cache.get(&index).copied().unwrap_or(0).min(5);
-                    masks.get(index).is_none_or(|mask| mask[stars as usize])
+                    masks.get(index).is_none_or(|mask| {
+                        self.rating_path_key(index)
+                            .is_some_and(|key| preview.allows(&key, stars, mask))
+                    })
                 })
                 .collect(),
         )

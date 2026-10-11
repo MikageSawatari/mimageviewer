@@ -2206,11 +2206,10 @@ impl App {
 
     #[cfg(windows)]
     pub(in crate::app) fn swap_viewer_context_bundle(&mut self, bundle: &mut ViewerContextBundle) {
-        // path-keyed DB 更新は context-global。退避する側も復元する側も、idx-keyed cache を
-        // その時点の最新世代へ揃えてから ownership を渡す。この関数はnavigationではなく
-        // ownership交換のプリミティブなので、同期に伴う表示再構築でApp-globalなfacet
-        // scope / suppressionを変更してはならない。
-        self.publish_current_context_rating_writes();
+        // The table may have a pending transition throughout this payload exchange.
+        // Publish ratings only at the stable plan-before / finish-after boundaries below.
+        // The existing favorite overlay transition is settings projection only; it must
+        // finish before the incoming owner publishes its membership or navigates.
         let favorite_view_now = std::time::Instant::now();
         self.capture_active_favorite_view_change_at(favorite_view_now);
         let favorite_view_inherited =
@@ -2789,7 +2788,6 @@ impl App {
         // 毎フレーム消え、Pending サムネがフレームごとに重複エンキュー/重複デコードされる
         // churn になっていた (review-v2.3.0 P2-8)。channel/token/キューを bundle 化した現在は
         // bookkeeping がコンテキストと一緒に移動するため clear 不要。
-        self.publish_current_context_rating_writes();
         let favorite_path = self.effective_folder();
         self.transition_favorite_view_for_path_with_inherited_at(
             favorite_path.as_deref(),
@@ -3535,6 +3533,20 @@ impl App {
 std::thread_local! {
     static VIEWER_CONTEXT_SWAP_INTERIOR_FAILPOINT: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    static VIEWER_CONTEXT_RATING_BOUNDARY_TRACE: std::cell::RefCell<Option<Vec<RatingBoundaryEvent>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, windows))]
+#[derive(Debug, PartialEq, Eq)]
+struct RatingBoundaryEvent {
+    boundary: &'static str,
+    owner: ViewerContextId,
+    seen_before: u64,
+    seen_after: u64,
+    write_generation: u64,
+    effective_filter: [bool; 6],
+    grid_cols: usize,
 }
 
 #[cfg(all(test, windows))]
@@ -3563,6 +3575,43 @@ enum ProductionForkSpec {
 
 #[cfg(windows)]
 impl App {
+    /// Publish only when the table, projected payload and effective favorite settings
+    /// describe the same mounted owner. Never call this from an exchange primitive or
+    /// while building an uncommitted payload.
+    fn publish_mounted_context_rating_writes_at_boundary(&mut self, _boundary: &'static str) {
+        self.publish_mounted_context_rating_writes_at_boundary_with_intent(
+            _boundary,
+            crate::rating_membership::RatingAdoptionIntent::Reconcile,
+        );
+    }
+
+    fn publish_mounted_context_rating_writes_at_boundary_with_intent(
+        &mut self,
+        _boundary: &'static str,
+        intent: crate::rating_membership::RatingAdoptionIntent,
+    ) {
+        let _owner = self
+            .mounted_viewer_context_id()
+            .expect("rating publication boundary requires a mounted viewer owner");
+        #[cfg(test)]
+        let seen_before = self.rating_session_write_seen_generation;
+        self.publish_current_context_rating_writes_with_intent(intent);
+        #[cfg(test)]
+        VIEWER_CONTEXT_RATING_BOUNDARY_TRACE.with(|trace| {
+            if let Some(trace) = trace.borrow_mut().as_mut() {
+                trace.push(RatingBoundaryEvent {
+                    boundary: _boundary,
+                    owner: _owner,
+                    seen_before,
+                    seen_after: self.rating_session_write_seen_generation,
+                    write_generation: self.rating_session_write_generation,
+                    effective_filter: self.effective_rating_filter(),
+                    grid_cols: self.settings.grid_cols,
+                });
+            }
+        });
+    }
+
     fn execute_viewer_context_ops(
         &mut self,
         ops: Vec<TableOp>,
@@ -4049,13 +4098,16 @@ impl App {
                 residence: self.viewer_contexts.table.residence(id),
             });
         };
+        self.publish_mounted_context_rating_writes_at_boundary("mount_outgoing");
         let ops = self.viewer_contexts.table.plan_mount(id)?;
         self.execute_viewer_context_ops(ops, None);
         self.viewer_contexts.table.finish_mount();
+        self.publish_mounted_context_rating_writes_at_boundary("mount_incoming");
         if let Some(ctx) = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.repaint_context() {
             self.poll_page_edit_reconciliation(&ctx);
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        self.publish_mounted_context_rating_writes_at_boundary("return_outgoing");
         let ops = self
             .viewer_contexts
             .table
@@ -4063,6 +4115,7 @@ impl App {
             .expect("mounted viewer-context owner disappeared");
         self.execute_viewer_context_ops(ops, None);
         self.viewer_contexts.table.finish_mount();
+        self.publish_mounted_context_rating_writes_at_boundary("return_incoming");
         if let Some(ctx) = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.repaint_context() {
             self.poll_page_edit_reconciliation(&ctx);
         }
@@ -4088,6 +4141,7 @@ impl App {
         reason: &'static str,
         f: impl FnOnce(&mut Self, ViewerContextId) -> BuildOutcome,
     ) -> Option<ViewerContextId> {
+        self.publish_mounted_context_rating_writes_at_boundary("build_outgoing");
         let (reserved, ops) = self.viewer_contexts.table.plan_begin_build();
         self.execute_viewer_context_ops(ops, None);
         self.viewer_contexts.table.finish_begin_build();
@@ -4107,6 +4161,7 @@ impl App {
         let ops = self.viewer_contexts.table.plan_abort_build();
         self.execute_viewer_context_ops(ops, None);
         self.viewer_contexts.table.finish_abort_build();
+        self.publish_mounted_context_rating_writes_at_boundary("abort_incoming");
         self.normalize_lookup_pending.remove(&abandoned);
         if self
             .normalize_state
@@ -4142,6 +4197,7 @@ impl App {
                 let ops = self.viewer_contexts.table.plan_commit_build();
                 self.execute_viewer_context_ops(ops, None);
                 let finished = self.viewer_contexts.table.finish_commit_build();
+                self.publish_mounted_context_rating_writes_at_boundary("commit_incoming");
                 if let Some(window_id) = self.viewer_contexts.table.window_for_context(finished) {
                     crate::logger::log(format!(
                         "[active-detached-session] t_us={} kind=binding action=publish_build window_id={} context={finished:?} reason={} session={:?} transition={}",
@@ -4168,8 +4224,27 @@ impl App {
     fn fork_mounted_context(
         &mut self,
         policy: ForkPolicy,
-        spec: ProductionForkSpec,
+        mut spec: ProductionForkSpec,
     ) -> ViewerContextId {
+        // The caller's target was chosen before rating publication. Publication can
+        // change items/order and the reader anchor; keep the explicitly chosen page.
+        let target_key = match &spec {
+            ProductionForkSpec::MaterializedStill { idx, .. } => Some(
+                self.page_path_key(*idx)
+                    .expect("materialized still fork requires a stable page key"),
+            ),
+            ProductionForkSpec::LiveMedia => None,
+        };
+        self.publish_mounted_context_rating_writes_at_boundary_with_intent(
+            "fork_outgoing",
+            crate::rating_membership::RatingAdoptionIntent::Manual,
+        );
+        if let ProductionForkSpec::MaterializedStill { idx, .. } = &mut spec {
+            let key = target_key.as_ref().unwrap();
+            *idx = (0..self.items.len())
+                .find(|candidate| self.page_path_key(*candidate).as_ref() == Some(key))
+                .expect("materialized fork target must remain installed during publication");
+        }
         let source = self.projected_viewer_context_id();
         let scan_candidate = self.normalize_state.as_ref().and_then(|state| {
             (state.owner_context_id == source).then(|| (state.fs_idx, state.file_path.clone()))
@@ -4183,6 +4258,7 @@ impl App {
         self.execute_viewer_context_ops(ops, Some(spec));
         let finished = self.viewer_contexts.table.finish_fork();
         assert_eq!(finished, id);
+        self.publish_mounted_context_rating_writes_at_boundary("fork_incoming");
         // Music analysis lives on App, outside the viewer bundle. Transfer its exact
         // source and worker inbox only when the same player and applied track moved.
         if let Some(old_source) = music_candidate {
@@ -4301,6 +4377,7 @@ impl App {
         let reason = _reason;
         let retiring_window = self.viewer_contexts.table.window_for_context(id);
         self.viewer_contexts.table.begin_retire(id)?;
+        self.cancel_rating_membership_restore_for_context(id);
         if retiring_window == self.active_detached_window_id() {
             self.begin_active_detached_session_close(reason);
             self.finish_active_detached_session_close(reason);
@@ -4350,9 +4427,12 @@ impl App {
         &mut self,
         _reason: &'static str,
     ) -> ViewerContextId {
+        self.publish_mounted_context_rating_writes_at_boundary("promote_outgoing");
         let ops = self.viewer_contexts.table.plan_promote();
         self.execute_viewer_context_ops(ops, None);
-        self.viewer_contexts.table.finish_promote()
+        let stashed = self.viewer_contexts.table.finish_promote();
+        self.publish_mounted_context_rating_writes_at_boundary("promote_incoming");
+        stashed
     }
 }
 
@@ -4536,6 +4616,298 @@ mod tests {
     use std::cell::RefCell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::rc::Rc;
+
+    #[cfg(windows)]
+    struct RatingBoundaryTrace;
+
+    #[cfg(windows)]
+    impl RatingBoundaryTrace {
+        fn start() -> Self {
+            VIEWER_CONTEXT_RATING_BOUNDARY_TRACE.with(|trace| {
+                assert!(trace.borrow().is_none());
+                *trace.borrow_mut() = Some(Vec::new());
+            });
+            Self
+        }
+
+        fn take(&self) -> Vec<RatingBoundaryEvent> {
+            VIEWER_CONTEXT_RATING_BOUNDARY_TRACE
+                .with(|trace| std::mem::take(trace.borrow_mut().as_mut().unwrap()))
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for RatingBoundaryTrace {
+        fn drop(&mut self) {
+            VIEWER_CONTEXT_RATING_BOUNDARY_TRACE.with(|trace| *trace.borrow_mut() = None);
+        }
+    }
+
+    #[cfg(windows)]
+    fn seed_rating_boundary_page(app: &mut App, path: &Path, stars: u8) -> String {
+        app.items = vec![GridItem::Image(path.to_path_buf())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.rating_cache.insert(0, stars);
+        let key = app.rating_path_key(0).unwrap();
+        app.rating_db.as_ref().unwrap().set(&key, stars).unwrap();
+        key
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rating_boundary_swap_never_publishes_during_table_transition() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let path = app.tmp.path().join("swap-rating.jpg");
+        let key = seed_rating_boundary_page(&mut app, &path, 3);
+        let other = app
+            .build_viewer_context("rating_swap_other", |owner, _| {
+                seed_rating_boundary_page(owner, &path, 3);
+                BuildOutcome::Commit
+            })
+            .unwrap();
+        app.write_user_rating_shared_deferred(&key, 4, None)
+            .unwrap();
+        let trace = RatingBoundaryTrace::start();
+        let publications = app.rating_publication_count;
+        let ops = app.viewer_contexts.table.plan_mount(other).unwrap();
+        app.execute_viewer_context_ops(ops, None);
+        // This accessor is deliberately unavailable while pending: the primitive must
+        // leave rating caches and publication receipts with their original payloads.
+        assert_eq!(app.rating_publication_count, publications);
+        assert_eq!(app.rating_session_write_seen_generation, 0);
+        assert_eq!(app.rating_cache.get(&0), Some(&3));
+        assert!(trace.take().is_empty());
+        app.viewer_contexts.table.finish_mount();
+        app.publish_mounted_context_rating_writes_at_boundary("test_finished_mount");
+        assert_eq!(app.projected_viewer_context_id(), other);
+        assert_eq!(app.rating_publication_count, publications + 1);
+        assert_eq!(app.rating_cache.get(&0), Some(&4));
+        assert_eq!(trace.take()[0].owner, other);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rating_boundary_mount_and_return_publish_unobserved_writes_with_effective_settings() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        app.settings.remember_favorite_view_state = true;
+        let path = app.tmp.path().join("b").join("mount-rating.jpg");
+        let key = seed_rating_boundary_page(&mut app, &path, 3);
+        let main = app.viewer_context_main();
+        let a = crate::settings::FavoriteEntry::new("main".into(), app.tmp.path().join("a"));
+        let b = crate::settings::FavoriteEntry::new("other".into(), app.tmp.path().join("b"));
+        let a_filter = [false, false, false, true, false, false];
+        let b_filter = [true; 6];
+        app.settings.rating_filter = a_filter;
+        let mut a_state = crate::settings::FavoriteViewState::from_settings(&app.settings);
+        a_state.grid_cols = 4;
+        let mut b_state = a_state.clone();
+        b_state.grid_cols = 7;
+        app.favorite_view_states.insert(a.id, a_state);
+        app.favorite_view_states.insert(b.id, b_state);
+        app.settings.favorites.extend([a.clone(), b.clone()]);
+        app.current_folder = Some(a.path.clone());
+        app.transition_favorite_view_for_path(Some(&a.path));
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        let other = app
+            .build_viewer_context("rating_mount_other", |owner, _| {
+                seed_rating_boundary_page(owner, &path, 3);
+                owner.current_folder = Some(b.path.clone());
+                owner.transition_favorite_view_for_path(Some(&b.path));
+                owner.rating_filter_suppressed_at = Some((b.path.clone(), a_filter));
+                // F12 physical readers keep their own membership despite App filters.
+                owner.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+                owner.fullscreen_idx = Some(0);
+                BuildOutcome::Commit
+            })
+            .unwrap();
+        let trace = RatingBoundaryTrace::start();
+        let write_generation = app.rating_session_write_generation;
+        app.write_user_rating_shared_deferred(&key, 4, None)
+            .unwrap();
+        app.with_viewer_context(other, |owner| {
+            assert_eq!(owner.projected_viewer_context_id(), other);
+            assert_eq!(owner.effective_rating_filter(), b_filter);
+            assert_eq!(owner.rating_cache.get(&0), Some(&4));
+            assert_eq!(owner.visible_indices, vec![0]);
+            assert_eq!(owner.fullscreen_idx, Some(0));
+            let parked_main = owner.viewer_contexts.table.at_rest(main).unwrap();
+            assert!(parked_main.visible_indices.is_empty());
+            assert_eq!(parked_main.fullscreen_idx, None);
+            assert_eq!(parked_main.rating_cache.get(&0), Some(&4));
+            owner
+                .write_user_rating_shared_deferred(&key, 3, None)
+                .unwrap();
+        })
+        .unwrap();
+        assert_eq!(app.projected_viewer_context_id(), main);
+        assert_eq!(app.effective_rating_filter(), a_filter);
+        assert_eq!(app.rating_cache.get(&0), Some(&3));
+        assert_eq!(app.visible_indices, vec![0]);
+        assert_eq!(app.fullscreen_idx, None);
+        assert_eq!(app.rating_session_write_generation, write_generation + 2);
+        let events = trace.take();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.boundary, event.owner, event.effective_filter))
+                .collect::<Vec<_>>(),
+            vec![
+                ("mount_outgoing", main, a_filter),
+                ("mount_incoming", other, b_filter),
+                ("return_outgoing", other, b_filter),
+                ("return_incoming", main, a_filter),
+            ]
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.seen_after == event.write_generation)
+        );
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.grid_cols)
+                .collect::<Vec<_>>(),
+            [4, 7, 7, 4]
+        );
+        let publications = app.rating_publication_count;
+        app.with_viewer_context(other, |_| ()).unwrap();
+        assert_eq!(app.rating_publication_count, publications);
+        assert_eq!(app.rating_session_write_generation, write_generation + 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rating_boundary_build_commit_abort_and_promote_publish_only_finished_owner() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let path = app.tmp.path().join("build-rating.jpg");
+        let key = seed_rating_boundary_page(&mut app, &path, 3);
+        let main = app.viewer_context_main();
+        app.write_user_rating_shared_deferred(&key, 4, None)
+            .unwrap();
+        let trace = RatingBoundaryTrace::start();
+        let built = app
+            .build_viewer_context("rating_boundary_commit", |owner, _| {
+                assert_eq!(owner.rating_publication_count, 1);
+                seed_rating_boundary_page(owner, &path, 4);
+                owner
+                    .write_user_rating_shared_deferred(&key, 5, None)
+                    .unwrap();
+                assert_eq!(owner.rating_publication_count, 1);
+                BuildOutcome::Commit
+            })
+            .unwrap();
+        assert_eq!(app.rating_cache.get(&0), Some(&5));
+        let events = trace.take();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.boundary, event.owner))
+                .collect::<Vec<_>>(),
+            [("build_outgoing", main), ("commit_incoming", main)]
+        );
+        // The new payload did not consume the generation before its first mount.
+        assert_eq!(
+            app.viewer_contexts
+                .table
+                .at_rest(built)
+                .unwrap()
+                .rating_session_write_seen_generation,
+            0
+        );
+        app.with_viewer_context(built, |owner| {
+            assert_eq!(owner.rating_cache.get(&0), Some(&5));
+        })
+        .unwrap();
+        trace.take();
+        assert_eq!(
+            app.build_viewer_context("rating_boundary_abort", |owner, _| {
+                owner
+                    .write_user_rating_shared_deferred(&key, 2, None)
+                    .unwrap();
+                BuildOutcome::Abort("test")
+            }),
+            None
+        );
+        assert_eq!(app.rating_cache.get(&0), Some(&2));
+        let events = trace.take();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.boundary, event.owner))
+                .collect::<Vec<_>>(),
+            [("build_outgoing", main), ("abort_incoming", main)]
+        );
+        assert_eq!(
+            app.stash_mounted_and_start_fresh("rating_boundary_promote"),
+            main
+        );
+        let fresh = app.viewer_context_main();
+        let events = trace.take();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.boundary, event.owner))
+                .collect::<Vec<_>>(),
+            [("promote_outgoing", main), ("promote_incoming", fresh)]
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.seen_after == event.write_generation)
+        );
+        app.retire_context(built, "rating_boundary_retire", |_| ())
+            .unwrap();
+        assert!(
+            trace.take().is_empty(),
+            "retirement must not reopen a dead reader"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rating_boundary_materialized_fork_keeps_explicit_page_when_source_cursor_moves() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let root = app.tmp.path().join("fork-pages");
+        let first = root.join("first.jpg");
+        let second = root.join("second.jpg");
+        let key = seed_rating_boundary_page(&mut app, &first, 3);
+        app.items.push(GridItem::Image(second));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.image_metas.push(None);
+        app.visible_indices.push(1);
+        app.rating_cache.insert(1, 3);
+        let other_key = app.rating_path_key(1).unwrap();
+        app.rating_db.as_ref().unwrap().set(&other_key, 3).unwrap();
+        app.settings.rating_filter = [false, false, false, true, false, false];
+        app.current_folder = Some(root.clone());
+        app.write_user_rating_shared_deferred(&key, 4, None)
+            .unwrap();
+        let main = app.viewer_context_main();
+        let trace = RatingBoundaryTrace::start();
+        let forked = app.fork_materialized_still_context(&root, 0);
+        assert_eq!(app.projected_viewer_context_id(), main);
+        assert_eq!(app.selected, Some(1));
+        assert_eq!(app.visible_indices, vec![1]);
+        let fork = app.viewer_contexts.table.at_rest(forked).unwrap();
+        assert_eq!(fork.selected, Some(0));
+        assert_eq!(fork.items[0], GridItem::Image(first));
+        assert_eq!(fork.visible_indices, vec![0, 1]);
+        let events = trace.take();
+        assert_eq!(events[0].boundary, "fork_outgoing");
+        assert_eq!(events[1].boundary, "fork_incoming");
+        assert_eq!(events[0].owner, main);
+        assert_eq!(events[1].owner, main);
+        assert!(
+            events
+                .iter()
+                .all(|event| event.seen_after == event.write_generation)
+        );
+    }
 
     #[cfg(windows)]
     #[test]

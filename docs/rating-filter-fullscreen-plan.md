@@ -1,8 +1,8 @@
 # 評価変更で読書ページが絞り込みから外れる場合 (§1.371)
 
-2026-10-11 / Stage 1 **R3 設計案**。再照合対象: `next-tray` HEAD `94bc236d1` (R2)。R1 の調査開始点は `ed0be21fa`。
-製品コード未変更、実機再現未実施。観測は [バックログ §1.371](next-release-backlog.md) の利用者報告、以下は現ソースと独立再レビューの照合結果である。
-R2の前回5件は解消、F12の公開境界修正は構造修正として独立レビュアーが同意。ringの独立検索更新まで保留する新規P2はR3で修正し、全体の再レビューは未取得。実装前の合意を先取りしない。
+2026-10-11 / Stage 1 **R3 ACCEPT** (`57b7e320b`、利用者提示の独立レビュー)。再照合対象は `94bc236d1` (R2)、R1 の調査開始点は `ed0be21fa`。
+Stage 2 は同 ACCEPT と、2026-10-11 の編集範囲限定の利用者決定 (§8) を基に実装済み。独立ソースレビューは限定差分と後続の検索・遅延open修正まで **ACCEPT**。最終自動gateの結果は `target/K-1371-impl-msg.txt` へ記録する。実機再現・受入は未実施。観測は [バックログ §1.371](next-release-backlog.md) の利用者報告、以下の設計はソースと独立再レビューの照合結果である。
+R2の前回5件とR3のring独立検索更新の指摘は解消。F12公開境界の構造合意は [detached plan §11](detached-rework-plan.md#11-リワーク外からの変更記録) に記録済み。
 
 ## 1. 契約と現コードの差分
 
@@ -158,11 +158,11 @@ CLAUDE.md「設計の簡素化」に従い、picker中のrating由来自動移�
 - 設定変更で常にreaderをclose/reload: 次へ進む決定B、zoom/連結/窓identityを壊すため不採用。ゼロだけ通常teardown、実際のitems交換だけ既存再入場を使う。
 - Undoスタック全体の退避/復元: idx-only編集や他contextを復活させるため不採用。rating entryのoriginと内部causeに限定する。
 
-実装時の必須テスト (R3では追加・実行していない):
+実装時の必須テスト (Stage 1 では未実行、Stage 2 の実行結果は `target/K-1371-impl-msg.txt` へ記録):
 
 1. 純粋近傍: 中/先頭/末尾、複数同時離脱、ゼロ、Details降順/非単調idx、RTL/LTR、新entrantのみ残存、gridとstill/media domainの差。次→前、残存anchorはKeep。一般補正を先行させず、cursor apply/reader landing各一回をassertする。
 2. rating handler: F1–F6/custom/step、selected≠fullscreen、全表示/未評価除外filter、情報パネル/マウス★/native HUD。stable DB key/cache/generation/所属/行先、publication/成功ログ/toast、bound/no-opを検査。Image/ZIP/PDF/EPUB/入れ子・変換書庫とShift+F containerを分離し、最後のstill+container-only残存で現在gridへ戻る。
-3. Undo/Redo: 自動next/prev後、最後の一枚grid後、二操作、並び替え/slot変更、非評価filter、別窓Undo。元画像/元presentation、rating entry/redo保持、filter不変、idx-only Undoが復活しないこと。**Undo→同じ一覧でmanual next/prev/seek→Ready、Undo→Esc/close→Ready、Undo→Redo→古いReady→最新Ready**を固定し、manual結果を上書き/reader再openしない。別Undoで置換、一度consume後の別workerでも再復帰しない。
+3. Undo/Redo: 自動next/prev後、最後の一枚grid後、二操作、並び替え/slot変更、非評価filter、別窓Undo。元画像/元presentation、rating entry/redo保持、filter不変、idx-only Undoが復活しないこと。Rating再採用では既存の編集終了と非rating Undo破棄を確認し、同identityの非rating Undo保持/remapは受入条件にしない。**Undo→同じ一覧でmanual next/prev/seek→Ready、Undo→Esc/close→Ready、Undo→Redo→古いReady→最新Ready**を固定し、manual結果を上書き/reader再openしない。別Undoで置換、一度consume後の別workerでも再復帰しない。
 4. 評価世代: **A除外→AなしReady保留→Undo成功/A復帰→古いReady解放**をRatingと検索(通常/評価ソート)で実行。set/items/fs/cursorが一切古く戻らないこと。prepare中の評価write、DB epochだけ変わるproducer、session更新と古いRatedBatch後着、filter/query/source/context/sequence変更、stamp有効でないcached factsに新stampを付けないこと。Smart現行write-generation検査も維持する。
 5. Ring: preview除外→他の全行preview→再評価一致→closeはKeep、最後の一枚preview除外中もstrip/seek/番号・元slotが存在し、新entrantがなければcloseでGrid。Rating/検索/Smartとin-flight/streaming、**評価preview後のGridSortOrderのlive変更**、Details sort、commit/マウス終端/切断/無効化/modal/stale/manual close/scope変更を検証。成功済み分一件Undo、元key/owner、page個別行/全体行/playerの保存先、重複writeなし、picker-ended後の移動一回。source/非評価離脱や別producerの評価を誤ってHへ含めない。owner Aのring中にBへmountしてもAのrecipe・Bの通常公開・各worker tokenが独立する。
 6. ContextTable: outgoing未公開rating→mount、incoming未公開rating→mount、callback内rating→original復帰。traceで **outgoing publish→plan→swap→finish→settings projection→incoming publish** をassertし、projected-ID assertion/panic・swap内landing・再mountなし。build commit/abort、fork/promote/retire、catch-unwind後のoriginal復帰も同じ契約。read-only primitive単体テストは値交換だけで、save/移動を期待しない。
@@ -172,8 +172,10 @@ CLAUDE.md「設計の簡素化」に従い、picker中のrating由来自動移�
 10. 単ページ/見開き・表紙/分割/縦横連結、native動画/音声: 新集合とHUD・seek・strip・unit、空grid/toast、AI/補正/ロード中のpresentationを検証。可能なheadless snapshotを更新。実機確認は別の明示承認済み検証枠へ残す。
 11. **評価未操作のring中の新規hit**: A(★3)を表示、ring openのままB(★3)/C(★0)のRatedBatch→Readyを解放する。★3 filterならraw3/可視2・最新★別件数とA/Bのitems/strip/page numberを**close前に**採用する。P/Hは空、現在Aとpicker/選択/Shift起点を同じidentityで維持。Rating write/Undo/landingなし。closeでも新hit/件数を失わずKeep。検索Flat/Drilled、Details非単調順と集約countsに適用する。
 12. **評価preview後の新規hit**: 初期A/B(★3)、ringでAを★0へ保存してH=A、そのままC(★3)/D(★0)のBatch→Readyを採用。close前にM=A/B/C・raw4/可視3、実factsの★0=2/★3=2と新countsを採用し、Aの星表示は0、Aとpicker/全行previewは継続する。closeでHだけを外しB/C・可視2へ一回着地し、UndoはAへ戻る。初期Aだけ→preview除外→新一致Bの場合もcloseはBへMoveとなりGridへ戻らない。preview→新hit→ソート→新hit、close後に旧recipeのReady解放でもHが復活せず二度移動しない。追加が重なってもkey重複やcounts二重加算なし。
+13. **編集の限定範囲**: Rating再採用は出荷済みの編集終了境界を通し、非rating Undoを落としてrating Undoだけを保持する。Searchは既存のclear/cancel方針を維持する。reader同identity、selected/Shift起点のpaired remapとこの終了方針を確認し、loaded/global editor・idx-only Undoの保持/remapや一般的なcross-context編集の正しさを本項の修正・検証済みと主張しない。下記の出荷済みSearch streaming問題は別件とする。
+14. **遅延openの操作意図**: IndexOnlyと通常hydrationでrating自動open/Undo復帰のcauseとrating Redoを保持する。旧readerあり/なしの双方で、準備完了前のfilter更新のKeep/Move/Emptyを論理的な遅延targetへ一度適用する。受理されたmanual移動/close・Redo後に完了しても取消済み画像を再openせず、worker・兄弟context・Manual要求の既存動作は維持する。復元中の既存modal入力制限を変更せず、modalで受理されないEscを新たに通すことはしない。
 
-検証ownerは実装担当。焦点lib tests→core check→fmt、UI文字列変更ならglyph、snapshot、共有変更の完了時は `scripts/test-full.ps1`。実装後は `scripts/build-dev.ps1` で確認binaryを渡す。R3は文書のみのためtest/build不要、mIV起動なし。
+検証ownerは実装担当。焦点lib tests・core/portable check・fmt、UI文字列変更ならglyph、snapshot、共有変更の完了時は full lib と `scripts/test-full.ps1`。実装後は `scripts/build-dev.ps1` で確認binaryを渡す。agent は mIV を起動しない。
 
 Stage 2の候補所有ファイル: `app.rs` (save/publication/rebuild/open/close)、`viewer_context_registry.rs` (安定境界)、`ui_fullscreen.rs` (landing/入力後のanchor再解決)、`undo_stack.rs` / `undo_ops.rs` (origin・intent取消・rating限定保持)、`ring_shortcut.rs` / `app/gamepad_input.rs`、各rating UI、検索/Rating/Smartのprepare/採用とtests。§1.370との共通cursor ownerを先に統合/照合し、別cursor helperを追加しない。実装と同時にdisplay pipeline/keymap/rating snapshot order/関連ownership docsを更新する。native placement/focus、Remote protocolは変更不要。
 
@@ -186,9 +188,45 @@ Stage 2の候補所有ファイル: `app.rs` (save/publication/rebuild/open/clos
 | P2-3 RestoreOriginの失効不足 | §4:live request intentの取消/置換/一度consume、manual/close/Redoを共通受理境界へ。必須test 3。 |
 | P2-4 ring stale/対象消失/行owner | §5:rating由来の離脱だけを終端まで保留、順序/全行previewを継続、行ごとの現owner維持。即時移動/強制終了案を撤回。必須test 5。 |
 | P2-5 二段補正/Shift anchor | §3.2:集合ownerの唯一決定を§1.370 ownerが一回適用、再配置はpaired remap。必須test 1/7。 |
-| R2再レビューの新規P2 独立検索更新まで保留 | §5.1–5.2:最新通常集合Sへpreview由来の離脱Hだけを統合しMを即時採用。Ready・新hit・countsは止めず、sort-only分岐も撤回。必須test 11/12、R3の独立再レビュー待ち。 |
+| R2再レビューの新規P2 独立検索更新まで保留 | §5.1–5.2:最新通常集合Sへpreview由来の離脱Hだけを統合しMを即時採用。Ready・新hit・countsは止めず、sort-only分岐も撤回。必須test 11/12。R3 `57b7e320b` の独立レビューで ACCEPT。 |
 
-上表の前回5件は `94bc236d1` の独立再レビューで解消と判定された。F12の安定context境界の修正についても「症状パッチではなく構造修正として同意」と明示された。対象はswapからのrating publication移設、安定したownerの集合採用と通常landing/teardownへの接続、cursorのpaired適用。swap再入と兄弟contextへの誤配送を作成境界で防ぎ、detached述語/viewport/geometry/配置/focusのヒューリスティックを足さない。この**限定した構造合意・scope**を利用者指示に従って [detached plan §11](detached-rework-plan.md#11-リワーク外からの変更記録) に記録した。ringの新規P2を含むR3全体へのACCEPTや、実装/検証/実機受入を意味しない。製品コード着手はR3再レビュー後とする。
+上表の前回5件は `94bc236d1` の独立再レビューで解消と判定された。F12の安定context境界の修正についても「症状パッチではなく構造修正として同意」と明示された。対象はswapからのrating publication移設、安定したownerの集合採用と通常landing/teardownへの接続、cursorのpaired適用。swap再入と兄弟contextへの誤配送を作成境界で防ぎ、detached述語/viewport/geometry/配置/focusのヒューリスティックを足さない。この**限定した構造合意・scope**を利用者指示に従って [detached plan §11](detached-rework-plan.md#11-リワーク外からの変更記録) に記録した。その後 R3 `57b7e320b` 全体が独立レビューで ACCEPT され、利用者が実装を指示した。設計 ACCEPT は実装検証・実機受入を意味しない。
+
+### Stage 2 の接続箇所
+
+- 集合の唯一決定は `src/app/rating_membership_ops.rs::adopt_rating_membership`。同 identity の再配置は selected/Shift起点をそれぞれ key で remap し、移動・Empty は `apply_rating_membership_cursor` へ渡す。
+- §1.370 の実装・最新追補handoff (`C:/home/mimageviewer-nexteffetune`、読取りのみ、HEAD `4330c9480` と未コミット追補) と照合した。統合時は同 helper の selected/Shift起点代入を既存 `move_grid_cursor(target)` 呼出しへ置き換え、続く `scroll_to_selected = target.is_some()` はこのcallerの既存方針として残す。近傍決定や二度目の補正を cursor owner に追加しない。
+- 明示filter採用は非表示だった entrant を含む同じ canonical/Details comparator の順で判断する。rating publication/picker終端は変更前の表示順を基準にし、旧 survivor が無いときだけ full basis で entrant の位置を求める。
+- Rating/Search の slot 交換はreaderの既存 snapshot exact identity transferに接続し、同identityの読書位置とselected/Shift起点のpaired remapを保つ。編集の扱いは下記の利用者決定へ限定し、loaded/global editorやidx-only Undoを新たに保持/remapしない。
+- Searchの同一覧採用は、items・page-edit投影の交換→readerのexact identity transfer完了→visible集合の再計算→集合ownerの一度だけの行先適用の順とする。新しい非表示containerが旧readerの数値slotへ入っても、その行をreaderとして非評価離脱判定しない。交換途中でvisible再計算を先行させず、Drilled/Detailsの新hit・sort・ring終端の固定順序テストで確認する。
+- ページidentity/sidecar準備でopenが遅延する場合も、既存 `DeferredFullscreen` 要求自身が `FsMetadataBoundary` を保持し、IndexOnly・通常hydrationの両再開経路へ渡す。rating自動open/Undo復帰を通常Manualへ変換せず、rating限定履歴の契約を終端まで維持する。所有中のRatingMembership要求のtargetを集合ownerの論理的な着地点として扱い、旧readerが存在する場合もそのtargetでKeep/Move/Emptyを一度判断する。Keepは継続、Moveは既存要求の置換、Empty・手動移動/close・Redoは当該要求の消費/取消とし、workerや兄弟context、Manual要求を巻き込まない。再開は決定済みの継続を実行し、第二の近傍決定やfallbackを足さない。通常openの既存既定値はManualのままとする。
+- 通常hydrationのownerが当該rating要求を**受理する境界**で、同ownerの旧AutoFullscreenFolder/RequiredFullscreenとZIP/PDFの旧reopen（WarmPdfの後続検証も含む）だけを置き換える。終端時だけの抑止にせず、その後rating要求が取消されても古いopenを復活させない。先行する通常openでrating履歴を消したり二度着地したりせず、hydration・サムネイル準備・ZIP/PDFの保守処理は維持する。DirectMedia/Collection/Dfsの新しい一覧遷移を一括取消しない。これらは新source採用と既存close/history終了を経るownerであり、同一覧Rating再採用のIndexOnlyとは別経路である。
+
+### Stage 2 の編集範囲限定 — 利用者決定 (2026-10-11)
+
+Stage 2の独立確認で、idxを持つ編集/Undoへreaderと同じexact mapを適用する前提は成立しないと判明した。
+`LocalAdjustmentChange` は idx のみを記録し、`apply_local_adjustment_change_to_app` は現在の mount の idx へ書く。
+`adjustment_drag_session`、local-adjust canvas/brush/shape 等の途中編集と `meta_undo` も App-global で、
+`ViewerContextBundle` の交換対象ではない。`with_viewer_context` と park cleanup はこれらの編集 owner を証明しない。
+
+利用者は、capture時のpage/context provenance追加やeditor stateのbundle移設へ拡張せず、
+**出荷済みの編集終了・clear/cancel境界を再利用する限定案**を選んだ。今回の実装範囲は次のとおり。
+
+- Rating一覧の再採用は、出荷済みの境界で進行中の編集を終了し、非rating Undoを破棄してrating Undo/Redoだけを保持する。同じ画像が残る場合も、非rating編集履歴の継続は今回の契約に加えない。
+- Searchの再採用は既存のclear/cancel方針を維持する。新しいloaded/global editorの保持・転送・remap、idx-only Undoの保持・remap、editor owner型やbundle fieldは追加しない。
+- readerの同identity保持と、selected/Shiftクリック起点のpaired remapは継続する。reader transferをeditorの所有証明に転用せず、兄弟contextの編集/historyへ採用先のmapを適用しない。
+- 全streamingの停止、一覧更新の保留、編集の新しい入力制限は追加しない。既存の終了boundaryを超える一般editor修正は別件とし、この限定案がそれを解決したとは主張しない。
+
+#### 出荷済みSearch streamingのidx-only誤配送 — 今回の対象外
+
+v4.5.0のtag `1ff9d07df` でも、Search streamingのReady採用でitem slotが変わる一方、
+idx-onlyの途中編集/Undoが現在のslotへ解釈される誤配送経路が存在する。根拠は同tagの
+`global_search_ui.rs` Ready採用 `:2672` とreplace処理 `:1860/:1921`、`undo_ops.rs:433/:544`、
+`app.rs:75911`。これは§1.371で新たに導入された問題として扱わず、今回の修正・受入範囲から分離する。
+利用者が別途バックログへ記載する予定であり、本作業では一般editor ownerの修正やこの問題の解決を行わない。
+
+限定範囲と最終検証結果・未検証の実機項目は `target/K-1371-impl-msg.txt` に記録する。
+上記scope決定自体と設計 ACCEPT は自動gate成功・実機受入を表さない。Stage 2の独立ソース完了レビューは、限定編集境界、検索のpaired採用順、遅延openのcause/endpoint/取消・WarmPdf後続検証への接続までACCEPTとなった。一般editor ownerや初期一覧のcursor復元へ拡張せず、同一覧RatingのIndexOnly ownerと既存の新source復元ownerを分離している。
 
 ## 利用者決定 (2026-10-11)
 
@@ -196,3 +234,4 @@ Stage 2の候補所有ファイル: `app.rs` (save/publication/rebuild/open/clos
 - ★の自動移動と最後の一枚の一覧復帰ではrating Undoを残し、Ctrl+Zで元画像へ戻す。
 - R2指示: リングは所属移動を終端まで保留する案を先に検討し、既存操作を制限せず組合せを減らせるなら優先する。集合ownerの一決定と§1.370 cursor ownerの適用を分ける。まれな失敗の既定方針を維持する。
 - R3指示: 保留は当該ringの評価由来の離脱だけ。独立検索/streamingの新hit・件数を即時採用し現在pageを維持する。二つの回帰条件と終端一決定を定義し、F12の限定構造合意をdetached plan §11へ記録する。
+- Stage 2の範囲決定: 編集は出荷済み終了boundaryの再利用へ限定する。Rating再採用では非rating Undoを落としてrating Undoだけを保持し、Searchは既存clear/cancelを維持する。loaded/global editorやidx-only Undoの新しい保持/remapは行わない。出荷済みSearch streamingのidx-only誤配送は利用者が別途バックログへ記載する。

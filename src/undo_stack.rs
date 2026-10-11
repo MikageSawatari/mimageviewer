@@ -123,6 +123,8 @@ pub struct TagChange {
 pub enum UndoEntry {
     Rating {
         changes: Vec<RatingChange>,
+        /// Stable viewer origin for Undo after a rating-induced move or grid return.
+        origin: Option<crate::rating_membership::RatingOrigin>,
         /// トースト表示用ラベル (例: "★3 を 5 件に付与")
         summary: String,
     },
@@ -239,6 +241,15 @@ impl UndoStack {
         self.redo.clear();
     }
 
+    /// Rating-induced navigation retains only rating history. Other entries may
+    /// carry page indices and must not cross the automatic landing/close.
+    pub fn retain_rating(&mut self) {
+        self.undo
+            .retain(|entry| matches!(entry, UndoEntry::Rating { .. }));
+        self.redo
+            .retain(|entry| matches!(entry, UndoEntry::Rating { .. }));
+    }
+
     /// 貼り付け / リセットで外部から置き換えたページについて、古い編集 Undo/Redo だけを
     /// 両スタックから除く。Rating / Tag、別ページ、Favorite / Global の補正履歴は残す。
     ///
@@ -329,6 +340,7 @@ mod tests {
                 after,
             }],
             summary: format!("★{after}"),
+            origin: None,
         }
     }
 
@@ -440,6 +452,7 @@ mod tests {
         s.push(UndoEntry::Rating {
             changes: vec![],
             summary: "noop".into(),
+            origin: None,
         });
         s.push(UndoEntry::Tag {
             changes: vec![],
@@ -494,6 +507,85 @@ mod tests {
 
         s.push(tag_entry("c:/b.jpg", vec!["#a"], vec!["#a", "#b"]));
         s.clear();
+        assert!(!s.can_undo());
+        assert!(!s.can_redo());
+    }
+
+    #[test]
+    fn retain_rating_keeps_both_stack_orders_and_stable_origins() {
+        let origin = crate::rating_membership::RatingOrigin {
+            owner: 17,
+            listing_identity: "listing".into(),
+            page_key: Some("origin-page".into()),
+            presentation: crate::app::ViewerPresentation::Fullscreen,
+        };
+        let mut with_origin = rating_entry("c:/a.jpg", 3, 4);
+        let UndoEntry::Rating { origin: stored, .. } = &mut with_origin else {
+            panic!("expected rating");
+        };
+        *stored = Some(origin.clone());
+        let non_rating = || {
+            vec![
+                tag_entry("c:/tag.jpg", vec!["a"], vec!["b"]),
+                adjust_entry(
+                    AdjustUndoScope::Page(2),
+                    None,
+                    Some(AdjustParams::default()),
+                ),
+                UndoEntry::LocalAdjustment {
+                    changes: vec![LocalAdjustmentChange {
+                        idx: 2,
+                        before: local_adjust_core::LocalAdjustmentLayers::default(),
+                        after: local_adjust_core::LocalAdjustmentLayers::default(),
+                    }],
+                    summary: "local".into(),
+                },
+            ]
+        };
+        let mut s = UndoStack::new();
+        s.undo.push_back(with_origin.clone());
+        s.undo.extend(non_rating());
+        s.undo.push_back(rating_entry("c:/b.jpg", 1, 2));
+        s.redo.push_back(rating_entry("c:/c.jpg", 2, 3));
+        s.redo.extend(non_rating());
+        s.redo.push_back(with_origin);
+
+        s.retain_rating();
+
+        assert_eq!(s.undo_len(), 2);
+        assert_eq!(s.redo_len(), 2);
+        for (entry, expected_key, expected_origin) in [
+            (&s.undo[0], "c:/a.jpg", Some(&origin)),
+            (&s.undo[1], "c:/b.jpg", None),
+            (&s.redo[0], "c:/c.jpg", None),
+            (&s.redo[1], "c:/a.jpg", Some(&origin)),
+        ] {
+            let UndoEntry::Rating {
+                changes,
+                origin: stored,
+                ..
+            } = entry
+            else {
+                panic!("non-rating entry retained");
+            };
+            assert_eq!(changes[0].path_key, expected_key);
+            assert_eq!(stored.as_ref(), expected_origin);
+        }
+        s.retain_rating();
+        assert_eq!(s.undo_len(), 2);
+        assert_eq!(s.redo_len(), 2);
+    }
+
+    #[test]
+    fn retain_rating_drops_non_rating_only_stacks() {
+        let mut s = UndoStack::new();
+        s.undo.push_back(tag_entry("c:/tag.jpg", vec![], vec!["a"]));
+        s.redo.push_back(adjust_entry(
+            AdjustUndoScope::Page(0),
+            None,
+            Some(AdjustParams::default()),
+        ));
+        s.retain_rating();
         assert!(!s.can_undo());
         assert!(!s.can_redo());
     }
