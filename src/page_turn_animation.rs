@@ -5,6 +5,8 @@
 //! A0 supports stable, axis-aligned singles and equal-size spread slots (including
 //! a fixed gutter and explicit Blank). Changed placements, unequal spread sizes,
 //! Vacant slots, and incomplete prepared ROIs reject the entire projection. A
+//! stable placement includes the one-physical-pixel bound of independently rounded
+//! paint edges; it does not require float-identical fitted rectangles.
 //! rejection means flat submission of the *same* already-prepared incoming unit.
 //! The cylinder's lower half is occluded by its upper half. Its projection and
 //! the flat folded portion are monotone strips, so visibility needs no depth
@@ -53,6 +55,8 @@ pub(crate) struct CanonicalPage {
 #[derive(Clone, Debug)]
 pub(crate) struct CanonicalUnit {
     pub layout: UnitLayout,
+    /// Effective scale of the destination that produced these paint rectangles.
+    pub pixels_per_point: f32,
     pub pages: Vec<CanonicalPage>,
 }
 
@@ -107,11 +111,23 @@ pub(crate) struct TurnProjection {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProjectionFailure {
-    UnsupportedGeometry,
-    IncompleteRoi,
-    IncomingNotVisible,
-    MidpointNotBroad,
+    UnsupportedGeometry(&'static str),
+    IncompleteRoi(&'static str),
+    IncomingNotVisible(&'static str),
+    MidpointNotBroad(&'static str),
     InvalidProgress,
+}
+
+impl ProjectionFailure {
+    pub(crate) fn sub_check(self) -> &'static str {
+        match self {
+            Self::UnsupportedGeometry(check)
+            | Self::IncompleteRoi(check)
+            | Self::IncomingNotVisible(check)
+            | Self::MidpointNotBroad(check) => check,
+            Self::InvalidProgress => "invalid_progress",
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -365,16 +381,35 @@ pub(crate) fn project_turn(
         }
     }
     let receipt = visibility(&builder.faces, incoming, old_area);
-    if receipt.incoming.iter().any(|p| {
-        p.fraction() + 0.00001 < MIN_VISIBLE_FRACTION || p.short_edge < MIN_VISIBLE_SHORT_EDGE
-    }) {
-        return Err(ProjectionFailure::IncomingNotVisible);
+    if receipt
+        .incoming
+        .iter()
+        .any(|p| p.fraction() + 0.00001 < MIN_VISIBLE_FRACTION)
+    {
+        return Err(ProjectionFailure::IncomingNotVisible(
+            "incoming_visible_fraction",
+        ));
+    }
+    if receipt
+        .incoming
+        .iter()
+        .any(|p| p.short_edge < MIN_VISIBLE_SHORT_EDGE)
+    {
+        return Err(ProjectionFailure::IncomingNotVisible(
+            "incoming_visible_short_edge",
+        ));
     }
     if progress == 0.5
         && (receipt.outgoing_front_area / old_area < 0.2
             || receipt.incoming.iter().any(|p| p.fraction() < 0.2))
     {
-        return Err(ProjectionFailure::MidpointNotBroad);
+        return Err(ProjectionFailure::MidpointNotBroad(
+            if receipt.outgoing_front_area / old_area < 0.2 {
+                "midpoint_outgoing_visible_fraction"
+            } else {
+                "midpoint_incoming_visible_fraction"
+            },
+        ));
     }
     debug_assert!(
         builder
@@ -400,6 +435,15 @@ pub(crate) fn project_turn(
 }
 
 fn preflight(outgoing: &CanonicalUnit, incoming: &CanonicalUnit) -> Result<(), ProjectionFailure> {
+    if !incoming.pixels_per_point.is_finite()
+        || incoming.pixels_per_point <= 0.0
+        || outgoing.pixels_per_point != incoming.pixels_per_point
+    {
+        return Err(ProjectionFailure::UnsupportedGeometry(
+            "destination_pixel_scale",
+        ));
+    }
+    let ppp = incoming.pixels_per_point;
     let expected = if incoming.layout == UnitLayout::Single {
         1
     } else {
@@ -409,30 +453,73 @@ fn preflight(outgoing: &CanonicalUnit, incoming: &CanonicalUnit) -> Result<(), P
         || outgoing.pages.len() != expected
         || incoming.pages.len() != expected
     {
-        return Err(ProjectionFailure::UnsupportedGeometry);
+        return Err(ProjectionFailure::UnsupportedGeometry(
+            "layout_or_slot_count",
+        ));
     }
     for (old, new) in outgoing.pages.iter().zip(&incoming.pages) {
-        if !valid_rect(old.rect)
-            || !valid_rect(new.rect)
-            || !valid_rect(old.clip_rect)
-            || !valid_rect(new.clip_rect)
-            || old.rect != new.rect
-            || old.clip_rect != new.clip_rect
-            || old.occurrence.is_some() != new.occurrence.is_some()
-        {
-            return Err(ProjectionFailure::UnsupportedGeometry);
+        for (failed, check) in [
+            (
+                !valid_rect(old.rect) || !valid_rect(new.rect),
+                "invalid_page_rect",
+            ),
+            (
+                !valid_rect(old.clip_rect) || !valid_rect(new.clip_rect),
+                "invalid_clip_rect",
+            ),
+            (
+                !paint_grid_equivalent(old.rect, new.rect, ppp),
+                "page_placement_changed",
+            ),
+            (old.clip_rect != new.clip_rect, "destination_clip_changed"),
+            (
+                old.occurrence.is_some() != new.occurrence.is_some(),
+                "slot_role_changed",
+            ),
+        ] {
+            if failed {
+                return Err(ProjectionFailure::UnsupportedGeometry(check));
+            }
         }
     }
     if expected == 2 {
-        let left = &incoming.pages[0];
-        let right = &incoming.pages[1];
-        if left.rect.width() != right.rect.width()
-            || left.rect.top() != right.rect.top()
-            || left.rect.bottom() != right.rect.bottom()
-            || left.rect.right() > right.rect.left()
-            || left.clip_rect != right.clip_rect
-        {
-            return Err(ProjectionFailure::UnsupportedGeometry);
+        for unit in [outgoing, incoming] {
+            let left = &unit.pages[0];
+            let right = &unit.pages[1];
+            // Width subtracts translated edges: cancellation error depends on
+            // their coordinates, not just the resulting (possibly tiny) width.
+            let width_roundoff = 4.0
+                * f32::EPSILON
+                * [
+                    left.rect.left(),
+                    left.rect.right(),
+                    right.rect.left(),
+                    right.rect.right(),
+                ]
+                .into_iter()
+                .map(f32::abs)
+                .fold(1.0_f32, f32::max);
+            if (left.rect.width() - right.rect.width()).abs() > 1.0 / ppp + width_roundoff {
+                return Err(ProjectionFailure::UnsupportedGeometry("spread_slot_width"));
+            }
+            for (a, b, check) in [
+                (left.rect.top(), right.rect.top(), "spread_slot_top"),
+                (
+                    left.rect.bottom(),
+                    right.rect.bottom(),
+                    "spread_slot_bottom",
+                ),
+            ] {
+                if !paint_grid_scalar_equivalent(a, b, ppp) {
+                    return Err(ProjectionFailure::UnsupportedGeometry(check));
+                }
+            }
+            if left.rect.right() > right.rect.left() {
+                return Err(ProjectionFailure::UnsupportedGeometry("spread_overlap"));
+            }
+            if left.clip_rect != right.clip_rect {
+                return Err(ProjectionFailure::UnsupportedGeometry("spread_slot_clip"));
+            }
         }
     }
     for unit in [outgoing, incoming] {
@@ -440,12 +527,16 @@ fn preflight(outgoing: &CanonicalUnit, incoming: &CanonicalUnit) -> Result<(), P
         for page in &unit.pages {
             if let Some(id) = page.occurrence {
                 if seen == Some(id) {
-                    return Err(ProjectionFailure::UnsupportedGeometry);
+                    return Err(ProjectionFailure::UnsupportedGeometry(
+                        "duplicate_occurrence",
+                    ));
                 }
                 seen = Some(id);
             }
             if matches!(page.material, PageMaterial::Texture { .. }) != page.occurrence.is_some() {
-                return Err(ProjectionFailure::UnsupportedGeometry);
+                return Err(ProjectionFailure::UnsupportedGeometry(
+                    "material_occurrence_mismatch",
+                ));
             }
             for material in std::iter::once(&page.material).chain(page.underlay.iter()) {
                 if let PageMaterial::Texture {
@@ -455,23 +546,41 @@ fn preflight(outgoing: &CanonicalUnit, incoming: &CanonicalUnit) -> Result<(), P
                     let u_axis = uv[1] - uv[0];
                     let v_axis = uv[3] - uv[0];
                     let uv_area = u_axis.x * v_axis.y - u_axis.y * v_axis.x;
-                    if !valid_rect(*available_uv)
-                        || !uv_area.is_finite()
-                        || uv_area == 0.0
-                        || uv.iter().any(|p| {
-                            !p.x.is_finite() || !p.y.is_finite() || !available_uv.contains(*p)
-                        })
+                    if !valid_rect(*available_uv) {
+                        return Err(ProjectionFailure::IncompleteRoi("invalid_available_uv"));
+                    }
+                    if !uv_area.is_finite() || uv_area == 0.0 {
+                        return Err(ProjectionFailure::IncompleteRoi("degenerate_uv_basis"));
+                    }
+                    if uv
+                        .iter()
+                        .any(|p| !p.x.is_finite() || !p.y.is_finite() || !available_uv.contains(*p))
                     {
-                        return Err(ProjectionFailure::IncompleteRoi);
+                        return Err(ProjectionFailure::IncompleteRoi("uv_outside_prepared_roi"));
                     }
                 }
             }
             if !valid_rect(page.rect.intersect(page.clip_rect)) {
-                return Err(ProjectionFailure::IncomingNotVisible);
+                return Err(ProjectionFailure::IncomingNotVisible("incoming_clip_empty"));
             }
         }
     }
     Ok(())
+}
+
+fn paint_grid_scalar_equivalent(a: f32, b: f32, ppp: f32) -> bool {
+    // Two independent round-to-nearest paint edges each contribute <= 0.5px.
+    // Account only for f32 arithmetic at the actual (possibly offset) viewport
+    // coordinates; a fixed point-space epsilon would vary with DPI.
+    let arithmetic = 4.0 * f32::EPSILON * a.abs().max(b.abs()).max(1.0);
+    (a - b).abs() <= 1.0 / ppp + arithmetic
+}
+
+fn paint_grid_equivalent(a: Rect, b: Rect, ppp: f32) -> bool {
+    [a.min.x, a.min.y, a.max.x, a.max.y]
+        .into_iter()
+        .zip([b.min.x, b.min.y, b.max.x, b.max.y])
+        .all(|(a, b)| paint_grid_scalar_equivalent(a, b, ppp))
 }
 
 fn visibility(faces: &[Face], incoming: &CanonicalUnit, old_area: f32) -> VisibilityReceipt {
@@ -603,6 +712,156 @@ mod snapshot_tests;
 mod tests {
     use super::*;
 
+    /// Paint rectangles read from the user's PDF capture (items generation 18,
+    /// pages 17/18 -> 19/20). Effective DPI is 1.5: one paint pixel is 2/3 pt.
+    /// The surrounding fullscreen is 16:9; the media clip excludes its chrome.
+    pub(super) fn portrait_pdf_fixture(spread: bool) -> (CanonicalUnit, CanonicalUnit) {
+        let (mut old, mut new) = fixture(spread);
+        let clip = Rect::from_min_max(pos2(0.0, 44.0), pos2(2560.0, 1227.3334));
+        let old_rects = if spread {
+            vec![
+                Rect::from_min_size(pos2(512.66656, 44.0), egui::vec2(766.66669, 1182.66663)),
+                Rect::from_min_size(pos2(1280.66663, 44.0), egui::vec2(766.66663, 1183.33337)),
+            ]
+        } else {
+            // The same portrait raster aspect fitted alone, centered in 16:9.
+            vec![Rect::from_min_size(
+                pos2(896.6667, 44.0),
+                egui::vec2(766.6667, 1183.3334),
+            )]
+        };
+        let new_rects = if spread {
+            vec![
+                Rect::from_min_size(pos2(512.00006, 44.0), egui::vec2(767.33319, 1182.66663)),
+                Rect::from_min_size(pos2(1280.66675, 44.0), egui::vec2(766.66663, 1182.66663)),
+            ]
+        } else {
+            vec![Rect::from_min_size(
+                pos2(896.3334, 44.0),
+                egui::vec2(767.3332, 1182.6666),
+            )]
+        };
+        for (unit, rects) in [(&mut old, old_rects), (&mut new, new_rects)] {
+            unit.pixels_per_point = 1.5;
+            for (page, rect) in unit.pages.iter_mut().zip(rects) {
+                page.rect = rect;
+                page.clip_rect = clip;
+            }
+        }
+        (old, new)
+    }
+
+    #[test]
+    fn portrait_pdf_letterbox_and_spread_accept_paint_grid_geometry() {
+        for spread in [false, true] {
+            for ppp in [1.0, 1.25, 1.5, 2.0] {
+                let (mut old, mut new) = portrait_pdf_fixture(spread);
+                // Carry the same physical geometry through DPI and a nonzero
+                // viewport origin. No zero-origin or integral-DPI assumption.
+                for unit in [&mut old, &mut new] {
+                    let factor = unit.pixels_per_point / ppp;
+                    unit.pixels_per_point = ppp;
+                    for page in &mut unit.pages {
+                        let map = |r: Rect| {
+                            Rect::from_min_max(
+                                pos2(73.25, 19.5) + r.min.to_vec2() * factor,
+                                pos2(73.25, 19.5) + r.max.to_vec2() * factor,
+                            )
+                        };
+                        page.rect = map(page.rect);
+                        page.clip_rect = map(page.clip_rect);
+                    }
+                }
+                assert_ne!(old.pages[0].rect, new.pages[0].rect);
+                for reading_rtl in [false, true] {
+                    for forward in [false, true] {
+                        for progress in [0.0, 0.01, 0.25, 0.5, 0.75, 0.99, 1.0] {
+                            let projected = project_turn(
+                                &old,
+                                &new,
+                                TurnDirection {
+                                    reading_rtl,
+                                    forward,
+                                },
+                                progress,
+                            )
+                            .unwrap();
+                            assert!(
+                                projected
+                                    .visibility
+                                    .incoming
+                                    .iter()
+                                    .all(|p| p.fraction() >= 0.05 && p.short_edge >= 8.0)
+                            );
+                            if progress == 1.0 {
+                                for page in &new.pages {
+                                    let PageMaterial::Texture { texture_id, .. } = page.material
+                                    else {
+                                        unreachable!()
+                                    };
+                                    let image = projected
+                                        .meshes
+                                        .iter()
+                                        .find(|p| p.mesh.texture_id == texture_id)
+                                        .unwrap();
+                                    assert_eq!(image.mesh.vertices[0].pos, page.rect.left_top());
+                                    assert_eq!(
+                                        image.mesh.vertices[2].pos,
+                                        page.rect.right_bottom()
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn paint_grid_equivalence_does_not_admit_real_layout_or_roi_changes() {
+        let direction = TurnDirection {
+            reading_rtl: false,
+            forward: true,
+        };
+        let (old, mut new) = portrait_pdf_fixture(true);
+        // Actual wider page 22 from the same capture, not a rounding difference.
+        new.pages[0].rect =
+            Rect::from_min_size(pos2(489.33331, 44.0), egui::vec2(814.66669, 1183.33337));
+        assert_eq!(
+            project_turn(&old, &new, direction, 0.0).unwrap_err(),
+            ProjectionFailure::UnsupportedGeometry("page_placement_changed")
+        );
+        let (old, mut new) = portrait_pdf_fixture(false);
+        new.pages[0].rect = old.pages[0]
+            .rect
+            .translate(egui::vec2(2.0 / old.pixels_per_point, 0.0));
+        assert_eq!(
+            project_turn(&old, &new, direction, 0.0)
+                .unwrap_err()
+                .sub_check(),
+            "page_placement_changed"
+        );
+        let (old, mut new) = portrait_pdf_fixture(false);
+        new.pages[0].clip_rect.max.x -= 1.0;
+        assert_eq!(
+            project_turn(&old, &new, direction, 0.0)
+                .unwrap_err()
+                .sub_check(),
+            "destination_clip_changed"
+        );
+        let (old, mut new) = portrait_pdf_fixture(false);
+        if let PageMaterial::Texture { available_uv, .. } = &mut new.pages[0].material {
+            available_uv.max.x = 0.999;
+        }
+        assert_eq!(
+            project_turn(&old, &new, direction, 0.0)
+                .unwrap_err()
+                .sub_check(),
+            "uv_outside_prepared_roi"
+        );
+    }
+
     fn page(id: u64, rect: Rect) -> CanonicalPage {
         CanonicalPage {
             occurrence: Some(id),
@@ -631,6 +890,7 @@ mod tests {
             pages.push(page(2, rect.translate(egui::vec2(376.0, 0.0))));
         }
         let old = CanonicalUnit {
+            pixels_per_point: 1.0,
             layout: if spread {
                 UnitLayout::Spread
             } else {
@@ -762,7 +1022,7 @@ mod tests {
                 },
                 0.0
             ),
-            Err(ProjectionFailure::IncompleteRoi)
+            Err(ProjectionFailure::IncompleteRoi("uv_outside_prepared_roi"))
         ));
         let (mut old, mut new) = fixture(true);
         let clip = Rect::from_min_max(pos2(100.0, 60.0), pos2(460.0, 600.0));
@@ -795,7 +1055,9 @@ mod tests {
                 },
                 0.0
             ),
-            Err(ProjectionFailure::UnsupportedGeometry)
+            Err(ProjectionFailure::UnsupportedGeometry(
+                "page_placement_changed"
+            ))
         ));
         let (old, mut new) = fixture(true);
         new.pages.pop(); // Vacant is no surface, not a manufactured white page.
@@ -933,7 +1195,9 @@ mod tests {
                 },
                 0.0
             ),
-            Err(ProjectionFailure::IncomingNotVisible)
+            Err(ProjectionFailure::IncomingNotVisible(
+                "incoming_visible_short_edge"
+            ))
         ));
         let (old, mut new) = fixture(false);
         if let PageMaterial::Texture { uv, .. } = &mut new.pages[0].material {
@@ -949,7 +1213,7 @@ mod tests {
                 },
                 0.0
             ),
-            Err(ProjectionFailure::IncompleteRoi)
+            Err(ProjectionFailure::IncompleteRoi("degenerate_uv_basis"))
         ));
     }
 }

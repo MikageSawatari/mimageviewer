@@ -1728,8 +1728,10 @@ Ctrl+ホイールなど固定扱いの入力は従来どおり。
 
 ページめくりアニメーションのON/OFFも「その他の機能」の固定順に表示する。
 環境設定と同じ `Settings.page_turn_animation_enabled` が唯一の設定ownerで、通常/F12から即反映・保存する。
+HUD/任意キーの保存は既存overflowのナビゲータ設定と同じ同期 `Settings::save()` を再利用する（2026-10-11利用者決定）。専用async保存や別のdirty stateは追加しない。
 `FsPageTurnAnimationToggle` は `FsImage` / Press、既定キーなし。操作カスタマイズで割り当てるとHUDに先頭chordを表示する。
 overflowの表示項目カスタマイズや別のtoolbar/HUD設定は追加しない。
+紙めくりのstable geometryは描画先の物理px単位で判定し、fit矩形の独立丸めによる1px以内の差を許容する。実際の配置/寸法変更やROI/可視条件不足は同passの通常表示を保つ。
 
 サムネイル一覧、通常の画像フルスクリーン、動画フルスクリーン、消しゴム / 隠蔽加工 / 切り取り / テキスト注釈 / 補正レイヤーモードでは、既定 `?` の `HelpShowContextShortcuts` で現在の文脈のショートカット一覧を
 表示する。keymap 化済み操作は現在の実割り当てで表示し、Esc / 矢印など当面固定扱いの

@@ -147,6 +147,7 @@ fn units(textures: &SceneTextures, spread: bool, cell: Rect) -> (CanonicalUnit, 
         underlay: Some(material(&textures.checker)),
     };
     let unit = |incoming| CanonicalUnit {
+        pixels_per_point: 1.0,
         layout: if spread {
             UnitLayout::Spread
         } else {
@@ -198,8 +199,13 @@ fn paint_canonical(painter: &egui::Painter, unit: &CanonicalUnit) {
 }
 
 fn snapshot_route(spread: bool, reading_rtl: bool, forward: bool) {
+    snapshot_scene(spread, reading_rtl, forward, false);
+}
+
+fn snapshot_scene(spread: bool, reading_rtl: bool, forward: bool, portrait_pdf: bool) {
     let name = format!(
-        "page_turn_projection_{}_{}_{}",
+        "page_turn_projection_{}{}_{}_{}",
+        if portrait_pdf { "pdf_letterbox_" } else { "" },
         if spread { "spread" } else { "single" },
         if reading_rtl { "rtl" } else { "ltr" },
         if forward { "forward" } else { "back" }
@@ -224,9 +230,30 @@ fn snapshot_route(spread: bool, reading_rtl: bool, forward: bool) {
             egui::FontId::monospace(14.0), Color32::WHITE);
         for (index, progress) in POSES.into_iter().enumerate() {
             let cell = Rect::from_min_size(pos2(12.0 + index as f32 * CELL_WIDTH, 48.0), vec2(CELL_WIDTH, 208.0));
+            if portrait_pdf {
+                let viewport = Rect::from_min_size(pos2(cell.left(), 72.0), vec2(CELL_WIDTH, CELL_WIDTH * 9.0 / 16.0));
+                painter.rect_stroke(viewport, 0.0, egui::Stroke::new(1.0, Color32::from_gray(100)), egui::StrokeKind::Outside);
+            }
             painter.text(pos2(cell.center().x, 48.0), egui::Align2::CENTER_TOP, format!("{progress:.2}"),
                 egui::FontId::monospace(14.0), Color32::WHITE);
-            let (old, new) = units(textures.as_ref().unwrap(), spread, cell);
+            let (old, new) = if portrait_pdf {
+                let (mut old, mut new) = super::tests::portrait_pdf_fixture(spread);
+                let scale = CELL_WIDTH / 2560.0;
+                let origin = pos2(cell.left(), 72.0);
+                for (unit, incoming) in [(&mut old, false), (&mut new, true)] {
+                    unit.pixels_per_point /= scale;
+                    for (slot, page) in unit.pages.iter_mut().enumerate() {
+                        let map = |r: Rect| Rect::from_min_max(origin + r.min.to_vec2() * scale, origin + r.max.to_vec2() * scale);
+                        page.rect = map(page.rect);
+                        page.clip_rect = map(page.clip_rect);
+                        page.material = material(if incoming { &textures.as_ref().unwrap().new[slot] } else { &textures.as_ref().unwrap().old[slot] });
+                        page.underlay = Some(material(&textures.as_ref().unwrap().checker));
+                    }
+                }
+                (old, new)
+            } else {
+                units(textures.as_ref().unwrap(), spread, cell)
+            };
             if index == 4 && endpoint_flag.load(Ordering::Relaxed) {
                 paint_canonical(&painter, &new);
             } else {
@@ -238,7 +265,11 @@ fn snapshot_route(spread: bool, reading_rtl: bool, forward: bool) {
             }
         }
         painter.text(pos2(12.0, 270.0), egui::Align2::LEFT_TOP,
-            "Checker = transparent page underlay; dark spread gutter stays 8px. Last pose = canonical incoming.",
+            if portrait_pdf {
+                "Portrait PDF fit in outlined 16:9 fullscreen; letterbox and real paint-grid gap. Last pose = canonical incoming."
+            } else {
+                "Checker = transparent page underlay; dark spread gutter stays 8px. Last pose = canonical incoming."
+            },
             egui::FontId::monospace(12.0), Color32::from_rgb(206, 216, 228));
     });
     harness.run();
@@ -262,6 +293,26 @@ fn snapshot_route(spread: bool, reading_rtl: bool, forward: bool) {
         projected == canonical,
         "finished projected endpoint must render exactly like canonical incoming: {name}"
     );
+}
+
+#[test]
+fn page_turn_projection_snapshot_pdf_letterbox_single_ltr() {
+    snapshot_scene(false, false, true, true);
+}
+
+#[test]
+fn page_turn_projection_snapshot_pdf_letterbox_single_rtl() {
+    snapshot_scene(false, true, true, true);
+}
+
+#[test]
+fn page_turn_projection_snapshot_pdf_letterbox_spread_ltr() {
+    snapshot_scene(true, false, true, true);
+}
+
+#[test]
+fn page_turn_projection_snapshot_pdf_letterbox_spread_rtl() {
+    snapshot_scene(true, true, true, true);
 }
 
 macro_rules! route_test {

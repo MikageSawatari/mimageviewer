@@ -32044,12 +32044,13 @@ impl App {
     }
 
     pub(crate) fn toggle_page_turn_animation(&mut self) {
-        // Persistence awaits the UI-thread save decision recorded in plan §13.
         let enabled = !self.settings.page_turn_animation_enabled;
         self.adopt_page_turn_animation_settings(
             enabled,
             self.settings.page_turn_animation_duration_ms,
         );
+        // Same established persistence route as the navigator overflow toggles.
+        self.settings.save();
         self.show_feedback_toast(format!(
             "[ページめくりアニメーション {}]",
             if enabled { "ON" } else { "OFF" }
@@ -57271,6 +57272,9 @@ mod tests {
             assert_eq!(app.settings.page_turn_animation_enabled, enabled);
             assert_eq!(app.settings.page_turn_animation_duration_ms, duration);
             assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Root);
+            let stored = crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
+            assert_eq!(stored.page_turn_animation_enabled, enabled);
+            assert_eq!(stored.page_turn_animation_duration_ms, duration);
         }
     }
 
@@ -83255,6 +83259,7 @@ mod page_turn_submission_tests {
                             .show(ctx, |ui| {
                                 let make = |incoming: bool| CanonicalUnit {
                                     layout,
+                                    pixels_per_point: 1.0,
                                     pages: (0..if layout == UnitLayout::Single { 1 } else { 2 })
                                         .map(|slot| {
                                             let x = if layout == UnitLayout::Single {

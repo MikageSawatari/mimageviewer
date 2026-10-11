@@ -1420,7 +1420,7 @@ impl App {
                             },
                             progress,
                         )
-                        .map_err(|_| "geometry_visibility_or_roi")
+                        .map_err(|failure| failure.sub_check())
                     })
                 });
                 match projection {
@@ -1491,10 +1491,12 @@ impl App {
                     }
                     Err(reason) => {
                         let previous = offer.submission.end();
-                        if matches!(
-                            previous,
-                            SubmissionStatus::Offered | SubmissionStatus::Started
-                        ) {
+                        if crate::perf::is_enabled()
+                            && matches!(
+                                previous,
+                                SubmissionStatus::Offered | SubmissionStatus::Started
+                            )
+                        {
                             emit(
                                 &offer.fact,
                                 if previous == SubmissionStatus::Started {
@@ -1502,8 +1504,17 @@ impl App {
                                 } else {
                                     "skip"
                                 },
-                                reason,
-                                &[],
+                                "geometry_visibility_or_roi",
+                                &[
+                                    ("sub_check", reason.into()),
+                                    (
+                                        "geometry",
+                                        serde_json::json!({
+                                            "outgoing": unit_diagnostics(outgoing, offer),
+                                            "incoming": unit_diagnostics(incoming, offer),
+                                        }),
+                                    ),
+                                ],
                             );
                         }
                         final_state = PresentationState::Flat(unit.clone());
@@ -1695,6 +1706,7 @@ fn unit_diagnostics(unit: &PaintedUnit, offer: &AcceptedOffer) -> serde_json::Va
                 "source_generation":resource.source_generation().map(|g|serde_json::json!({"items":g.items,"input":g.input})),
                 "visible_source_roi":resource.visible_source_uv_rect().map(rect_diagnostics),
                 "canonical_rect":rect_diagnostics(page.transform.paint_rect),"clip_rect":rect_diagnostics(page.painter.clip_rect()),
+                "viewport_rect":rect_diagnostics(page.transform.viewport_rect),"pixels_per_point":page.transform.pixels_per_point,
                 "uv":uv.map(|p|[p.x,p.y]),"quality":"normal_selected_processed_resource"
             })
         }).collect::<Vec<_>>()
@@ -1729,6 +1741,9 @@ fn canonical_unit(
     use crate::page_turn_animation::*;
     let mut pages = Vec::new();
     for (i, page) in unit.pages.iter().enumerate() {
+        if page.transform.pixels_per_point != unit.pages[0].transform.pixels_per_point {
+            return Err("mixed_destination_pixel_scale");
+        }
         if page.transform.free_rotation_rad.abs() > TRANSFORM_EPSILON {
             return Err("free_rotation");
         }
@@ -1790,6 +1805,7 @@ fn canonical_unit(
         pages.sort_by(|a, b| a.rect.left().total_cmp(&b.rect.left()));
     }
     Ok(CanonicalUnit {
+        pixels_per_point: unit.pages[0].transform.pixels_per_point,
         layout: if pages.len() == 2 {
             UnitLayout::Spread
         } else {

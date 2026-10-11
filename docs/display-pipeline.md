@@ -18,6 +18,12 @@ ONはeguiの最終output hookで破棄passを除外して実occurrence/source/na
 OFFは従来の瞬時切替、ONは単発手動/slideshowの即ready時を対象にする。連打・読込待ち・
 連結・媒体境界は通常切替を保つ。時間は評価用100〜600ms・既定200msで、最終採択は未了。
 
+projectionのstable geometryは描画先transformのeffective pppで比較する。独立に物理pxへ
+丸めたpaint矩形の辺/見開き幅は1物理px以内の差を許容し、float完全一致を要求しない。
+実際のpaint矩形/UVと終端の通常画素は保持し、clip変更、1pxを超える配置/寸法変更、
+不完全なprepared ROI、可視面積不足は引き続きunit全体を同pass flatへ戻す。
+skipは`sub_check`と両unitのpaint/clip/viewport/ppp/ROIをperf有効時だけ記録する。
+
 この記録はA0差分の接続方針であり、実GPU提示・画質・速度・native lease・多窓受入れの証明ではない。
 実装の独立完了レビュー、実機とOFF/ON性能比較は未完了。
 正本は[page-turn-animation-plan.md](page-turn-animation-plan.md)、detached範囲は同rework plan §11。

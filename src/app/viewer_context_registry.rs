@@ -4624,6 +4624,7 @@ mod tests {
         app.items = vec![GridItem::Image(app.tmp.path().join("main.png"))];
         app.fullscreen_idx = Some(0);
         app.adopt_page_turn_animation_settings(true, 400);
+        app.settings.save();
         let main = app.page_turn_destination();
         app.page_turn_presentation.seed_operation_for_test(main, 41);
         let sibling = app.build_window_context_for_test(91343, |owner| {
@@ -4639,6 +4640,9 @@ mod tests {
             let before_items = owner.items.clone();
             let before_input = owner.input_seq;
             owner.toggle_page_turn_animation();
+            let stored = crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
+            assert!(!stored.page_turn_animation_enabled);
+            assert_eq!(stored.page_turn_animation_duration_ms, 400);
             assert!(!owner.settings.page_turn_animation_enabled);
             assert_eq!(owner.settings.page_turn_animation_duration_ms, 400);
             assert_eq!(owner.page_turn_presentation.operation_for_test(), None);

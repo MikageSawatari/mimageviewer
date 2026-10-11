@@ -528,17 +528,17 @@ Q3/Q4の採択とQ2の仮評価設定は§10のとおり。R3の設計採択はA
 
 ## 13. HUD追加要求（2026-10-11）
 
-A0は利用者が`532635fdd`、projection golden補完を`e0f323d24`でコミットした。本追補は`e0f323d24`を基点とする未コミット差分。
+A0は利用者が`532635fdd`、projection golden補完を`e0f323d24`でコミットした。HUD追補は`e0f323d24`を基点に実装され、利用者が`bf3b2fae0`でコミットした。
 `target/A-1341-user-answers.txt`の追加要求に従い、PC静止画上部の「その他の機能」に同名のON/OFF行を追加する。固定順のナビゲータ位置の後へ置き、既定OFFと仮時間は維持する。
 既存toggleのKeyAction/実割り当て表示の方式を使い、既定キーなしの`FsPageTurnAnimationToggle`を追加する。固定順はカスタマイズ一覧ではないため、toolbar/HUD用の別設定やring Actionは作らない。
 
 PreferencesとHUDは`adopt_page_turn_animation_settings`に設定採用を集約する。全体Settingsの同じbool/時間、既存の全presentation退役とingress policy更新だけを使用し、window/contextの別設定、reload、pending stateや保存の待機は追加しない。既存ownerの採用経路へ合流する簡素化を選び、専用のlive rebuildや非同期保存の後着を扱う機構は導入しない。
 
-**保存方式は確認待ち**。sourceではPreferencesの保存も`Settings::save_checked()`による同期SQLite保存であり、設計§7の「save worker」という前提は成立していなかった。新しいHUD入口へ同期I/Oを接続することはAGENTS.mdのUI-thread規則と衝突するため、既存保存経路の再利用を認めるか、Settings writer全体の非同期化まで範囲を広げるかを利用者へ確認中。単独workerで古い全Settings snapshotを後着保存する実装は行わない。現在のHUD差分はメモリ反映までで、保存は未接続。manual/specの保存記述は要求仕様であり、この差分の完了・受入れを示さない。
+**保存方式の利用者決定（2026-10-11）**: fullscreen overflowの既存Settings toggleと同じ経路を使う。source照合ではナビゲータ表示・位置・サイズと本別調整保存toggleが同期`Settings::save()`を呼ぶ。ページめくりも共通toggle出口で設定採用直後にこの呼出しを再利用する。Preferencesは既存の`save_checked()`のまま。save workerという旧前提は撤回し、専用async writer、dirty state、待機、全Settings snapshotの後着保存は追加しない。保存失敗は既存save経路の扱いを継承する。通常のページ送り/paintから保存を呼ばない。
 
-利用者が現在のA0 dev buildを確認中のため、`build-dev.ps1`や`target/dev-runtime`への書込み、製品起動は行わない。検証は`target/debug`のcheckとheadless testsに限定する。検証結果と残件は`target/A-1341-hud-msg.txt`へ記録する。独立レビュー・実機受入れの実績を追加しない。
+HUDコミットまでの検証時は利用者がA0 dev buildを確認中だったため、`build-dev.ps1`や`target/dev-runtime`への書込み、製品起動は行わなかった。検証を`target/debug`のcheckとheadless testsに限定し、結果と残件を`target/A-1341-hud-msg.txt`へ記録した。§14の追加指示では利用者がtest buildを終了し、worktreeのcore不在確認後の確認用buildを許可した。独立レビュー・実機受入れの実績を追加しない。
 
-HUD差分の実施済み検証は次のとおり。保存の未接続を解消した証拠ではなく、現時点のメモリ反映/既存presentation owner/入力・描画を検証した結果である。Cargoは`MSBUILDDISABLENODEREUSE=1`。
+以下はHUDコミット`bf3b2fae0`までの検証履歴。保存接続後のDB再読込とprojection修正の検証は§14へ記録する。Cargoは`MSBUILDDISABLENODEREUSE=1`。
 
 | コマンド/対象 | 結果 | 記録 |
 | --- | --- | --- |
@@ -550,4 +550,56 @@ HUD差分の実施済み検証は次のとおり。保存の未接続を解消�
 | `cargo test -p mimageviewer --lib fullscreen_overflow` | exit 0、6成功 | `target/A-1341-hud-overflow.log` |
 | `cargo test -p mimageviewer --test ui_snapshot` | exit 0、157成功 | `target/A-1341-hud-ui-snapshot.log` |
 
-HUD rootの既存PNGを更新し、ON代表PNGを1枚追加して両方を目視した。Navigator submenu PNGは未変更。UPDATEなしの通常検査も成功した。初回lib compileのprivate context API参照は検査を既存context moduleへ移して解消し、APIの公開範囲を広げていない。新keymap fixtureの失敗は既存のkeyboard-owner cache/input guardへ揃えて解消し、製品側の入力条件を緩めていない。現coreのsize/mtimeはA0の325133312 bytes / LastWriteTimeUtc 2026-10-11 02:18:42のままである。
+HUD rootの既存PNGを更新し、ON代表PNGを1枚追加して両方を目視した。Navigator submenu PNGは未変更。UPDATEなしの通常検査も成功した。初回lib compileのprivate context API参照は検査を既存context moduleへ移して解消し、APIの公開範囲を広げていない。新keymap fixtureの失敗は既存のkeyboard-owner cache/input guardへ揃えて解消し、製品側の入力条件を緩めていない。当時のcoreのsize/mtimeはA0の325133312 bytes / LastWriteTimeUtc 2026-10-11 02:18:42のままだった。
+
+## 14. 実PDFのprojection拒否・HUD保存追補（2026-10-11）
+
+基点は利用者がコミットした`bf3b2fae0`。利用者はnormal profileの実PDFで演出が始まらないと報告した。`%APPDATA%/mimageviewer/logs/perf_events.jsonl`を読み取りだけで調査し、47件の`not_final_ready_at_accept`、18件の`rendition_or_burst`、11件のready opportunity/offeredと、その11件すべての`geometry_visibility_or_roi`を確認した。製品やPDFを起動・変更していない。
+
+### 14.1 失敗条件と修正境界
+
+generic reasonはpure `project_turn`の失敗をまとめたものだった。callerの`canonical_unit`のfree rotation/partial ROI拒否は元から別reasonであり、この11件のgeneric reasonとは区別できる。ready区間の既存`fs/paint`は全件が二つのPDF occurrenceを示す。利用者が述べたsingleの実geometryは旧ログから確定できないため、single fixtureは同じportrait aspectを16:9へ中央fitした再構成とする。
+旧ログには実viewport/clip/prepared ROIの値もなく、fixtureのmedia clipは再構成値である。拒否の最初の成立条件であるpaint rect不一致は実記録から確認できる。その他の値まで実測済みと扱わず、新しいskip geometry診断で次の実機確認時に残りを記録できるようにする。
+
+実座標例（t330.412→330.823、point単位）:
+
+| unit | 左 paint rect (x,y,w,h) | 右 paint rect (x,y,w,h) |
+| --- | --- | --- |
+| PDF 18/17 | 512.66656,44,766.66669,1182.66663 | 1280.66663,44,766.66663,1183.33337 |
+| PDF 20/19 | 512.00006,44,767.33319,1182.66663 | 1280.66675,44,766.66663,1182.66663 |
+
+旧preflightは最初のold/new paint rectの`!=`で拒否する。さらに左右width/top/bottomにもfloat完全一致を要求し、通常のportrait fitの小差も拒否した。PDFも読み取り専用で確認し、全26頁、index 17〜22のMediaBox/CropBoxは約499×725 PDF pointで、499.32×726.36、498.6×724.56、499.44×725.76、499.32×724.92、499.44×725.4、499.56×725.04と元寸法にも小差がある（回転なし）。したがってすべてを同一page boxの丸めだけと断定しない。2/3ptのpaint格子はeffective ppp=1.5相当（旧イベント自体にはpppなし）。source rasterは1343〜1346×1954、scaleは約0.605。paint幅はtrimを反映するためraster幅×scaleとは同一でなく、UVは既存transformをそのまま使う。
+
+修正はstable paint geometryの比較単位を描画先transformのeffective pppへ揃える。独立のround-to-nearest edgeに各0.5物理pxの誤差があるため、fitの小差を許容する上限を1物理pxとし、辺・左右幅/上下位置をこの範囲で比較する。元寸法の小差を一般の異寸法morphへ拡張しない。f32演算誤差は辺の座標から計算し、幅の引き算にも元の座標の大きさを使う（右へ移した小型goldenがこの負のpremiseを検出した）。paint rect、clip、UV、source/native resource、prepared ROIは書き換えず、page sheetや別layout ownerを作らない。終端はincomingの実canonical rect/UVをそのまま提出する。clip/DPI/layout/role変更、overlap、1pxを超える寸法/配置変更、ROI不足、可視面積/8pt短辺/中盤20%条件は維持する。outgoingとincomingの両spreadを検査する。
+
+実ログのPDF 22は幅814.66669pt（通常約767pt）で、これは丸め差ではない。22への切替と戻りは従来A0の異寸法/配置変更除外のままで、全ready機会を開始できると主張しない。このページを含む一般の不等寸法morphは本追補の範囲外。通常flat提示を遅らせない。
+
+geometry skip/cancelは既存reasonを保ち、`sub_check`に`page_placement_changed`、`spread_slot_width/top/bottom`、`destination_clip_changed`、UV/可視面積/短辺などの具体的条件を付ける。両unitのpaint/clip/viewport rect、effective ppp、source/native size/id、UV/prepared ROIも添える。JSON構築はperf有効時だけ。OFF経路・prepare一回/全unit同pass提出・destination/operation identity・lease/VRAM契約は変更しない。
+
+### 14.2 readinessの調査（final-only規則は維持）
+
+ready lookupは現edit/params keyのresidentかつcompleteなfinal composite、読込済みannotation metadata、必要なら一致するcomic composite、texture identityを要求する。PDF raw prefetchやCPU AI prefetchだけではfinal textureの存在を意味しない。AI OFFでも初回final compositeは通常の可視処理経路で作られる。
+
+47件中45件はt326.5より前で、ログにはt319までAI workと多数の`complete=false`がある。AI OFF切替とみられる後、19/20のfinalはt326.456/.463でcomplete=trueに再構築された。残る2件は22/21（t326.903、同世代で先行paintなし）と18/17（t327.837、以前のpaintはAI期間）で、どちらも受理後にcomplete finalを作る。その後の暖まった往復は11件ともreadyで、失敗はgeometryへ移る。AI設定変更は既存generation更新でfinal cacheを消す。旧ログに受理時key/entry状態/metadata residencyがないため、47件すべての内部失敗predicateやAI設定値を確定したとは言わない。
+
+この証拠で通常warmのreadiness bugとは判断しない。final-onlyを緩める、受理時にproducerを起動する、animation用prefetch、後着で開始する、通常cache保持を増やす変更は行わない。最終品質を待たず演出する仕様への変更は利用者判断として残す。
+
+### 14.3 保存・簡素化・検証
+
+§13の利用者決定に従い、HUDと任意KeyActionの共通toggleは既存overflowの`Settings::save()`を呼ぶ。Preferencesと同じSettings owner/adoptionを使い、F12の変更でitems/idx/input sequenceを変えない。headless実行でON→OFF各clickとF12 OFFの後、隔離DBを再読込してboolと仮時間を確認する。
+
+非同期保存や追加pendingの組合せを作らず、既存同期保存の出口へ揃える簡素化を採用する。geometryは一つのpure比較境界で補正し、viewport reloadやreader別の丸め状態は作らない。まれな保存失敗は既存経路を継承し、新たなretry/recoveryは追加しない。
+
+実ログのspread矩形とportrait singleの16:9 letterbox fixtureを加え、LTR/RTL・前後・5時点以上・DPI 100/125/150/200%・非zero originを検査する。2px pan、大きい実寸法変更、clip変更、ROI不足は拒否する負の回帰を含む。projection goldenはsingle/spread各LTR/RTLの4枚を追加し、終端の通常paintとのheadless画素一致も検証する。実GPU/OS present、実機の開始率/完走率、OFF/ON速度、最終durationの採択と独立レビューは引き続き未了。今回のコマンド結果は`target/A-1341-fix-msg.txt`へ記録する。
+
+| 今回の検証 | 結果 | 記録 |
+| --- | --- | --- |
+| fmt check / glyph lint / diff check | exit 0、危険glyph 0 | agent command結果 |
+| normal core check | exit 0 | `target/A-1341-fix-normal-check-final.log` |
+| `cargo check --features portable` | exit 0 | `target/A-1341-fix-portable-check-final.log` |
+| `cargo test -p mimageviewer --lib page_turn`（UPDATEなし） | 86成功、0失敗 | `target/A-1341-fix-focused-final.log` |
+| PDF golden生成、終端画素比較 | 5成功、4枚目視済み | `target/A-1341-fix-pdf-snapshots-verified.log` |
+| `cargo test -p mimageviewer --test ui_snapshot` | 157成功、0失敗 | `target/A-1341-fix-ui-snapshot.log` |
+| `build-dev.ps1 -PreserveRuntime`（通常profile） | exit 0、core/remote/EPUB成功、VCRT/PE runtime=4・pe=3。起動なし | `target/A-1341-fix-build-dev.log` |
+
+初回の小型spread goldenは幅の引き算に必要な座標丸め誤差を検出し、計算境界を修正してから上の最終gateを通した。閾値を大きくして通したものではない。unfiltered lib/workspace検査を成功したと主張しない。確認用buildはcore process不在を直前に確認して`build-dev.ps1 -PreserveRuntime`で行い、結果をhandoffとbuild logへ記録する。製品起動は利用者のみ。
