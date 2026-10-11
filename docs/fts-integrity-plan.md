@@ -633,7 +633,7 @@ FS ↔ SQLite 差分の限界、再構築の durable 順序、非同期境界と
 
 点検は `fts-startup-integrity` opt-in・既定 OFF。既存 ownership scan の件数と loaded reader を
 再利用する worker 上の実装で、OFF build に追加 COUNT/比較の呼出しはない。
-[起動 A/B 手順](fts-startup-ab-measurement.md) と `scripts/analyze_fts_startup_ab.py` は、隔離 data-dir、
+起動 A/B 手順 (撤去済み、§12.3) と `scripts/analyze_fts_startup_ab.py` は、隔離 data-dir、
 24条件、交互反復、保存 checkpoint、全 endpoint と count 診断を確認する。
 未測定/欠落/ノイズ/判断不能/悪化は不採用。起動 A/B、遅延なしの証明、点検採用、原事故の
 原因確定は未実施であり、非対話 fixture の費用測定を採用証拠へ読み替えない。
@@ -723,7 +723,7 @@ feature ON の Cargo lib test 実行体から同じ ignored test を直接実行
 
 §12.1 と同じく SQL scan は空 callback の streaming 読取。これを起動時間の上限、A/B、
 UI-readyへの無影響と読み替えない。点検は未採用・既定 OFF。利用者の隔離 A/B は
-[計測手順](fts-startup-ab-measurement.md) に従う、という追加検証時点の判断だった。
+計測手順 (撤去済み、§12.3) に従う、という追加検証時点の判断だった。
 その後の利用者承認の手順変更・採用は§7.4と§12.3に記録する。
 
 ### 12.3 起動点検の採用とfeature撤去 (2026-10-11)
@@ -741,7 +741,7 @@ perfの `fts_integrity_check`、`metadata_out_of_range_cleanup`、`metadata_supe
 通常のmmap GC拒否・正常shutdown取消の扱いを変えず、patched Tantivyの回帰も確認する。
 
 旧24条件向け専用解析器 `scripts/analyze_fts_startup_ab.py` とそのunit testを削除した。
-`docs/fts-startup-ab-measurement.md` は採用記録へ案内する短い参照ページに置き換えた。
+`docs/fts-startup-ab-measurement.md` と解析器は採用後に削除し、記録は本書 §7.4 / §12.3 に一本化した。
 過去の検証台帳と `target/fts-ab/` の原証拠は保持し、旧解析器が軽量手順をACCEPTしたとは
 主張しない。architecture/async/UI応答性/仕様とマニュアルを常時点検へ合わせた。
 `docs/next-release-backlog.md` は利用者指示で今回編集しない。
