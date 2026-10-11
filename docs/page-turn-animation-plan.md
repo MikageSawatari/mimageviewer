@@ -534,7 +534,7 @@ A0は利用者が`532635fdd`、projection golden補完を`e0f323d24`でコミッ
 
 PreferencesとHUDは`adopt_page_turn_animation_settings`に設定採用を集約する。全体Settingsの同じbool/時間、既存の全presentation退役とingress policy更新だけを使用し、window/contextの別設定、reload、pending stateや保存の待機は追加しない。既存ownerの採用経路へ合流する簡素化を選び、専用のlive rebuildや非同期保存の後着を扱う機構は導入しない。
 
-**保存方式の利用者決定（2026-10-11）**: fullscreen overflowの既存Settings toggleと同じ経路を使う。source照合ではナビゲータ表示・位置・サイズと本別調整保存toggleが同期`Settings::save()`を呼ぶ。ページめくりも共通toggle出口で設定採用直後にこの呼出しを再利用する。Preferencesは既存の`save_checked()`のまま。save workerという旧前提は撤回し、専用async writer、dirty state、待機、全Settings snapshotの後着保存は追加しない。保存失敗は既存save経路の扱いを継承する。通常のページ送り/paintから保存を呼ばない。
+**保存方式の決定（2026-10-11、設計担当 ClaudeCode。既存経路の踏襲）**: fullscreen overflowの既存Settings toggleと同じ経路を使う。source照合ではナビゲータ表示・位置・サイズと本別調整保存toggleが同期`Settings::save()`を呼ぶ。ページめくりも共通toggle出口で設定採用直後にこの呼出しを再利用する。Preferencesは既存の`save_checked()`のまま。save workerという旧前提は撤回し、専用async writer、dirty state、待機、全Settings snapshotの後着保存は追加しない。保存失敗は既存save経路の扱いを継承する。通常のページ送り/paintから保存を呼ばない。
 
 HUDコミットまでの検証時は利用者がA0 dev buildを確認中だったため、`build-dev.ps1`や`target/dev-runtime`への書込み、製品起動は行わなかった。検証を`target/debug`のcheckとheadless testsに限定し、結果と残件を`target/A-1341-hud-msg.txt`へ記録した。§14の追加指示では利用者がtest buildを終了し、worktreeのcore不在確認後の確認用buildを許可した。独立レビュー・実機受入れの実績を追加しない。
 
