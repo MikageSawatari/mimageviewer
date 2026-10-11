@@ -33,6 +33,14 @@ queryは終端を含む32,768 UTF-16 unitsまで、raw件数は10,000、offset�
 
 validated replyは `EverythingDataset` に分類・statし、`SearchProjection::Everything` から既存prepareへ
 渡す。sort/facet/編集metadataと完成items/metasを準備してから一回のadoptionで公開する。
+Everythingの動画pinも同じworkerで、初期化済みVideoPinDbの実pathをreadonlyで開き、
+`lookup_webps_many`のSQL/WebP BLOB取得を完了させる。完成metadataのArcマップを
+`SearchVideoPins::Prepared`として既存動画thumbnail workerへ移譲する。空mapも完成payloadであり、
+UIでDB再取得へfallbackしない。DB connection/書込権限はVideoPinDbが保持し、workerは
+readonly sourceと変更revisionの読取publicationだけを持つ。更新/DB instance交換でstaleな
+metadataは既存Search再準備へ戻す。BLOBをUIでclone/decodeせず、cancel/dropのpayload退役も既存ownerを使う。
+既存Ctrl+Gの`SearchVideoPins::Existing`には同期bulk lookupが残ることをP2対応時に確認・報告した。
+今回のEverything修正からは広げず、別件として扱う。
 古いrun/context/generation/policyの完了は副作用を公開しない。sortや本からの帰路では保持datasetを
 同じprepare workerで再利用し、Everythingへ問い合わせない。UIに新しいFS/DB/IPC待機を追加しない。
 旧dataset/準備済みpayload/receiverの退役は既存smart-folder payload退役workerへ渡し、

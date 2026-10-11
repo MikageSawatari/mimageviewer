@@ -14,6 +14,7 @@ use std::sync::Arc;
 pub(crate) struct SearchMetadataResources {
     pub(crate) pin_db: Option<Arc<FolderThumbPinDb>>,
     pub(crate) tags_db_path: Option<PathBuf>,
+    pub(crate) video_pins: Option<crate::video_pins::VideoPinReadSource>,
 }
 
 pub(crate) enum SearchMetadataInstall {
@@ -26,9 +27,11 @@ pub(crate) struct EverythingMetadata {
     pub(crate) pins: HashMap<String, FolderPinSource>,
     pub(crate) converted: HashMap<String, ConvertedArchiveSourceState>,
     pub(crate) tags: HashMap<String, Vec<String>>,
+    pub(crate) video_pin_blobs: Arc<HashMap<PathBuf, Vec<u8>>>,
     pub(crate) tag_stamp: WriteStamp,
     pin_stamp: Option<FolderPinMutationStamp>,
     tags_db_path: Option<PathBuf>,
+    video_pin_stamp: Option<crate::video_pins::VideoPinMutationStamp>,
 }
 
 impl SearchMetadataInstall {
@@ -47,6 +50,11 @@ impl EverythingMetadata {
         self.tags_db_path == resources.tags_db_path
             && self.pin_stamp == resources.pin_db.as_ref().map(|db| db.mutation_stamp())
             && TAG_WRITES.accepts(self.tag_stamp)
+            && self.video_pin_stamp
+                == resources
+                    .video_pins
+                    .as_ref()
+                    .map(|source| source.mutation_stamp())
     }
 }
 
@@ -62,6 +70,28 @@ pub(crate) fn prepare(
     }
     let mut tag_stamp = TAG_WRITES.sample();
     let pin_stamp = resources.pin_db.as_ref().map(|db| db.mutation_stamp());
+    let video_pin_stamp = resources
+        .video_pins
+        .as_ref()
+        .map(|source| source.mutation_stamp());
+    let video_paths = items
+        .iter()
+        .filter_map(|item| match item {
+            GridItem::Video(path) => Some(path),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let video_pin_blobs = if !video_paths.is_empty() {
+        if let Some(source) = &resources.video_pins {
+            let db = crate::video_pins::VideoPinDb::open_readonly(&source.path)
+                .map_err(|_| "検索結果の動画ピンを読み取れませんでした。".to_owned())?;
+            db.lookup_webps_many(video_paths)
+        } else {
+            HashMap::new()
+        }
+    } else {
+        HashMap::new()
+    };
     let pins = resources.pin_db.as_ref().map_or_else(HashMap::new, |db| {
         db.lookup_many(items.iter().filter_map(GridItem::container_path))
     });
@@ -113,9 +143,11 @@ pub(crate) fn prepare(
         pins,
         converted,
         tags,
+        video_pin_blobs: Arc::new(video_pin_blobs),
         tag_stamp,
         pin_stamp,
         tags_db_path: resources.tags_db_path.clone(),
+        video_pin_stamp,
     }))
 }
 
@@ -130,6 +162,45 @@ mod tests {
             SearchMetadataInstall::Prepared(metadata) => metadata,
             SearchMetadataInstall::Existing => panic!("Everything metadata must be prepared"),
         }
+    }
+
+    #[test]
+    fn video_pin_payload_uses_readonly_worker_connection_and_rejects_changed_source() {
+        let _epochs = TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("pins.db");
+        let db = crate::video_pins::VideoPinDb::open_at(&path).unwrap();
+        let video = temp.path().join("movie.mp4");
+        db.set_pin(&video, 1.0, &[1, 2, 3]).unwrap();
+        let resources = SearchMetadataResources {
+            video_pins: db.read_source(),
+            ..Default::default()
+        };
+        let items = [GridItem::Video(video.clone())];
+        let payload = unpack(prepare(&items, &[Some((0, 1))], &resources).unwrap());
+        assert_eq!(payload.video_pin_blobs[&video], [1, 2, 3]);
+        assert_eq!(db.bulk_lookup_calls_for_test(), 0);
+        assert!(payload.is_current(&resources));
+        db.set_pin(&video, 2.0, &[4, 5]).unwrap();
+        assert!(!payload.is_current(&resources));
+        let updated = unpack(prepare(&items, &[Some((0, 1))], &resources).unwrap());
+        assert_eq!(updated.video_pin_blobs[&video], [4, 5]);
+        assert!(updated.is_current(&resources));
+        let replacement = crate::video_pins::VideoPinDb::open_at(&path).unwrap();
+        assert!(!updated.is_current(&SearchMetadataResources {
+            video_pins: replacement.read_source(),
+            ..Default::default()
+        }));
+        db.remove(&video).unwrap();
+        assert!(!updated.is_current(&resources));
+        let removed = unpack(prepare(&items, &[Some((0, 1))], &resources).unwrap());
+        assert!(removed.video_pin_blobs.is_empty());
+        assert!(removed.is_current(&resources));
+        assert!(
+            unpack(prepare(&items, &[Some((0, 1))], &Default::default()).unwrap())
+                .video_pin_blobs
+                .is_empty()
+        );
     }
 
     #[test]
@@ -191,6 +262,7 @@ mod tests {
         let resources = SearchMetadataResources {
             pin_db: Some(Arc::clone(&pin_db)),
             tags_db_path: Some(tag_path.clone()),
+            ..Default::default()
         };
         let items = [GridItem::ZipFile(zip.clone()), GridItem::Image(image)];
         let payload = unpack(prepare(&items, &[Some((0, 1)); 2], &resources).unwrap());
@@ -217,6 +289,7 @@ mod tests {
                 FolderThumbPinDb::open_at(&temp.path().join("other-pins.db")).unwrap(),
             )),
             tags_db_path: Some(tag_path),
+            ..Default::default()
         };
         assert!(!final_payload.is_current(&replacement));
     }
@@ -229,6 +302,7 @@ mod tests {
         let resources = SearchMetadataResources {
             pin_db: None,
             tags_db_path: Some(missing.clone()),
+            ..Default::default()
         };
         let items = [GridItem::Image("C:/photo.jpg".into())];
         assert!(prepare(&items, &[Some((0, 1))], &resources).is_err());
@@ -239,6 +313,7 @@ mod tests {
         let resources = SearchMetadataResources {
             pin_db: None,
             tags_db_path: Some(empty),
+            ..Default::default()
         };
         let _ = prepare(&items, &[Some((0, 1))], &resources);
         assert_eq!(

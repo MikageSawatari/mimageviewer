@@ -471,3 +471,59 @@ source/UI/ownerの無変更部分の先行検証は§14.4を再利用し、full 
 詳細ログは`target/EV-1374-ipc-fix-{tests,everything,check-normal,check-portable,build-dev}.log`。
 manual real probeのexit 101は上記の外部client応答停止の観測であり、fake自動gateの失敗に数えない。
 実検索成功・Everything内部の停止理由・必要な製品修正の特定は残る。結果を「IPC修正済み」と扱わない。
+
+利用者の追加確認: PID91556はResponding=False、22:45からCPU約19,000秒でbusy/hung。
+これがSendFailedを説明する。初期indexingは利用者の推定であり、IPCで取得した状態ではない。
+利用者判断に従って応答回復後に再測定する。Everything設定は変更しない。
+
+## 16. P2: 動画pinのworker準備（2026-10-12）
+
+独立reviewはP1/P3なし、P2としてEverything完成採用の動画pin SQL/WebP BLOB読取を指摘した。
+`replace_search_view_items_with_ratings`が`respawn_search_video_thread`を呼び、
+従来はUI上で`lookup_webps_many`（500件ずつSQL）を実行していた。完了採用に同期DB I/Oを
+含めない§11.2の契約に反するため、pin取得を完成metadataのproducerへ移す。
+
+`SearchMetadataResources`は初期化済みVideoPinDbから、cached connection filenameと
+読取専用revision publicationを捕捉する。path取得はSQL/FS/既定profile探索を行わない。
+SQLite connectionと変更revisionのwriterはVideoPinDbに保持し、非CloneのDBをworkerへ共有しない。
+prepare workerは実pathをreadonlyで開き、表示動画のpin BLOBを一括取得して
+`EverythingMetadata.video_pin_blobs`のArcマップと、読取前のinstance/revision stampを返す。
+UIのfreshnessチェックはpublicationだけを読み、変更・同pathのDB交換でstaleなら既存再準備へ戻る。
+pin変更がworker作成後に起きても、publicationは最新revisionを読めるので古いspawn時stampへ固定されない。
+
+採用は`SearchVideoPins::Prepared`を動画thumbnail workerへ渡す。空mapも取得済みと明示し、
+UIでDB fallback・BLOB copy/decodeを行わない。別items/cache/worker ownerやAppのpending状態は追加しない。
+Rootの初回・置換・再sort・物理本からの帰路はいずれも既存の同じprepare/adoption経路を通す。
+旧payload/cancel/stale退役は既存のworker retirementとitems generationを使い、兄弟contextを失効しない。
+まれな失敗は既定のlog＋通知で扱い、DBを作成し直したり削除したりせず、回復手順を増やさない。
+
+Ctrl+Gにも同じ同期lookupがあることを実装前に利用者へ報告した。
+`SearchMetadataInstall::Existing`→`SearchVideoPins::Existing`に従来のlookupとstreaming時のpin-only規則を残す。
+Ctrl+Gを移行するには既存streaming/rebuildの準備契約を別件で扱う必要があり、今回の範囲を広げない。
+これは今回追加したEverythingの同期I/O漏れを既存producer境界で直す修正であり、一般的なDB actor導入ではない。
+
+回帰は既存10,000行fixtureへ5,000動画＋pin DBの実WebP BLOBを加える。初回・置換のReadyに
+全pin BLOBが含まれること、UI側DBのbulk lookup件数が0のままで採用・本からの帰路を行えることを確認する。
+兄弟の同PDF ticket/generation/cancel/itemsは従来通り不変。readonly worker接続とDB更新/交換/削除の
+freshness回帰も追加する。実Everythingを自動テストの依存先にしない。
+
+### 16.1 検証記録
+
+- `cargo fmt --all -- --check`、normal/portable core check、UI glyph（危険文字0）は成功。
+- 焦点test: `global_search_ui` 81、`everything` 61（実probeは1 ignored）、
+  `video_pins` 17、`viewer_context_registry` 84、`thumbnail_request` 48 passed。filter間の重複あり。
+  ログは`target/EV-1374-P2-test-{filter}.log`。
+- 動画/BLOB入り10,000行fixtureの初回観測はmax UI drain 3.282 ms、初回adoption 15.761 ms、
+  replacement 28.007 ms、帰路adoption 23.108 ms。実DBの5,000件のpinがReadyに含まれ、
+  初回/置換/取消/完成帰路のUI側bulk lookupは0。tiny WebPを使うsynthetic fixtureであり、
+  実ファイル/実画面全体の性能保証へ一般化しない。`target/EV-1374-P2-everything-tests.log`。
+- 最終full libは1回だけ実行: `cargo test -p mimageviewer --lib --features pack-build-tools`。
+  **12,209 passed / 0 failed / 57 ignored**、exit 0、1057.06秒。
+  `target/EV-1374-P2-full-lib.log`。新pin回帰も成功し、前回のEOF flakeも今回は成功した。
+  test processだけのcrash-dialog抑止は既存helperを再利用し、desktop/製品設定を変更しない。
+- UI layoutは変更せず、先行のfull UI snapshot 162 passedを再利用。実Everything probeは実行しない。
+- `scripts/build-dev.ps1 -PreserveRuntime`はexit 0。直前にglobal/worktree core数0を確認
+  (`target/EV-1374-P2-process-check.txt`)。normal feature / dev-runtimeのcore・Remote companion・
+  EPUB workerをbuild/stageした。coreは2026-10-12 05:17:48、325,190,144 bytes。
+  `target/EV-1374-P2-build-dev.log`。起動/Everything設定変更/downloadなし。
+- `git diff --check`成功 (`target/EV-1374-P2-diff-check.log`)。OS error 1455なし。差分は未コミット。

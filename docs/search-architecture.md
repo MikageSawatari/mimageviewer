@@ -75,6 +75,10 @@ raw/除外/読取不能/重複/上限の件数をimmutable `EverythingDataset` �
 Folder、unsafe path、未対応形式、非表示種類は除外し、stat失敗をゼロstampに置き換えない。
 同名collapseやsidecar探索で検索hitを別のファイルへ置換しない。通常sort/★/tag/編集準備は
 共通workerで行い、UIは完成したitems/metasと副作用を一つのadoption closureでinstallする。
+Everythingの動画pin WebPもprepare workerのreadonly DBで取得し、完成Arcマップを
+動画thumbnail workerへ渡す。採用時の`lookup_webps_many`やBLOB再取得は行わない。
+pin変更stampが古ければ同じprepareで再準備する。Ctrl+Gの既存同期bulk lookupは確認済みだが、
+EverythingのP2修正とは別件として残す（[対応範囲](everything-search-plan.md#16-p2-動画pinのworker準備2026-10-12)）。
 
 採用済みEverythingの位置は `EverythingPosition::Root` / `PhysicalChild`。
 ZIP/PDF/EPUB/変換書庫の物理表示が受理された境界だけでlogical source/return anchor/routeを保持し、

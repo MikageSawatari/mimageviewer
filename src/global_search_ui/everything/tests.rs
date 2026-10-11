@@ -691,6 +691,8 @@ fn ten_thousand_completed_rows_keep_ui_adoption_bounded_and_sibling_unchanged() 
                 .map(|index| {
                     if index == 0 {
                         GridItem::ZipFile(root.join("00000.zip"))
+                    } else if index % 2 == 1 {
+                        GridItem::Video(root.join(format!("{index:05}.mp4")))
                     } else {
                         GridItem::Image(root.join(format!("{index:05}.jpg")))
                     }
@@ -700,6 +702,35 @@ fn ten_thousand_completed_rows_keep_ui_adoption_bounded_and_sibling_unchanged() 
     };
     let first = make_rows(&app.tmp.path().join("first"));
     let second = make_rows(&app.tmp.path().join("second"));
+    // File-backed pin store with real WebP BLOBs: exercise all bulk-read chunks
+    // without depending on native Shell/video decoding or the user's profile.
+    let pin_path = app.tmp.path().join("prepared-video-pins.db");
+    app.video_pin_db = Some(crate::video_pins::VideoPinDb::open_at(&pin_path).unwrap());
+    let mut webp = Vec::new();
+    image::codecs::webp::WebPEncoder::new_lossless(&mut webp)
+        .encode(&[19, 73, 127, 255], 1, 1, image::ExtendedColorType::Rgba8)
+        .unwrap();
+    let mut connection = rusqlite::Connection::open(&pin_path).unwrap();
+    let transaction = connection.transaction().unwrap();
+    {
+        let mut insert = transaction.prepare(
+            "INSERT INTO video_pins(path,pin_pts_secs,thumb_webp,thumb_pts_secs) VALUES(?1,1,?2,1)",
+        ).unwrap();
+        for rows in [&first, &second] {
+            for row in &rows.rows {
+                if let GridItem::Video(path) = &row.item {
+                    insert
+                        .execute(rusqlite::params![
+                            crate::path_key::normalize_keep_drive(path),
+                            &webp
+                        ])
+                        .unwrap();
+                }
+            }
+        }
+    }
+    transaction.commit().unwrap();
+    drop(connection);
     let first_weak = Arc::downgrade(&first);
     let mut maximum_drain = Duration::ZERO;
     let mut adoption_times = Vec::new();
@@ -721,6 +752,26 @@ fn ten_thousand_completed_rows_keep_ui_adoption_bounded_and_sibling_unchanged() 
             std::thread::yield_now();
         }
         assert_eq!(app.items_generation, prior_generation);
+        let prepare = app.global_search.page_edit_prepare.as_ref().unwrap();
+        let Some(SearchPrepareOutput::Ready(_, prepared)) = &prepare.held_ready_for_test else {
+            panic!("expected held complete payload");
+        };
+        let SearchMetadataInstall::Prepared(metadata) = &prepared.metadata else {
+            panic!("Everything metadata must be prepared");
+        };
+        assert_eq!(metadata.video_pin_blobs.len(), 5_000);
+        for row in &result.rows {
+            if let GridItem::Video(path) = &row.item {
+                assert_eq!(metadata.video_pin_blobs.get(path), Some(&webp));
+            }
+        }
+        assert_eq!(
+            app.video_pin_db
+                .as_ref()
+                .unwrap()
+                .bulk_lookup_calls_for_test(),
+            0
+        );
         check_sibling(&mut app);
         app.release_search_ready_for_test();
         let adoption_started = Instant::now();
@@ -729,6 +780,14 @@ fn ten_thousand_completed_rows_keep_ui_adoption_bounded_and_sibling_unchanged() 
         assert!(Arc::ptr_eq(accepted_dataset(&app), result));
         assert_eq!(app.items.len(), 10_000);
         assert_eq!(app.image_metas.len(), 10_000);
+        assert_eq!(
+            app.video_pin_db
+                .as_ref()
+                .unwrap()
+                .bulk_lookup_calls_for_test(),
+            0,
+            "UI adoption must install worker pin BLOBs without a connection lookup"
+        );
         assert_eq!(app.selected, Some(0));
         for (index, (item, stamp)) in app.items.iter().zip(&app.image_metas).enumerate() {
             assert_eq!(item, &result.rows[index].item);
@@ -774,6 +833,14 @@ fn ten_thousand_completed_rows_keep_ui_adoption_bounded_and_sibling_unchanged() 
     assert_eq!(app.items, vec![child]);
     assert!(app.everything_has_physical_child());
     assert!(Arc::ptr_eq(accepted_dataset(&app), &second));
+    assert_eq!(
+        app.video_pin_db
+            .as_ref()
+            .unwrap()
+            .bulk_lookup_calls_for_test(),
+        0,
+        "retained return must also prepare video pins on the worker"
+    );
     check_sibling(&mut app);
     assert!(app.return_from_everything_child());
     poll_until(
@@ -790,6 +857,14 @@ fn ten_thousand_completed_rows_keep_ui_adoption_bounded_and_sibling_unchanged() 
     assert!(Arc::ptr_eq(accepted_dataset(&app), &second));
     check_sibling(&mut app);
     // Only run/context/count and timing diagnostics: no query or physical paths.
+    assert_eq!(
+        app.video_pin_db
+            .as_ref()
+            .unwrap()
+            .bulk_lookup_calls_for_test(),
+        0,
+        "completed retained return must install worker-prepared video pins"
+    );
     eprintln!(
         "Everything prepare timing source=Everything run={} context={:?} count=10000 max_drain_ms={:.3} first_adopt_ms={:.3} replacement_adopt_ms={:.3} owner_adopt_ms={:.3}",
         app.global_search.run_sequence,

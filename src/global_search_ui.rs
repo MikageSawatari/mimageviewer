@@ -37,6 +37,7 @@ impl SearchMetadataResources {
         Self {
             pin_db: app.folder_thumb_pin_db.clone(),
             tags_db_path: app.tags_db.as_ref().map(|db| db.read_path().to_path_buf()),
+            video_pins: app.video_pin_db.as_ref().and_then(|db| db.read_source()),
         }
     }
 }
@@ -318,6 +319,13 @@ struct SearchPreparedItems {
     lookup_passes: usize,
     #[cfg(test)]
     looked_up_keys: usize,
+}
+
+/// Explicit install input: Everything must supply the completed worker payload,
+/// including an empty map. Existing Ctrl+G keeps its separately tracked DB path.
+enum SearchVideoPins {
+    Existing,
+    Prepared(Arc<HashMap<PathBuf, Vec<u8>>>),
 }
 
 /// Facts actually read by the worker, rather than the epoch at request creation.
@@ -2203,10 +2211,10 @@ impl App {
         // items_generation bump + thumbnails 初期化を一箇所に集約。
         // これ以降に届く旧ワーカーの ThumbMsg は poll_thumbnails の
         // 世代不一致チェックで破棄される。
-        let prepared_tags = match metadata {
+        let (prepared_tags, video_pins) = match metadata {
             SearchMetadataInstall::Existing => {
                 self.install_new_items(items, image_metas);
-                None
+                (None, SearchVideoPins::Existing)
             }
             SearchMetadataInstall::Prepared(prepared) => {
                 self.install_prepared_aggregate_items(
@@ -2219,7 +2227,10 @@ impl App {
                 );
                 self.folder_pin_map = prepared.pins;
                 self.converted_archive_cache_paths = prepared.converted;
-                Some(prepared.tags)
+                (
+                    Some(prepared.tags),
+                    SearchVideoPins::Prepared(prepared.video_pin_blobs),
+                )
             }
         };
         if let Some(index) = page_identity_index {
@@ -2357,7 +2368,7 @@ impl App {
         }
         // Ctrl+G 結果の動画サムネ抽出スレッドを (必要に応じて) 再 spawn する。
         // streaming 中は pin 持ち動画のみ、`done=true` 後は全動画を Shell API で展開する。
-        self.respawn_search_video_thread();
+        self.respawn_search_video_thread(video_pins);
     }
 
     /// Ctrl+G 結果ビュー専用の動画サムネ抽出スレッドの候補リストを組み立てる。
@@ -2425,7 +2436,7 @@ impl App {
     ///    ことで、前 spawn を素早く終了させる。spawn_video_thread の cancel チェックは
     ///    Shell call の合間に入るので 1 件分のラグはあるが、Shell Thumbcache が hit
     ///    する 2 回目以降は ms オーダーで完了する。Codex P2 #3 指摘の緩和策。
-    pub(crate) fn respawn_search_video_thread(&mut self) {
+    fn respawn_search_video_thread(&mut self, video_pins: SearchVideoPins) {
         use std::sync::atomic::Ordering;
         // 旧 spawn を cancel する (worker は次の Shell call 終了後に exit)。
         if let Some(old) = self.search_video_thread_cancel.take() {
@@ -2473,19 +2484,22 @@ impl App {
             ));
             return;
         }
-        // **バルクルックアップ** (Codex P2 #2 指摘): streaming 中の rebuild が ~1 秒
-        // 周期で走り、検索結果に動画が数千〜数万件あると 1 件ずつ `db.lookup()` を
-        // 呼ぶと UI スレッドで大量の SQLite I/O が発生する。`lookup_webps_many` で
-        // `IN` 句に集約することで 500 件チャンク × N 回の prepared statement に圧縮。
-        let pin_fetch_section =
-            crate::perf::stall::PollSection::start(crate::perf::stall::PollPart::VideoPinFetch);
-        let pin_blobs: std::collections::HashMap<std::path::PathBuf, Vec<u8>> =
-            if let Some(db) = self.video_pin_db.as_ref() {
-                db.lookup_webps_many(&not_loaded_paths)
-            } else {
-                std::collections::HashMap::new()
-            };
-        drop(pin_fetch_section);
+        let pin_blobs = match video_pins {
+            // Completed Everything payload: no DB open, SQL, BLOB copy, or fallback.
+            SearchVideoPins::Prepared(blobs) => blobs,
+            // Existing Ctrl+G synchronous lookup is reported separately. Its
+            // streaming/pin-only policy is outside this bounded Everything fix.
+            SearchVideoPins::Existing => {
+                let _section = crate::perf::stall::PollSection::start(
+                    crate::perf::stall::PollPart::VideoPinFetch,
+                );
+                Arc::new(
+                    self.video_pin_db
+                        .as_ref()
+                        .map_or_else(HashMap::new, |db| db.lookup_webps_many(&not_loaded_paths)),
+                )
+            }
+        };
         let pin_paths: HashSet<std::path::PathBuf> = pin_blobs.keys().cloned().collect();
         let streaming = !self.global_search.done;
         let candidates = Self::compute_search_video_candidates(
@@ -2520,7 +2534,7 @@ impl App {
             new_cancel,
             candidates,
             self.video_thumb_overrides.clone(),
-            std::sync::Arc::new(pin_blobs),
+            pin_blobs,
         );
     }
 
