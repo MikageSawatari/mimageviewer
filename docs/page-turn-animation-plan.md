@@ -1,6 +1,6 @@
 # ページめくりアニメーション設計案 — backlog §1.341
 
-2026-10-11 / **R6設計案（§17、未実装・再レビュー/採択待ち）**。R3はACCEPT後に統合され、A0と追補もコミット済みだが、利用者の実機評価で動きは不合格となった。R4（§15、`afc474d8d`）・R5（§16、`c73f0d857`）の独立設計レビューはREVISE。R5のcanonical flatによる提示保証と台帳訂正は再レビューで解消と伝達された。R6ではclose解決→continuation commit→ページ情報捕捉の共通境界、異高さunder-pageの連続露出、別sourceのHalf/Fullを一頁窓として返す最小split対応を定義する。既定OFF・仮時間・final-only・F12所有・VRAM会計は維持する。§1〜16は履歴を含み、衝突箇所は§17の置換表を優先する。R6の独立レビュー・実装/実機/性能受入れは未了。利用者の2026-10-11決定で、リリースは次の次の版へ延期済み。
+2026-10-11 / **R7設計案（§18、未実装・再レビュー/採択待ち）**。R3はACCEPT後に統合され、A0と追補もコミット済みだが、利用者の実機評価で動きは不合格となった。R4（§15、`afc474d8d`）・R5（§16、`c73f0d857`）・R6（§17、`29291d496`）の独立設計レビューはREVISE。R6のframe境界・外周連続性・split最小対応は再レビューで解消と伝達された。R7ではcontinuation commit後の描画owner/経路再判定と、媒体が変わった場合の旧canvas終了・既存media経路への引継ぎを補う。既定OFF・仮時間・final-only・F12所有・VRAM会計は維持する。§1〜17は履歴を含み、衝突箇所は§18を優先する。R7の独立レビュー・実装/実機/性能受入れは未了。利用者の2026-10-11決定で、リリースは次の次の版へ延期済み。
 
 R3設計時の参照treeは `next-prefs` / `1ee3e178288f2eff119da16b672d546cc3c9992c`（R2文書commit、開始時clean）。当時の製品コードはmaster `cb00930011323cacd7088ae70c37835141aad58a` と同じだった。
 既存の `file:line` は各設計/追補時のsource inspection位置。A0は§1.364統合後の`0f6ad9f19`を基点に具体化した（§12）。A0は`532635fdd`、golden補完は`e0f323d24`、HUDは`bf3b2fae0`、PDF追補は`ea5f6624a`、保存判断の来歴訂正は`e3a328ff6`でコミットされた。§15はこのHEADと利用者提示の実機結果を基点とする。既存の自動検証成功は動きの品質合格を意味しない。
@@ -1227,6 +1227,8 @@ final-only、通常prepare各一回・同pass排他的flat/leaf、通常mount/de
 
 ### 17.2 frame共通境界 — closeを先に解決してからcommit/captureする
 
+**R7注記: commit前のembedded/viewport選択は入口の選択だけ。commit後は§18.2で描画owner/経路を再判定し、同じ経路の場合だけC/Dへ進む。変更時は旧callbackと通常footerを終了し、既存media dispatchへ渡す。**
+
 #### コードで確認した境界違反
 
 root `handle_fullscreen_root_key_input`は入口で`fs_idx`を捕捉し、その後に`page_turn_pre_draw`を呼び、
@@ -1429,6 +1431,8 @@ R5見積りへの追加は**1〜2作業日**、製品Rust約100〜200行・tests
 
 ### 17.5 R6の回帰・計測gate
 
+**R7注記: 画像turnへの割込み先がnative動画になるfullscreen/in-window回帰とF12拒否を§18.3で追加する。**
+
 R5のflat-first保証・幅swap/2%仮品質admission、中央単頁reverseのinstant、F12/VRAM/ROI/endpointを維持し、
 以下をR6-a/bの完成条件へ加える。CPU p95追加0.5ms/context、GPU追加2ms/4Kは未検証の仮予算のまま。
 
@@ -1447,6 +1451,8 @@ wrong receiptは`presentation_step_mismatch`として該当source/slice/geometry
 実機profileの通常scan省略率・motion品質・最終durationは未実証。headless snapshotをOS presentや利用者合格の代用にしない。
 
 ### 17.6 簡素化・更新見積り・今回の記録
+
+**R7注記: 媒体経路引継ぎの追加範囲と現見積りは§18.4。外周clip/splitの設計は維持。**
 
 採用する簡素化は「一つのframe入口」「終了判定を既存ownerから共有」「commit後にsnapshotを一回作る」
 「同じclockからの外周clip」「halfも同じSingleWindow」。old/new idxを両方正本として持つ案、
@@ -1471,3 +1477,118 @@ backlogはR6の現状に合わせ、R5のhalf全省略を現行仕様として�
 製品code/tests/golden/.git/dev-runtime/normal profileへの書込、build/test/launchは行わない。
 共通frame入口はviewport/context所有境界に触れる構造変更として再レビューへ出す。
 実装前の構造確認と実装時detached §11の範囲記録が必要であり、今回未実施の合意や実装確認を追記しない。
+
+## 18. R7 — continuationの媒体境界と描画経路引継ぎ（2026-10-11）
+
+**状態: 設計改訂のみ、未実装・独立再レビュー待ち。** 対象は`next-viewer` / R6 `29291d496`。
+伝達された再レビューはREVISE。§17.2のclose→commit→fresh snapshot、§17.3の外周clip、
+§17.4のsplit最小対応は設計上解消との確認を記録する。残るP2は画像からnative動画へのcontinuationで描画経路が変わる場合。
+R7の独立確認、実GPU/OS present、motion/性能の受入れは未実施。
+
+### 18.1 反証された前提と維持する境界
+
+`fullscreen_embedded_still_active`は`native_video_in_window_active`だけでなく現在媒体も見て、
+Image/ZipImage/PdfPageまたは音楽ビューをembedded対象とする（`ui_fullscreen.rs:28024`）。
+通常Videoはnative presenterで、`render_fullscreen_viewport`の通常canvasより前の分岐を使う（同:23381）。
+`show_native_video_black_backdrop`と`hide_native_video_black_backdrop_if_shown`はともに
+`show_viewport_immediate(fullscreen_viewport_id(),...)`を呼ぶ（同:28186/28078）。
+R6でその分岐を旧viewport callback内へ単に移すと同じIDへ再入する危険があり、fresh `FsFrameState`だけでは解決しない。
+
+「A→Bのturn中に、通常入力で次の動画Cへ進む」操作は効果の対象媒体が静止画でも発生する。
+continuationを静止画だけへ制限したり、動画Cを飛ばしたりしない。現在のnormal navigation/open/media policyを維持する。
+§16.2のBを一canonical flat採用frame提示してから次navigationする保証、§17.2のclose優先、
+元operation ID、一回だけのcommit、同じcontext所有、default OFF/仮duration/final-only/VRAM/leaseは変更しない。
+R6のsplit/外周clip/四方向leafも変更せず、Remoteやnative動画自体にpage-turn effectを追加しない。
+
+### 18.2 commit後の経路再判定とframe-local return
+
+§17.2のA/BとCの間へ**描画owner/経路の再判定**を入れる。
+commit前に選んだembedded/専用viewportは、現在Bの入力を受けてA/Bを行うための入口でしかなく、Cの描画ownerを固定しない。
+実装は既存のmedia/session/presentation predicateを共用し、page-turn専用の第二のmedia分類/保存stateを作らない。
+
+比較するframe-localな描画bindingはcontext/window/viewportと、egui canvas（main embedded /専用viewport）、
+native video（既存fullscreen popup / in-window child）、音楽等の既存egui経路の区別。
+presenterのReady/PendingやHWND生成は既存native ownerが管理し、R7のbindingへready bool/pending targetを複製しない。
+requested target Cの種類だけで判定せず、通常handlerのcommit結果から**実際に採用されたcurrent session/媒体・既存媒体切替state**を読む。
+F12拒否や別の既存noopでBに留まれば旧経路のまま。音声モードのVideoは既存`fs_music_view_active`を通し、
+一律にnative Videoと扱わない。current itemのkindが同じでも描画window/viewport/host経路が変われば旧callbackは継続不可。
+
+| commit後の結果 | owning callback | callback外の既存dispatcher |
+| --- | --- | --- |
+| 描画bindingが同じ | §17.2 Cでcurrent source/step/composition/FsFrameStateを捕捉し、Dの入力/通常prepare/drawへ進む | Cのsnapshotから通常footerを一回実行 |
+| 描画bindingが変わった | **page prepare・CentralPanel/canvas・画像HUD・still shortcut・通常navigation/slideshow footerへ進まず**、frame-localな`DrawingPathChanged`結果を返して旧callbackを終了 | callbackを完全にunwindしてから、採用済みsessionを正本とする既存media-switch/update経路へ制御を渡す。continuationを再実行しない |
+| close/既存終了 | R6のExitViewer結果、continuationなし | 既存close/親一覧復帰、一回だけ |
+
+`DrawingPathChanged`はR6のframe-local callback結果のenum variantで、old/new binding、current source、
+元operation IDとcommit済みの相関を添えるだけ。App/ViewerContextへpending flag/target/queueを保存せず、そのframeで消費する。
+通常footerの代わりに実行できるのはcallback終了・perf/test witness・既存出力のlease寿命の処理と、
+経路引継ぎのouter bookkeepingだけ。古い`embedded`/`fs_idx`で`fs_viewport_shown`/presentationを上書きしたり、
+旧C/D snapshotを作ってから廃棄したりしない。存在するviewportの通常output寿命を処理することと、new mediaの所有を旧経路で主張することを区別する。
+
+通常handlerは`land_still_page_navigation_target`→`open_fullscreen_from_fs_navigation_with_contract`を通り、
+動画Cの通常open/既存fast swap可否・source/履歴・native起動を一回だけ決定する（同:21623/35898）。
+R7のhandoffで`open_fullscreen`をもう一度呼ばず、追加load/二重history/別のnative presenterを作らない。
+`app.rs`の通常native poll/open/presentation処理とmain native backdrop/chrome分岐（同:90433以降/91940以降）へ戻す。
+main UI/grid抑止もcommit後の正本とframe-local結果を使い、古いembedded判定だけで旧canvasやgridを再描画しない。
+未処理の同frame root ingress等は有効な既存media input owner/handlerへ渡し、旧静止画Bのshortcutを実行しない。
+再配送native keyや次frame用の入力queueは作らず、既存のmedia loading/focus/modalによるdropはそのまま。
+R6のB回帰はstill→stillのまま維持し、native動画のB等はその既存media規則で扱う。
+
+#### 同viewport ID再入を避ける具体的なdispatch順
+
+経路変更を受けたframeでは、旧callback内からbackdropのshow/hide helperや`render_fullscreen_viewport`を呼ばない。
+outerでも同じfullscreen viewportをそのframeに再showして二つ目のbodyを走らせる接続は採らない。
+動画open/source switch自体はBのcommitで開始済みで、native presenterは既存runtimeに従って進む。
+outerは現在の媒体に対する既存main chrome/grid抑止等を処理し、その通常updateを終える。
+backdrop show/hideは**次の通常top-level render dispatch**でcommit後のsessionから再判定する。
+fullscreen動画は既存の「presenter未確定時だけ起動cover、ready時はhide」の条件をそのまま使い、
+in-window動画はmainのchild presenter経路なので専用fullscreen起動coverを作らない。
+
+これはviewport再入を避けるframe-local returnであり、Cのcommit/native起動を次frameまで延期する待機ではない。
+新しいrepaint timer/待機state/finish wait/holdover resourceを作らず、進捗通知・通常repaintは既存media-switchに任せる。
+新ready待ちやBの再prepare/延命はなく、Bの最後の採用outputのbatch leaseは既存の寿命で解放する。
+old callbackを終えた際の画面露出・startup cover/child attach/旧viewport退役は既存媒体切替と同じ責務で検査し、
+grid露出や二重canvasを隠すための新guard/遅延を足さない。実装時に既存切替ではこの順序を満たせない前提が判明した場合は、
+通常媒体切替の所有境界として設計担当へ返し、R7専用のpending/waitを足して通さない。
+
+#### F12の既存動画拒否
+
+`should_block_detached_independent_still_navigation_to_video`はindependent still sessionからmediaへ進む操作を拒否し、
+`open_fullscreen_from_fs_navigation_with_contract`は`DetachedVideoUnsupported`のnoopへ戻す（`app.rs:63734` / `ui_fullscreen.rs:35915`）。
+continuationもこの同じ通常handler/policyを通し、Cのkindを見てnative側へ直接openしない。
+拒否時はcurrent Bと既存F12 drawing bindingを維持し、Bの通常flatを描く。新native owner・別窓・兄弟contextの変更はない。
+これは既存independent still sessionの拒否を維持する規則で、既存detached native動画の機能を新たに禁止するものではない。
+
+### 18.3 回帰・perf・成立条件
+
+headlessでは実handlerとframe dispatchを通して経路/呼出し順/一回性を検査し、fake native adapter等の既存境界を使用する。
+純粋なroute enumの比較だけを統合回帰の代用にしない。HWND/実present/起動時露出は将来の承認済み実機枠の検査と区別する。
+
+| fixture | 必須結果 |
+| --- | --- |
+| fullscreen A→B turn、θ<90で次動画Cへ割込み | Bの全実頁canonical flat採用N→observer完了→N+1以降Cを一回commit。post-commit native fullscreen routeを検出し、旧callback canvas/prepare/still HUD/通常footerなし。動画open/history/source admission一回、callback内show/hideなし、同viewport IDの二重bodyなし |
+| in-window embedded A→B turn→C | 同じflat-first順序。post-commit native child route、旧embedded CentralPanel/footerなし。main grid二重描画/専用fullscreen coverなし、in-window設定/placement維持。outerのnative main chrome分岐はcurrent Cを使用 |
+| 動画Cの既存起動がpending / ready | readyを待ってcommitしない。既存native進捗を使用。次の通常dispatchでfullscreen起動cover/hideの通常条件を検査。stale embedded/shown/presentation上書きなし。old outputのbatch lease後解放、effect-only pinの二重計上なし |
+| F12 independent still A→B turn→動画C | 既存拒否handler/feedbackを一回通す。current B、items/reading位置、F12 drawing ownerを維持。native open/handoffなし、兄弟reader不変、B flat提示保証維持 |
+| Esc/× + 動画C continuation、replay/root+viewport | R6 close優先でC commit/native起動なし。closeなしのreplayはCを二回openせず、post-commit routeはそのpassの正本から判定。古いpassのfooter/ingressを再実行しない |
+
+媒体境界を新たなpage-turn候補へ数えず、全navigation分母には含める既存方針を維持する。
+perfは同じoperation/context/flat receiptに`drawing_path_before/after`、`drawing_path_changed`、
+`continuation_commit_frame`、既存media open/presentationの相関を付け、canvas snapshotとnative targetを混同しない。
+追加decode/upload禁止は効果の仕事についての規則で、通常動画navigationに必要な既存video open/decodeを抑制しない。
+CPU/GPU仮予算・scan省略率・実機motionの受入れ未了はR6のまま。
+
+### 18.4 簡素化・費用・今回の範囲
+
+採用: **commit後に経路を読み直す、変わったらcallbackから返す、既存media-switchへ戻す**。
+不採用: Cをstill限定、動画をskip、旧canvasへnative動画を描く、callback内で同IDをshow、再帰render、
+新pending target/ready bool/wait/入力queue、二回open、Bの追加holdover/再prepare。
+R6-aのprojection/split/外周clipに変更はなく、R6-b/cへroute再判定・frame result/outer dispatchの接続と媒体境界回帰を追加する。
+追加概算**0.5〜1作業日**、製品Rust約50〜120行・tests約100〜200行。
+全体の目安を**14〜21作業日（約3〜5週）+ 独立設計/完了レビュー・修正・実機枠**へ更新する。
+永続設定/KeyAction/DB/native worker/protocolの追加は不要。
+
+今回の変更は本plan、backlogの現行revision/見積り要約、`target/A-1341-r7-design-msg.txt`のみ。
+製品code/tests/golden/.git/dev-runtime/normal profileへ書き込まず、build/test/launchは行わない。
+既存媒体切替とF12/context境界を保つ構造変更として再レビューへ提出し、実装前の確認と実装時detached §11記録を継承する。
+今回未実施の独立合意・実装・実機・性能確認を記録しない。
