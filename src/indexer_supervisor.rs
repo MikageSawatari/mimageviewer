@@ -815,10 +815,9 @@ fn run_initial_scan(
         "indexer[{favorite_id}]: acquiring writer for ingest..."
     ));
     let t_ingest = Instant::now();
-    // session.apply は dispatcher へ bounded sub-batch を送り、境界で待機中の
-    // 他 lock 利用者 (タグ書き込み worker など) に取り合いの機会を与える (CLAUDE.md
-    // 並行処理ガイダンス + docs/async-architecture.md §5.5)。supervisor 側は Mutex 参照を
-    // そのまま渡すだけ。
+    // session.apply は writer を所有する dispatcher へ bounded sub-batch を送る
+    // (docs/async-architecture.md §5.5)。タグ書き込み worker は tags.db だけを更新し、
+    // この writer を共有しない。
     let ingest_stats = match session.apply(
         scan.to_ingest,
         scan.to_delete,
