@@ -249,6 +249,13 @@ always-active guidance.
   approval. The flag is an execution assertion, not a way to obtain consent.
   Keep desktop-interactive tests separate from automatic `test-full.ps1` and
   build gates. Existing normal-profile launch prohibitions still apply.
+- The canonical release idle/perf procedure is the user-run PowerShell command
+  `scripts/ui-smoke.ps1 -Scenario ReleaseChecks -InteractiveApproved`; see
+  `CLAUDE.md` Phase 2 9.6/9.7 and `docs/release-check-automation-plan.md`.
+  Minimize other application windows before starting and leave the PC untouched
+  through build and run. Adoption does not grant agent launch approval or relax
+  disposable-portable and real-settings protection; manual scripts remain the
+  fallback/diagnostic path.
 
 - After completing a user-requested application or runtime behavior change,
   run the relevant automated checks, then build a user-runnable verification

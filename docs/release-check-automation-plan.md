@@ -1,5 +1,10 @@
 # リリース前 idle health / perf smoke 自動化計画
 
+**現行状態（2026-10-11）: 利用者がReleaseChecks suiteを毎リリースの正規手順として採用。**
+`45a2be935` の了承済み確認runはPASS_WITH_WARNINGS／exit 0（PASS 7、警告付きPASS 2）。
+採用証跡・foreground再試行と残す手動範囲は [§10](#10-phase-4-確認と正規手順の採用2026-10-11) に記録する。
+以下の設計・blocker修正時の「未実行／利用者待ち」は各時点の履歴であり、現在の採用状態ではない。
+
 2026-10-09、line F の Step 1（設計案、未実装・未実行）。`next-qa` / `840c309ec` の
 文書・ソースを参照した。backlog [§1.361 / §1.197](next-release-backlog.md) を、この検証範囲について
 一つの手順へまとめる。§1.197 全体の複数窓・native 入力自動化を完成扱いにはしない。
@@ -14,15 +19,18 @@ v4.4.0 / v4.5.0 の [検証記録](release-verification-records.md) は過去の
 
 ## 1. 目的・境界・簡素化
 
-提案する入口は次の一つ。**以下は実装後の予定コマンドで、現在は存在しない。**
+採用済みの入口は次の一つ。利用者がrepository rootのPowerShellで実行する。
 
 ```powershell
 .\scripts\ui-smoke.ps1 -Scenario ReleaseChecks -InteractiveApproved
 # 同一ソースの診断ビルドが確認できる場合だけ -SkipBuild を追加
 ```
 
-生成 → 準備 → idle 5 ケース → perf の cached / uncached 2 ケース → 終了 → 解析 →
+診断portable build → 生成 → seed準備 → idle 5 ケース → perf の cached / uncached 2 ケース → 終了 → 解析 →
 貼り付け用 Markdown まで実行し、途中の Enter や利用者の操作は不要にする。
+FFmpeg CLIがPATHに必要。他アプリ窓を最小化し、build待ちを含め終了までPCに触れない。
+同一ソースの診断artifactが検証できる場合だけ `-SkipBuild` を追加する。
+suite採用は起動了承ではなく、§7の明示了承・隔離data・通常profile起動禁止を維持する。
 既存の runner に suite を追加し、汎用 E2E framework、独自 input backend、別のキャッシュ管理器は作らない。
 
 **一度に一つの scenario / 一つの App process** とし、ケース間は完全終了して、停止済みの生成データを
@@ -142,7 +150,9 @@ tray 2ケースだけは起動時 overlay で既存の `cache_policy=off` を指
 cache が作られた、source 再生成がない、Finalized 受理時に当該画像が backlog にない等の場合は
 再現条件不足として SKIPPED / 環境不成立。idle 値が低くても PASS にしない。
 成立した後の旧版で同一要求の再投入反復、修正版で収束を確認する。**読み込み中／完了後をそれぞれ
-独立に旧版 FAIL・修正版 PASS** とするのが採用条件で、一方の成功で他方を代替しない。
+独立に旧版 FAIL・修正版 PASS** の比較証拠を残し、一方の成功で他方を代替しない。
+設計時には手順の採用条件としていたが、2026-10-11の利用者判断で手順採用を実施し、
+この比較証拠は別項目として残す（§10）。
 通常フローの速度を変えず両版で同じ read-only 計装・fixture / overlay を使う。
 
 ### foreground と無操作区間
@@ -194,9 +204,10 @@ index settle の既定上限は 180 秒。現行 sampler は timeout を warning
 生成 fixture suite では準備未完了として保留し、背景の索引負荷を idle regression と誤判定しない。
 video-pin は最新 folder-load 以降の work 証拠に加え cached 読取を求め、upgrade 評価未確認の warning は
 自動 suite の完了証拠不足として保留する。ピン直後 `from_cache=false` の状態を PASS にしない。
-なお CLAUDE 9.7 は `idle_upgrade_ineligible` を必須と記述する一方、idle 正本 / 現行 analyzer は
-対象 work を必須、enqueue / ineligible の評価未確認を warning としている。本案は後者を基礎に
-suite の証拠不足を保留し、採用時にこの文書差も統一する（ineligible だけを唯一の成立証拠にはしない）。
+**2026-10-11採用時にCLAUDE 9.7とidle正本の表記を統一**。対象workは必須とし、
+`idle_upgrade_enqueue` **または** `idle_upgrade_ineligible` を評価証跡とする。
+手動analyzerの評価未確認はwarning、正規suiteはcached読取と評価証跡の不足を環境不成立として止める。
+ineligibleだけを唯一の成立証拠にはしない。
 
 ## 5. perf smoke の操作・自動判定
 
@@ -336,6 +347,7 @@ suite が具体化した後、5 idle ケース・2 perf ケース、見込み **
    trayの読み込み中／完了後それぞれで旧版 FAIL / 修正版 PASS を出す証拠を取る
    （同じ read-only test-only 計装・fixture / overlay、製品挙動は変更しない）。
    foreground 不成立はそのまま記録。採用後に CLAUDE Phase 2、idle 正本、運用・索引を更新する。
+   **2026-10-11の利用者判断で正規手順への採用と文書更新を実施。実測・残る比較証拠は§10。**
 
 **利用者決定（2026-10-09）**: 当初の3質問は、すべて推奨案を採用する回答を受領した。
 
@@ -648,3 +660,54 @@ commitの永続化と本体DBへのcheckpointは別であり、process終了だ�
 
 実行済みの非対話検証と引き継ぎは `target/F-phase4-fix7-msg.txt` と `target/F-phase4-fix7-evidence/`。
 Rustソースは変更しておらず、診断portableの再buildは行わない。アプリ／ui-smokeは実行していない。
+
+## 10. Phase 4 確認と正規手順の採用（2026-10-11）
+
+利用者が了承済みの確認runと4回の夜間runを踏まえ、ReleaseChecks suiteを採用すると明示した。
+本節は保存済み証跡の確認と文書反映であり、新しいアプリ起動や再測定ではない。
+CLAUDE Phase 2 9.6／9.7、idle正本、release運用、build/test手順、README索引、AGENTSの入口を
+正規suiteへ揃えた。手動 `perf_smoke.ps1`／`perf_smoke.sh`／`check-idle-health.ps1` はfallback／診断に残す。
+
+### 採用の実行証跡
+
+各runは `target/ui-smoke/runs/` 配下。表のverdictは当時保存した `summary.json` の値を保持する。
+夜間runの旧FAILを、分類変更後のPASSとして上書きしない。
+
+| run directory | 保存済みsuite verdict／exit | case内訳と成立状況 |
+| --- | --- | --- |
+| `release-checks-20261010-185441-f521e6cd` | FAIL／1 | PASS 7（2 seed＋5 idle）、perf 2件FAIL。理由はframe 1→2の未知startup gapのみ |
+| `release-checks-20261010-190214-b8bfc979` | FAIL／1 | 同上。seed／5 idleは全PASS、perfのFAIL理由は同じstartup gapのみ |
+| `release-checks-20261010-190911-5db88aed` | FAIL／1 | 同上。seed／5 idleは全PASS、perfのFAIL理由は同じstartup gapのみ |
+| `release-checks-20261010-193002-05e9ee9d` | FAIL／1 | 同上のstartup gap FAIL。追加でperf-uncachedに `slow update 154 lacks stage breakdown` の環境注記あり（122.071ms、分類変更後も証拠不足を保留） |
+| `release-checks-20261011-021214-981a5c43` | FAIL／1 | seed-profileで `exact root foreground was not acquired`。seed FAIL 1／suite-preparation SKIPPED 1、後続未実施 |
+| `release-checks-20261011-022136-2ae15cb6` | **PASS_WITH_WARNINGS／0（suite完了）** | **PASS 7、PASS_WITH_WARNINGS 2**。2 seed＋5 idle全PASS、両perfも完了。警告は `known-startup-first-frame` だけ、FAIL／環境エラーなし |
+
+確認runのソースは `45a2be93586c7d4e2a833c461f0739b268d96c78`、
+診断core SHA256は `69bf851fce892eca8b2bb1de136a43cf684387bf94c51681c1ac8f058f333e76`、
+source fingerprintは `df0120b7cdfd11427522c1b331f4137ace8930f683ed47b3da7367cc19ebd3b5`。
+release＋portable,test-script、fixture `release-checks-v4`、window 1328×900、idle case DPI 144（150%）。
+CPU Intel Core Ultra 9 285、GPU Intel Graphics／NVIDIA GeForce RTX 4090、Windows 10.0.26300.0。
+各perfは256/256 folder-load、Ctrl+Down 5/5、固定検索完了、未知100ms超0件、100ms超update 0件。
+cachedはdrawn 300/301が16ms未満（99.67%）、raw pre-grid p95 0.08957ms、
+uncachedは301/302（99.67%）、p95 0.09633ms。既知startup gapはcached **109ms**、uncached **125ms**、
+いずれも測定操作前のframe 1→2、§5の500ms上限内。段別内訳不足はこの確認runでは再発していない。
+この同一PC／fixtureの測定を他環境のbaselineやdrawn比率のhard gateにはしない。
+
+### foreground失敗後の再試行
+
+`021214-981a5c43` は利用者報告で約7.5分のbuild中に他窓が前面にあり、seed-profileのexact rootを
+取得できず停止した。失敗runのverdict・logを保持し、後続caseを実施済み扱いにしない。
+同一ソースの診断artifactを使い、環境を整えて利用者が `-SkipBuild` 付きの新run
+`022136-2ae15cb6` を実行した。自動retryやforeground保護の解除による成功ではない。
+今後は開始前に他アプリ窓を最小化し、build待ちを含め完了までPCに触れないことを正規手順に明記する。
+
+### 採用の範囲と維持する条件
+
+今回の利用者判断は、毎リリースのidle／perf確認手順としての採用。
+§8 step 4で求めたtray両ケースの**同一suite fixture／計装による旧版FAIL・修正版PASS比較**は、
+これらのrunがすべて修正版なので新たに確認したとは書かない。§9の過去の再現記録と区別し、
+追加の比較証拠は別途残す。採用を出荷許可、配布版の厳密性能、full gateや§1.197全体の完了に読み替えない。
+UI／I/O変更版の実データ、実タイトルバー[×]／tray復帰、変更したnative入力・IME・DPI等の
+手動確認は§7のまま。AI／GPU変更版は `-IncludeFirstAi` を明示し、未実施を記録する。
+閾値・証跡必須条件は緩和しない。foreground失敗や段別内訳不足を隠さず、FAIL／SKIPPED／警告を残す。
+エージェントの明示実行了承、normal-profile起動禁止、使い捨てportableと実設定保護も維持する。

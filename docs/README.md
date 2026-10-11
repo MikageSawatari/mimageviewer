@@ -35,7 +35,8 @@
 | [startup-diagnostics-plan.md](startup-diagnostics-plan.md) | §1.241 常時起動timeline、実PRESENT、5秒Indexer overlay、単一採用、狭いwatchdog。Phase Aと§1.335統合後の初期フォルダPhase Bの境界は§10 |
 | [preferences-layout-guidelines.md](preferences-layout-guidelines.md) | 環境設定 UI のページ構成、配置、レスポンシブレイアウトを触るとき |
 | [v3.7.0-input-and-still-seek-plan.md](v3.7.0-input-and-still-seek-plan.md) | v3.7.0 の動画ホイール・マウスボタン割り当て、段階別シーク秒数、詳細表示起点の不具合と静止画サムネイル列5段階の実装計画 |
-| [idle-health-check.md](idle-health-check.md) | 静止中・背面表示中・トレイ常駐中の高速 repaint / work 再投入 / CPU・ログ肥大をリリース前に自動検出する手順と判定値 |
+| [release-check-automation-plan.md](release-check-automation-plan.md) | **2026-10-11利用者採用**。毎リリースのReleaseChecks suite（隔離seed、5 idle、cached／uncached perf）、証拠・既知startup gapの上限500ms・foreground条件・採用run記録。手動／実データ確認の範囲も維持 |
+| [idle-health-check.md](idle-health-check.md) | ReleaseChecks suiteを正規手順とする静止／背面／動画ピン／tray読込中・完了後の条件と判定値。従来の手動scriptはfallback／診断 |
 | [ui-smoke-automation-plan.md](ui-smoke-automation-plan.md) | §1.197 の実アプリ自動検証。診断portable、複数窓PDF、静止画pointer、動画の実OSマウス入力の段階と検証範囲 |
 | [interactive-release-verification.md](interactive-release-verification.md) | 実アプリ起動・操作テストはリリース前等の検証枠で、内容・所要時間を示し利用者の明示了承後に実行する運用 |
 | [v3.7.0-priority-work.md](v3.7.0-priority-work.md) | §1.198 / §1.197 / §1.195 のコード照合、担当移行、設計判断、実行済み検証の台帳 |

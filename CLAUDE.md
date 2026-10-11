@@ -2052,7 +2052,39 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
      `python scripts/check_bench_regression.py vendor/bench_baseline.json run1.json run2.json run3.json`。
      **ノイズと判断した場合に `--save` で baseline を上書きしない** (`--save` は 1 ファイルだけ受け付ける)。
 
-9.6. **perf smoke** (UI 周り / I/O 経路に変更を入れたリリースで実施):
+9.6. **perf smoke** (正規手順は idle 5ケースと合わせた ReleaseChecks suite。毎リリース実施):
+   利用者が repository root の PowerShell で実行する:
+   ```powershell
+   .\scripts\ui-smoke.ps1 -Scenario ReleaseChecks -InteractiveApproved
+   ```
+   - 診断portableのbuild、生成fixture／隔離dataのseed、5 idle、cached／uncached perf、通常終了・
+     証跡保存・解析まで逐次実行する。**9.7も同じ1回のsuiteで確認し、重複実行しない**。
+     FFmpeg CLI (`ffmpeg.exe`) がPATHに必要。初回buildは別に約7.5分かかった実績があり、
+     suiteはseed込み約5〜8分を見込む。AI追加は別途準備・実行時間を見積もる。
+   - **開始前に他アプリの窓を最小化し、build待ちを含め終了までPCに触れない**。
+     exact rootのforeground取得、runner所有窓への背面移行、測定中の状態を検証する。
+     foreground不成立時は記録を残して停止し、環境を整えた別runでやり直す。自動retryはしない。
+   - 同一ソースの診断artifactが検証できる場合だけ上記に `-SkipBuild` を追加できる。
+     buildを先に済ませる場合は `prepare-portable-smoke.ps1 -TestScript` を使う（起動しない）。
+     stale artifactの利用や設定保護の省略を認めるフラグではない。
+   - 結果は `target/ui-smoke/runs/<run-id>/summary.json` と `release-record.md`。
+     全必須caseの証跡と終了codeを確認する。0=PASS／PASS_WITH_WARNINGS、1=FAIL、2=SKIPPED／環境不成立。
+     警告はリリース記録に残し、FAIL／SKIPPEDをPASSに読み替えない。
+     `known-startup-first-frame` は測定操作前のstartup-overlay frame 1→2 gapだけ、上限500ms。
+     gap時間は別記され、超過や通常操作中の未知100ms超はFAIL。段別内訳不足も環境注記に残す。
+   - cached／uncachedで256個の異なるfolder-load、Ctrl+Down x5、Ctrl+G固定検索を検証する。
+     drawnは直前tailが厳密に `request_repaint` のgapだけ、暫定n≥200／<16ms比率97%はWARN目標、
+     raw `pre_grid.total_ms` p95≤0.3msは必須。通常sleepをhitchとして集計しない。
+   - AI／GPU経路変更版では同じ入口に `-IncludeFirstAi` を明示追加する。
+     UI／I/O経路変更版では普段のフォルダの短い手動確認も別に残す。生成fixtureの成功を
+     実データ・配布版の厳密性能・native入力／IMEの確認へ読み替えない。
+   - 採用は実行了承ではない。エージェント実行は [実行確認](docs/interactive-release-verification.md)
+     に従い対象・所要時間・desktop入力・使い捨てdata・AI有無への明示了承後だけ行う。
+     `-InteractiveApproved` は了承済みの実行assertion。normal-profile起動禁止と
+     本書「検証起動時の設定データ保護」は維持し、利用者の通常設定をseedにコピーしない。
+     full gate／buildへ自動連結しない。詳細・採用証跡は [自動化計画](docs/release-check-automation-plan.md)。
+
+   **手動fallback／診断** (利用者が通常releaseを起動。UI／I/O変更版の実データ確認にも使う):
    ```powershell
    .\scripts\perf_smoke.ps1
    ```
@@ -2062,9 +2094,11 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
      操作の合間の sleep がすべて「ヒッチ」として数えられる (実測: 通常操作 55 秒で 108 件、
      最大 16 秒)。判定は**大きいギャップ 1 件ずつ、直前の `ui.tail_repaint.action`** を見る:
      - `none` = repaint を要求していない (= 入力待ちで就寝) → **正常**
-     - `request_repaint_after_idle_upgrade` 等の遅延 wake → **正常** (予定どおりの起床)
+     - `request_repaint_after_idle_upgrade` の遅延 wake → 予定遅延との一致を確認した場合は**正常**
      - 上記以外で 100ms を超える → UI スレッド同期 I/O 退行の疑い
        (docs/ui-responsiveness.md §4)
+   - 遅いupdate自体はtail=`none`でも検査する。既知startup gapを認める場合も、
+     自動化計画§5と同じ証跡・frame 1→2・測定操作前・500ms上限を確認し、時間を別記する。
    - ⚠️ **「16ms 未満が 97% 以上」を全フレームで測らない。** この比率は**正しい就寝を
      ヒッチとして数える**ので、短い / 暇なセッションほど悪く出る。実際 v3.3.1 の計測では、
      健全そのものの 11 秒セッションが 91.4% になり、v3.3.0 の 97.3% (4,708 フレーム) と
@@ -2075,12 +2109,23 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
    - もう 1 つ見る値: `ui.pre_grid_breakdown` の `total_ms`。UI スレッドの各段の合計で、
      健全なら **p95 0.3ms 以下**。ここが膨らんでいれば同期 I/O 退行が濃厚で、
      どの段かも同じイベントの内訳で分かる。
-   - **先に `.\scripts\build-release.ps1` が要る** (idle health と同じく `target\release` の
-     core を起動する)。`build-dev.ps1` だけでは古い release バイナリが動く。
+   - **手動fallbackは先に `.\scripts\build-release.ps1` が要る** (`target\release` のcoreを起動する)。
+     `build-dev.ps1` だけでは古いreleaseバイナリが動く。エージェントはこの通常profileを起動しない。
    - `scripts/perf_smoke.sh` は同じ内容の bash 版。中身は「FFmpeg DLL を target/release へ
      コピー → perf log を退避 → core を起動 → 終了後に解析」なので、手で分けて実行してもよい。
 
 9.7. **idle health smoke** (毎リリース必須。静止中の高速 repaint / 再投入ループを検出):
+   **正規手順は9.6のReleaseChecks suiteの同一run**。static-foreground／static-background／
+   video-pin-background／tray-close-while-loading／tray-close-after-loadingの5ケースをすべて確認する。
+   生成fixture・停止済みseed復元・cached読取・tray格納時の要求寿命・source／Finalized-image-backlog、
+   exact PID／foreground／UTC測定境界を証明する。5秒warmup／15秒測定と既存閾値を維持する。
+   背面はrunner所有の専用窓へ移行するため利用者が他窓へ切り替える必要はない。
+   動画ピンは対象workとcached読取、`idle_upgrade_enqueue` **または** `idle_upgrade_ineligible` の
+   評価証跡を求める。ineligibleだけを唯一の成立条件にしない。評価未確認はsuiteではSKIPPED／環境不成立。
+
+   **手動fallback／原因診断** (以下はsuiteの正規コマンドではない。利用者が状態を準備する):
+   手動の場合も事前に `build-release.ps1` で通常releaseをbuildする。起動は利用者のみとし、
+   通常の実設定を開くことと設定保護のルールを確認する。
    ```powershell
    .\scripts\check-idle-health.ps1 -Scenario static-foreground
    .\scripts\check-idle-health.ps1 -NoLaunch -Scenario static-background
@@ -2117,9 +2162,11 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
      受動 snapshot だけは操作件数から除く (focus と修飾キーの値は問わない)。key / wheel / 他の
      input、矛盾 heartbeat、欠損・未知形式は入力として FAIL。総 event 数と repaint / work の
      反復検査には snapshot を残す。
-   - `-Scenario` は上記4値だけを受け付ける。perf log の session PID と測定対象 PID が違えば失敗し、
-     空の測定窓は同一 session を確認できた場合だけ完全 sleep として扱う。動画ピンシナリオは
-     準備開始後の `thumb.idle_upgrade_ineligible` が無ければセットアップ不成立として失敗する。
+   - 手動scriptの `-Scenario` は上記4値だけを受け付ける。perf logのsession PIDと測定対象PIDが
+     違えば失敗し、空の測定窓は同一session・ログ完全性を確認できた場合だけ完全sleepと扱う。
+     動画ピンは最新folder-load以降の対象workが必須。`idle_upgrade_enqueue`／`idle_upgrade_ineligible`
+     の両方が無い場合、手動analyzerは評価未確認をwarningにするので、cached状態を作り直して再測定する。
+     正規suiteはcached読取と評価証跡の不足を環境不成立として止める。詳細はidle正本に従う。
    - ZIP / PDF / スマートフォルダ、AI、動画・音楽の非同期経路を変更した場合は、その処理が
      完了した静止状態も追加測定する。詳細は `docs/idle-health-check.md`。
 
