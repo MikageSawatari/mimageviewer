@@ -6704,7 +6704,7 @@ impl App {
             return;
         };
 
-        self.selected = Some(target);
+        self.move_grid_cursor(Some(target));
         self.scroll_to_selected = true;
         self.update_last_selected_image();
         self.bump_input_seq(
@@ -7071,7 +7071,7 @@ impl App {
             return;
         };
         if self.selected != Some(new_sel) {
-            self.selected = Some(new_sel);
+            self.move_grid_cursor(Some(new_sel));
             self.scroll_to_selected = true;
             self.update_last_selected_image();
             self.bump_input_seq("gamepad_grid_nav", Some(&format!("sel={new_sel}")));

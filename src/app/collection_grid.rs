@@ -943,7 +943,7 @@ impl App {
             .selected
             .is_some_and(|index| removed_indices.contains(&index))
         {
-            self.selected = None;
+            self.move_grid_cursor(None);
         }
     }
 
@@ -3671,7 +3671,7 @@ impl App {
         self.search_filter = None;
         self.search_query.clear();
 
-        self.selected = selected;
+        self.move_grid_cursor(selected);
         self.scroll_to_selected = selected.is_some();
         if selected.is_none() {
             self.scroll_offset_y = 0.0;

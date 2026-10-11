@@ -14413,6 +14413,56 @@ impl GridClickSelectionAnchor {
     }
 }
 
+/// Cursor intent, independent of the input device or viewer presentation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GridCursorMove {
+    Move,
+    Extend { anchor: usize },
+}
+
+/// The single cursor/selection-anchor transition. Identity remapping and context
+/// transfer are not navigation and retain their existing paired state instead.
+pub(crate) fn apply_grid_cursor_move(
+    selected: &mut Option<usize>,
+    anchor: &mut Option<GridClickSelectionAnchor>,
+    items_generation: u64,
+    target: Option<usize>,
+    movement: GridCursorMove,
+) {
+    let mut anchor_index = None;
+    apply_grid_cursor_move_indices(selected, &mut anchor_index, target, movement);
+    *anchor = anchor_index.map(|index| GridClickSelectionAnchor::new(index, items_generation));
+}
+
+/// Saved grids carry identity-remapped indices until a new generation is installed.
+/// They use the same transition as the live generation-tagged cursor.
+pub(crate) fn apply_grid_cursor_move_indices(
+    selected: &mut Option<usize>,
+    anchor: &mut Option<usize>,
+    target: Option<usize>,
+    movement: GridCursorMove,
+) {
+    *selected = target;
+    *anchor = match movement {
+        GridCursorMove::Move => target,
+        GridCursorMove::Extend { anchor } => target.map(|_| anchor),
+    };
+}
+
+pub(crate) fn grid_selection_anchor(
+    anchor: Option<GridClickSelectionAnchor>,
+    items_generation: u64,
+    selected: Option<usize>,
+    display_order: &[usize],
+    target: usize,
+) -> usize {
+    anchor
+        .and_then(|anchor| anchor.index_for_generation(items_generation))
+        .filter(|idx| display_order.contains(idx))
+        .or_else(|| selected.filter(|idx| display_order.contains(idx)))
+        .unwrap_or(target)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GridClickSource {
     Mouse,
@@ -23690,10 +23740,9 @@ impl App {
         // 「場所を忘れる」操作なので、現在表示中の一覧も同じ所有境界で先頭へ戻す。
         // current_grid_order は詳細表示の並べ替えも含む、画面上の実際の表示順。
         self.scroll_offset_y = 0.0;
-        self.selected = self.current_grid_order().first().copied();
+        self.move_grid_cursor(self.current_grid_order().first().copied());
         self.scroll_to_selected = false;
         self.pending_grid_scroll = None;
-        self.grid_click_selection_anchor = None;
         self.update_last_selected_image();
         self.sync_quick_folder_settings();
 
@@ -25606,7 +25655,7 @@ impl App {
             .as_ref()
             .map(|pending| pending.submitted.clone());
         self.zip_nav_show_current_level(crate::app::StartupListIntent::PreservePresentation);
-        self.selected = selected.filter(|index| *index < self.items.len());
+        self.move_grid_cursor(selected.filter(|index| *index < self.items.len()));
         self.scroll_offset_y = scroll;
         self.checked = checked;
         self.show_search_bar = show_search_bar;
@@ -26244,7 +26293,7 @@ impl App {
         self.archive_source_override = None;
         self.address.clear();
         self.settings.last_folder = Some(drive_list_last_folder_sentinel());
-        self.selected = None;
+        self.move_grid_cursor(None);
         self.scroll_offset_y = 0.0;
         self.scroll_to_selected = false;
         self.pending_grid_scroll = None;
@@ -26332,15 +26381,15 @@ impl App {
 
         self.rebuild_visible_indices();
         if let Some(origin) = origin {
-            self.selected = self.items.iter().position(|item| {
+            self.move_grid_cursor(self.items.iter().position(|item| {
                 matches!(item, GridItem::Folder(path) if crate::folder_tree::path_eq(path, &origin))
-            });
+            }));
             if self.selected.is_some() {
                 self.scroll_to_selected = true;
             }
         }
         if self.selected.is_none() {
-            self.selected = self.visible_indices.first().copied();
+            self.move_grid_cursor(self.visible_indices.first().copied());
         }
 
         self.finish_main_list_open(StartupListIntent::ExplicitList);
@@ -29783,7 +29832,7 @@ impl App {
                     self.visible_indices.push(idx);
                     idx
                 });
-            self.selected = Some(idx);
+            self.move_grid_cursor(Some(idx));
             self.fs_open_intent_from_grid = true;
             self.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
             if let Some(state) = self.play_test.as_mut() {
@@ -31551,7 +31600,7 @@ impl App {
         if self.selected.is_none()
             && let Some(&idx) = self.visible_indices.first()
         {
-            self.selected = Some(idx);
+            self.move_grid_cursor(Some(idx));
             self.scroll_to_selected = true;
         }
         if !video_items.is_empty() {
@@ -31693,7 +31742,7 @@ impl App {
         if self.selected.is_none()
             && let Some(&idx) = self.visible_indices.first()
         {
-            self.selected = Some(idx);
+            self.move_grid_cursor(Some(idx));
             self.scroll_to_selected = true;
         }
         hydration
@@ -34302,7 +34351,7 @@ impl App {
                         if crate::folder_tree::path_eq(zip_path, path)
                 );
             if matches_path {
-                self.selected = Some(idx);
+                self.move_grid_cursor(Some(idx));
                 self.scroll_to_selected = true;
                 self.log_rating_grid_scroll(
                     "opened-item-select",
@@ -35128,15 +35177,13 @@ impl App {
                 })
             })
             .or_else(|| self.visible_indices.first().copied());
+        let saved_scroll_offset = position.map(|position| position.scroll_offset_y);
         if let Some(idx) = selected {
-            self.selected = Some(idx);
+            self.move_grid_cursor(Some(idx));
             self.scroll_to_selected = true;
         }
         self.log_rating_grid_scroll(
-            &format!(
-                "rating-position-restore saved={:?}",
-                position.map(|position| position.scroll_offset_y)
-            ),
+            &format!("rating-position-restore saved={:?}", saved_scroll_offset),
             before_restore,
             self.scroll_offset_y,
             (
@@ -35410,8 +35457,7 @@ impl App {
             pending.cancel.store(true, Ordering::Relaxed);
         }
         self.details_image_dims_state = LazyColumnState::Disabled;
-        self.selected = None;
-        self.grid_click_selection_anchor = None;
+        self.move_grid_cursor(None);
         self.scroll_offset_y = 0.0;
         self.pending_grid_scroll = None;
         // 変換キャッシュの override は「current_folder == そのキャッシュ ZIP」の間だけ
@@ -36325,7 +36371,7 @@ impl App {
         // Ctrl+F フィルタの残留を解除 (旧レベルの entry 向けなので新レベルでは無効)。
         self.search_filter = None;
         self.search_query.clear();
-        self.selected = None;
+        self.move_grid_cursor(None);
         self.scroll_offset_y = 0.0;
         self.scroll_to_selected = false;
         self.pending_grid_scroll = None;
@@ -36486,7 +36532,7 @@ impl App {
             _ => false,
         });
         if let Some(idx) = target {
-            self.selected = Some(idx);
+            self.move_grid_cursor(Some(idx));
             self.scroll_to_selected = true;
         }
         self.capture_main_list_restore_cursor();
@@ -36577,7 +36623,7 @@ impl App {
         // 新しい本の先頭画像をフルスクリーンで開く (Ctrl+↑↓ 慣習: 常に先頭着地)。
         if let Some(new_idx) = self.find_fullscreen_nav_target_filtered(true) {
             self.open_fullscreen(new_idx, crate::app::HistoryTrigger::UserChosen);
-            self.selected = Some(new_idx);
+            self.move_grid_cursor(Some(new_idx));
             self.scroll_to_selected = true;
             self.update_last_selected_image();
         } else {
@@ -37479,7 +37525,7 @@ impl App {
                 self.fs_open_intent_from_grid = true;
             }
             self.open_fullscreen(new_idx, deferred.history_trigger);
-            self.selected = Some(new_idx);
+            self.move_grid_cursor(Some(new_idx));
             self.scroll_to_selected = true;
             self.update_last_selected_image();
             if deferred.resume_slideshow {
@@ -39348,7 +39394,7 @@ impl App {
         if !detached_physical {
             self.update_global_search_address();
         }
-        self.selected = None;
+        self.move_grid_cursor(None);
         self.scroll_offset_y = 0.0;
         self.scroll_to_selected = false;
         self.pending_grid_scroll = None;
@@ -40175,7 +40221,7 @@ impl App {
         if !restored {
             if let Some((scroll, sel)) = history_state {
                 self.scroll_offset_y = scroll;
-                self.selected = sel;
+                self.move_grid_cursor(sel);
                 if sel.is_some() {
                     self.scroll_to_selected = true;
                 }
@@ -40191,7 +40237,7 @@ impl App {
         if !restored && history_state.is_none() {
             let resume = self.resume_page_for_path(&source_path);
             if let Some(page) = resume {
-                self.selected = Some(page);
+                self.move_grid_cursor(Some(page));
                 self.scroll_to_selected = true;
                 self.redirect_selected_to_visible();
             }
@@ -40271,7 +40317,7 @@ impl App {
                     self.fs_open_intent_from_grid = true;
                 }
                 self.open_fullscreen(new_idx, HistoryTrigger::UserChosen);
-                self.selected = Some(new_idx);
+                self.move_grid_cursor(Some(new_idx));
                 self.scroll_to_selected = true;
                 self.update_last_selected_image();
             } else {
@@ -40314,7 +40360,7 @@ impl App {
     fn finish_main_list_after_hydration(&mut self, action: MainListAfterHydration) {
         match action {
             MainListAfterHydration::StackSelection { select } => {
-                self.selected = Some(select);
+                self.move_grid_cursor(Some(select));
                 self.scroll_to_selected = true;
             }
             MainListAfterHydration::DirectMedia(prepared) => {
@@ -43438,6 +43484,9 @@ impl App {
         }
         self.remove_smart_folder_rating_masks(sorted_desc_idxs);
         let previous_items_generation = self.items_generation;
+        let cursor_removed = self
+            .selected
+            .is_some_and(|idx| sorted_desc_idxs.contains(&idx));
         let removed_snapshot_paths: Vec<std::path::PathBuf> = sorted_desc_idxs
             .iter()
             .filter_map(|&i| {
@@ -43857,6 +43906,12 @@ impl App {
             if sel >= n {
                 self.selected = Some(n - 1);
             }
+        }
+
+        // Surviving identities were only reindexed. A removed cursor now points
+        // to a different item, even when its numeric index stayed the same.
+        if cursor_removed {
+            self.move_grid_cursor(self.selected);
         }
 
         self.rebuild_visible_indices();
@@ -48437,14 +48492,16 @@ impl App {
         if let Some(return_grid) = return_grid {
             self.restore_bookmark_view_grid(return_grid, &installed_keys);
         } else {
-            self.selected = previous_key
-                .and_then(|key| {
-                    self.bookmark_browser_rows
-                        .iter()
-                        .position(|row| row.stable_key() == key)
-                })
-                .filter(|idx| self.visible_indices.contains(idx))
-                .or_else(|| self.visible_indices.first().copied());
+            self.move_grid_cursor(
+                previous_key
+                    .and_then(|key| {
+                        self.bookmark_browser_rows
+                            .iter()
+                            .position(|row| row.stable_key() == key)
+                    })
+                    .filter(|idx| self.visible_indices.contains(idx))
+                    .or_else(|| self.visible_indices.first().copied()),
+            );
             self.scroll_to_selected = self.selected.is_some();
         }
         true
@@ -48461,13 +48518,15 @@ impl App {
         } else {
             return_grid.selected_key
         };
-        self.selected = restore_key
-            .and_then(|key| {
-                self.bookmark_browser_rows
-                    .iter()
-                    .position(|row| row.stable_key() == key)
-            })
-            .filter(|idx| self.visible_indices.contains(idx));
+        self.move_grid_cursor(
+            restore_key
+                .and_then(|key| {
+                    self.bookmark_browser_rows
+                        .iter()
+                        .position(|row| row.stable_key() == key)
+                })
+                .filter(|idx| self.visible_indices.contains(idx)),
+        );
         self.scroll_offset_y = return_grid.scroll_offset_y;
         self.pending_grid_scroll = None;
         // 同一一覧なら位置を一切動かさない。一覧が増減・並べ替えされた場合だけ、
@@ -53474,6 +53533,19 @@ impl App {
             let new_sel = new_vis_pos.and_then(|vp| vi.get(vp).copied());
 
             if let Some(s) = new_sel {
+                let movement = if shift {
+                    GridCursorMove::Extend {
+                        anchor: grid_selection_anchor(
+                            self.grid_click_selection_anchor,
+                            self.items_generation,
+                            self.selected,
+                            vi,
+                            sel,
+                        ),
+                    }
+                } else {
+                    GridCursorMove::Move
+                };
                 // Shift+カーソル: 移動元から移動先までの画像をチェックに追加
                 if shift && new_vis_pos.is_some() {
                     let old_pos = vis_pos;
@@ -53492,7 +53564,13 @@ impl App {
                     }
                 }
 
-                self.selected = Some(s);
+                apply_grid_cursor_move(
+                    &mut self.selected,
+                    &mut self.grid_click_selection_anchor,
+                    self.items_generation,
+                    Some(s),
+                    movement,
+                );
                 self.scroll_to_selected = true;
                 self.update_last_selected_image();
                 // perf: グリッドのカーソル移動イベントを記録
@@ -55388,7 +55466,7 @@ impl App {
                 self.detached_viewer_open_next_still_detached_once = true;
                 self.fs_open_intent_from_grid = true;
                 self.open_fullscreen(image_idx, crate::app::HistoryTrigger::UserChosen);
-                self.selected = Some(image_idx);
+                self.move_grid_cursor(Some(image_idx));
                 self.scroll_to_selected = true;
                 self.update_last_selected_image();
                 DetachedPhysicalFolderOpenPoll::Applied
@@ -55727,7 +55805,7 @@ impl App {
             let _ = restore_video_tile;
 
             self.open_fullscreen(new_idx, history_trigger);
-            self.selected = Some(new_idx);
+            self.move_grid_cursor(Some(new_idx));
             self.scroll_to_selected = true;
             self.update_last_selected_image();
 
@@ -57810,7 +57888,11 @@ impl App {
             self.last_viewer_sync_stamp = self.viewer_sync_stamp_for_idx(idx);
             return;
         }
-        self.selected = Some(idx);
+        // Linked grid -> viewer sync can return the same cursor after Shift
+        // extension. Only a viewer-originated cursor change establishes an anchor.
+        if self.selected != Some(idx) {
+            self.move_grid_cursor(Some(idx));
+        }
         self.scroll_to_selected = true;
         self.update_last_selected_image();
         #[cfg(windows)]
@@ -61136,7 +61218,7 @@ impl App {
                 }) else {
                     return BuildOutcome::Abort("collection_root_anchor_missing");
                 };
-                app.selected = Some(idx);
+                app.move_grid_cursor(Some(idx));
                 app.address = format!("コレクション: {}", plan.prepared.collection_name);
                 if let Some(session) = app.top_level_grid_view.collection_session_mut() {
                     session.accepted_revision = plan.prepared.collection_revision;
@@ -62480,7 +62562,7 @@ impl App {
                 _ => false,
             })
         {
-            self.selected = Some(idx);
+            self.move_grid_cursor(Some(idx));
             self.scroll_to_selected = true;
         }
     }
@@ -64955,7 +65037,7 @@ impl App {
                 crate::app::HistoryTrigger::UserChosen,
             );
         }
-        self.selected = Some(selected);
+        // The grid already owns this cursor; linked viewer sync is not a move.
         self.scroll_to_selected = true;
         self.update_last_selected_image();
         self.last_viewer_sync_stamp = Some(stamp);
@@ -69782,11 +69864,23 @@ impl App {
         v
     }
 
+    /// Establish a new range anchor with every non-extending cursor move.
+    /// Callers keep their existing scroll, checked-selection and viewer policies.
+    pub(crate) fn move_grid_cursor(&mut self, target: Option<usize>) {
+        apply_grid_cursor_move(
+            &mut self.selected,
+            &mut self.grid_click_selection_anchor,
+            self.items_generation,
+            target,
+            GridCursorMove::Move,
+        );
+    }
+
     /// 親復帰で解決済みの item を選択し、通常の ensure-visible 経路へ渡す。
     /// 名前ヒントと smart-folder の exact root-entry 解決が同じ適用規則を共有する。
     fn select_item_after_load(&mut self, idx: usize) {
         debug_assert!(idx < self.items.len());
-        self.selected = Some(idx);
+        self.move_grid_cursor(Some(idx));
         self.scroll_to_selected = true;
         self.redirect_selected_to_visible();
     }
@@ -69851,10 +69945,6 @@ impl App {
         ));
         self.checked.clear();
         self.checked.extend(plan.checked.iter().copied());
-        self.grid_click_selection_anchor = Some(GridClickSelectionAnchor::new(
-            plan.cursor,
-            self.items_generation,
-        ));
         self.select_item_after_load(plan.cursor);
         request.record_applied(&visible, &indices, now);
         self.post_operation_selection = Some(request);
@@ -69942,7 +70032,7 @@ impl App {
         let pos = vi.partition_point(|&i| i < sel);
         let prev = pos.checked_sub(1).map(|p| vi[p]);
         let next = vi.get(pos).copied();
-        self.selected = prev.or(next);
+        self.move_grid_cursor(prev.or(next));
         if self.selected.is_some() {
             self.scroll_to_selected = true;
         }
@@ -69957,7 +70047,7 @@ impl App {
         }
         let first_selectable = self.visible_indices.first().copied();
         if let Some(idx) = first_selectable {
-            self.selected = Some(idx);
+            self.move_grid_cursor(Some(idx));
             self.scroll_to_selected = true;
         }
     }
@@ -70156,7 +70246,7 @@ impl App {
                 });
                 self.search_filter_origin_folder = self.effective_folder();
                 self.rebuild_visible_indices();
-                self.selected = None;
+                self.move_grid_cursor(None);
                 self.scroll_offset_y = 0.0;
                 self.pending_grid_scroll = None;
                 self.search_pending = None;
@@ -75519,7 +75609,7 @@ impl App {
         if self.items.get(idx).is_none() {
             return;
         }
-        self.selected = Some(idx);
+        self.move_grid_cursor(Some(idx));
         self.scroll_to_selected = true;
         self.update_last_selected_image();
         self.redirect_selected_to_visible();
@@ -96247,6 +96337,8 @@ fn finite_video_target_secs(target_secs: f64, duration_secs: f64) -> f64 {
 
 // テスト専用。`ui_fullscreen` など兄弟モジュールのテストからも
 // `phase_c_support::setup_app` を使う (production 配線を通した回帰は App が要る)。
+#[cfg(test)]
+mod grid_cursor_tests;
 #[cfg(all(test, windows))]
 pub(crate) mod multiwindow_scenario_tests;
 #[cfg(test)]

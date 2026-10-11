@@ -1727,7 +1727,7 @@ impl crate::app::App {
                         _ => false,
                     })
                 {
-                    self.selected = Some(idx);
+                    self.move_grid_cursor(Some(idx));
                     self.scroll_to_selected = true;
                 }
             } else if let Some(root) = self.subfolder_expansion_root.clone() {
@@ -1974,7 +1974,7 @@ impl crate::app::App {
         self.clear_tags_cache();
         self.search_filter = None;
         self.search_query.clear();
-        self.selected = select;
+        self.move_grid_cursor(select);
         self.scroll_offset_y = 0.0;
         self.scroll_to_selected = select.is_some();
         self.scroll_hint

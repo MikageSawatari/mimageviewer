@@ -18,14 +18,54 @@ PowerShell 側で測る。ただし空の窓を、perf log を書かない別 in
 記録して warning を出し、空の窓の sleep 証明を認めない。実行パスが取得できた場合は常に
 `%APPDATA%\mimageviewer\runtime\` 配下のランチャー展開コピーではないことも確認する。
 analyzer の `session.start.pid` 照合はその後のログ整合性確認であり、単独ではプロセス同一性の証拠に
-しない。2026-10-09の§1.356以降は、測定開始前と終了後の保存完了checkpointも必須とする。
+しない。2026-10-09の§1.356以降はログの保存完了証明も必須とする。手動samplerは測定開始前と
+終了後のcheckpointを照合する。ReleaseChecks suiteは停止済みのshutdown checkpointを照合してから
+perf解析する（測定中にflushやrepaintを要求しない）。
 session累計の通常／perf／診断ログ欠落が一件でもある場合、完全性を確認できない場合、旧buildの場合は
-参考値を残して `CannotJudge`（判定不能、exit 2）にする。CPUが低い、保存済みframeが少ない、
+参考値を残して手動scriptは `CannotJudge`、suiteは `SKIPPED`（いずれも判定不能／環境不成立、exit 2）にする。
+CPUが低い、保存済みframeが少ない、
 command lineに`--perf-log`があるという事実だけではPASSにしない。
 
 ## 2. 実行方法
 
-先に release verification binary を作る。
+### 正規手順: ReleaseChecks suite（2026-10-11採用、毎リリース）
+
+利用者がrepository rootのPowerShellで実行する:
+
+```powershell
+.\scripts\ui-smoke.ps1 -Scenario ReleaseChecks -InteractiveApproved
+```
+
+診断portableのbuildと生成fixture／隔離dataのseedを行い、static-foreground、static-background、
+video-pin-background、tray-close-while-loading、tray-close-after-loadingの5 idleケースと、
+cached／uncached perfを逐次実行する。通常終了後に証跡を保存して解析し、途中のEnterや手動setupは不要。
+**CLAUDE Phase 2 9.6／9.7は同じ1回のrunで確認する**。FFmpeg CLIがPATHに必要。
+seed込み約5〜8分、初回buildは別（採用確認日のbuildは約7.5分）。
+
+開始前に他アプリの窓を最小化し、build待ちを含め終了までPCに触れない。suiteがexact rootを
+前面にし、背面ケースではrunner所有の専用窓へ移行する。利用者がコンソール等へ切り替えない。
+foreground条件が失われれば停止して証跡を残す。環境を整えた別runで再実行し、自動retryで隠さない。
+同一ソースの診断artifactが検証できる場合だけ `-SkipBuild` を追加できる。
+先に `prepare-portable-smoke.ps1 -TestScript` でbuildしておくこともできる（この準備は起動しない）。
+
+結果は `target/ui-smoke/runs/<run-id>/` のcase別log／sampler／case JSON、`summary.json`、
+貼り付け用 `release-record.md` に保存する。0=PASS／PASS_WITH_WARNINGS、1=FAIL、2=SKIPPED／環境不成立。
+警告・環境注記を記録し、証拠不足をPASSにしない。閾値は引き続き `idle_health_thresholds.json` を正本とする。
+suiteはexact PID／exe／data path、測定区間全体の窓状態、UTC／session anchor／worker sleep包含、
+cached／source来歴とtray要求寿命も照合する。性能値だけが低くてもこれらが欠ければ成立しない。
+
+採用はエージェントの実行了承ではない。[実行確認](interactive-release-verification.md)に従い、
+具体的なsuite／所要時間／desktop入力／使い捨てdata／AI有無への明示了承後だけ起動する。
+`target/portable-smoke/mimageviewer.exe` と `target/portable-smoke/data` を使い、通常profileを起動せず、
+利用者設定をコピー・初期化しない。full gateやbuildからの自動起動も行わない。
+採用証跡・perf分類・手動で残す範囲は [自動化計画](release-check-automation-plan.md) を参照。
+
+### 手動fallback／原因診断
+
+以下は従来の `check-idle-health.ps1` による手動手順。利用者が通常releaseを起動するため、
+実設定を開くことに注意する。エージェントはこの通常profileを起動しない。
+隔離dataによる正規suiteの代わりに通常設定を消したり、suiteの証拠不足を手動の低CPU値だけで補わない。
+先にrelease verification binaryを作る。
 
 ```powershell
 .\scripts\build-release.ps1
@@ -112,14 +152,16 @@ UIがそのI/Oを待ったとは判断しない。
 
 ## 3. リリース前シナリオ
 
-毎リリース、最低限次を実行する。
+毎リリース、正規suiteで次を実行する。以下のEnter／TargetKey／手動[×]はfallbackで同じ条件を
+準備する場合の手順であり、suiteでは生成fixtureと台本が設定・操作する。
 
 1. 通常画像フォルダのロード完了後、前面で静止 (`static-foreground`)
 2. 同じ状態を背面へ移して静止 (`static-background`)
 3. 動画を代表画像に固定したフォルダを keep 範囲内へ置き、背面で静止
    (`video-pin-background`)
 4. cache の無い Folder 代表を多数含む一覧を、**読込中に格納**と**読込完了後に格納**の
-   両方で測る (`tray-residency` を 2 回実行)。前者は未完了要求が残る間、後者は通常ロードと
+   両方で測る（suiteは `tray-close-while-loading`／`tray-close-after-loading`、手動は
+   `tray-residency` を2回）。前者は未完了要求が残る間、後者は通常ロードと
    idle upgrade が完了してから `[×]` で close-to-tray し、格納したまま静止する。
 
 通常画像の前面・背面測定には、884×444のような横長画像と、要求長辺374px付近の条件を
@@ -173,7 +215,9 @@ paused media / still は完全 sleep、active media はこの静止シナリオ�
 最後のフォルダ load より後なら有効なので、連続シナリオのために対象場所を開き直す必要はない。
 根拠は perf report の `evidence_floor_t` / `evidence_floor_basis` に残る。
 対象タイルの work はあっても `idle_upgrade_enqueue` / `idle_upgrade_ineligible` が無い場合は、
-アイドル高画質化パスがそのタイルを評価していないことを warning で知らせる。
+手動analyzerはアイドル高画質化パスの評価未確認をwarningで知らせる。
+**ineligibleだけを必須にしない**。正規suiteは最新folder-load以降の対象workに加えてcached読取と、
+`idle_upgrade_enqueue` **または** `idle_upgrade_ineligible` の評価証跡を要求し、不足はSKIPPED／環境不成立。
 
 **ピン作成直後はこのシナリオは成立しない。** 作りたてのサムネイルは `from_cache=false` の
 ためアイドル高画質化の候補にならない。このシナリオが意味を持つのは、アプリ再起動後など、

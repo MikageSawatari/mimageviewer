@@ -551,15 +551,17 @@ function Invoke-UiSmokeCapturedProcess {
         [string] $StandardOutputPath,
         [string] $StandardErrorPath
     )
-    return Start-Process `
+    $capturedProcess = Start-Process `
         -FilePath $FilePath `
         -ArgumentList (Join-NativeArguments $ArgumentValues) `
         -WorkingDirectory $WorkingDirectory `
         -RedirectStandardOutput $StandardOutputPath `
         -RedirectStandardError $StandardErrorPath `
         -WindowStyle Hidden `
-        -Wait `
         -PassThru
+    $null = $capturedProcess.Handle # retain the handle before waiting for exit
+    $capturedProcess.WaitForExit()
+    return $capturedProcess
 }
 
 function Save-UiSmokeEvidence {
@@ -1787,6 +1789,7 @@ $arguments = @(
     else {
         $script:process = Start-Process -FilePath $exe -ArgumentList (Join-NativeArguments $arguments) -PassThru
     }
+    $null = $script:process.Handle # retain for both normal and button-helper launches
     $script:startedPid = $script:process.Id
     if ($Scenario -in @('NativeTopPanoramaClick', 'ClipboardCapture')) {
         $remainingAcceptMilliseconds = [long]$timeoutMilliseconds - $scenarioClock.ElapsedMilliseconds
@@ -1923,6 +1926,7 @@ $arguments = @(
             )
             Write-UiSmokeEvent 'always-on-top: restarting with the same disposable profile and an empty override'
             $script:process = Start-Process -FilePath $exe -ArgumentList (Join-NativeArguments $restartArguments) -PassThru
+            $null = $script:process.Handle # retain before the restart can exit
             $script:startedPid = $script:process.Id
             $script:restartAppPid = $script:startedPid
             Write-UiSmokeEvent "restart PID: $($script:startedPid)"
@@ -1939,7 +1943,11 @@ $arguments = @(
             }
             else {
                 $script:process.WaitForExit()
-                $script:appExitCode = [int]$script:process.ExitCode
+                $restartExitCode = $script:process.ExitCode
+                if ($null -eq $restartExitCode -or -not ($restartExitCode -is [int])) {
+                    throw '[ui-smoke] restart exited without an integer exit code'
+                }
+                $script:appExitCode = $restartExitCode
                 $script:restartAppExitCode = $script:appExitCode
                 $script:runExitCode = $script:appExitCode
                 $script:runPhase = if ($script:appExitCode -eq 0) { 'completed' } else { 'application-failed' }

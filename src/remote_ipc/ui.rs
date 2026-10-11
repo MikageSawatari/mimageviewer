@@ -4286,7 +4286,7 @@ impl crate::app::App {
                 .iter()
                 .position(|item| item.perf_key() == pending.item_key)
             {
-                self.selected = Some(index);
+                self.move_grid_cursor(Some(index));
                 if matches!(
                     self.items.get(index),
                     Some(crate::grid_item::GridItem::Video(_))

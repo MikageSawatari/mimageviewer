@@ -3145,7 +3145,7 @@ impl App {
                 .filter(|&index| self.idx_visible(index))
                 .or_else(|| self.visible_indices.first().copied());
             if let Some(index) = index {
-                self.selected = Some(index);
+                self.move_grid_cursor(Some(index));
                 self.scroll_to_selected = true;
             }
         }
@@ -3433,7 +3433,7 @@ impl App {
                 .filter(|&idx| self.idx_visible(idx))
                 .or_else(|| self.visible_indices.first().copied());
             if let Some(idx) = resolved {
-                self.selected = Some(idx);
+                self.move_grid_cursor(Some(idx));
                 self.scroll_to_selected = true;
             }
         }
@@ -3616,7 +3616,7 @@ impl App {
                     idx,
                     crate::app::HistoryTrigger::UserChosen,
                 );
-                self.selected = Some(idx);
+                self.move_grid_cursor(Some(idx));
                 self.scroll_to_selected = true;
                 self.update_last_selected_image();
                 return true;
@@ -4157,7 +4157,7 @@ impl App {
         // 落としてしまい、新クエリで 1000+ hit 時の自動切替が発火しない。
         // 旧クエリ結果から作った items は直後の rebuild で全て無効化されるので、
         // selected / scroll もここで「ユーザー未操作」状態へ戻す。
-        self.selected = None;
+        self.move_grid_cursor(None);
         self.scroll_offset_y = 0.0;
         // query == last_executed でも debounce → spawn を必ず再走させる。
         // そうしないと、Enter 2 連打で旧検索が cancel されたあと

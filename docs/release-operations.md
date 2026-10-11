@@ -151,9 +151,26 @@ perf/idle検証および実アプリsmokeの実行前に適用する。必須検
   落ちたら、個別に潰す前に **`cargo test --no-fail-fast -- --test-threads=1` で確定検証**する。
 - stale テストは「設計が変わった (期待が古い)」のか「実バグ」かを切り分けてから直す。
 - 単体テストと hitch 検査だけでは、短い work を高速で再投入する「速い無限ループ」を
-  検出できない。毎リリース `scripts/check-idle-health.ps1` で前面 / 背面 / 動画ピンの静止
-  シナリオを測り、`target/idle-health/` の統合 report が全て PASS であることを確認する。
-  手順と閾値は [idle-health-check.md](idle-health-check.md) を正とする。
+  検出できない。**毎リリースの正規手順はReleaseChecks suite**（2026-10-11利用者採用）。
+  利用者がrepository rootのPowerShellで次を実行する:
+
+  ```powershell
+  .\scripts\ui-smoke.ps1 -Scenario ReleaseChecks -InteractiveApproved
+  ```
+
+  build／隔離seed、5 idle（前面・背面・動画ピン・tray読込中／完了後）、cached／uncached perfを
+  一つのrunで確認する。同一ソースの診断artifactが検証できる場合だけ `-SkipBuild` を追加する。
+  FFmpeg CLIがPATHに必要。seed込み約5〜8分＋初回build（採用確認日のbuildは約7.5分）。
+  **他アプリ窓を最小化し、build待ちを含め終了までPCに触れない**。foreground不成立は保存し、
+  環境を整えた別runで再実行する。採用はエージェントへの起動了承ではなく、上記の明示了承と
+  通常profile起動禁止・使い捨てportable／設定保護を維持する。full gate／buildへ自動連結しない。
+  `target/ui-smoke/runs/<run-id>/summary.json`／`release-record.md` の全case・終了codeを確認する。
+  0=PASS／PASS_WITH_WARNINGS、1=FAIL、2=SKIPPED／環境不成立。既知startup gap（frame 1→2、
+  測定操作前のoverlay、上限500ms）は時間付きで別記し、他の停止や証拠不足を免除しない。
+  手動 `perf_smoke.ps1`／`perf_smoke.sh`／`check-idle-health.ps1` はfallback／診断に残す。
+  UI／I/O変更版の実データ、変更したnative入力／IME／DPI、実[×]／tray復帰、配布版の厳密性能は
+  別に必要な確認を残す。手順・閾値は [idle-health-check.md](idle-health-check.md)、
+  分類・採用証跡は [自動化計画](release-check-automation-plan.md) を参照する。
 
 ### 3.1 全 PE と app-local VC runtime gate
 

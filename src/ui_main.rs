@@ -11,8 +11,9 @@ use std::sync::atomic::Ordering;
 use eframe::egui;
 
 use crate::app::{
-    App, FacetField, GridClickPairingState, GridClickSelectionAnchor, GridScrollIntent,
-    LazyColumnState, QuickFolderSlotId, QuickFolderSwitchTarget,
+    App, FacetField, GridClickPairingState, GridClickSelectionAnchor, GridCursorMove,
+    GridScrollIntent, LazyColumnState, QuickFolderSlotId, QuickFolderSwitchTarget,
+    apply_grid_cursor_move, grid_selection_anchor,
 };
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::keymap::{KeyAction, Keymap, MenuCommandId, TopMenuId, resolve_menu_layout};
@@ -5667,20 +5668,6 @@ fn grid_selection_item_is_checkable(items: &[GridItem], allow_folders: bool, idx
     })
 }
 
-fn grid_selection_anchor(
-    anchor: Option<GridClickSelectionAnchor>,
-    items_generation: u64,
-    selected: Option<usize>,
-    display_order: &[usize],
-    clicked_idx: usize,
-) -> usize {
-    anchor
-        .and_then(|anchor| anchor.index_for_generation(items_generation))
-        .filter(|idx| display_order.contains(idx))
-        .or_else(|| selected.filter(|idx| display_order.contains(idx)))
-        .unwrap_or(clicked_idx)
-}
-
 fn add_grid_selection_range(
     checked: &mut HashSet<usize>,
     display_order: &[usize],
@@ -5765,9 +5752,9 @@ fn grid_item_archive_key(item: &GridItem) -> Option<String> {
 /// サムネイル / 詳細表示に共通のクリック選択状態遷移。
 ///
 /// 単一選択は `selected`、複数選択は `checked` で表す既存モデルを維持する。
-/// `anchor` は Shift+クリックの起点で、通常 / Ctrl クリック時だけ更新する。
+/// Cursor/anchor updates go through the shared Move/Extend transition.
 #[allow(clippy::too_many_arguments)]
-fn apply_grid_click_selection(
+pub(crate) fn apply_grid_click_selection(
     mode: GridClickSelectionMode,
     selected: &mut Option<usize>,
     anchor: &mut Option<GridClickSelectionAnchor>,
@@ -5783,9 +5770,6 @@ fn apply_grid_click_selection(
     let mode = mode.normalized();
     let plain_click_clears_checks = grid_plain_click_clears_checks(mode);
     if shift {
-        let previous_anchor_is_valid = anchor
-            .and_then(|anchor| anchor.index_for_generation(items_generation))
-            .is_some_and(|idx| display_order.contains(&idx));
         let range_anchor = grid_selection_anchor(
             *anchor,
             items_generation,
@@ -5804,13 +5788,15 @@ fn apply_grid_click_selection(
             items,
             allow_folders,
         );
-        *selected = Some(clicked_idx);
-        if !previous_anchor_is_valid {
-            *anchor = Some(GridClickSelectionAnchor::new(
-                range_anchor,
-                items_generation,
-            ));
-        }
+        apply_grid_cursor_move(
+            selected,
+            anchor,
+            items_generation,
+            Some(clicked_idx),
+            GridCursorMove::Extend {
+                anchor: range_anchor,
+            },
+        );
         return;
     }
 
@@ -5818,8 +5804,13 @@ fn apply_grid_click_selection(
         if plain_click_clears_checks {
             checked.clear();
         }
-        *selected = Some(clicked_idx);
-        *anchor = Some(GridClickSelectionAnchor::new(clicked_idx, items_generation));
+        apply_grid_cursor_move(
+            selected,
+            anchor,
+            items_generation,
+            Some(clicked_idx),
+            GridCursorMove::Move,
+        );
         return;
     }
 
@@ -5837,8 +5828,13 @@ fn apply_grid_click_selection(
         {
             checked.insert(clicked_idx);
         }
-        *selected = Some(clicked_idx);
-        *anchor = Some(GridClickSelectionAnchor::new(clicked_idx, items_generation));
+        apply_grid_cursor_move(
+            selected,
+            anchor,
+            items_generation,
+            Some(clicked_idx),
+            GridCursorMove::Move,
+        );
         return;
     }
 
@@ -5846,12 +5842,22 @@ fn apply_grid_click_selection(
     // 混在できないため、そのセルだけの単一選択として扱う。
     if !grid_selection_item_is_checkable(items, allow_folders, clicked_idx) {
         if checked.is_empty() && *selected == Some(clicked_idx) {
-            *selected = None;
-            *anchor = None;
+            apply_grid_cursor_move(
+                selected,
+                anchor,
+                items_generation,
+                None,
+                GridCursorMove::Move,
+            );
         } else {
             checked.clear();
-            *selected = Some(clicked_idx);
-            *anchor = Some(GridClickSelectionAnchor::new(clicked_idx, items_generation));
+            apply_grid_cursor_move(
+                selected,
+                anchor,
+                items_generation,
+                Some(clicked_idx),
+                GridCursorMove::Move,
+            );
         }
         return;
     }
@@ -5859,8 +5865,13 @@ fn apply_grid_click_selection(
     if checked.is_empty() {
         match *selected {
             Some(previous) if previous == clicked_idx => {
-                *selected = None;
-                *anchor = None;
+                apply_grid_cursor_move(
+                    selected,
+                    anchor,
+                    items_generation,
+                    None,
+                    GridCursorMove::Move,
+                );
                 return;
             }
             Some(previous)
@@ -5871,8 +5882,13 @@ fn apply_grid_click_selection(
                 checked.insert(clicked_idx);
             }
             _ => {
-                *selected = Some(clicked_idx);
-                *anchor = Some(GridClickSelectionAnchor::new(clicked_idx, items_generation));
+                apply_grid_cursor_move(
+                    selected,
+                    anchor,
+                    items_generation,
+                    Some(clicked_idx),
+                    GridCursorMove::Move,
+                );
                 return;
             }
         }
@@ -5880,26 +5896,31 @@ fn apply_grid_click_selection(
         checked.insert(clicked_idx);
     }
 
-    *anchor = Some(GridClickSelectionAnchor::new(clicked_idx, items_generation));
-    match checked.len() {
-        0 => {
-            *selected = None;
-        }
+    let target = match checked.len() {
+        0 => None,
         1 => {
-            *selected = checked.iter().copied().next();
+            let target = checked.iter().copied().next();
             checked.clear();
+            target
         }
         _ => {
-            *selected = if checked.contains(&clicked_idx) {
+            if checked.contains(&clicked_idx) {
                 Some(clicked_idx)
             } else {
                 display_order
                     .iter()
                     .copied()
                     .find(|idx| checked.contains(idx))
-            };
+            }
         }
-    }
+    };
+    apply_grid_cursor_move(
+        selected,
+        anchor,
+        items_generation,
+        target,
+        GridCursorMove::Move,
+    );
 }
 
 fn apply_grid_secondary_selection(
@@ -5913,8 +5934,13 @@ fn apply_grid_secondary_selection(
     if mode.normalized() == GridClickSelectionMode::Explorer && !checked.contains(&clicked_idx) {
         checked.clear();
     }
-    *selected = Some(clicked_idx);
-    *anchor = Some(GridClickSelectionAnchor::new(clicked_idx, items_generation));
+    apply_grid_cursor_move(
+        selected,
+        anchor,
+        items_generation,
+        Some(clicked_idx),
+        GridCursorMove::Move,
+    );
 }
 
 fn clear_grid_selection_for_background_click(
@@ -5927,8 +5953,7 @@ fn clear_grid_selection_for_background_click(
         return false;
     }
     let changed = selected.is_some() || anchor.is_some() || !checked.is_empty();
-    *selected = None;
-    *anchor = None;
+    apply_grid_cursor_move(selected, anchor, 0, None, GridCursorMove::Move);
     checked.clear();
     changed
 }
@@ -5938,6 +5963,8 @@ fn clear_grid_selection_for_background_click(
 /// the selection policy explicit and leaves checked multi-selection untouched.
 fn apply_grid_right_drag_start_selection(
     selected: &mut Option<usize>,
+    anchor: &mut Option<GridClickSelectionAnchor>,
+    items_generation: u64,
     enabled: bool,
     mode: &crate::ring_shortcut::RightDragMode,
     target_idx: Option<usize>,
@@ -5954,7 +5981,13 @@ fn apply_grid_right_drag_start_selection(
     let Some(idx) = target_idx else {
         return false;
     };
-    *selected = Some(idx);
+    apply_grid_cursor_move(
+        selected,
+        anchor,
+        items_generation,
+        Some(idx),
+        GridCursorMove::Move,
+    );
     true
 }
 
@@ -5969,6 +6002,8 @@ mod grid_right_drag_start_selection_tests {
             let mut selected = Some(1);
             assert!(apply_grid_right_drag_start_selection(
                 &mut selected,
+                &mut None,
+                7,
                 true,
                 &mode,
                 Some(4)
@@ -5978,6 +6013,8 @@ mod grid_right_drag_start_selection_tests {
             selected = Some(1);
             assert!(!apply_grid_right_drag_start_selection(
                 &mut selected,
+                &mut None,
+                7,
                 false,
                 &mode,
                 Some(4)
@@ -5991,6 +6028,8 @@ mod grid_right_drag_start_selection_tests {
         let mut selected = Some(2);
         assert!(!apply_grid_right_drag_start_selection(
             &mut selected,
+            &mut None,
+            7,
             true,
             &RightDragMode::Disabled,
             Some(5)
@@ -5999,6 +6038,8 @@ mod grid_right_drag_start_selection_tests {
 
         assert!(!apply_grid_right_drag_start_selection(
             &mut selected,
+            &mut None,
+            7,
             true,
             &RightDragMode::MouseGesture,
             None
@@ -16144,14 +16185,14 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 .right_drag_mode(crate::ring_shortcut::RightDragContext::Grid);
             if apply_grid_right_drag_start_selection(
                 &mut self.selected,
+                &mut self.grid_click_selection_anchor,
+                self.items_generation,
                 self.settings
                     .ring_shortcuts
                     .select_grid_item_on_right_drag_start,
                 &mode,
                 Some(idx),
             ) {
-                self.grid_click_selection_anchor =
-                    Some(GridClickSelectionAnchor::new(idx, self.items_generation));
                 self.update_last_selected_image();
             }
             match mode {
