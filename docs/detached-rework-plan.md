@@ -1457,7 +1457,7 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ### 2026-10-11 §1.341 A0: context単位の紙めくりpresentationと共有会計（確認待ち）
 
-2026-10-11 HUD追補（`bf3b2fae0`）: 既存PC静止画HUDに全体設定のON/OFF行を追加し、Preferencesのadoption処理へ合流する。既存`deactivate_all_page_turn_presentations`を設定変更時に再利用するだけで、detached述語・viewport routing・bundle/workerの所有契約は変更しない。F12からの変更が全体設定と各presentationに反映し、兄弟のitems/idx/input sequenceを変えないことを既存context test内で検査する。利用者の追加決定で既存overflowの`Settings::save()`へ保存を接続し、DB再読込を同testへ追加する。projection追補は描画先transformのeffective pppをpure geometryへ渡し、独立に丸められたpaint矩形の比較を物理1px以内へ定義する。viewport origin/clipの正本、destination binding、resource/context所有者は変更しない。構造的なgeometryの比較単位修正として記録し、独立構造合意・実機確認を主張しない。詳細と範囲はpage-turn plan §14。
+2026-10-11 HUD追補（`bf3b2fae0`）: 既存PC静止画HUDに全体設定のON/OFF行を追加し、Preferencesのadoption処理へ合流する。既存`deactivate_all_page_turn_presentations`を設定変更時に再利用するだけで、detached述語・viewport routing・bundle/workerの所有契約は変更しない。F12からの変更が全体設定と各presentationに反映し、兄弟のitems/idx/input sequenceを変えないことを既存context test内で検査する。設計担当ClaudeCodeの判断で既存overflowの`Settings::save()`へ保存を接続し、DB再読込を同testへ追加する（判断者の訂正は`e3a328ff6`。HUDへON/OFFを追加する利用者要求とは別の保存経路判断）。projection追補は描画先transformのeffective pppをpure geometryへ渡し、独立に丸められたpaint矩形の比較を物理1px以内へ定義する。viewport origin/clipの正本、destination binding、resource/context所有者は変更しない。構造的なgeometryの比較単位修正として記録し、独立構造合意・実機確認を主張しない。詳細と範囲はpage-turn plan §14。
 
 R3は利用者からACCEPTと伝達され`0f6ad9f19`へ統合済み。今回のA0未コミット差分は、
 `src/ui_fullscreen/page_turn.rs`のtyped `PageTurnPresentation`を既存`ViewerContextBundle`へ接続する。
