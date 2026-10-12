@@ -6,7 +6,10 @@
 
 `001a0dabf` の独立設計レビューは **REVISE**。本改訂は coordinator 判断を優先して
 P1-1 の過剰な同定を撤去し、P1-2 の既存 book operation owner への統合、P2 の失効入口を
-確定した再レビュー用。削除方式の最終承認は利用者が行う。未承認・未実装。
+確定した再レビュー用。ごみ箱方式は利用者決定済み (2026-10-12)。設計は再レビュー待ち・未実装。
+
+R2 (`1c313a2ec`) の **REVISE** を反映。新規Busy条件を `UndoAppend` に限定し、
+ごみ箱への実移動は `PostDeleteItem` の結果で判定する。既存本操作の受付規則は変えない。
 
 ## 1. 正本の前提と実装の差異
 
@@ -54,14 +57,21 @@ Ctrl+B／メニュー／viewer 追加は同じ成功 receipt を使う。別本 
 - 全 skip (将来統合される場合)、失敗、partial write の Err は token を作らない。
   ログと通知、本を開いて残ったページを整理する既存導線で扱う。再試行や部分 Undo は作らない。
 
-### 削除方式 (レビューで確定する判断)
+### 削除方式 (利用者決定済み)
 
-既定案は **今回追加したコピーだけをごみ箱へ移す**。完全削除案は撤回する。
+利用者決定は **今回追加したコピーだけをごみ箱へ移す**。完全削除案は撤回済み。
 元ファイル・既存ページ・本フォルダは削除しない。既存 delete worker の Shell recycle helper を
 再利用し、ごみ箱に送れない保存先では完全削除に自動 fallback せず、取り消せないと通知する。
 現行一般 Delete の nuke warning／完全削除許容の flags をそのまま Undo へ流用しない。
 ごみ箱必須の設定で拒否できる共通 Shell helper に限定して再利用する。
 **利用者決定 (2026-10-12): ごみ箱へ移す形で確定**。
+
+成功はpath消失／`PerformOperations`の全体HRESULTだけでは判定しない。
+各exact sourceに結び付いた `IFileOperationProgressSink::PostDeleteItem` の `hrDelete` が
+実操作の成功を表し、`psiNewlyCreated` がごみ箱内itemを返したものだけをrecycle成功に数える。
+callback欠落／失敗／NULL item (完全削除) はごみ箱成功と報告しない。
+成功分のpurgeもこの結果に合わせる。一般Deleteの成功規則は今回変更しない。
+根拠: [Microsoft PostDeleteItem仕様](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-ifileoperationprogresssink-postdeleteitem)。
 
 ### receipt 同定の費用とまれな競合 (P1-1への回答)
 
@@ -127,6 +137,10 @@ partial resume は追加しない。削除途中のまれな失敗時も成功 p
 ### 3.1 既存の本操作／source mutation の受付境界 (P1-2)
 
 `UndoAppend` は `BookOpIntent::blocks_rename_migration()` の source mutation に含める。
+この既存移行保護と、新規の通常操作Busyは別判定にする。新Busy／modal／Remote write拒否は
+`matches!(pending.intent, BookOpIntent::UndoAppend { .. })` の場合だけ。
+既存 `SourceMutation`／本削除／改名等がpendingでも、新helperを理由にタグ／★／管理画面closeを
+拒否しない。それらはreceiptを失効させ、従来の各受付条件で実行する。
 受付条件は一箇所に揃え、対象viewerの既存解放→最終busy検査→receipt 消費→
 `start_book_op` の pending 設定を同じ
 UI呼出しで行う。metadata producer、Remote、context変更はこの既存 pending の intent を
@@ -137,9 +151,9 @@ UI呼出しで行う。metadata producer、Remote、context変更はこの既存
 | Undo受付前 | 別 book op、delete、book_reorder の flush／transfer、migration in-flight、cleanup、Remote Active／Acquiring があれば受け付けない。receipt がまだ有効であれば「処理中」と通知し、その入力で古い meta Undo を実行しない |
 | 既に受理済みの書込み | `rename_migration_writers_busy()` の tag未回収 batch、rating、local_adjust未完了／未回収、edit_preview、spread_shift、book_resume、bookmark pending に加え、Remote pending書込み完了を確認。対象viewerの解放がflushを発行した場合も、その後に再検査する。未解放surface／未完了writerがあれば Undoを受け付けず、workerを開始しない。新しい fence／drain待ち state を作らない。自分の append に必要な copy 終端が終わるまで成功 receipt を公開しない |
 | Undo worker開始 | `book_op_pending` を設置した後、worker で既存 `acquire_delete_epub_guard` を exact generated paths に取得。既存 delete-worker と同じ EPUB→shift maintenance の順序。検証より前に取得し、全 Shell chunk と成功分 purge の終端まで保持 |
-| ローカル後続mutation | §3.2 の共通受付で source mutation pending を検査。Undo中は受理・worker投入を行わない。Ctrl+Z連打は新しい操作を開始しない |
+| ローカル後続mutation | §3.2 の共通受付で UndoAppend pending だけを新規Busy判定。Undo中は受理・worker投入を行わない。Ctrl+Z連打は新しい操作を開始しない |
 | Remote acquire | 現行 `LocalAiRemoteBarrierSnapshot.book_op_pending` (app.rs:10243) が Undo を含む。pending が残る間は引継ぎを完了しない。Undo前に Acquiring ならローカルUndoを受け付けない |
-| Remote write | `apply_pending_remote_write` (remote_ipc/ui.rs:2413) の bookmark early branch／`apply_remote_write` より前に同じ source mutation gate を適用。Undo中は既存 Busy 応答で終え、書込みを後で再生する新queueは作らない。受理済みRemoteジョブは前段のbusy検査で排除 |
+| Remote write | `apply_pending_remote_write` (remote_ipc/ui.rs:2413) の bookmark early branch／`apply_remote_write` より前にUndoAppend限定gateを適用。Undo中は既存 Busy 応答で終え、書込みを後で再生する新queueは作らない。受理済みRemoteジョブは前段のbusy検査で排除。他の本intentは既存Remote受付規則を維持 |
 | 汎用metadata移行 | `rename_migration_source_changes_pending` (app.rs:45960) が Undo intent を見る。queued移行は開始しない。既に走った移行は受付前busyで排除。token失効をworker完了時へ遅らせない |
 | context close／A/B／navigation | Undo pending の間は新しい切替／close要求を受理しない (既存modal受付で理由通知、専用延期stateなし)。対象生成物のreadonly解放だけは受理前の既存 removed-path 経路で行い、同一operation IDに限定する。既に編集draftがあるならtoken失効済みであり、解放による保存を自分のappendの除外にしない。元contextが消えても新contextへreceiptを移さない |
 | 終端 | Shell成功分だけ guarded purge→worker result→UIの成功path更新まで pending を保つ。`poll_book_op_pending` は受信直後に take して受付を開けず、UI終端後に一度退役。Remote引継ぎ／次移行はその後 |
@@ -153,7 +167,7 @@ leaseだけ取って後から旧queued書込みが削除pathへ着地する形�
 
 失効は操作の**受付成功から最初のdraft変更／job投入までの間**に行う。
 `push_*_undo_entry` や非同期 completion だけでは遅い。受付共通 helper は
-「既存book source mutationならBusy、その他の後続操作ならreceipt失効／受付revision更新」を
+「UndoAppendならBusy、それ以外の後続操作ならreceipt失効／受付revision更新」を
 行う。空target／入力拒否等の非操作はrevisionを進めない。以下を実装・回帰の対象とする。
 
 | producer群 | コード上の入口／捕捉位置 |
@@ -204,6 +218,10 @@ context採用／終了の既存所有箇所。`book_fs_journal.rs` の全件hand
 navigation／context切替、遅延成功結果、同じ operation の refresh、外部追加／同名再作成／
 内容上書き／本改名／reparse、二件目のstamp不一致ならShell呼出し0件、途中write失敗、purge成功path。
 ごみ箱非対応なら完全削除呼出し0件、receiptにないpathへの削除要求0件。
+PostDeleteItemの成功＋ごみ箱item／失敗／NULL／未callbackをfake sinkで検査し、pathが消えた
+だけのケースを成功にしない。実ごみ箱確認は別の了承済み検証枠で行い、今回アプリは起動しない。
+UndoAppend中はタグ／★／Remote書込みが拒否され、既存の本改名・削除・SourceMutation中は
+管理画面close後の別画像タグ／★が従来どおり受理される対のhandler回帰を追加する。
 §3.2 のproducerを各群最低一件、受付直後・非同期完了前に失効することを検査。
 Remote acquire先着／Undo先着、queued Remote bookmark／spread書込み、既存tag/rating/
 local-adjust/bookmark等の未完了writer、queued／in-flight migration、context close／A/B、

@@ -23219,35 +23219,40 @@ mod phase_c_folder_nav_history_tests {
         let root_filter = app.settings.facet_filter.clone();
         app.zip_nav_enter("A/");
         app.settings.facet_filter.exts.insert("jpg".into());
+        let level = app.facet_navigation.route().clone();
+        let child_filter = app.settings.facet_filter.clone();
         let back = app.folder_nav_back_stack.clone();
         let forward = app.folder_nav_forward_stack.clone();
         // F5 / "Update to latest information" uses the real full-refresh handler.
         app.reload_current_folder_preserving_override();
         finish_staged_physical_history_for_test(&mut app);
-        assert!(app.zip_nav.as_ref().unwrap().current().is_empty());
+        assert_eq!(app.zip_nav.as_ref().unwrap().current(), &["A"]);
         assert_eq!(
             app.facet_navigation.route(),
-            &root,
+            &level,
             "SameLocation must still describe the actually prepared ZIP level"
         );
-        assert_eq!(app.settings.facet_filter, root_filter);
+        assert_eq!(app.settings.facet_filter, child_filter);
         assert_eq!(
             app.visible_indices.len(),
-            2,
-            "both root folder rows remain visible"
+            1,
+            "the same child page remains visible"
         );
-        assert_eq!(app.facet_navigation.saved_frame_count(), 1);
+        assert_eq!(app.facet_navigation.saved_frame_count(), 2);
         assert_eq!(app.folder_nav_back_stack, back);
         assert_eq!(app.folder_nav_forward_stack, forward);
         // Consuming the remaining root frame manually, then reloading the same level,
         // must preserve its value and must not invent another frame.
         assert!(app.restore_facet_filter_suppression());
+        assert_eq!(app.settings.facet_filter, root_filter);
+        assert!(app.restore_facet_filter_suppression());
         let manual = app.settings.facet_filter.clone();
         assert_eq!(app.facet_navigation.saved_frame_count(), 0);
         app.reload_current_folder_preserving_override();
         finish_staged_physical_history_for_test(&mut app);
-        assert!(app.zip_nav.as_ref().unwrap().current().is_empty());
-        assert_eq!(app.facet_navigation.route(), &root);
+        assert_eq!(app.zip_nav.as_ref().unwrap().current(), &["A"]);
+        assert_ne!(app.facet_navigation.route(), &root);
+        assert_eq!(app.facet_navigation.route(), &level);
         assert_eq!(app.settings.facet_filter, manual);
         assert_eq!(app.facet_navigation.saved_frame_count(), 0);
         assert_eq!(app.folder_nav_back_stack, back);
@@ -23347,6 +23352,203 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.settings.facet_filter, live_parent);
         assert!(app.settings.facet_filter.kinds.is_empty());
         assert_eq!(app.facet_navigation.saved_frame_count(), 0);
+    }
+
+    fn section1353_write_zip(path: &std::path::Path, entries: &[&str]) {
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        for entry in entries {
+            zip.start_file(*entry, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut zip, b"page").unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn section1353_staged_folder_refresh_reexecutes_submitted_search_on_new_rows() {
+        for during_wait in [0, 1, 2] {
+            let mut app = setup_app();
+            app.active_quick_folder_slot = None;
+            let folder = app.tmp.path().join("refresh-search-folder");
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(folder.join("match-old.jpg"), []).unwrap();
+            app.load_folder(folder.clone());
+            finish_staged_physical_history_for_test(&mut app);
+            let ctx = egui::Context::default();
+            app.show_search_bar = true;
+            app.search_query = "match".into();
+            app.search_target =
+                crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::Filename]);
+            app.execute_search(&ctx);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while app.search_pending.is_some() {
+                app.poll_search(&ctx);
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            let mut submitted = app.submitted_local_search();
+            app.search_query = "unsubmitted draft".into();
+            std::fs::write(folder.join("match-new.jpg"), []).unwrap();
+            std::fs::write(folder.join("other.jpg"), []).unwrap();
+            app.reload_top_level_grid(&ctx);
+            assert!(
+                app.top_level_grid_view
+                    .history_navigation_transition()
+                    .is_some()
+            );
+            if during_wait == 1 {
+                app.search_query = "match-new".into();
+                app.execute_search(&ctx);
+                submitted = app.submitted_local_search();
+                app.search_query = "latest draft".into();
+            } else if during_wait == 2 {
+                app.show_search_bar = false;
+                app.search_query.clear();
+                app.search_filter = None;
+                app.cancel_search_pending();
+                submitted = None;
+            }
+            finish_staged_physical_history_for_test(&mut app);
+            while app.search_pending.is_some() {
+                app.poll_search(&ctx);
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            assert_eq!(app.show_search_bar, during_wait != 2);
+            assert_eq!(
+                app.search_query,
+                match during_wait {
+                    0 => "unsubmitted draft",
+                    1 => "latest draft",
+                    _ => "",
+                }
+            );
+            assert_eq!(app.submitted_local_search(), submitted);
+            if during_wait == 2 {
+                assert!(app.search_filter.is_none());
+            } else {
+                assert_eq!(
+                    app.search_filter.as_ref().unwrap().len(),
+                    if during_wait == 1 { 1 } else { 2 }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn section1353_grid_reload_key_preserves_zip_level_cursor_facet_and_history() {
+        let _input = crate::key_input::lock_test_input();
+        for ctrl in [false, true] {
+            let mut app = setup_app();
+            app.active_quick_folder_slot = None;
+            let book = app.tmp.path().join("refresh.zip");
+            section1353_write_zip(
+                &book,
+                &["root.jpg", "A/cover.jpg", "A/sub/1.jpg", "A/sub/2.jpg"],
+            );
+            app.settings.auto_fullscreen_zip_pdf = false;
+            app.load_folder(book.clone());
+            finish_staged_physical_history_for_test(&mut app);
+            app.zip_nav_enter("A/");
+            app.zip_nav_enter("A/sub/");
+            finish_staged_physical_history_for_test(&mut app);
+            app.selected = Some(1);
+            app.settings.facet_filter.exts.insert("jpg".into());
+            let facet = app.settings.facet_filter.clone();
+            let route = app.facet_navigation.route().clone();
+            let history = app.folder_nav_history_snapshot();
+            let chord = if ctrl { "Ctrl+F5" } else { "F5" };
+            app.keymap = crate::keymap::Keymap::from_ini_str(&format!(
+                "[Grid]\nGridReload = {chord}\n[Rating]\nRatingItem5 = none\n"
+            ));
+            let ctx = egui::Context::default();
+            let modifiers = egui::Modifiers {
+                ctrl,
+                ..Default::default()
+            };
+            ctx.begin_pass(egui::RawInput {
+                modifiers,
+                events: vec![egui::Event::Key {
+                    key: egui::Key::F5,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }],
+                ..Default::default()
+            });
+            let _ = app.handle_keyboard(&ctx);
+            let _ = ctx.end_pass();
+            assert!(
+                app.top_level_grid_view
+                    .history_navigation_transition()
+                    .is_some()
+            );
+            finish_staged_physical_history_for_test(&mut app);
+            assert_eq!(app.zip_nav.as_ref().unwrap().current().join("/"), "A/sub");
+            assert_eq!(app.items[app.selected.unwrap()].name(), "2.jpg");
+            assert_eq!(app.settings.facet_filter, facet);
+            assert_eq!(app.facet_navigation.route(), &route);
+            assert_eq!(app.folder_nav_back_stack, history.back_stack);
+            assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+            // The menu's common entry dispatches the same current physical list.
+            app.reload_top_level_grid(&ctx);
+            finish_staged_physical_history_for_test(&mut app);
+            assert_eq!(app.zip_nav.as_ref().unwrap().current().join("/"), "A/sub");
+        }
+    }
+
+    #[test]
+    fn section1353_disappeared_level_uses_parent_facet_and_new_backspace_stack() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        let book = app.tmp.path().join("refresh-missing.zip");
+        section1353_write_zip(&book, &["root.jpg", "A/cover.jpg", "A/sub/1.jpg"]);
+        app.load_folder(book.clone());
+        finish_staged_physical_history_for_test(&mut app);
+        app.zip_nav_enter("A/");
+        app.settings.facet_filter.exts.insert("png".into());
+        let parent_filter = app.settings.facet_filter.clone();
+        app.zip_nav_enter("A/sub/");
+        app.settings.facet_filter.exts.insert("jpg".into());
+        section1353_write_zip(&book, &["root.jpg", "A/cover.jpg"]);
+        app.reload_top_level_grid(&egui::Context::default());
+        finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(app.zip_nav.as_ref().unwrap().current().join("/"), "A");
+        assert_eq!(app.settings.facet_filter, parent_filter);
+        assert!(app.zip_nav_back());
+        assert!(app.zip_nav.as_ref().unwrap().at_root());
+    }
+
+    #[test]
+    fn section1353_refresh_cancel_and_stale_results_keep_the_current_location() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        let book = app.tmp.path().join("refresh-cancel.zip");
+        section1353_write_zip(&book, &["root.jpg", "A/1.jpg"]);
+        app.load_folder(book.clone());
+        finish_staged_physical_history_for_test(&mut app);
+        app.zip_nav_enter("A/");
+        finish_staged_physical_history_for_test(&mut app);
+        let rows = app.items.clone();
+        let facet = app.facet_navigation.clone();
+        app.reload_top_level_grid(&egui::Context::default());
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+        );
+        app.retire_main_list_requests_for_surface_switch();
+        assert_eq!(app.items, rows);
+        assert_eq!(app.facet_navigation, facet);
+        let other = app.tmp.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        app.load_folder(other.clone());
+        finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(app.current_folder.as_ref(), Some(&other));
+        assert!(app.zip_nav.is_none());
     }
 
     #[test]
@@ -89537,6 +89739,76 @@ mod smart_folder_transition_tests {
             app.render_smart_folder_overlay(ctx);
         });
         assert!(ctx.memory(|memory| memory.top_modal_layer().is_some()));
+    }
+
+    #[test]
+    fn section1353_smart_child_reload_keeps_zip_level_and_root_return() {
+        for converted in [false, true] {
+            let mut app = setup_app();
+            app.active_quick_folder_slot = None;
+            app.settings.auto_fullscreen_zip_pdf = false;
+            let source = app.tmp.path().join("smart-refresh-source");
+            std::fs::create_dir_all(&source).unwrap();
+            let book = source.join("book.zip");
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&book).unwrap());
+            for name in ["root.jpg", "A/1.jpg", "B/2.jpg"] {
+                zip.start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                std::io::Write::write_all(&mut zip, b"page").unwrap();
+            }
+            zip.finish().unwrap();
+            let logical = if converted {
+                let logical = source.join("source.7z");
+                std::fs::write(&logical, b"source").unwrap();
+                logical
+            } else {
+                book.clone()
+            };
+            let definition = definition("Refresh", source);
+            let id = definition.id;
+            app.settings.smart_folders = vec![definition];
+            let ctx = egui::Context::default();
+            app.open_smart_folder_staged(id, false);
+            wait_for_staged_smart_terminal(&mut app, &ctx);
+            if converted {
+                assert!(
+                    app.begin_smart_physical_navigation_with_backing(
+                        logical.clone(),
+                        book.clone(),
+                        super::smart_folder::SmartChildKind::ConvertibleArchive,
+                        false,
+                        None,
+                        None,
+                        crate::app::StartupListIntent::ExplicitList,
+                        None,
+                    )
+                    .is_ok()
+                );
+            } else {
+                assert!(app.begin_staged_smart_drill(&book));
+            }
+            wait_for_staged_smart_terminal(&mut app, &ctx);
+            app.zip_nav_enter("A/");
+            app.settings.facet_filter.exts.insert("jpg".into());
+            let route = app.facet_navigation.route().clone();
+            let back = app.folder_nav_back_stack.clone();
+            let forward = app.folder_nav_forward_stack.clone();
+            if converted {
+                std::fs::remove_file(&logical).unwrap();
+            }
+            app.reload_top_level_grid(&ctx);
+            wait_for_staged_smart_terminal(&mut app, &ctx);
+            assert_eq!(app.zip_nav.as_ref().unwrap().current().join("/"), "A");
+            assert_eq!(app.facet_navigation.route(), &route);
+            assert_eq!(app.folder_nav_back_stack, back);
+            assert_eq!(app.folder_nav_forward_stack, forward);
+            assert!(app.settings.facet_filter.exts.contains("jpg"));
+            assert!(matches!(
+                app.top_level_grid_view.smart_folder().unwrap().position,
+                crate::app::top_level_grid_view::SmartFolderPosition::Container { .. }
+                    | crate::app::top_level_grid_view::SmartFolderPosition::Scoped { .. }
+            ));
+        }
     }
 
     #[test]

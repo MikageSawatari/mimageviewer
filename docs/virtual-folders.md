@@ -1,8 +1,13 @@
-# 仮想フォルダ (ZIP / RAR / PDF / EPUB) 処理
+﻿# 仮想フォルダ (ZIP / RAR / PDF / EPUB) 処理
 
-§1.353 の全再読込時の現在階層保持は [設計レビュー待ち](section353-zip-refresh-location-plan.md)
-(2026-10-12、未実装)。現行全再読込は root／collapse へ戻る。提案では要求に実効 prefix を
-固定し、新ツリーで同階層、消失時だけ直近の存在する祖先へ着地する。履歴再入場の root 規則は維持する。
+§1.353 の全再読込は [承認設計](section353-zip-refresh-location-plan.md) に従い、
+`RefreshList` に現在の論理 source・実効 ZIP prefix・カーソルを固定する。
+新ツリーで同階層を復元し、階層が消失した場合だけ直近の存在する祖先へ戻る。
+collapse で実効階層／親 stack が変わっても、存在する階層の active facet を保持し、
+Backspace の帰路だけ新ツリーへ合わせる。Collection／Smart／検索等の物理子は
+親の root へ配送せず、その子を既存 owner で更新する。変換済み書庫は論理 source と
+mounted backing を保持する。PDF の page cursor と履歴再入場の root 規則は維持する。
+検索 hit drill は途中 batch のヒット不足では戻さず、完全な結果の確定後だけ祖先／一覧へ戻す。
 
 ## 本別見開き調整のscope/転送とRemote（§1.364 D1–D3、未リリース）
 

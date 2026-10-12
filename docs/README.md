@@ -1,4 +1,4 @@
-# docs/ — ドキュメント索引
+﻿# docs/ — ドキュメント索引
 
 修正作業の前に、関連するドキュメントを読んで全体設計を把握すること。
 
@@ -8,9 +8,9 @@
 
 | ドキュメント | 読むべきタイミング |
 | --- | --- |
-| [section353-zip-refresh-location-plan.md](section353-zip-refresh-location-plan.md) | §1.353 全再読込で ZIP 現在 prefix が欠落する原因、F5 / Ctrl+F5 の Action 差、変換書庫・nested ZIP・PDF の範囲。非同期要求への意図追加は設計レビュー待ち |
-| [section375-operation-reconcile-plan.md](section375-operation-reconcile-plan.md) | §1.375 削除後の signature 無効化による watch 全再読込。操作 ID と適用済み一覧の照合、外部変更混在、改名・move・copy の経路。設計レビュー待ち |
-| [section373-book-append-undo-plan.md](section373-book-append-undo-plan.md) | §1.373 本追加直後一回の Undo、生成コピー限定の削除・同名差し替え保護。membership は現基点で未実装、削除方式はレビュー時の判断事項 |
+| [section353-zip-refresh-location-plan.md](section353-zip-refresh-location-plan.md) | §1.353 ZIP の現在 prefix、Collection／Smart／Search 等の root・物理子更新配送、collapse とfacet／親stack。R2 設計 ACCEPT、実装・targeted/check成功。fullはrelease入力不足で未完了 |
+| [section375-operation-reconcile-plan.md](section375-operation-reconcile-plan.md) | §1.375 操作ID・raw rowsと表示投影の照合、contextごとの監視購読、通知kind/path。第一段はDelete、第二段は改名・move・copy。§1.314 維持の R2 REVISE 反映・再レビュー待ち |
+| [section373-book-append-undo-plan.md](section373-book-append-undo-plan.md) | §1.373 追加直後一回のUndo。既存book_op_pendingへ統合、失効producer、瞬間競合の既定割り切り、ごみ箱方式は利用者決定済み、UndoAppend 限定排他・実移動確認。REVISE反映・再レビュー待ち |
 | [async-log-writer-plan.md](async-log-writer-plan.md) | §1.356 通常／perfの同期ログI/OによるUI・stderr reader停止。単一writer、有界queue・欠落、重要診断、終了flush、診断ZIP workerの完了barrier、解析gateの保存証明／判定不能。2026-10-09利用者決定済み・実装／検証記録 |
 | [details-name-color-plan.md](details-name-color-plan.md) | 詳細一覧の名前色。フォルダ黄系・六分類、標準カスタム/強め固定、選択/チェック共通色、切り取り不透明と設定保存・検証 |
 | [raw-libraw-plan.md](raw-libraw-plan.md) | RAW の内蔵現像、プレビュー差し替え・編集 gate・Remote・設定・配布を触るとき |

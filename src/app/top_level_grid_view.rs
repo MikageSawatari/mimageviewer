@@ -1274,60 +1274,95 @@ pub(crate) enum TopLevelGridSurface {
 }
 
 impl super::App {
+    /// A synthetic surface can still own a physical descendant. Its position and the
+    /// adopted row producer decide refresh routing, not the parent's surface alone.
+    fn current_grid_reload_is_physical(&self) -> bool {
+        match self.top_level_grid_view.surface() {
+            TopLevelGridSurface::Folder => true,
+            TopLevelGridSurface::Collection(_) => self
+                .top_level_grid_view
+                .collection_session()
+                .is_some_and(|session| {
+                    matches!(
+                        session.position,
+                        CollectionGridPosition::PhysicalSource { .. }
+                    )
+                }),
+            TopLevelGridSurface::SmartFolder(state) => {
+                !matches!(state.position, SmartFolderPosition::Root)
+            }
+            TopLevelGridSurface::Search(TopLevelSearchView::Global) => {
+                !self.items_are_global_search_view
+            }
+            TopLevelGridSurface::Search(TopLevelSearchView::Favorite) => {
+                !self.favsearch.on_results_grid()
+            }
+            TopLevelGridSurface::Search(TopLevelSearchView::Tag) => !self.items_are_tag_view,
+            TopLevelGridSurface::Rating { .. } => !self.items_are_rating_view,
+            _ => false,
+        }
+    }
+
     /// 現在の最上位一覧を、その surface が所有する再入場経路で更新する。
     pub(crate) fn reload_top_level_grid(&mut self, ctx: &egui::Context) {
         let surface = self.top_level_grid_view.surface().clone();
         let folder_pane_active = self.effective_folder();
 
-        match surface {
-            TopLevelGridSurface::Folder => {
-                let local_search = self.show_search_bar.then(|| self.search_query.clone());
-                self.reload_current_folder_preserving_override();
-                if let Some(query) = local_search {
-                    self.show_search_bar = true;
-                    self.search_query = query;
-                    self.reexecute_search_for_installed_list(ctx);
+        if self.current_grid_reload_is_physical() {
+            self.reload_current_physical_list();
+        } else {
+            match surface {
+                TopLevelGridSurface::Folder => {
+                    let local_search = self.show_search_bar.then(|| self.search_query.clone());
+                    self.reload_current_folder_preserving_override();
+                    if let Some(query) = local_search {
+                        self.show_search_bar = true;
+                        self.search_query = query;
+                        self.reexecute_search_for_installed_list(ctx);
+                    }
                 }
-            }
-            TopLevelGridSurface::SmartFolder(state) => {
-                if self.smart_folder_busy() {
-                    return;
+                TopLevelGridSurface::SmartFolder(state) => {
+                    if self.smart_folder_busy() {
+                        return;
+                    }
+                    let _ = self.refresh_smart_folder_staged(state.definition_id);
                 }
-                let _ = self.refresh_smart_folder_staged(state.definition_id);
-            }
-            TopLevelGridSurface::SubfolderExpansion => {
-                if self.subfolder_expansion_busy() {
-                    return;
+                TopLevelGridSurface::SubfolderExpansion => {
+                    if self.subfolder_expansion_busy() {
+                        return;
+                    }
+                    if let Some(snapshot) = self.subfolder_expansion_snapshot.as_ref() {
+                        self.start_subfolder_expansion_scan_roots(
+                            snapshot.root.clone(),
+                            snapshot.roots.clone(),
+                        );
+                    }
                 }
-                if let Some(snapshot) = self.subfolder_expansion_snapshot.as_ref() {
-                    self.start_subfolder_expansion_scan_roots(
-                        snapshot.root.clone(),
-                        snapshot.roots.clone(),
-                    );
+                TopLevelGridSurface::Search(TopLevelSearchView::Global) => {
+                    self.refresh_global_search(ctx);
                 }
-            }
-            TopLevelGridSurface::Search(TopLevelSearchView::Global) => {
-                self.spawn_global_search(ctx);
-            }
-            TopLevelGridSurface::Search(TopLevelSearchView::Favorite) => {
-                self.execute_favsearch();
-            }
-            TopLevelGridSurface::Search(TopLevelSearchView::Tag) => {
-                self.open_tag_view_with_query(Some(self.tag_view.query.clone()), false);
-            }
-            TopLevelGridSurface::Rating { .. } => self.reload_current_rating_view_preserving_sort(),
-            TopLevelGridSurface::ReadingHistory => self.enter_reading_history(),
-            TopLevelGridSurface::Bookmarks => self.enter_bookmark_view(),
-            TopLevelGridSurface::DriveList => {
-                let origin = self.selected.and_then(|index| match self.items.get(index) {
-                    Some(crate::grid_item::GridItem::Folder(path)) => Some(path.clone()),
-                    _ => None,
-                });
-                self.enter_drive_list(origin);
-            }
-            TopLevelGridSurface::Snapshot => {}
-            TopLevelGridSurface::Collection(identity) => {
-                self.open_collection_grid(identity.collection_id, None);
+                TopLevelGridSurface::Search(TopLevelSearchView::Favorite) => {
+                    self.execute_favsearch();
+                }
+                TopLevelGridSurface::Search(TopLevelSearchView::Tag) => {
+                    self.open_tag_view_with_query(Some(self.tag_view.query.clone()), false);
+                }
+                TopLevelGridSurface::Rating { .. } => {
+                    self.reload_current_rating_view_preserving_sort()
+                }
+                TopLevelGridSurface::ReadingHistory => self.enter_reading_history(),
+                TopLevelGridSurface::Bookmarks => self.enter_bookmark_view(),
+                TopLevelGridSurface::DriveList => {
+                    let origin = self.selected.and_then(|index| match self.items.get(index) {
+                        Some(crate::grid_item::GridItem::Folder(path)) => Some(path.clone()),
+                        _ => None,
+                    });
+                    self.enter_drive_list(origin);
+                }
+                TopLevelGridSurface::Snapshot => {}
+                TopLevelGridSurface::Collection(identity) => {
+                    self.open_collection_grid(identity.collection_id, None);
+                }
             }
         }
 

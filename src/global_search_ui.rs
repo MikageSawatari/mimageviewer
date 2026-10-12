@@ -652,6 +652,77 @@ impl GlobalSearchState {
         self.mtime_lookup_pending = None;
     }
 
+    fn reset_for_refresh(&mut self) {
+        let drill = self.drill.clone();
+        let aggregate = self.aggregate;
+        let aggregate_auto = self.aggregate_auto;
+        self.reset_for_new_query();
+        self.drill = drill;
+        self.aggregate = aggregate;
+        self.aggregate_auto = aggregate_auto;
+    }
+
+    /// Only a complete stream with all rated batches adopted proves missing hit scopes.
+    /// An empty first batch, truncation or failure cannot move the current drill.
+    fn reconcile_completed_drill(&mut self) -> bool {
+        if !self.done
+            || self.truncated
+            || self.reject_message.is_some()
+            || self
+                .page_edit_prepare
+                .as_ref()
+                .is_some_and(|prepare| prepare.rated_batch_sequence != prepare.raw_batch_sequence)
+        {
+            return false;
+        }
+        let Some(drill) = self.drill.as_ref() else {
+            return false;
+        };
+        let container_has_hit = self.all_hits.iter().any(|hit| {
+            if drill.is_zip {
+                parent_container(&hit.path).0 == drill.container_root
+            } else {
+                !is_zip_hit_path(&hit.path)
+                    && Path::new(&hit.path)
+                        .parent()
+                        .is_some_and(|parent| path_is_under_or_eq(parent, &drill.container_root))
+            }
+        });
+        if !container_has_hit {
+            // The existing derived view returns to Flat/Aggregated without another owner.
+            self.drill = None;
+            return true;
+        }
+        let drill = self.drill.as_mut().unwrap();
+        // ZIP hit drill is the container's flat projection, not ZipNavState hierarchy.
+        if drill.is_zip {
+            return false;
+        }
+        let original = drill.current_path.clone();
+        while drill.current_path != drill.container_root {
+            let has_hit = self.all_hits.iter().any(|hit| {
+                if is_zip_hit_path(&hit.path) {
+                    return false;
+                }
+                Path::new(&hit.path)
+                    .parent()
+                    .is_some_and(|parent| path_is_under_or_eq(parent, &drill.current_path))
+            });
+            if has_hit {
+                break;
+            }
+            let Some(parent) = drill
+                .current_path
+                .parent()
+                .filter(|parent| path_is_under_or_eq(parent, &drill.container_root))
+            else {
+                break;
+            };
+            drill.current_path = parent.to_path_buf();
+        }
+        original != drill.current_path
+    }
+
     /// 集約ロジック (docs §10.4.2): 1 ヒットをコンテナに追加 + 生データも保持
     pub(crate) fn accumulate_hit(&mut self, hit: &GlobalHit) {
         if !crate::global_search::search_hit_type_is_visible(&self.visibility, &hit.path) {
@@ -2538,6 +2609,14 @@ impl App {
 
     /// 現在のクエリで検索を spawn する。
     pub(crate) fn spawn_global_search(&mut self, ctx: &egui::Context) {
+        self.spawn_global_search_with_refresh(ctx, false);
+    }
+
+    pub(crate) fn refresh_global_search(&mut self, ctx: &egui::Context) {
+        self.spawn_global_search_with_refresh(ctx, true);
+    }
+
+    fn spawn_global_search_with_refresh(&mut self, ctx: &egui::Context, refresh: bool) {
         // Indexerのreadinessとは独立した、保存設定だけのフィルター健全化。
         // 準備中も削除済み/対象外のfavoriteを解除し、表示と検索scopeを一致させる。
         let ownership = crate::metadata_ownership::metadata_ownership(
@@ -2556,7 +2635,11 @@ impl App {
         if self.global_search.query != self.global_search.last_executed {
             self.retire_main_list_requests_for_surface_switch();
         }
-        self.global_search.reset_for_new_query();
+        if refresh {
+            self.global_search.reset_for_refresh();
+        } else {
+            self.global_search.reset_for_new_query();
+        }
         self.global_search.visibility = self.settings.file_type_visibility.clone();
         if !self.restart_search_page_edit_prepare(ctx) {
             return;
@@ -2704,6 +2787,9 @@ impl App {
                             self.global_search.reject_message =
                                 Some(r.as_user_message().to_string());
                         }
+                        DoneReason::Cancelled => {
+                            self.global_search.reject_message = Some("検索を中止しました".into());
+                        }
                         _ => {}
                     }
                     changed = true;
@@ -2720,6 +2806,8 @@ impl App {
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     self.global_search.done = true;
+                    self.global_search.reject_message =
+                        Some("検索結果を受信できませんでした".into());
                     changed = true;
                     stats_changed = true;
                     break;
@@ -3315,6 +3403,9 @@ impl App {
     }
 
     fn request_search_view_build(&mut self, survivor_order: Option<Vec<String>>) {
+        if self.global_search.reconcile_completed_drill() {
+            self.update_global_search_address();
+        }
         if self.global_search.page_edit_prepare.is_some() {
             self.global_search.maybe_auto_switch_aggregate();
             ensure_container_mtime_populated(&mut self.global_search);
@@ -5528,6 +5619,182 @@ mod tests {
         // クエリリセットで drill state もリセットされる契約
         state.reset_for_new_query();
         assert_eq!(state.view(), GlobalSearchView::Flat);
+    }
+
+    #[test]
+    fn section1353_search_refresh_keeps_drill_until_complete_untruncated_results() {
+        let root = PathBuf::from("C:/photos");
+        let current = root.join("A/sub");
+        let mut state = GlobalSearchState::default();
+        state.drill = Some(DrillState {
+            container_root: root.clone(),
+            current_path: current.clone(),
+            is_zip: false,
+        });
+        state.aggregate = true;
+        state.aggregate_auto = false;
+        state.reset_for_refresh();
+        assert!(state.aggregate);
+        assert!(!state.aggregate_auto);
+        state.all_hits.push(GlobalHit {
+            path: root.join("B/early.jpg").to_string_lossy().into_owned(),
+            score: 1.0,
+            stars: 0,
+            mtime: 0,
+            file_size: Some(0),
+        });
+        assert!(!state.reconcile_completed_drill());
+        assert_eq!(state.drill.as_ref().unwrap().current_path, current);
+        state.done = true;
+        state.truncated = true;
+        assert!(!state.reconcile_completed_drill());
+        state.truncated = false;
+        state.reject_message = Some("failed".into());
+        assert!(!state.reconcile_completed_drill());
+        state.reject_message = None;
+        assert!(state.reconcile_completed_drill());
+        assert_eq!(state.drill.as_ref().unwrap().current_path, root);
+    }
+
+    #[test]
+    fn section1353_completed_search_missing_container_returns_to_derived_root() {
+        for is_zip in [false, true] {
+            for aggregate in [false, true] {
+                let root = PathBuf::from(if is_zip { "C:/gone.zip" } else { "C:/gone" });
+                let mut state = GlobalSearchState::default();
+                state.aggregate = aggregate;
+                state.drill = Some(DrillState {
+                    container_root: root.clone(),
+                    current_path: root,
+                    is_zip,
+                });
+                assert!(!state.reconcile_completed_drill());
+                state.done = true;
+                assert!(state.reconcile_completed_drill());
+                assert!(state.drill.is_none());
+                assert_eq!(
+                    state.view(),
+                    if aggregate {
+                        GlobalSearchView::Aggregated
+                    } else {
+                        GlobalSearchView::Flat
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn section1353_search_stream_late_hit_preserves_drill_and_active_facet() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        app.active_quick_folder_slot = None;
+        let root = app.tmp.path().join("refresh-search");
+        let current = root.join("A/sub");
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::create_dir_all(root.join("B")).unwrap();
+        let later = current.join("later.jpg");
+        let early = root.join("B/early.jpg");
+        for path in [&later, &early] {
+            std::fs::write(path, b"page").unwrap();
+        }
+        let hit = |path: &Path| GlobalHit {
+            path: path.to_string_lossy().into_owned(),
+            score: 1.0,
+            stars: 0,
+            mtime: 0,
+            file_size: Some(4),
+        };
+        app.global_search.drill = Some(DrillState {
+            container_root: root,
+            current_path: current.clone(),
+            is_zip: false,
+        });
+        app.global_search.aggregate_auto = false;
+        let ctx = egui::Context::default();
+        let settle = |app: &mut crate::app::App, hits: usize| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                app.poll_global_search_events(&ctx);
+                let prepare = app.global_search.page_edit_prepare.as_ref().unwrap();
+                if app.global_search.all_hits.len() == hits
+                    && prepare.in_flight.is_none()
+                    && prepare.desired.is_none()
+                {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "search refresh did not settle");
+                std::thread::yield_now();
+            }
+        };
+        app.begin_search_page_edit_prepare_for_test(&ctx);
+        let (seed, rx) = crossbeam_channel::unbounded();
+        app.global_search.pending = Some(crate::indexer_manager::SearchHandle {
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx,
+        });
+        seed.send(SearchStreamEvent::Batch {
+            hits: vec![hit(&later)],
+            scanned_candidates: 1,
+            valid_hits: 1,
+            visibility_notice: None,
+        })
+        .unwrap();
+        seed.send(SearchStreamEvent::Done {
+            truncated: false,
+            reason: DoneReason::Complete,
+        })
+        .unwrap();
+        settle(&mut app, 1);
+        app.settings.facet_filter.exts.insert("jpg".into());
+        let filter = app.settings.facet_filter.clone();
+        let route = app.facet_navigation.route().clone();
+        app.global_search.reset_for_refresh();
+        app.begin_search_page_edit_prepare_for_test(&ctx);
+        let (stream, rx) = crossbeam_channel::unbounded();
+        app.global_search.pending = Some(crate::indexer_manager::SearchHandle {
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx,
+        });
+        stream
+            .send(SearchStreamEvent::Batch {
+                hits: vec![hit(&early)],
+                scanned_candidates: 1,
+                valid_hits: 1,
+                visibility_notice: None,
+            })
+            .unwrap();
+        settle(&mut app, 1);
+        assert!(!app.global_search.done);
+        assert_eq!(
+            app.global_search.drill.as_ref().unwrap().current_path,
+            current
+        );
+        assert_eq!(app.facet_navigation.route(), &route);
+        assert_eq!(app.settings.facet_filter, filter);
+        stream
+            .send(SearchStreamEvent::Batch {
+                hits: vec![hit(&later)],
+                scanned_candidates: 2,
+                valid_hits: 2,
+                visibility_notice: None,
+            })
+            .unwrap();
+        stream
+            .send(SearchStreamEvent::Done {
+                truncated: false,
+                reason: DoneReason::Complete,
+            })
+            .unwrap();
+        settle(&mut app, 2);
+        assert_eq!(
+            app.global_search.drill.as_ref().unwrap().current_path,
+            current
+        );
+        assert_eq!(app.facet_navigation.route(), &route);
+        assert_eq!(app.settings.facet_filter, filter);
+        assert_eq!(app.items.len(), 1);
+        assert_eq!(app.items[0].name(), "later.jpg");
     }
 
     #[test]

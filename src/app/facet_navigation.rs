@@ -165,11 +165,46 @@ impl FacetNavigationState {
     }
 
     pub(crate) fn suppressed(&self) -> bool {
-        !self.frames.is_empty()
+        self.frames.iter().any(|frame| frame.filter.is_active())
     }
 
     pub(crate) fn saved_frame_count(&self) -> usize {
-        self.frames.len()
+        self.frames
+            .iter()
+            .filter(|frame| frame.filter.is_active())
+            .count()
+    }
+
+    /// Re-enumeration keeps the live filter but rebuilds ancestry from the new tree.
+    /// Frames are parent-owned, not index-owned; consumed frames are never recreated.
+    pub(crate) fn reproject(&mut self, destination: FacetRoute) {
+        let old = &self.route.0;
+        let mut frames = self
+            .frames
+            .drain(..)
+            .filter_map(|mut frame| {
+                let parent = old.get(frame.entered.checked_sub(1)?)?;
+                let index = destination.0.iter().position(|scope| scope == parent)?;
+                if index + 1 >= destination.0.len() {
+                    return None;
+                }
+                frame.entered = index + 1;
+                Some(frame)
+            })
+            .collect::<Vec<_>>();
+        // Newly exposed wrapper parents have no prior live filter. Record their default
+        // return value, without inventing a suppressed-filter badge or a consumed frame.
+        for entered in 1..destination.0.len() {
+            if !old.contains(&destination.0[entered - 1]) {
+                frames.push(SavedFacetFrame {
+                    entered,
+                    filter: FacetFilter::default(),
+                });
+            }
+        }
+        frames.sort_by_key(|frame| frame.entered);
+        self.frames = frames;
+        self.route = destination;
     }
 
     #[cfg(test)]
@@ -196,7 +231,6 @@ impl FacetNavigationState {
             for frame in &mut self.frames {
                 frame.filter.place_keys.clear();
             }
-            self.frames.retain(|frame| frame.filter.is_active());
         }
         let common = self
             .route
@@ -231,11 +265,13 @@ impl FacetNavigationState {
     /// Badge action: consume only the latest live frame; lineage stays intact.
     /// The caller synchronizes name runtime and persists Settings as before.
     pub(crate) fn restore_latest(&mut self, active: &mut FacetFilter) -> bool {
-        let Some(frame) = self.frames.pop() else {
-            return false;
-        };
-        *active = frame.filter;
-        true
+        while let Some(frame) = self.frames.pop() {
+            if frame.filter.is_active() {
+                *active = frame.filter;
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -255,6 +291,45 @@ mod tests {
 
     fn book() -> FacetScope {
         FacetScope::book(Path::new(r"C:\books\comic.zip"), "")
+    }
+
+    #[test]
+    fn section1353_reproject_preserves_frames_by_parent_and_new_parent_defaults() {
+        let root = FacetRoute::root(book());
+        let leaf = FacetScope::book(Path::new(r"C:\books\comic.zip"), "A/sub");
+        let parent = FacetScope::book(Path::new(r"C:\books\comic.zip"), "A");
+        let mut state = FacetNavigationState::default();
+        let mut active = filter("zip");
+        state.adopt(root.clone(), &mut active);
+        state.adopt(root.child(leaf.clone()), &mut active);
+        active = filter("jpg");
+        state.reproject(root.child(parent.clone()).child(leaf));
+        assert_eq!(active, filter("jpg"));
+        assert_eq!(state.saved_frame_count(), 1);
+        state.adopt(root.child(parent), &mut active);
+        assert!(
+            !active.is_active(),
+            "unseen parent has no inherited child facet"
+        );
+        state.adopt(root, &mut active);
+        assert_eq!(active, filter("zip"));
+    }
+
+    #[test]
+    fn section1353_reproject_collapse_does_not_recreate_consumed_parent_frame() {
+        let root = FacetRoute::root(book());
+        let parent = FacetScope::book(Path::new(r"C:\books\comic.zip"), "A");
+        let leaf = FacetScope::book(Path::new(r"C:\books\comic.zip"), "A/sub");
+        let mut state = FacetNavigationState::default();
+        let mut active = filter("zip");
+        state.adopt(root.clone(), &mut active);
+        state.adopt(root.child(parent), &mut active);
+        assert!(state.restore_latest(&mut active));
+        let manual = active.clone();
+        state.reproject(root.child(leaf));
+        assert_eq!(active, manual);
+        assert_eq!(state.saved_frame_count(), 0);
+        assert!(!state.suppressed());
     }
 
     #[test]

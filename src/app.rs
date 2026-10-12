@@ -1269,6 +1269,14 @@ pub(crate) struct MainListNavigation {
 pub(crate) struct MainListAdoption {
     navigation: MainListNavigation,
     destination: FolderNavHistoryEntry,
+    facet_mode: MainFacetAdoption,
+}
+
+#[derive(Clone, Copy, Default)]
+enum MainFacetAdoption {
+    #[default]
+    Navigation,
+    Reproject,
 }
 
 pub(crate) type MainListHydration = Option<(sidecar_restore::SidecarLoadContinuation, bool)>;
@@ -4528,6 +4536,7 @@ struct PreparedZipGrid {
     image_metas: Vec<Option<(i64, i64)>>,
     existing_keys: std::collections::HashSet<String>,
     has_foreign_archives: bool,
+    refresh_position: crate::zip_tree::ZipRefreshPosition,
 }
 
 /// Only materialized, admitted memory payloads may cross the main adoption boundary.
@@ -23485,7 +23494,51 @@ impl App {
         Some(MainListAdoption {
             navigation,
             destination,
+            facet_mode: MainFacetAdoption::Navigation,
         })
+    }
+
+    /// The refreshed tree owns the effective ZIP parents. A retained node preserves the
+    /// active facet even when automatic collapse changed its displayed prefix.
+    fn reconcile_zip_refresh_adoption(
+        &self,
+        adoption: &mut MainListAdoption,
+        prepared: &PreparedZipGrid,
+    ) {
+        use crate::zip_tree::ZipRefreshPosition;
+        if prepared.refresh_position == ZipRefreshPosition::Open {
+            return;
+        }
+        let location = &adoption.destination.location;
+        let (source, synthetic_parent) = match location {
+            FolderNavHistoryTarget::Path(path) => (path, false),
+            FolderNavHistoryTarget::RatingPhysical(child) => (&child.visible_path, false),
+            FolderNavHistoryTarget::CollectionPhysical(child) => (&child.visible_path, true),
+            FolderNavHistoryTarget::SmartFolder(state) => match &state.position {
+                top_level_grid_view::SmartFolderPosition::Container { current, .. }
+                | top_level_grid_view::SmartFolderPosition::Scoped { current, .. } => {
+                    (current, true)
+                }
+                _ => return,
+            },
+            _ => return,
+        };
+        let root = FacetScope::book(source, "");
+        let route = &mut adoption.destination.route.0;
+        while route.last().is_some_and(|scope| {
+            matches!((scope, &root),
+            (FacetScope::Book { source: a, .. }, FacetScope::Book { source: b, .. }) if a == b)
+        }) {
+            route.pop();
+        }
+        for level in prepared.nav.effective_levels() {
+            if !synthetic_parent || !level.is_empty() {
+                route.push(FacetScope::book(source, &level.join("/")));
+            }
+        }
+        if prepared.refresh_position == ZipRefreshPosition::Preserved {
+            adoption.facet_mode = MainFacetAdoption::Reproject;
+        }
     }
 
     /// This closure receives only an already-admitted prepared install. It cannot reject or
@@ -23498,9 +23551,16 @@ impl App {
         let MainListAdoption {
             navigation,
             destination,
+            facet_mode,
         } = adoption;
         self.save_leaving_folder_grid_position();
-        self.adopt_main_facet_route(destination.route.clone());
+        match facet_mode {
+            MainFacetAdoption::Navigation => self.adopt_main_facet_route(destination.route.clone()),
+            MainFacetAdoption::Reproject => {
+                self.facet_navigation.reproject(destination.route.clone());
+                self.sync_facet_name_runtime_from_filter();
+            }
+        }
         self.select_after_load = navigation.selection_after_load;
         if matches!(
             navigation.history,
@@ -25426,6 +25486,10 @@ impl App {
             self.refresh_current_view_pin_thumbnails(refresh);
             return;
         }
+        self.reload_current_physical_list();
+    }
+
+    fn reload_current_physical_list(&mut self) {
         let Some(folder) = self.current_folder.clone() else {
             return;
         };
@@ -25439,11 +25503,66 @@ impl App {
         self.preserve_cursor_hint_for_reload();
         let saved_override = self.archive_source_override.clone();
         let owner = self.current_folder_reload_owner(&folder);
+        let restore_intent = self.current_list_refresh_intent();
+        let logical = saved_override.as_ref().unwrap_or(&folder).clone();
+        if let Some(kind) = self.smart_physical_target_kind(&logical) {
+            if self.smart_folder_busy() {
+                return;
+            }
+            let Some(lease) = self.smart_folder_source_lease() else {
+                return;
+            };
+            let navigation = self.capture_main_list_navigation(
+                MainHistoryOperation::SameLocation,
+                MainListSourceProof::Surface(lease),
+            );
+            if self
+                .begin_smart_physical_navigation_with_backing(
+                    logical,
+                    folder.clone(),
+                    kind,
+                    false,
+                    None,
+                    None,
+                    restore_intent,
+                    Some(navigation),
+                )
+                .is_err()
+            {
+                self.select_after_load = previous_hint;
+                self.show_feedback_toast("一覧の更新を開始できませんでした".into());
+            } else if kind == smart_folder::SmartChildKind::ConvertibleArchive
+                && saved_override.is_none()
+                && self.zip_nav.is_none()
+            {
+                self.start_smart_archive_conversion_current();
+            }
+            return;
+        }
+        if self.current_folder_last_mtime.is_some()
+            && let (Some(intent), Some(navigation)) = (
+                Self::physical_open_intent(&owner, false),
+                self.capture_physical_open_navigation(&owner, &folder),
+            )
+        {
+            if !self.start_physical_history_transition_classified(
+                intent,
+                folder,
+                None,
+                Some(OpenPathKind::Directory),
+                restore_intent,
+                navigation,
+                None,
+            ) {
+                self.select_after_load = previous_hint;
+            }
+            return;
+        }
         let outcome = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
             folder,
             false,
             owner,
-            crate::app::StartupListIntent::PreservePresentation,
+            restore_intent,
         );
         if matches!(
             outcome,
@@ -33657,7 +33776,7 @@ impl App {
         if !self.snapshot_scope_allows_open(&request.path, &owner) {
             return;
         }
-        let restore_intent = match &payload {
+        let restore_intent = self.capture_refresh_search(match &payload {
             collection_navigation::PhysicalHistoryPreflightPayload::Folder(scan) => {
                 request.restore_intent.clone().for_scanned_folder(
                     auto_fullscreen
@@ -33666,7 +33785,7 @@ impl App {
                 )
             }
             _ => request.restore_intent.clone().for_book(),
-        };
+        });
         let full_path = matches!(
             request.intent,
             PhysicalHistoryIntent::CollectionNavigation { .. }
@@ -33815,10 +33934,13 @@ impl App {
                 prefix.as_deref(),
             ),
         };
-        let Some(adoption) = self.prepare_main_list_adoption(request.navigation, destination)
+        let Some(mut adoption) = self.prepare_main_list_adoption(request.navigation, destination)
         else {
             return;
         };
+        if let PreparedPhysicalListing::Zip { prepared, .. } = &prepared {
+            self.reconcile_zip_refresh_adoption(&mut adoption, prepared);
+        }
         if let PhysicalHistoryIntent::RequiredFullscreen {
             navigation_purpose, ..
         } = &request.intent
@@ -35848,7 +35970,15 @@ impl App {
     ) -> PreparedZipGrid {
         let sort = BOOK_READING_PAGE_ORDER;
         existing_keys.extend(pinned_keys);
-        let nav = match restore_intent.materialization_intent() {
+        let (nav, refresh_position) = match restore_intent.materialization_intent() {
+            StartupListIntent::RefreshList {
+                target:
+                    crate::settings::StartupListTarget::PhysicalList {
+                        zip_prefix: Some(prefix),
+                        ..
+                    },
+                ..
+            } => crate::zip_tree::ZipNavState::refresh_prefix(tree, prefix),
             StartupListIntent::RestoreList {
                 target:
                     crate::settings::StartupListTarget::PhysicalList {
@@ -35856,9 +35986,15 @@ impl App {
                         ..
                     },
                 ..
-            } => crate::zip_tree::ZipNavState::restore_prefix(tree.clone(), prefix)
-                .unwrap_or_else(|| crate::zip_tree::ZipNavState::new(tree)),
-            _ => crate::zip_tree::ZipNavState::new(tree),
+            } => (
+                crate::zip_tree::ZipNavState::restore_prefix(tree.clone(), prefix)
+                    .unwrap_or_else(|| crate::zip_tree::ZipNavState::new(tree)),
+                crate::zip_tree::ZipRefreshPosition::Open,
+            ),
+            _ => (
+                crate::zip_tree::ZipNavState::new(tree),
+                crate::zip_tree::ZipRefreshPosition::Open,
+            ),
         };
         let (mut items, mut image_metas) = nav.materialize_current(sort);
         crate::grid_item::arrange_grid_items(
@@ -35873,6 +36009,7 @@ impl App {
             image_metas,
             existing_keys,
             has_foreign_archives,
+            refresh_position,
         }
     }
 
@@ -35990,6 +36127,7 @@ impl App {
             image_metas,
             existing_keys,
             has_foreign_archives,
+            refresh_position: _,
         } = prepared;
         let installed_items = items.len();
 
@@ -37070,6 +37208,7 @@ impl App {
         action: sidecar_restore::FirstDisplayAction,
         intent: StartupListIntent,
     ) -> bool {
+        let intent = self.capture_refresh_search(intent);
         if !self.open_request_owner_is_current(path, owner)
             || !self.snapshot_scope_allows_open(path, owner)
         {
@@ -37880,7 +38019,6 @@ impl App {
         if need_rebuild {
             let (items, image_metas, existing_keys) =
                 Self::build_pdf_page_rows(&pdf_path, &pages.pages);
-
             self.start_loading_items(
                 pdf_path.clone(),
                 items,
@@ -40395,6 +40533,7 @@ impl App {
                 true,
             );
         }
+        self.finish_refresh_search(&restore_intent);
         self.finish_main_list_open(restore_intent);
         self.finalize_direct_media_reader_order();
         if let Some(action) = navigation_after_hydration {

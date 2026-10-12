@@ -2551,9 +2551,12 @@ impl App {
             }),
             prefix.as_deref(),
         );
-        let Some(adoption) = self.prepare_main_list_adoption(navigation, destination) else {
+        let Some(mut adoption) = self.prepare_main_list_adoption(navigation, destination) else {
             return false;
         };
+        if let super::PreparedPhysicalListing::Zip { prepared, .. } = &listing {
+            self.reconcile_zip_refresh_adoption(&mut adoption, prepared);
+        }
         self.adopt_main_list_navigation(adoption, |app| {
             let _ = app.prepare_collection_main_context_change(session.identity.collection_id);
             app.save_leaving_rating_grid_position();
@@ -8214,6 +8217,14 @@ mod tests {
         if zip {
             assert!(app.items.iter().any(|item| matches!(item, GridItem::ZipDir { dir_prefix, .. } if dir_prefix == "chapter/")));
             app.zip_nav_enter("chapter/");
+            let refresh_route = app.facet_navigation.route().clone();
+            app.keymap = crate::keymap::Keymap::from_ini_str("[Grid]\nGridReload = F13\n");
+            assert!(history_grid_key(&mut app, egui::Key::F13).is_none());
+            poll_real_history_load(&mut app, Some(&source), None);
+            assert_eq!(app.zip_nav.as_ref().unwrap().current().join("/"), "chapter");
+            assert_eq!(app.facet_navigation.route(), &refresh_route);
+            assert_eq!(app.folder_nav_back_stack, outer_back);
+            assert_eq!(app.folder_nav_forward_stack, outer_forward);
             assert!(app.items.iter().any(|item| matches!(item, GridItem::ZipImage { entry_name, .. } if entry_name == "chapter/second.png")));
             assert_eq!(app.folder_nav_current_target(), Some(source_target.clone()));
             assert_eq!(app.folder_nav_back_stack, outer_back);

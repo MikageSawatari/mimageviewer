@@ -15,6 +15,13 @@ pub(crate) enum StartupListIntent {
     PageContinuation,
     ClassifyFolder,
     PreservePresentation,
+    /// Re-enumerate an adopted physical list, retaining its logical ZIP level and cursor.
+    RefreshList {
+        target: StartupListTarget,
+        cursor: Option<ListCursorHint>,
+        local_search: Option<Arc<LocalSearchSubmission>>,
+        search_draft: Option<String>,
+    },
     RestoreList {
         target: StartupListTarget,
         cursor: Option<ListCursorHint>,
@@ -89,6 +96,43 @@ enum MainListRestoreEvent {
 }
 
 impl App {
+    pub(super) fn capture_refresh_search(
+        &self,
+        mut intent: StartupListIntent,
+    ) -> StartupListIntent {
+        if let StartupListIntent::RefreshList {
+            local_search,
+            search_draft,
+            ..
+        } = &mut intent
+        {
+            *local_search = self.submitted_local_search();
+            *search_draft = self.show_search_bar.then(|| self.search_query.clone());
+        }
+        intent
+    }
+
+    pub(super) fn current_list_refresh_intent(&self) -> StartupListIntent {
+        let target = StartupListTarget::PhysicalList {
+            logical_path: self
+                .archive_source_override
+                .clone()
+                .or_else(|| self.current_folder.clone())
+                .unwrap_or_default(),
+            zip_prefix: self
+                .zip_nav
+                .as_ref()
+                .map(|nav| zip_prefix_string(nav.current())),
+        };
+        let cursor = self.current_main_list_cursor(&target);
+        StartupListIntent::RefreshList {
+            target,
+            cursor,
+            local_search: self.submitted_local_search(),
+            search_draft: self.show_search_bar.then(|| self.search_query.clone()),
+        }
+    }
+
     pub(crate) fn open_previous_startup_list(&mut self) {
         let StartupListRestore::V1 { target, cursor } = self
             .settings
@@ -377,6 +421,28 @@ impl App {
         self.close_fullscreen();
     }
 
+    pub(super) fn finish_refresh_search(&mut self, intent: &StartupListIntent) {
+        // PDF page search remains outside the released Ctrl+F scope.
+        if self.grid_is_pdf_pages() {
+            return;
+        }
+        if let StartupListIntent::RefreshList {
+            local_search,
+            search_draft,
+            ..
+        } = intent
+        {
+            if let Some(draft) = search_draft {
+                self.show_search_bar = true;
+                self.search_query = draft.clone();
+            }
+            if let Some(submitted) = local_search {
+                let ctx = self.edit_preview_repaint_ctx.clone().unwrap_or_default();
+                self.execute_submitted_local_search(&ctx, submitted.clone());
+            }
+        }
+    }
+
     pub(crate) fn finish_main_list_open(&mut self, intent: StartupListIntent) {
         if matches!(
             intent,
@@ -394,6 +460,11 @@ impl App {
         if let StartupListIntent::ResumeList {
             target: requested,
             cursor,
+        }
+        | StartupListIntent::RefreshList {
+            target: requested,
+            cursor,
+            ..
         } = &intent
             && same_list_target(requested, &target)
             && let Some(cursor) = cursor
@@ -404,7 +475,9 @@ impl App {
         }
         if !matches!(
             intent,
-            StartupListIntent::ExplicitList | StartupListIntent::RestoreList { .. }
+            StartupListIntent::ExplicitList
+                | StartupListIntent::RestoreList { .. }
+                | StartupListIntent::RefreshList { .. }
         ) {
             self.settings.save();
             return;

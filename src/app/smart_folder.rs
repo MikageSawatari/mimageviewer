@@ -2408,6 +2408,29 @@ impl App {
         restore_intent: super::StartupListIntent,
         navigation: Option<super::MainListNavigation>,
     ) -> Result<(), Option<ScannedDir>> {
+        self.begin_smart_physical_navigation_with_backing(
+            path.clone(),
+            path,
+            kind,
+            auto_fullscreen,
+            pre_scan,
+            source_index,
+            restore_intent,
+            navigation,
+        )
+    }
+
+    pub(super) fn begin_smart_physical_navigation_with_backing(
+        &mut self,
+        path: PathBuf,
+        backing: PathBuf,
+        kind: SmartChildKind,
+        auto_fullscreen: bool,
+        pre_scan: Option<ScannedDir>,
+        source_index: Option<usize>,
+        restore_intent: super::StartupListIntent,
+        navigation: Option<super::MainListNavigation>,
+    ) -> Result<(), Option<ScannedDir>> {
         let Some(mut state) = self.smart_physical_target_state(&path) else {
             return Err(pre_scan);
         };
@@ -2422,7 +2445,31 @@ impl App {
         if pre_scan.is_some() && kind != SmartChildKind::Folder {
             return Err(pre_scan);
         }
-        let source = match SmartChildSource::try_new(path.clone(), path) {
+        let preflight_kind = if matches!(
+            restore_intent.materialization_intent(),
+            super::StartupListIntent::RefreshList {
+                target: crate::settings::StartupListTarget::PhysicalList {
+                    zip_prefix: Some(_),
+                    ..
+                },
+                ..
+            }
+        ) || (path != backing
+            && backing
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("zip")))
+        {
+            SmartChildKind::Zip
+        } else if path != backing
+            && backing
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+        {
+            SmartChildKind::Pdf
+        } else {
+            kind
+        };
+        let source = match SmartChildSource::try_new(path, backing) {
             Ok(source) => source,
             Err(reason) => {
                 self.show_open_admission_refusal(reason);
@@ -2473,7 +2520,7 @@ impl App {
                 child: SmartPhysicalReady::Folder(scan),
             }
         } else {
-            let Ok(child) = self.begin_smart_child_preflight(&source, kind) else {
+            let Ok(child) = self.begin_smart_child_preflight(&source, preflight_kind) else {
                 return Err(None);
             };
             SmartFolderTransitionPhase::ChildPreflight {
@@ -2716,7 +2763,7 @@ impl App {
 
     /// Conversion belongs to the staged request, including a history target whose root has
     /// only been prepared offscreen and therefore has no visible source item index.
-    fn start_smart_archive_conversion_current(&mut self) {
+    pub(super) fn start_smart_archive_conversion_current(&mut self) {
         let Some(transition) = self.smart_folder_transition.as_ref() else {
             return;
         };
@@ -3562,14 +3609,14 @@ impl App {
         navigation: super::MainListNavigation,
         archive_commit: Option<super::SmartFolderArchiveCommit>,
     ) -> bool {
-        let restore_intent = match &child {
+        let restore_intent = self.capture_refresh_search(match &child {
             SmartPhysicalReady::Folder(scan) => restore_intent.for_scanned_folder(
                 auto_fullscreen
                     && self.settings.auto_fullscreen_image_folders_enabled()
                     && self.scanned_folder_is_image_book(&source.load_path, scan),
             ),
             _ => restore_intent.for_book(),
-        };
+        });
         if let SmartPhysicalReady::Error(reason) = &child {
             crate::logger::log(reason.log_line());
             self.show_feedback_toast(reason.message().to_owned());
@@ -3689,20 +3736,20 @@ impl App {
             }
             _ => None,
         };
-        if !matches!(
-            navigation.history,
-            super::MainHistoryOperation::SameLocation
-        ) {
+        if prefix.is_some() {
             destination = self.reconcile_main_list_saved_destination(
                 destination.location,
                 destination.route,
                 prefix.as_deref(),
             );
         }
-        let Some(adoption) = self.prepare_main_list_adoption(navigation, destination) else {
+        let Some(mut adoption) = self.prepare_main_list_adoption(navigation, destination) else {
             self.retire_smart_folder_payloads([Box::new(child) as RetiredSmartFolderPayload]);
             return false;
         };
+        if let SmartPhysicalReady::ZipPrepared(prepared) = &child {
+            self.reconcile_zip_refresh_adoption(&mut adoption, prepared);
+        }
         self.adopt_main_list_navigation(adoption, |app| {
             app.adopt_smart_child_session(request_id, root, target, &source);
             let hydration = app.install_adopted_smart_child_ready(

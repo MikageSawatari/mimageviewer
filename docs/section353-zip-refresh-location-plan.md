@@ -1,11 +1,11 @@
 ﻿# §1.353 書庫の全再読込で現在階層を保つ
 
-2026-10-12、`next-list` / `ea060b66e` 基点のコード調査。**設計レビュー待ち・未実装**。
+2026-10-12、`next-list` / `ea060b66e` 基点のコード調査。**R2 設計 ACCEPT、実装・targeted/check成功、full gate未完了**。
 実機の観測者はバックログ記載の利用者。エージェントはアプリを起動していない。
 正本項目: [next-release-backlog.md §1.353](next-release-backlog.md#1353-zip-の中の階層で最新の情報に更新ctrlf5-するとzip-の最上位の階層に戻る--利用者の実機確認-2026-10-08)。
 
 `001a0dabf` の独立設計レビューは **REVISE**。本改訂は P2 (子一覧の配送漏れ) と
-P3 (prefix が存在する場合の collapse／親 stack 変更) を反映した再レビュー用。未承認・未実装。
+P3 (prefix が存在する場合の collapse／親 stack 変更) を反映し、`1c313a2ec` の R2 設計レビューは **ACCEPT**。2026-10-12 の利用者指示で実装へ進む。
 
 ## 1. 原因と入口
 
@@ -102,7 +102,7 @@ bool、完了後の「root を表示してから階層へ入り直す」処理�
 6. 列挙失敗・取消・別要求への切替・stale は既存終端に従い、旧一覧の prefix／facet／帰路へ
    遅延結果を適用しない。兄弟 viewer の tree／receiver／cache を変更しない。
 
-所有する非同期要求と場所採用に関わるため、ユーザー指定に従い**この設計で実装前に止める**。
+所有する非同期要求と場所採用に関わるため、実装前の独立レビューで構造を承認済み。
 `ResumeList` の流用は、materializer が現状未対応であり、主一覧保存の意味も異なるので採らない。
 まれな失敗は割り切り (ログ + 通知 [+ 作り直し])。新しい retry／rollback は追加しない。
 
@@ -122,14 +122,14 @@ route 対応で再整合し、Backspace は新 tree の実効親を使う。node
 
 ## 3. 実装範囲・検収
 
-予定: `src/app.rs`、`src/app/startup_list_restore.rs`、`src/zip_tree.rs`、
+実装対象: `src/app.rs`、`src/app/startup_list_restore.rs`、`src/zip_tree.rs`、
 `src/app/top_level_grid_view.rs`、`src/app/collection_grid.rs`、`src/app/smart_folder.rs`、
 `src/global_search_ui.rs`、検索物理子を扱う `src/ui_main.rs`、`src/app/tests.rs`。
 各 staged producer の要求生成・準備・採用へ `RefreshList` を明示的に接続する。
 detached 述語／viewport は変更しない。
 実装時に `docs/virtual-folders.md` の現在位置と fallback の仕様も更新する。
 
-予定回帰 (未実行):
+回帰範囲:
 
 - 純粋 state: 同階層、root、nested ZIP、wrapper collapse、深い階層消失→直近祖先、
   不正 prefix 拒否、Backspace stack。
@@ -148,4 +148,30 @@ detached 述語／viewport は変更しない。
   query／drill／facet／帰路の保持を実 Action／メニュー入口で検査。
 
 検証所有者: 実装担当。targeted → fmt → 通常／portable core check → 項目最後に full gate 一回。
-アプリ起動・コミットなし。今回は文書のみ、テスト追加 0 件・実行 0 件・build 0 件。
+アプリ起動・コミットなし。検証実数は末尾へ記録する。
+
+### R2 追加回帰と実装レビュー
+
+Global Search は完了・非 truncated・エラーなし・rating prepare の最終 batch ACK 後だけ祖先へ戻す。最初の batch に現在階層のヒットがなく後続 batch で現れる handler 回帰で drill／facet を保持する。コンテナ全体が消えた場合は既存の drill 解除で Flat／Aggregated へ戻す。
+
+実装レビューで、新しい実効親の無条件 facet frame を場所変更時に除去する問題を修正した。frame は帰路として保持し、badge／手動復元は有効条件だけを対象とする。Smart の更新は論理 source と既存 backing を同じ既存 owner に渡し、変換元の metadata 再検証・再変換を行わず mounted 子を再列挙する。実 Folder の更新も既存 PhysicalHistory worker を使う。
+
+非モーダル更新中の Ctrl+F は最新の提出済み条件と入力 draft を成功採用直前に捕捉し、同じ intent の既存 hydration 終端から新しい rows に一回再実行する。更新受理時の古い条件を利用者の再提出・close の上へ戻さない。
+
+独立実装レビュー (`gpt-6.1-sol` / `xhigh`、2026-10-12) は修正後 **ACCEPT（コードレビュー）**。未解消の重要所見なし。targeted/checkは成功、full gateはrelease入力不足で未完了。PDF ページの Ctrl+F 禁止、warm verifier と起動復元記録の従来の意味は維持する。
+
+### 検証記録 (2026-10-12)
+
+追加回帰12件すべて成功。関連 targeted は28件成功（追加facet回帰2件の再実行を含む、計40実行・重複除外38件）。既存の ZIP 再入場3件、通常／Collectionの変換cache更新2件、Collection／Ratingの実ZIP更新・外側履歴2件、PDF2件、EPUB2件、facet15件、detached cacheのmain非干渉1件、park/remount1件を確認した。F5／Ctrl+F5はGridReloadへの明示割当で検証。既定キーは変更していない。
+
+cold target の最初のnative buildがMSBuild段階で失敗したため、同じ pinned libjpeg-turbo 3.1.0 をworktreeの `target/native-verification/turbojpeg/` へ実コピーしてstatic/SIMDで構築した。依存版・Cargo設定は変更していない。検証コマンドだけ `TURBOJPEG_SOURCE=explicit`、`TURBOJPEG_LIB_DIR`／`TURBOJPEG_INCLUDE_DIR` をそのinstallへ設定し、MSVCのcanonical include経路を補う `CXXFLAGS=/I G:\home\mimageviewer-nextlist\target\native-verification\turbojpeg\install\include` を使用。Cargo同時ジョブは2。初回テスト実行のDLL不足は既存手順どおりFFmpeg／VCRT DLLの実コピーで解消した。
+
+試験fixtureのキー受付前・別場所採用前の未完了待ちと、直接深い階層へ跳んだ旧親stackの期待を修正し、全12件を再実行して成功を確認した。実製品の同期待ち／入力制限は追加していない。
+
+`cargo fmt --check`、通常／portable の `cargo check -p mimageviewer --bin mimageviewer-core`、UI glyph検査（問題0件）、`git diff --check` は成功。full gate は指定の一回を実行し、以下の前提不足で停止。
+
+変更ファイル: `src/app.rs`、`src/app/startup_list_restore.rs`、`src/app/top_level_grid_view.rs`、`src/app/collection_grid.rs`、`src/app/smart_folder.rs`、`src/app/facet_navigation.rs`、`src/app/tests.rs`、`src/global_search_ui.rs`、`src/zip_tree.rs`（Rust9）。文書は本書、`virtual-folders.md`、`section375-operation-reconcile-plan.md`、`section373-book-append-undo-plan.md`、`README.md`、`next-release-backlog.md`（6）。§1.375／§1.373の実装は行わず、R2指摘を設計へ反映して再レビューを待つ。
+
+`powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-full.ps1 -SuppressCrashDialogs` は **一回だけ実行、exit 101、テスト実行0件**。workspaceのlauncher build scriptが `target/release/mimageviewer-core.exe`、`mimageviewer-remote.exe`、`mimageviewer-epub-pdf.exe` の欠落を検出した。coreの型／回帰の失敗ではなく、全体gateのビルド前提が未成立。vendor3 crateの後続gateも未実行。指定に従いfullを再実行していない。ログ: [section1353-full.log](../target/section1353-full.log)。
+
+cold worktreeにrelease入力が必要という前提不足でここを安全な引継ぎ区切りにする。確認用 `build-dev.ps1` binaryは全体gate前提未成立のため未作成。アプリ起動・コミットなし。coordinatorがrelease入力3exeを準備し、未完了gateと確認用buildを引き継ぐ。失敗をPASS扱いにしない。

@@ -7,6 +7,9 @@
 `001a0dabf` の独立設計レビューは **REVISE**。本改訂は表示投影、context ごとの購読、
 通知 kind／path、段階の受入範囲を確定する再レビュー用。指摘は通常操作として構造で扱う。
 
+R2 (`1c313a2ec`) は **REVISE**。実 Folder の mtime だけの差分で親一覧を再 install しない
+§1.314 の契約を以下へ反映。実装は再レビュー後。
+
 ## 1. 原因の確定 (コード上)
 
 `handle_delete_key` (ui_dialogs/context_menu.rs:2246) → `request_delete_confirm` →
@@ -76,6 +79,12 @@ viewer context。folder、scan options、一覧世代、scan 由来の観測 row
 動画／音声 sidecar、folder pin／代表画像と依存 stamp、facet／rating を含む採用投影を記録する。
 表示用 index は proof の identity に使わず、stable row key／asset dependency を使う。
 設定・rating／pin等の revision が変わった候補を旧 projection と比較して合格にしない。
+
+ただし **実 Folder の mtime だけ**は既存 `FolderScanSignature::same_listing` (§1.314) と
+同じ比較除外を維持する。完全精度の観測 stamp は進めるが、表示 metadata・sort 用metadata・
+代表要求 stamp は前回採用値を使って投影比較する。この例外は実 Folder に限り、ZIP/PDF等の
+コンテナファイル、通常ファイル、追加・削除・改名・サイズ／種別／依存変更へ広げない。
+新しい代表固定 state は作らず、既存一覧 owner の観測値と採用表示値を使う。
 
 削除 receipt は raw rows の成功差分と「現在行から success を取り除いた暫定投影」を
 同時に作る。この段階は **要照合** とし、完了した projection proof を持つ状態と区別する。
@@ -161,8 +170,9 @@ OS watcher 登録と初期 scan は worker で、購読を開始してから sca
 | --- | --- |
 | Create／Remove／`Modify(Name)` | Namespace。raw rows と投影を全照合。操作結果の後と一致すれば再 install 不要。改名を一律 Content にしない |
 | `Modify(Data)`／ファイル属性・時刻等の `Modify(Metadata)` | Content/Metadata と対象 path を保持。残存 row または代表／sidecar依存への通知は stamp一致でも通常更新が必要。成功削除で消えた exact source だけなら、消失と投影一致を確認して既読にできる |
-| directory 自身の Metadata | 子一覧／依存投影の照合へ。directory mtime だけを「残存画像の上書き」としない。対象が曖昧なら Unknown |
-| Modify(Any)／Other／path不明／watch error／集約上限超過 | Unknown。raw hash一致を免除理由にせず、一度 full prepare／採用する |
+| 対象が確定した実 directory の Metadata／Modify(Any) | worker が前後 scan の typed directory と通知pathを照合。mtimeだけの変化は観測値だけを更新し、§1.314の表示値を維持。再installを強制しない。追加・削除・改名／種別変化は通常照合 |
+| ファイルへの Modify(Any) | 内容変更を否定できないのでContent。stamp一致だけで更新を抑止しない |
+| Other／path不明／directoryと確定できないModify(Any)／watch error／coverage不明／集約上限超過 | Unknown。raw hash一致を免除理由にせず、一度 full prepare／採用する |
 | Access | 既存どおり一覧 mutation 対象外 |
 
 `observed_watch_sequence` と `reconciled_watch_sequence` はこの同じ購読の記録。
@@ -232,6 +242,10 @@ partial cancel、stack・facet・同名 sidecar、全件削除、複数 context�
   B再 mount で更新。A→B→A、park中の同サイズ上書き (directory mtime不変)、context破棄。
 - Remove／Name と残存 B の Data／Metadata が同じ batch に混在、分割 rename、Unknown、
   cutoff後に同pathの内容通知、modal中の通知のみ (次の通知なし)、subscription再作成。
+- §1.314既存handler回帰を維持。子フォルダ内の.part追加・削除による実Folder mtimeだけの
+  `Modify(Any)`、および自己Delete通知との同batch混在で、親一覧の追加install 0回。
+  観測stampのみ進み、表示metadata・sort順・代表要求stamp・textureを維持する。
+  ファイルModify(Any)／対象不明／watch errorは更新される対照例も検査する。
 
 第二段は改名／D&D／整理先move・copy のイベント先着／終端先着、外部変更混在、
 Shell 衝突名を別に検証する。`Modify(Name)` だけの重複通知で二重 install しないことと、
