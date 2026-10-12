@@ -1480,6 +1480,25 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 - 症状パッチではなく所有境界の構造追加にできるかを、実装前の設計 lead／独立 reviewer
   の明示合意に委ねる。製品コード変更・アプリ起動・コミットは行っていない。
 
+**独立設計レビューへの改訂（2026-10-12、対象 `6432e8e04`）**:
+利用者が提示したレビューは REVISE（P1 0件、P2 3件、P3 1件）。単一 context owner、
+既存 navigation、exact demand 一般化は症状パッチではなく構造追加と評価されたが、
+実装着手への全面的な構造合意は保留。以下を設計書へ反映し、再レビュー待ちとした。
+
+- `next-book` `5fb135810` の構成正本に合わせ、一覧は可視実ページのみ。
+  白紙は対応実ページセル内の補助表示に限り、独立セル／identity／選択／総数／landing を作らない。
+  上記初回記録の「白紙 landing」の検討は撤回し、構成との統合確認は実ページ projection を対象にする。
+- toggle は FsCommon、一覧 scope は Global／FsCommon／FsPageOverview。
+  一覧の許可 Action 集合と優先順位を dispatch・競合表示・ヘルプ・リングで共有する。
+  toggle=Enter と Confirm の競合を同時実行可能集合により表示する。
+- passive に可視実ページ全列の immutable metadata を共有し、画像保持だけを有界にする。
+  park後のresize／DPI変更で露出した未生成セルも、描画した identity へ最初の一クリックで着地する。
+- 入力なしの repaint／resize／サムネ終端では前面化せず、通常resumeはwindow bindingと
+  生存HWND／incarnationを維持する。focus移動後の配送済み stamped edge は元contextへ適用し、
+  current-levelで破棄／再活性化しない。独立静止画窓のF12無効と連動窓migrationの受入を分ける。
+
+設計書 §13 に指摘別の対応と受入ケースを記録。今回も製品コード・実装・起動・コミットなし。
+
 ### 2026-10-11 §1.371: 評価集合の公開を安定context境界へ移す構造合意（設計段階）
 
 利用者が提示した独立再レビュー（対象 `94bc236d1`、rating-filter-fullscreen-plan R2）は、
