@@ -125,52 +125,15 @@ bool point_in_rect(const RECT& rect, POINT pt) {
 }
 
 void layout_editor_child(HWND frame_hwnd, HWND child_hwnd) {
-    if (!frame_hwnd || !child_hwnd || !IsWindow(frame_hwnd) || !IsWindow(child_hwnd)) {
-        return;
-    }
-    RECT client{};
-    if (!GetClientRect(frame_hwnd, &client)) {
-        return;
-    }
-    const int title_h = editor_titlebar_height(frame_hwnd);
-    const RECT bounds = miv::editor_child_bounds(client, GetDpiForWindow(frame_hwnd));
-    const int width = bounds.right - bounds.left;
-    const int height = bounds.bottom - bounds.top;
-    SetWindowPos(child_hwnd,
-                 nullptr,
-                 0,
-                 title_h,
-                 width,
-                 height,
-                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
-    RedrawWindow(child_hwnd,
-                 nullptr,
-                 nullptr,
-                 RDW_INVALIDATE | RDW_ALLCHILDREN);
+    if (!miv::layout_normal_editor_child(frame_hwnd, child_hwnd)) return;
+    RedrawWindow(child_hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN);
 }
 
 bool resize_frame_for_plugin_client(HWND frame_hwnd, int plugin_w, int plugin_h) {
     if (!frame_hwnd || !IsWindow(frame_hwnd) || plugin_w <= 0 || plugin_h <= 0) {
         return false;
     }
-    const int title_h = editor_titlebar_height(frame_hwnd);
-    if (native_editor_frame(frame_hwnd)) {
-        return miv::resize_normal_editor_frame(frame_hwnd, plugin_w, plugin_h);
-    }
-    RECT outer{0, 0, plugin_w, plugin_h + title_h};
-    DWORD style = static_cast<DWORD>(GetWindowLongPtrW(frame_hwnd, GWL_STYLE));
-    DWORD ex_style = static_cast<DWORD>(GetWindowLongPtrW(frame_hwnd, GWL_EXSTYLE));
-    UINT dpi = GetDpiForWindow(frame_hwnd);
-    if (dpi == 0) dpi = 96;
-    AdjustWindowRectExForDpi(&outer, style, FALSE, ex_style, dpi);
-    SetWindowPos(frame_hwnd,
-                 nullptr,
-                 0,
-                 0,
-                 std::max<LONG>(1, outer.right - outer.left),
-                 std::max<LONG>(1, outer.bottom - outer.top),
-                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
-    return true;
+    return miv::resize_normal_editor_frame(frame_hwnd, plugin_w, plugin_h);
 }
 
 void hide_editor_surface_from_user(HWND hwnd, miv::PluginLoader* loader) {
@@ -297,11 +260,17 @@ LRESULT CALLBACK BridgeViewContainerProc(HWND hwnd, UINT msg, WPARAM wparam, LPA
         return 0;
     }
     const bool native_frame = native_editor_frame(hwnd);
+    if (native_frame && loader &&
+        (msg == miv::editor_taskbar_button_created_message() || msg == miv::editor_taskbar_created_message())) {
+        loader->sync_gui_taskbar(msg == miv::editor_taskbar_created_message());
+        return 0;
+    }
     if (msg == WM_SYSCOMMAND) {
         auto result = miv::handle_editor_system_command(native_frame, wparam,
             !native_frame || !loader || loader->gui_surface_should_show(),
             [hwnd, loader] { hide_editor_surface_from_user(hwnd, loader); },
-            [loader] { if (loader) loader->publish_gui_normal_rect(); });
+            [loader] { if (loader) loader->publish_gui_normal_rect(); },
+            !loader || loader->editor_show_in_taskbar());
         if (result) return *result;
     }
     if (native_frame && msg == WM_DPICHANGED) {
@@ -314,7 +283,7 @@ LRESULT CALLBACK BridgeViewContainerProc(HWND hwnd, UINT msg, WPARAM wparam, LPA
         if (loader) {
             layout_editor_child(hwnd, reinterpret_cast<HWND>(loader->gui_plugin_host_hwnd()));
             loader->handle_editor_drag_tick(msg);
-            if (!loader->editor_frame_mutating()) loader->handle_editor_window_size();
+            loader->handle_editor_window_size();
         }
         RedrawWindow(hwnd,
                      nullptr,
@@ -425,7 +394,13 @@ LRESULT CALLBACK BridgeViewContainerProc(HWND hwnd, UINT msg, WPARAM wparam, LPA
         // side polls the actual foreground process and sends set_gui_app_active
         // when the group really leaves or re-enters the foreground.
     }
-    return DefWindowProcW(hwnd, msg, wparam, lparam);
+    const LRESULT result = DefWindowProcW(hwnd, msg, wparam, lparam);
+    if (native_frame && loader) {
+        const auto* position = msg == WM_WINDOWPOSCHANGED ? reinterpret_cast<WINDOWPOS*>(lparam) : nullptr;
+        if (msg == WM_SYSCOMMAND || (position && (position->flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW))))
+            loader->sync_gui_taskbar();
+    }
+    return result;
 }
 
 LRESULT CALLBACK BridgePluginHostProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
@@ -528,7 +503,7 @@ BridgeEditorWindows create_bridge_view_container(const miv::GuiWindowOptions& op
         return {};
     }
     const DWORD style = miv::editor_frame_style(options.unowned, options.resizable);
-    const DWORD ex_style = miv::editor_taskbar_ex_style(WS_EX_WINDOWEDGE, options.unowned && options.show_in_taskbar);
+    const DWORD ex_style = miv::editor_ex_style(WS_EX_WINDOWEDGE, options.unowned);
     HWND dpi_reference = options.unowned ? reinterpret_cast<HWND>(options.main_hwnd) : owner_hwnd;
     UINT dpi = dpi_reference ? GetDpiForWindow(dpi_reference) : GetDpiForSystem();
     if (dpi == 0) dpi = 96;
@@ -1604,59 +1579,26 @@ bool PluginLoader::show_gui(const GuiWindowOptions& options, bool visible, std::
     view_plugin_host_hwnd_ = attach_hwnd;
     editor_slot_id_ = options.slot_id;
     view_container_hwnd_snapshot_.store(frame_hwnd, std::memory_order_release);
+    if (options.unowned) gui_taskbar_ = std::make_unique<EditorTaskbar>(frame_hwnd, options.show_in_taskbar);
     blog("show_gui: attached ok");
 
     // attached 後に推奨サイズで onSize を呼んで「このサイズで描画して」と通知する。
     // これも描画開始トリガとして必要なプラグインが多い。
     Steinberg::ViewRect rect{};
     if (miv::editor_uses_saved_outer_size(options.unowned, options.resizable, options.has_initial_size)) {
-        if (HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
-            container_hwnd && IsWindow(container_hwnd)) {
-            layout_editor_child(container_hwnd, reinterpret_cast<HWND>(view_plugin_host_hwnd_));
-        }
-        HWND plugin_hwnd = reinterpret_cast<HWND>(view_plugin_host_hwnd_);
-        RECT client{};
-        if (plugin_hwnd && IsWindow(plugin_hwnd) && GetClientRect(plugin_hwnd, &client)) {
-            uint32_t width = static_cast<uint32_t>(std::max<LONG>(1, client.right - client.left));
-            uint32_t height = static_cast<uint32_t>(std::max<LONG>(1, client.bottom - client.top));
-            Steinberg::ViewRect restored_rect{0,
-                                              0,
-                                              static_cast<Steinberg::int32>(width),
-                                              static_cast<Steinberg::int32>(height)};
+        if (const auto allocated = layout_normal_editor_child(frame_hwnd, attach_hwnd)) {
             if (options.unowned) {
-                view_->checkSizeConstraint(&restored_rect);
-                const int checked_w = std::max<Steinberg::int32>(1, restored_rect.right - restored_rect.left);
-                const int checked_h = std::max<Steinberg::int32>(1, restored_rect.bottom - restored_rect.top);
-                resize_frame_for_plugin_client(frame_hwnd, checked_w, checked_h);
-                layout_editor_child(frame_hwnd, attach_hwnd);
-                width = static_cast<uint32_t>(checked_w);
-                height = static_cast<uint32_t>(checked_h);
+                Steinberg::ViewRect restored{0, 0, allocated->cx, allocated->cy};
+                view_->checkSizeConstraint(&restored);
+                resize_frame_for_plugin_client(frame_hwnd, restored.right - restored.left, restored.bottom - restored.top);
             }
-            view_->onSize(&restored_rect);
-            last_gui_width_ = width;
-            last_gui_height_ = height;
-            blog("show_gui: onSize restored host size=%ux%u", width, height);
-        } else {
-            last_gui_width_ = 0;
-            last_gui_height_ = 0;
-            blog("show_gui: restored-size onSize failed");
+            notify_gui_client(true);
         }
     } else if (view_->getSize(&rect) == Steinberg::kResultOk) {
-        const int preferred_w = std::max<Steinberg::int32>(1, rect.right - rect.left);
-        const int preferred_h = std::max<Steinberg::int32>(1, rect.bottom - rect.top);
-        blog("show_gui: getSize=%dx%d, resize container, onSize", preferred_w, preferred_h);
-        if (HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
-            container_hwnd && IsWindow(container_hwnd)) {
-            resize_frame_for_plugin_client(container_hwnd, preferred_w, preferred_h);
-            layout_editor_child(container_hwnd, reinterpret_cast<HWND>(view_plugin_host_hwnd_));
-        }
-        view_->onSize(&rect);
-        last_gui_width_ = static_cast<uint32_t>(preferred_w);
-        last_gui_height_ = static_cast<uint32_t>(preferred_h);
-        blog("show_gui: onSize done");
+        resize_frame_for_plugin_client(frame_hwnd, std::max<Steinberg::int32>(1, rect.right - rect.left),
+                                      std::max<Steinberg::int32>(1, rect.bottom - rect.top));
+        notify_gui_client(true);
     } else {
-        last_gui_width_ = 0;
-        last_gui_height_ = 0;
         blog("show_gui: getSize failed");
     }
     if (suppress_host_resize_for_restore) {
@@ -1669,7 +1611,7 @@ bool PluginLoader::show_gui(const GuiWindowOptions& options, bool visible, std::
     if (HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
         container_hwnd && IsWindow(container_hwnd)) {
         const bool should_show = gui_surface_should_show();
-        ShowWindow(container_hwnd, should_show ? SW_SHOWNOACTIVATE : SW_HIDE);
+        show_gui_surface(should_show ? SW_SHOWNOACTIVATE : SW_HIDE);
         if (should_show) {
             refresh_gui_surface(container_hwnd);
         }
@@ -1698,31 +1640,21 @@ void PluginLoader::set_user_resizing(bool active) {
     }
 }
 
-void PluginLoader::refresh_gui_surface(void* container_hwnd_ptr) {
-    HWND container_hwnd = reinterpret_cast<HWND>(container_hwnd_ptr);
-    if (!container_hwnd || !IsWindow(container_hwnd)) {
-        return;
-    }
-    HWND plugin_hwnd = reinterpret_cast<HWND>(view_plugin_host_hwnd_);
-    layout_editor_child(container_hwnd, plugin_hwnd);
-    if (view_attached_ && view_) {
-        RECT client{};
-        if (plugin_hwnd && IsWindow(plugin_hwnd) && GetClientRect(plugin_hwnd, &client)) {
-            const uint32_t width = static_cast<uint32_t>(std::max<LONG>(1, client.right - client.left));
-            const uint32_t height = static_cast<uint32_t>(std::max<LONG>(1, client.bottom - client.top));
-            Steinberg::ViewRect rect{0,
-                                     0,
-                                     static_cast<Steinberg::int32>(width),
-                                     static_cast<Steinberg::int32>(height)};
+bool PluginLoader::notify_gui_client(bool force_notify) {
+    if (!view_attached_ || !view_) return false;
+    return apply_normal_editor_client(reinterpret_cast<HWND>(view_container_hwnd_),
+        reinterpret_cast<HWND>(view_plugin_host_hwnd_), last_gui_width_, last_gui_height_, force_notify,
+        [this](SIZE allocated) {
+            Steinberg::ViewRect rect{0, 0, allocated.cx, allocated.cy};
             view_->onSize(&rect);
-            last_gui_width_ = width;
-            last_gui_height_ = height;
-        }
-    }
-    RedrawWindow(container_hwnd,
-                 nullptr,
-                 nullptr,
-                 RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW | RDW_FRAME);
+        });
+}
+
+void PluginLoader::refresh_gui_surface(void* container_hwnd_ptr) {
+    HWND container = reinterpret_cast<HWND>(container_hwnd_ptr);
+    if (!read_normal_editor_client(container)) return;
+    notify_gui_client(true);
+    RedrawWindow(container, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW | RDW_FRAME);
 }
 
 void PluginLoader::set_gui_surface_visible_state(bool visible) {
@@ -1841,7 +1773,7 @@ void PluginLoader::sync_gui_main_visibility() {
     if (!container || !IsWindow(container)) return;
     const bool show = gui_surface_should_show();
     if (!!IsWindowVisible(container) != show) {
-        ShowWindow(container, show ? SW_SHOWNA : SW_HIDE);
+        show_gui_surface(show ? SW_SHOWNA : SW_HIDE);
         if (show) refresh_gui_surface(container);
     }
 }
@@ -1849,8 +1781,7 @@ void PluginLoader::sync_gui_main_visibility() {
 void PluginLoader::publish_gui_normal_rect() {
     // Call sites run on the GUI thread. Drag completion owns the final snapshot;
     // do not stream partial interactive positions through stdout on every step.
-    if (!is_gui_thread() || !view_main_hwnd_ || editor_drag_active_ ||
-        geometry_publication_ == GeometryPublication::FrameMutation) return;
+    if (!is_gui_thread() || !view_main_hwnd_ || editor_drag_active_) return;
     HWND container = reinterpret_cast<HWND>(view_container_hwnd_);
     if (auto normal = read_normal_screen_rect(container))
         send_event_gui_normal_rect(editor_slot_id_, reinterpret_cast<uint64_t>(container), *normal);
@@ -1874,7 +1805,7 @@ void PluginLoader::user_hide_gui() {
     }
     gui_visibility_.request(false);
     send_event_gui_user_hidden(editor_slot_id_, reinterpret_cast<uint64_t>(container), normal);
-    ShowWindow(container, SW_HIDE);
+    show_gui_surface(SW_HIDE);
 }
 
 void PluginLoader::set_gui_taskbar(bool value) {
@@ -1886,19 +1817,33 @@ void PluginLoader::set_gui_taskbar(bool value) {
     if (!view_main_hwnd_) return; // ordinary VST editors retain their existing policy
     HWND container = reinterpret_cast<HWND>(view_container_hwnd_);
     if (!container || !IsWindow(container)) return;
-    const DWORD current_ex = DWORD(GetWindowLongPtrW(container, GWL_EXSTYLE));
-    if (editor_taskbar_ex_style(current_ex, value) == current_ex) return;
-    geometry_publication_ = GeometryPublication::FrameMutation;
-    const bool updated = update_editor_taskbar(container, value, [this] { return gui_surface_should_show(); });
-    geometry_publication_ = GeometryPublication::Live;
-    if (!updated) {
-        blog("EffeTune taskbar style update failed err=%lu", GetLastError());
-        send_event_gui_warning(editor_slot_id_, reinterpret_cast<uint64_t>(container),
-                               "EffeTune taskbar style update failed; previous saved position retained");
+    if (!gui_taskbar_ || gui_taskbar_->enabled() == value) return;
+    gui_taskbar_->set_enabled(value);
+    if (editor_taskbar_requires_user_hide(value, IsIconic(container) != FALSE)) {
+        user_hide_gui();
         return;
     }
-    layout_editor_child(container, reinterpret_cast<HWND>(view_plugin_host_hwnd_));
-    publish_gui_normal_rect();
+    sync_gui_taskbar();
+}
+
+void PluginLoader::sync_gui_taskbar(bool shell_recreated) {
+    if (!is_gui_thread() || !gui_taskbar_) return;
+    HWND container = reinterpret_cast<HWND>(view_container_hwnd_);
+    if (!container || !IsWindow(container)) return;
+    HRESULT hr = shell_recreated ? gui_taskbar_->shell_recreated() : S_OK;
+    if (SUCCEEDED(hr)) hr = gui_taskbar_->sync(IsWindowVisible(container) != FALSE, gui_surface_should_show());
+    if (FAILED(hr)) {
+        blog("EffeTune taskbar membership update failed hr=0x%lx", static_cast<unsigned long>(hr));
+        send_event_gui_warning(editor_slot_id_, reinterpret_cast<uint64_t>(container),
+                               "EffeTune taskbar membership could not be updated");
+    }
+}
+
+void PluginLoader::show_gui_surface(int command) {
+    HWND container = reinterpret_cast<HWND>(view_container_hwnd_);
+    if (!container || !IsWindow(container)) return;
+    ShowWindow(container, command);
+    sync_gui_taskbar();
 }
 
 void PluginLoader::handle_editor_dpi_change(uint32_t dpi, const RECT* suggested) {
@@ -1914,8 +1859,7 @@ void PluginLoader::handle_editor_dpi_change(uint32_t dpi, const RECT* suggested)
     if (suggested && !IsIconic(container))
         SetWindowPos(container, nullptr, suggested->left, suggested->top, 0, 0,
                      SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-    layout_editor_child(container, reinterpret_cast<HWND>(view_plugin_host_hwnd_));
-    view_->onSize(&size);
+    notify_gui_client(true);
     publish_gui_normal_rect();
 }
 
@@ -1929,7 +1873,8 @@ void PluginLoader::activate_gui() {
     if (!gui_surface_should_show()) return;
     HWND container = reinterpret_cast<HWND>(view_container_hwnd_);
     if (!container || !IsWindow(container)) return;
-    ShowWindow(container, view_main_hwnd_ && IsIconic(container) ? SW_RESTORE : SW_SHOW);
+    show_gui_surface(view_main_hwnd_ && IsIconic(container) ? SW_RESTORE : SW_SHOW);
+    refresh_gui_surface(container);
     if (SetForegroundWindow(container)) {
         HWND child = reinterpret_cast<HWND>(view_plugin_host_hwnd_);
         if (child && IsWindow(child)) SetFocus(child);
@@ -1951,7 +1896,7 @@ void PluginLoader::set_gui_visibility_checked(bool visible, GuiGateSnapshot perm
     if (!visible) {
         publish_gui_normal_rect();
         gui_visibility_.request(false);
-        ShowWindow(container, SW_HIDE);
+        show_gui_surface(SW_HIDE);
         reply("hidden");
         return;
     }
@@ -1961,7 +1906,7 @@ void PluginLoader::set_gui_visibility_checked(bool visible, GuiGateSnapshot perm
         reply("cancelled");
         return;
     }
-    ShowWindow(container, SW_SHOWNA);
+    show_gui_surface(SW_SHOWNA);
     // ShowWindow can call plugin/window code reentrantly. Recheck before
     // accepting the first show and before activation, without a queued raise.
     if (!IsWindow(main) || !permit.permits(gui_gate_->snapshot(), IsIconic(main) != FALSE, IsWindowVisible(main) != FALSE)) {
@@ -2006,7 +1951,7 @@ void PluginLoader::set_gui_visible(bool visible) {
     HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
     if (container_hwnd && IsWindow(container_hwnd)) {
         const bool should_show = gui_surface_should_show();
-        ShowWindow(container_hwnd, should_show ? SW_SHOWNA : SW_HIDE);
+        show_gui_surface(should_show ? SW_SHOWNA : SW_HIDE);
         if (should_show) {
             refresh_gui_surface(container_hwnd);
         }
@@ -2115,7 +2060,7 @@ void PluginLoader::set_gui_app_active(bool active) {
     HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
     if (container_hwnd && IsWindow(container_hwnd)) {
         if (gui_visibility_.requested() && gui_app_active_) {
-            ShowWindow(container_hwnd, SW_SHOWNA);
+            show_gui_surface(SW_SHOWNA);
             refresh_gui_surface(container_hwnd);
         } else if (gui_visibility_.requested()) {
             // Do not hide here: several D3D-backed plugin editors repaint as a
@@ -2133,7 +2078,7 @@ void PluginLoader::set_gui_app_active(bool active) {
                          0,
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
         } else {
-            ShowWindow(container_hwnd, SW_HIDE);
+            show_gui_surface(SW_HIDE);
         }
         blog("set_gui_app_active: bridge surface hwnd=0x%llx active=%d visible=%d",
              static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(container_hwnd)),
@@ -2158,66 +2103,20 @@ void PluginLoader::handle_editor_window_size() {
         return;
     }
 
-    HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
-    if (!view_attached_ || !view_ || !container_hwnd || !IsWindow(container_hwnd)) {
-        return;
-    }
-    HWND plugin_hwnd = reinterpret_cast<HWND>(view_plugin_host_hwnd_);
-    layout_editor_child(container_hwnd, plugin_hwnd);
-    RECT client{};
-    if (!plugin_hwnd || !IsWindow(plugin_hwnd) || !GetClientRect(plugin_hwnd, &client)) {
-        return;
-    }
-    const uint32_t width = static_cast<uint32_t>(std::max<LONG>(1, client.right - client.left));
-    const uint32_t height = static_cast<uint32_t>(std::max<LONG>(1, client.bottom - client.top));
-    uint32_t constrained_width = width;
-    uint32_t constrained_height = height;
-    Steinberg::ViewRect constrained_rect{0,
-                                         0,
-                                         static_cast<Steinberg::int32>(width),
-                                         static_cast<Steinberg::int32>(height)};
-    view_->checkSizeConstraint(&constrained_rect);
-    if (constrained_rect.right > constrained_rect.left &&
-        constrained_rect.bottom > constrained_rect.top) {
-        constrained_width = static_cast<uint32_t>(std::max<Steinberg::int32>(
-            1, constrained_rect.right - constrained_rect.left));
-        constrained_height = static_cast<uint32_t>(std::max<Steinberg::int32>(
-            1, constrained_rect.bottom - constrained_rect.top));
-    }
-    if ((constrained_width != width || constrained_height != height) &&
-        resize_frame_for_plugin_client(container_hwnd,
-                                       static_cast<int>(constrained_width),
-                                       static_cast<int>(constrained_height))) {
-        layout_editor_child(container_hwnd, plugin_hwnd);
-        if (!GetClientRect(plugin_hwnd, &client)) {
-            return;
-        }
-        constrained_width = static_cast<uint32_t>(std::max<LONG>(1, client.right - client.left));
-        constrained_height = static_cast<uint32_t>(std::max<LONG>(1, client.bottom - client.top));
-        blog("editor host resize constrained plugin=\"%s\" requested=%ux%u constrained=%ux%u",
-             plugin_name_.empty() ? "(unknown)" : plugin_name_.c_str(),
-             width,
-             height,
-             constrained_width,
-             constrained_height);
-    }
-    if (constrained_width == last_gui_width_ && constrained_height == last_gui_height_) {
-        return;
-    }
-    last_gui_width_ = constrained_width;
-    last_gui_height_ = constrained_height;
-    if (plug_frame_) {
-        plug_frame_->mark_user_resize();
-    }
-    Steinberg::ViewRect rect{0,
-                             0,
-                             static_cast<Steinberg::int32>(constrained_width),
-                             static_cast<Steinberg::int32>(constrained_height)};
-    view_->onSize(&rect);
-    RedrawWindow(container_hwnd,
-                 nullptr,
-                 nullptr,
-                 RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME);
+    HWND container = reinterpret_cast<HWND>(view_container_hwnd_);
+    HWND child = reinterpret_cast<HWND>(view_plugin_host_hwnd_);
+    if (!view_attached_ || !view_) return;
+    const auto allocated = layout_normal_editor_child(container, child);
+    if (!allocated) return;
+    Steinberg::ViewRect constrained{0, 0, allocated->cx, allocated->cy};
+    view_->checkSizeConstraint(&constrained);
+    const int width = constrained.right - constrained.left, height = constrained.bottom - constrained.top;
+    if (width > 0 && height > 0 && (width != allocated->cx || height != allocated->cy))
+        resize_frame_for_plugin_client(container, width, height);
+    // Constraints/resize may invoke plugin/window code, so the shared applicator
+    // confirms normal allocation again before touching dimensions or onSize.
+    if (notify_gui_client(false))
+        RedrawWindow(container, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME);
 }
 
 void PluginLoader::handle_editor_drag_start() {
@@ -2412,30 +2311,13 @@ void PluginLoader::notify_host_resize(uint32_t width, uint32_t height) {
         return;
     }
 
-    if (!view_attached_ || !view_) return;
-    HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
-    if (container_hwnd && IsWindow(container_hwnd) && width > 0 && height > 0) {
-        resize_frame_for_plugin_client(container_hwnd,
-                                       static_cast<int>(width),
-                                       static_cast<int>(height));
-        layout_editor_child(container_hwnd, reinterpret_cast<HWND>(view_plugin_host_hwnd_));
-    }
-    const bool size_changed = width != last_gui_width_ || height != last_gui_height_;
-    if (!size_changed) {
-        return;
-    }
-    last_gui_width_ = width;
-    last_gui_height_ = height;
-    Steinberg::ViewRect rect{0, 0,
-                             static_cast<Steinberg::int32>(width),
-                             static_cast<Steinberg::int32>(height)};
-    // タイムスタンプを更新: その後 250ms 間、プラグインから resizeView が
-    // 同期 / 非同期 (PostMessage) どちらで来ても SetWindowPos スキップ扱い。
-    // Insight2 の「リサイズ中暴れる」フィードバックループ対策。
-    if (plug_frame_) {
-        plug_frame_->mark_user_resize();
-    }
-    view_->onSize(&rect);
+    if (!view_attached_ || !view_ || width == 0 || height == 0) return;
+    HWND container = reinterpret_cast<HWND>(view_container_hwnd_);
+    if (!resize_frame_for_plugin_client(container, static_cast<int>(width), static_cast<int>(height))) return;
+    if (!read_normal_editor_client(container)) { publish_gui_normal_rect(); return; }
+    if (plug_frame_) plug_frame_->mark_user_resize();
+    notify_gui_client(false);
+    publish_gui_normal_rect();
 }
 
 void PluginLoader::hide_gui() {
@@ -2472,6 +2354,15 @@ void PluginLoader::hide_gui() {
         view_->setFrame(nullptr);
     }
     HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
+    if (gui_taskbar_) {
+        const HRESULT hr = gui_taskbar_->detach();
+        if (FAILED(hr)) {
+            blog("EffeTune taskbar detach failed hr=0x%lx", static_cast<unsigned long>(hr));
+            send_event_gui_warning(editor_slot_id_, reinterpret_cast<uint64_t>(container_hwnd),
+                                   "EffeTune taskbar membership could not be removed");
+        }
+        gui_taskbar_.reset();
+    }
     if (container_hwnd && IsWindow(container_hwnd)) {
         DestroyWindow(container_hwnd);
     }

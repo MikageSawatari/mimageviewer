@@ -29552,7 +29552,12 @@ impl App {
                 };
                 use crate::effetune::{GuiButtonAction, gui_button_action};
                 let visible = bridge.slot(0).is_some_and(|slot| slot.gui_visible);
-                match gui_button_action(visible, bridge.slot_gui_is_foreground(0, foreground)) {
+                let action =
+                    gui_button_action(visible, bridge.slot_gui_is_foreground(0, foreground));
+                crate::logger::log(format!(
+                    "[EffeTune GUI] button decision visible={visible} action={action:?}"
+                ));
+                match action {
                     GuiButtonAction::Hide => {
                         self.save_effetune_gui_rect();
                         self.effetune.request_hide_gui();

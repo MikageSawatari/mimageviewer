@@ -35,11 +35,18 @@ try {
         [System.IO.File]::WriteAllText($path, "raw fixture $name`r`n")
     }
     $iconPath = Join-Path $testRoot 'assets\icon.ico'
-    Assert-Throws { Get-MivVst3HostSourceHash -SourceRoot $source } 'Shared host icon is missing'
+    Assert-Throws { Get-MivVst3HostSourceHash -SourceRoot $source } 'Host icon dependency is missing'
     New-Item -ItemType Directory -Path (Split-Path -Parent $iconPath) -Force | Out-Null
     # Include a CRLF byte pair in the binary to prove it is hashed unchanged.
     $iconBytes = [byte[]]@(0, 0, 1, 0, 255, 13, 10, 0, 13, 65)
     [System.IO.File]::WriteAllBytes($iconPath, $iconBytes)
+    $effetuneIconPath = Join-Path $testRoot 'assets\effetune.ico'
+    Assert-Throws { Get-MivVst3HostSourceHash -SourceRoot $source } 'Host icon dependency is missing.*effetune.ico'
+    [System.IO.File]::WriteAllBytes($effetuneIconPath, $iconBytes)
+    $generatorPath = Join-Path $testRoot 'scripts\generate-effetune-icon.py'
+    Assert-Throws { Get-MivVst3HostSourceHash -SourceRoot $source } 'Host icon generator is missing'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $generatorPath) -Force | Out-Null
+    [System.IO.File]::WriteAllText($generatorPath, "generator fixture`r`n")
     $hash = Get-MivVst3HostSourceHash -SourceRoot $source
     $lfRepo = Join-Path $testRoot 'lf-repo'
     $lfSource = Join-Path $lfRepo 'crates\vst3-host'
@@ -51,6 +58,9 @@ try {
     }
     New-Item -ItemType Directory -Path (Join-Path $lfRepo 'assets') -Force | Out-Null
     [System.IO.File]::WriteAllBytes((Join-Path $lfRepo 'assets\icon.ico'), $iconBytes)
+    [System.IO.File]::WriteAllBytes((Join-Path $lfRepo 'assets\effetune.ico'), $iconBytes)
+    New-Item -ItemType Directory -Path (Join-Path $lfRepo 'scripts') -Force | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $lfRepo 'scripts\generate-effetune-icon.py'), "generator fixture`n")
     Assert-True ((Get-MivVst3HostSourceHash -SourceRoot $lfSource) -eq $hash) 'LF and CRLF source trees differ'
     $cliHash = & powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'vst3-host-identity.ps1') -HashSourceRoot $lfSource
     Assert-True ($LASTEXITCODE -eq 0 -and $cliHash -eq $hash) 'CMake hash CLI differs from validator'
@@ -87,6 +97,19 @@ try {
     Assert-Throws { Assert-MivVst3HostIdentity -RepoRoot $testRoot } 'Missing/stale source identity'
     [System.IO.File]::WriteAllBytes($iconPath, $iconBytes)
     Assert-True ((Get-MivVst3HostSourceHash -SourceRoot $source) -eq $hash) 'Restored resource/icon identity differs'
+    [System.IO.File]::WriteAllBytes($effetuneIconPath, [byte[]]@(0, 0, 1, 0, 255, 10, 0, 13, 65))
+    Assert-True ((Get-MivVst3HostSourceHash -SourceRoot $source) -ne $hash) 'Normalized EffeTune binary icon CRLF bytes'
+    Assert-Throws { Assert-MivVst3HostIdentity -RepoRoot $testRoot } 'Missing/stale source identity'
+    [System.IO.File]::WriteAllBytes($effetuneIconPath, $changedIcon)
+    Assert-True ((Get-MivVst3HostSourceHash -SourceRoot $source) -ne $hash) 'Missed EffeTune icon change'
+    Assert-Throws { Assert-MivVst3HostIdentity -RepoRoot $testRoot } 'Missing/stale source identity'
+    [System.IO.File]::WriteAllBytes($effetuneIconPath, $iconBytes)
+    $originalGenerator = [System.IO.File]::ReadAllBytes($generatorPath)
+    [System.IO.File]::AppendAllText($generatorPath, 'changed geometry')
+    Assert-True ((Get-MivVst3HostSourceHash -SourceRoot $source) -ne $hash) 'Missed icon generator change'
+    Assert-Throws { Assert-MivVst3HostIdentity -RepoRoot $testRoot } 'Missing/stale source identity'
+    [System.IO.File]::WriteAllBytes($generatorPath, $originalGenerator)
+    Assert-True ((Get-MivVst3HostSourceHash -SourceRoot $source) -eq $hash) 'Restored EffeTune icon/generator identity differs'
     $ignored = Join-Path $source 'build\generated\build_identity.h'
     New-Item -ItemType Directory -Path (Split-Path -Parent $ignored) -Force | Out-Null
     [System.IO.File]::WriteAllText($ignored, 'ignored generated header')

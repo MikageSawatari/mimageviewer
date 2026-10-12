@@ -52,20 +52,29 @@ function Get-MivVst3HostSourceHash {
         }
     }
     if (-not $names.Contains('CMakeLists.txt')) { throw '[vst3-identity] CMakeLists.txt is missing' }
-    # CMake compiles the shared repository icon into the host PE. Unlike text
-    # inputs, its bytes must not be changed by checkout newline normalization.
-    $iconName = '../../assets/icon.ico'
-    $iconPath = [System.IO.Path]::GetFullPath((Join-Path $root $iconName))
-    if (-not (Test-Path -LiteralPath $iconPath -PathType Leaf)) {
-        throw "[vst3-identity] Shared host icon is missing: $iconPath"
+    # The compiled icon, base artwork, and reproducible geometry generator are
+    # all identity inputs. Binary ICOs must retain their exact bytes.
+    $iconNames = @('../../assets/icon.ico', '../../assets/effetune.ico')
+    foreach ($iconName in $iconNames) {
+        $iconPath = [System.IO.Path]::GetFullPath((Join-Path $root $iconName))
+        if (-not (Test-Path -LiteralPath $iconPath -PathType Leaf)) {
+            throw "[vst3-identity] Host icon dependency is missing: $iconPath"
+        }
+        Assert-MivVst3IdentityAncestors -Path $iconPath
+        $names.Add($iconName)
     }
-    Assert-MivVst3IdentityAncestors -Path $iconPath
-    $names.Add($iconName)
+    $generatorName = '../../scripts/generate-effetune-icon.py'
+    $generatorPath = [System.IO.Path]::GetFullPath((Join-Path $root $generatorName))
+    if (-not (Test-Path -LiteralPath $generatorPath -PathType Leaf)) {
+        throw "[vst3-identity] Host icon generator is missing: $generatorPath"
+    }
+    Assert-MivVst3IdentityAncestors -Path $generatorPath
+    $names.Add($generatorName)
     $names.Sort([System.StringComparer]::Ordinal)
     $aggregate = New-Object System.Text.StringBuilder
     foreach ($name in $names) {
-        $hash = if ($name -eq $iconName) {
-            (Get-FileHash -LiteralPath $iconPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $hash = if ($name -in $iconNames) {
+            (Get-FileHash -LiteralPath (Join-Path $root $name) -Algorithm SHA256).Hash.ToLowerInvariant()
         } else {
             Get-MivVst3NormalizedFileHash -Path (Join-Path $root $name)
         }

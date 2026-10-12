@@ -158,7 +158,8 @@ public:
     void user_hide_gui();
     void handle_editor_dpi_change(uint32_t dpi, const RECT* suggested);
     bool editor_native_caption() const { return view_main_hwnd_ != nullptr; }
-    bool editor_frame_mutating() const { return geometry_publication_ == GeometryPublication::FrameMutation; }
+    bool editor_show_in_taskbar() const { return !gui_taskbar_ || gui_taskbar_->enabled(); }
+    void sync_gui_taskbar(bool shell_recreated = false);
     /// Already-attached GUI surface visibility toggle. Keeps the VST3 view
     /// attached and only hides/shows the bridge-owned top-level surface.
     void set_gui_visible(bool visible);
@@ -258,6 +259,8 @@ private:
     void quarantine_editor(const char* reason);
     void abandon_gui_thread(const char* reason);
     void refresh_gui_surface(void* container_hwnd);
+    bool notify_gui_client(bool force_notify);
+    void show_gui_surface(int command);
 
     Steinberg::IPtr<HostApplication> host_app_;
     Steinberg::IPtr<ComponentHandler> component_handler_;
@@ -281,6 +284,7 @@ private:
     std::atomic<bool> editor_show_bypass_button_{true};
     GuiVisibility gui_visibility_;
     std::unique_ptr<GuiGateReader> gui_gate_;
+    std::unique_ptr<EditorTaskbar> gui_taskbar_;
     bool gui_app_active_ = true;
     uint32_t last_gui_width_ = 0;
     uint32_t last_gui_height_ = 0;
@@ -294,10 +298,6 @@ private:
     std::atomic<bool> processing_enabled_{false};
 
     bool editor_drag_active_ = false;
-    // GUI-thread scoped frame mutation: intermediate workspace/style pairs must
-    // never be published as a completed canonical geometry snapshot.
-    enum class GeometryPublication { Live, FrameMutation };
-    GeometryPublication geometry_publication_ = GeometryPublication::Live;
     void* editor_drag_restore_owner_hwnd_ = nullptr;
     uint64_t editor_drag_started_ms_ = 0;
     uint64_t editor_drag_last_tick_ms_ = 0;

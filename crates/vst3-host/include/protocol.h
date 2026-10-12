@@ -10,7 +10,7 @@
 // stdin がクローズされたら bridge は graceful shutdown する。
 //
 // ### 親 → bridge (要求):
-//   {"cmd":"hello","version":6}
+//   {"cmd":"hello","version":7}
 //   {"cmd":"set_now_playing","slot_id":<u64>,"revision":<u64>,"title":"",
 //    "album":"","artist":"","artwork":"<base64>","artworkMimeType":""}
 //     Complete snapshot; revision orders updates within the slot incarnation.
@@ -31,7 +31,7 @@
 //   {"cmd":"shutdown"}              // bridge 終了
 //
 // ### bridge → 親 (応答 / 通知):
-//   {"event":"ready","version":6,"shm_name":"<Windows 名前付きオブジェクト>",
+//   {"event":"ready","version":7,"shm_name":"<Windows 名前付きオブジェクト>",
 //    "shm_size":<u64>,"sig_in":"<event名>","sig_out":"<event名>"}
 //   {"event":"loaded","plugin_name":"<UTF-8>","latency_samples":<u32>,
 //    "params":[{"id":<u32>,"name":"<UTF-8>","default":<f64>}, ...]}
@@ -98,7 +98,8 @@ static_assert(sizeof(ShmHeader) == 272,
 // 1 のままだと「無視されていた hello が黙って通る」状態だった。2 へ上げることで、
 // v0.8.x 以前の bridge exe (= version=1 を返すだけ) は新 Rust 側の比較で reject され、
 // stale bridge による IPC スキーマ不整合を検出できる。
-constexpr uint32_t PROTOCOL_VERSION = 6;
+// v7 requires frame-scoped GUI close/normal geometry and taskbar presentation.
+constexpr uint32_t PROTOCOL_VERSION = 7;
 
 // 制御メッセージの最大長。
 // 通常は 1 KB 未満だが、`plugin_state` event (= IComponent::getState チャンク) は

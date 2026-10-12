@@ -357,7 +357,8 @@ bridge IPC のレイテンシ実測 (Phase 0b):
 
 EffeTune 専用 bridge は `GuiOwnerPolicy::Unowned`。owner=0 を維持し、音響調整の
 タスクバー表示設定は既定ON。専用frameはnative caption / system menu / minimizeを持ち、
-ONはWS_EX_APPWINDOW、OFFはWS_EX_TOOLWINDOWとする。mIV全体のAppUserModelIDやpinは変更しない。
+ON/OFFとも通常captionとWS_EX_APPWINDOWを保ち、host GUI threadのITaskbarListでtaskbar項目だけを
+切り替える。EffeTuneは音符を重ねた専用iconを使う。mIV全体のAppUserModelIDやpinは変更しない。
 `main_hwnd` は DPI / 最小化参照であり owner ではない。ユーザー VST の `Auto`、fullscreen の
 owner / TOPMOST / focus handoff は従来どおり。EffeTune は owner 変更 IPC と app-active relay の対象外。
 表示希望と一時非表示理由 (`Minimized` / `RemoteSession`) は host の `GuiVisibility` に集約し、
@@ -386,15 +387,24 @@ plugin UI thread で `IConnectionPoint::notify` に完全snapshotを渡し、同
 metadata owner、画像worker、Local/Remote終端と詳細試験は
 [Now Playing 計画](effetune-now-playing-plan.md) を参照。
 
-§1.378の追加wireはv6に加算し、埋込hostのsource identityで同じsourceを保証する。
+§1.378のframe付きClose/通常矩形とtaskbar制御は互換性を変えるため、protocolをv7へ上げる。
+core・host・独立testerはhello/readyで旧v6を拒否する。probeもcoreと同じready-version検査を使う。
+source identityは成果物一致を検証する別のgateであり、protocol互換性判定の代わりにしない。
 `show_gui.show_in_taskbar`は一般VSTでfalse、EffeTuneはhost-control workerの最新設定を継承する。
 `set_gui_taskbar { slot_id, value }`は同じGUI threadで現在frameを更新し、再attachしない。
+再表示・TaskbarButtonCreatedでOFFを再適用し、hidden/suppressed frameへ項目を追加しない。
+OFFの最小化およびiconicからOFFへの変更は既存user-hideに揃え、音響調整ボタンで戻す。
+ONの最小化/復元はnative経路のまま。Hide/破棄は明示追加したtaskbar項目を削除する。
 `gui_attached.normal_rect`、`gui_normal_rect { slot_id, container_hwnd, normal_rect }`、
 `gui_user_hidden`内の同じframe/通常矩形はvirtual-screen物理pxのimmutable payload。
 hostがWINDOWPLACEMENTをTOOLWINDOW有無に応じてscreen座標へ正規化してから公開する。
 coreはbridge/slot/current HWNDを照合し、同じFIFOで矩形を先に適用してからCloseを処理する。
 EffeTuneのボタンHide・native Close・終了保存は完了snapshotをdrainして読むだけでWin32再読/IPC待機しない。
 一般VSTのGetWindowRect保存は維持する。iconic状態はOSが所有し、coreに別boolを置かない。
+pluginへのchild layout/`onSize`/最終寸法の更新はhost GUI threadの通常client確認入口へ揃える。
+iconic中のDPI/host/plugin resizeは復元用通常配置だけを更新し、pluginの寸法は通常復元後に通知する。
+Close後のSW_SHOWNAやRemote抑止解除はiconicを保つため、そこでは通知せず、SW_RESTORE/通常WM_SIZEで
+確定したallocationを使う。hidden-but-normalのattach/resizeは維持し、一般VSTのresizeView受領も同じ境界で検査する。
 操作と座標系の契約は[EffeTune計画 §17](effetune-integration-plan.md)を参照。
 
 要件:

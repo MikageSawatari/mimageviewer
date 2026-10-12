@@ -1248,11 +1248,14 @@ Windows SDK hosting moduleのMIT原文を `crates/vst3-host/src/sdk/` に保持�
 UNC namespace markerは大小文字を区別しない。host内FS検査は拡張形式を維持する。
 `GetModuleFileNameW`が保持する `\\?\` とpluginが付加する `/` の組合せによるEffeTune missing-assetsを避ける。
 2026-10-02 R2ではhost PE内の `MIV_VST3_HOST_SOURCE_SHA256:` markerを、CMakeLists／include／src／testsの
-現ソースhashと照合する。2026-10-12の音響調整窓対応では `src/*.rc` と共有 `assets/icon.ico` も対象に含める。
+現ソースhashと照合する。2026-10-12の音響調整窓対応では `src/*.rc`、baseの `assets/icon.ico`、
+専用 `assets/effetune.ico`、再生成用 `scripts/generate-effetune-icon.py` も対象に含める。
 APPDATA等から旧hostをimportするfallbackはない。
 identityは `scripts/vst3-host-identity.ps1` に計算を一本化し、CMakeも同scriptの
 `-HashSourceRoot` を使う。text対象のCRLFだけをbyte単位でLFへ正規化し、他のbyteは保持する。
-iconはbinaryのままraw SHA256を取り、host source rootからの相対名 `../../assets/icon.ico` を使う。
+二つのiconはbinaryのままraw SHA256を取り、host source rootからの相対名を使う。
+generatorは他のtextと同じLF正規化で検証する。`python scripts/generate-effetune-icon.py --check` で
+追跡ICOが再生成結果と一致することを確認できる（Pillowが必要、取得をbuildで行わない）。
 ordinal順のslash相対名と各SHA256を `name:hash\n` としてUTF-8/BOMなしで連結しSHA256化する。
 Gitの改行変換によるLF／CRLF checkout差を無視するが、未コミットのソース変更は検知する。
 SDK欠落時や `-SkipVst3Bridge` は現ソースと一致するvendor hostのみ再利用可能。不一致／欠落は復旧案内付きで停止する。

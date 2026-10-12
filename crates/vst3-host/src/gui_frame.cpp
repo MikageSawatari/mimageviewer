@@ -1,5 +1,6 @@
 #include "gui_frame.h"
 #include <limits>
+#include <shobjidl.h>
 
 namespace miv {
 namespace {
@@ -16,25 +17,6 @@ bool monitor_info(HWND hwnd, MONITORINFO& info) {
     info.cbSize = sizeof(info);
     HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
     return monitor && GetMonitorInfoW(monitor, &info);
-}
-bool frame_insets(HWND hwnd, DWORD ex_style, RECT& insets) {
-    UINT dpi = GetDpiForWindow(hwnd);
-    if (!dpi) dpi = 96;
-    insets = RECT{};
-    const DWORD style = DWORD(GetWindowLongPtrW(hwnd, GWL_STYLE)) & ~(WS_MINIMIZE | WS_MAXIMIZE);
-    return AdjustWindowRectExForDpi(&insets, style, FALSE, ex_style, dpi) != FALSE;
-}
-bool set_hidden_normal_rect(HWND hwnd, const NormalScreenRect& rect, DWORD ex_style) {
-    MONITORINFO info{};
-    WINDOWPLACEMENT placement{};
-    placement.length = sizeof(placement);
-    if (!monitor_info(hwnd, info) || !GetWindowPlacement(hwnd, &placement)) return false;
-    auto converted = screen_to_placement(rect, ex_style, info.rcMonitor, info.rcWork);
-    if (!converted) return false;
-    placement.rcNormalPosition = *converted;
-    placement.flags &= ~WPF_RESTORETOMAXIMIZED;
-    placement.showCmd = SW_HIDE; // placement must not reveal suppressed/hidden windows
-    return SetWindowPlacement(hwnd, &placement) != FALSE;
 }
 }
 std::optional<NormalScreenRect> placement_to_screen(const RECT& normal, DWORD ex_style,
@@ -63,22 +45,27 @@ bool editor_uses_saved_outer_size(bool native_caption, bool resizable, bool has_
     // saved outer size from the older custom-caption frame.
     return has_saved_size && (!native_caption || resizable);
 }
-DWORD editor_taskbar_ex_style(DWORD current, bool show_in_taskbar) {
+DWORD editor_ex_style(DWORD current, bool native_caption) {
     return (current & ~(WS_EX_APPWINDOW | WS_EX_TOOLWINDOW)) |
-           (show_in_taskbar ? WS_EX_APPWINDOW : WS_EX_TOOLWINDOW);
+           (native_caption ? WS_EX_APPWINDOW : WS_EX_TOOLWINDOW);
 }
-EditorSystemCommand editor_system_command(bool native_frame, WPARAM command, bool restore_permitted) {
+bool editor_taskbar_requires_user_hide(bool show_in_taskbar, bool iconic) {
+    return !show_in_taskbar && iconic;
+}
+EditorSystemCommand editor_system_command(bool native_frame, WPARAM command, bool restore_permitted,
+                                          bool show_in_taskbar) {
     const auto action = command & 0xFFF0;
     if (action == SC_CLOSE) return EditorSystemCommand::UserHide;
     if (!native_frame) return EditorSystemCommand::NativeDefault;
     if (action == SC_MAXIMIZE || (action == SC_RESTORE && !restore_permitted)) return EditorSystemCommand::Block;
-    if (action == SC_MINIMIZE) return EditorSystemCommand::PublishBeforeMinimize;
+    if (action == SC_MINIMIZE) return show_in_taskbar ? EditorSystemCommand::PublishBeforeMinimize
+                                                    : EditorSystemCommand::UserHide;
     return EditorSystemCommand::NativeDefault;
 }
 std::optional<LRESULT> handle_editor_system_command(bool native_frame, WPARAM command,
     bool restore_permitted, const std::function<void()>& user_hide,
-    const std::function<void()>& before_minimize) {
-    switch (editor_system_command(native_frame, command, restore_permitted)) {
+    const std::function<void()>& before_minimize, bool show_in_taskbar) {
+    switch (editor_system_command(native_frame, command, restore_permitted, show_in_taskbar)) {
         case EditorSystemCommand::UserHide: user_hide(); return 0;
         case EditorSystemCommand::Block: return 0;
         case EditorSystemCommand::PublishBeforeMinimize: before_minimize(); break;
@@ -95,6 +82,42 @@ RECT editor_child_bounds(const RECT& client, UINT dpi) {
     return RECT{0, status, client.right > 0 ? client.right : 1,
                 client.bottom > status ? client.bottom : status + 1};
 }
+std::optional<RECT> read_normal_editor_client(HWND frame) {
+    RECT client{};
+    if (!IsWindow(frame) || IsIconic(frame) || !GetClientRect(frame, &client) ||
+        client.right <= 0 || client.bottom <= 0) return std::nullopt;
+    return client;
+}
+std::optional<SIZE> layout_normal_editor_child(HWND frame, HWND child) {
+    const auto client = read_normal_editor_client(frame);
+    if (!client || !IsWindow(child) || !IsChild(frame, child)) return std::nullopt;
+    const auto bounds = editor_child_bounds(*client, GetDpiForWindow(frame));
+    if (!SetWindowPos(child, nullptr, bounds.left, bounds.top,
+        bounds.right - bounds.left, bounds.bottom - bounds.top,
+        SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS)) return std::nullopt;
+    // SetWindowPos invokes window/plugin code. Never publish a size if that
+    // code has minimized the parent in the meantime.
+    RECT allocated{};
+    if (!read_normal_editor_client(frame) || !GetClientRect(child, &allocated) ||
+        allocated.right <= 0 || allocated.bottom <= 0) return std::nullopt;
+    return SIZE{allocated.right, allocated.bottom};
+}
+bool notify_normal_editor_view(HWND frame, const std::function<void()>& notify) {
+    if (!read_normal_editor_client(frame)) return false;
+    notify();
+    return true;
+}
+bool apply_normal_editor_client(HWND frame, HWND child, uint32_t& last_width,
+    uint32_t& last_height, bool force_notify, const std::function<void(SIZE)>& notify) {
+    const auto allocated = layout_normal_editor_child(frame, child);
+    if (!allocated) return false;
+    if (!force_notify && last_width == uint32_t(allocated->cx) && last_height == uint32_t(allocated->cy)) return true;
+    return notify_normal_editor_view(frame, [&] {
+        last_width = uint32_t(allocated->cx);
+        last_height = uint32_t(allocated->cy);
+        notify(*allocated);
+    });
+}
 std::optional<SIZE> editor_outer_size(DWORD style, DWORD ex_style, UINT dpi,
                                      int plugin_width, int plugin_height) {
     const int status = editor_status_height(dpi);
@@ -108,13 +131,13 @@ std::optional<SIZE> editor_outer_size(DWORD style, DWORD ex_style, UINT dpi,
 }
 bool initialize_native_editor_frame(HWND hwnd, UINT dpi, bool resizable) {
     HINSTANCE instance = GetModuleHandleW(nullptr);
-    HICON big = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(101), IMAGE_ICON,
+    HICON big_icon = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(101), IMAGE_ICON,
         GetSystemMetricsForDpi(SM_CXICON, dpi), GetSystemMetricsForDpi(SM_CYICON, dpi), LR_SHARED));
-    HICON small = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(101), IMAGE_ICON,
+    HICON small_icon = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(101), IMAGE_ICON,
         GetSystemMetricsForDpi(SM_CXSMICON, dpi), GetSystemMetricsForDpi(SM_CYSMICON, dpi), LR_SHARED));
-    if (!big || !small) return false;
-    SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(big));
-    SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(small));
+    if (!big_icon || !small_icon) return false;
+    SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(big_icon));
+    SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(small_icon));
     HMENU menu = GetSystemMenu(hwnd, FALSE);
     if (!menu) return false;
     EnableMenuItem(menu, SC_MAXIMIZE, MF_BYCOMMAND | MF_GRAYED);
@@ -138,34 +161,58 @@ std::optional<NormalScreenRect> read_normal_screen_rect(HWND hwnd) {
         !IntersectRect(&intersection, &screen, &info.rcWork)) return std::nullopt;
     return rect;
 }
-bool update_editor_taskbar(HWND hwnd, bool show_in_taskbar, const std::function<bool()>& permit) {
-    const DWORD old_ex = DWORD(GetWindowLongPtrW(hwnd, GWL_EXSTYLE));
-    const DWORD new_ex = editor_taskbar_ex_style(old_ex, show_in_taskbar);
-    if (new_ex == old_ex) return true;
-    auto normal = read_normal_screen_rect(hwnd);
-    RECT old_insets{}, new_insets{};
-    if (!normal || !frame_insets(hwnd, old_ex, old_insets) || !frame_insets(hwnd, new_ex, new_insets)) return false;
-    const int64_t width = int64_t(normal->outer_width) - (old_insets.right - old_insets.left) +
-                         (new_insets.right - new_insets.left);
-    const int64_t height = int64_t(normal->outer_height) - (old_insets.bottom - old_insets.top) +
-                          (new_insets.bottom - new_insets.top);
-    if (width <= 1 || height <= 1 || width > INT32_MAX || height > INT32_MAX) return false;
-    normal->outer_width = uint32_t(width);
-    normal->outer_height = uint32_t(height);
-    const bool visible = IsWindowVisible(hwnd) != FALSE, iconic = IsIconic(hwnd) != FALSE;
-    const bool foreground = GetAncestor(GetForegroundWindow(), GA_ROOT) == hwnd;
-    if (visible) ShowWindow(hwnd, SW_HIDE);
-    SetLastError(0);
-    if (!SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex) && GetLastError()) return false;
-    if (!SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
-                      SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE) ||
-        !set_hidden_normal_rect(hwnd, *normal, new_ex)) return false;
-    if (visible && permit()) {
-        ShowWindow(hwnd, iconic ? SW_SHOWMINNOACTIVE : SW_SHOWNOACTIVATE);
-        if (!permit()) ShowWindow(hwnd, SW_HIDE);
-        else if (foreground && !iconic) SetForegroundWindow(hwnd);
+UINT editor_taskbar_button_created_message() {
+    static const UINT message = RegisterWindowMessageW(L"TaskbarButtonCreated");
+    return message;
+}
+UINT editor_taskbar_created_message() {
+    static const UINT message = RegisterWindowMessageW(L"TaskbarCreated");
+    return message;
+}
+EditorTaskbar::EditorTaskbar(HWND hwnd, bool enabled, Sink sink)
+    : hwnd_(hwnd), enabled_(enabled), sink_(std::move(sink)) {
+    initialization_ = initialize();
+}
+EditorTaskbar::~EditorTaskbar() {
+    detach();
+    if (shell_) shell_->Release();
+}
+HRESULT EditorTaskbar::initialize() {
+    if (sink_) return S_OK;
+    HRESULT hr = CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER,
+        IID_PPV_ARGS(&shell_));
+    if (SUCCEEDED(hr)) hr = shell_->HrInit();
+    if (FAILED(hr) && shell_) { shell_->Release(); shell_ = nullptr; }
+    return hr;
+}
+HRESULT EditorTaskbar::apply(bool add) {
+    if (FAILED(initialization_)) return initialization_;
+    return sink_ ? sink_(hwnd_, add) : (add ? shell_->AddTab(hwnd_) : shell_->DeleteTab(hwnd_));
+}
+HRESULT EditorTaskbar::sync(bool visible, bool permitted) {
+    if (enabled_ && visible && permitted) {
+        HRESULT hr = apply(true);
+        if (SUCCEEDED(hr)) added_ = hwnd_;
+        return hr;
     }
-    return true;
+    // OFF must remove implicit APPWINDOW registration after every Show/Restore
+    // and TaskbarButtonCreated. Hidden ON windows only remove our explicit add.
+    if (!enabled_) {
+        added_ = nullptr;
+        return apply(false);
+    }
+    return detach();
+}
+HRESULT EditorTaskbar::detach() {
+    if (!added_) return S_OK;
+    added_ = nullptr; // a rare failure is reported once, without a cleanup retry
+    return apply(false);
+}
+HRESULT EditorTaskbar::shell_recreated() {
+    added_ = nullptr;
+    if (shell_) { shell_->Release(); shell_ = nullptr; }
+    initialization_ = initialize();
+    return initialization_;
 }
 bool resize_normal_editor_frame(HWND hwnd, int plugin_width, int plugin_height) {
     if (plugin_width <= 0 || plugin_height <= 0) return false;

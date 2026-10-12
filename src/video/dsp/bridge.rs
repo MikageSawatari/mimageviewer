@@ -38,7 +38,18 @@ use windows::core::{HSTRING, PCWSTR};
 /// `mimageviewer-vst3-host.exe` (version=1 を返すだけ) を新 Rust 側で reject できる。
 /// v5: checked GUI-thread presentation outcomes and shared suppression epochs.
 // v6: bounded, fire-and-forget Now Playing snapshots.
-pub const PROTOCOL_VERSION: u32 = 6;
+// v7: frame-scoped GUI close/normal geometry and taskbar presentation commands.
+pub const PROTOCOL_VERSION: u32 = 7;
+
+pub(crate) fn require_current_protocol(reported: u32) -> Result<(), String> {
+    if reported == PROTOCOL_VERSION {
+        Ok(())
+    } else {
+        Err(format!(
+            "VST3 bridge protocol version mismatch (bridge reported {reported}, mIV expects {PROTOCOL_VERSION})"
+        ))
+    }
+}
 pub const MAX_CONTROL_MSG_SIZE: usize = 32 * 1024 * 1024;
 pub(crate) const STATE_WATCHDOG_EXIT_CODE: u32 = 0xEFFE_C001;
 
@@ -1674,6 +1685,49 @@ impl Drop for Bridge {
 #[cfg(test)]
 mod concurrent_state_tests {
     use super::*;
+
+    #[test]
+    fn protocol_handshake_rejects_v6_ready_before_any_audio_or_gui_command() {
+        let (bridge, commands, events) = Bridge::fake_host_for_test();
+        bridge
+            .send(&Cmd::Hello {
+                version: PROTOCOL_VERSION,
+            })
+            .unwrap();
+        let hello = commands
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(hello["cmd"], "hello");
+        assert_eq!(hello["version"], PROTOCOL_VERSION);
+        events.emit(Event::Ready { version: 6 });
+        let Event::Ready { version } = bridge.recv().unwrap() else {
+            panic!("fake legacy host must reply Ready")
+        };
+        let error = require_current_protocol(version).unwrap_err();
+        assert!(error.contains("bridge reported 6"));
+        assert!(
+            commands.try_recv().is_err(),
+            "rejected peer must not receive open or show_gui"
+        );
+    }
+
+    #[test]
+    fn protocol_handshake_accepts_current_ready() {
+        let (bridge, commands, events) = Bridge::fake_host_for_test();
+        bridge
+            .send(&Cmd::Hello {
+                version: PROTOCOL_VERSION,
+            })
+            .unwrap();
+        assert_eq!(commands.recv().unwrap()["version"], PROTOCOL_VERSION);
+        events.emit(Event::Ready {
+            version: PROTOCOL_VERSION,
+        });
+        let Event::Ready { version } = bridge.recv().unwrap() else {
+            panic!("fake current host must reply Ready")
+        };
+        require_current_protocol(version).unwrap();
+    }
 
     #[test]
     fn probe_and_open_preserve_utf8_windows_paths_in_ipc() {

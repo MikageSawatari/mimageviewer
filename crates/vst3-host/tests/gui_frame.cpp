@@ -1,9 +1,11 @@
 #include "gui_frame.h"
 #include "protocol.h"
 #include "gui_visibility.h"
+#include "host_app.h"
 #include <cstdio>
 #include <cstdlib>
 #include <thread>
+#include <memory>
 #include <tlhelp32.h>
 
 namespace {
@@ -66,8 +68,8 @@ void pure_tests() {
     check(miv::editor_uses_saved_outer_size(true, true, true), "resizable native view retains saved size for constraint check");
     check(miv::editor_uses_saved_outer_size(false, false, true), "generic fixed view saved sizing unchanged");
     const DWORD other = WS_EX_WINDOWEDGE | WS_EX_TOPMOST | WS_EX_NOACTIVATE;
-    check(miv::editor_taskbar_ex_style(other | WS_EX_TOOLWINDOW, true) == (other | WS_EX_APPWINDOW), "ON preserves unrelated exstyle");
-    check(miv::editor_taskbar_ex_style(other | WS_EX_APPWINDOW, false) == (other | WS_EX_TOOLWINDOW), "OFF preserves unrelated exstyle");
+    check(miv::editor_ex_style(other | WS_EX_TOOLWINDOW, true) == (other | WS_EX_APPWINDOW), "native frame preserves unrelated exstyle");
+    check(miv::editor_ex_style(other | WS_EX_APPWINDOW, false) == (other | WS_EX_TOOLWINDOW), "generic TOOLWINDOW frame unchanged");
     check(miv::normal_rect_json_member(miv::NormalScreenRect{-1700, -900, 700, 500}) ==
           ",\"normal_rect\":{\"x\":-1700,\"y\":-900,\"outer_width\":700,\"outer_height\":500}", "canonical wire");
     check(miv::normal_rect_json_member(std::nullopt).empty(), "failed geometry not substituted");
@@ -82,7 +84,11 @@ void pure_tests() {
         for (bool resizable : {false, true}) {
             for (bool taskbar : {false, true}) {
                 const DWORD style = miv::editor_frame_style(true, resizable);
-                const DWORD ex = miv::editor_taskbar_ex_style(WS_EX_WINDOWEDGE, taskbar);
+                const DWORD ex = miv::editor_ex_style(WS_EX_WINDOWEDGE, true);
+                check(ex == (WS_EX_WINDOWEDGE | WS_EX_APPWINDOW), "ON/OFF use same native extended style");
+                check(miv::editor_system_command(true, SC_MINIMIZE, true, taskbar) ==
+                    (taskbar ? miv::EditorSystemCommand::PublishBeforeMinimize : miv::EditorSystemCommand::UserHide),
+                    "taskbar policy controls minimize without changing the frame");
                 auto size = miv::editor_outer_size(style, ex, dpi, 600, 400);
                 RECT nc{};
                 check(size && AdjustWindowRectExForDpi(&nc, style, FALSE, ex, dpi), "DPI frame size");
@@ -96,6 +102,27 @@ void pure_tests() {
     }
     check(!miv::editor_outer_size(native, WS_EX_TOOLWINDOW, 96, 500, INT32_MAX), "size arithmetic overflow rejected");
 }
+class FakeView : public Steinberg::IPlugView {
+public:
+    Steinberg::ViewRect size{0, 0, 600, 400};
+    int notifications = 0;
+    Steinberg::uint32 references = 1;
+    Steinberg::tresult PLUGIN_API queryInterface(const Steinberg::TUID, void** out) override { *out = nullptr; return Steinberg::kNoInterface; }
+    Steinberg::uint32 PLUGIN_API addRef() override { return ++references; }
+    Steinberg::uint32 PLUGIN_API release() override { return --references; }
+    Steinberg::tresult PLUGIN_API isPlatformTypeSupported(Steinberg::FIDString) override { return Steinberg::kResultTrue; }
+    Steinberg::tresult PLUGIN_API attached(void*, Steinberg::FIDString) override { return Steinberg::kResultOk; }
+    Steinberg::tresult PLUGIN_API removed() override { return Steinberg::kResultOk; }
+    Steinberg::tresult PLUGIN_API onWheel(float) override { return Steinberg::kResultOk; }
+    Steinberg::tresult PLUGIN_API onKeyDown(Steinberg::char16, Steinberg::int16, Steinberg::int16) override { return Steinberg::kResultOk; }
+    Steinberg::tresult PLUGIN_API onKeyUp(Steinberg::char16, Steinberg::int16, Steinberg::int16) override { return Steinberg::kResultOk; }
+    Steinberg::tresult PLUGIN_API getSize(Steinberg::ViewRect* out) override { *out = size; return Steinberg::kResultOk; }
+    Steinberg::tresult PLUGIN_API onSize(Steinberg::ViewRect* requested) override { size = *requested; ++notifications; return Steinberg::kResultOk; }
+    Steinberg::tresult PLUGIN_API onFocus(Steinberg::TBool) override { return Steinberg::kResultOk; }
+    Steinberg::tresult PLUGIN_API setFrame(Steinberg::IPlugFrame*) override { return Steinberg::kResultOk; }
+    Steinberg::tresult PLUGIN_API canResize() override { return Steinberg::kResultTrue; }
+    Steinberg::tresult PLUGIN_API checkSizeConstraint(Steinberg::ViewRect*) override { return Steinberg::kResultOk; }
+};
 struct FrameFixture {
     miv::GuiVisibility visibility;
     std::optional<miv::NormalScreenRect> before_minimize;
@@ -103,6 +130,35 @@ struct FrameFixture {
     int closes = 0;
     int shows = 0;
     int window_positions = 0;
+    int adds = 0, deletes = 0;
+    HWND child = nullptr;
+    FakeView* view = nullptr;
+    uint32_t last_width = 0, last_height = 0;
+    bool apply(HWND hwnd, bool force = true) {
+        if (!view || !child) return false;
+        return miv::apply_normal_editor_client(hwnd, child, last_width, last_height, force, [this](SIZE size) {
+            Steinberg::ViewRect rect{0, 0, size.cx, size.cy};
+            view->onSize(&rect);
+        });
+    }
+    std::unique_ptr<miv::EditorTaskbar> taskbar;
+    void sync(HWND hwnd, bool recreated = false) {
+        if (!taskbar) return;
+        if (recreated) check(SUCCEEDED(taskbar->shell_recreated()), "Shell recreation");
+        check(SUCCEEDED(taskbar->sync(IsWindowVisible(hwnd) != FALSE, visibility.should_show(true, true))), "Shell membership sync");
+    }
+    void hide(HWND hwnd) {
+        closed = miv::read_normal_screen_rect(hwnd);
+        ++closes;
+        visibility.request(false);
+        ShowWindow(hwnd, SW_HIDE);
+        sync(hwnd);
+    }
+    void set_taskbar(HWND hwnd, bool enabled) {
+        taskbar->set_enabled(enabled);
+        if (miv::editor_taskbar_requires_user_hide(enabled, IsIconic(hwnd) != FALSE)) hide(hwnd);
+        else sync(hwnd);
+    }
 };
 LRESULT CALLBACK fixture_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     if (msg == WM_NCCREATE) {
@@ -112,19 +168,33 @@ LRESULT CALLBACK fixture_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
     auto* fixture = reinterpret_cast<FrameFixture*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     if (fixture && msg == WM_SHOWWINDOW && wparam) ++fixture->shows;
     if (fixture && msg == WM_WINDOWPOSCHANGED) ++fixture->window_positions;
+    if (fixture && msg == WM_SIZE && wparam != SIZE_MINIMIZED) fixture->apply(hwnd, false);
+    if (fixture && msg == WM_APP + 0x4D9) {
+        check(miv::resize_normal_editor_frame(hwnd, static_cast<int>(wparam), static_cast<int>(lparam)), "plugin resize request");
+        miv::layout_normal_editor_child(hwnd, fixture->child);
+        return 0;
+    }
+    if (fixture && fixture->taskbar &&
+        (msg == miv::editor_taskbar_button_created_message() || msg == miv::editor_taskbar_created_message())) {
+        fixture->sync(hwnd, msg == miv::editor_taskbar_created_message());
+        return 0;
+    }
     if (fixture && msg == WM_SYSCOMMAND) {
         auto result = miv::handle_editor_system_command(true, wparam, fixture->visibility.should_show(true, true),
-            [hwnd, fixture] {
-                fixture->closed = miv::read_normal_screen_rect(hwnd);
-                ++fixture->closes;
-                fixture->visibility.request(false);
-                ShowWindow(hwnd, SW_HIDE);
-            },
-            [hwnd, fixture] { fixture->before_minimize = miv::read_normal_screen_rect(hwnd); });
+            [hwnd, fixture] { fixture->hide(hwnd); },
+            [hwnd, fixture] { fixture->before_minimize = miv::read_normal_screen_rect(hwnd); },
+            !fixture->taskbar || fixture->taskbar->enabled());
         if (result) return *result;
     }
-    return DefWindowProcW(hwnd, msg, wparam, lparam);
+    const LRESULT result = DefWindowProcW(hwnd, msg, wparam, lparam);
+    if (fixture) {
+        const auto* position = msg == WM_WINDOWPOSCHANGED ? reinterpret_cast<WINDOWPOS*>(lparam) : nullptr;
+        if (msg == WM_SYSCOMMAND || (position && (position->flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW))))
+            fixture->sync(hwnd);
+    }
+    return result;
 }
+
 void native_chrome_and_commands(WNDCLASSW& klass, const MONITORINFO& info) {
     for (bool resizable : {false, true}) {
         FrameFixture fixture;
@@ -180,6 +250,124 @@ void native_chrome_and_commands(WNDCLASSW& klass, const MONITORINFO& info) {
         check(DestroyWindow(hwnd) != FALSE, "native fixture window retired");
     }
 }
+void minimized_plugin_allocation_tests(WNDCLASSW& klass, const MONITORINFO& info) {
+    for (bool native : {false, true}) for (bool resizable : {false, true}) for (bool taskbar : {false, true}) {
+        FrameFixture fixture;
+        FakeView view;
+        fixture.view = &view;
+        fixture.visibility.request(true);
+        const DWORD style = miv::editor_frame_style(native, resizable);
+        const DWORD ex = miv::editor_ex_style(WS_EX_WINDOWEDGE, native);
+        const UINT dpi = GetDpiForSystem();
+        const auto outer = miv::editor_outer_size(style, ex, dpi, 600, 400);
+        check(outer.has_value(), "allocation initial geometry");
+        HWND hwnd = CreateWindowExW(ex, klass.lpszClassName, L"allocation fixture", style,
+            info.rcWork.left + 70, info.rcWork.top + 70, outer->cx, outer->cy,
+            nullptr, nullptr, klass.hInstance, &fixture);
+        check(hwnd != nullptr, "allocation inert parent");
+        fixture.child = CreateWindowExW(0, L"STATIC", L"inert plugin child", WS_CHILD | WS_VISIBLE,
+            0, 0, 1, 1, hwnd, nullptr, klass.hInstance, nullptr);
+        check(fixture.child != nullptr && fixture.apply(hwnd), "normal hidden attach notifies plugin");
+        check(view.size.right == 600 && view.size.bottom == 400 && fixture.last_width == 600 && fixture.last_height == 400,
+              "confirmed normal allocation populates view and cached dimensions");
+        fixture.taskbar = std::make_unique<miv::EditorTaskbar>(hwnd, taskbar, [](HWND, bool) { return S_OK; });
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        // Even OFF can receive an already-iconic frame (setting change or OS
+        // transition). Allocation safety must not depend on taskbar policy.
+        ShowWindow(hwnd, SW_SHOWMINNOACTIVE);
+        check(IsIconic(hwnd), "allocation parent iconic");
+        RECT child_before{}; GetClientRect(fixture.child, &child_before);
+        const int notifications = view.notifications;
+        const uint32_t last_width = fixture.last_width, last_height = fixture.last_height;
+        miv::PlugFrame plug_frame;
+        plug_frame.set_host_hwnd(hwnd);
+        Steinberg::ViewRect requested{0, 0, 500, 300};
+        check(plug_frame.resizeView(&view, &requested) == Steinberg::kResultOk, "actual PlugFrame accepts minimized plugin request");
+        check(!fixture.apply(hwnd) && !miv::read_normal_editor_client(hwnd), "iconic refresh rejects client allocation");
+        RECT child_after{}; GetClientRect(fixture.child, &child_after);
+        check(EqualRect(&child_before, &child_after) && view.notifications == notifications &&
+              fixture.last_width == last_width && fixture.last_height == last_height,
+              "iconic resizeView/refresh preserve child view and last dimensions");
+        // Host/DPI producers update only restore placement, using the same
+        // production frame helper then normal allocation applicator.
+        check(miv::resize_normal_editor_frame(hwnd, 550, 350) && !fixture.apply(hwnd), "host resize only changes iconic restore geometry");
+        check(view.notifications == notifications && fixture.last_width == last_width && fixture.last_height == last_height,
+              "iconic host resize leaves notification cache unchanged");
+        const auto resized = miv::read_normal_screen_rect(hwnd);
+        const auto expected_outer = miv::editor_outer_size(style, ex, GetDpiForWindow(hwnd), 550, 350);
+        check(resized && expected_outer && resized->outer_width == uint32_t(expected_outer->cx) &&
+              resized->outer_height == uint32_t(expected_outer->cy), "iconic requests update normal placement dimensions");
+        fixture.visibility.suppress(miv::GuiSuppression::RemoteSession, true);
+        ShowWindow(hwnd, SW_HIDE);
+        fixture.visibility.suppress(miv::GuiSuppression::RemoteSession, false);
+        ShowWindow(hwnd, SW_SHOWNA);
+        check(IsIconic(hwnd) && !fixture.apply(hwnd) && view.notifications == notifications,
+              "Remote unsuppress keeps iconic allocation and sends no onSize");
+        SendMessageW(hwnd, WM_SYSCOMMAND, SC_CLOSE, 0);
+        check(fixture.closed && resized && equal(*fixture.closed, *resized), "minimized Close snapshots latest normal placement");
+        check(!fixture.apply(hwnd) && view.notifications == notifications, "hidden iconic Close/refresh never changes allocation");
+        fixture.visibility.request(true);
+        ShowWindow(hwnd, SW_SHOWNA);
+        check(!fixture.apply(hwnd) && view.notifications == notifications, "manual Show pre-restore does not publish iconic client");
+        ShowWindow(hwnd, SW_RESTORE);
+        check(fixture.apply(hwnd) && !IsIconic(hwnd) && fixture.last_width == 550 && fixture.last_height == 350 &&
+              view.size.right == 550 && view.size.bottom == 350, "manual restore publishes actual normal plugin client");
+        // Normal suppressed resizeView acknowledgement is released behavior:
+        // it still accepts the requested view size without resizing the shell.
+        plug_frame.set_host_resize_enabled(false);
+        const auto normal_before = miv::read_normal_screen_rect(hwnd);
+        requested = {0, 0, 540, 340};
+        const int normal_notifications = view.notifications;
+        plug_frame.resizeView(&view, &requested);
+        const auto normal_after = miv::read_normal_screen_rect(hwnd);
+        check(normal_before && normal_after && equal(*normal_before, *normal_after) &&
+              view.notifications == normal_notifications + 1 && view.size.right == 540 && view.size.bottom == 340,
+              "normal suppressed resizeView requested acknowledgement preserved");
+        fixture.taskbar.reset();
+        check(DestroyWindow(hwnd) != FALSE, "allocation frame and inert child retired");
+    }
+}
+LRESULT CALLBACK reentrant_child_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    if (msg == WM_SIZE) {
+        HWND parent = reinterpret_cast<HWND>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (parent) {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            ShowWindow(parent, SW_SHOWMINNOACTIVE);
+        }
+    }
+    return DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+void reentrant_allocation_test(WNDCLASSW& klass, const MONITORINFO& info) {
+    WNDCLASSW child_class{};
+    child_class.hInstance = klass.hInstance;
+    child_class.lpfnWndProc = reentrant_child_proc;
+    child_class.lpszClassName = L"MivReentrantInertPluginChild";
+    check(RegisterClassW(&child_class) != 0, "reentrant child class");
+    FrameFixture fixture;
+    FakeView view;
+    fixture.view = &view;
+    fixture.visibility.request(true);
+    HWND hwnd = CreateWindowExW(WS_EX_APPWINDOW, klass.lpszClassName, L"reentrant allocation",
+        miv::editor_frame_style(true, true), info.rcWork.left + 80, info.rcWork.top + 80, 700, 500,
+        nullptr, nullptr, klass.hInstance, &fixture);
+    check(hwnd != nullptr, "reentrant parent");
+    fixture.child = CreateWindowExW(0, child_class.lpszClassName, L"", WS_CHILD | WS_VISIBLE,
+        0, 0, 1, 1, hwnd, nullptr, klass.hInstance, nullptr);
+    check(fixture.child != nullptr, "reentrant child");
+    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    // Force a changed child allocation so SetWindowPos enters child window code.
+    SetWindowPos(fixture.child, nullptr, 0, 0, 1, 1, SWP_NOZORDER | SWP_NOACTIVATE);
+    const int before_apply = view.notifications;
+    fixture.last_width = 123; fixture.last_height = 456;
+    SetWindowLongPtrW(fixture.child, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(hwnd));
+    check(!fixture.apply(hwnd) && IsIconic(hwnd), "child layout reentrantly minimized parent");
+    check(view.notifications == before_apply && fixture.last_width == 123 && fixture.last_height == 456,
+          "reentrant minimization prevents stale onSize and cached dimension update");
+    ShowWindow(hwnd, SW_RESTORE);
+    check(fixture.apply(hwnd) && !IsIconic(hwnd), "later normal restore accepts client allocation");
+    check(DestroyWindow(hwnd) != FALSE && UnregisterClassW(child_class.lpszClassName, child_class.hInstance),
+          "reentrant fixture retired");
+}
 void native_tests(HDESK desktop) {
     HDESK original_desktop = GetThreadDesktop(GetCurrentThreadId());
     desktop_diagnostic("worker original", original_desktop);
@@ -192,51 +380,92 @@ void native_tests(HDESK desktop) {
     MONITORINFO info{}; info.cbSize = sizeof(info);
     check(GetMonitorInfoW(MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY), &info) != FALSE, "test work area");
     native_chrome_and_commands(klass, info);
+    minimized_plugin_allocation_tests(klass, info);
+    reentrant_allocation_test(klass, info);
     const int x = info.rcWork.left + 60, y = info.rcWork.top + 60;
     for (bool initially_visible : {false, true}) {
-        for (bool iconic : {false, true}) {
-            FrameFixture fixture;
-            HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_WINDOWEDGE, klass.lpszClassName, L"inert",
-                miv::editor_frame_style(true, true), x, y, 640, 480, nullptr, nullptr, klass.hInstance, &fixture);
-            check(hwnd != nullptr, "inert HWND");
-            if (iconic) ShowWindow(hwnd, SW_SHOWMINNOACTIVE);
-            if (!initially_visible) ShowWindow(hwnd, SW_HIDE);
-            else if (!iconic) ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-            const int no_op_positions = fixture.window_positions, no_op_shows = fixture.shows;
-            bool no_op_permit_read = false;
-            check(miv::update_editor_taskbar(hwnd, false, [&] { no_op_permit_read = true; return false; }), "same-style no-op succeeds");
-            check(!no_op_permit_read && fixture.window_positions == no_op_positions && fixture.shows == no_op_shows,
-                  "same-style no-op does not check permit or change window position/visibility");
-            const auto original = miv::read_normal_screen_rect(hwnd);
-            check(original.has_value(), "normal geometry acquired including iconic");
-            const auto original_hwnd = hwnd;
-            HWND foreground = GetForegroundWindow();
-            for (bool taskbar : {true, false, true, false}) {
-                check(miv::update_editor_taskbar(hwnd, taskbar, [] { return true; }), "same HWND taskbar update");
-                check(IsWindow(hwnd) && hwnd == original_hwnd, "HWND retained");
-                check(((GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_APPWINDOW) != 0) == taskbar, "taskbar target style");
-                check(!!IsWindowVisible(hwnd) == initially_visible, "hidden/visible preserved");
-                check(!!IsIconic(hwnd) == iconic, "iconic preserved");
-                check(GetWindow(hwnd, GW_OWNER) == nullptr, "unowned preserved");
-                check(GetForegroundWindow() == foreground, "inactive style change does not activate");
-                auto rect = miv::read_normal_screen_rect(hwnd);
-                check(rect && rect->x == original->x && rect->y == original->y, "screen top-left preserved");
-                if (!taskbar) check(equal(*rect, *original), "client size roundtrip preserved");
-            }
-            check(miv::resize_normal_editor_frame(hwnd, 500, 400), "programmatic normal resize");
-            check(!!IsWindowVisible(hwnd) == initially_visible && !!IsIconic(hwnd) == iconic, "resize preserves visibility/iconic");
-            const auto close_rect = miv::read_normal_screen_rect(hwnd);
-            check(close_rect && close_rect->x == original->x && close_rect->y == original->y, "close snapshot retains normal position");
-            const auto expected = miv::editor_outer_size(DWORD(GetWindowLongPtrW(hwnd, GWL_STYLE)),
-                DWORD(GetWindowLongPtrW(hwnd, GWL_EXSTYLE)), GetDpiForWindow(hwnd), 500, 400);
-            check(expected && close_rect->outer_width == uint32_t(expected->cx) &&
-                  close_rect->outer_height == uint32_t(expected->cy), "programmatic resize status/client/native sizing");
-            const int prior_shows = fixture.shows;
-            check(miv::update_editor_taskbar(hwnd, true, [] { return false; }), "suppressed style update");
-            check(!IsWindowVisible(hwnd), "suppression never reveals frame");
-            check(fixture.shows == prior_shows, "suppression does not briefly show then hide");
-            check(DestroyWindow(hwnd) != FALSE, "style fixture window retired");
+        FrameFixture fixture;
+        fixture.visibility.request(initially_visible);
+        const DWORD ex = miv::editor_ex_style(WS_EX_WINDOWEDGE, true);
+        HWND hwnd = CreateWindowExW(ex, klass.lpszClassName, L"EffeTune",
+            miv::editor_frame_style(true, true), x, y, 640, 480, nullptr, nullptr, klass.hInstance, &fixture);
+        check(hwnd != nullptr, "inert HWND");
+        fixture.taskbar = std::make_unique<miv::EditorTaskbar>(hwnd, true, [&fixture, hwnd](HWND actual, bool add) {
+            check(actual == hwnd, "Shell operations scoped to frame");
+            if (add) ++fixture.adds; else ++fixture.deletes;
+            return S_OK;
+        });
+        if (initially_visible) ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        const auto original = miv::read_normal_screen_rect(hwnd);
+        RECT original_client{}; check(GetClientRect(hwnd, &original_client) != FALSE, "original native client");
+        check(original.has_value(), "normal geometry acquired");
+        const LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        const int positions = fixture.window_positions, shows = fixture.shows;
+        HWND foreground = GetForegroundWindow();
+        for (bool taskbar : {false, true, false, true}) {
+            const int adds = fixture.adds;
+            fixture.set_taskbar(hwnd, taskbar);
+            check(GetWindowLongPtrW(hwnd, GWL_EXSTYLE) == ex && GetWindowLongPtrW(hwnd, GWL_STYLE) == style,
+                  "ON/OFF leave native caption and styles identical");
+            check(!!IsWindowVisible(hwnd) == initially_visible && !IsIconic(hwnd), "normal setting toggle preserves visibility");
+            check(GetWindow(hwnd, GW_OWNER) == nullptr && GetForegroundWindow() == foreground, "owner/focus retained");
+            const auto normal = miv::read_normal_screen_rect(hwnd);
+            RECT client{}; GetClientRect(hwnd, &client);
+            check(normal && equal(*normal, *original) && EqualRect(&client, &original_client), "normal and client geometry unchanged");
+            check(fixture.window_positions == positions && fixture.shows == shows, "setting toggle neither shows nor reframes");
+            if (!initially_visible) check(fixture.adds == adds, "hidden setting toggle never AddTab");
         }
+        fixture.visibility.suppress(miv::GuiSuppression::RemoteSession, true);
+        ShowWindow(hwnd, SW_HIDE);
+        for (bool enabled : {false, true}) {
+            fixture.set_taskbar(hwnd, enabled);
+            const int adds = fixture.adds, shows_before = fixture.shows;
+            SendMessageW(hwnd, miv::editor_taskbar_button_created_message(), 0, 0);
+            SendMessageW(hwnd, miv::editor_taskbar_created_message(), 0, 0);
+            check(fixture.adds == adds && fixture.shows == shows_before && !IsWindowVisible(hwnd),
+                  "hidden/suppressed Shell events never add or show");
+        }
+        fixture.visibility.suppress(miv::GuiSuppression::RemoteSession, false);
+        fixture.visibility.request(true);
+        fixture.set_taskbar(hwnd, false);
+        for (int repeat = 0; repeat != 3; ++repeat) {
+            const int deletes = fixture.deletes;
+            ShowWindow(hwnd, SW_SHOWNA); fixture.sync(hwnd);
+            SendMessageW(hwnd, miv::editor_taskbar_button_created_message(), 0, 0);
+            check(fixture.deletes >= deletes + 2 && IsWindowVisible(hwnd), "OFF reapplied after repeated show and Shell creation");
+        }
+        SendMessageW(hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0);
+        check(!IsWindowVisible(hwnd) && !IsIconic(hwnd) && !fixture.visibility.requested(),
+              "OFF minimize follows user hide without desktop iconic stub");
+        check(fixture.closed && equal(*fixture.closed, *original), "OFF minimize publishes latest normal close geometry");
+        SendMessageW(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0);
+        check(!IsWindowVisible(hwnd), "OFF user-hide rejects unsolicited restore");
+        fixture.visibility.request(true);
+        ShowWindow(hwnd, SW_SHOWNA); fixture.sync(hwnd);
+        check(IsWindowVisible(hwnd) && !IsIconic(hwnd), "explicit button-equivalent Show reopens OFF user hide");
+        fixture.set_taskbar(hwnd, true);
+        SendMessageW(hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0);
+        check(IsIconic(hwnd), "ON minimize retains native iconic behavior");
+        check(miv::resize_normal_editor_frame(hwnd, 500, 400), "iconic programmatic resize");
+        const auto resized = miv::read_normal_screen_rect(hwnd);
+        check(resized && resized->x == original->x && resized->y == original->y, "iconic resize preserves normal origin");
+        SendMessageW(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0);
+        check(!IsIconic(hwnd) && IsWindowVisible(hwnd), "ON shell restore native behavior");
+        SendMessageW(hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0);
+        fixture.set_taskbar(hwnd, false);
+        check(!IsWindowVisible(hwnd) && !fixture.visibility.requested() && fixture.closed && equal(*fixture.closed, *resized),
+              "iconic ON to OFF uses causal user hide with normal snapshot");
+        fixture.set_taskbar(hwnd, true);
+        const int hidden_adds = fixture.adds;
+        SendMessageW(hwnd, miv::editor_taskbar_button_created_message(), 0, 0);
+        check(fixture.adds == hidden_adds && !IsWindowVisible(hwnd), "hidden iconic OFF to ON does not reopen or add");
+        fixture.visibility.request(true);
+        ShowWindow(hwnd, SW_RESTORE); fixture.sync(hwnd);
+        check(IsWindowVisible(hwnd) && !IsIconic(hwnd), "button-equivalent restore reopens hidden iconic frame");
+        const int deletes = fixture.deletes;
+        fixture.taskbar.reset();
+        check(fixture.deletes == deletes + 1, "destructor removes explicitly added taskbar entry before HWND retirement");
+        check(DestroyWindow(hwnd) != FALSE, "taskbar fixture window retired");
     }
     check(UnregisterClassW(klass.lpszClassName, klass.hInstance) != FALSE, "inert class cleanup");
     check(SetThreadDesktop(original_desktop) != FALSE, "worker desktop release");

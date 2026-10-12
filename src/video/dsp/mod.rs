@@ -401,6 +401,15 @@ fn editor_in_owner_chain(editor: u64, root: u64, mut owner: impl FnMut(u64) -> u
     false
 }
 
+pub(crate) fn editor_owns_foreground(
+    editor: u64,
+    foreground: u64,
+    root: impl FnOnce(u64) -> u64,
+    owner: impl FnMut(u64) -> u64,
+) -> bool {
+    editor != 0 && foreground != 0 && editor_in_owner_chain(editor, root(foreground), owner)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LatencyPolicy {
     AutoBypass,
@@ -1256,11 +1265,7 @@ impl DspBridge {
                         // Codex P2 round 6: 単に Err を返すだけだと per-plugin skip 扱いで
                         // chain が is_enabled() のまま放置される。明示的に
                         // `disable_with_reason` してセッション全体を止める。
-                        if version != crate::video::dsp::bridge::PROTOCOL_VERSION {
-                            let reason = format!(
-                                "VST3 bridge protocol version mismatch (bridge reported {version}, mIV expects {})",
-                                crate::video::dsp::bridge::PROTOCOL_VERSION
-                            );
+                        if let Err(reason) = bridge::require_current_protocol(version) {
                             self.disable_with_reason(Some(reason.clone()));
                             return Err(reason);
                         }
@@ -1849,11 +1854,20 @@ impl DspBridge {
             return false;
         }
         let root = unsafe { GetAncestor(HWND(foreground as *mut _), GA_ROOT) }.0 as u64;
-        editor_in_owner_chain(editor, root, |window| {
-            unsafe { GetWindow(HWND(window as *mut _), GW_OWNER) }
-                .unwrap_or_default()
-                .0 as u64
-        })
+        let in_front = editor_owns_foreground(
+            editor,
+            foreground,
+            |_| root,
+            |window| {
+                unsafe { GetWindow(HWND(window as *mut _), GW_OWNER) }
+                    .unwrap_or_default()
+                    .0 as u64
+            },
+        );
+        crate::logger::log(format!(
+            "[EffeTune GUI] foreground editor=0x{editor:x} captured=0x{foreground:x} root=0x{root:x} in_front={in_front}"
+        ));
+        in_front
     }
 
     pub fn activate_slot_gui(&self, idx: usize) {

@@ -1479,8 +1479,9 @@ worker の hidden attach 前後と host GUI の表示直前でも成功時 revis
 
 ## 17. 音響調整窓のタスクバー表示（2026-10-12 設計メモ）
 
-**状態: R2設計修正・再レビュー待ち。製品コード未変更。** 利用者指定の案A（窓の表示スタイルだけを変更）を
-採用し、設定ON/OFF・既定ONとする。mIVのAppUserModelID、shortcut、pin、Jump Listは変更しない。
+**状態: R2独立ACCEPT後の実装・実機確認を経て、§17.10の修正を実施。** 以下§17.1–§17.8は
+R2設計時の記録。現在のOFF時のtaskbar方式とiconは§17.10を正とする。
+設定ON/OFF・既定ON、mIVのAppUserModelID、shortcut、pin、Jump Listを変更しない範囲を維持する。
 EV9のCtrl+R修正・検証完了後に着手。調査先はmain worktree、HEAD `e984bab26`、開始時の差分なし。
 別worktreeに残るEV9差分を移動・変更していない。
 上記はR1調査の記録。R2は `C:/home/mimageviewer-nexteffetune` のHEAD `74e735f77`、
@@ -1788,3 +1789,115 @@ skipされたvendor egui25/25・egui-wgpu11/11・eframe18/18を個別補完し�
 release scriptのPreserveRuntimeはインストール版の起動を検出して停止したため、既存processを触らず、
 AGENTS.mdで許可された直接Cargoのcore/helper→launcher経路でrelease確認物を作成した。
 両確認物は非署名であり、配布時の署名・公開とは分ける。agentによるアプリ起動・コミットはない。
+
+### 17.10 利用者実機確認後の修正（2026-10-12、基点26b7dfaf2）
+
+利用者がrelease launcherでtaskbar表示・最小化/復元・最小化後Closeの配置保存・設定即時反映を確認した。
+残る3点はiconの識別、ボタン再押下のHide、OFFの小さいnative captionである。
+
+OFFの小さいcaptionは`WS_EX_TOOLWINDOW`による。EffeTuneはON/OFFとも同じ通常frameと
+`WS_EX_APPWINDOW`を使い、owner=0を保持する。表示設定はhost GUI threadの
+`ITaskbarList::HrInit`→`AddTab`/`DeleteTab`に集約し、frame再作成・exstyle切替・配置変換を起こさない。
+正当な表示/復元と`TaskbarButtonCreated`で現在のOFF要求を適用し、Shell再作成時も再反映する。
+隠れた/抑止されたframeへAddTabしない。Hide/破棄時は明示追加した項目を削除する。
+ownerを持つ補助窓の新設はownerなし契約と寿命を増やすため採らず、mIV全体AppUserModelIDも使わない。
+APIの根拠はMicrosoftの[taskbar仕様](https://learn.microsoft.com/en-us/windows/win32/shell/taskbar)、
+[AddTab](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-itaskbarlist-addtab)、
+[DeleteTab](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-itaskbarlist-deletetab)、
+[TaskbarButtonCreated](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nn-shobjidl_core-itaskbarlist3)。
+
+OFF時はtaskbarに復元入口がないため、SC_MINIMIZEを既存user-hideへ合流させる。
+音響調整ボタンで再表示し、DSPは継続する。ONのnative minimize/restoreは維持する。
+すでに最小化した窓をOFFへ変更した場合もuser-hideに合流し、画面上に復元できない最小化枠を残さない。
+表示希望/抑止は既存GuiVisibility、iconicはOSが所有し、coreに最小化boolや復旧stateを増やさない。
+Shell操作のまれな失敗は既存log＋gui_warningに留め、retry、部分復旧、settings削除は行わない。
+
+窓iconは`assets/icon.ico`に図形の音符を右下へ重ねた`assets/effetune.ico`とする。
+16/24/32/48/64/256を各々描画し、font/emojiに依存しないPython/PIL生成スクリプトをscriptsへ置く。
+生成物も追跡し、base icon・生成物・生成scriptをhost source identityとCMake/Cargoの変更検知に含める。
+core/launcherのiconは変更しない。
+
+前面判定に使う登録HWNDはGuiAttachedのouter frameで正しく、GA_ROOT/GW_OWNERの照合も維持する。
+不具合はMainWindowObserverのクリックsnapshotの寿命境界にある。
+`WM_MOUSEACTIVATE(editor)`→`DOWN(main)`→遅着`WA_CLICKACTIVE`でPressedがActivatingへ戻ると、
+eguiのrelease consumerはsnapshotを使わずcurrent main HWNDを返し、HideがActivateへ変わる。
+input queueが異なる場合のWM_ACTIVATEは[公式仕様上非同期](https://learn.microsoft.com/en-us/windows/win32/inputdev/wm-activate)。
+native captionが必ずこの順序を作るとは断定せず、実機の通知列は未採取と区別する。
+同じnative message reducerとfake HWNDのroot/owner treeでこの壊れた遷移を再現し、
+前面frame/child/nested popupはHide、別VST/外部窓/mainはActivateになることを検査する。
+
+単一ClickForeground enumでactivation/press/release/完了を所有し、DOWN/UP後の遅着activationは
+snapshotを降格させない。消費/取消を終端とし、遅着で古いクリックを再開しない。
+次のfresh activation/DOWNは新しいgestureを開始する。mouse/touch/pen、keyboard、cancel、
+double-click、独立した次のクリックも同じ所有境界で検査し、delay、PID代替判定、余分なpending boolを追加しない。
+standard winitはpointer/touchをconsumeするため、mouse promotionが実機で二重配送されたとは扱わない。
+実機再確認にはボタン操作時だけのinput provenance・captured/current/editor/root HWND・visible/action logを残し、
+WndProc/毎frameのlogや同期IPC/FSを追加しない。
+
+生成ICOをrootが16pxを含むpreviewで目視確認し、再生成byte一致・6サイズ・identity回帰を通過した。
+CMake/CTestは4/4（21.75秒）、source identity一致、vendor hostを更新済み。
+Windows COM headerのsmallマクロと既存icon local名の衝突は変数名変更で解消した。
+最終検証（2026-10-12/13、未コミット差分）:
+- EffeTune焦点127/127（入力状態の最終12件を含む）、Preferences snapshot3/3、fmt、UI glyph zero、
+  通常/portable core checkを通過。生成ICOの再生成byte一致・identity回帰・canonical CRT4本一致も確認。
+- release wrapperはPreserveRuntimeで稼働中インストール版を検出して停止。既存process/APPDATAを触らず、
+  AGENTS.md許可の直接Cargo core/helper→launcher経路で非署名release確認物を完成した。
+  host source markerは`42ec87a5d776066961245fc23a96a003cc91b1d7d23c1b50d58724d4e71ee907`。
+  最終vendor host全byteとcore内包、最終coreとlauncher内包の一致、CRT依存検査を通過。
+- 初回test-fullは本体lib12,228 PASS / 57 ignored / 0 FAILの後、UI snapshot末尾で記録が途切れ、
+  Codex側中断後にprocess/sessionも消失した。終了status不明のgateをPASS/製品FAILとは扱わない。
+  未完了の`tracks_hud_music_543pt_dark`は単独1/1 PASS（0.98秒）。
+  終了証拠がない条件不成立のため、同じsource/期待値をCARGO_BUILD_JOBS=4・RUST_TEST_THREADS=4で
+  1回再実行し、test-fullを完了した（exit0 / PASS）。本体lib12,228 PASS / 57 ignored、
+  UI snapshot全163件、vendor egui25・egui-wgpu11・eframe18件も通過した。
+  全result集計は13,505 PASS / 0 FAIL / 64 ignored（65 target結果、fixture子実行を含む）。
+  初回中断logと再実行logを両方保持し、期待値の緩和/skip/製品変更は行っていない。
+
+証拠と利用者確認手順は`target/ET-1378-impl-msg.txt`、
+`target/ET-1378-R3-test-full-retry.log`、`target/ET-1378-R3-release-embed-final.json`に集約する。
+R3はhost変更のためrelease確認物を使う。先行R2のdev-runtimeを今回の更新物として扱わない。
+本体起動・desktop操作・外部vendor backup更新・コミットは行っていない。
+
+### 17.11 独立コードレビューP2 2件の修正（2026-10-13、EV13と同じ未コミット差分）
+
+対象レビューはHEAD `26b7dfaf2`。reviewerはwindow/geometryのhost所有とframe付きimmutable配送を
+構造的な修正として認め、症状パッチではないことに同意した。EV13の§17.10を保持して以下を修正する。
+
+P2-1: EV13でstyle変更後のlayout経路は削除済みだが、refresh/再表示・DPI・host resize・
+pluginの`PlugFrame::resizeView`にiconic時の通知経路が残っていた。
+`read_normal_editor_client`→`layout_normal_editor_child`→`apply_normal_editor_client`を共有のallocation入口とし、
+iconic中は復元用normal placementだけを変える。child、`onSize`、既存last_gui_width/heightを更新しない。
+SetWindowPosからのreentrant minimizationも、通知/cache更新前の通常client確認で失効する。
+WM_SIZEのSIZE_MINIMIZEDも通知を起こさず、explicit activateはSW_RESTORE後に通常clientをrefreshする。
+Remote/main suppressionの解除やClose後のSW_SHOWNAはiconicを保持し得るため、その時点では通知しない。
+hidden-but-normalのattach・resize・generic VST受領は維持する。
+実PlugFrameとfake IPlugView、inert childを使う隔離desktop回帰で、最小化中のON/OFF、
+Close→再表示→Restore、Remote抑止解除、通常通知とcached寸法、generic/fixed/resizable/各DPIを検査する。
+新しいminimized bool、pending resize、待機/復旧queueは追加しない。
+
+P2-2: GUI Closeのframe必須payload/通常矩形/taskbar命令は旧v6と互換でないため、
+core・C++ host・独立testerをprotocol v7へ上げる。coreのload/probeは同じready-version検査を使い、
+v6 Readyをaudio open/GUIより前に拒否する。hostはv6 Helloへerrorを返して終了する。
+fake endpointとtesterの旧Ready拒否、実hostのHello7/旧Hello6（従来5も）のheadless疎通を回帰に加える。
+source identityはrelease成果物一致の別gateであり、debug時も必要なhandshake互換性判定を代替しない。
+共有suppression mappingのlayout/versionは変えない。旧hostを受理してCloseを無視するfallbackは置かない。
+
+上記以外のrareな取得/配送/保存失敗は既定のlog＋通知で扱い、部分復旧やretry loopを増やさない。
+host再生成後のCMake Release serial1 buildとCTest 5/5を通過（39.89秒）。fake viewは実PlugFrameを使い、
+公式SDKのcommoniids.cppをfixtureにもlinkする。source identityは
+`027fd0b95b62f17fe97ebefab203e43d9b299179329588ac7e409cb7fc63d10b`と一致。
+vendor hostは1,198,592 bytes、SHA256
+`ba77679f2f953bf1c75937c7d680c7939b8907860cd94b83db8b75613514d337`。
+canonical CRT4本一致、identity回帰、専用ICO再生成チェックも通過。
+Rust bridge18件、EffeTune127件、tester旧Ready拒否1件、fmt、通常/portable core check、UI glyph zeroを通過。
+P2はPreferencesの配置/stringを変えず、§17.10のsnapshot3件の証拠は維持する。
+
+build-release.ps1 -PreserveRuntimeは稼働中インストール版を検出しexit1で停止した。
+process/APPDATAを操作せず、AGENTS.md許可の直接Cargo core/helper→launcherで非署名release確認物を完成。
+最新host全byteとcore内包、最新core全byteとlauncher内包、CRT依存runtime4/pe4・内包pe12の検査を通過。
+full gateはソース変更なし・CARGO_BUILD_JOBS=4/RUST_TEST_THREADS=4で1回実行し、exit0 / PASS。
+本体lib12,230 PASS / 0 FAIL / 57 ignored（1199.10秒）、UI snapshot163/163 PASS（36.01秒）、
+vendor egui25・egui-wgpu11・eframe18件も通過した。
+全result集計13,508 PASS / 0 FAIL / 64 ignored（65 target結果、fixture子実行を含む）。
+最終identity・差分チェックも通過。証拠は`target/ET-1378-EV13-P2-*`、引き渡しは`target/ET-1378-impl-msg.txt`。
+本体起動・外部backup更新・コミットは行っていない。実Shell/pluginと前面ボタンの実機再確認は利用者が行う。

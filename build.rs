@@ -103,6 +103,8 @@ fn check_release_vst3_host_identity() {
         "crates/vst3-host/src",
         "crates/vst3-host/tests",
         "assets/icon.ico",
+        "assets/effetune.ico",
+        "scripts/generate-effetune-icon.py",
         "vendor/vst3-host/mimageviewer-vst3-host.exe",
     ] {
         println!("cargo:rerun-if-changed={path}");
