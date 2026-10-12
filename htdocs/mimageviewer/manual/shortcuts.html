@@ -263,7 +263,7 @@
           <li>ファイル削除・移動は対象外です。</li>
           <li>10 枚に <kbd>F3</kbd> で一括★3 → <kbd>Ctrl</kbd>+<kbd>Z</kbd> 1 回で 10 枚すべてが元に戻ります。</li>
           <li>スライダーはドラッグ後に手を離した時点で 1 操作とカウントされるので、CRT エミュレーション設定のような細かい調整も「1 つ前に戻す」が直感的に効きます。</li>
-          <li>フォルダ移動・フルスクリーン遷移・フルスクリーン中のページ切替・消しゴムモード遷移で Undo 履歴がクリアされます（現在のページ・モード単位で履歴を保持）。</li>
+          <li>フォルダ移動・通常のフルスクリーン遷移・手動のページ切替・消しゴムモード遷移で Undo 履歴がクリアされます。★の変更で条件から外れた際の自動移動・現在の一覧への復帰では、評価の取り消し履歴が残り、直後の <kbd>Ctrl</kbd>+<kbd>Z</kbd> で評価と元画像へ戻れます（<a href="grid.html#rating-filter-move">評価変更と絞り込み</a>）。</li>
           <li>消しゴムモード中は <kbd>Ctrl</kbd>+<kbd>Z</kbd> がマスク編集側の Undo に切り替わります。</li>
         </ul>
       </div>
@@ -307,6 +307,7 @@
           <tr><td><kbd>Ctrl</kbd>+<kbd>O</kbd></td><td>フォルダを開くダイアログ</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>F</kbd></td><td>現在地フィルタを表示（今表示中のグリッドを絞り込む。PDF ページ表示中は無効）</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>G</kbd></td><td>アイテム検索バーを表示（お気に入り全体の画像・PDF・動画を横断）</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>R</kbd></td><td><a href="search.html#ctrl-r">Everything ファイル名検索</a>を開く。メインウィンドウの一覧で有効。入力した検索語は変換確定後の Enter または「検索」で送信します。操作カスタマイズで変更・解除できます</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>S</kbd></td><td>コンテナ検索バーを表示（お気に入り配下のフォルダ・ZIP・PDF を名前で横断検索）</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>T</kbd></td><td>タグビューを表示（mIV タグで画像・動画・フォルダ・ZIP/PDF を横断）</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>B</kbd></td><td>チェック済みアイテム（なければ選択中の 1 件）を追加先の本へ追加</td></tr>
@@ -399,7 +400,7 @@
           <tr><td><kbd>Shift</kbd>+<kbd>F1</kbd>〜<kbd>F5</kbd></td><td>今見ている画像が入っているフォルダ / ZIP / PDF 本体にコンテナ★を付与</td></tr>
           <tr><td><kbd>Shift</kbd>+<kbd>F6</kbd></td><td>コンテナ★を解除</td></tr>
           <tr><td>標準キーなし</td><td>表示中のアイテム / 現在のコンテナの評価を1段階上げる・下げる（「操作カスタマイズ」で割り当て）</td></tr>
-          <tr><td><kbd>Ctrl</kbd>+<kbd>Z</kbd> / <kbd>Ctrl</kbd>+<kbd>Y</kbd></td><td>レーティング / タグ / 画像補正操作を取り消す / やり直す（フルスクリーン中の画像切替で履歴はクリアされます）</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>Z</kbd> / <kbd>Ctrl</kbd>+<kbd>Y</kbd></td><td>レーティング / タグ / 画像補正操作を取り消す / やり直す（手動の画像切替で履歴はクリア。★の変更による自動移動・一覧復帰では評価履歴を保持し、取り消しで元画像へ戻れます）</td></tr>
           <tr><td><kbd>右Ctrl</kbd>（既定、押している間）</td><td>元画像プレビュー（補正・ポストフィルタ・AI 処理・消しゴム補完・補正レイヤー・隠蔽加工・テキスト注釈を一時的に外す）。「操作カスタマイズ」で変更・無効化できます</td></tr>
           <tr><td><kbd>E</kbd></td><td>消しゴムモード開始 / マスクを確定して AI 補完実行（<a href="erase.html">詳細</a>）</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>G</kbd></td><td>補正レイヤーモード開始（<a href="local-adjustment.html">詳細</a>）。「操作カスタマイズ…」で変更可能</td></tr>

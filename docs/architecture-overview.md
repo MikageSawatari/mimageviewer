@@ -50,6 +50,33 @@ synthetic pathから推定しない。recipeはViewerContextBundleのmount/fork�
 Remoteは本の通常responseから復元し、A2のSingle/一時Spreadを本へ保存しない。
 
 
+## Everything検索の所有（§1.374）
+
+Everything ファイル名検索（§1.374、実装中・検証待ち）は `everything_ipc`
+（pure codec / Windows不可視reply-window transport）と`everything_results`
+（対応形式/pathの検査とworker stat）を追加し、一覧のownerは既存 `GlobalSearchState` と
+`TopLevelGridView::Search` に置く。`SearchSource`、排他的pending `SearchProducer`、
+accepted `SearchAccepted` / `EverythingPosition` がdraft・取得中・表示中の位置を区別する。
+`SearchPageEditPrepare` がimmutable datasetからsort/★/tag/編集情報を準備し、既存adoptionへ渡す。
+通常thumbnail・物理本open/back・F12 fork/park/promoteを利用し、検索専用の第二items/cache/worker群を作らない。
+Everything本体/SDK DLLは同梱せず、同PCで起動中の既定clientへ直接IPCする。
+IPCのHWND/send/pump/packetは検索ごとの`everything-ipc` runが一括所有し、検索prepare workerは
+完了event/取消eventで待つ。native sendが遅くても取消は先に返し、旧runは有限deadlineで自然退役する。
+[遅いsendと取消の契約](everything-search-plan.md#17-wm_copydataの遅い送信と取消2026-10-12)。
+raw10,000件・明示送信・完了後一括採用・mainの取消可能modalを使う。
+新設定field/DB/schema/検索履歴/Remote APIは追加せず、query/result一覧は永続化・診断ログへ保存しない。
+PDF共有poolの失効は先行改修 `4510346f5` / master `c1e66f589` のviewer-context ownerを使う。
+最新実装の独立レビューと自動/実機検証の受入は未完了。
+[仕様・履歴・検証台帳](everything-search-plan.md#14-実装記録2026-10-12検証待ち)。
+
+## PDF render epochのviewer-context所有（§1.377）
+
+未リリースPDF-EPOCH-OWNERSHIP: PDF renderの失効権限は非Cloneの
+`PdfRenderEpochOwner` としてApp投影/ViewerContextBundleが一つずつ所有する。
+worker/Jobはimmutable ticketだけを持ち、失効とViewer優先昇格はそのowner/要求世代に限定する。
+registryの値移譲はidentityを保持し、forkはfresh owner。共有pool内maintenanceがpruneを担当し、
+UIはatomic＋非blocking wakeだけ。fullscreen本体・独立backgroundは明示Unscoped。
+[後継設計](pdf-render-epoch-ownership-plan.md)。
 
 mimageviewer 全体の構造を俯瞰するための入口ドキュメント。**修正作業の前に必ず目を通すこと**。
 個別の詳細は下の「関連ドキュメント」にある専用ページに任せる。
@@ -86,6 +113,13 @@ UI は snapshot 提出と進捗参照を行い、停止・join・DB cleanup は�
 起動確認の省略には既存の `fts_meta.db`・`search_index.db`・`similar.db` 内の追加テーブル
 `scanned_once` を使う。fts/name は root 単位、similar は有効 root 集合全体で1つの完走印を持ち、
 永続ストアの追加や保存先の変更はない。
+
+live一覧のcursor／Shift起点は `App::move_grid_cursor(target, GridCursorIntent)` が所有する。
+入力callerは明示Move/Extendまたは受理no-opのExplicitKeep、自動採用callerはAutomaticを
+必ず指定する。明示入力は同context・一覧のrating履歴、pending復帰、ring内Grid originの
+復帰権限を失効させてからcursorを公開する。クリックpolicyはローカルコピーから行先を
+計算し、このownerへ渡す。identity remap／contextの値転送は対を保つ既存非navigation経路。
+詳細と全caller分類は [評価filterのfullscreen整合](rating-filter-fullscreen-plan.md)。
 
 ---
 
@@ -379,7 +413,7 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 
 | モジュール | 役割 |
 | --- | --- |
-| `search_query.rs` | 検索クエリのトークナイザ + マッチャ (AND / OR / NOT / `"..."` フレーズ、`MatchMode`)。3 モード共通 |
+| `search_query.rs` | 検索クエリのトークナイザ + マッチャ (AND / OR / NOT / `"..."` フレーズ、`MatchMode`)。Ctrl+S/F/G共通、Everythingは通さない |
 | `search_norm.rs` | `normalize_for_match` — ingest / クエリ / post-filter で共有する唯一の正規化関数 (lowercase) |
 | `search_index_db.rs` | Ctrl+S 用 `search_index.db` (お気に入り配下のフォルダ / ZIP / PDF / 動画名) |
 | `fts_index.rs` | Tantivy 0.26 ラッパ。`IndexDoc` / `Fields` / `QueryFilters` / `build_bigram_and_query` / `search_page`。bigram tokenizer + lower_caser |

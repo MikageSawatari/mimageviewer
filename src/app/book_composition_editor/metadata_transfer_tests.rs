@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Sent editor saves must finish at their existing receipt owner before any
 //! metadata maintenance producer is admitted, even after the viewer retires.
 #![cfg(windows)]

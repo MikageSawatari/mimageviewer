@@ -4051,7 +4051,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer"
-version = "4.5.0"
+version = "4.6.0"
 dependencies = [
  "ab_glyph",
  "base64",
@@ -4075,6 +4075,7 @@ dependencies = [
  "kamadak-exif",
  "libraw-sys",
  "local-adjust-core",
+ "log",
  "lopdf",
  "mimageviewer-ipc",
  "mimalloc",
@@ -4130,7 +4131,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-ipc"
-version = "4.5.0"
+version = "4.6.0"
 dependencies = [
  "argon2",
  "getrandom 0.3.4",
@@ -4141,7 +4142,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-launcher"
-version = "4.5.0"
+version = "4.6.0"
 dependencies = [
  "fs4",
  "miv-startup",
@@ -4153,7 +4154,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-remote"
-version = "4.5.0"
+version = "4.6.0"
 dependencies = [
  "argon2",
  "fast_image_resize",
@@ -6815,8 +6816,6 @@ dependencies = [
 [[package]]
 name = "tantivy"
 version = "0.26.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "edde6a10743fff00a4e1a8c9ef020bf5f3cbad301b7d2d39f2b07f123c4eac07"
 dependencies = [
  "aho-corasick",
  "arc-swap",

@@ -32,6 +32,13 @@ UIでDBを開かず、古い投影処理による上書きを防ぐ。詳細は[
 
 ---
 
+PDF thumbnailの一覧失効・優先昇格はviewer owner/要求世代/keyに限定する
+（未リリースPDF-EPOCH-OWNERSHIP）。seek/hoverもViewer ticketをUI admissionで捕捉し、
+派生workerで更新しない。fullscreen本体はUnscoped＋既存fs_pending cancel/generation、
+そのpromotionはUnscoped jobsだけをfoundと数える。兄弟同PDF/pageの表示要求は失効しない。
+GPU upload、ThumbnailRequests、Canceled/SourcePixels/Finalizedの既存採用契約は維持する。
+[詳細](pdf-render-epoch-ownership-plan.md)。
+
 ### 音声セルの代表画像 (§1.347、2026-10-08)
 
 同名補助画像の採用は表示行の種類投影から独立している。画像種類を隠しても既存の候補順で
@@ -700,6 +707,39 @@ continuous transition が実際に選ばれた場合も同イベントへ `branc
 フルスクリーンの先読み対象は、`items` 全体ではなく `visible_indices` 由来の display list から
 作る。★フィルタや Ctrl+F で一覧が疎になっているときも、スライドショー / 前後移動と同じ
 次候補を先読みし、フィルタで隠れた画像は対象にしない。
+
+評価変更による所属更新 (§1.371) は、各 viewer context の表示集合を採用する境界で読書位置まで
+調停する。現在ページが残れば同じ identity を保ち、外れれば旧読書順の次の残存ページ、なければ
+前へ一度だけ着地する。RTL でも読書順の ordinal が増える方向を「次」とし、raw index や左右キーで
+反転しない。読書対象がゼロなら既存 teardown で現在の絞り込み済みページ一覧へ戻り、親退出や
+filter 解除を行わない。strip / seek / ページ番号、見開き相方、連結 unit、先読みは同じ採用済み集合を使う。
+評価による landing / close は評価通知と評価 Undo を保持し、有効な Undo origin の復帰を通常近傍より
+優先して一度適用する。独立した `DetachedPhysical` は main の global filter に従わず、main の所属更新で
+移動・閉鎖しない。ContextTable の plan / execute / finish 中に publication を再入させず、設定投影済みの
+安定境界でその owner だけに公開する。
+
+リングの★は保存済み live preview のまま、その preview だけで離脱する既存行を picker 終端まで
+context の共有表示集合へ残す。全画面専用の例外ページ列は作らない。新しい検索 hit・件数・明示 sort は
+即時採用し、保留行を含む集合から可視件数と読書ページ数を毎回計算する。source 削除・非評価条件の離脱を
+復活させず、通常終端で保留だけを外して最終成功値から一度調停する。集合決定・非同期結果の採用前検証・
+Undo 復帰の取消は [評価変更と絞り込みの計画](rating-filter-fullscreen-plan.md) を参照。
+grid cursor の移動・解除は §1.370 の `App::move_grid_cursor` に適用し、scroll intent は集合採用callerが保持する。
+Grid起点の評価Undo/Redoは、元項目が現在集合へ戻れば同じownerからcursorとShift起点を戻す。
+明示選択は履歴内のGrid originをValueOnlyへ失効させ、live requestの復帰も取消す。Viewer originからの復帰と分け、Grid復帰ではreaderを開かない。
+同identityの再配置は移動とせず、selectedとShift+クリック起点をそれぞれpaired remapする。
+Searchの同一覧items交換では、readerのexact identity transferを完了してからvisible集合を再計算し、
+集合ownerが行先を一度適用する。交換前のreader idxを交換後のslotへ解釈してpickerのsource離脱を判定しない。
+ページidentity/sidecar準備でopenを待つ場合は、既存の遅延open要求にrating/Manualのmetadata境界を保持し、
+IndexOnlyと通常hydrationの両再開経路へ渡す。遅延を挟んだrating Undo復帰でもrating Redoを消さない。
+所有中のrating遅延targetは集合ownerの論理的な着地点とし、集合更新時のKeep/Move/Emptyを一度適用する。
+Keepは要求を継続し、Moveは置換、Emptyや手動操作はその要求だけを取消す。再開時に移動先を再決定しない。
+
+2026-10-11の利用者決定により、Rating/Searchのitems再採用に伴う編集の扱いは出荷済みboundaryの
+再利用へ限定する。Rating再採用は既存境界で編集を終了し、非rating Undoを落としてrating Undoだけを
+保持する。Searchは既存のclear/cancel方針を維持する。reader同identityとselected/Shift起点のpaired remapを
+保つ一方、loaded/global editorやidx-only Undoの新しい保持/remap、一般editor ownerの拡張は行わない。
+v4.5.0で既存のSearch streaming idx-only誤配送は別件・本修正の対象外であり、利用者がバックログへ
+記載する。根拠と受入範囲は [編集範囲の利用者決定](rating-filter-fullscreen-plan.md#stage-2-の編集範囲限定--利用者決定-2026-10-11) を参照。
 
 ### 2.2 ロードスレッド
 

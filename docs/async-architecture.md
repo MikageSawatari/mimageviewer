@@ -25,6 +25,94 @@ Remoteは本の通常responseから復元し、A2のSingle/一時Spreadを本へ
 
 ---
 
+## Everything の取得と共通Search採用（§1.374、未リリース）
+
+`GlobalSearchState.pending` の `SearchProducer` がMetadata/Everythingを排他に所有し、
+Everythingのrun/query/context/items generation/送信時policyと取消tokenを保持する。
+送信時policyは同producer内の`Box<Settings>`に置き、未実行時のApp/bundleへ大きいSettingsを
+インラインで持ち込まない。immutable snapshotの所有・移譲・freshness契約は同じである。
+取得中はmain contextの取消可能modalに集約し、open/navigation/別queryの組合せを増やさない。
+送信/本からの帰路のproducerは `SessionHandle::try_local_modal_lease()` の非Clone leaseも所有する。
+Remote acquireと同じsession mutex・typed ownerで受付を排他にするため、事前のUI bool検査後に
+Remoteが割り込む隙間を残さない。取消/失敗/採用/dropでleaseを解放する。
+公開phaseはLocalのままで兄弟窓を止めず、Remote wire schema/APIに検索を追加しない。
+`SearchPageEditPrepare` のworkerが `everything_ipc` を呼び、検索ごとのIPC runを開始する。
+専用不可視reply window/send/packet/message pumpはIPC run一つのthread-affine RAII ownerが持ち、
+egui/HWNDを流用しない。検索workerは完了event/取消eventをOSで待ち、取消時はnative sendやjoinを
+待たず戻る。IPC runはそのbounded sendが終わるまでHWND/callback/送信bufferを保持して自然退役する。
+caller threadを検索終了まで生かし、Everythingのcaller-thread監視と衝突しない。
+完了は一件用channelで移譲し、取消済みcallerの遅い完了はIPC worker内で破棄する。第二の一覧ownerは作らない。
+
+Win32送信失敗はworker内で、`SendMessageTimeoutW`直前にlast-errorを0へクリアし、
+戻り値直後の`GetLastError`とmessage/status番号だけを通常の非blocking loggerへ記録する。
+応答停止したclientへのversion照会失敗ではqueryを送らず、reply HWNDをRAIIで破棄する。
+retry・IPC versionのfallbackは行わない。実clientの応答停止を調べる
+手動のignored probeとfake HWND回帰は[調査記録](everything-search-plan.md#15-実everything-sendfailed調査2026-10-12)を参照。
+
+statusは1秒/ABORTIFHUNG、queryはsend＋replyで合計60秒まで。
+query sendはERRORONEXITで待ち、CPU/DB処理中にmessage pumpが止まることだけでは失敗にしない。
+NOTIMEOUTIFNOTHUNG/BLOCKは使わない。caller全体にも65秒の上限（status4回＋query60秒＋cleanup）を置く。
+timeout/hungはBusy案内、IPC HWND不在はclient起動案内へ分ける。Process.RespondingはIPC windowの応答証明にしない。
+詳細と実機観測は[§17](everything-search-plan.md#17-wm_copydataの遅い送信と取消2026-10-12)を参照。
+`WM_COPYDATA` callbackは16MiBの上限とrequest IDを
+確認してowned bytesへコピーし、UTF-16/table/offset解釈と候補stat/DB準備はcallback外のworkerで行う。
+queryは終端を含む32,768 UTF-16 unitsまで、raw件数は10,000、offsetは0でpagingしない。
+取消/close/source切替/context retireは同じdrop/cancel境界へ通す。UIはworkerをjoinしない。
+IPC runは取消を観測後、同じreply HWNDへ`nothing:`を一度だけ最大100msで送信して破棄し、返信や相手の停止を待たない。
+
+validated replyは `EverythingDataset` に分類・statし、`SearchProjection::Everything` から既存prepareへ
+渡す。sort/facet/編集metadataと完成items/metasを準備してから一回のadoptionで公開する。
+Everythingの動画pinも同じworkerで、初期化済みVideoPinDbの実pathをreadonlyで開き、
+`lookup_webps_many`のSQL/WebP BLOB取得を完了させる。完成metadataのArcマップを
+`SearchVideoPins::Prepared`として既存動画thumbnail workerへ移譲する。空mapも完成payloadであり、
+UIでDB再取得へfallbackしない。DB connection/書込権限はVideoPinDbが保持し、workerは
+readonly sourceと変更revisionの読取publicationだけを持つ。更新/DB instance交換でstaleな
+metadataは既存Search再準備へ戻す。BLOBをUIでclone/decodeせず、cancel/dropのpayload退役も既存ownerを使う。
+既存Ctrl+Gの`SearchVideoPins::Existing`には同期bulk lookupが残ることをP2対応時に確認・報告した。
+今回のEverything修正からは広げず、別件として扱う。
+古いrun/context/generation/policyの完了は副作用を公開しない。sortや本からの帰路では保持datasetを
+同じprepare workerで再利用し、Everythingへ問い合わせない。UIに新しいFS/DB/IPC待機を追加しない。
+旧dataset/準備済みpayload/receiverの退役は既存smart-folder payload退役workerへ渡し、
+10,000行の最終解放やworker joinをUIで行わない。I/O permit数も送信時settings snapshotに保持する。
+IPCのversion/readiness/send/reply-copy/wait/parseは既存perf sinkへ件数・byte・時間だけを記録する。
+classify/prepare/adoptはrun/context/件数・時間を記録し、queryや全結果pathは記録しない。
+Everythingのprepareは初期化済みpin DB handleとtags DBの実pathを取得し、pin/タグ/変換書庫Pending状態を
+workerで準備する。UIは既存prepared aggregate installとmap交換だけを行い、通常installの
+`refresh_folder_pin_map` / `prewarm_grid_tags` の同期DB照会を通らない。TAG_WRITESとpin handle/revisionが
+準備後に変われば、既存の通常write freshness再投影に戻す。新しい失敗回復やworker ownerは作らない。
+同一datasetのsort/facetだけがrating membershipを移譲し、新queryの候補は新sourceとして採用する。
+共通neighbor判定の旧/新集合交差はHashSetで行い、大量のdisjoint集合でUIの二乗探索をしない。
+
+thumbnail channel/queue/cancel/generationは既存context ownerを維持し、一覧交換はmainのPDF ticketだけを
+失効する。PDF prerequisiteは `4510346f5`（master `c1e66f589`、独立ACCEPT）であり、同pathのdetached兄弟へ
+無関係な失効を出さない。Remoteへsource/query/listを公開せず、既存local-control lockを守る。
+まれな失敗はlog＋通知、採用前の一覧保持で扱い、retry/recovery state/DB再作成は増やさない。
+自動検証と既知のEOF timing failureの再確認は台帳に記録する。独立実装レビュー・実機確認は未完了。
+[設計・検証台帳](everything-search-plan.md#14-実装記録2026-10-12)。
+
+## PDF render の viewer-context 所有（PDF-EPOCH-OWNERSHIP、未リリース）
+
+`App` のmounted投影と `ViewerContextBundle` が非Cloneの `PdfRenderEpochOwner` を
+移譲する。通常・priority/seek・upgrade・色分類のUI admissionは
+`LoadRequest.pdf_render_validity = Viewer(owner.snapshot())` を設定し、pin/RAW/EPUB等の
+派生workerはimmutable ticketをcloneする。workerが現在の世代を取り直す経路はない。
+一覧採用はそのcontextだけadvance、terminal/dropはそのownerだけretireする。
+park/mount/promoteはwriterを保持し、fork先はfresh ownerとIdleの昇格追跡を持つ。
+
+共有poolのNormal/HighNormal pruneは各job自身のticketを検査する。一覧失効のUI処理は
+atomic publishと容量1の非blocking wakeだけで、pool初期化・queue lock・走査・reply・joinは
+しない。pool内の一つのmaintenance workerがprune/reply/freeを行い、dispatcherはIPC前にも
+同じpredicateを検査する。late enqueue/retireはInterrupted→既存Canceled終端になる。
+in-flightのAbort/Harvest、request ID/items generationによる採用、共通source cache keyは維持する。
+
+Viewerの優先昇格/foundはowner identity＋要求世代＋既存keyで照合する。
+`PdfVisiblePromotionState` はticket/keys/retryを一つに保持してbundleと移譲する。
+兄弟同keyでretryを終えず、同keyの新世代でも再評価する。fullscreen本体/独立background/
+Similar/Remote/enumerateは明示Unscoped。fullscreen昇格もUnscoped同士だけを照合し、
+Viewer seek thumbnailを含めない。lane cap/open admission/Remote IPC schemaは変更しない。
+まれな失敗はログ＋通知、再試行・多段回復を追加しない。
+[設計と回帰条件](pdf-render-epoch-ownership-plan.md)。
+
 ## 本別見開き調整の永続化基盤とviewer/Remote接続（§1.364 D1–D3、2026-10-11）
 
 `SpreadShiftService`のUI handleは送信・immutable snapshot lookup・結果pollだけを行い、
@@ -450,9 +538,10 @@ session 取消で通知・未開始仕事を失効させ、最後の fetch / sav
 
 | EPUB のページ数メタ保存 | `epub-pdf-meta` | 列挙完了ごとに短命 1 本 | 非同期列挙が返した世代 stamp とページ数を親 catalog へ保存する。既存の warm catalog があれば共有し、cold open は worker が行う。旧世代の遅れた書込も stamp 不一致で再利用されない。通常 PDF の保存経路は従来どおり |
 | Ctrl+F メタデータフィルター | `std::thread` (`metadata-search`) + request 専用 `rayon::ThreadPool` | 外側 1 本 + Pass 2 最大 8 本 | Pass 1 の構造項目は逐次、画像 / 動画の on-demand メタ読みだけ 8 並列。前面検索なので `ActivityGate` は使わない。cancel 後は未開始 item を止め、開始済み item の結果までを部分結果として返す。XMP cache miss は正規化 path ごとの `OnceLock` で重複排除 |
-| メタ索引 supervisor (Ctrl+G 用) | `std::thread` (常駐) | お気に入りごとに 1 本 (`auto_index_metadata=true`) | 初期スキャン + notify-rs 監視 + ingest を統括。共有 `Arc<Mutex<IndexWriter>>` 経由で Tantivy writer を直列化 (Tantivy は Index あたり writer 1 本制約) |
-| メタ ingest worker | `std::thread` (supervisor 内部) | 速度プロファイルで 1 / 2 / 4 | メタ抽出 + Tantivy buffer + バッチ commit (100 件 or 5 秒) + commit 成功後に fts_meta upsert_meta_ok / delete_paths (Tantivy First) |
-| メタ walker | `std::thread` (supervisor 内部、1 回) | 1 | 起動時 3-way diff (FS vs fts_meta.db) |
+| メタ索引 supervisor (Ctrl+G 用) | `std::thread` (常駐) | 実効 ownership のお気に入りごとに 1 本 | 初期スキャン + notify-rs 監視 + supervisor 内の逐次 ingest/apply を統括。Tantivy writer は単一 `FtsWriterDispatcher` が所有し、commit/reload reply 成功後に SQLite を apply する。caller が reply を放棄しても永続化失敗は共有 reporter へ届く |
+| メタ ingest/apply | supervisor スレッド内の逐次処理 | 各 supervisor に 1。速度プロファイルは共有 I/O permit を調整 | メタ抽出 + dispatcher への batch (100 件 or 5 秒) + commit/reload 成功後に fts_meta upsert_meta_ok / delete_paths (Tantivy First)。独立した 1/2/4 ingest worker は作らない |
+| メタ構成/startup cleanup | `metadata_reconfiguration::Runtime` worker | manager に 1 | 固定構成の ownership cleanup/Failed reconciliation→supervisor spawn、構成変更の cancel/join/cleanup/spawn を所有。constructor/result送信/overlay解除は完了を待たない。起動 count 点検は常時実行し、cleanup 前の snapshot を使い、欠落疑いは log/通知/pending。UI は共有 maintenance view だけを読む |
+| メタ walker | supervisor スレッド内の逐次処理 | 各 Full ごとに 1 | FS ↔ fts_meta.db を追加・変更・削除へ分類。Tantivy の path 全集合は照合しない |
 | メタ FsWatcher | `std::thread` (notify-rs 内部) | お気に入りごとに 1 本 | `ReadDirectoryChangesW` + 500ms debounce → `DebouncedChange` 送信 |
 | 名前索引 supervisor (Ctrl+S 用) | `std::thread` (常駐) | 有効な正規化 root ごとに 1 本 (`auto_index_structure=true`) | manager が stop/join/clear/start を直列化し、完走印も同じ root の所有。印一致の起動は watcher 開始後の初回 Full だけ省く。手動 Full は owner mailbox で構成採用後・pause 再開後に実行 |
 | Ctrl+G クエリワーカー | `std::thread` (使い捨て) | 1 入力ごとに spawn | Tantivy ページング (Searcher snapshot 固定) + token matching (post-filter で Tantivy STORED 原文を引く) + streaming 送信 |
@@ -593,7 +682,7 @@ ZIP 自動/pin 代表を `process_load_request` の `RawThumbHandoff::DedicatedW
 | `SimilarIndexNotifier` | 既存 favorite supervisor → 別バージョン索引 scheduler | 同じ `FsWatcher` の追加・変更・削除通知を軽量な再照合要求へ変換する。進行中なら revision だけ進め、終了後の 1 回へ coalesce するため watcher を追加しない。coalesce された中間 pass では Complete 済みの検索 snapshot を保持し、最終 pass の全 in-flight 回収後だけ再読込する。検索用メモリ表は起動時 configure と索引 worker の DB open 時に専用 `similar-index-load` worker で先行ロードし、パネルは実行中に未ロードでも新たなロードを開始しない。`similar.compact` が DB store ID・内容世代・行数・hash/proxy version・SHA-256 と一致すれば順次読込し、不一致なら SQLite snapshot へ戻して sidecar を作り直す。更新中の右パネルは変更が完了後に反映されることを明示する |
 | `similar_index` bounded work queue | 別バージョン索引 coordinator → 16 scan worker | ルーズ画像 1 枚または本 1 冊を単位に、全体 16・ドライブ文字または UNC server/share ごと 8 まで実行する。操作中は既存 `ActivityGate` で 1 / 1 へ縮退し、cancel 時は未開始を捨てても in-flight 全件の終了を待ってから Cancelled を返す。本のページ処理と generation publish は 1 worker 内に閉じる |
 | `local_adjust_write_handle` の job / result | UI ↔ 補正レイヤー書き込みワーカー | job = `LocalAdjustWriteJob { key, generation, layers }` (`layers` は `Arc` 共有なので積んでも複製しない)。result = `LocalAdjustWriteCompletion`: `Settled { key, generation, layers, outcome }` / `Superseded { key, generation }`。**`layers` を結果にも載せる**のは、UI がミラーする文書を「worker が実際に書いたもの」に固定するため (メモリから取り直すと、積んでから完了までの間に入った編集を写す)。`Superseded` は成功でも失敗でもないので、ミラーもトーストも出さない |
-| `IndexerManager.writer` | 全書き込み経路で共有 | `Arc<FtsWriterDispatcher>` — Tantivy は Index あたり writer 1 本制約。専用ディスパッチャースレッドが優先度キュー (Interactive > Background) でジョブを直列処理する。 ingest worker (Background) と tag_write_worker (Interactive) は `WriterJob::Upsert` / `Delete` / `Commit` / `Batch` を `submit` するだけで、writer に直接触らない (§5.5)。 |
+| `IndexerManager.writer` | 全 FTS 書き込み経路で共有 | `Arc<FtsWriterDispatcher>` — Tantivy は Index あたり writer 1 本制約。専用ディスパッチャースレッドが優先度キュー (Interactive > Background) でジョブを直列処理する。ingest と purge/cleanup は dispatcher に job を `submit` し、writer に直接触らない (§5.5)。通常の tag_write_worker は tags.db のみを更新し、この writer を使わない。 |
 
 ### 2.3 ワーカーキュー
 
@@ -602,7 +691,7 @@ ZIP 自動/pin 代表を `process_load_request` の `RawThumbHandoff::DedicatedW
 | `reload_queue` | `Arc<Mutex<Vec<LoadRequest>>>` | 通常サムネイル要求 (Image/ZipImage/PdfPage に加え、PdfFile のフォルダ代表画も IPC 待ちのためここに振る)。**スクロール中 / visible 待ち中は `prefetch_allowed_now` gate で `req.priority=false` の prefetch enqueue が抑制され、queue 内の既存 prefetch も `q.retain` で prune される** (= PDF pool に prefetch が流れる前に止めて in-flight 占有を防ぐ、docs/prefetch-suppression-during-scroll-plan.md) |
 | RAW half handoff (`raw_thumb_develop`) | viewer context ごとの `ItemsGenerationMap<RawThumbPending>` と既存 `reload_queue` | thumbnail worker は half を submit して `ThumbMsg` を送らず次の要求へ進む。executor は現像枠を返してから画像付き `LoadRequest::RawHalfDeveloped` を queue へ戻し、thumbnail worker が縮小、cache、画像と finalized の 2 通、`gen_done` を担当する。同 idx の新旧 submission ID を照合し、旧完了が新 ticket を外さない。keep 範囲外、items generation、folder 変更、mounted context の pause/park、drop は ticket を cancel し canceled `ThumbMsg` を送る。queue 済み follow-up が keep 外で skip されても `gen_done` を進める |
 | `heavy_io_queue` | `Arc<Mutex<Vec<LoadRequest>>>` | Folder/ZipFile/ConvertibleArchive/ZipDir 要求 (本物の同期 I/O または ZIP 内 prefix の代表解決)。Folder の再帰 pin 伝播で行う既存 catalog の read-only open / exact-row WebP lookup もここで実行し、UI スレッドへ SQLite cold open を持ち込まない。reload_queue と同じ prefetch suppression gate を共有 |
-| `pdf_pool.queue` | `Arc<(Mutex<JobQueue>, Condvar)>` | PDF ワーカーへのレンダ/列挙要求。`critical` / `high_normal` / `normal` VecDeque + `normal_in_flight` + `workers_busy` + `in_flight_started_at: Vec<Option<Instant>>` (起動時の設定数で固定、worker_id index) を同一 Mutex で保護。起動失敗した worker_id は詰めないため、実際に起動した数ではなく設定数で Vec を確保する。dispatcher は `critical → high_normal → normal` の順で pop する。Critical は従来どおり lane cap の影響を受けない。**`CRITICAL_RESERVATION_ACTIVE` (v1.0.0 から常時 ON)** のとき HighNormal + Normal の in-flight は `max(worker_count - 1, 1)`、Normal の開始だけは `max(worker_count - 2, 1)` までに制限する。これにより最低 1 ワーカーを Critical 用に予約しつつ、Normal 先読みが積まれても HighNormal 用にさらに 1 枠を残す。正式 pool の設定範囲は 3〜10 で、3 / 4 / 10 worker 時も同じ式から HighNormal / Normal cap がそれぞれ 2 / 1、3 / 2、9 / 8 になる。1〜2 の clamp は純関数の防御性と旧構成の回帰テスト用で、初期化結果としては公開しない。HighNormal は `req.priority=true` の可視セルと、`promote_fullscreen_to_high_normal` で昇格した現在 PDF ページ用 (= 画面外先読みより先に処理)。**Context epoch (`CURRENT_CONTEXT_EPOCH`)** で UI ナビゲーション (フォルダ移動 / Ctrl+G 結果差替え) ごとに HighNormal/Normal ジョブを世代管理し、bump で stale を一括 prune + dispatcher pop 時にも stale 判定。Critical と epoch=0 (background) はプルーン対象外。**`CancelWaitPolicy::HarvestOnCancel`** (thumbnail PDF render の cache-savable 経路のみ) では cancel が立っても in-flight IPC の reply を待ち、PDFium が既に処理した render 結果を harvest して cache 保存に進ませる (= 再エントリ時の再 render 地獄を防ぐ)。`promote_to_high_normal` はスクロール後の現可視 PDF サムネを同じ HighNormal lane へ昇格する。 **Open admission gate (2026-08-21)**: lane cap とは別に、**同時に走る文書 open を 3 件 (うち背景 HighNormal/Normal が使えるのは 2 件) に制限する**。open はディスク律速、render は CPU 律速で性質が正反対なため、1 つの並列度で両方を縛らない。ワーカーが既に保持している文書への要求は open を必要としないので **枠を消費せず常に通る** (= ページ送りの定常状態は影響を受けない)。親は `worker_documents: Vec<Option<PdfDocumentIdentity>>` で各ワーカーの保持文書を追跡し、open が要る job は `MSG_OPEN` を 1 往復送ってから本要求を送る。**枠は MSG_OPEN の往復だけを覆い、render 中は保持しない**。さらに上位 lane に「どのワーカーも保持していない文書」の job が待っている間、下位 lane の open は開始しない (前面優先)。判定は `decide_open_admission` / `higher_priority_open_pending` / `decide_lane_dispatch` の純関数で、実行時の待ち時間やストレージ種別には適応させない。 |
+| `pdf_pool.queue` | `Arc<(Mutex<JobQueue>, Condvar)>` | PDF ワーカーへのレンダ/列挙要求。`critical` / `high_normal` / `normal` VecDeque + `normal_in_flight` + `workers_busy` + `in_flight_started_at: Vec<Option<Instant>>` (起動時の設定数で固定、worker_id index) を同一 Mutex で保護。起動失敗した worker_id は詰めないため、実際に起動した数ではなく設定数で Vec を確保する。dispatcher は `critical → high_normal → normal` の順で pop する。Critical は従来どおり lane cap の影響を受けない。**`CRITICAL_RESERVATION_ACTIVE` (v1.0.0 から常時 ON)** のとき HighNormal + Normal の in-flight は `max(worker_count - 1, 1)`、Normal の開始だけは `max(worker_count - 2, 1)` までに制限する。これにより最低 1 ワーカーを Critical 用に予約しつつ、Normal 先読みが積まれても HighNormal 用にさらに 1 枠を残す。正式 pool の設定範囲は 3〜10 で、3 / 4 / 10 worker 時も同じ式から HighNormal / Normal cap がそれぞれ 2 / 1、3 / 2、9 / 8 になる。1〜2 の clamp は純関数の防御性と旧構成の回帰テスト用で、初期化結果としては公開しない。HighNormal は `req.priority=true` の可視セルと、`promote_fullscreen_to_high_normal` で昇格した現在 PDF ページ用 (= 画面外先読みより先に処理)。**Viewer-context epoch**: App/bundleの非Clone writerがpublishし、各jobはimmutable owner/generation ticketに従う。UIはatomic＋容量1wakeだけ、pool内maintenanceがNormal/HighNormalをpruneし、popも同じstale predicateを使う。UnscopedとCritical laneはqueued prune対象外。**`CancelWaitPolicy::HarvestOnCancel`** (thumbnail PDF render の cache-savable 経路のみ) では cancel が立っても in-flight IPC の reply を待ち、PDFium が既に処理した render 結果を harvest して cache 保存に進ませる (= 再エントリ時の再 render 地獄を防ぐ)。`promote_to_high_normal` はスクロール後の現可視 PDF サムネを同じ HighNormal lane へ昇格する。 **Open admission gate (2026-08-21)**: lane cap とは別に、**同時に走る文書 open を 3 件 (うち背景 HighNormal/Normal が使えるのは 2 件) に制限する**。open はディスク律速、render は CPU 律速で性質が正反対なため、1 つの並列度で両方を縛らない。ワーカーが既に保持している文書への要求は open を必要としないので **枠を消費せず常に通る** (= ページ送りの定常状態は影響を受けない)。親は `worker_documents: Vec<Option<PdfDocumentIdentity>>` で各ワーカーの保持文書を追跡し、open が要る job は `MSG_OPEN` を 1 往復送ってから本要求を送る。**枠は MSG_OPEN の往復だけを覆い、render 中は保持しない**。さらに上位 lane に「どのワーカーも保持していない文書」の job が待っている間、下位 lane の open は開始しない (前面優先)。判定は `decide_open_admission` / `higher_priority_open_pending` / `decide_lane_dispatch` の純関数で、実行時の待ち時間やストレージ種別には適応させない。 |
 | `CatchupQueue` (`thumb_loader.rs`) | `Arc<(Mutex<CatchupQueueState>, Condvar)>` | `pdf_meta` 背景書き込みキュー (v1.0.0)。`high: VecDeque<NeighborPrefetch>` (cap 16) + `low: VecDeque<MetaOnly>` (cap 256) + `pending: HashSet<PathBuf>` を同一 Mutex で保護。worker は high → low の順で pop。同 path が low にいる時に高優先が後から来ると **`high` 空き確認後に `low` から remove → `high` に push** で昇格する (lane が満杯のときだけ drop、lane 間は独立)。詳細は [docs/pdf-page-count-cache-plan.md の「最終形」セクション](pdf-page-count-cache-plan.md) |
 | `AiJobQueue` (`app.rs`) | `Arc<(Mutex<AiJobQueueState>, Condvar)>` | final AI (upscale/denoise) ジョブ。`display: VecDeque` (表示中ページ, push_front=LIFO) + `prefetch: VecDeque` (先読み, push_back=FIFO) + `shutdown` を同一 Mutex で保護。`final-ai-worker` が `display → prefetch` の順で pop。enqueue 重複は呼び出し側 `final_ai_pending.contains_key` で dedup。cancel は `final_ai_pending[key].cancel` (Drop でも立つ) を worker が pop 時に確認し、立っていれば推論せず `Cancelled` を返す (= 高速ページ送りで keep_set 外になったジョブは GPU 推論が始まる前に止まる)。PDF の表示中 final AI だけは、保持 LRU に入れる価値が高いので session close / keep-set evict 時に最大 1 件まで `retained_final_ai_orphans` へ移し、live pending から外したまま完走を許可する |
 | `texture_backlog` | ローカル Vec (App) | GPU アップロード未完の ColorImage。MAX_TEXTURES_PER_FRAME=8 超過分 |
@@ -1048,7 +1137,7 @@ keep外動画retryでupgrade・repaint・進捗を増減させない。VideoBatc
 
 STALE checkpointは従来どおりworker pop直後、ZIP/Folder heavy I/O resolve後、PDF render前。
 取消は同request IDのCanceledを送り、ただのcontinueで予約を残さない。
-RAW deferred callback/follow-upとEPUB fallbackも元のID・世代・操作sequence・context epochを保つ。
+RAW deferred callback/follow-upとEPUB fallbackも元のID・世代・操作sequence・immutable PDF render ticketを保つ。
 [寿命計画・回帰・検証証拠](thumbnail-request-lifecycle-plan.md)。
 
 静止画ページシークのサムネイル列 / hover preview はグリッド保持帯から遠いページを
@@ -1082,17 +1171,19 @@ upload待ち画像があるEvicted / Loaded-upgradeを再投入する。両終�
 | walker / ingest (supervisor 内部) | supervisor cancel | 各ループ checkpoint で `Ordering::Relaxed` read。大ファイル走査中も数百 ms 以内に抜ける |
 | tag_write_worker | App drop | `None` 送信 + cancel フラグ。commit 後のループ先頭で check |
 
-**Tantivy writer 共有ルール**: `IndexerManager.writer: Arc<Mutex<IndexWriter>>` を
-ingest worker と tag_write_worker が共有する。独自に `fts.writer()` を呼ぶと
-`LockBusy` で **全 upsert が無効化される**。新しい書き込み経路を足すなら必ず
-共有 writer を使う。
+**Tantivy writer 共有ルール**: `IndexerManager.writer: Arc<FtsWriterDispatcher>` が
+唯一の `IndexWriter` を所有する。ingest と purge/cleanup は共有 dispatcher へ submit する。
+同じ Index に独自の writer を開くと `LockBusy` になるため、新しい FTS 書き込み経路も
+dispatcher を使う。通常の tag_write_worker は tags.db のみを更新し、FTS を書き換えない。
 
 #### Indexer shutdown の有界化 (v2.3.0 第12弾)
 
 walker の Full 観測は `ObservationCompleteness` で Complete / Incomplete を返す。
 列挙・属性取得の失敗や深さ制限を `ScanDiag` から集約し、Incomplete では削除候補を
-生成せず、観測できた新規・変更候補だけを既存 ingest 経路へ渡す。取消は既存の Err 終端で
-あり、Complete として返さない。この型は FS 観測だけの結果で、Full 全体の typed な
+生成せず、観測できた新規・変更候補だけを既存 ingest 経路へ渡す。通常の取消は
+`ScanError::Cancelled` の終端であり、Complete や再構築予約として扱わない。
+inventory の SQL 読取失敗は `ScanError::Metadata` のまま共通 reporter へ進め、後着の
+cancel フラグやエラー文字列で通常取消へ変換しない。この型は FS 観測だけの結果で、Full 全体の typed な
 完了結果とは分離する。S2 の停止は既存 cancel のまま。metadata manager worker が
 重複グループの cancel・join・cleanup・spawn を固定 snapshot で直列化し、後続要求は
 最新の1つに集約する。UI は軽量 control/view のみを持ち、再構成 worker が join handle
@@ -1107,13 +1198,16 @@ transaction で消す。起動設定は最初の構成でだけ採用し、実�
 - App drop は全 supervisor に cancel を先行送信し、全 supervisor 合計 4 秒の
   manager-wide deadline までだけ join する。期限を超えた JoinHandle は detach し、
   プロセス終了を将来追加される長時間処理でも塞がない。
-- walker は entry / 3-way diff の各ループ、ingest は delete / ingest の各ループで cancel を見る。
+- walker は entry / FS ↔ SQLite 差分の各ループ、ingest は delete / ingest の各ループで cancel を見る。
   GlobalIoSemaphore の permit 待ちと FtsWriterDispatcher の reply 待ちは50ms timeoutで再確認する。
   cancel 後の未flush batchはsubmitせず、受信済みを含む watcher queue も処理しない。
 - final commit と dispatcher の最終所有は indexer-writer-finalizer へ移し、main thread は
   commit / queue drain / dispatcher join を待たない。submit済みbatchの応答をcancelで放棄しても、
-  Tantivy First により SQLite側を先行更新しない。次回起動時の FS / Tantivy / fts_meta
-  3-way diff が未反映・片側反映を再照合するため、detachは索引整合性を犠牲にしない。
+  Tantivy First により SQLite側を先行更新しない。Full は FS ↔ SQLite の差分を再投入するが、
+  同じ署名の既存 Ok に対応する全文文書の欠落は検出しない。捕捉した commit/reload/SQLite apply、
+  cleanup と実行由来の自動 merge failure は共通 reporter の log+通知+durable pending へ進む。
+  writer kill による未実行 merge task は実 I/O failure と区別する。detach/abrupt termination が
+  全整合や marker 完了を保証するとはしない。runtime wipe/reopen、自動 Full retry は追加しない。
 
 ### 3.5 新ワーカー追加時のテンプレ
 

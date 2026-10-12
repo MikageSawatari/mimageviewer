@@ -4,6 +4,7 @@ use crate::book_composition::ReadingDirection;
 use crate::book_composition::*;
 use crate::book_resume_db::{PageIdentity, ReadingPosition};
 
+#[cfg(test)]
 fn install(app: &mut App, root: &std::path::Path, book: &BookComposition) {
     let token = CompositionToken {
         service_epoch: 8,
@@ -57,6 +58,7 @@ fn install(app: &mut App, root: &std::path::Path, book: &BookComposition) {
     app.spread_shift.availability = crate::spread_shift::PairingEditAvailability::Composed;
 }
 
+#[cfg(test)]
 fn accepted(
     app: &App,
 ) -> (
@@ -77,6 +79,7 @@ fn accepted(
 }
 
 #[test]
+#[cfg(test)]
 fn batch_removal_reindexes_topology_targets_resume_and_export_before_reload() {
     let mut env = setup_app();
     let root = env.tmp.path().join("deletion.pdf");
@@ -169,6 +172,7 @@ fn batch_removal_reindexes_topology_targets_resume_and_export_before_reload() {
 }
 
 #[test]
+#[cfg(test)]
 fn removal_preserves_hidden_reference_and_empty_projection_without_repairing_record() {
     let mut env = setup_app();
     let root = env.tmp.path().join("hidden.pdf");
@@ -200,6 +204,7 @@ fn removal_preserves_hidden_reference_and_empty_projection_without_repairing_rec
 }
 
 #[test]
+#[cfg(test)]
 fn removal_adoption_invalidates_permission_proof_and_same_slot_cache() {
     let mut env = setup_app();
     let root = env.tmp.path().join("proof.pdf");
@@ -275,6 +280,7 @@ fn removal_adoption_invalidates_permission_proof_and_same_slot_cache() {
 }
 
 #[test]
+#[cfg(test)]
 fn invalid_removal_preparation_leaves_owner_and_rows_unchanged() {
     let mut env = setup_app();
     let root = env.tmp.path().join("invalid.pdf");
@@ -295,6 +301,7 @@ fn invalid_removal_preparation_leaves_owner_and_rows_unchanged() {
 
 #[cfg(windows)]
 #[test]
+#[cfg(test)]
 fn removal_updates_only_mounted_composed_context() {
     let mut env = setup_app();
     let root = env.tmp.path().join("mounted.pdf");

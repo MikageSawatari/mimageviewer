@@ -5,6 +5,7 @@ pub(super) fn close_ready(observation: &Value, mode: &str) -> bool {
     observation["keep_count"].as_u64().is_some_and(|n| n > 8)
         && observation["items_len"].as_u64().is_some_and(|n| n > 0)
         && observation["index_settled"] == true
+        && observation["interaction_ready"] == true
         && match mode {
             "after-loading" => observation["loading_complete"] == true,
             "while-loading" => {
@@ -197,7 +198,7 @@ mod tests {
 
     #[test]
     fn close_waits_for_the_requested_loading_mode_and_real_worker_activity() {
-        let mut observation = json!({"keep_count":20,"items_len":600,"index_settled":true,
+        let mut observation = json!({"keep_count":20,"items_len":600,"index_settled":true,"interaction_ready":true,
             "loading_complete":false,"worker_pending_count":1});
         assert!(close_ready(&observation, "while-loading"));
         assert!(!close_ready(&observation, "after-loading"));
@@ -205,5 +206,10 @@ mod tests {
         assert!(!close_ready(&observation, "while-loading"));
         observation["loading_complete"] = json!(true);
         assert!(close_ready(&observation, "after-loading"));
+        observation["interaction_ready"] = json!(false);
+        assert!(!close_ready(&observation, "after-loading"));
+        observation["loading_complete"] = json!(false);
+        observation["worker_pending_count"] = json!(1);
+        assert!(!close_ready(&observation, "while-loading"));
     }
 }

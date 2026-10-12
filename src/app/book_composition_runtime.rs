@@ -1212,7 +1212,7 @@ impl App {
         }
         self.local_adjust_page_layers = layers;
         self.local_adjust_selected_layers = selected_layers;
-        self.selected = selected;
+        self.move_grid_cursor(selected, super::GridCursorIntent::Automatic);
         for (index, layers) in &self.local_adjust_page_layers {
             if layers.is_empty() {
                 self.local_adjust_pages.remove(index);
@@ -1326,7 +1326,7 @@ impl App {
         if was_fullscreen {
             if let Some(index) = landing {
                 self.fullscreen_idx = Some(index);
-                self.selected = Some(index);
+                self.move_grid_cursor(Some(index), super::GridCursorIntent::Automatic);
             } else if !self.has_book_dfs_continuation() {
                 self.close_fullscreen();
             }

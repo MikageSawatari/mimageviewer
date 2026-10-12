@@ -1,5 +1,7 @@
 //! Reusable E-side C1–C12 fixtures for G3. G is not integrated in this worktree.
 //! Composition payloads below are deliberately opaque: only E's boundary is exercised.
+#![cfg(test)]
+
 use super::*;
 use crate::{
     app::{

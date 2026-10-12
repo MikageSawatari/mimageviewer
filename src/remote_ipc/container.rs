@@ -540,7 +540,7 @@ fn decode_remote_source(
             request.input_seq,
             request.items_gen,
             request.request_id,
-            request.context_epoch,
+            request.pdf_render_validity.clone(),
             crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
             false,
             true,
@@ -1174,7 +1174,10 @@ impl RemoteSourceDecodeIdentity {
         debug_assert!(!request.force_cache);
         debug_assert_eq!(request.input_seq, 0);
         debug_assert_eq!(request.items_gen, 0);
-        debug_assert_eq!(request.context_epoch, 0);
+        debug_assert!(matches!(
+            request.pdf_render_validity,
+            crate::pdf_loader::PdfRenderValidity::Unscoped
+        ));
         // The folder-representative branch also enters on CACHE_KEY_FOLDER. It consults the pin
         // DB, which is not part of this source identity, so reject that request shape here.
         debug_assert!(
@@ -1202,7 +1205,7 @@ impl RemoteSourceDecodeIdentity {
         //   cannot affect this raster.
         // - folder_thumb_depth is zero, pinned_only is None, and force_cache is false here.
         //   resolve_override is ZipDirRepresentative exactly when zip_dir_prefix is present.
-        // - context_epoch is the documented zero sentinel for this background path.
+        // - pdf_render_validity is explicitly Unscoped for this background path.
         // - folder_thumb_sort is fixed to BOOK_READING_PAGE_ORDER for ZipDirectory, asserted
         //   above. Other remote source shapes never read it.
         Self {
@@ -5592,7 +5595,7 @@ impl ContainerEngine {
                     password.as_deref(),
                     Some(Arc::clone(cancel)),
                     crate::pdf_loader::JobPriority::Normal,
-                    0,
+                    crate::pdf_loader::PdfRenderValidity::Unscoped,
                     crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
                 )
                 .map_err(|error| RemoteAiRunError::Failed(error.to_string()))?
@@ -7258,7 +7261,7 @@ impl ContainerEngine {
             // foreground でも HighNormal までとし、ローカル UI 用 Critical 予約枠は
             // 消費しない。prefetch は Normal lane へ分離する。
             priority: foreground,
-            context_epoch: 0,
+            pdf_render_validity: crate::pdf_loader::PdfRenderValidity::Unscoped,
             ..Default::default()
         };
         if full_page && let Some(selected) = raw_pins.and_then(|pins| pins.selected_entry(address))

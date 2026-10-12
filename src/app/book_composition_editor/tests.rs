@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::*;
 use crate::app::book_materialization;
 use crate::app::tests::phase_c_support::{AppTestEnv, setup_app};

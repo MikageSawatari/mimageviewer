@@ -943,7 +943,7 @@ impl App {
             .selected
             .is_some_and(|index| removed_indices.contains(&index))
         {
-            self.selected = None;
+            self.move_grid_cursor(None, crate::app::GridCursorIntent::Automatic);
         }
     }
 
@@ -2569,9 +2569,11 @@ impl App {
             {
                 app.reading_history_return_from = None;
             }
-            if folder_changes && !app.navigation_scope.is_detached_physical() {
-                crate::thumb_loader::bump_catchup_epoch();
-                let _ = crate::pdf_loader::bump_render_context_epoch();
+            if folder_changes {
+                if !app.navigation_scope.is_detached_physical() {
+                    crate::thumb_loader::bump_catchup_epoch();
+                }
+                app.bump_render_epoch_only();
             }
             if folder {
                 app.transition_favorite_view_for_path(Some(&path));
@@ -3678,7 +3680,7 @@ impl App {
         self.search_filter = None;
         self.search_query.clear();
 
-        self.selected = selected;
+        self.move_grid_cursor(selected, crate::app::GridCursorIntent::Automatic);
         self.scroll_to_selected = selected.is_some();
         if selected.is_none() {
             self.scroll_offset_y = 0.0;
@@ -4056,12 +4058,15 @@ mod tests {
                     session.observed_catalog_revision >= deleted.catalog_revision
                         && matches!(session.load, CollectionGridLoadState::Deleted { .. })
                 })
+                // The deleted surface and the ready catalog arrive independently.
+                // Snapshot history only after its legitimate deletion notice has applied.
+                && app
+                    .folder_nav_back_stack
+                    .iter()
+                    .chain(&app.folder_nav_forward_stack)
+                    .all(|entry| entry.collection_id() != Some(collection.collection_id()))
         });
-        // The catalog delete notice and history-prune notice may arrive in adjacent polls.
-        // Settle both before comparing the parked display with its resumed owner.
         let ctx = egui::Context::default();
-        app.poll_collection_ui(&ctx);
-        app.poll_collection_grid(&ctx);
         // The physical child has an asynchronous page-identity preparation phase.
         // Complete that accepted listing before parking it and testing keyboard navigation.
         let preparation_deadline = Instant::now() + Duration::from_secs(5);

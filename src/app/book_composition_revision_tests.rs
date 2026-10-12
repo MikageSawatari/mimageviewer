@@ -2,6 +2,7 @@
 
 #[cfg(windows)]
 #[test]
+#[cfg(test)]
 fn g3_hidden_extracted_candidate_terminates_initial_detached_permission_open() {
     use crate::book_composition::fixtures::document_page;
     let mut env = setup_app();
@@ -58,6 +59,7 @@ fn g3_hidden_extracted_candidate_terminates_initial_detached_permission_open() {
 
 #[cfg(windows)]
 #[test]
+#[cfg(test)]
 fn g3_hidden_required_detached_open_terminates_session_runtime_and_preserves_siblings() {
     use crate::book_composition::fixtures::document_page;
     for shell_active in [false, true] {
@@ -166,6 +168,7 @@ fn g3_hidden_required_detached_open_terminates_session_runtime_and_preserves_sib
 }
 
 #[test]
+#[cfg(test)]
 fn g3_automatic_zip_snapshot_return_preserves_memory_off_session_shift_after_generation_poll() {
     use super::spread_shift_owner::ViewerShift;
     use crate::spread_shift::{
@@ -241,6 +244,7 @@ fn g3_automatic_zip_snapshot_return_preserves_memory_off_session_shift_after_gen
 }
 
 #[test]
+#[cfg(test)]
 fn g3_document_direction_mode_only_release_and_pc_reentry_agree() {
     use crate::pdf_loader::PdfReadingDirection;
     use crate::settings::{ReadingDirection as Direction, SpreadMode};
@@ -353,6 +357,7 @@ fn g3_document_direction_mode_only_release_and_pc_reentry_agree() {
 }
 
 #[test]
+#[cfg(test)]
 fn g3_document_direction_release_retains_accepted_epub_generation() {
     use crate::pdf_loader::PdfReadingDirection;
     use crate::settings::{ReadingDirection as Direction, SpreadMode};

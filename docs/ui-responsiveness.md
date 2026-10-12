@@ -34,7 +34,8 @@ overlayの段階名と経過時間は常時timelineのmemory snapshotを使う�
 | `ctx.load_texture` (GPU アップロード) | 20MP RGBA で 26-58ms、1 フレームに複数来ると合算 | `fs_upload_backlog` にステージして 1 枚/frame |
 | `std::fs::read_dir` + **`Path::is_dir()` / `Path::is_file()`** per-entry | Windows では per-entry で `GetFileAttributes` syscall。500 ファイルで 500-1000ms | `DirEntry::file_type()` を使う (`FindFirstFile` のキャッシュ再利用) |
 | DFS フォルダ走査 (`navigate_folder_with_skip`) | HDD で 20-300ms、最悪 1s+ | 常に別スレッド (`spawn_folder_nav`) |
-| SQLite の `search()` (FTS クエリ) | インデックス小なら数 ms、大なら 100ms+ | `execute_favsearch` がバックグラウンド化 |
+| SQLite の名前/コンテナ検索 (Ctrl+S、FTS クエリ) | インデックス小なら数 ms、大なら 100ms+ | `execute_favsearch` がバックグラウンド化 |
+| Tantivy の全文検索 (Ctrl+G) | 文書数・検索条件・I/O に依存 | `global_search` の専用 worker が検索・ページ取得を実行 |
 | Windows Shell の `IContextMenu::QueryContextMenu` | シェル拡張が多い環境で 1.2〜1.4 秒 | 右クリック直後には呼ばず、既定では「Windows のメニュー」の `WM_INITMENUPOPUP` まで遅延する。同階層へ併記する設定では従来どおり同期コストを受け入れる |
 
 ### 1.1 Windows 固有: `Path::is_dir` は syscall、`DirEntry::file_type` はキャッシュ
@@ -166,6 +167,20 @@ process memory の毎フレーム sample は追加していない（page-fault �
 ---
 
 ## 2. 非同期 I/O の実装テンプレ
+
+### FTS 起動整理と失敗表示 (§1.367)
+
+metadata manager worker の所有範囲 cleanup/Failed reconciliation は supervisor spawn 前に行うが、
+`IndexerManager::new`、IndexerInit の result送信、overlay解除、Ctrl+G の manager 準備完了は
+その worker の完了を待たない。UI は manager の在メモリ maintenance snapshot と typed Full outcome
+だけで失敗/次回再構築を表示する。描画・toast確認のために SQLite pending の読取、SQL、I/O、
+wait/retry を追加しない。トレイで toast を見逃してもお気に入り編集で予約状態を確認できる。
+
+起動 count 点検は常時実行し、feature gate は撤去した。利用者承認の軽量A/Bを設計リードが
+実施し、観測した起動費用の差はノイズと判断して採用した。[採用記録 §7.4](fts-integrity-plan.md#74-起動点検の採用判断-2026-10-11)
+に条件・結果・未測定範囲を残す。worker配置や単発fixtureだけで全環境の「追加費用ゼロ」とは
+扱わない。他 workerとのCPU/I/O競合やFailed大量時の費用は残り、perf eventで追跡する。
+点検completionを待つ起動 barrier を足さない。
 
 EPUB の事前確認と変換もこの境界を使う。`EpubConvertState` が取消 token と結果 receiver を持ち、
 UI は `try_recv` で確認・進捗・完了を受け取る。`inspect` と `convert` の起動、元 EPUB の読み込み、

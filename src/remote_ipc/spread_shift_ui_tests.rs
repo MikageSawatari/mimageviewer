@@ -1,3 +1,4 @@
+#[cfg(test)]
 mod spread_shift_d3 {
     use super::*;
     use crate::book_scope::BookScopeKey;

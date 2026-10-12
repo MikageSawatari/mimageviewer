@@ -915,8 +915,8 @@ fn load_similar_thumbnail(job: SimilarThumbJob) -> Option<egui::ColorImage> {
         source_policy: crate::thumb_loader::LoadSourcePolicy::SourceOnly,
         priority: true,
         // Similar-panel requests own their cancellation token. They are deliberately outside
-        // the App-global grid/PDF epoch, just like fullscreen per-viewer render work.
-        context_epoch: 0,
+        // viewer grid/PDF validity, just like fullscreen per-viewer render work.
+        pdf_render_validity: crate::pdf_loader::PdfRenderValidity::Unscoped,
         ..Default::default()
     };
     let cache_map = std::sync::RwLock::new(std::collections::HashMap::new());
@@ -1603,7 +1603,7 @@ fn prepare_similar_compare_result(
         &stamp,
         &pdf_passwords,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        crate::pdf_loader::current_render_context_epoch(),
+        crate::pdf_loader::PdfRenderValidity::Unscoped,
     )?;
     crate::ui_fullscreen::prepare_compare_pin_result(
         crate::capture::CapturePixelJob::already_adjusted(asset.display_name, asset.pixels),
@@ -8231,7 +8231,7 @@ mod similar_panel_tests {
     }
 
     #[test]
-    fn same_source_is_reused_across_global_epoch_bumps_and_stale_completion_is_ignored() {
+    fn same_source_is_reused_across_viewer_owner_advances_and_stale_completion_is_ignored() {
         let ctx = egui::Context::default();
         let mut state = SimilarPanelState::default();
         let first_target =
@@ -8246,7 +8246,8 @@ mod similar_panel_tests {
         };
         let first_cancel = first_cancel.clone();
 
-        crate::pdf_loader::bump_render_context_epoch();
+        let mut viewer_owner = crate::pdf_loader::PdfRenderEpochOwner::fresh();
+        viewer_owner.advance();
         request_test_thumbnail(&mut state, "same", first_target, 1, None, &ctx);
         assert_eq!(state.thumbnails["same"].request_id, first_id);
         assert_eq!(

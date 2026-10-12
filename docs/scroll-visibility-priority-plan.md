@@ -1,5 +1,11 @@
 # スクロール後の可視サムネ優先化 + 計装拡張 (Codex R1 反映版)
 
+> 2026-10-12 PDF-EPOCH-OWNERSHIP（未リリース）: 以下は導入時の履歴。
+> 現行Viewer昇格/foundはowner identity＋要求世代＋keyに限定し、App/bundleの
+> `PdfVisiblePromotionState` がticket/keys/retryを所有する。兄弟同keyを対象に含めず、
+> target世代が替われば同keyでも再評価する。fullscreenはUnscopedだけを照合する。
+> lane/cap方針は維持。[後継契約](pdf-render-epoch-ownership-plan.md) §5.4。
+
 ## 背景・問題
 
 `HarvestOnCancel` 導入 (commit 5c2a3526) 後の perf log 解析 (2026-05-24 セッション) で、

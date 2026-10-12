@@ -623,21 +623,22 @@ egui::Window::new("...").show(ctx, |ui| {
 - 実例: `src/pdf_loader.rs` の `PdfWorkerPool` / `JobQueue` / `run_dispatcher`
 - `try_lock` 自体は「取れなければ今回は諦める」best-effort 用途のみ OK
 
-### PDF レンダ pool の context epoch (2026-05)
+### PDF レンダ pool の viewer-context epoch (2026-10-12、未リリース)
 
-`PdfWorkerPool` は **3 段階優先度** (`Critical / HighNormal / Normal`) + **context epoch**
-で管理されている。UI ナビゲーション (フォルダ移動 / Ctrl+G) で
-`pdf_loader::bump_render_context_epoch()` が呼ばれると、それ以前に enqueue された
-HighNormal/Normal ジョブが pool 内で stale 化 → bump 時の一括 prune + dispatcher pop 時の
-個別 stale 判定で skip される。これで PDF 多数フォルダを Ctrl+↑↓ で高速にめくっても、
-旧 PDF のページレンダリングが queue に溜まって新 PDF の cover を遅らせる事象を防ぐ。
+`PdfWorkerPool` は **3 段階優先度** (`Critical / HighNormal / Normal`) を維持し、
+PDF render失効はviewerごとの非Clone `PdfRenderEpochOwner` が所有する。
+App投影/bundleとwriterを移譲し、一覧採用で自身だけadvance、retire/dropで自身だけ終端する。
+UIはatomic publish＋容量1の非blocking wakeだけ。pool内の一つのmaintenance workerが
+HighNormal/Normalをpruneし、dispatcher popも各job ticketのstaleを検査する。
+同じPDF/pageを読む兄弟contextのjobsを失効させない。
 
-- `LoadRequest.context_epoch` を **UI スレッドの enqueue 時点で** 焼き付ける (TOCTOU 防止、
-  worker から `current_render_context_epoch()` を呼ばない)
-- `context_epoch=0` は background / Critical 用 sentinel (= プルーン対象外)
+- `LoadRequest.pdf_render_validity` のViewer ticketを **UI enqueue時点で** 捕捉し、派生要求は
+  immutable ticketをcloneする。workerはfresh化しない。
+- fullscreen本体/background/Remote/Similar/enumerateは明示 `Unscoped`（旧epoch=0）。
 - background 経路 (CatchupQueue / NeighborPrefetch / build_and_save_one_pdf / cache creator /
-  `get_document_info` / `enumerate_pages_with_cancel`) は全て epoch=0
-- 詳細: [docs/pdf-pool-context-epoch-plan.md](docs/pdf-pool-context-epoch-plan.md)
+  `get_document_info` / `enumerate_pages_with_cancel`) は全てUnscoped。
+- 詳細: [docs/pdf-render-epoch-ownership-plan.md](docs/pdf-render-epoch-ownership-plan.md)。
+  旧global整数epoch導入計画は履歴として残す。
 
 ### PDF レンダ pool の HarvestOnCancel (2026-05)
 
@@ -662,9 +663,10 @@ perf イベント: `pool_cancel_harvest_wait` (待ち開始時) / `pdf_thumb_cac
 `reload_queue` は毎フレーム re-tag されるが、**既に pdf_pool.normal に積まれたものは
 priority=False のまま居座る**。可視範囲到達後も Normal lane で処理されて 3 秒以上待たされる。
 
-対策: `pdf_loader::promote_to_high_normal(visible_keys)` を毎フレーム呼び、現可視 PDF の
-perf_key と match するジョブを Normal → HighNormal lane に移す。dedup は
-`last_promoted_visible_keys` で行い、lock 取得を最小化。
+対策: `pdf_loader::promote_to_high_normal(visible_keys, viewer_target)` がowner/要求世代/perf_keyを
+照合してNormal→HighNormalへ移す。dedup/retryはbundle-owned `PdfVisiblePromotionState` に集約する。
+兄弟の同keyをfoundと数えず、遅着した対象要求は既存frame再評価で昇格する。
+fullscreenの昇格targetはUnscoped固定で、Viewer seek thumbnailはその対象に含めない。
 
 新 perf イベント:
 - `ui/scroll_settle`: スクロール停止 (300ms) 検出。pool snapshot + target_count + already_loaded
@@ -1793,6 +1795,24 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 安心セクションが取り残され、「通信するのは 2 つだけ」「画像は外部に送信されません」が
 事実として誤りのまま 8 日間公開されていた。
 
+### 製品ページのカードは短く保つ (2026-10-11 利用者指示)
+
+製品ページ (`htdocs/mimageviewer/index.html`) の横に並ぶカード (`feature-card` / `trust-item` /
+`usecase-card` / `migration-card`) は、**見出し 1 つ + 本文 1 段落、本文は 150 字まで**
+(タグを除き空白を詰めた文字数)。1 枚が長いと同じ行の全カードが引き伸ばされ、ページの見た目が崩れる。
+
+- 機能を足したときに、カードへ説明を書き足さない。詳細はマニュアルの該当ページ、通信や保存場所は
+  `privacy.html` に書き、カードからはリンクする。カードを書き換えるのは、カードの主張そのもの
+  (「〜はありません」など) が変わるときだけ。
+- 書き換えるときは「足す」ではなく「置き換える」。上限を超えるなら、既存の文を削って収める。
+- 全称・否定の表現 (「〜だけ」「〜はありません」) は短くしても正しいままか確かめる
+  (下の「通信・データ保存に関わる機能を追加したときは 2 か所を突き合わせる」)。
+- 検査: `python scripts/check_site_cards.py` (違反があれば exit 1)。製品ページを変えたコミットの前と、
+  リリース手順 Phase 1 の手順 6 で必ず回す。上限を変えるときは、この節とスクリプトの `MAX_CHARS` を揃える。
+- 経緯: 2026-10-11、「安心して使えます」のカードに機能追加のたびに保存場所・通信の詳細が書き足され、
+  1 枚が数段落に伸びてページが大きく崩れているのを利用者が公開中のサイトで見つけた。機能紹介のカードも
+  7 枚が 170〜250 字に伸びていた。
+
 ### マニュアル・製品ページの記述方針
 
 ユーザーが見るマニュアル・製品ページ (`htdocs/mimageviewer/manual/` と
@@ -1951,7 +1971,8 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
    操作・既定の変更が無いリリースでは追記不要。追記したら
    `cargo test --lib version_highlights::` でテーブルがパースできることを確認。
 6. `htdocs/` 以下 — 新機能がマニュアル・製品ページに反映されていることを確認
-   - マニュアル左サイドバーを持つ通常ページ 31 ページでリンク一覧が揃っているか
+   - 製品ページのカードの長さを `python scripts/check_site_cards.py` で検査する (「製品ページのカードは短く保つ」)。
+   - マニュアル左サイドバーを持つ通常ページ 32 ページでリンク一覧が揃っているか
      `htdocs/mimageviewer/manual/` 配下で一括確認:
      ```bash
      cd htdocs/mimageviewer/manual && for f in *.html; do
@@ -1961,7 +1982,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
          | grep -E 'href="[a-z-]+\.html"' | wc -l
      done
      ```
-     各ページが 31 以外 (= いずれかのページ名リンクが抜けている) なら同期を合わせる。
+     各ページが 32 以外 (= いずれかのページ名リンクが抜けている) なら同期を合わせる。
      ページを増減したらこの数も更新する (数そのものより、**全ページが同じ数で揃っている**ことが要件)。
      `tut-*.html` など `sidebar-section` を持たないチュートリアルページは別レイアウトなので対象外。
      新規の通常ページを追加した際はサイドバーを持つ全ページを更新すること
@@ -2052,7 +2073,39 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
      `python scripts/check_bench_regression.py vendor/bench_baseline.json run1.json run2.json run3.json`。
      **ノイズと判断した場合に `--save` で baseline を上書きしない** (`--save` は 1 ファイルだけ受け付ける)。
 
-9.6. **perf smoke** (UI 周り / I/O 経路に変更を入れたリリースで実施):
+9.6. **perf smoke** (正規手順は idle 5ケースと合わせた ReleaseChecks suite。毎リリース実施):
+   利用者が repository root の PowerShell で実行する:
+   ```powershell
+   .\scripts\ui-smoke.ps1 -Scenario ReleaseChecks -InteractiveApproved
+   ```
+   - 診断portableのbuild、生成fixture／隔離dataのseed、5 idle、cached／uncached perf、通常終了・
+     証跡保存・解析まで逐次実行する。**9.7も同じ1回のsuiteで確認し、重複実行しない**。
+     FFmpeg CLI (`ffmpeg.exe`) がPATHに必要。初回buildは別に約7.5分かかった実績があり、
+     suiteはseed込み約5〜8分を見込む。AI追加は別途準備・実行時間を見積もる。
+   - **開始前に他アプリの窓を最小化し、build待ちを含め終了までPCに触れない**。
+     exact rootのforeground取得、runner所有窓への背面移行、測定中の状態を検証する。
+     foreground不成立時は記録を残して停止し、環境を整えた別runでやり直す。自動retryはしない。
+   - 同一ソースの診断artifactが検証できる場合だけ上記に `-SkipBuild` を追加できる。
+     buildを先に済ませる場合は `prepare-portable-smoke.ps1 -TestScript` を使う（起動しない）。
+     stale artifactの利用や設定保護の省略を認めるフラグではない。
+   - 結果は `target/ui-smoke/runs/<run-id>/summary.json` と `release-record.md`。
+     全必須caseの証跡と終了codeを確認する。0=PASS／PASS_WITH_WARNINGS、1=FAIL、2=SKIPPED／環境不成立。
+     警告はリリース記録に残し、FAIL／SKIPPEDをPASSに読み替えない。
+     `known-startup-first-frame` は測定操作前のstartup-overlay frame 1→2 gapだけ、上限500ms。
+     gap時間は別記され、超過や通常操作中の未知100ms超はFAIL。段別内訳不足も環境注記に残す。
+   - cached／uncachedで256個の異なるfolder-load、Ctrl+Down x5、Ctrl+G固定検索を検証する。
+     drawnは直前tailが厳密に `request_repaint` のgapだけ、暫定n≥200／<16ms比率97%はWARN目標、
+     raw `pre_grid.total_ms` p95≤0.3msは必須。通常sleepをhitchとして集計しない。
+   - AI／GPU経路変更版では同じ入口に `-IncludeFirstAi` を明示追加する。
+     UI／I/O経路変更版では普段のフォルダの短い手動確認も別に残す。生成fixtureの成功を
+     実データ・配布版の厳密性能・native入力／IMEの確認へ読み替えない。
+   - 採用は実行了承ではない。エージェント実行は [実行確認](docs/interactive-release-verification.md)
+     に従い対象・所要時間・desktop入力・使い捨てdata・AI有無への明示了承後だけ行う。
+     `-InteractiveApproved` は了承済みの実行assertion。normal-profile起動禁止と
+     本書「検証起動時の設定データ保護」は維持し、利用者の通常設定をseedにコピーしない。
+     full gate／buildへ自動連結しない。詳細・採用証跡は [自動化計画](docs/release-check-automation-plan.md)。
+
+   **手動fallback／診断** (利用者が通常releaseを起動。UI／I/O変更版の実データ確認にも使う):
    ```powershell
    .\scripts\perf_smoke.ps1
    ```
@@ -2062,9 +2115,11 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
      操作の合間の sleep がすべて「ヒッチ」として数えられる (実測: 通常操作 55 秒で 108 件、
      最大 16 秒)。判定は**大きいギャップ 1 件ずつ、直前の `ui.tail_repaint.action`** を見る:
      - `none` = repaint を要求していない (= 入力待ちで就寝) → **正常**
-     - `request_repaint_after_idle_upgrade` 等の遅延 wake → **正常** (予定どおりの起床)
+     - `request_repaint_after_idle_upgrade` の遅延 wake → 予定遅延との一致を確認した場合は**正常**
      - 上記以外で 100ms を超える → UI スレッド同期 I/O 退行の疑い
        (docs/ui-responsiveness.md §4)
+   - 遅いupdate自体はtail=`none`でも検査する。既知startup gapを認める場合も、
+     自動化計画§5と同じ証跡・frame 1→2・測定操作前・500ms上限を確認し、時間を別記する。
    - ⚠️ **「16ms 未満が 97% 以上」を全フレームで測らない。** この比率は**正しい就寝を
      ヒッチとして数える**ので、短い / 暇なセッションほど悪く出る。実際 v3.3.1 の計測では、
      健全そのものの 11 秒セッションが 91.4% になり、v3.3.0 の 97.3% (4,708 フレーム) と
@@ -2075,12 +2130,23 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
    - もう 1 つ見る値: `ui.pre_grid_breakdown` の `total_ms`。UI スレッドの各段の合計で、
      健全なら **p95 0.3ms 以下**。ここが膨らんでいれば同期 I/O 退行が濃厚で、
      どの段かも同じイベントの内訳で分かる。
-   - **先に `.\scripts\build-release.ps1` が要る** (idle health と同じく `target\release` の
-     core を起動する)。`build-dev.ps1` だけでは古い release バイナリが動く。
+   - **手動fallbackは先に `.\scripts\build-release.ps1` が要る** (`target\release` のcoreを起動する)。
+     `build-dev.ps1` だけでは古いreleaseバイナリが動く。エージェントはこの通常profileを起動しない。
    - `scripts/perf_smoke.sh` は同じ内容の bash 版。中身は「FFmpeg DLL を target/release へ
      コピー → perf log を退避 → core を起動 → 終了後に解析」なので、手で分けて実行してもよい。
 
 9.7. **idle health smoke** (毎リリース必須。静止中の高速 repaint / 再投入ループを検出):
+   **正規手順は9.6のReleaseChecks suiteの同一run**。static-foreground／static-background／
+   video-pin-background／tray-close-while-loading／tray-close-after-loadingの5ケースをすべて確認する。
+   生成fixture・停止済みseed復元・cached読取・tray格納時の要求寿命・source／Finalized-image-backlog、
+   exact PID／foreground／UTC測定境界を証明する。5秒warmup／15秒測定と既存閾値を維持する。
+   背面はrunner所有の専用窓へ移行するため利用者が他窓へ切り替える必要はない。
+   動画ピンは対象workとcached読取、`idle_upgrade_enqueue` **または** `idle_upgrade_ineligible` の
+   評価証跡を求める。ineligibleだけを唯一の成立条件にしない。評価未確認はsuiteではSKIPPED／環境不成立。
+
+   **手動fallback／原因診断** (以下はsuiteの正規コマンドではない。利用者が状態を準備する):
+   手動の場合も事前に `build-release.ps1` で通常releaseをbuildする。起動は利用者のみとし、
+   通常の実設定を開くことと設定保護のルールを確認する。
    ```powershell
    .\scripts\check-idle-health.ps1 -Scenario static-foreground
    .\scripts\check-idle-health.ps1 -NoLaunch -Scenario static-background
@@ -2117,9 +2183,11 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
      受動 snapshot だけは操作件数から除く (focus と修飾キーの値は問わない)。key / wheel / 他の
      input、矛盾 heartbeat、欠損・未知形式は入力として FAIL。総 event 数と repaint / work の
      反復検査には snapshot を残す。
-   - `-Scenario` は上記4値だけを受け付ける。perf log の session PID と測定対象 PID が違えば失敗し、
-     空の測定窓は同一 session を確認できた場合だけ完全 sleep として扱う。動画ピンシナリオは
-     準備開始後の `thumb.idle_upgrade_ineligible` が無ければセットアップ不成立として失敗する。
+   - 手動scriptの `-Scenario` は上記4値だけを受け付ける。perf logのsession PIDと測定対象PIDが
+     違えば失敗し、空の測定窓は同一session・ログ完全性を確認できた場合だけ完全sleepと扱う。
+     動画ピンは最新folder-load以降の対象workが必須。`idle_upgrade_enqueue`／`idle_upgrade_ineligible`
+     の両方が無い場合、手動analyzerは評価未確認をwarningにするので、cached状態を作り直して再測定する。
+     正規suiteはcached読取と評価証跡の不足を環境不成立として止める。詳細はidle正本に従う。
    - ZIP / PDF / スマートフォルダ、AI、動画・音楽の非同期経路を変更した場合は、その処理が
      完了した静止状態も追加測定する。詳細は `docs/idle-health-check.md`。
 

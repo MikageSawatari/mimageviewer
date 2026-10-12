@@ -1,8 +1,10 @@
+#![cfg(test)]
+
 use super::*;
 
 #[test]
 fn deferred_projection_wait_is_retired_by_close_source_replacement_and_fork() {
-    for close in [false, true] {
+    for close in ["replace", "manual", "rating"] {
         let mut env = crate::app::setup_app_for_test();
         let scope = crate::book_scope::BookScopeKey::document("C:/waiting.pdf").unwrap();
         let (_deliver, receiver) = mpsc::channel();
@@ -34,10 +36,10 @@ fn deferred_projection_wait_is_retired_by_close_source_replacement_and_fork() {
             scope,
             deferred,
         };
-        if close {
-            env.close_fullscreen();
-        } else {
-            env.cancel_pending_folder_nav();
+        match close {
+            "manual" => env.close_fullscreen(),
+            "rating" => env.close_fullscreen_for_rating_membership(),
+            _ => env.cancel_pending_folder_nav(),
         }
         assert!(!env.book_deferred_open_wait_active());
         assert!(matches!(
@@ -118,6 +120,48 @@ fn occurrence(idx: usize) -> PresentationOccurrence {
         } else {
             PresentationSlot::Right
         },
+    }
+}
+
+#[test]
+fn fullscreen_open_captures_rating_metadata_boundary_in_composition_continuation() {
+    for boundary in [
+        FsMetadataBoundary::Manual,
+        FsMetadataBoundary::RatingMembership,
+    ] {
+        let mut env = crate::app::tests::phase_c_support::setup_app();
+        let root = env.tmp.path().join("metadata-boundary.pdf");
+        env.items = vec![crate::grid_item::GridItem::PdfPage {
+            pdf_path: root,
+            page_num: 0,
+            content_type: None,
+        }];
+        env.visible_indices = vec![0];
+        env.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+        env.image_metas = vec![None];
+        let (service, process) =
+            BookCompositionService::spawn_at(env.tmp.path().join("permission"), None).unwrap();
+        env.install_book_composition_runtime(service);
+        assert!(
+            env.defer_book_composition_fullscreen_open_with_metadata_boundary(
+                0,
+                HistoryTrigger::UserChosen,
+                FsOpenMaterialization::Eager,
+                FsPageLoadContract::Sequential,
+                BookTargetPurpose::Explicit,
+                boundary
+            )
+        );
+        let OpenPermission::Checking { intent, .. } = &env.book_composition_permission.open else {
+            panic!("open must carry its own qualified continuation");
+        };
+        assert_eq!(intent.route, BookTargetRoute::FullscreenOpen(boundary));
+        assert_eq!(
+            intent.clone().route,
+            BookTargetRoute::FullscreenOpen(boundary)
+        );
+        assert_eq!(env.fullscreen_idx, None);
+        process.shutdown_and_join();
     }
 }
 fn hidden() -> CandidatePermission {

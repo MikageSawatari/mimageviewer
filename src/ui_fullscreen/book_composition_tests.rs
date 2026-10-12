@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::*;
 use crate::book_composition::ReadingDirection as CompositionDirection;
 use crate::book_composition::*;
@@ -99,6 +101,66 @@ fn composed_cache_never_observes_dormant_shift_or_late_landscape() {
             .collect::<Vec<_>>(),
         vec![0, 1]
     );
+}
+
+#[test]
+fn book_composition_rating_key_rebase_recomputes_paint_permission_and_masked_anchor() {
+    for status in ["allowed", "hidden", "checking", "partial"] {
+        let data = tempfile::tempdir().unwrap();
+        let (service, owner) =
+            BookCompositionService::spawn_at(data.path().to_path_buf(), None).unwrap();
+        let mut app = composed_app(&fixtures::four_page_book(CompositionDirection::Ltr));
+        app.install_book_composition_runtime(service);
+        app.fullscreen_idx = Some(0);
+        let old = app
+            .spread_display_composition_for_anchor(0)
+            .presentation_demand(app.spread_mode, app.fullscreen_page_slice);
+        app.install_allowed_presentation_for_test(&old);
+        assert!(app.resolve_book_fullscreen_presentation(0).allowed);
+
+        // The rating key can replace the reader anchor inside the same paint pass.
+        // A cached old permission cannot authorize the newly rebound unit.
+        app.fullscreen_idx = Some(2);
+        let next = app
+            .spread_display_composition_for_anchor(2)
+            .presentation_demand(app.spread_mode, app.fullscreen_page_slice);
+        app.install_allowed_presentation_for_test(&next);
+        let held = if status == "checking" {
+            app.install_checking_presentation_for_test(&next)
+        } else {
+            Vec::new()
+        };
+        match status {
+            "hidden" => app.install_hidden_presentation_for_test(&next),
+            "partial" => app.install_hidden_presentation_for_test(&next[..1]),
+            _ => {}
+        }
+        let rebound = app.resolve_book_fullscreen_presentation(2);
+        assert_eq!(
+            rebound.allowed,
+            matches!(status, "allowed" | "partial"),
+            "{status}"
+        );
+        if status == "partial" {
+            assert_eq!(rebound.paint_idx, 3);
+            assert_eq!(
+                rebound
+                    .composition
+                    .pages_in_screen_order(app.spread_mode)
+                    .iter()
+                    .map(|page| page.idx)
+                    .collect::<Vec<_>>(),
+                vec![3]
+            );
+        }
+        assert!(
+            app.book_presentation_demand_snapshot()
+                .iter()
+                .all(|occurrence| next.contains(occurrence))
+        );
+        drop(held);
+        owner.shutdown_and_join();
+    }
 }
 
 #[test]

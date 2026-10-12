@@ -23,12 +23,13 @@ from pathlib import Path
 from generate_rating_sort_fixture import png
 
 
-RECIPE_VERSION = "release-checks-v2"
+RECIPE_VERSION = "release-checks-v4"
 SCHEMA_VERSION = 1
 WIDTH, HEIGHT = 884, 444
 STATIC_COUNT = 16
 STATIC_REQUESTED_PX_TARGET = 374
 STATIC_REQUESTED_PX_TOLERANCE = 8
+STATIC_THUMB_ASPECT = "Portrait3x4"
 FOLDER_COUNT, IMAGES_PER_FOLDER = 512, 4
 TRAY_FOLDER_COUNT, TRAY_IMAGES_PER_FOLDER = 600, 1
 TRAY_WIDTH, TRAY_HEIGHT = 400, 300
@@ -36,7 +37,20 @@ TRAY_GRID_COLS = 10
 NAVIGATION_COUNT = 6
 SEARCH_TERM = "mivreleasefixtureorchid"
 SEARCH_HIT_NUMBERS = (1, 3, 6)
+PERF_FOLDER_LOAD_COUNT = 256
 DEFAULT_ALLOWED_ROOT = Path(__file__).resolve().parents[2] / "target" / "ui-smoke" / "runs"
+
+
+def cache_seed_sessions(paths: dict, perf: dict) -> list[dict]:
+    return [
+        {"case_id": "seed-profile", "overlay": "seed-static", "startup_path": paths["static"],
+         "cache_paths": [paths["static"]], "seed_kinds": ["cache", "video-pin", "search"]},
+        {"case_id": "seed-perf-cached", "overlay": "seed-perf-cached", "startup_path": paths["cached"],
+         "cache_paths": [paths["cached"], *perf["cached"]["navigation_order"],
+                         *perf["cached"]["load_order"]], "seed_kinds": ["cache"]},
+    ]
+
+
 MANY_NAMES = ("cached", "uncached")
 TRAY_NAMES = ("tray-while", "tray-after")
 CASE_PATHS = {
@@ -100,7 +114,7 @@ def fixture_png(identity: int, prompt: str | None = None, *,
 
 
 def settings_overlay(start_path: Path, search_root: Path, *, tray_case: bool = False,
-                     seed_cache: bool = False) -> dict:
+                     seed_cache: bool = False, static_case: bool = False) -> dict:
     overlay = {
         "startup_folder_mode": "specific",
         "startup_folder_path": str(start_path),
@@ -109,13 +123,19 @@ def settings_overlay(start_path: Path, search_root: Path, *, tray_case: bool = F
         "window_size": [1328.0, 900.0],
         "grid_view_mode": "Thumbnail",
         "grid_cols": 7,
-        "thumb_aspect": "Landscape16x9",
+        # §1.198: the taller 3:4 cell requests ~374px at 150% DPI here.
+        # A 16:9 cell with the same width requests only ~281px, missing the
+        # integer-decode regression. Actual request evidence remains mandatory.
+        "thumb_aspect": STATIC_THUMB_ASPECT if static_case else "Landscape16x9",
         "thumb_aspect_auto": False,
         "sort_order": "FileName",
         "minimize_to_tray_on_close": True,
         "always_on_top": False,
         "auto_fullscreen_image_folders": False,
         "remember_favorite_view_state": False,
+        # The stopped seed profile persists Always. Override it explicitly in
+        # runtime cases instead of inheriting the preparation policy.
+        "cache_policy": "Auto",
         "keymap": {"overrides": [], "legacy_ini_migration_done": True,
                    "legacy_ini_backup": None},
         "favorites": [{
@@ -136,6 +156,15 @@ def settings_overlay(start_path: Path, search_root: Path, *, tray_case: bool = F
         # generated PNGs reliably. Runtime non-tray cases retain default Auto.
         overlay["cache_policy"] = "Always"
     return overlay
+
+
+def static_recipe() -> dict:
+    return {"width": WIDTH, "height": HEIGHT, "window_size": [1328, 900],
+            "grid_cols": 7, "thumb_aspect": STATIC_THUMB_ASPECT, "thumb_aspect_auto": False,
+            "requested_px_hint": STATIC_REQUESTED_PX_TARGET,
+            "requested_px_target": STATIC_REQUESTED_PX_TARGET,
+            "requested_px_tolerance": STATIC_REQUESTED_PX_TOLERANCE,
+            "requested_px_must_be_observed": True}
 
 
 def tray_recipe() -> dict:
@@ -206,7 +235,8 @@ def generate(output: Path, ffmpeg: Path, *, allowed_root: Path = DEFAULT_ALLOWED
                 image(child / f"image-{number:02d}.png")
         perf[mode] = {"many_folders": paths[mode], "start_folder": order[0],
                       "navigation_order": order, "ctrl_down_count": 5,
-                      "cache_prepared": False}
+                      "cache_prepared": False, "load_order": [str(Path(paths[mode]) / f"folder-{i:04d}")
+                                     for i in range(1, min(FOLDER_COUNT, PERF_FOLDER_LOAD_COUNT) + 1)]}
     paths["navigation"] = paths["perf-cached-navigation"]
     hits, non_hits = [], []
     for number in range(1, 7):
@@ -234,11 +264,13 @@ def generate(output: Path, ffmpeg: Path, *, allowed_root: Path = DEFAULT_ALLOWED
     overlay_values = {}
     for case, name in CASE_PATHS.items():
         overlay_values[case] = settings_overlay(Path(paths[name]), Path(paths["search"]),
-                                               tray_case=case.startswith("tray-"))
+                                               tray_case=case.startswith("tray-"),
+                                               static_case=case.startswith("static-"))
     for seed, name in (("seed-static", "static"), ("seed-perf-cached", "cached"),
                        ("seed-video-pin", "video-pin-child"), ("seed-search", "search")):
         overlay_values[seed] = settings_overlay(Path(paths[name]), Path(paths["search"]),
-                                               seed_cache=seed != "seed-search")
+                                               seed_cache=seed != "seed-search",
+                                               static_case=seed == "seed-static")
     for case, value in overlay_values.items():
         path = output / "overlays" / f"{case}.json"
         path.parent.mkdir(exist_ok=True)
@@ -261,11 +293,7 @@ def generate(output: Path, ffmpeg: Path, *, allowed_root: Path = DEFAULT_ALLOWED
                    "navigation_subtrees": 2, "navigation_folders_per_subtree": NAVIGATION_COUNT,
                    "search_images": 6, "search_hits": len(hits),
                    "png_images": identity, "videos": 1},
-        "static": {"width": WIDTH, "height": HEIGHT, "window_size": [1328, 900],
-                   "grid_cols": 7, "requested_px_hint": STATIC_REQUESTED_PX_TARGET,
-                   "requested_px_target": STATIC_REQUESTED_PX_TARGET,
-                   "requested_px_tolerance": STATIC_REQUESTED_PX_TOLERANCE,
-                   "requested_px_must_be_observed": True},
+        "static": static_recipe(),
         "tray": tray_recipe(),
         "search": {"root": paths["search"], "term": SEARCH_TERM,
                    "metadata_key": "parameters", "expected_hits": hits,
@@ -280,8 +308,9 @@ def generate(output: Path, ffmpeg: Path, *, allowed_root: Path = DEFAULT_ALLOWED
             "write_owner": "normal_app_apis", "app_launch_requires_interactive_approval": True,
             "profile_copy_requires_clean_process_exit": True,
             "same_absolute_paths_after_restore": True,
+            "sessions": cache_seed_sessions(paths, perf),
             "cache": {"prepare": [paths["static"], paths["cached"],
-                                   *perf["cached"]["navigation_order"]],
+                                   *perf["cached"]["navigation_order"], *perf["cached"]["load_order"]],
                       "read_after_restart": True,
                       "must_remain_unread": [paths["uncached"], paths["tray-while"],
                                              paths["tray-after"],
@@ -331,6 +360,8 @@ def verify_fixture(output: Path, *, allowed_root: Path = DEFAULT_ALLOWED_ROOT) -
             manifest["static"].get("requested_px_tolerance") != STATIC_REQUESTED_PX_TOLERANCE or
             manifest["static"].get("requested_px_must_be_observed") is not True):
         raise ValueError("static request observation range is invalid")
+    if manifest["static"] != static_recipe():
+        raise ValueError("static regression recipe is invalid")
     expected_paths = {name: str(output / name)
                       for name in ("static", *MANY_NAMES, *TRAY_NAMES, "video-pin", "search")}
     expected_paths.update({f"perf-{mode}-navigation": str(output / f"perf-{mode}-navigation")
@@ -388,11 +419,16 @@ def verify_fixture(output: Path, *, allowed_root: Path = DEFAULT_ALLOWED_ROOT) -
                  for folder in range(1, NAVIGATION_COUNT + 1)]
         if manifest["perf"][mode] != {
                 "many_folders": expected_paths[mode], "start_folder": order[0],
-                "navigation_order": order, "ctrl_down_count": 5, "cache_prepared": False}:
+                "navigation_order": order, "ctrl_down_count": 5, "cache_prepared": False,
+                "load_order": [str(Path(expected_paths[mode]) / f"folder-{i:04d}")
+                               for i in range(1, min(FOLDER_COUNT, PERF_FOLDER_LOAD_COUNT) + 1)]}:
             raise ValueError("perf preparation recipe is invalid")
+    if manifest["seed_requirements"].get("sessions") != cache_seed_sessions(expected_paths, manifest["perf"]):
+        raise ValueError("seed session layout/isolation recipe is invalid")
     if manifest["seed_requirements"]["cache"] != {
             "prepare": [expected_paths["static"], expected_paths["cached"],
-                        *manifest["perf"]["cached"]["navigation_order"]],
+                        *manifest["perf"]["cached"]["navigation_order"],
+                        *manifest["perf"]["cached"]["load_order"]],
             "read_after_restart": True,
             "must_remain_unread": [expected_paths["uncached"], expected_paths["tray-while"],
                                    expected_paths["tray-after"],
@@ -406,13 +442,15 @@ def verify_fixture(output: Path, *, allowed_root: Path = DEFAULT_ALLOWED_ROOT) -
         if case in CASE_PATHS:
             expected = settings_overlay(Path(manifest["paths"][CASE_PATHS[case]]),
                                         Path(manifest["paths"]["search"]),
-                                        tray_case=case.startswith("tray-"))
+                                        tray_case=case.startswith("tray-"),
+                                        static_case=case.startswith("static-"))
         elif case in ("seed-static", "seed-perf-cached", "seed-video-pin", "seed-search"):
             name = {"seed-static": "static", "seed-perf-cached": "cached",
                     "seed-video-pin": "video-pin-child", "seed-search": "search"}[case]
             expected = settings_overlay(Path(manifest["paths"][name]),
                                         Path(manifest["paths"]["search"]),
-                                        seed_cache=case != "seed-search")
+                                        seed_cache=case != "seed-search",
+                                        static_case=case == "seed-static")
         else:
             raise ValueError(f"unknown overlay: {case}")
         overlay_path = isolated_path(Path(path), output)

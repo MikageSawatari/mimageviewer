@@ -90,6 +90,7 @@ pub(crate) struct RatingViewPreparedItems {
 }
 
 pub(crate) struct RatingViewPrepareOptions {
+    pub(crate) rating_preview: crate::rating_membership::RatingPreviewRecipe,
     pub(crate) sort: RatingViewSort,
     pub(crate) visibility: crate::file_type_visibility::FileTypeVisibility,
     pub(crate) include_epub: bool,
@@ -116,6 +117,8 @@ pub struct RatingViewPending {
     pub source_generation: u64,
     pub(crate) context: crate::app::ViewerContextId,
     pub rating_write_generation: u64,
+    pub(crate) rating_preview: crate::rating_membership::RatingPreviewRecipe,
+    pub(crate) rating_adoption: crate::rating_membership::RatingAdoptionIntent,
     pub sort: RatingViewSort,
     pub(crate) membership_only: bool,
     /// Direct/history entry keeps its outgoing grid mounted until prepared rows are adopted.
@@ -141,6 +144,7 @@ pub(crate) fn spawn_rating_view_build(
     options: RatingViewPrepareOptions,
 ) -> RatingViewPending {
     let options_sort = options.sort;
+    let rating_preview = options.rating_preview.clone();
     let membership_only = matches!(options.intent, RatingViewBuildIntent::Membership { .. });
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_worker = Arc::clone(&cancel);
@@ -163,6 +167,8 @@ pub(crate) fn spawn_rating_view_build(
         source_generation,
         context,
         rating_write_generation,
+        rating_preview,
+        rating_adoption: crate::rating_membership::RatingAdoptionIntent::Reconcile,
         sort: options_sort,
         membership_only,
         navigation: None,
@@ -176,6 +182,16 @@ fn build_rating_view_rows(
     stars: u8,
     cancel: &AtomicBool,
 ) -> Result<RatingViewBuildResult, rusqlite::Error> {
+    build_rating_view_rows_with_recipe(db_path, stars, cancel, &Default::default())
+        .map(|(result, _)| result)
+}
+
+fn build_rating_view_rows_with_recipe(
+    db_path: PathBuf,
+    stars: u8,
+    cancel: &AtomicBool,
+    recipe: &crate::rating_membership::RatingPreviewRecipe,
+) -> Result<(RatingViewBuildResult, std::collections::HashMap<String, u8>), rusqlite::Error> {
     // 既存 DB を読み取り専用で開く (マイグレーション DDL を再実行せず、main 接続と
     // 競合しない)。ファイルが無い等で失敗したら作成込みの open_at にフォールバックする。
     let db = match crate::rating_db::RatingDb::open_readonly(&db_path) {
@@ -183,6 +199,10 @@ fn build_rating_view_rows(
         Err(_) => crate::rating_db::RatingDb::open_at(&db_path)?,
     };
     let rows = db.list_by_stars(stars)?;
+    let mut ratings = rows
+        .iter()
+        .map(|row| (row.key.clone(), row.stars))
+        .collect::<std::collections::HashMap<_, _>>();
     let mut out = Vec::with_capacity(rows.len());
     let mut skipped = 0usize;
     for row in rows {
@@ -194,13 +214,50 @@ fn build_rating_view_rows(
             None => skipped += 1,
         }
     }
-    Ok(RatingViewBuildResult {
-        stars,
-        rows: out,
-        skipped,
-        visibility_notice: None,
-        prepared: None,
-    })
+    // Fixed-star SQL filtering would otherwise erase this ring's departed row.
+    // Resolve its canonical descriptor at the candidate boundary, validating its
+    // present source and ordinary visibility before sorting/materialization.
+    let mut fixed_filter = [false; 6];
+    fixed_filter[stars.clamp(1, 5) as usize] = true;
+    for leave in &recipe.entries {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        if ratings.contains_key(&leave.key) {
+            continue;
+        }
+        let stored = db.row_for_key(&leave.key)?;
+        let current = stored.as_ref().map(|row| row.stars).unwrap_or(0);
+        if !recipe.allows(&leave.key, current, &fixed_filter) {
+            continue;
+        }
+        let row = if let Some(stored) = stored {
+            rating_row_to_view_row(&stored)
+        } else {
+            source_path_for_item(&leave.item)
+                .and_then(|path| std::fs::metadata(path).ok())
+                .map(|meta| RatingViewRow {
+                    key: leave.key.clone(),
+                    item: leave.item.clone(),
+                    image_meta: Some((mtime_secs(&meta), meta.len().min(i64::MAX as u64) as i64)),
+                    rated_at_ms: None,
+                })
+        };
+        if let Some(row) = row {
+            ratings.insert(row.key.clone(), current);
+            out.push(row);
+        }
+    }
+    Ok((
+        RatingViewBuildResult {
+            stars,
+            rows: out,
+            skipped,
+            visibility_notice: None,
+            prepared: None,
+        },
+        ratings,
+    ))
 }
 
 fn prepare_rating_view(
@@ -210,10 +267,11 @@ fn prepare_rating_view(
     cancel: &AtomicBool,
 ) -> Result<RatingViewBuildResult, String> {
     let rating_before = crate::rating_db::RATING_WRITES.sample();
-    let mut result = match build_rating_view_rows(db_path, stars, cancel) {
-        Ok(result) => result,
-        Err(error) => return Err(error.to_string()),
-    };
+    let (mut result, rating_values) =
+        match build_rating_view_rows_with_recipe(db_path, stars, cancel, &options.rating_preview) {
+            Ok(result) => result,
+            Err(error) => return Err(error.to_string()),
+        };
     if !options.include_epub {
         result.rows.retain(|row| {
             !matches!(&row.item, GridItem::PdfFile(path) if path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("epub")))
@@ -318,7 +376,7 @@ fn prepare_rating_view(
         .iter()
         .enumerate()
         .filter(|(_, item)| item.accepts_rating())
-        .map(|(index, _)| (index, stars))
+        .map(|(index, _)| (index, rating_values[&result.rows[index].key]))
         .collect();
     let tag_keys = items
         .iter()
@@ -346,7 +404,10 @@ fn prepare_rating_view(
     if !crate::page_edit_write_epoch::EditWriteEpoch::read_is_stable(tag_before, tag_stamp) {
         return Err("tag read changed during rating prepare".into());
     }
-    let rating_stamp = rating_before;
+    let rating_stamp = crate::rating_db::RATING_WRITES.sample();
+    if !crate::page_edit_write_epoch::EditWriteEpoch::read_is_stable(rating_before, rating_stamp) {
+        return Err("rating read changed during rating prepare".into());
+    }
     result.prepared = Some(RatingViewPreparedItems {
         items,
         image_metas,
@@ -726,6 +787,133 @@ mod tests {
     use crate::rating_db::{RatingItemKind, RatingRow};
     use std::io::Write;
 
+    fn membership_options(
+        recipe: crate::rating_membership::RatingPreviewRecipe,
+    ) -> RatingViewPrepareOptions {
+        RatingViewPrepareOptions {
+            rating_preview: recipe,
+            sort: RatingViewSort::default(),
+            visibility: Default::default(),
+            include_epub: true,
+            intent: RatingViewBuildIntent::Reorder,
+            display_order: Default::default(),
+            pin_db: None,
+            folder_thumb_sort: crate::settings::SortOrder::FileName,
+            folder_thumb_depth: 0,
+            edits: Default::default(),
+            tags_db_path: None,
+            sidecar_settings: Default::default(),
+        }
+    }
+
+    #[test]
+    fn rating_membership_prepare_rejects_active_write_and_old_ready_after_restore() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("rating.db");
+        let db = crate::rating_db::RatingDb::open_at(&db_path).unwrap();
+        let a = tmp.path().join("a.jpg");
+        let b = tmp.path().join("b.jpg");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        let key = crate::adjustment_db::normalize_path(&a);
+        db.set_user_rating(&key, 0, None).unwrap();
+        db.set_user_rating(&crate::adjustment_db::normalize_path(&b), 3, None)
+            .unwrap();
+        let old = prepare_rating_view(
+            db_path.clone(),
+            3,
+            membership_options(Default::default()),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(old.rows.len(), 1);
+        let stamp = old.prepared.unwrap().rating_stamp;
+        db.set_user_rating(&key, 3, None).unwrap();
+        assert!(!crate::rating_db::RATING_WRITES.accepts(stamp));
+        let restored = prepare_rating_view(
+            db_path.clone(),
+            3,
+            membership_options(Default::default()),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(restored.rows.len(), 2);
+        let writing = crate::rating_db::RATING_WRITES.begin();
+        assert_eq!(
+            prepare_rating_view(
+                db_path,
+                3,
+                membership_options(Default::default()),
+                &AtomicBool::new(false)
+            )
+            .err()
+            .as_deref(),
+            Some("rating read changed during rating prepare")
+        );
+        drop(writing);
+    }
+
+    #[test]
+    fn rating_membership_ring_candidate_merges_current_hits_and_true_rating_values() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("rating.db");
+        let db = crate::rating_db::RatingDb::open_at(&db_path).unwrap();
+        let a = tmp.path().join("a.jpg");
+        let b = tmp.path().join("b.jpg");
+        let c = tmp.path().join("c.jpg");
+        for path in [&a, &b, &c] {
+            std::fs::write(path, b"image").unwrap();
+        }
+        let key = crate::adjustment_db::normalize_path(&a);
+        db.set_user_rating(&key, 0, None).unwrap();
+        for path in [&b, &c] {
+            db.set_user_rating(&crate::adjustment_db::normalize_path(path), 3, None)
+                .unwrap();
+        }
+        let recipe = crate::rating_membership::RatingPreviewRecipe {
+            entries: vec![crate::rating_membership::RatingPreviewLeave {
+                key: key.clone(),
+                item: GridItem::Image(a.clone()),
+                before: 3,
+                after: 0,
+                write_generation: 1,
+            }],
+        };
+        let held = prepare_rating_view(
+            db_path.clone(),
+            3,
+            membership_options(recipe.clone()),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(held.rows.len(), 3);
+        let a_index = held.rows.iter().position(|row| row.key == key).unwrap();
+        assert_eq!(held.prepared.unwrap().rating_cache[&a_index], 0);
+        let closed = prepare_rating_view(
+            db_path.clone(),
+            3,
+            membership_options(Default::default()),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(closed.rows.len(), 2);
+        std::fs::remove_file(a).unwrap();
+        let deleted = prepare_rating_view(
+            db_path,
+            3,
+            membership_options(recipe),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(
+            deleted.rows.len(),
+            2,
+            "recipe cannot revive a missing source"
+        );
+    }
+
     #[test]
     fn visibility_rating_worker_preserves_cache_proof_and_ratings_without_current_source() {
         for missing_source in [false, true] {
@@ -762,6 +950,7 @@ mod tests {
                 }
             };
             let options = || RatingViewPrepareOptions {
+                rating_preview: Default::default(),
                 sort: RatingViewSort::default(),
                 include_epub: true,
                 intent: RatingViewBuildIntent::Reorder,
@@ -1296,6 +1485,7 @@ mod tests {
                 db_path.clone(),
                 3,
                 RatingViewPrepareOptions {
+                    rating_preview: Default::default(),
                     sort: RatingViewSort::default(),
                     visibility: settings.file_type_visibility.clone(),
                     include_epub: true,
@@ -1356,6 +1546,7 @@ mod tests {
                 db_path.clone(),
                 3,
                 RatingViewPrepareOptions {
+                    rating_preview: Default::default(),
                     sort: RatingViewSort::default(),
                     visibility: settings.file_type_visibility.clone(),
                     include_epub: true,

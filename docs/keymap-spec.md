@@ -83,6 +83,8 @@ OS/egui clipboard、D&D、IME 確定、右クリックメニューは keymap 対
 `RatingContainer1..5/Clear/StepUp/StepDown`) で、グリッド / 画像フルスクリーン / 動画フルスクリーンが
 同じ割り当てを共有する。v2.2.0 からは物理キー寄りの `KeySlot` を正本にし、通常の数字キーとテンキー数字を別キーとして扱う。互換性のため、従来の数字キー既定操作は `1` と `Numpad1` のように両方を既定割り当てにする。
 `StepUp/StepDown` は標準キーなし。未評価は操作時だけ ★3 を基準にし、上げると ★4、下げると ★2 を保存する。★5 から上げる / ★1 から下げる操作は書き込み・Undo を作らない。チェック済み項目は各自の現在値から一括で変化し、1 回の Undo で戻せる。コンテナ用は直接指定と同じく現在開いているフォルダ / ZIP / PDF 本体が対象。
+評価変更で表示条件から外れた場合、グリッド選択は現在の表示順、フルスクリーンは現在の読書順で次の残存対象、なければ前へ移る。読む順の「次」は RTL でも左右キーの向きで反転しない。ページがゼロなら現在の絞り込み済みページ一覧へ戻り、フィルタを解除しない。自動移動・一覧復帰で評価通知と評価 Undo を消さず、直後の `Ctrl+Z` は評価を戻して、同じ一覧・条件で対象となる元画像へ復帰する。通常の手動移動・close の履歴終了方針は維持する。
+マウス / パッドのピッカーの★は保存済み live preview を維持し、その preview だけで離脱する既存行を終了まで残す。現在ページと各行の preview は維持するが、新しい検索 hit・件数・明示 sort は通常どおり更新する。終端で最終成功値の一件 Undo を記録し、次 / 前 / 現在一覧の移動を一度決める。新しい `KeyAction` は追加しない。所有・復帰不可・取消の詳細は [§1.371 の計画](rating-filter-fullscreen-plan.md) を参照。
 本体 <kbd>Enter</kbd> と `NumpadEnter` も別スロットであり、押下操作、KeyHold、native 動画、
 操作カスタマイズの「押して入力」の全経路で相互に発火しない。Windows では両者が
 `VK_RETURN` を共有するため、Win32 `WM_KEYDOWN/WM_KEYUP` の extended bit を物理種別の
@@ -376,10 +378,22 @@ dispatch 可否とは別の状態遷移であり、取消後の unfocused pass �
 
 ## グリッドビュー (フルスクリーン外) 共通
 
+Everything ファイル名検索は `GlobalEverythingSearch` / `Grid` / `Press`、既定
+`Ctrl+R`。名前の Global は検索範囲を表し、fullscreen の Global scope へは登録しない。
+main の一覧からだけ開き、text focus / IME（focus recovery を含む）/ modal / Remote lock
+中には発火しない。画像・egui動画/音声・native動画/音声・detached viewer の検索起動には
+使わず、native 転送 snapshot に含めない。画像 fullscreen の R 検出 probe は action の
+dispatch ではない。`Ctrl+G/S/E` の既存割当は維持する。メニュー
+`MenuCommandId::GlobalEverythingSearch`（ファイル → Everything ファイル名検索…）も
+同じ受付へ接続し、caption は実効 keymap の先頭キーを表示する。操作カスタマイズでは
+サムネイル一覧の操作として変更・解除できる。Everything の入力は明示送信とし、IME確定の
+Enter では送信せず、確定後の Enter または「検索」で送信する。
+
 `GridColumnCount11..20` のリング・マウス割り当てを旧版から守るには、公開時にアプリ版番号を v4.1.0 より上げることが前提。`settings.db` は保存時の版番号が実行版より新しければ、旧版の起動時に読み込み前の `Incompatible` 判定で保存を止める。同じ v4.1.0 の開発ビルド間ではこの判定が働かず、旧版の `sanitize()` が未知のリング・マウス操作を `None` に置き換えて保存し得る。版番号の更新はリリース作業で行う。
 
 | キー | 動作 |
 |---|---|
+| <kbd>Ctrl</kbd>+<kbd>R</kbd> | main の一覧から Everything ファイル名検索バーを開く。Action: `GlobalEverythingSearch`。閉じる操作は×/Esc。取得・準備中は取消可能なmainのモーダルを使い、完成した一覧だけを採用する |
 | <kbd>?</kbd> (既定) | 現在のサムネイル一覧コンテキストで使えるショートカット一覧を表示する。Action: `HelpShowContextShortcuts`。keymap 化済み操作は現在読み込まれている割り当て済みのものを表示し、固定扱いのナビゲーションキーは別枠で表示する |
 | <kbd>Backspace</kbd> | 親フォルダへ。Action: `GridParentFolder`。ドライブルート (`C:\` など) ではドライブ一覧へ戻り、元ドライブを選択状態にする。検索 (Ctrl+S / Ctrl+G) 中は検索仮想階層を 1 段ドリルアップ、最上位 (集約ビュー / 結果一覧) では no-op。タグビュー (Ctrl+T) 中は、検索結果から開いたフォルダ / ZIP / PDF / 変換アーカイブを 1 段戻り、検索結果一覧では no-op (検索を閉じるには <kbd>Esc</kbd> / 検索バーの <kbd>×</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd>・<kbd>Ctrl</kbd>+<kbd>S</kbd>・<kbd>Ctrl</kbd>+<kbd>T</kbd> 再押下)。Ctrl+F フィルタ中は、フィルタを実行したフォルダだけ親移動を no-op にする。検索結果から子フォルダへ入った後は通常どおり親へ戻れる |
 | <kbd>Enter</kbd> | 選択アイテムを開く。Action: `GridOpenSelected`。別ウィンドウセッションが同じ項目を既に表示中の場合は再オープンせず、必要に応じて別ウィンドウを前面化する |
@@ -444,6 +458,13 @@ mIV は各フレームの入力処理前と Shell 復帰直後に Win32 の実�
 `i.modifiers` / `raw.modifiers` を同期する。個別の `Event::Key` に記録された
 modifiers はイベント発生時点の情報として残し、離散ショートカットの event 判定は
 書き換えない。
+
+一覧の矢印 / PageUp・Down / Home・End による通常移動は、移動先を次の Shift 選択の起点にする。
+Shift を伴う一覧カーソル移動と Shift+クリックは起点を保持する（キーの範囲チェック加算は従来どおり）。
+既定の Shift 派生は矢印キーだけで、PageUp・Down / Home・End の受付は既存の完全一致 keymap に従う。
+全画面のページ送り・ジャンプと Esc で戻るカーソルも通常移動として起点を更新する。
+これらは既存の固定 / KeyAction 派生動作の意味を揃える修正で、新 Action・割り当ては追加しない。
+サムネイル / 詳細一覧と context 所有の詳細は [範囲選択の起点](spec.md#範囲選択の起点-13702026-10-11) を参照。
 
 ## フォルダツリーペイン
 

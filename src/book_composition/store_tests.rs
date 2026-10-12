@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::store::*;
 use super::*;
 use crate::book_scope::BookScopeKey;

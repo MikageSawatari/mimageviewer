@@ -1,4 +1,12 @@
 # Function-only support. Dot-sourcing this file has no filesystem/process/UI effects.
+function Test-ReleaseCheckContinueAfterAnalysis {
+    param([string]$CaseId,[int]$ExitCode)
+    # Called only after normal process completion. Collect the independent
+    # uncached performance evidence even if cached has a real performance FAIL.
+    # Its recorded failure still determines the suite verdict.
+    return $ExitCode -eq 0 -or ($CaseId -eq 'perf-cached' -and $ExitCode -eq 1)
+}
+
 function Invoke-ReleaseCheckPreflight {
     param([scriptblock]$Action)
     try { return [pscustomobject]@{exit_code=0;value=(& $Action);environment_error=$null} }
@@ -127,6 +135,40 @@ function Get-ReleaseCheckWindowSample {
     return [pscustomobject]@{ unix_ms = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(); foreground_pid = $owner; foreground_hwnd = $h.ToInt64(); total = $counts[0]; visible = $counts[1] }
 }
 
+function Assert-ReleaseCheckBackgroundTransitionForeground {
+    param([int]$AppPid, [long]$RootHwnd, [int]$RunnerPid, [long]$BackgroundHwnd, [string]$Operation)
+    # A saved grant can survive a foreground change. Check the current exact
+    # PID/HWND pair at each side-effect boundary, without enumerating windows.
+    $foreground=[MivReleaseCheckNative]::GetForegroundWindow(); [uint32]$owner=0
+    $null=[MivReleaseCheckNative]::GetWindowThreadProcessId($foreground,[ref]$owner)
+    $hwnd=$foreground.ToInt64()
+    if (-not (($owner -eq $AppPid -and $hwnd -eq $RootHwnd) -or
+              ($owner -eq $RunnerPid -and $hwnd -eq $BackgroundHwnd))) {
+        throw "Foreground changed before background ${Operation}: expected root PID=$AppPid HWND=$RootHwnd or runner PID=$RunnerPid HWND=$BackgroundHwnd, observed PID=$owner HWND=$hwnd."
+    }
+}
+
+function Set-ReleaseCheckBackgroundForeground {
+    param($Ready, [int]$AppPid, $Window, [int]$RunnerPid)
+    # The foreground app grants ONLY this runner before publishing ready.json.
+    # Showing/activating a form from a nonforeground process is not sufficient.
+    $grant=$Ready.background_foreground_grant
+    if ($Ready.pid -ne $AppPid -or $grant.granted -ne $true -or
+        $grant.app_pid -ne $AppPid -or $grant.runner_pid -ne $RunnerPid -or
+        $grant.root_hwnd -ne $Ready.root_hwnd -or $Ready.root_hwnd -le 0 -or
+        $RunnerPid -le 0 -or $RunnerPid -eq $AppPid) { throw 'Exact runner foreground grant missing or mismatched.' }
+    $hwnd=$Window.Handle.ToInt64(); [uint32]$owner=0
+    $null=[MivReleaseCheckNative]::GetWindowThreadProcessId([IntPtr]$hwnd,[ref]$owner)
+    if ($hwnd -le 0 -or $hwnd -eq $Ready.root_hwnd -or $owner -ne $RunnerPid) { throw 'Background HWND is not owned by this runner.' }
+    Assert-ReleaseCheckBackgroundTransitionForeground $AppPid $Ready.root_hwnd $RunnerPid $hwnd 'Show'
+    $Window.Show()
+    Assert-ReleaseCheckBackgroundTransitionForeground $AppPid $Ready.root_hwnd $RunnerPid $hwnd 'activation'
+    if (-not [MivReleaseCheckNative]::SetForegroundWindow([IntPtr]$hwnd)) { throw 'Runner background foreground activation was refused.' }
+    $sample=Get-ReleaseCheckWindowSample $AppPid
+    Assert-ReleaseCheckWindowSamples @($sample) 'static-background' $AppPid $Ready.root_hwnd $hwnd $RunnerPid
+    return $sample
+}
+
 function Assert-ReleaseCheckWindowSamples {
     param($Samples, [string]$Scenario, [int]$AppPid, [long]$RootHwnd, [long]$BackgroundHwnd, [int]$BackgroundProcessId=0)
     foreach ($s in $Samples) {
@@ -137,7 +179,7 @@ function Assert-ReleaseCheckWindowSamples {
         } else {
             if ($BackgroundHwnd -eq 0 -or $BackgroundProcessId -le 0 -or
                 $s.foreground_hwnd -ne $BackgroundHwnd -or $s.foreground_pid -ne $BackgroundProcessId -or
-                $s.foreground_pid -eq $AppPid) { throw 'Runner-owned background window condition was not maintained.' }
+                $s.foreground_pid -eq $AppPid) { throw "Runner-owned background window condition was not maintained: expected PID=$BackgroundProcessId HWND=$BackgroundHwnd, observed PID=$($s.foreground_pid) HWND=$($s.foreground_hwnd)." }
         }
     }
 }

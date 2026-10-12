@@ -549,6 +549,7 @@ impl App {
         _fs_idx: usize,
     ) -> FsKeyAction {
         let action = FsKeyAction {
+            page_transition: Default::default(),
             close: false,
             close_to_page_list: false,
             page_nav: crate::ui_fullscreen::FsPageNav::None,

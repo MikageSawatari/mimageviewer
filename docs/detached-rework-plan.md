@@ -1455,6 +1455,150 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-12 §1.374 Everything の共通Search接続（未コミット・独立実装レビュー待ち）
+
+利用者の実装指示と承認済みEverything計画、先行PDF ownershipの独立ACCEPT実装
+`4510346f5`（master `c1e66f589`）に基づく変更。Stage1の限定ACCEPTやPDF受入を、
+今回のEverything製品実装に対する独立ACCEPTへ読み替えない。追加実装の独立レビューは未完了。
+
+変更caller familyは `global_search_ui.rs` / `global_search_ui/everything.rs` のSearch source/prepare/adopt、
+物理本openの成功採用とRoot/PhysicalChild帰路、共通main modal/input受付、既存物理open/enumerate/return接続。
+実ファイル一覧を既存Search ownerへ採用するための構造接続で、detachedのrect/focus/placement/HWND/recreate
+症状に条件を足す変更ではない。`SearchProducer` と `SearchAccepted` が未採用/採用済みsourceを型で所有し、
+兄弟contextの状態を推測する新しいbool/Option、時間窓、reset、retryを追加しない。
+
+modalはmainのみ、Everything検索起動はmain Gridのみ。detachedから検索を転送しない。
+F12 open/fork/park/promoteは既存物理viewer ownerを使い、mainの検索dataset/return originを複製しない。
+main Searchの一覧交換は同ownerのPDF ticketだけを進め、同pathを読む兄弟queue/cache/requested/編集状態を変更しない。
+Remote source/query/result API、viewport/placement/HWND owner/focus/z-order述語は追加しない。
+取得/帰路のproducerだけがRemote sessionのlocal-modal leaseを持ち、acquireの受付と排他にする。
+既存Search installのpin/タグDB照会をEverythingの共通prepareへ渡し、UIは完成mapを採用する。
+新datasetは同一一覧のrating membership移譲対象にせず、保持datasetのsort/facetは移譲を維持する。
+共通neighbor集合交差のHashSet化は選択規則を変えずUIの二乗探索を除く。
+cross-context/物理本open-back/cancel/failed/stale回帰はfakeで成功した。大きい送信時policyを
+同producer内のBoxへ移してAppサイズを105,400に戻し、App/bundleのstack所有を既存上限内に保つ。
+full libは12,206成功・既知EOF timing failure一件（単独成功）、full UI snapshotは162成功。
+独立実装レビューと実機確認は未完了で、
+証拠は [Everything計画 §14](everything-search-plan.md#14-実装記録2026-10-12)へ集約する。
+
+### 2026-10-12 PDF-EPOCH-OWNERSHIP: R2受入後の実装記録（未コミット）
+
+利用者からR2（`b5b3f06be`）の独立ACCEPTとPDF先行実装指示を取得した。
+以下の設計段階で記録した双方の「BA-7の所有境界を直す構造修正、症状パッチではない」
+合意の範囲で、App/bundleの非Clone writer、immutable ticketの全producer継承、
+共有poolの非同期prune/pop、owner/要求世代/key昇格、fullscreen Unscopedを実装した。
+registryはfresh/build/swap/park/fork/promote/retireでwriterとViewer昇格追跡を分類して移譲する。
+direct-readerからmainのphysical basisを実際に復元する場合だけmain旧要求を失効させる。
+
+回帰は同path/page/targetのmain＋detached Search replace（逆方向も）、
+B同key→A昇格要求→A遅着、旧世代/別owner除外、fullscreen Unscoped/Critical、
+park/fork/build commit/abort/promote/retire、ticket派生、maintenance wake合流を含む。
+viewport/placement/HWND/focus/recreate述語、lane/cap/open-admission、Remote protocol、
+Abort/Harvest/cache keyは変更しない。Everything製品コードは含めない。
+まれなmaintenance切断は既存toastへのログ＋通知のみで、再起動worker/回復stateは追加しない。
+
+指定自動検証の件数・失敗名・ログは `target/EV-pdf-epoch-impl-msg.txt` に集約する。
+fmt、通常/portable check、PDF/context/thumbnail/継承の焦点テストは成功。
+全libは一回で12,150成功・2失敗・56 ignored（未変更のmetadata batch数とvideo first-frame通知）。
+ui_snapshotは156成功・1失敗（変更履歴の基準画像はv4.5.0先頭、現行v4.6.0先頭で未追随）。
+全gate成功とは扱わず、失敗を記録して独立判断へ渡す。
+実装完了の独立レビューと実機受入は未取得。利用者指示に従いbuild-dev/launch/commit/mergeなし。
+
+### 2026-10-12 PDF-EPOCH-OWNERSHIP: render失効と優先昇格のcontext所有（設計段階）
+
+利用者が提示した独立設計レビュー（対象 `efe965453`）は、非Clone writerをbundleと移譲し、
+immutable ticketで失効を判断する案について、
+「BA-7の所有境界を直す構造修正であり、症状パッチではないことに同意します」と明示した。
+設計担当（Codex）も、共有global render epochによる兄弟jobsの失効を、既存context payloadの
+変更権限と要求時点の証明へ移す根本修正であることに同意する。
+詳細は [pdf-render-epoch-ownership-plan.md](pdf-render-epoch-ownership-plan.md) §3–§6/§8/§9。
+
+予定範囲はApp投影/ViewerContextBundleの`PdfRenderEpochOwner`、enqueueと派生要求のread-only
+ticket継承、poolのowner-local prune/pop/cancel/drop、registryのfresh/build/swap/park/fork/
+promote/retire移譲。同じpath/pageのmain+detachedでも、一覧を替えたcontextの旧PDF thumbnail
+jobsだけを失効させる。writerは移動し、fork先はfresh owner、in-flight thumbnail要求は複製しない。
+既存Ctrl+G/通常一覧にもある不具合の独立stageで、EverythingのIPC/UI/新shortcutを含めない。
+
+レビュー唯一のP2は、現行priority promotionがpath/pageだけで兄弟をfoundと数え、未到着Aの
+昇格再試行を終える点。今回の設計改訂はViewer promotionをowner/要求世代/既存keyに限定し、
+found/already_high・Normal昇格・HighNormal対象再配置へ同じselectorを使う。
+既存の昇格追跡値も同じbundle所有のtyped stateへ置換し、forkで複製しない。
+fullscreen本体は明示Unscoped promotionでViewer thumbnailを対象にせず、Unscoped同士の
+共有source/page照合とCritical found契約を維持する。B同key存在→A昇格要求→A遅着の順序、
+同owner旧世代・同generation別owner、main/detached逆方向を回帰条件とする。
+
+viewport/placement/HWND/focus/recreate述語、lane/cap/open-admission方針は変更しない。
+全窓停止、global bump省略guard、時間窓、F12/seek制限、追加retry stateで症状を隠さない。
+UI失効はatomic publishと非blocking wakeまで、prune/reply/freeは既定のpool内maintenance
+worker案。まれな失敗は既定のログ＋通知とし、回復機構/DB再作成を追加しない。
+
+本項は**構造修正への双方の設計合意と予定範囲**の記録。
+独立判定はPDF計画REVISE（P2一件、P1/P3なし）、Everything計画ACCEPT。
+今回のP2改訂へのreviewer再確認・full ACCEPTは未取得。利用者のcommitとreviewer確認後に
+PDF ownershipを独立stageとして先に実装する。実装済み・test成功・製品起動・実機受入を意味しない。
+今回の変更はPDF計画、本§11、引き継ぎTXTのみで、製品コード/.git/build/launchは未変更・未実行。
+
+### 2026-10-11 §1.371: 評価集合の公開を安定context境界へ移す構造合意（設計段階）
+
+利用者が提示した独立再レビュー（対象 `94bc236d1`、rating-filter-fullscreen-plan R2）は、
+「F12の境界修正には、症状パッチではなく構造修正として同意します」と明示した。
+本設計もこの方針を採用し、利用者のR3指示に従って対象・理由をここへ記録する。
+詳細は [rating-filter-fullscreen-plan.md §3.1/§3.2/§8](rating-filter-fullscreen-plan.md#31-contexttableの安定境界-レビューp1-1)。
+
+対象は `viewer_context_registry.rs` のswap内rating publicationを退避前のplan前と、
+incomingのfinish_mount・favorite/effective設定投影完了後へ移すこと、およびbuild/commit/abort/
+fork/promote/retireの同じ安定境界の照合である。swap primitiveはpayload交換だけを担い、
+新しいnavigation・publication・context取得による配送・再mountを開始しない。
+集合の採用出口でcontext自身のreader/cursorを調停し、既存fullscreen landing/teardownと
+§1.370のcursor-move/paired identity remapへ渡す。Main scopeだけに実効filterを適用し、
+DetachedPhysical/CollectionRootの独立membershipと兄弟のitems・cache・channel・queue・世代・tokenを保つ。
+
+理由は、ContextTableのpending遷移内の再入と、集合外anchor/誤配送を作る公開境界を除き、
+完成したowner/settings/集合でreaderとの整合を確立するため。pending guard、時間窓、repaint、
+新しいdetached bool/Option、viewport/geometry/host同定、placement/focus/recreate機構は追加しない。
+未公開ratingを持つoutgoing/incoming mountと元context復帰、build/fork等のtrace、main/F12/A/Bの
+資源分離、Shift+click起点を実装時の回帰対象とする（同planの必須test 6/7/8）。
+
+この同意は **F12の公開境界修正に限定**する。その後、利用者が提示した独立レビューで
+R3 `57b7e320b` 全体が ACCEPT され、Stage 2 の実装を指示した。実装は上記の安定した
+publication 境界と exact identity transfer、既存 landing/teardown/cursor 経路への接続に限定する。
+同identityのRating/Search slot交換ではreaderとselected/Shift起点のpaired remapを保つ。
+編集は下記の2026-10-11利用者決定に従い、出荷済みの終了/clear/cancel境界を再利用する。
+readerのtransfer mapをidx-owned編集/Undoの新しい所有証明に使わず、兄弟contextへ適用しない。
+実装・自動検証結果は `target/K-1371-impl-msg.txt` へ記録する。設計 ACCEPT とこの記録は
+実機受入を意味しない。agent による mIV 起動は行わない。
+
+Stage 2 の独立確認で、idx-only local-adjust Undo と途中編集が App-global のままで、
+一時mount先のexact mapを適用できないowner不足を確認した。2026-10-11に利用者は、
+capture provenance追加やeditorのbundle移設へ広げず、既存編集boundaryを再利用する限定案を選んだ。
+Rating再採用では出荷済みの境界で編集を終了し、非rating Undoを落としてrating Undoだけを保持する。
+Searchは既存clear/cancel方針を維持する。loaded/global editorやidx-only Undoの保持/remapは新設しない。
+**F12の構造合意は引き続き安定publication境界とreader/cursor接続に限定し、一般editor ownerの拡張を含めない**。
+新しいbundle field、context状態、focus/mountによるeditor owner推測を加えず、既存終了boundaryの再利用に留める。
+回帰範囲もreader同identity・paired cursor・rating Undo保持と既存編集終了方針に限定し、
+一般的なcross-context編集/historyの保持・誤配送解消を検証済みと主張しない。
+v4.5.0 tag `1ff9d07df` のSearch streamingにもidx-only誤配送の既存経路があるが、今回の対象外とし、
+利用者が別途バックログへ記載する。根拠・scopeは
+[rating plan の利用者決定](rating-filter-fullscreen-plan.md#stage-2-の編集範囲限定--利用者決定-2026-10-11) に記録する。
+Stage 2の独立ソース完了レビューは、限定編集境界と安定publication、reader/cursor採用、
+既存遅延open ownerのcause/endpoint保持と取消（WarmPdf後続検証を含む）までACCEPT。
+遅延要求の受理時に古いopenを消費し、swap途中やresumeで二度目の行先決定を始めない。
+このscope決定と構造合意は自動gate成功・実機受入を表さない。最終自動結果は上記handoffを参照する。
+
+### 2026-10-11 §1.370: カーソル / 範囲選択起点の共通遷移
+
+実装範囲は `App::move_grid_cursor` / `apply_grid_cursor_move` と既存の selected 更新入口。
+`viewer_context_registry` の独立 viewer 初期選択・物理 context fork・main 復元も同じ遷移へ接続する。
+bundle の交換・同一 identity の再マップでは対の selected / 起点を保持し、linked viewer の
+同じ selected の同期で Shift 起点を上書きしない。新しい detached 述語・viewport・placement・
+待機・状態フィールドは追加しない。起点を残す誤ったカーソル遷移そのものを直す構造修正であり、
+症状パッチではない。実装指示（通常移動の単一 owner と context 所有）に従い、Codex 実装者と
+独立 GPT-6.1 Sol / xhigh の事前設計レビューがこの判断に合意。ClaudeCode の最終検収と実機は未実施。
+同 reviewer の実装レビューで、退避 smart-folder root のカーソル削除後も旧起点が残る同型漏れを
+修正し、snapshot / main 復元の起点確立を世代更新後へ移動。追補レビューは追加指摘なしで ACCEPT。
+仕様・入口棚卸しは [spec.md の範囲選択](spec.md#範囲選択の起点-13702026-10-11)、
+回帰は `app::grid_cursor_tests`（linked 同期と mounted sibling 不変を含む）。§1.371 の動作は変更しない。
+
 2026-10-10 §1.364 D2 本別見開き調整のcontext接続（独立確認・検証待ち）:
 以下は履歴。root操作のlive反映は2026-10-11 D2cの記録とspread-shift設計§11.6で撤回する。
 `src/app/spread_shift_owner.rs::ViewerSpreadShift`を`ViewerContextBundle`へ持たせ、
@@ -4711,3 +4855,67 @@ folder mirrorがなくなったため、migrationによるfolder cache claim・�
 これは利用者指定の機能切り離しと既存保存票の所有境界の補完であり、detached述語・viewport/HWND・
 placement・keep-alive・新状態・時間窓・回復guardを追加しない。実worker完了順とcontext退役のfixturesで確認する。
 本記録は独立レビューや実機観測の完了を主張しない。
+### §11 追補: next-bookとmasterのPDF所有・検索採用の統合（2026-10-12）
+
+利用者指定のmaster統合で、G1〜G4のrecipe/構成/許可/editorと、§1.377のPDF epoch owner、
+EverythingのSearch採用とローカルmodal leaseを両立させる。PDF epochは既存bundleのfresh/swap/fork/retireを
+維持し、G4 editorの独立thumbnail workerは旧epoch=0と同じUnscoped＋専用cancelを明示する。
+Searchのworker準備metadata採用へG1のExtractedResult recipeを同時に渡し、Everythingの本から
+結果へ戻る場合も同じrecipeを戻す。兄弟のPDF ticket/queue/cacheは失効させない。
+
+masterの★キーによる同frame再着地では、G3の許可投影・実paint anchor・Checking mode surfaceを
+同じframe用解決へ再入力する。旧anchorの許可やtextureを新unitへ流用しない。
+構成確認待ちのfullscreen openは既存typed continuationにFsMetadataBoundaryを保持し、
+RatingMembershipの再開をManual navigationとして解除しない。manual close/seekの既存終端は保持し、
+masterで加わったRatingMembership closeも同じ構成許可ownerを退役させて古い再開要求を残さない。
+G3の再投影での選択remapとfullscreen再着地もmasterの共通move_grid_cursor（Automatic）へ通し、
+新しいitems世代のcursor/range anchorを対で確定する。範囲選択の検査例外は追加しない。
+これらは既存の所有・操作理由を共通consumerまで運ぶ統合であり、detached述語/HWND/viewport/
+placementの症状patch、新しい持続状態、時間窓、repaintによる回復は追加しない。
+
+監査はG側の既存APIをコード/callerで照合し、A4の3指紋を更新、既存のretained構成poll APIを1件登録。
+A6は11個の既存test-onlyファイルへcfg(test)を明記する（8個はinner属性、include先3個は
+各関数のouter属性で、既存のmodule階層を変えない）。A2bは同contextの編集状態を
+identity remapして戻す既存adopt_book_projectionだけを理由付きで限定登録する。
+規則・閾値・ファイル除外・known findingは変更しない。実行結果はtarget/G-1242-master-merge-msg.txtへ記録し、
+本記録で独立レビューや実機確認の完了を主張しない。
+
+### 2026-10-12 v4.6.0 CI viewer-context audit の現行契約への追従
+
+master で停止を再現し、A6 131 件 / A4 9 件の計 140 指摘を確認した。
+前例 a03777b0f と同じ方針で、製品動作・registry protocol は変更しない。
+
+- A4: §1.364 D1〜D3 の既存実装をコードと caller で照合し、6 個の現行 API 指紋を登録する。
+  `ViewerContextBundle.spread_shift` は mount / swap で移送され、fork は accepted state だけを複製する。
+  `ContextAsyncOwner::RetainedSpreadShift` と先頭に同 owner を加えた 20 件の `ALL` は、
+  context 所有の retained readoption の poll / park 時取消を既存 inventory に接続する。
+  `deliver_spread_shift_reply_at_rest` は reply の context ID で所有 bundle を選び、
+  sequence / operation / scope を照合する既存 owner へ配送する。
+  `make_at_rest_spread_shifts_session_only` は記憶設定変更時に retained owner の session 調整を保ち、
+  `migrate_at_rest_spread_shifts` は同本の page ref 移行だけを反映する。
+  root 改名時に accepted context を旧 source へ留める D2c の契約を保持する。
+  旧指紋 3 個の欠落と現行指紋 6 個の未登録が 9 指摘の内訳で、各登録行に由来コメントを付ける。
+- A6: 親の test cfg のみで囲われた `spread_shift_owner_tests` (76 件) /
+  `rating_membership_tests` (38 件) / `grid_cursor_tests` (1 件) /
+  `spread_shift::contract_fixtures` (3 件) に同等の inner `cfg(test)` を明記する。
+  既存の Windows / portable 等の追加条件は変更しない。
+  `remote_ipc::ui::tests` 内で `include!` される `spread_shift_ui_tests.rs` (13 件) は、
+  include 先に inner 属性を置けないため、ファイル全体を既に囲う `spread_shift_d3` に
+  outer `#[cfg(test)]` を 1 行だけ付ける。module 移動・階層変更・監査例外の追加は不要で、
+  既存の per-file visitor が同じ test 所有を確認できる最小の変更である。
+
+規則・閾値・ファイル除外・A2b の限定登録は変更せず、A4 の完全一致、A6 の
+production 呼出し拒否を維持する。製品側の変更は既存 test-only ファイルの cfg 明記だけで、
+cfg(test) でない製品コード、detached 述語 / viewport / mount / drop の実装を変更しない。
+署名済み配布物に関わる runtime 変更・製品起動・コミットは行わない。
+
+検証: `cargo test --locked -p viewer_context_audit` 36 件成功、
+`cargo run --locked -p viewer_context_audit` exit 0。
+`--no-allowlist` は既存の限定登録 5 件の A2b だけを再検出 (期待する exit 1) し、
+ファイル / 関数も登録と完全一致。A4 / A6 の残存指摘、known finding はいずれも 0 件。
+関連 lib の `spread_shift` 128 件 / `rating_membership` 80 件 / `grid_cursor` 31 件成功
+(すべて `--locked`、失敗 / ignored は各 0 件)。`cargo fmt --check`、通常 / portable の
+`mimageviewer-core cargo check --locked`、`git diff --check` はすべて exit 0。
+ログは `target/ci-v460-*.log`。7 変更ファイルの CRLF を維持し、製品側 5 ファイルは
+test cfg 追加だけ、監査側は `PUBLIC_API_ALLOWLIST` 内だけの差分であることも機械照合した。
+別セッションの `docs/next-release-backlog.md` は変更せず、アプリ起動・コミットは行っていない。

@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Runtime ownership and worker projection adoption, including parked contexts.
 use super::{
     book_composition_runtime::ViewerBookComposition, tests::phase_c_support::setup_app, *,
@@ -1297,6 +1299,12 @@ fn g3_source_terminal_required_hidden_or_missing_target_never_uses_another_page(
         assert!(!env.book_deferred_open_wait_active());
         let accepted_grid_selection = env.selected;
         assert_eq!(
+            env.grid_click_selection_anchor
+                .and_then(|anchor| anchor.index_for_generation(env.items_generation)),
+            accepted_grid_selection,
+            "projection remaps the cursor and range anchor into the same generation",
+        );
+        assert_eq!(
             env.open_deferred_fullscreen_after_enumerate(deferred),
             if requested_page == 0 {
                 DeferredFsOpenOutcome::RequiredTargetHidden
@@ -1353,6 +1361,12 @@ fn g3_hidden_refresh_follows_next_previous_first_and_closes_without_resume_write
         admit_projection(&mut env, &service, &scope);
         settle_projection(&mut env);
         assert_eq!(current_physical_page(&env), expected);
+        assert_eq!(
+            env.grid_click_selection_anchor
+                .and_then(|anchor| anchor.index_for_generation(env.items_generation)),
+            env.selected,
+            "automatic fullscreen landing keeps the shared cursor/anchor owner coherent",
+        );
         if let Some(index) = env.fullscreen_idx {
             env.record_book_resume(index);
         }

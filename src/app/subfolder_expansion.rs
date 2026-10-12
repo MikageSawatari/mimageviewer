@@ -2698,7 +2698,7 @@ impl App {
         if let (Some(ctx), Some(query)) = (ctx, local_search) {
             self.show_search_bar = true;
             self.search_query = query;
-            self.execute_search(ctx);
+            self.reexecute_search_for_installed_list(ctx);
         }
         if perf_on {
             crate::perf::event(
@@ -2713,7 +2713,7 @@ impl App {
             );
         }
         if let Some(&idx) = self.visible_indices.first() {
-            self.selected = Some(idx);
+            self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
             self.scroll_to_selected = true;
         }
         if perf_on {

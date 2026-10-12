@@ -7,6 +7,7 @@ use crate::app::tests::phase_c_support::setup_app;
 use crate::book_composition::{CompositionToken, PageDomain, StoredComposition, fixtures};
 use std::time::Duration;
 
+#[cfg(test)]
 fn install_document(app: &mut App, root: &Path, pages: &[u32]) {
     app.current_folder = Some(root.to_path_buf());
     app.zip_nav = None;
@@ -40,6 +41,7 @@ fn install_document(app: &mut App, root: &Path, pages: &[u32]) {
     );
 }
 
+#[cfg(test)]
 fn composed(app: &mut App, root: &Path) {
     let scope = BookScopeKey::document(root).unwrap();
     let token = CompositionToken {
@@ -76,6 +78,7 @@ fn composed(app: &mut App, root: &Path) {
     app.spread_shift.availability = PairingEditAvailability::Composed;
 }
 
+#[cfg(test)]
 fn dormant(app: &mut App) {
     app.spread_shift.state = ViewerShift::Book(SpreadShiftState::Adjusted {
         anchor_ref: SpreadShiftPageRef::DocumentPageIdentity(1),
@@ -84,6 +87,7 @@ fn dormant(app: &mut App) {
     });
 }
 
+#[cfg(test)]
 fn seed(service: &SpreadShiftService, scope: &BookScopeKey, page: u32) {
     service
         .set_shift(
@@ -104,6 +108,7 @@ fn seed(service: &SpreadShiftService, scope: &BookScopeKey, page: u32) {
 }
 
 #[test]
+#[cfg(test)]
 fn g3_composed_unreadable_and_extracted_routes_do_not_touch_dormant_shift() {
     for kind in 0..3 {
         let mut env = setup_app();
@@ -180,6 +185,7 @@ fn g3_composed_unreadable_and_extracted_routes_do_not_touch_dormant_shift() {
 }
 
 #[test]
+#[cfg(test)]
 fn g3_composition_removed_uses_saved_identity_on_and_ignores_dormant_row_off() {
     for memory in [true, false] {
         let mut env = setup_app();
@@ -208,6 +214,7 @@ fn g3_composition_removed_uses_saved_identity_on_and_ignores_dormant_row_off() {
 }
 
 #[test]
+#[cfg(test)]
 fn g3_composed_open_keeps_resume_fence_independent_of_paused_shift_service() {
     let mut env = setup_app();
     let root = env.tmp.path().join("resume.pdf");
@@ -257,6 +264,7 @@ fn g3_composed_open_keeps_resume_fence_independent_of_paused_shift_service() {
 }
 
 #[test]
+#[cfg(test)]
 fn g3_preparing_waits_for_classification_then_reads_original_shift_cutoff() {
     let mut env = setup_app();
     let root = env.tmp.path().join("prepare.pdf");
@@ -299,6 +307,7 @@ fn g3_preparing_waits_for_classification_then_reads_original_shift_cutoff() {
 }
 
 #[test]
+#[cfg(test)]
 fn g3_global_memory_preference_changes_policy_preserves_composed_dormant_owner() {
     let mut env = setup_app();
     let root = env.tmp.path().join("policy.pdf");
@@ -317,6 +326,7 @@ fn g3_global_memory_preference_changes_policy_preserves_composed_dormant_owner()
 }
 
 #[test]
+#[cfg(test)]
 fn g3_composition_removed_pending_read_stays_in_existing_context_owner() {
     let mut env = setup_app();
     let root = env.tmp.path().join("pending-removal.pdf");
@@ -353,6 +363,7 @@ fn g3_composition_removed_pending_read_stays_in_existing_context_owner() {
 }
 
 #[test]
+#[cfg(test)]
 fn g3_composition_removed_missing_saved_identity_does_not_substitute_raw_slot() {
     let mut env = setup_app();
     let root = env.tmp.path().join("filtered-removal.pdf");
@@ -379,6 +390,7 @@ fn g3_composition_removed_missing_saved_identity_does_not_substitute_raw_slot() 
 
 #[cfg(windows)]
 #[test]
+#[cfg(test)]
 fn g3_composed_inactive_context_keeps_dormant_owner_when_global_memory_changes() {
     let mut env = setup_app();
     let root = env.tmp.path().join("main.pdf");

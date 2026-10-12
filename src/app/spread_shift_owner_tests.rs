@@ -1,4 +1,6 @@
 //! D2 regressions exercise the accepted viewer owner and the real isolated writer.
+#![cfg(test)]
+
 use super::{spread_shift_owner::*, tests::phase_c_support::setup_app, *};
 use crate::{book_scope::BookScopeKey, spread_shift::*};
 use std::time::{Duration, Instant};
