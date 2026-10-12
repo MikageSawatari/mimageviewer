@@ -5,6 +5,20 @@
 
 ---
 
+## EffeTuneのタスクバー設定・通常矩形（§1.378、未リリース）
+
+Preferences OKと起動時は`effetune-host-control`へ設定を配送するだけで、UIはIPCを送信しない。
+workerの一つの最新targetをRegisterBridgeで将来attachへ継承し、作成済みframeは同じhost GUI threadで
+exstyleを変更する。再attach、新しいvisibility owner、minimized bool、復帰queueは追加しない。
+Shell Restoreも既存GuiVisibility permitを通し、Closeはuser-hideでDSPを維持する。
+通常配置のwriterもhost GUI threadであり、WINDOWPLACEMENTをscreen物理pxに正規化した
+immutable snapshotを初回attach・移動/resize完了・最小化前・style変更後に公開する。
+native Closeは同じ通知にframe identityと通常矩形を載せ、coreはbridge/slot/current HWNDを照合して
+矩形を適用してからuser-hidden処理を行う。checked Hideは通常矩形の公開後にACKを返す。
+音響調整の全保存callerはFIFOの完成通知をdrainしてsnapshotを読むだけで、同期geometry取得や完了待機をしない。
+一般VSTの矩形保存、owner、custom chromeは維持する。まれな失敗はログ＋通知、前の有効値を保持し、retryを追加しない。
+設計・実装台帳は[音響調整計画 §17](effetune-integration-plan.md)を参照。
+
 ## Everything の取得と共通Search採用（§1.374、未リリース）
 
 `GlobalSearchState.pending` の `SearchProducer` がMetadata/Everythingを排他に所有し、

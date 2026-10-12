@@ -59,8 +59,14 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
+#include <string>
+#include "gui_frame.h"
 
 namespace miv {
+// Optional JSON member, shared by attach and causal close notifications.
+std::string normal_rect_json_member(const std::optional<NormalScreenRect>& rect);
+std::string gui_warning_json(uint64_t slot_id, uint64_t container_hwnd, const std::string& detail);
 
 // 共有メモリのレイアウト header。block_size は openコマンドで親が指定する値。
 // in_ring / out_ring の容量はそれぞれ block_size * 4 sample (8 ブロック分マージン)。

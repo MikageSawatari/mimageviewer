@@ -408,6 +408,7 @@ preferences_policy! {
         effetune_pre_limiter_enabled => "移行先の EffeTune/VST 導入状態と音声処理構成に依存する微調整";
         effetune_auto_open_on_video => "移行先の EffeTune 導入状態とウィンドウ運用に依存する表示方針";
         effetune_keep_visible_when_minimized => "移行先の EffeTune/VST 導入状態とウィンドウ運用に依存する表示方針";
+        effetune_show_in_taskbar => "移行先の EffeTune 導入状態とウィンドウ運用に依存する表示方針";
         grid_cols => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         grid_view_mode => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_sort_key => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -1860,7 +1861,7 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 457);
+        assert_eq!(entries.len(), 458);
         assert_eq!(
             entries
                 .iter()
@@ -1873,7 +1874,7 @@ mod tests {
                 .iter()
                 .filter(|(_, reason)| reason.is_some())
                 .count(),
-            313
+            314
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -2168,6 +2169,7 @@ mod tests {
         source.effetune_pre_limiter_enabled = false;
         source.effetune_auto_open_on_video = true;
         source.effetune_keep_visible_when_minimized = true;
+        source.effetune_show_in_taskbar = false;
         source.window_pos = Some([100.0, 200.0]);
         source.toolbar_section_order.reverse();
         let exported = export_preferences(&source).unwrap();
@@ -2184,6 +2186,7 @@ mod tests {
                 "effetune_keep_visible_when_minimized",
                 serde_json::json!(true),
             ),
+            ("effetune_show_in_taskbar", serde_json::json!(false)),
             ("window_pos", serde_json::json!([100.0, 200.0])),
             (
                 "toolbar_section_order",
@@ -2201,7 +2204,7 @@ mod tests {
         let before = destination.clone();
         let parsed = parse_preferences(&document.to_string()).unwrap();
         let report = parsed.apply_to(&mut destination);
-        assert_eq!(report.unknown_count, 12);
+        assert_eq!(report.unknown_count, 13);
         assert_eq!(destination.raw_brightness, crate::raw::RawBrightness::None);
         assert_excluded_unchanged(&before, &destination);
 
@@ -2211,6 +2214,35 @@ mod tests {
         assert_eq!(report.issues.len(), 1);
         assert_eq!(destination.raw_brightness, crate::raw::RawBrightness::None);
         assert_excluded_unchanged(&before, &destination);
+    }
+
+    #[test]
+    fn effetune_taskbar_transfer_excludes_and_preserves_destination_in_both_flavors() {
+        for destination_value in [false, true] {
+            let source = Settings {
+                effetune_show_in_taskbar: !destination_value,
+                ..Settings::default()
+            };
+            let exported = export_preferences(&source).unwrap();
+            let mut document: Value = serde_json::from_str(&exported.json).unwrap();
+            assert!(
+                document["preferences"]
+                    .get("effetune_show_in_taskbar")
+                    .is_none()
+            );
+            // An externally supplied excluded key must not change the destination either.
+            document["preferences"]["effetune_show_in_taskbar"] =
+                serde_json::json!(!destination_value);
+            let mut destination = Settings {
+                effetune_show_in_taskbar: destination_value,
+                ..Settings::default()
+            };
+            let report = parse_preferences(&document.to_string())
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(report.unknown_count, 1);
+            assert_eq!(destination.effetune_show_in_taskbar, destination_value);
+        }
     }
 
     #[test]

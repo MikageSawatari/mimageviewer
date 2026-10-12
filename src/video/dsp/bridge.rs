@@ -233,8 +233,20 @@ pub enum Event {
         slot_id: u64,
         #[serde(default)]
         container_hwnd: u64,
+        #[serde(default)]
+        normal_rect: Option<NormalScreenRect>,
     },
     GuiDetached,
+    GuiWarning {
+        slot_id: u64,
+        container_hwnd: u64,
+        detail: String,
+    },
+    GuiNormalRect {
+        slot_id: u64,
+        container_hwnd: u64,
+        normal_rect: NormalScreenRect,
+    },
     GuiVisibilityResult {
         request_id: u64,
         slot_id: u64,
@@ -243,6 +255,10 @@ pub enum Event {
     GuiUserHidden {
         #[serde(default)]
         slot_id: u64,
+        #[serde(default)]
+        container_hwnd: u64,
+        #[serde(default)]
+        normal_rect: Option<NormalScreenRect>,
     },
     GuiBypassToggle {
         #[serde(default)]
@@ -294,9 +310,47 @@ pub enum GuiVisibilityOutcome {
     Error,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Immutable host GUI-thread snapshot, in virtual-screen physical pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct NormalScreenRect {
+    pub x: i32,
+    pub y: i32,
+    pub outer_width: u32,
+    pub outer_height: u32,
+}
+
+impl NormalScreenRect {
+    pub(super) fn valid(self) -> bool {
+        self.outer_width > 0
+            && self.outer_height > 0
+            && i32::try_from(self.outer_width)
+                .ok()
+                .and_then(|w| self.x.checked_add(w))
+                .is_some()
+            && i32::try_from(self.outer_height)
+                .ok()
+                .and_then(|h| self.y.checked_add(h))
+                .is_some()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GuiVisibilitySignal {
-    Closed(u64),
+    Warning {
+        slot_id: u64,
+        container_hwnd: u64,
+        detail: String,
+    },
+    Closed {
+        slot_id: u64,
+        container_hwnd: u64,
+        normal_rect: Option<NormalScreenRect>,
+    },
+    NormalRect {
+        slot_id: u64,
+        container_hwnd: u64,
+        normal_rect: NormalScreenRect,
+    },
     Checked {
         slot_id: u64,
         outcome: GuiVisibilityOutcome,
@@ -304,17 +358,17 @@ pub enum GuiVisibilitySignal {
 }
 
 impl GuiVisibilitySignal {
-    pub(super) fn projection(self) -> Option<(u64, bool, bool)> {
+    pub(super) fn projection(&self) -> Option<(u64, bool, bool)> {
         match self {
-            Self::Closed(slot) => Some((slot, false, true)),
+            Self::Closed { slot_id, .. } => Some((*slot_id, false, true)),
             Self::Checked {
                 slot_id,
                 outcome: GuiVisibilityOutcome::Shown,
-            } => Some((slot_id, true, false)),
+            } => Some((*slot_id, true, false)),
             Self::Checked {
                 slot_id,
                 outcome: GuiVisibilityOutcome::Hidden,
-            } => Some((slot_id, false, false)),
+            } => Some((*slot_id, false, false)),
             _ => None,
         }
     }
@@ -465,8 +519,38 @@ fn route_gui_signal(
     wake: Option<&GuiSignalWake>,
 ) -> bool {
     let queued = match event {
-        Event::GuiUserHidden { slot_id } => user_hidden_tx
-            .try_send(GuiVisibilitySignal::Closed(*slot_id))
+        Event::GuiUserHidden {
+            slot_id,
+            container_hwnd,
+            normal_rect,
+        } => user_hidden_tx
+            .try_send(GuiVisibilitySignal::Closed {
+                slot_id: *slot_id,
+                container_hwnd: *container_hwnd,
+                normal_rect: *normal_rect,
+            })
+            .is_ok(),
+        Event::GuiWarning {
+            slot_id,
+            container_hwnd,
+            detail,
+        } => user_hidden_tx
+            .try_send(GuiVisibilitySignal::Warning {
+                slot_id: *slot_id,
+                container_hwnd: *container_hwnd,
+                detail: detail.clone(),
+            })
+            .is_ok(),
+        Event::GuiNormalRect {
+            slot_id,
+            container_hwnd,
+            normal_rect,
+        } => user_hidden_tx
+            .try_send(GuiVisibilitySignal::NormalRect {
+                slot_id: *slot_id,
+                container_hwnd: *container_hwnd,
+                normal_rect: *normal_rect,
+            })
             .is_ok(),
         Event::GuiVisibilityResult {
             slot_id, outcome, ..
@@ -700,6 +784,8 @@ impl Bridge {
                         }
                         Ok(event @ Event::GuiVisibilityResult { .. })
                         | Ok(event @ Event::GuiUserHidden { .. })
+                        | Ok(event @ Event::GuiNormalRect { .. })
+                        | Ok(event @ Event::GuiWarning { .. })
                         | Ok(event @ Event::GuiBypassToggle { .. }) => {
                             route_gui_event(&event, &gui_visibility_tx, &gui_bypass_toggle_tx,
                                 gui_signal_wake.as_ref(), &pending_gui_for_pump);
@@ -1653,7 +1739,11 @@ mod concurrent_state_tests {
         ));
         assert_eq!(
             hidden_rx.try_recv().unwrap(),
-            GuiVisibilitySignal::Closed(17)
+            GuiVisibilitySignal::Closed {
+                slot_id: 17,
+                container_hwnd: 0,
+                normal_rect: None
+            }
         );
         assert!(repaint_count.load(Ordering::SeqCst) > 0);
 
@@ -1697,7 +1787,11 @@ mod concurrent_state_tests {
             None
         ));
         assert!(route_gui_signal(
-            &Event::GuiUserHidden { slot_id: 7 },
+            &Event::GuiUserHidden {
+                slot_id: 7,
+                container_hwnd: 0,
+                normal_rect: None
+            },
             &visibility_tx,
             &bypass_tx,
             None

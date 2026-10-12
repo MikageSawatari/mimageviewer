@@ -1248,10 +1248,12 @@ Windows SDK hosting moduleのMIT原文を `crates/vst3-host/src/sdk/` に保持�
 UNC namespace markerは大小文字を区別しない。host内FS検査は拡張形式を維持する。
 `GetModuleFileNameW`が保持する `\\?\` とpluginが付加する `/` の組合せによるEffeTune missing-assetsを避ける。
 2026-10-02 R2ではhost PE内の `MIV_VST3_HOST_SOURCE_SHA256:` markerを、CMakeLists／include／src／testsの
-現ソースhashと照合する。APPDATA等から旧hostをimportするfallbackはない。
+現ソースhashと照合する。2026-10-12の音響調整窓対応では `src/*.rc` と共有 `assets/icon.ico` も対象に含める。
+APPDATA等から旧hostをimportするfallbackはない。
 identityは `scripts/vst3-host-identity.ps1` に計算を一本化し、CMakeも同scriptの
-`-HashSourceRoot` を使う。対象ファイルのCRLFだけをbyte単位でLFへ正規化し、他のbyteは保持する。
-ordinal順のslash相対名と各正規化SHA256を `name:hash\n` としてUTF-8/BOMなしで連結しSHA256化する。
+`-HashSourceRoot` を使う。text対象のCRLFだけをbyte単位でLFへ正規化し、他のbyteは保持する。
+iconはbinaryのままraw SHA256を取り、host source rootからの相対名 `../../assets/icon.ico` を使う。
+ordinal順のslash相対名と各SHA256を `name:hash\n` としてUTF-8/BOMなしで連結しSHA256化する。
 Gitの改行変換によるLF／CRLF checkout差を無視するが、未コミットのソース変更は検知する。
 SDK欠落時や `-SkipVst3Bridge` は現ソースと一致するvendor hostのみ再利用可能。不一致／欠落は復旧案内付きで停止する。
 build-release／build-distの署名前・core埋込前と、非portable coreのbare cargo release buildにも同じgateを通す。
@@ -1273,7 +1275,7 @@ cmake --build crates/vst3-host/build --config Release
 - 前提:
   - Visual Studio 2026 (18) BuildTools (MSVC C++ デスクトップ開発ワークロード)
   - CMake 3.20+
-  - 一度ビルドしたら、C++ ソースを変更しない限り再ビルド不要
+  - 一度ビルドしたら、identity対象のソース・RC・共有iconを変更しない限り再ビルド不要
 - CMakeは `vendor/vcrt/` の公式 `vcruntime140.dll` / `vcruntime140_1.dll` /
   `msvcp140.dll` / `msvcp140_1.dll` を `vendor/vst3-host/vcrt/` へcopy-if-differentで配置する。
   hostが再リンク不要でも配置targetは実行される。正本が欠けた場合は復旧案内付きでbuildを停止する。

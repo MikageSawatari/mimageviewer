@@ -1743,3 +1743,48 @@ AGENTS.mdの `Review important ownership/asynchronous/multi-window designs befor
   TOOLWINDOWに応じた座標変換とstyle変更順序、immutableなClose payload、全保存callerと回帰を定義。
 - P3: ownerなしの訂正はcoordinatorがmasterのbacklogへ反映する。このworktreeのbacklogは編集していない。
 - 本turnはnexteffetuneのこの設計メモのみを変更。実装・build・起動・commitは行わず、再レビューへ引き渡す。
+
+### 17.9 §1.378実装台帳（2026-10-12、R2独立ACCEPT後）
+
+設計基点は`de286f035`。設定は既定ONで、Preferences OKと起動時から既存host-control FIFOへ配送する。
+workerの最新targetをRegisterで将来attachへ継承し、作成済みframeはGUI threadで同じHWNDのstyleを更新する。
+targetと現在exstyleが同じなら、child layout・通常矩形公開も含めて何もしない。
+一般VSTはtaskbar既定falseとcustom frameを維持し、EffeTuneのみnative caption / system menu / minimize /
+latency status bandと埋込mIV iconを使う。AppUserModelID、pin、Remoteの操作APIは変更しない。
+
+通常矩形はhostのGUI threadが取得・screen物理pxへ正規化して配送する。
+初回attachのsnapshot、移動/resize完了、最小化前、style変更後、Close payloadを同じ取得経路へ揃えた。
+checked Hideもsnapshot公開後にACKを返す。coreはbridge/slot/current HWNDを照合し、旧frameを棄却する。
+native Close、ボタンHide、runtime終了保存は同じ完成snapshotをdrainして保存し、EffeTuneのGetWindowRect再読を外した。
+GeometryPublicationはGUI thread内のframe変更だけを直列化し、途中のworkspace矩形を公開しない。
+まれな取得/style失敗はframe付き`gui_warning`で既存UIの案内へ配送し、DSPや前の有効な配置を保持する。
+同期Error受信channelへfire-and-forget失敗を残す方式は採らず、retry/復旧ownerは追加しない。
+
+portableは設定項目・検索anchorを非表示とし、互換設定値のみ保持する。settings_transferでは除外し、
+現行件数は全458 / 対象144 / 除外314、wire142。manualの音響調整・設定ページを同時に更新する。
+privacyと製品ページへの影響はなく、ネットワーク通信や保存する個人情報は増えない。
+
+host identityはRCのLF正規化と共有iconのraw SHA256を含み、Cargo再検証にもicon変更を加えた。
+vendor host / CRTはこのworktreeのCMake buildで更新する。外部バックアップはcoordinatorのmaster統合担当であり触らない。
+非署名の確認buildと配布用署名を区別し、配布時のhost→core→launcherの署名順を維持する。
+
+自動検証の最終結果・artifact identity・実機確認手順は`target/ET-1378-impl-msg.txt`へ記録する。
+本体・plugin・入力desktopの起動や操作は行わない。native witnessは切り替えない隔離desktopのinert HWNDを使い、
+実Shellのicon/group/preview操作は利用者の確認待ちとする。コミットせず引き渡す。
+
+自動検証はCMake/CTest 4/4、host source identityとCRT一致、identity script回帰、
+EffeTune 120/120、DSP bridge 16/16、taskbar通常7/7・portable5/5、settings_transfer25/25、
+UI snapshot明暗/narrow3/3、fmt・通常/portable core check・UI glyph zeroを通過。
+`test-full.ps1`は1回実行し、本体libは12,219 PASS / 2 FAIL / 57 ignored、
+UI snapshot全163件と他workspace targetは通過した。失敗は既存の
+`detached_native_video_navigation_syncs_main_selection`と
+`normalize_scan_navigation_without_openable_candidate_keeps_scan`で、共通fixtureの
+10,000回yieldによるworker完了待機上限（`tests.rs:61157`）。個別再実行は各1/1通過し、
+全体負荷時のschedulingによる可能性が高いが、全体gateはexit101のまま記録する。
+この実装で当該製品経路・待機fixtureは変更していない。全体再実行は行わず、
+skipされたvendor egui25/25・egui-wgpu11/11・eframe18/18を個別補完した。
+最終hostの全byteとrelease core埋込、最終coreとlauncher埋込の一致も確認済み。
+最後に`build-dev.ps1 -PreserveRuntime`を完了し、dev core内hostの全byte一致とCRT依存検査を通過。
+release scriptのPreserveRuntimeはインストール版の起動を検出して停止したため、既存processを触らず、
+AGENTS.mdで許可された直接Cargoのcore/helper→launcher経路でrelease確認物を作成した。
+両確認物は非署名であり、配布時の署名・公開とは分ける。agentによるアプリ起動・コミットはない。

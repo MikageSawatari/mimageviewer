@@ -20812,6 +20812,8 @@ impl App {
             app.effetune
                 .set_keep_visible_when_minimized(app.settings.effetune_keep_visible_when_minimized);
             app.effetune
+                .set_show_in_taskbar(app.settings.effetune_show_in_taskbar);
+            app.effetune
                 .slot
                 .set_pre_limiter_enabled(app.settings.effetune_pre_limiter_enabled);
         }
@@ -29481,9 +29483,23 @@ impl App {
 
     #[cfg(windows)]
     fn save_effetune_gui_rect(&mut self) {
-        let Some(bridge) = self.effetune.bridge() else {
+        let Some(bridge) = self.effetune.bridge().cloned() else {
             return;
         };
+        // Host snapshots are already complete; draining never waits for IPC.
+        let changes = bridge.pump_gui_signals();
+        if !changes.warnings.is_empty() {
+            self.show_feedback_toast("音響調整の窓の表示・配置を更新できませんでした。".into());
+        }
+        if !changes.user_hidden_paths.is_empty() {
+            self.effetune.capture_on_hide();
+        }
+        if !changes.bypass_updates.is_empty() {
+            self.effetune
+                .fail(crate::effetune::EffetuneFailure::ProcessFailed(
+                    "unexpected editor bypass event".into(),
+                ));
+        }
         let Some((_, x, y, width, height)) =
             bridge.snapshot_all_window_positions().into_iter().next()
         else {
@@ -29800,19 +29816,8 @@ impl App {
         if self.effetune.has_pending_ui_work() {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
-        if let Some(bridge) = self.effetune.bridge().cloned() {
-            let changes = bridge.pump_gui_signals();
-            if !changes.user_hidden_paths.is_empty() {
-                self.save_effetune_gui_rect();
-                self.effetune.capture_on_hide();
-            }
-            if !changes.bypass_updates.is_empty() {
-                self.effetune
-                    .fail(crate::effetune::EffetuneFailure::ProcessFailed(
-                        "unexpected editor bypass event".into(),
-                    ));
-            }
-        }
+        // Same snapshot path for user-hide, checked button Hide, and exit saving.
+        self.save_effetune_gui_rect();
         if !was_failed
             && matches!(
                 self.effetune.runtime,

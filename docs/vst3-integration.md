@@ -355,8 +355,9 @@ bridge IPC のレイテンシ実測 (Phase 0b):
 
 ## 5. プラグイン GUI ホスティング
 
-EffeTune 専用 bridge は `GuiOwnerPolicy::Unowned` (2026-09-30 利用者決定)。owner=0 の
-tool window なのでメインをクリックするとメインを手前にでき、タスクバーボタンは増えない。
+EffeTune 専用 bridge は `GuiOwnerPolicy::Unowned`。owner=0 を維持し、音響調整の
+タスクバー表示設定は既定ON。専用frameはnative caption / system menu / minimizeを持ち、
+ONはWS_EX_APPWINDOW、OFFはWS_EX_TOOLWINDOWとする。mIV全体のAppUserModelIDやpinは変更しない。
 `main_hwnd` は DPI / 最小化参照であり owner ではない。ユーザー VST の `Auto`、fullscreen の
 owner / TOPMOST / focus handoff は従来どおり。EffeTune は owner 変更 IPC と app-active relay の対象外。
 表示希望と一時非表示理由 (`Minimized` / `RemoteSession`) は host の `GuiVisibility` に集約し、
@@ -384,6 +385,17 @@ plugin UI thread で `IConnectionPoint::notify` に完全snapshotを渡し、同
 収束し、Rustの既存HostLostで素通し・一度の案内・自動再起動無しとなる。ユーザーVSTは別host。
 metadata owner、画像worker、Local/Remote終端と詳細試験は
 [Now Playing 計画](effetune-now-playing-plan.md) を参照。
+
+§1.378の追加wireはv6に加算し、埋込hostのsource identityで同じsourceを保証する。
+`show_gui.show_in_taskbar`は一般VSTでfalse、EffeTuneはhost-control workerの最新設定を継承する。
+`set_gui_taskbar { slot_id, value }`は同じGUI threadで現在frameを更新し、再attachしない。
+`gui_attached.normal_rect`、`gui_normal_rect { slot_id, container_hwnd, normal_rect }`、
+`gui_user_hidden`内の同じframe/通常矩形はvirtual-screen物理pxのimmutable payload。
+hostがWINDOWPLACEMENTをTOOLWINDOW有無に応じてscreen座標へ正規化してから公開する。
+coreはbridge/slot/current HWNDを照合し、同じFIFOで矩形を先に適用してからCloseを処理する。
+EffeTuneのボタンHide・native Close・終了保存は完了snapshotをdrainして読むだけでWin32再読/IPC待機しない。
+一般VSTのGetWindowRect保存は維持する。iconic状態はOSが所有し、coreに別boolを置かない。
+操作と座標系の契約は[EffeTune計画 §17](effetune-integration-plan.md)を参照。
 
 要件:
 - アプリ起動中ずっとプラグイン GUI を表示しておける

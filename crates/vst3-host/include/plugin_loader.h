@@ -17,6 +17,7 @@
 #include <windows.h>
 
 #include "gui_visibility.h"
+#include "gui_frame.h"
 #include "host_app.h"  // PlugFrame, HostApplication, ComponentHandler の完全型
 #include "pluginterfaces/gui/iplugview.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
@@ -53,6 +54,7 @@ struct GuiWindowOptions {
     uint64_t slot_id = 0;
     void* owner_hwnd = nullptr;
     bool unowned = false;
+    bool show_in_taskbar = false;
     void* main_hwnd = nullptr; // DPI/minimize reference, never an owner
     std::string gui_gate_name;
     uint32_t width = 0;
@@ -149,7 +151,14 @@ public:
     bool query_gui_size_at_dpi(uint32_t dpi, uint32_t& width_out, uint32_t& height_out,
                                 bool& resizable_out);
     /// 指定 HWND にプラグイン GUI をアタッチする。失敗時は false。
-    bool show_gui(const GuiWindowOptions& options, bool visible, std::string& error_out);
+    bool show_gui(const GuiWindowOptions& options, bool visible, std::string& error_out,
+                  std::optional<NormalScreenRect>* normal_out = nullptr);
+    void set_gui_taskbar(bool value);
+    void publish_gui_normal_rect();
+    void user_hide_gui();
+    void handle_editor_dpi_change(uint32_t dpi, const RECT* suggested);
+    bool editor_native_caption() const { return view_main_hwnd_ != nullptr; }
+    bool editor_frame_mutating() const { return geometry_publication_ == GeometryPublication::FrameMutation; }
     /// Already-attached GUI surface visibility toggle. Keeps the VST3 view
     /// attached and only hides/shows the bridge-owned top-level surface.
     void set_gui_visible(bool visible);
@@ -285,6 +294,10 @@ private:
     std::atomic<bool> processing_enabled_{false};
 
     bool editor_drag_active_ = false;
+    // GUI-thread scoped frame mutation: intermediate workspace/style pairs must
+    // never be published as a completed canonical geometry snapshot.
+    enum class GeometryPublication { Live, FrameMutation };
+    GeometryPublication geometry_publication_ = GeometryPublication::Live;
     void* editor_drag_restore_owner_hwnd_ = nullptr;
     uint64_t editor_drag_started_ms_ = 0;
     uint64_t editor_drag_last_tick_ms_ = 0;

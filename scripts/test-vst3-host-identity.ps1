@@ -29,19 +29,28 @@ try {
     $source = Join-Path $testRoot 'crates\vst3-host'
     $hostPath = Join-Path $testRoot 'vendor\vst3-host\mimageviewer-vst3-host.exe'
     New-Item -ItemType Directory -Path (Split-Path -Parent $hostPath) -Force | Out-Null
-    foreach ($name in @('CMakeLists.txt', 'include/z.h', 'include/nested/a.h', 'src/main.cpp', 'src/sdk/module_win32.cpp', 'tests/pure.cpp')) {
+    foreach ($name in @('CMakeLists.txt', 'include/z.h', 'include/nested/a.h', 'src/main.cpp', 'src/host_icon.rc', 'src/sdk/module_win32.cpp', 'tests/pure.cpp')) {
         $path = Join-Path $source $name
         New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force | Out-Null
         [System.IO.File]::WriteAllText($path, "raw fixture $name`r`n")
     }
+    $iconPath = Join-Path $testRoot 'assets\icon.ico'
+    Assert-Throws { Get-MivVst3HostSourceHash -SourceRoot $source } 'Shared host icon is missing'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $iconPath) -Force | Out-Null
+    # Include a CRLF byte pair in the binary to prove it is hashed unchanged.
+    $iconBytes = [byte[]]@(0, 0, 1, 0, 255, 13, 10, 0, 13, 65)
+    [System.IO.File]::WriteAllBytes($iconPath, $iconBytes)
     $hash = Get-MivVst3HostSourceHash -SourceRoot $source
-    $lfSource = Join-Path $testRoot 'lf-source'
+    $lfRepo = Join-Path $testRoot 'lf-repo'
+    $lfSource = Join-Path $lfRepo 'crates\vst3-host'
     foreach ($file in @(Get-MivTreeFiles -Path $source)) {
         $relative = $file.FullName.Substring($source.Length + 1)
         $lfPath = Join-Path $lfSource $relative
         New-Item -ItemType Directory -Path (Split-Path -Parent $lfPath) -Force | Out-Null
         [System.IO.File]::WriteAllBytes($lfPath, [System.Text.Encoding]::UTF8.GetBytes("raw fixture $($relative.Replace('\', '/'))`n"))
     }
+    New-Item -ItemType Directory -Path (Join-Path $lfRepo 'assets') -Force | Out-Null
+    [System.IO.File]::WriteAllBytes((Join-Path $lfRepo 'assets\icon.ico'), $iconBytes)
     Assert-True ((Get-MivVst3HostSourceHash -SourceRoot $lfSource) -eq $hash) 'LF and CRLF source trees differ'
     $cliHash = & powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'vst3-host-identity.ps1') -HashSourceRoot $lfSource
     Assert-True ($LASTEXITCODE -eq 0 -and $cliHash -eq $hash) 'CMake hash CLI differs from validator'
@@ -62,6 +71,22 @@ try {
     Assert-MivVst3HostIdentity -RepoRoot $testRoot
     & powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'vst3-host-identity.ps1') -ValidateRepo $testRoot
     Assert-True ($LASTEXITCODE -eq 0) 'CLI rejected the current-source fake PE'
+    $rcPath = Join-Path $source 'src\host_icon.rc'
+    $originalRc = [System.IO.File]::ReadAllBytes($rcPath)
+    [System.IO.File]::AppendAllText($rcPath, 'changed resource')
+    Assert-True ((Get-MivVst3HostSourceHash -SourceRoot $source) -ne $hash) 'Missed resource script change'
+    Assert-Throws { Assert-MivVst3HostIdentity -RepoRoot $testRoot } 'Missing/stale source identity'
+    [System.IO.File]::WriteAllBytes($rcPath, $originalRc)
+    [System.IO.File]::WriteAllBytes($iconPath, [byte[]]@(0, 0, 1, 0, 255, 10, 0, 13, 65))
+    Assert-True ((Get-MivVst3HostSourceHash -SourceRoot $source) -ne $hash) 'Normalized binary icon CRLF bytes'
+    Assert-Throws { Assert-MivVst3HostIdentity -RepoRoot $testRoot } 'Missing/stale source identity'
+    $changedIcon = [byte[]]$iconBytes.Clone()
+    $changedIcon[4] = 254
+    [System.IO.File]::WriteAllBytes($iconPath, $changedIcon)
+    Assert-True ((Get-MivVst3HostSourceHash -SourceRoot $source) -ne $hash) 'Missed binary icon change'
+    Assert-Throws { Assert-MivVst3HostIdentity -RepoRoot $testRoot } 'Missing/stale source identity'
+    [System.IO.File]::WriteAllBytes($iconPath, $iconBytes)
+    Assert-True ((Get-MivVst3HostSourceHash -SourceRoot $source) -eq $hash) 'Restored resource/icon identity differs'
     $ignored = Join-Path $source 'build\generated\build_identity.h'
     New-Item -ItemType Directory -Path (Split-Path -Parent $ignored) -Force | Out-Null
     [System.IO.File]::WriteAllText($ignored, 'ignored generated header')

@@ -1281,6 +1281,13 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     ),
     #[cfg(not(feature = "portable"))]
     entry!(
+        "video/effetune-taskbar",
+        Video,
+        "音響調整の窓をタスクバーに表示する",
+        ["音響調整", "タスクバー", "taskbar", "復元", "EffeTune"]
+    ),
+    #[cfg(not(feature = "portable"))]
+    entry!(
         "video/effetune-minimized",
         Video,
         "メインウィンドウを最小化しても音響調整の窓を表示したままにする",
@@ -1621,6 +1628,18 @@ mod tests {
             .position(|candidate| *candidate == page)
             .unwrap();
         ("カテゴリ", 0, index)
+    }
+
+    #[test]
+    fn effetune_taskbar_search_matches_the_build_flavor() {
+        let result = search_preferences("EffeTune タスクバー", test_tree_position);
+        #[cfg(not(feature = "portable"))]
+        assert_eq!(
+            result.first().map(|entry| entry.anchor),
+            Some("video/effetune-taskbar")
+        );
+        #[cfg(feature = "portable")]
+        assert!(result.is_empty());
     }
 
     #[test]

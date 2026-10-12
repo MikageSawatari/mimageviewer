@@ -329,6 +329,7 @@ enum HostCommand {
     RefreshNowPlaying,
     RegisterBridge(std::sync::Weak<DspBridge>),
     ReconcileVisibility,
+    SetTaskbar(bool),
     Disable(Arc<DspBridge>),
     Show {
         bridge: Arc<DspBridge>,
@@ -975,6 +976,8 @@ pub struct EffetuneController {
     gui_failure_tx: mpsc::Sender<GuiFailure>,
     gui_failure_rx: mpsc::Receiver<GuiFailure>,
     host_tx: mpsc::Sender<HostCommand>,
+    #[cfg(test)]
+    show_in_taskbar: bool,
     pending_hide: Option<mpsc::Receiver<Result<(), String>>>,
     repaint_context: Arc<Mutex<Option<egui::Context>>>,
 }
@@ -1028,16 +1031,22 @@ impl EffetuneController {
             .spawn(move || {
                 let mut presentation_bridge = std::sync::Weak::<DspBridge>::new();
                 let mut now_playing_revision = None;
+                let mut show_in_taskbar = true;
                 while let Ok(command) = host_rx.recv() {
                     match command {
                         HostCommand::RegisterBridge(bridge) => {
                             presentation_bridge = bridge;
+                            if let Some(bridge) = presentation_bridge.upgrade() { bridge.set_gui_show_in_taskbar(show_in_taskbar); }
                             now_playing_revision = None;
                             if let Some(core) = host_now_playing.upgrade() { send_latest_now_playing(&core, &presentation_bridge, &mut now_playing_revision); }
                         }
                         HostCommand::RefreshNowPlaying => {
                             if let Some(core) = host_now_playing.upgrade() {core.refresh_consumed();}
                             if let Some(core) = host_now_playing.upgrade() { send_latest_now_playing(&core, &presentation_bridge, &mut now_playing_revision); }
+                        }
+                        HostCommand::SetTaskbar(value) => {
+                            show_in_taskbar = value;
+                            if let Some(bridge) = presentation_bridge.upgrade() { bridge.set_gui_show_in_taskbar(value); }
                         }
                         HostCommand::ReconcileVisibility => {
                             if let Some(bridge) = presentation_bridge.upgrade() { bridge.sync_main_window_visibility(); }
@@ -1123,6 +1132,8 @@ impl EffetuneController {
             gui_failure_tx,
             gui_failure_rx,
             host_tx,
+            #[cfg(test)]
+            show_in_taskbar: true,
             pending_hide: None,
             repaint_context,
         }
@@ -1169,6 +1180,20 @@ impl EffetuneController {
     }
     pub(crate) fn take_now_playing_warning(&mut self) -> Option<String> {
         self.now_playing.take_warning()
+    }
+
+    /// Preference publication only; the host-control worker owns the current target.
+    pub(crate) fn set_show_in_taskbar(&mut self, value: bool) {
+        #[cfg(test)]
+        {
+            self.show_in_taskbar = value;
+        }
+        let _ = self.host_tx.send(HostCommand::SetTaskbar(value));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn show_in_taskbar(&self) -> bool {
+        self.show_in_taskbar
     }
 
     pub fn set_main_hwnd(&self, hwnd: u64) {
