@@ -4666,3 +4666,12 @@ snapshot PNGは変更せず、既存の実metadata観測とsnapshot harnessを�
 変更範囲はsrc/ui_fullscreen.rs、本§11、fullscreen-specified-scale-plan.md §23、vendor/egui/PATCHES.md。
 vendorのAPI実装自体は変更せず、台帳へ破棄対象・呼出境界・更新時の保持差分を補う。
 snapshot PNG、runtime、metadata製品処理は変更しない。
+
+#### 2026-10-12 §1.341 見開きの横長素材正規化
+
+§2を読み、利用者指定の構造変更として既存context単位page-turn presentationのshape admission、
+canonical projectionと実occurrence receiptの境界を揃える。横長の二faceは一つの通常resourceを
+共有し、Vacantはsurface/occurrenceを持たない。lease/pin/context bundle、通常mount/deposit、
+viewport生成・host選択・focus・close/continuationのownerは増やさない。F12も同じ投影境界を使う。
+src/ui_fullscreen.rsの変更はtest-only描画fixtureの寸法/回転を通常素材から取る部分のみ。
+この実装指定を根拠とし、独立レビュー合格・実機受入れを先取りしない。

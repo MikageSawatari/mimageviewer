@@ -1,6 +1,6 @@
 # ページめくりアニメーション設計案 — backlog §1.341
 
-2026-10-11 / **R7設計ACCEPT（`fa5119c19`、Stage 1自動検証・確認用build済、実機評価待ち・§19）**。採択済みR7に従い、まず通常単頁と二実頁Pairのleaf・陰影・per-page geometryを既存A0へ接続し、利用者のmotion評価用buildを作った。cover/中央単頁/split等の対応は後段に残す。R3統合後のA0は利用者の実機評価で不合格。R4 `afc474d8d`・R5 `c73f0d857`・R6 `29291d496`はREVISE、R7の独立設計レビューACCEPTは利用者から伝達された。§1〜17は履歴で、衝突箇所は§18、段階実装の範囲は§19を優先する。既定OFF・仮時間・F12所有・VRAM会計を維持。readinessは2026-10-11利用者決定の§22でresident displayableへ置換し、Pairの移動背とpin上限は§23を正本とする。実装の独立完了レビュー・実機motion/性能受入れ・最終時間は未了。利用者の2026-10-11決定でリリースは次の次の版。
+2026-10-11 / **R7設計ACCEPT（`fa5119c19`、Stage 1自動検証・確認用build済、実機評価待ち・§19）**。採択済みR7に従い、まず通常単頁と二実頁Pairのleaf・陰影・per-page geometryを既存A0へ接続し、利用者のmotion評価用buildを作った。§19時点ではcover/中央単頁/split等の対応を後段に残した。§24で通常の中央/片側singletonと横長への対応を追加する。R3統合後のA0は利用者の実機評価で不合格。R4 `afc474d8d`・R5 `c73f0d857`・R6 `29291d496`はREVISE、R7の独立設計レビューACCEPTは利用者から伝達された。§1〜17は履歴で、衝突箇所は§18、段階実装の範囲は§19を優先する。既定OFF・仮時間・F12所有・VRAM会計を維持。readinessは2026-10-11利用者決定の§22でresident displayableへ置換し、Pairの移動背とpin上限は§23、横長・通常singletonは§24を正本とする。実装の独立完了レビュー・実機motion/性能受入れ・最終時間は未了。2026-10-11の次の次の版への延期を、2026-10-12利用者決定で次の版を目指して継続する方針へ改訂した（採用は進捗を見て判断、§24）。
 
 R3設計時の参照treeは `next-prefs` / `1ee3e178288f2eff119da16b672d546cc3c9992c`（R2文書commit、開始時clean）。当時の製品コードはmaster `cb00930011323cacd7088ae70c37835141aad58a` と同じだった。
 既存の `file:line` は各設計/追補時のsource inspection位置。A0は§1.364統合後の`0f6ad9f19`を基点に具体化した（§12）。A0は`532635fdd`、golden補完は`e0f323d24`、HUDは`bf3b2fae0`、PDF追補は`ea5f6624a`、保存判断の来歴訂正は`e3a328ff6`でコミットされた。§15はこのHEADと利用者提示の実機結果を基点とする。既存の自動検証成功は動きの品質合格を意味しない。
@@ -86,9 +86,9 @@ Q5は **PC viewer限定（F12を含む）、Remote不要** と確定。2026-10-1
 2026-10-11利用者決定: 背は読書方向ごとに固定する（LTRは頁左端、RTLは頁右端）。進む操作では現在頁がこの背から起きて次頁を現し、戻る操作では前の頁が同じ背から戻って現在頁の上へ着地する。操作方向で背を反対側へ替えない（§15.2・§21）。
 RTLは頁の配置と回転を左右対応させるが、画像UVや印字は鏡映しない。
 旧画像の実際の裏面は提供されていないため、裏は弱い紙色・陰影だけ。次の画像を「旧画像の真の裏」と偽って貼らない。
-横長でも単ページunitは一枚の横長sheet。中央で勝手に二分・再pairingしない。縦長画像との切替ではそれぞれの採用済みrectと背景を使う。
+単ページ表示の横長画像は従来どおり一枚のsheet。2026-10-12利用者決定により、見開き表示の横長画像だけは中央を背にして左右の頁面としてめくる（§24）。navigationの再pairingは行わない。
 
-**2026-10-12利用者決定で上の一文を改める (次の次の版で実装、未着手)**: 見開き表示中の横長画像は「見開き2頁を1枚にした画像」として扱い、画像の中央を綴じ目にして片側を折り返すleaf turnにする (単ページ表示の横長は従来どおり一枚)。利用者の実機報告: `C:/tmp/miv-spread-test/03_landscape_mid_10` (縦長 900×1300 の中に5枚目だけ横長 1600×900、表紙なし見開き [1,2][3,4][5][6,7][8,9][10]) で、めくりアニメーションが一部しか出ない (どの遷移で出ないかは未切り分け、回転画像を含むケースも要確認)。Pair↔横長unit・末尾単独unitへの遷移のtemplate選択とadmissionを最初に調べる。
+**2026-10-12利用者決定（このworktreeで継続実装、次の版への採用は進捗を見て判断）**: 見開き表示中の横長画像は「見開き2頁を1枚にした画像」として扱い、画像の中央を綴じ目にして片側を折り返すleaf turnにする (単ページ表示の横長は従来どおり一枚)。利用者の実機報告: `C:/tmp/miv-spread-test/03_landscape_mid_10` (縦長 900×1300 の中に5枚目だけ横長 1600×900、表紙なし見開き [1,2][3,4][5][6,7][8,9][10]) で、めくりアニメーションが一部しか出ない (各遷移の切り分け・回転検証は§24)。Pair↔横長unit・末尾単独unitへの遷移のtemplate選択とadmissionを最初に調べる。
 
 ### 3.2 安定した見開きのleaf turnと綴じ目
 
@@ -1875,3 +1875,78 @@ perfへpin_limit_policy/fullscreen_budget_bytes/pool_budget_bytesを追加し、
 2026-10-11自動検証の参考値: page-turn focused 144件、projection golden限定19件、normal/portable check、ui_snapshot157件が成功。
 R5-aのcached debug CPU各300poseではportrait PDF scan Pairのsilhouette/visibility p95=0.0153ms、outer mask p95=0.0013ms（前者の内数）、tessellation p95=0.0706ms、合計p95=0.0844ms。
 これは単独headless fixtureの参考値で、UI全frame/実GPU/実機motion受入れではない。詳細は`target/A-1341-spine-feasibility.log`。
+
+
+## 24. 見開きの横長一画像と通常単独unit（2026-10-12）
+
+本節は§3.1・§19のCenteredSingle一律省略、および§23の形状由来gutter差の拒否を改める。
+利用者決定に従い次の版を目指して作業を続け、出荷判断は検証・実機motionの進捗から行う。
+
+### 24.1 表示素材を二つの頁面へ正規化する
+
+見開きの横長singletonは通常描画済みのpaint_rectの中央を背Hとし、左右half rectを持つ
+二slotのBookLeafとして扱う。判定は通常compositionと回転後の表示形状から取り、sourceの
+生寸法だけやtextureのpreview寸法で推測しない。単頁モードの横長はSingleWindowのまま。
+source/通常native ROI/textureは一枚を共有する。通常回転を含む四隅UVの左右辺を50%で
+補間して各halfへ配り、90/180/270度でも表示の左・右を切り出す。underlayも同じ表示UVを切る。
+追加decode/upload、半面専用texture、history/seek/navigationの半頁は作らない。
+
+| 旧→新 | LTR進む / RTL戻る | RTL進む / LTR戻る | 着地 |
+| --- | --- | --- | --- |
+| Pair→横長 | 旧右が表、新画像左halfが裏、右halfが下 | 旧左が表、新画像右halfが裏、左halfが下 | 一枚の新画像の通常rect |
+| 横長→Pair | 旧画像右halfが表、新左頁が裏、新右頁が下 | 旧画像左halfが表、新右頁が裏、新左頁が下 | 新Pairの通常rect |
+| 横長→横長 | 旧右halfが表、新左halfが裏、新右halfが下 | 旧左halfが表、新右halfが裏、新左halfが下 | 一枚の新画像の通常rect |
+
+反対側の旧面は裏が覆うまで保持する。旧/新背はq=smoothstep(progress)で補間し、
+旧静止面をH-H0、新下頁をH-H1だけ移動するoption Aをそのまま使う。横長の中央gapは0、
+Pairは通常gapを持つが、この形状差は設定変更ではない。各inner距離をleafの同じmorphで
+補間し、静止面は自身の寸法・UVを維持する。設定gap変更はcontent/binding失効のまま。
+露出gate・終端外周退役・shadow/visibilityは§23の移動後footprintを共用し、終端でsnapしない。
+
+### 24.2 末尾・境界の縦長singletonとVacant
+
+通常の縦長singletonは通常paint_rect/sideを保持する。Left/Right配置はその実頁の内辺と
+通常gapからHを取り、Center配置は実頁を読書先頭slot（LTR左、RTL右）として扱い、その
+内辺をHとする。表示中の実頁を中央から別の場所へ移さない。空いたslotは明示Vacantで
+surfaceもoccurrenceもreadinessも持たない。白紙へ置き換えず、canvas背景が見える。
+Pairとの遷移も同じ二slot時計で扱う。めくる表がVacantなら90度から新裏面のarrival、
+着地する裏がVacantなら旧表のdepartureを90度で終える。Vacantのstatic/leafは描かず、
+存在しない紙や頁番号を足さない。特殊な片側配置で表/裏が共にVacantとなる方向は、実leafが無いため`vacant_leaf_on_both_sides`の理由でinstantとする。全actual incomingの通常flat採用だけがnavigation完了条件。
+実際の白紙companion・補助表紙・split・媒体継続は今回の別scopeで、理由付きinstantを維持する。
+
+### 24.3 受付・receipt・会計と切り分け
+
+旧stage_one_shape_reasonはreal_pages!=2を一律省略し、offer matchingも実頁数一致を要求し、
+canonical_unitは一枚ならSingleとした。三境界を通常compositionの同じ正規化規則へ揃える。
+旧・新のactual頁数が違っても同じlayout token/destination/mode/roleを検査する。
+投影だけのface identityは左右0/1、横長のreceiptは二面の可視面積を実occurrence一件に集約する。
+短辺は各面の保守的spanの最大値を使い、bounding unionから架空の可視spanを作らない。
+perfはactual頁とfaceの両方を記録し、halfを別navigation頁として数えない。
+素材lease・TextureId dedupはactual resourcesに対して行い、横長二面でpin量を倍にしない。
+
+`03_landscape_mid_10`の旧結果はPair→Pairだけ候補、Pair→[5] / [5]→Pair /
+Pair→末尾[10]と逆方向がshape省略（その先にも実頁数/slot数の拒否がある）。回帰では
+六unit・五境界の前後、LTR/RTL、横長連続、回転後横長/縦長、空slot、正規終端を検査する。
+新goldenはPair↔横長・横長↔横長・Pair↔縦長singletonと四方向のUV/紙面/背移動を目視確認する。
+簡素化は既存BookLeafへの素材正規化を採用し、別state・pending・worker・navigation topologyの
+増加を退けた。OFFの通常描画・レイアウトには変更を加えない。
+
+実ログ補足: read-only `perf_events.4.jsonl` session `47452-1791765013300`では対象フォルダを
+開いた後に`stage1_centered_single`が8回。7枚目のsourceは900×1300だが通常paintは1300×900で、
+保存済み回転を含むunit列だった。READMEの未回転六unit列の結果と混同しない。
+対象59画像のEXIF orientationは全て無し。画像ヘッダだけ読み、素材・profileは変更していない。
+
+
+### 24.4 実装回帰と検証記録
+
+通常composition/offer/prepare/receipt/提示observerを通る未回転40遷移（5境界×LTR/RTL×前後×
+末尾配置OFF/ON）と、元横長5/元縦長6・7の90/180/270回転180遷移で、開始・canonical着地と
+actual occurrence数を検査した。fixtureは実資料と同じaspectの1/10素材で、実PNGのlive操作ではない。
+153 focused tests成功、5新golden（2,911,571B）を目視。終端は製品と同じ通常描画を独立quadへ
+画素比較し、終端直前はprojectionのまま検査する。初回の二half quad対一whole quadの比較に
+12画素/最大RGB1のGPU丸め差があり、許容差を緩めず製品経路へfixtureを揃えた。
+normal/portable check・fmt/glyph lint成功。test-fullは13,374 passed/62既存ignored/0 failed
+（本体lib12,119、UI snapshot157、vendor54含む）で成功。確認用buildの結果は
+`target/A-1341-landscape-msg.txt`へ記録した。normal確認用core/remote/EPUB workerの
+`build-dev -PreserveRuntime -WaitForOtherBuildsMinutes 0`も成功（待機省略は残存MSBuild nodeへの対応、script変更無し）。アプリは起動せず、独立レビュー・実機motion/性能の
+受入れ・出荷時期の確定は利用者/設計担当の判断へ残す。

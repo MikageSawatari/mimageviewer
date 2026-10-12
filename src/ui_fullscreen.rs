@@ -83716,7 +83716,8 @@ pub(crate) mod page_turn_submission_tests {
                         ui,
                         rect,
                         page.idx,
-                        Some(egui::vec2(80.0, 120.0)),
+                        app.known_page_dims_for_idx(page.idx)
+                            .map(|(w, h)| egui::vec2(w as f32, h as f32)),
                         FsPageLayoutSource::CurrentItem,
                         None,
                         None,
@@ -83726,7 +83727,10 @@ pub(crate) mod page_turn_submission_tests {
                         false,
                         false,
                         false,
-                        crate::rotation_db::Rotation::None,
+                        app.rotation_cache
+                            .get(&page.idx)
+                            .copied()
+                            .unwrap_or(crate::rotation_db::Rotation::None),
                         None,
                         0.0,
                         &FsBgStyle::Solid(egui::Color32::WHITE),

@@ -240,7 +240,7 @@
 - 規模 / 優先度: 未見積もり / P3。
 
 ### 1.341 ページめくりのアニメーションを追加する — mIV スレ >>520 (2026-10-07)
-- **2026-10-11 利用者決定: 次の次の版へ回す（v4.5.0の次の版には入れない）**。A0（`next-viewer` / `532635fdd`〜`e3a328ff6`）は利用者のnormal profile実機評価で不合格。PDF scanの数px差で`page_placement_changed`となる、画像では黒い帯に見える、spread全体を一枚として動かすように見える、という評価を受けた。本のように一枚の頁を背から返す動きが必要（RTL forwardは旧左頁だけを右へ返す）。
+- **2026-10-12 利用者決定: 次の版を目指してこのworktreeで継続し、進捗から採用判断**。2026-10-11の次の次の版への延期を改訂した。A0（`next-viewer` / `532635fdd`〜`e3a328ff6`）は利用者のnormal profile実機評価で不合格。PDF scanの数px差で`page_placement_changed`となる、画像では黒い帯に見える、spread全体を一枚として動かすように見える、という評価を受けた。本のように一枚の頁を背から返す動きが必要（RTL forwardは旧左頁だけを右へ返す）。
 - **設計改訂（2026-10-11）**: R4 `afc474d8d`、R5 `c73f0d857`、R6 `29291d496`の独立設計レビューはREVISE、R7 `fa5119c19`はACCEPT。[page-turn-animation-plan.md §19](page-turn-animation-plan.md)のStage 1は実装・自動検証・normal確認用build済、利用者の実機motion評価待ち。通常単頁・Pair間の背回転、頁ごとの異寸法、紙・陰影・影を先に評価できる形へ接続した。取消targetのcanonical flat採用、close→継続commit→fresh snapshot、commit後の描画owner再判定を維持する。cover/中央単頁/横長splitはこの段階では理由付きinstant、継続操作もflat採用後instant。F12 independent stillの既存動画拒否を維持する。R7の別source Half/Full最小対応（全landscape N頁で2N−1操作中N−1が候補）は後続stage。Stage 1ではsplit候補率0%であり、通常scanの実開始率・motion品質・性能受入れは未了。
 - **Stage 1実機追補（2026-10-11）**: `0d1b1f99f`では利用者が演出を確認できなかった。初回key観測のkeyboard owner未確定による候補消失と、入力ゼロgamepad pollが作る偽Continuousによる初回描画後取消を修正した。実handlerで初回key/click→開始→完了、neutral poll保持、理由付きskip一回の回帰を追加（[plan §20](page-turn-animation-plan.md)）。focused回帰・normal/portable check・ui_snapshot・normal確認用build済。修正後の実機motion評価と独立完了レビューは未了。
 - **Stage 1評価追補（2026-10-11）**: `52cd5a15f`の見開き・単頁motionは利用者から良いとの評価。単頁の固定背（LTR左／RTL右、戻りは前頁のarrival）を再確認し、固定端を明示した4枚のgoldenと連続pose回帰を追加する。実機ログの背は既に往復で同じ位置のため、見え方の症状は未再現。missing fact 18件はchild→ROOT受理時に別viewportのframe counterを比較して元factを消した問題で、元ID/source/phaseを保持する構造修正を行う。取消3件は終了直前の別native矢印入力で既存flat-first規則に従っていた（[plan §21](page-turn-animation-plan.md)）。最終受入れ・独立レビューは未了。
@@ -252,6 +252,8 @@
 - 返信済み: まずはシンプルなアニメーションから実装を試す。方式・長さ・ON/OFF は設計時に決める。
 - 連続ページ送り、見開き、連結表示、複数ウィンドウで既存の表示速度や入力応答を落とさないことを先に確認する。
 - 規模 / 優先度: R7再実装概算14〜21作業日（約3〜5週）+独立レビュー・修正・実機枠、別sourceの最小half対応を含む / P3。
+
+- 2026-10-12利用者決定: 次の版を目指してこのworktreeで継続し、進捗から採用判断。見開きの横長一画像を中央の背で片側めくりにする（単頁表示は従来一枚）。Pair↔横長・末尾単独・回転素材の対応/検証はpage-turn-animation-plan §24。
 
 ### 1.342 指定スケールを％・pxの両方で設定できるようにする — mIV スレ >>510、>>521 (2026-10-07)
 - **次の版の決定 (利用者 2026-10-07)**: ライン E (2 番目)。

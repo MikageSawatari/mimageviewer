@@ -8,6 +8,8 @@ mod barrier;
 #[cfg(test)]
 mod input_regression_tests;
 #[cfg(test)]
+mod landscape_tests;
+#[cfg(test)]
 mod nonfinal_tests;
 #[cfg(test)]
 mod spine_budget_tests;
@@ -1911,13 +1913,13 @@ impl App {
                     && outgoing.reading_rtl == unit.reading_rtl
                     && outgoing.slice == unit.slice
                     && Arc::ptr_eq(&outgoing.layout, &unit.layout)
-                    && outgoing.pages.len() == unit.pages.len()
-                    && outgoing.white.is_some() == unit.white.is_some()
                     && outgoing
                         .pages
                         .iter()
-                        .zip(&unit.pages)
-                        .all(|(old, new)| old.occurrence.role == new.occurrence.role)
+                        .chain(&unit.pages)
+                        .all(|page| page.occurrence.role == SpreadPageRole::Navigation)
+                    && outgoing.white.is_none()
+                    && unit.white.is_none()
                     && offer.ready_sources.0.len() == unit.pages.len()
                     && offer
                         .ready_sources
@@ -2135,14 +2137,16 @@ impl App {
                         self.page_turn_leases.register(outgoing);
                         self.page_turn_leases.register(incoming);
                         receipt.curl = true;
-                        // Canonical geometry uses bounded caller-local indices;
-                        // Blank never enters this actual-occurrence receipt.
+                        // A landscape's two projection faces share one actual
+                        // source occurrence. Vacant never enters the receipt.
+                        let actual_visibility = actual_page_visibility(
+                            &projection.visibility,
+                            receipt.pages.as_slice().len(),
+                        );
                         for (i, (_, _, _, area)) in
                             receipt.pages.as_mut_slice().iter_mut().enumerate()
                         {
-                            *area = projection
-                                .visibility
-                                .incoming
+                            *area = actual_visibility
                                 .iter()
                                 .find(|v| v.occurrence == i as u64)
                                 .map_or(0.0, |v| v.visible_area);
@@ -2160,9 +2164,9 @@ impl App {
                             silhouette_visibility_ms: projection.cost.silhouette_visibility_ms,
                             tessellation_ms: projection.cost.tessellation_ms,
                             outer_mask_ms: projection.cost.outer_mask_cpu_ms,
-                            visible_pages: projection.visibility.incoming.iter().fold(0, |mask, v| if v.fraction() >= 0.05 && v.short_edge >= 8.0 { mask | (1 << v.occurrence) } else { mask }),
+                            visible_pages: actual_visibility.iter().fold(0, |mask, v| if v.fraction() >= 0.05 && v.short_edge >= 8.0 { mask | (1 << v.occurrence) } else { mask }),
                             proof: crate::perf::is_enabled()
-                                .then(||serde_json::json!({"recipe":if unit.mode.is_spread() { "BookLeaf" } else if offer.forward { "SingleDeparture" } else { "SingleArrival" },"angle_degrees":projection.angle_degrees,"hinge_x":projection.hinge_x,"face":if projection.showing_back {"back"} else {"front"},"recipe_prepare_cpu_ms":prepared.prepare_cpu_ms,"mesh":mesh_stats,"static_clip_loss_fraction":projection.cost.static_clip_loss_fraction,"static_support_loss_fraction":projection.cost.static_support_loss_fraction,"visible":projection.visibility.incoming.iter().map(|v|serde_json::json!({"occurrence":v.occurrence,"area":v.visible_area,"fraction":v.fraction(),"short_edge":v.short_edge})).collect::<Vec<_>>(),"incoming":unit_diagnostics(incoming,offer),"outgoing":unit_diagnostics(outgoing,offer)})),
+                                .then(||serde_json::json!({"recipe":if unit.mode.is_spread() { "BookLeaf" } else if offer.forward { "SingleDeparture" } else { "SingleArrival" },"angle_degrees":projection.angle_degrees,"hinge_x":projection.hinge_x,"face":if projection.showing_back {"back"} else {"front"},"recipe_prepare_cpu_ms":prepared.prepare_cpu_ms,"mesh":mesh_stats,"static_clip_loss_fraction":projection.cost.static_clip_loss_fraction,"static_support_loss_fraction":projection.cost.static_support_loss_fraction,"visible":actual_visibility.iter().map(|v|serde_json::json!({"occurrence":v.occurrence,"area":v.visible_area,"fraction":v.fraction(),"short_edge":v.short_edge})).collect::<Vec<_>>(),"projection_faces":projection.visibility.incoming.iter().map(|v|serde_json::json!({"face":v.occurrence,"area":v.visible_area,"fraction":v.fraction(),"short_edge":v.short_edge})).collect::<Vec<_>>(),"incoming":unit_diagnostics(incoming,offer),"outgoing":unit_diagnostics(outgoing,offer)})),
                         });
                         curl = true;
                         ctx.request_repaint();
@@ -2471,7 +2475,7 @@ fn slideshow_interval_allows_turn(duration: Duration, interval: Duration) -> boo
     duration <= interval
 }
 
-/// Stage 1 supports ordinary full-page windows and two real navigation pages.
+/// Ordinary full-page windows, real pairs and normalized spread singletons.
 /// This boundary is about composition, never a guess from fitted aspect ratios.
 fn stage_one_shape_reason(
     mode: SpreadMode,
@@ -2483,12 +2487,8 @@ fn stage_one_shape_reason(
         Some("stage1_split_step")
     } else if supplement || white {
         Some("stage1_cover_or_single_companion")
-    } else if mode.is_spread() && real_pages != 2 {
-        Some(if mode.has_cover() {
-            "stage1_cover_or_side_single"
-        } else {
-            "stage1_centered_single"
-        })
+    } else if !(1..=2).contains(&real_pages) {
+        Some("invalid_actual_page_count")
     } else if !mode.is_spread() && mode != SpreadMode::Single {
         Some("stage1_unsupported_flow")
     } else {
@@ -2520,6 +2520,7 @@ fn unit_diagnostics(unit: &PaintedUnit, offer: &AcceptedOffer) -> serde_json::Va
         "duration_ms":offer.duration.as_millis() as u64,
         "mode":format!("{:?}",unit.mode),
         "slice":format!("{:?}",unit.slice),
+        "projection_shape":if unit.mode.is_spread() && unit.pages.len()==1 { if displayed_landscape(&unit.pages[0].transform) { "landscape_halves" } else { "real_and_vacant" } } else { "ordinary" },
         "pages":unit.pages.iter().map(|page|{
             let resource=&page.resource;
             let uv=canonical_source_uv(&page.transform);
@@ -2677,7 +2678,7 @@ fn canonical_unit(
         });
         pages.sort_by(|a, b| a.rect.left().total_cmp(&b.rect.left()));
     }
-    Ok(CanonicalUnit {
+    let canonical = CanonicalUnit {
         spine_x: unit.pages[0].spine.map(|(spine, _)| spine),
         gutter_width: unit.pages[0].spine.map_or(0.0, |(_, gap)| gap),
         pixels_per_point: unit.pages[0].transform.pixels_per_point,
@@ -2687,7 +2688,82 @@ fn canonical_unit(
             UnitLayout::Single
         },
         pages,
-    })
+    };
+    if unit.mode.is_spread() && unit.pages.len() == 1 && unit.white.is_none() {
+        let page = &unit.pages[0];
+        let window = if displayed_landscape(&page.transform) {
+            SpreadWindow::Landscape
+        } else {
+            // A cover's physical mapping is a separate stage. Body and tail
+            // singleton shapes keep their normal placement and vacant slot.
+            if unit.mode.has_cover()
+                && unit
+                    .layout
+                    .first()
+                    .is_some_and(|first| first.pages.first() == Some(&page.occurrence.idx))
+            {
+                return Err("stage1_portrait_cover");
+            }
+            let (side, gap) = match page.transform.placement {
+                ResolvedDisplayPlacement::SingletonSpread { side, gap, .. } => (side, gap),
+                ResolvedDisplayPlacement::Z {
+                    singleton_side,
+                    singleton_gap,
+                    ..
+                } => (singleton_side, singleton_gap),
+                ResolvedDisplayPlacement::Normal { .. } => (SingletonSpreadPlacement::Center, 0.0),
+            };
+            SpreadWindow::Side {
+                right: match side.side() {
+                    SingletonSpreadPlacement::Right => true,
+                    SingletonSpreadPlacement::Left => false,
+                    _ => unit.reading_rtl,
+                },
+                gap: if side == SingletonSpreadPlacement::Center {
+                    0.0
+                } else {
+                    gap
+                },
+            }
+        };
+        normalize_spread_window(canonical, window).map_err(|e| e.sub_check())
+    } else {
+        Ok(canonical)
+    }
+}
+
+fn displayed_landscape(transform: &DisplayedImageTransform) -> bool {
+    let size = transform.source_size;
+    match transform.rotation {
+        crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => size.y > size.x,
+        _ => size.x > size.y,
+    }
+}
+
+fn actual_page_visibility(
+    receipt: &crate::page_turn_animation::VisibilityReceipt,
+    actual_count: usize,
+) -> Vec<crate::page_turn_animation::PageVisibility> {
+    let mut result: Vec<crate::page_turn_animation::PageVisibility> =
+        Vec::with_capacity(actual_count);
+    for face in &receipt.incoming {
+        let actual = if actual_count == 1 {
+            0
+        } else {
+            face.occurrence
+        };
+        if let Some(page) = result.iter_mut().find(|p| p.occurrence == actual) {
+            page.visible_area += face.visible_area;
+            page.canonical_visible_area += face.canonical_visible_area;
+            page.short_edge = page.short_edge.max(face.short_edge);
+        } else {
+            result.push(crate::page_turn_animation::PageVisibility {
+                occurrence: actual,
+                ..face.clone()
+            });
+        }
+    }
+    result
 }
 
 #[cfg(test)]
@@ -3485,7 +3561,7 @@ mod tests {
             SpreadMode::RtlCover,
         ] {
             assert_eq!(stage_one_shape_reason(mode, 2, false, false), None);
-            assert!(stage_one_shape_reason(mode, 1, false, false).is_some());
+            assert_eq!(stage_one_shape_reason(mode, 1, false, false), None);
             assert_eq!(
                 stage_one_shape_reason(mode, 2, true, false),
                 Some("stage1_cover_or_single_companion")

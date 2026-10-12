@@ -769,6 +769,608 @@ fn page_turn_projection_snapshot_resident_quality() {
     snapshots.unwrap();
 }
 
+struct LandscapeTextures {
+    old: TextureHandle,
+    new: TextureHandle,
+    checker: TextureHandle,
+}
+
+fn landscape_image(incoming: bool) -> egui::ColorImage {
+    let halves = if incoming {
+        [
+            page_image('C', '3', Color32::from_rgb(254, 226, 142)),
+            page_image('D', '4', Color32::from_rgb(154, 235, 183)),
+        ]
+    } else {
+        [
+            page_image('A', '1', Color32::from_rgb(140, 203, 246)),
+            page_image('B', '2', Color32::from_rgb(201, 174, 242)),
+        ]
+    };
+    let mut image = egui::ColorImage::filled([224, 168], Color32::TRANSPARENT);
+    for y in 0..168 {
+        for x in 0..224 {
+            image[(x, y)] = halves[x / 112][(x % 112, y)];
+        }
+    }
+    // A single stripe crosses the displayed midpoint without a break. It
+    // belongs to the one actual texture, not two separately uploaded halves.
+    for y in 82..88 {
+        for x in 4..220 {
+            image[(x, y)] = Color32::from_rgb(25, 105, 171);
+        }
+    }
+    image
+}
+
+fn source_image_for_rotation(
+    displayed: egui::ColorImage,
+    rotation: crate::rotation_db::Rotation,
+) -> egui::ColorImage {
+    use crate::rotation_db::Rotation;
+    let [width, height] = displayed.size;
+    let size = match rotation {
+        Rotation::Cw90 | Rotation::Cw270 => [height, width],
+        Rotation::None | Rotation::Cw180 => [width, height],
+    };
+    let mut source = egui::ColorImage::filled(size, Color32::TRANSPARENT);
+    for y in 0..height {
+        for x in 0..width {
+            let source_pixel = match rotation {
+                Rotation::None => (x, y),
+                Rotation::Cw90 => (y, width - 1 - x),
+                Rotation::Cw180 => (width - 1 - x, height - 1 - y),
+                Rotation::Cw270 => (height - 1 - y, x),
+            };
+            source[source_pixel] = displayed[(x, y)];
+        }
+    }
+    source
+}
+
+fn load_landscape_textures(
+    ctx: &egui::Context,
+    rotation: crate::rotation_db::Rotation,
+) -> LandscapeTextures {
+    let load = |name, image| {
+        ctx.load_texture(
+            format!("{name}-{}", rotation.degrees()),
+            source_image_for_rotation(image, rotation),
+            TextureOptions::NEAREST,
+        )
+    };
+    let mut checker = egui::ColorImage::filled([224, 168], Color32::WHITE);
+    for y in 0..168 {
+        for x in 0..224 {
+            checker[(x, y)] = if (x / 8 + y / 8) % 2 == 0 {
+                Color32::from_rgb(222, 226, 232)
+            } else {
+                Color32::from_rgb(120, 132, 148)
+            };
+        }
+    }
+    LandscapeTextures {
+        old: load("landscape-old-A1-B2", landscape_image(false)),
+        new: load("landscape-new-C3-D4", landscape_image(true)),
+        checker: load("landscape-underlay", checker),
+    }
+}
+
+fn rotated_material(
+    texture: &TextureHandle,
+    rotation: crate::rotation_db::Rotation,
+) -> PageMaterial {
+    PageMaterial::Texture {
+        texture_id: texture.id(),
+        uv: [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)].map(|(u, v)| {
+            let (u, v) = crate::displayed_image_transform::inverse_uv(rotation, u, v);
+            pos2(u, v)
+        }),
+        available_uv: unit_uv(),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SpreadFixtureKind {
+    Pair,
+    Landscape,
+    Portrait,
+}
+
+fn spread_window_fixture(
+    pair: &SceneTextures,
+    landscape: &LandscapeTextures,
+    cell: Rect,
+    kind: SpreadFixtureKind,
+    incoming: bool,
+    reading_rtl: bool,
+    rotation: crate::rotation_db::Rotation,
+) -> CanonicalUnit {
+    if matches!(kind, SpreadFixtureKind::Pair) {
+        let sizes = if incoming {
+            [vec2(66.0, 144.0), vec2(42.0, 128.0)]
+        } else {
+            [vec2(44.0, 132.0), vec2(66.0, 146.0)]
+        };
+        let gap = 8.0;
+        let left = cell.center().x - (sizes[0].x + gap + sizes[1].x) * 0.5;
+        return CanonicalUnit {
+            layout: UnitLayout::Spread,
+            pixels_per_point: 1.0,
+            spine_x: Some(left + sizes[0].x + gap * 0.5),
+            gutter_width: gap,
+            pages: sizes
+                .into_iter()
+                .enumerate()
+                .map(|(slot, size)| CanonicalPage {
+                    occurrence: Some(if incoming { 3 } else { 1 } + slot as u64),
+                    rect: Rect::from_min_size(
+                        pos2(
+                            left + if slot == 0 { 0.0 } else { sizes[0].x + gap },
+                            cell.center().y - size.y * 0.5,
+                        ),
+                        size,
+                    ),
+                    clip_rect: cell,
+                    material: material(if incoming {
+                        &pair.new[slot]
+                    } else {
+                        &pair.old[slot]
+                    }),
+                    underlay: Some(material(&pair.checker)),
+                })
+                .collect(),
+        };
+    }
+    let landscape_page = matches!(kind, SpreadFixtureKind::Landscape);
+    // Every destination has a nonzero origin. Unequal widths/heights and
+    // independent horizontal centers make H0 != H1 in all transition rows.
+    let size = if landscape_page {
+        if incoming {
+            vec2(146.0, 122.0)
+        } else {
+            vec2(138.0, 106.0)
+        }
+    } else {
+        vec2(72.0, 144.0)
+    };
+    let center = cell.center() + vec2(if incoming { 7.0 } else { -6.0 }, 0.0);
+    let texture = if landscape_page {
+        if incoming {
+            &landscape.new
+        } else {
+            &landscape.old
+        }
+    } else if incoming {
+        &pair.new[usize::from(reading_rtl)]
+    } else {
+        &pair.old[usize::from(reading_rtl)]
+    };
+    let material_rotation = if landscape_page {
+        rotation
+    } else {
+        crate::rotation_db::Rotation::None
+    };
+    CanonicalUnit {
+        layout: UnitLayout::Single,
+        pixels_per_point: 1.0,
+        spine_x: None,
+        gutter_width: 0.0,
+        pages: vec![CanonicalPage {
+            occurrence: Some(if incoming { 3 } else { 1 }),
+            rect: Rect::from_center_size(center, size),
+            clip_rect: cell,
+            material: rotated_material(texture, material_rotation),
+            underlay: Some(rotated_material(
+                if landscape_page {
+                    &landscape.checker
+                } else {
+                    &pair.checker
+                },
+                material_rotation,
+            )),
+        }],
+    }
+}
+
+fn normalize_fixture(
+    unit: CanonicalUnit,
+    kind: SpreadFixtureKind,
+    reading_rtl: bool,
+) -> CanonicalUnit {
+    let actual = unit.clone();
+    let normalized = match kind {
+        SpreadFixtureKind::Pair => unit,
+        SpreadFixtureKind::Landscape => {
+            super::normalize_spread_window(unit, SpreadWindow::Landscape)
+                .expect("normal landscape singleton must normalize")
+        }
+        SpreadFixtureKind::Portrait => super::normalize_spread_window(
+            unit,
+            // Center placement retains its actual centered rect and assigns
+            // the reading-first face. The opposite face is explicitly vacant.
+            SpreadWindow::Side {
+                right: reading_rtl,
+                gap: 0.0,
+            },
+        )
+        .expect("normal centered portrait singleton must normalize"),
+    };
+    assert_normalized_display(&actual, &normalized, kind);
+    normalized
+}
+
+fn assert_normalized_display(
+    actual: &CanonicalUnit,
+    normalized: &CanonicalUnit,
+    kind: SpreadFixtureKind,
+) {
+    if matches!(kind, SpreadFixtureKind::Pair) {
+        return;
+    }
+    let source = &actual.pages[0];
+    let assert_material = |source: &PageMaterial, face: &PageMaterial, half: Option<usize>| {
+        let PageMaterial::Texture {
+            texture_id,
+            available_uv,
+            ..
+        } = source
+        else {
+            panic!("fixture actual page must own a texture");
+        };
+        let PageMaterial::Texture {
+            texture_id: face_id,
+            available_uv: face_available,
+            ..
+        } = face
+        else {
+            panic!("normalized actual face must retain its texture");
+        };
+        assert_eq!(
+            face_id, texture_id,
+            "halves must share the one actual texture"
+        );
+        assert_eq!(face_available, available_uv);
+        for y in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            for x in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                let actual_x = half.map_or(x, |slot| (slot as f32 + x) * 0.5);
+                assert_eq!(
+                    material_uv(face, pos2(x, y)),
+                    material_uv(source, pos2(actual_x, y)),
+                    "normalized UV field must preserve the normally displayed image"
+                );
+            }
+        }
+    };
+    for (slot, face) in normalized.pages.iter().enumerate() {
+        if matches!(face.material, PageMaterial::Vacant) {
+            assert!(face.occurrence.is_none());
+            assert!(face.underlay.is_none());
+            assert!(matches!(kind, SpreadFixtureKind::Portrait));
+            continue;
+        }
+        let half = matches!(kind, SpreadFixtureKind::Landscape).then_some(slot);
+        let expected_rect = half.map_or(source.rect, |slot| {
+            Rect::from_min_max(
+                pos2(
+                    if slot == 0 {
+                        source.rect.left()
+                    } else {
+                        source.rect.center().x
+                    },
+                    source.rect.top(),
+                ),
+                pos2(
+                    if slot == 0 {
+                        source.rect.center().x
+                    } else {
+                        source.rect.right()
+                    },
+                    source.rect.bottom(),
+                ),
+            )
+        });
+        assert_eq!(face.rect, expected_rect);
+        assert_eq!(face.clip_rect, source.clip_rect);
+        assert_material(&source.material, &face.material, half);
+        assert_material(
+            source.underlay.as_ref().unwrap(),
+            face.underlay.as_ref().unwrap(),
+            half,
+        );
+    }
+}
+
+fn paint_closed_spread_window(
+    painter: &egui::Painter,
+    actual: &CanonicalUnit,
+    kind: SpreadFixtureKind,
+    rotation: crate::rotation_db::Rotation,
+) {
+    use crate::rotation_db::Rotation;
+    let rotation = if matches!(kind, SpreadFixtureKind::Landscape) {
+        rotation
+    } else {
+        Rotation::None
+    };
+    for page in &actual.pages {
+        let source_size = match rotation {
+            Rotation::Cw90 | Rotation::Cw270 => vec2(page.rect.height(), page.rect.width()),
+            Rotation::None | Rotation::Cw180 => page.rect.size(),
+        };
+        let transform = DisplayedImageTransform::from_resolved_rect(
+            DisplayedImageTransformInput {
+                page_idx: page.occurrence.unwrap() as usize,
+                viewport_rect: page.clip_rect,
+                source_size,
+                texture_size: source_size,
+                rotation,
+                free_rotation_rad: 0.0,
+                content_bbox: None,
+                fit_mode: FullscreenFitInput::legacy(crate::settings::FullscreenFitMode::Page),
+                fit_scale_limits: FullscreenFitScaleLimits::default(),
+                pixels_per_point: actual.pixels_per_point,
+                placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                pixel_fit: RectPixelFit::Proportional,
+            },
+            page.rect,
+        )
+        .unwrap();
+        assert_eq!(transform.paint_rect, page.rect);
+        for layer in page.underlay.iter().chain(std::iter::once(&page.material)) {
+            let PageMaterial::Texture { texture_id, .. } = layer else {
+                panic!("closed fixture paints only actual textured pages");
+            };
+            transform.paint_texture(
+                &painter.with_clip_rect(page.clip_rect),
+                *texture_id,
+                Color32::WHITE,
+            );
+        }
+    }
+}
+
+fn paint_canonical_display_uv(painter: &egui::Painter, unit: &CanonicalUnit) {
+    for page in &unit.pages {
+        for layer in page.underlay.iter().chain(std::iter::once(&page.material)) {
+            let PageMaterial::Texture { texture_id, uv, .. } = layer else {
+                assert!(matches!(layer, PageMaterial::Vacant));
+                continue;
+            };
+            let mut mesh = egui::Mesh::with_texture(*texture_id);
+            let positions = [
+                page.rect.left_top(),
+                page.rect.right_top(),
+                page.rect.right_bottom(),
+                page.rect.left_bottom(),
+            ];
+            for (pos, uv) in positions.into_iter().zip(*uv) {
+                mesh.vertices.push(egui::epaint::Vertex {
+                    pos,
+                    uv,
+                    color: Color32::WHITE,
+                });
+            }
+            // Identical to DisplayedImageTransform::paint_texture's normal
+            // TL->BR primitive. Flat landscape uses the original whole quad,
+            // and portrait uses only its actual page; no white vacancy proxy.
+            mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+            painter
+                .with_clip_rect(page.clip_rect)
+                .add(egui::Shape::mesh(mesh));
+        }
+    }
+}
+
+fn snapshot_spread_windows(
+    reading_rtl: bool,
+    forward: bool,
+    rotation_atlas: bool,
+) -> egui_kittest::SnapshotResults {
+    use SpreadFixtureKind::{Landscape, Pair, Portrait};
+    const WINDOW_POSES: [f32; 7] = [0.0, 0.0001, 0.25, 0.5, 0.75, 0.9999, 1.0];
+    const WIDTH: f32 = 170.0;
+    const HEIGHT: f32 = 208.0;
+    let rows = if rotation_atlas { 3 } else { 5 };
+    let name = if rotation_atlas {
+        "page_turn_projection_landscape_rotations".to_owned()
+    } else {
+        format!(
+            "page_turn_projection_spread_windows_{}_{}",
+            if reading_rtl { "rtl" } else { "ltr" },
+            if forward { "forward" } else { "back" }
+        )
+    };
+    let canonical_endpoint = Arc::new(AtomicBool::new(false));
+    let endpoint_flag = canonical_endpoint.clone();
+    let mut pair_textures = None;
+    let mut landscape_textures = None;
+    let mut harness = crate::test_ui::builder()
+        .with_size(vec2(1550.0, 64.0 + rows as f32 * HEIGHT))
+        .build(move |ctx| {
+            if pair_textures.is_none() {
+                crate::ui_fonts::configure_fonts(ctx);
+                pair_textures = Some(load_textures(ctx, false, false));
+                landscape_textures = Some(
+                    (0..4)
+                        .map(|quarter| {
+                            load_landscape_textures(
+                                ctx,
+                                crate::rotation_db::Rotation::from_degrees(quarter * 90),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                ctx.request_repaint();
+                return;
+            }
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            painter.rect_filled(ctx.content_rect(), 0.0, Color32::from_rgb(29, 35, 46));
+            painter.text(
+                pos2(10.0, 8.0),
+                egui::Align2::LEFT_TOP,
+                format!(
+                    "SPREAD WINDOWS / {} / {} / original canonical old and new at outside columns",
+                    if reading_rtl { "RTL" } else { "LTR" },
+                    if forward { "FORWARD" } else { "BACK" }
+                ),
+                egui::FontId::monospace(13.0),
+                Color32::WHITE,
+            );
+            for row in 0..rows {
+                let (old_kind, new_kind, label, quarter) = if rotation_atlas {
+                    (
+                        Landscape,
+                        Landscape,
+                        "rotated landscape -> landscape",
+                        row + 1,
+                    )
+                } else {
+                    let (old, new, label) = [
+                        (Pair, Landscape, "Pair -> landscape"),
+                        (Landscape, Pair, "landscape -> Pair"),
+                        (Landscape, Landscape, "landscape -> landscape"),
+                        (Pair, Portrait, "Pair -> centered portrait + Vacant"),
+                        (Portrait, Pair, "centered portrait + Vacant -> Pair"),
+                    ][row];
+                    (old, new, label, 0)
+                };
+                let rotation = crate::rotation_db::Rotation::from_degrees(quarter as i32 * 90);
+                painter.text(
+                    pos2(10.0, 30.0 + row as f32 * HEIGHT),
+                    egui::Align2::LEFT_TOP,
+                    if rotation_atlas {
+                        format!(
+                            "{label} / {} degrees / displayed print stays upright",
+                            rotation.degrees()
+                        )
+                    } else {
+                        label.to_owned()
+                    },
+                    egui::FontId::monospace(12.0),
+                    Color32::from_rgb(206, 216, 228),
+                );
+                for column in 0..9 {
+                    let cell = Rect::from_min_size(
+                        pos2(10.0 + column as f32 * WIDTH, 70.0 + row as f32 * HEIGHT),
+                        vec2(WIDTH, 178.0),
+                    );
+                    let old_flat = spread_window_fixture(
+                        pair_textures.as_ref().unwrap(),
+                        &landscape_textures.as_ref().unwrap()[quarter],
+                        cell,
+                        old_kind,
+                        false,
+                        reading_rtl,
+                        rotation,
+                    );
+                    let new_flat = spread_window_fixture(
+                        pair_textures.as_ref().unwrap(),
+                        &landscape_textures.as_ref().unwrap()[quarter],
+                        cell,
+                        new_kind,
+                        true,
+                        reading_rtl,
+                        rotation,
+                    );
+                    let label = match column {
+                        0 => "canonical old".to_owned(),
+                        8 => "canonical new".to_owned(),
+                        _ => format!("{:.4}", WINDOW_POSES[column - 1]),
+                    };
+                    painter.text(
+                        pos2(cell.center().x, cell.top() - 18.0),
+                        egui::Align2::CENTER_TOP,
+                        label,
+                        egui::FontId::monospace(12.0),
+                        Color32::WHITE,
+                    );
+                    if column == 0 {
+                        paint_canonical_display_uv(&painter, &old_flat);
+                    } else if column == 8 || (column == 7 && endpoint_flag.load(Ordering::Relaxed))
+                    {
+                        paint_canonical_display_uv(&painter, &new_flat);
+                    } else if column == 7 {
+                        // Production only projects progress < 1; at the closed
+                        // endpoint it paints the retained actual normal page
+                        // through paint_flat_page/DisplayedImageTransform.
+                        // Comparing split half quads here instead introduces
+                        // GPU interpolation/blend LSB differences from their
+                        // different triangulation, though their UV fields agree.
+                        // Keep p=.9999 as a real projection in column 6.
+                        let _ = normalize_fixture(new_flat.clone(), new_kind, reading_rtl);
+                        paint_closed_spread_window(&painter, &new_flat, new_kind, rotation);
+                    } else {
+                        let old = normalize_fixture(old_flat, old_kind, reading_rtl);
+                        let new = normalize_fixture(new_flat, new_kind, reading_rtl);
+                        if matches!(new_kind, Portrait) {
+                            assert_eq!(
+                                new.pages
+                                    .iter()
+                                    .filter(|page| matches!(page.material, PageMaterial::Vacant))
+                                    .count(),
+                                1
+                            );
+                        }
+                        let projection = project_turn(
+                            &old,
+                            &new,
+                            TurnDirection {
+                                reading_rtl,
+                                forward,
+                            },
+                            WINDOW_POSES[column - 1],
+                        )
+                        .expect("normalized landscape/portrait spread transition must project");
+                        for projected in projection.meshes {
+                            painter
+                                .with_clip_rect(projected.clip_rect)
+                                .add(egui::Shape::mesh(projected.mesh));
+                        }
+                    }
+                }
+            }
+        });
+    harness.run();
+    harness.snapshot(&name);
+    let projected = harness.render().unwrap();
+    canonical_endpoint.store(true, Ordering::Relaxed);
+    harness.step();
+    harness.run();
+    let canonical = harness.render().unwrap();
+    if projected != canonical {
+        let evidence = std::path::Path::new("target/page-turn-endpoint-debug");
+        std::fs::create_dir_all(evidence).unwrap();
+        projected
+            .save(evidence.join(format!("{name}-projected.png")))
+            .unwrap();
+        canonical
+            .save(evidence.join(format!("{name}-canonical.png")))
+            .unwrap();
+    }
+    assert!(
+        projected == canonical,
+        "closed normal endpoint must match original actual-page canonical UV quads: {name}"
+    );
+    harness.take_snapshot_results()
+}
+
+#[test]
+fn page_turn_projection_snapshot_spread_windows_four_routes() {
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    for reading_rtl in [false, true] {
+        for forward in [false, true] {
+            snapshots.extend(snapshot_spread_windows(reading_rtl, forward, false));
+        }
+    }
+    snapshots.unwrap();
+}
+
+#[test]
+fn page_turn_projection_snapshot_landscape_display_rotations() {
+    snapshot_spread_windows(false, true, true).unwrap();
+}
+
 macro_rules! route_test {
     ($name:ident, $spread:expr, $rtl:expr, $forward:expr) => {
         #[test]

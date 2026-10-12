@@ -3036,3 +3036,15 @@ UV/寸法は保持し、reveal gate・終端の差分退役・shadow/visibility�
 projectionのdestination clipはpainter scissorとtransform viewportの交差で、任意のtrim有無をcanvas変更と誤認しない。
 初回incomingが不可視でもvalid Pairを開始し、first_visibleは実面積、完了は全canonical flat採用で保証する。
 有限pin枠はfullscreenの10%（固定128 MiB cap撤去）、VRAM無制限時は1 GiB。実測737.47 MiB/準備後推計756.02 MiBが根拠で、会計/dedup/leaseと低VRAM・memory_pressure gateを維持する。
+
+
+### §1.341 見開きの横長一画像とVacant（2026-10-12）
+
+[page-turn plan §24](page-turn-animation-plan.md)により、見開きで単独表示する横長は通常paint_rect
+の中央を背にして二つの投影faceへ正規化する。sourceの回転後サイズで判定し、quarter rotationを
+適用済みのquad UV/underlay UVを表示左右へ分ける。追加decode/upload・texture・navigation stepは無い。
+Pair↔横長・横長↔横長は同じBookLeaf/移動背時計で着地し、形状由来のgap0↔Pair gapを扱う。
+単頁表示の横長は従来の一枚。通常の縦長singletonは既存のCenter/Left/Right rectを保持し、
+空slotは明示Vacant（surface/occurrence無し）。Vacant側のleafは描かず、90度arrival/departureを使う。
+提示receiptは横長二面の実面積を一つのsource occurrenceへ合算し、面ごとの保守的short spanを使う。
+pin/lease/dedupはactual resourceのまま。OFFの通常layout・page count/seek/historyは変更しない。

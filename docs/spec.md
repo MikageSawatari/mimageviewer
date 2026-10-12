@@ -2319,7 +2319,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 先読み枚数の設定上限が前後とも 10 枚なので、上限まで増やしても行が伸び続けない。ホバー時は全対象の状態別件数を表示する。OFF にしても先読み処理は続ける。処理状況も OFF のとき、表示する行も点表示もなければ左下の枠自体を描画しない |
 | `downscale_smoothing_percent` | u32 | 0 | 通常静止画の「縮小時のなめらかさ」。0〜100・10刻みに正規化し、Lanczos3 の blur 1.00〜1.30 へ対応させる。全画像・全ウィンドウ共通 |
 | `anime_upscale_source_limit` | AnimeUpscaleSourceLimit | Px4096 | 「アニメ塗り拡大」を適用する可視元領域の長辺上限。2048px / 4096px / 制限なし。上限ちょうどは処理し、超過時は標準拡大へフォールバックする |
-| `page_turn_animation_enabled` | bool | false | 評価中のPC静止画ページめくり。環境設定 → 表示 → 閲覧表示と上部HUDの「その他の機能」で同じ値を変更する。通常/F12共通で即反映・保存。単発の表示可能なresident隣接単ページ/LTR・RTL見開きとslideshowが対象。連打・読込待ち・連結読み、動画・音楽・Remoteには適用しない |
+| `page_turn_animation_enabled` | bool | false | 評価中のPC静止画ページめくり。環境設定 → 表示 → 閲覧表示と上部HUDの「その他の機能」で同じ値を変更する。通常/F12共通で即反映・保存。単発の表示可能なresident隣接単ページ/LTR・RTL見開きとslideshowが対象。見開きの横長一画像は中央を背に左右の半面をめくり、通常の末尾・境界単独頁は配置と空slotを保持する。連打・読込待ち・連結読み、動画・音楽・Remoteには適用しない |
 | `page_turn_animation_duration_ms` | u32 | 200 | 評価用の「時間（仮）」、100〜600ms。最終時間は動きを見てから採択する。HUDのON/OFFはこの値を変更しない。slideshowのintervalまたはdeadline残時間が選択時間より短ければ演出を省略し、intervalを延長しない |
 | `fullscreen_seek_bar_locked` | bool | false | 静止画フルスクリーンの下部ページシークバーを固定表示する。ON のときは下端のバー領域を画像フィット範囲から除外する |
 | `still_seek_strip_locked` | bool | false | 静止画のサムネイル列を固定表示する。ON は下部ページシークバー固定を含意し、列表示中はバーと列を画像フィット範囲から除外する。列を閉じると OFF になる |
