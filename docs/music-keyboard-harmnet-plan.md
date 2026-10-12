@@ -1,6 +1,7 @@
 # 音楽ビュー鍵盤の基音推定 (HarmNet 移植) 設計
 
-状態: 設計 (2026-10-12、利用者が方針 A と下記の推奨 2 点を承認)。実装前の独立レビュー待ち。
+状態: 設計 (2026-10-12、利用者が方針 A と下記の推奨 2 点を承認)。実装前の独立レビュー (GPT-6.1 Sol /
+xhigh) 1 回目 = ACCEPT WITH CHANGES、指摘は §12 のとおり反映。
 作業ブランチ: `pitch-lab` (worktree `G:\home\mimageviewer-pitchlab`)。
 
 ## 1. 目的と背景
@@ -50,6 +51,11 @@ scalar 実装で 1 フレーム (20ms) あたり約 2ms だった。
   操作は既存の `MusicSpectrumState::clear()` がワーカーごと捨てるので、新しい終了経路を足さない。
 - **結果は既存の 1 本の結果チャネルに載せる**: `SpectrumAnalysis` に確率の配列を 1 つ足すだけで、
   別チャネル・別 pending を作らない (棒グラフと鍵盤の時刻が常に同じ要求から来る)。
+- **所有の前提**: 音楽の状態 (`music_pcm` / `music_spectrum`) は ViewerContextBundle ではなく App 全体で
+  1 つ。新しいメディアを開く前に parked-live を閉じる契約と、音源の所有者に限った teardown により、
+  同時に 2 つの音源を描くことはない。tracker はさらに **PCM の同一性 (`Arc::ptr_eq`) と絶対フレーム番号**
+  で継続を判断するので、teardown の経路に漏れがあっても別の音源の状態を使うことはない (音声トラック
+  変更・別ファイルは別の `MusicPcm` になる)。park / 復帰は同じ PCM なので状態がそのまま続く。
 - まれな失敗 (計算が想定より遅い等) は割り切り: 追いつけない分は助走扱いで作り直す (§5.3)。
   再試行や状態保持は足さない。
 
@@ -83,9 +89,15 @@ pitch-lab の `examples/harmnet_dump.rs` を出発点にしてよいが、次を
 ### 4.2 `MusicPcm` に範囲コピーを追加
 
 `copy_window` (再生位置 ±1 秒) では助走 (1 秒 + 長窓 0.34 秒 + 先読み 0.16 秒) が足りない。
-`MusicPcm::copy_range(start_frame, end_frame) -> Option<Vec<f32>>` 相当を足す。デコード済みの
-範囲を超える部分は返さない (呼び出し側が「どこまで計算できるか」を知れる形にする)。read lock の
-保持は今の `copy_window` と同じく短くする。
+`MusicPcm::copy_range(start_frame, end_frame)` 相当を足す。範囲の扱い:
+
+- ファイル先頭より前 (負の位置) は 0 で埋める。
+- **デコード完了済み (`is_complete()`) なら、ファイル末尾より後も 0 で埋める** (末尾 180ms や
+  180ms 未満の短いファイルでも計算できるように。Sol P1)。
+- デコード中の先端より後だけを「まだ無い」として扱い、取れた所までを返す (呼び出し側が
+  どこまで計算できるかを知れる形にする)。
+
+read lock の保持は今の `copy_window` と同じく短くする。
 
 ### 4.3 spectrum worker の変更 (`src/ui_music_spectrum.rs`)
 
@@ -96,8 +108,9 @@ pitch-lab の `examples/harmnet_dump.rs` を出発点にしてよいが、次を
 1. 既存どおり ±1 秒窓で `SpectrumAnalyzer::analyze_moving_window` を回す (棒グラフ・`notes`)。
 2. 表示したいフレーム番号 `k` を再生位置から求め (§5.1)、先読みに必要な最終フレーム
    `k_end = k + 8` までを計算する (§5.2、§5.3)。
-3. `SpectrumAnalysis` に `pitch_probabilities: Vec<f32>` (MIDI 21〜108 の 88 個、`notes` と同じ並び)
-   を入れて返す。計算できなかった (未デコード等) ときは空の Vec。
+3. `SpectrumAnalysis` に `pitch_probabilities: Option<Vec<f32>>` (MIDI 21〜108 の 88 個、`notes` と
+   同じ並び) を入れて返す。**`None` = 未取得** (デコード先端が `k_end` に届いていない)、
+   `Some` = 有効な 88 個 (全部 0 もあり得る) を区別する (Sol P3)。
    `SpectrumAnalysis` は `Serialize/Deserialize` を derive しているので `#[serde(default)]` を付ける
    (永続化はされていない: music-integration-plan D8)。
 
@@ -107,7 +120,14 @@ pitch-lab の `examples/harmnet_dump.rs` を出発点にしてよいが、次を
   (`update_keyboard_sustain` 後の `notes` の最大値に Norm ゲインを反映し、`KEY_HIGHLIGHT_MIN_PEAK` と
   0.28 で正規化した値の 0.7 乗) をそのまま使う。確率への追加のガンマは定数 1 本 (`KEY_PITCH_GAMMA`、
   既定 1.0) にして実機で調整できるようにする。
-- `pitch_probabilities` が空のフレームは中央 0 (鍵盤はベースラインのまま)。
+- `pitch_probabilities` が `None` のときは中央の入力を 0 として扱い、既存の残光
+  (`note_trail`) で自然に消えるに任せる。特別なベースライン描画は足さない (未取得はデコード先端で
+  一時的にしか起きないため)。`Some` の全 0 も同じ見た目になる。
+- **再要求**: 今の `MusicSpectrumState::update` は `bands.is_empty() || playing || center_changed` の
+  ときだけ要求する。一時停止中に棒グラフは取れたが確率が `None` だった場合、デコードが進んでも
+  再要求されない (Sol P2)。条件に **「直近の結果の確率が `None` かつ `source_complete == false`」**
+  を 1 つ足す (16ms 間隔・in-flight 1 件の既存の間引きに乗る)。デコード完了後は P1 により
+  `None` が出ないので、完了後に要求し続けることはない。進捗通知チャネルは足さない。
 - 偶数・奇数倍音比は今の `harmonic_energies` と `even/odd = energy / (raw + 1e-4)` の 0..1 クランプ、
   EMA (`KEY_HARMONIC_SMOOTH`) をそのまま使う。上下端の色は今と同じく `key_fill(midi, center × factor)`。
 - 中央の残光 (`note_trail` の `KEY_HIGHLIGHT_DECAY`) は残す。
@@ -125,9 +145,20 @@ HarmNet のフレーム `L` は、サンプル `L × hop` で終わる窓から�
 再生位置 `c` 秒に対して表示フレーム `k = round((c + 0.02) / hop)` とし、head 3 (age 8) を使うため
 `k_end = k + 8` まで計算した時点の head 3 の出力を表示する。
 
-この対応は**golden テストで確かめる** (§6): Python `effetune==0.13.0` の `revised_levels`
-(age 8) が、何番目の推論の head 3 と、どのフレームの無音判定を使っているかを、オンセットを含む
-fixture で一致させる。pitch-lab では head 0 の一致だけを確認しており、age 8 側の対応は未確認。
+2026-10-12 に pitch-lab で確認した対応 (合成音 3 種、無音境界以外で最大差 5e-5):
+
+- Rust のフレーム `L` (サンプル `L × hop` で終わる窓) = Python の `frame_index = L − 1`
+  (`time_seconds = L × hop`)。
+- Python の `revised_levels` (age 8) の行 `L` = **推論 `L` の head 3 の出力 × フレーム `L − 8` の
+  無音判定**。age 2 (`revisions`) も同じく推論 `L` の head 1 × フレーム `L − 2` の無音判定。
+- オンセット 0.2 秒の音で、head 3 の値はフレーム `L − 8` の時刻 ≈ 0.22 秒で立ち上がった。
+  したがって `k = round((c + 0.02) / hop)`、`k_end = k + 8` の head 3 がフレーム `k` (時刻
+  `k × hop − 0.02`) の推定になる。
+- EffeTune のリアルタイム処理は計算を 1 hop に分散するので公開がさらに 1 hop 遅れるが、mIV は
+  オフラインで計算するので **この遅れを `k_end` に足さない**。
+- Python の 440 セル (1 鍵 5 セル) は各鍵の最大値で 88 鍵へ集約する (細かい位置の形は最大が 1)。
+
+golden テスト (§6) はこれらを固定する。
 
 ### 5.2 続けるか作り直すかの判定 (純関数)
 
@@ -155,15 +186,26 @@ decide(cursor, pcm, k_end) ->
 
 - **重み**: 埋め込みバイト列の長さ 188,048 と SHA-256 一致。
 - **golden**: Python `effetune==0.13.0` で作った短い fixture (合成音、2〜3 秒、オンセット・無音・
-  和音を含む) の age 0 と age 8 の出力を `crates/music-core/tests/fixtures/` に小さなバイナリで保存し、
+  和音を含み、**有音→無音と無音→有音の両方の境界を age 8 の範囲にまたがって含む**) の age 0 と
+  age 8 の出力を `crates/music-core/tests/fixtures/` に小さなバイナリで保存し、
   Rust の出力が 1e-3 以内で一致すること。fixture の生成スクリプトも同じ場所に置く (Python 依存は
   テスト実行には不要)。
 - **判定関数**: `decide` の Reuse / Advance / Restart (別 PCM・後退・飛びすぎ) の状態遷移テスト。
-- **助走**: 持続音の途中へ Restart したとき、助走後の出力が連続計算と許容差内で一致すること。
+- **助走**: 持続音・和音の切り替え・オンセット・無音後の再発音それぞれの途中へ Restart したとき、
+  助走後の出力が連続計算と一致すること。許容差は実装時に測って数値で固定し、本書に記録する
+  (目安: 確率の差 0.05 以下)。
+- **範囲**: 180ms 未満の短いファイル、hop で割り切れない長さ、末尾の持続音で、デコード完了後は
+  末尾まで確率が `Some` になること (P1)。
+- **再要求**: 「一時停止・位置固定・bands あり・確率 `None`」→ PCM 追記 / 完了 → 次の要求で確率が
+  `Some` になること (P2、`MusicSpectrumState::update` の handler-level テスト)。
+- **PCM の同一性**: 同じ位置でも別の `MusicPcm` なら Restart になること。
 - **未デコード**: デコード済み範囲の外を要求したとき空の結果になり、カーソルが計算できたところに
   あること。
 - **鍵盤**: 倍音のある単音で、中央が最大の鍵が基音であり、オクターブ上・半音上の鍵の中央が
-  基音の 0.3 倍未満であること。HarmNet が光らせない鍵は上下端も 0 であること。
+  基音の 0.3 倍未満であること。`compute_keyboard_visuals` の**瞬時値**で、確率 0 の鍵は中央・上下端とも
+  0 であること。残光を含む描画状態は別のテストで、確率が 0 になった後に減衰することを確かめる。
+- **ライセンス表記**: 通常構成と `portable` 構成の両方で、バージョン情報の notice 一覧に HarmNet
+  (EffeTune MIT) が含まれること。
 - 既存の `keyboard_visuals_*` テストは新しい意味へ置き換える。
 - 実行: `cargo test -p music-core`、`cargo test -p mimageviewer --lib ui_music_spectrum::`。
 
@@ -184,13 +226,19 @@ decide(cursor, pcm, k_end) ->
 - 目標: 1 フレーム 1ms 以下 (再生中は 50 フレーム/秒なので 1 コアの 5% 以下)。pitch-lab の scalar
   試作は約 2ms で、層ごとの Vec 確保と境界検査を除けば届く見込み。届かなくても動作はする
   (再生中 10% 程度) ので、目標未達は記録して実機判断とする。
-- 計測用に release の小さな bench (example か `#[ignore]` テスト) を残す。
+- 計測用に release の小さな bench (example か `#[ignore]` テスト) を残す。1 フレームの推論だけでなく、
+  初期化 (重みの読み込み・FFT 計画)、助走 1 回 (58 フレーム + PCM コピー)、通常の要求 1 回
+  (棒グラフの FFT + 1 フレーム) の時間を出す。
 
 ## 9. 文書の更新
 
 - `docs/music-integration-plan.md` §5.6 / §7.2: 鍵盤の中央が HarmNet の推定になったこと、worker が
   状態を持つこと、助走。
 - `docs/architecture-overview.md`: music-core に pitch モジュールが加わったこと。
+- `docs/async-architecture.md`: spectrum worker が HarmNet の状態を持ち、PCM の同一性で継続を
+  判断すること。
+- EffeTune 関連の文書 (`docs/effetune-integration-plan.md` 等) で、ポータブル版に同梱しないのは
+  Mixwright bundle であり、HarmNet の表記は全形態に出ることを区別して書く。
 - `htdocs/mimageviewer/manual/music.html` (145 行目付近) と `tut-music.html` (99〜105 行目付近):
   「鳴っている音の基音を推定して光る」「上下のグラデーションは倍音の多さ」。内部用語
   (ニューラルネット、GRU、HarmNet) は書かない。
@@ -204,6 +252,26 @@ decide(cursor, pcm, k_end) ->
 - pitch-lab の調査用 example (`keyboard_dump.rs`、`examples/pitch_lab/`) は master へ持ち込まない。
   必要なのは重み変換スクリプトと fixture 生成スクリプトだけ。
 
+- **既存の不一致 (今回は直さない)**: parked-live の音楽ウィンドウ
+  (`src/ui_fullscreen.rs` の `draw_parked_live_music_window`) は `draw(..., 0.0, ...)` で Norm の
+  ゲインを渡しておらず、通常表示と鍵盤の明るさが違う (Sol P4)。今の presence も同じ式なので、
+  この設計で新しく生じる差ではない。detached 経路に触れる修正は凍結ルールの手続きが要るため、
+  バックログへ別件として起票する。
+
 ## 11. 永続データ
 
 なし。`SpectrumAnalysis` は永続化されていない (D8)。設定項目も足さない。
+
+## 12. 独立レビューの記録
+
+1 回目 (GPT-6.1 Sol / xhigh、2026-10-12、session `01a12f97-de07-7290-b8e6-a4095800d4bd`):
+ACCEPT WITH CHANGES。
+
+| 指摘 | 対応 |
+| --- | --- |
+| P1 確定 EOF と未デコードを同じ扱いにすると末尾が空になる | §4.2: 完了後は末尾より後を 0 埋め。§6 に短いファイル・端数長・末尾の持続音 |
+| P2 一時停止中に確率だけ未取得だと再要求されない | §4.4: 「確率 None かつデコード未完了」を再要求条件に追加。進捗通知は足さない |
+| P3 未取得と有効なゼロ確率の区別、残光との関係 | §4.3: `Option`。§4.4: 未取得は入力 0 として残光で減衰 (ベースライン専用描画は足さない)。§6 で瞬時値と残光を分けて検査 |
+| P4 parked-live が Norm ゲインを渡していない | 既存の不一致でこの設計が生むものではない。detached 凍結ルールの対象なので §10 に記録し別件で起票 |
+| P5 golden の時刻対応と助走の合格条件 | §5.1 に確認済みの対応を記載、§6 に境界・助走ケースと数値許容差の記録 |
+| P6 所有の前提・文書・検査 | §3 に App 全体 1 つの前提と PCM 同一性による継続判断。App レベルの park/復帰テストは、継続を PCM 同一性で判定するため tracker 単体の同一性テストで代える。§9 に async-architecture と EffeTune 文書。§6 にライセンス表記の検査、§8 に要求全体の計測 |
