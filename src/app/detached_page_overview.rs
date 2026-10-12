@@ -3,7 +3,9 @@
 
 use super::page_overview::PageOverviewCommand;
 use super::*;
-use crate::page_overview::{PageOverviewDirection, PageOverviewStamp, PageOverviewView};
+#[cfg(test)]
+use crate::page_overview::PageOverviewDirection;
+use crate::page_overview::{PageOverviewStamp, PageOverviewView};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DetachedPageOverviewInputProvenance {

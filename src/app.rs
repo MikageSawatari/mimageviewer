@@ -876,7 +876,7 @@ pub(crate) struct PhysicalHistoryTransition {
     dfs_continuation: Option<PhysicalHistoryDfsContinuation>,
     favsearch_origin: bool,
     tag_view_origin: bool,
-    global_search_origin: bool,
+    global_search_origin: Option<crate::global_search_ui::SearchOpenOrigin>,
     grid_open_effects: Option<GridVirtualOpenEffects>,
 }
 
@@ -8576,6 +8576,37 @@ enum FullscreenPdfPromotionState {
 impl Default for FullscreenPdfPromotionState {
     fn default() -> Self {
         Self::Idle
+    }
+}
+
+/// Visible promotion belongs to the viewer that admitted the thumbnail request.
+/// Equal paths in a sibling or a new list generation cannot settle its retry.
+#[derive(Debug, Default)]
+pub(crate) enum PdfVisiblePromotionState {
+    #[default]
+    Idle,
+    Tracking {
+        ticket: crate::pdf_loader::PdfRenderEpochTicket,
+        keys: HashSet<String>,
+        retry_needed: bool,
+    },
+}
+
+impl PdfVisiblePromotionState {
+    fn needs_attempt(
+        &self,
+        ticket: &crate::pdf_loader::PdfRenderEpochTicket,
+        keys: &HashSet<String>,
+    ) -> bool {
+        !keys.is_empty()
+            && match self {
+                Self::Idle => true,
+                Self::Tracking {
+                    ticket: previous,
+                    keys: previous_keys,
+                    retry_needed,
+                } => !previous.same_request(ticket) || previous_keys != keys || *retry_needed,
+            }
     }
 }
 
@@ -18258,13 +18289,9 @@ pub struct App {
     /// スキップして worker の暇をユーザーの確定操作のために空けておく。
     pub(crate) pdf_prefetch_grace_until: Option<std::time::Instant>,
 
-    /// 前フレームに `pdf_loader::promote_to_high_normal` に渡した visible_keys。
-    /// 同じ keys なら lock 取らず skip するための dedup snapshot。
-    /// (docs/scroll-visibility-priority-plan.md Phase 2)
-    pub(crate) last_promoted_visible_keys: Option<std::collections::HashSet<String>>,
-    /// 前回の promote で `not_found_keys > 0` (= まだ pool に入ってない visible key あり)
-    /// だったとき次フレームでも再 promote 走らせるためのラッチ。Codex P2-2 対応。
-    pub(crate) promote_retry_pending: bool,
+    /// Sole invalidation writer for the currently projected viewer context.
+    pub(crate) pdf_render_epoch: crate::pdf_loader::PdfRenderEpochOwner,
+    pub(crate) pdf_visible_promotion: PdfVisiblePromotionState,
 
     // ── スクロール後の可視サムネ計装 (docs/scroll-visibility-priority-plan.md Phase 1) ──
     /// 前フレームの scroll_offset_y。比較して変化があれば `last_scroll_event_at` 更新
@@ -18635,6 +18662,7 @@ pub struct App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        self.pdf_render_epoch.retire();
         self.transfer_spread_shift_exit_ownership();
         self.diagnostics_export.retire();
         self.retire_pending_startup_result();
@@ -20693,8 +20721,8 @@ impl App {
             fs_holdover_tex: None,
             virtual_folder_writeback: None,
             pdf_prefetch_grace_until: None,
-            last_promoted_visible_keys: None,
-            promote_retry_pending: false,
+            pdf_render_epoch: crate::pdf_loader::PdfRenderEpochOwner::fresh(),
+            pdf_visible_promotion: PdfVisiblePromotionState::Idle,
             prev_scroll_offset_y: 0.0,
             last_scroll_event_at: None,
             last_prefetch_scroll_at: None,
@@ -22156,6 +22184,24 @@ impl App {
         self.modal_dialog_block_reason().is_some()
     }
 
+    pub(crate) fn everything_main_grid_available(&self) -> bool {
+        if !self.main_folder_history_available() || self.fullscreen_idx.is_some() {
+            return false;
+        }
+        #[cfg(windows)]
+        if self.native_video_fullscreen_active_for_main_backdrop() {
+            return false;
+        }
+        true
+    }
+
+    pub(crate) fn finish_everything_edit_boundary(&mut self) {
+        self.finish_rating_membership_edit_boundary();
+        if self.fullscreen_idx.is_some() {
+            self.close_fullscreen_for_rating_membership();
+        }
+    }
+
     /// Which of those states is holding input, by name.
     ///
     /// This was a bare `||` chain of sixty flags. When one of them stayed set with nothing drawn
@@ -22174,6 +22220,7 @@ impl App {
             };
         }
         first![
+            self.everything_search_progress_visible() => "everything_search",
             self.capture_selection_open() => "clipboard_capture_selection",
             self.sidecar_restore_active() => "sidecar_restore",
             self.remote_session_blocks_local_control() => "remote_session",
@@ -28511,7 +28558,7 @@ impl App {
         let search_origin = (
             self.favsearch.active,
             self.tag_view.active,
-            self.global_search.active,
+            self.capture_search_open_origin(),
         );
         let book_prefix = grid_effects
             .as_ref()
@@ -32487,7 +32534,7 @@ impl App {
             dfs_continuation,
             favsearch_origin: self.favsearch.active,
             tag_view_origin: self.tag_view.active,
-            global_search_origin: self.global_search.active,
+            global_search_origin: self.capture_search_open_origin(),
             grid_open_effects: None,
 
             restore_intent: restore_intent.clone(),
@@ -32762,7 +32809,7 @@ impl App {
             dfs_continuation: None,
             favsearch_origin: self.favsearch.active,
             tag_view_origin: self.tag_view.active,
-            global_search_origin: self.global_search.active,
+            global_search_origin: self.capture_search_open_origin(),
             grid_open_effects: None,
         };
         self.replace_history_navigation_transition(None);
@@ -32771,6 +32818,12 @@ impl App {
     }
 
     fn physical_history_source_is_current(&self, request: &PhysicalHistoryTransition) -> bool {
+        if request
+            .global_search_origin
+            .is_some_and(|origin| !self.search_open_origin_is_current(origin))
+        {
+            return false;
+        }
         if !self.main_list_navigation_is_current(&request.navigation) {
             return false;
         }
@@ -34266,7 +34319,7 @@ impl App {
         {
             self.stack_mode_requested = false;
             crate::thumb_loader::bump_catchup_epoch();
-            let _ = crate::pdf_loader::bump_render_context_epoch();
+            self.bump_render_epoch_only();
         }
         if !self.smart_folder_session_owns_load(path) {
             self.reconcile_bookmark_return_target_for_folder_load(path);
@@ -34289,7 +34342,7 @@ impl App {
         path: &Path,
         favsearch_origin: bool,
         tag_view_origin: bool,
-        global_search_origin: bool,
+        global_search_origin: Option<crate::global_search_ui::SearchOpenOrigin>,
     ) {
         if favsearch_origin && self.favsearch.active {
             self.favsearch.nav_stack.push(path.to_path_buf());
@@ -34299,7 +34352,7 @@ impl App {
             self.record_tag_view_nav_open(path);
             self.update_tag_view_address();
         }
-        if global_search_origin && self.global_search.active {
+        if global_search_origin.is_some_and(|origin| self.search_open_origin_is_current(origin)) {
             self.advance_drilled_current_path(path);
         }
     }
@@ -36276,7 +36329,7 @@ impl App {
                 dfs_continuation: None,
                 favsearch_origin: self.favsearch.active,
                 tag_view_origin: self.tag_view.active,
-                global_search_origin: self.global_search.active,
+                global_search_origin: self.capture_search_open_origin(),
                 grid_open_effects: auto_fullscreen.then(|| GridVirtualOpenEffects {
                     reading_history_return_from: self.reading_history_return_from.clone(),
                     suppress_rating_filter: false,
@@ -37002,7 +37055,7 @@ impl App {
                     dfs_continuation: None,
                     favsearch_origin: self.favsearch.active,
                     tag_view_origin: self.tag_view.active,
-                    global_search_origin: self.global_search.active,
+                    global_search_origin: self.capture_search_open_origin(),
                     grid_open_effects: None,
 
                     restore_intent: crate::app::StartupListIntent::ExplicitList,
@@ -37136,8 +37189,8 @@ impl App {
             self.stack_mode_requested = false;
             if !self.navigation_scope.is_detached_physical() {
                 crate::thumb_loader::bump_catchup_epoch();
-                let _ = crate::pdf_loader::bump_render_context_epoch();
             }
+            self.bump_render_epoch_only();
         }
     }
 
@@ -37186,7 +37239,7 @@ impl App {
         let search_origin = (
             self.favsearch.active,
             self.tag_view.active,
-            self.global_search.active,
+            self.capture_search_open_origin(),
         );
         let install = move |app: &mut Self| {
             app.finish_direct_pdf_visible_adoption(path, owner);
@@ -48142,6 +48195,13 @@ impl App {
     }
 
     fn current_bookmark_panel_thumbnail_pages(&mut self) -> Vec<usize> {
+        // An inactive consumer owns no demand; resolving its spread can read cold rotations.
+        if !self.adjustment_mode.is_open()
+            || self.settings.fullscreen_left_panel_tab
+                != crate::settings::FullscreenLeftPanelTab::Bookmarks
+        {
+            return Vec::new();
+        }
         let Some(fs_idx) = self.fullscreen_idx else {
             return Vec::new();
         };
@@ -48150,10 +48210,7 @@ impl App {
             self.resolve_visible_spread_pair(fs_idx),
             crate::ui_fullscreen::SpreadPair::Double { .. }
         );
-        if !self.fullscreen_adjustment_panel_draw_reachable(fs_idx, is_video, is_spread_double)
-            || self.settings.fullscreen_left_panel_tab
-                != crate::settings::FullscreenLeftPanelTab::Bookmarks
-        {
+        if !self.fullscreen_adjustment_panel_draw_reachable(fs_idx, is_video, is_spread_double) {
             return Vec::new();
         }
         // Image-folder eligibility scans every materialized item. Repeating that scan in the
@@ -50424,15 +50481,12 @@ impl App {
         }
         self.wake_all_workers();
         self.cancel_token = Arc::new(AtomicBool::new(false));
-        // catchup / PDF render epoch は crate-global。detached context のロードで bump すると
-        // main 文脈の queue 済み PDF render が stale 扱いで prune され、requested が in-flight の
-        // まま固着する (swap 時の requested clear を撤去した P2-8 以降は自己回復しない)。
-        // detached 側は epoch prune の恩恵 (Ctrl+↑↓ 高速フォルダめくりの旧ジョブ破棄) を
-        // 必要としないので main 文脈のロードに限定する (review-v2.3.0 P2-9)。
+        // Catchup keeps its existing main-only contract. PDF invalidation belongs
+        // to the projected viewer, including a detached viewer replacing its list.
         if !self.detached_viewer_context_is_mounted() {
             crate::thumb_loader::bump_catchup_epoch();
-            let _ = crate::pdf_loader::bump_render_context_epoch();
         }
+        self.bump_render_epoch_only();
     }
 
     /// 現在 detached viewer context (独立/ピン/Book) がマウント中 (= bundle swap で App が
@@ -50456,7 +50510,32 @@ impl App {
     ///
     /// items 差し替え経路の共通 (docs/pdf-pool-context-epoch-plan.md Phase 4)。
     pub(crate) fn bump_render_epoch_only(&mut self) {
-        let _ = crate::pdf_loader::bump_render_context_epoch();
+        self.pdf_render_epoch.advance();
+        self.pdf_visible_promotion = PdfVisiblePromotionState::Idle;
+    }
+
+    /// UI admission stamps the projected context once. Derived worker requests
+    /// inherit this immutable ticket; the request owner assigns its ID at begin.
+    fn attach_viewer_thumbnail_context(&self, req: &mut LoadRequest) {
+        req.input_seq = self.input_seq;
+        req.items_gen = self.items_generation;
+        req.pdf_render_validity =
+            crate::pdf_loader::PdfRenderValidity::Viewer(self.pdf_render_epoch.snapshot());
+    }
+
+    fn promote_viewer_pdf_keys(
+        &mut self,
+        keys: HashSet<String>,
+    ) -> crate::pdf_loader::PromoteStats {
+        let ticket = self.pdf_render_epoch.snapshot();
+        let target = crate::pdf_loader::PdfRenderValidity::Viewer(ticket.clone());
+        let stats = crate::pdf_loader::promote_to_high_normal(&keys, &target);
+        self.pdf_visible_promotion = PdfVisiblePromotionState::Tracking {
+            ticket,
+            keys,
+            retry_needed: stats.not_found_keys > 0,
+        };
+        stats
     }
 
     /// condvar.wait() 中の全ワーカーを起床させる。
@@ -51718,9 +51797,7 @@ impl App {
             })
             .collect::<HashSet<_>>();
         if !pdf_keys.is_empty() {
-            let stats = crate::pdf_loader::promote_to_high_normal(&pdf_keys);
-            self.promote_retry_pending = stats.not_found_keys > 0;
-            self.last_promoted_visible_keys = Some(pdf_keys);
+            self.promote_viewer_pdf_keys(pdf_keys);
         }
         if pages.iter().any(|idx| self.requested.contains_key(idx)) {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
@@ -51797,12 +51874,8 @@ impl App {
         );
     }
 
-    /// Interim non-PDF consumer; PDF admission/promotion connects after §1.377 is merged.
-    pub(crate) fn ensure_non_pdf_page_overview_requests(
-        &mut self,
-        ctx: &egui::Context,
-        pages: &[usize],
-    ) {
+    /// Gallery uses the same context-stamped thumbnail admission and PDF promotion as the strip.
+    pub(crate) fn ensure_page_overview_requests(&mut self, ctx: &egui::Context, pages: &[usize]) {
         self.ensure_foreground_thumbnail_requests(
             ctx,
             pages,
@@ -51844,7 +51917,7 @@ impl App {
             if overview {
                 if !matches!(
                     self.items.get(idx),
-                    Some(GridItem::Image(_) | GridItem::ZipImage { .. })
+                    Some(GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. })
                 ) {
                     continue;
                 }
@@ -51868,17 +51941,19 @@ impl App {
                 _ => None,
             })
             .collect::<HashSet<_>>();
-        if !overview && !pdf_keys.is_empty() {
-            let stats = crate::pdf_loader::promote_to_high_normal(&pdf_keys);
-            self.promote_retry_pending = stats.not_found_keys > 0;
-            self.last_promoted_visible_keys = Some(pdf_keys);
+        if !pdf_keys.is_empty() {
+            self.promote_viewer_pdf_keys(pdf_keys);
         }
         if request_pages.iter().any(|idx| {
             self.requested.contains_key(idx)
                 || (overview
                     && matches!(
                         self.items.get(*idx),
-                        Some(GridItem::Image(_) | GridItem::ZipImage { .. })
+                        Some(
+                            GridItem::Image(_)
+                                | GridItem::ZipImage { .. }
+                                | GridItem::PdfPage { .. }
+                        )
                     )
                     && matches!(
                         self.thumbnails.get(*idx),
@@ -51968,9 +52043,7 @@ impl App {
             req.force_cache = true;
         }
         req.priority = true;
-        req.input_seq = self.input_seq;
-        req.items_gen = self.items_generation;
-        req.context_epoch = crate::pdf_loader::current_render_context_epoch();
+        self.attach_viewer_thumbnail_context(&mut req);
         let is_heavy = self.items.get(idx).is_some_and(|item| item.is_heavy_io());
         let queue = if is_heavy {
             self.heavy_io_queue.clone()
@@ -52372,11 +52445,7 @@ impl App {
                 deferred_pdf_prefetch = true;
                 continue;
             }
-            req.input_seq = self.input_seq;
-            req.items_gen = self.items_generation;
-            // PDF render pool の context epoch を UI スレッドで焼き付ける (TOCTOU 防止)。
-            // background 経路は LoadRequest::default() の 0 のまま (= epoch チェック対象外)。
-            req.context_epoch = crate::pdf_loader::current_render_context_epoch();
+            self.attach_viewer_thumbnail_context(&mut req);
             let is_heavy = self.items.get(i).is_some_and(|it| it.is_heavy_io());
             // perf: エンキューイベント (タスク種別 + 優先度 + 相関 seq)
             self.attach_edit_preview_to_request(&mut req);
@@ -52738,13 +52807,12 @@ impl App {
         //   (a) keys が前回と異なる (= スクロールで visible が変わった)
         //   (b) 前回の promote で `not_found_keys > 0` だった (= まだ pool に入ってない key が
         //       後から enqueue されるのを待つ)
-        let keys_changed = self.last_promoted_visible_keys.as_ref() != Some(&visible_keys);
-        let retry_due_to_pending = self.promote_retry_pending && !visible_keys.is_empty();
-        if (keys_changed || retry_due_to_pending) && !visible_keys.is_empty() {
-            let stats = crate::pdf_loader::promote_to_high_normal(&visible_keys);
-            self.last_promoted_visible_keys = Some(visible_keys);
-            // not_found が残っているなら次フレームでも再試行する (= retry latch を立てる)
-            self.promote_retry_pending = stats.not_found_keys > 0;
+        let ticket = self.pdf_render_epoch.snapshot();
+        if self
+            .pdf_visible_promotion
+            .needs_attempt(&ticket, &visible_keys)
+        {
+            let stats = self.promote_viewer_pdf_keys(visible_keys);
             if crate::perf::is_enabled() && (stats.promoted > 0 || stats.not_found_keys > 0) {
                 crate::perf::event(
                     "pdf",
@@ -52761,8 +52829,7 @@ impl App {
         } else if visible_keys.is_empty() {
             // visible が空になった (= PDF 無しフォルダや scroll off で keep_set 0 など)
             // 状態を完全クリア
-            self.last_promoted_visible_keys = None;
-            self.promote_retry_pending = false;
+            self.pdf_visible_promotion = PdfVisiblePromotionState::Idle;
         }
     }
 
@@ -53008,11 +53075,7 @@ impl App {
             }
             req.relative_page_provenance = self.relative_page_provenance_for_idx(i);
             // 通常エンキューと同じく現世代を載せる (旧 items への upgrade 混入防止)
-            req.input_seq = self.input_seq;
-            req.items_gen = self.items_generation;
-            // PDF render pool の context epoch を UI スレッドで焼き付ける (TOCTOU 防止)。
-            // idle upgrade も UI 経路なので current epoch を使う。
-            req.context_epoch = crate::pdf_loader::current_render_context_epoch();
+            self.attach_viewer_thumbnail_context(&mut req);
             upgrade_reqs.push(req);
         }
 
@@ -53291,7 +53354,7 @@ impl App {
         // Ctrl+G 絞り込みビュー中なら 1 段上げる (current_path != container_root) か、
         // Aggregated に戻る。自由な fs 遡行は許さない (docs §10.3)。
         if self.global_search.active {
-            if self.global_search.drill.is_some() {
+            if self.global_search.drill.is_some() || self.everything_has_physical_child() {
                 self.drill_back_one_level();
                 return None;
             }
@@ -60455,6 +60518,7 @@ impl App {
     /// Retire local viewer-open intentions admitted before Remote began acquiring ownership.
     /// A late PDF/ZIP completion may still install list data, but it cannot reopen a viewer.
     pub(crate) fn invalidate_local_viewer_open_intents_for_remote(&mut self) {
+        self.cancel_everything_search();
         self.cancel_unresolved_open_for_remote_session();
         self.cancel_archive_view_open_for_remote_session();
         self.cancel_saved_group_open_for_other_nav();
@@ -73626,10 +73690,12 @@ impl App {
         self.projected_viewer_context_id().serial()
     }
 
-    pub(crate) fn fs_pdf_render_context_epoch(_priority: crate::pdf_loader::JobPriority) -> u64 {
+    pub(crate) fn fs_pdf_render_validity(
+        _priority: crate::pdf_loader::JobPriority,
+    ) -> crate::pdf_loader::PdfRenderValidity {
         // Fullscreen fs_load is scoped to the open viewer context, not to the main
         // grid context. fs_pending cancel tokens own its lifetime.
-        0
+        crate::pdf_loader::PdfRenderValidity::Unscoped
     }
 
     pub(crate) fn fs_pdf_render_error_is_cancel_like(
@@ -73979,7 +74045,7 @@ impl App {
         } else {
             crate::pdf_loader::JobPriority::Normal
         };
-        let pdf_context_epoch = Self::fs_pdf_render_context_epoch(pdf_priority);
+        let pdf_render_validity = Self::fs_pdf_render_validity(pdf_priority);
 
         let (tx, rx) = mpsc::channel::<FsLoadResult>();
         let perf_key = self.perf_item_key(idx);
@@ -74159,7 +74225,7 @@ impl App {
                     // this scheduler permit until the IPC reply arrives.
                     None,
                     pdf_priority,
-                    pdf_context_epoch,
+                    pdf_render_validity,
                     // フルスクリーンは fs_cache (memory) のみで永続 cache 無し。
                     // Critical 経路は即時応答 UX 優先 → AbortOnCancel。
                     crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
@@ -74869,7 +74935,7 @@ impl App {
                 // scheduler permit remains held until this call returns.
                 None,
                 job_priority,
-                Self::fs_pdf_render_context_epoch(job_priority),
+                Self::fs_pdf_render_validity(job_priority),
                 crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
             ) {
                 Ok(crate::pdf_loader::RenderResult {
@@ -81382,7 +81448,10 @@ impl App {
 
     pub(crate) fn refresh_fullscreen_pdf_promotion(&mut self) {
         let Some(attempt) = self.refresh_fullscreen_pdf_promotion_with(|keys| {
-            crate::pdf_loader::promote_fullscreen_to_high_normal(keys)
+            crate::pdf_loader::promote_fullscreen_to_high_normal(
+                keys,
+                &crate::pdf_loader::PdfRenderValidity::Unscoped,
+            )
         }) else {
             return;
         };
@@ -93063,6 +93132,13 @@ impl App {
         }
         // PDF pool の遅延初期化失敗 notice。poll は pool 自体を初期化しない。
         self.poll_pdf_worker_notice();
+        if crate::pdf_loader::take_render_epoch_maintenance_failure() {
+            crate::logger::log("PDF render epoch maintenance worker disconnected".to_owned());
+            self.show_feedback_toast_on(
+                "PDFサムネイルの旧要求を整理できませんでした。再起動してください".to_owned(),
+                ActionSurface::MainWindow,
+            );
+        }
         self.show_pdf_worker_notice_dialog(ctx);
         self.poll_susie_worker_notice();
         self.show_susie_worker_notice_dialog(ctx);
@@ -93310,6 +93386,8 @@ impl App {
         }
 
         // ── Ctrl+G: グローバルメタ検索バー表示 (docs §10.3) ──────────
+        self.dispatch_everything_search_shortcut(ctx);
+
         if !self.address_has_focus
             && !main_viewer_blocked
             && !self.any_dialog_open()
@@ -96113,7 +96191,7 @@ fn apply_folder_thumb_pin(
             priority: base_req.priority,
             input_seq: base_req.input_seq,
             items_gen: base_req.items_gen,
-            context_epoch: base_req.context_epoch,
+            pdf_render_validity: base_req.pdf_render_validity.clone(),
             pinned_only: None,
             epub_pin_fallback: None,
             force_cache: false,
@@ -96220,7 +96298,7 @@ fn apply_folder_thumb_pin(
         priority: base_req.priority,
         input_seq: base_req.input_seq,
         items_gen: base_req.items_gen,
-        context_epoch: base_req.context_epoch,
+        pdf_render_validity: base_req.pdf_render_validity.clone(),
         pinned_only: None,
         epub_pin_fallback,
         force_cache: false,

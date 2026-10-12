@@ -56781,9 +56781,9 @@ mod tests {
         assert_eq!(submenu.width(), root.width());
         assert_eq!(
             root.height() - submenu.height(),
-            FS_OVERFLOW_PANEL_ROW_HEIGHT
+            2.0 * FS_OVERFLOW_PANEL_ROW_HEIGHT
         );
-        assert_eq!(root.height(), 348.0);
+        assert_eq!(root.height(), 396.0);
         assert_eq!(submenu.height(), 300.0);
         assert_eq!(root.width(), FS_OVERFLOW_PANEL_WIDTH);
 
@@ -56841,6 +56841,13 @@ mod tests {
                     .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
                     .show(ctx, |ui| {
                         let root_rows = vec![
+                            FsOverflowPanelRow {
+                                item: FullscreenOverflowItemId::PageOverview,
+                                label: "ページ一覧 [O]".into(),
+                                status: String::new(),
+                                enabled: true,
+                                disabled_reason: None,
+                            },
                             FsOverflowPanelRow {
                                 item: FullscreenOverflowItemId::SpreadAdjustment,
                                 label: "見開きの調整".into(),

@@ -88,7 +88,27 @@ pub struct VideoPinDb {
     #[allow(dead_code)]
     conn: rusqlite::Connection,
     instance: u64,
-    mutation_revision: AtomicU64,
+    mutation_revision: std::sync::Arc<AtomicU64>,
+    #[cfg(test)]
+    bulk_lookup_calls: std::cell::Cell<usize>,
+}
+
+/// Readonly worker resource; the SQLite connection and write authority stay in
+/// VideoPinDb. Cloning this publication cannot mutate the store or its stamp.
+#[derive(Clone)]
+pub(crate) struct VideoPinReadSource {
+    pub(crate) path: PathBuf,
+    instance: u64,
+    revision: std::sync::Arc<AtomicU64>,
+}
+
+impl VideoPinReadSource {
+    pub(crate) fn mutation_stamp(&self) -> VideoPinMutationStamp {
+        VideoPinMutationStamp {
+            instance: self.instance,
+            revision: self.revision.load(Ordering::Acquire),
+        }
+    }
 }
 
 impl VideoPinDb {
@@ -135,7 +155,9 @@ impl VideoPinDb {
         Self {
             conn,
             instance: NEXT_VIDEO_PIN_DB_INSTANCE.fetch_add(1, Ordering::Relaxed),
-            mutation_revision: AtomicU64::new(0),
+            mutation_revision: std::sync::Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            bulk_lookup_calls: std::cell::Cell::new(0),
         }
     }
 
@@ -144,6 +166,22 @@ impl VideoPinDb {
             instance: self.instance,
             revision: self.mutation_revision.load(Ordering::Acquire),
         }
+    }
+
+    /// SQLite's cached connection filename; no query, path discovery, or FS I/O.
+    /// An in-memory store has no independently openable worker source.
+    pub(crate) fn read_source(&self) -> Option<VideoPinReadSource> {
+        let path = self.conn.path().filter(|path| !path.is_empty())?;
+        Some(VideoPinReadSource {
+            path: PathBuf::from(path),
+            instance: self.instance,
+            revision: std::sync::Arc::clone(&self.mutation_revision),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bulk_lookup_calls_for_test(&self) -> usize {
+        self.bulk_lookup_calls.get()
     }
 
     /// DB ファイルのパス
@@ -195,6 +233,8 @@ impl VideoPinDb {
         I: IntoIterator<Item = P>,
         P: AsRef<Path>,
     {
+        #[cfg(test)]
+        self.bulk_lookup_calls.set(self.bulk_lookup_calls.get() + 1);
         use std::collections::HashMap;
         // 入力 PathBuf を保持しつつ正規化キーを作る。同 path が重複したら最初の出現を保持。
         let mut key_to_path: HashMap<String, PathBuf> = HashMap::new();

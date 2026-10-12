@@ -384,10 +384,22 @@ dispatch 可否とは別の状態遷移であり、取消後の unfocused pass �
 
 ## グリッドビュー (フルスクリーン外) 共通
 
+Everything ファイル名検索は `GlobalEverythingSearch` / `Grid` / `Press`、既定
+`Ctrl+R`。名前の Global は検索範囲を表し、fullscreen の Global scope へは登録しない。
+main の一覧からだけ開き、text focus / IME（focus recovery を含む）/ modal / Remote lock
+中には発火しない。画像・egui動画/音声・native動画/音声・detached viewer の検索起動には
+使わず、native 転送 snapshot に含めない。画像 fullscreen の R 検出 probe は action の
+dispatch ではない。`Ctrl+G/S/E` の既存割当は維持する。メニュー
+`MenuCommandId::GlobalEverythingSearch`（ファイル → Everything ファイル名検索…）も
+同じ受付へ接続し、caption は実効 keymap の先頭キーを表示する。操作カスタマイズでは
+サムネイル一覧の操作として変更・解除できる。Everything の入力は明示送信とし、IME確定の
+Enter では送信せず、確定後の Enter または「検索」で送信する。
+
 `GridColumnCount11..20` のリング・マウス割り当てを旧版から守るには、公開時にアプリ版番号を v4.1.0 より上げることが前提。`settings.db` は保存時の版番号が実行版より新しければ、旧版の起動時に読み込み前の `Incompatible` 判定で保存を止める。同じ v4.1.0 の開発ビルド間ではこの判定が働かず、旧版の `sanitize()` が未知のリング・マウス操作を `None` に置き換えて保存し得る。版番号の更新はリリース作業で行う。
 
 | キー | 動作 |
 |---|---|
+| <kbd>Ctrl</kbd>+<kbd>R</kbd> | main の一覧から Everything ファイル名検索バーを開く。Action: `GlobalEverythingSearch`。閉じる操作は×/Esc。取得・準備中は取消可能なmainのモーダルを使い、完成した一覧だけを採用する |
 | <kbd>?</kbd> (既定) | 現在のサムネイル一覧コンテキストで使えるショートカット一覧を表示する。Action: `HelpShowContextShortcuts`。keymap 化済み操作は現在読み込まれている割り当て済みのものを表示し、固定扱いのナビゲーションキーは別枠で表示する |
 | <kbd>Backspace</kbd> | 親フォルダへ。Action: `GridParentFolder`。ドライブルート (`C:\` など) ではドライブ一覧へ戻り、元ドライブを選択状態にする。検索 (Ctrl+S / Ctrl+G) 中は検索仮想階層を 1 段ドリルアップ、最上位 (集約ビュー / 結果一覧) では no-op。タグビュー (Ctrl+T) 中は、検索結果から開いたフォルダ / ZIP / PDF / 変換アーカイブを 1 段戻り、検索結果一覧では no-op (検索を閉じるには <kbd>Esc</kbd> / 検索バーの <kbd>×</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd>・<kbd>Ctrl</kbd>+<kbd>S</kbd>・<kbd>Ctrl</kbd>+<kbd>T</kbd> 再押下)。Ctrl+F フィルタ中は、フィルタを実行したフォルダだけ親移動を no-op にする。検索結果から子フォルダへ入った後は通常どおり親へ戻れる |
 | <kbd>Enter</kbd> | 選択アイテムを開く。Action: `GridOpenSelected`。別ウィンドウセッションが同じ項目を既に表示中の場合は再オープンせず、必要に応じて別ウィンドウを前面化する |

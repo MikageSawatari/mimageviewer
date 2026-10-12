@@ -557,29 +557,45 @@ fn still_seek_f5_unknown_side_stops_then_worker_rotation_grows_it() {
 
 #[test]
 fn still_seek_f5_spread_cold_cache_and_invalidation_never_read_sql_on_ui() {
-    for spread in [
-        crate::settings::SpreadMode::Ltr,
-        crate::settings::SpreadMode::Rtl,
+    use crate::settings::FullscreenLeftPanelTab;
+    use crate::ui_helpers::MetadataPanelOpenState;
+
+    for (panel, tab) in [
+        (
+            MetadataPanelOpenState::Closed,
+            FullscreenLeftPanelTab::Bookmarks,
+        ),
+        (
+            MetadataPanelOpenState::ByPointer,
+            FullscreenLeftPanelTab::Adjustment,
+        ),
     ] {
-        let mut app = still_seek_edge_test_app();
-        let ctx = egui::Context::default();
-        load_textures(&mut app, &ctx, &[Rotation::Cw90; 10]);
-        app.spread_mode = spread;
-        for idx in 0..10 {
-            app.rotation_db
-                .as_ref()
-                .unwrap()
-                .set_key(&app.page_path_key(idx).unwrap(), Rotation::Cw90)
-                .unwrap();
-        }
-        for _ in 0..2 {
-            app.clear_rotation_cache_for_reload();
-            overlay_output(&mut app, &ctx, None);
-            assert!(app.rotation_cache.is_empty());
-            app.rotation_cache.wait_for_result_for_test();
-            overlay_output(&mut app, &ctx, None);
+        for spread in [
+            crate::settings::SpreadMode::Ltr,
+            crate::settings::SpreadMode::Rtl,
+        ] {
+            let mut app = still_seek_edge_test_app();
+            let ctx = egui::Context::default();
+            load_textures(&mut app, &ctx, &[Rotation::Cw90; 10]);
+            app.spread_mode = spread;
+            app.adjustment_mode = panel;
+            app.settings.fullscreen_left_panel_tab = tab;
             for idx in 0..10 {
-                assert_eq!(app.rotation_cache.get(&idx), Some(&Rotation::Cw90));
+                app.rotation_db
+                    .as_ref()
+                    .unwrap()
+                    .set_key(&app.page_path_key(idx).unwrap(), Rotation::Cw90)
+                    .unwrap();
+            }
+            for _ in 0..2 {
+                app.clear_rotation_cache_for_reload();
+                overlay_output(&mut app, &ctx, None);
+                assert!(app.rotation_cache.is_empty());
+                app.rotation_cache.wait_for_result_for_test();
+                overlay_output(&mut app, &ctx, None);
+                for idx in 0..10 {
+                    assert_eq!(app.rotation_cache.get(&idx), Some(&Rotation::Cw90));
+                }
             }
         }
     }

@@ -27,6 +27,11 @@ UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot
 更新後は `tests/snapshots/*.png` の差分を必ず目視確認してからコミットする。
 git diff のバイナリ比較では変化の意図 (改善なのか回帰なのか) は判断できない。
 
+閲覧中のページ一覧（§1.340）は専用6枚に加え、unit snapshotの
+`fullscreen_overflow_panel_root`で「ページ一覧 [O]」を含む7行の入口を検査する。
+行のtouch targetは48pxを維持し、狭い面では共通のscroll／clampを使う。
+rootの入口追加で変わったPNGは1枚だけを更新して目視確認し、navigator submenuの基準は維持する。
+
 本別見開き調整 (§1.364 D2) は`spread_shift_hud_{resolved,unresolved}_{normal,narrow}_{light,dark}`の
 8ケースを定義する。normalは720×500、narrowは320×480。実HUDの調整submenuと調整の印を
 使い、resolvedの基点jump・解除・全体checkboxの到達性を確認する。unresolvedはjumpのみ無効にし、

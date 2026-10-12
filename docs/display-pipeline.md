@@ -5,6 +5,13 @@
 
 ---
 
+PDF thumbnailの一覧失効・優先昇格はviewer owner/要求世代/keyに限定する
+（未リリースPDF-EPOCH-OWNERSHIP）。seek/hoverもViewer ticketをUI admissionで捕捉し、
+派生workerで更新しない。fullscreen本体はUnscoped＋既存fs_pending cancel/generation、
+そのpromotionはUnscoped jobsだけをfoundと数える。兄弟同PDF/pageの表示要求は失効しない。
+GPU upload、ThumbnailRequests、Canceled/SourcePixels/Finalizedの既存採用契約は維持する。
+[詳細](pdf-render-epoch-ownership-plan.md)。
+
 ### 音声セルの代表画像 (§1.347、2026-10-08)
 
 同名補助画像の採用は表示行の種類投影から独立している。画像種類を隠しても既存の候補順で
@@ -442,7 +449,7 @@ RotationDb read-only open / SELECT 回数が増えないこと、未確定セル
 向き、失効中の release 入力、終了・context 交換、実テクスチャの UV と矩形を検査する。
 `still_seek_real_overlay_rotation_*` の PNG 6 枚で本体・列・吹き出しを同時に比較する。
 
-### 1.6.1 閲覧中のページ一覧 (§1.340、先行実装)
+### 1.6.1 閲覧中のページ一覧 (§1.340、接続・検証補完済み)
 
 通常 fullscreen／メイン内閲覧／F12連動窓／独立窓は既存surface内で
 `ui_page_overview::draw_page_overview` を使う。現在の可視実ページ列を仮想行として描き、
@@ -460,8 +467,11 @@ resize／DPI変更後の新セルもmetadataからtargetを解決する。full-i
 
 前面需要は同一viewerのstrip／hoverと一覧のいずれか一つをdispatcherで選び、
 可視セルを先に、上下overscanを後に要求する。非表示stripが一覧のexact setを解除しない。
-現行の一覧新規要求は通常画像／ZIP画像に限る。PDF／EPUBは§1.377のmaster取り込み後に
-既存viewer ticket付き要求・昇格へ接続する。[所有・入力・統合の正本](detached-book-page-overview-plan.md)。
+一覧新規要求は通常画像／ZIP画像／PDFページ（変換済みEPUBを含む）を共通dispatcherへ渡す。
+PDFは§1.377の既存viewer ticket付き要求・owner-scoped昇格へ接続済み。
+構成由来の白紙補助表示は§1.242未統合のadapter契約に留まり、fixtureの描画を現行sourceの
+構成採用とは扱わない。full 1回で見つかった環境／fixture／回帰修正、補完検証実数・実機残工程は
+[所有・入力・統合の正本§20](detached-book-page-overview-plan.md) を参照する。
 
 ### 1.7 サムネイル画質ダイアログのプレビュー寸法
 

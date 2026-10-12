@@ -1189,10 +1189,13 @@ fn visibility_search_notice_keeps_nonterminal_search_active() {
     app.global_search.last_executed = "pages".into();
     app.global_search.done = false;
     let (tx, rx) = crossbeam_channel::unbounded();
-    app.global_search.pending = Some(crate::indexer_manager::SearchHandle {
-        cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        rx,
-    });
+    app.global_search.pending = Some(
+        crate::indexer_manager::SearchHandle {
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            rx,
+        }
+        .into(),
+    );
     tx.send(crate::global_search::SearchStreamEvent::Batch {
         hits: Vec::new(),
         scanned_candidates: 1,

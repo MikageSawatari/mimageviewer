@@ -3663,5 +3663,19 @@ fn section1335_tray_image_folder_book_setting_changed_in_f12_keeps_backspace_exp
     assert_eq!(env.current_folder.as_ref(), Some(&book));
     assert_eq!(env.items[env.selected.unwrap()].name(), "b.png");
     assert_eq!(env.settings.startup_list_restore, before);
+    // Tray persistence stays asynchronous; inspect the admitted position only after its ACK.
+    let writer = env.book_resume_writer.as_ref().expect("book-resume writer");
+    let read = writer
+        .read_position_after(
+            &crate::path_key::normalize(&book),
+            writer.watermarks().admitted,
+        )
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("book-resume writer acknowledgment");
+    assert!(read.status.is_ok(), "{:?}", read.status);
+    assert_eq!(
+        read.position.as_ref().map(|position| position.page),
+        Some(1)
+    );
     assert_eq!(env.resume_page_for_container(), Some(1));
 }

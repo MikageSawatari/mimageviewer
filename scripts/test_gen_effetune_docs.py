@@ -3,6 +3,7 @@ import contextlib
 import importlib.util
 import io
 from pathlib import Path
+import re
 import shutil
 import unittest
 import uuid
@@ -301,6 +302,7 @@ class GenerationTests(unittest.TestCase):
     def test_check_exit_status_and_version_fallback_without_writes(self):
         with workspace_temporary_directory() as temporary:
             root = Path(temporary)
+            (root / '.htaccess').write_bytes(b'<IfModule mod_rewrite.c>\n  RewriteEngine On\n</IfModule>\n')
             with patch.object(docs, 'ROOT', root), patch.object(docs, 'MANUAL', root / 'manual'), patch.object(docs, 'generate', return_value={'index.html': b'current'}), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 def run(*args):
                     with patch('sys.argv', ['gen-effetune-docs.py', *args]):
@@ -333,7 +335,100 @@ class GenerationTests(unittest.TestCase):
                 self.assertEqual(run('--version', 'v0.12.0'), 0)
                 self.assertTrue((root / 'manual/effetune/v0.13.0/index.html').exists())
                 self.assertEqual(entry.read_bytes(), docs.entry_page('v0.13.0'))
-                self.assertEqual(output.read_bytes(), b'current')  # Older version remains intact.
+                self.assertEqual(output.read_bytes(), b'current')  # Check mode flags old versions without deleting them.
+                self.assertEqual(run('--check'), 1)
+                shutil.rmtree(output.parent)
+                self.assertEqual(run('--check'), 0)
+                htaccess = root / '.htaccess'
+                original = htaccess.read_bytes()
+                self.assertIn(b'/v0.13.0/%1 [R=301,L]', original)
+                htaccess.write_bytes(original.replace(b'v0.13.0/%1', b'v0.12.0/%1'))
+                self.assertEqual(run('--check'), 1)
+                self.assertNotEqual(htaccess.read_bytes(), original)
+                self.assertEqual(run(), 0)
+                self.assertEqual(htaccess.read_bytes(), original)
+                self.assertEqual(run('--check'), 0)
+
+    def test_check_rejects_empty_and_non_semver_version_directories_without_writes(self):
+        with workspace_temporary_directory() as temporary:
+            root = Path(temporary)
+            htaccess = root / '.htaccess'
+            htaccess.write_bytes(b'<IfModule mod_rewrite.c>\n</IfModule>\n')
+            with patch.object(docs, 'ROOT', root), patch.object(docs, 'MANUAL', root / 'manual'), patch.object(docs, 'generate', return_value={'index.html': b'current'}), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                def run(*args):
+                    with patch('sys.argv', ['gen-effetune-docs.py', '--version', 'v0.13.0', *args]):
+                        return docs.main()
+                self.assertEqual(run(), 0)
+                base = root / 'manual/effetune'
+                (base / 'notes').mkdir()
+                self.assertEqual(run('--check'), 0)
+                before = htaccess.read_bytes()
+                for name in ['v0.12.0', 'v0.14.0-beta.1', 'v-archive']:
+                    old = base / name
+                    old.mkdir()
+                    self.assertEqual(run('--check'), 1)
+                    self.assertTrue(old.is_dir())
+                    self.assertEqual(htaccess.read_bytes(), before)
+                    old.rmdir()
+                self.assertEqual(run('--check'), 0)
+
+
+class RedirectTests(unittest.TestCase):
+    HTACCESS = b'<IfModule mod_rewrite.c>\n  RewriteEngine On\n  RewriteCond %{HTTP_HOST} ^www\\.mikage\\.to$ [NC]\n  RewriteRule ^(.*)$ https://mikage.to/mimageviewer/$1 [R=301,L]\n</IfModule>\n# Other configuration\n'
+
+    def test_single_redirect_rule_current_files_and_removed_page_fallback(self):
+        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.13.0')
+        lines = [line.split() for line in docs.redirect_block('v0.13.0', output).splitlines() if line.strip().startswith('Rewrite')]
+        keep, fallback, rule = lines
+        self.assertEqual(keep[0:2], ['RewriteCond', '$1'])
+        self.assertEqual(keep[3], '[OR]')
+        self.assertEqual(fallback[0:2], ['RewriteCond', 'index.html'])
+        self.assertEqual(rule[0], 'RewriteRule')
+        self.assertEqual(rule[3], '[R=301,L]')
+        self.assertEqual(rule[2], 'https://mikage.to/mimageviewer/manual/effetune/v0.13.0/%1')
+
+        def target(path):
+            match = re.fullmatch(rule[1], path)
+            if not match:
+                return None
+            # Apache evaluates the rule first, then OR conditions with short
+            # circuiting; %1 is the last matching condition's capture.
+            condition = re.fullmatch(keep[2], match[1] or '') or re.fullmatch(fallback[2], fallback[1])
+            return rule[2].replace('%1', condition[1])
+
+        base = 'manual/effetune/'
+        current = 'https://mikage.to/mimageviewer/manual/effetune/v0.13.0/'
+        for version in ['v0.12.0', 'v0.11.1', 'v0.14.0', 'v1.2.3-beta.1']:
+            for name in output:
+                with self.subTest(version=version, name=name):
+                    self.assertEqual(target(base + version + '/' + name), current + name)
+            for removed in ['', '/', '/removed.html', '/nested/removed.html', '/eq-15band-peq.html/extra', '/images/missing.png']:
+                self.assertEqual(target(base + version + removed), current + 'index.html')
+        for path in ['v0.13.0', 'v0.13.0/', 'v0.13.0/index.html', 'v0.13.0/removed.html', 'index.html', 'vfoo/index.html', 'v0.12/index.html', 'v0.13.00x/index.html']:
+            self.assertIsNone(target(base + path))
+        self.assertIsNone(target('manual/other/v0.12.0/index.html'))
+
+    def test_marked_block_updates_only_generated_section_and_keeps_lf(self):
+        first = docs.updated_htaccess(self.HTACCESS, 'v0.13.0', {'index.html': b'', 'retired.html': b''})
+        self.assertEqual(docs.updated_htaccess(first, 'v0.13.0', {'retired.html': b'', 'index.html': b''}), first)
+        second = docs.updated_htaccess(first, 'v0.14.0', {'index.html': b''})
+        self.assertNotIn(b'v0.13.0', second)
+        self.assertNotIn(b'retired', second)
+        self.assertEqual(second.count(docs.REDIRECT_BEGIN.encode()), 1)
+        start = second.index(docs.REDIRECT_BEGIN.encode())
+        end = second.index(docs.REDIRECT_END.encode()) + len(docs.REDIRECT_END) + 1
+        self.assertEqual(second[:start] + second[end:], self.HTACCESS.replace(b'</IfModule>', b'\n</IfModule>'))
+        self.assertEqual(docs.updated_htaccess(self.HTACCESS.replace(b'\n', b'\r\n'), 'v0.14.0', {'index.html': b''}), second)
+        self.assertNotIn(b'\r', second)
+
+    def test_invalid_configuration_fails_instead_of_overwriting_unrelated_rules(self):
+        block = docs.redirect_block('v0.13.0', {'index.html': b''}).encode()
+        for data in [b'', self.HTACCESS * 2, self.HTACCESS + block,
+                     self.HTACCESS.replace(b'</IfModule>', docs.REDIRECT_BEGIN.encode() + b'\n</IfModule>'),
+                     self.HTACCESS.replace(b'</IfModule>', block + block + b'</IfModule>'),
+                     self.HTACCESS.replace(b'</IfModule>', block.replace(docs.REDIRECT_END.encode(), b'') + b'</IfModule>')]:
+            with self.subTest(data=data), self.assertRaises(docs.ConversionError):
+                docs.updated_htaccess(data, 'v0.13.0', {'index.html': b''})
 
 
 class SplitTests(unittest.TestCase):

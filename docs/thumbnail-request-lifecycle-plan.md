@@ -1,5 +1,11 @@
 # サムネイル要求の寿命を一つの owner に集約する（§1.360）
 
+2026-10-12 PDF-EPOCH-OWNERSHIP（未リリース）: request ID/items generationと本ownerは維持し、
+PDF queue失効の変更権限だけをviewer bundleの非Clone writerへ移す。UI admissionの
+immutable ticketをpin/RAW/EPUB/fallback/upgradeで継承する。queued staleはInterruptedから
+既存Canceled終端へ入り、兄弟同PDF/pageのrequestedを変更しない。
+[所有設計と回帰](pdf-render-epoch-ownership-plan.md)。
+
 作成: 2026-10-09。ライン A / `next-tray`、基点 `840c309ec`。
 状態: **独立設計再レビュー ACCEPT（利用者報告、2026-10-09）。実装・指定自動検証・確認build完了。
 実機検収は未実施。コミットは利用者が行う。**

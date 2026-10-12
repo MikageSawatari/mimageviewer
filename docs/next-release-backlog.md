@@ -32,14 +32,19 @@
 
 ## 1. 優先候補
 
+### 1.378 音響調整 (EffeTune) の窓をタスクバーに表示する設定 — 利用者要望 (2026-10-12)
+- **次の版に入れる (利用者 2026-10-12)**: 案 A = 窓にタスクバー表示の印を付ける (mIV のグループとは別のアイコン)。**ON/OFF の設定、既定 ON**。案 B (AppUserModelID で mIV のグループに入れる) は既存のピン留め・ジャンプリストへ影響し得るので今回は対象外。
+- 現状: EffeTune の窓は mimageviewer-vst3-host.exe が作る **owner なし**の窓 (mIV を最小化しても表示を続けるため。main HWND は参照用) で、タスクバーに出ない。音響調整ボタンは背面なら前面化、前面なら隠す (利用者が 1 回で前面化を確認)。
+- 作業: worktree mimageviewer-nexteffetune で設計・実装中。
+
 ### 1.377 PDF のサムネイル要求の取り消しが、別ウィンドウの同じ PDF の要求まで取り消す — Everything 設計の調査 (2026-10-12)
-- **次の版に入れる (利用者 2026-10-12)**: 実装・独立レビュー ACCEPT 済み (worktree mimageviewer-nexteffetune の `4510346f5`、計画 `docs/pdf-render-epoch-ownership-plan.md`)。残り = master 統合。
+- **master 統合済み (420b38a14、2026-10-12)**。`4510346f5`、計画 `docs/pdf-render-epoch-ownership-plan.md`。
 - 内容 (コードの参照、実機での再現の主張ではない): 一覧の失効で PDF レンダの世代 (`CURRENT_CONTEXT_EPOCH`) をプロセス全体で進めるため、別の viewer context の同じ PDF / ページの要求も古いとみなされて取り消され得る。優先昇格もパスとページだけで照合していた。修正は世代を所有する viewer context ごとにした。
 
 ### 1.376 起動記録 (startup-logs) が 0 バイトのまま残る起動がある — v4.6.0 でも残る (2026-10-12)
 - **次の版に入れる (利用者 2026-10-12)**。
-- 内容: `%LOCALAPPDATA%\mimageviewer\startup-logs` の core / launcher の記録が 0 バイトの起動がある (v4.4.0 で 10 件すべて、v4.6.0 の開発機でも一部)。実装担当がテストで OS error 33 (共有ロック中の書き込み) を再現している。修正は Store 用の切り分け版 (worktree mimageviewer-alloc、branch next-alloc の `90a8a9353` Fix Windows startup timeline writes with separate retention leases) にあり、master に入っていない。
-- 対応: allocator 切り替え (`0aad6cb95` など) とは分けて、記録の書き込み修正だけを取り込む。Store の起動停止の調査 ([MS Store の記録] の v4.1.0 / v4.3.0 却下) で、止まったときの手がかりになる。
+- 内容: `%LOCALAPPDATA%\mimageviewer\startup-logs` の core / launcher の記録が 0 バイトの起動がある (v4.4.0 で 10 件すべて、v4.6.0 の開発機でも一部)。実装担当がテストで OS error 33 (共有ロック中の書き込み) を再現している。**訂正 (2026-10-12、実装担当の確認)**: Store 用の切り分け版 (next-alloc の `90a8a9353`) の書き込み修正は、`642ed1ee5` で master に移植済み (v4.6.0 に入っている、`crates/startup-diagnostics/src/output.rs`、`docs/startup-diagnostics-plan.md` §10.4)。開発機で 0 バイトだったのは 10-11 19:25 と 10-12 00:22 の 2 組だけで、00:22 は v4.6.0 の配布ビルド中。ビルドやテストの短時間起動かを確認中 (worktree mimageviewer-nextfix)。
+- 対応: 短時間起動による空ファイルなら仕様として記録する。そうでなければ原因を調べる。Store の起動停止の調査 ([MS Store の記録] の v4.1.0 / v4.3.0 却下) で、止まったときの手がかりになる。
 
 ### 1.375 フォルダで Delete キーで削除すると、正しく消えた一覧がもう一度丸ごと読み直されてちらつく — 利用者の実機報告 (2026-10-12)
 - **次の版に入れる (利用者 2026-10-12)**。
@@ -48,7 +53,7 @@
 - 着手時: 削除の経路 (ごみ箱 / 完全削除、通常フォルダ / ZIP・PDF の中 / 検索結果 / コレクション) と、フォルダ監視の通知から読み直しまでの経路を列挙する。自分の操作の通知を時間で握りつぶす方法 (delay / 時間窓) ではなく、自分の操作を一意に表す印で「既に反映済み」と判定できるかを設計する。外部で同時に起きた変更を見落とさないこと。改名・移動・コピーにも同じ形がないか確認する。
 
 ### 1.374 Everything IPC を使う任意のファイル名検索を試験的に検討する — mIV スレ >>546 (2026-10-11)
-- **次の版に入れる (利用者 2026-10-12)**: 実装・独立レビュー ACCEPT 済み (worktree mimageviewer-nexteffetune、既定キー Ctrl+R、計画 `docs/everything-search-plan.md`)。残り = 実機での動作確認 → master 統合。
+- **master 統合済み (420b38a14、2026-10-12)**。既定キー Ctrl+R、計画 `docs/everything-search-plan.md`。coordinator が隔離データで実機確認 (案内 3 種・取消・取得 10,000 件・開いて戻る)。
 - 状態: **未着手。実現性を検証してから採否を決める**。USN 変更ジャーナルを mIV に直接組み込む案 (§1.374 の対象外) の代替候補。
 - 目的: Everything が既に索引したファイル名を mIV から素早く探し、結果を mIV の一覧・サムネイル・閲覧操作で扱えるか試す。既存の Ctrl+S/Ctrl+G、タグ・レーティング等の mIV 索引は置き換えない。
 - 試験案: 新しいキー割り当て可能な操作とメニュー導線から検索を開き、ローカルで起動中の Everything へ IPC / 公式 SDK で問い合わせる。返った実ファイルのパスを mIV 対応形式に絞り、既存の仮想検索結果一覧へ渡してサムネイルを非同期生成する。まずは問い合わせ時点の結果を表示する単発検索に限定し、常時追従は対象外。既定キーは競合を確認して決める。
@@ -219,7 +224,8 @@
 - **R5決定 (2026-10-12)**: 利用者は既定キーを **O（Overview）** に確定。R4 `7d0d0cf0a` の再レビューP1を受け、coordinatorは一覧からの選択を通常ページ移動と同じ扱いにする判断を採用。Grid保持は一覧閲覧中／取消に限定し、選択後は通常／連動F12で既存のGrid追従、独立窓では既存のmain非干渉に従う。R4の選択後Grid保持案・キー選択待ちを置き換え、専用のGrid同期抑止／着地効果分離は作らない。R5設計へ反映済み、再レビュー待ち・未実装。
 - **R5 ACCEPT／T1実装 (2026-10-12)**: `a3bb1775b` は独立レビューACCEPT（P1/P2/P3なし）、ClaudeCode側も構造的修正へ合意し、利用者が実装開始を指示。T1純粋state／layout／targetは16 tests・fmt・通常／portable check成功、独立完了レビューACCEPT。UI／キー／worker接続は未実装。T2のPDF promotionが同keyの兄弟／Remote jobへ作用する前提不足を確認し、設計§8.2／§10に従い[限定案（§18）](detached-book-page-overview-plan.md#18-t2-pdf昇格は1377の既存owner-scoped-apiへ接続する2026-10-12決定)を記載して停止。独立reviewerは案へ合意済み、ClaudeCode側の追加境界合意待ち。test-full・確認build・製品起動・コミットはまだ行っていない。
 - **§1.377再利用の決定 (2026-10-12)**: T1はcoordinatorが `588fe1d76` としてコミット。PDF owner-scoped promotionはnext-effetuneの `4510346f5` で独立ACCEPT済みのため、§18の別cancel Arc identity API案は撤回。§1.377のmaster統合後にmasterをnext-tileへ取り込み、既存API上へ接続する。それまで非PDFのUI・キーO・入力・snapshot・マニュアルを先行する。旧§18の停止／合意待ち記録は履歴。
-- **非PDF先行chunk (2026-10-12)**: 通常fullscreen／main内／detachedの共通UI・入力・O、context owner、strip共用exact需要・局所取消、snapshot6枚・マニュアルを更新。独立完了レビューACCEPT（P1/P2/P3なし）。現在の検証実数と残工程は設計§19。§1.377はmaster統合済みだが、外部Git管理領域の書込み権限拒否によりnext-tileへの取込み未実施。PDF／EPUB要求接続・最終test-fullは取込み後に残す。製品起動・コミット・CHANGELOG更新なし。
+- **非PDF先行chunk (2026-10-12、履歴)**: 通常fullscreen／main内／detachedの共通UI・入力・O、context owner、strip共用exact需要・局所取消、snapshot6枚・マニュアルを更新。独立完了レビューACCEPT（P1/P2/P3なし）。先行検証実数は設計§19。当時は§1.377のmaster取込みが外部Git管理領域の書込み権限拒否で未実施となり、PDF／EPUB要求接続・最終test-fullを後続へ残した。製品起動・コミット・CHANGELOG更新なし。
+- **PDF／EPUB接続 (2026-10-12、現行)**: coordinatorが非PDF先行chunkを `f3d5cbe22` としてコミットし、master取込み後に一覧の要求を通常画像／ZIP画像／PDFページ（変換済みEPUBを含む）へ接続。§1.377の既存ticket・`promote_viewer_pdf_keys`・`PdfVisiblePromotionState`を再利用し、別ownerは追加しない。接続・最終修正の独立完了レビューACCEPT（P1/P2/P3なし）。test-fullを1回実行し、RAW素材不足・保存ACK fixture・overflow期待値／PNG・非表示consumerの同期SQL回帰を修正、affected targetedと未実行vendor gateを補完済み。通常／portable check・fmt・監査成功。元のfull exit 101、補完実数と確認buildは設計§20へ区別して記録。構成由来の白紙adapterは§1.242未統合、実機受入は未完了。
 - 複数ウィンドウの表示・入力所有をまたぐため、実装前に detached rework の境界を確認する。時期は未定。
 - 規模 / 優先度: 未見積もり / P3。
 

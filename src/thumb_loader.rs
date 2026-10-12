@@ -54,7 +54,7 @@ impl LoadRequest {
         self.request_id = outer.request_id;
         self.items_gen = outer.items_gen;
         self.input_seq = outer.input_seq;
-        self.context_epoch = outer.context_epoch;
+        self.pdf_render_validity = outer.pdf_render_validity.clone();
         self.priority = outer.priority;
     }
 
@@ -793,10 +793,9 @@ pub struct LoadRequest {
     /// items 世代番号: `App::items_generation` のスナップショット。
     /// ワーカーは ThumbMsg にエコーバックし、UI 側は現行世代と一致しないメッセージを破棄する。
     pub items_gen: u64,
-    /// PDF render pool の context epoch。**UI スレッドの enqueue 時点**で
-    /// `pdf_loader::current_render_context_epoch()` を焼き付ける (TOCTOU 防止)。
-    /// 0 = epoch チェック対象外 (background 経路の sentinel)。`Default::default()` は 0。
-    pub context_epoch: u64,
+    /// UI enqueue 時点の viewer owner/snapshot。派生要求と worker は Clone して継承する。
+    /// 独立 background 要求は明示 Unscoped。Default も Unscoped。
+    pub pdf_render_validity: crate::pdf_loader::PdfRenderValidity,
     /// Typed source owner: the original source, a RAW development handoff, or an Audio thumbnail.
     /// Only the thumbnail worker may resize, cache, count, and signal its result.
     pub raw_source: LoadRequestSource,
@@ -836,6 +835,40 @@ fn diagnostic_request_key(req: &LoadRequest) -> Option<String> {
 mod diagnostic_request_key_tests {
     use super::*;
     use crate::grid_item::GridItem;
+
+    #[test]
+    fn derived_pdf_epub_and_pin_fallback_keep_the_original_viewer_ticket() {
+        let mut owner = crate::pdf_loader::PdfRenderEpochOwner::fresh();
+        let outer = LoadRequest {
+            idx: 8,
+            request_id: ThumbnailRequestId::Registered(41),
+            items_gen: 12,
+            input_seq: 7,
+            priority: true,
+            pdf_render_validity: crate::pdf_loader::PdfRenderValidity::Viewer(owner.snapshot()),
+            ..Default::default()
+        };
+        owner.advance();
+        for path in ["selected.pdf", "selected.epub", "automatic-fallback.png"] {
+            let mut derived = LoadRequest {
+                path: path.into(),
+                pdf_page: path.ends_with("pdf").then_some(0),
+                ..Default::default()
+            };
+            derived.inherit_request_identity_from(&outer);
+            assert!(
+                derived
+                    .pdf_render_validity
+                    .same_request(&outer.pdf_render_validity)
+            );
+            assert!(derived.pdf_render_validity.is_stale());
+            assert_eq!(derived.idx, outer.idx);
+            assert_eq!(derived.request_id, outer.request_id);
+            assert_eq!(derived.items_gen, outer.items_gen);
+            assert_eq!(derived.input_seq, outer.input_seq);
+            assert_eq!(derived.priority, outer.priority);
+        }
+    }
 
     #[test]
     fn original_item_keys_match_folder_image_and_archive_page_projections() {
@@ -2454,7 +2487,7 @@ pub fn process_load_request(
             req.input_seq,
             req.items_gen,
             req.request_id,
-            req.context_epoch,
+            req.pdf_render_validity.clone(),
             crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
             req.force_cache,
             true,
@@ -3297,7 +3330,7 @@ pub fn process_load_request(
         req.input_seq,
         req.items_gen,
         req.request_id,
-        req.context_epoch,
+        req.pdf_render_validity.clone(),
         cancel_policy,
         req.force_cache,
         req.source_policy.bypasses_cache(),
@@ -3760,7 +3793,7 @@ fn process_neighbor_prefetch(
     // **review #11/#13 対応**: cancel をプール経由で render_page にも渡す。
     // フォルダ移動で bump_epoch されたら、走行中の PDFium 描画も Interrupted で
     // 抜けて Normal 枠を即座に解放する。
-    // neighbor prefetch は background なので epoch=0 (UI nav の bump で巻き込まれない)
+    // neighbor prefetch は background なので Unscoped (UI nav の bump で巻き込まれない)
     // + AbortOnCancel (background は cancel=フォルダ移動意図、harvest 不要)
     let render = if let Some(read) = epub_read.as_ref() {
         crate::pdf_loader::render_page_with_read_target(
@@ -3771,7 +3804,7 @@ fn process_neighbor_prefetch(
             None,
             Some(Arc::clone(cancel)),
             crate::pdf_loader::JobPriority::Normal,
-            0,
+            crate::pdf_loader::PdfRenderValidity::Unscoped,
             crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
         )
     } else {
@@ -3782,7 +3815,7 @@ fn process_neighbor_prefetch(
             None,
             Some(Arc::clone(cancel)),
             crate::pdf_loader::JobPriority::Normal,
-            0,
+            crate::pdf_loader::PdfRenderValidity::Unscoped,
             crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
         )
     };
@@ -4149,6 +4182,7 @@ impl FolderResolveContext<'_> {
                 cache_key_override: Some(key.to_owned()),
                 folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::AutoSelected),
                 file_type_visibility: self.policy.clone(),
+                pdf_render_validity: crate::pdf_loader::PdfRenderValidity::Unscoped,
                 ..Default::default()
             };
             if !folder_cached_row_usable_in_cache_dir_with_pins(
@@ -4912,9 +4946,8 @@ pub fn load_one_cached(
     items_gen: u64,
     // Echo the request's producer/consumer ownership through all worker branches.
     request_id: ThumbnailRequestId,
-    // PDF render pool の context epoch。`req.context_epoch` をそのまま流す。
-    // 0 = epoch チェック対象外 (background)。
-    context_epoch: u64,
+    // Enqueue 時点の immutable ticket をそのまま PDF render pool まで継承する。
+    pdf_render_validity: crate::pdf_loader::PdfRenderValidity,
     // PDF render の cancel 時挙動。HarvestOnCancel なら in-flight IPC を harvest して
     // cache 保存に進む (cache savable な PDF render thumbnail のみ)。
     // 詳細は `pdf_loader::CancelWaitPolicy` doc 参照。
@@ -5179,7 +5212,7 @@ pub fn load_one_cached(
         };
         let render_started = std::time::Instant::now();
         #[cfg(test)]
-        let fixture_result = tests::take_pdf_render_result(cancel_policy);
+        let fixture_result = tests::take_pdf_render_result(cancel_policy, &pdf_render_validity);
         #[cfg(not(test))]
         let fixture_result: Option<std::io::Result<crate::pdf_loader::RenderResult>> = None;
         let render_result = fixture_result.unwrap_or_else(|| {
@@ -5192,7 +5225,7 @@ pub fn load_one_cached(
                     pdf_password,
                     cancel.map(Arc::clone),
                     pdf_priority,
-                    context_epoch,
+                    pdf_render_validity,
                     cancel_policy,
                 )
             } else {
@@ -5203,7 +5236,7 @@ pub fn load_one_cached(
                     pdf_password,
                     cancel.map(Arc::clone),
                     pdf_priority,
-                    context_epoch,
+                    pdf_render_validity,
                     cancel_policy,
                 )
             }
@@ -5425,7 +5458,7 @@ pub fn load_one_cached(
 
             // **Codex P2 対応 (2026-05)**:
             // `pdf_interrupted` は cancel_token を flip せず epoch だけ進めた経路
-            // (= `load_folder` 入口の `bump_render_context_epoch` から `start_loading_items` の
+            // (= `load_folder` 入口の viewer owner の `advance` から `start_loading_items` の
             // `invalidate_idx_state_and_queues` までの window) でも発生し得る。この window では
             // 旧フォルダの items_generation が生きており、`requested` が wipe されていない。
             // ここで silent return すると `requested` に dangling entry が残り、Pending のまま
@@ -5889,6 +5922,7 @@ mod tests {
         result: std::io::Result<crate::pdf_loader::RenderResult>,
         cancel_on_reply: Option<Arc<AtomicBool>>,
         observed_policy: Arc<Mutex<Option<crate::pdf_loader::CancelWaitPolicy>>>,
+        observed_validity: Option<Arc<Mutex<Option<crate::pdf_loader::PdfRenderValidity>>>>,
     }
 
     struct PdfRenderFixtureScope(Option<PdfRenderFixture>);
@@ -5909,11 +5943,15 @@ mod tests {
 
     pub(super) fn take_pdf_render_result(
         policy: crate::pdf_loader::CancelWaitPolicy,
+        validity: &crate::pdf_loader::PdfRenderValidity,
     ) -> Option<std::io::Result<crate::pdf_loader::RenderResult>> {
         PDF_RENDER_FIXTURE
             .with(|current| current.borrow_mut().take())
             .map(|fixture| {
                 *fixture.observed_policy.lock().unwrap() = Some(policy);
+                if let Some(observed) = fixture.observed_validity {
+                    *observed.lock().unwrap() = Some(validity.clone());
+                }
                 if let Some(cancel) = fixture.cancel_on_reply {
                     cancel.store(true, Ordering::Relaxed);
                 }
@@ -5929,6 +5967,8 @@ mod tests {
                 Arc::new(crate::catalog::CatalogDb::open(tmp.path(), tmp.path()).unwrap());
             let cancel = Arc::new(AtomicBool::new(false));
             let observed_policy = Arc::new(Mutex::new(None));
+            let observed_validity = Arc::new(Mutex::new(None));
+            let mut pdf_owner = crate::pdf_loader::PdfRenderEpochOwner::fresh();
             let _scope = PdfRenderFixtureScope::install(PdfRenderFixture {
                 result: Ok(crate::pdf_loader::RenderResult {
                     image: image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
@@ -5945,6 +5985,7 @@ mod tests {
                 }),
                 cancel_on_reply: harvested.then(|| Arc::clone(&cancel)),
                 observed_policy: Arc::clone(&observed_policy),
+                observed_validity: Some(Arc::clone(&observed_validity)),
             });
             let mut request = LoadRequest {
                 path: tmp.path().join("injected.pdf"),
@@ -5955,8 +5996,12 @@ mod tests {
                 mtime: 7,
                 file_size: 9,
                 force_cache,
+                pdf_render_validity: crate::pdf_loader::PdfRenderValidity::Viewer(
+                    pdf_owner.snapshot(),
+                ),
                 ..Default::default()
             };
+            pdf_owner.advance();
             let (messages, done) =
                 collect_protocol_messages(&mut request, Some(&catalog), Some(&cancel), 1);
             assert_eq!(done, 1);
@@ -5977,6 +6022,13 @@ mod tests {
                 Some(crate::pdf_loader::CancelWaitPolicy::HarvestOnCancel)
             );
             assert_eq!(cancel.load(Ordering::Relaxed), harvested);
+            let observed_validity = observed_validity.lock().unwrap();
+            let observed_validity = observed_validity.as_ref().expect("PDF dispatch observed");
+            assert!(observed_validity.same_request(&request.pdf_render_validity));
+            assert!(
+                observed_validity.is_stale(),
+                "worker must never refresh the ticket"
+            );
             let row = catalog
                 .load_one(&crate::grid_item::pdf_page_cache_key(0))
                 .unwrap();
@@ -6112,6 +6164,7 @@ mod tests {
                     )),
                     cancel_on_reply: None,
                     observed_policy: Arc::new(Mutex::new(None)),
+                    observed_validity: None,
                 })
             });
             let mut request = LoadRequest {
@@ -6141,6 +6194,7 @@ mod tests {
 
     #[test]
     fn epub_fallback_worker_uses_outer_request_correlation_and_completes_once() {
+        let pdf_owner = crate::pdf_loader::PdfRenderEpochOwner::fresh();
         let tmp = TempDir::new().unwrap();
         let image = tmp.path().join("fallback.png");
         image::RgbaImage::from_pixel(8, 8, image::Rgba([32, 64, 128, 255]))
@@ -6156,7 +6210,7 @@ mod tests {
             epub_pin_fallback: Some(Box::new(fallback)),
             input_seq: 12,
             items_gen: 19,
-            context_epoch: 73,
+            pdf_render_validity: crate::pdf_loader::PdfRenderValidity::Viewer(pdf_owner.snapshot()),
             priority: true,
             request_id: ThumbnailRequestId::Registered(112),
             ..Default::default()
@@ -6843,6 +6897,7 @@ mod tests {
         gen_done: &Arc<AtomicUsize>,
         stats: &Arc<Mutex<crate::stats::ThumbStats>>,
         handoff: &RawThumbHandoff,
+        pdf_render_validity: crate::pdf_loader::PdfRenderValidity,
     ) {
         let metadata = std::fs::metadata(path).unwrap();
         let mut request = LoadRequest {
@@ -6857,6 +6912,7 @@ mod tests {
             items_gen: 1,
             force_cache: catalog.is_some(),
             source_policy: LoadSourcePolicy::SourceOnly,
+            pdf_render_validity,
             ..Default::default()
         };
         process_load_request(
@@ -6904,6 +6960,10 @@ mod tests {
             queue: Arc::clone(&queue),
             tickets: Arc::clone(&tickets),
         });
+        let mut pdf_owner = crate::pdf_loader::PdfRenderEpochOwner::fresh();
+        let pdf_render_validity =
+            crate::pdf_loader::PdfRenderValidity::Viewer(pdf_owner.snapshot());
+        pdf_owner.advance();
         raw_thumb_request(
             &path,
             None,
@@ -6913,6 +6973,7 @@ mod tests {
             &gen_done,
             &stats,
             &handoff,
+            pdf_render_validity.clone(),
         );
         assert!(rx.try_recv().is_err(), "submit must send no ThumbMsg");
         assert_eq!(gen_done.load(Ordering::Relaxed), 0);
@@ -6931,6 +6992,12 @@ mod tests {
         let mut followup = queued.pop().unwrap();
         drop(queued);
         assert_eq!(followup.request_id, ThumbnailRequestId::Registered(104));
+        assert!(
+            followup
+                .pdf_render_validity
+                .same_request(&pdf_render_validity)
+        );
+        assert!(followup.pdf_render_validity.is_stale());
         assert!(matches!(
             followup.raw_source,
             LoadRequestSource::RawHalfDeveloped { .. }
@@ -7106,6 +7173,7 @@ mod tests {
             &gen_done,
             &stats,
             &handoff,
+            crate::pdf_loader::PdfRenderValidity::Unscoped,
         );
         let display = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         assert!(display.pixels().is_some() && !display.is_canceled());
@@ -7254,7 +7322,15 @@ mod tests {
             let gen_done = Arc::new(AtomicUsize::new(0));
             let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
             raw_thumb_request(
-                &path, None, &cache_map, &tx, None, &gen_done, &stats, &handoff,
+                &path,
+                None,
+                &cache_map,
+                &tx,
+                None,
+                &gen_done,
+                &stats,
+                &handoff,
+                crate::pdf_loader::PdfRenderValidity::Unscoped,
             );
             executor.wait_for_queued_job_for_test();
             assert!(tickets.lock().unwrap().contains_key(&0));
@@ -7938,7 +8014,7 @@ mod tests {
             1,
             1,
             ThumbnailRequestId::Registered(109),
-            0,
+            crate::pdf_loader::PdfRenderValidity::Unscoped,
             crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
             true,
             false,
@@ -8273,11 +8349,12 @@ mod tests {
             source_policy: LoadSourcePolicy::SourceOnly,
             ..Default::default()
         };
+        let pdf_owner = crate::pdf_loader::PdfRenderEpochOwner::fresh();
         let mut request = LoadRequest {
             request_id: ThumbnailRequestId::Registered(1360),
             items_gen: 19,
             input_seq: 12,
-            context_epoch: 73,
+            pdf_render_validity: crate::pdf_loader::PdfRenderValidity::Viewer(pdf_owner.snapshot()),
             priority: true,
             path: archive.clone(),
             zip_entry: Some("inner.zip/page.png".into()),
@@ -9691,6 +9768,7 @@ mod tests {
     fn epub_thumb_request_replaces_display_metadata_with_generation_identity() {
         let path = Path::new("book.epub");
         let read = crate::pdf_loader::generation_target_for_test(path, 17, 4096);
+        let mut pdf_owner = crate::pdf_loader::PdfRenderEpochOwner::fresh();
         let req = LoadRequest {
             path: path.to_path_buf(),
             pdf_page: Some(0),
@@ -9698,9 +9776,17 @@ mod tests {
             file_size: 456,
             pdf_stamp_policy: PdfStampPolicy::ResolveInWorker,
             cache_key_override: Some("pdfthumb:book.epub#pin:pdfpage".into()),
+            pdf_render_validity: crate::pdf_loader::PdfRenderValidity::Viewer(pdf_owner.snapshot()),
             ..Default::default()
         };
+        pdf_owner.advance();
         let stamped = stamp_resolved_pdf_request(&req, &read).unwrap();
+        assert!(
+            stamped
+                .pdf_render_validity
+                .same_request(&req.pdf_render_validity)
+        );
+        assert!(stamped.pdf_render_validity.is_stale());
         assert_eq!((stamped.mtime, stamped.file_size), (17, 4096));
         assert_eq!(
             stamped.cache_key_override.as_deref(),
@@ -9709,6 +9795,12 @@ mod tests {
         assert_eq!((req.mtime, req.file_size), (123, 456));
         let new_generation = crate::pdf_loader::generation_target_for_test(path, 18, 4096);
         let fresh = stamp_resolved_pdf_request(&req, &new_generation).unwrap();
+        assert!(
+            fresh
+                .pdf_render_validity
+                .same_request(&req.pdf_render_validity)
+        );
+        assert!(fresh.pdf_render_validity.is_stale());
         assert_ne!(
             (stamped.mtime, stamped.file_size),
             (fresh.mtime, fresh.file_size)
@@ -10131,7 +10223,7 @@ pub fn build_and_save_one_pdf(
     thumb_px: u32,
     thumb_quality: u8,
 ) -> Option<usize> {
-    // バッチキャッシュ作成は Normal 優先度 + 非 UI 経路なので epoch=0:
+    // バッチキャッシュ作成は Normal 優先度 + 非 UI 経路なので Unscoped:
     // フルスクリーン操作より優先されない、かつ UI nav の bump で巻き込まれない
     // + AbortOnCancel (bulk は cancel=明示中断意図)
     let res = if let Some(read) = epub_read {
@@ -10143,7 +10235,7 @@ pub fn build_and_save_one_pdf(
             password,
             None,
             crate::pdf_loader::JobPriority::Normal,
-            0,
+            crate::pdf_loader::PdfRenderValidity::Unscoped,
             crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
         )
     } else {
@@ -10154,7 +10246,7 @@ pub fn build_and_save_one_pdf(
             password,
             None,
             crate::pdf_loader::JobPriority::Normal,
-            0,
+            crate::pdf_loader::PdfRenderValidity::Unscoped,
             crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
         )
     }

@@ -1,5 +1,31 @@
 # 仮想フォルダ (ZIP / RAR / PDF / EPUB) 処理
 
+## Everything 検索からの本open/back（§1.374、実装中・検証待ち）
+
+Everythingは外側の実ファイルだけを検索し、ZIP内部entry/PDFページを列挙しない。
+対応・表示設定に合うZIP/CBZ、PDF/EPUB、変換対象書庫をworkerで分類・statしてSearchのflat行へ採用する。
+元EPUB/変換書庫のidentityを維持し、検索時に変換や内部probeを先行実行しない。
+本openは既存通常open/enumerate/password/convert経路へ渡す。取消/失敗はaccepted位置を変更せず、
+物理表示の成功adoptionだけが `EverythingPosition::PhysicalChild` にlogical source/return anchor/routeを記録する。
+
+ZIP内部の親移動は通常zip navを使い、本の外側では保持したimmutable検索datasetを
+既存Search prepareで再投影してRootへ戻る。IPCを再送せず、表示中本の合成pathから物理parentを推測しない。
+同contextのitems/metasとthumbnail requestsは共通adoptionに従い、同pathを読むdetached兄弟の
+PDF ticket/queue/cacheを失効しない。先行PDF ownership改修 `4510346f5` / master `c1e66f589` を前提とする。
+F12は既存open/fork/park/promoteを維持し、Everything datasetを兄弟viewerの一覧ownerにしない。
+この変更の自動gate・独立レビュー・実機確認は未完了。[台帳](everything-search-plan.md#14-実装記録2026-10-12検証待ち)。
+
+## PDF render失効の所有（未リリース）
+
+PDF/EPUB thumbnail要求は、pathやmain/windowの役割ではなく、要求を採用したviewerの
+`PdfRenderEpochOwner` に従う。read-only ticketをpin/fallback/RAW等の派生要求まで継承し、
+一覧交換で失効するのは同ownerの旧世代だけ。同じPDF/pageを読むdetached兄弟は継続する。
+writerとViewer昇格追跡は既存bundleと移譲、fork先はfresh、retire/dropは自身だけ終端する。
+pruneはpool maintenance worker、late enqueueはdispatcher popで検査し、UIはatomic＋wakeだけ。
+Viewer昇格/foundもowner/世代/keyを照合する。fullscreen本体・neighbor/bulk・Similar・Remote・
+列挙は明示Unscopedで、既存cancel/Abort/Harvest/cache identityを維持する。
+[所有設計](pdf-render-epoch-ownership-plan.md)が旧global整数epoch計画の後継正本。
+
 ## 本別見開き調整のscope/転送とRemote（§1.364 D1–D3、未リリース）
 
 永続scopeは`book_scope::BookScopeKey`。元書庫/PDF/EPUBの論理rootをKeepDrive正規化し、

@@ -878,7 +878,7 @@ impl App {
         let pages = page_overview_request_ordinals(&geometry.layout, view.scroll_anchor)
             .filter_map(|ordinal| view.projection.entry(ordinal).map(|entry| entry.items_idx))
             .collect::<Vec<_>>();
-        self.ensure_non_pdf_page_overview_requests(&ctx, &pages);
+        self.ensure_page_overview_requests(&ctx, &pages);
         self.start_still_seek_rotations(&ctx, &pages);
         let thumbnails = self.page_overview_thumbnail_projection(&pages);
         let idx = self.fullscreen_idx;

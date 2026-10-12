@@ -62,6 +62,7 @@
 # HelpShowContextShortcuts = ? ; 現在のコンテキストで使えるショートカット一覧を表示する
 
 [Grid] ; サムネイル一覧
+# GlobalEverythingSearch = Ctrl+R ; Everything でファイル名を検索する
 # GridFavoritePrev = none ; 前のお気に入りへ移動する
 # GridFavoriteNext = none ; 次のお気に入りへ移動する
 # GridManageFavorites = none ; お気に入りの管理を開く

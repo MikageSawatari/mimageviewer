@@ -1,10 +1,10 @@
 # 画像閲覧中の本のページ一覧（§1.340）設計
 
 作成: 2026-10-12 / Codex、基準: `next-tile` / `ea060b66e`。
-状態: **R5 `a3bb1775b` は双方の構造合意済み。T1 `588fe1d76` は実装・検証・独立ACCEPT。非PDF先行chunkも独立ACCEPT、検証・確認build済み。§1.377はmaster統合済み、next-tileへのmaster取込み待ちでPDF／EPUB接続は未完了。**
+状態: **R5 `a3bb1775b` は双方の構造合意済み。T1 `588fe1d76`、非PDF `f3d5cbe22` は実装・検証・独立ACCEPT。master取込みの作業ファイルで競合を解消し、§1.377のowner-scoped API上にPDF／EPUBを接続、独立完了レビューACCEPT。最終検証・確認buildの記録は§20。Gitのstage／merge commitはcoordinatorが行う。**
 改訂 R5: R4 `7d0d0cf0a` の再レビュー REVISE（P1 1件）と2026-10-12の利用者／coordinator判断を反映。
 既定キーは **O（Overview）で確定**。一覧からの選択は当該viewerの通常ページ移動と同じ扱いにする。
-利用者の指示により§10のT1→T5で実装する。T1記録は§17、現行の検証・未解決事項は§19へ記録する。
+利用者の指示により§10のT1→T5で実装する。T1記録は§17、統合前の履歴は§19、現行の検証・残事項は§20へ記録する。
 R3 の非アクティブ context への Select 破棄・一覧維持の契約は保持する。
 公開時期は v4.6.0 の次の版の**後**。次の版の必須成果にはしない。
 項目・出典・時期の正本は [next-release-backlog.md §1.340](next-release-backlog.md#1340-複数ウィンドウの画像ウィンドウ内に本のページをタイル表示する--miv-スレ-509519-2026-10-07)。
@@ -782,7 +782,7 @@ T1は利用者が `588fe1d76` としてコミットした。以前の§18で提�
 `mimageviewer-nexteffetune` / `next-effetune`、`4510346f5` で修正済み・独立ACCEPTと確認した。
 `git show 4510346f5` と同commitの `docs/pdf-render-epoch-ownership-plan.md`（R2）、
 `src/pdf_loader/render_epoch.rs`／`src/pdf_loader.rs`／`src/app.rs` を読むだけで照合した。
-next-effetune側の編集・build・test・mergeは行っていない。現在のnext-tileのHEADには未統合。
+next-effetune側の編集・build・test・mergeは行っていない。この決定時点ではnext-tileのHEADには未統合だった。
 
 §1.377がmasterへ入った後、masterをnext-tileへ取り込んでその正本・APIを利用する。
 同commitのcherry-pickや別実装、仮のUnscopedでの迂回はしない。
@@ -826,7 +826,7 @@ master取り込み後は実際のAPI差分・bundle分類を照合し、以下�
 §1.377の有効なtest証拠は再利用し、overview接続のtargeted tests・fmt・通常／portable checkを追加する。
 実機のPDFium／focus／性能の成功はheadless検証だけから主張しない。
 
-## 19. 非PDF先行実装と検証記録（2026-10-12）
+## 19. 非PDF先行実装と検証記録（2026-10-12、統合前の履歴）
 
 T2の非PDF需要／context接続、T3のactive／passive描画、T4のO・入力を実装し、T5の
 snapshot／マニュアルを更新した。PDF／EPUB要求・owner-scoped昇格接続は§18の取込み後に残る。
@@ -915,3 +915,154 @@ Grid不変と取消、選択後の通常Grid追従／独立窓のmain非干渉�
 park→resize／DPI変更→新たに露出したplaceholderの一クリック選択、F11／連動F12のreflow、
 独立静止画窓のF12無効、AへEnter配送→B復帰→AのSelect破棄・Bのactive/runtime/foreground不変。
 headlessでnative HWND／z-order／実PDFium／実機性能を確認済みとはしない。
+
+## 20. master統合とT2 PDF／EPUB接続（2026-10-12）
+
+coordinatorが非PDF `f3d5cbe22` をコミットし、Everythingと§1.377 `4510346f5`を含むmasterを
+next-tileへmergeした。作業ファイルの3競合（detached記録／App／context registry）を、
+双方のowner分類・移譲・破棄と履歴を保持して解消した。Gitのindexはcoordinatorのstage待ちであり、
+本担当はgit add／commitも他worktreeの編集も行わない。
+
+T2接続は`ensure_page_overview_requests`から既存foreground dispatcherに`PdfPage`を許可し、
+既存`promote_viewer_pdf_keys`へ渡す変更である。新規admissionは32件／2msの予算と可視優先を維持し、
+未完了需要は既存repaintで再評価する。PDF本体のUnscoped経路、Remote、Grid昇格は変更しない。
+EPUBは論理sourceと既存lease／派生要求ticket継承を維持し、別の昇格identityやretry mapは作らない。
+overview closeは局所foreground需要の撤回で、PDF render owner全体をadvance／retireしない。
+
+registryのempty/build/swap/keep-in-main/fork/retireは一覧ownerとPDF owner／trackingを両方保持する。
+両親の回帰関数を保持し、A4の既存`ContextRef::page_overview_view`完全一致指紋を確認した。
+PDF owner／trackingはprivate分類のため新規公開API登録は不要。監査規則・allowlistは変更しない。
+独立 `gpt-6.1-sol`／`xhigh` 完了レビューは **ACCEPT、P1/P2/P3なし**。
+対象はこの競合解消とPDF／EPUB接続で、既存R5／§1.377の承認済み所有境界を再利用する構造追加に合意した。
+
+新規回帰3件は、PDF close／再入場時の局所queued pruneと取得済みPixels／Finalizedの保持、
+同PDFのmain／detachedでのticket・channel・promotion追跡の分離、EPUB logical identity／read lease／
+派生要求ticketの継承を実際のadmission経路で検査する。PDFium／pool workerを起動せず、
+poolの別owner／旧世代／遅着／Remote・Unscoped除外は既存§1.377の回帰と併せて検査する。
+
+最終検証の実数は以下へ追記する。filter間の重複を合算しない。
+製品起動・git add／commit・CHANGELOG更新は0回。§1.242の構成consumerは未統合で、
+白紙fixtureは補助annotationのadapter契約だけを保証する。
+
+統合後監査でEverythingの子testファイルにA6が46件発生した。親の既存`#[cfg(test)] mod tests`と
+同じ`#![cfg(test)]`を`src/global_search_ui/everything/tests.rs`に明示する2行だけで修正した。
+既存A6のper-file判定に合わせる変更で、製品経路・test本体・監査規則／allowlistは不変。
+追加の独立静的レビューもACCEPT、P1/P2/P3なし。再監査はexit 0、known／残指摘0。
+
+| 統合後のtargeted検証 | 実数／結果 |
+| --- | --- |
+| lib `overview` | 85 passed、0 failed、0 ignored、12,267 filtered out |
+| lib `viewer_context_registry` | 86 passed、0 failed、0 ignored、12,266 filtered out |
+| lib `pdf_render_epoch` | 5 passed、0 failed、0 ignored、12,347 filtered out |
+| lib `still_seek_thumbnail_ownership` | 21 passed、0 failed、0 ignored、12,331 filtered out |
+| lib `pdf_loader` | 105 passed、0 failed、0 ignored、12,247 filtered out |
+| lib `global_search_ui::everything::tests` | 18 passed、0 failed、0 ignored、12,334 filtered out |
+| `viewer_context_audit` tests | 36 passed、0 failed、0 ignored（bin／doc tests各0件） |
+| `cargo run --locked -p viewer_context_audit` | exit 0、known／残指摘0 |
+| `cargo fmt --check` | exit 0 |
+| 通常core check | exit 0、38.91秒、既存警告あり |
+| portable core check | exit 0、1分17秒、既存警告あり |
+| UI glyph検査 | exit 0、dangerous glyphs 0 |
+
+ログは`target/tile-final-*.log`と`target/tile-pdf-overview-tests.log`。
+競合解消直後・PDF接続前の通常checkもexit 0（1分53秒）で、最終値は上記の接続後検証を使う。
+releaseのcore／launcherが存在しなかったため、利用者指示に従いrelease入力を作成してから
+`test-full.ps1`を1回実行する。build scriptは`-PreserveRuntime`を指定してplainに呼び、
+実行中アプリの停止・通常APPDATAの変更をしない。確認buildは最後に通常featureのbuild-devを行う。
+
+release入力の作成は`build-release.ps1 -PreserveRuntime` 1回、exit 0。
+core 16分06秒、remote 52.33秒、EPUB worker 23.72秒、launcher 29.40秒。
+前回の並列native失敗を避ける準備はTurboJPEGのみ`cargo build --release -p turbojpeg-sys -j 1`
+（3分12秒、exit 0）で、Rust本体のジョブ数・source／profile／featureは変更しない。
+VST3 SDK不在はscript既存経路で現行sourceのvendor host hashを検証して再利用した。
+VCRT／PE検査はrelease runtime 4／PE 4、embedded runtime 4／PE 12が成功。
+releaseのcore 330,927,104bytes、remote 11,702,784bytes、EPUB worker 3,055,104bytes、
+launcher 488,899,072bytesを生成し、いずれも起動していない。
+script段階ログは`target/tile-build-release.log`、PE正本は`target/vcrt-pe-reports/release-*.json`。
+
+### 20.1 最終full実行で見つかった範囲と補完
+
+`test-full.ps1 -SuppressCrashDialogs`は1回だけ実行してexit 101。
+本体libは12,286 passed／9 failed／57 ignored（1,515.94秒）、LibRaw bindingは0 passed／4 failed。
+別targetのUI snapshotは168 passed／0 failedで、先行6枚も含む。
+失敗した2 target以外のworkspace targetは成功し、vendor 3 crateはscriptの失敗時規則で未実行となった。
+stdout／stderrの正本は`target/tile-test-full.stdout.log`／`target/tile-test-full.stderr.log`。
+以下の原因を確認し、全体を重ねて走らせずaffected targeted／未実行vendorを補完する。
+
+- RAW 9件は`vendor/raw-samples`がない前提不足。masterのCC0素材27ファイル・360,971,087bytesを
+  実体コピーし、全ファイルのSHA-256とサイズを`tests/raw-samples.json`へ照合した。
+  master側には書かず、source／テスト期待値／skip条件は変更しない。
+- tray／F12 1件は最終resume比較でSome(0)／期待Some(1)。単独では成功したが、fixtureは
+  非同期writerのACK前にDBを読み返していた。既存`read_position_after(admitted)`のACKを
+  testだけで待ち、保存位置と従来のresume比較を両方検査する。製品のtray保存を同期化しない。
+- overflow 2件は追加した「ページ一覧」でrootが6→7行になったことの期待値／fixture更新漏れ。
+  48pxの行高、44pxのheader、位置・狭面clampの検査を保持し、root高さ396px／submenuとの差96pxへ更新。
+  同じ実rendererを使うsnapshot fixtureへOの行を追加し、root PNG 1枚を更新・目視確認する。
+- rotation SQL 1件は単独でも再現。exact需要の共用reconcileが、非表示Bookmark consumerのgetterで
+  eligibilityより先にspreadを解決し、cold rotation SQLを同期実行していた。
+  共通getterの既存条件（panel open／Bookmarks tab）をresolver前に移す根本修正とする。
+  details／foreground／通常keep更新の3 callerに効き、既に空だった需要集合は不変。
+  有資格時の実spread判定・既存draw reachability・需要／保持契約は変更しない。
+  独立Sol/xhigh reviewはR5 §8.1の同じ所有境界の実装是正としてACCEPT、追加設計／API／ownerは不要。
+  旧SQLzero回帰の期待を維持し、閉panel＋Bookmarks／開panel＋別tabのLTR／RTL・2度のF5を検査する。
+  active bookmark保持は既存回帰で確認し、active経路の別の表示pair契約をこの修正で作らない。
+
+この後の製品差分は非表示consumerの副作用除去だけ。入力／着地／Grid同期／window所有は不変。
+release入力は上記full前のsourceで生成済みであり、最終修正は最後のdev確認buildへ反映する。
+
+修正後の独立実装レビューもACCEPT、P1/P2/P3なし。更新root PNGは29,487bytesで、
+実装担当とreviewerが旧／新を目視確認した。新O行・文字・disabled表示・scrollが意図どおりで、
+navigator submenuのPNGは変更しない。LibRaw補完の最初のparallel 24 buildはcold TurboJPEGで
+exit 101（テスト未実行）となり、同じ検証を`-j 1`で準備して成功した。
+LibRaw compileは5分55秒、4 testsは133.34秒。source／feature／profile／skip条件は変更しない。
+
+| 最終差分・環境補完後の検証 | 実数／結果 |
+| --- | --- |
+| lib `overview` | 85 passed、0 failed、0 ignored |
+| lib `still_seek_thumbnail_ownership` | 21 passed、0 failed、0 ignored（active bookmarkのdetails／foreground／grid保持・context分離を含む） |
+| lib `bookmark_panel` | 4 passed、0 failed、0 ignored |
+| lib `still_seek_rotation` | 16 passed、0 failed、1 ignored（既存isolated child） |
+| lib `fullscreen_overflow` | 5 passed、0 failed、0 ignored。root更新後の通常比較／submenu比較を含む |
+| lib tray／F12 setting changed | 2 passed、0 failed、0 ignored |
+| LibRaw binding lib | 4 passed、0 failed、0 ignored |
+| lib RAW quality／color／metadata | 1／3／1 passed、failed／ignored各0 |
+| vendor egui／egui-wgpu（winit）／eframe（wgpu）lib | 25／11／18 passed、failed／ignored各0（未実行になった3 gateをunfilteredで補完） |
+| `cargo fmt --check` | exit 0 |
+| 最終通常／portable core check | 各exit 0、31.20秒／25.20秒 |
+| 最終`viewer_context_audit` run | exit 0、known／残指摘0。A4指紋の登録・規則は不変 |
+| 最終UI glyph検査 | exit 0、dangerous glyphs 0 |
+
+元のtest-fullのexit 101をPASSへ書き換えず、失敗13件の原因別補完と未実行gate成功を上表へ残す。
+全体再実行は0回、test-full総実行は1回。検証ログは`target/tile-*-after.log`と
+`target/tile-{rotation,tray}-fixed.log`。最終code差分に対する追加指摘・未解決のfailed targetedは0件。
+最終通常profile確認binaryは`build-dev.ps1 -PreserveRuntime`で生成し、製品を起動しない。
+
+### 20.2 最終確認buildとhandoff
+
+`build-dev.ps1 -PreserveRuntime`は1回、exit 0。通常feature（portableなし）の
+coreは7分42秒、変更のないremote／EPUB workerは既存成果物を再利用して0.75秒／0.85秒で成功。
+FFmpeg DLL6・VCRT DLL4・EffeTune bundleを確認し、runtime 4／PE 3の検査は成功した。
+正本ログは`target/tile-build-dev.stdout.log`／`target/tile-build-dev.stderr.log`、
+PE記録は`target/vcrt-pe-reports/dev-runtime.json`。
+最終core 323,067,904bytes、remote 12,786,688bytes、EPUB worker 3,125,248bytes。
+release buildはfull入力用に1回、dev buildは最終修正を含め1回、製品起動／git add／commitは各0回。
+CHANGELOG／バージョン表記は追加しない。
+
+coordinatorのmaster merge差分以外に、本担当の作業ファイル差分は20ファイル
+（Rust9、docs9、manual1、既存PNG1）。競合3ファイルを含む全一覧は`target/tile-final-files.txt`。
+A4 getter指紋・PDF private owner分類を保持し、監査側の登録追加／例外追加は不要だった。
+Gitのindex上の3 unmerged entryはcoordinatorのgit add待ちで、作業ファイルの競合マーカーは0件。
+最終`git diff --check`も成功。fullを再実行していないことと補完実数を隠さずにhandoffする。
+
+利用者がinstalled／tray常駐版を先に閉じ（共有single-instance mutex）、以下で手動起動する:
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+既定は通常の`%APPDATA%/mimageviewer` profileで、起動だけでも実設定／dataを更新し得る。
+PDF／変換済みEPUBでO／「…」入口→スクロール→単クリック／Enter選択、取消・再入場を確認する。
+同じPDFを複数窓で開いてAの需要撤回／park／復帰がBの表示・runtimeへ作用しないこと、
+通常／連動SelectはGrid追従・独立Selectはmain非干渉、Sの休止／再開も確認対象とする。
+nativeのDPI／placeholder first-click、AへEnter配送→B復帰でAのSelect破棄、
+HWND／foreground／実PDFium／実機性能の受入は利用者の実機確認に残す。
