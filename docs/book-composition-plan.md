@@ -38,7 +38,9 @@ EPUBも今回対象。既存個別編集と同じ元EPUB + 物理ページ番号
 再変換でページがずれる場合は既存編集と同様に構成もずれる仕様を利用者が了承した。
 **2026-10-12 利用者決定**: 独立段階G4Fを切り離し、画像だけのフォルダは今期の構成対象外とする。
 ZIP/PDF/EPUBのG1〜G4、既存folder閲覧・個別編集・sidecar v1・metadata transferを維持する。
-次段は「画像フォルダをZIPに変換する機能」で、設計は利用者確認待ち。今回は変換ボタンを追加しない。
+次段は「画像フォルダをZIPに変換する機能」。2026-10-12の利用者決定に基づく
+[独立した設計案](image-folder-to-zip-plan.md)を作成し、実装前の独立レビューを待つ。
+G4F切り離しの差分には変換ボタンを追加しない。
 製本フォルダも引き続き構成対象外。対象範囲の旧G4F記述は将来案として読み、現行契約は本決定を優先する。
 
 抽出一覧A2は**v4.5.0の既存挙動を意図して変更する、2026-10-10承認済み仕様**。
@@ -1699,7 +1701,10 @@ Checking予約のfolder root除外・改名mirrorからcache採用までのfolde
 画像だけのBook folderで既存editor入口を使った時は、editor/state/構成を作らず次の案内だけを表示する。
 「画像だけのフォルダでは本の構成を作れません。ZIP に変換してから行ってください。」
 既存の採用済ProjectionRecipeで判定し、追加走査や新しい状態は設けない。
-次段「画像フォルダをZIPに変換する機能」は設計を利用者に確認してから進める。現時点でボタン・変換処理は追加しない。
+次段「画像フォルダをZIPに変換する機能」は2026-10-12の利用者決定を記録した
+[独立設計](image-folder-to-zip-plan.md)を実装前に独立レビューする。
+同じ場所のStored ZIP、元folder保持、初回からの利用者データ複製、同名ZIP時の停止、
+modalと既定ONの同名folder省略を扱う。現時点でボタン・変換処理は追加しない。
 
 所有: folder資格/adoption、RelativePath PageRef migration、sidecar全snapshot/構成family/消費receipt、folder用editor入口。
 G1〜G4の書庫/PDF/EPUB契約を変更せず、共通pure model/storeへfolder adapterだけを追加する。
