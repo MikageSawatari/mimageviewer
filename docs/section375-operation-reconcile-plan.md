@@ -1,15 +1,19 @@
-# §1.375 自分のファイル操作の反映とフォルダ監視の照合
+﻿# §1.375 自分のファイル操作の反映とフォルダ監視の照合
 
 2026-10-12、`next-list` / `ea060b66e` 基点。**設計レビュー待ち・未実装**。
 利用者の実機報告をソースで調査した。アプリは起動していない。
 正本項目: [next-release-backlog.md §1.375](next-release-backlog.md#1375-フォルダで-delete-キーで削除すると正しく消えた一覧がもう一度丸ごと読み直されてちらつく--利用者の実機報告-2026-10-12)。
+
+`001a0dabf` の独立設計レビューは **REVISE**。本改訂は表示投影、context ごとの購読、
+通知 kind／path、段階の受入範囲を確定する再レビュー用。指摘は通常操作として構造で扱う。
 
 ## 1. 原因の確定 (コード上)
 
 `handle_delete_key` (ui_dialogs/context_menu.rs:2246) → `request_delete_confirm` →
 `start_delete_files` (app.rs:46555) → delete worker → `DeleteMsg::Batch` / `Done` →
 `poll_delete_pending` (app.rs:46610) → 成功 path だけ `remove_items_batch`。
-ここまでは正しい削除後一覧を投影する。
+ここでは既存表示行から削除成功項目を除く。ただし非表示候補の再露出等の再投影は行わない
+(今回のレビューで判明)。削除後の全表示が常に正しいと仮定しない。
 
 しかし末尾 (app.rs:46738–46754) は UI で directory metadata を取り、
 `current_folder_last_mtime` を進め、**`current_folder_signature = None`** にする。
@@ -58,35 +62,116 @@ ZIP/PDF 内、合成検索、Collection root を通常物理一覧の receipt �
 `current_folder_signature` だけの scalar では成功 path を差し引けないため、
 既存 physical-list stamp を **`AppliedFolderListing`** に置き換える。owner は表示する
 viewer context。folder、scan options、一覧世代、scan 由来の観測 rows、適用済み operation ID
-を一つに保持する。観測 rows は画面の `items` から逆算しない (stack、同名除去、facetで欠ける)。
+と、その rows の採用済み表示投影 proof を一つに保持する。
+観測 rows は画面の `items` から逆算しない (stack、同名除去、facetで欠ける)。
 表示メタ用秒精度とは別に、worker 列挙の完全精度の変更 stamp を照合用に保持する。
 新たな DB、永続 journal、時間 TTL は不要。
 
-同じ owner に `observed_watch_sequence` / `reconciled_watch_sequence` を持たせる。
-イベントを channel から drain した時点で前者を進め、削除 modal 中に check を見送っても
-dirty を消さない。現行の `should_check` 一回だけの呼出しでは、削除中の return 後に次の通知が
-来る保証はない。終端後は残った dirty から照合を開始する。古い世代の scan 拒否でも未照合
-sequence は残し、同じ owner が再び表示された時に再照合する。新しい場所へ dirty を転送しない。
+### 3.1 rows と表示投影の不変条件 (P2)
+
+「反映済み」と呼べるのは、**採用済み rows と、それを現行設定／metadata revision で投影した
+表示・代表画像依存が対応している**場合だけ。raw rows の一致は必要条件であり十分条件ではない。
+`ScannedDir` の同名 filter 前の folders／all_media／auxiliary candidates を immutable に保持し、
+`materialize_local_folder_listing_with_order` の同名優先、並び順、画像本判定、Stack、
+動画／音声 sidecar、folder pin／代表画像と依存 stamp、facet／rating を含む採用投影を記録する。
+表示用 index は proof の identity に使わず、stable row key／asset dependency を使う。
+設定・rating／pin等の revision が変わった候補を旧 projection と比較して合格にしない。
+
+削除 receipt は raw rows の成功差分と「現在行から success を取り除いた暫定投影」を
+同時に作る。この段階は **要照合** とし、完了した projection proof を持つ状態と区別する。
+`remove_items_batch` を行っただけで Applied と扱わない。新 bool は足さず、既存一覧 owner の
+typed 採用状態で `NeedsProjection` / `Applied` を表す。
+watch 通知が届かなくても delete terminal 自体が再投影準備を提出する。
+
+worker は保持 raw rows から成功差分を除いた expected と現在 actual scan を照合し、
+actual の表示投影を既存 prepare 経路で作る。UI は次の二択だけを行う。
+
+- actual rows が expected に一致し、prepared projection が暫定表示と依存まで一致:
+  rows／projection proof／watch cutoff を一緒に Applied へ進める。再 install はしない。
+  世代、texture、選択、checked、scroll、AI/PDF保持画像は維持。
+- raw rows が異なる、非表示候補が露出する、代表／sidecar／本判定等が変わる、または後述の
+  強制 dirty が残る: 同じ actual scan の prepared listing を既存採用境界へ一回渡す。
+  本当に変わった表示の更新であり、削除直後の全再読込を常に省略する仕様にはしない。
+  カーソル等の復元は既存 reload owner に任せる。新しい独自 partial install は作らない。
+
+`a.jpg + a.png` の JPG 優先、Folder + ZIP、PDF + EPUB、動画 + 同名画像／音声 sidecar は
+この後者になる。外部 C が混ざった actual を baseline だけに採用することも禁止。
+UI で列挙・DB再照会・代表画像 decode はしない。prepare の I/O は worker に移す。
+
+### 3.2 操作採用
 
 1. 操作受理時にプロセス内単調 `FileOperationId` を一回発行。要求と終端結果へ同じ ID を渡す。
    receipt は `{id, owner context, physical folder, baseline revision, successful exact effects}`。
    path／時刻だけを操作の印にしない。
 2. delete worker の terminal は成功／失敗／取消を確定する。削除 receipt に入るのは成功分だけ。
-   UI は受理した同じ baseline に成功差分を一回適用し、items と AppliedFolderListing の rows を
-   同じ呼出し中に更新する。operation ID の二度目の採用は no-op。
+   UI は同じ baseline に成功差分を一回反映し、§3.1 の NeedsProjection として照合を提出する。
+   operation ID の二度目の採用は no-op。表示候補の欠落を「反映済み」として残さない。
    完了時の directory metadata を「適用済み contents」の証拠にしない。
 3. watch event は一件も receipt ID で捨てない。notify のイベントには mIV 操作 ID がないため、
    **OS 通知へ勝手に ID を付けて自己由来と断定しない**。全イベントを既存 worker 照合へ渡す。
-4. worker は現在の scan 全体を返す。`baseline - accepted successful deletes` と全体が一致
-   した時だけ「この operation ID の効果は既に反映済み」と判定し、stamp 更新だけで終わる。
-   items 世代、サムネイル、選択、checked、scroll、AI/PDF保持画像は変えない。
+4. worker は現在の scan 全体とその prepared projection を返す。§3.1 の両方の一致と
+   §3.4 の通知分類を満たす時だけ「この operation ID の効果は既に反映済み」と判定する。
 5. 一件でも説明できない差分があれば、その scan を既存 full load の pre_scan として採用する。
    receipt が説明した差分だけを消して残りを捨てる処理は作らない。
-6. 不明／Modify／watch error は dirty として保持する。とくに秒精度・同サイズ上書きを
+6. 内容変更／不明／watch error は強制 dirty として保持する。名前変更は内容変更と区別する。
+   とくに秒精度・同サイズ上書きを
    従来 signature の一致だけで「自己削除反映済み」へ落とさない。削除 receipt が説明できるのは
    成功 source の消失だけ。残存ファイルへの内容変更通知は通常更新へ渡す。
    reconciliation の採用時にだけ、その要求が取り込んだ sequence まで既読にする。
    worker 実行後の通知は未照合のまま残り、次の入力／新しい通知がなくても次の照合を起動する。
+
+### 3.3 購読 identity と context lifecycle (P2)
+
+単純化: App-global watcher を folder 一致で A/B が共有する形はやめ、
+**一つの physical-list context に一つの購読**を既存 ViewerContextBundle へ置く。
+同 folder の A/B にも別購読を持たせ、通知の fanout／共有 ack／休止 context の追跡台帳を作らない。
+signature、projection、watch、dirty、rescan 要求の所有先を同じ一覧 context へ揃える。
+同じ directory の OS watcher が複数になる費用は、購読を共有する新 service より小さい設計を優先。
+本棚／ZIP／PDF／合成 root の既存非監視仕様は変更しない。
+
+購読 identity は `{ViewerContextId, subscription_epoch, logical_folder, listing_options}`。
+同 path でも別 context／再入場／再作成した watcher では epoch を変える。
+callback はこの immutable identity とその購読の dirty summary だけを更新し、App の
+「今投影中の context」から配送先を再計算しない。sequence は callback が受理した順に進める。
+OS watcher 登録と初期 scan は worker で、購読を開始してから scan する。
+候補一覧の受理拒否／取消では候補購読を drop し、元の購読を変更しない。
+
+| lifecycle | 契約 |
+| --- | --- |
+| 同じ採用一覧の更新 | 同じ subscription epoch。採用した rows／projection と、その scan の通知 cutoff を同時確定 |
+| A を park、B を mount | A の watcher／dirty は A bundle に残る。B 自身の watcher を使う。同 folder という理由で A の購読を B へ付け替えない |
+| park 中の通知 | callback は元購読の dirty に記録。UIへ install はせず、A の再 mount 時に未照合通知から worker を起動。directory mtime が同じでも開始 |
+| scan 中の park／generation変更 | 結果は元 identity を照合。新世代へ適用せず、dirty を既読にしない。再 mount／新基点の採用後に未照合分を再検査 |
+| source 切替／context破棄 | その購読を drop。古い callback／結果は identity で拒否。兄弟購読の dirty／ack／取消を変更しない |
+| watcher 不成立／coverage切断 | 元一覧を保ち、次の復帰で worker の全照合を提出。mtime の安いふるいだけで無変更としない。新しい retry loop は作らない |
+
+現行の `external_rescan_pending` も context-owned physical-list owner に移し、cancel／drop が
+一つの context にだけ作用するようにする。main の現在 folder 判定だけで旧結果を採用しない。
+初期 scan 中・削除 modal 中の通知は未照合で残す。mtime は購読の連続した coverage を
+代替しない。callback の集約は短いメモリ操作のみ、UI に OS登録や重い待ちを追加しない。
+
+### 3.4 通知 kind／path の保持と消費 (P2)
+
+`saw_change` へ潰さず、購読ごとに `WatchDirtySummary` を保持する。
+各対象には event sequence と分類を付け、名前変更の old/new paths (分割イベントでは片側)、
+内容変更 paths、Unknown を記録する。集約上限を越えたら同じ summary を Unknown に昇格して
+全照合する。時刻 TTL／通知の無視は使わない。
+
+| notify kind | 保持と採用条件 |
+| --- | --- |
+| Create／Remove／`Modify(Name)` | Namespace。raw rows と投影を全照合。操作結果の後と一致すれば再 install 不要。改名を一律 Content にしない |
+| `Modify(Data)`／ファイル属性・時刻等の `Modify(Metadata)` | Content/Metadata と対象 path を保持。残存 row または代表／sidecar依存への通知は stamp一致でも通常更新が必要。成功削除で消えた exact source だけなら、消失と投影一致を確認して既読にできる |
+| directory 自身の Metadata | 子一覧／依存投影の照合へ。directory mtime だけを「残存画像の上書き」としない。対象が曖昧なら Unknown |
+| Modify(Any)／Other／path不明／watch error／集約上限超過 | Unknown。raw hash一致を免除理由にせず、一度 full prepare／採用する |
+| Access | 既存どおり一覧 mutation 対象外 |
+
+`observed_watch_sequence` と `reconciled_watch_sequence` はこの同じ購読の記録。
+scan 開始時に dirty と cutoff を snapshot。採用成功時だけ **cutoff 以下**の evidence を消費する。
+同 path に後から内容通知が来ても先の Name とまとめて消さない (集約 record の最大 sequence と
+最も強い分類を保持し、cutoffを越える record は未照合のまま)。
+Nameだけの batch は照合／投影一致で既読、残存 B の Content または Unknown が混ざれば
+同じ batch でも full 更新へ進む。イベントの kind/path は自己由来の証明には使わない。
+更新が pending の間の新通知は未照合として残し、次のscanへ引き継ぐ。
 
 外部変更を混ぜた worker の事後 snapshot を無条件で新 baseline にする案も採らない。
 外部で追加された C を scan に含めて基点だけ更新すると、UI に C がないまま見逃すため。
@@ -111,7 +196,12 @@ sequence は残し、同じ owner が再び表示された時に再照合する�
 
 delete は exact 成功 source を既に持つので第一段で上記を実装できる。
 改名／コピー／移動は事前 scan だけで新 row・実際の衝突名・sidecar／代表画像を正しく作れない。
-第一段では既存 prepare worker の一回の full 更新を保持し、更新要求を同じ ID にまとめる。
+**第一段の完了対象は Delete の二重 install 解消だけ**。
+表示投影、購読／通知分類の基盤は第一段に含めるが、rename／move／copy の共通 operation ID
+配管と二重 install の解消は第二段の完了条件とする。第一段では既存操作を維持し、第二段の
+受入を済ませたと報告しない。項目全体の完了は両段の受入後。
+
+第二段では既存 prepare worker の一回の full 更新を保持し、更新要求を同じ ID にまとめる。
 通知が早ければ watch prepare に操作終端を引き継ぎ、終端が早ければその prepare に watch dirty を
 引き継ぐ。どちらも結果採用直前の全 scan と watch sequence で確認し、通知そのものは捨てない。
 採用済み snapshot に一致した二回目の候補は再 install しない。
@@ -123,7 +213,9 @@ PowerShell copy と ShellTransferOutcome の成功出力を拡張して incremen
 設計変更範囲予定: `app.rs`、`app/folder_scan.rs`、`delete_worker.rs`、
 `app/viewer_context_registry.rs`、`app/tests.rs`。操作要求の共通 ID 配管は
 `ui_dialogs/rename_item.rs` / `file_organize.rs` / `shell_file_ops.rs` と D&D終端を別段に分ける。
-各共有ファイルは一人の実装者が所有する。設計レビューで第一段と後続段の受入範囲を固定する。
+各共有ファイルは一人の実装者が所有する。第一段では `CurrentFolderWatch` と
+`ExternalRescanPending` の bundle 移設も含める。第二段は上記操作 producer の ID／終端／
+採用の接続を行い、成功 destination の incremental 投影は含めない。
 まれな失敗は割り切り (ログ + 通知 [+ 作り直し])。新しい retry／復旧 journal は作らない。
 
 ## 5. 受入試験と記録
@@ -131,7 +223,19 @@ PowerShell copy と ShellTransferOutcome の成功出力を拡張して incremen
 予定: 上表の順序ごとの reducer tests、`poll_delete_pending`→実 `apply_external_rescan` の
 handler 回帰 (full load／世代／thumbnail の変更回数を検査)、完全削除と recycle の fake sink、
 partial cancel、stack・facet・同名 sidecar、全件削除、複数 context、検索／Collection を追加する。
-改名／D&D はイベント先着／終端先着、外部変更混在、Shell 衝突名を別に検証する。
+第一段の追加回帰:
+
+- JPG優先の `a.jpg + a.png` から JPG Delete → PNG再露出。Folder／ZIP、PDF／EPUB、
+  動画／画像、音声 sidecar の依存変更。raw一致でも必要な新 projection を採用する。
+- 名前／path が不変の代表差し替え、画像本判定・Stack再編、facetで隠れた代替候補。
+- 同 folder の二 context: A が自己削除を反映済みにしても B の購読／dirty は残り、
+  B再 mount で更新。A→B→A、park中の同サイズ上書き (directory mtime不変)、context破棄。
+- Remove／Name と残存 B の Data／Metadata が同じ batch に混在、分割 rename、Unknown、
+  cutoff後に同pathの内容通知、modal中の通知のみ (次の通知なし)、subscription再作成。
+
+第二段は改名／D&D／整理先move・copy のイベント先着／終端先着、外部変更混在、
+Shell 衝突名を別に検証する。`Modify(Name)` だけの重複通知で二重 install しないことと、
+同じbatchの B 上書きを取り込むことを同時に検査する。
 単に最終一覧が同じという試験だけではちらつきを検知できない。
 
 検証所有者は各段の実装担当。targeted、fmt、通常／portable core check、項目末尾 full gate 一回。

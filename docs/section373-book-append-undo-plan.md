@@ -1,8 +1,12 @@
-# §1.373 本棚への追加直後の一回取り消し
+﻿# §1.373 本棚への追加直後の一回取り消し
 
 2026-10-12、`next-list` / `ea060b66e` 基点。**設計レビュー待ち・未実装**。
 正本項目: [next-release-backlog.md §1.373](next-release-backlog.md#1373-本棚ツールバーの右クリックで本棚へ追加した操作を-ctrlz-で取り消す--利用者の要望-2026-10-11)。
 アプリは起動していない。実ファイルの削除を行う実装には着手しない。
+
+`001a0dabf` の独立設計レビューは **REVISE**。本改訂は coordinator 判断を優先して
+P1-1 の過剰な同定を撤去し、P1-2 の既存 book operation owner への統合、P2 の失効入口を
+確定した再レビュー用。削除方式の最終承認は利用者が行う。未承認・未実装。
 
 ## 1. 正本の前提と実装の差異
 
@@ -52,16 +56,26 @@ Ctrl+B／メニュー／viewer 追加は同じ成功 receipt を使う。別本 
 
 ### 削除方式 (レビューで確定する判断)
 
-提案は **検証した今回の生成コピーだけを handle で完全削除**。
-`book_fs_journal.rs:329` の `remove_file_if_identity` は、exclusive open → 同じ handle で
-SHA-256検証 → `FileDispositionInfo` による削除を既に実装している。
-今回もこの所有境界を再利用し、名前照合→handle close→path ベース削除に戻さない。
-これは元ファイルの Delete のごみ箱仕様を変更するものではなく、新しい取り消しの提案である。
+既定案は **今回追加したコピーだけをごみ箱へ移す**。完全削除案は撤回する。
+元ファイル・既存ページ・本フォルダは削除しない。既存 delete worker の Shell recycle helper を
+再利用し、ごみ箱に送れない保存先では完全削除に自動 fallback せず、取り消せないと通知する。
+現行一般 Delete の nuke warning／完全削除許容の flags をそのまま Undo へ流用しない。
+ごみ箱必須の設定で拒否できる共通 Shell helper に限定して再利用する。
+**利用者決定 (2026-10-12): ごみ箱へ移す形で確定**。
 
-ごみ箱案では、検証後に handle を閉じて Shell へ path を渡す間に外部が同名を差し替えると、
-違うファイルを削除する余地が残る。安全な staging／所有権移管を別設計せず、既存 recycle
-worker に path を渡すだけの案は採らない。ごみ箱を必須にするか、生成物限定の完全削除でよいかは
-設計責任者／利用者がレビュー時に確定する。**この判断前には実装しない**。
+### receipt 同定の費用とまれな競合 (P1-1への回答)
+
+出力は既存の create-new／上書き禁止規則を維持し、worker が実際に作った全 path を記録する。
+作成した handle からサイズ・完全精度の更新時刻・object identity を取得できる出力経路では
+それを使う。既存 write_source／capture 保存が handle を閉じる経路は、書込直後に worker で
+path + サイズ + 更新時刻を採取すれば足りる。object identity は全経路の必須条件にしない。
+新しい hash 全件計算、全件 handle 保持 API、private staging、多段検証は作らない。
+
+書込完了→receipt 確定、照合→Shellごみ箱移動の短い隙間に、外部プロセスが同名・同じ bytes／
+同じ stamp の別物へ差し替える競合は、coordinator が「通常の使い方では起きない」と判断した。
+**既定の割り切り方針による**。この瞬間の差し替えを防ぐ API／復旧機構は追加しない。
+通常の後続編集／改名／外部追加・削除・上書きは、本構成と receipt stamp の照合で拒否する。
+この区別を、すべての外部変更が構造的に排除されるという保証へ広げない。
 
 ## 3. 所有と受付・完了
 
@@ -69,45 +83,97 @@ worker に path を渡すだけの案は採らない。ごみ箱を必須にす�
 その変更は採らない。追加 worker は既存 `book_op_pending` に載せ、後続操作が起きたら
 取り消し token を失効させる。取消対象の追跡・再開・移動先への追従はしない。
 新しい Undo の検証／削除中だけ modal にして、追加・編集・移動・履歴・窓切替を入れない。
-OS の外部変更は modal で排除できないので、削除対象の handle による同定が別に必要。
+OS の外部変更は modal で排除できないので、§2 の stamp 照合で通常変更を検査する。
 
-`BookAppendUndoState = Empty | Appending { operation, origin, mutation_epoch }
-| Ready { receipt } | Undoing { receipt, receiver }` の一つの owner にまとめる。
-App に独立 pending bool と ready Option を並べない。既存 book pending の intent/result と
-接続し、処理状態を二重に所有しない形を実装レビューで確認する。
-受理時の operation ID と Undo boundary epoch を、非同期成功結果まで引き継ぐ。
+**処理中 owner は既存 `book_op_pending: Option<BookOpPending>` だけ**。
+前版の `BookAppendUndoState`／別 receiver／Undoing／quiescing state を撤去する。
+既存 `BookOpIntent` に `Append` (operation ID・source context・受付 revision を固定) と
+`UndoAppend` (消費した receipt を保持する source mutation intent) を載せ、
+`start_book_op` と `poll_book_op_pending` の同じ要求／終端へ配送する。
+別の pending field や「Undo中」bool は追加しない。
+直後一回の receipt は本操作の既存管理に一つだけ保持する値で、実行中 owner ではない。
+後続 mutation の受付 revision は単調な比較値であり、新しい処理 state machine を作らない。
 
-receipt は root と本の実 folder identity、全 created paths／file object identity／出力 hash、
-成功後の本一覧 stamp、必要な metadata revision、source viewer context／undo epoch を持つ。
-path は worker が実際に作った絶対 path を記録し、UI の変更後 settings／active_book_name で
-作り直さない。worker は既存全件列挙の情報に変更 stamp を加え、出力 hash は書込時に算出する。
-常時全ページをデコード／再 hash しない。初期／事後 snapshot の比較で外部差分が混ざっていたら
-追加は成功しても token は作らず、通常の追加完了として扱う。
+receipt は本棚 root／本 folder、全 created paths と各サイズ・更新時刻 (取れればobject identity)、
+成功後の本全体の構成 stamp、source context、operation ID、受付 revision を持つ。
+UI の後から変わった settings／active_book_name で出力名を作り直さない。
+初期／事後 snapshot に今回の append で説明できない差分があれば追加は成功しても token は
+作らない。元の append・edit／semantic copy・成功 UI の機能は維持する。
 
 1. append の受理時に前 token を退役。既存 Undo/Redo の履歴は捨てない。
-2. 追加中の後続 mutation／Undo boundary は epoch を進める。成功が遅れて来ても古い epoch の
+2. 追加中の後続 mutation／Undo boundary は受付 revision を進める。成功が遅れて来ても古い revision の
    token を復活させない。ファイル追加と通常成功 UI は既存どおり反映する。
 3. metadata copy の受付／完了も同じ append の終端へ含め、成功した自分の内部 copy や同じ
    operation の一覧 refresh を「他操作」と誤分類しない。read-only一覧準備を一般の失効
    除外にせず、operation ID の同一性で限定する。
 4. Ctrl+Z の新操作は `KeyAction` へ配送する。既存メタ Undo の固定 Ctrl+Z の入口も同じ
-   Action (`UndoLastAction` 仮称) に集約し、Readyならこの一回、なければ既存メタ Undoへ。
+   Action (`UndoLastAction` 仮称) に集約し、有効receiptがあればこの一回、なければ既存メタ Undoへ。
    Redoと編集専用 Undo の優先順、IME／dialog gate は維持する。新しい raw `Key::Z` 判定は作らない。
-5. 検証と削除は worker。root と folder の reparse／移動／同名再作成を拒否し、追加後の
-   **本全体の構成・変更 stamp**、mIV metadata epoch を照合する。
-   `BookFileIdentity` は bytes の同定だけなので、同じ bytes の別 object を許可する代用にしない。
-   同定が利用できない filesystem では安全に取り消せないと通知する。
-6. 消す全出力を先に exclusive handle で開いて identity/hash を検証し、全部合格してから削除へ。
-   同じ handle を削除まで保持する。構成検証の確定より後の外部変更は後続変更として扱い、
-   いずれの場合も receipt 外のファイルに削除命令を出さない。
+5. Undo の受付は次節の既存本操作 gate で行い、`UndoAppend` pending を同期的に設定する。
+   検証・ごみ箱移動・purge はその worker が一回の操作として行う。
+6. worker は root／本folder／直下出力範囲 (reparse を辿らない) と、追加後の本全体の構成・
+   各 receipt の stamp を一度照合する。全対象が一致してから Shell recycle を開始する。
+   二件目が不一致なら一件目も Shell へ渡さない。handle を保持する検証 API は作らない。
+   Shell 実行に渡すのは receipt の exact paths だけ、folder丸ごと／glob／番号範囲削除はしない。
 7. worker terminal は実際に消した exact paths を返す。既存 metadata purge／presence／
-   read cache／book count 更新の成功 path 境界を再利用する。全部終端後 token は Empty、Redoなし。
+   read cache／book count 更新の成功 path 境界を再利用する。全部終端後 receipt は消費済み、Redoなし。
    UI thread に read_dir、hash、delete、DB全照会を入れない。
 
-外部の同名差し替え、改名後の旧 path 再作成は、普通に到達する race なので構造で拒否する。
+普通の外部変更・後続操作は失効／stamp 照合で拒否し、§2 の瞬間的な差し替えだけは割り切る。
 書込・DB・削除のまれな失敗は割り切り (ログ + 通知 [+ 作り直し])。自動 rollback／retry／
 partial resume は追加しない。削除途中のまれな失敗時も成功 path だけを反映し、残りを通知する。
 失敗を理由にユーザーの本構成・しおり・設定を作り直さない。
+
+### 3.1 既存の本操作／source mutation の受付境界 (P1-2)
+
+`UndoAppend` は `BookOpIntent::blocks_rename_migration()` の source mutation に含める。
+受付条件は一箇所に揃え、対象viewerの既存解放→最終busy検査→receipt 消費→
+`start_book_op` の pending 設定を同じ
+UI呼出しで行う。metadata producer、Remote、context変更はこの既存 pending の intent を
+参照する。dialog が見えているかだけを排他条件にしない。
+
+| 境界／段階 | 契約 |
+| --- | --- |
+| Undo受付前 | 別 book op、delete、book_reorder の flush／transfer、migration in-flight、cleanup、Remote Active／Acquiring があれば受け付けない。receipt がまだ有効であれば「処理中」と通知し、その入力で古い meta Undo を実行しない |
+| 既に受理済みの書込み | `rename_migration_writers_busy()` の tag未回収 batch、rating、local_adjust未完了／未回収、edit_preview、spread_shift、book_resume、bookmark pending に加え、Remote pending書込み完了を確認。対象viewerの解放がflushを発行した場合も、その後に再検査する。未解放surface／未完了writerがあれば Undoを受け付けず、workerを開始しない。新しい fence／drain待ち state を作らない。自分の append に必要な copy 終端が終わるまで成功 receipt を公開しない |
+| Undo worker開始 | `book_op_pending` を設置した後、worker で既存 `acquire_delete_epub_guard` を exact generated paths に取得。既存 delete-worker と同じ EPUB→shift maintenance の順序。検証より前に取得し、全 Shell chunk と成功分 purge の終端まで保持 |
+| ローカル後続mutation | §3.2 の共通受付で source mutation pending を検査。Undo中は受理・worker投入を行わない。Ctrl+Z連打は新しい操作を開始しない |
+| Remote acquire | 現行 `LocalAiRemoteBarrierSnapshot.book_op_pending` (app.rs:10243) が Undo を含む。pending が残る間は引継ぎを完了しない。Undo前に Acquiring ならローカルUndoを受け付けない |
+| Remote write | `apply_pending_remote_write` (remote_ipc/ui.rs:2413) の bookmark early branch／`apply_remote_write` より前に同じ source mutation gate を適用。Undo中は既存 Busy 応答で終え、書込みを後で再生する新queueは作らない。受理済みRemoteジョブは前段のbusy検査で排除 |
+| 汎用metadata移行 | `rename_migration_source_changes_pending` (app.rs:45960) が Undo intent を見る。queued移行は開始しない。既に走った移行は受付前busyで排除。token失効をworker完了時へ遅らせない |
+| context close／A/B／navigation | Undo pending の間は新しい切替／close要求を受理しない (既存modal受付で理由通知、専用延期stateなし)。対象生成物のreadonly解放だけは受理前の既存 removed-path 経路で行い、同一operation IDに限定する。既に編集draftがあるならtoken失効済みであり、解放による保存を自分のappendの除外にしない。元contextが消えても新contextへreceiptを移さない |
+| 終端 | Shell成功分だけ guarded purge→worker result→UIの成功path更新まで pending を保つ。`poll_book_op_pending` は受信直後に take して受付を開けず、UI終端後に一度退役。Remote引継ぎ／次移行はその後 |
+| 正常終了／強制終了 | 既存本操作の終了判定に同じ pending として含める。別の永続Undoや終了時resumeを作らない。途中でプロセスが失われる場合は既定のまれな失敗方針 |
+
+maintenance lease は **既存受付済みmetadata workerの完了確認の代用ではない**。
+leaseだけ取って後から旧queued書込みが削除pathへ着地する形は不可。
+一方、busyなwriterをUIで同期wait／sleepする形も不可。今回の短いUndo操作だけを既存境界で排他にする。
+
+### 3.2 失効 producer inventory (P2、実装前の確定範囲)
+
+失効は操作の**受付成功から最初のdraft変更／job投入までの間**に行う。
+`push_*_undo_entry` や非同期 completion だけでは遅い。受付共通 helper は
+「既存book source mutationならBusy、その他の後続操作ならreceipt失効／受付revision更新」を
+行う。空target／入力拒否等の非操作はrevisionを進めない。以下を実装・回帰の対象とする。
+
+| producer群 | コード上の入口／捕捉位置 |
+| --- | --- |
+| タグ | `tag_ops.rs::request_tag_toggle_for_targets_impl`、set/add/remove/clear経路から共通 `submit_tag_jobs`。accepted targetsが確定して最初の投入より前。Undo確定／poll結果ではない |
+| ★／解除 | `app.rs::write_user_rating_shared_deferred_from`、`write_user_ratings_shared_deferred_from`、container rating write を共通受付へ。grid/viewer／Remote／Undo由来を同じ境界で扱う |
+| 色補正／標準／ローカル調整 | `set_page_params_for_target`／`set_page_params`、`set_local_adjust_layers_for_idx`、`ui_adjustment_panel.rs` の標準値変更、shape key／drag／brushの最初のdraft mutation。prepare-only hydrationと実editを区別 |
+| 消しゴム／隠蔽／注釈／crop／rotation | mask／conceal／comic／crop等の最初のbrush・shape・text draft変更と、draftを経由しない確定入口 (`save_mask_with_sidecar`、`save_conceal_with_sidecar`、`save_comic_objects` 等)。保存helperだけに寄せない。readonly描画／decodeは除外 |
+| 本しおり／タイトル | `add_current_book_bookmark` (:47419)、remove／set_title、browser削除、Remoteのbookmark branch。service投入前。`clear_book_bookmark_title_edit` はhydration／破棄だけなら非mutation |
+| 見開き／トリム／読書設定 | `app/spread_shift_owner.rs::set_live_spread_shift`／reset、fullscreenのspread／page-alone／final-cover設定、view trim永続化。setter／service投入前。通常read-only読書位置記録は後続ユーザー編集として失効させないが、未完了書込みは§3.1のbusyに含める |
+| 本の操作 | `start_book_append_to_named`／create／rename／delete／transfer、`ui_main.rs::move_selected_book_reorder_group` 等の最初のreorder draft変更。flush受付より前。管理一覧のreadonly refreshは一般除外せず、source一覧を置換するものは下記境界へ |
+| 実ファイル操作 | `start_delete_files`、rename dialog submit、file_organize submit、Shell paste・D&D copy の受付、native Shell操作へ制御を渡す時点。結果pollより前。ZIP/PDF内の拒否入力は操作でない |
+| メタ Undo／Redo・編集専用 Undo | 通常のUndo/Redoが受理された時点。book receiptを消費するこの一回のUndoは別のmeta entryをpopしない |
+| 一覧／context 終了 | `clear_meta_undo`／そのrating move版、主一覧採用／検索置換、quick-folder切替、viewer真のclose、A/B交換／context破棄の共通受付。後から古いappend完了が届いてもrevision/context不一致でreceiptを公開しない |
+| Remote | acquire受付でsource contextのtoken失効、上記Remote write共通入口で受付revision更新。bookmark early branch、spread／rating／tag、Remote切断・context退役も含む。既存session ownershipを維持 |
+| metadata import／復元・設定 | metadata transferのwrite受付、content-identity復元の採用、本root変更／対象書込みに影響する設定変更。表示を読むだけのworkerは失効しない |
+| 自分のcopy／refresh | `Append` intentに捕捉した同一operation IDから配送されたedit/semantic copyと一覧refreshだけを除外。source path一致／時間窓／「本処理中」だけでは除外しない。異なるaccepted mutationは必ず失効 |
+
+同じreceiptに対する失効は冪等。producerごとに別pending／復活用snapshotを置かない。
+自分の刷新で一覧世代が変わっても同一operationの採用として扱い、後続の別更新は失効させる。
 
 ## 4. 並べ替え・membership・実装範囲
 
@@ -120,19 +186,30 @@ membership が別工程で導入された場合は、同じ receipt の `created
 現基点には該当 DB がないため、今回の実装に membership schema やバッジは追加しない。
 この前提差を coordinator が採否判断する。
 
-予定実装: `books.rs` (出力receipt)、`book_fs_journal.rs` (同定済みhandleの再利用)、
+予定実装: `books.rs` (出力receipt／既存intent・result)、`delete_worker.rs` (ごみ箱必須helper／
+既存guarded purge共通経路)、
 `app.rs` (book operation intent / terminal)、`undo_ops.rs`、`keymap.rs`、
-`ui_main.rs` / `ui_fullscreen.rs` の追加／mutation入口、並べ替え dialog の実所有箇所。
+`ui_main.rs` / `ui_fullscreen.rs`／`ui_adjustment_panel.rs` のmutation入口、`tag_ops.rs`、
+`app/spread_shift_owner.rs`、`remote_ipc/ui.rs`、file operation dialog受付、
+context採用／終了の既存所有箇所。`book_fs_journal.rs` の全件handle新APIは対象外。
 `undo_stack.rs` の metadata entry にファイル削除は追加しない。
 文書は compile-book、keymap spec／plan、architecture、必要なら virtual-folders を同時更新。
-metadata mutation／Undo boundary の inventory は独立レビューで確定してから編集する。
+§3.2 のinventoryを確定範囲とし、実装中に別の直接書込み入口が判明したら同じ受付へ接続し、
+根拠と追加範囲をレビューへ戻す。completionだけのtoken失効で代用しない。
 
 ## 5. 回帰・受入
 
 予定 (未実行): 単枚／複数／Stack／ZIP／PDF／合成の一回 undo、元と既存ページが残ること、
 二度目の Ctrl+Z と Redo、古い metadata 履歴、後続タグ／編集／別追加／並べ替え draft／
 navigation／context切替、遅延成功結果、同じ operation の refresh、外部追加／同名再作成／
-内容上書き／本改名／reparse、検証→削除間の差し替え拒否、途中write失敗、purge成功path。
+内容上書き／本改名／reparse、二件目のstamp不一致ならShell呼出し0件、途中write失敗、purge成功path。
+ごみ箱非対応なら完全削除呼出し0件、receiptにないpathへの削除要求0件。
+§3.2 のproducerを各群最低一件、受付直後・非同期完了前に失効することを検査。
+Remote acquire先着／Undo先着、queued Remote bookmark／spread書込み、既存tag/rating/
+local-adjust/bookmark等の未完了writer、queued／in-flight migration、context close／A/B、
+worker result受信→UI purge反映の間も同じbook pendingで受付が閉じることを検査。
+対象viewer解放が書込みを発行した場合の受付拒否も検査する。
+瞬間的な同bytes別object差し替えを必須試験／新APIの動機にしない (**既定の割り切り方針による**)。
 membership は統合された場合に専用回帰を追加。
 
 検証所有者: 実装担当。targeted、fmt、通常／portable core check、項目末尾 full gate 一回。
