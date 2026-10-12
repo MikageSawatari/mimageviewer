@@ -38,8 +38,8 @@
 
 ### 1.376 起動記録 (startup-logs) が 0 バイトのまま残る起動がある — v4.6.0 でも残る (2026-10-12)
 - **次の版に入れる (利用者 2026-10-12)**。
-- 内容: `%LOCALAPPDATA%\mimageviewer\startup-logs` の core / launcher の記録が 0 バイトの起動がある (v4.4.0 で 10 件すべて、v4.6.0 の開発機でも一部)。実装担当がテストで OS error 33 (共有ロック中の書き込み) を再現している。修正は Store 用の切り分け版 (worktree mimageviewer-alloc、branch next-alloc の `90a8a9353` Fix Windows startup timeline writes with separate retention leases) にあり、master に入っていない。
-- 対応: allocator 切り替え (`0aad6cb95` など) とは分けて、記録の書き込み修正だけを取り込む。Store の起動停止の調査 ([MS Store の記録] の v4.1.0 / v4.3.0 却下) で、止まったときの手がかりになる。
+- 内容: `%LOCALAPPDATA%\mimageviewer\startup-logs` の core / launcher の記録が 0 バイトの起動がある (v4.4.0 で 10 件すべて、v4.6.0 の開発機でも一部)。実装担当がテストで OS error 33 (共有ロック中の書き込み) を再現している。**訂正 (2026-10-12、実装担当の確認)**: Store 用の切り分け版 (next-alloc の `90a8a9353`) の書き込み修正は、`642ed1ee5` で master に移植済み (v4.6.0 に入っている、`crates/startup-diagnostics/src/output.rs`、`docs/startup-diagnostics-plan.md` §10.4)。開発機で 0 バイトだったのは 10-11 19:25 と 10-12 00:22 の 2 組だけで、00:22 は v4.6.0 の配布ビルド中。ビルドやテストの短時間起動かを確認中 (worktree mimageviewer-nextfix)。
+- 対応: 短時間起動による空ファイルなら仕様として記録する。そうでなければ原因を調べる。Store の起動停止の調査 ([MS Store の記録] の v4.1.0 / v4.3.0 却下) で、止まったときの手がかりになる。
 
 ### 1.375 フォルダで Delete キーで削除すると、正しく消えた一覧がもう一度丸ごと読み直されてちらつく — 利用者の実機報告 (2026-10-12)
 - **次の版に入れる (利用者 2026-10-12)**。
