@@ -27,7 +27,7 @@ UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot
 更新後は `tests/snapshots/*.png` の差分を必ず目視確認してからコミットする。
 git diff のバイナリ比較では変化の意図 (改善なのか回帰なのか) は判断できない。
 
-閲覧中のページ一覧（§1.340）は専用6枚に加え、unit snapshotの
+閲覧中のページ一覧（§1.340）は専用8枚に加え、unit snapshotの
 `fullscreen_overflow_panel_root`で「ページ一覧 [O]」を含む7行の入口を検査する。
 行のtouch targetは48pxを維持し、狭い面では共通のscroll／clampを使う。
 rootの入口追加で変わったPNGは1枚だけを更新して目視確認し、navigator submenuの基準は維持する。
@@ -56,7 +56,12 @@ Light／Dark × 標準／強い、計8枚を保持する。前者は六分類・
 
 本のページ一覧 (§1.340) は `page_overview_light/dark`、
 `page_overview_narrow_light/dark`、`page_overview_rtl_dark`、
-`page_overview_white_companion_dark` の6ケースを定義する。通常は600×420、狭幅は200×440。
+`page_overview_white_companion_dark`、`page_overview_eight_columns_dark`、
+`page_overview_twenty_columns_dark` の8ケースを定義する。通常は600×420、狭幅は200×440、
+8列は960×480、20列は2200×440。初期8列と上限20列を実際に描画し、通常／狭幅は
+最小セル幅で実効列数が減ることも確認する。Light／Darkは親のテーマを表し、一覧自体は
+共通rendererのchild Uiに`os_theme::apply_dark_ui`を適用して常に黒ベースにする。
+親visuals／Contextの両theme style／theme preferenceの不変と強い文字コントラストの維持はunitテストで検査する。
 本体と共通のrendererで固定ヘッダ・戻る・列数・番号／短名・現在ページとcursor・
 placeholder／失敗セル・RTL順・白紙／表示余白の補助表示を描く。
 fixtureはApp・実ファイル・workerを使わず、全ページ生成や製品起動を行わない。

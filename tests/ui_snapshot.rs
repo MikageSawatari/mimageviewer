@@ -3783,6 +3783,24 @@ fn page_overview_snapshot(
     rtl: bool,
     white_companion: bool,
 ) {
+    page_overview_snapshot_with_columns(
+        name,
+        theme,
+        size,
+        rtl,
+        white_companion,
+        mimageviewer::page_overview::PageOverviewLayout::DEFAULT_COLUMNS,
+    );
+}
+
+fn page_overview_snapshot_with_columns(
+    name: &str,
+    theme: mimageviewer::os_theme::ResolvedTheme,
+    size: egui::Vec2,
+    rtl: bool,
+    white_companion: bool,
+    columns: u8,
+) {
     use mimageviewer::book_resume_db::PageIdentity;
     use mimageviewer::page_overview::{
         PageOverviewDirection, PageOverviewEntry, PageOverviewMetadata, PageOverviewPage,
@@ -3832,7 +3850,7 @@ fn page_overview_snapshot(
             incarnation: 4,
         },
         0,
-        4,
+        columns,
         egui::Rect::from_min_size(egui::Pos2::ZERO, size),
         direction,
     )
@@ -3924,5 +3942,28 @@ fn page_overview_white_companion_dark() {
         egui::vec2(600.0, 420.0),
         false,
         true,
+    );
+}
+
+#[test]
+fn page_overview_eight_columns_dark() {
+    page_overview_snapshot(
+        "page_overview_eight_columns_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(960.0, 480.0),
+        false,
+        false,
+    );
+}
+
+#[test]
+fn page_overview_twenty_columns_dark() {
+    page_overview_snapshot_with_columns(
+        "page_overview_twenty_columns_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(2200.0, 440.0),
+        false,
+        false,
+        20,
     );
 }

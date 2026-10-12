@@ -1,8 +1,8 @@
 //! Connect the pure overview to its existing viewer owner and ordinary absolute navigation.
 use super::*;
 use crate::page_overview::{
-    PageOverviewCursorMove, PageOverviewDirection, PageOverviewSelect, PageOverviewStamp,
-    PageOverviewState, PageOverviewView,
+    PageOverviewCursorMove, PageOverviewDirection, PageOverviewLayout, PageOverviewSelect,
+    PageOverviewStamp, PageOverviewState, PageOverviewView,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -186,8 +186,14 @@ impl App {
             .checked_add(1)
             .expect("page overview incarnation exhausted");
         let stamp = self.page_overview_stamp(&projection);
-        let Ok(opened) = PageOverviewState::open(projection, stamp, idx, 4, viewport, direction)
-        else {
+        let Ok(opened) = PageOverviewState::open(
+            projection,
+            stamp,
+            idx,
+            PageOverviewLayout::DEFAULT_COLUMNS,
+            viewport,
+            direction,
+        ) else {
             return false;
         };
         self.page_overview = opened;
@@ -397,8 +403,10 @@ fn apply_overview_layout_command(
             session.scroll_rows(*delta, &layout);
         }
         PageOverviewCommand::ColumnsDelta { delta, .. } => {
-            let columns = (i16::from(session.view().preferred_columns) + i16::from(*delta))
-                .clamp(1, 10) as u8;
+            let columns = (i16::from(session.view().preferred_columns) + i16::from(*delta)).clamp(
+                i16::from(PageOverviewLayout::MIN_COLUMNS),
+                i16::from(PageOverviewLayout::MAX_COLUMNS),
+            ) as u8;
             session.set_preferred_columns(columns, viewport, direction);
         }
         PageOverviewCommand::Cancel { .. }
@@ -486,7 +494,7 @@ mod tests {
             Default::default()
         ));
         let view = state.session().unwrap().view();
-        assert_eq!(view.preferred_columns, 10);
+        assert_eq!(view.preferred_columns, 20);
         assert_eq!(view.capture_select(view.cursor), Some(selection));
         assert!(!overview_command_matches(
             &state,
@@ -657,6 +665,10 @@ mod tests {
             Default::default()
         ));
         let before = app.page_overview_view().unwrap();
+        assert_eq!(
+            before.preferred_columns,
+            PageOverviewLayout::DEFAULT_COLUMNS
+        );
         app.show_search_bar = true;
         for action in [
             crate::keymap::KeyAction::FsCtrlNavPrev,

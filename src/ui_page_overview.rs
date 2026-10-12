@@ -282,7 +282,10 @@ fn wheel_actions(
         actions.push(PageOverviewUiAction::ScrollRows(delta));
     }
     let preferred = i16::from(view.preferred_columns);
-    let columns = ((preferred + i16::from(columns)).clamp(1, 10) - preferred) as i8;
+    let columns = ((preferred + i16::from(columns)).clamp(
+        i16::from(PageOverviewLayout::MIN_COLUMNS),
+        i16::from(PageOverviewLayout::MAX_COLUMNS),
+    ) - preferred) as i8;
     if columns != 0 {
         actions.push(PageOverviewUiAction::ColumnsDelta(columns));
     }
@@ -332,6 +335,15 @@ pub fn draw_page_overview(
     ui: &mut egui::Ui,
     input: PageOverviewRenderInput<'_>,
 ) -> PageOverviewRenderOutput {
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(ui.available_rect_before_wrap()));
+    crate::os_theme::apply_dark_ui(&mut child);
+    draw_dark_page_overview(&mut child, input)
+}
+
+fn draw_dark_page_overview(
+    ui: &mut egui::Ui,
+    input: PageOverviewRenderInput<'_>,
+) -> PageOverviewRenderOutput {
     let surface = ui.available_rect_before_wrap();
     let geometry = page_overview_geometry(surface, input.view, input.direction);
     let layout = geometry.layout;
@@ -343,7 +355,7 @@ pub fn draw_page_overview(
     let painter = ui
         .painter()
         .with_clip_rect(surface.intersect(ui.clip_rect()));
-    painter.rect_filled(surface, 0.0, ui.visuals().panel_fill);
+    painter.rect_filled(surface, 0.0, Color32::BLACK);
     painter.rect_filled(geometry.header, 0.0, ui.visuals().faint_bg_color);
     let id = ui.id().with((
         "page-overview",
@@ -401,7 +413,7 @@ pub fn draw_page_overview(
         geometry.columns_less,
         id.with("less"),
         "-",
-        view.preferred_columns > 1,
+        view.preferred_columns > PageOverviewLayout::MIN_COLUMNS,
         input.input_enabled,
     ) {
         actions.push(PageOverviewUiAction::ColumnsDelta(-1));
@@ -411,7 +423,7 @@ pub fn draw_page_overview(
         geometry.columns_more,
         id.with("more"),
         "+",
-        view.preferred_columns < 10,
+        view.preferred_columns < PageOverviewLayout::MAX_COLUMNS,
         input.input_enabled,
     ) {
         actions.push(PageOverviewUiAction::ColumnsDelta(1));
@@ -789,6 +801,62 @@ mod tests {
             wheel_actions(&[wheel(-3.0, true)], &view, &grid),
             vec![PageOverviewUiAction::ColumnsDelta(1)]
         );
+        view.preferred_columns = 20;
+        assert!(wheel_actions(&[wheel(-3.0, true)], &view, &grid).is_empty());
+        view.preferred_columns = 19;
+        assert_eq!(
+            wheel_actions(&vec![wheel(-3.0, true); 4], &view, &grid),
+            vec![PageOverviewUiAction::ColumnsDelta(1)]
+        );
+    }
+
+    #[test]
+    fn overview_dark_child_preserves_parent_theme_and_text_contrast() {
+        let ctx = egui::Context::default();
+        crate::os_theme::apply_resolved_with_contrast(
+            &ctx,
+            crate::os_theme::ResolvedTheme::Light,
+            crate::settings::TextContrast::Strong,
+        );
+        let light_before = ctx.style_of(egui::Theme::Light);
+        let dark_before = ctx.style_of(egui::Theme::Dark);
+        let preference_before = ctx.options(|options| options.theme_preference);
+        let view = view(20);
+        let mut surface = Rect::NOTHING;
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| {
+                    let parent_visuals = ui.visuals().clone();
+                    surface = ui.available_rect_before_wrap();
+                    draw_page_overview(
+                        ui,
+                        PageOverviewRenderInput {
+                            view: &view,
+                            title: "book",
+                            current_items_indices: &[0],
+                            thumbnails: None,
+                            direction: PageOverviewDirection::LeftToRight,
+                            input_enabled: false,
+                        },
+                    );
+                    assert_eq!(ui.visuals(), &parent_visuals);
+                });
+        });
+        assert_eq!(ctx.style_of(egui::Theme::Light), light_before);
+        assert_eq!(ctx.style_of(egui::Theme::Dark), dark_before);
+        assert_eq!(
+            ctx.options(|options| options.theme_preference),
+            preference_before
+        );
+        assert!(output.shapes.iter().any(|shape| matches!(
+            &shape.shape, egui::Shape::Rect(rect) if rect.rect == surface && rect.fill == Color32::BLACK
+        )));
+        let text_color =
+            crate::os_theme::dark_visuals(crate::settings::TextContrast::Strong).text_color();
+        assert!(output.shapes.iter().any(|shape| matches!(
+            &shape.shape, egui::Shape::Text(text) if text.fallback_color == text_color
+        )));
     }
 
     #[test]

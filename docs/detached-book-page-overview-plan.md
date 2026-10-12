@@ -62,13 +62,18 @@ R3 の非アクティブ context への Select 破棄・一覧維持の契約は
 
 単クリックで閲覧へ戻る、RTL の行内順、取消で元ページ維持、一覧中だけ当該 viewer の
 スライドショー休止・退出後再開、現在の読書列全体を対象として階層をまたがない操作は、
-2026-10-12 に利用者が案どおり確定した。列数の初期値等、未確定の細部は引き続き案として記す。
+2026-10-12 に利用者が案どおり確定した。同日の確認用ビルドでの利用者確認により、
+黒ベースの暗色固定、初期8列、最大20列も確定した（§21）。
 
 ### 3.1 一覧
 
 - 現在 viewer のクライアント領域を一覧へ切り替える。通常 fullscreen は同じ fullscreen viewport、
   メイン内閲覧は同じ root viewport の閲覧領域、detached は同じ画像窓を使う。
   別 HWND、メイン一覧への切替、独立ダイアログは作らない。
+- 通常fullscreen／メイン内閲覧／detachedの共通renderer内のchild Uiに
+  `os_theme::apply_dark_ui`を適用し、本文の背景は黒とする。固定ヘッダ・操作・文字は
+  helperの暗色visualsと現在の文字コントラスト設定に従う。passive投影も同じrendererを使う。
+  親UiやContextのテーマ／styleを書き換えず、Lightのメイン画面への影響を出さない。
 - 上部に本／階層の名前、現在位置／総数、列数の増減、「ページ表示に戻る」を固定する。
   OS の窓を閉じる操作と一覧を閉じる操作を区別する。
 - 本文はスクロール可能なタイル。1 可視実ページにつき 1 セル、ページ番号と短い名前を付ける。
@@ -79,7 +84,8 @@ R3 の非アクティブ context への Select 破棄・一覧維持の契約は
   失敗セルも選択でき、元画像の読み取りエラーは既存のページオープン経路が通知する。
 - セルの単クリック／タップ、またはカーソルを合わせて確定すると一覧を閉じ、同じ窓へ着地する。
   カーソル移動・スクロール・hover だけでは読書位置を書き換えない。
-- 列数は窓ごとのセッション値（初期案 4 列、1〜10 列かつ最小セル幅で実効列数を制限）。
+- 列数は窓ごとのセッション値（初期8列、1〜20列かつ最小セル幅96 logical pxで実効列数を制限）。
+  最小／最大値はメインGridの`settings::MIN_GRID_COLS`／`MAX_GRID_COLS`を共有する。
   ボタンと Ctrl+wheel で変更でき、リサイズ時はカーソル位置を基点に可視範囲を再計算する。
   UI 倍率と client rect は**その描画先**から取得する。セル高さにも下限を設け、窓サイズによる
   実効可視行数を bounded にする。小窓でも戻るボタンとスクロール導線を残す。
@@ -1066,3 +1072,43 @@ PDF／変換済みEPUBでO／「…」入口→スクロール→単クリック
 通常／連動SelectはGrid追従・独立Selectはmain非干渉、Sの休止／再開も確認対象とする。
 nativeのDPI／placeholder first-click、AへEnter配送→B復帰でAのSelect破棄、
 HWND／foreground／実PDFium／実機性能の受入は利用者の実機確認に残す。
+
+## 21. 利用者確認後の暗色・列数修正（2026-10-12）
+
+利用者がPDF対応前の確認用ビルドを操作し、Lightテーマで一覧も明るくなる点と、
+初期4列／最大10列の密度を変更するよう指定した。§20のmerge／PDF接続／full補完／
+確認用buildを完了後、黒ベースの暗色固定・初期8列／最大20列へ変更する。
+
+`ui_page_overview`の共通rendererにchild Uiを設け、既存`os_theme::apply_dark_ui`を
+そのchildだけに適用する。文字色を別途固定せず現在の文字コントラスト設定を使い、
+親Ui・Contextのtheme preference／LightとDarkのstyleは不変とする。
+通常fullscreen・メイン内閲覧・detached・passive投影は同じ描画関数を使うため、
+入口ごとのテーマ例外やviewer所有／viewport／入力状態は追加しない。
+
+初期値は`PageOverviewLayout::DEFAULT_COLUMNS = 8`、最小／最大は
+`settings::MIN_GRID_COLS`／`MAX_GRID_COLS`を共有し、open／layout／列数command／
+wheel／ボタンを同じ範囲へ揃える。最小セル幅96 logical px、cursor基点のreflow、
+窓ごとのセッション値は維持し、新規の保存設定やmain Grid列数変更は作らない。
+
+snapshotは既存6枚を更新し、実際の8列（960×480）／20列（2200×440）を2枚追加する。
+Light／Dark親で一覧が暗色のままであること、狭幅・RTL・白紙補助表示を確認し、
+マニュアルには暗色固定・初期8列／1〜20列・狭い窓での実効列制限を追記する。
+§20のtest-fullは再実行しない。この修正の検証結果:
+
+| 検証 | 実数／結果 |
+| --- | --- |
+| lib `overview` targeted（`pack-build-tools`） | 86 passed、0 failed／ignored。親テーマ非干渉・Strong文字色、実App初期8列、20列上限／最小幅制限を含む |
+| integration `ui_snapshot ... page_overview`（`pack-build-tools`） | 基準生成8 passed、UPDATEなしの通常比較8 passed。8枚すべて目視確認 |
+| `cargo fmt --check` | 成功 |
+| 通常／portable core `cargo check` | 各成功（29.58秒／25.26秒） |
+| `check_ui_glyphs.py` | 危険glyph 0 |
+| 限定独立レビュー（Sol/xhigh） | ACCEPT、P1／P2／P3なし。共通child暗色境界・全caller・列数境界・8枚を確認 |
+| `build-dev.ps1 -PreserveRuntime` | 成功。通常feature／非portable。core 4分26秒、Remote 0.55秒、EPUB worker 0.49秒、ランタイム4／PE3の検査成功 |
+
+本修正の差分は15ファイル（Rust4、docs2、manual1、PNG8）。
+`git add`／commit／製品起動は行わず、CHANGELOG／バージョン表記も追加しない。
+
+確認用binaryは`target/dev-runtime/mimageviewer-core.exe`。§20.2の起動コマンドと
+通常profile／共有mutexの注意を継承する。Lightテーマで通常fullscreen／メイン内閲覧と
+detachedのO一覧を開き、黒ベース・広い窓での初期8列・＋／Ctrl+wheelで最大20列・
+小窓での実効列制限を確認する。取消後もメインがLightのままであることを確認対象に加える。

@@ -184,6 +184,9 @@ pub struct PageOverviewLayout {
 }
 
 impl PageOverviewLayout {
+    pub const DEFAULT_COLUMNS: u8 = 8;
+    pub const MIN_COLUMNS: u8 = crate::settings::MIN_GRID_COLS as u8;
+    pub const MAX_COLUMNS: u8 = crate::settings::MAX_GRID_COLS as u8;
     pub const MIN_CELL_WIDTH: f32 = 96.0;
     pub const MIN_CELL_HEIGHT: f32 = 120.0;
     pub const GAP: f32 = 8.0;
@@ -207,7 +210,8 @@ impl PageOverviewLayout {
         };
         let fits =
             ((viewport.width() + Self::GAP) / (Self::MIN_CELL_WIDTH + Self::GAP)).floor() as usize;
-        let columns = usize::from(preferred_columns.clamp(1, 10)).min(fits.max(1));
+        let columns = usize::from(preferred_columns.clamp(Self::MIN_COLUMNS, Self::MAX_COLUMNS))
+            .min(fits.max(1));
         let width = ((viewport.width() - Self::GAP * (columns - 1) as f32) / columns as f32)
             .max(Self::MIN_CELL_WIDTH);
         Self {
@@ -510,7 +514,10 @@ impl PageOverviewState {
             stamp,
             cursor,
             scroll_anchor: PageOverviewScrollAnchor::default(),
-            preferred_columns: preferred_columns.clamp(1, 10),
+            preferred_columns: preferred_columns.clamp(
+                PageOverviewLayout::MIN_COLUMNS,
+                PageOverviewLayout::MAX_COLUMNS,
+            ),
         };
         let layout = view.layout(viewport, direction);
         view.scroll_anchor = layout.clamp_anchor(PageOverviewScrollAnchor {
@@ -659,7 +666,10 @@ impl PageOverviewSession {
         direction: PageOverviewDirection,
     ) -> PageOverviewLayout {
         let previous = self.view.layout(viewport, direction);
-        self.view.preferred_columns = preferred_columns.clamp(1, 10);
+        self.view.preferred_columns = preferred_columns.clamp(
+            PageOverviewLayout::MIN_COLUMNS,
+            PageOverviewLayout::MAX_COLUMNS,
+        );
         let next = self.view.layout(viewport, direction);
         self.reflow(&previous, &next);
         next
@@ -870,10 +880,21 @@ mod tests {
             grid.visible_ordinals(PageOverviewScrollAnchor::default()),
             0..1
         );
-        let wide = Rect::from_min_size(Pos2::ZERO, egui::vec2(2000.0, 500.0));
+        let wide = Rect::from_min_size(Pos2::ZERO, egui::vec2(2200.0, 500.0));
         assert_eq!(
             PageOverviewLayout::new(100, 255, wide, PageOverviewDirection::LeftToRight).columns(),
-            10
+            20
+        );
+        assert_eq!(
+            PageOverviewLayout::new(
+                100,
+                20,
+                Rect::from_min_size(Pos2::ZERO, egui::vec2(2000.0, 500.0)),
+                PageOverviewDirection::LeftToRight,
+            )
+            .columns(),
+            19,
+            "the minimum cell width still limits effective columns"
         );
         assert_eq!(
             PageOverviewLayout::new(100, 0, wide, PageOverviewDirection::LeftToRight).columns(),
