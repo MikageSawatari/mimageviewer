@@ -157,15 +157,6 @@ impl SidecarProbeProof {
         };
         let edits = family(families.edits, MarkerStore::Edits)?;
         let tags = family(families.tags, MarkerStore::Tags)?;
-        let composition = super::folder_composition::probe(
-            data_dir,
-            &self.sidecar,
-            &super::SidecarImportSource::Disk(self.source.clone()),
-            families.composition,
-        );
-        if !family_synchronized(families.composition, &composition) {
-            return Err(SidecarProbeReuseMissReason::MarkerMismatch);
-        }
         if cancel.load(Ordering::Relaxed) {
             return Err(SidecarProbeReuseMissReason::Cancelled);
         }
@@ -180,11 +171,7 @@ impl SidecarProbeProof {
                 .clone_clean_import_snapshot()
                 .ok_or(SidecarProbeReuseMissReason::Ineligible)?,
             source: Some(self.source.clone()),
-            result: {
-                let mut result = probe_result(started, load_elapsed, Duration::ZERO, edits, tags);
-                result.composition = composition;
-                result
-            },
+            result: probe_result(started, load_elapsed, Duration::ZERO, edits, tags),
         })
     }
 }
@@ -282,7 +269,7 @@ pub(super) fn proof_candidate(
     data_dir: &Path,
     families: ImportFamilies,
 ) -> Result<Arc<SidecarProbeProof>, SidecarProbeReuseMissReason> {
-    if !families.edits && !families.tags && !families.composition {
+    if !families.edits && !families.tags {
         return Err(SidecarProbeReuseMissReason::Ineligible);
     }
     let SidecarImportProbe::Current {
@@ -297,7 +284,6 @@ pub(super) fn proof_candidate(
         || sidecar.is_dirty()
         || !family_synchronized(families.edits, &result.edits)
         || !family_synchronized(families.tags, &result.tags)
-        || !family_synchronized(families.composition, &result.composition)
         || sidecar.folder() != folder
     {
         return Err(SidecarProbeReuseMissReason::Ineligible);
@@ -332,18 +318,6 @@ fn estimate_proof_heap(source: &SidecarDiskToken, sidecar: &SidecarFile) -> Opti
         return None;
     }
     let mut bytes = source.byte_len().checked_mul(8)?;
-    if let Some(root) = sidecar.folder_composition() {
-        bytes = bytes.checked_add(
-            (root.units.capacity()
-                * std::mem::size_of::<crate::book_composition::CompositionUnit>())
-                as u64,
-        )?;
-        bytes = bytes.checked_add(
-            (root.hidden_pages.capacity()
-                * std::mem::size_of::<crate::book_composition::CompositionPageRef>())
-                as u64,
-        )?;
-    }
     for entry in sidecar.items().values() {
         // BTreeMap node slots/allocator slack plus the inline String and entry.
         bytes = bytes.checked_add(

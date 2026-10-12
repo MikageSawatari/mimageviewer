@@ -1,6 +1,6 @@
 # §1.242 本の構成 — 設計案
 
-更新: 2026-10-11、G3実装と安全でない書庫参照の扱いを追記。ライン G / `next-book`。
+更新: 2026-10-12、利用者決定によるG4F切り離しと共通保存票の転送開始境界を追記。ライン G / `next-book`。
 設計履歴: R6は独立再レビューACCEPT、P3文言修正は `330e070f6`。G0照合treeは `76488f0ec`。
 Eの共有BookScopeKeyと§1.364はmerge `97c9b711d`で取り込み済み。G3の実装・検証結果は§13とhandoffへ記録し、受入とは区別する。
 
@@ -15,7 +15,7 @@ Eの共有BookScopeKeyと§1.364はmerge `97c9b711d`で取り込み済み。G3�
 正本は [next-release-backlog.md §1.242 / §1.364](next-release-backlog.md)。2026-09-15 の利用者決定と
 2026-10-10 の追補を区別する。
 
-- ZIP/CBZ、PDF、EPUB、画像だけの本フォルダ、直接閲覧・変換閲覧する対応書庫に、本単位の非破壊な構成を保存する。
+- ZIP/CBZ、PDF、EPUB、直接閲覧・変換閲覧する対応書庫に、本単位の非破壊な構成を保存する。
   書庫階層ごとに独立する。製本フォルダは構成作成対象外。変換書庫の保存先 identity は元書庫。
 - ページの並べ替え、非表示、任意位置の白紙、見開きの組、単ページ配置を編集する。
   表紙あり/なし・右開き/左開きを構成に含める。方向は本の作り方によって決まるため、閲覧設定ではなく構成の所有とする。
@@ -36,8 +36,10 @@ Eの共有BookScopeKeyと§1.364はmerge `97c9b711d`で取り込み済み。G3�
 
 EPUBも今回対象。既存個別編集と同じ元EPUB + 物理ページ番号を使う (§4.1)。
 再変換でページがずれる場合は既存編集と同様に構成もずれる仕様を利用者が了承した。
-画像だけの本フォルダは独立したG4Fで追加する。難航時は利用者相談でその段階だけ外し、
-書庫/PDF/EPUBを先に完成できる (§13)。製本フォルダは引き続き対象外。
+**2026-10-12 利用者決定**: 独立段階G4Fを切り離し、画像だけのフォルダは今期の構成対象外とする。
+ZIP/PDF/EPUBのG1〜G4、既存folder閲覧・個別編集・sidecar v1・metadata transferを維持する。
+次段は「画像フォルダをZIPに変換する機能」で、設計は利用者確認待ち。今回は変換ボタンを追加しない。
+製本フォルダも引き続き構成対象外。対象範囲の旧G4F記述は将来案として読み、現行契約は本決定を優先する。
 
 抽出一覧A2は**v4.5.0の既存挙動を意図して変更する、2026-10-10承認済み仕様**。
 Ctrl+G/タグ/評価/スマートフォルダ/コレクション/★固定/サブフォルダ展開は、開くたび単ページ。
@@ -1631,6 +1633,10 @@ context所有のBoxに置き、ClosedのAppやbundleへその全サイズを埋�
 短いLocal admissionで採用し、workerの列挙・fingerprint・構成writer待ちをそのlock内へ置かない。
 送信済み保存ticketはeditor/window closeで破棄せず、共通完了ownerが一回回収してRemote取得barrierへ渡す。
 各窓のreload着地と、編集元の捕捉したresume intentの一回受付は別の責任として扱う。
+metadata preview/import/exportとGeneric改名maintenanceの開始も、この同じ保存票の完了・採用を待つ。
+保存workerがserviceへwriteを送る前に窓を閉じても、転送previewがmaintenanceを先取りしない。
+転送は既存WaitingForWritersの待ち先を型で分け、UIで待機・DB/FS処理をせず、並列のpending ownerを作らない。
+folderのsidecar restoreは構成maintenanceを使わないため、この待ちを追加せず従来の開始条件を維持する。
 
 `book_composition/editor` のdraftは明示unitを保ち、操作previewを経て方向/表紙/Pair/Single/空き側を
 変更する。既存Pairを壊す操作、方向・表紙で組を作り直す操作は変更される組を確認してから適用する。
@@ -1671,7 +1677,24 @@ PNG生成・目視、最終共有gate・確認build・独立レビューの実�
 この実装記述をテスト成功や実機確認の証拠とは扱わない。出荷は利用者決定どおり**次々回release**、
 今回のmasterには統合しない。画像folder/sidecarはG4F、Remote/出力の残る契約はG5を維持する。
 
-### G4F: 画像だけの本フォルダ (独立・切り離し可能)
+### G4F: 画像だけの本フォルダ (2026-10-12 利用者決定で切り離し・将来案)
+
+**切り離し決定（2026-10-12 利用者）**: 以下は採択前の将来案であり、今回の実装・gateには含めない。
+`6b6b259e6`と`ecd2eaf7e`のfolder adapter/editor/sidecar v2・専用tests/snapshotを撤去する。
+共通pure model、BookScopeKey、A2/Q16、G4 owner/ticketは再設計しない。未リリースのためmigrationは不要。
+単純な二コミットの撤去だけでは、G3で先取りしたImageFolder行のruntime消費が残るため、
+通常/抽出/退避画像の提示候補、類似preview、RemoteのFile候補・binding受付・構成管理表示も対象外へ揃える。
+型・pure resolver・store・明示転送のfolder値は将来用として保持し、既存DB行を削除・移行しない。
+File画像は既存の候補なし/Allowed(None)を使い、画像閲覧・個別編集・Eのfolder見開き調整を妨げない。
+Remoteのwire形状は変更しない。保護対象を持たない完全空のwrite admissionは構成snapshotへ依存せず、
+対象がある書庫/PDF/EPUBのadmissionは従来どおり失敗時に書込を拒否する。
+書庫/PDF/EPUBにも必要なGeneric改名開始時の送信済保存票確認は残す。
+Checking予約のfolder root除外・改名mirrorからcache採用までのfolder claimは、mirror自体と一緒に外す。
+構成のないfolderの通常・定期・終了・tray flushはmasterと同じ既存v1 writerへ戻し、改名claimで省略しない。
+画像だけのBook folderで既存editor入口を使った時は、editor/state/構成を作らず次の案内だけを表示する。
+「画像だけのフォルダでは本の構成を作れません。ZIP に変換してから行ってください。」
+既存の採用済ProjectionRecipeで判定し、追加走査や新しい状態は設けない。
+次段「画像フォルダをZIPに変換する機能」は設計を利用者に確認してから進める。現時点でボタン・変換処理は追加しない。
 
 所有: folder資格/adoption、RelativePath PageRef migration、sidecar全snapshot/構成family/消費receipt、folder用editor入口。
 G1〜G4の書庫/PDF/EPUB契約を変更せず、共通pure model/storeへfolder adapterだけを追加する。
@@ -1715,69 +1738,6 @@ G4Fのbounded設計/実装レビューで、同じ画像folder ownership/分類/
 費用/残る不便を示す。切る最終決定は利用者、agentが自動で対象を削らない。
 採択時はfolder adapter/editor/sidecar新字段とその専用testsを外せばよく、A2/Q16/書庫等の共通型/ownerを再設計しない。
 既存folder閲覧/個別編集/既存sidecar/metadata transfer機能は撤去しない。未リリースfolder構成はmigration不要。
-
-#### G4F 実装記録（2026-10-12、next-book）
-
-`app/book_composition_folder`を画像folder専用adapterとし、既存physical分類/列挙/重複除外を
-再利用する。BookImageFolderだけが構成projection/editorへ参加し、画像本設定OFFと混在folderは
-従来列を保つ。OFFでも明示folder openの不足行restoreは行い、再適格化で保存構成を適用する。
-compiled folderと抽出結果の全leaf列挙へrestoreを拡げない。相対page refの個別rename、rootの
-rename/purgeは共有BookScopeKeyと既存maintenanceへ接続し、Folder内容ID ledgerは追加しない。
-
-sidecar v2は`folder_composition`を任意root値として持ち、v1 readerは維持する。rootとitemsは
-一つのimmutable SidecarSnapshotであり、各ArcをCOWで共有する。既存writerのFIFOとfull-snapshot
-identityが予約/完了/失効を所有し、構成専用writerやroot dirty flagを足さない。
-構成保存はG4のmodal ownerとsave ticketを再利用し、同folderの既存sidecar flushをworkerで
-完了させてからDB保存/ミラーを行う。終了時も同じwriterを使う。タグだけのwriteは既存rootを
-保持し、構成DB値を取得して差し替えない。UIはworkerが公開したroot Arcを採用するだけで、
-sidecar read/write/hashや大きなrootのcloneを行わない。
-保存票があるfolderの通常/定期flushと、別folderを開くChecking workerのflush予約は、
-その票の完了採用まで同ownerへ委ねる。所有viewerを閉じてもApp共通の送信済票は残り、
-旧snapshotをCheckingへ予約しない。予約後のArc照合だけでdisk上書きを防ごうとしない。
-個別page改名は既存migration ownerがworkerへ渡したbackup設定を保持し、同folderの
-書込権をミラーからUIキャッシュ採用まで持つ。workerのmaintenance解除によるroot Arc公開を
-完了応答が証明し、応答の消費内でdirty itemsを維持したままrootを採用してから書込権を返す。
-通常service pollの順序へ採用を委ねない。backup OFFの改名ではタグだけのbackup rootを維持する。
-改名ミラーはtransactionが割り当てた現revisionを含む保存値を使用し、DB/ミラー/公開Arcを一致させる。
-遅いtag完了はcacheのitemsを変更できるが、workerの新rootを旧snapshotで上書きしない。
-採用後はdirty itemsを維持して新rootと共に既存writerへ送る。他folderのflushは続ける。
-列切替でキャッシュを退役する入口も書込ownerのsnapshotを保持し、既存root-close barrierは
-構成ミラー中のmigrationを同じ完了境界まで待つ。構成を持たない従来改名はこの終了待ちの対象外。
-
-同型の製本page並べ替え/移動も既存migration queueの型付き段階
-`BookComposition → Collection`へ載せる。既存の個別改名は`Generic → Collection`を維持する。
-構成移行を直接fire-and-forgetしてからcollection-onlyへ進めない。backup設定は受付時に捕捉し、
-queued/in-flightとも同じ書込権を持つ。既存journalのGeneric/Collection JSONは変更せず、
-新しい構成段階だけoptionalなbackup設定を記録する。既存journalの変換/再作成は行わない。
-runtimeの段階は排他的enumであり、二つのpending flagへ分散しない。
-
-G4F REVISEの完了順fixtureは「保存受付→所有detached contextを閉じる→実workerのミラー完了→
-別folderのChecking」と「dirty tags→個別page改名/製本page移動の実worker完了→採用前flush→応答採用」を固定する。
-経過時間のsleep/retryで順序を作らず、既存worker/channelの完了を待つ。書込claim専用ownerや
-root dirty flagは追加しない。全体openを新たにmodal化するより、既存save ticket/migration ownerの
-書込権を全予約入口へ揃える方が、他folderの閲覧/flushを維持したまま状態の組合せを減らせる。
-
-自動restoreは既存sidecar import ownerの独立composition familyへ載せる。strict tokenの
-SHA-256/metadata照合とfull-snapshot PendingWriter照合を再利用し、root witnessと実disk markerを
-構成DBの消費receiptへ保存する。receiptは不足行restore/明示解除と同じtransactionで更新し、
-commit時に現行行を再確認する。receiptは転送しない。root renameは移動先sidecar照合後、
-purge/resetはreceipt-only行も扱う。表示開始は同contextのsource restore終端後に既存projectionへ
-進み、Resumingが依存するBook準備を止めない。兄弟窓のrestore ownerや行は変更しない。
-画像Bookの自動fullscreenは既存の本用deferred-open ownerへ渡し、構成採用前の元indexを
-明示page identityとして固定しない。「最初から」は採用した構成の先頭、「続きから」は
-同じresume/target resolverで解決する。画像Book以外のfolderは従来入口を維持する。
-
-明示metadata importは既存の一回summary確認と項目SAVEPOINTを使い、新形式空もroot消費を
-記録する。backup OFFではDB/receiptのみ、ONではcommit後に既存writerへミラーする。
-backupだけ失敗した場合はDB成功/receiptを保持し、
-「フォルダのバックアップを更新できませんでした」と通知する。古いbackupが残るため、
-移動前に保存し直すか明示メタ情報exportを使う案内を付ける。自動retry/DB-file rollbackはしない。
-
-検討した簡素化は、folder専用restore/editor待機を追加せず既存modal/FIFO/import ownerを使うこと。
-その構造を採用した。切り離し時はfolder adapter、folder source分岐、sidecar root/receipt/familyと
-専用fixtureを除けばよく、共通model/unit/提示許可、書庫/PDF/EPUBのsource ownerは維持できる。
-Remote wireは変更していない。G5と実機確認は別工程であり、本節は受入/レビュー成功の主張ではない。
-自動検証の実数と失敗は`target/G-1242-g4f-msg.txt`へ記録する。
 
 ### G5: Remote / 出力 / 最終gateと文書
 

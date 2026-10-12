@@ -9,7 +9,6 @@ fn page(n: u32) -> CompositionPageRef {
 fn input() -> EditorSourceInput {
     let root = std::path::PathBuf::from("C:/fixture/book.epub");
     EditorSourceInput {
-        folder_settings: std::sync::Arc::new(Default::default()),
         scope: BookScopeKey::document(&root).unwrap(),
         domain: PageDomain::Document,
         source: BookCompositionSource::Document {
@@ -121,7 +120,6 @@ fn sent_save_receipt_updates_shared_resume_at_most_once_and_uses_existing_dedup(
     };
     let (tx, rx) = mpsc::channel();
     tx.send(SaveCompletion {
-        flushed: None,
         status: Ok(Some(committed)),
     })
     .unwrap();

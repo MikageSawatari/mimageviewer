@@ -20,6 +20,70 @@ fn document(root: &str, page_num: usize) -> CandidatePage {
         raw_tree: None,
     }
 }
+
+#[test]
+fn empty_write_admission_ignores_unavailable_store_but_protected_resources_fail_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("book_composition.db");
+    let original = b"invalid composition database";
+    std::fs::write(&path, original).unwrap();
+    let (service, owner) = BookCompositionService::spawn_at(temp.path().into(), None).unwrap();
+    let scope = crate::book_scope::BookScopeKey::document("C:/book.pdf").unwrap();
+    assert!(
+        service
+            .prepare(scope.clone(), PageDomain::Document)
+            .recv()
+            .unwrap()
+            .status
+            .is_err()
+    );
+    let snapshot = service.snapshot();
+    assert!(snapshot.status.is_err());
+    assert!(
+        CompositionWriteAdmission::default()
+            .validate(&snapshot)
+            .is_ok()
+    );
+    for admission in [
+        CompositionWriteAdmission {
+            targets: vec![CompositionTarget {
+                scope: scope.clone(),
+                page: CompositionPageRef::PdfPage { page_num: 0 },
+            }],
+            ..Default::default()
+        },
+        CompositionWriteAdmission {
+            binding_scope: Some(scope.clone()),
+            ..Default::default()
+        },
+        CompositionWriteAdmission {
+            unsupported_scopes: vec![ScopePermissionToken {
+                token: snapshot.token_for(&scope),
+                scope: scope.clone(),
+            }],
+            ..Default::default()
+        },
+        CompositionWriteAdmission {
+            unsupported_pages: vec![document("C:/book.pdf", 0).identity],
+            ..Default::default()
+        },
+    ] {
+        assert!(admission.validate(&snapshot).is_err());
+    }
+    // Ordinary folder trim keeps the existing worker even when this unrelated store is unreadable.
+    service
+        .set_view_trim_book(
+            crate::spread_db::container_key_with_fallback(&temp.path().join("image-book"), &[]),
+            crate::view_trim::ViewTrimBookState::default(),
+            CompositionWriteAdmission::default(),
+        )
+        .recv()
+        .unwrap()
+        .unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    owner.shutdown_and_join();
+}
+
 #[test]
 fn candidate_worker_checks_only_identity_and_adopts_fresh_scope_publication() {
     let temp = tempfile::tempdir().unwrap();

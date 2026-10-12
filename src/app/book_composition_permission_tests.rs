@@ -129,6 +129,141 @@ fn hidden() -> CandidatePermission {
         },
     })
 }
+
+fn assert_image_presentation_does_not_qualify(app: &mut crate::app::App) {
+    let sequence = app.book_composition_permission.sequence;
+    assert!(app.presentation_candidate(0).is_none());
+    let demand = [occurrence(0)];
+    app.retain_book_presentation_demand(&demand);
+    assert!(matches!(
+        app.book_composition_permission.occurrences.get(&demand[0]),
+        Some(OccurrencePermission::Complete(
+            CandidatePermission::Allowed(None)
+        ))
+    ));
+    assert_eq!(
+        app.book_presentation_current(&demand),
+        PresentationDecision::Allowed(vec![true])
+    );
+    assert!(!app.defer_book_composition_fullscreen_open(
+        0,
+        HistoryTrigger::UserChosen,
+        FsOpenMaterialization::Eager,
+        FsPageLoadContract::Sequential,
+        BookTargetPurpose::Explicit,
+    ));
+    assert_eq!(
+        app.book_composition_permission.sequence, sequence,
+        "ordinary images do not send candidate requests to the composition worker"
+    );
+    assert!(matches!(
+        app.book_composition_permission.open,
+        OpenPermission::Idle
+    ));
+}
+
+#[test]
+fn saved_folder_hidden_row_is_ignored_by_book_ordinary_and_extracted_image_consumers() {
+    use crate::app::book_materialization::{BookScope, ExtractedSurface, ProjectionRecipe};
+    let mut env = crate::app::tests::phase_c_support::setup_app();
+    let root = env.tmp.path().join("plain-folder");
+    std::fs::create_dir(&root).unwrap();
+    let path = root.join("hidden.png");
+    image::RgbaImage::new(8, 12).save(&path).unwrap();
+    env.items = vec![crate::grid_item::GridItem::Image(path.clone())];
+    env.image_metas = vec![None];
+    env.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+    env.visible_indices = vec![0];
+    env.current_folder = Some(root.clone());
+    env.fullscreen_idx = Some(0);
+    env.selected = Some(0);
+    let index = std::sync::Arc::new(
+        crate::app::file_type_resume::PreparedPageIdentityIndex::prepare(
+            &env.items,
+            Some(&root),
+            env.settings.file_type_visibility.clone(),
+        ),
+    );
+    env.page_identity_index = index;
+    let (service, owner) =
+        BookCompositionService::spawn_at(env.tmp.path().join("folder-permission-data"), None)
+            .unwrap();
+    env.install_book_composition_runtime(service.clone());
+    let scope = crate::book_scope::BookScopeKey::folder(&root).unwrap();
+    let page = CompositionPageRef::RelativePath {
+        path: "hidden.png".into(),
+    };
+    let mut record = BookComposition::new(
+        ReadingDirection::Rtl,
+        vec![CompositionUnit::Single {
+            page: page.clone(),
+            placement: SinglePlacement::Center,
+            companion: SingleCompanion::Vacant,
+        }],
+    );
+    record.hidden_pages.push(page);
+    service
+        .save(scope.clone(), PageDomain::ImageFolder, record)
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap()
+        .status
+        .unwrap();
+    let snapshot = service.snapshot();
+    let row = snapshot.rows[&scope.storage_key()].clone();
+    let token = snapshot.token_for(&scope);
+    assert!(
+        matches!(
+            candidate_permission(
+                &snapshot,
+                &CandidatePage {
+                    identity: crate::book_resume_db::PageIdentity::Image {
+                        path: crate::path_key::normalize_keep_drive(&path),
+                    },
+                    physical_archive: None,
+                    raw_tree: None,
+                }
+            )
+            .unwrap(),
+            CandidatePermission::Hidden(_)
+        ),
+        "preserve the saved row and the pure folder permission model"
+    );
+    for recipe in [
+        ProjectionRecipe::Book(BookScope::ImageFolder(root.clone())),
+        ProjectionRecipe::Book(BookScope::CompiledFolder(root.clone())),
+        ProjectionRecipe::OrdinaryList,
+        ProjectionRecipe::ExtractedResult(ExtractedSurface::Snapshot),
+        ProjectionRecipe::ExtractedResult(ExtractedSurface::Rating),
+    ] {
+        env.projection_recipe = recipe;
+        env.book_composition_permission = ViewerPresentationPermission::default();
+        assert_image_presentation_does_not_qualify(&mut env);
+    }
+    #[cfg(windows)]
+    {
+        env.projection_recipe = ProjectionRecipe::Book(BookScope::ImageFolder(root.clone()));
+        let detached = env.fork_materialized_still_context(&root, 0);
+        env.with_window_context_for_test(detached, |app| {
+            app.book_composition_permission = ViewerPresentationPermission::default();
+            assert_image_presentation_does_not_qualify(app);
+        });
+        env.retire_context(
+            detached,
+            "folder_composition_excluded_permission_test",
+            |_| (),
+        )
+        .unwrap();
+        assert_image_presentation_does_not_qualify(&mut env);
+    }
+    let current = service.snapshot();
+    assert_eq!(current.token_for(&scope), token);
+    assert!(std::sync::Arc::ptr_eq(
+        &current.rows[&scope.storage_key()],
+        &row
+    ));
+    owner.shutdown_and_join();
+}
+
 #[test]
 fn pair_projection_waits_atomically_and_retains_original_slot_mask() {
     let mut owner = ViewerPresentationPermission::default();

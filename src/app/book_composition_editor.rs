@@ -10,7 +10,6 @@ use crate::book_composition::*;
 use crate::book_resume_db::{PageIdentity, ReadingMeterValue, ReadingPosition};
 use crate::book_scope::BookScopeKey;
 use crate::ui_composition_editor as ui;
-use std::path::PathBuf;
 use std::sync::mpsc;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -136,12 +135,6 @@ struct ResumeCommit {
     meter: ReadingMeterValue,
 }
 struct SaveCompletion {
-    /// Exact existing sidecar owners flushed before a folder DB transaction.
-    /// The terminal consumer reconciles them before admitting another edit.
-    flushed: Option<(
-        crate::sidecar::SidecarFlushReservations,
-        crate::sidecar::SidecarFlushReport,
-    )>,
     status: Result<Option<ResumeCommit>, String>,
 }
 struct SentSaveTicket {
@@ -169,22 +162,6 @@ impl App {
     pub(crate) fn composition_editor_writes_pending(&self) -> bool {
         !self.composition_editor_operations.tickets.is_empty()
     }
-    /// Folder saves and migrations own their complete sidecar through adoption.
-    /// Late tag completions may keep editing the cache, but a normal flush must
-    /// not publish its old root between the worker mirror and UI adoption. All
-    /// flush producers, including another source's Checking reservation, consult
-    /// these same existing owners.
-    pub(super) fn composition_sidecar_flush_roots(&self) -> Vec<PathBuf> {
-        let mut roots: Vec<_> = self
-            .composition_editor_operations
-            .tickets
-            .iter()
-            .filter(|ticket| ticket.owner.scope.level_prefix.is_empty())
-            .map(|ticket| ticket.owner.scope.logical_root.clone())
-            .collect();
-        roots.extend(self.rename_migration_sidecar_flush_roots());
-        roots
-    }
     pub(crate) fn composition_editor_acquire_ready(&self) -> bool {
         !self.composition_editor_modal_active() && !self.composition_editor_writes_pending()
     }
@@ -200,6 +177,16 @@ impl App {
         })
     }
     pub(crate) fn composition_editor_available(&self) -> bool {
+        // Keep the existing Book entrance; unsupported image folders show only
+        // guidance and never acquire an editor/save owner.
+        if matches!(
+            &self.projection_recipe,
+            super::book_materialization::ProjectionRecipe::Book(
+                super::book_materialization::BookScope::ImageFolder(_)
+            )
+        ) {
+            return true;
+        }
         self.composition_scope_domain().is_some()
             && self.book_composition_service.is_some()
             && !self.book_composition.is_pending()
@@ -267,7 +254,6 @@ impl App {
             })
             .collect();
         EditorSourceInput {
-            folder_settings: std::sync::Arc::new(self.settings.clone()),
             password: self.pdf_open_password(&scope.logical_root),
             scope,
             domain,
@@ -300,6 +286,17 @@ impl App {
             return false;
         }
         let Some((scope, domain)) = self.composition_scope_domain() else {
+            if matches!(
+                &self.projection_recipe,
+                super::book_materialization::ProjectionRecipe::Book(
+                    super::book_materialization::BookScope::ImageFolder(_)
+                )
+            ) {
+                self.show_feedback_toast(
+                    "画像だけのフォルダでは本の構成を作れません。ZIP に変換してから行ってください。"
+                        .into(),
+                );
+            }
             return false;
         };
         let input = self.editor_source_input(scope.clone(), domain);
@@ -470,36 +467,14 @@ impl App {
         }
     }
     pub(super) fn defer_composition_editor_root_close(&mut self, ctx: &egui::Context) {
-        // The existing root-close barrier also covers a migration's mirrored
-        // folder cache. Retiring the App before adoption would drop dirty items.
-        let writes_pending = self.composition_editor_writes_pending()
-            || self
-                .rename_migration_sidecar_flush_roots()
-                .iter()
-                .any(|root| {
-                    self.sidecars
-                        .get(root)
-                        .is_some_and(|sidecar| sidecar.folder_composition().is_some())
-                        || self
-                            .book_composition_service
-                            .as_ref()
-                            .is_some_and(|service| {
-                                BookScopeKey::folder(root).is_ok_and(|scope| {
-                                    service
-                                        .snapshot()
-                                        .folder_roots
-                                        .contains_key(&scope.storage_key())
-                                })
-                            })
-                });
         if ctx.input(|input| input.viewport().close_requested()) {
             self.close_local_composition_editor(CompositionEditorCloseReason::Shutdown);
-            if writes_pending {
+            if self.composition_editor_writes_pending() {
                 self.composition_editor_operations.exit = EditorExitRequest::RootClose;
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             }
         }
-        if !writes_pending
+        if !self.composition_editor_writes_pending()
             && matches!(
                 self.composition_editor_operations.exit,
                 EditorExitRequest::RootClose
@@ -522,18 +497,9 @@ impl App {
                     continue;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => SaveCompletion {
-                    flushed: None,
                     status: Err("本の構成の保存処理が終了しました".into()),
                 },
             };
-            if let Some((reservations, report)) = completion.flushed {
-                if let Err(error) =
-                    reservations.resolve_in_place(&mut self.sidecars, Ok(report), false)
-                {
-                    crate::logger::log(format!("composition editor backup fence: {error}"));
-                    self.show_feedback_toast("フォルダのバックアップを確認できませんでした".into());
-                }
-            }
             let still_owned =
                 self.composition_editor_operations.owner.as_ref() == Some(&ticket.owner);
             match completion.status {
@@ -707,12 +673,6 @@ impl App {
         let raw_pages = prepared.raw_pages.clone();
         let record = (!remove).then(|| prepared.draft.record().clone());
         let service = self.book_composition_service.clone().unwrap();
-        let backup_enabled = self.settings.sidecar_backup_enabled;
-        let folder_flush = (input.domain == PageDomain::ImageFolder).then(|| {
-            crate::sidecar::prepare_worker_flush_in_place(self.sidecars.values().filter(
-                |sidecar| crate::folder_tree::path_eq(sidecar.folder(), &input.scope.logical_root),
-            ))
-        });
         let (request_tx, request_rx) = mpsc::channel();
         let (reply_tx, reply_rx) = mpsc::channel();
         let wake = ctx.clone();
@@ -724,24 +684,14 @@ impl App {
                 if request_rx.recv().is_err() {
                     return;
                 }
-                let mut flushed = None;
                 let result = (|| {
-                    if let Some((reservations, batch)) = folder_flush {
-                        let report = batch.run_on_worker(std::time::Duration::from_secs(10))?;
-                        flushed = Some((reservations, report));
-                    }
                     preparation::verify_source(&input, &fingerprint)?;
                     let rows = preparation::project_record(&input, record.as_ref())?;
                     let resume = resolve_editor_resume(&intent, &rows, &input, &raw_pages)?;
-                    let reply = match (input.domain == PageDomain::ImageFolder, record) {
-                        (true, Some(record)) => {
-                            service.save_folder(input.scope.clone(), record, backup_enabled)
-                        }
-                        (true, None) => service.remove_folder(input.scope.clone(), backup_enabled),
-                        (false, Some(record)) => {
-                            service.save(input.scope.clone(), input.domain.clone(), record)
-                        }
-                        (false, None) => service.remove(input.scope.clone(), input.domain.clone()),
+                    let reply = if let Some(record) = record {
+                        service.save(input.scope.clone(), input.domain.clone(), record)
+                    } else {
+                        service.remove(input.scope.clone(), input.domain.clone())
                     };
                     reply
                         .recv()
@@ -749,10 +699,7 @@ impl App {
                         .status?;
                     Ok(resume)
                 })();
-                let _ = reply_tx.send(SaveCompletion {
-                    status: result,
-                    flushed,
-                });
+                let _ = reply_tx.send(SaveCompletion { status: result });
                 wake.request_repaint_of(egui::ViewportId::ROOT);
             });
         if let Err(error) = spawn {
@@ -1599,5 +1546,5 @@ mod resume_tests;
 mod tests;
 
 #[cfg(test)]
-#[path = "book_composition_editor/folder_tests.rs"]
-mod folder_tests;
+#[path = "book_composition_editor/metadata_transfer_tests.rs"]
+mod metadata_transfer_tests;

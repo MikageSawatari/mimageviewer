@@ -6,6 +6,81 @@ use std::{io::Write, sync::Arc, time::Duration};
 
 const WAIT: Duration = Duration::from_secs(15);
 
+#[test]
+fn image_folder_editor_entry_only_guides_and_preserves_existing_reader() {
+    let mut f = fixture();
+    let root = f.app.tmp.path().join("image-folder");
+    std::fs::create_dir(&root).unwrap();
+    let pages = ["a.png", "b.png"].map(|name| root.join(name));
+    for page in &pages {
+        image::RgbaImage::new(8, 16).save(page).unwrap();
+    }
+    f.app.settings.auto_fullscreen_zip_pdf = true;
+    f.app.settings.auto_fullscreen_image_folders = true;
+    f.app.current_folder = Some(root.clone());
+    f.app.zip_nav = None;
+    f.app.items = pages
+        .into_iter()
+        .map(crate::grid_item::GridItem::Image)
+        .collect();
+    f.app.projection_recipe = book_materialization::ProjectionRecipe::for_physical(
+        &f.app.settings,
+        &root,
+        &root,
+        &f.app.items,
+    );
+    assert!(matches!(
+        &f.app.projection_recipe,
+        book_materialization::ProjectionRecipe::Book(book_materialization::BookScope::ImageFolder(
+            _
+        ))
+    ));
+    f.app.book_composition = ViewerBookComposition::Automatic;
+    f.app.fullscreen_idx = Some(0);
+    let rows = f.app.items.clone();
+    let settings = serde_json::to_value(&f.app.settings).unwrap();
+    // Startup publication is a separate worker boundary. Finish it explicitly
+    // before asserting the guide does not publish another snapshot.
+    f.service
+        .prepare(f.scope.clone(), f.domain.clone())
+        .recv_timeout(WAIT)
+        .unwrap()
+        .status
+        .unwrap();
+    let snapshot = f.service.snapshot();
+    let ctx = egui::Context::default();
+    for mode in [
+        crate::settings::SpreadMode::Single,
+        crate::settings::SpreadMode::Rtl,
+        crate::settings::SpreadMode::SplitRtl,
+    ] {
+        f.app.spread_mode = mode;
+        assert!(f.app.composition_editor_available());
+        assert!(!f.app.start_local_composition_editor(&ctx));
+        assert_eq!(
+            f.app
+                .fs_feedback_toast
+                .as_ref()
+                .map(|toast| toast.0.as_str()),
+            Some("画像だけのフォルダでは本の構成を作れません。ZIP に変換してから行ってください。")
+        );
+        assert!(matches!(
+            f.app.composition_editor,
+            CompositionEditorState::Closed
+        ));
+        assert!(!f.app.composition_editor_modal_active());
+        assert!(!f.app.composition_editor_writes_pending());
+        assert!(f.app.composition_scope_domain().is_none());
+        assert_eq!(f.app.items, rows);
+        assert_eq!(f.app.current_folder.as_ref(), Some(&root));
+        assert_eq!(f.app.fullscreen_idx, Some(0));
+        assert_eq!(f.app.spread_mode, mode);
+        assert_eq!(serde_json::to_value(&f.app.settings).unwrap(), settings);
+        assert!(Arc::ptr_eq(&snapshot, &f.service.snapshot()));
+        assert!(f.service.drain_changed_scope_keys().is_empty());
+    }
+}
+
 fn editor_harness(
     f: Fixture,
 ) -> (

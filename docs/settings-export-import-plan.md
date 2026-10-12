@@ -825,16 +825,11 @@ core check / settings_restore / ui_snapshot / glyph の成功を再利用した�
 過去の15件という検証記録はその時点の証拠として残す。
 ログは`target/G-1242-g2b-settings_transfer-final.log`、全gateの結果は`target/G-1242-g2b-msg.txt`。
 
-### §1.242 G4F結合時の再確認（2026-10-12）
+### §1.242 G4F切り離し時の再確認（2026-10-12）
 
-画像folderの構成と消費receiptはmetadata/sidecar側のfamilyで扱い、settings転送項目は
-増やさない。`cargo test -p mimageviewer --lib settings_transfer`は24件成功（exit 0）。
-現行の分類assertionは全457 / 対象144 / 除外313、wireキー142を通過した。
-ログは`target/G-1242-g4f-focused-settings_transfer.log`。metadata転送の焦点試験は105件成功
-（`target/G-1242-g4f-focused-metadata_transfer.log`）。他のgateの実数は
-`target/G-1242-g4f-msg.txt`に記録し、独立レビュー/実機確認の証拠とは扱わない。
-
-G4F REVISEの保存/改名owner修正後もsettings転送は24件、metadata転送は105件成功（exit 0）。
-分類assertionは全457 / 対象144 / 除外313、wireキー142を維持する。今回の実行ログは
-`target/G-1242-g4f-fix-focused-settings_transfer.log`と
-`target/G-1242-g4f-fix-focused-metadata_transfer.log`。旧実装時のログとは区別する。
+folder構成のadapter/sidecar v2を外し、既存metadata transfer v11とpreferences転送を維持する。
+今回の実行は`cargo test -p mimageviewer --lib settings_transfer`が24件、
+`cargo test -p mimageviewer --lib metadata_transfer`が108件成功（各exit 0）。
+分類assertは全457 / 対象144 / 除外313、wire142のまま。folderの新しい設定字段は追加していない。
+ログは`target/G-1242-g4f-detach-focused-settings_transfer.log`と
+`target/G-1242-g4f-detach-focused-metadata_transfer.log`。全体gateは今回のhandoffで別途記録する。

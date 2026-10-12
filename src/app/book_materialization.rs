@@ -21,7 +21,7 @@ pub(crate) struct MaterializedBookRows {
 }
 
 /// Semantic classification delegates key normalization to E's shared constructor.
-/// Compiled folders keep their existing generated page ownership.
+/// Image/compiled folders remain outside composition adoption until G4F.
 pub(crate) fn composition_scope_domain(
     book: &BookScope,
 ) -> Result<
@@ -44,10 +44,7 @@ pub(crate) fn composition_scope_domain(
             Some((scope, domain))
         }
         BookScope::Document(root) => Some((BookScopeKey::document(root)?, PageDomain::Document)),
-        BookScope::ImageFolder(root) => {
-            Some((BookScopeKey::folder(root)?, PageDomain::ImageFolder))
-        }
-        BookScope::CompiledFolder(_) => None,
+        BookScope::ImageFolder(_) | BookScope::CompiledFolder(_) => None,
     })
 }
 
@@ -57,7 +54,7 @@ pub(crate) fn raw_archive_book_prefix(tree: &ZipTree, requested: &[String]) -> V
     tree.raw_source().collapse_redundant(requested)
 }
 
-pub(super) fn finish_book_rows(
+fn finish_book_rows(
     logical: &Path,
     rows: PageRows,
     policy: crate::file_type_visibility::FileTypeVisibility,

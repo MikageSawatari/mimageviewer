@@ -44,7 +44,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::adjustment::AdjustParams;
-use crate::book_composition::{BookComposition, CompositionUnit, PageDomain, SingleCompanion};
 use crate::mask_db::Shape;
 
 /// サイドカーファイル名。`.dat` は Windows 上で「アプリ内部データ」として広く認識される拡張子で、
@@ -52,7 +51,7 @@ use crate::mask_db::Shape;
 pub const SIDECAR_FILENAME: &str = "mimageviewer.dat";
 
 /// 現在のスキーマバージョン。互換性のない変更があったら上げる。
-const CURRENT_VERSION: u32 = 2;
+const CURRENT_VERSION: u32 = 1;
 
 /// dirty のまま放置されたサイドカーを書き出す間隔。
 ///
@@ -63,7 +62,7 @@ pub const PERIODIC_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::fr
 
 // ── JSON 形式 ─────────────────────────────────────────────────────────
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Default)]
 struct SidecarJson {
     version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -74,19 +73,6 @@ struct SidecarJson {
     /// (serde の `rc` feature。復元時は共有を持ち越さず新しい `Arc` になる)。
     #[serde(default)]
     items: Arc<BTreeMap<String, SidecarEntry>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    folder_composition: Option<Arc<BookComposition>>,
-}
-
-// Decode the optional new family only after reading the envelope version. A v1
-// reader must ignore this undefined field, even when its shape differs from v2.
-#[derive(Deserialize)]
-struct SidecarReadJson {
-    version: u32,
-    #[serde(default)]
-    items: Arc<BTreeMap<String, SidecarEntry>>,
-    #[serde(default)]
-    folder_composition: Option<Box<serde_json::value::RawValue>>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
@@ -169,9 +155,15 @@ impl SidecarMask {
 /// フォルダごとに 1 個。dirty 管理と flush タイミングを保持する。
 pub struct SidecarFile {
     folder: PathBuf,
-    /// One immutable identity for both page metadata and the folder root. Nested
-    /// items/root Arcs avoid copying either large family for an unrelated update.
-    snapshot: Arc<SidecarSnapshot>,
+    /// **writer と共有する不変スナップショット。** flush は `Arc` を 1 つ渡すだけで、
+    /// map も、その中の全ページ分のラスターマスク (`Vec<f32>`、原寸なので 24MP なら
+    /// 1 面 96 MB) も複製しない。書き換えは `items_mut` の `Arc::make_mut` を通り、
+    /// writer がまだ前の snapshot を持っているときだけ 1 回複製する。
+    ///
+    /// 以前は flush・pending からの読み直し・worker の取り出しの 3 か所がそれぞれ
+    /// map 全体を deep clone しており、フォルダ切替や編集終了のたびに数百 MB を
+    /// UI スレッドで写していた (2026-08-29 レビュー R-14)。
+    items: Arc<BTreeMap<String, SidecarEntry>>,
     dirty: bool,
     /// ディスク上の内容を**上書きしてはいけない**と分かっているフラグ。パース失敗や
     /// 新しいバージョンが書いたファイルがこれに当たる。書き込み自体の失敗 (読み取り
@@ -181,95 +173,6 @@ pub struct SidecarFile {
     /// 編集を continuous に続けても「最大 N 分ぶんしか危険に晒さない」保証になる
     /// (最後の変更時刻で測ると、編集し続ける限り一度も書かれない)。
     dirty_since: Option<Instant>,
-}
-
-/// Complete immutable payload shared by cache, flush reservation and writer.
-#[derive(Clone, Default)]
-struct SidecarSnapshot {
-    items: Arc<BTreeMap<String, SidecarEntry>>,
-    folder_composition: Option<Arc<BookComposition>>,
-}
-
-impl SidecarSnapshot {
-    fn is_empty(&self) -> bool {
-        self.items.is_empty() && self.folder_composition.is_none()
-    }
-}
-
-impl SidecarReadJson {
-    fn into_snapshot(self) -> Result<SidecarSnapshot, String> {
-        // Released v1 has no composition family. Never interpret an unknown v1 field.
-        let root = if self.version >= 2 {
-            self.folder_composition
-                .map(|value| {
-                    BookComposition::from_json(value.get().as_bytes(), &PageDomain::ImageFolder)
-                        .map(Arc::new)
-                        .map_err(|error| error.to_string())
-                })
-                .transpose()?
-        } else {
-            None
-        };
-        if let Some(root) = &root {
-            validate_folder_composition(root)?;
-        }
-        Ok(SidecarSnapshot {
-            items: self.items,
-            folder_composition: root,
-        })
-    }
-}
-
-fn validate_folder_composition(root: &BookComposition) -> Result<(), String> {
-    root.validate(&PageDomain::ImageFolder)
-        .map_err(|error| error.to_string())?;
-    if root.revision > i64::MAX as u64 {
-        return Err("composition revision exceeds SQLite integer range".into());
-    }
-    Ok(())
-}
-
-/// Content witness for this family only; page edits/tags and file timestamps are
-/// deliberately absent. References use the model's matching identity, and hidden
-/// pages have set semantics. Ordinary unit order, blank slots and revision remain.
-/// Called on workers, like strict source preparation and composition persistence.
-pub(crate) fn folder_composition_digest(root: Option<&BookComposition>) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(b"mimageviewer-folder-composition-root-v1");
-    match root {
-        None => hasher.update([0]),
-        Some(root) => {
-            hasher.update([1]);
-            let mut normalized = root.clone();
-            normalized.cover = normalized.cover.as_ref().map(|page| page.matching_key());
-            for unit in &mut normalized.units {
-                match unit {
-                    CompositionUnit::Pair { first, second } => {
-                        *first = first.matching_key();
-                        *second = second.matching_key();
-                    }
-                    CompositionUnit::Single {
-                        page, companion, ..
-                    } => {
-                        *page = page.matching_key();
-                        if let SingleCompanion::FrontCoverSupplement { page } = companion {
-                            *page = page.matching_key();
-                        }
-                    }
-                }
-            }
-            normalized.hidden_pages = normalized
-                .hidden_pages
-                .iter()
-                .map(|page| page.matching_key())
-                .collect();
-            normalized.hidden_pages.sort_by_cached_key(|page| {
-                serde_json::to_string(page).expect("page reference serializes")
-            });
-            hasher.update(serde_json::to_vec(&normalized).expect("composition serializes"));
-        }
-    }
-    hasher.finalize().into()
 }
 
 /// A disk snapshot used by the sidecar import path.
@@ -369,10 +272,6 @@ pub struct LoadedSidecarImport {
 impl LoadedSidecarImport {
     pub fn sidecar(&self) -> &SidecarFile {
         &self.sidecar
-    }
-
-    pub(crate) fn source(&self) -> &SidecarImportSource {
-        &self.source
     }
 
     pub(crate) fn into_parts(self) -> (SidecarFile, SidecarImportSource) {
@@ -562,13 +461,9 @@ fn revalidate_import_source_from(
             };
             let same_snapshot = match (kind, current.kind) {
                 (PendingWriterKind::Write, PendingWriterKind::Write) => {
-                    Arc::ptr_eq(&current.snapshot, &sidecar.snapshot)
+                    Arc::ptr_eq(&current.items, &sidecar.items)
                 }
-                (PendingWriterKind::Remove, PendingWriterKind::Remove) => {
-                    Arc::ptr_eq(&current.snapshot, &sidecar.snapshot)
-                        && current.snapshot.is_empty()
-                        && sidecar.snapshot.is_empty()
-                }
+                (PendingWriterKind::Remove, PendingWriterKind::Remove) => sidecar.items.is_empty(),
                 _ => false,
             };
             if current.sequence != *sequence || !same_snapshot {
@@ -614,7 +509,7 @@ impl SidecarFile {
     pub fn new(folder: PathBuf) -> Self {
         Self {
             folder,
-            snapshot: Arc::new(SidecarSnapshot::default()),
+            items: Arc::new(BTreeMap::new()),
             dirty: false,
             disabled: false,
             dirty_since: None,
@@ -640,7 +535,7 @@ impl SidecarFile {
     /// 書き換え用の可変参照。writer がまだ前の snapshot を持っていれば、ここで
     /// **1 回だけ** 複製する (`Arc::make_mut`)。誰も持っていなければ複製しない。
     fn items_mut(&mut self) -> &mut BTreeMap<String, SidecarEntry> {
-        Arc::make_mut(&mut Arc::make_mut(&mut self.snapshot).items)
+        Arc::make_mut(&mut self.items)
     }
 
     /// フォルダから `mimageviewer.dat` を読み込む。無ければ空のサイドカーを返す。
@@ -673,7 +568,7 @@ impl SidecarFile {
         };
         if let Some(pending) = pending {
             let mut sidecar = Self::new(folder.to_path_buf());
-            sidecar.snapshot = pending.snapshot;
+            sidecar.items = pending.items;
             return SidecarImportLoad::Loaded(LoadedSidecarImport {
                 sidecar,
                 source: SidecarImportSource::PendingWriter {
@@ -753,7 +648,7 @@ impl SidecarFile {
         let digest: [u8; 32] = Sha256::digest(&data).into();
         let legacy_before = local_adjust_core::mask_codec::legacy_decode_count();
         let _mask_budget = local_adjust_core::mask_codec::DocumentBudget::open();
-        let parsed: SidecarReadJson = match serde_json::from_slice(&data) {
+        let parsed: SidecarJson = match serde_json::from_slice(&data) {
             Ok(parsed) => parsed,
             Err(error) => {
                 let mut sidecar = Self::new(folder.to_path_buf());
@@ -774,13 +669,7 @@ impl SidecarFile {
         }
 
         let mut sidecar = Self::new(folder.to_path_buf());
-        sidecar.snapshot = match parsed.into_snapshot() {
-            Ok(snapshot) => Arc::new(snapshot),
-            Err(error) => {
-                sidecar.disabled = true;
-                return SidecarImportLoad::Corrupt { sidecar, error };
-            }
-        };
+        sidecar.items = parsed.items;
         if local_adjust_core::mask_codec::legacy_decode_count() != legacy_before {
             sidecar.mark_dirty();
         }
@@ -799,8 +688,8 @@ impl SidecarFile {
     /// 本番の入口は 1 つ (`load`)。
     fn load_from(folder: &Path, writer: &WriterState) -> Self {
         let mut me = Self::new(folder.to_path_buf());
-        if let Some(snapshot) = writer.pending_snapshot(folder) {
-            me.snapshot = snapshot;
+        if let Some(items) = writer.pending_items(folder) {
+            me.items = items;
             return me;
         }
         let path = folder.join(SIDECAR_FILENAME);
@@ -816,7 +705,7 @@ impl SidecarFile {
         // One sidecar covers every item in a folder, and each layer can hold four mask
         // buffers. Bound what the whole file may decode, not just its largest field.
         let _mask_budget = local_adjust_core::mask_codec::DocumentBudget::open();
-        let parsed: SidecarReadJson = match serde_json::from_str(&data) {
+        let parsed: SidecarJson = match serde_json::from_str(&data) {
             Ok(v) => v,
             Err(e) => {
                 crate::logger::log(format!(
@@ -841,17 +730,7 @@ impl SidecarFile {
             me.disabled = true;
             return me;
         }
-        me.snapshot = match parsed.into_snapshot() {
-            Ok(snapshot) => Arc::new(snapshot),
-            Err(error) => {
-                crate::logger::log(format!(
-                    "sidecar: invalid folder composition: {} ({error})",
-                    path.display()
-                ));
-                me.disabled = true;
-                return me;
-            }
-        };
+        me.items = parsed.items;
         // v1.1.0〜v3.2.0 は補正レイヤーのマスクを 1 画素 1 数値の JSON 配列で書いていた。
         // 実測で 1 ページ 290MB になり、フォルダ切替のたびに UI を数秒止めていた。読めた
         // ものはメモリ上では新形式なので、dirty にしておけば次の書き出しで置き換わる。
@@ -873,75 +752,11 @@ impl SidecarFile {
     }
 
     pub fn items(&self) -> &BTreeMap<String, SidecarEntry> {
-        &self.snapshot.items
-    }
-
-    pub(crate) fn folder_composition(&self) -> Option<&BookComposition> {
-        self.snapshot.folder_composition.as_deref()
-    }
-
-    pub(crate) fn folder_composition_digest(&self) -> [u8; 32] {
-        folder_composition_digest(self.folder_composition())
-    }
-
-    /// Update the root in the same copy-on-write owner as page metadata. The
-    /// caller chooses backup policy; tags-only writes never call this setter.
-    pub(crate) fn set_folder_composition(
-        &mut self,
-        root: Option<BookComposition>,
-    ) -> Result<(), String> {
-        if self.disabled {
-            return Err("sidecar source is write-disabled".into());
-        }
-        if let Some(root) = &root {
-            validate_folder_composition(root)?;
-        }
-        if self.folder_composition() == root.as_ref() {
-            return Ok(());
-        }
-        Arc::make_mut(&mut self.snapshot).folder_composition = root.map(Arc::new);
-        self.mark_dirty();
-        Ok(())
-    }
-
-    /// Reflect a root already validated and mirrored by the composition worker.
-    /// Existing dirty page metadata and write-disabled state retain their owner;
-    /// this is cache adoption, not another write producer or a retry request.
-    pub(crate) fn adopt_mirrored_folder_composition(&mut self, root: Option<BookComposition>) {
-        self.adopt_mirrored_folder_composition_arc(root.map(Arc::new));
-    }
-
-    /// UI adoption compares only immutable root ownership, never 100k page refs.
-    /// The composition worker prepares these validated Arcs in its snapshot.
-    pub(crate) fn adopt_mirrored_folder_composition_arc(
-        &mut self,
-        root: Option<Arc<BookComposition>>,
-    ) {
-        let same = match (&self.snapshot.folder_composition, &root) {
-            (Some(current), Some(next)) => Arc::ptr_eq(current, next),
-            (None, None) => true,
-            _ => false,
-        };
-        if !same {
-            Arc::make_mut(&mut self.snapshot).folder_composition = root;
-        }
+        &self.items
     }
 
     pub fn is_dirty(&self) -> bool {
         self.dirty
-    }
-
-    /// Worker handoff for another import family. Preserve the exact validated
-    /// full snapshot identity even when legacy conversion made the owner dirty.
-    /// This clones ownership/state only and performs no I/O or serialization.
-    pub(crate) fn clone_import_snapshot(&self) -> Self {
-        Self {
-            folder: self.folder.clone(),
-            snapshot: Arc::clone(&self.snapshot),
-            dirty: self.dirty,
-            disabled: self.disabled,
-            dirty_since: self.dirty_since,
-        }
     }
 
     /// A read-only import proof may share the parsed tree, never a writable owner state.
@@ -951,7 +766,7 @@ impl SidecarFile {
         }
         Some(Self {
             folder: self.folder.clone(),
-            snapshot: Arc::clone(&self.snapshot),
+            items: Arc::clone(&self.items),
             dirty: false,
             disabled: false,
             dirty_since: None,
@@ -962,12 +777,12 @@ impl SidecarFile {
     /// `SidecarEntry::Clone` keeps the large local-mask raster Arcs shared, while
     /// the BTreeMap itself is unique before any later UI `items_mut` call.
     pub(crate) fn detach_outer_items_for_writable_owner(&mut self) {
-        Arc::make_mut(&mut self.snapshot).items = Arc::new((*self.snapshot.items).clone());
+        self.items = Arc::new((*self.items).clone());
     }
 
     #[cfg(test)]
     pub(crate) fn outer_items_unique_for_test(&self) -> bool {
-        Arc::strong_count(&self.snapshot.items) == 1
+        Arc::strong_count(&self.items) == 1
     }
 
     /// clean → dirty になった時刻。定期フラッシュの判定に使う。
@@ -978,11 +793,7 @@ impl SidecarFile {
     /// 画像編集の 6 系統だけを page bundle として全置換する。タグは編集 bundle の
     /// 対象外なので、同じ entry に保存済みの値を必ず引き継ぐ。
     pub fn replace_edit_bundle(&mut self, rel_key: &str, mut replacement: SidecarEntry) {
-        replacement.tags = self
-            .snapshot
-            .items
-            .get(rel_key)
-            .and_then(|entry| entry.tags.clone());
+        replacement.tags = self.items.get(rel_key).and_then(|entry| entry.tags.clone());
         if replacement.is_empty() {
             self.items_mut().remove(rel_key);
         } else {
@@ -1158,13 +969,13 @@ impl SidecarFile {
     pub fn purge_deleted_root(&mut self, rel_root: &str) -> bool {
         let container_prefix = format!("{rel_root}::");
         let folder_prefix = format!("{rel_root}/");
-        let before = self.snapshot.items.len();
+        let before = self.items.len();
         self.items_mut().retain(|key, _| {
             key != rel_root
                 && !key.starts_with(&container_prefix)
                 && !key.starts_with(&folder_prefix)
         });
-        if self.snapshot.items.len() != before {
+        if self.items.len() != before {
             self.mark_dirty();
             true
         } else {
@@ -1239,13 +1050,13 @@ impl SidecarFile {
         self.dirty_since = None;
     }
 
-    /// Share the complete snapshot with the writer without copying page metadata
-    /// or the root. Remove only when both families are empty.
+    /// flush で積む内容。`items` の `Arc` をそのまま渡すので map は複製しない
+    /// (`items` の doc comment 参照)。空なら削除要求。
     fn write_request(&self) -> WriteRequest {
-        if self.snapshot.is_empty() {
-            WriteRequest::Remove(Arc::clone(&self.snapshot))
+        if self.items.is_empty() {
+            WriteRequest::Remove
         } else {
-            WriteRequest::Write(Arc::clone(&self.snapshot))
+            WriteRequest::Write(Arc::clone(&self.items))
         }
     }
 
@@ -1279,10 +1090,10 @@ impl SidecarFile {
 /// 1 フォルダぶんの書き出し要求。
 #[derive(Clone)]
 enum WriteRequest {
-    /// The same complete immutable allocation held by the cache owner.
-    Write(Arc<SidecarSnapshot>),
-    /// Absence has an owner identity too; pending readers must reuse this Arc.
-    Remove(Arc<SidecarSnapshot>),
+    /// 積んだ時点の内容そのもの。`SidecarFile::items` と同じ `Arc` を共有するので、
+    /// 積む側も worker も map を複製しない。
+    Write(Arc<BTreeMap<String, SidecarEntry>>),
+    Remove,
 }
 
 /// UI-owned dirty sidecars retained while a worker flushes immutable snapshots.
@@ -1299,7 +1110,7 @@ pub(crate) struct SidecarFlushOwners {
 
 /// Immutable snapshots reserved from cache owners that remain available to the UI.
 ///
-/// Holding each full snapshot `Arc` makes a later mutation use copy-on-write. Resolution can
+/// Holding each items `Arc` makes a later mutation use copy-on-write. Resolution can
 /// therefore clear or evict only the exact owner that was written, while a sibling
 /// context may keep using the cache without falling back to a synchronous disk load.
 pub(crate) struct SidecarFlushReservations {
@@ -1310,7 +1121,7 @@ pub(crate) struct SidecarFlushReservations {
 
 struct SidecarFlushReservation {
     folder: PathBuf,
-    snapshot: Arc<SidecarSnapshot>,
+    items: Arc<BTreeMap<String, SidecarEntry>>,
     disabled: bool,
     requested: bool,
 }
@@ -1319,7 +1130,7 @@ impl SidecarFlushReservations {
     /// Reconcile a worker result with cache owners that stayed in place.
     ///
     /// Errors leave every cache owner untouched. A successful request clears dirty
-    /// state only when the folder, full snapshot `Arc`, and writable state still match the
+    /// state only when the folder, item `Arc`, and writable state still match the
     /// captured owner. Main-view cache eviction uses the same exact identity, so a
     /// clean cache inserted or replaced while the worker ran is preserved.
     pub(crate) fn resolve_in_place(
@@ -1334,7 +1145,7 @@ impl SidecarFlushReservations {
             let Some(current) = sidecars.get_mut(&reservation.folder) else {
                 continue;
             };
-            let exact = Arc::ptr_eq(&current.snapshot, &reservation.snapshot)
+            let exact = Arc::ptr_eq(&current.items, &reservation.items)
                 && current.disabled == reservation.disabled;
             if !exact {
                 continue;
@@ -1446,7 +1257,7 @@ pub(crate) enum SidecarFlushCompletion {
 
 /// Split sidecars into retained owners and an immutable dirty worker batch.
 ///
-/// This function only moves `SidecarFile` values and clones their full snapshot `Arc`s;
+/// This function only moves `SidecarFile` values and clones their item `Arc`s;
 /// it does no serialization, filesystem access, channel wait, or SQLite work.
 /// Clean and write-disabled sidecars remain in the retained owner set, so a
 /// caller may safely move its complete cache into this boundary without
@@ -1482,7 +1293,7 @@ pub(crate) fn prepare_worker_flush(
 
 /// Capture an immutable worker batch without removing cache owners from the App.
 ///
-/// The captured full snapshot `Arc`s are reservations: any edit after this call receives a
+/// The captured item `Arc`s are reservations: any edit after this call receives a
 /// distinct `Arc` through `Arc::make_mut`, and resolution will leave that newer dirty
 /// owner untouched. The batch still excludes dirty write-disabled owners and still
 /// requires the process-global idle fence even when it is empty.
@@ -1502,7 +1313,7 @@ pub(crate) fn prepare_worker_flush_in_place<'a>(
         }
         owners.push(SidecarFlushReservation {
             folder: sidecar.folder.clone(),
-            snapshot: Arc::clone(&sidecar.snapshot),
+            items: Arc::clone(&sidecar.items),
             disabled: sidecar.disabled,
             requested,
         });
@@ -1601,7 +1412,7 @@ struct QueuedWrite {
 
 struct PendingImportSnapshot {
     sequence: u64,
-    snapshot: Arc<SidecarSnapshot>,
+    items: Arc<BTreeMap<String, SidecarEntry>>,
     kind: PendingWriterKind,
 }
 
@@ -1782,18 +1593,12 @@ impl WriterState {
         Ok(())
     }
 
-    fn pending_snapshot(&self, folder: &Path) -> Option<Arc<SidecarSnapshot>> {
+    fn pending_items(&self, folder: &Path) -> Option<Arc<BTreeMap<String, SidecarEntry>>> {
         let pending = self.pending.lock().ok()?;
         match &pending.get(folder)?.request {
-            WriteRequest::Write(snapshot) => Some(Arc::clone(snapshot)),
-            WriteRequest::Remove(snapshot) => Some(Arc::clone(snapshot)),
+            WriteRequest::Write(items) => Some(Arc::clone(items)),
+            WriteRequest::Remove => Some(Arc::new(BTreeMap::new())),
         }
-    }
-
-    #[cfg(test)]
-    fn pending_items(&self, folder: &Path) -> Option<Arc<BTreeMap<String, SidecarEntry>>> {
-        self.pending_snapshot(folder)
-            .map(|snapshot| Arc::clone(&snapshot.items))
     }
 
     /// Strict snapshot lookup for the import engine.  Unlike the forgiving UI
@@ -1810,13 +1615,13 @@ impl WriterState {
         let Some(queued) = pending.get(folder) else {
             return Ok(None);
         };
-        let (snapshot, kind) = match &queued.request {
-            WriteRequest::Write(snapshot) => (Arc::clone(snapshot), PendingWriterKind::Write),
-            WriteRequest::Remove(snapshot) => (Arc::clone(snapshot), PendingWriterKind::Remove),
+        let (items, kind) = match &queued.request {
+            WriteRequest::Write(items) => (Arc::clone(items), PendingWriterKind::Write),
+            WriteRequest::Remove => (Arc::new(BTreeMap::new()), PendingWriterKind::Remove),
         };
         Ok(Some(PendingImportSnapshot {
             sequence: queued.seq,
-            snapshot,
+            items,
             kind,
         }))
     }
@@ -1879,8 +1684,8 @@ impl WriterState {
 /// 実際のディスク操作。成功なら true。
 fn write_sidecar_to_disk(folder: &Path, request: &WriteRequest) -> bool {
     let path = folder.join(SIDECAR_FILENAME);
-    let snapshot = match request {
-        WriteRequest::Remove(_) => {
+    let items = match request {
+        WriteRequest::Remove => {
             return match std::fs::remove_file(&path) {
                 Ok(()) => true,
                 Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => true,
@@ -1894,15 +1699,14 @@ fn write_sidecar_to_disk(folder: &Path, request: &WriteRequest) -> bool {
                 }
             };
         }
-        WriteRequest::Write(snapshot) => snapshot,
+        WriteRequest::Write(items) => items,
     };
 
     let json_value = SidecarJson {
         version: CURRENT_VERSION,
         app: Some(format!("mimageviewer {}", env!("CARGO_PKG_VERSION"))),
         saved_at: Some(current_timestamp()),
-        items: Arc::clone(&snapshot.items),
-        folder_composition: snapshot.folder_composition.clone(),
+        items: Arc::clone(items),
     };
     // pretty ではなく compact。人が読むファイルではないし、マスクを packed 文字列に
     // したあとは pretty の改行とインデントが残りの大半になる。
@@ -2230,13 +2034,6 @@ fn current_timestamp() -> String {
 mod tests {
     use super::*;
 
-    fn snapshot_with_items(items: Arc<BTreeMap<String, SidecarEntry>>) -> Arc<SidecarSnapshot> {
-        Arc::new(SidecarSnapshot {
-            items,
-            folder_composition: None,
-        })
-    }
-
     #[cfg(windows)]
     #[test]
     fn attributes_without_hidden_system_preserves_unrelated_bits() {
@@ -2269,7 +2066,7 @@ mod tests {
     use local_adjust_core::{LocalAdjustmentLayer, LocalEffect, LocalMask};
     use std::path::PathBuf;
 
-    pub(super) fn sample_params() -> AdjustParams {
+    fn sample_params() -> AdjustParams {
         let mut p = AdjustParams::default();
         p.brightness = 10.0;
         p.contrast = -5.0;
@@ -2497,7 +2294,7 @@ mod tests {
         assert!(valid_folder.join(SIDECAR_FILENAME).is_file());
     }
 
-    pub(super) fn reservation_success(
+    fn reservation_success(
         reservations: &SidecarFlushReservations,
     ) -> Result<SidecarFlushReport, String> {
         Ok(SidecarFlushReport {
@@ -2636,10 +2433,7 @@ mod tests {
         .join();
 
         let error = state
-            .queue_strict(
-                PathBuf::from("C:/strict-queue-test"),
-                WriteRequest::Remove(Arc::new(SidecarSnapshot::default())),
-            )
+            .queue_strict(PathBuf::from("C:/strict-queue-test"), WriteRequest::Remove)
             .unwrap_err();
         assert!(error.contains("pending state is unavailable"));
         assert_eq!(*state.inflight.lock().unwrap(), 0);
@@ -2662,10 +2456,7 @@ mod tests {
     fn missing_import_source_revalidation_rejects_a_pending_remove() {
         let dir = tempfile::tempdir().unwrap();
         let state = WriterState::default();
-        state.queue(
-            dir.path().to_path_buf(),
-            WriteRequest::Remove(Arc::new(SidecarSnapshot::default())),
-        );
+        state.queue(dir.path().to_path_buf(), WriteRequest::Remove);
         let error = revalidate_missing_import_source_from(dir.path(), &state).unwrap_err();
         assert!(error.contains("pending write"));
     }
@@ -2686,10 +2477,10 @@ mod tests {
         let pending = WriterState::default();
         pending.queue(
             dir.path().to_path_buf(),
-            WriteRequest::Write(snapshot_with_items(Arc::new(BTreeMap::from([(
+            WriteRequest::Write(Arc::new(BTreeMap::from([(
                 "new.jpg".to_string(),
                 SidecarEntry::default(),
-            )])))),
+            )]))),
         );
         assert_eq!(
             revalidate_disk_import_source_for_reuse_from(dir.path(), &token, &pending),
@@ -2860,7 +2651,7 @@ mod tests {
         items.insert("a.jpg".to_string(), SidecarEntry::default());
         state.queue(
             dir.path().to_path_buf(),
-            WriteRequest::Write(snapshot_with_items(Arc::new(items))),
+            WriteRequest::Write(Arc::new(items)),
         );
 
         let loaded = SidecarFile::load_for_import_from(dir.path(), &state);
@@ -2889,7 +2680,7 @@ mod tests {
         replacement.insert("b.jpg".to_string(), SidecarEntry::default());
         state.queue(
             dir.path().to_path_buf(),
-            WriteRequest::Write(snapshot_with_items(Arc::new(replacement))),
+            WriteRequest::Write(Arc::new(replacement)),
         );
         assert!(revalidate_import_source_from(&sidecar, &source, &state).is_err());
     }
@@ -2898,10 +2689,7 @@ mod tests {
     fn sidecar_import_pending_remove_remains_current_until_superseded() {
         let dir = tempfile::tempdir().unwrap();
         let state = WriterState::default();
-        state.queue(
-            dir.path().to_path_buf(),
-            WriteRequest::Remove(Arc::new(SidecarSnapshot::default())),
-        );
+        state.queue(dir.path().to_path_buf(), WriteRequest::Remove);
 
         let loaded = SidecarFile::load_for_import_from(dir.path(), &state);
         let SidecarImportLoad::Loaded(loaded) = loaded else {
@@ -2920,7 +2708,7 @@ mod tests {
 
         state.queue(
             dir.path().to_path_buf(),
-            WriteRequest::Write(snapshot_with_items(Arc::new(BTreeMap::new()))),
+            WriteRequest::Write(Arc::new(BTreeMap::new())),
         );
         assert!(revalidate_import_source_from(&sidecar, &source, &state).is_err());
     }
@@ -2938,7 +2726,7 @@ mod tests {
         replacement.insert("new.jpg".to_string(), SidecarEntry::default());
         state.queue(
             media.path().to_path_buf(),
-            WriteRequest::Write(snapshot_with_items(Arc::new(replacement))),
+            WriteRequest::Write(Arc::new(replacement)),
         );
         state.finish_write(media.path(), 0, false);
 
@@ -3637,7 +3425,6 @@ mod tests {
 
 #[cfg(test)]
 mod writer_tests {
-    use super::tests::{reservation_success, sample_params};
     use super::*;
 
     fn sample_layer() -> local_adjust_core::LocalAdjustmentLayer {
@@ -3659,10 +3446,7 @@ mod writer_tests {
         let state = WriterState::default();
 
         let items = items_named(&["img.jpg"]);
-        state.queue(
-            folder.clone(),
-            WriteRequest::Write(snapshot_with_items(Arc::clone(&items))),
-        );
+        state.queue(folder.clone(), WriteRequest::Write(Arc::clone(&items)));
 
         assert!(
             !folder.join(SIDECAR_FILENAME).exists(),
@@ -3699,7 +3483,7 @@ mod writer_tests {
             panic!("中身があるのに削除要求になった");
         };
         assert!(
-            Arc::ptr_eq(&queued, &file.snapshot),
+            Arc::ptr_eq(&queued, &file.items),
             "flush のたびに map 全体を複製している"
         );
 
@@ -3710,7 +3494,7 @@ mod writer_tests {
         );
         let read_back = state.pending_items(dir.path()).expect("積んだものが読める");
         assert!(
-            Arc::ptr_eq(&read_back, &queued.items),
+            Arc::ptr_eq(&read_back, &queued),
             "pending から読み直すたびに map 全体を複製している"
         );
     }
@@ -3731,629 +3515,17 @@ mod writer_tests {
         file.set_adjust("b.jpg", crate::adjustment::AdjustParams::default());
 
         assert!(
-            !queued.items.contains_key("b.jpg"),
+            !queued.contains_key("b.jpg"),
             "積んだ後の編集が、積んだ内容に混ざった"
         );
         assert!(
-            file.snapshot.items.contains_key("b.jpg"),
+            file.items.contains_key("b.jpg"),
             "編集が手元にも入っていない"
         );
         assert!(
-            !Arc::ptr_eq(&queued, &file.snapshot),
+            !Arc::ptr_eq(&queued, &file.items),
             "共有したまま書き換えている"
         );
-    }
-
-    fn folder_root(names: &[&str]) -> BookComposition {
-        use crate::book_composition::{CompositionPageRef, ReadingDirection, SinglePlacement};
-        BookComposition::new(
-            ReadingDirection::Rtl,
-            names
-                .iter()
-                .map(|name| CompositionUnit::Single {
-                    page: CompositionPageRef::RelativePath {
-                        path: (*name).into(),
-                    },
-                    placement: SinglePlacement::Center,
-                    companion: SingleCompanion::Vacant,
-                })
-                .collect(),
-        )
-    }
-
-    #[test]
-    fn folder_sidecar_root_only_round_trip_and_pending_share_the_full_snapshot() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = WriterState::default();
-        let root = folder_root(&["missing-page.jpg"]);
-        let mut file = SidecarFile::new(dir.path().to_path_buf());
-        file.set_folder_composition(Some(root.clone())).unwrap();
-        assert!(file.items().is_empty());
-        let WriteRequest::Write(snapshot) = file.write_request() else {
-            panic!("a root-only sidecar must be written");
-        };
-        state.queue(
-            dir.path().to_path_buf(),
-            WriteRequest::Write(Arc::clone(&snapshot)),
-        );
-        let SidecarImportLoad::Loaded(pending) =
-            SidecarFile::load_for_import_from(dir.path(), &state)
-        else {
-            panic!("pending root must be importable");
-        };
-        assert!(Arc::ptr_eq(&snapshot, &pending.sidecar.snapshot));
-        assert_eq!(pending.sidecar().folder_composition(), Some(&root));
-        assert!(matches!(
-            pending.source(),
-            SidecarImportSource::PendingWriter {
-                kind: PendingWriterKind::Write,
-                ..
-            }
-        ));
-        revalidate_import_source_from(pending.sidecar(), pending.source(), &state).unwrap();
-        state.write_one(dir.path());
-        let SidecarImportLoad::Loaded(disk) = SidecarFile::load_for_import_from(dir.path(), &state)
-        else {
-            panic!("disk root must be importable");
-        };
-        assert_eq!(disk.sidecar().folder_composition(), Some(&root));
-        assert_eq!(
-            disk.sidecar().folder_composition_digest(),
-            file.folder_composition_digest()
-        );
-        assert!(matches!(disk.source(), SidecarImportSource::Disk(_)));
-        let bytes = std::fs::read(dir.path().join(SIDECAR_FILENAME)).unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["version"], 2);
-        assert!(json["items"].as_object().unwrap().is_empty());
-    }
-
-    #[test]
-    fn folder_sidecar_v1_page_metadata_upgrades_without_interpreting_root() {
-        let dir = tempfile::tempdir().unwrap();
-        let params = sample_params();
-        let value = serde_json::json!({
-            "version": 1,
-            "items": {"page.jpg": {"tags": ["#legacy"], "adjust": params}},
-            "folder_composition": "undefined-v1-field"
-        });
-        std::fs::write(
-            dir.path().join(SIDECAR_FILENAME),
-            serde_json::to_vec(&value).unwrap(),
-        )
-        .unwrap();
-        let state = WriterState::default();
-        let SidecarImportLoad::Loaded(loaded) =
-            SidecarFile::load_for_import_from(dir.path(), &state)
-        else {
-            panic!("released v1 items must remain readable");
-        };
-        let mut file = loaded.into_parts().0;
-        assert_eq!(file.folder_composition(), None);
-        assert_eq!(
-            file.items()["page.jpg"].adjust.as_ref().unwrap().brightness,
-            params.brightness
-        );
-        assert_eq!(
-            file.items()["page.jpg"].tags.as_ref().unwrap(),
-            &["#legacy"]
-        );
-        file.set_tags("page.jpg", ["updated"]);
-        assert!(write_sidecar_to_disk(dir.path(), &file.write_request()));
-        let read = SidecarFile::load_from(dir.path(), &state);
-        assert_eq!(read.folder_composition(), None);
-        assert_eq!(
-            read.items()["page.jpg"].adjust.as_ref().unwrap().brightness,
-            params.brightness
-        );
-        let json: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(dir.path().join(SIDECAR_FILENAME)).unwrap())
-                .unwrap();
-        assert_eq!(json["version"], 2);
-        assert!(json.get("folder_composition").is_none());
-    }
-
-    #[test]
-    fn folder_sidecar_page_bundle_tag_updates_and_final_page_removal_preserve_root() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut file = SidecarFile::new(dir.path().to_path_buf());
-        let root = folder_root(&["page.jpg"]);
-        file.set_folder_composition(Some(root.clone())).unwrap();
-        file.set_tags("page.jpg", ["tag"]);
-        file.set_adjust("page.jpg", sample_params());
-        file.replace_edit_bundle("page.jpg", SidecarEntry::default());
-        assert!(file.items()["page.jpg"].adjust.is_none());
-        assert_eq!(file.items()["page.jpg"].tags.as_ref().unwrap(), &["#tag"]);
-        assert_eq!(file.folder_composition(), Some(&root));
-        file.remove_tags("page.jpg");
-        assert!(file.items().is_empty());
-        assert!(matches!(file.write_request(), WriteRequest::Write(_)));
-        assert!(write_sidecar_to_disk(dir.path(), &file.write_request()));
-        assert_eq!(
-            SidecarFile::load_from(dir.path(), &WriterState::default()).folder_composition(),
-            Some(&root)
-        );
-        file.set_folder_composition(None).unwrap();
-        assert!(matches!(file.write_request(), WriteRequest::Remove(_)));
-        assert!(write_sidecar_to_disk(dir.path(), &file.write_request()));
-        assert!(!dir.path().join(SIDECAR_FILENAME).exists());
-    }
-
-    #[test]
-    fn folder_sidecar_root_and_items_updates_copy_only_the_affected_family() {
-        let mut file = SidecarFile::new(PathBuf::from("C:/cow-root"));
-        file.set_tags("page.jpg", ["tag"]);
-        file.set_folder_composition(Some(folder_root(&["page.jpg"])))
-            .unwrap();
-        let before = Arc::clone(&file.snapshot);
-        file.set_folder_composition(Some(folder_root(&["other.jpg"])))
-            .unwrap();
-        assert!(!Arc::ptr_eq(&before, &file.snapshot));
-        assert!(Arc::ptr_eq(&before.items, &file.snapshot.items));
-        assert_eq!(
-            before.folder_composition.as_deref(),
-            Some(&folder_root(&["page.jpg"]))
-        );
-        let root = Arc::clone(file.snapshot.folder_composition.as_ref().unwrap());
-        let second = Arc::clone(&file.snapshot);
-        file.set_tags("page.jpg", ["changed"]);
-        assert!(!Arc::ptr_eq(&second, &file.snapshot));
-        assert!(!Arc::ptr_eq(&second.items, &file.snapshot.items));
-        assert!(Arc::ptr_eq(
-            &root,
-            file.snapshot.folder_composition.as_ref().unwrap()
-        ));
-        // A no-op root replacement keeps both identity and dirty age.
-        let current = Arc::clone(&file.snapshot);
-        let age = file.dirty_since;
-        file.set_folder_composition(Some(folder_root(&["other.jpg"])))
-            .unwrap();
-        assert!(Arc::ptr_eq(&current, &file.snapshot));
-        assert_eq!(age, file.dirty_since);
-    }
-
-    #[test]
-    fn folder_sidecar_old_flush_does_not_clear_a_changed_or_removed_root() {
-        for root_after in [Some(folder_root(&["new.jpg"])), None] {
-            let folder = PathBuf::from("C:/root-flush-reservation");
-            let mut file = SidecarFile::new(folder.clone());
-            file.set_tags("page.jpg", ["unchanged"]);
-            file.set_folder_composition(Some(folder_root(&["old.jpg"])))
-                .unwrap();
-            let mut cache = HashMap::from([(folder.clone(), file)]);
-            let (reservations, batch) = prepare_worker_flush_in_place(cache.values());
-            let old_items = Arc::clone(&cache[&folder].snapshot.items);
-            cache
-                .get_mut(&folder)
-                .unwrap()
-                .set_folder_composition(root_after.clone())
-                .unwrap();
-            assert!(Arc::ptr_eq(&old_items, &cache[&folder].snapshot.items));
-            let result = reservation_success(&reservations);
-            reservations
-                .resolve_in_place(&mut cache, result, true)
-                .unwrap();
-            assert!(cache[&folder].is_dirty());
-            assert_eq!(cache[&folder].folder_composition(), root_after.as_ref());
-            let WriteRequest::Write(old_snapshot) = &batch.requests[0].request else {
-                panic!("old snapshot expected");
-            };
-            assert_eq!(
-                old_snapshot.folder_composition.as_deref(),
-                Some(&folder_root(&["old.jpg"]))
-            );
-        }
-    }
-
-    #[test]
-    fn folder_sidecar_old_flush_does_not_evict_a_clean_root_replacement() {
-        let folder = PathBuf::from("C:/root-clean-replacement");
-        let mut file = SidecarFile::new(folder.clone());
-        file.set_folder_composition(Some(folder_root(&["old.jpg"])))
-            .unwrap();
-        let mut cache = HashMap::from([(folder.clone(), file)]);
-        let (reservations, _batch) = prepare_worker_flush_in_place(cache.values());
-        let mut replacement = cache[&folder].clone_import_snapshot();
-        replacement
-            .set_folder_composition(Some(folder_root(&["new.jpg"])))
-            .unwrap();
-        replacement.dirty = false;
-        replacement.dirty_since = None;
-        cache.insert(folder.clone(), replacement);
-        let result = reservation_success(&reservations);
-        reservations
-            .resolve_in_place(&mut cache, result, true)
-            .unwrap();
-        assert_eq!(
-            cache[&folder].folder_composition(),
-            Some(&folder_root(&["new.jpg"]))
-        );
-        assert!(!cache[&folder].is_dirty());
-    }
-
-    #[test]
-    fn folder_sidecar_pending_root_supersession_rejects_old_sequence_and_arc() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = WriterState::default();
-        let mut file = SidecarFile::new(dir.path().to_path_buf());
-        file.set_folder_composition(Some(folder_root(&["old.jpg"])))
-            .unwrap();
-        state.queue(dir.path().to_path_buf(), file.write_request());
-        let SidecarImportLoad::Loaded(old) = SidecarFile::load_for_import_from(dir.path(), &state)
-        else {
-            panic!("pending expected");
-        };
-        file.set_folder_composition(Some(folder_root(&["new.jpg"])))
-            .unwrap();
-        state.queue(dir.path().to_path_buf(), file.write_request());
-        assert!(revalidate_import_source_from(old.sidecar(), old.source(), &state).is_err());
-        // Even a matching sequence is insufficient when only the root Arc changed.
-        let SidecarImportSource::PendingWriter { sequence, .. } = old.source() else {
-            panic!("pending source expected");
-        };
-        state
-            .pending
-            .lock()
-            .unwrap()
-            .get_mut(dir.path())
-            .unwrap()
-            .seq = *sequence;
-        assert!(revalidate_import_source_from(old.sidecar(), old.source(), &state).is_err());
-        let clone = old.sidecar().clone_import_snapshot();
-        assert!(Arc::ptr_eq(&old.sidecar.snapshot, &clone.snapshot));
-        assert_eq!(clone.dirty, old.sidecar.dirty);
-    }
-
-    #[test]
-    fn folder_sidecar_pending_remove_admits_only_the_exact_empty_owner_sequence_and_kind() {
-        let dir = tempfile::tempdir().unwrap();
-        let folder = dir.path().to_path_buf();
-        let state = WriterState::default();
-        let owner = SidecarFile::new(folder.clone());
-        state.queue(folder.clone(), owner.write_request());
-        let SidecarImportLoad::Loaded(loaded) =
-            SidecarFile::load_for_import_from(dir.path(), &state)
-        else {
-            panic!("actual pending Remove must load");
-        };
-        assert!(Arc::ptr_eq(&owner.snapshot, &loaded.sidecar.snapshot));
-        assert!(matches!(
-            loaded.source(),
-            SidecarImportSource::PendingWriter {
-                kind: PendingWriterKind::Remove,
-                ..
-            }
-        ));
-        revalidate_import_source_from(loaded.sidecar(), loaded.source(), &state).unwrap();
-        let read_again = SidecarFile::load_from(dir.path(), &state);
-        assert!(Arc::ptr_eq(&owner.snapshot, &read_again.snapshot));
-        let Some(pending) = state.pending_import_snapshot(dir.path()).unwrap() else {
-            panic!("pending expected");
-        };
-        assert!(Arc::ptr_eq(&owner.snapshot, &pending.snapshot));
-        // Equal sequence/kind/contents are insufficient: another empty cache owner
-        // may have replaced this source while a read/flush reservation was held.
-        let replacement = SidecarFile::new(folder.clone());
-        assert!(replacement.snapshot.is_empty());
-        assert!(!Arc::ptr_eq(&owner.snapshot, &replacement.snapshot));
-        state
-            .pending
-            .lock()
-            .unwrap()
-            .get_mut(dir.path())
-            .unwrap()
-            .request = replacement.write_request();
-        assert!(revalidate_import_source_from(loaded.sidecar(), loaded.source(), &state).is_err());
-        // Restoring the exact Arc admits the source again, but changing kind does not.
-        state
-            .pending
-            .lock()
-            .unwrap()
-            .get_mut(dir.path())
-            .unwrap()
-            .request = owner.write_request();
-        revalidate_import_source_from(loaded.sidecar(), loaded.source(), &state).unwrap();
-        state
-            .pending
-            .lock()
-            .unwrap()
-            .get_mut(dir.path())
-            .unwrap()
-            .request = WriteRequest::Write(Arc::clone(&owner.snapshot));
-        assert!(revalidate_import_source_from(loaded.sidecar(), loaded.source(), &state).is_err());
-        state.queue(folder, owner.write_request());
-        assert!(revalidate_import_source_from(loaded.sidecar(), loaded.source(), &state).is_err());
-    }
-
-    #[test]
-    fn folder_sidecar_remove_flush_reservation_carries_and_reconciles_the_empty_owner_arc() {
-        let folder = PathBuf::from("C:/empty-remove-reservation");
-        let mut owner = SidecarFile::new(folder.clone());
-        owner
-            .set_folder_composition(Some(folder_root(&["page.jpg"])))
-            .unwrap();
-        owner.set_folder_composition(None).unwrap();
-        let mut cache = HashMap::from([(folder.clone(), owner)]);
-        let (reservations, batch) = prepare_worker_flush_in_place(cache.values());
-        let WriteRequest::Remove(snapshot) = &batch.requests[0].request else {
-            panic!("empty snapshot must reserve Remove");
-        };
-        assert!(Arc::ptr_eq(&cache[&folder].snapshot, snapshot));
-        assert!(Arc::ptr_eq(&reservations.owners[0].snapshot, snapshot));
-        cache.insert(folder.clone(), SidecarFile::new(folder.clone()));
-        let result = reservation_success(&reservations);
-        reservations
-            .resolve_in_place(&mut cache, result, true)
-            .unwrap();
-        assert!(
-            cache.contains_key(&folder),
-            "an old Remove cannot evict another empty owner"
-        );
-        assert!(!Arc::ptr_eq(&cache[&folder].snapshot, snapshot));
-    }
-
-    #[test]
-    fn folder_sidecar_pending_remove_revalidation_checks_root_absence() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = WriterState::default();
-        state.queue(
-            dir.path().to_path_buf(),
-            WriteRequest::Remove(Arc::new(SidecarSnapshot::default())),
-        );
-        let SidecarImportLoad::Loaded(loaded) =
-            SidecarFile::load_for_import_from(dir.path(), &state)
-        else {
-            panic!("pending remove expected");
-        };
-        let (mut file, source) = loaded.into_parts();
-        revalidate_import_source_from(&file, &source, &state).unwrap();
-        file.set_folder_composition(Some(folder_root(&["page.jpg"])))
-            .unwrap();
-        assert!(file.items().is_empty());
-        assert!(revalidate_import_source_from(&file, &source, &state).is_err());
-    }
-
-    #[test]
-    fn folder_sidecar_invalid_root_preserves_original_and_disables_the_writer() {
-        use crate::book_composition::{CompositionPageRef, SinglePlacement};
-        let valid = folder_root(&["page.jpg"]);
-        let mut unknown = valid.clone();
-        unknown.schema_version += 1;
-        let mut revision = valid.clone();
-        revision.revision = u64::MAX;
-        let mut invalid_blank = valid.clone();
-        let CompositionUnit::Single {
-            companion,
-            placement,
-            ..
-        } = &mut invalid_blank.units[0]
-        else {
-            unreachable!()
-        };
-        *placement = SinglePlacement::Center;
-        *companion = SingleCompanion::Blank;
-        let mut wrong_kind = valid.clone();
-        wrong_kind.units = vec![CompositionUnit::Single {
-            page: CompositionPageRef::PdfPage { page_num: 0 },
-            placement: SinglePlacement::Center,
-            companion: SingleCompanion::Vacant,
-        }];
-        let invalid = vec![
-            folder_root(&["../outside.jpg"]),
-            folder_root(&["C:/outside.jpg"]),
-            folder_root(&["sub/page.jpg"]),
-            folder_root(&["NUL.jpg"]),
-            folder_root(&["page.jpg", "PAGE.JPG"]),
-            unknown,
-            revision,
-            invalid_blank,
-            wrong_kind,
-        ];
-        for root in invalid {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join(SIDECAR_FILENAME);
-            let bytes = serde_json::to_vec(&serde_json::json!({"version": 2, "items": {"page.jpg": {"tags": ["#preserve"]}}, "folder_composition": root})).unwrap();
-            std::fs::write(&path, &bytes).unwrap();
-            let state = WriterState::default();
-            let SidecarImportLoad::Corrupt { mut sidecar, .. } =
-                SidecarFile::load_for_import_from(dir.path(), &state)
-            else {
-                panic!("invalid root must fail closed");
-            };
-            assert!(sidecar.disabled);
-            assert!(sidecar.set_folder_composition(Some(valid.clone())).is_err());
-            sidecar.set_tags("page.jpg", ["changed"]);
-            let (_owners, batch) = prepare_worker_flush([sidecar]);
-            assert!(batch.is_empty());
-            assert_eq!(std::fs::read(path).unwrap(), bytes);
-            assert!(SidecarFile::load_from(dir.path(), &state).disabled);
-        }
-        // A blank-only wire shape has no ordinary page and cannot decode as a unit.
-        let dir = tempfile::tempdir().unwrap();
-        let mut wire = serde_json::to_value(&valid).unwrap();
-        wire["units"] = serde_json::json!([{"kind": "blank"}]);
-        let bytes = serde_json::to_vec(
-            &serde_json::json!({"version": 2, "items": {}, "folder_composition": wire}),
-        )
-        .unwrap();
-        std::fs::write(dir.path().join(SIDECAR_FILENAME), &bytes).unwrap();
-        assert!(matches!(
-            SidecarFile::load_for_import_from(dir.path(), &WriterState::default()),
-            SidecarImportLoad::Corrupt { .. }
-        ));
-        assert_eq!(
-            std::fs::read(dir.path().join(SIDECAR_FILENAME)).unwrap(),
-            bytes
-        );
-    }
-
-    #[test]
-    fn folder_sidecar_mirror_adoption_preserves_page_dirty_and_disabled_owners() {
-        for (dirty, disabled) in [(false, false), (true, false), (true, true)] {
-            let mut file = SidecarFile::new(PathBuf::from("C:/mirror-root-adoption"));
-            file.set_tags("page.jpg", ["retain"]);
-            file.dirty = dirty;
-            file.disabled = disabled;
-            let before = Arc::clone(&file.snapshot);
-            let age = file.dirty_since;
-            let root = folder_root(&["page.jpg"]);
-            file.adopt_mirrored_folder_composition(Some(root.clone()));
-            assert!(Arc::ptr_eq(&before.items, &file.snapshot.items));
-            assert!(!Arc::ptr_eq(&before, &file.snapshot));
-            assert_eq!(file.folder_composition(), Some(&root));
-            assert_eq!(file.dirty, dirty);
-            assert_eq!(file.disabled, disabled);
-            assert_eq!(file.dirty_since, age);
-            file.adopt_mirrored_folder_composition(None);
-            assert_eq!(file.folder_composition(), None);
-            assert_eq!(
-                file.items()["page.jpg"].tags.as_ref().unwrap(),
-                &["#retain"]
-            );
-            assert_eq!(file.dirty, dirty);
-            assert_eq!(file.disabled, disabled);
-        }
-    }
-
-    #[test]
-    fn folder_sidecar_root_raw_bytes_limit_and_future_envelope_preserve_originals() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(SIDECAR_FILENAME);
-        let root = folder_root(&["page.jpg"]);
-        let root_json = serde_json::to_string(&root).unwrap();
-        // Whitespace is part of the untrusted root byte budget. The model must
-        // reject before allocating the typed 100k-page tree, just like DB decode.
-        let oversized = format!(
-            "{{{}{}",
-            " ".repeat(crate::book_composition::MAX_JSON_BYTES),
-            &root_json[1..]
-        );
-        let bytes = format!("{{\"version\":2,\"items\":{{}},\"folder_composition\":{oversized}}}")
-            .into_bytes();
-        std::fs::write(&path, &bytes).unwrap();
-        let SidecarImportLoad::Corrupt { sidecar, error } =
-            SidecarFile::load_for_import_from(dir.path(), &WriterState::default())
-        else {
-            panic!("oversized root must fail closed");
-        };
-        assert!(sidecar.disabled);
-        assert!(error.contains("JSON bytes"), "{error}");
-        assert_eq!(std::fs::read(&path).unwrap(), bytes);
-        let bytes = serde_json::to_vec(&serde_json::json!({"version": CURRENT_VERSION + 1, "items": {"page.jpg": {"tags": ["#future"]}}, "folder_composition": root})).unwrap();
-        std::fs::write(&path, &bytes).unwrap();
-        let SidecarImportLoad::UnsupportedVersion { sidecar, .. } =
-            SidecarFile::load_for_import_from(dir.path(), &WriterState::default())
-        else {
-            panic!("future sidecar envelope must remain unsupported");
-        };
-        assert!(sidecar.disabled);
-        assert_eq!(std::fs::read(path).unwrap(), bytes);
-    }
-
-    #[test]
-    fn folder_sidecar_arc_root_adoption_reuses_identity_for_the_same_worker_root() {
-        let mut file = SidecarFile::new(PathBuf::from("C:/arc-root-adoption"));
-        let root = Arc::new(folder_root(&["page.jpg"]));
-        file.adopt_mirrored_folder_composition_arc(Some(root.clone()));
-        let before = Arc::clone(&file.snapshot);
-        file.adopt_mirrored_folder_composition_arc(Some(root.clone()));
-        assert!(Arc::ptr_eq(&before, &file.snapshot));
-        assert!(Arc::ptr_eq(
-            file.snapshot.folder_composition.as_ref().unwrap(),
-            &root
-        ));
-        assert!(!file.is_dirty());
-        file.adopt_mirrored_folder_composition_arc(None);
-        assert!(!Arc::ptr_eq(&before, &file.snapshot));
-        assert!(!file.is_dirty());
-    }
-
-    #[test]
-    fn folder_sidecar_root_digest_is_independent_of_items_and_normalizes_set_identity() {
-        use crate::book_composition::CompositionPageRef;
-        let mut root = folder_root(&["One.JPG", "Two.JPG"]);
-        root.hidden_pages = vec![
-            CompositionPageRef::RelativePath {
-                path: "One.JPG".into(),
-            },
-            CompositionPageRef::RelativePath {
-                path: "Two.JPG".into(),
-            },
-        ];
-        let mut equivalent = folder_root(&["one.jpg", "two.jpg"]);
-        equivalent.hidden_pages = vec![
-            CompositionPageRef::RelativePath {
-                path: "two.jpg".into(),
-            },
-            CompositionPageRef::RelativePath {
-                path: "one.jpg".into(),
-            },
-        ];
-        assert_eq!(
-            folder_composition_digest(Some(&root)),
-            folder_composition_digest(Some(&equivalent))
-        );
-        let mut file = SidecarFile::new(PathBuf::from("C:/digest-root"));
-        file.set_folder_composition(Some(root.clone())).unwrap();
-        let digest = file.folder_composition_digest();
-        file.set_tags("unrelated.jpg", ["new"]);
-        assert_eq!(file.folder_composition_digest(), digest);
-        root.units.reverse();
-        assert_ne!(folder_composition_digest(Some(&root)), digest);
-        assert_ne!(folder_composition_digest(None), digest);
-        root = equivalent;
-        root.revision += 1;
-        assert_ne!(folder_composition_digest(Some(&root)), digest);
-    }
-
-    #[test]
-    fn folder_sidecar_root_only_change_with_equal_len_mtime_rejects_retained_disk_reuse() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(SIDECAR_FILENAME);
-        let state = WriterState::default();
-        let mut file = SidecarFile::new(dir.path().to_path_buf());
-        file.set_folder_composition(Some(folder_root(&["one.jpg"])))
-            .unwrap();
-        assert!(write_sidecar_to_disk(dir.path(), &file.write_request()));
-        let old_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
-        let SidecarImportLoad::Loaded(old) = SidecarFile::load_for_import_from(dir.path(), &state)
-        else {
-            panic!("loaded root expected");
-        };
-        let old_digest = old.sidecar().folder_composition_digest();
-        let (_, SidecarImportSource::Disk(token)) = old.into_parts() else {
-            panic!("disk token expected");
-        };
-        file.set_folder_composition(Some(folder_root(&["two.jpg"])))
-            .unwrap();
-        assert!(write_sidecar_to_disk(dir.path(), &file.write_request()));
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(old_mtime))
-            .unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), token.byte_len());
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().modified().unwrap(),
-            old_mtime
-        );
-        assert_eq!(
-            revalidate_disk_import_source_for_reuse_from(dir.path(), &token, &state),
-            Err(SidecarDiskReuseRevalidationError::TokenMismatch)
-        );
-        let SidecarImportLoad::Loaded(new) = SidecarFile::load_for_import_from(dir.path(), &state)
-        else {
-            panic!("new root expected");
-        };
-        assert_ne!(old_digest, new.sidecar().folder_composition_digest());
-    }
-
-    fn snapshot_with_items(items: Arc<BTreeMap<String, SidecarEntry>>) -> Arc<SidecarSnapshot> {
-        Arc::new(SidecarSnapshot {
-            items,
-            folder_composition: None,
-        })
     }
 
     fn items_named(names: &[&str]) -> Arc<BTreeMap<String, SidecarEntry>> {
@@ -4375,14 +3547,14 @@ mod writer_tests {
 
         state.queue(
             folder.clone(),
-            WriteRequest::Write(snapshot_with_items(items_named(&["one.jpg"]))),
+            WriteRequest::Write(items_named(&["one.jpg"])),
         );
         let (seq, request) = state.take_for_write(&folder).expect("the first job");
 
         // ここで編集が入る。
         state.queue(
             folder.clone(),
-            WriteRequest::Write(snapshot_with_items(items_named(&["one.jpg", "two.jpg"]))),
+            WriteRequest::Write(items_named(&["one.jpg", "two.jpg"])),
         );
 
         // 1 件目の書き込みが完了する。
@@ -4410,11 +3582,11 @@ mod writer_tests {
 
         state.queue(
             folder.clone(),
-            WriteRequest::Write(snapshot_with_items(items_named(&["one.jpg"]))),
+            WriteRequest::Write(items_named(&["one.jpg"])),
         );
         state.queue(
             folder.clone(),
-            WriteRequest::Write(snapshot_with_items(items_named(&["one.jpg", "two.jpg"]))),
+            WriteRequest::Write(items_named(&["one.jpg", "two.jpg"])),
         );
 
         // 2 つ積まれているが、最初の job が既に最新を書いてしまう。
@@ -4435,10 +3607,7 @@ mod writer_tests {
         )
         .unwrap();
         let state = WriterState::default();
-        state.queue(
-            folder.clone(),
-            WriteRequest::Remove(Arc::new(SidecarSnapshot::default())),
-        );
+        state.queue(folder.clone(), WriteRequest::Remove);
         assert_eq!(
             state.pending_items(&folder).map(|items| items.len()),
             Some(0),

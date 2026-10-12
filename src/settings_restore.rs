@@ -776,11 +776,6 @@ pub(crate) fn full_reset_with_permit(
             .map_err(|error| {
                 RestoreFailure::Terminal(RestoreError::ValidationFailed(error.to_string()))
             })?;
-        transaction
-            .execute("DELETE FROM folder_composition_receipts", [])
-            .map_err(|error| {
-                RestoreFailure::Terminal(RestoreError::ValidationFailed(error.to_string()))
-            })?;
         transaction.commit().map_err(|error| {
             RestoreFailure::Terminal(RestoreError::ValidationFailed(error.to_string()))
         })?;
@@ -1141,9 +1136,6 @@ mod tests {
         let composition = crate::book_composition::fixtures::four_page_book(
             crate::book_composition::ReadingDirection::Ltr,
         );
-        let receipt_key = crate::book_scope::BookScopeKey::folder(&dir.join("receipt-only-folder"))
-            .unwrap()
-            .storage_key();
         {
             let connection = Connection::open(&path).unwrap();
             crate::book_composition::store::replace_row_in(
@@ -1152,14 +1144,6 @@ mod tests {
                 &scope.storage_key(),
                 &crate::book_composition::PageDomain::Document,
                 &composition,
-            )
-            .unwrap();
-            crate::book_composition::store::consume_folder_root_in(
-                &connection,
-                "book_compositions",
-                &receipt_key,
-                [7; 32],
-                Some(71),
             )
             .unwrap();
         }
@@ -1178,15 +1162,6 @@ mod tests {
             .unwrap();
         let restored = Connection::open(backup).unwrap();
         let rows = crate::book_composition::store::load_rows(&restored).unwrap();
-        assert!(
-            crate::book_composition::store::folder_receipt_in(
-                &restored,
-                "book_compositions",
-                &receipt_key
-            )
-            .unwrap()
-            .is_some()
-        );
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[&scope.storage_key()].composition.units,
@@ -1196,15 +1171,6 @@ mod tests {
             crate::book_composition::store::load_rows(&Connection::open(path).unwrap())
                 .unwrap()
                 .is_empty()
-        );
-        assert!(
-            crate::book_composition::store::folder_receipt_in(
-                &Connection::open(dir.join("book_composition.db")).unwrap(),
-                "book_compositions",
-                &receipt_key
-            )
-            .unwrap()
-            .is_none()
         );
         assert_eq!(
             std::fs::read(dir.join("spread_shift.db")).unwrap(),

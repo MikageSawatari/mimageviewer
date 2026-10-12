@@ -118,6 +118,14 @@ pub(crate) struct CompositionWriteAdmission {
 }
 impl CompositionWriteAdmission {
     pub(crate) fn validate(&self, snapshot: &CompositionSnapshot) -> Result<(), String> {
+        // An outside-scope write has no composition resource to protect.
+        if self.targets.is_empty()
+            && self.binding_scope.is_none()
+            && self.unsupported_scopes.is_empty()
+            && self.unsupported_pages.is_empty()
+        {
+            return Ok(());
+        }
         snapshot.status.clone()?;
         for proof in &self.unsupported_scopes {
             if snapshot.token_for(&proof.scope) != proof.token {

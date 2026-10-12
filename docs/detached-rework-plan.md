@@ -4697,28 +4697,17 @@ Remoteはeditor中でも後の取得を受け付け、mainのみ/fullscreenな�
 detached専用bool/Option、geometry/placement/HWND/viewport生成、時間窓や回復guardは追加しない。
 独立レビュー・自動gate・利用者実機観測の完了は本記録では主張しない。
 
-### §11 追補: §1.242 G4F 画像folder adapter（2026-10-12、実装記録）
+### §11 追補: §1.242 G4F切り離しと送信済保存票の共通境界（2026-10-12 利用者決定）
 
-画像Bookの初回自動fullscreenは既存の本用deferred-open ownerへ接続する。構成採用前に
-元indexを選ぶと「最初から」が元ページの明示identityとなり、並べ替え後の途中へ着地する。
-folder adapterが開始intentを渡し、projection採用後に同じresume/target/提示許可resolverで
-解決する。空列の終端も既存の所有context限定終了経路を使う。新しいpending状態は追加せず、
-画像Book以外のfolder入口と兄弟contextは変更しない。
-
-G4のmodal editor、context所有source、既存sidecar restore continuationを画像folderにも使う。
-BookImageFolderの相対page ref/元列はworkerで準備し、immutable projectionだけを各contextへ採用する。
-不足行のsidecar構成restoreは既存import ownerのfamilyであり、source終端まで同contextの
-初回projectionを待たせる。Resumingはそのprojectionの完了を消費するため、source待機の対象外。
-parked兄弟のasync routerは別contextのmain restoreを待たず、それぞれのscope/tokenを照合する。
-保存時は同folderの既存sidecar予約をG4のsave ticketへ載せ、workerのFIFO完了後にDB保存/ミラーし、
-正確な予約ownerの完了を回収する。兄弟のdirty itemsや異なるsnapshotを消去しない。
-
-G4F REVISEでは、所有contextを閉じた後も残るApp共通save ticketを、別folderのChecking
-workerがflushを予約する境界にも適用する。ticketを退役contextへ戻さず、旧rootのdisk上書きを
-予約時に防ぐ。個別page改名/製本page移動の既存migration ownerも、ミラー完了からキャッシュroot採用まで
-同folderの書込権を保持する。dirty tags/他folderのflushを維持し、viewport/sessionの状態は増やさない。
-
-この変更はBA-7のsource/保存/復元の所有境界を再利用するfolder adapterであり、detached専用
-bool/例外phase、HWND/focus/placement/viewport、時間窓や再試行は追加しない。
-同folder兄弟の保存完了順、restore中のparked採用、初回fullscreenまでのcontinuationを
-非対話fixtureへ加える。レビュー・自動gate・実機確認の成功は本記録では主張しない。
+G4Fのfolder source/projection/editor/sidecar v2と専用fixturesを撤去し、G4直後のcontext所有へ戻す。
+G1〜G4の書庫/PDF/EPUB、A2/Q16、既存ViewerContextBundle、共通editor owner/save ticketは維持する。
+所有窓を閉じた後の保存票も完了・採用までprocess側に残り、metadata preview/import/exportとGeneric改名が
+maintenanceを先取りしないよう既存開始待ちへ接続する。context retireを待機機構として変更しない。
+通常/抽出/退避の物理Imageを構成候補へ渡さず、既存のAllowed(None)で提示する。
+類似previewのFileもworkerと採用の同じsource資格で除外し、ZIP/PDFのFIFO/proof契約を保つ。
+pure型/storeのfolder値は保持し、DB行の削除やviewer ownerの再設計は行わない。
+folder mirrorがなくなったため、migrationによるfolder cache claim・追加root-close待ちは外し、
+構成のないfolderの終了/tray flushをmasterと同じ既存v1 writerへ戻す。
+これは利用者指定の機能切り離しと既存保存票の所有境界の補完であり、detached述語・viewport/HWND・
+placement・keep-alive・新状態・時間窓・回復guardを追加しない。実worker完了順とcontext退役のfixturesで確認する。
+本記録は独立レビューや実機観測の完了を主張しない。

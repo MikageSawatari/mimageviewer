@@ -569,7 +569,6 @@ use presentation_transition::{PreparingProgress, PresentationTransitionState};
 pub(crate) mod book_composition_editor;
 mod book_composition_editor_prepare;
 mod book_composition_editor_thumbnails;
-mod book_composition_folder;
 pub(crate) mod book_composition_permission;
 mod book_composition_remap;
 pub(crate) mod book_composition_runtime;
@@ -13891,13 +13890,6 @@ fn video_pin_dirty_paths_visible(
 /// 実行中のリネーム移行 worker のハンドル (`App::rename_migration_in_flight`)。
 pub(crate) enum RenameMigrationInFlight {
     Generic {
-        job: crate::rename_key_migration::PathMigrationJob,
-        /// Captured backup policy: this owner retains sidecar writes through
-        /// worker mirroring and adoption, even if the live setting changes.
-        folder_backup_enabled: bool,
-        rx: std::sync::mpsc::Receiver<crate::rename_key_migration::RenameMigrationReport>,
-    },
-    BookComposition {
         job: crate::rename_key_migration::PathMigrationJob,
         rx: std::sync::mpsc::Receiver<crate::rename_key_migration::RenameMigrationReport>,
     },
@@ -39247,7 +39239,8 @@ impl App {
             && !is_synthetic_view_path(&source_path)
             && (self.settings.sidecar_backup_enabled || self.settings.tag_sidecar_backup_enabled);
         if !detached_physical && !sidecar_restore_candidate {
-            self.flush_and_retire_unowned_sidecars();
+            self.flush_all_sidecars();
+            self.sidecars.clear();
         }
         if crate::perf::is_enabled() {
             crate::perf::event(
@@ -40297,8 +40290,7 @@ impl App {
         if matches!(
             first_display_action,
             sidecar_restore::FirstDisplayAction::AutoFullscreenFolder
-        ) && !self.start_folder_composition_first_display()
-        {
+        ) {
             let resume_rejected =
                 self.settings.book_open_resume.resumes() && self.saved_resume_is_unresolvable();
             let new_idx = if self.settings.book_open_resume.resumes() {
@@ -45175,7 +45167,6 @@ impl App {
         if let Some(job) = &self.rename_migration_in_flight {
             entries.push(match job {
                 RenameMigrationInFlight::Generic { job, .. }
-                | RenameMigrationInFlight::BookComposition { job, .. }
                 | RenameMigrationInFlight::Collection { job, .. } => job.clone(),
             });
         }
@@ -45808,12 +45799,10 @@ impl App {
         }
         let matches_key = removed_path_key_matcher(removed);
         let suppress_generic = |job: &crate::rename_key_migration::PathMigrationJob| {
-            matches!(
-                job.stage,
-                crate::rename_key_migration::PathMigrationStage::Generic
-            ) && job.mappings.iter().any(|mapping| {
-                matches_key(&crate::adjustment_db::normalize_path(&mapping.new_path))
-            })
+            job.generic_pending
+                && job.mappings.iter().any(|mapping| {
+                    matches_key(&crate::adjustment_db::normalize_path(&mapping.new_path))
+                })
         };
         let mut changed = 0usize;
         for job in self
@@ -45822,7 +45811,7 @@ impl App {
             .chain(self.rename_migration_boot_retry.iter_mut())
         {
             if suppress_generic(job) {
-                job.stage = crate::rename_key_migration::PathMigrationStage::Collection;
+                job.generic_pending = false;
                 changed += 1;
             }
         }
@@ -45947,90 +45936,6 @@ impl App {
             })
     }
 
-    /// Migration mappings claim direct-page parents and explicitly moved trees;
-    /// similarly named neighboring folders stay writable.
-    fn sidecar_roots_for_rename_migration(
-        &self,
-        job: &crate::rename_key_migration::PathMigrationJob,
-    ) -> Vec<PathBuf> {
-        self.sidecars
-            .keys()
-            .filter(|folder| {
-                job.mappings.iter().any(|mapping| {
-                    [&mapping.old_path, &mapping.new_path]
-                        .into_iter()
-                        .any(|path| {
-                            path.parent()
-                                .is_some_and(|parent| crate::folder_tree::path_eq(folder, parent))
-                                || (mapping.tree
-                                    && crate::path_key::physical_path_is_within(folder, path))
-                        })
-                })
-            })
-            .cloned()
-            .collect()
-    }
-
-    pub(super) fn rename_migration_sidecar_flush_roots(&self) -> Vec<PathBuf> {
-        let mut roots = Vec::new();
-        if let Some(RenameMigrationInFlight::Generic {
-            job,
-            folder_backup_enabled: true,
-            ..
-        }) = &self.rename_migration_in_flight
-        {
-            roots.extend(self.sidecar_roots_for_rename_migration(job));
-        }
-        if let Some(RenameMigrationInFlight::BookComposition { job, .. }) =
-            &self.rename_migration_in_flight
-        {
-            if matches!(
-                job.stage,
-                crate::rename_key_migration::PathMigrationStage::BookComposition {
-                    backup_enabled: true
-                }
-            ) {
-                roots.extend(self.sidecar_roots_for_rename_migration(job));
-            }
-        }
-        for job in &self.rename_migration_queue {
-            let owns_backup = match job.stage {
-                crate::rename_key_migration::PathMigrationStage::Generic => {
-                    self.settings.sidecar_backup_enabled
-                }
-                crate::rename_key_migration::PathMigrationStage::BookComposition {
-                    backup_enabled,
-                } => backup_enabled,
-                crate::rename_key_migration::PathMigrationStage::Collection => false,
-            };
-            if owns_backup {
-                roots.extend(self.sidecar_roots_for_rename_migration(job));
-            }
-        }
-        roots
-    }
-
-    fn adopt_rename_migration_sidecar_roots(
-        &mut self,
-        job: &crate::rename_key_migration::PathMigrationJob,
-    ) {
-        // Page migration mirrors an existing DB root. A backup-only root with
-        // no DB row must remain untouched, including backup-OFF tag-only writes.
-        let Some(service) = &self.book_composition_service else {
-            return;
-        };
-        let snapshot = service.snapshot();
-        let roots: Vec<_> = self
-            .sidecar_roots_for_rename_migration(job)
-            .into_iter()
-            .filter(|folder| {
-                crate::book_scope::BookScopeKey::folder(folder)
-                    .is_ok_and(|scope| snapshot.folder_roots.contains_key(&scope.storage_key()))
-            })
-            .collect();
-        self.adopt_mirrored_folder_composition_roots(&roots);
-    }
-
     /// キュー先頭のリネーム移行 worker を起動する (直列 = in-flight が無いときだけ)。
     /// 書込 worker が busy の間は開始せず、`poll_rename_migration_pending` が毎フレーム
     /// 再試行する。
@@ -46044,53 +45949,7 @@ impl App {
         let Some(job) = self.rename_migration_queue.front().cloned() else {
             return;
         };
-        if let crate::rename_key_migration::PathMigrationStage::BookComposition { backup_enabled } =
-            job.stage
-        {
-            if self.composition_editor_writes_pending()
-                || self.rename_migration_writers_busy()
-                || self.rename_migration_source_changes_pending()
-                || self.metadata_cleanup_pending.is_some()
-                || self.delete_purge_retry_pending.is_some()
-            {
-                return;
-            }
-            let job = self
-                .rename_migration_queue
-                .pop_front()
-                .expect("front exists");
-            let worker_mappings = job.mappings.clone();
-            let data_dir = self.rename_migration_data_dir();
-            let (tx, rx) = std::sync::mpsc::channel();
-            match std::thread::Builder::new()
-                .name("book-composition-migration".into())
-                .spawn(move || {
-                    let report = crate::rename_key_migration::run_book_page_composition_at(
-                        &data_dir,
-                        &worker_mappings,
-                        backup_enabled,
-                    );
-                    let _ = tx.send(report);
-                }) {
-                Ok(_) => {
-                    self.rename_migration_in_flight =
-                        Some(RenameMigrationInFlight::BookComposition { job, rx })
-                }
-                Err(error) => {
-                    crate::logger::log(format!(
-                        "[RENAME-MIG] book composition spawn failed: {error}"
-                    ));
-                    self.show_feedback_toast("本の構成のページ移動を反映できませんでした".into());
-                    self.rename_migration_boot_retry.push(job);
-                    self.persist_rename_migration_journal();
-                }
-            }
-            return;
-        }
-        if matches!(
-            job.stage,
-            crate::rename_key_migration::PathMigrationStage::Generic
-        ) {
+        if job.generic_pending {
             if self.composition_editor_writes_pending()
                 || self.rename_migration_writers_busy()
                 || self.rename_migration_source_changes_pending()
@@ -46120,17 +45979,15 @@ impl App {
             let worker_old = old_path;
             let worker_new = new_path;
             let worker_tree = job.mappings[0].tree;
-            let folder_backup_enabled = self.settings.sidecar_backup_enabled;
             match std::thread::Builder::new()
                 .name("rename-key-migration".into())
                 .spawn(move || {
                     let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        crate::rename_key_migration::run_at_with_shape_and_folder_backup(
+                        crate::rename_key_migration::run_at_with_shape(
                             &data_dir,
                             &worker_old,
                             &worker_new,
                             worker_tree,
-                            folder_backup_enabled,
                         )
                     }))
                     .unwrap_or_else(|_| {
@@ -46145,11 +46002,8 @@ impl App {
                     let _ = tx.send(report);
                 }) {
                 Ok(_) => {
-                    self.rename_migration_in_flight = Some(RenameMigrationInFlight::Generic {
-                        job,
-                        folder_backup_enabled,
-                        rx,
-                    });
+                    self.rename_migration_in_flight =
+                        Some(RenameMigrationInFlight::Generic { job, rx });
                 }
                 Err(e) => {
                     crate::logger::log(format!("[RENAME-MIG] spawn failed (requeue): {e}"));
@@ -46249,21 +46103,8 @@ impl App {
         }
         if let Some(in_flight) = self.rename_migration_in_flight.take() {
             match in_flight {
-                RenameMigrationInFlight::Generic {
-                    mut job,
-                    folder_backup_enabled,
-                    rx,
-                } => match rx.try_recv() {
+                RenameMigrationInFlight::Generic { mut job, rx } => match rx.try_recv() {
                     Ok(report) => {
-                        // Lease release in the worker has already published its
-                        // immutable roots. Adopt them before releasing this
-                        // migration's write claim or invoking other consumers.
-                        if folder_backup_enabled
-                            && report.store_mutations.book_composition_changed()
-                        {
-                            let roots = self.sidecar_roots_for_rename_migration(&job);
-                            self.adopt_rename_migration_sidecar_roots(&job);
-                        }
                         self.apply_content_identity_store_mutations(report.store_mutations);
                         if report.panicked {
                             // panic = 残ストアを試行しないまま中断した可能性がある。per-store
@@ -46347,7 +46188,7 @@ impl App {
                         self.refresh_smart_folders_after_rename();
                         // The physical metadata migration has completed, but the durable journal
                         // remains until the collection actor acknowledges the same source mapping.
-                        job.stage = crate::rename_key_migration::PathMigrationStage::Collection;
+                        job.generic_pending = false;
                         self.rename_migration_queue.push_front(job);
                         self.persist_rename_migration_journal();
                     }
@@ -46364,50 +46205,8 @@ impl App {
                         self.persist_rename_migration_journal();
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
-                        self.rename_migration_in_flight = Some(RenameMigrationInFlight::Generic {
-                            job,
-                            folder_backup_enabled,
-                            rx,
-                        });
-                    }
-                },
-                RenameMigrationInFlight::BookComposition { mut job, rx } => match rx.try_recv() {
-                    Ok(report) => {
-                        if matches!(
-                            job.stage,
-                            crate::rename_key_migration::PathMigrationStage::BookComposition {
-                                backup_enabled: true
-                            }
-                        ) && report.store_mutations.book_composition_changed()
-                        {
-                            self.adopt_rename_migration_sidecar_roots(&job);
-                        }
-                        self.apply_content_identity_store_mutations(report.store_mutations);
-                        for error in &report.errors {
-                            crate::logger::log(format!("[RENAME-MIG] book composition: {error}"));
-                        }
-                        if !report.errors.is_empty() {
-                            self.show_feedback_toast(
-                                "本の構成のページ移動を反映できませんでした".into(),
-                            );
-                        }
-                        // The same durable queue now owns collection ACK. No
-                        // separate composition-pending owner or retry loop.
-                        job.stage = crate::rename_key_migration::PathMigrationStage::Collection;
-                        self.rename_migration_queue.push_front(job);
-                        self.persist_rename_migration_journal();
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => {
                         self.rename_migration_in_flight =
-                            Some(RenameMigrationInFlight::BookComposition { job, rx });
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        crate::logger::log("[RENAME-MIG] book composition worker disconnected");
-                        self.show_feedback_toast(
-                            "本の構成のページ移動を反映できませんでした".into(),
-                        );
-                        self.rename_migration_boot_retry.push(job);
-                        self.persist_rename_migration_journal();
+                            Some(RenameMigrationInFlight::Generic { job, rx });
                     }
                 },
                 RenameMigrationInFlight::Collection { job, rx } => match rx.try_recv() {
@@ -49828,10 +49627,18 @@ impl App {
                 ));
             }
         }
-        if let (Some(service), Some((source, target))) =
-            (&self.book_composition_service, collection_tree_migration)
-        {
-            if let Err(error) = service.rename_book_root(source, target) {
+        if let Some(service) = &self.book_composition_service {
+            let admission = if let Some((source, target)) = collection_tree_migration {
+                service.rename_book_root(source, target)
+            } else {
+                service.migrate_page_paths(
+                    mappings
+                        .iter()
+                        .map(|mapping| (mapping.from.clone(), mapping.to.clone()))
+                        .collect(),
+                )
+            };
+            if let Err(error) = admission {
                 crate::logger::log(format!(
                     "book_composition: page mapping admission failed: {error}"
                 ));
@@ -49857,17 +49664,7 @@ impl App {
         }
         let collection_mappings =
             book_collection_source_mappings(mappings, collection_tree_migration);
-        if collection_tree_migration.is_some() {
-            self.enqueue_collection_source_migration_batch(collection_mappings);
-        } else if let Some(job) = crate::rename_key_migration::PathMigrationJob::book_page_moves(
-            collection_mappings,
-            self.settings.sidecar_backup_enabled,
-        ) {
-            self.ensure_rename_migration_journal_loaded();
-            self.rename_migration_queue.push_back(job);
-            self.persist_rename_migration_journal();
-            self.try_start_next_rename_migration();
-        }
+        self.enqueue_collection_source_migration_batch(collection_mappings);
         let mappings = Self::normalized_book_page_edit_mappings(mappings);
         if mappings.is_empty() {
             return;
@@ -77462,26 +77259,9 @@ impl App {
     /// **戻った時点ではまだ書けていない。**終了時など、書けたことが必要な経路は
     /// このあと [`crate::sidecar::wait_for_pending_writes`] を呼ぶこと。
     pub(crate) fn flush_all_sidecars(&mut self) {
-        let owned = self.composition_sidecar_flush_roots();
         for sidecar in self.sidecars.values_mut() {
-            if owned
-                .iter()
-                .any(|root| crate::folder_tree::path_eq(sidecar.folder(), root))
-            {
-                continue;
-            }
             sidecar.queue_flush();
         }
-    }
-
-    fn flush_and_retire_unowned_sidecars(&mut self) {
-        self.flush_all_sidecars();
-        let owned = self.composition_sidecar_flush_roots();
-        self.sidecars.retain(|folder, _| {
-            owned
-                .iter()
-                .any(|root| crate::folder_tree::path_eq(folder, root))
-        });
     }
 
     /// アプリ終了時・トレイ退避時の共通永続化処理:
@@ -83688,14 +83468,7 @@ impl App {
             return;
         }
         let now = std::time::Instant::now();
-        let owned = self.composition_sidecar_flush_roots();
         for sidecar in self.sidecars.values_mut() {
-            if owned
-                .iter()
-                .any(|root| crate::folder_tree::path_eq(sidecar.folder(), root))
-            {
-                continue;
-            }
             if !sidecar.is_dirty() {
                 continue;
             }
@@ -96491,6 +96264,9 @@ mod similar_preview_context_tests;
 mod spread_shift_lifecycle_tests;
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod composition_detach_tests;
 
 #[cfg(test)]
 #[path = "app/tests/still_seek_thumbnail_ownership.rs"]

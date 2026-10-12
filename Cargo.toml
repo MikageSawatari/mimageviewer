@@ -400,7 +400,7 @@ scraper = { version = "0.27", default-features = false }
 cssparser = "0.37"
 # `rc`: サイドカーの items を `Arc` のまま直列化・復元する (deep clone を作らない)。
 serde = { version = "1", features = ["derive", "rc"] }
-serde_json = { version = "1", features = ["raw_value"] }
+serde_json = "1"
 webp = "0.3"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 sevenz-rust2 = "0.20"

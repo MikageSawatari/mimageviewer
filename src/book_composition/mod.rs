@@ -4,7 +4,6 @@
 //! key. `PageDomain` only validates the kind and direct membership of page references.
 mod edit;
 mod editor;
-pub(crate) mod folder_sidecar;
 mod model;
 mod permission;
 mod projection;

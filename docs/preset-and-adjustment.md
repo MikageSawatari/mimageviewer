@@ -1501,12 +1501,6 @@ release 時に 1 Undo として確定する。モード終了・フォルダ切�
 これを補うため、各ユーザーフォルダ直下に `mimageviewer.dat` (Hidden+System 属性の JSON)
 をバックアップとして配置する。
 
-next-bookの§1.242 G4Fではv2の任意root `folder_composition`を追加する（出荷は次々回release）。
-個別itemsとrootは一つのimmutable snapshotを既存writerへ渡し、v1 readerを維持する。
-不足構成の自動復元と解除済みrootの消費receiptは独立familyで扱い、編集/タグの復元を抑えない。
-backup OFFは構成DBのみ、タグだけONのwriteは以前のrootを保持する。
-詳しい契約は[本の構成計画 §7.4](book-composition-plan.md)を参照。
-
 ### 9.1 ミラーの原則
 
 - **中央 DB が authoritative**。サイドカーはあくまでバックアップ。
@@ -1609,9 +1603,10 @@ backup OFFは構成DBのみ、タグだけONのwriteは以前のrootを保持す
   プロセスが止まるので、積んだだけの書き込みが失われる」ことだけなので、トレイ退避のように
   プロセスが動き続ける経路では待たない (writer も読み手も生きたままで、読み手は pending を
   先に見る)。削除移行のように結果を報告する必要がある経路は `flush_blocking()`。
-- UI のflushはimmutable snapshotのArcを渡す。itemsのmapと内部rasterも共有し、
-  書込/JSON/hashはworkerで行う。G4Fではrootも同じidentityへ載せ、root-only変更でitemsをcloneしない。
-  旧items cloneの38ms（415 items / 31.5M画素、同期flush 6059ms）は当時の観測値である。
+- UI スレッドが払うのは `items` の clone だけ。マスクはメモリ上では `Vec<f32>` のままなので
+  これはゼロコストではない —— 実測で **415 items / 31.5M 画素の最大ケースが 38ms**
+  (元の同期 flush は 6059ms)。`Arc<SidecarEntry>` にすればほぼ 0 にできるが、
+  flush の契機は限られている (毎フレームではない) のでこの数字なら見合わない。
 
 書き出しの契機:
 
@@ -1629,9 +1624,9 @@ backup OFFは構成DBのみ、タグだけONのwriteは以前のrootを保持す
 
 ### 9.4 空になったファイル
 
-個別エントリの編集/マスク/補正レイヤー/crop/注釈/タグがすべて空なら`items`から削除する。
-G4Fでは`items`とroot構成の両方が空の時だけ **ファイル自体を `remove_file`** する。
-構成だけのfileと、最後の個別編集を除いた後のroot構成は保持する。
+サイドカーエントリは `{adjust?, mask?}` 構造。`adjust` と `mask` が両方 `None` になると
+`items` マップから削除する。`items` が空のまま flush されると **ファイル自体を `remove_file`**
+する (消しゴムマスクも全削除しないと空にはならないので、ユーザの明示的操作が前提)。
 ファイル削除失敗は黙って無視。
 
 ### 9.5 設定トグル (`sidecar_backup_enabled`)

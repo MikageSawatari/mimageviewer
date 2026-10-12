@@ -4,10 +4,6 @@
 //! App-global request identity and the continuation that starts DB hydration and
 //! thumbnail workers only after recovery reaches a terminal state.
 
-#[cfg(all(test, windows))]
-#[path = "sidecar_restore_folder_composition_tests.rs"]
-mod folder_composition_tests;
-
 use super::*;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
@@ -707,17 +703,6 @@ impl App {
         self.sidecar_restore.is_some() || self.spread_shift.retained_readoption_pending()
     }
 
-    /// The folder composition source must reach its restore terminal before
-    /// the common projection starts. Resuming may poll the dependent Book
-    /// preparation, so it is deliberately outside this source gate.
-    pub(super) fn folder_composition_restore_source_pending(&self) -> bool {
-        self.sidecar_restore.as_ref().is_some_and(|state| {
-            self.sidecar_restore_context_current(&state.common)
-                && state.common.families.composition
-                && !matches!(state.phase, Phase::Resuming)
-        })
-    }
-
     /// Index-only preparation follows an already-installed list. It gates exact page opens,
     /// but has no hydration continuation in which to replay list/cursor adoption.
     pub(super) fn sidecar_restore_list_adoption_blocked(&self) -> bool {
@@ -847,7 +832,6 @@ impl App {
                 families: crate::sidecar_import::ImportFamilies {
                     edits: true,
                     tags: true,
-                    composition: false,
                 },
                 tag_item_keys: Vec::new(),
                 source_path: Some(folder),
@@ -886,7 +870,6 @@ impl App {
                 families: crate::sidecar_import::ImportFamilies {
                     edits: true,
                     tags: true,
-                    composition: false,
                 },
                 tag_item_keys: Vec::new(),
                 source_path: Some(folder.clone()),
@@ -1199,16 +1182,6 @@ impl App {
         let families = crate::sidecar_import::ImportFamilies {
             edits: self.settings.sidecar_backup_enabled,
             tags: self.settings.tag_sidecar_backup_enabled,
-            composition: self.settings.sidecar_backup_enabled
-                && restore_sidecar
-                && continuation.source_is_directory
-                && !crate::folder_tree::is_open_as_container(&continuation.source_path)
-                && !self.current_folder_is_book_folder()
-                && !self.items.is_empty()
-                && self
-                    .items
-                    .iter()
-                    .all(|item| matches!(item, GridItem::Image(_))),
         };
         let mut tag_item_keys = self
             .items
@@ -1399,7 +1372,6 @@ impl App {
                 families: crate::sidecar_import::ImportFamilies {
                     edits: false,
                     tags: false,
-                    composition: false,
                 },
                 tag_item_keys: Vec::new(),
                 source_path,
@@ -1456,17 +1428,8 @@ impl App {
     }
 
     fn sidecar_restore_start_checking(&mut self, state: &mut SidecarRestoreState) -> Phase {
-        // A reservation is a future disk write, just like a normal flush. Save
-        // tickets and migration owners retain that right until cache adoption,
-        // including when their original viewer has already been closed.
-        let owned = self.composition_sidecar_flush_roots();
-        let (reservations, batch) = crate::sidecar::prepare_worker_flush_in_place(
-            self.sidecars.values().filter(|sidecar| {
-                !owned
-                    .iter()
-                    .any(|root| crate::folder_tree::path_eq(sidecar.folder(), root))
-            }),
-        );
+        let (reservations, batch) =
+            crate::sidecar::prepare_worker_flush_in_place(self.sidecars.values());
         let (tx, rx) = mpsc::channel();
         let folder = state.common.folder.clone();
         let data_dir = state.common.data_dir.clone();
@@ -1518,18 +1481,6 @@ impl App {
                 terminal: None,
             }),
         }
-    }
-
-    #[cfg(test)]
-    pub(super) fn advance_sidecar_restore_worker_for_test(&mut self) {
-        folder_composition_tests::advance_source_step(self);
-    }
-
-    #[cfg(test)]
-    pub(super) fn sidecar_restore_checking_for_test(&self) -> bool {
-        self.sidecar_restore
-            .as_ref()
-            .is_some_and(|state| matches!(state.phase, Phase::Checking(_)))
     }
 
     fn sidecar_restore_start_running(
@@ -2793,10 +2744,6 @@ fn load_current_sidecar_cache(
 fn probe_result_has_failure(result: &crate::sidecar_import::SidecarProbeResult) -> bool {
     result.source_validation_error.is_some()
         || matches!(
-            &result.composition,
-            crate::sidecar_import::SidecarProbeFamilyOutcome::Failed(_)
-        )
-        || matches!(
             result.edits,
             crate::sidecar_import::SidecarProbeFamilyOutcome::Failed(_)
         )
@@ -2832,7 +2779,7 @@ fn probe_result_warning(result: &crate::sidecar_import::SidecarProbeResult) -> S
     if let Some(error) = &result.source_validation_error {
         return error.clone();
     }
-    [&result.edits, &result.tags, &result.composition]
+    [&result.edits, &result.tags]
         .into_iter()
         .filter_map(|outcome| match outcome {
             crate::sidecar_import::SidecarProbeFamilyOutcome::Failed(error) => Some(error.as_str()),
@@ -3045,7 +2992,6 @@ fn import_result_warning(result: &crate::sidecar_import::SidecarImportResult) ->
     let warning = [
         import_family_warning(&result.edits),
         import_family_warning(&result.tags),
-        import_family_warning(&result.composition),
     ]
     .into_iter()
     .flatten()
@@ -3132,7 +3078,6 @@ mod tests {
                 families: crate::sidecar_import::ImportFamilies {
                     edits: true,
                     tags: true,
-                    composition: false,
                 },
                 tag_item_keys: Vec::new(),
                 source_path: Some(folder),
@@ -3156,7 +3101,6 @@ mod tests {
         tags: crate::sidecar_import::SidecarProbeFamilyOutcome,
     ) -> crate::sidecar_import::SidecarProbeResult {
         crate::sidecar_import::SidecarProbeResult {
-            composition: crate::sidecar_import::SidecarProbeFamilyOutcome::NotRequested,
             edits,
             tags,
             source_validation_error: None,
@@ -4416,7 +4360,6 @@ mod tests {
         let mut report = crate::sidecar_import::EditImportReport::default();
         report.stats.imported_mask = 1;
         let result = crate::sidecar_import::SidecarImportResult {
-            composition: crate::sidecar_import::ImportFamilyOutcome::NotRequested,
             edits: crate::sidecar_import::ImportFamilyOutcome::Applied(report),
             tags: crate::sidecar_import::ImportFamilyOutcome::SourceChanged("changed".into()),
             source_validation_error: None,
@@ -5039,7 +4982,6 @@ mod tests {
             crate::sidecar_import::SidecarImportCompletion::Current {
                 sidecar: crate::sidecar::SidecarFile::new(PathBuf::from("C:/book")),
                 result: crate::sidecar_import::SidecarImportResult {
-                    composition: crate::sidecar_import::ImportFamilyOutcome::NotRequested,
                     edits: crate::sidecar_import::ImportFamilyOutcome::NotRequested,
                     tags: crate::sidecar_import::ImportFamilyOutcome::NotRequested,
                     source_validation_error: None,
@@ -5054,7 +4996,6 @@ mod tests {
             crate::sidecar_import::SidecarImportCompletion::SourceChanged {
                 error: "changed".into(),
                 result: crate::sidecar_import::SidecarImportResult {
-                    composition: crate::sidecar_import::ImportFamilyOutcome::NotRequested,
                     edits: crate::sidecar_import::ImportFamilyOutcome::SourceChanged(
                         "changed".into(),
                     ),
@@ -5070,7 +5011,6 @@ mod tests {
         let cancelled = restore_terminal(RunningWorkerResult::Import(Ok(
             crate::sidecar_import::SidecarImportCompletion::Cancelled {
                 result: crate::sidecar_import::SidecarImportResult {
-                    composition: crate::sidecar_import::ImportFamilyOutcome::NotRequested,
                     edits: crate::sidecar_import::ImportFamilyOutcome::Cancelled,
                     tags: crate::sidecar_import::ImportFamilyOutcome::NotRequested,
                     source_validation_error: None,
@@ -5434,7 +5374,6 @@ mod tests {
             crate::sidecar_import::ImportFamilies {
                 edits: true,
                 tags: true,
-                composition: false,
             },
             &[page_key.to_string()],
         )
@@ -5458,7 +5397,6 @@ mod tests {
             crate::sidecar_import::ImportFamilies {
                 edits: false,
                 tags: true,
-                composition: false,
             },
             &["c:/book/page.jpg".to_string()],
         ) {
@@ -5521,7 +5459,6 @@ mod tests {
             crate::sidecar_import::ImportFamilies {
                 edits: false,
                 tags: true,
-                composition: false,
             },
         ) else {
             panic!("an invalid unrequested edit must still disable whole-file writes");

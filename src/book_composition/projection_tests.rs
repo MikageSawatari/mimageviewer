@@ -635,15 +635,12 @@ fn g3_raw_structure_keeps_policy_excluded_parent_and_original_effective_scope() 
         scope,
         BookScopeKey::archive(&tree.zip_path, &prefix).unwrap()
     );
-    assert_eq!(
+    assert!(
         crate::app::book_materialization::composition_scope_domain(
             &crate::app::book_materialization::BookScope::ImageFolder(source.to_owned())
         )
-        .unwrap(),
-        Some((
-            BookScopeKey::folder(source).unwrap(),
-            PageDomain::ImageFolder
-        ))
+        .unwrap()
+        .is_none()
     );
 }
 

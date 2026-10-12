@@ -55,8 +55,6 @@ pub(crate) struct EditorThumbnails {
     tx: mpsc::SyncSender<Demand>,
     rx: mpsc::Receiver<WorkerReply>,
     cancel: Arc<AtomicBool>,
-    #[cfg(test)]
-    batch_complete: mpsc::Receiver<()>,
 }
 
 impl EditorThumbnails {
@@ -72,8 +70,6 @@ impl EditorThumbnails {
         let (tx, requests) = mpsc::sync_channel::<Demand>(2);
         let (results, rx) = mpsc::sync_channel::<WorkerReply>(REQUEST_BUDGET);
         let cancel = Arc::new(AtomicBool::new(false));
-        #[cfg(test)]
-        let (batch_done, batch_complete) = mpsc::channel();
         let owner = Self {
             scope: input.scope.clone(),
             domain: input.domain.clone(),
@@ -83,8 +79,6 @@ impl EditorThumbnails {
             tx,
             rx,
             cancel: cancel.clone(),
-            #[cfg(test)]
-            batch_complete,
         };
         std::thread::Builder::new()
             .name("composition-editor-thumbnails".into())
@@ -169,8 +163,6 @@ impl EditorThumbnails {
                         ctx.request_repaint_of(egui::ViewportId::ROOT);
                         ctx.request_repaint();
                     }
-                    #[cfg(test)]
-                    let _ = batch_done.send(());
                 }
             })
             .map_err(|error| error.to_string())?;
@@ -205,11 +197,6 @@ impl EditorThumbnails {
         }
     }
 
-    #[cfg(test)]
-    pub(super) fn wait_for_batch_for_test(&self, timeout: std::time::Duration) {
-        self.batch_complete.recv_timeout(timeout).unwrap();
-    }
-
     fn admitted_index(&self, page: &CompositionPageRef) -> Option<usize> {
         self.domain.validate_page(page).ok()?;
         let allowed = match page {
@@ -219,9 +206,7 @@ impl EditorThumbnails {
             CompositionPageRef::PdfPage { .. } => {
                 self.policy.allows_physical_file(&self.scope.logical_root)
             }
-            CompositionPageRef::RelativePath { path } => self
-                .policy
-                .allows_physical_file(&self.scope.logical_root.join(path)),
+            CompositionPageRef::RelativePath { .. } => false, // G4F is separate.
         };
         if !allowed {
             return None;
@@ -231,9 +216,6 @@ impl EditorThumbnails {
             .page_identities
             .resolve_shift_identity(&page.resume_identity(&self.scope.logical_root))?;
         let stored = match self.rows.items.get(index)? {
-            GridItem::Image(path) => {
-                super::book_composition_folder::page_ref(&self.scope.logical_root, path).ok()?
-            }
             GridItem::ZipImage { entry_name, .. } => CompositionPageRef::ArchiveEntry {
                 entry_name: entry_name.clone(),
             },
@@ -287,47 +269,6 @@ fn decode_thumbnail(
         RawStage,
     };
     let image = match item {
-        GridItem::Image(path) => {
-            let BookCompositionSource::Folder { root } = &input.source else {
-                return Err("folder thumbnail source does not match the editor".into());
-            };
-            super::book_composition_folder::page_ref(root, path)?;
-            if crate::raw_format::is_raw_path(path) {
-                let raster = crate::thumb_loader::decode_raw_thumbnail_on_bounded_worker(
-                    crate::raw::RawOwnedSource::Path(path.clone()),
-                    THUMB_PX,
-                    &input.raw_executor,
-                    cancel,
-                    256 * 1024 * 1024,
-                )
-                .map_err(|error| error.to_string())?;
-                return Ok(crate::thumb_loader::resize_to_display_color_image(
-                    &raster.image,
-                    THUMB_PX,
-                    Some(raster.developed_dims),
-                ));
-            }
-            let decoded = crate::canonical_image_loader::decode_canonical_image(
-                CanonicalImageSource::File {
-                    path,
-                    verified_bytes: None,
-                },
-                CanonicalDecodeOptions::fullscreen_cancellable(
-                    AnimationPolicy::FirstFrameOnly,
-                    cancel,
-                    RawStage::Preview,
-                ),
-            )
-            .map_err(|error| format!("{error:?}"))?;
-            match decoded {
-                CanonicalImageDecode::Static(image) => image.image,
-                CanonicalImageDecode::RawPreview {
-                    preview: Some(preview),
-                    ..
-                } => preview.image,
-                _ => return Err("folder thumbnail could not be decoded".into()),
-            }
-        }
         GridItem::ZipImage {
             zip_path,
             entry_name,
@@ -447,162 +388,10 @@ mod tests {
                 tx,
                 rx,
                 cancel: Arc::new(AtomicBool::new(false)),
-                batch_complete: mpsc::channel().1,
             },
             requests,
             results,
         )
-    }
-
-    fn folder_owner() -> (
-        EditorThumbnails,
-        mpsc::Receiver<Demand>,
-        mpsc::SyncSender<WorkerReply>,
-    ) {
-        let (mut owner, requests, results) = owner();
-        let root = Path::new("C:/test/image-folder");
-        owner.scope = BookScopeKey::folder(root).unwrap();
-        owner.domain = PageDomain::ImageFolder;
-        let items = vec![
-            GridItem::Image(root.join("page.png")),
-            GridItem::Image(root.join("photo.dng")),
-        ];
-        owner.rows = Arc::new(MaterializedBookRows {
-            page_identities: Arc::new(
-                super::super::file_type_resume::PreparedPageIdentityIndex::prepare(
-                    &items,
-                    Some(root),
-                    owner.policy.clone(),
-                ),
-            ),
-            metas: vec![None; items.len()],
-            items,
-            composition: crate::book_composition::CompositionProjectionOutcome::Automatic,
-        });
-        (owner, requests, results)
-    }
-
-    fn folder_page(name: &str) -> CompositionPageRef {
-        CompositionPageRef::RelativePath { path: name.into() }
-    }
-
-    #[test]
-    fn folder_thumbnail_admission_accepts_direct_aliases_and_raw_but_rejects_unsafe_or_missing() {
-        let (mut owner, requests, _) = folder_owner();
-        owner.request(vec![
-            folder_page("PAGE.PNG"),
-            folder_page("page.png"),
-            folder_page("photo.dng"),
-            folder_page("../page.png"),
-            folder_page("sub/page.png"),
-            folder_page("C:/page.png"),
-            folder_page("missing.png"),
-            page("page.png"),
-        ]);
-        let demand = requests.try_recv().unwrap();
-        assert_eq!(
-            demand,
-            vec![(folder_page("PAGE.PNG"), 0), (folder_page("photo.dng"), 1)]
-        );
-        assert_eq!(owner.requested.len(), 2);
-        assert!(requests.try_recv().is_err());
-    }
-
-    #[test]
-    fn folder_thumbnail_private_worker_decodes_canonical_file_and_captured_rotation_without_db_writes()
-     {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("page.png");
-        image::RgbaImage::from_pixel(20, 40, image::Rgba([20, 40, 60, 255]))
-            .save(&path)
-            .unwrap();
-        let page = folder_page("page.png");
-        let policy = FileTypeVisibility::default();
-        let items = vec![GridItem::Image(path)];
-        let rows = MaterializedBookRows {
-            page_identities: Arc::new(
-                super::super::file_type_resume::PreparedPageIdentityIndex::prepare(
-                    &items,
-                    Some(dir.path()),
-                    policy.clone(),
-                ),
-            ),
-            items,
-            metas: vec![None],
-            composition: crate::book_composition::CompositionProjectionOutcome::Automatic,
-        };
-        let input = EditorSourceInput {
-            folder_settings: Arc::new(Default::default()),
-            scope: BookScopeKey::folder(dir.path()).unwrap(),
-            domain: PageDomain::ImageFolder,
-            source: BookCompositionSource::Folder {
-                root: dir.path().into(),
-            },
-            policy,
-            placement: Default::default(),
-            sort: crate::settings::SortOrder::FileName,
-            rules: crate::spread_shift::ResolvedAutomaticRules {
-                mode: crate::settings::SpreadMode::Ltr,
-                direction: crate::settings::ReadingDirection::Ltr,
-                flow: crate::settings::ReadingFlow::Paged,
-                final_cover: false,
-                page_alone: Default::default(),
-                singleton_endpoints: Default::default(),
-                landscape_epoch: 0,
-            },
-            shift: None,
-            rotations: HashMap::from([(page.clone(), crate::rotation_db::Rotation::Cw90)]),
-            data_dir: dir.path().into(),
-            password: None,
-            initial_binding: None,
-            raw_executor: Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap()),
-        };
-        let mut owner = EditorThumbnails::spawn(input, rows, egui::Context::default()).unwrap();
-        owner.request(vec![page.clone()]);
-        let WorkerReply::Pixels(actual, texture) = owner
-            .rx
-            .recv_timeout(std::time::Duration::from_secs(15))
-            .unwrap()
-        else {
-            panic!("the physical PNG must decode on the editor worker");
-        };
-        assert_eq!(actual, page);
-        let [width, height] = texture.size();
-        assert!(
-            width > height,
-            "captured clockwise rotation changes portrait to landscape"
-        );
-        assert!(width <= THUMB_PX as usize && height <= THUMB_PX as usize);
-        assert!(!dir.path().join("rotation.db").exists());
-        assert!(!dir.path().join(crate::sidecar::SIDECAR_FILENAME).exists());
-    }
-
-    #[test]
-    fn folder_thumbnail_policy_and_lifetime_keep_sibling_queues_independent() {
-        let (mut first, first_requests, first_results) = folder_owner();
-        let (mut second, second_requests, _) = folder_owner();
-        first.policy.excluded_extensions.insert("png".into());
-        first.request(vec![folder_page("page.png")]);
-        second.request(vec![folder_page("page.png")]);
-        assert!(first_requests.try_recv().is_err());
-        assert_eq!(
-            second_requests.try_recv().unwrap(),
-            vec![(folder_page("page.png"), 0)]
-        );
-        let cancel = first.cancel.clone();
-        drop(first);
-        assert!(cancel.load(Ordering::Relaxed));
-        assert!(
-            first_results
-                .try_send(WorkerReply::Failed(folder_page("page.png")))
-                .is_err()
-        );
-        assert!(!second.cancel.load(Ordering::Relaxed));
-        second.request(vec![folder_page("photo.dng")]);
-        assert_eq!(
-            second_requests.try_recv().unwrap(),
-            vec![(folder_page("photo.dng"), 1)]
-        );
     }
 
     fn page(name: &str) -> CompositionPageRef {

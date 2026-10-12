@@ -465,6 +465,11 @@ impl App {
             return None;
         }
         let item = self.items.get(idx)?;
+        // Folder compositions are outside the viewing scope. Old/imported
+        // ImageFolder rows remain stored, but ordinary images need no receipt.
+        if matches!(item, crate::grid_item::GridItem::Image(_)) {
+            return None;
+        }
         let logical = match item {
             crate::grid_item::GridItem::ZipImage { zip_path, .. }
                 if self.zip_nav.as_ref().is_some_and(|nav| {
@@ -548,7 +553,7 @@ impl App {
                     receiver,
                 }
             } else {
-                // Videos/audio and an application without a composition service
+                // Ordinary images, videos/audio and an application without a composition service
                 // have no composition-page permission to acquire.
                 OccurrencePermission::Complete(CandidatePermission::Allowed(None))
             };

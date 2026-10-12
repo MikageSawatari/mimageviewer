@@ -19,6 +19,12 @@ mode-onlyの読取は休眠bindingと閲覧分類を分離し、親/全体と文
 PCの解除・再入場と同じ純粋resolverを使う内部読取修正で、wire字段とprotocol v70は変更しない。
 非対応ページ名では構成を使わず従来の操作を維持し、通知とlogを出す。書庫や保存構成を変更しない。
 この段でRemote構成editorやG5の表示/export全体を実装済みとはしない。
+2026-10-12の利用者決定でG4Fを切り離す。物理File画像/folderの保存構成は、
+read/write候補・binding受付（qualified/fallback）・`composition_managed`へ使用しない。
+既存のfolder一覧・個別編集・Eのshift scope/saved anchor/grouping・読む方向は保持する。
+保存行は削除せず、pure model/store/明示転送の値として残す。書庫/PDF/EPUBの資格/proofは維持する。
+完全空のwrite admissionは保護対象がないため構成snapshotのエラーに依存せず、非空は従来どおり拒否する。
+wire字段・owner・writer・公開addressを変更せず、protocol v70を維持する。
 
 
 v3.0.0 の目玉として、外出先のスマートフォン / タブレット / PC のブラウザから

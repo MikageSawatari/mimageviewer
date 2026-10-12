@@ -22,8 +22,6 @@ pub(crate) struct CompositionToken {
 pub(crate) struct CompositionSnapshot {
     pub(crate) status: Result<(), String>,
     pub(crate) rows: BTreeMap<String, Arc<StoredComposition>>,
-    /// Worker-created immutable roots allow cached sidecar adoption without a UI clone.
-    pub(crate) folder_roots: BTreeMap<String, Arc<BookComposition>>,
     epoch: u64,
     sequence: u64,
     tokens: BTreeMap<String, u64>,
@@ -87,7 +85,7 @@ enum Mutation {
 enum MaintenanceAction {
     Rename(String, String),
     Purge(String),
-    Pages(Vec<(PathBuf, PathBuf)>, bool),
+    Pages(Vec<(PathBuf, PathBuf)>),
 }
 enum Command {
     ViewTrim(
@@ -109,8 +107,6 @@ enum Command {
     ),
     #[cfg(test)]
     HoldWorker(mpsc::Sender<()>, mpsc::Receiver<()>),
-    #[cfg(test)]
-    BeforeFolderMirror(Box<dyn FnOnce() + Send>),
     ViewMode(
         BookScopeKey,
         crate::settings::SpreadMode,
@@ -136,17 +132,6 @@ enum Command {
         BookScopeKey,
         PageDomain,
         Mutation,
-        bool,
-        mpsc::Sender<CompositionWriteReply>,
-    ),
-    FolderReceipt(
-        BookScopeKey,
-        mpsc::Sender<Result<Option<store::FolderReceipt>, String>>,
-    ),
-    FolderRestore(
-        BookScopeKey,
-        crate::sidecar::SidecarFile,
-        crate::sidecar::SidecarImportSource,
         mpsc::Sender<CompositionWriteReply>,
     ),
     Begin(mpsc::Sender<()>),
@@ -197,22 +182,6 @@ pub(crate) struct BookCompositionProcessOwner {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
-/// Worker-only lookup; restores join the existing process writer and maintenance fence.
-pub(crate) fn service_at(data_dir: &Path) -> Result<BookCompositionService, String> {
-    let portal = portal_at(data_dir)?;
-    let shared = portal
-        .state
-        .lock()
-        .unwrap()
-        .service
-        .upgrade()
-        .ok_or("composition service unavailable")?;
-    Ok(BookCompositionService {
-        shared,
-        _portal: portal,
-    })
-}
-
 impl BookCompositionService {
     pub(crate) fn close_admission(&self) {
         let mut admission = self.shared.admission.lock().unwrap();
@@ -234,7 +203,6 @@ impl BookCompositionService {
                 snapshot: Arc::new(CompositionSnapshot {
                     status: Err("composition store initializing".into()),
                     rows: BTreeMap::new(),
-                    folder_roots: BTreeMap::new(),
                     epoch: NEXT_EPOCH.fetch_add(1, Ordering::Relaxed),
                     sequence: 0,
                     tokens: BTreeMap::new(),
@@ -406,28 +374,6 @@ impl BookCompositionService {
             .unwrap();
         (receiver, release)
     }
-    #[cfg(test)]
-    pub(crate) fn remove_folder_with_before_mirror_for_test(
-        &self,
-        scope: BookScopeKey,
-        before_mirror: impl FnOnce() + Send + 'static,
-    ) -> mpsc::Receiver<CompositionWriteReply> {
-        let (reply, rx) = mpsc::channel();
-        let admission = self.shared.admission.lock().unwrap();
-        assert!(admission.mode == Mode::Running);
-        let tx = admission.tx.as_ref().unwrap();
-        tx.send(Command::BeforeFolderMirror(Box::new(before_mirror)))
-            .unwrap();
-        tx.send(Command::Write(
-            scope,
-            PageDomain::ImageFolder,
-            Mutation::Remove,
-            true,
-            reply,
-        ))
-        .unwrap();
-        rx
-    }
     pub(crate) fn set_view_trim_book(
         &self,
         key: crate::spread_db::SpreadContainerKey,
@@ -484,84 +430,14 @@ impl BookCompositionService {
         domain: PageDomain,
         composition: BookComposition,
     ) -> mpsc::Receiver<CompositionWriteReply> {
-        self.write(scope, domain, Mutation::Save(composition), false)
+        self.write(scope, domain, Mutation::Save(composition))
     }
     pub(crate) fn remove(
         &self,
         scope: BookScopeKey,
         domain: PageDomain,
     ) -> mpsc::Receiver<CompositionWriteReply> {
-        self.write(scope, domain, Mutation::Remove, false)
-    }
-
-    pub(crate) fn save_folder(
-        &self,
-        scope: BookScopeKey,
-        composition: BookComposition,
-        backup_enabled: bool,
-    ) -> mpsc::Receiver<CompositionWriteReply> {
-        self.write(
-            scope,
-            PageDomain::ImageFolder,
-            Mutation::Save(composition),
-            backup_enabled,
-        )
-    }
-    pub(crate) fn remove_folder(
-        &self,
-        scope: BookScopeKey,
-        backup_enabled: bool,
-    ) -> mpsc::Receiver<CompositionWriteReply> {
-        self.write(
-            scope,
-            PageDomain::ImageFolder,
-            Mutation::Remove,
-            backup_enabled,
-        )
-    }
-    pub(crate) fn receipt(
-        &self,
-        scope: BookScopeKey,
-    ) -> mpsc::Receiver<Result<Option<store::FolderReceipt>, String>> {
-        let (reply, rx) = mpsc::channel();
-        let admission = self.shared.admission.lock().unwrap();
-        if admission.mode == Mode::Closed
-            || !admission.tx.as_ref().is_some_and(|tx| {
-                tx.send(Command::FolderReceipt(scope, reply.clone()))
-                    .is_ok()
-            })
-        {
-            let _ = reply.send(Err("composition service is closing".into()));
-        }
-        rx
-    }
-    pub(crate) fn restore_folder(
-        &self,
-        scope: BookScopeKey,
-        sidecar: crate::sidecar::SidecarFile,
-        source: crate::sidecar::SidecarImportSource,
-    ) -> mpsc::Receiver<CompositionWriteReply> {
-        let (reply, rx) = mpsc::channel();
-        let admission = self.shared.admission.lock().unwrap();
-        if admission.mode == Mode::Closed
-            || !admission.tx.as_ref().is_some_and(|tx| {
-                tx.send(Command::FolderRestore(
-                    scope.clone(),
-                    sidecar,
-                    source,
-                    reply.clone(),
-                ))
-                .is_ok()
-            })
-        {
-            let _ = reply.send(CompositionWriteReply {
-                token: admission.snapshot.token_for(&scope),
-                scope,
-                changed: false,
-                status: Err("composition service is closing".into()),
-            });
-        }
-        rx
+        self.write(scope, domain, Mutation::Remove)
     }
 
     pub(crate) fn rename_book_root(&self, source: &Path, target: &Path) -> Result<(), String> {
@@ -579,14 +455,7 @@ impl BookCompositionService {
         &self,
         mappings: Vec<(PathBuf, PathBuf)>,
     ) -> Result<(), String> {
-        self.maintain(MaintenanceAction::Pages(mappings, false))
-    }
-    pub(crate) fn migrate_page_paths_with_backup(
-        &self,
-        mappings: Vec<(PathBuf, PathBuf)>,
-        backup_enabled: bool,
-    ) -> Result<(), String> {
-        self.maintain(MaintenanceAction::Pages(mappings, backup_enabled))
+        self.maintain(MaintenanceAction::Pages(mappings))
     }
     fn maintain(&self, action: MaintenanceAction) -> Result<(), String> {
         let admission = self.shared.admission.lock().unwrap();
@@ -606,7 +475,6 @@ impl BookCompositionService {
         scope: BookScopeKey,
         domain: PageDomain,
         mutation: Mutation,
-        backup_enabled: bool,
     ) -> mpsc::Receiver<CompositionWriteReply> {
         let (reply, rx) = mpsc::channel();
         let admission = self.shared.admission.lock().unwrap();
@@ -616,7 +484,6 @@ impl BookCompositionService {
                     scope.clone(),
                     domain,
                     mutation,
-                    backup_enabled,
                     reply.clone(),
                 ))
                 .is_ok()
@@ -789,26 +656,6 @@ fn reload(
             .expect("composition publication sequence exhausted");
         state.tokens.insert(key.clone(), state.sequence);
     }
-    state.folder_roots = rows
-        .iter()
-        .filter(|(_, row)| row.domain == PageDomain::ImageFolder)
-        .map(|(key, row)| {
-            let root = if state
-                .rows
-                .get(key)
-                .is_some_and(|previous| previous.as_ref() == row)
-            {
-                state
-                    .folder_roots
-                    .get(key)
-                    .cloned()
-                    .unwrap_or_else(|| Arc::new(row.composition.clone()))
-            } else {
-                Arc::new(row.composition.clone())
-            };
-            (key.clone(), root)
-        })
-        .collect();
     state.rows = rows
         .into_iter()
         .map(|(key, row)| {
@@ -851,8 +698,6 @@ fn run_worker(
         publish(&shared, &state, Vec::new(), None);
     }
     let mut maintenance = false;
-    #[cfg(test)]
-    let mut before_folder_mirror: Option<Box<dyn FnOnce() + Send>> = None;
     let mut deferred = VecDeque::new();
     loop {
         let command = if !maintenance && !deferred.is_empty() {
@@ -868,11 +713,6 @@ fn run_worker(
             Command::HoldWorker(entered, wait) => {
                 let _ = entered.send(());
                 let _ = wait.recv();
-            }
-            #[cfg(test)]
-            Command::BeforeFolderMirror(hook) => {
-                assert!(before_folder_mirror.is_none());
-                before_folder_mirror = Some(hook);
             }
             Command::ViewTrim(batch, write, reply) => {
                 let result =
@@ -997,75 +837,6 @@ fn run_worker(
             }
             command @ Command::Prepare(..) if maintenance => deferred.push_back(command),
             command @ Command::Candidate(..) if maintenance => deferred.push_back(command),
-            command @ Command::FolderReceipt(..) if maintenance => deferred.push_back(command),
-            command @ Command::FolderRestore(..) if maintenance => deferred.push_back(command),
-            Command::FolderReceipt(scope, reply) => {
-                let result = (|| {
-                    state.status.clone()?;
-                    store::validate_scope_domain(&scope, &PageDomain::ImageFolder)?;
-                    connection
-                        .as_ref()
-                        .map(|connection| {
-                            store::folder_receipt_in(
-                                connection,
-                                "book_compositions",
-                                &scope.storage_key(),
-                            )
-                        })
-                        .transpose()
-                        .map(Option::flatten)
-                })();
-                let _ = reply.send(result);
-            }
-            Command::FolderRestore(scope, sidecar, source, reply) => {
-                let key = scope.storage_key();
-                let result: Result<bool, String> = (|| {
-                    state.status.clone()?;
-                    store::validate_scope_domain(&scope, &PageDomain::ImageFolder)?;
-                    if connection.is_none() {
-                        store::initialize_database_at(&path)?;
-                        connection = store::open_existing(&path)?;
-                    }
-                    let transaction = connection
-                        .as_mut()
-                        .ok_or("composition writer unavailable")?
-                        .transaction()
-                        .map_err(|error| error.to_string())?;
-                    store::validate_database_rows(&transaction)?;
-                    let changed = super::folder_sidecar::restore_in(
-                        &transaction,
-                        "book_compositions",
-                        &key,
-                        &sidecar,
-                        &source,
-                    )?;
-                    transaction.commit().map_err(|error| error.to_string())?;
-                    Ok(changed)
-                })();
-                let (changed, status) = match result {
-                    Ok(changed) => match reload(&path, &mut connection, &mut state) {
-                        Ok(keys) => {
-                            publish(&shared, &state, keys, None);
-                            (changed, Ok(()))
-                        }
-                        Err(error) => {
-                            block(&mut state, &error);
-                            publish(&shared, &state, Vec::new(), Some(error.clone()));
-                            (changed, Err(error))
-                        }
-                    },
-                    Err(error) => {
-                        publish(&shared, &state, Vec::new(), Some(error.clone()));
-                        (false, Err(error))
-                    }
-                };
-                let _ = reply.send(CompositionWriteReply {
-                    scope,
-                    changed,
-                    token: state.token_for_key(&key),
-                    status,
-                });
-            }
             Command::Candidate(correlation, candidate, reply) => {
                 let status = super::candidate_permission(&state, &candidate);
                 let _ = reply.send(super::CandidatePermissionReply {
@@ -1109,16 +880,9 @@ fn run_worker(
                                 store::purge_book_root(connection, &root)?;
                             }
                         }
-                        MaintenanceAction::Pages(mappings, backup_enabled) => {
+                        MaintenanceAction::Pages(mappings) => {
                             connection = None;
-                            let (_, warnings) = store::migrate_page_paths_with_backup_at(
-                                &data_dir,
-                                &mappings,
-                                backup_enabled,
-                            )?;
-                            for warning in warnings {
-                                publish(&shared, &state, Vec::new(), Some(warning));
-                            }
+                            store::migrate_page_paths_at(&data_dir, &mappings)?;
                         }
                     }
                     reload(&path, &mut connection, &mut state)
@@ -1131,7 +895,7 @@ fn run_worker(
                     }
                 }
             }
-            Command::Write(scope, mut domain, mutation, backup_enabled, reply) => {
+            Command::Write(scope, mut domain, mutation, reply) => {
                 let key = scope.storage_key();
                 let result = (|| {
                     state.status.clone()?;
@@ -1145,17 +909,8 @@ fn run_worker(
                             .validate(&domain)
                             .map_err(|error| error.to_string())?;
                     }
-                    // Every explicit folder write consumes the captured prior backup,
-                    // even when backup is OFF or the current DB row is already absent.
-                    let source = if domain == PageDomain::ImageFolder {
-                        Some(super::folder_sidecar::prepare_source(Path::new(
-                            &scope.logical_root,
-                        ))?)
-                    } else {
-                        None
-                    };
                     if connection.is_none() {
-                        if matches!(mutation, Mutation::Remove) && source.is_none() {
+                        if matches!(mutation, Mutation::Remove) {
                             return Ok(false);
                         }
                         store::initialize_database_at(&path)?;
@@ -1171,10 +926,6 @@ fn run_worker(
                         block(&mut state, &error);
                         return Err(error);
                     }
-                    if let Some(source) = &source {
-                        source.revalidate()?;
-                        source.consume_in(&transaction, "book_compositions", &key)?;
-                    }
                     let changed = match &mutation {
                         Mutation::Save(composition) => store::replace_row_in(
                             &transaction,
@@ -1187,39 +938,11 @@ fn run_worker(
                             store::remove_row_in(&transaction, "book_compositions", &key)?
                         }
                     };
-                    let mirrored_root = if domain == PageDomain::ImageFolder && backup_enabled {
-                        store::row_in(&transaction, "book_compositions", &key)?
-                            .map(|row| row.composition)
-                    } else {
-                        None
-                    };
                     transaction.commit().map_err(|error| error.to_string())?;
-                    if domain == PageDomain::ImageFolder && backup_enabled {
-                        #[cfg(test)]
-                        if let Some(hook) = before_folder_mirror.take() {
-                            hook();
-                        }
-                        if let Err(error) = super::folder_sidecar::mirror(
-                            Path::new(&scope.logical_root),
-                            mirrored_root,
-                        ) {
-                            crate::logger::log(format!(
-                                "composition backup mirror failed: {error}"
-                            ));
-                            publish(&shared, &state, Vec::new(), Some(error));
-                        }
-                    }
                     Ok(changed)
                 })();
                 let (changed, status) = match result {
-                    Ok(false) => {
-                        if domain == PageDomain::ImageFolder && backup_enabled {
-                            // An explicit no-op DB write can still replace a stale
-                            // backup root. Let App adopt that root before editing resumes.
-                            publish(&shared, &state, vec![key.clone()], None);
-                        }
-                        (false, Ok(()))
-                    }
+                    Ok(false) => (false, Ok(())),
                     Ok(true) => {
                         if matches!(mutation, Mutation::Save(_))
                             && domain != PageDomain::ImageFolder

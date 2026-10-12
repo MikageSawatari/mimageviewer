@@ -40,15 +40,14 @@ G3の共通projectionはraw sourceを保持し、直下の実ページblockだ�
 元行を置き換えるworkerは未保存trimを既存page keyで保存してから個別編集を投影し、UI同期I/Oを追加しない。
 unsafe/case衝突を含む階層は構成だけ拒否し、書庫と保存構成は変更せず従来表示を使う。
 通知は「この本のページ名では本の構成を使えません。構成を使わずに開きます。」。
-G4Fは画像だけのphysical Book folderへ相対page refのadapterを加える。OFF/混在は従来列、
-再適格化は保存構成を再採用する。compiled folderと抽出全leafへの自動restoreは対象外。
-sidecar v2のroot構成と個別itemsは一つのimmutable snapshot/既存writerで保存する。
-不足行restore/解除の消費receiptは構成DBの同transactionへ記録し、旧backupの同場所復活を防ぐ。
-source restore完了を既存continuationが所有し、同contextのprojection/初回表示へ引き継ぐ。
+画像folder sidecarのwriter/schemaはG4Fまで変更しない。
 metadata v11の`composition_family { coverage, scopes }`はlogical folder/書庫/document entryが所有する。
 既存のcache DriveStripped spread/trim familyと別にsource KeepDrive構成を運ぶ。
 旧v7–v10/字段なしは保持、新版空はcoverage内だけ解除、非空はscope単位の置換。skip/coverage外は保持する。
 追加/置換/解除のpreviewは既存の確認一回へ載せ、実適用数はbatch/SAVEPOINT後のcommit結果から表示する。
+2026-10-12の利用者決定でG4Fを切り離し、画像だけのfolderは構成対象外とする。
+共通型/store/明示転送のfolder値は将来用として保持するが、物理画像の提示・類似preview・Remoteは消費しない。
+既存folder閲覧・編集・sidecar v1・Eの見開き調整は維持し、保存行をpurgeするmigrationは追加しない。
 連結方式（flow）はA2のpairing初期化と分離し、各入口の従来の採用規則を維持する。タグ・お気に入り・評価・サブ展開・Smart新規rootは既存の保存flow（旧Vertical表現を含む）または従来の分類に対応するdefaults（通常はNON_BOOKのPaged）を採用し、GlobalSearch・Smart保存root復帰・Collection root・固定snapshotの直接列差し替えは既存flowを維持する。単ページ化・再openだけを理由にflowを変更せず、連結読みの操作を維持する。旧Vertical mode行はflow列に別値が残っていても従来どおり縦連結へ復元し、旧行は変更しない。
 元の本の列を保存する既存SnapshotStateは閲覧状態（mode/方向/flow/shift index/補助設定）も
 一緒に保持し、固定解除の同じadoption内で復元する。BSで固定列へ戻る場合はA2のまま。

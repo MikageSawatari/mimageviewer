@@ -2708,9 +2708,19 @@ impl crate::app::App {
                     Err(error) => return write_error(RemoteWriteErrorCode::Unsupported, error),
                 };
                 let admission = qualified.cloned().unwrap_or_else(|| {
+                    let root = std::path::Path::new(&address.path);
+                    let source_supported =
+                        matches!(address.subresource, RemoteSubresource::ZipDirectory { .. })
+                            || crate::folder_tree::is_open_as_container(root)
+                            || crate::folder_tree::is_convertible_archive_path(root);
+                    let snapshot = service.snapshot();
                     crate::book_composition::CompositionWriteAdmission {
                         targets: Vec::new(),
-                        binding_scope: Some(scope),
+                        binding_scope: (source_supported
+                            && !snapshot.rows.get(&scope.storage_key()).is_some_and(|row| {
+                                row.domain == crate::book_composition::PageDomain::ImageFolder
+                            }))
+                        .then_some(scope),
                         ..Default::default()
                     }
                 });
@@ -5132,6 +5142,127 @@ mod tests {
     use super::*;
 
     include!("spread_shift_ui_tests.rs");
+
+    #[test]
+    fn detached_folder_composition_allows_qualified_and_fallback_remote_binding_writes() {
+        use crate::book_composition::*;
+        let mut app = crate::app::setup_app_for_test();
+        let data = tempfile::tempdir().unwrap();
+        app.spread_db =
+            Ok(crate::spread_db::SpreadDb::open_at(&data.path().join("spread.db")).unwrap());
+        let (service, owner) =
+            BookCompositionService::spawn_at(data.path().join("composition"), None).unwrap();
+        app.install_book_composition_runtime(service.clone());
+        for name in ["image-book", "directory.pdf", "directory.zip"] {
+            let root = data.path().join(name);
+            std::fs::create_dir(&root).unwrap();
+            let scope = crate::book_scope::BookScopeKey::folder(&root).unwrap();
+            let page = CompositionPageRef::RelativePath {
+                path: "page.png".into(),
+            };
+            let mut record = BookComposition::new(
+                ReadingDirection::Ltr,
+                vec![CompositionUnit::Single {
+                    page: page.clone(),
+                    placement: SinglePlacement::Center,
+                    companion: SingleCompanion::Vacant,
+                }],
+            );
+            record.hidden_pages.push(page);
+            service
+                .save(scope.clone(), PageDomain::ImageFolder, record)
+                .recv()
+                .unwrap()
+                .status
+                .unwrap();
+            let before = service.snapshot();
+            let address =
+                mimageviewer_ipc::RemoteAddress::file(root.to_string_lossy().into_owned());
+            for qualified in [None, Some(CompositionWriteAdmission::default())] {
+                let response = app.apply_remote_write_with_composition_admission(
+                    &RemoteWriteRequest::SetSpread {
+                        address: address.clone(),
+                        spread_mode: RemoteSpreadMode::RtlCover,
+                        reading_direction: RemoteReadingDirection::Rtl,
+                    },
+                    qualified.as_ref(),
+                );
+                assert!(
+                    matches!(response, RemoteWriteResponse::Success(_)),
+                    "{response:?}"
+                );
+                let key = remote_spread_key(&address).unwrap().exact;
+                assert_eq!(
+                    app.spread_db.as_ref().unwrap().get(&key),
+                    Some(crate::settings::SpreadMode::RtlCover)
+                );
+                assert_eq!(
+                    app.spread_db.as_ref().unwrap().get_direction(&key),
+                    Some(crate::settings::ReadingDirection::Rtl)
+                );
+            }
+            assert_eq!(service.snapshot().rows, before.rows);
+            assert_eq!(
+                service.snapshot().token_for(&scope),
+                before.token_for(&scope)
+            );
+        }
+        owner.shutdown_and_join();
+    }
+
+    #[test]
+    fn detached_folder_remote_binding_ignores_unavailable_store_and_document_fails_closed() {
+        use crate::book_composition::*;
+        let mut app = crate::app::setup_app_for_test();
+        let data = tempfile::tempdir().unwrap();
+        let composition_data = data.path().join("composition");
+        std::fs::create_dir(&composition_data).unwrap();
+        let broken_path = composition_data.join("book_composition.db");
+        let original = b"invalid composition database";
+        std::fs::write(&broken_path, original).unwrap();
+        let root = data.path().join("image-book");
+        std::fs::create_dir(&root).unwrap();
+        let document = data.path().join("book.pdf");
+        std::fs::write(&document, b"no document decoding").unwrap();
+        app.spread_db =
+            Ok(crate::spread_db::SpreadDb::open_at(&data.path().join("spread.db")).unwrap());
+        let (service, owner) = BookCompositionService::spawn_at(composition_data, None).unwrap();
+        assert!(
+            service
+                .prepare(
+                    crate::book_scope::BookScopeKey::document(&document).unwrap(),
+                    PageDomain::Document
+                )
+                .recv()
+                .unwrap()
+                .status
+                .is_err()
+        );
+        app.install_book_composition_runtime(service.clone());
+        let request = |root: &std::path::Path| RemoteWriteRequest::SetSpread {
+            address: mimageviewer_ipc::RemoteAddress::file(root.to_string_lossy().into_owned()),
+            spread_mode: RemoteSpreadMode::Rtl,
+            reading_direction: RemoteReadingDirection::Rtl,
+        };
+        for qualified in [None, Some(CompositionWriteAdmission::default())] {
+            assert!(matches!(
+                app.apply_remote_write_with_composition_admission(
+                    &request(&root),
+                    qualified.as_ref()
+                ),
+                RemoteWriteResponse::Success(_)
+            ));
+        }
+        assert!(matches!(
+            app.apply_remote_write(&request(&document)),
+            RemoteWriteResponse::Error(RemoteWriteError {
+                code: RemoteWriteErrorCode::Unsupported,
+                ..
+            })
+        ));
+        assert_eq!(std::fs::read(broken_path).unwrap(), original);
+        owner.shutdown_and_join();
+    }
 
     fn ready_unharvested_remote_audio_stream() -> (
         crate::app::AppTestEnvForTest,

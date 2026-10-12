@@ -1849,11 +1849,6 @@ Preparing中は既存pending workerと同じ50ms遅延repaintをROOTへ予約す
 Accepted/Blockedの同token読取は起床を予約しない。新しいpending fieldやworker側UI ownerは作らない。
 既存maintenance workerはEPUB→spread_shift→book_compositionの順でquiesceし、DB接続を解放してから共通rename/import/restore/cleanupを行う。
 lease終了時のwriter再読込が実変更scopeだけを公開する。UI側でmaintenance待ちやDB/FS読取を追加しない。
-G4Fのfolderミラーでは、既存save ticketとmigration queueの段階がキャッシュroot採用まで書込権を持つ。
-通常/定期flush、Checkingのflush予約、列切替時のキャッシュ退役は同じowner集合を参照する。
-製本page移動は同queueの`BookComposition → Collection`段階へ通し、maintenance worker完了を
-回収して公開済root Arcを採用してから段階を進める。Generic改名も同じ採用を完了処理内で行う。
-backup設定はそのworker受付時の値を保持し、UI採用時に再解釈しない。新しいwriter/待機ownerは作らない。
 終了時はcomposition writerをjoinしてから、保持されたcontent-identity recorderを所有するshift ownerを終了し、捕捉済みEdit観測を落とさない。
 まれな失敗はログ＋通知。未知/破損は利用者作成recordを保持して書込停止し、新DBのmigration/recreate/自動retryを作らない。
 
@@ -1867,6 +1862,9 @@ prepareのsource列挙、保存前fingerprint照合、writerの応答待ちは�
 
 Remote取得/窓closeが後から来ても、すでに送信したsave ticketの受取ownerはprocess側へ残す。
 その一回の終端を既存Remote close barrierへ含め、draft dropだけで完了を捨てない。
+metadata preview/import/exportとGeneric改名maintenanceも、同じticketの完了・採用まで開始を待つ。
+previewには既存WaitingForWritersの型付き待ち先を使い、追加のpending ownerやUI待機を作らない。
+G4Fは2026-10-12の利用者決定で切り離し。folder sidecar v1 restoreは構成maintenanceを使わず、開始条件を変更しない。
 DB成功後のreloadは保存済みrecordを使用する。reload失敗の再操作は利用者へ案内し、DB成功を巻き戻さない。
 捕捉した編集元のresume intentは保存完了ownerだけが一回記録し、兄弟/退避のreloadはresumeを追加記録しない。
 
