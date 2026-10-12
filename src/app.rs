@@ -533,6 +533,7 @@ pub(crate) mod file_type_resume;
 #[cfg(test)]
 mod rar_archive_cache_tests;
 pub(crate) use facet_navigation::{FacetNavigationState, FacetRoute, FacetScope};
+pub(crate) mod folder_reconcile;
 pub(crate) mod folder_scan;
 #[cfg(test)]
 mod media_resume_meter_tests;
@@ -1272,11 +1273,18 @@ pub(crate) struct MainListAdoption {
     facet_mode: MainFacetAdoption,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 enum MainFacetAdoption {
     #[default]
     Navigation,
-    Reproject,
+    Reproject {
+        actual_book: FacetScope,
+        root_alias: Option<facet_navigation::ZipRefreshFacetRootAlias>,
+    },
+    ZipRefreshAncestor {
+        actual_book: FacetScope,
+        root_alias: Option<facet_navigation::ZipRefreshFacetRootAlias>,
+    },
 }
 
 pub(crate) type MainListHydration = Option<(sidecar_restore::SidecarLoadContinuation, bool)>;
@@ -23506,9 +23514,8 @@ impl App {
         prepared: &PreparedZipGrid,
     ) {
         use crate::zip_tree::ZipRefreshPosition;
-        if prepared.refresh_position == ZipRefreshPosition::Open {
-            return;
-        }
+        // Initial and history admission must use the same effective parents as
+        // refresh and internal navigation. Open keeps its normal facet mode.
         let location = &adoption.destination.location;
         let (source, synthetic_parent) = match location {
             FolderNavHistoryTarget::Path(path) => (path, false),
@@ -23524,6 +23531,32 @@ impl App {
             _ => return,
         };
         let root = FacetScope::book(source, "");
+        let root_alias = synthetic_parent
+            .then(|| {
+                let scope = Self::facet_scope_for_location(location);
+                let old_nav = self.zip_nav.as_ref()?;
+                let old_source = self
+                    .archive_source_override
+                    .as_deref()
+                    .unwrap_or(&old_nav.tree.zip_path);
+                if FacetScope::book(old_source, "") != root
+                    || !self.facet_navigation.route().0.contains(&scope)
+                {
+                    return None;
+                }
+                Some(facet_navigation::ZipRefreshFacetRootAlias {
+                    scope,
+                    old_book_root: FacetScope::book(
+                        old_source,
+                        &old_nav.effective_levels().first()?.join("/"),
+                    ),
+                    new_book_root: FacetScope::book(
+                        source,
+                        &prepared.nav.effective_levels().first()?.join("/"),
+                    ),
+                })
+            })
+            .flatten();
         let route = &mut adoption.destination.route.0;
         while route.last().is_some_and(|scope| {
             matches!((scope, &root),
@@ -23531,13 +23564,23 @@ impl App {
         }) {
             route.pop();
         }
-        for level in prepared.nav.effective_levels() {
-            if !synthetic_parent || !level.is_empty() {
+        for (index, level) in prepared.nav.effective_levels().into_iter().enumerate() {
+            // The synthetic physical child already represents the effective ZIP
+            // root, including a nonempty root produced by wrapper collapse.
+            if !synthetic_parent || index != 0 {
                 route.push(FacetScope::book(source, &level.join("/")));
             }
         }
         if prepared.refresh_position == ZipRefreshPosition::Preserved {
-            adoption.facet_mode = MainFacetAdoption::Reproject;
+            adoption.facet_mode = MainFacetAdoption::Reproject {
+                actual_book: FacetScope::book(source, &prepared.nav.current().join("/")),
+                root_alias,
+            };
+        } else if prepared.refresh_position == ZipRefreshPosition::Ancestor {
+            adoption.facet_mode = MainFacetAdoption::ZipRefreshAncestor {
+                actual_book: FacetScope::book(source, &prepared.nav.current().join("/")),
+                root_alias,
+            };
         }
     }
 
@@ -23556,8 +23599,27 @@ impl App {
         self.save_leaving_folder_grid_position();
         match facet_mode {
             MainFacetAdoption::Navigation => self.adopt_main_facet_route(destination.route.clone()),
-            MainFacetAdoption::Reproject => {
-                self.facet_navigation.reproject(destination.route.clone());
+            MainFacetAdoption::Reproject {
+                actual_book,
+                root_alias,
+            } => {
+                self.facet_navigation.reproject_zip_refresh(
+                    destination.route.clone(),
+                    actual_book,
+                    root_alias,
+                );
+                self.sync_facet_name_runtime_from_filter();
+            }
+            MainFacetAdoption::ZipRefreshAncestor {
+                actual_book,
+                root_alias,
+            } => {
+                self.facet_navigation.adopt_refresh_ancestor(
+                    destination.route.clone(),
+                    actual_book,
+                    root_alias,
+                    &mut self.settings.facet_filter,
+                );
                 self.sync_facet_name_runtime_from_filter();
             }
         }
@@ -27102,6 +27164,11 @@ impl App {
             self.clear_pending_folder_nav_steps();
             self.release_fs_nav_lock();
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poll_history_navigation_transition_for_test(&mut self, ctx: &egui::Context) {
+        self.poll_collection_history_transition(ctx);
     }
 
     #[cfg(test)]
@@ -36400,11 +36467,35 @@ impl App {
                 .archive_source_override
                 .as_deref()
                 .unwrap_or(&nav.tree.zip_path);
-            let mut destination = self.main_list_destination_entry(
-                FolderNavHistoryTarget::Path(logical.to_path_buf()),
-                Some(&source),
-                Some(&nav.current().join("/")),
-            );
+            let synthetic_parent = match &source.location {
+                FolderNavHistoryTarget::CollectionPhysical(_) => true,
+                FolderNavHistoryTarget::SmartFolder(state) => matches!(
+                    &state.position,
+                    top_level_grid_view::SmartFolderPosition::Container { .. }
+                        | top_level_grid_view::SmartFolderPosition::Scoped { .. }
+                ),
+                _ => false,
+            };
+            let mut destination = if synthetic_parent {
+                // Use the same root and effective parents as refresh adoption.
+                // At root this is precisely the typed physical-child route;
+                // an extra Book scope would consume and re-stash its filter.
+                let mut entry =
+                    self.main_list_destination_entry(source.location.clone(), Some(&source), None);
+                for level in nav.effective_levels().into_iter().skip(1) {
+                    entry
+                        .route
+                        .0
+                        .push(FacetScope::book(logical, &level.join("/")));
+                }
+                entry
+            } else {
+                self.main_list_destination_entry(
+                    FolderNavHistoryTarget::Path(logical.to_path_buf()),
+                    Some(&source),
+                    Some(&nav.current().join("/")),
+                )
+            };
             destination.location = source.location.clone();
             let operation = if source.route == destination.route {
                 MainHistoryOperation::SameLocation

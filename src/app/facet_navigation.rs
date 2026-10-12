@@ -153,6 +153,15 @@ pub(crate) struct FacetAdoption {
     pub(crate) location_changed: bool,
 }
 
+/// A synthetic physical child represents the ZIP's effective root without an
+/// explicit empty-prefix Book scope. Capture both roots at refresh adoption.
+#[derive(Clone, Debug)]
+pub(crate) struct ZipRefreshFacetRootAlias {
+    pub(crate) scope: FacetScope,
+    pub(crate) old_book_root: FacetScope,
+    pub(crate) new_book_root: FacetScope,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct FacetNavigationState {
     route: FacetRoute,
@@ -178,13 +187,67 @@ impl FacetNavigationState {
     /// Re-enumeration keeps the live filter but rebuilds ancestry from the new tree.
     /// Frames are parent-owned, not index-owned; consumed frames are never recreated.
     pub(crate) fn reproject(&mut self, destination: FacetRoute) {
+        self.reproject_with_zip_root_alias(destination, None);
+    }
+
+    pub(crate) fn reproject_zip_refresh(
+        &mut self,
+        destination: FacetRoute,
+        actual_book: FacetScope,
+        root_alias: Option<ZipRefreshFacetRootAlias>,
+    ) {
+        if let Some(alias) = root_alias.as_ref() {
+            self.reproject_with_zip_root_alias(destination, Some((alias, &actual_book)));
+        } else {
+            self.reproject(destination);
+        }
+    }
+
+    fn reproject_with_zip_root_alias(
+        &mut self,
+        destination: FacetRoute,
+        alias: Option<(&ZipRefreshFacetRootAlias, &FacetScope)>,
+    ) {
         let old = &self.route.0;
         let mut frames = self
             .frames
             .drain(..)
             .filter_map(|mut frame| {
                 let parent = old.get(frame.entered.checked_sub(1)?)?;
-                let index = destination.0.iter().position(|scope| scope == parent)?;
+                let index = if let Some((alias, actual)) = alias
+                    && parent == &alias.scope
+                {
+                    // Root aliases are semantic Book parents, not stable-key
+                    // parents. Retain only levels still in the effective stack.
+                    if &alias.old_book_root == actual {
+                        return None;
+                    }
+                    destination
+                        .0
+                        .iter()
+                        .position(|scope| scope == &alias.old_book_root)
+                        .or_else(|| {
+                            (alias.old_book_root == alias.new_book_root)
+                                .then(|| {
+                                    destination.0.iter().position(|scope| scope == &alias.scope)
+                                })
+                                .flatten()
+                        })?
+                } else {
+                    destination
+                        .0
+                        .iter()
+                        .position(|scope| scope == parent)
+                        .or_else(|| {
+                            // A surviving Book parent can become the new
+                            // effective root represented by the physical child.
+                            alias
+                                .filter(|(alias, _)| parent == &alias.new_book_root)
+                                .and_then(|(alias, _)| {
+                                    destination.0.iter().position(|scope| scope == &alias.scope)
+                                })
+                        })?
+                };
                 if index + 1 >= destination.0.len() {
                     return None;
                 }
@@ -195,7 +258,22 @@ impl FacetNavigationState {
         // Newly exposed wrapper parents have no prior live filter. Record their default
         // return value, without inventing a suppressed-filter badge or a consumed frame.
         for entered in 1..destination.0.len() {
-            if !old.contains(&destination.0[entered - 1]) {
+            let parent = &destination.0[entered - 1];
+            let was_known = if let Some((alias, _)) = alias {
+                if parent == &alias.scope {
+                    // Nonempty effective roots also have an explicit Book scope;
+                    // that duplicate projection is not another return edge.
+                    if destination.0[entered] == alias.new_book_root {
+                        continue;
+                    }
+                    alias.old_book_root == alias.new_book_root || old.contains(&alias.new_book_root)
+                } else {
+                    old.contains(parent) || parent == &alias.old_book_root
+                }
+            } else {
+                old.contains(parent)
+            };
+            if !was_known {
                 frames.push(SavedFacetFrame {
                     entered,
                     filter: FacetFilter::default(),
@@ -205,6 +283,55 @@ impl FacetNavigationState {
         frames.sort_by_key(|frame| frame.entered);
         self.frames = frames;
         self.route = destination;
+    }
+
+    /// A missing ZIP node returns to the actual surviving ancestor. Wrapper collapse
+    /// may remove earlier route levels, so restoring by common-prefix depth can walk
+    /// past that ancestor and overwrite its filter with an obsolete root's filter.
+    pub(crate) fn adopt_refresh_ancestor(
+        &mut self,
+        destination: FacetRoute,
+        actual_book: FacetScope,
+        root_alias: Option<ZipRefreshFacetRootAlias>,
+        active: &mut FacetFilter,
+    ) -> FacetAdoption {
+        let parent_index = self.route.0.iter().rposition(|scope| {
+            let book_scope = root_alias
+                .as_ref()
+                .filter(|alias| &alias.scope == scope)
+                .map_or(scope, |alias| &alias.old_book_root);
+            matches!(book_scope, FacetScope::Book { .. }) && book_scope.contains(&actual_book)
+        });
+        let mut result = FacetAdoption {
+            // Ancestor adoption means the requested node disappeared. Synthetic
+            // scope keys can stay equal while their semantic Book prefix changes.
+            location_changed: true,
+            ..FacetAdoption::default()
+        };
+        if result.location_changed {
+            active.place_keys.clear();
+            for frame in &mut self.frames {
+                frame.filter.place_keys.clear();
+            }
+        }
+        if let Some(parent_index) = parent_index {
+            if let Some(index) = self
+                .frames
+                .iter()
+                .position(|frame| frame.entered == parent_index + 1)
+            {
+                *active = self.frames.remove(index).filter;
+                result.restored = 1;
+            }
+        } else {
+            // The old displayed root may itself have been a collapsed branch.
+            // A different new branch has no old ancestor condition to inherit.
+            *active = FacetFilter::default();
+        }
+        // A manually consumed ancestor frame stays absent; surviving outer frames
+        // retain their ownership, while obsolete wrappers are discarded silently.
+        self.reproject_zip_refresh(destination, actual_book, root_alias);
+        result
     }
 
     #[cfg(test)]
@@ -265,13 +392,15 @@ impl FacetNavigationState {
     /// Badge action: consume only the latest live frame; lineage stays intact.
     /// The caller synchronizes name runtime and persists Settings as before.
     pub(crate) fn restore_latest(&mut self, active: &mut FacetFilter) -> bool {
-        while let Some(frame) = self.frames.pop() {
-            if frame.filter.is_active() {
-                *active = frame.filter;
-                return true;
-            }
-        }
-        false
+        let Some(index) = self
+            .frames
+            .iter()
+            .rposition(|frame| frame.filter.is_active())
+        else {
+            return false;
+        };
+        *active = self.frames.remove(index).filter;
+        true
     }
 }
 
@@ -306,6 +435,22 @@ mod tests {
         state.reproject(root.child(parent.clone()).child(leaf));
         assert_eq!(active, filter("jpg"));
         assert_eq!(state.saved_frame_count(), 1);
+        let mut manually_restored = state.clone();
+        let mut manual_filter = active.clone();
+        assert!(manually_restored.restore_latest(&mut manual_filter));
+        assert_eq!(manual_filter, filter("zip"));
+        assert!(!manually_restored.restore_latest(&mut manual_filter));
+        assert!(!manually_restored.suppressed());
+        manually_restored.adopt(root.child(parent.clone()), &mut manual_filter);
+        assert!(
+            !manual_filter.is_active(),
+            "manual restoration must keep the new parent's empty return frame"
+        );
+        manually_restored.adopt(root.clone(), &mut manual_filter);
+        assert!(
+            !manual_filter.is_active(),
+            "the manually consumed root frame must stay absent on Backspace"
+        );
         state.adopt(root.child(parent), &mut active);
         assert!(
             !active.is_active(),
@@ -313,6 +458,413 @@ mod tests {
         );
         state.adopt(root, &mut active);
         assert_eq!(active, filter("zip"));
+    }
+
+    #[test]
+    fn section1353_ancestor_refresh_restores_scope_when_root_collapses() {
+        for manual in [false, true] {
+            let outer = rating();
+            let root = outer.child(book());
+            let parent = FacetScope::book(Path::new(r"C:\books\comic.zip"), "A");
+            let leaf = FacetScope::book(Path::new(r"C:\books\comic.zip"), "A/sub");
+            let mut state = FacetNavigationState::default();
+            let mut active = filter("cbz");
+            state.adopt(outer.clone(), &mut active);
+            state.adopt(root.clone(), &mut active);
+            active = filter("zip");
+            state.adopt(root.child(parent.clone()), &mut active);
+            active = filter("png");
+            state.adopt(root.child(parent.clone()).child(leaf), &mut active);
+            if manual {
+                assert!(state.restore_latest(&mut active));
+                assert_eq!(active, filter("png"));
+            }
+            active = filter("jpg");
+            active.place_keys.insert("old-child-row".to_owned());
+            let destination = outer.child(parent);
+            let result = state.adopt_refresh_ancestor(
+                destination.clone(),
+                destination.current().unwrap().clone(),
+                None,
+                &mut active,
+            );
+            assert_eq!(result.restored, usize::from(!manual));
+            assert!(result.location_changed);
+            assert_eq!(active, filter(if manual { "jpg" } else { "png" }));
+            assert_eq!(state.route(), &destination);
+            assert_eq!(state.saved_frame_count(), 1);
+            assert_eq!(state.saved_filter(0), &filter("cbz"));
+            state.adopt(outer, &mut active);
+            assert_eq!(active, filter("cbz"));
+            assert!(!state.suppressed());
+        }
+    }
+
+    #[test]
+    fn section1353_ancestor_refresh_uses_nearest_old_scope_for_new_collapsed_branch() {
+        for (prefix, expected) in [("A/new", "png"), ("B/pages", "zip")] {
+            let outer = rating();
+            let root = outer.child(book());
+            let parent = FacetScope::book(Path::new(r"C:\books\comic.zip"), "A");
+            let leaf = FacetScope::book(Path::new(r"C:\books\comic.zip"), "A/sub");
+            let actual = FacetScope::book(Path::new(r"C:\books\comic.zip"), prefix);
+            let mut state = FacetNavigationState::default();
+            let mut active = filter("cbz");
+            state.adopt(outer.clone(), &mut active);
+            state.adopt(root.clone(), &mut active);
+            active = filter("zip");
+            state.adopt(root.child(parent.clone()), &mut active);
+            active = filter("png");
+            state.adopt(root.child(parent).child(leaf), &mut active);
+            active = filter("jpg");
+            state.adopt_refresh_ancestor(outer.child(actual.clone()), actual, None, &mut active);
+            assert_eq!(active, filter(expected));
+            assert_eq!(state.saved_frame_count(), 1);
+            state.adopt(outer, &mut active);
+            assert_eq!(active, filter("cbz"));
+        }
+
+        // Both trees collapse at root, but into unrelated branches. The old A
+        // filter cannot become B's condition, and the outer return is unchanged.
+        let outer = rating();
+        let old_root = FacetScope::book(Path::new(r"C:\books\comic.zip"), "A");
+        let actual = FacetScope::book(Path::new(r"C:\books\comic.zip"), "B");
+        let mut state = FacetNavigationState::default();
+        let mut active = filter("cbz");
+        state.adopt(outer.clone(), &mut active);
+        state.adopt(outer.child(old_root), &mut active);
+        active = filter("jpg");
+        state.adopt_refresh_ancestor(outer.child(actual.clone()), actual, None, &mut active);
+        assert!(!active.is_active());
+        assert_eq!(state.saved_frame_count(), 1);
+        state.adopt(outer, &mut active);
+        assert_eq!(active, filter("cbz"));
+    }
+
+    #[test]
+    fn section1353_ancestor_refresh_restores_synthetic_zip_root_frame_only() {
+        for (outer, child) in [
+            (
+                FacetScope::Smart {
+                    id: "smart".into(),
+                    position: "root".into(),
+                },
+                FacetScope::Smart {
+                    id: "smart".into(),
+                    position: "book.zip".into(),
+                },
+            ),
+            (
+                FacetScope::Collection {
+                    id: "collection".into(),
+                    entry: None,
+                },
+                FacetScope::Collection {
+                    id: "collection".into(),
+                    entry: Some("book".into()),
+                },
+            ),
+        ] {
+            for manual in [false, true] {
+                let outer = FacetRoute::root(outer.clone());
+                let zip_root = outer.child(child.clone());
+                let nested =
+                    zip_root.child(FacetScope::book(Path::new(r"C:\books\comic.zip"), "A"));
+                let mut state = FacetNavigationState::default();
+                let mut active = filter("zip");
+                state.adopt(outer.clone(), &mut active);
+                state.adopt(zip_root.clone(), &mut active);
+                active = filter("png");
+                state.adopt(nested, &mut active);
+                if manual {
+                    assert!(state.restore_latest(&mut active));
+                    assert_eq!(active, filter("png"));
+                }
+                active = filter("jpg");
+                let actual = book();
+                let alias = ZipRefreshFacetRootAlias {
+                    scope: child.clone(),
+                    old_book_root: actual.clone(),
+                    new_book_root: actual.clone(),
+                };
+                let result = state.adopt_refresh_ancestor(
+                    zip_root.clone(),
+                    actual,
+                    Some(alias),
+                    &mut active,
+                );
+                assert_eq!(result.restored, usize::from(!manual));
+                assert_eq!(active, filter(if manual { "jpg" } else { "png" }));
+                assert_eq!(state.route(), &zip_root);
+                assert_eq!(state.saved_frame_count(), 1);
+                assert_eq!(state.saved_filter(0), &filter("zip"));
+                state.adopt(outer, &mut active);
+                assert_eq!(active, filter("zip"));
+                assert!(!state.suppressed());
+            }
+        }
+    }
+
+    #[test]
+    fn section1353_synthetic_root_alias_tracks_semantic_prefix_and_surviving_parents() {
+        let source = Path::new(r"C:\books\comic.zip");
+        let scope = |prefix: &str| FacetScope::book(source, prefix);
+        for (old_root, new_root, actual, saved_parent_survives, expected) in [
+            ("", "B", "B", false, "png"),
+            ("A", "B", "B", false, ""),
+            ("A", "", "", false, ""),
+            ("", "A/new", "A/new", false, "gif"),
+            ("", "", "A/new", true, "gif"),
+        ] {
+            for manual in [false, true] {
+                let outer_scope = FacetScope::Smart {
+                    id: "smart".into(),
+                    position: "root".into(),
+                };
+                let child_scope = FacetScope::Smart {
+                    id: "smart".into(),
+                    position: "book.zip".into(),
+                };
+                let outer = FacetRoute::root(outer_scope);
+                let root = outer.child(child_scope.clone());
+                let mut state = FacetNavigationState::default();
+                let mut active = filter("zip");
+                state.adopt(outer.clone(), &mut active);
+                state.adopt(root.clone(), &mut active);
+                active = filter("png");
+                let current = if expected == "gif" {
+                    state.adopt(root.child(scope("A")), &mut active);
+                    active = filter("gif");
+                    root.child(scope("A")).child(scope("A/sub"))
+                } else {
+                    root.child(scope(if old_root.is_empty() {
+                        "A/sub"
+                    } else {
+                        "A/sub/deep"
+                    }))
+                };
+                state.adopt(current, &mut active);
+                if manual {
+                    assert!(state.restore_latest(&mut active));
+                }
+                active = filter("jpg");
+                active.place_keys.insert("old-page".into());
+                let mut destination = root.clone();
+                if actual != new_root {
+                    destination = destination.child(scope(actual));
+                }
+                let alias = ZipRefreshFacetRootAlias {
+                    scope: child_scope,
+                    old_book_root: scope(old_root),
+                    new_book_root: scope(new_root),
+                };
+                let result = state.adopt_refresh_ancestor(
+                    destination.clone(),
+                    scope(actual),
+                    Some(alias),
+                    &mut active,
+                );
+                assert!(result.location_changed);
+                let expected = if manual && !expected.is_empty() {
+                    "jpg"
+                } else {
+                    expected
+                };
+                assert_eq!(
+                    active,
+                    if expected.is_empty() {
+                        FacetFilter::default()
+                    } else {
+                        filter(expected)
+                    }
+                );
+                assert_eq!(state.route(), &destination);
+                assert_eq!(
+                    state.saved_frame_count(),
+                    1 + usize::from(saved_parent_survives)
+                );
+                assert_eq!(state.saved_filter(0), &filter("zip"));
+                if saved_parent_survives {
+                    state.adopt(root, &mut active);
+                    assert_eq!(active, filter("png"));
+                }
+                state.adopt(outer, &mut active);
+                assert_eq!(active, filter("zip"));
+            }
+        }
+
+        // A collapsed old root can change semantic position while the route key
+        // stays exactly the same; this still clears location-bound conditions.
+        let outer = rating();
+        let child = FacetScope::Collection {
+            id: "collection".into(),
+            entry: Some("book".into()),
+        };
+        let destination = outer.child(child.clone());
+        let mut state = FacetNavigationState::default();
+        let mut active = filter("zip");
+        state.adopt(outer, &mut active);
+        state.adopt(destination.clone(), &mut active);
+        active = filter("png");
+        active.place_keys.insert("old-page".into());
+        let result = state.adopt_refresh_ancestor(
+            destination.clone(),
+            scope(""),
+            Some(ZipRefreshFacetRootAlias {
+                scope: child,
+                old_book_root: scope("A"),
+                new_book_root: scope(""),
+            }),
+            &mut active,
+        );
+        assert!(result.location_changed);
+        assert!(!active.is_active());
+        assert_eq!(state.saved_frame_count(), 1);
+
+        // An old collapsed root can become an explicit effective parent after a
+        // wrapper is exposed. Its frame moves to that Book parent, not to the
+        // newly exposed empty root represented by the same synthetic key.
+        let outer = rating();
+        let child = FacetScope::Smart {
+            id: "smart".into(),
+            position: "book.zip".into(),
+        };
+        let root = outer.child(child.clone());
+        let mut state = FacetNavigationState::default();
+        let mut active = filter("zip");
+        state.adopt(outer.clone(), &mut active);
+        state.adopt(root.clone(), &mut active);
+        active = filter("png");
+        state.adopt(root.child(scope("A/sub")), &mut active);
+        active = filter("gif");
+        state.adopt(
+            root.child(scope("A/sub")).child(scope("A/sub/deep")),
+            &mut active,
+        );
+        active = filter("jpg");
+        let destination = root.child(scope("A")).child(scope("A/sub/new"));
+        state.adopt_refresh_ancestor(
+            destination,
+            scope("A/sub/new"),
+            Some(ZipRefreshFacetRootAlias {
+                scope: child,
+                old_book_root: scope("A"),
+                new_book_root: scope(""),
+            }),
+            &mut active,
+        );
+        assert_eq!(active, filter("gif"));
+        assert_eq!(state.saved_frame_count(), 2);
+        state.adopt(root.child(scope("A")), &mut active);
+        assert_eq!(active, filter("png"));
+        state.adopt(root, &mut active);
+        assert!(
+            !active.is_active(),
+            "newly exposed empty root has a default return"
+        );
+        state.adopt(outer, &mut active);
+        assert_eq!(active, filter("zip"));
+    }
+
+    #[test]
+    fn section1353_preserved_node_drops_synthetic_wrapper_frames_without_touching_active() {
+        let source = Path::new(r"C:\books\comic.zip");
+        let actual = FacetScope::book(source, "A/sub");
+        let parent = FacetScope::book(source, "A");
+        for synthetic in [false, true] {
+            let outer = rating();
+            let root_scope = if synthetic {
+                FacetScope::Smart {
+                    id: "smart".into(),
+                    position: "book.zip".into(),
+                }
+            } else {
+                book()
+            };
+            let root = outer.child(root_scope.clone());
+            let mut state = FacetNavigationState::default();
+            let mut active = filter("zip");
+            state.adopt(outer.clone(), &mut active);
+            state.adopt(root.clone(), &mut active);
+            active = filter("png");
+            state.adopt(root.child(parent.clone()), &mut active);
+            active = filter("gif");
+            state.adopt(
+                root.child(FacetScope::book(source, "A"))
+                    .child(actual.clone()),
+                &mut active,
+            );
+            active = filter("jpg");
+            active.place_keys.insert("same-page".into());
+            let before = active.clone();
+            let destination = if synthetic {
+                root.clone()
+            } else {
+                outer.child(actual.clone())
+            };
+            let alias = synthetic.then(|| ZipRefreshFacetRootAlias {
+                scope: root_scope,
+                old_book_root: book(),
+                new_book_root: actual.clone(),
+            });
+            state.reproject_zip_refresh(destination.clone(), actual.clone(), alias);
+            assert_eq!(active, before);
+            assert_eq!(state.route(), &destination);
+            assert_eq!(state.saved_frame_count(), 1);
+            assert_eq!(state.saved_filter(0), &filter("zip"));
+            state.adopt(outer, &mut active);
+            assert_eq!(active, filter("zip"));
+        }
+    }
+
+    #[test]
+    fn section1353_preserved_book_parent_becomes_synthetic_root_without_losing_its_frame() {
+        let source = Path::new(r"C:\books\comic.zip");
+        let parent = FacetScope::book(source, "A");
+        let actual = FacetScope::book(source, "A/sub");
+        for manual in [false, true] {
+            let outer = rating();
+            let child = FacetScope::Smart {
+                id: "smart".into(),
+                position: "book.zip".into(),
+            };
+            let root = outer.child(child.clone());
+            let mut state = FacetNavigationState::default();
+            let mut active = filter("zip");
+            state.adopt(outer.clone(), &mut active);
+            state.adopt(root.clone(), &mut active);
+            active = filter("png");
+            state.adopt(root.child(parent.clone()), &mut active);
+            active = filter("gif");
+            state.adopt(
+                root.child(parent.clone()).child(actual.clone()),
+                &mut active,
+            );
+            if manual {
+                assert!(state.restore_latest(&mut active));
+            }
+            active = filter("jpg");
+            active.place_keys.insert("same-page".into());
+            let before = active.clone();
+            let destination = root.child(actual.clone());
+            state.reproject_zip_refresh(
+                destination.clone(),
+                actual.clone(),
+                Some(ZipRefreshFacetRootAlias {
+                    scope: child,
+                    old_book_root: book(),
+                    new_book_root: parent.clone(),
+                }),
+            );
+            assert_eq!(active, before);
+            assert_eq!(state.route(), &destination);
+            assert_eq!(state.saved_frame_count(), 1 + usize::from(!manual));
+            state.adopt(root, &mut active);
+            assert_eq!(active, filter(if manual { "jpg" } else { "gif" }));
+            state.adopt(outer, &mut active);
+            assert_eq!(active, filter("zip"));
+            assert!(!state.suppressed());
+        }
     }
 
     #[test]

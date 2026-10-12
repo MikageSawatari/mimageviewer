@@ -98,7 +98,9 @@ bool、完了後の「root を表示してから階層へ入り直す」処理�
    自動 collapse で消えたラッパーと Backspace の親 stack も新ツリーに基づく。
 5. 採用時に actual prefix、rows、facet route を一緒に確定する。同じ actual route の更新は
    active facet と手動復元済み frame を保持。祖先 fallback 時は既存帰路の親 frame を復元。
-   外側履歴の cursor／stack は進めない。主一覧の起動復元記録は成功した実位置と対応させる。
+   外側履歴の cursor／stack は進めない。ここで確定する実位置は表示一覧の prefix／rows／route
+   の整合であり、新しい起動復元先の採用ではない。§1.335 の既存契約に従い、更新は保存済み
+   target と cursor を保持し、同じ明示済み target の通常の departure／exit だけが最新 cursor を捕捉する。
 6. 列挙失敗・取消・別要求への切替・stale は既存終端に従い、旧一覧の prefix／facet／帰路へ
    遅延結果を適用しない。兄弟 viewer の tree／receiver／cache を変更しない。
 
@@ -119,6 +121,59 @@ active facet は更新前の値を保持し、その値を新 actual route へ�
 現在 actual prefix が同じで親 stack だけ変わった場合も active facet は不変、frame は上記
 route 対応で再整合し、Backspace は新 tree の実効親を使う。node 消失時だけ §2.4–5 の
 祖先 fallback／親 frame 復元を使う。この理由の区別は準備結果に載せ、採用後に推測しない。
+
+### P2 facet 帰路の追加修正 (2026-10-12)
+
+新たな実効親へ `reproject` が追加した無条件 frame は、Backspace 用の帰路である。
+badge の手動復元は最新の有効条件 frame 一件だけを消費し、間にある無条件 frame を
+除去しない。手動復元後も新しい親への Backspace は無条件となり、消費した元親の条件を
+再生成しない。
+
+消失階層から祖先へ戻る採用は専用の純粋 reducer を使う。新 actual の Book scope と、
+Smart／Collection の物理子 scope が表していた旧実効 Book root の alias を、同じ採用
+payload へ渡す。alias は採用前の旧 `zip_nav` の実効 stack 先頭と論理元書庫から捕捉し、
+同じ論理 source と typed physical child scope が一致する場合だけ作る。新 stack の先頭も
+渡し、scope key が同じでも意味上の Book prefix が変わったことを区別する。
+旧 Book scope と alias の意味上の Book scope のうち、新 actual と同じ論理書庫・segment
+境界での祖先に当たる最深のものを選び、その scope が
+所有する帰路 frame だけを復元する。旧／新 route の位置番号や common prefix を使った
+連続 pop はしない。例えば旧 root→A→A/sub、更新後の実効 stack が [A] なら、A の
+保存条件を復元し、表示されなくなった root の条件で上書きしない。actual が A/new や
+B/pages に collapse したときも、旧 A／旧 root の scope から条件を選ぶ。
+選んだ frame が手動消費済みなら active 条件を保持し、frame を再生成しない。
+旧表示自体が root→A に collapse しており、新 B に対応する旧祖先 Book scope がない
+場合は無条件とする。旧 root A → 新 root B／空 root へ A の条件を転用しない。
+外側の Smart／Collection root の frame へ遡って上書きせず、残る外側の帰路は保持する。
+
+条件決定後に新実効 route へ frame を再投影し、消えた wrapper の frame は復元せず
+除去する。未消費 alias frame も、旧実効 Book root が新しい実効親 stack に残る場合だけ
+保持し、新 parent の対応 scope へ再投影する。旧 []→A→A/sub、root PNG／A GIF の
+更新先が A/new だけなら GIF を復元して obsolete root PNG frame を落とす。新 stack に
+[] が残る場合は root PNG の帰路を保持する。消費済み条件は scope 表現が変わっても
+再生成しない。Ancestor は旧 node 消失による場所変更なので、synthetic scope key が
+同じ場合も場所条件を除く。外側履歴不変は既存契約を維持する。新しい pending／
+完了待ち／モーダル制限は不要で、既存の成功採用境界内でこの条件決定だけを行う。
+
+requested node が残る `Preserved` 採用にも、同じ同 source 確認済み alias と new actual
+Book scope を渡して意味上の親 frame を再投影する。root []→A→A/sub の root PNG／A GIF
+が保存されていて、更新後が A/sub 一階層だけなら両 wrapper frame を除く。
+この採用理由では active facet の復元・無条件化・場所条件 clear は一切行わない。
+残る外側 synthetic root の帰路と、手動消費済み frame の不在は維持する。
+
+Smart／Collection の typed physical child は、空／非空を問わず ZIP の実効 stack 先頭を
+表す。Book scope は二段目以降だけにし、初期 Open・履歴・Refresh・階層移動・同階層の
+sort／pin 再投影で同じ route を作る。Open は既存 Navigation mode を維持する。
+旧 Book(A) が新実効 root になった場合は、その保存 frame を physical child へ転写する。
+逆に旧 physical child の実効 root が新しい途中 Book 親になれば、その Book scope へ転写する。
+消費済み frame は両方向とも再生成しない。sort／pin 再投影で場所条件を消さない。
+
+この producer 統一と双方向転写は独立 follow-up review (`gpt-6.1-sol` / `xhigh`) で
+ACCEPT（コードレビュー）。純粋な親転写の手動消費有無、Smart／Collection 各16ケース、
+初期 collapsed root の Backspace→再入場と、同階層の場所条件保持を回帰へ追加した。
+
+回帰は手動復元→新親 Backspace、祖先 fallback と root collapse の同時発生、手動消費済み
+A frame、collapse 先の新枝、外側 frame／履歴不変を含む。検証は全 writer の作業が安定した
+後に担当を集約して行い、この節の追記時点では追加回帰をまだ実行していない。
 
 ## 3. 実装範囲・検収
 
@@ -175,3 +230,183 @@ cold target の最初のnative buildがMSBuild段階で失敗したため、同�
 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-full.ps1 -SuppressCrashDialogs` は **一回だけ実行、exit 101、テスト実行0件**。workspaceのlauncher build scriptが `target/release/mimageviewer-core.exe`、`mimageviewer-remote.exe`、`mimageviewer-epub-pdf.exe` の欠落を検出した。coreの型／回帰の失敗ではなく、全体gateのビルド前提が未成立。vendor3 crateの後続gateも未実行。指定に従いfullを再実行していない。ログ: [section1353-full.log](../target/section1353-full.log)。
 
 cold worktreeにrelease入力が必要という前提不足でここを安全な引継ぎ区切りにする。確認用 `build-dev.ps1` binaryは全体gate前提未成立のため未作成。アプリ起動・コミットなし。coordinatorがrelease入力3exeを準備し、未完了gateと確認用buildを引き継ぐ。失敗をPASS扱いにしない。
+
+### `3bfbf1989` 後の中間検証（追加6件の時点、2026-10-12）
+
+手動復元で無条件の帰路frameを消さず、階層消失＋root collapseでは実際の祖先scopeのframeを
+復元する。独立follow-up reviewで判明したSmart／Collectionのsynthetic ZIP rootも、旧routeの
+同一scopeを優先してその保存条件だけを復元する。手動消費済みならactive条件を保持する。
+新規回帰6件（pure3・実reload3）と既存の手動復元→Backspace回帰拡張を追加した。
+独立コードレビュー `gpt-6.1-sol` / `xhigh` は追加P2修正後 **ACCEPT**。
+
+最終targeted成功: `section1353`18件、`facet_navigation`18件、未接続の照合部品17件、
+`folder_scan`45件、`folder_mtime`6件。計104実行・重複除外98件成功、失敗0件。
+照合部品の初回fixture失敗3件と修正は§1.375の記録へ分離した。
+`cargo fmt --check`、UI glyph検査（問題0件）、通常／portable core check、`git diff --check` は成功。
+同じpinned TurboJPEGのworktree内explicit installとCargoジョブ2を使い、依存版・Cargo設定は変更なし。
+検証環境: `target/nextlist-verify-env.ps1`。
+ログ: [ZIP更新18件](../target/nextlist-section1353.log)、
+[facet18件](../target/nextlist-facet_navigation.log)、
+[通常check](../target/nextlist-check.log)、[portable check](../target/nextlist-check-portable.log)。
+
+`build-release.ps1 -PreserveRuntime` は一回実行し **exit1、Rustビルド前で停止**。
+起動中mImageViewer（APPDATAのruntimeを含む）を保護する既存ガードが停止を要求した。
+アプリ停止・キャッシュ削除・保護ガードの迂回は行っていない。
+このworktreeのrelease入力core／remote／EPUB workerは未生成のため、依存するtest-fullは
+**今回0回・未実行**。既知の入力不足で再び0テストのfullを回して成功扱いにはしない。
+先に起動中アプリの終了という前提を整え、release build後に指定のfull gate一回を引き継ぐ。
+ログ: [release前提停止](../target/nextlist-build-release.log)。
+
+`build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` は確認用通常profileの構築中。
+このworktreeのdev-runtime出力だけを検査し、既存アプリに作用しない。
+TurboJPEGはshared registryをビルドせずworktree専用installを使う。
+§1.373の未レビュー接続コードは退役し、§1.375もApp handler／context bundleへ未接続。
+確認用binaryの機能確認対象は§1.353である。アプリ起動・コミットなし。
+
+### 最新ソースの検証（2026-10-12）
+
+追加回帰は9件（pure6、実reload3）。Smart／Collection の実reloadは各16ケース。
+手動復元→Backspace、新実効親、階層消失＋root collapse、旧 Book 親→新 physical root、
+逆方向、消費済み frame、初期 Open／履歴／同階層 sort・pin の canonical root と場所条件を検査する。
+独立 follow-up コードレビューは最終修正後 ACCEPT、未解消の重要所見なし。
+追加ケースの最初の実行は20件中18件成功・2件失敗で、root帰路の不一致をコードと試験で確定した。
+期待値を維持して producer を修正した。ログ: [不一致の回帰](../target/nextlist-section1353-root-route-failure.log)。
+
+最新targeted: ZIP21件、facet21件、未接続の照合部品17件、folder_scan45件、folder_mtime6件。
+計110実行・重複除外101件成功、失敗0件。部品・走査・mtimeの計68実行は、その対象コードに
+追加変更がないため有効な成功結果を再利用した。fmt、通常／portable core check、UI glyph検査
+（問題0件）、git diff --checkも成功。
+ログ: [ZIP21件](../target/nextlist-section1353-final.log)、
+[facet21件](../target/nextlist-facet_navigation-final.log)、
+[通常check](../target/nextlist-check-final.log)、[portable check](../target/nextlist-check-portable-final.log)。
+
+release wrapperの保護停止後、CLAUDE.md「実機検証用バイナリの準備」に記載された代替の
+core→remote→EPUB worker→launcher直接cargo buildを実行中。worktree内のexact出力に
+起動中processがないことを確認し、VST3 identity／EffeTune source・stage／VCRT gateを維持する。
+既存アプリを停止せず、APPDATAにも作用しない。依存版は変更せず、同じexplicit TurboJPEGと
+Cargoジョブ2を使う。release四段完了後にtest-full一回、最新sourceのbuild-devを更新する。
+§1.375第一段Delete／§1.373 Undoは各設計書の前提矛盾で未接続のまま。新Undoと新Busyは製品に残していない。
+release直接buildの初回はcore binaryのLLVM段階で `out of memory / Allocation failed`、exit101。
+Rustの型エラー・製品テストの失敗ではない。ログを `target/nextlist-release-oom.log` に保存した。
+通常プロセスを停止せず、Cargoジョブだけ2→1へ下げ、同じopt-level=3／ThinLTO／依存版で
+一回再実行中。Windowsメモリ照会では物理127.3GiB中50.1GiB空き、commit空き22.4GiBだった。
+system設定・pagefile・Cargo.toml・release最適化は変更していない。
+
+### release 入力の完了と全体 gate の開始（2026-10-12）
+
+直接 release build の単一ジョブ再実行は exit0。core 29分34秒、remote 5分53秒、EPUB worker
+2分49秒、launcher 1分01秒で四段とも成功した。最終 VCRT 検査は runtime4／PE4 成功。
+標準 opt-level=3／ThinLTO、VST3 identity と EffeTune stage を保持し、既存アプリの停止・
+APPDATAへの変更・アプリ起動は行っていない。
+ログ: [release四段](../target/nextlist-release-inputs.log)。
+
+`test-full.ps1 -SuppressCrashDialogs` は今回一回を開始済み（2026-10-12 20:33:33 JST）。
+開始印 `target/nextlist-test-full-started.txt` が重複実行を禁止する。全体テストと後続の
+最新sourceの `build-dev.ps1` は一担当が所有し、結果・終了コードを同worktreeのログへ記録する。
+現在はworkspaceのテスト用コンパイル中。最終実数は完了後に追記する。
+
+### 今回の変更範囲と利用者確認
+
+- Rust（意味のある差分8ファイル）: [app.rs](../src/app.rs)、
+  [facet_navigation.rs](../src/app/facet_navigation.rs)、[tests.rs](../src/app/tests.rs)、
+  [folder_scan.rs](../src/app/folder_scan.rs)、
+  [similar_navigation_tests.rs](../src/app/similar_navigation_tests.rs)、
+  [folder_reconcile.rs](../src/app/folder_reconcile.rs)。最後の照合部品は製品へ未接続。
+  [startup_list_restore.rs](../src/app/startup_list_restore.rs) は更新を復元先の明示採用から除外する修正。
+  [ui_main.rs](../src/ui_main.rs) は実更新メニュー回帰の非同期採用待機だけ。
+- 文書7ファイル: 本書、[§1.375](section375-operation-reconcile-plan.md)、
+  [§1.373](section373-book-append-undo-plan.md)、[virtual-folders.md](virtual-folders.md)、
+  [README.md](README.md)、[next-release-backlog.md](next-release-backlog.md)、
+  [startup-restore-target-plan.md](startup-restore-target-plan.md)。
+- manual: [shortcuts.html](../htdocs/mimageviewer/manual/shortcuts.html)。ZIP更新時の階層保持を記載。
+
+確認用 binary の最新構築が成功した後、利用者が起動するコマンド:
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+通常 `%APPDATA%\mimageviewer` profile を使い、実際の設定・データを更新し得る。
+single-instance mutex を共有するため、インストール済み／トレイ常駐の mImageViewer を先に閉じる。
+agent は起動しない。確認対象は通常 ZIP と Smart／Collection 子の深い階層で、更新メニュー／
+割当済み `GridReload` による位置と条件の保持、手動復元→Backspace、階層消失と root collapse、
+初期入場／履歴／sort・pin 後の帰路。現基点の F5 は既定★5、`GridReload` は既定キーなし。
+§1.375 の Delete と§1.373 の新 Undo は、この binary の完了機能として扱わない。
+
+### full 一回の結果と原因修正（2026-10-12）
+
+指定の full は一回を完走し、終了コード101。全62結果行の合計は13,339成功・48失敗・63無視
+（内部subprocessの2結果行も含む）。本体libraryは12,126成功・44失敗・56無視、LibRawは0成功・4失敗。
+workspaceは全対象を終えたが、後続のegui／egui-wgpu／eframeは未到達。自動のdev構築も止まった。
+ログ: [full一回](../target/nextlist-test-full.log)。再実行しない。
+
+失敗の41件は `vendor/raw-samples` 未準備が原因。既存nextfix／nexttile worktreeの非reparseな
+実directoryにmanifest全27ファイル（計360,971,087 bytes）のsize／SHA-256一致を確認した。
+同じ実ファイルをこのworktreeへコピーし、再照合後にRAWのtargeted検証を補完する。
+full実行中のサンプル追加や環境変更は行っていない。
+
+非RAWの7件のうち、export／Stack Escape／viewer後watch反映／locked facetの更新メニューの
+4件は、既存PhysicalHistory workerの採用前にitems／入力受付を検査していたfixture。
+元の期待・呼出回数を維持し、既存採用ownerの終端をtest内だけで待つ。製品へ同期待ちを足さない。
+
+残る起動復元3件は製品の回帰で、`finish_main_list_open` がRefreshListをExplicitListと同じ
+復元記録Adoptへ入れていた根因を修正。RefreshListのcursor復元・settings.saveは保ち、
+新target採用だけから除外する。既存§1.335の3回帰の期待は変更していない。
+独立追加確認はこの最小修正をACCEPT。本文の不変条件5と§1.335文書も同じ保存契約へ訂正した。
+新owner／状態／回復機構は追加しない。
+
+補完順は失敗関連targeted・ZIP／startup／reload回帰、fmt、通常／portable core check、
+未到達vendor3ゲートの初回、最新sourceのdev構築。担当を一つに集約し、各結果を別ログへ記録する。
+release入力四段はfull前に構築した版であり、最後の起動復元修正の利用者確認用は最新devとする。
+補完検証の最終実数は完了後に記録する。
+
+### 補完targeted・checkの確定結果（2026-10-12）
+
+RAW sample全27件の実コピーとsize／SHA-256照合は成功。
+補完targetedはLibRaw4件、本体RAW354件（既存無視1件）、startup73件、reload72件、ZIP21件、
+export／Stack Escape／watch復帰／facet更新メニュー各1件、名前にrawを含まないCR2回帰1件、
+計529成功・失敗0。
+変更がないfacet21件、照合部品17件、folder scan45件、mtime6件の89実行を再利用し、
+最新の有効なtargetedは**618成功実行・重複除外596件・失敗0**となる。
+
+起動復元3件の期待は変更せず、全startup回帰を成功させた。四つのfixtureも元のitems／
+入力受付／一回だけreloadのassertを維持して成功。UIからprivate pollを呼んだ補完初回の
+コンパイル失敗は、`#[cfg(test)]`だけの既存ownerへの委譲入口で修正し、製品visibilityは維持。
+その限定follow-upは最終ACCEPT。失敗compileのログを保存し、テスト実行失敗と混同しない。
+
+fmt、通常／portable core check、glyph検査（問題0）は最新sourceで全成功。
+ログは `target/nextlist-supplement-*.log`、各終了コードは同名`-exit.txt`に保存。
+参照: [RAW354件](../target/nextlist-supplement-raw-r2.log)、
+[startup73件](../target/nextlist-supplement-startup.log)、
+[reload72件](../target/nextlist-supplement-reload.log)、
+[ZIP21件](../target/nextlist-supplement-section1353.log)、
+[通常check](../target/nextlist-supplement-normal-check.log)、
+[portable check](../target/nextlist-supplement-portable-check.log)。
+
+未到達vendorの初回補完はegui25件、egui-wgpu11件、eframe18件の全54件成功、各exit0。
+最新sourceの `build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` は通常profileで成功、exit0。
+portable featureは使わず、起動・既存アプリ停止・APPDATA変更は行っていない。
+元のfull一回はexit101のまま保存しており、上記補完をfull再実行／full PASSと表記しない。
+
+### 最終引継ぎ（2026-10-12）
+
+初回full失敗48件と補完成功のcrate＋qualified test nameを照合し、全48件を被覆、未被覆0件。
+名前に`raw`を含まない `thumb_loader::tests::remote_cr2_preview_is_available_from_zip_bytes` は
+exact filter一件で追加成功した。sourceは変更せず、dev／fmt／check等の有効結果を再利用した。
+補完targeted＋初回vendorの合計は583成功・失敗0・既存無視1、重複除外577件。
+変更がない関連89実行も合わせた有効結果は672成功実行・重複除外650件
+（targeted618／596件、vendor54件）。
+
+最新devはcore16分46秒、remote0.68秒、EPUB worker0.56秒で成功。worker二件は変更がなく
+有効cacheを使用。core／remote／EPUBの3exeと最終VCRT runtime4／PE3成功を確認した。
+coreは2026-10-12 22:19:31 JST生成、324,525,568 bytes、SHA-256
+`A0F2D626577EFF9395442DDD0071567F510CDD4718E5F0995363292C390AD4BB`。
+ログ: [最新dev](../target/nextlist-supplement-build-dev.log)、
+[CR2 exact一件](../target/nextlist-supplement-missing-cr2.log)、
+[VCRT report](../target/vcrt-pe-reports/dev-runtime.json)。
+
+限定最終コードレビューはACCEPT。コミット・アプリ起動・既存アプリ停止・ユーザーの
+APPDATA profileへの変更は行っていない。§1.375は初期採用provenance、§1.373は現在の本への
+appendと観測先着について、各設計書の判断点で停止したまま。両項目の製品修正は未完了。
+最終 `git diff --check` は成功。文書7件のUTF-8を確認し、既存BOMを保持した。
+HEADは `3bfbf1989` のまま。変更範囲は上記Rust8・文書7・manual1、未コミット。

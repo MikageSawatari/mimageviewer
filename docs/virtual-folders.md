@@ -8,6 +8,9 @@ Backspace の帰路だけ新ツリーへ合わせる。Collection／Smart／検�
 親の root へ配送せず、その子を既存 owner で更新する。変換済み書庫は論理 source と
 mounted backing を保持する。PDF の page cursor と履歴再入場の root 規則は維持する。
 検索 hit drill は途中 batch のヒット不足では戻さず、完全な結果の確定後だけ祖先／一覧へ戻す。
+facet の手動復元は有効な帰路 frame 一件だけを消費し、新しい実効親の無条件 frame は残す。
+階層消失と wrapper collapse が重なる場合、実際の祖先 scope に保存した条件を復元し、
+route の位置番号によって外側の条件まで復元しない。
 
 ## 本別見開き調整のscope/転送とRemote（§1.364 D1–D3、未リリース）
 

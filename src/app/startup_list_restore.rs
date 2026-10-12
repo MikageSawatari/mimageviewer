@@ -475,10 +475,10 @@ impl App {
         }
         if !matches!(
             intent,
-            StartupListIntent::ExplicitList
-                | StartupListIntent::RestoreList { .. }
-                | StartupListIntent::RefreshList { .. }
+            StartupListIntent::ExplicitList | StartupListIntent::RestoreList { .. }
         ) {
+            // Refreshes retain the explicit startup target; cursor capture belongs to
+            // the existing same-target departure/exit boundary, as for PreservePresentation.
             self.settings.save();
             return;
         }

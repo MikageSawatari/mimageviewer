@@ -1,15 +1,20 @@
 ﻿# §1.373 本棚への追加直後の一回取り消し
 
-2026-10-12、`next-list` / `ea060b66e` 基点。**設計レビュー待ち・未実装**。
+2026-10-12、`next-list` / `ea060b66e` 設計基点、実装基点 `3bfbf1989`。
+**R3 設計 ACCEPT後、通常の自己通知経路で設計前提不足が判明。R4 設計判断待ち・製品未接続**。
 正本項目: [next-release-backlog.md §1.373](next-release-backlog.md#1373-本棚ツールバーの右クリックで本棚へ追加した操作を-ctrlz-で取り消す--利用者の要望-2026-10-11)。
-アプリは起動していない。実ファイルの削除を行う実装には着手しない。
+アプリは起動していない。利用者の実装指示で試作を開始したが、下記R4の判断が必要なため
+製品への接続を撤回し、未検証の試作を`target`へ退役した。
 
 `001a0dabf` の独立設計レビューは **REVISE**。本改訂は coordinator 判断を優先して
 P1-1 の過剰な同定を撤去し、P1-2 の既存 book operation owner への統合、P2 の失効入口を
-確定した再レビュー用。ごみ箱方式は利用者決定済み (2026-10-12)。設計は再レビュー待ち・未実装。
+確定した再レビュー用。ごみ箱方式は利用者決定済み (2026-10-12)。
 
 R2 (`1c313a2ec`) の **REVISE** を反映。新規Busy条件を `UndoAppend` に限定し、
 ごみ箱への実移動は `PostDeleteItem` の結果で判定する。既存本操作の受付規則は変えない。
+
+R3 **ACCEPT** 後、利用者が実装を指示。試作中に判明したR4の通常経路は、
+R3の承認範囲では所有と受付仕様を決められないため、根本設計の判断に戻す。
 
 ## 1. 正本の前提と実装の差異
 
@@ -230,5 +235,85 @@ worker result受信→UI purge反映の間も同じbook pendingで受付が閉�
 瞬間的な同bytes別object差し替えを必須試験／新APIの動機にしない (**既定の割り切り方針による**)。
 membership は統合された場合に専用回帰を追加。
 
-検証所有者: 実装担当。targeted、fmt、通常／portable core check、項目末尾 full gate 一回。
-今回: テスト追加 0 件、実行 0 件、build 0 件。アプリ起動・コミットなし。
+検証所有者: root実装担当が集約。targeted、fmt、通常／portable core check、項目末尾 full gate 一回。
+§1.373の試作にcargo／fmt／build検証は行っていない。アプリ起動・コミットなし。
+下記R4の設計判断前に製品への接続・実ごみ箱操作の検証を進めない。
+
+## 6. 退役した実装試作 (2026-10-12、製品未接続・未検証)
+
+- `BookAppendSummary.undo_files` はworkerで実際に書いた全pathと完全精度のmtime／size、
+  前後の直下構成照合から作る。説明できない外部差分や採取失敗は追加成功を保ちreceiptだけ作らない。
+- 追加のファイル書込み結果は`AppendFilesWritten`として同じ`book_op_pending`へ戻す。
+  pollの同UI呼出しで既存local-adjust FIFO fenceを発行し、そのreceiverをmetadata copy workerへ
+  渡す。既存の成功受信時点に受理済みの書込みcutを維持し、UIでwaitしない。
+  receiverの交代中も同intent／operation ID／context／revisionを保持する。
+  `copy_append_metadata_at`が既存8storeのfull-edit／semantic copyを完了してから
+  `Append`終端を返し、UIは返されたpresence／cacheだけを更新する。
+  copy失敗は生成ページを残して通知し、receiptを公開しない。
+- `book_append_undo` はreceiptとworker検証・ごみ箱移動・成功pathだけのguarded purgeを所有。
+  root／本folderと祖先のreparseを拒否し、全対象の照合が終わってからShellへexact pathsを渡す。
+  新hash計算・handle保持・rollback・retry・部分resumeは追加しない。
+- `delete_worker::recycle_required` は既存COM chunk helperのごみ箱必須policyを使う。
+  `FOFX_RECYCLEONDELETE`／`FOF_NOERRORUI`／`FOFX_EARLYFAILURE`で要求し、
+  per-item sinkは完全削除の`PreDeleteItem`を拒否する。各exact sourceの`PostDeleteItem`
+  成功かつnon-null recycle itemだけを成功分へ含める。path消失、全体HRESULT、callback欠落を
+  ごみ箱成功の代わりにしない。一般Deleteのflags／成功規則は従来どおり。
+- `KeyAction::UndoLastAction` (Global／Press、既定Ctrl+Z) がappend receiptとメタUndoの
+  共通入口。ファイル操作をmetadata `UndoStack`へ積まず、追加のRedoはない。
+- worker／pure回帰は出力範囲、全件検証先行、外部構成変更、初期／事後差分、空receipt、
+  部分成功purge、callback成功／失敗／NULL／欠落を対象にする。受付とcontextの回帰はApp側で集約。
+
+## 7. R4: 現在の本への追加とfolder watcher通知の先着 (2026-10-12、設計判断待ち)
+
+### コードから判明した通常経路
+
+`App::check_external_folder_changes`は、現在の実folderのmtime、またはwatcherのNotifiedを
+受けて`start_external_rescan`を呼ぶ。既存の抑止は一般Deleteの`delete_pending`であり、
+追加の`book_op_pending`は抑止に含まれない。既に受理済みのscan完了も
+`poll_external_rescan_pending`のowner/context/items-generation照合を通り、
+`apply_external_rescan`が内容signatureの変更を見て既存のreload／fullscreen後reloadへ配送する。
+
+そのため、**現在の本へclipboard／capture等を追加する通常操作**では、今回の書込み自身が
+folder変更を通知し、`AppendFilesWritten`受信→metadata copy worker→`Append`終端より先に
+一般rescan／source一覧置換が受理・採用され得る。R3 §3.2では一般source置換を受付時に
+receipt revisionの失効境界としている。このまま接続すると、通常の追加なのに自分の通知で
+受付revisionが進み、成功receiptを公開できない、または直後に失効する経路が残る。
+これは実行観測ではなく、上記のsource inspectionから判明した順序である。
+
+単に「本操作pending中」「同じpath」「短い時間窓」を理由に一般rescanを自分の更新とする
+方法は採らない。同時に外部で追加／削除／改名／上書きされた変更を自分のappendと誤分類する。
+callback／検証を変更して末尾のCtrl+Zだけを通す症状パッチもしない。
+
+### 未採用の設計候補と費用
+
+1. **captured target folderを既存`Append` intentへ追加し、同folderへの自動観測をappend終端へ
+   配送する案**。要求入口と先着済みscanの採用入口の両方で、exact folderとoperation IDを
+   照合する。metadata copy終端でreceiptの全構成stampも照合し、説明できない外部差分は
+   tokenを作らず一般refreshへ返す。専用pending ownerは追加しない。
+   ただし、対象folderの外部変更表示が追加中は遅れる。この通常経路の非同期受付変更は
+   R3の「新規排他はUndoAppendだけ」と区別した仕様合意が必要であり、未採用。
+2. **観測を延期せず、既存のsource観測ownerがappendの自己差分を証明する案**。
+   初期の全物理構成と、各scanのreceipt差分を同operationへ相関させる必要がある。
+   §1.375の初期代表provenanceは別の設計判断待ちなので、その未接続基盤を暗黙の前提にしない。
+   同案を採るなら、先着／後着／混在観測の所有と追加範囲を別途レビューする。
+3. 追加全体のmodal化は§3で検討して退けた案。通常の閲覧・移動を制限するため、
+   今回の実装担当だけで変更しない。
+
+### 停止点と再開条件
+
+R4の判断が付くまで、新しいcaptured target field、watcher／rescanの延期、一般refreshの
+自己操作除外は実装しない。試作のApp fields／Undo入口／producer gate／typed refresh接続を
+撤回し、既存製品の受付規則を維持する。
+退役記録は`target/section1373-integration-prototype.patch`と
+`target/section1373-prototype/`の実ファイルcopy。これは未検証の途中差分であり、
+製品仕様の正本・適用済み変更・検証証跡とは扱わない。
+
+再開時は候補の採否と費用を設計所有者が決め、独立レビューでR3との差分を確認する。
+最低限、現在の本への単枚／clipboard／capture追加で通知がFilesWrittenより先、metadata中、
+成功終端後に来る三つの順序、既存scan先着、外部追加／削除との混在、fullscreen後の
+deferred refreshをhandler回帰へ追加する。通常の自分appendだけはUndo可能、外部混在は
+stampまたは明示失効で拒否し、別のmetadata Undoを同入力で続けて実行しないことを検査する。
+
+退役前の worker／receipt／Shell 部分は独立コードレビューで重要所見なし。App接続は
+未完成・未検証であり、この部分レビューを製品の§1.373全体 ACCEPTとは扱わない。
+瞬間的な同stamp差替えは既定の割り切り方針による。今回の製品差分には新Undo入口を残さない。

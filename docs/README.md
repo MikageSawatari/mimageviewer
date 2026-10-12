@@ -8,9 +8,9 @@
 
 | ドキュメント | 読むべきタイミング |
 | --- | --- |
-| [section353-zip-refresh-location-plan.md](section353-zip-refresh-location-plan.md) | §1.353 ZIP の現在 prefix、Collection／Smart／Search 等の root・物理子更新配送、collapse とfacet／親stack。R2 設計 ACCEPT、実装・targeted/check成功。fullはrelease入力不足で未完了 |
-| [section375-operation-reconcile-plan.md](section375-operation-reconcile-plan.md) | §1.375 操作ID・raw rowsと表示投影の照合、contextごとの監視購読、通知kind/path。第一段はDelete、第二段は改名・move・copy。§1.314 維持の R2 REVISE 反映・再レビュー待ち |
-| [section373-book-append-undo-plan.md](section373-book-append-undo-plan.md) | §1.373 追加直後一回のUndo。既存book_op_pendingへ統合、失効producer、瞬間競合の既定割り切り、ごみ箱方式は利用者決定済み、UndoAppend 限定排他・実移動確認。REVISE反映・再レビュー待ち |
+| [section353-zip-refresh-location-plan.md](section353-zip-refresh-location-plan.md) | §1.353 ZIP の更新位置。facet帰路・起動復元を修正、回帰9件追加、独立最終ACCEPT。targeted618実行／596件・vendor54件・fmt・通常／portable check・最新dev成功。full一回exit101の失敗48件を全補完、再実行なし |
+| [section375-operation-reconcile-plan.md](section375-operation-reconcile-plan.md) | §1.375 第一段Delete。R3 ACCEPT後に初期表示・自動代表proofの前提矛盾を確認。backend未接続、既存の遅延探索を維持する採用境界の設計判断待ち。§1.314維持 |
+| [section373-book-append-undo-plan.md](section373-book-append-undo-plan.md) | §1.373 R3 ACCEPT。本追加直後一回のUndo、ごみ箱は決定済み、実移動確認・UndoAppendだけの新規排他。R3後に本を表示中の自己通知先着との前提矛盾を確認。R4設計判断待ち、実装候補は退避 |
 | [async-log-writer-plan.md](async-log-writer-plan.md) | §1.356 通常／perfの同期ログI/OによるUI・stderr reader停止。単一writer、有界queue・欠落、重要診断、終了flush、診断ZIP workerの完了barrier、解析gateの保存証明／判定不能。2026-10-09利用者決定済み・実装／検証記録 |
 | [details-name-color-plan.md](details-name-color-plan.md) | 詳細一覧の名前色。フォルダ黄系・六分類、標準カスタム/強め固定、選択/チェック共通色、切り取り不透明と設定保存・検証 |
 | [raw-libraw-plan.md](raw-libraw-plan.md) | RAW の内蔵現像、プレビュー差し替え・編集 gate・Remote・設定・配布を触るとき |

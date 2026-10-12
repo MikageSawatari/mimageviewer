@@ -12,7 +12,7 @@ pub(crate) enum ScanMediaKind {
     Audio,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct ScannedFolderEntry {
     pub(crate) item: GridItem,
     pub(crate) display_meta: Option<(i64, i64)>,
@@ -26,6 +26,113 @@ pub(crate) struct ScannedMediaEntry {
     pub(crate) mtime: i64,
     pub(crate) file_size: i64,
     pub(crate) sort_meta: crate::settings::ListingSortMetadata,
+}
+
+/// Full precision scan evidence is distinct from the released seconds-based display metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ObservedEntryStamp {
+    pub(crate) kind: crate::fs_entry::DirEntryKind,
+    pub(crate) modified: Option<std::time::SystemTime>,
+    pub(crate) size: Option<u64>,
+    pub(crate) readonly: Option<bool>,
+}
+
+impl ObservedEntryStamp {
+    pub(crate) fn from_metadata(
+        kind: crate::fs_entry::DirEntryKind,
+        metadata: Option<&std::fs::Metadata>,
+    ) -> Self {
+        Self {
+            kind,
+            modified: metadata.and_then(|meta| meta.modified().ok()),
+            size: metadata.map(|meta| if kind.is_directory() { 0 } else { meta.len() }),
+            readonly: metadata.map(|meta| meta.permissions().readonly()),
+        }
+    }
+
+    pub(crate) fn same_listing(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.size == other.size
+            && self.readonly == other.readonly
+            && (self.kind.is_directory() || self.modified == other.modified)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RawFolderSnapshot {
+    pub(crate) complete: bool,
+    pub(crate) folders: Vec<ScannedFolderEntry>,
+    pub(crate) all_media: Vec<ScannedMediaEntry>,
+    pub(crate) auxiliary_media: AuxiliaryMediaCandidates,
+    pub(crate) observations: std::collections::BTreeMap<PathBuf, ObservedEntryStamp>,
+    pub(crate) entry_file_names_ci: std::collections::HashSet<String>,
+    pub(crate) omitted: OmittedFolderEntryCounts,
+    pub(crate) complete_audio_inventory: Option<std::collections::HashSet<String>>,
+}
+
+impl RawFolderSnapshot {
+    /// Removes only exact successful sources. A recreated same-name file is not explained by this.
+    pub(crate) fn without_sources(&self, sources: &std::collections::HashSet<PathBuf>) -> Self {
+        let mut expected = self.clone();
+        expected.folders.retain(|entry| {
+            !entry
+                .item
+                .drag_source_path()
+                .is_some_and(|path| sources.contains(path))
+        });
+        expected
+            .all_media
+            .retain(|entry| !sources.contains(&entry.path));
+        expected
+            .auxiliary_media
+            .entries
+            .retain(|entry| !sources.contains(&entry.path));
+        expected
+            .observations
+            .retain(|path, _| !sources.contains(path));
+        for path in sources {
+            if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                expected.entry_file_names_ci.remove(&name.to_lowercase());
+                if let Some(inventory) = expected.complete_audio_inventory.as_mut() {
+                    inventory.remove(&name.to_lowercase());
+                }
+            }
+        }
+        expected
+    }
+
+    pub(crate) fn same_listing(&self, actual: &Self) -> bool {
+        self.complete
+            && actual.complete
+            && self.omitted == actual.omitted
+            && self.observations.len() == actual.observations.len()
+            && self.observations.iter().all(|(path, stamp)| {
+                actual
+                    .observations
+                    .get(path)
+                    .is_some_and(|other| stamp.same_listing(other))
+            })
+            && raw_row_kinds(self) == raw_row_kinds(actual)
+    }
+}
+
+fn raw_row_kinds(snapshot: &RawFolderSnapshot) -> std::collections::BTreeMap<PathBuf, String> {
+    snapshot
+        .folders
+        .iter()
+        .filter_map(|entry| {
+            Some((
+                entry.item.drag_source_path()?.to_path_buf(),
+                format!("{:?}", entry.item),
+            ))
+        })
+        .chain(
+            snapshot
+                .all_media
+                .iter()
+                .map(|entry| (entry.path.clone(), format!("{:?}", entry.kind))),
+        )
+        .collect()
 }
 
 /// 通常フォルダ一覧を作るときに、物理フォルダ内には存在するが一覧へ出さなかった項目数。
@@ -82,7 +189,12 @@ pub(crate) fn is_system_metadata_name(name: &str) -> bool {
 /// フル機能ウィンドウの直接ロードでは `scan_directory` を UI スレッドで呼ぶ経路も残る。
 /// 複数ウィンドウの grid Folder 候補は worker で生成し、画像本と確定した結果だけを
 /// detached context へ移譲する。
+#[derive(Clone, Default)]
 pub(crate) struct ScannedDir {
+    /// Immutable, pre-projection observations. Never reconstruct these from visible items.
+    pub(crate) raw: std::sync::Arc<RawFolderSnapshot>,
+    /// Optional worker-prepared projection; the UI only consumes this payload.
+    pub(crate) prepared: Option<Box<super::folder_reconcile::PreparedFolderScanInputs>>,
     pub(crate) complete_audio_inventory: Option<std::collections::HashSet<String>>,
     /// Folder / ZipFile / PdfFile / ConvertibleArchive と、表示用metadata・一覧sort用metadata。
     /// load_folder 内で3本を同じ順序へ並べ替える。
@@ -97,7 +209,7 @@ pub(crate) struct ScannedDir {
     pub(crate) auxiliary_media: AuxiliaryMediaCandidates,
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct AuxiliaryMediaCandidates {
     entries: Vec<ScannedMediaEntry>,
 }
@@ -147,6 +259,7 @@ impl AuxiliaryMediaCandidates {
 /// App::load_folder と remote IPC の通常フォルダ一覧 / 読書位置再計算が
 /// この同じ pure helper を使う。表示対象・sort・重複除外を変える場合はここだけを変更し、
 /// remote 側に別のオーケストレーションを増やさない。
+#[derive(Clone)]
 pub(crate) struct MaterializedFolderListing {
     pub(crate) items: Vec<GridItem>,
     pub(crate) metas: Vec<Option<(i64, i64)>>,
@@ -165,6 +278,7 @@ pub(crate) struct MaterializedFolderListing {
     pub(crate) rating_order: FolderRatingOrder,
 }
 
+#[derive(Clone)]
 pub(crate) enum FolderRatingOrder {
     Standard,
     Prepared {
@@ -671,6 +785,8 @@ pub(crate) fn is_image_only_book_contents(
 pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
     scan_directory_with_convertible_archives(path, true, true, false).unwrap_or_else(|_| {
         ScannedDir {
+            raw: Default::default(),
+            prepared: None,
             complete_audio_inventory: None,
             folders: Vec::new(),
             all_media: Vec::new(),
@@ -796,6 +912,8 @@ where
     let mut all_media: Vec<ScannedMediaEntry> = Vec::new();
     let mut omitted = OmittedFolderEntryCounts::default();
     let mut complete_audio_inventory = Some(std::collections::HashSet::new());
+    let mut observations = std::collections::BTreeMap::new();
+    let mut classification_complete = true;
     let mut entry_file_names_ci: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     for entry in entries {
@@ -818,6 +936,7 @@ where
         let kind = match entry.file_type() {
             Ok(ft) => crate::fs_entry::classify_dir_entry(&entry, &ft),
             Err(_) => {
+                classification_complete = false;
                 complete_audio_inventory = None;
                 crate::fs_entry::DirEntryKind::Other
             }
@@ -853,6 +972,10 @@ where
                 continue;
             }
             let meta = entry.metadata().ok();
+            observations.insert(
+                p.clone(),
+                ObservedEntryStamp::from_metadata(kind, meta.as_ref()),
+            );
             let mtime = meta
                 .as_ref()
                 .map_or(0, |m| crate::ui_helpers::mtime_secs(m));
@@ -869,6 +992,10 @@ where
         {
             let ext_lower = ext.to_ascii_lowercase();
             let meta = entry.metadata().ok();
+            observations.insert(
+                p.clone(),
+                ObservedEntryStamp::from_metadata(kind, meta.as_ref()),
+            );
             let mtime = meta
                 .as_ref()
                 .map_or(0, |m| crate::ui_helpers::mtime_secs(m));
@@ -948,7 +1075,34 @@ where
     }
     let auxiliary_media =
         AuxiliaryMediaCandidates::capture(&all_media, policy, &entry_file_names_ci);
+    let candidate_paths = folders
+        .iter()
+        .filter_map(|entry| entry.item.drag_source_path())
+        .map(std::path::Path::to_path_buf)
+        .chain(all_media.iter().map(|entry| entry.path.clone()))
+        .collect::<std::collections::HashSet<_>>();
+    observations.retain(|path, _| {
+        candidate_paths.contains(path)
+            || path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().to_lowercase().ends_with(".miv.json"))
+    });
+    let raw = std::sync::Arc::new(RawFolderSnapshot {
+        complete: classification_complete
+            && observations
+                .values()
+                .all(|stamp| stamp.modified.is_some() && stamp.size.is_some()),
+        folders: folders.clone(),
+        all_media: all_media.clone(),
+        auxiliary_media: auxiliary_media.clone(),
+        observations,
+        entry_file_names_ci,
+        omitted,
+        complete_audio_inventory: complete_audio_inventory.clone(),
+    });
     let mut scan = ScannedDir {
+        raw,
+        prepared: None,
         complete_audio_inventory,
         folders,
         all_media,
@@ -956,7 +1110,7 @@ where
         auxiliary_media,
     };
     project_scanned_directory(&mut scan, policy);
-    filter_upscaled_video_pairs_fast(&mut scan.all_media, &entry_file_names_ci);
+    filter_upscaled_video_pairs_fast(&mut scan.all_media, &scan.raw.entry_file_names_ci);
     Ok(scan)
 }
 
@@ -1381,6 +1535,8 @@ impl FolderScanSignature {
 /// 上書きされた場合は差分検知できず再ロードがスキップされる。画像ファイルが
 /// 偶然同サイズで <1 秒以内に書き換わる現実的なシナリオは稀なため許容している。
 /// 必要なら `metadata.modified()` の SystemTime を秒+nanos で取り直す拡張が可能。
+/// §1.375 reconciliation uses RawFolderSnapshot full-precision observations instead; this
+/// Copy signature is retained for legacy navigation/rating/Stack callers only.
 pub(crate) fn signature_from_scan(scan: &ScannedDir) -> FolderScanSignature {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -1496,6 +1652,8 @@ pub(crate) mod signature_tests {
         })
         .collect();
         ScannedDir {
+            raw: Default::default(),
+            prepared: None,
             complete_audio_inventory: None,
             folders,
             all_media,
@@ -1895,6 +2053,8 @@ mod page_count_tests {
         db.set_user_rating(&key("z.jpg"), 5, None).unwrap();
         db.set_user_rating(&key("a.jpg"), 4, None).unwrap();
         let scan = || ScannedDir {
+            raw: Default::default(),
+            prepared: None,
             complete_audio_inventory: None,
             folders: Vec::new(),
             all_media: ["a.jpg", "z.jpg", "x.jpg", "x.png"]
@@ -2012,6 +2172,8 @@ mod page_count_tests {
             sort_meta: crate::settings::ListingSortMetadata::new(7, known.then_some(file_size)),
         };
         let scan = || ScannedDir {
+            raw: Default::default(),
+            prepared: None,
             complete_audio_inventory: None,
             folders: vec![ScannedFolderEntry {
                 item: GridItem::Folder(PathBuf::from(r"C:\sizes\child")),

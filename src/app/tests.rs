@@ -17298,6 +17298,7 @@ mod phase_c_key_tests {
         let mut app = setup_stack_refresh_key_app();
         assert!(grid_key_nav(&mut app, egui::Modifiers::NONE, egui::Key::Escape).is_none());
         assert!(!app.stack_mode_requested);
+        super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
         assert!(app.grid_item_input_allowed());
     }
 
@@ -19290,6 +19291,8 @@ mod folder_pane_open_nav_tests {
 
     fn empty_scan() -> ScannedDir {
         ScannedDir {
+            raw: Default::default(),
+            prepared: None,
             auxiliary_media: Default::default(),
             complete_audio_inventory: None,
             folders: Vec::new(),
@@ -22796,6 +22799,8 @@ mod phase_c_folder_nav_history_tests {
                 panic!("fixture expected folder preflight");
             };
             let mut scan = crate::app::folder_scan::ScannedDir {
+                raw: Default::default(),
+                prepared: None,
                 auxiliary_media: Default::default(),
                 folders: Vec::new(),
                 all_media: Vec::new(),
@@ -23522,6 +23527,88 @@ mod phase_c_folder_nav_history_tests {
     }
 
     #[test]
+    fn section1353_disappeared_level_with_root_collapse_restores_actual_parent_facet() {
+        use crate::app::FacetScope;
+
+        for manual in [false, true] {
+            let mut app = setup_app();
+            app.active_quick_folder_slot = None;
+            app.settings.sidecar_backup_enabled = false;
+            app.settings.auto_fullscreen_zip_pdf = false;
+            let parent = app.tmp.path().join("refresh-collapse-parent");
+            std::fs::create_dir_all(&parent).unwrap();
+            let book = parent.join("book.zip");
+            section1353_write_zip(&book, &["root.jpg", "A/cover.jpg", "A/sub/1.jpg"]);
+            app.load_folder(parent);
+            finish_staged_physical_history_for_test(&mut app);
+            app.settings.facet_filter.exts.insert("zip".into());
+            let outer_filter = app.settings.facet_filter.clone();
+            assert!(
+                app.start_grid_virtual_open(crate::app::GridVirtualOpenIntent {
+                    path: book.clone(),
+                    source: crate::app::GridVirtualOpenSource::Direct,
+                    effects: crate::app::GridVirtualOpenEffects {
+                        auto_fullscreen: false,
+                        suppress_rating_filter: false,
+                        suppress_facet_filter: true,
+                        reading_history_return_from: None,
+                    },
+                })
+            );
+            finish_staged_physical_history_for_test(&mut app);
+            app.settings.facet_filter.exts.insert("gif".into());
+            app.zip_nav_enter("A/");
+            finish_staged_physical_history_for_test(&mut app);
+            app.settings.facet_filter.exts.insert("png".into());
+            let parent_filter = app.settings.facet_filter.clone();
+            app.zip_nav_enter("A/sub/");
+            finish_staged_physical_history_for_test(&mut app);
+            if manual {
+                assert!(app.restore_facet_filter_suppression());
+                assert_eq!(app.settings.facet_filter, parent_filter);
+            }
+            app.settings.facet_filter = crate::settings::FacetFilter::default();
+            app.settings.facet_filter.exts.insert("jpg".into());
+            let child_filter = app.settings.facet_filter.clone();
+            let history = app.folder_nav_history_snapshot();
+            section1353_write_zip(&book, &["A/cover.jpg"]);
+            app.reload_top_level_grid(&egui::Context::default());
+            finish_staged_physical_history_for_test(&mut app);
+            let nav = app.zip_nav.as_ref().unwrap();
+            assert_eq!(nav.current().join("/"), "A");
+            assert_eq!(nav.effective_levels(), &[vec!["A".to_owned()]]);
+            assert_eq!(app.items.len(), 1);
+            assert_eq!(app.items[0].name(), "cover.jpg");
+            assert_eq!(
+                app.settings.facet_filter,
+                if manual { child_filter } else { parent_filter }
+            );
+            assert_eq!(
+                app.facet_navigation.route().current(),
+                Some(&FacetScope::book(&book, "A"))
+            );
+            let book_scopes = app
+                .facet_navigation
+                .route()
+                .0
+                .iter()
+                .filter(|scope| matches!(scope, FacetScope::Book { .. }))
+                .collect::<Vec<_>>();
+            assert_eq!(book_scopes, vec![&FacetScope::book(&book, "A")]);
+            assert_eq!(app.facet_navigation.saved_frame_count(), 1);
+            assert_eq!(app.facet_navigation.saved_filter(0), &outer_filter);
+            assert_eq!(app.folder_nav_back_stack, history.back_stack);
+            assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+            assert!(
+                !app.zip_nav_back(),
+                "collapsed root has no internal Backspace parent"
+            );
+            assert_eq!(app.folder_nav_back_stack, history.back_stack);
+            assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+        }
+    }
+
+    #[test]
     fn section1353_refresh_cancel_and_stale_results_keep_the_current_location() {
         let mut app = setup_app();
         app.active_quick_folder_slot = None;
@@ -23549,6 +23636,249 @@ mod phase_c_folder_nav_history_tests {
         finish_staged_physical_history_for_test(&mut app);
         assert_eq!(app.current_folder.as_ref(), Some(&other));
         assert!(app.zip_nav.is_none());
+    }
+
+    #[test]
+    fn section1353_collection_missing_prefix_restores_synthetic_zip_root_facet() {
+        use crate::collection_store::{
+            CollectionRegistration, CollectionResolvedKind, CollectionStoreRuntime,
+        };
+
+        for (old_collapsed, new_collapsed, deep, preserved, preserve_parent) in [
+            (false, false, false, false, false),
+            (false, true, false, false, false),
+            (true, true, false, false, false),
+            (true, false, false, false, false),
+            (false, true, true, false, false),
+            (false, false, true, false, false),
+            (false, true, true, true, false),
+            (false, true, true, true, true),
+        ] {
+            for manual in [false, true] {
+                let mut app = setup_app();
+                app.active_quick_folder_slot = None;
+                app.settings.auto_fullscreen_zip_pdf = false;
+                app.settings.sidecar_backup_enabled = false;
+                let book = app.tmp.path().join("collection-refresh-root.zip");
+                section1353_write_zip(
+                    &book,
+                    if old_collapsed {
+                        &["A/cover.jpg", "A/sub/1.jpg"]
+                    } else if deep {
+                        &["root.jpg", "A/cover.jpg", "A/sub/1.jpg"]
+                    } else {
+                        &["root.jpg", "A/1.jpg", "B/2.jpg"]
+                    },
+                );
+                let runtime =
+                    CollectionStoreRuntime::start_at(app.tmp.path().join("collection-refresh.db"))
+                        .unwrap();
+                let client = runtime.client();
+                app.install_collection_runtime(runtime);
+                let ctx = egui::Context::default();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !matches!(app.collection_store_client_for_read(), Ok(Some(_))) {
+                    assert!(std::time::Instant::now() < deadline);
+                    app.poll_collection_ui(&ctx);
+                    std::thread::yield_now();
+                }
+                let created = client
+                    .create_collection("Refresh synthetic root".into())
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .unwrap()
+                    .unwrap();
+                let snapshot = client
+                    .add_batch(
+                        created.collection_id(),
+                        created.revision(),
+                        vec![
+                            CollectionRegistration::from_trusted_path(
+                                &book,
+                                CollectionResolvedKind::Zip,
+                            )
+                            .unwrap(),
+                        ],
+                    )
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .unwrap()
+                    .unwrap()
+                    .snapshot;
+                app.open_collection_grid(snapshot.collection_id(), None);
+                loop {
+                    app.poll_collection_ui(&ctx);
+                    app.poll_collection_grid(&ctx);
+                    app.poll_collection_history_transition(&ctx);
+                    app.poll_sidecar_restore(&ctx);
+                    let ready =
+                        app.top_level_grid_view
+                            .collection_session()
+                            .is_some_and(|session| {
+                                session.identity.collection_id == snapshot.collection_id()
+                                    && matches!(
+                                session.load,
+                                crate::app::top_level_grid_view::CollectionGridLoadState::Ready(_)
+                            ) && session.installed_items_generation
+                                    == Some(app.items_generation)
+                            });
+                    if ready && !app.sidecar_restore_active() {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "Collection root did not settle"
+                    );
+                    std::thread::yield_now();
+                }
+                app.settings.facet_filter.exts.insert("zip".into());
+                let outer_filter = app.settings.facet_filter.clone();
+                let owner = app.collection_grid_physical_load_owner(0, &book).unwrap();
+                assert!(app.load_folder_with_scan_owned(
+                    book.clone(),
+                    None,
+                    crate::app::OpenRequestOwner::CollectionGridPhysical(owner),
+                    crate::app::StartupListIntent::ExplicitList,
+                ));
+                finish_staged_physical_history_for_test(&mut app);
+                let zip_root_route = app.facet_navigation.route().clone();
+                let mut physical_root_route = zip_root_route.clone();
+                while matches!(
+                    physical_root_route.current(),
+                    Some(crate::app::FacetScope::Book { .. })
+                ) {
+                    physical_root_route.0.pop();
+                }
+                assert_eq!(zip_root_route, physical_root_route);
+                let place = app.facet_place_path_for_idx(0).unwrap();
+                app.settings
+                    .facet_filter
+                    .place_keys
+                    .insert(crate::adjustment_db::normalize_path(&place));
+                let root_place_filter = app.settings.facet_filter.clone();
+                app.zip_nav_show_current_level(crate::app::StartupListIntent::PreservePresentation);
+                assert_eq!(app.facet_navigation.route(), &physical_root_route);
+                assert_eq!(app.settings.facet_filter, root_place_filter);
+                app.settings.facet_filter.place_keys.clear();
+                app.settings.facet_filter.exts.insert("png".into());
+                let zip_root_filter = app.settings.facet_filter.clone();
+                app.zip_nav_enter(if old_collapsed { "A/sub/" } else { "A/" });
+                finish_staged_physical_history_for_test(&mut app);
+                if old_collapsed {
+                    let child_route = app.facet_navigation.route().clone();
+                    assert!(app.zip_nav_back());
+                    assert_eq!(app.zip_nav.as_ref().unwrap().current().join("/"), "A");
+                    assert_eq!(app.facet_navigation.route(), &physical_root_route);
+                    assert_eq!(app.settings.facet_filter, zip_root_filter);
+                    assert_eq!(app.facet_navigation.saved_frame_count(), 1);
+                    app.zip_nav_enter("A/sub/");
+                    finish_staged_physical_history_for_test(&mut app);
+                    assert_eq!(app.facet_navigation.route(), &child_route);
+                    assert_eq!(app.facet_navigation.saved_frame_count(), 2);
+                }
+                if deep {
+                    app.settings.facet_filter.exts.insert("gif".into());
+                    app.zip_nav_enter("A/sub/");
+                    finish_staged_physical_history_for_test(&mut app);
+                }
+                if manual {
+                    assert!(app.restore_facet_filter_suppression());
+                    assert_eq!(
+                        app.settings
+                            .facet_filter
+                            .exts
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                        vec![if deep { "gif" } else { "png" }.to_owned()]
+                    );
+                }
+                app.settings.facet_filter = crate::settings::FacetFilter::default();
+                app.settings.facet_filter.exts.insert("jpg".into());
+                let child_filter = app.settings.facet_filter.clone();
+                let history = app.folder_nav_history_snapshot();
+                section1353_write_zip(
+                    &book,
+                    if preserve_parent {
+                        &["A/cover.jpg", "A/sub/1.jpg"]
+                    } else if preserved {
+                        &["A/sub/1.jpg"]
+                    } else {
+                        match (deep, new_collapsed) {
+                            (true, true) => &["A/new/1.jpg"],
+                            (true, false) => &["root.jpg", "A/new/1.jpg"],
+                            (false, true) => &["B/2.jpg"],
+                            (false, false) => &["root.jpg", "B/2.jpg"],
+                        }
+                    },
+                );
+                app.reload_top_level_grid(&ctx);
+                finish_staged_physical_history_for_test(&mut app);
+                let actual_prefix = if preserved {
+                    "A/sub"
+                } else if deep {
+                    "A/new"
+                } else if new_collapsed {
+                    "B"
+                } else {
+                    ""
+                };
+                assert_eq!(
+                    app.zip_nav.as_ref().unwrap().current().join("/"),
+                    actual_prefix
+                );
+                assert_eq!(
+                    app.zip_nav.as_ref().unwrap().at_root(),
+                    !deep || (new_collapsed && !preserve_parent)
+                );
+                let actual_route = if app.zip_nav.as_ref().unwrap().at_root() {
+                    physical_root_route.clone()
+                } else {
+                    physical_root_route.child(crate::app::FacetScope::book(&book, actual_prefix))
+                };
+                assert_eq!(app.facet_navigation.route(), &actual_route);
+                assert_eq!(
+                    app.settings.facet_filter,
+                    if preserved {
+                        child_filter
+                    } else if old_collapsed {
+                        crate::settings::FacetFilter::default()
+                    } else if manual {
+                        child_filter
+                    } else if deep {
+                        let mut filter = crate::settings::FacetFilter::default();
+                        filter.exts.insert("gif".into());
+                        filter
+                    } else {
+                        zip_root_filter
+                    }
+                );
+                assert_eq!(
+                    app.facet_navigation.saved_frame_count(),
+                    1 + usize::from(deep && (!new_collapsed || (preserve_parent && !manual)))
+                );
+                assert_eq!(app.facet_navigation.saved_filter(0), &outer_filter);
+                assert_eq!(app.folder_nav_back_stack, history.back_stack);
+                assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+                assert_eq!(
+                    app.zip_nav_back(),
+                    deep && (!new_collapsed || preserve_parent)
+                );
+                if deep && (!new_collapsed || preserve_parent) {
+                    assert_eq!(
+                        app.zip_nav.as_ref().unwrap().current().join("/"),
+                        if preserve_parent { "A" } else { "" },
+                    );
+                    assert_eq!(app.facet_navigation.route(), &physical_root_route);
+                    assert!(app.settings.facet_filter.exts.contains(if preserve_parent {
+                        if manual { "jpg" } else { "gif" }
+                    } else {
+                        "png"
+                    },));
+                }
+                app.shutdown_collection_runtime_for_exit();
+            }
+        }
     }
 
     #[test]
@@ -46420,6 +46750,7 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(app.folder_refresh_pending.as_ref(), Some(&folder));
         app.consume_folder_refresh_pending();
         assert!(app.folder_refresh_pending.is_none());
+        super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
         assert!(app.items.iter().any(|item| {
             matches!(item, GridItem::Image(path) if crate::folder_tree::path_eq(path, &output))
         }));
@@ -57957,6 +58288,7 @@ mod pipeline_cache_refactor_tests {
         app.consume_folder_refresh_pending();
 
         assert!(app.folder_refresh_pending.is_none());
+        super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
         assert!(app.items.iter().any(
             |item| matches!(item, GridItem::Image(path) if crate::folder_tree::path_eq(path, &added_image))
         ));
@@ -89808,6 +90140,188 @@ mod smart_folder_transition_tests {
                 crate::app::top_level_grid_view::SmartFolderPosition::Container { .. }
                     | crate::app::top_level_grid_view::SmartFolderPosition::Scoped { .. }
             ));
+        }
+    }
+
+    #[test]
+    fn section1353_smart_missing_prefix_restores_synthetic_zip_root_facet() {
+        for (old_collapsed, new_collapsed, deep, preserved, preserve_parent) in [
+            (false, false, false, false, false),
+            (false, true, false, false, false),
+            (true, true, false, false, false),
+            (true, false, false, false, false),
+            (false, true, true, false, false),
+            (false, false, true, false, false),
+            (false, true, true, true, false),
+            (false, true, true, true, true),
+        ] {
+            for manual in [false, true] {
+                let mut app = setup_app();
+                app.active_quick_folder_slot = None;
+                app.settings.auto_fullscreen_zip_pdf = false;
+                app.settings.sidecar_backup_enabled = false;
+                let source = app.tmp.path().join("smart-refresh-root-source");
+                std::fs::create_dir_all(&source).unwrap();
+                let book = source.join("book.zip");
+                let write_zip = |names: &[&str]| {
+                    let mut zip = zip::ZipWriter::new(std::fs::File::create(&book).unwrap());
+                    for name in names {
+                        zip.start_file(*name, zip::write::SimpleFileOptions::default())
+                            .unwrap();
+                        std::io::Write::write_all(&mut zip, b"page").unwrap();
+                    }
+                    zip.finish().unwrap();
+                };
+                write_zip(if old_collapsed {
+                    &["A/cover.jpg", "A/sub/1.jpg"]
+                } else if deep {
+                    &["root.jpg", "A/cover.jpg", "A/sub/1.jpg"]
+                } else {
+                    &["root.jpg", "A/1.jpg", "B/2.jpg"]
+                });
+                let definition = definition("Refresh synthetic root", source);
+                let id = definition.id;
+                app.settings.smart_folders = vec![definition];
+                let ctx = egui::Context::default();
+                app.open_smart_folder_staged(id, false);
+                wait_for_staged_smart_terminal(&mut app, &ctx);
+                app.settings.facet_filter.exts.insert("zip".into());
+                let outer_filter = app.settings.facet_filter.clone();
+                assert!(app.begin_staged_smart_drill(&book));
+                wait_for_staged_smart_terminal(&mut app, &ctx);
+                let zip_root_route = app.facet_navigation.route().clone();
+                let mut physical_root_route = zip_root_route.clone();
+                while matches!(
+                    physical_root_route.current(),
+                    Some(crate::app::FacetScope::Book { .. })
+                ) {
+                    physical_root_route.0.pop();
+                }
+                assert_eq!(zip_root_route, physical_root_route);
+                let place = app.facet_place_path_for_idx(0).unwrap();
+                app.settings
+                    .facet_filter
+                    .place_keys
+                    .insert(crate::adjustment_db::normalize_path(&place));
+                let root_place_filter = app.settings.facet_filter.clone();
+                app.zip_nav_show_current_level(crate::app::StartupListIntent::PreservePresentation);
+                assert_eq!(app.facet_navigation.route(), &physical_root_route);
+                assert_eq!(app.settings.facet_filter, root_place_filter);
+                app.settings.facet_filter.place_keys.clear();
+                app.settings.facet_filter.exts.insert("png".into());
+                let zip_root_filter = app.settings.facet_filter.clone();
+                app.zip_nav_enter(if old_collapsed { "A/sub/" } else { "A/" });
+                wait_for_staged_smart_terminal(&mut app, &ctx);
+                if old_collapsed {
+                    let child_route = app.facet_navigation.route().clone();
+                    assert!(app.zip_nav_back());
+                    assert_eq!(app.zip_nav.as_ref().unwrap().current().join("/"), "A");
+                    assert_eq!(app.facet_navigation.route(), &physical_root_route);
+                    assert_eq!(app.settings.facet_filter, zip_root_filter);
+                    assert_eq!(app.facet_navigation.saved_frame_count(), 1);
+                    app.zip_nav_enter("A/sub/");
+                    wait_for_staged_smart_terminal(&mut app, &ctx);
+                    assert_eq!(app.facet_navigation.route(), &child_route);
+                    assert_eq!(app.facet_navigation.saved_frame_count(), 2);
+                }
+                if deep {
+                    app.settings.facet_filter.exts.insert("gif".into());
+                    app.zip_nav_enter("A/sub/");
+                    wait_for_staged_smart_terminal(&mut app, &ctx);
+                }
+                if manual {
+                    assert!(app.restore_facet_filter_suppression());
+                    assert_eq!(
+                        app.settings
+                            .facet_filter
+                            .exts
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                        vec![if deep { "gif" } else { "png" }.to_owned()]
+                    );
+                }
+                app.settings.facet_filter = crate::settings::FacetFilter::default();
+                app.settings.facet_filter.exts.insert("jpg".into());
+                let child_filter = app.settings.facet_filter.clone();
+                let history = app.folder_nav_history_snapshot();
+                write_zip(if preserve_parent {
+                    &["A/cover.jpg", "A/sub/1.jpg"]
+                } else if preserved {
+                    &["A/sub/1.jpg"]
+                } else {
+                    match (deep, new_collapsed) {
+                        (true, true) => &["A/new/1.jpg"],
+                        (true, false) => &["root.jpg", "A/new/1.jpg"],
+                        (false, true) => &["B/2.jpg"],
+                        (false, false) => &["root.jpg", "B/2.jpg"],
+                    }
+                });
+                app.reload_top_level_grid(&ctx);
+                wait_for_staged_smart_terminal(&mut app, &ctx);
+                let actual_prefix = if preserved {
+                    "A/sub"
+                } else if deep {
+                    "A/new"
+                } else if new_collapsed {
+                    "B"
+                } else {
+                    ""
+                };
+                assert_eq!(
+                    app.zip_nav.as_ref().unwrap().current().join("/"),
+                    actual_prefix
+                );
+                assert_eq!(
+                    app.zip_nav.as_ref().unwrap().at_root(),
+                    !deep || (new_collapsed && !preserve_parent)
+                );
+                let actual_route = if app.zip_nav.as_ref().unwrap().at_root() {
+                    physical_root_route.clone()
+                } else {
+                    physical_root_route.child(crate::app::FacetScope::book(&book, actual_prefix))
+                };
+                assert_eq!(app.facet_navigation.route(), &actual_route);
+                assert_eq!(
+                    app.settings.facet_filter,
+                    if preserved {
+                        child_filter
+                    } else if old_collapsed {
+                        crate::settings::FacetFilter::default()
+                    } else if manual {
+                        child_filter
+                    } else if deep {
+                        let mut filter = crate::settings::FacetFilter::default();
+                        filter.exts.insert("gif".into());
+                        filter
+                    } else {
+                        zip_root_filter
+                    }
+                );
+                assert_eq!(
+                    app.facet_navigation.saved_frame_count(),
+                    1 + usize::from(deep && (!new_collapsed || (preserve_parent && !manual)))
+                );
+                assert_eq!(app.facet_navigation.saved_filter(0), &outer_filter);
+                assert_eq!(app.folder_nav_back_stack, history.back_stack);
+                assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+                assert_eq!(
+                    app.zip_nav_back(),
+                    deep && (!new_collapsed || preserve_parent)
+                );
+                if deep && (!new_collapsed || preserve_parent) {
+                    assert_eq!(
+                        app.zip_nav.as_ref().unwrap().current().join("/"),
+                        if preserve_parent { "A" } else { "" },
+                    );
+                    assert_eq!(app.facet_navigation.route(), &physical_root_route);
+                    assert!(app.settings.facet_filter.exts.contains(if preserve_parent {
+                        if manual { "jpg" } else { "gif" }
+                    } else {
+                        "png"
+                    },));
+                }
+            }
         }
     }
 

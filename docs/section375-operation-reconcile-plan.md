@@ -1,6 +1,6 @@
 ﻿# §1.375 自分のファイル操作の反映とフォルダ監視の照合
 
-2026-10-12、`next-list` / `ea060b66e` 基点。**設計レビュー待ち・未実装**。
+2026-10-12、`next-list` / `ea060b66e` 設計基点。**R3 ACCEPT 後の実装調査で前提の矛盾を確認・第一段の採用境界は未接続**。
 利用者の実機報告をソースで調査した。アプリは起動していない。
 正本項目: [next-release-backlog.md §1.375](next-release-backlog.md#1375-フォルダで-delete-キーで削除すると正しく消えた一覧がもう一度丸ごと読み直されてちらつく--利用者の実機報告-2026-10-12)。
 
@@ -8,7 +8,10 @@
 通知 kind／path、段階の受入範囲を確定する再レビュー用。指摘は通常操作として構造で扱う。
 
 R2 (`1c313a2ec`) は **REVISE**。実 Folder の mtime だけの差分で親一覧を再 install しない
-§1.314 の契約を以下へ反映。実装は再レビュー後。
+§1.314 の契約を以下へ反映し、R3 は ACCEPT。
+
+R3 の受入と利用者の指示により、`3bfbf1989` 基点で第一段 Delete の実装へ進む。
+第二段の rename／move／copy は今回の完了対象ではない。
 
 ## 1. 原因の確定 (コード上)
 
@@ -253,4 +256,113 @@ Shell 衝突名を別に検証する。`Modify(Name)` だけの重複通知で�
 単に最終一覧が同じという試験だけではちらつきを検知できない。
 
 検証所有者は各段の実装担当。targeted、fmt、通常／portable core check、項目末尾 full gate 一回。
-今回は設計のみ: テスト追加 0 件、実行 0 件、build 0 件。アプリ起動・コミットなし。
+設計時点はテスト追加 0 件、実行 0 件、build 0 件。以下へ第一段の記録を分離する。
+
+### 第一段の部品実装記録 (2026-10-12、App統合前で設計判断停止)
+
+- `folder_scan::RawFolderSnapshot` は既存走査の分類済み候補を種類採否／派生動画／同名除去より
+  前に保持する。実 Folder／通常ファイルの `SystemTime`、size availability、readonly と種別を
+  記録し、派生動画の判定を変える `.miv.json` も同じ走査から照合材料へ入れる。
+  `ScannedDir` の `raw` は immutable `Arc`、`prepared` は worker の表示準備成果物である。
+  fixture の既定 `raw` は未証明であり、一致だけで再 install を省略できない。
+  legacy `FolderScanSignature` の Copy／秒精度比較 API は既存 caller 用に保持する。
+- `folder_reconcile::AppliedFolderListing` は購読 identity、一覧世代／revision、raw、投影 proof、
+  operation ID を一つに持つ。Delete receipt の exact 成功 source だけを差し引き、
+  `NeedsProjection` を経て actual worker proof と暫定表示が一致する場合のみ `Applied` へ進める。
+  UI の行除去だけを完了証明にはしない。
+- `FolderPrepareInputs` は設定、評価 DB の実 backing path、pin DB `Arc`、write／metadata revision、
+  cache-key scope、Stack aggregate／flat mode の immutable snapshot。
+  RatingDb は bare SQLite Connection を持ち `Arc<RatingDb>` が worker に渡せないため、
+  worker は caller の backing path を read-only で開く。UI で新しい SELECT はしない。
+  materialize、pin lookup／cascade と既存 cache-key helper、sidecar の完全精度 dependency、
+  既存 Rhai script／grouping／StackView 投影を worker の `PreparedFolderScanInputs` にまとめる。
+  pure `build_projection_proof` は同じ準備で得た依存証拠を受け取り、不足した証拠を捏造しない。
+- `prepare_reconcile_scan_inputs` は実 Folder の mtime-only 変化に前回の **proof の採用値** を使う。
+  raw の観測値は進め、表示metadata・sortmetadata・directory由来の代表要求 stamp は保持する。
+  二回連続した mtime-only 照合でも新観測mtimeが表示へ漏れない。
+- `FolderWatchSubscription` は worker で登録し、その後に初期 scan を行う。
+  callback は購読ごとの immutable identity／bounded dirty summary だけを使う。
+  `WatchDirtySummary` は Name を Namespace、Data を Content、Metadata／Modify(Any) を
+  worker で型判定する evidence として残す。上限超過／error は Unknown。
+  同 path の cutoff 後の通知は最強分類／最大sequenceを残し、成功採用時だけ cutoff を ack する。
+- backend の回帰17件を追加した。exact成功／重複receipt、JPG候補再露出、Folder／ZIP、PDF／EPUB、
+  sidecar再露出、nanos上書き、連続実Folder mtime-only、Content／Unknown混在、Name／Access分類、
+  cutoff後同path通知、overflow／error、兄弟context独立、metadata revision／同名再作成を扱う。
+  App handler／bundle 統合と検証結果は検証所有者が追記する。backend担当は cargo／fmt／test／buildを
+  実行していない。アプリ起動・コミットなし。
+
+### 初期表示・自動代表の証拠に関する設計判断 (2026-10-12)
+
+R3 の worker 準備だけで既存の初期表示を証明できる、という実装前提は成立しなかった。
+独立した `gpt-6.1-sol` / `xhigh` のコード調査でも同じ結論となった。
+**第一段の App handler・context bundle 接続はここで止める。Delete のちらつき修正は未完了。**
+backend の reducer／worker 部品は未接続であり、初期 proof を後日生成して Applied とする
+fallback、初回だけ余計に再 install する回避策、通知の時間窓抑止は実装しない。
+
+#### 確定したコード上の不足
+
+- `prepare_scanned_folder_listing_with_cache_keys` は初期 scan を UI で materialize し、pin lookup、
+  cache key を作るが、full precision の pin leaf stamp と実際の自動代表の採用証拠は残さない。
+  `install_prepared_scanned_folder_listing` が保持するのは従来の秒精度 signature。
+- `LoadRequest` の outer Folder key／秒精度 stamp は代表の object を同定しない。
+  `catalog::FolderSelectionProof` は winner の秒 precision と catalog revision の証拠であり、
+  filesystem の全候補 snapshot ではない。direct image の winner で空 directory dependency も正常。
+- cache entry の proof は `ThumbMsg`／`ThumbPixels` の採用境界を通らず、App は採用した
+  texture とその代表証拠の対応を保持しない。後日 worker が選んだ代表を初期表示の証拠にできない。
+- 初期 scan worker で先に代表だけ選んでも、後段の thumbnail worker が再選定するため、
+  選定間の変更で別 winner が表示され得る。同じ準備結果に由来する証拠だとは証明できない。
+
+#### 初期採用を揃える範囲
+
+初期購読 register → scan → prepare → 一回採用を既存 owner へ統合する。
+通常 Physical／Quick／Rating／Collection の preflight、Smart child preflight、DFS の走査終端、
+`FolderPaneOpenPending` が対象。`Some(pre_scan)` を即時 ready とする shortcut も対象で、
+購読前の走査をその購読の initial cutoff の証拠にしない。
+新 standalone pending owner や初期二重 install は追加しない。
+初期同期 loader を残す [startup-diagnostics-plan.md §10](startup-diagnostics-plan.md) の Phase B 保留との境界変更も同時に記録・レビューする。
+
+#### 自動代表について選択が必要な二案
+
+| 案 | 正確な採用契約 | 通常操作への影響 |
+| --- | --- | --- |
+| A: 初期全件の代表決定 | 初期 worker が代表を決め、その同じ決定を thumbnail 要求に渡す。後段で独立に再選定しない | 現行の keep_range 内だけの遅延探索を全 Folder へ広げる。開く際の I/O と待ちが増えるため、利用者の判断なしに実装しない |
+| B: 既存の遅延探索を維持 (提案) | 既存 ThumbnailRequests の要求 identity と ThumbMsg の採用へ完全精度／pin・catalog provenance を運ぶ。実採用と対応した証拠だけを projection が使用 | 表示範囲だけの探索を維持。thumbnail result と projection の所有境界を具体化し独立設計レビューが必要 |
+
+B は現在の `ThumbnailState`／既存 request owner を使って未要求・処理中・採用済みを
+区別し、別の bool／pending owner で同じ状態を複製しない方向とする。
+未要求で placeholder の Folder と、既に texture を表示したが証拠のない Folder を混同しない。
+後者を raw 一致だけで「表示反映済み」にしない。result は context、一覧世代、request identity が
+一致した一件にだけ作用し、cancel／park／再要求は同じ既存 owner の規則を使う。
+この具体化と、§1.314 の採用 metadata／sort／代表要求 stamp の保持を合わせてレビューする。
+
+**判断依頼は B の具体化・再レビューへ進むかどうか。** A は通常の表示開始を重くするため
+自動採用しない。これは通常操作で生じる所有・非同期の前提矛盾であり、まれな失敗の
+割り切り対象ではない。未知証拠を理由に一律 full install して完了扱いにもしない。
+
+追加の受入: 初期代表決定→thumbnail 採用の間の子ファイル差替え、未要求→要求中→採用済み、
+stale result／同 folder 二 context／park・再 mount、削除と代表変更の同 batch、
+§1.314 の子 Folder mtime-only で表示・sort・代表要求・texture が不変である対照例。
+最終テストの実数は検証後に追記する。
+
+未レビューの§1.373 App接続と関連producerも今回の設計判断で退役したため、DeletePendingへの
+共通operation ID／listing ownerの接続は現作業ツリーへ残していない。既存Delete handlerは変更なし。
+
+### 部品の検証記録 (2026-10-12)
+
+`cargo test -p mimageviewer --lib folder_reconcile` は17件成功、失敗0件。
+初回は16件中13件成功／3件失敗。2件はWindows `SystemTime`に1nsを足しても100nsの量子で
+値が変わらないfixture、1件は既定Rhaiのall-match／distinct条件を満たさない名前のfixtureだった。
+同秒・同サイズで100nsだけ違うことと、既定規則に適合する2枚のexact member pathsを厳密に検査し、
+分類アルゴリズムの変更や期待の弱体化は行っていない。
+
+rawのpreprojection omitted countsと投影後の表示countsをproofへ保持し、行が同じでも件数差分を
+retainしない回帰を1件追加した。将来のApp接続では `normal_folder_omitted_entries` まで同じ採用
+境界で照合する必要がある。OSのsystem metadataだけの件数差とchip-only更新を、既存の
+一覧採用を増やさず扱う契約もレビュー対象。現部品の「未知／差分ならretain拒否」をそのまま
+通常watchへ接続して第一段完了扱いにしない。子.part由来の§1.314では親の件数は変わらない。
+
+関連 `folder_scan` 45件、`folder_mtime` 6件も成功（重複1件を含む）。App handler／bundle接続、
+第一段Deleteの世代／thumbnail採用回数の回帰は未実装。部品成功は製品のちらつき修正完了を意味しない。
+ログ: [部品17件](../target/nextlist-folder_reconcile.log)、
+[folder scan 45件](../target/nextlist-folder_scan.log)、
+[mtime 6件](../target/nextlist-folder_mtime.log)。

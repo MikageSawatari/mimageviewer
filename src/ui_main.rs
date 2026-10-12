@@ -30283,6 +30283,26 @@ mod section292_tests {
         refresh.click();
         harness.run();
         SORT_CONTROL_TEST_RELOADS.with(|count| assert_eq!(count.get(), 1));
+        {
+            let mut app = app.borrow_mut();
+            let ctx = egui::Context::default();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while app
+                .top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+                || app.sidecar_restore_active()
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "refresh did not settle"
+                );
+                app.settle_open_path_classification_for_test();
+                app.poll_sidecar_restore(&ctx);
+                app.poll_history_navigation_transition_for_test(&ctx);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
         app.borrow_mut().finish_page_identity_preparation_for_test();
         assert!(
             app.borrow()
