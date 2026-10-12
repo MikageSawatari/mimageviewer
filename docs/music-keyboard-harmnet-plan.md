@@ -71,7 +71,8 @@ pitch-lab の `examples/harmnet_dump.rs` を出発点にしてよいが、次を
   名前・形は実装者が決めてよい。UI 依存は持たない。
 - サンプルレートは `MusicPcm` が常に 48kHz なので 48kHz を前提にしてよいが、窓長・hop は
   EffeTune と同じ式 (窓 = round(rate×4096/48000)、round(rate×16384/48000)、hop = round(rate×0.02))
-  で求め、48kHz 以外を渡されたら空の結果を返す (assert で落とさない)。
+  で求め、48kHz 以外を渡されたら**有効な全 0** (`Some`) を返す (assert で落とさない。`None` を
+  返すと §4.4 の再要求が止まらなくなるため)。
 - 前処理は EffeTune `harmnet_frontend.h` と同じ: 非対称窓 (短窓のピークは 10ms 前、長窓は 20ms 前)、
   300 本の 1/3 半音三角フィルタ (幅がビン以下なら線形補間)、`ln(1 + 1e4 × v)`、入力の scale/shift。
 - 推論は `harmnet_inference.h` と同じ: 3 層の周波数畳み込み (直近 3 フレーム)、0.5〜8 倍の倍音位置の
@@ -125,9 +126,12 @@ read lock の保持は今の `copy_window` と同じく短くする。
   一時的にしか起きないため)。`Some` の全 0 も同じ見た目になる。
 - **再要求**: 今の `MusicSpectrumState::update` は `bands.is_empty() || playing || center_changed` の
   ときだけ要求する。一時停止中に棒グラフは取れたが確率が `None` だった場合、デコードが進んでも
-  再要求されない (Sol P2)。条件に **「直近の結果の確率が `None` かつ `source_complete == false`」**
-  を 1 つ足す (16ms 間隔・in-flight 1 件の既存の間引きに乗る)。デコード完了後は P1 により
-  `None` が出ないので、完了後に要求し続けることはない。進捗通知チャネルは足さない。
+  再要求されない (Sol P2)。条件に **「直近の結果の確率が `None`」** を 1 つ足す (16ms 間隔・
+  in-flight 1 件の既存の間引きに乗る)。デコード完了の有無は条件に入れない (完了を `update` が先に
+  観測しても、保存済みの `None` は次の要求を処理するまで更新されないため。Sol 2 回目 P2)。
+  完了後の要求は P1 により `Some` を返すので自然に止まる。間引きで送信を見送ったときも、
+  確率が `None` の間は `request_repaint_after(SPECTRUM_REFRESH_INTERVAL)` で次の機会を予約する。
+  進捗通知チャネルや完了検出用のフィールドは足さない。
 - 偶数・奇数倍音比は今の `harmonic_energies` と `even/odd = energy / (raw + 1e-4)` の 0..1 クランプ、
   EMA (`KEY_HARMONIC_SMOOTH`) をそのまま使う。上下端の色は今と同じく `key_fill(midi, center × factor)`。
 - 中央の残光 (`note_trail` の `KEY_HIGHLIGHT_DECAY`) は残す。
@@ -197,7 +201,8 @@ decide(cursor, pcm, k_end) ->
 - **範囲**: 180ms 未満の短いファイル、hop で割り切れない長さ、末尾の持続音で、デコード完了後は
   末尾まで確率が `Some` になること (P1)。
 - **再要求**: 「一時停止・位置固定・bands あり・確率 `None`」→ PCM 追記 / 完了 → 次の要求で確率が
-  `Some` になること (P2、`MusicSpectrumState::update` の handler-level テスト)。
+  `Some` になること (P2、`MusicSpectrumState::update` の handler-level テスト)。**`None` を受け取った後、
+  次の `update` より前に `mark_complete()` する順序**も固定して検査する (2 回目 P2)。
 - **PCM の同一性**: 同じ位置でも別の `MusicPcm` なら Restart になること。
 - **未デコード**: デコード済み範囲の外を要求したとき空の結果になり、カーソルが計算できたところに
   あること。
@@ -265,7 +270,8 @@ decide(cursor, pcm, k_end) ->
 ## 12. 独立レビューの記録
 
 1 回目 (GPT-6.1 Sol / xhigh、2026-10-12、session `01a12f97-de07-7290-b8e6-a4095800d4bd`):
-ACCEPT WITH CHANGES。
+ACCEPT WITH CHANGES。2 回目 (同セッション): 残る P1 なし、P2 1 件を反映すれば実装へ進めてよい。
+P4 の別件化、P6 の単体テストでの代替 (既存の park／復帰・音声トラック変更テストは維持) も了承。
 
 | 指摘 | 対応 |
 | --- | --- |
@@ -274,4 +280,5 @@ ACCEPT WITH CHANGES。
 | P3 未取得と有効なゼロ確率の区別、残光との関係 | §4.3: `Option`。§4.4: 未取得は入力 0 として残光で減衰 (ベースライン専用描画は足さない)。§6 で瞬時値と残光を分けて検査 |
 | P4 parked-live が Norm ゲインを渡していない | 既存の不一致でこの設計が生むものではない。detached 凍結ルールの対象なので §10 に記録し別件で起票 |
 | P5 golden の時刻対応と助走の合格条件 | §5.1 に確認済みの対応を記載、§6 に境界・助走ケースと数値許容差の記録 |
+| 2 回目 P2 完了を先に観測すると None のまま再要求されない | §4.4: 再要求条件を「確率 None」だけに。48kHz 以外は有効な全 0 を返す (§4.1)。§6 に順序固定テスト |
 | P6 所有の前提・文書・検査 | §3 に App 全体 1 つの前提と PCM 同一性による継続判断。App レベルの park/復帰テストは、継続を PCM 同一性で判定するため tracker 単体の同一性テストで代える。§9 に async-architecture と EffeTune 文書。§6 にライセンス表記の検査、§8 に要求全体の計測 |
