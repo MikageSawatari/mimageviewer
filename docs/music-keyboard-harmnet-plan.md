@@ -683,3 +683,22 @@ TMP/TEMP変更、target削除、nativeビルドの回避／再試行、`target/d
 `docs/{music-keyboard-harmnet-plan.md,music-integration-plan.md,async-architecture.md,detached-rework-plan.md}`、
 `htdocs/mimageviewer/manual/{music.html,tut-music.html}`、上記PNG。seek stripは共通ラスタ関数へ
 `None`を追加しただけで、動画側の表示動作は変更しない。CHANGELOG／next-release-backlogは未変更。
+
+### 13.9 再ラスタ負荷の release 計測 (2026-10-12、ClaudeCode が実行、commit 167bd5008)
+
+`cargo test --release -p mimageviewer --lib ui_music_timeline::tests::timeline_bass_raster_benchmark -- --ignored --nocapture`
+(exit 0)。4 区間のスナップショットが到着する間に可視 4 行のラスタを要求し、最新 (第 4 区間) の色が
+信頼度付きで表示されるまでを測る。判定はコードレビュー P3 に従い「C かつ confidence > 0.06」で、
+第 3 区間までのスナップショットでは成立しないことを通常テストで固定済み。
+
+| 曲長 | 到着間隔 | 要求 / 処理 | 最大滞留 | 最大待ち (ms) | 最新色の反映 (ms、最後の到着から) | Bass スナップショット最大 (bytes) | ラスタ payload 上限 (bytes) |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 180 秒 | 0ms (連続) | 16 / 16 | 16 | 465 | 514 | 288,072 | 15,790,592 |
+| 180 秒 | 250ms (設計値) | 16 / 16 | 4 | 104 | 133 | 72,018 | 7,895,296 |
+| 60 分 | 0ms (連続) | 16 / 16 | 16 | 492 | 526 | 5,760,756 | 15,790,592 |
+| 60 分 | 250ms (設計値) | 16 / 16 | 4 | 105 | 137 | 1,440,189 | 7,895,296 |
+
+設計値の 250ms 間隔では滞留が可視行数 (4) に収まり、最新の色は最後の公開から約 0.14 秒で反映される。
+連続到着でも 0.53 秒以内に全要求が処理された。プロセスのメモリ増分 (16ms 標本) は 180 秒で約 1MB
+(250ms)、60 分の連続到着ケースの 80MB はテスト用の 60 分 timeline (72MB) の生成を含む。GPU なしの
+headless 計測で、実アプリの描画時間は含まない。§13.7 P5 の受入条件を満たす。
