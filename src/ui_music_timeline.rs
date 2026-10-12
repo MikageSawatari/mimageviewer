@@ -2612,6 +2612,63 @@ mod tests {
         assert!(!cache.row_is_fresh(0, key));
     }
 
+    fn benchmark_has_fourth_segment_bass(hint: TimelinePitchHint) -> bool {
+        hint.pitch_class == 0 && hint.confidence > 0.06
+    }
+
+    #[test]
+    fn bass_benchmark_latest_color_rejects_third_segment_snapshot() {
+        let mut track = TimelineBassTrack::new(180 * 48_000, 48_000);
+        for index in 0..3 {
+            assert!(track.merge_segment(bass_segment(&track, index, 45 + index as u8)));
+        }
+        let third_snapshot = track.clone();
+        assert!(track.merge_segment(bass_segment(&track, 3, 48)));
+        let bins: Vec<_> = (6000..9000)
+            .map(|index| WaveformBin {
+                start_secs: index as f64 * 0.01,
+                duration_secs: 0.01,
+                peak: 0.5,
+                rms: 0.3,
+                loudness_db: -12.0,
+                band_energy: [0.45, 0.2, 0.1],
+                chroma: [0.1; 12],
+                ..WaveformBin::default()
+            })
+            .collect();
+        let key = measurement_key(6, 30.0);
+        let raster_hint = |snapshot: &TimelineBassTrack| {
+            let (_, _, hints) = render_timeline_row_with_hints(
+                60.0,
+                30.0,
+                &bins,
+                Some(snapshot),
+                None,
+                key.width_px,
+                key.waveform_h_px,
+                key.gap_px,
+                key.metrics_h_px,
+                key.dark,
+            );
+            bass_display_hint_at_time(&hints, 65.0)
+        };
+        let old_hint = raster_hint(&third_snapshot);
+        // The old pitch-class-only assertion incorrectly accepted this pending bin.
+        assert_eq!(old_hint.pitch_class, 0);
+        assert_eq!(old_hint.confidence, 0.0);
+        assert!(!benchmark_has_fourth_segment_bass(old_hint));
+        let latest_hint = raster_hint(&track);
+        assert!(benchmark_has_fourth_segment_bass(latest_hint));
+        assert!(!benchmark_has_fourth_segment_bass(TimelinePitchHint {
+            confidence: 0.06,
+            ..latest_hint
+        }));
+        assert!(!benchmark_has_fourth_segment_bass(TimelinePitchHint {
+            pitch_class: 11,
+            ..latest_hint
+        }));
+    }
+
     /// Headless production raster/cache benchmark. Measures the FIFO request/result
     /// backlog (submitted minus drained), worker queue wait, latest-row adoption,
     /// retained bass snapshots and raster/texture payload bytes. CPU egui texture
@@ -2714,8 +2771,8 @@ mod tests {
                     if arrivals == 4 && request_rows.iter().all(|&row| cache.row_is_fresh(row, key))
                     {
                         let latest_hint = cache.bass_hint_at_time(2, 65.0);
-                        assert_eq!(
-                            latest_hint.pitch_class, 0,
+                        assert!(
+                            benchmark_has_fourth_segment_bass(latest_hint),
                             "latest snapshot's fourth-segment C must be displayed"
                         );
                         println!(
