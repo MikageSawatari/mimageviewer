@@ -1,7 +1,7 @@
 # §1.372 補正編集のページ identity と viewer context 所有
 
-2026-10-12、branch `next-fix`、調査基点 `f182037c2` と §1.369 の未コミット差分。
-状態: **設計案・独立レビュー待ち。§1.372 の製品コードは未変更**。
+2026-10-12、branch `next-fix`、初回調査基点 `f182037c2`、追補基点 `440fdf69b`。
+状態: **独立レビューREVISEのP2 2件を設計へ反映・再レビュー待ち。§1.372 の製品コードは未変更**。
 正本は [next-release-backlog.md §1.372](next-release-backlog.md)。実機での再現報告ではなくコード調査。
 
 ## 1. 問題と既存の保護
@@ -94,8 +94,10 @@
 | 普通のmount/deposit／park/resume | interactionとdraftをbundleと一緒に移す。非表示で入力を受けず、兄弟contextの終端処理をしない |
 | split/fork／新context | 新ownerはIdle。描画用snapshotを複写する場合もgesture／beforeを複製しない。元ownerのparkならそのownerへ移す |
 | 明示ページ移動／パネルfold／close／新source採用 | 所有中の編集だけを既存のfinish/cancel契約で畳む。次のページへbeforeやgestureを持ち越さない |
+| Undo／Redoの受理／別の履歴操作の受理 | §4.1の共有履歴境界で完了済み保留を先に確定。Undo／Redoのpopや次操作のbefore captureより前。単なるmountとは区別 |
 | 対象が非resident | draftはowner側にありBへ投影しない。明示終了で完了済み変更をAへ確定、未完gestureは取消 |
 | context drop | 完了済み変更を既存writerへ配送してownerを破棄。保存workerはAppの既存寿命を使い、UI待機や通知待ちの延命を追加しない |
+| App通常終了 | mountedと全at-rest／park中ownerを§4.2で畳んで配送し、その後に共有writerを停止。drop任せにしない |
 
 inputもownerに属する。readerが同じAを表示し続ける再配置ではAのgestureを継続する。
 一覧外でもretained readerがAを表示しているなら、その安定target／geometryで操作する。
@@ -107,6 +109,81 @@ Bのpointer／キー入力をAのgestureへ配送しない。gridのselectedだ�
 レーティング／タグの操作順を変えない。local undoはstable targetへ変換し、
 通常PageKeyと同様に非residentでも元のページへ配送する。元context情報は
 draftと描画投影の所有判定に用い、contextが閉じたことを理由に永続UndoをBへ付け替えない。
+
+### 4.1 共有Undoへの受理順序（レビューP2-1）
+
+現行の `apply_meta_undo`／`apply_meta_redo` はstackを先にpopし、形状キー編集は
+`persist_local_adjust_shape_key_edit` がidle／終端で保存と履歴登録を行う。この順序を変更する。
+**次の履歴操作を受け付ける前に、先行する完了済み保留編集を安定targetで確定する。**
+メモリ上の終端と既存writerへのenqueueだけで順序を決め、writerの完了は待たない。
+
+「完了済み保留」は、キーの一押し／反復で既に適用された値、既存persist対象の
+shape drag／canvas drag／brushの有効な変更など、現行finishが保存する内容をいう。
+まだページ内容になっていないラッソの途中点や未完成の新しい線／図形は取消対象であり、
+保存要求もUndo entryも作らない。既存のfinish/cancel区別をtyped variantの終端に移す。
+
+1. Undo／Redoは既存の入力・IME・tag-busy等の受理判定を通った後、**can_undo／can_redoの
+   判定とpopより前**に、mountedとpark中を含む全ownerの完了済み保留を確定する。
+   beforeとdraftをownerからtakeしてIdleへ移し、変更があれば保存enqueueと通常のUndo登録を
+   一度だけ行う。受理contextの未完gestureは取消し、その後で既存Undo／Redoを適用する。
+   他contextの未完gestureはこの共有履歴整理だけでは取消さず、別keyのdraftを触らない。
+   受理されなかったキーにはこの境界の副作用を発生させない。
+2. Rating／Tag／通常補正／local補正など**別の履歴操作の開始時**にも同じ確定境界を通す。
+   次操作のbefore capture・メモリ変更・worker投入より前に行い、履歴push時だけの後処理に
+   しない。同一ownerの同じキー反復だけは既存の一連の編集として継続し、別対象／別操作なら
+   先行runを閉じる。park自体はdraftを保持できるが、Bで最初の履歴操作を開始するときに
+   park中Aの完了済み保留を先に登録する。新contextで保留runを作る前にもこの境界を通る。
+3. 各 `push_*_undo_entry` の呼出しを棚卸しし、同期操作は上記開始境界と対にする。
+   Tag等の既存非同期操作は**投入時**に先行補正を畳み、結果の履歴登録は既存の
+   pending／成功確認へ残す。遅い結果のpushで、その投入後に始めた補正runを
+   先行編集として畳み直さない。既存tag-busy規則を拡大する待機・poll・保存barrierは加えない。
+   補正保存のcompletionは履歴を積まず、確定時に登録したentryを再登録しない。
+4. idle／release／foldと共有履歴境界は同じowner終端を使う。低水準の終端はownerをtakeして
+   安定target・before・after・summaryを返し、Appが保存と履歴へ配送する。配送から再び
+   共有境界を呼ぶ再帰を作らない。before==afterは既存のno-opで、Redoを消さない。
+   履歴を消す既存open／Rating境界では、先に必要な保存を配送してから既存clear／retainを行う。
+
+これにより `Aのキー編集→idle前にCtrl+Z` は、Aのentryを登録→そのentryをUndo→Redoへ移動の順。
+消費済みownerへ後のtimer／fold／completionが来ても新たな保存・履歴pushを作らず、
+Undo結果を上書きせずRedoも消さない。Redo受理前に実際の新規保留変更があれば、
+まずそれを新操作として登録するので既存Redoは通常のpush規則で消える。変更なしなら維持する。
+`Aをpark→Bの操作→Aをresume／idle` はA登録→B登録の順となり、Aの再登録はない。
+
+入力ownerの切替だけで全draftを捨てる案や履歴順のtimestamp／予約slot／新queueを足す案を
+採らず、次の履歴操作の開始境界へ確定を揃える。完了済みで未登録の補正runを複数contextに
+積み重ねない不変条件をこの入口で作るため、HashMap列挙順で履歴順を決めない。
+park中の未完gestureが再開して有効な変更を受け取る場合も、新しい入力受理境界を通す。
+通常のmount／検索の同一覧再配置／read-only openだけでは共有履歴境界を発火しない。
+
+### 4.2 App終了の全owner確定とwriter停止（レビューP2-2）
+
+現行 `persist_window_state_and_flush` はmountedの `commit_local_adjust_pending_edits` を呼んでから
+`finish_local_adjust_writes`→`flush_all_sidecars`→`sidecar::wait_for_pending_writes` と進む。
+bundleへinteractionを移した後は、**全ownerから要求を作り切る前にwriterを停止しない**。
+App通常終了の既存経路を次の順序へ揃える。
+
+1. 通常終了の受理後は既存終了経路内で新しい編集入力／idle確定の配送を終える。
+   mounted ownerとregistry内の全at-rest／park中ownerを、所有表に従い重複なく一度ずつ巡回する。
+   at-restを画面へmountして確定せず、各ownerのtargetとdraftから終端要求を取り出す。
+   同一覧から消えたページや非表示のwindowも対象に含める。
+2. 各ownerの完了済み保留をtakeし、capture済みtarget・文書・保存世代・originから既存の
+   保存要求を作って、まだ生きている共通writerへ全てenqueueする。通常／標準補正も既存の
+   保存経路へ渡し、設定値の反映後に既存settings保存を行う。未完の線／ラッソ等は
+   取消して保存しない。共有Undoへの確定は§4.1の終端を再利用し、dropで二重配送しない。
+3. **全contextの配送が終わってから**既存 `finish_local_adjust_writes` の
+   `shutdown_and_collect`（drain→stop→join）を一度だけ呼ぶ。各completionのcaptured key・
+   sidecar座標・originで既存mirrorへ反映する。originを破棄した場合でもmirrorの配送先は
+   request／completionに残し、現在mountedのidxや最新pendingから取り直さない。
+4. 全completionを反映した後、既存 `flush_all_sidecars` でdirtyなmirrorをqueueし、
+   終了に既にある `sidecar::wait_for_pending_writes` を通してからowner／Appを破棄する。
+   既存sidecar所有者もこのflush前にdropしない。既存待機の順序を利用し、新しいworker・
+   barrier・timeout・完了待ち・終了中の回復処理を作らない。
+
+全ownerの終端はUI同期DB読取／新規同期I/Oを行わず、既存保存APIへの要求配送である。
+トレイ退避（`PersistScope::ProcessKeepsRunning`）は通常終了（`ProcessIsStopping`）と区別し、
+既存の確定・到着済み結果poll・
+sidecar queueだけを行い、writer停止／join／sidecar完了待ちへ拡張しない。
+正常終了のDB／sidecar保存を実worker fixtureで検証し、まれな保存失敗は既定のログ＋通知に留める。
 
 ## 5. 保存・projection・非同期完了
 
@@ -159,6 +236,8 @@ rating-only Undo保持と遅延openの既存契約を維持する。
 入口はslider／reset／copy/paste／preset／bulk、shapeのKeyAction、canvas／brush／mask、
 Undo/Redo、idle確定。出口はrelease／別shape開始／fold／navigation／close／取消／drop／失敗。
 通常フォルダ、検索、Rating、Collection、ZIP/PDF、製本、Remoteの同型入口を確認する。
+Smart／Collectionの実adopt handlerは、同一覧再配置ならdraft再投影、新source採用なら
+所有editorのfinish/cancelという区別で接続する。cursor変更だけで終端を代用しない。
 
 | 非対話回帰 | 必須のassert |
 | --- | --- |
@@ -166,7 +245,12 @@ Undo/Redo、idle確定。出口はrelease／別shape開始／fold／navigation�
 | Aが一覧から消える→Undo／Redo／終了 | 元のAへ永続化し、Bの表示／保存／beforeを変えない |
 | slider／shape key／canvas／shape／brush中に複数stream採用 | ownerとbefore/draft維持。timer／release／foldでAへ一度確定、完成済み編集を失わない |
 | 旧prepared snapshotがdraft開始前／保存enqueue前に作られる | 既存stamp不一致拒否と最新draft overlayにより値を戻さない |
-| 2 contextの異なるkey／同key、mount/deposit／park/resume／fork／close | 相手のgestureを確定／取消しない。同key更新はpublication、別keyはcacheも不変 |
+| 2 contextの異なるkey／同key、mount/deposit／park/resume／fork／close | 読取だけの交換は相手のgestureを確定／取消しない。別履歴操作の受理は§4.1で完了済み保留だけを先に確定。同key更新はpublication、無関係なdraftは不変 |
+| Aのキー編集保留→idle前の実Undo handler→idle／fold／completion→Redo | Aを一度登録してそのentryをUndo。AのDB／sidecarはbefore、後続timerで戻らず、Redo entry維持。Redoでafterへ。B不変 |
+| 既存Redo＋新規保留変更／変更なし／未完ラッソ→実Redo handler | 新規変更は先に登録し通常pushで旧Redoを消す。no-opはRedoを維持。未完gestureは保存・履歴登録せず受理contextで取消 |
+| Aをpark→BでRating／通常補正／local補正／Tag投入→Aをresume／idle | 実handlerでAの確定・enqueue・履歴pushがBのbefore capture／変更／投入より先。stackはA→B、Aの再pushなし。Tag結果到着時に後発draftを先行確定しない |
+| park中Aのキー編集保留＋mounted Bの未完線／ラッソ→通常終了 | 実終了handler＋実workerで全context要求配送→writer stop→completion mirror→sidecar flushの順。Aの正しいDB key／sidecarへ保存、Bの未完gestureは保存しない。二重enqueueなし |
+| mounted／at-rest双方の完了済み値、一覧外A、origin drop後の終了completion | 全ownerを一度回収してからshutdown。capture済み座標へDB／sidecar保存し、別contextのidxを使わない。既存ProcessKeepsRunningはworkerを停止・待機しない |
 | completion前にreindex／別context mount／origin close | captured key／sidecarへ保存。volatile／cache更新はownerと最新revisionだけ。旧Committed mirrorも維持 |
 | A保存待ちの間に同contextのBを編集 | Aの最新保存完了はAのvolatileだけを解除できる。context全体revisionの変更だけで拒否しない。Bのdraftは不変 |
 | 同key複数slot／同idx別key／items世代だけの変化 | keyごとに全投影更新、idx再利用は保存先にならない、reindexだけではUndo無効化しない |
@@ -181,6 +265,9 @@ pure state-transitionと実handler／使い捨てDB fixtureを組み合わせる
 
 この変更は編集内容という利用者データと、非同期・複数windowの所有境界に関わる。
 **本書で止め、独立設計レビューと設計責任者の合意後に実装する。**
+`440fdf69b`の独立レビューは§1.369実装ACCEPT、§1.372設計REVISE（P2 2件）。
+本追補は§4.1／§4.2と実handler受入条件へ2件を反映した設計修正であり、製品実装は0件。
+今回の試験実行は0件（文書のみ）。`git diff --check`で差分形式を確認する。
 新しい操作制限や通常利用の遅延を必要とする実装案が出た場合は、実装前に再相談する。
 detachedの述語／viewport／HWND制御は本設計の対象に追加しない。bundleの所有統合を
 実装する際は [detached-rework-plan.md §2](detached-rework-plan.md) の構造レビューを守り、
