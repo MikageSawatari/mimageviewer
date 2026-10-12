@@ -19291,8 +19291,6 @@ mod folder_pane_open_nav_tests {
 
     fn empty_scan() -> ScannedDir {
         ScannedDir {
-            raw: Default::default(),
-            prepared: None,
             auxiliary_media: Default::default(),
             complete_audio_inventory: None,
             folders: Vec::new(),
@@ -22799,8 +22797,6 @@ mod phase_c_folder_nav_history_tests {
                 panic!("fixture expected folder preflight");
             };
             let mut scan = crate::app::folder_scan::ScannedDir {
-                raw: Default::default(),
-                prepared: None,
                 auxiliary_media: Default::default(),
                 folders: Vec::new(),
                 all_media: Vec::new(),

@@ -400,6 +400,13 @@ Resumed の親 mtime ふるい、通知時のふるい bypass、走査中通知�
 新しい P2 が出続けた。mtime だけの再走査を無視する最小設計で、開いている一覧の代表も安定するため、
 session state／catalog／Remote・IPC の変更を避ける。
 
+次の版の設計変更 (利用者2026-10-13、未実装・独立レビュー待ち):
+[§1.375 R5](section375-operation-reconcile-plan.md) は走査・一覧準備を実行し、現在の表示と
+完全一致した場合だけ再表示を省く。監視更新では実採用の代表画像を保持し、明示「最新の情報に更新」
+で再選定する。上記§1.314の観測mtime／採用表示metadata・sort・代表要求stampの区別は維持する。
+代表sourceのprovenance照合や自己操作IDは使わない。旧B1の共有catalog／Remote全体の代表固定を
+復活させる方式ではなく、表示contextが採用成果物を保持する境界を独立レビューする。
+
 ## 3. GPU テクスチャアップロード
 
 `ctx.load_texture(name, ColorImage, options)` は UI スレッドで同期実行され、内部で

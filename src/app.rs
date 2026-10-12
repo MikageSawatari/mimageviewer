@@ -533,7 +533,6 @@ pub(crate) mod file_type_resume;
 #[cfg(test)]
 mod rar_archive_cache_tests;
 pub(crate) use facet_navigation::{FacetNavigationState, FacetRoute, FacetScope};
-pub(crate) mod folder_reconcile;
 pub(crate) mod folder_scan;
 #[cfg(test)]
 mod media_resume_meter_tests;

@@ -9,7 +9,7 @@
 | ドキュメント | 読むべきタイミング |
 | --- | --- |
 | [section353-zip-refresh-location-plan.md](section353-zip-refresh-location-plan.md) | §1.353 ZIP の更新位置。facet帰路・起動復元を修正、回帰9件追加、独立最終ACCEPT。targeted618実行／596件・vendor54件・fmt・通常／portable check・最新dev成功。full一回exit101の失敗48件を全補完、再実行なし |
-| [section375-operation-reconcile-plan.md](section375-operation-reconcile-plan.md) | §1.375 第一段Delete。利用者2026-10-12案B採用。既存の遅延探索を維持し、request identity・実画素provenance・表示投影の採用契約をR4 §6へ具体化。§1.314維持、独立設計レビュー待ち・App未接続 |
+| [section375-operation-reconcile-plan.md](section375-operation-reconcile-plan.md) | §1.375 R5、利用者2026-10-13決定。監視更新の走査・一覧準備は実行し、現在の表示と完全一致なら再表示だけを省く。代表画像は監視では保持、明示「最新の情報に更新」で再選定。案B／自己操作ID照合を撤回、未接続部品を撤去。§1.314・context／通知契約を維持、独立設計レビュー待ち |
 | [section373-book-append-undo-plan.md](section373-book-append-undo-plan.md) | §1.373 利用者2026-10-12 R4案1決定。追加中だけexact targetの自動観測を既存Append終端へ配送、全構成stamp照合・外部差分はtokenなし。ごみ箱の実移動確認・UndoAppend限定排他を維持。独立設計レビュー待ち・製品未接続 |
 | [async-log-writer-plan.md](async-log-writer-plan.md) | §1.356 通常／perfの同期ログI/OによるUI・stderr reader停止。単一writer、有界queue・欠落、重要診断、終了flush、診断ZIP workerの完了barrier、解析gateの保存証明／判定不能。2026-10-09利用者決定済み・実装／検証記録 |
 | [details-name-color-plan.md](details-name-color-plan.md) | 詳細一覧の名前色。フォルダ黄系・六分類、標準カスタム/強め固定、選択/チェック共通色、切り取り不透明と設定保存・検証 |
