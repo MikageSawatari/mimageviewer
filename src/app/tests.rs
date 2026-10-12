@@ -71985,6 +71985,17 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     #[test]
     fn remote_session_barriers_keep_modal_until_final_release() {
         let mut app = setup_app();
+        // App startup admits an asynchronous meter read. This test isolates the AI
+        // terminal lease, so first fence that independent work by its actual receipt.
+        // A single UI poll cannot promise that the writer has finished under load.
+        let writer = app.book_resume_writer.as_ref().expect("resume writer");
+        let cutoff = writer.watermarks().admitted;
+        let startup = writer
+            .read_position_after("remote-session-startup", cutoff)
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("startup resume read completion");
+        startup.status.expect("startup resume read succeeded");
+        assert!(startup.completed_through >= cutoff);
         let ctx = egui::Context::default();
         let handle = crate::remote_ipc::session::SessionHandle::new();
         app.set_remote_session_handle(handle.clone());
@@ -72053,6 +72064,73 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             after_later_poll.control_return_sequence,
             released.control_return_sequence
         );
+    }
+
+    #[test]
+    fn remote_session_barriers_wait_for_resume_read_after_local_worker_release() {
+        use crate::remote_ipc::session::RemoteControlPhase;
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let handle = crate::remote_ipc::session::SessionHandle::new();
+        app.set_remote_session_handle(handle.clone());
+        assert!(app.spread_shift_service.is_none());
+        assert!(app.book_composition_service.is_none());
+        assert!(app.composition_editor_acquire_ready());
+
+        // This is the same Read command used by BookResumeMeters::reload at startup.
+        // Hold its real worker before admission, without sleeps or UI-poll retries.
+        let writer = app.book_resume_writer.as_ref().expect("resume writer");
+        let release = writer.pause_for_test();
+        let read = writer.read_all();
+        let pending = writer.watermarks();
+        assert_eq!(pending.admitted, pending.completed_through + 1);
+
+        let local_ai_activity = app.local_ai_activity_lease();
+        handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
+            client_id: "phone".to_owned(),
+            peer: mimageviewer_ipc::SessionPeerInfo {
+                connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+                device_name: None,
+            },
+        });
+        app.poll_remote_session(&ctx);
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::AcquiringRemote);
+        drop(local_ai_activity);
+        assert!(app.local_ai_remote_barrier_snapshot().is_quiesced());
+        assert_eq!(
+            app.local_viewer_close_state(None),
+            crate::app::LocalViewerCloseState::Closed
+        );
+        app.poll_remote_session(&ctx);
+        assert_eq!(
+            handle.snapshot().phase,
+            RemoteControlPhase::AcquiringRemote,
+            "AI completion alone cannot release an outstanding resume read"
+        );
+        assert_eq!(
+            app.book_resume_writer.as_ref().unwrap().watermarks(),
+            pending
+        );
+        assert!(app.remote_session_blocks_local_control());
+        assert_eq!(handle.snapshot().acquisition_sequence, 1);
+        assert_eq!(handle.snapshot().control_return_sequence, 0);
+
+        release.send(()).unwrap();
+        read.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("held resume read completion")
+            .expect("held resume read succeeded");
+        let completed = app.book_resume_writer.as_ref().unwrap().watermarks();
+        assert_eq!(completed.admitted, pending.admitted);
+        assert_eq!(completed.completed_through, pending.admitted);
+        app.poll_remote_session(&ctx);
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::RemoteActive);
+
+        handle.local_disconnect();
+        app.poll_remote_session(&ctx);
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::Local);
+        assert_eq!(handle.snapshot().control_return_sequence, 1);
+        assert!(!app.remote_session_blocks_local_control());
     }
 
     #[test]
