@@ -20,6 +20,21 @@ pub(crate) enum SegmentsStatus {
     Uncommitted,
 }
 
+// A merge result whose source set is no longer available cannot replace the
+// current registers. Keep this origin typed until the terminal observer has
+// decided whether to report it; the public merge Future retains its old error.
+pub(crate) struct MergeSourcesUnavailable;
+
+impl MergeSourcesUnavailable {
+    pub(crate) fn into_error(self) -> TantivyError {
+        TantivyError::InvalidArgument(
+            "The segments that were merged could not be found in the SegmentManager. This \
+             is not necessarily a bug, and can happen after a rollback for instance."
+                .to_string(),
+        )
+    }
+}
+
 impl SegmentRegisters {
     /// Check if all the segments are committed or uncommitted.
     ///
@@ -188,17 +203,13 @@ impl SegmentManager {
         &self,
         before_merge_segment_ids: &[SegmentId],
         after_merge_segment_entry: Option<SegmentEntry>,
-    ) -> crate::Result<SegmentsStatus> {
+    ) -> Result<SegmentsStatus, MergeSourcesUnavailable> {
         let mut registers_lock = self.write();
         let segments_status = registers_lock
             .segments_status(before_merge_segment_ids)
             .ok_or_else(|| {
                 warn!("couldn't find segment in SegmentManager");
-                crate::TantivyError::InvalidArgument(
-                    "The segments that were merged could not be found in the SegmentManager. This \
-                     is not necessarily a bug, and can happen after a rollback for instance."
-                        .to_string(),
-                )
+                MergeSourcesUnavailable
             })?;
 
         let target_register: &mut SegmentRegister = match segments_status {

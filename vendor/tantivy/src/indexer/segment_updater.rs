@@ -9,7 +9,7 @@ use std::sync::{Arc, RwLock};
 
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
-use super::segment_manager::SegmentManager;
+use super::segment_manager::{MergeSourcesUnavailable, SegmentManager};
 use crate::core::META_FILEPATH;
 use crate::directory::{Directory, DirectoryClone, GarbageCollectionResult};
 use crate::fastfield::AliveBitSet;
@@ -29,6 +29,20 @@ use crate::{FutureResult, Opstamp, TantivyError};
 const PANIC_CAUGHT: &str = "Panic caught in merge thread";
 
 type MergeFailureHandler = Arc<dyn Fn(&TantivyError) + Send + Sync>;
+
+enum EndMergeOutcome {
+    Published(Option<SegmentMeta>),
+    SourcesUnavailable(MergeSourcesUnavailable),
+}
+
+impl EndMergeOutcome {
+    fn into_public_result(self) -> crate::Result<Option<SegmentMeta>> {
+        match self {
+            Self::Published(meta) => Ok(meta),
+            Self::SourcesUnavailable(unavailable) => Err(unavailable.into_error()),
+        }
+    }
+}
 
 // This is admission failure only; errors from an accepted task are kept separately.
 struct UpdaterKilledBeforeSchedule;
@@ -630,6 +644,8 @@ impl SegmentUpdater {
                     // end_merge has returned (including its task.wait), so no Directory or
                     // segment-manager lock is held here. Admission cancellation is excluded
                     // structurally, never by message or the writer's current killed flag.
+                    // An unavailable source set is also a typed outcome: no registers or
+                    // committed metas were changed, so only the existing diagnostic is kept.
                     if let Ok(Err(error)) = &res {
                         segment_updater.report_merge_failure(error);
                     }
@@ -644,7 +660,9 @@ impl SegmentUpdater {
                             hook(res.is_err());
                         }
                     }
-                    let res = res.unwrap_or_else(|killed| Err(killed.into_error()));
+                    let res = res
+                        .unwrap_or_else(|killed| Err(killed.into_error()))
+                        .and_then(EndMergeOutcome::into_public_result);
                     let _send_result = merging_future_send.send(res);
                 }
                 Err(merge_error) => {
@@ -714,7 +732,7 @@ impl SegmentUpdater {
         &self,
         merge_operation: MergeOperation,
         mut after_merge_segment_entry: Option<SegmentEntry>,
-    ) -> Result<crate::Result<Option<SegmentMeta>>, UpdaterKilledBeforeSchedule> {
+    ) -> Result<crate::Result<EndMergeOutcome>, UpdaterKilledBeforeSchedule> {
         let segment_updater = self.clone();
         let after_merge_segment_meta = after_merge_segment_entry
             .as_ref()
@@ -763,9 +781,17 @@ impl SegmentUpdater {
                     }
                 }
                 let previous_metas = segment_updater.load_meta();
-                let segments_status = segment_updater
+                let segments_status = match segment_updater
                     .segment_manager
-                    .end_merge(merge_operation.segment_ids(), after_merge_segment_entry)?;
+                    .end_merge(merge_operation.segment_ids(), after_merge_segment_entry)
+                {
+                    Ok(status) => status,
+                    Err(unavailable) => {
+                        // A commit can remove fully deleted source segments while the
+                        // merge runs. Discard this merge result, preserving that commit.
+                        return Ok(EndMergeOutcome::SourcesUnavailable(unavailable));
+                    }
+                };
 
                 if segments_status == SegmentsStatus::Committed {
                     segment_updater
@@ -776,9 +802,9 @@ impl SegmentUpdater {
             } // we drop all possible handle to a now useless `SegmentMeta`.
 
             let _ = garbage_collect_files(segment_updater);
-            Ok(())
+            Ok(EndMergeOutcome::Published(after_merge_segment_meta))
         })?;
-        Ok(task.wait().map(|()| after_merge_segment_meta))
+        Ok(task.wait())
     }
 
     /// Wait for current merging threads.

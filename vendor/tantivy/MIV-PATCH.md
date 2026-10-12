@@ -28,6 +28,13 @@ Local changes, designed in `docs/fts-integrity-plan.md` r3 §§5/6.1:
   outside this observer. The observer follows the writer across its existing
   rollback replacement of the SegmentUpdater; rollback behavior is otherwise
   unchanged.
+- `src/indexer/segment_manager.rs` / `segment_updater.rs`: keep the exact
+  end-merge source-set rejection as a private typed outcome. Ordinary upsert
+  commits can remove fully deleted sources during a merge; that obsolete
+  result changes neither registers nor committed metas. Keep its diagnostics,
+  skip the failure observer, then convert it to the original public Future's
+  InvalidArgument. Other InvalidArgument and all I/O failures still report;
+  no error-message matching, public error variant, retry or merge wait is added.
 - `Cargo.toml`: opt-in `miv-test-hooks` provides per-directory atomic-stage
   injection and per-writer before-end/terminal observations plus an executed
   end-merge task error injection. The application
@@ -49,3 +56,10 @@ exclude `miv-test-hooks` (recorded in `target/I-1367-tantivy-normal-features.txt
 The GC regression holds an old mmap searcher plus a deliberate no-delete-sharing
 read handle, since this Windows/Rust version can otherwise delete mapped files;
 it verifies actual GC deletion refusal does not reserve a rebuild or notify.
+
+2026-10-12 source-set rejection correction: the same integration target passed
+all 14 tests (`target/fts-merge-tantivy-tests.log`). New regressions reproduce
+real automatic end-merge rejection during 20 upsert commits, with complete and
+partial source removal, verify exact live/reopened contents and unchanged
+scan/rebuild/notification state, preserve the explicit Future error, and prove
+that an identical-text InvalidArgument from another origin still reports.

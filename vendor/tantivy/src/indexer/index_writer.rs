@@ -476,6 +476,8 @@ impl<D: Document> IndexWriter<D> {
     /// Called on the merge worker after all merge/update tasks release their locks,
     /// before sending the result, even when the caller discarded the merge future.
     /// Normal shutdown rejection of an unexecuted end-merge task is excluded.
+    /// End-merge rejection of a source set no longer available in the segment
+    /// manager is also excluded; its public future still returns InvalidArgument.
     /// Synchronous commit failures and ordinary garbage-collection deletion refusal
     /// are not reported here. The observer must not retain this writer or its Index,
     /// wait for merge completion, or panic.
