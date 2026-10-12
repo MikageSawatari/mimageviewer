@@ -1499,6 +1499,20 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 設計書 §13 に指摘別の対応と受入ケースを記録。今回も製品コード・実装・起動・コミットなし。
 
+**R2再レビュー P1へのR3改訂（2026-10-12、対象 `daa32a068`）**:
+利用者が提示した再レビューは REVISE（P1 1件、P2/P3 0件）。前回4件の文書対応は確認されたが、
+scoped mount内のSelect着地がApp-global active session／presentationを変更する問題で構造合意は保留。
+coordinatorの状態組合せ削減の判断を採用し、上記R2記録のfocus移動後のSelect着地案を撤回した。
+
+- Select処理時に元contextが実際のactive ownerでなければ着地させずSelectを破棄し、元窓の一覧を残す。
+  遅延Selectを成立させる再activation／scoped mount／fullscreen openを行わず、保留・再配送しない。
+- AへEnter配送→B復帰→AのSelect処理で、Bのactive session・runtime・描画先・foregroundが不変、
+  Aの一覧Openが維持される受入を設計書§6.3／ケース13・18へ記載。Aへ戻って新しいSelectで選び直す。
+- 共通navigationの内容更新／presentation分離、非active窓のClosed投影／backgroundロード回収は
+  この機能の契約に追加しない。既存着地はactive contextで使用する。
+
+設計書 §14 にR3の判断と検証範囲を記録。今回も実装・製品起動・コミットなし、再レビュー待ち。
+
 ### 2026-10-11 §1.371: 評価集合の公開を安定context境界へ移す構造合意（設計段階）
 
 利用者が提示した独立再レビュー（対象 `94bc236d1`、rating-filter-fullscreen-plan R2）は、

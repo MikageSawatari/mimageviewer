@@ -2,8 +2,9 @@
 
 作成: 2026-10-12 / Codex、基準: `next-tile` / `ea060b66e`。
 状態: **設計提出・独立レビュー／利用者確認待ち。実装未着手。**
-改訂: `6432e8e04` の独立設計レビュー REVISE（P2 3件・P3 1件）への対応。
-構造追加の方針は評価されたが、実装着手への全面的な構造合意は保留。今回の改訂は再レビュー待ち。
+改訂 R3: R2 `daa32a068` の再レビュー REVISE（P1 1件）への対応。
+coordinator 判断により非アクティブ context への Select は破棄し、一覧を維持する。
+構造追加の基本方針は評価されたが、実装着手への全面的な構造合意は保留。今回の改訂は再レビュー待ち。
 公開時期は v4.6.0 の次の版の**後**。次の版の必須成果にはしない。
 項目・出典・時期の正本は [next-release-backlog.md §1.340](next-release-backlog.md#1340-複数ウィンドウの画像ウィンドウ内に本のページをタイル表示する--miv-スレ-509519-2026-10-07)。
 本書は要望を実装可能な境界へ整理した提案で、利用者が下記の細部を承認した記録ではない。
@@ -187,6 +188,8 @@ flowchart LR
 1. 一覧の開閉は読み取り操作であり、items / context / 読書位置／履歴の世代や Remote の
    mutation generation を進めない。メインや兄弟 context の queue / cancel / cache を変更しない。
 2. 一覧 cursor と閲覧位置は別。確定した一回だけ既存の着地を呼び、既存の表示確定時点で記録する。
+   Select は処理時に元 viewer が実際のアクティブ context である場合だけ受理する。
+   非アクティブなら着地せず破棄し、その viewer の Open を維持する（§6.3）。
    `fullscreen_idx` だけを直接書き換える経路や、main へ戻して open し直す経路を作らない。
 3. 通知は元 context の channel / request ID / items generation で照合する。
    UI 選択 command は binding / items・projection revision / 一覧 incarnation と描画したセルの
@@ -219,14 +222,17 @@ park 後の resize／DPI変更で新たに露出したセルも、metadata の�
 stable identity を解決する。画像が無ければ placeholder を描き、同じ frame の hit から
 **その実ページ identity**を command に捕捉する。旧可視セル cache や旧座標から推測せず、
 生成待ち／再アクティブ化だけのクリックを挟まない。root が mount した後も座標で選び直さない。
-画像 cache に無いセルでも一クリックで選択可能とし、active 復帰時に現在表示範囲の需要を再評価する。
+画像 cache に無いセルでも、一クリックによる明示 activation が成立してその context が active に
+復帰した場合は選択可能とする。Select 処理前に別 context へ切り替わった場合は §6.3 に従い破棄する。
+active 復帰時に現在表示範囲の需要を再評価する。
 非アクティブ一覧を理由に兄弟窓の worker を動かし直さない。
 
 passive での最初のセルクリック／スクロール／一覧キーは **activate と command の一組**として
 既存 Shared → root event → manager activation intent → registry mount の経路で実行する。
 既存の RightDrag intent と同じ所有原則を用い、overview 用 typed intent を追加する。
 ActivateOnly に落として最初のクリックを失わせない。command は描画時の owner stamp と
-stable cell identity を持ち、root は該当窓を mount した後に一度だけ適用する。
+stable cell identity を持ち、root は明示 activation の成立と元 owner の active 資格を確認して適用する。
+Select の受付は一度だけ。遅延 Select を成立させるために元窓を再 activation／scoped mount しない。
 同じ event を active 側入力として再実行しない。viewport に stamped された配送済み key edge を
 捕捉し、frame 最終 focus／現在の物理 key level／時間窓で stale 判定しない。
 送信元の証明を持たない generic egui event を unfocused callback で代用しない。
@@ -243,7 +249,7 @@ keepalive tick を足さず、既存の window_id と表示先を使う。これ
 | --- | --- |
 | Open | 適格性を確認し、現在 viewer の canonical projection を参照。現在ページへ cursor、可視需要を publish。items 再列挙／履歴 write はしない |
 | Cancel / toggle | Closed へ。overview の需要だけを解除し、元のページと strip 設定へ戻す |
-| Select | stamp と identity を検証、既存 navigation gate へ着地を受理させてから Closed。gate が入力を受理しない frame は一覧を残し、勝手に別ページへ移らない |
+| Select | stamp と identity に加え、処理時の実際の active context を検証。元 owner が非アクティブなら着地も再activationもせず Select を破棄し、Openを維持。activeなら既存 navigation gateへ渡し、受理された場合だけClosed。非受理は一覧を残す |
 | Scroll / resize / columns | 同じ Open の表示範囲と bounded demand を更新。実ページの位置とグローバル grid サイズを変更しない |
 | F11 / 連動窓の同一 context の F12 migration | 一覧状態は同じ bundle とともに移動。新 client rect で layout 再計算。placement の別保存先を作らない。独立静止画窓の F12 は無効のまま |
 | 別本 open / フォルダ移動 | 既存 command が受理された時点で Closed。incoming の loading/holdover と混在させず、既存 open continuation を使用する |
@@ -253,7 +259,7 @@ keepalive tick を足さず、既存の window_id と表示先を使う。これ
 | terminal close / mode 全体終了 / Remote acquire / tray | 既存の context teardown／非表示処理へ接続。Closed と需要解除、CPU画像破棄は所有 context の request owner 経由。Remote barrier は新たな UI 待機を追加しない |
 | stale command / late thumbnail | 元 owner の照合で破棄。新一覧／別窓へ再解釈しない。採用しない画像の寸法・origin・catalog invalidation を公開しない |
 
-### 6.3 focus／z-order と配送済み edge（P3-1）
+### 6.3 focus／z-order と Select の active 資格（R3 P1-1）
 
 入力なしの repaint、passive resize／DPI変更、thumbnail Pixels／Finalized／Failed の終端は
 閲覧窓の activate／foreground／raise を要求しない。main／兄弟窓の foreground と z-order を維持し、
@@ -264,17 +270,36 @@ keepalive tick を足さず、既存の window_id と表示先を使う。これ
 host 再生成理由にしない。明示的な F12 migration に伴う host の生成・廃棄は既存 transition owner の
 契約に従う別ケースであり、同 HWND の維持を要求しない。
 
-配送済み stamped key edge の後に focus が別窓へ移っても、元 stamp／binding／一覧 incarnation が
-有効なら元 context へ一度 dispatch する。処理時点の focus を freshness の代用にしない。
-このとき最終 focus が別窓なら元窓を OS activate／raise せず、既存 `with_viewer_context` 等の
-scope 内 mount／復帰境界を使って元 owner の command だけを適用する。Select もその窓の着地であり、
-現在 foreground の窓のカーソルや閲覧ページへ付け替えない。遅れて到着した edge を理由に
-passive→active の foreground activation を再要求しない。
-modal／TextInput／IME／別 viewport owner の block は edge dispatch より優先する。
+**非アクティブ context への着地（background landing）は行わない。**
+配送済み stamped key edge は元 viewport の入力であることを証明するが、Select を処理する時点の
+active 資格まで保証しない。A に Enter が配送された後、B へ復帰し、A の Select が処理される時点で
+A がアクティブ context でなければ、その Select は**着地させずに破棄し、A の一覧は Open のまま残す**。
+利用者は A に戻ってから選び直す。破棄した Select を保存／再配送／再生して後から着地させない。
+
+資格判定は既存 active session と registry の window→context binding が示す実際の active owner を
+用い、元 command の context identity と照合する。`with_viewer_context(A)` による一時的な mounted
+projection や OS foreground のみを active 資格の代用にしない。判定は Select を理由に新たな
+scoped mount／activation／navigation の副作用を発行する前に行い、非activeなら `land_still_page_navigation_target`、
+fullscreen open、`prepare_viewer_presentation_open`、`begin_active_detached_session` を呼ばない。
+stamp／identity の照合とこの実行資格は別の境界であり、現在の物理 key level／時間窓を使って
+配送済み edge を stale と判定する仕組みではない。
+passive窓の最初のクリックでは、§6.1の利用者による明示activationが既存intentで先に成立し、
+その後も元contextがactiveならSelectを受理できる。このactivationと、B復帰後の旧Selectを
+成立させるための再activationを区別する。後者は行わない。
+
+A の破棄 Select は A の閲覧位置／cursor／一覧表示／需要を変更せず、B の active session、
+runtime、描画先（ViewportId／host）、foreground／z-order を変更しない。A を active／Resuming に
+戻す intent や raise 抑止付きの background open を作らない。他の Action は §4.1 と既存の入力／
+activation gate に従い、scoped mount だけで presentation 副作用が隔離できるとはみなさない。
+modal／TextInput／IME／別 viewport owner の block は command 実行より優先する。
 hold／repeat の current-level 参照は `FocusedKeyStatePermit` があるときだけとし、focus喪失後に
-hold state を復活させない。window mode／F12等の明示 command の効果は元 target の既存契約へ渡し、
-通常の cursor／select が暗黙に foreground を変更する効果を持たないよう分離する。
+hold state を復活させない。window mode／F12等の明示 command は元 target の既存契約へ渡す。
 stamp 不一致・元 context 退役・一覧終了なら元 command を破棄し、別窓へ再配送しない。
+
+この判断は coordinator が CLAUDE.md「設計の簡素化: 状態の組み合わせを減らす」に従って採用した。
+共通 navigation の内容更新と active session／presentation を分離して background landing を維持する案は
+採らない。非アクティブ窓の Closed 投影、background ロード完了の回収・復帰契約も追加しない。
+既存の着地経路は active context だけで使用し、途中で別窓へ復帰した未受理 Select の組み合わせをなくす。
 
 ## 7. ZIP / PDF / EPUB / 本の構成
 
@@ -389,6 +414,9 @@ IPC payload を変更する必要は現提案にはなく、変更するなら�
 - **採用**: items／構成／読み順が変われば一覧を閉じ、次回入場で参照し直す。
   設定変更ごとの専用 live rebuild、rollback、一覧位置の復旧 pending を足さない。
 - **採用**: 既存 conversion／password／保存 modal の中では新規一覧操作を開始しない。
+- **採用（R3 coordinator判断）**: Select処理時に元contextが非アクティブならSelectを破棄し、一覧を残す。
+  Aへ戻って選び直す仕様とし、background landing、共通navigationのpresentation分離、
+  非active窓のClosed投影／ロード回収の状態組合せを作らない。
 - **不採用**: 一覧を全窓モーダルにして窓切替を止める。複数窓とメイン一覧の通常操作を削るため。
 - **不採用**: park で一覧を自動取消する。別の窓を見た後にページ探索をやり直す手間が増えるため、
   bounded read-only snapshot と既存 activation intent で保持する。
@@ -438,9 +466,10 @@ coordinator は有効な結果を再利用し、項目の最後に `test-full.ps
 10. 高速の末尾／先頭往復で queue／CPU画像／GPU texture がページ総数や訪問数に比例しないこと。
 11. A と B の同数 generation／同idx／同path でも要求・drop・取消が片側だけへ作用すること。
 12. main／active／at-rest の mount/swap/park/resume/fork/terminal close と production context audit。
-13. passive の最初の click／wheel／key が元の一覧へ一度適用され、stale stamp と閉じた窓は拒否されること。
+13. passive の最初の click／wheel／key は既存 activation／input gate に従って一度処理し、stale stamp と閉じた窓は拒否されること。
     park→passive resize／DPI変更→新たに露出した未生成セルを一クリックで選択でき、
-    root は描画時の metadata identity に着地する。旧座標や画像 cache の有無で target を変えないこと。
+    明示activation後に元contextがactiveである場合だけ描画時metadata identityへ着地する。
+    処理前に別contextへ切り替わったSelectは破棄して一覧を維持。旧座標や画像cacheの有無でtargetを変えないこと。
 14. active／deferred passive／legacy passive／backstop の同じ表示 projection、gesture 終了と snapshot 有界性。
 15. keymap の inventory／default／競合／任意再割当／none、S slideshow／動画 S を保持し、入力が背後へ漏れないこと。
     toggle=Enter と Confirm の競合を表示して toggle だけ一度実行。dispatch／ヘルプ／リング／
@@ -451,7 +480,10 @@ coordinator は有効な結果を再利用し、項目の最後に `test-full.ps
 17. Remote acquire／release／既存 standalone thumbnail consumer。read-only open/close で Remote mutation 通知を出さないこと。
 18. headless snapshot（小窓／RTL／placeholder／current spread／白紙補助表示／暗色・倍率）、終端 idle の repaint／仕事収束。
     入力なしの repaint／resize／DPI変更／サムネ終端で activate／foreground／raise effect が0件。
-    stamped key edge→別窓へ focus移動→処理では元 context に一度適用し、別窓の focus／z-orderを維持。
+    **AへEnter配送→B復帰→AのSelect処理**では、Aへの着地／fullscreen open／active-session切替の
+    effectが0件、Bのactive session・runtime・描画先（ViewportId／host）・foreground／z-orderが不変。
+    Aの一覧Open・閲覧位置・cursor・需要が保持され、Selectの再配送／保留が無いこと。
+    Aへ再復帰しても旧Selectは発火せず、利用者の新しいSelectだけが既存着地へ一度進むこと。
     stamp不一致／terminal close は破棄、証明のない unfocused generic event／held は非実行となること。
 
 自動検証コマンド（filter 名は実装後に実在名と件数を記録）:
@@ -475,6 +507,8 @@ python scripts/check_ui_glyphs.py
 一方で一覧を開く→スクロール→他窓へ移る→passive の窓を拡大／DPI変更→新たに露出した
 未生成セルを最初のクリックで選択、取消、F11 を確認する。独立静止画窓の F12 は無効が期待値。
 連動窓の F12 migration は別シナリオで確認し、入力なしの再描画／resize／サムネ終端では前面化しない。
+AへEnter配送後にBへ復帰する競合は、AのSelectが着地せず一覧が残り、Bのactive session／runtime／
+描画先／foregroundが不変という期待値で検査する（配送順序の確定はheadless handler／effect検査を併用）。
 加えて、大きい本の末尾選択、本の構成と兄弟動画／音声の併用、Remote の取得を確認する。
 実機観測なしに性能／最初の入力到達／native focus 成功を断定しない。
 normal profile binary はエージェントが起動しない。実機枠とデータ保護は
@@ -484,6 +518,8 @@ normal profile binary はエージェントが起動しない。実機枠とデ�
 
 独立レビューの重点は、R4 未完の複数描画経路、passive の first-input と identity、
 foreground exact demand の撤回と保存終端、PDF の sibling scope、§1.242 の可視実ページと白紙補助表示。
+R3では、非アクティブSelect破棄がactive session／presentation副作用より前に成立し、Aの一覧と
+Bのactive ownerを保持することも重点とする。background landingの契約は追加しない。
 性能を理由に全窓 modal、park 自動取消、既存 S の無断変更を採用しないことも確認する。
 
 利用者確認事項（本書では未決定）:
@@ -503,7 +539,7 @@ Rust テスト／通常・portable core check／test-full／確認 build は設�
 追加文書／行の末尾空白 0、`git diff --check` 成功、`cargo fmt --check` 成功（exit 0）。
 Rust テスト実行 0 件、通常／portable core check 各 0 回、test-full 0 回、確認 build 0 回。
 
-## 13. 独立設計レビュー REVISE への対応（2026-10-12）
+## 13. 初回 REVISE への R2 対応（2026-10-12、履歴）
 
 対象 `6432e8e04`、利用者が提示した独立レビュー: P1 0件、P2 3件、P3 1件。
 単一 context owner／既存 navigation／exact demand 一般化は症状パッチではなく構造追加と
@@ -525,3 +561,23 @@ Rust テスト0件、通常／portable core check各0回、test-full・build各0
 改訂の検証: 本書のローカルリンク15箇所の参照先ファイルあり、欠落0。
 指摘別の対応記録4件、受入計画18ケース群を検査し、`git diff --check` 成功（exit 0）。
 受入計画の実装検証は未実施。
+
+## 14. R2 再レビュー P1 への R3 対応（2026-10-12）
+
+対象 R2 `daa32a068`、利用者が提示した独立レビュー: **REVISE、P1 1件、P2 0件、P3 0件**。
+前回4件の文書対応は確認されたが、scoped mount による Select 着地では App-global active session／
+presentation の副作用が B に漏れるため、R2 全体への構造合意は保留。
+
+coordinator は CLAUDE.md の状態組合せ削減に従い、background landing をしない仕様を採用した。
+§6.3 の R2 の scoped mount 着地案を撤回し、Select 処理時に元 context が実際の active owner でなければ
+Select を破棄して一覧 Open を維持する。§5 の不変条件、§6.1／§6.2 の受付、§9 の簡素化判断、
+受入ケース13／18、実機手順も同じ契約へ揃えた。
+着地前の active 資格を、入力 edge の provenance や一時 mounted projection と混同しない。
+共通 navigation 境界の分離、非active窓のClosed投影、backgroundロード回収の契約は作らない。
+
+回帰は **AへEnter配送→B復帰→AのSelectは着地せず破棄、Bのactive session・runtime・描画先・
+foregroundが不変、Aの一覧が残る**。Aへの再復帰だけで旧Selectが発火しないことも検査する。
+変更は本書と detached 計画 §11 の対応記録のみ。再レビュー待ちで停止し、実装着手の合意を主張しない。
+Rustテスト0件、通常／portable core check各0回、test-full・build各0回、製品起動0回、コミット0回。
+文書のみのためCargoは再実行しない。ローカルリンク15箇所・欠落0、受入計画18ケース群を検査し、
+`git diff --check` 成功（exit 0）。受入ケースの実装検証は未実施。
