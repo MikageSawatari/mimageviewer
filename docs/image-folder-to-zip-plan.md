@@ -1,7 +1,8 @@
 # §1.242 画像だけのフォルダを ZIP に変換する設計案
 
-作成: 2026-10-12。調査基準: `next-book` / `05f7783cd`。
-状態: **設計案・独立設計レビュー前。実装していない。**
+作成: 2026-10-12。初回調査基準: `next-book` / `05f7783cd`。
+改訂: `53e90f8ef`への独立設計レビューREVISE（P2 5件・P3 2件）と2026-10-12利用者決定を反映。
+状態: **設計案・改訂後の独立設計レビュー待ち。実装していない。**
 
 G4F切り離し後の独立した機能。本の構成のfolder adapter、folder構成の保存・復元、
 sidecar v2を復活させない。G1〜G4のZIP/PDF/EPUBと、既存のfolder閲覧・編集を維持する。
@@ -15,6 +16,8 @@ sidecar v2を復活させない。G1〜G4のZIP/PDF/EPUBと、既存のfolder閲
    `CompressionMethod::Stored` で格納する。元folderは残し、削除・ごみ箱送りをしない。
 2. 同名ZIPがあればエラー。上書き・連番・別名出力をしない。
 3. タグ、★、編集、しおり等は初回利用からZIP側へ複製する。元側の登録を消さない。
+   **タグの後続決定（2026-10-12）**: 全画像のタグを集め、変換したZIP本体のタグにする。
+   元画像のタグはそのまま。ZIPページごとのタグは今回の範囲外。既存のZIP本体タグ操作を維持する。
 4. 変換はモーダル。他の操作と組み合わせてsupersession/rollbackを作る案は採らない。
 5. folder右クリックと、folderで本の構成を開こうとしたときの案内に「ZIP に変換」を置く。
 6. **後続決定・案B（2026-10-12）**: 環境設定「同名ファイル」の既存folder/本のboolを
@@ -41,12 +44,17 @@ sidecar v2を復活させない。G1〜G4のZIP/PDF/EPUBと、既存のfolder閲
 | `app.rs::copy_book_page_edit_key` | 製本の既存copyには補正・各mask・local adjust・crop・comic・rating・tagsがある。UI同期DB APIを今回のworkerから使う形へ分け、UIからそのまま呼ばない |
 | `app/book_composition_editor.rs` のfolder受付、`App.fs_feedback_toast` | 現行folder案内は文字列/時刻/寿命だけのtoastで、actionを保持しない。全toastの再設計ではなく本変換ownerの確認画面へ接続する |
 | `rating_db.rs::RatingMeta` / `RatingItemKind` | kind/source_path/entry_name等も保存。Image行のkeyだけZIP用に変えても評価一覧の復元は正しくならない |
+| `app.rs::enqueue_visible_tag_prewarms` / `hydrate_ratings_from_xmp`、`tag_prewarm.rs` | 現行XMP評価読取りは表示近傍の物理Imageのみ。設定`write_rating_to_xmp`、DB優先、App共有の明示解除/世代を尊重する。変換は全manifestへ同じ判定をworkerで適用する |
+| `app/metadata_ops.rs::tag_item_path`、`tag_ops.rs`、`tag_view.rs` | ZipImageのページkeyはタグ一覧/編集の対象ではない。全画面のタグ操作はZIP本体へ付く。今回もその本体keyだけを作る |
 | `book_bookmarks.rs` | ImageFolder/RelativePathとZip/ArchiveEntryが既存型。専用serviceと自動採番idを持つ |
 | `book_resume_db.rs::PageIdentity`、`spread_shift/model.rs::SpreadShiftPageRef` | Image/RelativePathとArchive/ArchiveEntryを区別。保存番号だけのcopyではない |
 | `sidecar.rs`、`sidecar_import.rs`、`app/sidecar_restore.rs` | v1 DAT、pending writerのimmutable snapshot、検証token、Checkingの所有境界がある |
 | `ui_dialogs/metadata_transfer.rs::metadata_transfer_writers_busy` | 送信済editor保存票の採用まで待ち、その後にcontext/tag/migration等のwriterを静止させる。previewも保存票待ちを持つ |
 | `rename_key_migration.rs::StoreMaintenanceLease` | 既存lease取得順はEPUB coverage → spread shift → composition。新しいDB排他ownerを並立させない |
 | `collection_store/{model,path,db,runtime}.rs` | FileSystemPathのみ。登録pathは実パスで、ZIP内ページnamespace/kindは無い。collection actorが唯一のwriter |
+| `collection_store/model.rs::MAX_COLLECTION_ENTRIES`、`db.rs`のbatch追加 | 上限10,000。既存batchは部分追加と`capacity_rejected`を返し得るため、変換cloneの全件成功には公開前の容量検査と全件commandが必要 |
+| `adjustment.db.favorite_view_states`、`favorite_view_state.rs`、`settings.rs::FavoriteViewState` | Settings内favoritesやfavorite_paramsとは別の永続表示状態。専用FIFO writerと500ms debounceがあり、既定見開き/読書方向/指定倍率等を新UUIDへ複製する |
+| `smart_folder.rs::scan_one_directory / normalize_smart_folder_candidates`、`subfolder_expansion.rs::scan_one_directory` | 旧同名設定はディレクトリ内候補の投影にだけ適用。再帰先は先に登録済みで、子の画像/本セルは親の同名省略で消えない（§8.2.1） |
 | `crates/remote-ipc/src/lib.rs`、`remote_ipc/persistent_collections.rs` | Collectionのwireには既にRemoteAddress/ZipEntry、Image、opaque source_identityがある。内部source型拡張だけでwire変更が必須とは限らない |
 | `remote_ipc/session.rs::with_local_composition_admission` | Local受付とRemote acquireの短いmutex境界があるが、callback終了後の長い処理の排他leaseではない |
 | `settings_transfer.rs` | 同名設定はportable preferences対象。現行assertは全457 / 対象144 / 除外313、wire142。これはコード値であり今回実行した試験数ではない |
@@ -121,8 +129,8 @@ missing DBはデータなしと扱えるが、存在するDBの未知schema/読�
 
 | データ / 保存先 | 複製する内容と変換 | owner / 注意 |
 | --- | --- | --- |
-| `tags.db.item_tags` / `tag_item_state` | 全画像、folder自身のtag・applied_at・明示空/decided状態。page→entry、folder→ZIP本体 | TagsDb既存型・tag writerの完了を待つ。tag定義は共通のため増殖させない |
-| `rating.db.ratings` | 画像★→ZipImage★、folder★→ZipFile★。時刻も保持 | kindを6/3に、source_pathをZ、entry_nameをnへ変換。元Image/Folderの復元metadataをそのまま写さない。評価一覧から実際に開けることを検査 |
+| `tags.db.item_tags` / `tag_item_state` | 全manifest画像とfolder自身の有効タグの和集合→ZIP本体Z。tag_keyで重複除去し、明示空/decidedを尊重 | §4.2。TagsDb既存型・tag writerの完了を待つ。ZIPページkeyのタグ行は作らず、tag定義も増殖させない |
+| `rating.db.ratings` | 画像★→ZipImage★、folder★→ZipFile★。DB評価の時刻を保持し、XMP-only評価も全manifestから補う | §4.3。kindを6/3に、source_pathをZ、entry_nameをnへ変換。元Image/Folderの復元metadataをそのまま写さない。評価一覧から実際に開けることを検査 |
 | `adjustment.db.page_params` | AI指定を含むAdjustParams | page keyだけ変換。焼き込みなし |
 | `rotation.db.rotations` | 非破壊回転角 | ZIP page keyへ。Exif orientationと別に保存 |
 | `mask.db.masks` / `conceal.db.conceal_entries` | bitmap/vectorと保存付随情報 | 同一bytesなので座標・寸法を保持。BLOB/JSON全件をUIでcloneしない |
@@ -136,9 +144,10 @@ missing DBはデータなしと扱えるが、存在するDBの未知schema/読�
 | `book_bookmarks.db.book_bookmarks` | ImageFolder/RelativePath(n)→Zip/ArchiveEntry(n)。title・登録時刻・hintも保持 | 専用serviceの複製command、destination id新規採番。source id/行は保持。安全な既存Missing参照も消さず型を変換 |
 | `reading_history.db.reading_history` | Fの既存履歴があればZのZip履歴を複製。path/key/kindを書き換え、時刻・既存位置を保持 | 専用writer。変換した時刻を「読んだ時刻」にしない。成功後の選択だけで閲覧履歴を追加しない |
 | `folder_thumb_pins.db.folder_thumb_pins` | F自身のpinをZへ。File(n,Image)→ZipEntry(zip_rel空,n) | payloadも変換。親folderがFを指すpinは変更しない。元pinも保持 |
-| `settings.db` favorites / `adjustment.db.favorite_params` | Fそのものを指すお気に入りがあればZ用に複製し、新UUID。名前は「元の名前 (ZIP)」。index flagsと専用標準設定を対応する新UUIDへ複製 | Settings保存ownerとAdjustment owner。親rootのお気に入り・全体標準は共通のまま。favorite内UI状態もUUIDを誤流用しない |
+| `settings.db` favorites / `adjustment.db.favorite_params` | Fそのものを指すお気に入りがあればZ用に複製し、新UUID。名前は「元の名前 (ZIP)」。index flagsと専用標準設定を対応する新UUIDへ複製 | Settings保存ownerとAdjustment owner。親rootのお気に入り・全体標準は共通のまま |
+| `adjustment.db.favorite_view_states` | 対応するsource UUIDの永続`FavoriteViewState`全体→新UUID。未設定の指定倍率は未設定のまま | §4.4。`FavoriteViewWriteDebounce`の未送信分をflushし、専用`FavoriteViewStoreWriter`のFIFO完了・採用まで成功に含める |
 | `collection.db.collection_entries` | Fの本全体登録→ZのZip登録を追加。F/nの個別画像登録→Z,nの個別ページ登録を追加 | §5の型拡張が必要。既存actor経由。元entry id/参照は削除・差替えしない |
-| 自動 `mimageviewer.dat` v1 | まず既存source復元の不足行補充を完了。成功時はPのDATへ `本.zip::n` の編集/tagをmergeする | §6。v2化・ZIPへのDAT埋込・FのDAT丸コピーをしない。backups OFFでも中央DBの複製は必須 |
+| 自動 `mimageviewer.dat` v1 | まず既存source復元の不足行補充を完了。成功時はPのDATへ `本.zip::n` の編集と `本.zip` 本体の集約タグをmergeする | §6。ZIPページタグ/v2化/ZIPへのDAT埋込/FのDAT丸コピーをしない。backups OFFでも中央DBの複製は必須 |
 
 明示されたNone/空値、未設定、明示解除を区別する。
 copy先に同値の残存行がある場合はno-opとして検証できるが、**異なる利用者データが既にある場合は
@@ -161,6 +170,57 @@ target keyの現在非採用ImageFolder構成行もこの競合検査の対象�
 | `mimageviewer.meta.miv` の明示転送bundle | 元folderに保持。型/fingerprintが変わるので丸copy/自動importしない。成功後の明示exportは既存機能でZをexport可能 |
 | saved search / Smartの定義・parent root・全体設定 / session UI状態 | 画像に付く値ではなく登録された規則/閲覧状態。sourceは残るので元参照は有効。rootやフィルタを勝手に書き換えない |
 | 画像以外の付随ファイル | 元folderに保持。ZIPには入れないことを確認画面に明記 |
+
+### 4.2 タグは全画像からZIP本体へ集約する
+
+2026-10-12利用者決定。post-fenceのworkerが全manifestの`F/n`とF自身のタグを読み、
+既存tag_key正規化による和集合をZの実ファイルkeyへ用意する。未訪問/hidden/種類・facet除外の
+画像も対象。DATだけのタグは§6.3の不足行補充後に読む。sourceの明示空/decidedによって
+復元を拒否された旧タグを和集合へ戻さない。ある画像の空指定が他画像のタグを消す意味にはしない。
+同じtag_keyは1件とし、元applied_atの最古値を保持、同時刻の表記差はmanifest順
+（F自身を先頭）で決める。source各行の時刻/表記/decided状態は変更しない。
+
+空でない和集合はZのタグとして保存する。空でもsourceにdecided状態があれば、Zへ既存の
+明示空状態を保存して旧sidecarによる復活を防ぐ。source全て未設定なら空の決定行を捏造しない。
+集約結果の状態は既存TagsDbのimport由来として記録し、各画像の状態を1件のZへ機械的に複写しない。
+destinationの異なる既存タグ/状態は§4の事前競合で止め、無条件unionで上書きを隠さない。
+
+中央DB、親PのDAT v1、cache/索引の公開は全てZIP本体keyを使う。`Z::n`のタグを作らず、
+tag一覧/検索、ZIPセルの表示、PC全画面の付与/削除、Remoteの既存本体タグconsumerで確認する。
+ZIPページタグの型・検索・UI・wire拡張は今回行わない。元画像を対象にした既存操作は維持する。
+
+### 4.3 XMP-only評価の全manifest準備
+
+現行の表示近傍prewarmに依存せず、post-fence workerが全manifestの物理画像を対象にする。
+`write_rating_to_xmp`と既存format/magic/parse規則を使い、設定OFFではXMPから評価を補わない。
+DBにある評価を正本とし、XMPと異なっていてもDB値・時刻をコピーする。DB未登録の場合にだけ
+XMPから有効な★を読む。埋込bytesをZIPへ入れたことを評価DBの引継ぎの代用にしない。
+
+workerへ渡すのは、既存App共有`rating_session_writes`のmanifest該当keyの世代/明示解除事実と
+既存設定snapshot。所有contextだけのcacheや未訪問idxを正本にしない。未完了のXMP書込みは
+§6.2で先に完了・採用し、旧XMPを読んで明示解除を復活させない。sourceの最新明示解除は
+DB行が無くてもXMP補充より優先し、既存hydrationの世代照合も共有する。
+解除はZIP側のcopy payloadにも0の決定として含め、通常の共有rating公開境界へ対応keyを渡す。
+存在しない0行を永続DBにあると仮定したり、解除を保存する第二の台帳を作ったりしない。
+
+XMP由来の★は読取り準備としてcopy payloadへ含め、今回のためだけにsource DBへ先行commitしない。
+destinationではZipImageのmetadataと既存import由来の時刻規則で保存する（XMPから読んだだけの
+値に、元に無い利用者評価時刻を捏造しない）。読取りは一画像ずつworkerで行い、UIや全画像bytesの
+一括snapshotへ移さない。評価一覧からZ,nを開くこと、ZIP内セルと全画面で★が出ることまで検証する。
+
+### 4.4 お気に入り永続表示状態
+
+`favorite_params`と別表の`adjustment.db.favorite_view_states`を別ownerとして扱う。
+変換開始時に既存のcontext表示状態reconcileを行い、`FavoriteViewWriteDebounce`の未送信Setと
+deferred commandを既存送信経路へ全てflushする。500ms経過や次の入力を待たない。
+先行Set/Remove/ClearのFIFO結果を採用してからsource UUIDの保存状態をworkerで読む。
+
+複製対象の各お気に入りについてold UUID→new UUIDを同じcopy planへ持ち、永続表示状態の
+全フィールド（一覧/列数/順序/既定見開き/読書方向/指定倍率）を新UUIDへ専用writerでSetする。
+指定倍率のNoneと明示無効を区別し、sourceに行が無い場合は新UUIDにも行を作らず継承を保持する。
+Settings保存とfavorite_paramsとこのSetの結果回収・既存mapへの採用を成功条件に含める。
+source UUID/値、兄弟のoverlayを変更せず、新UUIDへ切り替わる表示を勝手に起動しない。
+第二のDB writer、待機用sleep/独自retry、変換専用debounceを作らない。
 
 ## 5. Collection個別画像参照 — 実装前に閉じる重要な範囲
 
@@ -195,6 +255,25 @@ ZIP内ページを表す値がない。`Z::n`を実パスとして入れる案�
 
 独立レビューではAのowner/type/consumer範囲を確認し、設計担当が採否を決める。
 この論点を閉じるまで、引継ぎを満たした機能として実装開始・採択しない。
+
+### 5.1 公開前の容量検査とcloneの完全性
+
+上限は既存の`MAX_COLLECTION_ENTRIES = 10,000`。source登録を残して複製するため、各Collectionの
+現在件数Nと、対応するdestination source identityの同値既存登録/plan内重複を除いた必要追加数Kを
+既存actorで数える。全対象について`K <= 10,000.saturating_sub(N)`を満たすことをConfirm前に確認する。
+旧上限超過Collectionも削除や切詰めをせず、K=0ならno-op、K>0なら事前停止する。
+不足時は最終ZIP公開・destination複製を行わず、
+「コレクションの登録数が上限を超えるため、ZIP を作れません。元のフォルダは残っています。」と通知する。
+
+これは件数だけのUI予測ではない。先行actor変更のreceiptを回収した後、既存revision/catalog guardを
+持つtyped clone planを準備し、modal/Remote受付境界で追加変更を止める。公開直前にも同じactorで
+guardと全対象の容量を照合する。確認後の通常入力との競争を新しい容量予約ownerで解かない。
+上限不足やguard不一致は公開前に止め、部分追加できる既存batchをそのまま成功扱いしない。
+
+clone commandはCollectionごとの既存transactionで全予定登録を追加するか、変更せず拒否する。
+結果receiptはplanに対応するaddedと同値no-opのidentity全件を証明し、`capacity_rejected`は0が必須。
+revision/snapshotも同時に回収する。複数Collectionの全receiptが揃うまで引継ぎ成功を報告しない。
+公開後のDB障害は§7.3の割り切りで扱い、容量不足を部分成功や多段rollbackへ転換しない。
 
 ## 6. 所有境界、非同期、モーダル
 
@@ -254,6 +333,8 @@ modalになった時点でqueueが空だったという観測だけで完了と�
 resume/history/settingsの受理済み保存、bookmark/collection actorの先行変更にも各既存FIFOの
 read/command receiptを用いる。今回必要なsource読取りとcopy commandをそのownerへ通し、
 test-only barrierを製品の完了証明として呼ばない。
+お気に入り表示状態の未送信debounce/deferredを§4.4どおりflushし、専用FIFOの結果採用も待つ。
+全manifestのXMP評価準備（§4.3）とCollection全件容量検査（§5.1）をpost-fence preflightへ含める。
 source/destination/parentのsidecar cacheは既存のworker resources handoffで移す。
 Checking・定期・終了flushが旧Arcを書き戻せる別の予約を残さない。
 worker所有中にsidecarをUIへ再挿入せず、結果receiptとsnapshotを対にして一度だけ採用する。
@@ -279,9 +360,12 @@ sourceの未保存利用者値はそれより前のFIFO fenceで保存済みで�
 未訪問sourceにDATだけの編集/tagがある場合も、既存不足行補充を完了してからsnapshotを作る。
 中央の明示空/解除をDATで復活させない。source DATの丸copyや、source sync印の転記をしない。
 ZIP用のbackup置場はZの親P。`Z.filename::entry`という既存v1相対keyを使う。
+このentry keyはページ編集用。集約タグは`Z.filename`の本体keyだけへ保存する（§4.2）。
 Pの他の画像・他のZIPのtag/編集を保持したmergeを既存SidecarFile/writerで保存する。
 編集backup/tag backupの既存二つの設定を尊重し、OFFでも中央の複製を省略しない。
 source FのDATは保持。今までdirtyだった最新編集を保存することと、変換によるsourceデータ変更を区別する。
+既存source不足行補充はConfirmより前に中央DBへcommitし得る。取消でこれや先行保存を巻き戻さず、
+通常の復元として採用・保持する。sourceファイル/既存登録を失わない保証と、DBの完全不変を混同しない。
 
 ### 6.4 Remoteとの排他
 
@@ -318,16 +402,20 @@ G4F構成行へ戻さず、作成された実ZIPだけが構成対象になる�
 3. 全画像をStoredで格納し、finish/flush/close後にCRCとmanifestを検証。
    列挙時の入力stampと最終stampを照合する。
 4. 最後の取消受付とcommit開始を同じcontrol claimで線形化する。
-   取消が先ならDB/最終Zに一切書かない。commit開始が先なら取消不可の完了保存phaseへ進む。
+   取消が先ならdestination複製/最終Z公開を行わない。既存保存・source不足行補充は保持する。
+   commit開始が先なら取消不可の完了保存phaseへ進む。Collection guard/容量も公開前に検証済みとする。
 5. **最終Zをno-clobberで公開してから**、検証済みmetadataを各既存ownerで複製する。
    先にmetadataだけ写す案は、最終公開で外部アプリが作った同名ZIPと衝突した際に
    その別ZIPのデータを汚すので採らない。公開したZはhandle/実体identityで操作所有を保持する。
 6. データ・DAT・専用service snapshotの完了、index/ledgerの必要な受付receiptを回収する。
    成功はmetadata完了後にだけ報告する。途中のZをApp/Remoteへ成功として開かせない。
 7. worker準備済みrefresh結果を所有contextへ一度だけ採用する。
-   そのcontextを既存の親実folder一覧へ戻し、Zの**path identity**をcursor/選択にする。
+   そのcontextを既存の親実folder一覧へ戻し、採用済み可視投影にZがあればその**path identity**を
+   cursor/選択にする。Zが同名3択・種類・facet等で不可視なら、既存の操作後可視選択規則を使う。
+   設定を強制変更せず、非表示idxを選択しない。空の可視列も既存規則に従う。
    自動fullscreen・本の構成editor自動openはしない。別context/兄弟の位置や列を変更しない。
 8. modalを成功Resultへ進める。閉じてから通常のZIP閲覧/構成編集ができる。
+   可視/不可視にかかわらず成功通知に出力先Zを出し、不可視でも作成失敗とは扱わない。
 
 集約一覧/検索/collectionでfolderを右クリックした場合も、その操作の起点contextを
 既存の「ある場所のfolderへ移動」経路でPへ戻す。起点のreturn stateを破壊して独自にitemsを差替えない。
@@ -344,6 +432,8 @@ display-independent pollから回収する。利用者の次の入力を待っ�
 Preparing/Confirm/WaitingForWriters/Copyingで「取消」またはIME-safe Escape。
 worker中の取消はsignal送信後、terminal receiptまではmodal ownerを保持する。
 コピーchunk/画像境界/CRC検査/最終claimでcancelを確認する。
+commit前取消でも、先行した通常の保存とsource DAT不足行補充は保持し、destination複製と
+最終ZIP公開だけを行わない。この操作のtempは除去する。source補充の巻戻し用状態を追加しない。
 Committing/Adoptingは取消ボタンを無効にし「保存を完了しています」と表示。
 ×/Escapeで隠して裏に保存workerだけ残さない。
 
@@ -357,7 +447,8 @@ DB/FS障害はログと日本語通知。再試行loop、独自journal、補償t
 回復中の回復を作らない。source files/source利用者行は常に保持する。
 元のfolderと画像、変換先にあったデータを削除して復旧しない。
 
-- commit前: この操作のtempだけ除去。最終Z/中央DBは変更無し。
+- commit前: この操作のtempだけ除去。最終Z公開/destination複製無し。
+  既存保存とsource不足行補充は保持し、中央DB全体の変更無しとは保証しない。
 - 公開競合: 既存Zを保持。metadata複製はまだ行っていない。
 - commit後の複製失敗: 成功として開かず、この操作が公開したZだけをidentity確認して除去する。
   外部差替えされた同名Zは消さない。既にcommitしたコピー行は再取得/巻戻ししない。
@@ -400,9 +491,9 @@ DB/FS障害はログと日本語通知。再試行loop、独自journal、補償t
 既存case/path規則で照合する（`本.pdf` folderの相手は`本.pdf.zip`等）。
 純粋関数の入力はworkerが確定した実体種類・照合名・3択で、関数内にFS/DB I/Oを入れない。
 
-source種類/hiddenの採否 → 本同士の既存優先規則 → folder/本の3択 → 従来の後段投影を
-同じ候補集合へ適用する。本同士の`skip_archive_if_zip_exists`（ZIP/CBZ優先）と
-`skip_epub_if_pdf_exists`（PDF優先）は独立した既存設定として維持する。
+source種類/hiddenの採否を済ませ、各producerの旧folder/本の同名除外位置を共通3択へ置き換える。
+本同士の`skip_archive_if_zip_exists`（ZIP/CBZ優先）と`skip_epub_if_pdf_exists`（PDF優先）は
+独立した既存設定として維持する。既存のfilter順・後段facet・再帰探索範囲を組み替えない。
 同名の本が複数あるときも、それらの生存候補を3択へ渡す。folderを省略する側の本が
 別filterで全部消えた後に、folderだけが省略された結果を作らない。
 逆に「フォルダを表示」で本が省略されても、同じ集合のfolderを再度省略しない。
@@ -411,8 +502,9 @@ source種類/hiddenの採否 → 本同士の既存優先規則 → folder/本�
 ### 8.2 接続するproducerと設定の適用
 
 - `book_materialization`の通常一覧、共通folder scanを使うSmart / subfolder expansion / Remote。
-  一つのpure policyを呼び、行・display metadata・sort metadataを対で省略する。
+  各producerの既存ディレクトリ内候補へ一つのpure policyを呼び、行・display metadata・sort metadataを対で省略する。
   formatごとの分岐へ別々のbool条件を増やさない。
+  Smart/subfolder expansionの再帰先と再帰生成行には§8.2.1の境界を維持し、集約完了後の全件filterは加えない。
 - `FolderTreeOptions`、sorted_subdirs、DFS、Ctrl+↑↓。旧`skip_zip`のboolを同じenumへ置換する。
   各child folderの新規内容走査はしない。省略された現在folder/本のanchorは位置探索に保持し、
   次/前の着地対象からだけ外す。画像なしfolderを飛ばすlimitとは別の同名規則で、limit=0でも適用する。
@@ -423,6 +515,40 @@ source種類/hiddenの採否 → 本同士の既存優先規則 → folder/本�
   Remote内部の設定読取りも§8.3の互換decoderを共有する。新しいRemote操作/wire fieldは加えない。
 - 直接path指定、既存history/bookmark、明示collection登録を無効化しない。
   source行や検索定義を書換え/削除する設定ではない。
+
+### 8.2.1 Smart / subfolder expansionの現行範囲を維持する
+
+調査基準`53e90f8ef`。旧`skip_zip_if_folder_exists`は、親の同名folderを根拠に
+**そのディレクトリ内の本候補を省略する設定であり、探索先の枝刈りではない**。
+
+| producer / 現行境界 | 旧ONの作用 | 3択で維持する範囲 |
+| --- | --- | --- |
+| Smart `scan_one_directory`の`subdirs.push` → `normalize_smart_folder_candidates` | 再帰先を先に登録。直下Folder/Zip/Pdf/Archive候補の本側を省略し、その後rule/facetへ渡す | 同じ直下候補をpolicyへ渡す。「本を表示」は親に出すfolder行だけを省略。`subdirs`は変更しない |
+| subfolder expansion `scan_one_directory`の`subdirs.push` → container retain | 子を先に探索予定へ登録。現在ディレクトリの`real_folder_names`を根拠に、表示対象Zip/Pdf候補を省略 | 同じ直下候補とfolder照合情報をpolicyへ渡す。親走査は元々folder行を出さないので、「本を表示」で削るfolder行はそこには無い。子の探索予定は変更しない |
+| subfolder expansionの子ディレクトリ走査での`image_folder_books`折畳み | 子自身の内容からFolder本セルを出し、親の兄弟ZIPを見直さない | この自己生成セルを親の省略maskで消さない。OFFなら配下画像を従来どおり出す |
+
+例えばPに画像folder FとF.zipがあり、再帰が有効な場合:
+
+| 結果 | フォルダを表示（旧ON相当） | 本を表示 | 両方表示（旧OFF相当） |
+| --- | --- | --- | --- |
+| Smartの親候補 | F、F.zip無し | F.zip、親のF行無し | FとF.zip |
+| Smartの配下画像 | 従来ruleで一致する画像を保持 | 同じ画像を保持 | 同じ画像を保持 |
+| subfolder expansion、画像folder本扱いON | 子走査で生成したFセル | F.zipと子走査で生成したFセル | F.zipと子走査で生成したFセル |
+| subfolder expansion、画像folder本扱いOFF | F配下画像 | F.zipとF配下画像 | F.zipとF配下画像 |
+
+この再帰結果でFとF.zipが共に残る場合も、親の表示方向だけを変える承認範囲内であり、
+それを見た目の重複として後から全件除外しない。種類/hidden/rule/画像folder本扱い/深さ制限は従来のまま。
+subfolder expansionに現状無いArchive行や新しい走査先を今回追加して全形式の見かけを揃えない。
+pure policy自体は全対象形式を扱い、各producerは現行の資格・提示可能種類だけを入力する。
+明示Smart source F、明示subfolder expansion root F、直接open/history/bookmark/collectionのFは
+親の候補行が省略されても走査/open可能。rootを同名policyで退役させたり定義を書き換えたりしない。
+
+受入は直下policyの単体試験に加え、実walkerの再帰完了snapshotとprepared itemsまで確認する。
+Smartの複数source/重複rootとinclude_descendants OFF、subfolder expansionの本扱いON/OFF、
+明示root、hidden/種類/rule/facet/深さ制限で旧ON→「フォルダを表示」、旧OFF→「両方表示」の
+旧結果との一致を固定する。「本を表示」でも到達ディレクトリ・配下結果が増減しないことを検査する。
+**再帰を刈る/再帰生成セルや配下画像へ適用を拡張する変更はこの設計に含めない。**
+実装でこの範囲を保てない前提が見つかった場合は、その時点で止めて設計担当へ報告する。
 
 ### 8.3 リリース済みboolの設定DB移行 — 利用者決定2026-10-12
 
@@ -516,7 +642,9 @@ folder右クリックの「ZIP に変換…」と、構成対象外案内の「Z
 画像以外を格納しないこと、全画像を対象にすることを表示。「ZIP に変換」「取消」。
 保存先入力・別名・圧縮率・元を削除するcheckboxを加えない。
 進捗は「画像を ZIP に保存しています」「登録や編集を引き継いでいます」「一覧を更新しています」。
-成功は「ZIP を作成しました。元のフォルダは残っています。」、失敗は実際のpath付きの簡潔な通知。
+成功は「ZIP を作成しました。元のフォルダは残っています。保存先: ＜出力先＞」。
+出力ZIPの可視性は成功条件としない。不可視なら既存の可視選択規則に従い、設定は変えない。
+失敗も実際のpath付きの簡潔な通知。
 内部名（scope、ledger、maintenance、token）を利用者の画面へ出さない。
 
 ダイアログはCLAUDE.mdのIME helpers、theme/弱文字/警告色、wheel/key guard、
@@ -548,17 +676,35 @@ source/destination sidecar所有の設計レビューを終える。案Bの3択�
 - Stored/ZIP64、元bytesの完全一致、名前/CRC/枚数、元file/folder不変、同名existing/公開直前競合/既存part不変。
 - source途中変更、unsafe/非UTF/case衝突/reparse拒否。拒否後も従来folder閲覧と編集が可能。
 - 棚卸しの各authoritative値・明示空・Missing参照・元行/元id保持。評価/タグ一覧とZIPの実openから検証。
+- タグは複数画像の和集合とF自身のタグをZ本体へ集約。重複tag_key/時刻/表記差、未訪問/hidden/種類・facet除外、
+  DAT-only、画像ごとの明示空、全て空/未設定、残存target競合、backup ON/OFFを確認。
+  `Z::n`タグが作られず、親DATの本体key、タグ一覧/検索/ZIPセル、PC全画面とRemoteの既存本体付与/削除で利用できる。
+- 全manifestの未訪問/hidden/種類・facet除外画像のXMP-only★。設定ON/OFF、DBとXMP不一致、
+  明示解除0と先行XMP writerの完了順、format/magic非対応、評価無しを確認。
+  変換後の評価一覧から実ZIPページへopenし、ZIP内セル/全画面の★を確認。sourceへの不要なXMP補充commit無し。
 - bookmark/resume/shiftは型変換したidentityへ実consumerで着地。Single/Spread/Split、mode-only、RTL/表紙の一致。
 - DATだけのsource補充、backup OFF、Pの他ZIP/画像値保持、旧pending Arc/Checking/終了flushの完了順序。
 - editor保存→所有窓終了→別folderから変換開始。保存票の採用前にmaintenanceを取らず、worker拒否/古いflushが出ない。
 - dirty trim/tag/edit/migration完了→copyの順序を実worker信号で固定。sleep/retryで正しい順序を偶然待たない。
+- お気に入り表示状態を変更直後、500ms前の未送信debounceがある状態で変換開始。
+  source Set/Remove/Clear→fence→新UUIDへのSet→結果採用を実FIFOで固定し、再読取とZIP側お気に入りconsumerで
+  既定見開き/読書方向/指定倍率（None/明示無効含む）の一致、source UUID/兄弟overlay不変を確認。
 - AならCollection folder/個別画像/部分集合/複数登録/手動順/shuffle/現行v2 migration/backup/PC/Remote playback。
-- 取消の全phase、最終claim前後、root/F12 close、worker失敗・progress無しでも完了採用。source/sibling不変。
+- Collection満杯、上限直前（Kが残容量と一致/1件超過）、同値target/plan内重複、複数Collectionの1件だけ不足、
+  旧上限超過（K=0/K>0）、先行actor commandの完了順を確認。不足時は最終ZIP無し/destination追加無し。
+  成功receiptは全identityを覆い`capacity_rejected=0`、拒否commandは部分追加無し、source登録/順序を保持。
+- 取消の全phase、最終claim前後、root/F12 close、worker失敗・progress無しでも完了採用。
+  sourceファイル/既存登録とsiblingを保持。source DAT補充済み→Confirm取消と先行dirty保存→Copying取消では
+  保存/補充を保持してsnapshotを採用し、destination複製/最終ZIP無し/temp除去/資源返却を確認する。
+- 完了選択は3択×種類/facetでZ可視/不可視（可視列空も含む）を検査。可視ならZのpath identity、
+  不可視なら既存の可視選択、通知は全て出力先付き。F12/集約一覧起点、起点退役で兄弟選択不変、設定変更無し。
 - Remote acquireと変換受付の両順序。LocalInUseでphase/generationが変わらず、変換完了後は通常取得可能。
 - 3択×ZIP/PDF/EPUB/RAR/7z/LZH（既存別名含む）、同名の本が複数ある場合、本同士の既存優先設定との組合せ。
   `.zip`/`.pdf`名の実folder、`本.pdf`folder、種類非表示/hidden/Ignore/non-first volume、表示候補無しの場合。
-- 通常一覧 / Ctrl+↑↓ / sorted_subdirs/DFS / Smart / subfolder expansion / Remoteで同じ3択の結果。
+- 通常一覧 / Ctrl+↑↓ / sorted_subdirs/DFS / Smart / subfolder expansion / Remoteで同じpure policyを使用。
   省略されたcurrent folder/本anchorの前後、limit=0、明示「フォルダを表示」で旧表示を再現、source直接open維持。
+- Smart/subfolder expansionは§8.2.1の実walker再帰完了結果を検査。親行の省略と配下の保持を分け、
+  本セル再出力/配下画像/明示source rootを一括filterで消さない。旧ON/OFF相当の結果はHEADの既存範囲と一致。
 - 新規設定の既定「本を表示」、旧DBのON/OFF/欠落、旧JSON→DB、backup復元、移行前後の正常保存、再起動。
   旧ONの明示選択/既定を区別できると偽ったfixtureを作らず、双方「本を表示」、旧OFFは「両方表示」を検査する。
   新enumがある場合は3値全てを保持し、旧bool共存で上書きしない。未知enum/型不正/future schemaの保存保護も検査。
@@ -574,5 +720,5 @@ source/destination sidecar所有の設計レビューを終える。案Bの3択�
 `scripts/test-full.ps1`。各commandの実数/exit/logを記録し、既知の別失敗と新失敗を区別する。
 実アプリ起動は通常開発へ混ぜず、別途明示了承済みの確認枠にする。
 
-今回行ったのはコード・文書の読取りとこの設計書の作成のみ。実装・build・試験・起動は行っていない。
-独立レビュー済み、利用者確認済み、全gate成功という主張はしない。
+今回行ったのはコード・文書の読取りとこの設計書の改訂のみ。実装・build・製品試験・起動は行っていない。
+2026-10-12の利用者決定は§1/§4.2/§8.3へ記録済み。設計全体の独立レビューACCEPT・実装gate成功は未記録。
