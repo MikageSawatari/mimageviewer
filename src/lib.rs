@@ -217,6 +217,7 @@ mod native_name_dialog;
 pub mod open_with;
 pub mod os_theme;
 mod page_dims;
+pub mod page_overview;
 pub mod page_split;
 pub mod panorama;
 pub mod panorama_wgpu;

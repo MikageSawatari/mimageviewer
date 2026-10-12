@@ -1455,6 +1455,26 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-12 §1.340 R5: 双方の構造合意と実装開始
+
+利用者が提示した独立レビュー結果は `a3bb1775b` **ACCEPT（P1/P2/P3なし）**。
+R5の通常fullscreen／メイン内閲覧への拡張も含め、「症状パッチではなく構造的修正である」
+ことに独立Codex reviewerが合意し、ClaudeCode側も同意した。§2の着手条件を満たした記録として残す。
+[設計書](detached-book-page-overview-plan.md) §10のT1→T5に沿って実装する。
+既定O、context-owned state／immutable metadata／bounded exact demand、既存着地とGrid同期、
+非active Select破棄を維持し、placement／HWND捕捉／background landingは追加しない。
+各chunkのtargeted tests／fmt／通常・portable checkと最終gate・確認buildは設計書へ記録する。
+アプリ起動・コミット・CHANGELOG更新は今回の作業に含めない。
+
+T1純粋モデル（`src/page_overview.rs`／`src/lib.rs`）は16 tests／fmt／通常・portable core check成功、
+独立完了レビューACCEPT（P1/P2/P3なし）。App／viewport接続はまだ行っていない。
+T2の前提照合で、PDF queued promotionがperf_keyだけで兄弟／Remote jobにも作用することを確認。
+§8.2／§10の条件に従い、[設計書§18](detached-book-page-overview-plan.md#18-t2-pdf-queued-promotionの限定設計2026-10-12claudecode側の合意待ち)に
+mandatory-ownerのcancel Arc identityでqueued jobだけを昇格する限定案と、foreground再評価も
+同じownerへ揃える接続条件を記載して停止した。独立reviewerは限定構造案へ合意済み、
+ClaudeCode側の追加境界合意と実装レビューは未実施。PDF製品コード変更・新たなepoch／取消変更はない。
+T1 ACCEPTを機能全体の完成・native入力／focus確認済みとは扱わない。
+
 ### 2026-10-12 §1.340: 画像窓内ページ一覧の設計提出（構造合意待ち、コード変更なし）
 
 `next-tile` / `ea060b66e` 基準の

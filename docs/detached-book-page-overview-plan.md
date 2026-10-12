@@ -1,10 +1,10 @@
 # 画像閲覧中の本のページ一覧（§1.340）設計
 
 作成: 2026-10-12 / Codex、基準: `next-tile` / `ea060b66e`。
-状態: **R3 `015b44c03` は独立レビュー ACCEPT・構造的修正への合意済み。実装未着手。**
+状態: **R5 `a3bb1775b` は独立レビュー ACCEPT（P1/P2/P3なし）、独立Codex reviewer／ClaudeCode双方の構造合意済み。T1実装・検証・独立レビュー完了。T2のPDF scoped APIの限定設計を§18へ提出し停止。**
 改訂 R5: R4 `7d0d0cf0a` の再レビュー REVISE（P1 1件）と2026-10-12の利用者／coordinator判断を反映。
 既定キーは **O（Overview）で確定**。一覧からの選択は当該viewerの通常ページ移動と同じ扱いにする。
-拡張部分は再レビュー待ち。ここで実装を開始しない。
+利用者の指示により§10のT1→T5で実装する。検証・未解決事項は§17へ記録する。
 R3 の非アクティブ context への Select 破棄・一覧維持の契約は保持する。
 公開時期は v4.6.0 の次の版の**後**。次の版の必須成果にはしない。
 項目・出典・時期の正本は [next-release-backlog.md §1.340](next-release-backlog.md#1340-複数ウィンドウの画像ウィンドウ内に本のページをタイル表示する--miv-スレ-509519-2026-10-07)。
@@ -510,10 +510,9 @@ IPC payload を変更する必要は現提案にはなく、変更するなら�
 
 ## 10. 実装 chunk と予定ファイル所有
 
-今回は docs だけを書く。R3 `015b44c03` は独立レビューACCEPT、
-「detached §2 に沿う構造追加であり症状パッチではない」ことへの合意済み。
-通常fullscreen／メイン内閲覧への拡張はR4再レビューでP1が出たため、R5の通常ページ移動との
-同一契約・O入力を再レビューに出す。キー選択は確定済みで、拡張部分の合意後に実装へ進む。
+R5 `a3bb1775b` は独立レビューACCEPT、通常fullscreen／メイン内閲覧への対象拡張を含め
+「detached §2 に沿う構造追加であり症状パッチではない」ことへ独立Codex reviewer／ClaudeCode双方が合意。
+既定Oと通常ページ移動との同一契約も確定し、利用者が実装開始を指示した。
 §1.242 統合後の projection／landing API の差分もレビュー対象に含める。
 一つの chunk で shared file の writer は実装担当一人とし、別 worktree の master 更新と突き合わせる。
 
@@ -634,7 +633,8 @@ Bのactive ownerを保持することも重点とする。background landingの�
 
 5. **既定chordはO（Overview）で確定**。固定入力との照合とKeyAction実装前提は§4.2。
 
-キー選択待ちは解消済み。対象拡張のP1へ通常ページ移動との同一契約で対応したR5を再レビューに出す。
+キー選択待ちは解消済み。対象拡張のP1へ通常ページ移動との同一契約で対応したR5はACCEPT済み。
+現在の実装状況とT2限定設計の確認事項は§17／§18を参照する。
 
 初回設計提出（`6432e8e04`）の文書作成時の記録: 成果は設計文書と索引／§11 記録のみ。
 実装担当による製品コード変更 0、製品起動 0、コミット 0（文書のコミットは coordinator）。
@@ -725,3 +725,111 @@ R3の構造合意は維持、R4拡張全体への合意は保留。通常単ペ�
 Rustテスト0件、通常／portable core check各0回、test-full・build各0回、製品起動0回、コミット0回。
 改訂の検証: ローカルリンク16箇所・欠落0、現行O関連既定chord式4件（Ctrl+O 1件、編集O 3件）と
 固定入力境界を静的照合。受入計画20ケース群を検査し、`git diff --check`成功（exit 0）。実装検証は未実施。
+
+## 17. R5 ACCEPT と T1 実装記録（2026-10-12）
+
+利用者が提示したR5 `a3bb1775b` の独立レビューは **ACCEPT、P1/P2/P3なし**。
+通常fullscreen／メイン内閲覧への対象拡張を含めて構造的修正へ独立reviewerとClaudeCodeが双方合意し、
+利用者が§10順での実装を指示した。detached計画§11へ双方合意を記録した。
+
+T1の変更は `src/page_overview.rs` と `src/lib.rs` のmodule宣言。純粋なClosed／Open owner、
+metadata／reader-orderのArc共有、整数index remap、仮想行／有界overscan、RTL／幾何cursor移動、
+scroll／reflow、stamped Selectの検証を実装した。実ページの白紙補助annotationは独立targetを持たない。
+inactive／stale／navigation拒否のSelectはlandingもcloseもせず、受理時だけClosedへ遷移する。
+実際のactive session／surface bindingの検証はT2／T3の接続先が供給する契約であり、
+純粋モデルのcontext serialだけでnative window所有を検証済みと扱わない。
+
+canonical metadataと読み順を準備する実装、ViewerContextBundleへの接続、需要／worker／PDF、
+全surfaceの描画・入力、OのKeyAction、snapshot、マニュアルは未実装（T2〜T5）。
+T1の白紙情報は既存構成ownerの情報を受け取るadapterであり、新たな構成保存形式ではない。
+§1.242 consumerの統合時には§7のprojection／landing照合を実施する。
+
+独立 `gpt-6.1-sol` / `xhigh` reviewerによるT1完了レビューは **ACCEPT、P1/P2/P3なし**。
+対象は純粋モデル2ファイルで、ページ一覧機能全体の完了判定ではない。
+reviewerは以下の証拠を再利用し、追加のtest／build／製品起動は行っていない。
+
+| T1の実行済み検証 | 実数／結果 |
+| --- | --- |
+| `cargo test -p mimageviewer --lib page_overview` | **16 passed、0 failed、0 ignored、12,188 filtered out**。初回compile込み7分40秒、test 0.08秒、exit 0 |
+| `cargo fmt --check` | 1回、exit 0 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 1回、2分10秒、exit 0 |
+| `cargo check -p mimageviewer --bin mimageviewer-core --features portable` | 1回、1分24秒、exit 0 |
+
+testsは状態遷移、各stamp要素／identity／active ownerの拒否、landing受理、共有／remap、
+RTL／空slot／gap、幾何移動、PageUp／Down／Home／End、縮小面／列数、50,000ページの有界範囲、
+passive metadataによる新規露出placeholderのidentity、reflow、白紙補助を対象とした16本。
+passiveテストは純粋metadataの高さ拡大であり、実際のwidth／DPI変更・first-clickの
+activation／handler回帰は未実施でT3に残る。既存警告あり、compile errorなし。
+
+§18の前提不足でT2接続前に停止した。最終 `test-full.ps1` 0回、release／dev確認build各0回、
+UI glyph／snapshot実行0回、製品起動0回、コミット0回、CHANGELOG変更なし。
+まだAppが呼び出さない純粋モデルだけなので、確認用binaryを作ってページ一覧を試せる段階ではない。
+最終gate／必要時のrelease build／build-devとマニュアル・snapshot更新はT5で実施する。
+停止時の文書差分は `git diff --check` 成功、新規ローカルリンク4箇所・参照先欠落0。
+§17／§18と索引・backlog・detached§11の記録を独立reviewerが確認し、追加指摘0件。
+
+## 18. T2 PDF queued promotionの限定設計（2026-10-12、ClaudeCode側の合意待ち）
+
+### 18.1 確認した前提不足と停止根拠
+
+§8.2の「scoped queued prune／promotionに必要な相関が現行APIに足りなければ、その所有境界の
+限定修正を独立レビューへ返す」、§10 T2の「必要時のPDF scoped APIは別レビューしてから」に該当する。
+既存のAPIをそのままoverviewへ接続すると、同じPDFの同ページを読む兄弟／Remoteの仕事にも作用する。
+通常操作で到達する所有境界であり、まれな失敗として割り切るものではない。
+
+静的確認した経路（今回PDF製品コードは変更していない）:
+
+- `src/app.rs::ensure_still_seek_thumbnail_requests`はPDF page keyだけで
+  `pdf_loader::promote_to_high_normal`を呼ぶ。APIはcontext／request ownerを受け取らない。
+- `src/pdf_loader.rs::PdfWorkerPool::promote_to_high_normal_impl`は全Normal／HighNormal laneを
+  perf_keyだけで走査・昇格・並べ替えする。同keyの別context jobも対象になる。
+  `PromoteScope`はGridVisible／FullscreenCurrentという用途区別で、context所有者ではない。
+- `Job.cancel`はworkerのcontext cancel Arcから `thumb_loader`のPDF render、
+  `pool.execute`を経てcloneされたArcを保持する。bool値ではなくArcのidentityで識別できる。
+- ensureはApp-globalの `last_promoted_visible_keys`／`promote_retry_pending`も書き、
+  Grid bookkeepingは同じmemoを読む／更新してunscoped APIを呼ぶ。
+  この2フィールドはViewerContextBundleのswap対象ではないため、単一callの差し替えだけでは不足する。
+
+### 18.2 提案する限定境界
+
+既存unscoped APIの互換性は保ち、foreground exact demand用に
+`promote_to_high_normal_for_owner(keys, owner_cancel: &Arc<AtomicBool>)`（名称案）を追加する。
+owner引数をoptionalにせず、queued jobの**perf_key一致 AND cancel Arcの`Arc::ptr_eq`一致**で対象を決める。
+同じbool値でも別Arc、cancelなし、同keyの兄弟／Remoteは対象外。context epochをownerの代用にしない。
+
+- 対象ownerのqueued NormalをHighNormalへ昇格し、対象ownerのHighNormal内では現需要を優先する。
+  対象外jobのpriorityと対象外同士の相対順を保持する。追加された自contextの仕事が共有poolで
+  schedulingされることまで禁止するものではない。
+- `already_high`／`not_found_keys`も対象ownerのjobだけで計算する。
+  pool未初期化時には従来同様起動せず、対象keysを未発見として返す。
+- Critical／取得済みin-flight／completed、epoch、取消tokenの値、prune／reply／保存終端は変更しない。
+  cancel Arcは識別に使うだけで、overview close時に立てない。context tokenの新設も不要。
+- T2の単一foreground dispatcherは、最初の昇格とworker enqueue後の再評価を同じowner付きAPIへ揃える。
+  overviewのkeys／未発見状態を既存App-global Grid memoへ書かず、bundleが所有する
+  foreground exact demandの生命周期内に収める。Gridの既存unscoped callや共有memoへoverviewの
+  再昇格を委譲しない。park／swap／fork／retireでもownerと需要が一緒に扱われることを検査する。
+
+新たなpool／queue／Job ownerフィールド、全窓epoch失効、広域取消、retry機構を増やす案は採らない。
+既存cancel Arcを使い、既存の需要ownerへ再評価を揃える方が状態の組合せを減らせるため。
+局所queued pruneのrequest ID／Pixels／Finalized契約は§8.2のまま。
+**まれな失敗は割り切り（ログ + 通知 [+ 作り直し]）**を維持する。
+
+### 18.3 限定レビューと次の検証
+
+独立 `gpt-6.1-sol` / `xhigh` reviewerは上記のAPI前提不足を確認し、
+mandatory-ownerのkey AND cancel Arc identityという限定構造案へ合意した。
+T1 ACCEPTやR5全体合意を、この追加境界のClaudeCode側合意・実装レビューと取り違えない。
+**ClaudeCode側へ本節の限定境界とforeground再評価の接続条件を返し、合意確認までT2を実装しない。**
+製品コードでPDF queueの所有境界を変える前の停止であり、公開済み操作は変更していない。
+
+合意後のtargeted regression:
+
+1. 同key・同bool値の別ArcのA／B／Remote、cancelなしを混在させ、AだけNormal昇格／HighNormal並べ替え。
+   非対象priority／相互順序とCritical／in-flightが不変、statsもAだけから算出されること。
+2. 同じownerのArc cloneは一致し、keys空／pool未初期化では新規仕事やpool起動がないこと。
+3. A demandをpublish→worker enqueue後の再評価、A park→B mount／同key demand→A resumeを通し、
+   owner memo／keysが漏れず、再評価もscopedで、Gridのmemoでoverview需要が再投入されないこと。
+4. overview close／再入場・fork／retireと局所prune／Finalizedを通し、兄弟の仕事は保持されること。
+
+PDF scoped API／dispatcher接続は未実装、上記4群の実行済みtestは0件。
+T2ではこのregressionと既存thumbnail request／viewer context回帰、fmt、通常／portable checkを実施する。
