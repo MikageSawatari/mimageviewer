@@ -43,6 +43,16 @@ live一覧のcursor／Shift起点は `App::move_grid_cursor(target, GridCursorIn
 計算し、このownerへ渡す。identity remap／contextの値転送は対を保つ既存非navigation経路。
 詳細と全caller分類は [評価filterのfullscreen整合](rating-filter-fullscreen-plan.md)。
 
+ページ補正の編集内容・選択レイヤー・gestureは `ViewerContextBundle` が所有する。
+`PageEditOwner` の安定した `PageAdjustmentTarget` が保存先を決め、items番号は描画投影だけに使う。
+同一覧の採用時にownerのslotを再解決し、入力中はその小さなslot集合へdraftを投影する。
+App共有のUndoへ次操作を受理する前に全contextの完了済み保留を確定する。
+local writerの最新受付済み全文を新規runのbeforeに使い、completionはrequestごとのoriginへ配送する。
+通常Pageも受付成功を同keyの全contextへbatch反映し、parked代表サムネの更新通知を
+表示中contextだけで消費せず、既存退去境界で全所有contextへ配送する。
+通常終了は全contextの要求配送→既存writer停止→completion mirror→sidecar flushの順。
+詳細は [ページ補正の所有設計](page-adjustment-owner-plan.md)。
+
 ---
 
 ### 音声サムネイル (§1.347、2026-10-08)

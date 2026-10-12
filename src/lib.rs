@@ -152,6 +152,7 @@ pub mod filename_stack;
 pub mod filename_stack_script;
 mod final_composite;
 // filename_stack_ui は private な App へ impl を追加する library-internal module。
+mod adjustment_parameter_edit;
 mod filename_stack_ui;
 pub mod folder_pane;
 pub mod folder_rating_counter;
@@ -192,6 +193,7 @@ pub mod known_folders;
 pub mod local_adjust_catalog;
 pub mod local_adjust_db;
 pub mod local_adjust_effect_ui;
+pub(crate) mod local_adjust_parameter_edit;
 pub(crate) mod local_adjust_write_worker;
 pub(crate) mod log_writer;
 pub mod logger;

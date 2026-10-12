@@ -1,7 +1,7 @@
 # §1.372 補正編集のページ identity と viewer context 所有
 
-2026-10-12、branch `next-fix`、初回調査基点 `f182037c2`、追補基点 `440fdf69b`。
-状態: **独立レビューREVISEのP2 2件を設計へ反映・再レビュー待ち。§1.372 の製品コードは未変更**。
+2026-10-12、branch `next-fix`、初回調査基点 `f182037c2`、R2追補基点 `440fdf69b`、R3基点 `a5648d3cb`。
+状態: **R2再レビューのP2 1件を反映、実装・独立sourceレビュー・自動検証・確認用build完了。§9は範囲外として別項目に起票（coordinator担当）**。
 正本は [next-release-backlog.md §1.372](next-release-backlog.md)。実機での再現報告ではなくコード調査。
 
 ## 1. 問題と既存の保護
@@ -79,13 +79,16 @@
 同じownerの投影として扱い、交換時に別contextの状態を借用しない。
 
 通常ページdrag、標準drag、local shape key、canvas、shape drag、brushなどの
-相互排他的な編集中状態は一つのenumへまとめる。各variant内にowner、before、
+相互排他的な編集中状態は一つのownerへまとめる。各状態内にowner、before、
 現在のdraftとgesture payloadを持ち、別Optionのbeforeやfield-presenceを状態判定に使わない。
 完了済みキー編集と未完のラッソ／線の取消の区別をvariantの終端で表す。
 レイヤー／マスク／図形番号もそのdraft文書内の座標として保持する。
 編集対象に結び付くmode／選択レイヤー／図形／maskの状態もこのcontextのeditorに属する。
 全体で共有するブラシ設定などの利用者設定までper-contextへ移して操作仕様を変えない。
 単一enumへ束ねる前に実際の同時成立経路を確認し、合法な組を無断で除去しない。
+実装前棚卸しではkey保留とpointer操作の合法な同時成立を確認した。coordinatorの判断で
+§9の同一ページ内の終端不整合は今回は直さない。既存の併存payload・pointer/key終端を
+維持してcontextと安定targetへ所有を揃え、排他enumへの機械的な統合で操作を除去しない。
 
 | 遷移 | ownerの扱い |
 | --- | --- |
@@ -193,6 +196,15 @@ sidecar queueだけを行い、writer停止／join／sidecar完了待ちへ拡�
 UI同期SQL／I/O、待機、sleep、repaint追加で順序を調整しない。
 
 編集中の全文はownerのdraftが正本。preparedなdurable snapshotとindex mapは読み取り投影。
+**新規runのbeforeとdraft初期値は、同keyの最新受付済み文書から取得する**（R2レビューP2）。
+§4.1で先行runを確定した後、既存write ownerが保持する最新文書を保存待ち／完了未回収でも
+優先する。該当文書がない場合だけ、現contextの有効なprepared投影を使う。
+他contextに未完draftがあってもそれを最新受付済み文書として借用しない。
+キーだけのpendingへ別の正本mapを重ねず、既存write ownerの要求文書と保存世代へ揃える。
+workerへ受け付けた時点でこの文書を新規runから参照可能にし、DB読取・completion待ちを追加しない。
+保存完了で古い別contextの投影へ戻さず、同keyの既存projection更新とownerの同key版に接続する。
+これにより同keyのAがS0→S1を確定直後、Bの編集はS1をbeforeにして始まり、
+BのUndoはS1、RedoはBのafterへ配送される。Aの変更をS0へ巻き戻さない。
 採用時は既存 `PAGE_EDIT_WRITES` stamp／context／items世代／edit revisionのfenceを維持し、
 その上へ同keyのdraftを投影する。volatile keyだけ残してlayersを捨てない。
 ローカル編集の全文を複数mapの独立した正本として持たず、既存layers mapを投影へ位置付ける。
@@ -214,6 +226,30 @@ sidecar座標・表示更新のowner contextとedit revisionを対応させる�
 保存失敗は既定のログ＋通知で扱い、retry・rollback・回復worker・新たな完了待ちを作らない。
 既存page-edit reconcileの仕組みは本件で増設しない。renameでkey自体が変わる経路は
 既存の明示編集終端・key付替え境界へ接続し、一般一覧reindexと同一視しない。
+
+### 5.1 通常Pageの受付値と終端の色差（full gate追補）
+
+通常PageもDBがCommittedを返した時点で、受付済みkey→個別値を同keyの全contextへ
+batch publicationする。単体set/clear・Undo・全ページapply/clear・選択適用/解除・
+標準一致prune・bundleの成功後runtime commitを同じ境界へ接続する。
+既存key集合を一配送にまとめ、各contextのitems/orderは一回だけ走査する。
+mapとprepared snapshotを更新し、activeな同key Page draftは保持する。
+派生キャッシュは実効before/afterの既存分類（final-only変更ではfinal AI保持）で失効する。
+ring pickerのpreviewとread-only hydrationは共有publicationしない。
+新runはこの最新受付済み投影をbeforeに使い、DB読取やcompletion待ちを追加しない。
+
+common Page終端の色差はpreview適用済みmapから取り直さず、captured beforeの実効値と
+normalized afterの実効値から判定する。失効先はcaptured stable keyの本人とrepresentativeの
+保持中サムネのみで、元のslot/items世代に依存しない。無関係なkeepセルは保持する。
+代表が非pageセルに焼き込まれている場合、既存pinned refresh keyをdrainする境界で
+全living contextへ同じbatchを配送する。queued request・source thumbnail/pixels・
+preview layers・adjusted texを既存退去契約で失効させ、parked代表に旧画素が残らない。
+mainのcolor representativeもmain所有境界で失効する。新しい予約・配送状態は追加しない。
+full gateの既存 `interrupted_page_drag_invalidates_only_matching_thumb_keys` がこの境界の
+取りこぼしを検出したため、同key別contextの新run/Undo/Redoとpark/reindex終端も回帰に加える。
+独立レビュアーとこの構造・通常Pageの全受付経路の棚卸しに合意済み。新state/worker/待機はない。
+Undo/Redoは既存の復元順を維持し、Page順序区間の末尾（次のFavorite/Globalより前）で
+batch配送する。Redoの後続標準prune後に古いPage値を再配送しない。
 
 ## 6. §1.371のgrid cursor ownerとの関係
 
@@ -253,6 +289,7 @@ Smart／Collectionの実adopt handlerは、同一覧再配置ならdraft再投�
 | mounted／at-rest双方の完了済み値、一覧外A、origin drop後の終了completion | 全ownerを一度回収してからshutdown。capture済み座標へDB／sidecar保存し、別contextのidxを使わない。既存ProcessKeepsRunningはworkerを停止・待機しない |
 | completion前にreindex／別context mount／origin close | captured key／sidecarへ保存。volatile／cache更新はownerと最新revisionだけ。旧Committed mirrorも維持 |
 | A保存待ちの間に同contextのBを編集 | Aの最新保存完了はAのvolatileだけを解除できる。context全体revisionの変更だけで拒否しない。Bのdraftは不変 |
+| 同keyのA／BがS0を保持→AのS1保存を実worker停止点で保持→Bの新規編集→Undo／Redo | Bのbefore／draft初期値は最新受付済みS1。BのUndoでS1、RedoでBのafterへ保存。停止点解除後のDB／sidecarも同順。DB読取／completion待ちは行わない |
 | 同key複数slot／同idx別key／items世代だけの変化 | keyごとに全投影更新、idx再利用は保存先にならない、reindexだけではUndo無効化しない |
 | Rating自動移動、検索・通常open/close、明示navigation、gesture取消 | 既存履歴境界とfinish/cancel仕様を維持。次sessionへbeforeを持ち越さない |
 | キー操作とpointer操作の等価入口 | キーは既存KeyAction経由。shape key idle、フォーカス／IME入力保護、Undo順序を維持 |
@@ -261,14 +298,183 @@ pure state-transitionと実handler／使い捨てDB fixtureを組み合わせる
 既存のpanel表示が変わる場合だけ更新する。通常／portable core check、fmt、対象tests、
 項目末一度のtest-full、確認用buildが実装後のgate。設計段階の試験実行は0件。
 
+### 実装上の所有と入力境界（2026-10-12）
+
+`LocalPageEditDocument` はIdle／Selection／Editingで、active draftだけが全文を所有する。
+完了済みdraftは選択レイヤーとrevisionだけへ畳み、bulkや新しい投影を古い全文で上書きしない。
+ownerは採用済み世代の同key slot集合を持つ。再配置時だけ一覧を一度走査し、各入力は
+そのslot集合へ投影する。重複keyは全slotを更新し、readerのexact transferを二度やり直さない。
+local見開きpivotもcontext所有とし、pair／anchorはcontent keyと重複出現順から再投影する。
+未完点列だけが残るとき、新しい有効編集は最新受付済み全文から開始する。点列を保ちつつ
+先行contextの確定文書をbeforeへ採り、保存完了が先に届いても同key publicationで鮮度を維持する。
+
+パネルは通常／localともUIのbefore／after差分をtyped parameter intentとして最新文書へ適用する。
+同じframeに先行編集を確定しても、操作していないshape／値を古いUIコピーから戻さない。
+全リセットやeffect／maskの明示変更は既存の全変更意図を維持する。
+通常sliderの収集後処理を共通frame handlerへ揃え、開始→更新→releaseの一Undoを試験する。
+非同期LUT／Subject／Regionは開始境界を通し、request ownerのtargetと開始時のread-only文書claimで結果を採用する。
+items世代だけの変更や同contextの別key編集を失効理由にせず、結果を別keyへ適用しない。
+同keyの本文変更は既存pendingを取消し、claimが古いまま採用後の未hydrateへ戻ることを防ぐ。
+比較対象は同keyのcanonical draft／最新受付済みwrite文書／有効投影を優先し、変更の証拠が無く
+未hydrateの場合だけclaimを使う。別revision mapや新たなworker／待機を追加しない。
+bulkの既存Producer→writer fenceは全contextのproducerを対象にし、parked結果も既存pollへ配送して
+その保存を先に完了させる。Subjectの整形alphaは最新sourceから導出し、Creative LUTはIDと強度の意図を分ける。
+
 ## 8. レビュー境界
 
 この変更は編集内容という利用者データと、非同期・複数windowの所有境界に関わる。
-**本書で止め、独立設計レビューと設計責任者の合意後に実装する。**
+初回／R2は本書で停止して独立設計レビューを受けた。
 `440fdf69b`の独立レビューは§1.369実装ACCEPT、§1.372設計REVISE（P2 2件）。
-本追補は§4.1／§4.2と実handler受入条件へ2件を反映した設計修正であり、製品実装は0件。
-今回の試験実行は0件（文書のみ）。`git diff --check`で差分形式を確認する。
+R2（`a5648d3cb`）の再レビューは上記2件を解消、P2 1件（同keyの新規beforeの鮮度）。
+§5と停止点付き実worker回帰へ反映後は、利用者が再レビュー待ちを挟まず実装することを許可した。
+この反映内容は実装レビューで併せて確認する。検証結果は実装後に記録する。
+実装前棚卸しで§9を確認して一度停止したが、coordinatorは同一ページ内のpointer/key
+終端の既存不整合を本件の範囲外と判断した。別項目へ起票し、本件は既存終端を維持して進める。
 新しい操作制限や通常利用の遅延を必要とする実装案が出た場合は、実装前に再相談する。
 detachedの述語／viewport／HWND制御は本設計の対象に追加しない。bundleの所有統合を
 実装する際は [detached-rework-plan.md §2](detached-rework-plan.md) の構造レビューを守り、
 触れた範囲と合意を同書§11へ記録する。設計書の存在をその合意の代わりにしない。
+
+## 9. 範囲外として別項目に起票する同時入力の終端（2026-10-12）
+
+**coordinator判断: 本節は§1.372の範囲外。今回は修正せず、coordinatorがバックログへ別項目を起票する。**
+検索再配置による保存先の付替えと異なり、同一ページ内のpointer/key同時入力の終端不整合。
+以下の根拠を別項目へ引き継ぎ、本件でpointer基準の再設定、Escの取消範囲、Undo粒度を変更しない。
+§9.1は別項目の未採用候補、§9.2は別項目の試験候補であり、本件の受入条件へ混ぜない。
+
+以下は `a5648d3cb` のsource調査であり、実機再現の主張ではない。
+local shape keyとpointerの併存を確認しただけでは設計矛盾としない。問題は、両方の
+操作が異なる時点の全文beforeを持ち、共通の現在mapからafterを採ることにある。
+
+| 経路 | 確認した事実／守るべき不変条件 |
+| --- | --- |
+| key更新 `update_selected_local_adjust_shape` (`ui_adjustment_panel.rs:11691`) とpointer開始 (`:12195`以降) | pointer開始で保留keyを閉じず、キー側もpointer保持を除外しない。既存の同時入力を無断で禁止しない |
+| K: S0→S1保留→pointer開始before=S1→pointer更新S2→release | `set_local_adjust_layers_for_idx_with_undo` (`undo_ops.rs:606`) がkeyを先に確定するため、key entryがS0→S2、pointer entryがS1→S2となる。別操作を二つのentryへ混入させない |
+| pointer保持→keyで移動／回転→次pointer更新 | `apply_local_adjust_shape_drag_from_canvas` (`ui_adjustment_panel.rs:11994`) は開始時の `vector_edit::DragState.base` から結果を作りshape slotへ代入する。key反映が次pointer更新で消えない基準が必要 |
+| pointer保持＋key保留→Esc (`ui_adjustment_panel.rs:11630`以降) | pointer payloadをtake→key確定→pointerの全文before復元の順。完了済みkeyはDB／Undoへ送られるが、画面ではkeyまで戻る場合がある。確定済み変更と取消範囲を一致させる |
+| canvas／brushのlive更新 | `mutate_local_adjust_layer_from_canvas_impl` (`:11018`) がmapを直接 `Arc::make_mut` で更新する。owner draftを正本にする際はこの更新seam自体を移し、保存直前のidx guardだけでは直さない |
+
+通常page／standard dragの入口は互いのsessionをNoneにする一方、local mode入口は通常パネルを
+閉じるだけでsession終了の証明にはならない。polygonの点列もクリック間に保持される。
+従って全Optionを単一の排他variantへ機械的に置き換えず、同一owner内の合法な操作を表す。
+
+### 9.1 追加判断に出す案とコスト
+
+候補は **pointerを押したままでもキーを受理し、別操作の受理境界でそれまでの有効な
+pointer変更を確定し、pointerの継続基準を更新する** 形。同じキー反復だけなら既存runを
+継続するが、異なる操作へ移るとbefore／afterを閉じて次の操作のbeforeを取り直す。
+shapeのbase／origin／anchorやcanvasの開始値も、共通draftの最新状態と現在pointer座標へ
+揃える必要がある。単に文書beforeだけを変え、古いDragState.baseを残す案は不十分。
+brushの前点を保ち、線の連続性や選択を解除せず、入力遅延・ボタン押し直しを追加しない。
+
+この案の判断点は、交互入力のUndo粒度とEscの取消範囲。キー受理より前に確定した
+pointer部分と完了済みkeyは保持し、Escで取り消すのはその後の未確定pointer部分だけとする
+案を提示する。これは現在の不整合を直すが、「pointerを押し始めた全文beforeまで戻す」
+という実装とは異なる終端になるため、実装前に設計責任者と独立レビューで確認する。
+
+比較した簡素化:
+
+- pointer中のキー入力を拒否／遅延する案は、到達可能な操作を失うため採らない。
+- pointerとkeyを一つの履歴へ無条件にまとめる案は、Escでkeyだけを保持する既存意図と
+  整合しない。取消時の再生／merge／rollback機構も追加しない。
+- pointer部分を確定して継続基準を更新する案は、単一draftと既存終端を使い、新worker・
+  待機・履歴予約slotを増やさずに順序を決められる。未承認の代案として上記の意味を提示する。
+
+### 9.2 追加の実handler回帰
+
+- key S0→S1→pointer S2→release: 履歴はkey S0→S1、pointer S1→S2の二件で、
+  Undo二回／Redo二回が各文書を正確に辿る。idleが後でentryを足さない。
+- pointer変更→key移動／回転→pointer継続→release: keyは次pointer更新で消えず、
+  保存・表示・beforeが同じ操作順になる。pan／resize／rotate／endpointを各々確認する。
+- 同経路→Esc: 判断後の取消範囲をDB／sidecar／画面全文／履歴の全てでassertする。
+  完了済みkeyが画面だけ消える状態を作らない。
+- canvas／brush保持中key、polygon点列保持中handle操作、通常dragからlocal入口:
+  合法な併存と未完取消を実handlerで固定し、無断で入力や描画の継続を除去しない。
+- 上記にreindex／park／resume／同keyの別context開始を挟み、同じowner draftへ作用し、
+  元の§5の最新受付文書から新規beforeを取得することを組み合わせて確認する。
+
+本節の初回報告は設計書のみ、試験実行・アプリ起動・コミット0件だった。
+その後のcoordinator判断を上に記録し、§1.372の実装を再開する。
+
+## 10. 実装と検証記録（2026-10-12〜13）
+
+独立追補ソースレビューはACCEPT、P1／P2 0件。初回指摘と追補の同key未完run、
+producerの別key継続・全context drain、Subject派生alpha、Creative LUTの細分化を修正した。
+採用後のexact reader公開をcached owner slotsへ配送する境界も独立確認済み。
+2026-10-13のfull gate追補レビューで通常Pageの受付値batch反映とUndo/Redo区間配送を確認し、
+parkedの代表source materialization配送を修正後、最終source ACCEPT（P1／P2 0件）。
+§9のpointer/key終端は変更しない。新しいretry／回復worker／待機機構を追加しない。
+
+変更は26ファイル。coordinator所有のbacklogは編集せず、コミット・アプリ起動は行っていない。
+
+| 区分 | 変更ファイル |
+| --- | --- |
+| Appとcontext所有 | `src/app.rs`, `src/app/viewer_context_registry.rs`, 新規 `src/app/page_edit_owner.rs`, 新規 `src/app/page_edit_pivot.rs` |
+| 採用と入力境界 | `src/app/snapshot_ops.rs`, `src/app/collection_grid.rs`, `src/app/color_filter.rs`, `src/app/gamepad_input.rs`, `src/tag_ops.rs`, `src/edit_bundle_bulk.rs`, `src/edit_bundle_app.rs` |
+| 編集・履歴・保存 | `src/ui_adjustment_panel.rs`, `src/undo_ops.rs`, `src/undo_stack.rs`, `src/local_adjust_write_worker.rs`, `src/lib.rs` |
+| typed parameter intent | 新規 `src/local_adjust_parameter_edit.rs`, 新規 `src/adjustment_parameter_edit.rs` |
+| handler回帰 | 新規 `src/app/page_edit_owner_tests.rs`, `src/app/tests.rs`, `src/app/rating_membership_tests.rs` |
+| 文書 | 本書, `docs/README.md`, `docs/architecture-overview.md`, `docs/preset-and-adjustment.md`, `docs/detached-rework-plan.md` |
+
+新規回帰は計38件（owner実handler20、local parameter intent10、通常parameter intent3、
+worker origin2、stable local Undo3）。既存gesture監査は新しいparked終端関数だけを
+限定登録し、pending在庫監査はparkで保持する既存編集producerの寿命を明記して登録した。
+reader回帰はprepare→replace→finishの実境界を通し、同key第二slotのcache／before／draft／
+一Undo／DB／sidecarを確認する。adopt途中のhelperへ完了後のreader条件を要求しない。
+
+| targeted filter（下記の有効範囲） | 成功 | 失敗 | ignore | 証拠 (`target/`) |
+| --- | ---: | ---: | ---: | --- |
+| page_edit_owner_tests | 20 | 0 | 0 | `nextfix-1372-owner-final.out.log` |
+| local_adjust | 159 | 0 | 0 | `nextfix-1372-local-final.out.log` |
+| adjustment | 576 | 0 | 1 | `nextfix-1372-adjustment-final.out.log` |
+| viewer_context | 99 | 0 | 0 | `nextfix-1372-viewer-final.out.log` |
+| rating_membership | 80 | 0 | 0 | `nextfix-1372-final-rating_membership.log` |
+| snapshot | 347 | 0 | 2 | `nextfix-1372-final-snapshot.log` |
+| undo | 107 | 0 | 0 | `nextfix-1372-undo-final.out.log` |
+| edit_bundle | 29 | 0 | 0 | `nextfix-1372-bundle-final.out.log` |
+| color_filter | 16 | 0 | 0 | `nextfix-1372-color-final.out.log` |
+| interrupted_page_drag_invalidates_only_matching_thumb_keys | 1 | 0 | 0 | `nextfix-1372-interrupted-final.out.log` |
+| still_window_mode_key_tests（pack-build-tools） | 548 | 0 | 0 | `nextfix-1372-live-park-final.out.log` |
+| 合計（filter間の重複あり） | 1,982 | 0 | 3 | 初期失敗の監査登録と試験境界は修正後に再検証済み |
+
+追補前検証のundo／edit_bundle／adjustmentと前回のlocal／rating／snapshotの結果を上表に含む。
+最終sourceではowner20／color16／viewer99／割り込み1を再実行し、残りの現source検証を
+最終test-fullで補完済み。型検証／fmt／glyphも最終製品sourceで再実行して成功した。
+
+通常／portableのcore cargo check、cargo fmt --all --check、glyph lint（危険glyph 0）は成功。
+証拠は `nextfix-1372-check-normal.err.log`, `nextfix-1372-check-portable.err.log`,
+`nextfix-1372-fmt.*.log`, `nextfix-1372-glyph-final.out.log`。
+release core／remote／EPUB workerが既に揃っていたため、前提用のbuild-release再実行は不要。
+初回test-fullは既存の通常Page割り込み終端回帰1件で失敗（lib 12,175成功／1失敗／56 ignore）。
+§5.1の共通境界を修正してtargeted検証後に全体gateを再実行した。
+二回目の本体は12,179成功／1失敗／56 ignore。失敗はlive-parkの旧fixtureがfork後の
+DB受付まで同一の「編集mapは空」条件で検査していたため。元のfork直後の検証をsetter前へ
+全て保持し、受付後は通常Page値1件だけの共有、mask/local/spread/thumbの分離を確認する。
+独立レビューはこのtest-only差分をACCEPT。製品コード変更／pub除外／新flagは不要。
+その後の通常／portable checkはtest-only変更に影響されないため最終sourceの成功を再利用し、
+fixture修正後の関連targeted（pack-build-tools）は548成功／0失敗、fmt／glyphも成功。
+最終fullはPASS、13,450成功／0失敗／63 ignore。本体は12,180成功／0失敗／56 ignore。
+本体内の子harness結果2件を重複集計せず、65結果行のうち63個のtop-level結果を集計した。
+証拠は `nextfix-1372-full.out.log`, `nextfix-1372-full.err.log`,
+`nextfix-1372-full-summary.json`。vendorはegui25／egui-wgpu11／eframe18成功。
+build-devは `-PreserveRuntime`、通常feature／dev-runtime profileで成功（exit 0）。
+coreは10分06秒、remote／EPUB workerは増分buildで各0.38／0.36秒。
+CRT/PE検査はruntime 4／PE 3成功、core／remote／EPUB workerとFFmpeg DLLをstageした。
+証拠は `nextfix-1372-build-dev.out.log`, `nextfix-1372-build-dev.err.log`。
+アプリは起動せず、利用者確認は検索再配置中のA編集→確定/Undo/Redoと、同key別contextで
+直後の編集→Undoが先行文書へ戻るケースを対象とする。
+二回の失敗ログも `nextfix-1372-full-first-failure.*.log` と
+`nextfix-1372-full-second-fixture-failure.*.log` に保持する。
+
+最終gate対象のRust差分21ファイルは `target/nextfix-1372-source-manifest.json` のSHA-256で固定。
+coordinator基点HEAD `a5648d3cb` に対する未コミット差分として検証した。
+
+最終証拠・manifest・台帳の独立照合もACCEPT（P1／P2 0件）。Rust hash、全体集計、
+再利用したtargetedの範囲、通常／portable checkとbuild-dev成果物の実在を確認済み。
+利用者の実機確認は未実施。PowerShellで以下を実行する場合、先にインストール版／
+トレイ常駐mImageViewerを閉じる（single-instance mutex共有）。通常の
+`%APPDATA%\mimageviewer` profileを使い、実際の設定・データを更新し得る。
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```

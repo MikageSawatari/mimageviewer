@@ -15,7 +15,7 @@ fn color_filter_item_supported(item: &crate::grid_item::GridItem) -> bool {
         || color_filter_representative_supported(item)
 }
 
-fn color_filter_representative_supported(item: &GridItem) -> bool {
+pub(super) fn color_filter_representative_supported(item: &GridItem) -> bool {
     match item {
         GridItem::ZipFile(_) => true,
         // PdfFile also represents converted EPUBs; do not expand the requested scope.

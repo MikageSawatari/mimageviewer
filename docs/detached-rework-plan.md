@@ -1455,6 +1455,24 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### §1.372 ページ補正のcontext所有（2026-10-12）
+
+検索の同一覧再配置でdraft／Undoが別画像へ保存される件を、既存bundleの所有境界で修正する。
+設計R2 `a5648d3cb` の独立レビューは共有履歴受理と全context終了配送を確認し、残る同keyの
+before鮮度P2を反映後に実装することをcoordinator／利用者が許可した。
+通常／標準drag、localの単一文書と既存gesture、選択レイヤー、未完点列、pickerと非同期
+LUT／mask要求、およびlocal見開きpivotをbundleと一緒に交換する。
+保存writerはApp共有の既存1本を維持し、request／completionに安定targetとoriginを持たせる。
+viewport、detachedの述語、HWND／focus制御は変更しない。読取mount／depositはgestureを
+確定・取消せず、兄弟の編集世代やcacheを失効させない。§9の同ページ同時入力は別項目。
+2026-10-12の独立追補ソースレビューはP1／P2 0件でACCEPT。述語／viewport／HWNDを変更しない
+pureなbundle所有統合が構造的修正であることに実装担当と独立reviewerが合意した。
+2026-10-13には通常Pageの同key受付値と代表source materializationを全所有contextへ配送する
+追補もACCEPT。mountによる副作用を使わず、既存のqueued/materialized退去契約を維持する。
+自動検証の証拠は
+[page-adjustment-owner-plan.md](page-adjustment-owner-plan.md)へ記録する。
+
+
 ### 2026-10-11 §1.371: 評価集合の公開を安定context境界へ移す構造合意（設計段階）
 
 利用者が提示した独立再レビュー（対象 `94bc236d1`、rating-filter-fullscreen-plan R2）は、
