@@ -1,6 +1,7 @@
 ﻿# §1.375 自分のファイル操作の反映とフォルダ監視の照合
 
-2026-10-12、`next-list` / `ea060b66e` 設計基点。**R3 ACCEPT 後の実装調査で前提の矛盾を確認・第一段の採用境界は未接続**。
+2026-10-13改訂、`next-list` / `ea060b66e` 設計基点、確認基点 `df20dba7b`。
+**利用者決定 (2026-10-12): 案Bを採用。以下のR4具体化を独立設計レビューへ提出・第一段のApp採用境界は未接続**。
 利用者の実機報告をソースで調査した。アプリは起動していない。
 正本項目: [next-release-backlog.md §1.375](next-release-backlog.md#1375-フォルダで-delete-キーで削除すると正しく消えた一覧がもう一度丸ごと読み直されてちらつく--利用者の実機報告-2026-10-12)。
 
@@ -10,7 +11,8 @@
 R2 (`1c313a2ec`) は **REVISE**。実 Folder の mtime だけの差分で親一覧を再 install しない
 §1.314 の契約を以下へ反映し、R3 は ACCEPT。
 
-R3 の受入と利用者の指示により、`3bfbf1989` 基点で第一段 Delete の実装へ進む。
+R3 の受入と利用者の指示により、`3bfbf1989` 基点で第一段 Delete の部品実装を開始した。
+実際の画素採用証拠の不足を確認して接続を停止し、案Bの具体化までを今回の範囲とする。
 第二段の rename／move／copy は今回の完了対象ではない。
 
 ## 1. 原因の確定 (コード上)
@@ -54,7 +56,7 @@ mtime を進めるのは `Resumed` の安いふるいにしか効かない。
 | 外から D&D copy | app.rs:46832 付近 → `copy_paths_into_folder` (PowerShell worker) → `poll_file_drop_pending` が `pending_reload`。watch との二重開始候補。CopyOutcome は件数中心で全出力 identity を持たない |
 | Ctrl+C / X → Ctrl+V、Shell 背景 Paste | clipboard / Shell verb が owner。衝突後の出力名を mIV は所有しない。watch で初めて反映する。既に反映済み扱いは禁止 |
 | native Shell メニュー、外向き D&D | OS／外部 owner。mIV worker 成功 receipt がない。外部変更として扱う |
-| 製本フォルダ | `current_favorite_target` が本棚配下を監視対象から除外。本追加の `pending_reload` 等の明示更新が担当。同じ watch ちらつき原因ではない |
+| 製本フォルダ | `ensure_current_folder_watch` の `current_favorite_target` は本棚配下を購読対象から除外するが、`check_external_folder_changes(Resumed)` は直接 `current_folder` を使うため本にも届く。明示更新だけとは限らず、先着済みrescanもある。本追加の所有境界は §1.373 R4で扱い、第一段Deleteと混同しない |
 
 ZIP/PDF 内、合成検索、Collection root を通常物理一覧の receipt 比較へ入れない。
 ピン、sidecar 音声画像、非表示候補の影響も scan の projection に含める。
@@ -96,12 +98,13 @@ typed 採用状態で `NeedsProjection` / `Applied` を表す。
 watch 通知が届かなくても delete terminal 自体が再投影準備を提出する。
 
 worker は保持 raw rows から成功差分を除いた expected と現在 actual scan を照合し、
-actual の表示投影を既存 prepare 経路で作る。UI は次の二択だけを行う。
+actual の表示投影を既存 prepare 経路で作る。R4では実採用provenanceもsnapshotから照合する。
+行に関する採用は次の境界を使い、行不変の画素／省略chip差分は§6.4の既存更新へ配送する。
 
 - actual rows が expected に一致し、prepared projection が暫定表示と依存まで一致:
   rows／projection proof／watch cutoff を一緒に Applied へ進める。再 install はしない。
   世代、texture、選択、checked、scroll、AI/PDF保持画像は維持。
-- raw rows が異なる、非表示候補が露出する、代表／sidecar／本判定等が変わる、または後述の
+- 非表示候補が露出する、代表行／sidecar／本判定等の行投影が変わる、または後述の
   強制 dirty が残る: 同じ actual scan の prepared listing を既存採用境界へ一回渡す。
   本当に変わった表示の更新であり、削除直後の全再読込を常に省略する仕様にはしない。
   カーソル等の復元は既存 reload owner に任せる。新しい独自 partial install は作らない。
@@ -123,7 +126,8 @@ UI で列挙・DB再照会・代表画像 decode はしない。prepare の I/O 
    **OS 通知へ勝手に ID を付けて自己由来と断定しない**。全イベントを既存 worker 照合へ渡す。
 4. worker は現在の scan 全体とその prepared projection を返す。§3.1 の両方の一致と
    §3.4 の通知分類を満たす時だけ「この operation ID の効果は既に反映済み」と判定する。
-5. 一件でも説明できない差分があれば、その scan を既存 full load の pre_scan として採用する。
+5. 一件でも説明できない差分があれば、その scan を既存 prepare に渡し通常更新する。
+   行差分なら既存 full load の pre_scan、画素／chipだけなら§6.4の既存更新へ配送する。
    receipt が説明した差分だけを消して残りを捨てる処理は作らない。
 6. 内容変更／不明／watch error は強制 dirty として保持する。名前変更は内容変更と区別する。
    とくに秒精度・同サイズ上書きを
@@ -291,7 +295,7 @@ Shell 衝突名を別に検証する。`Modify(Name)` だけの重複通知で�
   App handler／bundle 統合と検証結果は検証所有者が追記する。backend担当は cargo／fmt／test／buildを
   実行していない。アプリ起動・コミットなし。
 
-### 初期表示・自動代表の証拠に関する設計判断 (2026-10-12)
+### 初期表示・自動代表の証拠に関する調査と利用者決定 (2026-10-12)
 
 R3 の worker 準備だけで既存の初期表示を証明できる、という実装前提は成立しなかった。
 独立した `gpt-6.1-sol` / `xhigh` のコード調査でも同じ結論となった。
@@ -321,12 +325,12 @@ fallback、初回だけ余計に再 install する回避策、通知の時間窓
 新 standalone pending owner や初期二重 install は追加しない。
 初期同期 loader を残す [startup-diagnostics-plan.md §10](startup-diagnostics-plan.md) の Phase B 保留との境界変更も同時に記録・レビューする。
 
-#### 自動代表について選択が必要な二案
+#### 比較した二案と決定
 
 | 案 | 正確な採用契約 | 通常操作への影響 |
 | --- | --- | --- |
 | A: 初期全件の代表決定 | 初期 worker が代表を決め、その同じ決定を thumbnail 要求に渡す。後段で独立に再選定しない | 現行の keep_range 内だけの遅延探索を全 Folder へ広げる。開く際の I/O と待ちが増えるため、利用者の判断なしに実装しない |
-| B: 既存の遅延探索を維持 (提案) | 既存 ThumbnailRequests の要求 identity と ThumbMsg の採用へ完全精度／pin・catalog provenance を運ぶ。実採用と対応した証拠だけを projection が使用 | 表示範囲だけの探索を維持。thumbnail result と projection の所有境界を具体化し独立設計レビューが必要 |
+| B: 既存の遅延探索を維持 (利用者採用、2026-10-12) | 既存 ThumbnailRequests の要求 identity と ThumbMsg の採用へ完全精度／pin・catalog provenance を運ぶ。実採用と対応した証拠だけを projection が使用 | 表示範囲だけの探索を維持。下記R4のthumbnail resultとprojectionの所有境界を独立設計レビューへ提出 |
 
 B は現在の `ThumbnailState`／既存 request owner を使って未要求・処理中・採用済みを
 区別し、別の bool／pending owner で同じ状態を複製しない方向とする。
@@ -335,8 +339,8 @@ B は現在の `ThumbnailState`／既存 request owner を使って未要求・�
 一致した一件にだけ作用し、cancel／park／再要求は同じ既存 owner の規則を使う。
 この具体化と、§1.314 の採用 metadata／sort／代表要求 stamp の保持を合わせてレビューする。
 
-**判断依頼は B の具体化・再レビューへ進むかどうか。** A は通常の表示開始を重くするため
-自動採用しない。これは通常操作で生じる所有・非同期の前提矛盾であり、まれな失敗の
+**利用者がBの具体化・再レビューへ進むと決定済み (2026-10-12)**。Aは採用しない。
+これは通常操作で生じる所有・非同期の前提矛盾であり、まれな失敗の
 割り切り対象ではない。未知証拠を理由に一律 full install して完了扱いにもしない。
 
 追加の受入: 初期代表決定→thumbnail 採用の間の子ファイル差替え、未要求→要求中→採用済み、
@@ -356,9 +360,8 @@ stale result／同 folder 二 context／park・再 mount、削除と代表変更
 分類アルゴリズムの変更や期待の弱体化は行っていない。
 
 rawのpreprojection omitted countsと投影後の表示countsをproofへ保持し、行が同じでも件数差分を
-retainしない回帰を1件追加した。将来のApp接続では `normal_folder_omitted_entries` まで同じ採用
-境界で照合する必要がある。OSのsystem metadataだけの件数差とchip-only更新を、既存の
-一覧採用を増やさず扱う契約もレビュー対象。現部品の「未知／差分ならretain拒否」をそのまま
+無視しない回帰を1件追加した。将来のApp接続では `normal_folder_omitted_entries` まで同じ採用
+境界で照合し、件数だけの差分は下記R4のchip-only更新へ分類する。現部品の「未知／差分ならretain拒否」をそのまま
 通常watchへ接続して第一段完了扱いにしない。子.part由来の§1.314では親の件数は変わらない。
 
 関連 `folder_scan` 45件、`folder_mtime` 6件も成功（重複1件を含む）。App handler／bundle接続、
@@ -366,3 +369,122 @@ retainしない回帰を1件追加した。将来のApp接続では `normal_fold
 ログ: [部品17件](../target/nextlist-folder_reconcile.log)、
 [folder scan 45件](../target/nextlist-folder_scan.log)、
 [mtime 6件](../target/nextlist-folder_mtime.log)。
+
+## 6. R4: 案Bの要求・画素・表示投影の採用契約 (2026-10-13、独立レビュー提出)
+
+### 6.1 証明する対象と単純化
+
+一覧を開いた時点に全Folderの代表を探索しない。既存の `keep_range`、idle upgrade、
+pin fallback、cache利用を維持し、**その時点で実際に表示している成果物**を比較対象にする。
+初期raw候補・行投影はscan/prepare workerで作り、自動代表の証拠はその後の既存thumbnail要求が
+実際に採用されたときに同じ一覧ownerへ合流する。初期採用をthumbnail全件完了まで待たせない。
+新しい代表固定state、provenance専用pending、全件先読み、初期の二重installは作らない。
+
+不変条件は「適用済みraw、現設定の行投影、実表示成果物とその由来が対応している」。
+未要求のplaceholderは正当な遅延表示であり、代表が未確定であること自体を投影不一致にしない。
+一方、既に表示した画素については後日の再探索結果をその画素の証拠にしない。
+
+### 6.2 所有する値とidentity
+
+| 境界 | 所有する値／照合条件 |
+| --- | --- |
+| 初期scan/prepare → 一覧採用 | 購読identity、cutoff、raw全候補、設定・metadata revision、安定row key、表示metadataと代表要求stampを既存prepared resultに載せる。購読前のpre_scanは初期証明に使わない。自動代表の探索は含めない |
+| `ThumbnailRequests::begin` → `LoadRequest` | 既存request ID／items_gen／contextのownerに、row key、代表選定条件 (visibility・sort・depth・pin/cache scope)、採用済み代表要求stampをimmutable snapshotとして載せる。idxだけでは対応付けない |
+| resolver/cache/source worker → `ThumbPixels` | 実際に使った選定結果・読込成果物のprovenanceを、その画素と同じpayloadで返す。outer folderと選ばれたleafは別のkey。RAW継続／pin cascade／fallbackでも同じrequest IDを保持し、実際に使った経路の証拠へ更新する |
+| `ThumbnailRequests::receive` → `next_image` | request IDとitems_genを既存ownerで検査し、provenanceも同じQueued/Uploading payloadが所有する。先着 `Finalized` は保存終端だけを表し、表示採用の証拠を作らない |
+| texture採用 → `ThumbnailState` | 最後にcontext、世代、request ID、row key、選定条件revisionを再確認。画素と証拠を同時にLoadedへ採用し、同UI呼出しでAppliedFolderListingの表示投影revisionを進める。upload中／破棄したpayloadは採用済みにしない |
+
+画素と証拠は同じimmutable成果物として保持する。`ThumbnailState::Loaded`の値へ由来を
+組み込み、別のidx→provenance mapや「証拠受信済み」boolは追加しない。projectionはその値を
+参照して比較用snapshotを作る。request ownerは既存 `ThumbnailRequestPhase` のまま。
+requestがupgrade中でも旧Loadedが見えている間は旧画素の証拠を使用し、要求中の候補で上書きしない。
+NoArt等の画素なし終端は、その探索を行った場合のnegative evidenceを同じ終端へ付ける。
+
+### 6.3 選定・pin・cache provenanceの内容
+
+source生成では、実際に読んだleafのexact path／archive entry等の安定key、サイズ、完全精度
+mtime (取得可能ならobject identity)、pin cascadeの各参照とrevision、選定に使ったcatalog
+dependency／winnerを保持する。filesystem探索を使ったscopeは、訪れた候補の名前・種別・
+選定に必要なstampと「候補なし」の範囲も残す。winnerのstampだけでは、先に選ばれる新候補の
+追加を説明できない。これは既に要求された代表の既存探索に付随する採取であり、未要求の
+Folderを再帰走査する入口にはしない。読込と証拠採取は同じworker経路で行い、別pickerで
+選び直さない。選定中／読込中に依存が変わって対応を証明できない結果は未証明として返す。
+
+cache hit／seeded代表／cascade先の完成WebPは **そのcache成果物を表示した証拠** を返す。
+cache key・出所・保存されていたselection proofと、実際に読んだ画像bytesの同一性をworkerで
+記録する (既に読むbytesのdigest等。元画像の全件hashや追加readはしない)。lookup時のleaf／
+pinの完全精度観測も残すが、これをcache生成時の完全精度stampに読み替えない。
+現行 `FolderSelectionProof` の秒precision／空directory dependencyはそのまま意味を区別する。
+初期cacheの鮮度判定は既存policyを維持し、今回cache DBの移行や旧cache全件再生成はしない。
+保持判断では「同じcache成果物が、同じlookup観測・現行policyにより引き続き使用可能」を
+検査する。lookup後の同秒・同size上書きは完全精度差分として扱い、古いcache画素をsource生成の
+証拠と偽ってretainしない。cache差替えも成果物identityの差分となる。
+
+cache miss、unverifiable proof、decode失敗からsourceへのfallbackは既存要求の同一IDで続ける。
+fallback画素にはsource側の証拠を付ける。旧cacheの粗い証拠しかないLoadedは、raw一致だけで
+表示証明を作らず、その行の既存thumbnail要求で証拠と画素を揃える。証拠不足だけを理由に
+一覧全体を再installしたり、全Folderを先にdecodeしたりしない。
+
+### 6.4 状態別の照合と採用
+
+| 実表示／要求状態 | Delete後・watch照合の扱い |
+| --- | --- |
+| Pending／Evictedのplaceholder、未要求 | 行投影・設定が同じならその表示を保持。代表未探索を理由にfull installせず、次のkeep_range要求で現在の候補を探索 |
+| 要求中でplaceholder | raw候補・選定条件が変われば既存requestのcancel／再要求へ配送。旧要求の遅延結果を現在の行に採用しない。行が同じならitems_genを無用に進めない |
+| Loaded、upgrade中に旧Loadedを表示 | 実採用のprovenanceに対してworkerが必要な依存だけを照合。影響なしならtexture保持・観測証拠更新。代表／leaf内容／pin／使用cache成果物が変われば既存thumbnail無効化・再要求へ配送 |
+| NoArt／Failedの画素なし終端 | negative evidenceが変わり候補が現れた場合は既存再要求。未証明の失敗を完全な「候補なし」と扱わない |
+| 行の露出・代表行・Stack構成が変わる | raw一致だけでretainしない。既存prepare/installへ一回配送し、非表示候補の再露出を含めて採用 |
+| raw観測または省略件数だけが変わる | 行と実表示の証拠が一致すれば、raw観測・cutoff・`normal_folder_omitted_entries`のchipだけを同じ一覧ownerで更新。items_gen／sort／textureを変更しない |
+
+表示範囲外の未要求Folderの子候補を比較のためだけに探索しない。既に表示した代表を検証する
+workerは、その採用証拠が指す選定scopeを必要な範囲で照合する。catalog revisionが動いたこと
+だけで代表変更と決めず、選定結果と使用成果物が同じなら証拠のみ更新する。
+この処理は行を独自にincremental installする別経路ではなく、行差分は既存一覧採用、画素差分は
+既存thumbnail要求、省略chip差分は既存表示値更新へ分ける。共通の一覧ownerで一度に確定する。
+
+§1.314では、対象が確定した実Folderのmtime-only通知／raw差分は観測stampだけを進める。
+Loadedの画素・表示metadata・sort・代表要求stampとprovenanceの採用値は維持し、mtimeだけを
+理由に代表再探索しない。cache miss／既存証拠の別の失効／idle upgradeは従来どおり許可する。
+ファイルContent、対象不明、watch errorにはこの例外を適用しない。自己Deleteと子Folderの
+mtime-onlyが同batchでも、Delete後の行／表示が対応すれば一覧の追加installは0回。
+§3.4のContentはstamp一致でも対象画素の通常更新へ渡し、Unknownはfull prepare／採用する。
+§6.4の「影響なし」の保持はこれら強制dirtyを免除する契約ではない。
+
+### 6.5 非同期とcontextの終端
+
+reconcile workerへはraw／投影／実採用provenanceと一覧revisionのimmutable snapshotを渡す。
+worker中にthumbnail採用でそのrevisionが進んだ場合、古い照合結果で新しいLoadedの証拠を
+上書きしない。既存reconcile ownerへ最新snapshotで戻し、dirty/cutoffは未照合のまま保持する。
+UIで待たず、thumbnail完了を待つ専用stateも設けない。
+cancel、row remap、park、再mount、context dropは既存ThumbnailRequestsとbundleの所有規則で
+画素・証拠を一緒に移す／捨てる。同folderのAの採用やackはBの要求・投影・購読を変更しない。
+一つのpayloadのstale拒否は、通知を照合済みにした理由にはならない。
+
+初期scan/prepareをworkerへ揃える範囲は前節のproducer全てを含む。
+`startup-diagnostics-plan.md` Phase Bで保留されていた初期同期loaderのうち、物理一覧の
+購読・scan・表示準備・proof作成を今回の実装範囲へ移す。タグ移行や他の起動処理まで
+Phase B完了扱いにはしない。UIへ新しい同期I/Oは加えない。
+
+### 6.6 実装範囲・独立レビューの受入
+
+§4の第一段Delete範囲へ `thumb_loader.rs`、`grid_item.rs`、`app/thumbnail_requests.rs`、
+thumbnailの実採用箇所、catalog/cache返却値のprovenance配管を追加する。cache選定policyの
+変更・永続schema移行・第二段rename/move/copyは含めない。共通ファイルは一人のwriterが所有する。
+実装時にdisplay-pipeline、thumbnail-request-lifecycle、ui-responsiveness、architectureと
+startup-diagnosticsの該当境界を同時更新する。
+
+追加予定回帰は以下。既存§5のhandler／cross-context回帰と合わせて受け入れる。
+
+- 初期採用時に未要求Folderの代表探索0回。placeholderと証拠なしLoadedを混同しない。
+- resolver後のleaf差替え、cacheとsourceの異なる画素、pin cascade／seeded成果物／RAW継続。
+  画素と証拠が常に同じrequest IDの実採用結果であり、後日のpickerを証拠にしない。
+- cache hitの保存proofが秒precisionでも生成時完全精度と偽らない。lookup後の同秒・同size
+  上書き／cache bytes差替えを検出し、無関係なcatalog revisionだけならtextureを保持。
+- Finalized先着、provisional→final、upgrade中の旧画素、cancel／remap／stale、A/B同folder、park。
+- Delete成功でhidden候補／代表が変わる例と、Delete後のraw・行・表示が一致してinstall0回の例。
+- thumbnail採用がreconcile完了より先行した場合、新画素の証拠を旧snapshotで上書きせずdirtyを保持。
+- §1.314のmtime-onlyとDelete混在、Content／Unknownの対照、省略chipだけの変化で世代・texture不変。
+
+今回の変更は設計具体化のみ。追加・実行テスト0件、build0件、アプリ起動0回、コミット0件。
+**ここで止め、R4の独立設計レビュー後にApp接続を再開する。** 過去の部品17件成功は再利用できる
+部品証拠であり、この新しい採用境界や製品のちらつき解消の検証結果ではない。
