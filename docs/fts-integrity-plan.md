@@ -362,6 +362,10 @@ FTS対策で名前索引も全て閉じたとは記録しない。
 着手/リリース優先度は管理担当が別件として決める。本件のFTS修正の受入条件へ
 名前索引の全failure対応を混ぜない。
 
+2026-10-12: §1.369の通知所有、停止後の通知保持、全入口の共通出口と成功件数の具体化は
+[name-index-write-failure-plan.md](name-index-write-failure-plan.md)を参照。事前独立設計レビュー待ちで、
+名前索引の製品コードはまだ変更していない。新規retry/回復workerは設計に含めない。
+
 類似索引はSQLite正本から`similar_search_array::load_or_rebuild` / `rebuild_from_sqlite`
 (`src/similar_search_array.rs:166,195`)で派生検索配列を再生成できる。
 お気に入りUIも`favorites_editor.rs:1329,1344`でFailed/Degradedを表示する。

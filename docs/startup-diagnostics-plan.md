@@ -898,3 +898,43 @@ TensorRT builderはusage／不正モデル／DirectML専用モデルのskipを�
 coreの`exit_startup`へ接続し、一般writerとstartup writerで一つの2秒deadlineを共有する。
 正常・エラー・skipの実終了は、独立したunit-test executableの子processと一時LOCALAPPDATAで
 回帰確認する。製品binary・モデルruntimeを起動せず、pending記録と末尾terminalを検査する。
+
+### 10.5 §1.376 配布ビルド経路の照合（2026-10-12）
+
+`ea060b66e`には`642ed1ee5`で`90a8a9353`のsidecar修正と実ファイル回帰が移植済み。
+allocator flavorは取り込まれていない。利用者報告の空ログは10月11日19:25のrun
+`00023fa7fbc0cf83`と10月12日00:22のrun `000099d1756a58b6`のcore/launcher各1組。
+後者は利用者のbuild-dist実行時間00:14〜00:26と重なるが、それだけで原因とは判定しない。
+コード照合ではbuild-dist/build-release/build-portable、sign-filesの署名/verify、VCRT PE検査は
+製品launcher/coreを短時間起動しない。終了境界の回帰はテスト実行体を一時LOCALAPPDATAで
+起動するので、通常startup-logsへこの2組を作る経路ではない。既存の起動済みprocessを
+build-release/build-portableが`Stop-Process -Force`する経路はある（`-PreserveRuntime`では停止しない）
+が、当該2組がその対象だった証拠はない。正常終了は§10.4のflush/close
+ACKを待つ。強制終了やI/O失敗で記録を必ず残す保証はなく、当該2組の原因は未確定。
+空ログを配布ビルドの正常な仕様と扱わない。実アプリと通常profileのファイルは操作していない。
+
+Windows限定の実ファイル回帰を1件追加し、旧shared lock取得後の同handleへのheader書込が
+OS error 33で失敗して0 bytesを残し、unlock後は同handleで書けることをassertする。
+修正後のlauncher/core非空・全行JSON、稼働中lease、旧lock共存、10-run保持、上書き防止は
+既存回帰を維持。`cargo test -p miv-startup --lib`は36 passed / 0 failed / 0 ignored。
+原ログは`target/nextfix-1376-startup-tests.log`。これは非対話試験であり、利用者の2組の原因や
+v4.6.0実機起動の成功を証明するものではない。
+
+| §1.376 の非対話検証 | 結果 | 原ログ (`target/` 内) |
+| --- | --- | --- |
+| startup crate lib tests（追加1件を含む） | 36 passed / 0 failed / 0 ignored | `nextfix-1376-startup-tests.log` |
+| `cargo fmt --all -- --check` | exit 0（初回の新規testの行折返し差分を整形後） | `nextfix-1376-fmt.log` |
+| 通常 core check | exit 0、25m35s | `nextfix-1376-core-check.log` |
+| portable core check | exit 0、1m30s | `nextfix-1376-portable-check.log` |
+| `test-full.ps1 -SuppressCrashDialogs`（1回） | **未完了**、exit 101、テスト開始前で実行0件。launcherのrelease入力3 exe欠落 | `nextfix-1376-full.log` |
+
+初回target構築、`CARGO_BUILD_JOBS=1`、`RUST_TEST_THREADS=4`。full用のFFmpeg DLL6本は
+このworktreeの`vendor/ffmpeg/bin`から`target/debug/deps`へ実ファイルをコピーした。
+通常／portable checkの既存warningは230／233件。製品実装は変更していない。
+テストと文書のみの変更なので実機確認用buildは不要。アプリ起動・commit・backlog編集は行わない。
+
+fullの停止は`crates/launcher/build.rs`が要求する`target/release/mimageviewer-core.exe`、
+`mimageviewer-remote.exe`、`mimageviewer-epub-pdf.exe`が新規worktreeにないため。
+通常／portable core checkやstartup36件の失敗ではなく、全体gateのbuild前提不足である。
+compile済みtargetを全体test成功へ読み替えない。入力を用意した後のfull再実行は未実施。
+release build・署名・起動を追加せず、§1.369の事前設計レビュー区切りで引き渡す。
