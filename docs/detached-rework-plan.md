@@ -1455,6 +1455,31 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-12 §1.340: 画像窓内ページ一覧の設計提出（構造合意待ち、コード変更なし）
+
+`next-tile` / `ea060b66e` 基準の
+[detached-book-page-overview-plan.md](detached-book-page-overview-plan.md) を作成した。
+公開は v4.6.0 の次の版の後。独立レビュー・利用者確認の前に実装しない。
+本記録は設計提出であり、ClaudeCode／Codex の構造合意や検収完了を表さない。
+
+- §2 を読んだ上で、一覧状態は `ViewerContextBundle` の単一 typed owner、
+  表示先は既存 window_id／context binding、前面サムネイル需要は既存 request owner を
+  維持して exact set を一般化する案とした。App-global detached flag、placement の
+  第二の正本、rect 捕捉条件、host_lost による recreate、競合回避の時間窓は追加しない。
+- R4 未完を前提に active／passive deferred／legacy passive／backstop を棚卸しし、
+  同じ bounded read-only overview projection を使う案を記した。passive の入力は
+  描画時 identity 付き command と activation を既存 manager／registry 境界へ渡す。
+  最初のクリックを単なる ActivateOnly に落とさず、一度だけ元窓へ実行する。
+- 一覧の開閉だけで items 世代／兄弟 context／Remote mutation を失効させず、
+  需要解除では保存終端を偽装しない。全ページ queue／画像生成、全窓 modal、
+  park 時の一覧自動取消を避け、items／構成変更時は既存境界で一覧を閉じる。
+- 今後触る予定範囲は App の mounted projection、bundle の交換・teardown、
+  detached snapshot／deferred event／activation intent、既存 foreground demand、
+  viewport 描画・入力分岐。HWND 捕捉／placement／presentation transition の所有は変えない。
+  §1.242 の canonical projection と白紙 landing は統合後の設計再照合が必要。
+- 症状パッチではなく所有境界の構造追加にできるかを、実装前の設計 lead／独立 reviewer
+  の明示合意に委ねる。製品コード変更・アプリ起動・コミットは行っていない。
+
 ### 2026-10-11 §1.371: 評価集合の公開を安定context境界へ移す構造合意（設計段階）
 
 利用者が提示した独立再レビュー（対象 `94bc236d1`、rating-filter-fullscreen-plan R2）は、
