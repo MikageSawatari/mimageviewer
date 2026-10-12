@@ -1,5 +1,9 @@
 # 仮想フォルダ (ZIP / RAR / PDF / EPUB) 処理
 
+§1.353 の全再読込時の現在階層保持は [設計レビュー待ち](section353-zip-refresh-location-plan.md)
+(2026-10-12、未実装)。現行全再読込は root／collapse へ戻る。提案では要求に実効 prefix を
+固定し、新ツリーで同階層、消失時だけ直近の存在する祖先へ着地する。履歴再入場の root 規則は維持する。
+
 ## 本別見開き調整のscope/転送とRemote（§1.364 D1–D3、未リリース）
 
 永続scopeは`book_scope::BookScopeKey`。元書庫/PDF/EPUBの論理rootをKeepDrive正規化し、
