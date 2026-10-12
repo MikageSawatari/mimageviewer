@@ -46,10 +46,34 @@ fn push(tracker: &mut HarmNetTracker, signal: &[f32], frame: usize) {
 }
 
 fn difference(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len(), "comparison lengths must match");
+    for (name, values) in [("actual", a), ("expected", b)] {
+        for (index, value) in values.iter().enumerate() {
+            assert!(value.is_finite(), "{name}[{index}] is not finite: {value}");
+        }
+    }
     a.iter()
         .zip(b)
         .map(|(a, b)| (a - b).abs())
         .fold(0.0, f32::max)
+}
+
+#[test]
+fn golden_comparison_rejects_nonfinite_actual_and_expected_values() {
+    let finite = [0.25; HARMNET_PITCH_COUNT];
+    assert_eq!(difference(&finite, &finite), 0.0);
+    for index in [0, HARMNET_PITCH_COUNT / 2, HARMNET_PITCH_COUNT - 1] {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut invalid = finite;
+            invalid[index] = value;
+            for (actual, expected) in [(&invalid, &finite), (&finite, &invalid)] {
+                assert!(
+                    std::panic::catch_unwind(|| difference(actual, expected)).is_err(),
+                    "nonfinite value at key {index} must fail the golden comparison"
+                );
+            }
+        }
+    }
 }
 
 #[test]

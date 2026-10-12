@@ -1,6 +1,6 @@
 # 音楽ビュー鍵盤の基音推定 (HarmNet 移植) 設計
 
-状態: 実装済み・独立コードレビュー ACCEPT。portable check / 本体 release 計測 / 全体ゲート / 検証用 build は環境・成果物の前提待ち (2026-10-12、助走の合格条件は設計担当の追加判断で確定)。実装前の独立レビュー (GPT-6.1 Sol /
+状態: 実装済み。コミット `555c41be9` の独立コードレビューは ACCEPT WITH CHANGES、回帰検査と記録の追補を §12 に記載。portable check / 本体 release 計測 / 全体ゲート / 検証用 build は環境・成果物の前提待ち (2026-10-12、助走の合格条件は設計担当の追加判断で確定)。実装前の独立レビュー (GPT-6.1 Sol /
 xhigh) 1 回目 = ACCEPT WITH CHANGES、指摘は §12 のとおり反映。
 作業ブランチ: `pitch-lab` (worktree `G:\home\mimageviewer-pitchlab`)。
 
@@ -250,7 +250,8 @@ Restart は旧カーソルを消し、0 フレーム投入ならカーソル無�
   和音を含み、**有音→無音と無音→有音の両方の境界を age 8 の範囲にまたがって含む**) の age 0 と
   age 8 の出力を `crates/music-core/tests/fixtures/` に小さなバイナリで保存し、
   Rust の出力が 1e-3 以内で一致すること。fixture の生成スクリプトも同じ場所に置く (Python 依存は
-  テスト実行には不要)。
+  テスト実行には不要)。比較前に実測値・期待値の全要素が有限であることを要求し、どちらに
+  NaN / ±Inf を混ぜても比較検査が失敗することを回帰検査する。
 - **判定関数**: `decide` の Reuse / Advance / Restart (別 PCM・後退・飛びすぎ) の状態遷移テスト。
 - **助走**: 持続音・和音の切り替え・オンセット・無音後の再発音それぞれの途中へ Restart したとき、
   各ケースの末尾要求で確率 **0.5 以上の鍵の集合が正解の音と一致すること**を、連続計算と
@@ -263,6 +264,9 @@ Restart は旧カーソルを消し、0 フレーム投入ならカーソル無�
   `Some` になること (P2、`MusicSpectrumState::update` の handler-level テスト)。**`None` を受け取った後、
   次の `update` より前に `mark_complete()` する順序**も固定して検査する (2 回目 P2)。
 - **PCM の同一性**: 同じ位置でも別の `MusicPcm` なら Restart になること。
+- **worker 結果**: 本番 `run_music_spectrum_worker` の要求・結果チャネルを使う headless 検査で、
+  確率の結果への組み込み、同位置での有音／無音 PCM 切替、未取得／完了後の取得、取消後の終了と
+  結果非公開を検査する。テスト内で結果へ確率を代入する検査だけで代替しない。
 - **未デコード**: デコード済み範囲の外を要求したとき空の結果になり、カーソルが計算できたところに
   あること。
 - **部分助走後のシーク**: Restart が 0 / 1 / 9 フレームしか投入できなかった後で先端へ戻った場合、
@@ -273,7 +277,8 @@ Restart は旧カーソルを消し、0 フレーム投入ならカーソル無�
   基音の 0.3 倍未満であること。`compute_keyboard_visuals` の**瞬時値**で、確率 0 の鍵は中央・上下端とも
   0 であること。残光を含む描画状態は別のテストで、確率が 0 になった後に減衰することを確かめる。
 - **ライセンス表記**: 通常構成と `portable` 構成の両方で、バージョン情報の notice 一覧に HarmNet
-  (EffeTune MIT) が含まれること。
+  (EffeTune MIT) が含まれること。実際の `show_about_dialog_window` を headless 描画し、一覧名と
+  全文への入口、入口をクリックした後の埋め込み LICENSE 全文を検査する。
 - 既存の `keyboard_visuals_*` テストは新しい意味へ置き換える。
 - 実行: `cargo test -p music-core`、`cargo test -p mimageviewer --lib ui_music_spectrum::`。
 
@@ -368,7 +373,7 @@ P4 の別件化、P6 の単体テストでの代替 (既存の park／復帰・�
 | 2 回目 P2 完了を先に観測すると None のまま再要求されない | §4.4: 再要求条件を「確率 None」だけに。48kHz 以外は有効な全 0 を返す (§4.1)。§6 に順序固定テスト |
 | P6 所有の前提・文書・検査 | §3 に App 全体 1 つの前提と PCM 同一性による継続判断。App レベルの park/復帰テストは、継続を PCM 同一性で判定するため tracker 単体の同一性テストで代える。§9 に async-architecture と EffeTune 文書。§6 にライセンス表記の検査、§8 に要求全体の計測 |
 
-### 最終検証記録 (2026-10-12、pitch-lab の未コミット差分)
+### 初回実装の検証記録 (2026-10-12、コミット前の pitch-lab 差分)
 
 助走の合格条件は設計担当の追加判断 (§5.2) で確定。独立実装レビュー (GPT-6.1 Sol / xhigh) は
 最終差分を ACCEPT、新 P1/P2 なし。連続計算との差 0.05 という旧条件に関する初回指摘は撤回済み。
@@ -379,8 +384,12 @@ P4 の別件化、P6 の単体テストでの代替 (既存の park／復帰・�
 公開し、要求の助走範囲を含むときだけ Reuse/Advance する。独立レビューはこれを既承認の
 助走・None 契約を成立させる範囲内の構造修正と合意した。所有者・助走長・結果チャネルは変更なし。
 0 / 1 / 9 投入後の取得済み／末尾 1 サンプル未取得、追記、fresh Restart との一致、旧カーソル破棄の
-回帰検査を追加。レビュー対象 `src/ui_music_spectrum.rs` の hash は
-`b686311df56f69ea58950bccbec51491db507999`。
+回帰検査を追加。当時のレビュー記録にあった `b686311df56f69ea58950bccbec51491db507999` は
+コミット前の版を指す記録であり、方式・対象版が明記されていなかったため、コミットの検証根拠には
+使用しない。今回の別セッション独立レビューの対象版はコミット
+`555c41be9d2883c1af10d402cbebff429cff4862`。その `src/ui_music_spectrum.rs` の **Git blob SHA-1** は
+`a588ea21a58719549c3de2d0f6184edddfa54fb1` (`git rev-parse 555c41be9:src/ui_music_spectrum.rs`)。
+コミット時に設計担当が追加した `PITCH_REFERENCE_DELAY_SECS` 定数もこの対象版に含む。
 
 | コマンド | exit / 結果 |
 | --- | --- |
@@ -408,3 +417,46 @@ music-core の成功結果は同一ソースのまま、後続の worker 修正�
 §8 の初回直接 rustc headless 検査と `pitch-measurement-summary.txt` は以前の別枠の記録として維持する。
 未成立の portable check / release bench / build は設計担当側の環境での実行が必要。
 全体ゲートは release 入力 3 本を用意してから再実行する。検収・実アプリの手動確認は未完了。
+
+### コミット後の独立レビューへの追補 (2026-10-12、基点 `555c41be9`)
+
+別セッションの GPT-6.1 Sol / xhigh は上記コミットを ACCEPT WITH CHANGES と判定。
+ソース照合では DSP 移植、age の無音履歴、部分助走カーソル、PCM 同一性、EOF 補完の
+具体的な実装不具合は見つからず、以下の回帰検査・記録修正を要求した。今回の変更は
+テストと本書だけで、製品の実行経路・動作は変更していない。追補は未コミット。
+
+| 指摘 | 追補対応 |
+| --- | --- |
+| P2 golden の `f32::max` が NaN 差分を捨てる | 共通比較関数で両配列の全要素に `is_finite()` を要求。実測側／期待側の先頭・中央・末尾に NaN / ±Inf を混ぜる 18 通りが必ず失敗することを検査 |
+| P2 本番 worker の確率代入が検査対象外 | 実際の `run_music_spectrum_worker` にチャネルで要求を送り、受信した確率・同位置の有音／無音／有音 PCM 切替・未取得から完了後の取得・取消終了と結果非公開を検査。結果への確率代入をテスト内で代替しない |
+| P3 notice の実際の表示登録が検査対象外 | 隔離された App fixture で `show_about_dialog_window` を実際に描画し、一覧名・全文入口・AccessKit のクリック操作後の埋め込み LICENSE 本文を検査。通常／portable とも cfg なしの同じテストを実行 |
+| P3 レビュー対象 hash の不一致 | 初回記録をコミット前の版として区別し、別セッションの対象コミットと Git blob SHA-1 を明記 |
+
+追補の検証対象 `src/ui_music_spectrum.rs` の Git blob SHA-1 は
+`bb9ccd7d8f7428a872b10ed798329b011b4e495e` (`git hash-object src/ui_music_spectrum.rs`)。
+これは上記コミットに回帰テストだけを足した作業ツリーの版で、別セッションレビューの対象版とは区別する。
+
+| コマンド | exit / 結果 |
+| --- | --- |
+| `cargo fmt --check` | 0 |
+| `cargo test -p music-core` | 0: lib 21、HarmNet 7、allocation 1 の計 29 成功、失敗 0。doc test 0 件 |
+| `cargo test -p mimageviewer --lib ui_music_spectrum::` | 0: 27 成功、失敗 0、bench 1 ignored |
+| `cargo test -p mimageviewer --lib ui_dialogs::about::tests::` | 0: 5 成功、失敗 0。実際の HarmNet notice 描画／全文展開を含む |
+| `cargo test -p mimageviewer --features portable --lib ui_dialogs::about::tests::` | 0: 4 成功、失敗 0。実際の HarmNet notice 描画／全文展開を含む |
+
+Cargo は全て `MSBUILDDISABLENODEREUSE=1`。golden 検査を今回ビルドした music-core の
+テスト実行ファイルで `--nocapture` 再実行し、age 0 最大差 0.000000782、age 8 最大差
+0.000000358 (exit 0、1 成功) を再確認した。助走長・合格条件・性能の測定対象コードは
+変更していないため、§5.2 / §8 の測定値を維持し、今回の性能再計測とは扱わない。
+通常版 About の最初の座標クリックによる検査は本文を取得できず失敗したため、同じ実描画の
+入口を AccessKit のクリック操作で開く検査へ修正し、通常／portable とも成功した。
+全ての指摘へ対応済みで、今回の指定確認は全て exit 0。native ビルド障害は発生していない。
+`src/ui_music_spectrum.rs` と `src/ui_dialogs/about.rs` のテストモジュールより前の本番コードが
+HEAD と一致することもソース比較で確認した。追補差分の再独立レビュー・検収は未実施。
+
+今回の作業では TMP/TEMP の変更、target 成果物の削除、`target/dev-runtime` の操作、
+製品実行ファイルの起動、コミット、master／別 worktree の操作を行っていない。
+本体テストの raw log は `target/pitch-validation/{spectrum,about,portable-about}-review.log`、
+golden 再実行は `golden-review.log` に保存。music-core 全体テストの結果はツール出力に記録。
+初回の portable check / release bench / 全体ゲート / 検証用 build と実アプリ idle 測定の
+未成立・未実施は、今回のテスト追補によって成立した扱いにはしない。

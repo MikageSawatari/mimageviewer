@@ -383,6 +383,44 @@ mod tests {
         assert_eq!(license, tracked);
     }
 
+    #[test]
+    fn harmnet_notice_is_drawn_and_full_license_can_be_opened_in_every_build_flavor() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut app = crate::app::setup_app_for_test();
+        app.show_about_dialog = true;
+        // Isolate the optional pack from the fixture; the dialog uses its normal
+        // rendering path, including the notice grid and collapsing license text.
+        app.editing_pack_about_loaded = true;
+        app.editing_pack_about = None;
+        let mut fonts_ready = false;
+        let mut harness = crate::test_ui::builder()
+            .with_size(eframe::egui::vec2(900.0, 2000.0))
+            .build_state(
+                move |ctx, app: &mut crate::app::AppTestEnvForTest| {
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    app.show_about_dialog_window(ctx);
+                },
+                app,
+            );
+        harness.run();
+        harness.get_by_label("EffeTune Note Spectrogram (HarmNet L)");
+        assert!(
+            harness.query_by_label(super::HARMNET_NOTICE.2).is_none(),
+            "the full text starts collapsed"
+        );
+        harness
+            .get_by_label("EffeTune Note Spectrogram (HarmNet L) — MIT License 全文")
+            .click_accesskit();
+        harness.run();
+        harness.get_by_label(super::HARMNET_NOTICE.2);
+    }
+
     #[cfg(not(feature = "portable"))]
     #[test]
     fn effetune_notice_texts_include_attribution_and_match_vendor_when_present() {

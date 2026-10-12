@@ -1610,6 +1610,64 @@ mod tests {
     }
 
     #[test]
+    fn spectrum_worker_publishes_pitch_switches_pcm_and_exits_on_cancel() {
+        let (request_tx, request_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let worker = std::thread::spawn(move || {
+            run_music_spectrum_worker(request_rx, result_tx, worker_cancel);
+            finished_tx.send(()).unwrap();
+        });
+        let tone = tone_pcm(3 * 48_000, true);
+        let silence = Arc::new(MusicPcm::with_capacity(48_000, 3 * 48_000));
+        silence.append(&vec![0.0; 3 * 48_000 * 2]).unwrap();
+        silence.mark_complete();
+        let request = |pcm: &Arc<MusicPcm>| MusicSpectrumRequest {
+            pcm: Arc::clone(pcm),
+            center_secs: 1.42,
+        };
+        let receive = || result_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+
+        request_tx.send(request(&tone)).unwrap();
+        let analysis = receive();
+        assert!(!analysis.bands.is_empty());
+        let tone_probabilities = analysis
+            .pitch_probabilities
+            .expect("worker must publish pitch");
+        assert_eq!(tone_probabilities.len(), 88);
+        assert!(tone_probabilities.iter().all(|p| p.is_finite()));
+        assert!(tone_probabilities[(57 - SPECTRUM_NOTE_MIN_MIDI) as usize] >= 0.5);
+
+        // Same position, different PCM: the previous tone must not be reused.
+        request_tx.send(request(&silence)).unwrap();
+        assert_eq!(receive().pitch_probabilities, Some(vec![0.0; 88]));
+        request_tx.send(request(&tone)).unwrap();
+        assert_eq!(receive().pitch_probabilities, Some(tone_probabilities));
+
+        let streaming = tone_pcm(HARMNET_HOP_SAMPLES, false);
+        request_tx.send(request(&streaming)).unwrap();
+        assert!(receive().pitch_probabilities.is_none());
+        streaming.mark_complete();
+        request_tx.send(request(&streaming)).unwrap();
+        assert_eq!(receive().pitch_probabilities, Some(vec![0.0; 88]));
+
+        // Keep the request sender alive and wake recv after cancellation, verifying
+        // the cancel path rather than relying on request-channel disconnection.
+        // The worker may also observe cancellation at the top of its loop and
+        // disconnect before the wake-up send; both must exit without a result.
+        cancel.store(true, Ordering::Relaxed);
+        let _ = request_tx.send(request(&tone));
+        finished_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        worker.join().unwrap();
+        assert!(matches!(
+            result_rx.recv_timeout(Duration::from_secs(1)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+    }
+
+    #[test]
     fn pitch_frontier_keeps_cursor_and_resumes_after_append() {
         let pcm = tone_pcm(20 * HARMNET_HOP_SAMPLES + 7, false);
         let request = MusicSpectrumRequest {
