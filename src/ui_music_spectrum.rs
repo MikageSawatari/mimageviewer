@@ -25,9 +25,11 @@ use std::sync::mpsc;
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
+use music_core::bass::{BassEstimate, pitch_frame_at_secs, select_bass};
+#[cfg(test)]
+use music_core::pitch::HARMNET_HOP_SECS;
 use music_core::pitch::{
-    HARMNET_HOP_SAMPLES, HARMNET_HOP_SECS, HARMNET_LONG_WINDOW_SAMPLES, HARMNET_PITCH_COUNT,
-    HarmNetTracker,
+    HARMNET_HOP_SAMPLES, HARMNET_LONG_WINDOW_SAMPLES, HARMNET_PITCH_COUNT, HarmNetTracker,
 };
 use music_core::{
     SPECTRUM_BAND_COUNT, SPECTRUM_BAND_MAX_MIDI, SPECTRUM_BAND_MIN_MIDI, SPECTRUM_NOTE_MAX_MIDI,
@@ -55,16 +57,14 @@ const KEY_HARMONIC_SMOOTH: f32 = 0.45;
 /// Layer ④ 縦グラデで倍音の伸びをどこまで許すか (上下端 = center × factor.clamp(0, これ))。
 const KEY_GRADIENT_SPREAD: f32 = 1.0;
 /// Bass 音マーカー (▼) のパラメータ。上の Bass 表示と同じ配色 (key_color) + afterglow 減衰。
-const BASS_MARKER_MIN_CONF: f32 = 0.06;
+const BASS_MARKER_MIN_CONF: f32 = 0.5;
 /// 明るさ用に信頼度を持ち上げる係数。
 const BASS_MARKER_CONF_GAIN: f32 = 1.6;
 /// afterglow 減衰 (毎フレーム)。オクターブ間の一瞬のちらつきを目で追いやすくする。
 const BASS_MARKER_DECAY: f32 = 0.92;
-/// 直近光っていた octave へのバイアス (flip-flop 抑制)。
-const BASS_MARKER_STICKY: f32 = 0.15;
 /// これ未満の afterglow 強度は描かない。
 const BASS_MARKER_DRAW_MIN: f32 = 0.03;
-const BASS_MARKER_MIN_MIDI: u8 = 24; // ~C1 (32.7Hz)
+const BASS_MARKER_MIN_MIDI: u8 = 21; // A0
 const BASS_MARKER_MAX_MIDI: u8 = 55; // ~G3 (196Hz)
 const BASS_MARKER_W: f32 = 7.0;
 const BASS_MARKER_H: f32 = 5.0;
@@ -91,9 +91,6 @@ const SPECTRUM_VIEW_MAX_HZ: f32 = 18_000.0;
 /// スペクトラム更新のリクエスト間隔。再生中はフレーム毎に届くが、この間隔で throttle して
 /// 過剰リクエストを抑える (1 フレーム 1 リクエストが上限)。
 const SPECTRUM_REFRESH_INTERVAL: Duration = Duration::from_millis(16);
-/// HarmNet frame L (window ending at sample L*hop) describes audio this far before its end,
-/// because the long analysis window peaks 20 ms before its newest sample (EffeTune frontend).
-const PITCH_REFERENCE_DELAY_SECS: f64 = 0.02;
 const PITCH_LOOKAHEAD_FRAMES: i64 = 8;
 const WARMUP_FRAMES: i64 = 58;
 const MAX_ADVANCE_FRAMES: i64 = WARMUP_FRAMES;
@@ -456,13 +453,7 @@ impl MusicSpectrumState {
 
     /// 下段スペクトラム + ピッチ鍵盤を `rect` に描く。ラボの `draw_spectrum` を本体向けに
     /// 移植したもの (描画状態 trail/onset/note は `self` に持つ)。
-    pub fn draw(
-        &mut self,
-        ui: &egui::Ui,
-        rect: egui::Rect,
-        norm_gain_db: f32,
-        bass_marker: Option<(u8, f32)>,
-    ) {
+    pub fn draw(&mut self, ui: &egui::Ui, rect: egui::Rect, norm_gain_db: f32) {
         let response = ui.interact(
             rect,
             ui.id().with("music_spectrum_panel"),
@@ -515,6 +506,12 @@ impl MusicSpectrumState {
             );
             // まだデコード中 (窓が取れない) 間はプロット領域に「解析中」を出し、無反応に見せない。
             // デコード完了後にバンドが空 = 無音区間なので、その場合はラベルを出さない。
+            draw_bass_marker(
+                &painter,
+                keyboard_rect,
+                &mut self.bass_marker_trail,
+                select_bass(self.pitch_probabilities.as_deref().unwrap_or(&[])),
+            );
             if self.source_present && !self.source_complete {
                 painter.text(
                     plot.center(),
@@ -610,13 +607,12 @@ impl MusicSpectrumState {
             &mut self.note_odd,
             norm_gain_db,
         );
-        // 上の Bass グラフと同じ推定を鍵盤上の ▼ で示す (afterglow 減衰、明るさ=信頼度)。
+        // 鍵盤と同じ確率から最低音を選ぶ (残光は保持、明るさ=確率)。
         draw_bass_marker(
             &painter,
             keyboard_rect,
-            &self.notes,
             &mut self.bass_marker_trail,
-            bass_marker,
+            select_bass(self.pitch_probabilities.as_deref().unwrap_or(&[])),
         );
     }
 }
@@ -683,20 +679,9 @@ fn decide(cursor: Option<&PitchTrackerCursor>, pcm: &Arc<MusicPcm>, k_end: i64) 
 }
 
 fn pitch_end_frame(center_secs: f64) -> i64 {
-    let center = if center_secs.is_finite() {
-        center_secs.max(0.0)
-    } else {
-        0.0
-    };
-    // Bound the subsequent sample-index multiplication (normal media positions are far smaller).
-    let k = (((center + PITCH_REFERENCE_DELAY_SECS) / HARMNET_HOP_SECS).round() as i64).clamp(
-        1,
-        i64::MAX / HARMNET_HOP_SAMPLES as i64 - PITCH_LOOKAHEAD_FRAMES,
-    );
-    k + PITCH_LOOKAHEAD_FRAMES
+    pitch_frame_at_secs(center_secs) + PITCH_LOOKAHEAD_FRAMES
 }
 
-/// The existing spectrum worker is the only owner; no UI-side DSP or extra result channel.
 struct SpectrumPitchTracker {
     tracker: HarmNetTracker,
     cursor: Option<PitchTrackerCursor>,
@@ -945,52 +930,28 @@ fn draw_pitch_keyboard(
     }
 }
 
-/// 上の Bass グラフと同じ推定 (ピッチクラス + 信頼度) を、鍵盤上の小さな ▼ で示す。Bass 音域で
-/// 推定ピッチクラスに一致する鍵のうち最もエネルギーの高い octave を選び、その鍵の上 (鍵盤とプロット
-/// の隙間) に信頼度に応じた明るさで描く。控えめなサイズ。
+/// 共通選択関数が返す MIDI 鍵へ直接 ▼ を描く。倍音でオクターブを選び直さない。
 fn draw_bass_marker(
     painter: &egui::Painter,
     keyboard_rect: egui::Rect,
-    notes: &[f32],
     trail: &mut Vec<f32>,
-    bass_marker: Option<(u8, f32)>,
+    bass_marker: BassEstimate,
 ) {
     let note_count = (SPECTRUM_NOTE_MAX_MIDI - SPECTRUM_NOTE_MIN_MIDI + 1) as usize;
     if trail.len() != note_count {
         trail.clear();
         trail.resize(note_count, 0.0);
     }
-    // afterglow: 毎フレーム緩やかに減衰させ、オクターブ間の一瞬のちらつきに残光を残す。
     for value in trail.iter_mut() {
         *value *= BASS_MARKER_DECAY;
     }
-    // 現在の推定を対象鍵に載せる。Bass 音域で推定ピッチクラスに一致する鍵のうちエネルギー最大を
-    // 選ぶが、直近光っていた octave に軽くバイアスして flip-flop を抑える。
-    if let Some((pitch_class, confidence)) = bass_marker
-        && confidence >= BASS_MARKER_MIN_CONF
+    if (BASS_MARKER_MIN_MIDI..=BASS_MARKER_MAX_MIDI).contains(&bass_marker.midi)
+        && bass_marker.confidence >= BASS_MARKER_MIN_CONF
     {
-        let pc = pitch_class % 12;
-        let mut best_idx = None;
-        let mut best_score = 0.0_f32;
-        for midi in BASS_MARKER_MIN_MIDI..=BASS_MARKER_MAX_MIDI {
-            if midi % 12 != pc || !(SPECTRUM_NOTE_MIN_MIDI..=SPECTRUM_NOTE_MAX_MIDI).contains(&midi)
-            {
-                continue;
-            }
-            let idx = (midi - SPECTRUM_NOTE_MIN_MIDI) as usize;
-            let energy = notes.get(idx).copied().unwrap_or(0.0);
-            let score = energy + trail[idx] * BASS_MARKER_STICKY;
-            if score > best_score {
-                best_score = score;
-                best_idx = Some(idx);
-            }
-        }
-        if let Some(idx) = best_idx {
-            let target = (confidence * BASS_MARKER_CONF_GAIN).clamp(0.0, 1.0);
-            trail[idx] = trail[idx].max(target);
-        }
+        let idx = (bass_marker.midi - SPECTRUM_NOTE_MIN_MIDI) as usize;
+        let target = (bass_marker.confidence * BASS_MARKER_CONF_GAIN).clamp(0.0, 1.0);
+        trail[idx] = trail[idx].max(target);
     }
-    // 残光のある鍵に ▼ を描く。色は上の Bass 表示と同じ key_color、明るさ = afterglow 強度。
     for idx in 0..trail.len() {
         let intensity = trail[idx];
         if intensity < BASS_MARKER_DRAW_MIN {
@@ -1429,6 +1390,43 @@ fn color_with_alpha(color: egui::Color32, alpha: u8) -> egui::Color32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bass_marker_draws_selected_absolute_midi_and_keeps_only_afterglow() {
+        use super::*;
+        for midi in [21, 33, 40, 55] {
+            let ctx = egui::Context::default();
+            let mut trail = Vec::new();
+            let mut probabilities = vec![0.0; 88];
+            probabilities[(midi - 21) as usize] = 0.5;
+            // A stronger octave/harmonic must never move the selected marker.
+            probabilities[(midi + 12 - 21) as usize] = 0.99;
+            let mut painted = Vec::new();
+            let selected = select_bass(&probabilities);
+            assert_eq!(selected.midi, midi);
+            let _ = ctx.run(Default::default(), |ctx| {
+                let painter = ctx.layer_painter(egui::LayerId::background());
+                draw_bass_marker(
+                    &painter,
+                    egui::Rect::from_min_size(egui::pos2(0.0, 50.0), egui::vec2(1200.0, 34.0)),
+                    &mut trail,
+                    selected,
+                );
+                painted = (0..trail.len()).filter(|&i| trail[i] > 0.0).collect();
+            });
+            assert_eq!(painted, vec![(midi - SPECTRUM_NOTE_MIN_MIDI) as usize]);
+            let old = trail[painted[0]];
+            let _ = ctx.run(Default::default(), |ctx| {
+                draw_bass_marker(
+                    &ctx.layer_painter(egui::LayerId::background()),
+                    egui::Rect::from_min_size(egui::pos2(0.0, 50.0), egui::vec2(1200.0, 34.0)),
+                    &mut trail,
+                    BassEstimate::default(),
+                );
+            });
+            assert!((trail[painted[0]] - old * BASS_MARKER_DECAY).abs() < 1e-6);
+        }
+    }
+
     use super::*;
 
     #[test]

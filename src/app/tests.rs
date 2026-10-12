@@ -62580,6 +62580,8 @@ mod still_window_mode_key_tests {
             },
         );
         app.ensure_music_analysis(0, &path, Some((1, 15)));
+        let bass = Arc::new(music_core::bass::TimelineBassTrack::new(960, 48_000));
+        app.music_bass = Some(bass.clone());
         let first = app.music_analysis_source.clone().unwrap();
         let first_cancel = app.music_analysis_pending.as_ref().unwrap().cancel.clone();
         let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
@@ -62591,6 +62593,7 @@ mod still_window_mode_key_tests {
         );
         app.ensure_music_analysis(0, &path, Some((1, 15)));
         assert_eq!(app.music_analysis_source.as_ref(), Some(&first));
+        assert!(Arc::ptr_eq(app.music_bass.as_ref().unwrap(), &bass));
         assert!(!first_cancel.load(std::sync::atomic::Ordering::Relaxed));
         let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
             unreachable!()
@@ -62604,6 +62607,7 @@ mod still_window_mode_key_tests {
             Some(2)
         );
         assert!(first_cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(app.music_bass.is_none());
         assert_eq!(
             app.music_analysis_pending
                 .as_ref()
@@ -62712,6 +62716,9 @@ mod still_window_mode_key_tests {
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel();
         tx.send(MusicAnalysisMsg::Pcm(next_pcm.clone())).unwrap();
+        let first_bass = Arc::new(music_core::bass::TimelineBassTrack::new(960, 48_000));
+        let next_bass = Arc::new(music_core::bass::TimelineBassTrack::new(1920, 48_000));
+        tx.send(MusicAnalysisMsg::Bass(next_bass.clone())).unwrap();
         app.music_analysis_source = Some(old_source.clone());
         app.music_analysis_pending = Some(MusicAnalysisPending {
             source: old_source.clone(),
@@ -62720,6 +62727,7 @@ mod still_window_mode_key_tests {
         });
         app.set_music_analysis(Some(analysis.clone()));
         app.music_pcm = Some(first_pcm.clone());
+        app.music_bass = Some(first_bass.clone());
         let version = app.music_analysis_version;
 
         app.bind_mounted_context_for_test(909);
@@ -62739,6 +62747,7 @@ mod still_window_mode_key_tests {
                 .as_ref()
                 .is_some_and(|pcm| std::sync::Arc::ptr_eq(pcm, &first_pcm))
         );
+        assert!(Arc::ptr_eq(app.music_bass.as_ref().unwrap(), &first_bass));
         assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
 
         let ctx = egui::Context::default();
@@ -62764,7 +62773,8 @@ mod still_window_mode_key_tests {
                     .as_ref()
                     .is_some_and(|got| std::sync::Arc::ptr_eq(got, &next_pcm))
             );
-            assert_eq!(owner.music_analysis_version, version);
+            assert_eq!(owner.music_analysis_version, version + 1);
+            assert!(Arc::ptr_eq(owner.music_bass.as_ref().unwrap(), &next_bass));
         })
         .unwrap();
         let stashed = app.stash_mounted_and_start_fresh("test_music_fork_old_owner");
@@ -62784,6 +62794,7 @@ mod still_window_mode_key_tests {
                 .is_some_and(|got| std::sync::Arc::ptr_eq(got, &next_pcm))
         );
         assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(Arc::ptr_eq(app.music_bass.as_ref().unwrap(), &next_bass));
         drop(tx);
     }
 

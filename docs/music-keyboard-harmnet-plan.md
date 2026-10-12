@@ -463,7 +463,7 @@ golden 再実行は `golden-review.log` に保存。music-core 全体テスト�
 
 ## 13. 第 2 段階: タイムラインのベース表示と鍵盤の ▼ (2026-10-12 追加)
 
-状態: 設計。利用者が方向を承認 (タイムラインとは別枠で計算、スレッド数は控えめ)。実装前の独立レビュー待ち。
+状態: 第2段階を実装。実装前レビューは§13.7、実装・検証・計測の記録は§13.8。
 
 ### 13.1 背景
 
@@ -557,3 +557,129 @@ GPT-6.1 Sol / xhigh (session `01a12f97-…`、3 回目): ACCEPT WITH CHANGES。�
 `draw` 呼び出しから旧解析由来の ▼ 引数を外す。これは ▼ のデータの出どころを鍵盤と同じ確率へ移す
 機能側の変更で、detached の述語・viewport 経路・所有は変えない (症状パッチではない)。CLAUDE.md の
 手続きに従い、実装の独立レビューでこの主張への合意を取り、`docs/detached-rework-plan.md` に記録する。
+
+### 13.8 第2段階の実装・検証記録 (2026-10-12、pitch-lab、未コミット)
+
+全音域推論を採用し、音域を限定する任意の最適化は行っていない。`TimelineBassTrack` は
+20秒単位の計算済み印と絶対MIDI／確率を保持し、時刻は鍵盤と同じ共通丸め関数で引く。
+末尾の丸めを覆う1フレームを加え、head 3の先読みは0埋めする。
+デコード成功→必要な `TimelineComplete`→区間計算の順序、単一公開者・250ms公開間隔・
+完了公開・各フレーム取消を実装した。UIの1 drainで最新BassとTimelineをまとめて採用し、
+共有の版数を1回進める。ベース結果のLRU保存、UIでの配列cloneや推論は追加していない。
+
+ラスタ結果が計算済み印付きのリズム投票を保持し、textureと一緒に採用される。
+tooltipはその表示中のtextureと同じ票を参照するので、旧textureを表示している間も色と
+音名が一致する。未計算binには計算済み側の色を広げない。▼は鍵盤と同じ確率から最低音を
+共通選択して直接描き、倍音エネルギーによるオクターブ再選択とstickyは除去、残光は保持した。
+
+独立実装レビュー: GPT-6.1 Sol / xhigh、ACCEPT、material findingなし。
+parked-liveの変更は旧▼引数の除去に限られ、detached述語／viewport／ownerを変えない
+構造的なデータ出どころの変更という§13.7末尾の主張に明示的に合意。
+設計側の判断と触れた範囲を `detached-rework-plan.md` §11へ記録した。
+
+**不一致計測の意味**: §13.7 P6は不一致の合格上限を定めていない。B4/B7で許容した
+58フレーム助走とGRU履歴の差を、正解付き合成音のraw MIDI選択で測る。
+これはタイムラインのリズム投票・▼の残光を含む可視表示の一致率ではない。
+B7の「食い違いはまれ」は普遍的保証ではなく、以下の実験条件付き観測に限定する。
+特に確率0.5付近へシークした場合にはこの主張を適用しない。
+独立レビューもこの測定だけから推論／助走／閾値を変更する必要はないと判断した。
+
+指定コマンドのraw logと集約結果は `target/pitch-stage2-validation/` に保存する。
+release core計測は `bass_track_benchmark`、ラスタはheadlessの
+`ui_music_timeline::tests::timeline_bass_raster_benchmark`。製品実行ファイルは起動しない。
+ラスタ計測は本番cache／workerと16msごとのCPU texture採用を通すが、native GPU presentを含まない。
+計算時間・メモリはそれぞれの計測範囲を区別し、core単体値を本体release成功へ読み替えない。
+
+#### 指定確認結果
+
+Cargoは全て `MSBUILDDISABLENODEREUSE=1`。最新ソースのfmt再確認とclippy再確認もexit 0、
+clippyの最終ログ (`clippy-final.log`) は警告0。初回clippyのexample警告は修正済み。
+`results.json`／`fmt-check.log` のfmtは取消回帰追加前の集約実行で、追加後の最終
+`cargo fmt --check` はツールから直接実行してexit 0を確認した（この再確認のraw logは保存していない）。
+この出どころと最終clippyの結果は `extra-results.json` に分けて記録する。
+本体には既存の警告があり、本体全体を警告0へ変更する作業は行っていない。
+
+| コマンド | exit | 件数／結果 |
+| --- | ---: | --- |
+| `cargo fmt` | 0 | workspace全体 |
+| `cargo fmt --check` | 0 | 追加取消回帰後の最終ソースでも成功 |
+| `cargo test -p music-core` | 0 | lib 21、Bass 9、HarmNet 7、allocation 1、計38成功、失敗0、doc test 0 |
+| `cargo clippy -p music-core --all-targets` | 0 | 最終警告0 |
+| `cargo test -p mimageviewer --lib ui_music_spectrum::` | 0 | 28成功、失敗0、bench 1 ignored |
+| `cargo test -p mimageviewer --lib ui_music_timeline::` | 0 | 19成功、失敗0、bench 1 ignored |
+| `cargo test -p mimageviewer --lib music` | 0 | 151成功、失敗0、bench 2 ignored |
+| `cargo test --test ui_snapshot` | 0 | 162成功、失敗0、既存PNG変更なし |
+| `cargo check -p mimageviewer --features portable` | 0 | check完了 |
+| `python scripts/check_ui_glyphs.py` | 0 | 危険glyph 0 |
+| 新partial snapshotの限定生成 | 0 | 1成功。続くtimeline／musicで通常比較も成功 |
+| `cargo run --release -p music-core --example bass_track_benchmark` | 0 | 下記計測 |
+| 本体releaseの `timeline_bass_raster_benchmark` | 101 | `turbojpeg-sys v1.2.0` のCMake/MSBuild段がexit 1、bench 0件・未測定 |
+
+新規PNGは `tests/snapshots/timeline_bass_partial_raster.png` (240×80、1,553 bytes) の1枚だけ。
+計算済み／未計算の境界を同じリズム区間の途中に置き、ベース色が未計算側へ漏れないことを描く。
+目視で紫系の計算済み側と既定色の未計算側を確認した。既存162件のPNGには差分なし。
+Appを起動するsnapshotや製品実行ファイルの起動は行っていない。
+
+#### release計測（最終ソース、4 worker、Windows BELOW_NORMAL）
+
+入力は48kHz stereo f32。180秒／3600秒は、20秒の合成音楽信号を繰り返したPCM。
+計測は区間キュー・単一結合owner・250ms／完了snapshotを含むcore exampleで、
+本体のデコード・`MusicPcm` read lock・UI poll・ラスタ・GPUは含まない。
+
+| PCM尺 | 全区間計算 | 最初の区間 | フレーム／区間 | 公開数 | snapshot clone累計 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 180秒 | 2,756.503ms | 923.196ms | 9,001／10 | 3 | 0.139ms |
+| 3600秒 | 41,716.022ms | 854.681ms | 180,001／181 | 47 | 24.498ms |
+
+| PCM尺 | PCM配列payload | Bass配列payload（1個） | mutable＋最新snapshot（2個） |
+| --- | ---: | ---: | ---: |
+| 180秒 | 69,120,000 bytes | 72,018 bytes | 144,036 bytes |
+| 3600秒 | 1,382,400,000 bytes | 1,440,189 bytes | 2,880,378 bytes |
+
+これらのメモリ値は配列payloadの計数であり、プロセス全体やUI／チャネルの全保持量ではない。
+音域限定は不採用なので、全音域版との一致検査と削れた時間の計測は該当なし。
+§13.2 B6の「3分で約2秒の見込み」はこの合成条件では2.757秒だった。アルゴリズムや閾値は変更していない。
+
+不一致fixtureは42秒。0〜10秒E2（10倍音）、11〜20.05秒G2＋C4/E4、20.05〜30秒D2、
+30〜40秒はE2の振幅を0.5秒ごとに変えるsweep、区間間と末尾に無音を置く。
+連続推論と、各採取位置でresetして58フレーム助走する推論を、分割trackの選択MIDIと比較する。
+切替／区間境界は±0.5秒、seek全体はそれらの窓と30〜40秒sweepだけ（全42秒ではない）。
+閾値近傍は各modeのpeak、連続推論のpeak、track信頼度のいずれかが0.35〜0.65に入る採取点。
+このためmodeごとの閾値近傍の分母は異なる。
+
+| 比較 | 範囲 | 不一致／採取数 | 率 | 採取不一致時間合計 | 最長連続時間 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 連続 | 全42秒 | 1／2100 | 0.0476% | 20ms | 20ms |
+| 連続 | 音切替±0.5秒 | 1／253 | 0.3953% | 20ms | 20ms |
+| 連続 | 区間境界±0.5秒 | 1／102 | 0.9804% | 20ms | 20ms |
+| 連続 | sweep閾値近傍 | 0／4 | 0% | 0 | 0 |
+| seek助走 | 指定窓全体 | 23／705 | 3.2624% | 460ms | 420ms |
+| seek助走 | 音切替±0.5秒 | 2／253 | 0.7905% | 40ms | 20ms |
+| seek助走 | 区間境界±0.5秒 | 0／102 | 0% | 0 | 0 |
+| seek助走 | sweep閾値近傍 | 10／17 | 58.8235% | 200ms | 160ms |
+
+**未成立の計測**: 本体releaseラスタbenchはnative依存のビルド失敗で実行できなかった。
+4区間連続到着／250ms到着、180秒／60分の4条件を実cache／workerへ流すbenchと、
+queue滞留・最新色採用時間・生存snapshot配列量・ラスタpayload上界・16msプロセスメモリ標本の
+計装は追加したが、これらの数値は未測定。payload上界を実保持量、16ms標本を瞬間最大の
+保証として扱わない。debug計測や直接rustcによる回避は行わない。
+使用可能な2〜3分の実曲も未指定のため実曲計測は未実施（180秒合成値で代替成立とは扱わない）。
+
+利用者側で実行する未成立コマンド:
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+cargo test --release -p mimageviewer --lib ui_music_timeline::tests::timeline_bass_raster_benchmark -- --ignored --nocapture
+```
+
+実曲を48kHz stereo f32 LEへデコードしたPCMに対しては、同じcore exampleの
+`--pcm <PCMパス> --no-compare` で計算時間と配列payloadを取得できる。
+TMP/TEMP変更、target削除、nativeビルドの回避／再試行、`target/dev-runtime`操作は行っていない。
+作業はpitch-labのみで、master／他worktree／通常設定データへ触れず、コミットしていない。
+検証用buildも利用者の明示的禁止に従って行わない。実装の設計逸脱はなし。
+
+変更ファイル: `crates/music-core/{src/bass.rs,src/lib.rs,tests/bass.rs,examples/bass_track_benchmark.rs}`、
+`src/{app.rs,app/music_bass.rs,app/tests.rs,ui_music_timeline.rs,ui_music_spectrum.rs,ui_fullscreen.rs,video/seek_strip_wave.rs}`、
+`docs/{music-keyboard-harmnet-plan.md,music-integration-plan.md,async-architecture.md,detached-rework-plan.md}`、
+`htdocs/mimageviewer/manual/{music.html,tut-music.html}`、上記PNG。seek stripは共通ラスタ関数へ
+`None`を追加しただけで、動画側の表示動作は変更しない。CHANGELOG／next-release-backlogは未変更。

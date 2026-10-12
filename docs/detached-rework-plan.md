@@ -1455,6 +1455,18 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-12 音楽ベース表示の共通基音推定への移行 (§13、第2段階)
+
+[鍵盤設計 §13.7 P4](music-keyboard-harmnet-plan.md) と利用者の実装指示による。
+`src/ui_fullscreen.rs::draw_parked_live_music_window` の `MusicSpectrumState::draw` 呼出から、
+旧タイムライン解析由来の▼引数を除去した。通常表示も同じ変更を行い、spectrum自身が
+鍵盤と同じ再生中の確率から絶対MIDI鍵を選んで▼へ渡す。
+これは▼のデータの出どころを鍵盤と揃える機能変更であり、detachedの症状パッチではない。
+detached述語、viewport経路、park／復帰の所有・遷移、Norm引数は変更していない。
+既存のpark／復帰回帰にはBass結果の保持・採用の検査を加えた。
+設計側の判断は§13.7末尾に記録済み。実装側も上記主張に合意する。
+独立実装レビューの合意・自動検証は鍵盤設計の今回の検証記録へ追記する。
+
 ### 2026-10-12 §1.374 Everything の共通Search接続（未コミット・独立実装レビュー待ち）
 
 利用者の実装指示と承認済みEverything計画、先行PDF ownershipの独立ACCEPT実装

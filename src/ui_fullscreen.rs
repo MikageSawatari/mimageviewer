@@ -19566,16 +19566,7 @@ impl App {
         let spectrum_rect = layout.spectrum_rect;
         if layout.show_spectrum && spectrum_rect.width() >= 180.0 && spectrum_rect.height() >= 60.0
         {
-            let bass_marker = self.music_analysis.as_ref().and_then(|analysis| {
-                let idx =
-                    (info.position_secs.max(0.0) / analysis.config.bin_secs.max(1.0e-3)) as usize;
-                analysis
-                    .bins
-                    .get(idx)
-                    .map(|bin| (bin.bass_pitch_class, bin.bass_pitch_confidence))
-            });
-            self.music_spectrum
-                .draw(ui, spectrum_rect, 0.0, bass_marker);
+            self.music_spectrum.draw(ui, spectrum_rect, 0.0);
         }
 
         let hud_h = crate::ui_music_panels::MUSIC_HUD_HEIGHT;
@@ -50027,6 +50018,7 @@ impl App {
                     outcome = crate::ui_music_timeline::draw_music_timeline(
                         ui,
                         analysis,
+                        &self.music_bass,
                         analysis_version,
                         timeline_dur,
                         pos,
@@ -50134,16 +50126,9 @@ impl App {
             let pcm = self.music_pcm.clone();
             // Norm (ラウドネス正規化) 適用中のゲインを鍵盤の明るさ (presence) に反映する。未適用は 0dB。
             let norm_gain_db = self.normalize_ui_state_for_player(fs_idx).applied_gain_db();
-            // 上の Bass グラフと同じ推定 (ピッチクラス + 信頼度) を playhead から取り、鍵盤上の ▼ に渡す。
-            let bass_marker = self.music_analysis.as_ref().and_then(|a| {
-                let idx = (pos.max(0.0) / a.config.bin_secs.max(1.0e-3)) as usize;
-                a.bins
-                    .get(idx)
-                    .map(|b| (b.bass_pitch_class, b.bass_pitch_confidence))
-            });
+            // ▼はspectrum自身が鍵盤と同じ基音確率から選ぶ。
             self.music_spectrum.update(ctx, pcm.as_ref(), pos, playing);
-            self.music_spectrum
-                .draw(ui, spectrum_rect, norm_gain_db, bass_marker);
+            self.music_spectrum.draw(ui, spectrum_rect, norm_gain_db);
         }
 
         // ── 左右パネル (Inc 5 FB / §1.15) ── 表示モードに従ってオーバーレイ表示する。

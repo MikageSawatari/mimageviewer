@@ -235,11 +235,19 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
 - 再生制御は §2.2 の公開メソッドをそのまま呼ぶ。`step_frame` は音声では使わない（seek で代替）。
 
 ### 5.3 解析ワーカー + in-memory LRU（UI スレッド外）
+- タイムラインのベース表示は `TimelineBassTrack` を独立して計算する
+  ([鍵盤設計 §13](music-keyboard-harmnet-plan.md))。デコード成功・取消なしを確認し、必要な
+  `TimelineComplete` を送った後、最大 `min(4, available_parallelism)` 本の BELOW_NORMAL
+  スレッドで20秒ごとの区間を助走付きで計算する。スコープの持ち主だけが結果を結合し、
+  `MusicAnalysisMsg::Bass(Arc<TimelineBassTrack>)` を250ms以上の間隔と完了時に公開する。
+  LRUヒットでも毎回計算し、ベース結果はLRUへ保存しない。UIは既存のsource一致判定内で
+  1 drainの最新結果だけを採用し、タイムラインと共通の版数を1回進める。
+  曲・適用済みトラックの変更とcloseで破棄し、同じ音源のpark／復帰では保持する。
 - `docs/async-architecture.md` のワーカーテンプレ（`XxxPending { cancel, rx }` + `start_xxx` /
   `poll_xxx` + cancel 3 箇所）で **解析ワーカー**を新設。入力 = path + cancel + `want_analysis` +
   `hit_meta`、出力 = `Probe` / `Timeline`（progressive 部分解析、display 専用）/
   `TimelineComplete { analysis, meta }`（全尺確定・LRU に載せる。`meta` = ワーカー検証済み
-  (mtime,size)）/ `Pcm`（spectrum 用）。
+  (mtime,size)）/ `Pcm`（spectrum 用）/ `Bass`（独立計算の部分／全尺snapshot）。
 - ワーカー内: **FFmpeg で PCM decode → インターリーブ stereo f32 → `analyze_stereo_timeline`**。
   decode = `src/audio_decode.rs`（`decode_audio_file_to_stereo_f32_streaming`、48kHz stereo）。
 - **永続化はしない（2026-07-03 方針転換、D8）**。旧 `src/audio_analysis_db.rs`（SQLite）は削除。
@@ -500,6 +508,11 @@ cargo fmt / fmt --check、通常 / portable core check、glyph lint（危険glyp
     左パネルは同じブックマークデータを一覧描画するだけ（動画はシークバー/HUD 上に出す差だけ）。
 
 ### 5.6 MIDI 半音 spectrum（下段アナライザ）
+- 鍵盤上の▼も鍵盤と同じ基音確率から、A0〜G3の範囲で確率0.5以上の最低音を選ぶ。
+  タイムラインと選択関数を共用し、絶対MIDI鍵へ直接描く。スペクトルによるオクターブの
+  再選択は行わず、残光は維持する。タイムラインはリズム区間ごとの音量・低域エネルギー付き
+  投票で色を決め、ツールチップにも描画済みの同じ票を使う。未計算部分は既定色のままで、
+  計算済み側の票を未計算側へ広げない。鍵盤と全曲解析の助走履歴が異なるため完全一致は保証しない。
 - 常駐 spectrum worker が `SpectrumAnalyzer` と music-core の `pitch::HarmNetTracker` を所有する。
   棒グラフと倍音比率は従来どおり再生位置周辺 ±1 秒の PCM 窓から FFT で求め、鍵盤の中央は
   **HarmNet L の基音確率 × 既存の音量ゲート（Norm ゲイン反映）**で光る。上下端は中央の明るさに
@@ -1194,7 +1207,8 @@ placement に作り直す経路。headless→native の「presenter 無し→有
   `WaveformBin` に `peak_l/rms_l/peak_r/rms_r` を additive 追加（music-core §2.1、`#[serde(default)]`）。
   mono 素材は L==R で従来どおり対称。L/R が全ゼロの既定/旧 bin は mono にフォールバック描画。
   in-memory 化 (§6/D8) 済みなのでディスク増はゼロ。
-- [x] loudness+bass root レーン（高さ=loudness、色=`bass_pitch_class` 五度圏）（Inc 3b）
+- [x] loudness+bass root レーン（高さ=loudness、色=`TimelineBassTrack` の計算済みbinのリズム投票。
+  未計算は既定色、tooltipは描画済みの同じ票）（鍵盤設計§13、旧binのbass値は本体表示に使わない）
 - [x] key レーン（`key_pitch_class` / `key_confidence`、低 confidence は淡色）（Inc 3b）
 - [x] 歌声目安レーンはキャンセル済み。`center_ratio` は汎用の stereo center metric として残す。
 - [x] Row 秒数切替（解析キャッシュ再生成せず raster のみ作り直し）（Inc 3b、上バー巡回）
