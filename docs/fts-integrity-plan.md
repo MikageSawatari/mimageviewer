@@ -363,8 +363,11 @@ FTS対策で名前索引も全て閉じたとは記録しない。
 名前索引の全failure対応を混ぜない。
 
 2026-10-12: §1.369の通知所有、停止後の通知保持、全入口の共通出口と成功件数の具体化は
-[name-index-write-failure-plan.md](name-index-write-failure-plan.md)を参照。事前独立設計レビュー待ちで、
-名前索引の製品コードはまだ変更していない。新規retry/回復workerは設計に含めない。
+[name-index-write-failure-plan.md](name-index-write-failure-plan.md)を参照。
+上記の表は§1.367実装時の棚卸し記録である。§1.369では独立レビューのP2 2件を反映し、
+利用者の許可で実装へ進んだ。同じDBの起動中に1回の通知／予約と、通常UIでだけdrainする
+契約へ揃えた。名前索引専用markerを使い、FTS markerは変更しない。新規retry/回復workerはない。
+実装レビュー・自動検証の結果は同計画を正本とする。
 
 類似索引はSQLite正本から`similar_search_array::load_or_rebuild` / `rebuild_from_sqlite`
 (`src/similar_search_array.rs:166,195`)で派生検索配列を再生成できる。

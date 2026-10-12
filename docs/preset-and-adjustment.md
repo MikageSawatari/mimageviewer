@@ -1401,7 +1401,8 @@ egui の popup は別レイヤーで生成されるため、パネルの `Visual
 
 ```rust
 enum AdjustUndoScope {
-    Page(usize),       // adjustment_page_params[idx]
+    Page(usize),       // キー取得不可のlegacy退避先
+    PageKey(PageAdjustmentTarget), // 通常のページ補正。適用ごとに現一覧で解決
     Favorite(Uuid),    // adjustment_favorite_params[uuid]
     Global,            // settings.global_preset
 }
@@ -1418,6 +1419,11 @@ struct LocalAdjustmentChange {
     after: Vec<LocalAdjustmentLayer>,
 }
 ```
+
+現行の通常補正Undoは既に `PageKey` を使用し、一覧外のページも元の安定キーへ復元する。
+一方、補正レイヤーUndoの `idx` と編集中セッションの対象には再配置時の所有問題が残る。
+§1.372の [編集owner設計案](page-adjustment-owner-plan.md) はその差を明記している。
+同案は設計レビュー待ちであり、local Undo／draftの新設計を実装済みとは扱わない。
 
 `Global` スコープは常に `Some` (`settings.global_preset` は Optional ではない)。
 `Page` / `Favorite` の `None` は「そのスコープにエントリが存在しない =

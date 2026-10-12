@@ -2130,6 +2130,17 @@ pub(crate) enum NativeUiCommandForTest {
 
 #[cfg(all(windows, test))]
 impl NativeUiProbeForTest {
+    pub(crate) fn drain_toasts(&self) -> Vec<(String, Option<std::time::Duration>)> {
+        self.command_rx
+            .drain()
+            .into_iter()
+            .filter_map(|command| match command {
+                NativeVideoOutputCommand::ShowToast { text, linger, .. } => Some((text, linger)),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub(crate) fn send_event(&self, event: NativeVideoOutputEvent) {
         self.event_tx.send(0, event);
     }

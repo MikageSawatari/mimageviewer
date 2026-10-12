@@ -938,3 +938,11 @@ fullの停止は`crates/launcher/build.rs`が要求する`target/release/mimagev
 通常／portable core checkやstartup36件の失敗ではなく、全体gateのbuild前提不足である。
 compile済みtargetを全体test成功へ読み替えない。入力を用意した後のfull再実行は未実施。
 release build・署名・起動を追加せず、§1.369の事前設計レビュー区切りで引き渡す。
+
+上記は`f182037c2`の初回引渡し時点の記録。利用者の再開指示後、稼働中アプリを止めずに
+CLAUDE.mdの直接Cargo手順でrelease入力3本を作成した。RAWサンプル27件の前提も
+正本SHA-256／サイズで検証後、§1.369の項目末の`test-full.ps1 -SuppressCrashDialogs`は
+PASS／exit 0（主実行13,412成功／0失敗／63既存ignore）。
+原ログと前提修正・再実行理由は [name-index-write-failure-plan.md §6](name-index-write-failure-plan.md) を参照。
+OS error 33の独立レビューACCEPTとstartup36件の証拠を再利用し、単独試験の再実行はしていない。
+利用者の空ログ2組の原因を確定する新しい証拠ではない。allocator変更・アプリ起動・commitは行っていない。

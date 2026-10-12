@@ -30489,12 +30489,19 @@ impl App {
     }
 
     /// worker で確定した再起動案内を既存の全画面トーストへ届ける。
-    fn poll_indexer_notifications(&mut self) {
-        let notifications = self
+    fn poll_indexer_notifications(&mut self, minimized: bool) {
+        let mut notifications = self
             .indexer_init
             .as_ref()
             .map(|manager| manager.take_notifications())
             .unwrap_or_default();
+        // Do not start the one-shot name notice's toast clock until normal UI
+        // can draw it. This projection never acquires the SQLite connection.
+        if !self.indexer_init.overlay_active() && self.window_visible && !minimized {
+            if let Some(db) = &self.search_index_db {
+                notifications.extend(db.take_failure_notifications());
+            }
+        }
         if !notifications.is_empty() {
             self.show_feedback_toast_with_duration(notifications.join("\n"), 5.0);
         }
@@ -84159,7 +84166,11 @@ impl App {
     /// 本文長による自動計算を使わず、一定時間を保証したい案内向け。
     pub(crate) fn show_feedback_toast_with_duration(&mut self, text: String, duration_secs: f32) {
         #[cfg(windows)]
-        self.show_native_video_overlay_toast(text.clone(), false);
+        self.show_native_video_overlay_toast_with_linger(
+            text.clone(),
+            false,
+            Some(std::time::Duration::from_secs_f32(duration_secs)),
+        );
         self.fs_feedback_toast = Some((text, std::time::Instant::now(), duration_secs));
         self.fs_feedback_toast_reveal_path = None;
         // 発火面不明の従来経路: 全面に描く (単面表示は show_feedback_toast_on を使う)。
@@ -91701,7 +91712,9 @@ impl App {
         // IndexerManager の重い初期化はバックグラウンドスレッドで実行する。
         // 進行中は中央に「起動中…」+ 現在ステップを表示し、× ボタン以外の
         // 入力イベントを破棄する。完了したら通常 update に進む。
-        self.poll_indexer_notifications();
+        self.poll_indexer_notifications(
+            ctx.input(|input| input.viewport().minimized.unwrap_or(false)),
+        );
         self.poll_housekeeping_arm();
         // VST3 起動時の bridge enable + 自動ロードは専用 worker で走らせる。
         // 画像閲覧だけの起動では通常 UI を先に出し、動画を開いた時点でまだロード中なら
@@ -96794,6 +96807,79 @@ mod index_full_check_tests {
         let shown_at = toast.1;
         app.poll_startup_diagnostics_notice(false, take_notice);
         assert_eq!(app.fs_feedback_toast.as_ref().unwrap().1, shown_at);
+    }
+
+    #[test]
+    fn name_index_failure_notice_waits_for_drawable_ui_and_survives_drains_once() {
+        let mut env = setup_app_for_test();
+        let app = &mut env.app;
+        let db = Arc::new(crate::search_index_db::SearchIndexDb::open_in_memory().unwrap());
+        app.search_index_db = Some(db.clone());
+        db.report_write_failure(
+            "fixture",
+            std::path::Path::new("C:/root"),
+            &rusqlite::Error::InvalidQuery,
+        );
+        let (_tx, rx) = mpsc::channel();
+        app.indexer_init = IndexerInit::Pending(StartupInitPending {
+            rx,
+            started_at: Instant::now(),
+            full_check_requested: false,
+            disposal_witness: None,
+        });
+        app.window_visible = true;
+        app.poll_indexer_notifications(false);
+        assert!(app.fs_feedback_toast.is_none(), "overlay keeps the notice");
+        // The name DB is independent of the FTS manager's availability.
+        app.indexer_init = IndexerInit::Unavailable;
+        app.window_visible = false;
+        app.poll_indexer_notifications(false);
+        assert!(app.fs_feedback_toast.is_none(), "tray keeps the notice");
+        app.window_visible = true;
+        app.poll_indexer_notifications(true);
+        assert!(
+            app.fs_feedback_toast.is_none(),
+            "minimized UI keeps the notice"
+        );
+        #[cfg(windows)]
+        let native_probe = {
+            let mut player = crate::video::VideoPlayer::local_ready_disconnected_for_test(
+                PathBuf::from("fixture.mp4"),
+            );
+            let probe = player.install_native_ui_probe_for_test();
+            app.fullscreen_idx = Some(0);
+            app.fs_cache.insert(
+                0,
+                FsCacheEntry::Video {
+                    player: Box::new(player),
+                    load_seq: 0,
+                },
+            );
+            probe
+        };
+        let before = Instant::now();
+        app.poll_indexer_notifications(false);
+        let toast = app.fs_feedback_toast.as_ref().unwrap();
+        assert_eq!(toast.0, crate::search_index_db::NAME_UPDATE_FAILURE_NOTICE);
+        assert!(toast.1 >= before);
+        assert_eq!(toast.2, 5.0);
+        #[cfg(windows)]
+        assert_eq!(
+            native_probe.drain_toasts(),
+            vec![(
+                crate::search_index_db::NAME_UPDATE_FAILURE_NOTICE.to_owned(),
+                Some(std::time::Duration::from_secs(5)),
+            )]
+        );
+        let shown_at = toast.1;
+        db.report_write_failure(
+            "later root",
+            std::path::Path::new("C:/other"),
+            &rusqlite::Error::InvalidQuery,
+        );
+        app.poll_indexer_notifications(false);
+        assert_eq!(app.fs_feedback_toast.as_ref().unwrap().1, shown_at);
+        assert!(db.take_failure_notifications().is_empty());
     }
 
     #[test]
