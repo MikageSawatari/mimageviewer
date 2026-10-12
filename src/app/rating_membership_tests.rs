@@ -1,4 +1,6 @@
 //! Context-owned rating membership, reader landing and Undo regressions (§1.371).
+#![cfg(test)]
+
 use super::tests::phase_c_support::{AppTestEnv, setup_app};
 use super::*;
 use crate::keymap::{RatingEdit, RatingStepDirection};

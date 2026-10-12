@@ -4645,3 +4645,43 @@ snapshot PNGは変更せず、既存の実metadata観測とsnapshot harnessを�
 変更範囲はsrc/ui_fullscreen.rs、本§11、fullscreen-specified-scale-plan.md §23、vendor/egui/PATCHES.md。
 vendorのAPI実装自体は変更せず、台帳へ破棄対象・呼出境界・更新時の保持差分を補う。
 snapshot PNG、runtime、metadata製品処理は変更しない。
+
+### 2026-10-12 v4.6.0 CI viewer-context audit の現行契約への追従
+
+master で停止を再現し、A6 131 件 / A4 9 件の計 140 指摘を確認した。
+前例 a03777b0f と同じ方針で、製品動作・registry protocol は変更しない。
+
+- A4: §1.364 D1〜D3 の既存実装をコードと caller で照合し、6 個の現行 API 指紋を登録する。
+  `ViewerContextBundle.spread_shift` は mount / swap で移送され、fork は accepted state だけを複製する。
+  `ContextAsyncOwner::RetainedSpreadShift` と先頭に同 owner を加えた 20 件の `ALL` は、
+  context 所有の retained readoption の poll / park 時取消を既存 inventory に接続する。
+  `deliver_spread_shift_reply_at_rest` は reply の context ID で所有 bundle を選び、
+  sequence / operation / scope を照合する既存 owner へ配送する。
+  `make_at_rest_spread_shifts_session_only` は記憶設定変更時に retained owner の session 調整を保ち、
+  `migrate_at_rest_spread_shifts` は同本の page ref 移行だけを反映する。
+  root 改名時に accepted context を旧 source へ留める D2c の契約を保持する。
+  旧指紋 3 個の欠落と現行指紋 6 個の未登録が 9 指摘の内訳で、各登録行に由来コメントを付ける。
+- A6: 親の test cfg のみで囲われた `spread_shift_owner_tests` (76 件) /
+  `rating_membership_tests` (38 件) / `grid_cursor_tests` (1 件) /
+  `spread_shift::contract_fixtures` (3 件) に同等の inner `cfg(test)` を明記する。
+  既存の Windows / portable 等の追加条件は変更しない。
+  `remote_ipc::ui::tests` 内で `include!` される `spread_shift_ui_tests.rs` (13 件) は、
+  include 先に inner 属性を置けないため、ファイル全体を既に囲う `spread_shift_d3` に
+  outer `#[cfg(test)]` を 1 行だけ付ける。module 移動・階層変更・監査例外の追加は不要で、
+  既存の per-file visitor が同じ test 所有を確認できる最小の変更である。
+
+規則・閾値・ファイル除外・A2b の限定登録は変更せず、A4 の完全一致、A6 の
+production 呼出し拒否を維持する。製品側の変更は既存 test-only ファイルの cfg 明記だけで、
+cfg(test) でない製品コード、detached 述語 / viewport / mount / drop の実装を変更しない。
+署名済み配布物に関わる runtime 変更・製品起動・コミットは行わない。
+
+検証: `cargo test --locked -p viewer_context_audit` 36 件成功、
+`cargo run --locked -p viewer_context_audit` exit 0。
+`--no-allowlist` は既存の限定登録 5 件の A2b だけを再検出 (期待する exit 1) し、
+ファイル / 関数も登録と完全一致。A4 / A6 の残存指摘、known finding はいずれも 0 件。
+関連 lib の `spread_shift` 128 件 / `rating_membership` 80 件 / `grid_cursor` 31 件成功
+(すべて `--locked`、失敗 / ignored は各 0 件)。`cargo fmt --check`、通常 / portable の
+`mimageviewer-core cargo check --locked`、`git diff --check` はすべて exit 0。
+ログは `target/ci-v460-*.log`。7 変更ファイルの CRLF を維持し、製品側 5 ファイルは
+test cfg 追加だけ、監査側は `PUBLIC_API_ALLOWLIST` 内だけの差分であることも機械照合した。
+別セッションの `docs/next-release-backlog.md` は変更せず、アプリ起動・コミットは行っていない。
