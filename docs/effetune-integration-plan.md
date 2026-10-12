@@ -1479,10 +1479,12 @@ worker の hidden attach 前後と host GUI の表示直前でも成功時 revis
 
 ## 17. 音響調整窓のタスクバー表示（2026-10-12 設計メモ）
 
-**状態: 設計・調査のみ。製品コード未変更。** 利用者指定の案A（窓の表示スタイルだけを変更）を
+**状態: R2設計修正・再レビュー待ち。製品コード未変更。** 利用者指定の案A（窓の表示スタイルだけを変更）を
 採用し、設定ON/OFF・既定ONとする。mIVのAppUserModelID、shortcut、pin、Jump Listは変更しない。
 EV9のCtrl+R修正・検証完了後に着手。調査先はmain worktree、HEAD `e984bab26`、開始時の差分なし。
 別worktreeに残るEV9差分を移動・変更していない。
+上記はR1調査の記録。R2は `C:/home/mimageviewer-nexteffetune` のHEAD `74e735f77`、
+開始時cleanの作業ツリーで、独立レビューのP2 2件を修正する。backlogのP3訂正はcoordinatorがmasterで扱う。
 
 ### 17.1 現コードの前提と、単なるflag追加で終わらない点
 
@@ -1494,6 +1496,8 @@ hostの`show_gui`検査がこれを固定している。main HWNDはDPI・最小
 
 hostの`create_bridge_view_container`はcustom chromeの `WS_POPUP | WS_BORDER` を作り、
 `WS_EX_TOOLWINDOW | WS_EX_WINDOWEDGE`でタスクバーから除外する。window classにicon resourceは未設定。
+現行frameにはWS_SYSMENUもWS_CAPTIONもない。APPWINDOWとicon resourceの追加だけで
+taskbar icon・system menu・最小化が成立するとは扱わず、EffeTune専用の通常styleも§17.2.1で定める。
 `gui_button_action` は hidden→Show、visible/front→Hide、visible/back→Activate。
 native closeとSC_CLOSEは既存のuser-hideへ入り、editorを破棄せずDSPを続ける。
 
@@ -1518,7 +1522,8 @@ native closeとSC_CLOSEは既存のuser-hideへ入り、editorを破棄せずDSP
 
 初回作成は新しいGuiWindowOptionsの`show_in_taskbar`（一般VSTの既定false）で決める。
 ONはAPPWINDOWを加えTOOLWINDOWを外す。OFFはTOOLWINDOWを加えAPPWINDOWを外す。
-WINDOWEDGE、TOPMOST等の他bitとstyle/ownerは保持する。
+WINDOWEDGE、TOPMOST等の他exstyle bitとownerは保持する。EffeTuneの通常styleは§17.2.1へ変更し、
+ON/OFFでその通常styleを切り替えない。
 一般VSTの表示は変えず、EffeTuneの設定だけをこのoptionへ渡す。
 
 設定OK後は既存`effetune-host-control` queueへ目標値を送る。workerが一つの目標値を所有し、
@@ -1527,15 +1532,53 @@ current bridgeのGUI作成snapshotと既存frameへの設定commandは同じ目�
 queue順序で連続ON/OFFとLoading→Register→attachのlate arrivalを扱い、別のUI pending stateを足さない。
 IPCはworker、SetWindowLongPtr/ShowWindow/frame操作はhostの既存GUI thread。core UIでIPC待機しない。
 
+### 17.2.1 EffeTuneの通常styleとcustom chrome（R2・P2-1）
+
+[taskbar仕様](https://learn.microsoft.com/en-us/windows/win32/shell/taskbar)は、system menuなしの
+taskbar buttonにiconが付かないことを記載する。
+[Window Styles](https://learn.microsoft.com/en-us/windows/win32/winmsg/window-styles)の
+WS_SYSMENUにはWS_CAPTION、WS_MINIMIZEBOXにはWS_SYSMENUが必要である。
+これを満たす **native caption/system menuを使うEffeTune専用frame** を採用する。
+既存のcustom captionを残したままcaption bitだけ付ける、未検証のnon-client描画抑止を加える案は採らない。
+
+通常styleは `WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX |
+WS_CLIPCHILDREN | WS_CLIPSIBLINGS` とし、pluginがresizableのときだけWS_THICKFRAMEを加える。
+WS_MAXIMIZEBOXは加えない。taskbar ON/OFFともこの通常styleを使い、一般VSTのcustom frameは現状維持。
+
+- EffeTuneのタイトル・icon・close/minimize・caption dragはnative captionへ集約する。
+  既存client内custom chromeはlatency表示のstatus bandとして残し、重複するtitle/closeやcaption hit-testを外す。
+  latency表示とplugin editorの機能は残す。EffeTuneではbypass buttonは元から非表示であり、一般VSTのbuttonは変えない。
+- EffeTuneのnon-client hit-test/paintとcaption activationはnative処理へ委譲する。
+  現行のWM_NCHITTESTによるclient座標のedge判定やWM_MOUSEACTIVATEのHTCAPTION抑止を
+  native captionへ適用しない。plugin child/clientの既存入力処理・owner-chainによる前面判定は維持する。
+- 初回サイズとplugin要求resizeは、status bandとnative non-clientを含めて
+  `AdjustWindowRectExForDpi`で計算し、`layout_editor_child`/`resize_frame_for_plugin_client`を同じ計算へ揃える。
+  DPI変更とexstyle切替でもpluginのclient寸法を保ち、status bandとの二重計上や固定サイズviewのclippingを起こさない。
+  保存済み外枠サイズも新しいframe計算とpluginのsize constraintへ照合する。
+  固定サイズviewは必要なclient寸法を優先し、旧custom frameの外枠を無条件に再利用してclipしない。
+- system menuはRestore/Move/Minimize/Closeを扱い、Sizeはresizableの場合だけ有効にする。
+  Maximizeは有効にせず、EffeTune宛SC_MAXIMIZEも採用しない。
+  taskbarクリック・Shell menu・Alt+Space・native captionの操作が、同じWndProcの契約へ入ることを検証する。
+  最小化はOSのiconic状態、Restoreは既存表示permit付き、Closeは既存user-hide。
+
+見た目はnative caption＋latency status bandへ変更する設計であり、現行のcustom titlebarと同じ外観とは主張しない。
+実装前にこの変更も再レビュー対象に含め、native見た目とShell挙動は利用者の実機確認で確定する。
+
 ### 17.3 即時反映と表示状態
 
 [Microsoft taskbar仕様](https://learn.microsoft.com/en-us/windows/win32/shell/taskbar)に合わせ、
 表示中は **同じHWNDを短くhide→exstyle変更→FRAMECHANGED→再表示** する。
 styleが同じなら何もしない。非表示ならstyleだけ更新し、表示要求を作らない。
-requested表示、Remote抑止、main最小化の運用、窓の位置/サイズ、plugin view/DSP stateは既存ownerに残す。
+requested表示、Remote抑止、main最小化の運用、plugin view/DSP stateは既存ownerに残す。
+通常位置はscreen上のtop-leftを保ち、pluginのclient寸法も保つ。
+TOOLWINDOWによるnative caption寸法の差は外枠寸法へ反映するため、切替前後で外枠サイズが常に同じとは約束しない。
+新しい通常外枠矩形を§17.3.1の共通経路で配送・保存する。
 変更前のiconic状態は保ち、非activeの窓を前面へ持ってこない。
 再表示直前に既存`gui_surface_should_show()`を再検査し、close/Remote/main抑止でhiddenとなった窓を復活させない。
 前面だった窓の再表示時だけ、既存の許可条件を満たしていれば前面状態を保つ。
+style変更前に通常screen矩形を取得し、変更後のframe metrics/座標種別で通常placementを設定する。
+hidden中のplacement更新自体からshow/activateを発生させず、再表示は既存permitを満たす場合だけ行う。
+iconic中の更新は現在の最小化矩形へSetWindowPosする処理にしない。
 
 簡素化候補の「editorを閉じて既存attach経路で作り直す」は、plugin UIの一時状態を失い得るため不採用。
 次回openまで延期する案も即時反映要求を満たさない。HWND再作成・新しいvisibility owner・復帰queueは不要。
@@ -1548,11 +1591,60 @@ GUI thread内の現在state検査と同HWNDのstyle更新に限定する。
 - ShellのSC_RESTORE入口でも既存の表示permitを検査し、Remote/close/main抑止を迂回しない。
   一般VSTの動作を変えないようEffeTuneのmain-reference付きframeだけを対象にする。
 - taskbarの「閉じる」は既存SC_CLOSE→user-hide。窓が前面のときの音響調整ボタンも従来どおりHide。
+  最小化後のCloseも、通常screen矩形を含むuser-hide通知で保存する（§17.3.1）。
 - OFFにした時点でiconicだった窓は勝手に開かない。mIVの音響調整ボタンで後から復元できる。
 
 [ShowWindow](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-showwindow)
 のSW_SHOWは現在stateでの表示、SW_RESTOREは最小化stateからの復元である。
 この違いは実clientを操作して観測した結果ではなく、現コードと公開API契約からの確認。
+
+### 17.3.1 最小化後にも保存する通常矩形（R2・P2-2）
+
+現行はhostのuser-hide通知→`App::poll_effetune`→`save_effetune_gui_rect`→
+`DspBridge::snapshot_all_window_positions`→`gui::get_window_rect`のGetWindowRect再読である。
+iconicの画面外矩形はここで保存を省かれるため、移動→最小化→Closeで最新配置を失う。
+この「通知後に現在矩形を読む」経路を、**hostが取得した通常screen矩形の配送**へ変更する。
+
+保存・将来のCreateWindowExへ渡す正規形は `NormalScreenRect { x, y, outer_width, outer_height }`、
+virtual-screenの物理px。workspace矩形やiconicの現在矩形をsettingsへ保存しない。
+normal取得はhostのGUI threadで、同じframeのstyle変更と直列化する。
+coreがGWL_EXSTYLEとGetWindowPlacementを別々に読んで、途中のTOOLWINDOW切替と競合する方式は採らない。
+
+取得・変換契約:
+1. `WINDOWPLACEMENT.length = sizeof(WINDOWPLACEMENT)`で取得し、rcNormalPositionを使う。
+   `GetWindowRect`のiconic矩形、ptMinPosition、showCmdを通常矩形の代わりにしない。
+2. [WINDOWPLACEMENT仕様](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-windowplacement)どおり、
+   top-levelかつTOOLWINDOWなしならworkspace座標、TOOLWINDOWありならscreen座標として扱う。
+3. [MonitorFromWindow](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-monitorfromwindow)は
+   iconic時も最小化前の矩形でmonitorを選ぶ。`MONITOR_DEFAULTTONEAREST`と
+   [MONITORINFO](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-monitorinfo)の
+   rcWork/rcMonitorを使い、workspace→screenは
+   `dx = rcWork.left - rcMonitor.left / dy = rcWork.top - rcMonitor.top`を両cornerへ加える。
+   TOOLWINDOWありでは加算しない。これは仕様の座標系を揃える本設計の変換規則であり、pure回帰で固定する。
+   右/下taskbarのように原点offsetが0でも、負のmonitor座標やwork areaの大きさをprimary固定にしない。
+4. hostの既存Per-Monitor V2 contextで取得し、core側で別DPIへ再換算しない。
+   幅/高さと算術範囲を検査し、screenへ変換した通常矩形に既存のwork-area可視性検査を適用する。
+   正常な通常矩形を、iconicの-32000系矩形を見たことで棄却しない。
+5. exstyle切替前にold styleでscreenへ正規化する。新しいnon-client寸法で外枠を計算し、
+   placementへ戻す必要があれば新styleで逆変換する。screen→workspaceは同offsetを引く。
+   raw rcNormalPositionをstyle変更後へ持ち越さず、workspace値をCreateWindowEx/SetWindowPosへ渡さない。
+   hidden/iconic/非activeを保つplacement更新はfake HWNDでも検証し、抑止中に一度showしてからhideする実装は不可。
+
+配送・保存の所有境界:
+- 初回attach、完了した移動/resize、最小化直前、style変更後に現在frameのnormal snapshotを公開する。
+  interactive dragでは既存の終了通知で最新値を公開し、pluginのprogrammatic resizeも同じ取得経路を使う。
+- user-hide（native close/SC_CLOSE）は**hide前**にこのnormal snapshotを確定し、同じ通知に付ける。
+  coreでは現在bridge/slotとcurrent container HWNDの同一性を検査し、矩形を適用してからuser-hidden処理を行う。
+  単なるpath通知後にWin32で再読する方式や、通知とは別の非同期取得結果にClose保存を依存させない。
+- coreの現在slotにはimmutableな通常screen矩形のsnapshotだけを置く。geometryのwriterはhostであり、
+  coreへ別のminimized bool、復元要求、poll/retry ownerを足さない。GuiAttached/Detach等と同じ配送順序で扱い、
+  退役bridge/slot/旧frameのsnapshotを新frameへ適用しない。
+- `save_effetune_gui_rect`の全caller（user-hide、音響調整ボタンHide、終了時のruntime_ops）をこのsnapshot経路へ揃える。
+  core UIは既存GUI通知をdrainしてから完成snapshotを読むだけで、IPCやgeometry取得の完了を待たない。
+  core側のHide完了も同じ通常矩形を配送してから扱い、旧snapshotによる先行保存が最終Close保存を上書きしない。
+  一般VSTのGetWindowRect読取や描画/hit-test用の現在矩形queryは、このEffeTuneの保存仕様へ巻き込まない。
+- 取得/変換失敗やframe退役はlog＋既存通知で扱い、以前保存した有効値を保持する。
+  iconic矩形・workspace値へのfallback、retry、DB初期化/削除は行わない。
 
 ### 17.4 グループ、タイトル、アイコン
 
@@ -1565,6 +1657,8 @@ Shellのheuristicによる。従って通常はhost実行体側の別項目/グ�
 EffeTune専用frameのwindow titleを`EffeTune`に揃え、preview/window切替時の表示名に使う。
 pluginの識別名・保存state・一般VST editor titleは変えない。
 mIVの`assets/icon.ico`をhost PEのicon resourceへ組み込み、frameの大小iconへ設定する。
+§17.2.1のWS_SYSMENU/WS_CAPTIONと組み合わせて初めてtaskbar iconの前提を満たす。
+resourceがあるだけでShellにiconが出たと判定せず、表示確認は§17.7の実機条件に含める。
 core HWNDからWM_GETICONを同期取得する方法は採らず、core UIへの再入待機を作らない。
 hostの内部group/context menuラベルはShellが決めるもので、window titleとの同一性は保証しない。
 AppUserModelID、FileDescriptionのEffeTuneへの全体改名、shortcut編集で表示名を強制しない。
@@ -1601,6 +1695,8 @@ agentはnormal-profile core/launcherを起動しない。
 
 producer/consumerは Settings draft→OK/起動→controller host queue→current bridge/将来attach snapshot→
 host protocol→GUI thread→CreateWindowEx/既存frame更新。Shell restore/closeは同じWndProc/GuiVisibilityをconsumerとする。
+通常geometryはGUI threadのnormal取得→current bridge/slot/frameのimmutable配送→coreのslot snapshot→
+save_effetune_gui_rect→既存settings保存であり、user-hideの終端通知もこの通常矩形を持つ。
 Loading、Register、Show、Remote/main suppression、user-hide、disable、GUI destroy/dropをこの所有境界で検査する。
 
 実装後に必要な自動確認:
@@ -1608,18 +1704,42 @@ Loading、Register、Show、Remote/main suppression、user-hide、disable、GUI 
 2. fake bridge配送で設定→Register→Show、Loading中変更、連続ON/OFF、一般VST既定falseを確認。
 3. C++のpure style/visibilityテストとhidden fake HWNDで、他exstyle bit/ownerの保持、非表示を開かない、
    suppression中のrestore拒否、iconic状態と手動restore、closeがuser-hideとなることを確認。
+   EffeTuneのWS_CAPTION/SYSMENU/MINIMIZEBOXと、一般VSTのstyle不変、GetSystemMenu、大小iconの設定、
+   native caption hit-test・status band/plugin clientのlayoutと固定サイズ/各DPIを確認する。
+   SC_MINIMIZE/SC_RESTORE/SC_CLOSE、Alt+Space相当のsystem menu経路、Maximize不可、Sizeの可否を確認する。
    本物EffeTuneやExplorerのtaskbar、ユーザー設定には自動テストを依存させない。
+   nativeな最小化/復元のwitnessにshowが必要なら、切替を行わない隔離test desktopを使い、利用者のdesktopへ窓を表示しない。
+   geometryのpureテストは上/左taskbarの原点offset、右/下taskbar、負の副monitor座標、混在DPI、
+   TOOLWINDOW両方と変換round-trip、style切替前後の通常位置/client寸法を含む。
+   fake HWND/bridgeとApp保存の回帰は「移動/resize→最小化→SC_CLOSE→配送→保存→再open」で最新の
+   通常screen位置/サイズが復元されること、iconic状態でON→OFF/ OFF→ON→Closeしても座標がずれないことを確認する。
+   通知を遅らせて直後にstyleを再変更しても、Close payloadの座標種別と値が変わらないこと、旧frame配送の棄却も確認する。
+   user-hide・ボタンHide・runtime終了保存が同じnormal snapshotを使い、iconicの画面外矩形を保存しないことを確認する。
 4. host identity script回帰・CMake/CTest、EffeTune/VST3/Preferences/settings_transfer焦点テスト、
    fmt・通常/portable check・UI glyph・preferencesの明暗/narrow snapshot・manual更新。
 5. 通常のverification artifactを準備し、利用者が隔離data-dirで taskbar ON/OFF、実icon/title/group、
    taskbar最小化/復元、音響調整ボタン、Close後DSP継続、main最小化設定両方、Remote抑止を確認。
+   Windows Shell上でmIV iconの表示、taskbarクリック/右click menu/preview Close/Alt+Space/native caption操作、
+   native captionとlatency bandの重複なし、pluginのclient clippingなしを確認する。
+   上/左taskbarおよび副monitorで「移動→最小化→Close→再open」と最小化中のON/OFF切替を確認する。
+   fake HWND成功だけでShellのicon・操作が成立したとは扱わない。
 
 rareなstyle/resource/DB/host配送失敗は既定のlog＋通知に留める。retry loop、partial復旧owner、
 保存データ削除/再作成、failure内のrecoveryは追加しない。
 
 実装前reviewの焦点は **Shell復元という新しい通常入力と既存GuiVisibility permitの境界**、
 同HWND style変更後のhidden/iconic/foreground保持、queueでのLoading/登録順序。
+R2では通常style/native caption/system menuと、normal geometryの取得・座標変換・Close payloadも焦点に加える。
 AGENTS.mdの `Review important ownership/asynchronous/multi-window designs before substantial implementation`
 をこの新入力経路へ適用し、独立レビューを経てから製品コードを変更する。
 利用者が決める新しい設定選択は増やさず、案A/既定ONは確定事項。上記操作契約をreview対象として提示する。
 現時点ではhost build・製品test・UI起動・署名・commitは行っていない。
+
+### 17.8 R2レビュー指摘の対応記録（2026-10-12）
+
+- P2-1: exstyle/resourceだけを前提にする記述を撤回。§17.2.1でEffeTune専用の通常style、native caption、
+  latency status band、system menuの操作を定義。§17.4/§17.7でfake確認と実Shell確認を分けた。
+- P2-2: 最小化後のGetWindowRect再読を撤回。§17.3.1でhost GUI threadのnormal screen矩形、
+  TOOLWINDOWに応じた座標変換とstyle変更順序、immutableなClose payload、全保存callerと回帰を定義。
+- P3: ownerなしの訂正はcoordinatorがmasterのbacklogへ反映する。このworktreeのbacklogは編集していない。
+- 本turnはnexteffetuneのこの設計メモのみを変更。実装・build・起動・commitは行わず、再レビューへ引き渡す。
