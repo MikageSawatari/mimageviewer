@@ -109,7 +109,7 @@
 | [detached-viewer-keepalive-design.md](detached-viewer-keepalive-design.md) | keep-alive の不変条件、target 設計、K0〜K3 の現況。K0 完了、K1 未完、K2/K3 部分完了で、single render entry は未実装 |
 | [detached-viewer-smoke-checklist.md](detached-viewer-smoke-checklist.md) | K0 詳細 smoke の補助チェックリスト。現行 registry ログ (`registered host` / `hwnd_adopted_*`) に対応。リリース全体は ship checklist を正とする |
 | [detached-rework-plan.md](detached-rework-plan.md) | **detached viewport リワーク正本**。§9 が唯一の現況表。R2b は部分完了、R3 は実質完了、R4 は未完 |
-| [detached-book-page-overview-plan.md](detached-book-page-overview-plan.md) | **§1.340 設計提出・独立レビュー／利用者確認待ち、未実装**。メイン一覧を変えない画像窓内ページ一覧、KeyAction、active／passive の表示・入力所有、サムネイルの bounded demand と取消、ZIP/PDF/EPUB・本の構成・Remote の接続条件 |
+| [detached-book-page-overview-plan.md](detached-book-page-overview-plan.md) | **§1.340 R3 ACCEPT、R4拡張再レビュー・既定キー選択待ち、未実装**。メイン一覧を維持する通常fullscreen／メイン内／detachedのページ一覧、KeyAction候補、active／passiveの所有、bounded demandと取消、ZIP/PDF/EPUB・本の構成・Remoteの接続条件 |
 | [detached-rework-ship-checklist.md](detached-rework-ship-checklist.md) | 現行リワーク出荷前 smoke matrix (F/W/V/P/R 系)。独立静止画窓の Ctrl 物理フォルダ移動と configurable 右クリックを含む |
 | [details-view-and-filter-plan.md](details-view-and-filter-plan.md) | **Ph1〜Ph4 + Ph5 画像/動画/作成日時遅延列まで実装済み**。ファイル選択画面の詳細表示モード (サムネ無しで名前/サイズ/日付＋★/タグ/編集フラグを行表示) ＋ Excel オートフィルタ風スマートフィルタの設計。現状は列セクションの詳細切替、右クリック列表示メニュー、`details_order` による列ヘッダ 3 トグルソート、種類/拡張子/場所/★/タグ/日付/サイズ/状態の共通 `FacetFilter`、遅延列 worker / 進捗表示、作成日時列、画像解像度列、長さ/動画解像度/コーデック列まで実装済み (長さ・コーデックは音声も対応)。場所は元ファイル/元コンテナの親フォルダで、製本フォルダは `本棚 > 本名` 表記。場所条件は移動で解除される非永続の一時条件。EXIF/PDF/アーカイブ系の追加遅延列は後続 |
 | [file-organize-destinations-plan.md](file-organize-destinations-plan.md) | **実装済み (レビュー前)**。固定整理先の登録、Shell によるコピー・移動と実機確認 |
