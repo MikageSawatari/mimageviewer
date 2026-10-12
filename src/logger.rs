@@ -10,6 +10,27 @@ use std::time::Instant;
 static START: OnceLock<Instant> = OnceLock::new();
 static CONFIGURED: OnceLock<()> = OnceLock::new();
 
+/// Tantivy's atomic-operation diagnostics use the log facade. Keep normal segment activity
+/// out of the product log and forward only warnings/errors to the existing asynchronous sink.
+struct TantivyDiagnostics;
+static TANTIVY_DIAGNOSTICS: TantivyDiagnostics = TantivyDiagnostics;
+impl log::Log for TantivyDiagnostics {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= log::Level::Warn && metadata.target().starts_with("tantivy::")
+    }
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            log(format!(
+                "[{}] {}: {}",
+                record.level(),
+                record.target(),
+                record.args()
+            ));
+        }
+    }
+    fn flush(&self) {}
+}
+
 #[cfg(test)]
 pub(crate) fn install_test_clock(start: Instant) {
     assert!(START.set(start).is_ok());
@@ -141,6 +162,9 @@ fn init_inner(file_name: &str, truncate: bool) {
         path: crate::data_dir::logs_dir().join(file_name),
         truncate,
     });
+    if log::set_logger(&TANTIVY_DIAGNOSTICS).is_ok() {
+        log::set_max_level(log::LevelFilter::Warn);
+    }
     log(LogRetention::from_environment().description());
 }
 

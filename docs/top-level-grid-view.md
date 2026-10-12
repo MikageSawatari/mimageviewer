@@ -1,5 +1,24 @@
 # 最上位一覧ビューの ownership とスマートフォルダ scope
 
+## Everything 検索のsourceと物理child（§1.374、未リリース）
+
+Everythingは新しい最上位surfaceを増やさず `TopLevelGridView::Search` を共有する。
+検索開始前の唯一の `return_origin` は通常Searchと同じownerが保持し、query送信やsource変更で
+復元先を別の一覧へすり替えない。draft `SearchSource` とaccepted `SearchAccepted` は別で、
+未実行queryや失敗した新producerが表示済みdatasetの出所を上書きしない。
+取得/prepare中はmainだけのmodalとし、完成payloadだけを既存adoption closureで一回公開する。
+
+Everythingのaccepted位置は `Root` / `PhysicalChild { logical_source, return_anchor, route }`。
+Rootからの物理ZIP/PDF/EPUB/変換書庫openは通常経路へ委譲し、実際に物理表示が採用された境界でだけ
+childへ進む。内部ZIP階層は既存zip navを使い、外側の帰路は保持datasetを共通prepareで再投影する。
+その復帰でIPC、元queryの再実行、新しいorigin captureをしない。検索終了は既存close/restoreを通す。
+
+sort/★/tag/編集準備の入力はimmutable datasetと送信時stampであり、表示中itemsを第二の正本にしない。
+mainの準備/採用は同contextのthumbnail/PDF ownerだけを更新する。detachedにはSearchのdatasetや
+return_originを複製せず、既存fork/park/promoteの物理viewer ownerを使う。
+RemoteへSearchSource/query/result surfaceを追加しない。自動gate・独立レビュー・実機確認は未完了。
+[正本・検証台帳](everything-search-plan.md#14-実装記録2026-10-12)。
+
 ## 1. 正本
 
 検索、★固定、サブ展開、スマートフォルダ、閲覧履歴、ブックマーク一覧、レーティング一覧は同じ `App.items`

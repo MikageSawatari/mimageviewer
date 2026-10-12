@@ -2628,6 +2628,9 @@ pub struct RingPickerState {
     pub anchor: RingPickerAnchor,
     pub(crate) grid_sort_target: RingPickerGridSortTarget,
     pub original: RingPickerOriginalState,
+    /// Own durable preview receipts and their candidate membership policy.
+    pub(crate) preview_recipe: crate::rating_membership::RatingPreviewRecipe,
+    pub(crate) rating_origin: Option<crate::rating_membership::RatingOrigin>,
     pub row: usize,
     pub dirty_rows: Vec<RingPickerRowId>,
     pub x_close_armed: bool,

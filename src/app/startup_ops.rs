@@ -2030,7 +2030,7 @@ impl App {
                 requested.display()
             ));
         }
-        self.selected = Some(idx);
+        self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
         self.scroll_to_selected = true;
         crate::logger::log(format!(
             "{input_reason}: opening requested file through the loaded-folder viewer path: {}",

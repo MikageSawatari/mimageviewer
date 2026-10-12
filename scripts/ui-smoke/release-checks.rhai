@@ -1,5 +1,6 @@
 // Sequential suite recipe. All paths are generated literals from the verified manifest.
 const CASE_ID = "__CASE_ID__";
+const RUNNER_PID = __RUNNER_PID__;
 const CASE_DIRECTORY = "__CASE_DIRECTORY__";
 const STATIC_PATH = "__STATIC_PATH__";
 const MANY_PATH = "__MANY_PATH__";
@@ -10,7 +11,15 @@ const SEARCH_TERM = "__SEARCH_TERM__";
 const SEARCH_HITS = __SEARCH_HITS__;
 const CACHE_PATHS = __CACHE_PATHS__;
 const NAVIGATION_PATHS = __NAVIGATION_PATHS__;
+const LOAD_PATHS = __LOAD_PATHS__;
 const INCLUDE_FIRST_AI = __INCLUDE_FIRST_AI__;
+
+fn root_selectable(s) {
+    for w in s.windows {
+        if w.role == "root" && w.host_ready { return true; }
+    }
+    false
+}
 
 // Win32 canonical paths can carry a verbatim prefix and backslash separators.
 // Normalize only for comparing observed physical paths to generated literals.
@@ -20,15 +29,19 @@ fn comparable_path(path) {
     path.to_lower()
 }
 fn settled(path) {
+    let last = #{};
     for attempt in 0..1800 {
         let state = release_check_observe();
         if comparable_path(state.current_folder_path) == comparable_path(path)
-            && state.loading_complete && state.index_settled {
+            && state.loading_complete && state.index_settled && state.interaction_ready {
             return state;
         }
+        last = state;
         sleep(100);
     }
-    fail("release-check readiness timeout for " + path);
+    fail("release-check readiness timeout for " + path + ": observed=" + last.current_folder_path
+        + " generation=" + last.items_generation + " interaction_ready=" + last.interaction_ready
+        + " loading_complete=" + last.loading_complete + " index_settled=" + last.index_settled);
 }
 fn focused() {
     for attempt in 0..200 {
@@ -37,7 +50,7 @@ fn focused() {
     }
     fail("environment: exact root foreground was not acquired");
 }
-fn search() {
+fn search(term, expected_hits) {
     focused();
     let before = release_check_observe();
     tap_key("G", "ctrl");
@@ -47,42 +60,53 @@ fn search() {
         if attempt == 299 { fail("environment: Ctrl+G search did not focus"); }
         sleep(100);
     }
-    release_check_text(SEARCH_TERM);
+    release_check_text(term);
     for attempt in 0..1800 {
         let state = release_check_observe();
-        if state.search_query == SEARCH_TERM && state.search_done && !state.search_searching {
+        if state.search_query == term && state.search_done && !state.search_searching
+            && state.interaction_ready {
             return #{ ctrl_g_receipt: true, text_receipt: true, completed: true,
-                start_t: before.perf_t, end_t: state.perf_t, expected_query: SEARCH_TERM, actual_query: state.search_query,
-                expected_hits: SEARCH_HITS, actual_hits: state.search_hits };
+                start_t: before.perf_t, end_t: state.perf_t, expected_query: term, actual_query: state.search_query,
+                expected_hits: expected_hits, actual_hits: state.search_hits };
         }
         sleep(100);
     }
     fail("environment: fixture search did not settle");
 }
 
+
 release_check_begin(CASE_ID, CASE_DIRECTORY);
+// host_ready joins the real context/HWND/backend identity used by select_root.
+// host_incarnation belongs to detached hosts and is always absent on root.
+// This passive startup wait adds no repaint or input to the measured idle window.
+wait_until(|s| root_selectable(s), 30000);
 select_root();
 for attempt in 0..1800 {
-    if release_check_observe().index_settled { break; }
+    let state = release_check_observe();
+    if state.index_settled && state.interaction_ready { break; }
     if attempt == 1799 { fail("environment: initial index scans did not settle"); }
     sleep(100);
 }
 let evidence = #{ case_id: CASE_ID, pid: release_check_observe().pid };
-if CASE_ID == "seed-profile" {
+if CASE_ID == "seed-profile" || CASE_ID == "seed-perf-cached" {
     for path in CACHE_PATHS {
         release_check_open(path);
         settled(path);
         release_check_seed("cache");
     }
-    release_check_open(VIDEO_CHILD);
-    settled(VIDEO_CHILD);
-    release_check_pin(VIDEO_SOURCE);
-    // Normal pin worker/capture and cache producers own their completion.
-    release_check_open(VIDEO_PARENT);
-    settled(VIDEO_PARENT);
-    release_check_seed("cache");
-    evidence.search = search();
-    release_check_seed("search");
+    if CASE_ID == "seed-profile" {
+        release_check_open(VIDEO_CHILD);
+        settled(VIDEO_CHILD);
+        release_check_pin(VIDEO_SOURCE);
+        // DB persistence precedes the ordinary pin-triggered child reload. Wait for
+        // its dirty/classification/sidecar owners before admitting another open.
+        settled(VIDEO_CHILD);
+        release_check_open(VIDEO_PARENT);
+        settled(VIDEO_PARENT);
+        release_check_seed("cache");
+        evidence.search = search(SEARCH_TERM, SEARCH_HITS);
+        release_check_seed("search");
+    }
 } else if CASE_ID == "first-ai" {
     release_check_open(STATIC_PATH);
     settled(STATIC_PATH);
@@ -95,6 +119,19 @@ if CASE_ID == "seed-profile" {
     }
     settled(MANY_PATH);
     evidence.folder_open = #{ completed: true };
+    // Distinct image folders exercise ordinary load/thumbnail work. Reopening
+    // uncached folders would turn this measurement into a warm-cache workload.
+    let loads = [];
+    for path in LOAD_PATHS {
+        focused();
+        let before = release_check_observe();
+        release_check_open(path);
+        let after = settled(path);
+        loads.push(#{ before_path: before.current_folder_path, after_path: after.current_folder_path,
+            before_generation: before.items_generation, after_generation: after.items_generation,
+            start_t: before.perf_t, end_t: after.perf_t });
+    }
+    evidence.folder_loads = loads;
     release_check_open(NAVIGATION_PATHS[0]);
     settled(NAVIGATION_PATHS[0]);
     let navigation = [];
@@ -108,7 +145,7 @@ if CASE_ID == "seed-profile" {
             after_path: after.current_folder_path, start_t: before.perf_t, end_t: after.perf_t });
     }
     evidence.navigation = navigation;
-    evidence.search = search();
+    evidence.search = search(SEARCH_TERM, SEARCH_HITS);
 } else {
     let path = if CASE_ID == "video-pin-background" { VIDEO_PARENT }
         else if CASE_ID.starts_with("tray-") { MANY_PATH } else { STATIC_PATH };
@@ -121,7 +158,7 @@ if CASE_ID == "seed-profile" {
     }
     // One worker sleep includes warmup, actual sample, and completion margins.
     // pause waits read-only for sampler-finished.json after writing its real end clock.
-    release_check_pause(CASE_DIRECTORY, 35);
+    release_check_pause(CASE_DIRECTORY, 35, RUNNER_PID);
 }
 release_check_evidence(CASE_DIRECTORY, evidence);
 release_check_quit();

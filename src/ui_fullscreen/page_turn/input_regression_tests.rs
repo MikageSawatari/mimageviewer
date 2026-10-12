@@ -1,4 +1,5 @@
 //! Exercise the first keyboard turn through the production input and navigation owners.
+#![cfg(test)]
 use super::*;
 use crate::ui_fullscreen::page_turn_submission_tests::{draw_current, ready_app};
 

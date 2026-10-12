@@ -2070,3 +2070,54 @@ coordinatorは未コミット差分を保護してmaster（確認時v4.6.0）を
 確認用buildを用意する。取込で変わった共有経路の検証結果を、このpre-merge結果から先取りしない。
 根拠・各command/feature/exit code・ログ・build後の隔離比較手順は
 `target/A-1341-roi-spine-compare-msg.txt`。実機motion・最終案/時間・出荷受入れは利用者/設計担当へ残す。
+
+### 25.5 master取り込みの入力・描画契約
+
+2026-10-12、coordinatorが§25.4の差分を`a7155f674`へ保護し、master `d357fd5ae`
+（v4.6.0以降のEverything・PDF世代・spread shift・rating/grid cursor・監査復旧等）を取り込んだ。
+競合6ファイルは双方の契約を合成し、backlogは§1.341以外をmasterと一致させる。
+
+rating publicationによるClosed/Rebasedは通常root・委譲root・viewer内の全入力経路で扱う。
+Rebased後は同じ描画経路なら既存prepareを呼び、state/compositionとfooterのpage snapshotを
+新しいページへ更新する。描画経路が変わればそのframeを終了し、既存dispatcherへ戻す。
+ClosedはCentralPanel後のvisibility/tailも終了する。Manual/RatingMembership共通closeで
+page-turnと未配送readyを退役し、rating Undo/toastはmasterのmetadata boundaryを維持する。
+manual navigationによるRestoreOrigin取消はflat-first defer前に行う。
+
+gamepadのoperation witness/replay判定とrating picker終端型を共存させ、masterの
+GridCursorIntent・spread shift・PDF ticket・Everything所有境界を保持する。
+新しいstate ownerやnative host述語は加えず、既存frame/context境界を接続する構造に
+独立GPT-6.1 Sol / xhighレビューが合意した。検証結果・確認用buildは今回の引き継ぎに記録する。
+git add/commitはcoordinatorへ残し、アプリ起動と実機motion採択は行わない。
+
+masterの監査復旧との合成では、既存page-turn registry API 5件の正確なfingerprintを登録した。
+配送bindingとMounted/AtRest readyの読み取り、追跡要否、tray hide/全体設定の明示取消だけであり、
+通常mountによる兄弟contextの変更はない。Everythingとpage-turnのtest-only module計3ファイルは
+parentのcfg(test)に加えてinner cfg(test)を明記した。監査規則や製品公開範囲は変更しない。
+限定監査追従も独立レビューACCEPT、`cargo run --locked -p viewer_context_audit`はexit 0。
+
+追加merge回帰は、rating→nextのroot/委譲root/viewer、空集合close、Turning/Completing終了、
+flat defer前のRestoreOrigin取消を検査する。ratingとnextの複数Pressが同居し、初回drawも未採用な
+fixtureではアニメーションofferを必須にせず、実submissionの頁1とfooterによる移動先2を検査する。
+一操作・採用済outgoingの開始/完走gateは既存focused回帰が検査する。
+
+取り込み後の最終sourceでfocusedはpage_turn 167件、rating_membership 80件、grid_cursor 31件、
+spread_shift 128件、settings_transfer 25件、viewer_context_audit unit 36件が成功。
+通常/portableのcore check、fmt/glyph lintもexit 0。全体gateとbuildの結果・各ログは
+`target/A-1341-merge-msg.txt`へ記録する。実機での採択を自動結果から先取りしない。
+
+全体初回はlib 12,366件成功/1件失敗/57件ignored、UI snapshot integration 162件成功。
+唯一の失敗は`preferences_viewer_notice_visibility`のscroll thumb下端で、単頁spine比較UIの
+追加に伴う総contentheight増による約1px短縮だった。本文・checkbox・色・配置は画素一致。
+差分画像/sourceを独立レビューして1goldenだけ通常UPDATE_SNAPSHOTS経路で更新し、対象試験は成功。
+判定の許容値を広げず、利用者指示に従ってbuild jobsを2から1へ下げた全体再実行を1回行う。
+
+全体再実行はexit 0 / PASS。本体12,367件成功・0件失敗・57件ignored、UI snapshot162件成功。
+workspaceの残りとdoc-tests、vendor egui 25件・egui-wgpu 11件・eframe 18件も成功した。
+初回の失敗/未実行をこの結果で解消し、通常の確認用buildへ進む。コマンド・環境・時間・ログは
+今回の引き継ぎ記録を参照。実機motion・性能・最終案/時間・出荷受入れは利用者/設計担当へ残す。
+
+`build-dev.ps1 -PreserveRuntime`はbuild jobs=1、normal feature / dev-runtime profileで成功。
+core・remote service・EPUB workerの生成とruntime 4 DLL / PE 3 binary検査を完了した。
+アプリ起動・実設定操作・git add/commitは行わず、mergeの登録とコミットはcoordinatorへ引き継ぐ。
+利用者の隔離`--data-dir .\target\dev-runtime\data --perf-log`比較手順は今回の記録に用意した。

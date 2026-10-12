@@ -19398,6 +19398,7 @@ impl Settings {
             skip_duplicate_images: self.skip_duplicate_images,
             image_ext_priority: self.image_ext_priority.clone(),
             susie_enabled: self.susie_enabled,
+            indexer_speed_profile: self.indexer_speed_profile,
             ..Self::default()
         }
     }

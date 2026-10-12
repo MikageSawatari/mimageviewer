@@ -2,7 +2,7 @@
 //!
 //! お気に入り単位で以下を統括するバックグラウンドスレッド:
 //!
-//! 1. 起動時に初期スキャン (Walker による 3-way diff) を実行
+//! 1. 起動時に初期スキャン (Walker による FS/SQLite comparison) を実行
 //! 2. FS watcher (notify-rs) を起動し、debounce 済みの変更イベントを受信
 //! 3. 変更イベントを ingest_worker に流して Tantivy First 書き込み順序で反映
 //! 4. キャンセル・一時停止の受信
@@ -715,6 +715,7 @@ fn run_initial_scan(
         &crate::metadata_ownership::root_key(favorite_root),
         &fingerprint,
     ) {
+        writer.report_failure(&format!("indexer[{favorite_id}] prepare_full_scan"), &error);
         crate::logger::log(format!(
             "indexer[{favorite_id}]: scan marker invalidation failed: {error}"
         ));
@@ -772,9 +773,17 @@ fn run_initial_scan(
     ) {
         Ok(r) => r,
         Err(e) => {
-            crate::logger::log(format!("indexer[{favorite_id}]: walker scan failed: {e}"));
-            if cancel.load(Ordering::SeqCst) {
-                stats.lock().unwrap().last_full_outcome = Some(FullScanOutcome::Stopped);
+            match &e {
+                crate::search_walker::ScanError::Cancelled => {
+                    stats.lock().unwrap().last_full_outcome = Some(FullScanOutcome::Stopped);
+                }
+                crate::search_walker::ScanError::Metadata(error) => {
+                    writer.report_failure(
+                        &format!("indexer[{favorite_id}] walker metadata read"),
+                        error,
+                    );
+                    crate::logger::log(format!("indexer[{favorite_id}]: walker scan failed: {e}"));
+                }
             }
             return;
         }
@@ -806,10 +815,9 @@ fn run_initial_scan(
         "indexer[{favorite_id}]: acquiring writer for ingest..."
     ));
     let t_ingest = Instant::now();
-    // session.apply は writer Mutex を内部で flush 境界ごとに lock/unlock し、待機中の
-    // 他 lock 利用者 (タグ書き込み worker など) に取り合いの機会を与える (CLAUDE.md
-    // 並行処理ガイダンス + docs/async-architecture.md §5.5)。supervisor 側は Mutex 参照を
-    // そのまま渡すだけ。
+    // session.apply は writer を所有する dispatcher へ bounded sub-batch を送る
+    // (docs/async-architecture.md §5.5)。タグ書き込み worker は tags.db だけを更新し、
+    // この writer を共有しない。
     let ingest_stats = match session.apply(
         scan.to_ingest,
         scan.to_delete,
@@ -851,7 +859,7 @@ fn run_initial_scan(
         diag.depth_limit_hits,
     ));
     update_stats(stats, &ingest_stats);
-    let outcome = if ingest_stats.cancelled || cancel.load(Ordering::SeqCst) {
+    let mut outcome = if ingest_stats.cancelled || cancel.load(Ordering::SeqCst) {
         FullScanOutcome::Stopped
     } else if ingest_stats.ingested_failed > 0 {
         FullScanOutcome::Failed
@@ -865,6 +873,8 @@ fn run_initial_scan(
             &crate::metadata_ownership::root_key(favorite_root),
             &fingerprint,
         ) {
+            writer.report_failure(&format!("indexer[{favorite_id}] mark_scanned_once"), &e);
+            outcome = FullScanOutcome::Failed;
             crate::logger::log(format!(
                 "indexer[{favorite_id}]: scanned_once write failed: {e}"
             ));
@@ -1148,7 +1158,7 @@ fn build_candidate_from_path(abs_path: &std::path::Path, key: String) -> Option<
     }
     // 差分用署名: 画像はサイドカー (同名 .json/.txt) を織り込む (walker と同じロジック、
     // docs/sidecar-metadata-ingest.md §14-3/§14-4)。これで fts_meta にサイドカー込みの
-    // 署名が保存され、次回起動の walker 3-way diff と整合する。
+    // 署名が保存され、次回起動の walker FS/SQLite comparison と整合する。
     let (diff_mtime, diff_size) = if kind == search_walker::CandidateKind::Image {
         match crate::external_metadata::sidecar_signature(abs_path) {
             Some(sig) => (mtime.max(sig.mtime), file_size + sig.fingerprint),
@@ -1205,8 +1215,11 @@ mod tests {
         let meta = Arc::new(FtsMetaDb::open_at(&tmp.path().join("m.db")).unwrap());
         let fts = Arc::new(FtsIndex::open_at(&tmp.path().join("fts")).unwrap());
         let raw_writer = fts.writer().unwrap();
-        let writer =
-            crate::fts_writer_dispatcher::FtsWriterDispatcher::start(raw_writer, Arc::clone(&fts));
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start_with_reporter(
+            raw_writer,
+            Arc::clone(&fts),
+            crate::fts_integrity::FailureReporter::new(Arc::clone(&meta)),
+        );
         let sem = Arc::new(GlobalIoSemaphore::new(2));
         // テストでは idle 閾値 0ms にして wait_until_idle を即抜けさせる
         let gate = Arc::new(crate::activity_gate::ActivityGate::new(0));
@@ -1431,6 +1444,7 @@ mod tests {
         let worker_cancel = cancel.clone();
         let worker_stats = stats.clone();
         let worker_meta = meta.clone();
+        let notifications = writer.clone();
         let worker = std::thread::spawn(move || {
             FULL_SCAN_GATE.with(|gate| *gate.borrow_mut() = Some((started_tx, release_rx)));
             let id = Uuid::new_v4();
@@ -1456,6 +1470,8 @@ mod tests {
         assert!(!stats.in_full_scan);
         assert_eq!(stats.last_full_outcome, Some(FullScanOutcome::Stopped));
         assert!(meta.list_path_owners().unwrap().is_empty());
+        assert!(!meta.tantivy_rebuild_pending().unwrap());
+        assert!(notifications.test_take_failure_notifications().is_empty());
         let conn = rusqlite::Connection::open(tmp.path().join("m.db")).unwrap();
         assert_eq!(
             conn.query_row("SELECT count(*) FROM scanned_once", [], |r| r
@@ -1671,6 +1687,141 @@ mod tests {
     }
 
     #[test]
+    fn full_scan_metadata_read_error_is_failed_and_reports_once() {
+        let (tmp, meta, fts, writer, sem, _gate) = setup();
+        let root = tmp.path().join("read-failure");
+        fs::create_dir(&root).unwrap();
+        write_image(&root, "first.jpg");
+        let observer = rusqlite::Connection::open(tmp.path().join("m.db")).unwrap();
+        // Only the disposable fixture is broken; the product must not reset a failed DB.
+        observer.execute_batch("DROP TABLE files").unwrap();
+        let id = Uuid::new_v4();
+        let session = IngestSession::new(id, root.clone(), &meta, &fts);
+        let stats = Mutex::new(SupervisorStats::default());
+        run_initial_scan(
+            id,
+            &root,
+            &session,
+            &writer,
+            &sem,
+            &[],
+            Arc::new(AtomicBool::new(false)),
+            &stats,
+            &ProgressReporter::new(),
+        );
+        assert_eq!(
+            stats.lock().unwrap().last_full_outcome,
+            Some(FullScanOutcome::Failed)
+        );
+        assert!(meta.tantivy_rebuild_pending().unwrap());
+        assert_eq!(
+            writer.test_take_failure_notifications(),
+            vec![crate::fts_integrity::UPDATE_FAILURE_NOTICE]
+        );
+    }
+
+    #[test]
+    fn full_scan_marker_write_failure_is_failed_and_reserves_rebuild() {
+        let (tmp, meta, fts, writer, sem, _gate) = setup();
+        let root = tmp.path().join("full-marker");
+        fs::create_dir(&root).unwrap();
+        write_image(&root, "first.jpg");
+        let connection = rusqlite::Connection::open(tmp.path().join("m.db")).unwrap();
+        connection.execute_batch("CREATE TRIGGER fail_complete BEFORE INSERT ON scanned_once BEGIN SELECT RAISE(FAIL, 'injected scan marker failure'); END;").unwrap();
+        let id = Uuid::new_v4();
+        let session = IngestSession::new(id, root.clone(), &meta, &fts);
+        let stats = Mutex::new(SupervisorStats::default());
+        run_initial_scan(
+            id,
+            &root,
+            &session,
+            &writer,
+            &sem,
+            &[],
+            Arc::new(AtomicBool::new(false)),
+            &stats,
+            &ProgressReporter::new(),
+        );
+        assert_eq!(
+            stats.lock().unwrap().last_full_outcome,
+            Some(FullScanOutcome::Failed)
+        );
+        assert!(meta.tantivy_rebuild_pending().unwrap());
+        assert_eq!(
+            writer.test_take_failure_notifications(),
+            vec![crate::fts_integrity::UPDATE_FAILURE_NOTICE]
+        );
+    }
+
+    #[test]
+    fn watcher_and_sidecar_failures_use_one_common_exit_without_clearing_pending() {
+        let (tmp, meta, fts, writer, sem, _gate) = setup();
+        let root = tmp.path().join("watch-failures");
+        fs::create_dir(&root).unwrap();
+        write_image(&root, "watched.jpg");
+        let id = Uuid::new_v4();
+        let session = IngestSession::new(id, root.clone(), &meta, &fts);
+        let stats = Mutex::new(SupervisorStats::default());
+        let cancel = AtomicBool::new(false);
+        let progress = ProgressReporter::new();
+        writer.test_set_reload_failure(true);
+        for (path, kind) in [
+            (root.join("watched.jpg"), ChangeKind::Upsert),
+            (root.join("removed.jpg"), ChangeKind::Remove),
+            (root.join("missing.jpg"), ChangeKind::Upsert),
+        ] {
+            apply_single_change(
+                &session,
+                &writer,
+                &sem,
+                &[],
+                &cancel,
+                &stats,
+                &progress,
+                path,
+                kind,
+            );
+            assert_eq!(
+                writer.test_take_failure_notifications(),
+                vec![crate::fts_integrity::UPDATE_FAILURE_NOTICE]
+            );
+            assert!(meta.tantivy_rebuild_pending().unwrap());
+        }
+        let sidecar = root.join("watched.jpg.txt");
+        fs::write(&sidecar, "metadata").unwrap();
+        assert!(!crate::external_metadata::images_for_sidecar(&sidecar).is_empty());
+        apply_single_change(
+            &session,
+            &writer,
+            &sem,
+            &[],
+            &cancel,
+            &stats,
+            &progress,
+            sidecar,
+            ChangeKind::Upsert,
+        );
+        assert_eq!(
+            writer.test_take_failure_notifications(),
+            vec![crate::fts_integrity::UPDATE_FAILURE_NOTICE]
+        );
+        writer.test_set_reload_failure(false);
+        apply_single_change(
+            &session,
+            &writer,
+            &sem,
+            &[],
+            &cancel,
+            &stats,
+            &progress,
+            root.join("watched.jpg"),
+            ChangeKind::Upsert,
+        );
+        assert!(meta.tantivy_rebuild_pending().unwrap());
+        assert!(writer.test_take_failure_notifications().is_empty());
+    }
+
+    #[test]
     fn full_outcome_distinguishes_incomplete_reload_and_sqlite_failures() {
         let (tmp, meta, fts, writer, sem, _gate) = setup();
         let root = tmp.path().join("full_outcome");
@@ -1715,7 +1866,8 @@ mod tests {
             stats.lock().unwrap().last_full_outcome,
             Some(FullScanOutcome::Complete)
         );
-        assert!(meta.scanned_once(&root_key).unwrap().is_some());
+        assert!(meta.tantivy_rebuild_pending().unwrap());
+        assert_eq!(meta.scanned_once(&root_key).unwrap(), None);
         meta.clear_scanned_once_for_root(&root_key).unwrap();
         let db = rusqlite::Connection::open(tmp.path().join("m.db")).unwrap();
         db.execute_batch("CREATE TRIGGER fail_full BEFORE INSERT ON files BEGIN SELECT RAISE(FAIL, 'injected SQLite failure'); END;").unwrap();

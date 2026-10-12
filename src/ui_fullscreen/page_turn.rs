@@ -9,6 +9,8 @@ mod barrier;
 mod input_regression_tests;
 #[cfg(test)]
 mod landscape_tests;
+#[cfg(all(test, windows))]
+mod merge_tests;
 #[cfg(test)]
 mod nonfinal_tests;
 #[cfg(test)]

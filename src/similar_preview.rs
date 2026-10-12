@@ -1372,7 +1372,12 @@ fn validate_or_prepare_similar_preview(
     cancel: Arc<AtomicBool>,
 ) -> Result<SimilarPreviewWorkerResult, String> {
     validate_or_prepare_similar_preview_with(request, cancel, |request, cancel| {
-        load_similar_preview_pixels(&request.stamp, &request.passwords, cancel, 0)
+        load_similar_preview_pixels(
+            &request.stamp,
+            &request.passwords,
+            cancel,
+            crate::pdf_loader::PdfRenderValidity::Unscoped,
+        )
     })
 }
 
@@ -1405,7 +1410,7 @@ pub(crate) fn load_similar_preview_pixels(
     stamp: &SimilarPreviewStamp,
     passwords: &crate::pdf_passwords::PdfPasswordStore,
     cancel: Arc<AtomicBool>,
-    pdf_context_epoch: u64,
+    pdf_render_validity: crate::pdf_loader::PdfRenderValidity,
 ) -> Result<SimilarPreviewPixels, String> {
     if cancel.load(Ordering::Relaxed) {
         return Err("画像の準備を取り消しました".to_owned());
@@ -1533,7 +1538,7 @@ pub(crate) fn load_similar_preview_pixels(
                 password.as_deref(),
                 Some(cancel.clone()),
                 crate::pdf_loader::JobPriority::Critical,
-                pdf_context_epoch,
+                pdf_render_validity,
                 crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
             )
             .map_err(|error| error.to_string())?;

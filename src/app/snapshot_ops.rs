@@ -20,7 +20,9 @@ use crate::snapshot::{
 /// `old_to_new` is deliberately built from exact [`SnapshotKey`] equality. It is not the
 /// owner-entry relation used by cross-container navigation: a `ZipImage` must never turn into
 /// its `ZipFile` container merely because both share a path prefix.
-struct SnapshotViewerIndexSwap {
+pub(crate) struct SnapshotViewerIndexSwap {
+    policy: ViewerIndexSwapPolicy,
+    old_items_generation: u64,
     old_fullscreen_idx: usize,
     new_fullscreen_idx: usize,
     old_to_new: HashMap<usize, usize>,
@@ -32,6 +34,14 @@ struct SnapshotViewerIndexSwap {
     last_sync_stamp_new_idx: Option<usize>,
     #[cfg(windows)]
     last_sync_stamp_existed: bool,
+}
+
+/// A snapshot transition changes the browsing surface; membership publication
+/// only remaps identities in the same surface and keeps live input ownership.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewerIndexSwapPolicy {
+    Snapshot,
+    Membership,
 }
 
 #[derive(Clone, Copy)]
@@ -199,6 +209,10 @@ impl App {
     }
 
     fn clear_snapshot_index_space_derived_state(&mut self) {
+        self.clear_viewer_index_space_derived_state(ViewerIndexSwapPolicy::Snapshot);
+    }
+
+    fn clear_viewer_index_space_derived_state(&mut self, policy: ViewerIndexSwapPolicy) {
         self.slideshow_scroll_range_cache = None;
         self.viewer_navigation_caches.invalidate();
         self.fs_vertical_cache_keep_set.clear();
@@ -208,19 +222,44 @@ impl App {
         self.analysis_hist_cache = None;
         self.analysis_sv_cache = None;
         self.fs_context_menu_idx = None;
-        self.fs_secondary_press.cancel();
         self.adjust_scope_selection_idx = None;
-        self.cancel_mouse_ring_flick();
-        self.mouse_ring_grid_target_idx = None;
-        self.mouse_gesture_grid_target_idx = None;
-        self.mouse_ring_suppress_context_menu_once = false;
+        if policy == ViewerIndexSwapPolicy::Snapshot {
+            self.fs_secondary_press.cancel();
+            self.cancel_mouse_ring_flick();
+            self.mouse_ring_grid_target_idx = None;
+            self.mouse_gesture_grid_target_idx = None;
+            self.mouse_ring_suppress_context_menu_once = false;
+        }
     }
 
     fn finish_snapshot_viewer_index_swap(&mut self, swap: Option<SnapshotViewerIndexSwap>) {
+        self.finish_viewer_index_swap(swap, ViewerIndexSwapPolicy::Snapshot);
+    }
+
+    /// Finish an exact-identity membership remap after installing the new items.
+    /// A missing anchor is handled by the caller's membership decision/teardown.
+    pub(crate) fn finish_rating_membership_viewer_swap(
+        &mut self,
+        swap: Option<SnapshotViewerIndexSwap>,
+    ) {
+        self.finish_viewer_index_swap(swap, ViewerIndexSwapPolicy::Membership);
+    }
+
+    fn finish_viewer_index_swap(
+        &mut self,
+        swap: Option<SnapshotViewerIndexSwap>,
+        policy: ViewerIndexSwapPolicy,
+    ) {
         let Some(mut swap) = swap else {
-            self.clear_snapshot_index_space_derived_state();
+            match policy {
+                ViewerIndexSwapPolicy::Snapshot => self.clear_snapshot_index_space_derived_state(),
+                ViewerIndexSwapPolicy::Membership => {
+                    self.clear_viewer_index_space_derived_state(policy)
+                }
+            }
             return;
         };
+        debug_assert_eq!(swap.policy, policy);
         let remap = |idx: usize| swap.old_to_new.get(&idx).copied();
 
         match self.try_own_fullscreen_epub_at(swap.new_fullscreen_idx) {
@@ -268,7 +307,22 @@ impl App {
         self.fs_continuous_fit_reference.remap_indices(&remap);
 
         self.finish_snapshot_platform_media_index_swap(&swap);
-        self.clear_snapshot_index_space_derived_state();
+        if policy == ViewerIndexSwapPolicy::Membership {
+            let owner = self.edit_request_owner_context();
+            self.fs_secondary_press.remap_owner(
+                owner,
+                swap.old_items_generation,
+                swap.old_fullscreen_idx,
+                self.items_generation,
+                swap.new_fullscreen_idx,
+            );
+        }
+        match policy {
+            ViewerIndexSwapPolicy::Snapshot => self.clear_snapshot_index_space_derived_state(),
+            ViewerIndexSwapPolicy::Membership => {
+                self.clear_viewer_index_space_derived_state(policy)
+            }
+        }
     }
 
     fn finish_snapshot_platform_media_index_swap(&mut self, swap: &SnapshotViewerIndexSwap) {
@@ -412,14 +466,78 @@ impl App {
         phase: &'static str,
         target_membership: &HashMap<SnapshotKey, usize>,
     ) -> Option<SnapshotViewerIndexSwap> {
-        self.cancel_media_navigation_pending_for_current_context("snapshot_items_swap");
-        self.cancel_pending_folder_nav();
+        self.prepare_viewer_index_swap(phase, target_membership, ViewerIndexSwapPolicy::Snapshot)
+    }
+
+    /// Preserve a still/media page when asynchronous rating/search membership
+    /// replaces its item slots. No navigation or close is started on a miss.
+    pub(crate) fn prepare_rating_membership_viewer_swap(
+        &mut self,
+        new_items: &[GridItem],
+    ) -> Option<SnapshotViewerIndexSwap> {
+        let membership = new_items
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, item)| snapshot_key_from_grid_item(item).map(|key| (key, idx)))
+            .collect();
+        self.prepare_viewer_index_swap(
+            "rating-membership",
+            &membership,
+            ViewerIndexSwapPolicy::Membership,
+        )
+    }
+
+    fn prepare_viewer_index_swap(
+        &mut self,
+        phase: &'static str,
+        target_membership: &HashMap<SnapshotKey, usize>,
+        policy: ViewerIndexSwapPolicy,
+    ) -> Option<SnapshotViewerIndexSwap> {
+        if policy == ViewerIndexSwapPolicy::Snapshot {
+            self.cancel_media_navigation_pending_for_current_context("snapshot_items_swap");
+            self.cancel_pending_folder_nav();
+        }
 
         // The list owns the pairing anchor even after Esc closes its reader. Remap
         // at the items-swap boundary for every outcome, exactly once.
         let old_to_new = self.snapshot_exact_idx_map(target_membership);
         self.spread_shift
             .remap_with(&|idx| old_to_new.get(&idx).copied());
+        if policy == ViewerIndexSwapPolicy::Membership {
+            let remap = |idx: usize| old_to_new.get(&idx).copied();
+            let projected = self.projected_viewer_context_id();
+            let owns_drag = |owner| match owner {
+                crate::ring_shortcut::RightDragOwner::Root => {
+                    projected == self.viewer_context_main()
+                }
+                crate::ring_shortcut::RightDragOwner::DetachedWindow(window_id) => {
+                    #[cfg(windows)]
+                    {
+                        self.viewer_context_window(projected) == Some(window_id)
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        let _ = window_id;
+                        false
+                    }
+                }
+            };
+            let owns_flick = self
+                .mouse_ring_flick
+                .as_ref()
+                .is_some_and(|flick| owns_drag(flick.owner));
+            let owns_gesture = self
+                .mouse_gesture
+                .as_ref()
+                .is_some_and(|gesture| owns_drag(gesture.owner));
+            if owns_flick {
+                self.mouse_ring_grid_target_idx = self.mouse_ring_grid_target_idx.and_then(&remap);
+            }
+            if owns_gesture {
+                self.mouse_gesture_grid_target_idx =
+                    self.mouse_gesture_grid_target_idx.and_then(&remap);
+            }
+        }
 
         let Some(old_fullscreen_idx) = self.fullscreen_idx else {
             crate::logger::log(format!(
@@ -438,20 +556,32 @@ impl App {
             .get(old_fullscreen_idx)
             .and_then(snapshot_key_from_grid_item)
         else {
+            let outcome = match policy {
+                ViewerIndexSwapPolicy::Snapshot => "closing reader",
+                ViewerIndexSwapPolicy::Membership => "membership caller decides reader",
+            };
             crate::logger::log(format!(
-                "[snapshot] {phase}: closing reader, the open item has no snapshot key \
+                "[snapshot] {phase}: {outcome}, the open item has no snapshot key \
                  old_idx={old_fullscreen_idx} item={open_label}"
             ));
-            self.close_fullscreen();
+            if policy == ViewerIndexSwapPolicy::Snapshot {
+                self.close_fullscreen();
+            }
             return None;
         };
         let Some(&new_fullscreen_idx) = target_membership.get(&open_key) else {
+            let outcome = match policy {
+                ViewerIndexSwapPolicy::Snapshot => "closing reader",
+                ViewerIndexSwapPolicy::Membership => "membership caller decides reader",
+            };
             crate::logger::log(format!(
-                "[snapshot] {phase}: closing reader, the open item is outside the new list \
+                "[snapshot] {phase}: {outcome}, the open item is outside the new list \
                  old_idx={old_fullscreen_idx} target_len={} item={open_label}",
                 target_membership.len()
             ));
-            self.close_fullscreen();
+            if policy == ViewerIndexSwapPolicy::Snapshot {
+                self.close_fullscreen();
+            }
             return None;
         };
         crate::logger::log(format!(
@@ -502,6 +632,8 @@ impl App {
         let preserved_fs_page = self.take_fs_page_for_snapshot(old_fullscreen_idx);
 
         Some(SnapshotViewerIndexSwap {
+            policy,
+            old_items_generation: self.items_generation,
             old_fullscreen_idx,
             new_fullscreen_idx,
             old_to_new,
@@ -1291,8 +1423,6 @@ impl App {
             self.image_metas = snap.saved_image_metas;
             self.visible_indices = snap.saved_visible_indices;
             self.scroll_offset_y = snap.saved_scroll_offset_y;
-            self.selected = snap.saved_selected;
-            self.grid_click_selection_anchor = None;
             // ネスト ZIP 由来の snapshot: saved_items (= ZIP 階層の items) と対で
             // ナビ状態も復元する。これをしないと「ZIP items なのに nav なし」になり、
             // BS が階層を戻らず ZIP ごと抜ける / ZipDir セルの Enter が無反応になる。
@@ -1303,6 +1433,7 @@ impl App {
             // invalidate 後も保持される (= thumbnails 自体は invalidate 対象外)。
             self.bump_items_generation();
             self.invalidate_idx_state_and_queues();
+            self.move_grid_cursor(snap.saved_selected, crate::app::GridCursorIntent::Automatic);
             self.invalidate_snapshot_details_index_state();
             self.finish_snapshot_viewer_index_swap(viewer_index_swap);
             self.clear_tags_cache();
@@ -1419,8 +1550,7 @@ impl App {
         self.address = snap_origin.display().to_string();
         self.scroll_offset_y = 0.0;
         self.pending_grid_scroll = None;
-        self.selected = None;
-        self.grid_click_selection_anchor = None;
+        self.move_grid_cursor(None, crate::app::GridCursorIntent::Automatic);
         // items_generation bump + invalidate (= Codex P1-1)
         self.bump_items_generation();
         self.invalidate_idx_state_and_queues();
@@ -2104,7 +2234,7 @@ impl App {
             return;
         };
         self.open_fullscreen(idx, history_trigger);
-        self.selected = Some(idx);
+        self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
         self.scroll_to_selected = true;
         self.update_last_selected_image();
     }
@@ -3123,6 +3253,238 @@ mod tests {
         assert!(!app.is_snapshot_active());
         assert_eq!(app.snapshot_count(), None);
         assert!(app.snapshot_origin().is_none());
+    }
+
+    #[test]
+    fn rating_membership_swap_keeps_still_texture_picker_and_input_owner() {
+        use crate::ring_shortcut::{MouseFlickState, RightDragOwner, RingShortcutContext};
+
+        let mut app = test_app_with_items(vec![
+            GridItem::Image(PathBuf::from(r"E:\test\a.png")),
+            GridItem::Image(PathBuf::from(r"E:\test\b.png")),
+        ]);
+        app.fullscreen_idx = Some(1);
+        let ctx = egui::Context::default();
+        let pixels = std::sync::Arc::new(egui::ColorImage::filled([2, 3], egui::Color32::WHITE));
+        let tex = ctx.load_texture("membership-still", (*pixels).clone(), Default::default());
+        let texture_id = tex.id();
+        app.fs_cache.insert(
+            1,
+            crate::app::FsCacheEntry::Static {
+                tex,
+                pixels: pixels.clone(),
+                source_dims: Some([2, 3]),
+                load_seq: 41,
+                animation: crate::fs_animation::StaticAnimationState::Still,
+            },
+        );
+        let picker = app.build_ring_picker_state(RingShortcutContext::ImageFullscreen);
+        app.ring_picker = Some(picker.clone());
+        let now = std::time::Instant::now();
+        let pos = egui::pos2(100.0, 120.0);
+        app.mouse_ring_flick = Some(MouseFlickState::new(
+            RightDragOwner::Root,
+            RingShortcutContext::ImageFullscreen,
+            now,
+            pos,
+        ));
+        app.mouse_ring_grid_target_idx = Some(1);
+        app.mouse_gesture = Some(crate::ring_shortcut::MouseGestureState::new(
+            RightDragOwner::Root,
+            crate::ring_shortcut::RightDragContext::ImageFullscreen,
+            now,
+            pos,
+        ));
+        app.mouse_gesture_grid_target_idx = Some(0);
+        app.mouse_ring_suppress_context_menu_once = true;
+        let owner = app.edit_request_owner_context();
+        app.fs_secondary_press = crate::ui_fullscreen::FullscreenSecondaryPress::armed_for_test(
+            owner,
+            app.items_generation,
+            1,
+            crate::ring_shortcut::RightDragContext::ImageFullscreen,
+            now,
+            pos,
+        );
+        app.pending_folder_nav_steps = 3;
+        let replacement = vec![
+            GridItem::Image(PathBuf::from(r"E:\test\new.png")),
+            app.items[0].clone(),
+            app.items[1].clone(),
+        ];
+
+        let swap = app.prepare_rating_membership_viewer_swap(&replacement);
+        assert!(swap.is_some());
+        app.items = replacement;
+        app.visible_indices = vec![0, 1, 2];
+        app.bump_items_generation();
+        app.finish_rating_membership_viewer_swap(swap);
+
+        assert_eq!(app.fullscreen_idx, Some(2));
+        let Some(crate::app::FsCacheEntry::Static {
+            tex,
+            pixels: kept,
+            load_seq,
+            ..
+        }) = app.fs_cache.get(&2)
+        else {
+            panic!("current still page was not transferred");
+        };
+        assert_eq!(tex.id(), texture_id);
+        assert!(std::sync::Arc::ptr_eq(kept, &pixels));
+        assert_eq!(*load_seq, 41);
+        assert_eq!(app.ring_picker, Some(picker));
+        assert!(app.mouse_ring_flick.is_some());
+        assert_eq!(app.mouse_ring_grid_target_idx, Some(2));
+        assert_eq!(app.mouse_gesture_grid_target_idx, Some(1));
+        assert!(app.mouse_ring_suppress_context_menu_once);
+        assert_eq!(app.pending_folder_nav_steps, 3);
+        let generation = app.items_generation;
+        assert_eq!(
+            app.fs_secondary_press.finish_for_test(
+                owner,
+                generation,
+                2,
+                crate::ring_shortcut::RightDragContext::ImageFullscreen,
+                now + std::time::Duration::from_millis(10),
+                pos,
+                false,
+                true,
+            ),
+            Some(false),
+            "the same page's armed short tap follows its identity across generation/slot changes"
+        );
+    }
+
+    #[test]
+    fn rating_membership_swap_does_not_remap_sibling_pointer_targets() {
+        use crate::ring_shortcut::{
+            MouseFlickState, MouseGestureState, RightDragOwner, RingShortcutContext,
+        };
+
+        let mut app = test_app_with_items(vec![GridItem::Image(PathBuf::from(r"E:\test\a.png"))]);
+        app.fullscreen_idx = Some(0);
+        let now = std::time::Instant::now();
+        let pos = egui::pos2(100.0, 120.0);
+        app.mouse_ring_flick = Some(MouseFlickState::new(
+            RightDragOwner::DetachedWindow(77),
+            RingShortcutContext::ImageFullscreen,
+            now,
+            pos,
+        ));
+        app.mouse_gesture = Some(MouseGestureState::new(
+            RightDragOwner::DetachedWindow(77),
+            crate::ring_shortcut::RightDragContext::ImageFullscreen,
+            now,
+            pos,
+        ));
+        app.mouse_ring_grid_target_idx = Some(0);
+        app.mouse_gesture_grid_target_idx = Some(0);
+        let replacement = vec![
+            GridItem::Image(PathBuf::from(r"E:\test\new.png")),
+            app.items[0].clone(),
+        ];
+        let swap = app.prepare_rating_membership_viewer_swap(&replacement);
+        app.items = replacement;
+        app.bump_items_generation();
+        app.finish_rating_membership_viewer_swap(swap);
+        assert_eq!(app.fullscreen_idx, Some(1));
+        assert_eq!(app.mouse_ring_grid_target_idx, Some(0));
+        assert_eq!(app.mouse_gesture_grid_target_idx, Some(0));
+        assert_eq!(
+            app.mouse_ring_flick.as_ref().unwrap().owner,
+            RightDragOwner::DetachedWindow(77)
+        );
+        assert_eq!(
+            app.mouse_gesture.as_ref().unwrap().owner,
+            RightDragOwner::DetachedWindow(77)
+        );
+    }
+
+    #[test]
+    fn rating_membership_swap_keeps_exact_media_player_allocation() {
+        let path = PathBuf::from(r"E:\test\playing.mp4");
+        let mut app = test_app_with_items(vec![GridItem::Video(path.clone())]);
+        app.fullscreen_idx = Some(0);
+        let player = Box::new(crate::video::VideoPlayer::stream_ready_disconnected_for_test(path));
+        let original_player = std::ptr::from_ref(&*player);
+        app.fs_cache.insert(
+            0,
+            crate::app::FsCacheEntry::Video {
+                player,
+                load_seq: 19,
+            },
+        );
+        app.video_audio_mode = Some(0);
+        let replacement = vec![
+            GridItem::Image(PathBuf::from(r"E:\test\new.png")),
+            app.items[0].clone(),
+        ];
+        let swap = app.prepare_rating_membership_viewer_swap(&replacement);
+        app.items = replacement;
+        app.bump_items_generation();
+        app.finish_rating_membership_viewer_swap(swap);
+        let Some(crate::app::FsCacheEntry::Video { player, load_seq }) = app.fs_cache.get(&1)
+        else {
+            panic!("media player was not transferred");
+        };
+        assert_eq!(std::ptr::from_ref(&**player), original_player);
+        assert_eq!(*load_seq, 19);
+        assert_eq!(app.fullscreen_idx, Some(1));
+        assert_eq!(app.video_audio_mode, Some(1));
+    }
+
+    #[test]
+    fn rating_membership_missing_page_does_not_close_or_match_container() {
+        let archive = PathBuf::from(r"E:\test\book.zip");
+        let mut app = test_app_with_items(vec![GridItem::ZipImage {
+            zip_path: archive.clone(),
+            entry_name: "page.png".into(),
+        }]);
+        app.fullscreen_idx = Some(0);
+        app.fs_cache.insert(0, crate::app::FsCacheEntry::Failed);
+        app.pending_folder_nav_steps = 2;
+        assert!(
+            app.prepare_rating_membership_viewer_swap(&[GridItem::ZipFile(archive)])
+                .is_none()
+        );
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert!(app.fs_cache.get(&0).is_some());
+        assert_eq!(app.pending_folder_nav_steps, 2);
+    }
+
+    #[test]
+    fn snapshot_reindex_still_retires_live_pointer_sequence() {
+        use crate::ring_shortcut::{MouseFlickState, RightDragOwner, RingShortcutContext};
+
+        let mut app = test_app_with_items(vec![GridItem::Image(PathBuf::from(r"E:\test\a.png"))]);
+        app.fullscreen_idx = Some(0);
+        let now = std::time::Instant::now();
+        let pos = egui::pos2(100.0, 120.0);
+        app.mouse_ring_flick = Some(MouseFlickState::new(
+            RightDragOwner::Root,
+            RingShortcutContext::ImageFullscreen,
+            now,
+            pos,
+        ));
+        app.fs_secondary_press = crate::ui_fullscreen::FullscreenSecondaryPress::armed_for_test(
+            app.edit_request_owner_context(),
+            app.items_generation,
+            0,
+            crate::ring_shortcut::RightDragContext::ImageFullscreen,
+            now,
+            pos,
+        );
+        let membership = HashMap::from([(snapshot_key_from_grid_item(&app.items[0]).unwrap(), 0)]);
+        let swap = app.prepare_snapshot_viewer_index_swap("test", &membership);
+        app.bump_items_generation();
+        app.finish_snapshot_viewer_index_swap(swap);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert!(app.mouse_ring_flick.is_none());
+        assert_eq!(
+            app.fs_secondary_press,
+            crate::ui_fullscreen::FullscreenSecondaryPress::Idle
+        );
     }
 
     #[test]

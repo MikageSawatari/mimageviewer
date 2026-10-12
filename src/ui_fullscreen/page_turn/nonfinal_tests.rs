@@ -1,4 +1,5 @@
 //! Resident-quality acceptance must not manufacture a final image to start a turn.
+#![cfg(test)]
 use super::*;
 use crate::ui_fullscreen::page_turn_submission_tests::{draw_current, frame, ready_app};
 

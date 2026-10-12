@@ -3039,10 +3039,18 @@ impl App {
                     "video_presentation_transition_non_detached",
                 );
             }
-            super::PresentationTransitionEffect::TerminalSessionClose { .. } => {
+            super::PresentationTransitionEffect::TerminalSessionClose {
+                metadata_boundary, ..
+            } => {
                 // ここで通常の teardown まで走る。呼び出し側が「まだ閉じていない」と
                 // 判断して二度目を呼ぶと、初回 close が整えた状態を巻き戻す。
-                self.close_fullscreen();
+                match metadata_boundary {
+                    super::FsMetadataBoundary::Manual => self.close_fullscreen(),
+                    super::FsMetadataBoundary::RatingMembership => self
+                        .close_fullscreen_now_with_metadata_boundary(
+                            super::FsMetadataBoundary::RatingMembership,
+                        ),
+                }
                 outcome = PresentationEffectsOutcome::ClosedFullscreen;
             }
             super::PresentationTransitionEffect::SetZOrderRecoveryPermit(permitted) => {
@@ -14844,6 +14852,9 @@ impl App {
         // 最新 delta を deferred フィールドに格納し、swap 完了後の polling で drain する
         // (`maybe_apply_deferred_native_video_nav` 参照)。most-recent-wins。
         if self.video_tile_swap_pending.is_some() || self.native_video_fast_swap_pending.is_some() {
+            if base_delta != 0 {
+                self.cancel_rating_membership_restore();
+            }
             if self.start_collection_manual_navigation(
                 ctx,
                 fs_idx,
@@ -14862,6 +14873,9 @@ impl App {
         // (Codex 第 8 P2 指摘)。defer せず silent return に留める。
         if self.fs_nav_is_locked() {
             return;
+        }
+        if base_delta != 0 {
+            self.cancel_rating_membership_restore();
         }
         if !self.video_tile_mode_active {
             self.cancel_stale_video_tile_reopen(Some(fs_idx), "wheel-navigation");
@@ -15985,6 +15999,144 @@ impl App {
             player.request_native_overlay_render();
         }
         ctx.request_repaint();
+    }
+}
+
+#[cfg(all(test, windows))]
+mod rating_terminal_close_tests {
+    use super::*;
+    use crate::undo_stack::{RatingChange, TagChange, UndoEntry};
+
+    fn rating_entry() -> UndoEntry {
+        UndoEntry::Rating {
+            changes: vec![RatingChange {
+                path_key: "rating-terminal-page".to_owned(),
+                source_path: std::path::PathBuf::from("rating-terminal-page.png"),
+                meta: None,
+                xmp_target: None,
+                before: 3,
+                after: 1,
+            }],
+            summary: "rating".to_owned(),
+            origin: None,
+        }
+    }
+
+    #[test]
+    fn rating_terminal_effect_preserves_rating_history_and_membership_cursor() {
+        for boundary in [
+            FsMetadataBoundary::RatingMembership,
+            FsMetadataBoundary::Manual,
+        ] {
+            for stage in 0..3 {
+                let mut app = crate::app::tests::phase_c_support::setup_app();
+                app.items = vec![
+                    GridItem::Image(app.tmp.path().join("grid.png")),
+                    GridItem::Image(app.tmp.path().join("reader.png")),
+                ];
+                app.visible_indices = vec![0, 1];
+                app.thumbnails = vec![ThumbnailState::Pending; 2];
+                app.image_metas = vec![None; 2];
+                app.selected = Some(0);
+                app.fullscreen_idx = Some(1);
+                app.viewer_presentation = ViewerPresentation::Fullscreen;
+                app.settings.rating_filter = [true; 6];
+                app.meta_undo.push(rating_entry());
+                app.meta_undo.push(UndoEntry::Tag {
+                    changes: vec![TagChange {
+                        path: std::path::PathBuf::from("tag.png"),
+                        tag_sidecar: None,
+                        before: vec![],
+                        after: vec!["tag".to_owned()],
+                    }],
+                    summary: "tag".to_owned(),
+                });
+                app.meta_undo.push_redo(rating_entry());
+                app.video_presentation_transition
+                    .reset_stable(ViewerPresentation::Fullscreen);
+                let request_id = app.video_presentation_transition.request_transition(
+                    ViewerPresentation::MainWindow,
+                    false,
+                    false,
+                    0,
+                    None,
+                    None,
+                );
+                app.video_presentation_transition.take_effects();
+                app.video_presentation_transition.drive();
+                if stage >= 1 {
+                    assert!(matches!(
+                        app.video_presentation_transition.take_effects().as_slice(),
+                        [PresentationTransitionEffect::PrepareNative { .. }]
+                    ));
+                    app.video_presentation_transition.dispatch(
+                        PresentationTransitionEvent::NativeReady {
+                            request_id,
+                            candidate: PresentationCandidate {
+                                presenter_hwnd: 0,
+                                native_generation: 7,
+                                host_hwnd: 0,
+                                requires_retire: true,
+                            },
+                        },
+                    );
+                    app.video_presentation_transition.drive();
+                }
+                if stage >= 2 {
+                    assert!(matches!(
+                        app.video_presentation_transition.take_effects().as_slice(),
+                        [PresentationTransitionEffect::PublishNative { .. }]
+                    ));
+                    app.video_presentation_transition.dispatch(
+                        PresentationTransitionEvent::NativeCommitted {
+                            request_id,
+                            candidate_generation: 7,
+                        },
+                    );
+                }
+                assert!(app.video_presentation_transition.has_pending_effects());
+                assert!(app.video_presentation_transition.is_transitioning());
+                app.video_presentation_transition.dispatch(match boundary {
+                    FsMetadataBoundary::Manual => PresentationTransitionEvent::TerminalClose,
+                    FsMetadataBoundary::RatingMembership => {
+                        PresentationTransitionEvent::TerminalCloseForRatingMembership
+                    }
+                });
+                let ctx = egui::Context::default();
+                assert_eq!(
+                    app.execute_video_presentation_transition_effects(&ctx),
+                    PresentationEffectsOutcome::ClosedFullscreen
+                );
+                assert_eq!(app.fullscreen_idx, None);
+                assert!(!app.video_presentation_transition.is_transitioning());
+                if boundary == FsMetadataBoundary::RatingMembership {
+                    assert_eq!(
+                        app.selected,
+                        Some(0),
+                        "membership cursor was replaced by old reader"
+                    );
+                    assert_eq!(app.meta_undo.undo_len(), 1);
+                    assert_eq!(app.meta_undo.redo_len(), 1);
+                    assert!(matches!(
+                        app.meta_undo.peek_undo(),
+                        Some(UndoEntry::Rating { .. })
+                    ));
+                } else {
+                    assert_eq!(
+                        app.selected,
+                        Some(1),
+                        "manual close no longer restores reader cursor"
+                    );
+                    assert_eq!(app.meta_undo.undo_len(), 0);
+                    assert_eq!(app.meta_undo.redo_len(), 0);
+                }
+                assert_eq!(
+                    app.execute_video_presentation_transition_effects(&ctx),
+                    PresentationEffectsOutcome::DidNotClose,
+                    "terminal effects were executed twice"
+                );
+            }
+        }
     }
 }
 

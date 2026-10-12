@@ -406,12 +406,23 @@ impl SmartFolderPreparedGrid {
             .grid_click_selection_anchor_index
             .and_then(|index| remap_smart_folder_grid_index(index, &removed));
         if let Some(index) = self.selected {
-            self.selected = remap_smart_folder_grid_index(index, &removed).or_else(|| {
-                (!self.items.is_empty()).then_some(
+            let surviving_cursor = remap_smart_folder_grid_index(index, &removed);
+            let target = surviving_cursor.or_else(|| {
+                (!self.items.is_empty()).then(|| {
                     (index - removed.partition_point(|removed_index| *removed_index < index))
-                        .min(self.items.len() - 1),
-                )
+                        .min(self.items.len() - 1)
+                })
             });
+            if surviving_cursor.is_some() {
+                self.selected = target;
+            } else {
+                super::apply_grid_cursor_move_indices(
+                    &mut self.selected,
+                    &mut self.grid_click_selection_anchor_index,
+                    target,
+                    super::GridCursorMove::Move,
+                );
+            }
         }
         self.tags_cache
             .retain(|path, _| !smart_folder_path_is_removed(path, removed_paths));
@@ -1297,13 +1308,17 @@ impl App {
             return None;
         }
         let masks = session.item_rating_masks.as_ref()?;
+        let preview = self.rating_preview_recipe();
         Some(
             self.items
                 .iter()
                 .enumerate()
                 .map(|(index, _)| {
                     let stars = self.rating_cache.get(&index).copied().unwrap_or(0).min(5);
-                    masks.get(index).is_none_or(|mask| mask[stars as usize])
+                    masks.get(index).is_none_or(|mask| {
+                        self.rating_path_key(index)
+                            .is_some_and(|key| preview.allows(&key, stars, mask))
+                    })
                 })
                 .collect(),
         )
@@ -3524,7 +3539,7 @@ impl App {
             self.stack_mode_requested = false;
 
             crate::thumb_loader::bump_catchup_epoch();
-            let _ = crate::pdf_loader::bump_render_context_epoch();
+            self.bump_render_epoch_only();
         }
         self.cancel_folder_pane_open(super::PaneOpenRestoreExit::Adopted);
         self.clear_meta_undo();
@@ -9264,7 +9279,7 @@ impl App {
         self.smart_folder_progress = None;
         self.address = format!("スマートフォルダ: {definition_name}");
         if let Some(&index) = self.visible_indices.first() {
-            self.selected = Some(index);
+            self.move_grid_cursor(Some(index), crate::app::GridCursorIntent::Automatic);
             self.scroll_to_selected = true;
         }
         if let Some(SmartFolderOpenOrigin::ReturnReprepare {
@@ -9334,7 +9349,7 @@ impl App {
         if self.search_query.trim().is_empty() {
             self.rebuild_visible_indices();
         } else {
-            self.execute_search(ctx);
+            self.reexecute_search_for_installed_list(ctx);
         }
     }
 
@@ -11684,6 +11699,69 @@ mod tests {
             PositionResolution::Restored(1)
         );
         assert!(!Arc::ptr_eq(&app.page_identity_index, &saved_root));
+    }
+
+    #[test]
+    fn grid_cursor_saved_smart_root_deleted_cursor_rebases_before_restore() {
+        let mut app = crate::app::setup_app_for_test();
+        let definition_id = install_smart_identity_test_root(&mut app, Default::default());
+        let mut grid = app.take_visible_smart_folder_grid();
+        grid.items.extend([
+            GridItem::Image(r"C:\Smart\c.jpg".into()),
+            GridItem::Image(r"C:\Smart\d.jpg".into()),
+        ]);
+        grid.thumbnails
+            .extend([ThumbnailState::Failed, ThumbnailState::Failed]);
+        grid.image_metas.extend([None, None]);
+        grid.visible_indices = vec![0, 1, 2, 3];
+        // Shift extension from A to C, then C is removed in another context.
+        grid.selected = Some(2);
+        grid.grid_click_selection_anchor_index = Some(0);
+        let removed = HashSet::from([crate::path_key::normalize_keep_drive(std::path::Path::new(
+            r"C:\Smart\c.jpg",
+        ))]);
+        let retired = grid.remove_paths(&removed);
+        app.retire_smart_folder_payloads(
+            retired.map(|index| Box::new(index) as RetiredSmartFolderPayload),
+        );
+        assert_eq!(grid.selected, Some(2));
+        assert_eq!(grid.grid_click_selection_anchor_index, Some(2));
+        park_smart_identity_test_root(&mut app, grid);
+        assert!(app.restore_prepared_smart_folder_session(definition_id, None));
+        assert_eq!(app.selected, Some(2));
+        assert_eq!(
+            app.grid_click_selection_anchor
+                .and_then(|anchor| anchor.index_for_generation(app.items_generation)),
+            Some(2)
+        );
+        let order = app.current_grid_order().to_vec();
+        let generation = app.items_generation;
+        let items = app.items.clone();
+        let app = &mut *app;
+        crate::ui_main::apply_grid_click_selection(
+            crate::settings::GridClickSelectionMode::Explorer,
+            &mut app.selected,
+            &mut app.grid_click_selection_anchor,
+            generation,
+            &mut app.checked,
+            &order,
+            &items,
+            false,
+            1,
+            false,
+            true,
+        );
+        assert_eq!(app.checked, HashSet::from([1, 2]));
+        let mut grid = app.take_visible_smart_folder_grid();
+        let removed = grid
+            .items
+            .iter()
+            .filter_map(GridItem::drag_source_path)
+            .map(crate::path_key::normalize_keep_drive)
+            .collect();
+        let _ = grid.remove_paths(&removed);
+        assert_eq!(grid.selected, None);
+        assert_eq!(grid.grid_click_selection_anchor_index, None);
     }
 
     fn smart_membership_identity_test_result(

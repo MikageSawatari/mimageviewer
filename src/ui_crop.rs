@@ -242,6 +242,7 @@ impl App {
         fs_idx: usize,
     ) -> crate::ui_fullscreen::FsKeyAction {
         let action = crate::ui_fullscreen::FsKeyAction {
+            page_transition: Default::default(),
             close: false,
             close_to_page_list: false,
             page_nav: crate::ui_fullscreen::FsPageNav::None,

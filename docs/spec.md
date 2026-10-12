@@ -1,5 +1,24 @@
 # mimageviewer 仕様書
 
+### Everything ファイル名検索（§1.374、実装中・検証待ち）
+
+- mainの一覧で `GlobalEverythingSearch`（Grid / Press / 既定Ctrl+R）、または
+  「ファイル → Everything ファイル名検索…」から開く。閉じる操作は×/Esc。操作カスタマイズで変更/解除できる。
+  text/IME/focus recovery、modal、Remote lock、fullscreen/native動画/detachedからは起動しない。
+- 同じPCで起動中のEverything通常版1.4.1以降の既定clientへ直接IPCする。serviceだけでは利用不可。
+  Everything本体/SDK DLLを同梱せず、named instance選択・Lite・1.5 alphaの専用対応は初版対象外。
+  mIV索引の有効化は不要。queryをそのまま明示送信し、IME確定後Enter/検索ボタンを使う。
+- raw先頭10,000件、offset paging/追加表示なし。folder/非対応形式もraw上限を消費する。
+  返却後に対応形式、表示種類、EPUB/変換書庫設定を適用し、対応候補のstat/編集情報を背景で準備する。
+  取得/準備中はmainの取消可能modal。完了後に一括採用し、取消/失敗は前のaccepted一覧を維持する。
+- flat一覧は通常sort/詳細表示/★/tag/閲覧を共有する。Ctrl+Gの集約/hit-count sort/全文対象フィルタは出さない。
+  ZIP内部entry/PDFページは検索せず外側本体を通常openする。成功した物理childからの帰路は保持datasetの
+  共通prepareで作り、IPCを再送しない。検索を閉じると共通Searchのoriginへ戻る。
+- 新しいSettings field/DB/schema/索引/Remote query endpoint/result共有は追加しない。
+  query/result一覧を永続化・診断ログへ保存せず、通常open/tag/★/cacheの保存と既存F12 viewer機能は維持する。
+  PDF prerequisiteは独立ACCEPT済み `4510346f5`（master `c1e66f589`）。Everything最新実装の独立レビュー、
+  自動gate、確認build、利用者の実Everything確認は未完了。[設計・検証台帳](everything-search-plan.md#14-実装記録2026-10-12検証待ち)。
+
 ### 音声一覧の画像 (§1.347、2026-10-08 決定)
 
 音声の一覧・詳細 hover・mIV Remote は、同じフォルダ / stem の画像、MP3 の埋め込み画像、音楽アイコンの順で表示する。埋め込み画像はファイル先頭の ID3v2 タグ一つだけを読み、前面表紙を優先する。後続 / 末尾タグのみの表紙は対象外で、同名画像で補える。非 MP3 も同名画像を使う。
@@ -623,6 +642,44 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
   track/boundaryは従来の不透明灰色。fill/trackのコントラスト比はLight 7.91 / Dark 6.26、
   fill/選択strokeはLight 2.27 / Dark 1.94。比較と実測は設計書§14へ記録する。
   一覧はメモリ上の記録を参照し、描画から本の走査・ページ数取得・DB 読み取りを行わない。
+
+### 範囲選択の起点 (§1.370、2026-10-11)
+
+サムネイル・詳細一覧とも、範囲を伸ばさないカーソル移動は移動先を次の Shift 選択の起点にする。
+Shift+クリックと Shift+一覧カーソル移動だけは起点を保持する。Shift+キーのチェックは従来どおり
+移動元から移動先までを加算する。Shift+クリックは Explorer 方式では範囲に置換、Check 方式では加算する。
+通常 / Ctrl クリック、右クリック・右ドラッグ開始、キー・パッド・リングによる移動でチェックを
+保持 / 解除する既存規則は維持し、Ctrl 解除で単一選択へ戻った場合の起点は結果のカーソルに合わせる。
+
+カーソルと起点の更新は `apply_grid_cursor_move` の `GridCursorMove::Move / Extend` が所有する。
+App の通常移動入口は `move_grid_cursor`。入力先ごとの起点代入やフレーム末尾の補正は設けない。
+退避一覧の世代なし index も、内部の `apply_grid_cursor_move_indices` で同じ遷移を適用する。
+一覧世代と起点は既存 `GridClickSelectionAnchor` に保持し、Shift 開始時に世代と表示順への所属を検査する。
+起点が失効していれば可視カーソル、可視カーソルもなければ移動対象を起点にする。
+状態の組合せ削減は既存カーソルと起点を同じ遷移で確定することで行う。待機・復旧・新しい pending 状態は不要。
+まれな失敗は既定の割り切り方針（ログ + 通知）による。
+
+| 入口 / 遷移 | 起点の扱い |
+| --- | --- |
+| 全画面のページ送り、先頭 / 末尾 / seek、連続読み、スタックジャンプ、スライドショー、画像 / 動画 / 音声の前後移動、Esc 復帰 | 実際に移したカーソルへ更新。全画面で Shift を使うジャンプも範囲拡張ではない |
+| 見開き調整の metadata / retained 再採用 | 同じページのレイアウト更新では保持。unit 先頭への正規化で別ページへ移る場合だけ `move_grid_cursor` を呼ぶ |
+| 一覧の矢印 / PageUp・Down / Home・End、パッド、リング / ジェスチャの先頭 / 末尾 | 通常移動は更新。Shift 派生キーは保持。既定の Shift 派生は矢印だけで、その他は既存 keymap の完全一致受付を維持 |
+| フォルダ・ZIP / PDF 階層移動、履歴・読書位置・起動先・操作後の選択復元 | 復元したカーソルへ更新 |
+| 検索 / filter / rating / bookmark の表示変更 | 非表示カーソルの近傍移動・初期選択・別一覧の復元は更新。同じ item identity の整数 index 再マップは起点も同じ identity へ保持 |
+| スタック集約 / 展開・Collection / smart folder / サブ展開の一覧 | 新一覧に解決したカーソルへ更新。退避した同じ smart-folder 一覧の復元は保存したカーソル・起点を一緒に復元 |
+| 一覧内削除 | 生き残った同一項目の reindex は保持。カーソル項目の削除による別項目への移動は、同じ数値 index でも更新 |
+| 詳細表示への切替 / 詳細ソート | 表示形式だけでカーソルが動かなければ保持。移動・範囲は `current_grid_order` の表示順で解く |
+| F12 の linked viewer | viewer から別項目へカーソルが動くと更新。同じカーソルの grid → viewer 同期は保持 |
+| F12 独立 / passive / mounted context | 既存 bundle の selected・起点・世代を対で移譲。移動は mounted context 内だけに適用し、兄弟 context を変更しない |
+| Remote | PC へ返す fullscreen restore のカーソルは通常移動。Remote 自身のページ / 読書位置は PC の起点を借用せず、返却時の既存 reload / 復元経路に従う |
+| type-ahead | 現在の一覧には文字によるカーソル移動の実装がない。検索文字入力は検索 / filter の行を参照 |
+
+§1.371 の予定する「評価後に現在ページが非表示なら近傍ページへ移動」も通常移動であり、
+移動先決定後に `move_grid_cursor` を呼べる。通常 `Move` は移動先が既存 selected と同じ整数でも
+起点を確立でき、`sync_main_selection_from_viewer_idx` の同じカーソルへの linked 追従同期とは区別する。
+評価・Undo の移動先決定は §1.371 の所有者に任せ、本修正では変更しない。
+実装の状態 / handler 回帰は `app::grid_cursor_tests`。
+実機 UI は未確認。
 
 ### 3.1 仮想スクロール
 
@@ -1654,7 +1711,7 @@ SW fallback で隠さず再生エラーとして表示する。
 番号 key、日時、サイズが同じ項目は名前昇順で安定させる。サイズが取得できない項目は
 昇順・降順とも同じ行の末尾へ置き、実在する0バイトファイルとは区別する。
 評価順は一覧を開くか明示的に更新した時点の評価で items を並べる。表示中の評価変更は
-バッジとフィルタへ反映し、既存行は動かさない。同値は名前昇順、評価非対応の行は末尾。
+バッジとフィルタへ反映し、表示条件に残る既存行の相対順を保つ。同値は名前昇順、評価非対応の行は末尾。
 未評価の既定位置は★3と★2の間で、設定により評価可能な行の末尾へ変更できる。
 低い順は評価可能な行を完全に逆順にする。Collection、ブックマーク、固定順の一覧、
 本のページ順には評価順を適用しない。Remote の物理フォルダも同じ規則を使う。
@@ -2450,7 +2507,7 @@ typed event の送信だけを行い、前面化しない。受付できない�
 | `vst3_panel_pos` | Option<[f32; 2]> | None | 動画再生中 VST3 パネルの保存位置。表示時に現在の viewport/native overlay 内へクランプ |
 | `minimize_to_tray_on_close` | bool | false | ON のとき [×] で終了せずタスクトレイに常駐する。main の静止画読書（画像のみフォルダ本を含む）を閉じる際、明示一覧 record が現在の本の親一覧なら既存の親戻りでそこへ戻し、record と読書位置を保持する。判定は採用済みの一覧に基づき、読書中の画像フォルダ自動オープン設定変更には依存しない。本一覧を明示済みならその一覧に留まる。tray 復帰は起動復元を実行しない。通常 fullscreen / in-window / F12 別窓 / ParkedLive の viewport と native presenter は同じ identity のまま hidden にし、動画、動画→音声モード、単体音楽の running / paused / EOF transport state を変更しない。hidden presenter は decode queue を drain して最新 frame を保持し、復帰で viewport と presenter を visible に戻すため再生中ならそのまま映像が再開する。detached / switching session と typed placement request は維持し、復帰時の外部フォルダ変更でも context を退避してから一覧へ反映する。復帰の `ShowWindow` で main focus が一時的に戻っても session は閉じない。mounted context の非 media texture とアイドル GPU 動画プールは解放するが、detached active viewer cache、稼働中 decoder / presenter / GPU frame、VST3 プラグインチェーンは保持するため、常駐中も動画 decode の CPU/GPU/電力コストを負う |
 | `network_data_dir_notice_dismissed_for` | Option\<String\> | None | ネットワーク上の data_dir に関する起動案内を「この保存先では今後表示しない」で抑止したパス。Windows の区切り・大文字小文字・通常 UNC / verbatim UNC の同値表記を正規化して比較し、別の保存先なら再案内する |
-| `skip_offline_change_scan` | bool | false | 起動時に mIV を終了していた間の変更を確認しない。完全に作成した索引と対象条件が同じ場合だけ初回確認を省く。終了中の追加・削除・移動や途中終了による未反映は [今すぐ確認] で反映する。お気に入り編集とライブラリ > 検索インデックスページが同じ値を編集し、次回起動から有効 |
+| `skip_offline_change_scan` | bool | false | 起動時に mIV を終了していた間の変更を確認しない。完全に作成した索引と対象条件が同じ場合だけ初回確認を省く。終了中の追加・削除・移動等は [今すぐ確認] の差分確認で反映する。ただし SQLite の署名が変わらない Ok に対応する全文文書の欠落は Full で検出できない。お気に入り編集とライブラリ > 検索インデックスページが同じ値を編集し、次回起動から有効 |
 | `pause_indexer_while_minimized` | bool | false | タスクトレイ常駐中にファイル監視 / インデックス更新を一時停止する。OFF でも常駐中は I/O 並列度を絞る |
 | `folder_thumb_sort` | SortOrder | FileName | フォルダ代表画像の自動選定順。通常一覧の `sort_order` とは独立して設定できる。FileName / Numeric / DateAsc / DateDesc |
 | `folder_thumb_depth` | u32 | 3 | フォルダ代表画像の探索最大階層数（0 で直接の子のみ） |
@@ -2582,6 +2639,19 @@ mIV Remote のホーム「検索」タブは Ctrl+S と同じコンテナ索引�
 お気に入り全体のフォルダ / ZIP / PDF を名前と種類で検索する。画像単体・動画は対象外。
 コンテナ索引が無効な場合と、索引が未作成または一時的に読めない場合は、0 件とは別の状態として表示する。
 
+お気に入り編集のコンテナ索引/アイテム索引は、監視開始と最後の Full の成功を区別する。
+Full の型付き結果が Failed なら「作成失敗」、FTS の不完全観測は「確認未完了」、取消は
+「確認中止」、新しい Full 実行中は「スキャン中」。正常完走・正常な確認省略は「監視中」を維持する。
+FTS の commit/reload/SQLite apply/cleanup と実行由来の自動 merge 永続化失敗は通知し、
+共有 maintenance snapshot に次回起動の索引再構築予約 (予約自体の失敗も) を表示する。
+今の session で wipe/reopen せず、次回起動に SQLite inventory/scan印の reset と pending を先に
+durable commit してから Tantivy を作り直す。ユーザー作成のタグ/評価等の別 DB は変更しない。
+名前索引の Full 失敗表示も訂正するが、名前 DB の書込失敗を通知/既存 rebuild marker へ揃える
+対応は [§1.369](next-release-backlog.md) の別件。FTS の marker を名前索引へ適用しない。
+起動 count 点検は既存 worker で常時実行する。管理情報の Ok 件数より生存全文文書が少ない場合は
+同じ通知・次回再構築予約へ進む。今の session で索引を消さず、件数一致を完全整合の保証にしない。
+利用者承認の軽量A/Bによる採用判断と測定範囲は [FTS 整合計画 §7.4](fts-integrity-plan.md#74-起動点検の採用判断-2026-10-11) を参照。
+
 mIV Remote のドライブ一覧 / 閲覧履歴 / ブックマーク / 本棚 / レーティング / スマートフォルダで
 通常画像を開いた場合は、実親フォルダへ移動せず元のフラット一覧全体を読み順として維持する。
 画像だけを本体と同じ単ページ・見開き規則で組み、異なる実親フォルダの画像間でも連続してページを
@@ -2658,6 +2728,12 @@ AI 生成メタデータが含まれる場合、**Negative Prompt は検索対�
     (対応表が 2 つあると、同じ★を押しているのに入口で結果が変わる)
   - ページ・コンテナ両方に同じフィルタが適用される (フォルダ一覧を★絞り込みできる)
   - 検索フィルタと AND 結合
+  - 評価変更で選択中の項目が条件から外れた場合は、現在の一覧の表示順で次の残存項目、なければ前の残存項目へ選択を移す。残存項目がなければ選択を解除する。履歴復元等の一般的な選択補正は変更しない
+  - フルスクリーンで現在ページが条件から外れた場合は、読む順の次の残存ページ、なければ前の残存ページへ移る。「次」は右→左でも読む順で決まり、左右キーの向きでは反転しない。ページが残らなければ現在の絞り込み済みページ一覧へ戻る。親フォルダへ自動移動せず、フィルタも解除しない
+  - 評価の通知と評価 Undo は自動移動・一覧復帰後も保持する。直後の Ctrl+Z は評価を戻し、同じ一覧・条件で元画像が再び対象になる場合は元画像へ戻る。対象の消失やほかの条件で復帰できない場合は値だけを戻して通知し、条件を解除したり閉じたウィンドウを再作成したりしない
+  - グリッドでも、評価Undoで元項目が現在一覧に再表示される場合は元項目へカーソルとShift+クリック起点を戻す。Redoも対象が再表示される場合は同じ規則を適用する。評価後にクリック・キー・パッド・右ドラッグ開始時の選択・リング移動や検索・絞り込み条件変更で明示選択した場合（端のno-opも含む）は、その選択を優先し復帰を取消す。対象が非表示のままなら値のみ戻し、サムネイル/詳細で同じ規則とする
+  - マウス / ゲームパッドのピッカーでは★の変更を保存・プレビューしながら、そのプレビューだけで条件から外れる既存項目を終了まで表示集合に残す。現在ページとほかの項目のプレビューを維持し、終了時に最終成功値で上記の移動を一度決める。途中で届く検索ヒット・件数・明示ソートは通常どおり更新する。削除や非評価条件による離脱まで保留しない
+  - 集合採用・Undo・ピッカーの所有境界は [評価変更と絞り込み](rating-filter-fullscreen-plan.md) を参照。Shift+クリック起点の適用は別件 §1.370 の cursor owner に接続し、本節で再実装しない
 - レーティング一覧:
   - ファイルメニューの「レーティング一覧」と、アドレスバー「場所▼」の「レーティング」から
     ★1〜★5 を選ぶと、その★が付いたアイテム / コンテナを場所横断でフラット表示する
@@ -3042,7 +3118,7 @@ SourceURL と画像候補のある HTML を検出して小窓へ通知する。�
 - [x] `FavoriteEntry` に `id: Uuid` + `auto_index_{structure,metadata,thumbs}` 3 フラグ追加
 - [x] お気に入り編集 / 追加ダイアログに 3 つのチェックボックス + 一括 ON/OFF
 - [x] FsWatcher (notify-rs ReadDirectoryChangesW) + 500ms debounce
-- [x] Walker (3-way diff) + IngestSession (Tantivy First 書き込み) + IndexerSupervisor (統括)
+- [x] Walker (FS ↔ SQLite を追加・変更・削除へ分類) + IngestSession (Tantivy First 書き込み) + IndexerSupervisor (統括)
 - [x] 起動時 reconciliation (status != ok の残留行を整理)
 - [x] `GlobalIoSemaphore` で UI 優先度制御 (Low/Normal/High)
 - [x] PDFium document info (Title / Author / Subject / Keywords) 取り込み

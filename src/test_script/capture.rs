@@ -4,16 +4,15 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
-use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use super::evidence_path::no_reparse_directory as no_reparse;
 use super::{TestScriptWindowPresentation, TestScriptWindowSnapshot};
 use eframe::egui;
 use image::ImageEncoder;
 
-const REPARSE_POINT: u32 = 0x400;
 pub(super) const EXPLICIT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) const FAILURE_TIMEOUT: Duration = Duration::from_millis(1500);
 const MAX_CAPTURES: u64 = 64;
@@ -88,35 +87,6 @@ pub(super) struct Coordinator {
     write_rx: mpsc::Receiver<WriteResult>,
 }
 
-fn no_reparse(path: &Path) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
-    if !metadata.is_dir() || metadata.file_attributes() & REPARSE_POINT != 0 {
-        return Err(format!(
-            "refusing non-directory or reparse point: {}",
-            path.display()
-        ));
-    }
-    Ok(())
-}
-
-fn validate_run_dir_under(runs_root: &Path, run_dir: &Path) -> Result<PathBuf, String> {
-    no_reparse(runs_root)?;
-    no_reparse(run_dir)?;
-    let root = fs::canonicalize(runs_root)
-        .map_err(|error| format!("cannot resolve screenshot runs root: {error}"))?;
-    let run = fs::canonicalize(run_dir)
-        .map_err(|error| format!("cannot resolve screenshot run directory: {error}"))?;
-    if run.parent() != Some(root.as_path()) {
-        return Err(format!(
-            "screenshot directory must be one run below {}: {}",
-            root.display(),
-            run.display()
-        ));
-    }
-    Ok(run)
-}
-
 fn native_readiness(target: &Target) -> Result<Readiness, String> {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindow, IsWindowVisible};
@@ -162,10 +132,7 @@ fn request_capture_repaint(ctx: &egui::Context, target: &Target) -> Result<(), S
 impl Coordinator {
     pub(super) fn new(run_dir: &Path) -> Result<Self, String> {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
-        no_reparse(repository)?;
-        no_reparse(&repository.join("target"))?;
-        let runs_root = repository.join("target").join("ui-smoke-runs");
-        let run = validate_run_dir_under(&runs_root, run_dir)?;
+        let run = super::evidence_path::validate_directory(repository, run_dir)?;
         let dir = run.join("screenshots");
         fs::create_dir(&dir)
             .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
@@ -686,22 +653,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(*requests.lock().unwrap(), vec![deferred]);
-    }
-
-    #[test]
-    fn evidence_path_accepts_only_direct_run_children() {
-        let temp = tempfile::tempdir().unwrap();
-        let runs = temp.path().join("ui-smoke-runs");
-        let run = runs.join("one-run");
-        let nested = run.join("nested");
-        fs::create_dir_all(&nested).unwrap();
-        assert_eq!(
-            validate_run_dir_under(&runs, &run).unwrap(),
-            fs::canonicalize(&run).unwrap()
-        );
-        assert!(validate_run_dir_under(&runs, &nested).is_err());
-        assert!(validate_run_dir_under(&runs, temp.path()).is_err());
-        assert!(validate_run_dir_under(&runs, &runs).is_err());
     }
 
     #[test]

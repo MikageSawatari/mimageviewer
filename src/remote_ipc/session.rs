@@ -82,7 +82,20 @@ impl RemoteControlPhase {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct RemoteControlLifecycle {
-    phase: RemoteControlPhase,
+    owner: RemoteControlOwner,
+}
+
+/// Local modal work and a Remote owner are mutually exclusive at the same boundary.
+/// The public phase remains Local during a local modal: it does not grant Remote
+/// ownership, suppress sibling local viewers, or extend the Remote wire protocol.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RemoteControlOwner {
+    #[default]
+    Local,
+    LocalModal(u64),
+    AcquiringRemote,
+    RemoteActive,
+    DrainingRemote,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,29 +113,57 @@ struct RemoteControlTransitionError {
 }
 
 impl RemoteControlLifecycle {
+    fn phase(self) -> RemoteControlPhase {
+        match self.owner {
+            RemoteControlOwner::Local | RemoteControlOwner::LocalModal(_) => {
+                RemoteControlPhase::Local
+            }
+            RemoteControlOwner::AcquiringRemote => RemoteControlPhase::AcquiringRemote,
+            RemoteControlOwner::RemoteActive => RemoteControlPhase::RemoteActive,
+            RemoteControlOwner::DrainingRemote => RemoteControlPhase::DrainingRemote,
+        }
+    }
+
+    fn begin_local_modal(&mut self, lease_id: u64) -> bool {
+        if self.owner != RemoteControlOwner::Local {
+            return false;
+        }
+        self.owner = RemoteControlOwner::LocalModal(lease_id);
+        true
+    }
+
+    fn end_local_modal(&mut self, lease_id: u64) {
+        if self.owner == RemoteControlOwner::LocalModal(lease_id) {
+            self.owner = RemoteControlOwner::Local;
+        }
+    }
+
     fn transition(
         &mut self,
         transition: RemoteControlTransition,
     ) -> Result<(), RemoteControlTransitionError> {
-        let next = match (self.phase, transition) {
-            (RemoteControlPhase::Local, RemoteControlTransition::BeginAcquire) => {
-                RemoteControlPhase::AcquiringRemote
+        let next = match (self.owner, transition) {
+            (RemoteControlOwner::Local, RemoteControlTransition::BeginAcquire) => {
+                RemoteControlOwner::AcquiringRemote
             }
-            (RemoteControlPhase::AcquiringRemote, RemoteControlTransition::FinishAcquire) => {
-                RemoteControlPhase::RemoteActive
+            (RemoteControlOwner::AcquiringRemote, RemoteControlTransition::FinishAcquire) => {
+                RemoteControlOwner::RemoteActive
             }
             (
-                RemoteControlPhase::AcquiringRemote | RemoteControlPhase::RemoteActive,
+                RemoteControlOwner::AcquiringRemote | RemoteControlOwner::RemoteActive,
                 RemoteControlTransition::BeginDrain,
-            ) => RemoteControlPhase::DrainingRemote,
-            (RemoteControlPhase::DrainingRemote, RemoteControlTransition::FinishDrain) => {
-                RemoteControlPhase::Local
+            ) => RemoteControlOwner::DrainingRemote,
+            (RemoteControlOwner::DrainingRemote, RemoteControlTransition::FinishDrain) => {
+                RemoteControlOwner::Local
             }
-            (phase, transition) => {
-                return Err(RemoteControlTransitionError { phase, transition });
+            (_, transition) => {
+                return Err(RemoteControlTransitionError {
+                    phase: self.phase(),
+                    transition,
+                });
             }
         };
-        self.phase = next;
+        self.owner = next;
         Ok(())
     }
 }
@@ -249,6 +290,7 @@ struct SessionStateMachine {
     generation: u64,
     next_operation: u64,
     next_streaming_registration: u64,
+    next_local_modal_lease: u64,
     acquisition_sequence: u64,
     #[cfg(windows)]
     gui_gate: Option<Weak<crate::effetune::gui_gate::GuiGate>>,
@@ -273,6 +315,7 @@ impl Default for SessionStateMachine {
             generation: 0,
             next_operation: 1,
             next_streaming_registration: 1,
+            next_local_modal_lease: 1,
             acquisition_sequence: 0,
             #[cfg(windows)]
             gui_gate: None,
@@ -299,7 +342,7 @@ impl SessionStateMachine {
         if let Some(gate) = self.gui_gate.as_ref().and_then(Weak::upgrade) {
             gate.publish_remote_with_revision(
                 Some(self.acquisition_sequence),
-                self.lifecycle.phase.blocks_local_control(),
+                self.lifecycle.phase().blocks_local_control(),
                 transition == RemoteControlTransition::BeginAcquire,
             );
         }
@@ -315,7 +358,13 @@ impl SessionStateMachine {
         if self.app_retired {
             return session_closing_response();
         }
-        match self.lifecycle.phase {
+        if matches!(self.lifecycle.owner, RemoteControlOwner::LocalModal(_)) {
+            return status_response(
+                SessionStatus::LocalInUse,
+                "本体で処理中です。処理が終了してから再接続してください。",
+            );
+        }
+        match self.lifecycle.phase() {
             // The previous owner's resources still belong to that drain. A new acquire is a
             // waiter, not a second BeginDrain transition, and must not replace its reason.
             RemoteControlPhase::DrainingRemote => return session_closing_response(),
@@ -390,7 +439,7 @@ impl SessionStateMachine {
 
     fn abort_acquire_barrier(&mut self, generation: u64, now: Duration) -> bool {
         if generation != self.generation
-            || self.lifecycle.phase != RemoteControlPhase::AcquiringRemote
+            || self.lifecycle.phase() != RemoteControlPhase::AcquiringRemote
         {
             return false;
         }
@@ -410,7 +459,7 @@ impl SessionStateMachine {
                 "この接続の操作権は無効です。再接続してください。",
             );
         }
-        if self.lifecycle.phase == RemoteControlPhase::DrainingRemote {
+        if self.lifecycle.phase() == RemoteControlPhase::DrainingRemote {
             return self.draining_owner_response();
         }
         let active = self
@@ -437,7 +486,7 @@ impl SessionStateMachine {
                 "この接続の操作権は無効です。再接続してください。",
             );
         }
-        if self.lifecycle.phase != RemoteControlPhase::DrainingRemote {
+        if self.lifecycle.phase() != RemoteControlPhase::DrainingRemote {
             self.begin_drain(ReleaseReason::Logout, now);
         }
         self.draining_owner_response()
@@ -449,7 +498,7 @@ impl SessionStateMachine {
         };
         if active.client_id != owner.client_id
             || active.session_id != owner.session_id
-            || self.lifecycle.phase == RemoteControlPhase::DrainingRemote
+            || self.lifecycle.phase() == RemoteControlPhase::DrainingRemote
         {
             return false;
         }
@@ -475,7 +524,7 @@ impl SessionStateMachine {
                 "この接続の操作権は無効です。再接続してください。",
             ));
         }
-        if self.lifecycle.phase == RemoteControlPhase::DrainingRemote {
+        if self.lifecycle.phase() == RemoteControlPhase::DrainingRemote {
             return Err(self.draining_owner_response());
         }
         let active = self
@@ -524,7 +573,7 @@ impl SessionStateMachine {
                 "この接続の操作権は無効です。再接続してください。",
             ));
         }
-        if !self.lifecycle.phase.accepts_remote_work() {
+        if !self.lifecycle.phase().accepts_remote_work() {
             return Err(self.draining_owner_response());
         }
         let active = self
@@ -544,7 +593,7 @@ impl SessionStateMachine {
         cancel: Arc<AtomicBool>,
     ) -> Result<u64, SessionResponse> {
         self.expire(now);
-        if !self.lifecycle.phase.accepts_remote_work() {
+        if !self.lifecycle.phase().accepts_remote_work() {
             return Err(self.draining_owner_response());
         }
         let Some(active) = self.active.as_mut() else {
@@ -639,7 +688,7 @@ impl SessionStateMachine {
     }
 
     fn start_operation(&mut self, generation: u64, token: u64) -> bool {
-        if self.lifecycle.phase.accepts_remote_work()
+        if self.lifecycle.phase().accepts_remote_work()
             && generation == self.generation
             && let Some(operation) = self
                 .active
@@ -756,7 +805,7 @@ impl SessionStateMachine {
         let newly_retired = !self.app_retired;
         self.app_retired = true;
         if matches!(
-            self.lifecycle.phase,
+            self.lifecycle.phase(),
             RemoteControlPhase::AcquiringRemote | RemoteControlPhase::RemoteActive
         ) {
             self.begin_drain(ReleaseReason::Local, now);
@@ -768,7 +817,7 @@ impl SessionStateMachine {
         &mut self,
         now: Duration,
     ) -> Option<(ReleaseReason, Duration, bool, usize, usize, usize)> {
-        if self.lifecycle.phase != RemoteControlPhase::DrainingRemote {
+        if self.lifecycle.phase() != RemoteControlPhase::DrainingRemote {
             return None;
         }
         let elapsed = now.saturating_sub(self.drain_started_at?);
@@ -791,7 +840,7 @@ impl SessionStateMachine {
 
     fn complete_app_drain(&mut self, generation: u64) -> bool {
         if generation != self.generation
-            || self.lifecycle.phase != RemoteControlPhase::DrainingRemote
+            || self.lifecycle.phase() != RemoteControlPhase::DrainingRemote
         {
             return false;
         }
@@ -800,7 +849,7 @@ impl SessionStateMachine {
     }
 
     fn try_finish_drain(&mut self) -> bool {
-        if self.lifecycle.phase != RemoteControlPhase::DrainingRemote
+        if self.lifecycle.phase() != RemoteControlPhase::DrainingRemote
             || !self.app_drain_complete
             || self.active.as_ref().is_some_and(|active| {
                 !active.operations.is_empty() || !active.streaming_workers.is_empty()
@@ -894,7 +943,7 @@ impl SessionStateMachine {
                 .is_some_and(|streaming| streaming.playing),
         });
         SessionSnapshot {
-            phase: self.lifecycle.phase,
+            phase: self.lifecycle.phase(),
             generation: self.generation,
             active,
             acquisition_sequence: self.acquisition_sequence,
@@ -1214,6 +1263,26 @@ impl RemoteAiExecutionBridge {
     }
 }
 
+/// Sole release authority for one admitted local modal. It is never cloned into a
+/// worker or sibling viewer; dropping the App request immediately restores admission.
+#[derive(Debug)]
+pub(crate) struct LocalModalLease {
+    state: Weak<Mutex<SessionStateMachine>>,
+    lease_id: u64,
+}
+
+impl Drop for LocalModalLease {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.upgrade() {
+            state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .lifecycle
+                .end_local_modal(self.lease_id);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct SessionHandle {
     inner: Arc<Mutex<SessionStateMachine>>,
@@ -1389,6 +1458,25 @@ impl ClaimedVideoStreamUiRequest {
 }
 
 impl SessionHandle {
+    /// Linearizes local modal admission against BeginAcquire under the existing short
+    /// session mutex. No waiting/retry, OS work, or notifications run inside this lock.
+    pub(crate) fn try_local_modal_lease(&self) -> Option<LocalModalLease> {
+        let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        if state.app_retired {
+            return None;
+        }
+        let lease_id = state.next_local_modal_lease;
+        let next = lease_id.checked_add(1)?;
+        if !state.lifecycle.begin_local_modal(lease_id) {
+            return None;
+        }
+        state.next_local_modal_lease = next;
+        Some(LocalModalLease {
+            state: Arc::downgrade(&self.inner),
+            lease_id,
+        })
+    }
+
     #[cfg(windows)]
     pub(crate) fn set_gui_gate(&self, gate: Option<Arc<crate::effetune::gui_gate::GuiGate>>) {
         let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
@@ -1400,7 +1488,7 @@ impl SessionHandle {
             gate.invalidate_auto();
             gate.publish_remote(
                 Some(state.acquisition_sequence),
-                state.lifecycle.phase.blocks_local_control(),
+                state.lifecycle.phase().blocks_local_control(),
             );
         }
         state.gui_gate = gate.map(|gate| Arc::downgrade(&gate));
@@ -1557,10 +1645,10 @@ impl SessionHandle {
             .unwrap_or(u64::MAX);
         let (response, phase_changed, generation_changed, drain_reason) = {
             let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-            let phase = state.lifecycle.phase;
+            let phase = state.lifecycle.phase();
             let generation = state.generation;
             let response = state.acquire(self.now(), connected_unix_ms, request);
-            let next_phase = state.lifecycle.phase;
+            let next_phase = state.lifecycle.phase();
             (
                 response,
                 next_phase != phase,
@@ -1603,9 +1691,9 @@ impl SessionHandle {
             if has_nonterminal_long_job {
                 state.note_long_job_client_seen(self.now(), &request.owner);
             }
-            let phase = state.lifecycle.phase;
+            let phase = state.lifecycle.phase();
             let response = state.ping(self.now(), request);
-            (response, state.lifecycle.phase != phase)
+            (response, state.lifecycle.phase() != phase)
         };
         if phase_changed {
             self.close_ui_request_admission();
@@ -1620,9 +1708,9 @@ impl SessionHandle {
     pub(crate) fn logout(&self, owner: &RemoteSessionIdentity) -> SessionResponse {
         let (response, phase_changed) = {
             let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-            let phase = state.lifecycle.phase;
+            let phase = state.lifecycle.phase();
             let response = state.logout(self.now(), owner);
-            (response, state.lifecycle.phase != phase)
+            (response, state.lifecycle.phase() != phase)
         };
         if phase_changed {
             self.close_ui_request_admission();
@@ -1646,9 +1734,9 @@ impl SessionHandle {
             if has_nonterminal_long_job {
                 state.note_long_job_client_seen(self.now(), owner);
             }
-            let phase = state.lifecycle.phase;
+            let phase = state.lifecycle.phase();
             let result = state.begin_operation(self.now(), owner, description);
-            (result, state.lifecycle.phase != phase)
+            (result, state.lifecycle.phase() != phase)
         };
         if phase_changed {
             self.close_ui_request_admission();
@@ -1857,12 +1945,12 @@ impl SessionHandle {
         self.close_ui_request_admission();
         let (generation, began_drain, newly_retired) = {
             let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-            let before = state.lifecycle.phase;
+            let before = state.lifecycle.phase();
             let newly_retired = state.retire_app(self.now());
             (
                 state.generation,
-                before != state.lifecycle.phase
-                    && state.lifecycle.phase == RemoteControlPhase::DrainingRemote,
+                before != state.lifecycle.phase()
+                    && state.lifecycle.phase() == RemoteControlPhase::DrainingRemote,
                 newly_retired,
             )
         };
@@ -2272,9 +2360,9 @@ impl SessionHandle {
         let has_nonterminal_long_job = self.has_nonterminal_long_jobs();
         let (reason, phase_changed) = {
             let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-            let phase = state.lifecycle.phase;
+            let phase = state.lifecycle.phase();
             let reason = state.expire_with_long_jobs(self.now(), has_nonterminal_long_job);
-            (reason, state.lifecycle.phase != phase)
+            (reason, state.lifecycle.phase() != phase)
         };
         if reason.is_some() {
             self.clear_video_stream(None);
@@ -2321,7 +2409,7 @@ impl RemoteSessionOwner {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         state.generation == self.generation
-            && state.lifecycle.phase.accepts_remote_work()
+            && state.lifecycle.phase().accepts_remote_work()
             && state
                 .active
                 .as_ref()
@@ -2531,7 +2619,7 @@ impl SessionOperation {
                 {
                     Some(Err(state.inactive_response(&self.owner.client_id)))
                 } else {
-                    match state.lifecycle.phase {
+                    match state.lifecycle.phase() {
                         RemoteControlPhase::RemoteActive => Some(Ok(())),
                         RemoteControlPhase::DrainingRemote | RemoteControlPhase::Local => {
                             Some(Err(state.draining_owner_response()))
@@ -2568,7 +2656,7 @@ impl SessionOperation {
                 {
                     Some(Err(state.inactive_response(&self.owner.client_id)))
                 } else {
-                    match state.lifecycle.phase {
+                    match state.lifecycle.phase() {
                         RemoteControlPhase::RemoteActive => Some(Ok(true)),
                         RemoteControlPhase::DrainingRemote | RemoteControlPhase::Local => {
                             Some(Err(state.draining_owner_response()))
@@ -2606,7 +2694,7 @@ impl SessionOperation {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if state.generation != self.generation
-            || state.lifecycle.phase != RemoteControlPhase::DrainingRemote
+            || state.lifecycle.phase() != RemoteControlPhase::DrainingRemote
         {
             return None;
         }
@@ -2651,7 +2739,7 @@ impl SessionOperation {
                 if state.generation == self.generation
                     && active.client_id == self.owner.client_id
                     && active.session_id == self.owner.session_id
-                    && state.lifecycle.phase != RemoteControlPhase::DrainingRemote =>
+                    && state.lifecycle.phase() != RemoteControlPhase::DrainingRemote =>
             {
                 SessionResponse::active(active.session_id.clone())
             }
@@ -2884,6 +2972,120 @@ mod tests {
             connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
             device_name: Some("phone".to_owned()),
         }
+    }
+
+    #[test]
+    fn local_modal_lease_blocks_acquire_without_publishing_remote_ownership() {
+        let handle = SessionHandle::new();
+        let before = handle.snapshot();
+        let lease = handle
+            .try_local_modal_lease()
+            .expect("local owns admission");
+        assert!(handle.try_local_modal_lease().is_none());
+        let during = handle.snapshot();
+        assert_eq!(during.phase, RemoteControlPhase::Local);
+        assert!(during.active.is_none());
+        assert_eq!(during.acquisition_sequence, before.acquisition_sequence);
+        assert_eq!(
+            during.control_return_sequence,
+            before.control_return_sequence
+        );
+        let request = SessionAcquireRequest {
+            client_id: "client".to_owned(),
+            peer: peer(),
+        };
+        assert_eq!(
+            handle.acquire(request.clone()).status,
+            SessionStatus::LocalInUse
+        );
+        assert_eq!(handle.snapshot().generation, before.generation);
+        drop(lease);
+        assert_eq!(handle.acquire(request).status, SessionStatus::Active);
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::AcquiringRemote);
+        assert_eq!(
+            handle.snapshot().acquisition_sequence,
+            before.acquisition_sequence + 1
+        );
+    }
+
+    #[test]
+    fn remote_acquire_and_drain_deny_local_modal_until_return_to_local() {
+        let handle = SessionHandle::new();
+        handle.acquire(SessionAcquireRequest {
+            client_id: "client".to_owned(),
+            peer: peer(),
+        });
+        assert!(handle.try_local_modal_lease().is_none());
+        let generation = handle.snapshot().generation;
+        assert!(handle.finish_acquire(generation));
+        assert!(handle.try_local_modal_lease().is_none());
+        handle.local_disconnect();
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::DrainingRemote);
+        assert!(handle.try_local_modal_lease().is_none());
+        assert!(handle.complete_app_drain(generation));
+        assert!(handle.try_local_modal_lease().is_some());
+    }
+
+    #[test]
+    fn stale_local_modal_drop_cannot_release_a_new_lease() {
+        let handle = SessionHandle::new();
+        let old = handle.try_local_modal_lease().unwrap();
+        // Simulate a completed owner retaining its RAII value until a later drop.
+        // Production callers have one non-Clone lease and cannot duplicate it.
+        handle
+            .inner
+            .lock()
+            .unwrap()
+            .lifecycle
+            .end_local_modal(old.lease_id);
+        let new = handle.try_local_modal_lease().unwrap();
+        assert_ne!(old.lease_id, new.lease_id);
+        drop(old);
+        assert!(handle.try_local_modal_lease().is_none());
+        assert_eq!(
+            handle
+                .acquire(SessionAcquireRequest {
+                    client_id: "client".to_owned(),
+                    peer: peer(),
+                })
+                .status,
+            SessionStatus::LocalInUse
+        );
+        drop(new);
+        assert!(handle.try_local_modal_lease().is_some());
+    }
+
+    #[test]
+    fn retired_admission_stays_absorbing_after_local_modal_drop() {
+        let handle = SessionHandle::new();
+        let lease = handle.try_local_modal_lease().unwrap();
+        handle.retire_app_admission();
+        drop(lease);
+        assert!(handle.try_local_modal_lease().is_none());
+        assert_eq!(
+            handle
+                .acquire(SessionAcquireRequest {
+                    client_id: "client".to_owned(),
+                    peer: peer(),
+                })
+                .status,
+            SessionStatus::LocalInUse
+        );
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.phase, RemoteControlPhase::Local);
+        assert!(snapshot.active.is_none());
+        assert_eq!(snapshot.acquisition_sequence, 0);
+    }
+
+    #[test]
+    fn local_modal_lease_ids_never_wrap_or_reuse() {
+        let handle = SessionHandle::new();
+        handle.inner.lock().unwrap().next_local_modal_lease = u64::MAX;
+        assert!(handle.try_local_modal_lease().is_none());
+        assert_eq!(
+            handle.inner.lock().unwrap().lifecycle.owner,
+            RemoteControlOwner::Local
+        );
     }
 
     #[test]
@@ -3136,37 +3338,37 @@ mod tests {
     #[test]
     fn remote_control_lifecycle_has_one_valid_linear_path() {
         let mut lifecycle = RemoteControlLifecycle::default();
-        assert_eq!(lifecycle.phase, RemoteControlPhase::Local);
-        assert!(!lifecycle.phase.blocks_local_control());
+        assert_eq!(lifecycle.phase(), RemoteControlPhase::Local);
+        assert!(!lifecycle.phase().blocks_local_control());
         assert!(
             lifecycle
                 .transition(RemoteControlTransition::BeginAcquire)
                 .is_ok()
         );
-        assert_eq!(lifecycle.phase, RemoteControlPhase::AcquiringRemote);
-        assert!(lifecycle.phase.blocks_local_control());
-        assert!(!lifecycle.phase.accepts_remote_work());
+        assert_eq!(lifecycle.phase(), RemoteControlPhase::AcquiringRemote);
+        assert!(lifecycle.phase().blocks_local_control());
+        assert!(!lifecycle.phase().accepts_remote_work());
         assert!(
             lifecycle
                 .transition(RemoteControlTransition::FinishAcquire)
                 .is_ok()
         );
-        assert_eq!(lifecycle.phase, RemoteControlPhase::RemoteActive);
-        assert!(lifecycle.phase.accepts_remote_work());
+        assert_eq!(lifecycle.phase(), RemoteControlPhase::RemoteActive);
+        assert!(lifecycle.phase().accepts_remote_work());
         assert!(
             lifecycle
                 .transition(RemoteControlTransition::BeginDrain)
                 .is_ok()
         );
-        assert_eq!(lifecycle.phase, RemoteControlPhase::DrainingRemote);
-        assert!(lifecycle.phase.blocks_local_control());
-        assert!(!lifecycle.phase.accepts_remote_work());
+        assert_eq!(lifecycle.phase(), RemoteControlPhase::DrainingRemote);
+        assert!(lifecycle.phase().blocks_local_control());
+        assert!(!lifecycle.phase().accepts_remote_work());
         assert!(
             lifecycle
                 .transition(RemoteControlTransition::FinishDrain)
                 .is_ok()
         );
-        assert_eq!(lifecycle.phase, RemoteControlPhase::Local);
+        assert_eq!(lifecycle.phase(), RemoteControlPhase::Local);
     }
 
     #[test]
@@ -3230,7 +3432,7 @@ mod tests {
         acquire(&mut state, Duration::ZERO);
 
         assert_eq!(state.expire_with_long_jobs(LIVENESS_TIMEOUT, true), None);
-        assert_eq!(state.lifecycle.phase, RemoteControlPhase::RemoteActive);
+        assert_eq!(state.lifecycle.phase(), RemoteControlPhase::RemoteActive);
         assert!(matches!(
             state.active.as_ref().map(|active| active.presence),
             Some(RemoteClientPresence::Detached { .. })
@@ -3242,7 +3444,7 @@ mod tests {
             state.active.as_ref().map(|active| active.presence),
             Some(RemoteClientPresence::Foreground)
         ));
-        assert_eq!(state.lifecycle.phase, RemoteControlPhase::RemoteActive);
+        assert_eq!(state.lifecycle.phase(), RemoteControlPhase::RemoteActive);
     }
 
     #[test]
@@ -3254,7 +3456,7 @@ mod tests {
             state.expire_with_long_jobs(IDLE_TIMEOUT, true),
             Some(ReleaseReason::BackgroundExpired)
         );
-        assert_eq!(state.lifecycle.phase, RemoteControlPhase::DrainingRemote);
+        assert_eq!(state.lifecycle.phase(), RemoteControlPhase::DrainingRemote);
         assert_eq!(state.drain_reason, Some(ReleaseReason::BackgroundExpired));
     }
 
@@ -3271,8 +3473,8 @@ mod tests {
         let _detached_payload = state.active.take().expect("active session payload");
 
         assert!(state.complete_app_drain(draining_generation));
-        assert_eq!(state.lifecycle.phase, RemoteControlPhase::Local);
-        assert!(!state.lifecycle.phase.blocks_local_control());
+        assert_eq!(state.lifecycle.phase(), RemoteControlPhase::Local);
+        assert!(!state.lifecycle.phase().blocks_local_control());
         assert_eq!(
             state.control_return_sequence,
             control_before.wrapping_add(1)
@@ -3280,7 +3482,7 @@ mod tests {
 
         let released_generation = state.generation;
         assert!(!state.complete_app_drain(released_generation));
-        assert_eq!(state.lifecycle.phase, RemoteControlPhase::Local);
+        assert_eq!(state.lifecycle.phase(), RemoteControlPhase::Local);
         assert_eq!(
             state.control_return_sequence,
             control_before.wrapping_add(1),
@@ -3406,7 +3608,7 @@ mod tests {
                 .status,
             SessionStatus::Expired
         );
-        assert_eq!(state.lifecycle.phase, RemoteControlPhase::DrainingRemote);
+        assert_eq!(state.lifecycle.phase(), RemoteControlPhase::DrainingRemote);
         assert_eq!(state.drain_reason, Some(ReleaseReason::LivenessTimeout));
         assert!(state.active.is_some());
         assert!(state.complete_app_drain(state.generation));
@@ -3485,10 +3687,10 @@ mod tests {
         state.local_disconnect();
 
         assert!(cancel.load(Ordering::Acquire));
-        assert_eq!(state.lifecycle.phase, RemoteControlPhase::DrainingRemote);
+        assert_eq!(state.lifecycle.phase(), RemoteControlPhase::DrainingRemote);
         assert!(state.active.is_some());
         assert!(!state.complete_app_drain(state.generation));
-        assert_eq!(state.lifecycle.phase, RemoteControlPhase::DrainingRemote);
+        assert_eq!(state.lifecycle.phase(), RemoteControlPhase::DrainingRemote);
         assert!(!state.unregister_streaming(generation, registration));
         assert!(state.finish_streaming_worker(generation, registration));
         assert!(state.active.is_none());
@@ -3533,7 +3735,7 @@ mod tests {
 
         assert!(!state.unregister_streaming(old_generation, old_registration));
         assert!(state.finish_streaming_worker(old_generation, old_registration));
-        assert_eq!(state.lifecycle.phase, RemoteControlPhase::Local);
+        assert_eq!(state.lifecycle.phase(), RemoteControlPhase::Local);
         assert_eq!(
             state
                 .acquire(
@@ -3547,7 +3749,7 @@ mod tests {
                 .status,
             SessionStatus::Active
         );
-        assert_eq!(state.lifecycle.phase, RemoteControlPhase::AcquiringRemote);
+        assert_eq!(state.lifecycle.phase(), RemoteControlPhase::AcquiringRemote);
         assert!(state.finish_acquire(state.generation));
         let owner = state_owner(&state, "next-client");
         let new_generation = state
@@ -3712,10 +3914,10 @@ mod tests {
         let response = state.logout(Duration::from_secs(1), &owner);
 
         assert_eq!(response.status, SessionStatus::Expired);
-        assert_eq!(state.lifecycle.phase, RemoteControlPhase::DrainingRemote);
+        assert_eq!(state.lifecycle.phase(), RemoteControlPhase::DrainingRemote);
         assert_eq!(state.drain_reason, Some(ReleaseReason::Logout));
         assert!(state.complete_app_drain(state.generation));
-        assert_eq!(state.lifecycle.phase, RemoteControlPhase::Local);
+        assert_eq!(state.lifecycle.phase(), RemoteControlPhase::Local);
         assert!(state.active.is_none());
         assert_eq!(state.last_release_reason, Some(ReleaseReason::Logout));
     }
@@ -3730,7 +3932,7 @@ mod tests {
         let response = state.logout(Duration::from_secs(1), &owner);
 
         assert_eq!(response.status, SessionStatus::Superseded);
-        assert_eq!(state.lifecycle.phase, RemoteControlPhase::RemoteActive);
+        assert_eq!(state.lifecycle.phase(), RemoteControlPhase::RemoteActive);
         assert!(state.active.is_some());
     }
 

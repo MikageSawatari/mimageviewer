@@ -710,6 +710,14 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
   新版の保存状態互換、SFZ / Adaptive Prediction の実使用中の通信・保存範囲、
   最終署名 artifact は公開前の実機確認事項として残る。
 
+### 10.5 説明ページの版を上げる手順 (2026-10-12)
+
+説明ページは現在の版だけ公開する。vendor の VERSION と資料 snapshot を更新して
+`python scripts/gen-effetune-docs.py` を実行し、`manual/effetune/v*/` の他版を削除して `--check` を通す。
+自動削除より単純で誤削除を避けられる残存検査を選択した。現在版の正本は vendor VERSION で、生成時に
+`.htaccess` の印付きブロックも更新する。全他版を一つの301規則で同名ファイルへ、廃止ページは現在版の index.html へ送る。
+公開時はサーバ上の旧版も削除し、生成物と `.htaccess` を同時反映する。sitemap はコミット後に再生成する。
+
 ## 11. 試験版の引き渡し時点の記録 (2026-09-28)
 
 - 独立コードレビュー (実装者と別の Sol、5 回) の最終判定: SHIP-FOR-USER-TEST。
@@ -1468,3 +1476,150 @@ Manual / AutoVideo は既存 Loading／host queue に合流し、手動意図を
 worker の hidden attach 前後と host GUI の表示直前でも成功時 revision を検査する。取消 ACK は表示希望を作らない。
 自動表示は foreground 許可と activate を要求せず、既存の ownerless・非 TOPMOST 表示を維持する。
 手動表示・表示済み窓の最小化設定・tray 保持・Remote 復帰の扱いは変えない。
+
+## 17. 音響調整窓のタスクバー表示（2026-10-12 設計メモ）
+
+**状態: 設計・調査のみ。製品コード未変更。** 利用者指定の案A（窓の表示スタイルだけを変更）を
+採用し、設定ON/OFF・既定ONとする。mIVのAppUserModelID、shortcut、pin、Jump Listは変更しない。
+EV9のCtrl+R修正・検証完了後に着手。調査先はmain worktree、HEAD `e984bab26`、開始時の差分なし。
+別worktreeに残るEV9差分を移動・変更していない。
+
+### 17.1 現コードの前提と、単なるflag追加で終わらない点
+
+現行EffeTuneは **ownerなし**。`new_bridge()` の `GuiOwnerPolicy::Unowned`、
+`DspBridge` の `show_gui`配送の `unowned=1 / owner_hwnd=0 / main_hwnd`、
+hostの`show_gui`検査がこれを固定している。main HWNDはDPI・最小化・表示permitの参照でありownerではない。
+§14の「メイン最小化中も表示」を実現する既存契約なので、ownedへ戻さない。
+一般VST editorのowner/foreground/fullscreen policyにも触れない。
+
+hostの`create_bridge_view_container`はcustom chromeの `WS_POPUP | WS_BORDER` を作り、
+`WS_EX_TOOLWINDOW | WS_EX_WINDOWEDGE`でタスクバーから除外する。window classにicon resourceは未設定。
+`gui_button_action` は hidden→Show、visible/front→Hide、visible/back→Activate。
+native closeとSC_CLOSEは既存のuser-hideへ入り、editorを破棄せずDSPを続ける。
+
+新しいtaskbar項目は通常のShell最小化／復元を入口に増やす。現行`PluginLoader::activate_gui`は
+`SW_SHOW`だけであり、最小化済みeditorの復元を保証しない。
+`gui_surface_should_show()`はmain最小化とRemoteの正本を再読し、既存のrequested/suppressionを判定する。
+単なるcore側のexstyle操作では、復元とこの表示permitの整合を完成できない。
+この普通に到達する経路を含む設計をreviewしてから実装する。
+
+### 17.2 採用: host作成側とGUI thread側で適用
+
+| 比較 | (a) coreから別processのHWNDを変更 | (b) hostの窓所有threadで変更（採用） |
+| --- | --- | --- |
+| 作成時 | GuiAttachedを待って変更。初回表示前とのorderingを別途守る必要 | CreateWindowEx前にexstyleを決める |
+| 設定変更 | HWNDの失効、別process WndProc再入、UIPI、visibility ownerとの競合を扱う | 既存GUI task queueでhide/style/showを直列化する |
+| 復元/close | Shell入力をcoreだけでは所有できない | 同じWndProcとGuiVisibility ownerで処理する |
+| build | coreのみでflag変更は可能 | host再build、source identity、署名/埋込順序が必要 |
+
+(a)のGWL_EXSTYLE操作そのものが同process限定という理由ではない。
+[SetWindowLongPtrW](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowlongptrw)
+はUIPI制約とframe cache反映を持つ。窓の作成・表示・破棄を持つ(b)へ処理を揃える方が単純で確実。
+
+初回作成は新しいGuiWindowOptionsの`show_in_taskbar`（一般VSTの既定false）で決める。
+ONはAPPWINDOWを加えTOOLWINDOWを外す。OFFはTOOLWINDOWを加えAPPWINDOWを外す。
+WINDOWEDGE、TOPMOST等の他bitとstyle/ownerは保持する。
+一般VSTの表示は変えず、EffeTuneの設定だけをこのoptionへ渡す。
+
+設定OK後は既存`effetune-host-control` queueへ目標値を送る。workerが一つの目標値を所有し、
+RegisterBridgeで現在bridgeへ適用してからShowを扱う。未起動/Loading中の設定も登録時に継承する。
+current bridgeのGUI作成snapshotと既存frameへの設定commandは同じ目標値から作る。
+queue順序で連続ON/OFFとLoading→Register→attachのlate arrivalを扱い、別のUI pending stateを足さない。
+IPCはworker、SetWindowLongPtr/ShowWindow/frame操作はhostの既存GUI thread。core UIでIPC待機しない。
+
+### 17.3 即時反映と表示状態
+
+[Microsoft taskbar仕様](https://learn.microsoft.com/en-us/windows/win32/shell/taskbar)に合わせ、
+表示中は **同じHWNDを短くhide→exstyle変更→FRAMECHANGED→再表示** する。
+styleが同じなら何もしない。非表示ならstyleだけ更新し、表示要求を作らない。
+requested表示、Remote抑止、main最小化の運用、窓の位置/サイズ、plugin view/DSP stateは既存ownerに残す。
+変更前のiconic状態は保ち、非activeの窓を前面へ持ってこない。
+再表示直前に既存`gui_surface_should_show()`を再検査し、close/Remote/main抑止でhiddenとなった窓を復活させない。
+前面だった窓の再表示時だけ、既存の許可条件を満たしていれば前面状態を保つ。
+
+簡素化候補の「editorを閉じて既存attach経路で作り直す」は、plugin UIの一時状態を失い得るため不採用。
+次回openまで延期する案も即時反映要求を満たさない。HWND再作成・新しいvisibility owner・復帰queueは不要。
+GUI thread内の現在state検査と同HWNDのstyle更新に限定する。
+
+推奨操作契約:
+- taskbarの最小化はWindows標準のiconic状態。user-hideとは区別し、DSPは続く。
+- taskbarの復元と音響調整ボタンによるActivateは、表示が許可されている場合に復元する。
+  ActivateはiconicならSW_RESTORE、通常時は従来のSW_SHOW。auto-openや設定切替から無条件activateしない。
+- ShellのSC_RESTORE入口でも既存の表示permitを検査し、Remote/close/main抑止を迂回しない。
+  一般VSTの動作を変えないようEffeTuneのmain-reference付きframeだけを対象にする。
+- taskbarの「閉じる」は既存SC_CLOSE→user-hide。窓が前面のときの音響調整ボタンも従来どおりHide。
+- OFFにした時点でiconicだった窓は勝手に開かない。mIVの音響調整ボタンで後から復元できる。
+
+[ShowWindow](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-showwindow)
+のSW_SHOWは現在stateでの表示、SW_RESTOREは最小化stateからの復元である。
+この違いは実clientを操作して観測した結果ではなく、現コードと公開API契約からの確認。
+
+### 17.4 グループ、タイトル、アイコン
+
+mIVのグループへ統合しない。明示的なprocess/window AppUserModelIDは新設せず、host側のShell既定分類へ委ねる。
+[AppUserModelID仕様](https://learn.microsoft.com/en-us/windows/win32/shell/appids)では、明示IDがない場合は
+Shellのheuristicによる。従って通常はhost実行体側の別項目/グループとなる見込みだが、
+厳密なグループ名や異なるhost世代の統合、pin/relaunchの見え方を保証するとは書かない。
+独立起動可能なEffeTune appやrelaunch登録、mIV全体のpin修正は案Aの対象外。
+
+EffeTune専用frameのwindow titleを`EffeTune`に揃え、preview/window切替時の表示名に使う。
+pluginの識別名・保存state・一般VST editor titleは変えない。
+mIVの`assets/icon.ico`をhost PEのicon resourceへ組み込み、frameの大小iconへ設定する。
+core HWNDからWM_GETICONを同期取得する方法は採らず、core UIへの再入待機を作らない。
+hostの内部group/context menuラベルはShellが決めるもので、window titleとの同一性は保証しない。
+AppUserModelID、FileDescriptionのEffeTuneへの全体改名、shortcut編集で表示名を強制しない。
+
+### 17.5 設定・portable・移行
+
+- `Settings.effetune_show_in_taskbar: bool`。serde default_trueとSettings::defaultのtrueを揃える。
+  既存DB/JSONに項目がなくてもON。新しいDB schema migrationは不要。
+- 現行UIの「動画・音声 → 動画 → 音響調整」の既存設定群へ
+  `音響調整の窓をタスクバーに表示する` checkboxを追加。独立した新preferences pageは作らない。
+  draft編集/Cancelはruntimeへ公開せず、OKのinstall_preferences_settingsで確定値だけを配送する。
+- 初期設定もcontrollerへ同じ入口で公開。portableでは項目・検索anchorを表示せず、host起動もしない。
+  設定値は互換のためSettingsに残すが、音響調整なしのportableで作用しない。
+- settings_transferは既存EffeTuneのauto-open/minimizedと同じ除外方針。
+  導入状態・窓の運用に依存する設定として分類し、移行先の値を保持する。
+  実装後の予定件数は全458 / 対象144 / 除外314、wire142項目。
+  `all_settings_fields_are_classified`、除外値保持、manual/settingsと転送計画の現行件数を更新する。
+
+### 17.6 host identity・build・署名
+
+SDKは現worktreeのvendor/vst3sdkに存在する。downloadや他worktree/runtimeからの旧host importは不要。
+resource `.rc` と共有iconをidentity対象へ追加し、scriptとCMakeの算出を一本化したまま拡張する。
+RC等のtextは既存のCRLF→LF規則、iconのbinaryはraw SHA256として扱う。
+icon更新もsource identity不一致として検知するpure script回帰を追加する。
+
+実装時はCLAUDE.md「VST3 host bridge 管理」のCMake configure/buildでvendor hostと公式CRT4本を更新し、
+現ソースmarkerとの一致・SHA256・sizeを記録する。配布用は内側hostの署名→core→launcherの順で埋込。
+`build-release.ps1 -PreserveRuntime -Sign` はこの既存release経路であり、署名・公開はrelease担当へ引き継ぐ。
+署名済み旧exeでidentity検査を迂回しない。非署名の開発確認物を署名済み配布物と同一扱いしない。
+native/host変更の確認artifactはAGENTS.mdに従いrelease buildを作り、利用者へ手動起動を渡す。
+agentはnormal-profile core/launcherを起動しない。
+
+### 17.7 回帰・レビュー・未確認事項
+
+producer/consumerは Settings draft→OK/起動→controller host queue→current bridge/将来attach snapshot→
+host protocol→GUI thread→CreateWindowEx/既存frame更新。Shell restore/closeは同じWndProc/GuiVisibilityをconsumerとする。
+Loading、Register、Show、Remote/main suppression、user-hide、disable、GUI destroy/dropをこの所有境界で検査する。
+
+実装後に必要な自動確認:
+1. 既定true、欠落項目、false保存/再読込、Preferences Cancel/OK、portable検索/UI除外、転送分類/値保持。
+2. fake bridge配送で設定→Register→Show、Loading中変更、連続ON/OFF、一般VST既定falseを確認。
+3. C++のpure style/visibilityテストとhidden fake HWNDで、他exstyle bit/ownerの保持、非表示を開かない、
+   suppression中のrestore拒否、iconic状態と手動restore、closeがuser-hideとなることを確認。
+   本物EffeTuneやExplorerのtaskbar、ユーザー設定には自動テストを依存させない。
+4. host identity script回帰・CMake/CTest、EffeTune/VST3/Preferences/settings_transfer焦点テスト、
+   fmt・通常/portable check・UI glyph・preferencesの明暗/narrow snapshot・manual更新。
+5. 通常のverification artifactを準備し、利用者が隔離data-dirで taskbar ON/OFF、実icon/title/group、
+   taskbar最小化/復元、音響調整ボタン、Close後DSP継続、main最小化設定両方、Remote抑止を確認。
+
+rareなstyle/resource/DB/host配送失敗は既定のlog＋通知に留める。retry loop、partial復旧owner、
+保存データ削除/再作成、failure内のrecoveryは追加しない。
+
+実装前reviewの焦点は **Shell復元という新しい通常入力と既存GuiVisibility permitの境界**、
+同HWND style変更後のhidden/iconic/foreground保持、queueでのLoading/登録順序。
+AGENTS.mdの `Review important ownership/asynchronous/multi-window designs before substantial implementation`
+をこの新入力経路へ適用し、独立レビューを経てから製品コードを変更する。
+利用者が決める新しい設定選択は増やさず、案A/既定ONは確定事項。上記操作契約をreview対象として提示する。
+現時点ではhost build・製品test・UI起動・署名・commitは行っていない。

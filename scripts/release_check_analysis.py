@@ -19,6 +19,7 @@ REQUIRED_CASES = (
     "tray-close-while-loading", "tray-close-after-loading", "perf-cached", "perf-uncached",
 )
 HITCH_MS = 100.0
+STARTUP_FIRST_FRAME_MAX_GAP_MS = 500.0
 MIN_DRAWN_SAMPLES = 200
 U64_MAX = (1 << 64) - 1
 SOURCE_ORIGINS = {"source_generated", "source_intrinsic"}
@@ -261,7 +262,12 @@ def cache_errors(events: list[dict], evidence: dict, case_id: str) -> list[str]:
         if (not isinstance(many, str) or not many or not isinstance(order, list) or len(order) != 6
                 or not all(isinstance(p, str) and p for p in order)):
             return ["verified perf fixture manifest many-folder/navigation recipe missing"]
-        intended = [many, *order]
+        loads = recipe.get("load_order")
+        if (not isinstance(loads, list) or len(loads) != 256
+                or not all(isinstance(p, str) and p for p in loads)
+                or len({normalize_search_path(p) for p in loads}) != 256):
+            return ["verified perf fixture manifest distinct-folder load recipe missing"]
+        intended = [many, *loads, *order]
         for i, nav in enumerate(evidence.get("navigation", [])):
             if (i >= 5 or not isinstance(nav, dict)
                     or normalize_search_path(nav.get("before_path", "")) != normalize_search_path(order[i])
@@ -287,13 +293,26 @@ def cache_errors(events: list[dict], evidence: dict, case_id: str) -> list[str]:
             generation_field = "before_generation" if position == 0 else "after_generation"
             if len(navs) <= nav_index or navs[nav_index].get(generation_field) != generation:
                 continue
+        if case_id.startswith("perf-") and folder in [normalize_search_path(p) for p in recipe.get("load_order", [])]:
+            loads = evidence.get("folder_loads", [])
+            if not any(isinstance(load, dict) and normalize_search_path(load.get("after_path", "")) == folder
+                       and load.get("after_generation") == generation for load in loads):
+                continue
         if case_id == "video-pin-background" and evidence.get("target_key") not in keys:
             continue
         if mode == "cached":
             required_keys = [evidence["target_key"]] if case_id == "video-pin-background" else keys
-            if all(any(e.get("cat") == "qa" and e.get("kind") == "cache_read"
-                       and e.get("key") == key and e.get("items_gen") == generation
-                       and correlated_producer(e, begins) is not None for e in events) for key in required_keys):
+            first_reads = []
+            for key in required_keys:
+                producers = [e for e in events if e.get("cat") == "qa" and e.get("kind") in ("source", "cache_read")
+                             and e.get("key") == key and e.get("items_gen") == generation]
+                if any(correlated_producer(e, begins) is None for e in producers):
+                    first_reads.append(False)
+                    continue
+                producers.sort(key=lambda e: (begins[request_identity(e)]["t"], e["t"]))
+                first_reads.append(bool(producers and producers[0].get("kind") == "cache_read"
+                                        and producers[0].get("from_cache") is True))
+            if all(first_reads):
                 valid_folders.add(folder)
         elif opened.get("pre_open_absent") is True:
             first_sources = []
@@ -380,6 +399,38 @@ def static_request_errors(events: list[dict], evidence: dict, case_id: str) -> l
     return []
 
 
+def folder_load_errors(evidence: dict, case_id: str) -> list[str]:
+    """A fixed fresh-folder workload, with ordinary opens and observed outcomes."""
+    mode = "uncached" if case_id == "perf-uncached" else "cached"
+    recipe = evidence.get("fixture_manifest", {}).get("perf", {}).get(mode, {})
+    order, loads = recipe.get("load_order"), evidence.get("folder_loads")
+    if (not isinstance(order, list) or len(order) != 256
+            or not all(isinstance(p, str) and p for p in order)
+            or len({normalize_search_path(p) for p in order}) != 256
+            or not isinstance(loads, list) or len(loads) != 256):
+        return ["256 distinct fixture folder-load operations required"]
+    previous_path, previous_generation, previous_end = recipe.get("many_folders"), None, None
+    errors = []
+    for i, (path, load) in enumerate(zip(order, loads), 1):
+        span = interval(load) if isinstance(load, dict) else None
+        if (span is None or span[0] >= span[1] or previous_end is not None and span[0] < previous_end
+                or any(not isinstance(load.get(f), int) or isinstance(load[f], bool)
+                       for f in ("before_generation", "after_generation"))
+                or load["after_generation"] <= load["before_generation"]
+                or previous_generation is not None and load["before_generation"] != previous_generation
+                or not isinstance(load.get("before_path"), str) or not isinstance(load.get("after_path"), str)
+                or normalize_search_path(load["before_path"]) != normalize_search_path(previous_path or "")
+                or normalize_search_path(load["after_path"]) != normalize_search_path(path)):
+            errors.append(f"folder-load {i} invalid fixture route/generation/interval")
+            continue
+        previous_path, previous_generation, previous_end = path, load["after_generation"], span[1]
+    navs = evidence.get("navigation", [])
+    nav_start = number(navs[0].get("start_t")) if isinstance(navs, list) and navs and isinstance(navs[0], dict) else None
+    if previous_end is None or nav_start is None or previous_end > nav_start:
+        errors.append("folder-load workload must complete before the five Ctrl+Down operations")
+    return errors
+
+
 def analyze_perf_smoke(events: list[dict], *, expected_pid: int | None = None,
                        case_id: str = "perf-smoke", evidence: dict | None = None,
                        load_errors: list[str] | None = None) -> dict:
@@ -415,6 +466,8 @@ def analyze_perf_smoke(events: list[dict], *, expected_pid: int | None = None,
     errors.extend(cache_errors(events, evidence, case_id))
     if case_id != "first-ai":
         errors.extend(chord_errors(events, evidence))
+    if case_id in ("perf-cached", "perf-uncached"):
+        errors.extend(folder_load_errors(evidence, case_id))
     if not any(e.get("cat") == "qa" and e.get("kind") == "on_exit" and e.get("case_id") == case_id
                and e.get("flush_complete") is True for e in events):
         errors.append("normal on_exit/flush diagnostic witness missing")
@@ -558,6 +611,40 @@ def analyze_perf_smoke(events: list[dict], *, expected_pid: int | None = None,
     slow_updates = [classify_update(row) for row in sorted(updates.values(), key=lambda r: (r["start_t"], r["n"]))
                     if row["total_ms"] > HITCH_MS]
     slow_by_n = {row["n"]: row for row in slow_updates}
+    # Use the earliest operation interval, not a small startup timestamp. The
+    # initial command-line folder load is startup; the explicit workload starts
+    # with folder_loads (or first_ai in the optional independent session).
+    operation_windows = [evidence.get("search"), evidence.get("first_ai"), evidence.get("folder_open")]
+    for field in ("folder_loads", "navigation"):
+        windows = evidence.get(field)
+        if isinstance(windows, list):
+            operation_windows.extend(windows)
+    operation_starts = [span[0] for window in operation_windows if isinstance(window, dict)
+                        and (span := interval(window)) is not None]
+    first_operation_t = min(operation_starts, default=None)
+    startup_first_frames = [e for e in events if (e.get("cat"), e.get("kind")) == ("startup", "first_frame")]
+    init_completions = [e for e in events if (e.get("cat"), e.get("kind")) == ("startup", "indexer_manager_new")]
+
+    def startup_first_frame_gap(gap: dict, tail: dict) -> bool:
+        update = updates[gap["n"]]
+        # early_return alone also describes fullscreen/navigation exits. Prove
+        # that the startup init worker was still pending after this update, so
+        # the earlier startup-overlay guard owned the return. Perf event t is
+        # rounded to milliseconds; require a full 1ms margin for that witness.
+        return (gap["n"] == 1 and gap["next_n"] == 2
+                and gap["gap_ms"] <= STARTUP_FIRST_FRAME_MAX_GAP_MS + 1e-9
+                and tail.get("early_return") is True and tail.get("action") == "request_repaint"
+                and number(tail.get("delay_ms")) == 0 and 1 not in pre_grid_numbers
+                and update["outer_measured"] and update["total_ms"] <= HITCH_MS
+                and gap["start_t"] - .001 <= tail["t"] <= update["end_t"] + .001
+                and first_operation_t is not None and gap["end_t"] < first_operation_t
+                and len(startup_first_frames) == 1
+                and abs(startup_first_frames[0]["t"] - gap["start_t"]) <= .001
+                and len(init_completions) == 1
+                and (init_span := interval(init_completions[0], "ms")) is not None
+                and update["start_t"] - .001 <= init_span[0] <= update["end_t"]
+                and init_completions[0]["t"] > update["end_t"] + .001)
+
     for gap in gaps:
         n, tail = gap["n"], tails.get(gap["n"], {})
         if n not in updates or not tail:
@@ -568,6 +655,10 @@ def analyze_perf_smoke(events: list[dict], *, expected_pid: int | None = None,
             if (any(c.startswith("known-") for c in gap["categories"]) and tail.get("action") != "none"
                     and outside_ms > HITCH_MS and "unexplained" not in gap["categories"]):
                 gap["categories"].append("unexplained")
+        elif startup_first_frame_gap(gap, tail):
+            gap["categories"] = ["known-startup-first-frame"]
+            gap["first_operation_t"] = first_operation_t
+            gap["upper_bound_ms"] = STARTUP_FIRST_FRAME_MAX_GAP_MS
         elif tail.get("action") == "none":
             gap["categories"] = ["normal-sleep"]
         elif tail.get("action") == "request_repaint_after_idle_upgrade":
@@ -585,6 +676,8 @@ def analyze_perf_smoke(events: list[dict], *, expected_pid: int | None = None,
         result["failures"].append(f"unexplained >100ms gap/update in frames {unexplained_frames}")
     if any(any(c.startswith("known-") for c in r["categories"]) for r in slow_updates):
         result["warnings"].append("known startup/initial AI stalls retained; not a shipping waiver")
+    if any("known-startup-first-frame" in g["categories"] for g in gaps):
+        result["warnings"].append("known-startup-first-frame gap retained (user accepted 2026-10-11; maximum 500ms)")
     drawn_stats = stats(drawn)
     below = sum(ms < 16 - 1e-9 for ms in drawn)
     ratio = below / len(drawn) if drawn else None
@@ -605,7 +698,8 @@ def analyze_perf_smoke(events: list[dict], *, expected_pid: int | None = None,
                                 "stages_ms": {k: v for k, v in e.items() if k.endswith("_ms") and k != "total_ms"}}
                                for e in pre_grid if e["total_ms"] > .3]
     classification_stats = {}
-    for category in ("normal-sleep", "normal-idle-upgrade-wake", "known-startup-scan", "known-first-ai", "unexplained"):
+    for category in ("normal-sleep", "normal-idle-upgrade-wake", "known-startup-first-frame",
+                     "known-startup-scan", "known-first-ai", "unexplained"):
         matching_gaps = [g for g in gaps if category in g["categories"]]
         matching_updates = [u for u in slow_updates if category in u["categories"]]
         classification_stats[category] = {
@@ -677,6 +771,14 @@ def analyze_case_evidence(events: list[dict], evidence: dict, expected_pid: int 
                 if not any(f"dir::{Path(pin['key']).parent}" in target_keys(c.get("targets", []))
                            for pin in pinned for c in cache_seeds):
                     errors.append("normal video pin save plus parent-tile durable cache seed not proven")
+        if seed_kind == "cache" and "seed_cache_paths" in evidence:
+            saved = {normalize_search_path(e["folder_path"]) for e in seeds
+                     if isinstance(e.get("folder_path"), str) and e.get("saved_cache") is True
+                     and target_keys(e.get("targets", []))}
+            intended = evidence["seed_cache_paths"]
+            if (not isinstance(intended, list) or not intended
+                    or any(not isinstance(p, str) or normalize_search_path(p) not in saved for p in intended)):
+                errors.append("normal cache seed missing intended folder durable save witness")
         if seed_kind == "search":
             if not any(e.get("cat") == "index" and e.get("kind") == "initial_scan_settled" for e in events):
                 errors.append("seed index initial scan did not settle")
@@ -824,10 +926,14 @@ def analyze_idle_case(events: list[dict], sampler: dict, evidence: dict,
         result["environment_errors"].append("foreground/window lifetime samples missing or invalid")
     else:
         samples = sorted(samples, key=lambda s: s["unix_ms"])
+        max_gap = max(b["unix_ms"] - a["unix_ms"] for a, b in zip(samples, samples[1:]))
+        result["metrics"]["window_sample_max_gap_ms"] = max_gap
         if (samples[0]["unix_ms"] > clock["measure_start_unix_ms"] + 100 or
-                samples[-1]["unix_ms"] < clock["measure_end_unix_ms"] - 100 or
-                any(b["unix_ms"] - a["unix_ms"] > 1100 for a, b in zip(samples, samples[1:]))):
+                samples[-1]["unix_ms"] < clock["measure_end_unix_ms"] - 100):
             result["environment_errors"].append("lifetime samples do not cover the complete measurement window")
+        if max_gap > 1100:
+            result["environment_errors"].append(
+                f"lifetime sample gap {max_gap} ms exceeds 1100 ms coverage limit")
         if result["case_id"] == "static-foreground":
             root_hwnd = sampler.get("root_hwnd")
             if (not isinstance(root_hwnd, int) or root_hwnd <= 0 or
@@ -934,6 +1040,11 @@ def release_record(result: dict) -> str:
         evidence = case.get("evidence") if isinstance(case.get("evidence"), dict) else {}
         if "drawn" in metrics:
             draw, pg = metrics["drawn"], metrics["pre_grid"]
+            operations = evidence.get("operations", {})
+            if case.get("case_id") in ("perf-cached", "perf-uncached"):
+                lines.append(f"  distinct image-folder loads {len(operations.get('folder_loads', []))}/256、"
+                             f"Ctrl+Down {len(operations.get('navigation', []))}/5、"
+                             f"fixture search completed={operations.get('search', {}).get('completed', False)}。")
             ratio = draw.get("below_16ms_ratio")
             percent = f"{ratio * 100:.2f}%" if ratio is not None else "n/a"
             lines.append(f"  total frames {metrics['total_frames']}、drawn <16ms "
@@ -947,6 +1058,16 @@ def release_record(result: dict) -> str:
             lines.append("  known形の最大値 / scan / viewport " + json.dumps(
                 {k: v for k, v in metrics.get("classifications", {}).items() if k.startswith("known-")},
                 ensure_ascii=False) + "。")
+            for gap in evidence.get("gaps", []):
+                if "known-startup-first-frame" in gap.get("categories", []):
+                    lines.append(f"  known-startup-first-frame: frame 1→2、{gap['gap_ms']:.3f}ms "
+                                 f"(t={gap['start_t']}→{gap['end_t']}、上限 {gap['upper_bound_ms']}ms、"
+                                 f"最初の測定操作 t={gap['first_operation_t']} より前、利用者了承2026-10-11)。")
+            for update in evidence.get("slow_updates", []):
+                reason = f"slow update {update['n']} lacks stage breakdown"
+                if reason in case.get("environment_errors", []):
+                    lines.append(f"  環境注記: {reason}、{update['total_ms']:.3f}ms "
+                                 f"(t={update['start_t']}→{update['end_t']})。段別証拠不足の環境不成立を維持。")
         if metrics and "drawn" not in metrics:
             lines.append("  metrics " + json.dumps(metrics, ensure_ascii=False) + "。")
         clock = evidence.get("clock")

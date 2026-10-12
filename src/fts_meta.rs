@@ -4,16 +4,17 @@
 //!
 //! Tantivy インデックス (`fts_index/`) とは別 DB で、以下を担う:
 //! - お気に入り単位の登録ファイル追跡 (差分検出の基準: path / mtime / size)
-//! - `status=Ok / Failed` の 2 値 (Ok=Tantivy commit 済み、Failed=ingest 失敗で再試行待ち)
+//! - `status=Ok / Failed` の 2 値 (Ok=Tantivy commit + reload 済み)
 //! - ingest 世代カウンタ (`index_generation`) — 将来のスナップショット用
 //!
 //! **正規化済み原文 (`*_norm` 列) は持たない**。原文は Tantivy 側 (`*_text` フィールド
 //! に STORED) に集約されており、検索 post-filter は `fts_index::doc_text_for_target` で
 //! Tantivy snapshot から取り出す。
 //!
-//! **書き込み順序 (Tantivy First)**: ingest / delete どちらも Tantivy commit 成功後に
-//! SQLite を更新する。途中でクラッシュした場合は次回起動時の walker 3-way diff
-//! (FS / Tantivy / SQLite) または reconciliation で復旧する。
+//! **書き込み順序 (Tantivy First)**: ingest / delete どちらも Tantivy commit + reader reload
+//! 成功後に SQLite を更新する。walker は FS↔SQLite の added/changed/deleted を判定し、
+//! reconciliation は Failed 行を掃除する。Ok 行の全文欠落を全件照合する保証はない。
+//! 書込失敗は共通 reporter が通知と次回起動の再構築予約に接続する。
 //!
 //! **スレッド安全性**: `Mutex<Connection>` で包む (既存 catalog.rs と同じパターン)。
 //! 頻繁な UPSERT は Ingest Worker から呼ばれるため、ロックは短く保つ。
@@ -81,7 +82,7 @@ mod ownership_tests {
         );
     }
     #[test]
-    fn requested_rebuild_recreates_files_on_next_open_only() {
+    fn requested_rebuild_preserves_inventory_until_cross_store_owner_prepares_it() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("meta.db");
         let db = FtsMetaDb::open_at(&path).unwrap();
@@ -98,8 +99,10 @@ mod ownership_tests {
         assert!(db.get("c:/x.jpg").unwrap().is_some());
         drop(db);
         let db = FtsMetaDb::open_at(&path).unwrap();
-        assert!(db.rebuilt_on_open());
+        assert!(!db.rebuilt_on_open());
         assert!(db.tantivy_rebuild_pending().unwrap());
+        assert!(db.get("c:/x.jpg").unwrap().is_some());
+        db.prepare_tantivy_rebuild().unwrap();
         assert!(db.get("c:/x.jpg").unwrap().is_none());
     }
     #[test]
@@ -109,6 +112,135 @@ mod ownership_tests {
         let conn = db.conn.lock().unwrap();
         let plan: String = conn.query_row("EXPLAIN QUERY PLAN SELECT path FROM files WHERE favorite_id = ?1 AND NOT(path >= ?2 AND path < ?3)",params!["id","c:/a/","c:/a0"],|r| r.get(3)).unwrap();
         assert!(plan.contains("COVERING INDEX idx_files_fav_path"), "{plan}");
+    }
+
+    #[test]
+    fn rebuild_preparation_is_durable_and_atomic_before_tantivy_destruction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("meta.db");
+        let db = FtsMetaDb::open_at(&path).unwrap();
+        db.upsert_meta_ok(
+            "c:/kept.jpg",
+            Uuid::new_v4(),
+            Path::new("c:/"),
+            IndexKind::Image,
+            1,
+            1,
+        )
+        .unwrap();
+        db.mark_scanned_once("c:/", "old-complete").unwrap();
+        let observer = Connection::open(&path).unwrap();
+        // An interrupted/failed transaction cannot publish only part of the reset.
+        observer.execute_batch("CREATE TRIGGER deny_scan_reset BEFORE DELETE ON scanned_once BEGIN SELECT RAISE(FAIL, 'reset interruption'); END;").unwrap();
+        assert!(db.prepare_tantivy_rebuild().is_err());
+        assert!(db.get("c:/kept.jpg").unwrap().is_some());
+        assert_eq!(
+            db.scanned_once("c:/").unwrap().as_deref(),
+            Some("old-complete")
+        );
+        assert!(!db.tantivy_rebuild_pending().unwrap());
+        observer
+            .execute_batch("DROP TRIGGER deny_scan_reset")
+            .unwrap();
+        observer.execute_batch("CREATE TRIGGER require_full_reset BEFORE DELETE ON files BEGIN SELECT CASE WHEN (SELECT synchronous FROM pragma_synchronous) != 2 THEN RAISE(FAIL, 'reset must be FULL') END; END;").unwrap();
+        db.prepare_tantivy_rebuild().unwrap();
+        assert_eq!(
+            db.conn
+                .lock()
+                .unwrap()
+                .pragma_query_value(None, "synchronous", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        // A separate connection sees the completed transaction before the owner wipes.
+        assert_eq!(
+            observer
+                .query_row("SELECT COUNT(*) FROM files", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            observer
+                .query_row("SELECT COUNT(*) FROM scanned_once", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            observer
+                .query_row(
+                    "SELECT value FROM index_state WHERE key='tantivy_rebuild_pending'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        drop(db);
+        let reopened = FtsMetaDb::open_at(&path).unwrap();
+        assert!(reopened.tantivy_rebuild_pending().unwrap());
+        assert!(reopened.get("c:/kept.jpg").unwrap().is_none());
+    }
+
+    #[test]
+    fn runtime_rebuild_marker_commit_uses_full_without_changing_ordinary_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = FtsMetaDb::open_at(&tmp.path().join("meta.db")).unwrap();
+        db.conn.lock().unwrap().execute_batch("CREATE TRIGGER require_full_marker BEFORE INSERT ON index_state BEGIN SELECT CASE WHEN (SELECT synchronous FROM pragma_synchronous) != 2 THEN RAISE(FAIL, 'marker must be FULL') END; END;").unwrap();
+        db.request_item_index_rebuild().unwrap();
+        assert!(db.tantivy_rebuild_pending().unwrap());
+        assert_eq!(
+            db.conn
+                .lock()
+                .unwrap()
+                .pragma_query_value(None, "synchronous", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn integrity_failed_count_uses_partial_index_and_includes_orphans() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = FtsMetaDb::open_at(&tmp.path().join("meta.db")).unwrap();
+        assert_eq!(db.count_not_ok().unwrap(), 0);
+        let known = Uuid::new_v4();
+        let orphan = Uuid::new_v4();
+        for (path, id, failed) in [
+            ("c:/ok.jpg", known, false),
+            ("c:/failed.jpg", known, true),
+            ("c:/orphan.jpg", orphan, true),
+        ] {
+            db.upsert_meta_ok(path, id, Path::new("c:/"), IndexKind::Image, 1, 1)
+                .unwrap();
+            if failed {
+                db.mark_failed(path).unwrap();
+            }
+        }
+        assert_eq!(db.for_each_path_owner(|_, _| {}).unwrap(), 3);
+        assert_eq!(db.count_not_ok().unwrap(), 2);
+        let conn = db.conn.lock().unwrap();
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM files WHERE status != 0",
+                [],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("COVERING INDEX idx_files_status"), "{plan}");
+        let statuses = conn
+            .prepare("SELECT DISTINCT status FROM files ORDER BY status")
+            .unwrap()
+            .query_map([], |r| r.get::<_, i64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            statuses,
+            vec![FileStatus::Ok as i64, FileStatus::Failed as i64]
+        );
+        assert_eq!(FileStatus::from_i64(1), FileStatus::Failed);
+        assert_eq!(FileStatus::from_i64(3), FileStatus::Failed);
     }
 
     #[test]
@@ -363,7 +495,7 @@ impl FtsMetaDb {
              PRAGMA foreign_keys=ON;",
         )?;
         // §19.8 自動マイグレーション: 旧スキーマを検出したら files を drop して再作成する。
-        // (Tantivy 側は FtsIndex::open_at が並列で wipe する)
+        // Tantivy 側の破棄は cross-store startup owner が後から行う。
         //
         // Codex startup 計装で fts_meta.db (~2GB) に対する `SELECT MIN(index_version)` が
         // cold cache で 10 秒超フルスキャンしていた。PRAGMA user_version でスキーマ最新
@@ -383,14 +515,7 @@ impl FtsMetaDb {
         let version_requires_rebuild = user_version > 0 && user_version < INDEX_VERSION;
         init_index_state_schema(&conn)?;
         init_scanned_once_schema(&conn)?;
-        let requested_rebuild: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM index_state WHERE key = ?1 AND value != 0)",
-            params![TANTIVY_REBUILD_PENDING_KEY],
-            |r| r.get(0),
-        )?;
-        let rebuild_needed = if requested_rebuild {
-            true
-        } else if user_version == INDEX_VERSION {
+        let rebuild_needed = if user_version == INDEX_VERSION {
             false
         } else {
             version_requires_rebuild || needs_rebuild(&conn)?
@@ -410,6 +535,11 @@ impl FtsMetaDb {
         //   委ねる。
         // schema DROP / recreate、durable Tantivy pending、user_version bump を 1 transaction に
         // まとめる。DROP だけ済んで marker が無い crash state を作らない。
+        // A destructive semantic migration must persist its marker before the owner
+        // touches Tantivy; ordinary upserts retain the existing NORMAL policy.
+        if rebuild_needed || force_tantivy_rebuild {
+            conn.pragma_update(None, "synchronous", "FULL")?;
+        }
         let tx = conn.transaction()?;
         if rebuild_needed {
             tx.execute_batch("DROP TABLE IF EXISTS files;")?;
@@ -438,6 +568,9 @@ impl FtsMetaDb {
             tx.execute_batch(&format!("PRAGMA user_version = {INDEX_VERSION};"))?;
         }
         tx.commit()?;
+        if rebuild_needed || force_tantivy_rebuild {
+            conn.pragma_update(None, "synchronous", "NORMAL")?;
+        }
         // 後始末 (VACUUM) は起動経路から外し、`maybe_run_housekeeping_async` で起動後に
         // バックグラウンド実行する。数 GB で数分かかりうるので起動 overlay を止めない方針。
         Ok(Self {
@@ -469,10 +602,11 @@ impl FtsMetaDb {
     /// Next startup recreates both stores through the existing rebuild-pending path.
     pub fn request_item_index_rebuild(&self) -> rusqlite::Result<()> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
-        tx.execute("DELETE FROM scanned_once", [])?;
-        tx.execute("INSERT INTO index_state(key, value) VALUES (?1, 1) ON CONFLICT(key) DO UPDATE SET value = 1", params![TANTIVY_REBUILD_PENDING_KEY])?;
-        tx.commit()
+        durable_rebuild_transaction(&mut conn, |tx| {
+            tx.execute("DELETE FROM scanned_once", [])?;
+            tx.execute("INSERT INTO index_state(key, value) VALUES (?1, 1) ON CONFLICT(key) DO UPDATE SET value = 1", params![TANTIVY_REBUILD_PENDING_KEY])?;
+            Ok(())
+        })
     }
 
     /// root 単位の完全走査の印。root は metadata_ownership::root_key で正規化する。
@@ -527,14 +661,26 @@ impl FtsMetaDb {
         Ok(())
     }
 
-    /// Tantivy が再作成された起動では、古い stamp を stable と判定させない。
-    /// 新しい全文ストアと対応する inventory・完走印を同じ transaction で空にする。
-    pub(crate) fn reset_inventory_for_recreated_tantivy(&self) -> rusqlite::Result<()> {
+    /// Cross-store owner commits inventory reset, scan invalidation and durable pending
+    /// together BEFORE wiping or creating Tantivy. Runtime requests only set the marker.
+    pub(crate) fn prepare_tantivy_rebuild(&self) -> rusqlite::Result<()> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
-        tx.execute("DELETE FROM files", [])?;
-        tx.execute("DELETE FROM scanned_once", [])?;
-        tx.commit()
+        durable_rebuild_transaction(&mut conn, |tx| {
+            tx.execute("DELETE FROM files", [])?;
+            tx.execute("DELETE FROM scanned_once", [])?;
+            tx.execute("INSERT INTO index_state(key, value) VALUES (?1, 1) ON CONFLICT(key) DO UPDATE SET value = 1", params![TANTIVY_REBUILD_PENDING_KEY])?;
+            Ok(())
+        })
+    }
+
+    /// Uses the existing partial Failed index, across every owner including orphans.
+    /// No additional Ok/table scan is needed: the startup ownership visitor counted all rows.
+    pub(crate) fn count_not_ok(&self) -> rusqlite::Result<u64> {
+        self.conn.lock().unwrap().query_row(
+            "SELECT COUNT(*) FROM files WHERE status != 0",
+            [],
+            |row| row.get(0),
+        )
     }
 
     /// Cross-store owner (`open_stores_with_rebuild_sync`) だけが、旧 directory の wipe と
@@ -1077,6 +1223,23 @@ impl FtsMetaDb {
     }
 }
 
+/// The marker/reset commit must survive before any Tantivy replacement. Restore the
+/// connection policy once; a failure returns to the existing log/notice exit, without retry.
+fn durable_rebuild_transaction(
+    conn: &mut Connection,
+    apply: impl FnOnce(&rusqlite::Transaction<'_>) -> rusqlite::Result<()>,
+) -> rusqlite::Result<()> {
+    let previous: i64 = conn.pragma_query_value(None, "synchronous", |row| row.get(0))?;
+    conn.pragma_update(None, "synchronous", "FULL")?;
+    let result = (|| {
+        let tx = conn.transaction()?;
+        apply(&tx)?;
+        tx.commit()
+    })();
+    let restore = conn.pragma_update(None, "synchronous", previous);
+    result.and(restore)
+}
+
 // `row_to_filemeta` が受け取るカラム順。2 つの SELECT で使い回す。
 // concat! は literal しか受けないので、列リスト部分をマクロで共有する。
 macro_rules! filemeta_select_cols {
@@ -1351,7 +1514,7 @@ mod tests {
         assert_eq!(db.scanned_once("c:/images").unwrap(), None);
         drop(db);
         let reopened = FtsMetaDb::open_at(&tmp.path().join("fts_meta.db")).unwrap();
-        assert!(reopened.rebuilt_on_open());
+        assert!(!reopened.rebuilt_on_open());
         assert_eq!(reopened.scanned_once("c:/images").unwrap(), None);
     }
 

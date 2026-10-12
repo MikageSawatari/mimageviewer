@@ -173,6 +173,7 @@ struct DeferredFullscreen {
     item_key: String,
     requested_materialization: FsOpenMaterialization,
     load_contract: FsPageLoadContract,
+    metadata_boundary: FsMetadataBoundary,
 }
 
 impl DeferredFullscreen {
@@ -626,6 +627,7 @@ impl SidecarRestoreState {
         item_key: String,
         requested_materialization: FsOpenMaterialization,
         load_contract: FsPageLoadContract,
+        metadata_boundary: FsMetadataBoundary,
     ) -> bool {
         if !self.target_matches(context, generation) {
             return false;
@@ -636,6 +638,7 @@ impl SidecarRestoreState {
             item_key,
             requested_materialization,
             load_contract,
+            metadata_boundary,
         });
         true
     }
@@ -906,6 +909,21 @@ impl App {
         rx
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_live_sidecar_first_display_for_test(
+        &mut self,
+        first_display: FirstDisplayAction,
+        navigation: Option<MainListAfterHydration>,
+    ) {
+        let ContinuationOwner::Live(continuation) =
+            &mut self.sidecar_restore.as_mut().unwrap().common.continuation
+        else {
+            panic!("test requires a live hydration continuation");
+        };
+        continuation.first_display_action = first_display;
+        continuation.navigation_after_hydration = navigation;
+    }
+
     /// Discard semantic input while keeping release edges available to the
     /// existing hold owners. Nothing retained here is queued for replay after
     /// the restore terminal.
@@ -1031,14 +1049,32 @@ impl App {
         requested_materialization: FsOpenMaterialization,
         load_contract: FsPageLoadContract,
     ) -> bool {
+        self.defer_sidecar_restore_fullscreen_with_metadata_boundary(
+            idx,
+            trigger,
+            requested_materialization,
+            load_contract,
+            FsMetadataBoundary::Manual,
+        )
+    }
+
+    /// The continuation retains the policy of the accepted open, including across hydration.
+    pub(super) fn defer_sidecar_restore_fullscreen_with_metadata_boundary(
+        &mut self,
+        idx: usize,
+        trigger: HistoryTrigger,
+        requested_materialization: FsOpenMaterialization,
+        load_contract: FsPageLoadContract,
+        metadata_boundary: FsMetadataBoundary,
+    ) -> bool {
         if self.sidecar_restore.is_none() {
             return false;
         }
         let context = self.sidecar_restore_projected_context();
         let generation = self.items_generation;
-        if let Some(item_key) = self.items.get(idx).map(GridItem::perf_key) {
+        let accepted = if let Some(item_key) = self.items.get(idx).map(GridItem::perf_key) {
             if let Some(state) = self.sidecar_restore.as_mut() {
-                let _ = state.defer_fullscreen(
+                state.defer_fullscreen(
                     context,
                     generation,
                     idx,
@@ -1046,12 +1082,69 @@ impl App {
                     item_key,
                     requested_materialization,
                     load_contract,
-                );
+                    metadata_boundary,
+                )
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if accepted
+            && metadata_boundary == FsMetadataBoundary::RatingMembership
+            && self.sidecar_restore_rating_deferred_target() == Some(idx)
+        {
+            if let ContinuationOwner::Live(continuation) =
+                &mut self.sidecar_restore.as_mut().unwrap().common.continuation
+            {
+                // Acceptance consumes the older demand now. Cancelling this Rating target
+                // later must not revive first-display navigation at hydration completion.
+                if continuation.first_display_action == FirstDisplayAction::AutoFullscreenFolder {
+                    continuation.first_display_action = FirstDisplayAction::None;
+                }
+                if matches!(
+                    continuation.navigation_after_hydration,
+                    Some(MainListAfterHydration::RequiredFullscreen { .. })
+                ) {
+                    continuation.navigation_after_hydration = None;
+                }
+                if matches!(
+                    continuation.first_display_action,
+                    FirstDisplayAction::Zip { .. }
+                        | FirstDisplayAction::Pdf { .. }
+                        | FirstDisplayAction::WarmPdf
+                ) {
+                    // The exact current source/generation owns this bundled reopen. Keep
+                    // the ZIP/PDF maintenance tail, but consume its superseded page choice.
+                    self.fs_nav_after_pdf_enumerate = None;
+                }
             }
         }
         // Active means every fullscreen mutation is consumed. Only an exact target request is
         // retained above; an invalid/sibling request must not fall through to raw/final/video work.
         true
+    }
+
+    /// A chosen Rating landing is the reader endpoint while its exact owner prepares it.
+    pub(super) fn sidecar_restore_rating_deferred_target(&self) -> Option<usize> {
+        let state = self.sidecar_restore.as_ref()?;
+        if !self.sidecar_restore_context_current(&state.common) {
+            return None;
+        }
+        let deferred = state.common.deferred_fullscreen.as_ref()?;
+        (deferred.metadata_boundary == FsMetadataBoundary::RatingMembership
+            && deferred.matches_item(&self.items))
+        .then_some(deferred.idx)
+    }
+
+    pub(super) fn cancel_sidecar_restore_rating_deferred_target(&mut self) {
+        if self.sidecar_restore_rating_deferred_target().is_some() {
+            self.sidecar_restore
+                .as_mut()
+                .unwrap()
+                .common
+                .deferred_fullscreen = None;
+        }
     }
 
     #[cfg(windows)]
@@ -2287,12 +2380,13 @@ impl App {
             }
             if let Some(deferred) = state.common.deferred_fullscreen.take() {
                 if deferred.matches_item(&self.items) {
-                    self.open_fullscreen_with_materialization_and_contract(
+                    self.open_fullscreen_with_metadata_boundary(
                         deferred.idx,
                         deferred.trigger,
                         deferred.requested_materialization,
                         deferred.load_contract,
                         None,
+                        deferred.metadata_boundary,
                     );
                 } else {
                     #[cfg(windows)]
@@ -2333,12 +2427,13 @@ impl App {
                 .get(deferred.idx)
                 .is_some_and(|item| item.perf_key() == deferred.item_key)
             {
-                self.open_fullscreen_with_materialization_and_contract(
+                self.open_fullscreen_with_metadata_boundary(
                     deferred.idx,
                     deferred.trigger,
                     deferred.requested_materialization,
                     deferred.load_contract,
                     None,
+                    deferred.metadata_boundary,
                 );
             } else {
                 deferred_identity_mismatch = true;
@@ -4393,6 +4488,7 @@ mod tests {
             item_key: "page-key".into(),
             requested_materialization: FsOpenMaterialization::DeferredPageTurn,
             load_contract: FsPageLoadContract::LatestSeek,
+            metadata_boundary: FsMetadataBoundary::Manual,
         };
 
         assert_eq!(

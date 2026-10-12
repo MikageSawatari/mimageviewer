@@ -1,5 +1,11 @@
 # PDF render pool への HarvestOnCancel 導入計画
 
+> 2026-10-12 PDF-EPOCH-OWNERSHIP（未リリース）: この導入時のAbort/Harvest契約は維持する。
+> render要求の旧global整数epochはViewer immutable ticket／明示Unscopedへ置換した。
+> 失効はqueued prune/IPC前popに作用し、IPC受理後のreplyをepochだけで強制中断しない。
+> items generation/request IDによる画像採用と、source cache identityは従来どおり。
+> [所有設計・in-flight回帰](pdf-render-epoch-ownership-plan.md)が後継正本。
+
 ## 背景・問題
 
 直前の `Add context epoch to PDF render pool` (bf99edec, Codex 5 round 通過) で
