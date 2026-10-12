@@ -2,19 +2,22 @@
 
 作成: 2026-10-12 / Codex、基準: `next-tile` / `ea060b66e`。
 状態: **R3 `015b44c03` は独立レビュー ACCEPT・構造的修正への合意済み。実装未着手。**
-改訂 R4: 2026-10-12 の利用者確認を反映し、通常フルスクリーン／メイン内閲覧へ対象を拡張。
-拡張部分は再レビュー待ち、既定キーは §4.2 の候補から利用者が選択する。ここで実装を開始しない。
+改訂 R5: R4 `7d0d0cf0a` の再レビュー REVISE（P1 1件）と2026-10-12の利用者／coordinator判断を反映。
+既定キーは **O（Overview）で確定**。一覧からの選択は当該viewerの通常ページ移動と同じ扱いにする。
+拡張部分は再レビュー待ち。ここで実装を開始しない。
 R3 の非アクティブ context への Select 破棄・一覧維持の契約は保持する。
 公開時期は v4.6.0 の次の版の**後**。次の版の必須成果にはしない。
 項目・出典・時期の正本は [next-release-backlog.md §1.340](next-release-backlog.md#1340-複数ウィンドウの画像ウィンドウ内に本のページをタイル表示する--miv-スレ-509519-2026-10-07)。
-利用者の確定事項と未決定事項は §12／§15 で区別する。既定キーの候補を決定済みと扱わない。
+利用者の確定事項と改訂履歴は §12／§15／§16 で区別する。R4のキー候補はOの確定で置き換えた。
 スレ >>509 / >>519 の内容は backlog の要約を参照した。原文の追加調査・製品起動による観測は行っていない。
 
 ## 1. 要望と対象
 
 画像閲覧中に、その viewer の表示領域へページをタイル状に並べ、任意のページを
-選んで同じ viewer の閲覧へ戻る。メイン画面の場所・一覧・カーソル・選択・チェック・絞り込み・
-スクロール・履歴を変えず、他の画像／動画／音声窓の操作も妨げない。
+選んで同じ viewer の閲覧へ戻る。一覧の入場・cursor移動・scroll・取消は、メイン画面の場所・一覧・
+カーソル・選択・チェック・絞り込み・スクロール・履歴を変更しない。他のviewerの操作を妨げない。
+**ページ選択の確定後は通常ページ移動と同じ副作用を許可する**。通常閲覧／連動窓は既存のGrid追従、
+独立窓は既存のmain非干渉に従い、一覧選択専用のGrid保持例外を作らない。
 
 「全ページ」は、**その viewer が現在読む可視実ページ列の全体**を意味する。構成内の白紙は
 実ページの補助表示に限り、独立セル・独立選択・一覧総数の対象にしない。小窓へ全ページを
@@ -24,7 +27,7 @@ R3 の非アクティブ context への Select 破棄・一覧維持の契約は
 
 **対象は利用者決定（2026-10-12）**: 独立複数窓、F12 の連動一窓、通常フルスクリーン、
 メインウィンドウ内の画像閲覧（`ViewerPresentation::MainWindow`）で使える。
-通常閲覧でもメイン一覧の位置・選択・チェック・履歴は同じ保持契約とする。
+全surfaceで一覧を開いている間と取消時はGrid保持、選択時はそのviewerの通常ページ移動と同じ契約とする。
 一覧の入場だけで表示先／viewer context を変更せず、連動モードの既存同期仕様も変えない。
 通常のサムネイル Grid 自体ではこの一覧を開かず、既存の「一覧を開く」と共存する（§3.2）。
 動画・音楽の画面には画像用一覧を出さず、動画の S タイルと音楽ビューは従来のまま。
@@ -88,7 +91,7 @@ R3 の非アクティブ context への Select 破棄・一覧維持の契約は
 | 機能 | 役割／一覧を開いている間 |
 | --- | --- |
 | サムネイルストリップ | 近傍確認として存続。一覧中は描画・hit・需要の consumer を休止し、閉じた後は同じ設定で復帰。表示／固定設定を保存し直さない |
-| メイン一覧 | ファイル操作・検索・評価・製本などのフル機能一覧。今回のタイルにチェック、一括選択、削除、D&D、製本編集は持ち込まない。通常／メイン内／detachedの一覧開閉・選択で、メインGridの場所・位置・選択・チェック・絞り込み・場所移動履歴を変更しない |
+| メイン一覧 | ファイル操作・検索・評価・製本などのフル機能一覧。今回のタイルにチェック、一括選択、削除、D&D、製本編集は持ち込まない。一覧中のcursor／scrollと取消はGridを変更せず、Select受理後は通常ページ移動と同じGrid同期を行う（§5.1） |
 | 既存の「一覧を開く」 | コンテナをメイン画面のページ一覧に切り替える既存コマンド。通常Gridではそのまま使え、複数窓での既存拒否も維持。今回の「ページ一覧」は閲覧surface内の一時的なページ選択で、メインのitems置換／コンテナopen／Grid表示への退出を行わない。双方の名称・入口・意味を区別し、既存コマンドの実行先を新機能へ読み替えない |
 | 動画 S | 時間位置へ seek する既存機能。画面の発見性・戻る操作を参考にするが、動画 state の bool / pending 群や decoder をコピーしない |
 | 単ページ／見開き／横長分割／連結 | 設定と現在位置を保持。タイル選択を既存の absolute seek 着地へ渡す。見開きは選んだ実ページを含む canonical unit、分割は既存 seek の slice 方針、連結は既存 seek の位置へ戻す |
@@ -102,7 +105,7 @@ R3 の非アクティブ context への Select 破棄・一覧維持の契約は
 
 新規 `KeyAction::FsPageOverviewToggle`（仮称）を **FsCommon / Press / no-repeat** として追加する。
 バー／「…」の「ページ一覧」に加えて、**既定キーを設けることは利用者決定済み**。
-最終 chord は §4.2 の候補から利用者が選ぶ。S は `FsSlideshow`、動画 S は `VideoTileMode` を維持し、
+既定は **O（Overview、利用者決定2026-10-12）**。S は `FsSlideshow`、動画 S は `VideoTileMode` を維持し、
 今回のために再割当しない。コマンド設定・適格なリング／ジェスチャ候補・ヘルプにも同じ入口を出す。
 
 一覧用のローカル `KeyContext::FsPageOverview`（仮称）を設け、一覧の scope 集合を
@@ -113,7 +116,7 @@ deferred callback は現在の effective keymap を read-only 投影として受
 
 | 操作 | 提案する Action / 既定 |
 | --- | --- |
-| 入場／取消 | `FsPageOverviewToggle`、既定chordは§4.2の利用者選択待ち。Open 時も同じ toggle を許可 |
+| 入場／取消 | `FsPageOverviewToggle`、既定O。Open 時も同じ toggle を許可 |
 | 選択確定 | `FsPageOverviewConfirm` / Enter。既存 IME-safe helper と input permit を使用 |
 | 行単位で画面送り | `FsPageOverviewPagePrev` / PageUp、`FsPageOverviewPageNext` / PageDown |
 | 先頭／末尾カーソル | `FsPageOverviewFirst` / Home、`FsPageOverviewLast` / End |
@@ -170,27 +173,33 @@ Ctrl／sibling navigation → overview confirm → その他の一覧 Action／�
 一覧の key／wheel／pointer は root の `process_scroll`、Grid selection／check、メインの
 コンテナopenへ漏らさず、通常fullscreen／detachedと同じ resolver／command を使う。
 
-### 4.2 既定キー候補（R4、利用者選択待ち）
+### 4.2 既定キー O（Overview、利用者決定2026-10-12）
 
-`015b44c03` の `src/keymap.rs` の `default_chords()`／`context()`／`FS_IMAGE_ACTIVE_SCOPES`、
-`docs/keymap-spec.md` の fullscreen共通／画像／固定入力を静的に照合した。
-画像閲覧の active scope は **Global + FsCommon + Rating + FsImage**、Gridは含まれない。
-一覧のscopeと許可Actionは§4.1に従う。修飾はexact matchで、plain Q等の既定をCtrl+Qへ流用しない。
-以下は**既定割当での空き**であり、個人のoverrideやOS外部hotkeyまで非衝突を保証するものではない。
-実装時は利用者のeffective keymapに通常の競合表示を行う。今回はキー設定を書き換えない。
+**既定は修飾なしOで確定**。R4のCtrl+D／Ctrl+W／Ctrl+Q候補は採用しない。
+`7d0d0cf0a` の `src/keymap.rs` の `default_chords()`／`context()`／`FS_IMAGE_ACTIVE_SCOPES`／
+`RESERVED_BINDINGS`、`docs/keymap-spec.md` の固定入力とゲームパッド仕様、`src/`のO入力参照を
+静的に照合した。画像閲覧のactive scopeは **Global + FsCommon + Rating + FsImage**。
+一覧のscopeと許可Actionは§4.1に従い、通常fullscreen／メイン内／連動・独立detachedで同じ意味にする。
 
-| 候補 | 既定割当／contextの照合 | 理由・留意点 |
-| --- | --- | --- |
-| **Ctrl+D（第一候補）** | `Chord::ctrl(D)` は `GridDeselect`（Grid）のみ。画像閲覧の上記4scopeと一覧の許可集合に同chord無し | 左Ctrl＋左手ホーム段Dで届きやすく、Displayの連想が可能。Gridでは既存のチェック解除を維持する。メイン内閲覧でもGridDeselectを発火させないことを回帰対象にする |
-| **Ctrl+W** | `default_chords()` に `Chord::ctrl(W)` 無し。画像閲覧のGlobal／FsCommon／Rating／FsImageにも既定Action無し | 左Ctrl＋左手上段W。W=window内の一覧と連想でき、Gridの既定とも重ならない。他アプリでは「閉じる」の慣習がある点は選択時の留意点 |
-| **Ctrl+Q** | `default_chords()` に `Chord::ctrl(Q)` 無し。plain Qは `FsClearAdjust`／`GridClearAdjust` だがexact modifiersで別chord | 左Ctrl＋左手上段Q、Quickな一覧として覚えられる。修飾は一つ。他アプリでは「終了」の慣習があるため、押し間違いの印象も含め利用者が選ぶ |
+| 照合対象 | 現行のOとの関係／設計上の扱い |
+| --- | --- |
+| KeyAction既定 | 上記画像閲覧scopeにはplain O無し。Ctrl+OはGlobalOpenFolderで、exact modifiersにより別chord。plain Oを割り当て済みのEraseToolEllipse／ConcealToolEllipse／LaToolEllipseは編集専用scopeで、一覧のavailabilityと排他。編集の楕円操作は変更しない |
+| 固定キー／OS予約 | keymap-specの固定扱いとRESERVED_BINDINGSはEsc／矢印／GridのShift+矢印等。plain Oは予約されていない。srcのKey::O／VK 0x4F参照はキー変換・転送で、閲覧用の別の固定O操作は見つからない。Endのscan code 0x4FをOのVKと混同しない |
+| マウス／タッチ | wheel、click、drag、タッチ、右ドラッグ取消などはpointerの固定入力／設定済みcommand。keyboard Oを生成・消費する固定入口は見つからない。既存入力をOの代わりに読み替えない |
+| ゲームパッド | A/B/X/Y等のボタン・方向・トリガーとリングはgamepad入力／command経路。keyboard Oとの重複無し。Oを押したために既存pad操作を無効化しない |
+| TextInput／IME／modal | Oは通常の文字でもあるため、既存input permitとmodal優先規則を使用。文字入力中のOを一覧へ奪わず、IME変換／確定や編集に漏らさない |
 
-S／Shift+S／Ctrl+Sはそれぞれslideshow／strip／captureで使用済み、Ctrl+FはGlobalLocalSearch、
-Ctrl+EはFsExportなので候補にしない。Shift単独はFsLoupeHold、Alt単独はFsNavigatorHoldのため、
-保持UIとの併発を避ける観点でもCtrl系を候補とした。左Ctrlなら右Ctrl限定の原画像holdと区別できる。
-この候補3件は通常fullscreen／メイン内閲覧／連動・独立detachedで同じ意味にする。
-`src/ui_fullscreen.rs` のW／Dの静的shortcut probeは計装用で実ハンドラではなく、新しい割当ではない。
-選定後に `default_chords`／同梱default／ヘルプとscope別dispatchを更新・検証する。
+以上は現行既定／固定入力の静的確認で、個人のoverride・OS外部hotkeyまで非衝突を保証するものではない。
+利用者が既にOを別Actionへ割り当てていれば通常の競合表示を行い、設定を勝手に変更しない。
+S／Shift+S／Ctrl+Sはslideshow／strip／captureのまま保持する。
+
+実装時は `KeyAction::FsPageOverviewToggle` の **ini_name=`FsPageOverviewToggle`、context=`FsCommon`、
+trigger=Press/no-repeat、default_chords=`ChordList::one(Chord::key(O))`**、`ALL_ACTIONS`、
+`description()`、consumerのkeymap helperを揃える。`docs/keymap.ini.default`は生成参照と一致する
+`# FsPageOverviewToggle = O` にし、`docs/keymap-spec.md`／コマンド設定／ヘルプにも反映する。
+`bundled_keymap_default_matches_generated_reference`等のinventory・default検査、§4.1の競合・scope・
+実行可能集合、text inputと固定入力のhandler回帰を同時に検証する。
+今回の変更は設計だけで、`src/keymap.rs`や同梱defaultを先行変更しない。
 
 ## 5. 状態と所有境界
 
@@ -206,14 +215,27 @@ detachedへの退避／復帰は`ViewerContextBundle`と一括交換する。通
 新contextを生成せず、App-global detached flagも作らない。empty / mount / swap / split / fork / retire / Drop と
 production context audit を同時に配線する。サムネイルの request / pixel / channel は既存 owner のまま。
 
-### 5.1 通常fullscreen／メイン内閲覧への拡張（R4再レビュー対象）
+### 5.1 一覧閲覧中のGrid保持と、選択後の通常ページ移動（R5再レビュー対象）
 
-一覧のcursor／scroll／列数は`PageOverviewSession`に置き、メインGridの`selected`、
-`grid_click_selection_anchor`、`checked`、`scroll_offset_y`／pending scrollを流用・更新しない。
+一覧のcursor／scroll／列数は`PageOverviewSession`に置く。**一覧を開いている間のcursor移動／scrollと
+取消**では、メインGridの`selected`、`grid_click_selection_anchor`、`checked`、
+`scroll_offset_y`／pending scrollを流用・更新しない。
 同じitemsを使う通常閲覧でも、一覧入場のために`load_folder`／`start_loading_items`／items再採用／
 場所履歴の追加・cursor移動を行わない。元のGrid状態を戻すための全件snapshot／rollbackも作らない。
-選択着地はactive viewerの既存absolute seekへ渡し、読書位置等の記録は既存viewer writerに任せる。
-この記録とメイン一覧の場所移動履歴は区別し、一覧の開閉・選択がメイン一覧の履歴を進めない。
+**Selectを受理した後は、そのviewerの通常ページ移動と同じ扱い**で既存absolute seekへ渡す。
+単ページの`sync_main_selection_from_viewer_idx`、連結の`seek_to_continuous_page_with_contract`の
+cursor／scroll更新、読書位置・読書履歴記録、連動F12の後続同期を省略・変更しない。
+
+| viewer | 一覧閲覧中／取消 | Select受理後の期待値 |
+| --- | --- | --- |
+| 通常fullscreen／メイン内閲覧 | メインGridを変更しない | 同viewerでの通常ページ移動と同じGrid追従。10ページ目から40ページ目を選べば既存規則でGrid cursorとscroll要求も40へ進む |
+| 連動F12窓 | メインGridを変更しない | 通常ページ移動と同じGrid／viewer同期。Gridを旧10へ保持してviewerを戻す例外を作らず、後続同期でも40を保持する |
+| 独立画像窓 | メインGridを変更しない | 通常ページ移動と同じ窓内着地。独立contextのcursor更新はそのcontextへ閉じ、main Gridを動かさない既存所有境界を維持する |
+
+通常のページ移動に伴う履歴・選択anchor等の更新は、そのviewerの既存規則に従う。
+一覧選択専用のnavigation origin、着地とGrid同期を分離する契約、同期抑止flag、snapshot／rollbackは
+作らない。Grid追従の有無を一覧側で独自に判断せず、既存の単ページ／連結／連動／独立境界に任せる。
+R3の非active Select破棄が先に成立した場合は着地もGrid同期も行わず、元一覧を維持する。
 取消／選択後も同じpresentationで閲覧を続ける。新機能は`FsBackToList`／close-to-page-listを呼ばず、
 メインGridへ退出しない。後の明示的なviewer退出自体は既存コマンドの契約に従う。
 
@@ -471,6 +493,9 @@ IPC payload を変更する必要は現提案にはなく、変更するなら�
 - **採用**: items／構成／読み順が変われば一覧を閉じ、次回入場で参照し直す。
   設定変更ごとの専用 live rebuild、rollback、一覧位置の復旧 pending を足さない。
 - **採用**: 既存 conversion／password／保存 modal の中では新規一覧操作を開始しない。
+- **採用（R5 利用者／coordinator判断）**: 一覧選択を通常ページ移動の既存経路・既存同期時点へ揃える。
+  一覧閲覧中／取消だけGridを保持し、Select受理後のGrid追従は通常／連動／独立の既存規則に任せる。
+  一覧起点だけGrid同期を抑止するnavigation origin／効果分離の組合せは作らない。
 - **採用（R3 coordinator判断）**: Select処理時に元contextが非アクティブならSelectを破棄し、一覧を残す。
   Aへ戻って選び直す仕様とし、background landing、共通navigationのpresentation分離、
   非active窓のClosed投影／ロード回収の状態組合せを作らない。
@@ -487,8 +512,8 @@ IPC payload を変更する必要は現提案にはなく、変更するなら�
 
 今回は docs だけを書く。R3 `015b44c03` は独立レビューACCEPT、
 「detached §2 に沿う構造追加であり症状パッチではない」ことへの合意済み。
-通常fullscreen／メイン内閲覧へ広げるR4の所有・入力・着地・メインGrid保持は再レビューに出し、
-拡張部分の合意と利用者による既定キー選択の後に実装へ進む。
+通常fullscreen／メイン内閲覧への拡張はR4再レビューでP1が出たため、R5の通常ページ移動との
+同一契約・O入力を再レビューに出す。キー選択は確定済みで、拡張部分の合意後に実装へ進む。
 §1.242 統合後の projection／landing API の差分もレビュー対象に含める。
 一つの chunk で shared file の writer は実装担当一人とし、別 worktree の master 更新と突き合わせる。
 
@@ -544,13 +569,18 @@ coordinator は有効な結果を再利用し、項目の最後に `test-full.ps
     Aの一覧Open・閲覧位置・cursor・需要が保持され、Selectの再配送／保留が無いこと。
     Aへ再復帰しても旧Selectは発火せず、利用者の新しいSelectだけが既存着地へ一度進むこと。
     stamp不一致／terminal close は破棄、証明のない unfocused generic event／held は非実行となること。
-19. 通常fullscreen／メイン内閲覧／連動一窓／独立窓のOpen→scroll／cursor→CancelとOpen→Selectで、
+19. 通常fullscreen／メイン内閲覧／連動一窓／独立窓のOpen→scroll／cursor→Cancelでは、
     メインGridの場所・items／generation・selected・選択anchor・checked・filter・scroll／pending scroll・
-    場所移動履歴／cursorが不変。読書位置の確定だけ既存writerへ渡し、各surfaceで同じ実ページへ着地すること。
+    場所移動履歴／cursorが不変。Open→Selectは、そのviewerで一覧を使わず同じtargetへ通常移動した対照と
+    Grid同期・scroll要求・読書位置／履歴の効果が一致すること。10→40の選択で通常／連動はGridも40へ追従し、
+    独立窓はmain Gridを10に保つ。Select直後だけでなく後続描画・連結再アンカー・連動同期まで通し、
+    選択ページを維持して旧Grid選択へ戻らないこと。続いてGridを利用者が明示操作した場合は、
+    連動窓は従来どおり追従、独立窓は従来どおり非連動であること。
     一覧の開閉・選択でpresentationを変えず、通常Gridの「一覧を開く」は従来どおりメインページ一覧へ切り替わる。
-20. 利用者が選定した既定chordを通常fullscreen／root embedded／連動・独立detachedの同じscopeでdispatchし、
-    Open時も同じtoggleで戻れること。root embeddedでGridやGlobalの未許可Actionへ漏らさず、
-    Ctrl+D採用時もGridDeselectの実行0回・mainのchecked不変、通常Gridでは既存Ctrl+Dチェック解除を維持。
+20. 既定Oを通常fullscreen／root embedded／連動・独立detachedの同じscopeでdispatchし、
+    Open時もOで戻れること。root embeddedでGridやGlobalの未許可Actionへ漏らさず、
+    Ctrl+Oのフォルダopen、編集scopeのO楕円、固定pointer／gamepad／キーを変更しないこと。
+    TextInput／IME／modal中はOを一覧へ流さず、held repeatでOpen→Closeが繰り返されないこと。
     S／Shift+S／Ctrl+Sを変更せず、ユーザーoverrideの競合表示とヘルプ／リングの実行可能集合が一致すること。
 
 自動検証コマンド（filter 名は実装後に実在名と件数を記録）:
@@ -571,8 +601,10 @@ python scripts/check_ui_glyphs.py
 
 独立完了レビュー後に正常 profile の `build-dev.ps1` で確認 binary を作る。
 本人が実機で確認する具体シナリオは、通常fullscreenとメイン内閲覧のそれぞれでメインGridの
-位置・選択・チェック・履歴を控え、既定キーとバー／「…」で一覧を開き、取消／別ページ選択後も
+位置・選択・チェック・履歴を控え、Oとバー／「…」で一覧を開き、cursor移動／scroll／取消で
 元のGrid状態が保持されること、RTLとslideshow休止／退出後再開を確認する。
+一覧から10→40を選択すると通常／連動ではGridも通常ページ移動と同じく40へ追従し、後続描画／
+連結再アンカー／連動同期でも選んだページが維持されることを確認する。独立窓ではmain Gridを動かさない。
 次にメイン一覧を残して ZIP と PDF/EPUB の独立画像窓を二つ開き、
 一方で一覧を開く→スクロール→他窓へ移る→passive の窓を拡大／DPI変更→新たに露出した
 未生成セルを最初のクリックで選択、取消、F11 を確認する。独立静止画窓の F12 は無効が期待値。
@@ -595,12 +627,14 @@ Bのactive ownerを保持することも重点とする。background landingの�
 利用者確認済み（2026-10-12）:
 
 1. バー／「…」の「ページ一覧」に加え既定キーを付ける。S slideshowは変更しない。
-2. 通常fullscreen（メイン内閲覧を含む）とdetachedを対象にする。メイン一覧保持の契約は共通。
+2. 通常fullscreen（メイン内閲覧を含む）とdetachedを対象にする。一覧閲覧中／取消はGrid保持、
+   選択受理後は通常ページ移動と同じ扱い（R5決定）。通常／連動はGrid追従、独立窓はmain非干渉。
 3. 単クリックで戻る、RTLの行内順、取消で元ページ維持、一覧中だけ当該viewerのslideshow休止・退出後再開。
 4. 現在読む列全体を対象にし、階層をまたがない。画像だけの列の適格性は既存stripと同じ規則を使う。
 
-**既定chordだけは利用者選択待ち**。§4.2のCtrl+D／Ctrl+W／Ctrl+Qから候補を提示し、
-実装担当が最終キーを決めない。対象拡張の所有境界はR4として再レビューに出す。
+5. **既定chordはO（Overview）で確定**。固定入力との照合とKeyAction実装前提は§4.2。
+
+キー選択待ちは解消済み。対象拡張のP1へ通常ページ移動との同一契約で対応したR5を再レビューに出す。
 
 初回設計提出（`6432e8e04`）の文書作成時の記録: 成果は設計文書と索引／§11 記録のみ。
 実装担当による製品コード変更 0、製品起動 0、コミット 0（文書のコミットは coordinator）。
@@ -653,7 +687,7 @@ Rustテスト0件、通常／portable core check各0回、test-full・build各0�
 文書のみのためCargoは再実行しない。ローカルリンク15箇所・欠落0、受入計画18ケース群を検査し、
 `git diff --check` 成功（exit 0）。受入ケースの実装検証は未実施。
 
-## 15. R3 ACCEPT と利用者確認による R4 拡張（2026-10-12）
+## 15. R3 ACCEPT と利用者確認による R4 拡張（2026-10-12、履歴）
 
 利用者が提示した結果: **R3 `015b44c03` は独立レビュー ACCEPT、構造的修正であることへ合意済み**。
 基本owner／exact demand／immutable projection、非active Select破棄の合意を保持する。
@@ -670,3 +704,24 @@ R3の合意を拡張部分まで自動的に承認済みと扱わず、再レビ
 通常／portable core check各0回、test-full・build各0回、製品起動0回、コミット0回。
 改訂の検証: 本書と他3文書の追加行のローカルリンク16箇所・欠落0、候補3件の既定chordの
 静的照合、受入計画20ケース群を検査し、`git diff --check`成功（exit 0）。実装検証は未実施。
+
+## 16. R4 再レビュー P1 と O 確定への R5 対応（2026-10-12）
+
+対象 R4 `7d0d0cf0a`、利用者が提示した独立再レビュー: **REVISE、P1 1件、P2 0件、P3 0件**。
+R3の構造合意は維持、R4拡張全体への合意は保留。通常単ページのGrid同期、連結のcursor／scroll更新、
+連動のGrid→viewer同期があるため、R4の「Select後もGrid保持」は既存absolute seekだけでは成立しなかった。
+
+利用者はOを既定キーに確定。coordinatorはCLAUDE.mdの「既存機能と同じ経路・同じタイミングに揃える」
+簡素化を採用し、一覧Selectを通常ページ移動と同じ扱いにする仕様を決定した。
+§1／§3.2／§5.1のGrid保持を一覧閲覧中・取消に限定し、Select受理後は通常／連動でGrid追従、
+独立窓ではmain非干渉という既存規則へ揃えた。レビュー提案のnavigation起点別の着地／Grid効果分離は
+採用せず、同期抑止flag・snapshot／rollbackも追加しない。R3の非active Select破棄は維持する。
+ケース19／実機手順に通常移動との対照と後続描画・連結再アンカー・連動同期・明示Grid操作を追加した。
+
+§4.2／ケース20はOの確定仕様へ更新。KeyActionのini_name／context／default_chords／ALL_ACTIONS／
+同梱defaultを揃える実装前提と、固定キー・マウス・ゲームパッド・編集scope／TextInputとの境界を記載。
+候補比較・Select後のGrid保持という§15のR4記録は履歴で、現行契約はこのR5を優先する。
+今回の変更は設計と索引・backlog・detached記録のみ。再レビュー待ちで停止し、実装着手の合意を主張しない。
+Rustテスト0件、通常／portable core check各0回、test-full・build各0回、製品起動0回、コミット0回。
+改訂の検証: ローカルリンク16箇所・欠落0、現行O関連既定chord式4件（Ctrl+O 1件、編集O 3件）と
+固定入力境界を静的照合。受入計画20ケース群を検査し、`git diff --check`成功（exit 0）。実装検証は未実施。

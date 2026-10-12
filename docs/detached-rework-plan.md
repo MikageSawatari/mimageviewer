@@ -1528,6 +1528,21 @@ R3の非active Select破棄・元一覧維持の契約は継続する。
 
 今回も設計のみ、実装・製品起動・コミットなし。R4拡張再レビューと既定キー選択待ちで停止する。
 
+**R4再レビューP1／既定OのR5改訂（2026-10-12、対象 `7d0d0cf0a`）**:
+利用者が提示した再レビューはREVISE（P1 1件、P2/P3 0件）。R3の構造合意は維持、拡張全体は保留。
+利用者はO（Overview）を既定キーに決定。閲覧scope、固定キー／マウス／gamepad、編集scopeのOを
+静的に照合し、設計書§4.2で確定仕様とKeyAction／同梱defaultの実装前提を記載した。
+
+- coordinatorの簡素化判断により一覧Selectを通常ページ移動と同じ経路・Grid同期に揃える。
+  一覧閲覧中／取消はGridを変更せず、受理Select後は通常fullscreen／メイン内／連動F12で
+  既存Grid追従、独立窓では既存main非干渉に従う。R4の「選択後もGrid保持」を撤回する。
+- `sync_main_selection_from_viewer_idx`／連結seekのcursor・scroll更新／後続連動同期を抑止せず、
+  一覧専用navigation origin、着地／Grid同期分離、snapshot／rollback、App-global抑止flagを作らない。
+- 受入ケース19は通常移動との対照と、10→40選択後の描画・連結再アンカー・連動同期、
+  続く明示Grid操作を含む。R3の非active Select破棄／元一覧維持の契約は変更しない。
+
+設計書§16に判断と検証範囲を記録し、R5再レビュー待ちで停止。今回も実装・製品起動・コミットなし。
+
 ### 2026-10-11 §1.371: 評価集合の公開を安定context境界へ移す構造合意（設計段階）
 
 利用者が提示した独立再レビュー（対象 `94bc236d1`、rating-filter-fullscreen-plan R2）は、
