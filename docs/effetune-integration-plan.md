@@ -710,6 +710,14 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
   新版の保存状態互換、SFZ / Adaptive Prediction の実使用中の通信・保存範囲、
   最終署名 artifact は公開前の実機確認事項として残る。
 
+### 10.5 説明ページの版を上げる手順 (2026-10-12)
+
+説明ページは現在の版だけ公開する。vendor の VERSION と資料 snapshot を更新して
+`python scripts/gen-effetune-docs.py` を実行し、`manual/effetune/v*/` の他版を削除して `--check` を通す。
+自動削除より単純で誤削除を避けられる残存検査を選択した。現在版の正本は vendor VERSION で、生成時に
+`.htaccess` の印付きブロックも更新する。全他版を一つの301規則で同名ファイルへ、廃止ページは現在版の index.html へ送る。
+公開時はサーバ上の旧版も削除し、生成物と `.htaccess` を同時反映する。sitemap はコミット後に再生成する。
+
 ## 11. 試験版の引き渡し時点の記録 (2026-09-28)
 
 - 独立コードレビュー (実装者と別の Sol、5 回) の最終判定: SHIP-FOR-USER-TEST。

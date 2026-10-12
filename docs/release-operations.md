@@ -10,6 +10,7 @@
   CLAUDE.md Phase 5 を参照。ここでは重複させない。
 - このメモに個人情報・認証情報・証明書拇印・注文番号などは載せない
   (証明書 subject / 拇印は `scripts/sign-files.ps1` と環境変数に閉じる)。
+- EffeTune 説明ページの公開前は `python scripts/gen-effetune-docs.py --check` を通す（旧版残存と301の同期を検査。[版更新手順](effetune-integration-plan.md#105-説明ページの版を上げる手順-2026-10-12)）。
 
 ---
 
