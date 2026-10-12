@@ -14,7 +14,7 @@
 | [libraw-source-distribution.md](libraw-source-distribution.md) | LibRaw の対応ソース・checksum・notice の準備と公開手順 |
 | [architecture-overview.md](architecture-overview.md) | 全体像の把握。レイヤー構造・モジュールマップ・永続化ストア一覧 |
 | [book-composition-plan.md](book-composition-plan.md) | §1.242 本の構成。利用者決定・G1〜G5の契約、G2のmodel/store/lifecycle、G3の共通projection・表示許可・mode-only・E接続。G4Fは2026-10-12に切り離し、画像folderは構成対象外。ZIP変換は次段の設計確認待ち。次々回リリース向けnext-bookで開発 |
-| [image-folder-to-zip-plan.md](image-folder-to-zip-plan.md) | §1.242 の独立した画像folder→Stored ZIP変換の設計案（2026-10-12、独立レビュー前）。利用者データ複製の棚卸し、modal/保存票/sidecar/Remote所有、Collection個別ページ参照の範囲、同名folder省略の既定ONと互いに逆向きの設定の優先順位 |
+| [image-folder-to-zip-plan.md](image-folder-to-zip-plan.md) | §1.242 の独立した画像folder→Stored ZIP変換の設計案（2026-10-12、独立レビュー前）。データ複製、modal/保存票/sidecar/Remote所有、Collection個別ページ参照。同名folder/本は案Bの3択・新既定「本を表示」。旧ON（既定含む）→本表示、旧OFF→両方表示の移行は2026-10-12利用者決定済み |
 | [thumbnail-request-lifecycle-plan.md](thumbnail-request-lifecycle-plan.md) | §1.360 サムネイル要求とCPU画像の単一owner、保存/画像両終端、request ID相関、動画のidle/repaint/進捗投影、tray両測定、回帰・検証証拠 |
 | [section327-startup-window-flicker-investigation.md](section327-startup-window-flicker-investigation.md) | §1.327 起動時の白窓、native診断の採取・観測限界、利用者ログで確認した最大化起動の原因、採用したnormal表示後の一度だけの最大化 (§8)。大規模backend案 (§7) は将来候補 |
 | [display-pipeline.md](display-pipeline.md) | サムネイル表示・フルスクリーン描画を触るとき。**補正/AI/回転の適用順の決定版** |

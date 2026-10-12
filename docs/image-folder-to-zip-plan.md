@@ -17,11 +17,15 @@ sidecar v2を復活させない。G1〜G4のZIP/PDF/EPUBと、既存のfolder閲
 3. タグ、★、編集、しおり等は初回利用からZIP側へ複製する。元側の登録を消さない。
 4. 変換はモーダル。他の操作と組み合わせてsupersession/rollbackを作る案は採らない。
 5. folder右クリックと、folderで本の構成を開こうとしたときの案内に「ZIP に変換」を置く。
-6. 環境設定「同名ファイル」に、同名ZIPがあるfolderを省略する設定を追加する。既定ON。
-   一覧とCtrl+↑↓の両方へ適用し、公開時に更新履歴と「重要な変更点」へ記載する。
+6. **後続決定・案B（2026-10-12）**: 環境設定「同名ファイル」の既存folder/本のboolを
+   「本を表示 / フォルダを表示 / 両方表示」の1つの3択へ置き換える。新規の既定は「本を表示」。
+   ZIPだけでなくPDF/EPUB/RAR/7z/LZHへ共通に適用する。反対向きのboolは追加しない。
+   一覧とCtrl+↑↓等へ適用し、公開時に更新履歴と「重要な変更点」へ記載する。
+   released boolは**旧ON（既定を含む）→「本を表示」、旧OFF→「両方表示」**へ移す
+   （2026-10-12利用者決定、§8.3）。「重要な変更点」で告知し、「フォルダを表示」への戻し方を案内する。
 7. まれな失敗は既定の割り切り（ログ + 通知、可能ならこの操作の未完成ZIPを除去）。
 
-以下の取消境界、完了後の選択、同名設定の優先順位、データ複製の詳細は設計提案。
+以下の取消境界、完了後の選択、データ複製の詳細は設計提案。旧同名設定の移行方針は利用者決定済み。
 特に§5のCollection個別画像参照は既存機能の型拡張を要する。これを含む範囲を
 独立レビューと設計担当の確認で閉じてから実装する。引継ぎを後の版へ黙って延期しない。
 
@@ -46,6 +50,7 @@ sidecar v2を復活させない。G1〜G4のZIP/PDF/EPUBと、既存のfolder閲
 | `crates/remote-ipc/src/lib.rs`、`remote_ipc/persistent_collections.rs` | Collectionのwireには既にRemoteAddress/ZipEntry、Image、opaque source_identityがある。内部source型拡張だけでwire変更が必須とは限らない |
 | `remote_ipc/session.rs::with_local_composition_admission` | Local受付とRemote acquireの短いmutex境界があるが、callback終了後の長い処理の排他leaseではない |
 | `settings_transfer.rs` | 同名設定はportable preferences対象。現行assertは全457 / 対象144 / 除外313、wire142。これはコード値であり今回実行した試験数ではない |
+| `settings_db.rs::RemoteListingSettings` / `load_into_settings_inner`、`settings_transfer`のv1 parse | 現行boolはDB、Remoteの最新設定overlay、preferences wireに存在する。runtimeの3択だけでなく各読取/保存と旧形式の互換入口を変更する必要がある |
 
 本設計のレビュー根拠は上のコード、[アーキテクチャ](architecture-overview.md)、
 [仮想folder](virtual-folders.md)、[非同期](async-architecture.md)、
@@ -363,55 +368,138 @@ DB/FS障害はログと日本語通知。再試行loop、独自journal、補償t
   操作が完了済みかのpersistent pending正本を追加しない。
 
 途中失敗時にtarget ZIPが残ると、新設定で元folderが一覧から省略される場合がある。
-エラー通知に元folderの場所と、必要なら同名folder省略をOFFにして開けることを明記する。
+エラー通知に元folderの場所と、必要なら同名のfolderと本の設定を「フォルダを表示」または
+「両方表示」にして開けることを明記する。
 除去できなかったZIPを、再実行で黙って削除する処理はしない。
 
-## 8. 同名ZIPがあるfolderを省略する設定
+## 8. 同名のfolderと本を1つの3択で扱う（案B・利用者決定2026-10-12）
 
-提案field: `Settings.skip_folder_if_zip_exists: bool`、serde欠落時/Defaultともtrue。
-表示: 「同名の ZIP がある場合、フォルダを省略」。対象は**実fileの `.zip`**。
-CBZ/PDF/RAR等へ新設定の対象を黙って広げない。ZIPの内容validityではなく既存一覧でのfile資格を使う。
-ZIP名の実directoryをZIPと推測しない。folder名全体とZIPのstemを既存case/path規則で照合する
-（`本.pdf` folderの相手は`本.pdf.zip`、`本.pdf` fileではない）。
+### 8.1 唯一の設定と共通pure policy
 
-### 8.1 逆向き設定との優先順位
+既存`skip_zip_if_folder_exists`（既定ON、v0.3.0からreleased）のruntime boolを、
+提案field `Settings.same_name_folder_book: SameNameFolderBookPolicy`へ置き換える。
+値は `PreferBook / PreferFolder / ShowBoth`、新規設定のDefaultは`PreferBook`。
+保存用のcanonical値は `prefer_book / prefer_folder / show_both`を提案する。
+旧boolは互換読取りの入力にだけ使い、live Settings・UI・worker・Remoteに二重の正本を残さない。
+`skip_folder_if_zip_exists`は作らない。旧boolからruntimeの反対向きboolを導出して配る案も採らない。
 
-現行`skip_zip_if_folder_exists`も既定ONなので、各filterを独立にraw候補へ適用すると両方消える。
-worker上の同じimmutable候補集合から共通pure policyで片側を決める。
+表示ラベル:
+「同名のフォルダと本 (ZIP/PDF/EPUB/RAR/7z/LZH) がある場合」
+選択肢: **「本を表示」 / 「フォルダを表示」 / 「両方表示」**。
 
-| 新: folder省略 | 旧: 本側省略 | 実folder F + 同名実ZIP Zの表示 |
-| --- | --- | --- |
-| ON | ON | Zのみ（新規のZIP優先が先） |
-| ON | OFF | Zのみ |
-| OFF | ON | Fのみ（従来どおり） |
-| OFF | OFF | 両方 |
+| 選択 | 同名の実folderと、表示対象の本fileがある場合 |
+| --- | --- |
+| 本を表示（新規の既定） | 本fileを残し、folderを省略 |
+| フォルダを表示 | folderを残し、同名の本fileを省略 |
+| 両方表示 | folder/本の相互省略を行わない |
 
-source種類/hiddenの採否を済ませた**候補ZIP**を使う。種類設定等でZIPを表示しない場合、
-それを優先して唯一のfolderまで消さない。既存の同名ZIP/CBZ→変換書庫、PDF→EPUB、
-動画/音声→画像、重複画像の規則もこの生存候補と順序を共有し、二段の相互消去を検査する。
-新規ZIP優先は対応するF/Zの選択を変える承認済み仕様で、他のname groupの順位を変えない。
+本はZIP/PDF/EPUB/RAR/7z/LZHを同じ規則で扱う。ZIP/CBZ等の既存の同種別別名も
+現行の本資格を維持する。変換書庫のIgnore、非先頭volume等は既存のworker分類に従い、
+本として提示しない候補を優先してfolderを消さない。
+`.zip`/`.pdf`という名前の実directoryを本fileと推測しない。folder名全体と本fileのstemを
+既存case/path規則で照合する（`本.pdf` folderの相手は`本.pdf.zip`等）。
+純粋関数の入力はworkerが確定した実体種類・照合名・3択で、関数内にFS/DB I/Oを入れない。
+
+source種類/hiddenの採否 → 本同士の既存優先規則 → folder/本の3択 → 従来の後段投影を
+同じ候補集合へ適用する。本同士の`skip_archive_if_zip_exists`（ZIP/CBZ優先）と
+`skip_epub_if_pdf_exists`（PDF優先）は独立した既存設定として維持する。
+同名の本が複数あるときも、それらの生存候補を3択へ渡す。folderを省略する側の本が
+別filterで全部消えた後に、folderだけが省略された結果を作らない。
+逆に「フォルダを表示」で本が省略されても、同じ集合のfolderを再度省略しない。
+種類設定で本を対象外にした場合はfolderを残す。rating/tag等の既存後段facetの意味は変えない。
 
 ### 8.2 接続するproducerと設定の適用
 
-- `book_materialization`の通常一覧、共通folder scanを使うsubfolder expansion / Smart / Remote。
-  行・display metadata・sort metadataを対で省略し、zipとfolderのcacheが同名だけで混ざらない。
-- `FolderTreeOptions`とsorted_subdirs/DFS/Ctrl+↑↓。一覧と同じpure policyを呼び、
-  新しく各child folderの内容を走査しない。省略された現在folderのanchorは位置探索のため保持し、
-  次/前の着地対象からだけ外す。limit=0でも新設定は同名省略規則として適用する。
-- folder scan signature / page-count cache条件 / nav memo / prepared settings snapshotへ新fieldを含める。
+- `book_materialization`の通常一覧、共通folder scanを使うSmart / subfolder expansion / Remote。
+  一つのpure policyを呼び、行・display metadata・sort metadataを対で省略する。
+  formatごとの分岐へ別々のbool条件を増やさない。
+- `FolderTreeOptions`、sorted_subdirs、DFS、Ctrl+↑↓。旧`skip_zip`のboolを同じenumへ置換する。
+  各child folderの新規内容走査はしない。省略された現在folder/本のanchorは位置探索に保持し、
+  次/前の着地対象からだけ外す。画像なしfolderを飛ばすlimitとは別の同名規則で、limit=0でも適用する。
+- folder scan signature / page-count cache条件 / nav memo / prepared settings snapshotへ3択全値を含める。
   Preferences OKの既存reload・表示の閉じて再作成を使い、専用live追従を作らない。
-- 直接pathを指定したopen、既存history/bookmark、明示collection登録を無効化しない。
-  既存collectionのsource行や検索定義を書換え/削除する設定ではない。
-- `settings_transfer`のregistry/wire/変化fixtureへ追加。古いpreferencesにfieldが無い場合は、
-  既存部分適用と同じく現在値を維持する。settings.db旧保存の欠落では既定trueを採用する。
-  ON/OFF双方のexport/import、Settings保存再読取、portable/data-dirでの独立保存を検査する。
-  現行457/144/313・wire142から追加分の件数を予測だけで完了記録にしない。
-  実装時に実試験で得た件数でassertとsettings transfer文書を更新する。
+- Remoteの`settings_db::RemoteListingSettings`、読取projection/overlayもenumへ置換する。
+  起動時boolを持ち続けず、確定後の次の一覧・移動要求で最新の選択を使う。
+  Remote内部の設定読取りも§8.3の互換decoderを共有する。新しいRemote操作/wire fieldは加えない。
+- 直接path指定、既存history/bookmark、明示collection登録を無効化しない。
+  source行や検索定義を書換え/削除する設定ではない。
 
-release時の重要な変更点の文案:
-「同じ場所に同名の ZIP があるフォルダは、一覧と前後のフォルダ移動で省略されます。
-元のフォルダや画像は削除されません。両方を表示するには、環境設定の「同名ファイル」で
-フォルダの省略と本側の省略をどちらもオフにしてください。」
+### 8.3 リリース済みboolの設定DB移行 — 利用者決定2026-10-12
+
+このboolはGの未リリースデータではない。CLAUDE.md「永続データ・スキーマ変更」の
+released側の規則に従い、旧設定の読取り・新形式の保存・互換/版gate・移行試験を用意する。
+旧JSONからsettings.dbへの既存移行、backupの復元、portableの旧DBも同じ入口で読む。
+旧DBを削除/作り直しして新既定へ揃える手段は採らない。
+
+**旧ONを利用者が明示的に選んだか、既定ONのままかは判別できない。**
+`true == 旧既定`は値の一致であり、未変更の証拠ではない。保存時刻、app_version、
+お気に入り、他の設定等から推測しない。利用者はこの区別不能を含め、
+**旧ON（既定・明示選択とも）→「本を表示」、旧OFF→「両方表示」**と決定した（2026-10-12）。
+旧settings DBと旧preferencesの取り込みに同じ読み替えを適用する。
+
+| 保存入力 | 読み替え | 契約 |
+| --- | --- | --- |
+| 有効な新3択がある | その値を保持。旧boolが共存しても新値が正本 | 保存済みの3択を保持 |
+| 新3択無し、旧ON | 「本を表示」 | **利用者決定。既定・明示選択とも変更される** |
+| 新3択無し、旧OFF | 「両方表示」 | 利用者決定。旧OFFの相互省略無しを保持 |
+| 新旧とも無い新規/既定設定 | 「本を表示」 | 新既定の利用者決定 |
+| 新3択が未知値/型不正 | 既存Incompatible/保存保護経路。旧boolへfallbackしない | 空扱い・既定による上書きを禁止 |
+| 旧boolだけが型不正 | 既存の検証/保存保護経路。ON/OFFを推測しない | 不正データを削除しない |
+
+旧ON→「フォルダを表示」とする旧表示保持案は採らない。既定ONだった大多数の既存環境を
+本優先へ移す目的に合わせる。「重要な変更点」で明示選択も含む変更を告知し、
+以前の見え方へ戻す場所として環境設定「同名ファイル」の「フォルダを表示」を案内する。
+
+実装では、raw旧値を確認してから共有decoderでenumへ射影し、通常のSettings保存
+transactionで新keyを保存して旧grouped keyを退役させる。新値の保存と旧keyの扱いは同一commitにする。
+新keyの存在を優先するため、保存した「フォルダを表示」を再起動で新既定へ戻さない。
+新keyがまだ保存されていない旧DBは、次回も同じ旧入力から同じ決定済みの値へ読める。
+新enumのserde defaultを先に埋めて旧OFFの存在を失う読取りはしない。
+loaderだけでなく、Settings save/build projectionとRemote subset読取りを棚卸しする。
+`schema_meta.app_version`は既存どおり正常save commit時の記録とし、loadだけで保存済み版を偽らない。
+既存のfuture-schema/enum/保存元版の保護を維持し、旧バイナリが新設定を壊さない版gateも検証する。
+
+移行のDB読取/保存は既存Settings ownerへ置く。失敗時はログ + 通知と既存保存保護を使い、
+空DB化、独自retry、回復中の回復、移行専用の第二writerを作らない。
+新しいlive bool/carrierや、移行済みだけを表す独立したApp状態は追加しない。
+
+### 8.4 settings_transferの旧形式とportable
+
+- registryの旧bool fieldを新enumへ置換し、exportはcanonicalな新key/3択だけを出す。
+  古いboolと新enumを同時に書き出す二重表現、3択を旧boolへ落とすlossy exportは行わない。
+- 旧preferences v1の`skip_zip_if_folder_exists: true/false`はcompat read aliasとして受ける。
+  §8.3の決定どおり旧ON→「本を表示」、旧OFF→「両方表示」とする同じ変換関数を使い、
+  DB/transferで異なる移行結果にしない。
+  旧aliasはlive Settings fieldでも新wireの通常fieldでもない。
+- 新旧key共存時は有効な新enumを優先し、二回setterを走らせない。
+  新keyが不正ならこの項目をissueとして適用せず、旧aliasへfallbackしない。他の有効項目は
+  既存部分importの契約で適用できる。旧boolの型不正もissueにする。
+- 新旧keyとも無い古い部分preferencesでは、既存の部分適用どおりdestinationの現在値を維持。
+  新規/欠落settings DBの既定採用と、preferencesの項目欠落は混同しない。
+- 新keyは既存preferences v1の追加/置換キーとして扱う案。旧版readerは未知項目の既存報告を行い、
+  この3択は適用できない。旧版向け完全互換と称さず、既存importの未知件数/通知を検査する。
+  format変更が必要と判明した場合は版gateを別途見直し、旧v1読取りを残す。
+- portableも通常profileと同じSettings decoder/保存/transferで扱い、portable専用のboolを残さない。
+  コピーした旧portable DB、`--data-dir`、新規portableでの新既定、再起動後の3択保持、
+  profile間の相互importを検査する。
+- exhaustive Settings分類、wire keys、accepted/changed/unknown counts、変化fixtureを更新する。
+  現行457/144/313・wire142から件数の増減を予測して完了記録にしない。
+  field置換とread aliasの扱いを分け、実試験で得た数値でassertと転送文書を更新する。
+
+### 8.5 更新履歴と重要な変更点
+
+これはv0.3.0以来の見え方を変えるreleased設定の変更。実装時はCHANGELOGと
+`src/version_highlights.rs`の対象releaseの**must_read**へ載せ、manual「同名ファイル」も3択へ更新する。
+portable/インストーラ更新の双方、版を飛ばした更新でも既存highlight選択の契約で告知する。
+移行方針は2026-10-12利用者決定として確定し、release版番号は設計段階で埋め込まない。
+
+告知文案（決定済みの移行と戻し方を含む）:
+「同名のフォルダと本の表示を「本を表示 / フォルダを表示 / 両方表示」から選べるようにしました。
+新しい既定は「本を表示」です。ZIP/PDF/EPUB/RAR/7z/LZHに共通で、一覧と前後のフォルダ移動に
+適用されます。以前の設定がオンの場合は、既定のままでも自分で選んだ場合でも「本を表示」へ
+切り替わります。オフの場合は「両方表示」を維持します。元のファイルやフォルダは削除されません。
+以前のフォルダ優先の見え方に戻すには、
+環境設定の「同名ファイル」で「フォルダを表示」、両方を見るには「両方表示」を選んでください。」
 
 ## 9. UI、マニュアル、更新履歴
 
@@ -437,18 +525,21 @@ folder右クリックの「ZIP に変換…」と、構成対象外案内の「Z
 新しいglobal shortcutは今回追加しない。Escape等はdialog-localとしてkeymap-specへ記録し、
 新しいcontext-menu項目の識別子/操作カスタマイズは既存の項目管理へ登録する。
 
-実装時にmanualのbooksページ、folder右クリック/操作説明、環境設定「同名ファイル」、
-更新履歴とアプリの「重要な変更点」を同時更新する。設計段階で出荷済みの機能としてmanualへ書かない。
+実装時にmanualのbooksページ、folder右クリック/操作説明、環境設定「同名ファイル」の3択、
+更新履歴と`src/version_highlights.rs`の「重要な変更点」を同時更新する。
+released設定の移行説明は§8.3の2026-10-12利用者決定に従う。設計段階で出荷済みの機能としてmanualへ書かない。
 
 ## 10. 実装分割と受入条件
 
 実装開始条件: §5のCollection範囲、§6.4のRemote排他capability、§7の公開/データ複製/rare failure、
-source/destination sidecar所有の設計レビューを終える。別の親coordinatorや自動追加review gateは作らない。
+source/destination sidecar所有の設計レビューを終える。案Bの3択と§8.3の旧ON/OFF移行は
+2026-10-12利用者決定済み。別の親coordinatorや自動追加review gateは作らない。
 
 1. **判定/manifest/Stored出力**: App/UI無しのmanifest・entry対応とworker、no-clobber公開。
 2. **利用者データ/owner**: 型付きcopy payloadと既存writer/FIFO/maintenance/sidecar receiptの接続。
 3. **Collection参照**: Aを採るなら既存actor/schema/PC/Remote source consumerを一まとまりで完成。
-4. **入口/完了選択/同名設定**: modal各surface、共通policy、Preferences/transfer/manual/release通知。
+4. **入口/完了選択/同名設定**: modal各surface、3択の共通policy、released bool移行、
+   Preferences/旧新transfer/portable/manual/release通知。旧runtime boolを残した二段実装にしない。
 5. **統合gateと引継ぎ**: 下記回帰・snapshot・full gate。既存Rare failureの過剰な回復状態を追加しない。
 
 最低限の自動受入fixture:
@@ -464,9 +555,19 @@ source/destination sidecar所有の設計レビューを終える。別の親coo
 - AならCollection folder/個別画像/部分集合/複数登録/手動順/shuffle/現行v2 migration/backup/PC/Remote playback。
 - 取消の全phase、最終claim前後、root/F12 close、worker失敗・progress無しでも完了採用。source/sibling不変。
 - Remote acquireと変換受付の両順序。LocalInUseでphase/generationが変わらず、変換完了後は通常取得可能。
-- 同名設定4組、`.zip`名の実folder、`本.pdf`folder、ZIP種類非表示、hidden、CBZ/RAR/PDF等の同名組合せ。
-- 一覧 / Ctrl+↑↓ / tree / Remote parity、省略されたcurrent anchorの前後、設定OFFで従来復帰、source直接open維持。
-- 新fieldのmissing/default/保存/portable/preferences部分import/全項目coverage。件数は実行結果で記録。
+- 3択×ZIP/PDF/EPUB/RAR/7z/LZH（既存別名含む）、同名の本が複数ある場合、本同士の既存優先設定との組合せ。
+  `.zip`/`.pdf`名の実folder、`本.pdf`folder、種類非表示/hidden/Ignore/non-first volume、表示候補無しの場合。
+- 通常一覧 / Ctrl+↑↓ / sorted_subdirs/DFS / Smart / subfolder expansion / Remoteで同じ3択の結果。
+  省略されたcurrent folder/本anchorの前後、limit=0、明示「フォルダを表示」で旧表示を再現、source直接open維持。
+- 新規設定の既定「本を表示」、旧DBのON/OFF/欠落、旧JSON→DB、backup復元、移行前後の正常保存、再起動。
+  旧ONの明示選択/既定を区別できると偽ったfixtureを作らず、双方「本を表示」、旧OFFは「両方表示」を検査する。
+  新enumがある場合は3値全てを保持し、旧bool共存で上書きしない。未知enum/型不正/future schemaの保存保護も検査。
+- 新enumの全値export/import、旧preferences ON/OFF互換読取り、項目欠落で現在値維持、新旧キー共存/不正/重複。
+  旧版readerで新keyが未知項目となること、二重setter/旧boolへのlossy exportが無いこと、全項目coverageを検査。
+- 通常profile/旧portable DB/新規portable/`--data-dir`の同じ移行・保存再読取・相互transfer。
+  Remote最新設定overlayとSettingsのdecoder結果も一致。分類/wire/accepted/changed/unknownの実数を記録する。
+- CHANGELOGとversion_highlightsのmust_readに3択・既定/移行の見え方変更と戻し方を記載。
+  通常更新/版飛ばし/portable更新の告知選択を既存helperで検査し、出荷済みとして設計段階で登録しない。
 - 入口二つの実入力・背面wheel/key拒否・IME中Escape・小画面/長文/全phaseのUI snapshot、glyph lint。
 
 検証計画はfmt、normal/portable check、対象lib filters、integration/UI snapshot、最後に

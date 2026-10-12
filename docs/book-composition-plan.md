@@ -1704,7 +1704,10 @@ Checking予約のfolder root除外・改名mirrorからcache採用までのfolde
 次段「画像フォルダをZIPに変換する機能」は2026-10-12の利用者決定を記録した
 [独立設計](image-folder-to-zip-plan.md)を実装前に独立レビューする。
 同じ場所のStored ZIP、元folder保持、初回からの利用者データ複製、同名ZIP時の停止、
-modalと既定ONの同名folder省略を扱う。現時点でボタン・変換処理は追加しない。
+modalと同名folder/本の3択（2026-10-12利用者決定・案B、新既定「本を表示」）を扱う。
+旧released boolはON（既定を含む）→「本を表示」、OFF→「両方表示」へ移す（2026-10-12利用者決定）。
+「重要な変更点」で告知し、環境設定「同名ファイル」の「フォルダを表示」で元の見え方へ戻せることを案内する。
+現時点でボタン・変換処理は追加しない。
 
 所有: folder資格/adoption、RelativePath PageRef migration、sidecar全snapshot/構成family/消費receipt、folder用editor入口。
 G1〜G4の書庫/PDF/EPUB契約を変更せず、共通pure model/storeへfolder adapterだけを追加する。
