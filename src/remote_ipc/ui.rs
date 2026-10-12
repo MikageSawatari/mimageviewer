@@ -2636,7 +2636,7 @@ impl crate::app::App {
         }
         let response = self.apply_remote_write_with_composition_admission(
             pending.request(),
-            Some(pending.composition_admission()),
+            pending.composition_admission(),
         );
         if matches!(response, RemoteWriteResponse::Success(_))
             && self.settings.remember_spread_shift_per_book
@@ -2683,14 +2683,46 @@ impl crate::app::App {
         ctx.request_repaint();
     }
 
+    #[cfg(test)]
+    fn qualify_remote_write_for_test(
+        &self,
+        request: &RemoteWriteRequest,
+    ) -> Result<crate::book_composition::CompositionWriteAdmission, RemoteWriteError> {
+        // Unqualified fixture calls use the same worker admission as IPC. The
+        // product UI always receives a qualified request and performs no FS I/O.
+        if let Some(service) = self.book_composition_service.clone() {
+            let request = request.clone();
+            std::thread::spawn(move || {
+                let session = SessionHandle::new();
+                session.install_book_composition_service(Some(service));
+                let engine = super::container::ContainerEngine::new_with_session(
+                    Default::default(),
+                    session,
+                );
+                engine.composition_write_admission(&request)
+            })
+            .join()
+            .expect("remote composition qualification worker")
+        } else {
+            Ok(crate::book_composition::CompositionWriteAdmission::default())
+        }
+    }
+
+    #[cfg(test)]
     fn apply_remote_write(&mut self, request: &RemoteWriteRequest) -> RemoteWriteResponse {
-        self.apply_remote_write_with_composition_admission(request, None)
+        let admission = self.qualify_remote_write_for_test(request);
+        match admission {
+            Ok(admission) => {
+                self.apply_remote_write_with_composition_admission(request, &admission)
+            }
+            Err(error) => RemoteWriteResponse::Error(error),
+        }
     }
 
     fn apply_remote_write_with_composition_admission(
         &mut self,
         request: &RemoteWriteRequest,
-        qualified: Option<&crate::book_composition::CompositionWriteAdmission>,
+        qualified: &crate::book_composition::CompositionWriteAdmission,
     ) -> RemoteWriteResponse {
         if matches!(
             request,
@@ -2700,31 +2732,8 @@ impl crate::app::App {
                 | RemoteWriteRequest::SetSingletonSpreadEndpointPreference { .. }
                 | RemoteWriteRequest::SetPageAlonePreference { .. }
         ) {
-            if let (Some(address), Some(service)) =
-                (request.address(), self.book_composition_service.as_ref())
-            {
-                let scope = match remote_shift_scope(address) {
-                    Ok(scope) => scope,
-                    Err(error) => return write_error(RemoteWriteErrorCode::Unsupported, error),
-                };
-                let admission = qualified.cloned().unwrap_or_else(|| {
-                    let root = std::path::Path::new(&address.path);
-                    let source_supported =
-                        matches!(address.subresource, RemoteSubresource::ZipDirectory { .. })
-                            || crate::folder_tree::is_open_as_container(root)
-                            || crate::folder_tree::is_convertible_archive_path(root);
-                    let snapshot = service.snapshot();
-                    crate::book_composition::CompositionWriteAdmission {
-                        targets: Vec::new(),
-                        binding_scope: (source_supported
-                            && !snapshot.rows.get(&scope.storage_key()).is_some_and(|row| {
-                                row.domain == crate::book_composition::PageDomain::ImageFolder
-                            }))
-                        .then_some(scope),
-                        ..Default::default()
-                    }
-                });
-                if let Err(error) = admission.validate(&service.snapshot()) {
+            if let Some(service) = self.book_composition_service.as_ref() {
+                if let Err(error) = qualified.validate(&service.snapshot()) {
                     return write_error(RemoteWriteErrorCode::Unsupported, error);
                 }
             }
@@ -5153,12 +5162,34 @@ mod tests {
         let (service, owner) =
             BookCompositionService::spawn_at(data.path().join("composition"), None).unwrap();
         app.install_book_composition_runtime(service.clone());
-        for name in ["image-book", "directory.pdf", "directory.zip"] {
+        for (name, domain) in [
+            ("image-book", PageDomain::ImageFolder),
+            ("directory.pdf", PageDomain::ImageFolder),
+            ("directory.zip", PageDomain::ImageFolder),
+            ("replaced.pdf", PageDomain::Document),
+            ("replaced.epub", PageDomain::Document),
+            (
+                "replaced.zip",
+                PageDomain::ArchiveLevel {
+                    prefix: String::new(),
+                },
+            ),
+        ] {
             let root = data.path().join(name);
-            std::fs::create_dir(&root).unwrap();
+            if domain == PageDomain::ImageFolder {
+                std::fs::create_dir(&root).unwrap();
+            } else {
+                std::fs::write(&root, b"former document/archive").unwrap();
+            }
             let scope = crate::book_scope::BookScopeKey::folder(&root).unwrap();
-            let page = CompositionPageRef::RelativePath {
-                path: "page.png".into(),
+            let page = match domain {
+                PageDomain::ImageFolder => CompositionPageRef::RelativePath {
+                    path: "page.png".into(),
+                },
+                PageDomain::Document => CompositionPageRef::PdfPage { page_num: 0 },
+                PageDomain::ArchiveLevel { .. } => CompositionPageRef::ArchiveEntry {
+                    entry_name: "page.png".into(),
+                },
             };
             let mut record = BookComposition::new(
                 ReadingDirection::Ltr,
@@ -5170,23 +5201,31 @@ mod tests {
             );
             record.hidden_pages.push(page);
             service
-                .save(scope.clone(), PageDomain::ImageFolder, record)
+                .save(scope.clone(), domain.clone(), record)
                 .recv()
                 .unwrap()
                 .status
                 .unwrap();
             let before = service.snapshot();
+            if domain != PageDomain::ImageFolder {
+                std::fs::remove_file(&root).unwrap();
+                std::fs::create_dir(&root).unwrap();
+            }
             let address =
                 mimageviewer_ipc::RemoteAddress::file(root.to_string_lossy().into_owned());
-            for qualified in [None, Some(CompositionWriteAdmission::default())] {
-                let response = app.apply_remote_write_with_composition_admission(
-                    &RemoteWriteRequest::SetSpread {
-                        address: address.clone(),
-                        spread_mode: RemoteSpreadMode::RtlCover,
-                        reading_direction: RemoteReadingDirection::Rtl,
-                    },
-                    qualified.as_ref(),
-                );
+            for use_worker_admission in [false, true] {
+                let request = RemoteWriteRequest::SetSpread {
+                    address: address.clone(),
+                    spread_mode: RemoteSpreadMode::RtlCover,
+                    reading_direction: RemoteReadingDirection::Rtl,
+                };
+                let response = if use_worker_admission {
+                    let admission = app.qualify_remote_write_for_test(&request).unwrap();
+                    assert!(admission.binding_scope.is_none());
+                    app.apply_remote_write_with_composition_admission(&request, &admission)
+                } else {
+                    app.apply_remote_write(&request)
+                };
                 assert!(
                     matches!(response, RemoteWriteResponse::Success(_)),
                     "{response:?}"
@@ -5199,6 +5238,34 @@ mod tests {
                 assert_eq!(
                     app.spread_db.as_ref().unwrap().get_direction(&key),
                     Some(crate::settings::ReadingDirection::Rtl)
+                );
+            }
+            if domain == PageDomain::ImageFolder && name == "directory.pdf" {
+                // Future folder values also remain inert if an external action
+                // replaces the folder with an actual document file.
+                std::fs::remove_dir(&root).unwrap();
+                std::fs::write(&root, b"%PDF-1.4\n").unwrap();
+                let request = RemoteWriteRequest::SetSpread {
+                    address: address.clone(),
+                    spread_mode: RemoteSpreadMode::LtrCover,
+                    reading_direction: RemoteReadingDirection::Ltr,
+                };
+                let admission = app.qualify_remote_write_for_test(&request).unwrap();
+                assert!(admission.binding_scope.is_none());
+                assert!(matches!(
+                    app.apply_remote_write_with_composition_admission(&request, &admission),
+                    RemoteWriteResponse::Success(_)
+                ));
+                assert!(matches!(
+                    app.apply_remote_write(&request),
+                    RemoteWriteResponse::Success(_)
+                ));
+                assert_eq!(
+                    app.spread_db
+                        .as_ref()
+                        .unwrap()
+                        .get(&remote_spread_key(&address).unwrap().exact),
+                    Some(crate::settings::SpreadMode::LtrCover)
                 );
             }
             assert_eq!(service.snapshot().rows, before.rows);
@@ -5246,10 +5313,11 @@ mod tests {
         };
         for qualified in [None, Some(CompositionWriteAdmission::default())] {
             assert!(matches!(
-                app.apply_remote_write_with_composition_admission(
-                    &request(&root),
-                    qualified.as_ref()
-                ),
+                match qualified {
+                    Some(admission) => app
+                        .apply_remote_write_with_composition_admission(&request(&root), &admission),
+                    None => app.apply_remote_write(&request(&root)),
+                },
                 RemoteWriteResponse::Success(_)
             ));
         }

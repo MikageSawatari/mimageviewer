@@ -3157,10 +3157,7 @@ impl ContainerEngine {
             let resolved = self
                 .resolve(address)
                 .map_err(remote_write_error_from_media)?;
-            if binding
-                && (is_archive_container(&resolved)
-                    || crate::folder_tree::is_paged_document_path(&resolved.logical))
-            {
+            if binding && is_composition_container(&resolved) {
                 let prefix = match &address.subresource {
                     RemoteSubresource::ZipDirectory { prefix } => prefix.trim_end_matches('/'),
                     _ => "",
@@ -3169,6 +3166,8 @@ impl ContainerEngine {
                     .map_err(|error| {
                         RemoteWriteError::new(RemoteWriteErrorCode::Unsupported, error)
                     })?;
+                // Eligibility above comes from the physical file. Future folder
+                // values at the same key are not an active file composition.
                 if service
                     .as_ref()
                     .unwrap()
@@ -3333,12 +3332,7 @@ impl ContainerEngine {
                 let is_directory = metadata.as_ref().is_some_and(|value| value.is_dir());
                 let supported = match address.subresource {
                     RemoteSubresource::File => {
-                        is_directory
-                            || is_file
-                                && (is_archive_container(&resolved)
-                                    || crate::folder_tree::is_paged_document_path(
-                                        &resolved.logical,
-                                    ))
+                        is_directory || is_supported_reading_file(&resolved, is_file)
                     }
                     RemoteSubresource::ZipDirectory { .. } => {
                         is_file && is_archive_container(&resolved)
@@ -6222,8 +6216,7 @@ impl ContainerEngine {
             .load(&self.settings)
             .map_err(remote_reading_settings_error)?;
         let composition_managed = shift_scope.as_ref().is_some_and(|scope| {
-            (is_archive_container(resolved)
-                || crate::folder_tree::is_paged_document_path(&resolved.logical))
+            is_composition_container(resolved)
                 && self
                     .session
                     .as_ref()
@@ -8907,6 +8900,21 @@ fn is_archive_container(resolved: &ResolvedPath) -> bool {
     resolved.has_archive_backing() || is_zip_path(&resolved.logical)
 }
 
+/// Only worker-side callers may classify the physical source. A directory can
+/// retain a document/archive suffix and an older composition row at its key.
+fn is_composition_container(resolved: &ResolvedPath) -> bool {
+    is_supported_reading_file(
+        resolved,
+        std::fs::metadata(&resolved.canonical).is_ok_and(|metadata| metadata.is_file()),
+    )
+}
+
+fn is_supported_reading_file(resolved: &ResolvedPath, is_file: bool) -> bool {
+    is_file
+        && (is_archive_container(resolved)
+            || crate::folder_tree::is_paged_document_path(&resolved.logical))
+}
+
 fn remote_address_may_contain_raw(address: &RemoteAddress, resolved: &ResolvedPath) -> bool {
     match &address.subresource {
         RemoteSubresource::File => {
@@ -9473,6 +9481,160 @@ mod tests {
             let read = shifts.read_after(scope.clone(), cutoff).recv().unwrap();
             read.status.unwrap();
             assert_eq!(read.row, Some(anchor));
+            assert_eq!(service.snapshot().rows, before.rows);
+            assert_eq!(
+                service.snapshot().token_for(&scope),
+                before.token_for(&scope)
+            );
+            owner.shutdown_and_join();
+            shift_owner.shutdown_and_join();
+        }
+    }
+
+    #[test]
+    fn replaced_document_archive_directory_ignores_retained_composition_for_remote_binding_and_display()
+     {
+        use crate::book_composition::*;
+        use std::io::Write;
+        for (name, domain) in [
+            ("replaced.pdf", PageDomain::Document),
+            ("replaced.epub", PageDomain::Document),
+            (
+                "replaced.zip",
+                PageDomain::ArchiveLevel {
+                    prefix: String::new(),
+                },
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join(name);
+            if matches!(domain, PageDomain::ArchiveLevel { .. }) {
+                let mut zip = zip::ZipWriter::new(std::fs::File::create(&root).unwrap());
+                zip.start_file("page.png", zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                zip.write_all(b"original page").unwrap();
+                zip.finish().unwrap();
+            } else {
+                std::fs::write(&root, b"original document").unwrap();
+            }
+            let page = match domain {
+                PageDomain::Document => CompositionPageRef::PdfPage { page_num: 0 },
+                PageDomain::ArchiveLevel { .. } => CompositionPageRef::ArchiveEntry {
+                    entry_name: "page.png".into(),
+                },
+                _ => unreachable!(),
+            };
+            let scope = crate::book_scope::BookScopeKey::new(&root, "").unwrap();
+            let (service, owner) =
+                BookCompositionService::spawn_at(temp.path().join("composition"), None).unwrap();
+            service
+                .save(
+                    scope.clone(),
+                    domain,
+                    BookComposition::new(
+                        ReadingDirection::Ltr,
+                        vec![CompositionUnit::Single {
+                            page,
+                            placement: SinglePlacement::Center,
+                            companion: SingleCompanion::Vacant,
+                        }],
+                    ),
+                )
+                .recv()
+                .unwrap()
+                .status
+                .unwrap();
+            let before = service.snapshot();
+            let session = super::super::session::SessionHandle::new();
+            session.install_book_composition_service(Some(service.clone()));
+            let (shifts, shift_owner) =
+                crate::spread_shift::SpreadShiftService::spawn_at(temp.path().join("shifts"), None)
+                    .unwrap();
+            session.install_spread_shift_service(Some(shifts));
+            let mut engine = ContainerEngine::new(Default::default());
+            engine.session = Some(session);
+            *engine.spread_db.lock().unwrap() = Ok(None);
+            let address = RemoteAddress::file(root.to_string_lossy().into_owned());
+            let binding = RemoteWriteRequest::SetSpread {
+                address: address.clone(),
+                spread_mode: RemoteSpreadMode::RtlCover,
+                reading_direction: RemoteReadingDirection::Rtl,
+            };
+            assert!(
+                engine.composition_write_admission(&binding).is_err(),
+                "actual composed file must remain protected"
+            );
+            std::fs::remove_file(&root).unwrap();
+            std::fs::create_dir(&root).unwrap();
+            for index in 0..4 {
+                image::RgbaImage::from_pixel(2, 4, image::Rgba([20, 40, 60, 255]))
+                    .save(root.join(format!("{index}.png")))
+                    .unwrap();
+            }
+            for mut request in [
+                binding,
+                RemoteWriteRequest::SetFinalCoverSpreadPreference {
+                    address: address.clone(),
+                    preference: Default::default(),
+                },
+                RemoteWriteRequest::SetSingletonSpreadPlacementPreference {
+                    address: address.clone(),
+                    preference: Default::default(),
+                },
+                RemoteWriteRequest::SetSingletonSpreadEndpointPreference {
+                    address: address.clone(),
+                    endpoint: Default::default(),
+                    preference: Default::default(),
+                },
+                RemoteWriteRequest::SetPageAlonePreference {
+                    address: address.clone(),
+                    endpoint: Default::default(),
+                    preference: Default::default(),
+                },
+            ] {
+                engine.validate_write_request(&mut request).unwrap();
+                let admission = engine.composition_write_admission(&request).unwrap();
+                assert!(admission.targets.is_empty());
+                assert!(admission.binding_scope.is_none());
+                assert!(admission.unsupported_scopes.is_empty());
+                assert!(admission.unsupported_pages.is_empty());
+            }
+            let request = ContainerRequest {
+                address: address.clone(),
+                spread_mode: Some(RemoteSpreadMode::RtlCover),
+                reading_direction: Some(RemoteReadingDirection::Rtl),
+                force_single_page: false,
+            };
+            let resolved = engine.resolve(&address).unwrap();
+            assert!(!is_composition_container(&resolved));
+            let payload = engine
+                .enumerate(&request, &resolved, current_catalog_admission())
+                .unwrap();
+            assert_eq!(payload.kind, ContainerKind::Folder);
+            assert_eq!(payload.entries.len(), 4);
+            assert!(!payload.composition_managed);
+            // Exercise the display classifier even if the folder listing is not book-locked.
+            let items = (0..4)
+                .map(|index| crate::grid_item::GridItem::Image(root.join(format!("{index}.png"))))
+                .collect::<Vec<_>>();
+            assert!(
+                !engine
+                    .spread_payload_with_read(
+                        &request,
+                        &resolved,
+                        &items,
+                        Some(&items),
+                        None,
+                        true,
+                        true,
+                        None,
+                        None,
+                        Some(scope.clone()),
+                        None
+                    )
+                    .unwrap()
+                    .composition_managed
+            );
             assert_eq!(service.snapshot().rows, before.rows);
             assert_eq!(
                 service.snapshot().token_for(&scope),

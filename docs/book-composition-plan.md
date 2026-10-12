@@ -1688,6 +1688,11 @@ PNG生成・目視、最終共有gate・確認build・独立レビューの実�
 File画像は既存の候補なし/Allowed(None)を使い、画像閲覧・個別編集・Eのfolder見開き調整を妨げない。
 Remoteのwire形状は変更しない。保護対象を持たない完全空のwrite admissionは構成snapshotへ依存せず、
 対象がある書庫/PDF/EPUBのadmissionは従来どおり失敗時に書込を拒否する。
+切り離し後のRemote資格はworkerの実体file/dir分類に揃える。PDF/EPUB/ZIPを外部操作で同名folderへ
+置き換え、旧Document/Archive構成行が残っていてもbinding受付・構成管理表示へ使用しない。
+UIはworkerで確定したadmissionを必須とし、同期FS確認や拡張子/保存行からの再推測を行わない。
+test-onlyの未修飾入口も同じworker資格へ通す。旧行/tokenは保持し、実ファイルの構成保護は維持する。
+実体fileの資格と保存値の適用可否は分離し、将来用ImageFolder値をfileの構成に使わない既存分岐も維持する。
 書庫/PDF/EPUBにも必要なGeneric改名開始時の送信済保存票確認は残す。
 Checking予約のfolder root除外・改名mirrorからcache採用までのfolder claimは、mirror自体と一緒に外す。
 構成のないfolderの通常・定期・終了・tray flushはmasterと同じ既存v1 writerへ戻し、改名claimで省略しない。

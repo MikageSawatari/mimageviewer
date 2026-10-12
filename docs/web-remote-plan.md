@@ -25,6 +25,12 @@ read/write候補・binding受付（qualified/fallback）・`composition_managed`
 保存行は削除せず、pure model/store/明示転送の値として残す。書庫/PDF/EPUBの資格/proofは維持する。
 完全空のwrite admissionは保護対象がないため構成snapshotのエラーに依存せず、非空は従来どおり拒否する。
 wire字段・owner・writer・公開addressを変更せず、protocol v70を維持する。
+構成の受付資格はwrite/read workerが既存の実体分類（metadataのfile/dir）から決める。
+`.pdf`/`.epub`/`.zip`名の実folderは、以前のDocument/Archive行が同じkeyに残っていても対象外。
+通常のwrite検証・binding admission・構成管理表示は同じfile資格を使い、行のdomainではfolderを推測しない。
+実体fileの資格を確定した後も、将来用ImageFolder保存値を現在のfile構成として消費しない既存分岐は維持する。
+UI採用はworkerのadmissionを必須引数として再検証し、拡張子からのfallbackを持たない。
+未修飾のtest-only入口も同じworkerへ通す。UIへの同期FS I/O、追加owner、wire変更はない。
 
 
 v3.0.0 の目玉として、外出先のスマートフォン / タブレット / PC のブラウザから
