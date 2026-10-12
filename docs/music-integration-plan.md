@@ -500,19 +500,30 @@ cargo fmt / fmt --check、通常 / portable core check、glyph lint（危険glyp
     左パネルは同じブックマークデータを一覧描画するだけ（動画はシークバー/HUD 上に出す差だけ）。
 
 ### 5.6 MIDI 半音 spectrum（下段アナライザ）
-- `SpectrumAnalyzer` 常駐 worker。解析ワーカーが保持する PCM から、再生位置周辺 ±1 秒の
-  window をスライスして取得する（`src/video/audio.rs` の playback ring buffer は窓幅不足のため
-  使わない。§11 参照）。
+- 常駐 spectrum worker が `SpectrumAnalyzer` と music-core の `pitch::HarmNetTracker` を所有する。
+  棒グラフと倍音比率は従来どおり再生位置周辺 ±1 秒の PCM 窓から FFT で求め、鍵盤の中央は
+  **HarmNet L の基音確率 × 既存の音量ゲート（Norm ゲイン反映）**で光る。上下端は中央の明るさに
+  奇数倍音比／偶数倍音比を掛ける。倍音加点・局所正規化による間引きは使わず、色相と残光は維持する。
+  `src/video/audio.rs` の playback ring buffer は窓幅不足のため使わない（§11）。
+- 推論は 20ms hop で順に進め、160ms 先読みの head 3（age 8）を再生位置に対応させる。
+  worker は PCM の `Arc::ptr_eq` と絶対フレーム番号で継続を判定し、別 PCM・後退・58 フレームを
+  超える移動ではリセットして表示位置の約 1 秒前から助走する。曲全体の事前計算・保存はしない。
+  棒グラフと確率は既存の 1 本の結果チャネルで同じ要求から返す。曲切替／close は既存の `clear()` が
+  worker ごと捨てる。音楽 PCM／spectrum は App 全体で 1 つで、park／復帰は同じ PCM を保持する。
 - **progressive PCM（長尺の下段グラフ出現遅延対策、2026-07-07）**: `MusicPcm` は
   `RwLock<Vec<f32>>` の**追記式共有バッファ**。解析ワーカーは**デコード開始前に空の
   `Arc<MusicPcm>` を `Pcm` メッセージで UI へ渡し**、以降デコード差分を末尾 `append`（write）する。
-  spectrum worker は再生位置 ±1 秒窓だけを read でコピー（`copy_window`、~1MB 未満）して FFT に
+  spectrum worker は再生位置 ±1 秒窓を短い read でコピー（`copy_window`、~1MB 未満）して FFT に
   渡すので、**全尺デコード完了を待たず、再生位置がデコード済み範囲にあれば下段グラフが即描く**。
   `RwLock` にするのは、timeline の partial/最終確定解析（`with_prefix` = `analyze_stereo_timeline`
   を回す**長い read**）と spectrum の窓コピー（**短い read**）を**同時に走らせて spectrum を固まらせ
   ない**ため（`Mutex` だと解析中に spectrum がフリーズする実機 FB → RwLock で解消）。追記（write）は
   解析と同じデコードスレッド上で逐次なので競合しない。
-  未デコード領域が中心のときは窓 `None` = 鍵盤ベースライン + 「解析中」表示。以前は全尺デコード
+  HarmNet 用の助走・先読み範囲は `copy_range` で取得し、先頭より前とデコード完了後の末尾より後は
+  0 埋めする。未デコードの先端より後は計算を進めず、確率 `None`（未取得）を返す。鍵盤は入力 0 と
+  して残光を減衰させ、一時停止中も直近の確率が `None` なら既存の 16ms 間引き・in-flight 1 件で
+  再要求する。有効な全 0（`Some`）とは区別し、デコード完了を先に観測しても再要求は止めない。
+  棒グラフの窓も取れない間は空バンドと「解析中」表示。以前は全尺デコード
   完了後に PCM を 1 回だけ送っていたため、74 分級で下段グラフが数十秒出なかった（timeline は
   progressive 先出しで早いのに下段だけ遅れる不整合）。バッファ容量は probe duration から先取り
   （追記中の数百 MB 級 realloc memcpy 回避、bogus probe の OOM 予防に上限クランプ）。常駐は
@@ -1192,9 +1203,10 @@ placement に作り直す経路。headless→native の「presenter 無し→有
 
 ### 7.2 MIDI 半音 spectrum（下段）
 - [x] E0–C#10 / MIDI 半音ごとのバー、多解像度 FFT（`SpectrumAnalyzer`）（Inc 4、常駐ワーカー。2026-07-05 に 20Hz–18kHz の等比分割から変更）
-- [x] 鍵盤ハイライト（相対突出評価、A0–C8 明色/範囲外グレー）（Inc 4、`draw_pitch_keyboard`）
+- [x] 88 鍵の中央は HarmNet L の基音確率 × 音量ゲート、上／下は奇数／偶数倍音比のグラデーション（`draw_pitch_keyboard`。色相・残光は維持）
 - [x] ホバーで周波数 Hz + 近似音名（Inc 4、`draw_spectrum_hover`）
 - [x] 再生位置周辺 ±1s の PCM 窓を tap（Inc 4、案A = 展開済み PCM をスライス。§11 参照）
+- [x] 状態を持つ推論は spectrum worker 内で連続計算し、PCM 同一性とフレーム番号で継続／助走を判定（[鍵盤の基音推定設計](music-keyboard-harmnet-plan.md)）
 
 ### 7.3 beat/bar grid
 - [x] `BeatGrid` 表示（低 confidence は非表示 or 淡色、`BeatTrackingStatus`）（Inc 3b、draw_beat_grid）

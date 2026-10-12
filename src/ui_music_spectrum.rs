@@ -25,6 +25,10 @@ use std::sync::mpsc;
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
+use music_core::pitch::{
+    HARMNET_HOP_SAMPLES, HARMNET_HOP_SECS, HARMNET_LONG_WINDOW_SAMPLES, HARMNET_PITCH_COUNT,
+    HarmNetTracker,
+};
 use music_core::{
     SPECTRUM_BAND_COUNT, SPECTRUM_BAND_MAX_MIDI, SPECTRUM_BAND_MIN_MIDI, SPECTRUM_NOTE_MAX_MIDI,
     SPECTRUM_NOTE_MIN_MIDI, SpectrumAnalysis, SpectrumAnalyzer,
@@ -44,25 +48,8 @@ const KEY_HIGHLIGHT_DECAY: f32 = 0.925;
 const KEY_HIGHLIGHT_MIN_PEAK: f32 = 0.035;
 const KEY_SUSTAIN_ATTACK: f32 = 0.18;
 const KEY_SUSTAIN_RELEASE: f32 = 0.965;
-// ── 鍵盤の倍音サリエンス / 縦グラデ演出パラメータ (実機で視覚チューニングする想定) ──
-/// Layer ② 倍音サリエンス加点の強さ。center = raw × (1 + α·harmonic_support)。加点のみ (乗数≥1)
-/// なので生より暗くならない。0 で加点無効。
-const KEY_HARMONIC_BOOST: f32 = 0.9;
-/// Layer ③ 適応的局所正規化: 参照する片側窓幅 (半音)。±この範囲で密度適応しきい値を作る。
-const KEY_LOCAL_WINDOW: usize = 6;
-/// Layer ③ 窓内で満額に光らせる目安本数 (窓内の上位この番目の値をしきい値に = 密度目安)。
-/// 和音 (1オクターブに 3-4 音) を潰さない程度に。
-const KEY_LOCAL_TARGET: usize = 3;
-/// Layer ③ しきい値比 (boosted/local_ref) → 際立ち のマップ下端/上端。lo 以下=floor、hi 以上=満額。
-const KEY_LOCAL_RATIO_LO: f32 = 0.85;
-const KEY_LOCAL_RATIO_HI: f32 = 1.25;
-/// Layer ③ 埋もれた鍵の最小 factor (完全に消さずチラつき防止)。
-const KEY_LOCAL_FLOOR: f32 = 0.2;
-/// Layer ③ 適用強度の周波数フェード。低域 (~FULL_HZ 以下)=full(1.0) / 高域 (~FADE_HZ 以上)=MIN。
-/// 機能している中高域を壊さないよう低域中心に効かせる。
-const KEY_LOCAL_FULL_HZ: f32 = 160.0;
-const KEY_LOCAL_FADE_HZ: f32 = 700.0;
-const KEY_LOCAL_MIN_STRENGTH: f32 = 0.45;
+/// 基音確率の明るさ曲線。1.0 は確率をそのまま使う (実機調整用)。
+const KEY_PITCH_GAMMA: f32 = 1.0;
 /// Layer ④ 偶数/奇数倍音サポートの EMA 平滑係数 (縦グラデのチラつき防止、大きいほど即応)。
 const KEY_HARMONIC_SMOOTH: f32 = 0.45;
 /// Layer ④ 縦グラデで倍音の伸びをどこまで許すか (上下端 = center × factor.clamp(0, これ))。
@@ -104,6 +91,12 @@ const SPECTRUM_VIEW_MAX_HZ: f32 = 18_000.0;
 /// スペクトラム更新のリクエスト間隔。再生中はフレーム毎に届くが、この間隔で throttle して
 /// 過剰リクエストを抑える (1 フレーム 1 リクエストが上限)。
 const SPECTRUM_REFRESH_INTERVAL: Duration = Duration::from_millis(16);
+/// HarmNet frame L (window ending at sample L*hop) describes audio this far before its end,
+/// because the long analysis window peaks 20 ms before its newest sample (EffeTune frontend).
+const PITCH_REFERENCE_DELAY_SECS: f64 = 0.02;
+const PITCH_LOOKAHEAD_FRAMES: i64 = 8;
+const WARMUP_FRAMES: i64 = 58;
+const MAX_ADVANCE_FRAMES: i64 = WARMUP_FRAMES;
 
 /// 音楽ビューの再生位置周辺スペクトラム用に、解析ワーカーがデコードした PCM を保持する
 /// 共有バッファ。48kHz interleaved stereo f32。再生エンジン (`VideoPlayer`) とは独立した、
@@ -223,6 +216,32 @@ impl MusicPcm {
         )?;
         Some((guard[start_frame * 2..end_frame * 2].to_vec(), local_center))
     }
+
+    /// Copy interleaved stereo [start, end), padding before zero and after confirmed EOF.
+    /// During decoding only the available prefix is returned; its length identifies the frontier.
+    /// This short read is used only by the spectrum worker, never the UI thread.
+    fn copy_range(&self, start_frame: i64, end_frame: i64) -> Vec<f32> {
+        let guard = self.read_samples();
+        let available = (guard.len() / 2) as i64;
+        let end = if self.is_complete() {
+            end_frame
+        } else {
+            end_frame.min(available)
+        };
+        if end <= start_frame {
+            return Vec::new();
+        }
+        let mut samples = vec![0.0; (end - start_frame) as usize * 2];
+        let copy_start = start_frame.max(0);
+        let copy_end = end.min(available);
+        if copy_start < copy_end {
+            let offset = (copy_start - start_frame) as usize * 2;
+            let count = (copy_end - copy_start) as usize * 2;
+            samples[offset..offset + count]
+                .copy_from_slice(&guard[copy_start as usize * 2..copy_end as usize * 2]);
+        }
+        samples
+    }
 }
 
 struct MusicSpectrumRequest {
@@ -248,6 +267,7 @@ pub struct MusicSpectrumState {
     // ── 描画状態 (draw で毎フレーム減衰更新) ──
     bands: Vec<f32>,
     notes: Vec<f32>,
+    pitch_probabilities: Option<Vec<f32>>,
     trail: Vec<f32>,
     prev_bands: Vec<f32>,
     onsets: Vec<f32>,
@@ -277,6 +297,7 @@ impl Default for MusicSpectrumState {
             last_center: f64::NEG_INFINITY,
             bands: Vec::new(),
             notes: Vec::new(),
+            pitch_probabilities: None,
             trail: Vec::new(),
             prev_bands: Vec::new(),
             onsets: Vec::new(),
@@ -303,6 +324,7 @@ impl MusicSpectrumState {
         self.cancel_worker();
         self.bands.clear();
         self.notes.clear();
+        self.pitch_probabilities = None;
         self.trail.clear();
         self.prev_bands.clear();
         self.onsets.clear();
@@ -382,7 +404,8 @@ impl MusicSpectrumState {
             .last_request
             .is_none_or(|t| t.elapsed() >= SPECTRUM_REFRESH_INTERVAL);
         let center_changed = (self.last_center - center_secs).abs() > 1.0e-4;
-        let want = self.bands.is_empty() || playing || center_changed;
+        let pitch_missing = self.pitch_probabilities.is_none();
+        let want = self.bands.is_empty() || playing || center_changed || pitch_missing;
         if want
             && !self.pending
             && due
@@ -401,7 +424,7 @@ impl MusicSpectrumState {
             }
         }
 
-        if playing || self.pending {
+        if playing || self.pending || pitch_missing {
             ctx.request_repaint_after(SPECTRUM_REFRESH_INTERVAL);
         }
     }
@@ -427,6 +450,7 @@ impl MusicSpectrumState {
         if let Some(analysis) = latest {
             self.bands = analysis.bands;
             self.notes = analysis.notes;
+            self.pitch_probabilities = analysis.pitch_probabilities;
         }
     }
 
@@ -482,6 +506,7 @@ impl MusicSpectrumState {
                 &painter,
                 keyboard_rect,
                 &self.notes,
+                self.pitch_probabilities.as_deref(),
                 &mut self.note_sustain,
                 &mut self.note_trail,
                 &mut self.note_even,
@@ -578,6 +603,7 @@ impl MusicSpectrumState {
             &painter,
             keyboard_rect,
             &self.notes,
+            self.pitch_probabilities.as_deref(),
             &mut self.note_sustain,
             &mut self.note_trail,
             &mut self.note_even,
@@ -601,6 +627,7 @@ fn run_music_spectrum_worker(
     cancel: Arc<AtomicBool>,
 ) {
     let mut analyzer = SpectrumAnalyzer::new(SPECTRUM_BANDS);
+    let mut pitch = SpectrumPitchTracker::new();
     while !cancel.load(Ordering::Relaxed) {
         let mut request = match request_rx.recv() {
             Ok(request) => request,
@@ -613,10 +640,130 @@ fn run_music_spectrum_worker(
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        let analysis = compute_spectrum(&mut analyzer, &request);
+        let mut analysis = compute_spectrum(&mut analyzer, &request);
+        analysis.pitch_probabilities = pitch.analyze(&request, &cancel);
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         if result_tx.send(analysis).is_err() {
             break;
         }
+    }
+}
+
+/// Published only after a frame is computed. Retaining the Arc also prevents pointer reuse.
+struct PitchTrackerCursor {
+    pcm: Arc<MusicPcm>,
+    first_frame: i64,
+    next_frame: i64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PitchDecision {
+    Reuse,
+    Advance(i64),
+    Restart(i64),
+}
+
+fn decide(cursor: Option<&PitchTrackerCursor>, pcm: &Arc<MusicPcm>, k_end: i64) -> PitchDecision {
+    let from = (k_end - WARMUP_FRAMES).max(1);
+    if let Some(cursor) = cursor
+        && Arc::ptr_eq(&cursor.pcm, pcm)
+        && cursor.first_frame <= from
+    {
+        let distance = k_end - (cursor.next_frame - 1);
+        if distance == 0 {
+            return PitchDecision::Reuse;
+        }
+        if (1..=MAX_ADVANCE_FRAMES).contains(&distance) {
+            return PitchDecision::Advance(distance);
+        }
+    }
+    PitchDecision::Restart(from)
+}
+
+fn pitch_end_frame(center_secs: f64) -> i64 {
+    let center = if center_secs.is_finite() {
+        center_secs.max(0.0)
+    } else {
+        0.0
+    };
+    // Bound the subsequent sample-index multiplication (normal media positions are far smaller).
+    let k = (((center + PITCH_REFERENCE_DELAY_SECS) / HARMNET_HOP_SECS).round() as i64).clamp(
+        1,
+        i64::MAX / HARMNET_HOP_SAMPLES as i64 - PITCH_LOOKAHEAD_FRAMES,
+    );
+    k + PITCH_LOOKAHEAD_FRAMES
+}
+
+/// The existing spectrum worker is the only owner; no UI-side DSP or extra result channel.
+struct SpectrumPitchTracker {
+    tracker: HarmNetTracker,
+    cursor: Option<PitchTrackerCursor>,
+}
+
+impl SpectrumPitchTracker {
+    fn new() -> Self {
+        Self {
+            tracker: HarmNetTracker::new(48_000),
+            cursor: None,
+        }
+    }
+
+    fn analyze(&mut self, request: &MusicSpectrumRequest, cancel: &AtomicBool) -> Option<Vec<f32>> {
+        if request.pcm.sample_rate != 48_000 {
+            return Some(vec![0.0; HARMNET_PITCH_COUNT]);
+        }
+        let k_end = pitch_end_frame(request.center_secs);
+        let mut next_frame = match decide(self.cursor.as_ref(), &request.pcm, k_end) {
+            PitchDecision::Reuse => return Some(self.tracker.probabilities(3).to_vec()),
+            PitchDecision::Advance(_) => {
+                self.cursor
+                    .as_ref()
+                    .expect("valid computed cursor")
+                    .next_frame
+            }
+            PitchDecision::Restart(from) => {
+                self.tracker.reset();
+                self.cursor = None;
+                from
+            }
+        };
+        let hop = HARMNET_HOP_SAMPLES as i64;
+        let start = next_frame * hop - HARMNET_LONG_WINDOW_SAMPLES as i64;
+        let stereo = request.pcm.copy_range(start, k_end * hop);
+        // Convert after releasing the read lock; sanitize as the upstream stereo frontend does.
+        let mono: Vec<f32> = stereo
+            .chunks_exact(2)
+            .map(|frame| {
+                let left = if frame[0].is_finite() { frame[0] } else { 0.0 };
+                let right = if frame[1].is_finite() { frame[1] } else { 0.0 };
+                0.5 * left + 0.5 * right
+            })
+            .collect();
+        while next_frame <= k_end {
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            let end = (next_frame * hop - start) as usize;
+            if end > mono.len() {
+                return None;
+            }
+            self.tracker
+                .push_frame(&mono[end - HARMNET_LONG_WINDOW_SAMPLES..end]);
+            next_frame += 1;
+            // The cursor describes actual inference state, never an uncomputed restart origin.
+            if let Some(cursor) = self.cursor.as_mut() {
+                cursor.next_frame = next_frame;
+            } else {
+                self.cursor = Some(PitchTrackerCursor {
+                    pcm: Arc::clone(&request.pcm),
+                    first_frame: next_frame - 1,
+                    next_frame,
+                });
+            }
+        }
+        Some(self.tracker.probabilities(3).to_vec())
     }
 }
 
@@ -716,6 +863,7 @@ fn draw_pitch_keyboard(
     painter: &egui::Painter,
     rect: egui::Rect,
     notes: &[f32],
+    pitch_probabilities: Option<&[f32]>,
     note_sustain: &mut Vec<f32>,
     note_trail: &mut Vec<f32>,
     note_even: &mut Vec<f32>,
@@ -738,15 +886,13 @@ fn draw_pitch_keyboard(
         }
     }
     let sustained_notes = update_keyboard_sustain(notes, note_sustain);
-    let visuals = compute_keyboard_visuals(&sustained_notes, note_count, norm_gain_db);
-    for idx in 0..note_count {
-        // center (基音) は attack 即時 / release 減衰。倍音サポートは EMA で平滑してチラつきを抑える。
-        note_trail[idx] = (note_trail[idx] * KEY_HIGHLIGHT_DECAY).max(visuals.center[idx]);
-        note_even[idx] =
-            note_even[idx] * (1.0 - KEY_HARMONIC_SMOOTH) + visuals.even[idx] * KEY_HARMONIC_SMOOTH;
-        note_odd[idx] =
-            note_odd[idx] * (1.0 - KEY_HARMONIC_SMOOTH) + visuals.odd[idx] * KEY_HARMONIC_SMOOTH;
-    }
+    let visuals = compute_keyboard_visuals(
+        &sustained_notes,
+        pitch_probabilities,
+        note_count,
+        norm_gain_db,
+    );
+    update_keyboard_trails(&visuals, note_trail, note_even, note_odd);
 
     for c_midi in (KEYBOARD_DISPLAY_MIN_MIDI..=144_u8).step_by(12) {
         let x = spectrum_axis_x_unclamped(rect, midi_to_hz(c_midi));
@@ -954,107 +1100,62 @@ struct KeyboardVisuals {
     odd: Vec<f32>,
 }
 
-/// 知覚補正済み notes から、鍵盤の中央明るさ (Layer ② 加点のみ倍音サリエンス + Layer ③ 適応的
-/// 局所正規化) と、偶数 / 奇数倍音サポートを求める。減点は一切せず、加点は乗数≥1 なので生より
-/// 暗くならない (オクターブ重ねの実音を消さない / 高音域を沈めないため)。
+/// Fundamental probabilities set the center; notes supply loudness and harmonic ratios only.
 fn compute_keyboard_visuals(
     notes: &[f32],
+    pitch_probabilities: Option<&[f32]>,
     note_count: usize,
     norm_gain_db: f32,
 ) -> KeyboardVisuals {
-    let flat = || KeyboardVisuals {
-        center: vec![0.0; note_count],
-        even: vec![0.0; note_count],
-        odd: vec![0.0; note_count],
-    };
     let raw: Vec<f32> = (0..note_count)
         .map(|idx| notes.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0))
         .collect();
     let peak = raw.iter().copied().fold(0.0_f32, f32::max);
     if peak < KEY_HIGHLIGHT_MIN_PEAK {
-        return flat();
+        return KeyboardVisuals {
+            center: vec![0.0; note_count],
+            even: vec![0.0; note_count],
+            odd: vec![0.0; note_count],
+        };
     }
-
-    let mut even_energy = vec![0.0_f32; note_count];
-    let mut odd_energy = vec![0.0_f32; note_count];
-    for idx in 0..note_count {
-        let (even, odd) = harmonic_energies(&raw, idx);
-        even_energy[idx] = even;
-        odd_energy[idx] = odd;
-    }
-
-    // Layer ② 加点のみ (乗数≥1): 基音に倍音支持があるほど明るくする。積 (HPS) ではなく和。
-    let mut boosted = vec![0.0_f32; note_count];
-    for idx in 0..note_count {
-        let support = ((even_energy[idx] + odd_energy[idx]) / (raw[idx] + 1.0e-4)).clamp(0.0, 1.0);
-        boosted[idx] = raw[idx] * (1.0 + KEY_HARMONIC_BOOST * support);
-    }
-
-    // Layer ③ 適応的局所正規化: 各鍵の周囲 ±KEY_LOCAL_WINDOW 半音の分布に対する相対的な際立ちで
-    // 明るさを絞る。局所しきい値 = 窓内の上位 KEY_LOCAL_TARGET 番目の値 (密度適応) なので、密な帯
-    // (低域クラッタ) は強い鍵だけ残し、疎な帯は主音がしきい値を明確に超えて強調される (= オクターブ
-    // 内で光る鍵数が一定に近づく)。「選択」(local_factor) と「明るさ」(絶対レベル×presence) を分離し、
-    // 静かな帯の主音が誤って満額で光らないようにする。低域ほど強く、中高域は弱く掛けて既存の
-    // (機能している) 挙動を保つ。旧 ±1 ピークゲートを置換。
-    let boosted_peak = boosted.iter().copied().fold(0.0_f32, f32::max).max(1.0e-6);
-    // 全体ラウドネスゲート: 静かな箇所で鍵盤が光りっぱなしにならないよう全体を抑える。Norm
-    // (ラウドネス正規化) 適用中は presence 用の peak だけ gain 分持ち上げ、録音レベルが小さくても
-    // 体感ラウドネスに合った明るさにする (パターンは boosted のまま = 不変)。
+    // Preserve the existing presence formula, including Norm's display gain.
     let presence_peak = music_core::apply_display_gain_db(peak, norm_gain_db);
     let presence = ((presence_peak - KEY_HIGHLIGHT_MIN_PEAK) / 0.28)
         .clamp(0.0, 1.0)
         .powf(0.7);
     let center = (0..note_count)
         .map(|idx| {
-            let lo = idx.saturating_sub(KEY_LOCAL_WINDOW);
-            let hi = (idx + KEY_LOCAL_WINDOW).min(note_count - 1);
-            let local_ref = kth_largest(&boosted[lo..=hi], KEY_LOCAL_TARGET);
-            let ratio = boosted[idx] / (local_ref + 1.0e-4);
-            let prominence = smoothstep(KEY_LOCAL_RATIO_LO, KEY_LOCAL_RATIO_HI, ratio);
-            let local_factor = KEY_LOCAL_FLOOR + (1.0 - KEY_LOCAL_FLOOR) * prominence;
-            let hz = midi_to_hz(SPECTRUM_NOTE_MIN_MIDI + idx as u8);
-            let strength = local_declutter_strength(hz);
-            let eff = 1.0 - strength * (1.0 - local_factor);
-            ((boosted[idx] / boosted_peak) * presence * eff).clamp(0.0, 1.0)
+            pitch_probabilities
+                .and_then(|p| p.get(idx))
+                .copied()
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0)
+                .powf(KEY_PITCH_GAMMA)
+                * presence
         })
         .collect();
-    // 縦グラデの伸び factor: 各鍵の倍音エネルギーを基音に対する相対量 (0..1) にする。
-    let even = (0..note_count)
-        .map(|idx| (even_energy[idx] / (raw[idx] + 1.0e-4)).clamp(0.0, 1.0))
-        .collect();
-    let odd = (0..note_count)
-        .map(|idx| (odd_energy[idx] / (raw[idx] + 1.0e-4)).clamp(0.0, 1.0))
-        .collect();
+    let mut even = vec![0.0; note_count];
+    let mut odd = vec![0.0; note_count];
+    for idx in 0..note_count {
+        let (even_energy, odd_energy) = harmonic_energies(&raw, idx);
+        even[idx] = (even_energy / (raw[idx] + 1.0e-4)).clamp(0.0, 1.0);
+        odd[idx] = (odd_energy / (raw[idx] + 1.0e-4)).clamp(0.0, 1.0);
+    }
     KeyboardVisuals { center, even, odd }
 }
 
-/// `values` の k 番目 (1-indexed) に大きい値。要素数 < k なら最小値 (= しきい値が低く全通過)。
-fn kth_largest(values: &[f32], k: usize) -> f32 {
-    if values.is_empty() {
-        return 0.0;
+fn update_keyboard_trails(
+    visuals: &KeyboardVisuals,
+    trail: &mut [f32],
+    even: &mut [f32],
+    odd: &mut [f32],
+) {
+    for idx in 0..trail.len() {
+        trail[idx] = (trail[idx] * KEY_HIGHLIGHT_DECAY).max(visuals.center[idx]);
+        even[idx] =
+            even[idx] * (1.0 - KEY_HARMONIC_SMOOTH) + visuals.even[idx] * KEY_HARMONIC_SMOOTH;
+        odd[idx] = odd[idx] * (1.0 - KEY_HARMONIC_SMOOTH) + visuals.odd[idx] * KEY_HARMONIC_SMOOTH;
     }
-    let mut buf: Vec<f32> = values.to_vec();
-    buf.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    buf[k.clamp(1, buf.len()) - 1]
-}
-
-/// 適応的局所正規化の適用強度。低域 (~KEY_LOCAL_FULL_HZ 以下)=1.0、高域 (~KEY_LOCAL_FADE_HZ 以上)
-/// =KEY_LOCAL_MIN_STRENGTH。log 周波数で補間。
-fn local_declutter_strength(hz: f32) -> f32 {
-    let fade = smoothstep(
-        KEY_LOCAL_FULL_HZ.log2(),
-        KEY_LOCAL_FADE_HZ.log2(),
-        hz.max(1.0).log2(),
-    );
-    1.0 - (1.0 - KEY_LOCAL_MIN_STRENGTH) * fade
-}
-
-fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
-    if (edge1 - edge0).abs() <= f32::EPSILON {
-        return if value >= edge1 { 1.0 } else { 0.0 };
-    }
-    let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
 }
 
 /// note index `idx` の偶数 / 奇数倍音の重み付きエネルギーを、知覚補正済み `notes` から求める。
@@ -1414,6 +1515,343 @@ mod tests {
     }
 
     #[test]
+    fn music_pcm_range_pads_only_known_boundaries() {
+        let pcm = MusicPcm::with_capacity(48_000, 0);
+        pcm.append(&[1.0, 2.0, 3.0, 4.0]).unwrap();
+        assert_eq!(
+            pcm.copy_range(-2, 4),
+            vec![0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0]
+        );
+        assert!(pcm.copy_range(3, 5).is_empty());
+        assert_eq!(pcm.copy_range(-3, -1), vec![0.0; 4]);
+        assert!(pcm.copy_range(2, 1).is_empty());
+        pcm.mark_complete();
+        assert_eq!(
+            pcm.copy_range(-1, 4),
+            vec![0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0]
+        );
+        assert_eq!(pcm.copy_range(3, 5), vec![0.0; 4]);
+    }
+
+    #[test]
+    fn pitch_decide_continuity_and_pcm_identity() {
+        let pcm = Arc::new(MusicPcm::with_capacity(48_000, 0));
+        let cursor = PitchTrackerCursor {
+            pcm: Arc::clone(&pcm),
+            first_frame: 1,
+            next_frame: 101,
+        };
+        assert_eq!(decide(None, &pcm, 200), PitchDecision::Restart(142));
+        assert_eq!(decide(None, &pcm, 9), PitchDecision::Restart(1));
+        assert_eq!(decide(Some(&cursor), &pcm, 100), PitchDecision::Reuse);
+        assert_eq!(decide(Some(&cursor), &pcm, 101), PitchDecision::Advance(1));
+        assert_eq!(decide(Some(&cursor), &pcm, 158), PitchDecision::Advance(58));
+        assert_eq!(
+            decide(Some(&cursor), &pcm, 159),
+            PitchDecision::Restart(101)
+        );
+        assert_eq!(decide(Some(&cursor), &pcm, 99), PitchDecision::Restart(41));
+        let parked_pcm = Arc::clone(&pcm);
+        assert_eq!(
+            decide(Some(&cursor), &parked_pcm, 100),
+            PitchDecision::Reuse
+        );
+        let other = Arc::new(MusicPcm::with_capacity(48_000, 0));
+        assert_eq!(
+            decide(Some(&cursor), &other, 100),
+            PitchDecision::Restart(42)
+        );
+        let partial = PitchTrackerCursor {
+            pcm: Arc::clone(&pcm),
+            first_frame: 142,
+            next_frame: 151,
+        };
+        assert_eq!(
+            decide(Some(&partial), &pcm, 150),
+            PitchDecision::Restart(92)
+        );
+        assert_eq!(
+            decide(Some(&partial), &pcm, 151),
+            PitchDecision::Restart(93)
+        );
+        assert_eq!(
+            decide(Some(&partial), &pcm, 200),
+            PitchDecision::Advance(50)
+        );
+    }
+
+    #[test]
+    fn pitch_display_frame_uses_peak_delay_and_age_eight() {
+        assert_eq!(pitch_end_frame(0.0), 9);
+        assert_eq!(pitch_end_frame(0.2), 19);
+        assert_eq!(pitch_end_frame(0.209), 19);
+        assert_eq!(pitch_end_frame(0.211), 20);
+        assert_eq!(pitch_end_frame(-1.0), 9);
+        assert_eq!(pitch_end_frame(f64::NAN), 9);
+    }
+
+    fn tone_pcm(frames: usize, complete: bool) -> Arc<MusicPcm> {
+        let pcm = Arc::new(MusicPcm::with_capacity(48_000, frames));
+        let mut samples = Vec::with_capacity(frames * 2);
+        for n in 0..frames {
+            let value: f64 = (1..=8)
+                .map(|h| {
+                    0.1 / h as f64
+                        * (std::f64::consts::TAU * 220.0 * h as f64 * n as f64 / 48_000.0).sin()
+                })
+                .sum();
+            samples.extend([value as f32, value as f32]);
+        }
+        pcm.append(&samples).unwrap();
+        if complete {
+            pcm.mark_complete();
+        }
+        pcm
+    }
+
+    #[test]
+    fn pitch_frontier_keeps_cursor_and_resumes_after_append() {
+        let pcm = tone_pcm(20 * HARMNET_HOP_SAMPLES + 7, false);
+        let request = MusicSpectrumRequest {
+            pcm: Arc::clone(&pcm),
+            center_secs: 0.5,
+        };
+        let mut pitch = SpectrumPitchTracker::new();
+        let cancel = AtomicBool::new(false);
+        assert!(pitch.analyze(&request, &cancel).is_none());
+        assert_eq!(pitch.cursor.as_ref().unwrap().next_frame, 21);
+        pcm.append(&vec![0.0; 20 * HARMNET_HOP_SAMPLES * 2])
+            .unwrap();
+        let probabilities = pitch.analyze(&request, &cancel).unwrap();
+        assert_eq!(probabilities.len(), 88);
+        assert_eq!(
+            pitch.cursor.as_ref().unwrap().next_frame,
+            pitch_end_frame(0.5) + 1
+        );
+        assert_eq!(pitch.analyze(&request, &cancel), Some(probabilities));
+    }
+
+    #[test]
+    fn pitch_far_undecoded_request_does_not_advance_cursor() {
+        let pcm = tone_pcm(HARMNET_HOP_SAMPLES, false);
+        let request = MusicSpectrumRequest {
+            pcm,
+            center_secs: 10.0,
+        };
+        let mut pitch = SpectrumPitchTracker::new();
+        assert!(pitch.analyze(&request, &AtomicBool::new(false)).is_none());
+        assert!(pitch.cursor.is_none(), "no frame computed means no cursor");
+    }
+
+    #[test]
+    fn pitch_partial_restart_then_backward_seek_uses_requested_warmup() {
+        for (computed_frames, missing_last_sample) in [0, 1, 9]
+            .into_iter()
+            .flat_map(|count| [false, true].map(|missing| (count, missing)))
+        {
+            let new_end = 141 + computed_frames;
+            let pcm = tone_pcm(
+                new_end * HARMNET_HOP_SAMPLES - usize::from(missing_last_sample),
+                false,
+            );
+            let mut pitch = SpectrumPitchTracker::new();
+            let cancel = AtomicBool::new(false);
+            let ahead = MusicSpectrumRequest {
+                pcm: Arc::clone(&pcm),
+                center_secs: 3.82,
+            };
+            assert_eq!(pitch_end_frame(ahead.center_secs), 200);
+            assert!(pitch.analyze(&ahead, &cancel).is_none());
+            let pushed = computed_frames.saturating_sub(usize::from(missing_last_sample));
+            if pushed == 0 {
+                assert!(pitch.cursor.is_none());
+            } else {
+                let cursor = pitch.cursor.as_ref().unwrap();
+                assert_eq!(cursor.first_frame, 142);
+                assert_eq!(cursor.next_frame, (142 + pushed) as i64);
+            }
+
+            // Return to the decoded frontier, which still needs its own full warmup.
+            let back = MusicSpectrumRequest {
+                pcm: Arc::clone(&pcm),
+                center_secs: (new_end - 9) as f64 * HARMNET_HOP_SECS,
+            };
+            assert_eq!(pitch_end_frame(back.center_secs), new_end as i64);
+            assert!(
+                !compute_spectrum(&mut SpectrumAnalyzer::new(SPECTRUM_BANDS), &back)
+                    .bands
+                    .is_empty()
+            );
+            let mut probabilities = pitch.analyze(&back, &cancel);
+            if missing_last_sample {
+                assert!(
+                    probabilities.is_none(),
+                    "undecoded lookahead must not return phantom Reuse"
+                );
+                assert_eq!(pitch.cursor.as_ref().unwrap().next_frame, new_end as i64);
+                pcm.append(&[0.1, 0.1]).unwrap();
+                probabilities = pitch.analyze(&back, &cancel);
+            }
+            let probabilities = probabilities.expect("decoded lookahead is available");
+            assert_eq!(
+                pitch.cursor.as_ref().unwrap().first_frame,
+                new_end as i64 - WARMUP_FRAMES
+            );
+            assert!(probabilities[(57 - SPECTRUM_NOTE_MIN_MIDI) as usize] >= 0.5);
+            let mut fresh = SpectrumPitchTracker::new();
+            assert_eq!(Some(probabilities), fresh.analyze(&back, &cancel));
+        }
+    }
+
+    #[test]
+    fn pitch_zero_frame_restart_discards_previous_computed_cursor() {
+        let pcm = tone_pcm(141 * HARMNET_HOP_SAMPLES, false);
+        let mut pitch = SpectrumPitchTracker::new();
+        let cancel = AtomicBool::new(false);
+        assert!(
+            pitch
+                .analyze(
+                    &MusicSpectrumRequest {
+                        pcm: Arc::clone(&pcm),
+                        center_secs: 0.4
+                    },
+                    &cancel
+                )
+                .is_some()
+        );
+        assert!(pitch.cursor.is_some());
+        assert!(
+            pitch
+                .analyze(
+                    &MusicSpectrumRequest {
+                        pcm,
+                        center_secs: 3.82
+                    },
+                    &cancel
+                )
+                .is_none()
+        );
+        assert!(
+            pitch.cursor.is_none(),
+            "restart clears the old sequence even when no new frame is ready"
+        );
+    }
+
+    #[test]
+    fn pitch_completed_eof_is_available_for_short_and_fractional_files() {
+        for frames in [1, 4_321, 48_123] {
+            let pcm = tone_pcm(frames, true);
+            let mut pitch = SpectrumPitchTracker::new();
+            for center_secs in [0.0, (frames - 1) as f64 / 48_000.0] {
+                let request = MusicSpectrumRequest {
+                    pcm: Arc::clone(&pcm),
+                    center_secs,
+                };
+                assert_eq!(
+                    pitch
+                        .analyze(&request, &AtomicBool::new(false))
+                        .unwrap()
+                        .len(),
+                    88,
+                    "frames={frames}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pitch_unsupported_sample_rate_is_valid_zero() {
+        let mut pitch = SpectrumPitchTracker::new();
+        let request = MusicSpectrumRequest {
+            pcm: Arc::new(MusicPcm::with_capacity(44_100, 0)),
+            center_secs: 0.0,
+        };
+        assert_eq!(
+            pitch.analyze(&request, &AtomicBool::new(false)),
+            Some(vec![0.0; 88])
+        );
+    }
+
+    #[test]
+    fn paused_update_reissues_missing_pitch_after_append_or_completion() {
+        for complete_before_update in [false, true] {
+            let pcm = tone_pcm(HARMNET_HOP_SAMPLES, false);
+            let (request_tx, request_rx) = mpsc::channel();
+            let (result_tx, result_rx) = mpsc::channel();
+            let mut state = MusicSpectrumState::default();
+            state.tx = Some(request_tx);
+            state.rx = Some(result_rx);
+            state.pending = true;
+            state.last_center = 0.0;
+            let mut analyzer = SpectrumAnalyzer::new(SPECTRUM_BANDS);
+            let mut pitch = SpectrumPitchTracker::new();
+            let initial = MusicSpectrumRequest {
+                pcm: Arc::clone(&pcm),
+                center_secs: 0.0,
+            };
+            let cancel = AtomicBool::new(false);
+            let mut analysis = compute_spectrum(&mut analyzer, &initial);
+            analysis.pitch_probabilities = pitch.analyze(&initial, &cancel);
+            assert!(!analysis.bands.is_empty());
+            assert!(analysis.pitch_probabilities.is_none());
+            result_tx.send(analysis).unwrap();
+            if complete_before_update {
+                // Critical ordering: complete before poll/update observes the saved None result.
+                pcm.mark_complete();
+            } else {
+                pcm.append(&vec![0.0; 10 * HARMNET_HOP_SAMPLES * 2])
+                    .unwrap();
+            }
+            let ctx = egui::Context::default();
+            state.update(&ctx, Some(&pcm), 0.0, false);
+            let request = request_rx
+                .try_recv()
+                .expect("paused fixed position must reissue None pitch");
+            assert!(state.pending);
+            let mut analysis = compute_spectrum(&mut analyzer, &request);
+            analysis.pitch_probabilities = pitch.analyze(&request, &cancel);
+            assert!(analysis.pitch_probabilities.is_some());
+            result_tx.send(analysis).unwrap();
+            state.last_request = None;
+            state.update(&ctx, Some(&pcm), 0.0, false);
+            assert!(!state.pending);
+            assert!(
+                request_rx.try_recv().is_err(),
+                "valid Some stops paused reissues"
+            );
+            state.clear();
+            assert!(state.pitch_probabilities.is_none());
+        }
+    }
+
+    #[test]
+    fn paused_missing_pitch_reserves_repaint_even_when_throttled() {
+        let pcm = tone_pcm(HARMNET_HOP_SAMPLES, false);
+        let (request_tx, request_rx) = mpsc::channel();
+        let mut state = MusicSpectrumState::default();
+        state.tx = Some(request_tx);
+        state.bands = vec![0.0; SPECTRUM_BANDS];
+        state.last_center = 0.0;
+        let ctx = egui::Context::default();
+        // Consume Context's initial immediate repaint before checking our delayed request.
+        for _ in 0..3 {
+            let _ = ctx.run(egui::RawInput::default(), |_| {});
+        }
+        let output = ctx.run(egui::RawInput::default(), |_| {
+            state.last_request = Some(Instant::now());
+            state.update(&ctx, Some(&pcm), 0.0, false);
+        });
+        assert!(
+            request_rx.try_recv().is_err(),
+            "throttle should skip sending"
+        );
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT].repaint_delay
+                <= SPECTRUM_REFRESH_INTERVAL
+        );
+    }
+
+    #[test]
     fn band_hz_range_is_monotonic_and_spans_audio() {
         let (lo0, hi0) = spectrum_band_hz_range(0, SPECTRUM_BANDS);
         let (lo_last, hi_last) = spectrum_band_hz_range(SPECTRUM_BANDS - 1, SPECTRUM_BANDS);
@@ -1445,7 +1883,12 @@ mod tests {
     #[test]
     fn keyboard_visuals_silence_is_flat() {
         let note_count = (SPECTRUM_NOTE_MAX_MIDI - SPECTRUM_NOTE_MIN_MIDI + 1) as usize;
-        let visuals = compute_keyboard_visuals(&vec![0.0; note_count], note_count, 0.0);
+        let visuals = compute_keyboard_visuals(
+            &vec![0.0; note_count],
+            Some(&vec![1.0; note_count]),
+            note_count,
+            0.0,
+        );
         assert_eq!(visuals.center.len(), note_count);
         assert!(visuals.center.iter().all(|v| *v == 0.0));
         assert!(visuals.even.iter().all(|v| *v == 0.0));
@@ -1462,7 +1905,9 @@ mod tests {
         notes[fundamental] = 0.8;
         notes[fundamental + 12] = 0.5;
         notes[fundamental + 24] = 0.3;
-        let visuals = compute_keyboard_visuals(&notes, note_count, 0.0);
+        let mut probabilities = vec![0.0; note_count];
+        probabilities[fundamental] = 0.9;
+        let visuals = compute_keyboard_visuals(&notes, Some(&probabilities), note_count, 0.0);
         assert!(visuals.center[fundamental] > 0.0);
         assert!(
             visuals.even[fundamental] > visuals.odd[fundamental],
@@ -1473,18 +1918,130 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_peak_gate_attenuates_adjacent_key() {
-        // 隣接した 2 鍵のうち弱い方 (局所最大でない) は floor まで減衰する。
-        let note_count = (SPECTRUM_NOTE_MAX_MIDI - SPECTRUM_NOTE_MIN_MIDI + 1) as usize;
-        let mut notes = vec![0.0_f32; note_count];
-        notes[40] = 0.9;
-        notes[41] = 0.7; // 局所最大ではない (左隣が強い)。
-        let visuals = compute_keyboard_visuals(&notes, note_count, 0.0);
+    fn keyboard_visuals_probabilities_gate_center_and_both_edges() {
+        let notes = vec![0.9; 88];
+        let mut probabilities = vec![0.0; 88];
+        probabilities[40] = 0.8;
+        let visuals = compute_keyboard_visuals(&notes, Some(&probabilities), 88, 0.0);
+        assert_eq!(visuals.center[40], 0.8);
+        for idx in (0..88).filter(|&idx| idx != 40) {
+            assert_eq!(visuals.center[idx], 0.0);
+            assert_eq!(visuals.center[idx] * visuals.even[idx], 0.0);
+            assert_eq!(visuals.center[idx] * visuals.odd[idx], 0.0);
+        }
         assert!(
-            visuals.center[40] > visuals.center[41],
-            "local max {} should exceed gated neighbor {}",
-            visuals.center[40],
-            visuals.center[41]
+            compute_keyboard_visuals(&notes, None, 88, 0.0)
+                .center
+                .iter()
+                .all(|&v| v == 0.0)
+        );
+    }
+
+    #[test]
+    fn keyboard_visuals_norm_changes_presence_only() {
+        let notes = vec![0.12; 88];
+        let probabilities = vec![0.8; 88];
+        let normal = compute_keyboard_visuals(&notes, Some(&probabilities), 88, 0.0);
+        let louder = compute_keyboard_visuals(&notes, Some(&probabilities), 88, 12.0);
+        assert!(louder.center[0] > normal.center[0]);
+        assert_eq!(normal.even, louder.even);
+        assert_eq!(normal.odd, louder.odd);
+        let presence = ((0.12 - KEY_HIGHLIGHT_MIN_PEAK) / 0.28)
+            .clamp(0.0, 1.0)
+            .powf(0.7);
+        assert!((normal.center[0] - 0.8 * presence).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn keyboard_visuals_harmonic_tone_highlights_fundamental() {
+        let pcm = tone_pcm(48_000, true);
+        let request = MusicSpectrumRequest {
+            pcm,
+            center_secs: 0.8,
+        };
+        let mut analyzer = SpectrumAnalyzer::new(SPECTRUM_BANDS);
+        let mut pitch = SpectrumPitchTracker::new();
+        let analysis = compute_spectrum(&mut analyzer, &request);
+        let probabilities = pitch.analyze(&request, &AtomicBool::new(false)).unwrap();
+        let visuals = compute_keyboard_visuals(&analysis.notes, Some(&probabilities), 88, 0.0);
+        let fundamental = (57 - SPECTRUM_NOTE_MIN_MIDI) as usize;
+        let brightest = visuals
+            .center
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap()
+            .0;
+        assert_eq!(brightest, fundamental);
+        assert!(visuals.center[fundamental] > 0.5);
+        for idx in [fundamental + 1, fundamental + 12] {
+            assert!(visuals.center[idx] < visuals.center[fundamental] * 0.3);
+        }
+    }
+
+    #[test]
+    fn keyboard_visuals_missing_and_zero_pitch_decay_existing_trail() {
+        let notes = vec![0.9; 88];
+        let probabilities = vec![1.0; 88];
+        let lit = compute_keyboard_visuals(&notes, Some(&probabilities), 88, 0.0);
+        let mut trail = vec![0.0; 88];
+        let mut even = vec![0.0; 88];
+        let mut odd = vec![0.0; 88];
+        update_keyboard_trails(&lit, &mut trail, &mut even, &mut odd);
+        assert_eq!(trail[0], 1.0);
+        for pitch in [None, Some(vec![0.0; 88])] {
+            let unlit = compute_keyboard_visuals(&notes, pitch.as_deref(), 88, 0.0);
+            let previous = trail[0];
+            update_keyboard_trails(&unlit, &mut trail, &mut even, &mut odd);
+            assert_eq!(trail[0], previous * KEY_HIGHLIGHT_DECAY);
+        }
+        for _ in 0..100 {
+            update_keyboard_trails(
+                &compute_keyboard_visuals(&notes, None, 88, 0.0),
+                &mut trail,
+                &mut even,
+                &mut odd,
+            );
+        }
+        assert!(trail[0] < 0.001);
+    }
+
+    /// Pure worker benchmark; no application/window launch. Run with --release --ignored --nocapture.
+    #[test]
+    #[ignore = "release worker timing benchmark"]
+    fn harmnet_worker_benchmark() {
+        let pcm = tone_pcm(48_000 * 10, true);
+        let mut analyzer = SpectrumAnalyzer::new(SPECTRUM_BANDS);
+        let mut pitch = SpectrumPitchTracker::new();
+        let cancel = AtomicBool::new(false);
+        let mut request = MusicSpectrumRequest {
+            pcm,
+            center_secs: 3.0,
+        };
+        let start = Instant::now();
+        std::hint::black_box(pitch.analyze(&request, &cancel));
+        println!(
+            "worker warmup (PCM copy + 59 frames, from=end-58 inclusive): {:.3} ms",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+        std::hint::black_box(compute_spectrum(&mut analyzer, &request));
+        let start = Instant::now();
+        request.center_secs += HARMNET_HOP_SECS;
+        std::hint::black_box(compute_spectrum(&mut analyzer, &request));
+        std::hint::black_box(pitch.analyze(&request, &cancel));
+        println!(
+            "worker normal request (both PCM copies + spectrum FFT + one pitch frame): {:.3} ms",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+        let start = Instant::now();
+        for _ in 0..100 {
+            request.center_secs += HARMNET_HOP_SECS;
+            std::hint::black_box(compute_spectrum(&mut analyzer, &request));
+            std::hint::black_box(pitch.analyze(&request, &cancel));
+        }
+        println!(
+            "worker normal request mean (100): {:.3} ms",
+            start.elapsed().as_secs_f64() * 10.0
         );
     }
 

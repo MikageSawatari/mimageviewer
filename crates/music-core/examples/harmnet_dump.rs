@@ -1,422 +1,55 @@
-//! Pitch-lab: Rust port of EffeTune DSP 0.13.0 Note Spectrogram (HarmNet L) inference,
-//! for checking feasibility against the reference Python package. Research prototype only.
-//! Usage: harmnet_dump <weights.bin> <in.f32 stereo 48k> <out.csv>
-#![allow(clippy::all)]
-use rustfft::{Fft, FftPlanner, num_complex::Complex32};
-use std::io::Write;
-use std::sync::Arc;
-
-const K_INPUT_SCALE: usize = 0;
-const K_INPUT_SHIFT: usize = 600;
-const K_CONV0_W: usize = 1200;
-const K_CONV0_B: usize = 1872;
-const K_CONV1_W: usize = 1888;
-const K_CONV1_B: usize = 5728;
-const K_CONV2_W: usize = 5744;
-const K_CONV2_B: usize = 9584;
-const K_PROJ_W: usize = 9600;
-const K_PROJ_B: usize = 16512;
-const K_PITCH_EMB: usize = 16560;
-const K_PCONV_W: usize = 20784;
-const K_PCONV_B: usize = 32304;
-const K_GRU_IW: usize = 32352;
-const K_GRU_HW: usize = 39264;
-const K_GRU_IB: usize = 46176;
-const K_GRU_HB: usize = 46320;
-const K_HEAD_W: usize = 46464;
-const K_HEAD_B: usize = 46656;
-const K_PITCH_BIAS: usize = 46660;
-const CALIBRATION: [f32; 4] = [0.25, 0.20, 0.20, 0.20];
-
-const BINS: usize = 300;
-const CH: usize = 16;
-const HID: usize = 48;
-const HARM: usize = 9;
-const PITCHES: usize = 88;
-const HEADS: usize = 4;
-const PAD: usize = 8;
-const STRIDE: usize = 316;
-const GATES: usize = 3 * HID;
-
-fn midi_hz(m: f64) -> f64 {
-    440.0 * ((m - 69.0) / 12.0).exp2()
-}
-
-struct Frontend {
-    window: Vec<f32>,
-    fft: Arc<dyn Fft<f32>>,
-    fft_size: usize,
-    buf: Vec<Complex32>,
-    mag: Vec<f32>,
-    rows: Vec<(usize, Vec<f32>)>,
-}
-
-impl Frontend {
-    fn new(rate: f64, long: bool) -> Self {
-        let window_length = (rate * if long { 16384.0 } else { 4096.0 } / 48000.0).round() as usize;
-        let mut fft_size = 32;
-        while fft_size < window_length {
-            fft_size *= 2;
-        }
-        let fall = (rate * if long { 0.02 } else { 0.01 }).round() as usize;
-        let rise = window_length - fall;
-        let pi = std::f64::consts::PI;
-        let raw: Vec<f64> = (0..window_length)
-            .map(|i| {
-                if i < rise {
-                    0.5 * (1.0 - (pi * (i as f64 + 0.5) / rise as f64).cos())
-                } else {
-                    0.5 * (1.0 + (pi * ((i - rise) as f64 + 0.5) / fall as f64).cos())
-                }
-            })
-            .collect();
-        let sum: f64 = raw.iter().sum();
-        let window = raw.iter().map(|v| (v / sum) as f32).collect();
-        let bins = fft_size / 2 + 1;
-        let df = rate / fft_size as f64;
-        let mut rows = Vec::with_capacity(BINS);
-        for k in 0..BINS {
-            let midi = 21.0 + (k as f64 - 1.0) / 3.0;
-            let (center, low, high) = (
-                midi_hz(midi),
-                midi_hz(midi - 1.0 / 3.0),
-                midi_hz(midi + 1.0 / 3.0),
-            );
-            if center > rate * 0.5 {
-                rows.push((0, Vec::new()));
-                continue;
-            }
-            let mut column = vec![0.0f64; bins];
-            let mut total = 0.0;
-            for j in 0..bins {
-                let hz = j as f64 * df;
-                let a = (hz - low) / (center - low);
-                let b = (high - hz) / (high - center);
-                let v = a.min(b).max(0.0);
-                column[j] = v;
-                total += v;
-            }
-            if (high - low) / 2.0 > df && total > 0.0 {
-                for v in &mut column {
-                    *v /= total;
-                }
-            } else {
-                column.iter_mut().for_each(|v| *v = 0.0);
-                let position = center / df;
-                let first = position.floor() as usize;
-                if first < bins {
-                    column[first] = 1.0 - (position - first as f64);
-                }
-                if first + 1 < bins {
-                    column[first + 1] = position - first as f64;
-                }
-            }
-            let first = column.iter().position(|v| *v != 0.0).unwrap_or(bins);
-            let last = column
-                .iter()
-                .rposition(|v| *v != 0.0)
-                .map_or(first, |l| l + 1);
-            rows.push((
-                first,
-                column[first..last].iter().map(|v| *v as f32).collect(),
-            ));
-        }
-        let fft = FftPlanner::<f32>::new().plan_fft_forward(fft_size);
-        Frontend {
-            window,
-            fft,
-            fft_size,
-            buf: vec![Complex32::new(0.0, 0.0); fft_size],
-            mag: vec![0.0; bins],
-            rows,
-        }
-    }
-
-    /// `history` ends at the newest sample.
-    fn features(&mut self, history: &[f32], out: &mut [f32]) {
-        let n = self.window.len();
-        let start = history.len() - n;
-        for i in 0..self.fft_size {
-            self.buf[i] = if i < n {
-                Complex32::new(history[start + i] * self.window[i], 0.0)
-            } else {
-                Complex32::new(0.0, 0.0)
-            };
-        }
-        self.fft.process(&mut self.buf);
-        for i in 0..self.mag.len() {
-            self.mag[i] = self.buf[i].norm();
-        }
-        for (k, (first, w)) in self.rows.iter().enumerate() {
-            let v: f32 = w
-                .iter()
-                .enumerate()
-                .map(|(j, x)| x * self.mag[first + j])
-                .sum();
-            out[k] = (1.0e4 * v).ln_1p();
-        }
-    }
-}
-
-struct Conv {
-    inputs: usize,
-    kernel: usize,
-    dilation: usize,
-    w: usize,
-    b: usize,
-    position: usize,
-    history: Vec<f32>,
-}
-
-impl Conv {
-    fn slot(&self, age: usize) -> usize {
-        ((self.position + 3 - age) % 3) * self.inputs * STRIDE
-    }
-}
-
-struct Net {
-    w: Vec<f32>,
-    conv: Vec<Conv>,
-    indices: Vec<usize>,
-    convolved: Vec<f32>,
-    projected: Vec<f32>,
-    pitch_features: Vec<f32>,
-    hidden: Vec<f32>,
-    logits: Vec<f32>,
-}
-
-fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
-}
-
-impl Net {
-    fn new(w: Vec<f32>) -> Self {
-        let mk = |inputs, kernel, dilation, wo, bo| Conv {
-            inputs,
-            kernel,
-            dilation,
-            w: wo,
-            b: bo,
-            position: 0,
-            history: vec![0.0; 3 * inputs * STRIDE],
-        };
-        let conv = vec![
-            mk(2, 7, 1, K_CONV0_W, K_CONV0_B),
-            mk(CH, 5, 1, K_CONV1_W, K_CONV1_B),
-            mk(CH, 5, 3, K_CONV2_W, K_CONV2_B),
-        ];
-        let harmonics = [0.5f64, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-        let mut indices = vec![BINS; PITCHES * HARM];
-        for p in 0..PITCHES {
-            for (h, hv) in harmonics.iter().enumerate() {
-                let idx = (p * 3 + 1) as i64 + (36.0 * hv.log2()).round() as i64;
-                if idx >= 0 && (idx as usize) < BINS {
-                    indices[p * HARM + h] = idx as usize;
-                }
-            }
-        }
-        Net {
-            w,
-            conv,
-            indices,
-            convolved: vec![0.0; CH * STRIDE],
-            projected: vec![0.0; PITCHES * HID],
-            pitch_features: vec![0.0; PITCHES * HID],
-            hidden: vec![0.0; PITCHES * HID],
-            logits: vec![0.0; PITCHES * HEADS],
-        }
-    }
-
-    fn step(&mut self, features: [&[f32]; 2]) {
-        for c in &mut self.conv {
-            c.position = (c.position + 1) % 3;
-        }
-        // input
-        {
-            let base = self.conv[0].slot(0);
-            for ch in 0..2 {
-                for i in 0..BINS {
-                    let scale = self.w[K_INPUT_SCALE + ch * BINS + i];
-                    let shift = self.w[K_INPUT_SHIFT + ch * BINS + i];
-                    self.conv[0].history[base + ch * STRIDE + PAD + i] =
-                        features[ch][i] * scale + shift;
-                }
-            }
-        }
-        for layer in 0..3 {
-            let mut out = vec![0.0f32; CH * STRIDE];
-            {
-                let c = &self.conv[layer];
-                for co in 0..CH {
-                    let dest = &mut out[co * STRIDE + PAD..co * STRIDE + PAD + BINS];
-                    dest.iter_mut().for_each(|d| *d = self.w[c.b + co]);
-                    for tap in 0..3 {
-                        let src = c.slot(2 - tap);
-                        for ci in 0..c.inputs {
-                            let x = &c.history[src + ci * STRIDE..src + (ci + 1) * STRIDE];
-                            let wo = c.w + ((co * c.inputs + ci) * 3 + tap) * c.kernel;
-                            for f in 0..BINS {
-                                let mut v = 0.0;
-                                for k in 0..c.kernel {
-                                    let pos = (PAD + f) as i64
-                                        + c.dilation as i64 * (k as i64 - (c.kernel / 2) as i64);
-                                    v += self.w[wo + k] * x[pos as usize];
-                                }
-                                dest[f] += v;
-                            }
-                        }
-                    }
-                    dest.iter_mut().for_each(|d| *d = d.max(0.0));
-                }
-            }
-            if layer < 2 {
-                let next = &mut self.conv[layer + 1];
-                let base = next.slot(0);
-                next.history[base..base + CH * STRIDE].copy_from_slice(&out);
-            } else {
-                self.convolved = out;
-            }
-        }
-        // gather
-        for p in 0..PITCHES {
-            let a = &mut self.projected[p * HID..(p + 1) * HID];
-            for j in 0..HID {
-                a[j] = self.w[K_PROJ_B + j] + self.w[K_PITCH_EMB + p * HID + j];
-            }
-            for c in 0..CH {
-                for h in 0..HARM {
-                    let idx = self.indices[p * HARM + h];
-                    let value = if idx < BINS {
-                        self.convolved[c * STRIDE + PAD + idx]
-                    } else {
-                        0.0
-                    };
-                    let wo = K_PROJ_W + (c * HARM + h) * HID;
-                    for j in 0..HID {
-                        a[j] += self.w[wo + j] * value;
-                    }
-                }
-            }
-            a.iter_mut().for_each(|v| *v = v.max(0.0));
-        }
-        // pitch convolution
-        for p in 0..PITCHES {
-            let mut a = [0.0f32; HID];
-            a.copy_from_slice(&self.w[K_PCONV_B..K_PCONV_B + HID]);
-            for k in 0..5 {
-                let pp = p as i64 + k as i64 - 2;
-                if pp < 0 || pp >= PITCHES as i64 {
-                    continue;
-                }
-                let input = &self.projected[pp as usize * HID..(pp as usize + 1) * HID];
-                for i in 0..HID {
-                    let wo = K_PCONV_W + (k * HID + i) * HID;
-                    for o in 0..HID {
-                        a[o] += self.w[wo + o] * input[i];
-                    }
-                }
-            }
-            for j in 0..HID {
-                self.pitch_features[p * HID + j] = self.projected[p * HID + j] + a[j].max(0.0);
-            }
-        }
-        // GRU + heads
-        for p in 0..PITCHES {
-            let mut gi = [0.0f32; GATES];
-            let mut gh = [0.0f32; GATES];
-            gi.copy_from_slice(&self.w[K_GRU_IB..K_GRU_IB + GATES]);
-            gh.copy_from_slice(&self.w[K_GRU_HB..K_GRU_HB + GATES]);
-            let x = &self.pitch_features[p * HID..(p + 1) * HID];
-            let hp = &mut self.hidden[p * HID..(p + 1) * HID];
-            for i in 0..HID {
-                for j in 0..GATES {
-                    gi[j] += self.w[K_GRU_IW + i * GATES + j] * x[i];
-                    gh[j] += self.w[K_GRU_HW + i * GATES + j] * hp[i];
-                }
-            }
-            for j in 0..HID {
-                let r = sigmoid(gi[j] + gh[j]);
-                let z = sigmoid(gi[HID + j] + gh[HID + j]);
-                let n = (gi[2 * HID + j] + r * gh[2 * HID + j]).tanh();
-                hp[j] = (1.0 - z) * n + z * hp[j];
-            }
-            for d in 0..HEADS {
-                let mut v = self.w[K_HEAD_B + d] + self.w[K_PITCH_BIAS + p * HEADS + d];
-                for j in 0..HID {
-                    v += self.w[K_HEAD_W + d * HID + j] * hp[j];
-                }
-                self.logits[p * HEADS + d] = v;
-            }
-        }
-    }
-
-    fn probability(&self, p: usize, head: usize) -> f32 {
-        sigmoid(self.logits[p * HEADS + head] + CALIBRATION[head])
-    }
-}
+//! Release benchmark for the production HarmNet frontend/inference.
+//! cargo run -p music-core --release --example harmnet_dump
+//! PCM copy and complete spectrum-worker request are benchmarked by the application test.
+use music_core::pitch::{HARMNET_LONG_WINDOW_SAMPLES, HarmNetTracker};
+use std::hint::black_box;
+use std::time::Instant;
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let wb = std::fs::read(&args[1]).unwrap();
-    let w: Vec<f32> = wb
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
-    let bytes = std::fs::read(&args[2]).unwrap();
-    let st: Vec<f32> = bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
-    let mono: Vec<f32> = st
-        .chunks_exact(2)
-        .map(|c| 0.5 * c[0] + 0.5 * c[1])
-        .collect();
-    let rate = 48_000.0;
-    let hop = 960usize;
-    let mut fronts = [Frontend::new(rate, false), Frontend::new(rate, true)];
-    let mut net = Net::new(w);
-    let long_len = fronts[1].window.len();
-    let mut padded = vec![0.0f32; long_len];
-    padded.extend_from_slice(&mono);
-    let mut f0 = vec![0.0f32; BINS];
-    let mut f1 = vec![0.0f32; BINS];
-    let mut out = std::io::BufWriter::new(std::fs::File::create(&args[3]).unwrap());
-    let started = std::time::Instant::now();
-    let mut frames = 0;
-    let mut n = hop;
-    while n <= mono.len() {
-        let end = long_len + n;
-        let hist = &padded[..end];
-        // silence floor on the short window (variance)
-        let sw = &hist[end - fronts[0].window.len()..];
-        let mean = sw.iter().map(|v| *v as f64).sum::<f64>() / sw.len() as f64;
-        let var = sw.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / sw.len() as f64
-            - mean * mean;
-        let below_floor = !(var >= 2.511886431509582e-10);
-        fronts[0].features(hist, &mut f0);
-        fronts[1].features(hist, &mut f1);
-        net.step([&f0, &f1]);
-        write!(out, "{:.4}", n as f64 / rate).unwrap();
-        for head in 0..HEADS {
-            for p in 0..PITCHES {
-                let v = if below_floor {
-                    0.0
-                } else {
-                    net.probability(p, head)
-                };
-                write!(out, ",{:.4}", v).unwrap();
-            }
-        }
-        writeln!(out).unwrap();
-        frames += 1;
-        n += hop;
+    if cfg!(debug_assertions) {
+        eprintln!("Use --release for performance measurements.");
     }
-    let el = started.elapsed().as_secs_f64();
-    eprintln!(
-        "{} frames in {:.2}s = {:.3} ms/frame ({:.1}x realtime)",
-        frames,
-        el,
-        el * 1000.0 / frames as f64,
-        (frames as f64 * 0.02) / el
+    let first = Instant::now();
+    let mut tracker = HarmNetTracker::new(48_000);
+    println!(
+        "cold initialization (weights + FFT plans): {:.3} ms",
+        first.elapsed().as_secs_f64() * 1e3
+    );
+    let started = Instant::now();
+    for _ in 0..10 {
+        black_box(HarmNetTracker::new(48_000));
+    }
+    println!(
+        "warm initialization: {:.3} ms",
+        started.elapsed().as_secs_f64() * 100.0
+    );
+    let signal: Vec<f32> = (0..HARMNET_LONG_WINDOW_SAMPLES)
+        .map(|i| (2.0 * std::f32::consts::PI * 220.0 * i as f32 / 48_000.0).sin() * 0.1)
+        .collect();
+    for _ in 0..10 {
+        tracker.push_frame(black_box(&signal));
+    }
+    let frames = 500;
+    let started = Instant::now();
+    for _ in 0..frames {
+        tracker.push_frame(black_box(&signal));
+        black_box(tracker.probabilities(3));
+    }
+    println!(
+        "frontend + inference frame: {:.3} ms",
+        started.elapsed().as_secs_f64() * 1e3 / frames as f64
+    );
+    let runs = 10;
+    let started = Instant::now();
+    for _ in 0..runs {
+        tracker.reset();
+        for _ in 0..58 {
+            tracker.push_frame(black_box(&signal));
+        }
+        black_box(tracker.probabilities(3));
+    }
+    println!(
+        "58-frame warmup (inference only): {:.3} ms",
+        started.elapsed().as_secs_f64() * 1e3 / runs as f64
     );
 }

@@ -1,5 +1,5 @@
 # Convert EffeTune DSP harmnet_weights.h (MIT, github.com/frieve-a/effetune,
-# dsp/plugins/analyzer/note_spectrogram/) into a little-endian f32 blob for harmnet_dump.
+# dsp/plugins/analyzer/note_spectrogram/) into the embedded little-endian f32 weight asset.
 import struct, sys
 s = open(sys.argv[1], encoding='utf-8').read()
 body = s[s.index('kWeights = {') + 12:]

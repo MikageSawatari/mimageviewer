@@ -1,6 +1,6 @@
 # 音楽ビュー鍵盤の基音推定 (HarmNet 移植) 設計
 
-状態: 設計 (2026-10-12、利用者が方針 A と下記の推奨 2 点を承認)。実装前の独立レビュー (GPT-6.1 Sol /
+状態: 実装済み・独立コードレビュー ACCEPT。portable check / 本体 release 計測 / 全体ゲート / 検証用 build は環境・成果物の前提待ち (2026-10-12、助走の合格条件は設計担当の追加判断で確定)。実装前の独立レビュー (GPT-6.1 Sol /
 xhigh) 1 回目 = ACCEPT WITH CHANGES、指摘は §12 のとおり反映。
 作業ブランチ: `pitch-lab` (worktree `G:\home\mimageviewer-pitchlab`)。
 
@@ -9,7 +9,8 @@ xhigh) 1 回目 = ACCEPT WITH CHANGES、指摘は §12 のとおり反映。
 音楽ビュー下段のピアノ鍵盤 (`src/ui_music_spectrum.rs` の `draw_pitch_keyboard`) は、各半音帯域の
 **スペクトルエネルギー**を表示している。利用者の報告では EffeTune v2.13.0 の Note Spectrogram と比べて
 「半音上などが間違えて選ばれるケースが多い」。2026-10-12 の調査 (pitch-lab ブランチの
-`crates/music-core/examples/`、手順は `examples/pitch_lab/README.md`) で次を確認した。
+`crates/music-core/examples/`、当時の手順書は `examples/pitch_lab/README.md`、調査用ファイルは
+§10 に従って整理済み) で次を確認した。
 
 - 正解付き合成音で、mIV は倍音・オクターブ上の鍵と**半音上の鍵**を誤点灯する
   (ベース+和音+歌の混合で半音上 187 件 / 半音下 0 件)。EffeTune はほぼ 0。
@@ -84,7 +85,7 @@ pitch-lab の `examples/harmnet_dump.rs` を出発点にしてよいが、次を
   188,048 バイト) を `include_bytes!` で埋め込む。SHA-256 は
   `0164ecb8b4eb9143a20255669612aed306c9db9b670d892de1aee7492051b6a3` (EffeTune の
   `harmnet_weights.provenance.json` の `weights_sha256` と一致することを pitch-lab で確認済み)。
-  テストでこの値を検査する。変換スクリプトは `examples/pitch_lab/convert_weights.py`。
+  テストでこの値を検査する。変換スクリプトは `third_party/effetune-harmnet/convert_weights.py`。
 - 1 フレームの計算で heap 確保をしない (配列は構造体に持つ)。性能目標は §8。
 
 ### 4.2 `MusicPcm` に範囲コピーを追加
@@ -103,7 +104,8 @@ read lock の保持は今の `copy_window` と同じく短くする。
 ### 4.3 spectrum worker の変更 (`src/ui_music_spectrum.rs`)
 
 `run_music_spectrum_worker` が `HarmNetTracker` と、それが**どの PCM のどのフレームまで計算したか**を
-持つ (`PitchTrackerCursor` 相当: `Arc<MusicPcm>` の同一性 (`Arc::ptr_eq`) + 次に計算するフレーム番号)。
+持つ (`PitchTrackerCursor` 相当: `Arc<MusicPcm>` の同一性 (`Arc::ptr_eq`) + 実計算範囲
+`[first_frame, next_frame)`)。カーソルは実際に 1 フレーム計算した後にのみ公開する。
 要求ごとに次を行う。
 
 1. 既存どおり ±1 秒窓で `SpectrumAnalyzer::analyze_moving_window` を回す (棒グラフ・`notes`)。
@@ -168,23 +170,78 @@ golden テスト (§6) はこれらを固定する。
 
 ```
 decide(cursor, pcm, k_end) ->
-  Reuse         : 同じ PCM で、計算済みの最終フレーム == k_end
-  Advance(n)    : 同じ PCM で、0 < k_end − 最終フレーム ≤ MAX_ADVANCE_FRAMES
+  Reuse         : 同じ PCM で、必要な助走範囲を含み、計算済みの最終フレーム == k_end
+  Advance(n)    : 同じ PCM で、必要な助走範囲を含み、
+                  0 < k_end − 最終フレーム ≤ MAX_ADVANCE_FRAMES
   Restart(from) : それ以外 (別の PCM / 後ろへ戻った / 先へ飛びすぎ)。
                   from = max(1, k_end − WARMUP_FRAMES)
 ```
 
 - `WARMUP_FRAMES` = 58 (1 秒 + 先読み 8 フレーム)、`MAX_ADVANCE_FRAMES` = `WARMUP_FRAMES`
   (それ以上先へ進むなら作り直したほうが安い)。
+- 「必要な助走範囲を含む」は `first_frame <= max(1, k_end - WARMUP_FRAMES)`。
+  デコード先端までしか処理できなかった要求の後で位置が戻ると、最終計算フレームが新要求の
+  `k_end` に届いていても、新要求に必要な前史を持たないことがある。この場合も Restart する。
+  元の未取得要求への再要求はこの条件を満たし、計算できた先端から Advance する。
 - 一時停止中は再生位置が変わらない限り要求が来ない (既存の `update` の条件)。小刻みに戻すシークは
   毎回 Restart になるが、要求は 16ms 間隔に間引かれ in-flight は 1 件なので許容する。
-- **Restart と Advance の結果が同じになるとは限らない** (GRU の状態が違う)。助走 1 秒後の出力が
-  連続計算とほぼ一致することをテストで確かめ (§6)、差の許容値を記録する。
+- **Restart と Advance の結果が同じになるとは限らない** (GRU の状態が違う)。連続計算もそれまでの
+  曲の流れに依存する推定値であり、正解ではない。合格条件は正解の音との一致 (§6) とする。
+  連続計算との最大確率差は参考値として記録し、合否に使わない。
+- **助走は 58 のまま** (設計担当の追加判断、2026-10-12)。200 区間へ延長するとシーク、特に
+  一時停止中の繰り返しシークごとに約 0.17 秒の推論費用を生み、利用者が承認した
+  「表示位置の約 1 秒前から助走」と食い違うため採らない。
+
+#### 実装時の助走測定と合格条件の確定 (2026-10-12)
+
+`tests/harmnet.rs` は絶対フレームの同じ PCM 窓を連続計算と reset 後の計算に渡し、head 3 の
+88 鍵の最大絶対差を測る。`from = k_end - 58` を両端含めて処理するため、最初の投入は
+59 フレーム (58 hop 区間) となる。以下は初回調査における末尾 8 要求の最大値。
+連続計算と Restart の差を 0.05 以下にするという当初の目安は、設計担当の追加判断で撤回した。
+比較するのは信号の定義から分かる正解の音で、各ケースの末尾要求の確率 0.5 以上の鍵集合が
+正解と一致することを連続計算と Restart の両方で検査する。和音切替直後など連続計算でも
+一致しない瞬間は、切替から十分後の位置で検査する。最大差は引き続き参考出力として残す。
+
+| 信号 | 4 秒信号、58 区間 | 前史を 4 秒延長、58 区間 | 延長信号、100 区間 | 延長信号、150 区間 | 延長信号、200 区間 | 延長信号、300 区間 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 持続音 A3、8 倍音 | 0.062645771 | 0.074530497 | 0.056932539 | 0.044586480 | 0.034883343 | 0.021358168 |
+| C4/E4/G4 → D4/F4/A4、6 倍音 | 0.127416074 | 0.213090032 | 0.113369733 | 0.067401230 | 0.033543557 | 0.004748879 |
+| A3 オンセット | 0.006171760 | 0.011413950 | 0.007891470 | 0.005196421 | 0.003242029 | 0.000773360 |
+| E2 消音後の再発音、10 倍音 | 0.012870982 | 0.007909354 | 0.004629370 | 0.002814675 | 0.000749758 | 0.004027961 |
+
+信号式は fixture と同じ絶対サンプル位相・振幅 0.1・両端 240 サンプル線形 fade。
+4 秒版では和音切替/再発音 2.6 秒、オンセット 2.5 秒、消音 1.8 秒、`k_end` は
+持続音/オンセット 150、和音/再発音 155。延長版はそれぞれ +4 秒、`k_end` +200。
+持続音/和音の先行区間は 0 秒から延長する。200 区間は今回の 4 ケースで差 0.05 以下だが、
+GRU の忘却に有限時間の保証はなく、再発音の差も単調ではない。普遍的保証とは扱わない。
+独立レビューでも時刻・age の取り違えや移植ミスは見つからず、GRU の履歴の違いによる差と判断した。
+この差だけを基音推定の正誤や助走延長の理由とは扱わない。
+
+最終助走テストは 4 秒信号と前史を 4 秒延長した 8 秒信号の計 8 ケースを、表示対象時刻
+3.42 / 7.42 秒 (`k_end = 180 / 380`、`from = 122 / 322`) で検査する。
+和音切替・再発音から 0.82 秒後、オンセットから 0.92 秒後となる。
+和音には 6 倍音・振幅 `0.1 × h^-2` を使う。初回の 4 秒版 `h^-1.3` 和音は連続推論自身が
+正解の `[62,65,69]` に倍音鍵 `[77,81]` を加えるため、連続推論も正解となるケースを選ぶという
+合格条件に従って助走テストの信号を選定した。上の初回測定表と Python golden の元の
+`h^-1.3` fixture は維持する。推論コードの制限や確率のしきい値変更で誤鍵を消してはいない。
+
+| 最終テストの信号 | 正解の MIDI 鍵集合 | 4 秒版の参考最大差 | 8 秒版の参考最大差 |
+| --- | --- | ---: | ---: |
+| 持続音 A3、8 倍音 | `[57]` | 0.064637609 | 0.074526176 |
+| C4/E4/G4 → D4/F4/A4、6 倍音 (`h^-2`) | `[62,65,69]` | 0.048666891 | 0.015140098 |
+| A3 オンセット | `[57]` | 0.023712359 | 0.029815186 |
+| E2 消音後の再発音、10 倍音 | `[40]` | 0.118740574 | 0.199600309 |
+
+全 8 ケースで連続計算と Restart の確率 0.5 以上の鍵集合がそれぞれ正解と一致した。
+最大差の許容値は設定しない。上表は各ケースの最終要求の 88 鍵における最大絶対差で、
+初回の末尾 8 要求の最大値とは測定位置・集約範囲・和音の信号定義が異なる。
 
 ### 5.3 デコードが追いついていないとき
 
 `copy_range` で取れたサンプルまでしか計算しない。`k_end` まで届かなければ、その要求の
 `pitch_probabilities` は空 (鍵盤の中央は暗い)。カーソルは計算できたところまで進める。
+Restart は旧カーソルを消し、0 フレーム投入ならカーソル無しを維持する。開始予定位置を
+計算済みとして公開しない。Advance で追加投入できない場合は既存の実計算範囲を維持する。
 
 ## 6. テスト
 
@@ -196,8 +253,10 @@ decide(cursor, pcm, k_end) ->
   テスト実行には不要)。
 - **判定関数**: `decide` の Reuse / Advance / Restart (別 PCM・後退・飛びすぎ) の状態遷移テスト。
 - **助走**: 持続音・和音の切り替え・オンセット・無音後の再発音それぞれの途中へ Restart したとき、
-  助走後の出力が連続計算と一致すること。許容差は実装時に測って数値で固定し、本書に記録する
-  (目安: 確率の差 0.05 以下)。
+  各ケースの末尾要求で確率 **0.5 以上の鍵の集合が正解の音と一致すること**を、連続計算と
+  Restart の両方で検査する。正解は信号の定義から求める。連続計算でも正解と一致しない
+  切替直後などは避け、対象時刻を切替から十分後 (0.3 秒以上) に置く。連続計算との最大差は
+  テスト出力と本書へ参考値として記録し、合否に使わない。
 - **範囲**: 180ms 未満の短いファイル、hop で割り切れない長さ、末尾の持続音で、デコード完了後は
   末尾まで確率が `Some` になること (P1)。
 - **再要求**: 「一時停止・位置固定・bands あり・確率 `None`」→ PCM 追記 / 完了 → 次の要求で確率が
@@ -206,6 +265,10 @@ decide(cursor, pcm, k_end) ->
 - **PCM の同一性**: 同じ位置でも別の `MusicPcm` なら Restart になること。
 - **未デコード**: デコード済み範囲の外を要求したとき空の結果になり、カーソルが計算できたところに
   あること。
+- **部分助走後のシーク**: Restart が 0 / 1 / 9 フレームしか投入できなかった後で先端へ戻った場合、
+  新しい表示位置の助走範囲を持たない状態を Reuse/Advance しないこと。未取得なら `None` を維持し、
+  追記後は `Some`。取得済みなら新位置での fresh Restart と一致すること。旧カーソルがあった場合も
+  0 投入 Restart で消えること。
 - **鍵盤**: 倍音のある単音で、中央が最大の鍵が基音であり、オクターブ上・半音上の鍵の中央が
   基音の 0.3 倍未満であること。`compute_keyboard_visuals` の**瞬時値**で、確率 0 の鍵は中央・上下端とも
   0 であること。残光を含む描画状態は別のテストで、確率が 0 になった後に減衰することを確かめる。
@@ -234,6 +297,28 @@ decide(cursor, pcm, k_end) ->
 - 計測用に release の小さな bench (example か `#[ignore]` テスト) を残す。1 フレームの推論だけでなく、
   初期化 (重みの読み込み・FFT 計画)、助走 1 回 (58 フレーム + PCM コピー)、通常の要求 1 回
   (棒グラフの FFT + 1 フレーム) の時間を出す。
+
+最終 music-core release 計測 (2026-10-12、`cargo run --release -p music-core --example harmnet_dump`、
+exit 0): 初期化 cold 11.549ms、同プロセスでの初期化平均 9.407ms、前処理＋1フレーム推論平均
+0.783ms (500 回)、58フレーム推論のみ 47.017ms (10 回平均)。1ms 目標を満たす。
+PCM コピーを含む助走と通常要求全体は `ui_music_spectrum::tests::harmnet_worker_benchmark`
+(`--release --ignored --nocapture`) で測る。本体 Cargo ビルドの native 依存障害を切り分ける間に、
+同じ `src/ui_music_spectrum.rs` を直接 `rustc --test -C opt-level=3 -C linker=rust-lld.exe`
+でコンパイルし、release の music-core とリンクして測定した (egui は既存 debug rlib、
+計測区間に描画は含まない)。59 フレーム助走＋PCM コピー 62.907ms、通常要求
+(両 PCM コピー＋棒グラフ FFT＋1 pitch フレーム) 2.036ms、通常要求 100 回平均 2.291ms。
+上の直接 rustc の値は部分助走カーソル修正前の初回測定で、最終コードの本体 Cargo release 計測とは
+区別する。最終コードで `cargo test --release -p mimageviewer --lib
+ui_music_spectrum::tests::harmnet_worker_benchmark -- --ignored --nocapture` を試みたが、
+`turbojpeg-sys` の CMake/MSBuild 段で失敗 (exit 101)、bench 自体は未実行。環境を変える回避策や
+再試行は行っていない。200 区間への延長費用は初回の 201 × 0.859 ≈ 173ms という推論のみの
+概算であり、実測ではない。§5.2 の判断により 200 区間は採らない。
+
+golden 最大差: age 0 = 0.000000782、age 8 = 0.000000358 (合格基準 0.001)。
+初回 push を含む 12 フレーム・probabilities・reset・無音 push の allocation 実測は 0。
+
+直接 `rustc --test` による spectrum モジュールの headless 検査は 24 成功・0 失敗・
+bench 1 ignored (exit 0)。本体の Cargo テスト成功を代替しない。
 
 ## 9. 文書の更新
 
@@ -276,9 +361,50 @@ P4 の別件化、P6 の単体テストでの代替 (既存の park／復帰・�
 | 指摘 | 対応 |
 | --- | --- |
 | P1 確定 EOF と未デコードを同じ扱いにすると末尾が空になる | §4.2: 完了後は末尾より後を 0 埋め。§6 に短いファイル・端数長・末尾の持続音 |
-| P2 一時停止中に確率だけ未取得だと再要求されない | §4.4: 「確率 None かつデコード未完了」を再要求条件に追加。進捗通知は足さない |
+| P2 一時停止中に確率だけ未取得だと再要求されない | §4.4: 「確率 None」を再要求条件に追加 (2 回目 P2 の追補を含む)。進捗通知は足さない |
 | P3 未取得と有効なゼロ確率の区別、残光との関係 | §4.3: `Option`。§4.4: 未取得は入力 0 として残光で減衰 (ベースライン専用描画は足さない)。§6 で瞬時値と残光を分けて検査 |
 | P4 parked-live が Norm ゲインを渡していない | 既存の不一致でこの設計が生むものではない。detached 凍結ルールの対象なので §10 に記録し別件で起票 |
 | P5 golden の時刻対応と助走の合格条件 | §5.1 に確認済みの対応を記載、§6 に境界・助走ケースと数値許容差の記録 |
 | 2 回目 P2 完了を先に観測すると None のまま再要求されない | §4.4: 再要求条件を「確率 None」だけに。48kHz 以外は有効な全 0 を返す (§4.1)。§6 に順序固定テスト |
 | P6 所有の前提・文書・検査 | §3 に App 全体 1 つの前提と PCM 同一性による継続判断。App レベルの park/復帰テストは、継続を PCM 同一性で判定するため tracker 単体の同一性テストで代える。§9 に async-architecture と EffeTune 文書。§6 にライセンス表記の検査、§8 に要求全体の計測 |
+
+### 最終検証記録 (2026-10-12、pitch-lab の未コミット差分)
+
+助走の合格条件は設計担当の追加判断 (§5.2) で確定。独立実装レビュー (GPT-6.1 Sol / xhigh) は
+最終差分を ACCEPT、新 P1/P2 なし。連続計算との差 0.05 という旧条件に関する初回指摘は撤回済み。
+
+最終確認で部分助走カーソルの所有境界を追加修正した。Restart の開始予定位置を計算済みとして
+公開すると 0 投入時に誤った Reuse となり、実際に少数投入した場合も後退した新要求の前史を
+持たない状態を再利用し得た。カーソルを実計算範囲 `[first_frame,next_frame)` として push 後にのみ
+公開し、要求の助走範囲を含むときだけ Reuse/Advance する。独立レビューはこれを既承認の
+助走・None 契約を成立させる範囲内の構造修正と合意した。所有者・助走長・結果チャネルは変更なし。
+0 / 1 / 9 投入後の取得済み／末尾 1 サンプル未取得、追記、fresh Restart との一致、旧カーソル破棄の
+回帰検査を追加。レビュー対象 `src/ui_music_spectrum.rs` の hash は
+`b686311df56f69ea58950bccbec51491db507999`。
+
+| コマンド | exit / 結果 |
+| --- | --- |
+| `cargo fmt` | 0 |
+| `cargo fmt --check` | 0 |
+| `cargo test -p music-core` | 0: lib 21、HarmNet 6、allocation 1 の計 28 成功、失敗 0。doc test 0 件 |
+| `cargo test -p mimageviewer --lib ui_music_spectrum::` | 0: 26 成功、失敗 0、bench 1 ignored |
+| `cargo test -p mimageviewer --lib ui_dialogs::about::tests::` | 0: 4 成功 (HarmNet MIT 表記を含む) |
+| `cargo check -p mimageviewer --features portable` | 101: `turbojpeg-sys` の CMake/MSBuild ビルドが exit 1。native 前提の失敗で check 未完了。回避策・再試行なし |
+| `cargo test -p mimageviewer --features portable --lib ui_dialogs::about::tests::harmnet_notice` | 0: 1 成功 (portable の HarmNet MIT 表記) |
+| `cargo clippy -p music-core --all-targets` | 0、警告 0。追加の `-- -D warnings` も 0 |
+| `python scripts/check_ui_glyphs.py` | 0、問題 0 件 |
+| `cargo run --release -p music-core --example harmnet_dump` | 0、§8 の最終計測値 |
+| 本体 release の `harmnet_worker_benchmark` | 101: `turbojpeg-sys` の CMake/MSBuild ビルド失敗、bench 0 件・未測定 |
+| `scripts/test-full.ps1 -SuppressCrashDialogs` | 101: launcher に取り込む release core / remote / EPUB worker の 3 本が未用意でビルド停止。テスト 0 件、全体ゲート未完了 |
+| `scripts/build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | 1: `turbojpeg-sys` の CMake/MSBuild ビルド失敗。検証用 core 未作成 |
+
+Cargo は全て `MSBUILDDISABLENODEREUSE=1`。この最終作業では TMP/TEMP を変更せず、target 成果物を
+削除していない。release test 実行に備え、存在しなかった FFmpeg DLL 6 本だけを同 worktree の
+`target/release/deps/` に実体コピーした。製品実行ファイルの起動・コミット・master 操作はなし。
+music-core の成功結果は同一ソースのまま、後続の worker 修正・文書更新では再利用した。
+
+記録は `target/pitch-validation/final/` (`results.json` と各コマンドの raw log)。
+検証用 build の `build-dev-summary.txt` はツール出力から転記した要約であり raw log ではない。
+§8 の初回直接 rustc headless 検査と `pitch-measurement-summary.txt` は以前の別枠の記録として維持する。
+未成立の portable check / release bench / build は設計担当側の環境での実行が必要。
+全体ゲートは release 入力 3 本を用意してから再実行する。検収・実アプリの手動確認は未完了。

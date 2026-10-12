@@ -7,6 +7,7 @@
 pub mod analysis;
 pub mod beat;
 pub mod effects;
+pub mod pitch;
 pub mod playback;
 pub mod timeline;
 

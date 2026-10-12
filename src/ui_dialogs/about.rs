@@ -10,6 +10,12 @@ const ZLIB_LICENSE: &str = include_str!("../../ZLIB-LICENSE.txt");
 const RUST_DEFLATE_NOTICES: &str = include_str!("../../RUST-DEFLATE-NOTICES.txt");
 const EVERYTHING_IPC_NOTICE: &str = include_str!("../../EVERYTHING-IPC-NOTICE.txt");
 const LIBJPEG_TURBO_LICENSE: &str = include_str!("../../LIBJPEG-TURBO-LICENSE.txt");
+// HarmNet の推論と重みは core に埋め込むため、portable を含む全構成で表示する。
+const HARMNET_NOTICE: (&str, &str, &str) = (
+    "EffeTune Note Spectrogram (HarmNet L)",
+    "MIT — © 2025-2026 Yoshiyuki Kobayashi",
+    include_str!("../../third_party/effetune-harmnet/LICENSE"),
+);
 const IJG_ATTRIBUTION: &str =
     "This software is based in part on the work of the Independent JPEG Group.";
 
@@ -59,7 +65,7 @@ pub fn draw_raw_license_snapshot_fixture(ui: &mut egui::Ui) {
     );
 }
 
-// portable は EffeTune の bundle / notices を同梱しない。
+// portable は Mixwright bundle / notices を同梱しない。HarmNet は上の共通 notice。
 #[cfg(not(feature = "portable"))]
 const EFFETUNE_NOTICES: &[(&str, &str, &str)] = &[
     (
@@ -147,6 +153,10 @@ impl App {
                         ui.label("UnRAR license — Alexander Roshal / RARLAB");
                         ui.end_row();
 
+                        ui.label(HARMNET_NOTICE.0);
+                        ui.label(HARMNET_NOTICE.1);
+                        ui.end_row();
+
                         #[cfg(not(feature = "portable"))]
                         {
                             ui.label("EffeTune Mixwright");
@@ -228,6 +238,12 @@ impl App {
                     "Everything IPC 定義 (MIT) 全文",
                     "about_everything_ipc_notice",
                     EVERYTHING_IPC_NOTICE,
+                );
+                draw_license_text(
+                    ui,
+                    &format!("{} — MIT License 全文", HARMNET_NOTICE.0),
+                    "about_harmnet_license",
+                    HARMNET_NOTICE.2,
                 );
 
                 ui.add_space(6.0);
@@ -347,6 +363,24 @@ mod tests {
         assert!(EGUI_LICENSE_MIT.contains("Copyright (c) 2018-2021 Emil Ernerfeldt"));
         assert!(EGUI_LICENSE_APACHE.contains("Apache License"));
         assert!(EGUI_LICENSE_APACHE.contains("Version 2.0, January 2004"));
+    }
+
+    // cfg を付けず、通常構成と portable 構成の両方で同じ登録・本文を検査する。
+    #[test]
+    fn harmnet_notice_is_registered_with_embedded_mit_license_in_every_build_flavor() {
+        use super::HARMNET_NOTICE;
+        assert_eq!(HARMNET_NOTICE.0, "EffeTune Note Spectrogram (HarmNet L)");
+        assert!(HARMNET_NOTICE.1.contains("MIT"));
+        let license = HARMNET_NOTICE.2;
+        assert!(license.contains("Copyright (c) 2025-2026, Yoshiyuki Kobayashi"));
+        assert!(license.contains("Permission is hereby granted, free of charge"));
+        assert!(license.contains("THE SOFTWARE IS PROVIDED \"AS IS\""));
+        let tracked = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("third_party/effetune-harmnet/LICENSE"),
+        )
+        .expect("HarmNet MIT license must be present");
+        assert_eq!(license, tracked);
     }
 
     #[cfg(not(feature = "portable"))]
