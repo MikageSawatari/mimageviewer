@@ -25,6 +25,10 @@ projectionのstable geometryは描画先transformのeffective pppで比較する
 skipは`sub_check`と両unitのpaint/clip/viewport/ppp/ROIをperf有効時だけ記録する。
 
 この記録はA0差分の接続方針であり、実GPU提示・画質・速度・native lease・多窓受入れの証明ではない。
+2026-10-12追補: native ROI端の丸めは元source texelの0.001以内だけを許容し、actual ROIへ
+clampしてnative UVへ写像する。単頁は一leafだけが動き、下頁は自身のcanonical rect全体で静止。
+自身の背（既定の案A）と見開きと同じ補間で移動する背を、環境設定の暫定項目で比較できる。
+正本と検証記録はpage-turn plan §25。比較後は一方を削除し、実機motionの採択は利用者へ残す。
 実装の独立完了レビュー、実機とOFF/ON性能比較は未完了。
 正本は[page-turn-animation-plan.md](page-turn-animation-plan.md)、detached範囲は同rework plan §11。
 既存`analyze_perf.py page-turn --check`のI1〜I5は維持し、専用`page-turn-animation --check`で

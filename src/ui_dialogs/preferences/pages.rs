@@ -10125,6 +10125,7 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
             ui,
             &mut state.settings.page_turn_animation_enabled,
             &mut state.settings.page_turn_animation_duration_ms,
+            &mut state.settings.page_turn_single_spine,
         );
     });
     anchored(ui, state, "spread/singleton-placement", |ui, state| {
@@ -10474,6 +10475,7 @@ pub(super) fn draw_page_turn_animation_setting(
     ui: &mut egui::Ui,
     enabled: &mut bool,
     duration_ms: &mut u32,
+    single_spine: &mut crate::settings::SinglePageTurnSpine,
 ) {
     ui.checkbox(enabled, "ページめくりアニメーション");
     ui.small("単発のページ送りとスライドショーで紙をめくる効果。連打・読込待ち・連結読みには適用しません。");
@@ -10490,18 +10492,38 @@ pub(super) fn draw_page_turn_animation_setting(
         });
     });
     ui.small("時間は動きを確認してから決定します。");
+    ui.add_enabled_ui(*enabled, |ui| {
+        ui.label("単頁の綴じ目（比較用・暫定）");
+        ui.radio_value(
+            single_spine,
+            crate::settings::SinglePageTurnSpine::OwnPage,
+            "案A：自身の綴じ目（既定）",
+        );
+        ui.radio_value(
+            single_spine,
+            crate::settings::SinglePageTurnSpine::Moving,
+            "比較案：綴じ目を移動",
+        );
+        ui.small("両案とも下の頁は最終位置で静止します。比較後に一方を削除します。");
+    });
 }
 
 #[cfg(test)]
 mod page_turn_animation_settings_tests {
     use super::*;
 
-    fn snapshot(name: &str, theme: crate::os_theme::ResolvedTheme, enabled: bool) {
+    fn snapshot(
+        name: &str,
+        theme: crate::os_theme::ResolvedTheme,
+        enabled: bool,
+        single_spine: crate::settings::SinglePageTurnSpine,
+    ) {
         let mut fonts_ready = false;
         let mut enabled = enabled;
         let mut duration_ms = 200;
+        let mut single_spine = single_spine;
         let mut harness = crate::test_ui::builder()
-            .with_size(egui::vec2(320.0, 210.0))
+            .with_size(egui::vec2(320.0, 320.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, theme);
                 if !fonts_ready {
@@ -10511,7 +10533,12 @@ mod page_turn_animation_settings_tests {
                     return;
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    draw_page_turn_animation_setting(ui, &mut enabled, &mut duration_ms);
+                    draw_page_turn_animation_setting(
+                        ui,
+                        &mut enabled,
+                        &mut duration_ms,
+                        &mut single_spine,
+                    );
                 });
             });
         harness.run();
@@ -10524,6 +10551,7 @@ mod page_turn_animation_settings_tests {
             "page_turn_animation_settings_light_on",
             crate::os_theme::ResolvedTheme::Light,
             true,
+            crate::settings::SinglePageTurnSpine::OwnPage,
         );
     }
 
@@ -10533,6 +10561,17 @@ mod page_turn_animation_settings_tests {
             "page_turn_animation_settings_dark_off",
             crate::os_theme::ResolvedTheme::Dark,
             false,
+            crate::settings::SinglePageTurnSpine::OwnPage,
+        );
+    }
+
+    #[test]
+    fn page_turn_animation_settings_snapshot_dark_moving() {
+        snapshot(
+            "page_turn_animation_settings_dark_moving",
+            crate::os_theme::ResolvedTheme::Dark,
+            true,
+            crate::settings::SinglePageTurnSpine::Moving,
         );
     }
 }

@@ -2404,6 +2404,9 @@ impl App {
         if self.settings.remember_spread_shift_per_book != settings.remember_spread_shift_per_book {
             self.spread_shift_memory_setting_changed(settings.remember_spread_shift_per_book);
         }
+        if self.settings.page_turn_single_spine != settings.page_turn_single_spine {
+            self.cancel_all_page_turn_effects_for_settings();
+        }
         self.adopt_page_turn_animation_settings(
             settings.page_turn_animation_enabled,
             settings.page_turn_animation_duration_ms,

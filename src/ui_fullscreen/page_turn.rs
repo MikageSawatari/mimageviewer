@@ -12,6 +12,8 @@ mod landscape_tests;
 #[cfg(test)]
 mod nonfinal_tests;
 #[cfg(test)]
+mod roi_tests;
+#[cfg(test)]
 mod spine_budget_tests;
 use barrier::{FlatCompletion, ResolvedPageTurnNavigation};
 
@@ -819,6 +821,7 @@ fn prepare_leaf(
     outgoing: &PaintedUnit,
     incoming: &PaintedUnit,
     forward: bool,
+    single_spine: crate::settings::SinglePageTurnSpine,
 ) -> Result<PreparedLeaf, &'static str> {
     let start = crate::perf::is_enabled().then(Instant::now);
     let outgoing = canonical_unit(outgoing)?;
@@ -827,8 +830,13 @@ fn prepare_leaf(
         reading_rtl: incoming.reading_rtl,
         forward,
     };
-    let recipe = crate::page_turn_animation::prepare_turn(&outgoing, &input, direction)
-        .map_err(|e| e.sub_check())?;
+    let recipe = crate::page_turn_animation::prepare_turn_with_single_spine(
+        &outgoing,
+        &input,
+        direction,
+        single_spine,
+    )
+    .map_err(|e| e.sub_check())?;
     Ok(PreparedLeaf {
         outgoing,
         incoming: input,
@@ -1727,6 +1735,37 @@ impl App {
             emit(&fact, "skip", "no_outgoing_paint", &[]);
             return;
         };
+        // Geometry may legitimately have different gutters (Pair <-> landscape).
+        // Its saved content must still belong to the current settings at acceptance,
+        // before any pin reservation; a settings change can precede the next paint.
+        if outgoing.content.len() != outgoing.pages.len()
+            || outgoing
+                .content
+                .iter()
+                .zip(&outgoing.pages)
+                .any(|(saved, page)| *saved != self.page_turn_content(page.occurrence.idx))
+        {
+            emit(
+                &fact,
+                "skip",
+                "outgoing_content_changed",
+                &[(
+                    "sub_check",
+                    if outgoing
+                        .content
+                        .iter()
+                        .any(|saved| saved.gap != self.settings.spread_page_gap_px)
+                    {
+                        "gap_setting_changed"
+                    } else {
+                        "page_content_changed"
+                    }
+                    .into(),
+                )],
+            );
+            self.page_turn_presentation.state = PresentationState::Flat(outgoing);
+            return;
+        }
         if let Some(reason) = stage_one_shape_reason(
             outgoing.mode,
             outgoing.pages.len(),
@@ -1944,7 +1983,12 @@ impl App {
                     && deadline_allows
                     && now.saturating_duration_since(offer.accepted_at) < offer.duration
                 {
-                    match prepare_leaf(&outgoing, &unit, offer.forward) {
+                    match prepare_leaf(
+                        &outgoing,
+                        &unit,
+                        offer.forward,
+                        self.settings.page_turn_single_spine,
+                    ) {
                         Ok(projection) => {
                             // Include the ordinary prepared native ROI as well as
                             // the accepted source, globally deduplicated.
@@ -2166,37 +2210,27 @@ impl App {
                             outer_mask_ms: projection.cost.outer_mask_cpu_ms,
                             visible_pages: actual_visibility.iter().fold(0, |mask, v| if v.fraction() >= 0.05 && v.short_edge >= 8.0 { mask | (1 << v.occurrence) } else { mask }),
                             proof: crate::perf::is_enabled()
-                                .then(||serde_json::json!({"recipe":if unit.mode.is_spread() { "BookLeaf" } else if offer.forward { "SingleDeparture" } else { "SingleArrival" },"angle_degrees":projection.angle_degrees,"hinge_x":projection.hinge_x,"face":if projection.showing_back {"back"} else {"front"},"recipe_prepare_cpu_ms":prepared.prepare_cpu_ms,"mesh":mesh_stats,"static_clip_loss_fraction":projection.cost.static_clip_loss_fraction,"static_support_loss_fraction":projection.cost.static_support_loss_fraction,"visible":actual_visibility.iter().map(|v|serde_json::json!({"occurrence":v.occurrence,"area":v.visible_area,"fraction":v.fraction(),"short_edge":v.short_edge})).collect::<Vec<_>>(),"projection_faces":projection.visibility.incoming.iter().map(|v|serde_json::json!({"face":v.occurrence,"area":v.visible_area,"fraction":v.fraction(),"short_edge":v.short_edge})).collect::<Vec<_>>(),"incoming":unit_diagnostics(incoming,offer),"outgoing":unit_diagnostics(outgoing,offer)})),
+                                .then(||serde_json::json!({"recipe":if unit.mode.is_spread() { "BookLeaf" } else if offer.forward { "SingleDeparture" } else { "SingleArrival" },"single_spine":format!("{:?}",prepared.recipe.single_spine),"angle_degrees":projection.angle_degrees,"hinge_x":projection.hinge_x,"face":if projection.showing_back {"back"} else {"front"},"recipe_prepare_cpu_ms":prepared.prepare_cpu_ms,"mesh":mesh_stats,"static_clip_loss_fraction":projection.cost.static_clip_loss_fraction,"static_support_loss_fraction":projection.cost.static_support_loss_fraction,"visible":actual_visibility.iter().map(|v|serde_json::json!({"occurrence":v.occurrence,"area":v.visible_area,"fraction":v.fraction(),"short_edge":v.short_edge})).collect::<Vec<_>>(),"projection_faces":projection.visibility.incoming.iter().map(|v|serde_json::json!({"face":v.occurrence,"area":v.visible_area,"fraction":v.fraction(),"short_edge":v.short_edge})).collect::<Vec<_>>(),"incoming":unit_diagnostics(incoming,offer),"outgoing":unit_diagnostics(outgoing,offer)})),
                         });
                         curl = true;
                         ctx.request_repaint();
                     }
                     Err(reason) => {
                         let previous = offer.submission.end();
-                        if crate::perf::is_enabled()
-                            && matches!(
-                                previous,
-                                SubmissionStatus::Offered | SubmissionStatus::Started
-                            )
-                        {
-                            emit(
-                                &offer.fact,
+                        if matches!(
+                            previous,
+                            SubmissionStatus::Offered | SubmissionStatus::Started
+                        ) {
+                            emit_projection_failure(
+                                offer,
+                                outgoing,
+                                incoming,
                                 if previous == SubmissionStatus::Started {
                                     "cancel"
                                 } else {
                                     "skip"
                                 },
-                                "geometry_visibility_or_roi",
-                                &[
-                                    ("sub_check", reason.into()),
-                                    (
-                                        "geometry",
-                                        serde_json::json!({
-                                            "outgoing": unit_diagnostics(outgoing, offer),
-                                            "incoming": unit_diagnostics(incoming, offer),
-                                        }),
-                                    ),
-                                ],
+                                reason,
                             );
                         }
                         final_state = PresentationState::Flat(unit.clone());
@@ -2548,6 +2582,9 @@ fn emit_projection_failure(
     reason: &'static str,
 ) {
     if !crate::perf::is_enabled() {
+        // Keep the light event observable by handler tests without constructing
+        // geometry diagnostics or enabling the process-wide perf logger.
+        emit(&offer.fact, kind, "geometry_visibility_or_roi", &[]);
         return;
     }
     let loss = canonical_unit(outgoing)
@@ -2617,17 +2654,9 @@ fn canonical_unit(
         let quad = page.transform.paint_quad();
         let uv = canonical_source_uv(&page.transform);
         let material = if let Some(roi) = page.resource.visible_source_uv_rect() {
-            if uv.iter().any(|p| !roi.contains(*p)) {
-                return Err("partial_roi");
-            }
             PageMaterial::Texture {
                 texture_id: page.resource.paint_texture_id(),
-                uv: uv.map(|p| {
-                    egui::pos2(
-                        (p.x - roi.min.x) / roi.width(),
-                        (p.y - roi.min.y) / roi.height(),
-                    )
-                }),
+                uv: canonical_roi_uv(uv, roi, page.resource.size())?,
                 available_uv: egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
             }
         } else {
@@ -2730,6 +2759,45 @@ fn canonical_unit(
     } else {
         Ok(canonical)
     }
+}
+
+fn canonical_roi_uv(
+    uv: [egui::Pos2; 4],
+    roi: egui::Rect,
+    source_size: [usize; 2],
+) -> Result<[egui::Pos2; 4], &'static str> {
+    // Visible ROI travels through screen -> source UV and physical-texel
+    // rounding before the native output retains its f32 edges. A nominally
+    // full edge can therefore be one ULP inside the canonical UV (the measured
+    // right edge was 0.99999994). Admit only TRANSFORM_EPSILON of one SOURCE
+    // texel, independently per axis; this is not a normalized-UV/whole-pixel
+    // allowance and never grows with the native output or screen dimensions.
+    let tolerance = egui::vec2(
+        TRANSFORM_EPSILON / source_size[0].max(1) as f32,
+        TRANSFORM_EPSILON / source_size[1].max(1) as f32,
+    );
+    if !roi.is_finite()
+        || roi.width() <= 0.0
+        || roi.height() <= 0.0
+        || uv.iter().any(|p| {
+            !p.is_finite()
+                || roi.min.x - p.x > tolerance.x
+                || p.x - roi.max.x > tolerance.x
+                || roi.min.y - p.y > tolerance.y
+                || p.y - roi.max.y > tolerance.y
+        })
+    {
+        return Err("partial_roi");
+    }
+    // Clamp to the admitted actual resource before renormalizing. Expanding
+    // coverage alone would let UV1 become >1 on the native ROI texture.
+    Ok(uv.map(|p| {
+        let p = roi.clamp(p);
+        egui::pos2(
+            ((p.x - roi.min.x) / roi.width()).clamp(0.0, 1.0),
+            ((p.y - roi.min.y) / roi.height()).clamp(0.0, 1.0),
+        )
+    }))
 }
 
 fn displayed_landscape(transform: &DisplayedImageTransform) -> bool {
@@ -3455,7 +3523,13 @@ mod tests {
             );
             let old_fact = app.page_turn_presentation.take_candidate().unwrap();
             app.page_turn_presentation.state = PresentationState::Turning {
-                projection: prepare_leaf(&outgoing, &incoming, true).unwrap(),
+                projection: prepare_leaf(
+                    &outgoing,
+                    &incoming,
+                    true,
+                    crate::settings::SinglePageTurnSpine::OwnPage,
+                )
+                .unwrap(),
                 outgoing: outgoing.clone(),
                 incoming: incoming.clone(),
                 offer: AcceptedOffer {

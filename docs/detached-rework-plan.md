@@ -4675,3 +4675,21 @@ canonical projectionと実occurrence receiptの境界を揃える。横長の二
 viewport生成・host選択・focus・close/continuationのownerは増やさない。F12も同じ投影境界を使う。
 src/ui_fullscreen.rsの変更はtest-only描画fixtureの寸法/回転を通常素材から取る部分のみ。
 この実装指定を根拠とし、独立レビュー合格・実機受入れを先取りしない。
+
+2026-10-12独立レビューP2の追補: contextに保持したoutgoing flatのcontentを受理境界で
+現content（設定gapを含む）と照合し、古ければpin/offer前に理由付きinstantとする。
+形状由来gutter差の投影許可は維持する。既存contextの素材有効性検査のみで、owner・
+lease lifecycle・mount/deposit・viewport経路や待機stateは変更しない。再レビューは別途。
+
+2026-10-12実機追補（page-turn plan §25）: 同じcanonical captureでnative ROI端の
+float丸めを小さいsource texel許容で扱い、許容した端をclampしてnative UVへ写像する。
+本当に不足するROIは引き続き拒否する。単頁の静止下頁は常に自身の通常rect全体を使い、
+leafだけが自身の背で回転する。F12も同じcapture/projectionを消費し、context owner、
+viewport述語/生成・mount/deposit、batch lease・VRAM dedup、終了/continuation経路は変えない。
+利用者指定の素材/投影境界修正として記録し、独立レビュー・実機受入れを先取りしない。
+
+同日の比較案追補（page-turn plan §25.3）: 単頁のleaf自身の背と、旧→新へ移動する背を
+暫定設定で比較する。移動背の補間だけを見開きoption Aと共用し、単頁の下頁は両案とも
+canonical rect全体で静止する。選択は既存TurnRecipeへ固定し、設定変更は既存全context
+取消を共用する。独立設計レビューはこの素材/投影境界の構成へ合意し、症状パッチではないと確認。
+detachedのviewport述語・生成・mount/deposit、素材leaseとcompletion ownerは追加・変更しない。

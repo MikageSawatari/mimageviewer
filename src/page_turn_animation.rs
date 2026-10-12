@@ -1,5 +1,6 @@
 //! Pure book-leaf projection. Materials and canonical placements are immutable;
 //! this module performs no source resolution, decoding, upload or I/O.
+use crate::settings::SinglePageTurnSpine;
 use egui::{Color32, Mesh, Pos2, Rect, TextureId, pos2};
 
 pub(crate) const MAX_PROJECTION_VERTICES: usize = 4096;
@@ -211,6 +212,7 @@ pub(crate) struct TurnRecipe {
     grid_u: usize,
     grid_v: usize,
     cost: ProjectionCost,
+    pub(crate) single_spine: SinglePageTurnSpine,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProjectionFailure {
@@ -318,10 +320,19 @@ pub(crate) fn project_turn_measured(
     let recipe = prepare_turn(old, new, direction)?;
     project_prepared(old, new, direction, recipe, progress, measure)
 }
+#[cfg(test)]
 pub(crate) fn prepare_turn(
     old: &CanonicalUnit,
     new: &CanonicalUnit,
     direction: TurnDirection,
+) -> Result<TurnRecipe, ProjectionFailure> {
+    prepare_turn_with_single_spine(old, new, direction, SinglePageTurnSpine::OwnPage)
+}
+pub(crate) fn prepare_turn_with_single_spine(
+    old: &CanonicalUnit,
+    new: &CanonicalUnit,
+    direction: TurnDirection,
+    single_spine: SinglePageTurnSpine,
 ) -> Result<TurnRecipe, ProjectionFailure> {
     preflight(old, new)?;
     let cost = admission(old, new, direction)?;
@@ -331,7 +342,7 @@ pub(crate) fn prepare_turn(
         let mut accepted = None;
         for degrees in [30.0_f32, 45.0, 60.0] {
             let angle = degrees.to_radians();
-            let scene = scene(old, new, direction, 0.0, angle);
+            let scene = scene_with_single_spine(old, new, direction, 0.0, angle, single_spine);
             let receipt = visibility(&scene, new, old);
             if meaningful(&receipt) {
                 accepted = Some(angle);
@@ -365,6 +376,7 @@ pub(crate) fn prepare_turn(
         grid_u: grid.0,
         grid_v: grid.1,
         cost,
+        single_spine,
     })
 }
 pub(crate) fn project_prepared(
@@ -380,7 +392,14 @@ pub(crate) fn project_prepared(
         return Err(ProjectionFailure::InvalidProgress);
     }
     let mut cost = recipe.cost;
-    let scene = scene(old, new, direction, progress, recipe.lift);
+    let scene = scene_with_single_spine(
+        old,
+        new,
+        direction,
+        progress,
+        recipe.lift,
+        recipe.single_spine,
+    );
     if let Some(start) = start {
         cost.outer_mask_cpu_ms = start.elapsed().as_secs_f64() * 1000.0;
     }
@@ -426,14 +445,20 @@ pub(crate) fn project_prepared(
             } else {
                 0.0
             },
-            if old.layout == UnitLayout::Single {
+            if old.layout == UnitLayout::Single
+                && recipe.single_spine == SinglePageTurnSpine::OwnPage
+            {
                 spine(
                     if direction.forward { old } else { new },
                     direction.single_leaf_sign(),
                 )
             } else {
-                let h0 = spine(old, 1.0);
-                h0 + (spine(new, 1.0) - h0) * smooth(progress)
+                let sign = if old.layout == UnitLayout::Single {
+                    direction.single_leaf_sign()
+                } else {
+                    1.0
+                };
+                moving_hinge(spine(old, sign), spine(new, sign), progress)
             },
             false,
         ),
@@ -503,6 +528,10 @@ fn smooth(p: f32) -> f32 {
     let p = p.clamp(0.0, 1.0);
     p * p * (3.0 - 2.0 * p)
 }
+/// Shared by spread option A and the temporary single-page comparison.
+fn moving_hinge(h0: f32, h1: f32, progress: f32) -> f32 {
+    h0 + (h1 - h0) * smooth(progress)
+}
 fn spine(unit: &CanonicalUnit, sign: f32) -> f32 {
     unit.spine_x.unwrap_or_else(|| {
         if unit.layout == UnitLayout::Spread {
@@ -555,12 +584,23 @@ fn outer_gate(old: Rect, new: Rect, p: f32) -> Rect {
         ),
     )
 }
+#[cfg(test)]
 fn scene<'a>(
     old: &'a CanonicalUnit,
     new: &'a CanonicalUnit,
     d: TurnDirection,
     p: f32,
     lift: f32,
+) -> Scene<'a> {
+    scene_with_single_spine(old, new, d, p, lift, SinglePageTurnSpine::OwnPage)
+}
+fn scene_with_single_spine<'a>(
+    old: &'a CanonicalUnit,
+    new: &'a CanonicalUnit,
+    d: TurnDirection,
+    p: f32,
+    lift: f32,
+    single_spine: SinglePageTurnSpine,
 ) -> Scene<'a> {
     let mut surfaces = Vec::with_capacity(6);
     if p == 1.0 {
@@ -604,8 +644,8 @@ fn scene<'a>(
     };
     let h0 = spine(old, sign);
     let h1 = spine(new, sign);
-    let hinge = if pair {
-        h0 + (h1 - h0) * smooth(p)
+    let hinge = if pair || single_spine == SinglePageTurnSpine::Moving {
+        moving_hinge(h0, h1, p)
     } else if d.forward {
         h0
     } else {
@@ -663,25 +703,12 @@ fn scene<'a>(
             }
         }
     } else if d.forward {
-        surfaces.push(surface(
-            back,
-            back.rect.intersect(outer_gate(front.rect, back.rect, p)),
-            incoming_owner(back),
-            1.0,
-        ));
+        surfaces.push(surface(back, back.rect, incoming_owner(back), 1.0));
     } else {
-        let hit = front.rect.intersect(back.rect);
-        if valid_rect(hit) {
-            surfaces.push(surface(front, hit, FaceOwner::Other, 1.0));
-        }
-        for r in subtract_rect(front.rect, back.rect) {
-            surfaces.push(surface(
-                front,
-                r,
-                FaceOwner::Other,
-                1.0 - smooth((p - 0.9) / 0.1),
-            ));
-        }
+        // Single-window turns move only the leaf. The receiving page already
+        // occupies its full canonical placement; it never grows or retires.
+        // At completion the ordinary incoming flat replaces this stack.
+        surfaces.push(surface(front, front.rect, FaceOwner::Other, 1.0));
     }
     let front_inner = if sign > 0.0 {
         front.rect.left() - h0
@@ -713,12 +740,10 @@ fn scene<'a>(
         )
     } else {
         let rect = page.rect;
-        let inner = if sign > 0.0 {
-            rect.left() - hinge
-        } else {
-            hinge - rect.right()
-        };
-        (inner, inner + rect.width(), rect.top(), rect.bottom())
+        // Each single leaf remains bound at its own inner edge. Moving H
+        // translates that binding; subtracting H from the canonical rect
+        // would instead stretch an unbound strip between H and the page.
+        (0.0, rect.width(), rect.top(), rect.bottom())
     };
     let envelope = old
         .pages
@@ -1532,6 +1557,93 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn single_portrait_landscape_both_spines_move_only_the_leaf_and_keep_the_whole_floor_static() {
+        let mut poses = 0;
+        let viewport = Rect::from_min_max(pos2(0.0, 44.0), pos2(1600.0, 944.0));
+        let portrait = Rect::from_min_max(pos2(488.5, 44.0), pos2(1111.5, 944.0));
+        let landscape = Rect::from_min_max(pos2(0.0, 44.0), pos2(1600.0, 944.0));
+        for (old_rect, new_rect) in [(portrait, landscape), (landscape, portrait)] {
+            let (mut old, mut new) = fixture(false);
+            old.pages[0].rect = old_rect;
+            new.pages[0].rect = new_rect;
+            old.pages[0].clip_rect = viewport;
+            new.pages[0].clip_rect = viewport;
+            for reading_rtl in [false, true] {
+                for forward in [false, true] {
+                    let d = TurnDirection {
+                        reading_rtl,
+                        forward,
+                    };
+                    for single_spine in [SinglePageTurnSpine::OwnPage, SinglePageTurnSpine::Moving]
+                    {
+                        let recipe =
+                            prepare_turn_with_single_spine(&old, &new, d, single_spine).unwrap();
+                        let (moving, floor) = if forward {
+                            (&old.pages[0], &new.pages[0])
+                        } else {
+                            (&new.pages[0], &old.pages[0])
+                        };
+                        for progress in [0.0, 0.000001, 0.0001]
+                            .into_iter()
+                            .chain((1..200).map(|i| i as f32 / 200.0))
+                            .chain([0.999999])
+                        {
+                            let pose = scene_with_single_spine(
+                                &old,
+                                &new,
+                                d,
+                                progress,
+                                recipe.lift,
+                                single_spine,
+                            );
+                            assert_eq!(pose.surfaces.len(), 1, "only one stationary floor");
+                            let rest = &pose.surfaces[0];
+                            assert!(std::ptr::eq(rest.page, floor));
+                            assert_eq!(rest.rect, floor.rect);
+                            assert_eq!(rest.polygon, rectangle(floor.rect.intersect(viewport)));
+                            assert_eq!(rest.alpha, 1.0, "floor neither fades nor expands");
+                            let leaf = pose.leaf.as_ref().unwrap();
+                            assert!(std::ptr::eq(leaf.page, moving));
+                            assert_eq!(leaf.top, moving.rect.top());
+                            assert_eq!(leaf.bottom, moving.rect.bottom());
+                            assert_eq!(leaf.outer - leaf.inner, moving.rect.width());
+                            assert_eq!(
+                                leaf.hinge,
+                                if single_spine == SinglePageTurnSpine::Moving {
+                                    moving_hinge(
+                                        spine(&old, d.single_leaf_sign()),
+                                        spine(&new, d.single_leaf_sign()),
+                                        progress,
+                                    )
+                                } else if reading_rtl {
+                                    moving.rect.right()
+                                } else {
+                                    moving.rect.left()
+                                }
+                            );
+                            assert_eq!(leaf.inner, 0.0, "leaf edge stays bound to H");
+                            assert!(matches!(leaf.owner, FaceOwner::OutgoingFront) == forward);
+                            if let FaceOwner::Incoming(id) = leaf.owner {
+                                assert_eq!(Some(id), moving.occurrence);
+                            }
+                            let projection =
+                                project_prepared(&old, &new, d, recipe, progress, false).unwrap();
+                            assert!(!projection.finished);
+                            poses += 1;
+                        }
+                        let landed =
+                            scene_with_single_spine(&old, &new, d, 1.0, recipe.lift, single_spine);
+                        assert!(landed.leaf.is_none());
+                        assert_eq!(landed.surfaces.len(), 1);
+                        assert!(std::ptr::eq(landed.surfaces[0].page, &new.pages[0]));
+                        assert_eq!(landed.surfaces[0].rect, new_rect);
+                    }
+                }
+            }
+        }
+        assert_eq!(poses, 16 * 203);
     }
     #[test]
     fn unequal_scan_and_height_are_admitted_but_a_spine_outside_its_gap_is_not() {

@@ -85,6 +85,10 @@ Q5は **PC viewer限定（F12を含む）、Remote不要** と確定。2026-10-1
 
 2026-10-11利用者決定: 背は読書方向ごとに固定する（LTRは頁左端、RTLは頁右端）。進む操作では現在頁がこの背から起きて次頁を現し、戻る操作では前の頁が同じ背から戻って現在頁の上へ着地する。操作方向で背を反対側へ替えない（§15.2・§21）。
 RTLは頁の配置と回転を左右対応させるが、画像UVや印字は鏡映しない。
+2026-10-12利用者決定（案A）: 単頁の縦長↔横長も動くのは一枚だけ。進むときは旧頁が
+自身の背で去り、新頁は最初から最終rect全体に静止。戻るときは前頁が自身の背から降り、
+現在頁を静止した下頁とする。下頁の補間・外周拡張clipは使わない（§25）。
+追加提案の比較用に、案Aを既定とする暫定切り替えと移動する綴じ目を§25.3で規定する。
 旧画像の実際の裏面は提供されていないため、裏は弱い紙色・陰影だけ。次の画像を「旧画像の真の裏」と偽って貼らない。
 単ページ表示の横長画像は従来どおり一枚のsheet。2026-10-12利用者決定により、見開き表示の横長画像だけは中央を背にして左右の頁面としてめくる（§24）。navigationの再pairingは行わない。
 
@@ -1901,6 +1905,13 @@ source/通常native ROI/textureは一枚を共有する。通常回転を含む�
 旧静止面をH-H0、新下頁をH-H1だけ移動するoption Aをそのまま使う。横長の中央gapは0、
 Pairは通常gapを持つが、この形状差は設定変更ではない。各inner距離をleafの同じmorphで
 補間し、静止面は自身の寸法・UVを維持する。設定gap変更はcontent/binding失効のまま。
+2026-10-12独立レビューP2への修正: 受理境界で、保存済みoutgoingの全実頁contentを
+各頁の現content（設定gapを含む）と照合する。旧flat提示後に設定gapが変わり、まだ再描画
+していなければpin予約・offer前に`skip=outgoing_content_changed`、
+`sub_check=gap_setting_changed`を一回記録し、通常incoming flatへ進む。他のcontent差は
+`sub_check=page_content_changed`。新しい設定でoutgoingを通常再描画した後は再び候補にできる。
+横長のresolved gutter=0とPairのresolved gutter差は設定content差ではなく、この検査を通る。
+投影でgutter一致を要求する方式は再導入せず、新state・待機・decode/uploadも加えない。
 露出gate・終端外周退役・shadow/visibilityは§23の移動後footprintを共用し、終端でsnapしない。
 
 ### 24.2 末尾・境界の縦長singletonとVacant
@@ -1950,3 +1961,112 @@ normal/portable check・fmt/glyph lint成功。test-fullは13,374 passed/62既�
 `target/A-1341-landscape-msg.txt`へ記録した。normal確認用core/remote/EPUB workerの
 `build-dev -PreserveRuntime -WaitForOtherBuildsMinutes 0`も成功（待機省略は残存MSBuild nodeへの対応、script変更無し）。アプリは起動せず、独立レビュー・実機motion/性能の
 受入れ・出荷時期の確定は利用者/設計担当の判断へ残す。
+
+同日、`787b4bf74`の独立レビューP2（gap設定変更後の古いoutgoing）へ対応。
+形状由来gutter差の8遷移は開始・完走、設定変更後の24遷移は受理時skip一回・pin予約無し・
+通常incoming flatを検査した。focused 155件、normal/portable check、fmtが成功。
+test-fullは一回実施したが、無変更のclipboard HTTP deadline fixtureが接続待ちで終了せず、
+このworktreeの本体libテストプロセスだけを診断後に停止したため未完了（exit 101）。
+後続を含む完了済み58スイートは1,201 passed/7 ignored/0 failed、うちui_snapshot157件成功。
+本体libの最終summaryは無く、vendor 3 crateはscriptの非ゼロgateにより未実行。
+全体greenとは扱わず、再実行もしていない。詳細は`target/A-1341-gap-fix-msg.txt`。
+同HTTP fixtureの単独確認は1件成功（1.43秒）。全体実行で接続が未到達となった理由は
+未確定であり、単独成功で全体gateの未完了を解消したとは扱わない。
+今回の確認用buildは利用者指示で行わず、稼働中の通常core・dev-runtimeへは触れていない。
+
+## 25. ROI端の丸めと単頁の静止下頁（2026-10-12）
+
+### 25.1 利用者決定: 単頁は一枚だけ動かす（案A）
+
+縦長↔横長を含む単ページ表示では、forwardは旧頁だけが自身の通常rectの綴じ目
+（LTR左／RTL右）から去り、新頁は最初のposeから最終canonical rect全体を静止して下に置く。
+backwardは前頁（incoming）だけが自身の同じ読書側の綴じ目から降り、現在頁（outgoing）は
+通常rect全体を静止して下に置く。下頁のrect補間・拡大・外周拡張clip・退役fadeは行わない。
+旧縦長の綴じ目が画面1/3付近、新横長の綴じ目が画面端にあることは各頁の通常placementであり許す。
+頁間で背の絶対座標を揃えたり、下頁をその背へ移したりしない。
+
+終端と取消は既存のincoming canonical flat提出・採用を共用する。backwardで旧下頁の外周が
+incomingの外に残る場合、終端で通常incoming flatに置き換える。その外周を途中で縮める別演出は
+加えない。透明部分の下頁/underlayはturn中の通常重ね順、終端は通常incomingの背景に従う。
+§17.3/§21の異寸法単頁に対する外周gate/退役は本決定で置換し、Pairの移動背・外周連続規則は維持。
+新recipe/state/時計/textureを増やさず、既存SingleDeparture/SingleArrivalの静止surfaceだけを修正する。
+矩形morphや二頁slide、下頁を順次開く方式は利用者の見え方と異なるため採用しない。
+
+LTR/RTL・前後・縦長→横長/横長→縦長の8routeをdense poseとGPU goldenで検査する。
+動くleafの所有・自身の背/寸法/UV、静止下頁のrect/全clip/alpha不変、p=0/直後の全下頁、
+canonical着地と取消は別々に確認する。追加decode/uploadやreadiness変更は行わない。
+
+### 25.2 Native ROI端の契約
+
+実機のLTR skipはnative prepared ROIの右端`0.9999999403953552`とcanonical source UV`1.0`の
+厳密contains比較で`partial_roi`となった。source UVからnative UVへの写像には丸めの許容を
+source texelの0.001（`TRANSFORM_EPSILON / source_texture_size`を軸別に適用）だけ設け、
+許容した端点はROI境界へclampしてからnative UVへ正規化する。本当に足りないROIを
+許容したり、不足部分の追加uploadを要求したりしない。LTRB・quarter rotationでも同じ契約を使う。
+実値のLTR/RTL回帰と、許容を超す部分ROIの拒否を対にする。fixtureとproducerの差、
+自動結果・golden目視・確認用buildは今回の引き継ぎへ記録する。
+
+実ログ6件の右頁幅は`2278.666748046875 - 1282 = 996.666748046875`、ppp=1.5で
+`1495.0001220703125`physical px。通常paint bandは1495pxへ丸め、そのUVへの逆写像が
+`1495 / 1495.0001220703125 = 0.9999999403953552`（f32）。`LanczosSourceRegionKey`は
+そのbitsを保持する。欠損に見える量は900px sourceで0.00005364418 texel、8192pxでも
+0.00048828125 texelであり、実pixel不足ではない。producerの通常clip/ROIを拡張せずcaptureで扱う。
+旧handler fixtureは`wgpu_render_state=None`でnative ROI作成前に元textureを返したため、
+LTRが通っても本件を検出できなかった。今回の回帰はheadless RenderStateと普通のnative準備を
+使い、実際に同じROI端が作られたことをassertしてから開始・完走を検査する。
+
+### 25.3 単頁の綴じ目移動を比較する暫定設定
+
+2026-10-12利用者追加提案により、§25.1の案Aと移動する綴じ目を実機で比較する。
+最終採択は利用者が実際の動きを見て決める。環境設定「閲覧表示」のページめくり設定に
+「単頁の綴じ目（比較用・暫定）」を置き、`page_turn_single_spine=OwnPage`（案A）を既定、
+`Moving`を比較案とする。評価時間のスライダーと同様の暫定設定で、比較後は一方と切り替えを削除する。
+
+| 案 | 動くleaf | 下頁 |
+| --- | --- | --- |
+| 案A・自身の綴じ目（既定） | forwardは旧頁自身のH0、backwardは新頁自身のH1を固定軸にする | forwardは新頁、backwardは旧頁を自身のcanonical rect全体で静止 |
+| 比較案・綴じ目を移動 | 同じ一枚のleafをH(p)=H0+(H1-H0)×smooth(p)で移動させながらめくる。内辺は常にHに付き、自身の幅・高さ・UVを保つ | 案Aと同じcanonical rect全体で静止。背の移動に追随させず、rect補間・外周gate・fadeもしない |
+
+H0/H1は通常singleのLTR左端／RTL右端。同じsmoothstepとH補間helperを見開きoption Aと共有する。
+見開きはその既存recipeの静止面translation・outer gateを維持し、単頁はそれを共用しない。
+共通化は背の軌道までとし、単頁の一枚だけ動く要求と下頁の静止を優先する。
+forwardは旧leafが90度で消え、backwardはH1・角度0へ収束する。着地・取消は既存canonical flatへ戻る。
+設定はprepare時のTurnRecipeに固定し、初回visibilityと全poseが同じ選択を使う。
+OKで設定を変えたときは既存の全context設定取消を使い、進行中のleafをlive rebuildしない。
+新pending・state owner・clock・worker・texture・upload・navigation操作は追加しない。
+
+独立設計レビュー（GPT-6.1 Sol / xhigh）はこの投影境界の構成に合意。素材/geometryの所有と
+detachedのviewport述語・生成・mount/deposit・continuationの境界は変更しない。
+両案の縦長↔横長×LTR/RTL×前後をdense pose、通常handler、GPU goldenで検査する。
+自動検証後は、利用者指定に従ってmaster（v4.6.0以降）の取り込みをcoordinatorへ引き継ぎ、
+build-devの直前で停止する。コミット・アプリ起動は行わない。
+
+### 25.4 引き継ぎ差分の自動検証と残るgate
+
+同日の継続セッションで、前任のgap/ROI/案A差分を確認し、比較案を追加した。
+`page_turn` focusedは163 passed、設定転送は25 passed、normal/portable check、fmt/glyph lint成功。
+両案16route×203poseでleafの所有・自身の幅高さ・内辺、静止下頁の全rect/clip/alphaを検査し、
+通常handlerでも16遷移の開始/完走と、設定変更取消→canonical flat採用→次操作を確認した。
+実測と同じnative ROI端が通常prepareで作られるLTR/RTL前後4routeと、実partialの理由付きinstantも成功。
+従来partial試験の観測不備は、perf OFF時にprojection失敗のTEST_EVENTSまで省かれたことが原因。
+軽いevent観測を共通emitへ通し、重いgeometry診断はperf ON限定を維持した。
+
+案A8枚/Moving8枚の新projection golden（計2,327,152 B）、高さ差の既存2枚更新、設定3枚を目視。
+正規終端は独立の通常canonical quadとGPU画素一致を検査した。
+独立GPT-6.1 Sol / xhighレビューは設計・全source・新Moving8枚/設定3枚・転送互換試験へACCEPT、
+要修正指摘なし。これは実機motion/性能の採択や全体gate成功を意味しない。
+
+`test-full.ps1 -SuppressCrashDialogs`は一回実施、exit 101で未完了。
+テスト実行並列を`RUST_TEST_THREADS=8`へ制限したが、コンパイル並列は未指定だった。
+コンパイル中にrustcの`memory allocation of 2096992 bytes failed`で本体lib testが終了し、
+後続にE0463、compiler ICE、rlib不足エラーが出た。test result summaryは0件、vendor 3 crateも未実行。
+timeoutや製品assertion failureとして扱わず、全体再実行・cache削除・無関係なsource修正はしていない。
+今回の実行は前回のHTTP fixture待ちまで到達していない。
+UI snapshot単独は`CARGO_BUILD_JOBS=1`/`RUST_TEST_THREADS=8`で157 passed（39.09秒）。
+この成功で全体gate未了を解消したとは扱わない。
+
+利用者指定のmaster取り込み境界で停止し、build-dev・master merge・コミット・アプリ起動は未実施。
+coordinatorは未コミット差分を保護してmaster（確認時v4.6.0）を取り込み、全体gate未了を解消して
+確認用buildを用意する。取込で変わった共有経路の検証結果を、このpre-merge結果から先取りしない。
+根拠・各command/feature/exit code・ログ・build後の隔離比較手順は
+`target/A-1341-roi-spine-compare-msg.txt`。実機motion・最終案/時間・出荷受入れは利用者/設計担当へ残す。

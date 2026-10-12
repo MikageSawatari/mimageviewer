@@ -45,8 +45,8 @@ impl SceneGeometry {
     fn poses(self) -> [f32; 5] {
         match self {
             // The first two cells deliberately expose a discontinuity that
-            // endpoint-only visual tests cannot find. The later cells show
-            // the growing outer footprint and the canonical destination.
+            // endpoint-only visual tests cannot find. Later cells show the
+            // unequal page footprints and the canonical destination.
             Self::TallerIncoming => [0.0, 0.0001, 0.1, 0.25, 1.0],
             Self::SpineEdge => [0.0, 0.425, 0.433, 0.44, 1.0],
             Self::FixedSingleSpine => [0.0, 0.15, 0.5, 0.85, 1.0],
@@ -461,7 +461,11 @@ fn snapshot_scene(
             } else if matches!(geometry, SceneGeometry::PortraitPdf) {
                 "Portrait PDF fit in outlined 16:9 fullscreen; letterbox and real paint-grid gap. Last pose = canonical incoming."
             } else if matches!(geometry, SceneGeometry::TallerIncoming) {
-                "Height 600 -> 900: p=0 and next clock pose; outer footprint grows continuously. Last = canonical incoming."
+                if spread {
+                    "Height 600 -> 900: p=0 and next clock pose; outer footprint grows continuously. Last = canonical incoming."
+                } else {
+                    "Height 600 -> 900: one moving leaf over a full static page at every pose. Last = canonical incoming."
+                }
             } else if matches!(geometry, SceneGeometry::SpineEdge) {
                 "Near 90 degrees: front -> thin paper edge -> printed back; the resting page never turns. Last = canonical incoming."
             } else if matches!(geometry, SceneGeometry::OpaqueBlack) {
@@ -971,6 +975,249 @@ fn spread_window_fixture(
             )),
         }],
     }
+}
+
+fn snapshot_single_portrait_landscape(
+    portrait_to_landscape: bool,
+    reading_rtl: bool,
+    forward: bool,
+    single_spine: SinglePageTurnSpine,
+) -> egui_kittest::SnapshotResults {
+    use SpreadFixtureKind::{Landscape, Portrait};
+    const SINGLE_POSES: [f32; 7] = [0.0, 0.0001, 0.25, 0.5, 0.75, 0.9999, 1.0];
+    const WIDTH: f32 = 170.0;
+    let transition = if portrait_to_landscape {
+        "portrait_to_landscape"
+    } else {
+        "landscape_to_portrait"
+    };
+    let name = format!(
+        "page_turn_projection_single_{transition}_{}_{}{}",
+        if reading_rtl { "rtl" } else { "ltr" },
+        if forward { "forward" } else { "back" },
+        if single_spine == SinglePageTurnSpine::Moving {
+            "_moving"
+        } else {
+            ""
+        }
+    );
+    let canonical_endpoint = Arc::new(AtomicBool::new(false));
+    let endpoint_flag = canonical_endpoint.clone();
+    let mut portrait_textures = None;
+    let mut landscape_textures = None;
+    let mut harness = crate::test_ui::builder()
+        .with_size(vec2(1550.0, 302.0))
+        .build(move |ctx| {
+            if portrait_textures.is_none() {
+                crate::ui_fonts::configure_fonts(ctx);
+                portrait_textures = Some(load_textures(ctx, false, false));
+                landscape_textures = Some(load_landscape_textures(
+                    ctx,
+                    crate::rotation_db::Rotation::None,
+                ));
+                ctx.request_repaint();
+                return;
+            }
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            painter.rect_filled(ctx.content_rect(), 0.0, Color32::BLACK);
+            painter.text(
+                pos2(10.0, 8.0),
+                egui::Align2::LEFT_TOP,
+                format!(
+                    "SINGLE / {transition} / {} / {} / one moving page; original canonical old and new at outside columns{}",
+                    if reading_rtl { "RTL" } else { "LTR" },
+                    if forward { "FORWARD" } else { "BACK" },
+                    if single_spine == SinglePageTurnSpine::Moving { "; MOVING SPINE" } else { "" }
+                ),
+                egui::FontId::monospace(13.0),
+                Color32::WHITE,
+            );
+            let (old_kind, new_kind) = if portrait_to_landscape {
+                (Portrait, Landscape)
+            } else {
+                (Landscape, Portrait)
+            };
+            for column in 0..9 {
+                let cell = Rect::from_min_size(
+                    pos2(10.0 + column as f32 * WIDTH, 74.0),
+                    vec2(WIDTH, 178.0),
+                );
+                let fixture = |kind, incoming| {
+                    // Keep the actual single page whole. Spread normalization
+                    // would split landscape into two faces and test a different
+                    // ownership/motion contract from single mode.
+                    let mut unit = spread_window_fixture(
+                        portrait_textures.as_ref().unwrap(),
+                        landscape_textures.as_ref().unwrap(),
+                        cell,
+                        kind,
+                        incoming,
+                        reading_rtl,
+                        crate::rotation_db::Rotation::None,
+                    );
+                    // The user's real book: 900x1300 portrait and 1600x900
+                    // landscape, each page fitted independently in one 16:9
+                    // canvas. Its own reading-side edge is the binding.
+                    let viewport = Rect::from_center_size(cell.center(), vec2(WIDTH, WIDTH * 9.0 / 16.0));
+                    let source = if matches!(kind, Landscape) { vec2(1600.0, 900.0) } else { vec2(900.0, 1300.0) };
+                    let scale = (viewport.width() / source.x).min(viewport.height() / source.y);
+                    unit.pages[0].rect = Rect::from_center_size(viewport.center(), source * scale);
+                    unit.pages[0].clip_rect = viewport;
+                    unit
+                };
+                let old = fixture(old_kind, false);
+                let new = fixture(new_kind, true);
+                assert_eq!(old.layout, UnitLayout::Single);
+                assert_eq!(new.layout, UnitLayout::Single);
+                assert_eq!(old.pages.len(), 1);
+                assert_eq!(new.pages.len(), 1);
+                let label = match column {
+                    0 => "canonical old".to_owned(),
+                    8 => "canonical new".to_owned(),
+                    _ => format!("{:.4}", SINGLE_POSES[column - 1]),
+                };
+                painter.text(
+                    pos2(cell.center().x, 48.0),
+                    egui::Align2::CENTER_TOP,
+                    label,
+                    egui::FontId::monospace(12.0),
+                    Color32::WHITE,
+                );
+                let (moving, stationary) = if forward {
+                    (&old.pages[0], &new.pages[0])
+                } else {
+                    (&new.pages[0], &old.pages[0])
+                };
+                // Cyan is the stationary page's full canonical footprint at
+                // every pose; the texture's unequal colored edge stripes and
+                // printed letters expose any actual clipping or translation.
+                painter.rect_stroke(
+                    stationary.rect,
+                    0.0,
+                    egui::Stroke::new(1.0, Color32::from_rgb(75, 217, 225)),
+                    egui::StrokeKind::Outside,
+                );
+                let spine = if single_spine == SinglePageTurnSpine::Moving {
+                    let sign = if reading_rtl { -1.0 } else { 1.0 };
+                    let p = match column { 0 => 0.0, 8 => 1.0, _ => SINGLE_POSES[column - 1] };
+                    moving_hinge(super::spine(&old, sign), super::spine(&new, sign), p)
+                } else if reading_rtl {
+                    moving.rect.right()
+                } else {
+                    moving.rect.left()
+                };
+                painter.line_segment(
+                    [
+                        pos2(spine, moving.rect.top() - 6.0),
+                        pos2(spine, moving.rect.bottom() + 6.0),
+                    ],
+                    egui::Stroke::new(1.0, Color32::from_rgb(241, 92, 104)),
+                );
+                painter.text(
+                    pos2(spine, moving.rect.bottom() + 8.0),
+                    egui::Align2::CENTER_TOP,
+                    "SPINE",
+                    egui::FontId::monospace(10.0),
+                    Color32::from_rgb(241, 92, 104),
+                );
+                if column == 0 {
+                    paint_canonical(&painter, &old);
+                } else if column == 8
+                    || (column == 7 && endpoint_flag.load(Ordering::Relaxed))
+                {
+                    paint_canonical(&painter, &new);
+                } else {
+                    let direction = TurnDirection { reading_rtl, forward };
+                    let recipe = prepare_turn_with_single_spine(&old, &new, direction, single_spine).unwrap();
+                    let projection = project_prepared(
+                        &old,
+                        &new,
+                        direction,
+                        recipe,
+                        SINGLE_POSES[column - 1],
+                        false,
+                    )
+                    .expect("single portrait/landscape transition must project at every pose");
+                    assert_eq!(projection.hinge_x, spine);
+                    for projected in projection.meshes {
+                        painter
+                            .with_clip_rect(projected.clip_rect)
+                            .add(egui::Shape::mesh(projected.mesh));
+                    }
+                }
+            }
+            painter.text(
+                pos2(10.0, 274.0),
+                egui::Align2::LEFT_TOP,
+                if single_spine == SinglePageTurnSpine::Moving {
+                    "Cyan = full stationary floor. Pink = shared smooth old-to-new spine trajectory; only the bound leaf translates while turning."
+                } else if forward {
+                    "Cyan = full incoming rect from the first pose; pink = outgoing own spine. Print/edges stay fixed beneath the departing page."
+                } else {
+                    "Cyan = full outgoing rect while the previous page arrives; pink = incoming own spine. Current print/edges stay fixed beneath it."
+                },
+                egui::FontId::monospace(12.0),
+                Color32::from_rgb(206, 216, 228),
+            );
+        });
+    harness.run();
+    harness.snapshot(&name);
+    let projected = harness.render().unwrap();
+    canonical_endpoint.store(true, Ordering::Relaxed);
+    harness.step();
+    harness.run();
+    let canonical = harness.render().unwrap();
+    if projected != canonical {
+        let evidence = std::path::Path::new("target/page-turn-endpoint-debug");
+        std::fs::create_dir_all(evidence).unwrap();
+        projected
+            .save(evidence.join(format!("{name}-projected.png")))
+            .unwrap();
+        canonical
+            .save(evidence.join(format!("{name}-canonical.png")))
+            .unwrap();
+    }
+    assert!(
+        projected == canonical,
+        "single portrait/landscape endpoint must render exactly like canonical incoming: {name}"
+    );
+    harness.take_snapshot_results()
+}
+
+#[test]
+fn page_turn_projection_snapshot_single_portrait_landscape_eight_routes() {
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    for portrait_to_landscape in [false, true] {
+        for reading_rtl in [false, true] {
+            for forward in [false, true] {
+                snapshots.extend(snapshot_single_portrait_landscape(
+                    portrait_to_landscape,
+                    reading_rtl,
+                    forward,
+                    SinglePageTurnSpine::OwnPage,
+                ));
+            }
+        }
+    }
+    snapshots.unwrap();
+}
+
+#[test]
+fn page_turn_projection_snapshot_single_portrait_landscape_moving_spine_eight_routes() {
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    for portrait_to_landscape in [false, true] {
+        for reading_rtl in [false, true] {
+            for forward in [false, true] {
+                snapshots.extend(snapshot_single_portrait_landscape(
+                    portrait_to_landscape,
+                    reading_rtl,
+                    forward,
+                    SinglePageTurnSpine::Moving,
+                ));
+            }
+        }
+    }
+    snapshots.unwrap();
 }
 
 fn normalize_fixture(
