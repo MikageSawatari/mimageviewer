@@ -32,6 +32,11 @@
 
 ## 1. 優先候補
 
+### 1.379 補正レイヤーで、マウスで図形を動かしている間にキーで動かすと、取り消し・Esc・保存の順序が食い違う — §1.372 の実装前調査 (2026-10-12)
+- 状態: **未着手 (時期未定)**。§1.372 の範囲外として分けた (coordinator 判断 2026-10-12)。
+- 内容 (コードの参照、実機での再現の主張ではない): 補正レイヤー (ローカル調整) の図形をポインタで操作している最中に、キーで移動・回転すると、(1) 履歴に別操作が混ざる (key entry が S0→S2、pointer entry が S1→S2)、(2) 次のポインタ更新が開始時の DragState.base から結果を作るのでキーの変更が上書きされる、(3) Esc で確定済みのキー変更が画面だけ消える、が起こり得る。経路: `ui_adjustment_panel.rs` の `update_selected_local_adjust_shape` / `apply_local_adjust_shape_drag_from_canvas` / Esc 処理、`undo_ops.rs` の `set_local_adjust_layers_for_idx_with_undo`。
+- 案 (worktree mimageviewer-nextfix の docs/page-adjustment-owner-plan.md §9 に根拠と候補): ポインタを押したままでもキーを受け付け、別操作の受理の境界でそれまでのポインタ変更を確定して継続の基準を更新する。判断点は交互入力の Undo の粒度と Esc の取消範囲。ポインタ中のキーを拒否する案は、できる操作が減るので採らない方向。
+
 ### 1.378 音響調整 (EffeTune) の窓をタスクバーに表示する設定 — 利用者要望 (2026-10-12)
 - **次の版に入れる (利用者 2026-10-12)**: 案 A = 窓にタスクバー表示の印を付ける (mIV のグループとは別のアイコン)。**ON/OFF の設定、既定 ON**。案 B (AppUserModelID で mIV のグループに入れる) は既存のピン留め・ジャンプリストへ影響し得るので今回は対象外。
 - 現状: EffeTune の窓は mimageviewer-vst3-host.exe が作る **owner なし**の窓 (mIV を最小化しても表示を続けるため。main HWND は参照用) で、タスクバーに出ない。音響調整ボタンは背面なら前面化、前面なら隠す (利用者が 1 回で前面化を確認)。
