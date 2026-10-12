@@ -1455,6 +1455,89 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-12 §1.374 Everything の共通Search接続（未コミット・独立実装レビュー待ち）
+
+利用者の実装指示と承認済みEverything計画、先行PDF ownershipの独立ACCEPT実装
+`4510346f5`（master `c1e66f589`）に基づく変更。Stage1の限定ACCEPTやPDF受入を、
+今回のEverything製品実装に対する独立ACCEPTへ読み替えない。追加実装の独立レビューは未完了。
+
+変更caller familyは `global_search_ui.rs` / `global_search_ui/everything.rs` のSearch source/prepare/adopt、
+物理本openの成功採用とRoot/PhysicalChild帰路、共通main modal/input受付、既存物理open/enumerate/return接続。
+実ファイル一覧を既存Search ownerへ採用するための構造接続で、detachedのrect/focus/placement/HWND/recreate
+症状に条件を足す変更ではない。`SearchProducer` と `SearchAccepted` が未採用/採用済みsourceを型で所有し、
+兄弟contextの状態を推測する新しいbool/Option、時間窓、reset、retryを追加しない。
+
+modalはmainのみ、Everything検索起動はmain Gridのみ。detachedから検索を転送しない。
+F12 open/fork/park/promoteは既存物理viewer ownerを使い、mainの検索dataset/return originを複製しない。
+main Searchの一覧交換は同ownerのPDF ticketだけを進め、同pathを読む兄弟queue/cache/requested/編集状態を変更しない。
+Remote source/query/result API、viewport/placement/HWND owner/focus/z-order述語は追加しない。
+取得/帰路のproducerだけがRemote sessionのlocal-modal leaseを持ち、acquireの受付と排他にする。
+既存Search installのpin/タグDB照会をEverythingの共通prepareへ渡し、UIは完成mapを採用する。
+新datasetは同一一覧のrating membership移譲対象にせず、保持datasetのsort/facetは移譲を維持する。
+共通neighbor集合交差のHashSet化は選択規則を変えずUIの二乗探索を除く。
+cross-context/物理本open-back/cancel/failed/stale回帰はfakeで成功した。大きい送信時policyを
+同producer内のBoxへ移してAppサイズを105,400に戻し、App/bundleのstack所有を既存上限内に保つ。
+full libは12,206成功・既知EOF timing failure一件（単独成功）、full UI snapshotは162成功。
+独立実装レビューと実機確認は未完了で、
+証拠は [Everything計画 §14](everything-search-plan.md#14-実装記録2026-10-12)へ集約する。
+
+### 2026-10-12 PDF-EPOCH-OWNERSHIP: R2受入後の実装記録（未コミット）
+
+利用者からR2（`b5b3f06be`）の独立ACCEPTとPDF先行実装指示を取得した。
+以下の設計段階で記録した双方の「BA-7の所有境界を直す構造修正、症状パッチではない」
+合意の範囲で、App/bundleの非Clone writer、immutable ticketの全producer継承、
+共有poolの非同期prune/pop、owner/要求世代/key昇格、fullscreen Unscopedを実装した。
+registryはfresh/build/swap/park/fork/promote/retireでwriterとViewer昇格追跡を分類して移譲する。
+direct-readerからmainのphysical basisを実際に復元する場合だけmain旧要求を失効させる。
+
+回帰は同path/page/targetのmain＋detached Search replace（逆方向も）、
+B同key→A昇格要求→A遅着、旧世代/別owner除外、fullscreen Unscoped/Critical、
+park/fork/build commit/abort/promote/retire、ticket派生、maintenance wake合流を含む。
+viewport/placement/HWND/focus/recreate述語、lane/cap/open-admission、Remote protocol、
+Abort/Harvest/cache keyは変更しない。Everything製品コードは含めない。
+まれなmaintenance切断は既存toastへのログ＋通知のみで、再起動worker/回復stateは追加しない。
+
+指定自動検証の件数・失敗名・ログは `target/EV-pdf-epoch-impl-msg.txt` に集約する。
+fmt、通常/portable check、PDF/context/thumbnail/継承の焦点テストは成功。
+全libは一回で12,150成功・2失敗・56 ignored（未変更のmetadata batch数とvideo first-frame通知）。
+ui_snapshotは156成功・1失敗（変更履歴の基準画像はv4.5.0先頭、現行v4.6.0先頭で未追随）。
+全gate成功とは扱わず、失敗を記録して独立判断へ渡す。
+実装完了の独立レビューと実機受入は未取得。利用者指示に従いbuild-dev/launch/commit/mergeなし。
+
+### 2026-10-12 PDF-EPOCH-OWNERSHIP: render失効と優先昇格のcontext所有（設計段階）
+
+利用者が提示した独立設計レビュー（対象 `efe965453`）は、非Clone writerをbundleと移譲し、
+immutable ticketで失効を判断する案について、
+「BA-7の所有境界を直す構造修正であり、症状パッチではないことに同意します」と明示した。
+設計担当（Codex）も、共有global render epochによる兄弟jobsの失効を、既存context payloadの
+変更権限と要求時点の証明へ移す根本修正であることに同意する。
+詳細は [pdf-render-epoch-ownership-plan.md](pdf-render-epoch-ownership-plan.md) §3–§6/§8/§9。
+
+予定範囲はApp投影/ViewerContextBundleの`PdfRenderEpochOwner`、enqueueと派生要求のread-only
+ticket継承、poolのowner-local prune/pop/cancel/drop、registryのfresh/build/swap/park/fork/
+promote/retire移譲。同じpath/pageのmain+detachedでも、一覧を替えたcontextの旧PDF thumbnail
+jobsだけを失効させる。writerは移動し、fork先はfresh owner、in-flight thumbnail要求は複製しない。
+既存Ctrl+G/通常一覧にもある不具合の独立stageで、EverythingのIPC/UI/新shortcutを含めない。
+
+レビュー唯一のP2は、現行priority promotionがpath/pageだけで兄弟をfoundと数え、未到着Aの
+昇格再試行を終える点。今回の設計改訂はViewer promotionをowner/要求世代/既存keyに限定し、
+found/already_high・Normal昇格・HighNormal対象再配置へ同じselectorを使う。
+既存の昇格追跡値も同じbundle所有のtyped stateへ置換し、forkで複製しない。
+fullscreen本体は明示Unscoped promotionでViewer thumbnailを対象にせず、Unscoped同士の
+共有source/page照合とCritical found契約を維持する。B同key存在→A昇格要求→A遅着の順序、
+同owner旧世代・同generation別owner、main/detached逆方向を回帰条件とする。
+
+viewport/placement/HWND/focus/recreate述語、lane/cap/open-admission方針は変更しない。
+全窓停止、global bump省略guard、時間窓、F12/seek制限、追加retry stateで症状を隠さない。
+UI失効はatomic publishと非blocking wakeまで、prune/reply/freeは既定のpool内maintenance
+worker案。まれな失敗は既定のログ＋通知とし、回復機構/DB再作成を追加しない。
+
+本項は**構造修正への双方の設計合意と予定範囲**の記録。
+独立判定はPDF計画REVISE（P2一件、P1/P3なし）、Everything計画ACCEPT。
+今回のP2改訂へのreviewer再確認・full ACCEPTは未取得。利用者のcommitとreviewer確認後に
+PDF ownershipを独立stageとして先に実装する。実装済み・test成功・製品起動・実機受入を意味しない。
+今回の変更はPDF計画、本§11、引き継ぎTXTのみで、製品コード/.git/build/launchは未変更・未実行。
+
 ### 2026-10-11 §1.371: 評価集合の公開を安定context境界へ移す構造合意（設計段階）
 
 利用者が提示した独立再レビュー（対象 `94bc236d1`、rating-filter-fullscreen-plan R2）は、

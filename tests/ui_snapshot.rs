@@ -31,6 +31,106 @@ use egui_kittest::{Harness, kittest::Queryable};
 mod test_ui;
 
 #[test]
+fn everything_search_bar_light() {
+    everything_search_bar_snapshot(
+        "everything_search_bar_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(720.0, 240.0),
+    );
+}
+
+#[test]
+fn everything_search_bar_dark() {
+    everything_search_bar_snapshot(
+        "everything_search_bar_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(720.0, 240.0),
+    );
+}
+
+#[test]
+fn everything_search_bar_narrow_dark() {
+    everything_search_bar_snapshot(
+        "everything_search_bar_narrow_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(320.0, 400.0),
+    );
+}
+
+fn everything_search_bar_snapshot(
+    name: &str,
+    theme: mimageviewer::os_theme::ResolvedTheme,
+    size: egui::Vec2,
+) {
+    snapshot_with_theme_contrast_and_size_with_interaction(
+        name,
+        theme,
+        mimageviewer::settings::TextContrast::Standard,
+        size,
+        mimageviewer::draw_everything_search_snapshot_fixture,
+        |harness| {
+            let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            for label in ["検索", "×"] {
+                assert!(
+                    viewport.contains_rect(harness.get_by_label(label).rect()),
+                    "{name}: {label} outside viewport"
+                );
+            }
+        },
+    );
+}
+
+#[test]
+fn everything_search_progress_small_100_light() {
+    everything_search_progress_snapshot(
+        "everything_search_progress_small_100_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        1.0,
+    );
+}
+
+#[test]
+fn everything_search_progress_small_200_dark() {
+    everything_search_progress_snapshot(
+        "everything_search_progress_small_200_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        2.0,
+    );
+}
+
+fn everything_search_progress_snapshot(
+    name: &str,
+    theme: mimageviewer::os_theme::ResolvedTheme,
+    scale: f32,
+) {
+    let size = egui::vec2(1093.0, 614.0);
+    let mut fonts_ready = false;
+    let mut harness = test_ui::builder().with_size(size).build(move |ctx| {
+        mimageviewer::os_theme::apply_resolved(ctx, theme);
+        if !fonts_ready {
+            install_app_fonts(ctx);
+            mimageviewer::settings::apply_ui_scale_factor(ctx, scale);
+            fonts_ready = true;
+            ctx.request_repaint();
+            return;
+        }
+        egui::CentralPanel::default().show(ctx, |_| {});
+        mimageviewer::draw_everything_progress_snapshot_fixture(ctx);
+    });
+    // The shared production body has an intentionally animated progress spinner.
+    harness.run_steps(12);
+    assert!((harness.ctx.content_rect().size() * scale - size).length() < 1.0);
+    let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+    for label in ["取消", "Close window"] {
+        assert!(
+            viewport.contains_rect(harness.get_by_label(label).rect()),
+            "{name}: {label} outside viewport"
+        );
+    }
+    harness.snapshot(name);
+}
+
+#[test]
 fn chrome_suppression_settings_light() {
     chrome_suppression_settings_snapshot(
         "chrome_suppression_settings_light",

@@ -260,7 +260,10 @@ impl App {
         media: Option<bool>,
     ) -> RatingNeighborDecision {
         let needs_basis = anchor.is_some_and(|anchor| !current.iter().any(|key| key == anchor))
-            && !old.iter().any(|key| current.contains(key));
+            && {
+                let current_keys = current.iter().map(String::as_str).collect::<HashSet<_>>();
+                !old.iter().any(|key| current_keys.contains(key.as_str()))
+            };
         let basis = if needs_basis {
             self.rating_membership_full_order(media)
         } else {

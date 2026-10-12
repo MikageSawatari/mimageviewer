@@ -27,10 +27,13 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 
 use crate::epub_cache::{self, EpubCache, GateOutcome};
+
+mod render_epoch;
+pub use render_epoch::{PdfRenderEpochOwner, PdfRenderEpochTicket, PdfRenderValidity};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DocumentStamp {
@@ -1169,31 +1172,27 @@ pub enum CancelWaitPolicy {
 // Context epoch (render ジョブの世代管理)
 // -----------------------------------------------------------------------
 
-/// Render ジョブの「コンテキスト世代」。`App::bump_full_context_for_load` /
-/// `App::bump_render_epoch_only` で +1 される。
-/// 0 は予約値 (= epoch チェック対象外、background 経路用 sentinel)。
-///
-/// 用途: フォルダ移動 / Ctrl+G 検索結果差替えで、それ以前の UI nav から enqueue された
-/// render ジョブを pool 内で stale 化して prune する。これにより、ユーザが新しい
-/// コンテキストに入った瞬間、見えていない古い PDF のページレンダリングが queue から
-/// 一掃される。
-static CURRENT_CONTEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
-
-/// 現在の context epoch を読む。UI スレッドが `LoadRequest.context_epoch` に
-/// 焼き付けるために使う (TOCTOU 防止のため worker thread からは呼ばない)。
-pub fn current_render_context_epoch() -> u64 {
-    CURRENT_CONTEXT_EPOCH.load(Ordering::Relaxed)
+/// Publication never initializes the pool or takes its queue lock.
+fn wake_render_epoch_maintenance() {
+    if let Some(pool) = initialized_pool()
+        && let Some(wake) = pool.maintenance_wake.as_ref()
+    {
+        try_wake_epoch_maintenance(wake);
+    }
 }
 
-/// Context epoch を +1 して、pool 内の stale Normal/HighNormal ジョブを即座に prune する。
-/// Critical ジョブは touch しない (UI nav の直結なので常に fresh)。
-/// 戻り値は bump 後の新 epoch。
-pub fn bump_render_context_epoch() -> u64 {
-    let new = CURRENT_CONTEXT_EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
-    if let Some(pool) = initialized_pool() {
-        pool.prune_stale_jobs(new);
+fn try_wake_epoch_maintenance(wake: &mpsc::SyncSender<()>) {
+    if let Err(mpsc::TrySendError::Disconnected(())) = wake.try_send(()) {
+        RENDER_EPOCH_MAINTENANCE_FAILED.store(true, Ordering::Release);
     }
-    new
+    // Full coalesces with the existing wake, which reads latest state.
+}
+
+static RENDER_EPOCH_MAINTENANCE_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// UI reports the rare failure once through its existing notification path.
+pub(crate) fn take_render_epoch_maintenance_failure() -> bool {
+    RENDER_EPOCH_MAINTENANCE_FAILED.swap(false, Ordering::AcqRel)
 }
 
 /// `promote_to_high_normal` の結果統計。
@@ -1215,9 +1214,10 @@ pub struct PromoteStats {
 /// 優先される lane に移す。Critical / in-flight ジョブは touch しない。
 ///
 /// `keys` は perf_key 集合 (= `pdf_page_perf_key(path, page_num)` で生成された文字列)。
-/// pool 未初期化なら no-op で empty stats を返す (= 無 PDF フォルダで pool 起動しない、
-/// Codex R3 P2 対応)。
-pub fn promote_to_high_normal(keys: &HashSet<String>) -> PromoteStats {
+/// Uninitialized pools return all requested keys as not found, without startup.
+/// Matching requires the same current viewer owner/generation (or explicit
+/// Unscoped target), together with the perf key.
+pub fn promote_to_high_normal(keys: &HashSet<String>, target: &PdfRenderValidity) -> PromoteStats {
     let Some(pool) = initialized_pool() else {
         return PromoteStats {
             promoted: 0,
@@ -1225,7 +1225,7 @@ pub fn promote_to_high_normal(keys: &HashSet<String>) -> PromoteStats {
             not_found_keys: keys.len(),
         };
     };
-    pool.promote_to_high_normal_impl(keys, PromoteScope::GridVisible)
+    pool.promote_to_high_normal_impl(keys, target, PromoteScope::GridVisible)
 }
 
 /// 現在 fullscreen に表示する PDF ページのジョブを Normal → HighNormal に昇格。
@@ -1234,7 +1234,10 @@ pub fn promote_to_high_normal(keys: &HashSet<String>) -> PromoteStats {
 /// match も `already_high` として found 扱いにする。これにより、新規 fullscreen
 /// load が Critical で enqueue 済みの場合に `not_found` retry を永続させず、
 /// Critical からの降格も行わない。
-pub fn promote_fullscreen_to_high_normal(keys: &HashSet<String>) -> PromoteStats {
+pub fn promote_fullscreen_to_high_normal(
+    keys: &HashSet<String>,
+    target: &PdfRenderValidity,
+) -> PromoteStats {
     let Some(pool) = initialized_pool() else {
         return PromoteStats {
             promoted: 0,
@@ -1242,7 +1245,7 @@ pub fn promote_fullscreen_to_high_normal(keys: &HashSet<String>) -> PromoteStats
             not_found_keys: keys.len(),
         };
     };
-    pool.promote_to_high_normal_impl(keys, PromoteScope::FullscreenCurrent)
+    pool.promote_to_high_normal_impl(keys, target, PromoteScope::FullscreenCurrent)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3123,9 +3126,8 @@ struct Job {
     enqueued_at: std::time::Instant,
     /// perf 相関キー (存在すれば dispatch/cancel イベントに載せる)
     perf_key: Option<String>,
-    /// enqueue 時点の context epoch。`CURRENT_CONTEXT_EPOCH` より小さければ stale。
-    /// 0 = epoch チェック対象外 (background 経路 / Critical 用 sentinel)。
-    context_epoch: u64,
+    /// Immutable request snapshot, or explicitly independent work.
+    validity: PdfRenderValidity,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3239,6 +3241,8 @@ struct PdfWorkerPool {
     /// 取り出して `wait()` する。Pool::Drop は in-flight 中の dispatcher 行きを
     /// 待たずに残ってる Child を `kill()` してアプリ終了を早める (A 案、2026-05)。
     worker_children: Vec<Arc<Mutex<Option<Child>>>>,
+    maintenance_wake: Option<mpsc::SyncSender<()>>,
+    maintenance_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 /// PDFium worker child process count の既定値。
@@ -3495,7 +3499,7 @@ trait PdfWorkerPoolInitExt {
         cancel: Option<&Arc<AtomicBool>>,
         priority: JobPriority,
         perf_key: Option<String>,
-        context_epoch: u64,
+        validity: PdfRenderValidity,
         cancel_policy: CancelWaitPolicy,
     ) -> std::io::Result<ProcessResponse>;
     fn workers_busy(&self) -> usize;
@@ -3509,18 +3513,11 @@ impl PdfWorkerPoolInitExt for PdfWorkerPoolInit {
         cancel: Option<&Arc<AtomicBool>>,
         priority: JobPriority,
         perf_key: Option<String>,
-        context_epoch: u64,
+        validity: PdfRenderValidity,
         cancel_policy: CancelWaitPolicy,
     ) -> std::io::Result<ProcessResponse> {
         match self {
-            Ok(pool) => pool.execute(
-                request,
-                cancel,
-                priority,
-                perf_key,
-                context_epoch,
-                cancel_policy,
-            ),
+            Ok(pool) => pool.execute(request, cancel, priority, perf_key, validity, cancel_policy),
             Err(_) => Err(pdf_worker_pool_unavailable_error()),
         }
     }
@@ -3622,6 +3619,173 @@ where
         return None;
     }
     Some(workers.drain(..).map(terminate).collect())
+}
+
+fn promotion_matches(job: &Job, keys: &HashSet<String>, target: &PdfRenderValidity) -> bool {
+    job.validity.matches_current(target)
+        && job.perf_key.as_ref().is_some_and(|key| keys.contains(key))
+}
+
+fn promote_queued_jobs(
+    queue: &Arc<(Mutex<JobQueue>, Condvar)>,
+    keys: &HashSet<String>,
+    target: &PdfRenderValidity,
+    scope: PromoteScope,
+) -> PromoteStats {
+    if matches!(scope, PromoteScope::FullscreenCurrent)
+        && !matches!(target, PdfRenderValidity::Unscoped)
+    {
+        return PromoteStats {
+            not_found_keys: keys.len(),
+            ..Default::default()
+        };
+    }
+    if keys.is_empty() {
+        return PromoteStats::default();
+    }
+    let (promoted_count, already_high, found_keys) = {
+        let (mtx, cv) = &**queue;
+        let mut q = mtx.lock().unwrap();
+
+        // fullscreen 用では Critical の match も「すでに目標以上」と数える。
+        // lane 自体は触らない (= Critical 予約ワーカーの意味論を変えない)。
+        let mut found_keys: HashSet<String> = HashSet::new();
+        let mut already_high = 0usize;
+        if matches!(scope, PromoteScope::FullscreenCurrent) {
+            for j in &q.critical {
+                if promotion_matches(&j, keys, target) {
+                    if let Some(k) = j.perf_key.as_ref() {
+                        found_keys.insert(k.clone());
+                    }
+                    already_high += 1;
+                }
+            }
+        }
+
+        // (1) 既存 high_normal を「現可視 (match) / 旧可視 (= stale)」に分けて再構築する。
+        // 同時に match を数える (= already_high) し found_keys にも記録。
+        let mut current_high: std::collections::VecDeque<Job> =
+            std::collections::VecDeque::with_capacity(q.high_normal.len());
+        let mut stale_high: std::collections::VecDeque<Job> =
+            std::collections::VecDeque::with_capacity(q.high_normal.len());
+        while let Some(j) = q.high_normal.pop_front() {
+            if promotion_matches(&j, keys, target) {
+                if let Some(k) = j.perf_key.as_ref() {
+                    found_keys.insert(k.clone());
+                }
+                already_high += 1;
+                current_high.push_back(j);
+            } else {
+                stale_high.push_back(j);
+            }
+        }
+
+        // (2) normal の single pass scan、match した Job を抜き出して priority 書き換え
+        let mut promoted_jobs = Vec::new();
+        let mut kept_normal = std::collections::VecDeque::with_capacity(q.normal.len());
+        while let Some(mut j) = q.normal.pop_front() {
+            if promotion_matches(&j, keys, target) {
+                if let Some(k) = j.perf_key.as_ref() {
+                    found_keys.insert(k.clone());
+                }
+                j.priority = JobPriority::HighNormal;
+                promoted_jobs.push(j);
+            } else {
+                kept_normal.push_back(j);
+            }
+        }
+        q.normal = kept_normal;
+        let promoted_count = promoted_jobs.len();
+
+        // (3) HighNormal lane を再構築: current → promoted (= 新規昇格、現可視) → stale
+        // dispatcher の pop_front は current から取るので、現可視が最優先で処理される
+        let mut new_high = current_high;
+        for j in promoted_jobs.drain(..) {
+            new_high.push_back(j);
+        }
+        for j in stale_high.drain(..) {
+            new_high.push_back(j);
+        }
+        q.high_normal = new_high;
+
+        cv.notify_all();
+        (promoted_count, already_high, found_keys)
+    };
+
+    PromoteStats {
+        promoted: promoted_count,
+        already_high,
+        not_found_keys: keys.len() - found_keys.len(),
+    }
+}
+
+/// Mutex transfers exclusive job ownership to this maintenance pass.
+fn drain_stale_jobs(queue: &Arc<(Mutex<JobQueue>, Condvar)>) -> Vec<Job> {
+    let (lock, changed) = &**queue;
+    let mut q = lock.lock().unwrap();
+    let mut drained = Vec::new();
+    let JobQueue {
+        high_normal,
+        normal,
+        ..
+    } = &mut *q;
+    for lane in [high_normal, normal] {
+        let mut kept = std::collections::VecDeque::with_capacity(lane.len());
+        while let Some(job) = lane.pop_front() {
+            if job.validity.is_stale() {
+                drained.push(job);
+            } else {
+                kept.push_back(job);
+            }
+        }
+        *lane = kept;
+    }
+    if !drained.is_empty() {
+        changed.notify_all();
+    }
+    drained
+}
+
+fn reply_stale_jobs(jobs: Vec<Job>) {
+    for job in jobs {
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "pdf",
+                "pool_prune_stale_epoch",
+                job.perf_key.as_deref(),
+                0,
+                &[
+                    (
+                        "waited_ms",
+                        serde_json::Value::from(job.enqueued_at.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                    (
+                        "priority",
+                        serde_json::Value::from(format!("{:?}", job.priority)),
+                    ),
+                ],
+            );
+        }
+        let _ = job.reply.send(Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "viewer render request expired",
+        )));
+    }
+}
+
+fn run_epoch_maintenance(queue: Arc<(Mutex<JobQueue>, Condvar)>, wake: mpsc::Receiver<()>) {
+    run_epoch_maintenance_observed(queue, wake, || {});
+}
+
+fn run_epoch_maintenance_observed(
+    queue: Arc<(Mutex<JobQueue>, Condvar)>,
+    wake: mpsc::Receiver<()>,
+    mut before_sweep: impl FnMut(),
+) {
+    while wake.recv().is_ok() {
+        before_sweep();
+        reply_stale_jobs(drain_stale_jobs(&queue));
+    }
 }
 
 impl PdfWorkerPool {
@@ -3746,7 +3910,26 @@ impl PdfWorkerPool {
             dispatcher_threads.push(handle);
         }
 
+        let (maintenance_wake, wake_rx) = mpsc::sync_channel(1);
+        let maintenance_queue = Arc::clone(&queue);
+        let maintenance_started = std::thread::Builder::new()
+            .name("pdf-pool-maintenance".into())
+            .spawn(move || run_epoch_maintenance(maintenance_queue, wake_rx));
+        let (maintenance_wake, maintenance_thread) = match maintenance_started {
+            Ok(thread) => (Some(maintenance_wake), Some(thread)),
+            Err(error) => {
+                crate::logger::log(format!(
+                    "pdf-pool: epoch maintenance startup failed: {error}"
+                ));
+                RENDER_EPOCH_MAINTENANCE_FAILED.store(true, Ordering::Release);
+                // Pop-time validity remains authoritative; no retry or second worker.
+                (None, None)
+            }
+        };
+
         Ok(PdfWorkerPool {
+            maintenance_wake,
+            maintenance_thread,
             queue,
             worker_count,
             worker_ids,
@@ -3777,146 +3960,10 @@ impl PdfWorkerPool {
     fn promote_to_high_normal_impl(
         &self,
         keys: &HashSet<String>,
+        target: &PdfRenderValidity,
         scope: PromoteScope,
     ) -> PromoteStats {
-        if keys.is_empty() {
-            return PromoteStats::default();
-        }
-        let (promoted_count, already_high, found_keys) = {
-            let (mtx, cv) = &*self.queue;
-            let mut q = mtx.lock().unwrap();
-
-            // fullscreen 用では Critical の match も「すでに目標以上」と数える。
-            // lane 自体は触らない (= Critical 予約ワーカーの意味論を変えない)。
-            let mut found_keys: HashSet<String> = HashSet::new();
-            let mut already_high = 0usize;
-            if matches!(scope, PromoteScope::FullscreenCurrent) {
-                for j in &q.critical {
-                    if j.perf_key.as_ref().is_some_and(|k| keys.contains(k)) {
-                        if let Some(k) = j.perf_key.as_ref() {
-                            found_keys.insert(k.clone());
-                        }
-                        already_high += 1;
-                    }
-                }
-            }
-
-            // (1) 既存 high_normal を「現可視 (match) / 旧可視 (= stale)」に分けて再構築する。
-            // 同時に match を数える (= already_high) し found_keys にも記録。
-            let mut current_high: std::collections::VecDeque<Job> =
-                std::collections::VecDeque::with_capacity(q.high_normal.len());
-            let mut stale_high: std::collections::VecDeque<Job> =
-                std::collections::VecDeque::with_capacity(q.high_normal.len());
-            while let Some(j) = q.high_normal.pop_front() {
-                if j.perf_key.as_ref().is_some_and(|k| keys.contains(k)) {
-                    if let Some(k) = j.perf_key.as_ref() {
-                        found_keys.insert(k.clone());
-                    }
-                    already_high += 1;
-                    current_high.push_back(j);
-                } else {
-                    stale_high.push_back(j);
-                }
-            }
-
-            // (2) normal の single pass scan、match した Job を抜き出して priority 書き換え
-            let mut promoted_jobs = Vec::new();
-            let mut kept_normal = std::collections::VecDeque::with_capacity(q.normal.len());
-            while let Some(mut j) = q.normal.pop_front() {
-                if j.perf_key.as_ref().is_some_and(|k| keys.contains(k)) {
-                    if let Some(k) = j.perf_key.as_ref() {
-                        found_keys.insert(k.clone());
-                    }
-                    j.priority = JobPriority::HighNormal;
-                    promoted_jobs.push(j);
-                } else {
-                    kept_normal.push_back(j);
-                }
-            }
-            q.normal = kept_normal;
-            let promoted_count = promoted_jobs.len();
-
-            // (3) HighNormal lane を再構築: current → promoted (= 新規昇格、現可視) → stale
-            // dispatcher の pop_front は current から取るので、現可視が最優先で処理される
-            let mut new_high = current_high;
-            for j in promoted_jobs.drain(..) {
-                new_high.push_back(j);
-            }
-            for j in stale_high.drain(..) {
-                new_high.push_back(j);
-            }
-            q.high_normal = new_high;
-
-            cv.notify_all();
-            (promoted_count, already_high, found_keys)
-        };
-
-        PromoteStats {
-            promoted: promoted_count,
-            already_high,
-            not_found_keys: keys.len() - found_keys.len(),
-        }
-    }
-
-    /// `current_epoch` より小さい `context_epoch` を持つ HighNormal / Normal ジョブを
-    /// 一括 prune する。各ジョブの reply に `Interrupted` を送って requester を解放する。
-    /// Critical はプルーンしない (= UI nav の直結は守る)。
-    /// `context_epoch == 0` のジョブは epoch チェック対象外なのでプルーンしない。
-    ///
-    /// `bump_render_context_epoch()` から呼ばれる。
-    fn prune_stale_jobs(&self, current_epoch: u64) {
-        let drained: Vec<Job> = {
-            let (mtx, _cv) = &*self.queue;
-            let mut q = mtx.lock().unwrap();
-            let mut dropped: Vec<Job> = Vec::new();
-            let mut filter_queue = |queue: &mut std::collections::VecDeque<Job>| {
-                let mut kept: std::collections::VecDeque<Job> =
-                    std::collections::VecDeque::with_capacity(queue.len());
-                while let Some(j) = queue.pop_front() {
-                    if j.context_epoch != 0 && j.context_epoch < current_epoch {
-                        dropped.push(j);
-                    } else {
-                        kept.push_back(j);
-                    }
-                }
-                *queue = kept;
-            };
-            filter_queue(&mut q.high_normal);
-            filter_queue(&mut q.normal);
-            dropped
-        };
-
-        // Mutex 外で reply を送る (notify_one で deadlock しないように)
-        let count = drained.len();
-        for j in drained {
-            if crate::perf::is_enabled() {
-                let waited_ms = j.enqueued_at.elapsed().as_secs_f64() * 1000.0;
-                crate::perf::event(
-                    "pdf",
-                    "pool_prune_stale_epoch",
-                    j.perf_key.as_deref(),
-                    0,
-                    &[
-                        ("waited_ms", serde_json::Value::from(waited_ms)),
-                        ("job_epoch", serde_json::Value::from(j.context_epoch)),
-                        ("current_epoch", serde_json::Value::from(current_epoch)),
-                        (
-                            "priority",
-                            serde_json::Value::from(format!("{:?}", j.priority)),
-                        ),
-                    ],
-                );
-            }
-            let _ = j.reply.send(Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "context epoch advanced",
-            )));
-        }
-        if count > 0 {
-            crate::logger::log(format!(
-                "pdf-pool: pruned {count} stale jobs (current_epoch={current_epoch})"
-            ));
-        }
+        promote_queued_jobs(&self.queue, keys, target, scope)
     }
 
     fn execute(
@@ -3925,7 +3972,7 @@ impl PdfWorkerPool {
         cancel: Option<&Arc<AtomicBool>>,
         priority: JobPriority,
         perf_key: Option<String>,
-        context_epoch: u64,
+        validity: PdfRenderValidity,
         cancel_policy: CancelWaitPolicy,
     ) -> std::io::Result<ProcessResponse> {
         let decoded = decode_request(request.bytes).map_err(|_| {
@@ -3959,7 +4006,7 @@ impl PdfWorkerPool {
             priority,
             enqueued_at: std::time::Instant::now(),
             perf_key: perf_key.clone(),
-            context_epoch,
+            validity,
         };
 
         // Job をキューに積んで worker を 1 つ起こす
@@ -4589,6 +4636,131 @@ fn try_pop_dispatch_job(
     None
 }
 
+fn queued_job_is_interrupted(job: &Job) -> bool {
+    job.validity.is_stale()
+        || job
+            .cancel
+            .as_ref()
+            .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+}
+
+fn finish_dispatch_counts(q: &mut JobQueue, worker_id: usize, non_critical: bool) {
+    q.workers_busy = q.workers_busy.saturating_sub(1);
+    if non_critical {
+        q.normal_in_flight = q.normal_in_flight.saturating_sub(1);
+    }
+    if let Some(slot) = q.in_flight_started_at.get_mut(worker_id) {
+        *slot = None;
+    }
+}
+
+/// Deterministic integration fixture: production queue ownership, selector,
+/// dispatch admission, stale predicate and counter tail, without PDFium or I/O.
+#[cfg(test)]
+pub(crate) struct TestPdfQueue {
+    queue: Arc<(Mutex<JobQueue>, Condvar)>,
+    ipc_calls: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct TestPdfReply(mpsc::Receiver<std::io::Result<ProcessResponse>>);
+
+#[cfg(test)]
+impl TestPdfReply {
+    pub(crate) fn recv(&self) -> std::io::Result<()> {
+        self.0.recv().expect("fake PDF job must reply").map(|_| ())
+    }
+
+    pub(crate) fn try_recv(&self) -> Result<std::io::Result<()>, mpsc::TryRecvError> {
+        self.0.try_recv().map(|reply| reply.map(|_| ()))
+    }
+}
+
+#[cfg(test)]
+impl TestPdfQueue {
+    pub(crate) fn new() -> Self {
+        Self {
+            queue: Arc::new((Mutex::new(JobQueue::new(DEFAULT_POOL_SIZE)), Condvar::new())),
+            ipc_calls: 0,
+        }
+    }
+
+    pub(crate) fn enqueue(
+        &self,
+        key: &str,
+        validity: PdfRenderValidity,
+        priority: JobPriority,
+    ) -> TestPdfReply {
+        let (reply, rx) = mpsc::channel();
+        let job = Job {
+            request: Vec::new(),
+            document_identity: PdfDocumentIdentity {
+                path: ResolvedReadPath::from_resolution(PathBuf::from("same.pdf")),
+                password: None,
+            },
+            cancel: None,
+            reply,
+            priority,
+            enqueued_at: std::time::Instant::now(),
+            perf_key: Some(key.into()),
+            validity,
+        };
+        let mut q = self.queue.0.lock().unwrap();
+        match priority {
+            JobPriority::Critical => q.critical.push_back(job),
+            JobPriority::HighNormal => q.high_normal.push_back(job),
+            JobPriority::Normal => q.normal.push_back(job),
+        }
+        TestPdfReply(rx)
+    }
+
+    pub(crate) fn prune_stale(&self) {
+        reply_stale_jobs(drain_stale_jobs(&self.queue));
+    }
+
+    pub(crate) fn complete_next(&mut self) -> bool {
+        let dispatch = {
+            let mut q = self.queue.0.lock().unwrap();
+            try_pop_dispatch_job(
+                &mut q,
+                0,
+                non_critical_lane_caps(DEFAULT_POOL_SIZE, true),
+                open_admission_caps(),
+            )
+        };
+        let Some(dispatch) = dispatch else {
+            return false;
+        };
+        self.complete_dispatch(dispatch);
+        true
+    }
+
+    fn complete_dispatch(&mut self, dispatch: DispatchJob) {
+        let non_critical = dispatch.job.priority != JobPriority::Critical;
+        let response = if queued_job_is_interrupted(&dispatch.job) {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "viewer render request expired",
+            ))
+        } else {
+            self.ipc_calls += 1;
+            Ok(ProcessResponse {
+                bytes: Vec::new(),
+                parent_read: ParentReadMetrics::default(),
+                worker_render: None,
+            })
+        };
+        let mut q = self.queue.0.lock().unwrap();
+        if dispatch.needs_open {
+            q.open_in_flight -= 1;
+        }
+        finish_dispatch_counts(&mut q, 0, non_critical);
+        self.queue.1.notify_all();
+        drop(q);
+        let _ = dispatch.job.reply.send(response);
+    }
+}
+
 enum DispatcherWork {
     Document(DispatchJob),
     Release(ReleaseDocumentRequest),
@@ -4691,10 +4863,8 @@ fn run_dispatcher(
             .cancel
             .as_ref()
             .is_some_and(|c| c.load(Ordering::Relaxed));
-        let current_epoch = CURRENT_CONTEXT_EPOCH.load(Ordering::Relaxed);
-        let stale_epoch = job.context_epoch != 0 && job.context_epoch < current_epoch;
 
-        if cancelled || stale_epoch {
+        if queued_job_is_interrupted(&job) {
             if crate::perf::is_enabled() {
                 let waited_ms = job.enqueued_at.elapsed().as_secs_f64() * 1000.0;
                 let kind = if cancelled {
@@ -4710,8 +4880,6 @@ fn run_dispatcher(
                     &[
                         ("waited_ms", serde_json::Value::from(waited_ms)),
                         ("pid", serde_json::Value::from(pid)),
-                        ("job_epoch", serde_json::Value::from(job.context_epoch)),
-                        ("current_epoch", serde_json::Value::from(current_epoch)),
                         (
                             "priority",
                             serde_json::Value::from(format!("{:?}", job.priority)),
@@ -4869,14 +5037,7 @@ fn run_dispatcher(
         {
             let (mtx, cv) = &*queue;
             let mut q = mtx.lock().unwrap();
-            q.workers_busy = q.workers_busy.saturating_sub(1);
-            if counts_against_non_critical_slots {
-                q.normal_in_flight = q.normal_in_flight.saturating_sub(1);
-            }
-            // in-flight metadata clear (cancel skip 経由でもここに来るので no-op で安全)
-            if let Some(slot) = q.in_flight_started_at.get_mut(worker_id) {
-                *slot = None;
-            }
+            finish_dispatch_counts(&mut q, worker_id, counts_against_non_critical_slots);
             // 他ワーカーが Normal スロット待ちで寝ている可能性があるので notify_all。
             // (Critical が来た/Normal スロットが空いた、の両方ともこれで波及する)
             cv.notify_all();
@@ -4901,6 +5062,7 @@ fn run_dispatcher(
 
 impl Drop for PdfWorkerPool {
     fn drop(&mut self) {
+        self.maintenance_wake.take();
         // ディスパッチャースレッドに shutdown を通知
         {
             let (mtx, cv) = &*self.queue;
@@ -4927,6 +5089,9 @@ impl Drop for PdfWorkerPool {
         }
         // 全スレッドを join (kill 後は pipe 切断で send_recv_io がすぐ Err で返り、
         // dispatcher が shutdown ループ末尾に到達して終了する)
+        if let Some(maintenance) = self.maintenance_thread.take() {
+            let _ = maintenance.join();
+        }
         if let Ok(mut threads) = self.dispatcher_threads.lock() {
             for h in threads.drain(..) {
                 let _ = h.join();
@@ -5325,13 +5490,13 @@ pub fn get_document_info(
     let pool = get_pool();
     let req = encode_get_info_request(&read.read_path, password);
     let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
-    // get_document_info は indexer 経由の background なので epoch=0 + AbortOnCancel
+    // get_document_info は indexer 経由の background なので Unscoped + AbortOnCancel
     let resp = pool.execute(
         PdfPoolRequest::new(&req, &read.read_path),
         None,
         JobPriority::Normal,
         Some(perf_key),
-        0,
+        PdfRenderValidity::Unscoped,
         CancelWaitPolicy::AbortOnCancel,
     )?;
     PdfWorkerPool::parse_get_info_response(&resp.bytes)
@@ -5364,13 +5529,13 @@ pub fn get_page_sizes_with_read_target(
     let pool = get_pool();
     let req = encode_page_sizes_request(&read.read_path, password);
     let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
-    // ページ構成を組むための背景処理。epoch=0 (prune 対象外) + AbortOnCancel。
+    // ページ構成を組むための背景処理。Unscoped (prune 対象外) + AbortOnCancel。
     let resp = pool.execute(
         PdfPoolRequest::new(&req, &read.read_path),
         None,
         JobPriority::Normal,
         Some(perf_key),
-        0,
+        PdfRenderValidity::Unscoped,
         CancelWaitPolicy::AbortOnCancel,
     )?;
     PdfWorkerPool::parse_page_sizes_response(&resp.bytes)
@@ -5400,7 +5565,7 @@ pub fn analyze_page_content_type(
         cancel.as_ref(),
         JobPriority::Normal,
         Some(perf_key),
-        0,
+        PdfRenderValidity::Unscoped,
         CancelWaitPolicy::AbortOnCancel,
     )?;
     PdfWorkerPool::parse_analyze_page_response(&resp.bytes)
@@ -5468,14 +5633,14 @@ pub fn enumerate_pages_with_read_target(
     let req = encode_enumerate_request(&read.read_path, password, worker_options);
     // enumerate は列挙のみで軽量 (PDFium page 列挙) だが Normal 扱いでよい
     let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
-    // enumerate_pages_with_cancel は background catch-up 経路なので epoch=0
+    // enumerate_pages_with_cancel は background catch-up 経路なので Unscoped
     // + AbortOnCancel (enumerate は cheap、cache 保存ロジック無し)。
     let resp = pool.execute(
         PdfPoolRequest::new(&req, &read.read_path),
         cancel.as_ref(),
         JobPriority::Normal,
         Some(perf_key),
-        0,
+        PdfRenderValidity::Unscoped,
         CancelWaitPolicy::AbortOnCancel,
     )?;
     let mut result = PdfWorkerPool::parse_enumerate_response(&resp.bytes)?;
@@ -5545,7 +5710,7 @@ fn verify_converter_pdf_with_cancel(
             cancel.as_ref(),
             JobPriority::Normal,
             None,
-            0,
+            PdfRenderValidity::Unscoped,
             CancelWaitPolicy::AbortOnCancel,
         )
         .map_err(|error| {
@@ -5574,10 +5739,8 @@ pub fn render_page(
     password: Option<&str>,
     cancel: Option<Arc<AtomicBool>>,
     priority: JobPriority,
-    // 0 = epoch チェック対象外 (background / Critical 用)。
-    // それ以外は `current_render_context_epoch()` を **UI スレッドの enqueue 時点で**
-    // 焼き付けた値を渡す (TOCTOU 防止のため worker thread からは呼ばない)。
-    context_epoch: u64,
+    // Inherit the UI snapshot; independent work is explicit Unscoped.
+    validity: PdfRenderValidity,
     // cancel 時に in-flight IPC を harvest するかどうか。
     // thumbnail PDF render の cache-savable 経路のみ `HarvestOnCancel`、それ以外は
     // `AbortOnCancel`。詳細は `CancelWaitPolicy` の doc コメント参照。
@@ -5590,7 +5753,7 @@ pub fn render_page(
         password,
         cancel,
         priority,
-        context_epoch,
+        validity,
         cancel_policy,
     )
 }
@@ -5606,7 +5769,7 @@ pub fn render_page_with_read_target(
     password: Option<&str>,
     cancel: Option<Arc<AtomicBool>>,
     priority: JobPriority,
-    context_epoch: u64,
+    validity: PdfRenderValidity,
     cancel_policy: CancelWaitPolicy,
 ) -> std::io::Result<RenderResult> {
     if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
@@ -5623,7 +5786,7 @@ pub fn render_page_with_read_target(
         password,
         cancel,
         priority,
-        context_epoch,
+        validity,
         cancel_policy,
     )
 }
@@ -5637,7 +5800,7 @@ pub fn render_page_for_display(
     password: Option<&str>,
     cancel: Option<Arc<AtomicBool>>,
     priority: JobPriority,
-    context_epoch: u64,
+    validity: PdfRenderValidity,
     cancel_policy: CancelWaitPolicy,
 ) -> std::io::Result<RenderResult> {
     render_page_target(
@@ -5650,7 +5813,7 @@ pub fn render_page_for_display(
         password,
         cancel,
         priority,
-        context_epoch,
+        validity,
         cancel_policy,
     )
 }
@@ -5669,7 +5832,7 @@ pub fn render_page_canonical_raster(
     password: Option<&str>,
     cancel: Option<Arc<AtomicBool>>,
     priority: JobPriority,
-    context_epoch: u64,
+    validity: PdfRenderValidity,
     cancel_policy: CancelWaitPolicy,
 ) -> std::io::Result<CanonicalPdfPage> {
     render_page_canonical_raster_with(content_type, |target_px| {
@@ -5680,7 +5843,7 @@ pub fn render_page_canonical_raster(
             password,
             cancel.clone(),
             priority,
-            context_epoch,
+            validity.clone(),
             cancel_policy,
         )
     })
@@ -5725,7 +5888,7 @@ fn render_page_target(
     password: Option<&str>,
     cancel: Option<Arc<AtomicBool>>,
     priority: JobPriority,
-    context_epoch: u64,
+    validity: PdfRenderValidity,
     cancel_policy: CancelWaitPolicy,
 ) -> std::io::Result<RenderResult> {
     if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
@@ -5745,7 +5908,7 @@ fn render_page_target(
         password,
         cancel,
         priority,
-        context_epoch,
+        validity,
         cancel_policy,
     )
 }
@@ -5759,7 +5922,7 @@ fn render_page_resolved_target(
     password: Option<&str>,
     cancel: Option<Arc<AtomicBool>>,
     priority: JobPriority,
-    context_epoch: u64,
+    validity: PdfRenderValidity,
     cancel_policy: CancelWaitPolicy,
 ) -> std::io::Result<RenderResult> {
     #[cfg(test)]
@@ -5808,7 +5971,7 @@ fn render_page_resolved_target(
         cancel.as_ref(),
         priority,
         Some(perf_key.clone()),
-        context_epoch,
+        validity,
         cancel_policy,
     )?;
     let result = PdfWorkerPool::parse_render_response(&resp.bytes);
@@ -6492,7 +6655,7 @@ fn start_enumerate_worker(work: PdfEnumerateStartWork) {
                     Some(&source_cancel),
                     JobPriority::Critical,
                     Some(perf_key),
-                    0,
+                    PdfRenderValidity::Unscoped,
                     CancelWaitPolicy::AbortOnCancel,
                 )
                 .and_then(|response| PdfWorkerPool::parse_enumerate_response(&response.bytes))
@@ -8191,6 +8354,8 @@ C:\isolated\miv-data"#
             worker_ids: Vec::new(),
             dispatcher_threads: Mutex::new(Vec::new()),
             worker_children: Vec::new(),
+            maintenance_wake: None,
+            maintenance_thread: None,
         };
 
         for request in [vec![0xff], encode_shutdown_request()] {
@@ -8200,7 +8365,7 @@ C:\isolated\miv-data"#
                     None,
                     JobPriority::Critical,
                     None,
-                    0,
+                    PdfRenderValidity::Unscoped,
                     CancelWaitPolicy::AbortOnCancel,
                 )
                 .unwrap_err();
@@ -8393,6 +8558,8 @@ C:\isolated\miv-data"#
             worker_ids: vec![0],
             dispatcher_threads: Mutex::new(Vec::new()),
             worker_children: Vec::new(),
+            maintenance_wake: None,
+            maintenance_thread: None,
         };
         let path = PathBuf::from("unresponsive-worker-book.g1.pdf");
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(30);
@@ -8421,11 +8588,11 @@ C:\isolated\miv-data"#
 
     // ── Context epoch tests (PdfWorkerPool 内部ロジックのみ、PDFium IPC は使わない) ──
 
-    /// JobQueue を直接構築して prune_stale_jobs と pop ロジックを検証する。
+    /// JobQueue を直接構築して drain_stale_jobs と pop ロジックを検証する。
     /// 実プールを起動せず、Mutex<JobQueue> を直接操作する。
     fn make_test_job(
         priority: JobPriority,
-        context_epoch: u64,
+        validity: PdfRenderValidity,
     ) -> (Job, mpsc::Receiver<std::io::Result<ProcessResponse>>) {
         let (tx, rx) = mpsc::channel();
         let job = Job {
@@ -8436,23 +8603,647 @@ C:\isolated\miv-data"#
             priority,
             enqueued_at: std::time::Instant::now(),
             perf_key: None,
-            context_epoch,
+            validity,
         };
         (job, rx)
     }
 
     fn make_test_job_for_document(
         priority: JobPriority,
-        context_epoch: u64,
+        validity: PdfRenderValidity,
         identity: PdfDocumentIdentity,
     ) -> (Job, mpsc::Receiver<std::io::Result<ProcessResponse>>) {
-        let (mut job, rx) = make_test_job(priority, context_epoch);
+        let (mut job, rx) = make_test_job(priority, validity);
         job.document_identity = identity;
         (job, rx)
     }
 
     fn empty_queue() -> Arc<(Mutex<JobQueue>, Condvar)> {
         Arc::new((Mutex::new(JobQueue::new(DEFAULT_POOL_SIZE)), Condvar::new()))
+    }
+
+    #[test]
+    fn viewer_prune_is_owner_local_in_both_directions_and_replies_once() {
+        for invalidate_a in [true, false] {
+            let mut a = PdfRenderEpochOwner::fresh();
+            let mut b = PdfRenderEpochOwner::fresh();
+            let fake = TestPdfQueue::new();
+            let target = PdfRenderValidity::Viewer(a.snapshot());
+            let sibling = PdfRenderValidity::Viewer(b.snapshot());
+            let replies: Vec<_> = [JobPriority::HighNormal, JobPriority::Normal]
+                .into_iter()
+                .flat_map(|priority| {
+                    [target.clone(), sibling.clone()]
+                        .into_iter()
+                        .map(move |validity| (priority, validity))
+                })
+                .map(|(priority, validity)| fake.enqueue("same.pdf#0", validity, priority))
+                .collect();
+            let unscoped = fake.enqueue(
+                "same.pdf#0",
+                PdfRenderValidity::Unscoped,
+                JobPriority::Normal,
+            );
+            let critical = fake.enqueue("same.pdf#0", target.clone(), JobPriority::Critical);
+            if invalidate_a {
+                a.advance();
+            } else {
+                b.advance();
+            }
+            fake.prune_stale();
+            fake.prune_stale();
+            for (index, reply) in replies.iter().enumerate() {
+                if (index % 2 == 0) == invalidate_a {
+                    assert_eq!(
+                        reply.recv().unwrap_err().kind(),
+                        std::io::ErrorKind::Interrupted
+                    );
+                    assert!(matches!(
+                        reply.try_recv(),
+                        Err(mpsc::TryRecvError::Disconnected)
+                    ));
+                } else {
+                    assert!(matches!(reply.try_recv(), Err(mpsc::TryRecvError::Empty)));
+                }
+            }
+            assert!(matches!(
+                unscoped.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            assert!(matches!(
+                critical.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            let q = fake.queue.0.lock().unwrap();
+            assert_eq!(q.high_normal.len(), 1);
+            assert_eq!(q.normal.len(), 2);
+            assert_eq!(q.critical.len(), 1);
+            assert_eq!(
+                (q.normal_in_flight, q.workers_busy, q.open_in_flight),
+                (0, 0, 0)
+            );
+            let expected = if invalidate_a { &sibling } else { &target };
+            assert!(q.high_normal[0].validity.same_request(expected));
+            assert!(q.normal[0].validity.same_request(expected));
+        }
+    }
+
+    #[test]
+    fn late_enqueue_after_sweep_and_retire_is_interrupted_without_ipc() {
+        let mut a = PdfRenderEpochOwner::fresh();
+        let b = PdfRenderEpochOwner::fresh();
+        let old = PdfRenderValidity::Viewer(a.snapshot());
+        let mut fake = TestPdfQueue::new();
+        a.advance();
+        fake.prune_stale();
+        let late = fake.enqueue("same.pdf#0", old, JobPriority::Normal);
+        assert!(fake.complete_next());
+        assert_eq!(
+            late.recv().unwrap_err().kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        assert_eq!(fake.ipc_calls, 0);
+        assert!(matches!(
+            late.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        let fresh = fake.enqueue(
+            "same.pdf#0",
+            PdfRenderValidity::Viewer(a.snapshot()),
+            JobPriority::Normal,
+        );
+        let sibling = fake.enqueue(
+            "same.pdf#0",
+            PdfRenderValidity::Viewer(b.snapshot()),
+            JobPriority::Normal,
+        );
+        assert!(fake.complete_next());
+        assert!(fake.complete_next());
+        fresh.recv().unwrap();
+        sibling.recv().unwrap();
+        assert_eq!(fake.ipc_calls, 2);
+        let retired = PdfRenderValidity::Viewer(a.snapshot());
+        a.retire();
+        let late = fake.enqueue("same.pdf#0", retired, JobPriority::Normal);
+        assert!(fake.complete_next());
+        assert_eq!(
+            late.recv().unwrap_err().kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        let q = fake.queue.0.lock().unwrap();
+        assert_eq!(
+            (q.normal_in_flight, q.workers_busy, q.open_in_flight),
+            (0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn accepted_in_flight_reply_survives_owner_advance_and_sibling_completes() {
+        let mut a = PdfRenderEpochOwner::fresh();
+        let b = PdfRenderEpochOwner::fresh();
+        let old_a = PdfRenderValidity::Viewer(a.snapshot());
+        let current_b = PdfRenderValidity::Viewer(b.snapshot());
+        let a_cancel = Arc::new(AtomicBool::new(false));
+        let mut fake = TestPdfQueue::new();
+        let a_reply = fake.enqueue("same.pdf#0", old_a.clone(), JobPriority::Normal);
+        let b_reply = fake.enqueue("same.pdf#0", current_b.clone(), JobPriority::Normal);
+        let dispatch = {
+            let mut q = fake.queue.0.lock().unwrap();
+            let request = encode_render_request(
+                &q.normal[0].document_identity.path,
+                0,
+                PdfRenderTarget::LongEdge(256),
+                None,
+                false,
+            );
+            q.normal[0].request = request.clone();
+            q.normal[1].request = request;
+            q.normal[0].cancel = Some(Arc::clone(&a_cancel));
+            assert_eq!(q.normal[0].document_identity, q.normal[1].document_identity);
+            assert_eq!(q.normal[0].request, q.normal[1].request);
+            let dispatch = try_pop_dispatch_job(
+                &mut q,
+                0,
+                non_critical_lane_caps(DEFAULT_POOL_SIZE, true),
+                open_admission_caps(),
+            )
+            .unwrap();
+            // This is the actual pre-IPC checkpoint. Everything after it models
+            // the already accepted IPC branch, which never rechecks the ticket.
+            assert!(!queued_job_is_interrupted(&dispatch.job));
+            dispatch
+        };
+        let (started, started_rx) = mpsc::channel();
+        let (resume, resume_rx) = mpsc::channel();
+        let queue = Arc::clone(&fake.queue);
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            resume_rx.recv().unwrap();
+            let response = ProcessResponse {
+                bytes: vec![STATUS_OK],
+                parent_read: ParentReadMetrics::default(),
+                worker_render: None,
+            };
+            let _ = dispatch.job.reply.send(Ok(response));
+            let mut q = queue.0.lock().unwrap();
+            if dispatch.needs_open {
+                q.open_in_flight -= 1;
+            }
+            finish_dispatch_counts(&mut q, 0, true);
+            queue.1.notify_all();
+        });
+        started_rx.recv().unwrap();
+        a.advance();
+        fake.prune_stale();
+        assert!(old_a.is_stale());
+        assert!(current_b.is_current());
+        // Owner publication is separate from cancel. Existing Abort/Harvest wait
+        // policies therefore retain their respective contracts for started IPC.
+        assert!(!a_cancel.load(Ordering::Relaxed));
+        assert!(matches!(a_reply.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert!(matches!(b_reply.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert!(fake.complete_next());
+        b_reply.recv().unwrap();
+        assert!(matches!(
+            b_reply.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        assert_eq!(fake.ipc_calls, 1);
+        resume.send(()).unwrap();
+        a_reply.recv().unwrap();
+        worker.join().unwrap();
+        assert!(matches!(
+            a_reply.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        let q = fake.queue.0.lock().unwrap();
+        assert_eq!(
+            (q.normal_in_flight, q.workers_busy, q.open_in_flight),
+            (0, 0, 0)
+        );
+        // Source cache identity is independent of either viewer's ticket. A's
+        // advance cannot turn the identical source into a cache miss for B.
+        let cache_a = document_cache_key("same.pdf", None, 10, 100);
+        let cache_b = document_cache_key("same.pdf", None, 10, 100);
+        assert!(cache_a == cache_b);
+        assert!(should_reuse_pdf_document(Some(&cache_a), Some(&cache_b)));
+    }
+
+    #[test]
+    fn popped_job_has_exclusive_terminal_and_releases_counts_once() {
+        let mut owner = PdfRenderEpochOwner::fresh();
+        let mut fake = TestPdfQueue::new();
+        let reply = fake.enqueue(
+            "same.pdf#0",
+            PdfRenderValidity::Viewer(owner.snapshot()),
+            JobPriority::HighNormal,
+        );
+        let dispatch = {
+            let mut q = fake.queue.0.lock().unwrap();
+            let dispatch = try_pop_dispatch_job(
+                &mut q,
+                0,
+                non_critical_lane_caps(DEFAULT_POOL_SIZE, true),
+                open_admission_caps(),
+            )
+            .unwrap();
+            assert_eq!(
+                (q.normal_in_flight, q.workers_busy, q.open_in_flight),
+                (1, 1, 1)
+            );
+            dispatch
+        };
+        owner.advance();
+        fake.prune_stale();
+        assert!(matches!(reply.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        fake.complete_dispatch(dispatch);
+        assert_eq!(
+            reply.recv().unwrap_err().kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        assert!(matches!(
+            reply.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        assert_eq!(fake.ipc_calls, 0);
+        let q = fake.queue.0.lock().unwrap();
+        assert_eq!(
+            (q.normal_in_flight, q.workers_busy, q.open_in_flight),
+            (0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn promotion_waits_for_target_late_arrival_and_new_generation() {
+        let mut a = PdfRenderEpochOwner::fresh();
+        let b = PdfRenderEpochOwner::fresh();
+        let old = PdfRenderValidity::Viewer(a.snapshot());
+        a.advance();
+        let target = PdfRenderValidity::Viewer(a.snapshot());
+        let sibling = PdfRenderValidity::Viewer(b.snapshot());
+        let fake = TestPdfQueue::new();
+        let keys = HashSet::from(["same.pdf#0".to_owned()]);
+        let _b_normal = fake.enqueue("same.pdf#0", sibling.clone(), JobPriority::Normal);
+        let _b_high = fake.enqueue("same.pdf#0", sibling.clone(), JobPriority::HighNormal);
+        let _old = fake.enqueue("same.pdf#0", old, JobPriority::Normal);
+        let _unscoped = fake.enqueue(
+            "same.pdf#0",
+            PdfRenderValidity::Unscoped,
+            JobPriority::Normal,
+        );
+        let _critical = fake.enqueue("same.pdf#0", target.clone(), JobPriority::Critical);
+        let missing = promote_queued_jobs(&fake.queue, &keys, &target, PromoteScope::GridVisible);
+        assert_eq!(
+            (
+                missing.promoted,
+                missing.already_high,
+                missing.not_found_keys
+            ),
+            (0, 0, 1)
+        );
+        {
+            let q = fake.queue.0.lock().unwrap();
+            assert!(q.high_normal[0].validity.same_request(&sibling));
+            assert_eq!(q.normal[0].priority, JobPriority::Normal);
+            assert!(q.normal[0].validity.same_request(&sibling));
+        }
+        let _late = fake.enqueue("same.pdf#0", target.clone(), JobPriority::Normal);
+        let found = promote_queued_jobs(&fake.queue, &keys, &target, PromoteScope::GridVisible);
+        assert_eq!(
+            (found.promoted, found.already_high, found.not_found_keys),
+            (1, 0, 0)
+        );
+        {
+            let q = fake.queue.0.lock().unwrap();
+            assert!(q.high_normal[0].validity.same_request(&target));
+            assert!(q.high_normal[1].validity.same_request(&sibling));
+            assert_eq!(q.normal[0].priority, JobPriority::Normal);
+        }
+        a.advance();
+        let next = PdfRenderValidity::Viewer(a.snapshot());
+        let missing = promote_queued_jobs(&fake.queue, &keys, &next, PromoteScope::GridVisible);
+        assert_eq!(
+            (
+                missing.promoted,
+                missing.already_high,
+                missing.not_found_keys
+            ),
+            (0, 0, 1)
+        );
+        let _late = fake.enqueue("same.pdf#0", next.clone(), JobPriority::Normal);
+        assert_eq!(
+            promote_queued_jobs(&fake.queue, &keys, &next, PromoteScope::GridVisible).promoted,
+            1
+        );
+        // A stale target cannot promote or claim found even when queued old A exists.
+        let stale = promote_queued_jobs(&fake.queue, &keys, &target, PromoteScope::GridVisible);
+        assert_eq!(
+            (stale.promoted, stale.already_high, stale.not_found_keys),
+            (0, 0, 1)
+        );
+    }
+
+    #[test]
+    fn fullscreen_promotion_only_matches_explicit_unscoped_work() {
+        let a = PdfRenderEpochOwner::fresh();
+        let viewer = PdfRenderValidity::Viewer(a.snapshot());
+        let fake = TestPdfQueue::new();
+        let keys = HashSet::from(["same.pdf#0".to_owned()]);
+        let _viewer = fake.enqueue("same.pdf#0", viewer.clone(), JobPriority::Normal);
+        let missing = promote_queued_jobs(
+            &fake.queue,
+            &keys,
+            &PdfRenderValidity::Unscoped,
+            PromoteScope::FullscreenCurrent,
+        );
+        assert_eq!(
+            (
+                missing.promoted,
+                missing.already_high,
+                missing.not_found_keys
+            ),
+            (0, 0, 1)
+        );
+        for priority in [
+            JobPriority::Normal,
+            JobPriority::HighNormal,
+            JobPriority::Critical,
+        ] {
+            let _reply = fake.enqueue("same.pdf#0", PdfRenderValidity::Unscoped, priority);
+        }
+        let found = promote_queued_jobs(
+            &fake.queue,
+            &keys,
+            &PdfRenderValidity::Unscoped,
+            PromoteScope::FullscreenCurrent,
+        );
+        assert_eq!(
+            (found.promoted, found.already_high, found.not_found_keys),
+            (1, 2, 0)
+        );
+        let invalid =
+            promote_queued_jobs(&fake.queue, &keys, &viewer, PromoteScope::FullscreenCurrent);
+        assert_eq!(
+            (
+                invalid.promoted,
+                invalid.already_high,
+                invalid.not_found_keys
+            ),
+            (0, 0, 1)
+        );
+        let q = fake.queue.0.lock().unwrap();
+        assert_eq!(q.critical[0].priority, JobPriority::Critical);
+        assert_eq!(q.normal[0].priority, JobPriority::Normal);
+        assert!(q.normal[0].validity.same_request(&viewer));
+    }
+
+    #[test]
+    fn maintenance_wake_coalesces_and_worker_disconnect_terminates() {
+        let mut a = PdfRenderEpochOwner::fresh();
+        let mut b = PdfRenderEpochOwner::fresh();
+        let fake = TestPdfQueue::new();
+        let a_reply = fake.enqueue(
+            "same.pdf#0",
+            PdfRenderValidity::Viewer(a.snapshot()),
+            JobPriority::Normal,
+        );
+        let b_reply = fake.enqueue(
+            "same.pdf#0",
+            PdfRenderValidity::Viewer(b.snapshot()),
+            JobPriority::HighNormal,
+        );
+        let (wake, rx) = mpsc::sync_channel(1);
+        a.advance();
+        wake.try_send(()).unwrap();
+        b.retire();
+        assert!(matches!(
+            wake.try_send(()),
+            Err(mpsc::TrySendError::Full(()))
+        ));
+        let queue = Arc::clone(&fake.queue);
+        let worker = std::thread::spawn(move || run_epoch_maintenance(queue, rx));
+        a_reply.recv().unwrap_err();
+        b_reply.recv().unwrap_err();
+        // Worker returned to blocking recv; this new wake observes latest state.
+        let new_a = fake.enqueue(
+            "same.pdf#0",
+            PdfRenderValidity::Viewer(a.snapshot()),
+            JobPriority::Normal,
+        );
+        a.advance();
+        wake.try_send(()).unwrap();
+        assert_eq!(
+            new_a.recv().unwrap_err().kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        drop(wake);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn advance_during_maintenance_keeps_a_followup_wake() {
+        let mut a = PdfRenderEpochOwner::fresh();
+        let mut b = PdfRenderEpochOwner::fresh();
+        let fake = TestPdfQueue::new();
+        let a_reply = fake.enqueue(
+            "same.pdf#0",
+            PdfRenderValidity::Viewer(a.snapshot()),
+            JobPriority::Normal,
+        );
+        let b_reply = fake.enqueue(
+            "same.pdf#0",
+            PdfRenderValidity::Viewer(b.snapshot()),
+            JobPriority::HighNormal,
+        );
+        let (wake, rx) = mpsc::sync_channel(1);
+        let (entered, entered_rx) = mpsc::channel();
+        let (resume, resume_rx) = mpsc::channel();
+        let queue = Arc::clone(&fake.queue);
+        let mut sweep = 0;
+        let worker = std::thread::spawn(move || {
+            run_epoch_maintenance_observed(queue, rx, || {
+                sweep += 1;
+                entered.send(sweep).unwrap();
+                if sweep == 1 {
+                    resume_rx.recv().unwrap();
+                }
+            })
+        });
+        a.advance();
+        wake.try_send(()).unwrap();
+        assert_eq!(entered_rx.recv().unwrap(), 1);
+        // First wake is consumed, while its maintenance pass is still in progress.
+        b.advance();
+        wake.try_send(()).unwrap();
+        b.retire();
+        assert!(matches!(
+            wake.try_send(()),
+            Err(mpsc::TrySendError::Full(()))
+        ));
+        resume.send(()).unwrap();
+        assert_eq!(
+            a_reply.recv().unwrap_err().kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        assert_eq!(
+            b_reply.recv().unwrap_err().kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        assert_eq!(entered_rx.recv().unwrap(), 2);
+        assert!(matches!(
+            a_reply.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        assert!(matches!(
+            b_reply.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        drop(wake);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn ten_thousand_jobs_publication_does_not_need_the_queue_mutex() {
+        let mut a = PdfRenderEpochOwner::fresh();
+        let b = PdfRenderEpochOwner::fresh();
+        let fake = TestPdfQueue::new();
+        let (wake, wake_rx) = mpsc::sync_channel(1);
+        let (started, started_rx) = mpsc::channel();
+        let (entered, entered_rx) = mpsc::channel();
+        let sweeps = Arc::new(AtomicUsize::new(0));
+        let worker_sweeps = Arc::clone(&sweeps);
+        let queue = Arc::clone(&fake.queue);
+        let worker = std::thread::spawn(move || {
+            started.send(std::time::Instant::now()).unwrap();
+            run_epoch_maintenance_observed(queue, wake_rx, || {
+                worker_sweeps.fetch_add(1, Ordering::Relaxed);
+                entered.send(std::time::Instant::now()).unwrap();
+            });
+        });
+        let worker_started = started_rx.recv().unwrap();
+        let mut replies = Vec::new();
+        let mut sibling_replies = Vec::new();
+        for _ in 0..5_000 {
+            replies.push(fake.enqueue(
+                "same.pdf#0",
+                PdfRenderValidity::Viewer(a.snapshot()),
+                JobPriority::Normal,
+            ));
+            sibling_replies.push(fake.enqueue(
+                "same.pdf#0",
+                PdfRenderValidity::Viewer(b.snapshot()),
+                JobPriority::Normal,
+            ));
+        }
+        assert_eq!(
+            sweeps.load(Ordering::Relaxed),
+            0,
+            "maintenance stays in recv without a wake"
+        );
+        // The worker consumes its wake before queue lock acquisition. Publication
+        // while that lock is held completes without an ACK or any queue scan.
+        let (publication, coalesced_publication, idle_exposure, contention_exposure, released) = {
+            let q = fake.queue.0.lock().unwrap();
+            let publish_started = std::time::Instant::now();
+            a.advance();
+            try_wake_epoch_maintenance(&wake);
+            let publication = publish_started.elapsed();
+            let worker_entered = entered_rx.recv().unwrap();
+            assert_eq!(q.normal.len(), 10_000);
+            let publish_started = std::time::Instant::now();
+            a.advance();
+            try_wake_epoch_maintenance(&wake);
+            a.retire();
+            try_wake_epoch_maintenance(&wake);
+            let coalesced_publication = publish_started.elapsed();
+            assert!(matches!(
+                wake.try_send(()),
+                Err(mpsc::TrySendError::Full(()))
+            ));
+            assert_eq!(
+                q.normal.len(),
+                10_000,
+                "UI publication did not scan or free queued jobs"
+            );
+            let released = std::time::Instant::now();
+            let idle_exposure = worker_entered.duration_since(worker_started);
+            let contention_exposure = released.duration_since(worker_entered);
+            drop(q);
+            (
+                publication,
+                coalesced_publication,
+                idle_exposure,
+                contention_exposure,
+                released,
+            )
+        };
+        for reply in replies {
+            assert_eq!(
+                reply.recv().unwrap_err().kind(),
+                std::io::ErrorKind::Interrupted
+            );
+        }
+        let completion = released.elapsed();
+        entered_rx.recv().unwrap(); // Follow-up wake remains observable during contention.
+        assert_eq!(fake.queue.0.lock().unwrap().normal.len(), 5_000);
+        for reply in sibling_replies {
+            assert!(matches!(reply.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        }
+        assert!(b.snapshot().is_current());
+        drop(wake);
+        worker.join().unwrap();
+        eprintln!(
+            "pdf_epoch_fake_10k: publication_ns={} coalesced_publication_ns={} idle_recv_exposure_us={} held_queue_exposure_us={} release_to_5000_replies_us={} sweeps={}; synthetic wall times, no hardware performance acceptance",
+            publication.as_nanos(),
+            coalesced_publication.as_nanos(),
+            idle_exposure.as_micros(),
+            contention_exposure.as_micros(),
+            completion.as_micros(),
+            sweeps.load(Ordering::Relaxed),
+        );
+    }
+
+    #[test]
+    fn ten_thousand_jobs_reports_separate_prune_and_reply_costs() {
+        let mut owner = PdfRenderEpochOwner::fresh();
+        let fake = TestPdfQueue::new();
+        let replies: Vec<_> = (0..10_000)
+            .map(|_| {
+                fake.enqueue(
+                    "same.pdf#0",
+                    PdfRenderValidity::Viewer(owner.snapshot()),
+                    JobPriority::Normal,
+                )
+            })
+            .collect();
+        let publish_started = std::time::Instant::now();
+        owner.advance();
+        let publication = publish_started.elapsed();
+        let prune_started = std::time::Instant::now();
+        let drained = drain_stale_jobs(&fake.queue);
+        let prune = prune_started.elapsed();
+        assert_eq!(drained.len(), 10_000);
+        let reply_started = std::time::Instant::now();
+        reply_stale_jobs(drained);
+        let reply_and_free = reply_started.elapsed();
+        for reply in replies {
+            assert_eq!(
+                reply.recv().unwrap_err().kind(),
+                std::io::ErrorKind::Interrupted
+            );
+        }
+        let q = fake.queue.0.lock().unwrap();
+        assert!(q.normal.is_empty());
+        assert_eq!(
+            (q.normal_in_flight, q.workers_busy, q.open_in_flight),
+            (0, 0, 0)
+        );
+        eprintln!(
+            "pdf_epoch_fake_10k_phases: publication_ns={} prune_10000_us={} reply_and_free_10000_us={}; synthetic wall times, no time assertions",
+            publication.as_nanos(),
+            prune.as_micros(),
+            reply_and_free.as_micros(),
+        );
     }
 
     #[test]
@@ -8538,8 +9329,11 @@ C:\isolated\miv-data"#
         ));
 
         let identity = test_document_identity("waiting.pdf", None);
-        let (critical_job, _critical_rx) =
-            make_test_job_for_document(JobPriority::Critical, 0, identity.clone());
+        let (critical_job, _critical_rx) = make_test_job_for_document(
+            JobPriority::Critical,
+            PdfRenderValidity::Unscoped,
+            identity.clone(),
+        );
         critical.push_back(critical_job);
         assert!(higher_priority_open_pending(
             JobPriority::HighNormal,
@@ -8564,8 +9358,11 @@ C:\isolated\miv-data"#
 
         critical.clear();
         let identity = test_document_identity("visible.pdf", Some("pw"));
-        let (high_job, _high_rx) =
-            make_test_job_for_document(JobPriority::HighNormal, 1, identity.clone());
+        let (high_job, _high_rx) = make_test_job_for_document(
+            JobPriority::HighNormal,
+            PdfRenderValidity::Unscoped,
+            identity.clone(),
+        );
         high_normal.push_back(high_job);
         assert!(higher_priority_open_pending(
             JobPriority::Normal,
@@ -8587,7 +9384,11 @@ C:\isolated\miv-data"#
         let mut jobs = std::collections::VecDeque::new();
         for index in 0..500 {
             let identity = test_document_identity(&format!("{index}.pdf"), None);
-            let (job, _rx) = make_test_job_for_document(JobPriority::Normal, 1, identity);
+            let (job, _rx) = make_test_job_for_document(
+                JobPriority::Normal,
+                PdfRenderValidity::Unscoped,
+                identity,
+            );
             jobs.push_back(job);
         }
 
@@ -8649,8 +9450,8 @@ C:\isolated\miv-data"#
         assert_eq!(caps.high_normal, 4);
         assert_eq!(caps.normal, 3);
         let queue = empty_queue();
-        let (high, _high_rx) = make_test_job(JobPriority::HighNormal, 1);
-        let (normal, _normal_rx) = make_test_job(JobPriority::Normal, 1);
+        let (high, _high_rx) = make_test_job(JobPriority::HighNormal, PdfRenderValidity::Unscoped);
+        let (normal, _normal_rx) = make_test_job(JobPriority::Normal, PdfRenderValidity::Unscoped);
         let (mtx, _) = &*queue;
         let mut q = mtx.lock().unwrap();
         q.normal_in_flight = caps.normal;
@@ -8668,8 +9469,9 @@ C:\isolated\miv-data"#
     fn dispatcher_critical_bypasses_non_critical_lane_caps() {
         let caps = non_critical_lane_caps(5, true);
         let queue = empty_queue();
-        let (critical, _critical_rx) = make_test_job(JobPriority::Critical, 0);
-        let (high, _high_rx) = make_test_job(JobPriority::HighNormal, 1);
+        let (critical, _critical_rx) =
+            make_test_job(JobPriority::Critical, PdfRenderValidity::Unscoped);
+        let (high, _high_rx) = make_test_job(JobPriority::HighNormal, PdfRenderValidity::Unscoped);
         let (mtx, _) = &*queue;
         let mut q = mtx.lock().unwrap();
         q.normal_in_flight = caps.high_normal;
@@ -8689,7 +9491,7 @@ C:\isolated\miv-data"#
         assert_eq!(caps.high_normal, 1);
         assert_eq!(caps.normal, 1);
         let queue = empty_queue();
-        let (normal, _normal_rx) = make_test_job(JobPriority::Normal, 1);
+        let (normal, _normal_rx) = make_test_job(JobPriority::Normal, PdfRenderValidity::Unscoped);
         let (mtx, _) = &*queue;
         let mut q = mtx.lock().unwrap();
         q.normal.push_back(normal);
@@ -8706,7 +9508,7 @@ C:\isolated\miv-data"#
         assert_eq!(caps.high_normal, 1);
         assert_eq!(caps.normal, 1);
         let queue = empty_queue();
-        let (normal, _normal_rx) = make_test_job(JobPriority::Normal, 1);
+        let (normal, _normal_rx) = make_test_job(JobPriority::Normal, PdfRenderValidity::Unscoped);
         let (mtx, _) = &*queue;
         let mut q = mtx.lock().unwrap();
         q.normal.push_back(normal);
@@ -8754,7 +9556,11 @@ C:\isolated\miv-data"#
         let lane_caps = non_critical_lane_caps(5, true);
         let open_caps = open_admission_caps();
         let identity = test_document_identity("held.pdf", None);
-        let (job, _rx) = make_test_job_for_document(JobPriority::Normal, 1, identity.clone());
+        let (job, _rx) = make_test_job_for_document(
+            JobPriority::Normal,
+            PdfRenderValidity::Unscoped,
+            identity.clone(),
+        );
         let mut q = JobQueue::new(5);
         q.worker_documents[0] = Some(identity);
         q.open_in_flight = open_caps.total;
@@ -8772,10 +9578,16 @@ C:\isolated\miv-data"#
         let open_caps = open_admission_caps();
         let blocked = test_document_identity("blocked.pdf", None);
         let reusable = test_document_identity("reusable.pdf", None);
-        let (blocked_job, _blocked_rx) =
-            make_test_job_for_document(JobPriority::Normal, 1, blocked.clone());
-        let (reusable_job, _reusable_rx) =
-            make_test_job_for_document(JobPriority::Normal, 1, reusable.clone());
+        let (blocked_job, _blocked_rx) = make_test_job_for_document(
+            JobPriority::Normal,
+            PdfRenderValidity::Unscoped,
+            blocked.clone(),
+        );
+        let (reusable_job, _reusable_rx) = make_test_job_for_document(
+            JobPriority::Normal,
+            PdfRenderValidity::Unscoped,
+            reusable.clone(),
+        );
         let mut q = JobQueue::new(5);
         q.worker_documents[0] = Some(reusable.clone());
         q.open_in_flight = open_caps.total;
@@ -8796,7 +9608,8 @@ C:\isolated\miv-data"#
         let lane_caps = non_critical_lane_caps(5, true);
         let open_caps = open_admission_caps();
         let identity = test_document_identity("waiting.pdf", None);
-        let (job, _rx) = make_test_job_for_document(JobPriority::Normal, 1, identity);
+        let (job, _rx) =
+            make_test_job_for_document(JobPriority::Normal, PdfRenderValidity::Unscoped, identity);
         let mut q = JobQueue::new(5);
         q.open_in_flight = open_caps.non_critical;
         q.normal.push_back(job);
@@ -8813,7 +9626,11 @@ C:\isolated\miv-data"#
     fn open_gate_does_not_bypass_existing_normal_lane_cap() {
         let lane_caps = non_critical_lane_caps(5, true);
         let identity = test_document_identity("held.pdf", None);
-        let (job, _rx) = make_test_job_for_document(JobPriority::Normal, 1, identity.clone());
+        let (job, _rx) = make_test_job_for_document(
+            JobPriority::Normal,
+            PdfRenderValidity::Unscoped,
+            identity.clone(),
+        );
         let mut q = JobQueue::new(5);
         q.worker_documents[0] = Some(identity);
         q.normal_in_flight = lane_caps.normal;
@@ -8823,138 +9640,6 @@ C:\isolated\miv-data"#
         assert_eq!(q.normal.len(), 1);
         assert_eq!(q.normal_in_flight, lane_caps.normal);
     }
-
-    /// prune_stale_jobs の代替実装 (pool 起動なし、JobQueue 直操作)。
-    fn prune_stale_in_queue(
-        queue: &Arc<(Mutex<JobQueue>, Condvar)>,
-        current_epoch: u64,
-    ) -> Vec<Job> {
-        let (mtx, _cv) = &**queue;
-        let mut q = mtx.lock().unwrap();
-        let mut dropped: Vec<Job> = Vec::new();
-        let mut filter_queue = |queue: &mut std::collections::VecDeque<Job>| {
-            let mut kept: std::collections::VecDeque<Job> =
-                std::collections::VecDeque::with_capacity(queue.len());
-            while let Some(j) = queue.pop_front() {
-                if j.context_epoch != 0 && j.context_epoch < current_epoch {
-                    dropped.push(j);
-                } else {
-                    kept.push_back(j);
-                }
-            }
-            *queue = kept;
-        };
-        filter_queue(&mut q.high_normal);
-        filter_queue(&mut q.normal);
-        dropped
-    }
-
-    #[test]
-    fn context_epoch_bump_increments_monotonically() {
-        let initial = current_render_context_epoch();
-        let a = bump_render_context_epoch();
-        let b = bump_render_context_epoch();
-        assert!(a > initial);
-        assert!(b > a);
-    }
-
-    #[test]
-    fn prune_drops_stale_normal_and_high_normal_only() {
-        let queue = empty_queue();
-        let (j_crit, _rx_c) = make_test_job(JobPriority::Critical, 5);
-        let (j_high_stale, rx_h_stale) = make_test_job(JobPriority::HighNormal, 5);
-        let (j_high_fresh, _rx_h_fresh) = make_test_job(JobPriority::HighNormal, 10);
-        let (j_norm_stale, rx_n_stale) = make_test_job(JobPriority::Normal, 5);
-        let (j_norm_fresh, _rx_n_fresh) = make_test_job(JobPriority::Normal, 10);
-        let (j_norm_sentinel, _rx_n_s) = make_test_job(JobPriority::Normal, 0);
-        {
-            let (mtx, _) = &*queue;
-            let mut q = mtx.lock().unwrap();
-            q.critical.push_back(j_crit);
-            q.high_normal.push_back(j_high_stale);
-            q.high_normal.push_back(j_high_fresh);
-            q.normal.push_back(j_norm_stale);
-            q.normal.push_back(j_norm_fresh);
-            q.normal.push_back(j_norm_sentinel);
-        }
-        let dropped = prune_stale_in_queue(&queue, 10);
-        assert_eq!(dropped.len(), 2, "stale HighNormal + Normal が drop される");
-        // Critical は触らない
-        {
-            let (mtx, _) = &*queue;
-            let q = mtx.lock().unwrap();
-            assert_eq!(q.critical.len(), 1, "Critical はプルーン対象外");
-            assert_eq!(q.high_normal.len(), 1, "fresh HighNormal は残る");
-            assert_eq!(q.normal.len(), 2, "fresh Normal + epoch=0 sentinel は残る");
-        }
-        // dropped 側に Interrupted reply を送る (= 実装と同じ挙動)
-        for j in dropped {
-            let _ = j.reply.send(Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "test prune",
-            )));
-        }
-        // requester は受け取れる
-        assert!(matches!(
-            rx_h_stale.recv().unwrap().unwrap_err().kind(),
-            std::io::ErrorKind::Interrupted
-        ));
-        assert!(matches!(
-            rx_n_stale.recv().unwrap().unwrap_err().kind(),
-            std::io::ErrorKind::Interrupted
-        ));
-    }
-
-    #[test]
-    fn prune_keeps_epoch_zero_sentinel() {
-        // epoch=0 は background 用 sentinel。current_epoch がどれだけ進んでもプルーンされない。
-        let queue = empty_queue();
-        let (j_zero, _rx) = make_test_job(JobPriority::Normal, 0);
-        {
-            let (mtx, _) = &*queue;
-            let mut q = mtx.lock().unwrap();
-            q.normal.push_back(j_zero);
-        }
-        let dropped = prune_stale_in_queue(&queue, u64::MAX);
-        assert_eq!(dropped.len(), 0);
-        let (mtx, _) = &*queue;
-        let q = mtx.lock().unwrap();
-        assert_eq!(q.normal.len(), 1, "epoch=0 sentinel は残る");
-    }
-
-    #[test]
-    fn race_old_epoch_enqueue_after_bump_caught_by_pop() {
-        // race: 古い epoch を取得した後 bump、enqueue が prune の後に来るケース。
-        // pop 時の epoch チェックが拾うことを確認する。
-        // (実 dispatcher を回さず、ロジックの等価チェック)
-        let queue = empty_queue();
-        // bump 前に古い epoch を capture
-        let old_epoch = 5u64;
-        // bump 後 (current=10) に old epoch のジョブが enqueue されたシナリオ
-        let current = 10u64;
-        // prune 後に enqueue
-        let _ = prune_stale_in_queue(&queue, current);
-        let (j_late, _rx) = make_test_job(JobPriority::Normal, old_epoch);
-        {
-            let (mtx, _) = &*queue;
-            let mut q = mtx.lock().unwrap();
-            q.normal.push_back(j_late);
-        }
-        // run_dispatcher の pop ロジックを mimic: pop 後の stale_epoch チェック
-        let popped = {
-            let (mtx, _) = &*queue;
-            let mut q = mtx.lock().unwrap();
-            q.normal.pop_front().unwrap()
-        };
-        let stale = popped.context_epoch != 0 && popped.context_epoch < current;
-        assert!(stale, "pop 時の epoch チェックが race を拾う");
-    }
-
-    // ── CancelWaitPolicy tests (recv ループの cancel 反応ロジック) ──
-    //
-    // execute() を直接呼ぶには PdfWorkerPool 起動が必要 (子プロセス spawn) で test には
-    // 重すぎる。代わりに execute の recv ループと等価なロジックを mock で再現し、
-    // AbortOnCancel と HarvestOnCancel の挙動差を検証する。
 
     fn mock_recv_loop(
         reply_rx: mpsc::Receiver<std::io::Result<Vec<u8>>>,
@@ -9070,7 +9755,7 @@ C:\isolated\miv-data"#
             priority,
             enqueued_at: std::time::Instant::now(),
             perf_key: perf_key.map(String::from),
-            context_epoch: 1,
+            validity: PdfRenderValidity::Unscoped,
         };
         (job, rx)
     }
@@ -9096,78 +9781,7 @@ C:\isolated\miv-data"#
         keys: &HashSet<String>,
         scope: PromoteScope,
     ) -> PromoteStats {
-        if keys.is_empty() {
-            return PromoteStats::default();
-        }
-        let (promoted_count, already_high, found_keys) = {
-            let (mtx, cv) = &**queue;
-            let mut q = mtx.lock().unwrap();
-
-            let mut found_keys: HashSet<String> = HashSet::new();
-            let mut already_high = 0usize;
-            if matches!(scope, PromoteScope::FullscreenCurrent) {
-                for j in &q.critical {
-                    if j.perf_key.as_ref().is_some_and(|k| keys.contains(k)) {
-                        if let Some(k) = j.perf_key.as_ref() {
-                            found_keys.insert(k.clone());
-                        }
-                        already_high += 1;
-                    }
-                }
-            }
-
-            // (1) high_normal を current / stale に振り分け
-            let mut current_high: std::collections::VecDeque<Job> =
-                std::collections::VecDeque::with_capacity(q.high_normal.len());
-            let mut stale_high: std::collections::VecDeque<Job> =
-                std::collections::VecDeque::with_capacity(q.high_normal.len());
-            while let Some(j) = q.high_normal.pop_front() {
-                if j.perf_key.as_ref().is_some_and(|k| keys.contains(k)) {
-                    if let Some(k) = j.perf_key.as_ref() {
-                        found_keys.insert(k.clone());
-                    }
-                    already_high += 1;
-                    current_high.push_back(j);
-                } else {
-                    stale_high.push_back(j);
-                }
-            }
-
-            // (2) normal から match を抜き出し
-            let mut promoted = Vec::new();
-            let mut kept = std::collections::VecDeque::with_capacity(q.normal.len());
-            while let Some(mut j) = q.normal.pop_front() {
-                if j.perf_key.as_ref().is_some_and(|k| keys.contains(k)) {
-                    if let Some(k) = j.perf_key.as_ref() {
-                        found_keys.insert(k.clone());
-                    }
-                    j.priority = JobPriority::HighNormal;
-                    promoted.push(j);
-                } else {
-                    kept.push_back(j);
-                }
-            }
-            q.normal = kept;
-            let promoted_count = promoted.len();
-
-            // (3) 再構築: current → promoted → stale
-            let mut new_high = current_high;
-            for j in promoted.drain(..) {
-                new_high.push_back(j);
-            }
-            for j in stale_high.drain(..) {
-                new_high.push_back(j);
-            }
-            q.high_normal = new_high;
-
-            cv.notify_all();
-            (promoted_count, already_high, found_keys)
-        };
-        PromoteStats {
-            promoted: promoted_count,
-            already_high,
-            not_found_keys: keys.len() - found_keys.len(),
-        }
+        promote_queued_jobs(queue, keys, &PdfRenderValidity::Unscoped, scope)
     }
 
     #[test]

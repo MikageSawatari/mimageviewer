@@ -3539,7 +3539,7 @@ impl App {
             self.stack_mode_requested = false;
 
             crate::thumb_loader::bump_catchup_epoch();
-            let _ = crate::pdf_loader::bump_render_context_epoch();
+            self.bump_render_epoch_only();
         }
         self.cancel_folder_pane_open(super::PaneOpenRestoreExit::Adopted);
         self.clear_meta_undo();

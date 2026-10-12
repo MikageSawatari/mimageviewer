@@ -5,6 +5,13 @@
 
 ---
 
+PDF thumbnailの一覧失効・優先昇格はviewer owner/要求世代/keyに限定する
+（未リリースPDF-EPOCH-OWNERSHIP）。seek/hoverもViewer ticketをUI admissionで捕捉し、
+派生workerで更新しない。fullscreen本体はUnscoped＋既存fs_pending cancel/generation、
+そのpromotionはUnscoped jobsだけをfoundと数える。兄弟同PDF/pageの表示要求は失効しない。
+GPU upload、ThumbnailRequests、Canceled/SourcePixels/Finalizedの既存採用契約は維持する。
+[詳細](pdf-render-epoch-ownership-plan.md)。
+
 ### 音声セルの代表画像 (§1.347、2026-10-08)
 
 同名補助画像の採用は表示行の種類投影から独立している。画像種類を隠しても既存の候補順で

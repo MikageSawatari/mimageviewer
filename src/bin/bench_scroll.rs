@@ -314,6 +314,7 @@ fn make_load_request(
         idx,
         mtime,
         file_size,
+        pdf_render_validity: mimageviewer::pdf_loader::PdfRenderValidity::Unscoped,
         ..Default::default()
     };
     match item {

@@ -1,5 +1,24 @@
 # mimageviewer 仕様書
 
+### Everything ファイル名検索（§1.374、実装中・検証待ち）
+
+- mainの一覧で `GlobalEverythingSearch`（Grid / Press / 既定Ctrl+R）、または
+  「ファイル → Everything ファイル名検索…」から開く。閉じる操作は×/Esc。操作カスタマイズで変更/解除できる。
+  text/IME/focus recovery、modal、Remote lock、fullscreen/native動画/detachedからは起動しない。
+- 同じPCで起動中のEverything通常版1.4.1以降の既定clientへ直接IPCする。serviceだけでは利用不可。
+  Everything本体/SDK DLLを同梱せず、named instance選択・Lite・1.5 alphaの専用対応は初版対象外。
+  mIV索引の有効化は不要。queryをそのまま明示送信し、IME確定後Enter/検索ボタンを使う。
+- raw先頭10,000件、offset paging/追加表示なし。folder/非対応形式もraw上限を消費する。
+  返却後に対応形式、表示種類、EPUB/変換書庫設定を適用し、対応候補のstat/編集情報を背景で準備する。
+  取得/準備中はmainの取消可能modal。完了後に一括採用し、取消/失敗は前のaccepted一覧を維持する。
+- flat一覧は通常sort/詳細表示/★/tag/閲覧を共有する。Ctrl+Gの集約/hit-count sort/全文対象フィルタは出さない。
+  ZIP内部entry/PDFページは検索せず外側本体を通常openする。成功した物理childからの帰路は保持datasetの
+  共通prepareで作り、IPCを再送しない。検索を閉じると共通Searchのoriginへ戻る。
+- 新しいSettings field/DB/schema/索引/Remote query endpoint/result共有は追加しない。
+  query/result一覧を永続化・診断ログへ保存せず、通常open/tag/★/cacheの保存と既存F12 viewer機能は維持する。
+  PDF prerequisiteは独立ACCEPT済み `4510346f5`（master `c1e66f589`）。Everything最新実装の独立レビュー、
+  自動gate、確認build、利用者の実Everything確認は未完了。[設計・検証台帳](everything-search-plan.md#14-実装記録2026-10-12検証待ち)。
+
 ### 音声一覧の画像 (§1.347、2026-10-08 決定)
 
 音声の一覧・詳細 hover・mIV Remote は、同じフォルダ / stem の画像、MP3 の埋め込み画像、音楽アイコンの順で表示する。埋め込み画像はファイル先頭の ID3v2 タグ一つだけを読み、前面表紙を優先する。後続 / 末尾タグのみの表紙は対象外で、同名画像で補える。非 MP3 も同名画像を使う。

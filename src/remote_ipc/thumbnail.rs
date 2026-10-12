@@ -434,6 +434,7 @@ impl ThumbnailEngine {
             mtime,
             file_size,
             priority: true,
+            pdf_render_validity: crate::pdf_loader::PdfRenderValidity::Unscoped,
             cache_key_override: Some(cache_key),
             folder_thumb_sort: is_folder.then_some(self.settings.folder_thumb_sort),
             folder_thumb_depth: self.settings.folder_thumb_depth,

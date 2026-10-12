@@ -5,6 +5,9 @@ use super::*;
 #[path = "tests/thumbnail_request_lifecycle.rs"]
 mod thumbnail_request_lifecycle;
 
+#[path = "tests/pdf_render_epoch.rs"]
+mod pdf_render_epoch;
+
 #[cfg(windows)]
 #[test]
 fn mixed_path_favorite_direct_navigation_standardizes_input_without_rewriting_saved_record() {
@@ -5817,10 +5820,13 @@ fn phase_b_search_stream(
 ) -> crossbeam_channel::Sender<crate::global_search::SearchStreamEvent> {
     let (tx, rx) = crossbeam_channel::unbounded();
     app.begin_search_page_edit_prepare_for_test(ctx);
-    app.global_search.pending = Some(crate::indexer_manager::SearchHandle {
-        cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        rx,
-    });
+    app.global_search.pending = Some(
+        crate::indexer_manager::SearchHandle {
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            rx,
+        }
+        .into(),
+    );
     tx
 }
 
@@ -10824,9 +10830,11 @@ fn fullscreen_pdf_loads_are_not_pruned_by_grid_epoch() {
         crate::pdf_loader::JobPriority::HighNormal,
         crate::pdf_loader::JobPriority::Normal,
     ] {
-        assert_eq!(
-            App::fs_pdf_render_context_epoch(priority),
-            0,
+        assert!(
+            matches!(
+                App::fs_pdf_render_validity(priority),
+                crate::pdf_loader::PdfRenderValidity::Unscoped
+            ),
             "fullscreen fs_load PDF renders must be owned by fs_pending, not the main-grid epoch"
         );
     }
@@ -33148,10 +33156,13 @@ mod phase_c_drill_address_tests {
         app: &mut crate::app::App,
     ) -> crossbeam_channel::Sender<SearchStreamEvent> {
         let (tx, rx) = crossbeam_channel::unbounded();
-        app.global_search.pending = Some(SearchHandle {
-            cancel: Arc::new(AtomicBool::new(false)),
-            rx,
-        });
+        app.global_search.pending = Some(
+            SearchHandle {
+                cancel: Arc::new(AtomicBool::new(false)),
+                rx,
+            }
+            .into(),
+        );
         tx
     }
 
