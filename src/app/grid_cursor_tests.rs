@@ -1,4 +1,6 @@
 //! State/handler regressions for the shared cursor/anchor owner (§1.370).
+#![cfg(test)]
+
 use super::*;
 use crate::settings::{GridClickSelectionMode, GridViewMode, SpreadMode};
 use crate::ui_fullscreen::FsPageNav;

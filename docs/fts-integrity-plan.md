@@ -290,6 +290,10 @@ dispatcherへ渡す前に同じ共通reporterを登録する。process-global ca
 Futureへ送る前・そのconsumerの有無に関係なくhookへ1回報告する。
 既存のpersist最大4回を使い切ったerrorと、persist以外の書込errorを含める。
 merge候補が開始前に無効になっただけの`segment_manager.start_merge`失敗は書込失敗として扱わない。
+merge完了時に元segment集合が利用できなくなった`SegmentManager::end_merge`の拒否も、
+既存診断logだけを残し通知/pendingの対象外とする。commitが全件削除済みsegmentを取り除く
+通常のupsertでも発生する。判定はこの発生箇所のprivate typed outcomeを使い、
+`InvalidArgument`全体やerror文字列で除外しない。根拠・回帰は§12.4。
 同期commit/save_metasはdispatcherから報告し、このhookと二重報告しない。
 
 **終了による未実行taskの打切りを、書込失敗から除外する。** コード上の事実として、
@@ -789,3 +793,72 @@ workspace外vendor egui/egui-wgpu/eframeは25/11/18件成功。原ログ/集計�
 core buildは10m13s、core SHA256は `2783ce2d661a0a8a9bee11b73a7124ca711e0c2885093eec3ef6296beefb6518`。
 原ログとexe/DLL identityは `I-1367-adoption-build-dev.log` / `I-1367-adoption-dev-runtime-artifacts.json`。
 portable/test hookは有効にせず、startup点検は通常コードとして含む。アプリは起動していない。
+
+### 12.4 公開直前の無害なmerge拒否の誤通知修正 (2026-10-12)
+
+利用者報告: 署名済みv4.6.0の実機で約33分に26回、SegmentManagerの元segment未検出と
+`InvalidArgument("The segments that were merged could not be found ...")`が発生し、毎回
+更新失敗のトーストと次回作り直し予約が出た。同時期に約5秒ごとの画像追加と約840件の
+再索引/commitが観測された。この実機ログの回数・規模は利用者観測であり、本作業でアプリは
+起動していない。別セッションの`docs/next-release-backlog.md`には触れず、commitもしない。
+
+対象はCargo patchで固定した`vendor/tantivy` 0.26.1。修正後のsource位置:
+
+- `src/fts_index.rs:473`のupsertはdelete_term→add_document。dispatcherの単一writerが
+  delete/upsert→commitを実行する。製品`src/`にTantivy writerのrollback/delete_all_documentsの
+  呼出しはなく、通常監視のcommitをこれらへ帰属させる根拠はない。
+- `vendor/tantivy/src/indexer/segment_updater.rs:522`のschedule_commitはpurge_deletes→
+  SegmentManager.commit→save_metas。save_metasはcommitted_segment_metasを取得し、
+  `segment_manager.rs:132,228`で生存数0のsegmentをregisterから除去してmeta.jsonを公開する。
+  mergeは別workerで走るため、その元segmentが全件upsertで置き換わる間にcommitできる。
+- `segment_manager.rs:202`のend_mergeは元集合が全てcommittedまたは全てuncommittedに
+  存在するかを最初に確認する。集合不成立の拒否はregisterのremove/addより前。
+  `segment_updater.rs:786`もこの結果ならsave_metasへ進まない。従って最新commitを
+  巻き戻したり削除したりせず、利用できないmerge結果を捨てるだけである。
+  register混在も同じ集合不成立に含まれるが、正常に開始したmergeは単一registerから選ばれ、
+  commitは全entryを一度に移すので、今回の通常競合の原因は元segmentの除去である。
+
+修正はこの所有境界だけ。`MergeSourcesUnavailable`と`EndMergeOutcome`をprivateに保ち、
+observerへ渡す本当のErrと区別してから既存公開FutureのInvalidArgumentへ変換する。
+文字列一致・汎用InvalidArgument除外・終了flagの別判定は使わない。元のWARNは保持する。
+merge本体、advance_deletes、save_metasのI/O/他のerrorは従来どおりreporterへ渡す。
+dispatcher/reporterの作り直し予約・通知処理自体は変更しない。
+既に記録されたpendingは本当の失敗との区別ができないため取り消さず、次回起動の既存処理に従う。
+本作業は通常profileのDB/設定を読み書きしない。
+
+並行組合せを減らす案も確認したが、commitをmerge待ちにしたり監視を止めたりする必要はない。
+公開不能なmergeを捨てる既存構造を保持するので、modal化・retry・回復state・追加待機は不要。
+独立Sol / xhighの事前設計レビュー・完了差分レビューともPASS (修正を要する指摘なし)。
+
+回帰は実際のon-disk Tantivyと既存のper-writer test gateを使う。自動merge policyで開始し、
+merge完了直前にworkerを止め、20回のdelete+add upsert/画像追加/commitを進める。
+元segmentが全て消える場合と、変更しない文書を持つ元segmentが1個残る場合を検証する。
+故意のrollback/delete_all/error注入でこの拒否を作らない。元IDの除去と実際のWARNを確認し、
+各commit/merge拒否後/再openの件数・path→内容、scanned_once保持、pendingなし、トーストなしを
+assertする。明示mergeの公開Future互換性、および同じ全文のInvalidArgumentを別箇所で返すと
+本当の失敗として通知される試験も追加する。既存の実OS persist拒否の回帰も再実行する。
+
+未commitの本節差分に対するWindowsでの検証 (全てexit 0):
+
+| command / 対象 | 実数・結果 | 原ログ (`target/` 内) |
+| --- | --- | --- |
+| `cargo test -p mimageviewer --test fts_tantivy_integrity` | 14 passed / 0 failed / 0 ignored (新規3件) | `fts-merge-tantivy-tests.log` |
+| `cargo test -p mimageviewer --lib fts_` | 87 passed / 0 failed / 0 ignored | `fts-merge-lib-tests.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 成功 (通常、test hookなし) | `fts-merge-normal-check.log` |
+| 同core check `--features portable` | 成功 (test hookなし) | `fts-merge-portable-check.log` |
+| `cargo fmt --all -- --check` / vendor変更3 Rust fileの`rustfmt --check` / `git diff --check` | 成功 | `fts-merge-fmt-check.log` |
+
+合計101件成功。自動mergeの2条件は競合区間が各20 commits / 40 upserts / 20追加文書で、最終生存数
+22件と23件を各commit・拒否後・再openで確認。明示mergeも同じ20 commitsの全消失条件を確認。
+初回integration fixtureのcompileはcrate-privateなscanned_once helperの参照で失敗したため、
+public APIを増やさずfixture専用SQLに修正してから上表を実行した。製品compile/test失敗ではない。
+full gateと実アプリ検証は今回の指定範囲外。実機ログと同じ84万件での負荷試験を実施したという
+意味ではない。
+
+通常profileの`build-dev.ps1 -PreserveRuntime`もexit 0で完了 (core 5m16s、Remote 34.22s、
+EPUB worker 0.39s)。core/Remote/EPUB workerと必要DLL/bundleの配置、VCRT PE検査まで成功。
+portable/test-script/test hookは有効にせず、アプリは起動していない。原記録は
+`target/fts-merge-build-dev.log`、exeのSHA256/size/timeは
+`target/fts-merge-dev-runtime-artifacts.json`。通常 `%APPDATA%/mimageviewer` を使うため、
+利用者が実行するときはinstalled/tray-residentを先に終了する。手動確認は索引作成完了後の
+監視フォルダへの約5秒間隔の画像追加、最新検索内容の保持、誤トーストが出ないこと。

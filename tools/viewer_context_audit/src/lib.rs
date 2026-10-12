@@ -139,6 +139,12 @@ const ALLOWLIST_ENTRIES: &[AllowlistEntry] = &[
 // implemented. A6 is therefore deliberately defined against the implementation that exists:
 // cfg(test)-gated App methods/functions ending in _for_test, plus their call sites.
 const PUBLIC_API_ALLOWLIST: &[&str] = &[
+    // 1.364 D2 routes write replies by context ID and validates the owning command/scope.
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn deliver_spread_shift_reply_at_rest (& mut self , reply : & crate :: spread_shift :: ShiftWriteReply ,) -> Option < bool >",
+    // 1.364 D2 applies the memory setting to retained owners without navigation or saving.
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn make_at_rest_spread_shifts_session_only (& mut self)",
+    // 1.364 D2c migrates page refs only; root rename preserves accepted contexts at the old source.
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn migrate_at_rest_spread_shifts (& mut self , mappings : & [crate :: books :: BookPathMapping] , root_move : Option < (& std :: path :: Path , & std :: path :: Path) > ,)",
     // 1.345 keeps bookmark projection, pending request and title draft in the owning bundle.
     // ContextRef only reads mounted/at-rest owners; it cannot mutate or replace sibling state.
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn book_bookmarks_request (self) -> Option < & 'a CurrentBookBookmarksRequest >",
@@ -166,7 +172,8 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     "inherent fn # [cfg (windows)]   ViewerContextRegistry ::  pub (in crate :: app) fn new () -> Self",
     "item enum # [cfg (windows)] pub (in crate :: app) enum BuildOutcome { Commit , Abort (& 'static str) , }",
     "item enum # [cfg (windows)] pub (in crate :: app) enum RetireContextError { Mount (MountError) , Retire (RetireError) , }",
-    "item struct # [cfg (windows)] pub (in crate :: app) struct ViewerContextBundle { }",
+    // 1.364 D2 keeps the accepted spread-shift owner in the bundle across mount/swap/fork.
+    "item struct # [cfg (windows)] pub (in crate :: app) struct ViewerContextBundle { pub (super) spread_shift : super :: spread_shift_owner :: ViewerSpreadShift }",
     "trait impl # [cfg (windows)]   ViewerContextBundle  Drop {   fn drop (& mut self) }",
     "item struct # [cfg (windows)] pub (in crate :: app) struct ContextRef < 'a > { }",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn mounted (app : & 'a App) -> Self",
@@ -214,10 +221,11 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn viewer_context_ids (& self) -> Vec < ViewerContextId >",
     "inherent fn # [cfg (not (windows))]   App ::  pub (in crate :: app) fn viewer_context_ids (& self) -> Vec < ViewerContextId >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn other_viewer_context_ids (& self) -> Vec < ViewerContextId >",
-    // RAW adds RawPages and its ordered ALL entry; keep the exact 19-owner inventory.
-    "item enum # [cfg (windows)] pub (in crate :: app) enum ContextAsyncOwner { PathClassification , HistoryTransition , CollectionGrid , CollectionNavigation , RatingNavigation , BookmarkOpen , FolderNavigation , FolderPaneScan , PdfEnumeration , ZipEnumeration , EpubConversion , PdfPassword , FullscreenDecode , RawPages , FinalAi , LocalAdjustment , ComicBake , EraseInpaint , SimilarPreview , }",
+    // 1.364 D2 adds context-owned retained readoption with mounted poll and park cancellation.
+    "item enum # [cfg (windows)] pub (in crate :: app) enum ContextAsyncOwner { RetainedSpreadShift , PathClassification , HistoryTransition , CollectionGrid , CollectionNavigation , RatingNavigation , BookmarkOpen , FolderNavigation , FolderPaneScan , PdfEnumeration , ZipEnumeration , EpubConversion , PdfPassword , FullscreenDecode , RawPages , FinalAi , LocalAdjustment , ComicBake , EraseInpaint , SimilarPreview , }",
     "item enum # [cfg (windows)] pub (in crate :: app) enum ContextAsyncServicePhase { Background , Dialog , }",
-    "inherent const # [cfg (windows)]   ContextAsyncOwner :: pub (in crate :: app) const ALL : [Self ; 19] = [Self :: EpubConversion , Self :: PdfPassword , Self :: PathClassification , Self :: HistoryTransition , Self :: CollectionGrid , Self :: CollectionNavigation , Self :: RatingNavigation , Self :: BookmarkOpen , Self :: FolderNavigation , Self :: FolderPaneScan , Self :: PdfEnumeration , Self :: ZipEnumeration , Self :: FullscreenDecode , Self :: RawPages , Self :: FinalAi , Self :: LocalAdjustment , Self :: ComicBake , Self :: EraseInpaint , Self :: SimilarPreview ,] ;",
+    // 1.364 D2 adds RetainedSpreadShift first; freeze the exact ordered 20-owner inventory.
+    "inherent const # [cfg (windows)]   ContextAsyncOwner :: pub (in crate :: app) const ALL : [Self ; 20] = [Self :: RetainedSpreadShift , Self :: EpubConversion , Self :: PdfPassword , Self :: PathClassification , Self :: HistoryTransition , Self :: CollectionGrid , Self :: CollectionNavigation , Self :: RatingNavigation , Self :: BookmarkOpen , Self :: FolderNavigation , Self :: FolderPaneScan , Self :: PdfEnumeration , Self :: ZipEnumeration , Self :: FullscreenDecode , Self :: RawPages , Self :: FinalAi , Self :: LocalAdjustment , Self :: ComicBake , Self :: EraseInpaint , Self :: SimilarPreview ,] ;",
     "inherent fn # [cfg (windows)]   ContextAsyncOwner ::  pub (in crate :: app) fn is_pending (self , context : ContextRef < '_ >) -> bool",
     "inherent fn # [cfg (windows)]   ContextAsyncOwner ::  pub (in crate :: app) fn needs_mounted_service (self , context : ContextRef < '_ >) -> bool",
     "inherent fn # [cfg (windows)]   ContextAsyncOwner ::  pub (in crate :: app) fn service (self , app : & mut App , ctx : & egui :: Context , phase : ContextAsyncServicePhase ,)",

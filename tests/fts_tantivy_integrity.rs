@@ -438,6 +438,142 @@ fn trigger_auto_merge(writer: &mut IndexWriter) {
     writer.commit().unwrap();
 }
 
+// Preserve public Future compatibility too; automatic merges have no consumer.
+const SOURCES_UNAVAILABLE_MESSAGE: &str = "The segments that were merged could not be found in the SegmentManager. This \
+     is not necessarily a bug, and can happen after a rollback for instance.";
+
+fn exercise_superseded_merge(explicit: bool, source_survivor: bool) {
+    let mut f = fixture();
+    let mut expected = BTreeMap::new();
+    for path in ["one", "two"] {
+        f.writer
+            .add_document(doc!(f.path => path, f.body => path))
+            .unwrap();
+        expected.insert(path.to_owned(), path.to_owned());
+        if source_survivor && path == "one" {
+            f.writer
+                .add_document(doc!(f.path => "unchanged", f.body => "preserved"))
+                .unwrap();
+            expected.insert("unchanged".to_owned(), "preserved".to_owned());
+        }
+        f.writer.commit().unwrap();
+    }
+    let sources = f.index.searchable_segment_ids().unwrap();
+    assert_eq!(sources.len(), 2);
+    let (reporter, db_path) = reporter_for(f.dir.path());
+    let observer = Connection::open(&db_path).unwrap();
+    observer
+        .execute(
+            "INSERT INTO scanned_once(root, fingerprint) VALUES ('fixture', 'complete')",
+            [],
+        )
+        .unwrap();
+    let failures = attach_reporter(&f.writer, &reporter);
+    let terminal = observe_terminal(&f.writer);
+    let (gate, started) = arm_before_end(&f.writer);
+    let future = if explicit {
+        Some(f.writer.merge(&sources))
+    } else {
+        trigger_auto_merge(&mut f.writer);
+        None
+    };
+    started.recv_timeout(WAIT).unwrap();
+    // Real delete+add upserts and commits run while the actual merge worker is
+    // paused before publication. No rollback/delete_all or injected error.
+    for generation in 0..20 {
+        for path in ["one", "two"] {
+            let body = format!("updated {generation}");
+            f.writer.delete_term(Term::from_field_text(f.path, path));
+            f.writer
+                .add_document(doc!(f.path => path, f.body => body.clone()))
+                .unwrap();
+            expected.insert(path.to_owned(), body);
+        }
+        let added = format!("added {generation}");
+        f.writer
+            .add_document(doc!(f.path => added.clone(), f.body => "new image"))
+            .unwrap();
+        expected.insert(added, "new image".to_owned());
+        f.writer.commit().unwrap();
+        assert_eq!(all_docs(&f.index, f.path, f.body), expected);
+    }
+    let remaining = f.index.searchable_segment_ids().unwrap();
+    assert_eq!(
+        sources.iter().filter(|id| remaining.contains(id)).count(),
+        usize::from(source_survivor),
+        "commit must have removed the fully deleted merge sources"
+    );
+    gate.open();
+    assert!(!terminal.recv_timeout(WAIT).unwrap(), "task was accepted");
+    if let Some(future) = future {
+        assert!(
+            matches!(future.wait(), Err(TantivyError::InvalidArgument(message))
+            if message == SOURCES_UNAVAILABLE_MESSAGE)
+        );
+    }
+    // The real SegmentManager diagnostic contains the unique original IDs;
+    // prove the automatic route reached precisely the observed rejection site.
+    assert!(DIAGNOSTIC_RECORDS.lock().unwrap().iter().any(|record| {
+        record.starts_with("segment_ids:") && record.contains(&format!("{:?}", sources[0]))
+    }));
+    assert!(failures.try_recv().is_err());
+    assert_eq!(reporter.snapshot(), MaintenanceState::Ready);
+    assert!(reporter.take_notifications().is_empty());
+    assert!(!durable_pending(&db_path));
+    assert_eq!(
+        observer
+            .query_row(
+                "SELECT fingerprint FROM scanned_once WHERE root='fixture'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .optional()
+            .unwrap()
+            .as_deref(),
+        Some("complete")
+    );
+    assert_eq!(all_docs(&f.index, f.path, f.body), expected);
+    drop(f.writer);
+    drop(f.index);
+    drop(f.mmap);
+    let reopened = Index::open_in_dir(f.dir.path()).unwrap();
+    assert_eq!(all_docs(&reopened, f.path, f.body), expected);
+}
+
+#[test]
+fn frequent_upsert_commits_supersede_automatic_merge_without_rebuild_or_notice() {
+    // Both complete disappearance and one still-live source are valid.
+    exercise_superseded_merge(false, false);
+    exercise_superseded_merge(false, true);
+}
+
+#[test]
+fn superseded_explicit_merge_retains_public_invalid_argument() {
+    exercise_superseded_merge(true, false);
+}
+
+#[test]
+fn executed_same_message_invalid_argument_is_still_reported() {
+    let mut f = merge_fixture();
+    let (reporter, db_path) = reporter_for(f.dir.path());
+    let failures = attach_reporter(&f.writer, &reporter);
+    let terminal = observe_terminal(&f.writer);
+    f.writer.set_end_merge_test_hook(|| {
+        Err(TantivyError::InvalidArgument(
+            SOURCES_UNAVAILABLE_MESSAGE.to_owned(),
+        ))
+    });
+    trigger_auto_merge(&mut f.writer);
+    assert!(matches!(
+        failures.recv_timeout(WAIT).unwrap(),
+        TantivyError::InvalidArgument(_)
+    ));
+    assert!(!terminal.recv_timeout(WAIT).unwrap());
+    assert_eq!(reporter.snapshot(), MaintenanceState::RebuildOnRestart);
+    assert_eq!(reporter.take_notifications(), vec![UPDATE_FAILURE_NOTICE]);
+    assert!(durable_pending(&db_path));
+}
+
 #[cfg(windows)]
 #[test]
 fn auto_merge_terminal_persist_failure_reaches_reporter_without_a_consumer() {
