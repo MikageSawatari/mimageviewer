@@ -442,6 +442,27 @@ RotationDb read-only open / SELECT 回数が増えないこと、未確定セル
 向き、失効中の release 入力、終了・context 交換、実テクスチャの UV と矩形を検査する。
 `still_seek_real_overlay_rotation_*` の PNG 6 枚で本体・列・吹き出しを同時に比較する。
 
+### 1.6.1 閲覧中のページ一覧 (§1.340、先行実装)
+
+通常 fullscreen／メイン内閲覧／F12連動窓／独立窓は既存surface内で
+`ui_page_overview::draw_page_overview` を使う。現在の可視実ページ列を仮想行として描き、
+未生成／回転未確定／失敗セルも番号とidentityを持つ選択可能なplaceholderにする。
+列数・scroll・cursorはviewer内のセッション値で、入場／取消は読書位置とmain Gridを変更しない。
+Selectの受理時だけ `land_still_page_navigation_target` の `LatestSeek` へ合流し、
+通常／連動のGrid追従、独立窓のmain非干渉を通常ページ移動と同じ時点・規則で扱う。
+
+画像は既存 `ThumbnailState::Loaded` と在メモリの `thumb_adjust_tex` を投影する。
+調整drag中は元のLoaded texture、それ以外は評価済みtextureを優先し、保存回転の確定値から
+寸法とUVを解く。描画でDB読取、補正texture生成、GPU upload、元画像decodeを始めない。
+回転は§1.6の既存workerを使い、未確定値を0°と推測しない。
+passive投影は全実ページのimmutable metadataと可視近傍のtexture handleだけを保持し、
+resize／DPI変更後の新セルもmetadataからtargetを解決する。full-image textureを入場条件にしない。
+
+前面需要は同一viewerのstrip／hoverと一覧のいずれか一つをdispatcherで選び、
+可視セルを先に、上下overscanを後に要求する。非表示stripが一覧のexact setを解除しない。
+現行の一覧新規要求は通常画像／ZIP画像に限る。PDF／EPUBは§1.377のmaster取り込み後に
+既存viewer ticket付き要求・昇格へ接続する。[所有・入力・統合の正本](detached-book-page-overview-plan.md)。
+
 ### 1.7 サムネイル画質ダイアログのプレビュー寸法
 
 `src/ui_dialogs/thumb_quality.rs` は viewport と実際の利用可能幅から A/B プレビューを配置する。

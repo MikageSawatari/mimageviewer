@@ -738,7 +738,17 @@ fn grid_touch_scroll_state(
     row_h: f32,
     items_generation: u64,
 ) -> GridTouchScrollState {
-    let id = grid_touch_scroll_state_id(ctx);
+    grid_touch_scroll_state_for_viewport(ctx, ctx.viewport_id(), anchor_y, row_h, items_generation)
+}
+
+fn grid_touch_scroll_state_for_viewport(
+    ctx: &egui::Context,
+    viewport: egui::ViewportId,
+    anchor_y: f32,
+    row_h: f32,
+    items_generation: u64,
+) -> GridTouchScrollState {
+    let id = egui::Id::new(("miv_grid_touch_scroll_fraction", viewport));
     ctx.data(|data| data.get_temp::<GridTouchScrollState>(id))
         .filter(|state| {
             state.items_generation == items_generation
@@ -761,6 +771,23 @@ pub(crate) fn grid_touch_scroll_remainder(
     items_generation: u64,
 ) -> f32 {
     grid_touch_scroll_state(ctx, anchor_y, row_h, items_generation).remainder_y
+}
+
+/// Grid retention always belongs to ROOT, even when requested by a fullscreen callback.
+pub(crate) fn root_grid_touch_scroll_remainder(
+    ctx: &egui::Context,
+    anchor_y: f32,
+    row_h: f32,
+    items_generation: u64,
+) -> f32 {
+    grid_touch_scroll_state_for_viewport(
+        ctx,
+        egui::ViewportId::ROOT,
+        anchor_y,
+        row_h,
+        items_generation,
+    )
+    .remainder_y
 }
 
 fn set_grid_touch_scroll_state(

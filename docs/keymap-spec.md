@@ -1,5 +1,29 @@
 # キー / マウス操作仕様 (静止画 vs 動画)
 
+ページ一覧は `FsPageOverviewToggle`（FsCommon / Press、既定 O）で開閉する。
+動画／音声／編集モードでは入場しない。S／Shift+S／Ctrl+S、Ctrl+O、編集の O は従来どおり。
+一覧中の scope は Global + FsCommon + FsPageOverview とし、FsImage／Rating は同時 active にしない。
+一覧確定は `FsPageOverviewConfirm`（Enter）、画面送りは `FsPageOverviewPagePrev`／
+`FsPageOverviewPageNext`（PageUp／PageDown）、先頭末尾は `FsPageOverviewFirst`／
+`FsPageOverviewLast`（Home／End）、列数は `FsPageOverviewColumnsLess`／
+`FsPageOverviewColumnsMore`（既定なし）。新規操作はすべて Press／no-repeat。
+
+一覧の実行可能集合は `FS_PAGE_OVERVIEW_ACTION_PRIORITY` を正本とし、新規一覧操作、
+`HelpShowContextShortcuts`、`FsToggleWindowMode`、`ToggleDetachedViewerMode`、
+`ToggleAlwaysOnTop`、`FsCtrlNavPrev`／`FsCtrlNavNext`／`FsSiblingPrev`／`FsSiblingNext`
+に限る。表示先と navigation の既存 gate でさらに絞り、独立静止画窓の F12 は含めない。
+ヘルプ・ボタン・リング／ジェスチャ・パッドも同じ集合を使い、許可外の保存済み割当は実行しない。
+`FsClose`／`FsBackToList`、背面の画像操作／評価／slideshow へ fallthrough しない。
+一覧を取消した後は通常の割当へ戻る。
+
+修飾なし矢印は一覧 cursor の固定ナビ、Esc は一覧取消の固定操作で keymap 対象外。
+どちらも通常 viewer と共通の固定入力／IME-safe 契約を保ち、TextInput／IME／modal を優先する。
+背景クリックでは取消しない。OS／タイトルバーの窓 close は従来の terminal close。
+入力優先は modal・text・popup → 固定 Esc → ヘルプ → toggle → F11／F12／最前面 →
+Ctrl／sibling navigation → Confirm → その他の一覧操作／固定 cursor とし、一つの edge を一度消費する。
+toggle を Enter に割り当てると Confirm との競合を表示し、実行時は toggle だけで一回取消す。
+潜在的な競合は一時的な modal／nav lock によって消さず、一覧の全許可集合で検査する。
+
 `GridOrganizeFiles` はサムネイル一覧のカーソル項目／チェック済み項目の「ファイル整理先」を開く。
 既定キーはなし。操作カスタマイズからキー、リング（マウス／パッド）、マウスジェスチャ、
 戻る／進む／ホイールクリックへ割り当てられ、右クリックの同じ入口と対象解決を共有する。

@@ -139,6 +139,9 @@ const ALLOWLIST_ENTRIES: &[AllowlistEntry] = &[
 // implemented. A6 is therefore deliberately defined against the implementation that exists:
 // cfg(test)-gated App methods/functions ending in _for_test, plus their call sites.
 const PUBLIC_API_ALLOWLIST: &[&str] = &[
+    // 1.340 R5: immutable overview metadata/cursor projection only; no mount or mutation.
+    // Accepted owner-scoped design and independent non-PDF implementation review (2026-10-12).
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn page_overview_view (self ,) -> Option < crate :: page_overview :: PageOverviewView >",
     // 1.364 D2 routes write replies by context ID and validates the owning command/scope.
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn deliver_spread_shift_reply_at_rest (& mut self , reply : & crate :: spread_shift :: ShiftWriteReply ,) -> Option < bool >",
     // 1.364 D2 applies the memory setting to retained owners without navigation or saving.

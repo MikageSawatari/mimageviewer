@@ -43,6 +43,137 @@ fn loaded_thumbnail(ctx: &egui::Context, name: &str) -> ThumbnailState {
     }
 }
 
+fn install_overview_demand(app: &mut App) {
+    use crate::page_overview::{
+        PageOverviewDirection, PageOverviewProjection, PageOverviewStamp, PageOverviewState,
+    };
+    app.page_identity_index = Arc::new(file_type_resume::PreparedPageIdentityIndex::prepare(
+        &app.items,
+        None,
+        app.settings.file_type_visibility.clone(),
+    ));
+    let projection = Arc::new(
+        PageOverviewProjection::new(
+            Arc::clone(app.page_identity_index.overview_metadata()),
+            Arc::new((0..app.items.len()).collect()),
+        )
+        .unwrap(),
+    );
+    app.fullscreen_idx = Some(0);
+    app.page_overview = PageOverviewState::open(
+        projection,
+        PageOverviewStamp {
+            context_serial: app.projected_viewer_context_id().serial(),
+            items_generation: app.items_generation,
+            reader_order_revision: 1,
+            incarnation: 1,
+        },
+        0,
+        4,
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800., 600.)),
+        PageOverviewDirection::LeftToRight,
+    )
+    .unwrap();
+}
+
+#[test]
+fn overview_detached_range_change_prunes_local_queue_but_preserves_popped_terminal() {
+    let ctx = egui::Context::default();
+    let mut app = setup_thumbnail_app(20);
+    install_overview_demand(&mut app);
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
+    app.viewer_presentation = ViewerPresentation::DetachedWindow;
+    app.fs_holdover_tex = Some(navigation_sequence(app.items_generation, vec![2]));
+    app.ensure_non_pdf_page_overview_requests(&ctx, &[4, 6]);
+    let popped = app
+        .reload_queue
+        .as_ref()
+        .unwrap()
+        .0
+        .lock()
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(popped.idx, 6);
+    app.thumbnails[4] = loaded_thumbnail(&ctx, "overview-departing");
+    app.ensure_non_pdf_page_overview_requests(&ctx, &[10]);
+    assert_eq!(app.keep_set, HashSet::from([2, 10]));
+    assert!(matches!(app.thumbnails[4], ThumbnailState::Evicted));
+    assert!(!app.requested.contains_key(&4));
+    assert_eq!(app.requested.id(6), Some(popped.request_id));
+    assert!(
+        app.reload_queue
+            .as_ref()
+            .unwrap()
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|req| req.idx == 10)
+    );
+    app.close_page_overview_with_ctx(&ctx);
+    assert_eq!(app.keep_set, HashSet::from([2]));
+    assert!(
+        app.still_seek_thumbnail_pages_shared
+            .read()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(app.requested.id(6), Some(popped.request_id));
+}
+
+#[test]
+fn overview_root_exact_replacement_retains_canonical_grid_band() {
+    let ctx = egui::Context::default();
+    let mut app = setup_thumbnail_app(200);
+    install_overview_demand(&mut app);
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
+    app.viewer_presentation = ViewerPresentation::Fullscreen;
+    let band = app.grid_thumbnail_retention_geometry(&ctx);
+    let grid = app.visible_indices[band.vis_keep_start_capped..band.vis_keep_end].to_vec();
+    assert!(!grid.contains(&198));
+    app.ensure_non_pdf_page_overview_requests(&ctx, &[198]);
+    app.ensure_non_pdf_page_overview_requests(&ctx, &[196]);
+    assert!(!app.keep_set.contains(&198));
+    assert!(grid.iter().all(|idx| app.keep_set.contains(idx)));
+    app.close_page_overview_with_ctx(&ctx);
+    assert_eq!(app.keep_set, grid.into_iter().collect());
+}
+
+#[test]
+#[cfg(windows)]
+fn overview_park_withdraws_demand_without_closing_metadata() {
+    let ctx = egui::Context::default();
+    let mut app = setup_thumbnail_app(20);
+    install_overview_demand(&mut app);
+    app.viewer_presentation = ViewerPresentation::DetachedWindow;
+    let view = app.page_overview_view().unwrap();
+    app.ensure_non_pdf_page_overview_requests(&ctx, &[4, 6]);
+    app.pause_mounted_background_work_keep_current_frame();
+    assert_eq!(app.page_overview_view().unwrap().stamp, view.stamp);
+    assert!(Arc::ptr_eq(
+        &app.page_overview_view().unwrap().projection,
+        &view.projection
+    ));
+    assert!(app.still_seek_thumbnail_pages.is_empty());
+    assert!(
+        app.still_seek_thumbnail_pages_shared
+            .read()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(app.keep_set.is_empty());
+    assert!(
+        app.reload_queue
+            .as_ref()
+            .unwrap()
+            .0
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+}
+
 fn cached_all_items_are_images(app: &mut App) -> bool {
     let items_generation = app.items_generation;
     let reading_flow = app.reading_flow;

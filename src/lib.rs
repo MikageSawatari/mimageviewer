@@ -355,6 +355,7 @@ pub use ui_fullscreen::{
 mod ui_details_icon;
 pub mod ui_helpers;
 mod ui_main;
+pub mod ui_page_overview;
 pub mod ui_toolbar_layout;
 #[doc(hidden)]
 pub use ui_dialogs::preferences::draw_details_name_color_settings_snapshot_fixture;

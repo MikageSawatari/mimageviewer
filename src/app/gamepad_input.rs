@@ -321,6 +321,151 @@ enum PadDir {
     Right,
 }
 
+fn overview_cursor_direction(direction: PadDir) -> crate::page_overview::PageOverviewCursorMove {
+    use crate::page_overview::PageOverviewCursorMove;
+    match direction {
+        PadDir::Up => PageOverviewCursorMove::Up,
+        PadDir::Down => PageOverviewCursorMove::Down,
+        PadDir::Left => PageOverviewCursorMove::Left,
+        PadDir::Right => PageOverviewCursorMove::Right,
+    }
+}
+
+fn overview_pad_key_action(action: PadAction) -> Option<KeyAction> {
+    if action.kind != PadActionKind::Press {
+        return None;
+    }
+    match action.button {
+        PadButton::South => Some(KeyAction::FsPageOverviewConfirm),
+        PadButton::East => Some(KeyAction::FsPageOverviewToggle),
+        PadButton::LeftShoulder => Some(KeyAction::FsCtrlNavPrev),
+        PadButton::RightShoulder => Some(KeyAction::FsCtrlNavNext),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod page_overview_pad_tests {
+    use super::*;
+
+    #[test]
+    fn overview_gamepad_confirm_cancel_are_direct_actions_and_never_repeat() {
+        for (button, expected) in [
+            (PadButton::South, KeyAction::FsPageOverviewConfirm),
+            (PadButton::East, KeyAction::FsPageOverviewToggle),
+        ] {
+            assert_eq!(
+                overview_pad_key_action(PadAction {
+                    button,
+                    kind: PadActionKind::Press
+                }),
+                Some(expected)
+            );
+            for kind in [PadActionKind::Repeat, PadActionKind::Release] {
+                assert_eq!(overview_pad_key_action(PadAction { button, kind }), None);
+            }
+        }
+        assert_eq!(
+            overview_pad_key_action(PadAction {
+                button: PadButton::Select,
+                kind: PadActionKind::Press
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn overview_gamepad_arrows_preserve_screen_geometry_instead_of_reader_next() {
+        use crate::page_overview::PageOverviewCursorMove;
+        assert_eq!(
+            overview_cursor_direction(PadDir::Left),
+            PageOverviewCursorMove::Left
+        );
+        assert_eq!(
+            overview_cursor_direction(PadDir::Right),
+            PageOverviewCursorMove::Right
+        );
+        assert_eq!(
+            overview_cursor_direction(PadDir::Up),
+            PageOverviewCursorMove::Up
+        );
+        assert_eq!(
+            overview_cursor_direction(PadDir::Down),
+            PageOverviewCursorMove::Down
+        );
+    }
+
+    #[test]
+    fn overview_saved_ring_action_is_blocked_then_restored_after_cancel() {
+        use crate::book_resume_db::PageIdentity;
+        use crate::page_overview::{
+            PageOverviewEntry, PageOverviewMetadata, PageOverviewPage, PageOverviewProjection,
+            PageOverviewStamp, PageOverviewState,
+        };
+        use std::sync::Arc;
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![GridItem::Image(app.tmp.path().join("overview.png"))];
+        app.fullscreen_idx = Some(0);
+        let metadata = PageOverviewMetadata::new([PageOverviewEntry {
+            items_idx: 0,
+            page: Arc::new(PageOverviewPage {
+                identity: PageIdentity::Image {
+                    path: "g:/test/overview.png".to_owned(),
+                },
+                label: Arc::from("overview.png"),
+                white_companion: None,
+            }),
+        }])
+        .unwrap();
+        app.page_overview = PageOverviewState::open(
+            Arc::new(PageOverviewProjection::new(Arc::new(metadata), Arc::new(vec![0])).unwrap()),
+            PageOverviewStamp {
+                context_serial: 1,
+                items_generation: 2,
+                reader_order_revision: 3,
+                incarnation: 4,
+            },
+            0,
+            4,
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0)),
+            Default::default(),
+        )
+        .unwrap();
+        let ctx = egui::Context::default();
+        assert!(!app.slideshow_playing);
+        app.apply_ring_action(
+            &ctx,
+            RingShortcutContext::ImageFullscreen,
+            RingActionId::ImageSlideshow,
+            "overview-test",
+        );
+        assert!(!app.slideshow_playing);
+        assert!(app.page_overview.session().is_some());
+        assert_eq!(
+            app.ring_runtime_label(
+                RingShortcutContext::ImageFullscreen,
+                &RingActionId::ImageSlideshow
+            ),
+            "無効: スライドショー"
+        );
+        app.page_overview.close();
+        assert_eq!(
+            app.ring_runtime_label(
+                RingShortcutContext::ImageFullscreen,
+                &RingActionId::ImageSlideshow
+            ),
+            "スライドショー"
+        );
+        app.apply_ring_action(
+            &ctx,
+            RingShortcutContext::ImageFullscreen,
+            RingActionId::ImageSlideshow,
+            "overview-test",
+        );
+        assert!(app.slideshow_playing);
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct MouseMiddleClickState {
     start: egui::Pos2,
@@ -644,6 +789,28 @@ pub(crate) struct MouseButtonDispatchResult {
 }
 
 impl App {
+    /// Shared gate for saved ring, gesture, mouse-button execution and runtime guide labels.
+    pub(crate) fn page_overview_ring_action_executable(
+        &self,
+        context: RingShortcutContext,
+        action: &RingActionId,
+    ) -> bool {
+        if context != RingShortcutContext::ImageFullscreen || self.page_overview.session().is_none()
+        {
+            return true;
+        }
+        action.is_executable_in_page_overview(&self.page_overview_executable_actions())
+    }
+
+    fn ring_runtime_label(&self, context: RingShortcutContext, action: &RingActionId) -> String {
+        let label = action.label_for_context(context);
+        if self.page_overview_ring_action_executable(context, action) {
+            label.to_owned()
+        } else {
+            format!("無効: {label}")
+        }
+    }
+
     pub(crate) fn draw_gamepad_ring_overlay(
         &self,
         ui: &mut egui::Ui,
@@ -662,12 +829,15 @@ impl App {
         let center = full_rect.center();
         let radius = ring_guide_radius_for_rect(full_rect);
         let slots = &self.settings.ring_shortcuts.profile(context).slots;
+        let labels = slots
+            .iter()
+            .map(|action| self.ring_runtime_label(context, action))
+            .collect::<Vec<_>>();
         draw_ring_guide_donut(painter, center, radius, selected, |direction| {
-            slots
+            labels
                 .get(direction.slot_index())
-                .cloned()
-                .unwrap_or_default()
-                .label_for_context(context)
+                .map(String::as_str)
+                .unwrap_or("なし")
         });
     }
 
@@ -976,12 +1146,8 @@ impl App {
                     selected: mouse_flick_direction(flick),
                     slot_labels: (0..crate::ring_shortcut::RING_SHORTCUT_SLOT_COUNT)
                         .map(|slot_index| {
-                            slots
-                                .get(slot_index)
-                                .cloned()
-                                .unwrap_or_default()
-                                .label_for_context(ring_context)
-                                .to_string()
+                            let action = slots.get(slot_index).cloned().unwrap_or_default();
+                            self.ring_runtime_label(ring_context, &action)
                         })
                         .collect(),
                 })
@@ -1640,12 +1806,15 @@ impl App {
                 if show_result_toast {
                     self.show_feedback_toast(format!(
                         "[Gesture: {pattern_label} {}]",
-                        action.label_for_context(action_context)
+                        self.ring_runtime_label(action_context, &action)
                     ));
                 }
                 self.apply_ring_action(ctx, action_context, action, "mouse-gesture")
             }
             RightDragCommand::ViewerShortRightClick { context, pos } => {
+                if self.page_overview.session().is_some() {
+                    return None;
+                }
                 let Some(fs_idx) = self.fullscreen_idx else {
                     crate::logger::log(
                         "passive right-drag short click dropped: fullscreen_idx_missing",
@@ -2507,7 +2676,16 @@ impl App {
             let surface = self.current_input_surface();
             self.note_input_surface(surface);
             self.consume_gamepad_directional_neutral_gate(now);
+            // Capture the mode for this batch. Cancel/Confirm cannot release later edges in
+            // the same physical batch into ordinary viewer navigation or analog zoom/pan.
+            let overview_batch =
+                self.page_overview.session().is_some() && self.gamepad_targets_viewer();
             for action in actions {
+                if overview_batch {
+                    self.dispatch_page_overview_gamepad_button(ctx, action);
+                    dispatched = true;
+                    continue;
+                }
                 if let Some(next_nav) = self.dispatch_gamepad_button(ctx, action) {
                     nav = Some(next_nav);
                     dispatched = true;
@@ -2515,7 +2693,11 @@ impl App {
                 }
                 dispatched = true;
             }
-            if self.dispatch_gamepad_analog(ctx, now) {
+            if if overview_batch {
+                self.dispatch_page_overview_gamepad_analog(ctx, now)
+            } else {
+                self.dispatch_gamepad_analog(ctx, now)
+            } {
                 dispatched = true;
             }
         } else {
@@ -2643,6 +2825,10 @@ impl App {
         ctx: &egui::Context,
         action: PadAction,
     ) -> Option<AddressBarNav> {
+        if self.page_overview.session().is_some() && self.gamepad_targets_viewer() {
+            self.dispatch_page_overview_gamepad_button(ctx, action);
+            return None;
+        }
         if self.gamepad_video_marker_picker.is_some() {
             self.dispatch_gamepad_video_marker_picker_button(ctx, action);
             return None;
@@ -2745,7 +2931,81 @@ impl App {
         }
     }
 
+    fn dispatch_page_overview_gamepad_button(&mut self, ctx: &egui::Context, action: PadAction) {
+        if self.page_overview.session().is_none() {
+            if action.kind == PadActionKind::Release && action.button == PadButton::West {
+                let _ = self.gamepad_state.finish_west_release();
+            }
+            return;
+        }
+        if self.gamepad_state.directional_neutral_required()
+            && (button_dir(action.button).is_some() || action.button == PadButton::West)
+        {
+            return;
+        }
+        if action.kind == PadActionKind::Release {
+            if action.button == PadButton::West {
+                self.finish_gamepad_west_release(ctx);
+            }
+            return;
+        }
+        if let Some(dir) = button_dir(action.button) {
+            if self.gamepad_state.west_ring_active() {
+                if let Some(direction) = self.current_ring_gamepad_direction() {
+                    self.gamepad_state.mark_west_ring_direction(direction);
+                    ctx.request_repaint();
+                }
+            } else {
+                self.page_overview_cursor_input(ctx, overview_cursor_direction(dir));
+            }
+            return;
+        }
+        if action.kind != PadActionKind::Press {
+            return;
+        }
+        if let Some(key_action) = overview_pad_key_action(action) {
+            self.execute_page_overview_key_action(ctx, &key_action);
+        } else if action.button == PadButton::West {
+            ctx.request_repaint();
+        }
+        if self.page_overview.session().is_none() {
+            self.gamepad_state.require_directional_neutral();
+        }
+    }
+
+    fn dispatch_page_overview_gamepad_analog(&mut self, ctx: &egui::Context, now: Instant) -> bool {
+        if self.page_overview.session().is_none() {
+            self.reset_gamepad_continuous_steps(now);
+            return false;
+        }
+        if self.consume_gamepad_directional_neutral_gate(now) {
+            return false;
+        }
+        if self.gamepad_state.west_ring_active() {
+            if let Some(direction) = self.current_ring_gamepad_direction() {
+                self.gamepad_state.mark_west_ring_direction(direction);
+            }
+            return true;
+        }
+        let direction = dominant_stick_dir(stick_pair(
+            &self.gamepad_state,
+            PadAxis::LeftX,
+            PadAxis::LeftY,
+        ));
+        if self
+            .gamepad_state
+            .left_stick_step_due(direction.is_some(), now, STICK_STEP_INTERVAL)
+            && let Some(direction) = direction
+        {
+            return self.page_overview_cursor_input(ctx, overview_cursor_direction(direction));
+        }
+        false
+    }
+
     fn dispatch_gamepad_analog(&mut self, ctx: &egui::Context, now: Instant) -> bool {
+        if self.page_overview.session().is_some() && self.gamepad_targets_viewer() {
+            return self.dispatch_page_overview_gamepad_analog(ctx, now);
+        }
         if self.gamepad_video_marker_picker.is_some() {
             return self.dispatch_gamepad_video_marker_picker_analog(ctx, now);
         }
@@ -3007,6 +3267,12 @@ impl App {
         self.clear_native_video_ring_guide_overlay(ctx);
         match self.gamepad_state.finish_west_release() {
             WestReleaseOutcome::Picker => {
+                if self.page_overview.session().is_some() {
+                    self.show_feedback_toast(
+                        "ページ一覧中は画像の設定ピッカーを使用できません".to_owned(),
+                    );
+                    return None;
+                }
                 self.open_gamepad_ring_picker(ctx);
                 None
             }
@@ -5621,6 +5887,9 @@ impl App {
             ));
             return MouseButtonDispatchResult::default();
         }
+        if !self.page_overview_ring_action_executable(context, &action) {
+            return MouseButtonDispatchResult::default();
+        }
         if mouse_button_action_blocked_by_edit_mode(self.is_overlay_edit_mode_active(), &action) {
             crate::logger::log(format!(
                 "[input-nav] source={source} ignored mouse button action={} during edit mode",
@@ -6102,6 +6371,15 @@ impl App {
         action: RingActionId,
         source: &'static str,
     ) -> Option<AddressBarNav> {
+        if self.page_overview.session().is_some() && context == RingShortcutContext::ImageFullscreen
+        {
+            if self.page_overview_ring_action_executable(context, &action)
+                && let Some(key_action) = action.page_overview_key_action()
+            {
+                self.execute_page_overview_key_action(ctx, &key_action);
+            }
+            return None;
+        }
         if context == RingShortcutContext::Grid
             && !self.grid_item_input_allowed()
             && !grid_ring_action_allowed_during_refresh(&action)
@@ -6130,6 +6408,12 @@ impl App {
 
         match action {
             RingActionId::None | RingActionId::Unknown(_) => None,
+            RingActionId::ImagePageOverview => {
+                if context == RingShortcutContext::ImageFullscreen {
+                    self.execute_page_overview_key_action(ctx, &KeyAction::FsPageOverviewToggle);
+                }
+                None
+            }
             RingActionId::ToggleDetachedViewer => {
                 self.toggle_detached_viewer_mode();
                 None

@@ -49,6 +49,15 @@ Light／Dark × 標準／強い、計8枚を保持する。前者は六分類・
 `preferences_restore_position_dark_off_narrow` の2枚で、本体と共通のチェック項目を描く。
 既定 ON のライト表示と、OFF のダーク表示・狭い幅での折り返しを確認する。
 
+本のページ一覧 (§1.340) は `page_overview_light/dark`、
+`page_overview_narrow_light/dark`、`page_overview_rtl_dark`、
+`page_overview_white_companion_dark` の6ケースを定義する。通常は600×420、狭幅は200×440。
+本体と共通のrendererで固定ヘッダ・戻る・列数・番号／短名・現在ページとcursor・
+placeholder／失敗セル・RTL順・白紙／表示余白の補助表示を描く。
+fixtureはApp・実ファイル・workerを使わず、全ページ生成や製品起動を行わない。
+取消／選択／wheel消費と小面の戻る到達性はheadless handlerテストで別に検査する。
+PNG生成・目視確認・実行結果の記録は検証ownerが担当し、定義追加だけを実行済みと扱わない。
+
 ## ディレクトリ構成
 
 ```

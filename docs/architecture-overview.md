@@ -45,6 +45,21 @@ live一覧のcursor／Shift起点は `App::move_grid_cursor(target, GridCursorIn
 
 ---
 
+### 閲覧中のページ一覧 (§1.340、2026-10-12先行実装)
+
+`PageOverviewState::Closed | Open(PageOverviewSession)` は `ViewerContextBundle` が所有し、
+mount / deposit で状態と incarnation を移譲する。独立 fork は Closed で開始し、
+items／読み順の置換と terminal teardown は当該 owner の一覧を閉じる。
+`PreparedPageIdentityIndex` が既存一覧の準備境界で実ページの identity／表示名を持つ
+immutable metadata を作り、`ViewerNavigationCaches` が現在の実ページ列との projection を共有する。
+通常 fullscreen、メイン内閲覧、F12連動窓、独立窓は同じ描画・入力・ページ着地の境界を使う。
+passive は `StillImage | PageOverview` の投影を持ち、全実ページ metadata の Arc と
+可視近傍の bounded texture だけを保持する。全ページ画像の生成や別の navigation owner は作らない。
+
+現行先行実装は非PDFの要求接続まで。PDF／EPUBの要求・昇格は、masterに入った§1.377を
+このブランチへ統合して既存 owner-scoped API へ接続する作業が残る。
+機能全体の受入完了は表さない。[R5と統合契約](detached-book-page-overview-plan.md)。
+
 ### 音声サムネイル (§1.347、2026-10-08)
 
 `audio_album_art` は先頭 ID3v2 タグ限定の bounded PIC/APIC reader、`audio_thumbnail` は worker stat・選定・decode・catalog を共通化する。動画の同名 sidecar discovery / 設定を Audio に拡張し、一覧出所は既存 `video_thumb_overrides` に統一する。Local / Remote は共通 I/O owner と catalog admission を使い、再生 decoder は変更しない。Remote IPC は統合版 v69（§1.345 v68＋master v67）、永続コレクションも snapshot / navigation 準備で thumbnail address を確定する。Web の NoArt / Failed は DOM 外の一覧 owner が持ち、明示 refresh で epoch と HTTP URL を更新する。[詳細設計](audio-album-art-plan.md)。
@@ -196,6 +211,8 @@ fit 基準へ戻さない。連結の基準 unit と PDF の絶対需要比較�
 | `ui_main.rs` | メイン画面のグリッド描画とクリック/ドラッグ処理 |
 | `ui_dialogs/smart_folder_editor.rs` | 名前だけのスマートフォルダ作成、現在の実フォルダ + facet 条件をルールとして追加する確認 UI、ルール / グループ化単位の管理 UI。場所 / AI / 画像色など保存対象外の条件を明示する。管理中のテキストはローカル draft に保持し、フォーカス離脱・選択変更・ダイアログ操作の確定境界でだけ Settings 保存と対応 worker / snapshot の無効化を行う。終了・トレイ退避の共通保存境界では有効 draft を Settings へ確定するが worker は開始せず、トレイ復帰時だけ遅延した副作用を1回適用する |
 | `ui_fullscreen.rs` | フルスクリーンビューポート (`show_viewport_immediate`)。描画テクスチャの優先順位はここで決定。見開きのcanonical `SpreadDisplayUnit`はpage列と形成理由（paired / 本当に相方がない / 横長境界 / 非ペア境界）を同じcache tokenで所有し、共通compositionだけが端の単ページ配置を解決する。paged、F12、連結読み、holdover、Remoteはtyped placementを消費し、縦横を再判定しない |
+| `page_overview.rs` / `ui_page_overview.rs` | viewer所有のClosed／Open、実ページprojection、stamp、cursor／仮想行／RTLの純粋モデルと共通描画。描画はstamped commandを返し、I/Oやページ移動を実行しない |
+| `app/page_overview.rs` / `app/detached_page_overview.rs` / `ui_fullscreen/page_overview.rs` | 一覧の適格性、root／detached入力所有、passive投影、bounded前面需要、既存LatestSeek着地を接続する。入力stampと実際のactive ownerを別々に検証する |
 | `seek_ruler.rs` | 静止画 / 本のページ数と動画 / 音楽の duration から、トラック幅に収まる 1 / 2 / 5 系の目盛り位置と大小区分を生成する純ロジック。3 面の共通寸法・低コントラスト色も所有する |
 | `page_dims.rs` | 一度判明したページ寸法を GPU texture の生存期間から分離して保持する generation 付き CPU cache。`ViewerContextBundle` 所有で、同じ idx の別 items へ寸法を誤適用しない |
 | `fullscreen_specified_scale.rs` | `FullscreenFitInput` が legacy fit と指定値＋`FullscreenFitBasis` を型で区別する。A（canonical aspect）と O（AI 前の物理原寸）を正規化し、任意軸の％ / logical px、合成 unit の実効 gap、既存倍率制限と指定方式だけの自動 5 倍上限を純粋計算する。PDF の O は page metadata と既存 Original 長辺 / native cap から解き、現在 raster へ依存しない |

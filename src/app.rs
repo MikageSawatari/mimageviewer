@@ -526,10 +526,21 @@ mod color_filter;
 mod content_identity_detection;
 pub(crate) mod content_identity_restore;
 #[cfg(windows)]
+mod detached_page_overview;
+#[cfg(windows)]
 mod detached_window_manager;
+#[cfg(windows)]
+pub(crate) use detached_page_overview::DetachedPageOverviewInputProvenance;
 mod facet_name_filter;
 mod facet_navigation;
 pub(crate) mod file_type_resume;
+pub(crate) mod page_overview;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewerForegroundThumbnailConsumer {
+    Seek,
+    PageOverview,
+}
 #[cfg(test)]
 mod rar_archive_cache_tests;
 pub(crate) use facet_navigation::{FacetNavigationState, FacetRoute, FacetScope};
@@ -622,8 +633,8 @@ pub(crate) use detached_window_manager::{
     DetachedActivationWatchDiagnostic, DetachedActivationWatchSample, DetachedActivationWatchState,
     DetachedActivationWatchStepResult, DetachedActivationWatchTarget,
     DetachedActivationWatchTargetRect, DetachedCloseRequest, DetachedHostClaim,
-    DetachedSessionLease, DetachedWindowHwndDiff, DetachedWindowManager, DetachedWindowRuntime,
-    DetachedWindowState, IdentifiedRightDragCommand,
+    DetachedSessionLease, DetachedWindowCommand, DetachedWindowHwndDiff, DetachedWindowManager,
+    DetachedWindowRuntime, DetachedWindowState, IdentifiedRightDragCommand,
 };
 #[cfg(all(windows, test))]
 pub(crate) use detached_window_manager::{DetachedActivationIntent, PendingRightDragCommand};
@@ -1746,12 +1757,58 @@ pub(crate) enum DetachedRightDragViewerIdentity {
     },
 }
 
+/// Passive content is one projection; overview does not require full-image pixels.
+#[cfg(windows)]
+#[derive(Clone)]
+pub(crate) enum DetachedImageWindowDisplay {
+    Still(crate::gpu_lanczos::FullscreenPaintResource),
+    PageOverview(DetachedPageOverviewProjection),
+}
+
+#[cfg(windows)]
+impl From<crate::gpu_lanczos::FullscreenPaintResource> for DetachedImageWindowDisplay {
+    fn from(resource: crate::gpu_lanczos::FullscreenPaintResource) -> Self {
+        Self::Still(resource)
+    }
+}
+
+#[cfg(windows)]
+impl DetachedImageWindowDisplay {
+    pub(crate) fn still(&self) -> Option<&crate::gpu_lanczos::FullscreenPaintResource> {
+        match self {
+            Self::Still(resource) => Some(resource),
+            Self::PageOverview(_) => None,
+        }
+    }
+    pub(crate) fn overview(&self) -> Option<&DetachedPageOverviewProjection> {
+        match self {
+            Self::PageOverview(overview) => Some(overview),
+            Self::Still(_) => None,
+        }
+    }
+}
+
+/// Immutable metadata is shared; only the capture-time overscan owns texture handles.
+#[cfg(windows)]
+#[derive(Clone)]
+pub(crate) struct DetachedPageOverviewProjection {
+    pub(crate) view: crate::page_overview::PageOverviewView,
+    pub(crate) captured_layout: crate::page_overview::PageOverviewLayout,
+    pub(crate) thumbnails: HashMap<usize, crate::ui_page_overview::PageOverviewThumbnail>,
+    pub(crate) retained_textures: Vec<egui::TextureHandle>,
+    pub(crate) direction: crate::page_overview::PageOverviewDirection,
+    pub(crate) current_items_indices: Vec<usize>,
+    pub(crate) keymap: crate::keymap::Keymap,
+    pub(crate) executable_actions: Vec<crate::keymap::KeyAction>,
+    pub(crate) input_blocked: bool,
+}
+
 // フィールド型 (ViewerContextDescriptor / ViewerContextBundle) が cfg(windows) の
 // detached 専用型なので、struct と impl も揃えてゲートする (非 Windows check 対応)。
 #[cfg(windows)]
 pub(crate) struct DetachedImageWindowSnapshot {
     pub(crate) id: u64,
-    pub(crate) texture: crate::gpu_lanczos::FullscreenPaintResource,
+    pub(crate) display: DetachedImageWindowDisplay,
     pub(crate) title: String,
     pub(crate) location_display: String,
     pub(crate) image_dims: Option<(u32, u32)>,
@@ -1802,7 +1859,7 @@ pub(crate) enum DetachedImageWindowUnderlay {
 #[derive(Clone)]
 pub(crate) struct DeferredDetachedImageWindowView {
     pub(crate) id: u64,
-    pub(crate) texture: crate::gpu_lanczos::FullscreenPaintResource,
+    pub(crate) display: DetachedImageWindowDisplay,
     pub(crate) location_display: String,
     pub(crate) image_dims: Option<(u32, u32)>,
     pub(crate) rotation: crate::rotation_db::Rotation,
@@ -1832,7 +1889,7 @@ impl DeferredDetachedImageWindowView {
     ) -> Self {
         Self {
             id: window.id,
-            texture: window.texture.clone(),
+            display: window.display.clone(),
             location_display: window.location_display.clone(),
             image_dims: window.image_dims,
             rotation: window.rotation,
@@ -1854,6 +1911,11 @@ impl DeferredDetachedImageWindowView {
 #[cfg(windows)]
 #[derive(Debug, Clone)]
 pub(crate) enum DeferredDetachedImageWindowEvent {
+    PageOverview {
+        id: u64,
+        command: page_overview::PageOverviewCommand,
+        provenance: DetachedPageOverviewInputProvenance,
+    },
     FirstCallback {
         id: u64,
     },
@@ -2031,7 +2093,7 @@ impl Clone for DetachedImageWindowSnapshot {
     fn clone(&self) -> Self {
         Self {
             id: self.id,
-            texture: self.texture.clone(),
+            display: self.display.clone(),
             title: self.title.clone(),
             location_display: self.location_display.clone(),
             image_dims: self.image_dims,
@@ -3550,6 +3612,12 @@ impl App {
             return false;
         };
         let id = dispatch.window_id;
+        if let Some(DetachedWindowCommand::PageOverview(command)) = dispatch.command.as_ref() {
+            if !self.can_activate_detached_page_overview_command(id, command) {
+                self.detached_window_manager.discard_detached_command(id);
+                return false;
+            }
+        }
         let frame = self.frame_counter;
         self.log_detached_image_window_debug(format!(
             "deferred_activate_commit frame={frame} id={id} before_active_dispatch=true \
@@ -3562,7 +3630,7 @@ impl App {
                 if self.active_detached_window_id() == Some(id) {
                     if self
                         .detached_window_manager
-                        .mark_right_drag_pending_execution(id, command)
+                        .mark_detached_command_pending_execution(id, command)
                     {
                         self.log_detached_image_window_debug(format!(
                             "right_drag_command_pending_execution frame={frame} id={id}"
@@ -3572,10 +3640,7 @@ impl App {
                             "right_drag_command_dropped frame={frame} id={id} \
                              phase=activating reason=illegal_activation_transition"
                         ));
-                        self.discard_detached_right_drag_command(
-                            id,
-                            "illegal_activation_transition",
-                        );
+                        self.detached_window_manager.discard_detached_command(id);
                     }
                 } else {
                     self.log_detached_image_window_debug(format!(
@@ -3583,7 +3648,7 @@ impl App {
                          phase=activating reason=active_window_mismatch active_id={:?}",
                         self.active_detached_window_id()
                     ));
-                    self.discard_detached_right_drag_command(id, "active_window_mismatch");
+                    self.detached_window_manager.discard_detached_command(id);
                 }
             }
             self.log_detached_image_window_debug(format!(
@@ -3595,7 +3660,7 @@ impl App {
             ));
             true
         } else {
-            self.discard_detached_right_drag_command(id, "activation_failed");
+            self.detached_window_manager.discard_detached_command(id);
             self.log_detached_image_window_debug(format!(
                 "deferred_activate_commit_failed frame={frame} id={id} \
                  passive_windows={} active_context={}",
@@ -6643,6 +6708,18 @@ struct ThumbnailKeepProjection {
     interactive_pages: HashSet<usize>,
 }
 
+#[derive(Debug)]
+struct GridThumbnailRetentionGeometry {
+    cols: usize,
+    items_per_page: usize,
+    vis_count: usize,
+    vis_first: usize,
+    fractional_drag_y: f32,
+    strict_visible_end: usize,
+    strict_visible_items: usize,
+    vis_keep_start_capped: usize,
+    vis_keep_end: usize,
+}
 mod thumbnail_requests;
 use thumbnail_requests::{ThumbnailReceipt, ThumbnailRequestKind, ThumbnailRequests};
 
@@ -14967,6 +15044,8 @@ pub struct App {
     pub(crate) navigation_scope: ViewerNavigationScope,
     pub(crate) items: Vec<GridItem>,
     pub(crate) page_identity_index: Arc<file_type_resume::PreparedPageIdentityIndex>,
+    pub(crate) page_overview: crate::page_overview::PageOverviewState,
+    pub(crate) page_overview_incarnation: u64,
     /// Hands out content identities. Process-wide on purpose: it maps content to identity and
     /// holds no per-viewer state, so sharing it lets the same page keep one id across every
     /// viewer context.
@@ -19468,6 +19547,8 @@ impl App {
             navigation_scope: ViewerNavigationScope::Main,
             items: Vec::new(),
             page_identity_index: Default::default(),
+            page_overview: crate::page_overview::PageOverviewState::Closed,
+            page_overview_incarnation: 0,
             item_id_interner: std::cell::RefCell::default(),
             texture_identity: std::cell::RefCell::default(),
             passthrough_unavailable: None,
@@ -21611,6 +21692,7 @@ impl App {
     // Ctrl+G UI 実装 (後続コミット) で使用。現状は API 先行追加。
     #[allow(dead_code)]
     pub(crate) fn push_grid_item_pending(&mut self, item: GridItem) -> usize {
+        self.close_page_overview();
         let idx = self.items.len();
         self.items.push(item);
         self.thumbnails.push(ThumbnailState::Pending);
@@ -35490,6 +35572,7 @@ impl App {
         // start_loading_items で行う (二重にやらない)。
         self.save_leaving_folder_grid_position();
         self.retire_direct_media_reader_for_source_adoption();
+        self.close_page_overview();
         self.items.clear();
         self.thumbnails.clear();
         self.image_metas.clear();
@@ -40435,8 +40518,23 @@ impl App {
         }
     }
 
+    fn close_page_overview_if_reader_order_changed(&mut self) {
+        let changed = self.page_overview.session().is_some_and(|session| {
+            session.view().projection.reader_order().as_slice()
+                != crate::ui_helpers::still_image_display_indices(
+                    &self.items,
+                    self.current_reader_order(),
+                )
+                .as_slice()
+        });
+        if changed {
+            self.close_page_overview();
+        }
+    }
+
     fn set_items_generation(&mut self, items_generation: u64) {
         if self.items_generation != items_generation {
+            self.close_page_overview();
             // Retire this context's old request namespace, including unadopted images.
             // Old notifications must not reserve indices in the successor generation.
             self.requested.clear();
@@ -51314,6 +51412,140 @@ impl App {
         self.details_thumb_suppression_applied = self.keep_set.is_empty();
     }
 
+    /// Transient canonical grid band; shared by normal bookkeeping and foreground demand.
+    fn grid_thumbnail_retention_geometry(
+        &self,
+        ctx: &egui::Context,
+    ) -> GridThumbnailRetentionGeometry {
+        let cols = self.settings.grid_cols.max(1);
+        // 極端に小さい cell_h (1〜数 px) では `viewport_h / cell_h` が数千行に膨れて
+        // keep_set が数万 idx に達し、下流の make_load_request / texture_backlog で
+        // UI スレッドが固まる。render_grid 側の MIN_CELL_PX=32 と揃える。
+        let cell_h = self.last_cell_h.max(32.0);
+        let viewport_h = self.last_viewport_h.max(cell_h);
+
+        let rows_per_page = (viewport_h / cell_h).ceil() as usize;
+        let items_per_page = (rows_per_page * cols).max(1);
+        // 設計: prefetch / eviction 対象は「display list = visible_indices の一部」を
+        // そのまま使い、raw idx の連続範囲には**絶対に潰さない**。
+        // `visible_indices` が★フィルタや Ctrl+F で疎になったとき、raw range で扱うと
+        // 非可視 idx を大量 (フォルダ 1300 件中 3 件表示 → 991 件の非可視) に enqueue
+        // してしまう。詳細は docs/async-architecture.md「display list vs filesystem list」。
+        let vis_count = self.visible_indices.len();
+        // スクロール位置が vis_count を超えるとき (フィルタ直後の縮退ケース) は末尾に寄せる。
+        // さらに vis_count=0 は冒頭で早期 return 済みなのでここでは 1 以上。
+        let vis_first_raw = (self.scroll_offset_y / cell_h) as usize * cols;
+        let grid_vis_first = vis_first_raw.min(vis_count.saturating_sub(1));
+        let vis_first = thumbnail_retention_anchor_position(
+            &self.visible_indices,
+            grid_vis_first,
+            self.fullscreen_idx,
+        );
+        let fractional_drag_y = crate::ui_main::root_grid_touch_scroll_remainder(
+            ctx,
+            self.scroll_offset_y,
+            cell_h,
+            self.items_generation,
+        );
+        let strict_visible_end = crate::ui_main::extend_grid_end_for_touch_fraction(
+            vis_first.saturating_add(items_per_page),
+            cols,
+            vis_count,
+            fractional_drag_y,
+        );
+        let strict_visible_items = strict_visible_end.saturating_sub(vis_first);
+
+        let prev_pages = self.settings.thumb_prev_pages as usize;
+        let next_pages = self.settings.thumb_next_pages as usize;
+
+        let vis_keep_start = vis_first.saturating_sub(prev_pages * items_per_page);
+        let mut vis_keep_end = vis_first
+            .saturating_add((1 + next_pages) * items_per_page)
+            .min(vis_count);
+        vis_keep_end = crate::ui_main::extend_grid_end_for_touch_fraction(
+            vis_keep_end,
+            cols,
+            vis_count,
+            fractional_drag_y,
+        );
+
+        // ── 共有 VRAM pool: サムネイル保持帯 ───────────────────────────
+        // モード別のサムネイル配分を超えている場合だけ、実 texture 寸法と TextureId
+        // 重複排除で保持帯を縮める。未ロード項目は 0 texel なので先読み要求自体は許可し、
+        // texture が載った後の次フレームで自然に配分へ収束する。現在位置は常に残す。
+        let mut vis_keep_start_capped = vis_keep_start;
+        let budget = self.vram_pool_budget();
+        if let Some(cap_bytes) = budget.thumbnail_bytes {
+            let cap_texels = crate::vram_budget::rgba8_bytes_to_texels(cap_bytes);
+            let desired = vis_keep_end.saturating_sub(vis_keep_start);
+            if desired > 0 {
+                let texture_texels_for_bounds = |start: usize, end: usize| {
+                    let indices = self
+                        .visible_indices
+                        .get(start..end)
+                        .unwrap_or(&[])
+                        .iter()
+                        .copied()
+                        .collect::<HashSet<_>>();
+                    self.thumbnail_texture_texels_for_indices(&indices)
+                };
+                let desired_texels = texture_texels_for_bounds(vis_keep_start, vis_keep_end);
+                if desired_texels > cap_texels {
+                    let mut chosen =
+                        thumbnail_keep_bounds_for_count(vis_keep_start, vis_keep_end, vis_first, 1);
+                    let mut low = 1usize;
+                    let mut high = desired;
+                    while low <= high {
+                        let count = low + (high - low) / 2;
+                        let bounds = thumbnail_keep_bounds_for_count(
+                            vis_keep_start,
+                            vis_keep_end,
+                            vis_first,
+                            count,
+                        );
+                        if count == 1 || texture_texels_for_bounds(bounds.0, bounds.1) <= cap_texels
+                        {
+                            chosen = bounds;
+                            low = count.saturating_add(1);
+                        } else {
+                            high = count.saturating_sub(1);
+                        }
+                    }
+                    vis_keep_start_capped = chosen.0;
+                    vis_keep_end = chosen.1;
+                    crate::logger::log(format!(
+                        "  VRAM thumbnail band reduced: mode={} desired={} kept={} \
+                         loaded={} MiB cap={} MiB",
+                        self.vram_budget_mode().as_str(),
+                        desired,
+                        vis_keep_end.saturating_sub(vis_keep_start_capped),
+                        crate::vram_budget::rgba8_texels_to_bytes(desired_texels) / (1024 * 1024),
+                        cap_bytes / (1024 * 1024),
+                    ));
+                }
+            }
+        }
+        if crate::ui_main::grid_touch_fraction_is_visible(fractional_drag_y) {
+            // The fractional viewport exposes this whole extra row. Even when
+            // the VRAM band is capped, do not evict the row currently peeking
+            // in at the bottom of the touch-dragged grid.
+            vis_keep_start_capped = vis_keep_start_capped.min(vis_first);
+            vis_keep_end = vis_keep_end.max(strict_visible_end);
+        }
+
+        GridThumbnailRetentionGeometry {
+            cols,
+            items_per_page,
+            vis_count,
+            vis_first,
+            fractional_drag_y,
+            strict_visible_end,
+            strict_visible_items,
+            vis_keep_start_capped,
+            vis_keep_end,
+        }
+    }
+
     fn install_thumbnail_keep_projection(
         &mut self,
         projection: ThumbnailKeepProjection,
@@ -51499,12 +51731,58 @@ impl App {
     ///
     /// `keep_range` はグリッド worker の安価な bounding box のまま維持する。遠いページを
     /// hover しても 0..N の巨大な range にせず、priority request だけが range を迂回する。
-    fn clear_still_seek_thumbnail_requests(&mut self) {
+    pub(crate) fn clear_still_seek_thumbnail_requests(&mut self) {
+        if self.page_overview.session().is_some() {
+            return; // The strip is not the foreground consumer in this mode.
+        }
+        self.withdraw_foreground_thumbnail_requests();
+    }
+
+    /// Withdraw only this mounted owner's demand; parked overview metadata remains Open.
+    pub(in crate::app) fn withdraw_foreground_thumbnail_requests(&mut self) {
         self.rotation_cache.cancel_still_seek_rotations();
         self.still_seek_thumbnail_pages.clear();
         if let Ok(mut shared) = self.still_seek_thumbnail_pages_shared.write() {
             shared.clear();
         }
+        self.reconcile_foreground_thumbnail_keep_owners(None);
+    }
+
+    pub(crate) fn reconcile_foreground_thumbnail_keep_owners(
+        &mut self,
+        ctx: Option<&egui::Context>,
+    ) {
+        if self.sidecar_restore_active() || self.delete_pending.is_some() {
+            return;
+        }
+        let detached = self.viewer_session_is_detached();
+        let details = self.settings.grid_view_mode == crate::settings::GridViewMode::Details;
+        let grid_pages = if detached || details {
+            Vec::new()
+        } else {
+            // Mutation-only closes without a UI context use the existing mutation/frame boundary.
+            let Some(ctx) = ctx else {
+                return;
+            };
+            let band = self.grid_thumbnail_retention_geometry(ctx);
+            self.visible_indices
+                .get(band.vis_keep_start_capped..band.vis_keep_end)
+                .unwrap_or(&[])
+                .to_vec()
+        };
+        let projection = thumbnail_keep_projection(
+            self.items.len(),
+            grid_pages,
+            self.current_navigation_thumbnail_pages(),
+            details.then_some(self.details_hover_thumb_idx).flatten(),
+            self.current_bookmark_panel_thumbnail_pages(),
+            self.still_seek_thumbnail_pages.iter().copied(),
+        );
+        self.install_thumbnail_keep_projection(projection, true);
+        crate::thumb_loader::cancel_raw_thumb_tickets_outside_keep(
+            &self.raw_thumb_develop,
+            &self.keep_set,
+        );
     }
 
     pub(crate) fn ensure_still_seek_thumbnail_requests(
@@ -51512,29 +51790,73 @@ impl App {
         ctx: &egui::Context,
         pages: &[usize],
     ) {
+        self.ensure_foreground_thumbnail_requests(
+            ctx,
+            pages,
+            ViewerForegroundThumbnailConsumer::Seek,
+        );
+    }
+
+    /// Interim non-PDF consumer; PDF admission/promotion connects after §1.377 is merged.
+    pub(crate) fn ensure_non_pdf_page_overview_requests(
+        &mut self,
+        ctx: &egui::Context,
+        pages: &[usize],
+    ) {
+        self.ensure_foreground_thumbnail_requests(
+            ctx,
+            pages,
+            ViewerForegroundThumbnailConsumer::PageOverview,
+        );
+    }
+
+    /// One dispatcher selects the current consumer, so a hidden strip cannot withdraw overview demand.
+    fn ensure_foreground_thumbnail_requests(
+        &mut self,
+        ctx: &egui::Context,
+        pages: &[usize],
+        consumer: ViewerForegroundThumbnailConsumer,
+    ) {
+        let overview = consumer == ViewerForegroundThumbnailConsumer::PageOverview;
+        if overview != self.page_overview.session().is_some() {
+            return;
+        }
         if pages.is_empty() {
             self.rotation_cache.cancel_still_seek_rotations();
         }
-        let next = pages
+        // Keep the caller's visible-first order; the set only owns exact demand membership.
+        let mut next = HashSet::new();
+        let request_pages = pages
             .iter()
             .copied()
-            .filter(|idx| *idx < self.items.len())
-            .collect::<HashSet<_>>();
+            .filter(|idx| *idx < self.items.len() && next.insert(*idx))
+            .collect::<Vec<_>>();
         if self.still_seek_thumbnail_pages != next {
             self.still_seek_thumbnail_pages = next;
             if let Ok(mut shared) = self.still_seek_thumbnail_pages_shared.write() {
                 shared.clone_from(&self.still_seek_thumbnail_pages);
             }
+            self.reconcile_foreground_thumbnail_keep_owners(Some(ctx));
         }
-        self.keep_set
-            .extend(self.still_seek_thumbnail_pages.iter().copied());
-        let request_pages = self
-            .still_seek_thumbnail_pages
-            .iter()
-            .copied()
-            .collect::<Vec<_>>();
+        let enqueue_started = std::time::Instant::now();
+        let mut new_requests = 0usize;
         for idx in request_pages.iter().copied() {
+            if overview {
+                if !matches!(
+                    self.items.get(idx),
+                    Some(GridItem::Image(_) | GridItem::ZipImage { .. })
+                ) {
+                    continue;
+                }
+                if new_requests >= 32
+                    || enqueue_started.elapsed() >= std::time::Duration::from_millis(2)
+                {
+                    break;
+                }
+            }
+            let existed = self.requested.contains_key(&idx);
             self.enqueue_priority_thumbnail(idx);
+            new_requests += usize::from(!existed && self.requested.contains_key(&idx));
         }
         let pdf_keys = request_pages
             .iter()
@@ -51546,15 +51868,23 @@ impl App {
                 _ => None,
             })
             .collect::<HashSet<_>>();
-        if !pdf_keys.is_empty() {
+        if !overview && !pdf_keys.is_empty() {
             let stats = crate::pdf_loader::promote_to_high_normal(&pdf_keys);
             self.promote_retry_pending = stats.not_found_keys > 0;
             self.last_promoted_visible_keys = Some(pdf_keys);
         }
-        if request_pages
-            .iter()
-            .any(|idx| self.requested.contains_key(idx))
-        {
+        if request_pages.iter().any(|idx| {
+            self.requested.contains_key(idx)
+                || (overview
+                    && matches!(
+                        self.items.get(*idx),
+                        Some(GridItem::Image(_) | GridItem::ZipImage { .. })
+                    )
+                    && matches!(
+                        self.thumbnails.get(*idx),
+                        Some(ThumbnailState::Pending | ThumbnailState::Evicted)
+                    ))
+        }) {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
         if self.settings.grid_view_mode == crate::settings::GridViewMode::Details {
@@ -51771,121 +52101,17 @@ impl App {
         self.display_px_shared
             .store(current_display_px, Ordering::Relaxed);
 
-        let cols = self.settings.grid_cols.max(1);
-        // 極端に小さい cell_h (1〜数 px) では `viewport_h / cell_h` が数千行に膨れて
-        // keep_set が数万 idx に達し、下流の make_load_request / texture_backlog で
-        // UI スレッドが固まる。render_grid 側の MIN_CELL_PX=32 と揃える。
-        let cell_h = self.last_cell_h.max(32.0);
-        let viewport_h = self.last_viewport_h.max(cell_h);
-
-        let rows_per_page = (viewport_h / cell_h).ceil() as usize;
-        let items_per_page = (rows_per_page * cols).max(1);
-        // 設計: prefetch / eviction 対象は「display list = visible_indices の一部」を
-        // そのまま使い、raw idx の連続範囲には**絶対に潰さない**。
-        // `visible_indices` が★フィルタや Ctrl+F で疎になったとき、raw range で扱うと
-        // 非可視 idx を大量 (フォルダ 1300 件中 3 件表示 → 991 件の非可視) に enqueue
-        // してしまう。詳細は docs/async-architecture.md「display list vs filesystem list」。
-        let vis_count = self.visible_indices.len();
-        // スクロール位置が vis_count を超えるとき (フィルタ直後の縮退ケース) は末尾に寄せる。
-        // さらに vis_count=0 は冒頭で早期 return 済みなのでここでは 1 以上。
-        let vis_first_raw = (self.scroll_offset_y / cell_h) as usize * cols;
-        let grid_vis_first = vis_first_raw.min(vis_count.saturating_sub(1));
-        let vis_first = thumbnail_retention_anchor_position(
-            &self.visible_indices,
-            grid_vis_first,
-            self.fullscreen_idx,
-        );
-        let fractional_drag_y = crate::ui_main::grid_touch_scroll_remainder(
-            ctx,
-            self.scroll_offset_y,
-            cell_h,
-            self.items_generation,
-        );
-        let strict_visible_end = crate::ui_main::extend_grid_end_for_touch_fraction(
-            vis_first.saturating_add(items_per_page),
+        let GridThumbnailRetentionGeometry {
             cols,
+            items_per_page,
             vis_count,
+            vis_first,
             fractional_drag_y,
-        );
-        let strict_visible_items = strict_visible_end.saturating_sub(vis_first);
-
-        let prev_pages = self.settings.thumb_prev_pages as usize;
-        let next_pages = self.settings.thumb_next_pages as usize;
-
-        let vis_keep_start = vis_first.saturating_sub(prev_pages * items_per_page);
-        let mut vis_keep_end = vis_first
-            .saturating_add((1 + next_pages) * items_per_page)
-            .min(vis_count);
-        vis_keep_end = crate::ui_main::extend_grid_end_for_touch_fraction(
+            strict_visible_end,
+            strict_visible_items,
+            vis_keep_start_capped,
             vis_keep_end,
-            cols,
-            vis_count,
-            fractional_drag_y,
-        );
-
-        // ── 共有 VRAM pool: サムネイル保持帯 ───────────────────────────
-        // モード別のサムネイル配分を超えている場合だけ、実 texture 寸法と TextureId
-        // 重複排除で保持帯を縮める。未ロード項目は 0 texel なので先読み要求自体は許可し、
-        // texture が載った後の次フレームで自然に配分へ収束する。現在位置は常に残す。
-        let mut vis_keep_start_capped = vis_keep_start;
-        let budget = self.vram_pool_budget();
-        if let Some(cap_bytes) = budget.thumbnail_bytes {
-            let cap_texels = crate::vram_budget::rgba8_bytes_to_texels(cap_bytes);
-            let desired = vis_keep_end.saturating_sub(vis_keep_start);
-            if desired > 0 {
-                let texture_texels_for_bounds = |start: usize, end: usize| {
-                    let indices = self
-                        .visible_indices
-                        .get(start..end)
-                        .unwrap_or(&[])
-                        .iter()
-                        .copied()
-                        .collect::<HashSet<_>>();
-                    self.thumbnail_texture_texels_for_indices(&indices)
-                };
-                let desired_texels = texture_texels_for_bounds(vis_keep_start, vis_keep_end);
-                if desired_texels > cap_texels {
-                    let mut chosen =
-                        thumbnail_keep_bounds_for_count(vis_keep_start, vis_keep_end, vis_first, 1);
-                    let mut low = 1usize;
-                    let mut high = desired;
-                    while low <= high {
-                        let count = low + (high - low) / 2;
-                        let bounds = thumbnail_keep_bounds_for_count(
-                            vis_keep_start,
-                            vis_keep_end,
-                            vis_first,
-                            count,
-                        );
-                        if count == 1 || texture_texels_for_bounds(bounds.0, bounds.1) <= cap_texels
-                        {
-                            chosen = bounds;
-                            low = count.saturating_add(1);
-                        } else {
-                            high = count.saturating_sub(1);
-                        }
-                    }
-                    vis_keep_start_capped = chosen.0;
-                    vis_keep_end = chosen.1;
-                    crate::logger::log(format!(
-                        "  VRAM thumbnail band reduced: mode={} desired={} kept={} \
-                         loaded={} MiB cap={} MiB",
-                        self.vram_budget_mode().as_str(),
-                        desired,
-                        vis_keep_end.saturating_sub(vis_keep_start_capped),
-                        crate::vram_budget::rgba8_texels_to_bytes(desired_texels) / (1024 * 1024),
-                        cap_bytes / (1024 * 1024),
-                    ));
-                }
-            }
-        }
-        if crate::ui_main::grid_touch_fraction_is_visible(fractional_drag_y) {
-            // The fractional viewport exposes this whole extra row. Even when
-            // the VRAM band is capped, do not evict the row currently peeking
-            // in at the bottom of the touch-dragged grid.
-            vis_keep_start_capped = vis_keep_start_capped.min(vis_first);
-            vis_keep_end = vis_keep_end.max(strict_visible_end);
-        }
+        } = self.grid_thumbnail_retention_geometry(ctx);
 
         // Build the shared owner projection from the already capped grid slice. Do not derive the
         // grid owner from the previous aggregate keep_set: that would keep released hover/seek
@@ -60518,7 +60744,7 @@ impl App {
         let owner = crate::ring_shortcut::RightDragOwner::DetachedWindow(window.id);
         let right_drag_guide = self
             .right_drag_guide_for_owner(owner, self.right_drag_context_for_window_id(window.id));
-        let view = DeferredDetachedImageWindowView::from_snapshot(
+        let mut view = DeferredDetachedImageWindowView::from_snapshot(
             window,
             placement,
             apply_initial_placement,
@@ -60528,6 +60754,13 @@ impl App {
                 egui::Color32::from_rgb(red, green, blue)
             },
         );
+        if let DetachedImageWindowDisplay::PageOverview(overview) = &mut view.display {
+            overview.keymap = self.keymap.clone();
+            overview.input_blocked = self.any_dialog_open()
+                || self.remote_session_blocks_local_control()
+                || self.document_open_modal_admission_blocked()
+                || self.sidecar_restore_blocks_window(window.id);
+        }
         #[cfg(feature = "test-script")]
         let view = {
             let mut view = view;
@@ -62702,6 +62935,7 @@ impl App {
                 app.poll_local_adjust_lut_load(ctx);
                 app.poll_local_adjust_segmentation(ctx);
 
+                app.execute_pending_page_overview_command_in_mounted_context(ctx);
                 app.execute_pending_right_drag_command_in_mounted_context(ctx);
 
                 if app.active_detached_transition_outstanding() {
@@ -62963,6 +63197,90 @@ impl App {
             ));
             return None;
         }
+        // Open metadata has a complete display projection even before any full-image
+        // texture exists. Never send it through the still-image snapshot prerequisite.
+        if let Some(view) = self.page_overview_view() {
+            let id = self.ensure_detached_viewer_window_id();
+            let placement =
+                self.ensure_detached_window_runtime_placement(id, "build_overview_snapshot");
+            let surface = egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(
+                    crate::settings::window_geometry_to_viewport_points(
+                        placement.w,
+                        self.settings.ui_scale_factor,
+                    ),
+                    crate::settings::window_geometry_to_viewport_points(
+                        placement.h,
+                        self.settings.ui_scale_factor,
+                    ),
+                ),
+            );
+            let direction = self.page_overview_direction();
+            let layout =
+                crate::ui_page_overview::page_overview_geometry(surface, &view, direction).layout;
+            let pages = layout
+                .overscan_ordinals(view.scroll_anchor)
+                .filter_map(|ordinal| view.projection.entry(ordinal).map(|entry| entry.items_idx))
+                .collect::<Vec<_>>();
+            let thumbnails = self.page_overview_thumbnail_projection(&pages);
+            let retained_textures = self.page_overview_retained_thumbnail_textures(&pages);
+            let captured_layout = ctx
+                .and_then(|ctx| Self::page_overview_cached_layout(ctx, &view))
+                .unwrap_or(layout);
+            let current_items_indices = match self.resolve_visible_spread_pair(idx) {
+                crate::ui_fullscreen::SpreadPair::Double { left, right } => vec![left, right],
+                crate::ui_fullscreen::SpreadPair::Single => vec![idx],
+            };
+            let display =
+                DetachedImageWindowDisplay::PageOverview(DetachedPageOverviewProjection {
+                    view,
+                    captured_layout,
+                    thumbnails,
+                    retained_textures,
+                    direction,
+                    current_items_indices,
+                    keymap: self.keymap.clone(),
+                    executable_actions: self.page_overview_executable_actions(),
+                    input_blocked: self.any_dialog_open()
+                        || self.remote_session_blocks_local_control()
+                        || self.document_open_modal_admission_blocked(),
+                });
+            let reopen_collection_root = self.detached_collection_root_image_open_plan(idx);
+            let reopen_descriptor = if reopen_collection_root.is_some() {
+                None
+            } else {
+                match self.parked_still_reopen_descriptor_for_idx(idx) {
+                    DetachedBuild::Built(descriptor) => Some(descriptor),
+                    DetachedBuild::NotApplicable => None,
+                    DetachedBuild::Refused(reason) => {
+                        self.show_open_admission_refusal(reason);
+                        return None;
+                    }
+                }
+            };
+            return Some(DetachedImageWindowSnapshot {
+                id,
+                display,
+                title: self.detached_image_snapshot_title_for_idx(idx),
+                location_display: self.detached_image_snapshot_location_for_idx(idx),
+                image_dims: None,
+                rotation: crate::rotation_db::Rotation::None,
+                zoom_pan: None,
+                free_rotation: 0.0,
+                image_rect_norm: egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                image_content_bbox: None,
+                image_underlay: DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
+                frozen_continuous_pages: Vec::new(),
+                reopen_descriptor,
+                reopen_sync_stamp: self.viewer_sync_stamp_for_idx(idx),
+                reopen_collection_root,
+                activation_ready_frame: self.frame_counter.saturating_add(1),
+                activation_armed: false,
+                focused_last_frame: false,
+                initial_placement_applied: false,
+            });
+        }
         // Select the actual last-painted paged presentation before looking up `items[idx]`.
         // A navigation/source-reload holdover can still own the visible pixels after that index
         // has been rebound (or while its replacement has no texture at all).
@@ -63156,7 +63474,7 @@ impl App {
         ));
         Some(DetachedImageWindowSnapshot {
             id,
-            texture,
+            display: texture.into(),
             title: self.detached_image_snapshot_title_for_idx(idx),
             location_display: self.detached_image_snapshot_location_for_idx(idx),
             image_dims: Some((texture_size.x as u32, texture_size.y as u32)),
@@ -63202,7 +63520,7 @@ impl App {
         ));
         Some(DetachedImageWindowSnapshot {
             id,
-            texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
+            display: crate::gpu_lanczos::FullscreenPaintResource::direct(texture).into(),
             title,
             location_display,
             image_dims: None,
@@ -63930,7 +64248,7 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn detached_toggle_disabled_by_always_new_images(&self) -> bool {
+    pub(crate) fn detached_toggle_disabled_by_always_new_images(&self) -> bool {
         if !self.settings.detached_viewer_open_images_in_window {
             return false;
         }
@@ -68291,6 +68609,7 @@ impl App {
             self.visible_indices = (0..self.items.len()).collect();
             self.details_thumb_suppression_applied = false;
             self.details_order.clear();
+            self.close_page_overview_if_reader_order_changed();
             self.viewer_navigation_caches.invalidate();
             if selection_policy == VisibleSelectionPolicy::General {
                 self.ensure_selected_visible_or_first();
@@ -68319,6 +68638,7 @@ impl App {
                 .unwrap_or_default();
             self.details_thumb_suppression_applied = false;
             self.details_order.clear();
+            self.close_page_overview_if_reader_order_changed();
             self.viewer_navigation_caches.invalidate();
             if !self.checked.is_empty() {
                 let vi = &self.visible_indices;
@@ -68535,6 +68855,7 @@ impl App {
         } else {
             self.details_order.clear();
         }
+        self.close_page_overview_if_reader_order_changed();
         self.viewer_navigation_caches.invalidate();
         // WYSIWYG 原則: 非表示になったアイテムは checked / selected の対象から外す。
         // これで `handle_grid_keys` の `position().unwrap_or(0)` 起因の
@@ -69461,6 +69782,7 @@ impl App {
                 self.details_order.clear();
                 self.details_order_revision = self.details_order_revision.wrapping_add(1);
                 self.details_tag_prewarm_indices.clear();
+                self.close_page_overview_if_reader_order_changed();
                 self.viewer_navigation_caches.invalidate();
             }
         }
@@ -69669,6 +69991,7 @@ impl App {
             // PageCount へ切り替えた直後は全件取得が終わるまで toolbar 順を維持する。
             // Finished で Ready になった時点で poll_details_meta_load が再構築する。
             self.details_order = self.visible_indices.clone();
+            self.close_page_overview_if_reader_order_changed();
             return;
         }
         // 列ヘッダが並びを所有していない状態 (ソートなし / 本のページ順 / 閲覧履歴 /
@@ -69676,6 +69999,7 @@ impl App {
         // `details_header_sort_active` が唯一の所有者で、UI の無効化もそこから導く。
         if !self.details_header_sort_active() {
             self.details_order = self.visible_indices.clone();
+            self.close_page_overview_if_reader_order_changed();
             return;
         }
         let visible = self.visible_indices.clone();
@@ -69685,6 +70009,7 @@ impl App {
             .collect();
         rows.sort_by(|a, b| Self::compare_details_sort_rows(a, b, key, ascending));
         self.details_order = rows.into_iter().map(|row| row.idx).collect();
+        self.close_page_overview_if_reader_order_changed();
     }
 
     fn details_sort_row(

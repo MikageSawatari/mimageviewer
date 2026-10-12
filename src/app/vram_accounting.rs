@@ -84,14 +84,28 @@ impl App {
             });
         }
         for window in &self.detached_image_windows {
-            add_lanczos_resource(accountant, &window.texture);
+            if let Some(resource) = window.display.still() {
+                add_lanczos_resource(accountant, resource);
+            }
+            if let Some(overview) = window.display.overview() {
+                for texture in &overview.retained_textures {
+                    accountant.add_texture(VramSubsystem::Thumbnails, texture, false);
+                }
+            }
             for page in &window.frozen_continuous_pages {
                 add_lanczos_resource(accountant, &page.texture);
             }
         }
         for shared in self.deferred_detached_image_window_views.values() {
             if let Some(view) = shared.view() {
-                add_lanczos_resource(accountant, &view.texture);
+                if let Some(resource) = view.display.still() {
+                    add_lanczos_resource(accountant, resource);
+                }
+                if let Some(overview) = view.display.overview() {
+                    for texture in &overview.retained_textures {
+                        accountant.add_texture(VramSubsystem::Thumbnails, texture, false);
+                    }
+                }
                 for page in &view.frozen_continuous_pages {
                     add_lanczos_resource(accountant, &page.texture);
                 }

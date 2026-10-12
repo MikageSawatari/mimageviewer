@@ -777,6 +777,9 @@ impl CollectionNavigationPending {
     }
 
     pub(crate) fn accumulate_outer(&mut self, fullscreen: bool, forward: bool) -> bool {
+        if !self.accepts_outer(fullscreen) {
+            return false;
+        }
         let delta = if forward { 1 } else { -1 };
         let action = match self {
             Self::RequestNeeded { request, .. }
@@ -807,6 +810,24 @@ impl CollectionNavigationPending {
             }
             _ => false,
         }
+    }
+
+    pub(crate) fn accepts_outer(&self, fullscreen: bool) -> bool {
+        let action = match self {
+            Self::RequestNeeded { request, .. }
+            | Self::Snapshot { request, .. }
+            | Self::Preparing { request, .. }
+            | Self::Preflighting { request, .. }
+            | Self::AwaitingPdfPassword { request, .. }
+            | Self::PdfPasswordPreflighting { request, .. } => &request.action,
+            Self::AwaitingOuterContinuation {
+                fullscreen: pending_fullscreen,
+                ..
+            } => return *pending_fullscreen == fullscreen,
+            Self::AwaitingManualContinuation { .. } => return false,
+        };
+        matches!(action, CollectionNavigationAction::OuterGrid { .. } if !fullscreen)
+            || matches!(action, CollectionNavigationAction::OuterFullscreen { .. } if fullscreen)
     }
 
     pub(in crate::app) fn set_outer_queued_steps(&mut self, steps: i32) {
@@ -1983,6 +2004,14 @@ impl App {
                 queued_steps: 0,
             },
         )
+    }
+
+    pub(crate) fn collection_outer_fullscreen_navigation_available(&self, fs_idx: usize) -> bool {
+        self.top_level_grid_view
+            .collection_outer_navigation_available(true)
+            || self
+                .collection_outer_navigation_origin(Some(fs_idx))
+                .is_some()
     }
 
     pub(crate) fn start_collection_video_eof_navigation(

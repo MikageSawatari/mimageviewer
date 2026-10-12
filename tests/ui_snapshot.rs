@@ -3675,3 +3675,154 @@ fn diagnostics_export_error_light() {
 fn diagnostics_export_error_dark() {
     diagnostics_export_snapshot("error", "dark", mimageviewer::os_theme::ResolvedTheme::Dark);
 }
+
+fn page_overview_snapshot(
+    name: &str,
+    theme: mimageviewer::os_theme::ResolvedTheme,
+    size: egui::Vec2,
+    rtl: bool,
+    white_companion: bool,
+) {
+    use mimageviewer::book_resume_db::PageIdentity;
+    use mimageviewer::page_overview::{
+        PageOverviewDirection, PageOverviewEntry, PageOverviewMetadata, PageOverviewPage,
+        PageOverviewProjection, PageOverviewStamp, PageOverviewState, WhiteCompanion,
+    };
+    use mimageviewer::ui_page_overview::{
+        PageOverviewRenderInput, PageOverviewThumbnail, draw_page_overview,
+    };
+    use std::sync::Arc;
+
+    let labels = [
+        "表紙.png",
+        "第1章 / 風が吹く庭.png",
+        "長い日本語のページ名もセルの外へはみ出さずに省略する.png",
+        "読み込みに失敗したページ.png",
+    ];
+    let metadata = PageOverviewMetadata::new((0..80).map(|idx| PageOverviewEntry {
+        items_idx: idx,
+        page: Arc::new(PageOverviewPage {
+            identity: PageIdentity::Image {
+                path: format!("g:/snapshot/book/{idx}.png"),
+            },
+            label: Arc::from(labels[idx % labels.len()]),
+            white_companion: if white_companion && idx == 1 {
+                Some(WhiteCompanion::Composition)
+            } else if white_companion && idx == 2 {
+                Some(WhiteCompanion::DisplayPadding)
+            } else {
+                None
+            },
+        }),
+    }))
+    .unwrap();
+    let direction = if rtl {
+        PageOverviewDirection::RightToLeft
+    } else {
+        PageOverviewDirection::LeftToRight
+    };
+    let state = PageOverviewState::open(
+        Arc::new(
+            PageOverviewProjection::new(Arc::new(metadata), Arc::new((0..80).collect())).unwrap(),
+        ),
+        PageOverviewStamp {
+            context_serial: 1,
+            items_generation: 2,
+            reader_order_revision: 3,
+            incarnation: 4,
+        },
+        0,
+        4,
+        egui::Rect::from_min_size(egui::Pos2::ZERO, size),
+        direction,
+    )
+    .unwrap();
+    let mut view = state.session().unwrap().view().clone();
+    view.cursor = 2;
+    let thumbnails = std::collections::HashMap::from([(3, PageOverviewThumbnail::Failed)]);
+    snapshot_with_theme_contrast_and_size(
+        name,
+        theme,
+        mimageviewer::settings::TextContrast::Standard,
+        size,
+        |ui| {
+            draw_page_overview(
+                ui,
+                PageOverviewRenderInput {
+                    view: &view,
+                    title: "花と風の図鑑 / 第十二章",
+                    current_items_indices: &[0, 1],
+                    thumbnails: Some(&thumbnails),
+                    direction,
+                    input_enabled: false,
+                },
+            );
+        },
+    );
+}
+
+#[test]
+fn page_overview_light() {
+    page_overview_snapshot(
+        "page_overview_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(600.0, 420.0),
+        false,
+        false,
+    );
+}
+
+#[test]
+fn page_overview_dark() {
+    page_overview_snapshot(
+        "page_overview_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(600.0, 420.0),
+        false,
+        false,
+    );
+}
+
+#[test]
+fn page_overview_narrow_light() {
+    page_overview_snapshot(
+        "page_overview_narrow_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(200.0, 440.0),
+        false,
+        false,
+    );
+}
+
+#[test]
+fn page_overview_narrow_dark() {
+    page_overview_snapshot(
+        "page_overview_narrow_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(200.0, 440.0),
+        false,
+        false,
+    );
+}
+
+#[test]
+fn page_overview_rtl_dark() {
+    page_overview_snapshot(
+        "page_overview_rtl_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(600.0, 420.0),
+        true,
+        false,
+    );
+}
+
+#[test]
+fn page_overview_white_companion_dark() {
+    page_overview_snapshot(
+        "page_overview_white_companion_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(600.0, 420.0),
+        false,
+        true,
+    );
+}

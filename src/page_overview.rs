@@ -35,7 +35,7 @@ pub struct PageOverviewPage {
 }
 
 /// Real-page metadata keyed by the actual items index, independent of reading order.
-#[derive(Debug)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct PageOverviewMetadata {
     entries: HashMap<usize, PageOverviewEntry>,
 }
@@ -377,6 +377,14 @@ impl PageOverviewLayout {
             PageOverviewCursorMove::Last => self.page_count - 1,
         }
     }
+
+    pub fn cursor_after_move(
+        &self,
+        cursor: usize,
+        movement: PageOverviewCursorMove,
+    ) -> Option<usize> {
+        (cursor < self.page_count).then(|| self.moved_cursor(cursor, movement))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -463,6 +471,21 @@ impl PageOverviewView {
                 identity: entry.page.identity.clone(),
             },
         })
+    }
+
+    /// Derive a geometric projection without moving the canonical session or changing its stamp.
+    /// Active reflow and read-only passive drawing preserve the same cursor-relative row.
+    pub fn reflowed(&self, previous: &PageOverviewLayout, next: &PageOverviewLayout) -> Self {
+        assert_eq!(previous.page_count, self.projection.len());
+        assert_eq!(next.page_count, self.projection.len());
+        let relative_row = (self.cursor / previous.columns)
+            .saturating_sub(previous.clamp_anchor(self.scroll_anchor).row)
+            .min(next.page_rows() - 1);
+        let mut view = self.clone();
+        view.scroll_anchor = next.clamp_anchor(PageOverviewScrollAnchor {
+            row: (self.cursor / next.columns).saturating_sub(relative_row),
+        });
+        view
     }
 }
 
@@ -578,6 +601,27 @@ impl PageOverviewSession {
     pub fn move_cursor(&mut self, movement: PageOverviewCursorMove, layout: &PageOverviewLayout) {
         self.check_layout(layout);
         self.view.cursor = layout.moved_cursor(self.view.cursor, movement);
+        self.reveal_cursor(layout);
+    }
+
+    pub fn set_cursor_target(
+        &mut self,
+        target: &PageOverviewTarget,
+        layout: &PageOverviewLayout,
+    ) -> bool {
+        self.check_layout(layout);
+        let Some(entry) = self.view.projection.entry(target.ordinal) else {
+            return false;
+        };
+        if entry.items_idx != target.items_idx || entry.page.identity != target.identity {
+            return false;
+        }
+        self.view.cursor = target.ordinal;
+        self.reveal_cursor(layout);
+        true
+    }
+
+    fn reveal_cursor(&mut self, layout: &PageOverviewLayout) {
         let row = self.view.cursor / layout.columns;
         let top = self.view.scroll_anchor.row;
         let desired = if row < top {
@@ -604,14 +648,7 @@ impl PageOverviewSession {
     /// Preserve cursor identity and its relative visible row across resize/DPI/column changes.
     /// If scrolling had hidden the cursor, reflow brings that same cursor back into view.
     pub fn reflow(&mut self, previous: &PageOverviewLayout, next: &PageOverviewLayout) {
-        self.check_layout(previous);
-        self.check_layout(next);
-        let relative_row = (self.view.cursor / previous.columns)
-            .saturating_sub(previous.clamp_anchor(self.view.scroll_anchor).row)
-            .min(next.page_rows() - 1);
-        self.view.scroll_anchor = next.clamp_anchor(PageOverviewScrollAnchor {
-            row: (self.view.cursor / next.columns).saturating_sub(relative_row),
-        });
+        self.view = self.view.reflowed(previous, next);
     }
 
     /// Preferred columns remain a session value even if a narrow surface reduces effective columns.

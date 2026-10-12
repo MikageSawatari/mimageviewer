@@ -1469,11 +1469,34 @@ R5の通常fullscreen／メイン内閲覧への拡張も含め、「症状パ�
 T1純粋モデル（`src/page_overview.rs`／`src/lib.rs`）は16 tests／fmt／通常・portable core check成功、
 独立完了レビューACCEPT（P1/P2/P3なし）。App／viewport接続はまだ行っていない。
 T2の前提照合で、PDF queued promotionがperf_keyだけで兄弟／Remote jobにも作用することを確認。
-§8.2／§10の条件に従い、[設計書§18](detached-book-page-overview-plan.md#18-t2-pdf-queued-promotionの限定設計2026-10-12claudecode側の合意待ち)に
+§8.2／§10の条件に従い、当時の設計書§18に
 mandatory-ownerのcancel Arc identityでqueued jobだけを昇格する限定案と、foreground再評価も
 同じownerへ揃える接続条件を記載して停止した。独立reviewerは限定構造案へ合意済み、
 ClaudeCode側の追加境界合意と実装レビューは未実施。PDF製品コード変更・新たなepoch／取消変更はない。
 T1 ACCEPTを機能全体の完成・native入力／focus確認済みとは扱わない。
+
+coordinator追補（2026-10-12）: T1を `588fe1d76` としてコミット。PDF所有は§1.377
+`next-effetune` `4510346f5` の独立ACCEPT済みowner ticket／世代付き昇格を再利用する。
+旧§18のcancel Arc identity API案は撤回し、別の所有判定を実装しない。
+master統合後にnext-tileへmasterを取り込み、既存promotion tracking／bundle移譲上へ接続する。
+その間は非PDF UI・キーO・入力・snapshot・マニュアルを先行する指示を受けた。
+現行契約は[設計書§18](detached-book-page-overview-plan.md#18-t2-pdf昇格は1377の既存owner-scoped-apiへ接続する2026-10-12決定)。
+
+非PDF先行実装（2026-10-12）: ViewerContextBundleにClosed／Open一覧ownerを分類し、
+canonical immutable metadata／読み順と有界thumbnail投影を通常fullscreen／main内閲覧／
+detachedの既存surfaceへ接続した。stripと単一foreground exact demandを共有し、局所queued prune／
+Pixels・Finalized／RAW取消とroot Gridの保持範囲を既存ownerで扱う。parkはOpenを保持して新規需要を撤回、
+forkはClosed。無入力のpassive描画は生成・activationを行わず、commandは実際のactive資格を再検証する。
+F11／連動F12の同context移動はowner stamp単位のgeometry cacheを引き継ぎ、実surfaceの変更でreflowする。
+一覧終了後の描画は既存Closed／Rebased transitionで再準備し、通常入力を同passで再実行しない。
+既定O／有限KeyAction集合をdispatch・help・ring・padへ揃えた。配置／foreground／HWNDの新ownerは作らない。
+
+独立gpt-6.1-sol／xhigh完了レビューは非PDF coherent chunkにACCEPT、P1/P2/P3なし。
+readonly `ContextRef::page_overview_view` はimmutable投影だけを返すAPIとして、監査の完全一致指紋を1件追加。
+規則・閾値・ファイル除外・known findingsは緩和しない。R5双方の構造合意の境界内であり、
+PDF／EPUB要求接続・実機focus／HWND検証・機能全体の最終gateを完了扱いにはしない。
+§1.377はmasterへ統合済みだが、この実行環境ではworktree外のGit管理領域のindex.lock書込みが拒否され、
+next-tileへのmaster取込みは未実施。検証実数と残工程は設計書§19へ記録する。
 
 ### 2026-10-12 §1.340: 画像窓内ページ一覧の設計提出（構造合意待ち、コード変更なし）
 

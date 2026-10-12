@@ -1,10 +1,10 @@
 # 画像閲覧中の本のページ一覧（§1.340）設計
 
 作成: 2026-10-12 / Codex、基準: `next-tile` / `ea060b66e`。
-状態: **R5 `a3bb1775b` は独立レビュー ACCEPT（P1/P2/P3なし）、独立Codex reviewer／ClaudeCode双方の構造合意済み。T1実装・検証・独立レビュー完了。T2のPDF scoped APIの限定設計を§18へ提出し停止。**
+状態: **R5 `a3bb1775b` は双方の構造合意済み。T1 `588fe1d76` は実装・検証・独立ACCEPT。非PDF先行chunkも独立ACCEPT、検証・確認build済み。§1.377はmaster統合済み、next-tileへのmaster取込み待ちでPDF／EPUB接続は未完了。**
 改訂 R5: R4 `7d0d0cf0a` の再レビュー REVISE（P1 1件）と2026-10-12の利用者／coordinator判断を反映。
 既定キーは **O（Overview）で確定**。一覧からの選択は当該viewerの通常ページ移動と同じ扱いにする。
-利用者の指示により§10のT1→T5で実装する。検証・未解決事項は§17へ記録する。
+利用者の指示により§10のT1→T5で実装する。T1記録は§17、現行の検証・未解決事項は§19へ記録する。
 R3 の非アクティブ context への Select 破棄・一覧維持の契約は保持する。
 公開時期は v4.6.0 の次の版の**後**。次の版の必須成果にはしない。
 項目・出典・時期の正本は [next-release-backlog.md §1.340](next-release-backlog.md#1340-複数ウィンドウの画像ウィンドウ内に本のページをタイル表示する--miv-スレ-509519-2026-10-07)。
@@ -459,7 +459,9 @@ keep は既存 grid／閲覧／hover consumer と exact demand の和である�
 
 新規 enqueue は可視範囲を優先し、frame 内の新規要求を最大 32 件／経過 2ms の準備予算で分割する案。
 これは生成 worker を UI 上で待たせる timeout ではない。request の file／archive／DB 解決は worker。
-GPU upload は既存 thumbnail の **全 consumer 合計 8 枚/frame**を上限にし、tile 用に別枠を追加しない。
+GPU upload は同一viewer contextの全thumbnail consumerで既存の **8枚/poll frame**を共有し、
+tile用の追加poll／別枠を作らない。mainとactive detachedなど複数contextの既存poll予算は維持する。
+App-globalの新しいbudget ownerや、兄弟の従来描画を遅らせる変更はこの項目へ追加しない。
 texture 作成の時間は budget 化された既存 upload 境界に限る。描画中の非制限 upload は禁止する。
 cache／生成サイズは既存 thumbnail 設定を使い、動画タイルの 640px 常時抽出は導入しない。
 一覧の列数で main の `display_px_shared` や grid 設定を変えない。拡大時は既存 origin の
@@ -519,12 +521,15 @@ R5 `a3bb1775b` は独立レビューACCEPT、通常fullscreen／メイン内閲�
 | chunk | 予定する内容／主なファイル |
 | --- | --- |
 | T1 | 純粋な overview state／layout／canonical target adapter、`src/page_overview.rs`（仮称）、`src/lib.rs`。構成の型は既存正本を利用 |
-| T2 | bundle mount/swap/fork/retire と bounded demand 一般化、`src/app.rs`、`src/app/viewer_context_registry.rs`、`src/thumb_loader.rs`。必要時の PDF scoped API は別レビューしてから |
+| T2 | bundle mount/swap/fork/retire と bounded demand 一般化、`src/app.rs`、`src/app/viewer_context_registry.rs`、`src/thumb_loader.rs`。PDF部分は§1.377をmaster経由で取り込んでから既存owner-scoped APIへ接続（§18）。非PDF部分は先行可能 |
 | T3 | 通常fullscreen／root embedded／detached active／passive／backstopの共通表示・surface入力所有・identified activation command、`src/ui_page_overview.rs`（仮称）、`src/ui_fullscreen.rs`、`src/app/detached_window_manager.rs`。placement・host 捕捉は変更しない |
 | T4 | KeyAction/context／入口／ring/gamepad／headless snapshot、`src/keymap.rs` と既存 command availability・`src/app/gamepad_input.rs` 等。新しい独立 raw-key handler は作らない |
 | T5 | 文書・回帰・最終 gate。`docs/keymap-spec.md`、`docs/keymap.ini.default`、display/async 正本、`spec.md`、`htdocs/mimageviewer/`、detached ship checklist を実装の仕様に更新 |
 
 T1〜T4 は内部の確認可能な chunk で、部分機能を公開する計画ではない。
+2026-10-12 coordinator指示により、§1.377待ちの間はT2の非PDF owner／metadataとT3／T4の
+非PDF UI・O・入力・snapshot、T5のマニュアルを先行する。PDFの昇格・ticket／再評価接続と
+PDF／EPUB回帰は統合後に実施する。部分実装の段階でPDF対応や全機能完成を主張しない。
 所有境界が想定より大きくなる、既存入力を失う、構成の契約と矛盾する場合は実装を止め、
 範囲と費用を lead／利用者へ返す。detachedリワークのステージR4の代わりに症状 guard や App-global flag を足さない。
 
@@ -768,68 +773,145 @@ UI glyph／snapshot実行0回、製品起動0回、コミット0回、CHANGELOG�
 停止時の文書差分は `git diff --check` 成功、新規ローカルリンク4箇所・参照先欠落0。
 §17／§18と索引・backlog・detached§11の記録を独立reviewerが確認し、追加指摘0件。
 
-## 18. T2 PDF queued promotionの限定設計（2026-10-12、ClaudeCode側の合意待ち）
+## 18. T2 PDF昇格は§1.377の既存owner-scoped APIへ接続する（2026-10-12決定）
 
-### 18.1 確認した前提不足と停止根拠
+### 18.1 coordinator判断と確認した既存修正
 
-§8.2の「scoped queued prune／promotionに必要な相関が現行APIに足りなければ、その所有境界の
-限定修正を独立レビューへ返す」、§10 T2の「必要時のPDF scoped APIは別レビューしてから」に該当する。
-既存のAPIをそのままoverviewへ接続すると、同じPDFの同ページを読む兄弟／Remoteの仕事にも作用する。
-通常操作で到達する所有境界であり、まれな失敗として割り切るものではない。
+T1は利用者が `588fe1d76` としてコミットした。以前の§18で提案したcancel Arc identityの
+別APIは**撤回し、実装しない**。coordinatorは同じ所有問題が§1.377の
+`mimageviewer-nexteffetune` / `next-effetune`、`4510346f5` で修正済み・独立ACCEPTと確認した。
+`git show 4510346f5` と同commitの `docs/pdf-render-epoch-ownership-plan.md`（R2）、
+`src/pdf_loader/render_epoch.rs`／`src/pdf_loader.rs`／`src/app.rs` を読むだけで照合した。
+next-effetune側の編集・build・test・mergeは行っていない。現在のnext-tileのHEADには未統合。
 
-静的確認した経路（今回PDF製品コードは変更していない）:
+§1.377がmasterへ入った後、masterをnext-tileへ取り込んでその正本・APIを利用する。
+同commitのcherry-pickや別実装、仮のUnscopedでの迂回はしない。
 
-- `src/app.rs::ensure_still_seek_thumbnail_requests`はPDF page keyだけで
-  `pdf_loader::promote_to_high_normal`を呼ぶ。APIはcontext／request ownerを受け取らない。
-- `src/pdf_loader.rs::PdfWorkerPool::promote_to_high_normal_impl`は全Normal／HighNormal laneを
-  perf_keyだけで走査・昇格・並べ替えする。同keyの別context jobも対象になる。
-  `PromoteScope`はGridVisible／FullscreenCurrentという用途区別で、context所有者ではない。
-- `Job.cancel`はworkerのcontext cancel Arcから `thumb_loader`のPDF render、
-  `pool.execute`を経てcloneされたArcを保持する。bool値ではなくArcのidentityで識別できる。
-- ensureはApp-globalの `last_promoted_visible_keys`／`promote_retry_pending`も書き、
-  Grid bookkeepingは同じmemoを読む／更新してunscoped APIを呼ぶ。
-  この2フィールドはViewerContextBundleのswap対象ではないため、単一callの差し替えだけでは不足する。
+### 18.2 利用する所有・昇格契約
 
-### 18.2 提案する限定境界
+- 非Clone `PdfRenderEpochOwner` はApp投影／ViewerContextBundleとともに移譲される。
+  `snapshot()` のimmutable `PdfRenderEpochTicket`はowner identityと要求世代を保持する。
+  `PdfRenderValidity::Viewer(ticket)` と既存perf_keyの双方をqueueの照合入力にする。
+- `pdf_loader::promote_to_high_normal(keys, target)` とAppの既存
+  `promote_viewer_pdf_keys` を利用する。Normal／HighNormalの対象判定、found／already_highは
+  **同じowner・同じcurrent要求世代・同key**へ限定される。兄弟／旧世代／Unscopedは一致しない。
+  対象外jobのpriorityと相互順、Critical／in-flight、lane cap／予約方針は既存契約を維持する。
+- 旧global `last_promoted_visible_keys`／`promote_retry_pending`は§1.377で
+  `PdfVisiblePromotionState::Idle | Tracking { ticket, keys, retry_needed }`へ置換され、
+  bundleへ分類済み。overviewもこのcontext-local追跡と既存の遅着再評価を使い、
+  poolのjob ticketをfresh化せず、新しいretry map／timer／ACK／別ownerを作らない。
+- fullscreen本体用の `promote_fullscreen_to_high_normal` はUnscoped専用。
+  fullscreenで表示するoverview／stripのthumbnailもViewer側へ渡し、本体用APIへ流さない。
+  closeはforeground新規需要の撤回であり、render owner全体のadvance／retireではない。
+- 単一foreground exact demand dispatcher、局所queued pruneのrequest ID、Pixels／Finalized、
+  EPUB lease／RAW派生の契約は§8を維持する。§1.377のticket継承を破るproducerを作らない。
 
-既存unscoped APIの互換性は保ち、foreground exact demand用に
-`promote_to_high_normal_for_owner(keys, owner_cancel: &Arc<AtomicBool>)`（名称案）を追加する。
-owner引数をoptionalにせず、queued jobの**perf_key一致 AND cancel Arcの`Arc::ptr_eq`一致**で対象を決める。
-同じbool値でも別Arc、cancelなし、同keyの兄弟／Remoteは対象外。context epochをownerの代用にしない。
-
-- 対象ownerのqueued NormalをHighNormalへ昇格し、対象ownerのHighNormal内では現需要を優先する。
-  対象外jobのpriorityと対象外同士の相対順を保持する。追加された自contextの仕事が共有poolで
-  schedulingされることまで禁止するものではない。
-- `already_high`／`not_found_keys`も対象ownerのjobだけで計算する。
-  pool未初期化時には従来同様起動せず、対象keysを未発見として返す。
-- Critical／取得済みin-flight／completed、epoch、取消tokenの値、prune／reply／保存終端は変更しない。
-  cancel Arcは識別に使うだけで、overview close時に立てない。context tokenの新設も不要。
-- T2の単一foreground dispatcherは、最初の昇格とworker enqueue後の再評価を同じowner付きAPIへ揃える。
-  overviewのkeys／未発見状態を既存App-global Grid memoへ書かず、bundleが所有する
-  foreground exact demandの生命周期内に収める。Gridの既存unscoped callや共有memoへoverviewの
-  再昇格を委譲しない。park／swap／fork／retireでもownerと需要が一緒に扱われることを検査する。
-
-新たなpool／queue／Job ownerフィールド、全窓epoch失効、広域取消、retry機構を増やす案は採らない。
-既存cancel Arcを使い、既存の需要ownerへ再評価を揃える方が状態の組合せを減らせるため。
-局所queued pruneのrequest ID／Pixels／Finalized契約は§8.2のまま。
+これにより§18旧案の追加API・cancel identityによる第二の所有判定は不要となる。
+PDF所有のstructural reviewは§1.377の承認済み境界を再利用し、統合後のoverview接続を完了レビューする。
 **まれな失敗は割り切り（ログ + 通知 [+ 作り直し]）**を維持する。
 
-### 18.3 限定レビューと次の検証
+### 18.3 先行作業と統合後の回帰
 
-独立 `gpt-6.1-sol` / `xhigh` reviewerは上記のAPI前提不足を確認し、
-mandatory-ownerのkey AND cancel Arc identityという限定構造案へ合意した。
-T1 ACCEPTやR5全体合意を、この追加境界のClaudeCode側合意・実装レビューと取り違えない。
-**ClaudeCode側へ本節の限定境界とforeground再評価の接続条件を返し、合意確認までT2を実装しない。**
-製品コードでPDF queueの所有境界を変える前の停止であり、公開済み操作は変更していない。
+利用者はPDF昇格に依存しない非PDF UI・O・入力・snapshot・マニュアルの先行を許可した。
+T2全体を停止する旧記録を現行状態とせず、§10の先行順で作業を継続する。
+PDF／EPUBの要求経路を旧unscoped APIへ接続して完成扱いにすることはない。
 
-合意後のtargeted regression:
+master取り込み後は実際のAPI差分・bundle分類を照合し、以下をoverview接続の回帰として実施する:
 
-1. 同key・同bool値の別ArcのA／B／Remote、cancelなしを混在させ、AだけNormal昇格／HighNormal並べ替え。
-   非対象priority／相互順序とCritical／in-flightが不変、statsもAだけから算出されること。
-2. 同じownerのArc cloneは一致し、keys空／pool未初期化では新規仕事やpool起動がないこと。
-3. A demandをpublish→worker enqueue後の再評価、A park→B mount／同key demand→A resumeを通し、
-   owner memo／keysが漏れず、再評価もscopedで、Gridのmemoでoverview需要が再投入されないこと。
-4. overview close／再入場・fork／retireと局所prune／Finalizedを通し、兄弟の仕事は保持されること。
+1. 同PDF/pageでA／B／Remote／Unscoped／旧A世代を混在させ、overview Aの昇格／foundがAだけへ作用。
+2. B同key先着→A overview昇格未着→A遅着の再評価と、同keyの世代変更でdedupが旧statsを持ち越さない。
+3. A open→park→B mount→A resume、fork／retireでticketと昇格追跡の既存移譲が保たれる。
+4. overview close／再入場・局所prune／Finalized、PDF／EPUBの論理source／lease、兄弟非干渉。
 
-PDF scoped API／dispatcher接続は未実装、上記4群の実行済みtestは0件。
-T2ではこのregressionと既存thumbnail request／viewer context回帰、fmt、通常／portable checkを実施する。
+§1.377の有効なtest証拠は再利用し、overview接続のtargeted tests・fmt・通常／portable checkを追加する。
+実機のPDFium／focus／性能の成功はheadless検証だけから主張しない。
+
+## 19. 非PDF先行実装と検証記録（2026-10-12）
+
+T2の非PDF需要／context接続、T3のactive／passive描画、T4のO・入力を実装し、T5の
+snapshot／マニュアルを更新した。PDF／EPUB要求・owner-scoped昇格接続は§18の取込み後に残る。
+機能全体の最終gate・native実機受入は未完了であり、非PDF先行chunkの完了と区別する。
+
+- `src/app/page_overview.rs`／`detached_page_overview.rs`、registry／manager／App:
+  contextのClosed／Open owner、worker準備のcanonical metadata、stamped command、実active資格、
+  有界holdover／VRAM投影、park／resume／fork／retireを既存境界へ接続した。
+- `src/ui_page_overview.rs`／`ui_fullscreen/page_overview.rs`／fullscreen／main:
+  共通仮想layout／描画、RTL、単クリック、列数、現在ページ・cursor・placeholder、strip相互排他。
+  passiveは全列metadataを共有し、現在rect／DPIのidentityで最初の入力を捕捉する。
+  geometry cacheはowner stamp単位で、F11／連動F12の同context移動後もcursor anchorをreflowする。
+  Select／取消で一覧shellを退出したら既存Closed／Rebased transitionで後続描画を再準備し、
+  同passの通常入力を二度処理しない。pointerとUI「×」は実際のviewer surfaceの資格を使う。
+- thumbnailのforeground exact需要をstripと共用し、可視セルをoverscanより先に扱う。
+  局所queued pruneは同contextのrequest ID／RAW ticketだけへ作用する。
+  rootでは既存Gridの保持帯・touch残量・VRAM制限を同じgeometry計算で保持する。
+  worker取得済みのPixels／Finalizedは従来の所有を維持する。
+- `src/keymap.rs`／ring／pad／設定UI、default ini／keymap spec:
+  Oと一覧Action群のini_name／context／trigger／default_chords／ALL_ACTIONSを揃え、
+  有限実行可能集合をdispatch・競合・help・ringへ共有した。S／Shift+S／Ctrl+Sは維持する。
+- snapshotはlight／dark／狭窓light／狭窓dark／RTL／白紙補助の6枚。
+  白紙annotationのfixtureは§1.242未統合のadapter契約を検査し、現行sourceからの構成採用を主張しない。
+  マニュアルはfullscreen／shortcuts／gamepadを更新し、バージョン表記・CHANGELOGは追加しない。
+
+独立 `gpt-6.1-sol`／`xhigh` 完了レビューは非PDF coherent chunkに **ACCEPT、P1/P2/P3なし**。
+最後のtyped transition、actual-surface入力、owner単位geometry cache、readonly API監査指紋も確認済み。
+§8.3の既存contextごとのupload予算の明確化にも合意した。
+reviewerは静的確認のみで、Cargo／build／製品起動を重ねていない。
+detached計画§11へ双方の構造合意と接続範囲を記録した。
+
+再開時の82件中1件の失敗は、新しいEsc回帰がnative edgeだけを注入し、既存の固定egui Esc入力を
+注入していなかったtest fixtureを修正したもの。製品側にnative Escの別経路を追加していない。
+keymap全体の検証で見つけたリング台帳の登録漏れも、KeyAction-backed分類へ1項目追加した。
+先行chunkの現行差分に対する検証（filter間の重複を合算しない）:
+
+| 最終検証 | 実数／結果 |
+| --- | --- |
+| lib `overview` | 82 passed、0 failed、0 ignored、12,184 filtered out |
+| lib `keymap::tests` | 156 passed、0 failed、0 ignored、12,110 filtered out |
+| lib `still_seek_thumbnail_ownership` | 18 passed、0 failed、0 ignored、12,248 filtered out |
+| lib `viewer_context_registry` | 81 passed、0 failed、0 ignored、12,185 filtered out |
+| `ui_snapshot page_overview` 比較 | 6 passed、0 failed、0 ignored、157 filtered out |
+| `viewer_context_audit` tests | 36 passed、0 failed、0 ignored（bin／doc tests各0件） |
+| `cargo run --locked -p viewer_context_audit` | exit 0、残指摘／known findings 0 |
+| `cargo fmt --check` | exit 0 |
+| 通常core check | exit 0、46.09秒、警告あり |
+| portable core check | exit 0、1分43秒、警告あり |
+| test-script core check | exit 0、2分02秒、警告あり |
+| UI glyph検査 | exit 0、dangerous glyphs 0 |
+| 文書／manual参照検査 | 差分関連28参照、欠落file／anchor 0、version追加0 |
+| `build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | process-local `CARGO_BUILD_JOBS=1`でexit 0。本体29分39秒、remote 7分03秒、EPUB worker 4分47秒 |
+| 付属runtime／PE検査 | runtime 4件／PE 3件、成功。FFmpeg DLL6／VC runtime DLL4／EffeTune bundleを配置 |
+| 最終test-full／release build／製品起動／コミット | 各0回。test-fullはPDF／EPUB接続後の最終gateに残す |
+
+snapshotは生成時も6 passedで、6枚すべて目視確認した後、上記の通常比較を通した。
+新規PNGは6枚・合計223,772bytes。`target/page-overview-*-final.log` と
+`target/page-overview-targeted-r9.log`へログを保存する。
+変更46ファイル（36変更・新規Rust4・PNG6）の一覧は `target/page-overview-handoff-files.txt`。
+
+§1.377 `4510346f5` はmasterへ統合済み。next-tileのHEADは `588fe1d76` のままで、
+Gitのindex.lockがworktree外の `C:/home/mimageviewer/.git/worktrees/mimageviewer-nexttile/` にあり、
+この環境の書込み権限ではmaster取込みが拒否された。追跡sourceの復元・mergeは実行されていない。
+外部Git管理領域を迂回した別API・cherry-pick・Git設定差替えは行わない。
+coordinatorが未コミット差分を保持してmasterを取り込んだ後、§18.3回帰、PDF／EPUB接続、
+各chunkのtargeted tests／fmt／通常・portable checkを行い、最後にtest-fullを1回だけ実施する。
+release固有処理の変更はなく、release buildは現段階で必要としない。
+確認用buildは通常profileのbuild-devを使い、製品を起動しない。
+
+確認buildの環境検証: 初回のログ用`*>`リダイレクトはPowerShellのStopによる通常stderrの
+エラー化で停止したため、scriptをplainに呼び直した。cold dev-runtimeのTurboJPEG native buildは
+Cargo／CMakeの24ジョブ実行でexit 101を再現し、同じ出力ディレクトリ・同じ設定の
+`cmake --build ... --target install --config RelWithDebInfo --parallel 1` は4分55秒、
+警告0／エラー0で成功した。確認buildだけprocess-localの `CARGO_BUILD_JOBS=1` を指定し、
+その環境変数は実行後に戻す。source／Cargo設定／build script／feature／profileを変更しない。
+診断ログは `target/page-overview-dev-core-diagnostic.log` と `target/page-overview-turbojpeg-msbuild.log`。
+成功した確認buildの収集出力は `target/page-overview-build-dev-tool-output.log`（途中のtool出力省略あり）、
+PE検査の正本は `target/vcrt-pe-reports/dev-runtime.json`。
+通常featureで生成した3実行ファイルは `target/dev-runtime/` に置いた。
+core 325,357,568bytes、remote 12,786,688bytes、EPUB worker 3,125,248bytes。
+いずれも生成後に起動していない。通常の `%APPDATA%/mimageviewer` profileを既定で使用するため、
+利用者にはinstalled／tray常駐版を先に閉じ、実設定／dataを更新し得ることを伝えて手動起動してもらう。
+
+確認用binaryで利用者が検査する非PDFケースは、画像／ZIP画像のOと「…」入口、一覧中の
+Grid不変と取消、選択後の通常Grid追従／独立窓のmain非干渉、S休止／再開、単ページRTL、
+park→resize／DPI変更→新たに露出したplaceholderの一クリック選択、F11／連動F12のreflow、
+独立静止画窓のF12無効、AへEnter配送→B復帰→AのSelect破棄・Bのactive/runtime/foreground不変。
+headlessでnative HWND／z-order／実PDFium／実機性能を確認済みとはしない。
