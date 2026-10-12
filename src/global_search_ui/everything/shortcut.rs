@@ -70,6 +70,141 @@ mod tests {
     }
 
     #[test]
+    fn everything_ctrl_r_reopen_selects_previous_query_and_typing_replaces_it() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::lock_test_input();
+        #[cfg(windows)]
+        let _clear = ClearKeyFrame;
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        crate::ime_focus::install_ime_input_policy(&ctx);
+
+        fn draw(ctx: &egui::Context, app: &mut App) -> egui::Id {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                super::super::ui::draw_everything_controls(
+                    ui,
+                    &mut app.global_search.query,
+                    &mut app.global_search.focus_request,
+                );
+            });
+            ctx.memory(|memory| memory.focused()).unwrap()
+        }
+
+        app.open_everything_search();
+        for (previous, replacement, ime) in [("mist", "mist", false), ("日本語🍀", "検索", true)]
+        {
+            app.global_search.query = previous.into();
+            ctx.begin_pass(egui::RawInput::default());
+            let id = draw(&ctx, &mut app);
+            let mut state = egui::TextEdit::load_state(&ctx, id).unwrap();
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::one(
+                    egui::text::CCursor::new(previous.chars().count()),
+                )));
+            state.store(&ctx, id);
+            ctx.memory_mut(|memory| memory.surrender_focus(id));
+            let _ = ctx.end_pass();
+
+            key_pass(
+                &ctx,
+                egui::Key::R,
+                egui::Modifiers::CTRL,
+                Some(main_owner()),
+            );
+            assert!(
+                app.dispatch_everything_search_shortcut(&ctx),
+                "reopen {previous}"
+            );
+            let id = draw(&ctx, &mut app);
+            let selection = egui::TextEdit::load_state(&ctx, id)
+                .unwrap()
+                .cursor
+                .char_range()
+                .unwrap()
+                .as_sorted_char_range();
+            assert_eq!(selection, 0..previous.chars().count());
+            assert!(!app.global_search.focus_request);
+            assert!(
+                app.global_search.pending.is_none(),
+                "reopen must not send IPC"
+            );
+            let _ = ctx.end_pass();
+
+            let mut events = if ime {
+                vec![
+                    egui::Event::Ime(egui::ImeEvent::Enabled),
+                    egui::Event::Ime(egui::ImeEvent::Preedit(replacement.into())),
+                    egui::Event::Ime(egui::ImeEvent::Commit(replacement.into())),
+                    egui::Event::Ime(egui::ImeEvent::Disabled),
+                ]
+            } else {
+                vec![egui::Event::Text(replacement.into())]
+            };
+            events.insert(
+                0,
+                egui::Event::Key {
+                    key: egui::Key::R,
+                    physical_key: Some(egui::Key::R),
+                    pressed: false,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            );
+            ctx.begin_pass(egui::RawInput {
+                events,
+                ..Default::default()
+            });
+            draw(&ctx, &mut app);
+            assert_eq!(app.global_search.query, replacement);
+            let _ = ctx.end_pass();
+            ctx.begin_pass(egui::RawInput {
+                events: vec![egui::Event::Text("x".into())],
+                ..Default::default()
+            });
+            draw(&ctx, &mut app);
+            assert_eq!(
+                app.global_search.query,
+                format!("{replacement}x"),
+                "ordinary typing must not repeatedly select the query"
+            );
+            let _ = ctx.end_pass();
+            if ime {
+                // IME focus recovery uses the same latch as opening. It must
+                // keep the preedit selection rather than select the whole query.
+                app.global_search.focus_request = true;
+                ctx.begin_pass(egui::RawInput {
+                    events: vec![
+                        egui::Event::Ime(egui::ImeEvent::Enabled),
+                        egui::Event::Ime(egui::ImeEvent::Preedit("未".into())),
+                    ],
+                    ..Default::default()
+                });
+                let id = draw(&ctx, &mut app);
+                let selection = egui::TextEdit::load_state(&ctx, id)
+                    .unwrap()
+                    .cursor
+                    .char_range()
+                    .unwrap()
+                    .as_sorted_char_range();
+                let start = replacement.chars().count() + 1;
+                assert_eq!(selection, start..start + 1);
+                let _ = ctx.end_pass();
+                ctx.begin_pass(egui::RawInput {
+                    events: vec![
+                        egui::Event::Ime(egui::ImeEvent::Commit("確".into())),
+                        egui::Event::Ime(egui::ImeEvent::Disabled),
+                    ],
+                    ..Default::default()
+                });
+                draw(&ctx, &mut app);
+                assert_eq!(app.global_search.query, format!("{replacement}x確"));
+                let _ = ctx.end_pass();
+            }
+        }
+    }
+
+    #[test]
     fn everything_shortcut_dispatch_opens_once_and_honors_rebind_and_none() {
         #[cfg(windows)]
         let _serial = crate::key_input::lock_test_input();

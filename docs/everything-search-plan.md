@@ -616,3 +616,26 @@ worktree内coreプロセス0を確認し、`scripts/build-dev.ps1 -PreserveRunti
 normal featureのdev-runtime core、Remote service、EPUB PDF workerとVCRT確認を完了した。
 core更新日時は2026-10-12 05:50:41、サイズ325,166,592 bytes。mIVの起動は行わず、未コミットで引き渡す。
 ログ、実probeの失敗観測、隔離data-dirの利用者確認手順は`target/EV-1374-impl-msg.txt`へ記録した。
+
+## 18. 実機確認と検索欄の再表示（2026-10-12）
+
+coordinatorが隔離データで実機確認を実施。未起動・索引準備中・60秒応答timeoutの案内、
+取消、キー入力の解放、元一覧の保持は設計どおり。応答するEverythingで `mist` は
+184,914件中10,000件取得、9,825件表示、取得から表示まで約3秒（classify 2.16秒）。
+結果からfullscreenを開き、Escで一覧へ戻る動作も確認済み。
+これは利用者から引き継いだ確認結果であり、実装agentがアプリを起動した記録ではない。
+
+再表示時は既存focus requestだけでcaret位置が残り、入力が前の検索語に追加されていた。
+Everything controlsはIME helper経由のTextEditに対し、再表示のfocus request時に文字数で
+全選択し、TextEdit stateへ保存する。IME active中の同latchによるfocus recoveryでは
+compositionの選択を変更しない。別のpending fieldや選択ownerを追加せず、通常passで再選択しない。
+Ctrl+R handler→実controls→次passの文字入力の回帰で `mist` の置換、Unicode文字範囲、
+IME確定、通常の続き入力、IPCを送信しないことを確認する。
+
+master `71e6b4c83` のincoming 17ファイルを共通ancestorから衝突なく作業ツリーへ展開した。
+共通git管理領域への書込み禁止によりmerge metadataは未作成。coordinator向けの通常mergeへの
+引継ぎ手順と検証logは `target/EV-1374-impl-msg.txt` に記録する。
+統合後のfmt・通常/portable check・Everything/検索/IME焦点テスト・検索バーsnapshotに成功。
+`test-full.ps1` を1回実行し、workspaceとvendor 3 crateがPASS（本体lib 12,214 passed / 0 failed / 57 ignored）。
+最後に `build-dev.ps1 -PreserveRuntime` を完了し、normal featureのcore/Remote/EPUB workerを構築。
+未コミットで引き渡す。agentによるmIVのUI起動は行っていない。

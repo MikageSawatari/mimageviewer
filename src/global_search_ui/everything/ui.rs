@@ -30,11 +30,24 @@ pub(super) fn draw_everything_controls(
         };
         let reserved = button_width("検索") + button_width("×") + ui.spacing().item_spacing.x * 3.0;
         let width = (ui.available_width() - reserved).clamp(80.0, 420.0);
+        // The same latch is also used by the IME helper for focus recovery.
+        // Select on opening, but preserve an active composition's selection.
+        let select_query = *focus_request && !crate::ime_focus::ime_input_active(ui.ctx());
         let mut output =
             crate::ime_focus::show_singleline(ui, query, Some(focus_request), |edit| {
                 edit.hint_text("ファイル名・Everything 構文 (ext:jpg;png など)")
                     .desired_width(width)
             });
+        if select_query {
+            let range = egui::text::CCursorRange::two(
+                egui::text::CCursor::new(0),
+                egui::text::CCursor::new(query.chars().count()),
+            );
+            output.state.cursor.set_char_range(Some(range));
+            output.state.clone().store(ui.ctx(), output.response.id);
+            output.cursor_range = Some(range);
+            ui.ctx().request_repaint();
+        }
         crate::ui_helpers::singleline_text_edit_context_menu(ui, &mut output, query);
         controls.has_focus = output.response.has_focus();
         controls.lost_focus = output.response.lost_focus();
