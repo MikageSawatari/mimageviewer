@@ -24552,24 +24552,6 @@ impl App {
                         );
                     }
                 }
-                // IME 変換確定の Enter が multiline 本文欄 (セリフ) に改行として入るのを防ぐ
-                // (egui の既知挙動。実機 FB 2026-06-06)。変換確定自体は Ime::Commit が行うので、
-                // IME がアクティブ (変換中 or 直近 300ms に Ime イベント = Windows の別フレーム
-                // 配信吸収) の間は raw な Key::Enter を除去する。非変換時の Enter は通るので
-                // 意図的な改行は可能。テキスト注釈モードの本文編集中のみに限定する。
-                if self.text_mode && self.ime_input_active(ctx) {
-                    ctx.input_mut(|i| {
-                        i.events.retain(|e| {
-                            !matches!(
-                                e,
-                                egui::Event::Key {
-                                    key: egui::Key::Enter,
-                                    ..
-                                }
-                            )
-                        });
-                    });
-                }
                 if need_show && !embedded {
                     // embedded のときは専用 viewport を作らないので Visible/Focus は
                     // 送らない (main ウィンドウは既に表示・フォーカス済み)。
@@ -84517,6 +84499,139 @@ mod specified_scale_consumer_tests {
     }
 
     #[cfg(windows)]
+    fn run_text_mode_annotation_ime_enter(same_pass: bool) {
+        use comic_core::{AnnotationObject, TextBlock};
+
+        let ctx = egui::Context::default();
+        install_fs_navigator_input_tracking(&ctx);
+        crate::ime_focus::install_ime_input_policy(&ctx);
+        let mut app = pdf_app(&ctx, 1);
+        app.items[0] = GridItem::Image(app.tmp.path().join("annotation-ime.png"));
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        app.native_video_in_window_active = true;
+        app.text_mode = true;
+        app.text_selected = Some(1);
+        app.text_selected_ids = vec![1];
+        // This fixture exercises input in the real annotation panel, without font loading/baking.
+        app.comic_font_registry_loaded = true;
+        app.comic_fonts_loaded = true;
+        app.comic_presets_loaded = true;
+        let page_key = app.page_path_key(0).unwrap();
+        app.comic_docs.insert(
+            page_key.clone(),
+            vec![AnnotationObject::new_text(
+                1,
+                (100.0, 100.0),
+                TextBlock {
+                    text: String::new(),
+                    markup_enabled: false,
+                    ..Default::default()
+                },
+            )],
+        );
+        let edit_id = egui::Id::new(("comic_text_edit", 1_u64));
+        let draw = |app: &mut App, events, time, expect_grace| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200.0, 800.0),
+                    )),
+                    events,
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |ctx| {
+                    app.update_ime_state(ctx);
+                    if expect_grace {
+                        assert!(app.ime_input_active(ctx), "exercise Enter within IME grace");
+                    }
+                    // Includes fullscreen input handling and src/ui_text.rs's actual body TextEdit.
+                    app.render_fullscreen_viewport(ctx);
+                },
+            );
+            assert!(app.text_mode);
+            assert_eq!(app.fullscreen_idx, Some(0));
+        };
+        for pass in 0..4 {
+            draw(&mut app, vec![], pass as f64 / 60.0, false);
+        }
+        assert!(egui::TextEdit::load_state(&ctx, edit_id).is_some());
+        ctx.memory_mut(|memory| memory.request_focus(edit_id));
+        draw(&mut app, vec![], 0.1, false);
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(edit_id));
+        draw(
+            &mut app,
+            vec![
+                egui::Event::Ime(egui::ImeEvent::Enabled),
+                egui::Event::Ime(egui::ImeEvent::Preedit("にほん".into())),
+            ],
+            0.2,
+            false,
+        );
+        let body = |app: &App| {
+            app.comic_docs[&page_key][0]
+                .text_block()
+                .unwrap()
+                .text
+                .clone()
+        };
+        assert_eq!(body(&app), "にほん");
+        let enter = |pressed| egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: Some(egui::Key::Enter),
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        // The observed egui-winit sequence for commit. Process press is suppressed at the bridge;
+        // empty native Preedit arrives as Disabled, and the physical Enter release still arrives.
+        let mut commit = vec![
+            egui::Event::Ime(egui::ImeEvent::Disabled),
+            egui::Event::Ime(egui::ImeEvent::Commit("日本".into())),
+            egui::Event::Ime(egui::ImeEvent::Disabled),
+            enter(false),
+        ];
+        if same_pass {
+            commit.push(enter(true));
+            draw(&mut app, commit, 0.3, true);
+        } else {
+            draw(&mut app, commit, 0.3, true);
+            assert_eq!(
+                body(&app),
+                "日本",
+                "IME commit itself must not insert a newline"
+            );
+            assert_eq!(ctx.memory(|memory| memory.focused()), Some(edit_id));
+            draw(&mut app, vec![enter(true)], 0.335, true);
+        }
+        assert_eq!(
+            body(&app),
+            "日本\n",
+            "the next ordinary Enter inserts one newline"
+        );
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(edit_id));
+        draw(&mut app, vec![enter(false)], 0.35, false);
+        assert_eq!(
+            body(&app),
+            "日本\n",
+            "release cannot insert another newline"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn text_mode_annotation_ime_commit_and_next_enter_same_pass_inserts_newline() {
+        run_text_mode_annotation_ime_enter(true);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn text_mode_annotation_ime_commit_and_next_enter_separate_passes_inserts_newline() {
+        run_text_mode_annotation_ime_enter(false);
+    }
+
+    #[cfg(windows)]
     fn run_specified_scale_real_numeric_ime_popup(key: egui::Key, size: egui::Vec2) {
         let ctx = egui::Context::default();
         install_fs_navigator_input_tracking(&ctx);
@@ -84604,48 +84719,24 @@ mod specified_scale_consumer_tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         };
-        draw(&mut app, vec![key_event(true)]);
-        assert_eq!(
-            app.fullscreen_idx,
-            Some(0),
-            "composition {key:?} must not close fullscreen"
-        );
-        assert!(
-            app.fit_popup_open,
-            "composition {key:?} belongs to the numeric editor"
-        );
-        if key == egui::Key::Escape {
-            assert_eq!(ctx.memory(|memory| memory.focused()), Some(edit_id));
-            draw(&mut app, vec![key_event(false)]);
+        // The IME consumes the press. egui-winit forwards only IME events and the release.
+        let end_events = if key == egui::Key::Enter {
+            vec![
+                egui::Event::Ime(egui::ImeEvent::Disabled),
+                egui::Event::Ime(egui::ImeEvent::Commit("125".into())),
+                egui::Event::Ime(egui::ImeEvent::Disabled),
+                key_event(false),
+            ]
         } else {
-            // DragValue's numeric TextEdit ends on Enter. That is widget-local,
-            // not a fullscreen close; start another real edit for commit ordering.
-            assert_ne!(ctx.memory(|memory| memory.focused()), Some(edit_id));
-            draw(
-                &mut app,
-                vec![egui::Event::Ime(egui::ImeEvent::Disabled), key_event(false)],
-            );
-            output = draw(&mut app, vec![]);
-            let number = painted_label(&output, "80.0").unwrap();
-            draw(&mut app, click(number.center()));
-            draw(&mut app, vec![]);
-            assert_eq!(ctx.memory(|memory| memory.focused()), Some(edit_id));
-            draw(
-                &mut app,
-                vec![
-                    egui::Event::Ime(egui::ImeEvent::Enabled),
-                    egui::Event::Ime(egui::ImeEvent::Preedit("１２５".into())),
-                ],
-            );
-        }
-        // Windows can deliver commit/disable before the same Enter/Esc edge.
-        // This crosses both the IME plugin and the App shortcut grace policy.
-        let end = if key == egui::Key::Enter {
-            egui::ImeEvent::Commit("125".into())
-        } else {
-            egui::ImeEvent::Disabled
+            vec![
+                egui::Event::Ime(egui::ImeEvent::Disabled),
+                egui::Event::Ime(egui::ImeEvent::Disabled),
+                egui::Event::Ime(egui::ImeEvent::Commit(String::new())),
+                egui::Event::Ime(egui::ImeEvent::Disabled),
+                key_event(false),
+            ]
         };
-        draw(&mut app, vec![egui::Event::Ime(end), key_event(true)]);
+        draw(&mut app, end_events);
         assert_eq!(
             app.fullscreen_idx,
             Some(0),
@@ -84656,11 +84747,21 @@ mod specified_scale_consumer_tests {
             "IME end + {key:?} must retain the popup"
         );
         assert!(app.ime_input_active(&ctx));
-        assert_ne!(
+        assert_eq!(
             ctx.memory(|memory| memory.focused()),
             Some(edit_id),
-            "numeric {key:?} ends the edit"
+            "IME {key:?} changes composition without ending numeric editing"
         );
+        assert_eq!(
+            ctx.data(|data| data.get_temp::<String>(edit_id)),
+            Some(if key == egui::Key::Enter { "125" } else { "" }.to_owned()),
+            "the real numeric TextEdit commits or clears its preedit"
+        );
+        // A subsequent ordinary press keeps DragValue's released Enter/Esc behavior.
+        draw(&mut app, vec![key_event(true)]);
+        assert_ne!(ctx.memory(|memory| memory.focused()), Some(edit_id));
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert!(app.fit_popup_open);
         let after = app.settings.common_fullscreen_specified_scale();
         if key == egui::Key::Enter {
             assert_eq!(

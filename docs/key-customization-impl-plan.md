@@ -568,8 +568,9 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
   `None` へ戻す。Tab traversal はアプリ全体で無効だが event は後段の Keymap まで残すため、
   Tab chord は引き続き任意の KeyAction へ割り当て可能。KeySlot と egui event queue の同一押下は
   Keymap ownership 境界で一緒に consume する。no-repeat の Tab repeat も発火させず除去する。
-  TextEdit / IME の keyboard owner gate は先に維持し、IME 中の field-level focus lock / 復帰と
+  TextEdit / IME の keyboard owner gate は先に維持し、矢印の field-level focus lock / 復帰と
   直前 pass の helper-managed field に対する `FocusRecovery` claim は `ime_focus` が別に所有する。
+  IME 処理済みの Process press は egui-winit が渡さず、helper の IME 専用 Tab lock は置かない。
   Hover side panel 内の helper field が実 focus を持つ間は panel lifetime も維持し、widget を描かなかった
   ことによる egui end-pass の dead-man focus clear を起こさない。これは非 IME の focus recovery ではなく、
   focus が別 widget へ移れば解除される。`[text-input-key]` の通常ログには helper field の id 継続、focus 前後、

@@ -775,6 +775,13 @@ impl State {
     }
 
     fn on_keyboard_input(&mut self, event: &winit::event::KeyEvent) {
+        // Windows reports keys consumed by the IME as Process (VK_PROCESSKEY).
+        // Do not turn their physical fallback into application keys, text, or
+        // clipboard commands. Releases remain available to clear held keys.
+        if !should_forward_keyboard_input(&event.logical_key, event.state) {
+            return;
+        }
+
         let winit::event::KeyEvent {
             // Represents the position of a key independent of the currently active layout.
             //
@@ -1094,6 +1101,89 @@ fn is_printable_char(chr: char) -> bool {
         || '\u{100000}' <= chr && chr <= '\u{10fffd}';
 
     !is_in_private_use_area && !chr.is_ascii_control()
+}
+
+fn should_forward_keyboard_input(
+    logical_key: &winit::keyboard::Key,
+    state: winit::event::ElementState,
+) -> bool {
+    state != winit::event::ElementState::Pressed
+        || *logical_key != winit::keyboard::Key::Named(winit::keyboard::NamedKey::Process)
+}
+
+#[cfg(test)]
+mod keyboard_input_tests {
+    use super::*;
+    use winit::{
+        event::ElementState,
+        keyboard::{Key, KeyCode, NamedKey},
+    };
+
+    #[test]
+    fn ime_process_press_is_not_forwarded() {
+        // The decision does not depend on physical key, text, modifiers, or
+        // repeat: it precedes every Key/Text/Cut/Copy/Paste producer.
+        assert!(!should_forward_keyboard_input(
+            &Key::Named(NamedKey::Process),
+            ElementState::Pressed,
+        ));
+    }
+
+    #[test]
+    fn releases_are_forwarded_including_process() {
+        for key in [
+            NamedKey::Process,
+            NamedKey::Enter,
+            NamedKey::Escape,
+            NamedKey::Tab,
+            NamedKey::Space,
+        ] {
+            assert!(should_forward_keyboard_input(
+                &Key::Named(key),
+                ElementState::Released
+            ));
+        }
+    }
+
+    #[test]
+    fn ordinary_named_keys_are_forwarded() {
+        for key in [
+            NamedKey::Enter,
+            NamedKey::Escape,
+            NamedKey::Tab,
+            NamedKey::Space,
+        ] {
+            assert!(should_forward_keyboard_input(
+                &Key::Named(key),
+                ElementState::Pressed
+            ));
+            assert!(key_from_winit_key(&Key::Named(key)).is_some());
+        }
+    }
+
+    #[test]
+    fn non_latin_physical_fallback_keeps_clipboard_commands() {
+        let logical = Key::Character("ж".into());
+        assert!(should_forward_keyboard_input(
+            &logical,
+            ElementState::Pressed
+        ));
+        assert_eq!(key_from_winit_key(&logical), None);
+        for (physical, expected) in [
+            (KeyCode::KeyX, egui::Key::X),
+            (KeyCode::KeyC, egui::Key::C),
+            (KeyCode::KeyV, egui::Key::V),
+        ] {
+            assert_eq!(
+                key_from_winit_key(&logical).or(key_from_key_code(physical)),
+                Some(expected)
+            );
+        }
+        let modifiers = egui::Modifiers::CTRL | egui::Modifiers::COMMAND;
+        assert!(is_cut_command(modifiers, egui::Key::X));
+        assert!(is_copy_command(modifiers, egui::Key::C));
+        assert!(is_paste_command(modifiers, egui::Key::V));
+    }
 }
 
 fn is_cut_command(modifiers: egui::Modifiers, keycode: egui::Key) -> bool {

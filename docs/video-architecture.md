@@ -348,8 +348,9 @@ Windows の owner rule (= owned は owner より常に手前) で、presenter HW
   presenter の egui Context にも App と同じ IME input plugin を登録し、composition state を
   viewport 単位で所有する。native event queue が次の egui pass を待つ間は、plugin snapshot に
   `pending_events` を read-only 投影して Ctrl+V/C/X と Enter/Esc の gate を決め、presenter-local な
-  composition bool / timestamp は持たない。変換中 Esc press の除去と空 preedit 補完は
-  plugin の RawInput 境界へ一本化する。
+  composition bool / timestamp は持たない。IME 処理済みの `VK_PROCESSKEY` は native key
+  変換で egui key にせず（winit 経路も Process press を遮断）、取消時の空 preedit 補完は
+  plugin の RawInput 境界へ一本化する。300ms grace と focus 復帰は維持する。
   Backspace / Space / Enter / 矢印 / F1〜F6 / W / J/K/L/M/B/P/S などの fullscreen ショートカットは、
   overlay 内のボタン focus が残っていても App 側へ転送する。ブックマーク名編集などの文字入力中だけは
   overlay 側がキーを保持し、Space を文字として入力できるようにする。
