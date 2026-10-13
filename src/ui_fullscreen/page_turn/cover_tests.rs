@@ -50,8 +50,10 @@ fn book(
         } else {
             [120, 170]
         };
-        let image =
-            egui::ColorImage::filled(dims, egui::Color32::from_rgb(40 + idx as u8 * 12, 100, 160));
+        let image = egui::ColorImage::filled(
+            dims,
+            egui::Color32::from_rgb((40 + idx * 12) as u8, 100, 160),
+        );
         let texture = ctx.load_texture(
             format!("cover-book-{idx}"),
             image.clone(),
@@ -105,6 +107,135 @@ fn cover_side(mode: SpreadMode) -> SingletonSpreadPlacement {
         SingletonSpreadPlacement::Left
     } else {
         SingletonSpreadPlacement::Right
+    }
+}
+
+#[test]
+fn page_turn_paged_prefetch_real_units_include_distant_cover_atomically() {
+    for mode in [SpreadMode::LtrCover, SpreadMode::RtlCover] {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::paged_prefetch_tests::pdf_book(&ctx);
+        app.spread_mode = mode;
+        for current in [19, 20] {
+            let plan = app.page_turn_prefetch_targets(current, 1, 0).unwrap();
+            assert_eq!(plan.current_position, 10);
+            assert_eq!(
+                plan.targets,
+                vec![(10, if current == 19 { 20 } else { 19 }), (11, 21), (11, 0)]
+            );
+            let zero = app.page_turn_prefetch_targets(current, 0, 0).unwrap();
+            assert_eq!(zero.targets.len(), 1, "only the displayed partner");
+            assert!(zero.targets.iter().all(|(pos, _)| *pos == 10));
+        }
+        let tail = app.page_turn_prefetch_targets(21, 0, 1).unwrap();
+        assert_eq!(tail.targets, vec![(11, 0), (10, 19), (10, 20)]);
+        let both = app.page_turn_prefetch_targets(19, 1, 22).unwrap();
+        assert_eq!(both.targets.iter().filter(|(_, idx)| *idx == 0).count(), 1);
+        assert!(
+            both.targets.contains(&(11, 0)),
+            "nearest occurrence is ahead"
+        );
+        let first = app.page_turn_prefetch_targets(0, 1, 0).unwrap();
+        assert_eq!(first.targets, vec![(1, 1), (1, 2)]);
+        let back = app.page_turn_prefetch_targets(1, 0, 1).unwrap();
+        assert_eq!(back.targets, vec![(1, 2), (0, 0)]);
+        // One navigation page plus its supplement consumes one page, not two.
+        let three = app.page_turn_prefetch_targets(19, 3, 0).unwrap();
+        assert_eq!(
+            three.targets,
+            app.page_turn_prefetch_targets(19, 1, 0).unwrap().targets
+        );
+    }
+}
+
+#[test]
+fn page_turn_paged_prefetch_single_size_change_and_media_keep_real_navigation() {
+    let ctx = egui::Context::default();
+    let mut app = book(&ctx, SpreadMode::Single, 12, false, false, false);
+    assert_eq!(
+        app.page_turn_prefetch_targets(2, 1, 1).unwrap().targets,
+        vec![(3, 3), (1, 1)]
+    );
+    app.items[3] = GridItem::Video(PathBuf::from("c:/prefetch-video.mp4"));
+    app.items[1] = GridItem::Audio(PathBuf::from("c:/prefetch-audio.mp3"));
+    app.items_generation += 1;
+    assert!(app.page_turn_prefetch_targets(3, 1, 1).is_none());
+    assert_eq!(
+        app.page_turn_prefetch_targets(2, 1, 1).unwrap().targets,
+        vec![(0, 0), (3, 4)]
+    );
+    assert_eq!(
+        app.page_turn_prefetch_targets(2, 2, 2).unwrap().targets,
+        vec![(0, 0), (3, 4), (4, 5)]
+    );
+    app.settings.page_turn_animation_enabled = false;
+    assert!(app.page_turn_prefetch_targets(2, 1, 1).is_none());
+    app.settings.page_turn_animation_enabled = true;
+    app.spread_mode = SpreadMode::SplitLtr;
+    assert!(app.page_turn_prefetch_targets(2, 1, 1).is_none());
+}
+
+#[test]
+fn page_turn_paged_prefetch_retained_cover_before_accept_starts_and_finishes() {
+    for mode in [SpreadMode::LtrCover, SpreadMode::RtlCover] {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::paged_prefetch_tests::pdf_book(&ctx);
+        app.spread_mode = mode;
+        app.settings.prefetch_forward = 1;
+        app.settings.prefetch_back = 0;
+        app.settings.ai_upscale_prefetch_forward = 0;
+        app.settings.ai_upscale_prefetch_back = 0;
+        // All required inference is already done: exercise the real retained
+        // producer without loading a model or relying on fixture GPU cover 0.
+        for idx in [19, 20, 21] {
+            crate::app::paged_prefetch_tests::retain_pdf_ai(&mut app, idx);
+        }
+        let final_key = crate::app::paged_prefetch_tests::retain_pdf_ai(&mut app, 0);
+        assert!(!app.fs_cache.contains_key(&0));
+        assert!(!app.final_composite_cache.contains_key(&final_key));
+        app.fullscreen_idx = Some(19);
+        app.reconcile_paged_prefetch_window(19);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            app.prefetch_final_ai(&ctx, 19);
+            if app
+                .final_composite_cache
+                .get(&final_key)
+                .is_some_and(|entry| entry.complete)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "existing prefetch worker must publish cover before navigation"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(app.fullscreen_idx, Some(19));
+        install(&ctx);
+        capture(&ctx, &mut app, 19);
+        // Force the shared CPU LRU to discard the cover after its GPU material
+        // is ready. Display preparation must not reload and invalidate it.
+        app.settings.retained_final_ai_cache_max_entries = 1;
+        crate::app::paged_prefetch_tests::retain_pdf_ai(&mut app, 1);
+        assert!(matches!(
+            app.fs_page_load_state(0),
+            FsPageLoadState::NeedsLoad
+        ));
+        assert!(
+            app.final_composite_cache
+                .get(&final_key)
+                .is_some_and(|entry| entry.complete)
+        );
+        // The cover becomes resident before either incoming capture or navigation.
+        navigate(&ctx, &mut app, 19, 21, true, BoundaryDiagnosis::Ready);
+        navigate(&ctx, &mut app, 21, 19, false, BoundaryDiagnosis::Ready);
+        assert!(!app.fs_pending.contains_key(&0));
+        assert!(
+            app.final_composite_cache
+                .get(&final_key)
+                .is_some_and(|entry| entry.complete)
+        );
     }
 }
 

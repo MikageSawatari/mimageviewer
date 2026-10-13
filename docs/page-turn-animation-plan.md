@@ -2280,3 +2280,62 @@ normal `build-dev.ps1 -PreserveRuntime`は通信中断後の再実行でexit0。
 成功したが、全体失敗の原因確定や全体PASSとは扱わない。音声sourceや待機期限は変更していない。
 workspace非ゼロによりscript後半のvendor gateは今回は未実行。全体gateの再実行はしない。
 詳細・コマンド・ログ・binary SHAと隔離確認手順は`target/A-1341-terminal-msg.txt`を参照する。
+
+### 26.8 2026-10-14 隣の表示単位を先読みする
+
+利用者の22頁PDFでは末尾の一つ前から22頁＋表紙へ進むとき、表紙idx0のGPU textureが
+未residentで受理を省いていた。従来のsource/AI先読みと保持は画像indexの近傍を選び、
+遠い補助表紙を加えるのは現在表示中の組だけだった。CPU Retained pageのhitはGPU素材の
+準備完了を意味しない。短い本で成立した理由は設定・組み方・cache履歴を未確認で断定しない。
+
+local pagedのアニメーションONでは、通常navigationの実unitと実compositionを共通の需要にする。
+各方向の既存予算はNavigation画像頁数で消費し、選ばれたunitの実画像は補助表紙も含めて全て選ぶ。
+予算境界でunitを分割しない。現在unitの相方は隣unitの予算を消費しない。ゼロ方向には
+新規投機要求を出さず、既存の保持幅＋1はresident素材のpassive保持として残す。
+sourceとAIの独立した予算を尊重し、双方の需要をlive cacheのkeepに合流する。
+indicatorも実unitの位置で前後を表し、遠い表紙を先頭側の処理と誤表示しない。
+動画・音声singletonは投機画像処理も画像枚数予算の消費もしない。実navigation位置を保ちつつ
+その先の画像unitまで走査し、従来の画像枚数の先読みを縮小しない。OFF・連結読み・Split・Remoteは従来どおり。
+
+既存current_loading抑止とpage-turnの非target作業admissionを維持する。ready後や組み合わせ
+変更後は導出した需要との差分だけを既存source schedulerへ渡す。root/active detachedの
+同じ非target作業admission内からmounted contextだけをreconcileする。受理時に同期decode/uploadを
+しない。PDFのRetained FinalAiだけが残る場合も、source先読み予算から既存final-effect workerで
+最終GPU素材を準備する。colorize/LUT無しやAI先読みゼロでも既存CPU結果を再利用できるが、
+新規AI推論はAI予算に従う。新しいpending/bool/queue/ownerは追加しない。
+
+Retained pageのentries/bytes上限と共有LRUは変更せず、隣unit全体を永久pinしない。
+CPU表紙が押し出されてもresident GPU素材があればめくれる。両方が失われた場合は既存loaderで
+再準備し、受理までに間に合わなければ既存readiness規則でinstantにする。待機・予算超過・
+専用再試行は追加しない。contextをまたぐcancel/eviction/pollのownerも変更しない。
+PDFのexact current edit/params/bypass keyとtexture identityが一致する完成live compositeは、
+display需要ではresidentとして扱う。raw sourceの状態は変えず、RAW比較や現像要求を妨げない。
+表示前の各ensureと通常texture選択でも同じ派生判定を使い、CPU LRU退去後の不要な再ロードで
+完成GPU素材を失効させない。RAWのdisplay需要の変化は既存需要計算との差分で検出する。
+
+先頭表紙→最初の組、補助付き末尾への前進/後退、本別補助指定を同じbuilder経由で扱う。
+単頁の縦長⇔横長の黒paperは実画像二枚の隣unit需要だけで、黒紙に別textureは不要。
+22頁実builder・source/AI独立予算・ゼロ・保持・Retained CPU→GPU・二contextを回帰で確認する。
+独立設計レビューは構造的修正として承認。関連テスト/fmt/checkと通常build-devを行い、
+今回test-full・コミット・アプリ起動は行わない。
+
+### 26.9 隣unit先読みの検証記録
+
+実builderの22頁でpenultimate19/20から末尾21＋表紙0をatomicに選び、既存Retained rasterの
+source queue/paced pollとRetained FinalAiのfinal-effect workerからGPUを準備した。
+CPU cap1退去後もexact GPU素材で実handlerの前進/後退が開始・完走する。
+LTR/RTL、current partner非消費、source/AI独立予算、ゼロ、media、OFF、RAW需要変更、
+LatestSeek、二contextのcache/cancel/channelを回帰した。既存Retained entries/MiB上限は維持する。
+極小PDF fixtureはnative Raster4×6の要求長辺6pxを証明して保持素材と合わせる。
+Vectorの最小256pxに6px rasterを当てる不一致を、製品側の許容拡大で隠さない。
+
+独立GPT-6.1 Sol / xhighの最終静的レビューはACCEPT、未解消P1/P2なし。
+focused16、page_turn186、retained53、pipeline163、RAW27、UI snapshot163が成功した。
+normal/portable core check、fmt/glyph、viewer_context_auditも成功。snapshot golden変更なし。
+新test moduleへfile-level cfg(test)も明示し、auditのtest-only境界と実compile条件を揃える。
+test-fullは利用者指定で未実行。新field/pending/queue/owner、共有LRU変更、RAW policy拡大はない。
+
+通常build-devはPreserveRuntime指定で開始したが、既存確認core PID54220が起動中のため
+scriptの保護でcompile前に停止した。利用者の終了待ちであり、アプリはagentから起動/停止しない。
+build完了後に結果を追記する。詳細・command/log・二冊の隔離確認手順は
+`target/A-1341-neighbor-msg.txt`へ記録する。コミットは行わない。

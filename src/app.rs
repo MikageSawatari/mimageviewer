@@ -29,8 +29,8 @@ use std::time::Instant;
 use crate::final_composite::FinalCompositeTiming;
 use crate::final_composite::{
     FinalCompositePlan, FinalCompositeResult, active_favorite_default_id_for_path,
-    build_final_composite_plan_without_ai, execute_final_composite,
-    final_composite_colorize_applies, resolve_effective_params,
+    build_final_composite_plan_after_ai, build_final_composite_plan_without_ai,
+    execute_final_composite, final_composite_colorize_applies, resolve_effective_params,
 };
 use crate::keymap::{
     CommandScope, EXTERNAL_TOOL_ACTIONS, KeyAction, LOCATION_NAVIGATION_ACTIONS,
@@ -9972,6 +9972,7 @@ pub(crate) enum FsPageLoadState {
 pub(crate) enum FsPageDisplaySource {
     LiveCache,
     RetainedPdfFinalAi,
+    ResidentFinalComposite,
 }
 
 /// Which full-resolution work an explicit fullscreen open may start. A materialized page-turn
@@ -62820,7 +62821,13 @@ impl App {
                     } else {
                         app.evict_adjustment_cache(fs_idx);
                     }
-                    app.prefetch_final_ai(ctx, fs_idx);
+                    let page_turn_decision = app.fs_page_turn_decision_for_frame(ctx, fs_idx);
+                    if page_turn_decision.admits_non_target_full_resolution_work() {
+                        app.reconcile_paged_prefetch_window(fs_idx);
+                        app.prefetch_final_ai(ctx, fs_idx);
+                    } else {
+                        app.poll_final_effects(ctx);
+                    }
                 }
 
                 app.keep_fullscreen_viewport_alive(ctx);
@@ -66236,7 +66243,8 @@ impl App {
             | Some(GridItem::ZipImage { .. })
             | Some(GridItem::PdfPage { .. }) => {
                 if materialization.admits_navigation_target_materialization() {
-                    let load_state = self.ensure_fs_page_load_with_contract(idx, load_contract);
+                    let load_state =
+                        self.ensure_fs_display_page_load_with_contract(idx, load_contract);
                     if load_state.is_display_ready() {
                         crate::logger::log(format!("  cache hit idx={idx} → instant display"));
                     }
@@ -74678,6 +74686,9 @@ impl App {
             ..=((pos + keep_forward).min(n - 1)))
             .map(|p| image_indices[p])
             .collect();
+        if let Some(keep) = self.page_turn_prefetch_keep_set(current_idx) {
+            keep_set = keep;
+        }
 
         // The final-cover supplement intentionally reuses page 0 far outside the last page's
         // positional prefetch window. Treat the actual presentation partner as display-critical
@@ -74690,8 +74701,12 @@ impl App {
             .collect::<Vec<_>>();
         keep_set.extend(self.reconcile_raw_demand(current_idx, &displayed_raw));
 
-        let prefetch_targets: Vec<usize> =
-            interleaved_prefetch_targets(&image_indices, pos, n, pf_forward, pf_back);
+        let prefetch_targets: Vec<usize> = self
+            .page_turn_prefetch_targets(current_idx, pf_forward, pf_back)
+            .map(|plan| plan.targets.into_iter().map(|(_, idx)| idx).collect())
+            .unwrap_or_else(|| {
+                interleaved_prefetch_targets(&image_indices, pos, n, pf_forward, pf_back)
+            });
 
         // 退避前に動画の再生位置を保存 (退避された Video エントリは drop で消える)
         self.save_all_video_resume_positions();
@@ -74762,7 +74777,9 @@ impl App {
         // 巻き込みキャンセルは、その commit が起きる前 (= 待機中) に先読みを止めていた。
         // 中断できない区間を短くするのが先で、それが S2 の仕事。
         // 経緯: docs/archive-page-load-scheduler-plan.md §8.1。
-        let current_loading = self.fs_page_load_state(current_idx).waiting_for_display();
+        let current_loading = self
+            .fs_display_page_load_state(current_idx)
+            .waiting_for_display();
 
         let to_cancel: Vec<usize> = self
             .fs_pending
@@ -74789,15 +74806,15 @@ impl App {
             // Paged and continuous-reading prefetch must both re-assert the
             // current producer: `NeedsLoad` may cancel siblings but must not
             // leave the display target without an in-flight request.
-            self.ensure_fs_page_load(current_idx);
+            self.ensure_fs_display_page_load(current_idx);
             return;
         }
 
         // まだキャッシュにも pending にもない先読み対象を読み込み開始
         for idx in prefetch_targets {
-            if self.fs_page_load_state(idx).needs_load_request() {
+            if self.fs_display_page_load_state(idx).needs_load_request() {
                 crate::logger::log(format!("  prefetch start idx={idx}"));
-                self.ensure_fs_page_load(idx);
+                self.ensure_fs_display_page_load(idx);
             }
         }
     }
@@ -76523,8 +76540,77 @@ impl App {
         }
     }
 
+    /// Source and AI preparation share the actual paged units' live-cache lifetime.
+    /// Cross-session retained CPU entries continue to use their global LRU budget.
+    pub(crate) fn page_turn_prefetch_policy_enabled(&self) -> bool {
+        self.settings.page_turn_animation_enabled
+            && self.reading_flow.is_paged()
+            && crate::page_split::SplitDirection::from_spread_mode(self.spread_mode).is_none()
+            && !self.remote_session_blocks_local_control()
+    }
+
+    fn page_turn_prefetch_keep_set(&mut self, current_idx: usize) -> Option<HashSet<usize>> {
+        let source = self.page_turn_prefetch_targets(
+            current_idx,
+            self.settings.prefetch_forward.saturating_add(1),
+            self.settings.prefetch_back.saturating_add(1),
+        )?;
+        let ai = self.page_turn_prefetch_targets(
+            current_idx,
+            self.settings.ai_upscale_prefetch_forward.saturating_add(1),
+            self.settings.ai_upscale_prefetch_back.saturating_add(1),
+        )?;
+        let mut keep = source
+            .targets
+            .into_iter()
+            .chain(ai.targets)
+            .map(|(_, idx)| idx)
+            .collect::<HashSet<_>>();
+        keep.insert(current_idx);
+        Some(keep)
+    }
+
+    /// Reconcile new unit dimensions, layout/settings, and completed current loads
+    /// through the existing source owner, without doing video-resume I/O every frame.
+    pub(crate) fn reconcile_paged_prefetch_window(&mut self, current_idx: usize) {
+        let Some(targets) = self.page_turn_prefetch_targets(
+            current_idx,
+            self.settings.prefetch_forward,
+            self.settings.prefetch_back,
+        ) else {
+            return;
+        };
+        let Some(mut keep) = self.page_turn_prefetch_keep_set(current_idx) else {
+            return;
+        };
+        let displayed_partner = self.displayed_spread_partner(current_idx);
+        let displayed = [Some(current_idx), displayed_partner]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let expected_raw_demand = self.raw_demand_for_display(current_idx, &displayed);
+        let raw_demand_changed = expected_raw_demand != self.raw_pages.demand;
+        keep.extend(expected_raw_demand.keys().copied());
+        let current_state = self.fs_display_page_load_state(current_idx);
+        let needs_load = current_state.needs_load_request()
+            || (!current_state.waiting_for_display()
+                && targets
+                    .targets
+                    .iter()
+                    .any(|&(_, idx)| self.fs_display_page_load_state(idx).needs_load_request()));
+        let keep_changed = self.fs_cache.keys().any(|idx| !keep.contains(idx))
+            || self.fs_pending.keys().any(|idx| !keep.contains(idx));
+        if needs_load || keep_changed || raw_demand_changed {
+            self.update_prefetch_window(current_idx);
+        }
+    }
+
     /// 先読み範囲内の item_idx 集合を計算する。
     fn compute_keep_set(&mut self, current_idx: usize) -> std::collections::HashSet<usize> {
+        if let Some(mut keep) = self.page_turn_prefetch_keep_set(current_idx) {
+            keep.extend(self.raw_pages.demand.keys().copied());
+            return keep;
+        }
         let image_indices = self.collect_image_indices();
         let Some(pos) = image_indices.iter().position(|&i| i == current_idx) else {
             // フルスクリーン表示中に★/Ctrl+Fフィルタが変わり、現在ページが
@@ -76574,6 +76660,18 @@ impl App {
 
     /// AI 先読み対象の item_idx を前方優先（+1..+pf_forward, -1..-pf_back）で返す。
     pub(crate) fn ai_prefetch_targets(&mut self, current_idx: usize) -> Vec<usize> {
+        if let Some(plan) = self.page_turn_prefetch_targets(
+            current_idx,
+            self.settings.ai_upscale_prefetch_forward,
+            self.settings.ai_upscale_prefetch_back,
+        ) {
+            return plan
+                .targets
+                .into_iter()
+                .map(|(_, idx)| idx)
+                .filter(|idx| !self.is_raw_page(*idx) || self.raw_pages.demand.contains_key(idx))
+                .collect();
+        }
         let image_indices = self.collect_image_indices();
         let Some(pos) = image_indices.iter().position(|&i| i == current_idx) else {
             return Vec::new();
@@ -76618,6 +76716,9 @@ impl App {
     /// `final_ai_key_for_pixels` と同じ判定式を共有するため、skip_px や bg mode の
     /// 整合性は自動で保たれる。
     pub(crate) fn is_idx_final_ai_done_or_skipped(&self, idx: usize) -> bool {
+        if self.has_retained_pdf_final_ai_for_current_params(idx) {
+            return true;
+        }
         // source pixels が無ければ判定不能 → pending 扱い (= done 数に入れない)
         let Some(pixels) = self.current_raw_source_pixels(idx) else {
             return false;
@@ -76640,28 +76741,37 @@ impl App {
         &mut self,
         fs_idx: usize,
     ) -> Option<FsPrefetchIndicator> {
-        let image_indices = self.collect_image_indices();
-        let current_pos = image_indices.iter().position(|&idx| idx == fs_idx)?;
-        let target_positions = interleaved_prefetch_positions(
-            current_pos,
-            image_indices.len(),
+        let paged = self.page_turn_prefetch_targets(
+            fs_idx,
             self.settings.ai_upscale_prefetch_forward,
             self.settings.ai_upscale_prefetch_back,
         );
+        let (current_pos, targets) = if let Some(plan) = paged {
+            (plan.current_position, plan.targets)
+        } else {
+            let image_indices = self.collect_image_indices();
+            let current_pos = image_indices.iter().position(|&idx| idx == fs_idx)?;
+            let targets = interleaved_prefetch_positions(
+                current_pos,
+                image_indices.len(),
+                self.settings.ai_upscale_prefetch_forward,
+                self.settings.ai_upscale_prefetch_back,
+            )
+            .into_iter()
+            .map(|pos| (pos, image_indices[pos]))
+            .collect();
+            (current_pos, targets)
+        };
         let active_indices: std::collections::HashSet<usize> = self
             .final_ai_pending
             .keys()
             .map(|key| key.edit_key.idx)
             .collect();
         let current_busy = active_indices.contains(&fs_idx);
-        let pages = target_positions
+        let pages = targets
             .into_iter()
-            .filter(|&pos| {
-                !self.is_raw_page(image_indices[pos])
-                    || self.raw_pages.demand.contains_key(&image_indices[pos])
-            })
-            .map(|pos| {
-                let idx = image_indices[pos];
+            .filter(|&(_, idx)| !self.is_raw_page(idx) || self.raw_pages.demand.contains_key(&idx))
+            .map(|(pos, idx)| {
                 (
                     pos,
                     fs_prefetch_page_state(
@@ -76671,6 +76781,79 @@ impl App {
                 )
             });
         build_fs_prefetch_indicator(current_pos, current_busy, pages)
+    }
+
+    /// Restore matching retained PDF AI pixels for upcoming actual occurrences.
+    /// This prepares a resident source even with an AI-inference budget of zero;
+    /// all remaining CPU effects and the paced upload use the existing owner.
+    fn prefetch_retained_paged_composites(&mut self, ctx: &egui::Context, current_idx: usize) {
+        let Some(source) = self.page_turn_prefetch_targets(
+            current_idx,
+            self.settings.prefetch_forward,
+            self.settings.prefetch_back,
+        ) else {
+            return;
+        };
+        if self
+            .final_effect_pending
+            .values()
+            .any(|pending| !pending.cancel.load(Ordering::Relaxed))
+        {
+            return;
+        }
+        let mut targets = source
+            .targets
+            .into_iter()
+            .map(|(_, idx)| idx)
+            .collect::<Vec<_>>();
+        for idx in self.ai_prefetch_targets(current_idx) {
+            if !targets.contains(&idx) {
+                targets.push(idx);
+            }
+        }
+        for idx in targets {
+            let Some((ai_key, edit_size)) = self.retained_pdf_final_ai_matches_current(idx) else {
+                continue;
+            };
+            let params = self.effective_params(idx).clone();
+            let final_key =
+                self.final_composite_key_for_pixels(ai_key.edit_key, edit_size, &params);
+            if self
+                .final_composite_cache
+                .get(&final_key)
+                .is_some_and(|entry| entry.complete)
+                || self.final_effect_pending.contains_key(&final_key)
+            {
+                continue;
+            }
+            let Some((ai_key, entry, edit_size)) =
+                self.lookup_retained_pdf_final_ai(idx, "paged_source_prefetch")
+            else {
+                continue;
+            };
+            let mut plan = build_final_composite_plan_after_ai(
+                &params,
+                self.resolved_creative_lut(&params),
+                entry.used_upscale,
+            );
+            if self.post_filter_bypassed {
+                plan.colorize = Default::default();
+                plan.creative_lut = None;
+                plan.post_filter = crate::adjustment::PostFilter::None;
+            }
+            self.final_ai_cache.insert(ai_key, entry.clone());
+            if self.spawn_final_effect_job(
+                ctx,
+                final_key,
+                entry.pixels,
+                edit_size,
+                plan,
+                true,
+                true,
+            ) {
+                return;
+            }
+        }
     }
 
     fn record_final_effect_prefetch_admission(
@@ -76844,6 +77027,7 @@ impl App {
         // 背景 final-effect は現在ページの ensure 経路に依存せず、fullscreen work
         // セクション自体で回収する。ensure 側の poll はコピー / 書き出し等の入口用に残す。
         self.poll_final_effects(ctx);
+        self.prefetch_retained_paged_composites(ctx, current_idx);
         // ページ送りのカラー化先読みは従来どおりここで回す。連結読みは描画レイアウトが
         // 算出した準備帯を渡す必要があるため `draw_fs_continuous_reading` から起動する。
         if self.reading_flow.is_paged() {
@@ -81173,6 +81357,42 @@ impl App {
         self.ensure_fs_page_load_with_contract(idx, FsPageLoadContract::Sequential)
     }
 
+    /// Display demand may already have a complete current GPU source after the
+    /// independently budgeted retained CPU entry was evicted. Raw/edit producers
+    /// continue to use `fs_page_load_state` and `ensure_fs_page_load` directly.
+    pub(crate) fn fs_display_page_load_state(&self, idx: usize) -> FsPageLoadState {
+        if self.page_turn_prefetch_policy_enabled()
+            && self.exact_complete_final_composite_texture(idx).is_some()
+        {
+            FsPageLoadState::DisplayReady(FsPageDisplaySource::ResidentFinalComposite)
+        } else {
+            self.fs_page_load_state(idx)
+        }
+    }
+
+    pub(crate) fn ensure_fs_display_page_load(&mut self, idx: usize) -> FsPageLoadState {
+        self.ensure_fs_display_page_load_with_contract(idx, FsPageLoadContract::Sequential)
+    }
+
+    pub(crate) fn ensure_fs_display_page_load_with_contract(
+        &mut self,
+        idx: usize,
+        contract: FsPageLoadContract,
+    ) -> FsPageLoadState {
+        let state = self.fs_display_page_load_state(idx);
+        if state == FsPageLoadState::DisplayReady(FsPageDisplaySource::ResidentFinalComposite) {
+            self.verify_display_identity(idx);
+            self.apply_fs_page_load_contract(idx, contract);
+            self.note_fs_page_load_skipped(idx, state);
+            if self.fullscreen_idx == Some(idx) {
+                self.refresh_fullscreen_pdf_promotion();
+            }
+            state
+        } else {
+            self.ensure_fs_page_load_with_contract(idx, contract)
+        }
+    }
+
     pub(crate) fn ensure_fs_page_load_with_contract(
         &mut self,
         idx: usize,
@@ -82488,6 +82708,11 @@ impl App {
         if self.fs_entry_is_animated(idx) {
             return None;
         }
+        if self.page_turn_prefetch_policy_enabled()
+            && let Some(texture) = self.exact_complete_final_composite_texture(idx)
+        {
+            return Some(texture);
+        }
         // 画像オープン時のフリーズ調査用 perf 計装 (--perf-log)。この関数の build 経路
         // (キャッシュミス時) は UI スレッドで同期実行され、AI アップスケール後の大判
         // 画像では post_filter + GPU upload が数百ms かかりうる。cat="fs" /
@@ -82741,6 +82966,25 @@ impl App {
             .iter()
             .find(|(key, _)| self.edit_key_describes_current_page(&key.edit_key, idx))
             .map(|(_, entry)| entry.texture.clone())
+    }
+
+    /// Exact params, source/edit generations, item identity, and completion are
+    /// required before a final texture can satisfy display loading without raw pixels.
+    pub(crate) fn exact_complete_final_composite_texture(
+        &self,
+        idx: usize,
+    ) -> Option<egui::TextureHandle> {
+        if !matches!(self.items.get(idx), Some(GridItem::PdfPage { .. })) {
+            return None;
+        }
+        let edit_key = self.current_edit_result_key(idx);
+        let params = self.effective_params(idx);
+        self.final_composite_cache.iter().find_map(|(key, entry)| {
+            (entry.complete
+                && *key == self.final_composite_key_for_pixels(edit_key, entry.source_size, params)
+                && self.display_texture_matches_page(&entry.texture, idx))
+            .then(|| entry.texture.clone())
+        })
     }
 
     pub(crate) fn final_composite_texture_is_complete(
@@ -92222,6 +92466,7 @@ impl App {
                 // Pipeline P1 リファクタで dead code 化していた旧 `prefetch_ai_upscale` の
                 // 後継 (= ページ送り時 AI を待たされる退行を直す)。
                 if page_turn_decision.admits_non_target_full_resolution_work() {
+                    self.reconcile_paged_prefetch_window(fs_idx);
                     self.prefetch_final_ai(ctx, fs_idx);
                 } else {
                     // Target final-effect results are part of materialization; unrelated
@@ -96498,6 +96743,8 @@ fn finite_video_target_secs(target_secs: f64, duration_secs: f64) -> f64 {
 mod grid_cursor_tests;
 #[cfg(all(test, windows))]
 pub(crate) mod multiwindow_scenario_tests;
+#[cfg(test)]
+pub(crate) mod paged_prefetch_tests;
 #[cfg(test)]
 pub(crate) mod paint_record_test_support;
 #[cfg(test)]

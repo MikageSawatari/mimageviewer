@@ -2171,11 +2171,11 @@ impl App {
         }
     }
 
-    pub(crate) fn reconcile_raw_demand(
+    pub(super) fn raw_demand_for_display(
         &mut self,
         current: usize,
         displayed: &[usize],
-    ) -> HashSet<usize> {
+    ) -> HashMap<usize, RawPriority> {
         let order = self.get_still_image_indices();
         let mut demand =
             raw_development_demand(&order, current, displayed, |idx| self.is_raw_page(idx));
@@ -2184,6 +2184,15 @@ impl App {
         {
             demand.insert(pending.source_idx, RawPriority::High);
         }
+        demand
+    }
+
+    pub(crate) fn reconcile_raw_demand(
+        &mut self,
+        current: usize,
+        displayed: &[usize],
+    ) -> HashSet<usize> {
+        let demand = self.raw_demand_for_display(current, displayed);
         for (&idx, record) in self.raw_pages.pages.iter() {
             if let RawPageRecord::Page(page) = record {
                 let mut phase = page.develop.lock().unwrap();

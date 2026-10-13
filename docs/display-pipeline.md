@@ -2984,6 +2984,13 @@ AI を含む段では各エントリの合成中に AI も実行する。焼き�
   直前・直後の表示単位を両ページとも範囲へ含める。v3.7.0 では旧既定の前方 2 だけを版境界で
   一度 3 へ移行し、保存済みの後方値は変更しない。表紙ありモードの末尾から先頭への循環は
   この範囲計算へ含めない。
+  未リリース§1.341のlocal pagedアニメーションONでは、source/AI先読みとも通常navigationの
+  表示unitから対象を選び、予算境界の組を分割しない。現在の相方は予算を消費せず、末尾unitの
+  実画像である補助表紙も同unitの需要へ含める。source/AI双方の需要をlive keepに合流し、
+  indicatorの方向もunit位置で示す。Retained PDF FinalAiのみ残る隣頁は、既存final-effect workerと
+  paced pollでGPU素材を準備する（AI先読みゼロでも既存結果の再利用は可能）。Retained pageの
+  entries/bytes共有LRU上限は維持し、受理までに素材が間に合わなければinstantとする。
+  OFF・連結・Split・Remoteの既存範囲計算は変更しない。詳細はページめくり設計§26.8。
   ⚠️ **退行注意**: Pipeline P1 リファクタ (be05cfef) で旧 `prefetch_ai_upscale` が
   dead code 化され、新版が未実装のまま 1 リリース過ごした。`App::update` の
   「フルスクリーン work セクション」(= `// AI 先読み (新パイプライン)` コメント) を

@@ -14751,6 +14751,13 @@ struct SpreadDisplayUnit {
     formation: SpreadDisplayUnitFormation,
 }
 
+/// A transient projection of ordinary navigation units onto their real image sources.
+/// Positions are unit ordinals, so a distant cover supplement keeps its landing direction.
+pub(crate) struct PagedPrefetchTargets {
+    pub(crate) current_position: usize,
+    pub(crate) targets: Vec<(usize, usize)>,
+}
+
 /// A page's role inside one visible reading unit. Navigation is projected only
 /// from `Navigation`; supplements participate in the complete presentation but
 /// never add a seek/history/page-count target.
@@ -17651,6 +17658,143 @@ impl App {
                 SpreadDisplayComposition::from_navigation_pages(anchor_idx, &[anchor_idx])
                     .expect("fallback composition contains its anchor")
             })
+    }
+
+    pub(crate) fn page_turn_prefetch_targets(
+        &mut self,
+        current_idx: usize,
+        forward: usize,
+        back: usize,
+    ) -> Option<PagedPrefetchTargets> {
+        if !self.page_turn_prefetch_policy_enabled()
+            || !matches!(
+                self.items.get(current_idx),
+                Some(GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. })
+            )
+        {
+            return None;
+        }
+        let nav = self.get_nav_indices();
+        if !self.spread_mode.is_spread() {
+            let current_position = nav.iter().position(|&idx| idx == current_idx)?;
+            let mut targets = Vec::new();
+            let mut forward_left = forward;
+            let mut back_left = back;
+            for distance in 1..nav.len() {
+                if forward_left == 0 && back_left == 0 {
+                    break;
+                }
+                for position in [
+                    (forward_left > 0)
+                        .then(|| current_position.checked_add(distance))
+                        .flatten()
+                        .filter(|&position| position < nav.len()),
+                    (back_left > 0)
+                        .then(|| current_position.checked_sub(distance))
+                        .flatten(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    let idx = nav[position];
+                    if matches!(
+                        self.items.get(idx),
+                        Some(
+                            GridItem::Image(_)
+                                | GridItem::ZipImage { .. }
+                                | GridItem::PdfPage { .. }
+                        )
+                    ) {
+                        targets.push((position, idx));
+                        if position > current_position {
+                            forward_left -= 1;
+                        } else {
+                            back_left -= 1;
+                        }
+                    }
+                }
+            }
+            return Some(PagedPrefetchTargets {
+                current_position,
+                targets,
+            });
+        }
+        let units = self.build_spread_display_units_for_nav(&nav);
+        let (current_position, _) = find_spread_display_unit(&units, current_idx)?;
+        let mut targets = Vec::new();
+        let mut seen = std::collections::HashSet::from([current_idx]);
+        let mut add_unit = |app: &mut App, position: usize| {
+            let composition =
+                app.spread_display_composition_for_anchor(units[position].anchor_idx());
+            for page in composition.pages_in_reading_order() {
+                if matches!(
+                    app.items.get(page.idx),
+                    Some(GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. })
+                ) && seen.insert(page.idx)
+                {
+                    targets.push((position, page.idx));
+                }
+            }
+        };
+        // The displayed partner is not a speculative neighbour and consumes no budget.
+        add_unit(self, current_position);
+        let mut forward_left = forward;
+        let mut back_left = back;
+        let mut distance = 1;
+        while forward_left > 0 || back_left > 0 {
+            if forward_left > 0 {
+                if let Some(position) = current_position
+                    .checked_add(distance)
+                    .filter(|&position| position < units.len())
+                {
+                    add_unit(self, position);
+                    let image_pages = units[position]
+                        .pages
+                        .iter()
+                        .filter(|&&idx| {
+                            matches!(
+                                self.items.get(idx),
+                                Some(
+                                    GridItem::Image(_)
+                                        | GridItem::ZipImage { .. }
+                                        | GridItem::PdfPage { .. }
+                                )
+                            )
+                        })
+                        .count();
+                    forward_left = forward_left.saturating_sub(image_pages);
+                } else {
+                    forward_left = 0;
+                }
+            }
+            if back_left > 0 {
+                if let Some(position) = current_position.checked_sub(distance) {
+                    add_unit(self, position);
+                    let image_pages = units[position]
+                        .pages
+                        .iter()
+                        .filter(|&&idx| {
+                            matches!(
+                                self.items.get(idx),
+                                Some(
+                                    GridItem::Image(_)
+                                        | GridItem::ZipImage { .. }
+                                        | GridItem::PdfPage { .. }
+                                )
+                            )
+                        })
+                        .count();
+                    back_left = back_left.saturating_sub(image_pages);
+                } else {
+                    back_left = 0;
+                }
+            }
+            distance += 1;
+        }
+        Some(PagedPrefetchTargets {
+            current_position,
+            targets,
+        })
     }
 
     fn fs_navigation_display_demand_for_anchor(
@@ -21873,7 +22017,7 @@ impl App {
         if current_page_changed {
             self.refresh_fullscreen_pdf_promotion();
         }
-        self.ensure_fs_page_load_with_contract(target_idx, load_contract);
+        self.ensure_fs_display_page_load_with_contract(target_idx, load_contract);
         ctx.request_repaint();
     }
 
@@ -23533,7 +23677,7 @@ impl App {
         {
             return None;
         }
-        Some(self.ensure_fs_page_load(idx))
+        Some(self.ensure_fs_display_page_load(idx))
     }
 
     /// Cycles this thread has actually executed. Dividing by wall time tells whether a
@@ -27910,8 +28054,11 @@ impl App {
             .image_metas
             .get(fs_idx)
             .and_then(|m| m.map(|(_, sz)| sz.max(0) as u64));
-        let is_loading =
-            !is_video && !fs_load_failed && self.fs_page_load_state(fs_idx).waiting_for_display();
+        let is_loading = !is_video
+            && !fs_load_failed
+            && self
+                .fs_display_page_load_state(fs_idx)
+                .waiting_for_display();
         #[cfg(windows)]
         let vst3_waiting_for_video = is_video
             && self.vst3_deferred_media_open == Some(fs_idx)
@@ -29908,8 +30055,10 @@ impl App {
         );
 
         let page_turn_decision = self.fs_page_turn_decision_for_frame(ctx, fs_idx);
-        let stop_page_needs_load =
-            matches!(self.fs_page_load_state(fs_idx), FsPageLoadState::NeedsLoad);
+        let stop_page_needs_load = matches!(
+            self.fs_display_page_load_state(fs_idx),
+            FsPageLoadState::NeedsLoad
+        );
         mark_fs_render_perf(
             fs_render_perf,
             FsRenderPerfStage::FsPageTurnDecisionForFrame,
@@ -38467,7 +38616,7 @@ impl App {
         let image_loading = !is_video
             && self
                 .fullscreen_idx
-                .is_some_and(|i| self.fs_page_load_state(i).waiting_for_display());
+                .is_some_and(|i| self.fs_display_page_load_state(i).waiting_for_display());
         let pdf_rerendering = self.fs_pending.contains_key(&fs_idx);
         if self.raw_current_developing(fs_idx) {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));

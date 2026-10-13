@@ -4909,3 +4909,13 @@ gamepadのoperation witness/replay判定とrating picker終端型を共存させ
 症状パッチではないことに合意。新たなpending/state owner/時間窓/生成述語は追加しない。
 限定merge差分の検証・build結果はpage-turn planの今回追補と`target/A-1341-merge-msg.txt`へ記録する。
 この合意を一般master新機能の完了受入や実機motion評価へ読み替えない。
+
+### 2026-10-14 §1.341 隣の表示unitの素材需要
+
+§2を再確認。通常navigation unit/compositionから補助表紙を含む隣unitの素材を導出し、
+既存source/final workerの需要とlive keepへ接続する。rootとactive detachedのfullscreen workは
+同じpage-turn非target作業admission内で不足をreconcileする。mount/deposit、cancel/poll、
+PDF ticket、native host/viewportのownerやpredicateは変更しない。共有Retained CPU LRUの
+entries/bytes上限を維持し、別contextのlive cache/pendingは変更しない。
+独立GPT-6.1 Sol / xhigh設計レビューは、需要の所有境界で直す構造修正であり症状パッチではない
+ことに合意。詳細・回帰・検証はpage-turn plan §26.8へ記録する。
