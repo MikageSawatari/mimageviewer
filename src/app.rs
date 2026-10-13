@@ -575,7 +575,15 @@ pub(crate) mod book_composition_runtime;
 mod image_folder_zip_operation;
 pub(crate) use book_composition_editor::CompositionEditorCloseReason;
 pub(crate) mod normalize;
+mod page_edit_owner;
+mod page_edit_pivot;
+use page_edit_pivot::LocalPageEditSpreadPivot;
+#[cfg(test)]
+mod page_edit_owner_tests;
+#[cfg(test)]
+mod page_edit_release_tests;
 pub(crate) mod page_edit_snapshot;
+pub(crate) use page_edit_owner::{LocalPageEditDocument, PageEditOwner};
 mod prefetch_policy;
 mod recursive_snapshot_scan;
 mod runtime_ops;
@@ -5331,17 +5339,19 @@ pub(crate) enum EditMaterializeResult {
 }
 
 pub(crate) struct LocalAdjustLutLoadPending {
+    pub(crate) owner: PageEditOwner,
     pub(crate) fs_idx: usize,
     pub(crate) layer_idx: usize,
-    pub(crate) generation: u64,
+    pub(crate) document: local_adjust_core::LocalAdjustmentLayers,
     pub(crate) path: PathBuf,
     pub(crate) rx: mpsc::Receiver<Result<local_adjust_core::CubeLutParams, String>>,
 }
 
 pub(crate) struct LocalAdjustSegmentationPending {
+    pub(crate) owner: PageEditOwner,
     pub(crate) fs_idx: usize,
     pub(crate) layer_idx: usize,
-    pub(crate) generation: u64,
+    pub(crate) document: local_adjust_core::LocalAdjustmentLayers,
     pub(crate) cancel: Arc<AtomicBool>,
     pub(crate) rx: mpsc::Receiver<Result<LocalAdjustGeneratedMask, String>>,
 }
@@ -5403,8 +5413,9 @@ pub(crate) enum LocalAdjustCanvasDragKind {
     TiltShiftOuterY,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct LocalAdjustCanvasDrag {
+    pub(crate) owner: PageEditOwner,
     pub(crate) fs_idx: usize,
     pub(crate) layer_idx: usize,
     pub(crate) kind: LocalAdjustCanvasDragKind,
@@ -5536,8 +5547,9 @@ pub(crate) enum LocalAdjustMaskTool {
     Ellipse,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct LocalAdjustMaskShapeDrag {
+    pub(crate) owner: PageEditOwner,
     pub(crate) fs_idx: usize,
     pub(crate) layer_idx: usize,
     pub(crate) target: LocalAdjustMaskEditTarget,
@@ -5545,8 +5557,9 @@ pub(crate) struct LocalAdjustMaskShapeDrag {
     pub(crate) vector_drag: crate::vector_edit::DragState,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct LocalAdjustMaskBrushStroke {
+    pub(crate) owner: PageEditOwner,
     pub(crate) fs_idx: usize,
     pub(crate) layer_idx: usize,
     pub(crate) target: LocalAdjustMaskEditTarget,
@@ -12026,7 +12039,6 @@ impl App {
             (!self.text_mode, &mut self.text_spread_ctx),
             (!self.export_crop_mode, &mut self.export_crop_spread_ctx),
             (self.sns_split.is_none(), &mut self.sns_split_spread_ctx),
-            (!self.local_adjust_mode, &mut self.local_adjust_spread_ctx),
         ]
         .into_iter()
         .filter_map(|(mode_is_off, slot)| mode_is_off.then(|| slot.take()).flatten())
@@ -12034,6 +12046,7 @@ impl App {
         for pivot in stale {
             self.leave_page_edit_single_view(Some(pivot));
         }
+        self.reconcile_local_page_edit_spread_pivot();
     }
 
     /// 編集ツールで倒す前の見開きペア。**倒した後も左右の切り替えを出すために使う。**
@@ -12046,8 +12059,8 @@ impl App {
             .or(self.text_spread_ctx)
             .or(self.export_crop_spread_ctx)
             .or(self.sns_split_spread_ctx)
-            .or(self.local_adjust_spread_ctx)
             .map(|pivot| pivot.pair)
+            .or_else(|| self.local_adjust_spread_ctx.as_ref().and_then(|p| p.pair()))
     }
 
     fn page_edit_navigation_anchor_idx(&self) -> Option<usize> {
@@ -12056,8 +12069,12 @@ impl App {
             .or(self.text_spread_ctx)
             .or(self.export_crop_spread_ctx)
             .or(self.sns_split_spread_ctx)
-            .or(self.local_adjust_spread_ctx)
             .map(|pivot| pivot.navigation_anchor_idx)
+            .or_else(|| {
+                self.local_adjust_spread_ctx
+                    .as_ref()
+                    .and_then(|p| p.anchor())
+            })
     }
 
     /// 退避しておいた見開きへ戻す。
@@ -12129,6 +12146,8 @@ pub(crate) struct VirtualFolderWriteback {
 #[derive(Debug, Clone)]
 pub(crate) struct AdjustmentDragSession {
     pub fs_idx: usize,
+    pub owner: PageEditOwner,
+    pub draft: Option<crate::adjustment::AdjustParams>,
     pub before: Option<crate::adjustment::AdjustParams>,
 }
 
@@ -12184,6 +12203,7 @@ pub(crate) enum AdjustmentStandardScope {
 /// 変えずに、標準側だけを release 時の 1 回書き込みへまとめる。
 #[derive(Debug, Clone)]
 pub(crate) struct AdjustmentStandardDragSession {
+    pub draft: crate::adjustment::AdjustParams,
     pub scope: AdjustmentStandardScope,
     pub before: crate::adjustment::AdjustParams,
 }
@@ -12229,6 +12249,7 @@ pub(crate) enum EditStoreOutcome {
 /// **畳むときに捨ててはいけない。**ドラッグ中のブラシと違い、キー編集は 1 回ごとが
 /// 完了した編集で、捨てると利用者の操作がそのまま消える。
 pub(crate) struct LocalAdjustShapeKeyEdit {
+    pub owner: PageEditOwner,
     pub fs_idx: usize,
     /// 対象のレイヤー。同じ数値の図形 index は別レイヤーにも在るので、これが無いと
     /// 無関係なレイヤーの編集が 1 つのセッションに混ざる。
@@ -12253,13 +12274,18 @@ pub(crate) struct LocalAdjustShapeKeyEdit {
 ///
 /// key ごとに**最後に積んだ 1 件**だけを持つ。同じ key の古い完了もこの座標でミラーして
 /// よい (key が同じなら指すページも同じ)。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LocalAdjustWriteOrigin {
+    pub context: ViewerContextId,
+    pub target: PageAdjustmentTarget,
+    pub revision: u64,
+}
+
 pub(crate) struct LocalAdjustWritePending {
+    pub origin: LocalAdjustWriteOrigin,
+    pub layers: local_adjust_core::LocalAdjustmentLayers,
     /// この key について最後に積んだ generation。記録を畳む時期を決めるのに使う。
     pub generation: u64,
-    /// 積んだ時点の一覧 idx。
-    pub idx: usize,
-    /// 積んだ時点で固定したミラー先。`None` は製本ページかサイドカー座標なし。
-    pub sidecar: Option<(std::path::PathBuf, String)>,
 }
 
 /// メタ操作 (タグ付与など) を発火させた UI 面。
@@ -17332,7 +17358,7 @@ pub struct App {
     /// 補正レイヤーを見開きから開いたときの退避。**当時の 5 つの編集ツールで唯一これが無く**、
     /// 見開きのまま入ると canvas 用 transform が作られずマスク編集が一切効かなかった
     /// (2026-08-26 の利用者報告)。
-    pub(crate) local_adjust_spread_ctx: Option<PageEditSpreadPivot>,
+    pub(crate) local_adjust_spread_ctx: Option<LocalPageEditSpreadPivot>,
     /// 補正レイヤーパネルで選択中のレイヤー index。ページごとに保持する。
     pub(crate) local_adjust_selected_layers: std::collections::HashMap<usize, usize>,
     /// 補正レイヤー追加時のマスク種類選択ダイアログ。
@@ -17425,6 +17451,7 @@ pub struct App {
         Option<local_adjust_core::LocalAdjustmentLayers>,
     /// キーボードでの図形移動 / 回転の保留。Undo と保存をセッション単位にまとめる。
     pub(crate) local_adjust_shape_key_edit: Option<LocalAdjustShapeKeyEdit>,
+    pub(crate) local_page_edit_document: LocalPageEditDocument,
     /// 手描きブラシ中の重い補正レイヤー再計算を少し遅らせるための保留状態。
     pub(crate) local_adjust_brush_deferred_render: Option<LocalAdjustBrushDeferredRender>,
     /// 補正レイヤー自身の世代番号。レイヤー追加 / 削除 / パラメータ変更で idx 単位に +1 する。
@@ -20424,6 +20451,7 @@ impl App {
             local_adjust_canvas_drag_before_layers: None,
             local_adjust_mask_brush_before_layers: None,
             local_adjust_shape_key_edit: None,
+            local_page_edit_document: LocalPageEditDocument::default(),
             local_adjust_brush_deferred_render: None,
             local_adjust_generation: std::collections::HashMap::new(),
             mask_pages: std::collections::HashSet::new(),
@@ -30665,12 +30693,19 @@ impl App {
     }
 
     /// worker で確定した再起動案内を既存の全画面トーストへ届ける。
-    fn poll_indexer_notifications(&mut self) {
-        let notifications = self
+    fn poll_indexer_notifications(&mut self, minimized: bool) {
+        let mut notifications = self
             .indexer_init
             .as_ref()
             .map(|manager| manager.take_notifications())
             .unwrap_or_default();
+        // Do not start the one-shot name notice's toast clock until normal UI
+        // can draw it. This projection never acquires the SQLite connection.
+        if !self.indexer_init.overlay_active() && self.window_visible && !minimized {
+            if let Some(db) = &self.search_index_db {
+                notifications.extend(db.take_failure_notifications());
+            }
+        }
         if !notifications.is_empty() {
             self.show_feedback_toast_with_duration(notifications.join("\n"), 5.0);
         }
@@ -42966,6 +43001,7 @@ impl App {
         if let Some(p) = self.stamp_embed_pending.take() {
             p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        self.reproject_page_edit_owners();
     }
 
     pub(crate) fn virtual_list_context_id(&self) -> ViewerContextId {
@@ -42991,6 +43027,7 @@ impl App {
         self.conceal_pages = projection.conceal;
         self.comic_pages = projection.comic;
         self.local_adjust_pages = projection.local_adjust;
+        self.reproject_page_edit_owners();
     }
 
     /// Reconcile only the mounted bundle. Parked bundles retain their compact order and check
@@ -43444,6 +43481,8 @@ impl App {
         for index in changed {
             self.bump_erase_mask_generation(index);
         }
+        self.project_adjustment_page_edit_document();
+        self.project_local_page_edit_document(0);
     }
 
     /// Rebuild an exact-key owner after a virtual list changes its index space without going
@@ -44230,6 +44269,7 @@ impl App {
             self.rebuild_auto_aspect_samples_from_loaded();
             self.maybe_apply_auto_aspect(false);
         }
+        self.reproject_page_edit_owners();
     }
 
     /// 削除 / リネームで消える path を表示・再生中の viewer サーフェス (メイン fullscreen /
@@ -59381,28 +59421,7 @@ impl App {
 
     #[cfg(windows)]
     fn finish_adjustment_drag_for_detached_pause(&mut self) {
-        self.adjustment_dragging = false;
-        if let Some(session) = self.adjustment_drag_session.take() {
-            if self.thumb_adjust_drag_color_dirty {
-                self.invalidate_thumb_adjust_for_dragged_page(session.fs_idx);
-                self.thumb_adjust_drag_color_dirty = false;
-            }
-            let in_memory = self.adjustment_page_params.get(&session.fs_idx).cloned();
-            if session.before != in_memory {
-                if let Some(params) = in_memory.clone() {
-                    self.set_page_params(session.fs_idx, params);
-                } else {
-                    self.clear_page_params(session.fs_idx);
-                }
-                let after = self.adjustment_page_params.get(&session.fs_idx).cloned();
-                self.capture_adjustment_undo(
-                    self.page_adjust_undo_scope(session.fs_idx),
-                    session.before,
-                    after,
-                    "ページ個別の補正".to_string(),
-                );
-            }
-        }
+        self.finish_adjustment_drag_context_boundary();
     }
 
     #[cfg(windows)]
@@ -71452,7 +71471,7 @@ impl App {
     }
 
     /// 正本が受理したときだけ真。偽なら sidecar ミラーを書かずに戻ること。
-    fn edit_store_write_succeeded(
+    pub(crate) fn edit_store_write_succeeded(
         &mut self,
         what: &'static str,
         outcome: EditStoreOutcome,
@@ -71624,6 +71643,7 @@ impl App {
     /// レーティング対象外アイテムの場合は何もしない。
     /// フォルダ / ZIP / PDF ファイル本体も対象 (コンテナレーティング)。
     pub(crate) fn set_rating(&mut self, idx: usize, stars: u8) -> bool {
+        self.prepare_page_edit_history_boundary();
         let stars = stars.min(5);
         let before = self.get_rating(idx);
         if before == stars {
@@ -72485,6 +72505,9 @@ impl App {
             .current_container_rating_target()
             .is_some_and(|(current, _, _)| current == key);
         let stars = stars.min(5);
+        if capture_undo {
+            self.prepare_page_edit_history_boundary();
+        }
         // Undo 用に変更前の値をキャッシュ or DB から取得 (なければ 0)。
         let before = showing_this_container
             .then_some(self.current_folder_rating_cache)
@@ -73171,6 +73194,7 @@ impl App {
         }
         // DB write に成功した項目だけを Undo / 派生ビュー更新の対象にする。失敗項目を
         // optimistic cache や undo stack へ公開しない。
+        self.prepare_page_edit_history_boundary();
         let mut pending_records: Vec<(usize, u8, u8)> = Vec::with_capacity(targets.len());
         for &idx in &targets {
             let before = self.rating_cache.get(&idx).copied().unwrap_or(0);
@@ -77783,23 +77807,7 @@ impl App {
         // the current DB value, so retaining unmatched page keys would grow this set for every
         // ordinary page adjustment during the process lifetime.
         let keys = std::mem::take(&mut self.pinned_adjustment_refresh_keys);
-        for key in keys {
-            let matching: Vec<usize> = self
-                .thumb_edit_preview_keys
-                .iter()
-                .filter_map(|(&idx, preview_key)| {
-                    (preview_key == &key
-                        && self
-                            .items
-                            .get(idx)
-                            .is_some_and(|item| !item.has_page_data()))
-                    .then_some(idx)
-                })
-                .collect();
-            for idx in matching {
-                self.evict_thumbnail_for_reload(idx);
-            }
-        }
+        self.evict_pinned_adjustment_materializations(&keys);
     }
 
     fn poll_edit_preview_cache(&mut self, ctx: &egui::Context) {
@@ -78142,6 +78150,14 @@ impl App {
         self.settings.window_maximized = self
             .startup_window_geometry
             .maximized_to_save(self.last_window_maximized);
+        self.prepare_page_edit_history_boundary();
+        if scope.waits_for_sidecar_writer() {
+            let commits = self.take_parked_page_edit_exit_commits();
+            self.deliver_page_edit_commits(commits);
+        }
+        self.local_adjust_mask_lasso_points.clear();
+        self.local_adjust_mask_shape_drag_start = None;
+        self.local_adjust_mask_shape_drag_end = None;
         self.settings.save();
         // **まず確定する。**保留のままの編集は、メモリにしか無いのでここで消える。
         self.commit_local_adjust_pending_edits();
@@ -78392,71 +78408,11 @@ impl App {
         idx: usize,
         layers: local_adjust_core::LocalAdjustmentLayers,
     ) {
-        let key = match self.page_path_key(idx) {
-            Some(key) => key,
-            None => return,
+        let Some(mut target) = self.page_adjustment_target_for_idx(idx) else {
+            return;
         };
-        self.invalidate_edit_preview_cache_for_key(&key);
-        // presence は「画面に出ている状態」を表す。保存の成否ではないので、同期版と
-        // 同じく結果を待たずに立てる (失敗しても編集は画面に残す)。
-        Self::set_page_key_presence(&mut self.local_adjust_page_keys, &key, !layers.is_empty());
-        self.set_local_adjust_layers_for_idx_memory_only(
-            idx,
-            local_adjust_core::LocalAdjustmentLayers::clone(&layers),
-        );
-        self.submit_local_adjust_write(idx, key, layers);
-    }
-
-    /// 保存要求を worker へ積み、完了時にミラー先を復元するための座標を控える。
-    ///
-    /// **サイドカー座標は積む時点で固定する。**完了が返る頃には一覧の idx が別のページを
-    /// 指し得るので、そのとき解決し直すと無関係なページへミラーする。
-    fn submit_local_adjust_write(
-        &mut self,
-        idx: usize,
-        key: String,
-        layers: local_adjust_core::LocalAdjustmentLayers,
-    ) {
-        self.ensure_local_adjust_write_handle();
-        let layer_count = layers.len();
-        let submitted = match self.local_adjust_write_handle.as_ref() {
-            Some(handle) => handle.submit(key.clone(), layers),
-            None => Err(EditStoreOutcome::Failed(
-                "保存ワーカーを起動できません".to_string(),
-            )),
-        };
-        let generation = match submitted {
-            Ok(generation) => generation,
-            Err(outcome) => {
-                // worker が受け取らなかった = 正本には何も書かれない。黙って積んだ
-                // ことにすると、画面には編集が残ったまま保存されない状態が続く。
-                // 他の失敗と同じ扱い (ミラーを書かず、利用者へ伝える) にする。
-                debug_assert!(!matches!(outcome, EditStoreOutcome::Committed));
-                let _ = self.edit_store_write_succeeded("補正レイヤー", outcome);
-                self.local_adjust_write_pending.remove(&key);
-                return;
-            }
-        };
-        crate::perf::event(
-            "local_adjust",
-            "save_enqueue",
-            Some(&key),
-            generation,
-            &[("layers", serde_json::Value::from(layer_count))],
-        );
-        let sidecar = if self.idx_is_compiled_book_page(idx) {
-            None
-        } else {
-            self.sidecar_coords(idx)
-        };
-        self.local_adjust_write_pending.insert(
-            key,
-            LocalAdjustWritePending {
-                generation,
-                idx,
-                sidecar,
-            },
-        );
+        target.idx_hint = PageIndexHint::Unresolved;
+        self.set_local_adjust_layers_for_target(&target, layers);
     }
 
     pub(crate) fn ensure_local_adjust_write_handle(&mut self) {
@@ -78477,9 +78433,7 @@ impl App {
                 completions.push(completion);
             }
         }
-        for completion in completions {
-            self.apply_local_adjust_write_completion(completion);
-        }
+        self.apply_local_adjust_write_completions(completions);
     }
 
     /// 終了時: worker を止めて在庫を書き切らせ、その結果をミラーへ反映する。
@@ -78491,9 +78445,7 @@ impl App {
         let Some(handle) = self.local_adjust_write_handle.take() else {
             return;
         };
-        for completion in handle.shutdown_and_collect() {
-            self.apply_local_adjust_write_completion(completion);
-        }
+        self.apply_local_adjust_write_completions(handle.shutdown_and_collect());
     }
 
     /// 積んである保存が着地するまで待ち、結果を反映する。
@@ -78505,9 +78457,8 @@ impl App {
         let Some(handle) = self.local_adjust_write_handle.as_ref() else {
             return;
         };
-        for completion in handle.drain_blocking() {
-            self.apply_local_adjust_write_completion(completion);
-        }
+        let completions = handle.drain_blocking();
+        self.apply_local_adjust_write_completions(completions);
     }
 
     /// 保存結果 1 件を UI 状態へ反映する。**R-26 の境界はここ。**
@@ -78526,54 +78477,72 @@ impl App {
         &mut self,
         completion: crate::local_adjust_write_worker::LocalAdjustWriteCompletion,
     ) {
+        self.apply_local_adjust_write_completions([completion]);
+    }
+
+    fn apply_local_adjust_write_completions(
+        &mut self,
+        completions: impl IntoIterator<
+            Item = crate::local_adjust_write_worker::LocalAdjustWriteCompletion,
+        >,
+    ) {
+        let mut documents = std::collections::HashMap::new();
+        for completion in completions {
+            if let Some((key, layers)) = self.apply_local_adjust_write_completion_inner(completion)
+            {
+                documents.insert(key, layers);
+            }
+        }
+        self.publish_accepted_local_page_edits(&documents);
+    }
+
+    fn apply_local_adjust_write_completion_inner(
+        &mut self,
+        completion: crate::local_adjust_write_worker::LocalAdjustWriteCompletion,
+    ) -> Option<(String, local_adjust_core::LocalAdjustmentLayers)> {
         let crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
             key,
             generation,
             layers,
             outcome,
+            origin,
         } = completion;
-        let Some(pending) = self.local_adjust_write_pending.get(&key) else {
-            return;
-        };
-        let sidecar = pending.sidecar.clone();
-        let idx = pending.idx;
-        // 記録を畳むのは最新の完了だけ。古い完了で畳むと、後から届く最新の完了が
-        // ミラー先を失う。
-        if pending.generation == generation {
+        let latest = self
+            .local_adjust_write_pending
+            .get(&key)
+            .is_some_and(|pending| pending.generation == generation);
+        if latest {
             self.local_adjust_write_pending.remove(&key);
         }
-
         if !self.edit_store_write_succeeded("補正レイヤー", outcome) {
-            // 画面には残す。durable な mirror だけ書かない。
-            return;
+            return None;
         }
-        if !self.local_adjust_write_pending.contains_key(&key)
-            && let Some(snapshot) = self.page_edit_snapshot.as_mut()
-        {
-            if snapshot.volatile_keys.remove(&key) {
-                self.page_edit_revision = self.page_edit_revision.wrapping_add(1);
-            }
-        }
+        let Some(origin) = origin else {
+            return None;
+        };
+        let sidecar = origin.target.sidecar_coords.clone();
         if layers.is_empty() {
             self.with_sidecar_coords_mut(sidecar.as_ref(), |sc, rel| {
                 sc.remove_local_adjust_layers(rel)
             });
         } else {
+            let mirrored = layers.clone();
             self.with_sidecar_coords_mut(sidecar.as_ref(), move |sc, rel| {
-                sc.set_local_adjust_layers(rel, layers)
+                sc.set_local_adjust_layers(rel, mirrored)
             });
         }
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Edits,
         );
-        // idx は完了までに別のページを指し得る。同じ key を指したままのときだけ
-        // idx 依存の後続処理を走らせる。
-        if self.page_path_key(idx).as_deref() == Some(key.as_str()) {
-            self.record_content_identity_for_idx(
-                idx,
-                crate::content_identity::ContentIdentityTrigger::Edit,
-            );
+        if origin.context == self.projected_viewer_context_id() {
+            for idx in self.page_adjustment_indices(&origin.target) {
+                self.record_content_identity_for_idx(
+                    idx,
+                    crate::content_identity::ContentIdentityTrigger::Edit,
+                );
+            }
         }
+        latest.then_some((key, layers))
     }
 
     /// 指定 idx の補正レイヤー配列を in-memory state だけに反映する。
@@ -78583,6 +78552,19 @@ impl App {
         idx: usize,
         layers: local_adjust_core::LocalAdjustmentLayers,
     ) {
+        if let Some(key) = self.page_path_key(idx)
+            && let LocalPageEditDocument::Editing {
+                owner,
+                layers: draft,
+                revision,
+                ..
+            } = &mut self.local_page_edit_document
+            && owner.target.page_key == key
+            && *draft != layers
+        {
+            *draft = layers.clone();
+            *revision = revision.wrapping_add(1);
+        }
         self.set_local_adjust_layers_for_idx_memory_only_inner(idx, layers);
         self.bump_local_adjust_generation(idx);
     }
@@ -78601,6 +78583,9 @@ impl App {
         idx: usize,
         layers: local_adjust_core::LocalAdjustmentLayers,
     ) {
+        if let Some(key) = self.page_path_key(idx) {
+            self.cancel_superseded_page_edit_producers(&key, &layers, false);
+        }
         if layers.is_empty() {
             self.local_adjust_page_layers.remove(&idx);
             self.local_adjust_pages.remove(&idx);
@@ -84742,7 +84727,11 @@ impl App {
     /// 本文長による自動計算を使わず、一定時間を保証したい案内向け。
     pub(crate) fn show_feedback_toast_with_duration(&mut self, text: String, duration_secs: f32) {
         #[cfg(windows)]
-        self.show_native_video_overlay_toast(text.clone(), false);
+        self.show_native_video_overlay_toast_with_linger(
+            text.clone(),
+            false,
+            Some(std::time::Duration::from_secs_f32(duration_secs)),
+        );
         self.fs_feedback_toast = Some((text, std::time::Instant::now(), duration_secs));
         self.fs_feedback_toast_reveal_path = None;
         // 発火面不明の従来経路: 全面に描く (単面表示は show_feedback_toast_on を使う)。
@@ -85199,6 +85188,24 @@ impl App {
         target: &PageAdjustmentTarget,
         params: crate::adjustment::AdjustParams,
     ) -> EditStoreOutcome {
+        let result = self.set_page_params_for_target_store(target, params.clone());
+        if result == EditStoreOutcome::Committed {
+            let document = Some(params);
+            let document = document
+                .filter(|params| *params != self.adjustment_standard_params_for_target(target));
+            self.publish_accepted_adjustment_page_edits(&HashMap::from([(
+                target.page_key.clone(),
+                document,
+            )]));
+        }
+        result
+    }
+
+    fn set_page_params_for_target_store(
+        &mut self,
+        target: &PageAdjustmentTarget,
+        params: crate::adjustment::AdjustParams,
+    ) -> EditStoreOutcome {
         // 固定代表サムネは、親コンテナだけが mounted で参照元ページ自体は items に
         // 無い場合がある。親セルの refresh 判定は idx ではなく page key の実効値で行う。
         let old_effective_for_key = self.effective_params_for_target(target);
@@ -85295,6 +85302,21 @@ impl App {
         &mut self,
         target: &PageAdjustmentTarget,
     ) -> EditStoreOutcome {
+        let result = self.clear_page_params_for_target_store(target);
+        if result == EditStoreOutcome::Committed {
+            let document = None;
+            self.publish_accepted_adjustment_page_edits(&HashMap::from([(
+                target.page_key.clone(),
+                document,
+            )]));
+        }
+        result
+    }
+
+    fn clear_page_params_for_target_store(
+        &mut self,
+        target: &PageAdjustmentTarget,
+    ) -> EditStoreOutcome {
         // set と同様、未 mounted の固定代表参照元も key 単位で変化を検出する。
         let old_effective_for_key = self.effective_params_for_target(target);
         let fallback = self.adjustment_standard_params_for_target(target);
@@ -85362,6 +85384,17 @@ impl App {
         target: &PageAdjustmentTarget,
         params: Option<crate::adjustment::AdjustParams>,
     ) {
+        let mut documents = HashMap::new();
+        self.restore_page_params_for_target_collect(target, params, &mut documents);
+        self.publish_accepted_adjustment_page_edits(&documents);
+    }
+
+    pub(crate) fn restore_page_params_for_target_collect(
+        &mut self,
+        target: &PageAdjustmentTarget,
+        params: Option<crate::adjustment::AdjustParams>,
+        documents: &mut HashMap<String, Option<crate::adjustment::AdjustParams>>,
+    ) {
         match params {
             Some(params) => {
                 let old_by_idx = self
@@ -85369,15 +85402,23 @@ impl App {
                     .into_iter()
                     .map(|idx| (idx, self.effective_params(idx).clone()))
                     .collect::<Vec<_>>();
-                let result = self.set_page_params_for_target(target, params.clone());
-                let _ = self.edit_store_write_succeeded("補正", result);
+                let result = self.set_page_params_for_target_store(target, params.clone());
+                let committed = self.edit_store_write_succeeded("補正", result);
                 for (idx, old) in old_by_idx {
                     self.clear_caches_for_param_change(idx, &old, &params);
                 }
+                if committed {
+                    let value = (params != self.adjustment_standard_params_for_target(target))
+                        .then_some(params);
+                    documents.insert(target.page_key.clone(), value);
+                }
             }
             None => {
-                let result = self.clear_page_params_for_target(target);
-                let _ = self.edit_store_write_succeeded("補正の解除", result);
+                let result = self.clear_page_params_for_target_store(target);
+                let committed = self.edit_store_write_succeeded("補正の解除", result);
+                if committed {
+                    documents.insert(target.page_key.clone(), None);
+                }
             }
         }
     }
@@ -85478,6 +85519,9 @@ impl App {
             );
             Self::set_page_keys_presence(&mut self.adjusted_page_keys, &keys, false);
             if self.edit_store_write_succeeded("補正の一括解除", written) {
+                self.publish_accepted_adjustment_page_edits(
+                    &keys.iter().map(|key| (key.clone(), None)).collect(),
+                );
                 for (folder, rels) in sidecar_coords {
                     if let Some(sc) = self.sidecar_mut(&folder) {
                         sc.remove_adjust_bulk(rels);
@@ -85496,6 +85540,12 @@ impl App {
             );
             Self::set_page_keys_presence(&mut self.adjusted_page_keys, &keys, true);
             if self.edit_store_write_succeeded("補正の一括適用", written) {
+                self.publish_accepted_adjustment_page_edits(
+                    &keys
+                        .iter()
+                        .map(|key| (key.clone(), Some(params.clone())))
+                        .collect(),
+                );
                 for (folder, rels) in sidecar_coords {
                     if let Some(sc) = self.sidecar_mut(&folder) {
                         sc.set_adjust_bulk(rels, &params);
@@ -85537,6 +85587,9 @@ impl App {
         );
         Self::set_page_keys_presence(&mut self.adjusted_page_keys, &keys, false);
         if self.edit_store_write_succeeded("補正の全解除", written) {
+            self.publish_accepted_adjustment_page_edits(
+                &keys.iter().map(|key| (key.clone(), None)).collect(),
+            );
             for (folder, rels) in sidecar_coords {
                 if let Some(sc) = self.sidecar_mut(&folder) {
                     sc.remove_adjust_bulk(rels);
@@ -85608,9 +85661,20 @@ impl App {
                         .is_some_and(|p| p == self.effective_default_for_idx(*idx))
             })
             .collect();
-        for idx in redundant {
-            self.clear_page_params(idx);
+        self.clear_page_params_for_indices(&redundant);
+    }
+
+    fn clear_page_params_for_indices(&mut self, indices: &[usize]) {
+        let mut documents = HashMap::new();
+        for &idx in indices {
+            if let Some(target) = self.page_adjustment_target_for_idx(idx) {
+                let result = self.clear_page_params_for_target_store(&target);
+                if self.edit_store_write_succeeded("補正の解除", result) {
+                    documents.insert(target.page_key, None);
+                }
+            }
         }
+        self.publish_accepted_adjustment_page_edits(&documents);
     }
 
     /// 指定パラメータを settings.global_preset にコピーして保存する。
@@ -86385,14 +86449,24 @@ impl App {
         };
 
         let mut any_ai_changed = false;
+        let mut documents = HashMap::new();
         for &idx in &targets {
             let old_params = self.effective_params(idx).clone();
             if !old_params.ai_settings_eq(&slot.params) {
                 any_ai_changed = true;
             }
-            self.set_page_params(idx, slot.params.clone());
+            if let Some(target) = self.page_adjustment_target_for_idx(idx) {
+                let result = self.set_page_params_for_target_store(&target, slot.params.clone());
+                if self.edit_store_write_succeeded("補正", result) {
+                    let params = (slot.params
+                        != self.adjustment_standard_params_for_target(&target))
+                    .then(|| slot.params.clone());
+                    documents.insert(target.page_key, params);
+                }
+            }
             self.clear_caches_for_param_change(idx, &old_params, &slot.params);
         }
+        self.publish_accepted_adjustment_page_edits(&documents);
         // AI 設定が変わった target が 1 件でもあれば AI キャッシュ / 進行中 pending を
         // 全体単位で畳む (AI キャッシュは item idx キーでフラグメント化できないため)。
         if any_ai_changed {
@@ -86429,9 +86503,7 @@ impl App {
             self.show_feedback_toast("[個別設定なし]".to_string());
             return;
         }
-        for &idx in &to_clear {
-            self.clear_page_params(idx);
-        }
+        self.clear_page_params_for_indices(&to_clear);
         let count = to_clear.len();
         if count == 1 {
             self.show_feedback_toast("[個別設定を解除]".to_string());
@@ -86674,24 +86746,7 @@ impl App {
             self.thumb_adjust_tex.remove(&idx);
             return;
         };
-        // 補正 tex のある keep セルだけ調べる。全 items の path を release 時に
-        // 作り直すと、大きな一覧では単一ページ操作でも UI を止めてしまう。
-        let affected: Vec<usize> = self
-            .thumb_adjust_tex
-            .keys()
-            .copied()
-            .filter(|&candidate| {
-                self.page_path_key(candidate).as_deref() == Some(key.as_str())
-                    || self
-                        .thumb_edit_preview_keys
-                        .get(&candidate)
-                        .is_some_and(|preview_key| preview_key == &key)
-            })
-            .collect();
-        for affected in affected {
-            self.thumb_adjust_tex.remove(&affected);
-        }
-        self.pinned_adjustment_refresh_keys.insert(key);
+        self.invalidate_thumb_adjust_for_page_key(&key);
     }
 
     /// フルスクリーン補正キャッシュとサムネ補正テクスチャを同時に全クリアする。
@@ -92296,7 +92351,9 @@ impl App {
         // IndexerManager の重い初期化はバックグラウンドスレッドで実行する。
         // 進行中は中央に「起動中…」+ 現在ステップを表示し、× ボタン以外の
         // 入力イベントを破棄する。完了したら通常 update に進む。
-        self.poll_indexer_notifications();
+        self.poll_indexer_notifications(
+            ctx.input(|input| input.viewport().minimized.unwrap_or(false)),
+        );
         self.poll_housekeeping_arm();
         // VST3 起動時の bridge enable + 自動ロードは専用 worker で走らせる。
         // 画像閲覧だけの起動では通常 UI を先に出し、動画を開いた時点でまだロード中なら
@@ -97422,6 +97479,79 @@ mod index_full_check_tests {
         let shown_at = toast.1;
         app.poll_startup_diagnostics_notice(false, take_notice);
         assert_eq!(app.fs_feedback_toast.as_ref().unwrap().1, shown_at);
+    }
+
+    #[test]
+    fn name_index_failure_notice_waits_for_drawable_ui_and_survives_drains_once() {
+        let mut env = setup_app_for_test();
+        let app = &mut env.app;
+        let db = Arc::new(crate::search_index_db::SearchIndexDb::open_in_memory().unwrap());
+        app.search_index_db = Some(db.clone());
+        db.report_write_failure(
+            "fixture",
+            std::path::Path::new("C:/root"),
+            &rusqlite::Error::InvalidQuery,
+        );
+        let (_tx, rx) = mpsc::channel();
+        app.indexer_init = IndexerInit::Pending(StartupInitPending {
+            rx,
+            started_at: Instant::now(),
+            full_check_requested: false,
+            disposal_witness: None,
+        });
+        app.window_visible = true;
+        app.poll_indexer_notifications(false);
+        assert!(app.fs_feedback_toast.is_none(), "overlay keeps the notice");
+        // The name DB is independent of the FTS manager's availability.
+        app.indexer_init = IndexerInit::Unavailable;
+        app.window_visible = false;
+        app.poll_indexer_notifications(false);
+        assert!(app.fs_feedback_toast.is_none(), "tray keeps the notice");
+        app.window_visible = true;
+        app.poll_indexer_notifications(true);
+        assert!(
+            app.fs_feedback_toast.is_none(),
+            "minimized UI keeps the notice"
+        );
+        #[cfg(windows)]
+        let native_probe = {
+            let mut player = crate::video::VideoPlayer::local_ready_disconnected_for_test(
+                PathBuf::from("fixture.mp4"),
+            );
+            let probe = player.install_native_ui_probe_for_test();
+            app.fullscreen_idx = Some(0);
+            app.fs_cache.insert(
+                0,
+                FsCacheEntry::Video {
+                    player: Box::new(player),
+                    load_seq: 0,
+                },
+            );
+            probe
+        };
+        let before = Instant::now();
+        app.poll_indexer_notifications(false);
+        let toast = app.fs_feedback_toast.as_ref().unwrap();
+        assert_eq!(toast.0, crate::search_index_db::NAME_UPDATE_FAILURE_NOTICE);
+        assert!(toast.1 >= before);
+        assert_eq!(toast.2, 5.0);
+        #[cfg(windows)]
+        assert_eq!(
+            native_probe.drain_toasts(),
+            vec![(
+                crate::search_index_db::NAME_UPDATE_FAILURE_NOTICE.to_owned(),
+                Some(std::time::Duration::from_secs(5)),
+            )]
+        );
+        let shown_at = toast.1;
+        db.report_write_failure(
+            "later root",
+            std::path::Path::new("C:/other"),
+            &rusqlite::Error::InvalidQuery,
+        );
+        app.poll_indexer_notifications(false);
+        assert_eq!(app.fs_feedback_toast.as_ref().unwrap().1, shown_at);
+        assert!(db.take_failure_notifications().is_empty());
     }
 
     #[test]

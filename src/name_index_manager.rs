@@ -142,11 +142,8 @@ impl Backend for DatabaseBackend {
 
     fn clear(&self, root: &std::path::Path) -> Result<(), String> {
         if let Err(error) = self.db.clear_for_favorite(root) {
-            if let Err(marker_error) = self.db.request_rebuild_on_next_start() {
-                crate::logger::log(format!(
-                    "name-index-manager: rebuild marker failed: {marker_error}"
-                ));
-            }
+            self.db
+                .report_write_failure("clear_for_favorite", root, &error);
             return Err(error.to_string());
         }
         Ok(())
@@ -798,6 +795,10 @@ mod tests {
             .unwrap();
         assert_eq!(pending, 1);
         shutdown(manager);
+        assert_eq!(
+            db.take_failure_notifications(),
+            vec![crate::search_index_db::NAME_UPDATE_FAILURE_NOTICE]
+        );
         conn.execute_batch("DROP TRIGGER fail_clear").unwrap();
         drop(conn);
         drop(db);

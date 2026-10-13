@@ -299,6 +299,7 @@ impl App {
             self.restore_fs_page_from_snapshot(swap.new_fullscreen_idx, transfer);
         }
         self.fullscreen_idx = Some(swap.new_fullscreen_idx);
+        self.align_page_edit_slots_with_exact_reader();
         self.video_audio_mode = self.video_audio_mode.and_then(&remap);
         self.video_audio_vst = self.video_audio_vst.take().and_then(|mut state| {
             remap(state.fs_idx).map(|new_idx| {

@@ -454,6 +454,29 @@ mod tests {
         assert_real_writer_records(Role::Core);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn legacy_shared_log_lock_rejects_owner_write_with_os_error_33() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("0000000000000001-core-1.jsonl");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        assert!(FileExt::try_lock_shared(&file).unwrap());
+        let error =
+            write_line(&mut file, &serde_json::json!({"kind":"header"}), &mut 0).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(33));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        // The old shared byte-range lock is the cause, rather than permissions
+        // or a failed sink. Releasing it makes the same handle writable.
+        FileExt::unlock(&file).unwrap();
+        assert!(write_line(&mut file, &serde_json::json!({"kind":"header"}), &mut 0).unwrap());
+        file.flush().unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() > 0);
+    }
+
     #[test]
     fn terminal_drains_more_than_one_batch_and_is_last_exactly_once() {
         let o = crate::tests::test_owner(Role::Core);

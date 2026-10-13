@@ -3670,6 +3670,7 @@ impl App {
             self.comic_pages = std::mem::take(&mut projection.comic);
             self.local_adjust_pages = std::mem::take(&mut projection.local_adjust);
         }
+        self.reproject_page_edit_owners();
         self.metadata_cache.clear();
         self.exif_cache.clear();
         self.xmp_cache.clear();

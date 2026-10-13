@@ -3045,6 +3045,7 @@ impl App {
         &mut self,
         context: RingShortcutContext,
     ) -> RingPickerState {
+        self.prepare_page_edit_history_boundary();
         let fs_idx = self.fullscreen_idx;
         let params = fs_idx.map(|idx| self.effective_params(idx).clone());
         let item_rating_records = self.current_picker_item_rating_records(context);

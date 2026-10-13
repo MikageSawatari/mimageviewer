@@ -3,6 +3,14 @@
 画像補正 (adjustment) と AI アップスケール/デノイズ/Inpaint は、複数レイヤーのキャッシュと優先順位の決定ロジックで
 成り立っている。「補正したら元に戻った」「AI 結果が一瞬消える」といった不具合は、ここの無効化ルールの間違いから起きる。
 
+§1.372: 通常ページ補正のdragと部分補正のdraft／選択レイヤーはviewer contextに属する。
+一覧再配置後の確定・Undo／Redoは開始時のpage keyへ保存する。同keyの別contextで新規編集を
+始めるときは、保存待ちも含む最新受付済み文書をbeforeにする。UIの値変更は操作した
+パラメーターだけをその文書へ適用し、旧パネルの全文で先行変更を置換しない。
+未完の線／ラッソは兄弟contextの履歴操作では保持し、そのcontextのUndo受理や終了で取消す。
+同一ページのpointer/key同時入力の既存終端は本件で変更しない。
+[所有・履歴・保存の契約](page-adjustment-owner-plan.md)を参照。
+
 ---
 
 ## 1. スコープ (v2.9.0 で 2 段化)
@@ -1401,7 +1409,8 @@ egui の popup は別レイヤーで生成されるため、パネルの `Visual
 
 ```rust
 enum AdjustUndoScope {
-    Page(usize),       // adjustment_page_params[idx]
+    Page(usize),       // キー取得不可のlegacy退避先
+    PageKey(PageAdjustmentTarget), // 通常のページ補正。適用ごとに現一覧で解決
     Favorite(Uuid),    // adjustment_favorite_params[uuid]
     Global,            // settings.global_preset
 }
@@ -1418,6 +1427,11 @@ struct LocalAdjustmentChange {
     after: Vec<LocalAdjustmentLayer>,
 }
 ```
+
+現行の通常補正Undoは既に `PageKey` を使用し、一覧外のページも元の安定キーへ復元する。
+一方、補正レイヤーUndoの `idx` と編集中セッションの対象には再配置時の所有問題が残る。
+§1.372の [編集owner設計案](page-adjustment-owner-plan.md) はその差を明記している。
+同案は設計レビュー待ちであり、local Undo／draftの新設計を実装済みとは扱わない。
 
 `Global` スコープは常に `Some` (`settings.global_preset` は Optional ではない)。
 `Page` / `Favorite` の `None` は「そのスコープにエントリが存在しない =
