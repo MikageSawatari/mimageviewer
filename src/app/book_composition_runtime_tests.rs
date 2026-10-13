@@ -1839,3 +1839,270 @@ fn g3_mode_only_archive_removal_and_reentry_preserve_inherited_rtl_cover() {
 }
 
 include!("book_composition_revision_tests.rs");
+
+fn install_followup_composed_book(
+    app: &mut AppTestEnvForTest,
+    archive: bool,
+) -> (
+    BookCompositionService,
+    BookCompositionProcessOwner,
+    BookScopeKey,
+    PageDomain,
+    crate::spread_db::SpreadDb,
+) {
+    use crate::book_composition::*;
+    let root = app.tmp.path().join(if archive {
+        "followup.zip"
+    } else {
+        "followup.pdf"
+    });
+    install_document(app, &root);
+    if archive {
+        let entries = (0..4)
+            .map(|page| crate::zip_loader::ZipImageEntry {
+                entry_name: format!("{page}.jpg"),
+                uncompressed_size: 0,
+                mtime: 0,
+                container_ancestry: vec![],
+            })
+            .collect::<Vec<_>>();
+        app.items = entries
+            .iter()
+            .map(|entry| GridItem::ZipImage {
+                zip_path: root.clone(),
+                entry_name: entry.entry_name.clone(),
+            })
+            .collect();
+        app.zip_nav = Some(crate::zip_tree::ZipNavState::new(Arc::new(
+            crate::zip_tree::ZipTree::build(root.clone(), entries),
+        )));
+        app.projection_recipe = book_materialization::ProjectionRecipe::Book(
+            book_materialization::BookScope::Archive {
+                logical_root: root,
+                prefix: vec![],
+            },
+        );
+    }
+    let (scope, domain) = app.composition_scope_domain().unwrap();
+    let raw = app
+        .items
+        .iter()
+        .enumerate()
+        .map(|(raw_index, item)| CanonicalRawPage {
+            raw_index,
+            page: match item {
+                GridItem::ZipImage { entry_name, .. } => CompositionPageRef::ArchiveEntry {
+                    entry_name: entry_name.clone(),
+                },
+                GridItem::PdfPage { page_num, .. } => CompositionPageRef::PdfPage {
+                    page_num: *page_num,
+                },
+                _ => unreachable!(),
+            },
+        })
+        .collect::<Vec<_>>();
+    let book = BookComposition::new(
+        ReadingDirection::Ltr,
+        vec![
+            CompositionUnit::Pair {
+                first: raw[0].page.clone(),
+                second: raw[1].page.clone(),
+            },
+            CompositionUnit::Pair {
+                first: raw[2].page.clone(),
+                second: raw[3].page.clone(),
+            },
+        ],
+    );
+    let data = app.tmp.path().join("followup-composition-data");
+    let (service, owner) = runtime(app, &data);
+    service
+        .save(scope.clone(), domain.clone(), book.clone())
+        .recv_timeout(WAIT)
+        .unwrap()
+        .status
+        .unwrap();
+    let manifest = raw
+        .iter()
+        .map(|page| ManifestPage {
+            page: page.page.clone(),
+            availability: ManifestAvailability::Present {
+                item_index: page.raw_index,
+            },
+        })
+        .collect::<Vec<_>>();
+    let projection = project_composition(
+        scope.clone(),
+        &domain,
+        service.snapshot().token_for(&scope),
+        Some(&book),
+        &raw,
+        &manifest,
+        4,
+    )
+    .unwrap();
+    let CompositionProjectionOutcome::Composed(layout) = projection.outcome else {
+        panic!("composed fixture");
+    };
+    app.install_composition_for_test(layout);
+    app.fullscreen_idx = Some(0);
+    app.reading_flow = crate::settings::ReadingFlow::Paged;
+    let db = crate::spread_db::SpreadDb::open_at(&data.join("spread.db")).unwrap();
+    db.set_presentation_state(
+        &crate::spread_db::container_key(&scope.logical_root, &[]),
+        crate::settings::SpreadMode::Ltr,
+        crate::settings::ReadingFlow::Paged,
+        crate::settings::ReadingDirection::Ltr,
+        (
+            crate::settings::SpreadMode::Single,
+            crate::settings::ReadingFlow::Paged,
+            crate::settings::ReadingDirection::Ltr,
+        ),
+    )
+    .unwrap();
+    assert!(app.composed_book_layout().is_some());
+    (service, owner, scope, domain, db)
+}
+
+fn composed_view_followup_cases(reading_flow: bool) {
+    use super::book_append_producer_tests::{
+        FOLLOWUP_PHASES, assert_followup_terminal, followup_fixture,
+    };
+    use crate::settings::{ReadingFlow, SpreadMode};
+    for archive in [false, true] {
+        for phase in FOLLOWUP_PHASES {
+            for noop in [false, true] {
+                let (mut app, append, worker) = followup_fixture(phase);
+                let (service, owner, scope, domain, db) =
+                    install_followup_composed_book(&mut app, archive);
+                let key = crate::spread_db::container_key(&scope.logical_root, &[]);
+                let (entered, release) = service.hold_worker_for_test();
+                entered.recv_timeout(WAIT).unwrap();
+                let ctx = egui::Context::default();
+                if reading_flow {
+                    app.set_reading_flow_for_fullscreen(
+                        &ctx,
+                        0,
+                        if noop {
+                            ReadingFlow::Paged
+                        } else {
+                            ReadingFlow::Horizontal
+                        },
+                    );
+                } else {
+                    app.apply_fullscreen_view_mode(
+                        &ctx,
+                        0,
+                        if noop {
+                            crate::ui_fullscreen::FullscreenViewMode::Spread
+                        } else {
+                            crate::ui_fullscreen::FullscreenViewMode::Single
+                        },
+                    );
+                }
+                // The service worker cannot publish or change DB values yet.
+                // Receipt invalidation/rejection must happen at admission.
+                assert_eq!(db.get(&key), Some(SpreadMode::Ltr));
+                assert_eq!(
+                    db.get_flow(&key).unwrap_or(ReadingFlow::Paged),
+                    ReadingFlow::Paged
+                );
+                let accepted = !noop && phase != "undo";
+                assert_eq!(
+                    app.book_append_undo_revision,
+                    append.accepted_revision + u64::from(accepted)
+                );
+                assert_eq!(
+                    app.book_append_operation_matches_receipt(append.operation()),
+                    !accepted
+                );
+                assert_eq!(
+                    app.fullscreen_idx,
+                    Some(0),
+                    "no cursor movement may mask missing admission"
+                );
+                release.send(()).unwrap();
+                service
+                    .prepare(scope, domain)
+                    .recv_timeout(WAIT)
+                    .unwrap()
+                    .status
+                    .unwrap();
+                assert_eq!(
+                    db.get(&key),
+                    Some(if accepted && !reading_flow {
+                        SpreadMode::Single
+                    } else {
+                        SpreadMode::Ltr
+                    })
+                );
+                assert_eq!(
+                    db.get_flow(&key).unwrap_or(ReadingFlow::Paged),
+                    if accepted && reading_flow {
+                        ReadingFlow::Horizontal
+                    } else {
+                        ReadingFlow::Paged
+                    }
+                );
+                assert_eq!(
+                    app.spread_mode,
+                    if accepted && !reading_flow {
+                        SpreadMode::Single
+                    } else {
+                        SpreadMode::Ltr
+                    }
+                );
+                assert_eq!(
+                    app.reading_flow,
+                    if accepted && reading_flow {
+                        ReadingFlow::Horizontal
+                    } else {
+                        ReadingFlow::Paged
+                    }
+                );
+                assert!(service.drain_errors().is_empty());
+                if noop {
+                    assert!(app.book_append_operation_is_live(append.operation()));
+                } else {
+                    // Includes a real late Append terminal, which cannot revive
+                    // the receipt after the accepted view-setting mutation.
+                    assert_followup_terminal(&mut app, &append, worker, phase);
+                }
+                owner.shutdown_and_join();
+            }
+        }
+    }
+}
+
+#[test]
+fn section1373_composed_local_view_mode_admits_before_enqueue_and_preserves_noop() {
+    composed_view_followup_cases(false);
+}
+
+#[test]
+fn section1373_composed_local_reading_flow_admits_before_enqueue_and_preserves_noop() {
+    composed_view_followup_cases(true);
+}
+
+#[test]
+fn section1373_composed_local_view_settings_validate_target_and_service_before_admission() {
+    use super::book_append_producer_tests::followup_fixture;
+    for missing_target in [false, true] {
+        for flow in [false, true] {
+            let (mut app, append, _worker) = followup_fixture("ready");
+            if !missing_target {
+                let root = app.tmp.path().join("unavailable-service.pdf");
+                install_document(&mut app, &root);
+            }
+            app.book_composition_service = None;
+            let result = if flow {
+                app.persist_fullscreen_reading_flow(crate::settings::ReadingFlow::Horizontal)
+            } else {
+                app.persist_fullscreen_view_mode(crate::settings::SpreadMode::Single)
+            };
+            assert!(result.is_err());
+            assert_eq!(app.book_append_undo_revision, append.accepted_revision);
+            assert!(app.book_append_operation_matches_receipt(append.operation()));
+        }
+    }
+}

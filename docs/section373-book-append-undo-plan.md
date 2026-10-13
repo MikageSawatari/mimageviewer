@@ -203,6 +203,7 @@ leaseだけ取って後から旧queued書込みが削除pathへ着地する形�
 | metadata import／復元・設定 | metadata transferのwrite受付、`start_content_identity_restore` のnonempty／pending検査後のworker投入前、本root変更／対象書込みに影響する設定変更。復元promptのUndo中の拒否はtake／設定保存前、dont-ask設定変更も既存受付へ。明示settings Restore／FullResetは `execute_pending_settings_restore` のpending破棄／worker投入前。表示を読むだけのworkerは失効しない |
 | 明示リセット／履歴削除 | `reset_saved_rotations`、`remove_reading_history_entry_for_idx`／preferencesの全履歴削除、`clear_book_resume_async`。通常の位置recordは除外したまま、利用者の明示clearだけを受付へ。favorite view stateのremove／reset／clearも最初のmap・queue変更前。favorite削除は後段のdefault清掃に頼らずsettingsからの除去前に受付 |
 | 本構成draft／保存・解除（master統合） | 有効なdraft編集・専用Undo／Redoの受理で既存受付を通す。保存／解除はRemoteのlocal admission内で、既存保存ticket登録／workerへの開始通知より前に受付。選択・preview・取消・無変更は除外。送信済ticketは既存writer-busy分類へ登録し、owner退役後も終端まで保持 |
+| 構成済み本のlocal表示モード／読み方（merge review修正） | `persist_fullscreen_view_mode`／`persist_fullscreen_reading_flow`でscope／service確認後、既存受付→service enqueue。同値は既存の`apply_fullscreen_view_mode`／`set_reading_flow_for_fullscreen`で除外。receipt保持中は失効、Append中は遅着receiptの復活を拒否、UndoAppend中はenqueue・表示変更を拒否。新pending／ownerは追加しない |
 | 画像folder→ZIP（master統合） | 有効manifestの受理後、既存ZIP worker入口のtrim移譲・portal／metadata投入前に受付。確認画面前にも補完importが走るためConvertボタンまで遅らせない。manifest探索／案内だけはreadonlyであり失効しない |
 | 自分のcopy／refresh | `Append` intentに捕捉した同一operation IDから配送されたedit/semantic copyと一覧refreshだけを除外。source path一致／時間窓／「本処理中」だけでは除外しない。異なるaccepted mutationは必ず失効 |
 
@@ -219,6 +220,23 @@ Remoteの未回収reading writeはShiftClear／ViewSetting／ViewTrimを数え�
 
 機械的監査: `python scripts/check-book-append-mutation-admission.py`。
 producer関数と最初の書込み／投入位置を列挙し、受付が先にあることと、3 storeの新しい直接書込みを検出する。
+構成serviceの表示設定／trimの固有methodについてもproduction callerを全列挙し、未分類入口を失敗にする。
+local mode／flow、book trim／page trim保存・解除、Remote mode／trimは共通受付を確認する。
+構成draft／保存・解除は既存の専用受付・最初のticket投入の監査を維持する。
+既存の`apply_view_trim_for_key_with_fallback`は旧MarginFitの自動移行、`begin_book_projection`は
+受理済みtrimの採用前FIFO flushとして分類し、読取／採用で別のユーザーmutationを受付しない。
+今回のruntime修正は2保存入口への接続だけに限定し、next-bookの組の作り直し・投影ownerには触れない。
+ZIP／PDFの実handlerで同値／変更とreceipt・Append・UndoAppend・既存SourceMutation／Deleteを対照し、
+worker停止中の受付revision、FIFO終端後の保存値、同一cursor、遅着Appendのreceipt復活拒否を検査する。
+merge `cf90efc2e`の独立レビューP2への修正では、この3回帰（44ケース）がすべて成功した。
+構成関連208件／§1.373関連76件を再検証し、重複を除く277件成功／失敗0／ignored 0。
+fmtと通常／portable core checkも成功。fixtureの型参照だけを修正したため、両checkの成功を再利用する。
+監査は607 Rust files／23,006関数を検査し、6つの構成view writerと2つの自動移行／flushを分類してPASS。
+既存の構成draft／保存・解除とtrim／Remoteにも未分類のユーザーmutation入口は見つからなかった。
+test-fullは利用者指定により実行しない。検証ログは`target/merge-review-cf90efc2e-final`に保存する。
+`build-dev.ps1 -PreserveRuntime`はexit 0、core／remote／EPUB workerとruntime 4／PE 3の検査に成功。
+source／監査scriptの検証前後SHA-256は一致し、`git diff --check`も成功した。
+HEAD `cf90efc2e`を維持し、commit・mIVアプリ起動・coreの停止は行っていない。
 自動補完の `persist_native_video_marker_thumbnail`／`tick_pending_pin_thumb_refresh` は
 既に受理済みmarkerの再生成として明示除外する。readonly lookup／export／hydration、通常の読書位置record、
 favorite view stateのautomatic capture／flush、migration／purge、テストfixture／seedも後続ユーザーmutationではない。

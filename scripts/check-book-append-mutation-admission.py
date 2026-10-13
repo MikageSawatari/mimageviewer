@@ -71,6 +71,10 @@ MAINTENANCE = {
 # Other homologous user writers found during LISTrev8. Keep the first mutation
 # token explicit so admission cannot silently drift to the completion side.
 DIRECT_WRITERS = {
+    ("src/app/book_composition_runtime.rs", "persist_fullscreen_view_mode"):
+        "service.set_view_mode(",
+    ("src/app/book_composition_runtime.rs", "persist_fullscreen_reading_flow"):
+        "service.set_view_flow(",
     ("src/app/page_edit_owner.rs", "set_local_adjust_layers_for_target"):
         "self.set_local_adjust_layers_for_target_memory_only(",
     ("src/app/book_composition_editor.rs", "save_local_composition_editor"):
@@ -93,6 +97,25 @@ DIRECT_WRITERS = {
         "self.settings_restore_state.pending = None",
     ("src/ui_dialogs/favorites_editor.rs", "show_favorites_editor_dialog"):
         "self.settings.favorites.remove(",
+}
+
+# Service-specific methods: enumerate every production caller, including the
+# read/adoption transitions which only flush already accepted trim edits.
+COMPOSITION_VIEW_WRITERS = {
+    ("src/app/book_composition_runtime.rs", "persist_fullscreen_view_mode"): {"set_view_mode"},
+    ("src/app/book_composition_runtime.rs", "persist_fullscreen_reading_flow"): {"set_view_flow"},
+    ("src/app.rs", "persist_current_view_trim_book_state"): {"save_view_trim"},
+    ("src/app.rs", "persist_view_trim_page_override"): {"save_view_trim"},
+    ("src/app.rs", "remove_view_trim_page_override"): {"remove_view_trim_page"},
+    ("src/remote_ipc/ui.rs", "apply_pending_remote_write"): {"set_view_mode", "set_view_trim_book"},
+}
+COMPOSITION_VIEW_MAINTENANCE = {
+    ("src/app.rs", "apply_view_trim_for_key_with_fallback"): {"save_view_trim"},
+    ("src/app/book_composition_runtime.rs", "begin_book_projection"): {"save_view_trim"},
+}
+COMPOSITION_VIEW_METHODS = {
+    method for inventory in (COMPOSITION_VIEW_WRITERS, COMPOSITION_VIEW_MAINTENANCE)
+    for methods in inventory.values() for method in methods
 }
 
 FN = re.compile(r"\bfn\s+(\w+)\s*(?:<[^;{}]*>)?\s*\(")
@@ -339,6 +362,29 @@ def audit(root):
         if guard < 0 or first < 0 or guard >= first:
             errors.append(f"{function.label}: admission must precede {mutation}")
 
+    composition_calls = re.compile(
+        r"\.\s*(" + "|".join(sorted(COMPOSITION_VIEW_METHODS)) + r")\s*\("
+    )
+    for key, methods in (COMPOSITION_VIEW_WRITERS | COMPOSITION_VIEW_MAINTENANCE).items():
+        function = require(key)
+        if function is None:
+            continue
+        calls = list(composition_calls.finditer(function.body))
+        actual = {call.group(1) for call in calls}
+        if actual != methods:
+            errors.append(f"{function.label}: composition view writes changed: {sorted(actual)}")
+        if key in COMPOSITION_VIEW_WRITERS:
+            guard = re.search(rf"if\s+!self\.{GATE}\(\)", function.body)
+            if not guard or any(call.start() < guard.end() for call in calls):
+                errors.append(f"{function.label}: composition view enqueue must follow admission")
+        elif GATE in function.body:
+            errors.append(f"{function.label}: automatic composition transition must not admit an edit")
+    for function in all_functions:
+        if composition_calls.search(function.body) and function.key not in (
+            COMPOSITION_VIEW_WRITERS | COMPOSITION_VIEW_MAINTENANCE
+        ):
+            errors.append(f"{function.label}: unclassified composition view writer")
+
     preferences = require(("src/ui_dialogs/preferences.rs", "show_preferences_dialog"))
     if preferences is not None and not re.search(
         rf"if\s+clear_reading_history_requested\s*&&\s*self\.{GATE}\(\)", preferences.body
@@ -366,6 +412,8 @@ def main():
     print(f"PASS: {len(USER_WRITERS)} media writers, {len(DIRECT_WRITERS) + 1} other user writers, "
           f"{len(STORES)} admission accessors, "
           f"{len(MAINTENANCE)} automatic maintenance exclusions; "
+          f"{len(COMPOSITION_VIEW_WRITERS)} composition view writers, "
+          f"{len(COMPOSITION_VIEW_MAINTENANCE)} automatic composition transitions; "
           f"{files} Rust files / {count} functions scanned")
     return 0
 
