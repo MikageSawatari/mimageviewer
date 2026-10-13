@@ -400,21 +400,26 @@ Resumed の親 mtime ふるい、通知時のふるい bypass、走査中通知�
 新しい P2 が出続けた。mtime だけの再走査を無視する最小設計で、開いている一覧の代表も安定するため、
 session state／catalog／Remote・IPC の変更を避ける。
 
-次の版の設計変更 (利用者2026-10-13、未実装・独立レビュー待ち):
-[§1.375 R6](section375-operation-reconcile-plan.md) は走査・一覧準備・全行exact比較を既存prepare
+次の版の設計変更 (利用者2026-10-13、R8・LISTrev10独立設計レビューACCEPT・実装承認済み、初回採用入力の共有境界は設計§7の判断待ち):
+[§1.375 R8](section375-operation-reconcile-plan.md) は走査・通常一覧準備・全行exact比較を既存prepare
 ownerのworkerで行い、UIは同一／差分と差分の場合だけprepared結果を受ける。採用直前は
 context・世代／revisionを確認し、比較中に表示値が変わった結果は既存の拒否／再準備へ戻す。
 UIで全行比較・全件clone・比較用snapshot再構築を行わず、worker生成のimmutable採用投影と
 既存所有データを安価に共有する。現状はApp.items／prepared itemsがVec、folder prepareも
 UI側であり、この共有投影とworker準備への分離は必要な未実装基盤（設計§3.4）である。
+通常の初回採用では行とmetadataがUIのVecへ入り、既存hydration workerには行だけが渡る。
+実際に採用した値を安価に共有する境界を設計§7で先に確定し、初回表示を勝手に遅らせない。
 大量一覧1万／10万行でUI時間・worker比較時間・割当量と既存perfを測定する予定。
-監視更新で保持するのは代表ファイルの選択キーだけ。同じ選択を既存cache／要求経路で表示し、
-選択先自体が消失した場合だけ監視でも再選定する。明示「最新の情報に更新」では最新選定へ進む。
-Stackの保持identityはsource／context＋group keyで、代表path由来のperf_key／ItemIdとは分ける。
-R5のCPU採用画素保持案は撤回し、CPU／GPU eviction・予算・要求終端は変更しない。
+完全一致時だけ一覧installとそれに伴うサムネイル再要求を省き、現在の表示と既存要求を残す。
+代表の選択保持保証・消失時だけ再選定・Stack保持identityの契約は撤回する。差分install、
+CPU／GPU eviction後の再読込、idle upgrade、サイズ変更、cache miss／再生成では通常の
+代表選定・cache／要求経路に従い、代表が変わってよい。明示「最新の情報に更新」は従来どおり。
+cache key／payload／lookup／catalog・旧cache移行を変更せず、新しい保持キーや要求modeを
+追加しない。CPU／GPU eviction・予算・画像／保存終端・request ID相関も変更しない。
+手動pin設定・pin先消失時の既存fallbackは維持する。
 上記§1.314の観測mtime／採用表示metadata・sort・代表要求stampの区別は維持する。
-代表sourceのprovenance照合や自己操作IDは使わない。旧B1の共有catalog／Remote全体の代表固定を
-復活させる方式ではなく、表示contextの選択保持と既存prepare ownerのworker比較境界を独立レビューする。
+購読・dirty・結果採用は元contextに閉じ、兄弟contextを変更しない。代表sourceのprovenance照合や
+自己操作IDは使わない。ちらつき修正は未完了で、旧方式の検証をR8の受入証拠に流用しない。
 
 ## 3. GPU テクスチャアップロード
 

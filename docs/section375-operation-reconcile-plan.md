@@ -1,8 +1,8 @@
 ﻿# §1.375 監視更新の準備結果と現在の表示を比較して再表示を省く
 
 2026-10-13、`next-list`、R8。作業基点 `c903a369b`。R6の比較設計の基点は`918a51309`、R7は`84f31c346`。
-**LISTrev7のREVISE（P2二件）を受けた設計担当決定を反映。代表の選択保持とcache変更・移行を撤回し、通常prepareの完全一致時だけinstallを省く。独立設計再レビュー提出用・新方式は未実装**。
-今回は設計書とmanualだけを改訂し、§1.373を含むコード・実装・ビルド／テストは変更・実行しない。
+**LISTrev7のREVISE（P2二件）を受けた設計担当決定を反映。代表の選択保持とcache変更・移行を撤回し、通常prepareの完全一致時だけinstallを省く。LISTrev10の独立設計再レビューはACCEPT（P1／P2なし）、2026-10-13利用者から実装指示を受けた。初回採用入力の共有境界が未確定のため設計判断待ち（§7）・新方式は未実装**。
+R8の設計提出時は設計書とmanualだけを改訂した。実装工程では本書の所有境界と受入条件を維持し、§1.373のAppend／Undo契約を変更しない。
 正本項目: [next-release-backlog.md §1.375](next-release-backlog.md#1375-フォルダで-delete-キーで削除すると正しく消えた一覧がもう一度丸ごと読み直されてちらつく--利用者の実機報告-2026-10-12)。
 
 R3はACCEPTだったが、その後の実装調査で初期表示と自動代表の採用証拠が対応しない前提不足を確認した。
@@ -366,4 +366,61 @@ ui-responsiveness、architectureも実装時に該当契約を同時更新する
   通常の再読込／高画質化で代表が変わり得る説明、既存の手動固定規則の整合を確認した。
 - コード・§1.373設計書・README・backlogは作業基点から変更なし。
   実装・回帰追加・cargo build／test・性能計測・アプリ起動・コミットは0件。
-- R8の独立設計再レビューは未実施。§6.1〜6.3の過去の検証記録をR8の受入証拠にしない。
+- この文書提出時点ではR8の独立設計再レビューは未実施だった。その後LISTrev10でACCEPT。
+  §6.1〜6.3の過去の検証記録をR8の受入証拠にしない。
+
+## 7. 実装前提照合: 初回採用入力を共有する境界 (2026-10-13)
+
+LISTrev10のACCEPT後、§3.4を実装するために通常の初回表示とhydrationを照合した。
+比較方式・代表保持の撤回を差し戻すものではなく、**最初の採用表示をworkerへ共有する
+具体的な所有境界**が未確定であることを記録する。ここを決める前に、表示時期を変更したり
+UIで全一覧を複製したりして接続しない。
+
+### 7.1 現コードで確定した順序
+
+通常の実Folderは `load_folder_with_scan_claimed` →
+`prepare_scanned_folder_listing_with_cache_keys` → 可視採用 →
+`install_prepared_scanned_folder_listing` → `hydrate_installed_main_list` →
+`begin_sidecar_restore` → page identity準備 → 必要なsidecar取込 →
+`resume_loading_items_after_sidecar` の順である。
+
+- 通常prepareはUI側の `&mut App` でmaterialize／rating read／pin read等を行い、
+  itemsとmetadataのVecを返す。`install_loading_items_inner` がこれらをAppへ移す。
+- `begin_sidecar_restore` の既存 `PreparingPageIndex` workerは、採用後の
+  `self.items.clone()` を入力とする。これは行と順序だけであり、採用済み
+  image／sort metadataや最終的なtag／rating／page-edit表示値は含まない。
+- sidecarの経路はreadonly準備だけではなく、flush／取込／cache更新を行う。
+  取込前のDBを読むだけで一致とすると、必要な取込を省く可能性がある。
+- 後からFS／DBを再読しても、先に実際に採用したmetadataの証明にはならない。
+  新しく走査した値をそのまま「現在表示」とする初回bootstrapも不可である。
+
+したがってpage-index workerに投影結果を一つ追加するだけでは、§3.2の完全一致を
+満たせない。必要なのは、採用した値の共有入力と、既存hydration終端での確定である。
+
+### 7.2 設計担当が確定する選択肢
+
+| 選択肢 | 所有境界と費用 |
+| --- | --- |
+| 採用済み入力の共有storageを既存hydrationへ渡す | install→sidecar→表示の既存順序を維持する。行／採用metadataの共有入力を `SidecarLoadContinuation` に載せ、必要な取込後に同じhydration workerで最終投影を作る。世代内更新は§3.4の部分共有で扱う。どのstorageを正本にするか、既存Vec／slice consumerとの境界を先に確定する必要がある |
+| 通常のsource準備を既存要求ownerのworker段へ移す | workerがprepared rowsと共有入力を生成してから既存可視採用へ渡す。通常startup／同期loadも含むcontinuation契約が必要で、現在の新しいPending行の表示時期が変わり得る。通常利用の待ち時間・表示変更は未承認なので、勝手に実装しない |
+
+既存page-index worker用のUI item cloneを再利用する場合も、**追加cloneがないこと**と、
+§3.4の「items全件のcloneでsnapshotを作らない」との整合を設計担当が明記する。
+新しいmetadata全件cloneは採用しない。共有storage案でも、元の採用値を共有できなければ
+この問題は解消しない。通常利用の表示順序を守れる共有storage案を先に具体化する。
+
+初回だけ常に差分扱いにする案は、最初のDelete後の余分なinstallを残すので採らない。
+sidecar有効時の一律比較省略、raw signatureだけの一致、UIの全件clone／比較も採らない。
+新しいcomparison pending／初回専用install owner、代表保持・cache形式変更は追加しない。
+本判断が済むまではstartup Phase Bの保留や§1.375の実装完了を宣言しない。
+
+### 7.3 今回の到達点
+
+- LISTrev10のP3に従い、README・backlog・ui-responsivenessの残ったR6の代表保持記述をR8へ同期。
+  manualのgrid／shortcutsは既にR8の許容仕様であり、整合を確認した。
+- 上記の初回入力境界について実装前に停止。未接続の抽出試作は製品コードへ残さない。
+  §1.373のコード・設計・manualは変更しない。
+- 新方式の実装回帰・性能計測・cargo test／check・build-dev・test-full・アプリ起動・コミットは0件。
+  既存試験の成功記録を、この新方式の検証結果には流用しない。
+- 今回の変更4文書のUTF-8 strict decode、既存manual 2ファイルのHTMLParser解析、
+  `git diff --check` が成功。src／htdocs／scripts／Cargo設定のHEADとの差分は0件。

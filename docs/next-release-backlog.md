@@ -44,10 +44,10 @@
 ### 1.375 フォルダで Delete キーで削除すると、正しく消えた一覧がもう一度丸ごと読み直されてちらつく — 利用者の実機報告 (2026-10-12)
 - **次の版に入れる (利用者 2026-10-12)**。
 - 独立設計レビュー `001a0dabf`: **REVISE**、指摘をR2/R3へ反映しR3はACCEPT。第一段Delete／第二段改名・move・copyの受入範囲を分ける。
-- 状態 (2026-10-13、next-list): **再レビューP2三件を反映したR6、未実装・独立再レビュー停止**。[設計書](section375-operation-reconcile-plan.md)では走査・一覧準備・全行exact比較を既存prepare ownerのworkerへ置き、UIは同一／差分と差分の場合だけprepared結果を受け、採用直前に世代／revisionを確認する。UI全件cloneは禁止、必要なimmutable共有投影基盤と1万／10万行perfを実装前提／検証予定として明記。代表は選択キーだけ保持し、選択先自体の消失は監視でも再選定、明示「最新の情報に更新」で最新選定へ進む。pin設定は解除せず、CPU／GPU eviction不変。Stack保持keyはsource／context＋group keyで、代表path由来perf_key／ItemIdとは分ける。案B／provenance／自己操作ID照合は撤回、未接続部品はR5で撤去済み。ちらつき修正は未完了。購読・context・通知kind/path・§1.314、§1.373 R4案1は維持する。
+- 状態 (2026-10-13、next-list): **R8はLISTrev10独立設計レビューACCEPT・利用者実装承認済み、初回採用入力の共有境界は§7の設計判断待ち・ちらつき修正は未完了**。[設計書](section375-operation-reconcile-plan.md)では走査・通常一覧準備・全行exact比較を既存prepare ownerのworkerへ置き、UIは同一／差分と差分の場合だけprepared結果を受け、採用直前に世代／revisionを確認する。UI全件cloneは禁止、必要なimmutable共有投影基盤と1万／10万行perfは実装前提／検証予定。完全一致時だけ一覧installとそれに伴うサムネイル再要求を省き、現在の表示と既存要求を残す。代表の選択キー保持・消失時だけ再選定・Stack保持identityの契約は撤回し、差分installや通常の再読込・高画質化では代表が変わり得る。cache key／payload／lookup／catalog・旧cache移行は変更せず、CPU／GPU eviction・予算・要求終端も不変。手動pin設定は解除せず、明示「最新の情報に更新」は従来どおり最新選定へ進む。案B／provenance／自己操作ID照合は撤回、未接続部品はR5で撤去済み。購読・context・通知kind/path・§1.314、§1.373 R4案1は維持する。過去の撤去検証をR8新方式の受入証拠に流用しない。
 - 観測 (利用者): 一覧で Delete キーでファイルを削除すると、削除した項目がすぐ消えた一覧になるが、その後にもう一度一覧全体が再表示される。遅れて起きるのでちらついて見える。
 - 見込み (利用者・未確認): mIV 自身の削除をフォルダ監視が外部の変更として検知し、読み直している。自分で削除して既に正しい状態なので、余分な読み直しになっている。
-- 調査済みの経路: 削除（ごみ箱／完全削除、通常フォルダ／ZIP・PDF本体／検索結果／Collection）と監視→再走査→一覧採用、改名・move・copyの同型を設計書へ列挙。R6でも自己由来を判定せず、外部変更を含む準備済み表示全体をworkerで比較し、比較中の表示変更は世代／revisionで拒否する。時間窓で通知を握りつぶさない。
+- 調査済みの経路: 削除（ごみ箱／完全削除、通常フォルダ／ZIP・PDF本体／検索結果／Collection）と監視→再走査→一覧採用、改名・move・copyの同型を設計書へ列挙。R8でも自己由来を判定せず、外部変更を含む準備済み表示全体をworkerで比較し、比較中の表示変更は世代／revisionで拒否する。時間窓で通知を握りつぶさない。
 
 ### 1.374 Everything IPC を使う任意のファイル名検索を試験的に検討する — mIV スレ >>546 (2026-10-11)
 - **次の版に入れる (利用者 2026-10-12)**: 実装・独立レビュー ACCEPT 済み (worktree mimageviewer-nexteffetune、既定キー Ctrl+R、計画 `docs/everything-search-plan.md`)。残り = 実機での動作確認 → master 統合。
