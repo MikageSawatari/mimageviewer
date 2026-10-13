@@ -972,7 +972,7 @@ modal 化や live rebuild の追加は不要。
    利用者にも本体で確認を依頼する（detached viewer と、使っていれば MS-IME も）。trace は段 2b の確認にも使うので
    残す（既定無効）。
 
-**段 2a の実装記録（2026-10-14、`15fa526ef` 上の未コミット差分）。**
+**段 2a の実装記録（2026-10-14、`62bc9f47c`）。**
 
 - egui-winit の純関数 `should_forward_keyboard_input` を入口に置き、Process press / repeat を
   Key / Text / Cut / Copy / Paste の生成前に遮断。release、Ime、EventResponse は維持。
@@ -988,9 +988,8 @@ modal 化や live rebuild の追加は不要。
   root graphの `cargo test -p egui-winit --lib` で同じvendored crate全件を実行する。
   設計上の前提矛盾は無し。コミット・アプリ起動・実機確認は行わない。
 
-独立実装レビュー: 別 context の GPT-6.1 Sol / xhigh が **ACCEPT**（重要指摘なし）。
-通常入力の保存、本文2回帰が撤去対象のfullscreen closureを通ること、detached側への変更が
-症状パッチではないことも確認。実機確認と設計 lead の検収は別途必要。
+実装担当が作業中に自分で依頼した確認（別 context）は ACCEPT だったが、これは正式な独立レビューとして扱わない。
+正式な独立レビューは設計 lead が別セッションで依頼する。
 
 | コマンド | 結果 |
 | --- | --- |
@@ -1004,13 +1003,29 @@ modal 化や live rebuild の追加は不要。
 | `cargo test -p mimageviewer --lib text_mode` | 3 passed（本文の新しい2回帰を含む、`target/i2a-text-mode.log`） |
 | `cargo fmt --check` / vendor rustfmt check / `git diff --check` | 成功 |
 | `cargo check -p mimageviewer --bin mimageviewer-core` | 成功 |
-| `.\scripts\build-dev.ps1 -PreserveRuntime` | 同worktreeの起動中core（PID 74036）で停止。停止許可はブリーフにあるが `Stop-Process` が Access is denied のため利用者の終了待ち（`MSBUILDDISABLENODEREUSE=1`） |
+| `.\scripts\build-dev.ps1 -PreserveRuntime` | 実装担当の環境では起動中 core の停止が Access is denied。設計 lead が隔離 core を止めて実行し成功 |
 | `cargo build --release -p musicvideo_lab` | 成功（40.26秒、`target/i2a-release-lab.log`） |
 | `.\scripts\test-release-build-safety.ps1` | PASS。egui-winit追加後の順序と5回実行に更新、追加差分も独立レビュー ACCEPT |
 | `.\scripts\test-full.ps1 -SuppressCrashDialogs` | exit 101。既知のAppサイズ制限失敗と、段1のログにもある `capture_region_focus_and_escape_terminals_preserve_event_order` のstack overflowで本体libが途中終了。ほかのworkspace targetは成功（`target/i2a-test-full.log`） |
 | 本体libの未完了範囲の補完 | `--list` と完了ログの差分2,717件を、同じpack-build-tools付きtest exeの `--exact` 複数filterで分割実行。2,704 passed / 13 ignored / 0 failed、exit 0。`RUST_MIN_STACK=67108864`。既存stack overflowのテストも成功。App構造・テスト上限・製品挙動は変更しない（`target/i2a-run-unfinished.ps1` / `i2a-unfinished-summary.log`） |
 | 全件照合 | 本体lib全12,691登録（重複登録3も照合）: 12,633 passed / 57 ignored / 1 failed、未確認0。失敗は既知のAppサイズ制限のみ。ほかのworkspace target: 1,584 passed / 7 ignored / 0 failed。原full gateのexit 101は維持し、full gate成功とは扱わない（`target/i2a-lib-coverage.json`） |
 | 追加vendor検証 | `cargo test --manifest-path vendor/egui/Cargo.toml --lib`: 25 passed（root graphは26 passed）。`cargo test --manifest-path vendor/egui-wgpu/Cargo.toml --features winit --lib`: 11 passed。`cargo test --manifest-path vendor/eframe/Cargo.toml --no-default-features --features wgpu --lib`: 18 passed |
+
+**段 2a の実機確認（2026-10-14 04:10 頃、設計 lead がエージェント操作で実施）。** `62bc9f47c` の build-dev 本体を
+隔離データ（`--data-dir`）で、release ラボを scratchpad のコピーで、どちらも trace 有効で起動し、Google 日本語入力で確認した。
+結果は入力欄の表示と、IME を閉じてから打った目印の文字の位置で判定した。
+
+| シナリオ | 本体（注釈テキスト本文） | ラボ（歌詞） |
+| --- | --- | --- |
+| 確定だけ | 改行なし（修正前と同じ） | 改行なし（修正前は確定の Enter で改行が入った） |
+| 確定→すぐ Enter | **改行が 1 つ入る**（修正前は入らなかった＝利用者報告） | 改行が 1 つ入る |
+| 変換中の Esc | 変換だけ取消。欄の focus・テキストモード・フルスクリーンは残る | 変換だけ取消 |
+| 候補選択中の Tab | focus は欄に残り、続く確定でも改行なし | 同左 |
+| IME オフの通常 Enter | 改行が入る | — |
+
+trace（scratchpad の `night\trace\main-2a.log` / `lab-2a.log`）では、本体・ラボとも `logical=Named(Process)` の press
+18 件すべてが `egui=[None]`（egui へ何も渡していない）。未確認: detached viewer、MS-IME 等の他の IME、
+利用者の実機・実設定。
 
 段 2b（設計は段 2a の実機確認後）: 300ms grace（`IME_EVENT_GRACE`）の文書上の理由は「Windows が
 `Disabled` と Esc / Enter を別フレームで届ける」ことで、その Esc / Enter は段 2a で egui へ届かなくなる。
