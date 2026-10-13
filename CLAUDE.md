@@ -526,6 +526,14 @@ C:\home\mimageviewer_vendor_backup\
   ScrollArea 内へ戻すと、縦スクロールバーが × ボタンに重なる退行を起こす。
 - パネルが下端近くまで伸びる場合、クリック吸収 sink とキャンバス入力抑制 rect も
   同じ高さから動的に作る。固定 1000px は 1440p / 4K / 縦長ウィンドウで不足する。
+- 高さを行数などの計算で決めるなら、item_spacing・separator・padding・Frame の margin を
+  計算に含めるか、該当する間隔を 0 にする。`show_rows` は行間を内部で足すので、行高に
+  含めて二重に数えない。行内を `scope_builder` で描くと親カーソルが子の自然高へ戻るので、
+  仮想行の高さと実際の行の位置がずれないか確かめる。
+- 収まる画面ではスクロールバーが出ないこと、高さ不足では末尾まで届くことを
+  `tests/support/scroll_layout.rs` の共通 helper で検査する。snapshot は見た目の記録であり、
+  スクロールの要否の検査にはならない。監査と残件は
+  [docs/calculated-panel-height-audit.md](docs/calculated-panel-height-audit.md)。
 
 ### IME 対応 (日本語入力) ⚠️ 重要
 TextEdit を含むダイアログで Enter / Escape を拾うときは **必ず専用ヘルパーを使う**こと。
