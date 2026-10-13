@@ -51,6 +51,9 @@ root `Cargo.lock` の変更は egui-winit の source / checksum の除去だけ�
   だけを出す。Preedit の cursor は有無だけ。文字内容、cursor の位置、clipboard 内容は出さない。
   logical Character / Dead / Unidentified の内容、文字に対応する physical / egui Key、
   unknown な physical code もマスクする。
+  Space は logical の NamedKey::Space も含めて文字キーと同じように秘匿する。
+  logical NamedKey::Space は Character の長さ等だけの表記、physical / egui Key は文字キーの汎用表記へ
+  そろえ、Space 固有のマスク名を残さない。logical NamedKey::Process は Process のまま残す。
   Enter / Escape / Tab / Process など非文字キーの種類は残す。
 - UI thread はメモリ上で秘匿した行を生成して非同期 channel へ送るだけ。
   worker がファイルを create / append し、1 行ごとに write / flush する。open / write / flush / send /
@@ -63,11 +66,25 @@ winit 0.30.13 `src/platform_impl/windows/keyboard_layout.rs:946` は `VK_PROCESS
 `NamedKey::Process` に変換する。同ファイル `:210` の `get_key` はこの非文字キーを優先して返す。
 `src/platform_impl/windows/keyboard.rs:502-513` は lParam の scan code から physical key を作り、
 scan code が 0 なら virtual key から補う。したがって physical が必ず元の Enter とはソースだけで
-断定できない。実 IME が届ける scan code / イベントの組み合わせは実機ログで確認する。
+断定できない。本 trace が観測するのは winit の logical Key と変換済みの physical KeyCode、
+egui への出力とイベントの到着順であり、raw VK / scan code は記録しない。
+実機ログでは Process と physical KeyCode・egui Key の対応を確認する（文字キーと Space の種類は秘匿）。
 
 egui-winit 原本 `src/lib.rs:1117` / `:1125` の変換には Process が無く、`:815` の
 `logical_key.or(physical_key)` が physical Enter へ fallback する見立ては一致する。
-これは発生条件のソース確認であり、利用者の再現経路の確定ではない。
+これは発生条件のソース確認であり、実機で確認した範囲は次節に区別して記録する。
+
+## 利用者の実機記録（2026-10-14、Google 日本語入力・この PC）
+
+修正前の段 1 trace に基づく利用者報告。本体の注釈本文欄とラボの歌詞欄の両方で、
+変換確定の Enter・変換中の Escape・候補選択中の Tab・変換の Space の press は
+logical=Named(Process)、physical は対応する KeyCode で到着し、egui-winit は対応する Key の
+press を出していた。文字キーの press も logical=Named(Process) だった。
+上記の非文字キーと Space の release は対応する NamedKey として到着し、Process ではなかった。
+Process の press は、同じ ms の空 Preedit → Commit → Disabled より前に到着した。
+IME が開いていても変換していないときの Enter は logical=Named(Enter) だった。
+raw VK / scan code の観測結果は含まない。他の IME・PC まで一般化しない。
+P2 修正後の trace は Space の種類を全経路で秘匿するが、logical=Named(Process) は保持する。
 
 ## 検証
 
@@ -76,7 +93,13 @@ KeyEvent は winit 0.30.13 `src/event.rs:655` の private `platform_specific` fi
 外部から安全に合成できないため、Process/Enter の元変換 helper と、キー metadata の射影を検証する。
 IME は合成でき、追加イベントだけの観測・複数 viewport・非改変・秘匿を検証する。
 writer の行ごとの flush、write / flush / channel 失敗時の停止も検証する。
-実 KeyboardInput 到着と実 IME の順序は利用者の記録待ち。独立レビュー完了は主張しない。
+実 KeyboardInput 到着と実 IME の順序の利用者報告は前節を参照。独立レビュー完了は主張しない。
+
+Space 秘匿の P2 回帰は、press / release・text の有無・logical Process の有無と、
+egui Key の key / physical_key の各経路で、Space の出力が他の文字キーの出力と一致することを確認する。
+両回帰が修正前に失敗することを確認済み。変更は trace の射影だけで、入力イベント生成は変更しない。
+P2 修正後の `cargo test -p egui-winit --lib` は全 12 件成功、`cargo fmt --check` と
+vendor の rustfmt check も成功。ログは `target/i2-review-space-{before,tests,fmt}.log`。
 
 2026-10-14 の検証: 上記診断単体 10 件、brief 指定の本体 core check / 共有 UI・ラボ・egui-ime /
 本体 ime_focus・egui_focus_policy、root fmt と vendor rustfmt が成功。依存 graph は本体・全ラボで
