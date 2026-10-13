@@ -48,6 +48,18 @@ C=赤と暗い音名だけの明度補正を鍵盤・ベース／調で共有す
 更新前後と新規3枚を目視確認し、波形・灰色の保持、文字表示、HUDと操作の非重複を確認した。
 実行結果は鍵盤設計§15.6へ記録する。
 
+第4段階の追加レビュー修正（鍵盤設計§15.7）は、共通パネルの行間3pxを高さ算定に含める。
+`fullscreen_overflow_panel_root`（720×440）と`fullscreen_overflow_panel_navigator_submenu`（720×440）、
+`music_overflow_panel`（820×300）は、基準画像を変更せずに通常比較で候補PNGを生成し、
+更新前に左右比較を目視した。不要なbarが消え、パネル高がそれぞれ15／12／3px増え、
+最終行と選択行が切れずに収まる。行間・文字・HUDは維持する。
+3枚の変更は9883／10231／2883px、新しいbytesは29893／15285／22472。
+通常幅／狭幅の音楽HUD画像は変更しない。確認画像と統計は`target/review-fixes-validation/`に保存する。
+`spread_shift_hud_{resolved,unresolved}_{normal,narrow}_{light,dark}`の8枚も、
+更新前の左右比較で目視確認した。本文は同じ自然な高さを保ち、余分な下部空白を除いて
+パネル高を348→282pxへ縮める。差分はy=338..411の下端だけで、本文・marker・disabled表示・
+チェック欄は一致する。normalは各26832px、narrowは各18792pxが変化し、画像寸法とbytesは維持する。
+
 本別見開き調整 (§1.364 D2) は`spread_shift_hud_{resolved,unresolved}_{normal,narrow}_{light,dark}`の
 8ケースを定義する。normalは720×500、narrowは320×480。実HUDの調整submenuと調整の印を
 使い、resolvedの基点jump・解除・全体checkboxの到達性を確認する。unresolvedはjumpのみ無効にし、

@@ -1115,3 +1115,93 @@ producer／共通入力handler／既存HUDテストの参照を一致させる�
 配色・設定保持・非同期再ラスタ・入力所有と終了経路・HUD・parked-liveの既存配置保持、
 音声トラックpopupの実入力回帰、最終gateログと5枚のPNGを確認した。
 最後の分類件数テストだけの変更に対する、他の成功証拠の再利用も確認済み。
+
+### 15.7 独立レビューの追加指摘修正（2026-10-14、pitch-lab）
+
+利用者が第4段階を`db1f0139c`でコミット後、別セッションの独立レビューは
+ACCEPT WITH CHANGESとなった。以下のP2/P3を追加修正する。
+
+- P2: パネル上で中ボタンを押したまま`L`で閉じ、次frameでタイムラインへ移動すると、
+  表示状態だけに依存していた入力所有が消え、背面のパンが始まった。
+  パネルの表示と開始済みのポインタ操作の寿命を分け、解放／接点の終了まで所有する。
+  キー本来の操作は既存の経路で続ける。別のApp boolやmodalは追加しない。
+  所有状態はviewport内の入力routerに置き、表示contextで分離する。ボタン／接点の順序付き
+  開始・終了を処理し、最後の解放後の新しい押下を閉じたパネルへ取り込まない。
+  解放frameの所有は維持し、focus喪失・音楽表示終了・context変更では終了する。
+  fullscreenを閉じて未描画の間に解放された操作は、再表示時に入力router内の描画leaseで失効する。
+  viewportごとのframe内再利用は維持し、親ROOTのframeも記録する。対象の通常音楽surfaceは
+  ROOT更新内から同期immediate描画されるため、ROOTの未描画gapを判別できる。
+  parked-liveにはボタンもrouter呼出もなく、この所有を生成しない。deferred描画経路を
+  今後変更する場合は描画頻度の前提も再検討する。既存keepalive／detachedの終了経路には変更を加えない。
+- P3: 共通パネルの高さが行間を含まず、2択でも不要なスクロールバーが出ていた。
+  高さ算定と描画の行間を共有し、十分な高さと小画面の両方を回帰検査する。
+  見開き調整のラベル／チェック欄は自然な高さを保持し、文字の折り返しを含むgalley寸法を
+  高さ算定・描画・ヒット判定で共有する。全欄の48px固定化や別frameでの再計測は採用しない。
+  行間は従来の3pxを維持する。見開き調整の入力geometry計算前に既存の基点解決を通し、
+  同frameの描画までにラベルが変わることでhit矩形と描画矩形が食い違わないようにする。
+  bar無し幅の自然高が収まる場合は、barの表示と幅予約をともに無くす。小画面では従来の
+  solid barを使い、同Contextの通常高→小画面→通常高でも長いラベルの余分な折り返しが残らない。
+  f32座標の加減算による丸めは、自然高のfit比較だけで0.01ptまで許容する。
+  小画面のbody高がegui既定の最小scroll高64px未満でも末尾が切れないよう、
+  ScrollAreaの最小高を0にし、実clip内で最後の行へ到達することを検査する。
+  静止画パネルも共有部分の修正対象とし、変更PNGは基準画像の更新前に目視確認する。
+
+実装前の入力所有設計は、独立レビュー担当（GPT-6.1 Sol／xhigh）と実装担当で確認した。
+detachedの述語やviewport構造は変更しない。通常設定・製品起動・`target/dev-runtime`への操作・
+コミットは行わない。追加検証のownerは実装担当、ログは`target/review-fixes-validation/`に保存する。
+
+#### 回帰と画像確認
+
+実入力は使い捨てAppの`render_fullscreen_viewport`を通し、中ボタン押下→`L`→押したまま移動→
+解放→新しいパン、touch終了／cancel、同frameの解放→新しい押下、focus／context変更、
+fullscreen終了・非描画中の解放・再表示を検査する。押下前のカーソル移動を別のunheld入力にし、
+実timelineのclip／delta（押下0、drag−70）／解析保持／manual-panと正のoffsetを確認する。
+テスト用の観測は`cfg(test)`だけで、IDやgeometryをContextのロック取得前に採取する。
+
+パネルは4variant×2幅×2文字サイズ×DPI倍率1／1.25／1.5の48条件で、自然高への収まり、
+実clipへのinner包含、小画面での末尾到達、同Contextの通常高→小画面→通常高を検査する。
+包含の丸め許容は0.01pt、末尾到達だけはeguiのpixel-grid丸めを含む1物理pixel＋0.01pt。
+画像はAppをsnapshot対象にせず、従来の共通surfaceと本体フォントで生成する。
+
+全11枚は基準画像更新前にbefore／candidateを並べて実装担当が目視し、独立レビュー担当も確認した。
+
+| PNG | 変化と確認 |
+| --- | --- |
+| `fullscreen_overflow_panel_root.png` | 高さ＋15px、不要bar除去、最後の48px行のclip除去。9883px変更 |
+| `fullscreen_overflow_panel_navigator_submenu.png` | 高さ＋12px、不要bar除去、選択行全体が表示。10231px変更 |
+| `music_overflow_panel.png` | 高さ＋3px、不要bar除去、2行が収まる。HUDは保持。2883px変更 |
+| `spread_shift_hud_resolved_normal_light.png` | 下部空白だけ削減（高さ348→282px）。26832px変更 |
+| `spread_shift_hud_resolved_normal_dark.png` | 同上 |
+| `spread_shift_hud_unresolved_normal_light.png` | 同上。jump無効色と解除・記憶の表示は保持 |
+| `spread_shift_hud_unresolved_normal_dark.png` | 同上 |
+| `spread_shift_hud_resolved_narrow_light.png` | 同じ下部空白削減。18792px変更 |
+| `spread_shift_hud_resolved_narrow_dark.png` | 同上 |
+| `spread_shift_hud_unresolved_narrow_light.png` | 同上。無効表示を保持 |
+| `spread_shift_hud_unresolved_narrow_dark.png` | 同上 |
+
+Spread8枚の差分はy=338..411の下端だけで、本文・marker・操作・チェック欄は一致する。
+音楽HUD通常幅／320px幅の2枚と、timeline配色の2枚は未変更。
+全11枚の寸法・bytes・pixel範囲は`target/review-fixes-validation/png-results.json`に保存した。
+
+#### 最終確認
+
+全Cargoへ`MSBUILDDISABLENODEREUSE=1`を設定。基準画像の更新後は`UPDATE_SNAPSHOTS`を使わず比較した。
+以下は最終source／PNGでの成功結果。ignoredは従来の計測テストだけで、新しい回帰はignoredにしていない。
+
+| コマンド | exit／成功／ignored |
+| --- | --- |
+| `cargo fmt` | 0 |
+| `cargo fmt --check` | 0 |
+| `cargo test -p mimageviewer --lib ui_fullscreen` | 0／714／1 |
+| `cargo test -p mimageviewer --lib music` | 0／189／2 |
+| `cargo test --test ui_snapshot` | 0／162／0 |
+| `python scripts/check_ui_glyphs.py` | 0／危険glyph 0 |
+
+焦点確認の音楽メニュー20件も成功（最小scroll高の追加修正前）。最後の2つのfull lib gateは
+その追加修正とpixel丸め許容も含めて実行した。native依存のbuild停止は発生していない。
+途中のfixtureのimport／観測時点・入力順序／ロック再入の不備を修正し、全指定gateを再実行した。
+旧nested AppTestEnv fixtureは実行前に自分の検証processを停止して同じ1環境へ修正し、
+中断を製品テストやnative依存の失敗として扱っていない。全実行履歴は同ディレクトリの`results.json`に保持する。
+設計逸脱なし。製品起動・`target/dev-runtime`への操作・コミットは行っていない。
+独立最終レビュー（GPT-6.1 Sol／xhigh）は **ACCEPT**。P2/P3の未解決指摘なし。
+実入力の所有と再表示境界、48条件の実clip検査、11枚のPNG、全指定gateの最終成功ログを確認した。
