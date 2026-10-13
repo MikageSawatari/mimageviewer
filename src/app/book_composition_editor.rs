@@ -292,10 +292,12 @@ impl App {
                     super::book_materialization::BookScope::ImageFolder(_)
                 )
             ) {
-                self.show_feedback_toast(
-                    "画像だけのフォルダでは本の構成を作れません。ZIP に変換してから行ってください。"
-                        .into(),
-                );
+                if let super::book_materialization::ProjectionRecipe::Book(
+                    super::book_materialization::BookScope::ImageFolder(path),
+                ) = &self.projection_recipe
+                {
+                    return self.start_image_folder_zip(ctx, path.clone(), true);
+                }
             }
             return false;
         };

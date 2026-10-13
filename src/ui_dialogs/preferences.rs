@@ -16,6 +16,19 @@ use crate::ring_shortcut::{
 };
 use crate::settings::{Parallelism, Settings};
 
+pub(crate) fn draw_same_name_folder_book_settings(
+    ui: &mut egui::Ui,
+    policy: &mut crate::same_name_folder_book::SameNameFolderBookPolicy,
+) {
+    pages::draw_same_name_folder_book(ui, policy);
+}
+
+#[doc(hidden)]
+pub fn draw_same_name_folder_book_settings_snapshot_fixture(ui: &mut egui::Ui) {
+    let mut policy = Default::default();
+    draw_same_name_folder_book_settings(ui, &mut policy);
+}
+
 #[doc(hidden)]
 pub fn draw_diagnostics_export_snapshot_fixture(ui: &mut egui::Ui, state: &str) {
     use crate::diagnostics::{ExportView, SavedExport};
@@ -2620,7 +2633,7 @@ impl App {
         name_colors::clear_hex_editor(ctx);
         if let Some(mut state) = self.pref_state.take() {
             let old_dup = (
-                self.settings.skip_zip_if_folder_exists,
+                self.settings.same_name_folder_book,
                 self.settings.skip_archive_if_zip_exists,
                 self.settings.skip_epub_if_pdf_exists,
                 self.settings.skip_image_if_video_exists,
@@ -2933,7 +2946,7 @@ impl App {
             // (Phase 5.3: video_thumb_use_sidecar_image も含む — 切り替え時に
             // video_thumb_overrides を作り直すため)
             let new_dup = (
-                self.settings.skip_zip_if_folder_exists,
+                self.settings.same_name_folder_book,
                 self.settings.skip_archive_if_zip_exists,
                 self.settings.skip_epub_if_pdf_exists,
                 self.settings.skip_image_if_video_exists,
@@ -7205,14 +7218,15 @@ mod tests {
         for close in ["ok", "cancel", "window", "escape"] {
             let mut harness = preferences_position_harness();
             let position = harness.state().preferences_view_position.clone();
-            let old = harness.state().settings.skip_zip_if_folder_exists;
+            let old = harness.state().settings.same_name_folder_book;
             harness
                 .state_mut()
                 .pref_state
                 .as_mut()
                 .unwrap()
                 .settings
-                .skip_zip_if_folder_exists = !old;
+                .same_name_folder_book =
+                crate::same_name_folder_book::SameNameFolderBookPolicy::PreferFolder;
             match close {
                 "ok" => harness.get_by_label("  OK  ").click(),
                 "cancel" => harness.get_by_label("キャンセル").click(),
@@ -7235,8 +7249,12 @@ mod tests {
             assert!(!harness.state().show_preferences);
             assert!(harness.state().pref_state.is_none());
             assert_eq!(
-                harness.state().settings.skip_zip_if_folder_exists,
-                if close == "ok" { !old } else { old }
+                harness.state().settings.same_name_folder_book,
+                if close == "ok" {
+                    crate::same_name_folder_book::SameNameFolderBookPolicy::PreferFolder
+                } else {
+                    old
+                }
             );
             harness.state_mut().show_preferences = true;
             harness.run();

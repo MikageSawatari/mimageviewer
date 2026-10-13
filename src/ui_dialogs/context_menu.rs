@@ -1599,12 +1599,16 @@ impl crate::app::App {
             crate::native_context_menu::ShellClipboardVerb,
         ),
     {
+        if self.image_folder_zip_operation.is_some() {
+            return None;
+        }
         if !self.grid_item_input_allowed()
             && !(target.is_folder_context
                 && matches!(
                     &command,
                     MenuCommand::NewFolder
                         | MenuCommand::EditBookComposition
+                        | MenuCommand::ConvertImageFolderToZip
                         | MenuCommand::Paste
                         | MenuCommand::OpenFolderInExplorer
                         | MenuCommand::OpenExternalToolSettings
@@ -1613,6 +1617,12 @@ impl crate::app::App {
             return None;
         }
         match command {
+            MenuCommand::ConvertImageFolderToZip => {
+                if let GridItem::Folder(path) = &target.item {
+                    self.start_image_folder_zip(ctx, path.clone(), false);
+                }
+                None
+            }
             MenuCommand::EditBookComposition => {
                 if target.surface == ContextMenuSurface::Grid {
                     self.start_local_composition_editor(ctx);
@@ -3280,6 +3290,31 @@ mod delete_confirm_tests {
         let mut commands = Vec::new();
         visit(&app.context_menu_nodes(&target, false), &mut commands);
         commands
+    }
+
+    #[test]
+    fn image_folder_zip_context_entry_uses_modal_and_blocks_stale_background_commands() {
+        let mut app = crate::app::setup_app_for_test();
+        let source = app.tmp.path().join("photos");
+        std::fs::create_dir(&source).unwrap();
+        let item = GridItem::Folder(source.clone());
+        assert!(
+            menu_commands(&mut app, item.clone(), ContextMenuSurface::Grid)
+                .contains(&MenuCommand::ConvertImageFolderToZip)
+        );
+        let mut target = target(&app, item, ContextMenuSurface::Grid);
+        let ctx = egui::Context::default();
+        app.dispatch_native_grid_context_command(
+            &ctx,
+            MenuCommand::ConvertImageFolderToZip,
+            &target,
+        );
+        assert!(app.image_folder_zip_operation.is_some());
+        assert!(app.common_modal_dialog_open());
+        target.is_folder_context = true;
+        app.dispatch_native_grid_context_command(&ctx, MenuCommand::NewFolder, &target);
+        assert!(!app.show_new_folder_dialog);
+        app.image_folder_zip_operation = None;
     }
 
     #[test]

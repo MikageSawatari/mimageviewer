@@ -1,6 +1,22 @@
 # 仮想フォルダ (ZIP / RAR / PDF / EPUB) 処理
 
-### G3 mode-onlyと文書方向（2026-10-11）
+## 画像folder→Stored ZIP（§1.242 G、実装中・検証待ち）
+
+`image_folder_zip`が直下全画像のmanifestとentry対応、Stored/ZIP64出力とno-clobber公開を担当する。
+表示種類・hidden・facet・同名画像省略はmanifestへ適用せず、元bytesをそのまま格納する。
+子folder・動画・音声・本を含むfolderは対象外。画像以外の許可された補助fileは元に残す。
+`app/image_folder_zip_operation`のprocess modalは二つの製品入口、保存完了待ち、worker、
+取消・成功・失敗の採用を一つの操作寿命で所有する。別のfolder構成adapterを復活させない。
+
+画像タグとfolder自身のタグは和集合をZIP本体へ複製し、ZIPページ別タグを作らない。
+★・編集・しおり等のidentityはmanifestでZIP側へ対応付け、元データも保持する。
+Collectionは登録・順序・revisionを変えず元参照を保持し、source削除時は既存missing表示を使う。
+DAT補充と先行保存の採用はsourceの該当keyを持つ各contextへ限定し、関係のない兄弟をresetしない。
+F12起点は元viewerを保つ。mainの一覧復帰だけが起点の親folderを読み直し、可視ならZIPのpathを選択する。
+不可視ZIPのために同名3択・種類・facet設定を変更しない。詳細・受入条件は
+[画像folder→ZIP計画](image-folder-to-zip-plan.md)と[リワーク外記録](detached-rework-plan.md#11-リワーク外からの変更記録)。
+
+## G3 mode-onlyと文書方向（2026-10-11）
 
 表示分類だけの保存は本別binding/方向の指定とは扱わない。文書方向追従ONで両方未設定なら、
 既存のPDF/EPUB open workerが方向を取得し、共通resolverがその既定を解決してからSingle/Spread/Splitを適用する。

@@ -153,6 +153,9 @@ pub mod filename_sort;
 pub mod filename_stack;
 pub mod filename_stack_script;
 mod final_composite;
+mod image_folder_zip;
+mod image_folder_zip_job;
+mod image_folder_zip_metadata;
 // filename_stack_ui は private な App へ impl を追加する library-internal module。
 mod everything_ipc;
 mod everything_results;
@@ -2369,3 +2372,10 @@ pub use ui_dialogs::preferences::{
 pub use ui_main::draw_file_type_visibility_status_snapshot_fixture;
 
 pub(crate) mod archive_visibility;
+
+pub mod same_name_folder_book;
+
+pub use ui_dialogs::preferences::draw_same_name_folder_book_settings_snapshot_fixture;
+
+mod ui_image_folder_zip;
+pub use ui_image_folder_zip::draw_snapshot as draw_image_folder_zip_snapshot;

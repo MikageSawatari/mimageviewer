@@ -221,7 +221,7 @@ pub(crate) struct SubfolderExpansionOptions {
     pub(crate) file_type_visibility: crate::file_type_visibility::FileTypeVisibility,
     skip_image_if_video_exists: bool,
     skip_duplicate_images: bool,
-    skip_zip_if_folder_exists: bool,
+    same_name_folder_book: crate::same_name_folder_book::SameNameFolderBookPolicy,
     video_thumb_use_sidecar_image: bool,
     image_folder_books: bool,
     include_convertible_archives: bool,
@@ -237,7 +237,7 @@ impl From<&crate::settings::Settings> for SubfolderExpansionOptions {
             file_type_visibility: settings.file_type_visibility.clone(),
             skip_image_if_video_exists: settings.skip_image_if_video_exists,
             skip_duplicate_images: settings.skip_duplicate_images,
-            skip_zip_if_folder_exists: settings.skip_zip_if_folder_exists,
+            same_name_folder_book: settings.same_name_folder_book,
             video_thumb_use_sidecar_image: settings.video_thumb_use_sidecar_image,
             image_folder_books: settings.auto_fullscreen_image_folders_enabled(),
             include_convertible_archives: !settings.archive_file_handling_ignores_convertible(),
@@ -872,9 +872,20 @@ fn scan_one_directory(
         return;
     }
 
-    if options.skip_zip_if_folder_exists {
-        containers.retain(|entry| !real_folder_names.contains(&super::stem_lower(&entry.path)));
-    }
+    // Traversal and child book cells retain the existing recursive scope.
+    let folders: Vec<_> = real_folder_names
+        .iter()
+        .map(|name| dir.join(name))
+        .collect();
+    let mask = crate::same_name_folder_book::keep_mask(
+        options.same_name_folder_book,
+        folders
+            .iter()
+            .map(|path| (path.as_path(), true))
+            .chain(containers.iter().map(|entry| (entry.path.as_path(), false))),
+    );
+    let mut mask = mask.into_iter().skip(folders.len());
+    containers.retain(|_| mask.next().unwrap());
     containers.retain(|entry| {
         options
             .scan_filter
@@ -3260,7 +3271,7 @@ mod tests {
             file_type_visibility: Default::default(),
             skip_image_if_video_exists: false,
             skip_duplicate_images: false,
-            skip_zip_if_folder_exists: false,
+            same_name_folder_book: crate::same_name_folder_book::SameNameFolderBookPolicy::ShowBoth,
             video_thumb_use_sidecar_image: true,
             image_folder_books,
             include_convertible_archives: false,
@@ -3728,7 +3739,8 @@ mod tests {
                 file_type_visibility: Default::default(),
                 skip_image_if_video_exists: false,
                 skip_duplicate_images: false,
-                skip_zip_if_folder_exists: false,
+                same_name_folder_book:
+                    crate::same_name_folder_book::SameNameFolderBookPolicy::ShowBoth,
                 video_thumb_use_sidecar_image: true,
                 image_folder_books: false,
                 include_convertible_archives: false,
@@ -3966,6 +3978,32 @@ mod tests {
     }
 
     #[test]
+    fn same_name_folder_book_subfolder_expansion_preserves_child_book_cells() {
+        use crate::same_name_folder_book::SameNameFolderBookPolicy as Policy;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let book = root.join("book");
+        std::fs::create_dir_all(&book).unwrap();
+        std::fs::write(book.join("page.jpg"), b"image").unwrap();
+        std::fs::write(root.join("book.zip"), b"zip").unwrap();
+        for policy in [Policy::PreferBook, Policy::PreferFolder, Policy::ShowBoth] {
+            let mut options = test_scan_options(true);
+            options.same_name_folder_book = policy;
+            let result = scan_test_root(&root, options);
+            assert!(result.entries.iter().any(
+                |entry| entry.path == book && entry.kind == SubfolderExpansionEntryKind::Folder
+            ));
+            assert_eq!(
+                result
+                    .entries
+                    .iter()
+                    .any(|entry| entry.path == root.join("book.zip")),
+                policy != Policy::PreferFolder
+            );
+        }
+    }
+
+    #[test]
     fn same_name_zip_is_hidden_in_favor_of_image_folder_book_when_configured() {
         let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -3975,7 +4013,8 @@ mod tests {
         std::fs::write(book.join("001.jpg"), b"image").unwrap();
         std::fs::write(root.join("volume.zip"), b"zip").unwrap();
         let mut options = test_scan_options(true);
-        options.skip_zip_if_folder_exists = true;
+        options.same_name_folder_book =
+            crate::same_name_folder_book::SameNameFolderBookPolicy::PreferFolder;
 
         let result = scan_test_root(&root, options);
 
@@ -4091,7 +4130,7 @@ mod tests {
             file_type_visibility: Default::default(),
             skip_image_if_video_exists: false,
             skip_duplicate_images: true,
-            skip_zip_if_folder_exists: false,
+            same_name_folder_book: crate::same_name_folder_book::SameNameFolderBookPolicy::ShowBoth,
             video_thumb_use_sidecar_image: true,
             image_folder_books: false,
             include_convertible_archives: false,

@@ -4805,7 +4805,7 @@ struct SmartFolderScanOptions {
     show_hidden_files: bool,
     include_convertible_archives: bool,
     include_epub: bool,
-    skip_zip_if_folder_exists: bool,
+    same_name_folder_book: crate::same_name_folder_book::SameNameFolderBookPolicy,
     skip_archive_if_zip_exists: bool,
     skip_epub_if_pdf_exists: bool,
     skip_image_if_video_exists: bool,
@@ -4821,7 +4821,7 @@ impl From<&crate::settings::Settings> for SmartFolderScanOptions {
             show_hidden_files: settings.show_hidden_files,
             include_convertible_archives: !settings.archive_file_handling_ignores_convertible(),
             include_epub: !settings.epub_file_handling_ignores_epub(),
-            skip_zip_if_folder_exists: settings.skip_zip_if_folder_exists,
+            same_name_folder_book: settings.same_name_folder_book,
             skip_archive_if_zip_exists: settings.skip_archive_if_zip_exists,
             skip_epub_if_pdf_exists: settings.skip_epub_if_pdf_exists,
             skip_image_if_video_exists: settings.skip_image_if_video_exists,
@@ -5114,8 +5114,12 @@ fn normalize_smart_folder_candidates(
             container_metas.push(Some((candidate.mtime, candidate.file_size.unwrap_or(0))));
         }
     }
-    if options.skip_zip_if_folder_exists {
-        super::folder_scan::filter_virtual_folder_duplicates(&mut containers, &mut container_metas);
+    {
+        super::folder_scan::filter_virtual_folder_duplicates(
+            options.same_name_folder_book,
+            &mut containers,
+            &mut container_metas,
+        );
     }
     if options.skip_archive_if_zip_exists {
         super::folder_scan::filter_convertible_archive_duplicates(
@@ -11502,7 +11506,7 @@ mod tests {
             show_hidden_files: false,
             include_convertible_archives: true,
             include_epub: true,
-            skip_zip_if_folder_exists: false,
+            same_name_folder_book: crate::same_name_folder_book::SameNameFolderBookPolicy::ShowBoth,
             skip_archive_if_zip_exists: false,
             skip_epub_if_pdf_exists: false,
             skip_image_if_video_exists: false,
@@ -12698,6 +12702,53 @@ mod tests {
     }
 
     #[test]
+    fn same_name_folder_book_recursive_smart_scan_keeps_descendant_images() {
+        use crate::same_name_folder_book::SameNameFolderBookPolicy as Policy;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let child = root.join("book");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("page.jpg"), b"image").unwrap();
+        std::fs::write(root.join("book.zip"), b"zip").unwrap();
+        let mut definition = crate::settings::SmartFolderDefinition::new("recursive");
+        definition.rules.push(rule(
+            uuid::Uuid::new_v4(),
+            root,
+            true,
+            true,
+            Default::default(),
+        ));
+        for policy in [Policy::PreferBook, Policy::PreferFolder, Policy::ShowBoth] {
+            let mut options = unfiltered_scan_options();
+            options.same_name_folder_book = policy;
+            let result = run_test_scan(definition.clone(), options);
+            assert!(
+                result
+                    .snapshot
+                    .entries
+                    .iter()
+                    .any(|entry| entry.path == child.join("page.jpg"))
+            );
+            assert_eq!(
+                result
+                    .snapshot
+                    .entries
+                    .iter()
+                    .any(|entry| entry.path.file_name().is_some_and(|n| n == "book.zip")),
+                policy != Policy::PreferFolder
+            );
+            assert_eq!(
+                result
+                    .snapshot
+                    .entries
+                    .iter()
+                    .any(|entry| entry.path == child),
+                policy != Policy::PreferBook
+            );
+        }
+    }
+
+    #[test]
     fn scan_applies_container_and_image_duplicate_settings_per_directory() {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path().join("root");
@@ -12721,7 +12772,8 @@ mod tests {
             Default::default(),
         ));
         let mut options = unfiltered_scan_options();
-        options.skip_zip_if_folder_exists = true;
+        options.same_name_folder_book =
+            crate::same_name_folder_book::SameNameFolderBookPolicy::PreferFolder;
         options.skip_archive_if_zip_exists = true;
         options.skip_epub_if_pdf_exists = true;
         options.skip_duplicate_images = true;

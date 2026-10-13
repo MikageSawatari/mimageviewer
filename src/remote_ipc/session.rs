@@ -92,7 +92,10 @@ struct RemoteControlLifecycle {
 enum RemoteControlOwner {
     #[default]
     Local,
-    LocalModal(u64),
+    LocalModal {
+        lease_id: u64,
+        notice: &'static str,
+    },
     AcquiringRemote,
     RemoteActive,
     DrainingRemote,
@@ -115,7 +118,7 @@ struct RemoteControlTransitionError {
 impl RemoteControlLifecycle {
     fn phase(self) -> RemoteControlPhase {
         match self.owner {
-            RemoteControlOwner::Local | RemoteControlOwner::LocalModal(_) => {
+            RemoteControlOwner::Local | RemoteControlOwner::LocalModal { .. } => {
                 RemoteControlPhase::Local
             }
             RemoteControlOwner::AcquiringRemote => RemoteControlPhase::AcquiringRemote,
@@ -124,16 +127,17 @@ impl RemoteControlLifecycle {
         }
     }
 
-    fn begin_local_modal(&mut self, lease_id: u64) -> bool {
+    fn begin_local_modal(&mut self, lease_id: u64, notice: &'static str) -> bool {
         if self.owner != RemoteControlOwner::Local {
             return false;
         }
-        self.owner = RemoteControlOwner::LocalModal(lease_id);
+        self.owner = RemoteControlOwner::LocalModal { lease_id, notice };
         true
     }
 
     fn end_local_modal(&mut self, lease_id: u64) {
-        if self.owner == RemoteControlOwner::LocalModal(lease_id) {
+        if matches!(self.owner,RemoteControlOwner::LocalModal {lease_id: current,..} if current == lease_id)
+        {
             self.owner = RemoteControlOwner::Local;
         }
     }
@@ -358,11 +362,8 @@ impl SessionStateMachine {
         if self.app_retired {
             return session_closing_response();
         }
-        if matches!(self.lifecycle.owner, RemoteControlOwner::LocalModal(_)) {
-            return status_response(
-                SessionStatus::LocalInUse,
-                "本体で処理中です。処理が終了してから再接続してください。",
-            );
+        if let RemoteControlOwner::LocalModal { notice, .. } = self.lifecycle.owner {
+            return status_response(SessionStatus::LocalInUse, notice);
         }
         match self.lifecycle.phase() {
             // The previous owner's resources still belong to that drain. A new acquire is a
@@ -1470,13 +1471,21 @@ impl SessionHandle {
     /// Linearizes local modal admission against BeginAcquire under the existing short
     /// session mutex. No waiting/retry, OS work, or notifications run inside this lock.
     pub(crate) fn try_local_modal_lease(&self) -> Option<LocalModalLease> {
+        self.try_local_modal_lease_with_notice(
+            "本体で処理中です。処理が終了してから再接続してください。",
+        )
+    }
+    pub(crate) fn try_local_modal_lease_with_notice(
+        &self,
+        notice: &'static str,
+    ) -> Option<LocalModalLease> {
         let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         if state.app_retired {
             return None;
         }
         let lease_id = state.next_local_modal_lease;
         let next = lease_id.checked_add(1)?;
-        if !state.lifecycle.begin_local_modal(lease_id) {
+        if !state.lifecycle.begin_local_modal(lease_id, notice) {
             return None;
         }
         state.next_local_modal_lease = next;
@@ -3147,6 +3156,23 @@ mod tests {
             handle.snapshot().acquisition_sequence,
             before.acquisition_sequence + 1
         );
+    }
+
+    #[test]
+    fn folder_zip_modal_notice_belongs_to_the_admission_lease() {
+        let handle = SessionHandle::new();
+        let notice = "PC で ZIP を作成中です。完了してから接続してください。";
+        let lease = handle.try_local_modal_lease_with_notice(notice).unwrap();
+        let request = SessionAcquireRequest {
+            client_id: "client".into(),
+            peer: peer(),
+        };
+        let response = handle.acquire(request.clone());
+        assert_eq!(response.status, SessionStatus::LocalInUse);
+        assert_eq!(response.message, notice);
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::Local);
+        drop(lease);
+        assert_eq!(handle.acquire(request).status, SessionStatus::Active);
     }
 
     #[test]

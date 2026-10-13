@@ -1455,6 +1455,35 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-13 §1.242 G: 画像folder→ZIPのprocess modalとcontext限定採用（実装中）
+
+画像folder→ZIP設計R3の独立ACCEPTは利用者報告（対象`7346683c6`）として記録済み。
+今回の製品実装の独立レビューと実機受入は未完了。設計・実装の証拠は
+[画像folder→ZIP計画](image-folder-to-zip-plan.md)へ集約する。
+
+変更caller familyはfolder右クリック、構成対象外案内、`app/image_folder_zip_operation`、
+共通main/fullscreen/detached modal受付と閉じる受付、既存metadata refresh/context registry分類。
+変換は一つのprocess operationが起点`ViewerContextId`・phase・worker・保存票とRemote local-modal leaseを
+所有し、背面のopen/navigationと重複開始を止める。新しいViewerContext owner、detached専用bool/Option、
+時間窓、rect/focus/placement/HWND/recreate述語を追加する変更ではない。
+  G4の既存viewer変更受付（F12独立化、DFS、改名、drop、slideshow、resume記録）を
+  同じprocess modalの共通述語へ接続する。各描画viewportのegui modal layerも入力を遮断し、
+  所有窓だけに同じ確認Windowを描く。embeddedはroot終端、dedicatedはそのcallbackだけで描く。
+  お気に入りの表示状態・標準補正とresume meterは既存FIFO/workerの完了値をメモリへ採用してから
+  完了表示へ進む。通常の保存完了が新しいメモリ上の操作を巻き戻すことはない。
+
+F12起点を同じIDの一覧へ変える経路が現行detachedにないため、設計§11.1の利用者決定に従い、
+元の閲覧を保ち、成功画面に出力先を示す。mainや兄弟へ選択を付け替えない。
+一覧を持つmain起点だけが既存の親folder再読込へ進み、可視ZIPのpath identityを選択する。
+同名3択や絞り込みでZIPが不可視でも変換成功を保ち、設定を変えない。
+
+source DAT補充・先行dirty保存は取消でも保持して採用する。source refreshはworkerで取得し、
+該当source keyを持つcontextとitems generationを照合して有界chunkで反映する。
+元一覧・選択・閲覧modeを維持し、関連しない兄弟のitems/cache/queueを一括resetしない。
+root/F12 closeと取消は同operationの完了境界へ送り、保存票や利用者データを放棄して窓を切り替えない。
+これは新機能の操作寿命と既存contextへの採用を接続する構造変更であり、detachedの既存症状へ
+guard/retry/repaintを足すパッチではない。完了時レビューではこの判断と所有境界を独立に確認する。
+
 ### 2026-10-12 §1.374 Everything の共通Search接続（未コミット・独立実装レビュー待ち）
 
 利用者の実装指示と承認済みEverything計画、先行PDF ownershipの独立ACCEPT実装

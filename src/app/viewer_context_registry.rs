@@ -2224,7 +2224,7 @@ impl App {
         window_id: u64,
         idx: usize,
     ) {
-        if self.composition_editor_modal_active() {
+        if self.viewer_mutation_modal_active() {
             return;
         }
         match self.try_own_fullscreen_epub_at(idx) {
@@ -4500,6 +4500,7 @@ impl App {
         let reason = _reason;
         let retiring_window = self.viewer_contexts.table.window_for_context(id);
         self.close_composition_editor_for_context(id);
+        self.cancel_image_folder_zip_for_context(id);
         self.viewer_contexts.table.begin_retire(id)?;
         self.cancel_rating_membership_restore_for_context(id);
         if retiring_window == self.active_detached_window_id() {

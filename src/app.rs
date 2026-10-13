@@ -572,6 +572,7 @@ mod book_composition_editor_thumbnails;
 pub(crate) mod book_composition_permission;
 mod book_composition_remap;
 pub(crate) mod book_composition_runtime;
+mod image_folder_zip_operation;
 pub(crate) use book_composition_editor::CompositionEditorCloseReason;
 pub(crate) mod normalize;
 pub(crate) mod page_edit_snapshot;
@@ -15422,6 +15423,7 @@ pub struct App {
     pub(crate) spread_shift_settings_generation: u64,
     pub(crate) spread_shift_service: Option<crate::spread_shift::SpreadShiftService>,
     pub(crate) book_composition_service: Option<crate::book_composition::BookCompositionService>,
+    pub(crate) image_folder_zip_operation: Option<Box<image_folder_zip_operation::Operation>>,
     pub(crate) composition_editor_operations: book_composition_editor::CompositionEditorOperations,
     spread_shift_process_owner:
         Option<Arc<std::sync::Mutex<Option<crate::spread_shift::SpreadShiftProcessOwner>>>>,
@@ -19670,6 +19672,7 @@ impl App {
             spread_shift_settings_generation: 0,
             spread_shift_service: None,
             book_composition_service: None,
+            image_folder_zip_operation: None,
             composition_editor_operations: Default::default(),
             spread_shift_process_owner: None,
             content_identity_index_load_pending,
@@ -22135,6 +22138,10 @@ impl App {
     ///
     /// main / fullscreen で別々の一覧を持つと、新規ダイアログ追加時に片方だけ漏れて
     /// wheel・キーが背面へ伝播するため、モーダル相当の状態は必ずここへ集約する。
+    pub(crate) fn viewer_mutation_modal_active(&self) -> bool {
+        self.image_folder_zip_operation.is_some() || self.composition_editor_modal_active()
+    }
+
     pub(crate) fn common_modal_dialog_open(&self) -> bool {
         self.modal_dialog_block_reason().is_some()
     }
@@ -22175,6 +22182,7 @@ impl App {
             };
         }
         first![
+            self.image_folder_zip_operation.is_some() => "image_folder_zip",
             self.composition_editor_modal_active() => "book_composition_editor",
             self.everything_search_progress_visible() => "everything_search",
             self.capture_selection_open() => "clipboard_capture_selection",
@@ -38465,7 +38473,8 @@ impl App {
     }
 
     pub(crate) fn document_open_modal_admission_blocked(&self) -> bool {
-        self.composition_editor_modal_active()
+        self.image_folder_zip_operation.is_some()
+            || self.composition_editor_modal_active()
             || self.capture_selection_open()
             || self.epub_convert_pending_in_any_context()
             || self.pdf_password_request_pending_in_any_context()
@@ -45994,7 +46003,7 @@ impl App {
 
     /// Called only at mIV-owned filesystem mutation producers, before a worker or viewer release.
     pub(crate) fn admit_rename_migration_source_change(&mut self, ctx: &egui::Context) -> bool {
-        if self.composition_editor_modal_active() {
+        if self.viewer_mutation_modal_active() {
             return false;
         }
         if self.ensure_rename_migration_journal_loaded() {
@@ -47017,9 +47026,13 @@ impl App {
     ///
     /// 完了時のフォルダ再読み込みは `poll_file_drop_pending` が `pending_reload` を立てて行う。
     pub(crate) fn handle_external_file_drop(&mut self, paths: Vec<PathBuf>) {
-        if self.composition_editor_modal_active() {
-            crate::logger::log("composition editor: rejected external file drop");
-            self.show_feedback_toast("本の構成を編集中のため、ファイルを操作できません".into());
+        if self.viewer_mutation_modal_active() {
+            crate::logger::log("viewer mutation modal: rejected external file drop");
+            self.show_feedback_toast(if self.image_folder_zip_operation.is_some() {
+                "ZIP を作成中のため、ファイルを操作できません".into()
+            } else {
+                "本の構成を編集中のため、ファイルを操作できません".into()
+            });
             return;
         }
         let paths: Vec<_> = paths
@@ -54497,7 +54510,7 @@ impl App {
         forward: bool,
         mode: FolderNavMode,
     ) {
-        if self.composition_editor_modal_active() {
+        if self.viewer_mutation_modal_active() {
             return;
         }
         // Repeated Ctrl traversal extends the staged request's virtual step count. No second
@@ -57748,7 +57761,7 @@ impl App {
             PathBuf,
         ),
     ) {
-        if self.composition_editor_modal_active() {
+        if self.viewer_mutation_modal_active() {
             return;
         }
         let on_search_results = self.items_are_global_search_view
@@ -57795,7 +57808,7 @@ impl App {
     /// 現在のフルスクリーンページを「最後に読んだページ」として永続記録する。
     /// 画像本のページのみ対象。dedup 付きで連続ページ送り中の重複書き込みを抑える。
     pub(crate) fn record_book_resume(&mut self, idx: usize) {
-        if self.composition_editor_modal_active() {
+        if self.viewer_mutation_modal_active() {
             return;
         }
         if matches!(
@@ -68662,7 +68675,11 @@ impl App {
         folders: &mut Vec<GridItem>,
         folder_metas: &mut Vec<Option<(i64, i64)>>,
     ) -> usize {
-        crate::app::folder_scan::filter_virtual_folder_duplicates(folders, folder_metas)
+        crate::app::folder_scan::filter_virtual_folder_duplicates(
+            crate::same_name_folder_book::SameNameFolderBookPolicy::PreferFolder,
+            folders,
+            folder_metas,
+        )
     }
 
     /// Prefer native ZIP/CBZ over a same-stem RAR/7z/LZH archive.
@@ -75212,7 +75229,7 @@ impl App {
     /// 通常のナビ (load → 内部で close_fullscreen) を発行する。BS は階層を 1 段だけ戻す
     /// (= 常に L2) ので本関数を通さず `close_fullscreen` を直接呼ぶ (ui_fullscreen 側)。
     pub(crate) fn handle_fullscreen_close_request(&mut self) {
-        if self.composition_editor_modal_active() {
+        if self.viewer_mutation_modal_active() {
             return;
         }
         self.finish_fullscreen_navigation_for_true_close();
@@ -86022,11 +86039,23 @@ impl App {
             .map(|writer| std::iter::from_fn(|| writer.try_recv()).collect())
             .unwrap_or_default();
         for outcome in results {
-            let Err(error) = outcome.result else {
+            let (command, result) = match outcome {
+                crate::favorite_view_state::FavoriteViewStoreResult::Copied { id, state } => {
+                    // The ZIP modal owns admission through FIFO copy adoption.
+                    // Normal persistence replies do not replace newer in-memory intent.
+                    self.favorite_view_states.insert(id, state);
+                    continue;
+                }
+                crate::favorite_view_state::FavoriteViewStoreResult::Persisted {
+                    command,
+                    result,
+                } => (command, result),
+            };
+            let Err(error) = result else {
                 continue;
             };
             crate::logger::log(format!("favorite view state store failed: {error}"));
-            match outcome.command {
+            match command {
                 crate::favorite_view_state::FavoriteViewStoreCommand::Set { id, state } => {
                     // この Set より後に reset / clear / 新しい変更が入っていれば、古い
                     // failure を再送して現在の意図を巻き戻してはならない。
@@ -93148,7 +93177,7 @@ impl App {
         self.poll_video_upscale_queue(ctx);
 
         let main_viewer_blocked =
-            self.viewer_session_blocks_main_window() || self.composition_editor_modal_active();
+            self.viewer_session_blocks_main_window() || self.viewer_mutation_modal_active();
 
         // ── ダイアログ群 ─────────────────────────────────────────────
         self.show_favorites_editor_dialog(ctx);
@@ -94629,6 +94658,7 @@ impl eframe::App for App {
         // remains under the established close policy.
         self.defer_settings_family_root_close(ctx);
         self.defer_composition_editor_root_close(ctx);
+        self.defer_image_folder_zip_root_close(ctx);
         #[cfg(not(windows))]
         {
             // Non-Windows builds have one mounted viewer context and therefore no
@@ -94639,6 +94669,7 @@ impl eframe::App for App {
                 self.show_feedback_toast(notice);
             }
         }
+        self.poll_image_folder_zip(ctx);
         self.update_frame(ctx, frame);
         // Composition publications and Prepare completions belong to the
         // display-independent async boundary. Run after the presentation pass
@@ -94648,6 +94679,7 @@ impl eframe::App for App {
         self.poll_book_composition_service(ctx);
         if self.fullscreen_idx.is_none() || self.fullscreen_embedded_still_active() {
             self.show_local_composition_editor(ctx);
+            self.show_image_folder_zip(ctx);
         }
         #[cfg(windows)]
         self.sync_clipboard_capture(ctx);

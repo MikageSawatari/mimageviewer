@@ -317,6 +317,12 @@ pub struct ReadingHistoryWriter {
 }
 
 enum ReadingHistoryCommand {
+    FolderZip(
+        PathBuf,
+        PathBuf,
+        crate::image_folder_zip_metadata::CopyPhase,
+        mpsc::Sender<crate::image_folder_zip_metadata::CopyReply>,
+    ),
     Upsert(ReadingHistoryEntry, usize),
     UpdateMediaProgress(MediaProgressUpdate),
     RemoveKeys(Vec<String>),
@@ -367,6 +373,16 @@ impl ReadingHistoryWriter {
                 };
                 while let Ok(command) = rx.recv() {
                     let result = match command {
+                        ReadingHistoryCommand::FolderZip(source, destination, phase, reply) => {
+                            let result = crate::image_folder_zip_metadata::clone_history_on(
+                                &db.conn,
+                                &source,
+                                &destination,
+                                phase,
+                            );
+                            let _ = reply.send(result);
+                            continue;
+                        }
                         ReadingHistoryCommand::Upsert(entry, limit) => db.upsert(entry, limit),
                         ReadingHistoryCommand::UpdateMediaProgress(update) => db
                             .update_media_progress(
@@ -401,6 +417,26 @@ impl ReadingHistoryWriter {
         if let Some(tx) = &self.tx {
             let _ = tx.send(ReadingHistoryCommand::Upsert(entry, limit));
         }
+    }
+
+    pub(crate) fn folder_zip_portal(
+        &self,
+        source: PathBuf,
+        destination: PathBuf,
+    ) -> crate::image_folder_zip_metadata::CopyPortal {
+        let tx = self.tx.clone();
+        std::sync::Arc::new(move |_, phase| {
+            let (reply, rx) = mpsc::channel();
+            if let Some(tx) = &tx {
+                let _ = tx.send(ReadingHistoryCommand::FolderZip(
+                    source.clone(),
+                    destination.clone(),
+                    phase,
+                    reply,
+                ));
+            }
+            rx
+        })
     }
 
     pub fn prune(&self, limit: usize) {
@@ -537,6 +573,95 @@ fn path_metadata(path: &Path) -> (Option<i64>, Option<i64>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folder_zip_history_fifo_keeps_read_time_and_source_without_touching_siblings() {
+        use crate::image_folder_zip_metadata::CopyPhase;
+        let data = crate::data_dir::TestDataDirGuard::new();
+        let source = data.path().join("book");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("p1.jpg"), b"image bytes").unwrap();
+        let manifest = crate::image_folder_zip::prepare_manifest(
+            &source,
+            None,
+            &crate::image_folder_zip::ConversionControl::default(),
+        )
+        .unwrap();
+        let writer = ReadingHistoryWriter::spawn().unwrap();
+        let original = ReadingHistoryEntry {
+            key: normalize_path_keep_drive(&source),
+            path: source.clone(),
+            kind: ReadingHistoryKind::Folder,
+            archive_format: None,
+            title: "saved title".into(),
+            last_read_at_ms: 1234,
+            last_page: Some(77),
+            page_count: Some(100),
+            media_position_ms: None,
+            media_duration_ms: None,
+            file_size: Some(987),
+            mtime_ms: Some(456),
+        };
+        let sibling = entry("C:/Books/sibling.zip", 3);
+        writer.record(original.clone(), 1000);
+        writer.record(sibling.clone(), 1000);
+        let portal = writer.folder_zip_portal(source.clone(), manifest.destination.clone());
+        assert_eq!(
+            portal(&manifest, CopyPhase::Check)
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap(),
+            Ok(1)
+        );
+        let db = ReadingHistoryDb::open_at(ReadingHistoryDb::db_path()).unwrap();
+        assert_eq!(db.list_recent(1000).unwrap().len(), 2);
+        assert_eq!(
+            portal(&manifest, CopyPhase::Apply)
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap(),
+            Ok(1)
+        );
+        assert_eq!(
+            portal(&manifest, CopyPhase::Apply)
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap(),
+            Ok(0)
+        );
+        let rows = db.list_recent(1000).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows.iter().find(|row| row.key == original.key),
+            Some(&original)
+        );
+        assert_eq!(
+            rows.iter().find(|row| row.key == sibling.key),
+            Some(&sibling)
+        );
+        let expected = ReadingHistoryEntry {
+            key: normalize_path_keep_drive(&manifest.destination),
+            path: manifest.destination.clone(),
+            kind: ReadingHistoryKind::Zip,
+            file_size: None,
+            mtime_ms: None,
+            ..original
+        };
+        assert_eq!(
+            rows.iter().find(|row| row.key == expected.key),
+            Some(&expected)
+        );
+        // No source history means no new "read now" record at conversion time.
+        let absent =
+            writer.folder_zip_portal(data.path().join("unread"), data.path().join("unread.zip"));
+        assert_eq!(
+            absent(&manifest, CopyPhase::Apply)
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap(),
+            Ok(0)
+        );
+        assert_eq!(db.list_recent(1000).unwrap(), rows);
+        drop(absent);
+        drop(portal);
+        drop(writer);
+    }
 
     fn temp_db() -> (tempfile::TempDir, ReadingHistoryDb) {
         let dir = tempfile::tempdir().unwrap();

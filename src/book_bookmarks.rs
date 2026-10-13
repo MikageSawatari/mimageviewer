@@ -197,6 +197,13 @@ pub enum BookBookmarkEvent {
 }
 
 enum BookBookmarkRequest {
+    FolderZip(
+        PathBuf,
+        PathBuf,
+        Vec<String>,
+        crate::image_folder_zip_metadata::CopyPhase,
+        mpsc::Sender<crate::image_folder_zip_metadata::CopyReply>,
+    ),
     Add(u64, NewBookBookmark),
     Remove(u64, i64),
     RemoveInContainer(u64, i64, PathBuf),
@@ -232,6 +239,10 @@ impl BookBookmarkService {
                         // UI は通常の event 経路で失敗を表示し、読み込み spinner も解除できる。
                         while let Ok(request) = request_rx.recv() {
                             let event = match request {
+                                BookBookmarkRequest::FolderZip(_, _, _, _, reply) => {
+                                    let _ = reply.send(Err(message.clone()));
+                                    continue;
+                                }
                                 BookBookmarkRequest::Add(request_id, _) => {
                                     BookBookmarkEvent::Added {
                                         request_id,
@@ -306,6 +317,23 @@ impl BookBookmarkService {
                 db.recover_path_migration_journal();
                 while let Ok(request) = request_rx.recv() {
                     let event = match request {
+                        BookBookmarkRequest::FolderZip(
+                            source,
+                            destination,
+                            members,
+                            phase,
+                            reply,
+                        ) => {
+                            let result = crate::image_folder_zip_metadata::clone_bookmarks_on(
+                                &db.conn,
+                                &source,
+                                &destination,
+                                &members,
+                                phase,
+                            );
+                            let _ = reply.send(result);
+                            continue;
+                        }
                         BookBookmarkRequest::Add(request_id, entry) => BookBookmarkEvent::Added {
                             request_id,
                             result: db.add(&entry).map_err(|err| err.to_string()),
@@ -452,6 +480,28 @@ impl BookBookmarkService {
         if let Some(tx) = &self.tx {
             let _ = tx.send(BookBookmarkRequest::ListAll(request_id));
         }
+    }
+
+    pub(crate) fn folder_zip_portal(
+        &self,
+        source: PathBuf,
+        destination: PathBuf,
+        sort: crate::settings::SortOrder,
+    ) -> crate::image_folder_zip_metadata::CopyPortal {
+        let tx = self.tx.clone();
+        std::sync::Arc::new(move |manifest, phase| {
+            let (reply, rx) = mpsc::channel();
+            if let Some(tx) = &tx {
+                let _ = tx.send(BookBookmarkRequest::FolderZip(
+                    source.clone(),
+                    destination.clone(),
+                    crate::image_folder_zip_metadata::target_order(manifest, sort),
+                    phase,
+                    reply,
+                ));
+            }
+            rx
+        })
     }
 
     pub fn migrate_paths(&self, request_id: u64, mappings: Vec<(PathBuf, PathBuf)>) {
@@ -1823,6 +1873,139 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folder_zip_bookmark_fifo_copies_fresh_ids_and_resolves_actual_zip_entries() {
+        use crate::image_folder_zip_metadata::CopyPhase;
+        let data = crate::data_dir::TestDataDirGuard::new();
+        let source = data.path().join("book");
+        std::fs::create_dir(&source).unwrap();
+        for name in ["p1.jpg", "p2.jpg", "p10.jpg"] {
+            std::fs::write(source.join(name), b"image bytes").unwrap();
+        }
+        let control = crate::image_folder_zip::ConversionControl::default();
+        let manifest = crate::image_folder_zip::prepare_manifest(&source, None, &control).unwrap();
+        let service = BookBookmarkService::spawn().unwrap();
+        for (request_id, name, hint) in [(1, "P1.JPG", 0), (2, "missing.jpg", 77)] {
+            service.add(
+                request_id,
+                NewBookBookmark {
+                    container_path: source.clone(),
+                    container_kind: BookContainerKind::ImageFolder,
+                    page_identity: PageIdentity::RelativePath(name.into()),
+                    page_index_hint: hint,
+                },
+            );
+        }
+        let originals: Vec<_> = (0..2)
+            .map(|_| {
+                match service
+                    .rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap()
+                {
+                    BookBookmarkEvent::Added { result, .. } => result.unwrap().0,
+                    event => panic!("unexpected {event:?}"),
+                }
+            })
+            .collect();
+        for original in &originals {
+            service.set_title(3, original.id, format!("title {}", original.id));
+        }
+        let sibling = data.path().join("sibling.pdf");
+        service.add(
+            4,
+            NewBookBookmark {
+                container_path: sibling.clone(),
+                container_kind: BookContainerKind::Pdf,
+                page_identity: PageIdentity::PdfPage(5),
+                page_index_hint: 5,
+            },
+        );
+        let portal = service.folder_zip_portal(
+            source.clone(),
+            manifest.destination.clone(),
+            crate::settings::SortOrder::NumericDesc,
+        );
+        assert_eq!(
+            portal(&manifest, CopyPhase::Check)
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap(),
+            Ok(2)
+        );
+        let db = BookBookmarkDb::open_at(&db_path()).unwrap();
+        assert!(
+            db.list_for_container(&manifest.destination)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            portal(&manifest, CopyPhase::Apply)
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap(),
+            Ok(2)
+        );
+        assert_eq!(
+            portal(&manifest, CopyPhase::Apply)
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap(),
+            Ok(0)
+        );
+        // Read back through the service consumer, after the copy receipt.
+        while service.rx.try_recv().is_ok() {}
+        service.list_for_container(5, manifest.destination.clone());
+        let cloned = match service
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+        {
+            BookBookmarkEvent::ContainerListed {
+                request_id: 5,
+                result,
+                ..
+            } => result.unwrap(),
+            event => panic!("unexpected {event:?}"),
+        };
+        assert_eq!(cloned.len(), 2);
+        for original in &originals {
+            let expected_name = match &original.page_identity {
+                PageIdentity::RelativePath(name) if name == "P1.JPG" => "p1.jpg",
+                PageIdentity::RelativePath(name) => name.as_str(),
+                _ => unreachable!(),
+            };
+            let copy = cloned
+                .iter()
+                .find(|copy| copy.page_identity == PageIdentity::ArchiveEntry(expected_name.into()))
+                .unwrap();
+            assert_ne!(copy.id, original.id);
+            assert_eq!(copy.container_kind, BookContainerKind::Zip);
+            assert_eq!(copy.container_path, manifest.destination);
+            assert_eq!(copy.created_at_ms, original.created_at_ms);
+            assert_eq!(copy.title, Some(format!("title {}", original.id)));
+            assert_eq!(
+                copy.page_index_hint,
+                if expected_name == "p1.jpg" { 2 } else { 77 }
+            );
+        }
+        let published = crate::image_folder_zip::write_zip(&manifest, &control, |_, _| {})
+            .unwrap()
+            .publish(&manifest, &control)
+            .unwrap();
+        let entries = crate::zip_loader::enumerate_image_entries(published.path()).unwrap();
+        let tree = crate::zip_tree::ZipTree::build(manifest.destination.clone(), entries);
+        let target = resolve_archive_bookmark_target(&tree, "p1.jpg").unwrap();
+        assert_eq!(target.entry_name, "p1.jpg");
+        assert_eq!(target.effective_prefix, "");
+        assert!(resolve_archive_bookmark_target(&tree, "missing.jpg").is_none());
+        let retained = db.list_for_container(&source).unwrap();
+        for original in &originals {
+            let row = retained.iter().find(|row| row.id == original.id).unwrap();
+            assert_eq!(row.page_identity, original.page_identity);
+            assert_eq!(row.page_index_hint, original.page_index_hint);
+            assert_eq!(row.created_at_ms, original.created_at_ms);
+        }
+        assert_eq!(db.list_for_container(&sibling).unwrap().len(), 1);
+    }
 
     #[test]
     fn bookmark_visibility_total_counts_full_media_and_book_registration() {

@@ -311,7 +311,7 @@ fn image_page_recognition_fingerprint_with_native_extensions(
     mix(b"image-folder-page-count-v2\0");
     mix(&settings.file_type_visibility.fingerprint().to_le_bytes());
     mix(&[u8::from(settings.skip_image_if_video_exists)]);
-    mix(&[u8::from(settings.skip_zip_if_folder_exists)]);
+    mix(&[settings.same_name_folder_book as u8]);
     mix(&[u8::from(settings.skip_archive_if_zip_exists)]);
     mix(&[u8::from(settings.skip_epub_if_pdf_exists)]);
     mix(&[u8::from(settings.show_hidden_files)]);
@@ -380,11 +380,14 @@ pub(crate) fn is_image_only_book_contents(
     has_container: bool,
     all_media: &[ScannedMediaEntry],
 ) -> bool {
-    !has_container
-        && !all_media.is_empty()
-        && all_media
-            .iter()
-            .all(|entry| entry.kind == ScanMediaKind::Image)
+    crate::file_type_visibility::is_image_only_book_contents(
+        has_container,
+        all_media.iter().map(|entry| match entry.kind {
+            ScanMediaKind::Image => crate::file_type_visibility::FileTypeCategory::Image,
+            ScanMediaKind::Video => crate::file_type_visibility::FileTypeCategory::Video,
+            ScanMediaKind::Audio => crate::file_type_visibility::FileTypeCategory::Audio,
+        }),
+    )
 }
 
 /// ディレクトリ走査: `read_dir` + 各エントリの `file_type()` / `metadata()` 呼び出し。
@@ -788,31 +791,40 @@ pub(crate) fn filter_video_image_duplicates(
 }
 
 /// ZIP/PDF/対応アーカイブと同名の実フォルダがあれば、実フォルダを一覧の正本にする。
-pub(crate) fn filter_virtual_folder_duplicates(
-    folders: &mut Vec<GridItem>,
-    folder_metas: &mut Vec<Option<(i64, i64)>>,
-) -> usize {
-    let real_folder_names: std::collections::HashSet<String> = folders
+fn folder_book_keep_mask(
+    folders: &[GridItem],
+    policy: crate::same_name_folder_book::SameNameFolderBookPolicy,
+) -> Vec<bool> {
+    let candidates: Vec<_> = folders
         .iter()
         .filter_map(|item| match item {
-            GridItem::Folder(path) => path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(str::to_lowercase),
+            GridItem::Folder(path) => Some((path.as_path(), true)),
+            GridItem::ZipFile(path)
+            | GridItem::PdfFile(path)
+            | GridItem::ConvertibleArchive { path, .. } => Some((path.as_path(), false)),
             _ => None,
         })
         .collect();
-    let keep: Vec<bool> = folders
+    let mask = crate::same_name_folder_book::keep_mask(policy, candidates);
+    let mut mask = mask.into_iter();
+    folders
         .iter()
         .map(|item| match item {
-            GridItem::ZipFile(path)
-            | GridItem::PdfFile(path)
-            | GridItem::ConvertibleArchive { path, .. } => {
-                !real_folder_names.contains(&super::stem_lower(path))
-            }
+            GridItem::Folder(_)
+            | GridItem::ZipFile(_)
+            | GridItem::PdfFile(_)
+            | GridItem::ConvertibleArchive { .. } => mask.next().unwrap(),
             _ => true,
         })
-        .collect();
+        .collect()
+}
+
+pub(crate) fn filter_virtual_folder_duplicates(
+    policy: crate::same_name_folder_book::SameNameFolderBookPolicy,
+    folders: &mut Vec<GridItem>,
+    folder_metas: &mut Vec<Option<(i64, i64)>>,
+) -> usize {
+    let keep = folder_book_keep_mask(folders, policy);
     let mut iter = keep.iter();
     folders.retain(|_| *iter.next().unwrap());
     let mut iter = keep.iter();
@@ -821,33 +833,14 @@ pub(crate) fn filter_virtual_folder_duplicates(
 }
 
 pub(super) fn filter_virtual_folder_duplicates_with_sort_metadata(
+    policy: crate::same_name_folder_book::SameNameFolderBookPolicy,
     folders: &mut Vec<GridItem>,
     folder_metas: &mut Vec<Option<(i64, i64)>>,
     sort_metas: &mut Vec<crate::settings::ListingSortMetadata>,
 ) -> usize {
     assert_eq!(folders.len(), folder_metas.len());
     assert_eq!(folders.len(), sort_metas.len());
-    let real_folder_names: std::collections::HashSet<String> = folders
-        .iter()
-        .filter_map(|item| match item {
-            GridItem::Folder(path) => path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(str::to_lowercase),
-            _ => None,
-        })
-        .collect();
-    let keep: Vec<bool> = folders
-        .iter()
-        .map(|item| match item {
-            GridItem::ZipFile(path)
-            | GridItem::PdfFile(path)
-            | GridItem::ConvertibleArchive { path, .. } => {
-                !real_folder_names.contains(&super::stem_lower(path))
-            }
-            _ => true,
-        })
-        .collect();
+    let keep = folder_book_keep_mask(folders, policy);
     let mut iter = keep.iter();
     folders.retain(|_| *iter.next().unwrap());
     let mut iter = keep.iter();

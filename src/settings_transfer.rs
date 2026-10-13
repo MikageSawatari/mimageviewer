@@ -213,7 +213,13 @@ macro_rules! preferences_policy {
         }
         fn parse_items(items: &Map<String, Value>) -> ParsedPreferences {
             let mut result = ParsedPreferences { accepted: Vec::new(), issues: Vec::new(), unknown_count: 0 };
-            for (key, raw) in items { match key.as_str() {
+            let mut items = items.clone();
+            if crate::same_name_folder_book::canonicalize(&mut items).is_err() {
+                items.remove(crate::same_name_folder_book::KEY);
+                items.remove(crate::same_name_folder_book::LEGACY_KEY);
+                result.issues.push(issue("同名のフォルダと本"));
+            }
+            for (key, raw) in &items { match key.as_str() {
                 $( stringify!($field) => match validated::<$ty>(raw, $check) {
                     Some(value) => result.accepted.push(Accepted::$field(value)),
                     None => result.issues.push(issue($label)),
@@ -317,7 +323,7 @@ preferences_policy! {
         edit_restore_prompt_enabled: bool => ("編集の復元確認", |_, _| true, plain, plain);
         sidecar_backup_enabled: bool => ("編集データのサイドカーバックアップ", |_, _| true, plain, plain);
         tag_sidecar_backup_enabled: bool => ("タグのサイドカーバックアップ", |_, _| true, plain, plain);
-        skip_zip_if_folder_exists: bool => ("同名フォルダがあるZIPを省略", |_, _| true, plain, plain);
+        same_name_folder_book: crate::same_name_folder_book::SameNameFolderBookPolicy => ("同名のフォルダと本", |_, _| true, plain, plain);
         skip_archive_if_zip_exists: bool => ("同名ZIPがあるアーカイブを省略", |_, _| true, plain, plain);
         skip_epub_if_pdf_exists: bool => ("同名PDFがあるEPUBを省略", |_, _| true, plain, plain);
         skip_image_if_video_exists: bool => ("同名の動画・音声がある画像を省略", |_, _| true, plain, plain);
@@ -861,6 +867,44 @@ pub fn write_preferences(path: &Path, json: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn same_name_folder_book_legacy_transfer_partial_and_new_precedence() {
+        use crate::same_name_folder_book::{KEY, LEGACY_KEY, SameNameFolderBookPolicy as Policy};
+        for (old, expected) in [(true, Policy::PreferBook), (false, Policy::ShowBoth)] {
+            let parsed = parse_items(serde_json::json!({LEGACY_KEY: old}).as_object().unwrap());
+            let mut destination = Settings::default();
+            destination.same_name_folder_book = Policy::PreferFolder;
+            let report = parsed.apply_to(&mut destination);
+            assert_eq!(report.accepted_count, 1);
+            assert_eq!(report.unknown_count, 0);
+            assert!(report.issues.is_empty());
+            assert_eq!(destination.same_name_folder_book, expected);
+        }
+        let mut destination = Settings::default();
+        destination.same_name_folder_book = Policy::PreferFolder;
+        parse_items(&serde_json::Map::new()).apply_to(&mut destination);
+        assert_eq!(destination.same_name_folder_book, Policy::PreferFolder);
+        let parsed = parse_items(
+            serde_json::json!({KEY:"show_both",LEGACY_KEY:true})
+                .as_object()
+                .unwrap(),
+        );
+        assert_eq!(parsed.apply_to(&mut destination).accepted_count, 1);
+        assert_eq!(destination.same_name_folder_book, Policy::ShowBoth);
+        let parsed = parse_items(
+            serde_json::json!({KEY:"future",LEGACY_KEY:true,"slideshow_interval_secs":9.0})
+                .as_object()
+                .unwrap(),
+        );
+        let report = parsed.apply_to(&mut destination);
+        assert_eq!(report.issues.len(), 1);
+        assert_eq!(destination.same_name_folder_book, Policy::ShowBoth);
+        assert_eq!(destination.slideshow_interval_secs, 9.0);
+        let (map, _) = project(capture_export(&destination));
+        assert_eq!(map[KEY], "show_both");
+        assert!(!map.contains_key(LEGACY_KEY));
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -1116,7 +1160,8 @@ mod tests {
         settings.edit_restore_prompt_enabled = !settings.edit_restore_prompt_enabled;
         settings.sidecar_backup_enabled = !settings.sidecar_backup_enabled;
         settings.tag_sidecar_backup_enabled = !settings.tag_sidecar_backup_enabled;
-        settings.skip_zip_if_folder_exists = !settings.skip_zip_if_folder_exists;
+        settings.same_name_folder_book =
+            crate::same_name_folder_book::SameNameFolderBookPolicy::PreferFolder;
         settings.skip_archive_if_zip_exists = !settings.skip_archive_if_zip_exists;
         settings.skip_epub_if_pdf_exists = !settings.skip_epub_if_pdf_exists;
         settings.skip_image_if_video_exists = !settings.skip_image_if_video_exists;

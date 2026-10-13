@@ -22,6 +22,33 @@ pub const SIDECAR_FILENAME: &str = crate::fs_entry::PORTABLE_METADATA_BUNDLE_DIR
 /// v2.7.0では安定化のため非公開にしたが、v2.8.0の継続開発で再び有効化する。
 /// 未リリース機能を緊急にrelease buildから外す場合だけ、このgateをfalseへ戻す。
 pub(crate) const UI_ENABLED: bool = true;
+
+/// Worker-only semantic validation/backup reused by image-folder conversion.
+/// This reads a single page through the same typed family readers as transfer;
+/// it does not create a transfer bundle or copy source sync receipts.
+pub(crate) fn folder_zip_page_backup(
+    data_dir: &Path,
+    path: &Path,
+) -> Result<crate::sidecar::SidecarEntry, String> {
+    let cancel = AtomicBool::new(false);
+    let mut entries = vec![
+        make_enumerated(path, "page".into(), PortableEntryKind::File, &cancel)
+            .map_err(|e| e.to_string())?,
+    ];
+    attach_metadata(data_dir, &mut entries, &cancel, &mut |_| {}).map_err(|e| e.to_string())?;
+    let entry = entries.pop().unwrap().portable;
+    validate_page_state(&entry.page_state, "page").map_err(|e| e.to_string())?;
+    let state = entry.page_state;
+    Ok(crate::sidecar::SidecarEntry {
+        adjust: state.adjustment,
+        mask: state.mask,
+        conceal: state.conceal,
+        local_adjust_layers: state.local_adjust_layers.map(std::sync::Arc::new),
+        export_crop: state.export_crop,
+        comic: state.comic,
+        tags: None,
+    })
+}
 const FORMAT_NAME: &str = "mimageviewer-portable-metadata";
 const SHARD_FORMAT_NAME: &str = "mimageviewer-portable-metadata-shard";
 const FORMAT_VERSION: u32 = 11;

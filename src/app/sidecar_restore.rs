@@ -2237,8 +2237,21 @@ impl App {
                         .map(|writer| std::iter::from_fn(|| writer.try_recv()).collect())
                         .unwrap_or_default();
                     for result in prior_results {
-                        if result.result.is_err() {
-                            state.common.favorite_failures.push(result.command);
+                        match result {
+                            crate::favorite_view_state::FavoriteViewStoreResult::Persisted {
+                                command,
+                                result,
+                            } => {
+                                if result.is_err() {
+                                    state.common.favorite_failures.push(command);
+                                }
+                            }
+                            crate::favorite_view_state::FavoriteViewStoreResult::Copied {
+                                id,
+                                state,
+                            } => {
+                                self.favorite_view_states.insert(id, state);
+                            }
                         }
                     }
                     for (id, favorite_state) in self.favorite_view_writes.take_all() {
@@ -2268,8 +2281,21 @@ impl App {
                     .map(|writer| std::iter::from_fn(|| writer.try_recv()).collect())
                     .unwrap_or_default();
                 for result in results {
-                    if result.result.is_err() {
-                        state.common.favorite_failures.push(result.command);
+                    match result {
+                        crate::favorite_view_state::FavoriteViewStoreResult::Persisted {
+                            command,
+                            result,
+                        } => {
+                            if result.is_err() {
+                                state.common.favorite_failures.push(command);
+                            }
+                        }
+                        crate::favorite_view_state::FavoriteViewStoreResult::Copied {
+                            id,
+                            state,
+                        } => {
+                            self.favorite_view_states.insert(id, state);
+                        }
                     }
                 }
                 if let Some(error) = terminal_error {

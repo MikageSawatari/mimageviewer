@@ -694,8 +694,16 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     entry!(
         "duplicate/archive-folder",
         DuplicateFiles,
-        "同名の ZIP/PDF/EPUB/RAR/7z/LZH ファイルとフォルダがある場合、本側をスキップ",
-        ["重複", "同名", "archive"]
+        "同名のフォルダと本 (ZIP/PDF/EPUB/RAR/7z/LZH) がある場合",
+        [
+            "重複",
+            "同名",
+            "archive",
+            "本を表示",
+            "フォルダを表示",
+            "両方表示",
+            "本側をスキップ"
+        ]
     ),
     entry!(
         "duplicate/zip-archive",
@@ -1383,6 +1391,28 @@ mod tests {
     const PREFERENCES_SOURCE: &str = include_str!("../preferences.rs");
     const RAW_SETTINGS_SOURCE: &str = include_str!("../../ui_raw.rs");
     const NAME_COLORS_SOURCE: &str = include_str!("name_colors.rs");
+
+    #[test]
+    fn same_name_folder_book_choice_queries_target_the_existing_anchor() {
+        for query in [
+            "本を表示",
+            "フォルダを表示",
+            "両方表示",
+            "ZIP フォルダ",
+            "本側をスキップ",
+        ] {
+            let results = search_preferences(query, |_| ("ファイル", 0, 0));
+            let result = results
+                .iter()
+                .find(|entry| entry.anchor == "duplicate/archive-folder")
+                .unwrap_or_else(|| panic!("same-name preference missing for {query}"));
+            assert_eq!(result.page, PreferencesPage::DuplicateFiles);
+            assert_eq!(
+                result.title,
+                "同名のフォルダと本 (ZIP/PDF/EPUB/RAR/7z/LZH) がある場合"
+            );
+        }
+    }
 
     fn anchors_in_pages_source(source: &str) -> Vec<&str> {
         source

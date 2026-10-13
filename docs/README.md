@@ -14,8 +14,8 @@
 | [raw-libraw-plan.md](raw-libraw-plan.md) | RAW の内蔵現像、プレビュー差し替え・編集 gate・Remote・設定・配布を触るとき |
 | [libraw-source-distribution.md](libraw-source-distribution.md) | LibRaw の対応ソース・checksum・notice の準備と公開手順 |
 | [architecture-overview.md](architecture-overview.md) | 全体像の把握。レイヤー構造・モジュールマップ・永続化ストア一覧 |
-| [book-composition-plan.md](book-composition-plan.md) | §1.242 本の構成。利用者決定・G1〜G5の契約、G2のmodel/store/lifecycle、G3の共通projection・表示許可・mode-only・E接続。G4Fは2026-10-12に切り離し、画像folderは構成対象外。ZIP変換は次段の設計確認待ち。次々回リリース向けnext-bookで開発 |
-| [image-folder-to-zip-plan.md](image-folder-to-zip-plan.md) | §1.242 の独立した画像folder→Stored ZIP変換の設計R3（対象7346683c6、独立レビューACCEPTは利用者報告）。P3のRemoteタグ試験文言を訂正、未実装。画像タグのZIP本体集約、XMP評価補充、Collection容量、favorite表示状態FIFO、取消/完了選択、既存再帰範囲。同名3択と旧ON→本表示/旧OFF→両方表示は2026-10-12利用者決定済み |
+| [book-composition-plan.md](book-composition-plan.md) | §1.242 本の構成。利用者決定・G1〜G5の契約、G2のmodel/store/lifecycle、G3の共通projection・表示許可・mode-only・E接続。G4Fは2026-10-12に切り離し、画像folderは構成対象外。画像folder→Stored ZIP変換は独立計画で実装中。次々回リリース向けnext-bookで開発 |
+| [image-folder-to-zip-plan.md](image-folder-to-zip-plan.md) | §1.242 の独立した画像folder→Stored ZIP変換の設計R3（対象7346683c6、独立レビューACCEPTは利用者報告）、実装中。画像タグのZIP本体集約、XMP評価補充、favorite表示状態FIFO、取消/完了選択、既存再帰範囲。2026-10-12利用者決定でCollectionは元参照を保持し、型拡張・容量検査・複製を除外。同名3択と旧ON→本表示/旧OFF→両方表示は決定済み |
 | [thumbnail-request-lifecycle-plan.md](thumbnail-request-lifecycle-plan.md) | §1.360 サムネイル要求とCPU画像の単一owner、保存/画像両終端、request ID相関、動画のidle/repaint/進捗投影、tray両測定、回帰・検証証拠 |
 | [section327-startup-window-flicker-investigation.md](section327-startup-window-flicker-investigation.md) | §1.327 起動時の白窓、native診断の採取・観測限界、利用者ログで確認した最大化起動の原因、採用したnormal表示後の一度だけの最大化 (§8)。大規模backend案 (§7) は将来候補 |
 | [display-pipeline.md](display-pipeline.md) | サムネイル表示・フルスクリーン描画を触るとき。**補正/AI/回転の適用順の決定版** |

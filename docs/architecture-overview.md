@@ -18,7 +18,13 @@ Eのframe-local wheel ownerを使う。保存完了ownerは各窓のreloadと共
 送信済保存票は所有窓の退役後もmetadata preview/import/exportとGeneric改名の開始を保護し、
 同じ完了ownerの採用後だけmaintenanceへ進む。folder sidecar restoreの従来開始条件は変更しない。
 §1.242はnext-bookで開発中、利用者決定の次々回release向け。G4Fは2026-10-12に切り離し、
-画像だけのfolderは構成対象外。folder閲覧・個別編集・sidecar v1は維持し、ZIP変換機能は次段の設計確認待ち。
+画像だけのfolderは構成対象外。folder閲覧・個別編集・sidecar v1は維持する。
+画像folderのZIP変換は、process単位の `app/image_folder_zip_operation` が一つのmodalとRemote admission leaseを所有する。
+先に受理した保存票・writerの完了を採用してから、既存sidecar/tag resourcesを単一workerへ移す。
+`image_folder_zip_job` が既存FIFO/service owner経由で利用者データを複製し、Stored出力をno-clobber公開する。
+元folderの補充だけをgeneration/key限定のbounded refreshで採用し、F12起点では元の閲覧を維持する。
+一覧を持つ起点だけ親一覧を更新し、可視なZIPを選択する。Collectionは元の画像を指したまま。
+取消・稀な失敗では元データを巻き戻さず、destination公開と複製を止める。詳細は [画像folder→ZIP設計](image-folder-to-zip-plan.md)。
 共通model/storeのfolder値は保持するが、物理画像の提示・類似preview・Remoteはその構成行を消費しない。
 Eのfolder scope/shiftは引き続き使用し、構成管理の表示や操作拒否へ流用しない。
 G5は別stage。
@@ -212,6 +218,7 @@ fit 基準へ戻さない。連結の基準 unit と PDF の絶対需要比較�
 | `app/viewer_context_registry.rs` | main / detached / parked viewer context の唯一の bundle 保管先。`ViewerContextId`、`ContextResidence`、window binding の双方向表と、mount / build / fork / retire / promote の 5 transaction を所有する。`App` の viewer field 群は常に registry が選んだ 1 context の投影であり、active / parked は bundle の保管場所ではなく detached window runtime state が表す。窓 ID は App / bundle に保存せず、mounted binding（build 中は非公開の予約）から導出するため、一覧差し替えや表示終了で所有窓が変わらない |
 | `app/vram_accounting.rs` | `App` が所有する全 GPU テクスチャキャッシュを、実寸・mip chain・`TextureId` 重複排除で横断集計する。サブシステム別会計、モード判定、共有予算の参照、1 秒間隔の perf 計装を担当する |
 | `app/folder_scan.rs` | 通常実フォルダの列挙と、1 物理フォルダ内に限定した同名メディア / コンテナ正規化の所有者。動画 + sidecar 画像、実フォルダ + ZIP/PDF/対応アーカイブ、ZIP + 変換元アーカイブ、画像拡張子優先度の規則を通常一覧・サブ展開・スマートフォルダで共有する |
+| `same_name_folder_book.rs` | 同名の実folder/本の「本を表示 / フォルダを表示 / 両方表示」を適格な候補へ適用するpure policy。通常一覧・Smart・サブ展開・Ctrl+↑↓/DFS・Remoteで共用し、再帰探索を刈らない。旧`skip_zip_if_folder_exists`のON→本表示/OFF→両方表示を、Settings・Remote subset・preferences transferの共通decoderで読み替える |
 | `app/startup_list_restore.rs` | 「前回終了した場所」の明示一覧 record と唯一の reducer。main の採用済み物理一覧／本／Drive の適格性を投影し、明示一覧採用、既存一覧の表示要求受理、同じ一覧の cursor 捕捉を分ける。直接読書・内部 load・合成 root・F12 表示先切替・independent viewer は target を更新しない。既存 typed request が intent を運び、ZIP prefix を含む restore hydration は最初の materialization に渡す。詳細と検証状況は [起動復元の所有設計](startup-restore-target-plan.md) |
 | `app/native_video.rs` | Windows native video presenter から戻る overlay event / key / mouse / marker / VST3 操作の App 側処理。native Touch は render overlay 内で完結し、App の legacy mouse 操作へは再注入しない |
 | `touch_input.rs` | 静止画 egui viewport と native video presenter が共有する、接点集合・所有・tap zone・pinch/pan/scroll の純粋な認識器 |

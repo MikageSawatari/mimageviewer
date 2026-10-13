@@ -9241,11 +9241,7 @@ pub(super) fn page_file_type_visibility(ui: &mut egui::Ui, state: &mut Preferenc
 
 pub(super) fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesState) {
     anchored(ui, state, "duplicate/archive-folder", |ui, state| {
-        let s = &mut state.settings;
-        ui.checkbox(
-            &mut s.skip_zip_if_folder_exists,
-            "同名の ZIP/PDF/EPUB/RAR/7z/LZH ファイルとフォルダがある場合、本側をスキップ",
-        );
+        draw_same_name_folder_book(ui, &mut state.settings.same_name_folder_book);
     });
     ui.add_space(4.0);
     anchored(ui, state, "duplicate/zip-archive", |ui, state| {
@@ -9345,6 +9341,19 @@ pub(super) fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesSta
                 }
             });
         }
+    });
+}
+
+pub(super) fn draw_same_name_folder_book(
+    ui: &mut egui::Ui,
+    policy: &mut crate::same_name_folder_book::SameNameFolderBookPolicy,
+) {
+    ui.label("同名のフォルダと本 (ZIP/PDF/EPUB/RAR/7z/LZH) がある場合");
+    ui.horizontal_wrapped(|ui| {
+        use crate::same_name_folder_book::SameNameFolderBookPolicy::*;
+        ui.radio_value(policy, PreferBook, "本を表示");
+        ui.radio_value(policy, PreferFolder, "フォルダを表示");
+        ui.radio_value(policy, ShowBoth, "両方表示");
     });
 }
 

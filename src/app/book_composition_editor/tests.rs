@@ -58,14 +58,11 @@ fn image_folder_editor_entry_only_guides_and_preserves_existing_reader() {
     ] {
         f.app.spread_mode = mode;
         assert!(f.app.composition_editor_available());
-        assert!(!f.app.start_local_composition_editor(&ctx));
-        assert_eq!(
-            f.app
-                .fs_feedback_toast
-                .as_ref()
-                .map(|toast| toast.0.as_str()),
-            Some("画像だけのフォルダでは本の構成を作れません。ZIP に変換してから行ってください。")
-        );
+        assert!(f.app.start_local_composition_editor(&ctx));
+        assert!(f.app.image_folder_zip_operation.is_some());
+        assert!(f.app.common_modal_dialog_open());
+        // The guide now offers conversion; dismissing it still leaves the reader intact.
+        f.app.image_folder_zip_operation = None;
         assert!(matches!(
             f.app.composition_editor,
             CompositionEditorState::Closed

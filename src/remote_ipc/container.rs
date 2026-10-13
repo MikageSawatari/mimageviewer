@@ -16471,7 +16471,8 @@ mod tests {
         let settings = crate::settings::Settings {
             favorites: vec![favorite.clone()],
             skip_duplicate_images: true,
-            skip_zip_if_folder_exists: true,
+            same_name_folder_book:
+                crate::same_name_folder_book::SameNameFolderBookPolicy::PreferFolder,
             skip_image_if_video_exists: true,
             video_thumb_use_sidecar_image: true,
             auto_fullscreen_zip_pdf: true,

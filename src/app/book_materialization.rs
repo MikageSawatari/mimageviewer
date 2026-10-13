@@ -536,8 +536,9 @@ pub(crate) fn materialize_local_folder_listing_with_order(
 
     let duplicate_started = std::time::Instant::now();
     let mut same_name = 0usize;
-    if settings.skip_zip_if_folder_exists {
+    {
         same_name = same_name.saturating_add(filter_virtual_folder_duplicates_with_sort_metadata(
+            settings.same_name_folder_book,
             &mut folders,
             &mut metas,
             &mut sort_metas,

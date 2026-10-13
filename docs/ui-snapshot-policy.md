@@ -49,6 +49,15 @@ Light／Dark × 標準／強い、計8枚を保持する。前者は六分類・
 `preferences_restore_position_dark_off_narrow` の2枚で、本体と共通のチェック項目を描く。
 既定 ON のライト表示と、OFF のダーク表示・狭い幅での折り返しを確認する。
 
+画像folder→ZIP (§1.242 G) は `image_folder_zip_{notice_small_light,confirm_small_200_dark,
+copying_small_light,result_small_dark}` の代表4枚を保持する。製品と共有する純粋なmodal描画を使い、
+1093×614の長い日本語path・確認本文・進捗・結果と固定操作行を検査する。
+`image_folder_zip_small_viewport_controls` は案内・準備・先行保存待ち・確認・画像保存・保存確定・
+表示反映・成功・失敗の9phase × 2画面（1093×614 / 1366×728）× 100%/200% × Light/Dark、
+計72条件で確定/取消/閉じる・タイトル×のviewport内矩形を確認する。全条件へPNGを増やさない。
+代表4枚は合計388,195 bytes（約0.37 MiB）。生成後に全4枚を目視確認した。
+App、変換worker、製品起動、実IME入力はこの純描画検査に含めない。
+
 ## ディレクトリ構成
 
 ```

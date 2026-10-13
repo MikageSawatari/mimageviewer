@@ -24696,7 +24696,7 @@ impl App {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(canvas_color))
                     .show(ctx, |ui| {
-                        if self.composition_editor_modal_active() { ui.disable(); }
+                        if self.viewer_mutation_modal_active() { ui.disable(); }
                         let full_rect = ui.max_rect();
                         // Determine this frame's front owner before keys can close it and before
                         // any backing raw-input consumer or ScrollArea handles its wheel.
@@ -24722,7 +24722,7 @@ impl App {
                                     ctx.input_mut(|input| input.discard_pending_scroll());
                                 }
                             }
-                            if self.composition_editor_modal_active() { FsRootOverflowFrame::EditorAdopted }
+                            if self.viewer_mutation_modal_active() { FsRootOverflowFrame::EditorAdopted }
                             else { FsRootOverflowFrame::Drawn }
                         } else { FsRootOverflowFrame::Absent };
                         let still_seek_geometry =
@@ -26662,6 +26662,9 @@ impl App {
                 }
                 self.show_sidecar_restore_dialog(ctx);
                 self.show_local_composition_editor(ctx);
+                if !embedded {
+                    self.show_image_folder_zip(ctx);
+                }
 
                 // The open owner is the mounted viewer bundle. A detached viewport must draw
                 // and drain its conversion here; the root update only sees the main bundle.
@@ -33190,7 +33193,7 @@ impl App {
             .order(egui::Order::Foreground)
             .fixed_pos(panel_rect.min)
             .movable(false)
-            .enabled(!self.composition_editor_modal_active())
+            .enabled(!self.viewer_mutation_modal_active())
             .show(ctx, |front| {
                 front.set_min_size(panel_rect.size());
                 self.draw_fs_overflow_panel(front, ctx, full_rect, is_spread_double);
@@ -36462,7 +36465,7 @@ impl App {
     /// フォルダ末尾に到達したら `slideshow_end_action` 設定に従って
     /// ループ / 次フォルダ / 停止する。
     pub(crate) fn advance_slideshow(&mut self, ctx: &egui::Context, cur: usize) {
-        if self.composition_editor_modal_active() || self.has_book_slideshow_continuation() {
+        if self.viewer_mutation_modal_active() || self.has_book_slideshow_continuation() {
             return;
         }
         let image_indices = self.get_still_image_indices();
@@ -37833,7 +37836,7 @@ impl App {
         fs_idx: usize,
         fs_render_perf: &mut Option<FsRenderPerfRecorder>,
     ) {
-        if self.composition_editor_modal_active() {
+        if self.viewer_mutation_modal_active() {
             return;
         }
         if close_fs
@@ -38251,7 +38254,7 @@ impl App {
         // フォルダを変えた場合は close_fullscreen が slideshow_playing=false にする。
         let slideshow_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
         if self.slideshow_playing
-            && !self.composition_editor_modal_active()
+            && !self.viewer_mutation_modal_active()
             && !close_fs
             && !self.fs_nav_is_locked()
             && !self.top_level_grid_view.collection_navigation_pending()
@@ -38958,8 +38961,7 @@ impl App {
         fs_idx: usize,
         now: std::time::Instant,
     ) -> bool {
-        if self.composition_editor_modal_active() || !self.continuous_reading_active_for_idx(fs_idx)
-        {
+        if self.viewer_mutation_modal_active() || !self.continuous_reading_active_for_idx(fs_idx) {
             return false;
         }
         let cached_range = self
@@ -41399,7 +41401,7 @@ impl App {
         new_slice: crate::page_split::PageSlice,
         history_trigger: crate::app::HistoryTrigger,
     ) {
-        if self.composition_editor_modal_active() || self.items.get(new_idx).is_none() {
+        if self.viewer_mutation_modal_active() || self.items.get(new_idx).is_none() {
             return;
         }
         match self.try_own_fullscreen_epub_at(new_idx) {

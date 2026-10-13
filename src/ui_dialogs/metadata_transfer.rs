@@ -328,7 +328,7 @@ impl App {
                 .is_some_and(|service| service.is_busy()))
     }
 
-    fn metadata_transfer_writers_busy(
+    pub(crate) fn metadata_transfer_writers_busy(
         &mut self,
         release_tag_db_for_import: bool,
     ) -> Result<bool, String> {

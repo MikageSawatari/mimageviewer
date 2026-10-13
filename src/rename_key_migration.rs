@@ -897,13 +897,16 @@ pub(crate) struct StoreDescriptor {
 }
 
 impl StoreDescriptor {
+    pub(crate) fn optional_legacy_table(self) -> bool {
+        self.table_availability == StoreTableAvailability::OptionalInLegacySchema
+    }
     const fn logical_book_family(mut self) -> Self {
         self.restore_family = StoreRestoreFamily::LogicalBookFamily;
         self
     }
     /// このストア自身が宣言する規則で物理 path を永続キーへ正規化する。
     /// copy / rename / purge の呼び出し側がキー方式を推測しないための単一境界。
-    fn normalize_path(self, path: &Path) -> String {
+    pub(crate) fn normalize_path(self, path: &Path) -> String {
         match self.normalization {
             StoreKeyNormalization::KeepDrive => crate::adjustment_db::normalize_path(path),
             StoreKeyNormalization::DriveStripped => crate::path_key::normalize(path),

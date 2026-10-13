@@ -34,8 +34,8 @@ impl NavigationArchivePolicy {
 #[derive(Clone, Debug, PartialEq)]
 pub struct FolderTreeOptions {
     pub file_type_visibility: crate::file_type_visibility::FileTypeVisibility,
-    /// 同名フォルダがある ZIP をスキップする (= `Settings.skip_zip_if_folder_exists`)。
-    pub skip_zip: bool,
+    /// Shared folder/book candidate projection, after existing eligibility checks.
+    pub same_name_folder_book: crate::same_name_folder_book::SameNameFolderBookPolicy,
     /// 同名 ZIP/CBZ がある変換アーカイブをスキップする。
     pub skip_archive_if_zip_exists: bool,
     /// 同名 PDF がある EPUB をスキップする。
@@ -53,7 +53,7 @@ impl FolderTreeOptions {
     pub fn from_settings(settings: &crate::settings::Settings) -> Self {
         Self {
             file_type_visibility: settings.file_type_visibility.clone(),
-            skip_zip: settings.skip_zip_if_folder_exists,
+            same_name_folder_book: settings.same_name_folder_book,
             skip_archive_if_zip_exists: settings.skip_archive_if_zip_exists,
             skip_epub_if_pdf_exists: settings.skip_epub_if_pdf_exists,
             include_epub: !settings.epub_file_handling_ignores_epub(),
@@ -71,7 +71,7 @@ impl Default for FolderTreeOptions {
     fn default() -> Self {
         Self {
             file_type_visibility: crate::file_type_visibility::FileTypeVisibility::default(),
-            skip_zip: true,
+            same_name_folder_book: Default::default(),
             skip_archive_if_zip_exists: true,
             skip_epub_if_pdf_exists: true,
             include_epub: true,
@@ -1115,7 +1115,7 @@ fn sorted_subdirs_for_nav_observed(
     if cancelled(cancel) {
         return None;
     }
-    let skip_zip = opts.skip_zip;
+
     let sort_order = opts.sort_order;
 
     // (PathBuf, mtime_secs) を蓄積。ソート時に mtime と name を引く。
@@ -1206,18 +1206,8 @@ fn sorted_subdirs_for_nav_observed(
         })
         .collect();
 
-    // コンテナフィルタ: 同名フォルダ、または優先 ZIP/CBZ があればスキップ
+    // Existing book-vs-book precedence, followed by the shared folder/book policy.
     for (zp, mtime) in container_candidates {
-        if skip_zip {
-            let stem = zp
-                .file_stem()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_lowercase();
-            if real_folder_names.contains(&stem) {
-                continue; // スキップ
-            }
-        }
         if opts.skip_archive_if_zip_exists
             && is_convertible_archive_path(&zp)
             && native_zip_stems.contains(
@@ -1245,6 +1235,24 @@ fn sorted_subdirs_for_nav_observed(
         }
         dirs.push((zp, mtime));
     }
+
+    let mask = crate::same_name_folder_book::keep_mask(
+        opts.same_name_folder_book,
+        dirs.iter().map(|(path, _)| {
+            (
+                path.as_path(),
+                real_folder_names.contains(
+                    &path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_lowercase(),
+                ),
+            )
+        }),
+    );
+    let mut mask = mask.into_iter();
+    dirs.retain(|_| mask.next().unwrap());
 
     // Locate the physical current entry in the same sort order even if policy, same-name
     // suppression, or a failed archive inspection makes it ineligible as a destination.
@@ -2096,13 +2104,54 @@ mod tests {
     }
 
     #[test]
+    fn same_name_folder_book_navigation_and_excluded_current_anchor() {
+        use crate::same_name_folder_book::SameNameFolderBookPolicy as Policy;
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("book")).unwrap();
+        std::fs::create_dir(root.join("next")).unwrap();
+        std::fs::write(root.join("book.zip"), b"zip").unwrap();
+        for (policy, folder, book) in [
+            (Policy::PreferBook, false, true),
+            (Policy::PreferFolder, true, false),
+            (Policy::ShowBoth, true, true),
+        ] {
+            let opts = FolderTreeOptions {
+                same_name_folder_book: policy,
+                ..FolderTreeOptions::default()
+            };
+            let candidates = sorted_subdirs(root, opts.clone());
+            assert_eq!(candidates.contains(&root.join("book")), folder);
+            assert_eq!(candidates.contains(&root.join("book.zip")), book);
+            let excluded = if policy == Policy::PreferBook {
+                root.join("book")
+            } else {
+                root.join("book.zip")
+            };
+            if policy != Policy::ShowBoth {
+                let observed =
+                    sorted_subdirs_for_nav(root, opts, None, None, Some(&excluded), None).unwrap();
+                assert!(
+                    observed
+                        .iter()
+                        .any(|(path, eligible)| path == &excluded && !eligible)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn rar_nav_same_name_suppression_does_not_erase_current_position() {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path();
         std::fs::write(root.join("book.rar"), b"rar").unwrap();
         std::fs::write(root.join("book.zip"), b"zip").unwrap();
         std::fs::write(root.join("next.zip"), b"zip").unwrap();
-        let opts = FolderTreeOptions::default();
+        let opts = FolderTreeOptions {
+            same_name_folder_book:
+                crate::same_name_folder_book::SameNameFolderBookPolicy::PreferFolder,
+            ..FolderTreeOptions::default()
+        };
         assert!(!sorted_subdirs(root, opts.clone()).contains(&root.join("book.rar")));
         assert_eq!(
             next_sibling_folder(&root.join("book.rar"), opts.clone()),

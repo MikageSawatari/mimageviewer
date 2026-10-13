@@ -887,7 +887,7 @@ fn do_convert(
     Ok(summary)
 }
 
-fn store_options() -> zip::write::FileOptions<'static, ()> {
+pub(crate) fn store_options() -> zip::write::FileOptions<'static, ()> {
     zip::write::FileOptions::default()
         .compression_method(zip::CompressionMethod::Stored)
         .large_file(true)

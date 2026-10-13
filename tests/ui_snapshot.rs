@@ -3801,3 +3801,129 @@ fn g1_extracted_result_view_snapshot(name: &str, theme: mimageviewer::os_theme::
         mimageviewer::draw_fs_extracted_result_view_snapshot_fixture,
     );
 }
+
+#[test]
+fn same_name_folder_book_light() {
+    snapshot_with_theme_at_size(
+        "same_name_folder_book_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(480.0, 100.0),
+        None,
+        mimageviewer::draw_same_name_folder_book_settings_snapshot_fixture,
+    );
+}
+#[test]
+fn same_name_folder_book_dark_narrow() {
+    snapshot_with_theme_at_size(
+        "same_name_folder_book_dark_narrow",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(260.0, 120.0),
+        None,
+        mimageviewer::draw_same_name_folder_book_settings_snapshot_fixture,
+    );
+}
+
+#[test]
+fn image_folder_zip_notice_small_light() {
+    image_folder_zip_snapshot("image_folder_zip_notice_small_light", "notice", 1.0, true);
+}
+
+#[test]
+fn image_folder_zip_confirm_small_200_dark() {
+    image_folder_zip_snapshot(
+        "image_folder_zip_confirm_small_200_dark",
+        "confirm",
+        2.0,
+        false,
+    );
+}
+
+#[test]
+fn image_folder_zip_copying_small_light() {
+    image_folder_zip_snapshot("image_folder_zip_copying_small_light", "copying", 1.0, true);
+}
+
+#[test]
+fn image_folder_zip_result_small_dark() {
+    image_folder_zip_snapshot("image_folder_zip_result_small_dark", "result", 1.0, false);
+}
+
+fn image_folder_zip_snapshot(name: &str, phase: &'static str, scale: f32, light: bool) {
+    let mut harness = image_folder_zip_harness(phase, egui::vec2(1093.0, 614.0), scale, light);
+    harness.run_steps(12);
+    assert!((harness.ctx.content_rect().size() * scale - egui::vec2(1093.0, 614.0)).length() < 1.0);
+    assert_image_folder_zip_controls(&harness, phase, name, egui::vec2(1093.0, 614.0));
+    harness.snapshot(name);
+}
+
+#[test]
+fn image_folder_zip_small_viewport_controls() {
+    for size in [egui::vec2(1093.0, 614.0), egui::vec2(1366.0, 728.0)] {
+        for scale in [1.0, 2.0] {
+            for light in [true, false] {
+                for phase in [
+                    "notice",
+                    "preparing",
+                    "waiting",
+                    "confirm",
+                    "copying",
+                    "saving",
+                    "adopting",
+                    "result",
+                    "error",
+                ] {
+                    let mut harness = image_folder_zip_harness(phase, size, scale, light);
+                    harness.run_steps(12);
+                    assert!((harness.ctx.content_rect().size() * scale - size).length() < 1.0);
+                    assert_image_folder_zip_controls(&harness, phase, "ZIP modal controls", size);
+                }
+            }
+        }
+    }
+}
+
+fn image_folder_zip_harness(
+    phase: &'static str,
+    size: egui::Vec2,
+    scale: f32,
+    light: bool,
+) -> Harness<'static> {
+    let theme = if light {
+        mimageviewer::os_theme::ResolvedTheme::Light
+    } else {
+        mimageviewer::os_theme::ResolvedTheme::Dark
+    };
+    let mut fonts_ready = false;
+    test_ui::builder().with_size(size).build(move |ctx| {
+        mimageviewer::os_theme::apply_resolved(ctx, theme);
+        if !fonts_ready {
+            install_app_fonts(ctx);
+            mimageviewer::settings::apply_ui_scale_factor(ctx, scale);
+            fonts_ready = true;
+            ctx.request_repaint();
+            return;
+        }
+        egui::CentralPanel::default().show(ctx, |_| {});
+        mimageviewer::draw_image_folder_zip_snapshot(ctx, phase);
+    })
+}
+
+fn assert_image_folder_zip_controls(
+    harness: &Harness<'_>,
+    phase: &str,
+    name: &str,
+    size: egui::Vec2,
+) {
+    let labels: &[&str] = match phase {
+        "notice" | "confirm" => &["ZIP に変換", "取消", "Close window"],
+        "result" | "error" => &["閉じる", "Close window"],
+        _ => &["取消", "Close window"],
+    };
+    let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+    for label in labels {
+        assert!(
+            viewport.contains_rect(harness.get_by_label(*label).rect()),
+            "{name}: {phase}/{label} outside viewport at {size:?}"
+        );
+    }
+}

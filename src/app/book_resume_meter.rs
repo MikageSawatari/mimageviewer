@@ -67,6 +67,9 @@ pub(crate) fn media_resume_fraction(position: f64, duration: f64) -> Option<f32>
 }
 
 impl BookResumeMeters {
+    pub(crate) fn read_pending(&self) -> bool {
+        self.pending.is_some()
+    }
     pub(crate) fn reload(&mut self, writer: &BookResumeWriter) {
         self.pending = Some(PendingRead {
             rx: writer.read_all(),

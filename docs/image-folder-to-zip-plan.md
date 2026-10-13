@@ -2,7 +2,7 @@
 
 作成: 2026-10-12。初回調査基準: `next-book` / `05f7783cd`。
 改訂: `53e90f8ef`への独立設計レビューREVISE（P2 5件・P3 2件）と2026-10-12利用者決定を反映。
-状態: **設計R3の独立レビューACCEPT（利用者報告、対象`7346683c6`）。P3のRemoteタグ試験文言を訂正。未実装。**
+状態: **設計R3の独立レビューACCEPT（利用者報告、対象`7346683c6`）。P3のRemoteタグ試験文言を訂正。ZIP変換の製品入口・利用者データの複製・同名3択・マニュアルを接続済み。最終test-fullはPASS。実装の独立レビュー・実機確認は未実施。検証記録は`target/G-1242-zip-msg.txt`。**
 
 G4F切り離し後の独立した機能。本の構成のfolder adapter、folder構成の保存・復元、
 sidecar v2を復活させない。G1〜G4のZIP/PDF/EPUBと、既存のfolder閲覧・編集を維持する。
@@ -29,8 +29,7 @@ sidecar v2を復活させない。G1〜G4のZIP/PDF/EPUBと、既存のfolder閲
 7. まれな失敗は既定の割り切り（ログ + 通知、可能ならこの操作の未完成ZIPを除去）。
 
 以下の取消境界、完了後の選択、データ複製の詳細は設計提案。旧同名設定の移行方針は利用者決定済み。
-特に§5のCollection個別画像参照は既存機能の型拡張を要する。これを含む範囲を
-独立レビューと設計担当の確認で閉じてから実装する。引継ぎを後の版へ黙って延期しない。
+コレクションは2026-10-12利用者決定により引き継がず、元の画像・folderへの登録を保持する（§5）。
 
 ## 2. コードで確認した境界
 
@@ -51,11 +50,8 @@ sidecar v2を復活させない。G1〜G4のZIP/PDF/EPUBと、既存のfolder閲
 | `sidecar.rs`、`sidecar_import.rs`、`app/sidecar_restore.rs` | v1 DAT、pending writerのimmutable snapshot、検証token、Checkingの所有境界がある |
 | `ui_dialogs/metadata_transfer.rs::metadata_transfer_writers_busy` | 送信済editor保存票の採用まで待ち、その後にcontext/tag/migration等のwriterを静止させる。previewも保存票待ちを持つ |
 | `rename_key_migration.rs::StoreMaintenanceLease` | 既存lease取得順はEPUB coverage → spread shift → composition。新しいDB排他ownerを並立させない |
-| `collection_store/{model,path,db,runtime}.rs` | FileSystemPathのみ。登録pathは実パスで、ZIP内ページnamespace/kindは無い。collection actorが唯一のwriter |
-| `collection_store/model.rs::MAX_COLLECTION_ENTRIES`、`db.rs`のbatch追加 | 上限10,000。既存batchは部分追加と`capacity_rejected`を返し得るため、変換cloneの全件成功には公開前の容量検査と全件commandが必要 |
 | `adjustment.db.favorite_view_states`、`favorite_view_state.rs`、`settings.rs::FavoriteViewState` | Settings内favoritesやfavorite_paramsとは別の永続表示状態。専用FIFO writerと500ms debounceがあり、既定見開き/読書方向/指定倍率等を新UUIDへ複製する |
 | `smart_folder.rs::scan_one_directory / normalize_smart_folder_candidates`、`subfolder_expansion.rs::scan_one_directory` | 旧同名設定はディレクトリ内候補の投影にだけ適用。再帰先は先に登録済みで、子の画像/本セルは親の同名省略で消えない（§8.2.1） |
-| `crates/remote-ipc/src/lib.rs`、`remote_ipc/persistent_collections.rs` | Collectionのwireには既にRemoteAddress/ZipEntry、Image、opaque source_identityがある。内部source型拡張だけでwire変更が必須とは限らない |
 | `remote_ipc/session.rs::with_local_composition_admission` | Local受付とRemote acquireの短いmutex境界があるが、callback終了後の長い処理の排他leaseではない |
 | `settings_transfer.rs` | 同名設定はportable preferences対象。現行assertは全457 / 対象144 / 除外313、wire142。これはコード値であり今回実行した試験数ではない |
 | `settings_db.rs::RemoteListingSettings` / `load_into_settings_inner`、`settings_transfer`のv1 parse | 現行boolはDB、Remoteの最新設定overlay、preferences wireに存在する。runtimeの3択だけでなく各読取/保存と旧形式の互換入口を変更する必要がある |
@@ -146,7 +142,6 @@ missing DBはデータなしと扱えるが、存在するDBの未知schema/読�
 | `folder_thumb_pins.db.folder_thumb_pins` | F自身のpinをZへ。File(n,Image)→ZipEntry(zip_rel空,n) | payloadも変換。親folderがFを指すpinは変更しない。元pinも保持 |
 | `settings.db` favorites / `adjustment.db.favorite_params` | Fそのものを指すお気に入りがあればZ用に複製し、新UUID。名前は「元の名前 (ZIP)」。index flagsと専用標準設定を対応する新UUIDへ複製 | Settings保存ownerとAdjustment owner。親rootのお気に入り・全体標準は共通のまま |
 | `adjustment.db.favorite_view_states` | 対応するsource UUIDの永続`FavoriteViewState`全体→新UUID。未設定の指定倍率は未設定のまま | §4.4。`FavoriteViewWriteDebounce`の未送信分をflushし、専用`FavoriteViewStoreWriter`のFIFO完了・採用まで成功に含める |
-| `collection.db.collection_entries` | Fの本全体登録→ZのZip登録を追加。F/nの個別画像登録→Z,nの個別ページ登録を追加 | §5の型拡張が必要。既存actor経由。元entry id/参照は削除・差替えしない |
 | 自動 `mimageviewer.dat` v1 | まず既存source復元の不足行補充を完了。成功時はPのDATへ `本.zip::n` の編集と `本.zip` 本体の集約タグをmergeする | §6。ZIPページタグ/v2化/ZIPへのDAT埋込/FのDAT丸コピーをしない。backups OFFでも中央DBの複製は必須 |
 
 明示されたNone/空値、未設定、明示解除を区別する。
@@ -223,58 +218,18 @@ Settings保存とfavorite_paramsとこのSetの結果回収・既存mapへの採
 source UUID/値、兄弟のoverlayを変更せず、新UUIDへ切り替わる表示を勝手に起動しない。
 第二のDB writer、待機用sleep/独自retry、変換専用debounceを作らない。
 
-## 5. Collection個別画像参照 — 実装前に閉じる重要な範囲
+## 5. コレクションは元の登録を保持する（2026-10-12利用者決定）
 
-現行`CollectionSourceNamespace::FileSystemPath`、`CollectionSourcePath`とresolved kindには
-ZIP内ページを表す値がない。`Z::n`を実パスとして入れる案、選んだ1枚をZIP全体の登録へ
-置き換える案、source参照を削除する案は採らない。集合・順序・再生対象が変わるため。
+コレクションはZIP側へ複製しない。元folder・元画像への既存参照、entry ID、手動順、
+shuffle seed、revision、テキスト入出力を変更しない。元folderを残すので従来どおり開ける。
+後で元folderを削除すると、その登録は既存の「見つからない」になる。
+manualにもこの点を一行記載する。
 
-**推奨A（引継ぎを完全にする案）**: 既存Collection sourceの型を拡張する。
-
-- 既存namespaceへtypedなarchive entryを追加。rootの物理pathと検証済みliteral entryを
-  対で保存する。新しい別名DBや、元画像への永続proxyは作らない。
-- actor内のclone commandがsource id群に対応する新entry idを発行。元entryの隣へ追加し、
-  元entry間の相対手動順・collection定義・shuffle seedを保持。重複target登録は同値ならno-op。
-  namespace/root/entryの全てをsource identityとunique keyへ含める。別entryを同じZIP rootだけで
-  同一sourceと扱わない。実体probeに使うpathはrootで、合成lookup keyをFile::openへ渡さない。
-- `collection_entries`の型付きpayload保持を追加するなら、released schema v2からの
-  migrationと既存backup手順が必要。Gの未リリースstoreだからmigration不要、とは扱わない。
-- PCのprepare/playback/snapshot/openは既存ZIP page materializer・identity・required targetへ接続。
-  後からそのZIPに構成が付いた場合もHidden/Missingを既存G3と同じ契約で解く。
-- Remoteのcollection snapshot/address/navigationも同じtyped sourceを受ける。
-  推奨は既存RemoteAddressのZipEntry、Image、PageSlot/Groupとopaque source_identityを再利用する。
-  wire field/enum/address契約が変わらない実装なら現行v70を維持できる。追加・変更が必要と
-  判明した場合は実装時の現行IPC版を1つ上げ、core/remote-webを同時更新する。
-  新namespaceをraw filesystem pathだと解釈するconsumerを残さず、wire parity試験で確認する。
-  numeric idやfilenameだけの独自ページアドレスを作らない。
-- 同じcollectionの登録だけを実変更としてrevision更新。元/兄弟の閲覧contextを移動しない。
-
-**B（利用者の明示的な範囲縮小が必要な案）**: folderの本全体登録だけZIP登録を複製し、
-個別画像登録は元画像への有効参照として残す。Collectionの新型/wireを避けられるが、
-「ZIP側へ最初から引き継ぐ」をその参照について満たさない。現在の利用者決定を根拠に
-実装者がBを勝手に選ばない。
-
-独立レビューではAのowner/type/consumer範囲を確認し、設計担当が採否を決める。
-この論点を閉じるまで、引継ぎを満たした機能として実装開始・採択しない。
-
-### 5.1 公開前の容量検査とcloneの完全性
-
-上限は既存の`MAX_COLLECTION_ENTRIES = 10,000`。source登録を残して複製するため、各Collectionの
-現在件数Nと、対応するdestination source identityの同値既存登録/plan内重複を除いた必要追加数Kを
-既存actorで数える。全対象について`K <= 10,000.saturating_sub(N)`を満たすことをConfirm前に確認する。
-旧上限超過Collectionも削除や切詰めをせず、K=0ならno-op、K>0なら事前停止する。
-不足時は最終ZIP公開・destination複製を行わず、
-「コレクションの登録数が上限を超えるため、ZIP を作れません。元のフォルダは残っています。」と通知する。
-
-これは件数だけのUI予測ではない。先行actor変更のreceiptを回収した後、既存revision/catalog guardを
-持つtyped clone planを準備し、modal/Remote受付境界で追加変更を止める。公開直前にも同じactorで
-guardと全対象の容量を照合する。確認後の通常入力との競争を新しい容量予約ownerで解かない。
-上限不足やguard不一致は公開前に止め、部分追加できる既存batchをそのまま成功扱いしない。
-
-clone commandはCollectionごとの既存transactionで全予定登録を追加するか、変更せず拒否する。
-結果receiptはplanに対応するaddedと同値no-opのidentity全件を証明し、`capacity_rejected`は0が必須。
-revision/snapshotも同時に回収する。複数Collectionの全receiptが揃うまで引継ぎ成功を報告しない。
-公開後のDB障害は§7.3の割り切りで扱い、容量不足を部分成功や多段rollbackへ転換しない。
+利用者がこの範囲縮小を明示決定したため、旧§5のCollection A（ZIP内ページnamespace/schema/
+PC・Remote consumerの拡張）、旧§5.1の容量検査とclone command、旧§5.2のテキスト形式拡張を
+設計と実装範囲から外した。型付きJSON行を追加する案は採用しない。
+Collectionを変換先のデータ競合・引継ぎ件数へ含めず、容量不足でも変換を拒否しない。
+chunk 1の基盤にはCollection用の型・command・DB変更はなかったため、撤去する実装はない。
 
 ## 6. 所有境界、非同期、モーダル
 
@@ -331,11 +286,11 @@ bookmark、capture/export、Checking等の旧writerも同じ境界へ接続す�
 全viewer contextの未保存trim/editはそれぞれの既存FIFOへ送り、receiptにより保存を確認する。
 modalになった時点でqueueが空だったという観測だけで完了としない。
 既存helperが列挙するbusy条件だけで棚卸し全部の完了を証明したことにしない。
-resume/history/settingsの受理済み保存、bookmark/collection actorの先行変更にも各既存FIFOの
+resume/history/settingsの受理済み保存、bookmarkの先行変更にも各既存FIFOの
 read/command receiptを用いる。今回必要なsource読取りとcopy commandをそのownerへ通し、
 test-only barrierを製品の完了証明として呼ばない。
 お気に入り表示状態の未送信debounce/deferredを§4.4どおりflushし、専用FIFOの結果採用も待つ。
-全manifestのXMP評価準備（§4.3）とCollection全件容量検査（§5.1）をpost-fence preflightへ含める。
+全manifestのXMP評価準備（§4.3）をpost-fence preflightへ含める。
 source/destination/parentのsidecar cacheは既存のworker resources handoffで移す。
 Checking・定期・終了flushが旧Arcを書き戻せる別の予約を残さない。
 worker所有中にsidecarをUIへ再挿入せず、結果receiptとsnapshotを対にして一度だけ採用する。
@@ -348,7 +303,7 @@ lease/resource所有下の安定したsourceをbounded batchで読み、各store
 page edit/rating/tagの既存epoch guardを最終Z公開前から更新完了まで保持し、
 途中のstore集合を準備結果として採用させない。indexer/watchの発見と閲覧への公開を区別し、
 modal中の新openと旧prepared結果の採用を入口/既存request ownerで止める。
-bookmark/collection/settingsは各唯一のwriterへcommandと完了receiptを渡す。
+bookmark/settingsは各唯一のwriterへcommandと完了receiptを渡す。
 workerがAppのUI DB handleを別スレッドから呼ぶ設計はしない。
 service read snapshotの更新・maintenance解放・副作用receiptまでを完了結果へ含める。
 成功/取消/通常errorの全terminalで、借りたDB/sidecar資源の返却と既存readerの再開を
@@ -384,7 +339,7 @@ capabilityは完了採用まで保持し、取消/errorでも同じownerが一�
 長い変換を既存acquire timeoutまで待たせたり、Remoteの取得で変換を黙って破棄したりしない。
 
 この内部受付だけならwireは既存LocalInUseを使え、IPC版変更は不要。
-§5 AのCollection内部source拡張も、既存wireで表現できるかを別に検査し、変更時だけ版を上げる。
+Collectionのsource型・wireは変更しない（§5）。
 Remoteのfolder一覧も§8の共通同名規則へ接続する。既存folderのSetSpread・閲覧・編集は
 G4F構成行へ戻さず、作成された実ZIPだけが構成対象になる。Remoteに変換入口は追加しない。
 
@@ -404,7 +359,7 @@ G4F構成行へ戻さず、作成された実ZIPだけが構成対象になる�
    列挙時の入力stampと最終stampを照合する。
 4. 最後の取消受付とcommit開始を同じcontrol claimで線形化する。
    取消が先ならdestination複製/最終Z公開を行わない。既存保存・source不足行補充は保持する。
-   commit開始が先なら取消不可の完了保存phaseへ進む。Collection guard/容量も公開前に検証済みとする。
+   commit開始が先なら取消不可の完了保存phaseへ進む。
 5. **最終Zをno-clobberで公開してから**、検証済みmetadataを各既存ownerで複製する。
    先にmetadataだけ写す案は、最終公開で外部アプリが作った同名ZIPと衝突した際に
    その別ZIPのデータを汚すので採らない。公開したZはhandle/実体identityで操作所有を保持する。
@@ -420,8 +375,9 @@ G4F構成行へ戻さず、作成された実ZIPだけが構成対象になる�
 
 集約一覧/検索/collectionでfolderを右クリックした場合も、その操作の起点contextを
 既存の「ある場所のfolderへ移動」経路でPへ戻す。起点のreturn stateを破壊して独自にitemsを差替えない。
-mainが不在のF12起点でも同じViewerContextIdを使う。request ownerはprocess側に残るため、
-窓の退役と保存結果の所有を混同しない。detached連携は実装前レビューと§11の変更記録を要する。
+F12起点は元の閲覧を維持して出力先を通知し、親一覧への移動・ZIP選択は行わない
+（2026-10-13 coordinator判断、利用者の既決事項の範囲内）。request ownerはprocess側に残るため、
+窓の退役と保存結果の所有を混同しない。detached連携は§11へ記録する。
 起点のcloseが完了後の予定動作になった場合は、保存receiptだけ回収して既存closeへ進む。
 既に退役したcontextへの選択は行わず、別の窓やmainへ暗黙に選択先を付け替えない。
 
@@ -615,10 +571,12 @@ loaderだけでなく、Settings save/build projectionとRemote subset読取り�
 
 ### 8.5 更新履歴と重要な変更点
 
-これはv0.3.0以来の見え方を変えるreleased設定の変更。実装時はCHANGELOGと
-`src/version_highlights.rs`の対象releaseの**must_read**へ載せ、manual「同名ファイル」も3択へ更新する。
+これはv0.3.0以来の見え方を変えるreleased設定の変更。対象releaseではCHANGELOGと
+`src/version_highlights.rs`の**must_read**へ載せ、manual「同名ファイル」も3択へ更新する。
 portable/インストーラ更新の双方、版を飛ばした更新でも既存highlight選択の契約で告知する。
 移行方針は2026-10-12利用者決定として確定し、release版番号は設計段階で埋め込まない。
+2026-10-12の実装指示では次の版番号が未決定のため、今回は以下の文案のみを保持する。
+`version_highlights::TABLE`とCHANGELOGは変更しない。manualは版番号なしで更新する。
 
 告知文案（決定済みの移行と戻し方を含む）:
 「同名のフォルダと本の表示を「本を表示 / フォルダを表示 / 両方表示」から選べるようにしました。
@@ -654,21 +612,21 @@ folder右クリックの「ZIP に変換…」と、構成対象外案内の「Z
 新しいglobal shortcutは今回追加しない。Escape等はdialog-localとしてkeymap-specへ記録し、
 新しいcontext-menu項目の識別子/操作カスタマイズは既存の項目管理へ登録する。
 
-実装時にmanualのbooksページ、folder右クリック/操作説明、環境設定「同名ファイル」の3択、
-更新履歴と`src/version_highlights.rs`の「重要な変更点」を同時更新する。
+実装時にmanualのbooksページ、folder右クリック/操作説明、環境設定「同名ファイル」の3択を更新する。
+更新履歴と`src/version_highlights.rs`の「重要な変更点」は§8.5の文案を使い、版番号決定後に登録する。
 released設定の移行説明は§8.3の2026-10-12利用者決定に従う。設計段階で出荷済みの機能としてmanualへ書かない。
 
 ## 10. 実装分割と受入条件
 
-実装開始条件: §5のCollection範囲、§6.4のRemote排他capability、§7の公開/データ複製/rare failure、
+実装開始条件: §5のCollection保持、§6.4のRemote排他capability、§7の公開/データ複製/rare failure、
 source/destination sidecar所有の設計レビューを終える。案Bの3択と§8.3の旧ON/OFF移行は
 2026-10-12利用者決定済み。別の親coordinatorや自動追加review gateは作らない。
 
 1. **判定/manifest/Stored出力**: App/UI無しのmanifest・entry対応とworker、no-clobber公開。
 2. **利用者データ/owner**: 型付きcopy payloadと既存writer/FIFO/maintenance/sidecar receiptの接続。
-3. **Collection参照**: Aを採るなら既存actor/schema/PC/Remote source consumerを一まとまりで完成。
+3. **Collection保持**: 利用者決定で型拡張・複製を除外。既存登録・順序・revision不変を検証する。
 4. **入口/完了選択/同名設定**: modal各surface、3択の共通policy、released bool移行、
-   Preferences/旧新transfer/portable/manual/release通知。旧runtime boolを残した二段実装にしない。
+   Preferences/旧新transfer/portable/manual/release通知文案。旧runtime boolを残した二段実装にしない。
 5. **統合gateと引継ぎ**: 下記回帰・snapshot・full gate。既存Rare failureの過剰な回復状態を追加しない。
 
 最低限の自動受入fixture:
@@ -691,10 +649,8 @@ source/destination sidecar所有の設計レビューを終える。案Bの3択�
 - お気に入り表示状態を変更直後、500ms前の未送信debounceがある状態で変換開始。
   source Set/Remove/Clear→fence→新UUIDへのSet→結果採用を実FIFOで固定し、再読取とZIP側お気に入りconsumerで
   既定見開き/読書方向/指定倍率（None/明示無効含む）の一致、source UUID/兄弟overlay不変を確認。
-- AならCollection folder/個別画像/部分集合/複数登録/手動順/shuffle/現行v2 migration/backup/PC/Remote playback。
-- Collection満杯、上限直前（Kが残容量と一致/1件超過）、同値target/plan内重複、複数Collectionの1件だけ不足、
-  旧上限超過（K=0/K>0）、先行actor commandの完了順を確認。不足時は最終ZIP無し/destination追加無し。
-  成功receiptは全identityを覆い`capacity_rejected=0`、拒否commandは部分追加無し、source登録/順序を保持。
+- Collectionのfolder/個別画像登録、entry ID、手動順、shuffle seed、revisionが変換で不変。
+  元画像を引き続き開け、元folderを後で削除した場合は既存のmissing表示になる。
 - 取消の全phase、最終claim前後、root/F12 close、worker失敗・progress無しでも完了採用。
   sourceファイル/既存登録とsiblingを保持。source DAT補充済み→Confirm取消と先行dirty保存→Copying取消では
   保存/補充を保持してsnapshotを採用し、destination複製/最終ZIP無し/temp除去/資源返却を確認する。
@@ -714,14 +670,42 @@ source/destination sidecar所有の設計レビューを終える。案Bの3択�
   旧版readerで新keyが未知項目となること、二重setter/旧boolへのlossy exportが無いこと、全項目coverageを検査。
 - 通常profile/旧portable DB/新規portable/`--data-dir`の同じ移行・保存再読取・相互transfer。
   Remote最新設定overlayとSettingsのdecoder結果も一致。分類/wire/accepted/changed/unknownの実数を記録する。
-- CHANGELOGとversion_highlightsのmust_readに3択・既定/移行の見え方変更と戻し方を記載。
-  通常更新/版飛ばし/portable更新の告知選択を既存helperで検査し、出荷済みとして設計段階で登録しない。
+- §8.5の告知文案に3択・既定/移行の見え方変更と戻し方を記載。今回はCHANGELOGと
+  version_highlightsのTABLEへ登録しない。版番号決定後のrelease作業でmust_readへ登録し、
+  通常更新/版飛ばし/portable更新の告知選択を既存helperで検査する。
 - 入口二つの実入力・背面wheel/key拒否・IME中Escape・小画面/長文/全phaseのUI snapshot、glyph lint。
 
 検証計画はfmt、normal/portable check、対象lib filters、integration/UI snapshot、最後に
 `scripts/test-full.ps1`。各commandの実数/exit/logを記録し、既知の別失敗と新失敗を区別する。
 実アプリ起動は通常開発へ混ぜず、別途明示了承済みの確認枠にする。
 
-今回行ったのはコード・文書の読取りとこの設計書の改訂のみ。実装・build・製品試験・起動は行っていない。
-2026-10-12の利用者決定は§1/§4.2/§8.3へ記録済み。設計R3の独立レビューACCEPTは利用者報告として記録し、
-ZIP変換の実装・実装gate成功は未記録。本設計の実装はmaster統合後の別指示で開始する。
+設計R3の独立レビューACCEPTは利用者報告として記録する。master統合後、manifest/Stored出力、
+既存ownerによるデータ複製、modalの二つの入口、完了採用、3択と移行を製品へ接続した。
+実行したcommand・実数・制約と残る実機確認は`target/G-1242-zip-msg.txt`へ記録する。
+実装の独立レビュー・実機受入は別途行う。製品起動は行わない。
+
+## 11. 実装で確認した前提の相違と決定（2026-10-13 coordinator）
+
+### 11.1 F12起点の完了表示
+
+§7.1の「同じViewerContextIdを親実folder一覧へ戻す」は、現行のdetached viewerに経路がない。
+detachedはviewer専用で一覧を描かず、`JumpToPhysicalFolder`のscan完了はmain専用として拒否する。
+既存のfolder移動はroot/mainへ送られ、ContextTableのpromoteもmainを退避して新しいmainを作る操作であり、
+起点childを同じIDの一覧へ変える操作ではない。単にfullscreen idxを空にしても一覧にはならない。
+
+**決定済み**: F12起点は元の閲覧を維持し、成功通知で出力先ZIPを示す。
+一覧を持つ起点だけで§7.1の親一覧復帰・可視ZIP選択を行う。mainや兄弟へ選択を付け替えない。
+mainへの移動やdetached一覧の所有変更は追加しない。
+
+### 11.2 同じ版番号の開発binaryと旧writerの保護
+
+実装基準HEADの版番号は公開版と同じ4.6.0。既存のsettings DB保護は
+`schema_meta.app_version`がreaderより新しいときに拒否する。旧writerの
+`write_settings_kv`は全行をDELETEして既知のfieldだけを書き直すので、同じ4.6.0では
+新3択keyを無視した旧readerの保存によって利用者が選んだ3択が失われる。
+schema_versionの値は旧readerが比較しないため、markerだけを上げても解消しない。
+
+**決定済み**: 版番号未決定の開発確認を明示的な隔離`--data-dir`に限定し、公開時に決まる
+Gの新しい版番号で既存app_version gateを働かせること。DBへ架空の未来版を保存したり、
+旧boolとの二重保存を加えたりしない。利用者に渡す確認手順は全て`--data-dir`付きとする。
+旧DB/旧transfer/portableの読取り互換と、将来版の既存保存保護の試験は別々に記録する。
