@@ -142,6 +142,10 @@ impl App {
             self.clear_rename_dialog_state();
             return;
         }
+        if !self.admit_book_append_followup_mutation() {
+            self.clear_rename_dialog_state();
+            return;
+        }
         let collection_scope = if target_is_file {
             crate::collection_store::CollectionSourceMigrationScope::Exact
         } else {

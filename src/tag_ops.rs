@@ -212,7 +212,10 @@ impl App {
         mode: &str,
         surface: crate::app::ActionSurface,
     ) {
-        let name_owned = name.to_string();
+        let name_owned = crate::tags_db::normalize_tag_display_name(name);
+        if name_owned.is_empty() {
+            return;
+        }
         crate::logger::log(format!(
             "[TAG] toggle requested: tag=#{name} mode={mode} \
              selected={:?} fullscreen_idx={:?} checked_count={}",
@@ -343,14 +346,14 @@ impl App {
             return;
         }
         let paths: Vec<PathBuf> = targets.iter().map(|target| target.path.clone()).collect();
-        if !self.precheck_tag_write_available(if add { "add" } else { "remove" }) {
-            return;
-        }
-        self.hydrate_tags_cache_for_paths(&paths);
         let tag_key = crate::tags_db::normalize_tag_key(&name);
         if tag_key.is_empty() {
             return;
         }
+        if !self.precheck_tag_write_available(if add { "add" } else { "remove" }) {
+            return;
+        }
+        self.hydrate_tags_cache_for_paths(&paths);
 
         let with_hash = crate::tags_db::format_display_tag(&name);
         self.tag_toast_label = Some(with_hash.clone());
@@ -460,7 +463,9 @@ impl App {
             self.show_feedback_toast(TAG_WRITE_UNAVAILABLE_MSG.to_string());
             return false;
         }
-        true
+        // Admission precedes optimistic cache changes and pending Undo capture,
+        // not merely the later worker submit. All callers have accepted targets.
+        self.admit_book_append_followup_mutation()
     }
 
     /// タグ書き込みジョブ投入の共通経路。

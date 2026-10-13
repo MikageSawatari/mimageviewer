@@ -9070,7 +9070,7 @@ mod tests {
         assert_collection_mutation_refresh(|app, folder| {
             app.note_exported_file_for_folder_refresh(&folder.join("export.png"));
             assert!(app.folder_refresh_pending.is_some());
-            app.consume_folder_refresh_pending();
+            app.consume_folder_refresh_pending(&egui::Context::default());
             assert!(app.folder_refresh_pending.is_none());
         });
     }

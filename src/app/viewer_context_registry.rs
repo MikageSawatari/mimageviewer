@@ -3899,6 +3899,66 @@ impl App {
         self.viewer_contexts.table.other_ids()
     }
 
+    /// Refresh only cached exact append destinations. In particular an unchanged
+    /// sibling remains parked with its draft, selection and unrelated caches.
+    pub(in crate::app) fn publish_book_append_destination_metadata(
+        &mut self,
+        ratings: &std::collections::HashMap<String, u8>,
+        tags: &std::collections::HashMap<String, Vec<String>>,
+    ) {
+        fn update(
+            items: &[GridItem],
+            rating_cache: &mut std::collections::HashMap<usize, u8>,
+            tags_cache: &mut std::collections::HashMap<String, Vec<String>>,
+            details: &mut DetailsCellContentRevisions,
+            ratings: &std::collections::HashMap<String, u8>,
+            tags: &std::collections::HashMap<String, Vec<String>>,
+        ) {
+            // Uncached ratings use the existing App-global path publication
+            // overlay on first access. Avoid traversing or cloning all items.
+            for (idx, value) in rating_cache.iter_mut() {
+                if let Some(GridItem::Image(path)) = items.get(*idx)
+                    && let Some(stars) = ratings.get(&crate::adjustment_db::normalize_path(path))
+                {
+                    *value = *stars;
+                }
+            }
+            let mut changed = false;
+            for (key, value) in tags_cache.iter_mut() {
+                if let Some(copied) = tags.get(key)
+                    && value != copied
+                {
+                    *value = copied.clone();
+                    changed = true;
+                }
+            }
+            if changed {
+                DetailsCellContentRevisions::bump(&mut details.tags);
+            }
+        }
+        update(
+            &self.items,
+            &mut self.rating_cache,
+            &mut self.tags_cache,
+            &mut self.details_cell_content_revisions,
+            ratings,
+            tags,
+        );
+        for slot in self.viewer_contexts.table.slots.values_mut() {
+            let bundle = match slot {
+                Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
+            };
+            update(
+                &bundle.items,
+                &mut bundle.rating_cache,
+                &mut bundle.tags_cache,
+                &mut bundle.details_cell_content_revisions,
+                ratings,
+                tags,
+            );
+        }
+    }
+
     /// A global final-cover setting is shared by every viewer context, while the geometry and
     /// interaction owners it changes are context-local. Reset parked owners in place without
     /// mounting them or cancelling unrelated workers; their navigation demand is rebound by the
@@ -4663,6 +4723,68 @@ mod tests {
         let key = app.rating_path_key(0).unwrap();
         app.rating_db.as_ref().unwrap().set(&key, stars).unwrap();
         key
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn section1373_exact_copy_publication_updates_parked_destination_without_mount_or_draft_reset()
+    {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let source = app.tmp.path().join("source.jpg");
+        let copy = app.tmp.path().join("0001_copy.jpg");
+        let source_key = crate::adjustment_db::normalize_path(&source);
+        let copy_key = crate::adjustment_db::normalize_path(&copy);
+        app.items = vec![GridItem::Image(source.clone())];
+        app.rating_cache.insert(0, 3);
+        app.tags_cache
+            .insert(source_key.clone(), vec!["#source".into()]);
+        app.erase_mask = Some(vec![true, false]);
+        let parked = app
+            .build_viewer_context("append_metadata_parked", |owner, _| {
+                owner.items = vec![GridItem::Image(copy), GridItem::Image(source)];
+                owner.rating_cache.insert(0, 0);
+                owner.rating_cache.insert(1, 3);
+                owner.tags_cache.insert(copy_key.clone(), Vec::new());
+                owner
+                    .tags_cache
+                    .insert(source_key.clone(), vec!["#source".into()]);
+                owner.erase_mask = Some(vec![false, true]);
+                owner.local_adjust_selected_layers.insert(1, 2);
+                owner.local_adjust_page_layers.insert(1, Vec::new().into());
+                BuildOutcome::Commit
+            })
+            .unwrap();
+        let projected = app.projected_viewer_context_id();
+        // Seed the mounted edit draft after constructing the parked fixture.
+        app.erase_mask = Some(vec![true, false]);
+        let current_tag_revision = app.details_cell_content_revisions.tags;
+        let ratings = [(copy_key.clone(), 4)].into();
+        let tags = [(copy_key.clone(), vec!["#copied".into()])].into();
+        app.publish_book_append_destination_metadata(&ratings, &tags);
+        assert_eq!(app.projected_viewer_context_id(), projected);
+        assert_eq!(app.rating_cache.get(&0), Some(&3));
+        assert_eq!(
+            app.tags_cache.get(&source_key),
+            Some(&vec!["#source".into()])
+        );
+        assert_eq!(app.erase_mask.as_deref(), Some([true, false].as_slice()));
+        assert_eq!(
+            app.details_cell_content_revisions.tags,
+            current_tag_revision
+        );
+        let bundle = app.viewer_contexts.table.at_rest_mut(parked).unwrap();
+        assert_eq!(bundle.rating_cache.get(&0), Some(&4));
+        assert_eq!(bundle.rating_cache.get(&1), Some(&3));
+        assert_eq!(
+            bundle.tags_cache.get(&copy_key),
+            Some(&vec!["#copied".into()])
+        );
+        assert_eq!(
+            bundle.tags_cache.get(&source_key),
+            Some(&vec!["#source".into()])
+        );
+        assert_eq!(bundle.local_adjust_selected_layers.get(&1), Some(&2));
+        assert!(bundle.local_adjust_page_layers.contains_key(&1));
     }
 
     #[cfg(windows)]

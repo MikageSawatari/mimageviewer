@@ -401,11 +401,20 @@ Resumed の親 mtime ふるい、通知時のふるい bypass、走査中通知�
 session state／catalog／Remote・IPC の変更を避ける。
 
 次の版の設計変更 (利用者2026-10-13、未実装・独立レビュー待ち):
-[§1.375 R5](section375-operation-reconcile-plan.md) は走査・一覧準備を実行し、現在の表示と
-完全一致した場合だけ再表示を省く。監視更新では実採用の代表画像を保持し、明示「最新の情報に更新」
-で再選定する。上記§1.314の観測mtime／採用表示metadata・sort・代表要求stampの区別は維持する。
+[§1.375 R6](section375-operation-reconcile-plan.md) は走査・一覧準備・全行exact比較を既存prepare
+ownerのworkerで行い、UIは同一／差分と差分の場合だけprepared結果を受ける。採用直前は
+context・世代／revisionを確認し、比較中に表示値が変わった結果は既存の拒否／再準備へ戻す。
+UIで全行比較・全件clone・比較用snapshot再構築を行わず、worker生成のimmutable採用投影と
+既存所有データを安価に共有する。現状はApp.items／prepared itemsがVec、folder prepareも
+UI側であり、この共有投影とworker準備への分離は必要な未実装基盤（設計§3.4）である。
+大量一覧1万／10万行でUI時間・worker比較時間・割当量と既存perfを測定する予定。
+監視更新で保持するのは代表ファイルの選択キーだけ。同じ選択を既存cache／要求経路で表示し、
+選択先自体が消失した場合だけ監視でも再選定する。明示「最新の情報に更新」では最新選定へ進む。
+Stackの保持identityはsource／context＋group keyで、代表path由来のperf_key／ItemIdとは分ける。
+R5のCPU採用画素保持案は撤回し、CPU／GPU eviction・予算・要求終端は変更しない。
+上記§1.314の観測mtime／採用表示metadata・sort・代表要求stampの区別は維持する。
 代表sourceのprovenance照合や自己操作IDは使わない。旧B1の共有catalog／Remote全体の代表固定を
-復活させる方式ではなく、表示contextが採用成果物を保持する境界を独立レビューする。
+復活させる方式ではなく、表示contextの選択保持と既存prepare ownerのworker比較境界を独立レビューする。
 
 ## 3. GPU テクスチャアップロード
 

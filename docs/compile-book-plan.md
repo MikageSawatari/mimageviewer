@@ -11,8 +11,11 @@
 > [toolbar-customization-plan.md](toolbar-customization-plan.md) に集約 (この refactor が先行)。
 
 2026-10-12 の next-list (`ea060b66e` 基点) 調査では、§11 の membership DB／登録済みバッジは
-未実装。§1.373 の追加直後 Undo は [別設計書](section373-book-append-undo-plan.md) に記録した
-(独立レビュー待ち・未実装)。生成コピーだけを消す範囲と削除方式の判断を先に行う。
+未実装。§1.373 の追加直後 Undo は [別設計書](section373-book-append-undo-plan.md) の
+R3/R4 ACCEPT 設計で実装を接続したが、2026-10-13 の実装レビューで通常の後続編集を
+metadata copyがDB正本から上書きする前提矛盾を確認し、§7.7の設計判断待ちで停止している。
+今回作ったコピーだけをごみ箱へ移し、元ファイル・既存ページ・本フォルダを残す。一回取消で
+追加のRedoはない。新しいmembership DBを導入せず、既存のmetadata Undo履歴も維持する。
 
 > **追補 (2026-07-11, 案 2・表示用最終強調を除外して実装済み): 本棚追加時のフル composite 焼き込み**
 > ユーザー実機 FB: 隠蔽加工した画像を本棚に右クリック追加すると加工が消える (= SNS 直アップ

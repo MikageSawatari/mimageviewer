@@ -383,6 +383,9 @@ impl App {
         let Some(current) = self.current_conceal_snapshot() else {
             return false;
         };
+        if !self.admit_book_append_followup_mutation() {
+            return false;
+        }
         let Some(prev) = self.conceal_undo_stack.pop_back() else {
             return false;
         };
@@ -399,6 +402,9 @@ impl App {
         let Some(current) = self.current_conceal_snapshot() else {
             return false;
         };
+        if !self.admit_book_append_followup_mutation() {
+            return false;
+        }
         let Some(next) = self.conceal_redo_stack.pop_back() else {
             return false;
         };
@@ -442,6 +448,9 @@ impl App {
             self.show_feedback_toast(format!("[隠蔽スロット{}は空です]", slot));
             return;
         }
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.push_conceal_undo();
         self.conceal_mask = Some(slot_mask);
         self.conceal_shapes = slot_shapes;
@@ -462,6 +471,9 @@ impl App {
     pub(crate) fn delete_all_conceal_mask(&mut self) {
         let [w, h] = self.conceal_mask_size;
         if w == 0 || h == 0 {
+            return;
+        }
+        if !self.admit_book_append_followup_mutation() {
             return;
         }
         self.push_conceal_undo();
@@ -629,9 +641,11 @@ impl App {
         // Ctrl+Z: Undo
         let ctrl_z = self.keymap.consume_action(ctx, KeyAction::ConcealUndo);
         if ctrl_z {
-            if self.conceal_tool == ConcealTool::Polygon
-                && self.conceal_lasso_points.pop().is_some()
-            {
+            if self.conceal_tool == ConcealTool::Polygon && !self.conceal_lasso_points.is_empty() {
+                if !self.admit_book_append_followup_mutation() {
+                    return action;
+                }
+                self.conceal_lasso_points.pop();
                 self.show_feedback_toast("[頂点を戻す]".to_string());
                 return action;
             }
@@ -650,6 +664,9 @@ impl App {
             && let Some(idx) = self.conceal_selected_shape
             && idx < self.conceal_shapes.len()
         {
+            if !self.admit_book_append_followup_mutation() {
+                return action;
+            }
             self.push_conceal_undo();
             self.conceal_shapes.remove(idx);
             self.conceal_selected_shape = None;
@@ -835,6 +852,12 @@ impl App {
     /// 矢印キー / Ctrl+矢印キーでマスクをシフトする。
     /// 選択中の Shape があればそれだけ、無ければビットマップ + 全 Shape を動かす。
     fn nudge_conceal(&mut self, dx: f32, dy: f32) {
+        if (dx == 0.0 && dy == 0.0) || self.conceal_shapes.is_empty() {
+            return;
+        }
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.push_conceal_undo_throttled();
         match self.conceal_selected_shape {
             Some(idx) if idx < self.conceal_shapes.len() => {
@@ -900,6 +923,10 @@ impl App {
     // ── ビットマップ塗り (Brush / Lasso 用) ────────────────────────────
 
     fn paint_brush_line_conceal(&mut self, from: (f32, f32), to: (f32, f32), paint: bool) {
+        if self.book_append_undo_in_progress() {
+            self.admit_book_append_followup_mutation();
+            return;
+        }
         let radius = self.settings.conceal_brush_radius.max(1.0);
         let [w, h] = self.conceal_mask_size;
         let Some(mask) = self.conceal_mask.as_mut() else {
@@ -908,6 +935,8 @@ impl App {
         let dirty = crate::mask_db::brush_line_bbox(w, h, from, to, radius)
             .and_then(|(x0, y0, x1, y1)| MaskDirtyRect::new(x0, y0, x1, y1));
         if crate::mask_db::paint_brush_line_bitmap(mask, w, h, from, to, radius, paint) {
+            // This call cannot reenter receipt publication before the boundary.
+            self.invalidate_book_append_undo();
             self.mark_conceal_mask_texture_dirty(dirty);
             // brush もマスクを変えるので conceal_cache 失効が必要 (= preview 時に
             // 最新マスクで再合成される、commit_conceal_shape と同じ理由)。
@@ -919,6 +948,12 @@ impl App {
 
     fn paint_polygon_conceal(&mut self, points: &[(f32, f32)], paint: bool) {
         let [w, h] = self.conceal_mask_size;
+        if points.len() < 3 || w == 0 || h == 0 || self.conceal_mask.is_none() {
+            return;
+        }
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         let Some(mask) = self.conceal_mask.as_mut() else {
             return;
         };
@@ -941,6 +976,9 @@ impl App {
             return;
         }
 
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.push_conceal_undo();
         self.conceal_mask = Some(next);
         self.mark_conceal_mask_texture_dirty(None);
@@ -1023,6 +1061,9 @@ impl App {
             | crate::mask_db::BucketFillOutcome::Invalid => return,
         }
 
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.push_conceal_undo();
         self.conceal_mask = Some(next);
         self.mark_conceal_mask_texture_dirty(None);
@@ -1273,6 +1314,13 @@ impl App {
             return;
         }
 
+        if self.book_append_undo_in_progress() {
+            if primary_down || primary_pressed || primary_released || secondary_pressed {
+                self.admit_book_append_followup_mutation();
+            }
+            return;
+        }
+
         // ⚠ 旧版は「Select 以外のツール開始時に選択を解除」していたが、これだと
         // `commit_conceal_shape` で自動選択した直後のフレームで選択が消されて
         // 「ハンドルが一瞬だけ出る」現象になっていた (Codex P1 / 実機 FB R3)。
@@ -1413,6 +1461,11 @@ impl App {
                 let new_shape = vector_edit::apply_drag(&drag, img_pos, &modifiers);
                 let drag_idx = drag.idx();
                 if drag_idx < self.conceal_shapes.len() {
+                    if self.conceal_shapes[drag_idx] != new_shape
+                        && !self.admit_book_append_followup_mutation()
+                    {
+                        return true;
+                    }
                     self.conceal_shapes[drag_idx] = new_shape;
                 }
                 // R5: ドラッグ中もマスク overlay + 隠蔽テクスチャを毎フレ再生成。
@@ -1513,6 +1566,11 @@ impl App {
         if let Some(drag) = self.conceal_drag {
             let new_shape = vector_edit::apply_drag(&drag, img_pos, &modifiers);
             if drag.idx() < self.conceal_shapes.len() {
+                if self.conceal_shapes[drag.idx()] != new_shape
+                    && !self.admit_book_append_followup_mutation()
+                {
+                    return;
+                }
                 self.conceal_shapes[drag.idx()] = new_shape;
                 // R5: ドラッグ中もマスク overlay + 隠蔽合成キャッシュを毎フレ更新する
                 // (実機 FB: 「ハンドルのドラッグでも楕円は再描画されません」)。
@@ -1576,10 +1634,13 @@ impl App {
             if let Some(pos) = pointer_pos {
                 if let Some(img_pos) = self.conceal_screen_to_image(pos, transform, false) {
                     // サンプリング間引き (~2px 離れたら追加)
-                    crate::manual_mask_tools::push_freehand_point(
+                    let changed = crate::manual_mask_tools::push_freehand_point(
                         &mut self.conceal_lasso_points,
                         img_pos,
                     );
+                    if changed {
+                        self.invalidate_book_append_undo();
+                    }
                 }
             }
         }
@@ -1637,11 +1698,14 @@ impl App {
                 self.show_feedback_toast("[多角形を確定]".to_string());
             }
         } else {
-            crate::manual_mask_tools::push_polygon_vertex(
+            let changed = crate::manual_mask_tools::push_polygon_vertex(
                 &mut self.conceal_lasso_points,
                 img_pos,
                 scale,
             );
+            if changed {
+                self.invalidate_book_append_undo();
+            }
         }
     }
 
@@ -1658,6 +1722,11 @@ impl App {
         if primary_down {
             if let Some(pos) = pointer_pos {
                 if let Some(img_pos) = self.conceal_screen_to_image(pos, transform, false) {
+                    if self.conceal_line_start.is_none() || self.conceal_line_end != Some(img_pos) {
+                        if !self.admit_book_append_followup_mutation() {
+                            return;
+                        }
+                    }
                     if self.conceal_line_start.is_none() {
                         self.conceal_line_start = Some(img_pos);
                     }
@@ -1725,6 +1794,13 @@ impl App {
         if primary_down {
             if let Some(pos) = pointer_pos {
                 if let Some(img_pos) = self.conceal_screen_to_image(pos, transform, false) {
+                    if self.conceal_shape_drag_start.is_none()
+                        || self.conceal_shape_drag_end != Some(img_pos)
+                    {
+                        if !self.admit_book_append_followup_mutation() {
+                            return;
+                        }
+                    }
                     if self.conceal_shape_drag_start.is_none() {
                         self.conceal_shape_drag_start = Some(img_pos);
                     }
@@ -1775,6 +1851,9 @@ impl App {
     /// 消去モードの矩形/楕円/線は既存 Shape を丸ごと削除せず、上から削る
     /// ベクターオブジェクトとして残る。
     fn commit_conceal_shape(&mut self, shape: Shape, paint: bool) {
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         let op = if paint {
             ShapeOp::Add
         } else {
@@ -2969,6 +3048,46 @@ mod tests {
         conceal_preview_pointer_state,
     };
     use crate::mask_db::{Shape, ShapeOp};
+
+    #[test]
+    fn section1373_conceal_draft_changes_invalidate_but_noop_and_history_capture_do_not() {
+        let mut app = crate::app::setup_app_for_test();
+        app.conceal_mask_size = [4, 4];
+        app.conceal_mask = Some(vec![false; 16]);
+        app.settings.conceal_brush_radius = 1.0;
+        let before = app.book_append_undo_revision;
+        app.push_conceal_undo();
+        assert_eq!(app.book_append_undo_revision, before);
+        app.paint_brush_line_conceal((1.0, 1.0), (1.0, 1.0), false);
+        app.apply_conceal_bitmap_morph_1px(false);
+        assert_eq!(app.book_append_undo_revision, before);
+        app.paint_brush_line_conceal((1.0, 1.0), (1.0, 1.0), true);
+        assert_eq!(app.book_append_undo_revision, before + 1);
+        assert!(
+            app.conceal_mask
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|value| *value)
+        );
+        app.paint_brush_line_conceal((1.0, 1.0), (1.0, 1.0), true);
+        assert_eq!(app.book_append_undo_revision, before + 1);
+    }
+
+    #[test]
+    fn section1373_conceal_bitmap_only_nudge_remains_a_noop_without_revision_change() {
+        let mut app = crate::app::setup_app_for_test();
+        app.conceal_mask_size = [2, 2];
+        app.conceal_mask = Some(vec![true, false, false, false]);
+        app.conceal_shapes.clear();
+        let before = app.book_append_undo_revision;
+        app.nudge_conceal(1.0, 0.0);
+        assert_eq!(
+            app.conceal_mask.as_deref(),
+            Some([true, false, false, false].as_slice())
+        );
+        assert_eq!(app.book_append_undo_revision, before);
+    }
 
     fn conceal_test_shape(revision: usize) -> Shape {
         Shape::Rect {

@@ -109,6 +109,17 @@ pub(crate) struct RemoteSessionUiState {
     video_progress_order: RemoteVideoProgressOrder,
 }
 
+impl RemoteSessionUiState {
+    pub(crate) fn has_pending_bookmark_writes(&self) -> bool {
+        self.pending_bookmark_writes.values().any(|pending| {
+            !matches!(
+                pending.kind,
+                PendingRemoteBookmarkWriteKind::ReadState { .. }
+            )
+        }) || !self.pending_shift_resets.is_empty()
+    }
+}
+
 impl Drop for RemoteSessionUiState {
     fn drop(&mut self) {
         if let Some(control) = self.final_exit_control.as_ref() {
@@ -1086,6 +1097,7 @@ impl crate::app::App {
         if let Some(snapshot) = snapshot.as_ref()
             && acquisition_changed
         {
+            self.invalidate_book_append_undo();
             #[cfg(windows)]
             self.dsp_processing.revoke();
             self.remote_session_ui.last_acquisition_sequence = snapshot.acquisition_sequence;
@@ -2416,6 +2428,23 @@ impl crate::app::App {
             pending.complete(UiWriteOutcome::Session(ownership));
             return;
         }
+        // Include the bookmark early route in the same UndoAppend-only gate.
+        // Read-only requests do not create a follow-up mutation.
+        if !matches!(
+            pending.request(),
+            RemoteWriteRequest::GetItemState { .. }
+                | RemoteWriteRequest::GetAdjustmentState { .. }
+                | RemoteWriteRequest::GetViewTrimState { .. }
+                | RemoteWriteRequest::ListBookBookmarks { .. }
+        ) && self.book_append_undo_in_progress()
+        {
+            pending.complete(UiWriteOutcome::Write(write_error(
+                RemoteWriteErrorCode::Busy,
+                "本への追加を取り消しています",
+            )));
+            ctx.request_repaint();
+            return;
+        }
         let _settings_family_lease = if remote_write_uses_settings_family(pending.request()) {
             match crate::settings_db::acquire_settings_family_read_lease() {
                 Ok(lease) => Some(lease),
@@ -2705,6 +2734,16 @@ impl crate::app::App {
                 }
             };
         let request_id = self.next_book_bookmark_request_id();
+        if self.book_bookmark_service.is_some()
+            && !matches!(&action, RemoteBookmarkRequestAction::ReadState { .. })
+            && !self.admit_book_append_followup_mutation()
+        {
+            pending.complete(UiWriteOutcome::Write(write_error(
+                RemoteWriteErrorCode::Busy,
+                "本への追加を取り消しています",
+            )));
+            return;
+        }
         let Some(service) = self.book_bookmark_service.as_ref() else {
             pending.complete(UiWriteOutcome::Write(write_error(
                 RemoteWriteErrorCode::PersistenceFailed,
@@ -2761,6 +2800,9 @@ impl crate::app::App {
             self.settings.default_reading_flow,
             self.settings.default_reading_direction,
         );
+        if self.spread_db.is_ok() && !self.admit_book_append_followup_mutation() {
+            return write_error(RemoteWriteErrorCode::Busy, "本への追加を取り消しています");
+        }
         let Ok(db) = self.spread_db.as_mut() else {
             return write_error(
                 RemoteWriteErrorCode::PersistenceFailed,
@@ -2804,6 +2846,9 @@ impl crate::app::App {
             Ok(key) => key,
             Err(error) => return RemoteWriteResponse::Error(error),
         };
+        if self.spread_db.is_ok() && !self.admit_book_append_followup_mutation() {
+            return write_error(RemoteWriteErrorCode::Busy, "本への追加を取り消しています");
+        }
         let Ok(db) = self.spread_db.as_mut() else {
             return write_error(
                 RemoteWriteErrorCode::PersistenceFailed,
@@ -2846,6 +2891,9 @@ impl crate::app::App {
             Ok(key) => key,
             Err(error) => return RemoteWriteResponse::Error(error),
         };
+        if self.spread_db.is_ok() && !self.admit_book_append_followup_mutation() {
+            return write_error(RemoteWriteErrorCode::Busy, "本への追加を取り消しています");
+        }
         let Ok(db) = self.spread_db.as_mut() else {
             return write_error(
                 RemoteWriteErrorCode::PersistenceFailed,
@@ -2905,6 +2953,9 @@ impl crate::app::App {
             Ok(key) => key,
             Err(error) => return RemoteWriteResponse::Error(error),
         };
+        if self.spread_db.is_ok() && !self.admit_book_append_followup_mutation() {
+            return write_error(RemoteWriteErrorCode::Busy, "本への追加を取り消しています");
+        }
         let Ok(db) = self.spread_db.as_mut() else {
             return write_error(
                 RemoteWriteErrorCode::PersistenceFailed,
@@ -3267,6 +3318,9 @@ impl crate::app::App {
             Ok(key) => key,
             Err(error) => return RemoteWriteResponse::Error(error),
         };
+        if self.view_trim_db.is_some() && !self.admit_book_append_followup_mutation() {
+            return write_error(RemoteWriteErrorCode::Busy, "本への追加を取り消しています");
+        }
         let Some(db) = self.view_trim_db.as_ref() else {
             return write_error(
                 RemoteWriteErrorCode::PersistenceFailed,
@@ -3329,6 +3383,9 @@ impl crate::app::App {
             Err(message) => return write_error(RemoteWriteErrorCode::BadRequest, message),
         };
         let previous = self.settings.sort_order;
+        if previous != sort_order && !self.admit_book_append_followup_mutation() {
+            return write_error(RemoteWriteErrorCode::Busy, "本への追加を取り消しています");
+        }
         self.settings.sort_order = sort_order;
         if !self.settings.save_checked() {
             self.settings.sort_order = previous;
@@ -5320,6 +5377,255 @@ mod tests {
         assert!(handle.finish_acquire(generation));
         let owner = handle.owner_for_test("drain-test");
         (handle, owner, generation)
+    }
+
+    fn section1373_remote_receipt(
+        app: &crate::app::AppTestEnvForTest,
+    ) -> crate::book_append_undo::BookAppendUndoReceipt {
+        let root = app.tmp.path().join("remote-append-books");
+        let folder = root.join("book");
+        std::fs::create_dir_all(&folder).unwrap();
+        let mut builder =
+            crate::book_append_undo::AppendReceiptBuilder::begin(&root, &folder, "book".into())
+                .unwrap();
+        let page = folder.join("0001_page.jpg");
+        std::fs::write(&page, b"generated page").unwrap();
+        builder.record(&page).unwrap();
+        crate::book_append_undo::BookAppendUndoReceipt {
+            files: builder.finish().unwrap(),
+            operation_id: 1,
+            source_context: app.virtual_list_context_id(),
+            accepted_revision: app.book_append_undo_revision,
+        }
+    }
+
+    fn section1373_apply_claimed_write(
+        app: &mut crate::app::App,
+        handle: &SessionHandle,
+        owner: &RemoteSessionIdentity,
+        request: RemoteWriteRequest,
+    ) -> UiWriteOutcome {
+        let operation = handle
+            .begin_operation(owner, request.kind_name().to_owned())
+            .unwrap();
+        let (pending, response) = ClaimedRemoteWrite::for_test(operation, request);
+        app.apply_pending_remote_write(pending, &egui::Context::default());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match response.try_recv() {
+                Ok(outcome) => return outcome,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    panic!("claimed write lost its terminal")
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "bookmark terminal did not arrive"
+                    );
+                    app.poll_book_bookmarks();
+                    std::thread::yield_now();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn section1373_remote_acquire_first_blocks_undo_then_expires_ready_receipt() {
+        let mut app = crate::app::setup_app_for_test();
+        app.book_append_undo_receipt = Some(section1373_remote_receipt(&app));
+        let revision = app.book_append_undo_revision;
+        let handle = SessionHandle::new();
+        app.set_remote_session_handle(handle.clone());
+        let acquired = handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
+            client_id: "append-acquire-first".into(),
+            peer: mimageviewer_ipc::SessionPeerInfo {
+                connection_kind: SessionConnectionKind::Direct,
+                device_name: None,
+            },
+        });
+        assert_eq!(acquired.status, SessionStatus::Active);
+        let ctx = egui::Context::default();
+        // Acquire is accepted before its UI observation: no local Undo worker
+        // may start during this existing control-ownership barrier.
+        assert!(app.try_undo_book_append(&ctx));
+        assert!(app.book_op_pending.is_none());
+        assert!(app.book_append_undo_receipt.is_some());
+        app.poll_remote_session(&ctx);
+        assert!(app.book_append_undo_receipt.is_none());
+        assert!(app.book_append_undo_revision > revision);
+        assert!(app.book_op_pending.is_none());
+        assert_eq!(
+            handle.snapshot().phase,
+            super::super::session::RemoteControlPhase::RemoteActive
+        );
+    }
+
+    #[test]
+    fn section1373_undo_first_keeps_remote_acquire_waiting_for_existing_book_owner() {
+        let mut app = crate::app::setup_app_for_test();
+        let receipt = section1373_remote_receipt(&app);
+        let (_worker, rx) = std::sync::mpsc::channel();
+        app.book_op_pending = Some(crate::books::BookOpPending {
+            rx,
+            intent: crate::books::BookOpIntent::UndoAppend { receipt },
+        });
+        let handle = SessionHandle::new();
+        app.set_remote_session_handle(handle.clone());
+        let acquired = handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
+            client_id: "append-undo-first".into(),
+            peer: mimageviewer_ipc::SessionPeerInfo {
+                connection_kind: SessionConnectionKind::Direct,
+                device_name: None,
+            },
+        });
+        assert_eq!(acquired.status, SessionStatus::Active);
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            app.poll_remote_session(&ctx);
+            assert_eq!(
+                handle.snapshot().phase,
+                super::super::session::RemoteControlPhase::AcquiringRemote
+            );
+            assert!(app.book_append_undo_in_progress());
+            assert!(!app.local_ai_remote_barrier_snapshot().is_quiesced());
+        }
+    }
+
+    #[test]
+    fn section1373_remote_bookmark_early_writes_reject_only_undo_and_read_queries_remain_allowed() {
+        for undo_pending in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let receipt = section1373_remote_receipt(&app);
+            app.settings.book_root = Some(receipt.files.root.clone());
+            let address = mimageviewer_ipc::RemoteAddress::file(
+                receipt.files.created[0].path.to_string_lossy().into_owned(),
+            );
+            let context_address = mimageviewer_ipc::RemoteAddress::file(
+                receipt.files.folder.to_string_lossy().into_owned(),
+            );
+            app.book_append_undo_receipt = Some(receipt.clone());
+            let (_worker, rx) = std::sync::mpsc::channel();
+            app.book_op_pending = Some(crate::books::BookOpPending {
+                rx,
+                intent: if undo_pending {
+                    crate::books::BookOpIntent::UndoAppend { receipt }
+                } else {
+                    crate::books::BookOpIntent::SourceMutation
+                },
+            });
+            let (handle, owner, _) = active_session();
+            let revision = app.book_append_undo_revision;
+            let outcome = section1373_apply_claimed_write(
+                &mut app,
+                &handle,
+                &owner,
+                RemoteWriteRequest::SetBookmark {
+                    address: address.clone(),
+                    context_address: context_address.clone(),
+                    page_index: 0,
+                    bookmarked: true,
+                },
+            );
+            if undo_pending {
+                assert!(matches!(
+                    outcome,
+                    UiWriteOutcome::Write(RemoteWriteResponse::Error(RemoteWriteError {
+                        code: RemoteWriteErrorCode::Busy,
+                        ..
+                    }))
+                ));
+                assert!(app.book_bookmark_pending_requests.is_empty());
+                assert!(app.remote_session_ui.pending_bookmark_writes.is_empty());
+                assert_eq!(app.book_append_undo_revision, revision);
+                assert!(app.book_append_undo_receipt.is_some());
+                for request in [
+                    RemoteWriteRequest::SetBookBookmarkTitle {
+                        address: address.clone(),
+                        context_address: context_address.clone(),
+                        page_index: 0,
+                        id: 1,
+                        title: "must not be submitted".into(),
+                    },
+                    RemoteWriteRequest::RemoveBookBookmark {
+                        address: address.clone(),
+                        context_address: context_address.clone(),
+                        page_index: 0,
+                        id: 1,
+                    },
+                ] {
+                    assert!(matches!(
+                        section1373_apply_claimed_write(&mut app, &handle, &owner, request),
+                        UiWriteOutcome::Write(RemoteWriteResponse::Error(RemoteWriteError {
+                            code: RemoteWriteErrorCode::Busy,
+                            ..
+                        }))
+                    ));
+                    assert!(app.book_bookmark_pending_requests.is_empty());
+                }
+            } else {
+                assert!(matches!(
+                    outcome,
+                    UiWriteOutcome::Write(RemoteWriteResponse::Success(_))
+                ));
+                assert!(app.book_append_undo_revision > revision);
+                assert!(app.book_append_undo_receipt.is_none());
+            }
+            // A normal write after the bookmark early route uses the same
+            // UndoAppend-only Busy contract, not a generic book-op barrier.
+            let rating_outcome = section1373_apply_claimed_write(
+                &mut app,
+                &handle,
+                &owner,
+                RemoteWriteRequest::SetRating {
+                    address: address.clone(),
+                    stars: 4,
+                },
+            );
+            if undo_pending {
+                assert!(matches!(
+                    rating_outcome,
+                    UiWriteOutcome::Write(RemoteWriteResponse::Error(RemoteWriteError {
+                        code: RemoteWriteErrorCode::Busy,
+                        ..
+                    }))
+                ));
+                assert_eq!(app.book_append_undo_revision, revision);
+            } else {
+                assert!(matches!(
+                    rating_outcome,
+                    UiWriteOutcome::Write(RemoteWriteResponse::Success(_))
+                ));
+            }
+            let rating_target = remote_rating_target(&app.settings, &address).unwrap();
+            assert_eq!(
+                app.rating_db.as_ref().unwrap().get(&rating_target.key),
+                if undo_pending { 0 } else { 4 }
+            );
+            let read_revision = app.book_append_undo_revision;
+            for request in [
+                RemoteWriteRequest::GetItemState {
+                    address: address.clone(),
+                    context_address: context_address.clone(),
+                    page_index: 0,
+                    bookmark_supported: true,
+                },
+                RemoteWriteRequest::GetAdjustmentState {
+                    address: address.clone(),
+                },
+                RemoteWriteRequest::GetViewTrimState {
+                    address: address.clone(),
+                    context_address: context_address.clone(),
+                },
+            ] {
+                assert!(matches!(
+                    section1373_apply_claimed_write(&mut app, &handle, &owner, request),
+                    UiWriteOutcome::Write(RemoteWriteResponse::Success(_))
+                ));
+                assert_eq!(app.book_append_undo_revision, read_revision);
+                assert!(!app.remote_session_ui.has_pending_bookmark_writes());
+            }
+            assert!(app.remote_session_ui.pending_bookmark_writes.is_empty());
+        }
     }
 
     #[test]

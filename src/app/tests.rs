@@ -677,7 +677,12 @@ mod folder_mtime_rescan_tests {
             real,
             signature,
         );
-        assert_eq!(app.folder_refresh_pending, Some(folder.clone()));
+        assert_eq!(
+            app.folder_refresh_pending
+                .as_ref()
+                .map(|request| &request.folder),
+            Some(&folder)
+        );
         assert_eq!(app.current_folder_signature, initial);
         let generation = app.items_generation;
         let scan = folder_mtime_changed(&folder);
@@ -689,7 +694,12 @@ mod folder_mtime_rescan_tests {
             signature,
         );
         assert_eq!(app.current_folder_signature, Some(signature));
-        assert_eq!(app.folder_refresh_pending, Some(folder));
+        assert_eq!(
+            app.folder_refresh_pending
+                .as_ref()
+                .map(|request| &request.folder),
+            Some(&folder)
+        );
         assert_eq!(app.fullscreen_idx, Some(5));
         assert_eq!(app.items_generation, generation);
     }
@@ -707,10 +717,11 @@ mod folder_mtime_rescan_tests {
             tx.send(if case == "failed" {
                 None
             } else {
-                Some((scan, new_signature))
+                Some((scan, new_signature, Default::default()))
             })
             .unwrap();
             app.external_rescan_pending = Some(ExternalRescanPending {
+                cause: Default::default(),
                 owner_context_id: if case == "other owner" {
                     ViewerContextId::for_test(u64::MAX)
                 } else {
@@ -46743,8 +46754,13 @@ mod favorite_adjustment_defaults_tests {
 
         app.poll_export_pending(&ctx);
 
-        assert_eq!(app.folder_refresh_pending.as_ref(), Some(&folder));
-        app.consume_folder_refresh_pending();
+        assert_eq!(
+            app.folder_refresh_pending
+                .as_ref()
+                .map(|request| &request.folder),
+            Some(&folder)
+        );
+        app.consume_folder_refresh_pending(&egui::Context::default());
         assert!(app.folder_refresh_pending.is_none());
         super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
         assert!(app.items.iter().any(|item| {
@@ -58266,7 +58282,12 @@ mod pipeline_cache_refactor_tests {
             Some(0),
             "rescan must not close the viewer"
         );
-        assert_eq!(app.folder_refresh_pending.as_ref(), Some(&folder));
+        assert_eq!(
+            app.folder_refresh_pending
+                .as_ref()
+                .map(|request| &request.folder),
+            Some(&folder)
+        );
         assert_eq!(
             app.current_folder_last_mtime,
             Some(initial_mtime),
@@ -58281,7 +58302,7 @@ mod pipeline_cache_refactor_tests {
 
         app.close_fullscreen();
         assert!(!app.viewer_session_blocks_main_window());
-        app.consume_folder_refresh_pending();
+        app.consume_folder_refresh_pending(&egui::Context::default());
 
         assert!(app.folder_refresh_pending.is_none());
         super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
@@ -58291,7 +58312,7 @@ mod pipeline_cache_refactor_tests {
         assert_ne!(app.current_folder_last_mtime, Some(initial_mtime));
         let generation_after_reload = app.items_generation;
 
-        app.consume_folder_refresh_pending();
+        app.consume_folder_refresh_pending(&egui::Context::default());
         assert_eq!(
             app.items_generation, generation_after_reload,
             "an empty pending slot must not reload the folder a second time"

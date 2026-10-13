@@ -501,15 +501,15 @@ fn collect_pdf_paths_for_delete(paths: &[PathBuf], cancel: &AtomicBool) -> Vec<P
     pdfs
 }
 
-struct DeleteChunkOutcome {
-    succeeded: Vec<PathBuf>,
-    failed: Vec<(PathBuf, String)>,
-    shell_aborted: bool,
-    retryable: bool,
+pub(crate) struct DeleteChunkOutcome {
+    pub(crate) succeeded: Vec<PathBuf>,
+    pub(crate) failed: Vec<(PathBuf, String)>,
+    pub(crate) shell_aborted: bool,
+    pub(crate) retryable: bool,
 }
 
 impl DeleteChunkOutcome {
-    fn all_failed(paths: &[PathBuf], message: String) -> Self {
+    pub(crate) fn all_failed(paths: &[PathBuf], message: String) -> Self {
         Self {
             succeeded: Vec::new(),
             failed: paths
@@ -614,6 +614,199 @@ fn recycle_flags() -> windows::Win32::UI::Shell::FILEOPERATION_FLAGS {
 /// 複数パス (ファイルまたはフォルダ) を 1 回の `IFileOperation` で削除する。
 #[cfg(windows)]
 fn recycle_chunk(hwnd: isize, paths: &[PathBuf]) -> DeleteChunkOutcome {
+    recycle_chunk_with_policy(hwnd, paths, false)
+}
+
+/// Append Undo must have an actual recycle item for each exact source. It never
+/// infers success from disappearance and never retries or falls back to deletion.
+pub(crate) fn recycle_required(hwnd: Option<isize>, paths: &[PathBuf]) -> DeleteChunkOutcome {
+    let mut result = DeleteChunkOutcome {
+        succeeded: Vec::new(),
+        failed: Vec::new(),
+        shell_aborted: false,
+        retryable: false,
+    };
+    for chunk in paths.chunks(FILE_OPERATION_CHUNK_SIZE) {
+        #[cfg(windows)]
+        let outcome = recycle_chunk_with_policy(hwnd.unwrap_or_default(), chunk, true);
+        #[cfg(not(windows))]
+        let outcome = recycle_chunk(hwnd.unwrap_or_default(), chunk);
+        result.succeeded.extend(outcome.succeeded);
+        result.failed.extend(outcome.failed);
+        result.shell_aborted |= outcome.shell_aborted;
+    }
+    result
+}
+
+#[cfg(windows)]
+fn required_recycle_flags() -> windows::Win32::UI::Shell::FILEOPERATION_FLAGS {
+    use windows::Win32::UI::Shell::{
+        FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOFX_EARLYFAILURE,
+        FOFX_RECYCLEONDELETE,
+    };
+    FOF_ALLOWUNDO
+        | FOF_NOCONFIRMATION
+        | FOF_NOERRORUI
+        | FOF_SILENT
+        | FOFX_EARLYFAILURE
+        | FOFX_RECYCLEONDELETE
+}
+
+fn required_recycle_callback_result(hr: i32, has_recycle_item: bool) -> Result<(), String> {
+    if hr < 0 {
+        Err(format!("ごみ箱への移動に失敗しました: 0x{:08x}", hr as u32))
+    } else if !has_recycle_item {
+        Err("ごみ箱への移動を確認できません (ごみ箱内の対象なし)".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn completed_required_recycle(result: Option<Result<(), String>>) -> Result<(), String> {
+    result.unwrap_or_else(|| Err("ごみ箱への移動結果を確認できません (Shell callbackなし)".into()))
+}
+
+#[cfg(windows)]
+#[windows::core::implement(windows::Win32::UI::Shell::IFileOperationProgressSink)]
+struct RequiredRecycleSink {
+    result: Arc<std::sync::Mutex<Option<Result<(), String>>>>,
+}
+
+#[cfg(windows)]
+#[allow(non_snake_case)]
+impl windows::Win32::UI::Shell::IFileOperationProgressSink_Impl for RequiredRecycleSink_Impl {
+    fn StartOperations(&self) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn FinishOperations(&self, _: windows::core::HRESULT) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PreRenameItem(
+        &self,
+        _: u32,
+        _: windows::core::Ref<windows::Win32::UI::Shell::IShellItem>,
+        _: &windows::core::PCWSTR,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PostRenameItem(
+        &self,
+        _: u32,
+        _: windows::core::Ref<windows::Win32::UI::Shell::IShellItem>,
+        _: &windows::core::PCWSTR,
+        _: windows::core::HRESULT,
+        _: windows::core::Ref<windows::Win32::UI::Shell::IShellItem>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PreMoveItem(
+        &self,
+        _: u32,
+        _: windows::core::Ref<windows::Win32::UI::Shell::IShellItem>,
+        _: windows::core::Ref<windows::Win32::UI::Shell::IShellItem>,
+        _: &windows::core::PCWSTR,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PostMoveItem(
+        &self,
+        _: u32,
+        _: windows::core::Ref<windows::Win32::UI::Shell::IShellItem>,
+        _: windows::core::Ref<windows::Win32::UI::Shell::IShellItem>,
+        _: &windows::core::PCWSTR,
+        _: windows::core::HRESULT,
+        _: windows::core::Ref<windows::Win32::UI::Shell::IShellItem>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PreCopyItem(
+        &self,
+        _: u32,
+        _: windows::core::Ref<windows::Win32::UI::Shell::IShellItem>,
+        _: windows::core::Ref<windows::Win32::UI::Shell::IShellItem>,
+        _: &windows::core::PCWSTR,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PostCopyItem(
+        &self,
+        _: u32,
+        _: windows::core::Ref<windows::Win32::UI::Shell::IShellItem>,
+        _: windows::core::Ref<windows::Win32::UI::Shell::IShellItem>,
+        _: &windows::core::PCWSTR,
+        _: windows::core::HRESULT,
+        _: windows::core::Ref<windows::Win32::UI::Shell::IShellItem>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PreDeleteItem(
+        &self,
+        flags: u32,
+        _: windows::core::Ref<windows::Win32::UI::Shell::IShellItem>,
+    ) -> windows::core::Result<()> {
+        use windows::Win32::UI::Shell::TSF_DELETE_RECYCLE_IF_POSSIBLE;
+        if flags & TSF_DELETE_RECYCLE_IF_POSSIBLE.0 as u32 == 0 {
+            *self.result.lock().unwrap() =
+                Some(Err("ごみ箱へ移せないため完全削除を拒否しました".into()));
+            return Err(windows::core::Error::from_hresult(
+                windows::Win32::Foundation::E_ABORT,
+            ));
+        }
+        Ok(())
+    }
+    fn PostDeleteItem(
+        &self,
+        _: u32,
+        _: windows::core::Ref<windows::Win32::UI::Shell::IShellItem>,
+        hr: windows::core::HRESULT,
+        recycle_item: windows::core::Ref<windows::Win32::UI::Shell::IShellItem>,
+    ) -> windows::core::Result<()> {
+        *self.result.lock().unwrap() = Some(required_recycle_callback_result(
+            hr.0,
+            recycle_item.as_ref().is_some(),
+        ));
+        Ok(())
+    }
+    fn PreNewItem(
+        &self,
+        _: u32,
+        _: windows::core::Ref<windows::Win32::UI::Shell::IShellItem>,
+        _: &windows::core::PCWSTR,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PostNewItem(
+        &self,
+        _: u32,
+        _: windows::core::Ref<windows::Win32::UI::Shell::IShellItem>,
+        _: &windows::core::PCWSTR,
+        _: &windows::core::PCWSTR,
+        _: u32,
+        _: windows::core::HRESULT,
+        _: windows::core::Ref<windows::Win32::UI::Shell::IShellItem>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn UpdateProgress(&self, _: u32, _: u32) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn ResetTimer(&self) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PauseTimer(&self) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn ResumeTimer(&self) -> windows::core::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn recycle_chunk_with_policy(
+    hwnd: isize,
+    paths: &[PathBuf],
+    require_recycle: bool,
+) -> DeleteChunkOutcome {
     use windows::Win32::Foundation::{HWND, RPC_E_CHANGED_MODE};
     use windows::Win32::System::Com::{
         CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
@@ -676,7 +869,13 @@ fn recycle_chunk(hwnd: isize, paths: &[PathBuf]) -> DeleteChunkOutcome {
             format!("Shell 操作の owner window を設定できません: {e}"),
         );
     }
-    if let Err(e) = unsafe { op.SetOperationFlags(recycle_flags()) } {
+    if let Err(e) = unsafe {
+        op.SetOperationFlags(if require_recycle {
+            required_recycle_flags()
+        } else {
+            recycle_flags()
+        })
+    } {
         return DeleteChunkOutcome::all_failed(
             paths,
             format!("Shell 操作フラグを設定できません: {e}"),
@@ -696,7 +895,7 @@ fn recycle_chunk(hwnd: isize, paths: &[PathBuf]) -> DeleteChunkOutcome {
         } {
             Ok(item) => item,
             Err(e) => {
-                if path_is_gone(path) {
+                if !require_recycle && path_is_gone(path) {
                     succeeded.push(path.clone());
                 } else {
                     failed.push((path.clone(), format!("対象を開けません: {e}")));
@@ -704,15 +903,22 @@ fn recycle_chunk(hwnd: isize, paths: &[PathBuf]) -> DeleteChunkOutcome {
                 continue;
             }
         };
-        if let Err(e) = unsafe { op.DeleteItem(&item, None::<&IFileOperationProgressSink>) } {
-            if path_is_gone(path) {
+        let callback = require_recycle.then(|| Arc::new(std::sync::Mutex::new(None)));
+        let sink: Option<IFileOperationProgressSink> = callback.as_ref().map(|result| {
+            RequiredRecycleSink {
+                result: Arc::clone(result),
+            }
+            .into()
+        });
+        if let Err(e) = unsafe { op.DeleteItem(&item, sink.as_ref()) } {
+            if !require_recycle && path_is_gone(path) {
                 succeeded.push(path.clone());
             } else {
                 failed.push((path.clone(), format!("削除を予約できません: {e}")));
             }
             continue;
         }
-        scheduled.push(path.clone());
+        scheduled.push((path.clone(), callback));
     }
 
     if scheduled.is_empty() {
@@ -733,8 +939,19 @@ fn recycle_chunk(hwnd: isize, paths: &[PathBuf]) -> DeleteChunkOutcome {
         perform_error.as_ref().map(|error| error.code().0),
     );
 
-    for path in scheduled {
-        if path_is_gone(&path) {
+    for (path, callback) in scheduled {
+        if require_recycle {
+            match completed_required_recycle(
+                callback
+                    .expect("required policy owns each callback")
+                    .lock()
+                    .unwrap()
+                    .take(),
+            ) {
+                Ok(()) => succeeded.push(path),
+                Err(error) => failed.push((path, error)),
+            }
+        } else if path_is_gone(&path) {
             succeeded.push(path);
         } else {
             let msg = if let Some(e) = &perform_error {
@@ -1403,6 +1620,7 @@ mod worker_tests {
 
 #[cfg(all(test, windows))]
 mod tests {
+    use std::sync::Arc;
     use windows::Win32::UI::Shell::{
         FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING, FOFX_RECYCLEONDELETE,
     };
@@ -1432,5 +1650,52 @@ mod tests {
             miv_owned_ui_flags,
             "mIV owns delete confirmation/progress UI; Shell UI should stay quiet except the nuke warning"
         );
+    }
+
+    #[test]
+    fn section1373_recycle_requires_success_hresult_and_nonnull_recycle_item() {
+        assert!(super::required_recycle_callback_result(0, true).is_ok());
+        assert!(super::required_recycle_callback_result(1, true).is_ok());
+        assert!(super::required_recycle_callback_result(0x80004005_u32 as i32, true).is_err());
+        assert!(super::required_recycle_callback_result(0, false).is_err());
+        assert!(super::required_recycle_callback_result(0x80004005_u32 as i32, false).is_err());
+        assert!(super::completed_required_recycle(None).is_err());
+        assert!(super::completed_required_recycle(Some(Ok(()))).is_ok());
+        assert!(super::completed_required_recycle(Some(Err("failure".into()))).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn section1373_required_sink_rejects_permanent_delete_before_shell_executes() {
+        use windows::Win32::UI::Shell::{
+            IFileOperationProgressSink, IShellItem, TSF_DELETE_RECYCLE_IF_POSSIBLE,
+        };
+        let result = Arc::new(std::sync::Mutex::new(None));
+        let sink: IFileOperationProgressSink = super::RequiredRecycleSink {
+            result: Arc::clone(&result),
+        }
+        .into();
+        assert!(
+            unsafe {
+                sink.PreDeleteItem(TSF_DELETE_RECYCLE_IF_POSSIBLE.0 as u32, None::<&IShellItem>)
+            }
+            .is_ok()
+        );
+        assert!(result.lock().unwrap().is_none());
+        assert!(unsafe { sink.PreDeleteItem(0, None::<&IShellItem>) }.is_err());
+        assert!(result.lock().unwrap().as_ref().unwrap().is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn section1373_required_flags_fail_without_permanent_delete_confirmation() {
+        use windows::Win32::UI::Shell::{
+            FOF_WANTNUKEWARNING, FOFX_EARLYFAILURE, FOFX_RECYCLEONDELETE,
+        };
+        let flags = super::required_recycle_flags().0;
+        assert_ne!(flags & FOFX_RECYCLEONDELETE.0, 0);
+        assert_ne!(flags & FOFX_EARLYFAILURE.0, 0);
+        assert_eq!(flags & FOF_WANTNUKEWARNING.0, 0);
+        assert_ne!(super::recycle_flags().0 & FOF_WANTNUKEWARNING.0, 0);
     }
 }

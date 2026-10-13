@@ -1455,6 +1455,23 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-13 §1.373: 本追加Undoの終端と既存context境界
+
+利用者が提示したR4案1の独立設計レビューACCEPTに従い、既存BookOpPendingへ
+Append／UndoAppendを接続する。追加元のcontextとRoot pollのMain投影を混同せず、
+捕捉したownerの通常終端へ配送する。独立実装レビューで、operationと採用先ownerを分けた
+型付きrefresh資格（ID・受付revision、owner、exact folder、generation/options、worker構成stamp）
+を既存payloadへ載せる方針にも合意した。詳細は
+[section373-book-append-undo-plan.md §7.6](section373-book-append-undo-plan.md#76-実装時の所有資格の具体化2026-10-13)。
+
+既存の窓activation受付で本追加receiptを失効させ、一時的なreadonly mountでは失効させない。
+UndoAppend中だけ既存modal gateで拒否し、他の本操作の受付規則は変えない。
+同operationのrefresh／Undo前readonly解放だけ`FsMetadataBoundary::BookAppend`を使い、
+元receiptの失効と既存metadata Undoの掃除を区別する。detached述語、viewport配置、HWND同定、
+focus/recreate機構には変更を加えず、無関係な兄弟のitems・cache・generation・scanを触らない。
+source ownerのF12終端、Mainへの同本refresh、旧generation／設定のscan拒否、source close後の
+成功通知・draft保持をheadless回帰で検査する。実機起動は行わない。
+
 ### 2026-10-11 §1.371: 評価集合の公開を安定context境界へ移す構造合意（設計段階）
 
 利用者が提示した独立再レビュー（対象 `94bc236d1`、rating-filter-fullscreen-plan R2）は、

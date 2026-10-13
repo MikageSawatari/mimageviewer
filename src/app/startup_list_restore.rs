@@ -17,6 +17,7 @@ pub(crate) enum StartupListIntent {
     PreservePresentation,
     /// Re-enumerate an adopted physical list, retaining its logical ZIP level and cursor.
     RefreshList {
+        book_append_refresh: Option<super::book_append_refresh::BookAppendRefresh>,
         target: StartupListTarget,
         cursor: Option<ListCursorHint>,
         local_search: Option<Arc<LocalSearchSubmission>>,
@@ -34,6 +35,17 @@ pub(crate) enum StartupListIntent {
 }
 
 impl StartupListIntent {
+    pub(super) fn book_append_refresh(
+        &self,
+    ) -> Option<&super::book_append_refresh::BookAppendRefresh> {
+        match self.materialization_intent() {
+            Self::RefreshList {
+                book_append_refresh,
+                ..
+            } => book_append_refresh.as_ref(),
+            _ => None,
+        }
+    }
     pub(crate) fn captures_list_departure(&self) -> bool {
         matches!(
             self,
@@ -126,6 +138,7 @@ impl App {
         };
         let cursor = self.current_main_list_cursor(&target);
         StartupListIntent::RefreshList {
+            book_append_refresh: None,
             target,
             cursor,
             local_search: self.submitted_local_search(),

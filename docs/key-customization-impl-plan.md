@@ -590,7 +590,10 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - FsAdjustSlot1..10 `Ctrl+1`..`Ctrl+0` (P) ★ / FsClearAdjust `Ctrl+Backspace` ★
 - FsPin `P` ★ / FsApplyErase1/2 `F7/F8` / FsApplyConceal1/2 `F9/F10`
   (family・予約候補)
-- FsMetaUndo/Redo (handle_meta_undo_keys、family・実コード確認) /
+- `UndoLastAction` (Global / Press、既定 `Ctrl+Z`) はグリッド・画像ビューア共通の本追加一回取消 / メタデータUndo入口。
+  有効な追加receiptを先に扱い、処理中・失効検出を含め同じ入力で古いメタUndoへ続けない。
+  編集専用UndoとTextEdit / IME / dialogの所有を優先する。追加自体のRedoはない。
+  メタRedo (`Ctrl+Y` / `Ctrl+Shift+Z`) は従来の固定入力を維持 /
   FsPipelineDebug `Ctrl+Alt+Shift+D` (固定)
 
 ### FsVideo (Ph5、VK 経路)

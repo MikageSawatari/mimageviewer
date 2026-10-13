@@ -3046,6 +3046,9 @@ impl App {
                 // 判断して二度目を呼ぶと、初回 close が整えた状態を巻き戻す。
                 match metadata_boundary {
                     super::FsMetadataBoundary::Manual => self.close_fullscreen(),
+                    boundary @ super::FsMetadataBoundary::BookAppend(_) => {
+                        self.close_fullscreen_now_with_metadata_boundary(boundary)
+                    }
                     super::FsMetadataBoundary::RatingMembership => self
                         .close_fullscreen_now_with_metadata_boundary(
                             super::FsMetadataBoundary::RatingMembership,
@@ -16098,6 +16101,9 @@ mod rating_terminal_close_tests {
                 assert!(app.video_presentation_transition.is_transitioning());
                 app.video_presentation_transition.dispatch(match boundary {
                     FsMetadataBoundary::Manual => PresentationTransitionEvent::TerminalClose,
+                    FsMetadataBoundary::BookAppend(_) => {
+                        unreachable!("this fixture only covers manual/rating boundaries")
+                    }
                     FsMetadataBoundary::RatingMembership => {
                         PresentationTransitionEvent::TerminalCloseForRatingMembership
                     }

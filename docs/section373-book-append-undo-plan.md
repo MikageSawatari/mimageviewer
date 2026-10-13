@@ -1,11 +1,12 @@
 ﻿# §1.373 本棚への追加直後の一回取り消し
 
 2026-10-13改訂、`next-list` / `ea060b66e` 設計基点、確認基点 `df20dba7b`。
-**利用者決定 (2026-10-12): R4案1を採用・設計確定。独立設計レビュー提出用、製品未接続**。
+**利用者決定 (2026-10-12): R4案1を採用。R4設計はACCEPT、実装レビューは§7.7のP1によりREVISE・設計判断待ち (2026-10-13)**。
 正本項目: [next-release-backlog.md §1.373](next-release-backlog.md#1373-本棚ツールバーの右クリックで本棚へ追加した操作を-ctrlz-で取り消す--利用者の要望-2026-10-11)。
-アプリは起動していない。利用者の実装指示で試作を開始したが、R4の判断が必要になった時点で
-製品への接続を撤回し、未検証の試作を`target`へ退役した。今回その判断を設計へ反映し、
-独立レビュー前に再接続しない。
+アプリは起動していない。R4判断前の未検証試作は製品への接続を撤回し、`target`へ退役した。
+R4案1の独立設計レビューACCEPTを受けて既存ownerへの接続と回帰を実装したが、通常の後続編集を
+metadata copyが正本から上書きする前提矛盾が判明した。実装候補を保持して停止し、完成とは扱わない。
+最終検証・実装ACCEPT・実機確認は未完了。下記の試作退役・レビュー前停止は当時の履歴である。
 
 `001a0dabf` の独立設計レビューは **REVISE**。本改訂は coordinator 判断を優先して
 P1-1 の過剰な同定を撤去し、P1-2 の既存 book operation owner への統合、P2 の失効入口を
@@ -124,7 +125,8 @@ UI の後から変わった settings／active_book_name で出力名を作り直
    operation の一覧 refresh を「他操作」と誤分類しない。read-only一覧準備を一般の失効
    除外にせず、operation ID の同一性で限定する。
 4. Ctrl+Z の新操作は `KeyAction` へ配送する。既存メタ Undo の固定 Ctrl+Z の入口も同じ
-   Action (`UndoLastAction` 仮称) に集約し、有効receiptがあればこの一回、なければ既存メタ Undoへ。
+   Action (`KeyAction::UndoLastAction`、Global／Press、既定Ctrl+Z) に集約し、有効receiptがあれば
+   この一回、なければ既存メタ Undoへ。消しゴム等の編集専用Undoが有効な面ではそちらを優先する。
    Redoと編集専用 Undo の優先順、IME／dialog gate は維持する。新しい raw `Key::Z` 判定は作らない。
 5. Undo の受付は次節の既存本操作 gate で行い、`UndoAppend` pending を同期的に設定する。
    検証・ごみ箱移動・purge はその worker が一回の操作として行う。
@@ -239,7 +241,8 @@ membership は統合された場合に専用回帰を追加。
 
 検証所有者: root実装担当が集約。targeted、fmt、通常／portable core check、項目末尾 full gate 一回。
 §1.373の試作にcargo／fmt／build検証は行っていない。アプリ起動・コミットなし。
-下記R4の独立設計レビュー前に製品への接続・実ごみ箱操作の検証を進めない。
+R4の独立設計レビュー前は製品への接続を停止した。現在はR4 ACCEPT後の実装中であり、
+実ごみ箱操作の検証は引き続き別の明示了承済み検証枠で行う。
 
 ## 6. 退役した実装試作 (2026-10-12、製品未接続・未検証)
 
@@ -381,7 +384,9 @@ Appendを終える。画面を強制的に閉じたり、閲覧終了までBookO
 同IDの説明済みrefreshだけを失効除外にし、不明差分ならreceiptを失効・通常更新へ戻す。
 deferred予約だけを理由にCtrl+Zの新しいBusy条件は追加しない。receiptが有効ならR3の受付と
 worker検証を使い、Undoに伴う既存readonly解放・refresh取消／世代失効を同じownerで処理する。
-採用workerが既に走っている場合は§3.1の既存busy判定を使う。古いAppend refreshの後着は
+採用に付随して受理済みの書込みが残る場合だけ、§3.1に列挙した既存writerのBusy条件
+(`rename_migration_writers_busy()`等)を使う。readonlyのrescan／prepareはこの判定に含めず、
+既存ownerの取消・世代拒否で扱い、新しいBusy理由にはしない。古いAppend refreshの後着は
 消費済みreceiptやUndo後の世代へ採用せず、取り消したページを旧scanで表示へ戻さない。
 本配下では `consume_folder_refresh_pending` の `current_favorite_target` が拒否するため、
 Append causeの要求はお気に入り可否ではなくcaptured physical sourceの既存refresh配送を使う。
@@ -415,13 +420,108 @@ metadata copy失敗・部分write・worker切断はtokenなし、生成済みfil
 - cutoff後の通知、copy失敗・scan不成立・worker切断で観測を一般経路へ返す。permanent delete0件、
   PostDeleteItemの実移動結果による成功pathだけのpurgeというR3回帰も維持。
 
-**ここで止め、R3からの所有・配送差分を独立設計レビューへ提出する。再承認の利用者質問は不要。**
-今回追加・実行テスト0件、build0件、アプリ起動0回、コミット0件。退役した試作は再適用していない。
+**R4提出時はここで停止した。R4設計はACCEPTだが、実装で§7.7の通常書込み順序の前提矛盾が判明し、設計判断のため停止している。ごみ箱方式の再承認は不要。**
+R4提出時点では追加・実行テスト0件、build0件、アプリ起動0回、コミット0件で、退役試作は再適用しなかった。
+これを現在の実装・検証の完了証拠として扱わない。
+
+### 7.6 実装時の所有資格の具体化（2026-10-13）
+
+`AppendOperation`の元contextと、一覧を採用するcontextは別の資格とする。
+Rootの`poll_book_op_pending`がMainを投影していても、F12から受けた追加の通常終端は
+既存`with_owner_viewer_context`で捕捉した元ownerへ配送する。一時mount自体では受付revisionを
+失効させず、利用者による窓の切替・設定変更・後続mutationの受付で失効させる。
+元窓が閉じられていればvisible採用とtokenだけを捨て、metadataコピーの結果、成功件数・
+エラーのログと通常通知は終端へ残す。コピー完了で元画像や兄弟の編集draftを全消去しない。
+
+既存refreshのpayload `BookAppendRefresh`にはoperation、採用先owner、exact folder、
+items generation、既存の全scan optionsを載せる。元operationの生存／ID／受付revisionと、
+採用先owner／folder／generation／optionsの一致を別々に照合する。fresh scanの全構成stampは
+workerで確認し、これらの資格が失効した旧scanはtokenだけでなく表示採用も拒否する。
+設定変更やDelete成功後の旧scanで行を戻さず、追加成功の通知は維持し、現在の通常refreshへ返す。
+表示signatureが既存`same_listing`で一致する場合は観測signature・worker取得の親mtimeだけを進め、
+一覧install・世代更新を行わない（§1.314を維持）。
+
+現製品のwatch／Resumed／外部scan producerはMain updateから呼ばれ、scan pendingはApp-global。
+本folderにはwatch購読がないため、Appendの観測はResumedと先着scanの採用入口を対象とする。
+新しいdetached巡回・watch fanoutを作らない。元ownerが非投影／移動／park／dropなら既存の
+stale/drop規則に従う。F12からの追加でMainが同じ対象本を表示している場合は、従来の追加成功更新を
+維持し、Mainの既存scan ownerへ同operationのqualified refreshを渡す。元contextと異なるMainへの
+採用でも、四つの資格（元operation、採用owner、exact folder、fresh構成stamp）が一致した
+自己refreshだけは元receiptを失効させない。これは§1.375の自己操作照合ではなく、R4のAppend終端配送である。
+
+Undo受付はその元contextで行う。readonly取消は同じ本の旧scan／同operationのdeferred要求と
+元contextの既存readonly要求に限定し、無関係なMain・兄弟のscanを取り消さない。
+fullscreen終了等でreceiptが失効してもdeferred更新は一般causeへ返す。Undoによる取消と、
+通常失効後の最新表示更新を混同しない。新しいpending owner・Busy理由・時間窓は追加しない。
+
+### 7.7 実装で判明した後続編集の正本上書き（設計判断停止点、2026-10-13）
+
+R4の「追加中も通常の明示reload／openとタグ・★・編集を受け付ける」と、ファイル作成後に
+八つのmetadata storeを独立workerで初期化する現実装は、書込みの順序を保証できない。
+これは通常操作で到達でき、まれな失敗の割り切り対象ではない。独立実装レビューもP1／REVISEと確認した。
+
+具体的な順序は次のとおり。
+
+1. `books::append_sources_with_cancel` が本フォルダへ番号付き画像を作成する。
+2. 自動観測はAppend終端へ延期するが、明示reload／openは延期しない。作成済み画像が一覧に現れる。
+3. その画像へ後続の★・タグ・編集を受け付け、DBへ保存する。receiptは失効するが、コピーは続く。
+4. `start_book_append_metadata_terminal` の独立workerが後からコピー先metadataを初期化する。
+   `RatingDb::copy_entry_key` の`ON CONFLICT ... UPDATE`、`TagsDb::copy_item_key`の
+   destination削除／source再挿入等が、後続ユーザー編集の正本を上書きする。
+5. DB書込みが逆順でも、古いimmutable copy reportをUI終端で採用すると、後続編集のcacheを戻し得る。
+
+タグworkerのFIFOはそのworker内だけであり、同期rating書込みや他storeのコピーを含まない。
+local-adjust fenceもhandoff前のそのworkerのjobを待つだけで、後続destination編集と八storeの
+コピーを共通に序列化しない。受付revision／operation ID、copy reportへのgeneration cut／
+受付key追加はtokenやcacheの保護には使えるが、正本DBの上書きを防ぐ十分条件ではない。
+実装調査で見つかったexact destination cache更新は候補として残したが、全体の正しさの証明とは扱わない。
+
+次のどちらかの所有／公開境界を設計し、通常操作の費用を確認して独立レビューを受ける必要がある。
+
+| 方針 | 構造と通常操作への費用 |
+| --- | --- |
+| metadata完成まで新ページを公開しない | 既存Append ownerでファイル作成・metadata初期化・公開を一体化し、未完成destinationへの後続編集の組合せを除く。staging等の安全な物理公開、外部変更、部分失敗の境界を再設計する。明示reloadでも追加途中の新ページが現れないという表示時期の変更がある |
+| metadata初期化と後続destination書込みを序列化する | 八storeの初期化と後続ユーザー書込みを同じ所有／順序境界へ接続する。途中ページを開ける既存操作は維持するが、同期ratingや別workerを含む広い構造変更になる。古いreportの採用資格も同じ順序から決める |
+
+現R4にはこの共通境界がなく、実装判断で新しいAppend Busy、画面露出の禁止、専用pending owner、
+rollback、時間窓を追加しない。今回の作業ツリーは実装候補・未完了のまま保持し、設計判断待ちとする。
+既知の正本上書き欠陥を残したまま最終full gate／確認用buildを完了証拠として提出しない。
+§1.375 R6はこの書込み所有とは独立した設計提出であり、表示比較方式の実装は始めていない。
+
+再設計の受入回帰では、制御channelでコピー前／コピー後／UI結果poll前の順序を固定する。
+明示reloadで新ページを開き、★変更・0への解除、タグ追加・削除・全解除、六つの画像編集storeの
+変更・解除を保存し、DB正本とmounted／parked cacheの両方で後続ユーザー操作が最後に残ることを
+検査する。sourceの同時編集、別destination、無関係な兄弟のdraft、部分copy失敗も対照にする。
+後着reportだけを抑止する試験を、正本の書込み順序の受入証拠として代用しない。
+
+### 7.8 停止checkpointの検証記録（2026-10-13）
+
+- 対象`section1373`は50件成功・失敗0件。途中のfixture不備2件を修正して同じ50件を再実行した。
+  新規Undo、receipt／構成、Shell実移動結果、後続入力、Remote先着順、F12→Main実採用、
+  stale拒否、Delete前後のdeferred配送、exact destination cache更新を検査する。
+  これらの成功を§7.7の正本／後着report上書きの解消証拠とは扱わない。
+- 通常／portableのcore cargo check、cargo fmt --all -- --check、git diff --checkが成功。
+- viewer_context_auditは違反0件。exact cache publication APIの正確なsignature一件を登録し、
+  audit規則・検出範囲は変更していない。UI glyph検査は危険文字0件。
+- 関連7文書のUTF-8 strict decode、manual 2ファイルのHTMLParser解析が成功。
+- 今回のtest-full・build-release・build-devは0回。§7.7の設計判断で停止し、未完成の候補を
+  最終検証・実装ACCEPT・利用者確認用binaryとして提出しない。アプリ起動0回・コミット0件。
+- 全差分は50ファイル（実装／試験37、docs／manual 13）。主な境界は
+  `src/books.rs`、`src/book_append_undo.rs`、`src/delete_worker.rs`、`src/app.rs`、
+  `src/app/book_append_undo.rs`、`src/app/book_append_refresh.rs`、既存mutation／Undo入口、
+  `src/app/viewer_context_registry.rs`と`tools/viewer_context_audit/src/lib.rs`。
+  [全変更ファイルと状態](../target/section1373-checkpoint-summary.txt)を保持する。
+
+ログ: [対象50件](../target/section1373-checkpoint-final.log)、
+[通常core check](../target/section1373-checkpoint-core.log)、
+[portable core check](../target/section1373-checkpoint-portable.log)、
+[context audit](../target/section1373-checkpoint-audit-final.log)。
+core check後のソース変更はfixture／audit登録のみで、製品codeは変えていない。
 
 ### 退役記録と再開範囲
 
 設計判断前に試作のApp fields／Undo入口／producer gate／typed refresh接続を撤回した。
-現製品は既存の受付規則を維持する。独立レビュー後、R4に沿って同じ既存ownerへ接続し直す。
+撤回時の製品は既存の受付規則を維持した。現在は独立レビューACCEPT後、R4に沿って同じ既存ownerへ接続中。
 退役記録は`target/section1373-integration-prototype.patch`と
 `target/section1373-prototype/`の実ファイルcopy。これは未検証の途中差分であり、
 製品仕様の正本・適用済み変更・検証証跡とは扱わない。
@@ -431,4 +531,4 @@ metadata copy失敗・部分write・worker切断はtokenなし、生成済みfil
 
 退役前の worker／receipt／Shell 部分は独立コードレビューで重要所見なし。App接続は
 未完成・未検証であり、この部分レビューを製品の§1.373全体 ACCEPTとは扱わない。
-瞬間的な同stamp差替えは既定の割り切り方針による。今回の製品差分には新Undo入口を残さない。
+瞬間的な同stamp差替えは既定の割り切り方針による。撤回時の製品差分には新Undo入口を残さなかった。

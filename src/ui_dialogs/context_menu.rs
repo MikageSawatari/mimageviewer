@@ -1212,7 +1212,9 @@ impl crate::app::App {
                 self.settings.show_windows_context_menu_inline,
             ),
         };
-        let native_result = crate::native_context_menu::show_native_context_menu(request);
+        let native_result = crate::native_context_menu::show_native_context_menu(request, || {
+            self.admit_book_append_followup_mutation()
+        });
         Self::resync_egui_modifiers_from_os(ctx);
         #[cfg(windows)]
         if matches!(&native_result, NativeContextMenuResult::Canceled)
@@ -1606,6 +1608,9 @@ impl crate::app::App {
                     && let (Some(hwnd), Some(folder)) =
                         (self.main_hwnd, target.folder_command_target.clone())
                 {
+                    if !self.admit_book_append_followup_mutation() {
+                        return None;
+                    }
                     // Ctrl+V と同じ約束。Shell が何を作るかは分からないので、呼ぶ前の
                     // 一覧を控えて差分で拾う ([`crate::post_operation_selection`])。
                     self.request_post_operation_selection_for_added_items(folder.clone());

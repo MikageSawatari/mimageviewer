@@ -2382,6 +2382,7 @@ mod local_adjust_canvas_edit_contract_tests {
     fn a_prepare_only_edit_updates_memory_without_saving_or_pushing_undo() {
         let mut app = seam_test_app();
         let undo_before = app.meta_undo.undo_len();
+        let append_revision = app.book_append_undo_revision;
 
         let applied = app.mutate_local_adjust_layer_from_canvas(0, 0, true, |layer| {
             layer.name = "prepared".to_string();
@@ -2389,6 +2390,7 @@ mod local_adjust_canvas_edit_contract_tests {
         });
 
         assert!(!applied, "PreparedOnly は「編集が効いた」ではない");
+        assert_eq!(app.book_append_undo_revision, append_revision);
         assert_eq!(
             seam_layer_name(&app),
             "prepared",
@@ -2409,12 +2411,14 @@ mod local_adjust_canvas_edit_contract_tests {
     fn an_untouched_edit_leaves_everything_alone() {
         let mut app = seam_test_app();
         let undo_before = app.meta_undo.undo_len();
+        let append_revision = app.book_append_undo_revision;
 
         let applied = app.mutate_local_adjust_layer_from_canvas(0, 0, true, |_layer| {
             LocalAdjustCanvasEdit::Untouched
         });
 
         assert!(!applied);
+        assert_eq!(app.book_append_undo_revision, append_revision);
         assert!(!seam_took_the_save_path(&app));
         assert_eq!(app.meta_undo.undo_len(), undo_before);
     }
@@ -2423,6 +2427,7 @@ mod local_adjust_canvas_edit_contract_tests {
     fn an_applied_edit_with_persist_saves_and_pushes_undo() {
         let mut app = seam_test_app();
         let undo_before = app.meta_undo.undo_len();
+        let append_revision = app.book_append_undo_revision;
 
         let applied = app.mutate_local_adjust_layer_from_canvas(0, 0, true, |layer| {
             layer.name = "applied".to_string();
@@ -2430,6 +2435,7 @@ mod local_adjust_canvas_edit_contract_tests {
         });
 
         assert!(applied);
+        assert!(app.book_append_undo_revision > append_revision);
         assert_eq!(seam_layer_name(&app), "applied");
         assert!(seam_took_the_save_path(&app));
         assert_eq!(
@@ -11023,6 +11029,14 @@ impl App {
         defer_render: bool,
         mutate: impl FnOnce(&mut local_adjust_core::LocalAdjustmentLayer) -> LocalAdjustCanvasEdit,
     ) -> bool {
+        // The closure can report hydration-only or a genuine edit only after
+        // examining the document. It is non-reentrant and cannot publish jobs.
+        // Reject UndoAppend before lending the document, then invalidate only
+        // an Applied edit in this same call, before any render/save publication.
+        if self.book_append_undo_in_progress() {
+            self.show_feedback_toast("本への追加を取り消しています".to_string());
+            return false;
+        }
         // Undo 用の複製は保存する回だけ作る。ドラッグ中は毎フレームここを通り、
         // レイヤー文書には**画像原寸**のラスターマスク (`Vec<f32>`) が入っているので、
         // 使わない複製が 1 枚 24MP で 27.7ms / 96 MB になる (2026-08-29 実測)。
@@ -11052,6 +11066,9 @@ impl App {
         };
         if !outcome.touched_document() {
             return false;
+        }
+        if outcome.did_apply() {
+            self.invalidate_book_append_undo();
         }
         self.local_adjust_selected_layers.insert(fs_idx, layer_idx);
         if outcome.did_apply()
@@ -13832,6 +13849,9 @@ impl App {
             .unwrap_or("3D LUT")
             .to_string();
         let worker_path = path.clone();
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         let spawn_result = std::thread::Builder::new()
             .name("local-adjust-lut-load".to_string())
@@ -14033,6 +14053,9 @@ impl App {
             self.show_feedback_toast("被写体マスク生成用の画像を取得できません".to_string());
             return;
         };
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         let generation = self
             .local_adjust_generation
             .get(&fs_idx)
@@ -14112,6 +14135,9 @@ impl App {
         };
         if scope.requires_subject() && subject.is_none() {
             self.show_feedback_toast("利用できる被写体マスクがありません".to_string());
+            return;
+        }
+        if !self.admit_book_append_followup_mutation() {
             return;
         }
         let color_tolerance = self.local_adjust_region_color_tolerance;
@@ -15227,13 +15253,25 @@ impl App {
                                     let edit = title_edit
                                         .as_mut()
                                         .expect("matching book bookmark title edit");
-                                    let (_, submit_title) = draw_bookmark_title_edit(
-                                        ui,
-                                        bookmark.id,
-                                        &mut edit.title,
-                                        &mut edit.request_focus,
-                                        enter_pressed,
-                                    );
+                                    let (response, submit_title) = ui
+                                        .add_enabled_ui(
+                                            !self.book_append_undo_in_progress(),
+                                            |ui| {
+                                                draw_bookmark_title_edit(
+                                                    ui,
+                                                    bookmark.id,
+                                                    &mut edit.title,
+                                                    &mut edit.request_focus,
+                                                    enter_pressed,
+                                                )
+                                            },
+                                        )
+                                        .inner;
+                                    if response.changed() {
+                                        // The local TextEdit draft is published back to App
+                                        // below. Opening/canceling an unchanged field is read-only.
+                                        self.invalidate_book_append_undo();
+                                    }
                                     if submit_title {
                                         save_title = Some((bookmark.id, edit.title.clone()));
                                         control_clicked = true;
@@ -16385,7 +16423,7 @@ impl App {
         // ── スライダー変更を選択中スコープへ反映 ──
         // ドラッグ中はページ / 標準とも in-memory のみ。release で 1 回だけ永続化する。
         // 非ドラッグのラジオ・コンボボックス・リセットは即時通常パスへ流す。
-        if changed {
+        if changed && self.admit_book_append_followup_mutation() {
             if is_dragging || was_dragging {
                 if let Some(session) = self.adjustment_standard_drag_session.as_ref() {
                     // scope はドラッグ開始時に固定し、途中の UI 状態変化に追従させない。

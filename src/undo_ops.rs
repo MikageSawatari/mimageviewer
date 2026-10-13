@@ -113,6 +113,7 @@ impl App {
     /// Undo/Redo スタック両方を破棄。フォルダ移動・フルスクリーン遷移・フルスクリーン
     /// 中の画像移動など「コンテキストが切り替わる境界」で呼ぶ。
     pub(crate) fn clear_meta_undo(&mut self) {
+        self.invalidate_book_append_undo();
         self.cancel_rating_membership_restore();
         if self.meta_undo.can_undo() || self.meta_undo.can_redo() {
             crate::logger::log(format!(
@@ -125,10 +126,23 @@ impl App {
         self.finish_meta_undo_boundary_cleanup();
     }
 
+    /// Only the accepted append's own refresh preserves its receipt and history.
+    pub(crate) fn clear_meta_undo_preserving_book_append(
+        &mut self,
+        operation: crate::book_append_undo::AppendOperation,
+    ) {
+        if !self.book_append_operation_is_live(operation) {
+            self.clear_meta_undo();
+            return;
+        }
+        self.finish_meta_undo_boundary_cleanup();
+    }
+
     /// Automatic rating membership landing changes the page, but its rating
     /// operation must remain undoable from the new page or the returned grid.
     /// Index-scoped editing entries and unfinished drag/tag sessions still end.
     pub(crate) fn clear_meta_undo_for_rating_move(&mut self) {
+        self.invalidate_book_append_undo();
         self.meta_undo.retain_rating();
         self.finish_meta_undo_boundary_cleanup();
     }
@@ -207,6 +221,9 @@ impl App {
     /// Ctrl+Z ハンドラ。スタック先頭を取り出し、`before` 状態を再適用してから
     /// Redo スタックへ移す。スタックが空なら no-op。
     pub(crate) fn apply_meta_undo(&mut self) {
+        if !self.meta_undo.can_undo() || !self.admit_book_append_followup_mutation() {
+            return;
+        }
         let Some(mut entry) = self.meta_undo.pop_undo() else {
             return;
         };
@@ -268,6 +285,9 @@ impl App {
     /// Ctrl+Y / Ctrl+Shift+Z ハンドラ。Redo スタック先頭を取り出し、`after` 状態を
     /// 再適用してから Undo スタックへ戻す。
     pub(crate) fn apply_meta_redo(&mut self) {
+        if self.meta_undo.can_redo() && !self.admit_book_append_followup_mutation() {
+            return;
+        }
         // An accepted Redo replaces any outstanding Undo restoration, including
         // when the after-value write fails or there is no entry left to replay.
         self.cancel_pending_rating_membership_restore();
@@ -341,7 +361,10 @@ impl App {
             .consume_fixed_chord(ctx, crate::keymap::Chord::ctrl(crate::keymap::KeyName::Y));
         let undo = self
             .keymap
-            .consume_fixed_chord(ctx, crate::keymap::Chord::ctrl(crate::keymap::KeyName::Z));
+            .consume_action(ctx, crate::keymap::KeyAction::UndoLastAction);
+        if undo && self.try_undo_book_append(ctx) {
+            return;
+        }
         // タグ書き込み worker が in-flight の間に Undo/Redo を通すと、未確定のタグ
         // 操作が `pending_tag_undos` に居座ったまま直前の別操作を pop してしまい、
         // worker 結果が遅れて到着するとスタック順がユーザー操作順と入れ替わる。

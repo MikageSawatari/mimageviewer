@@ -37841,7 +37841,7 @@ impl App {
     }
 
     fn persist_spread_presentation(
-        &self,
+        &mut self,
         mode: SpreadMode,
         flow: ReadingFlow,
         direction: ReadingDirection,
@@ -37849,6 +37849,10 @@ impl App {
         let Some(key) = self.spread_container_key() else {
             return Ok(());
         };
+        self.spread_db.as_ref().map_err(Clone::clone)?;
+        if !self.admit_book_append_followup_mutation() {
+            return Err("本への追加を取り消しています".to_owned());
+        }
         let db = self.spread_db.as_ref().map_err(Clone::clone)?;
         db.set_presentation_state(
             &key,
@@ -37869,12 +37873,16 @@ impl App {
     }
 
     fn persist_current_final_cover_spread_preference(
-        &self,
+        &mut self,
         preference: crate::settings::FinalCoverSpreadPreference,
     ) -> Result<(), String> {
         let Some(key) = self.spread_container_key_with_fallback() else {
             return Ok(());
         };
+        self.spread_db.as_ref().map_err(Clone::clone)?;
+        if !self.admit_book_append_followup_mutation() {
+            return Err("本への追加を取り消しています".to_owned());
+        }
         let db = self.spread_db.as_ref().map_err(Clone::clone)?;
         db.set_final_cover_spread_preference(&key.exact, key.fallback.as_deref(), preference)
             .map_err(|error| error.to_string())?;
@@ -37920,12 +37928,16 @@ impl App {
     }
 
     fn persist_current_singleton_spread_endpoint_preferences(
-        &self,
+        &mut self,
         preference: crate::settings::SingletonSpreadEndpointPreferences,
     ) -> Result<(), String> {
         let key = self
             .spread_container_key_with_fallback()
             .ok_or_else(|| "no current spread container".to_owned())?;
+        self.spread_db.as_ref().map_err(Clone::clone)?;
+        if !self.admit_book_append_followup_mutation() {
+            return Err("本への追加を取り消しています".to_owned());
+        }
         let db = self.spread_db.as_ref().map_err(Clone::clone)?;
         db.set_singleton_spread_endpoint_preferences(
             &key.exact,
@@ -37980,6 +37992,10 @@ impl App {
             let key = self
                 .spread_container_key_with_fallback()
                 .ok_or_else(|| "no current spread container".to_owned())?;
+            self.spread_db.as_ref().map_err(Clone::clone)?;
+            if !self.admit_book_append_followup_mutation() {
+                return Err("本への追加を取り消しています".to_owned());
+            }
             let db = self.spread_db.as_ref().map_err(Clone::clone)?;
             db.set_page_alone_preferences(&key.exact, key.fallback.as_deref(), preferences)
                 .map_err(|error| error.to_string())

@@ -27,7 +27,7 @@ pub struct BookPageEntry {
     pub display_name: String,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct BookAppendSummary {
     pub book_name: String,
     pub folder: PathBuf,
@@ -36,6 +36,8 @@ pub struct BookAppendSummary {
     pub edit_copies: Vec<BookPathMapping>,
     pub semantic_copies: Vec<BookPathMapping>,
     pub erase_fallback_pages: usize,
+    pub(crate) undo_files: Option<crate::book_append_undo::AppendFilesReceipt>,
+    pub(crate) metadata_copy: crate::book_append_undo::BookAppendMetadataCopySummary,
 }
 
 #[derive(Clone, Debug)]
@@ -67,7 +69,15 @@ pub struct BookTransferSummary {
 
 #[derive(Debug)]
 pub enum BookOpResult {
+    AppendFilesWritten(BookAppendSummary),
     Append(BookAppendSummary),
+    AppendRefreshPrepared {
+        summary: BookAppendSummary,
+        scan: crate::app::folder_scan::ScannedDir,
+        composition: crate::book_append_undo::BookCompositionStamp,
+        request: crate::app::book_append_refresh::BookAppendRefresh,
+    },
+    UndoAppend(crate::book_append_undo::BookAppendUndoResult),
     Transfer(BookTransferSummary),
     List(Vec<BookInfo>),
     Created {
@@ -207,6 +217,7 @@ pub struct BookOpPending {
 
 /// The physical operation owned by a pending book worker. A delete retains its
 /// exact requested root until the success result supplies the removed path.
+#[derive(Clone)]
 pub enum BookOpIntent {
     Unrelated,
     /// A manager refresh can also carry one read-only, cancelable grid-navigation request.
@@ -217,11 +228,24 @@ pub enum BookOpIntent {
     Delete {
         path: PathBuf,
     },
+    Append {
+        operation_id: u64,
+        source_context: crate::app::ViewerContextId,
+        accepted_revision: u64,
+        target_folder: PathBuf,
+        observations: crate::book_append_undo::AppendObservations,
+    },
+    UndoAppend {
+        receipt: crate::book_append_undo::BookAppendUndoReceipt,
+    },
 }
 
 impl BookOpIntent {
     pub fn blocks_rename_migration(&self) -> bool {
-        matches!(self, Self::SourceMutation | Self::Delete { .. })
+        matches!(
+            self,
+            Self::SourceMutation | Self::Delete { .. } | Self::UndoAppend { .. }
+        )
     }
 }
 
@@ -794,6 +818,13 @@ pub(crate) fn append_pages_at_with_raw(
         .map_err(|e| format!("本フォルダを作成できません: {}: {e}", folder.display()))?;
     ensure_direct_book_target(&root, &folder)?;
 
+    let mut receipt_builder =
+        crate::book_append_undo::AppendReceiptBuilder::begin(&root, &folder, book_name.clone())
+            .map_err(|error| {
+                crate::logger::log(format!("[book-append-undo] initial receipt: {error}"))
+            })
+            .ok();
+
     let start = next_page_number(&folder)?;
     if start + sources.len() - 1 > MAX_BOOK_PAGES {
         return Err(format!(
@@ -830,6 +861,12 @@ pub(crate) fn append_pages_at_with_raw(
         if write_source(source, &dest, raw)? {
             erase_fallback_pages += 1;
         }
+        if let Some(builder) = receipt_builder.as_mut()
+            && let Err(error) = builder.record(&dest)
+        {
+            crate::logger::log(format!("[book-append-undo] output receipt: {error}"));
+            receipt_builder = None;
+        }
         if let Some(source_path) = byte_copy_source {
             restore_declines.record(&source_path, &dest);
         }
@@ -848,7 +885,15 @@ pub(crate) fn append_pages_at_with_raw(
         restore_declines.errors.len(),
     ));
 
-    Ok(BookOpResult::Append(BookAppendSummary {
+    let undo_files = receipt_builder.and_then(|builder| {
+        builder
+            .finish()
+            .map_err(|error| {
+                crate::logger::log(format!("[book-append-undo] file terminal receipt: {error}"))
+            })
+            .ok()
+    });
+    Ok(BookOpResult::AppendFilesWritten(BookAppendSummary {
         book_name,
         folder,
         added,
@@ -856,6 +901,8 @@ pub(crate) fn append_pages_at_with_raw(
         edit_copies,
         semantic_copies,
         erase_fallback_pages,
+        undo_files,
+        metadata_copy: Default::default(),
     }))
 }
 
@@ -2487,7 +2534,7 @@ mod tests {
             }],
         )
         .unwrap();
-        assert!(matches!(result, BookOpResult::Append(_)));
+        assert!(matches!(result, BookOpResult::AppendFilesWritten(_)));
         let pages = book_page_paths(&root.join("raw")).unwrap();
         assert_eq!(pages.len(), 1);
         assert_eq!(
@@ -3911,7 +3958,7 @@ mod tests {
         )
         .unwrap();
 
-        let BookOpResult::Append(summary) = result else {
+        let BookOpResult::AppendFilesWritten(summary) = result else {
             panic!("expected append result");
         };
         assert_eq!(

@@ -1410,6 +1410,7 @@ pub enum KeyAction {
     GlobalOpenFolder,
     ToggleDetachedViewerMode,
     ToggleAlwaysOnTop,
+    UndoLastAction,
     HelpShowContextShortcuts,
     GridFavoritePrev,
     GridFavoriteNext,
@@ -1975,6 +1976,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GlobalOpenFolder,
     KeyAction::ToggleDetachedViewerMode,
     KeyAction::ToggleAlwaysOnTop,
+    KeyAction::UndoLastAction,
     KeyAction::HelpShowContextShortcuts,
     KeyAction::GridFavoritePrev,
     KeyAction::GridFavoriteNext,
@@ -3972,6 +3974,7 @@ impl KeyAction {
             GlobalOpenFolder => "GlobalOpenFolder",
             ToggleDetachedViewerMode => "ToggleDetachedViewerMode",
             ToggleAlwaysOnTop => "ToggleAlwaysOnTop",
+            UndoLastAction => "UndoLastAction",
             HelpShowContextShortcuts => "HelpShowContextShortcuts",
             GridOpenCurrentDriveRoot => "GridOpenCurrentDriveRoot",
             GridFavoritePrev => "GridFavoritePrev",
@@ -4694,6 +4697,7 @@ impl KeyAction {
             GlobalOpenFolder => "フォルダを開くダイアログを表示する",
             ToggleDetachedViewerMode => "画像・動画ビューアの別ウィンドウモードを切り替える",
             ToggleAlwaysOnTop => "常に最前面を切り替える",
+            UndoLastAction => "直前の操作を元に戻す",
             HelpShowContextShortcuts => "現在のコンテキストで使えるショートカット一覧を表示する",
             GridFavoritePrev => "前のお気に入りへ移動する",
             GridFavoriteNext => "次のお気に入りへ移動する",
@@ -5252,6 +5256,7 @@ impl KeyAction {
             | GlobalOpenFolder
             | ToggleDetachedViewerMode
             | ToggleAlwaysOnTop
+            | UndoLastAction
             | HelpShowContextShortcuts => KeyContext::Global,
             GridFavoritePrev
             | GridFavoriteNext
@@ -5756,6 +5761,7 @@ impl KeyAction {
             | GlobalOpenFolder
             | ToggleDetachedViewerMode
             | ToggleAlwaysOnTop
+            | UndoLastAction
             | HelpShowContextShortcuts
             | GridFavoritePrev
             | GridFavoriteNext
@@ -6300,6 +6306,7 @@ impl KeyAction {
             GlobalOpenFolder => ChordList::one(Chord::ctrl(O)),
             ToggleDetachedViewerMode => ChordList::one(Chord::key(F12)),
             ToggleAlwaysOnTop => ChordList::EMPTY,
+            UndoLastAction => ChordList::one(Chord::ctrl(Z)),
             HelpShowContextShortcuts => ChordList::one(Chord::shift(Slash)),
             GridFavoritePrev
             | GridFavoriteNext
@@ -9736,6 +9743,46 @@ mod tests {
     }
 
     #[test]
+    fn last_action_undo_keeps_redo_and_editor_input_priority() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::lock_test_input();
+        #[cfg(windows)]
+        let _clear = ClearTestKeyFrame;
+        let keymap = Keymap::empty();
+        let ctx = egui::Context::default();
+        begin_key_pass(
+            &ctx,
+            egui::Key::Z,
+            egui::Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            },
+        );
+        assert!(keymap.consume_fixed_chord(&ctx, Chord::ctrl_shift(KeyName::Z)));
+        assert!(!keymap.consume_action(&ctx, KeyAction::UndoLastAction));
+        let _ = ctx.end_pass();
+
+        for editor in [
+            KeyAction::EraseUndo,
+            KeyAction::ConcealUndo,
+            KeyAction::TextUndo,
+        ] {
+            let ctx = egui::Context::default();
+            begin_key_pass(&ctx, egui::Key::Z, egui::Modifiers::CTRL);
+            assert!(keymap.consume_action(&ctx, editor));
+            assert!(!keymap.consume_action(&ctx, KeyAction::UndoLastAction));
+            let _ = ctx.end_pass();
+        }
+        let rebound = Keymap::from_ini_str("[Global]\nUndoLastAction = F16\n");
+        let ctx = egui::Context::default();
+        begin_key_pass(&ctx, egui::Key::F16, egui::Modifiers::NONE);
+        assert!(rebound.consume_action(&ctx, KeyAction::UndoLastAction));
+        assert!(!rebound.consume_action(&ctx, KeyAction::UndoLastAction));
+        let _ = ctx.end_pass();
+    }
+
+    #[test]
     fn mask_redo_ctrl_shift_z_is_consumed_before_undo() {
         #[cfg(windows)]
         let _serial = crate::key_input::lock_test_input();
@@ -10687,6 +10734,26 @@ mod tests {
                 Chord::ctrl_alt(KeyName::NumpadSubtract),
             ]
         );
+    }
+
+    #[test]
+    fn last_action_undo_is_registered_and_customizable() {
+        let action = KeyAction::UndoLastAction;
+        assert!(KeyAction::all().contains(&action));
+        assert_eq!(KeyAction::parse_ini_name(action.ini_name()), Some(action));
+        assert_eq!(action.context(), KeyContext::Global);
+        assert_eq!(action.trigger(), KeyTrigger::Press);
+        assert_eq!(
+            action.default_chords().iter().collect::<Vec<_>>(),
+            vec![Chord::ctrl(KeyName::Z)],
+        );
+        let rebound = Keymap::from_ini_str("[Global]\nUndoLastAction = F16\n");
+        assert_eq!(
+            rebound.effective_chords(action),
+            vec![Chord::key(KeyName::F16)]
+        );
+        let disabled = Keymap::from_ini_str("[Global]\nUndoLastAction = none\n");
+        assert!(disabled.effective_chords(action).is_empty());
     }
 
     #[test]

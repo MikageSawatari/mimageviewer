@@ -97,6 +97,15 @@ pub(crate) struct ScannedDir {
     pub(crate) auxiliary_media: AuxiliaryMediaCandidates,
 }
 
+impl std::fmt::Debug for ScannedDir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScannedDir")
+            .field("folders", &self.folders.len())
+            .field("media", &self.all_media.len())
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct AuxiliaryMediaCandidates {
     entries: Vec<ScannedMediaEntry>,

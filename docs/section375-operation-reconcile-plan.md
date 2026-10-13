@@ -1,7 +1,7 @@
 ﻿# §1.375 監視更新の準備結果と現在の表示を比較して再表示を省く
 
-2026-10-13、`next-list`、確認基点 `ae2772c8e`。
-**利用者の2026-10-13提案によるR5。独立設計レビュー提出用・表示採用の新方式は未実装**。
+2026-10-13、`next-list`、R6コード照合基点 `918a51309`（R5の基点は `ae2772c8e`）。
+**利用者の2026-10-13再レビューP2三件を反映したR6。独立設計レビュー提出用・表示採用の新方式は未実装**。
 正本項目: [next-release-backlog.md §1.375](next-release-backlog.md#1375-フォルダで-delete-キーで削除すると正しく消えた一覧がもう一度丸ごと読み直されてちらつく--利用者の実機報告-2026-10-12)。
 
 R3はACCEPTだったが、実装調査で初期表示と自動代表の採用証拠が対応しない前提不足を確認した。
@@ -22,65 +22,71 @@ Delete後の表示と、後続走査が準備した表示を比べる境界が�
 `a.jpg + a.png` のJPG優先表示からJPGを削除した場合、PNGを再表示する必要がある。
 したがって「自分のDeleteだから読み直さない」でも、raw走査の一致だけでも正しくない。
 
-新しい不変条件は **通常の走査・表示準備を済ませ、採用直前の現在表示と完全に同じ場合だけ
-一覧の入れ直しを省く**。自分の操作か外部操作かは判定条件にしない。
+新しい不変条件は **通常の走査・表示準備と全行比較を既存prepare ownerのworkerで済ませ、
+比較対象の表示世代／revisionが採用直前にも有効で、完全に同じ場合だけ一覧の入れ直しを省く**。
+自分の操作か外部操作かは判定条件にしない。
 一致しない／比較材料が足りない場合は従来の一覧採用へ流す。
 時間窓で通知を捨てず、準備結果が違う外部変更を取り込む。
 
-## 2. 利用者決定: 監視更新では表示中の代表画像を保つ
+## 2. 利用者決定: 監視更新では代表ファイルの選択を保つ
 
-**利用者決定 (2026-10-13)**: 削除・移動・内容変更などを監視で検知しても、既に表示した
-代表画像は保つ。`Ctrl+F5`（「最新の情報に更新」）で初めて自動代表を選び直す。
+**利用者決定／再レビュー訂正 (2026-10-13)**: 監視更新では既に採用した代表ファイルの
+選択キーだけを保つ。`Ctrl+F5`（「最新の情報に更新」）で自動代表を選び直す。
+ただし、選択したファイル自体が削除・移動等で存在しなくなった場合は、監視更新でも再選定する。
 画像の由来・選定依存・pin leaf・catalog revisionのprovenance照合は不要とする。
 
 この変更は代表画像の表示に限る。行の追加・削除、同名候補の再露出、並び・表示metadata、
-省略件数は通常どおり準備して反映する。代表の元画像が消えても、その代表行が残る間は
-今の絵を使う。元画像の通常行は消え、実ファイルを開く処理も最新のsourceを扱う。
+省略件数は通常どおり準備して反映する。画素を固定する仕様ではなく、同じ選択を既存cache／
+要求経路で表示する。選択先の内容変更やcache再生成で画素が変わることは許す。
+候補の追加・並べ替え・catalog変更だけでは別のファイルへ選び直さない。
 
 対象は物理一覧のFolder／ZIP／PDF／変換済み書庫等の代表サムネイルと、同じ一覧に出る
 動画・音声の表紙／補助画像、Stackの代表表示。動画の再生中フレームは固定しない。
 通常画像・ZIP内の画像・PDFページ本体の内容更新を代表保持の対象へ広げない。
-行自体がなくなればその成果物を解放し、新しい行には通常の初回要求を行う。
+行自体がなくなれば選択キーを解放し、新しい行には通常の初回要求を行う。
 
 手動pin設定／解除、編集プレビュー等の明示操作は既存の明示更新を維持する。
 監視イベントをその明示操作と誤分類しない。Ctrl+F5で手動pin設定を解除する仕様ではない。
-pin先が存在しない場合のfallbackも、明示更新時に既存規則で行う。
+pin先が存在しない場合は監視更新でも既存規則でfallbackするが、保存されたpin設定は解除しない。
 
 コード上の操作は既存 `KeyAction::GridReload`、メニュー「最新の情報に更新」と同じ境界へ配送する。
 現基点のGridReloadは既定キーなし、F5は★5である。ここでのCtrl+F5は利用者の呼称／割当を
 指し、固定rawキー判定や既定keymap変更を追加しない。F5をGridReloadへ割り当てた場合も同じ操作。
 
-### 2.1 保持する成果物と遅延要求
+### 2.1 選択キーと既存要求の寿命
 
-保持するのは選ばれたsourceの証拠ではなく、**実際に採用したthumbnail画素と表示状態**。
-既存 `ThumbnailState` の採用成果物とCPU画像／textureの所有へ組み込み、
-別のrepresentative pending owner、操作receipt、provenance mapは作らない。
-stable row keyで対応する生存行へ成果物を移す。pathだけではなく種類、archive prefix/page等を
-含む既存row identityを使い、別の行へ移植しない。
+保持する値は、既存の代表要求ownerが実際に採用したファイル／書庫内entry／PDFページを
+再要求できる選択キーだけ。選定理由・候補の依存関係・catalog proofは保持しない。
+生存行への対応はcontext・source・種類を含む論理行identityで行い、別の行へ移さない。
+別のrepresentative pending owner、操作receipt、provenance map、DB／disk journalは作らない。
 
-- Loadedを保持する行は同じtexture・画素・寸法・表示originを使う。監視更新から新しい代表要求を
-  起動しない。必要な行入れ直しでも、invalidateが採用成果物を捨てる前に同じownerで引き継ぐ。
-- GPUの画面外evictionは維持する。再表示に使える採用済みthumbnail成果物をその行に残し、
-  画面へ戻ったら同じ画素を再uploadする。変化したsource／共有catalogを読み直して
-  別の代表を選ぶ経路には戻さない。既存CPU画素または既存cache画像の成果物を共有し、
-  cache key／pathだけでなく実際に採用したimmutable画像を保持する。同じkeyのcacheが
-  後から書き換わっても、保持画素を新しいcache画像へ差し替えない。
-  元画像の全件保持、GPU texture全件常駐、provenance検証用I/Oは行わない。
-- 保持費用は、既に採用した代表行ごとにthumbnail解像度の成果物一つ。履歴分を追加しない。
-  同一行の監視更新を重ねても増えず、明示更新・行消失・source終了／context破棄で解放する。
-  新しい代表用DB／disk journalは作らない。GPU keep_rangeとupload予算は変えない。
-- 未要求のPendingはplaceholderを保持し、初めて表示範囲へ来たときの通常の遅延探索を許す。
-  要求中でまだ採用画像がない行も既存request ownerで完了させる。「既に表示した代表」の
-  再選定と、初回生成を混同しない。NoArt／Failedの既採用終端も監視では保持する。
-- idle upgrade／サイズ変更で、監視を契機に別の代表へ選び直さない。保持画素の表示倍率変更や
-  再uploadは許す。Ctrl+F5では保持成果物を解放し、既存要求ownerから最新の選定を再開する。
-  先着済みupgrade／cache検証結果も保持中の代表を別画素へ上書きしない。
-  既存ThumbnailRequestsのcancel／image破棄／終端規則を使い、要求の終了を偽装しない。
+- Loadedの既存textureは使える間そのまま使うが、画面外／trayのGPU・CPU evictionとcache予算を
+  変更しない。`evict_grid_thumbnail` のCPU解放も維持し、追加のthumbnail画素保持を行わない。
+  再表示は保持した選択キーを既存cache／source要求へ渡す。同じcacheの更新は許す。
+- idle upgrade・サイズ変更・cache missも同じ選択を使う。sourceの存在確認／読出しは既存workerで
+  行い、実ファイル／entry／ページの消失が確認された場合だけ通常の再選定へ戻す。
+  単なる読込失敗を消失と見なさない。UIに同期stat／decodeを追加しない。
+- 未要求Pendingと未選定の要求中は通常の初回選定を行い、採用された選択を同ownerへ残す。
+  NoArt／Failedを永久固定せず、画像なし終端と要求の寿命は既存規則を維持する。
+  先着結果は既存request ID／世代で採用・破棄し、終了を偽装しない。
+- Ctrl+F5は保持選択を更新し、既存要求ownerから最新選定へ進む。手動pin／編集の明示操作は
+  従来どおり反映する。行消失・source終了／context破棄でそのownerの選択を解放する。
+  キー保持は通知反復で増えず、CPU画素・GPU textureを一覧全件分常駐させない。
 
-`evict_grid_thumbnail` は現在CPU画素も消すため、Loadedのcloneだけでは最後まで保てない。
-この成果物の寿命変更も今回の独立レビュー対象であり、未実装。
-row内の採用値を保つ方式で、PC／Remote／catalog全体の代表選定を固定する旧§1.314のB1案は
-復活させない。Remote・他contextはそれぞれの既存source／表示ownerを使う。
+R5のimmutable採用画素保持・eviction寿命変更案は撤回する。PC／Remote／catalog全体の
+代表選定を固定する旧§1.314のB1案も復活させない。各contextは既存のsource／表示ownerを使う。
+
+### 2.2 Stackの論理行identity
+
+Stackの保持対応キーは **source／context + Stackグループkey + Stack種別** とする。
+`GridItem::Stack { key, representative, count }` の `key` を使い、サブ展開では既存の
+親フォルダscope付きgroup keyを使う。代表pathやmember件数はidentityへ含めず、表示値として比較する。
+`src/grid_item.rs::perf_key` のStackは `stack::<representative path>` であり、代表path由来の
+`ItemId` とともに、この保持対応キーには使わない。計装／要求用identityの用途と分離する。
+
+同グループの代表を削除して2枚以上残ればStackは同じ論理行として存続し、消失例外で代表を再選定する。
+一方、1枚になれば `StackView::materialize_aggregated` は通常Imageを作るため、旧Stackの選択は
+引き継がない。Imageの通常要求へ戻る。同名keyの別source／兄弟contextへも保持選択を移さない。
 
 ## 3. 通知から走査・準備・比較・採用まで
 
@@ -106,17 +112,17 @@ startup-diagnosticsのPhase B保留を今回の計画だけで完了扱いにし
 ### 3.2 比較する表示投影
 
 hashだけの一致やGPU pixelの全件readbackで判定しない。
-prepared resultと現在の採用値から、以下の表示値をexactに比較する。
-textureそのものは2節で引き継いだ同一成果物を使うので、sourceのprovenance／全件decodeは不要。
+既存prepare ownerのworkerが、prepared resultと捕捉した採用表示投影の以下の値をexactに比較する。
+GPU texture／CPU画素そのものを比較せず、代表選択と表示状態を使う。provenance／全件decodeは不要。
 比較はviewport内のセルだけに限らず、一覧の全行と投影結果を対象にする。
 画面外の行・順序が変わる結果を、今見える部分が同じという理由で省かない。
 
 | 比較対象 | 一致に必要な値 |
 | --- | --- |
-| 行と表示投影 | stable row key・種類・表示名、同名候補の除去、画像本判定、Stack member構成・件数、facet／ratingによる可視性 |
+| 行と表示投影 | context／sourceを含む論理行key・種類・表示名、同名候補の除去、画像本判定、Stackグループkeyとmember構成・件数、facet／ratingによる可視性 |
 | 並び・表示layout | 実際の行順、sort条件／方向、採用済みsort metadata、画像比率等の一覧layoutに使う値 |
 | 表示metadata | 更新日時・size・rating・tag／badge・pin表示など、画面／tooltipへ使う採用値。source stampだけで代用しない |
-| 代表画像の状態 | 保持したLoaded成果物・寸法・origin、Pending／NoArt／Failed等の表示状態。GPU非常駐でも同じ保持成果物として比較 |
+| 代表画像の状態 | 採用した選択キー・寸法・layoutに影響する値、Pending／Loaded／NoArt／Failed等の表示状態。通常のcache／内容更新で再要求が必要なら差分にする。GPU常駐有無を画素固定の証拠にしない |
 | 通常画像等の内容更新 | Content通知で更新が必要な通常画像／ページは既存のthumbnail更新状態をprepared結果に含める。秒stampが同じでも古いLoadedとの一致にせず、既存cache失効／source要求へ配送し、同じcoarse cacheの読戻しで内容更新を落とさない |
 | 一覧の件数表示 | 表示／総件数、省略chipとその内訳など、利用者に出す値。OS system件数だけの内部差分と表示差分を区別 |
 
@@ -126,20 +132,23 @@ textureそのものは2節で引き継いだ同一成果物を使うので、sou
 
 §1.314の実Folder mtime-onlyでは、観測値だけを進め、表示metadata・sort・代表要求stampは
 旧採用値を準備結果へ使う。この例外を通常ファイル・ZIP/PDF本体へ広げない。
-代表成果物の保持は2節の別の利用者決定であり、ファイルのsize／mtimeの表示更新を省かない。
+代表選択の保持は2節の別の利用者決定であり、ファイルのsize／mtimeの表示更新を省かない。
 
-### 3.3 採用直前の比較と結果
+### 3.3 worker比較と採用直前の有効性確認
 
-結果は元のcontext・source・items generation・設定／metadata条件が有効な場合だけ採用する。
-worker開始時の旧画面ではなく、**採用直前の現在表示**と比べる。
-その間のDelete成功行除去、選択変更、thumbnail初回採用も現在の採用値を使う。
-準備条件が変わった結果は既存stale拒否／再準備へ戻し、dirtyを照合済みにしない。
+UIには **同一／差分の判定と、差分の場合だけprepared採用結果** を返す。
+全行の比較・比較用投影の組立て・hash計算・一覧cloneをUI poll／採用直前に置かない。
+UIは元context・source・items generation・設定条件と、捕捉した表示投影revisionの有効性だけを確認する。
+worker比較中にDelete成功行除去、sort／facet／metadata、thumbnail初回採用・寸法・選択先などの
+比較値が変われば、旧表示に対する「同一」も「差分」も既存stale拒否／再準備へ戻す。
+拒否結果のdirty／cutoffは照合済みにしない。選択／check／scrollは比較値へ含めず、差分採用時に
+その時点の状態を既存ownerで復元する。古いworker snapshotで利用者の操作を戻さない。
 
 - 完全一致: 観測signature／親mtime／取り込んだ通知cutoffだけを同じownerで進める。
   items／世代／texture／表示metadata／sort／選択／check／scroll／AI・PDF保持画像を触らない。
   同じ結果を再準備しても再表示0回。
 - 一つでも表示値が違う／不明: prepared resultを既存一覧採用へ一回渡す。
-  行入れ直しのときも、生存する代表行の成果物を2節の契約で引き継ぐ。
+  行入れ直しのときも、生存する代表行の選択キーを2節の契約で引き継ぐ。
   必要な更新をした後、後続の同じ準備結果は新しい現在表示と一致し再表示を省く。
 - 準備失敗・cancel・context不一致: 元表示を維持し、未照合dirtyは既存ownerに残す。
   空一覧を成功結果と偽らず、兄弟contextの購読・結果・ackを変更しない。
@@ -147,6 +156,28 @@ worker開始時の旧画面ではなく、**採用直前の現在表示**と比�
 
 新しいcomparison pending／二つ目の表示owner／初回専用installを作らない。
 選択やscrollは準備結果が書き換える表示内容ではなく、既存採用ownerの復元対象とする。
+
+### 3.4 コード照合と必要な共有投影の基盤
+
+`918a51309` の現状とR6の実装前提を区別する。以下の基盤は新方式に必要だが、今回未実装。
+
+| 現コードの境界 | R6で既存owner内に必要な変更 |
+| --- | --- |
+| `ExternalRescanPending` はcontext・items_generation・scan_options・cancel・restartを持ち、workerはScannedDir／signatureのみ返す | 同じrescan／prepare ownerで走査→表示準備→比較まで行い、typed結果を同一／差分にする。別のcomparison pending／worker ownerは足さない |
+| `App::prepare_scanned_folder_listing[_with_cache_keys]` は `&mut self` からmaterialize／DB read等を行い、PreparedScannedFolderListing.itemsとApp.itemsはVec | workerで使う設定・DB reader・分類／materializeをこの既存準備境界へ分離する。現関数が既に全準備workerであるとは扱わない。既存Stack／sidecar／page-edit準備の終端と合流してから比較する |
+| `page_identity_index: Arc<PreparedPageIdentityIndex>`、StackView／SubfolderExpansionSnapshotは共有immutable値を持つが、全表示値を覆うsnapshotはない | 採用する行順・metadata・件数・代表選択のimmutable表示投影を準備workerで生成し、元ViewerContextBundle／既存一覧ownerに保持する。要求時はArc等の参照を安価に渡す。items全件のcloneでsnapshotを作らない |
+| `items_generation` と `page_edit_revision`、PAGE_EDIT_WRITESのWriteStamp、rating_session_write_generation、Stack request sequence／設定照合がある | 既存の世代・revision／write stampを比較要求と結果の受理条件に使う。items_generationだけでは世代内thumbnail採用やmetadata変化を捕捉できないため、採用投影の参照identityも同ownerで更新し、有効性を照合する |
+
+immutable投影は一覧全体の複製をUIで作るための別ownerではない。workerが作った採用値をそのまま
+共有し、UIの単一行採用・除去等は変更した行／ブロックだけを更新し、未変更部分を共有する。
+root参照identityをrevisionとして使い、全件cloneを伴う `Arc::make_mut(Vec)` や
+毎フレームの全行snapshot再構築を行わない。この部分共有の基盤も現コードにあるとは主張しない。
+その基盤が揃わなければ「UIで比較する」「UIで全件cloneする」形で接続せず、実装前提不足として止める。
+thumbnail画素やegui textureを投影に保持・workerへ移す必要はない。
+
+簡素化としてDeleteの既存modalと既存再予約を維持する。比較中の全一覧操作を新たにmodalで止める
+方法は、通常の監視更新で入力を制限するため採用しない。既存の世代／revisionによる拒否と通常再準備を
+用い、rollback・時間窓・operation自己ID・provenance・専用のcompletion待ちを追加しない。
 
 ## 4. 購読・context・通知契約の維持
 
@@ -164,7 +195,7 @@ OS登録／初期scanは既存のsource準備worker内で、購読開始後にsc
 | --- | --- |
 | park／mount | 元bundleに購読・dirtyを残す。park中の通知も元identityへ記録し、再mountで走査・準備する |
 | scan中の切替／世代変更 | 元ownerの結果を新contextへ採用しない。拒否した結果のcutoffはackしない |
-| source終了／context破棄 | 元購読・worker・保持代表を解放。兄弟のdirty・代表・requestを触らない |
+| source終了／context破棄 | 元購読・worker・保持選択と共有投影を解放。兄弟のdirty・代表・requestを触らない |
 | 走査中の次通知 | restart予約とcutoff後のdirtyを残す。次の入力／新通知なしでも通常の再準備へ進む |
 | coverage不明／watch error | mtimeふるいだけで無変更としない。通常の全走査・準備へ渡し、既定のログ・通知で扱う |
 
@@ -175,12 +206,12 @@ Nameのold/new、Content、typed directory、Unknownを有界に集約し、採�
 | kind／対象 | 走査・準備と表示の扱い |
 | --- | --- |
 | Create／Remove／Modify(Name) | Namespace。全行投影を準備し現在表示と比較。Nameを一律Contentにしない |
-| ファイルModify(Data/Metadata/Any) | 内容・属性変更を否定しない。通常画像等を既存更新へ渡す。代表画像だけは2節の仕様で保持する |
+| ファイルModify(Data/Metadata/Any) | 内容・属性変更を否定しない。通常画像等を既存更新へ渡す。代表選択は2節の仕様で保持し、選択先の内容更新は既存cache／要求経路で反映する |
 | 確定した実directoryのmtime-only | §1.314を維持し観測stampだけ進める。Deleteと混在しても親の表示値へmtimeを漏らさない |
 | path不明／型不明／Other／watch error／overflow | Unknown。全走査・準備し、材料不足なら通常採用。raw一致を理由に更新を落とさない |
 | Access | 既存どおり一覧mutation対象外 |
 
-Unknownでも2節の代表保持は守る。Unknownを「準備不要」にする仕様ではない。
+Unknownでも2節の代表選択保持と消失例外は守る。Unknownを「準備不要」にする仕様ではない。
 通知を自己由来と認定しないので、外部Bの上書きや外部Cの追加がDeleteと同batchでも通常準備される。
 
 ## 5. 同型経路と今回の範囲
@@ -211,12 +242,12 @@ ScannedDirのraw／prepared payload、関連fixtureのfieldも外す。
 音声inventory、表示用省略件数は維持する。製品へ接続済みのwatcherを削除する変更ではない。
 
 旧部品の17件成功は旧方式の記録で、新方針の受入証拠に流用しない。
-本turnでは未接続部品の撤去と設計・manualだけを変更し、比較／代表保持の新実装は行わない。
+R5で未接続部品を撤去済み。R6は設計・manualだけを変更し、比較／代表選択保持の新実装は行わない。
 
 ## 6. 実装と独立レビューの受入条件
 
 実装予定範囲はappのexternal rescan要求／準備／採用、folder_scanの既存表示準備、
-ViewerContextBundleの購読所有、thumbnail採用成果物／eviction／明示refresh、
+ViewerContextBundleの購読所有と共有表示投影、thumbnail代表選択キー／明示refresh、
 実Delete handlerとその回帰。新source provenance／cache proof DB／operation receiptは範囲外。
 共有ファイルは一人のwriterが所有する。display-pipeline、thumbnail-request-lifecycle、
 ui-responsiveness、architectureも実装時に該当契約を同時更新する。
@@ -229,21 +260,42 @@ ui-responsiveness、architectureも実装時に該当契約を同時更新する
   sort・badge・省略chipの表示差分: 通常採用が必要であり、raw一致だけで省かない。
 - Deleteと残存Bの内容上書き／外部C追加が同batch。ファイルmtimeが同秒・size同じでも
   Content／Unknownを通常prepareへ渡し、通常画像の更新を落とさない。
-- 代表の元画像削除・移動・上書き、pin先消失／cascade変更: watcherでは旧成果物を保持し、
-  明示GridReloadでは最新選定／既存pin fallback。GPU evict→再表示でも旧画素を使う。
+- 選択先が存在する候補追加／並べ替え／cascade変更: watcherでは同じ選択キーを保持し、
+  明示GridReloadで最新選定。選択先上書き・cache miss／再生成・GPU／CPU evict→再表示は
+  同じ選択を既存要求へ渡し、古い画素保持を要求しない。
+- 代表の選択先削除／移動・pin先消失: watcherでも消失例外で再選定／既存fallback。
+  pin設定は解除せず、通常の内容更新・読込失敗を消失として扱わない。
+- Stack代表削除後に2枚残る場合と1枚残る場合を対で検証。前者はsource／context＋group keyで
+  同じStackに対応して消失例外の再選定、後者はImage化し旧Stack選択を引き継がない。
+  代表path由来perf_key／ItemIdが変わる対照と、同名group keyの別source／兄弟contextも含む。
 - 行が変わるwatch full install、NoArt／Failed、初回Pending／要求中、idle upgrade、
   サイズ変更、手動pin／編集の対照。初期全Folder探索0回、GPU keep_range／upload予算不変、
-  保持成果物は同じ行への通知反復で増えず、明示更新／dropで解放。
+  選択キーは同じ行への通知反復で増えず、明示更新／dropで解放。CPU／GPU evictionと
+  ThumbnailRequestsの保存／画像両終端・取消規則は不変。
 - §1.314の子.partによるmtime-onlyとDelete混在で親の追加install0回。表示日時・sort・
   代表要求stamp不変。ZIP/PDF／普通fileのmetadata変化をこの例外へ広げない。
 - 同folderのA/B、A→B→A、park中内容上書き、先着結果／cutoff後通知、cancel／close／
   subscription再作成。Aの一致判定でBのdirty・代表・要求を消さない。
-- 比較直前に現在表示が変わるhandler回帰。worker開始時の旧表示との一致だけで省かない。
+- worker比較中と採用直前の表示世代／revision変更のhandler回帰。Delete・sort／facet／metadata・
+  thumbnail初回採用／寸法変更で同一／差分の両結果を拒否し、dirtyを残して通常再準備する。
+  UI全行比較／全件cloneが0回であること、選択／check／scrollを旧snapshotで戻さないことも確認する。
   GridReloadのAction／メニュー／割当キーが同じ明示更新へ届くことを確認する。
 
-**ここで止め、R5の独立設計レビュー後に新方式の実装へ進む。**
+大量一覧の性能検証予定:
+
+- 1万／10万行のsynthetic prepared投影で同一、末尾1行差分、全行差分、比較中revision変更を測定する。
+  画面外差分も検出し、全行exact比較の仕事量がworker側にあることを確認する。
+- UI enqueue／poll／有効性確認の時間・最大frame時間、workerのscan／prepare／compare時間、
+  比較回数・再準備回数・install回数、snapshot共有／変更部分の割当量、CPU画像／GPU使用量を記録する。
+  同一時のUI時間が行数比例で増えないこと、UI全件clone／snapshot再構築0回を受入条件とする。
+- 既存の大規模一覧perfイベントと同じ行数／cold・warm条件で前後比較し、入力応答・scroll、
+  eviction後の再要求・idle／trayのCPU、keep_range／upload予算が退行しないことを確認する。
+  headless／fake-inputを先に行い、アプリ計測は具体的suiteの利用者承認を得た別の検証枠で行う。
+  今回は計測・試験を実行せず、R5の撤去検証をこの受入証拠へ流用しない。
+
+**ここで止め、R6の独立設計レビュー後に新方式の実装へ進む。**
 まれな失敗は割り切り (ログ + 通知 [+ 作り直し])。新しいretry／rollback／回復journalは作らない。
-今回の新方式の回帰追加0件。アプリ起動・コミットはしない。
+今回の新方式の実装・回帰追加0件。R6では文書検証だけを行い、ビルド・テスト実行・アプリ起動・コミットはしない。
 
 ### 6.1 未接続部品撤去の検証記録 (2026-10-13)
 
@@ -265,3 +317,11 @@ ui-responsiveness、architectureも実装時に該当契約を同時更新する
 [通常core check](../target/section1375-r5-cleanup/core-check.log)、
 [portable core check](../target/section1375-r5-cleanup/portable-check.log)。
 これらを新しい表示比較・代表保持方式の受入証拠とは扱わない。
+
+### 6.2 R6文書改訂の検証記録 (2026-10-13)
+
+- 指定4文書のUTF-8 strict decodeと、manual 2ファイルのHTMLParser解析が成功。
+- 指定4文書の `git diff --check` が成功。
+- コードは読取り照合のみ。新方式の実装・回帰追加・ビルド・テスト実行・性能計測・
+  アプリ起動・コミットは0件。§6.1はR5撤去時の履歴であり、R6の実行結果ではない。
+- R6の独立設計レビューと、§3.4の共有投影基盤・worker準備分離の実装は未実施。

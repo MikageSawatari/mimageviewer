@@ -595,6 +595,10 @@ mod test_script_support;
 pub(crate) use subfolder_expansion::{
     SUBFOLDER_EXPANSION_FILTER_KINDS, SubfolderExpansionDepthChoice, SubfolderExpansionScanFilter,
 };
+#[cfg(test)]
+mod book_append_producer_tests;
+pub(crate) mod book_append_refresh;
+mod book_append_undo;
 mod startup_list_restore;
 pub(crate) mod top_level_grid_view;
 pub(crate) use startup_list_restore::StartupListIntent;
@@ -1292,6 +1296,7 @@ pub(crate) type MainListHydration = Option<(sidecar_restore::SidecarLoadContinua
 /// installer. Cache deletion cannot turn a prepared success into a late install refusal.
 pub(crate) struct PreparedVisibleInstall {
     display_epub_source: Option<crate::pdf_loader::LeasedEpubPath>,
+    book_append_refresh: Option<book_append_refresh::BookAppendRefresh>,
 }
 
 impl FolderNavHistoryTarget {
@@ -1723,6 +1728,7 @@ enum VisibleSelectionPolicy {
 pub(crate) enum FsMetadataBoundary {
     Manual,
     RatingMembership,
+    BookAppend(crate::book_append_undo::AppendOperation),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -12256,6 +12262,7 @@ pub(crate) enum ActionSurface {
 /// 結果は**要求を出した viewer context** へ戻す。走査中に別のフォルダーへ移っていたら
 /// 捨てる (`folder` の一致で判定する)。
 pub(crate) struct ExternalRescanPending {
+    pub(crate) cause: book_append_refresh::FolderRefreshCause,
     pub(crate) owner_context_id: ViewerContextId,
     pub(crate) folder: PathBuf,
     pub(crate) mtime: std::time::SystemTime,
@@ -12266,8 +12273,13 @@ pub(crate) struct ExternalRescanPending {
     /// 走査の条件。隠しファイル表示などを変えて読み直したら、古い条件の結果は捨てる。
     pub(crate) scan_options: ExternalRescanOptions,
     pub(crate) cancel: Arc<AtomicBool>,
-    pub(crate) rx:
-        mpsc::Receiver<Option<(folder_scan::ScannedDir, folder_scan::FolderScanSignature)>>,
+    pub(crate) rx: mpsc::Receiver<
+        Option<(
+            folder_scan::ScannedDir,
+            folder_scan::FolderScanSignature,
+            book_append_refresh::FolderRefreshCause,
+        )>,
+    >,
     /// 走査中に届いた次の変更。**通知を捨てず、完了後にもう一度走らせる。**
     ///
     /// 「いま走っているから要らない」と扱うと、走査が stamp を読んだ後の上書きを
@@ -15828,6 +15840,9 @@ pub struct App {
     pub(crate) capture_region_selection: Option<crate::ui_fullscreen::CaptureRegionSelection>,
     /// 製本のページ追加 / 作成 / 改名 / 削除 / 一覧更新 worker 完了待ち。
     pub(crate) book_op_pending: Option<crate::books::BookOpPending>,
+    pub(crate) book_append_undo_receipt: Option<crate::book_append_undo::BookAppendUndoReceipt>,
+    pub(crate) book_append_undo_revision: u64,
+    book_append_operation_sequence: u64,
     /// 進行中の Append 元に、ファイルへ未焼き込みの編集が含まれるか。
     /// Append 成功後の警告トーストを 1 回に集約するため、単一 book worker と同じ寿命で保持する。
     pub(crate) show_book_manager: bool,
@@ -15863,7 +15878,7 @@ pub struct App {
     pub(crate) export_pending: Option<crate::export_dialog::ExportPending>,
     /// 現在表示中の実フォルダを、メイン viewer が閉じた後に再読み込みする対象。
     /// Ctrl+E 完了と、viewer 中に届いた監視由来の再走査が同じ先送りを使う。
-    pub(crate) folder_refresh_pending: Option<PathBuf>,
+    pub(crate) folder_refresh_pending: Option<book_append_refresh::FolderRefreshRequest>,
     /// X / C 比較ビューのピン留めスロット。CPU pixels を正とし、右下 indicator texture
     /// だけを派生物として保持する。本文は準備済み比較 pair から描画する。
     pub(crate) pinned_compare_slot: Option<PinnedCompareSlot>,
@@ -19790,6 +19805,9 @@ impl App {
             capture_pending: None,
             capture_region_selection: None,
             book_op_pending: None,
+            book_append_undo_receipt: None,
+            book_append_undo_revision: 0,
+            book_append_operation_sequence: 0,
             show_book_manager: false,
             book_manager_new_name: String::new(),
             book_manager_rename_name: String::new(),
@@ -22108,6 +22126,7 @@ impl App {
             };
         }
         first![
+            self.book_append_undo_in_progress() => "book_append_undo",
             self.capture_selection_open() => "clipboard_capture_selection",
             self.sidecar_restore_active() => "sidecar_restore",
             self.remote_session_blocks_local_control() => "remote_session",
@@ -23704,7 +23723,7 @@ impl App {
         items: &[GridItem],
         logical_source: Option<&Path>,
     ) -> Result<PreparedVisibleInstall, OpenAdmissionRefusal> {
-        if self.sidecar_restore_active() {
+        if self.sidecar_restore_active() || self.book_append_undo_in_progress() {
             return Err(OpenAdmissionRefusal::DocumentOpenBusy);
         }
         let logical = logical_source.unwrap_or(source_path);
@@ -23714,6 +23733,7 @@ impl App {
         } else { None };
         Ok(PreparedVisibleInstall {
             display_epub_source,
+            book_append_refresh: None,
         })
     }
 
@@ -25177,6 +25197,9 @@ impl App {
         let Some(folder) = self.current_folder.clone() else {
             return;
         };
+        if self.defer_book_append_observation(&folder, self.edit_request_owner_context()) {
+            return;
+        }
         let Ok(meta) = folder.metadata() else {
             return;
         };
@@ -25212,6 +25235,24 @@ impl App {
         folder: PathBuf,
         new_mtime: std::time::SystemTime,
     ) {
+        self.start_external_rescan_with_cause(
+            ctx,
+            folder,
+            new_mtime,
+            book_append_refresh::FolderRefreshCause::External,
+        );
+    }
+
+    fn start_external_rescan_with_cause(
+        &mut self,
+        ctx: &egui::Context,
+        folder: PathBuf,
+        new_mtime: std::time::SystemTime,
+        cause: book_append_refresh::FolderRefreshCause,
+    ) {
+        if self.defer_book_append_observation(&folder, self.edit_request_owner_context()) {
+            return;
+        }
         let scan_options = ExternalRescanOptions {
             file_type_visibility: self.settings.file_type_visibility.clone(),
             include_convertible_archives: !self
@@ -25220,11 +25261,14 @@ impl App {
             include_epub: !self.settings.epub_file_handling_ignores_epub(),
             show_hidden_files: self.settings.show_hidden_files,
         };
+        let request_owner = self.edit_request_owner_context();
         // 同じ要求が既に走っているなら、**通知を捨てずに再走査を予約する**。走査が stamp を
         // 読んだ後の上書きを取りこぼさないため (v3.5.0 レビュー R02)。
         if let Some(pending) = self.external_rescan_pending.as_mut()
             && crate::folder_tree::path_eq(&pending.folder, &folder)
             && pending.scan_options == scan_options
+            && pending.owner_context_id == request_owner
+            && !cause.is_append_delivery()
         {
             pending.restart_requested = true;
             return;
@@ -25246,6 +25290,7 @@ impl App {
         // 始めた時点で次の予約は無くなる。静止したグリッドでは、結果が最後のフレームの
         // poll に間に合わないと、次の入力まで取り込まれない (v3.5.0 レビュー N04)。
         let repaint = ctx.clone();
+        let worker_cause = cause.clone();
         let (tx, rx) = mpsc::channel();
         if std::thread::Builder::new()
             .name("external-folder-rescan".to_string())
@@ -25266,7 +25311,8 @@ impl App {
                 .ok()
                 .map(|scan| {
                     let signature = signature_from_scan(&scan);
-                    (scan, signature)
+                    let cause = worker_cause.verified_for_folder(&worker_folder);
+                    (scan, signature, cause)
                 });
                 // 送ってから起こす。起きたフレームの poll が必ず受け取れる順序。
                 let _ = tx.send(scan);
@@ -25277,6 +25323,7 @@ impl App {
             return;
         }
         self.external_rescan_pending = Some(ExternalRescanPending {
+            cause,
             owner_context_id: self.edit_request_owner_context(),
             folder,
             mtime: new_mtime,
@@ -25310,6 +25357,7 @@ impl App {
             return;
         };
         let ExternalRescanPending {
+            cause: requested_cause,
             owner_context_id,
             folder,
             mtime,
@@ -25318,6 +25366,12 @@ impl App {
             restart_requested,
             ..
         } = pending;
+
+        if self.edit_request_owner_context() == owner_context_id
+            && self.defer_book_append_observation(&folder, owner_context_id)
+        {
+            return;
+        }
 
         // 走査中に届いていた変更は、結果を適用したかどうかに関係なくやり直す (R02)。
         let restart = |app: &mut Self, ctx: &egui::Context| {
@@ -25336,8 +25390,8 @@ impl App {
         // - 削除の最中: 削除結果の世代を壊す。要求側の判定だけでは非同期化で外れている (R03)。
         let dropped_reason = if self.edit_request_owner_context() != owner_context_id {
             Some("owner_not_projected")
-        } else if scan_options.file_type_visibility != self.settings.file_type_visibility {
-            Some("file_type_visibility_changed")
+        } else if scan_options != self.current_external_scan_options() {
+            Some("scan_options_changed")
         } else if self.items_generation != items_generation {
             Some("items_generation_changed")
         } else if self.delete_pending.is_some() {
@@ -25348,6 +25402,20 @@ impl App {
             None
         };
         if let Some(reason) = dropped_reason {
+            if matches!(
+                reason,
+                "delete_in_progress" | "items_generation_changed" | "scan_options_changed"
+            ) && requested_cause.is_append_delivery()
+                && self
+                    .current_folder
+                    .as_ref()
+                    .is_some_and(|current| crate::folder_tree::path_eq(current, &folder))
+            {
+                self.folder_refresh_pending = Some(book_append_refresh::FolderRefreshRequest {
+                    folder: folder.clone(),
+                    cause: book_append_refresh::FolderRefreshCause::BookAppendExternal,
+                });
+            }
             crate::logger::log(format!(
                 "external_rescan: dropped ({reason}) owner={owner_context_id:?} folder={}                  restart={restart_requested}",
                 folder.display()
@@ -25356,8 +25424,31 @@ impl App {
             return;
         }
         let _ = scan_options;
-        let (scan, signature) = scan.expect("checked above");
-        self.apply_external_rescan(folder.clone(), mtime, scan, signature);
+        let (scan, signature, mut cause) = scan.expect("checked above");
+        if matches!(
+            requested_cause,
+            book_append_refresh::FolderRefreshCause::BookAppendExternal
+        ) {
+            cause = book_append_refresh::FolderRefreshCause::BookAppendExternal;
+        }
+        if let book_append_refresh::FolderRefreshCause::BookAppend(receipt) = &requested_cause
+            && !self.book_append_operation_matches_receipt(receipt.operation())
+        {
+            if self.book_append_undo_in_progress() {
+                return;
+            }
+            cause = book_append_refresh::FolderRefreshCause::BookAppendExternal;
+        }
+        if matches!(
+            requested_cause,
+            book_append_refresh::FolderRefreshCause::BookAppend(_)
+        ) && !matches!(
+            cause,
+            book_append_refresh::FolderRefreshCause::BookAppend(_)
+        ) {
+            self.invalidate_book_append_undo();
+        }
+        self.apply_external_rescan_with_cause(folder.clone(), mtime, scan, signature, cause);
         restart(self, ctx);
     }
 
@@ -25369,6 +25460,26 @@ impl App {
         scan: folder_scan::ScannedDir,
         new_sig: folder_scan::FolderScanSignature,
     ) {
+        self.apply_external_rescan_with_cause(
+            folder,
+            new_mtime,
+            scan,
+            new_sig,
+            book_append_refresh::FolderRefreshCause::External,
+        );
+    }
+
+    fn apply_external_rescan_with_cause(
+        &mut self,
+        folder: PathBuf,
+        new_mtime: std::time::SystemTime,
+        scan: folder_scan::ScannedDir,
+        new_sig: folder_scan::FolderScanSignature,
+        cause: book_append_refresh::FolderRefreshCause,
+    ) {
+        if self.defer_book_append_observation(&folder, self.edit_request_owner_context()) {
+            return;
+        }
         // 走査中に別のフォルダーへ移っていたら捨てる。
         if !self
             .current_folder
@@ -25399,7 +25510,8 @@ impl App {
                 "auto-refresh: folder content changed while main viewer is open; deferring reload ({})",
                 folder.display()
             ));
-            self.folder_refresh_pending = Some(folder);
+            self.folder_refresh_pending =
+                Some(book_append_refresh::FolderRefreshRequest { folder, cause });
             return;
         }
         self.clear_retained_final_ai_cache(&format!(
@@ -25470,12 +25582,17 @@ impl App {
         if self.select_after_load.is_none() {
             self.select_after_load = selected_name;
         }
-        if !self.load_folder_with_scan_owned(
-            folder,
-            Some(scan),
-            owner,
-            crate::app::StartupListIntent::PreservePresentation,
-        ) {
+        let mut intent = self.current_list_refresh_intent();
+        if let StartupListIntent::RefreshList {
+            book_append_refresh,
+            ..
+        } = &mut intent
+        {
+            *book_append_refresh = cause
+                .operation()
+                .map(|operation| self.book_append_refresh_request(operation, folder.clone()));
+        }
+        if !self.load_folder_with_scan_owned(folder, Some(scan), owner, intent) {
             self.select_after_load = previous_hint;
         }
     }
@@ -25551,9 +25668,21 @@ impl App {
     }
 
     fn reload_current_physical_list(&mut self) {
+        let restore_intent = self.current_list_refresh_intent();
+        self.reload_current_physical_list_with_intent(restore_intent);
+    }
+
+    fn reload_current_physical_list_with_intent(&mut self, restore_intent: StartupListIntent) {
         let Some(folder) = self.current_folder.clone() else {
             return;
         };
+        if !restore_intent
+            .book_append_refresh()
+            .is_some_and(|refresh| self.book_append_refresh_is_current(refresh))
+            && !self.admit_book_append_followup_mutation()
+        {
+            return;
+        }
         if self.restore_smart_folder_for_synthetic_path(&folder) {
             return;
         }
@@ -25564,7 +25693,6 @@ impl App {
         self.preserve_cursor_hint_for_reload();
         let saved_override = self.archive_source_override.clone();
         let owner = self.current_folder_reload_owner(&folder);
-        let restore_intent = self.current_list_refresh_intent();
         let logical = saved_override.as_ref().unwrap_or(&folder).clone();
         if let Some(kind) = self.smart_physical_target_kind(&logical) {
             if self.smart_folder_busy() {
@@ -26306,7 +26434,13 @@ impl App {
         }
     }
 
-    pub(crate) fn persist_current_view_trim_book_state(&self) {
+    pub(crate) fn persist_current_view_trim_book_state(&mut self) {
+        if self.view_trim_db.is_none() || self.spread_container_key().is_none() {
+            return;
+        }
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         let (Some(db), Some(key)) = (&self.view_trim_db, self.spread_container_key()) else {
             return;
         };
@@ -26333,6 +26467,12 @@ impl App {
         idx: usize,
         page_override: crate::view_trim::ViewTrimPageOverride,
     ) {
+        if self.view_trim_db.is_none() || self.page_path_key(idx).is_none() {
+            return;
+        }
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         let (Some(db), Some(key)) = (&self.view_trim_db, self.page_path_key(idx)) else {
             return;
         };
@@ -26350,6 +26490,12 @@ impl App {
     }
 
     pub(crate) fn remove_view_trim_page_override(&mut self, idx: usize) {
+        if self.view_trim_db.is_none() || self.page_path_key(idx).is_none() {
+            return;
+        }
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         let (Some(db), Some(key)) = (&self.view_trim_db, self.page_path_key(idx)) else {
             return;
         };
@@ -27841,6 +27987,19 @@ impl App {
 
         restore_intent: crate::app::StartupListIntent,
     ) -> FolderOpenOutcome {
+        if restore_intent
+            .book_append_refresh()
+            .is_some_and(|refresh| !self.book_append_refresh_is_current(refresh))
+        {
+            return FolderOpenOutcome::Ignored;
+        }
+        if !restore_intent
+            .book_append_refresh()
+            .is_some_and(|refresh| self.book_append_refresh_is_current(refresh))
+            && !self.admit_book_append_followup_mutation()
+        {
+            return FolderOpenOutcome::Ignored;
+        }
         let path = crate::path_key::normalize_input_path(&path);
         if restore_intent.captures_list_departure() {
             self.capture_main_list_restore_cursor();
@@ -28626,7 +28785,12 @@ impl App {
             }
             if !detached_physical {
                 app.finish_direct_pdf_visible_adoption(&path, &owner);
-                app.install_admitted_physical_surface(&path, &owner, rating.as_ref());
+                app.install_admitted_physical_surface_with_book_append(
+                    &path,
+                    &owner,
+                    rating.as_ref(),
+                    prepared.restore_intent.book_append_refresh().cloned(),
+                );
                 if let OpenRequestOwner::Bookmark(owner) = &owner {
                     app.begin_bookmark_page_wait(owner);
                 }
@@ -29012,8 +29176,10 @@ impl App {
         &mut self,
         prepared: PreparedScannedFolderListing,
         authority: VisibleInstallAuthority<'_>,
-        prepared_visible: PreparedVisibleInstall,
+        mut prepared_visible: PreparedVisibleInstall,
     ) -> MainListHydration {
+        prepared_visible.book_append_refresh =
+            prepared.restore_intent.book_append_refresh().cloned();
         let detached_physical = self.navigation_scope.is_detached_physical();
         let PreparedScannedFolderListing {
             path,
@@ -34308,7 +34474,24 @@ impl App {
         owner: &OpenRequestOwner,
         rating: Option<&top_level_grid_view::RatingPhysicalRestore>,
     ) {
-        self.clear_meta_undo();
+        self.install_admitted_physical_surface_with_book_append(path, owner, rating, None);
+    }
+
+    fn install_admitted_physical_surface_with_book_append(
+        &mut self,
+        path: &Path,
+        owner: &OpenRequestOwner,
+        rating: Option<&top_level_grid_view::RatingPhysicalRestore>,
+        refresh: Option<book_append_refresh::BookAppendRefresh>,
+    ) {
+        if let Some(refresh) = refresh.filter(|refresh| {
+            self.book_append_refresh_is_current(refresh)
+                && crate::folder_tree::path_eq(path, &refresh.folder)
+        }) {
+            self.clear_meta_undo_preserving_book_append(refresh.operation);
+        } else {
+            self.clear_meta_undo();
+        }
         crate::zip_loader::clear_nested_cache();
         self.zip_nav = None;
         self.cancel_folder_pane_open(PaneOpenRestoreExit::Adopted);
@@ -38547,7 +38730,8 @@ impl App {
     }
 
     pub(crate) fn document_open_modal_admission_blocked(&self) -> bool {
-        self.capture_selection_open()
+        self.book_append_undo_in_progress()
+            || self.capture_selection_open()
             || self.epub_convert_pending_in_any_context()
             || self.pdf_password_request_pending_in_any_context()
             || self.smart_pdf_password_dialog_path().is_some()
@@ -39367,7 +39551,13 @@ impl App {
         };
         let PreparedVisibleInstall {
             display_epub_source,
+            book_append_refresh,
         } = prepared_visible;
+        let book_append_refresh =
+            book_append_refresh.filter(|refresh| self.book_append_refresh_is_current(refresh));
+        if book_append_refresh.is_none() {
+            self.invalidate_book_append_undo();
+        }
         let preserve_smart_folder_session = match &authority {
             VisibleInstallAuthority::Ordinary
             | VisibleInstallAuthority::Rating { .. }
@@ -39560,7 +39750,12 @@ impl App {
         let rating_inherited_view = (!detached_physical
             && matches!(&authority, VisibleInstallAuthority::Rating { .. }))
         .then(|| crate::settings::FavoriteViewState::from_settings(&self.settings));
-        self.change_main_context_for_visible_grid(false);
+        self.change_main_context_for_visible_grid_with_metadata_boundary(
+            false,
+            book_append_refresh
+                .map(|refresh| FsMetadataBoundary::BookAppend(refresh.operation))
+                .unwrap_or(FsMetadataBoundary::Manual),
+        );
         let previous_page_index = std::mem::take(&mut self.page_identity_index);
         self.retire_smart_folder_payloads([
             Box::new(previous_page_index) as smart_folder::RetiredSmartFolderPayload
@@ -42695,7 +42890,7 @@ impl App {
             return;
         };
         if crate::folder_tree::path_eq(parent, &cur) {
-            self.folder_refresh_pending = Some(cur);
+            self.folder_refresh_pending = Some(cur.into());
         }
     }
 
@@ -42703,8 +42898,11 @@ impl App {
     ///
     /// メイン viewer 中に `load_folder` すると表示が閉じてしまうため、呼び出し側は
     /// `viewer_session_blocks_main_window()` が false のときだけ実行する。
-    pub(crate) fn consume_folder_refresh_pending(&mut self) {
-        if self.sidecar_restore_active() {
+    pub(crate) fn consume_folder_refresh_pending(&mut self, ctx: &egui::Context) {
+        if self.sidecar_restore_active()
+            || self.delete_pending.is_some()
+            || self.book_append_undo_in_progress()
+        {
             return;
         }
         // .take() より先にガードを評価する。検索ビュー中やフォルダ未確定の状態で
@@ -42721,13 +42919,44 @@ impl App {
         {
             return;
         }
-        let Some(cur) = self.current_favorite_target() else {
+        let append = self
+            .folder_refresh_pending
+            .as_ref()
+            .is_some_and(|request| request.cause.is_append_delivery());
+        let Some(cur) = (if append || self.current_folder_is_book_folder() {
+            self.current_folder.clone()
+        } else {
+            self.current_favorite_target()
+        }) else {
             return;
         };
         let Some(target) = self.folder_refresh_pending.take() else {
             return;
         };
-        if crate::folder_tree::path_eq(&cur, &target) {
+        if crate::folder_tree::path_eq(&cur, &target.folder) {
+            if let book_append_refresh::FolderRefreshCause::BookAppend(receipt) = &target.cause {
+                let cause = if self.book_append_operation_is_live(receipt.operation()) {
+                    target.cause
+                } else {
+                    book_append_refresh::FolderRefreshCause::BookAppendExternal
+                };
+                self.start_external_rescan_with_cause(
+                    ctx,
+                    cur,
+                    std::time::SystemTime::UNIX_EPOCH,
+                    cause,
+                );
+                return;
+            }
+            if append || self.current_folder_is_book_folder() {
+                self.start_external_rescan_with_cause(
+                    ctx,
+                    cur,
+                    std::time::SystemTime::UNIX_EPOCH,
+                    target.cause,
+                );
+                return;
+            }
             crate::logger::log(format!(
                 "folder-refresh: reloading current folder after deferred change ({})",
                 cur.display()
@@ -44218,6 +44447,21 @@ impl App {
         removed: &[std::path::PathBuf],
         reason: &'static str,
     ) {
+        self.release_viewer_surfaces_for_removed_paths_with_metadata_boundary(
+            ctx,
+            removed,
+            reason,
+            FsMetadataBoundary::Manual,
+        );
+    }
+
+    fn release_viewer_surfaces_for_removed_paths_with_metadata_boundary(
+        &mut self,
+        ctx: &egui::Context,
+        removed: &[std::path::PathBuf],
+        reason: &'static str,
+        boundary: FsMetadataBoundary,
+    ) {
         if removed.is_empty() {
             return;
         }
@@ -44267,7 +44511,11 @@ impl App {
                     "[removed-path] close main fullscreen (playing/deferred media target) \
                      reason={reason} player={player_matches} deferred={deferred_media_matches}"
                 ));
-                self.close_fullscreen();
+                if matches!(boundary, FsMetadataBoundary::BookAppend(_)) {
+                    self.close_fullscreen_now_with_metadata_boundary(boundary);
+                } else {
+                    self.close_fullscreen();
+                }
             }
         }
 
@@ -44284,7 +44532,13 @@ impl App {
                 crate::logger::log(format!(
                     "[removed-path] close active detached reason={reason}"
                 ));
-                self.close_current_active_viewer_context(ctx);
+                if matches!(boundary, FsMetadataBoundary::BookAppend(_)) {
+                    self.take_and_close_current_active_viewer_context_with_metadata_boundary(
+                        ctx, reason, boundary,
+                    );
+                } else {
+                    self.close_current_active_viewer_context(ctx);
+                }
             }
 
             // passive / parked 窓 (parked-live メディア含む)。ctx 不要の close 経路
@@ -46796,6 +47050,9 @@ impl App {
         if !self.admit_rename_migration_source_change(ctx) {
             return;
         }
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.release_viewer_surfaces_for_removed_paths(ctx, &paths, "delete_target_path");
         // 削除中に items を差し替える恐れのある in-flight pending を停止。poll_delete_pending
         // は path で現 items に引き直すので世代一致は厳密には不要だが、余計な再描画・
@@ -47060,6 +47317,9 @@ impl App {
         // 出して return する。Worker 内で検証 → PowerShell 起動 → 完了待ち の順で
         // 動き、完了を `drop_copy_pending` 経由で `CopyOutcome` 付きで受け取り、
         // 失敗があればトーストで通知する (review #15)。
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         let n_total = paths.len();
         let (tx, rx) = std::sync::mpsc::channel::<crate::ui_dialogs::context_menu::CopyOutcome>();
         let dest_for_worker = dest.clone();
@@ -47650,6 +47910,9 @@ impl App {
             self.show_feedback_toast("この画像は本のブックマーク対象ではありません".to_string());
             return;
         };
+        if self.book_bookmark_service.is_some() && !self.admit_book_append_followup_mutation() {
+            return;
+        }
         let request_id = self.next_book_bookmark_request_id();
         let Some(service) = self.book_bookmark_service.as_ref() else {
             self.show_feedback_toast("ブックマークDBを利用できません".to_string());
@@ -47723,6 +47986,9 @@ impl App {
     }
 
     pub(crate) fn remove_book_bookmark(&mut self, id: i64) {
+        if self.book_bookmark_service.is_some() && !self.admit_book_append_followup_mutation() {
+            return;
+        }
         let request_id = self.next_book_bookmark_request_id();
         if self.book_bookmark_service.is_some() {
             self.invalidate_current_book_bookmark_edit(id);
@@ -47736,6 +48002,9 @@ impl App {
         let request_id = self.next_book_bookmark_request_id();
         if self.book_bookmark_service.is_none() {
             self.show_feedback_toast("ブックマークDBを利用できません".to_string());
+            return;
+        }
+        if !self.admit_book_append_followup_mutation() {
             return;
         }
         self.invalidate_current_book_bookmark_edit(id);
@@ -49613,26 +49882,37 @@ impl App {
             self.show_feedback_toast("追加するページがありません".to_string());
             return;
         }
+        if self.book_op_pending.is_some() {
+            self.show_feedback_toast("製本処理中です".into());
+            return;
+        }
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
+        self.book_append_operation_sequence =
+            self.book_append_operation_sequence.wrapping_add(1).max(1);
         let root = self.book_root_path();
+        let intent = crate::books::BookOpIntent::Append {
+            operation_id: self.book_append_operation_sequence,
+            source_context: self.projected_viewer_context_id(),
+            accepted_revision: self.book_append_undo_revision,
+            target_folder: crate::books::book_folder(&root, &book_name),
+            observations: Default::default(),
+        };
         let data_dir = crate::data_dir::get();
         let raw = crate::raw::RawDecodeContext::new(
             Arc::clone(&self.raw_develop_executor),
             self.settings.raw_brightness,
         );
-        self.start_book_op(
-            ctx,
-            "book-append",
-            crate::books::BookOpIntent::Unrelated,
-            move || {
-                crate::books::append_pages_at_with_raw(
-                    data_dir,
-                    root,
-                    book_name,
-                    sources,
-                    Some(&raw),
-                )
-            },
-        );
+        self.start_book_op(ctx, "book-append", intent, move || {
+            crate::books::append_pages_at_with_raw(data_dir, root, book_name, sources, Some(&raw))
+                .map(|result| match result {
+                    crate::books::BookOpResult::Append(summary) => {
+                        crate::books::BookOpResult::AppendFilesWritten(summary)
+                    }
+                    result => result,
+                })
+        });
     }
 
     pub(crate) fn start_book_reorder_flush(
@@ -49641,6 +49921,9 @@ impl App {
         folder: PathBuf,
         ordered_paths: Vec<PathBuf>,
     ) -> Option<crate::books::BookOpPending> {
+        if !self.admit_book_append_followup_mutation() {
+            return None;
+        }
         if !self.admit_rename_migration_source_change(ctx) {
             return None;
         }
@@ -49674,6 +49957,9 @@ impl App {
         target_book_name: String,
         kind: crate::books::BookTransferKind,
     ) -> Option<crate::books::BookOpPending> {
+        if !self.admit_book_append_followup_mutation() {
+            return None;
+        }
         if !self.admit_rename_migration_source_change(ctx) {
             return None;
         }
@@ -50036,18 +50322,28 @@ impl App {
             self.show_feedback_toast("製本処理中です".to_string());
             return false;
         }
+        if !matches!(
+            intent,
+            crate::books::BookOpIntent::Append { .. }
+                | crate::books::BookOpIntent::UndoAppend { .. }
+                | crate::books::BookOpIntent::List { .. }
+        ) && !self.admit_book_append_followup_mutation()
+        {
+            return false;
+        }
         let (tx, rx) = std::sync::mpsc::channel();
+        self.book_op_pending = Some(crate::books::BookOpPending { rx, intent });
         match std::thread::Builder::new()
             .name(thread_name.into())
             .spawn(move || {
                 let _ = tx.send(f());
             }) {
             Ok(_) => {
-                self.book_op_pending = Some(crate::books::BookOpPending { rx, intent });
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
                 true
             }
             Err(err) => {
+                self.book_op_pending = None;
                 self.show_feedback_toast(format!("製本 worker を開始できません: {err}"));
                 false
             }
@@ -50068,55 +50364,107 @@ impl App {
                 Err("製本処理が中断されました".to_string())
             }
         };
-        let pending = self
+        let intent = self
             .book_op_pending
-            .take()
-            .expect("book pending is present");
-        let intent = pending.intent;
+            .as_ref()
+            .expect("book pending is present")
+            .intent
+            .clone();
+        let retained = matches!(
+            intent,
+            crate::books::BookOpIntent::Append { .. }
+                | crate::books::BookOpIntent::UndoAppend { .. }
+        );
+        if !retained {
+            self.book_op_pending = None;
+        }
+        // Metadata copying is global worker work and must finish even when its
+        // source window has closed. Visible terminals run in the captured owner.
+        let source = match &intent {
+            crate::books::BookOpIntent::Append { source_context, .. }
+                if !matches!(
+                    result,
+                    Ok(crate::books::BookOpResult::AppendFilesWritten(_))
+                ) =>
+            {
+                Some(*source_context)
+            }
+            crate::books::BookOpIntent::UndoAppend { receipt } => Some(receipt.source_context),
+            _ => None,
+        };
+        let continuing = if let Some(source) = source {
+            if self.with_viewer_context_ref(source, |_| ()).is_some() {
+                self.with_owner_viewer_context(source, |app| {
+                    app.complete_book_op_result(ctx, result, &intent)
+                })
+                .expect("live owner checked in this UI call")
+            } else {
+                self.invalidate_book_append_undo();
+                // Closing the source ends its visible adoption, not the actual
+                // copy/metadata result or its normal success/error notification.
+                self.complete_book_op_result(ctx, result, &intent)
+            }
+        } else {
+            self.complete_book_op_result(ctx, result, &intent)
+        };
+        if continuing {
+            return;
+        }
+        let terminal_intent = if retained {
+            self.book_op_pending
+                .take()
+                .map(|pending| pending.intent)
+                .unwrap_or(intent)
+        } else {
+            intent
+        };
+        self.release_book_append_observations(ctx, &terminal_intent);
+        if let crate::books::BookOpIntent::UndoAppend { receipt } = &terminal_intent
+            && self
+                .current_folder
+                .as_ref()
+                .is_some_and(|folder| crate::folder_tree::path_eq(folder, &receipt.files.folder))
+        {
+            self.folder_refresh_pending = Some(book_append_refresh::FolderRefreshRequest {
+                folder: receipt.files.folder.clone(),
+                cause: book_append_refresh::FolderRefreshCause::BookAppendExternal,
+            });
+        }
+        ctx.request_repaint();
+    }
+
+    fn complete_book_op_result(
+        &mut self,
+        ctx: &egui::Context,
+        result: Result<crate::books::BookOpResult, String>,
+        intent: &crate::books::BookOpIntent,
+    ) -> bool {
         match result {
+            Ok(crate::books::BookOpResult::AppendFilesWritten(summary)) => {
+                self.start_book_append_metadata_terminal(ctx, summary);
+                return true;
+            }
             Ok(crate::books::BookOpResult::Append(summary)) => {
-                self.apply_book_page_edit_copies(&summary.edit_copies);
-                self.apply_book_page_semantic_copies(&summary.semantic_copies);
-                if let Some(rows) = self.book_list_cache.as_mut() {
-                    crate::books::apply_append_to_cached_list(
-                        rows,
-                        &summary.book_name,
-                        &summary.folder,
-                        summary.added,
-                    );
+                if self.finish_book_append_terminal(ctx, summary, None) {
+                    return true;
                 }
-                if self
-                    .current_folder
-                    .as_ref()
-                    .is_some_and(|folder| crate::folder_tree::path_eq(folder, &summary.folder))
-                {
-                    self.pending_reload = true;
+            }
+            Ok(crate::books::BookOpResult::AppendRefreshPrepared {
+                summary,
+                scan,
+                composition,
+                request,
+            }) => {
+                if self.finish_book_append_terminal(
+                    ctx,
+                    summary,
+                    Some((scan, composition, request)),
+                ) {
+                    return true;
                 }
-                crate::logger::log(format!(
-                    "book append: {} added={} folder={}",
-                    summary.book_name,
-                    summary.added,
-                    summary.folder.display()
-                ));
-                if summary.erase_fallback_pages > 0 {
-                    self.show_feedback_toast_with_duration(
-                        format!(
-                            "「{}」に {} ページ追加しました\n{} ページの消しゴム補完は簡易処理で再作成しました",
-                            summary.book_name,
-                            summary.added,
-                            summary.erase_fallback_pages,
-                        ),
-                        4.5,
-                    );
-                } else {
-                    self.show_feedback_toast(format!(
-                        "「{}」に {} ページ追加しました",
-                        summary.book_name, summary.added
-                    ));
-                }
-                if let Some(path) = summary.first_path {
-                    crate::logger::log(format!("book append first page: {}", path.display()));
-                }
+            }
+            Ok(crate::books::BookOpResult::UndoAppend(result)) => {
+                self.finish_book_append_undo(result);
             }
             Ok(crate::books::BookOpResult::Transfer(summary)) => {
                 self.apply_book_page_edit_moves_with_journal(
@@ -50259,7 +50607,7 @@ impl App {
                 self.show_feedback_toast(format!("製本処理に失敗しました: {err}"));
             }
         }
-        ctx.request_repaint();
+        false
     }
 
     /// 変換済みアーカイブキャッシュ管理ダイアログのワーカー完了を拾う。
@@ -57544,6 +57892,9 @@ impl App {
                             }
                         }
                         _ => {
+                            if !app.admit_book_append_followup_mutation() {
+                                return;
+                            }
                             // Keep the Shell's existing added-item selection behavior.
                             app.request_post_operation_selection_for_added_items(folder.clone());
                             let result =
@@ -59096,6 +59447,20 @@ impl App {
         ctx: &egui::Context,
         reason: &'static str,
     ) -> Option<ClosedBookmarkSummary> {
+        self.take_and_close_current_active_viewer_context_with_metadata_boundary(
+            ctx,
+            reason,
+            FsMetadataBoundary::Manual,
+        )
+    }
+
+    #[cfg(windows)]
+    fn take_and_close_current_active_viewer_context_with_metadata_boundary(
+        &mut self,
+        ctx: &egui::Context,
+        reason: &'static str,
+        boundary: FsMetadataBoundary,
+    ) -> Option<ClosedBookmarkSummary> {
         let Some(id) = self.active_viewer_context_id() else {
             return None;
         };
@@ -59113,7 +59478,11 @@ impl App {
                 // ここで完遂させないと teardown へ到達しない (R-24)。
                 #[cfg(windows)]
                 {
-                    terminal_failed = app.close_fullscreen_to_completion(ctx).is_err();
+                    if matches!(boundary, FsMetadataBoundary::BookAppend(_)) {
+                        app.close_fullscreen_now_with_metadata_boundary(boundary);
+                    } else {
+                        terminal_failed = app.close_fullscreen_to_completion(ctx).is_err();
+                    }
                 }
                 #[cfg(not(windows))]
                 app.close_fullscreen();
@@ -60925,6 +61294,9 @@ impl App {
             ));
             return false;
         }
+        if !self.admit_book_append_followup_mutation() {
+            return false;
+        }
         self.ensure_detached_window_runtime_placement(id, "parked_live_activate_begin");
         self.log_detached_image_window_debug(format!(
             "parked_live_activate_begin id={id} pos={pos} active_context={} session={:?}",
@@ -62525,6 +62897,9 @@ impl App {
         else {
             return false;
         };
+        if !self.admit_book_append_followup_mutation() {
+            return false;
+        }
         let snapshot = self.detached_image_windows.remove(pos);
         self.update_detached_window_runtime_flags(snapshot.id, false, "passive_activate_begin");
         self.transition_detached_window_state(
@@ -63872,6 +64247,17 @@ impl App {
         &mut self,
         block_locked_media: bool,
     ) -> CollectionMainContextChange {
+        self.change_main_context_for_visible_grid_with_metadata_boundary(
+            block_locked_media,
+            FsMetadataBoundary::Manual,
+        )
+    }
+
+    fn change_main_context_for_visible_grid_with_metadata_boundary(
+        &mut self,
+        block_locked_media: bool,
+        boundary: FsMetadataBoundary,
+    ) -> CollectionMainContextChange {
         #[cfg(windows)]
         {
             if block_locked_media
@@ -63884,14 +64270,22 @@ impl App {
             if !preserved_media {
                 self.preserve_active_detached_image_window_for_main_context_change();
                 self.retire_direct_media_reader_for_source_adoption();
-                self.close_fullscreen();
+                if matches!(boundary, FsMetadataBoundary::BookAppend(_)) {
+                    self.close_fullscreen_now_with_metadata_boundary(boundary);
+                } else {
+                    self.close_fullscreen();
+                }
             }
         }
         #[cfg(not(windows))]
         {
             let _ = block_locked_media;
             self.retire_direct_media_reader_for_source_adoption();
-            self.close_fullscreen();
+            if matches!(boundary, FsMetadataBoundary::BookAppend(_)) {
+                self.close_fullscreen_now_with_metadata_boundary(boundary);
+            } else {
+                self.close_fullscreen();
+            }
         }
         self.retire_direct_media_reader_for_source_adoption();
         CollectionMainContextChange::Transferred
@@ -66186,7 +66580,9 @@ impl App {
         // フルスクリーン側ではページ単位 (= 1 ファイル/1 ページ) 操作中心になるため、
         // グリッド側で積み上げた Undo は破棄する。フルスクリーン中の操作は新しい
         // スタックで管理する (画像移動でさらにクリアされる)。
-        if boundary == FsMetadataBoundary::RatingMembership {
+        if let FsMetadataBoundary::BookAppend(operation_id) = boundary {
+            self.clear_meta_undo_preserving_book_append(operation_id);
+        } else if boundary == FsMetadataBoundary::RatingMembership {
             self.clear_meta_undo_for_rating_move();
         } else {
             self.clear_meta_undo();
@@ -70712,6 +71108,9 @@ impl App {
         let Some(key) = self.rotation_key_for_idx(idx) else {
             return Err("回転対象のページキーを取得できませんでした".to_string());
         };
+        if !self.admit_book_append_followup_mutation() {
+            return Err("本への追加を取り消しています".into());
+        }
         let exit_sns_split =
             self.sns_split.is_some() && self.fullscreen_idx == Some(idx) && !rot.is_none();
         let persist_result = self
@@ -71001,6 +71400,9 @@ impl App {
         source: &str,
         known: Option<(Option<usize>, u8)>,
     ) -> Result<(), String> {
+        if self.rating_db.is_some() && !self.admit_book_append_followup_mutation() {
+            return Err("本への追加を取り消しています".into());
+        }
         let (target, before) = if let Some((target, before)) = known {
             (target, Some(before))
         } else {
@@ -71054,6 +71456,9 @@ impl App {
     ) -> Result<(), String> {
         if writes.is_empty() {
             return Ok(());
+        }
+        if self.rating_db.is_some() && !self.admit_book_append_followup_mutation() {
+            return Err("本への追加を取り消しています".into());
         }
         let db_writes = writes
             .iter()
@@ -75184,6 +75589,9 @@ impl App {
     /// `keep_fullscreen_viewport_alive` がこのフラグを見て Visible(false) を
     /// 送信し、その直後に false に落とす。ここで先に落とすと送信が抑止される。
     pub(crate) fn close_fullscreen(&mut self) {
+        if self.book_append_undo_in_progress() {
+            return;
+        }
         self.finish_rating_picker_for_manual_navigation();
         self.cancel_rating_membership_restore();
         // A staged Ctrl traversal still leaves the old fullscreen visible. If that fullscreen
@@ -75703,7 +76111,9 @@ impl App {
         //   `fs_nav_holdover_for_draw` が別途判定する。
         // PDF pool の Critical 予約は v1.0.0 から常時 ON 方針なので、ここで切替えない。
         // フルスクリーン中の Undo スタックはここで破棄。グリッドに戻ったら新しい操作を積む。
-        if boundary == FsMetadataBoundary::RatingMembership {
+        if let FsMetadataBoundary::BookAppend(operation_id) = boundary {
+            self.clear_meta_undo_preserving_book_append(operation_id);
+        } else if boundary == FsMetadataBoundary::RatingMembership {
             self.clear_meta_undo_for_rating_move();
         } else {
             self.clear_meta_undo();
@@ -77875,6 +78285,9 @@ impl App {
             Some(k) => k,
             None => return,
         };
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.invalidate_edit_preview_cache_for_key(&key);
         let written = Self::edit_store_write(
             self.mask_db
@@ -77907,6 +78320,9 @@ impl App {
             Some(k) => k,
             None => return,
         };
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.invalidate_edit_preview_cache_for_key(&key);
         let written = Self::edit_store_write(self.mask_db.as_ref().map(|db| db.delete(&key)));
         Self::set_page_key_presence(&mut self.mask_page_keys, &key, false);
@@ -77973,6 +78389,9 @@ impl App {
             Some(k) => k,
             None => return,
         };
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.invalidate_edit_preview_cache_for_key(&key);
         let written = Self::edit_store_write(
             self.conceal_db
@@ -78005,6 +78424,9 @@ impl App {
             Some(k) => k,
             None => return,
         };
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.invalidate_edit_preview_cache_for_key(&key);
         let written = Self::edit_store_write(self.conceal_db.as_ref().map(|db| db.delete(&key)));
         Self::set_page_key_presence(&mut self.conceal_page_keys, &key, false);
@@ -78045,14 +78467,18 @@ impl App {
             Some(key) => key,
             None => return,
         };
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.invalidate_edit_preview_cache_for_key(&key);
         // presence は「画面に出ている状態」を表す。保存の成否ではないので、同期版と
         // 同じく結果を待たずに立てる (失敗しても編集は画面に残す)。
         Self::set_page_key_presence(&mut self.local_adjust_page_keys, &key, !layers.is_empty());
-        self.set_local_adjust_layers_for_idx_memory_only(
+        self.set_local_adjust_layers_for_idx_memory_only_inner(
             idx,
             local_adjust_core::LocalAdjustmentLayers::clone(&layers),
         );
+        self.bump_local_adjust_generation(idx);
         self.submit_local_adjust_write(idx, key, layers);
     }
 
@@ -78232,6 +78658,9 @@ impl App {
         idx: usize,
         layers: local_adjust_core::LocalAdjustmentLayers,
     ) {
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.set_local_adjust_layers_for_idx_memory_only_inner(idx, layers);
         self.bump_local_adjust_generation(idx);
     }
@@ -78241,6 +78670,9 @@ impl App {
         idx: usize,
         layers: local_adjust_core::LocalAdjustmentLayers,
     ) {
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.set_local_adjust_layers_for_idx_memory_only_inner(idx, layers);
         self.defer_local_adjust_brush_render(idx);
     }
@@ -78318,6 +78750,9 @@ impl App {
             })
             .filter(|settings| !settings.is_full(image_size[0], image_size[1]));
 
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         if let Some(settings) = normalized {
             let written = Self::edit_store_write(
                 self.export_crop_db
@@ -78374,6 +78809,9 @@ impl App {
                 )
             })
             .filter(|settings| !settings.is_full(image_size[0], image_size[1]));
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         let present = normalized.is_some();
         if let Some(settings) = normalized {
             self.export_crop_page_settings.insert(idx, settings);
@@ -82938,6 +83376,9 @@ impl App {
         key: &str,
         objects: &[comic_core::AnnotationObject],
     ) {
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.comic_docs.insert(key.to_string(), objects.to_vec());
         // グリッド「文」バッジ用の idx 集合を即時メンテ (mask_pages と同様)。注釈が
         // 1 件でもあれば付与、空なら除去。
@@ -84845,6 +85286,9 @@ impl App {
         target: &PageAdjustmentTarget,
         params: crate::adjustment::AdjustParams,
     ) -> EditStoreOutcome {
+        if !self.admit_book_append_followup_mutation() {
+            return EditStoreOutcome::Failed("本への追加を取り消しています".into());
+        }
         // 固定代表サムネは、親コンテナだけが mounted で参照元ページ自体は items に
         // 無い場合がある。親セルの refresh 判定は idx ではなく page key の実効値で行う。
         let old_effective_for_key = self.effective_params_for_target(target);
@@ -84941,6 +85385,9 @@ impl App {
         &mut self,
         target: &PageAdjustmentTarget,
     ) -> EditStoreOutcome {
+        if !self.admit_book_append_followup_mutation() {
+            return EditStoreOutcome::Failed("本への追加を取り消しています".into());
+        }
         // set と同様、未 mounted の固定代表参照元も key 単位で変化を検出する。
         let old_effective_for_key = self.effective_params_for_target(target);
         let fallback = self.adjustment_standard_params_for_target(target);
@@ -85098,6 +85545,12 @@ impl App {
     /// failed / pending もクリアして、次フレームで再実行されるようにする。
     pub(crate) fn apply_params_to_all_pages(&mut self, params: crate::adjustment::AdjustParams) {
         let (indices, keys) = self.collect_image_page_keys();
+        if keys.is_empty() {
+            return;
+        }
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         let sidecar_coords = self.collect_image_sidecar_coords();
         // 書換後の effective params は全画像ページで `params` になる。
         // 書換前に AI 設定が異なるページを拾っておく。
@@ -85162,6 +85615,12 @@ impl App {
     /// 個別解除で AI 設定が標準に戻って変わるページは AI キャッシュもクリアする。
     pub(crate) fn clear_all_page_params(&mut self) {
         let (indices, keys) = self.collect_image_page_keys();
+        if keys.is_empty() {
+            return;
+        }
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         let sidecar_coords = self.collect_image_sidecar_coords();
         let default_params = indices
             .first()
@@ -85268,6 +85727,9 @@ impl App {
     /// U/N/P が標準ではなくページを編集してしまう (お気に入り標準側は
     /// `apply_favorite_change` が同じ掃除を先に持っていた)。
     pub(crate) fn copy_params_to_global(&mut self, params: crate::adjustment::AdjustParams) {
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         let default_params_before = self.snapshot_inherited_default_params();
         crate::logger::log(format!(
             "[adjust scope] global <- {}",
@@ -85362,12 +85824,18 @@ impl App {
         favorite_id: uuid::Uuid,
         params: crate::adjustment::AdjustParams,
     ) {
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.apply_favorite_change(favorite_id, Some(params));
     }
 
     /// お気に入りの標準設定を解除する。
     /// 配下は、さらに外側の最近祖先の ON お気に入り標準または global へフォールバックする。
     pub(crate) fn clear_favorite_default(&mut self, favorite_id: uuid::Uuid) {
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         self.apply_favorite_change(favorite_id, None);
     }
 
@@ -93064,7 +93532,7 @@ impl App {
         // 一覧表示中の監視変更は従来どおり即時に適用し、進行中の Ctrl+E 出力が背後の
         // 一覧へ順次増える挙動も維持する (利用者判断 2026-09-05)。
         if !main_viewer_blocked && !self.sidecar_restore_active() {
-            self.consume_folder_refresh_pending();
+            self.consume_folder_refresh_pending(ctx);
             self.consume_folder_thumb_pin_dirty();
             // メディア別ウィンドウ (フル機能モード) の P ピンをメイン窓のグリッドへ
             // 即時反映する。従来は close_fullscreen でしか consume されず、メイン窓の
