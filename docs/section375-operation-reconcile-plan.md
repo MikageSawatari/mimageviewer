@@ -1,7 +1,8 @@
 ﻿# §1.375 監視更新の準備結果と現在の表示を比較して再表示を省く
 
-2026-10-13、`next-list`、R6コード照合基点 `918a51309`（R5の基点は `ae2772c8e`）。
-**利用者の2026-10-13再レビューP2三件を反映したR6。独立設計レビュー提出用・表示採用の新方式は未実装**。
+2026-10-13、`next-list`、R7。R6コード照合基点 `918a51309`（R5の基点は `ae2772c8e`）。
+**LISTrev6のP2一件を反映したR7。選択キーと画像の同時採用、leafを含むcache identityを具体化。独立設計再レビュー提出用・表示採用の新方式は未実装**。
+今回のコード照合は`3e8178b31`と既存の§1.373 R7作業内容（`4c0567b23`と同一）の読取りだけで行い、§1.373の変更は行わない。
 正本項目: [next-release-backlog.md §1.375](next-release-backlog.md#1375-フォルダで-delete-キーで削除すると正しく消えた一覧がもう一度丸ごと読み直されてちらつく--利用者の実機報告-2026-10-12)。
 
 R3はACCEPTだったが、実装調査で初期表示と自動代表の採用証拠が対応しない前提不足を確認した。
@@ -33,6 +34,7 @@ Delete後の表示と、後続走査が準備した表示を比べる境界が�
 **利用者決定／再レビュー訂正 (2026-10-13)**: 監視更新では既に採用した代表ファイルの
 選択キーだけを保つ。`Ctrl+F5`（「最新の情報に更新」）で自動代表を選び直す。
 ただし、選択したファイル自体が削除・移動等で存在しなくなった場合は、監視更新でも再選定する。
+設計担当判断: 消失時の再選定は「削除等をCtrl+F5まで反映しなくてもよい」という利用者の許容内の改善であり、消えた選択先を読みに行って失敗する状態を避けるため、例外を維持する。
 画像の由来・選定依存・pin leaf・catalog revisionのprovenance照合は不要とする。
 
 この変更は代表画像の表示に限る。行の追加・削除、同名候補の再露出、並び・表示metadata、
@@ -62,7 +64,8 @@ pin先が存在しない場合は監視更新でも既存規則でfallbackする
 
 - Loadedの既存textureは使える間そのまま使うが、画面外／trayのGPU・CPU evictionとcache予算を
   変更しない。`evict_grid_thumbnail` のCPU解放も維持し、追加のthumbnail画素保持を行わない。
-  再表示は保持した選択キーを既存cache／source要求へ渡す。同じcacheの更新は許す。
+  再表示は保持した選択キーを既存cache／source要求へ渡す。同じ選択先のcache更新は許すが、
+  親Folderだけの共有cacheから別の選択先の画像を取り込まない（§2.3–2.4）。
 - idle upgrade・サイズ変更・cache missも同じ選択を使う。sourceの存在確認／読出しは既存workerで
   行い、実ファイル／entry／ページの消失が確認された場合だけ通常の再選定へ戻す。
   単なる読込失敗を消失と見なさない。UIに同期stat／decodeを追加しない。
@@ -87,6 +90,84 @@ Stackの保持対応キーは **source／context + Stackグループkey + Stack�
 同グループの代表を削除して2枚以上残ればStackは同じ論理行として存続し、消失例外で代表を再選定する。
 一方、1枚になれば `StackView::materialize_aggregated` は通常Imageを作るため、旧Stackの選択は
 引き継がない。Imageの通常要求へ戻る。同名keyの別source／兄弟contextへも保持選択を移さない。
+
+### 2.3 R7: 選択キーは画像の実採用で確定する
+
+現在の`ThumbPixels`（`src/thumb_loader.rs:567`）には画像・origin・寸法等だけがあり、
+通常cache hit（同`load_one_cached`、2735行付近）も実際の選択先を配送しない。
+`folder_thumb_cache_key`は親・sort・depth等を区別するが、選んだleafを含まない。
+このままでは、Aがaを保持中にBの明示更新が同じcache rowをbの画像へ更新すると、
+Aのeviction後に「保持キーa／表示画像b」を作れる。request IDだけの一致では防げない。
+
+R7の不変条件は **採用表示の選択キーと、そのキーのsourceから得た画像を一組として採用し、
+以後の要求も同じsourceに限定する**。選択キーは再要求できる正規のsource addressで、
+実画像、書庫内entry、PDFページ、動画／音声の表紙等の種類も区別する。Folder再帰／pin／
+変換済み書庫では、既存のsource address／alias解決に合わせ、親Folderの名前だけをleafにしない。
+既存exact catalog代表を候補として読む場合も、実際に選んだsourceのaddressをresolverから返す。
+通常画像等と代表要求の違いはtyped payload／既存request種別で表し、画像と選択キーを別channelや
+独立したpendingへ分けない。以下の型名は概念名であり、実装時は既存型と揃える。
+
+| 境界 | 必要な契約 |
+| --- | --- |
+| 要求作成 | 同じ既存thumbnail requestに`Discover`（初回／明示再選定）または`Exact(selected_leaf)`（保持中）を載せる。request ID・context・source・items generation・既存設定条件をそのまま捕捉する |
+| source生成 | resolver／decoderが実際に読んだsource addressを画像・寸法と同じpayloadに載せ、同じrequest IDで返す。親要求の想定キーや、生成後に改めて選んだ候補で画像をラベル付けしない。Exactはleafを直接要求し、親の自動chooserを再実行しない |
+| cache hit | 実際に読んだimmutable cache entryから画像・選択キー・寸法を一度に取り出す。decode後に共有mapを読み直してキーだけ取らない。Exactでは保持キーと一致するentryだけを使う |
+| backlog／RAW継続 | 選択キーは`ThumbPixels`相当の画像payloadと一緒に既存ownerを流れる。RAW ticket／follow-upは解決済みsourceと同じrequest IDを保持し、親Folderへ戻って選定しない。preview／half／fullの品質差を別leafへの切替にしない |
+| UI画像採用 | 既存のrequest相関・設定／世代・source受理判定とExactのキー一致を通った画像だけ、texture／寸法と選択キーを同じ採用処理で更新する。キーは既存bundleの採用表示row record（§3.4の共有投影）に置く。受信／enqueue／cache保存／Finalizedだけでは更新しない |
+| 破棄・失効 | keep外破棄、cancel、stale／遅着、別contextへの誤配送、upload未採用は表示選択を変更しない。SourcePixelsの画像採用とFinalizedの保存終端は§1.360どおり別の終端であり、Finalizeは選択キーを更新しない |
+
+代表のProvisionalPixelsを使う経路は、その画像の実選択が確定し、継続も同じleafである場合だけ
+この契約へ参加する。検証前の別sourceに置換され得るseedを保持選択の根拠にしない。
+ドライブの暫定seed等、この監視更新の対象外の経路は既存のtyped lifecycleを維持する。
+NoArt／Failedで初回キーを捏造しない。保持中の単なる失敗でも別leafへ切り替えない。
+
+選択先の消失をworkerで確認した場合は、現在のExact要求を既存規則で終端にし、同ownerから
+新しいrequest IDのDiscoverを受け付ける。Exact(a)の途中でbを読んでaとして返すfallbackはしない。
+明示GridReload／pin変更も既存の明示受付からDiscover／新しい指定先の要求へ進む。
+新しい画像が採用されるまでは旧画像に随伴する旧採用キーを保ち、新しい結果を採用する時点で
+一緒に置換する。evictionは画素／textureだけを解放し、採用rowの小さな選択キーは残す。
+row消失・source終了／context破棄はそのrowを解放し、兄弟ownerのキーを変更しない。
+
+### 2.4 R7: leafを含むcache identityで食い違う状態を減らす
+
+先に次の簡素化を検討し、**実際の選択leafを含むcache keyを採用**する。
+
+| 案 | 採否と理由 |
+| --- | --- |
+| 親・sort・depthだけのmutable cacheに選択metadataを足し、読戻しごとに照合 | 不採用。正しい照合とExact sourceへのmiss配送で防げるが、Bがbを保存するたびA用aが同じrowから失われ、eviction／upgradeで再生成が増える。「親cacheはb、保持はa」という状態と全consumerの個別guardを残す |
+| source／描画条件のnamespaceに実selected leafを加えたpayload key | 採用。aとbの画像を別keyへ保存するので、Bのb保存がA用aを上書きする組合せがなくなる。同じleafの内容／品質更新は許し、既存cache予算・evictionを維持する |
+| contextごとの画素保存・cache丸ごと複製・新しい代表pending owner | 不採用。画素保持の撤回と共有cache／既存ownerの契約に反し、選択と画素の独立した寿命を増やす |
+
+payload keyは **既存のsource／描画条件namespace + selected leafの正規address**。
+Stackのnamespaceはsource＋group key＋種類で、代表path由来perf_key／ItemIdを使わない。
+contextは保持rowの所有identityへ含めるが、同じsource／leaf／描画条件のpayload cacheを
+共有するためだけにcontext別の画像を複製しない。addressの種類と区切りを一意に符号化し、
+basenameだけで別source・書庫entry・PDFページを衝突させない。
+
+- producerは実際の画像payloadに付いた選択キーから保存keyを作る。要求したaのkeyへ実bの
+  画像を書かない。catalog／in-memory entryには選択キーと画像・寸法を同じ更新で保存する。
+  読戻しでもkeyのaddressとentryの選択キーが一致することを確認する。
+- 初回のDiscoverにもcache hitを残す。既存の親・sort・depth等のlookup namespaceには、
+  最新の選定結果の**leaf payload keyへの参照だけ**を既存catalog内に持たせる。画像本体を
+  二重保存せず、別のcache proof DB／provenance map／ownerを作らない。
+  workerは参照からleaf entryを解決し、そのentryの画像＋キーの一組を同request IDで返す。
+  参照が途中でbへ替わっても、一度捕捉したaのpayloadをbのキーでラベル付けしない。
+- 保持済みExact(a)は上記の「最新の選定」参照を読まず、aのpayload keyだけを使う。
+  aのcacheがevict／missなら通常のExact(a) source要求へ進む。aが存在する限り、cache missや
+  idle SourceOnlyを親chooserによるbへの再選定理由にしない。
+- 旧parent cache等、**選択先を特定できない画像はR7代表のcache miss**とする。
+  現在の候補を選び直して旧画素へそのキーを付けず、provenanceや画素照合で旧選択を推測しない。
+  既存の画像／page等のキー自身がexact sourceを一意に表すcacheは、その既存address規則を
+  明示して配送できる。単なるFolder・ZIP/PDF親keyをentry／pageの選択証明にはしない。
+- 旧未知cacheの再生成は既存lazy需要に限り、初期全Folder探索・全件decode・UI I/Oを足さない。
+  CacheOnly／既存archive候補の「新規書庫を開かない」制限を解除せず、miss／判定待ちの
+  typed終端も維持する。既存cache-only候補がactual addressを返せる基盤も§3.4の必須条件とする。
+  それを満たせず既存候補を黙って飛ばす／代表機能を削る実装には進まず、前提不足として報告する。
+  一度の旧cache missに伴うcold化費用も性能検証に含め、通常利用の目立つ遅延は設計担当へ相談する。
+
+これは「その画像の選択先」という小さなキーの結合だけであり、候補一覧、選定依存、catalog revision、
+自己操作のoperation IDを照合する方式ではない。同じleafに対する共有cache更新は通常の
+cache／source経路で表示してよい。CPU画素保持、cache予算やeviction方針の変更はしない。
 
 ## 3. 通知から走査・準備・比較・採用まで
 
@@ -159,14 +240,20 @@ worker比較中にDelete成功行除去、sort／facet／metadata、thumbnail初
 
 ### 3.4 コード照合と必要な共有投影の基盤
 
-`918a51309` の現状とR6の実装前提を区別する。以下の基盤は新方式に必要だが、今回未実装。
+R6基点`918a51309`と今回読取り照合した作業ツリーの現状を、R7の実装前提と区別する。
+以下の基盤は新方式に必要だが、今回未実装。共有投影だけでなく、実選択を返す全producerと
+cache／source consumerを接続してから、保持選択の採用を有効にする。
 
-| 現コードの境界 | R6で既存owner内に必要な変更 |
+| 現コードの境界 | R7で既存owner内に必要な変更 |
 | --- | --- |
 | `ExternalRescanPending` はcontext・items_generation・scan_options・cancel・restartを持ち、workerはScannedDir／signatureのみ返す | 同じrescan／prepare ownerで走査→表示準備→比較まで行い、typed結果を同一／差分にする。別のcomparison pending／worker ownerは足さない |
 | `App::prepare_scanned_folder_listing[_with_cache_keys]` は `&mut self` からmaterialize／DB read等を行い、PreparedScannedFolderListing.itemsとApp.itemsはVec | workerで使う設定・DB reader・分類／materializeをこの既存準備境界へ分離する。現関数が既に全準備workerであるとは扱わない。既存Stack／sidecar／page-edit準備の終端と合流してから比較する |
 | `page_identity_index: Arc<PreparedPageIdentityIndex>`、StackView／SubfolderExpansionSnapshotは共有immutable値を持つが、全表示値を覆うsnapshotはない | 採用する行順・metadata・件数・代表選択のimmutable表示投影を準備workerで生成し、元ViewerContextBundle／既存一覧ownerに保持する。要求時はArc等の参照を安価に渡す。items全件のcloneでsnapshotを作らない |
 | `items_generation` と `page_edit_revision`、PAGE_EDIT_WRITESのWriteStamp、rating_session_write_generation、Stack request sequence／設定照合がある | 既存の世代・revision／write stampを比較要求と結果の受理条件に使う。items_generationだけでは世代内thumbnail採用やmetadata変化を捕捉できないため、採用投影の参照identityも同ownerで更新し、有効性を照合する |
+| `ThumbPixels`には実選択先がなく、source結果とcache hitは画像・origin・寸法等だけを返す | source resolverが実際に読んだleafのaddressを同じ画像payloadへ載せる。cache hitも一つのentryから画像・実選択キー・寸法を取り出す。同じ既存request IDで配送し、画像とキーの独立channel／pendingを作らない |
+| Folder cache keyは親・sort・depth等で、選択leafを区別しない。既存entryだけからactual leafを特定できるとは限らない | §2.4のleaf付きpayload key／同entryの選択値へ接続する。Discoverの既存catalog lookupはpayloadへの参照だけにし、Exactはその参照を使わない。選択不明cacheはmiss、既存exact source keyから導出できる場合はaddress規則を明示する |
+| `LoadRequest`／RAW follow-upは元Folder等の要求を保持し、idle upgrade／SourceOnlyでsourceを読み直す | 同じ要求ownerにDiscover／Exactを載せ、解決済みleafを継続へ渡す。cache miss・サイズ変更・RAW preview／half／fullで親chooserに戻らない。確認済み消失は旧要求を終端にして新request IDで再選定する |
+| `poll_thumbnails`は既存request相関・backlog・upload予算・SourcePixels／Finalizedの終端を管理するが、採用選択を持たない | 既存の画像採用を唯一の確定境界とし、texture／寸法と実選択キーを原子的に採用表示rowへ反映する。Exact不一致・遅着・破棄・保存終端では選択を更新しない。request解放後もrowのキーだけ残し、兄弟bundleへ移さない |
 
 immutable投影は一覧全体の複製をUIで作るための別ownerではない。workerが作った採用値をそのまま
 共有し、UIの単一行採用・除去等は変更した行／ブロックだけを更新し、未変更部分を共有する。
@@ -174,6 +261,14 @@ root参照identityをrevisionとして使い、全件cloneを伴う `Arc::make_m
 毎フレームの全行snapshot再構築を行わない。この部分共有の基盤も現コードにあるとは主張しない。
 その基盤が揃わなければ「UIで比較する」「UIで全件cloneする」形で接続せず、実装前提不足として止める。
 thumbnail画素やegui textureを投影に保持・workerへ移す必要はない。
+
+実装前に接続確認するproducer／consumerは、Folderの直接画像・子Folder・pin、ZIP／PDF／
+変換済み書庫の既存cache候補とsource生成、動画／音声のsidecar・埋込表紙、Stack、編集preview、
+memory／catalog cache hit、cache-only miss、idle SourceOnly、RAWの各品質／follow-up、
+backlog／画像採用／保存終端である。既存cache-only書庫候補もactual source addressを返す必要がある。
+Remote／bench等の共有型consumerと対象外のdrive seedは既存の要求寿命を維持し、
+UIのrequest ID照合をidxだけの配送へ緩めない。選択の分からない画像を暫定的に採用する接続、
+既存候補を省く接続、新規書庫を開く接続では基盤不足を埋めない。
 
 簡素化としてDeleteの既存modalと既存再予約を維持する。比較中の全一覧操作を新たにmodalで止める
 方法は、通常の監視更新で入力を制限するため採用しない。既存の世代／revisionによる拒否と通常再準備を
@@ -242,7 +337,7 @@ ScannedDirのraw／prepared payload、関連fixtureのfieldも外す。
 音声inventory、表示用省略件数は維持する。製品へ接続済みのwatcherを削除する変更ではない。
 
 旧部品の17件成功は旧方式の記録で、新方針の受入証拠に流用しない。
-R5で未接続部品を撤去済み。R6は設計・manualだけを変更し、比較／代表選択保持の新実装は行わない。
+R5で未接続部品を撤去済み。R6／R7は設計・manualだけを変更し、比較／代表選択保持の新実装は行わない。
 
 ## 6. 実装と独立レビューの受入条件
 
@@ -276,6 +371,19 @@ ui-responsiveness、architectureも実装時に該当契約を同時更新する
   代表要求stamp不変。ZIP/PDF／普通fileのmetadata変化をこの例外へ広げない。
 - 同folderのA/B、A→B→A、park中内容上書き、先着結果／cutoff後通知、cancel／close／
   subscription再作成。Aの一致判定でBのdirty・代表・要求を消さない。
+- Aがaを採用済み、Bの明示GridReloadが同じsource／描画条件の共有cacheへbを保存するhandler回帰。
+  異なる画素のfixtureで、AのCPU／GPU eviction後はaのleaf付きcache hit、aのcache miss時は
+  Exact(a) sourceだけを使うことを確認する。保持キーa／画像bを作らず、Bの選択／cache・dirtyは不変。
+- 初回Discoverのcache hitはentryの実選択キーと画像を同request IDで配送し、受信／backlog待ちでは
+  キー未確定、実画像採用で両方確定。keep外破棄・保存Finalizedだけではキーを確定しない。
+  旧parent cacheの選択不明画像を現在候補のキーでラベル付けせず、既存lazy miss終端へ流す。
+  lookup参照捕捉後にBが参照をbへ変えても、捕捉したaの画像とキーが対応することを確認する。
+- Exact(a)のidle upgrade・サイズ変更・RAW preview／half／full／follow-up中に、より優先されるbを
+  追加する。cache／sourceの実選択はすべてaのままとし、parent chooser再実行0回を確認する。
+  選択先a自体の内容／品質・寸法更新は反映し、CPU画素保持を増やさない。
+- 同idxでも旧request ID／世代／contextの遅着、cache keyとentry addressの不一致、Exact(a)へ
+  actual(b)を返す結果を実採用handlerで拒否する。拒否でキー／画像を別々に書き換えない。
+  aの確認済み消失では新IDで再選定し、旧aのRAW結果／Finalizedが新選択を戻さないことも確認する。
 - worker比較中と採用直前の表示世代／revision変更のhandler回帰。Delete・sort／facet／metadata・
   thumbnail初回採用／寸法変更で同一／差分の両結果を拒否し、dirtyを残して通常再準備する。
   UI全行比較／全件cloneが0回であること、選択／check／scrollを旧snapshotで戻さないことも確認する。
@@ -290,12 +398,16 @@ ui-responsiveness、architectureも実装時に該当契約を同時更新する
   同一時のUI時間が行数比例で増えないこと、UI全件clone／snapshot再構築0回を受入条件とする。
 - 既存の大規模一覧perfイベントと同じ行数／cold・warm条件で前後比較し、入力応答・scroll、
   eviction後の再要求・idle／trayのCPU、keep_range／upload予算が退行しないことを確認する。
+  leaf付きcacheのlookup／hit／miss・source呼出し回数、旧選択不明cacheからの一度のcold化費用、
+  A/B切替・長い一覧巡回時のcache bytes／選択キーbytesも記録する。全件の事前探索・decode0回、
+  既存cache予算不変を確認し、通常利用の目立つ遅延があれば実装を止めて設計担当へ相談する。
   headless／fake-inputを先に行い、アプリ計測は具体的suiteの利用者承認を得た別の検証枠で行う。
   今回は計測・試験を実行せず、R5の撤去検証をこの受入証拠へ流用しない。
 
-**ここで止め、R6の独立設計レビュー後に新方式の実装へ進む。**
+**ここで止め、R7の独立設計再レビュー後に新方式の実装へ進む。**
 まれな失敗は割り切り (ログ + 通知 [+ 作り直し])。新しいretry／rollback／回復journalは作らない。
-今回の新方式の実装・回帰追加0件。R6では文書検証だけを行い、ビルド・テスト実行・アプリ起動・コミットはしない。
+今回の新方式の実装・回帰追加0件。R7では文書検証だけを行い、ビルド・テスト実行・性能計測・
+アプリ起動・コミットはしない。§1.373 R7の既存実装は変更しない。
 
 ### 6.1 未接続部品撤去の検証記録 (2026-10-13)
 
@@ -325,3 +437,13 @@ ui-responsiveness、architectureも実装時に該当契約を同時更新する
 - コードは読取り照合のみ。新方式の実装・回帰追加・ビルド・テスト実行・性能計測・
   アプリ起動・コミットは0件。§6.1はR5撤去時の履歴であり、R6の実行結果ではない。
 - R6の独立設計レビューと、§3.4の共有投影基盤・worker準備分離の実装は未実施。
+
+### 6.3 R7文書改訂の検証記録 (2026-10-13)
+
+- 今回の変更はこの設計書とmanualのgrid／shortcuts、計3ファイルだけ。
+  UTF-8 strict decode 3ファイル、HTMLParser解析2ファイル、対象3ファイルの
+  `git diff --check`が成功。設計の節順と、manual両方の画面外復帰／別窓更新／消失例外を照合した。
+- §1.373 R7に属する既存13ファイルは、作業開始時のSHA-256とすべて一致。
+  既存作業内容は`4c0567b23`へコミット済みだが、この文書改訂ではコミットしていない。
+- 新方式の実装・回帰追加・cargo build／test・性能計測・アプリ起動・コミットは0件。
+  R7の独立設計再レビューは未実施。§6.1の過去の試験結果をR7の受入証拠にしない。
