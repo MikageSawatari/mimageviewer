@@ -775,111 +775,15 @@ impl State {
     }
 
     fn on_keyboard_input(&mut self, event: &winit::event::KeyEvent) {
-        // Windows reports keys consumed by the IME as Process (VK_PROCESSKEY).
-        // Do not turn their physical fallback into application keys, text, or
-        // clipboard commands. Releases remain available to clear held keys.
-        if !should_forward_keyboard_input(&event.logical_key, event.state) {
-            return;
-        }
-
-        let winit::event::KeyEvent {
-            // Represents the position of a key independent of the currently active layout.
-            //
-            // It also uniquely identifies the physical key (i.e. it's mostly synonymous with a scancode).
-            // The most prevalent use case for this is games. For example the default keys for the player
-            // to move around might be the W, A, S, and D keys on a US layout. The position of these keys
-            // is more important than their label, so they should map to Z, Q, S, and D on an "AZERTY"
-            // layout. (This value is `KeyCode::KeyW` for the Z key on an AZERTY layout.)
-            physical_key,
-
-            // Represents the results of a keymap, i.e. what character a certain key press represents.
-            // When telling users "Press Ctrl-F to find", this is where we should
-            // look for the "F" key, because they may have a dvorak layout on
-            // a qwerty keyboard, and so the logical "F" character may not be located on the physical `KeyCode::KeyF` position.
-            logical_key: winit_logical_key,
-
-            text,
-
-            state,
-
-            location: _, // e.g. is it on the numpad?
-            repeat: _,   // egui will figure this out for us
-            ..
-        } = event;
-
-        let pressed = *state == winit::event::ElementState::Pressed;
-
-        let physical_key = if let winit::keyboard::PhysicalKey::Code(keycode) = *physical_key {
-            key_from_key_code(keycode)
-        } else {
-            None
-        };
-
-        let logical_key = key_from_winit_key(winit_logical_key);
-
-        // Helpful logging to enable when adding new key support
-        log::trace!(
-            "logical {:?} -> {:?},  physical {:?} -> {:?}",
-            event.logical_key,
-            logical_key,
+        append_keyboard_input(
+            &mut self.egui_input,
+            &event.logical_key,
             event.physical_key,
-            physical_key
+            event.text.as_ref().map(|text| text.as_str()),
+            event.state,
+            event.repeat,
+            || self.clipboard.get(),
         );
-
-        // "Logical OR physical key" is a fallback mechanism for keyboard layouts without Latin characters: it lets them
-        // emit events as if the corresponding keys from the Latin layout were pressed. In this case, clipboard shortcuts
-        // are mapped to the physical keys that normally contain C, X, V, etc.
-        // See also: https://github.com/emilk/egui/issues/3653
-        if let Some(active_key) = logical_key.or(physical_key) {
-            if pressed {
-                if is_cut_command(self.egui_input.modifiers, active_key) {
-                    self.egui_input.events.push(egui::Event::Cut);
-                    return;
-                } else if is_copy_command(self.egui_input.modifiers, active_key) {
-                    self.egui_input.events.push(egui::Event::Copy);
-                    return;
-                } else if is_paste_command(self.egui_input.modifiers, active_key) {
-                    if let Some(contents) = self.clipboard.get() {
-                        let contents = contents.replace("\r\n", "\n");
-                        if !contents.is_empty() {
-                            self.egui_input.events.push(egui::Event::Paste(contents));
-                        }
-                    }
-                    return;
-                }
-            }
-
-            self.egui_input.events.push(egui::Event::Key {
-                key: active_key,
-                physical_key,
-                pressed,
-                repeat: false, // egui will fill this in for us!
-                modifiers: self.egui_input.modifiers,
-            });
-        }
-
-        if let Some(text) = text
-            .as_ref()
-            .map(|t| t.as_str())
-            .or_else(|| winit_logical_key.to_text())
-        {
-            // Make sure there is text, and that it is not control characters
-            // (e.g. delete is sent as "\u{f728}" on macOS).
-            if !text.is_empty() && text.chars().all(is_printable_char) {
-                // On some platforms we get here when the user presses Cmd-C (copy), ctrl-W, etc.
-                // We need to ignore these characters that are side-effects of commands.
-                // Also make sure the key is pressed (not released). On Linux, text might
-                // contain some data even when the key is released.
-                let is_cmd = self.egui_input.modifiers.ctrl
-                    || self.egui_input.modifiers.command
-                    || self.egui_input.modifiers.mac_cmd;
-                if pressed && !is_cmd {
-                    self.egui_input
-                        .events
-                        .push(egui::Event::Text(text.to_owned()));
-                }
-            }
-        }
     }
 
     /// Call with the output given by `egui`.
@@ -1103,6 +1007,92 @@ fn is_printable_char(chr: char) -> bool {
     !is_in_private_use_area && !chr.is_ascii_control()
 }
 
+// The complete keyboard delivery path, separated from KeyEvent's private
+// platform fields so tests exercise the same gate and event producers as State.
+// Clipboard access stays lazy: only an ordinary paste press reads it.
+fn append_keyboard_input(
+    input: &mut egui::RawInput,
+    winit_logical_key: &winit::keyboard::Key,
+    winit_physical_key: winit::keyboard::PhysicalKey,
+    text: Option<&str>,
+    state: winit::event::ElementState,
+    _repeat: bool, // egui derives repeat itself, as before
+    clipboard_text: impl FnOnce() -> Option<String>,
+) {
+    // Windows reports keys consumed by the IME as Process (VK_PROCESSKEY).
+    // Do not turn their physical fallback into application keys, text, or
+    // clipboard commands. Releases remain available to clear held keys.
+    if !should_forward_keyboard_input(winit_logical_key, state) {
+        return;
+    }
+
+    let pressed = state == winit::event::ElementState::Pressed;
+
+    let physical_key = if let winit::keyboard::PhysicalKey::Code(keycode) = winit_physical_key {
+        key_from_key_code(keycode)
+    } else {
+        None
+    };
+
+    let logical_key = key_from_winit_key(winit_logical_key);
+
+    // Helpful logging to enable when adding new key support
+    log::trace!(
+        "logical {:?} -> {:?},  physical {:?} -> {:?}",
+        winit_logical_key,
+        logical_key,
+        winit_physical_key,
+        physical_key
+    );
+
+    // "Logical OR physical key" is a fallback mechanism for keyboard layouts without Latin characters: it lets them
+    // emit events as if the corresponding keys from the Latin layout were pressed. In this case, clipboard shortcuts
+    // are mapped to the physical keys that normally contain C, X, V, etc.
+    // See also: https://github.com/emilk/egui/issues/3653
+    if let Some(active_key) = logical_key.or(physical_key) {
+        if pressed {
+            if is_cut_command(input.modifiers, active_key) {
+                input.events.push(egui::Event::Cut);
+                return;
+            } else if is_copy_command(input.modifiers, active_key) {
+                input.events.push(egui::Event::Copy);
+                return;
+            } else if is_paste_command(input.modifiers, active_key) {
+                if let Some(contents) = clipboard_text() {
+                    let contents = contents.replace("\r\n", "\n");
+                    if !contents.is_empty() {
+                        input.events.push(egui::Event::Paste(contents));
+                    }
+                }
+                return;
+            }
+        }
+
+        input.events.push(egui::Event::Key {
+            key: active_key,
+            physical_key,
+            pressed,
+            repeat: false, // egui will fill this in for us!
+            modifiers: input.modifiers,
+        });
+    }
+
+    if let Some(text) = text.or_else(|| winit_logical_key.to_text()) {
+        // Make sure there is text, and that it is not control characters
+        // (e.g. delete is sent as "\u{f728}" on macOS).
+        if !text.is_empty() && text.chars().all(is_printable_char) {
+            // On some platforms we get here when the user presses Cmd-C (copy), ctrl-W, etc.
+            // We need to ignore these characters that are side-effects of commands.
+            // Also make sure the key is pressed (not released). On Linux, text might
+            // contain some data even when the key is released.
+            let is_cmd = input.modifiers.ctrl || input.modifiers.command || input.modifiers.mac_cmd;
+            if pressed && !is_cmd {
+                input.events.push(egui::Event::Text(text.to_owned()));
+            }
+        }
+    }
+}
+
 fn should_forward_keyboard_input(
     logical_key: &winit::keyboard::Key,
     state: winit::event::ElementState,
@@ -1116,8 +1106,253 @@ mod keyboard_input_tests {
     use super::*;
     use winit::{
         event::ElementState,
-        keyboard::{Key, KeyCode, NamedKey},
+        keyboard::{Key, KeyCode, NamedKey, PhysicalKey},
     };
+
+    fn key_event(
+        key: egui::Key,
+        physical_key: egui::Key,
+        pressed: bool,
+        modifiers: egui::Modifiers,
+    ) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: Some(physical_key),
+            pressed,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn delivery_process_presses_and_repeats_append_no_events_or_read_clipboard() {
+        for physical in [
+            KeyCode::Enter,
+            KeyCode::Escape,
+            KeyCode::Tab,
+            KeyCode::Space,
+            KeyCode::KeyA,
+            KeyCode::KeyX,
+            KeyCode::KeyC,
+            KeyCode::KeyV,
+            KeyCode::Insert,
+            KeyCode::Delete,
+        ] {
+            for modifiers in [
+                egui::Modifiers::NONE,
+                egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
+                egui::Modifiers::SHIFT,
+            ] {
+                for repeat in [false, true] {
+                    let existing = vec![egui::Event::Text("already queued".into())];
+                    let mut input = egui::RawInput {
+                        events: existing.clone(),
+                        modifiers,
+                        ..Default::default()
+                    };
+                    append_keyboard_input(
+                        &mut input,
+                        &Key::Named(NamedKey::Process),
+                        PhysicalKey::Code(physical),
+                        Some("IME-handled text"),
+                        ElementState::Pressed,
+                        repeat,
+                        || panic!("Process must not read clipboard"),
+                    );
+                    assert_eq!(
+                        input.events, existing,
+                        "physical={physical:?}, modifiers={modifiers:?}, repeat={repeat}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn delivery_process_releases_keep_the_physical_key_without_text_or_clipboard() {
+        for (physical, expected) in [
+            (KeyCode::Enter, egui::Key::Enter),
+            (KeyCode::Escape, egui::Key::Escape),
+            (KeyCode::Tab, egui::Key::Tab),
+            (KeyCode::Space, egui::Key::Space),
+            (KeyCode::KeyA, egui::Key::A),
+            (KeyCode::KeyV, egui::Key::V),
+        ] {
+            let modifiers = egui::Modifiers::CTRL | egui::Modifiers::COMMAND;
+            let mut input = egui::RawInput {
+                modifiers,
+                ..Default::default()
+            };
+            append_keyboard_input(
+                &mut input,
+                &Key::Named(NamedKey::Process),
+                PhysicalKey::Code(physical),
+                Some("release text"),
+                ElementState::Released,
+                false,
+                || panic!("Release must not read clipboard"),
+            );
+            assert_eq!(
+                input.events,
+                vec![key_event(expected, expected, false, modifiers)]
+            );
+        }
+    }
+
+    #[test]
+    fn delivery_ordinary_keys_keep_press_release_text_and_egui_repeat_inference() {
+        for (logical, physical, expected, text) in [
+            (
+                Key::Named(NamedKey::Enter),
+                KeyCode::Enter,
+                egui::Key::Enter,
+                "\r",
+            ),
+            (
+                Key::Named(NamedKey::Escape),
+                KeyCode::Escape,
+                egui::Key::Escape,
+                "",
+            ),
+            (
+                Key::Named(NamedKey::Tab),
+                KeyCode::Tab,
+                egui::Key::Tab,
+                "\t",
+            ),
+            (
+                Key::Named(NamedKey::Space),
+                KeyCode::Space,
+                egui::Key::Space,
+                " ",
+            ),
+            (Key::Character("a".into()), KeyCode::KeyQ, egui::Key::A, "a"),
+            (Key::Character("ж".into()), KeyCode::KeyA, egui::Key::A, "ж"),
+        ] {
+            for state in [ElementState::Pressed, ElementState::Released] {
+                for repeat in [false, true] {
+                    let mut input = egui::RawInput::default();
+                    append_keyboard_input(
+                        &mut input,
+                        &logical,
+                        PhysicalKey::Code(physical),
+                        Some(text),
+                        state,
+                        repeat,
+                        || panic!("Ordinary key must not read clipboard"),
+                    );
+                    let mut expected_events = vec![key_event(
+                        expected,
+                        key_from_key_code(physical).unwrap(),
+                        state == ElementState::Pressed,
+                        egui::Modifiers::NONE,
+                    )];
+                    if state == ElementState::Pressed
+                        && !text.is_empty()
+                        && text.chars().all(is_printable_char)
+                    {
+                        expected_events.push(egui::Event::Text(text.into()));
+                    }
+                    assert_eq!(
+                        input.events, expected_events,
+                        "logical={logical:?}, state={state:?}, repeat={repeat}"
+                    );
+                }
+            }
+        }
+        let mut input = egui::RawInput::default();
+        append_keyboard_input(
+            &mut input,
+            &Key::Character("a".into()),
+            PhysicalKey::Code(KeyCode::KeyA),
+            None,
+            ElementState::Pressed,
+            false,
+            || None,
+        );
+        assert_eq!(
+            input.events,
+            vec![
+                key_event(egui::Key::A, egui::Key::A, true, egui::Modifiers::NONE),
+                egui::Event::Text("a".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn delivery_ordinary_clipboard_commands_keep_fallback_normalization_and_releases() {
+        let modifiers = egui::Modifiers::CTRL | egui::Modifiers::COMMAND;
+        for (physical, character, expected) in [
+            (KeyCode::KeyX, "x", egui::Event::Cut),
+            (KeyCode::KeyC, "c", egui::Event::Copy),
+            (
+                KeyCode::KeyV,
+                "v",
+                egui::Event::Paste("first\nsecond".into()),
+            ),
+        ] {
+            for logical in [Key::Character(character.into()), Key::Character("ж".into())] {
+                for repeat in [false, true] {
+                    let mut input = egui::RawInput {
+                        modifiers,
+                        ..Default::default()
+                    };
+                    let mut reads = 0;
+                    append_keyboard_input(
+                        &mut input,
+                        &logical,
+                        PhysicalKey::Code(physical),
+                        Some(character),
+                        ElementState::Pressed,
+                        repeat,
+                        || {
+                            reads += 1;
+                            Some("first\r\nsecond".into())
+                        },
+                    );
+                    assert_eq!(input.events, vec![expected.clone()]);
+                    assert_eq!(reads, usize::from(physical == KeyCode::KeyV));
+                    input.events.clear();
+                    append_keyboard_input(
+                        &mut input,
+                        &logical,
+                        PhysicalKey::Code(physical),
+                        Some(character),
+                        ElementState::Released,
+                        false,
+                        || panic!("Release must not read clipboard"),
+                    );
+                    let key = key_from_key_code(physical).unwrap();
+                    assert_eq!(input.events, vec![key_event(key, key, false, modifiers)]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn delivery_paste_without_clipboard_contents_appends_no_events() {
+        for contents in [None, Some(String::new())] {
+            let mut input = egui::RawInput {
+                modifiers: egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
+                ..Default::default()
+            };
+            let mut reads = 0;
+            append_keyboard_input(
+                &mut input,
+                &Key::Character("v".into()),
+                PhysicalKey::Code(KeyCode::KeyV),
+                Some("v"),
+                ElementState::Pressed,
+                false,
+                || {
+                    reads += 1;
+                    contents
+                },
+            );
+            assert_eq!(reads, 1);
+            assert!(input.events.is_empty());
+        }
+    }
 
     #[test]
     fn ime_process_press_is_not_forwarded() {

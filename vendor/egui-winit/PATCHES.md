@@ -90,7 +90,7 @@ P2 修正後の trace は Space の種類を全経路で秘匿するが、logica
 
 ## 段 2a のキー配送規則（2026-10-14、挙動変更）
 
-`on_keyboard_input` の入口で、`logical=NamedKey::Process` かつ press を
+`on_keyboard_input` が呼ぶ配送関数の入口で、`logical=NamedKey::Process` かつ press を
 `should_forward_keyboard_input` の純関数で拒否する。repeat も同じ入口を通るため、
 physical fallback、Text、Cut / Copy / Paste の全 producer より前に遮断される。
 release は Process であっても渡し、追跡集合や新しい入力状態は持たない。
@@ -109,6 +109,22 @@ trace は既定無効のまま残し、Process press の出力は実際の追加
 workspace 外のため `scripts/test-full.ps1` に無 filter の lib test を追加する。
 同梱 upstream lock の旧 image / tiff 依存は offline cache に無いため、manifest 単独ではなく
 root graph の `cargo test -p egui-winit --lib` で、本体と同じ依存を使って全件実行する。
+
+### 段 2a レビュー P3: 配送経路の回帰（2026-10-14）
+
+`KeyEvent` は private field のため合成できない。`on_keyboard_input` は部品を取り出して
+`append_keyboard_input` を呼ぶだけにし、遮断・キー変換・Key / Text / clipboard event の
+追加をこの関数へ挙動不変で移した。テストは軽量な `RawInput` の実イベント列を検査する。
+clipboard getter は遅延 closure とし、Process press / repeat と release では呼ばれないことも
+検証する。winit の repeat は従来どおり egui の判定に委ね、出力 Key の repeat は false。
+trace の begin / finish hook、出力と `EventResponse` は変更しない。
+
+追加5件は Process press / repeat（Enter / Esc / Tab / Space / 文字・clipboardキー）、
+Process release、通常キーの press / release・文字・非ラテンfallback、通常 Cut / Copy /
+Paste（CRLF正規化、release）、空・取得不能clipboardを実配送経路で固定する。
+全21件成功。配送関数内の `should_forward_keyboard_input` 呼び出しを一時的に削除すると
+新しい Process 配送テストが失敗（20 passed / 1 failed、exit 101）し、戻すと全21件成功。
+ログは `target/i2a-p3-{mutation,restored-tests}.log`。コミット・アプリ起動・build は行わない。
 
 ## 段 1 の検証履歴
 
