@@ -694,7 +694,7 @@ impl SmartFolderSession {
 static SMART_FOLDER_SESSION_DROP_BACKLOG: OnceLock<Mutex<Vec<RetiredSmartFolderPayload>>> =
     OnceLock::new();
 
-fn retire_smart_folder_session_payloads(values: Vec<RetiredSmartFolderPayload>) {
+pub(super) fn retire_smart_folder_session_payloads(values: Vec<RetiredSmartFolderPayload>) {
     let backlog = SMART_FOLDER_SESSION_DROP_BACKLOG.get_or_init(|| Mutex::new(Vec::new()));
     let mut retired = std::mem::take(&mut *backlog.lock().unwrap());
     retired.extend(values);

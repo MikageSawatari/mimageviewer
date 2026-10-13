@@ -923,6 +923,11 @@ pub(in crate::app) struct ViewerContextBundle {
     current_folder_rating_cache: Option<u8>,
     current_folder_last_mtime: Option<std::time::SystemTime>,
     current_folder_signature: Option<folder_scan::FolderScanSignature>,
+    folder_observation: Option<FolderObservation>,
+    current_folder_watch: Option<CurrentFolderWatch>,
+    current_folder_watch_failed: Option<PathBuf>,
+    external_rescan_pending: Option<ExternalRescanPending>,
+    folder_refresh_pending: Option<book_append_refresh::FolderRefreshRequest>,
     folder_pin_map: std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
     converted_archive_cache_paths: std::collections::HashMap<String, ConvertedArchiveSourceState>,
     converted_archive_pin_root_states:
@@ -1179,6 +1184,7 @@ pub(in crate::app) struct ContextRef<'a> {
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::app) enum ContextAsyncOwner {
+    FolderObservation,
     RetainedSpreadShift,
     PathClassification,
     HistoryTransition,
@@ -1210,7 +1216,8 @@ pub(in crate::app) enum ContextAsyncServicePhase {
 
 #[cfg(windows)]
 impl ContextAsyncOwner {
-    pub(in crate::app) const ALL: [Self; 20] = [
+    pub(in crate::app) const ALL: [Self; 21] = [
+        Self::FolderObservation,
         Self::RetainedSpreadShift,
         Self::EpubConversion,
         Self::PdfPassword,
@@ -1237,6 +1244,7 @@ impl ContextAsyncOwner {
         macro_rules! pending {
             ($owner:ident) => {
                 match self {
+                    Self::FolderObservation => $owner.external_rescan_pending.is_some(),
                     Self::RetainedSpreadShift => $owner.spread_shift.retained_readoption_pending(),
                     Self::PathClassification => $owner
                         .top_level_grid_view
@@ -1295,7 +1303,10 @@ impl ContextAsyncOwner {
         }
         matches!(
             self,
-            Self::CollectionGrid | Self::CollectionNavigation | Self::RatingNavigation
+            Self::FolderObservation
+                | Self::CollectionGrid
+                | Self::CollectionNavigation
+                | Self::RatingNavigation
         ) || self.is_pending(context)
     }
 
@@ -1318,6 +1329,10 @@ impl ContextAsyncOwner {
             return;
         }
         match self {
+            Self::FolderObservation => {
+                app.poll_current_folder_watch(ctx);
+                app.poll_external_rescan(ctx);
+            }
             Self::RetainedSpreadShift => app.poll_retained_shift_readoption(ctx),
             Self::PathClassification => app.poll_open_path_classification(ctx),
             Self::HistoryTransition => app.poll_collection_history_transition(ctx),
@@ -1365,6 +1380,7 @@ impl ContextAsyncOwner {
 
     pub(in crate::app) fn terminate_on_park(self, app: &mut App) {
         match self {
+            Self::FolderObservation => {}
             Self::PathClassification => {
                 if let Some(candidate) = app.top_level_grid_view.take_open_path_classification() {
                     app.finish_rejected_open_path_classification(&candidate);
@@ -1743,6 +1759,11 @@ impl ViewerContextBundle {
     /// one-shot worker だが、owner の消滅後に CPU / GPU / AI 処理を続ける理由がないので、
     /// 各 worker が既に監視している cancel token を立てる。
     fn cancel_all_context_work(&mut self) {
+        if let Some(pending) = self.external_rescan_pending.take() {
+            pending.cancel_and_retire();
+        }
+        self.current_folder_watch = None;
+        self.folder_refresh_pending = None;
         self.current_book_bookmarks_request = None;
         crate::thumb_loader::cancel_raw_thumb_tickets(&self.raw_thumb_develop);
         self.cancel_token.store(true, Ordering::Relaxed);
@@ -1949,6 +1970,11 @@ impl ViewerContextBundle {
             current_folder_rating_cache: None,
             current_folder_last_mtime: None,
             current_folder_signature: None,
+            folder_observation: None,
+            current_folder_watch: None,
+            current_folder_watch_failed: None,
+            external_rescan_pending: None,
+            folder_refresh_pending: None,
             folder_pin_map: std::collections::HashMap::new(),
             converted_archive_cache_paths: std::collections::HashMap::new(),
             converted_archive_pin_root_states: std::collections::HashMap::new(),
@@ -2161,11 +2187,10 @@ impl App {
         self.pending_folder_nav_mode = FolderNavMode::Grid;
         crate::thumb_loader::cancel_raw_thumb_tickets(&self.raw_thumb_develop);
         self.requested.discard_images();
-        debug_assert!(
-            ContextAsyncOwner::ALL
-                .into_iter()
-                .all(|owner| { !owner.is_pending(ContextRef::mounted(self)) })
-        );
+        debug_assert!(ContextAsyncOwner::ALL.into_iter().all(|owner| {
+            owner == ContextAsyncOwner::FolderObservation
+                || !owner.is_pending(ContextRef::mounted(self))
+        }));
     }
 
     #[cfg(windows)]
@@ -2320,6 +2345,11 @@ impl App {
             current_folder_rating_cache,
             current_folder_last_mtime,
             current_folder_signature,
+            folder_observation,
+            current_folder_watch,
+            current_folder_watch_failed,
+            external_rescan_pending,
+            folder_refresh_pending,
             folder_pin_map,
             converted_archive_cache_paths,
             converted_archive_pin_root_states,
@@ -2596,6 +2626,11 @@ impl App {
         swap_field!(current_folder_rating_cache);
         swap_field!(current_folder_last_mtime);
         swap_field!(current_folder_signature);
+        swap_field!(folder_observation);
+        swap_field!(current_folder_watch);
+        swap_field!(current_folder_watch_failed);
+        swap_field!(external_rescan_pending);
+        swap_field!(folder_refresh_pending);
         swap_field!(folder_pin_map);
         swap_field!(converted_archive_cache_paths);
         swap_field!(converted_archive_pin_root_states);
@@ -2936,6 +2971,11 @@ impl App {
             current_folder_rating_cache,
             current_folder_last_mtime,
             current_folder_signature,
+            folder_observation,
+            current_folder_watch,
+            current_folder_watch_failed,
+            external_rescan_pending,
+            folder_refresh_pending,
             folder_pin_map,
             converted_archive_cache_paths,
             converted_archive_pin_root_states,
@@ -3172,6 +3212,7 @@ impl App {
             tags_cache,
             current_folder_last_mtime,
             current_folder_signature,
+            folder_observation,
             top_level_grid_view,
             snapshot,
             global_search_subfolder_restore,
@@ -3295,6 +3336,10 @@ impl App {
         // グリッド worker / 詳細列 / タグ prewarm / 編集・見開き・view-trim / folder-nav は
         // main が原本を保持する。parked メディア窓はこれらを駆動しないので empty のままでよい。
         keep_in_main!(
+            current_folder_watch,
+            current_folder_watch_failed,
+            external_rescan_pending,
+            folder_refresh_pending,
             navigation_scope,
             global_search,
             rating_view_stars,
@@ -3418,6 +3463,17 @@ impl App {
             ai_classify_cache,
         );
         if let Some((mut snapshot, surface)) = direct_owner {
+            let basis_generation = match &snapshot.source_label {
+                crate::snapshot::SnapshotSourceLabel::DirectMedia {
+                    basis_generation, ..
+                } => *basis_generation,
+                _ => unreachable!("direct media owner has direct media source"),
+            };
+            let record_matches_basis = self.folder_observation.as_ref().is_some_and(|record| {
+                record.generation == basis_generation
+                    && record.source == snapshot.origin
+                    && self.current_folder.as_ref() == Some(&record.source)
+            });
             self.items = std::mem::take(&mut snapshot.saved_items);
             self.thumbnails = std::mem::take(&mut snapshot.saved_thumbnails);
             self.image_metas = std::mem::take(&mut snapshot.saved_image_metas);
@@ -3429,6 +3485,9 @@ impl App {
             // Appended target removal leaves every basis index stable. Retain its
             // metadata/edit caches and invalidate only generation-bound main work.
             self.bump_items_generation();
+            if record_matches_basis {
+                self.folder_observation.as_mut().unwrap().generation = self.items_generation;
+            }
             self.move_grid_cursor(
                 snapshot.saved_selected,
                 crate::app::GridCursorIntent::Automatic,
@@ -3443,6 +3502,9 @@ impl App {
             parked.navigation_scope = ViewerNavigationScope::DetachedPhysical;
             parked.snapshot = Some(snapshot);
             parked.top_level_grid_view = surface;
+        }
+        if let Some(record) = parked.folder_observation.as_mut() {
+            record.generation = parked.items_generation;
         }
         parked
     }
@@ -3505,6 +3567,12 @@ impl App {
         detached.display_epub_source = self.display_epub_source.clone();
         detached.fullscreen_epub_source = self.fullscreen_epub_source.clone();
         detached.current_folder = Some(physical_context.to_path_buf());
+        if let Some(record) = detached.folder_observation.as_mut() {
+            record.source = physical_context.to_path_buf();
+            record.generation = items_generation;
+            record.projection_key =
+                folder_projection_key(&self.settings, detached.stack_mode_requested);
+        }
         if !parked_direct_media_owner(&detached) {
             detached.visible_indices = detached
                 .items
@@ -3751,6 +3819,42 @@ impl App {
 
     pub(in crate::app) fn viewer_context_residence(&self, id: ViewerContextId) -> ContextResidence {
         self.viewer_contexts.table.residence(id)
+    }
+
+    pub(in crate::app) fn enqueue_at_rest_book_append_observation(
+        &mut self,
+        context: ViewerContextId,
+        folder: &Path,
+        cause: book_append_refresh::FolderRefreshCause,
+    ) {
+        if let Some(bundle) = self.viewer_contexts.table.at_rest_mut(context)
+            && bundle.current_folder.as_deref() == Some(folder)
+        {
+            bundle.folder_refresh_pending = Some(book_append_refresh::FolderRefreshRequest {
+                folder: folder.to_path_buf(),
+                cause,
+            });
+        }
+    }
+
+    pub(in crate::app) fn cancel_at_rest_book_append_observations(&mut self, folder: &Path) {
+        for slot in self.viewer_contexts.table.slots.values_mut() {
+            let Slot::AtRest(bundle) = slot else {
+                continue;
+            };
+            if bundle
+                .external_rescan_pending
+                .as_ref()
+                .is_some_and(|pending| pending.folder == folder)
+            {
+                let pending = bundle.external_rescan_pending.take().unwrap();
+                pending.cancel_and_retire();
+                bundle.folder_refresh_pending = Some(book_append_refresh::FolderRefreshRequest {
+                    folder: folder.to_path_buf(),
+                    cause: book_append_refresh::FolderRefreshCause::BookAppendExternal,
+                });
+            }
+        }
     }
 
     pub(in crate::app) fn deliver_spread_shift_reply_at_rest(
@@ -5720,6 +5824,7 @@ mod tests {
             .filter(|name| name.ends_with("pending"))
             .collect::<std::collections::BTreeSet<_>>();
         let registered = [
+            "external_rescan_pending",
             "folder_nav_pending",
             "folder_pane_open_pending",
             "fs_pending",
@@ -5737,6 +5842,7 @@ mod tests {
         // These are cache/write workers, not a document-open or fullscreen request. Their
         // established mounted frame and resume lifecycles remain separate from park terminal.
         let cache_or_write = [
+            "folder_refresh_pending",
             "stack_script_pending",
             "facet_name_cache_pending",
             "details_meta_pending",

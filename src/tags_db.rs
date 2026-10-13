@@ -3,6 +3,17 @@
 //! `%APPDATA%/mimageviewer/tags.db` を正本にし、タグ名は保存時に `#` を
 //! 持たない。UI 表示だけ `#` を付ける。
 
+#[cfg(test)]
+thread_local! { static READ_OPERATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+#[cfg(test)]
+pub(crate) fn read_operations_for_test() -> usize {
+    READ_OPERATIONS.with(std::cell::Cell::get)
+}
+#[cfg(test)]
+fn count_read_for_test() {
+    READ_OPERATIONS.with(|calls| calls.set(calls.get() + 1));
+}
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -190,6 +201,8 @@ impl TagsDb {
     }
 
     pub fn get_item_tags(&self, item_key: &str) -> Vec<ItemTag> {
+        #[cfg(test)]
+        count_read_for_test();
         let mut stmt = match self.conn.prepare_cached(
             "SELECT tag, tag_key, applied_at
              FROM item_tags
@@ -213,6 +226,8 @@ impl TagsDb {
     }
 
     pub fn get_many_display_tags(&self, item_keys: &[String]) -> HashMap<String, Vec<String>> {
+        #[cfg(test)]
+        count_read_for_test();
         let mut out: HashMap<String, Vec<String>> = HashMap::new();
         if item_keys.is_empty() {
             return out;
@@ -595,6 +610,8 @@ impl TagsDb {
     }
 
     pub fn has_item_state(&self, item_key: &str) -> bool {
+        #[cfg(test)]
+        count_read_for_test();
         self.conn
             .query_row(
                 "SELECT 1 FROM tag_item_state WHERE item_key = ?1 LIMIT 1",
@@ -629,6 +646,8 @@ impl TagsDb {
     }
 
     pub fn sidecar_sync_get(&self, folder_key: &str) -> Option<i64> {
+        #[cfg(test)]
+        count_read_for_test();
         self.conn
             .prepare_cached("SELECT sidecar_mtime FROM tag_sidecar_sync WHERE folder_key = ?1")
             .ok()?
@@ -661,6 +680,8 @@ impl TagsDb {
     }
 
     pub fn tag_summaries(&self) -> Vec<TagSummary> {
+        #[cfg(test)]
+        count_read_for_test();
         let mut stmt = match self.conn.prepare(
             "SELECT tag, tag_key, COUNT(*) AS c, MAX(applied_at) AS last_at
              FROM item_tags
@@ -687,6 +708,8 @@ impl TagsDb {
 
     /// タグが 1 件でも存在するかを、集約せず先頭行だけで確認する。
     pub fn has_any_tags(&self) -> Result<bool, rusqlite::Error> {
+        #[cfg(test)]
+        count_read_for_test();
         self.conn
             .query_row("SELECT 1 FROM item_tags LIMIT 1", [], |_| Ok(()))
             .optional()
@@ -694,6 +717,8 @@ impl TagsDb {
     }
 
     pub fn find_by_prefix(&self, prefix: &str, limit: usize) -> Vec<TagSummary> {
+        #[cfg(test)]
+        count_read_for_test();
         let key = normalize_tag_key(prefix);
         let escaped = escape_like_pattern(&key);
         let pattern = format!("{escaped}%");
@@ -724,6 +749,8 @@ impl TagsDb {
     }
 
     pub fn find_exact(&self, tag: &str) -> Option<TagSummary> {
+        #[cfg(test)]
+        count_read_for_test();
         let key = normalize_tag_key(tag);
         if key.is_empty() {
             return None;
@@ -752,6 +779,8 @@ impl TagsDb {
     }
 
     pub fn item_keys_by_tag_prefix(&self, prefix: &str, limit: usize) -> Vec<String> {
+        #[cfg(test)]
+        count_read_for_test();
         let key = normalize_tag_key(prefix);
         if key.is_empty() || limit == 0 {
             return Vec::new();
@@ -776,6 +805,8 @@ impl TagsDb {
     }
 
     pub fn item_keys_by_tag_exact(&self, tag: &str, limit: usize) -> Vec<String> {
+        #[cfg(test)]
+        count_read_for_test();
         let key = normalize_tag_key(tag);
         if key.is_empty() || limit == 0 {
             return Vec::new();
@@ -798,6 +829,8 @@ impl TagsDb {
     }
 
     pub fn item_keys_by_tag_terms_and(&self, terms: &[String], limit: usize) -> Vec<String> {
+        #[cfg(test)]
+        count_read_for_test();
         let mut matches = Vec::new();
         for term in terms {
             let key = normalize_tag_key(term);

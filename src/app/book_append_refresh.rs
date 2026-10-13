@@ -201,7 +201,7 @@ impl App {
             .is_some_and(|scan| crate::folder_tree::path_eq(&scan.folder, &receipt.files.folder))
         {
             let scan = self.external_rescan_pending.take().unwrap();
-            scan.cancel.store(true, Ordering::Relaxed);
+            scan.cancel_and_retire();
         }
         if self
             .folder_refresh_pending
@@ -209,6 +209,11 @@ impl App {
             .is_some_and(|request| request.cause.operation() == Some(receipt.operation()))
         {
             self.folder_refresh_pending = None;
+        }
+        #[cfg(windows)]
+        {
+            let folder = receipt.files.folder.clone();
+            self.cancel_at_rest_book_append_observations(&folder);
         }
         // Existing generation/cancel owners reject readonly results after Undo.
         self.cancel_pending_folder_nav();
@@ -292,6 +297,13 @@ impl App {
                     .is_some_and(|receipt| receipt.files.verify_composition(&composition).is_ok());
                 let observed_folder_mtime = request.observed_folder_mtime;
                 let mut refresh = self.current_list_refresh_intent();
+                if let StartupListIntent::RefreshList {
+                    automatic_observation,
+                    ..
+                } = &mut refresh
+                {
+                    *automatic_observation = true;
+                }
                 if explained
                     && self.book_append_operation_is_current(operation)
                     && let StartupListIntent::RefreshList {
@@ -492,25 +504,28 @@ impl App {
         else {
             return;
         };
-        // The current watcher/resume/scan producer is Main's projected owner;
-        // external_rescan_pending is App-global. Never mount sibling contexts
-        // or cancel their work to turn this terminal into a new fanout producer.
-        if (observations
-            .contexts()
-            .contains(&self.edit_request_owner_context())
+        let cause = self
+            .book_append_undo_receipt
+            .as_ref()
+            .filter(|receipt| {
+                receipt.accepted_revision == self.book_append_undo_revision
+                    && crate::folder_tree::path_eq(&receipt.files.folder, target_folder)
+            })
+            .cloned()
+            .map(FolderRefreshCause::BookAppend)
+            .unwrap_or(FolderRefreshCause::BookAppendExternal);
+        let current = self.edit_request_owner_context();
+        for context in observations.contexts().iter().copied() {
+            if context == current {
+                continue;
+            }
+            #[cfg(windows)]
+            self.enqueue_at_rest_book_append_observation(context, target_folder, cause.clone());
+        }
+        if (observations.contexts().contains(&current)
             || *source_context != self.projected_viewer_context_id())
             && self.book_append_refresh_folder_is_current(target_folder)
         {
-            let cause = self
-                .book_append_undo_receipt
-                .as_ref()
-                .filter(|receipt| {
-                    receipt.accepted_revision == self.book_append_undo_revision
-                        && crate::folder_tree::path_eq(&receipt.files.folder, target_folder)
-                })
-                .cloned()
-                .map(FolderRefreshCause::BookAppend)
-                .unwrap_or(FolderRefreshCause::BookAppendExternal);
             if self.delete_pending.is_some() {
                 self.folder_refresh_pending = Some(FolderRefreshRequest {
                     folder: target_folder.clone(),
@@ -767,9 +782,14 @@ mod tests {
         let scan = scan(&receipt.files.folder);
         let signature = signature_from_scan(&scan);
         let (tx, rx) = mpsc::channel();
-        tx.send(Some((scan, signature, FolderRefreshCause::External)))
-            .unwrap();
+        tx.send(Some(ExternalRescanResult::Different(
+            scan,
+            signature,
+            FolderRefreshCause::External,
+        )))
+        .unwrap();
         app.external_rescan_pending = Some(ExternalRescanPending {
+            proof: None,
             owner_context_id: app.edit_request_owner_context(),
             folder: receipt.files.folder.clone(),
             mtime: std::time::SystemTime::UNIX_EPOCH,
@@ -1027,7 +1047,7 @@ mod tests {
         let signature = signature_from_scan(&fresh);
         let (scan_tx, scan_rx) = mpsc::channel();
         scan_tx
-            .send(Some((
+            .send(Some(ExternalRescanResult::Different(
                 fresh,
                 signature,
                 FolderRefreshCause::BookAppend(receipt.clone()),
@@ -1083,13 +1103,14 @@ mod tests {
             let signature = signature_from_scan(&scan);
             let (scan_tx, scan_rx) = mpsc::channel();
             scan_tx
-                .send(Some((
+                .send(Some(ExternalRescanResult::Different(
                     scan,
                     signature,
                     FolderRefreshCause::BookAppendExternal,
                 )))
                 .unwrap();
             app.external_rescan_pending = Some(ExternalRescanPending {
+                proof: None,
                 owner_context_id: app.projected_viewer_context_id(),
                 folder: receipt.files.folder.clone(),
                 mtime: std::time::SystemTime::UNIX_EPOCH,
@@ -1146,6 +1167,7 @@ mod tests {
         let (_tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         app.external_rescan_pending = Some(ExternalRescanPending {
+            proof: None,
             owner_context_id: app.projected_viewer_context_id(),
             folder: receipt.files.folder.clone(),
             mtime: std::time::SystemTime::UNIX_EPOCH,

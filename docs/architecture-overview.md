@@ -28,6 +28,15 @@ I/Oなしhelperで比較し、`archive_cache::is_under_cache_root`とcache対応
 sourceの種類採否と派生動画判定後、producer既存のsort／走査順で採用し、画像種類の非表示で
 採用候補を変えない。候補metadataを既存signatureへ含め、追加I/Oやcontext ownerを作らない。
 
+実Folderの自動観測は、前回走査の軽い行記録、購読、dirty／cutoff、走査中要求を
+同じViewerContextBundleで所有する。既存rescan workerで種類採否・同名除去・順序を投影して
+前回記録と比較し、一致なら一覧install・世代更新・install起因のthumbnail再要求を省く。
+採用時はcontext／exact source／一覧世代／投影条件／記録revisionを照合する。
+forkはimmutableな行記録だけを継承し、購読・dirty・要求を共有しない。
+自動originは既存RefreshList intentからhydrationまで運び、sidecar取込だけを外す。
+明示GridReload／通常openは従来の取込とreloadを行う。
+契約と受入記録は [§1.375 R10](section375-operation-reconcile-plan.md)。
+
 
 検索索引の所有判定は `metadata_ownership`、metadata の構成変更は
 `metadata_reconfiguration`、名前索引の root 所有は `name_index_manager` に集約する。

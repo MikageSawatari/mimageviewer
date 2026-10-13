@@ -400,26 +400,26 @@ Resumed の親 mtime ふるい、通知時のふるい bypass、走査中通知�
 新しい P2 が出続けた。mtime だけの再走査を無視する最小設計で、開いている一覧の代表も安定するため、
 session state／catalog／Remote・IPC の変更を避ける。
 
-次の版の設計変更 (利用者2026-10-13、R8・LISTrev10独立設計レビューACCEPT・実装承認済み、初回採用入力の共有境界は設計§7の判断待ち):
-[§1.375 R8](section375-operation-reconcile-plan.md) は走査・通常一覧準備・全行exact比較を既存prepare
-ownerのworkerで行い、UIは同一／差分と差分の場合だけprepared結果を受ける。採用直前は
-context・世代／revisionを確認し、比較中に表示値が変わった結果は既存の拒否／再準備へ戻す。
-UIで全行比較・全件clone・比較用snapshot再構築を行わず、worker生成のimmutable採用投影と
-既存所有データを安価に共有する。現状はApp.items／prepared itemsがVec、folder prepareも
-UI側であり、この共有投影とworker準備への分離は必要な未実装基盤（設計§3.4）である。
-通常の初回採用では行とmetadataがUIのVecへ入り、既存hydration workerには行だけが渡る。
-実際に採用した値を安価に共有する境界を設計§7で先に確定し、初回表示を勝手に遅らせない。
-大量一覧1万／10万行でUI時間・worker比較時間・割当量と既存perfを測定する予定。
-完全一致時だけ一覧installとそれに伴うサムネイル再要求を省き、現在の表示と既存要求を残す。
-代表の選択保持保証・消失時だけ再選定・Stack保持identityの契約は撤回する。差分install、
-CPU／GPU eviction後の再読込、idle upgrade、サイズ変更、cache miss／再生成では通常の
-代表選定・cache／要求経路に従い、代表が変わってよい。明示「最新の情報に更新」は従来どおり。
-cache key／payload／lookup／catalog・旧cache移行を変更せず、新しい保持キーや要求modeを
-追加しない。CPU／GPU eviction・予算・画像／保存終端・request ID相関も変更しない。
-手動pin設定・pin先消失時の既存fallbackは維持する。
-上記§1.314の観測mtime／採用表示metadata・sort・代表要求stampの区別は維持する。
-購読・dirty・結果採用は元contextに閉じ、兄弟contextを変更しない。代表sourceのprovenance照合や
-自己操作IDは使わない。ちらつき修正は未完了で、旧方式の検証をR8の受入証拠に流用しない。
+次の版の設計変更 (利用者2026-10-13夜、R10・LISTrev13独立設計レビューACCEPT・実装／自動検証完了、2026-10-14):
+[§1.375 R10](section375-operation-reconcile-plan.md) は前回／今回の走査の行signature
+（名前・種類・サイズ・更新日時・投影後順序）をworkerで比較し、一致時だけinstall・世代更新・
+install起因thumb再要求を省く。UIは元context・source・世代・投影条件と前回記録の有効性を確認する。
+全表示snapshot・DB metadata共有storage・UI全件clone・追加同期I/Oを使わない。
+Delete成功行の除去は同じownerの前回記録へ反映し、非表示候補の繰上げは今回走査の差分として扱う。
+購読・dirty／cutoff・rescan・記録を元contextに閉じ、forkは記録を継承して新ownerへ束縛し、
+独立購読を登録後scanで始める。兄弟のdirty／要求を消さない。
+sidecar stampと別context／RemoteのDB反映資格は判定外。自動更新ではsidecarを取込まず、
+未反映のDB値・外部sidecarは明示GridReload／開き直しで反映する。defer→一覧復帰・restart・
+Resumedでも自動originを保持し、その直後の明示更新／通常openは設定どおり取込む対照試験を行う。
+実Folder mtime-onlyの観測値と表示metadata・sort・代表要求stampの分離（§1.314）は維持する。
+代表選択保持・cache key／payload変更・旧cache移行は撤回し、CPU／GPU eviction・予算・
+画像／保存両終端・request ID相関を変更しない。install省略中は現在の画像と要求が残るが、
+通常のeviction後再読込・idle upgrade等で代表は変わってよい。手動pin設定は解除しない。
+1万／10万行でUI／worker時間・割当量・install回数、Delete後の描画／scroll時の同期DB query数を
+測定済み。opt-level=2の100k行初回記録はmedian 8.353／max 10.949 ms、worker比較0.717 ms。
+Equal UI pollはdebug 0.551 ms、Delete後のheadless描画／scrollの同期DB read差分0回。
+constructor単体・headless測定であり実アプリの最大frameを示さない。自動gateと最新dev成功、
+実機確認待ち。詳しい条件・全結果は設計書§8.2へ残し、旧方式の結果をR10の受入証拠に流用しない。
 
 ## 3. GPU テクスチャアップロード
 

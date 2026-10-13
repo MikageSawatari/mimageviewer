@@ -564,13 +564,15 @@ mod folder_mtime_rescan_tests {
                     scan,
                     signature,
                 ),
-                "append_external" => app.apply_external_rescan_with_cause(
-                    folder.clone(),
-                    std::time::SystemTime::now(),
-                    scan,
-                    signature,
-                    book_append_refresh::FolderRefreshCause::BookAppendExternal,
-                ),
+                "append_external" => {
+                    app.apply_external_rescan_with_cause(
+                        folder.clone(),
+                        std::time::SystemTime::now(),
+                        scan,
+                        signature,
+                        book_append_refresh::FolderRefreshCause::BookAppendExternal,
+                    );
+                }
                 "manual" => {
                     app.reload_current_folder_preserving_override();
                     assert!(
@@ -663,32 +665,21 @@ mod folder_mtime_rescan_tests {
 
     fn prepare() -> (AppTestEnv, PathBuf) {
         let mut app = setup_app();
+        // Every archive/PDF/EPUB candidate in real_changes is a displayed row here.
+        // Hidden duplicate changes are covered separately by §1.375 projection regressions.
+        app.settings.skip_archive_if_zip_exists = false;
+        app.settings.skip_epub_if_pdf_exists = false;
         let folder = app.tmp.path().join("folder_mtime_rescan");
         std::fs::create_dir(&folder).unwrap();
         let scan = fixture(&folder);
         app.current_folder = Some(folder.clone());
         app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
         app.current_folder_signature = Some(signature_from_scan(&scan));
-        app.items = scan
-            .folders
-            .iter()
-            .map(|entry| entry.item.clone())
-            .chain(scan.all_media.iter().map(|entry| match entry.kind {
-                folder_scan::ScanMediaKind::Image => GridItem::Image(entry.path.clone()),
-                folder_scan::ScanMediaKind::Video => GridItem::Video(entry.path.clone()),
-                folder_scan::ScanMediaKind::Audio => GridItem::Audio(entry.path.clone()),
-            }))
-            .collect();
-        app.image_metas = scan
-            .folders
-            .iter()
-            .map(|entry| entry.display_meta)
-            .chain(
-                scan.all_media
-                    .iter()
-                    .map(|entry| Some((entry.mtime, entry.file_size))),
-            )
-            .collect();
+        app.seed_folder_observation_for_test(&folder, &scan);
+        let listing =
+            materialize_local_folder_listing(&folder, scan.clone_for_projection(), &app.settings);
+        app.items = listing.items;
+        app.image_metas = listing.metas;
         app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
         app.thumbnails[0] = mutation_refresh_loaded_thumb(&egui::Context::default());
         app.thumbnails[1] = ThumbnailState::Evicted;
@@ -796,6 +787,7 @@ mod folder_mtime_rescan_tests {
         let (mut app, folder) = prepare();
         for (label, scan) in real_changes(&folder) {
             app.current_folder_signature = Some(signature_from_scan(&fixture(&folder)));
+            app.seed_folder_observation_for_test(&folder, &fixture(&folder));
             let generation = app.items_generation;
             let signature = signature_from_scan(&scan);
             app.apply_external_rescan(
@@ -865,10 +857,16 @@ mod folder_mtime_rescan_tests {
             tx.send(if case == "failed" {
                 None
             } else {
-                Some((scan, new_signature, Default::default()))
+                Some(ExternalRescanResult::Equal(
+                    new_signature,
+                    app.folder_observation.as_ref().unwrap().rows.clone(),
+                    Default::default(),
+                    std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2),
+                ))
             })
             .unwrap();
             app.external_rescan_pending = Some(ExternalRescanPending {
+                proof: None,
                 cause: Default::default(),
                 owner_context_id: if case == "other owner" {
                     ViewerContextId::for_test(u64::MAX)
@@ -19450,6 +19448,8 @@ mod folder_pane_open_nav_tests {
 
     fn empty_scan() -> ScannedDir {
         ScannedDir {
+            precise_stamps: Default::default(),
+            reconcile: None,
             auxiliary_media: Default::default(),
             complete_audio_inventory: None,
             folders: Vec::new(),
@@ -22956,6 +22956,8 @@ mod phase_c_folder_nav_history_tests {
                 panic!("fixture expected folder preflight");
             };
             let mut scan = crate::app::folder_scan::ScannedDir {
+                precise_stamps: Default::default(),
+                reconcile: None,
                 auxiliary_media: Default::default(),
                 folders: Vec::new(),
                 all_media: Vec::new(),
@@ -46910,6 +46912,8 @@ mod favorite_adjustment_defaults_tests {
         );
         app.consume_folder_refresh_pending(&egui::Context::default());
         assert!(app.folder_refresh_pending.is_none());
+        assert!(app.external_rescan_pending.is_some());
+        super::phase_c_support::wait_for_external_rescan(&mut app);
         super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
         assert!(app.items.iter().any(|item| {
             matches!(item, GridItem::Image(path) if crate::folder_tree::path_eq(path, &output))
@@ -51023,7 +51027,7 @@ mod favorite_adjustment_defaults_tests {
     /// stale な signature が残っていると `check_external_folder_changes` が
     /// 「内容変化あり」と誤判定して数千件の items を再走査して UI が固まる。
     #[test]
-    fn poll_delete_pending_clears_current_folder_signature() {
+    fn section1375_poll_delete_pending_retains_and_updates_previous_scan_rows() {
         use crate::delete_worker::{DeleteMsg, DeletePending};
         use crate::grid_item::{GridItem, ThumbnailState};
         use std::sync::atomic::AtomicBool;
@@ -51037,6 +51041,8 @@ mod favorite_adjustment_defaults_tests {
         app.current_folder = Some(folder.clone());
         app.current_folder_signature =
             Some(folder_scan::FolderScanSignature::for_test(0xDEAD_BEEF));
+        app.seed_folder_observation_for_test(&folder, &folder_scan::scan_directory(&folder));
+        app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
         app.items.push(GridItem::Image(target_path.clone()));
         app.thumbnails.push(ThumbnailState::Pending);
         app.rating_cache.insert(0, 5);
@@ -51087,8 +51093,8 @@ mod favorite_adjustment_defaults_tests {
             "Done 受信で delete_pending は take される"
         );
         assert!(
-            app.current_folder_signature.is_none(),
-            "削除完了で signature が None reset されること"
+            app.current_folder_signature.is_some(),
+            "削除後の比較は旧走査行から成功行だけ除去した記録で続く"
         );
         assert_eq!(
             app.items.len(),
@@ -58362,6 +58368,7 @@ mod pipeline_cache_refactor_tests {
         app.current_folder = Some(folder.clone());
         app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
         app.current_folder_signature = Some(signature_from_scan(&scan_directory(&folder)));
+        app.seed_folder_observation_for_test(&folder, &scan_directory(&folder));
         app.items = vec![GridItem::Image(first_image.clone())];
         app.thumbnails = vec![ThumbnailState::Pending];
 
@@ -58410,6 +58417,7 @@ mod pipeline_cache_refactor_tests {
         app.current_folder = Some(folder.clone());
         app.current_folder_last_mtime = Some(initial_mtime);
         app.current_folder_signature = Some(signature_from_scan(&scan_directory(&folder)));
+        app.seed_folder_observation_for_test(&folder, &scan_directory(&folder));
         app.items = vec![GridItem::Image(first_image)];
         app.thumbnails = vec![ThumbnailState::Pending];
         app.visible_indices = vec![0];
@@ -58453,6 +58461,8 @@ mod pipeline_cache_refactor_tests {
         app.consume_folder_refresh_pending(&egui::Context::default());
 
         assert!(app.folder_refresh_pending.is_none());
+        assert!(app.external_rescan_pending.is_some());
+        phase_c_support::wait_for_external_rescan(&mut app);
         super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
         assert!(app.items.iter().any(
             |item| matches!(item, GridItem::Image(path) if crate::folder_tree::path_eq(path, &added_image))
@@ -58461,6 +58471,7 @@ mod pipeline_cache_refactor_tests {
         let generation_after_reload = app.items_generation;
 
         app.consume_folder_refresh_pending(&egui::Context::default());
+        assert!(app.external_rescan_pending.is_none());
         assert_eq!(
             app.items_generation, generation_after_reload,
             "an empty pending slot must not reload the folder a second time"
@@ -58484,6 +58495,7 @@ mod pipeline_cache_refactor_tests {
         app.current_folder = Some(folder.clone());
         app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
         app.current_folder_signature = Some(signature_from_scan(&scan_directory(&folder)));
+        app.seed_folder_observation_for_test(&folder, &scan_directory(&folder));
         app.items = vec![GridItem::Image(first_image.clone())];
         app.thumbnails = vec![ThumbnailState::Pending];
 

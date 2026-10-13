@@ -81,6 +81,20 @@ pub(super) struct DirectMediaPrepared {
     tags: HashMap<String, Vec<String>>,
 }
 
+#[cfg(test)]
+impl DirectMediaPrepared {
+    pub(super) fn image_fixture_for_test(path: PathBuf) -> Self {
+        Self {
+            item: GridItem::Image(path),
+            metadata: Some((10, 20)),
+            rating: crate::rating_sort::RatingSortKey::supported(0).unwrap(),
+            rating_generation: 0,
+            rotation: crate::rotation_db::Rotation::None,
+            tags: Default::default(),
+        }
+    }
+}
+
 impl App {
     pub(crate) fn set_startup_open_path(&mut self, path: PathBuf) {
         self.startup_open_path = Some(crate::path_key::normalize_input_path(&path));
@@ -1813,6 +1827,7 @@ impl App {
         });
         let policy = self.page_identity_index.policy.clone();
         let saved_page_identity_index = self.page_identity_index.clone();
+        let basis_generation = self.items_generation;
         let saved_items = self.items.clone();
         let saved_thumbnails = self.thumbnails.clone();
         let saved_image_metas = self.image_metas.clone();
@@ -1892,6 +1907,7 @@ impl App {
             origin: origin_path,
             filter_at_capture: self.current_filter_state(),
             source_label: crate::snapshot::SnapshotSourceLabel::DirectMedia {
+                basis_generation,
                 target: requested.clone(),
                 policy,
                 reader_order,

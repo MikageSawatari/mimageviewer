@@ -3,9 +3,11 @@
 2026-10-13夜、`next-list`、R10。改訂基点 `37dcc8b9c`。
 **LISTrev12のR9 REVISE（P2二件／P3一件）に対する利用者決定を反映。比較は前回／今回の走査の
 行signatureだけとし、sidecar stampと別context／RemoteのDB反映資格を判定から外す。
-fork時の前回記録の継承・新contextの所有資格・独立購読を明記。R10は独立設計レビュー提出用・未実装**。
-今回の変更はこの設計書とmanualのgrid／shortcutsだけ。コード・索引文書・§1.373は変更しない。
-cargo build／test・アプリ起動・コミットは行わない。R8 ACCEPTや旧検証をR10の受入証拠にしない。
+fork時の前回記録の継承・新contextの所有資格・独立購読を明記。LISTrev13の独立設計再レビューは
+ACCEPT（P1／P2なし）、利用者の実装指示に従い実装・独立コードレビュー・自動検証完了（2026-10-14）**。
+R10提出時は設計書とmanualだけを変更した。実装工程では§6の回帰・性能検証を行い、
+§1.373の既存Append／Undo契約を維持する。アプリ起動・コミットは行わない。
+R8 ACCEPTや旧検証をR10の受入証拠にしない。
 正本項目: [next-release-backlog.md §1.375](next-release-backlog.md#1375-フォルダで-delete-キーで削除すると正しく消えた一覧がもう一度丸ごと読み直されてちらつく--利用者の実機報告-2026-10-12)。
 
 案B・自己操作operation ID・provenanceによる照合、代表選択保持・leaf付きcache key・選択付きpayload・
@@ -109,8 +111,9 @@ sidecarファイル・そのstamp、DB由来rating／tag／編集／しおり／
 省略chip／tooltip内訳は比較対象にしない。画像の補助sidecarとして選ばれる通常Imageのstampは
 既存の行／source投影規則を維持する（取込用 `mimageviewer.dat` と混同しない）。
 DB依存sort／facetが行へ効く部分は既存の行投影・条件を使い、DB値全体の反映保証へ範囲を広げない。
-現行 `FolderScanSignature` は表示順非依存のhash・秒mtimeであり、R10の投影後順序・利用可能な
-時刻精度へ接続する変更は未実装。プロセス内signatureであり、永続cache形式・暗号学的保証は作らない。
+旧 `FolderScanSignature` は表示順非依存のhash・秒mtimeだった。R10実装では既存entry metadataから
+利用可能な精度のstampを得て、同じmaterializeの投影後行記録へ接続する（§8.1）。
+プロセス内signatureであり、永続cache形式・暗号学的保証は作らない。
 
 ### 3.2 Delete成功行の更新
 
@@ -185,7 +188,7 @@ DeleteReceipt等は復活させない。§1.373のcause／operation資格／Undo
 
 ## 6. R10の受入回帰・性能検証計画
 
-今回は計画だけで、実装・回帰追加・性能計測・cargo build／test・アプリ起動・コミットは0件。
+LISTrev13 ACCEPT後の実装・検証では以下を受入条件とし、実行結果は§8へ記録する。
 
 - 実Delete handlerの成功行除去後、行signature一致なら追加install・世代更新・thumb再要求0回。
   通知先着／終端先着／通知なし／反復通知、最初のDeleteから検査する。
@@ -198,6 +201,11 @@ DeleteReceipt等は復活させない。§1.373のcause／operation資格／Undo
 - 外部sidecarの作成・変更・削除だけの通知では行一致を保ち、自動取込0回。
   外部sidecar変更と行追加が同batchなら行は採用するがsidecar取込0回。
   Ctrl+F5／開き直しでは設定に従い通常取込する。scan中変更・pending writerでも自動取込を復活させない。
+- LISTrev13 P3: defer→一覧復帰、走査中通知によるrestart、Resumedの各実handler経路で、
+  行一致／行差分の両方を検査する。自動sidecar取込は0回、その直後の明示GridReload／通常openは
+  編集・タグそれぞれの設定に従い取込む、という対照試験にする。通常Folderのdefer終端が
+  `reload_current_folder_preserving_override`へ直接合流する現経路も自動originを維持する経路へ接続する。
+  originをrestart／deferred request／hydrationに運び、全体設定の一時変更やpage identity準備の省略はしない。
 - 別contextで補正・タグ・pinを変更し、書込み元を同sourceに残す／別sourceへ移動／終了する場合と、
   Remote補正、sidecar OFFを検査。受け手の行一致は同じ省略へ進み、DB反映資格によるreload例外を設けない。
   反映されないDB値は明示GridReload／開き直しで取得し、既存★publication・snapshot編集・本しおり反映は維持。
@@ -219,7 +227,7 @@ UI全件clone／全表示snapshot、新しい共有表示storage・全件decode�
 headless／fake-inputを先に実行し、実アプリ計測は別途具体的suiteへの利用者了承を必要とする。
 実装完了時はtargeted、fmt、通常／portable core check、build-dev、test-fullを既存方針で行う。
 
-**設計書とmanualで止め、R10の独立設計レビュー後に実装する。**
+**LISTrev13で設計ACCEPT。P3の対照試験を含め、この契約で実装・検証する。**
 まれな失敗は既定で割り切り（ログ＋通知［＋作り直し］）。新retry／rollback／回復journalは作らない。
 以下§6.1〜6.5は過去の記録で、R10の受入証拠ではない。
 
@@ -334,7 +342,7 @@ Remote補正は指定addressのDB keyへ書く。この反映境界の不足はR
 detachedのviewport／geometry／focus述語を変更する設計ではない。
 実装時は両fork経路で最初の通知・最初のDelete・元ownerの保留通知を対で検査する。
 
-### 7.4 R10文書改訂の検証
+### 7.4 R10文書改訂の検証（提出時の履歴）
 
 変更は本設計書とmanualのgrid／shortcuts、計3ファイルだけ。
 README／backlog／ui-responsivenessの旧R8索引は今回の指定範囲外で変更せず、
@@ -343,3 +351,156 @@ R10レビュー後の実装工程で同期する。§1.373のコード・設計�
 改訂3ファイルのUTF-8 strict decode、manual 2ファイルのHTMLParser解析、
 R10の節構造・両fork経路の記載確認、`git diff --check`が成功。
 コード・Cargo設定・索引文書・§1.373設計のHEADとの差分は0件。
+
+## 8. R10実装と検証
+
+### 8.1 実装境界
+
+`FolderRowRecord`は既存走査／materializeが採用した物理file-rowを記録する。
+種類採否、同名winner、補助画像、既存rating sortと表示block順までが記録の境界で、
+名前・種類・サイズ・更新時刻・補助画像stampをscalarとして保持する。
+Stackはこの同じ入力と既存separator／script／sort条件の決定的なgroup化なので、
+入力と条件が同じならmember／種類／順序が変わらず既存group表示を維持できる。
+facet／detailsはitems配列ではなく既存visible_indices／details_orderの投影を保持する。
+file由来の投影を変える名前・サイズ・更新時刻は行差分、投影条件変更は要求資格の変更として扱う。
+DBだけのfacet／details反映保証は§2.1の許容から追加しない。
+
+通常のScannedDir producerは一回のread_dirによる直下走査で、materializeの除外／並び替えは
+sourceを合成しない。Appの通常／pre_scan／external worker、Remoteのfolder／本棚も、走査元の
+exact folderをmaterializeへ渡す。この既存不変条件から親scope keyを一回作り、初回記録のUI側で
+行ごとにPath::parentを解析しない。行配列は投影件数分を先に確保し、構築中の拡張コピーを避ける。
+複数sourceの手製ScannedDirはテスト用入力で、
+通常producerの契約へ追加しない。forkのscope対応・資格検証は別途維持する。
+
+前回記録はimmutable Arc、要求はそのrecordとrevisionを捕捉する。
+成功Deleteの除去だけを元ownerの記録へ反映し、workerが今回の投影と比較する。
+非表示候補の露出は今回投影だけが決める。実Folderの観測stampは先に新しい値で生成し、
+一覧のprepareにだけ旧採用のdirectory表示／sort stampを渡して§1.314を維持する。
+EqualではUIに全走査payloadを送らず、retirement workerで旧記録を解放する。
+Differentではworkerで準備した投影を既存loadへ渡し、UIで同じ投影をやり直さない。
+
+既存RefreshList intentへ自動originを載せ、sidecar hydration入口で取込だけを外す。
+defer／restart／Resumed、Appendからの自動配送も同じoriginを維持する。
+Stackの非同期group採用後に行う二度目のhydrationも既存GroupingSourceでpolicyを配送する。
+既存InternalHydrationに入れ、既に消費したcursor／Append receipt／local searchは再適用せず、
+遅着groupの選択は既存StackSelectionTargetの解決を維持する。
+watch／dirty／cutoff／pendingは既存bundleへ移し、closeの既存cancel境界に接続する。
+forkは記録だけを継承し、元購読を共有しない。代表cache／payloadの変更は0件。
+direct readerからのforkでmainへ保存済みbasisを戻す場合は、既存DirectMedia source labelに
+捕捉したbasis generationと、record source／snapshot origin／mainのsourceの一致を確認して
+新main世代へ記録を束縛する。対応しない記録を有効化する全scopeの世代書換えはしない。
+取消はExternalRescanPendingの共通入口で先にatomic cancelを立て、receiver／proofと
+未pollの準備済み結果を既存retirementへ渡す。採用時に不要になったraw scanも同じworkerで解放する。
+前回記録の世代は既存installが成功して世代を進めた後に束縛する。
+Stackのflat／aggregate切替でも、切替前に同じphysical source・StackView・採用世代との対応を確認し、
+成功切替後の世代へ束縛する。sourceが違う記録や既に古い記録を切替だけで有効化しない。
+検索等のsynthetic rootには、既存の物理子／root配送資格をwatch登録・走査・Delete終端の入口で
+適用する。検索前に保持したfolder／mtimeだけを根拠にrootを物理Folderへ置き換えない。
+従来FolderScanSignatureは秒精度のhash tuple streamを完全維持する。精密比較はFolderRowRecordが
+担当し、既存signatureへ精密stampを追加するUI passを作らない。Append／Undoの完全構成stampは
+既存の別契約のままにする。§1.314の保持処理はdirectoryのmtimeだけを置き換え、size差分を消さない。
+
+### 8.2 検証記録
+
+2026-10-13〜14、確定source 17ファイルのfreezeと独立レビューを照合済み。コード判定はACCEPT、
+P1／P2なし。追加回帰28件を含む§1.375 filterは29件成功。
+
+| targeted filter | 成功数 |
+| --- | ---: |
+| `signature_from_scan` | 2 |
+| `folder_mtime` | 10 |
+| `section1375` | 29 |
+| `folder_scan` | 50 |
+| `multiwindow_scenario` | 36 |
+| `completed_export_refresh` | 1 |
+| `a_watch_rescan_during_main_viewer` | 1 |
+| `external_rescan` | 4 |
+| `current_folder_watch` | 1 |
+| `section1373` | 68 |
+| `sidecar_restore` | 61 |
+| `viewer_context_registry` | 80 |
+| `section1353` | 21 |
+| `filename_stack_ui` | 24 |
+| `remove_items_batch` | 15 |
+| `delete_pending` | 2 |
+
+16 filterは405実行／重複除外391件、失敗0・ignored 0。
+最適化constructor計測の1実行を加え406実行／391件。全コマンドexit 0。
+`cargo fmt --all -- --check`、通常／portable core check、glyph checker（問題0）が成功。
+コマンド・exit・時間は[最終targeted state](../target/section1375-r10/full-fixes/targeted-state.json)、
+handler回帰は[section1375 stdout](../target/section1375-r10/full-fixes/section1375.stdout.log)を参照。
+
+性能は全行に実経路と同じ精密stampを持つ合成入力を使い、constructorを5回測定した。
+`dev-runtime`（opt-level=2）の結果:
+
+| 行数 | 初回記録 median／max | workerの投影＋記録 | workerの全行比較 | 実行配列capacityのbytes |
+| --- | ---: | ---: | ---: | ---: |
+| 10,000 | 0.659／0.972 ms | 14.675 ms | 0.052 ms | 960,000 |
+| 100,000 | 8.353／10.949 ms | 139.539 ms | 0.717 ms | 9,600,000 |
+
+改修前の100k constructorはmedian 17.970／max 19.780 msで受入にせず、単一走査sourceの親key再利用・
+配列の事前確保で費用を削減した。通常loadの既存signatureへの不要な精密lookup／hash拡張も撤去した。
+旧測定は[attempt5](../target/section1375-r10/targeted-attempt5/record-opt2.stderr.log)、
+確定測定は[record-opt2](../target/section1375-r10/full-fixes/record-opt2.stderr.log)。
+debugの同constructorは100k median 62.336／max 69.763 ms。最終値は区切り文字の共通identity修正を含む。
+debugを実製品の受入性能として扱わず、同じconstructor・stamp条件の最適化結果と区別する。
+
+実filesystemに作った10k／100k JPEG行のdebug worker測定は、scan 61.044／645.627 ms、
+投影＋記録56.177／574.892 ms。Equal UI pollは0.304／0.551 ms。
+未poll Differentのcancel／replace／stale retirementは100kで0.097／0.604／0.299 ms、
+UI上のrecord destructor実行0回。forkのrecordはArc共有、Delete除去履歴の全件cloneは0回。
+数値は[section1375 stderr](../target/section1375-r10/full-fixes/section1375.stderr.log)。
+既存の32回連続remove処理も測定したが、その処理全体を新しい比較費用とはみなさない。
+
+実Delete終端→自動走査→Equalの後、headless grid描画と3箇所のscrollで、ratingの全read／point read、
+tag、rotationの同期DB read差分はそれぞれ0回。両方式で必要なfooter／全体件数の一度の読取りは
+同じ既存cacheをwarmしてから測定した。新しいUI同期I/Oや全一覧snapshotで抑止していない。
+実アプリの最大frame／初回一覧の総時間は未計測で、上記constructor単体・headlessメソッドの測定と
+混同しない。アプリ起動は0回。
+
+検証途中の失敗も履歴へ保存した。install前のrecord世代束縛は成功install後へ修正し、
+Stack flat／aggregate復帰の回帰を追加。既存hashの失敗は精密化の撤去で既存assertを維持。
+folder sizeの失敗はmtime保持がsizeまで0にしていた実装を修正し、全raw候補を表示する旧fixtureを
+設定と実materializeへ整合させた。`real_changes`の各assertは削除・緩和していない。
+新しい失敗のない最終targeted結果と、これら途中の結果を合算しない。
+
+最初のfull gateではworkspace 13,471成功／3失敗／63 ignored（lib内3件）が出た。
+一覧復帰のexport／watchの2件は旧physical-history helperだけを待っていたテストの完了境界を、
+実external-rescan ownerのpollへ接続した。元の画像存在・世代・mtime assertionは維持し、
+二度目のconsumeが新しい走査も作らないことを追加確認する。
+検索画像の実失敗は、初回scanの `/` 表記と採用後scanの `\` 表記を生OsStr hashで別keyにしたもの。
+baseline・source・世代・投影・stampは同じなのにrow keyだけが違うことをtraceで確定した。
+共通のrow／精密stamp／成功Delete keyをallocation-free・losslessのPath hashへ統一し、
+実scan二回とDeleteの区切り表記回帰を追加する。ドライブ・表示名のcaseは混同しない。
+検索画像の既存paint assertionは変更しない。
+
+同型inventoryで新しいDetachedPhysical観測の実差分が閲覧ページを閉じる採用経路も確認した。
+自動Differenceの既存deferを `viewer_session_blocks_main_window()` または
+`DetachedPhysical && fullscreen_idx.is_some()` という一覧所有資格へ接続する。
+Main一覧と別窓動画／音声の共存は従来の採用経路を維持し、fullscreen有無だけの一括抑止はしない。
+元bundleの既存FolderRefreshRequestだけを使い、一覧復帰で消費、context終了で破棄する。
+新pending・再open・猶予時間は足さず、R10のcontext／終了契約内の構造修正として独立レビューで合意。
+実workerの差分を使う「独立readerはdefer／Mainの別窓media中は採用」の対照回帰を追加する。
+
+最初の確認用`build-dev.ps1 -PreserveRuntime`はexit 0、通常機能セットのcore／remote／EPUB workerと
+VCRT（runtime 4／PE 3）が成功。上述のfull失敗を修正したsourceでtargeted・fmt・両core checkを
+再実行した。更新後のbuild-devはexit 0、最終full gateは13,531成功／失敗0／既存ignored 63件、PASS。
+full実行は計2回（最初は3件失敗、修正後の完走は1回）。最初の失敗ログは保存し、成功証拠に含めない。
+[最終state](../target/section1375-r10/final-after-fixes/final-state.json)と
+[stdout](../target/section1375-r10/final-after-fixes/final.stdout.log)／[stderr](../target/section1375-r10/final-after-fixes/final.stderr.log)に記録する。
+コミット0件。manualは提出済みR10と整合する。
+
+### 8.3 変更ファイル
+
+| 範囲 | ファイル |
+| --- | --- |
+| 走査・比較・採用・Delete／watch | `src/app.rs`, `src/app/folder_scan.rs`, `src/app/top_level_grid_view.rs` |
+| origin／hydration／Append接続 | `src/app/startup_list_restore.rs`, `src/app/sidecar_restore.rs`, `src/app/book_append_refresh.rs`, `src/filename_stack_ui.rs` |
+| context／fork／保存済みbasis | `src/app/viewer_context_registry.rs`, `src/app/startup_ops.rs`, `src/snapshot.rs`, `src/app/smart_folder.rs` |
+| 生存cache／テスト用query計数 | `src/rotation_cache.rs`, `src/rating_db.rs`, `src/tags_db.rs` |
+| 回帰・fixture | `src/app/section375_tests.rs`, `src/app/tests.rs`, `src/app/similar_navigation_tests.rs` |
+| 設計・索引・所有境界 | `docs/section375-operation-reconcile-plan.md`, `docs/README.md`, `docs/next-release-backlog.md`, `docs/ui-responsiveness.md`, `docs/architecture-overview.md`, `docs/async-architecture.md`, `docs/detached-rework-plan.md` |
+
+source 17ファイル（新規回帰module 1を含む）・docs 7ファイル。
+manualのgrid／shortcutsは提出済みR10の記述と照合し、追加変更はない。
+§1.373の設計書・manual、Cargo設定、ビルドscriptは変更しない。

@@ -1276,7 +1276,7 @@ pub(crate) enum TopLevelGridSurface {
 impl super::App {
     /// A synthetic surface can still own a physical descendant. Its position and the
     /// adopted row producer decide refresh routing, not the parent's surface alone.
-    fn current_grid_reload_is_physical(&self) -> bool {
+    pub(super) fn current_grid_reload_is_physical(&self) -> bool {
         match self.top_level_grid_view.surface() {
             TopLevelGridSurface::Folder => true,
             TopLevelGridSurface::Collection(_) => self

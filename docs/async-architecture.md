@@ -5,6 +5,26 @@
 
 ---
 
+## 実Folderの自動観測（§1.375 R10）
+
+前回走査の行記録、watch購読、dirty／cutoff、ExternalRescanPending、一覧復帰時の
+FolderRefreshRequestは既存viewer bundleに属する。OS購読の登録と登録後の確認scan、
+行投影・利用可能な精度のstamp取得・比較は既存rescan workerで実行する。
+Equal応答は軽い行記録と観測値だけを返し、不要な走査・準備済み一覧はworkerで破棄する。
+UIはowner／source／generation／投影条件／記録revision／購読epochを確認し、受理した
+cutoffまでだけをackする。走査中に届いた後続通知は元ownerのdirtyと既存restartへ残す。
+park／mountでは元購読と要求を保持し、forkでは記録だけを共有して独立購読を開始する。
+旧記録の大きなpayloadは既存retirement workerへ渡す。
+
+Differentは走査済み入力とworker準備済み投影を既存load／hydrationへ渡す。
+自動originをdefer／restart／Resumedでも維持し、sidecar取込を行わない。
+page identityと通常のDB hydrationは継続し、全体設定を一時変更しない。
+Stackの二度目のhydrationには既存GroupingSourceとInternalHydrationで同じ取込policyを渡し、
+既消費のcursor／Append receipt／local searchを再適用しない。
+明示GridReload／通常openでは設定どおりsidecarを取り込む。
+operation IDの自己通知照合、代表保持、cache形式変更、新しいpending ownerは追加しない。
+詳細は [section375-operation-reconcile-plan.md](section375-operation-reconcile-plan.md)。
+
 ## 本別見開き調整の永続化基盤とviewer/Remote接続（§1.364 D1–D3、2026-10-11）
 
 `SpreadShiftService`のUI handleは送信・immutable snapshot lookup・結果pollだけを行い、

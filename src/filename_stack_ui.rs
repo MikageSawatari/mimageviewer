@@ -74,6 +74,7 @@ impl StackPreparePending {
 }
 
 struct StackGroupingSource {
+    hydration_intent: crate::app::StartupListIntent,
     visibility: crate::file_type_visibility::FileTypeVisibility,
     logical_container: Option<PathBuf>,
     folder: PathBuf,
@@ -598,6 +599,31 @@ impl crate::app::App {
         script_enabled: bool,
         group_per_parent: bool,
     ) {
+        self.spawn_stack_script_worker_with_intent(
+            folder,
+            listing,
+            separator,
+            order,
+            existing_keys,
+            folder_signature,
+            script_enabled,
+            group_per_parent,
+            crate::app::StartupListIntent::InternalInstall,
+        );
+    }
+
+    pub(crate) fn spawn_stack_script_worker_with_intent(
+        &mut self,
+        folder: PathBuf,
+        listing: StackListingSource,
+        separator: char,
+        order: crate::rating_sort::ListingOrderRequest,
+        existing_keys: std::collections::HashSet<String>,
+        folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
+        script_enabled: bool,
+        group_per_parent: bool,
+        hydration_intent: crate::app::StartupListIntent,
+    ) {
         self.cancel_stack_script_pending();
         debug_assert!(
             matches!(order, crate::rating_sort::ListingOrderRequest::Standard(sort) if !sort.is_rating())
@@ -608,6 +634,7 @@ impl crate::app::App {
                 )
         );
         let source = StackGroupingSource {
+            hydration_intent,
             visibility: self.settings.file_type_visibility.clone(),
             logical_container: self.archive_source_override.clone(),
             folder,
@@ -1002,7 +1029,7 @@ impl crate::app::App {
         }
         // Separator, script and display-order changes re-group the same listing. Its captured
         // sort request remains valid until an explicit listing preparation replaces it.
-        self.spawn_stack_script_worker(
+        self.spawn_stack_script_worker_with_intent(
             source.folder.clone(),
             source.listing.clone(),
             self.settings.stack_separator,
@@ -1011,6 +1038,7 @@ impl crate::app::App {
             folder_signature,
             self.settings.stack_script_enabled,
             source.group_per_parent,
+            source.hydration_intent.clone(),
         );
     }
 
@@ -1124,6 +1152,7 @@ impl crate::app::App {
         }
         self.apply_stack_group_ready(
             pending.source.folder.clone(),
+            pending.source.hydration_intent.clone(),
             pending.existing_keys,
             pending.folder_signature,
             view,
@@ -1140,6 +1169,7 @@ impl crate::app::App {
     fn apply_stack_group_ready(
         &mut self,
         folder: PathBuf,
+        hydration_intent: crate::app::StartupListIntent,
         existing_keys: std::collections::HashSet<String>,
         folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
         view: Arc<StackView>,
@@ -1170,6 +1200,7 @@ impl crate::app::App {
             folder_signature,
             pin_map,
             select,
+            hydration_intent,
         );
         if is_subfolder_expansion_stack {
             self.restore_subfolder_expansion_view_state_after_items_install();
@@ -1957,7 +1988,21 @@ impl crate::app::App {
             page_identity_index,
             ..
         } = prepared;
+        let retained_physical_record =
+            !crate::folder_tree::path_eq(folder, &crate::app::subfolder_expansion_synthetic_path())
+                && self.stack_mode_requested
+                && self
+                    .stack_view
+                    .as_ref()
+                    .is_some_and(|view| view.folder == folder)
+                && self.current_folder.as_deref() == Some(folder)
+                && self.folder_observation.as_ref().is_some_and(|record| {
+                    record.source == folder && record.generation == self.items_generation
+                });
         self.install_prepared_aggregate_items(items, metas, page_identity_index);
+        if retained_physical_record {
+            self.folder_observation.as_mut().unwrap().generation = self.items_generation;
+        }
         if crate::folder_tree::path_eq(folder, &crate::app::subfolder_expansion_synthetic_path()) {
             self.restore_subfolder_expansion_view_state_after_items_install();
         }
@@ -2896,6 +2941,7 @@ mod tests {
         app.stack_view = None;
         app.stack_mode_requested = true;
         let source = Arc::new(StackGroupingSource {
+            hydration_intent: crate::app::StartupListIntent::InternalInstall,
             visibility: app.settings.file_type_visibility.clone(),
             logical_container: app.archive_source_override.clone(),
             folder,

@@ -83,6 +83,8 @@ pub(crate) fn is_system_metadata_name(name: &str) -> bool {
 /// 複数ウィンドウの grid Folder 候補は worker で生成し、画像本と確定した結果だけを
 /// detached context へ移譲する。
 pub(crate) struct ScannedDir {
+    pub(crate) precise_stamps: std::collections::HashMap<u64, Option<(std::time::SystemTime, u64)>>,
+    pub(crate) reconcile: Option<FolderScanReconcile>,
     pub(crate) complete_audio_inventory: Option<std::collections::HashSet<String>>,
     /// Folder / ZipFile / PdfFile / ConvertibleArchive と、表示用metadata・一覧sort用metadata。
     /// load_folder 内で3本を同じ順序へ並べ替える。
@@ -106,7 +108,7 @@ impl std::fmt::Debug for ScannedDir {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct AuxiliaryMediaCandidates {
     entries: Vec<ScannedMediaEntry>,
 }
@@ -157,6 +159,7 @@ impl AuxiliaryMediaCandidates {
 /// この同じ pure helper を使う。表示対象・sort・重複除外を変える場合はここだけを変更し、
 /// remote 側に別のオーケストレーションを増やさない。
 pub(crate) struct MaterializedFolderListing {
+    pub(crate) row_record: std::sync::Arc<FolderRowRecord>,
     pub(crate) items: Vec<GridItem>,
     pub(crate) metas: Vec<Option<(i64, i64)>>,
     /// `items` とalignedな一覧sort metadata。表示/cache metadataとは別owner。
@@ -290,6 +293,7 @@ pub(crate) fn materialize_local_folder_listing_with_order(
     read_rating: impl FnOnce(&[String]) -> Result<crate::rating_db::CompleteRatingFacts, String>,
 ) -> MaterializedFolderListing {
     let mut scan = scan;
+    let precise_stamps = std::mem::take(&mut scan.precise_stamps);
     project_scanned_directory(&mut scan, &settings.file_type_visibility);
     let mut auxiliary_media = scan.auxiliary_media;
     let mut omitted = scan.omitted;
@@ -524,7 +528,15 @@ pub(crate) fn materialize_local_folder_listing_with_order(
         FolderRatingOrder::Standard
     };
 
+    let row_record = std::sync::Arc::new(FolderRowRecord::from_projection(
+        path,
+        &items,
+        &metas,
+        &precise_stamps,
+        &video_thumb_overrides,
+    ));
     MaterializedFolderListing {
+        row_record,
         items,
         metas,
         sort_metas,
@@ -680,6 +692,8 @@ pub(crate) fn is_image_only_book_contents(
 pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
     scan_directory_with_convertible_archives(path, true, true, false).unwrap_or_else(|_| {
         ScannedDir {
+            precise_stamps: Default::default(),
+            reconcile: None,
             complete_audio_inventory: None,
             folders: Vec::new(),
             all_media: Vec::new(),
@@ -801,6 +815,7 @@ fn scan_directory_entries<I>(
 where
     I: IntoIterator<Item = std::io::Result<std::fs::DirEntry>>,
 {
+    let mut precise_stamps = std::collections::HashMap::new();
     let mut folders: Vec<ScannedFolderEntry> = Vec::new();
     let mut all_media: Vec<ScannedMediaEntry> = Vec::new();
     let mut omitted = OmittedFolderEntryCounts::default();
@@ -862,6 +877,11 @@ where
                 continue;
             }
             let meta = entry.metadata().ok();
+            precise_stamps.insert(
+                folder_scan_path_key(&p),
+                meta.as_ref()
+                    .and_then(|m| m.modified().ok().map(|modified| (modified, m.len()))),
+            );
             let mtime = meta
                 .as_ref()
                 .map_or(0, |m| crate::ui_helpers::mtime_secs(m));
@@ -878,6 +898,11 @@ where
         {
             let ext_lower = ext.to_ascii_lowercase();
             let meta = entry.metadata().ok();
+            precise_stamps.insert(
+                folder_scan_path_key(&p),
+                meta.as_ref()
+                    .and_then(|m| m.modified().ok().map(|modified| (modified, m.len()))),
+            );
             let mtime = meta
                 .as_ref()
                 .map_or(0, |m| crate::ui_helpers::mtime_secs(m));
@@ -958,6 +983,8 @@ where
     let auxiliary_media =
         AuxiliaryMediaCandidates::capture(&all_media, policy, &entry_file_names_ci);
     let mut scan = ScannedDir {
+        precise_stamps,
+        reconcile: None,
         complete_audio_inventory,
         folders,
         all_media,
@@ -1351,8 +1378,198 @@ fn file_stem_ci(path: &std::path::Path) -> Option<String> {
         .map(str::to_lowercase)
 }
 
-/// 一覧の適用済み stamp。通常比較は従来どおり全項目の mtime を含める。
-/// `same_listing` だけが実 Folder の mtime を除き、表示中の一覧を維持できるか判定する。
+/// Lossless, process-local physical row identity. Path hashing treats Windows
+/// separators consistently without allocating or folding the displayed filename's case.
+pub(crate) fn folder_scan_path_key(path: &std::path::Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hash);
+    hash.finish()
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FolderScanRow {
+    pub(crate) key: u64,
+    pub(crate) parent_key: u64,
+    kind: &'static str,
+    size: i64,
+    folder_mtime: i64,
+    modified: Option<std::time::SystemTime>,
+    auxiliary: Option<(u64, Option<(std::time::SystemTime, u64)>)>,
+}
+
+impl PartialEq for FolderScanRow {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+            && self.parent_key == other.parent_key
+            && self.kind == other.kind
+            && self.size == other.size
+            && self.modified == other.modified
+            && self.auxiliary == other.auxiliary
+    }
+}
+impl Eq for FolderScanRow {}
+
+#[derive(Debug)]
+pub(crate) struct FolderRowRecord {
+    pub(crate) rows: Vec<FolderScanRow>,
+    pub(crate) known: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static ROW_RECORD_DROPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn row_record_drops_for_test() -> usize {
+    ROW_RECORD_DROPS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+impl Drop for FolderRowRecord {
+    fn drop(&mut self) {
+        ROW_RECORD_DROPS.with(|count| count.set(count.get() + 1));
+    }
+}
+
+impl FolderRowRecord {
+    fn from_projection(
+        physical_source: &std::path::Path,
+        items: &[GridItem],
+        metas: &[Option<(i64, i64)>],
+        stamps: &std::collections::HashMap<u64, Option<(std::time::SystemTime, u64)>>,
+        sidecars: &[(PathBuf, PathBuf)],
+    ) -> Self {
+        let auxiliaries = sidecars
+            .iter()
+            .map(|(source, image)| (source, image))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut known = true;
+        // Production ScannedDir entries come from one read_dir(physical_source).
+        // Projection only excludes/reorders those direct children; it never joins sources.
+        // Reuse that boundary instead of parsing the same parent for every row on UI load.
+        let parent_key = folder_scan_path_key(physical_source);
+        let mut rows = Vec::with_capacity(items.len());
+        rows.extend(items.iter().zip(metas).filter_map(|(item, meta)| {
+            let (path, kind) = match item {
+                GridItem::Folder(p) => (p, "folder"),
+                GridItem::ZipFile(p) => (p, "zip"),
+                GridItem::PdfFile(p) => (p, "pdf"),
+                GridItem::ConvertibleArchive { path, .. } => (path, "archive"),
+                GridItem::Image(p) => (p, "image"),
+                GridItem::Video(p) => (p, "video"),
+                GridItem::Audio(p) => (p, "audio"),
+                _ => {
+                    known = false;
+                    return None;
+                }
+            };
+            let key = folder_scan_path_key(path);
+            let modified = if kind == "folder" {
+                None
+            } else {
+                stamps
+                    .get(&key)
+                    .copied()
+                    .map(|stamp| stamp.map(|(modified, _)| modified))
+                    .unwrap_or_else(|| {
+                        #[cfg(test)]
+                        {
+                            meta.map(|(seconds, _)| {
+                                std::time::SystemTime::UNIX_EPOCH
+                                    + std::time::Duration::from_secs(seconds.max(0) as u64)
+                            })
+                        }
+                        #[cfg(not(test))]
+                        {
+                            None
+                        }
+                    })
+            };
+            if kind != "folder" && modified.is_none() {
+                known = false;
+            }
+            let auxiliary = auxiliaries.get(path).map(|aux| {
+                let aux_key = folder_scan_path_key(aux);
+                let modified = stamps.get(&aux_key).copied().flatten();
+                if modified.is_none() {
+                    known = false;
+                }
+                (aux_key, modified)
+            });
+            Some(FolderScanRow {
+                key,
+                parent_key,
+                kind,
+                size: meta.map_or(0, |(_, size)| size),
+                folder_mtime: meta.map_or(0, |(mtime, _)| mtime),
+                modified,
+                auxiliary,
+            })
+        }));
+        Self { rows, known }
+    }
+
+    pub(crate) fn preserve_directory_sort_stamps(&self, scan: &mut ScannedDir) {
+        let stamps = self
+            .rows
+            .iter()
+            .filter(|row| row.kind == "folder")
+            .map(|row| (row.key, row.folder_mtime))
+            .collect::<std::collections::HashMap<_, _>>();
+        for entry in &mut scan.folders {
+            if let GridItem::Folder(path) = &entry.item
+                && let Some(mtime) = stamps.get(&folder_scan_path_key(path))
+            {
+                entry.sort_meta.mtime = *mtime;
+                let size = entry.display_meta.map_or(0, |(_, size)| size);
+                entry.display_meta = Some((*mtime, size));
+            }
+        }
+    }
+
+    pub(crate) fn same_remaining_rows<'a>(
+        &self,
+        previous: &Self,
+        removed: impl Iterator<Item = &'a PathBuf>,
+        scope: &std::path::Path,
+    ) -> bool {
+        if !self.known || !previous.known {
+            return false;
+        }
+        let removed = removed
+            .map(|path| folder_scan_path_key(path))
+            .collect::<std::collections::HashSet<_>>();
+        let parent = folder_scan_path_key(scope);
+        self.rows.iter().eq(previous
+            .rows
+            .iter()
+            .filter(|row| row.parent_key == parent && !removed.contains(&row.key)))
+    }
+}
+
+pub(crate) struct FolderScanReconcile {
+    pub(crate) observed_signature: FolderScanSignature,
+    pub(crate) parent_mtime: std::time::SystemTime,
+    pub(crate) materialized: Box<MaterializedFolderListing>,
+}
+
+impl ScannedDir {
+    /// The rescan worker duplicates raw scan input; UI never clones the listing.
+    pub(crate) fn clone_for_projection(&self) -> Self {
+        Self {
+            precise_stamps: self.precise_stamps.clone(),
+            reconcile: None,
+            complete_audio_inventory: None,
+            folders: self.folders.clone(),
+            all_media: self.all_media.clone(),
+            omitted: self.omitted,
+            auxiliary_media: self.auxiliary_media.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FolderScanSignature {
     full: u64,
@@ -1386,10 +1603,9 @@ impl FolderScanSignature {
 /// 並び順非依存にするため path で明示的にソートしてからハッシュする。
 /// プロセス内比較専用 (DefaultHasher は Rust バージョン間で安定でないため永続化しない)。
 ///
-/// 既知の制限: mtime は `mtime_secs` (秒精度) を使うので、同一秒内に同サイズで
-/// 上書きされた場合は差分検知できず再ロードがスキップされる。画像ファイルが
-/// 偶然同サイズで <1 秒以内に書き換わる現実的なシナリオは稀なため許容している。
-/// 必要なら `metadata.modified()` の SystemTime を秒+nanos で取り直す拡張が可能。
+/// 従来の秒精度の tuple stream を維持する。同秒・同サイズの書換えはこの signature では
+/// 区別しない。§1.375 の監視更新は別の FolderRowRecord が取得済み modified() を使って
+/// 精密比較するため、この既存 signature の精度へ依存しない。
 pub(crate) fn signature_from_scan(scan: &ScannedDir) -> FolderScanSignature {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -1505,6 +1721,8 @@ pub(crate) mod signature_tests {
         })
         .collect();
         ScannedDir {
+            precise_stamps: Default::default(),
+            reconcile: None,
             complete_audio_inventory: None,
             folders,
             all_media,
@@ -1904,6 +2122,8 @@ mod page_count_tests {
         db.set_user_rating(&key("z.jpg"), 5, None).unwrap();
         db.set_user_rating(&key("a.jpg"), 4, None).unwrap();
         let scan = || ScannedDir {
+            precise_stamps: Default::default(),
+            reconcile: None,
             complete_audio_inventory: None,
             folders: Vec::new(),
             all_media: ["a.jpg", "z.jpg", "x.jpg", "x.png"]
@@ -2021,6 +2241,8 @@ mod page_count_tests {
             sort_meta: crate::settings::ListingSortMetadata::new(7, known.then_some(file_size)),
         };
         let scan = || ScannedDir {
+            precise_stamps: Default::default(),
+            reconcile: None,
             complete_audio_inventory: None,
             folders: vec![ScannedFolderEntry {
                 item: GridItem::Folder(PathBuf::from(r"C:\sizes\child")),
@@ -2901,5 +3123,266 @@ mod file_type_visibility_tests {
                 .get(&temp.path().join("movie.mp4")),
             Some(&temp.path().join("movie.png"))
         );
+    }
+}
+
+#[cfg(test)]
+mod section1375_row_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant, SystemTime};
+
+    #[cfg(windows)]
+    #[test]
+    fn section1375_scan_record_and_delete_share_windows_separator_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("spelling");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("page.png"), b"same-source").unwrap();
+        let slash_folder = PathBuf::from(folder.to_string_lossy().replace('\\', "/"));
+        let settings = crate::settings::Settings::default();
+        let previous = materialize_local_folder_listing(
+            &folder,
+            scan_directory_with_settings(&slash_folder, &settings).unwrap(),
+            &settings,
+        );
+        let current = materialize_local_folder_listing(
+            &folder,
+            scan_directory_with_settings(&folder, &settings).unwrap(),
+            &settings,
+        );
+        assert!(current.row_record.same_remaining_rows(
+            &previous.row_record,
+            std::iter::empty(),
+            &folder,
+        ));
+        let removed = slash_folder.join("page.png");
+        std::fs::remove_file(&removed).unwrap();
+        let empty = materialize_local_folder_listing(
+            &folder,
+            scan_directory_with_settings(&folder, &settings).unwrap(),
+            &settings,
+        );
+        assert!(empty.row_record.same_remaining_rows(
+            &previous.row_record,
+            std::iter::once(&removed),
+            &folder,
+        ));
+        assert_ne!(
+            folder_scan_path_key(std::path::Path::new(r"C:\scope\page.png")),
+            folder_scan_path_key(std::path::Path::new(r"D:\scope\page.png")),
+        );
+        assert_ne!(
+            folder_scan_path_key(std::path::Path::new(r"C:\scope\page.png")),
+            folder_scan_path_key(std::path::Path::new(r"C:\scope\Page.png")),
+        );
+    }
+
+    #[test]
+    fn section1375_scan_projection_keeps_one_physical_scope_after_filter_and_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings = crate::settings::Settings {
+            skip_duplicate_images: true,
+            image_ext_priority: vec!["jpg".into(), "png".into()],
+            ..Default::default()
+        };
+        let mut records = Vec::new();
+        for name in ["a", "b"] {
+            let folder = temp.path().join(name);
+            std::fs::create_dir(&folder).unwrap();
+            std::fs::create_dir(folder.join("child")).unwrap();
+            for file in ["z.jpg", "cover.jpg", "cover.png", "book.zip", "book.pdf"] {
+                std::fs::write(folder.join(file), b"same-content").unwrap();
+            }
+            let scan = scan_directory_with_settings(&folder, &settings).unwrap();
+            let listing = materialize_local_folder_listing(&folder, scan, &settings);
+            assert_eq!(listing.omitted.same_name, 1);
+            assert_eq!(listing.row_record.rows.len(), 5);
+            assert!(listing.row_record.known);
+            assert!(
+                listing
+                    .row_record
+                    .rows
+                    .iter()
+                    .all(|row| { row.parent_key == folder_scan_path_key(&folder) })
+            );
+            assert!(listing.row_record.same_remaining_rows(
+                &listing.row_record,
+                std::iter::empty(),
+                &folder,
+            ));
+            records.push((folder, listing.row_record));
+        }
+        assert!(!records[0].1.same_remaining_rows(
+            &records[1].1,
+            std::iter::empty(),
+            &records[0].0,
+        ));
+    }
+
+    #[test]
+    fn section1375_signature_precision_order_tail_and_unknown() {
+        let root = std::path::Path::new(r"C:\section1375");
+        let mut old = signature_tests::fixture(root);
+        let path = old.all_media[0].path.clone();
+        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        old.precise_stamps
+            .insert(folder_scan_path_key(&path), Some((t, 20)));
+        let settings = crate::settings::Settings::default();
+        let previous =
+            materialize_local_folder_listing(root, old.clone_for_projection(), &settings)
+                .row_record;
+        let mut new = old.clone_for_projection();
+        new.precise_stamps.insert(
+            folder_scan_path_key(&path),
+            Some((t + Duration::from_micros(1), 20)),
+        );
+        assert_eq!(
+            signature_from_scan(&old),
+            signature_from_scan(&new),
+            "the legacy seconds signature stays unchanged; row records own precise comparison"
+        );
+        let current = materialize_local_folder_listing(root, new, &settings).row_record;
+        assert!(!current.same_remaining_rows(&previous, std::iter::empty(), root));
+        let mut rows = previous.rows.clone();
+        rows.reverse();
+        let changed_order = FolderRowRecord { rows, known: true };
+        assert!(!changed_order.same_remaining_rows(&previous, std::iter::empty(), root));
+        let mut unknown = old;
+        unknown
+            .precise_stamps
+            .insert(folder_scan_path_key(&path), None);
+        let current = materialize_local_folder_listing(root, unknown, &settings).row_record;
+        assert!(!current.known);
+        assert!(!current.same_remaining_rows(&current, std::iter::empty(), root));
+    }
+
+    #[test]
+    fn section1375_large_10k_100k_projection_compare_delete_and_first_fork() {
+        for count in [10_000, 100_000] {
+            let root = std::path::Path::new(r"C:\section1375-large");
+            let mut scan = signature_tests::fixture(root);
+            scan.folders.clear();
+            scan.all_media.clear();
+            scan.all_media
+                .extend((0..count).map(|index| ScannedMediaEntry {
+                    path: root.join(format!("image-{index:06}.jpg")),
+                    kind: ScanMediaKind::Image,
+                    mtime: 10,
+                    file_size: 20,
+                    sort_meta: crate::settings::ListingSortMetadata::new(10, Some(20)),
+                }));
+            scan.precise_stamps
+                .extend(scan.all_media.iter().map(|entry| {
+                    (
+                        folder_scan_path_key(&entry.path),
+                        Some((SystemTime::UNIX_EPOCH + Duration::from_secs(10), 20)),
+                    )
+                }));
+            let worker = std::thread::spawn(move || {
+                let settings = crate::settings::Settings::default();
+                let start = Instant::now();
+                let projected =
+                    materialize_local_folder_listing(root, scan.clone_for_projection(), &settings);
+                let projection_ms = start.elapsed().as_secs_f64() * 1000.0;
+                let mut initial_record_samples = Vec::with_capacity(5);
+                for _ in 0..5 {
+                    let initial_start = Instant::now();
+                    let initial = FolderRowRecord::from_projection(
+                        root,
+                        &projected.items,
+                        &projected.metas,
+                        &scan.precise_stamps,
+                        &projected.video_thumb_overrides,
+                    );
+                    initial_record_samples.push(initial_start.elapsed().as_secs_f64() * 1000.0);
+                    assert!(initial.known);
+                    assert_eq!(initial.rows, projected.row_record.rows);
+                }
+                initial_record_samples.sort_by(f64::total_cmp);
+                let initial_record_ms = initial_record_samples[2];
+                let initial_record_max_ms = initial_record_samples[4];
+                let previous = projected.row_record.clone();
+                let start = Instant::now();
+                assert!(previous.same_remaining_rows(&previous, std::iter::empty(), root));
+                let compare_ms = start.elapsed().as_secs_f64() * 1000.0;
+                let fork = Arc::clone(&previous);
+                assert!(previous.same_remaining_rows(&fork, std::iter::empty(), root));
+                for (label, variant) in [("tail", 0), ("all", 1), ("order", 2), ("unknown", 3)] {
+                    let mut changed = FolderRowRecord {
+                        rows: previous.rows.clone(),
+                        known: true,
+                    };
+                    match variant {
+                        0 => changed.rows.last_mut().unwrap().size += 1,
+                        1 => changed.rows.iter_mut().for_each(|row| row.size += 1),
+                        2 => changed.rows.reverse(),
+                        _ => changed.known = false,
+                    }
+                    let start = Instant::now();
+                    assert!(!changed.same_remaining_rows(&previous, std::iter::empty(), root));
+                    eprintln!(
+                        "section1375 rows={count} compare_{label}_ms={:.3}",
+                        start.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+
+                let removed = scan.all_media.last().unwrap().path.clone();
+                scan.all_media.pop();
+                let current = materialize_local_folder_listing(root, scan, &settings).row_record;
+                assert!(!current.same_remaining_rows(&previous, std::iter::empty(), root));
+                assert!(current.same_remaining_rows(&previous, std::iter::once(&removed), root));
+                eprintln!(
+                    "section1375 rows={count} projection_ms={projection_ms:.3} initial_record_ms={initial_record_ms:.3} initial_record_max_ms={initial_record_max_ms:.3} samples=5 precise_stamp_entries={count} compare_ms={compare_ms:.3} scalar_record_bytes={} shared_fork=true",
+                    previous.rows.capacity() * std::mem::size_of::<FolderScanRow>()
+                );
+                previous
+            });
+            let previous = worker.join().unwrap();
+            let start = Instant::now();
+            let fork = previous.clone();
+            assert!(Arc::ptr_eq(&previous, &fork));
+            eprintln!(
+                "section1375 rows={count} ui_fork_enqueue_us={:.3}",
+                start.elapsed().as_secs_f64() * 1_000_000.0
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod section1375_scan_perf_tests {
+    use super::*;
+    #[test]
+    fn section1375_large_physical_scan_10k_100k() {
+        for count in [10_000, 100_000] {
+            let temp = tempfile::tempdir().unwrap();
+            for index in 0..count {
+                std::fs::write(temp.path().join(format!("row-{index:06}.jpg")), b"x").unwrap();
+            }
+            let worker = std::thread::spawn(move || {
+                let start = std::time::Instant::now();
+                let scan = scan_directory_with_visibility_cancel(
+                    temp.path(),
+                    true,
+                    true,
+                    false,
+                    &Default::default(),
+                    None,
+                )
+                .unwrap();
+                let scan_ms = start.elapsed().as_secs_f64() * 1000.0;
+                let start = std::time::Instant::now();
+                let listing =
+                    materialize_local_folder_listing(temp.path(), scan, &Default::default());
+                let projection_ms = start.elapsed().as_secs_f64() * 1000.0;
+                assert_eq!(listing.items.len(), count);
+                assert!(listing.row_record.known);
+                eprintln!(
+                    "section1375 physical_rows={count} scan_ms={scan_ms:.3} projection_record_ms={projection_ms:.3}"
+                );
+            });
+            worker.join().unwrap();
+        }
     }
 }

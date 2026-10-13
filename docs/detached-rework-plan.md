@@ -1455,6 +1455,26 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-13 §1.375: Folder観測を一覧と同じcontextへ揃える
+
+設計担当のR10と独立設計再レビューLISTrev13 ACCEPTに従い、App-globalだった
+watch／rescan／一覧復帰要求を既存ViewerContextBundleへ移す構造修正である。
+前回行記録を両fork入口で継承し、新contextのsource／世代／投影条件へ束縛し直す。
+元contextの購読・dirty・cutoff・pendingは元ownerに残し、新ownerは独立購読を開始する。
+park／mount／closeもそのownerの資源だけに作用し、Aの一致でBの通知をackしない。
+症状を隠すguard・時間窓や新しいdetached stateを足す修正ではなく、一覧と観測の所有境界を
+一致させる。viewport、geometry、HWND同定、placement、focus／recreate機構は変更しない。
+§1.373のAppendへの自動観測配送は捕捉済みcontextごとの既存要求へ接続し、
+専用owner／新しい配送台帳を作らない。実装・検証の記録は
+[§1.375の設計書](section375-operation-reconcile-plan.md)へ残す。アプリ起動は行わない。
+
+fullで検索画像が閉じた根因は、正規化前scanの `/` と登録後scanの `\` を生文字列hashで
+別row keyにしたこと。共通Path hashへ統一し、既存paint試験と実scan／Delete表記回帰で検証する。
+新しい独立physical観測の実差分も、そのownerがfullscreenを持つ間は既存FolderRefreshRequestへ
+deferする。Mainの別窓動画／音声中の一覧更新は従来どおり採用する。既存のMain-blocking述語を
+変更せず、自動一覧採用の所有資格だけをDetachedPhysicalへ接続する構造修正として独立レビューで合意。
+新pending／再open／時間窓を追加せず、一覧復帰で消費、元contextのcloseで破棄する。
+
 ### 2026-10-13 §1.373: 本追加Undoの終端と既存context境界
 
 利用者が提示したR4案1の独立設計レビューACCEPTに従い、既存BookOpPendingへ
