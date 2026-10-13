@@ -867,6 +867,43 @@ Project 履歴の所有も確認する。起動するのは利用者だけとし
 gate・runtime 清掃）。閲覧中の音楽ビューと同時に再生すると両方鳴る（WASAPI shared で混ざるだけで
 互いの状態には影響しない）。
 
+#### I2（IME が処理したキー）（2026-10-14、段 1）
+
+利用者が開発版と v4.6.0 ポータブル版で確認した問題: 画像注釈の本文で日本語を入力し、
+Enter をすばやく 2 回押すと確定だけされ、改行が入らない。間を空けると改行が入る。
+本体は text 注釈モード中、composition / 直近 300ms の IME grace 中の Enter をすべて捨てるため、
+2 回目も抑止する。その対処が必要になった根の候補は、Windows の `VK_PROCESSKEY` が winit の
+`NamedKey::Process` になり、egui-winit の `logical_key.or(physical_key)` により通常の Enter へ
+fallback する経路。Process の変換と fallback はソースと一致するが、物理キーは Windows の
+scan code から作られるため、実 IME が Enter として届けるかは未確認。
+
+**段 1 は記録だけで、入力挙動を変えない。** checksum を原本と照合した egui-winit 0.33.3 を
+`vendor/egui-winit` に取り込み、root patch で本体・ラボの依存をそろえる。
+`MIV_IME_KEY_TRACE=<出力ファイルの絶対パス>` を最初の State 構築で 1 回だけ読み、既定は無効。
+有効時は KeyboardInput / Ime の到着時刻（統合起動からの単調 ms）、viewport、キー metadata と、
+処理後に実際に追加された egui の Key / Cut / Copy / Paste / Text / Ime を記録する。
+文字内容は残さず、UTF-8 byte 数・空・改行の有無・cursor の有無だけを残す。文字キーもマスクする。
+worker が追記・行ごとに flush し、UI thread でファイル I/O は行わない。失敗は黙って記録停止し、
+再試行・復旧・終了時の完了待ちは設けない。入力本体の既存変換・抑止・focus policy は維持する。
+これは非同期入力の新しい状態機械を作る作業ではなく、原本の出力を読む診断だけであり、
+modal 化や live rebuild の追加は不要。
+
+**段 2 は未設計。** 実機・実 IME のログで根の候補を確認してから修正を設計し、独立レビューを通す。
+trace 自体も診断用で、段 2 で扱いを決める。取り込み・秘匿・出力形式・ソース確認の詳細は
+[`vendor/egui-winit/PATCHES.md`](../vendor/egui-winit/PATCHES.md)、作業範囲と完了条件は
+[`brief-musicvideo-i2.md`](brief-musicvideo-i2.md) を参照。実機記録・検収は利用者と設計 lead が行う。
+
+段 1 の自動検証（2026-10-14、未コミット）: 原本 archive の全 9 ファイルの byte 照合、
+egui-winit 一系統の確認、本体 core check、共有 UI 121 / ラボ 75 / egui-ime 17、
+本体 ime_focus 12 / egui_focus_policy 5、診断単体 10、fmt / vendor rustfmt が成功。
+`cargo build --release -p musicvideo_lab` も成功した。ログは `target/i2-*`。
+追加の `test-full.ps1 -SuppressCrashDialogs` は exit 101: App のサイズ制限テストが
+110,600 bytes（上限は 110,000 未満）で失敗し、capture_region のイベント順序テストで
+`STATUS_STACK_OVERFLOW` により本体 lib の process が異常終了した。全件完走・全体 gate 成功は
+主張しない。本体の App 構造やテスト上限には触れず、設計 lead の別件判断へ渡す。
+本体 `build-dev.ps1 -PreserveRuntime` は出力先 core の既存プロセスを検出して exit 1。
+利用者の終了待ちで、core の診断 binary 更新は未完了。プロセス停止・アプリ起動・コミットは行っていない。
+
 ### D11. 出力の既定値
 
 1920x1080 / 60fps / H.264 High profile / yuv420p / bt709 / AAC-LC 48kHz。
