@@ -1890,7 +1890,6 @@ fn format_relative_time(mtime: SystemTime, now: SystemTime) -> String {
 mod tests {
     use super::*;
     use crate::keymap::KeyBindingOverride;
-    use egui_kittest::Harness;
 
     #[test]
     fn settings_family_close_policy_preserves_tray_hide_and_latches_process_exit() {
@@ -2083,7 +2082,7 @@ mod tests {
         let operation_diff = crate::operation_customize_share::diff(&defaults, &imported);
 
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(760.0, 420.0))
             .build(move |ctx| {
                 crate::ui_fonts::configure_fonts(ctx);
@@ -2393,7 +2392,7 @@ fn restore_backup_snapshot_fixture() -> Vec<BackupSummary> {
 #[cfg(test)]
 mod small_screen_tests {
     use super::*;
-    use egui_kittest::{Harness, kittest::Queryable};
+    use egui_kittest::kittest::Queryable;
 
     #[test]
     fn startup_restore_footer_wraps_inside_narrow_window() {
@@ -2401,7 +2400,7 @@ mod small_screen_tests {
         for scale in [1.0, 2.0] {
             let backups = restore_backup_snapshot_fixture();
             let mut fonts_ready = false;
-            let mut harness = Harness::builder()
+            let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1093.0, 614.0))
                 .build(move |ctx| {
                     if !fonts_ready {
@@ -2438,7 +2437,7 @@ mod small_screen_tests {
         for delta in [egui::vec2(0.0, 100.0), egui::vec2(100.0, 0.0)] {
             let backups = restore_backup_snapshot_fixture();
             let mut fonts_ready = false;
-            let mut harness = Harness::builder()
+            let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1093.0, 614.0))
                 .build(move |ctx| {
                     if !fonts_ready {
@@ -2494,8 +2493,9 @@ fn draw_restore_confirm_dialog(
         ),
         PendingAction::FullReset => (
             "設定を完全リセット",
-            "settings.db / bak1〜bak10 を含む設定ファイル一式を削除します。".to_string(),
-            "現在の設定一式は別名でバックアップしてから削除します。\n\
+            "settings.db / bak1〜bak10 を含む設定ファイル一式を削除し、本の構成を解除します。"
+                .to_string(),
+            "現在の設定一式と本の構成は別名でバックアップしてから削除・解除します。\n\
                  完了後、アプリを自動で終了します。次回起動時は初期状態になります。",
             "リセットして終了",
         ),

@@ -59,24 +59,128 @@ from statistics import median
 # ロード
 # -----------------------------------------------------------------------
 
+class PerfEvents(list):
+    """Parsed reference events plus evidence failures that cannot be skipped by gates."""
+
+    def __init__(self):
+        super().__init__()
+        self.evidence_errors: list[str] = []
+
+
 def load_events(path: Path) -> list[dict]:
-    """JSON Lines をイベント配列に読み込む。壊れた行はスキップ。"""
-    events: list[dict] = []
-    with path.open("r", encoding="utf-8") as f:
-        for lineno, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-                event["_line"] = lineno
-                events.append(event)
-            except json.JSONDecodeError as e:
-                print(
-                    f"warning: line {lineno}: {e}",
-                    file=sys.stderr,
-                )
+    """Keep readable legacy metrics, but retain malformed/truncated evidence for gates."""
+    events = PerfEvents()
+    with path.open("r", encoding="utf-8", errors="replace") as source:
+        raw = source.read()
+    if "\ufffd" in raw:
+        events.evidence_errors.append("Invalid JSONL UTF-8")
+    if raw and not raw.endswith("\n"):
+        events.evidence_errors.append("Incomplete JSONL tail")
+    for lineno, line in enumerate(raw.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+            if not isinstance(event, dict):
+                raise ValueError("event must be an object")
+            event["_line"] = lineno
+            events.append(event)
+        except (json.JSONDecodeError, ValueError) as error:
+            events.evidence_errors.append(f"JSONL line {lineno}: {error}")
+            print(f"warning: line {lineno}: {error}", file=sys.stderr)
     return events
+
+
+DELIVERY_CHECKPOINT_FIELDS = (
+    "schema", "session_id", "pid", "process_start_unix_ms", "request_id", "purpose",
+    "coverage_t", "ticket_cutoff", "settled_watermark", "written_watermark",
+    "normal_status", "perf_status", "normal_dropped_total", "perf_dropped_total",
+    "diagnostic_dropped_total", "normal_written_bytes", "perf_written_bytes",
+)
+
+
+def validate_delivery(
+    events: list[dict], *, checkpoint_id: str | None = None,
+    coverage_end_t: float | None = None, expected_pid: int | None = None,
+    ack: dict | None = None,
+) -> dict:
+    """Require stored flush evidence; absence of a drop summary never proves zero."""
+    reasons = list(getattr(events, "evidence_errors", []))
+    sessions = [e for e in events if (e.get("cat"), e.get("kind")) == ("session", "start")]
+    if len(sessions) != 1:
+        reasons.append("Expected exactly one session")
+    session = sessions[0] if len(sessions) == 1 else {}
+    if session.get("log_delivery_schema") != 1 or not session.get("session_id"):
+        reasons.append("Legacy log or missing delivery schema/session ID")
+    checkpoints = [e for e in events if (e.get("cat"), e.get("kind")) == ("log", "drain_checkpoint")]
+    if ack is not None:
+        checkpoint_id = checkpoint_id or ack.get("request_id")
+    if checkpoint_id is None:
+        checkpoints = [e for e in checkpoints if e.get("purpose") == "shutdown"]
+        if checkpoints and events[-1] is not checkpoints[-1]:
+            reasons.append("Unconfirmed tail after shutdown checkpoint")
+    else:
+        checkpoints = [e for e in checkpoints if e.get("request_id") == checkpoint_id]
+    checkpoint = checkpoints[0] if len(checkpoints) == 1 else {}
+    if len(checkpoints) != 1:
+        reasons.append("Missing stored checkpoint for the requested nonce")
+    if any(field not in checkpoint for field in DELIVERY_CHECKPOINT_FIELDS):
+        reasons.append("Unknown checkpoint counter/status/watermark")
+    if checkpoint.get("schema") != 1:
+        reasons.append("Checkpoint schema mismatch")
+    for field in ("session_id", "request_id", "purpose"):
+        if not isinstance(checkpoint.get(field), str) or not checkpoint[field]:
+            reasons.append(f"Missing checkpoint {field}")
+    for field in ("pid", "process_start_unix_ms"):
+        if type(checkpoint.get(field)) is not int or checkpoint[field] <= 0:
+            reasons.append(f"Invalid checkpoint {field}")
+    for field in ("session_id", "pid", "process_start_unix_ms"):
+        if field not in session or session.get(field) != checkpoint.get(field):
+            reasons.append(f"Checkpoint {field} does not match session")
+    if expected_pid is not None and session.get("pid") != expected_pid:
+        reasons.append("Checkpoint PID does not match measured process")
+    coverage = checkpoint.get("coverage_t")
+    if type(coverage) not in (float, int) or not math.isfinite(coverage) or coverage < 0:
+        reasons.append("Unknown checkpoint coverage")
+    elif coverage_end_t is not None and coverage < coverage_end_t:
+        reasons.append("Checkpoint coverage does not reach measurement end")
+    elif checkpoint_id is not None and coverage_end_t is None:
+        reasons.append("Specify measurement coverage end")
+    for field in ("ticket_cutoff", "settled_watermark", "written_watermark",
+                  "normal_written_bytes", "perf_written_bytes"):
+        if type(checkpoint.get(field)) is not int or checkpoint[field] < 0:
+            reasons.append(f"Unknown {field}")
+    cutoff = checkpoint.get("ticket_cutoff")
+    if type(cutoff) is int and any(
+        type(checkpoint.get(field)) is int and checkpoint[field] < cutoff
+        for field in ("settled_watermark", "written_watermark")
+    ):
+        reasons.append("Delivery before cutoff is incomplete")
+    for field in ("normal_status", "perf_status"):
+        if checkpoint.get(field) != "ready":
+            reasons.append(f"{field} is not ready")
+    for field in ("normal_dropped_total", "perf_dropped_total", "diagnostic_dropped_total"):
+        count = checkpoint.get(field)
+        if type(count) is not int or count < 0:
+            reasons.append(f"Unknown {field}")
+        elif count:
+            reasons.append(f"{field}={count} (cumulative session drops)")
+    for event in events:
+        if event.get("cat") == "log" and event.get("kind") in ("records_dropped", "diagnostic_dropped"):
+            reasons.append(f"{event.get('kind')}: count={event.get('count', '?')} total={event.get('total', '?')}")
+    if ack is not None and any(ack.get(field) != checkpoint.get(field) for field in DELIVERY_CHECKPOINT_FIELDS):
+        reasons.append("ACK does not match stored checkpoint")
+    return {"status": "CannotJudge" if reasons else "complete", "reasons": reasons,
+            "checkpoint": checkpoint, "coverage_end_t": coverage_end_t}
+
+
+def print_delivery(report: dict) -> None:
+    if report["reasons"]:
+        print("CannotJudge: 参考値・証拠不完全")
+        for reason in report["reasons"]:
+            print(f"  {reason}")
+    else:
+        print("log delivery: complete (stored/flushed checkpoint)")
 
 
 def fmt_key(key: str | None, maxlen: int = 60) -> str:
@@ -1920,6 +2024,8 @@ def analyze_idle_health(
     expected_pid: int | None = None,
     allow_sleeping_window: bool = False,
     require_work_key: str | None = None,
+    checkpoint_id: str | None = None,
+    delivery_ack: dict | None = None,
 ) -> dict:
     """静止測定区間を解析し、JSON 化可能な report を返す。
 
@@ -1928,7 +2034,7 @@ def analyze_idle_health(
     ``allow_sleeping_window`` で明示的に許可する。
     """
     duration = end_t - start_t
-    if duration <= 0.0:
+    if not all(math.isfinite(value) for value in (start_t, end_t)) or duration <= 0.0:
         raise ValueError("end_t は start_t より大きくしてください")
     # 空文字はあらゆる key に部分一致するため、ゲートが常に通る「嘘の PASS」になる。
     # 判定を無効化したい場合は None を渡すこと。
@@ -1954,7 +2060,20 @@ def analyze_idle_health(
         for e in selected
         if e.get("cat") == "ui" and e.get("kind") == "tail_repaint"
     ]
-    input_events = [e for e in selected if e.get("cat") == "input"]
+    # A passive modifier snapshot records an existing frame, not user activity.
+    # Match its exact no-input shape; missing fields and wheel=0 are not evidence
+    # of a heartbeat. Focus and modifier levels do not affect this classification.
+    input_events = [
+        e
+        for e in selected
+        if e.get("cat") == "input"
+        and not (
+            e.get("kind") == "modifier_probe"
+            and e.get("trigger") == "heartbeat"
+            and e.get("keys") == []
+            and e.get("wheel") is False
+        )
+    ]
 
     action_counts: dict[str, int] = defaultdict(int)
     reason_counts: dict[str, int] = defaultdict(int)
@@ -2140,8 +2259,11 @@ def analyze_idle_health(
             key=lambda pair: (-pair[1], pair[0]),
         )[:10]
     ]
+    delivery = validate_delivery(events, checkpoint_id=checkpoint_id, coverage_end_t=end_t,
+                                 expected_pid=expected_pid, ack=delivery_ack)
     return {
-        "status": "fail" if failures else "pass",
+        "status": "CannotJudge" if delivery["reasons"] else ("fail" if failures else "pass"),
+        "delivery": delivery,
         "window": {
             "start_t": start_t,
             "end_t": end_t,
@@ -2207,12 +2329,15 @@ def cmd_idle_health(
     expected_pid: int | None = None,
     allow_sleeping_window: bool = False,
     require_work_key: str | None = None,
+    checkpoint_id: str | None = None,
+    delivery_ack: dict | None = None,
 ) -> int:
     if not events:
         print("ERROR: perf event が 0 件です", file=sys.stderr)
         return 2
     if end_t is None:
-        end_t = max(float(e.get("t", 0.0)) for e in events)
+        checkpoints = [e for e in events if (e.get("cat"), e.get("kind")) == ("log", "drain_checkpoint")]
+        end_t = float(checkpoints[-1].get("coverage_t", 0.0)) if checkpoints else max(float(e.get("t", 0.0)) for e in events)
     if start_t is None:
         start_t = max(0.0, end_t - window_secs)
     try:
@@ -2228,11 +2353,13 @@ def cmd_idle_health(
             expected_pid=expected_pid,
             allow_sleeping_window=allow_sleeping_window,
             require_work_key=require_work_key,
+            checkpoint_id=checkpoint_id, delivery_ack=delivery_ack,
         )
     except ValueError as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 2
 
+    print_delivery(report["delivery"])
     metrics = report["metrics"]
     window = report["window"]
     print("=== idle health ===")
@@ -2285,7 +2412,7 @@ def cmd_idle_health(
             encoding="utf-8",
         )
         print(f"JSON report: {json_out}")
-    return 1 if report["failures"] else 0
+    return 2 if report["status"] == "CannotJudge" else (1 if report["failures"] else 0)
 
 
 # -----------------------------------------------------------------------
@@ -2348,13 +2475,14 @@ def _print_hitch_context(events: list[dict], interval: tuple[float, float]) -> N
         print(
             f"      [{span[0]:.3f}, {span[1]:.3f}]s "
             f"logger={event.get('logger', '?')} tid={event.get('tid', '?')} "
+            f"io_owner={event.get('io_owner', 'legacy_producer')} "
             f"operation={event.get('operation', '?')} acquired_t={event.get('acquired_t', '?')} "
             f"site={event.get('call_site', '?')} "
             f"holder(snapshot)={event.get('holder_tid')}/{event.get('holder_site')} "
             + _hitch_measurements(event, ["wait", "hold", "write", "flush", "auxiliary", "rotation", "diagnostics"])
         )
     if logger_rows:
-        print("      write/flush/auxiliary は hold の内訳。holder は待ち開始時の best-effort snapshot。")
+        print("      write/flush/auxiliary は hold の内訳。holder は best-effort snapshot。writer I/O重複はUIの待機を意味しません。")
     print(f"    thumb.load_phases 重複区間: {len(thumb_rows)} 件")
     for event, span in sorted(thumb_rows, key=lambda row: -(row[1][1] - row[1][0]))[:10]:
         print(
@@ -3559,7 +3687,7 @@ def main() -> None:
     subs.add_parser("remote-page")
     subs.add_parser("colorize")
     subs.add_parser("nav")
-    subs.add_parser("startup")
+    p_startup = subs.add_parser("startup")
     subs.add_parser("memory")
     subs.add_parser("collection")
     p_pre_grid = subs.add_parser("pre-grid")
@@ -3571,6 +3699,9 @@ def main() -> None:
     )
     p_hit = subs.add_parser("hitches")
     p_hit.add_argument("--ms", type=float, default=33.0, help="ヒッチ閾値 (ms、既定 33.0)")
+    p_perf_smoke = subs.add_parser("perf-smoke", help="isolated release-check verdict / JSON")
+    from release_check_analysis import add_perf_arguments, perf_smoke_cli
+    add_perf_arguments(p_perf_smoke)
     p_idle = subs.add_parser("idle-health")
     p_idle.add_argument("--start-t", type=float, default=None, help="測定開始 t (秒)")
     p_idle.add_argument("--end-t", type=float, default=None, help="測定終了 t (秒)")
@@ -3614,7 +3745,12 @@ def main() -> None:
     p_dump.add_argument("--with-frames", action="store_true", help="frame.begin も表示する")
     p_tl = subs.add_parser("timeline")
     p_tl.add_argument("seq", type=int, nargs="?", default=None)
-    subs.add_parser("scroll")
+    p_scroll = subs.add_parser("scroll")
+    for gate_parser in (p_startup, p_scroll, p_hit, p_idle):
+        gate_parser.add_argument("--checkpoint-id", default=None)
+        gate_parser.add_argument("--coverage-end-t", type=float, default=None)
+        gate_parser.add_argument("--delivery-ack", type=Path, default=None)
+        gate_parser.add_argument("--delivery-manifest", type=Path, default=None)
     p_display = subs.add_parser("display-integrity")
     p_display.add_argument(
         "--check",
@@ -3624,11 +3760,75 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    if args.cmd == "perf-smoke":
+        sys.exit(perf_smoke_cli(args))
+
     if not args.jsonl.is_file():
         print(f"ファイルが見つかりません: {args.jsonl}", file=sys.stderr)
+        if args.cmd in ("idle-health", "hitches", "scroll", "startup"):
+            print("CannotJudge: missing perf evidence")
+            sys.exit(2)
         sys.exit(1)
 
     events = load_events(args.jsonl)
+    delivery = None
+    delivery_ack = None
+    if args.cmd in ("idle-health", "hitches", "scroll", "startup"):
+        if args.delivery_manifest is not None:
+            try:
+                manifest = json.loads(args.delivery_manifest.read_text(encoding="utf-8-sig"))
+                if args.delivery_ack is not None:
+                    raise ValueError("Specify either delivery ACK or manifest")
+                if manifest.get("schema") != 1 or manifest.get("evidence_status") != "complete":
+                    events.evidence_errors.append("Manifest evidence is incomplete or unsupported")
+                perf_snapshot = manifest.get("snapshots", {}).get("perf") or {}
+                if type(perf_snapshot.get("length")) is not int or perf_snapshot["length"] != args.jsonl.stat().st_size:
+                    events.evidence_errors.append("Manifest perf prefix length mismatch")
+                delivery_ack = manifest["checkpoint"]
+                if not isinstance(delivery_ack, dict):
+                    raise ValueError("Manifest checkpoint must be an object")
+                args.checkpoint_id = args.checkpoint_id or delivery_ack.get("request_id")
+                if args.cmd == "idle-health":
+                    args.end_t = args.end_t if args.end_t is not None else delivery_ack.get("coverage_t")
+                else:
+                    args.coverage_end_t = args.coverage_end_t if args.coverage_end_t is not None else delivery_ack.get("coverage_t")
+            except (OSError, ValueError, KeyError, AttributeError, TypeError) as error:
+                events.evidence_errors.append(f"Invalid delivery manifest: {error}")
+                delivery_ack = None
+        if args.delivery_ack is not None:
+            try:
+                delivery_ack = json.loads(args.delivery_ack.read_text(encoding="utf-8-sig"))
+                if not isinstance(delivery_ack, dict):
+                    raise ValueError("ACK must be an object")
+                offset = delivery_ack.get("perf_end_offset")
+                if type(offset) is not int or args.jsonl.stat().st_size != offset:
+                    events.evidence_errors.append("ACK prefix length mismatch")
+                if not delivery_ack.get("perf_file_identity"):
+                    events.evidence_errors.append("ACK file identity is missing")
+            except (OSError, ValueError) as error:
+                events.evidence_errors.append(f"Invalid delivery ACK: {error}")
+                delivery_ack = None
+        delivery = validate_delivery(
+            events, checkpoint_id=args.checkpoint_id,
+            coverage_end_t=(args.end_t if args.cmd == "idle-health" else args.coverage_end_t),
+            expected_pid=(args.expected_pid if args.cmd == "idle-health" else None), ack=delivery_ack,
+        )
+        if args.cmd != "idle-health":
+            checkpoint = delivery["checkpoint"]
+            if checkpoint:
+                events = [event for event in events[:events.index(checkpoint) + 1]
+                          if event.get("cat") == "session" or
+                          float(event.get("t", 0.0)) <= (args.coverage_end_t if args.coverage_end_t is not None else checkpoint.get("coverage_t", 0.0))]
+            if args.cmd == "startup" and not any(
+                event.get("cat") == "startup" and event.get("kind") == "first_frame" for event in events
+            ):
+                delivery["reasons"].append("Missing startup.first_frame endpoint evidence")
+            if args.cmd == "scroll":
+                settles = [event for event in events if event.get("kind") == "scroll_settle"]
+                ready = {event.get("settle_seq") for event in events if event.get("kind") == "visible_thumb_all_ready"}
+                if not settles or any(event.get("settle_seq") not in ready for event in settles):
+                    delivery["reasons"].append("Missing scroll completion endpoint evidence")
+            print_delivery(delivery)
 
     if args.cmd == "summary":
         cmd_summary(events)
@@ -3680,6 +3880,8 @@ def main() -> None:
                 args.expected_pid,
                 args.allow_sleeping_window,
                 args.require_work_key,
+                args.checkpoint_id,
+                delivery_ack,
             )
         )
     elif args.cmd == "av_drift":
@@ -3692,6 +3894,9 @@ def main() -> None:
         cmd_timeline(events, args.seq)
     elif args.cmd == "scroll":
         cmd_scroll(events)
+
+    if delivery is not None and delivery["reasons"]:
+        sys.exit(2)
 
 
 if __name__ == "__main__":

@@ -1759,6 +1759,7 @@ pub struct VideoInfo {
     /// FFmpeg avformat が解釈できる形式 (Matroska tags / MP4 udta / ffmetadata) を
     /// 想定。値が無いキーは None。
     pub title: Option<String>,
+    pub album: Option<String>,
     pub artist: Option<String>,
     /// Original webpage URL embedded by external tools (`PURL`,
     /// `webpage_url`, etc.). Only HTTP(S) URLs are surfaced to the UI.
@@ -2674,6 +2675,7 @@ fn run_decoder(
     // 標準キーを拾う。Matroska / MP4 / ffmetadata で共通する小文字キー名を探し、
     // 大文字違いも順に試す。値が空なら None。
     let title = read_metadata_value(&input, &["title", "TITLE"]);
+    let album = read_metadata_value(&input, &["album", "ALBUM"]);
     let artist = read_metadata_value(&input, &["artist", "ARTIST", "author"]);
     let original_url = read_metadata_http_url(
         &input,
@@ -2755,6 +2757,7 @@ fn run_decoder(
         effective_deinterlace_mode: deinterlace,
         dynamic: Arc::clone(&dynamic),
         title,
+        album,
         artist,
         original_url,
         description,
@@ -9947,7 +9950,48 @@ mod audio_track_fixture_tests {
     }
 
     fn open_fixture_info(name: &str) -> VideoInfo {
-        let path = fixture_path(name);
+        open_fixture_info_path(fixture_path(name))
+    }
+
+    #[test]
+    fn now_playing_demux_publishes_album_title_and_artist_from_wav_info() {
+        fn chunk(id: &[u8; 4], bytes: &[u8]) -> Vec<u8> {
+            let mut result = id.to_vec();
+            result.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            result.extend_from_slice(bytes);
+            if bytes.len() % 2 == 1 {
+                result.push(0);
+            }
+            result
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("metadata.wav");
+        let mut format = Vec::new();
+        format.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        format.extend_from_slice(&1u16.to_le_bytes()); // mono
+        format.extend_from_slice(&8000u32.to_le_bytes());
+        format.extend_from_slice(&16000u32.to_le_bytes());
+        format.extend_from_slice(&2u16.to_le_bytes());
+        format.extend_from_slice(&16u16.to_le_bytes());
+        let mut info = b"INFO".to_vec();
+        info.extend(chunk(b"INAM", b"Track title\0"));
+        info.extend(chunk(b"IPRD", b"Album name\0"));
+        info.extend(chunk(b"IART", b"Artist name\0"));
+        let mut body = b"WAVE".to_vec();
+        body.extend(chunk(b"fmt ", &format));
+        body.extend(chunk(b"LIST", &info));
+        body.extend(chunk(b"data", &[0; 1600]));
+        let mut wav = b"RIFF".to_vec();
+        wav.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        wav.extend(body);
+        std::fs::write(&path, wav).unwrap();
+        let info = open_fixture_info_path(path);
+        assert_eq!(info.title.as_deref(), Some("Track title"));
+        assert_eq!(info.album.as_deref(), Some("Album name"));
+        assert_eq!(info.artist.as_deref(), Some("Artist name"));
+    }
+
+    fn open_fixture_info_path(path: PathBuf) -> VideoInfo {
         let input = ffmpeg_the_third::format::input(&path).expect("open committed fixture");
         let tracks = enumerate_audio_tracks(&input);
         let default_index = input.streams().best(MediaType::Audio).map(|s| s.index());

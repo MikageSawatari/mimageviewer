@@ -16,11 +16,53 @@ use crate::ring_shortcut::{
 };
 use crate::settings::{Parallelism, Settings};
 
+pub(crate) fn draw_same_name_folder_book_settings(
+    ui: &mut egui::Ui,
+    policy: &mut crate::same_name_folder_book::SameNameFolderBookPolicy,
+) {
+    pages::draw_same_name_folder_book(ui, policy);
+}
+
+#[doc(hidden)]
+pub fn draw_same_name_folder_book_settings_snapshot_fixture(ui: &mut egui::Ui) {
+    let mut policy = Default::default();
+    draw_same_name_folder_book_settings(ui, &mut policy);
+}
+
+#[doc(hidden)]
+pub fn draw_diagnostics_export_snapshot_fixture(ui: &mut egui::Ui, state: &str) {
+    use crate::diagnostics::{ExportView, SavedExport};
+    let view = match state {
+        "running" => ExportView::Running,
+        "incomplete" => ExportView::Finished(Ok(SavedExport {
+            path: PathBuf::from(r"C:\Users\User\Desktop\mImageViewer_diag.zip"),
+            evidence_incomplete: true,
+        })),
+        "error" => ExportView::Finished(Err(
+            "ログの保存完了を確認できないため、書き出しに失敗しました".into(),
+        )),
+        _ => ExportView::Idle,
+    };
+    let _ = pages::draw_diagnostics_export(ui, &view);
+}
+
 #[doc(hidden)]
 pub fn draw_fullscreen_fit_cycle_settings_snapshot_fixture(ui: &mut egui::Ui) {
     let mut settings = Settings::default();
-    settings.fullscreen_fit_cycle_excluded = vec!["Page".into(), "Width".into(), "Height".into()];
+    settings.fullscreen_fit_cycle_excluded = vec![
+        "Page".into(),
+        "Width".into(),
+        "Height".into(),
+        "SpecifiedScale".into(),
+    ];
     pages::draw_fullscreen_fit_cycle_settings(ui, &mut settings);
+}
+
+#[doc(hidden)]
+pub fn draw_preferences_restore_position_snapshot_fixture(ui: &mut egui::Ui, enabled: bool) {
+    let mut settings = Settings::default();
+    settings.preferences_restore_position = enabled;
+    pages::draw_preferences_restore_position_setting(ui, &mut settings);
 }
 
 #[doc(hidden)]
@@ -28,6 +70,47 @@ pub fn draw_grid_background_double_click_settings_snapshot_fixture(ui: &mut egui
     let mut settings = Settings::default();
     settings.grid_background_double_click_parent = true;
     pages::draw_grid_background_double_click_setting(ui, &mut settings);
+}
+
+/// Preferences editor. The HUD uses its own skin with the same axis controls.
+/// Returns true only when the user changed an axis setting or the common cap.
+pub fn draw_fullscreen_specified_scale_settings(
+    ui: &mut egui::Ui,
+    value: &mut crate::settings::FullscreenSpecifiedScale,
+    max_tenths: &mut u32,
+) -> bool {
+    pages::draw_fullscreen_specified_scale_settings(ui, value, max_tenths)
+}
+
+#[doc(hidden)]
+pub fn draw_fullscreen_fit_cycle_settings(ui: &mut egui::Ui, settings: &mut Settings) {
+    pages::draw_fullscreen_fit_cycle_settings(ui, settings);
+}
+
+#[doc(hidden)]
+pub fn draw_fullscreen_specified_scale_live_settings(
+    ui: &mut egui::Ui,
+    value: &mut crate::settings::FullscreenSpecifiedScale,
+    max_tenths: &mut u32,
+    favorite: bool,
+) -> bool {
+    crate::ui_fullscreen::draw_fs_specified_scale_live_editor(ui, value, max_tenths, favorite)
+}
+
+pub(crate) fn draw_fullscreen_specified_scale_axis_controls(
+    ui: &mut egui::Ui,
+    axis: &mut crate::settings::SpecifiedScaleAxisSetting,
+    label: &str,
+) {
+    pages::draw_fullscreen_specified_scale_axis_controls(ui, axis, label, true);
+}
+
+pub(crate) fn draw_fullscreen_specified_scale_max_controls(
+    ui: &mut egui::Ui,
+    max_tenths: &mut u32,
+    dark_popup: bool,
+) -> bool {
+    pages::draw_fullscreen_specified_scale_max_controls(ui, max_tenths, dark_popup)
 }
 
 mod name_colors;
@@ -105,6 +188,7 @@ pub fn draw_file_organize_destinations_settings_snapshot_fixture(ui: &mut egui::
 pub fn draw_effetune_input_limit_snapshot_fixture(ui: &mut egui::Ui) {
     pages::draw_effetune_input_limit_settings(ui, &mut Settings::default());
     pages::draw_effetune_auto_open_settings(ui, &mut Settings::default());
+    pages::draw_effetune_taskbar_settings(ui, &mut Settings::default());
     pages::draw_effetune_minimized_settings(ui, &mut Settings::default());
 }
 
@@ -257,6 +341,7 @@ pub(crate) enum PreferencesPage {
     /// v1.7.0: 製本（本棚の保存先ルート）
     Book,
     DuplicateFiles,
+    FileTypeVisibility,
     ExifDisplay,
     SpreadMode,
     /// 履歴と復元 (閲覧履歴、読書/再生位置の復元)
@@ -309,6 +394,7 @@ impl PreferencesOpenRequest {
     /// 同名ファイル処理。ページ内の 4 項目すべてが同名の設定なので、先頭へ寄せずに
     /// ページごと開く。
     pub(crate) const DUPLICATE_FILES: Self = Self::page(PreferencesPage::DuplicateFiles);
+    pub(crate) const FILE_TYPE_VISIBILITY: Self = Self::page(PreferencesPage::FileTypeVisibility);
 
     /// 変換対象書庫の扱い。キャッシュページの下の方にあり、ページを開いただけでは
     /// 画面に入らない (2026-09-05 利用者報告) ので anchor まで指定する。
@@ -321,6 +407,118 @@ impl PreferencesOpenRequest {
     /// 隠しファイル・フォルダの表示。
     pub(crate) const HIDDEN_FILES: Self =
         Self::anchored(PreferencesPage::Folder, "folder/hidden-files");
+}
+
+/// App owns the last rendered page position, independently of the settings draft.
+/// Search result lists do not replace this position. Nothing here is persisted.
+#[derive(Clone, Debug)]
+pub(crate) struct PreferencesViewPosition {
+    page: PreferencesPage,
+    scroll_y: f32,
+    in_page: Option<PreferencesInPageView>,
+}
+
+impl Default for PreferencesViewPosition {
+    fn default() -> Self {
+        Self {
+            page: PreferencesPage::General,
+            scroll_y: 0.0,
+            in_page: None,
+        }
+    }
+}
+
+/// Only navigation and presentation choices belong here, never settings drafts,
+/// editor buffers, pending actions, worker state or search navigation requests.
+#[derive(Clone, Debug)]
+struct PreferencesInPageView {
+    expanded: HashSet<&'static str>,
+    external_tools: Option<PreferencesExternalToolsView>,
+    ui_font_filter: String,
+    duplicate_priority_scroll_y: f32,
+    context_menu_preview_scenario: crate::context_menu_model::ContextMenuPreviewScenario,
+    menu_expanded: HashMap<crate::keymap::TopMenuId, bool>,
+    context_menu_expanded: HashMap<crate::context_menu_model::ContextMenuParentId, bool>,
+    exif_collapsed_groups: HashSet<crate::exif_reader::TagGroup>,
+    vst3_filter: String,
+    vst3_picker_scroll_y: f32,
+    #[cfg(windows)]
+    vst3_show_unusable: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PreferencesExternalToolsView {
+    selected: Option<crate::external_tool::ExternalToolId>,
+    association_ext: String,
+}
+
+impl PreferencesInPageView {
+    fn capture(
+        state: &PreferencesState,
+        previous: Option<&Self>,
+        rendered_page: Option<PreferencesPage>,
+    ) -> Self {
+        Self {
+            expanded: state.expanded.clone(),
+            // Preserve context-derived defaults until this page was shown.
+            external_tools: if rendered_page == Some(PreferencesPage::ExternalTools) {
+                Some(PreferencesExternalToolsView {
+                    selected: state.external_tool_selected,
+                    association_ext: state.external_tool_association_ext.clone(),
+                })
+            } else {
+                previous.and_then(|view| view.external_tools.clone())
+            },
+            ui_font_filter: state.ui_font_filter.clone(),
+            duplicate_priority_scroll_y: state.duplicate_priority_scroll_y,
+            context_menu_preview_scenario: state.context_menu_preview_scenario,
+            menu_expanded: state.menu_expanded.clone(),
+            context_menu_expanded: state.context_menu_expanded.clone(),
+            exif_collapsed_groups: state.exif_collapsed_groups.clone(),
+            vst3_filter: state.vst3_filter.clone(),
+            vst3_picker_scroll_y: state.vst3_picker_scroll_y,
+            #[cfg(windows)]
+            vst3_show_unusable: state.vst3_show_unusable,
+        }
+    }
+
+    fn restore(&self, state: &mut PreferencesState) {
+        state.expanded.clone_from(&self.expanded);
+        // A canceled addition or a removed tool must not restore a stale ID or
+        // its editor buffers. Keep from_settings' default if the ID disappeared.
+        if let Some(view) = &self.external_tools {
+            if let Some(id) = view.selected
+                && state
+                    .settings
+                    .external_tools
+                    .iter()
+                    .any(|tool| tool.id == id)
+            {
+                state.select_external_tool(Some(id));
+            }
+            if pages::association_extension_is_known(&view.association_ext) {
+                state
+                    .external_tool_association_ext
+                    .clone_from(&view.association_ext);
+            }
+        }
+        state.ui_font_filter.clone_from(&self.ui_font_filter);
+        state.duplicate_priority_scroll_y = self.duplicate_priority_scroll_y;
+        state.context_menu_preview_scenario = self.context_menu_preview_scenario;
+        state.menu_expanded.clone_from(&self.menu_expanded);
+        state
+            .context_menu_expanded
+            .clone_from(&self.context_menu_expanded);
+        state
+            .exif_collapsed_groups
+            .clone_from(&self.exif_collapsed_groups);
+        state.vst3_filter.clone_from(&self.vst3_filter);
+        state.vst3_picker_scroll_y = self.vst3_picker_scroll_y;
+        #[cfg(windows)]
+        {
+            state.vst3_show_unusable = self.vst3_show_unusable;
+        }
+    }
 }
 
 impl PreferencesPage {
@@ -347,6 +545,7 @@ impl PreferencesPage {
         Self::Folder,
         Self::Book,
         Self::DuplicateFiles,
+        Self::FileTypeVisibility,
         Self::ExifDisplay,
         Self::SpreadMode,
         Self::PlaybackResume,
@@ -385,6 +584,7 @@ impl PreferencesPage {
             Self::Folder => "フォルダ・ファイル",
             Self::Book => "製本",
             Self::DuplicateFiles => "同名ファイル",
+            Self::FileTypeVisibility => "表示するファイル種類",
             Self::ExifDisplay => "EXIF表示",
             Self::SpreadMode => "閲覧表示",
             Self::PlaybackResume => "履歴と復元",
@@ -644,6 +844,7 @@ const TREE: &[TreeCategory] = &[
         page: None,
         children: &[
             PreferencesPage::DuplicateFiles,
+            PreferencesPage::FileTypeVisibility,
             PreferencesPage::ExifDisplay,
             PreferencesPage::SusiePlugins,
             PreferencesPage::RawDevelop,
@@ -885,8 +1086,13 @@ pub(crate) struct PreferencesState {
     initial_video_normal_wheel_action: crate::ring_shortcut::VideoNormalWheelActionId,
     /// 現在選択中のページ
     pub selected: PreferencesPage,
+    /// 拡張子の追加欄。入力途中の値は永続設定へ混ぜない。
+    pub file_type_extension_input: String,
+    pub file_type_extension_error: Option<&'static str>,
     /// 右クリックメニュー設定に表示する固定の確認場面。保存対象ではない。
     pub context_menu_preview_scenario: crate::context_menu_model::ContextMenuPreviewScenario,
+    pub menu_expanded: HashMap<crate::keymap::TopMenuId, bool>,
+    pub context_menu_expanded: HashMap<crate::context_menu_model::ContextMenuParentId, bool>,
     /// 右ペインのスクロール状態をページ切替ごとに新しくする世代。
     /// 同じページの再描画では維持し、別ページへ移ったときだけ増やす。
     pub right_panel_scroll_generation: u64,
@@ -997,6 +1203,7 @@ pub(crate) struct PreferencesState {
     pub operation_mouse_gesture_recorder: Option<OperationMouseGestureRecorder>,
     /// EXIF タグ設定で折りたたみ中のグループ。`HashSet` に入っているものが折りたたみ。
     pub exif_collapsed_groups: HashSet<crate::exif_reader::TagGroup>,
+    pub duplicate_priority_scroll_y: f32,
     /// カスタム追加直後に「自動スクロールして見せる」タグ名 (1 フレームだけ持つ)。
     pub exif_scroll_to_added: Option<String>,
 
@@ -1109,6 +1316,7 @@ pub(crate) struct PreferencesState {
     pub vst3_scan_current: String,
     /// VST3 ページ内のフィルタ文字列。
     pub vst3_filter: String,
+    pub vst3_picker_scroll_y: f32,
     /// 音声入力を持たない plugin (= Instrument / MIDI FX 等) も候補一覧に表示する。
     #[cfg(windows)]
     pub vst3_show_unusable: bool,
@@ -1118,9 +1326,10 @@ pub(crate) struct PreferencesState {
     #[cfg(windows)]
     pub vst3_auto_bypassed: Vec<(String, f64)>,
 
-    /// 開発者タブ「ログを zip にする」ボタンの直近の実行結果。
-    /// `Ok(path)` なら作成した zip パス、`Err(msg)` なら失敗理由を表示する。
-    pub diag_export_result: Option<Result<std::path::PathBuf, String>>,
+    /// Appのexport ownerから毎フレーム投影する進捗・結果。
+    pub diag_export_view: crate::diagnostics::ExportView,
+    /// One-shot UI command, not worker lifecycle state.
+    pub diag_export_submit: bool,
 }
 
 impl PreferencesState {
@@ -1470,8 +1679,12 @@ impl PreferencesState {
             video_media_memory_clear_requested: false,
             initial_video_normal_wheel_action: s.ring_shortcuts.video_normal_wheel_action,
             selected: PreferencesPage::General,
+            file_type_extension_input: String::new(),
+            file_type_extension_error: None,
             context_menu_preview_scenario:
                 crate::context_menu_model::ContextMenuPreviewScenario::default(),
+            menu_expanded: HashMap::new(),
+            context_menu_expanded: HashMap::new(),
             right_panel_scroll_generation: 0,
             search_query: String::new(),
             showing_results: false,
@@ -1557,6 +1770,7 @@ impl PreferencesState {
             operation_mouse_gesture_inputs: HashMap::new(),
             operation_mouse_gesture_recorder: None,
             exif_collapsed_groups: HashSet::new(),
+            duplicate_priority_scroll_y: 0.0,
             exif_scroll_to_added: None,
             auto_thread_count,
             vram_mib: crate::gpu_info::query_vram_summary_mib(),
@@ -1610,11 +1824,13 @@ impl PreferencesState {
             #[cfg(windows)]
             vst3_scan_current: String::new(),
             vst3_filter: String::new(),
+            vst3_picker_scroll_y: 0.0,
             #[cfg(windows)]
             vst3_show_unusable: false,
             #[cfg(windows)]
             vst3_auto_bypassed: Vec::new(),
-            diag_export_result: None,
+            diag_export_view: crate::diagnostics::ExportView::Idle,
+            diag_export_submit: false,
         }
     }
 
@@ -1924,19 +2140,6 @@ fn advance_preferences_scroll_generation(
     }
 }
 
-fn advance_preferences_scroll_generation_on_open(
-    show_preferences: bool,
-    open_last_frame: &mut bool,
-    sequence: &mut u64,
-) -> Option<u64> {
-    let opened = show_preferences && !*open_last_frame;
-    *open_last_frame = show_preferences;
-    opened.then(|| {
-        *sequence = sequence.wrapping_add(1);
-        *sequence
-    })
-}
-
 const PREFERENCE_HIGHLIGHT_SECS: f64 = 2.5;
 
 /// ページ内の検索対象コントロールへ anchor を付ける。
@@ -2177,6 +2380,16 @@ fn merge_video_media_memory_for_preferences(
 
 impl App {
     pub(crate) fn install_preferences_settings(&mut self, mut settings: Settings) {
+        // A legacy favorite's missing value follows the newly edited common
+        // setting. Read presence from the existing state owner, not effective values.
+        if settings.active_favorite_view_id().is_some()
+            && self
+                .favorite_view_state_for_capture()
+                .fullscreen_specified_scale
+                .is_none()
+        {
+            settings.fullscreen_specified_scale = settings.common_fullscreen_specified_scale();
+        }
         let old_raw_brightness = self.settings.raw_brightness;
         let requested_raw_parallelism = settings.raw_develop_parallelism.clamp(1, 10);
         if requested_raw_parallelism != self.settings.raw_develop_parallelism {
@@ -2196,7 +2409,19 @@ impl App {
             != settings.thumb_show_media_duration
             || self.settings.thumb_show_resume_meter != settings.thumb_show_resume_meter;
         let books_root_changed = self.settings.books_root_path() != settings.books_root_path();
+        // Fit mode is shared across contexts. End the selected continuous unit
+        // at the setting boundary, including parked owners that will not draw
+        // between a mode exit and a later re-entry.
+        if self.settings.fullscreen_fit_mode != settings.fullscreen_fit_mode {
+            self.invalidate_all_continuous_specified_fit_references();
+        }
+        if self.settings.remember_spread_shift_per_book != settings.remember_spread_shift_per_book {
+            self.spread_shift_memory_setting_changed(settings.remember_spread_shift_per_book);
+        }
         self.settings = settings;
+        if !self.settings.preferences_restore_position {
+            self.preferences_view_position = PreferencesViewPosition::default();
+        }
         #[cfg(windows)]
         self.publish_effetune_auto_setting();
         if old_raw_brightness != self.settings.raw_brightness {
@@ -2207,6 +2432,8 @@ impl App {
             self.effetune.set_keep_visible_when_minimized(
                 self.settings.effetune_keep_visible_when_minimized,
             );
+            self.effetune
+                .set_show_in_taskbar(self.settings.effetune_show_in_taskbar);
             self.effetune
                 .slot
                 .set_pre_limiter_enabled(self.settings.effetune_pre_limiter_enabled);
@@ -2224,7 +2451,10 @@ impl App {
     }
 
     pub(crate) fn open_preferences_request(&mut self, request: PreferencesOpenRequest) {
-        if self.preferences_transfer_busy() {
+        if self.composition_editor_modal_active() {
+            return;
+        }
+        if self.preferences_transfer_busy() || self.collection_reorder_open() {
             return;
         }
         self.preferences_requested_page = Some(request);
@@ -2335,6 +2565,9 @@ impl App {
 
     fn ensure_preferences_state(&mut self) {
         if self.pref_state.is_none() {
+            if !self.settings.preferences_restore_position {
+                self.preferences_view_position = PreferencesViewPosition::default();
+            }
             let ai_runtime = self.ai_runtime_init.ready_runtime();
             let trt_worker_snapshot = self.ai_runtime_init.trt_worker_lifecycle().snapshot();
             let external_tool_target = crate::external_tool::LaunchTarget::from_grid_item(
@@ -2360,6 +2593,16 @@ impl App {
                     .unwrap_or(0),
             );
             new_state.favorite_view_state_entry_count = self.favorite_view_states.len();
+            if let Some(view) = &self.preferences_view_position.in_page {
+                view.restore(&mut new_state);
+            } else {
+                new_state
+                    .expanded
+                    .insert(preference_category(self.preferences_view_position.page).0);
+            }
+            new_state.selected = self.preferences_view_position.page;
+            new_state.right_panel_scroll_generation =
+                self.preferences_right_panel_scroll_sequence.wrapping_add(1);
             // 既にスキャン済みの VST3 プラグイン候補を引き継ぐ (= 再スキャン不要で表示)
             #[cfg(windows)]
             {
@@ -2369,30 +2612,435 @@ impl App {
         }
     }
 
-    pub(crate) fn show_preferences_dialog(&mut self, ctx: &egui::Context) {
-        // ScrollArea の id は open edge でだけ変える。毎フレーム変えると利用者が
-        // スクロールできない。sequence は PreferencesState より長寿命にして、閉じて
-        // state が破棄されても次回 open で過去の id を再利用しない。
-        let opened_scroll_generation = advance_preferences_scroll_generation_on_open(
-            self.show_preferences,
-            &mut self.preferences_open_last_frame,
-            &mut self.preferences_right_panel_scroll_sequence,
+    #[cfg(test)]
+    pub(crate) fn set_visibility_preferences_for_test(
+        &mut self,
+        visibility: crate::file_type_visibility::FileTypeVisibility,
+    ) {
+        let mut state = PreferencesState::from_settings(
+            &self.settings,
+            crate::external_tool::LaunchTarget::None,
+            None,
+            self.ai_runtime_init.trt_worker_lifecycle().snapshot(),
+            false,
+            0,
+            0,
+            0,
         );
+        state.settings.file_type_visibility = visibility;
+        self.pref_state = Some(Box::new(state));
+        self.show_preferences = true;
+    }
+
+    pub(crate) fn apply_preferences_dialog(&mut self, ctx: &egui::Context) {
+        name_colors::clear_hex_editor(ctx);
+        if let Some(mut state) = self.pref_state.take() {
+            let old_dup = (
+                self.settings.same_name_folder_book,
+                self.settings.skip_archive_if_zip_exists,
+                self.settings.skip_epub_if_pdf_exists,
+                self.settings.skip_image_if_video_exists,
+                self.settings.skip_duplicate_images,
+                self.settings.image_ext_priority.clone(),
+                self.settings.video_thumb_use_sidecar_image,
+                self.settings.archive_file_handling_resolved(),
+                self.settings.epub_file_handling,
+            );
+            let old_grid_display_order = self.settings.grid_display_order.clone();
+            let old_rating_sort_unrated_position = self.settings.rating_sort_unrated_position;
+            let old_show_hidden_files = self.settings.show_hidden_files;
+            let file_type_visibility_changed =
+                self.settings.file_type_visibility != state.settings.file_type_visibility;
+            let old_exif = self.settings.exif_hidden_tags.clone();
+
+            let old_susie = (
+                self.settings.susie_enabled,
+                self.settings.susie_allow_parallel,
+            );
+
+            let old_pause_minimized = self.settings.pause_indexer_while_minimized;
+
+            // 動画ループモード変更を検出してフルスクリーン中の player に反映する
+            let old_loop_mode = self.settings.video_loop_mode;
+
+            // AI バックエンド設定変更を検出してホットリロードトリガに使う
+            let old_ai_backend = self.settings.ai_backend.clone();
+            let new_ai_backend = state.settings.ai_backend.clone();
+            let old_ai_feature_mode = self.settings.ai_feature_mode;
+            let old_reading_history_limit = self.settings.reading_history_limit;
+            let old_keymap_settings = self.settings.keymap.clone();
+            let old_fullscreen_side_panel_mode =
+                self.settings.fullscreen_side_panel_mode.normalized();
+            let old_final_cover_spread_enabled = self.settings.final_cover_spread_enabled;
+            let old_singleton_spread_placement_enabled = (
+                self.settings.singleton_spread_first_enabled,
+                self.settings.singleton_spread_last_enabled,
+            );
+            let old_page_alone_enabled = (
+                self.settings.page_after_cover_alone_enabled,
+                self.settings.last_page_alone_enabled,
+            );
+            let old_ui_font = self.settings.ui_font.clone();
+            let old_creative_luts = self.settings.creative_luts.clone();
+            let mut creative_lut_transaction = std::mem::take(&mut state.creative_lut_transaction);
+
+            // AI 処理サイズ上限の変更検出 (final AI cache / failed / pending の
+            // 無効化トリガに使う)
+            let old_ai_size_limits = (
+                self.settings.ai_upscale_limit(),
+                self.settings.ai_denoise_limit(),
+            );
+            let old_retained_final_ai_cache_budget = (
+                self.settings.retained_final_ai_cache_max_entries,
+                self.settings.retained_final_ai_cache_max_mib,
+            );
+            let old_edit_preview_cache = (
+                self.settings.edit_preview_cache_enabled,
+                self.settings.edit_preview_cache_max_bytes,
+            );
+            let old_edit_restore_prompt_enabled = self.settings.edit_restore_prompt_enabled;
+            #[cfg(windows)]
+            let old_video_seek_strip_min_interval_secs =
+                self.settings.video_seek_strip_min_interval_secs;
+            #[cfg(windows)]
+            let old_video_seek_strip_waveform_span_secs =
+                self.settings.video_seek_strip_waveform_span_secs;
+
+            // VST3 enable 状態 + チェーン構成の変化を検出してホットリロード。
+            let old_vst3_enabled = self.settings.vst3_enabled;
+            let new_vst3_enabled = state.settings.vst3_enabled;
+            #[cfg(windows)]
+            let old_vst3_chain: Vec<String> = self
+                .settings
+                .vst3_plugins
+                .iter()
+                .map(|e| e.path.clone())
+                .collect();
+            #[cfg(windows)]
+            let new_vst3_chain: Vec<String> = state
+                .settings
+                .vst3_plugins
+                .iter()
+                .map(|e| e.path.clone())
+                .collect();
+            #[cfg(windows)]
+            let old_detached_open_images_in_window =
+                self.settings.detached_viewer_open_images_in_window;
+            #[cfg(windows)]
+            let old_fullfeature_media_window = self.settings.fullfeature_media_window;
+            // VST3 ページで再スキャンした候補を App 側に反映
+            #[cfg(windows)]
+            let new_vst3_discovered = state.vst3_discovered.clone();
+
+            // ダイアログを開いた時点の `state.settings` は self.settings の snapshot。
+            // 開いている間に他ダイアログ (お気に入り編集 / タグ編集 / 補正プリセット /
+            // 開いたアプリ履歴等) や runtime (ツールバー選択 / ウィンドウ移動 / レーティング
+            // フィルタ) が変えたフィールドは state.settings 側に反映されないため、そのまま
+            // self.settings = state.settings を実行するとそれらの変更が消える。
+            // 対策: 環境設定が管理しないフィールドを self.settings の最新値で state に
+            // 移送してから全体差し替えする。新しく「環境設定 UI から触らない」フィールドを
+            // Settings に追加した場合はここにも追記が必要。
+            prepare_preferences_state_settings_for_commit(&mut state, &mut self.settings);
+            self.install_preferences_settings(state.settings);
+            if old_final_cover_spread_enabled != self.settings.final_cover_spread_enabled {
+                #[cfg(windows)]
+                self.invalidate_final_cover_spread_display_in_parked_contexts();
+                if self.final_cover_spread_preference
+                    == crate::settings::FinalCoverSpreadPreference::FollowGlobal
+                {
+                    self.invalidate_final_cover_spread_display(ctx);
+                }
+            }
+            let first_endpoint_changed = old_singleton_spread_placement_enabled.0
+                != self.settings.singleton_spread_first_enabled;
+            let last_endpoint_changed = old_singleton_spread_placement_enabled.1
+                != self.settings.singleton_spread_last_enabled;
+            if first_endpoint_changed || last_endpoint_changed {
+                #[cfg(windows)]
+                self.invalidate_singleton_spread_placement_in_parked_contexts(
+                    first_endpoint_changed,
+                    last_endpoint_changed,
+                );
+                if first_endpoint_changed
+                    && self.singleton_spread_endpoint_preferences.first
+                        == crate::settings::SingletonSpreadPlacementPreference::FollowGlobal
+                    || last_endpoint_changed
+                        && self.singleton_spread_endpoint_preferences.last
+                            == crate::settings::SingletonSpreadPlacementPreference::FollowGlobal
+                {
+                    self.invalidate_singleton_spread_placement_display(ctx);
+                }
+            }
+            let after_cover_changed =
+                old_page_alone_enabled.0 != self.settings.page_after_cover_alone_enabled;
+            let last_page_changed =
+                old_page_alone_enabled.1 != self.settings.last_page_alone_enabled;
+            if after_cover_changed || last_page_changed {
+                #[cfg(windows)]
+                self.invalidate_page_alone_in_parked_contexts(
+                    after_cover_changed,
+                    last_page_changed,
+                );
+                if self.spread_mode.has_cover()
+                    && (after_cover_changed
+                        && self.page_alone_preferences.after_cover
+                            == crate::settings::PageAlonePreference::FollowGlobal
+                        || last_page_changed
+                            && self.page_alone_preferences.last
+                                == crate::settings::PageAlonePreference::FollowGlobal)
+                {
+                    self.invalidate_singleton_spread_placement_display(ctx);
+                }
+            }
+            #[cfg(windows)]
+            if old_video_seek_strip_min_interval_secs.to_bits()
+                != self.settings.video_seek_strip_min_interval_secs.to_bits()
+            {
+                self.rebuild_video_seek_strip_adopted_list();
+            }
+            #[cfg(windows)]
+            if old_video_seek_strip_waveform_span_secs.to_bits()
+                != self.settings.video_seek_strip_waveform_span_secs.to_bits()
+            {
+                self.rebuild_video_seek_strip_waveform_span();
+            }
+            self.sync_content_identity_detection_setting(old_edit_restore_prompt_enabled);
+            if old_creative_luts != self.settings.creative_luts {
+                if self
+                    .settings
+                    .video_adjustments
+                    .creative_lut
+                    .id
+                    .is_some_and(|id| {
+                        !self
+                            .settings
+                            .creative_luts
+                            .iter()
+                            .any(|entry| entry.id == id)
+                    })
+                {
+                    self.settings.video_adjustments.creative_lut.id = None;
+                }
+                self.creative_lut_library
+                    .reload(&self.settings.creative_luts);
+                self.clear_all_final_pipeline_caches();
+                #[cfg(windows)]
+                self.sync_native_video_grade();
+            }
+            if old_ui_font != self.settings.ui_font {
+                #[cfg(windows)]
+                {
+                    // detached viewer / native HUD はそれぞれ独立した egui Context を
+                    // 持つため、表示倍率変更と同じ正規 teardown 経路で閉じる。
+                    // 再度開いた時点で新しいフォント設定を使って生成される。
+                    let closed_detached = self
+                        .close_all_detached_viewers_for_mode_change(ctx)
+                        .unwrap_or(true);
+                    if !closed_detached && self.fullscreen_idx.is_some() {
+                        self.close_fullscreen();
+                    }
+                    self.request_main_font_update();
+                }
+                #[cfg(not(windows))]
+                crate::ui_fonts::configure_fonts_with_settings(ctx, &self.settings.ui_font);
+            }
+            if old_fullscreen_side_panel_mode
+                != self.settings.fullscreen_side_panel_mode.normalized()
+            {
+                self.reset_fs_side_panel_runtime_for_mode_change();
+            }
+            if old_keymap_settings != self.settings.keymap {
+                let keymap = crate::keymap::Keymap::from_settings(&self.settings.keymap);
+                for warning in keymap.warnings() {
+                    crate::logger::log(format!("[keymap] {warning}"));
+                }
+                keymap.install_global_native_video_shortcuts();
+                self.keymap = keymap;
+            }
+            #[cfg(windows)]
+            if (old_detached_open_images_in_window
+                != self.settings.detached_viewer_open_images_in_window
+                || old_fullfeature_media_window != self.settings.fullfeature_media_window)
+                && self
+                    .close_all_detached_viewers_for_mode_change(ctx)
+                    .unwrap_or(true)
+            {
+                self.show_feedback_toast(
+                    "別ウィンドウの表示モードを変更したため、開いていた別ウィンドウを閉じました"
+                        .to_string(),
+                );
+            }
+            // (フォルダ履歴 / A・B 記憶のクリアは v2.0.0 でフォルダバーの右クリック
+            //  メニューへ移動。環境設定 OK 経路でのクリア要求は廃止。)
+            if old_reading_history_limit != self.settings.reading_history_limit {
+                if let Some(writer) = &self.reading_history_writer {
+                    writer.prune(self.settings.reading_history_limit);
+                } else if let Some(db) = self.reading_history_db.as_ref() {
+                    if let Err(e) = db.prune(self.settings.reading_history_limit) {
+                        crate::logger::log(format!("reading-history prune failed: {e}"));
+                    }
+                }
+                if self.items_are_reading_history_view {
+                    self.enter_reading_history();
+                }
+            }
+            if !self.settings.save_checked() {
+                self.show_feedback_toast("設定を保存できませんでした。再起動すると今回の変更が残らない可能性があります。".to_owned());
+            }
+            creative_lut_transaction.commit();
+
+            #[cfg(windows)]
+            self.sync_all_native_chrome_policy();
+
+            if let Some(service) = &self.edit_preview_cache {
+                if !self.settings.edit_preview_cache_enabled {
+                    if old_edit_preview_cache.0 {
+                        service.clear();
+                    }
+                } else if old_edit_preview_cache
+                    != (
+                        self.settings.edit_preview_cache_enabled,
+                        self.settings.edit_preview_cache_max_bytes,
+                    )
+                {
+                    service.prune(self.settings.edit_preview_cache_max_bytes.max(1_000_000));
+                }
+            }
+
+            // 動画ループモードが変わったらフルスクリーン中の player に反映する
+            #[cfg(windows)]
+            if old_loop_mode != self.settings.video_loop_mode {
+                if let Some(idx) = self.fullscreen_idx {
+                    self.apply_loop_mode_to_player(idx);
+                }
+            }
+            #[cfg(not(windows))]
+            let _ = old_loop_mode;
+
+            // 「常駐中はインデックス更新を一時停止する」が変わったらトレイの checkmark も
+            // 同期する (お気に入り編集ダイアログと同じチェックボックス項目への二重経路)。
+            if old_pause_minimized != self.settings.pause_indexer_while_minimized {
+                self.sync_tray_pause_check();
+            }
+
+            // AI バックエンド変更のホットリロード処理 (Phase 3)
+            if old_ai_backend != new_ai_backend {
+                self.apply_ai_backend_change(new_ai_backend.as_deref());
+            }
+            if old_ai_feature_mode != self.settings.ai_feature_mode {
+                self.apply_ai_feature_mode_change();
+            }
+            let new_ai_size_limits = (
+                self.settings.ai_upscale_limit(),
+                self.settings.ai_denoise_limit(),
+            );
+            if old_ai_size_limits != new_ai_size_limits {
+                self.apply_ai_size_limit_change();
+            }
+            let new_retained_final_ai_cache_budget = (
+                self.settings.retained_final_ai_cache_max_entries,
+                self.settings.retained_final_ai_cache_max_mib,
+            );
+            if old_retained_final_ai_cache_budget != new_retained_final_ai_cache_budget {
+                self.prune_retained_final_ai_cache_to_settings();
+            }
+
+            // 同名ファイル設定が変更された場合はフォルダを再読み込み
+            // (Phase 5.3: video_thumb_use_sidecar_image も含む — 切り替え時に
+            // video_thumb_overrides を作り直すため)
+            let new_dup = (
+                self.settings.same_name_folder_book,
+                self.settings.skip_archive_if_zip_exists,
+                self.settings.skip_epub_if_pdf_exists,
+                self.settings.skip_image_if_video_exists,
+                self.settings.skip_duplicate_images,
+                self.settings.image_ext_priority.clone(),
+                self.settings.video_thumb_use_sidecar_image,
+                self.settings.archive_file_handling_resolved(),
+                self.settings.epub_file_handling,
+            );
+            let duplicate_settings_changed = old_dup != new_dup;
+            let file_visibility_changed = old_show_hidden_files != self.settings.show_hidden_files;
+            let grid_display_order_changed =
+                old_grid_display_order != self.settings.grid_display_order;
+            let rating_sort_position_changed = old_rating_sort_unrated_position
+                != self.settings.rating_sort_unrated_position
+                && self.settings.sort_order.is_rating();
+            if file_type_visibility_changed {
+                self.apply_file_type_visibility_change(ctx);
+            } else if duplicate_settings_changed || file_visibility_changed {
+                self.reload_current_folder_preserving_override();
+            } else if grid_display_order_changed || rating_sort_position_changed {
+                self.apply_sort_change_reload();
+            }
+            if old_exif != self.settings.exif_hidden_tags {
+                self.exif_cache.clear();
+            }
+
+            // VST3 enable 状態 / チェーン構成の変化反映
+            #[cfg(windows)]
+            {
+                self.vst3_discovered = new_vst3_discovered;
+                let chain_changed = old_vst3_chain != new_vst3_chain;
+                if old_vst3_enabled != new_vst3_enabled {
+                    if new_vst3_enabled {
+                        self.kick_off_vst3_chain_rebuild();
+                    } else {
+                        // VST3 OFF へのトグル: bridge teardown 前に内部状態と
+                        // ウィンドウ位置を保存 (= 次回 ON 時の復元用)。
+                        // T22: UI スレッドなので 2 秒に制限
+                        let states = self
+                            .snapshot_vst3_states_into_settings(std::time::Duration::from_secs(2));
+                        let positions = self.snapshot_vst3_window_positions_into_settings();
+                        if states > 0 || positions > 0 {
+                            self.settings.save();
+                        }
+                        self.dsp_bridge.disable();
+                    }
+                } else if chain_changed && new_vst3_enabled {
+                    self.kick_off_vst3_chain_rebuild();
+                }
+            }
+            #[cfg(not(windows))]
+            let _ = (old_vst3_enabled, new_vst3_enabled);
+
+            let new_susie = (
+                self.settings.susie_enabled,
+                self.settings.susie_allow_parallel,
+            );
+            if old_susie != new_susie {
+                crate::susie_loader::reload(
+                    self.settings.susie_enabled,
+                    self.settings.susie_allow_parallel,
+                );
+                // 対応拡張子が変わる可能性があるので現在のフォルダを再読み込み
+                self.reload_current_folder_preserving_override();
+            }
+        }
+        self.show_preferences = false;
+        self.show_preferences_discard_confirm = false;
+    }
+
+    pub(crate) fn show_preferences_dialog(&mut self, ctx: &egui::Context) {
         if !self.show_preferences {
             return;
         }
 
         // 初回: 一時コピーを作成
         self.ensure_preferences_state();
-        if let Some(generation) = opened_scroll_generation {
-            self.pref_state
-                .as_mut()
-                .expect("preferences state was initialized above")
-                .right_panel_scroll_generation = generation;
-        }
+        // A fresh draft gets a fresh ScrollArea id, with one explicit restore.
+        // This also works when close and reopen happen without a hidden frame.
+        let mut restore_scroll_y = (self
+            .pref_state
+            .as_ref()
+            .unwrap()
+            .right_panel_scroll_generation
+            != self.preferences_right_panel_scroll_sequence)
+            .then_some(self.preferences_view_position.scroll_y);
         let favorite_view_state_active = self.settings.active_favorite_view_id().is_some();
         let clipboard_capture_startup_failed = self.clipboard_capture_startup_failed();
         if let Some(state) = self.pref_state.as_mut() {
+            state.diag_export_view = self.diagnostics_export.view();
             state.clipboard_capture_startup_failed = clipboard_capture_startup_failed;
             state.clipboard_capture_default_output_dir =
                 crate::clipboard_capture::default_destination();
@@ -2403,20 +3051,16 @@ impl App {
 
         if let Some(requested) = self.preferences_requested_page.take() {
             if let Some(state) = self.pref_state.as_mut() {
-                let previous = state.selected;
                 state.selected = requested.page;
-                advance_preferences_scroll_generation(
-                    previous,
-                    state.selected,
-                    &mut state.right_panel_scroll_generation,
-                );
+                state.expanded.insert(preference_category(state.selected).0);
+                state.right_panel_scroll_generation =
+                    state.right_panel_scroll_generation.wrapping_add(1);
+                restore_scroll_y = Some(0.0);
+                state.pending_anchor = requested.anchor;
+                state.highlight = None;
+                state.showing_results = false;
                 // 項目まで指定された要求は、検索結果から飛んだときと同じ
                 // スクロール + 一時強調を通す。ここで別の見せ方を作らない。
-                if let Some(anchor) = requested.anchor {
-                    state.pending_anchor = Some(anchor);
-                    state.highlight = None;
-                    state.showing_results = false;
-                }
             }
         }
 
@@ -2447,6 +3091,7 @@ impl App {
         let mut cancel = false;
 
         let transfer_dialog_open = self.preferences_transfer_dialog_open();
+        let collection_reorder_open = self.collection_reorder_open();
         if transfer_dialog_open {
             // Popups use independent UI layers and do not inherit a disabled
             // parent. Remove that combination while the transfer modal is shown.
@@ -2512,6 +3157,9 @@ impl App {
                     state.selected,
                     &mut state.right_panel_scroll_generation,
                 );
+                if selected_before_tree != state.selected {
+                    restore_scroll_y = None;
+                }
 
                 // 区切り線
                 let sep_x = outer_rect.min.x + tree_width + 3.0;
@@ -2536,27 +3184,56 @@ impl App {
                         .next();
                     if let Some(entry) = first {
                         select_preference_search_result(state, entry);
+                        restore_scroll_y = None;
                     }
                 }
-                egui::ScrollArea::vertical()
+                let rendered_page = state.selected;
+                let rendered_generation = state.right_panel_scroll_generation;
+                let rendered_results = state.showing_results;
+                let mut scroll = egui::ScrollArea::vertical()
                     .id_salt(("pref_panel", state.right_panel_scroll_generation))
                     .scroll_bar_visibility(
                         egui::containers::scroll_area::ScrollBarVisibility::AlwaysVisible,
                     )
                     .auto_shrink([false, false])
-                    .max_height(main_height)
-                    .show(&mut right_ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        command_capture_waiting = state.command_capture_slot.is_some();
-                        if state.showing_results {
-                            let query = state.search_query.clone();
-                            if let Some(entry) = draw_preference_search_results(ui, &query) {
-                                select_preference_search_result(state, entry);
-                            }
-                        } else {
-                            draw_page(ui, state, enter_pressed);
+                    .max_height(main_height);
+                if let Some(scroll_y) = restore_scroll_y {
+                    scroll = scroll.vertical_scroll_offset(scroll_y);
+                }
+                let output = scroll.show(&mut right_ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    command_capture_waiting = state.command_capture_slot.is_some();
+                    if state.showing_results {
+                        let query = state.search_query.clone();
+                        if let Some(entry) = draw_preference_search_results(ui, &query) {
+                            select_preference_search_result(state, entry);
                         }
-                    });
+                    } else {
+                        draw_page(ui, state, enter_pressed);
+                    }
+                });
+                // ScrollArea clamps its output against the current content and viewport.
+                // Capture before any close path drops the draft; never associate a result
+                // list's offset with the page selected by a click inside that list.
+                if self.settings.preferences_restore_position
+                    && !rendered_results
+                    && rendered_page == state.selected
+                    && rendered_generation == state.right_panel_scroll_generation
+                {
+                    self.preferences_view_position.page = rendered_page;
+                    self.preferences_view_position.scroll_y = output.state.offset.y;
+                }
+                if self.settings.preferences_restore_position {
+                    let rendered_page = (!rendered_results
+                        && rendered_page == state.selected
+                        && rendered_generation == state.right_panel_scroll_generation)
+                        .then_some(rendered_page);
+                    self.preferences_view_position.in_page = Some(PreferencesInPageView::capture(
+                        state,
+                        self.preferences_view_position.in_page.as_ref(),
+                        rendered_page,
+                    ));
+                }
 
                 // 全体の高さを確保
                 ui.allocate_space(egui::vec2(available.x, main_height));
@@ -2587,6 +3264,7 @@ impl App {
                             && lut_ready
                             && clipboard_folder_ready
                             && organize_validation.is_ok()
+                            && !collection_reorder_open
                             && state.settings.details_name_colors.valid_standard_custom()
                             && name_colors::hex_input_ready(ctx),
                         egui::Button::new("  OK  "),
@@ -2639,391 +3317,16 @@ impl App {
         }
 
         let mut close_requested_this_frame = false;
+        let submit_diagnostics = self
+            .pref_state
+            .as_mut()
+            .is_some_and(|state| std::mem::take(&mut state.diag_export_submit));
+        if submit_diagnostics {
+            self.diagnostics_export.submit(ctx);
+        }
+
         if apply {
-            name_colors::clear_hex_editor(ctx);
-            if let Some(mut state) = self.pref_state.take() {
-                let old_dup = (
-                    self.settings.skip_zip_if_folder_exists,
-                    self.settings.skip_archive_if_zip_exists,
-                    self.settings.skip_epub_if_pdf_exists,
-                    self.settings.skip_image_if_video_exists,
-                    self.settings.skip_duplicate_images,
-                    self.settings.image_ext_priority.clone(),
-                    self.settings.video_thumb_use_sidecar_image,
-                    self.settings.archive_file_handling_resolved(),
-                    self.settings.epub_file_handling,
-                );
-                let old_grid_display_order = self.settings.grid_display_order.clone();
-                let old_rating_sort_unrated_position = self.settings.rating_sort_unrated_position;
-                let old_show_hidden_files = self.settings.show_hidden_files;
-                let old_exif = self.settings.exif_hidden_tags.clone();
-
-                let old_susie = (
-                    self.settings.susie_enabled,
-                    self.settings.susie_allow_parallel,
-                );
-
-                let old_pause_minimized = self.settings.pause_indexer_while_minimized;
-
-                // 動画ループモード変更を検出してフルスクリーン中の player に反映する
-                let old_loop_mode = self.settings.video_loop_mode;
-
-                // AI バックエンド設定変更を検出してホットリロードトリガに使う
-                let old_ai_backend = self.settings.ai_backend.clone();
-                let new_ai_backend = state.settings.ai_backend.clone();
-                let old_ai_feature_mode = self.settings.ai_feature_mode;
-                let old_reading_history_limit = self.settings.reading_history_limit;
-                let old_keymap_settings = self.settings.keymap.clone();
-                let old_fullscreen_side_panel_mode =
-                    self.settings.fullscreen_side_panel_mode.normalized();
-                let old_final_cover_spread_enabled = self.settings.final_cover_spread_enabled;
-                let old_singleton_spread_placement_enabled = (
-                    self.settings.singleton_spread_first_enabled,
-                    self.settings.singleton_spread_last_enabled,
-                );
-                let old_page_alone_enabled = (
-                    self.settings.page_after_cover_alone_enabled,
-                    self.settings.last_page_alone_enabled,
-                );
-                let old_ui_font = self.settings.ui_font.clone();
-                let old_creative_luts = self.settings.creative_luts.clone();
-                let mut creative_lut_transaction =
-                    std::mem::take(&mut state.creative_lut_transaction);
-
-                // AI 処理サイズ上限の変更検出 (final AI cache / failed / pending の
-                // 無効化トリガに使う)
-                let old_ai_size_limits = (
-                    self.settings.ai_upscale_limit(),
-                    self.settings.ai_denoise_limit(),
-                );
-                let old_retained_final_ai_cache_budget = (
-                    self.settings.retained_final_ai_cache_max_entries,
-                    self.settings.retained_final_ai_cache_max_mib,
-                );
-                let old_edit_preview_cache = (
-                    self.settings.edit_preview_cache_enabled,
-                    self.settings.edit_preview_cache_max_bytes,
-                );
-                let old_edit_restore_prompt_enabled = self.settings.edit_restore_prompt_enabled;
-                #[cfg(windows)]
-                let old_video_seek_strip_min_interval_secs =
-                    self.settings.video_seek_strip_min_interval_secs;
-                #[cfg(windows)]
-                let old_video_seek_strip_waveform_span_secs =
-                    self.settings.video_seek_strip_waveform_span_secs;
-
-                // VST3 enable 状態 + チェーン構成の変化を検出してホットリロード。
-                let old_vst3_enabled = self.settings.vst3_enabled;
-                let new_vst3_enabled = state.settings.vst3_enabled;
-                #[cfg(windows)]
-                let old_vst3_chain: Vec<String> = self
-                    .settings
-                    .vst3_plugins
-                    .iter()
-                    .map(|e| e.path.clone())
-                    .collect();
-                #[cfg(windows)]
-                let new_vst3_chain: Vec<String> = state
-                    .settings
-                    .vst3_plugins
-                    .iter()
-                    .map(|e| e.path.clone())
-                    .collect();
-                #[cfg(windows)]
-                let old_detached_open_images_in_window =
-                    self.settings.detached_viewer_open_images_in_window;
-                #[cfg(windows)]
-                let old_fullfeature_media_window = self.settings.fullfeature_media_window;
-                // VST3 ページで再スキャンした候補を App 側に反映
-                #[cfg(windows)]
-                let new_vst3_discovered = state.vst3_discovered.clone();
-
-                // ダイアログを開いた時点の `state.settings` は self.settings の snapshot。
-                // 開いている間に他ダイアログ (お気に入り編集 / タグ編集 / 補正プリセット /
-                // 開いたアプリ履歴等) や runtime (ツールバー選択 / ウィンドウ移動 / レーティング
-                // フィルタ) が変えたフィールドは state.settings 側に反映されないため、そのまま
-                // self.settings = state.settings を実行するとそれらの変更が消える。
-                // 対策: 環境設定が管理しないフィールドを self.settings の最新値で state に
-                // 移送してから全体差し替えする。新しく「環境設定 UI から触らない」フィールドを
-                // Settings に追加した場合はここにも追記が必要。
-                prepare_preferences_state_settings_for_commit(&mut state, &mut self.settings);
-                self.install_preferences_settings(state.settings);
-                if old_final_cover_spread_enabled != self.settings.final_cover_spread_enabled {
-                    #[cfg(windows)]
-                    self.invalidate_final_cover_spread_display_in_parked_contexts();
-                    if self.final_cover_spread_preference
-                        == crate::settings::FinalCoverSpreadPreference::FollowGlobal
-                    {
-                        self.invalidate_final_cover_spread_display(ctx);
-                    }
-                }
-                let first_endpoint_changed = old_singleton_spread_placement_enabled.0
-                    != self.settings.singleton_spread_first_enabled;
-                let last_endpoint_changed = old_singleton_spread_placement_enabled.1
-                    != self.settings.singleton_spread_last_enabled;
-                if first_endpoint_changed || last_endpoint_changed {
-                    #[cfg(windows)]
-                    self.invalidate_singleton_spread_placement_in_parked_contexts(
-                        first_endpoint_changed,
-                        last_endpoint_changed,
-                    );
-                    if first_endpoint_changed
-                        && self.singleton_spread_endpoint_preferences.first
-                            == crate::settings::SingletonSpreadPlacementPreference::FollowGlobal
-                        || last_endpoint_changed
-                            && self.singleton_spread_endpoint_preferences.last
-                                == crate::settings::SingletonSpreadPlacementPreference::FollowGlobal
-                    {
-                        self.invalidate_singleton_spread_placement_display(ctx);
-                    }
-                }
-                let after_cover_changed =
-                    old_page_alone_enabled.0 != self.settings.page_after_cover_alone_enabled;
-                let last_page_changed =
-                    old_page_alone_enabled.1 != self.settings.last_page_alone_enabled;
-                if after_cover_changed || last_page_changed {
-                    #[cfg(windows)]
-                    self.invalidate_page_alone_in_parked_contexts(
-                        after_cover_changed,
-                        last_page_changed,
-                    );
-                    if self.spread_mode.has_cover()
-                        && (after_cover_changed
-                            && self.page_alone_preferences.after_cover
-                                == crate::settings::PageAlonePreference::FollowGlobal
-                            || last_page_changed
-                                && self.page_alone_preferences.last
-                                    == crate::settings::PageAlonePreference::FollowGlobal)
-                    {
-                        self.invalidate_singleton_spread_placement_display(ctx);
-                    }
-                }
-                #[cfg(windows)]
-                if old_video_seek_strip_min_interval_secs.to_bits()
-                    != self.settings.video_seek_strip_min_interval_secs.to_bits()
-                {
-                    self.rebuild_video_seek_strip_adopted_list();
-                }
-                #[cfg(windows)]
-                if old_video_seek_strip_waveform_span_secs.to_bits()
-                    != self.settings.video_seek_strip_waveform_span_secs.to_bits()
-                {
-                    self.rebuild_video_seek_strip_waveform_span();
-                }
-                self.sync_content_identity_detection_setting(old_edit_restore_prompt_enabled);
-                if old_creative_luts != self.settings.creative_luts {
-                    if self
-                        .settings
-                        .video_adjustments
-                        .creative_lut
-                        .id
-                        .is_some_and(|id| {
-                            !self
-                                .settings
-                                .creative_luts
-                                .iter()
-                                .any(|entry| entry.id == id)
-                        })
-                    {
-                        self.settings.video_adjustments.creative_lut.id = None;
-                    }
-                    self.creative_lut_library
-                        .reload(&self.settings.creative_luts);
-                    self.clear_all_final_pipeline_caches();
-                    #[cfg(windows)]
-                    self.sync_native_video_grade();
-                }
-                if old_ui_font != self.settings.ui_font {
-                    #[cfg(windows)]
-                    {
-                        // detached viewer / native HUD はそれぞれ独立した egui Context を
-                        // 持つため、表示倍率変更と同じ正規 teardown 経路で閉じる。
-                        // 再度開いた時点で新しいフォント設定を使って生成される。
-                        let closed_detached = self
-                            .close_all_detached_viewers_for_mode_change(ctx)
-                            .unwrap_or(true);
-                        if !closed_detached && self.fullscreen_idx.is_some() {
-                            self.close_fullscreen();
-                        }
-                        self.request_main_font_update();
-                    }
-                    #[cfg(not(windows))]
-                    crate::ui_fonts::configure_fonts_with_settings(ctx, &self.settings.ui_font);
-                }
-                if old_fullscreen_side_panel_mode
-                    != self.settings.fullscreen_side_panel_mode.normalized()
-                {
-                    self.reset_fs_side_panel_runtime_for_mode_change();
-                }
-                if old_keymap_settings != self.settings.keymap {
-                    let keymap = crate::keymap::Keymap::from_settings(&self.settings.keymap);
-                    for warning in keymap.warnings() {
-                        crate::logger::log(format!("[keymap] {warning}"));
-                    }
-                    keymap.install_global_native_video_shortcuts();
-                    self.keymap = keymap;
-                }
-                #[cfg(windows)]
-                if (old_detached_open_images_in_window
-                    != self.settings.detached_viewer_open_images_in_window
-                    || old_fullfeature_media_window != self.settings.fullfeature_media_window)
-                    && self
-                        .close_all_detached_viewers_for_mode_change(ctx)
-                        .unwrap_or(true)
-                {
-                    self.show_feedback_toast(
-                        "別ウィンドウの表示モードを変更したため、開いていた別ウィンドウを閉じました"
-                            .to_string(),
-                    );
-                }
-                // (フォルダ履歴 / A・B 記憶のクリアは v2.0.0 でフォルダバーの右クリック
-                //  メニューへ移動。環境設定 OK 経路でのクリア要求は廃止。)
-                if old_reading_history_limit != self.settings.reading_history_limit {
-                    if let Some(writer) = &self.reading_history_writer {
-                        writer.prune(self.settings.reading_history_limit);
-                    } else if let Some(db) = self.reading_history_db.as_ref() {
-                        if let Err(e) = db.prune(self.settings.reading_history_limit) {
-                            crate::logger::log(format!("reading-history prune failed: {e}"));
-                        }
-                    }
-                    if self.items_are_reading_history_view {
-                        self.enter_reading_history();
-                    }
-                }
-                if !self.settings.save_checked() {
-                    self.show_feedback_toast("設定を保存できませんでした。再起動すると今回の変更が残らない可能性があります。".to_owned());
-                }
-                creative_lut_transaction.commit();
-                #[cfg(windows)]
-                self.sync_all_native_chrome_policy();
-
-                if let Some(service) = &self.edit_preview_cache {
-                    if !self.settings.edit_preview_cache_enabled {
-                        if old_edit_preview_cache.0 {
-                            service.clear();
-                        }
-                    } else if old_edit_preview_cache
-                        != (
-                            self.settings.edit_preview_cache_enabled,
-                            self.settings.edit_preview_cache_max_bytes,
-                        )
-                    {
-                        service.prune(self.settings.edit_preview_cache_max_bytes.max(1_000_000));
-                    }
-                }
-
-                // 動画ループモードが変わったらフルスクリーン中の player に反映する
-                #[cfg(windows)]
-                if old_loop_mode != self.settings.video_loop_mode {
-                    if let Some(idx) = self.fullscreen_idx {
-                        self.apply_loop_mode_to_player(idx);
-                    }
-                }
-                #[cfg(not(windows))]
-                let _ = old_loop_mode;
-
-                // 「常駐中はインデックス更新を一時停止する」が変わったらトレイの checkmark も
-                // 同期する (お気に入り編集ダイアログと同じチェックボックス項目への二重経路)。
-                if old_pause_minimized != self.settings.pause_indexer_while_minimized {
-                    self.sync_tray_pause_check();
-                }
-
-                // AI バックエンド変更のホットリロード処理 (Phase 3)
-                if old_ai_backend != new_ai_backend {
-                    self.apply_ai_backend_change(new_ai_backend.as_deref());
-                }
-                if old_ai_feature_mode != self.settings.ai_feature_mode {
-                    self.apply_ai_feature_mode_change();
-                }
-                let new_ai_size_limits = (
-                    self.settings.ai_upscale_limit(),
-                    self.settings.ai_denoise_limit(),
-                );
-                if old_ai_size_limits != new_ai_size_limits {
-                    self.apply_ai_size_limit_change();
-                }
-                let new_retained_final_ai_cache_budget = (
-                    self.settings.retained_final_ai_cache_max_entries,
-                    self.settings.retained_final_ai_cache_max_mib,
-                );
-                if old_retained_final_ai_cache_budget != new_retained_final_ai_cache_budget {
-                    self.prune_retained_final_ai_cache_to_settings();
-                }
-
-                // 同名ファイル設定が変更された場合はフォルダを再読み込み
-                // (Phase 5.3: video_thumb_use_sidecar_image も含む — 切り替え時に
-                // video_thumb_overrides を作り直すため)
-                let new_dup = (
-                    self.settings.skip_zip_if_folder_exists,
-                    self.settings.skip_archive_if_zip_exists,
-                    self.settings.skip_epub_if_pdf_exists,
-                    self.settings.skip_image_if_video_exists,
-                    self.settings.skip_duplicate_images,
-                    self.settings.image_ext_priority.clone(),
-                    self.settings.video_thumb_use_sidecar_image,
-                    self.settings.archive_file_handling_resolved(),
-                    self.settings.epub_file_handling,
-                );
-                let duplicate_settings_changed = old_dup != new_dup;
-                let file_visibility_changed =
-                    old_show_hidden_files != self.settings.show_hidden_files;
-                let grid_display_order_changed =
-                    old_grid_display_order != self.settings.grid_display_order;
-                let rating_sort_position_changed = old_rating_sort_unrated_position
-                    != self.settings.rating_sort_unrated_position
-                    && self.settings.sort_order.is_rating();
-                if duplicate_settings_changed || file_visibility_changed {
-                    self.reload_current_folder_preserving_override();
-                } else if grid_display_order_changed || rating_sort_position_changed {
-                    self.apply_sort_change_reload();
-                }
-                if old_exif != self.settings.exif_hidden_tags {
-                    self.exif_cache.clear();
-                }
-
-                // VST3 enable 状態 / チェーン構成の変化反映
-                #[cfg(windows)]
-                {
-                    self.vst3_discovered = new_vst3_discovered;
-                    let chain_changed = old_vst3_chain != new_vst3_chain;
-                    if old_vst3_enabled != new_vst3_enabled {
-                        if new_vst3_enabled {
-                            self.kick_off_vst3_chain_rebuild();
-                        } else {
-                            // VST3 OFF へのトグル: bridge teardown 前に内部状態と
-                            // ウィンドウ位置を保存 (= 次回 ON 時の復元用)。
-                            // T22: UI スレッドなので 2 秒に制限
-                            let states = self.snapshot_vst3_states_into_settings(
-                                std::time::Duration::from_secs(2),
-                            );
-                            let positions = self.snapshot_vst3_window_positions_into_settings();
-                            if states > 0 || positions > 0 {
-                                self.settings.save();
-                            }
-                            self.dsp_bridge.disable();
-                        }
-                    } else if chain_changed && new_vst3_enabled {
-                        self.kick_off_vst3_chain_rebuild();
-                    }
-                }
-                #[cfg(not(windows))]
-                let _ = (old_vst3_enabled, new_vst3_enabled);
-
-                let new_susie = (
-                    self.settings.susie_enabled,
-                    self.settings.susie_allow_parallel,
-                );
-                if old_susie != new_susie {
-                    crate::susie_loader::reload(
-                        self.settings.susie_enabled,
-                        self.settings.susie_allow_parallel,
-                    );
-                    // 対応拡張子が変わる可能性があるので現在のフォルダを再読み込み
-                    self.reload_current_folder_preserving_override();
-                }
-            }
-            self.show_preferences = false;
-            self.show_preferences_discard_confirm = false;
+            self.apply_preferences_dialog(ctx);
         } else if cancel || !open {
             name_colors::clear_hex_editor(ctx);
             close_requested_this_frame = true;
@@ -3767,6 +4070,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
         PreferencesPage::Folder => page_folder(ui, state),
         PreferencesPage::Book => page_book(ui, state),
         PreferencesPage::DuplicateFiles => page_duplicate_files(ui, state),
+        PreferencesPage::FileTypeVisibility => page_file_type_visibility(ui, state),
         PreferencesPage::ExifDisplay => page_exif_display(ui, state, enter_pressed),
         PreferencesPage::SpreadMode => page_spread_mode(ui, state),
         PreferencesPage::PlaybackResume => page_playback_resume(ui, state),
@@ -3800,22 +4104,158 @@ pub(crate) fn draw_raw_settings_snapshot_fixture(ui: &mut egui::Ui) {
     draw_page(ui, &mut state, false);
 }
 
+pub fn draw_file_type_visibility_snapshot_fixture(ui: &mut egui::Ui) {
+    let mut state = PreferencesState::from_settings(
+        &Settings::default(),
+        crate::external_tool::LaunchTarget::None,
+        None,
+        crate::ai::trt_worker_lifecycle::TrtWorkerLifecycleOwner::new().snapshot(),
+        false,
+        0,
+        0,
+        0,
+    );
+    state.selected = PreferencesPage::FileTypeVisibility;
+    state
+        .settings
+        .file_type_visibility
+        .excluded_categories
+        .insert(crate::file_type_visibility::FileTypeCategory::Raw);
+    state
+        .settings
+        .file_type_visibility
+        .excluded_extensions
+        .insert("png".into());
+    draw_page(ui, &mut state, false);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn file_type_visibility_page_edits_draft_and_all_show_reset() {
+        use egui_kittest::kittest::Queryable;
+        let live = Settings::default();
+        let mut state = preferences_state_for_test(&live);
+        state.selected = PreferencesPage::FileTypeVisibility;
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(700.0, 650.0))
+            .build_state(
+                |ctx, state| {
+                    egui::CentralPanel::default().show(ctx, |ui| draw_page(ui, state, false));
+                },
+                state,
+            );
+        harness.run();
+        harness.get_by_label("RAW").click();
+        harness.run();
+        assert!(
+            harness
+                .state()
+                .settings
+                .file_type_visibility
+                .excluded_categories
+                .contains(&crate::file_type_visibility::FileTypeCategory::Raw)
+        );
+        assert!(live.file_type_visibility.is_all_visible());
+        harness.state_mut().file_type_extension_input = "../png".into();
+        harness.get_by_label("非表示に追加").click();
+        harness.run();
+        assert!(harness.state().file_type_extension_error.is_some());
+        assert!(
+            harness
+                .state()
+                .settings
+                .file_type_visibility
+                .excluded_extensions
+                .is_empty()
+        );
+        harness.state_mut().file_type_extension_input = ".PNG".into();
+        harness.get_by_label("非表示に追加").click();
+        harness.run();
+        assert!(
+            harness
+                .state()
+                .settings
+                .file_type_visibility
+                .excluded_extensions
+                .contains("png")
+        );
+        assert!(harness.state().file_type_extension_error.is_none());
+        harness.get_by_label("すべて表示に戻す").click();
+        harness.run();
+        assert!(
+            harness
+                .state()
+                .settings
+                .file_type_visibility
+                .is_all_visible()
+        );
+    }
+
+    #[test]
+    fn file_type_visibility_preferences_cancel_ok_save_and_reopen() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = crate::app::setup_app_for_test();
+        app.open_preferences_request(PreferencesOpenRequest::FILE_TYPE_VISIBILITY);
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(1100.0, 850.0))
+            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+        harness.run();
+        harness.get_by_label("RAW").click();
+        harness.run();
+        harness.get_by_label("キャンセル").click();
+        harness.run();
+        harness.get_by_label("破棄して閉じる").click();
+        harness.run();
+        assert!(
+            harness
+                .state()
+                .settings
+                .file_type_visibility
+                .is_all_visible()
+        );
+        harness
+            .state_mut()
+            .open_preferences_request(PreferencesOpenRequest::FILE_TYPE_VISIBILITY);
+        harness.run();
+        harness.get_by_label("RAW").click();
+        harness.run();
+        harness.get_by_label("  OK  ").click();
+        harness.run();
+        let expected = harness.state().settings.file_type_visibility.clone();
+        assert!(
+            expected
+                .excluded_categories
+                .contains(&crate::file_type_visibility::FileTypeCategory::Raw)
+        );
+        assert_eq!(Settings::load().file_type_visibility, expected);
+        harness
+            .state_mut()
+            .open_preferences_request(PreferencesOpenRequest::FILE_TYPE_VISIBILITY);
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .file_type_visibility,
+            expected
+        );
+    }
+
+    #[test]
     fn details_name_colors_preferences_ok_validation_save_and_cancel() {
         use crate::details_name_colors::DetailsNameColor;
-        use egui_kittest::{
-            Harness,
-            kittest::{NodeT, Queryable},
-        };
+        use egui_kittest::kittest::{NodeT, Queryable};
 
         let mut app = crate::app::setup_app_for_test();
         let old = app.settings.details_name_colors.clone();
         app.open_preferences_page(PreferencesPage::General);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
             .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
         harness.run();
@@ -3915,7 +4355,7 @@ mod tests {
     fn raw_review_preferences_ok_saves_reloads_and_applies_executor_and_source_change() {
         use crate::app::raw_page_store::{RawDevelopPhase, RawInstalledStage, RawPageLoadState};
         use crate::raw::RawBrightness;
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
         for executor_closed in [false, true] {
             let mut app = crate::app::raw_page_store::tests::app_with_raw_and_jpeg();
             let ctx = egui::Context::default();
@@ -3951,7 +4391,7 @@ mod tests {
                 app.raw_develop_executor.shutdown();
             }
             app.open_preferences_page(PreferencesPage::RawDevelop);
-            let mut harness = Harness::builder()
+            let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1100.0, 850.0))
                 .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
             harness.run();
@@ -4101,7 +4541,7 @@ mod tests {
 
     #[test]
     fn section292_sort_placements_survive_toolbar_ui_preferences_ok_save_and_reopen() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
         use std::{
             cell::{Cell, RefCell},
             rc::Rc,
@@ -4121,7 +4561,7 @@ mod tests {
             app.borrow_mut().settings.show_facet_sort = !facet;
             let render = Rc::clone(&app);
             let fonts = Cell::new(false);
-            let mut harness = Harness::builder()
+            let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(500.0, 650.0))
                 .build(move |ctx| {
                     if !fonts.replace(true) {
@@ -4175,7 +4615,7 @@ mod tests {
     #[test]
     fn section207_folder_layout_survives_toolbar_ui_preferences_ok_db_and_reopen() {
         use crate::settings::ToolbarSectionId as TS;
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
         use std::{
             cell::{Cell, RefCell},
             rc::Rc,
@@ -4188,7 +4628,7 @@ mod tests {
             let mut state = preferences_state_for_test(&app.borrow().settings);
             let render = Rc::clone(&app);
             let fonts = Cell::new(false);
-            let mut harness = Harness::builder()
+            let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(600.0, 1050.0))
                 .build(move |ctx| {
                     if !fonts.replace(true) {
@@ -4370,7 +4810,7 @@ mod tests {
     #[test]
     fn file_organize_destinations_preferences_ok_save_failure_keeps_memory_db_and_notifies() {
         use crate::settings::FileOrganizeDestination;
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
         let mut app = crate::app::setup_app_for_test();
         app.settings.file_organize_destinations = vec![FileOrganizeDestination::from_path(
@@ -4386,7 +4826,7 @@ mod tests {
         }];
 
         app.open_preferences_page(PreferencesPage::Folder);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
             .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
         harness.run();
@@ -5320,10 +5760,8 @@ mod tests {
 
     #[test]
     fn preferences_search_results_snapshot() {
-        use egui_kittest::Harness;
-
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(560.0, 320.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -5344,7 +5782,7 @@ mod tests {
 
     #[test]
     fn preferences_context_menu_layout_snapshot() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
         let mut layout = crate::context_menu_model::ContextMenuLayoutSettings::default();
         layout.set_separator_before(
@@ -5354,7 +5792,8 @@ mod tests {
         let mut scenario =
             crate::context_menu_model::ContextMenuPreviewScenario::GridImageWithDynamicApps;
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut expanded = HashMap::new();
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(620.0, 700.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -5367,7 +5806,13 @@ mod tests {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        draw_context_menu_layout_settings(ui, &mut layout, &mut scenario);
+                        draw_context_menu_layout_settings(
+                            ui,
+                            &mut layout,
+                            &mut scenario,
+                            &mut expanded,
+                            0,
+                        );
                     });
                 });
             });
@@ -5388,12 +5833,12 @@ mod tests {
 
     #[test]
     fn opening_context_menu_page_and_switching_preview_scene_do_not_edit_settings() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
         let mut state = preferences_state_for_test(&crate::settings::Settings::default());
         state.selected = PreferencesPage::ContextMenuLayout;
         let expected = serde_json::to_value(&state.settings).unwrap();
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(700.0, 520.0))
             .build_state(
                 |ctx, state| {
@@ -5445,8 +5890,6 @@ mod tests {
 
     #[test]
     fn preferences_parallelism_pdf_count_snapshot() {
-        use egui_kittest::Harness;
-
         let mut state = PreferencesState::from_settings(
             &crate::settings::Settings::default(),
             crate::external_tool::LaunchTarget::None,
@@ -5458,7 +5901,7 @@ mod tests {
             0,
         );
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(560.0, 340.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -5499,8 +5942,6 @@ mod tests {
 
     #[test]
     fn preferences_duplicate_files_epub_option_snapshot() {
-        use egui_kittest::Harness;
-
         let mut state = PreferencesState::from_settings(
             &crate::settings::Settings::default(),
             crate::external_tool::LaunchTarget::None,
@@ -5512,7 +5953,7 @@ mod tests {
             0,
         );
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(780.0, 300.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -5533,11 +5974,9 @@ mod tests {
 
     #[test]
     fn preferences_recycle_bin_delete_confirmation_snapshot() {
-        use egui_kittest::Harness;
-
         let mut settings = crate::settings::Settings::default();
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(560.0, 230.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -5558,8 +5997,6 @@ mod tests {
 
     #[test]
     fn preferences_folder_edit_restore_snapshot() {
-        use egui_kittest::Harness;
-
         let mut state = PreferencesState::from_settings(
             &crate::settings::Settings::default(),
             crate::external_tool::LaunchTarget::None,
@@ -5571,7 +6008,7 @@ mod tests {
             0,
         );
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(620.0, 680.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -5594,8 +6031,6 @@ mod tests {
 
     #[test]
     fn preferences_viewer_notice_visibility_snapshot() {
-        use egui_kittest::Harness;
-
         let mut state = PreferencesState::from_settings(
             &crate::settings::Settings::default(),
             crate::external_tool::LaunchTarget::None,
@@ -5607,7 +6042,7 @@ mod tests {
             0,
         );
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(560.0, 360.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -5630,11 +6065,9 @@ mod tests {
 
     #[test]
     fn spread_page_supplement_setting_snapshot() {
-        use egui_kittest::Harness;
-
         let mut enabled = true;
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(540.0, 100.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -5655,12 +6088,10 @@ mod tests {
 
     #[test]
     fn singleton_spread_placement_setting_snapshot() {
-        use egui_kittest::Harness;
-
         let mut first_enabled = true;
         let mut last_enabled = false;
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(540.0, 100.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -5684,14 +6115,12 @@ mod tests {
     }
 
     fn still_seek_strip_height_settings_snapshot(size: egui::Vec2, name: &str) {
-        use egui_kittest::Harness;
-
         let mut settings = crate::settings::Settings {
             still_seek_strip_visible: true,
             ..crate::settings::Settings::default()
         };
         let mut fonts_ready = false;
-        let mut harness = Harness::builder().with_size(size).build(move |ctx| {
+        let mut harness = crate::test_ui::builder().with_size(size).build(move |ctx| {
             crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
             if !fonts_ready {
                 crate::ui_fonts::configure_fonts(ctx);
@@ -5730,11 +6159,9 @@ mod tests {
     }
 
     fn video_seek_strip_height_settings_snapshot(size: egui::Vec2, name: &str) {
-        use egui_kittest::Harness;
-
         let mut settings = crate::settings::Settings::default();
         let mut fonts_ready = false;
-        let mut harness = Harness::builder().with_size(size).build_ui(|ui| {
+        let mut harness = crate::test_ui::builder().with_size(size).build_ui(|ui| {
             if !fonts_ready {
                 crate::ui_fonts::configure_fonts(ui.ctx());
                 fonts_ready = true;
@@ -5814,51 +6241,1253 @@ mod tests {
         assert_eq!(generation, 8);
     }
 
-    #[test]
-    fn preferences_scroll_generation_advances_once_per_open_edge() {
-        let mut open_last_frame = false;
-        let mut sequence = 11;
+    fn preferences_position_harness()
+    -> egui_kittest::Harness<'static, crate::app::AppTestEnvForTest> {
+        use egui_kittest::kittest::Queryable;
+        let mut app = crate::app::setup_app_for_test();
+        app.open_preferences_page(PreferencesPage::Cache);
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(1093.0, 614.0))
+            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+        harness.run();
+        harness.get_by_label("確認せず変換する").scroll_to_me();
+        harness.run();
+        assert!(harness.state().preferences_view_position.scroll_y > 100.0);
+        harness
+    }
 
+    fn preferences_view_harness(
+        page: PreferencesPage,
+    ) -> egui_kittest::Harness<'static, crate::app::AppTestEnvForTest> {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.external_tools = (1..=2)
+            .map(|id| crate::external_tool::ExternalTool {
+                id: crate::external_tool::ExternalToolId(id),
+                name: format!("Tool {id}"),
+                ..crate::external_tool::ExternalTool::defaults_for_viewing()
+            })
+            .collect();
+        app.open_preferences_page(page);
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(1093.0, 614.0))
+            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+        // External-tool path checks repaint while their worker is pending.
+        // These navigation tests need rendered transitions, not worker quiescence.
+        harness.run_steps(3);
+        harness
+    }
+
+    #[test]
+    fn preferences_view_external_tool_selection_remembers_all_close_paths_and_falls_back() {
+        use crate::external_tool::ExternalToolId;
+        use egui_kittest::kittest::Queryable;
+        let mut harness = preferences_view_harness(PreferencesPage::ExternalTools);
         assert_eq!(
-            advance_preferences_scroll_generation_on_open(
-                false,
-                &mut open_last_frame,
-                &mut sequence
-            ),
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .external_tool_selected,
+            Some(ExternalToolId(1))
+        );
+        for close in ["ok", "cancel", "window", "escape"] {
+            harness.get_by_label("Tool 2").click();
+            harness.run_steps(3);
+            assert_eq!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .external_tool_selected,
+                Some(ExternalToolId(2))
+            );
+            match close {
+                "ok" => harness.get_by_label("  OK  ").click(),
+                "cancel" => harness.get_by_label("キャンセル").click(),
+                "window" => harness.get_by_label("Close window").click(),
+                "escape" => harness.event(egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }),
+                _ => unreachable!(),
+            }
+            harness.run_steps(3);
+            assert!(harness.state().pref_state.is_none());
+            harness.state_mut().show_preferences = true;
+            harness.run_steps(3);
+            let state = harness.state().pref_state.as_ref().unwrap();
+            assert_eq!(
+                state.external_tool_selected,
+                Some(ExternalToolId(2)),
+                "{close}"
+            );
+            assert_eq!(
+                state.external_tool_editor_loaded_for,
+                Some(ExternalToolId(2))
+            );
+        }
+        // Selection survives discarded edits; editor values are loaded from live settings.
+        harness
+            .state_mut()
+            .pref_state
+            .as_mut()
+            .unwrap()
+            .settings
+            .external_tools[1]
+            .name = "Unsaved tool".into();
+        harness.run_steps(3);
+        harness.get_by_label("キャンセル").click();
+        harness.run_steps(3);
+        harness.get_by_label("破棄して閉じる").click();
+        harness.run_steps(3);
+        harness.state_mut().show_preferences = true;
+        harness.run_steps(3);
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .external_tools[1]
+                .name,
+            "Tool 2"
+        );
+        harness.get_by_label("キャンセル").click();
+        harness.run_steps(3);
+        harness.state_mut().settings.external_tools.pop();
+        harness.state_mut().show_preferences = true;
+        harness.run_steps(3);
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .external_tool_selected,
+            Some(ExternalToolId(1))
+        );
+        harness.get_by_label("キャンセル").click();
+        harness.run_steps(3);
+        harness.state_mut().settings.external_tools.clear();
+        harness.state_mut().show_preferences = true;
+        harness.run_steps(3);
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .external_tool_selected,
             None
         );
+    }
+
+    #[test]
+    fn preferences_view_choices_survive_close_and_page_changes_without_preserving_drafts() {
+        use crate::{
+            context_menu_model::{ContextMenuParentId, ContextMenuPreviewScenario},
+            exif_reader::TagGroup,
+            keymap::TopMenuId,
+        };
+        use egui_kittest::kittest::Queryable;
+        let mut harness = preferences_view_harness(PreferencesPage::ExternalTools);
+        {
+            let state = harness.state_mut().pref_state.as_mut().unwrap();
+            state.expanded.insert("表示");
+            state.external_tool_association_ext = "png".into();
+            state.ui_font_filter = "Meiryo".into();
+            state.context_menu_preview_scenario = ContextMenuPreviewScenario::FullscreenVideo;
+            state.menu_expanded.insert(TopMenuId::File, false);
+            state
+                .context_menu_expanded
+                .insert(ContextMenuParentId::OpenWith, true);
+            state.exif_collapsed_groups.insert(TagGroup::Camera);
+            state.vst3_filter = "EQ".into();
+            #[cfg(windows)]
+            {
+                state.vst3_show_unusable = true;
+            }
+            state.file_type_extension_input = "unfinished".into();
+            state.exif_add_tag_input = "unfinished".into();
+            state.external_tool_message = Some("old result".into());
+        }
+        harness.run_steps(3);
+        // Viewing another page starts at its top, but keeps other page choices.
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::Startup);
+        harness.run_steps(3);
+        harness.get_by_label("キャンセル").click();
+        harness.run_steps(3);
+        harness.state_mut().show_preferences = true;
+        harness.run_steps(3);
+        let state = harness.state().pref_state.as_ref().unwrap();
+        assert_eq!(state.selected, PreferencesPage::Startup);
+        assert!(state.expanded.contains("表示"));
+        assert_eq!(state.external_tool_association_ext, "png");
+        assert_eq!(state.ui_font_filter, "Meiryo");
         assert_eq!(
-            advance_preferences_scroll_generation_on_open(
-                true,
-                &mut open_last_frame,
-                &mut sequence
+            state.context_menu_preview_scenario,
+            ContextMenuPreviewScenario::FullscreenVideo
+        );
+        assert_eq!(state.menu_expanded.get(&TopMenuId::File), Some(&false));
+        assert_eq!(
+            state
+                .context_menu_expanded
+                .get(&ContextMenuParentId::OpenWith),
+            Some(&true)
+        );
+        assert!(state.exif_collapsed_groups.contains(&TagGroup::Camera));
+        assert_eq!(state.vst3_filter, "EQ");
+        #[cfg(windows)]
+        assert!(state.vst3_show_unusable);
+        assert!(state.file_type_extension_input.is_empty());
+        assert!(state.exif_add_tag_input.is_empty());
+        assert!(state.external_tool_message.is_none());
+    }
+
+    #[test]
+    fn preferences_view_unvisited_external_page_uses_current_context_defaults() {
+        use egui_kittest::kittest::Queryable;
+        let mut harness = preferences_view_harness(PreferencesPage::General);
+        assert!(
+            harness
+                .state()
+                .preferences_view_position
+                .in_page
+                .as_ref()
+                .unwrap()
+                .external_tools
+                .is_none()
+        );
+        harness.get_by_label("キャンセル").click();
+        harness.run_steps(3);
+        {
+            let app = harness.state_mut();
+            app.settings.external_tools.swap(0, 1);
+            app.items = vec![crate::grid_item::GridItem::Image(PathBuf::from(
+                r"C:\fake\image.png",
+            ))];
+            app.selected = Some(0);
+            app.open_preferences_page(PreferencesPage::ExternalTools);
+        }
+        harness.run_steps(3);
+        let state = harness.state().pref_state.as_ref().unwrap();
+        assert_eq!(
+            state.external_tool_selected,
+            Some(crate::external_tool::ExternalToolId(2))
+        );
+        assert_eq!(state.external_tool_association_ext, "png");
+        assert!(
+            harness
+                .state()
+                .preferences_view_position
+                .in_page
+                .as_ref()
+                .unwrap()
+                .external_tools
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn preferences_view_off_and_reenabled_on_clear_all_choices() {
+        use crate::{
+            context_menu_model::{ContextMenuParentId, ContextMenuPreviewScenario},
+            exif_reader::TagGroup,
+            keymap::TopMenuId,
+        };
+        use egui_kittest::kittest::Queryable;
+        let mut harness = preferences_view_harness(PreferencesPage::ExternalTools);
+        harness.get_by_label("Tool 2").click();
+        harness.run_steps(3);
+        {
+            let state = harness.state_mut().pref_state.as_mut().unwrap();
+            state.ui_font_filter = "Meiryo".into();
+            state.vst3_filter = "EQ".into();
+            state.duplicate_priority_scroll_y = 123.0;
+            state.vst3_picker_scroll_y = 456.0;
+            state.external_tool_association_ext = "png".into();
+            state.context_menu_preview_scenario = ContextMenuPreviewScenario::FullscreenVideo;
+            state.menu_expanded.insert(TopMenuId::File, false);
+            state
+                .context_menu_expanded
+                .insert(ContextMenuParentId::OpenWith, true);
+            state.exif_collapsed_groups.insert(TagGroup::Camera);
+            state.expanded.insert("表示");
+            #[cfg(windows)]
+            {
+                state.vst3_show_unusable = true;
+            }
+            state.settings.preferences_restore_position = false;
+        }
+        harness.get_by_label("  OK  ").click();
+        harness.run_steps(3);
+        assert!(harness.state().preferences_view_position.in_page.is_none());
+        for enable in [false, true] {
+            harness
+                .state_mut()
+                .open_preferences_page(PreferencesPage::ExternalTools);
+            harness.run_steps(3);
+            let state = harness.state().pref_state.as_ref().unwrap();
+            assert_eq!(
+                state.external_tool_selected,
+                Some(crate::external_tool::ExternalToolId(1))
+            );
+            assert!(state.ui_font_filter.is_empty());
+            assert!(state.vst3_filter.is_empty());
+            assert_eq!(state.duplicate_priority_scroll_y, 0.0);
+            assert_eq!(state.vst3_picker_scroll_y, 0.0);
+            assert_eq!(state.external_tool_association_ext, "jpg");
+            assert_eq!(
+                state.context_menu_preview_scenario,
+                ContextMenuPreviewScenario::default()
+            );
+            assert!(!state.expanded.contains("表示"));
+            assert!(state.menu_expanded.is_empty());
+            assert!(state.context_menu_expanded.is_empty());
+            assert!(state.exif_collapsed_groups.is_empty());
+            #[cfg(windows)]
+            assert!(!state.vst3_show_unusable);
+            harness.get_by_label("Tool 2").click();
+            harness.run_steps(3);
+            harness
+                .state_mut()
+                .pref_state
+                .as_mut()
+                .unwrap()
+                .settings
+                .preferences_restore_position = enable;
+            harness.get_by_label("  OK  ").click();
+            harness.run_steps(3);
+        }
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::ExternalTools);
+        harness.run_steps(3);
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .external_tool_selected,
+            Some(crate::external_tool::ExternalToolId(1))
+        );
+        harness.get_by_label("Tool 2").click();
+        harness.run_steps(3);
+        harness.get_by_label("キャンセル").click();
+        harness.run_steps(3);
+        harness.state_mut().show_preferences = true;
+        harness.run_steps(3);
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .external_tool_selected,
+            Some(crate::external_tool::ExternalToolId(2))
+        );
+    }
+
+    #[test]
+    fn preferences_view_real_headers_off_then_on_does_not_revive_egui_state() {
+        use crate::{context_menu_model::ContextMenuParentId, keymap::TopMenuId};
+        use egui_kittest::kittest::Queryable;
+
+        for (page, header, body) in [
+            (
+                PreferencesPage::MenuLayout,
+                format!("{} の項目", TopMenuId::File.label()),
+                crate::keymap::menu_command_spec(crate::keymap::MenuCommandId::FileOpenFolder)
+                    .unwrap()
+                    .label,
             ),
-            Some(12)
+            (
+                PreferencesPage::ContextMenuLayout,
+                ContextMenuParentId::Root.label().to_owned(),
+                crate::context_menu_model::ContextMenuItemId::CutFiles.label(),
+            ),
+        ] {
+            let mut harness = preferences_view_harness(page);
+            assert!(
+                harness.query_by_label(body).is_some(),
+                "{page:?}: default open"
+            );
+            harness.get_by_label(&header).click();
+            harness.run();
+            assert!(
+                harness.query_by_label(body).is_none(),
+                "{page:?}: ON collapse"
+            );
+            harness.get_by_label("キャンセル").click();
+            harness.run();
+
+            harness
+                .state_mut()
+                .open_preferences_page(PreferencesPage::General);
+            harness.run();
+            harness
+                .get_by_label("環境設定を開き直したときに前回の位置を復元する")
+                .click();
+            harness.run();
+            harness.get_by_label("  OK  ").click();
+            harness.run();
+            assert!(!harness.state().settings.preferences_restore_position);
+            assert!(harness.state().preferences_view_position.in_page.is_none());
+
+            // Re-render the real header in the same egui Context, not just its map.
+            harness.state_mut().open_preferences_page(page);
+            harness.run();
+            assert!(
+                harness.query_by_label(body).is_some(),
+                "{page:?}: OFF default"
+            );
+            // OFF remains interactive, but this new collapse must also be discarded.
+            harness.get_by_label(&header).click();
+            harness.run();
+            assert!(
+                harness.query_by_label(body).is_none(),
+                "{page:?}: OFF collapse"
+            );
+            harness.get_by_label("キャンセル").click();
+            harness.run();
+            harness.state_mut().open_preferences_page(page);
+            harness.run();
+            assert!(
+                harness.query_by_label(body).is_some(),
+                "{page:?}: OFF reopen"
+            );
+
+            harness
+                .state_mut()
+                .open_preferences_page(PreferencesPage::General);
+            harness.run();
+            harness
+                .get_by_label("環境設定を開き直したときに前回の位置を復元する")
+                .click();
+            harness.run();
+            harness.get_by_label("  OK  ").click();
+            harness.run();
+            assert!(harness.state().settings.preferences_restore_position);
+            harness.state_mut().open_preferences_page(page);
+            harness.run();
+            assert!(
+                harness.query_by_label(body).is_some(),
+                "{page:?}: ON no revival"
+            );
+            harness.get_by_label("キャンセル").click();
+            harness.run();
+            harness.state_mut().show_preferences = true;
+            harness.run();
+            assert!(
+                harness.query_by_label(body).is_some(),
+                "{page:?}: fresh ON snapshot"
+            );
+        }
+    }
+
+    #[test]
+    fn preferences_view_menu_and_exif_header_clicks_are_restored() {
+        use crate::{
+            context_menu_model::ContextMenuParentId, exif_reader::TagGroup, keymap::TopMenuId,
+        };
+        use egui_kittest::kittest::Queryable;
+        let mut harness = preferences_view_harness(PreferencesPage::MenuLayout);
+        let label = format!("{} の項目", TopMenuId::File.label());
+        harness.get_by_label(&label).click();
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .menu_expanded
+                .get(&TopMenuId::File),
+            Some(&false)
+        );
+        harness.get_by_label("キャンセル").click();
+        harness.run();
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .menu_expanded
+                .get(&TopMenuId::File),
+            Some(&false)
+        );
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::ContextMenuLayout);
+        harness.run();
+        harness
+            .get_by_label(ContextMenuParentId::OpenWith.label())
+            .scroll_to_me();
+        harness.run();
+        harness
+            .get_by_label(ContextMenuParentId::OpenWith.label())
+            .click();
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .context_menu_expanded
+                .get(&ContextMenuParentId::OpenWith),
+            Some(&true)
+        );
+        harness.get_by_label("キャンセル").click();
+        harness.run();
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .context_menu_expanded
+                .get(&ContextMenuParentId::OpenWith),
+            Some(&true)
+        );
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::ExifDisplay);
+        harness.run();
+        let header = harness.get_by_label_contains("▼ カメラ");
+        header.click();
+        harness.run();
+        assert!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .exif_collapsed_groups
+                .contains(&TagGroup::Camera)
+        );
+        harness.get_by_label("キャンセル").click();
+        harness.run();
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        harness.get_by_label_contains("▶ カメラ");
+        assert!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .exif_collapsed_groups
+                .contains(&TagGroup::Camera)
+        );
+    }
+
+    #[test]
+    fn preferences_view_tree_expansion_restores_and_explicit_and_search_navigation_win() {
+        use egui_kittest::kittest::Queryable;
+        let mut harness = preferences_view_harness(PreferencesPage::ExternalTools);
+        harness.get_by_label("Tool 2").click();
+        harness.run_steps(3);
+        let category = preference_category(PreferencesPage::ExternalTools).0;
+        harness
+            .state_mut()
+            .pref_state
+            .as_mut()
+            .unwrap()
+            .expanded
+            .remove(category);
+        harness.run_steps(3);
+        harness.get_by_label("キャンセル").click();
+        harness.run_steps(3);
+        harness.state_mut().show_preferences = true;
+        harness.run_steps(3);
+        assert!(
+            !harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .expanded
+                .contains(category)
+        );
+        // Explicit requests override remembered page/scroll and open the target category.
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::ExternalTools);
+        harness.run_steps(3);
+        assert!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .expanded
+                .contains(category)
+        );
+        harness
+            .state_mut()
+            .open_preferences_request(PreferencesOpenRequest::anchored(
+                PreferencesPage::Cache,
+                "cache/epub-handling",
+            ));
+        harness.run_steps(1);
+        assert_eq!(
+            harness.state().pref_state.as_ref().unwrap().selected,
+            PreferencesPage::Cache
         );
         assert_eq!(
-            advance_preferences_scroll_generation_on_open(
-                true,
-                &mut open_last_frame,
-                &mut sequence
-            ),
-            None
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .highlight
+                .unwrap()
+                .0,
+            "cache/epub-handling"
+        );
+        harness.state_mut().pref_state.as_mut().unwrap().highlight = None;
+        harness.run_steps(3);
+        {
+            let state = harness.state_mut().pref_state.as_mut().unwrap();
+            state.search_query = "外部ツール".into();
+            state.showing_results = true;
+            state.expanded.remove(category);
+        }
+        harness.run_steps(3);
+        let entry = search_preferences("外部ツール", preference_category)
+            .into_iter()
+            .next()
+            .unwrap();
+        harness.event(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run_steps(1);
+        let state = harness.state().pref_state.as_ref().unwrap();
+        assert_eq!(state.selected, entry.page);
+        assert_eq!(state.highlight.unwrap().0, entry.anchor);
+        assert!(state.expanded.contains(category));
+        assert_eq!(
+            state.external_tool_selected,
+            Some(crate::external_tool::ExternalToolId(2))
+        );
+    }
+
+    #[test]
+    fn preferences_view_duplicate_priority_inner_scroll_reopens_clamps_and_resets_when_off() {
+        use egui_kittest::kittest::Queryable;
+        let mut harness = preferences_view_harness(PreferencesPage::DuplicateFiles);
+        let extensions: Vec<_> = (0..40).map(|i| format!("testext{i}")).collect();
+        {
+            let app = harness.state_mut();
+            app.settings.skip_duplicate_images = true;
+            app.settings.image_ext_priority = extensions.clone();
+            let state = app.pref_state.as_mut().unwrap();
+            state.settings.skip_duplicate_images = true;
+            state.settings.image_ext_priority = extensions;
+        }
+        harness.run();
+        harness.get_by_label("testext39").scroll_to_me();
+        harness.run();
+        let y = harness
+            .state()
+            .pref_state
+            .as_ref()
+            .unwrap()
+            .duplicate_priority_scroll_y;
+        assert!(y > 100.0);
+        harness.get_by_label("キャンセル").click();
+        harness.run();
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        assert!(
+            (harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .duplicate_priority_scroll_y
+                - y)
+                .abs()
+                < 1.0
+        );
+        // Smaller content clamps immediately through the same ScrollArea output.
+        harness.get_by_label("キャンセル").click();
+        harness.run();
+        harness.state_mut().settings.image_ext_priority.truncate(2);
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .duplicate_priority_scroll_y,
+            0.0
+        );
+        harness.get_by_label("キャンセル").click();
+        harness.run();
+        harness.state_mut().settings.preferences_restore_position = false;
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::DuplicateFiles);
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .duplicate_priority_scroll_y,
+            0.0
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn preferences_view_vst3_picker_inner_scroll_reopens_clamps_and_resets_when_off() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.vst3_enabled = true;
+        app.vst3_discovered = (0..40)
+            .map(|i| crate::video::dsp::DiscoveredPlugin {
+                path: PathBuf::from(format!(r"C:\fake\Effect {i}.vst3")),
+                display_name: format!("Effect {i}"),
+                audio_input_buses: None,
+                audio_output_buses: None,
+                event_input_buses: None,
+                event_output_buses: None,
+                audio_input_channels: None,
+                audio_output_channels: None,
+                usable_audio_effect: None,
+                probe_error: None,
+            })
+            .collect();
+        app.open_preferences_page(PreferencesPage::Vst3);
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(1093.0, 614.0))
+            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+        harness.run();
+        harness.get_by_label("Effect 39").scroll_to_me();
+        harness.run();
+        let y = harness
+            .state()
+            .pref_state
+            .as_ref()
+            .unwrap()
+            .vst3_picker_scroll_y;
+        assert!(y > 100.0);
+        harness.get_by_label("キャンセル").click();
+        harness.run();
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        assert!(
+            (harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .vst3_picker_scroll_y
+                - y)
+                .abs()
+                < 1.0
+        );
+        harness.get_by_label("キャンセル").click();
+        harness.run();
+        harness.state_mut().vst3_discovered.truncate(2);
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .vst3_picker_scroll_y,
+            0.0
+        );
+        harness.get_by_label("キャンセル").click();
+        harness.run();
+        harness.state_mut().settings.preferences_restore_position = false;
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::Vst3);
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .vst3_picker_scroll_y,
+            0.0
+        );
+    }
+
+    fn assert_preferences_position(
+        harness: &egui_kittest::Harness<'_, crate::app::AppTestEnvForTest>,
+        page: PreferencesPage,
+        scroll_y: f32,
+    ) {
+        assert_eq!(harness.state().pref_state.as_ref().unwrap().selected, page);
+        assert_eq!(harness.state().preferences_view_position.page, page);
+        assert!(
+            (harness.state().preferences_view_position.scroll_y - scroll_y).abs() < 1.0,
+            "expected {scroll_y}, got {:?}",
+            harness.state().preferences_view_position,
+        );
+    }
+
+    #[test]
+    fn preferences_position_setting_off_starts_at_top_on_every_close_path() {
+        use egui_kittest::kittest::Queryable;
+        let mut harness = preferences_position_harness();
+        harness
+            .state_mut()
+            .pref_state
+            .as_mut()
+            .unwrap()
+            .settings
+            .preferences_restore_position = false;
+        harness.get_by_label("  OK  ").click();
+        harness.run();
+        assert!(!harness.state().settings.preferences_restore_position);
+        assert_eq!(
+            harness.state().preferences_view_position.page,
+            PreferencesPage::General
+        );
+        assert_eq!(harness.state().preferences_view_position.scroll_y, 0.0);
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        let top_rect = harness.get_by_label("テーマ").rect();
+        for close in ["ok", "cancel", "window", "escape"] {
+            harness
+                .state_mut()
+                .open_preferences_page(PreferencesPage::Cache);
+            harness.run();
+            harness.get_by_label("確認せず変換する").scroll_to_me();
+            harness.run();
+            assert_eq!(
+                harness.state().pref_state.as_ref().unwrap().selected,
+                PreferencesPage::Cache
+            );
+            assert_eq!(harness.state().preferences_view_position.scroll_y, 0.0);
+            match close {
+                "ok" => harness.get_by_label("  OK  ").click(),
+                "cancel" => harness.get_by_label("キャンセル").click(),
+                "window" => harness.get_by_label("Close window").click(),
+                "escape" => harness.event(egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }),
+                _ => unreachable!(),
+            }
+            harness.run();
+            assert!(!harness.state().show_preferences);
+            harness.state_mut().show_preferences = true;
+            harness.run();
+            assert_preferences_position(&harness, PreferencesPage::General, 0.0);
+            assert_eq!(harness.get_by_label("テーマ").rect(), top_rect);
+        }
+    }
+
+    #[test]
+    fn preferences_position_checkbox_toggle_applies_on_ok_and_cancel_keeps_setting() {
+        use egui_kittest::kittest::Queryable;
+        let mut harness = preferences_position_harness();
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::General);
+        harness.run();
+        let label = "環境設定を開き直したときに前回の位置を復元する";
+        harness.get_by_label(label).click();
+        harness.run();
+        assert!(
+            !harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .preferences_restore_position
+        );
+        harness.get_by_label("キャンセル").click();
+        harness.run();
+        harness.get_by_label("破棄して閉じる").click();
+        harness.run();
+        assert!(harness.state().settings.preferences_restore_position);
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        harness.get_by_label(label).click();
+        harness.run();
+        harness.get_by_label("  OK  ").click();
+        harness.run();
+        assert!(!harness.state().settings.preferences_restore_position);
+        assert_eq!(harness.state().preferences_view_position.scroll_y, 0.0);
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        harness.get_by_label(label).click();
+        harness.run();
+        harness.get_by_label("  OK  ").click();
+        harness.run();
+        assert!(harness.state().settings.preferences_restore_position);
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        assert_preferences_position(&harness, PreferencesPage::General, 0.0);
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::Cache);
+        harness.run();
+        harness.get_by_label("確認せず変換する").scroll_to_me();
+        harness.run();
+        let position = harness.state().preferences_view_position.clone();
+        assert!(position.scroll_y > 100.0);
+        harness.state_mut().request_close_preferences_dialog();
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        assert_preferences_position(&harness, position.page, position.scroll_y);
+    }
+
+    #[test]
+    fn preferences_position_setting_off_explicit_anchor_and_search_override() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.preferences_restore_position = false;
+        app.show_preferences = true;
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(1093.0, 614.0))
+            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+        harness.run();
+        assert_preferences_position(&harness, PreferencesPage::General, 0.0);
+        harness
+            .state_mut()
+            .open_preferences_request(PreferencesOpenRequest::EPUB_HANDLING);
+        harness.run_steps(1);
+        let state = harness.state().pref_state.as_ref().unwrap();
+        assert_eq!(state.selected, PreferencesPage::Cache);
+        assert_eq!(state.highlight.unwrap().0, "cache/epub-handling");
+        harness.state_mut().pref_state.as_mut().unwrap().highlight = None;
+        harness.run();
+        // The anchor really scrolls the page while OFF; memory remains cleared.
+        let anchor_y = harness.get_by_label("確認せず変換する").rect().top();
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::Cache);
+        harness.run();
+        assert!(harness.get_by_label("確認せず変換する").rect().top() > anchor_y + 100.0);
+        let state = harness.state_mut().pref_state.as_mut().unwrap();
+        state.search_query = "前回の位置".into();
+        state.showing_results = true;
+        harness.run();
+        harness.event(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run_steps(1);
+        let state = harness.state().pref_state.as_ref().unwrap();
+        assert_eq!(state.selected, PreferencesPage::General);
+        assert_eq!(state.highlight.unwrap().0, "general/restore-position");
+        assert_eq!(harness.state().preferences_view_position.scroll_y, 0.0);
+    }
+
+    #[test]
+    fn preferences_position_reopen_after_ok_cancel_window_close_and_escape() {
+        use egui_kittest::kittest::Queryable;
+        for close in ["ok", "cancel", "window", "escape"] {
+            let mut harness = preferences_position_harness();
+            let position = harness.state().preferences_view_position.clone();
+            let old = harness.state().settings.same_name_folder_book;
+            harness
+                .state_mut()
+                .pref_state
+                .as_mut()
+                .unwrap()
+                .settings
+                .same_name_folder_book =
+                crate::same_name_folder_book::SameNameFolderBookPolicy::PreferFolder;
+            match close {
+                "ok" => harness.get_by_label("  OK  ").click(),
+                "cancel" => harness.get_by_label("キャンセル").click(),
+                "window" => harness.get_by_label("Close window").click(),
+                "escape" => harness.event(egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }),
+                _ => unreachable!(),
+            }
+            harness.run();
+            if close != "ok" {
+                assert!(harness.state().show_preferences_discard_confirm);
+                harness.get_by_label("破棄して閉じる").click();
+                harness.run();
+            }
+            assert!(!harness.state().show_preferences);
+            assert!(harness.state().pref_state.is_none());
+            assert_eq!(
+                harness.state().settings.same_name_folder_book,
+                if close == "ok" {
+                    crate::same_name_folder_book::SameNameFolderBookPolicy::PreferFolder
+                } else {
+                    old
+                }
+            );
+            harness.state_mut().show_preferences = true;
+            harness.run();
+            assert_preferences_position(&harness, position.page, position.scroll_y);
+        }
+    }
+
+    #[test]
+    fn preferences_position_reopen_without_hidden_frame_and_new_process_default() {
+        let mut harness = preferences_position_harness();
+        let position = harness.state().preferences_view_position.clone();
+        // Exercise the same handler as an unchanged Cancel/title close, immediately
+        // followed by any ordinary menu/toolbar/key/gamepad open flag.
+        harness.state_mut().request_close_preferences_dialog();
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        assert_preferences_position(&harness, position.page, position.scroll_y);
+        harness.state_mut().discard_preferences_dialog();
+        drop(harness);
+        let mut app = crate::app::setup_app_for_test();
+        app.show_preferences = true;
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(1093.0, 614.0))
+            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+        harness.run();
+        assert_preferences_position(&harness, PreferencesPage::General, 0.0);
+    }
+
+    #[test]
+    fn preferences_position_tree_switch_then_reopen_starts_at_top() {
+        use egui_kittest::kittest::Queryable;
+        let mut harness = preferences_position_harness();
+        harness.get_by_label("全体設定").click();
+        harness.run();
+        assert_preferences_position(&harness, PreferencesPage::General, 0.0);
+        harness.get_by_label("キャンセル").click();
+        harness.run();
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        assert_preferences_position(&harness, PreferencesPage::General, 0.0);
+    }
+
+    #[test]
+    fn preferences_position_explicit_page_and_anchor_override_memory() {
+        let mut harness = preferences_position_harness();
+        for page in [PreferencesPage::Cache, PreferencesPage::General] {
+            harness.state_mut().request_close_preferences_dialog();
+            harness.state_mut().open_preferences_page(page);
+            harness.run();
+            assert_preferences_position(&harness, page, 0.0);
+        }
+        harness
+            .state_mut()
+            .open_preferences_request(PreferencesOpenRequest::EPUB_HANDLING);
+        harness.run_steps(1);
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .highlight
+                .unwrap()
+                .0,
+            "cache/epub-handling"
+        );
+        harness.state_mut().pref_state.as_mut().unwrap().highlight = None;
+        harness.run();
+        assert!(harness.state().preferences_view_position.scroll_y > 100.0);
+        // A page-only request while already open also overrides an anchor/offset.
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::Cache);
+        harness.run();
+        assert_preferences_position(&harness, PreferencesPage::Cache, 0.0);
+    }
+
+    #[test]
+    fn preferences_position_search_jump_overrides_and_results_do_not_replace_page() {
+        let mut harness = preferences_position_harness();
+        let position = harness.state().preferences_view_position.clone();
+        harness
+            .state_mut()
+            .pref_state
+            .as_mut()
+            .unwrap()
+            .search_query = "テーマ".into();
+        harness
+            .state_mut()
+            .pref_state
+            .as_mut()
+            .unwrap()
+            .showing_results = true;
+        harness.run();
+        assert_preferences_position(&harness, position.page, position.scroll_y);
+        let entry = search_preferences("テーマ", preference_category)
+            .into_iter()
+            .next()
+            .unwrap();
+        harness.event(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run_steps(1);
+        assert_eq!(
+            harness.state().pref_state.as_ref().unwrap().selected,
+            entry.page
         );
         assert_eq!(
-            advance_preferences_scroll_generation_on_open(
-                false,
-                &mut open_last_frame,
-                &mut sequence
-            ),
-            None
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .highlight
+                .unwrap()
+                .0,
+            entry.anchor
         );
+        harness.state_mut().pref_state.as_mut().unwrap().highlight = None;
+        harness.run();
+        let position = harness.state().preferences_view_position.clone();
+        assert_preferences_position(&harness, PreferencesPage::General, 0.0);
+        harness.state_mut().discard_preferences_dialog();
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        assert_preferences_position(&harness, position.page, position.scroll_y);
+    }
+
+    #[test]
+    fn preferences_position_clamps_when_content_changes() {
+        let mut harness = preferences_position_harness();
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::General);
+        harness.run();
+        // Transient import feedback can make a page much taller; it disappears
+        // with the draft. Restore must use the new page's actual scroll range.
+        harness.state_mut().discard_preferences_dialog();
+        harness.state_mut().preferences_view_position.scroll_y = 100_000.0;
+        harness.state_mut().ensure_preferences_state();
+        harness
+            .state_mut()
+            .pref_state
+            .as_mut()
+            .unwrap()
+            .transfer_feedback = Some(PreferencesTransferFeedback::Failed(
+            "長い取り込み結果\n".repeat(120),
+        ));
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        let tall_content_limit = harness.state().preferences_view_position.scroll_y;
+        assert!(tall_content_limit > 1000.0 && tall_content_limit < 100_000.0);
+        harness.state_mut().request_close_preferences_dialog();
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        assert!(harness.state().preferences_view_position.scroll_y < tall_content_limit - 1000.0);
+        assert!(harness.state().preferences_view_position.scroll_y >= 0.0);
+        let clamped = harness.state().preferences_view_position.scroll_y;
+        harness.state_mut().request_close_preferences_dialog();
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        assert_preferences_position(&harness, PreferencesPage::General, clamped);
+    }
+
+    #[test]
+    fn preferences_position_clamps_when_dialog_height_changes() {
+        let mut app = crate::app::setup_app_for_test();
+        app.preferences_view_position = PreferencesViewPosition {
+            page: PreferencesPage::Cache,
+            scroll_y: 100_000.0,
+            ..Default::default()
+        };
+        app.show_preferences = true;
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(1100.0, 900.0))
+            .build_state(
+                |ctx, (app, saved_ctx)| {
+                    *saved_ctx = ctx.clone();
+                    app.show_preferences_dialog(ctx);
+                },
+                (app, egui::Context::default()),
+            );
+        harness.run();
+        let before_y = harness.state().0.preferences_view_position.scroll_y;
+        let window_id = egui::Id::new("環境設定");
+        let before_rect = harness
+            .state()
+            .1
+            .memory(|memory| memory.area_rect(window_id).unwrap());
+        let start = before_rect.right_bottom() - egui::vec2(2.0, 2.0);
+        let end = start + egui::vec2(0.0, 120.0);
+        // Resize the actual egui Window using headless input, keeping page
+        // content and width fixed. Merely growing the app viewport is insufficient.
+        harness.event(egui::Event::PointerMoved(start));
+        harness.run_steps(1);
+        harness.event(egui::Event::PointerButton {
+            pos: start,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run_steps(1);
+        harness.event(egui::Event::PointerMoved(end));
+        harness.run_steps(1);
+        harness.event(egui::Event::PointerButton {
+            pos: end,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+        let after_rect = harness
+            .state()
+            .1
+            .memory(|memory| memory.area_rect(window_id).unwrap());
+        assert!(after_rect.height() > before_rect.height() + 80.0);
+        let clamped = harness.state().0.preferences_view_position.scroll_y;
+        assert!(clamped >= 0.0 && clamped < before_y - 80.0);
+        harness.state_mut().0.request_close_preferences_dialog();
+        harness.state_mut().0.show_preferences = true;
+        harness.run();
         assert_eq!(
-            advance_preferences_scroll_generation_on_open(
-                true,
-                &mut open_last_frame,
-                &mut sequence
-            ),
-            Some(13)
+            harness.state().0.pref_state.as_ref().unwrap().selected,
+            PreferencesPage::Cache
         );
+        assert!((harness.state().0.preferences_view_position.scroll_y - clamped).abs() < 1.0);
     }
 
     #[test]
@@ -5875,11 +7504,11 @@ mod tests {
 
     #[test]
     fn shared_sidecar_checkbox_lives_on_thumbnail_page_and_edits_one_setting() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
         let _data_dir = crate::data_dir::TestDataDirGuard::new();
         let mut state = preferences_state_for_test(&Settings::default());
         state.selected = PreferencesPage::Thumbnail;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(600.0, 2400.0))
             .build_state(
                 |ctx, state| {
@@ -5915,10 +7544,10 @@ mod tests {
 
     #[test]
     fn raw_controls_only_appear_on_dedicated_page() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
         let mut state = preferences_state_for_test(&Settings::default());
         state.selected = PreferencesPage::Parallelism;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(600.0, 400.0))
             .build_state(
                 |ctx, state| {
@@ -6049,6 +7678,9 @@ mod tests {
                 sort_order: SortOrder::FileName,
                 default_spread_mode: SpreadMode::Single,
                 default_reading_flow: ReadingFlow::Paged,
+                fullscreen_specified_scale: Some(
+                    crate::settings::FullscreenSpecifiedScale::default(),
+                ),
             },
             1 => FavoriteViewState {
                 grid_view_mode: GridViewMode::Details,
@@ -6064,6 +7696,14 @@ mod tests {
                 sort_order: SortOrder::DateDesc,
                 default_spread_mode: SpreadMode::RtlCover,
                 default_reading_flow: ReadingFlow::Horizontal,
+                fullscreen_specified_scale: Some(crate::settings::FullscreenSpecifiedScale {
+                    width: crate::settings::SpecifiedScaleAxisSetting::disabled(
+                        crate::settings::SpecifiedScaleAxis::PercentTenths(800),
+                    ),
+                    height: crate::settings::SpecifiedScaleAxisSetting::enabled(
+                        crate::settings::SpecifiedScaleAxis::LogicalPixels(800),
+                    ),
+                }),
             },
             _ => FavoriteViewState {
                 grid_view_mode: GridViewMode::Thumbnail,
@@ -6079,6 +7719,14 @@ mod tests {
                 sort_order: SortOrder::Numeric,
                 default_spread_mode: SpreadMode::Ltr,
                 default_reading_flow: ReadingFlow::Vertical,
+                fullscreen_specified_scale: Some(crate::settings::FullscreenSpecifiedScale {
+                    width: crate::settings::SpecifiedScaleAxisSetting::disabled(
+                        crate::settings::SpecifiedScaleAxis::PercentTenths(800),
+                    ),
+                    height: crate::settings::SpecifiedScaleAxisSetting::disabled(
+                        crate::settings::SpecifiedScaleAxis::PercentTenths(800),
+                    ),
+                }),
             },
         }
     }
@@ -6142,6 +7790,222 @@ mod tests {
     }
 
     #[test]
+    fn specified_scale_preferences_install_updates_inheritance_and_preserves_explicit_favorite() {
+        use crate::settings::{FavoriteViewState, FullscreenSpecifiedScale, SpecifiedScaleAxis};
+
+        for explicit in [
+            None,
+            Some(FullscreenSpecifiedScale {
+                width: crate::settings::SpecifiedScaleAxisSetting::disabled(
+                    crate::settings::SpecifiedScaleAxis::PercentTenths(800),
+                ),
+                height: crate::settings::SpecifiedScaleAxisSetting::disabled(
+                    crate::settings::SpecifiedScaleAxis::PercentTenths(800),
+                ),
+            }),
+        ] {
+            let mut app = crate::app::setup_app_for_test();
+            app.settings.remember_favorite_view_state = true;
+            app.settings.fullscreen_specified_scale_max_tenths = 80;
+            let id = uuid::Uuid::new_v4();
+            let mut stored = FavoriteViewState::from_settings(&app.settings);
+            stored.fullscreen_specified_scale = explicit;
+            app.favorite_view_states.insert(id, stored.clone());
+            app.settings.apply_favorite_view_overlay(id, &stored);
+            let new_common = FullscreenSpecifiedScale {
+                width: crate::settings::SpecifiedScaleAxisSetting::enabled(
+                    SpecifiedScaleAxis::LogicalPixels(800),
+                ),
+                height: crate::settings::SpecifiedScaleAxisSetting::enabled(
+                    SpecifiedScaleAxis::PercentTenths(250),
+                ),
+            };
+            let mut edited = app.settings.preferences_snapshot();
+            edited.fullscreen_specified_scale = new_common;
+            edited.fullscreen_specified_scale_max_tenths = 25;
+            assert_eq!(app.settings.fullscreen_specified_scale_max_tenths, 80);
+            prepare_preferences_settings_for_commit(&mut edited, &mut app.settings);
+            assert_eq!(edited.fullscreen_specified_scale_max_tenths, 25);
+            app.install_preferences_settings(edited);
+            assert_eq!(app.settings.fullscreen_specified_scale_max_tenths, 25);
+            assert_eq!(
+                app.settings
+                    .preferences_snapshot()
+                    .fullscreen_specified_scale_max_tenths,
+                25
+            );
+            assert_eq!(app.settings.common_fullscreen_specified_scale(), new_common);
+            assert_eq!(
+                app.settings.fullscreen_specified_scale,
+                explicit.unwrap_or(new_common)
+            );
+            assert_eq!(app.favorite_view_states.get(&id), Some(&stored));
+            assert_eq!(app.settings.active_favorite_view_id(), Some(id));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn specified_scale_preferences_mode_exit_reentry_invalidates_mounted_and_parked_units() {
+        use crate::settings::FullscreenFitMode;
+        use crate::ui_fullscreen::{ContinuousReadingUnitSpec, ContinuousSpecifiedFitReference};
+
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.fullscreen_fit_mode = FullscreenFitMode::SpecifiedScale;
+        let seed = |owner: &mut App| {
+            owner.fs_continuous_fit_reference = ContinuousSpecifiedFitReference::Specified {
+                unit: ContinuousReadingUnitSpec::pages(7, vec![7, 8]),
+                settings: Default::default(),
+                limits: Default::default(),
+                base: None,
+            };
+            owner.fs_zoom = 1.7;
+            owner.fs_vertical_scroll = 123.0;
+        };
+        let parked = app.build_window_context_for_test(13420, seed);
+        seed(&mut app);
+
+        // Applying an unchanged mode preserves the selected reference.
+        let unchanged = app.settings.clone();
+        app.install_preferences_settings(unchanged);
+        assert!(matches!(
+            app.fs_continuous_fit_reference,
+            ContinuousSpecifiedFitReference::Specified { .. }
+        ));
+        app.with_window_context_for_test(parked, |owner| {
+            assert!(matches!(
+                owner.fs_continuous_fit_reference,
+                ContinuousSpecifiedFitReference::Specified { .. }
+            ));
+        });
+
+        let mut edited = app.settings.clone();
+        edited.fullscreen_fit_mode = FullscreenFitMode::Page;
+        app.install_preferences_settings(edited);
+        assert!(matches!(
+            app.fs_continuous_fit_reference,
+            ContinuousSpecifiedFitReference::Legacy
+        ));
+
+        // No layout or parked mount takes place between exit and re-entry.
+        let mut edited = app.settings.clone();
+        edited.fullscreen_fit_mode = FullscreenFitMode::SpecifiedScale;
+        app.install_preferences_settings(edited);
+        assert!(matches!(
+            app.fs_continuous_fit_reference,
+            ContinuousSpecifiedFitReference::Legacy
+        ));
+        assert_eq!(app.fs_zoom, 1.7);
+        assert_eq!(app.fs_vertical_scroll, 123.0);
+        app.with_window_context_for_test(parked, |owner| {
+            assert!(matches!(
+                owner.fs_continuous_fit_reference,
+                ContinuousSpecifiedFitReference::Legacy
+            ));
+            assert_eq!(owner.fs_zoom, 1.7);
+            assert_eq!(owner.fs_vertical_scroll, 123.0);
+        });
+    }
+
+    #[test]
+    fn specified_scale_preferences_numeric_editor_ime_enter_escape_keeps_dialog_open() {
+        use crate::settings::{FullscreenSpecifiedScale, SpecifiedScaleAxis};
+        use egui_kittest::kittest::Queryable;
+
+        for (key, maximum) in [
+            (egui::Key::Enter, 32768.0),
+            (egui::Key::Escape, 32768.0),
+            (egui::Key::Enter, 20.0),
+            (egui::Key::Escape, 20.0),
+        ] {
+            let mut app = crate::app::setup_app_for_test();
+            app.settings.fullscreen_specified_scale = FullscreenSpecifiedScale {
+                width: crate::settings::SpecifiedScaleAxisSetting::enabled(
+                    SpecifiedScaleAxis::LogicalPixels(800),
+                ),
+                height: crate::settings::SpecifiedScaleAxisSetting::enabled(
+                    SpecifiedScaleAxis::PercentTenths(800),
+                ),
+            };
+            let original = app.settings.fullscreen_specified_scale;
+            app.open_preferences_request(PreferencesOpenRequest::anchored(
+                PreferencesPage::SpreadMode,
+                "spread/specified-scale",
+            ));
+            let mut harness = crate::test_ui::builder()
+                .with_size(egui::vec2(1100.0, 850.0))
+                .build_state(
+                    |ctx, app| {
+                        crate::ime_focus::install_ime_input_policy(ctx);
+                        app.show_preferences_dialog(ctx);
+                    },
+                    app,
+                );
+            // The anchor highlight deliberately repaints for a bounded time.
+            // Finish the initial scroll frames, then clear only that visual
+            // test decoration before checking the real numeric input handler.
+            harness.run_steps(5);
+            harness.state_mut().pref_state.as_mut().unwrap().highlight = None;
+            harness
+                .get_by(|node| {
+                    node.min_numeric_value() == Some(1.0)
+                        && node.max_numeric_value() == Some(maximum)
+                })
+                .scroll_to_me();
+            harness.run();
+            harness
+                .get_by(|node| {
+                    node.min_numeric_value() == Some(1.0)
+                        && node.max_numeric_value() == Some(maximum)
+                })
+                .focus();
+            harness.run();
+            assert!(
+                harness
+                    .get_by(|node| {
+                        node.min_numeric_value() == Some(1.0)
+                            && node.max_numeric_value() == Some(maximum)
+                    })
+                    .is_focused()
+            );
+            harness.input_mut().events.extend([
+                egui::Event::Ime(egui::ImeEvent::Enabled),
+                egui::Event::Ime(egui::ImeEvent::Preedit("１２".into())),
+            ]);
+            harness.run();
+            harness.key_press(key);
+            harness.run();
+            assert!(
+                harness.state().show_preferences,
+                "IME {key:?} must not close the preferences dialog; max={maximum}"
+            );
+            assert_eq!(
+                harness
+                    .state()
+                    .settings
+                    .fullscreen_specified_scale_max_tenths,
+                50
+            );
+            assert!(!harness.state().show_preferences_discard_confirm);
+            assert!(harness.state().pref_state.is_some());
+            assert_eq!(
+                harness.state().settings.fullscreen_specified_scale,
+                original
+            );
+            assert!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .fullscreen_specified_scale
+                    .is_valid()
+            );
+        }
+    }
+
+    #[test]
     fn unrated_position_survives_preferences_ok_save_reopen_and_orders_folder() {
         use crate::rating_sort::{
             ListingOrderRequest, RatingSortDirection, RatingSortSpec, RatingSortUnratedPosition,
@@ -6200,7 +8064,7 @@ mod tests {
     #[test]
     #[cfg(all(windows, not(feature = "portable")))]
     fn effetune_pre_limiter_preferences_checkbox_ok_save_reload_consumers() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
         let mut app = crate::app::setup_app_for_test();
         // Retain consumers BEFORE opening preferences: an existing player/pump
         // and existing Remote admission/generation must see OK without reopening.
@@ -6212,7 +8076,7 @@ mod tests {
             PreferencesPage::Video,
             "video/effetune-input-limit",
         ));
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
             .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
         // The search anchor intentionally animates a highlight; settle the scroll
@@ -6288,14 +8152,14 @@ mod tests {
     #[test]
     #[cfg(all(windows, not(feature = "portable")))]
     fn effetune_auto_open_preferences_cancel_ok_save_reload() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
         let mut app = crate::app::setup_app_for_test();
         assert!(!app.settings.effetune_auto_open_on_video);
         app.open_preferences_request(PreferencesOpenRequest::anchored(
             PreferencesPage::Video,
             "video/effetune-auto-open",
         ));
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
             .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
         for cancel in [true, false] {
@@ -6366,13 +8230,110 @@ mod tests {
 
     #[test]
     #[cfg(all(windows, not(feature = "portable")))]
+    fn effetune_taskbar_preferences_cancel_ok_save_reload() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = crate::app::setup_app_for_test();
+        assert!(app.settings.effetune_show_in_taskbar);
+        assert!(app.effetune.show_in_taskbar());
+        app.open_preferences_request(PreferencesOpenRequest::anchored(
+            PreferencesPage::Video,
+            "video/effetune-taskbar",
+        ));
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(1100.0, 850.0))
+            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+        for (cancel, enabled) in [(true, false), (false, false), (false, true)] {
+            if !harness.state().show_preferences {
+                harness
+                    .state_mut()
+                    .open_preferences_request(PreferencesOpenRequest::anchored(
+                        PreferencesPage::Video,
+                        "video/effetune-taskbar",
+                    ));
+            }
+            harness.run_steps(5);
+            harness.state_mut().pref_state.as_mut().unwrap().highlight = None;
+            harness.run();
+            harness
+                .get_by_label("音響調整の窓をタスクバーに表示する")
+                .click();
+            harness.run();
+            assert_eq!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .effetune_show_in_taskbar,
+                enabled
+            );
+            assert_eq!(harness.state().settings.effetune_show_in_taskbar, !enabled);
+            assert_eq!(harness.state().effetune.show_in_taskbar(), !enabled);
+            harness
+                .get_by_label(if cancel { "キャンセル" } else { "  OK  " })
+                .click();
+            harness.run();
+            if cancel {
+                assert!(harness.state().show_preferences_discard_confirm);
+                assert!(harness.state().effetune.show_in_taskbar());
+                harness.get_by_label("破棄して閉じる").click();
+                harness.run();
+            }
+            assert!(!harness.state().show_preferences);
+            let expected = if cancel { !enabled } else { enabled };
+            assert_eq!(harness.state().settings.effetune_show_in_taskbar, expected);
+            assert_eq!(harness.state().effetune.show_in_taskbar(), expected);
+            if !cancel {
+                let reloaded = Settings::load();
+                assert_eq!(reloaded.effetune_show_in_taskbar, enabled);
+                assert_eq!(
+                    crate::app::App::new_from_settings(reloaded)
+                        .effetune
+                        .show_in_taskbar(),
+                    enabled
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(all(windows, feature = "portable"))]
+    fn effetune_taskbar_preferences_portable_hides_control_and_keeps_value() {
+        use egui_kittest::kittest::Queryable;
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let settings = Settings {
+            effetune_show_in_taskbar: false,
+            ..Settings::default()
+        };
+        let mut state = preferences_state_for_test(&settings);
+        state.selected = PreferencesPage::Video;
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(600.0, 2400.0))
+            .build_state(
+                |ctx, state| {
+                    egui::CentralPanel::default().show(ctx, |ui| draw_page(ui, state, false));
+                },
+                state,
+            );
+        harness.run();
+        assert!(
+            harness
+                .query_by_label("音響調整の窓をタスクバーに表示する")
+                .is_none()
+        );
+        assert!(!harness.state().settings.effetune_show_in_taskbar);
+    }
+
+    #[test]
+    #[cfg(all(windows, not(feature = "portable")))]
     fn effetune_minimized_preferences_ok_publishes_saved_policy() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
         let mut app = crate::app::setup_app_for_test();
         app.settings.effetune_keep_visible_when_minimized = true;
         let app = crate::app::App::new_from_settings(app.settings.clone());
         assert!(app.effetune.keep_visible_when_minimized());
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
             .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
         for enabled in [false, true] {
@@ -6427,7 +8388,7 @@ mod tests {
     #[test]
     fn epub_handling_preferences_cancel_ok_reload_reset_and_listing_effect() {
         use crate::settings::{ArchiveFileHandling, EpubFileHandling, Settings};
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
         let mut app = crate::app::setup_app_for_test();
         app.settings
@@ -6438,7 +8399,7 @@ mod tests {
         std::fs::write(folder.join("archive.7z"), b"archive").unwrap();
 
         app.open_preferences_page(PreferencesPage::Cache);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
             .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
         harness.run();
@@ -6515,7 +8476,7 @@ mod tests {
     fn ignoring_open_epub_on_preferences_ok_does_not_select_same_named_item_in_next_book() {
         use crate::grid_item::GridItem;
         use crate::settings::EpubFileHandling;
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
         let mut app = crate::app::setup_app_for_test();
         let epub = app.tmp.path().join("open-book.epub");
@@ -6538,7 +8499,7 @@ mod tests {
         app.selected = Some(1);
         app.open_preferences_page(PreferencesPage::Cache);
 
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
             .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
         harness.run();
@@ -6581,7 +8542,7 @@ mod tests {
     fn archive_and_epub_handling_ok_use_same_history_reload_timing() {
         use crate::reading_history_db::{ReadingHistoryEntry, ReadingHistoryKind};
         use crate::settings::{ArchiveFileHandling, EpubFileHandling};
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
         let apply = |change_epub: bool| {
             let mut app = crate::app::setup_app_for_test();
@@ -6609,7 +8570,7 @@ mod tests {
             assert_eq!(app.visible_indices, vec![0, 1]);
 
             app.open_preferences_page(PreferencesPage::Cache);
-            let mut harness = Harness::builder()
+            let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1100.0, 850.0))
                 .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
             harness.run();
@@ -6639,11 +8600,11 @@ mod tests {
 
     #[test]
     fn epub_handling_cache_page_radio_and_reset_edit_only_epub_setting() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
         let mut state = preferences_state_for_test(&crate::settings::Settings::default());
         state.selected = PreferencesPage::Cache;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(760.0, 950.0))
             .build_state(
                 |ctx, state| {
@@ -6715,11 +8676,11 @@ mod tests {
 
     #[test]
     fn clipboard_capture_picker_result_on_another_page_is_polled_before_ok_commit() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
         let mut app = crate::app::setup_app_for_test();
         app.open_preferences_page(PreferencesPage::ClipboardCapture);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
             .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
         // Opening requests the page; the first dialog frame creates its draft.

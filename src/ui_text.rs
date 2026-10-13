@@ -4102,8 +4102,7 @@ impl App {
         selected: bool,
         allow_build: bool,
     ) -> bool {
-        let (rect, resp) =
-            ui.allocate_exact_size(egui::vec2(FONT_CARD_W, FONT_CARD_H), egui::Sense::click());
+        let (rect, resp) = allocate_font_card(ui);
         let hovered = resp.hovered();
         let painter = ui.painter_at(rect);
         let bg = if selected {
@@ -4292,39 +4291,37 @@ impl App {
                 let mut build_budget = 4i32;
                 let mut need_repaint = false;
 
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show_rows(ui, FONT_CARD_H + 8.0, rows, |ui, row_range| {
-                        for row in row_range {
-                            ui.horizontal(|ui| {
-                                for col in 0..cols {
-                                    let idx = row * cols + col;
-                                    let Some(key) = visible.get(idx) else {
-                                        break;
-                                    };
-                                    let selected = key == &current_key;
-                                    // 構築済み (テクスチャ有) か失敗済みなら予算を消費しない。
-                                    let settled = self.font_sample_cache.contains_key(&(
-                                        key.clone(),
-                                        self.text_font_dialog_sample.clone(),
-                                    )) || self.font_sample_failed.contains(key);
-                                    let allow = settled || build_budget > 0;
-                                    if !settled && allow {
-                                        build_budget -= 1;
-                                    }
-                                    if !settled && !allow {
-                                        need_repaint = true;
-                                    }
-                                    if self.draw_font_card(ui, ctx, key, selected, allow) {
-                                        chosen = Some(key.clone());
-                                    }
+                show_font_card_rows(ui, rows, |ui, row_range| {
+                    for row in row_range {
+                        ui.horizontal(|ui| {
+                            for col in 0..cols {
+                                let idx = row * cols + col;
+                                let Some(key) = visible.get(idx) else {
+                                    break;
+                                };
+                                let selected = key == &current_key;
+                                // 構築済み (テクスチャ有) か失敗済みなら予算を消費しない。
+                                let settled = self.font_sample_cache.contains_key(&(
+                                    key.clone(),
+                                    self.text_font_dialog_sample.clone(),
+                                )) || self.font_sample_failed.contains(key);
+                                let allow = settled || build_budget > 0;
+                                if !settled && allow {
+                                    build_budget -= 1;
                                 }
-                            });
-                        }
-                        if need_repaint {
-                            ui.ctx().request_repaint();
-                        }
-                    });
+                                if !settled && !allow {
+                                    need_repaint = true;
+                                }
+                                if self.draw_font_card(ui, ctx, key, selected, allow) {
+                                    chosen = Some(key.clone());
+                                }
+                            }
+                        });
+                    }
+                    if need_repaint {
+                        ui.ctx().request_repaint();
+                    }
+                });
             });
 
         self.text_font_dialog = open;
@@ -6172,6 +6169,22 @@ const ONOMATO_CELL_W: f32 = 184.0;
 /// フォント選択ダイアログの 1 カード寸法 (見本ストリップ + フォント名)。
 const FONT_CARD_W: f32 = 220.0;
 const FONT_CARD_H: f32 = 70.0;
+
+fn allocate_font_card(ui: &mut egui::Ui) -> (egui::Rect, egui::Response) {
+    ui.allocate_exact_size(egui::vec2(FONT_CARD_W, FONT_CARD_H), egui::Sense::click())
+}
+
+fn show_font_card_rows<R>(
+    ui: &mut egui::Ui,
+    rows: usize,
+    draw: impl FnOnce(&mut egui::Ui, std::ops::Range<usize>) -> R,
+) -> egui::scroll_area::ScrollAreaOutput<R> {
+    // Each horizontal row allocates exactly FONT_CARD_H; show_rows adds
+    // the parent's vertical item spacing once.
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show_rows(ui, FONT_CARD_H, rows, draw)
+}
 
 #[derive(Clone, Copy)]
 struct OnomatopoeiaPreset {
@@ -9600,6 +9613,77 @@ mod tests {
     use crate::rotation_db::Rotation;
 
     #[test]
+    fn calculated_font_card_rows_match_allocation_and_reach_end() {
+        use crate::test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
+        for height in [220.0, 110.0] {
+            let ctx = egui::Context::default();
+            let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, height));
+            let draw = |events| {
+                let mut measured = None;
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(viewport),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(ctx, |ui| {
+                                let output = show_font_card_rows(ui, 3, |ui, rows| {
+                                    for _ in rows {
+                                        ui.horizontal(|ui| {
+                                            for _ in 0..2 {
+                                                allocate_font_card(ui);
+                                            }
+                                        });
+                                    }
+                                });
+                                measured = Some(ScrollLayout::from_output(&output));
+                            });
+                    },
+                );
+                measured.unwrap()
+            };
+            let mut before = draw(vec![]);
+            for _ in 0..3 {
+                before = draw(vec![]);
+            }
+            assert_eq!(
+                before.content.y,
+                3.0 * FONT_CARD_H + 2.0 * ctx.style().spacing.item_spacing.y
+            );
+            before.assert_height(
+                if height > 200.0 {
+                    HeightExpectation::Fits
+                } else {
+                    HeightExpectation::Scrolls
+                },
+                viewport,
+                ctx.pixels_per_point(),
+            );
+            if height < 200.0 {
+                let mut after = before;
+                for frame in 0..40 {
+                    after = draw(if frame == 0 {
+                        vec![
+                            egui::Event::PointerMoved(before.inner.center()),
+                            egui::Event::MouseWheel {
+                                unit: egui::MouseWheelUnit::Point,
+                                delta: egui::vec2(0.0, -4000.0),
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ]
+                    } else {
+                        vec![]
+                    });
+                }
+                after.assert_scrolled_to_end(before, ctx.pixels_per_point());
+            }
+        }
+    }
+
+    #[test]
     fn annotation_color_pickers_do_not_use_egui_additive_default() {
         let source = include_str!("ui_text.rs");
         let raw_ui_call = ["ui.", "color_edit_button_srgba("].concat();
@@ -10419,7 +10503,6 @@ mod tests {
     }
 
     fn bubble_body_rendered_width(fill: Option<Rgba>) -> f32 {
-        use egui_kittest::Harness;
         use std::sync::{Arc, Mutex};
 
         let measured = Arc::new(Mutex::new(0.0));
@@ -10435,7 +10518,7 @@ mod tests {
             auto_size: false,
             ..BubbleObject::default()
         };
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(PANEL_W + 32.0, 720.0))
             .build(move |ctx| {
                 if !fonts_ready {
@@ -10477,8 +10560,6 @@ mod tests {
 
     #[test]
     fn bubble_body_panel_frame_preserves_out_of_range_round_rect_half_width() {
-        use egui_kittest::Harness;
-
         let bubble = BubbleObject {
             shape: BubbleShape::RoundRect {
                 half_w: 950.0,
@@ -10488,7 +10569,7 @@ mod tests {
             auto_size: false,
             ..BubbleObject::default()
         };
-        let harness = Harness::builder()
+        let harness = crate::test_ui::builder()
             .with_size(egui::vec2(PANEL_W, 720.0))
             .build_ui_state(
                 |ui, state: &mut (BubbleObject, bool)| {
@@ -10513,8 +10594,6 @@ mod tests {
 
     #[test]
     fn marker_body_panel_frame_preserves_out_of_range_half_width() {
-        use egui_kittest::Harness;
-
         let marker = BubbleObject {
             shape: BubbleShape::RoundRect {
                 half_w: 950.0,
@@ -10525,7 +10604,7 @@ mod tests {
             auto_size: false,
             ..BubbleObject::default()
         };
-        let harness = Harness::builder()
+        let harness = crate::test_ui::builder()
             .with_size(egui::vec2(PANEL_W, 360.0))
             .build_ui_state(
                 |ui, state: &mut (BubbleObject, bool)| {
@@ -10550,8 +10629,6 @@ mod tests {
 
     #[test]
     fn annotation_arrow_panel_frame_preserves_out_of_range_half_width() {
-        use egui_kittest::Harness;
-
         let arrow = BubbleObject {
             shape: BubbleShape::Arrow {
                 half_w: 1200.0,
@@ -10563,7 +10640,7 @@ mod tests {
             auto_size: false,
             ..BubbleObject::default()
         };
-        let harness = Harness::builder()
+        let harness = crate::test_ui::builder()
             .with_size(egui::vec2(PANEL_W, 420.0))
             .build_ui_state(
                 |ui, state: &mut (BubbleObject, bool)| {
@@ -10588,15 +10665,13 @@ mod tests {
 
     #[test]
     fn annotation_add_dialog_snapshot_dark() {
-        use egui_kittest::Harness;
-
         let mut fonts_ready = false;
         let mut preset = AnnotationPreset::Rect;
         let mut shape_color = ANNOTATION_DEFAULT_COLOR;
         let mut marker_color = ANNOTATION_MARKER_DEFAULT_COLOR;
         let mut stroke = AnnotationStrokePreset::Standard;
         let mut cursor_thumbs = HashMap::new();
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(620.0, 460.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -10714,7 +10789,9 @@ mod tests {
                 rotation: rot,
                 free_rotation_rad: free,
                 content_bbox: None,
-                fit_mode: crate::settings::FullscreenFitMode::Page,
+                fit_mode: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
+                    crate::settings::FullscreenFitMode::Page,
+                ),
                 fit_scale_limits:
                     crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
                 pixels_per_point: 1.0,

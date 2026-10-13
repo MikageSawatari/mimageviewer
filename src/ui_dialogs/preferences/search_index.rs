@@ -23,6 +23,30 @@ macro_rules! entry {
 
 pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     entry!(
+        "file-types/categories",
+        FileTypeVisibility,
+        "表示するファイル種類",
+        [
+            "非表示",
+            "画像",
+            "RAW",
+            "動画",
+            "音声",
+            "ZIP",
+            "PDF",
+            "EPUB",
+            "RAR",
+            "7z",
+            "LZH"
+        ]
+    ),
+    entry!(
+        "file-types/extensions",
+        FileTypeVisibility,
+        "個別に非表示にする拡張子",
+        ["png", "cr2", "形式", "拡張子"]
+    ),
+    entry!(
         "general/theme",
         General,
         "テーマ",
@@ -33,6 +57,21 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         General,
         "文字のコントラスト",
         ["文字色", "見やすさ", "contrast"]
+    ),
+    entry!(
+        "general/restore-position",
+        General,
+        "環境設定を開き直したときに前回の位置を復元する",
+        [
+            "再表示",
+            "記憶",
+            "スクロール",
+            "ページ",
+            "選択",
+            "折りたたみ",
+            "絞り込み",
+            "restore"
+        ]
     ),
     entry!(
         "general/ai-processing",
@@ -655,8 +694,16 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     entry!(
         "duplicate/archive-folder",
         DuplicateFiles,
-        "同名の ZIP/PDF/EPUB/RAR/7z/LZH ファイルとフォルダがある場合、本側をスキップ",
-        ["重複", "同名", "archive"]
+        "同名のフォルダと本 (ZIP/PDF/EPUB/RAR/7z/LZH) がある場合",
+        [
+            "重複",
+            "同名",
+            "archive",
+            "本を表示",
+            "フォルダを表示",
+            "両方表示",
+            "本側をスキップ"
+        ]
     ),
     entry!(
         "duplicate/zip-archive",
@@ -762,6 +809,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["PDF", "EPUB", "右開き", "綴じ方向"]
     ),
     entry!(
+        "spread/remember-adjustment",
+        SpreadMode,
+        "見開きの調整を本ごとに記憶する",
+        ["見開き", "1ページずらし", "Ctrl", "保存", "復元", "記憶"]
+    ),
+    entry!(
         "spread/final-cover",
         SpreadMode,
         "末尾に表紙を添える",
@@ -802,6 +855,25 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         SpreadMode,
         "ズーム/フィット",
         ["拡大", "縮小", "倍率", "zoom"]
+    ),
+    entry!(
+        "spread/specified-scale",
+        SpreadMode,
+        "指定サイズ",
+        [
+            "幅",
+            "高さ",
+            "％",
+            "%",
+            "px",
+            "point",
+            "サイズ",
+            "余白",
+            "5倍",
+            "最大倍率",
+            "共通",
+            "20倍"
+        ]
     ),
     entry!(
         "spread/no-upscale",
@@ -1217,6 +1289,13 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     ),
     #[cfg(not(feature = "portable"))]
     entry!(
+        "video/effetune-taskbar",
+        Video,
+        "音響調整の窓をタスクバーに表示する",
+        ["音響調整", "タスクバー", "taskbar", "復元", "EffeTune"]
+    ),
+    #[cfg(not(feature = "portable"))]
+    entry!(
         "video/effetune-minimized",
         Video,
         "メインウィンドウを最小化しても音響調整の窓を表示したままにする",
@@ -1319,6 +1398,28 @@ mod tests {
     const PREFERENCES_SOURCE: &str = include_str!("../preferences.rs");
     const RAW_SETTINGS_SOURCE: &str = include_str!("../../ui_raw.rs");
     const NAME_COLORS_SOURCE: &str = include_str!("name_colors.rs");
+
+    #[test]
+    fn same_name_folder_book_choice_queries_target_the_existing_anchor() {
+        for query in [
+            "本を表示",
+            "フォルダを表示",
+            "両方表示",
+            "ZIP フォルダ",
+            "本側をスキップ",
+        ] {
+            let results = search_preferences(query, |_| ("ファイル", 0, 0));
+            let result = results
+                .iter()
+                .find(|entry| entry.anchor == "duplicate/archive-folder")
+                .unwrap_or_else(|| panic!("same-name preference missing for {query}"));
+            assert_eq!(result.page, PreferencesPage::DuplicateFiles);
+            assert_eq!(
+                result.title,
+                "同名のフォルダと本 (ZIP/PDF/EPUB/RAR/7z/LZH) がある場合"
+            );
+        }
+    }
 
     fn anchors_in_pages_source(source: &str) -> Vec<&str> {
         source
@@ -1466,6 +1567,10 @@ mod tests {
                             .contains("crate::ui_raw::draw_settings(ui, &mut state.settings)")
                     );
                     RAW_SETTINGS_SOURCE
+                } else if entry.anchor == "file-types/categories" {
+                    assert_eq!(entry.title, PreferencesPage::FileTypeVisibility.label());
+                    assert!(PREFERENCES_SOURCE.contains("ui.heading(state.selected.label())"));
+                    PREFERENCES_SOURCE
                 } else if entry.anchor == "thumbnail/details-name-colors" {
                     assert!(
                         PAGES_SOURCE
@@ -1556,6 +1661,18 @@ mod tests {
     }
 
     #[test]
+    fn effetune_taskbar_search_matches_the_build_flavor() {
+        let result = search_preferences("EffeTune タスクバー", test_tree_position);
+        #[cfg(not(feature = "portable"))]
+        assert_eq!(
+            result.first().map(|entry| entry.anchor),
+            Some("video/effetune-taskbar")
+        );
+        #[cfg(feature = "portable")]
+        assert!(result.is_empty());
+    }
+
+    #[test]
     fn effetune_minimized_search_matches_the_build_flavor() {
         let result = search_preferences("EffeTune 最小化", test_tree_position);
         #[cfg(not(feature = "portable"))]
@@ -1609,9 +1726,31 @@ mod tests {
     }
 
     #[test]
+    fn specified_scale_search_targets_shared_editor_anchor() {
+        for query in [
+            "指定サイズ",
+            "幅 高さ",
+            "％",
+            "px",
+            "5倍",
+            "最大倍率",
+            "20倍",
+        ] {
+            assert!(
+                search_preferences(query, test_tree_position)
+                    .iter()
+                    .any(|entry| {
+                        entry.page == PreferencesPage::SpreadMode
+                            && entry.anchor == "spread/specified-scale"
+                    }),
+                "missing specified-size result for {query}"
+            );
+        }
+    }
+
+    #[test]
     fn raw_settings_search_targets_dedicated_page() {
         for query in [
-            "raw",
             "RAW 現像",
             "同時現像数",
             "RAW 明るさ",
@@ -1624,6 +1763,23 @@ mod tests {
                 entry.page == PreferencesPage::RawDevelop && entry.anchor == "raw-develop/settings"
             }));
         }
+    }
+
+    #[test]
+    fn raw_keyword_includes_development_and_visibility_settings() {
+        let results = search_preferences("raw", test_tree_position);
+        assert!(
+            results
+                .iter()
+                .any(|entry| entry.page == PreferencesPage::RawDevelop
+                    && entry.anchor == "raw-develop/settings")
+        );
+        assert!(
+            results
+                .iter()
+                .any(|entry| entry.page == PreferencesPage::FileTypeVisibility
+                    && entry.anchor == "file-types/categories")
+        );
     }
 
     #[test]

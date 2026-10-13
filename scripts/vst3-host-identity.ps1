@@ -45,17 +45,39 @@ function Get-MivVst3HostSourceHash {
         $relative = $file.FullName.Substring($root.Length + 1).Replace('\', '/')
         if ($relative -eq 'CMakeLists.txt' -or
             ($relative.StartsWith('include/') -and $file.Extension.ToLowerInvariant() -eq '.h') -or
-            ($relative.StartsWith('src/') -and $file.Extension.ToLowerInvariant() -in @('.cpp', '.h')) -or
+            ($relative.StartsWith('src/') -and $file.Extension.ToLowerInvariant() -in @('.cpp', '.h', '.rc')) -or
             ($relative.StartsWith('tests/') -and $file.Extension.ToLowerInvariant() -eq '.cpp')) {
             if ($relative -match '[^\x20-\x7e]') { throw "[vst3-identity] Source path must be ASCII: $relative" }
             $names.Add($relative)
         }
     }
     if (-not $names.Contains('CMakeLists.txt')) { throw '[vst3-identity] CMakeLists.txt is missing' }
+    # The compiled icon, base artwork, and reproducible geometry generator are
+    # all identity inputs. Binary ICOs must retain their exact bytes.
+    $iconNames = @('../../assets/icon.ico', '../../assets/effetune.ico')
+    foreach ($iconName in $iconNames) {
+        $iconPath = [System.IO.Path]::GetFullPath((Join-Path $root $iconName))
+        if (-not (Test-Path -LiteralPath $iconPath -PathType Leaf)) {
+            throw "[vst3-identity] Host icon dependency is missing: $iconPath"
+        }
+        Assert-MivVst3IdentityAncestors -Path $iconPath
+        $names.Add($iconName)
+    }
+    $generatorName = '../../scripts/generate-effetune-icon.py'
+    $generatorPath = [System.IO.Path]::GetFullPath((Join-Path $root $generatorName))
+    if (-not (Test-Path -LiteralPath $generatorPath -PathType Leaf)) {
+        throw "[vst3-identity] Host icon generator is missing: $generatorPath"
+    }
+    Assert-MivVst3IdentityAncestors -Path $generatorPath
+    $names.Add($generatorName)
     $names.Sort([System.StringComparer]::Ordinal)
     $aggregate = New-Object System.Text.StringBuilder
     foreach ($name in $names) {
-        $hash = Get-MivVst3NormalizedFileHash -Path (Join-Path $root $name)
+        $hash = if ($name -in $iconNames) {
+            (Get-FileHash -LiteralPath (Join-Path $root $name) -Algorithm SHA256).Hash.ToLowerInvariant()
+        } else {
+            Get-MivVst3NormalizedFileHash -Path (Join-Path $root $name)
+        }
         [void]$aggregate.Append($name).Append(':').Append($hash).Append("`n")
     }
     $sha = [System.Security.Cryptography.SHA256]::Create()

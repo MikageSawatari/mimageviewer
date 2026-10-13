@@ -33,6 +33,8 @@ int miv_raw_info(void *, MivRawInfo *);
 int miv_raw_preview_info(void *, uint32_t, MivRawPreviewInfo *);
 int miv_raw_preview_extract(void *, uint32_t, MivRawBuffer *);
 int miv_raw_develop(void *, int, int, MivRawProgress, void *);
+// Bound LibRaw's pre-allocation RAW memory checks; UINT64_MAX preserves its default.
+int miv_raw_develop_bounded(void *, int, int, MivRawProgress, void *, uint64_t);
 int miv_raw_image_info(void *, uint32_t *, uint32_t *);
 int miv_raw_copy_rgb(void *, unsigned char *, size_t);
 // After a no-auto-bright develop: 1 = auto threshold 0.001, 3 = linear gain.

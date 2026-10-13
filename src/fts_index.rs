@@ -327,86 +327,51 @@ pub struct FtsIndex {
     index: Index,
     reader: IndexReader,
     fields: Fields,
-    recreated_on_open: bool,
+}
+
+/// Non-destructive startup inspection. The cross-store owner decides when to rebuild.
+pub(crate) enum FtsIndexProbe {
+    Compatible(FtsIndex),
+    RebuildRequired,
 }
 
 impl FtsIndex {
-    /// 既定パス (`%APPDATA%/mimageviewer/fts_index/`) で開く (なければ作成)。
+    /// 既定パスの compatible store だけを開く。再作成は cross-store owner が担当する。
     pub fn open_default() -> tantivy::Result<Self> {
         let dir = crate::data_dir::get().join("fts_index");
-        Self::open_at(&dir)
+        match Self::probe_at(&dir)? {
+            FtsIndexProbe::Compatible(index) => Ok(index),
+            FtsIndexProbe::RebuildRequired => Err(tantivy::TantivyError::InvalidArgument(
+                "Default FTS store requires a coordinated rebuild".to_owned(),
+            )),
+        }
     }
 
-    /// 任意ディレクトリで開く (テスト用)。
-    ///
-    /// §19.8 + tag 統合: 既存ディレクトリに旧スキーマ (per-source フィールド or tags
-    /// フィールドのどちらかが無い) が残っていたらディレクトリごと破棄して新規作成する。
-    /// fts_meta.db 側の `needs_rebuild` と合わせて「起動時は自動でフル再インデックス」を実現する。
+    /// Standalone helper: reuse a compatible index, or create in a fresh directory.
+    /// Existing stale/incomplete stores are never destroyed here. Application startup
+    /// uses the cross-store rebuild owner to reset SQLite before any destructive work.
     pub fn open_at(dir: &Path) -> tantivy::Result<Self> {
         let open = span(Lane::Indexer, Stage::FtsOpen);
         let result = (|| {
-            std::fs::create_dir_all(dir).ok();
-            // 既存インデックスがあれば 1 回だけ open して schema を確認し、そのまま使い回す。
-            // 旧スキーマだったら drop して wipe + create に切り替える。
-            let mmap_dir = tantivy::directory::MmapDirectory::open(dir)?;
-            let existing = if Index::exists(&mmap_dir)? {
-                Some(Index::open_in_dir(dir)?)
-            } else {
-                None
-            };
-            drop(mmap_dir);
-
-            let recreated_on_open = existing
-                .as_ref()
-                .is_none_or(|idx| schema_is_stale(&idx.schema()));
-            let index = match existing {
-                Some(idx) if schema_is_stale(&idx.schema()) => {
-                    drop(idx);
-                    crate::logger::log(format!(
-                        "fts_index: detected old schema at {} — wiping dir for rebuild",
-                        dir.display()
-                    ));
-                    let recreate = span(Lane::Indexer, Stage::FtsSchemaRecreate);
-                    let result = wipe_index_dir(dir)
-                        .and_then(|()| Index::create_in_dir(dir, build_schema()));
-                    recreate.finish(if result.is_ok() {
-                        Outcome::Ok
-                    } else {
-                        Outcome::Error
-                    });
-                    result?
+            match Self::probe_at(dir)? {
+                FtsIndexProbe::Compatible(index) => Ok(index),
+                FtsIndexProbe::RebuildRequired => {
+                    // A standalone test may create a brand-new store; remnants or a
+                    // stale schema require the explicit cross-store rebuild contract.
+                    let fresh = match std::fs::read_dir(dir) {
+                        Ok(mut entries) => entries.next().transpose()?.is_none(),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                        Err(error) => return Err(error.into()),
+                    };
+                    if !fresh {
+                        return Err(tantivy::TantivyError::InvalidArgument(format!(
+                            "FTS store at {} requires a coordinated rebuild",
+                            dir.display()
+                        )));
+                    }
+                    Self::create_at(dir)
                 }
-                Some(idx) => idx,
-                None => {
-                    let create = span(Lane::Indexer, Stage::FtsSchemaRecreate);
-                    let result = Index::create_in_dir(dir, build_schema());
-                    create.finish(if result.is_ok() {
-                        Outcome::Ok
-                    } else {
-                        Outcome::Error
-                    });
-                    result?
-                }
-            };
-            register_tokenizer(&index);
-            let reader_span = span(Lane::Indexer, Stage::FtsReader);
-            let reader_result: tantivy::Result<IndexReader> = index
-                .reader_builder()
-                .reload_policy(tantivy::ReloadPolicy::OnCommitWithDelay)
-                .try_into();
-            reader_span.finish(if reader_result.is_ok() {
-                Outcome::Ok
-            } else {
-                Outcome::Error
-            });
-            let reader = reader_result?;
-            let fields = Fields::from_schema(&index.schema());
-            Ok(Self {
-                index,
-                reader,
-                fields,
-                recreated_on_open,
-            })
+            }
         })();
         open.finish(if result.is_ok() {
             Outcome::Ok
@@ -416,9 +381,60 @@ impl FtsIndex {
         result
     }
 
-    /// 新規作成・schema 再構築を同じ起動の省略判断へ渡す。
-    pub(crate) fn recreated_on_open(&self) -> bool {
-        self.recreated_on_open
+    /// Never creates, wipes or overwrites files. Read/parse failures are errors.
+    pub(crate) fn probe_at(dir: &Path) -> tantivy::Result<FtsIndexProbe> {
+        match std::fs::metadata(dir) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(FtsIndexProbe::RebuildRequired);
+            }
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+        let directory = tantivy::directory::MmapDirectory::open(dir)?;
+        if !Index::exists(&directory)? {
+            return Ok(FtsIndexProbe::RebuildRequired);
+        }
+        let index = Index::open(directory)?;
+        if schema_is_stale(&index.schema()) {
+            // Drop the old index/directory before the owner can wipe it.
+            return Ok(FtsIndexProbe::RebuildRequired);
+        }
+        Self::from_index(index).map(FtsIndexProbe::Compatible)
+    }
+
+    /// Called by the cross-store owner only after durable inventory reset and wipe.
+    /// Standalone callers must provide a fresh directory; no old store is erased here.
+    pub(crate) fn create_at(dir: &Path) -> tantivy::Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        let create = span(Lane::Indexer, Stage::FtsSchemaRecreate);
+        let result = Index::create_in_dir(dir, build_schema()).and_then(Self::from_index);
+        create.finish(if result.is_ok() {
+            Outcome::Ok
+        } else {
+            Outcome::Error
+        });
+        result
+    }
+
+    fn from_index(index: Index) -> tantivy::Result<Self> {
+        register_tokenizer(&index);
+        let reader_span = span(Lane::Indexer, Stage::FtsReader);
+        let reader_result: tantivy::Result<IndexReader> = index
+            .reader_builder()
+            .reload_policy(tantivy::ReloadPolicy::OnCommitWithDelay)
+            .try_into();
+        reader_span.finish(if reader_result.is_ok() {
+            Outcome::Ok
+        } else {
+            Outcome::Error
+        });
+        let reader = reader_result?;
+        let fields = Fields::from_schema(&index.schema());
+        Ok(Self {
+            index,
+            reader,
+            fields,
+        })
     }
 
     pub fn fields(&self) -> &Fields {
@@ -803,26 +819,6 @@ fn schema_is_stale(schema: &Schema) -> bool {
         }
     }
     false
-}
-
-/// ディレクトリ配下のファイルを全削除してから、ディレクトリ自体も再作成する。
-/// Tantivy が内部的に持つ .lock / meta.json / segments を一掃するため。
-fn wipe_index_dir(dir: &Path) -> tantivy::Result<()> {
-    // remove_dir_all → create_dir_all のトランザクションをベストエフォートで実行
-    if let Err(e) = std::fs::remove_dir_all(dir) {
-        // Windows で他プロセスが開いているとアクセス拒否になる。ここでは致命ではない
-        // (下で create_dir_all を試みる; 残骸があっても create_in_dir が上書きする)。
-        crate::logger::log(format!(
-            "fts_index: remove_dir_all({}) failed: {e} (continuing)",
-            dir.display()
-        ));
-    }
-    std::fs::create_dir_all(dir).map_err(|e| {
-        tantivy::TantivyError::SystemError(format!(
-            "fts_index: create_dir_all after wipe failed: {e}"
-        ))
-    })?;
-    Ok(())
 }
 
 fn build_schema() -> Schema {
@@ -1347,9 +1343,9 @@ mod tests {
     // =======================================================================
 
     #[test]
-    fn opening_old_schema_index_dir_wipes_and_rebuilds() {
+    fn probing_old_schema_requires_rebuild_without_mutating_it() {
         // §19.8 マイグレーション回帰: 旧スキーマ (all_text 有 / exif_text 無) のインデックスを
-        // 開いたらディレクトリを wipe して新スキーマで再作成する。
+        // Probe/open must preserve the old index until the cross-store owner resets SQLite.
         use tantivy::schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions};
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("idx");
@@ -1380,8 +1376,16 @@ mod tests {
         assert!(schema_is_stale(&old_idx.schema()));
         drop(old_idx);
 
-        // open_at が wipe → 新スキーマで作り直す
-        let idx = FtsIndex::open_at(&path).unwrap();
+        let original = std::fs::read(path.join("meta.json")).unwrap();
+        assert!(matches!(
+            FtsIndex::probe_at(&path).unwrap(),
+            FtsIndexProbe::RebuildRequired
+        ));
+        assert!(FtsIndex::open_at(&path).is_err());
+        assert_eq!(std::fs::read(path.join("meta.json")).unwrap(), original);
+        // Explicit destructive fixture setup; there is no SQLite inventory in this unit test.
+        std::fs::remove_dir_all(&path).unwrap();
+        let idx = FtsIndex::create_at(&path).unwrap();
         // 新スキーマのフィールドが全部あること
         let s = idx.index().schema();
         assert!(s.get_field("exif_text").is_ok());
@@ -1395,6 +1399,39 @@ mod tests {
         // 新規ディレクトリでは wipe パスを通らず、普通に create される。
         let dir = TempDir::new().unwrap();
         let _idx = FtsIndex::open_at(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn probe_missing_store_does_not_create_directory_or_replace_remnants() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("missing");
+        assert!(matches!(
+            FtsIndex::probe_at(&path).unwrap(),
+            FtsIndexProbe::RebuildRequired
+        ));
+        assert!(!path.exists());
+        std::fs::create_dir(&path).unwrap();
+        let sentinel = path.join("segment-remnant");
+        std::fs::write(&sentinel, b"preserved").unwrap();
+        assert!(matches!(
+            FtsIndex::probe_at(&path).unwrap(),
+            FtsIndexProbe::RebuildRequired
+        ));
+        assert!(FtsIndex::open_at(&path).is_err());
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserved");
+        assert!(!path.join("meta.json").exists());
+    }
+
+    #[test]
+    fn probe_corrupt_metadata_returns_error_and_preserves_store() {
+        for name in ["meta.json", ".managed.json"] {
+            let dir = TempDir::new().unwrap();
+            drop(FtsIndex::open_at(dir.path()).unwrap());
+            let corrupt = dir.path().join(name);
+            std::fs::write(&corrupt, b"{broken-json").unwrap();
+            assert!(FtsIndex::probe_at(dir.path()).is_err(), "{name}");
+            assert_eq!(std::fs::read(&corrupt).unwrap(), b"{broken-json");
+        }
     }
 
     /// Codex P2 回帰: v4 schema (per-source field 名は同じ・STORED 無し) で作られた
@@ -1441,8 +1478,14 @@ mod tests {
         );
         drop(v4_idx);
 
-        // FtsIndex::open_at が wipe → 新 schema で再作成し、STORED 付き
-        let idx = FtsIndex::open_at(&path).unwrap();
+        assert!(matches!(
+            FtsIndex::probe_at(&path).unwrap(),
+            FtsIndexProbe::RebuildRequired
+        ));
+        assert!(FtsIndex::open_at(&path).is_err());
+        // Explicit destructive fixture setup; no paired SQLite inventory exists here.
+        std::fs::remove_dir_all(&path).unwrap();
+        let idx = FtsIndex::create_at(&path).unwrap();
         let s = idx.index().schema();
         // 再作成後の schema は STORED 付きなので stale ではない
         assert!(!schema_is_stale(&s));

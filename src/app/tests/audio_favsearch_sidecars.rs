@@ -55,8 +55,10 @@ fn canceled_favorite_search_does_not_publish_prepared_sources() {
 }
 
 fn finish_favorite_search(app: &mut App) {
+    let ctx = egui::Context::default();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while app.favsearch_pending.is_some() {
+    while app.favsearch_pending.is_some() || app.sidecar_restore_active() {
+        app.poll_sidecar_restore(&ctx);
         app.poll_favsearch();
         assert!(std::time::Instant::now() < deadline);
         std::thread::yield_now();

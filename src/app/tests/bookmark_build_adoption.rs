@@ -11,7 +11,18 @@ fn audio_sidecar(parent: &std::path::Path, name: &str) -> (PathBuf, PathBuf) {
 
 /// Hold a result produced by the real DB/sidecar worker until the destination is installed.
 /// Replacing only its receiver retains the pending request's production ownership evidence.
+fn drain_bookmark_identity_preparation(app: &mut App) {
+    // The feature's identity preparation gates adoption; model the normal frame polls.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.sidecar_restore_active() {
+        app.poll_sidecar_restore(&egui::Context::default());
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+}
+
 fn queue_finished_bookmark_build(app: &mut App) -> Arc<AtomicBool> {
+    drain_bookmark_identity_preparation(app);
     let pending = app
         .bookmark_browser_pending
         .as_mut()
@@ -114,6 +125,7 @@ fn bookmark_build_reading_adoption_retires_worker_and_preserves_audio_sidecar() 
         .reading_history_sources_pending
         .contains_key(&app.projected_viewer_context_id())
     {
+        app.poll_sidecar_restore(&ctx);
         app.poll_reading_history_thumbnail_sources(&ctx);
         assert!(
             std::time::Instant::now() < deadline,
@@ -191,6 +203,7 @@ fn bookmark_build_completed_refresh_survives_same_bookmark_sort_and_hydrates_sou
     assert!(!cancel.load(Ordering::Relaxed));
     let key = crate::path_key::normalize_keep_drive(&old_audio);
     assert_eq!(app.video_thumb_overrides.get(&key), Some(&old_cover));
+    drain_bookmark_identity_preparation(&mut app);
     app.poll_bookmark_browser(&ctx);
     assert!(app.bookmark_browser_pending.is_none());
     assert!(app.items_are_bookmark_view);
@@ -280,4 +293,70 @@ fn bookmark_build_detached_item_install_and_poll_preserve_main_pending() {
     assert!(app.items_are_bookmark_view);
     assert_eq!(app.bookmark_browser_rows.len(), 1);
     assert!(!app.video_thumb_overrides.is_empty());
+}
+
+#[test]
+fn bookmark_build_visibility_preserves_audio_source_and_registered_count() {
+    let mut app = phase_c_support::setup_app();
+    app.active_quick_folder_slot = None;
+    app.settings.skip_image_if_video_exists = true;
+    app.settings.video_thumb_use_sidecar_image = true;
+    app.settings
+        .file_type_visibility
+        .excluded_extensions
+        .insert("png".into());
+    let (audio, cover) = audio_sidecar(&app.tmp.path().join("visible-audio"), "song");
+    app.video_bookmark_db
+        .as_ref()
+        .unwrap()
+        .add(&audio, 12.0, Some("bookmark"), &[])
+        .unwrap();
+    app.open_bookmark_browser();
+    queue_finished_bookmark_build(&mut app);
+    app.poll_bookmark_browser(&egui::Context::default());
+    assert!(
+        matches!(&app.items[..], [GridItem::Audio(path)] if crate::path_key::eq_keep_drive(path, &audio))
+    );
+    assert_eq!(app.bookmark_view_registered_total, 1);
+    assert!(
+        app.video_thumb_overrides
+            .get(&crate::path_key::normalize_keep_drive(&audio))
+            .is_some_and(|path| crate::path_key::eq_keep_drive(path, &cover))
+    );
+
+    drain_bookmark_identity_preparation(&mut app);
+    app.settings
+        .file_type_visibility
+        .excluded_extensions
+        .insert("flac".into());
+    app.apply_file_type_visibility_change(&egui::Context::default());
+    let pending = app
+        .bookmark_browser_pending
+        .as_mut()
+        .expect("new owner for new policy");
+    let result = pending
+        .rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.registered_total, 1);
+    assert!(result.rows.is_empty());
+    assert!(result.video_thumb_overrides.is_empty());
+    let (tx, rx) = mpsc::channel();
+    tx.send(Ok(result)).unwrap();
+    pending.rx = rx;
+    drain_bookmark_identity_preparation(&mut app);
+    app.poll_bookmark_browser(&egui::Context::default());
+    assert!(app.items.is_empty());
+    assert_eq!(app.bookmark_view_registered_total, 1);
+    assert!(app.video_thumb_overrides.is_empty());
+    assert_eq!(
+        app.video_bookmark_db
+            .as_ref()
+            .unwrap()
+            .list_all_global()
+            .unwrap()
+            .len(),
+        1
+    );
 }

@@ -6731,7 +6731,7 @@ impl ScanContext<'_> {
             password,
             Some(Arc::clone(self.cancel)),
             crate::pdf_loader::JobPriority::Normal,
-            0,
+            crate::pdf_loader::PdfRenderValidity::Unscoped,
             crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
         )
         .map_err(|error| error.to_string())?;

@@ -11,8 +11,9 @@ use std::sync::atomic::Ordering;
 use eframe::egui;
 
 use crate::app::{
-    App, FacetField, GridClickPairingState, GridClickSelectionAnchor, GridScrollIntent,
-    LazyColumnState, QuickFolderSlotId, QuickFolderSwitchTarget,
+    App, FacetField, GridClickPairingState, GridClickSelectionAnchor, GridCursorMove,
+    GridScrollIntent, LazyColumnState, QuickFolderSlotId, QuickFolderSwitchTarget,
+    apply_grid_cursor_move, grid_selection_anchor,
 };
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::keymap::{KeyAction, Keymap, MenuCommandId, TopMenuId, resolve_menu_layout};
@@ -24,6 +25,40 @@ use crate::settings::{
 };
 use crate::tag_view::{TagViewMenuChoice, tag_view_menu_sections};
 use crate::ui_details_icon::{DetailsIconKind, details_icon_kind, draw_details_preview_icon};
+
+#[cfg(windows)]
+fn effetune_toolbar_button(
+    ui: &mut egui::Ui,
+    active: bool,
+    available: bool,
+    drag_enabled: bool,
+    tooltip: &str,
+) -> egui::Response {
+    ui.add_enabled(
+        available,
+        egui::Button::new("音響調整")
+            .selected(active)
+            .sense(if drag_enabled {
+                egui::Sense::click_and_drag()
+            } else {
+                egui::Sense::click()
+            }),
+    )
+    .on_hover_text(tooltip)
+    .on_disabled_hover_text(tooltip)
+}
+
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn draw_effetune_show_only_snapshot_fixture(ui: &mut egui::Ui, active: bool) {
+    let effective = if active {
+        crate::effetune::EffectiveState::Effective
+    } else {
+        crate::effetune::EffectiveState::Inert
+    };
+    let tooltip = crate::effetune::running_gui_tooltip(Some(effective));
+    let _ = effetune_toolbar_button(ui, active, true, false, &tooltip);
+}
 // open_external_player はグリッドからは使わなくなった (動画はフルスクリーン化 →
 // インライン再生)。フォルダ系は別途同モジュールから直接呼んでいる箇所がある。
 
@@ -307,10 +342,10 @@ fn normalize_folder_bar_input_path(path: &Path) -> PathBuf {
     if trimmed.len() == 2 {
         let bytes = trimmed.as_bytes();
         if bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-            return PathBuf::from(format!("{}\\", trimmed));
+            return crate::path_key::normalize_input_path(Path::new(&format!("{}\\", trimmed)));
         }
     }
-    path.to_path_buf()
+    crate::path_key::normalize_input_path(path)
 }
 
 fn checked_selection_overlay_label(checked_count: usize) -> Option<String> {
@@ -1124,6 +1159,10 @@ fn filtered_count_label(total: usize, visible: usize) -> String {
     format!("{visible} / {total} 件")
 }
 
+fn registered_count_label(registered_total: usize, visible: usize) -> String {
+    format!("表示{visible} / 登録{registered_total}")
+}
+
 fn facet_menu_label(base: &str, active: usize) -> String {
     if active == 0 {
         base.to_string()
@@ -1334,7 +1373,8 @@ fn show_virtualized_facet_choice_rows(
     }
 
     let spacing = ui.spacing();
-    let row_h = spacing.interact_size.y.max(22.0) + spacing.item_spacing.y;
+    // show_rows adds item_spacing itself; the drawing allocates only row_h.
+    let row_h = spacing.interact_size.y.max(22.0);
     let body_height = facet_choice_body_height(ui, choice_count);
     ui.allocate_ui_with_layout(
         egui::vec2(width, body_height),
@@ -1342,7 +1382,7 @@ fn show_virtualized_facet_choice_rows(
         |ui| {
             ui.set_min_height(body_height);
             ui.set_width(width);
-            egui::ScrollArea::vertical()
+            let output = egui::ScrollArea::vertical()
                 .max_height(body_height)
                 .auto_shrink([false, false])
                 .show_rows(ui, row_h, choice_count, |ui, row_range| {
@@ -1351,6 +1391,15 @@ fn show_virtualized_facet_choice_rows(
                         add_row(ui, idx);
                     }
                 });
+            #[cfg(test)]
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::new("facet_choice_scroll_layout"),
+                    (output.inner_rect, output.content_size, output.state.offset),
+                )
+            });
+            #[cfg(not(test))]
+            let _ = output;
         },
     );
 }
@@ -1479,11 +1528,9 @@ mod sticky_settings_menu_header_tests {
 
     #[test]
     fn header_width_does_not_follow_available_screen_width() {
-        use egui_kittest::Harness;
-
         let measured_width = Arc::new(Mutex::new(None));
         let measured_width_in_ui = measured_width.clone();
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(800.0, 180.0))
             .build(move |ctx| {
                 let area = egui::Area::new(egui::Id::new("sticky_settings_menu_header_test"))
@@ -1509,11 +1556,11 @@ mod sticky_settings_menu_header_tests {
 
     #[test]
     fn sticky_menu_keeps_checkbox_clicks_open_and_closes_explicitly() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
         let dedicated = Arc::new(Mutex::new(false));
         let dedicated_in_ui = Arc::clone(&dedicated);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(640.0, 360.0))
             .build(move |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
@@ -1598,6 +1645,35 @@ fn omitted_entries_chip_label(counts: crate::app::OmittedFolderEntryCounts) -> O
     (primary > 0).then(|| format!("非表示 {primary} 件"))
 }
 
+fn file_type_visibility_button(ui: &mut egui::Ui, active: bool) -> bool {
+    ui.selectable_label(
+        active,
+        if active {
+            "ファイル種類 (適用中)"
+        } else {
+            "ファイル種類"
+        },
+    )
+    .on_hover_text("環境設定の「表示するファイル種類」を開きます")
+    .clicked()
+}
+
+#[doc(hidden)]
+pub fn draw_file_type_visibility_status_snapshot_fixture(ui: &mut egui::Ui) {
+    let _ = file_type_visibility_button(ui, true);
+    ui.label(registered_count_label(12, 7));
+    let _ = draw_omitted_entries_chip(
+        ui,
+        crate::app::OmittedFolderEntryCounts {
+            same_name: 3,
+            hidden: 2,
+            file_type: 4,
+            unsupported: 1,
+            ..Default::default()
+        },
+    );
+}
+
 /// 内訳の区切りは `/` ではなく `、` を使う。
 ///
 /// 書庫の分類名が `RAR / 7z / LZH` を含むので、区切りも `/` にすると
@@ -1617,6 +1693,9 @@ fn omitted_entries_breakdown_label(counts: crate::app::OmittedFolderEntryCounts)
     }
     if counts.ignored_epub > 0 {
         parts.push(format!("EPUB（設定で無視） {}", counts.ignored_epub));
+    }
+    if counts.file_type > 0 {
+        parts.push(format!("ファイル種類 {}", counts.file_type));
     }
     parts.push(format!("対象外 {}", counts.unsupported));
     if counts.system > 0 {
@@ -1651,12 +1730,19 @@ fn draw_omitted_entries_chip(
             || counts.ignored_archive > 0
             || counts.ignored_epub > 0
             || counts.hidden > 0
+            || counts.file_type > 0
         {
             ui.separator();
         }
         if counts.same_name > 0 && ui.link("同名ファイル設定を開く").clicked() {
             open_preferences =
                 Some(crate::ui_dialogs::preferences::PreferencesOpenRequest::DUPLICATE_FILES);
+            ui.close();
+        }
+        if counts.file_type > 0 && ui.link("表示するファイル種類を設定する").clicked()
+        {
+            open_preferences =
+                Some(crate::ui_dialogs::preferences::PreferencesOpenRequest::FILE_TYPE_VISIBILITY);
             ui.close();
         }
         if counts.ignored_archive > 0 {
@@ -5626,20 +5712,6 @@ fn grid_selection_item_is_checkable(items: &[GridItem], allow_folders: bool, idx
     })
 }
 
-fn grid_selection_anchor(
-    anchor: Option<GridClickSelectionAnchor>,
-    items_generation: u64,
-    selected: Option<usize>,
-    display_order: &[usize],
-    clicked_idx: usize,
-) -> usize {
-    anchor
-        .and_then(|anchor| anchor.index_for_generation(items_generation))
-        .filter(|idx| display_order.contains(idx))
-        .or_else(|| selected.filter(|idx| display_order.contains(idx)))
-        .unwrap_or(clicked_idx)
-}
-
 fn add_grid_selection_range(
     checked: &mut HashSet<usize>,
     display_order: &[usize],
@@ -5724,9 +5796,9 @@ fn grid_item_archive_key(item: &GridItem) -> Option<String> {
 /// サムネイル / 詳細表示に共通のクリック選択状態遷移。
 ///
 /// 単一選択は `selected`、複数選択は `checked` で表す既存モデルを維持する。
-/// `anchor` は Shift+クリックの起点で、通常 / Ctrl クリック時だけ更新する。
+/// Cursor/anchor updates go through the shared Move/Extend transition.
 #[allow(clippy::too_many_arguments)]
-fn apply_grid_click_selection(
+pub(crate) fn apply_grid_click_selection(
     mode: GridClickSelectionMode,
     selected: &mut Option<usize>,
     anchor: &mut Option<GridClickSelectionAnchor>,
@@ -5742,9 +5814,6 @@ fn apply_grid_click_selection(
     let mode = mode.normalized();
     let plain_click_clears_checks = grid_plain_click_clears_checks(mode);
     if shift {
-        let previous_anchor_is_valid = anchor
-            .and_then(|anchor| anchor.index_for_generation(items_generation))
-            .is_some_and(|idx| display_order.contains(&idx));
         let range_anchor = grid_selection_anchor(
             *anchor,
             items_generation,
@@ -5763,13 +5832,15 @@ fn apply_grid_click_selection(
             items,
             allow_folders,
         );
-        *selected = Some(clicked_idx);
-        if !previous_anchor_is_valid {
-            *anchor = Some(GridClickSelectionAnchor::new(
-                range_anchor,
-                items_generation,
-            ));
-        }
+        apply_grid_cursor_move(
+            selected,
+            anchor,
+            items_generation,
+            Some(clicked_idx),
+            GridCursorMove::Extend {
+                anchor: range_anchor,
+            },
+        );
         return;
     }
 
@@ -5777,8 +5848,13 @@ fn apply_grid_click_selection(
         if plain_click_clears_checks {
             checked.clear();
         }
-        *selected = Some(clicked_idx);
-        *anchor = Some(GridClickSelectionAnchor::new(clicked_idx, items_generation));
+        apply_grid_cursor_move(
+            selected,
+            anchor,
+            items_generation,
+            Some(clicked_idx),
+            GridCursorMove::Move,
+        );
         return;
     }
 
@@ -5796,8 +5872,13 @@ fn apply_grid_click_selection(
         {
             checked.insert(clicked_idx);
         }
-        *selected = Some(clicked_idx);
-        *anchor = Some(GridClickSelectionAnchor::new(clicked_idx, items_generation));
+        apply_grid_cursor_move(
+            selected,
+            anchor,
+            items_generation,
+            Some(clicked_idx),
+            GridCursorMove::Move,
+        );
         return;
     }
 
@@ -5805,12 +5886,22 @@ fn apply_grid_click_selection(
     // 混在できないため、そのセルだけの単一選択として扱う。
     if !grid_selection_item_is_checkable(items, allow_folders, clicked_idx) {
         if checked.is_empty() && *selected == Some(clicked_idx) {
-            *selected = None;
-            *anchor = None;
+            apply_grid_cursor_move(
+                selected,
+                anchor,
+                items_generation,
+                None,
+                GridCursorMove::Move,
+            );
         } else {
             checked.clear();
-            *selected = Some(clicked_idx);
-            *anchor = Some(GridClickSelectionAnchor::new(clicked_idx, items_generation));
+            apply_grid_cursor_move(
+                selected,
+                anchor,
+                items_generation,
+                Some(clicked_idx),
+                GridCursorMove::Move,
+            );
         }
         return;
     }
@@ -5818,8 +5909,13 @@ fn apply_grid_click_selection(
     if checked.is_empty() {
         match *selected {
             Some(previous) if previous == clicked_idx => {
-                *selected = None;
-                *anchor = None;
+                apply_grid_cursor_move(
+                    selected,
+                    anchor,
+                    items_generation,
+                    None,
+                    GridCursorMove::Move,
+                );
                 return;
             }
             Some(previous)
@@ -5830,8 +5926,13 @@ fn apply_grid_click_selection(
                 checked.insert(clicked_idx);
             }
             _ => {
-                *selected = Some(clicked_idx);
-                *anchor = Some(GridClickSelectionAnchor::new(clicked_idx, items_generation));
+                apply_grid_cursor_move(
+                    selected,
+                    anchor,
+                    items_generation,
+                    Some(clicked_idx),
+                    GridCursorMove::Move,
+                );
                 return;
             }
         }
@@ -5839,26 +5940,31 @@ fn apply_grid_click_selection(
         checked.insert(clicked_idx);
     }
 
-    *anchor = Some(GridClickSelectionAnchor::new(clicked_idx, items_generation));
-    match checked.len() {
-        0 => {
-            *selected = None;
-        }
+    let target = match checked.len() {
+        0 => None,
         1 => {
-            *selected = checked.iter().copied().next();
+            let target = checked.iter().copied().next();
             checked.clear();
+            target
         }
         _ => {
-            *selected = if checked.contains(&clicked_idx) {
+            if checked.contains(&clicked_idx) {
                 Some(clicked_idx)
             } else {
                 display_order
                     .iter()
                     .copied()
                     .find(|idx| checked.contains(idx))
-            };
+            }
         }
-    }
+    };
+    apply_grid_cursor_move(
+        selected,
+        anchor,
+        items_generation,
+        target,
+        GridCursorMove::Move,
+    );
 }
 
 fn apply_grid_secondary_selection(
@@ -5872,8 +5978,13 @@ fn apply_grid_secondary_selection(
     if mode.normalized() == GridClickSelectionMode::Explorer && !checked.contains(&clicked_idx) {
         checked.clear();
     }
-    *selected = Some(clicked_idx);
-    *anchor = Some(GridClickSelectionAnchor::new(clicked_idx, items_generation));
+    apply_grid_cursor_move(
+        selected,
+        anchor,
+        items_generation,
+        Some(clicked_idx),
+        GridCursorMove::Move,
+    );
 }
 
 fn clear_grid_selection_for_background_click(
@@ -5886,8 +5997,7 @@ fn clear_grid_selection_for_background_click(
         return false;
     }
     let changed = selected.is_some() || anchor.is_some() || !checked.is_empty();
-    *selected = None;
-    *anchor = None;
+    apply_grid_cursor_move(selected, anchor, 0, None, GridCursorMove::Move);
     checked.clear();
     changed
 }
@@ -5897,6 +6007,8 @@ fn clear_grid_selection_for_background_click(
 /// the selection policy explicit and leaves checked multi-selection untouched.
 fn apply_grid_right_drag_start_selection(
     selected: &mut Option<usize>,
+    anchor: &mut Option<GridClickSelectionAnchor>,
+    items_generation: u64,
     enabled: bool,
     mode: &crate::ring_shortcut::RightDragMode,
     target_idx: Option<usize>,
@@ -5913,8 +6025,121 @@ fn apply_grid_right_drag_start_selection(
     let Some(idx) = target_idx else {
         return false;
     };
-    *selected = Some(idx);
+    apply_grid_cursor_move(
+        selected,
+        anchor,
+        items_generation,
+        Some(idx),
+        GridCursorMove::Move,
+    );
     true
+}
+
+impl App {
+    /// Pure selection policy helpers calculate with local copies. Only the live
+    /// cursor owner publishes the result, after invalidating return authority.
+    fn apply_explicit_grid_selection(
+        &mut self,
+        update: impl FnOnce(
+            &mut Option<usize>,
+            &mut Option<GridClickSelectionAnchor>,
+            &mut HashSet<usize>,
+        ),
+    ) {
+        let mut target = self.selected;
+        let mut anchor = self.grid_click_selection_anchor;
+        update(&mut target, &mut anchor, &mut self.checked);
+        let intent = if target == self.selected && anchor == self.grid_click_selection_anchor {
+            crate::app::GridCursorIntent::ExplicitKeep
+        } else {
+            crate::app::GridCursorIntent::Explicit(
+                match anchor.and_then(|anchor| anchor.index_for_generation(self.items_generation)) {
+                    Some(anchor) if Some(anchor) != target => GridCursorMove::Extend { anchor },
+                    _ => GridCursorMove::Move,
+                },
+            )
+        };
+        self.move_grid_cursor(target, intent);
+    }
+
+    fn select_grid_cell(
+        &mut self,
+        idx: usize,
+        ctrl: bool,
+        shift: bool,
+        display_order: &[usize],
+        allow_folders: bool,
+    ) {
+        let mode = self.settings.grid_click_selection_mode;
+        let generation = self.items_generation;
+        // Policy only needs checkability; borrow items separately from the live cursor.
+        let mut target = self.selected;
+        let mut anchor = self.grid_click_selection_anchor;
+        apply_grid_click_selection(
+            mode,
+            &mut target,
+            &mut anchor,
+            generation,
+            &mut self.checked,
+            display_order,
+            &self.items,
+            allow_folders,
+            idx,
+            ctrl,
+            shift,
+        );
+        let movement = if shift {
+            GridCursorMove::Extend {
+                anchor: anchor
+                    .and_then(|anchor| anchor.index_for_generation(generation))
+                    .unwrap_or(idx),
+            }
+        } else {
+            GridCursorMove::Move
+        };
+        self.move_grid_cursor(target, crate::app::GridCursorIntent::Explicit(movement));
+    }
+
+    fn select_grid_secondary_cell(&mut self, idx: usize) {
+        let mode = self.settings.grid_click_selection_mode;
+        let generation = self.items_generation;
+        self.apply_explicit_grid_selection(|selected, anchor, checked| {
+            apply_grid_secondary_selection(mode, selected, anchor, generation, checked, idx);
+        });
+    }
+
+    fn clear_grid_background_selection(&mut self) {
+        let mode = self.settings.grid_click_selection_mode;
+        self.apply_explicit_grid_selection(|selected, anchor, checked| {
+            clear_grid_selection_for_background_click(mode, selected, anchor, checked);
+        });
+    }
+
+    fn select_grid_right_drag_start(
+        &mut self,
+        mode: &crate::ring_shortcut::RightDragMode,
+        idx: Option<usize>,
+    ) -> bool {
+        let mut target = self.selected;
+        let mut anchor = self.grid_click_selection_anchor;
+        if !apply_grid_right_drag_start_selection(
+            &mut target,
+            &mut anchor,
+            self.items_generation,
+            self.settings
+                .ring_shortcuts
+                .select_grid_item_on_right_drag_start,
+            mode,
+            idx,
+        ) {
+            return false;
+        }
+        self.move_grid_cursor(
+            target,
+            crate::app::GridCursorIntent::Explicit(GridCursorMove::Move),
+        );
+        true
+    }
 }
 
 #[cfg(test)]
@@ -5928,6 +6153,8 @@ mod grid_right_drag_start_selection_tests {
             let mut selected = Some(1);
             assert!(apply_grid_right_drag_start_selection(
                 &mut selected,
+                &mut None,
+                7,
                 true,
                 &mode,
                 Some(4)
@@ -5937,6 +6164,8 @@ mod grid_right_drag_start_selection_tests {
             selected = Some(1);
             assert!(!apply_grid_right_drag_start_selection(
                 &mut selected,
+                &mut None,
+                7,
                 false,
                 &mode,
                 Some(4)
@@ -5950,6 +6179,8 @@ mod grid_right_drag_start_selection_tests {
         let mut selected = Some(2);
         assert!(!apply_grid_right_drag_start_selection(
             &mut selected,
+            &mut None,
+            7,
             true,
             &RightDragMode::Disabled,
             Some(5)
@@ -5958,6 +6189,8 @@ mod grid_right_drag_start_selection_tests {
 
         assert!(!apply_grid_right_drag_start_selection(
             &mut selected,
+            &mut None,
+            7,
             true,
             &RightDragMode::MouseGesture,
             None
@@ -6147,11 +6380,9 @@ mod details_column_context_menu_layout_tests {
 
     #[test]
     fn tall_screen_shows_the_full_menu_without_scrolling() {
-        use egui_kittest::Harness;
-
         let measured = Arc::new(Mutex::new(None));
         let measured_in_ui = Arc::clone(&measured);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_pixels_per_point(1.25)
             .with_size(egui::vec2(900.0, 900.0))
             .build(move |ctx| {
@@ -6195,11 +6426,11 @@ mod details_column_context_menu_layout_tests {
 
     #[test]
     fn short_screen_bounds_the_menu_and_keeps_it_scrollable() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
         let measured = Arc::new(Mutex::new(None));
         let measured_in_ui = Arc::clone(&measured);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(900.0, 200.0))
             .build(move |ctx| {
                 let area = egui::Area::new(egui::Id::new(0xD37A_12_u64))
@@ -6236,11 +6467,9 @@ mod details_column_context_menu_layout_tests {
 
     #[test]
     fn menu_width_is_bounded_and_columns_are_side_by_side() {
-        use egui_kittest::Harness;
-
         let measured = Arc::new(Mutex::new(None));
         let measured_in_ui = Arc::clone(&measured);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1200.0, 700.0))
             .build(move |ctx| {
                 let area = egui::Area::new(egui::Id::new("details_column_menu_layout_test"))
@@ -6403,7 +6632,7 @@ fn details_header_sort_hover_text(
 #[cfg(test)]
 mod collection_order_mode_menu_tests {
     use super::*;
-    use egui_kittest::{Harness, kittest::Queryable};
+    use egui_kittest::kittest::Queryable;
 
     #[test]
     fn reorder_disabled_message_matches_root_mode_and_admission_state() {
@@ -6494,7 +6723,7 @@ mod collection_order_mode_menu_tests {
 
         let app = std::rc::Rc::new(std::cell::RefCell::new(app));
         let render_app = std::rc::Rc::clone(&app);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(520.0, 240.0))
             .build(move |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
@@ -6557,10 +6786,7 @@ mod collection_order_mode_menu_tests {
 #[cfg(test)]
 mod fixed_sort_control_tests {
     use super::*;
-    use egui_kittest::{
-        Harness,
-        kittest::{NodeT, Queryable},
-    };
+    use egui_kittest::kittest::{NodeT, Queryable};
     use std::{
         cell::{Cell, RefCell},
         rc::Rc,
@@ -6634,7 +6860,7 @@ mod fixed_sort_control_tests {
             let render_app = Rc::clone(&app);
             let fonts_set = Cell::new(false);
             SORT_CONTROL_TEST_RELOADS.with(|count| count.set(0));
-            let mut harness = Harness::builder()
+            let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1700.0, 500.0))
                 .build(move |ctx| {
                     if !fonts_set.replace(true) {
@@ -6730,7 +6956,7 @@ mod fixed_sort_control_tests {
         let app = Rc::new(RefCell::new(app));
         let render_app = Rc::clone(&app);
         let fonts_set = Cell::new(false);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1280.0, 800.0))
             .build(move |ctx| {
                 if !fonts_set.replace(true) {
@@ -6897,7 +7123,7 @@ mod fixed_sort_control_tests {
         let app = Rc::new(RefCell::new(app));
         let render_app = Rc::clone(&app);
         let fonts_set = Cell::new(false);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1700.0, 500.0))
             .build(move |ctx| {
                 if !fonts_set.replace(true) {
@@ -6940,7 +7166,7 @@ mod fixed_sort_control_tests {
         let render_app = Rc::clone(&app);
         let fonts_set = Cell::new(false);
         SORT_CONTROL_TEST_RESPONSES.with(|responses| responses.borrow_mut().clear());
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1500.0, 500.0))
             .build(move |ctx| {
                 if !fonts_set.replace(true) {
@@ -7158,6 +7384,7 @@ impl App {
         let help_about_menu_label = self.keymap.menu_command_label(MenuCommandId::HelpAbout);
 
         egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
+            if self.composition_editor_modal_active() { ui.disable(); }
             egui::MenuBar::new().ui(ui, |ui| {
                 let mut top_menu_responses = Vec::with_capacity(9);
 
@@ -7260,6 +7487,13 @@ impl App {
                                                 self.request_application_quit(ctx);
                                             }
                                         }
+                                        MenuCommandId::GlobalEverythingSearch => {
+                                            let label = self.keymap.menu_command_label(MenuCommandId::GlobalEverythingSearch);
+                                            if ui.add_enabled(self.everything_search_entry_allowed(), egui::Button::new(label)).clicked() {
+                                                self.open_everything_search();
+                                                ui.close();
+                                            }
+                                        }
                                         _ => {}
                                     }
                                 }
@@ -7331,6 +7565,13 @@ impl App {
                                             if ui.button(&metadata_search_menu_label).clicked() {
                                                 // 相互排他は toggle_global_search 内で
                                                 self.toggle_global_search();
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::GlobalEverythingSearch => {
+                                            let label = self.keymap.menu_command_label(MenuCommandId::GlobalEverythingSearch);
+                                            if ui.add_enabled(self.everything_search_entry_allowed(), egui::Button::new(label)).clicked() {
+                                                self.open_everything_search();
                                                 ui.close();
                                             }
                                         }
@@ -7444,6 +7685,17 @@ impl App {
                             let response = ui.menu_button(TopMenuId::Books.label(), |ui| {
                                 let active_name = self.active_book_name();
                                 ui.label(format!("追加先の本: {active_name}"));
+                                // Current reader scope, independent of selection and page
+                                // count: an empty/all-hidden book still has this entrance.
+                                let can_edit_composition = self.composition_editor_available();
+                                if ui.add_enabled(can_edit_composition, egui::Button::new("本の構成を編集"))
+                                    .on_disabled_hover_text("現在開いている書庫・PDF・EPUB の本で使えます")
+                                    .clicked()
+                                {
+                                    self.start_local_composition_editor(ctx);
+                                    ui.close();
+                                }
+                                ui.separator();
                                 let has_selection = self.grid_item_input_allowed()
                                     && (self.selected.is_some() || !self.checked.is_empty());
                                 for &command in books_menu_commands {
@@ -9261,12 +9513,16 @@ impl App {
                     |ui| {
                         ui.set_min_width(scroll_width);
                         ui.set_min_height(scroll_height);
-                        let scroll_output = egui::ScrollArea::vertical()
-                            .id_salt("book_reorder_thumb_scroll")
-                            .vertical_scroll_offset(state.scroll_offset_y)
-                            .max_height(scroll_height)
-                            .auto_shrink([false, false])
-                            .show_rows(ui, row_height, rows.max(1), |ui, row_range| {
+                        let scroll_output = crate::ui_helpers::show_fixed_slot_rows(
+                            ui,
+                            egui::ScrollArea::vertical()
+                                .id_salt("book_reorder_thumb_scroll")
+                                .vertical_scroll_offset(state.scroll_offset_y)
+                                .max_height(scroll_height)
+                                .auto_shrink([false, false]),
+                            row_height,
+                            rows.max(1),
+                            |ui, row_range| {
                                 egui::Grid::new("book_reorder_thumb_grid")
                                     .num_columns(cols)
                                     .spacing(egui::vec2(gap, gap))
@@ -9482,7 +9738,8 @@ impl App {
                                             ui.end_row();
                                         }
                                     });
-                            });
+                            },
+                        );
                         state.scroll_offset_y = scroll_output.state.offset.y;
                         if !busy
                             && !pointer_released
@@ -9989,6 +10246,7 @@ impl App {
             Vec::new();
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+            if self.composition_editor_modal_active() { ui.disable(); }
             if toolbar_section_order.first() != Some(&crate::settings::ToolbarSectionId::Folder) {
                 ui.add_space(2.0);
             }
@@ -10167,29 +10425,12 @@ impl App {
                 TS::EffeTune => {
                     #[cfg(windows)]
                     {
-                        let active = matches!(
-                            self.effetune.runtime,
-                            crate::effetune::EffetuneRuntime::Running { .. }
-                        ) && matches!(
-                            self.effetune.effective_state(),
-                            Some(crate::effetune::EffectiveState::Effective)
-                        );
+                        let active = self.effetune_toolbar_active();
                         let available = self.effetune_toolbar_available();
-                        let resp = ui
-                            .add_enabled(
-                                available,
-                                egui::Button::selectable(active, "音響調整").sense(
-                                    if drag_enabled {
-                                        egui::Sense::click_and_drag()
-                                    } else {
-                                        egui::Sense::click()
-                                    },
-                                ),
-                            )
-                            .on_hover_text(format!("{}\n{lead_hint}", self.effetune_toolbar_tooltip()))
-                            .on_disabled_hover_text(format!("{}\n{lead_hint}", self.effetune_toolbar_tooltip()));
+                        let tooltip = format!("{}\n{lead_hint}", self.effetune_toolbar_tooltip());
+                        let resp = effetune_toolbar_button(ui, active, available, drag_enabled, &tooltip);
                         if resp.clicked() {
-                            self.effetune_toolbar_click(resp.clicked_by(egui::PointerButton::Primary));
+                            self.effetune_toolbar_click();
                         }
                         self.finish_toolbar_section_lead(
                             ui,
@@ -11175,6 +11416,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         // selected が filter から外れた場合の処理は `rebuild_visible_indices` が
         // 直近の visible idx にリダイレクト (旧コードは None にクリアしていた)。
         if toolbar_rating_changed {
+            self.finish_rating_picker_before_source_adoption();
+            self.move_grid_cursor(self.selected, crate::app::GridCursorIntent::ExplicitKeep);
             // ユーザーによる明示的な filter 操作 → suppression anchor を破棄する
             // (ユーザー意思を尊重して、BS しても以前の filter は復元しない)。
             self.drop_rating_filter_suppression_on_user_edit();
@@ -12304,6 +12547,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let mut sort_reload_requested = false;
         let mut sort_popup_open = false;
         egui::TopBottomPanel::top("facet_filter_bar").show(ctx, |ui| {
+            if self.composition_editor_modal_active() { ui.disable(); }
             ui.add_space(1.0);
             ui.horizontal_wrapped(|ui| {
                 let filter_label = egui::Label::new(egui::RichText::new("絞り込み:").small())
@@ -12509,6 +12753,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 facet_name_changed |= self.clear_facet_name_filter_state();
                             }
                         }
+                        FI::FileTypeVisibility => {
+                            let active = !self.settings.file_type_visibility.is_all_visible();
+                            if file_type_visibility_button(ui, active) {
+                                self.open_preferences_request(crate::ui_dialogs::preferences::PreferencesOpenRequest::FILE_TYPE_VISIBILITY);
+                            }
+                        }
                         FI::Unknown => {}
                     }
                 }
@@ -12579,10 +12829,15 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 }
                 ui.separator();
                 ui.label(
-                    egui::RichText::new(filtered_count_label(
-                        self.smart_folder_rule_total(),
-                        self.visible_indices.len(),
-                    ))
+                    egui::RichText::new(
+                        if self.items_are_bookmark_view {
+                            registered_count_label(self.bookmark_view_registered_total, self.visible_indices.len())
+                        } else if let Some(total) = self.collection_registered_total() {
+                            registered_count_label(total, self.visible_indices.len())
+                        } else {
+                            filtered_count_label(self.smart_folder_rule_total(), self.visible_indices.len())
+                        }
+                    )
                     .small(),
                 );
                 if self.settings.show_facet_sort {
@@ -12611,6 +12866,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         }
 
         if rating_changed {
+            self.finish_rating_picker_before_source_adoption();
+            self.move_grid_cursor(self.selected, crate::app::GridCursorIntent::ExplicitKeep);
             self.drop_rating_filter_suppression_on_user_edit();
         }
         let color_scope_changed =
@@ -12619,6 +12876,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             self.color_filter.applied_scope_signature = None;
         }
         if facet_changed || facet_name_changed || rating_changed {
+            self.move_grid_cursor(self.selected, crate::app::GridCursorIntent::ExplicitKeep);
             let preserve_place_counts =
                 place_changed && !non_place_facet_changed && !rating_changed;
             let place_counts_cache = preserve_place_counts
@@ -12635,6 +12893,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             }
         }
         if color_changed || color_scope_changed {
+            if color_changed {
+                self.move_grid_cursor(self.selected, crate::app::GridCursorIntent::ExplicitKeep);
+            }
             if self.color_filter.enabled {
                 self.ensure_color_scan_for_current_scope(ctx);
             } else {
@@ -12642,6 +12903,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             }
         }
         if bookmark_filter_changed || reading_history_filter_changed {
+            self.move_grid_cursor(self.selected, crate::app::GridCursorIntent::ExplicitKeep);
             self.rebuild_visible_indices();
         }
     }
@@ -14194,7 +14456,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             self.show_search_bar || self.search_filter.is_some() || self.search_pending.is_some();
         // 検索の仮想階層でドリルイン中か (= ⬆ で 1 段戻れる / ▲▼ で前後ヒットへ
         // 動ける状態。最上位ではこれらを disabled にする条件)。
-        let search_drilled_in = (self.global_search.active && self.global_search.drill.is_some())
+        let search_drilled_in = (self.global_search.active
+            && (self.global_search.drill.is_some() || self.everything_has_physical_child()))
             || (self.favsearch.active && !self.favsearch.nav_stack.is_empty())
             || (self.tag_view.active && !self.tag_view.nav_stack.is_empty());
         let search_tree_drilled_in = (self.global_search.active
@@ -14212,7 +14475,18 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             && !self.items_are_tag_view
             && self.search_filter.is_none()
             && self.search_pending.is_none())
-        .then(|| thumbnail_count_label(self.smart_folder_rule_total(), self.visible_indices.len()));
+        .then(|| {
+            if self.items_are_bookmark_view {
+                registered_count_label(
+                    self.bookmark_view_registered_total,
+                    self.visible_indices.len(),
+                )
+            } else if let Some(total) = self.collection_registered_total() {
+                registered_count_label(total, self.visible_indices.len())
+            } else {
+                thumbnail_count_label(self.smart_folder_rule_total(), self.visible_indices.len())
+            }
+        });
         // 📌 (代表サムネ固定) ボタンの表示判定 + 状態をあらかじめ計算する。
         // closure 内で `self` のミュータブル借用が衝突しないように外で確定しておく。
         let pin_button_info = self.compute_folder_pin_button_state();
@@ -15224,6 +15498,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             self.search_filter_origin_folder = None;
             self.search_has_focus = false;
             self.search_tag_bridge.clear();
+            // Automatic cleanup after a source transition is not an explicit selection.
+            // Keep the context's rating history and pending return authority intact.
             self.cancel_search_pending();
             self.rebuild_visible_indices();
             return;
@@ -15239,6 +15515,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             .keymap
             .first_chord_action_label("現在地フィルタ", KeyAction::GlobalLocalSearch);
         egui::TopBottomPanel::top("search_bar").show(ctx, |ui| {
+            if self.composition_editor_modal_active() {
+                ui.disable();
+            }
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.label("検索:").on_hover_text(format!(
@@ -15284,6 +15563,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     self.search_filter_origin_folder = None;
                     self.search_has_focus = false;
                     self.search_tag_bridge.clear();
+                    self.move_grid_cursor(
+                        self.selected,
+                        crate::app::GridCursorIntent::ExplicitKeep,
+                    );
                     self.cancel_search_pending();
                     self.rebuild_visible_indices();
                     self.refresh_color_filter_for_scope_change(ctx);
@@ -15336,6 +15619,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     self.search_filter_origin_folder = None;
                     self.search_has_focus = false;
                     self.search_tag_bridge.clear();
+                    self.move_grid_cursor(
+                        self.selected,
+                        crate::app::GridCursorIntent::ExplicitKeep,
+                    );
                     self.cancel_search_pending();
                     self.rebuild_visible_indices();
                     self.refresh_color_filter_for_scope_change(ctx);
@@ -15421,6 +15708,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let mut query_changed = false;
 
         egui::TopBottomPanel::top("favsearch_bar").show(ctx, |ui| {
+            if self.composition_editor_modal_active() {
+                ui.disable();
+            }
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.label("コンテナ検索:");
@@ -15584,6 +15874,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let mut clicked_tag: Option<String> = None;
 
         egui::TopBottomPanel::top("tag_view_bar").show(ctx, |ui| {
+            if self.composition_editor_modal_active() {
+                ui.disable();
+            }
             ui.add_space(2.0);
             ui.horizontal_wrapped(|ui| {
                 ui.label("タグビュー:");
@@ -15933,9 +16226,22 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         );
     }
 
-    /// Capture popup ownership before widgets can dismiss it with this frame's input.
+    /// Cancel ROOT click pairs before extraction/cell handling, even if focus returns in this
+    /// batch or cell navigation later skips the background handler. Capture popup ownership
+    /// before widgets can dismiss it with this frame's input.
     pub(crate) fn begin_grid_click_input_frame(&mut self, ctx: &egui::Context) {
-        if ctx.viewport_id() == egui::ViewportId::ROOT && egui::Popup::is_any_open(ctx) {
+        if ctx.viewport_id() != egui::ViewportId::ROOT {
+            return;
+        }
+        if ctx.input(|input| {
+            input
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::WindowFocused(false)))
+        }) {
+            self.grid_click_pairing.end_activation();
+        }
+        if egui::Popup::is_any_open(ctx) {
             self.grid_click_pairing.end_activation();
             let frame = ctx.cumulative_frame_nr();
             ctx.data_mut(|data| {
@@ -16069,16 +16375,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 .settings
                 .ring_shortcuts
                 .right_drag_mode(crate::ring_shortcut::RightDragContext::Grid);
-            if apply_grid_right_drag_start_selection(
-                &mut self.selected,
-                self.settings
-                    .ring_shortcuts
-                    .select_grid_item_on_right_drag_start,
-                &mode,
-                Some(idx),
-            ) {
-                self.grid_click_selection_anchor =
-                    Some(GridClickSelectionAnchor::new(idx, self.items_generation));
+            if self.select_grid_right_drag_start(&mode, Some(idx)) {
                 self.update_last_selected_image();
             }
             match mode {
@@ -16175,19 +16472,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 Vec::new()
             };
             let allow_folders = self.subfolder_expansion_available();
-            apply_grid_click_selection(
-                self.settings.grid_click_selection_mode,
-                &mut self.selected,
-                &mut self.grid_click_selection_anchor,
-                self.items_generation,
-                &mut self.checked,
-                &display_order,
-                &self.items,
-                allow_folders,
-                idx,
-                ctrl,
-                shift,
-            );
+            self.select_grid_cell(idx, ctrl, shift, &display_order, allow_folders);
             self.update_last_selected_image();
         }
         // egui remains the owner of whether this release is a click at all. Pairing is grid-local:
@@ -16547,14 +16832,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             && !self.selection_info_bar_contains_pointer(ctx)
             && !self.mouse_ring_context_menu_suppressed(ctx)
         {
-            apply_grid_secondary_selection(
-                self.settings.grid_click_selection_mode,
-                &mut self.selected,
-                &mut self.grid_click_selection_anchor,
-                self.items_generation,
-                &mut self.checked,
-                idx,
-            );
+            self.select_grid_secondary_cell(idx);
             self.update_last_selected_image();
             self.context_menu_idx = Some(self.capture_grid_context_menu_owner(idx));
             self.context_menu_pos = ctx.input(|i| i.pointer.interact_pos().unwrap_or_default());
@@ -16646,9 +16924,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
     ) -> Option<AddressBarNav> {
         use crate::app::{GridBackgroundClickContext, GridClickSource};
         let frame = ctx.cumulative_frame_nr();
+        let items_generation = self.items_generation;
+        let view_mode = self.settings.grid_view_mode;
         let context = |source| GridBackgroundClickContext {
-            items_generation: self.items_generation,
-            view_mode: self.settings.grid_view_mode,
+            items_generation,
+            view_mode,
             viewport: ctx.viewport_id(),
             source,
         };
@@ -16673,7 +16953,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let id = egui::Id::new("grid_background_primary_frame");
         let frame_owner = ctx.data(|data| data.get_temp::<GridPrimaryInputFrame>(id));
         let blocked = matches!(frame_owner, Some(GridPrimaryInputFrame::Blocked(owner_frame)) if owner_frame == frame)
-            || !ctx.input(|input| input.focused)
             || !self.grid_item_input_allowed()
             || suppress_primary_pointer
             || self.any_dialog_open()
@@ -16691,6 +16970,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             || scroll;
         if blocked {
             self.grid_click_pairing.end_activation();
+            return None;
+        }
+        if !ctx.input(|input| input.focused) {
+            // Background activation requires focus. Cell responses also accept the diagnostic
+            // pointer path without OS focus, so this background-only restriction must not erase
+            // their accepted first click. The common input start cancels both on focus loss.
+            self.grid_click_pairing.end_background_run();
             return None;
         }
         // One frame may have several egui passes. Observe/consume this input only once.
@@ -16734,12 +17020,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         {
             self.folder_pane.set_focus_grid();
         }
-        clear_grid_selection_for_background_click(
-            self.settings.grid_click_selection_mode,
-            &mut self.selected,
-            &mut self.grid_click_selection_anchor,
-            &mut self.checked,
-        );
+        self.clear_grid_background_selection();
         let source = if touch.is_touch_primary(pos, false) {
             if !touch.accepts_grid_tap_release(pos) {
                 self.grid_click_pairing.end_activation();
@@ -16878,14 +17159,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             && idx < self.items.len()
             && !self.items_are_drive_list
         {
-            apply_grid_secondary_selection(
-                self.settings.grid_click_selection_mode,
-                &mut self.selected,
-                &mut self.grid_click_selection_anchor,
-                self.items_generation,
-                &mut self.checked,
-                idx,
-            );
+            self.select_grid_secondary_cell(idx);
             self.update_last_selected_image();
             self.context_menu_idx = Some(self.capture_grid_context_menu_owner(idx));
             self.context_menu_pos = pos;
@@ -20361,6 +20635,74 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 #[cfg(test)]
 mod facet_filter_bar_tests {
     use super::*;
+
+    #[test]
+    fn calculated_facet_choice_height_uses_each_gap_once() {
+        use crate::test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(720.0, 900.0));
+        let draw = |events| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(viewport),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            show_virtualized_facet_choice_rows(ui, 360.0, 26, |ui, idx| {
+                                draw_facet_checkbox_choice(
+                                    ui,
+                                    &mut false,
+                                    format!("選択肢 {idx}"),
+                                    "",
+                                );
+                            });
+                        });
+                },
+            );
+            let (inner, content, offset) = ctx.data(|data| {
+                data.get_temp(egui::Id::new("facet_choice_scroll_layout"))
+                    .unwrap()
+            });
+            ScrollLayout {
+                inner,
+                content,
+                offset,
+            }
+        };
+        let mut before = draw(vec![]);
+        for _ in 0..3 {
+            before = draw(vec![]);
+        }
+        let spacing = ctx.style().spacing.clone();
+        let row_height = spacing.interact_size.y.max(22.0);
+        assert_eq!(
+            before.content.y,
+            26.0 * row_height + 25.0 * spacing.item_spacing.y
+        );
+        // This menu intentionally caps its viewport at 24 of the 26 choices.
+        before.assert_height(HeightExpectation::Scrolls, viewport, ctx.pixels_per_point());
+        let mut after = before;
+        for frame in 0..40 {
+            after = draw(if frame == 0 {
+                vec![
+                    egui::Event::PointerMoved(before.inner.center()),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -4000.0),
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]
+            } else {
+                vec![]
+            });
+        }
+        after.assert_scrolled_to_end(before, ctx.pixels_per_point());
+    }
     use crate::app::setup_app_for_test;
 
     #[test]
@@ -20370,6 +20712,7 @@ mod facet_filter_bar_tests {
             hidden: 2,
             ignored_archive: 4,
             ignored_epub: 0,
+            file_type: 0,
             unsupported: 1,
             system: 4,
         };
@@ -20399,6 +20742,7 @@ mod facet_filter_bar_tests {
             hidden: 0,
             ignored_archive: 0,
             ignored_epub: 0,
+            file_type: 0,
             unsupported: 5,
             system: 0,
         };
@@ -20418,6 +20762,7 @@ mod facet_filter_bar_tests {
             hidden: 0,
             ignored_archive: 0,
             ignored_epub: 0,
+            file_type: 0,
             unsupported: 0,
             system: 9,
         };
@@ -20431,17 +20776,18 @@ mod facet_filter_bar_tests {
 
     #[test]
     fn omitted_chip_shows_only_relevant_settings_links() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
         let counts = crate::app::OmittedFolderEntryCounts {
             same_name: 3,
             hidden: 2,
             ignored_archive: 4,
             ignored_epub: 0,
+            file_type: 0,
             unsupported: 1,
             system: 0,
         };
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(640.0, 240.0))
             .build(move |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
@@ -20474,10 +20820,11 @@ mod facet_filter_bar_tests {
             hidden: 0,
             ignored_archive: 0,
             ignored_epub: 0,
+            file_type: 0,
             unsupported: 1,
             system: 0,
         };
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(640.0, 240.0))
             .build(move |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
@@ -20501,13 +20848,13 @@ mod facet_filter_bar_tests {
         link_label: &str,
         expected: crate::ui_dialogs::preferences::PreferencesOpenRequest,
     ) {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
         use std::sync::{Arc, Mutex};
 
         let opened = Arc::new(Mutex::new(None));
         let opened_for_ui = Arc::clone(&opened);
         let chip_label = omitted_entries_chip_label(counts).expect("chip label");
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(640.0, 240.0))
             .build(move |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
@@ -20535,6 +20882,7 @@ mod facet_filter_bar_tests {
                 hidden: 0,
                 ignored_archive: 0,
                 ignored_epub: 0,
+                file_type: 0,
                 unsupported: 0,
                 system: 0,
             },
@@ -20551,6 +20899,7 @@ mod facet_filter_bar_tests {
                 hidden: 0,
                 ignored_archive: 1,
                 ignored_epub: 0,
+                file_type: 0,
                 unsupported: 0,
                 system: 0,
             },
@@ -20563,6 +20912,7 @@ mod facet_filter_bar_tests {
                 hidden: 1,
                 ignored_archive: 0,
                 ignored_epub: 0,
+                file_type: 0,
                 unsupported: 0,
                 system: 0,
             },
@@ -21501,6 +21851,13 @@ mod rating_filter_op_tests {
     }
 
     #[test]
+    fn registered_count_label_keeps_filtered_and_stored_totals_distinct() {
+        assert_eq!(registered_count_label(12, 7), "表示7 / 登録12");
+        assert_eq!(registered_count_label(12, 0), "表示0 / 登録12");
+        assert_eq!(registered_count_label(0, 0), "表示0 / 登録0");
+    }
+
+    #[test]
     fn folder_bar_drive_letter_input_becomes_drive_root() {
         assert_eq!(
             normalize_folder_bar_input_path(Path::new("D:")),
@@ -21508,7 +21865,7 @@ mod rating_filter_op_tests {
         );
         assert_eq!(
             normalize_folder_bar_input_path(Path::new(" d: ")),
-            PathBuf::from(r"d:\")
+            PathBuf::from(if cfg!(windows) { r"D:\" } else { r"d:\" })
         );
     }
 
@@ -21521,6 +21878,16 @@ mod rating_filter_op_tests {
         assert_eq!(
             normalize_folder_bar_input_path(Path::new(r"D:books")),
             PathBuf::from(r"D:books")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn folder_bar_mixed_path_input_uses_standard_spelling() {
+        assert_eq!(
+            normalize_folder_bar_input_path(Path::new(r"g:/home/comfyui\genshin_random"))
+                .as_os_str(),
+            std::ffi::OsStr::new(r"G:\home\comfyui\genshin_random")
         );
     }
 
@@ -24978,10 +25345,7 @@ mod effetune_toolbar_flavor_tests {
     #[cfg(not(feature = "portable"))]
     fn effetune_button_enables_preparation_retry_but_keeps_other_failures_disabled() {
         use crate::effetune::{EffetuneFailure, EffetuneRuntime, LoadOrigin, UnavailableReason};
-        use egui_kittest::{
-            Harness,
-            kittest::{NodeT, Queryable},
-        };
+        use egui_kittest::kittest::{NodeT, Queryable};
         let cases = [
             (EffetuneRuntime::Idle, true),
             (EffetuneRuntime::Running { generation: 1 }, true),
@@ -25019,7 +25383,7 @@ mod effetune_toolbar_flavor_tests {
             app.effetune.runtime = runtime;
             assert_eq!(app.effetune_toolbar_available(), expected);
             let mut fonts_ready = false;
-            let mut harness = Harness::builder()
+            let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1200.0, 300.0))
                 .build(move |ctx| {
                     if fonts_ready {
@@ -25256,7 +25620,7 @@ mod collection_toolbar_interaction_tests {
         first: crate::collection_store::CollectionId,
     ) -> Harness<'static, ToolbarState> {
         let second = crate::collection_store::CollectionId::new();
-        Harness::builder()
+        crate::test_ui::builder()
             .with_size(egui::vec2(900.0, 240.0))
             .build_state(
                 |ctx, state| {
@@ -25619,7 +25983,7 @@ mod collection_toolbar_interaction_tests {
 #[cfg(test)]
 mod checked_selection_overlay_tests {
     use super::*;
-    use egui_kittest::{Harness, kittest::Queryable};
+    use egui_kittest::kittest::Queryable;
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -25731,7 +26095,7 @@ mod checked_selection_overlay_tests {
     fn checked_selection_overlay_real_area_honors_available_top_and_marker_clearance() {
         let available_top = Arc::new(std::sync::Mutex::new(None));
         let available_top_in_ui = Arc::clone(&available_top);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(640.0, 420.0))
             .build(move |ctx| {
                 egui::TopBottomPanel::top("checked-overlay-test-toolbar")
@@ -25752,7 +26116,7 @@ mod checked_selection_overlay_tests {
 
     #[test]
     fn checked_selection_overlay_is_absent_when_no_items_are_checked() {
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(480.0, 300.0))
             .build(|ctx| {
                 let _ = show_checked_selection_overlay(ctx, 0);
@@ -25765,7 +26129,7 @@ mod checked_selection_overlay_tests {
 
     #[test]
     fn checked_selection_overlay_shows_the_exact_checked_count() {
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(480.0, 300.0))
             .build(|ctx| {
                 let _ = show_checked_selection_overlay(ctx, 1);
@@ -25780,7 +26144,7 @@ mod checked_selection_overlay_tests {
     fn checked_selection_overlay_click_requests_deselect() {
         let clicked = Arc::new(AtomicBool::new(false));
         let clicked_in_ui = Arc::clone(&clicked);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(480.0, 300.0))
             .build(move |ctx| {
                 if show_checked_selection_overlay(ctx, 2) {
@@ -25798,7 +26162,7 @@ mod checked_selection_overlay_tests {
     fn checked_selection_overlay_count_text_does_not_deselect() {
         let clicked = Arc::new(AtomicBool::new(false));
         let clicked_in_ui = Arc::clone(&clicked);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(480.0, 300.0))
             .build(move |ctx| {
                 if show_checked_selection_overlay(ctx, 2) {
@@ -26097,8 +26461,6 @@ mod saved_group_number_ui_tests {
 
     #[test]
     fn book_manager_numbered_dark_snapshot() {
-        use egui_kittest::Harness;
-
         let mut app = crate::app::setup_app_for_test();
         app.show_book_manager = true;
         app.settings.active_book_name = "Alpha".into();
@@ -26119,7 +26481,7 @@ mod saved_group_number_ui_tests {
         let app = std::rc::Rc::new(std::cell::RefCell::new(app));
         let ui_app = std::rc::Rc::clone(&app);
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(900.0, 600.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -26198,7 +26560,7 @@ mod grid_reclick_open_tests {
             background_navs: Vec::new(),
             close_popup_before_background: false,
         };
-        Harness::builder()
+        crate::test_ui::builder()
             .with_size(egui::vec2(460.0, 200.0))
             .with_step_dt(0.01)
             .build_state(
@@ -26310,6 +26672,460 @@ mod grid_reclick_open_tests {
             );
         }
         harness.run();
+    }
+
+    fn rating_selection_harness(
+        view: crate::settings::GridViewMode,
+    ) -> Harness<'static, HandlerState> {
+        let mut harness = handler_harness(
+            GridClickSelectionMode::Explorer,
+            false,
+            Some(0),
+            false,
+            false,
+        );
+        let app = &mut harness.state_mut().app;
+        let folder = app.tmp.path().join("rating-shift-pages");
+        std::fs::create_dir_all(&folder).unwrap();
+        app.items = ["a", "b", "c"]
+            .into_iter()
+            .map(|name| {
+                let path = folder.join(format!("{name}.png"));
+                image::RgbaImage::from_pixel(4, 4, image::Rgba([90, 100, 110, 255]))
+                    .save(&path)
+                    .unwrap();
+                GridItem::Image(path)
+            })
+            .collect();
+        app.thumbnails = vec![ThumbnailState::Pending; 3];
+        app.image_metas = vec![None; 3];
+        app.visible_indices = vec![0, 1, 2];
+        app.current_folder = Some(folder);
+        app.settings.grid_view_mode = view;
+        app.settings.details_sort_key = crate::settings::DetailsSortKey::Name;
+        app.settings.details_sort_ascending = true;
+        app.details_order = vec![0, 1, 2];
+        app.settings.rating_filter = [false, false, false, true, false, false];
+        app.rating_cache.clear();
+        for index in 0..3 {
+            let key = app.rating_path_key(index).unwrap();
+            app.rating_db.as_ref().unwrap().set(&key, 3).unwrap();
+            app.rating_cache.insert(index, 3);
+        }
+        app.fullscreen_idx = Some(1);
+        app.viewer_presentation = crate::app::ViewerPresentation::Fullscreen;
+        app.grid_click_selection_anchor =
+            Some(GridClickSelectionAnchor::new(0, app.items_generation));
+        harness
+    }
+
+    fn ctrl_z_rating_origin(app: &mut AppTestEnvForTest) {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            modifiers: egui::Modifiers::CTRL,
+            events: vec![egui::Event::Key {
+                key: egui::Key::Z,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL,
+            }],
+            ..Default::default()
+        });
+        app.keyboard_owner_for_pass(&ctx);
+        app.handle_meta_undo_keys(&ctx);
+        let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn grid_cursor_rating_next_previous_and_ctrl_z_rebase_shift_click_in_both_views() {
+        let _input_guard = crate::key_input::lock_test_input();
+        for view in [
+            crate::settings::GridViewMode::Thumbnail,
+            crate::settings::GridViewMode::Details,
+        ] {
+            let mut harness = rating_selection_harness(view);
+            let app = &mut harness.state_mut().app;
+            app.checked.insert(0);
+            app.scroll_to_selected = false;
+            assert!(app.set_rating(1, 4));
+            assert_eq!(app.fullscreen_idx, Some(2));
+            assert_eq!(app.selected, Some(2));
+            assert_eq!(
+                app.grid_click_selection_anchor,
+                Some(GridClickSelectionAnchor::new(2, app.items_generation))
+            );
+            assert_eq!(app.checked, HashSet::from([0]));
+            assert!(app.scroll_to_selected);
+            click_cell(&mut harness, 0, egui::Modifiers::SHIFT);
+            assert_eq!(harness.state().app.checked, HashSet::from([0, 2]));
+            assert_eq!(harness.state().activations, 0);
+
+            ctrl_z_rating_origin(&mut harness.state_mut().app);
+            assert_eq!(harness.state().app.fullscreen_idx, Some(1));
+            assert_eq!(harness.state().app.selected, Some(1));
+            assert_eq!(
+                harness.state().app.grid_click_selection_anchor,
+                Some(GridClickSelectionAnchor::new(
+                    1,
+                    harness.state().app.items_generation
+                ))
+            );
+            harness.run_steps(40);
+            click_cell(&mut harness, 0, egui::Modifiers::SHIFT);
+            assert_eq!(harness.state().app.checked, HashSet::from([0, 1]));
+            harness.state_mut().app.apply_meta_redo();
+            assert_eq!(harness.state().app.fullscreen_idx, Some(2));
+            assert!(harness.state_mut().app.set_rating(2, 4));
+            assert_eq!(harness.state().app.fullscreen_idx, Some(0));
+            harness.run_steps(40);
+            click_cell(&mut harness, 0, egui::Modifiers::SHIFT);
+            assert_eq!(harness.state().app.checked, HashSet::from([0]));
+            assert_eq!(harness.state().activations, 0);
+        }
+    }
+
+    #[test]
+    fn grid_cursor_rating_last_page_return_and_ctrl_z_rebase_shift_click_in_both_views() {
+        let _input_guard = crate::key_input::lock_test_input();
+        for view in [
+            crate::settings::GridViewMode::Thumbnail,
+            crate::settings::GridViewMode::Details,
+        ] {
+            let mut harness = rating_selection_harness(view);
+            let app = &mut harness.state_mut().app;
+            app.items[1] = GridItem::ZipFile(app.tmp.path().join("container.zip"));
+            let container = app.rating_path_key(1).unwrap();
+            app.rating_db.as_ref().unwrap().set(&container, 3).unwrap();
+            app.fullscreen_idx = Some(0);
+            let hidden = app.rating_path_key(2).unwrap();
+            app.rating_db.as_ref().unwrap().set(&hidden, 4).unwrap();
+            app.rating_cache.insert(2, 4);
+            app.visible_indices = vec![0, 1];
+            app.details_order = vec![0, 1];
+            assert!(app.set_rating(0, 4));
+            assert_eq!(app.fullscreen_idx, None);
+            assert_eq!(app.selected, Some(1));
+            assert_eq!(
+                app.grid_click_selection_anchor,
+                Some(GridClickSelectionAnchor::new(1, app.items_generation))
+            );
+            assert!(app.scroll_to_selected);
+            click_cell(&mut harness, 1, egui::Modifiers::SHIFT);
+            assert_eq!(harness.state().app.checked, HashSet::from([1]));
+            assert_eq!(harness.state().activations, 0);
+
+            ctrl_z_rating_origin(&mut harness.state_mut().app);
+            assert_eq!(harness.state().app.fullscreen_idx, Some(0));
+            harness.run_steps(40);
+            click_cell(&mut harness, 1, egui::Modifiers::SHIFT);
+            assert_eq!(harness.state().app.checked, HashSet::from([0, 1]));
+            assert_eq!(harness.state().activations, 0);
+            assert_eq!(
+                harness.state().app.settings.rating_filter,
+                [false, false, false, true, false, false]
+            );
+        }
+    }
+
+    #[test]
+    fn grid_cursor_rating_grid_move_then_shift_click_uses_display_order_in_both_views() {
+        for view in [
+            crate::settings::GridViewMode::Thumbnail,
+            crate::settings::GridViewMode::Details,
+        ] {
+            let mut harness = rating_selection_harness(view);
+            let app = &mut harness.state_mut().app;
+            app.fullscreen_idx = None;
+            app.selected = Some(1);
+            let (target, click) = if view == crate::settings::GridViewMode::Details {
+                app.settings.details_sort_ascending = false;
+                app.details_order = vec![2, 1, 0];
+                (0, 2)
+            } else {
+                (2, 0)
+            };
+            app.grid_click_selection_anchor =
+                Some(GridClickSelectionAnchor::new(click, app.items_generation));
+            app.scroll_to_selected = false;
+            app.pending_grid_scroll = Some(GridScrollIntent::Bottom);
+            app.scroll_selected_to_rows_above = Some(3);
+            assert!(app.set_rating(1, 4));
+            assert_eq!(app.fullscreen_idx, None);
+            assert_eq!(app.selected, Some(target));
+            assert_eq!(
+                app.grid_click_selection_anchor,
+                Some(GridClickSelectionAnchor::new(target, app.items_generation))
+            );
+            assert!(app.scroll_to_selected);
+            assert_eq!(app.pending_grid_scroll, Some(GridScrollIntent::Bottom));
+            assert_eq!(app.scroll_selected_to_rows_above, Some(3));
+            click_cell(&mut harness, click, egui::Modifiers::SHIFT);
+            assert_eq!(harness.state().app.checked, HashSet::from([0, 2]));
+            assert_eq!(harness.state().activations, 0);
+        }
+    }
+
+    #[test]
+    fn grid_cursor_rating_grid_undo_restores_shift_origin_in_thumbnail_and_details() {
+        let _input_guard = crate::key_input::lock_test_input();
+        for view in [
+            crate::settings::GridViewMode::Thumbnail,
+            crate::settings::GridViewMode::Details,
+        ] {
+            let mut harness = rating_selection_harness(view);
+            let app = &mut harness.state_mut().app;
+            app.fullscreen_idx = None;
+            app.move_grid_cursor(Some(1), crate::app::GridCursorIntent::Automatic);
+            assert!(app.set_rating(1, 2));
+            assert_eq!(app.selected, Some(2));
+            ctrl_z_rating_origin(app);
+            assert_eq!(app.fullscreen_idx, None);
+            assert_eq!(app.selected, Some(1));
+            assert_eq!(
+                app.grid_click_selection_anchor,
+                Some(GridClickSelectionAnchor::new(1, app.items_generation))
+            );
+            click_cell(&mut harness, 0, egui::Modifiers::SHIFT);
+            assert_eq!(harness.state().app.checked, HashSet::from([0, 1]));
+            assert_eq!(harness.state().activations, 0);
+        }
+    }
+
+    #[test]
+    fn rating_grid_right_drag_start_then_center_cancel_keeps_explicit_selection_for_undo_redo() {
+        let _input_guard = crate::key_input::lock_test_input();
+        for view in [GridViewMode::Thumbnail, GridViewMode::Details] {
+            let mut harness = rating_selection_harness(view);
+            let app = &mut harness.state_mut().app;
+            app.fullscreen_idx = None;
+            app.move_grid_cursor(Some(1), crate::app::GridCursorIntent::Automatic);
+            app.settings
+                .ring_shortcuts
+                .select_grid_item_on_right_drag_start = true;
+            app.settings.ring_shortcuts.set_right_drag_mode(
+                crate::ring_shortcut::RightDragContext::Grid,
+                crate::ring_shortcut::RightDragMode::RingShortcut,
+            );
+            assert!(app.set_rating(1, 2));
+            assert_eq!(app.selected, Some(2));
+            let center = cell_rect(0).center();
+            pointer_button(&mut harness, center, egui::PointerButton::Secondary, true);
+            assert_eq!(harness.state().app.selected, Some(0));
+            assert!(harness.state().app.mouse_ring_flick.is_some());
+            // Assert the press boundary itself; a short-tap context menu must
+            // not supply a later cancellation that masks the original defect.
+            let Some(crate::undo_stack::UndoEntry::Rating {
+                origin: Some(origin),
+                ..
+            }) = harness.state().app.meta_undo.peek_undo()
+            else {
+                panic!("rating origin missing");
+            };
+            assert!(matches!(
+                origin.target,
+                crate::rating_membership::RatingOriginTarget::ValueOnly
+            ));
+            // Controlled elapsed time makes release at the center Cancelled,
+            // rather than ShortTap. No sleep or real input is involved.
+            harness
+                .state_mut()
+                .app
+                .mouse_ring_flick
+                .as_mut()
+                .unwrap()
+                .start_time -= crate::ring_shortcut::mouse_flick_menu_delay()
+                + std::time::Duration::from_millis(1);
+            pointer_button(&mut harness, center, egui::PointerButton::Secondary, false);
+            assert!(harness.state().app.context_menu_idx.is_none());
+            assert!(harness.state().app.mouse_ring_flick.is_none());
+            assert_eq!(harness.state().activations, 0);
+            ctrl_z_rating_origin(&mut harness.state_mut().app);
+            assert_eq!(harness.state().app.selected, Some(0));
+            assert_eq!(
+                harness
+                    .state()
+                    .app
+                    .grid_click_selection_anchor
+                    .unwrap()
+                    .index_for_generation(harness.state().app.items_generation)
+                    .unwrap(),
+                0
+            );
+            harness.state_mut().app.apply_meta_redo();
+            assert_eq!(harness.state().app.selected, Some(0));
+        }
+    }
+
+    #[test]
+    fn rating_grid_right_drag_selection_boundary_cancels_held_ready_in_both_views() {
+        for view in [GridViewMode::Thumbnail, GridViewMode::Details] {
+            crate::app::rating_membership_tests::rating_undo_grid_input_case(
+                view,
+                Some(1),
+                Some(0),
+                true,
+                |app| {
+                    app.settings
+                        .ring_shortcuts
+                        .select_grid_item_on_right_drag_start = true;
+                    assert!(app.select_grid_right_drag_start(
+                        &crate::ring_shortcut::RightDragMode::RingShortcut,
+                        Some(0)
+                    ));
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn grid_cursor_rating_grid_explicit_click_cancels_later_undo_and_redo_landing() {
+        let _input_guard = crate::key_input::lock_test_input();
+        for view in [
+            crate::settings::GridViewMode::Thumbnail,
+            crate::settings::GridViewMode::Details,
+        ] {
+            let mut harness = rating_selection_harness(view);
+            let app = &mut harness.state_mut().app;
+            app.fullscreen_idx = None;
+            app.move_grid_cursor(Some(1), crate::app::GridCursorIntent::Automatic);
+            assert!(app.set_rating(1, 2));
+            click_cell(&mut harness, 0, egui::Modifiers::NONE);
+            ctrl_z_rating_origin(&mut harness.state_mut().app);
+            assert_eq!(harness.state().app.selected, Some(0));
+            assert_eq!(
+                harness.state().app.grid_click_selection_anchor,
+                Some(GridClickSelectionAnchor::new(
+                    0,
+                    harness.state().app.items_generation
+                ))
+            );
+            harness.state_mut().app.apply_meta_redo();
+            assert_eq!(harness.state().app.selected, Some(0));
+            assert_eq!(harness.state().app.fullscreen_idx, None);
+            click_cell(&mut harness, 2, egui::Modifiers::SHIFT);
+            assert_eq!(harness.state().app.checked, HashSet::from([0, 2]));
+        }
+    }
+
+    #[test]
+    fn paired_identity_remap_keeps_checks_and_scroll_then_shift_click_uses_remapped_anchor() {
+        for view in [
+            crate::settings::GridViewMode::Thumbnail,
+            crate::settings::GridViewMode::Details,
+        ] {
+            let mut harness = rating_selection_harness(view);
+            let app = &mut harness.state_mut().app;
+            app.selected = Some(2);
+            app.checked = HashSet::from([1]);
+            app.scroll_to_selected = false;
+            app.pending_grid_scroll = Some(GridScrollIntent::Bottom);
+            app.scroll_selected_to_rows_above = Some(3);
+            let before = app.capture_rating_membership();
+            app.items.swap(0, 2);
+            app.bump_items_generation();
+            app.visible_indices = vec![0, 1, 2];
+            app.details_order = vec![2, 1, 0];
+            app.adopt_rating_membership(
+                before,
+                crate::rating_membership::RatingAdoptionIntent::Reconcile,
+            );
+            assert_eq!(app.fullscreen_idx, Some(1));
+            assert_eq!(app.selected, Some(0));
+            assert_eq!(app.checked, HashSet::from([1]));
+            assert!(!app.scroll_to_selected);
+            assert_eq!(app.pending_grid_scroll, Some(GridScrollIntent::Bottom));
+            assert_eq!(app.scroll_selected_to_rows_above, Some(3));
+            click_cell(&mut harness, 1, egui::Modifiers::SHIFT);
+            assert_eq!(harness.state().app.checked, HashSet::from([1, 2]));
+            assert_eq!(harness.state().activations, 0);
+        }
+    }
+
+    #[test]
+    fn same_raw_slot_different_identity_rebases_actual_shift_range_in_both_views() {
+        for view in [
+            crate::settings::GridViewMode::Thumbnail,
+            crate::settings::GridViewMode::Details,
+        ] {
+            let mut harness = rating_selection_harness(view);
+            let app = &mut harness.state_mut().app;
+            app.fullscreen_idx = Some(0);
+            app.grid_click_selection_anchor =
+                Some(GridClickSelectionAnchor::new(2, app.items_generation));
+            let before = app.capture_rating_membership();
+            app.items = vec![app.items[1].clone()];
+            app.bump_items_generation();
+            app.visible_indices = vec![0];
+            app.details_order = vec![0];
+            app.adopt_rating_membership(
+                before,
+                crate::rating_membership::RatingAdoptionIntent::Reconcile,
+            );
+            assert_eq!(app.fullscreen_idx, Some(0));
+            assert_eq!(app.selected, Some(0));
+            assert!(app.scroll_to_selected);
+            click_cell(&mut harness, 0, egui::Modifiers::SHIFT);
+            assert_eq!(harness.state().app.checked, HashSet::from([0]));
+            assert_eq!(harness.state().activations, 0);
+        }
+    }
+
+    #[test]
+    fn accepted_grid_primary_and_secondary_clicks_cancel_rating_origin_restore() {
+        for secondary in [false, true] {
+            let mut harness = handler_harness(
+                GridClickSelectionMode::Explorer,
+                false,
+                Some(0),
+                false,
+                false,
+            );
+            let app = &mut harness.state_mut().app;
+            let (_, rx) = std::sync::mpsc::channel();
+            app.rating_view_pending = Some(crate::rating_view::RatingViewPending {
+                stars: 3,
+                sequence: 1,
+                source_generation: app.items_generation,
+                context: app.virtual_list_context_id(),
+                rating_write_generation: app.rating_session_write_generation,
+                rating_preview: Default::default(),
+                rating_adoption: crate::rating_membership::RatingAdoptionIntent::RestoreOrigin(
+                    app.capture_rating_origin().unwrap(),
+                ),
+                sort: Default::default(),
+                membership_only: true,
+                navigation: None,
+                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                rx,
+            });
+            if secondary {
+                let center = cell_rect(1).center();
+                harness.hover_at(center);
+                for pressed in [true, false] {
+                    harness.event(egui::Event::PointerButton {
+                        pos: center,
+                        button: egui::PointerButton::Secondary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
+                harness.run();
+            } else {
+                click_cell(&mut harness, 1, egui::Modifiers::NONE);
+            }
+            assert_eq!(harness.state().app.selected, Some(1));
+            assert_eq!(
+                harness
+                    .state()
+                    .app
+                    .rating_view_pending
+                    .as_ref()
+                    .unwrap()
+                    .rating_adoption,
+                crate::rating_membership::RatingAdoptionIntent::Reconcile
+            );
+        }
     }
 
     fn click_at(harness: &mut Harness<'static, HandlerState>, pos: egui::Pos2) {
@@ -26729,7 +27545,7 @@ mod grid_reclick_open_tests {
             app.image_metas = vec![None];
             app.settings.grid_cols = 4;
             let fonts_set = std::cell::Cell::new(false);
-            let mut harness = Harness::builder()
+            let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(640.0, 480.0))
                 .with_step_dt(0.01)
                 .build_state(
@@ -26829,6 +27645,219 @@ mod grid_reclick_open_tests {
         harness.state_mut().close_popup_before_background = false;
         click_at(&mut harness, egui::pos2(30.0, 170.0));
         assert!(harness.state().background_navs.is_empty());
+    }
+
+    #[test]
+    fn cell_focus_roundtrip_batch_restarts_pair_before_handlers() {
+        check_cell_focus_roundtrip_batch(false);
+    }
+
+    #[test]
+    fn cell_focus_roundtrip_batch_restarts_pair_when_navigation_skips_background() {
+        check_cell_focus_roundtrip_batch(true);
+    }
+
+    fn check_cell_focus_roundtrip_batch(skip_background_on_navigation: bool) {
+        let mut app = setup_app_for_test();
+        let path = app.tmp.path().join("book.zip");
+        app.items = vec![GridItem::ZipFile(path.clone())];
+        app.visible_indices = vec![0];
+        app.settings.auto_fullscreen_zip_pdf = false;
+        app.settings.grid_open_selected_item_on_click = false;
+        let ctx = egui::Context::default();
+        let pos = cell_rect(0).center();
+        let click = || {
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        let draw = |app: &mut AppTestEnvForTest, time, events| {
+            let mut navs = Vec::new();
+            let mut background_calls = 0;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(460.0, 200.0),
+                    )),
+                    focused: true,
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    // Same start/extraction/cell/background order as ROOT render_grid.
+                    app.begin_grid_click_input_frame(ctx);
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let previous = app.begin_grid_primary_click_frame(
+                            ctx,
+                            ctx.input(|input| input.pointer.primary_clicked()),
+                        );
+                        let cell_nav = app.handle_cell_interaction(
+                            ui,
+                            ctx,
+                            cell_rect(0),
+                            0,
+                            &crate::thumb_overlay_layout::ThumbnailOverlayLayout::default(),
+                            false,
+                            false,
+                            previous,
+                            None,
+                        );
+                        let mut background = || {
+                            background_calls += 1;
+                            app.handle_grid_background_primary_click(
+                                ctx,
+                                ui.max_rect(),
+                                true,
+                                true,
+                                false,
+                                previous,
+                                &crate::touch_correlation::TouchFrame::default(),
+                            )
+                        };
+                        let nav = if skip_background_on_navigation {
+                            cell_nav.or_else(background)
+                        } else {
+                            let background_nav = background();
+                            cell_nav.or(background_nav)
+                        };
+                        if let Some(nav) = nav {
+                            navs.push(nav);
+                        }
+                    });
+                },
+            );
+            (navs, background_calls)
+        };
+        // Establish the interactive rectangle before supplying pointer edges.
+        for time in [0.8, 0.9] {
+            assert!(draw(&mut app, time, Vec::new()).0.is_empty());
+        }
+        let generation = app.items_generation;
+        assert!(draw(&mut app, 1.0, click()).0.is_empty());
+        assert_eq!(
+            app.grid_click_pairing
+                .pending_index_for_generation(generation),
+            Some(0)
+        );
+        assert!(ctx.options(|options| options.input_options.max_double_click_delay) > 0.2);
+
+        let mut roundtrip = vec![
+            egui::Event::WindowFocused(false),
+            egui::Event::WindowFocused(true),
+        ];
+        roundtrip.extend(click());
+        let (navs, background_calls) = draw(&mut app, 1.1, roundtrip);
+        assert!(
+            ctx.input(|input| input.focused),
+            "focus is regained in the same batch"
+        );
+        assert_eq!(app.items_generation, generation);
+        assert!(
+            navs.is_empty(),
+            "focus roundtrip must break the old cell pair: {navs:?}"
+        );
+        assert!(background_calls > 0);
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(
+            app.grid_click_pairing
+                .pending_index_for_generation(generation),
+            Some(0)
+        );
+
+        // The regained-focus click starts a fresh pair; another click still opens normally.
+        let (navs, background_calls) = draw(&mut app, 1.2, click());
+        assert_eq!(navs.len(), 1);
+        assert!(matches!(&navs[0], AddressBarNav::GridVirtual(intent) if intent.path == path));
+        assert_eq!(background_calls == 0, skip_background_on_navigation);
+    }
+
+    #[test]
+    fn background_focus_eligibility_preserves_cells_but_focus_loss_cancels_all() {
+        use crate::app::{GridBackgroundClickContext, GridClickSource};
+        for cell in [false, true] {
+            for focus_lost in [false, true] {
+                let mut app = setup_app_for_test();
+                let ctx = egui::Context::default();
+                let context = GridBackgroundClickContext {
+                    items_generation: app.items_generation,
+                    view_mode: app.settings.grid_view_mode,
+                    viewport: ctx.viewport_id(),
+                    source: GridClickSource::Mouse,
+                };
+                let pos = egui::pos2(30.0, 170.0);
+                if cell {
+                    let previous = app.grid_click_pairing;
+                    app.grid_click_pairing.register_cell_click(
+                        previous,
+                        0,
+                        context.items_generation,
+                        1.0,
+                        0.5,
+                    );
+                } else {
+                    app.grid_click_pairing.begin_background_press(context, 0);
+                    let previous = app.grid_click_pairing;
+                    app.grid_click_pairing
+                        .register_background_click(previous, context, pos, 0, 1.0, 0.5, 6.0);
+                }
+                let accepted = app.grid_click_pairing;
+                assert_ne!(accepted, GridClickPairingState::default());
+                let _ = ctx.run(
+                    egui::RawInput {
+                        focused: false,
+                        time: Some(1.1),
+                        events: if focus_lost {
+                            vec![egui::Event::WindowFocused(false)]
+                        } else {
+                            Vec::new()
+                        },
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        app.begin_grid_click_input_frame(ctx);
+                        let previous = app.grid_click_pairing;
+                        assert!(
+                            app.handle_grid_background_primary_click(
+                                ctx,
+                                egui::Rect::from_min_size(
+                                    egui::Pos2::ZERO,
+                                    egui::vec2(400.0, 200.0)
+                                ),
+                                false,
+                                false,
+                                false,
+                                previous,
+                                &crate::touch_correlation::TouchFrame::default(),
+                            )
+                            .is_none()
+                        );
+                    },
+                );
+                assert_eq!(
+                    app.grid_click_pairing,
+                    if cell && !focus_lost {
+                        accepted
+                    } else {
+                        GridClickPairingState::default()
+                    },
+                    "cell={cell} focus_lost={focus_lost}",
+                );
+            }
+        }
     }
 
     #[test]
@@ -27690,7 +28719,7 @@ mod toolbar_wrap_tests {
 
     #[test]
     fn sort_popup_shows_all_ten_rows_or_fits_a_short_screen() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
         for (screen_size, font_size, all_rows_expected) in [
             (egui::vec2(600.0, 480.0), 14.0, true),
@@ -27701,40 +28730,42 @@ mod toolbar_wrap_tests {
             let observed_id = combo_id.clone();
             let row_geometry = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let observed_rows = row_geometry.clone();
-            let mut harness = Harness::builder().with_size(screen_size).build(move |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.spacing_mut().interact_size.y = 22.0;
-                    ui.spacing_mut().button_padding.y = 1.0;
-                    ui.style_mut().text_styles.insert(
-                        egui::TextStyle::Button,
-                        egui::FontId::proportional(font_size),
-                    );
-                    let orders = crate::settings::SortOrder::all();
-                    let height =
-                        sort_combo_popup_height(ui, orders.len(), false, false, false, 0, 0);
-                    let combo = egui::ComboBox::from_id_salt("ten-sort-rows")
-                        .width(100.0)
-                        .height(height)
-                        .popup_style(sort_combo_popup_style())
-                        .selected_text("ソート")
-                        .show_ui(ui, |ui| {
-                            ui.spacing_mut().interact_size.y = 22.0;
-                            ui.style_mut().text_styles.insert(
-                                egui::TextStyle::Button,
-                                egui::FontId::proportional(font_size),
-                            );
-                            observed_rows.lock().unwrap().clear();
-                            for &order in orders {
-                                let row = ui.selectable_label(false, order.short_label());
-                                observed_rows
-                                    .lock()
-                                    .unwrap()
-                                    .push((row.rect, ui.clip_rect()));
-                            }
-                        });
-                    *observed_id.lock().unwrap() = Some(combo.response.id);
+            let mut harness = crate::test_ui::builder()
+                .with_size(screen_size)
+                .build(move |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.spacing_mut().interact_size.y = 22.0;
+                        ui.spacing_mut().button_padding.y = 1.0;
+                        ui.style_mut().text_styles.insert(
+                            egui::TextStyle::Button,
+                            egui::FontId::proportional(font_size),
+                        );
+                        let orders = crate::settings::SortOrder::all();
+                        let height =
+                            sort_combo_popup_height(ui, orders.len(), false, false, false, 0, 0);
+                        let combo = egui::ComboBox::from_id_salt("ten-sort-rows")
+                            .width(100.0)
+                            .height(height)
+                            .popup_style(sort_combo_popup_style())
+                            .selected_text("ソート")
+                            .show_ui(ui, |ui| {
+                                ui.spacing_mut().interact_size.y = 22.0;
+                                ui.style_mut().text_styles.insert(
+                                    egui::TextStyle::Button,
+                                    egui::FontId::proportional(font_size),
+                                );
+                                observed_rows.lock().unwrap().clear();
+                                for &order in orders {
+                                    let row = ui.selectable_label(false, order.short_label());
+                                    observed_rows
+                                        .lock()
+                                        .unwrap()
+                                        .push((row.rect, ui.clip_rect()));
+                                }
+                            });
+                        *observed_id.lock().unwrap() = Some(combo.response.id);
+                    });
                 });
-            });
             harness.run();
             let popup_id = combo_id.lock().unwrap().expect("sort combo").with("popup");
             egui::Popup::open_id(&harness.ctx, popup_id);
@@ -27786,10 +28817,7 @@ mod toolbar_wrap_tests {
 
     #[test]
     fn collection_sort_popup_shows_manual_shuffle_and_all_standard_rows_or_fits_screen() {
-        use egui_kittest::{
-            Harness,
-            kittest::{NodeT, Queryable},
-        };
+        use egui_kittest::kittest::{NodeT, Queryable};
 
         for (screen_size, font_size, all_rows_expected) in [
             (egui::vec2(600.0, 480.0), 14.0, true),
@@ -27800,52 +28828,54 @@ mod toolbar_wrap_tests {
             let observed_id = combo_id.clone();
             let row_geometry = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let observed_rows = row_geometry.clone();
-            let mut harness = Harness::builder().with_size(screen_size).build(move |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.spacing_mut().interact_size.y = 22.0;
-                    ui.spacing_mut().button_padding.y = 1.0;
-                    ui.style_mut().text_styles.insert(
-                        egui::TextStyle::Button,
-                        egui::FontId::proportional(font_size),
-                    );
-                    let orders = crate::settings::SortOrder::all();
-                    let height =
-                        sort_combo_popup_height(ui, orders.len(), true, false, false, 0, 0);
-                    let combo = egui::ComboBox::from_id_salt("collection-sort-rows")
-                        .width(100.0)
-                        .height(height)
-                        .popup_style(sort_combo_popup_style())
-                        .selected_text("手動")
-                        .show_ui(ui, |ui| {
-                            ui.spacing_mut().interact_size.y = 22.0;
-                            ui.style_mut().text_styles.insert(
-                                egui::TextStyle::Button,
-                                egui::FontId::proportional(font_size),
-                            );
-                            observed_rows.lock().unwrap().clear();
-                            for label in ["手動", "シャッフル（再選択で並べ直す）"]
-                            {
-                                let row = ui.selectable_label(false, label);
-                                observed_rows
-                                    .lock()
-                                    .unwrap()
-                                    .push((row.rect, ui.clip_rect()));
-                            }
-                            ui.separator();
-                            for &order in orders {
-                                let row = ui.add_enabled(
-                                    !order.is_rating(),
-                                    egui::Button::selectable(false, order.short_label()),
+            let mut harness = crate::test_ui::builder()
+                .with_size(screen_size)
+                .build(move |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.spacing_mut().interact_size.y = 22.0;
+                        ui.spacing_mut().button_padding.y = 1.0;
+                        ui.style_mut().text_styles.insert(
+                            egui::TextStyle::Button,
+                            egui::FontId::proportional(font_size),
+                        );
+                        let orders = crate::settings::SortOrder::all();
+                        let height =
+                            sort_combo_popup_height(ui, orders.len(), true, false, false, 0, 0);
+                        let combo = egui::ComboBox::from_id_salt("collection-sort-rows")
+                            .width(100.0)
+                            .height(height)
+                            .popup_style(sort_combo_popup_style())
+                            .selected_text("手動")
+                            .show_ui(ui, |ui| {
+                                ui.spacing_mut().interact_size.y = 22.0;
+                                ui.style_mut().text_styles.insert(
+                                    egui::TextStyle::Button,
+                                    egui::FontId::proportional(font_size),
                                 );
-                                observed_rows
-                                    .lock()
-                                    .unwrap()
-                                    .push((row.rect, ui.clip_rect()));
-                            }
-                        });
-                    *observed_id.lock().unwrap() = Some(combo.response.id);
+                                observed_rows.lock().unwrap().clear();
+                                for label in ["手動", "シャッフル（再選択で並べ直す）"]
+                                {
+                                    let row = ui.selectable_label(false, label);
+                                    observed_rows
+                                        .lock()
+                                        .unwrap()
+                                        .push((row.rect, ui.clip_rect()));
+                                }
+                                ui.separator();
+                                for &order in orders {
+                                    let row = ui.add_enabled(
+                                        !order.is_rating(),
+                                        egui::Button::selectable(false, order.short_label()),
+                                    );
+                                    observed_rows
+                                        .lock()
+                                        .unwrap()
+                                        .push((row.rect, ui.clip_rect()));
+                                }
+                            });
+                        *observed_id.lock().unwrap() = Some(combo.response.id);
+                    });
                 });
-            });
             harness.run();
             let popup_id = combo_id.lock().unwrap().expect("sort combo").with("popup");
             egui::Popup::open_id(&harness.ctx, popup_id);
@@ -27893,13 +28923,12 @@ mod toolbar_wrap_tests {
 
     #[test]
     fn collection_popup_first_frame_fits_right_edge_at_150_percent_dpi() {
-        use egui_kittest::Harness;
         let rows = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let observed = rows.clone();
         let id = std::sync::Arc::new(std::sync::Mutex::new(None));
         let observed_id = id.clone();
         let fonts_set = std::cell::Cell::new(false);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(853.0, 533.0))
             .with_pixels_per_point(1.5)
             .build(move |ctx| {
@@ -28258,7 +29287,7 @@ mod details_header_right_click_tests {
                 crate::ring_shortcut::RightDragMode::MouseGesture,
             );
         }
-        Harness::builder()
+        crate::test_ui::builder()
             .with_size(egui::vec2(640.0, 400.0))
             .with_step_dt(0.01)
             .build_state(
@@ -28378,7 +29407,7 @@ mod section207_tests {
         let nav = Rc::new(RefCell::new(Vec::new()));
         let nav_render = Rc::clone(&nav);
         let fonts = Cell::new(false);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 480.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -28459,7 +29488,7 @@ mod section207_tests {
         let wheel_after = Rc::new(Cell::new(false));
         let observed = Rc::clone(&wheel_after);
         let fonts = Cell::new(false);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 480.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -28516,7 +29545,7 @@ mod section207_tests {
         let app = Rc::new(RefCell::new(env));
         let render = Rc::clone(&app);
         let fonts = Cell::new(false);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(480.0, 700.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -28561,7 +29590,9 @@ mod section207_tests {
                         std::fs::create_dir_all(&folder).unwrap();
                         std::fs::write(folder.join("image.jpg"), b"fixture").unwrap();
                         app.load_folder_with_scan(folder, None);
+                        app.finish_page_identity_preparation_for_test();
                         app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+                        app.finish_page_identity_preparation_for_test();
                         if changed {
                             app.settings.rating_filter = [false; 6];
                         }
@@ -28572,7 +29603,7 @@ mod section207_tests {
                         let render = Rc::new(RefCell::new(app));
                         let state = render.clone();
                         let fonts = Cell::new(false);
-                        let mut harness = Harness::builder()
+                        let mut harness = crate::test_ui::builder()
                             .with_size(egui::vec2(width * zoom, 400.0 * zoom))
                             .build(move |ctx| {
                                 ctx.set_zoom_factor(zoom);
@@ -28691,7 +29722,7 @@ mod section207_tests {
                     if new_row { vec![TS::Folder] } else { vec![] };
                 let render = Rc::new(RefCell::new(env));
                 let fonts = Cell::new(false);
-                let mut harness = Harness::builder()
+                let mut harness = crate::test_ui::builder()
                     .with_size(egui::vec2(width, 400.0 * zoom))
                     .build(move |ctx| {
                         ctx.set_zoom_factor(zoom);
@@ -28818,7 +29849,7 @@ mod section207_tests {
                         let app = Rc::new(RefCell::new(env));
                         let render = Rc::clone(&app);
                         let fonts = Cell::new(false);
-                        let mut harness = Harness::builder()
+                        let mut harness = crate::test_ui::builder()
                             .with_size(egui::vec2(width, 360.0))
                             .build(move |ctx| {
                                 if !fonts.replace(true) {
@@ -28881,7 +29912,7 @@ mod section207_tests {
         let app = Rc::new(RefCell::new(env));
         let render = Rc::clone(&app);
         let fonts = Cell::new(false);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1200.0, 280.0))
             .build(move |ctx| {
                 if !fonts.replace(true) {
@@ -28992,7 +30023,7 @@ mod section207_tests {
         let nav = Rc::new(RefCell::new(Vec::new()));
         let nav_render = Rc::clone(&nav);
         let fonts = Cell::new(false);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1200.0, 280.0))
             .build(move |ctx| {
                 crate::ime_focus::install_ime_input_policy(ctx);
@@ -29068,7 +30099,7 @@ mod section207_tests {
         let nav = Rc::new(Cell::new(false));
         let nav_render = Rc::clone(&nav);
         let fonts = Cell::new(false);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(720.0, 360.0))
             .build(move |ctx| {
                 crate::ime_focus::install_ime_input_policy(ctx);
@@ -29129,7 +30160,7 @@ mod section207_tests {
         let legacy = Rc::new(Cell::new(true));
         let legacy_render = Rc::clone(&legacy);
         let fonts = Cell::new(false);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1200.0, 280.0))
             .build(move |ctx| {
                 if !fonts.replace(true) {
@@ -29208,10 +30239,7 @@ mod section207_tests {
 #[cfg(test)]
 mod section292_tests {
     use super::*;
-    use egui_kittest::{
-        Harness,
-        kittest::{NodeT, Queryable},
-    };
+    use egui_kittest::kittest::{NodeT, Queryable};
     use std::{
         cell::{Cell, RefCell},
         rc::Rc,
@@ -29237,7 +30265,7 @@ mod section292_tests {
         let fonts = Cell::new(false);
         let wheel_after = Rc::new(Cell::new(false));
         let observed = Rc::clone(&wheel_after);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1400.0, 600.0))
             .build(move |ctx| {
                 if !fonts.replace(true) {
@@ -29347,6 +30375,7 @@ mod section292_tests {
             std::fs::write(path, b"image").unwrap();
         }
         app.load_folder_with_scan(root.join("a"), None);
+        app.finish_page_identity_preparation_for_test();
         app.settings.show_toolbar_sort = false;
         app.settings.show_facet_sort = true;
         app.settings.toolbar_sort_items = vec![SortOrder::FileName];
@@ -29356,7 +30385,7 @@ mod section292_tests {
         let app = Rc::new(RefCell::new(app));
         let render = Rc::clone(&app);
         let fonts = Cell::new(false);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1400.0, 600.0))
             .build(move |ctx| {
                 if !fonts.replace(true) {
@@ -29392,6 +30421,7 @@ mod section292_tests {
         refresh.click();
         harness.run();
         SORT_CONTROL_TEST_RELOADS.with(|count| assert_eq!(count.get(), 1));
+        app.borrow_mut().finish_page_identity_preparation_for_test();
         assert!(
             app.borrow()
                 .items
@@ -29418,6 +30448,7 @@ mod section292_tests {
             app.borrow_mut().poll_subfolder_expansion(&ctx);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        app.borrow_mut().finish_page_identity_preparation_for_test();
         assert!(app.borrow().items_are_subfolder_expansion_view);
         assert_eq!(app.borrow().items.len(), 2);
         assert_eq!(app.borrow().items[0].name(), "a.jpg");
@@ -29451,7 +30482,9 @@ mod section292_tests {
                 app.settings.subfolder_expansion_order,
                 SubfolderExpansionOrder::FolderGrouped
             );
+            app.finish_page_identity_preparation_for_test();
             app.finish_subfolder_expansion_prepare_for_test();
+            app.finish_page_identity_preparation_for_test();
             assert_eq!(app.items.len(), 2);
             assert_eq!(app.items[0].name(), "z.jpg");
             assert!(std::sync::Arc::ptr_eq(
@@ -29465,7 +30498,7 @@ mod section292_tests {
 
     fn facet_sort_snapshot(name: &str, width: f32) {
         let fonts = Cell::new(false);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(width, 240.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);

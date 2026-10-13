@@ -63,6 +63,8 @@ pub(crate) struct CollectionPreparedSnapshot {
     /// UI-independent denominator for Collection-root automatic thumbnail aspect selection.
     /// Classification owns this once; presentation adoption can then read it in O(1).
     pub(crate) auto_aspect_eligible_total: usize,
+    /// Full actor membership before the display policy projects rows.
+    pub(crate) registered_total: usize,
     pub(crate) entries: Arc<[PreparedCollectionEntry]>,
 }
 
@@ -548,6 +550,7 @@ pub(crate) fn prepare_collection_snapshot_while(
         })
         .count();
     Ok(CollectionPreparedSnapshot {
+        registered_total: snapshot.entries.len(),
         collection_id: snapshot.collection_id(),
         collection_revision: snapshot.revision(),
         collection_name: snapshot.definition.name.clone(),
@@ -828,6 +831,7 @@ mod tests {
 
     fn navigation_snapshot(entries: Vec<PreparedCollectionEntry>) -> CollectionPreparedSnapshot {
         CollectionPreparedSnapshot {
+            registered_total: entries.len(),
             collection_id: CollectionId::new(),
             collection_revision: 9,
             collection_name: "Navigation".into(),

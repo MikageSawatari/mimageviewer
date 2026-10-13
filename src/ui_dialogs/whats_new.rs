@@ -85,17 +85,14 @@ pub(super) fn draw_whats_new_dialog(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use egui_kittest::{
-        Harness,
-        kittest::{NodeT, Queryable},
-    };
+    use egui_kittest::kittest::{NodeT, Queryable};
 
     #[test]
     fn version_highlights_initial_width_keeps_previous_reading_area() {
         for size in [egui::vec2(1093.0, 614.0), egui::vec2(1366.0, 728.0)] {
             for scale in [1.0, 2.0] {
                 let mut fonts_ready = false;
-                let mut harness = Harness::builder().with_size(size).build(move |ctx| {
+                let mut harness = crate::test_ui::builder().with_size(size).build(move |ctx| {
                     if !fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);
                         crate::settings::apply_ui_scale_factor(ctx, scale);
@@ -129,7 +126,7 @@ mod tests {
         for width in [440.0, 507.0, 640.0, 860.0] {
             for scale in [1.0, 2.0] {
                 let mut fonts_ready = false;
-                let mut harness = Harness::builder().build(move |ctx| {
+                let mut harness = crate::test_ui::builder().build(move |ctx| {
                     if !fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);
                         crate::settings::apply_ui_scale_factor(ctx, scale);
@@ -187,7 +184,7 @@ mod tests {
                     entries.insert(0, &LONG_ENTRY);
                 }
                 let mut fonts_ready = false;
-                let mut harness = Harness::builder()
+                let mut harness = crate::test_ui::builder()
                     .with_size(egui::vec2(1093.0, 614.0))
                     .build(move |ctx| {
                         if !fonts_ready {

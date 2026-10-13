@@ -1,7 +1,7 @@
 //! Album-art-only metadata inspection. No recursive EXIF, owned tag objects, or codecs.
 use crate::audio_album_art::Error;
 
-pub(super) const DECODE_BUDGET: u64 = 160 * 1024 * 1024;
+pub(crate) const DECODE_BUDGET: u64 = 160 * 1024 * 1024;
 const EXIF_LIMIT: usize = 64 * 1024;
 
 /// Walk every marker, including between scans. Stuffed bytes and restart markers
@@ -81,7 +81,7 @@ fn jpeg_segments(
     }
 }
 
-fn tiff_orientation(
+pub(crate) fn tiff_orientation(
     data: &[u8],
     check: &mut (impl FnMut() -> Result<(), Error> + ?Sized),
 ) -> Result<Option<u16>, Error> {
@@ -140,7 +140,7 @@ fn tiff_orientation(
     Ok(None)
 }
 
-pub(super) fn orientation(
+pub(crate) fn orientation(
     bytes: &[u8],
     check: &mut impl FnMut() -> Result<(), Error>,
 ) -> Result<u16, Error> {
@@ -181,7 +181,7 @@ pub(super) fn orientation(
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(super) struct JpegBudget {
+pub(crate) struct JpegBudget {
     pub dims: (u32, u32),
     pub required: u64,
 }
@@ -189,7 +189,7 @@ pub(super) struct JpegBudget {
 /// Conservative bound for both fixed-version native and fallback decoders.
 /// Assume full-image coefficients even for sequential JPEG and for any scan layout.
 /// Metadata is stripped before either decoder, so neither expands EXIF/XMP/ICC.
-pub(super) fn jpeg_budget(
+pub(crate) fn jpeg_budget(
     bytes: &[u8],
     budget: u64,
     check: &mut impl FnMut() -> Result<(), Error>,
@@ -254,7 +254,7 @@ pub(super) fn jpeg_budget(
 
 /// Retain JFIF/Adobe color hints, coding/scan data, and entropy verbatim. Drop
 /// APP1..APP13, APP15 and COM so downstream general codecs never parse metadata.
-pub(super) fn jpeg_without_metadata(
+pub(crate) fn jpeg_without_metadata(
     bytes: &[u8],
     check: &mut impl FnMut() -> Result<(), Error>,
 ) -> Result<Vec<u8>, Error> {

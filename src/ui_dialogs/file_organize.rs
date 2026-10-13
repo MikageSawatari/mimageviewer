@@ -570,31 +570,29 @@ mod tests {
 
     fn navigation_harness(size: egui::Vec2) -> NavigationHarness {
         let mut fonts_ready = false;
-        let mut harness = egui_kittest::Harness::builder()
-            .with_size(size)
-            .build_state(
-                move |ctx, state: &mut (Vec<FileOrganizeDestination>, Option<_>)| {
-                    if !fonts_ready {
-                        crate::ui_fonts::configure_fonts(ctx);
-                        fonts_ready = true;
-                    }
-                    let _ = show_file_organize_modal(
-                        ctx,
-                        &[r"C:\source\image.jpg".into()],
-                        &state.0,
-                        &mut state.1,
-                    );
-                },
-                (
-                    (0..60)
-                        .map(|row| FileOrganizeDestination {
-                            name: format!("destination {row}"),
-                            path: PathBuf::from(format!(r"D:\destination\{row}")),
-                        })
-                        .collect(),
-                    None,
-                ),
-            );
+        let mut harness = crate::test_ui::builder().with_size(size).build_state(
+            move |ctx, state: &mut (Vec<FileOrganizeDestination>, Option<_>)| {
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                }
+                let _ = show_file_organize_modal(
+                    ctx,
+                    &[r"C:\source\image.jpg".into()],
+                    &state.0,
+                    &mut state.1,
+                );
+            },
+            (
+                (0..60)
+                    .map(|row| FileOrganizeDestination {
+                        name: format!("destination {row}"),
+                        path: PathBuf::from(format!(r"D:\destination\{row}")),
+                    })
+                    .collect(),
+                None,
+            ),
+        );
         harness.run();
         harness
     }
@@ -703,7 +701,7 @@ mod tests {
 
     #[test]
     fn file_organize_modal_size_is_stable_across_frames_and_viewport_changes() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
         for count in [0, 1, 5, 60] {
             let destinations = (0..count)
@@ -714,7 +712,7 @@ mod tests {
                     ),
                 })
                 .collect::<Vec<_>>();
-            let mut harness = Harness::builder()
+            let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1000.0, 720.0))
                 .build_state(
                     |ctx,
@@ -779,8 +777,8 @@ mod tests {
 
     #[test]
     fn file_organize_table_buttons_keep_pointer_focus_and_action() {
-        use egui_kittest::{Harness, kittest::Queryable};
-        let mut harness = Harness::builder()
+        use egui_kittest::kittest::Queryable;
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1000.0, 720.0))
             .build_state(
                 |ctx,

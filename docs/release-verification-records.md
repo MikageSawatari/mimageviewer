@@ -12,6 +12,28 @@
 
 ---
 
+## §1.361 Phase 4 初回隔離 run（2026-10-11 JST、同日調査）
+
+- **対象・出所**: 利用者が報告した了承済みの初回 run
+  `C:\home\mimageviewer\target\ui-smoke\runs\release-checks-20261010-151540-f99fc454`。
+  run-id の日付・時刻は UTC（2026-10-10 15:15:40）、日本時間では2026-10-11 00:15:40。
+  本調査では既存の `seed-profile/mimageviewer.log` と `release-record.md` を読み取り、アプリを再実行していない。
+- **未完了**: seed のログは `runner start failed: screenshot directory must be one run below ...ui-smoke-runs`
+  による EnvironmentFailure / 2 を記録。元の release-record は seed FAIL / application exit code 1 と記録しており、
+  process ExitCode 取得の修正前の結果なので一致しない。元証跡を変更せず、suite PASS／採用証拠として使わない。
+- **環境注記（Remote IPC）**: 同じログの起動時 t=0.052s に、共有
+  `\\.\pipe\mimageviewer-remote-thumbnail` の作成拒否（access denied / OS error 5）がある。
+  常駐インストール版が存在する条件と `FILE_FLAG_FIRST_PIPE_INSTANCE` の同名二重起動拒否に一致する。
+  source inspection では pipe 作成は Remote worker 起動より前で、失敗時は listener／service を作らず、
+  ローカル操作 phase を維持する（`src/remote_ipc/pipe.rs`、`src/lib.rs`、`src/remote_ipc/ui.rs`）。
+  seed／idle 5ケース／perf 2ケース／任意の first-AI はアプリ内 test-script queue と exact PID／HWND の
+  観測を使い、Remote IPC・Remote service・既存インスタンスへの open 転送を使わない。
+  このエラー自体は対象ケースの操作や必須証拠を妨げない。起動時の一回の診断で、idle の log 増加測定前に出る。
+  Remote worker 不在と常駐版の同時稼働は環境条件として残し、配布版の厳密性能／Remote 動作の証明には使わない。
+  診断の除外、pipe 分離、retry、既存インスタンス停止は追加していない。
+- **修正後**: 非対話チェックの結果は `target/F-phase4-fix-msg.txt` に引き継ぐ。
+  修正後の実アプリ run、各3回の成立率／閾値、tray 旧版FAIL／修正版PASS の採用証拠は未取得。
+
 ## v4.5.0 (2026-10-09)
 
 - **対象**: 配布ビルドは master `16524e981`。その後のコミットはバックログ (§1.360) とこの記録だけで、コードは配布ビルドと同一。

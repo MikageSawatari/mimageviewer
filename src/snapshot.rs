@@ -125,6 +125,13 @@ impl SnapshotEntryKind {
 /// tooltip / debug log 用。filter 変化検出には使わない (= それは [`FilterState`])。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SnapshotSourceLabel {
+    /// External physical media owns one explicit initial page beside projected siblings.
+    DirectMedia {
+        target: PathBuf,
+        policy: crate::file_type_visibility::FileTypeVisibility,
+        reader_order: Vec<usize>,
+        details_sort: Option<(crate::settings::DetailsSortKey, bool)>,
+    },
     /// ★ filter から (active な ★ レベルの一覧)
     RatingFilter { active_levels: Vec<u8> },
     /// Ctrl+F text search の query
@@ -474,6 +481,36 @@ impl Default for FilterState {
     }
 }
 
+/// Runtime presentation paired with the original rows in the existing snapshot owner.
+/// The shift owner uses the saved book/row basis, rather than the extracted subset basis.
+#[derive(Debug, PartialEq)]
+pub(crate) struct SnapshotViewingState {
+    pub mode: crate::settings::SpreadMode,
+    pub direction: crate::settings::ReadingDirection,
+    pub flow: crate::settings::ReadingFlow,
+    pub shift: crate::app::spread_shift_owner::ViewerSpreadShift,
+    pub composition: crate::app::book_composition_runtime::ViewerBookComposition,
+    pub final_cover: crate::settings::FinalCoverSpreadPreference,
+    pub endpoints: crate::settings::SingletonSpreadEndpointPreferences,
+    pub page_alone: crate::settings::PageAlonePreferences,
+}
+
+impl Clone for SnapshotViewingState {
+    fn clone(&self) -> Self {
+        Self {
+            mode: self.mode,
+            direction: self.direction,
+            flow: self.flow,
+            // Snapshot forks follow the same accepted-session boundary as live viewers.
+            shift: self.shift.fork_accepted(),
+            composition: self.composition.clone(),
+            final_cover: self.final_cover,
+            endpoints: self.endpoints,
+            page_alone: self.page_alone,
+        }
+    }
+}
+
 /// `App` が snapshot active 中に保持する state。`App.snapshot: Option<SnapshotState>` で
 /// active/inactive を表現する (= `is_some()` で判定)。
 ///
@@ -509,6 +546,11 @@ pub struct SnapshotState {
     // ── 退避 state (= snapshot OFF 時に復元) ──
     /// snapshot ON 時点の `App.items` (= 通常フォルダの GridItem 一覧)
     pub saved_items: Vec<crate::grid_item::GridItem>,
+    pub(crate) saved_viewing_state: SnapshotViewingState,
+    pub(crate) saved_projection_recipe: crate::app::book_materialization::ProjectionRecipe,
+    /// Immutable prepared identities stay paired with the saved basis rows.
+    pub(crate) saved_page_identity_index:
+        std::sync::Arc<crate::app::file_type_resume::PreparedPageIdentityIndex>,
     /// snapshot ON 時点の `App.thumbnails` (= GPU texture 状態含む)
     pub saved_thumbnails: Vec<crate::grid_item::ThumbnailState>,
     /// snapshot ON 時点の `App.image_metas`。
@@ -534,11 +576,14 @@ pub struct SnapshotState {
     /// `reconstruct_grid_item` での再構築だと ZipImage/PdfPage の細部 (= content_type 等)
     /// が失われるため、初回 activate 時の clone を保持する。
     pub list_view_items: Vec<crate::grid_item::GridItem>,
+    pub(crate) list_view_projection_recipe: crate::app::book_materialization::ProjectionRecipe,
     /// 同上、サムネイル状態 (= GPU texture 含む、ロード済みフォルダ代表サムネ保持)。
     /// 子フォルダから BS で戻った際にサムネが Pending に戻らないために必要。
     pub list_view_thumbnails: Vec<crate::grid_item::ThumbnailState>,
     /// 同上、`list_view_items` と位置対応する画像 metadata。
     pub list_view_image_metas: Vec<Option<(i64, i64)>>,
+    pub(crate) list_view_page_identity_index:
+        std::sync::Arc<crate::app::file_type_resume::PreparedPageIdentityIndex>,
 
     /// 検索 view (Ctrl+G/Ctrl+S) から ★固定した場合の「戻り先フォルダ」。
     ///

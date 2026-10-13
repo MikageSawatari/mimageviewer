@@ -2040,6 +2040,15 @@ impl ContainerRemoteArchiveExecutor {
             Ok(settings) => settings,
             Err(error) => return archive_settings_read_failed(error),
         };
+        if !settings
+            .file_type_visibility
+            .allows_physical_file(&resolved.logical)
+        {
+            return failed(
+                RemoteArchiveTerminalCode::IgnoredBySettings,
+                "表示するファイル種類の設定で、このアーカイブは非表示になっています",
+            );
+        }
         if settings.archive_file_handling_ignores_convertible() {
             return failed(
                 RemoteArchiveTerminalCode::IgnoredBySettings,
@@ -2080,9 +2089,14 @@ impl ContainerRemoteArchiveExecutor {
         // ArchiveCacheDb の key は本体 UI と共有する。Windows の canonical path は
         // extended prefix を持ち得るため、DB lookup / record / reserve には通常表記へ
         // 戻した logical path を使い、実ファイル I/O と fingerprint だけ canonical path を使う。
-        let mut fallback_cached = cache_db
-            .as_ref()
-            .and_then(|db| db.lookup(&resolved.logical, fingerprint.mtime, fingerprint.size));
+        let mut fallback_cached = cache_db.as_ref().and_then(|db| {
+            db.lookup_with_visibility(
+                &resolved.logical,
+                fingerprint.mtime,
+                fingerprint.size,
+                &settings.file_type_visibility,
+            )
+        });
         let mut password = None;
         let summary = if format == crate::archive_converter::ArchiveFormat::Rar {
             match self.prepare_rar(
@@ -2149,6 +2163,7 @@ impl ContainerRemoteArchiveExecutor {
             settings.archive_cache_max_bytes,
             control,
             cancel,
+            &settings.file_type_visibility,
         )
     }
 
@@ -2251,6 +2266,7 @@ impl ContainerRemoteArchiveExecutor {
         max_cache_bytes: u64,
         control: &dyn RemoteArchiveJobControl,
         cancel: &Arc<AtomicBool>,
+        policy: &crate::file_type_visibility::FileTypeVisibility,
     ) -> RemoteArchiveExecutionOutcome {
         loop {
             control.update(RemoteArchiveJobState::WaitingForConversionSlot, None);
@@ -2265,9 +2281,12 @@ impl ContainerRemoteArchiveExecutor {
             if current != fingerprint {
                 return source_changed();
             }
-            if let Some(path) =
-                cache_db.lookup(&resolved.logical, fingerprint.mtime, fingerprint.size)
-            {
+            if let Some(path) = cache_db.lookup_with_visibility(
+                &resolved.logical,
+                fingerprint.mtime,
+                fingerprint.size,
+                policy,
+            ) {
                 return cached_outcome(public_source, &resolved.canonical, fingerprint, path);
             }
             let destination = match cache_db.reserve_cache_zip_path(&resolved.logical) {

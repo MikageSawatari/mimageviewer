@@ -326,6 +326,21 @@ const V4_5_HIGHLIGHTS: &[HighlightItem] = &[
     },
 ];
 
+const V4_6_HIGHLIGHTS: &[HighlightItem] = &[
+    HighlightItem {
+        title: "同梱の音響調整（EffeTune）を新しい版にしました",
+        body: "ビジュアライザーを起動時の表示に選べるようになり、再生中の曲名やジャケットも表示できます。",
+    },
+    HighlightItem {
+        title: "幅・高さを指定した大きさで表示する「指定サイズ」を追加しました",
+        body: "ズーム／フィットのメニューと 0 の切り替えから選べます。標準の値は環境設定の「表示 → 閲覧表示」で変えられます。",
+    },
+    HighlightItem {
+        title: "アプリ全体で表示するファイルの種類を選べます",
+        body: "環境設定の「ファイル処理」の「表示するファイル種類」で、種類ごとに表示・非表示を切り替えられます（既定はすべて表示）。",
+    },
+];
+
 const TABLE: &[VersionHighlights] = &[
     VersionHighlights {
         version: "2.0.0",
@@ -1047,6 +1062,15 @@ const TABLE: &[VersionHighlights] = &[
             body: "分割した RAR の 2 つ目以降のファイル（part2 以降）を開くと、変換せずに「最初のファイルを開いてください」と案内します。最初のファイル（part1）から開くと、これまでどおり読めます。",
         }],
         highlights: V4_5_HIGHLIGHTS,
+    },
+    VersionHighlights {
+        version: "4.6.0",
+        // ★の絞り込みから外れたときの移動先が前から次に変わったことを必読へ置く。
+        must_read: &[HighlightItem {
+            title: "★で絞り込みから外れたとき、次の項目へ移るようになりました",
+            body: "一覧で★を変えて絞り込みから外れたとき、選択はこれまでの前の項目ではなく次の項目へ移ります。フルスクリーンでも読む順の次のページへ移ります。直後の Ctrl+Z で元に戻せます。",
+        }],
+        highlights: V4_6_HIGHLIGHTS,
     },
 ];
 

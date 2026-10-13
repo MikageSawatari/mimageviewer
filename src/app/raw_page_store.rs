@@ -1102,11 +1102,13 @@ pub(crate) mod tests {
         let Some(FsCacheEntry::Static { pixels: source, .. }) = app.fs_cache.get(&0) else {
             unreachable!()
         };
+        let source_size = source.size;
         let key =
-            app.final_composite_key_for_pixels(edit_key, source.size, app.effective_params(0));
+            app.final_composite_key_for_pixels(edit_key, source_size, app.effective_params(0));
         app.final_composite_cache.insert(
             key,
             FinalCompositeEntry {
+                source_size,
                 pixels,
                 texture,
                 complete: true,
@@ -1856,6 +1858,7 @@ pub(crate) mod tests {
                     app.final_composite_cache.insert(
                         final_key,
                         FinalCompositeEntry {
+                            source_size: [2, 3],
                             pixels: processed,
                             texture: final_tex.clone(),
                             complete: true,

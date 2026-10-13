@@ -8,14 +8,21 @@
 
 | ドキュメント | 読むべきタイミング |
 | --- | --- |
+| [everything-search-plan.md](everything-search-plan.md) | §1.374 Everythingファイル名検索。Stage1履歴と§14の実装台帳、直接IPCの公式wire根拠、単一Search owner/完了採用/main modal、raw10,000件、Root/PhysicalChild帰路、Ctrl+R、PDF prerequisite。実装中・自動gate/独立レビュー/実機確認待ち |
+| [async-log-writer-plan.md](async-log-writer-plan.md) | §1.356 通常／perfの同期ログI/OによるUI・stderr reader停止。単一writer、有界queue・欠落、重要診断、終了flush、診断ZIP workerの完了barrier、解析gateの保存証明／判定不能。2026-10-09利用者決定済み・実装／検証記録 |
 | [details-name-color-plan.md](details-name-color-plan.md) | 詳細一覧の名前色。フォルダ黄系・六分類、標準カスタム/強め固定、選択/チェック共通色、切り取り不透明と設定保存・検証 |
 | [raw-libraw-plan.md](raw-libraw-plan.md) | RAW の内蔵現像、プレビュー差し替え・編集 gate・Remote・設定・配布を触るとき |
 | [libraw-source-distribution.md](libraw-source-distribution.md) | LibRaw の対応ソース・checksum・notice の準備と公開手順 |
 | [architecture-overview.md](architecture-overview.md) | 全体像の把握。レイヤー構造・モジュールマップ・永続化ストア一覧 |
+| [book-composition-plan.md](book-composition-plan.md) | §1.242 本の構成。利用者決定・G1〜G5の契約、G2のmodel/store/lifecycle、G3の共通projection・表示許可・mode-only・E接続。G4Fは2026-10-12に切り離し、画像folderは構成対象外。画像folder→Stored ZIP変換は独立計画で実装中。次々回リリース向けnext-bookで開発 |
+| [image-folder-to-zip-plan.md](image-folder-to-zip-plan.md) | §1.242 の独立した画像folder→Stored ZIP変換の設計R3（対象7346683c6、独立レビューACCEPTは利用者報告）、実装中。画像タグのZIP本体集約、XMP評価補充、favorite表示状態FIFO、取消/完了選択、既存再帰範囲。2026-10-12利用者決定でCollectionは元参照を保持し、型拡張・容量検査・複製を除外。同名3択と旧ON→本表示/旧OFF→両方表示は決定済み |
+| [thumbnail-request-lifecycle-plan.md](thumbnail-request-lifecycle-plan.md) | §1.360 サムネイル要求とCPU画像の単一owner、保存/画像両終端、request ID相関、動画のidle/repaint/進捗投影、tray両測定、回帰・検証証拠 |
 | [section327-startup-window-flicker-investigation.md](section327-startup-window-flicker-investigation.md) | §1.327 起動時の白窓、native診断の採取・観測限界、利用者ログで確認した最大化起動の原因、採用したnormal表示後の一度だけの最大化 (§8)。大規模backend案 (§7) は将来候補 |
 | [display-pipeline.md](display-pipeline.md) | サムネイル表示・フルスクリーン描画を触るとき。**補正/AI/回転の適用順の決定版** |
 | [audio-album-art-plan.md](audio-album-art-plan.md) | **§1.347 利用者実機確認の成功記録、共有設定を「表示 → サムネイル」へ移設・動画と音声の画像省略一致を確認 (§22)、Remote受付証明/ZIP RAW継続の修正・検証と取消保証の文書訂正 (§21)、bounded Rust gateの受入証拠 (§20)、前実装検証 (§19)、FFmpeg gate失敗履歴 (§15)**。動画と共通の同名 sidecar と MP3 埋め込み画像を本体・Remote の一覧に表示する仕様・実装と検証記録。既存設定・画像行省略・出所と更新、3 択の音声表示マーク、Rust APIC 読取の依存比較・割当前上限と新 gate、再生時割当の別観測、終端状態、catalog、IPC 版、2026-10-08 利用者訂正 (手動 pin は範囲外) |
 | [final-cover-spread-plan.md](final-cover-spread-plan.md) | 末尾に表紙を添える見開きの実装・検証記録。本体・連結読み・Remoteで共有する描画構成、読書位置と表示役割の分離、全体/本別設定 |
+| [spread-shift-memory-plan.md](spread-shift-memory-plan.md) | §1.364 R3、D2/D2bの履歴と§11.6の2026-10-11利用者決定。D1の永続root/相対payload移行は維持し、D2cでopen-contextのroot追従・同本pending-open直列化を撤去。§11.7で独立resume fence、§11.8でretained調整保持とscope epoch、§11.9で書込み前import取消の変更なしleaseを規定。D3はRemoteのfull-scope保存基点解決・完全応答parity・acquire/SetSpread fenceと共有C1–C12 fixture。masterで確認した既存budget制限と変換書庫のlogical base keyを保持。検証記録は§11.10、G3 consumerは未統合 |
+| [spread-shift-contract-fixtures.md](spread-shift-contract-fixtures.md) | §1.364 D3のE→G3共有C1–C12 fixtureとnext-bookのconsumer接続。E供給時点の履歴、G3のadmission/restore/builder/mode-only検証、G4で接続するeditor C7/C9を区別する |
 | [section218-singleton-spread-placement.md](section218-singleton-spread-placement.md) | §1.218見開き端の単ページ配置。実装・自動検証・独立レビュー・確認build完了、本体・Remoteの利用者確認済み。ページ構成を変えない配置、全体/本別設定、連結読み・Remote・保持画像の共通geometry |
 | [spread-endpoint-and-blank-pages-plan.md](spread-endpoint-and-blank-pages-plan.md) | §1.239先頭/末尾の配置分離と§1.240端近くの実ページ単独表示。旧設定移行、白い空き slot の描画、Remote・多窓検証、将来の本構成との境界 |
 | [async-architecture.md](async-architecture.md) | 並列処理・キャンセル・キャッシュ競合を触るとき。ワーカー一覧とテンプレ。動画 packet/control channel、bridge 内 per-slot VST GUI thread、Normalize scan lifecycle を含む |
@@ -33,7 +40,8 @@
 | [startup-diagnostics-plan.md](startup-diagnostics-plan.md) | §1.241 常時起動timeline、実PRESENT、5秒Indexer overlay、単一採用、狭いwatchdog。Phase Aと§1.335統合後の初期フォルダPhase Bの境界は§10 |
 | [preferences-layout-guidelines.md](preferences-layout-guidelines.md) | 環境設定 UI のページ構成、配置、レスポンシブレイアウトを触るとき |
 | [v3.7.0-input-and-still-seek-plan.md](v3.7.0-input-and-still-seek-plan.md) | v3.7.0 の動画ホイール・マウスボタン割り当て、段階別シーク秒数、詳細表示起点の不具合と静止画サムネイル列5段階の実装計画 |
-| [idle-health-check.md](idle-health-check.md) | 静止中・背面表示中・トレイ常駐中の高速 repaint / work 再投入 / CPU・ログ肥大をリリース前に自動検出する手順と判定値 |
+| [release-check-automation-plan.md](release-check-automation-plan.md) | **2026-10-11利用者採用**。毎リリースのReleaseChecks suite（隔離seed、5 idle、cached／uncached perf）、証拠・既知startup gapの上限500ms・foreground条件・採用run記録。手動／実データ確認の範囲も維持 |
+| [idle-health-check.md](idle-health-check.md) | ReleaseChecks suiteを正規手順とする静止／背面／動画ピン／tray読込中・完了後の条件と判定値。従来の手動scriptはfallback／診断 |
 | [ui-smoke-automation-plan.md](ui-smoke-automation-plan.md) | §1.197 の実アプリ自動検証。診断portable、複数窓PDF、静止画pointer、動画の実OSマウス入力の段階と検証範囲 |
 | [interactive-release-verification.md](interactive-release-verification.md) | 実アプリ起動・操作テストはリリース前等の検証枠で、内容・所要時間を示し利用者の明示了承後に実行する運用 |
 | [v3.7.0-priority-work.md](v3.7.0-priority-work.md) | §1.198 / §1.197 / §1.195 のコード照合、担当移行、設計判断、実行済み検証の台帳 |
@@ -44,7 +52,7 @@
 | [collection-spec-proposal.md](collection-spec-proposal.md) | §1.118 名前付きコレクションの初期仕様案と、その後の利用者判断の記録。現在の操作仕様はマニュアル、実装状態は実装計画 §23 を参照 |
 | [collection-implementation-plan.md](collection-implementation-plan.md) | コレクションの保存・管理UI・一覧・再生・Remoteを触るとき。actorと各画面の所有境界、出荷前修正の実装・検収台帳 |
 | [folder-history-location-plan.md](folder-history-location-plan.md) | **Stage B 実装・自動 gate 完了**。§1.280 / §1.281 / §1.282 の Rating・Collection子の表示位置とフォルダ履歴、A/B・detached の所有境界、Rating 一覧ソート保存の設計・検証台帳。実アプリ smoke は未実行 |
-| [file-type-visibility-plan.md](file-type-visibility-plan.md) | **仕様確定・未実装（利用者決定2026-10-08）**。§1.345の全体ファイル種類設定、全一覧producer・代表画像・本判定・Remoteの共通ポリシーと確定仕様。§1.339の履歴再入場facet退避の独立した根治設計。bf509352dの独立レビュー承認を記録 |
+| [file-type-visibility-plan.md](file-type-visibility-plan.md) | **実装済み・独立レビュー指摘修正と自動検証済み（利用者決定2026-10-08/09、実機確認待ち）**。§1.345の全体ファイル種類設定、全一覧producer・代表画像・本判定・Remoteの共通ポリシー、旧変換cache通知、本内ブックマークのcontext所有と検証記録。§1.339の履歴再入場facet退避の独立した根治設計。bf509352dの独立レビュー承認を記録 |
 | [startup-restore-target-plan.md](startup-restore-target-plan.md) | §1.335「前回終了した場所」の明示一覧所有、物理／本／Drive の復元範囲、旧データの初回移行、ZIP 内階層、一覧復帰要求の受理境界と回帰検証。実機確認は未実施 |
 | [collection-rereview-fixes-20260921.md](collection-rereview-fixes-20260921.md) | v4.0.0再レビューの追加修正。指摘の妥当性、直列の実装範囲、バックアップ・復旧・待機要求の設計合意と検証記録 |
 | [collection-migration-journal-recovery.md](collection-migration-journal-recovery.md) | M-2/M-1 の復旧記録保護。読込失敗時の物理変更の事前停止、旧記録保持、再読込・終了と名前変更 scope の所有境界 |
@@ -72,7 +80,9 @@
 | [web-remote-left-panel-plan.md](web-remote-left-panel-plan.md) | リモートの左パネル (場所 / 検索 / タグ / お気に入り / 本棚) の範囲と、本体一覧との差 |
 | [web-remote-ai-plan.md](web-remote-ai-plan.md) | **段 3b-0〜3b-2 実装・実機確認済み。JPEG 転送 / 端末別画質 mode は実装済み・実機確認待ち**。remote AI アップスケール / デノイズの PC modal 排他、共有 canonical decoder、接続取得 / 切断 drain barrier、App 所有 singleton Runtime、stable remote key、HTTP job、Web UI、画面消灯復帰、VRAM、撤退条件 |
 | [local-adjust-testing.md](local-adjust-testing.md) | 部分補正レイヤーの回帰テスト、合成順、キャッシュ無効化を検証するとき |
-| [search-architecture.md](search-architecture.md) | 検索 / インデクサ / タグを触るとき。**Ctrl+S/F/G の経路 + インデクサパイプライン + DB 責任分離** |
+| [search-architecture.md](search-architecture.md) | 検索 / インデクサ / タグを触るとき。**Ctrl+S/F/G/R の経路、Everythingの共通Search ownership、インデクサパイプライン + DB 責任分離** |
+| [name-index-write-failure-plan.md](name-index-write-failure-plan.md) | §1.369 名前／コンテナ索引の書込失敗。レビュー反映・実装と検証記録。同じDBの起動中1回の通知／予約、通常UIへの配送、Full/watch/clearの共通出口、無害なno-opの維持 |
+| [page-adjustment-owner-plan.md](page-adjustment-owner-plan.md) | §1.372 検索再配置中の補正Undo／draftの保存先。設計R2反映・実装／自動検証／確認用build完了。安定target、context所有draft、共有Undo受理順と最新受付済み文書、終了配送と§1.371 cursor ownerとの関係 |
 | [item-kind-capability-matrix.md](item-kind-capability-matrix.md) | **★ / タグ / 削除 / コピー / 外部ツール / 検索が `GridItem` の種別ごとにどう振る舞うかの現状表**。セルは 対応 / 拒否 / コンテナへ寄せる / **無反応** の 4 値。仮想ページ (ZipImage / PdfPage) を扱う機能を足すときは先にここを見る |
 | [top-level-grid-view.md](top-level-grid-view.md) | 検索・★固定・サブ展開・スマートフォルダ等の最上位一覧 ownership / 復元 snapshot と、スマートフォルダ root / scoped drill の不変条件 |
 | [section257-smart-folder-navigation.md](section257-smart-folder-navigation.md) | スマートフォルダからの PDF 読み込み取消と親復帰位置の不具合。お気に入り表示設定の適用先、root/物理子の所有境界と回帰検証 |
@@ -90,13 +100,13 @@
 | [music-video-export-plan.md](music-video-export-plan.md) | **実装中**。音楽ビデオの共有シーンモデル、CPU ラスタライザ、MP4 書き出し、共有編集 UI、プロジェクト JSON と音付きプレビューの正本 |
 | [music-video-handoff-20260907.md](music-video-handoff-20260907.md) | **2026-09-07 引き継ぎ監査**。コードと過去報告の照合、保存・Undo の未解決事項、検証範囲、P4 前の設計課題、Astra / Sol への担当移行 |
 | [brief-musicvideo-edit-integrity.md](brief-musicvideo-edit-integrity.md) | **実装・独立レビュー完了、実機未確認**。保存要求・素材と Undo・歌詞の行編集・選択状態の所有境界、受入条件、設計判断と検証記録 |
-| [settings-export-import-plan.md](settings-export-import-plan.md) | **§1.317 実装済み (レビュー前)**。環境設定の持ち運び、全452フィールドの分類 (139対象 / 313除外、§1.298とmasterの結合後)、形式 v1、draft → 既存 OK、単一転送 job、利用者承認と検証計画。既存 OK の §1.305 / §1.295 は今回未修正 |
+| [settings-export-import-plan.md](settings-export-import-plan.md) | **§1.317 実装済み (レビュー前)**。環境設定の持ち運び、全458フィールドの分類 (144対象 / 314除外、音響調整タスクバー設定追加後)、形式 v1、draft → 既存 OK、単一転送 job、利用者承認と検証計画。既存 OK の §1.305 / §1.295 は今回未修正 |
 | [comic-integration-plan.md](comic-integration-plan.md) | comic DB、注釈 overlay、編集・書き出しパイプラインの統合契約 |
 | [conceal-feature-plan.md](conceal-feature-plan.md) | 隠蔽加工の形状、保存、合成、キャッシュ無効化の現行仕様 |
 | [panorama-360-view-plan.md](panorama-360-view-plan.md) | **コード実装済み・実素材／実機性能の手動確認は記録上未確認**。360° パノラマ表示、GPano crop、mipmap、settle refinement、fullscreen 合成の現行仕様と設計経緯 |
 | [fullscreen-side-panel-mode-plan.md](fullscreen-side-panel-mode-plan.md) | **実装済み・手動実機確認は記録上未確認**。静止画・動画・音楽で共通のサイドパネル表示モード仕様 |
 | [fullscreen-locked-chrome-suppression-plan.md](fullscreen-locked-chrome-suppression-plan.md) | §1.344 の決定仕様と実装記録。F11 の正確な表示先から導く実効ロック、native 動画・F12・描画/予約/hit の共通契約。2026-10-08に利用者判断・構造合意済み |
-| [fullscreen-specified-scale-plan.md](fullscreen-specified-scale-plan.md) | §1.342 の設計案（利用者判断・独立設計レビュー待ち）。既存fit cycleへ指定サイズを追加、％/物理px・表示単位・保存/転送・Q1〜Q10 |
+| [fullscreen-specified-scale-plan.md](fullscreen-specified-scale-plan.md) | §1.342 の決定仕様と実装記録（2026-10-10の利用者改訂まで反映）。初期幅・高さ80％、表示領域％ / logical point相当のpx、AI前原寸の共通最大倍率（既定5倍）・OFF値保持・PDF需要の収束、連結の中央pair基準、favorite保存 / 共通値転送 |
 | [edit-content-identity-plan.md](edit-content-identity-plan.md) | **Phase 1 実装済み・実機確認済み (A1〜A6)**。OS 側でファイルを移動・コピーしたときに、内容ハッシュで編集内容 (補正 / 消しゴム / モザイク / 注釈 / トリミング / ★ / タグ) を再結合して復元する機能。size → 先頭 64KB → 全体の 3 段照合、`rename_key_migration::STORES` 駆動の batch copy、変換アーカイブの 4 面キー、モーダル確認ウィンドウ |
 | [next-release-backlog.md](next-release-backlog.md) | **次リリース検討バックログ**。いま着手できる未対応の P2/P3、ユーザー要望、依存ライブラリ更新、リリース手順の未解決点だけを恒久管理。完了した項目はこのファイルから削除する |
 | [book-resume-meter-plan.md](book-resume-meter-plan.md) | 本・動画・音声のサムネイルの前回位置。記録時のHUD位置/総数と既存再生位置/長さ、常に左→右、writer移行・全行map、下端帯、Remote NULL、通常削除競合の合意済み割り切り |
@@ -158,7 +168,8 @@
 | [similar-image-search-research.md](similar-image-search-research.md) | 上の前段の調査メモ。類似画像検索 / 重複検出。他ツール (hydrus / digiKam / XnView MP / Eagle / Komga / Immich) の機能と用途、perceptual hash と埋め込みのアルゴリズム比較、100 万件規模の実測 (索引不要という結論)、mIV へ載せる場合の保存先・スコープ・UI 案 |
 | [dpi-multimonitor-issue.md](dpi-multimonitor-issue.md) | マルチモニター DPI 問題の調査記録 |
 | [pdf-issues.md](pdf-issues.md) | PDF サポートの既知問題 |
-| [pdf-pool-context-epoch-plan.md](pdf-pool-context-epoch-plan.md) | PDF レンダ pool の 3 段階優先度と、ナビゲーションで stale 化したジョブを除去する context epoch |
+| [pdf-render-epoch-ownership-plan.md](pdf-render-epoch-ownership-plan.md) | PDF render失効・優先昇格のviewer-context所有。非Clone writer、immutable ticket、非同期prune、registry移譲、同path/pageの兄弟回帰（未リリース） |
+| [pdf-pool-context-epoch-plan.md](pdf-pool-context-epoch-plan.md) | 旧global整数context epoch導入時の履歴。現行契約はviewer-context所有計画 |
 | [pdf-pool-harvest-on-cancel-plan.md](pdf-pool-harvest-on-cancel-plan.md) | cancel 時に in-flight の PDF レンダ結果を回収してキャッシュ保存する `CancelWaitPolicy` |
 | [screenshot-howto.md](screenshot-howto.md) | 製品ページ用スクリーンショット手順 |
 | [e2e-smoke-test.md](e2e-smoke-test.md) | E2E スモークテストのチェックリスト |
@@ -166,6 +177,7 @@
 | [development-build-and-test.md](development-build-and-test.md) | 開発中の `cargo check` / 絞り込みテスト / 軽量 core ビルドと、リリース前の全体テストゲートの使い分け |
 | [test-video-generation.md](test-video-generation.md) | `testimage/movie/test_*fps_*p_sync.mp4` (FFmpeg testsrc2 + sine ビープ) の再生成手順 |
 | [ui-snapshot-policy.md](ui-snapshot-policy.md) | egui_kittest によるスナップショットテストの運用方針 |
+| [ui-snapshot-gpu-investigation.md](ui-snapshot-gpu-investigation.md) | §1.175 の GPU test executable AV / 停滞調査。WGL 初期化で捕捉した AV、CDB 採取ハーネス、共有 GPU fixture の未確定な修正候補 |
 | [startup-dialog-small-screen.md](startup-dialog-small-screen.md) | §1.241の小画面初回設定対策。起動時通知/復元経路の監査と1093×614 / 1366×728の描画回帰 |
 | [downscale-moire-lod-plan.md](downscale-moire-lod-plan.md) | 静止画縮小時のモアレ原因と、vendored `egui-wgpu` による opt-in GPU mipmap、旧手動縮小フィルタの互換撤去方針 |
 | [keymap-spec.md](keymap-spec.md) | キー / マウス操作仕様。フルスクリーン横断の詳細は [fullscreen-navigation-consistency.md](fullscreen-navigation-consistency.md) も参照 |
@@ -188,7 +200,7 @@
 | [ffmpeg-lgpl-current-report.txt](ffmpeg-lgpl-current-report.txt) | 現在の同梱 FFmpeg DLL から抽出した版、ライセンス、configure flags、GPL 混入検査の監査記録。依存更新時に `collect-ffmpeg-lgpl-info.ps1` で再生成する |
 | [video-engine-redesign.md](video-engine-redesign.md) | エンジンの現行仕様 + 初期設計案 / 採否履歴。現行は `Arc<Mutex<EngineActor>>` + UI tick drain。未採用の `TransportController` / 専用 actor thread は将来候補として隔離 |
 | [audio-normalize-scan-bench.md](audio-normalize-scan-bench.md) | 音量ノーマライズ初回スキャン待ち時間の実測用 CLI (`normalize_scan_bench`) と、HDD 上の動画で逐次 / 並列スキャンを比較するときの読み方 |
-| [effetune-integration-plan.md](effetune-integration-plan.md) | 音響調整 (EffeTune Mixwright) の独立DSP段・GUI・状態保存・Remote共有と配布契約。§10はv4.3.0の全bundle同梱・署名・通知・CRT配置、portableの非同梱とUI非表示の利用者決定 |
+| [effetune-integration-plan.md](effetune-integration-plan.md) | 音響調整 (EffeTune Mixwright) の独立DSP段・GUI・状態保存・Remote共有と配布契約。§10は全bundle同梱・署名・CRT配置とportable非同梱、§17はタスクバー表示設定・native caption・通常矩形配送。§17.10は実機確認後の専用音符icon、ボタン入力の寿命、OFFでも通常captionを維持するShell登録と検証台帳。§17.11は最小化中のplugin allocation禁止とprotocol v7互換性判定、§17.12は利用者決定の表示・前面化専用ボタンと前面判定/Hide経路の撤去 |
 | [music-integration-plan.md](music-integration-plan.md) | **主要 Inc 実装完了**。`VideoPlayer` 再利用による音声再生、音楽ビュー、ブックマーク、VST3、動画→音声モードの統合契約と継続保守事項 |
 | [vst3-integration.md](vst3-integration.md) | VST3 統合 — 1 chain = 1 C++ bridge、音声 IPC 1 roundtrip、bridge 内 per-slot STA editor、Rust chain/GUI/persistence/audio hot-path ownership と現行負債 |
 | [settings-sqlite-migration.md](settings-sqlite-migration.md) | 設定永続化を `settings.json` から `settings.db` (SQLite) に移行する spec。transient NotFound による設定消失事故の構造的解消、将来版の未知設定値を `Incompatible` として無変更・save 抑止にする downgrade 保護、VST3 BLOB の dirty-skip による I/O 浪費解消。4 ラウンドの Codex review 反映済み |

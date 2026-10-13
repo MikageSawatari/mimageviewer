@@ -63,7 +63,7 @@ public:
     /// resizeView で SetWindowPos するために必要 (= プロセス境界をまたぐ HWND
     /// 操作も Win32 API は許容)。
     void set_host_hwnd(void* hwnd) { host_hwnd_ = hwnd; }
-    /// When false, `resizeView` still forwards `onSize` to the plugin view but
+    /// When false, `resizeView` still forwards `onSize` for a normal frame but
     /// does not resize the host outer HWND. Used for fixed-size plugins after
     /// restoring a user-saved outer shell size.
     void set_host_resize_enabled(bool enabled) { host_resize_enabled_ = enabled; }

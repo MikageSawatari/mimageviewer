@@ -112,18 +112,32 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
 
 fn main() {
     miv_startup::init_process(Role::Launcher, VERSION, false);
-    match run() {
+    let code = complete_launcher(run(), show_error);
+    if code != 0 {
+        std::process::exit(code);
+    }
+}
+
+fn complete_launcher(result: Result<&str, String>, present_error: impl FnOnce(&str)) -> i32 {
+    let (code, error) = match result {
         Ok(reason) => {
             miv_startup::record_detail("launcher_terminal", reason);
             miv_startup::terminal(Outcome::Ok);
+            (0, None)
         }
-        Err(e) => {
-            miv_startup::record_detail("launcher_terminal", &e);
+        Err(error) => {
+            miv_startup::record_detail("launcher_terminal", &error);
             miv_startup::terminal(Outcome::Error);
-            show_error(&e);
-            std::process::exit(1);
+            (1, Some(error))
         }
+    };
+    // Final process boundary, after all launcher producers. Never join a stalled owner.
+    let _ =
+        miv_startup::shutdown_until(std::time::Instant::now() + std::time::Duration::from_secs(2));
+    if let Some(error) = error {
+        present_error(&error);
     }
+    code
 }
 
 /// Observe the existing operation at its ownership boundary; diagnostics never
@@ -1084,5 +1098,66 @@ mod tests {
 
         super::extract_asset(&runtime_dir, asset).unwrap();
         assert_eq!(super::sha256_file_hex(&extracted).unwrap(), asset.2);
+    }
+}
+
+#[cfg(test)]
+mod final_boundary_tests {
+    #[test]
+    fn launcher_success_and_error_exit_preserve_startup_tail() {
+        for (outcome, code) in [("ok", 0), ("error", 1)] {
+            let directory = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "final_boundary_tests::launcher_exit_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("MIV_LAUNCHER_EXIT_TEST", outcome)
+                .env("LOCALAPPDATA", directory.path())
+                .env_remove(miv_startup::HANDOFF_ENV)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(code), "{:?}", output);
+            let log = std::fs::read_dir(directory.path().join("mimageviewer/startup-logs"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+                .unwrap();
+            let rows = std::fs::read_to_string(log)
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            assert!(rows.iter().any(|row| row.contains("pending-before-exit")));
+            assert!(
+                rows.last()
+                    .unwrap()
+                    .contains("\"name\":\"process.terminal\"")
+            );
+            let outcome = if code == 0 { "Ok" } else { "Error" };
+            assert!(
+                rows.last()
+                    .unwrap()
+                    .contains(&format!("\"outcome\":\"{outcome}\""))
+            );
+        }
+    }
+    #[test]
+    #[ignore = "isolated actual launcher completion and process exit"]
+    fn launcher_exit_child() {
+        let outcome = std::env::var("MIV_LAUNCHER_EXIT_TEST").unwrap();
+        miv_startup::init_process(miv_startup::Role::Launcher, super::VERSION, false);
+        for _ in 0..512 {
+            miv_startup::record_detail("exit-fixture", "pending-before-exit");
+        }
+        let result = if outcome == "ok" {
+            Ok("test-success")
+        } else {
+            Err("test-error".to_owned())
+        };
+        let code = super::complete_launcher(result, |_| {});
+        std::process::exit(code);
     }
 }

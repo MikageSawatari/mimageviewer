@@ -800,7 +800,7 @@ fn still_seek_f6_real_overlay_rotation_snapshots() {
         }
         let mut initialized = false;
         let hover = std::cell::Cell::new(egui::Pos2::ZERO);
-        let mut harness = egui_kittest::Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(640.0, 480.0))
             .build(|ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);

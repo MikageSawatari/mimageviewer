@@ -37,7 +37,20 @@ use windows::core::{HSTRING, PCWSTR};
 /// 1 のままだと stale bridge を検出できなかった。2 へ上げることで v0.8.x 以前の
 /// `mimageviewer-vst3-host.exe` (version=1 を返すだけ) を新 Rust 側で reject できる。
 /// v5: checked GUI-thread presentation outcomes and shared suppression epochs.
-pub const PROTOCOL_VERSION: u32 = 5;
+// v6: bounded, fire-and-forget Now Playing snapshots.
+// v7: frame-scoped GUI close/normal geometry and taskbar presentation commands.
+pub const PROTOCOL_VERSION: u32 = 7;
+
+pub(crate) fn require_current_protocol(reported: u32) -> Result<(), String> {
+    if reported == PROTOCOL_VERSION {
+        Ok(())
+    } else {
+        Err(format!(
+            "VST3 bridge protocol version mismatch (bridge reported {reported}, mIV expects {PROTOCOL_VERSION})"
+        ))
+    }
+}
+pub const MAX_CONTROL_MSG_SIZE: usize = 32 * 1024 * 1024;
 pub(crate) const STATE_WATCHDOG_EXIT_CODE: u32 = 0xEFFE_C001;
 
 static NEXT_AUDIO_PIPE_ID: AtomicU64 = AtomicU64::new(0);
@@ -74,6 +87,17 @@ pub fn shm_size_bytes(capacity_samples: u32) -> u64 {
 #[serde(tag = "cmd")]
 #[serde(rename_all = "lowercase")]
 pub enum Cmd {
+    #[serde(rename = "set_now_playing")]
+    SetNowPlaying {
+        slot_id: u64,
+        revision: u64,
+        title: Arc<str>,
+        album: Arc<str>,
+        artist: Arc<str>,
+        artwork: Arc<str>,
+        #[serde(rename = "artworkMimeType")]
+        artwork_mime_type: Arc<str>,
+    },
     Hello {
         version: u32,
     },
@@ -220,8 +244,20 @@ pub enum Event {
         slot_id: u64,
         #[serde(default)]
         container_hwnd: u64,
+        #[serde(default)]
+        normal_rect: Option<NormalScreenRect>,
     },
     GuiDetached,
+    GuiWarning {
+        slot_id: u64,
+        container_hwnd: u64,
+        detail: String,
+    },
+    GuiNormalRect {
+        slot_id: u64,
+        container_hwnd: u64,
+        normal_rect: NormalScreenRect,
+    },
     GuiVisibilityResult {
         request_id: u64,
         slot_id: u64,
@@ -230,6 +266,10 @@ pub enum Event {
     GuiUserHidden {
         #[serde(default)]
         slot_id: u64,
+        #[serde(default)]
+        container_hwnd: u64,
+        #[serde(default)]
+        normal_rect: Option<NormalScreenRect>,
     },
     GuiBypassToggle {
         #[serde(default)]
@@ -281,9 +321,47 @@ pub enum GuiVisibilityOutcome {
     Error,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Immutable host GUI-thread snapshot, in virtual-screen physical pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct NormalScreenRect {
+    pub x: i32,
+    pub y: i32,
+    pub outer_width: u32,
+    pub outer_height: u32,
+}
+
+impl NormalScreenRect {
+    pub(super) fn valid(self) -> bool {
+        self.outer_width > 0
+            && self.outer_height > 0
+            && i32::try_from(self.outer_width)
+                .ok()
+                .and_then(|w| self.x.checked_add(w))
+                .is_some()
+            && i32::try_from(self.outer_height)
+                .ok()
+                .and_then(|h| self.y.checked_add(h))
+                .is_some()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GuiVisibilitySignal {
-    Closed(u64),
+    Warning {
+        slot_id: u64,
+        container_hwnd: u64,
+        detail: String,
+    },
+    Closed {
+        slot_id: u64,
+        container_hwnd: u64,
+        normal_rect: Option<NormalScreenRect>,
+    },
+    NormalRect {
+        slot_id: u64,
+        container_hwnd: u64,
+        normal_rect: NormalScreenRect,
+    },
     Checked {
         slot_id: u64,
         outcome: GuiVisibilityOutcome,
@@ -291,17 +369,17 @@ pub enum GuiVisibilitySignal {
 }
 
 impl GuiVisibilitySignal {
-    pub(super) fn projection(self) -> Option<(u64, bool, bool)> {
+    pub(super) fn projection(&self) -> Option<(u64, bool, bool)> {
         match self {
-            Self::Closed(slot) => Some((slot, false, true)),
+            Self::Closed { slot_id, .. } => Some((*slot_id, false, true)),
             Self::Checked {
                 slot_id,
                 outcome: GuiVisibilityOutcome::Shown,
-            } => Some((slot_id, true, false)),
+            } => Some((*slot_id, true, false)),
             Self::Checked {
                 slot_id,
                 outcome: GuiVisibilityOutcome::Hidden,
-            } => Some((slot_id, false, false)),
+            } => Some((*slot_id, false, false)),
             _ => None,
         }
     }
@@ -408,6 +486,8 @@ pub struct Bridge {
     stdin: Mutex<Option<ChildStdin>>,
     #[cfg(test)]
     fake_commands: Option<std::sync::mpsc::Sender<serde_json::Value>>,
+    #[cfg(test)]
+    fake_command_threads: Mutex<Vec<String>>,
     /// 同期 event 受信用 channel。spawn 時に起動した event-pump スレッドが
     /// stdout を読んで非同期 (LatencyChanged / ResetDone) 以外の event をここに流す。
     /// recv() はここから読む。
@@ -450,8 +530,38 @@ fn route_gui_signal(
     wake: Option<&GuiSignalWake>,
 ) -> bool {
     let queued = match event {
-        Event::GuiUserHidden { slot_id } => user_hidden_tx
-            .try_send(GuiVisibilitySignal::Closed(*slot_id))
+        Event::GuiUserHidden {
+            slot_id,
+            container_hwnd,
+            normal_rect,
+        } => user_hidden_tx
+            .try_send(GuiVisibilitySignal::Closed {
+                slot_id: *slot_id,
+                container_hwnd: *container_hwnd,
+                normal_rect: *normal_rect,
+            })
+            .is_ok(),
+        Event::GuiWarning {
+            slot_id,
+            container_hwnd,
+            detail,
+        } => user_hidden_tx
+            .try_send(GuiVisibilitySignal::Warning {
+                slot_id: *slot_id,
+                container_hwnd: *container_hwnd,
+                detail: detail.clone(),
+            })
+            .is_ok(),
+        Event::GuiNormalRect {
+            slot_id,
+            container_hwnd,
+            normal_rect,
+        } => user_hidden_tx
+            .try_send(GuiVisibilitySignal::NormalRect {
+                slot_id: *slot_id,
+                container_hwnd: *container_hwnd,
+                normal_rect: *normal_rect,
+            })
             .is_ok(),
         Event::GuiVisibilityResult {
             slot_id, outcome, ..
@@ -685,6 +795,8 @@ impl Bridge {
                         }
                         Ok(event @ Event::GuiVisibilityResult { .. })
                         | Ok(event @ Event::GuiUserHidden { .. })
+                        | Ok(event @ Event::GuiNormalRect { .. })
+                        | Ok(event @ Event::GuiWarning { .. })
                         | Ok(event @ Event::GuiBypassToggle { .. }) => {
                             route_gui_event(&event, &gui_visibility_tx, &gui_bypass_toggle_tx,
                                 gui_signal_wake.as_ref(), &pending_gui_for_pump);
@@ -757,6 +869,8 @@ impl Bridge {
             stdin: Mutex::new(Some(stdin)),
             #[cfg(test)]
             fake_commands: None,
+            #[cfg(test)]
+            fake_command_threads: Mutex::new(Vec::new()),
             event_rx,
             sync_call_mutex: Mutex::new(()),
             cached_latency_samples: cached_latency,
@@ -1097,6 +1211,12 @@ impl Bridge {
         }
         let payload = serde_json::to_vec(cmd)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        if payload.len() > MAX_CONTROL_MSG_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "control message too large",
+            ));
+        }
         let len = u32::try_from(payload.len()).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "message too large")
         })?;
@@ -1114,12 +1234,22 @@ impl Bridge {
     pub fn send_value(&self, value: &serde_json::Value) -> std::io::Result<()> {
         #[cfg(test)]
         if let Some(commands) = &self.fake_commands {
+            self.fake_command_threads
+                .lock()
+                .unwrap()
+                .push(std::thread::current().name().unwrap_or("unnamed").into());
             return commands.send(value.clone()).map_err(|_| {
                 std::io::Error::new(std::io::ErrorKind::BrokenPipe, "fake host disconnected")
             });
         }
         let payload = serde_json::to_vec(value)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        if payload.len() > MAX_CONTROL_MSG_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "control message too large",
+            ));
+        }
         let len = u32::try_from(payload.len()).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "message too large")
         })?;
@@ -1138,6 +1268,11 @@ impl Bridge {
     /// 内部的には event-pump スレッドが stdout から読み出して channel に流したものを取得。
     /// LatencyChanged event は pump が intercept して `cached_latency_samples` に
     /// 直接反映するため、ここには来ない (= 同期待ちを妨げない)。
+    #[cfg(test)]
+    pub(crate) fn fake_command_threads_for_test(&self) -> Vec<String> {
+        self.fake_command_threads.lock().unwrap().clone()
+    }
+
     pub fn recv(&self) -> std::io::Result<Event> {
         match self.event_rx.recv() {
             Ok(result) => result,
@@ -1176,7 +1311,6 @@ fn read_event_blocking(stdout: &mut ChildStdout) -> std::io::Result<Event> {
     // (= ML / preset 内蔵 plugin)。
     // **C++ 側 `crates/vst3-host/include/protocol.h::MAX_CONTROL_MSG_SIZE`
     // と必ず一致**させること。protocol.h を変えたらここも変える。
-    const MAX_CONTROL_MSG_SIZE: usize = 32 * 1024 * 1024;
     if len > MAX_CONTROL_MSG_SIZE {
         let mut remaining = len;
         let mut scratch = [0u8; 64 * 1024];
@@ -1553,6 +1687,49 @@ mod concurrent_state_tests {
     use super::*;
 
     #[test]
+    fn protocol_handshake_rejects_v6_ready_before_any_audio_or_gui_command() {
+        let (bridge, commands, events) = Bridge::fake_host_for_test();
+        bridge
+            .send(&Cmd::Hello {
+                version: PROTOCOL_VERSION,
+            })
+            .unwrap();
+        let hello = commands
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(hello["cmd"], "hello");
+        assert_eq!(hello["version"], PROTOCOL_VERSION);
+        events.emit(Event::Ready { version: 6 });
+        let Event::Ready { version } = bridge.recv().unwrap() else {
+            panic!("fake legacy host must reply Ready")
+        };
+        let error = require_current_protocol(version).unwrap_err();
+        assert!(error.contains("bridge reported 6"));
+        assert!(
+            commands.try_recv().is_err(),
+            "rejected peer must not receive open or show_gui"
+        );
+    }
+
+    #[test]
+    fn protocol_handshake_accepts_current_ready() {
+        let (bridge, commands, events) = Bridge::fake_host_for_test();
+        bridge
+            .send(&Cmd::Hello {
+                version: PROTOCOL_VERSION,
+            })
+            .unwrap();
+        assert_eq!(commands.recv().unwrap()["version"], PROTOCOL_VERSION);
+        events.emit(Event::Ready {
+            version: PROTOCOL_VERSION,
+        });
+        let Event::Ready { version } = bridge.recv().unwrap() else {
+            panic!("fake current host must reply Ready")
+        };
+        require_current_protocol(version).unwrap();
+    }
+
+    #[test]
     fn probe_and_open_preserve_utf8_windows_paths_in_ipc() {
         let path = r"C:\Users\山田😀\音響調整\EffeTune Mixwright.vst3";
         let commands = [
@@ -1616,7 +1793,11 @@ mod concurrent_state_tests {
         ));
         assert_eq!(
             hidden_rx.try_recv().unwrap(),
-            GuiVisibilitySignal::Closed(17)
+            GuiVisibilitySignal::Closed {
+                slot_id: 17,
+                container_hwnd: 0,
+                normal_rect: None
+            }
         );
         assert!(repaint_count.load(Ordering::SeqCst) > 0);
 
@@ -1660,7 +1841,11 @@ mod concurrent_state_tests {
             None
         ));
         assert!(route_gui_signal(
-            &Event::GuiUserHidden { slot_id: 7 },
+            &Event::GuiUserHidden {
+                slot_id: 7,
+                container_hwnd: 0,
+                normal_rect: None
+            },
             &visibility_tx,
             &bypass_tx,
             None
@@ -1960,6 +2145,87 @@ mod effetune_host_handler_tests {
                 )
                 .unwrap_err(),
             "reset deadline expired"
+        );
+    }
+}
+#[cfg(test)]
+mod now_playing_wire_tests {
+    use super::*;
+    #[test]
+    fn now_playing_typed_command_serializes_cmd_first_with_exact_wire_keys() {
+        let title = "曲😀 \\\"cmd\\\": \\\"slot_id\\\" \\\\ tail";
+        let command = Cmd::SetNowPlaying {
+            slot_id: 17,
+            revision: 4,
+            title: title.into(),
+            album: "アルバム".into(),
+            artist: "artist".into(),
+            artwork: "".into(),
+            artwork_mime_type: "".into(),
+        };
+        let bytes = serde_json::to_vec(&command).unwrap();
+        assert!(bytes.starts_with(b"{\"cmd\":\"set_now_playing\""));
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["title"], title);
+        assert_eq!(value["slot_id"], 17);
+        assert_eq!(value["artworkMimeType"], "");
+        assert_eq!(
+            value
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                "cmd",
+                "slot_id",
+                "revision",
+                "title",
+                "album",
+                "artist",
+                "artwork",
+                "artworkMimeType"
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert!(matches!(
+            serde_json::from_slice::<Cmd>(&bytes).unwrap(),
+            Cmd::SetNowPlaying {
+                slot_id: 17,
+                revision: 4,
+                ..
+            }
+        ));
+        assert!(
+            serde_json::from_str::<Event>(r#"{"event":"now_playing_ack","slot_id":17}"#).is_err()
+        );
+    }
+    #[test]
+    fn now_playing_maximum_artwork_serializes_inside_control_frame() {
+        use base64::Engine;
+        let data = vec![42; 8 * 1024 * 1024];
+        let artwork = base64::engine::general_purpose::STANDARD.encode(&data);
+        assert_eq!(artwork.len(), 11_184_812);
+        let command = Cmd::SetNowPlaying {
+            slot_id: 3,
+            revision: 8,
+            title: "曲😀".into(),
+            album: "".into(),
+            artist: "".into(),
+            artwork: artwork.into(),
+            artwork_mime_type: "image/png".into(),
+        };
+        let bytes = serde_json::to_vec(&command).unwrap();
+        assert!(bytes.len() < MAX_CONTROL_MSG_SIZE);
+        let Cmd::SetNowPlaying { artwork, .. } = serde_json::from_slice(&bytes).unwrap() else {
+            panic!("wrong command");
+        };
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(&*artwork)
+                .unwrap(),
+            data
         );
     }
 }

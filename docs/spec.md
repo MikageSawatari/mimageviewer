@@ -1,5 +1,24 @@
 # mimageviewer 仕様書
 
+### Everything ファイル名検索（§1.374、実装中・検証待ち）
+
+- mainの一覧で `GlobalEverythingSearch`（Grid / Press / 既定Ctrl+R）、または
+  「ファイル → Everything ファイル名検索…」から開く。閉じる操作は×/Esc。操作カスタマイズで変更/解除できる。
+  text/IME/focus recovery、modal、Remote lock、fullscreen/native動画/detachedからは起動しない。
+- 同じPCで起動中のEverything通常版1.4.1以降の既定clientへ直接IPCする。serviceだけでは利用不可。
+  Everything本体/SDK DLLを同梱せず、named instance選択・Lite・1.5 alphaの専用対応は初版対象外。
+  mIV索引の有効化は不要。queryをそのまま明示送信し、IME確定後Enter/検索ボタンを使う。
+- raw先頭10,000件、offset paging/追加表示なし。folder/非対応形式もraw上限を消費する。
+  返却後に対応形式、表示種類、EPUB/変換書庫設定を適用し、対応候補のstat/編集情報を背景で準備する。
+  取得/準備中はmainの取消可能modal。完了後に一括採用し、取消/失敗は前のaccepted一覧を維持する。
+- flat一覧は通常sort/詳細表示/★/tag/閲覧を共有する。Ctrl+Gの集約/hit-count sort/全文対象フィルタは出さない。
+  ZIP内部entry/PDFページは検索せず外側本体を通常openする。成功した物理childからの帰路は保持datasetの
+  共通prepareで作り、IPCを再送しない。検索を閉じると共通Searchのoriginへ戻る。
+- 新しいSettings field/DB/schema/索引/Remote query endpoint/result共有は追加しない。
+  query/result一覧を永続化・診断ログへ保存せず、通常open/tag/★/cacheの保存と既存F12 viewer機能は維持する。
+  PDF prerequisiteは独立ACCEPT済み `4510346f5`（master `c1e66f589`）。Everything最新実装の独立レビュー、
+  自動gate、確認build、利用者の実Everything確認は未完了。[設計・検証台帳](everything-search-plan.md#14-実装記録2026-10-12検証待ち)。
+
 ### 音声一覧の画像 (§1.347、2026-10-08 決定)
 
 音声の一覧・詳細 hover・mIV Remote は、同じフォルダ / stem の画像、MP3 の埋め込み画像、音楽アイコンの順で表示する。埋め込み画像はファイル先頭の ID3v2 タグ一つだけを読み、前面表紙を優先する。後続 / 末尾タグのみの表紙は対象外で、同名画像で補える。非 MP3 も同名画像を使う。
@@ -115,6 +134,35 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
 - ZIP / PDF ページと Stack、動画の `CurrentFrame`、見開きの
   `Merged` / `BothPages` / `MainPageOnly` は materializer の実体化対象。
 - 環境設定は左ツリー上部の検索欄で項目名・関連語・ページ名・カテゴリ名を AND 部分一致検索でき、結果を選ぶと該当ページの項目へスクロールして一時的に強調表示する。
+- 環境設定「ファイル処理 → 表示するファイル種類」はアプリ全体の一覧の基礎層。
+  画像 / RAW / 動画 / 音声 / ZIP / PDF / EPUB / RAR / 7z / LZH と拡張子単位の除外を
+  `Settings.file_type_visibility` に保存する。既定・旧設定の欠落時は全表示。同名優先や
+  本判定・スタック・集約・代表選定の前に適用し、現在地フィルタとは AND で組み合わせる。
+  実フォルダとドライブは通路として残し、Remote も本体の最新設定を使う。
+  評価・タグ・ブックマーク・コレクション登録・手動順・代表 pin・索引は削除しない。
+  除外された代表 pin は登録を保ち、自動代表またはアイコンへ切り替える。
+  動画の sidecar 画像は補助入力なので、画像の除外後も利用できる。
+  OK で確定し検索・サブ展開・一時 snapshot を閉じて元の場所を再読込する。開いている
+  PC viewer の読順・再生は終了まで維持し、次の一覧生成・open から新設定を使う。
+  Remote は次の一覧・読出し要求から新設定を使う。
+  ツールバーには同じ環境設定を開く任意登録項目と適用中の印を置く。
+  コレクション並べ替えは可視 ID の slot だけを置換して全登録順を保存する。
+  ブックマークとコレクションの「表示 X / 登録 Y」は、表示数と除外前の登録総数を区別する。
+  OS の関連付け・コマンドラインから明示された単体の画像 / RAW / 動画 / 音声は、
+  除外設定中でもそのファイルを開く。親一覧は除外後のまま保持し、前後移動は表示対象の
+  兄弟へ進む。この例外は書庫・文書、一覧からの操作、Remote には適用しない。
+  読書位置は論理ページ identity を照合し、除外されたページを同じ raw index の別画像で
+  代用しない。旧 raw-only 記録は除外適用時に自動復元を見送り通知する。
+  同じ書庫内の実 directory `book.zip/` とネスト書庫 `book.zip` の同名衝突は非対応
+  （2026-10-08 利用者決定）。既存 reader のネスト書庫としての扱いを維持する。
+  評価・検索・登録一覧が変換cache内の実在ページを参照するときは、元書庫が削除・更新
+  されてもそのcache自身の来歴で内部形式を判定する。来歴のない旧cacheの実在項目は、
+  内部形式の除外に来歴が必要な場合だけ一時的に隠して再生成を案内する。登録は保持し、
+  元書庫への欠落登録・cache内でも欠落したmemberの従来の削除経路は維持する。
+  cache-root所属判定は通常／Windows canonical verbatimのdrive・UNC表記と大小文字を
+  共通helperで照合する。RAW先読みとRemoteのFile／ZipDirectory代表選定も同じ判定を
+  通り、RAW識別では直接memberの中央directoryと取消可能なmanifestだけを読み、
+  入れ子の器を展開しない。保存済みDBキーと公開Remote addressは変更しない。
 - 環境設定「ファイル処理 → RAW 現像」（「Susie プラグイン」の直後）に「同時現像数」(`raw_develop_parallelism`: 1〜10、既定 3) と「明るさ」(`raw_brightness: RawBrightness`: `MatchPreview` = プレビューに合わせる / `None` = 補正しない、既定 MatchPreview) を置く。「並列読み込み」には通常画像と PDF の設定を置く。検索は RAW・現像・同時現像数・明るさ・プレビューなどから専用ページへ移動する。現像数は executor の変更が成功したときだけ設定へ反映し、途中の worker 起動失敗では以前の上限を維持して画面へエラーを返す。明るさ変更は全 viewer context の RAW 入力を再現像し、サムネイルと非 RAW ページは保持する。未リリース設定なので migration は作らない。
 - v2.7.0では「メタ情報をエクスポート / インポート」を安定化のため一時非表示にしたが、
   v2.8.0の継続開発で再表示する。実フォルダ表示中だけ使用できる。既存の自動
@@ -122,7 +170,7 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
   directoryへ、評価、タグ（表示順・最近使用順を保つ適用時刻と空タグを含む決定状態を含む）、
   動画・音声ブックマーク（横断一覧用WebPサムネイルを含む）、
   本ブックマーク、見開きモード・
-  連結方式・綴じ方向、表示トリム（本 / ページ）、非破壊回転、ページごとの画像補正・
+  連結方式・綴じ方向、本別見開き調整、表示トリム（本 / ページ）、非破壊回転、ページごとの画像補正・
   消しゴムマスク・隠蔽加工・部分補正・書き出しクロップ・テキスト注釈、フォルダ / 本の
   代表サムネピン、動画ピン（位置と WebP）を保存する。`mimageviewer.dat` の自動バックアップ
   設定が OFF でも、明示 export は中央 DB からこれらを読み、自己完結した manifest を作る。
@@ -154,6 +202,11 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
   `spread.db`は本の見開き・連結方式・綴じ方向がexport元環境のグローバル既定と一致すると行を持たないため、
   その本に明示値はexportされず、移送先では移送先のグローバル既定を使う。グローバル設定自体を
   転送対象外とする仕様に対応した挙動である。
+  本別見開き調整はmetadata transfer v10の`spread_shifts`とcoverageに含む。scopeは元本の
+  logical rootと実効ZIP level prefix、anchorはPageRefで、変換cacheの物理keyへ置換しない。
+  OFF休眠・Missingの保存値も搬送する。covered範囲の未記載scopeは既存調整をClearし、
+  coverage外は保持する。v7/v8/v9の字段不在は既存値を保持する。settings transferには
+  全体記憶boolだけを含め、本別anchorは含めない。外部フォルダ移動にはexport/importを使える。
 - インポートは先に sidecar 全体を検証し、存在件数、欠落件数、ファイル種別・サイズ相違件数を
   確認表示してから実行する。sidecar に記載された物理項目は、含まれる各メタ情報区分を
   ファイル単位で上書きする（空の区分は既存値を消す）。sidecar に記載がないファイルの
@@ -590,6 +643,44 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
   fill/選択strokeはLight 2.27 / Dark 1.94。比較と実測は設計書§14へ記録する。
   一覧はメモリ上の記録を参照し、描画から本の走査・ページ数取得・DB 読み取りを行わない。
 
+### 範囲選択の起点 (§1.370、2026-10-11)
+
+サムネイル・詳細一覧とも、範囲を伸ばさないカーソル移動は移動先を次の Shift 選択の起点にする。
+Shift+クリックと Shift+一覧カーソル移動だけは起点を保持する。Shift+キーのチェックは従来どおり
+移動元から移動先までを加算する。Shift+クリックは Explorer 方式では範囲に置換、Check 方式では加算する。
+通常 / Ctrl クリック、右クリック・右ドラッグ開始、キー・パッド・リングによる移動でチェックを
+保持 / 解除する既存規則は維持し、Ctrl 解除で単一選択へ戻った場合の起点は結果のカーソルに合わせる。
+
+カーソルと起点の更新は `apply_grid_cursor_move` の `GridCursorMove::Move / Extend` が所有する。
+App の通常移動入口は `move_grid_cursor`。入力先ごとの起点代入やフレーム末尾の補正は設けない。
+退避一覧の世代なし index も、内部の `apply_grid_cursor_move_indices` で同じ遷移を適用する。
+一覧世代と起点は既存 `GridClickSelectionAnchor` に保持し、Shift 開始時に世代と表示順への所属を検査する。
+起点が失効していれば可視カーソル、可視カーソルもなければ移動対象を起点にする。
+状態の組合せ削減は既存カーソルと起点を同じ遷移で確定することで行う。待機・復旧・新しい pending 状態は不要。
+まれな失敗は既定の割り切り方針（ログ + 通知）による。
+
+| 入口 / 遷移 | 起点の扱い |
+| --- | --- |
+| 全画面のページ送り、先頭 / 末尾 / seek、連続読み、スタックジャンプ、スライドショー、画像 / 動画 / 音声の前後移動、Esc 復帰 | 実際に移したカーソルへ更新。全画面で Shift を使うジャンプも範囲拡張ではない |
+| 見開き調整の metadata / retained 再採用 | 同じページのレイアウト更新では保持。unit 先頭への正規化で別ページへ移る場合だけ `move_grid_cursor` を呼ぶ |
+| 一覧の矢印 / PageUp・Down / Home・End、パッド、リング / ジェスチャの先頭 / 末尾 | 通常移動は更新。Shift 派生キーは保持。既定の Shift 派生は矢印だけで、その他は既存 keymap の完全一致受付を維持 |
+| フォルダ・ZIP / PDF 階層移動、履歴・読書位置・起動先・操作後の選択復元 | 復元したカーソルへ更新 |
+| 検索 / filter / rating / bookmark の表示変更 | 非表示カーソルの近傍移動・初期選択・別一覧の復元は更新。同じ item identity の整数 index 再マップは起点も同じ identity へ保持 |
+| スタック集約 / 展開・Collection / smart folder / サブ展開の一覧 | 新一覧に解決したカーソルへ更新。退避した同じ smart-folder 一覧の復元は保存したカーソル・起点を一緒に復元 |
+| 一覧内削除 | 生き残った同一項目の reindex は保持。カーソル項目の削除による別項目への移動は、同じ数値 index でも更新 |
+| 詳細表示への切替 / 詳細ソート | 表示形式だけでカーソルが動かなければ保持。移動・範囲は `current_grid_order` の表示順で解く |
+| F12 の linked viewer | viewer から別項目へカーソルが動くと更新。同じカーソルの grid → viewer 同期は保持 |
+| F12 独立 / passive / mounted context | 既存 bundle の selected・起点・世代を対で移譲。移動は mounted context 内だけに適用し、兄弟 context を変更しない |
+| Remote | PC へ返す fullscreen restore のカーソルは通常移動。Remote 自身のページ / 読書位置は PC の起点を借用せず、返却時の既存 reload / 復元経路に従う |
+| type-ahead | 現在の一覧には文字によるカーソル移動の実装がない。検索文字入力は検索 / filter の行を参照 |
+
+§1.371 の予定する「評価後に現在ページが非表示なら近傍ページへ移動」も通常移動であり、
+移動先決定後に `move_grid_cursor` を呼べる。通常 `Move` は移動先が既存 selected と同じ整数でも
+起点を確立でき、`sync_main_selection_from_viewer_idx` の同じカーソルへの linked 追従同期とは区別する。
+評価・Undo の移動先決定は §1.371 の所有者に任せ、本修正では変更しない。
+実装の状態 / handler 回帰は `app::grid_cursor_tests`。
+実機 UI は未確認。
+
 ### 3.1 仮想スクロール
 
 ```
@@ -830,6 +921,64 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
 
 ### 4.2 表示仕様
 
+- 本別見開き調整 (§1.364 D1–D3): `Ctrl+←/→` の1ページずらしを、既定ONの
+  `remember_spread_shift_per_book`に従って`spread_shift.db`へ非同期保存する。
+  保存するのはキー押下位置や符号offsetではなく実際のre-pairing anchorのPageRef。
+  本はlogical root + 実効ZIP level prefixで区別し、items/nav変更後もidentityから解決する。
+  Missing/filteredは他ページへ代用せず保存値を保持し、ページ復帰後は再解決できる。
+  新規/再入場は先行shift/resume writeの完了を満たした一つの受入結果からfirst unitを作る。
+  normal exitは先行writeをdrainする。履歴/読書位置の削除は調整を削除しない。
+  各viewerのlive調整はcontext別。同本siblingsをsave後に移動・再pairせず、最新保存値は
+  次の入場で使う。F12のfork/park/mount/closeはlive stateを移送/終了するだけで保存しない。
+  retained ONは受入済みidentity indexで再採用し、bundle内のtyped read ownerが待機を持つ。
+  fresh-openのglobal Commonと別contextのretained readは併存し、既存target-context gate/dialogで
+  対象窓だけを止める。兄弟窓の操作を維持し、parkはreceiverだけをdrop、forkはreceiverをcloneしない。
+  再採用はfresh cutoffを捕捉する。OFFはlive調整を保つ。
+  明示ON/OFFはretained待機を取り消し、受入済みの兄弟窓へ旧保存値を適用しない。
+  fresh-open待機は元のresume cutoffと捕捉済み対象を保ち、新settings世代・現在のshift受付cutoffで
+  依存を再受付する。設定変更で元の読書位置の完了待ちを失わない。
+  差し替えはshift依存のみで、元のresume receiver・取得済み位置も保持する。
+  resumeのroot資格・保存キーは既存記録producerと共用し、単一ラッパーZIP・変換書庫も同じfenceを通す。
+  retained/import復元は現在の実ページを含むunitへ正規化するだけで共有resume/historyを書かない。
+  importの捕捉FIFO読取はContextRequest workerで待ち、context/items世代採用後に
+  current scope + ON + Automaticの一致で使う。成功済みページ改名のmappingは同じ本のlive PageRefへ
+  pureに反映し、追加save/mountなし。snapshotはdurable scopeを切り離して現在のnumeric session組を保つ。
+  import後のshift再採用は実際にcommitで変更したscopeだけに限定する。
+  root改名はD1の永続storeだけを移し、開いているcontextの参照元・items・identity index・pending load・
+  addressとshift scopeを旧rootに保つ。mainの旧path再読込・F12の旧items保持はmasterの挙動を維持し、
+  live追従・自動reopen・同一本pending-open直列化は追加しない。新rootは改めて開くときに使う。
+  旧contextのSet/Clearは旧keyを再作成・解除し得るが新rowへ読み替えない（2026-10-11利用者決定）。
+  D1の単一FIFOが受理済みshift write/read/root操作を整列する。
+  snapshotのanchor remapはfullscreenの有無によらずitems交換で行う。case/slash衝突は受入列の先頭slotを選ぶ。
+  保守中のSet/Clearは既存FIFOへ受理し、完了replyの種別から保存/解除を通知する。
+  記憶OFFは現表示をsession扱いで保持し、保存値を休眠させ、新規openの復元とnudge保存を止める。
+  OFF→ONは適格な操作元Bookのlive調整だけを保存し、調整なしではその場で旧保存値を適用しない。
+  siblings/parkedを一斉保存しない。明示ClearはOFF中もlive調整と保存値を消す (Q1)。
+  mode再押下・mode/flow/direction変更は従来のsession resetに加え、ONなら保存値もClearして通知する。
+  OFFならsession resetだけ。hydrationや一時Single pivotは明示Clearと推定しない (Q3)。
+  HUD `… → 見開きの調整` に状態、実re-pairing anchorへのjump、本別Clear、全体記憶checkboxを置く。
+  見開き操作の近くには調整の印を添え、保存結果は成功/失敗を通知する。新しいKeyActionは追加しない。
+  Composed/Unreadable/ExtractedResultでは調整groupを無効にし、Single/Splitの従来移動は保持する。
+  構成ありのmode-only変更は休眠保存値をClearせず、global boolは環境設定から変更できる。
+  PDF/EPUBは既存個別編集と同じ物理ページidentityを使う。内部再編・再変換/reflowで
+  内容がずれる制限をマニュアルに明記する。
+  RemoteはApp serviceからSessionHandleへ登録したclone可能なread handleを使い、PCのlive調整を読まない。
+  Bookのlogical scopeとfull本のidentityで保存基点を解き、共通Automatic builderへoptional shiftを渡す。
+  応答budgetでページ列を切り詰める前に解決し、基点が応答外にあるだけでMissingとみなさない。
+  完全応答では同じrules・列のPC unitとgroup/anchor/相方/slot/roleを共有する。bounded応答は
+  既存group生成・cap・ページアクセスを維持する。切詰め境界差はshiftなしのmasterでも確認した
+  既存制限であり、省略ページの全寸法走査や境界group削除を追加しない。
+  記憶OFFの新規openには適用せず、force_single_page/orientationはread-onlyな表示投影で保存値を変えない。
+  acquireは先行shift/resume完了とsnapshot公開を待ってFinishAcquireへ進む。
+  Remoteの既存SetSpreadは同期base setterを維持し、Q3のClearが必要なら同requestのsequence-owned
+  continuationでcommit結果を待つ。成功応答・remote_state_generation更新・group cache失効はClear成功後だけ。
+  新しいRemote nudge/記憶設定UIは追加しない。wire/address/slot/roleの契約を変えないためIPC v69と
+  Web asset tokenを維持する。
+  現行Remoteの変換書庫base設定は元書庫のlogical keyを保持する。PCのcache側base設定とは異なり、
+  この既存境界をD3で変更・移行しない。master証明とD3検証記録は設計§11.10および
+  `target/D-1364-d3-msg.txt`を参照する。
+  G3の構成統合は未実施。C1–C12の共有fixture供給はG側consumerの統合・検収を意味しない。
+
 - 静止画 / ZIP 内画像 / PDF ページのフルスクリーンでは、タッチの中央矩形をタップすると
   上部バー（閉じる × を含む）と下部シークバーを表示 / 非表示にする。表示は時間切れにせず、
   ページ移動またはフルスクリーン終了で解除する。中央以外の左右タップは既存の読み方向と
@@ -975,7 +1124,7 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
   クリップボードにコピーする。範囲コピーは一回限りで、永続的な切り取り設定や本ページの実体は変更しない。
 - 静止画の上部ホバーバーでは、`…` を `×` のすぐ左に置き、上部バー直下の画面右上へ暗色固定の
   「その他の機能」パネルを開く。中央タップには新しい意味を追加せず、タッチもマウスも同じ上部ボタンを
-  入口にする。パネルの操作行は 48pt とし、ナビゲータ ON / OFF、4 隅から選ぶ配置サブメニュー、
+  入口にする。パネルの操作行は 48pt とし、見開きの調整、ナビゲータ ON / OFF、4 隅から選ぶ配置サブメニュー、
   分析ツール、ピクセルグリッド、ルーペ固定をこの固定順で、現在状態と実効ショートカット付きで表示する。
   サブメニューには戻る行を置く。パネル矩形はタップ分類の除外領域とし、表示中は共通モーダル入力規則に
   従って背面の wheel / key / pointer 操作を止める。
@@ -1562,7 +1711,7 @@ SW fallback で隠さず再生エラーとして表示する。
 番号 key、日時、サイズが同じ項目は名前昇順で安定させる。サイズが取得できない項目は
 昇順・降順とも同じ行の末尾へ置き、実在する0バイトファイルとは区別する。
 評価順は一覧を開くか明示的に更新した時点の評価で items を並べる。表示中の評価変更は
-バッジとフィルタへ反映し、既存行は動かさない。同値は名前昇順、評価非対応の行は末尾。
+バッジとフィルタへ反映し、表示条件に残る既存行の相対順を保つ。同値は名前昇順、評価非対応の行は末尾。
 未評価の既定位置は★3と★2の間で、設定により評価可能な行の末尾へ変更できる。
 低い順は評価可能な行を完全に逆順にする。Collection、ブックマーク、固定順の一覧、
 本のページ順には評価順を適用しない。Remote の物理フォルダも同じ規則を使う。
@@ -2194,6 +2343,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `ring_shortcuts` | RingShortcutSettings | default | リングショートカット設定。右ドラッグ mode (`right_drag_grid` / `right_drag_image` / `right_drag_video` / `right_drag_edit`) は未使用 / リング / ジェスチャを文脈別に保持し、`short_right_click_image` / `short_right_click_video` は画像 / 動画ビューアの短い右クリックを閉じる / 何もしない / メニュー表示から個別に選ぶ（既定は閉じる）。`select_grid_item_on_right_drag_start` はグリッドの有効な右ドラッグ開始セルを押下時点で選択するかを保持する（既定 false）。旧 `mouse_flick_enabled` は互換読み込み用のグローバルリングトグルとして残す。グリッド / 画像フルスクリーン / 動画フルスクリーンごとの 8 方向スロット、4 文脈ごとのマウスジェスチャ割り当て (`mouse_gestures_*`)、`mouse_buttons_grid` / `mouse_buttons_image` / `mouse_buttons_video` によるマウス戻る / 進む / ホイールクリックの個別割り当て、リング / ジェスチャのガイド表示設定、マウスジェスチャ実行後の通知表示設定 (`mouse_gesture_result_toast_visible`、既定 true)、移行ダイアログ表示済み状態、X ピッカー初回案内の表示済み状態を保持する。通知を OFF にしてもジェスチャのアクションと、そのアクション自身が出す結果・エラー表示は抑止しない。画像 / 動画フルスクリーンのマウスボタン候補では `C:\`〜`Z:\`、お気に入り、閲覧履歴、★一覧などの場所移動系を候補外にする。マウスジェスチャ追加 UI は実際の右ドラッグ軌跡を記録して方向列へ変換し、既存ジェスチャの再記録も同じ記録ダイアログで行う。ゲームパッド X リング/ピッカーは常時有効。旧 `gamepad_ring_enabled` / `mouse_back_forward_action` は migration 用、旧 Shift / Alt + ホイール設定は互換読み込み用にのみ残す |
 | `first_setup_completed` | bool | false | 初回セットアップダイアログ (テーマ / AI 機能 / ビューワモード) を完了したか |
 | `ui_theme` | UiTheme | System | メイン UI のテーマ（System / Light / Dark）。System は Windows のアプリ用色に追従 |
+| `preferences_restore_position` | bool | true | 環境設定を開き直す際に前回のページ・スクロール位置・ページ内の表示専用の選択/絞り込み/折りたたみを復元。全体設定で変更し OK で確定。OFF 確定時に表示状態の記憶をすべて消し、全体設定の先頭から開く。位置/選択自体はプロセス内のみ。指定ページ/項目・検索ジャンプを優先 |
 | `text_contrast` | TextContrast | Standard | 通常文字・薄い補足文字・widget 状態色のコントラスト（Standard / Strong）。Light / Dark の両 Style、暗色固定 popup / Window、native 動画 HUD へ同じ値を適用する。背景色は変更しない |
 | `ui_scale_factor` | f32 | 1.0 | アプリ内 UI 表示倍率。設定メニュー「スケーリング」から 0.5〜2.0 を 0.1 刻みで選ぶ。main egui Context の `zoom_factor` が正本で、メイン UI・静止画フルスクリーン・native 動画 overlay に反映する。物理 window geometry は倍率に依存しない。active viewer は倍率変更時に閉じ、再 open で新倍率を適用する。VST plugin GUI の別 HWND は対象外 |
 | `ui_font` | UiFontSettings | 既定 / 0.0pt | v2.7.0 UI フォント。`selection` は既定、または font file path + TTC/OTC face index + 表示名を保存する。`vertical_adjust` は実メトリクスから導出したツールバー縦位置へ加える -4.0〜4.0 logical pt の微調整。環境設定「表示 → フォント」では日本語を持つ正立 face のみ選べ、Italic / Oblique と日本語なし face は候補外（保存値から渡されても既定へ fallback）。同一ファミリーは正確な weight 名で区別し、可変フォントは `Variable` と表示する。保存済み face の同一性は表示名ではなく path + face index で判定する。変更時は font atlas を full-resync し、active viewer / native presenter は閉じて再表示時に同じ設定を使う。動画・音声 HUD の固定サイズ control label は位置・幅を保つため既定 HUD font family を使う。文字サイズは独立設定を持たず、既存の `ui_scale_factor` で UI 全体とともに変更する |
@@ -2201,6 +2351,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `detached_viewer_open_images_in_window` | bool | false | 環境設定「ビューワモード」の複数ウィンドウ。ON のとき通常画像 / ZIP 内画像 / PDF ページを開くたびに新しい別ウィンドウで開き、動画 / 音声は 1 つのメディア別ウィンドウを再利用する。画像編集機能は複数ウィンドウ側では無効。ON の間は ZIP/PDF/対応アーカイブの直開き実効値も true になるが、`auto_fullscreen_zip_pdf` の保存値は変更しない。フル機能ウィンドウ用の「ページを開く」/「一覧を開く」コマンドは、どの入力経路でも理由をトースト表示して副作用なしの no-op にする |
 | `auto_fullscreen_zip_pdf` | bool | false | フル機能ウィンドウモードで、ZIP/PDF/対応アーカイブを一覧、起動引数、SendTo、外部ファイラ経由で明示的に開いたとき、ページ一覧を経由せずページをフルスクリーンで表示する保存値。複数ウィンドウモードではこの保存値に関わらず実効的に ON として扱う。開く位置 (1 ページ目 / 続きから) は位置復元マトリクスの `book_open_resume` に従う。フルスクリーン中の Esc/Enter で親一覧 (L1)、Backspace でそのファイルのページ一覧 (L2) へ戻る |
 | `auto_fullscreen_image_folders` | bool | false | 直開きの実効値が ON のとき、表示上の項目が 1 件以上かつ通常画像だけのフォルダも、ページ一覧を経由せずフルスクリーンで表示する。サブフォルダ、動画、ZIP/PDF、対応アーカイブが混ざるフォルダは対象外。開く位置は `book_open_resume` に従い、Esc/Enter は親一覧、Backspace はそのフォルダのページ一覧へ戻る |
+| `remember_spread_shift_per_book` | bool | true | 本別の見開き1ページずらしを記憶・復元する全体設定。旧設定で字段なしもtrue。OFFは保存済み調整を休眠保持し現在表示を変えない。ON復帰は操作元本のsession調整だけを保存し、旧値の復元は次回入場から。settings transferに含め、本別anchorはmetadata transferへ分離する |
 | `fullscreen_image_margin_color` | `[u8; 3]` | `[0, 0, 0]` | フルスクリーン表示の共通 RGB 余白色。通常 / F12 の静止画・本では単ページ / 見開き / 連結 / 比較、回転 / 表示トリム、360 度 / 分析のメインキャンバスと、サムネイルストリップのセル外空欄へ適用する。native 動画では映像表示矩形のレターボックスと、拡大・パン / scaling resolve で source 外になる画素へ適用する。透過画像内の黒 / 白 / 市松、実動画画素と素材に含まれる黒帯、字幕、音声 / 動画の音声モード、HUD / 左右パネル、ナビゲータ / ルーペなど部品内部の背景、画像画素と copy / capture / export は変更しない |
 | `fullscreen_fit_mode` | FullscreenFitMode | Page | フルスクリーンのズーム/フィット基準。ページ全体 / 横幅 / 縦幅 / 100%原寸。旧ページ全体+余白カットは表示トリムの自動余白カットへ移行する |
 | `fullscreen_fit_cycle_excluded` | Vec<String> | [] | フィット循環から除外するstable ID。既定は全選択可能モード有効。最低1つ必須。未知IDを保持し、新モードは明示除外済みでなければ有効（変更済みの集合にも適用）。全候補除外の読込値は先頭モードを有効化。環境設定転送の対象 |
@@ -2344,7 +2495,7 @@ typed event の送信だけを行い、前面化しない。受付できない�
 | `vst3_panel_pos` | Option<[f32; 2]> | None | 動画再生中 VST3 パネルの保存位置。表示時に現在の viewport/native overlay 内へクランプ |
 | `minimize_to_tray_on_close` | bool | false | ON のとき [×] で終了せずタスクトレイに常駐する。main の静止画読書（画像のみフォルダ本を含む）を閉じる際、明示一覧 record が現在の本の親一覧なら既存の親戻りでそこへ戻し、record と読書位置を保持する。判定は採用済みの一覧に基づき、読書中の画像フォルダ自動オープン設定変更には依存しない。本一覧を明示済みならその一覧に留まる。tray 復帰は起動復元を実行しない。通常 fullscreen / in-window / F12 別窓 / ParkedLive の viewport と native presenter は同じ identity のまま hidden にし、動画、動画→音声モード、単体音楽の running / paused / EOF transport state を変更しない。hidden presenter は decode queue を drain して最新 frame を保持し、復帰で viewport と presenter を visible に戻すため再生中ならそのまま映像が再開する。detached / switching session と typed placement request は維持し、復帰時の外部フォルダ変更でも context を退避してから一覧へ反映する。復帰の `ShowWindow` で main focus が一時的に戻っても session は閉じない。mounted context の非 media texture とアイドル GPU 動画プールは解放するが、detached active viewer cache、稼働中 decoder / presenter / GPU frame、VST3 プラグインチェーンは保持するため、常駐中も動画 decode の CPU/GPU/電力コストを負う |
 | `network_data_dir_notice_dismissed_for` | Option\<String\> | None | ネットワーク上の data_dir に関する起動案内を「この保存先では今後表示しない」で抑止したパス。Windows の区切り・大文字小文字・通常 UNC / verbatim UNC の同値表記を正規化して比較し、別の保存先なら再案内する |
-| `skip_offline_change_scan` | bool | false | 起動時に mIV を終了していた間の変更を確認しない。完全に作成した索引と対象条件が同じ場合だけ初回確認を省く。終了中の追加・削除・移動や途中終了による未反映は [今すぐ確認] で反映する。お気に入り編集とライブラリ > 検索インデックスページが同じ値を編集し、次回起動から有効 |
+| `skip_offline_change_scan` | bool | false | 起動時に mIV を終了していた間の変更を確認しない。完全に作成した索引と対象条件が同じ場合だけ初回確認を省く。終了中の追加・削除・移動等は [今すぐ確認] の差分確認で反映する。ただし SQLite の署名が変わらない Ok に対応する全文文書の欠落は Full で検出できない。お気に入り編集とライブラリ > 検索インデックスページが同じ値を編集し、次回起動から有効 |
 | `pause_indexer_while_minimized` | bool | false | タスクトレイ常駐中にファイル監視 / インデックス更新を一時停止する。OFF でも常駐中は I/O 並列度を絞る |
 | `folder_thumb_sort` | SortOrder | FileName | フォルダ代表画像の自動選定順。通常一覧の `sort_order` とは独立して設定できる。FileName / Numeric / DateAsc / DateDesc |
 | `folder_thumb_depth` | u32 | 3 | フォルダ代表画像の探索最大階層数（0 で直接の子のみ） |
@@ -2476,6 +2627,19 @@ mIV Remote のホーム「検索」タブは Ctrl+S と同じコンテナ索引�
 お気に入り全体のフォルダ / ZIP / PDF を名前と種類で検索する。画像単体・動画は対象外。
 コンテナ索引が無効な場合と、索引が未作成または一時的に読めない場合は、0 件とは別の状態として表示する。
 
+お気に入り編集のコンテナ索引/アイテム索引は、監視開始と最後の Full の成功を区別する。
+Full の型付き結果が Failed なら「作成失敗」、FTS の不完全観測は「確認未完了」、取消は
+「確認中止」、新しい Full 実行中は「スキャン中」。正常完走・正常な確認省略は「監視中」を維持する。
+FTS の commit/reload/SQLite apply/cleanup と実行由来の自動 merge 永続化失敗は通知し、
+共有 maintenance snapshot に次回起動の索引再構築予約 (予約自体の失敗も) を表示する。
+今の session で wipe/reopen せず、次回起動に SQLite inventory/scan印の reset と pending を先に
+durable commit してから Tantivy を作り直す。ユーザー作成のタグ/評価等の別 DB は変更しない。
+名前索引の Full 失敗表示も訂正するが、名前 DB の書込失敗を通知/既存 rebuild marker へ揃える
+対応は [§1.369](next-release-backlog.md) の別件。FTS の marker を名前索引へ適用しない。
+起動 count 点検は既存 worker で常時実行する。管理情報の Ok 件数より生存全文文書が少ない場合は
+同じ通知・次回再構築予約へ進む。今の session で索引を消さず、件数一致を完全整合の保証にしない。
+利用者承認の軽量A/Bによる採用判断と測定範囲は [FTS 整合計画 §7.4](fts-integrity-plan.md#74-起動点検の採用判断-2026-10-11) を参照。
+
 mIV Remote のドライブ一覧 / 閲覧履歴 / ブックマーク / 本棚 / レーティング / スマートフォルダで
 通常画像を開いた場合は、実親フォルダへ移動せず元のフラット一覧全体を読み順として維持する。
 画像だけを本体と同じ単ページ・見開き規則で組み、異なる実親フォルダの画像間でも連続してページを
@@ -2552,6 +2716,12 @@ AI 生成メタデータが含まれる場合、**Negative Prompt は検索対�
     (対応表が 2 つあると、同じ★を押しているのに入口で結果が変わる)
   - ページ・コンテナ両方に同じフィルタが適用される (フォルダ一覧を★絞り込みできる)
   - 検索フィルタと AND 結合
+  - 評価変更で選択中の項目が条件から外れた場合は、現在の一覧の表示順で次の残存項目、なければ前の残存項目へ選択を移す。残存項目がなければ選択を解除する。履歴復元等の一般的な選択補正は変更しない
+  - フルスクリーンで現在ページが条件から外れた場合は、読む順の次の残存ページ、なければ前の残存ページへ移る。「次」は右→左でも読む順で決まり、左右キーの向きでは反転しない。ページが残らなければ現在の絞り込み済みページ一覧へ戻る。親フォルダへ自動移動せず、フィルタも解除しない
+  - 評価の通知と評価 Undo は自動移動・一覧復帰後も保持する。直後の Ctrl+Z は評価を戻し、同じ一覧・条件で元画像が再び対象になる場合は元画像へ戻る。対象の消失やほかの条件で復帰できない場合は値だけを戻して通知し、条件を解除したり閉じたウィンドウを再作成したりしない
+  - グリッドでも、評価Undoで元項目が現在一覧に再表示される場合は元項目へカーソルとShift+クリック起点を戻す。Redoも対象が再表示される場合は同じ規則を適用する。評価後にクリック・キー・パッド・右ドラッグ開始時の選択・リング移動や検索・絞り込み条件変更で明示選択した場合（端のno-opも含む）は、その選択を優先し復帰を取消す。対象が非表示のままなら値のみ戻し、サムネイル/詳細で同じ規則とする
+  - マウス / ゲームパッドのピッカーでは★の変更を保存・プレビューしながら、そのプレビューだけで条件から外れる既存項目を終了まで表示集合に残す。現在ページとほかの項目のプレビューを維持し、終了時に最終成功値で上記の移動を一度決める。途中で届く検索ヒット・件数・明示ソートは通常どおり更新する。削除や非評価条件による離脱まで保留しない
+  - 集合採用・Undo・ピッカーの所有境界は [評価変更と絞り込み](rating-filter-fullscreen-plan.md) を参照。Shift+クリック起点の適用は別件 §1.370 の cursor owner に接続し、本節で再実装しない
 - レーティング一覧:
   - ファイルメニューの「レーティング一覧」と、アドレスバー「場所▼」の「レーティング」から
     ★1〜★5 を選ぶと、その★が付いたアイテム / コンテナを場所横断でフラット表示する
@@ -2936,7 +3106,7 @@ SourceURL と画像候補のある HTML を検出して小窓へ通知する。�
 - [x] `FavoriteEntry` に `id: Uuid` + `auto_index_{structure,metadata,thumbs}` 3 フラグ追加
 - [x] お気に入り編集 / 追加ダイアログに 3 つのチェックボックス + 一括 ON/OFF
 - [x] FsWatcher (notify-rs ReadDirectoryChangesW) + 500ms debounce
-- [x] Walker (3-way diff) + IngestSession (Tantivy First 書き込み) + IndexerSupervisor (統括)
+- [x] Walker (FS ↔ SQLite を追加・変更・削除へ分類) + IngestSession (Tantivy First 書き込み) + IndexerSupervisor (統括)
 - [x] 起動時 reconciliation (status != ok の残留行を整理)
 - [x] `GlobalIoSemaphore` で UI 優先度制御 (Low/Normal/High)
 - [x] PDFium document info (Title / Author / Subject / Keywords) 取り込み
@@ -3132,3 +3302,14 @@ ONNX Runtime + DirectML EP でタイル分割 4x アップスケールを実行�
 - HEIC / AVIF / JXL / TIFF は Windows の WIC (Windows Imaging Component) 経由でデコード。
   WIC 呼び出しは `unsafe` ブロックに局所化（`src/wic_decoder.rs`）
 - NVIDIA NGX 呼び出し部分も `unsafe` ブロックに局所化（Phase 2、未実装）
+
+## 抽出結果の直接閲覧（§1.242 G1）
+
+検索・評価・スマートフォルダ・コレクション・★固定snapshot・サブ展開の結果一覧は、
+新規閲覧のたびに単ページから始める。一時見開き／横長分割は一覧全体の結果順を使い、
+読む方向は閲覧開始時の全体既定。別本の隣接画像も組になり得る。表紙単独・見開きずらし・
+末尾表紙補助・端への配置・端近くの強制単独は無効で、表示種別は記憶しない。
+一冊分だけの検索結果にも適用する。本を開き直して入った子階層、通常のmixed/本扱いOFF/スタック、
+読書履歴／しおりから対象の本を開く経路は従来どおり。F12で表示中の結果を複製した窓はその表示種別を保持できる。
+
+固定解除で元の本へ戻るときは、元列と一緒に退避した閲覧状態を復元する。A2の一時表示を本へ保存しない。

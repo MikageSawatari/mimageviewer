@@ -654,6 +654,12 @@ impl ArchiveDirectoryCache {
             .retain(|entry| entry.key != *key || !Arc::ptr_eq(&entry.slot, slot));
     }
 
+    fn retire_mutated_path(&self, path: &Path) {
+        lock_unpoisoned(&self.inner)
+            .entries
+            .retain(|entry| !crate::path_key::eq_keep_drive(&entry.key.path, path));
+    }
+
     #[cfg(feature = "dev-tools")]
     fn clear(&self) {
         lock_unpoisoned(&self.inner).entries.clear();
@@ -914,6 +920,13 @@ pub fn clear_nested_cache() {
     NESTED_CACHE.clear();
 }
 
+/// Only a writer replacing this file may retire its shared parsed directory. Read-only
+/// navigation keeps templates alive across contexts; on Windows their retained file
+/// handles otherwise prevent atomic replacement even with delete sharing enabled.
+pub(crate) fn retire_archive_directory_for_mutation(path: &Path) {
+    ARCHIVE_DIRECTORY_CACHE.retire_mutated_path(path);
+}
+
 /// ベンチマークで cold miss を再現するためだけに、共有目次 cache を明示的に破棄する。
 /// 通常の navigation / reload から呼んではならない。
 #[cfg(feature = "dev-tools")]
@@ -1040,6 +1053,7 @@ pub struct ZipImageEntry {
     pub uncompressed_size: u64,
     /// エントリの最終更新時刻 (UNIX 秒)。取得できない場合は ZIP ファイル自身の mtime
     pub mtime: i64,
+    pub container_ancestry: Vec<crate::archive_origin::ArchiveContainerOrigin>,
 }
 
 /// `enumerate_image_entries_detailed` の結果 (エントリ + 付帯情報)。
@@ -1057,6 +1071,37 @@ pub struct ZipEnumeration {
     /// このペアで旧キー → 新キーの一度きり移行を行う (`zip_key_migration`)。
     /// UTF-8 名 ZIP では常に空。
     pub legacy_renames: Vec<(String, String)>,
+}
+
+/// Worker-prepared display projection, retaining the original enumeration for metadata
+/// migration and cleanup. Reuse requires exactly the captured visibility policy.
+#[derive(Debug)]
+pub(crate) struct PreparedZipEnumeration {
+    pub(crate) raw: ZipEnumeration,
+    pub(crate) tree: Arc<crate::zip_tree::ZipTree>,
+    pub(crate) policy: crate::file_type_visibility::FileTypeVisibility,
+}
+
+impl PreparedZipEnumeration {
+    pub(crate) fn prepare(
+        path: PathBuf,
+        raw: ZipEnumeration,
+        policy: crate::file_type_visibility::FileTypeVisibility,
+    ) -> Self {
+        let tree = crate::zip_tree::ZipTree::build(path, raw.entries.clone()).project(&policy);
+        Self {
+            raw,
+            tree: Arc::new(tree),
+            policy,
+        }
+    }
+}
+
+impl std::ops::Deref for PreparedZipEnumeration {
+    type Target = ZipEnumeration;
+    fn deref(&self) -> &Self::Target {
+        &self.raw
+    }
 }
 
 /// ZIP ファイル内の画像エントリをすべて列挙する。
@@ -1086,6 +1131,36 @@ pub fn enumerate_image_entries_detailed_with_cancels(
     cancel: Option<&AtomicBool>,
     stop: Option<&AtomicBool>,
 ) -> std::io::Result<ZipEnumeration> {
+    enumerate_image_entries_detailed_inner(zip_path, cancel, stop, false, false)
+}
+
+/// Aggregate read-only consumers must not mutate cache mappings on a missing manifest.
+pub(crate) fn enumerate_image_entries_detailed_readonly_with_cancel(
+    zip_path: &Path,
+    cancel: Option<&AtomicBool>,
+) -> std::io::Result<ZipEnumeration> {
+    enumerate_image_entries_detailed_inner(zip_path, cancel, None, true, false)
+}
+
+/// DB-confirmed converted caches may live outside the current cache root. Their literal
+/// member names require the same cancellable manifest read as ordinary converted caches.
+pub(crate) fn enumerate_converted_image_entries_detailed_readonly_with_cancel(
+    zip_path: &Path,
+    cancel: Option<&AtomicBool>,
+) -> std::io::Result<ZipEnumeration> {
+    enumerate_image_entries_detailed_inner(zip_path, cancel, None, true, true)
+}
+
+fn enumerate_image_entries_detailed_inner(
+    zip_path: &Path,
+    cancel: Option<&AtomicBool>,
+    stop: Option<&AtomicBool>,
+    readonly: bool,
+    require_origins: bool,
+) -> std::io::Result<ZipEnumeration> {
+    if cancelled_by(cancel, stop) {
+        return Err(interrupted_error());
+    }
     if crate::rar_loader::is_rar_path(zip_path) {
         return crate::rar_loader::enumerate_image_entries_detailed_with_cancel(zip_path, cancel);
     }
@@ -1110,12 +1185,71 @@ pub fn enumerate_image_entries_detailed_with_cancels(
         &mut legacy_renames,
         cancel,
         stop,
+        &[],
     )?;
+    // Converted caches have literal names; only their manifest recovers real boundaries.
+    if require_origins || crate::archive_cache::is_under_cache_root(zip_path) {
+        let manifest = read_archive_origin_manifest_with_cancel(&mut archive, cancel)?;
+        if manifest.is_none()
+            && (readonly
+                || crate::archive_cache::mark_missing_origin_manifest_for_reconversion(zip_path))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "converted cache origin manifest is missing; reopen to reconvert",
+            ));
+        }
+        if let Some(manifest) = manifest {
+            for image in &mut out {
+                image.container_ancestry = manifest
+                    .images
+                    .get(&image.entry_name)
+                    .cloned()
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "archive origin manifest misses image",
+                        )
+                    })?;
+            }
+        }
+    }
     Ok(ZipEnumeration {
         entries: out,
         has_foreign_archives: has_foreign,
         legacy_renames,
     })
+}
+
+fn read_archive_origin_manifest<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+) -> std::io::Result<Option<crate::archive_origin::ArchiveOriginManifest>> {
+    read_archive_origin_manifest_with_cancel(archive, None)
+}
+
+fn read_archive_origin_manifest_with_cancel<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    cancel: Option<&AtomicBool>,
+) -> std::io::Result<Option<crate::archive_origin::ArchiveOriginManifest>> {
+    if cancelled_by(cancel, None) {
+        return Err(interrupted_error());
+    }
+    let mut member = match archive.by_name(crate::archive_origin::MANIFEST_ENTRY) {
+        Ok(member) => member,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+        Err(error) => return Err(std::io::Error::other(error)),
+    };
+    let mut bytes = Vec::new();
+    read_to_end_with_cancel(&mut member, &mut bytes, cancel, None)?;
+    let manifest: crate::archive_origin::ArchiveOriginManifest = serde_json::from_slice(&bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if manifest.version != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unsupported archive origin manifest",
+        ));
+    }
+    Ok(Some(manifest))
 }
 
 #[cfg(test)]
@@ -1239,6 +1373,24 @@ pub fn next_remote_image_candidate(
     cancel: &Arc<AtomicBool>,
     stop: Option<&AtomicBool>,
 ) -> std::io::Result<Option<RemoteImageCandidate>> {
+    next_remote_image_candidate_with_visibility(
+        zip_path,
+        directory_prefix,
+        after,
+        cancel,
+        stop,
+        &crate::file_type_visibility::FileTypeVisibility::default(),
+    )
+}
+
+pub fn next_remote_image_candidate_with_visibility(
+    zip_path: &Path,
+    directory_prefix: Option<&str>,
+    after: Option<&RemoteArchiveCandidateCursor>,
+    cancel: &Arc<AtomicBool>,
+    stop: Option<&AtomicBool>,
+    policy: &crate::file_type_visibility::FileTypeVisibility,
+) -> std::io::Result<Option<RemoteImageCandidate>> {
     if cancelled_by(Some(cancel), stop) {
         return Err(interrupted_error());
     }
@@ -1251,6 +1403,7 @@ pub fn next_remote_image_candidate(
         let candidates: Vec<_> = entries
             .into_iter()
             .enumerate()
+            .filter(|(_, entry)| policy.allows_physical_file(Path::new(&entry.entry_name)))
             .map(|(index, entry)| RemoteImageCandidate {
                 entry_name: entry.entry_name,
                 cursor: RemoteArchiveCandidateCursor::Rar(index),
@@ -1265,6 +1418,21 @@ pub fn next_remote_image_candidate(
         return Ok(next_after_cursor(candidates, after));
     }
     let mut archive = ARCHIVE_DIRECTORY_CACHE.open_archive(zip_path, Some(cancel))?;
+    let manifest = if policy.requires_archive_origins()
+        && crate::archive_cache::is_under_cache_root(zip_path)
+    {
+        let manifest = read_archive_origin_manifest(&mut archive)?;
+        if manifest.is_none() {
+            crate::archive_cache::mark_missing_origin_manifest_for_reconversion(zip_path);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "converted cache origin manifest is missing; reopen to reconvert",
+            ));
+        }
+        manifest
+    } else {
+        None
+    };
     if let Some(prefix) = directory_prefix {
         return next_remote_directory_candidate(
             &mut archive,
@@ -1273,6 +1441,8 @@ pub fn next_remote_image_candidate(
             after,
             cancel,
             stop,
+            policy,
+            manifest.as_ref(),
         );
     }
     let mut passed_after = after.is_none();
@@ -1285,6 +1455,8 @@ pub fn next_remote_image_candidate(
         &mut passed_after,
         cancel,
         stop,
+        policy,
+        manifest.as_ref(),
     )
 }
 
@@ -1313,6 +1485,9 @@ fn remote_metadata_indices<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     cancel: &Arc<AtomicBool>,
     stop: Option<&AtomicBool>,
+    prefix: &str,
+    policy: &crate::file_type_visibility::FileTypeVisibility,
+    manifest: Option<&crate::archive_origin::ArchiveOriginManifest>,
 ) -> std::io::Result<Vec<(usize, String, bool)>> {
     let mut entries = Vec::new();
     for index in 0..archive.len() {
@@ -1333,6 +1508,21 @@ fn remote_metadata_indices<R: Read + Seek>(
             continue;
         };
         let image = is_image_ext(&ext);
+        if !policy.allows_physical_file(Path::new(&name)) {
+            continue;
+        }
+        if image && let Some(manifest) = manifest {
+            let full_name = format!("{prefix}{name}");
+            let ancestry = manifest.images.get(&full_name).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "archive origin manifest misses image",
+                )
+            })?;
+            if !ancestry.iter().all(|origin| origin.allows(policy)) {
+                continue;
+            }
+        }
         if image || crate::folder_tree::is_zip_extension(&ext) {
             entries.push((index, name, image));
         }
@@ -1386,8 +1576,12 @@ fn find_next_remote_file_candidate<R: Read + Seek>(
     passed_after: &mut bool,
     cancel: &Arc<AtomicBool>,
     stop: Option<&AtomicBool>,
+    policy: &crate::file_type_visibility::FileTypeVisibility,
+    manifest: Option<&crate::archive_origin::ArchiveOriginManifest>,
 ) -> std::io::Result<Option<RemoteImageCandidate>> {
-    for (index, name, is_image) in remote_metadata_indices(archive, cancel, stop)? {
+    for (index, name, is_image) in
+        remote_metadata_indices(archive, cancel, stop, prefix, policy, manifest)?
+    {
         if cancelled_by(Some(cancel), stop) {
             return Err(interrupted_error());
         }
@@ -1431,6 +1625,8 @@ fn find_next_remote_file_candidate<R: Read + Seek>(
             passed_after,
             cancel,
             stop,
+            policy,
+            manifest,
         )? {
             return Ok(Some(found));
         }
@@ -1445,9 +1641,11 @@ fn next_remote_directory_candidate<R: Read + Seek>(
     after: Option<&RemoteArchiveCandidateCursor>,
     cancel: &Arc<AtomicBool>,
     stop: Option<&AtomicBool>,
+    policy: &crate::file_type_visibility::FileTypeVisibility,
+    manifest: Option<&crate::archive_origin::ArchiveOriginManifest>,
 ) -> std::io::Result<Option<RemoteImageCandidate>> {
     let directory = prefix.trim_end_matches('/');
-    let mut direct: Vec<_> = remote_metadata_indices(archive, cancel, stop)?
+    let mut direct: Vec<_> = remote_metadata_indices(archive, cancel, stop, "", policy, manifest)?
         .into_iter()
         .filter_map(|(index, name, image)| {
             (image && name.rsplit_once('/').map_or("", |(parent, _)| parent) == directory)
@@ -1467,7 +1665,17 @@ fn next_remote_directory_candidate<R: Read + Seek>(
     // No direct image remains. Collect only eligible central-directory entries,
     // expanding nested ZIP containers without preparing an image decompressor.
     let mut entries = Vec::new();
-    collect_remote_metadata_candidates(archive, zip_path, "", &[], &mut entries, cancel, stop)?;
+    collect_remote_metadata_candidates(
+        archive,
+        zip_path,
+        "",
+        &[],
+        &mut entries,
+        cancel,
+        stop,
+        policy,
+        manifest,
+    )?;
     Ok(next_after_cursor(
         ordered_remote_directory_candidates(entries, prefix),
         after,
@@ -1482,8 +1690,12 @@ fn collect_remote_metadata_candidates<R: Read + Seek>(
     out: &mut Vec<RemoteImageCandidate>,
     cancel: &Arc<AtomicBool>,
     stop: Option<&AtomicBool>,
+    policy: &crate::file_type_visibility::FileTypeVisibility,
+    manifest: Option<&crate::archive_origin::ArchiveOriginManifest>,
 ) -> std::io::Result<()> {
-    for (index, name, is_image) in remote_metadata_indices(archive, cancel, stop)? {
+    for (index, name, is_image) in
+        remote_metadata_indices(archive, cancel, stop, prefix, policy, manifest)?
+    {
         if cancelled_by(Some(cancel), stop) {
             return Err(interrupted_error());
         }
@@ -1520,6 +1732,8 @@ fn collect_remote_metadata_candidates<R: Read + Seek>(
             out,
             cancel,
             stop,
+            policy,
+            manifest,
         )?;
     }
     Ok(())
@@ -1646,7 +1860,11 @@ pub(crate) fn resolve_direct_raw_prefetch_candidate(
     zip_path: &Path,
     entry_name: &str,
     cancel: &Arc<AtomicBool>,
+    policy: &crate::file_type_visibility::FileTypeVisibility,
 ) -> std::io::Result<Option<(RemoteImageCandidate, u64)>> {
+    if is_cancelled(Some(cancel)) {
+        return Err(interrupted_error());
+    }
     if crate::rar_loader::is_rar_path(zip_path) {
         return Ok(None);
     }
@@ -1665,19 +1883,39 @@ pub(crate) fn resolve_direct_raw_prefetch_candidate(
         .by_index_raw(index)
         .map_err(|error| zip_error_to_io(error, Some(cancel)))?;
     let name = normalized_zip_entry_name(&entry);
+    let size = entry.size();
     if !entry.is_file()
         || !remote_readable_zip_metadata(&entry)
         || !crate::raw_format::is_raw_path(Path::new(&name))
-        || entry.size() > 256 * 1024 * 1024
+        || size > 256 * 1024 * 1024
+        || !policy.allows_physical_file(Path::new(&name))
     {
         return Ok(None);
+    }
+    drop(entry);
+    // A direct literal name proves there are no physical nested boundaries. A
+    // converted cache instead carries those boundaries in its origin manifest.
+    if policy.requires_archive_origins() && crate::archive_cache::is_under_cache_root(zip_path) {
+        let Some(manifest) = read_archive_origin_manifest_with_cancel(&mut archive, Some(cancel))?
+        else {
+            return Ok(None);
+        };
+        let Some(ancestry) = manifest.images.get(&name) else {
+            return Ok(None);
+        };
+        if !ancestry.iter().all(|origin| origin.allows(policy)) {
+            return Ok(None);
+        }
+    }
+    if is_cancelled(Some(cancel)) {
+        return Err(interrupted_error());
     }
     Ok(Some((
         RemoteImageCandidate {
             entry_name: name,
             cursor: RemoteArchiveCandidateCursor::Zip(vec![index]),
         },
-        entry.size(),
+        size,
     )))
 }
 
@@ -1941,6 +2179,7 @@ fn enumerate_recursive<R: Read + Seek>(
     legacy_renames: &mut Vec<(String, String)>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
     stop: Option<&AtomicBool>,
+    ancestry: &[crate::archive_origin::ArchiveContainerOrigin],
 ) -> std::io::Result<()> {
     let len = archive.len();
     for i in 0..len {
@@ -1976,6 +2215,7 @@ fn enumerate_recursive<R: Read + Seek>(
                 entry_name: full_name,
                 uncompressed_size: entry.size(),
                 mtime: zip_mtime,
+                container_ancestry: ancestry.to_vec(),
             });
             continue;
         }
@@ -2017,6 +2257,20 @@ fn enumerate_recursive<R: Read + Seek>(
             };
             let new_prefix = format!("{full_name}/");
             let new_legacy_prefix = format!("{legacy_full}/");
+            let mut next_ancestry = ancestry.to_vec();
+            let mut locators = ancestry
+                .last()
+                .map(|origin| origin.locators.clone())
+                .unwrap_or_default();
+            locators.push(crate::archive_origin::ArchiveEntryLocator {
+                index: i,
+                member_name: name,
+            });
+            next_ancestry.push(crate::archive_origin::ArchiveContainerOrigin {
+                locators,
+                category: crate::file_type_visibility::FileTypeCategory::Zip,
+                navigation_prefix: new_prefix.clone(),
+            });
             enumerate_recursive(
                 &mut inner,
                 outer_zip_path,
@@ -2028,6 +2282,7 @@ fn enumerate_recursive<R: Read + Seek>(
                 legacy_renames,
                 cancel,
                 stop,
+                &next_ancestry,
             )?;
         }
     }
@@ -2037,6 +2292,52 @@ fn enumerate_recursive<R: Read + Seek>(
 fn cancelled_by(cancel: Option<&AtomicBool>, stop: Option<&AtomicBool>) -> bool {
     cancel.is_some_and(|token| token.load(Ordering::Relaxed))
         || stop.is_some_and(|token| token.load(Ordering::Relaxed))
+}
+
+/// Shared policy-aware first page for navigation and representatives, on the caller's worker.
+pub fn visible_image_entry(
+    zip_path: &Path,
+    entry_name: &str,
+    policy: &crate::file_type_visibility::FileTypeVisibility,
+) -> std::io::Result<bool> {
+    if !policy.allows_physical_file(Path::new(entry_name)) {
+        return Ok(false);
+    }
+    if !policy.requires_archive_origins() {
+        return Ok(true);
+    }
+    Ok(enumerate_image_entries_detailed(zip_path)?
+        .entries
+        .iter()
+        .any(|entry| {
+            entry.entry_name == entry_name
+                && entry
+                    .container_ancestry
+                    .iter()
+                    .all(|origin| origin.allows(policy))
+        }))
+}
+
+pub fn first_visible_image_entry(
+    path: &Path,
+    cancel: Option<&AtomicBool>,
+    policy: &crate::file_type_visibility::FileTypeVisibility,
+) -> Option<String> {
+    if policy.is_all_visible() {
+        return first_image_entry(path, cancel);
+    }
+    enumerate_image_entries_detailed_with_cancel(path, cancel)
+        .ok()?
+        .entries
+        .into_iter()
+        .find(|entry| {
+            policy.allows_physical_file(Path::new(&entry.entry_name))
+                && entry
+                    .container_ancestry
+                    .iter()
+                    .all(|origin| origin.allows(policy))
+        })
+        .map(|entry| entry.entry_name)
 }
 
 fn read_to_end_with_cancel(
@@ -2700,6 +3001,7 @@ mod tests {
             &mut legacy_renames,
             Some(&cancel),
             None,
+            &[],
         );
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
         assert!(cancel.load(Ordering::Acquire));
@@ -2898,6 +3200,136 @@ mod tests {
     }
 
     #[test]
+    fn visibility_missing_recorded_cache_manifest_fails_and_requests_reconversion() {
+        let guard = crate::data_dir::TestDataDirGuard::new();
+        let db = crate::archive_cache::ArchiveCacheDb::open().unwrap();
+        let source = guard.path().join("book.7z");
+        std::fs::write(&source, b"SOURCE").unwrap();
+        let cached = db.reserve_cache_zip_path(&source).unwrap();
+        write_test_zip(&cached, &[("nested.zip/1.jpg", b"IMAGE")]);
+        let metadata = std::fs::metadata(&source).unwrap();
+        let mtime = crate::ui_helpers::mtime_secs(&metadata);
+        db.record(
+            &source,
+            mtime,
+            metadata.len() as i64,
+            crate::archive_converter::ArchiveFormat::SevenZ,
+            &cached,
+            std::fs::metadata(&cached).unwrap().len() as i64,
+            1,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            enumerate_image_entries_detailed(&cached)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        let mut policy = crate::file_type_visibility::FileTypeVisibility::default();
+        policy.excluded_extensions.insert("zip".into());
+        assert!(
+            db.lookup_with_visibility(&source, mtime, metadata.len() as i64, &policy)
+                .is_none()
+        );
+        assert!(cached.exists());
+        assert_eq!(db.list_all().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ordinary_zip_auxiliary_manifest_name_does_not_control_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("ordinary.zip");
+        write_test_zip(
+            &path,
+            &[
+                ("1.jpg", b"IMAGE"),
+                (crate::archive_origin::MANIFEST_ENTRY, b"not a manifest"),
+            ],
+        );
+        assert_eq!(
+            enumerate_image_entries_detailed(&path)
+                .unwrap()
+                .entries
+                .len(),
+            1
+        );
+        let mut policy = crate::file_type_visibility::FileTypeVisibility::default();
+        policy.excluded_extensions.insert("png".into());
+        assert_eq!(
+            first_visible_image_entry(&path, None, &policy).as_deref(),
+            Some("1.jpg")
+        );
+        policy.excluded_extensions.insert("zip".into());
+        let cancel = Arc::new(AtomicBool::new(false));
+        assert_eq!(
+            next_remote_image_candidate_with_visibility(&path, None, None, &cancel, None, &policy)
+                .unwrap()
+                .unwrap()
+                .entry_name,
+            "1.jpg"
+        );
+    }
+
+    #[test]
+    fn visibility_uses_actual_nested_boundaries_and_keeps_suffixed_directories() {
+        use crate::file_type_visibility::{FileTypeCategory, FileTypeVisibility};
+        let temp = tempfile::tempdir().unwrap();
+        let inner = temp.path().join("inner.zip");
+        write_test_zip(&inner, &[("p.png", b"INNER")]);
+        let inner_bytes = std::fs::read(&inner).unwrap();
+        let middle = temp.path().join("middle.zip");
+        write_test_zip(&middle, &[("deep.cbz", &inner_bytes)]);
+        let middle_bytes = std::fs::read(&middle).unwrap();
+        let outer = temp.path().join("outer.zip");
+        write_test_zip(
+            &outer,
+            &[
+                ("notes.zip/p.jpg", b"DIR"),
+                ("book.zip", &middle_bytes),
+                ("last.jpg", b"LAST"),
+            ],
+        );
+        let enumeration = enumerate_image_entries_detailed(&outer).unwrap();
+        let nested = enumeration
+            .entries
+            .iter()
+            .find(|e| e.entry_name == "book.zip/deep.cbz/p.png")
+            .unwrap();
+        assert_eq!(nested.container_ancestry.len(), 2);
+        assert_eq!(nested.container_ancestry[1].locators.len(), 2);
+        assert!(enumeration.entries[0].container_ancestry.is_empty());
+        let tree = crate::zip_tree::ZipTree::build(outer.clone(), enumeration.entries);
+        let mut policy = FileTypeVisibility::default();
+        policy.excluded_categories.insert(FileTypeCategory::Zip);
+        let projected = tree.project(&policy);
+        assert!(projected.root.dirs.contains_key("notes.zip"));
+        assert!(!projected.root.dirs.contains_key("book.zip"));
+        assert_eq!(projected.all_cache_keys(), tree.all_cache_keys());
+        assert!(visible_image_entry(&outer, "notes.zip/p.jpg", &policy).unwrap());
+        assert!(!visible_image_entry(&outer, "book.zip/deep.cbz/p.png", &policy).unwrap());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let first =
+            next_remote_image_candidate_with_visibility(&outer, None, None, &cancel, None, &policy)
+                .unwrap()
+                .unwrap();
+        assert_eq!(first.entry_name, "notes.zip/p.jpg");
+        let second = next_remote_image_candidate_with_visibility(
+            &outer,
+            None,
+            Some(&first.cursor),
+            &cancel,
+            None,
+            &policy,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(second.entry_name, "last.jpg");
+        assert_eq!(candidate_payload_read_count(&outer, &first.cursor), 0);
+        assert_eq!(candidate_payload_read_count(&outer, &second.cursor), 0);
+    }
+
+    #[test]
     fn raw_prefetch_identifies_only_direct_entries_without_payload_or_nested_reads() {
         let temp = tempfile::tempdir().unwrap();
         let inner = temp.path().join("inner.zip");
@@ -2912,21 +3344,35 @@ mod tests {
             ],
         );
         let cancel = Arc::new(AtomicBool::new(false));
-        let (candidate, size) =
-            resolve_direct_raw_prefetch_candidate(&outer, "direct.dng", &cancel)
-                .unwrap()
-                .unwrap();
+        let (candidate, size) = resolve_direct_raw_prefetch_candidate(
+            &outer,
+            "direct.dng",
+            &cancel,
+            &Default::default(),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(candidate.cursor, RemoteArchiveCandidateCursor::Zip(vec![0]));
         assert_eq!(size, 3);
         assert!(
-            resolve_direct_raw_prefetch_candidate(&outer, "plain.jpg", &cancel)
-                .unwrap()
-                .is_none()
+            resolve_direct_raw_prefetch_candidate(
+                &outer,
+                "plain.jpg",
+                &cancel,
+                &Default::default()
+            )
+            .unwrap()
+            .is_none()
         );
         assert!(
-            resolve_direct_raw_prefetch_candidate(&outer, "inner.zip/nested.dng", &cancel)
-                .unwrap()
-                .is_none()
+            resolve_direct_raw_prefetch_candidate(
+                &outer,
+                "inner.zip/nested.dng",
+                &cancel,
+                &Default::default()
+            )
+            .unwrap()
+            .is_none()
         );
         assert_eq!(raw_payload_read_count(&outer, "direct.dng"), 0);
         assert!(!nested_cache_contains(&outer, "inner.zip"));
@@ -2953,7 +3399,8 @@ mod tests {
             resolve_direct_raw_prefetch_candidate(
                 &path,
                 "large.dng",
-                &Arc::new(AtomicBool::new(false))
+                &Arc::new(AtomicBool::new(false)),
+                &Default::default()
             )
             .unwrap()
             .is_none()
@@ -3000,9 +3447,10 @@ mod tests {
         bytes[central + 24..central + 28].copy_from_slice(&4_u32.to_le_bytes());
         std::fs::write(&path, bytes).unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
-        let (candidate, size) = resolve_direct_raw_prefetch_candidate(&path, "page.dng", &cancel)
-            .unwrap()
-            .unwrap();
+        let (candidate, size) =
+            resolve_direct_raw_prefetch_candidate(&path, "page.dng", &cancel, &Default::default())
+                .unwrap()
+                .unwrap();
         assert_eq!(size, 4);
         let error =
             read_direct_raw_prefetch_candidate(&path, &candidate, size, &cancel).unwrap_err();
@@ -3456,6 +3904,32 @@ mod tests {
         }
         assert_eq!(cache.len(), 2);
         assert_eq!(cache.parse_count(), 3);
+    }
+
+    #[test]
+    fn visibility_directory_mutation_retirement_preserves_unrelated_parse_and_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let changed = dir.path().join("Changed.zip");
+        let sibling = dir.path().join("Sibling.zip");
+        write_test_zip(&changed, &[("page.jpg", b"CHANGED")]);
+        write_test_zip(&sibling, &[("page.jpg", b"SIBLING")]);
+        let cache = ArchiveDirectoryCache::new(2);
+        read_with_directory_cache(&cache, &changed, "page.jpg", None).unwrap();
+        read_with_directory_cache(&cache, &sibling, "page.jpg", None).unwrap();
+        let sibling_slot = cache.slot_for_path_for_test(&sibling).unwrap();
+        let sibling_parse_count = cache.parse_count();
+        cache.retire_mutated_path(Path::new(&crate::path_key::normalize_keep_drive(&changed)));
+        assert!(cache.slot_for_path_for_test(&changed).is_none());
+        assert!(Arc::ptr_eq(
+            &sibling_slot,
+            &cache.slot_for_path_for_test(&sibling).unwrap()
+        ));
+        assert_eq!(
+            read_with_directory_cache(&cache, &sibling, "page.jpg", None).unwrap(),
+            b"SIBLING"
+        );
+        assert_eq!(cache.parse_count(), sibling_parse_count);
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]

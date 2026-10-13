@@ -1,5 +1,22 @@
 # キー / マウス操作仕様 (静止画 vs 動画)
 
+## 構成のある本の表示キー（§1.242 G3）
+
+`FsViewSpread` / `FsViewLandscapeSplit`は閲覧方法だけを切り替える。既定キーなしでカスタム割当の対象。
+`FsSpreadSingle`も構成本ではmode-only。方向/表紙付きの既存見開き・分割Actionとずらしは共通受付で拒否し、
+「本の構成で設定されています」を表示する。Single/Splitの通常ページ送りfallbackは維持する。
+本別mode欄だけを保存し、構成/方向/表紙/休眠shiftを書き換えない。構成なしの既存割当は維持する。
+
+## 抽出一覧の表示キー（§1.242 G1）
+
+検索・評価・スマートフォルダ・コレクション・★固定・サブ展開の結果を直接見るときは、
+新規openで単ページに戻る。既存`FsSpreadLtr/Rtl`とcover付きは一時見開き、
+`FsSpreadSplitLtr/Rtl`は一時横長分割として受け、読む方向は全体既定からのsession snapshotを使う。
+`FsReadingDirectionToggle`と見開きずらしは無効。Single/Split時のずらしキーは従来のページ送りfallbackを保つ。
+キー/リング/パッドは既存KeyActionと共通表示setterを通し、結果の表示設定を記憶しない。
+新Action・既定割当は追加しない。通常の本・通常一覧の既存キーは変更しない。
+
+
 `GridOrganizeFiles` はサムネイル一覧のカーソル項目／チェック済み項目の「ファイル整理先」を開く。
 既定キーはなし。操作カスタマイズからキー、リング（マウス／パッド）、マウスジェスチャ、
 戻る／進む／ホイールクリックへ割り当てられ、右クリックの同じ入口と対象解決を共有する。
@@ -9,7 +26,7 @@
 
 `RingActionId::ImageFitModeCycle` は `FsFitModeCycle` に対応し、画像フルスクリーンの
 リング（マウス／パッド）、ジェスチャ、戻る／進む／ホイールクリックへ割り当てられる。
-ページ全体 → 横幅フィット → 縦幅フィット → 100%原寸 → ページ全体の循環をキーと共有し、
+ページ全体 → 横幅フィット → 縦幅フィット → 100%原寸 → 指定サイズ → ページ全体の循環をキーと共有し、
 単ページ／見開き／縦・横連結で使える。動画／音声、一覧、編集モード中は実行しない。
 新しい既定割り当てはなし。既存の `0` / `Numpad0` と保存済み設定は変更しない。
 
@@ -26,8 +43,10 @@
 未知IDは保持し、現在の候補には影響させない。読込時に全候補が除外されていたら、通常順の
 先頭（現在はページ全体）を有効に戻す。環境設定の転送に含め、全候補除外の転送値は拒否する。
 包含一覧や「利用者が変更した」フラグを併設せず、既存の環境設定draftと循環ownerを再利用する。
-§1.342 の指定倍率は別ラインの実装で `all()` / `selectable_for_flow` の通常順へ追加し、
-`cycle_id` にstable IDを定義すれば同じUI・循環・既定有効の規則に参加する。
+§1.342 の「指定サイズ」は `SpecifiedScale` のstable IDで通常順のOriginalの次へ追加した。
+既存4方式だけを除外した設定では指定サイズが有効に残る。`FutureScale`など未知IDを改名しない。
+幅・高さが両方未指定でも選択方式は指定サイズのままで、循環候補から自動的に外さない。
+追加のキーActionや既定割り当ては設けず、指定値の編集は環境設定または既存fitメニューで行う。
 
 初回設定の Enter はダイアログ専用の固定操作で keymap 対象外。選択肢/リンクにフォーカスが
 ないときは現在の設定で「開始」を確定する。フォーカス中はその widget の操作を優先し、
@@ -64,6 +83,8 @@ OS/egui clipboard、D&D、IME 確定、右クリックメニューは keymap 対
 `RatingContainer1..5/Clear/StepUp/StepDown`) で、グリッド / 画像フルスクリーン / 動画フルスクリーンが
 同じ割り当てを共有する。v2.2.0 からは物理キー寄りの `KeySlot` を正本にし、通常の数字キーとテンキー数字を別キーとして扱う。互換性のため、従来の数字キー既定操作は `1` と `Numpad1` のように両方を既定割り当てにする。
 `StepUp/StepDown` は標準キーなし。未評価は操作時だけ ★3 を基準にし、上げると ★4、下げると ★2 を保存する。★5 から上げる / ★1 から下げる操作は書き込み・Undo を作らない。チェック済み項目は各自の現在値から一括で変化し、1 回の Undo で戻せる。コンテナ用は直接指定と同じく現在開いているフォルダ / ZIP / PDF 本体が対象。
+評価変更で表示条件から外れた場合、グリッド選択は現在の表示順、フルスクリーンは現在の読書順で次の残存対象、なければ前へ移る。読む順の「次」は RTL でも左右キーの向きで反転しない。ページがゼロなら現在の絞り込み済みページ一覧へ戻り、フィルタを解除しない。自動移動・一覧復帰で評価通知と評価 Undo を消さず、直後の `Ctrl+Z` は評価を戻して、同じ一覧・条件で対象となる元画像へ復帰する。通常の手動移動・close の履歴終了方針は維持する。
+マウス / パッドのピッカーの★は保存済み live preview を維持し、その preview だけで離脱する既存行を終了まで残す。現在ページと各行の preview は維持するが、新しい検索 hit・件数・明示 sort は通常どおり更新する。終端で最終成功値の一件 Undo を記録し、次 / 前 / 現在一覧の移動を一度決める。新しい `KeyAction` は追加しない。所有・復帰不可・取消の詳細は [§1.371 の計画](rating-filter-fullscreen-plan.md) を参照。
 本体 <kbd>Enter</kbd> と `NumpadEnter` も別スロットであり、押下操作、KeyHold、native 動画、
 操作カスタマイズの「押して入力」の全経路で相互に発火しない。Windows では両者が
 `VK_RETURN` を共有するため、Win32 `WM_KEYDOWN/WM_KEYUP` の extended bit を物理種別の
@@ -333,6 +354,8 @@ dispatch 可否とは別の状態遷移であり、取消後の unfocused pass �
 | OS 予約 | <kbd>Alt</kbd>+<kbd>F4</kbd>、<kbd>Alt</kbd>+<kbd>Tab</kbd>、<kbd>Win</kbd> キー系など | Windows 側が先に処理する。mIV の keymap では上書きしない |
 | keyboard focus 移動 | <kbd>Tab</kbd> traversal | 非テキスト widget へ focus が移って `wants_keyboard_input()` が true のまま残り、全 shortcut が停止した履歴と、TextEdit から 1 hop だけ移動する不統一を避けるため、アプリ全体で常に無効。Tab chord 自体は `KeyAction` へ割り当て可能 |
 | フォーカスローカル UI | テキスト入力、IME 変換、コンボボックス、リスト、フォルダツリー、製本並べ替えダイアログ内の矢印 / Enter / Esc / PageUp / PageDown / Home / End など | その UI 部品の中だけで意味を持ち、グローバルショートカットとして外へ漏らさない |
+| 本の構成editor (G4、next-book) | 実ページのクリック / Ctrl で2枚選択、ページ・組のドラッグ、各編集button、IME-safe な Enter = 保存 / Escape = キャンセル | 本HUD・本一覧右クリック・「本」menuから開く局所UI。新しい KeyAction は設けない。Enter はフォーカスwidgetがなく確認中でないときだけ保存し、Escape は確認を先に閉じる。保存 / 再読込中は取消を受け付けず、IME変換中は Enter / Escape の保存・取消を行わない。modal owner が背面の閲覧 / メタ情報 / ナビゲータ入力を止める。解除 / 作り直し / 変更previewの確定は明示buttonで行う |
+| 画像folder→ZIP変換 (G) | 「ZIP に変換」「取消」「閉じる」、IME-safe な Escape = 取消 / 閉じる | folder右クリックと構成対象外案内から開く局所UI。新しい KeyAction / global shortcut は設けない。変換は明示buttonで確定し、取消可能なphaseだけEscapeを受け付ける。保存確定以降は取消しない。process modal ownerがmain / fullscreen / detachedの背面操作と新しいopenを止める |
 | 環境設定の持ち運び | 設定の復元の「環境設定を書き出し…」「環境設定を取り込み…」、説明 Modal の「書き出す」「ファイルを選ぶ」、取り込み後の環境設定の Enter / Escape | ダイアログ内だけのファイル操作で、新しい KeyAction は設けない。Enter / Escape は IME-safe な dialog helper を通す。環境設定表示中は新しい転送入口二つだけを無効化し、既存の復元操作は変更しない。取り込み完了時にも環境設定が開いていれば draft を変更せず通知する。転送 Modal の表示中は背後の環境設定へ Enter / Escape を渡さず、操作カスタマイズの「押して入力」も捕捉を停止する。待機状態と入力欄は保持し、Modal を閉じれば捕捉を再開する。通常の設定復元の表示だけでは捕捉を停止しない。転送 job 中は説明 Modal と設定復元の実行 / キャンセル / × / Enter / Escape を無効にし、メインの背面設定メニュー・ツールバーは既存の設定復元/common modal と説明 Modal で止める。別窓・fullscreen・native 動画への転送専用入力遮断は加えない。検証成功後の環境設定は既存 OK / キャンセルを使う。操作カスタマイズ自体は転送対象外で既存共有を使う |
 | モーダル削除確認 | <kbd>Y</kbd> = 削除、<kbd>N</kbd> / <kbd>Esc</kbd> = キャンセル、<kbd>←</kbd> / <kbd>↑</kbd> = 削除を選択、<kbd>→</kbd> / <kbd>↓</kbd> = キャンセルを選択、<kbd>Enter</kbd> = 選択中を実行 | 破壊的操作の確認ダイアログだけで意味を持つフォーカスローカル入力のため keymap 対象外。ごみ箱へ移す確認は削除、完全削除の可能性がある確認はキャンセルを初期選択にする。表示中に各キーを消費して背面の KeyAction へ漏らさず、Enter は IME-safe helper で判定する。IME 変換中は Y / N / Esc / Enter の確認操作を行わない |
 | 最低限の脱出 / 閲覧ナビ | <kbd>Esc</kbd>、修飾なし矢印キー | モード脱出とページ / 一覧移動の最後の手段として残す。静止画 FS では raw-key permit を要求し、TextInput の全 phase では editor に残す一方、非テキスト `FocusedUi` はスライダー等にページ矢印を奪われないよう通す。Enter / Backspace / Home / End / PageUp / PageDown などは文脈ごとの `KeyAction` 化対象 |
@@ -356,10 +379,22 @@ dispatch 可否とは別の状態遷移であり、取消後の unfocused pass �
 
 ## グリッドビュー (フルスクリーン外) 共通
 
+Everything ファイル名検索は `GlobalEverythingSearch` / `Grid` / `Press`、既定
+`Ctrl+R`。名前の Global は検索範囲を表し、fullscreen の Global scope へは登録しない。
+main の一覧からだけ開き、text focus / IME（focus recovery を含む）/ modal / Remote lock
+中には発火しない。画像・egui動画/音声・native動画/音声・detached viewer の検索起動には
+使わず、native 転送 snapshot に含めない。画像 fullscreen の R 検出 probe は action の
+dispatch ではない。`Ctrl+G/S/E` の既存割当は維持する。メニュー
+`MenuCommandId::GlobalEverythingSearch`（ファイル → Everything ファイル名検索…）も
+同じ受付へ接続し、caption は実効 keymap の先頭キーを表示する。操作カスタマイズでは
+サムネイル一覧の操作として変更・解除できる。Everything の入力は明示送信とし、IME確定の
+Enter では送信せず、確定後の Enter または「検索」で送信する。
+
 `GridColumnCount11..20` のリング・マウス割り当てを旧版から守るには、公開時にアプリ版番号を v4.1.0 より上げることが前提。`settings.db` は保存時の版番号が実行版より新しければ、旧版の起動時に読み込み前の `Incompatible` 判定で保存を止める。同じ v4.1.0 の開発ビルド間ではこの判定が働かず、旧版の `sanitize()` が未知のリング・マウス操作を `None` に置き換えて保存し得る。版番号の更新はリリース作業で行う。
 
 | キー | 動作 |
 |---|---|
+| <kbd>Ctrl</kbd>+<kbd>R</kbd> | main の一覧から Everything ファイル名検索バーを開く。Action: `GlobalEverythingSearch`。閉じる操作は×/Esc。取得・準備中は取消可能なmainのモーダルを使い、完成した一覧だけを採用する |
 | <kbd>?</kbd> (既定) | 現在のサムネイル一覧コンテキストで使えるショートカット一覧を表示する。Action: `HelpShowContextShortcuts`。keymap 化済み操作は現在読み込まれている割り当て済みのものを表示し、固定扱いのナビゲーションキーは別枠で表示する |
 | <kbd>Backspace</kbd> | 親フォルダへ。Action: `GridParentFolder`。ドライブルート (`C:\` など) ではドライブ一覧へ戻り、元ドライブを選択状態にする。検索 (Ctrl+S / Ctrl+G) 中は検索仮想階層を 1 段ドリルアップ、最上位 (集約ビュー / 結果一覧) では no-op。タグビュー (Ctrl+T) 中は、検索結果から開いたフォルダ / ZIP / PDF / 変換アーカイブを 1 段戻り、検索結果一覧では no-op (検索を閉じるには <kbd>Esc</kbd> / 検索バーの <kbd>×</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd>・<kbd>Ctrl</kbd>+<kbd>S</kbd>・<kbd>Ctrl</kbd>+<kbd>T</kbd> 再押下)。Ctrl+F フィルタ中は、フィルタを実行したフォルダだけ親移動を no-op にする。検索結果から子フォルダへ入った後は通常どおり親へ戻れる |
 | <kbd>Enter</kbd> | 選択アイテムを開く。Action: `GridOpenSelected`。別ウィンドウセッションが同じ項目を既に表示中の場合は再オープンせず、必要に応じて別ウィンドウを前面化する |
@@ -424,6 +459,13 @@ mIV は各フレームの入力処理前と Shell 復帰直後に Win32 の実�
 `i.modifiers` / `raw.modifiers` を同期する。個別の `Event::Key` に記録された
 modifiers はイベント発生時点の情報として残し、離散ショートカットの event 判定は
 書き換えない。
+
+一覧の矢印 / PageUp・Down / Home・End による通常移動は、移動先を次の Shift 選択の起点にする。
+Shift を伴う一覧カーソル移動と Shift+クリックは起点を保持する（キーの範囲チェック加算は従来どおり）。
+既定の Shift 派生は矢印キーだけで、PageUp・Down / Home・End の受付は既存の完全一致 keymap に従う。
+全画面のページ送り・ジャンプと Esc で戻るカーソルも通常移動として起点を更新する。
+これらは既存の固定 / KeyAction 派生動作の意味を揃える修正で、新 Action・割り当ては追加しない。
+サムネイル / 詳細一覧と context 所有の詳細は [範囲選択の起点](spec.md#範囲選択の起点-13702026-10-11) を参照。
 
 ## フォルダツリーペイン
 
@@ -534,10 +576,10 @@ snapshot として一方向 publish し、App から presenter Context を直接
 | 既定キーなし (`FsPagePrev` / `FsPageNext`) | コマンド設定でキーを割り当てると、前 / 次のページへ移動する。矢印ナビゲーションは固定扱いのまま残しつつ、明示的にページ送りへ割り当てたい場合の Action |
 | <kbd>Shift</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 現在の表示順で、環境設定の「ページジャンプ量」ぶん前 / 次へジャンプ。Action: `FsFixedJumpPrev` / `FsFixedJumpNext`。既定は全ページの 10%。固定ページ数にも切替可。見開き中は最低 2 ページ進む。左右の意味はページ表示の RTL で反転し、「カーソルキー左右の方向」の影響は受けない。動画は対象外 |
 | <kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 縦/横連結モードでは画面単位で連結方向へスクロール。通常のページ単位表示では、環境設定の「ページジャンプ量」ぶん前 / 次へジャンプする。Action: `FsFixedJumpPrevNoRtl` / `FsFixedJumpNextNoRtl`。こちらは PageUp/PageDown へ割り当てる用途のため RTL でも前 / 次の意味を反転しない。修飾なし矢印ナビゲーションは文脈依存の固定入力として残す一方、メタデータパネル・ページジャンプ・Home/End 先頭末尾移動など副作用が明確な操作は KeyAction 化して競合検出対象にする |
-| <kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 見開きの「1 ページずらし」(現在の表示ユニット先頭を軸に見開きを 1 ページぶんずらす。空白/欠落ページでの綴じずれ補正。1 回押すごとに必ず 1 ページ動く)。結果はセッション内の一時アンカーとして保持し、`spread_db` には保存しない。Single モードでは前 / 次ファイル。ページ表示が RTL なら左右の意味を反転し、「カーソルキー左右の方向」の影響は受けない。リング / マウス / パッド用の操作候補には、この左右版に加えて PageUp/PageDown と同じく RTL でも前 / 次を反転しない「前 / 次」版を用意する |
+| <kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 見開きの「1 ページずらし」(現在の表示ユニット先頭を軸に見開きを 1 ページぶんずらす。空白/欠落ページでの綴じずれ補正。端の no-op は保存しない)。適格な本では既定ONの全体記憶設定に従い、実際の内部アンカーのPageRefを`spread_shift.db`へ保存する。通常一覧と記憶OFFではセッション調整。`spread_db`のmodeは保存し直さない。Single / Split モードでは従来の前 / 次ページ移動。ページ表示が RTL なら左右の意味を反転し、「カーソルキー左右の方向」の影響は受けない。リング / マウス / パッド用の操作候補には、この左右版に加えて PageUp/PageDown と同じく RTL でも前 / 次を反転しない「前 / 次」版を用意する |
 | <kbd>Ctrl</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | ツリー順で前 / 次のフォルダへ移動する。Action: `FsCtrlNavPrev` / `FsCtrlNavNext`。スマートフォルダでは Folder 内 DFS の端と root 直下の本から、一覧表示順の Folder/PDF/ZIP/変換書庫へ移る。独立 detached 静止画窓では main の検索・絞り込みを継承せず、窓自身の物理順で通常画像フォルダ / ZIP / CBZ / PDF へ移動する |
 | <kbd>Ctrl</kbd>+<kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 同じ親直下の前 / 次の兄弟フォルダへ移動する。Action: `FsSiblingPrev` / `FsSiblingNext`。独立 detached 静止画窓でも窓自身の物理兄弟順を使う |
-| <kbd>0</kbd> 〜 <kbd>7</kbd> | <kbd>1</kbd>〜<kbd>5</kbd>: ページ構成切替 (<kbd>1</kbd>: 単ページ / <kbd>2</kbd>: 見開き 左開き / <kbd>3</kbd>: 見開き 左開き+表紙単独 / <kbd>4</kbd>: 見開き 右開き / <kbd>5</kbd>: 見開き 右開き+表紙単独)。<kbd>6</kbd>: 連結方式をページ単位 → 縦連結 → 横連結で循環。<kbd>7</kbd>: 横方向 左→右 / 右→左を切替。<kbd>0</kbd>: ズーム/フィットをページ全体 → 横幅フィット → 縦幅フィット → 100%原寸で循環。余白カットは左パネルの表示トリムで設定する。見開き中は表紙あり/なしを保ったまま左開き / 右開きも連動して切り替える。ZIP の作品区切り表示上でも有効。ホバーバーの表示モード/フィットボタンからも切替可 |
+| <kbd>0</kbd> 〜 <kbd>7</kbd> | <kbd>1</kbd>〜<kbd>5</kbd>: ページ構成切替 (<kbd>1</kbd>: 単ページ / <kbd>2</kbd>: 見開き 左開き / <kbd>3</kbd>: 見開き 左開き+表紙単独 / <kbd>4</kbd>: 見開き 右開き / <kbd>5</kbd>: 見開き 右開き+表紙単独)。<kbd>6</kbd>: 連結方式をページ単位 → 縦連結 → 横連結で循環。<kbd>7</kbd>: 横方向 左→右 / 右→左を切替。<kbd>0</kbd>: ズーム/フィットをページ全体 → 横幅フィット → 縦幅フィット → 100%原寸 → 指定サイズで循環。余白カットは左パネルの表示トリムで設定する。見開き中は表紙あり/なしを保ったまま左開き / 右開きも連動して切り替える。ZIP の作品区切り表示上でも有効。ホバーバーの表示モード/フィットボタンからも切替可 |
 | 既定キーなし (`FsTogglePageAfterCoverAlone` / `FsToggleLastPageAlone`) | 表紙あり見開きで、表紙の次 / 最終ページを白い相方付きで単独表示する本別設定を切り替える。全体設定に従う状態からは現在の実効値の反対を明示保存する。表紙なし見開き・単ページ・横長分割では値だけ変更し、表示には適用しない |
 
 連結モード (縦連結 / 横連結) は画像 / ZIP 内画像 / PDF ページの通常閲覧用。360度パノラマ、分析、全画面ズーム、比較表示、消しゴム、隠蔽加工、テキスト注釈、補正レイヤーなどの編集・解析系モードはページ単位表示でのみ起動する。連結表示中にこれらのショートカットを押すと、`[機能名] ページ単位表示でのみ使用できます` と理由を画面表示する。

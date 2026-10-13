@@ -18,6 +18,7 @@ use std::path::PathBuf;
 
 use crate::adjustment::AdjustParams;
 use crate::app::App;
+use crate::rating_membership::RatingAdoptionIntent;
 use crate::tag_write_worker::{TagJobKind, TagWriteJob};
 use crate::undo_stack::{
     AdjustUndoScope, AdjustmentChange, LocalAdjustmentChange, RatingChange, TagChange, UndoEntry,
@@ -29,6 +30,16 @@ impl App {
     /// 1 回のレーティング操作 (単発 / バルク / コンテナ) を Undo スタックに積む。
     /// `before == after` の変更はフィルタ済みで OK。空エントリは undo_stack 側で破棄される。
     pub(crate) fn push_rating_undo_entry(&mut self, changes: Vec<RatingChange>, summary: String) {
+        let origin = self.capture_rating_origin();
+        self.push_rating_undo_entry_with_origin(changes, summary, origin);
+    }
+
+    pub(crate) fn push_rating_undo_entry_with_origin(
+        &mut self,
+        changes: Vec<RatingChange>,
+        summary: String,
+        origin: Option<crate::rating_membership::RatingOrigin>,
+    ) {
         // 実質変化のないものは積まない (Ctrl+Z 1 回が "見た目変化なし" になるのを防ぐ)
         let filtered: Vec<RatingChange> = changes
             .into_iter()
@@ -40,6 +51,7 @@ impl App {
         self.meta_undo.push(UndoEntry::Rating {
             changes: filtered,
             summary,
+            origin,
         });
     }
 
@@ -101,6 +113,8 @@ impl App {
     /// Undo/Redo スタック両方を破棄。フォルダ移動・フルスクリーン遷移・フルスクリーン
     /// 中の画像移動など「コンテキストが切り替わる境界」で呼ぶ。
     pub(crate) fn clear_meta_undo(&mut self) {
+        self.prepare_page_edit_history_boundary();
+        self.cancel_rating_membership_restore();
         if self.meta_undo.can_undo() || self.meta_undo.can_redo() {
             crate::logger::log(format!(
                 "[UNDO] clear_meta_undo: drop {} undo, {} redo entries",
@@ -109,61 +123,19 @@ impl App {
             ));
             self.meta_undo.clear();
         }
-        // ドラッグ中に境界を跨いだ場合 (フォルダ移動・フルスクリーン遷移・消しゴム遷移)、
-        // 進行中のセッションを安全に終了させる。
-        //
-        // ドラッグ中は DB / sidecar / settings.save をスキップしているため、ページ map
-        // または標準値はドラッグ最後の値をメモリにだけ持つ可能性がある。ここで対象の
-        // 通常書き込み API へ 1 回だけ流し、「ドラッグ中に画面が切り替わってしまっても
-        // 操作は失われない」挙動を保証する。
-        // Undo エントリは積まない (= boundary を跨ぐ操作は redo 不可) — Undo スタック自体を
-        // クリアする処理の最中なので一貫性が取れる。
-        let mut interrupted_adjustment_drag = false;
-        let mut interrupted_page_idx = None;
-        if let Some(session) = self.adjustment_drag_session.take() {
-            interrupted_adjustment_drag = true;
-            interrupted_page_idx = Some(session.fs_idx);
-            if let Some(p) = self.adjustment_page_params.get(&session.fs_idx).cloned() {
-                if Some(&p) != session.before.as_ref() {
-                    self.set_page_params(session.fs_idx, p);
-                }
-            }
-        }
-        if let Some(session) = self.adjustment_standard_drag_session.take() {
-            interrupted_adjustment_drag = true;
-            let after = match session.scope {
-                crate::app::AdjustmentStandardScope::Favorite(id) => self
-                    .adjustment_favorite_params
-                    .get(&id)
-                    .cloned()
-                    .unwrap_or_else(|| self.settings.global_preset.clone()),
-                crate::app::AdjustmentStandardScope::Global => self.settings.global_preset.clone(),
-            };
-            if session.before != after {
-                match session.scope {
-                    crate::app::AdjustmentStandardScope::Favorite(id) => {
-                        // ドラッグ中の map はプレビュー値。通常 release と同じく
-                        // before へ戻してから永続化し、AI 影響判定と prune の前後差を保つ。
-                        self.adjustment_favorite_params.insert(id, session.before);
-                        self.set_favorite_default(id, after)
-                    }
-                    crate::app::AdjustmentStandardScope::Global => {
-                        self.settings.global_preset = session.before;
-                        self.copy_params_to_global(after)
-                    }
-                }
-            }
-        }
-        if interrupted_adjustment_drag {
-            // 中断したページドラッグだけ、同じキーを使うセルを失効させる。
-            // 標準ドラッグは通常の永続化 API が必要な範囲を失効させる。
-            if self.thumb_adjust_drag_color_dirty {
-                if let Some(idx) = interrupted_page_idx {
-                    self.invalidate_thumb_adjust_for_dragged_page(idx);
-                }
-            }
-            self.thumb_adjust_drag_color_dirty = false;
-        }
+        self.finish_meta_undo_boundary_cleanup();
+    }
+
+    /// Automatic rating membership landing changes the page, but its rating
+    /// operation must remain undoable from the new page or the returned grid.
+    /// Index-scoped editing entries and unfinished drag/tag sessions still end.
+    pub(crate) fn clear_meta_undo_for_rating_move(&mut self) {
+        self.prepare_page_edit_history_boundary();
+        self.meta_undo.retain_rating();
+        self.finish_meta_undo_boundary_cleanup();
+    }
+
+    fn finish_meta_undo_boundary_cleanup(&mut self) {
         // 進行中のタグ操作の保留 Undo entry を破棄する。worker 結果は引き続き来るが、
         // poll_tag_write_results 側で「対応する pending が無い」ことを検出して
         // tags_cache 更新だけ行い undo push をスキップする。boundary を跨いだ操作の
@@ -182,22 +154,34 @@ impl App {
     /// Ctrl+Z ハンドラ。スタック先頭を取り出し、`before` 状態を再適用してから
     /// Redo スタックへ移す。スタックが空なら no-op。
     pub(crate) fn apply_meta_undo(&mut self) {
+        self.prepare_page_edit_history_boundary();
+        self.local_adjust_mask_lasso_points.clear();
+        self.local_adjust_mask_shape_drag_start = None;
+        self.local_adjust_mask_shape_drag_end = None;
         let Some(mut entry) = self.meta_undo.pop_undo() else {
             return;
         };
         let summary = entry.summary().to_string();
         crate::logger::log(format!("[UNDO] applying undo: {summary}"));
+        let mut notice = None;
         match &mut entry {
-            UndoEntry::Rating { changes, .. } => {
-                if let Err(error) =
-                    self.apply_rating_changes_to_app(changes, /* use_before */ true)
-                {
-                    crate::logger::log(format!("[UNDO] rating undo failed: {error}"));
-                    self.report_rating_write_error(&error);
-                    // The entry was only borrowed, not applied. Restore it to
-                    // the same side; Redo must remain untouched.
-                    self.meta_undo.push_undo_from_redo(entry);
-                    return;
+            UndoEntry::Rating {
+                changes, origin, ..
+            } => {
+                match self.apply_rating_undo_to_origin(
+                    changes,
+                    /* use_before */ true,
+                    origin.as_ref(),
+                ) {
+                    Ok(origin_notice) => notice = origin_notice,
+                    Err(error) => {
+                        crate::logger::log(format!("[UNDO] rating undo failed: {error}"));
+                        self.report_rating_write_error(&error);
+                        // The entry was only borrowed, not applied. Restore it to
+                        // the same side; Redo must remain untouched.
+                        self.meta_undo.push_undo_from_redo(entry);
+                        return;
+                    }
                 }
             }
             UndoEntry::Tag { changes, .. } => {
@@ -214,38 +198,69 @@ impl App {
                 //  古い Favorite 標準で発火して entry が消える事故が起きる。Codex P1)
                 let mut order: Vec<usize> = (0..changes.len()).collect();
                 order.sort_by_key(|&i| adjust_scope_priority(&changes[i].scope));
+                let mut documents = std::collections::HashMap::new();
                 for i in order {
-                    self.apply_adjustment_change_to_app(&changes[i], true);
+                    // Publish each contiguous Page segment before a later
+                    // standard change can prune its overrides (notably Redo).
+                    if !matches!(
+                        changes[i].scope,
+                        AdjustUndoScope::Page(_) | AdjustUndoScope::PageKey(_)
+                    ) {
+                        self.publish_accepted_adjustment_page_edits(&documents);
+                        documents.clear();
+                    }
+                    self.apply_adjustment_change_to_app(&changes[i], true, &mut documents);
                 }
+                self.publish_accepted_adjustment_page_edits(&documents);
             }
             UndoEntry::LocalAdjustment { changes, .. } => {
+                self.resolve_local_restore_targets(changes);
                 for c in changes {
                     self.apply_local_adjustment_change_to_app(c, true);
                 }
             }
         }
-        self.show_feedback_toast(format!("元に戻す: {summary}"));
+        let mut feedback = format!("元に戻す: {summary}");
+        if let Some(notice) = notice {
+            feedback.push_str(&format!(" ({notice})"));
+        }
+        self.show_feedback_toast(feedback);
         self.meta_undo.push_redo(entry);
     }
 
     /// Ctrl+Y / Ctrl+Shift+Z ハンドラ。Redo スタック先頭を取り出し、`after` 状態を
     /// 再適用してから Undo スタックへ戻す。
     pub(crate) fn apply_meta_redo(&mut self) {
+        self.prepare_page_edit_history_boundary();
+        self.local_adjust_mask_lasso_points.clear();
+        self.local_adjust_mask_shape_drag_start = None;
+        self.local_adjust_mask_shape_drag_end = None;
+        // An accepted Redo replaces any outstanding Undo restoration, including
+        // when the after-value write fails or there is no entry left to replay.
+        self.cancel_pending_rating_membership_restore();
         let Some(mut entry) = self.meta_undo.pop_redo() else {
             return;
         };
         let summary = entry.summary().to_string();
         crate::logger::log(format!("[UNDO] applying redo: {summary}"));
+        let mut notice = None;
         match &mut entry {
-            UndoEntry::Rating { changes, .. } => {
-                if let Err(error) =
-                    self.apply_rating_changes_to_app(changes, /* use_before */ false)
-                {
-                    crate::logger::log(format!("[UNDO] rating redo failed: {error}"));
-                    self.report_rating_write_error(&error);
-                    // Keep the failed operation retryable on the Redo side.
-                    self.meta_undo.push_redo(entry);
-                    return;
+            UndoEntry::Rating {
+                changes, origin, ..
+            } => {
+                match self.apply_rating_undo_to_origin(
+                    changes,
+                    /* use_before */ false,
+                    origin.as_ref(),
+                ) {
+                    Ok(origin_notice) => notice = origin_notice,
+                    Err(error) => {
+                        crate::logger::log(format!("[UNDO] rating redo failed: {error}"));
+                        self.report_rating_write_error(&error);
+                        // Keep the failed operation retryable on the Redo side.
+                        self.meta_undo.push_redo(entry);
+                        return;
+                    }
                 }
             }
             UndoEntry::Tag { changes, .. } => {
@@ -260,17 +275,33 @@ impl App {
                 // Redo は元操作の自然順 (Page → Favorite → Global、つまり下層から上層)
                 let mut order: Vec<usize> = (0..changes.len()).collect();
                 order.sort_by_key(|&i| std::cmp::Reverse(adjust_scope_priority(&changes[i].scope)));
+                let mut documents = std::collections::HashMap::new();
                 for i in order {
-                    self.apply_adjustment_change_to_app(&changes[i], false);
+                    // Publish each contiguous Page segment before a later
+                    // standard change can prune its overrides (notably Redo).
+                    if !matches!(
+                        changes[i].scope,
+                        AdjustUndoScope::Page(_) | AdjustUndoScope::PageKey(_)
+                    ) {
+                        self.publish_accepted_adjustment_page_edits(&documents);
+                        documents.clear();
+                    }
+                    self.apply_adjustment_change_to_app(&changes[i], false, &mut documents);
                 }
+                self.publish_accepted_adjustment_page_edits(&documents);
             }
             UndoEntry::LocalAdjustment { changes, .. } => {
+                self.resolve_local_restore_targets(changes);
                 for c in changes {
                     self.apply_local_adjustment_change_to_app(c, false);
                 }
             }
         }
-        self.show_feedback_toast(format!("やり直し: {summary}"));
+        let mut feedback = format!("やり直し: {summary}");
+        if let Some(notice) = notice {
+            feedback.push_str(&format!(" ({notice})"));
+        }
+        self.show_feedback_toast(feedback);
         self.meta_undo.push_undo_from_redo(entry);
     }
 
@@ -318,10 +349,11 @@ impl App {
     /// Apply a rating Undo/Redo entry as one SQLite transaction. Durable DB
     /// success is the publication boundary for caches, generations, XMP jobs,
     /// and the caller's stack transition.
-    fn apply_rating_changes_to_app(
+    pub(crate) fn apply_rating_changes_to_app(
         &mut self,
         changes: &[RatingChange],
         use_before: bool,
+        intent: RatingAdoptionIntent,
     ) -> Result<(), String> {
         let mut writes = Vec::with_capacity(changes.len());
         let mut seen = std::collections::HashSet::with_capacity(changes.len());
@@ -339,7 +371,10 @@ impl App {
             });
             writes.push((change.path_key.clone(), target, meta));
         }
-        self.write_user_ratings_shared(&writes)?;
+        self.write_user_ratings_shared_deferred_from(
+            &writes,
+            if use_before { "undo" } else { "redo" },
+        )?;
         for change in changes {
             self.record_content_identity_for_path(
                 &change.source_path,
@@ -383,6 +418,7 @@ impl App {
                 crate::app::smart_folder::SmartFolderMetadataDependency::Rating,
             );
         }
+        self.publish_current_context_rating_writes_with_intent(intent);
         Ok(())
     }
 
@@ -391,7 +427,12 @@ impl App {
     /// `clear_favorite_default` / `copy_params_to_global`) に流す — これらは
     /// すべて DB / settings / キャッシュクリアの副作用を含むので、Undo 用に
     /// 別経路を組まずに既存の書き込み API を再利用する。
-    fn apply_adjustment_change_to_app(&mut self, c: &AdjustmentChange, use_before: bool) {
+    fn apply_adjustment_change_to_app(
+        &mut self,
+        c: &AdjustmentChange,
+        use_before: bool,
+        documents: &mut std::collections::HashMap<String, Option<crate::adjustment::AdjustParams>>,
+    ) {
         let target = if use_before { &c.before } else { &c.after };
         match &c.scope {
             AdjustUndoScope::Page(idx) => match target {
@@ -409,7 +450,7 @@ impl App {
                 }
             },
             AdjustUndoScope::PageKey(page_target) => {
-                self.restore_page_params_for_target(page_target, target.clone());
+                self.restore_page_params_for_target_collect(page_target, target.clone(), documents);
             }
             AdjustUndoScope::Favorite(id) => match target {
                 Some(p) => self.set_favorite_default(*id, p.clone()),
@@ -430,7 +471,7 @@ impl App {
         use_before: bool,
     ) {
         let target = if use_before { &c.before } else { &c.after };
-        self.set_local_adjust_layers_for_idx(c.idx, target.clone());
+        self.set_local_adjust_layers_for_target(&c.target, target.clone());
     }
 
     /// 補正 Undo の **ページ側の復元先**。index ではなくページの識別子で持つ。
@@ -514,6 +555,33 @@ impl App {
             .collect()
     }
 
+    /// Resolve local documents once against the current list, just like the
+    /// existing PageKey adjustment path. Undo/Redo never reuse an old slot hint.
+    fn resolve_local_restore_targets(&self, changes: &mut [LocalAdjustmentChange]) {
+        use crate::app::PageIndexHint;
+        let wanted: std::collections::HashSet<&str> = changes
+            .iter()
+            .map(|change| change.target.page_key.as_str())
+            .collect();
+        let mut found: std::collections::HashMap<String, Vec<usize>> =
+            std::collections::HashMap::new();
+        for idx in 0..self.items.len() {
+            let Some(key) = self.page_path_key(idx) else {
+                continue;
+            };
+            if wanted.contains(key.as_str()) {
+                found.entry(key).or_default().push(idx);
+            }
+        }
+        for change in changes {
+            change.target.idx_hint = match found.get(&change.target.page_key).map(Vec::as_slice) {
+                Some([idx]) => PageIndexHint::At(*idx),
+                Some(_) => PageIndexHint::Unresolved,
+                None => PageIndexHint::Absent,
+            };
+        }
+    }
+
     /// 単一スコープの単一変更を Undo スタックに積む共通ヘルパー。`before == after`
     /// は捨てられるので、呼び出し側で抑止判定を書かなくて済む。
     pub(crate) fn capture_adjustment_undo(
@@ -540,10 +608,49 @@ impl App {
         after: local_adjust_core::LocalAdjustmentLayers,
         summary: String,
     ) {
+        let Some(target) = self.page_adjustment_target_for_idx(idx) else {
+            return;
+        };
+        self.capture_local_adjustment_undo_for_target(target, before, after, summary);
+    }
+
+    /// Record an already owned document without resolving its former index or
+    /// re-entering the shared history boundary from an edit-session finish.
+    pub(crate) fn capture_local_adjustment_undo_for_target(
+        &mut self,
+        mut target: crate::app::PageAdjustmentTarget,
+        before: local_adjust_core::LocalAdjustmentLayers,
+        after: local_adjust_core::LocalAdjustmentLayers,
+        summary: String,
+    ) {
+        target.idx_hint = crate::app::PageIndexHint::Unresolved;
         self.push_local_adjustment_undo_entry(
-            vec![LocalAdjustmentChange { idx, before, after }],
+            vec![LocalAdjustmentChange {
+                target,
+                before,
+                after,
+            }],
             summary,
         );
+    }
+
+    /// Finish a captured edit with its own before/after document. This low-level
+    /// dispatch is also used by history-boundary cleanup and must not call that
+    /// boundary again.
+    pub(crate) fn set_local_adjust_layers_for_target_with_undo(
+        &mut self,
+        target: &crate::app::PageAdjustmentTarget,
+        before: local_adjust_core::LocalAdjustmentLayers,
+        layers: local_adjust_core::LocalAdjustmentLayers,
+        summary: String,
+    ) {
+        // Keep the pre-owner release order: a pending key run is recorded
+        // before the pointer operation, using the current document as its after.
+        // The key terminal takes its session before entering this helper, so
+        // its own dispatch cannot recurse. Do not re-enter the history boundary.
+        self.persist_local_adjust_shape_key_edit();
+        self.set_local_adjust_layers_for_target(target, layers.clone());
+        self.capture_local_adjustment_undo_for_target(target.clone(), before, layers, summary);
     }
 
     pub(crate) fn set_local_adjust_layers_for_idx_with_undo(
@@ -560,13 +667,10 @@ impl App {
         // セッションの確定自身もここへ来るが、あちらは先に `take` してから呼ぶので
         // ここでは `None` を見て即戻る (再入しない)。
         self.persist_local_adjust_shape_key_edit();
-        self.set_local_adjust_layers_for_idx(idx, layers);
-        let after = self
-            .local_adjust_page_layers
-            .get(&idx)
-            .cloned()
-            .unwrap_or_default();
-        self.capture_local_adjustment_undo(idx, before, after, summary);
+        let Some(target) = self.page_adjustment_target_for_idx(idx) else {
+            return;
+        };
+        self.set_local_adjust_layers_for_target_with_undo(&target, before, layers, summary);
     }
 
     /// 補正書き込み操作の **直前 → 直後** で 3 層 (Page / Favorite / Global) すべての
@@ -609,6 +713,7 @@ impl App {
     ) where
         F: FnOnce(&mut App),
     {
+        self.prepare_page_edit_history_boundary();
         let pages_before = self.adjustment_page_params.clone();
         let favs_before = self.adjustment_favorite_params.clone();
         let global_before = self.settings.global_preset.clone();
@@ -747,6 +852,264 @@ fn adjust_scope_priority(scope: &AdjustUndoScope) -> u8 {
     }
 }
 
+#[cfg(test)]
+mod local_adjustment_target_tests {
+    use super::*;
+    use crate::app::PageIndexHint;
+    use local_adjust_core::{LocalAdjustmentLayer, LocalAdjustmentLayers, LocalEffect, LocalMask};
+
+    fn document(name: &str) -> LocalAdjustmentLayers {
+        LocalAdjustmentLayers::new(vec![LocalAdjustmentLayer::new(
+            name,
+            LocalMask::Full,
+            LocalEffect::None,
+        )])
+    }
+
+    fn assert_saved_document(
+        app: &App,
+        db: &crate::local_adjust_db::LocalAdjustDb,
+        target: &crate::app::PageAdjustmentTarget,
+        expected: &LocalAdjustmentLayers,
+    ) {
+        assert_eq!(
+            db.get_layers(&target.page_key).as_deref(),
+            Some(expected.as_slice())
+        );
+        let (folder, item_key) = target.sidecar_coords.as_ref().unwrap();
+        assert_eq!(
+            app.sidecars
+                .get(folder)
+                .unwrap()
+                .items()
+                .get(item_key)
+                .and_then(|item| item.local_adjust_layers.as_ref()),
+            Some(expected),
+        );
+    }
+
+    #[test]
+    fn local_undo_redo_keeps_captured_target_when_index_moves_or_disappears() {
+        for resident in [true, false] {
+            let mut app = crate::app::tests::phase_c_support::setup_app();
+            app.settings.sidecar_backup_enabled = true;
+            let folder_a = app.tmp.path().join("a");
+            let folder_b = app.tmp.path().join("b");
+            std::fs::create_dir_all(&folder_a).unwrap();
+            std::fs::create_dir_all(&folder_b).unwrap();
+            let path_a = folder_a.join("page.png");
+            let path_b = folder_b.join("page.png");
+            std::fs::write(&path_a, b"a").unwrap();
+            std::fs::write(&path_b, b"b").unwrap();
+            app.items = vec![
+                crate::grid_item::GridItem::Image(path_a.clone()),
+                crate::grid_item::GridItem::Image(path_b.clone()),
+            ];
+            app.image_metas = vec![None, None];
+            app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending; 2];
+            let target_a = app.page_adjustment_target_for_idx(0).unwrap();
+            let target_b = app.page_adjustment_target_for_idx(1).unwrap();
+            let before = document("a-before");
+            let after = document("a-after");
+            let sibling = document("b-unchanged");
+            app.set_local_adjust_layers_for_target(&target_a, before.clone());
+            app.set_local_adjust_layers_for_target(&target_b, sibling.clone());
+            app.set_local_adjust_layers_for_target_with_undo(
+                &target_a,
+                before.clone(),
+                after.clone(),
+                "stable local".into(),
+            );
+            let UndoEntry::LocalAdjustment { changes, .. } = app.meta_undo.peek_undo().unwrap()
+            else {
+                panic!("local entry expected");
+            };
+            assert_eq!(changes[0].target.page_key, target_a.page_key);
+            assert_eq!(changes[0].target.idx_hint, PageIndexHint::Unresolved);
+
+            // Simulate an adopted projection: B reuses A's old index, while A
+            // either moves to another slot or is no longer in this list.
+            app.items = vec![crate::grid_item::GridItem::Image(path_b)];
+            if resident {
+                app.items.push(crate::grid_item::GridItem::Image(path_a));
+            }
+            app.local_adjust_page_layers.clear();
+            app.local_adjust_pages.clear();
+            app.set_local_adjust_layers_for_idx_memory_only(0, sibling.clone());
+            if resident {
+                app.set_local_adjust_layers_for_idx_memory_only(1, after.clone());
+            }
+
+            app.apply_meta_undo();
+            app.finish_local_adjust_writes();
+            let db = crate::local_adjust_db::LocalAdjustDb::open_at(
+                &app.tmp.path().join("local_adjust.db"),
+            )
+            .unwrap();
+            assert_saved_document(&app, &db, &target_a, &before);
+            assert_saved_document(&app, &db, &target_b, &sibling);
+            assert_eq!(app.local_adjust_page_layers.get(&0), Some(&sibling));
+            if resident {
+                assert_eq!(app.local_adjust_page_layers.get(&1), Some(&before));
+            }
+            assert_eq!(app.meta_undo.redo_len(), 1);
+
+            app.apply_meta_redo();
+            app.finish_local_adjust_writes();
+            assert_saved_document(&app, &db, &target_a, &after);
+            assert_saved_document(&app, &db, &target_b, &sibling);
+            assert_eq!(app.local_adjust_page_layers.get(&0), Some(&sibling));
+            if resident {
+                assert_eq!(app.local_adjust_page_layers.get(&1), Some(&after));
+            }
+            assert_eq!(app.meta_undo.undo_len(), 1);
+        }
+    }
+
+    #[test]
+    fn local_restore_targets_resolve_duplicate_and_absent_keys_in_current_list() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let path_a = app.tmp.path().join("a.png");
+        let path_b = app.tmp.path().join("b.png");
+        app.items = vec![
+            crate::grid_item::GridItem::Image(path_a.clone()),
+            crate::grid_item::GridItem::Image(path_b.clone()),
+        ];
+        let target_a = app.page_adjustment_target_for_idx(0).unwrap();
+        let target_b = app.page_adjustment_target_for_idx(1).unwrap();
+        let mut changes = vec![target_a, target_b]
+            .into_iter()
+            .map(|target| LocalAdjustmentChange {
+                target,
+                before: document("before"),
+                after: document("after"),
+            })
+            .collect::<Vec<_>>();
+        app.items = vec![
+            crate::grid_item::GridItem::Image(path_a.clone()),
+            crate::grid_item::GridItem::Image(path_a),
+        ];
+        app.resolve_local_restore_targets(&mut changes);
+        assert_eq!(changes[0].target.idx_hint, PageIndexHint::Unresolved);
+        assert_eq!(changes[1].target.idx_hint, PageIndexHint::Absent);
+    }
+
+    #[test]
+    fn local_undo_capture_without_page_key_does_not_push_history() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        app.capture_local_adjustment_undo(
+            0,
+            document("before"),
+            document("after"),
+            "absent".into(),
+        );
+        assert_eq!(app.meta_undo.undo_len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod rating_origin_tests {
+    use super::*;
+
+    fn change(path: PathBuf) -> RatingChange {
+        RatingChange {
+            path_key: crate::adjustment_db::normalize_path(&path),
+            source_path: path,
+            meta: None,
+            xmp_target: None,
+            before: 3,
+            after: 4,
+        }
+    }
+
+    #[test]
+    fn rating_undo_captures_origin_before_reader_moves() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let path = app.tmp.path().join("origin.jpg");
+        app.items = vec![crate::grid_item::GridItem::Image(path.clone())];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = crate::app::ViewerPresentation::Fullscreen;
+        let expected = app.capture_rating_origin();
+        assert!(expected.is_some());
+        app.push_rating_undo_entry(vec![change(path)], "rating".into());
+        app.fullscreen_idx = None;
+        let UndoEntry::Rating { origin, .. } = app.meta_undo.peek_undo().unwrap() else {
+            panic!("rating entry expected");
+        };
+        assert_eq!(origin, &expected);
+    }
+
+    #[test]
+    fn automatic_rating_move_retains_rating_stacks_and_ends_tag_cleanup() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let path = app.tmp.path().join("retained.jpg");
+        app.push_rating_undo_entry(vec![change(path.clone())], "rating redo".into());
+        let redo = app.meta_undo.pop_undo().unwrap();
+        app.push_rating_undo_entry(vec![change(path.clone())], "rating undo".into());
+        app.push_tag_undo_entry(
+            vec![TagChange {
+                path,
+                tag_sidecar: None,
+                before: vec![],
+                after: vec!["tag".into()],
+            }],
+            "tag".into(),
+        );
+        app.meta_undo.push_redo(redo);
+        app.register_pending_tag_op(1, "pending tag".into(), 1);
+        app.clear_meta_undo_for_rating_move();
+        assert_eq!(app.meta_undo.undo_len(), 1);
+        assert_eq!(app.meta_undo.redo_len(), 1);
+        assert!(matches!(
+            app.meta_undo.peek_undo(),
+            Some(UndoEntry::Rating { .. })
+        ));
+        assert!(matches!(
+            app.meta_undo.peek_redo(),
+            Some(UndoEntry::Rating { .. })
+        ));
+        assert!(app.pending_tag_undos.is_empty());
+        app.clear_meta_undo();
+        assert_eq!(app.meta_undo.undo_len(), 0);
+        assert_eq!(app.meta_undo.redo_len(), 0);
+    }
+
+    #[test]
+    fn failed_rating_origin_dispatch_keeps_entry_on_same_stack() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let path = app.tmp.path().join("failed-origin.jpg");
+        app.items = vec![crate::grid_item::GridItem::Image(path.clone())];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = crate::app::ViewerPresentation::Fullscreen;
+        let expected = app.capture_rating_origin();
+        app.push_rating_undo_entry(vec![change(path)], "rating".into());
+        app.rating_db = None;
+        let generation = app.rating_session_write_generation;
+        app.apply_meta_undo();
+        assert_eq!(app.meta_undo.undo_len(), 1);
+        assert_eq!(app.meta_undo.redo_len(), 0);
+        let UndoEntry::Rating { origin, .. } = app.meta_undo.peek_undo().unwrap() else {
+            panic!("failed Undo must retain rating origin");
+        };
+        assert_eq!(origin, &expected);
+        let redo = app.meta_undo.pop_undo().unwrap();
+        app.meta_undo.push_redo(redo);
+        app.apply_meta_redo();
+        assert_eq!(app.meta_undo.undo_len(), 0);
+        assert_eq!(app.meta_undo.redo_len(), 1);
+        let UndoEntry::Rating { origin, .. } = app.meta_undo.peek_redo().unwrap() else {
+            panic!("failed Redo must retain rating origin");
+        };
+        assert_eq!(origin, &expected);
+        assert_eq!(app.rating_session_write_generation, generation);
+        assert_eq!(app.fullscreen_idx, Some(0));
+    }
+}
+
 // ── 操作キャプチャ ──────────────────────────────────────────────────
 //
 // レーティング/タグ操作の **直前** に呼ぶ snapshot ヘルパー。各操作のエントリポイント
@@ -812,7 +1175,11 @@ impl App {
         } else {
             format!("コンテナを★{after}")
         };
-        self.push_rating_undo_entry(
+        let origin = self.capture_rating_origin().map(|mut origin| {
+            origin.target = crate::rating_membership::RatingOriginTarget::ValueOnly;
+            origin
+        });
+        self.push_rating_undo_entry_with_origin(
             vec![RatingChange {
                 path_key,
                 source_path,
@@ -822,6 +1189,7 @@ impl App {
                 after,
             }],
             summary,
+            origin,
         );
     }
 

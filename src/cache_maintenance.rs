@@ -894,6 +894,7 @@ mod tests {
             app.retained_pdf_page_cache.insert(
                 crate::app::RetainedPdfPageKey { item_key },
                 crate::app::RetainedPdfPageEntry {
+                    metadata: None,
                     kind: crate::app::RetainedPdfPageCacheKind::Raster {
                         pixels: std::sync::Arc::clone(&pixels),
                         source_dims: [1, 1],

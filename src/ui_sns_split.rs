@@ -724,6 +724,7 @@ impl App {
         fs_idx: usize,
     ) -> crate::ui_fullscreen::FsKeyAction {
         let action = crate::ui_fullscreen::FsKeyAction {
+            page_transition: Default::default(),
             close: false,
             close_to_page_list: false,
             page_nav: crate::ui_fullscreen::FsPageNav::None,
@@ -1432,7 +1433,7 @@ mod tests {
 
     #[test]
     fn panel_controls_wire_choices_fit_and_custom_editor_to_live_state() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
         use std::cell::RefCell;
         use std::rc::Rc;
 
@@ -1446,7 +1447,7 @@ mod tests {
         let app = Rc::new(RefCell::new(app));
         let app_for_ui = Rc::clone(&app);
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(360.0, 700.0))
             .build(move |ctx| {
                 if !fonts_ready {

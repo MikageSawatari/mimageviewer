@@ -27,6 +27,162 @@
 
 use egui_kittest::{Harness, kittest::Queryable};
 
+#[path = "support/ui_harness.rs"]
+mod test_ui;
+
+#[cfg(windows)]
+#[test]
+fn effetune_show_only_active_tooltip_dark() {
+    effetune_show_only_tooltip_snapshot(
+        "effetune_show_only_active_tooltip_dark",
+        true,
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn effetune_show_only_inert_tooltip_light() {
+    effetune_show_only_tooltip_snapshot(
+        "effetune_show_only_inert_tooltip_light",
+        false,
+        mimageviewer::os_theme::ResolvedTheme::Light,
+    );
+}
+
+#[cfg(windows)]
+fn effetune_show_only_tooltip_snapshot(
+    name: &str,
+    active: bool,
+    theme: mimageviewer::os_theme::ResolvedTheme,
+) {
+    snapshot_with_theme_contrast_and_size_with_interaction(
+        name,
+        theme,
+        mimageviewer::settings::TextContrast::Standard,
+        egui::vec2(640.0, 260.0),
+        move |ui| {
+            ui.ctx()
+                .style_mut(|style| style.interaction.tooltip_delay = 0.0);
+            mimageviewer::draw_effetune_show_only_snapshot_fixture(ui, active);
+        },
+        |harness| {
+            harness.get_by_label("音響調整").hover();
+            harness.run();
+            assert!(
+                harness
+                    .query_by_label_contains("表示して前面に出します")
+                    .is_some()
+            );
+            assert!(
+                harness
+                    .query_by_label_contains("点灯は音響調整が有効")
+                    .is_some()
+            );
+        },
+    );
+}
+
+#[test]
+fn everything_search_bar_light() {
+    everything_search_bar_snapshot(
+        "everything_search_bar_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(720.0, 240.0),
+    );
+}
+
+#[test]
+fn everything_search_bar_dark() {
+    everything_search_bar_snapshot(
+        "everything_search_bar_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(720.0, 240.0),
+    );
+}
+
+#[test]
+fn everything_search_bar_narrow_dark() {
+    everything_search_bar_snapshot(
+        "everything_search_bar_narrow_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(320.0, 400.0),
+    );
+}
+
+fn everything_search_bar_snapshot(
+    name: &str,
+    theme: mimageviewer::os_theme::ResolvedTheme,
+    size: egui::Vec2,
+) {
+    snapshot_with_theme_contrast_and_size_with_interaction(
+        name,
+        theme,
+        mimageviewer::settings::TextContrast::Standard,
+        size,
+        mimageviewer::draw_everything_search_snapshot_fixture,
+        |harness| {
+            let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            for label in ["検索", "×"] {
+                assert!(
+                    viewport.contains_rect(harness.get_by_label(label).rect()),
+                    "{name}: {label} outside viewport"
+                );
+            }
+        },
+    );
+}
+
+#[test]
+fn everything_search_progress_small_100_light() {
+    everything_search_progress_snapshot(
+        "everything_search_progress_small_100_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        1.0,
+    );
+}
+
+#[test]
+fn everything_search_progress_small_200_dark() {
+    everything_search_progress_snapshot(
+        "everything_search_progress_small_200_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        2.0,
+    );
+}
+
+fn everything_search_progress_snapshot(
+    name: &str,
+    theme: mimageviewer::os_theme::ResolvedTheme,
+    scale: f32,
+) {
+    let size = egui::vec2(1093.0, 614.0);
+    let mut fonts_ready = false;
+    let mut harness = test_ui::builder().with_size(size).build(move |ctx| {
+        mimageviewer::os_theme::apply_resolved(ctx, theme);
+        if !fonts_ready {
+            install_app_fonts(ctx);
+            mimageviewer::settings::apply_ui_scale_factor(ctx, scale);
+            fonts_ready = true;
+            ctx.request_repaint();
+            return;
+        }
+        egui::CentralPanel::default().show(ctx, |_| {});
+        mimageviewer::draw_everything_progress_snapshot_fixture(ctx);
+    });
+    // The shared production body has an intentionally animated progress spinner.
+    harness.run_steps(12);
+    assert!((harness.ctx.content_rect().size() * scale - size).length() < 1.0);
+    let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+    for label in ["取消", "Close window"] {
+        assert!(
+            viewport.contains_rect(harness.get_by_label(label).rect()),
+            "{name}: {label} outside viewport"
+        );
+    }
+    harness.snapshot(name);
+}
+
 #[test]
 fn chrome_suppression_settings_light() {
     chrome_suppression_settings_snapshot(
@@ -234,7 +390,7 @@ fn startup_dialogs_small_viewport() {
             for &(kind, buttons) in STARTUP_DIALOG_CASES {
                 let size = egui::vec2(width as f32, height as f32);
                 let mut fonts_ready = false;
-                let mut harness = Harness::builder().with_size(size).build_state(
+                let mut harness = test_ui::builder().with_size(size).build_state(
                     move |ctx, actions: &mut Actions| {
                         mimageviewer::os_theme::apply_resolved(
                             ctx,
@@ -362,7 +518,7 @@ fn startup_dialogs_refit_after_viewport_resize() {
     for scale in [1.0, 2.0] {
         for &(kind, buttons) in STARTUP_DIALOG_CASES {
             let mut fonts_ready = false;
-            let mut harness = Harness::builder()
+            let mut harness = test_ui::builder()
                 .with_size(egui::vec2(1920.0, 1440.0))
                 .build_state(
                     move |ctx, state: &mut (Vec<egui::Id>, Vec<egui::Response>)| {
@@ -535,7 +691,7 @@ fn folder_toolbar_snapshot_status_label() {
                 };
                 let mut fonts_ready = false;
                 let mut path = String::from(r"C:\Pictures\日本語フォルダ");
-                let mut harness = Harness::builder()
+                let mut harness = test_ui::builder()
                     .with_size(egui::vec2(width * zoom, 120.0 * zoom))
                     .build(move |ctx| {
                         ctx.set_zoom_factor(zoom);
@@ -618,7 +774,7 @@ fn folder_toolbar_flexible_snapshots() {
                 for buttons in [true, false] {
                     let mut fonts_ready = false;
                     let mut path = String::from(r"C:\Pictures\日本語フォルダ");
-                    let mut harness = Harness::builder()
+                    let mut harness = test_ui::builder()
                         .with_size(egui::vec2(width, 240.0 * zoom))
                         .build(move |ctx| {
                             ctx.set_zoom_factor(zoom);
@@ -840,7 +996,7 @@ fn draw_folder_toolbar_fixture(
 
 fn snapshot_color_presets(name: &str, width: f32) {
     let mut fonts_ready = false;
-    let mut harness = Harness::builder()
+    let mut harness = test_ui::builder()
         .with_size(egui::vec2(width, 160.0))
         .build(move |ctx| {
             mimageviewer::os_theme::apply_resolved(
@@ -880,6 +1036,33 @@ fn preferences_transfer_entry_disabled_dark() {
         "preferences_transfer_entry_disabled_dark",
         mimageviewer::os_theme::ResolvedTheme::Dark,
         mimageviewer::draw_preferences_transfer_disabled_entry_snapshot_fixture,
+    );
+}
+
+#[test]
+fn file_type_visibility_preferences_dark() {
+    snapshot_with_theme_contrast_and_size(
+        "file_type_visibility_preferences_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::Standard,
+        egui::vec2(760.0, 700.0),
+        mimageviewer::draw_file_type_visibility_snapshot_fixture,
+    );
+}
+
+#[test]
+fn file_type_visibility_status_dark() {
+    use egui_kittest::kittest::Queryable;
+    snapshot_with_theme_contrast_and_size_with_interaction(
+        "file_type_visibility_status_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::Standard,
+        egui::vec2(760.0, 400.0),
+        mimageviewer::draw_file_type_visibility_status_snapshot_fixture,
+        |harness| {
+            harness.get_by_label("非表示 10 件").click();
+            harness.run();
+        },
     );
 }
 
@@ -1066,7 +1249,7 @@ fn snapshot_file_organize_modal(
     )>,
 ) {
     let mut fonts_ready = false;
-    let mut harness = Harness::builder().with_size(size).build(move |ctx| {
+    let mut harness = test_ui::builder().with_size(size).build(move |ctx| {
         mimageviewer::os_theme::apply_resolved_with_contrast(
             ctx,
             theme,
@@ -1274,11 +1457,31 @@ fn snapshot_with_theme_options(
     contrast: mimageviewer::settings::TextContrast,
     size: egui::Vec2,
     animated_steps: Option<usize>,
-    mut build_ui: impl FnMut(&mut egui::Ui),
+    build_ui: impl FnMut(&mut egui::Ui),
     interact: impl FnOnce(&mut Harness<'_>),
 ) {
+    drop(snapshot_with_theme_options_collect(
+        name,
+        resolved,
+        contrast,
+        size,
+        animated_steps,
+        build_ui,
+        interact,
+    ));
+}
+
+fn snapshot_with_theme_options_collect(
+    name: &str,
+    resolved: mimageviewer::os_theme::ResolvedTheme,
+    contrast: mimageviewer::settings::TextContrast,
+    size: egui::Vec2,
+    animated_steps: Option<usize>,
+    mut build_ui: impl FnMut(&mut egui::Ui),
+    interact: impl FnOnce(&mut Harness<'_>),
+) -> egui_kittest::SnapshotResults {
     let mut fonts_ready = false;
-    let mut harness = Harness::builder().with_size(size).build(move |ctx| {
+    let mut harness = test_ui::builder().with_size(size).build(move |ctx| {
         mimageviewer::os_theme::apply_resolved_with_contrast(ctx, resolved, contrast);
         if !fonts_ready {
             install_app_fonts(ctx);
@@ -1302,6 +1505,7 @@ fn snapshot_with_theme_options(
     }
     interact(&mut harness);
     harness.snapshot(name);
+    harness.take_snapshot_results()
 }
 
 #[cfg(windows)]
@@ -1311,7 +1515,7 @@ fn snapshot_with_ui_font(
     mut build_ui: impl FnMut(&mut egui::Ui),
 ) {
     let mut fonts_ready = false;
-    let mut harness = Harness::builder()
+    let mut harness = test_ui::builder()
         .with_size(egui::vec2(480.0, 260.0))
         .build(move |ctx| {
             mimageviewer::os_theme::apply_resolved(
@@ -1617,6 +1821,28 @@ fn preferences_effetune_auto_open_light() {
 }
 
 #[test]
+#[cfg(not(feature = "portable"))]
+fn preferences_effetune_taskbar_narrow_dark() {
+    let size = egui::vec2(320.0, 360.0);
+    snapshot_with_theme_contrast_and_size_with_interaction(
+        "preferences_effetune_taskbar_narrow_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::Standard,
+        size,
+        mimageviewer::draw_effetune_input_limit_snapshot_fixture,
+        |harness| {
+            let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            for label in [
+                "音響調整の窓をタスクバーに表示する",
+                "メインウィンドウを最小化しても音響調整の窓を表示したままにする",
+            ] {
+                assert!(viewport.contains_rect(harness.get_by_label(label).rect()));
+            }
+        },
+    );
+}
+
+#[test]
 fn preferences_book_resume_meter_light() {
     snapshot_with_theme(
         "preferences_book_resume_meter_light",
@@ -1733,6 +1959,307 @@ fn fullscreen_fit_cycle_single_mode_dark() {
 }
 
 #[test]
+fn fullscreen_specified_scale_editor_snapshots() {
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    use mimageviewer::settings::{FullscreenSpecifiedScale, SpecifiedScaleAxis};
+    let cases = [
+        ("default", FullscreenSpecifiedScale::default()),
+        (
+            "disabled_mixed",
+            FullscreenSpecifiedScale {
+                width: mimageviewer::settings::SpecifiedScaleAxisSetting::disabled(
+                    SpecifiedScaleAxis::LogicalPixels(1234),
+                ),
+                height: mimageviewer::settings::SpecifiedScaleAxisSetting::disabled(
+                    SpecifiedScaleAxis::PercentTenths(375),
+                ),
+            },
+        ),
+        (
+            "width_only",
+            FullscreenSpecifiedScale {
+                width: mimageviewer::settings::SpecifiedScaleAxisSetting::enabled(
+                    SpecifiedScaleAxis::PercentTenths(800),
+                ),
+                height: mimageviewer::settings::SpecifiedScaleAxisSetting::disabled(
+                    mimageviewer::settings::SpecifiedScaleAxis::PercentTenths(800),
+                ),
+            },
+        ),
+        (
+            "height_only",
+            FullscreenSpecifiedScale {
+                width: mimageviewer::settings::SpecifiedScaleAxisSetting::disabled(
+                    mimageviewer::settings::SpecifiedScaleAxis::PercentTenths(800),
+                ),
+                height: mimageviewer::settings::SpecifiedScaleAxisSetting::enabled(
+                    SpecifiedScaleAxis::LogicalPixels(800),
+                ),
+            },
+        ),
+        (
+            "mixed",
+            FullscreenSpecifiedScale {
+                width: mimageviewer::settings::SpecifiedScaleAxisSetting::enabled(
+                    SpecifiedScaleAxis::PercentTenths(500),
+                ),
+                height: mimageviewer::settings::SpecifiedScaleAxisSetting::enabled(
+                    SpecifiedScaleAxis::LogicalPixels(800),
+                ),
+            },
+        ),
+        (
+            "none",
+            FullscreenSpecifiedScale {
+                width: mimageviewer::settings::SpecifiedScaleAxisSetting::disabled(
+                    mimageviewer::settings::SpecifiedScaleAxis::PercentTenths(800),
+                ),
+                height: mimageviewer::settings::SpecifiedScaleAxisSetting::disabled(
+                    mimageviewer::settings::SpecifiedScaleAxis::PercentTenths(800),
+                ),
+            },
+        ),
+        (
+            "limits",
+            FullscreenSpecifiedScale {
+                width: mimageviewer::settings::SpecifiedScaleAxisSetting::enabled(
+                    SpecifiedScaleAxis::PercentTenths(1),
+                ),
+                height: mimageviewer::settings::SpecifiedScaleAxisSetting::enabled(
+                    SpecifiedScaleAxis::LogicalPixels(32768),
+                ),
+            },
+        ),
+    ];
+    for (theme_name, theme) in [
+        ("light", mimageviewer::os_theme::ResolvedTheme::Light),
+        ("dark", mimageviewer::os_theme::ResolvedTheme::Dark),
+    ] {
+        for (size_name, size) in [
+            ("normal", egui::vec2(560.0, 430.0)),
+            ("narrow", egui::vec2(280.0, 570.0)),
+        ] {
+            for (case, mut value) in cases {
+                let mut max_tenths = if case == "disabled_mixed" {
+                    25
+                } else {
+                    mimageviewer::settings::FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS
+                };
+                if size_name == "narrow" && matches!(case, "width_only" | "height_only" | "limits")
+                {
+                    continue;
+                }
+                snapshots.extend(snapshot_with_theme_options_collect(
+                    &format!("fullscreen_specified_scale_{case}_{size_name}_{theme_name}"),
+                    theme,
+                    mimageviewer::settings::TextContrast::Standard,
+                    size,
+                    None,
+                    |ui| {
+                        ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                assert!(!mimageviewer::draw_fullscreen_specified_scale_settings(
+                                    ui,
+                                    &mut value,
+                                    &mut max_tenths
+                                ));
+                            });
+                    },
+                    |_| {},
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn fullscreen_specified_scale_live_popup_snapshots() {
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    for (theme_name, theme) in [
+        ("light", mimageviewer::os_theme::ResolvedTheme::Light),
+        ("dark", mimageviewer::os_theme::ResolvedTheme::Dark),
+    ] {
+        for (size_name, size) in [
+            ("normal", egui::vec2(480.0, 450.0)),
+            ("narrow", egui::vec2(280.0, 620.0)),
+        ] {
+            for (scope, favorite) in [("standard", false), ("favorite", true)] {
+                let mut value = mimageviewer::settings::FullscreenSpecifiedScale::default();
+                snapshots.extend(snapshot_with_theme_options_collect(
+                    &format!("fullscreen_specified_scale_live_{scope}_{size_name}_{theme_name}"),
+                    theme,
+                    mimageviewer::settings::TextContrast::Standard,
+                    size,
+                    None,
+                    |ui| {
+                        mimageviewer::draw_fullscreen_specified_scale_live_settings(
+                            ui, &mut value, &mut { mimageviewer::settings::FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS }, favorite,
+                        );
+                    },
+                    |_| {},
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn spread_shift_hud_snapshots() {
+    use egui_kittest::kittest::NodeT;
+    use std::{cell::RefCell, collections::HashSet, rc::Rc};
+
+    #[derive(Default)]
+    struct Actions {
+        watched: Vec<egui::Id>,
+        clicked: HashSet<egui::Id>,
+    }
+
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    for (theme_name, theme) in [
+        ("light", mimageviewer::os_theme::ResolvedTheme::Light),
+        ("dark", mimageviewer::os_theme::ResolvedTheme::Dark),
+    ] {
+        for (size_name, size) in [
+            ("normal", egui::vec2(720.0, 500.0)),
+            ("narrow", egui::vec2(320.0, 480.0)),
+        ] {
+            for (state_name, unresolved) in [("resolved", false), ("unresolved", true)] {
+                let name = format!("spread_shift_hud_{state_name}_{size_name}_{theme_name}");
+                let actions = Rc::new(RefCell::new(Actions::default()));
+                let drawn_actions = Rc::clone(&actions);
+                snapshots.extend(snapshot_with_theme_options_collect(
+                    &name,
+                    theme,
+                    mimageviewer::settings::TextContrast::Standard,
+                    size,
+                    None,
+                    move |ui| {
+                        mimageviewer::draw_spread_shift_hud_snapshot_fixture(ui, unresolved);
+                        let mut actions = drawn_actions.borrow_mut();
+                        let watched = actions.watched.clone();
+                        for id in watched {
+                            if ui.ctx().read_response(id).is_some_and(|r| r.clicked()) {
+                                actions.clicked.insert(id);
+                            }
+                        }
+                    },
+                    |harness| {
+                        let viewport = harness.ctx.content_rect();
+                        let mut targets = Vec::new();
+                        for (label, actionable) in [
+                            ("基点のページへ移動", !unresolved),
+                            // Missing/filtered saved adjustments must still be clearable.
+                            ("調整を解除", true),
+                            ("見開きの調整を本ごとに記憶する", true),
+                        ] {
+                            let node = harness.get_by_label(label);
+                            let id = unsafe {
+                                egui::Id::from_high_entropy_bits(node.accesskit_node().id().0)
+                            };
+                            let response = harness.ctx.read_response(id).unwrap();
+                            assert!(
+                                viewport.contains_rect(response.rect),
+                                "{name} {label}: outside viewport"
+                            );
+                            assert!(
+                                response.interact_rect.contains_rect(response.rect),
+                                "{name} {label}: clipped"
+                            );
+                            assert_eq!(
+                                response.sense.senses_click(),
+                                actionable,
+                                "{name} {label}: actionability"
+                            );
+                            harness.hover_at(response.rect.center());
+                            harness.run_steps(3);
+                            let response = harness.ctx.read_response(id).unwrap();
+                            assert!(response.contains_pointer(), "{name} {label}: covered");
+                            targets.push((label, id, actionable));
+                        }
+                        actions.borrow_mut().watched =
+                            targets.iter().map(|(_, id, _)| *id).collect();
+                        for (label, id, actionable) in targets {
+                            let pos = harness.ctx.read_response(id).unwrap().rect.center();
+                            harness.hover_at(pos);
+                            for pressed in [true, false] {
+                                harness.event(egui::Event::PointerButton {
+                                    pos,
+                                    button: egui::PointerButton::Primary,
+                                    pressed,
+                                    modifiers: egui::Modifiers::NONE,
+                                });
+                            }
+                            harness.run_steps(3);
+                            assert_eq!(
+                                actions.borrow().clicked.contains(&id),
+                                actionable,
+                                "{name} {label}: click"
+                            );
+                        }
+                        harness.hover_at(egui::Pos2::ZERO);
+                        harness.run_steps(3);
+                    },
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn fullscreen_fit_hud_popup_snapshots() {
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    for (theme_name, theme) in [
+        ("light", mimageviewer::os_theme::ResolvedTheme::Light),
+        ("dark", mimageviewer::os_theme::ResolvedTheme::Dark),
+    ] {
+        for (size_name, size) in [
+            ("tall", egui::vec2(1200.0, 1000.0)),
+            ("normal1093", egui::vec2(1093.0, 614.0)),
+            ("narrow", egui::vec2(280.0, 320.0)),
+        ] {
+            for (scope, favorite) in [("standard", false), ("favorite", true)] {
+                snapshots.extend(snapshot_with_theme_options_collect(
+                    &format!("fullscreen_fit_hud_popup_{scope}_{size_name}_{theme_name}"),
+                    theme,
+                    mimageviewer::settings::TextContrast::Standard,
+                    size,
+                    None,
+                    |ui| mimageviewer::draw_fs_fit_popup_snapshot_fixture(ui, favorite),
+                    |_| {},
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn fullscreen_fit_cycle_all_modes_snapshots() {
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    for (theme_name, theme) in [
+        ("light", mimageviewer::os_theme::ResolvedTheme::Light),
+        ("dark", mimageviewer::os_theme::ResolvedTheme::Dark),
+    ] {
+        for (size_name, size) in [
+            ("normal", egui::vec2(480.0, 320.0)),
+            ("narrow", egui::vec2(280.0, 410.0)),
+        ] {
+            let mut settings = mimageviewer::settings::Settings::default();
+            snapshots.extend(snapshot_with_theme_options_collect(
+                &format!("fullscreen_fit_cycle_all_{size_name}_{theme_name}"),
+                theme,
+                mimageviewer::settings::TextContrast::Standard,
+                size,
+                None,
+                |ui| mimageviewer::draw_fullscreen_fit_cycle_settings(ui, &mut settings),
+                |_| {},
+            ));
+        }
+    }
+}
+
+#[test]
 fn preferences_favorite_view_state_dark() {
     snapshot_with_theme_at_size(
         "preferences_favorite_view_state_dark",
@@ -1745,6 +2272,28 @@ fn preferences_favorite_view_state_dark() {
                 mimageviewer::draw_favorite_view_state_settings_snapshot_fixture(ui);
             });
         },
+    );
+}
+
+#[test]
+fn preferences_restore_position_light_on() {
+    snapshot_with_theme_at_size(
+        "preferences_restore_position_light_on",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(480.0, 80.0),
+        None,
+        |ui| mimageviewer::draw_preferences_restore_position_snapshot_fixture(ui, true),
+    );
+}
+
+#[test]
+fn preferences_restore_position_dark_off_narrow() {
+    snapshot_with_theme_at_size(
+        "preferences_restore_position_dark_off_narrow",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(260.0, 80.0),
+        None,
+        |ui| mimageviewer::draw_preferences_restore_position_snapshot_fixture(ui, false),
     );
 }
 
@@ -2885,7 +3434,7 @@ fn content_restore_prompt_long_paths() {
     let mut dont_ask_again = false;
     let mut fonts_ready = false;
     const WINDOW_SIZE: egui::Vec2 = egui::vec2(980.0, 600.0);
-    let mut harness = Harness::builder().with_size(WINDOW_SIZE).build(move |ctx| {
+    let mut harness = test_ui::builder().with_size(WINDOW_SIZE).build(move |ctx| {
         mimageviewer::os_theme::apply_resolved(ctx, mimageviewer::os_theme::ResolvedTheme::Light);
         if !fonts_ready {
             install_app_fonts(ctx);
@@ -2955,7 +3504,7 @@ fn content_restore_prompt_light() {
     ];
     let mut dont_ask_again = false;
     let mut fonts_ready = false;
-    let mut harness = Harness::builder()
+    let mut harness = test_ui::builder()
         .with_size(egui::vec2(980.0, 600.0))
         .build(move |ctx| {
             mimageviewer::os_theme::apply_resolved(
@@ -3236,4 +3785,220 @@ fn external_tool_preparing_dark() {
             mimageviewer::external_tool::draw_external_tool_preparing_body(ui, 128);
         },
     );
+}
+
+fn diagnostics_export_snapshot(
+    state: &str,
+    theme_name: &str,
+    theme: mimageviewer::os_theme::ResolvedTheme,
+) {
+    snapshot_with_theme_contrast_and_size(
+        &format!("diagnostics_export_{state}_{theme_name}"),
+        theme,
+        mimageviewer::settings::TextContrast::Standard,
+        egui::vec2(620.0, 180.0),
+        |ui| mimageviewer::draw_diagnostics_export_snapshot_fixture(ui, state),
+    );
+}
+
+#[test]
+fn diagnostics_export_running_light() {
+    diagnostics_export_snapshot(
+        "running",
+        "light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+    );
+}
+
+#[test]
+fn diagnostics_export_running_dark() {
+    diagnostics_export_snapshot(
+        "running",
+        "dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+    );
+}
+
+#[test]
+fn diagnostics_export_incomplete_light() {
+    diagnostics_export_snapshot(
+        "incomplete",
+        "light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+    );
+}
+
+#[test]
+fn diagnostics_export_incomplete_dark() {
+    diagnostics_export_snapshot(
+        "incomplete",
+        "dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+    );
+}
+
+#[test]
+fn diagnostics_export_error_light() {
+    diagnostics_export_snapshot(
+        "error",
+        "light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+    );
+}
+
+#[test]
+fn diagnostics_export_error_dark() {
+    diagnostics_export_snapshot("error", "dark", mimageviewer::os_theme::ResolvedTheme::Dark);
+}
+
+#[test]
+fn g1_extracted_result_view_light() {
+    g1_extracted_result_view_snapshot(
+        "g1_extracted_result_view_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+    );
+}
+
+#[test]
+fn g1_extracted_result_view_dark() {
+    g1_extracted_result_view_snapshot(
+        "g1_extracted_result_view_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+    );
+}
+
+fn g1_extracted_result_view_snapshot(name: &str, theme: mimageviewer::os_theme::ResolvedTheme) {
+    snapshot_with_theme_at_size(
+        name,
+        theme,
+        egui::vec2(270.0, 185.0),
+        None,
+        mimageviewer::draw_fs_extracted_result_view_snapshot_fixture,
+    );
+}
+
+#[test]
+fn same_name_folder_book_light() {
+    snapshot_with_theme_at_size(
+        "same_name_folder_book_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(480.0, 100.0),
+        None,
+        mimageviewer::draw_same_name_folder_book_settings_snapshot_fixture,
+    );
+}
+#[test]
+fn same_name_folder_book_dark_narrow() {
+    snapshot_with_theme_at_size(
+        "same_name_folder_book_dark_narrow",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(260.0, 120.0),
+        None,
+        mimageviewer::draw_same_name_folder_book_settings_snapshot_fixture,
+    );
+}
+
+#[test]
+fn image_folder_zip_notice_small_light() {
+    image_folder_zip_snapshot("image_folder_zip_notice_small_light", "notice", 1.0, true);
+}
+
+#[test]
+fn image_folder_zip_confirm_small_200_dark() {
+    image_folder_zip_snapshot(
+        "image_folder_zip_confirm_small_200_dark",
+        "confirm",
+        2.0,
+        false,
+    );
+}
+
+#[test]
+fn image_folder_zip_copying_small_light() {
+    image_folder_zip_snapshot("image_folder_zip_copying_small_light", "copying", 1.0, true);
+}
+
+#[test]
+fn image_folder_zip_result_small_dark() {
+    image_folder_zip_snapshot("image_folder_zip_result_small_dark", "result", 1.0, false);
+}
+
+fn image_folder_zip_snapshot(name: &str, phase: &'static str, scale: f32, light: bool) {
+    let mut harness = image_folder_zip_harness(phase, egui::vec2(1093.0, 614.0), scale, light);
+    harness.run_steps(12);
+    assert!((harness.ctx.content_rect().size() * scale - egui::vec2(1093.0, 614.0)).length() < 1.0);
+    assert_image_folder_zip_controls(&harness, phase, name, egui::vec2(1093.0, 614.0));
+    harness.snapshot(name);
+}
+
+#[test]
+fn image_folder_zip_small_viewport_controls() {
+    for size in [egui::vec2(1093.0, 614.0), egui::vec2(1366.0, 728.0)] {
+        for scale in [1.0, 2.0] {
+            for light in [true, false] {
+                for phase in [
+                    "notice",
+                    "preparing",
+                    "waiting",
+                    "confirm",
+                    "copying",
+                    "saving",
+                    "adopting",
+                    "result",
+                    "error",
+                ] {
+                    let mut harness = image_folder_zip_harness(phase, size, scale, light);
+                    harness.run_steps(12);
+                    assert!((harness.ctx.content_rect().size() * scale - size).length() < 1.0);
+                    assert_image_folder_zip_controls(&harness, phase, "ZIP modal controls", size);
+                }
+            }
+        }
+    }
+}
+
+fn image_folder_zip_harness(
+    phase: &'static str,
+    size: egui::Vec2,
+    scale: f32,
+    light: bool,
+) -> Harness<'static> {
+    let theme = if light {
+        mimageviewer::os_theme::ResolvedTheme::Light
+    } else {
+        mimageviewer::os_theme::ResolvedTheme::Dark
+    };
+    let mut fonts_ready = false;
+    test_ui::builder().with_size(size).build(move |ctx| {
+        mimageviewer::os_theme::apply_resolved(ctx, theme);
+        if !fonts_ready {
+            install_app_fonts(ctx);
+            mimageviewer::settings::apply_ui_scale_factor(ctx, scale);
+            fonts_ready = true;
+            ctx.request_repaint();
+            return;
+        }
+        egui::CentralPanel::default().show(ctx, |_| {});
+        mimageviewer::draw_image_folder_zip_snapshot(ctx, phase);
+    })
+}
+
+fn assert_image_folder_zip_controls(
+    harness: &Harness<'_>,
+    phase: &str,
+    name: &str,
+    size: egui::Vec2,
+) {
+    let labels: &[&str] = match phase {
+        "notice" | "confirm" => &["ZIP に変換", "取消", "Close window"],
+        "result" | "error" => &["閉じる", "Close window"],
+        _ => &["取消", "Close window"],
+    };
+    let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+    for label in labels {
+        assert!(
+            viewport.contains_rect(harness.get_by_label(*label).rect()),
+            "{name}: {phase}/{label} outside viewport at {size:?}"
+        );
+    }
 }

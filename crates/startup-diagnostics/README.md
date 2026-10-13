@@ -40,7 +40,24 @@ uses the shared run origin; stage duration uses that stage's own begin clock.
 
 Explicit `--data-dir` and portable invocations write below that data directory;
 normal invocations use LOCALAPPDATA. Files are capped at 2 MiB and pruning keeps
-the ten most recent run IDs, skips locked active writers, and only recognizes
-this crate's exact log filename format. Data-directory environment probes run
+the ten most recent run IDs and only recognizes this crate's exact log filename
+format. A writer acquires a nonblocking exclusive lease on the same-stem `.lock`
+sidecar before creating its unique run/role/pid JSONL with `create_new`. The lease
+is held until the writer exits; it protects retention, not log contents. JSONL
+stays unlocked so Windows writes and live evidence collection both work. Pruning
+tries the sidecar lease without waiting, then also checks the JSONL lock for
+compatibility with active v4.4.0 writers. It removes eligible logs and sidecars
+while holding both locks; active runs may temporarily exceed the ten-run limit.
+Old logs without sidecars are supported, including the empty files left by the
+v4.4.0 shared-log-lock defect. Data-directory environment probes run
 on a separate worker. UNC recognition is pure; mapped-drive and reparse probes
 never run in publishers. Unproven redirection remains `unknown`.
+
+`terminal` publishes the first actual process outcome without waiting. The
+terminal event has protected owner metadata outside the bounded journal; the
+writer drains accepted pending records and emits it last exactly once, reserving
+four KiB within the file cap. Ordinary publishers stop accepting records after
+this seal. `shutdown_until(Instant)` is for the final process boundary only and
+uses the caller's deadline shared with the general log writer. Completion is
+reported after the final flush and the file/lease close; file-cap or I/O failure
+returns false. Timeout leaves I/O on the worker, with no join, retry or fallback.

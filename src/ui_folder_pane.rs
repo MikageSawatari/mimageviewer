@@ -415,13 +415,12 @@ mod tests {
 
     #[test]
     fn sort_control_and_reload_fit_the_minimum_folder_pane_width() {
-        use egui_kittest::Harness;
         use std::sync::{Arc, Mutex};
 
         let extents = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&extents);
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(480.0, 240.0))
             .build(move |ctx| {
                 if !fonts_ready {
@@ -469,11 +468,10 @@ mod tests {
 
     #[test]
     fn loading_row_does_not_grow_folder_pane_across_frames() {
-        use egui_kittest::Harness;
         use std::sync::{Arc, Mutex};
         let widths = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&widths);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(800.0, 480.0))
             .build(move |ctx| {
                 captured

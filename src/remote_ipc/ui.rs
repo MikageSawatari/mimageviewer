@@ -61,12 +61,15 @@ enum RemoteAcquireBarrierDecision {
 fn remote_acquire_barrier_decision(
     close_state: crate::app::LocalViewerCloseState,
     ai_quiesced: bool,
+    composition_editor_quiesced: bool,
     elapsed: std::time::Duration,
 ) -> RemoteAcquireBarrierDecision {
     use crate::app::LocalViewerCloseState;
     match close_state {
         LocalViewerCloseState::Failed(_) => RemoteAcquireBarrierDecision::AbortCloseFailure,
-        LocalViewerCloseState::Closed if ai_quiesced => RemoteAcquireBarrierDecision::Finish,
+        LocalViewerCloseState::Closed if ai_quiesced && composition_editor_quiesced => {
+            RemoteAcquireBarrierDecision::Finish
+        }
         _ if elapsed >= REMOTE_ACQUIRE_BARRIER_ABORT_AFTER => {
             RemoteAcquireBarrierDecision::AbortTimeout
         }
@@ -97,6 +100,8 @@ pub(crate) struct RemoteSessionUiState {
     pending_fullscreen_restore: Option<PendingFullscreenRestore>,
     paused_animation_restore_key: Option<String>,
     pending_bookmark_writes: std::collections::HashMap<u64, PendingRemoteBookmarkWrite>,
+    pending_reading_writes: Vec<PendingRemoteReadingWrite>,
+    pending_resume_reads: Vec<PendingRemoteResumeRead>,
     connection_dialog: Option<RemoteConnectionDialogState>,
     // Unlike the dialog-owned PIN and tailscale receivers, logout completion must outlive the
     // window because a successful secret rotation still has to disconnect local control.
@@ -121,6 +126,8 @@ impl Drop for RemoteSessionUiState {
             video_stream: self.video_stream.take(),
             pending_bookmark_writes: std::mem::take(&mut self.pending_bookmark_writes),
             pending_fullscreen_restore: self.pending_fullscreen_restore.take(),
+            pending_reading_writes: std::mem::take(&mut self.pending_reading_writes),
+            pending_resume_reads: std::mem::take(&mut self.pending_resume_reads),
             handle,
             generation,
         });
@@ -572,6 +579,14 @@ struct AppRemoteVideoStreaming {
 }
 
 impl AppRemoteVideoStreaming {
+    #[cfg(windows)]
+    fn now_playing_owner(&self) -> crate::effetune::NowPlayingOwner {
+        crate::effetune::NowPlayingOwner::Remote {
+            session: self.session.id().0,
+            registration: self.player.media_identity(),
+        }
+    }
+
     fn published(&self) -> PublishedVideoStream {
         PublishedVideoStream {
             session: self.session.id(),
@@ -733,6 +748,38 @@ struct RemoteAppDrainLease {
     video_stream: Option<AppRemoteVideoStreamState>,
     pending_bookmark_writes: std::collections::HashMap<u64, PendingRemoteBookmarkWrite>,
     pending_fullscreen_restore: Option<PendingFullscreenRestore>,
+    pending_reading_writes: Vec<PendingRemoteReadingWrite>,
+    pending_resume_reads: Vec<PendingRemoteResumeRead>,
+}
+
+enum PendingRemoteReadingWrite {
+    ShiftClear {
+        sequence: u64,
+        pending: ClaimedRemoteWrite,
+    },
+    ViewSetting {
+        pending: ClaimedRemoteWrite,
+        receiver: std::sync::mpsc::Receiver<Result<(), String>>,
+    },
+    ViewTrim {
+        pending: ClaimedRemoteWrite,
+        receiver: std::sync::mpsc::Receiver<Result<crate::view_trim::ViewTrimBookState, String>>,
+    },
+}
+impl PendingRemoteReadingWrite {
+    fn into_pending(self) -> ClaimedRemoteWrite {
+        match self {
+            Self::ShiftClear { pending, .. }
+            | Self::ViewSetting { pending, .. }
+            | Self::ViewTrim { pending, .. } => pending,
+        }
+    }
+}
+
+struct PendingRemoteResumeRead {
+    claimed: super::session::ClaimedBookResumeRead,
+    cutoff: u64,
+    receiver: std::sync::mpsc::Receiver<crate::book_resume_db::PositionReadReply>,
 }
 
 impl Drop for RemoteAppDrainLease {
@@ -745,6 +792,16 @@ impl Drop for RemoteAppDrainLease {
                 RemoteWriteErrorCode::UiTimeout,
                 "アプリを終了しています",
             )));
+        }
+        for pending in self.pending_reading_writes.drain(..) {
+            let pending = pending.into_pending();
+            pending.complete(UiWriteOutcome::Write(write_error(
+                RemoteWriteErrorCode::UiTimeout,
+                "アプリを終了しています",
+            )));
+        }
+        for pending in self.pending_resume_reads.drain(..) {
+            pending.claimed.complete_position(None);
         }
         if let Some(video) = self.video_stream.take() {
             match video {
@@ -873,6 +930,8 @@ impl crate::app::App {
             self.fs_transparent_bg_mode,
         ));
         handle.install_archive_cache_db(self.archive_cache_db.clone());
+        handle.install_spread_shift_service(self.spread_shift_service.clone());
+        handle.install_book_composition_service(self.book_composition_service.clone());
         #[cfg(windows)]
         self.effetune
             .set_remote_session_source(Some(handle.clone()));
@@ -902,6 +961,10 @@ impl crate::app::App {
                 &mut self.remote_session_ui.pending_bookmark_writes,
             ),
             pending_fullscreen_restore: self.remote_session_ui.pending_fullscreen_restore.take(),
+            pending_reading_writes: std::mem::take(
+                &mut self.remote_session_ui.pending_reading_writes,
+            ),
+            pending_resume_reads: std::mem::take(&mut self.remote_session_ui.pending_resume_reads),
             handle,
             generation,
         };
@@ -1081,6 +1144,11 @@ impl crate::app::App {
         if remote_phase == super::session::RemoteControlPhase::AcquiringRemote
             && let (Some(handle), Some(snapshot)) = (handle.as_ref(), snapshot.as_ref())
         {
+            // The editor belongs to its global operation owner, independently of whichever
+            // context is mounted and whether any fullscreen/detached viewer surface exists.
+            self.close_local_composition_editor(
+                crate::app::CompositionEditorCloseReason::RemoteAcquire,
+            );
             self.remote_session_ui.pending_fullscreen_restore = None;
             self.remote_session_ui.paused_animation_restore_key = None;
             self.invalidate_local_viewer_open_intents_for_remote();
@@ -1111,7 +1179,25 @@ impl crate::app::App {
                 .active
                 .as_ref()
                 .map_or(std::time::Duration::ZERO, |active| active.elapsed);
-            match remote_acquire_barrier_decision(close_state, barrier.is_quiesced(), elapsed) {
+            // Close is read-only for shift. Its final resume Record and all
+            // previously admitted shifts must publish before FinishAcquire.
+            let book_io_ready = self
+                .spread_shift_service
+                .as_ref()
+                .is_none_or(|service| service.is_ready() && !service.is_busy())
+                && self.book_resume_writer.as_ref().is_none_or(|writer| {
+                    let watermarks = writer.watermarks();
+                    watermarks.admitted == watermarks.completed_through
+                });
+            // Sent saves outlive terminal editor close. The existing composition completion
+            // poll must harvest success/failure before the global ticket owner reports ready.
+            let composition_editor_ready = self.composition_editor_acquire_ready();
+            match remote_acquire_barrier_decision(
+                close_state,
+                barrier.is_quiesced() && book_io_ready,
+                composition_editor_ready,
+                elapsed,
+            ) {
                 RemoteAcquireBarrierDecision::Finish => {
                     handle.finish_acquire(snapshot.generation);
                 }
@@ -1124,7 +1210,7 @@ impl crate::app::App {
                 }
                 RemoteAcquireBarrierDecision::AbortTimeout => {
                     crate::logger::log(format!(
-                        "remote_ipc: acquire_barrier_timeout generation={} elapsed_ms={} blockers={} close_state={close_state:?}",
+                        "remote_ipc: acquire_barrier_timeout generation={} elapsed_ms={} blockers={} close_state={close_state:?} composition_editor_ready={composition_editor_ready}",
                         snapshot.generation,
                         elapsed.as_millis(),
                         barrier.blocker_summary()
@@ -1138,7 +1224,7 @@ impl crate::app::App {
                         .should_log(snapshot.generation, elapsed) =>
                 {
                     crate::logger::log(format!(
-                        "remote_ipc: acquire_barrier_wait generation={} elapsed_ms={} blockers={} close_state={close_state:?}",
+                        "remote_ipc: acquire_barrier_wait generation={} elapsed_ms={} blockers={} close_state={close_state:?} composition_editor_ready={composition_editor_ready}",
                         snapshot.generation,
                         elapsed.as_millis(),
                         barrier.blocker_summary()
@@ -1162,6 +1248,7 @@ impl crate::app::App {
         if let Some(handle) = handle.as_ref() {
             self.apply_pending_remote_ui_requests(handle, ctx);
         }
+        self.poll_remote_resume_reads(ctx);
         if remote_phase == super::session::RemoteControlPhase::Local {
             self.poll_remote_fullscreen_restore();
         }
@@ -1176,7 +1263,12 @@ impl crate::app::App {
             }
             self.reload_after_remote_session_release();
         }
-        if matches!(
+        // The App frame poll drains Clear replies. Keep the existing Remote
+        // tick prompt until its claimed request consumes the completion.
+        self.poll_remote_reading_writes();
+        if !self.remote_session_ui.pending_reading_writes.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        } else if matches!(
             self.remote_session_ui.video_stream.as_ref(),
             Some(AppRemoteVideoStreamState::Opening(_) | AppRemoteVideoStreamState::Starting(_))
         ) {
@@ -1454,6 +1546,25 @@ impl crate::app::App {
             AppRemoteVideoStreamState::Streaming(streaming) => streaming,
         };
         streaming.player.tick(ctx);
+        #[cfg(windows)]
+        if self.effetune.now_playing_owner() == Some(streaming.now_playing_owner())
+            && let Some(info) = streaming.player.info()
+            && (!self.effetune.now_playing_metadata_matches(
+                streaming.now_playing_owner(),
+                streaming.player.path(),
+                info.title.as_deref(),
+                info.album.as_deref(),
+                info.artist.as_deref(),
+            ) || !self.effetune.now_playing_artwork_source_matches(
+                streaming.now_playing_owner(),
+                None,
+                &self.settings,
+            ))
+        {
+            let input = self.now_playing_input_for_player(&streaming.player, None);
+            self.effetune
+                .publish_now_playing(streaming.now_playing_owner(), input);
+        }
         self.remember_confirmed_remote_audio_track(&mut streaming);
         let snapshot = streaming.playback.snapshot();
         streaming.playback.update(
@@ -1484,6 +1595,9 @@ impl crate::app::App {
     }
 
     fn retire_remote_audio_stream(&mut self, streaming: &mut AppRemoteVideoStreaming) {
+        #[cfg(windows)]
+        self.effetune
+            .clear_now_playing(streaming.now_playing_owner());
         let stream_index = streaming.session.retire();
         self.remember_remote_audio_track_index(streaming, stream_index);
     }
@@ -1563,6 +1677,13 @@ impl crate::app::App {
                     return;
                 }
                 self.remember_confirmed_remote_audio_track(&mut starting.streaming);
+                #[cfg(windows)]
+                {
+                    // The metadata player is intentionally paused/headless; Stable is adoption.
+                    let owner = starting.streaming.now_playing_owner();
+                    let input = self.now_playing_input_for_player(&starting.streaming.player, None);
+                    self.effetune.publish_now_playing(owner, input);
+                }
                 let path = starting.streaming.requested_path.clone();
                 let kind = if path
                     .extension()
@@ -1890,17 +2011,38 @@ impl crate::app::App {
                     }
                 }
                 ClaimedRemoteUiRequest::BookResumeRead(pending) => {
-                    let latest = self.last_book_resume.as_ref().and_then(|(path, page, _)| {
-                        (crate::path_key::normalize(path)
-                            == crate::path_key::normalize(pending.path()))
-                        .then_some(*page)
-                    });
+                    if let Some(writer) = self.book_resume_writer.as_ref() {
+                        let cutoff = writer.watermarks().admitted;
+                        let receiver = writer.read_position_after(
+                            &crate::path_key::normalize(pending.path()),
+                            cutoff,
+                        );
+                        self.remote_session_ui
+                            .pending_resume_reads
+                            .push(PendingRemoteResumeRead {
+                                claimed: pending,
+                                cutoff,
+                                receiver,
+                            });
+                        continue;
+                    }
+                    let latest =
+                        self.last_book_resume
+                            .as_ref()
+                            .and_then(|(path, page, _, identity)| {
+                                (crate::path_key::normalize(path)
+                                    == crate::path_key::normalize(pending.path()))
+                                .then(|| crate::book_resume_db::ReadingPosition {
+                                    page: *page,
+                                    identity: identity.clone(),
+                                })
+                            });
                     let page = latest.or_else(|| {
                         self.book_resume_db
                             .as_ref()
-                            .and_then(|db| db.get(pending.path()))
+                            .and_then(|db| db.get_position(pending.path()))
                     });
-                    pending.complete(page);
+                    pending.complete_position(page);
                 }
                 ClaimedRemoteUiRequest::VideoStream(pending) => {
                     if self.sidecar_restore_active() {
@@ -1914,6 +2056,116 @@ impl crate::app::App {
                 }
             }
         }
+    }
+
+    fn poll_remote_resume_reads(&mut self, ctx: &egui::Context) {
+        let mut waiting = Vec::new();
+        for pending in std::mem::take(&mut self.remote_session_ui.pending_resume_reads) {
+            match pending.receiver.try_recv() {
+                Ok(reply)
+                    if reply.cutoff == pending.cutoff
+                        && reply.completed_through >= pending.cutoff
+                        && reply.status.is_ok() =>
+                {
+                    pending.claimed.complete_position(reply.position)
+                }
+                Ok(reply) => {
+                    crate::logger::log(format!(
+                        "remote_ipc: fenced resume read failed: {:?}",
+                        reply.status
+                    ));
+                    pending.claimed.complete_position(None);
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    pending.claimed.complete_position(None)
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => waiting.push(pending),
+            }
+        }
+        self.remote_session_ui.pending_resume_reads = waiting;
+        if !self.remote_session_ui.pending_resume_reads.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+    }
+
+    fn poll_remote_reading_writes(&mut self) {
+        let mut waiting = Vec::new();
+        for write in std::mem::take(&mut self.remote_session_ui.pending_reading_writes) {
+            match write {
+                PendingRemoteReadingWrite::ViewSetting { pending, receiver } => {
+                    let result = match receiver.try_recv() {
+                        Ok(result) => result,
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            waiting
+                                .push(PendingRemoteReadingWrite::ViewSetting { pending, receiver });
+                            continue;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            Err("表示設定の保存 worker が停止しました".into())
+                        }
+                    };
+                    let response = match result {
+                        Ok(()) => RemoteWriteResponse::Success(RemoteWriteResult::applied()),
+                        Err(error) => write_error(RemoteWriteErrorCode::PersistenceFailed, error),
+                    };
+                    pending.complete(UiWriteOutcome::Write(response));
+                }
+                PendingRemoteReadingWrite::ViewTrim { pending, receiver } => {
+                    let ownership = pending.ownership_response();
+                    if ownership.status != SessionStatus::Active {
+                        pending.complete(UiWriteOutcome::Session(ownership));
+                        continue;
+                    }
+                    let result = match receiver.try_recv() {
+                        Ok(result) => result,
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            waiting.push(PendingRemoteReadingWrite::ViewTrim { pending, receiver });
+                            continue;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            Err("view trim worker stopped".into())
+                        }
+                    };
+                    let response = match result {
+                        Ok(state) => self.complete_remote_view_trim_write(state),
+                        Err(error) => write_error(RemoteWriteErrorCode::PersistenceFailed, error),
+                    };
+                    pending.complete(UiWriteOutcome::Write(response));
+                }
+                other => waiting.push(other),
+            }
+        }
+        self.remote_session_ui.pending_reading_writes = waiting;
+    }
+
+    pub(crate) fn complete_remote_shift_reset(
+        &mut self,
+        reply: &crate::spread_shift::ShiftWriteReply,
+    ) -> bool {
+        let Some(pos) = self.remote_session_ui.pending_reading_writes.iter().position(|write| matches!(write, PendingRemoteReadingWrite::ShiftClear { sequence, .. } if *sequence == reply.sequence)) else {
+            return false;
+        };
+        let pending = self
+            .remote_session_ui
+            .pending_reading_writes
+            .remove(pos)
+            .into_pending();
+        let response = match &reply.status {
+            Ok(()) => {
+                self.show_feedback_toast("見開き調整を解除しました".into());
+                RemoteWriteResponse::Success(RemoteWriteResult::applied())
+            }
+            Err(error) => {
+                crate::logger::log(format!("remote_ipc: shift reset failed: {error}"));
+                self.show_feedback_toast(format!("見開き調整を保存できませんでした: {error}"));
+                write_error(
+                    RemoteWriteErrorCode::PersistenceFailed,
+                    "見開き調整の解除を保存できませんでした",
+                )
+            }
+        };
+        pending.complete(UiWriteOutcome::Write(response));
+        true
     }
 
     fn apply_remote_video_stream_request(&mut self, pending: ClaimedVideoStreamUiRequest) {
@@ -1997,6 +2249,19 @@ impl crate::app::App {
             });
         if let Err(error) = ownership {
             claimed.complete(video_stream_ui_failure(error));
+            return;
+        }
+
+        // Recheck the UI's latest snapshot at the player ownership boundary.
+        if !self
+            .settings
+            .file_type_visibility
+            .allows_physical_file(&requested_path)
+        {
+            claimed.complete(VideoStreamUiOutcome::Error(VideoStreamError::new(
+                VideoStreamErrorCode::Unsupported,
+                "表示するファイル種類の設定で、このファイルは非表示になっています",
+            )));
             return;
         }
 
@@ -2243,6 +2508,82 @@ impl crate::app::App {
             pending.complete(UiWriteOutcome::Session(ownership));
             return;
         }
+        if let Some(service) = &self.book_composition_service
+            && let Err(error) = pending
+                .composition_admission()
+                .validate(&service.snapshot())
+        {
+            pending.complete(UiWriteOutcome::Write(write_error(
+                RemoteWriteErrorCode::Unsupported,
+                error,
+            )));
+            return;
+        }
+        if let RemoteWriteRequest::SetViewMode { address, mode } = pending.request() {
+            let result = remote_shift_scope(address).and_then(|scope| {
+                let service = self
+                    .book_composition_service
+                    .as_ref()
+                    .ok_or("composition service unavailable")?;
+                let mode = match mode {
+                    mimageviewer_ipc::RemoteViewMode::Single => crate::settings::SpreadMode::Single,
+                    mimageviewer_ipc::RemoteViewMode::Spread => crate::settings::SpreadMode::Ltr,
+                    mimageviewer_ipc::RemoteViewMode::LandscapeSplit => {
+                        crate::settings::SpreadMode::SplitLtr
+                    }
+                };
+                service.set_view_mode(scope, mode)
+            });
+            match result {
+                Ok(receiver) => self
+                    .remote_session_ui
+                    .pending_reading_writes
+                    .push(PendingRemoteReadingWrite::ViewSetting { pending, receiver }),
+                Err(error) => pending.complete(UiWriteOutcome::Write(write_error(
+                    RemoteWriteErrorCode::PersistenceFailed,
+                    error,
+                ))),
+            }
+            ctx.request_repaint();
+            return;
+        }
+        if let Some(service) = self.book_composition_service.as_ref()
+            && let RemoteWriteRequest::SetViewTrim {
+                context_address,
+                state,
+                ..
+            } = pending.request()
+        {
+            let result = (|| {
+                let state =
+                    serde_json::from_value::<crate::view_trim::ViewTrimBookState>(state.clone())
+                        .map_err(|_| {
+                            RemoteWriteError::new(
+                                RemoteWriteErrorCode::BadRequest,
+                                "表示トリム設定が正しくありません",
+                            )
+                        })?;
+                let key = remote_spread_key(context_address)?;
+                if self.view_trim_db.is_none() {
+                    return Err(RemoteWriteError::new(
+                        RemoteWriteErrorCode::PersistenceFailed,
+                        "view_trim.db を利用できません",
+                    ));
+                }
+                Ok(service.set_view_trim_book(key, state, pending.composition_admission().clone()))
+            })();
+            match result {
+                Ok(receiver) => self
+                    .remote_session_ui
+                    .pending_reading_writes
+                    .push(PendingRemoteReadingWrite::ViewTrim { pending, receiver }),
+                Err(error) => {
+                    pending.complete(UiWriteOutcome::Write(RemoteWriteResponse::Error(error)))
+                }
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            return;
+        }
         let _settings_family_lease = if remote_write_uses_settings_family(pending.request()) {
             match crate::settings_db::acquire_settings_family_read_lease() {
                 Ok(lease) => Some(lease),
@@ -2293,13 +2634,115 @@ impl crate::app::App {
             )));
             return;
         }
-        let response = self.apply_remote_write(pending.request());
+        let response = self.apply_remote_write_with_composition_admission(
+            pending.request(),
+            pending.composition_admission(),
+        );
+        if matches!(response, RemoteWriteResponse::Success(_))
+            && self.settings.remember_spread_shift_per_book
+            && let RemoteWriteRequest::SetSpread { address, .. } = pending.request()
+        {
+            // The validated effective address owns the logical shift key.
+            // The existing base setter remains synchronous; only its Q3 Clear
+            // completion extends this same claimed request.
+            let scope = remote_shift_scope(address);
+            let result = scope.and_then(|scope| {
+                let service = self
+                    .spread_shift_service
+                    .as_ref()
+                    .ok_or_else(|| "shift service unavailable".to_owned())?;
+                service.clear_shift(
+                    scope,
+                    crate::spread_shift::ShiftOperation {
+                        context_id: self.spread_shift_context_id(),
+                        items_generation: self.items_generation,
+                        operation_sequence: pending.generation(),
+                    },
+                )
+            });
+            match result {
+                Ok(sequence) => {
+                    self.remote_session_ui
+                        .pending_reading_writes
+                        .push(PendingRemoteReadingWrite::ShiftClear { sequence, pending });
+                }
+                Err(error) => {
+                    crate::logger::log(format!(
+                        "remote_ipc: shift reset admission failed: {error}"
+                    ));
+                    pending.complete(UiWriteOutcome::Write(write_error(
+                        RemoteWriteErrorCode::PersistenceFailed,
+                        "見開き調整の解除を保存できませんでした",
+                    )));
+                }
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            return;
+        }
         pending.complete(UiWriteOutcome::Write(response));
         ctx.request_repaint();
     }
 
+    #[cfg(test)]
+    fn qualify_remote_write_for_test(
+        &self,
+        request: &RemoteWriteRequest,
+    ) -> Result<crate::book_composition::CompositionWriteAdmission, RemoteWriteError> {
+        // Unqualified fixture calls use the same worker admission as IPC. The
+        // product UI always receives a qualified request and performs no FS I/O.
+        if let Some(service) = self.book_composition_service.clone() {
+            let request = request.clone();
+            std::thread::spawn(move || {
+                let session = SessionHandle::new();
+                session.install_book_composition_service(Some(service));
+                let engine = super::container::ContainerEngine::new_with_session(
+                    Default::default(),
+                    session,
+                );
+                engine.composition_write_admission(&request)
+            })
+            .join()
+            .expect("remote composition qualification worker")
+        } else {
+            Ok(crate::book_composition::CompositionWriteAdmission::default())
+        }
+    }
+
+    #[cfg(test)]
     fn apply_remote_write(&mut self, request: &RemoteWriteRequest) -> RemoteWriteResponse {
+        let admission = self.qualify_remote_write_for_test(request);
+        match admission {
+            Ok(admission) => {
+                self.apply_remote_write_with_composition_admission(request, &admission)
+            }
+            Err(error) => RemoteWriteResponse::Error(error),
+        }
+    }
+
+    fn apply_remote_write_with_composition_admission(
+        &mut self,
+        request: &RemoteWriteRequest,
+        qualified: &crate::book_composition::CompositionWriteAdmission,
+    ) -> RemoteWriteResponse {
+        if matches!(
+            request,
+            RemoteWriteRequest::SetSpread { .. }
+                | RemoteWriteRequest::SetFinalCoverSpreadPreference { .. }
+                | RemoteWriteRequest::SetSingletonSpreadPlacementPreference { .. }
+                | RemoteWriteRequest::SetSingletonSpreadEndpointPreference { .. }
+                | RemoteWriteRequest::SetPageAlonePreference { .. }
+        ) {
+            if let Some(service) = self.book_composition_service.as_ref() {
+                if let Err(error) = qualified.validate(&service.snapshot()) {
+                    return write_error(RemoteWriteErrorCode::Unsupported, error);
+                }
+            }
+        }
         match request {
+            RemoteWriteRequest::SetViewMode { .. } => write_error(
+                RemoteWriteErrorCode::Internal,
+                "表示モードの非同期経路が使われませんでした",
+            ),
             RemoteWriteRequest::SetSpread {
                 address,
                 spread_mode,
@@ -2356,7 +2799,7 @@ impl crate::app::App {
                 ..
             } => {
                 self.apply_remote_media_resume_update(
-                    std::path::PathBuf::from(&address.path),
+                    crate::path_key::normalize_input_path(std::path::Path::new(&address.path)),
                     *position_secs,
                     *duration_secs,
                     *ended,
@@ -2754,7 +3197,34 @@ impl crate::app::App {
         let page_index = page_index as usize;
         if record_resume {
             // Remoteの従来のNULL記録を維持し、旧meterを消す。
-            self.persist_book_resume(target.container_path.clone(), page_index, None);
+            let identity = match &address.subresource {
+                mimageviewer_ipc::RemoteSubresource::File => {
+                    Some(crate::book_resume_db::PageIdentity::Image {
+                        path: crate::path_key::normalize_keep_drive(std::path::Path::new(
+                            &address.path,
+                        )),
+                    })
+                }
+                mimageviewer_ipc::RemoteSubresource::ZipEntry { entry_name } => {
+                    Some(crate::book_resume_db::PageIdentity::Archive {
+                        container: crate::path_key::normalize_keep_drive(&target.container_path),
+                        entry_name: entry_name.replace('\\', "/"),
+                    })
+                }
+                mimageviewer_ipc::RemoteSubresource::PdfPage { page_number } => {
+                    Some(crate::book_resume_db::PageIdentity::Document {
+                        container: crate::path_key::normalize_keep_drive(&target.container_path),
+                        page_num: *page_number as usize,
+                    })
+                }
+                mimageviewer_ipc::RemoteSubresource::ZipDirectory { .. } => None,
+            };
+            self.persist_book_resume_with_identity(
+                target.container_path.clone(),
+                page_index,
+                None,
+                identity,
+            );
         }
 
         if self.settings.reading_history_enabled
@@ -2806,13 +3276,20 @@ impl crate::app::App {
             Ok(target) => target,
             Err(error) => return RemoteWriteResponse::Error(error),
         };
-        if let Err(error) = self.write_user_rating_shared(&target.key, stars, Some(&target.meta)) {
+        if let Err(error) = self.write_user_rating_shared_deferred_from(
+            &target.key,
+            stars,
+            Some(&target.meta),
+            "remote",
+            None,
+        ) {
             crate::logger::log(format!("remote_ipc: rating write failed: {error}"));
             return write_error(
                 RemoteWriteErrorCode::PersistenceFailed,
                 "rating.db への保存に失敗しました",
             );
         }
+        self.publish_current_context_rating_writes();
         self.invalidate_rating_counts_cache();
         self.schedule_current_smart_folder_metadata_refresh(
             crate::app::smart_folder::SmartFolderMetadataDependency::Rating,
@@ -3047,6 +3524,13 @@ impl crate::app::App {
                 "view_trim.db への保存に失敗しました",
             );
         }
+        self.complete_remote_view_trim_write(state)
+    }
+
+    fn complete_remote_view_trim_write(
+        &mut self,
+        state: crate::view_trim::ViewTrimBookState,
+    ) -> RemoteWriteResponse {
         if matches!(
             self.settings.fullscreen_fit_mode,
             crate::settings::FullscreenFitMode::MarginFit
@@ -4038,7 +4522,7 @@ impl crate::app::App {
                 .iter()
                 .position(|item| item.perf_key() == pending.item_key)
             {
-                self.selected = Some(index);
+                self.move_grid_cursor(Some(index), crate::app::GridCursorIntent::Automatic);
                 if matches!(
                     self.items.get(index),
                     Some(crate::grid_item::GridItem::Video(_))
@@ -4071,7 +4555,8 @@ fn remote_write_uses_settings_family(request: &RemoteWriteRequest) -> bool {
     match request {
         RemoteWriteRequest::SetSortOrder { .. }
         | RemoteWriteRequest::RecordVideoProgress { .. } => true,
-        RemoteWriteRequest::SetSpread { .. }
+        RemoteWriteRequest::SetViewMode { .. }
+        | RemoteWriteRequest::SetSpread { .. }
         | RemoteWriteRequest::SetFinalCoverSpreadPreference { .. }
         | RemoteWriteRequest::SetSingletonSpreadPlacementPreference { .. }
         | RemoteWriteRequest::SetSingletonSpreadEndpointPreference { .. }
@@ -4111,6 +4596,20 @@ fn remote_spread_key(
     Ok(crate::spread_db::container_key_with_fallback(
         &root, &segments,
     ))
+}
+
+fn remote_shift_scope(
+    address: &mimageviewer_ipc::RemoteAddress,
+) -> Result<crate::book_scope::BookScopeKey, String> {
+    let root = std::path::Path::new(&address.path);
+    match &address.subresource {
+        RemoteSubresource::ZipDirectory { prefix } => crate::book_scope::BookScopeKey::archive(
+            root,
+            &super::container::zip_prefix_segments(prefix),
+        ),
+        RemoteSubresource::File => crate::book_scope::BookScopeKey::folder(root),
+        _ => Err("a page is not a book shift scope".into()),
+    }
 }
 
 struct RemoteRatingTarget {
@@ -4474,7 +4973,7 @@ pub(super) fn core_reading_direction(
     }
 }
 
-fn write_error(code: RemoteWriteErrorCode, message: &'static str) -> RemoteWriteResponse {
+fn write_error(code: RemoteWriteErrorCode, message: impl Into<String>) -> RemoteWriteResponse {
     RemoteWriteResponse::Error(RemoteWriteError::new(code, message))
 }
 
@@ -4658,6 +5157,188 @@ fn format_elapsed(elapsed: std::time::Duration) -> String {
 mod tests {
     use super::*;
 
+    include!("spread_shift_ui_tests.rs");
+
+    #[test]
+    fn detached_folder_composition_allows_qualified_and_fallback_remote_binding_writes() {
+        use crate::book_composition::*;
+        let mut app = crate::app::setup_app_for_test();
+        let data = tempfile::tempdir().unwrap();
+        app.spread_db =
+            Ok(crate::spread_db::SpreadDb::open_at(&data.path().join("spread.db")).unwrap());
+        let (service, owner) =
+            BookCompositionService::spawn_at(data.path().join("composition"), None).unwrap();
+        app.install_book_composition_runtime(service.clone());
+        for (name, domain) in [
+            ("image-book", PageDomain::ImageFolder),
+            ("directory.pdf", PageDomain::ImageFolder),
+            ("directory.zip", PageDomain::ImageFolder),
+            ("replaced.pdf", PageDomain::Document),
+            ("replaced.epub", PageDomain::Document),
+            (
+                "replaced.zip",
+                PageDomain::ArchiveLevel {
+                    prefix: String::new(),
+                },
+            ),
+        ] {
+            let root = data.path().join(name);
+            if domain == PageDomain::ImageFolder {
+                std::fs::create_dir(&root).unwrap();
+            } else {
+                std::fs::write(&root, b"former document/archive").unwrap();
+            }
+            let scope = crate::book_scope::BookScopeKey::folder(&root).unwrap();
+            let page = match domain {
+                PageDomain::ImageFolder => CompositionPageRef::RelativePath {
+                    path: "page.png".into(),
+                },
+                PageDomain::Document => CompositionPageRef::PdfPage { page_num: 0 },
+                PageDomain::ArchiveLevel { .. } => CompositionPageRef::ArchiveEntry {
+                    entry_name: "page.png".into(),
+                },
+            };
+            let mut record = BookComposition::new(
+                ReadingDirection::Ltr,
+                vec![CompositionUnit::Single {
+                    page: page.clone(),
+                    placement: SinglePlacement::Center,
+                    companion: SingleCompanion::Vacant,
+                }],
+            );
+            record.hidden_pages.push(page);
+            service
+                .save(scope.clone(), domain.clone(), record)
+                .recv()
+                .unwrap()
+                .status
+                .unwrap();
+            let before = service.snapshot();
+            if domain != PageDomain::ImageFolder {
+                std::fs::remove_file(&root).unwrap();
+                std::fs::create_dir(&root).unwrap();
+            }
+            let address =
+                mimageviewer_ipc::RemoteAddress::file(root.to_string_lossy().into_owned());
+            for use_worker_admission in [false, true] {
+                let request = RemoteWriteRequest::SetSpread {
+                    address: address.clone(),
+                    spread_mode: RemoteSpreadMode::RtlCover,
+                    reading_direction: RemoteReadingDirection::Rtl,
+                };
+                let response = if use_worker_admission {
+                    let admission = app.qualify_remote_write_for_test(&request).unwrap();
+                    assert!(admission.binding_scope.is_none());
+                    app.apply_remote_write_with_composition_admission(&request, &admission)
+                } else {
+                    app.apply_remote_write(&request)
+                };
+                assert!(
+                    matches!(response, RemoteWriteResponse::Success(_)),
+                    "{response:?}"
+                );
+                let key = remote_spread_key(&address).unwrap().exact;
+                assert_eq!(
+                    app.spread_db.as_ref().unwrap().get(&key),
+                    Some(crate::settings::SpreadMode::RtlCover)
+                );
+                assert_eq!(
+                    app.spread_db.as_ref().unwrap().get_direction(&key),
+                    Some(crate::settings::ReadingDirection::Rtl)
+                );
+            }
+            if domain == PageDomain::ImageFolder && name == "directory.pdf" {
+                // Future folder values also remain inert if an external action
+                // replaces the folder with an actual document file.
+                std::fs::remove_dir(&root).unwrap();
+                std::fs::write(&root, b"%PDF-1.4\n").unwrap();
+                let request = RemoteWriteRequest::SetSpread {
+                    address: address.clone(),
+                    spread_mode: RemoteSpreadMode::LtrCover,
+                    reading_direction: RemoteReadingDirection::Ltr,
+                };
+                let admission = app.qualify_remote_write_for_test(&request).unwrap();
+                assert!(admission.binding_scope.is_none());
+                assert!(matches!(
+                    app.apply_remote_write_with_composition_admission(&request, &admission),
+                    RemoteWriteResponse::Success(_)
+                ));
+                assert!(matches!(
+                    app.apply_remote_write(&request),
+                    RemoteWriteResponse::Success(_)
+                ));
+                assert_eq!(
+                    app.spread_db
+                        .as_ref()
+                        .unwrap()
+                        .get(&remote_spread_key(&address).unwrap().exact),
+                    Some(crate::settings::SpreadMode::LtrCover)
+                );
+            }
+            assert_eq!(service.snapshot().rows, before.rows);
+            assert_eq!(
+                service.snapshot().token_for(&scope),
+                before.token_for(&scope)
+            );
+        }
+        owner.shutdown_and_join();
+    }
+
+    #[test]
+    fn detached_folder_remote_binding_ignores_unavailable_store_and_document_fails_closed() {
+        use crate::book_composition::*;
+        let mut app = crate::app::setup_app_for_test();
+        let data = tempfile::tempdir().unwrap();
+        let composition_data = data.path().join("composition");
+        std::fs::create_dir(&composition_data).unwrap();
+        let broken_path = composition_data.join("book_composition.db");
+        let original = b"invalid composition database";
+        std::fs::write(&broken_path, original).unwrap();
+        let root = data.path().join("image-book");
+        std::fs::create_dir(&root).unwrap();
+        let document = data.path().join("book.pdf");
+        std::fs::write(&document, b"no document decoding").unwrap();
+        app.spread_db =
+            Ok(crate::spread_db::SpreadDb::open_at(&data.path().join("spread.db")).unwrap());
+        let (service, owner) = BookCompositionService::spawn_at(composition_data, None).unwrap();
+        assert!(
+            service
+                .prepare(
+                    crate::book_scope::BookScopeKey::document(&document).unwrap(),
+                    PageDomain::Document
+                )
+                .recv()
+                .unwrap()
+                .status
+                .is_err()
+        );
+        app.install_book_composition_runtime(service.clone());
+        let request = |root: &std::path::Path| RemoteWriteRequest::SetSpread {
+            address: mimageviewer_ipc::RemoteAddress::file(root.to_string_lossy().into_owned()),
+            spread_mode: RemoteSpreadMode::Rtl,
+            reading_direction: RemoteReadingDirection::Rtl,
+        };
+        for qualified in [None, Some(CompositionWriteAdmission::default())] {
+            assert!(matches!(
+                match qualified {
+                    Some(admission) => app
+                        .apply_remote_write_with_composition_admission(&request(&root), &admission),
+                    None => app.apply_remote_write(&request(&root)),
+                },
+                RemoteWriteResponse::Success(_)
+            ));
+        }
+        assert!(matches!(
+            app.apply_remote_write(&request(&document)),
+            RemoteWriteResponse::Error(RemoteWriteError {
+                code: RemoteWriteErrorCode::Unsupported,
+                ..
+            })
+        ));
+        assert_eq!(std::fs::read(broken_path).unwrap(), original);
+        owner.shutdown_and_join();
+    }
+
     fn ready_unharvested_remote_audio_stream() -> (
         crate::app::AppTestEnvForTest,
         SessionHandle,
@@ -4719,6 +5400,186 @@ mod tests {
         }
         assert!(app.settings.video_audio_track_choices.is_empty());
         (app, handle, path, session, generation)
+    }
+
+    #[cfg(windows)]
+    fn now_playing_starting_from_streaming(
+        handle: &SessionHandle,
+        streaming: AppRemoteVideoStreaming,
+    ) -> AppRemoteVideoStarting {
+        let owner = handle.owner_for_test("audio-boundary-test");
+        let request = VideoStreamUiRequest::start_for_test(
+            owner.clone(),
+            streaming.requested_path.clone(),
+            mimageviewer_ipc::VideoStreamQuality::Standard,
+        );
+        let operation = handle
+            .begin_operation(&owner, "now playing start".to_owned())
+            .unwrap();
+        let (claimed, _response) = ClaimedVideoStreamUiRequest::for_test(operation, request);
+        AppRemoteVideoStarting {
+            claimed,
+            streaming,
+            budget: VideoStreamStartBudget::from_enqueued_at(std::time::Instant::now()),
+            waiting_stage: VideoStreamStartStage::Encoder,
+        }
+    }
+
+    #[cfg(windows)]
+    fn now_playing_next_streaming(
+        app: &mut crate::app::App,
+        handle: &SessionHandle,
+        path: &std::path::Path,
+    ) -> AppRemoteVideoStreaming {
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.to_path_buf());
+        player.set_opened_audio_stream_for_test(0, 1);
+        let inputs = player.remote_stream_start_inputs().unwrap();
+        app.create_remote_video_streaming(
+            &handle.owner_for_test("audio-boundary-test"),
+            path,
+            crate::video::stream::quality::QualityPreset::Standard,
+            Some(0),
+            inputs,
+            Box::new(player),
+        )
+        .unwrap()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn now_playing_remote_stable_adopts_paused_headless_and_keeps_pause_ended() {
+        let (mut app, handle, _path, session, _generation) =
+            ready_unharvested_remote_audio_stream();
+        let streaming = app.take_remote_video_streaming().unwrap();
+        assert!(!streaming.player.is_playing());
+        let owner = streaming.now_playing_owner();
+        let starting = now_playing_starting_from_streaming(&handle, streaming);
+        app.finish_stable_remote_video_start(
+            starting,
+            Ok((StreamReconcile::Active, RemoteVideoStartReadiness::Stable)),
+        );
+        assert_eq!(app.effetune.now_playing_owner(), Some(owner));
+        assert!(matches!(
+            app.apply_remote_video_control(session, VideoStreamControlAction::Pause),
+            VideoStreamUiOutcome::Controlled(_)
+        ));
+        assert_eq!(app.effetune.now_playing_owner(), Some(owner));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            match app.remote_video_streaming_status().unwrap() {
+                StreamGenerationStatus::Ended(_) => break,
+                StreamGenerationStatus::Ready(_) | StreamGenerationStatus::Opening => {
+                    assert!(std::time::Instant::now() < deadline, "fixture did not end");
+                    std::thread::yield_now();
+                }
+                status => panic!("remote fixture failed before Ended: {status:?}"),
+            }
+        }
+        app.poll_remote_video_streaming(&egui::Context::default());
+        assert_eq!(
+            app.effetune.now_playing_owner(),
+            Some(owner),
+            "Pause / encoder Ended retain metadata"
+        );
+        app.apply_remote_video_stop(session);
+        assert_eq!(app.effetune.now_playing_owner(), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn now_playing_remote_next_waiting_failure_and_delayed_old_stop_leave_blank() {
+        let (mut app, handle, path, old_session, _) = ready_unharvested_remote_audio_stream();
+        let streaming = app.take_remote_video_streaming().unwrap();
+        let starting = now_playing_starting_from_streaming(&handle, streaming);
+        app.finish_stable_remote_video_start(
+            starting,
+            Ok((StreamReconcile::Active, RemoteVideoStartReadiness::Stable)),
+        );
+        app.cancel_remote_video_stream_state(VideoStreamErrorCode::Failed, "next media");
+        assert_eq!(app.effetune.now_playing_owner(), None);
+        let owner = handle.owner_for_test("audio-boundary-test");
+        let request = VideoStreamUiRequest::start_for_test(
+            owner.clone(),
+            path.clone(),
+            mimageviewer_ipc::VideoStreamQuality::Standard,
+        );
+        let operation = handle
+            .begin_operation(&owner, "now playing opening".to_owned())
+            .unwrap();
+        let (claimed, _response) = ClaimedVideoStreamUiRequest::for_test(operation, request);
+        app.remote_session_ui.video_stream =
+            Some(AppRemoteVideoStreamState::Opening(AppRemoteVideoOpening {
+                claimed,
+                owner,
+                requested_path: path.clone(),
+                quality: crate::video::stream::quality::QualityPreset::Standard,
+                audio_track: None,
+                player: None,
+                budget: VideoStreamStartBudget::from_enqueued_at(std::time::Instant::now()),
+                dsp_admission_deadline: std::time::Instant::now(),
+            }));
+        app.apply_remote_video_stop(old_session);
+        assert!(matches!(
+            app.remote_session_ui.video_stream,
+            Some(AppRemoteVideoStreamState::Opening(_))
+        ));
+        assert_eq!(app.effetune.now_playing_owner(), None);
+        app.cancel_remote_video_stream_state(VideoStreamErrorCode::Failed, "opening failed");
+        assert_eq!(app.effetune.now_playing_owner(), None);
+        let next = now_playing_next_streaming(&mut app, &handle, &path);
+        let starting = now_playing_starting_from_streaming(&handle, next);
+        app.finish_stable_remote_video_start(
+            starting,
+            Ok((
+                StreamReconcile::Active,
+                RemoteVideoStartReadiness::WaitingForEncoder,
+            )),
+        );
+        assert_eq!(app.effetune.now_playing_owner(), None);
+        app.apply_remote_video_stop(old_session);
+        assert!(
+            app.remote_video_starting_for_test(),
+            "old stop cannot cancel new Starting"
+        );
+        let Some(AppRemoteVideoStreamState::Starting(starting)) =
+            app.remote_session_ui.video_stream.take()
+        else {
+            panic!()
+        };
+        app.finish_stable_remote_video_start(starting, Err("next start failed".to_owned()));
+        assert_eq!(app.effetune.now_playing_owner(), None);
+        assert!(app.remote_session_ui.video_stream.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn now_playing_remote_delayed_old_retirement_cannot_clear_new_or_local_owner() {
+        let (mut app, handle, path, old_session, _) = ready_unharvested_remote_audio_stream();
+        let mut old = app.take_remote_video_streaming().unwrap();
+        let old_input = app.now_playing_input_for_player(&old.player, None);
+        app.effetune
+            .publish_now_playing(old.now_playing_owner(), old_input);
+        app.retire_remote_audio_stream(&mut old);
+        assert_eq!(app.effetune.now_playing_owner(), None);
+        let next = now_playing_next_streaming(&mut app, &handle, &path);
+        let next_owner = next.now_playing_owner();
+        let starting = now_playing_starting_from_streaming(&handle, next);
+        app.finish_stable_remote_video_start(
+            starting,
+            Ok((StreamReconcile::Active, RemoteVideoStartReadiness::Stable)),
+        );
+        app.apply_remote_video_stop(old_session);
+        app.retire_remote_audio_stream(&mut old);
+        assert_eq!(app.effetune.now_playing_owner(), Some(next_owner));
+        let local = crate::effetune::NowPlayingOwner::Local(999_359);
+        let input = app.now_playing_input_for_player(&old.player, None);
+        app.effetune.publish_now_playing(local, input);
+        app.cancel_remote_video_stream_state(
+            VideoStreamErrorCode::SessionMismatch,
+            "control returned",
+        );
+        assert_eq!(app.effetune.now_playing_owner(), Some(local));
     }
 
     fn saved_remote_audio_index(app: &crate::app::App, path: &std::path::Path) -> Option<usize> {
@@ -4879,6 +5740,107 @@ mod tests {
     }
 
     #[test]
+    fn queued_video_and_audio_start_rechecks_latest_policy_before_replacing_player() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.remote_video_streaming_enabled = true;
+        let (handle, owner, _) = active_session();
+        app.set_remote_session_handle(handle.clone());
+        let original_path = std::path::PathBuf::from(r"C:\videos\original.mp4");
+        let original_request = VideoStreamUiRequest::start_for_test(
+            owner.clone(),
+            original_path.clone(),
+            mimageviewer_ipc::VideoStreamQuality::Standard,
+        );
+        let (original_claimed, original_rx) = ClaimedVideoStreamUiRequest::for_test(
+            handle
+                .begin_operation(&owner, "previous start".into())
+                .unwrap(),
+            original_request,
+        );
+        app.remote_session_ui.video_stream =
+            Some(AppRemoteVideoStreamState::Opening(AppRemoteVideoOpening {
+                claimed: original_claimed,
+                owner: owner.clone(),
+                requested_path: original_path.clone(),
+                quality: crate::video::stream::quality::QualityPreset::Standard,
+                audio_track: None,
+                player: Some(Box::new(
+                    crate::video::VideoPlayer::stream_ready_disconnected_for_test(
+                        original_path.clone(),
+                    ),
+                )),
+                budget: VideoStreamStartBudget::from_enqueued_at(std::time::Instant::now()),
+                dsp_admission_deadline: std::time::Instant::now(),
+            }));
+        for (name, category, extension) in [
+            (
+                r"C:\videos\requested.mp4",
+                crate::file_type_visibility::FileTypeCategory::Video,
+                "mp4",
+            ),
+            (
+                r"C:\audio\requested.mp3",
+                crate::file_type_visibility::FileTypeCategory::Audio,
+                "mp3",
+            ),
+        ] {
+            for category_exclusion in [true, false] {
+                // Capture an already-admitted request, then change the UI snapshot
+                // before dispatch. No worker or decoder participates in this test.
+                let request = VideoStreamUiRequest::start_for_test(
+                    owner.clone(),
+                    name.into(),
+                    mimageviewer_ipc::VideoStreamQuality::Standard,
+                );
+                let (claimed, result_rx) = ClaimedVideoStreamUiRequest::for_test(
+                    handle
+                        .begin_operation(&owner, "queued start".into())
+                        .unwrap(),
+                    request,
+                );
+                app.settings
+                    .file_type_visibility
+                    .excluded_categories
+                    .clear();
+                app.settings
+                    .file_type_visibility
+                    .excluded_extensions
+                    .clear();
+                if category_exclusion {
+                    app.settings
+                        .file_type_visibility
+                        .excluded_categories
+                        .insert(category);
+                } else {
+                    app.settings
+                        .file_type_visibility
+                        .excluded_extensions
+                        .insert(extension.into());
+                }
+                app.apply_remote_video_stream_request(claimed);
+                assert!(matches!(
+                    result_rx.try_recv(),
+                    Ok(VideoStreamUiOutcome::Error(VideoStreamError {
+                        code: VideoStreamErrorCode::Unsupported,
+                        ..
+                    }))
+                ));
+                let Some(AppRemoteVideoStreamState::Opening(original)) =
+                    app.remote_session_ui.video_stream.as_ref()
+                else {
+                    panic!("previous player was replaced");
+                };
+                assert_eq!(original.requested_path, original_path);
+                assert_eq!(original.player.as_ref().unwrap().path(), &original_path);
+                assert!(matches!(
+                    original_rx.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn app_drain_lease_drop_terminals_every_representative_resource_before_one_ack() {
         let (handle, owner, generation) = active_session();
 
@@ -4934,6 +5896,8 @@ mod tests {
                 dsp_admission_deadline: std::time::Instant::now(),
             })),
             pending_bookmark_writes,
+            pending_reading_writes: Default::default(),
+            pending_resume_reads: Default::default(),
             pending_fullscreen_restore: Some(PendingFullscreenRestore {
                 item_key: "resume".to_owned(),
                 view: ReloadedView::Other,
@@ -5134,20 +6098,21 @@ mod tests {
 
         let before = REMOTE_ACQUIRE_BARRIER_ABORT_AFTER - std::time::Duration::from_millis(1);
         assert_eq!(
-            remote_acquire_barrier_decision(LocalViewerCloseState::Closed, true, before),
+            remote_acquire_barrier_decision(LocalViewerCloseState::Closed, true, true, before),
             Finish
         );
         assert_eq!(
-            remote_acquire_barrier_decision(LocalViewerCloseState::Closed, false, before),
+            remote_acquire_barrier_decision(LocalViewerCloseState::Closed, false, true, before),
             Wait
         );
         assert_eq!(
-            remote_acquire_barrier_decision(LocalViewerCloseState::InProgress, true, before),
+            remote_acquire_barrier_decision(LocalViewerCloseState::InProgress, true, true, before),
             Wait
         );
         assert_eq!(
             remote_acquire_barrier_decision(
                 LocalViewerCloseState::Failed(LocalViewerCloseFailure::PassiveContextRetire),
+                true,
                 true,
                 before,
             ),
@@ -5157,6 +6122,7 @@ mod tests {
             remote_acquire_barrier_decision(
                 LocalViewerCloseState::InProgress,
                 true,
+                true,
                 REMOTE_ACQUIRE_BARRIER_ABORT_AFTER,
             ),
             AbortTimeout
@@ -5164,6 +6130,33 @@ mod tests {
         assert_eq!(
             remote_acquire_barrier_decision(
                 LocalViewerCloseState::Closed,
+                false,
+                true,
+                REMOTE_ACQUIRE_BARRIER_ABORT_AFTER,
+            ),
+            AbortTimeout
+        );
+    }
+
+    #[test]
+    fn acquire_decision_waits_for_composition_editor_and_harvested_save_terminal() {
+        use crate::app::LocalViewerCloseState;
+        use RemoteAcquireBarrierDecision::{AbortTimeout, Finish, Wait};
+
+        let before = REMOTE_ACQUIRE_BARRIER_ABORT_AFTER - std::time::Duration::from_millis(1);
+        // Closed viewer surfaces and idle AI do not imply a terminal editor/save operation.
+        assert_eq!(
+            remote_acquire_barrier_decision(LocalViewerCloseState::Closed, true, false, before),
+            Wait
+        );
+        assert_eq!(
+            remote_acquire_barrier_decision(LocalViewerCloseState::Closed, true, true, before),
+            Finish
+        );
+        assert_eq!(
+            remote_acquire_barrier_decision(
+                LocalViewerCloseState::Closed,
+                true,
                 false,
                 REMOTE_ACQUIRE_BARRIER_ABORT_AFTER,
             ),
@@ -6043,7 +7036,17 @@ mod tests {
             true,
         );
         assert!(matches!(response, RemoteWriteResponse::Success(_)));
-        assert_eq!(app.last_book_resume, Some((folder.clone(), 1, None)));
+        assert_eq!(
+            app.last_book_resume,
+            Some((
+                folder.clone(),
+                1,
+                None,
+                Some(crate::book_resume_db::PageIdentity::Image {
+                    path: crate::path_key::normalize_keep_drive(&second)
+                })
+            ))
+        );
         assert_eq!(app.book_resume_meters.get(&folder), None);
         settle_book_resume_meter(&mut app);
         assert_eq!(
@@ -6059,11 +7062,8 @@ mod tests {
             handle.snapshot().phase,
             super::super::session::RemoteControlPhase::Local
         );
-        app.current_folder = Some(folder);
-        app.items = vec![
-            crate::grid_item::GridItem::Image(first),
-            crate::grid_item::GridItem::Image(second),
-        ];
+        app.load_folder(folder);
+        app.finish_page_identity_preparation_for_test();
         assert_eq!(app.resume_page_for_container(), Some(1));
     }
 

@@ -218,9 +218,10 @@ const SUBFOLDER_SORT_PROGRESS_INTERVAL: usize = 16_384;
 
 #[derive(Clone)]
 pub(crate) struct SubfolderExpansionOptions {
+    pub(crate) file_type_visibility: crate::file_type_visibility::FileTypeVisibility,
     skip_image_if_video_exists: bool,
     skip_duplicate_images: bool,
-    skip_zip_if_folder_exists: bool,
+    same_name_folder_book: crate::same_name_folder_book::SameNameFolderBookPolicy,
     video_thumb_use_sidecar_image: bool,
     image_folder_books: bool,
     include_convertible_archives: bool,
@@ -233,9 +234,10 @@ pub(crate) struct SubfolderExpansionOptions {
 impl From<&crate::settings::Settings> for SubfolderExpansionOptions {
     fn from(settings: &crate::settings::Settings) -> Self {
         Self {
+            file_type_visibility: settings.file_type_visibility.clone(),
             skip_image_if_video_exists: settings.skip_image_if_video_exists,
             skip_duplicate_images: settings.skip_duplicate_images,
-            skip_zip_if_folder_exists: settings.skip_zip_if_folder_exists,
+            same_name_folder_book: settings.same_name_folder_book,
             video_thumb_use_sidecar_image: settings.video_thumb_use_sidecar_image,
             image_folder_books: settings.auto_fullscreen_image_folders_enabled(),
             include_convertible_archives: !settings.archive_file_handling_ignores_convertible(),
@@ -326,6 +328,7 @@ pub(crate) struct SubfolderExpansionEntry {
 
 #[derive(Debug)]
 pub(crate) struct SubfolderExpansionResult {
+    pub(crate) file_type_visibility: crate::file_type_visibility::FileTypeVisibility,
     pub(crate) root: PathBuf,
     pub(crate) roots: Vec<PathBuf>,
     pub(crate) scan_filter: SubfolderExpansionScanFilter,
@@ -340,6 +343,7 @@ pub(crate) struct SubfolderExpansionResult {
 
 #[derive(Clone, Debug)]
 pub(crate) struct SubfolderExpansionSnapshot {
+    pub(crate) file_type_visibility: crate::file_type_visibility::FileTypeVisibility,
     pub(crate) root: PathBuf,
     pub(crate) roots: Vec<PathBuf>,
     pub(crate) scan_filter: SubfolderExpansionScanFilter,
@@ -599,6 +603,7 @@ fn scan_subfolder_expansion(
 ) -> Option<SubfolderExpansionResult> {
     let roots = normalize_expansion_roots(&root, roots);
     let mut result = SubfolderExpansionResult {
+        file_type_visibility: options.file_type_visibility.clone(),
         root: root.clone(),
         roots: roots.clone(),
         scan_filter: options.scan_filter.clone(),
@@ -718,7 +723,12 @@ fn scan_one_directory(
             }
         };
         let kind = crate::fs_entry::classify_dir_entry(&entry, &file_type);
-        entry_file_names_ci.insert(entry.file_name().to_string_lossy().to_lowercase());
+        if options
+            .file_type_visibility
+            .allows_physical_file(&entry.path())
+        {
+            entry_file_names_ci.insert(entry.file_name().to_string_lossy().to_lowercase());
+        }
         if crate::fs_entry::should_hide_fs_entry(&entry, options.show_hidden_files) {
             continue;
         }
@@ -762,9 +772,11 @@ fn scan_one_directory(
         } else {
             None
         };
-        if entry_kind.is_some()
-            || (options.include_convertible_archives
-                && crate::archive_converter::ArchiveFormat::from_extension(&ext_lower).is_some())
+        if options.file_type_visibility.allows_physical_file(&path)
+            && (entry_kind.is_some()
+                || (options.include_convertible_archives
+                    && crate::archive_converter::ArchiveFormat::from_extension(&ext_lower)
+                        .is_some()))
         {
             has_book_container = true;
         }
@@ -789,7 +801,9 @@ fn scan_one_directory(
                 file_size,
                 sort_meta: crate::settings::ListingSortMetadata::new(mtime, Some(file_size)),
             });
-        } else if let Some(kind) = entry_kind {
+        } else if let Some(kind) = entry_kind
+            && options.file_type_visibility.allows_physical_file(&path)
+        {
             containers.push(SubfolderExpansionEntry {
                 path,
                 kind,
@@ -799,9 +813,42 @@ fn scan_one_directory(
         }
     }
 
+    // Audio is absent from this view and cannot own an image sidecar or suppress an
+    // image row. Its visible presence still prevents image-folder book folding.
+    let has_visible_audio = media.iter().any(|entry| {
+        entry.kind == super::folder_scan::ScanMediaKind::Audio
+            && options
+                .file_type_visibility
+                .allows_physical_file(&entry.path)
+    });
+    media.retain(|entry| entry.kind != super::folder_scan::ScanMediaKind::Audio);
+    if options.skip_image_if_video_exists && options.video_thumb_use_sidecar_image {
+        for (video, image) in super::folder_scan::AuxiliaryMediaCandidates::capture(
+            &media,
+            &options.file_type_visibility,
+            &entry_file_names_ci,
+        )
+        .sidecars()
+        {
+            if options.file_type_visibility.allows_physical_file(&video) {
+                result
+                    .video_thumb_overrides
+                    .insert(crate::path_key::normalize_keep_drive(&video), image);
+            }
+        }
+    }
+    media.retain(|entry| {
+        options
+            .file_type_visibility
+            .allows_physical_file(&entry.path)
+    });
     super::folder_scan::filter_upscaled_video_pairs_fast(&mut media, &entry_file_names_ci);
+    apply_duplicate_filters_to_media(&mut media, options);
     if options.image_folder_books
-        && super::folder_scan::is_image_only_book_contents(has_book_container, &media)
+        && super::folder_scan::is_image_only_book_contents(
+            has_book_container || has_visible_audio,
+            &media,
+        )
     {
         let metadata = std::fs::metadata(dir).ok();
         if metadata.is_none() {
@@ -825,17 +872,25 @@ fn scan_one_directory(
         return;
     }
 
-    if options.skip_zip_if_folder_exists {
-        containers.retain(|entry| !real_folder_names.contains(&super::stem_lower(&entry.path)));
-    }
+    // Traversal and child book cells retain the existing recursive scope.
+    let folders: Vec<_> = real_folder_names
+        .iter()
+        .map(|name| dir.join(name))
+        .collect();
+    let mask = crate::same_name_folder_book::keep_mask(
+        options.same_name_folder_book,
+        folders
+            .iter()
+            .map(|path| (path.as_path(), true))
+            .chain(containers.iter().map(|entry| (entry.path.as_path(), false))),
+    );
+    let mut mask = mask.into_iter().skip(folders.len());
+    containers.retain(|_| mask.next().unwrap());
     containers.retain(|entry| {
         options
             .scan_filter
             .entry_matches(entry.kind, entry.mtime, entry.file_size, filter_now)
     });
-    // Audio is absent from this view, so it must not suppress an otherwise visible image.
-    media.retain(|entry| entry.kind != super::folder_scan::ScanMediaKind::Audio);
-    apply_duplicate_filters_to_media(&mut media, options, &mut result.video_thumb_overrides);
     media.retain(|entry| {
         let entry_kind = match entry.kind {
             super::folder_scan::ScanMediaKind::Image => SubfolderExpansionEntryKind::Image,
@@ -867,16 +922,9 @@ fn scan_one_directory(
 fn apply_duplicate_filters_to_media(
     media: &mut Vec<super::folder_scan::ScannedMediaEntry>,
     options: &SubfolderExpansionOptions,
-    video_thumb_overrides: &mut HashMap<String, PathBuf>,
 ) {
     if options.skip_image_if_video_exists {
-        let filtered = super::folder_scan::filter_video_image_duplicates(
-            media,
-            options.video_thumb_use_sidecar_image,
-        );
-        for (video, image) in filtered.sidecars {
-            video_thumb_overrides.insert(crate::path_key::normalize_keep_drive(&video), image);
-        }
+        super::folder_scan::filter_video_image_duplicates(media, false);
     }
     if options.skip_duplicate_images {
         super::folder_scan::filter_image_ext_duplicates(media, &options.image_ext_priority);
@@ -2059,6 +2107,7 @@ impl App {
         navigation: Option<SubfolderExpansionAdoption>,
     ) {
         let SubfolderExpansionResult {
+            file_type_visibility,
             root,
             roots,
             scan_filter,
@@ -2067,6 +2116,7 @@ impl App {
             diag,
         } = result;
         let snapshot = SubfolderExpansionSnapshot {
+            file_type_visibility,
             root,
             roots,
             scan_filter,
@@ -2166,6 +2216,14 @@ impl App {
         reused_metadata: Option<ReusedSubfolderMetadata>,
         navigation: Option<SubfolderExpansionAdoption>,
     ) {
+        if snapshot.file_type_visibility != self.settings.file_type_visibility {
+            self.start_subfolder_expansion_scan_roots_owned(
+                snapshot.root,
+                snapshot.roots,
+                navigation,
+            );
+            return;
+        }
         self.retire_replaced_main_list_requests(Some(super::MainListRequestOwner::Subfolder));
         if let Some(pending) = self.subfolder_expansion_install_pending.take() {
             pending.cancel();
@@ -2485,6 +2543,14 @@ impl App {
         {
             return;
         }
+        if prepared.snapshot.file_type_visibility != self.settings.file_type_visibility {
+            self.start_subfolder_expansion_scan_roots_owned(
+                prepared.snapshot.root,
+                prepared.snapshot.roots,
+                navigation,
+            );
+            return;
+        }
         if prepared.page_edit_revision != self.page_edit_revision
             || prepared
                 .metadata
@@ -2596,7 +2662,11 @@ impl App {
             None,
             None,
             None,
-            VisibleInstallAuthority::Ordinary,
+            VisibleInstallAuthority::Projection {
+                recipe: super::book_materialization::ProjectionRecipe::ExtractedResult(
+                    super::book_materialization::ExtractedSurface::SubfolderExpansion,
+                ),
+            },
             token,
         );
         if let Some(generation) = rating_write_generation {
@@ -2639,7 +2709,7 @@ impl App {
         if let (Some(ctx), Some(query)) = (ctx, local_search) {
             self.show_search_bar = true;
             self.search_query = query;
-            self.execute_search(ctx);
+            self.reexecute_search_for_installed_list(ctx);
         }
         if perf_on {
             crate::perf::event(
@@ -2654,7 +2724,7 @@ impl App {
             );
         }
         if let Some(&idx) = self.visible_indices.first() {
-            self.selected = Some(idx);
+            self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
             self.scroll_to_selected = true;
         }
         if perf_on {
@@ -2931,6 +3001,127 @@ mod tests {
     use super::*;
 
     #[test]
+    fn g1_subfolder_real_handler_reopen_restores_legacy_flow_and_book_return() {
+        use crate::app::book_materialization::ExtractedSurface;
+        use crate::settings::{ReadingDirection, ReadingFlow, SpreadMode};
+        let ctx = egui::Context::default();
+        for saved_flow in [None, Some(ReadingFlow::Vertical)] {
+            let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+            let mut app = crate::app::setup_app_for_test();
+            app.active_quick_folder_slot = None;
+            app.settings.detached_viewer_open_images_in_window = false;
+            // Explicit compiled Books remain Books without making the extraction scan
+            // collapse every image-only directory into a Folder row.
+            app.settings.auto_fullscreen_image_folders = false;
+            app.settings.auto_fullscreen_zip_pdf = true;
+            app.settings.default_spread_mode = SpreadMode::RtlCover;
+            app.settings.default_reading_flow = ReadingFlow::Vertical;
+            app.settings.default_reading_direction = ReadingDirection::Rtl;
+            let books_root = app.tmp.path().join("books");
+            let book = books_root.join("subfolder-a2-original-book");
+            app.settings.book_root = Some(books_root);
+            std::fs::create_dir_all(&book).unwrap();
+            for name in ["a_1.png", "a_2.png"] {
+                image::RgbImage::new(2, 3).save(book.join(name)).unwrap();
+            }
+            let synthetic = subfolder_expansion_synthetic_path();
+            if let Some(flow) = saved_flow {
+                let db = app.spread_db.as_ref().unwrap();
+                db.set(
+                    &synthetic,
+                    SpreadMode::RtlCover,
+                    SpreadMode::Single,
+                    ReadingFlow::Paged,
+                    ReadingDirection::Ltr,
+                )
+                .unwrap();
+                db.set_flow(
+                    &synthetic,
+                    flow,
+                    ReadingDirection::Rtl,
+                    SpreadMode::Single,
+                    ReadingFlow::Paged,
+                    ReadingDirection::Ltr,
+                )
+                .unwrap();
+            }
+            let stored = app
+                .spread_db
+                .as_ref()
+                .unwrap()
+                .get_state_with_fallback(&synthetic, None);
+            app.load_folder(book.clone());
+            app.settle_open_path_classification_for_test();
+            app.finish_page_identity_preparation_for_test();
+            assert_eq!(app.spread_mode, SpreadMode::RtlCover);
+            assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+            app.start_subfolder_expansion_scan_roots(book.clone(), vec![book.clone()]);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !app.items_are_subfolder_expansion_view {
+                assert!(
+                    Instant::now() < deadline,
+                    "Subfolder A2 scan did not settle"
+                );
+                app.poll_subfolder_expansion(&ctx);
+                app.poll_sidecar_restore(&ctx);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            finish_list_hydration_for_test(&mut app);
+            assert_eq!(
+                app.extracted_result_surface(),
+                Some(ExtractedSurface::SubfolderExpansion)
+            );
+            // Like a new Smart root, this producer uses the legacy synthetic-key
+            // NON_BOOK restore: no saved flow means Paged after a Vertical Book.
+            let expected_flow = saved_flow.unwrap_or(ReadingFlow::Paged);
+            assert_eq!(app.reading_flow, expected_flow);
+            let index = app
+                .items
+                .iter()
+                .position(|item| matches!(item, GridItem::Image(_)))
+                .unwrap();
+            for _ in 0..2 {
+                app.open_fullscreen(index, crate::app::HistoryTrigger::UserChosen);
+                assert_eq!(app.fullscreen_idx, Some(index));
+                assert_eq!(app.spread_mode, SpreadMode::Single);
+                assert_eq!(app.reading_flow, expected_flow);
+                app.apply_fullscreen_spread_mode(&ctx, index, SpreadMode::RtlCover);
+                assert_eq!(app.spread_mode, SpreadMode::Rtl);
+                assert_eq!(app.reading_flow, expected_flow);
+                app.close_fullscreen();
+            }
+            assert_eq!(
+                app.spread_db
+                    .as_ref()
+                    .unwrap()
+                    .get_state_with_fallback(&synthetic, None),
+                stored
+            );
+            app.exit_subfolder_expansion_view();
+            app.settle_open_path_classification_for_test();
+            app.finish_page_identity_preparation_for_test();
+            assert_eq!(app.current_folder.as_deref(), Some(book.as_path()));
+            assert!(app.extracted_result_surface().is_none());
+            assert_eq!(app.spread_mode, SpreadMode::RtlCover);
+            assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+            assert_eq!(app.reading_direction, ReadingDirection::Rtl);
+        }
+    }
+
+    fn finish_list_hydration_for_test(app: &mut App) {
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.sidecar_restore_active() {
+            assert!(
+                Instant::now() < deadline,
+                "subfolder hydration did not settle"
+            );
+            app.poll_sidecar_restore(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
     fn audit_subfolder_readers_with_foreign_writers() {
         crate::page_edit_write_epoch::with_foreign_scoped_writers(|| {
             phase_a_subfolder_mask_is_projected_after_accepted_prepare();
@@ -2957,6 +3148,7 @@ mod tests {
             .set(&key, &[true], &[], 1, 1)
             .unwrap();
         let snapshot = SubfolderExpansionSnapshot {
+            file_type_visibility: Default::default(),
             root: root.clone(),
             roots: vec![root],
             scan_filter: SubfolderExpansionScanFilter::default(),
@@ -2975,6 +3167,7 @@ mod tests {
         };
         app.start_subfolder_expansion_prepare(snapshot, false);
         app.finish_subfolder_expansion_prepare_for_test();
+        finish_list_hydration_for_test(&mut app);
         assert_eq!(app.page_path_key(0).as_deref(), Some(key.as_str()));
         assert!(
             app.mask_pages.contains(&0),
@@ -2997,6 +3190,7 @@ mod tests {
             .set(&key, &[true], &[], 1, 1)
             .unwrap();
         let snapshot = SubfolderExpansionSnapshot {
+            file_type_visibility: Default::default(),
             root: root.clone(),
             roots: vec![root],
             scan_filter: SubfolderExpansionScanFilter::default(),
@@ -3040,6 +3234,7 @@ mod tests {
         assert_eq!(app.items_generation, generation_before_rejection);
         assert!(app.subfolder_expansion_install_pending.is_some());
         app.finish_subfolder_expansion_prepare_for_test();
+        finish_list_hydration_for_test(&mut app);
         assert_eq!(app.page_path_key(0).as_deref(), Some(key.as_str()));
         assert!(
             !app.mask_pages.contains(&0),
@@ -3073,9 +3268,10 @@ mod tests {
 
     fn test_scan_options(image_folder_books: bool) -> SubfolderExpansionOptions {
         SubfolderExpansionOptions {
+            file_type_visibility: Default::default(),
             skip_image_if_video_exists: false,
             skip_duplicate_images: false,
-            skip_zip_if_folder_exists: false,
+            same_name_folder_book: crate::same_name_folder_book::SameNameFolderBookPolicy::ShowBoth,
             video_thumb_use_sidecar_image: true,
             image_folder_books,
             include_convertible_archives: false,
@@ -3111,6 +3307,85 @@ mod tests {
             options,
             SubfolderExpansionDepthChoice::Unlimited.max_depth(),
         )
+    }
+
+    #[test]
+    fn file_type_policy_runs_before_image_book_folding_and_same_name() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("movie.jpg"), b"image").unwrap();
+        std::fs::write(temp.path().join("movie.mp4"), b"video").unwrap();
+        std::fs::write(temp.path().join("book.zip"), b"zip").unwrap();
+        let mut options = test_scan_options(true);
+        options.file_type_visibility.excluded_categories.extend([
+            crate::file_type_visibility::FileTypeCategory::Video,
+            crate::file_type_visibility::FileTypeCategory::Zip,
+        ]);
+        let result = scan_test_root(temp.path(), options.clone());
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].kind, SubfolderExpansionEntryKind::Folder);
+        assert_eq!(result.file_type_visibility, options.file_type_visibility);
+        options.image_folder_books = false;
+        let result = scan_test_root(temp.path(), options.clone());
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].kind, SubfolderExpansionEntryKind::Image);
+        options
+            .file_type_visibility
+            .excluded_categories
+            .insert(crate::file_type_visibility::FileTypeCategory::Image);
+        options.image_folder_books = true;
+        assert!(scan_test_root(temp.path(), options).entries.is_empty());
+    }
+
+    #[test]
+    fn subfolder_keeps_selected_video_sidecar_when_only_its_image_kind_is_hidden() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("movie.mp4");
+        for path in [
+            &source,
+            &source.with_extension("jpg"),
+            &source.with_extension("png"),
+        ] {
+            std::fs::write(path, b"fixture").unwrap();
+        }
+        let mut options = test_scan_options(false);
+        options.skip_image_if_video_exists = true;
+        let baseline = scan_test_root(temp.path(), options.clone());
+        let key = crate::path_key::normalize_keep_drive(&source);
+        let adopted = baseline.video_thumb_overrides.get(&key).unwrap();
+        assert!([source.with_extension("jpg"), source.with_extension("png")].contains(adopted));
+        options
+            .file_type_visibility
+            .excluded_extensions
+            .insert(adopted.extension().unwrap().to_str().unwrap().to_owned());
+        let hidden = scan_test_root(temp.path(), options);
+        assert_eq!(hidden.video_thumb_overrides, baseline.video_thumb_overrides);
+        assert_eq!(hidden.entries.len(), 1);
+        assert_eq!(hidden.entries[0].kind, SubfolderExpansionEntryKind::Video);
+    }
+
+    #[test]
+    fn file_type_policy_keeps_hidden_image_as_video_sidecar() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("movie.jpg"), b"image").unwrap();
+        std::fs::write(temp.path().join("movie.mp4"), b"video").unwrap();
+        let mut options = test_scan_options(false);
+        options.skip_image_if_video_exists = true;
+        options.video_thumb_use_sidecar_image = true;
+        options
+            .file_type_visibility
+            .excluded_categories
+            .insert(crate::file_type_visibility::FileTypeCategory::Image);
+        let result = scan_test_root(temp.path(), options);
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].kind, SubfolderExpansionEntryKind::Video);
+        assert_eq!(
+            result
+                .video_thumb_overrides
+                .get(&crate::path_key::normalize_keep_drive(
+                    &temp.path().join("movie.mp4")
+                )),
+            Some(&temp.path().join("movie.jpg"))
+        );
     }
 
     #[test]
@@ -3461,9 +3736,11 @@ mod tests {
             root.clone(),
             vec![a.clone(), b.clone()],
             SubfolderExpansionOptions {
+                file_type_visibility: Default::default(),
                 skip_image_if_video_exists: false,
                 skip_duplicate_images: false,
-                skip_zip_if_folder_exists: false,
+                same_name_folder_book:
+                    crate::same_name_folder_book::SameNameFolderBookPolicy::ShowBoth,
                 video_thumb_use_sidecar_image: true,
                 image_folder_books: false,
                 include_convertible_archives: false,
@@ -3595,6 +3872,7 @@ mod tests {
         })
         .collect::<Vec<_>>();
         let snapshot = SubfolderExpansionSnapshot {
+            file_type_visibility: Default::default(),
             root: root.clone(),
             roots: vec![root],
             scan_filter: SubfolderExpansionScanFilter::default(),
@@ -3700,6 +3978,32 @@ mod tests {
     }
 
     #[test]
+    fn same_name_folder_book_subfolder_expansion_preserves_child_book_cells() {
+        use crate::same_name_folder_book::SameNameFolderBookPolicy as Policy;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let book = root.join("book");
+        std::fs::create_dir_all(&book).unwrap();
+        std::fs::write(book.join("page.jpg"), b"image").unwrap();
+        std::fs::write(root.join("book.zip"), b"zip").unwrap();
+        for policy in [Policy::PreferBook, Policy::PreferFolder, Policy::ShowBoth] {
+            let mut options = test_scan_options(true);
+            options.same_name_folder_book = policy;
+            let result = scan_test_root(&root, options);
+            assert!(result.entries.iter().any(
+                |entry| entry.path == book && entry.kind == SubfolderExpansionEntryKind::Folder
+            ));
+            assert_eq!(
+                result
+                    .entries
+                    .iter()
+                    .any(|entry| entry.path == root.join("book.zip")),
+                policy != Policy::PreferFolder
+            );
+        }
+    }
+
+    #[test]
     fn same_name_zip_is_hidden_in_favor_of_image_folder_book_when_configured() {
         let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -3709,13 +4013,42 @@ mod tests {
         std::fs::write(book.join("001.jpg"), b"image").unwrap();
         std::fs::write(root.join("volume.zip"), b"zip").unwrap();
         let mut options = test_scan_options(true);
-        options.skip_zip_if_folder_exists = true;
+        options.same_name_folder_book =
+            crate::same_name_folder_book::SameNameFolderBookPolicy::PreferFolder;
 
         let result = scan_test_root(&root, options);
 
         assert_eq!(result.entries.len(), 1);
         assert_eq!(result.entries[0].path, book);
         assert_eq!(result.entries[0].kind, SubfolderExpansionEntryKind::Folder);
+    }
+
+    #[test]
+    fn visible_audio_keeps_image_folder_unfolded_without_suppressing_its_image() {
+        let tmp = tempfile::tempdir().unwrap();
+        let audio = tmp.path().join("song.mp3");
+        let image = tmp.path().join("song.jpg");
+        std::fs::write(&audio, b"audio").unwrap();
+        std::fs::write(&image, b"image").unwrap();
+        let mut options = test_scan_options(true);
+        options.skip_image_if_video_exists = true;
+        options.video_thumb_use_sidecar_image = true;
+
+        let result = scan_test_root(tmp.path(), options.clone());
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].path, image);
+        assert_eq!(result.entries[0].kind, SubfolderExpansionEntryKind::Image);
+        assert!(result.video_thumb_overrides.is_empty());
+
+        options
+            .file_type_visibility
+            .excluded_categories
+            .insert(crate::file_type_visibility::FileTypeCategory::Audio);
+        let result = scan_test_root(tmp.path(), options);
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].path, tmp.path());
+        assert_eq!(result.entries[0].kind, SubfolderExpansionEntryKind::Folder);
+        assert!(result.video_thumb_overrides.is_empty());
     }
 
     #[test]
@@ -3794,9 +4127,10 @@ mod tests {
             };
         let mut media = vec![entry(a.clone(), 1, 10), entry(b.clone(), 2, 20)];
         let options = SubfolderExpansionOptions {
+            file_type_visibility: Default::default(),
             skip_image_if_video_exists: false,
             skip_duplicate_images: true,
-            skip_zip_if_folder_exists: false,
+            same_name_folder_book: crate::same_name_folder_book::SameNameFolderBookPolicy::ShowBoth,
             video_thumb_use_sidecar_image: true,
             image_folder_books: false,
             include_convertible_archives: false,
@@ -3805,16 +4139,15 @@ mod tests {
             image_ext_priority: vec!["jpg".into(), "png".into()],
             scan_filter: SubfolderExpansionScanFilter::default(),
         };
-        let mut overrides = HashMap::new();
-        apply_duplicate_filters_to_media(&mut media, &options, &mut overrides);
+        apply_duplicate_filters_to_media(&mut media, &options);
 
         assert_eq!(media.len(), 1);
         assert_eq!(media[0].path, a);
 
         let mut parent_a = vec![entry(a.clone(), 1, 10)];
         let mut parent_b = vec![entry(b.clone(), 2, 20)];
-        apply_duplicate_filters_to_media(&mut parent_a, &options, &mut overrides);
-        apply_duplicate_filters_to_media(&mut parent_b, &options, &mut overrides);
+        apply_duplicate_filters_to_media(&mut parent_a, &options);
+        apply_duplicate_filters_to_media(&mut parent_b, &options);
         assert_eq!(parent_a[0].path, a);
         assert_eq!(parent_b[0].path, b);
     }
@@ -4041,6 +4374,7 @@ mod tests {
             },
         ]);
         let snapshot = SubfolderExpansionSnapshot {
+            file_type_visibility: Default::default(),
             root: root.clone(),
             roots: vec![root],
             scan_filter: SubfolderExpansionScanFilter::default(),
@@ -4118,6 +4452,7 @@ mod tests {
         let a2_key = crate::adjustment_db::normalize_path(&a2);
         let b1_key = crate::adjustment_db::normalize_path(&b1);
         let snapshot = SubfolderExpansionSnapshot {
+            file_type_visibility: Default::default(),
             root: root.clone(),
             roots: vec![root],
             scan_filter: SubfolderExpansionScanFilter::default(),
@@ -4269,6 +4604,7 @@ mod tests {
             .set_user_rating(&b_key, 5, None)
             .unwrap();
         let snapshot = SubfolderExpansionSnapshot {
+            file_type_visibility: Default::default(),
             root: root.clone(),
             roots: vec![root],
             scan_filter: SubfolderExpansionScanFilter::default(),
@@ -4362,6 +4698,7 @@ mod tests {
         )
         .unwrap();
         let snapshot = SubfolderExpansionSnapshot {
+            file_type_visibility: Default::default(),
             root: root.clone(),
             roots: vec![root],
             scan_filter: SubfolderExpansionScanFilter::default(),
@@ -4571,6 +4908,7 @@ mod tests {
         let removed_image = root.join("removed.jpg");
         let kept_image = root.join("kept.jpg");
         let mut snapshot = SubfolderExpansionSnapshot {
+            file_type_visibility: Default::default(),
             root: root.clone(),
             roots: vec![root],
             scan_filter: SubfolderExpansionScanFilter::default(),

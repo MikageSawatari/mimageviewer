@@ -849,12 +849,24 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
         (Method::Get, "/api/image-info") => with_session_activity(
             state,
             remote_owner.expect("route guard checked session"),
-            || api_image_info(state, &query),
+            || {
+                api_image_info(
+                    state,
+                    &query,
+                    remote_owner.expect("route guard checked session"),
+                )
+            },
         ),
         (Method::Get, "/api/image") => with_session_activity(
             state,
             remote_owner.expect("route guard checked session"),
-            || api_image(state, &query),
+            || {
+                api_image(
+                    state,
+                    &query,
+                    remote_owner.expect("route guard checked session"),
+                )
+            },
         ),
         (Method::Get, "/api/page") => api_page(
             state,
@@ -4359,11 +4371,17 @@ fn ipc_error_response(
     }))
 }
 
-fn api_image_info(state: &AppState, query: &[(String, String)]) -> HttpResponse {
+fn api_image_info(
+    state: &AppState,
+    query: &[(String, String)],
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
     match with_legacy_image_generation(state, query, || {
-        let path = required_query_value(query, "path")
-            .map_err(|()| HttpResponse::text(400, "Bad Request"))?;
-        state.library.image_info(path).map_err(store_error_response)
+        let address = legacy_image_read_address(state, query, owner)?;
+        state
+            .library
+            .image_info(&address.path)
+            .map_err(store_error_response)
     }) {
         Ok((value, remote_state_generation)) => HttpResponse::json(&value)
             .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
@@ -4373,10 +4391,12 @@ fn api_image_info(state: &AppState, query: &[(String, String)]) -> HttpResponse 
     }
 }
 
-fn api_image(state: &AppState, query: &[(String, String)]) -> HttpResponse {
+fn api_image(
+    state: &AppState,
+    query: &[(String, String)],
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
     match with_legacy_image_generation(state, query, || {
-        let path = required_query_value(query, "path")
-            .map_err(|()| HttpResponse::text(400, "Bad Request"))?;
         let width = required_query_value(query, "w")
             .and_then(|value| {
                 value
@@ -4385,9 +4405,10 @@ fn api_image(state: &AppState, query: &[(String, String)]) -> HttpResponse {
                     .and_then(|width| (width > 0).then_some(width).ok_or(()))
             })
             .map_err(|()| HttpResponse::text(400, "Bad Request"))?;
+        let address = legacy_image_read_address(state, query, owner)?;
         state
             .library
-            .image(path, width)
+            .image(&address.path, width)
             .map_err(store_error_response)
     }) {
         Ok((value, remote_state_generation)) => {
@@ -4398,6 +4419,35 @@ fn api_image(state: &AppState, query: &[(String, String)]) -> HttpResponse {
         }
         Err(response) => response,
     }
+}
+
+/// Both legacy renderers retain their released image semantics, but source
+/// admission belongs to the core's current policy and is never cached here.
+fn legacy_image_read_address(
+    state: &AppState,
+    query: &[(String, String)],
+    owner: &RemoteSessionIdentity,
+) -> Result<RemoteAddress, HttpResponse> {
+    let path =
+        required_query_value(query, "path").map_err(|()| HttpResponse::text(400, "Bad Request"))?;
+    let address = RemoteAddress::file(path);
+    state
+        .library
+        .validate_remote_address(&address)
+        .map_err(store_error_response)?;
+    let started = Instant::now();
+    let result = state
+        .ipc_admission
+        .run(IpcClass::Browse, || {
+            state
+                .thumbnail_client
+                .source_read_eligibility(owner, address.clone())
+        })
+        .map_err(|busy| media_admission_busy_response(busy, "source_read_eligibility"))?;
+    result.map_err(|failure| {
+        media_ipc_error_response(failure, started.elapsed(), "source_read_eligibility", None)
+    })?;
+    Ok(address)
 }
 
 fn with_legacy_image_generation<T>(
@@ -5373,15 +5423,94 @@ mod tests {
                 info_query.push(("generation".to_owned(), generation.to_owned()));
                 image_query.push(("generation".to_owned(), generation.to_owned()));
             }
-            assert_eq!(api_image_info(&state, &info_query).status, 400);
-            assert_eq!(api_image(&state, &image_query).status, 400);
+            assert_eq!(
+                api_image_info(&state, &info_query, &legacy_test_owner()).status,
+                400
+            );
+            assert_eq!(
+                api_image(&state, &image_query, &legacy_test_owner()).status,
+                400
+            );
         }
+    }
+
+    fn legacy_test_owner() -> RemoteSessionIdentity {
+        RemoteSessionIdentity {
+            client_id: "legacy-client".into(),
+            session_id: "0123456789abcdef0123456789abcdef".into(),
+        }
+    }
+
+    #[test]
+    fn legacy_image_handlers_recheck_current_core_policy_in_same_session_and_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let image_path = temp.path().join("page.png");
+        image::RgbImage::from_pixel(3, 2, image::Rgb([10, 20, 30]))
+            .save(&image_path)
+            .unwrap();
+        let path = image_path.to_string_lossy().into_owned();
+        let generation = state
+            .library
+            .remote_state()
+            .unwrap()
+            .remote_state_generation;
+        let owner = legacy_test_owner();
+        let hidden = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let checks = Arc::new(AtomicU64::new(0));
+        let current_hidden = Arc::clone(&hidden);
+        let current_checks = Arc::clone(&checks);
+        let expected_owner = owner.clone();
+        let expected_path = path.clone();
+        state
+            .thumbnail_client
+            .set_source_read_test_handler(Arc::new(move |actual_owner, address| {
+                assert_eq!(actual_owner, &expected_owner);
+                assert_eq!(address, &RemoteAddress::file(expected_path.clone()));
+                current_checks.fetch_add(1, Ordering::Relaxed);
+                if current_hidden.load(Ordering::Acquire) {
+                    mimageviewer_ipc::SourceReadEligibilityResponse::Error(
+                        mimageviewer_ipc::MediaError::new(
+                            mimageviewer_ipc::MediaErrorCode::Unsupported,
+                            "hidden by current policy",
+                        ),
+                    )
+                } else {
+                    mimageviewer_ipc::SourceReadEligibilityResponse::Success
+                }
+            }));
+        let query = vec![
+            ("path".into(), path),
+            ("generation".into(), generation.clone()),
+            ("w".into(), "32".into()),
+        ];
+        for (excluded, expected_status) in [(false, 200), (true, 415), (false, 200)] {
+            hidden.store(excluded, Ordering::Release);
+            for response in [
+                api_image_info(&state, &query, &owner),
+                api_image(&state, &query, &owner),
+            ] {
+                assert_eq!(response.status, expected_status);
+                if expected_status == 200 {
+                    assert_eq!(
+                        response_header_values(&response, "X-mIV-Remote-State-Generation"),
+                        [generation.as_str()]
+                    );
+                }
+            }
+        }
+        assert_eq!(checks.load(Ordering::Relaxed), 6);
     }
 
     #[test]
     fn legacy_image_routes_reject_stale_generation_and_attest_success() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_state(&temp);
+        state
+            .thumbnail_client
+            .set_source_read_test_handler(Arc::new(|_, _| {
+                mimageviewer_ipc::SourceReadEligibilityResponse::Success
+            }));
         let image_path = temp.path().join("page.png");
         image::RgbImage::from_pixel(3, 2, image::Rgb([10, 20, 30]))
             .save(&image_path)
@@ -5404,8 +5533,8 @@ mod tests {
             .unwrap()
             .remote_state_generation;
         for response in [
-            api_image_info(&state, &query("stale-1", false)),
-            api_image(&state, &query("stale-1", true)),
+            api_image_info(&state, &query("stale-1", false), &legacy_test_owner()),
+            api_image(&state, &query("stale-1", true), &legacy_test_owner()),
         ] {
             assert_eq!(response.status, 409);
             assert_eq!(
@@ -5417,7 +5546,11 @@ mod tests {
             assert_eq!(body["remote_state_generation"], current_generation);
         }
 
-        let info_response = api_image_info(&state, &query(&current_generation, false));
+        let info_response = api_image_info(
+            &state,
+            &query(&current_generation, false),
+            &legacy_test_owner(),
+        );
         assert_eq!(info_response.status, 200);
         assert_eq!(
             response_header_values(&info_response, "X-mIV-Remote-State-Generation"),
@@ -5431,7 +5564,11 @@ mod tests {
         assert_eq!(info["width"], 3);
         assert_eq!(info["height"], 2);
 
-        let image_response = api_image(&state, &query(&current_generation, true));
+        let image_response = api_image(
+            &state,
+            &query(&current_generation, true),
+            &legacy_test_owner(),
+        );
         assert_eq!(image_response.status, 200);
         assert_eq!(
             response_header_values(&image_response, "X-mIV-Remote-State-Generation"),
@@ -6001,6 +6138,123 @@ mod tests {
     }
 
     #[test]
+    fn visibility_page_route_rejects_archive_files_and_zip_directories_before_ipc() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let generation = state
+            .library
+            .remote_state()
+            .unwrap()
+            .remote_state_generation;
+        // Saturating IPC proves that these responses come from the page-kind guard,
+        // rather than a request being dispatched or rejected by the core.
+        let _permits = (0..MAX_CONCURRENT_HEAVY_IPC)
+            .map(|_| state.ipc_admission.try_enter(IpcClass::Heavy).unwrap())
+            .collect::<Vec<_>>();
+        for (name, prefix) in [
+            ("book.zip", None),
+            ("book.7z", None),
+            ("book.zip", Some("chapter.zip/")),
+        ] {
+            let archive = temp.path().join(name);
+            std::fs::write(&archive, b"archive fixture").unwrap();
+            let mut url = format!(
+                "/api/page?path={}&generation={generation}&job=page-1&display=display-1&w=256",
+                utf8_percent_encode(&archive.to_string_lossy(), NON_ALPHANUMERIC)
+            );
+            if let Some(prefix) = prefix {
+                url.push_str(&format!(
+                    "&prefix={}",
+                    utf8_percent_encode(prefix, NON_ALPHANUMERIC)
+                ));
+            }
+            let mut request: Request = TestRequest::new()
+                .with_method(Method::Get)
+                .with_path(&url)
+                .with_header(cookie_header(&state))
+                .with_header(Header::from_bytes("X-mIV-Remote-Client", "archive-client").unwrap())
+                .with_header(
+                    Header::from_bytes("X-mIV-Remote-Session", "0123456789abcdef0123456789abcdef")
+                        .unwrap(),
+                )
+                .into();
+            let response = route(&mut request, &state);
+            assert_eq!(response.status, 400, "{name}: {prefix:?}");
+            assert_eq!(response.body, b"Bad Request");
+            assert_eq!(
+                state.ipc_admission.heavy.in_flight(),
+                MAX_CONCURRENT_HEAVY_IPC
+            );
+        }
+    }
+
+    #[test]
+    fn visibility_thumb_route_admits_archive_files_and_zip_directories_to_thumbnail_ipc() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        // Exercise the real HTTP route without connecting to a running core. The
+        // existing admission boundary returns a distinctive response after validation.
+        let _permits = (0..MAX_CONCURRENT_HEAVY_IPC - 1)
+            .map(|_| state.ipc_admission.try_enter(IpcClass::Thumbnail).unwrap())
+            .collect::<Vec<_>>();
+        for (name, prefix, source_kind) in [
+            ("book.zip", None, "zip"),
+            ("book.7z", None, "file"),
+            ("book.zip", Some("chapter.zip/"), "zip"),
+        ] {
+            let archive = temp.path().join(name);
+            std::fs::write(&archive, b"archive fixture").unwrap();
+            let path = archive.to_string_lossy().into_owned();
+            let mut url = format!(
+                "/api/thumb?path={}&w=256",
+                utf8_percent_encode(&path, NON_ALPHANUMERIC)
+            );
+            if let Some(prefix) = prefix {
+                url.push_str(&format!(
+                    "&prefix={}",
+                    utf8_percent_encode(prefix, NON_ALPHANUMERIC)
+                ));
+            }
+            let address =
+                remote_address_from_query(&parse_query(split_url(&url).1).unwrap()).unwrap();
+            assert_eq!(
+                address,
+                RemoteAddress {
+                    path,
+                    subresource: prefix.map_or(RemoteSubresource::File, |prefix| {
+                        RemoteSubresource::ZipDirectory {
+                            prefix: prefix.to_owned(),
+                        }
+                    }),
+                }
+            );
+            let mut request: Request = TestRequest::new()
+                .with_method(Method::Get)
+                .with_path(&url)
+                .with_header(cookie_header(&state))
+                .with_header(Header::from_bytes("X-mIV-Remote-Client", "archive-client").unwrap())
+                .with_header(
+                    Header::from_bytes("X-mIV-Remote-Session", "0123456789abcdef0123456789abcdef")
+                        .unwrap(),
+                )
+                .into();
+            let response = route(&mut request, &state);
+            assert_eq!(response.status, 503, "{name}: {prefix:?}");
+            let body: Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(body["error"], "ipc_busy");
+            let details = response.log_details.unwrap();
+            assert_eq!(details["thumb"]["ipc_status"], "admission_busy");
+            assert_eq!(details["thumb"]["source_kind"], source_kind);
+            assert_eq!(details["thumb"]["target_px"], 256);
+            assert_eq!(details["thumb"]["ipc_retry_count"], 0);
+            assert_eq!(
+                state.ipc_admission.heavy.in_flight(),
+                MAX_CONCURRENT_HEAVY_IPC - 1
+            );
+        }
+    }
+
+    #[test]
     fn persistent_post_validation_reanchors_a_spread_to_its_surviving_page() {
         let temp = tempfile::tempdir().unwrap();
         let survivor_path = temp.path().join("survivor.jpg");
@@ -6016,6 +6270,7 @@ mod tests {
         };
         let survivor_address = RemoteAddress::file(survivor_path.to_string_lossy().into_owned());
         let mut payload = PersistentCollectionSnapshotPayload {
+            registered_total: 2,
             thumbnail_presentation: mimageviewer_ipc::ThumbnailPresentation::default(),
             collection_id: "33333333-3333-4333-8333-333333333333".to_owned(),
             collection_revision: 1,

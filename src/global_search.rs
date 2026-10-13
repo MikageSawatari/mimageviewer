@@ -51,6 +51,7 @@ pub enum SearchStreamEvent {
         scanned_candidates: usize,
         /// 累計で post-filter を通った数
         valid_hits: usize,
+        visibility_notice: Option<crate::archive_visibility::ArchiveVisibilityNotice>,
     },
     /// 正常終了
     Done { truncated: bool, reason: DoneReason },
@@ -132,6 +133,21 @@ pub struct SearchScope {
     pub mode: crate::search_query::MatchMode,
     /// Hide EPUB paths before counting accepted hits toward HARD_MAX.
     pub ignore_epub: bool,
+    /// List policy is captured once per search run and applied before the accepted-hit cap.
+    pub visibility: crate::file_type_visibility::FileTypeVisibility,
+}
+
+/// Classify indexed logical identities without filesystem access. Archive member rows use
+/// their member extension; PDF/EPUB rows use the original document path, never render assets.
+/// Nested archive provenance is separate from this leaf-type predicate.
+pub(crate) fn search_hit_type_is_visible(
+    visibility: &crate::file_type_visibility::FileTypeVisibility,
+    path: &str,
+) -> bool {
+    let source = path
+        .split_once(crate::search_norm::ZIP_ENTRY_SEP)
+        .map_or(path, |(_, member)| member);
+    visibility.allows_physical_file(std::path::Path::new(source))
 }
 
 /// 検索ワーカーのエントリーポイント。別スレッドで実行する想定。
@@ -247,8 +263,11 @@ fn run_with_hit_limit(
 
     // 5. ページングループ
     let mut offset = 0usize;
+    let mut notice_emitted = false;
     let mut scanned = 0usize;
     let mut valid = 0usize;
+    let mut archive_visibility =
+        crate::archive_visibility::ArchiveVisibilityProjection::new(&scope.visibility, cancel);
 
     // final_reason は labeled break で確定させる (unused-assignment 警告回避)。
     let (truncated, final_reason) = 'paging: loop {
@@ -290,6 +309,9 @@ fn run_with_hit_limit(
             if scope.ignore_epub && is_epub_search_path(&path) {
                 continue;
             }
+            if !search_hit_type_is_visible(&scope.visibility, &path) {
+                continue;
+            }
             let text = match fts_index::doc_text_for_target(
                 &searcher,
                 fts.fields(),
@@ -300,6 +322,16 @@ fn run_with_hit_limit(
                 Err(_) => continue,
             };
             if search_query::matches_with_mode(&tokens, &text, scope.mode) {
+                // Only matching omitted rows produce an origin warning. Keep this before
+                // accepted-hit counting and metadata materialization.
+                if path
+                    .split_once(crate::search_norm::ZIP_ENTRY_SEP)
+                    .is_some_and(|(container, member)| {
+                        !archive_visibility.allows_member(std::path::Path::new(container), member)
+                    })
+                {
+                    continue;
+                }
                 // STORED mtime を取り出す (日付ソート用 §5.2)。post-filter を通った
                 // ヒットだけに対して呼ぶので、走査候補全件への doc fetch は発生しない。
                 let (mtime, file_size) =
@@ -322,6 +354,8 @@ fn run_with_hit_limit(
 
         // 1 ページごとに累計を通知する。除外語の post-filter で全滅する検索でも
         // PAGE_SIZE 件ずつ進捗が見え、UI 側は 1 frame の drain 上限で負荷を抑える。
+        let visibility_notice = archive_visibility.notice().filter(|_| !notice_emitted);
+        notice_emitted |= visibility_notice.is_some();
         if !send_event(
             tx,
             wake,
@@ -329,6 +363,7 @@ fn run_with_hit_limit(
                 hits: batch,
                 scanned_candidates: scanned,
                 valid_hits: valid,
+                visibility_notice,
             },
         ) {
             return;
@@ -482,6 +517,117 @@ mod tests {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 result => return result,
+            }
+        }
+    }
+
+    #[test]
+    fn visibility_search_worker_preserves_cache_proof_and_index_without_current_source() {
+        for missing_source in [false, true] {
+            let guard = crate::data_dir::TestDataDirGuard::new();
+            let (source, cached) =
+                crate::archive_visibility::legacy_conversion_fixture(guard.path());
+            let source_bytes = std::fs::read(&source).unwrap();
+            let (_tmp, meta, fts) = setup();
+            let fav = Uuid::new_v4();
+            let keys = [
+                "root.jpg",
+                "chapter.zip/page.jpg",
+                "notes.zip/page.jpg",
+                "missing.jpg",
+            ]
+            .map(|member| {
+                format!(
+                    "{}{}{member}",
+                    cached.to_string_lossy(),
+                    crate::search_norm::ZIP_ENTRY_SEP
+                )
+            });
+            for key in &keys {
+                ingest(&meta, &fts, fav, key, "visibilitylegacy");
+            }
+            let stored = fts.searcher().num_docs();
+            assert_eq!(stored, 4);
+            let invalidate_source = || {
+                if missing_source {
+                    std::fs::remove_file(&source).unwrap();
+                } else {
+                    std::fs::write(&source, b"changed original archive").unwrap();
+                }
+            };
+            let scope = SearchScope {
+                visibility: crate::file_type_visibility::FileTypeVisibility {
+                    excluded_categories: [crate::file_type_visibility::FileTypeCategory::Zip]
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let collect = || {
+                let (tx, rx) = crossbeam_channel::unbounded();
+                run(
+                    "visibilitylegacy",
+                    &[fav],
+                    &scope,
+                    &fts,
+                    &AtomicBool::new(false),
+                    &tx,
+                    None,
+                );
+                drop(tx);
+                let mut hits = Vec::new();
+                let mut notice = None;
+                for event in rx.try_iter() {
+                    if let SearchStreamEvent::Batch {
+                        hits: batch,
+                        visibility_notice,
+                        ..
+                    } = event
+                    {
+                        hits.extend(batch);
+                        notice = notice.or(visibility_notice);
+                    }
+                }
+                (hits, notice)
+            };
+            invalidate_source();
+            let (hits, notice) = collect();
+            assert_eq!(hits.len(), 1);
+            assert!(hits[0].path.ends_with("missing.jpg"));
+            assert_eq!(
+                notice,
+                Some(crate::archive_visibility::ArchiveVisibilityNotice::LegacyConvertedCache)
+            );
+            assert_eq!(fts.searcher().num_docs(), stored);
+            std::fs::write(&source, &source_bytes).unwrap();
+            crate::archive_visibility::regenerate_conversion_fixture(&source, &cached);
+            let (hits, notice) = collect();
+            assert_eq!(hits.len(), 3);
+            assert!(
+                hits.iter()
+                    .all(|hit| !hit.path.ends_with("chapter.zip/page.jpg"))
+            );
+            assert_eq!(notice, None);
+            invalidate_source();
+            let (hits, notice) = collect();
+            assert_eq!(hits.len(), 3);
+            assert!(
+                hits.iter()
+                    .all(|hit| !hit.path.ends_with("chapter.zip/page.jpg"))
+            );
+            assert_eq!(notice, None);
+            assert_eq!(fts.searcher().num_docs(), stored);
+            for key in &keys {
+                assert!(
+                    crate::fts_index::find_doc_by_path(
+                        &fts.searcher(),
+                        fts.fields(),
+                        &normalize_path(&PathBuf::from(key))
+                    )
+                    .unwrap()
+                    .is_some()
+                );
             }
         }
     }
@@ -716,6 +862,7 @@ mod tests {
                     hits,
                     scanned_candidates,
                     valid_hits,
+                    ..
                 } => Some((hits.len(), scanned_candidates, valid_hits)),
                 _ => None,
             })
@@ -743,6 +890,7 @@ mod tests {
                 hits: Vec::new(),
                 scanned_candidates: PAGE_SIZE,
                 valid_hits: 0,
+                visibility_notice: None,
             },
         ));
         assert!(matches!(

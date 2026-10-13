@@ -7,5 +7,6 @@ fn main() -> eframe::Result {
     } else {
         miv_startup::Outcome::Error
     });
+    mimageviewer::finish_logs();
     result
 }

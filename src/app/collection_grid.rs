@@ -401,7 +401,22 @@ pub(in crate::app) fn prepare_collection_grid_install(
         0,
         &classified,
     );
-    let prepared = classified?;
+    let mut archive_projection = crate::archive_visibility::ArchiveVisibilityProjection::new(
+        &settings.file_type_visibility,
+        cancel,
+    );
+    let mut classified = classified?;
+    let projected_entries: Vec<_> = classified
+        .entries
+        .iter()
+        .filter(|entry| archive_projection.allows_item(&entry.item))
+        .cloned()
+        .collect();
+    if cancel.load(Ordering::Acquire) {
+        return Err(CollectionPrepareError::Cancelled);
+    }
+    classified.entries = Arc::from(projected_entries);
+    let prepared = project_collection_display_snapshot(classified, &settings.file_type_visibility);
     let videos = prepared
         .entries
         .iter()
@@ -570,7 +585,10 @@ pub(in crate::app) fn prepare_collection_grid_install(
             ],
         );
     }
+    let page_identity_index =
+        prepare_collection_page_identity_index(&prepared, settings.file_type_visibility.clone());
     Ok(CollectionGridPreparedInstall {
+        page_identity_index,
         prepared,
         page_edits: Some(page_edits),
         retained_page_edits,
@@ -586,6 +604,49 @@ pub(in crate::app) fn prepare_collection_grid_install(
             thumbnail_source_epoch,
         ),
     })
+}
+
+/// Prepared on the same worker, from the final projected order used by every binding.
+pub(in crate::app) fn prepare_collection_page_identity_index(
+    prepared: &CollectionPreparedSnapshot,
+    policy: crate::file_type_visibility::FileTypeVisibility,
+) -> Arc<super::file_type_resume::PreparedPageIdentityIndex> {
+    let items: Vec<_> = prepared
+        .entries
+        .iter()
+        .map(|entry| entry.item.clone())
+        .collect();
+    Arc::new(super::file_type_resume::PreparedPageIdentityIndex::prepare(
+        &items, None, policy,
+    ))
+}
+
+/// Display-only projection after source resolution. Export/backup preparation keeps the full
+/// classified snapshot; every display binding and thumbnail consumer sees this same row set.
+pub(crate) fn project_collection_display_snapshot(
+    mut prepared: CollectionPreparedSnapshot,
+    visibility: &crate::file_type_visibility::FileTypeVisibility,
+) -> CollectionPreparedSnapshot {
+    if visibility.is_all_visible() {
+        return prepared;
+    }
+    let entries = prepared
+        .entries
+        .iter()
+        .filter(|entry| visibility.allows_grid_item(&entry.item))
+        .cloned()
+        .collect::<Vec<_>>();
+    prepared.auto_aspect_eligible_total = entries
+        .iter()
+        .filter(|entry| {
+            !matches!(
+                entry.item,
+                GridItem::CollectionPlaceholder { .. } | GridItem::Audio(_)
+            )
+        })
+        .count();
+    prepared.entries = Arc::from(entries);
+    prepared
 }
 
 fn collection_prepare_stage_event<T>(
@@ -628,6 +689,17 @@ fn collection_prepare_stage_event<T>(
 }
 
 impl App {
+    pub(crate) fn collection_registered_total(&self) -> Option<usize> {
+        let session = self.top_level_grid_view.collection_session()?;
+        if !matches!(session.position, CollectionGridPosition::Root) {
+            return None;
+        }
+        session
+            .load
+            .installed()
+            .map(|prepared| prepared.registered_total)
+    }
+
     pub(crate) fn collection_grid_context_id(&self) -> ViewerContextId {
         self.projected_viewer_context_id()
     }
@@ -871,7 +943,7 @@ impl App {
             .selected
             .is_some_and(|index| removed_indices.contains(&index))
         {
-            self.selected = None;
+            self.move_grid_cursor(None, crate::app::GridCursorIntent::Automatic);
         }
     }
 
@@ -1593,6 +1665,7 @@ impl App {
                         Arc::clone(&prepared),
                         source_owner.presentation.clone(),
                         source_owner.reuse_key.clone(),
+                        Arc::clone(&source_owner.page_identity_index),
                     );
                     presentation.page_edit_snapshot = source_owner
                         .retained_edit_snapshot
@@ -1606,6 +1679,17 @@ impl App {
                     Arc::new(presentation)
                 })
                 .unwrap_or_else(|| {
+                    let page_identity_index = self
+                        .top_level_grid_view
+                        .collection_session()
+                        .and_then(CollectionGridSession::installed_presentation)
+                        .filter(|presentation| Arc::ptr_eq(&presentation.prepared, &prepared))
+                        .map(|presentation| Arc::clone(&presentation.page_identity_index))
+                        .unwrap_or_else(|| {
+                            Arc::new(super::file_type_resume::PreparedPageIdentityIndex::empty(
+                                self.settings.file_type_visibility.clone(),
+                            ))
+                        });
                     let mut presentation = CollectionGridInstalledPresentation::new(
                         prepared,
                         CollectionGridPresentationSources::Oversized(
@@ -1615,6 +1699,7 @@ impl App {
                             owner.stamp.collection_id,
                             owner.accepted_revision,
                         ),
+                        page_identity_index,
                     );
                     presentation.page_edit_snapshot = previous_edit_snapshot;
                     presentation.page_edit_revision = self.page_edit_revision;
@@ -2260,6 +2345,7 @@ impl App {
             page_edit_revision,
             thumbnail_sources,
             reuse_key,
+            page_identity_index,
             ..
         } = install;
         let revision = prepared.collection_revision;
@@ -2267,6 +2353,7 @@ impl App {
             Arc::new(prepared),
             thumbnail_sources.presentation,
             reuse_key,
+            page_identity_index,
         );
         presentation.page_edit_snapshot = retained_page_edits;
         presentation.page_edit_revision = page_edit_revision;
@@ -2482,9 +2569,11 @@ impl App {
             {
                 app.reading_history_return_from = None;
             }
-            if folder_changes && !app.navigation_scope.is_detached_physical() {
-                crate::thumb_loader::bump_catchup_epoch();
-                let _ = crate::pdf_loader::bump_render_context_epoch();
+            if folder_changes {
+                if !app.navigation_scope.is_detached_physical() {
+                    crate::thumb_loader::bump_catchup_epoch();
+                }
+                app.bump_render_epoch_only();
             }
             if folder {
                 app.transition_favorite_view_for_path(Some(&path));
@@ -3225,6 +3314,7 @@ impl App {
             thumbnail_sources,
             auto_aspect_lookup,
             reuse_key,
+            page_identity_index,
         } = install;
         let CollectionGridPreparedThumbnailDelivery {
             presentation: presentation_sources,
@@ -3339,6 +3429,7 @@ impl App {
             .collection_auto_aspect_cache
             .as_mut()
             .and_then(|cache| cache.adopt_lookup(prepared.collection_id, auto_aspect_lookup));
+        let presentation_page_identity_index = Arc::clone(&page_identity_index);
         self.install_collection_grid_items_with_thumbnail_sources(
             items,
             image_metas,
@@ -3350,6 +3441,7 @@ impl App {
             collection_seed,
             prepared.auto_aspect_eligible_total,
             page_edits,
+            page_identity_index,
         );
         self.checked = checked;
         if let Some(query) = old_search_query {
@@ -3385,8 +3477,12 @@ impl App {
             session.accepted_revision = prepared.collection_revision;
             session.wanted_revision = session.wanted_revision.max(prepared.collection_revision);
             session.installed_items_generation = Some(installed_generation);
-            let mut presentation =
-                CollectionGridInstalledPresentation::new(prepared, presentation_sources, reuse_key);
+            let mut presentation = CollectionGridInstalledPresentation::new(
+                prepared,
+                presentation_sources,
+                reuse_key,
+                presentation_page_identity_index,
+            );
             presentation.page_edit_snapshot = retained_page_edits;
             presentation.page_edit_revision = page_edit_revision;
             let presentation = Arc::new(presentation);
@@ -3459,6 +3555,10 @@ impl App {
         );
         self.apply_collection_grid_prepared_install(
             CollectionGridPreparedInstall {
+                page_identity_index: prepare_collection_page_identity_index(
+                    &prepared,
+                    self.settings.file_type_visibility.clone(),
+                ),
                 prepared: (*prepared).clone(),
                 page_edits: Some((edits.snapshot, edits.projection)),
                 retained_page_edits: retained_edits,
@@ -3493,6 +3593,9 @@ impl App {
             collection_seed,
             auto_aspect_eligible_total,
             None,
+            Arc::new(super::file_type_resume::PreparedPageIdentityIndex::empty(
+                self.settings.file_type_visibility.clone(),
+            )),
         );
     }
 
@@ -3514,6 +3617,7 @@ impl App {
             super::page_edit_snapshot::PageEditSnapshot,
             super::page_edit_snapshot::PageEditProjection,
         )>,
+        page_identity_index: Arc<super::file_type_resume::PreparedPageIdentityIndex>,
     ) {
         // A grid menu owns the old item generation. Do not let its saved row index operate on
         // the newly installed collection; a menu owned by another viewer context is untouched.
@@ -3545,7 +3649,14 @@ impl App {
         self.stack_mode_requested = false;
         self.stack_showing_flat = false;
         self.cancel_stack_script_pending();
-        self.install_prepared_aggregate_items(items, image_metas);
+        self.install_prepared_aggregate_items(
+            crate::app::book_materialization::ProjectionRecipe::ExtractedResult(
+                crate::app::book_materialization::ExtractedSurface::Collection,
+            ),
+            items,
+            image_metas,
+            page_identity_index,
+        );
         self.invalidate_idx_state_and_queues();
         self.clear_page_edit_state();
         if let Some((snapshot, mut projection)) = page_edits {
@@ -3559,6 +3670,7 @@ impl App {
             self.comic_pages = std::mem::take(&mut projection.comic);
             self.local_adjust_pages = std::mem::take(&mut projection.local_adjust);
         }
+        self.reproject_page_edit_owners();
         self.metadata_cache.clear();
         self.exif_cache.clear();
         self.xmp_cache.clear();
@@ -3569,7 +3681,7 @@ impl App {
         self.search_filter = None;
         self.search_query.clear();
 
-        self.selected = selected;
+        self.move_grid_cursor(selected, crate::app::GridCursorIntent::Automatic);
         self.scroll_to_selected = selected.is_some();
         if selected.is_none() {
             self.scroll_offset_y = 0.0;
@@ -3715,6 +3827,68 @@ mod tests {
     use crate::grid_item::ThumbnailState;
 
     #[test]
+    fn g1_collection_real_handler_reopen_preserves_vertical_flow_and_book_return() {
+        use crate::app::book_materialization::{ExtractedSurface, ProjectionRecipe};
+        use crate::settings::{ReadingDirection, ReadingFlow, SpreadMode};
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        app.active_quick_folder_slot = None;
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.settings.auto_fullscreen_image_folders = true;
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.settings.default_spread_mode = SpreadMode::RtlCover;
+        app.settings.default_reading_flow = ReadingFlow::Vertical;
+        app.settings.default_reading_direction = ReadingDirection::Rtl;
+        let book = temp.path().join("collection-a2-original-book");
+        std::fs::create_dir_all(&book).unwrap();
+        let pages = [book.join("01.png"), book.join("02.png")];
+        for page in &pages {
+            image::RgbImage::new(2, 3).save(page).unwrap();
+        }
+        app.load_folder(book.clone());
+        app.settle_open_path_classification_for_test();
+        app.finish_page_identity_preparation_for_test();
+        assert!(matches!(app.projection_recipe, ProjectionRecipe::Book(_)));
+        assert_eq!(app.spread_mode, SpreadMode::RtlCover);
+        assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+        let collection = collection_with_sources(
+            &client,
+            &pages.map(|page| (page, CollectionResolvedKind::Image)),
+        );
+        app.open_collection_grid_from_navigation(collection.collection_id());
+        wait_for_grid(&mut app, collection.collection_id());
+        assert_eq!(
+            app.extracted_result_surface(),
+            Some(ExtractedSurface::Collection)
+        );
+        // Released Collection root installation retains the mounted reader's flow.
+        assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            app.open_fullscreen(0, crate::app::HistoryTrigger::UserChosen);
+            assert_eq!(app.fullscreen_idx, Some(0));
+            assert_eq!(app.spread_mode, SpreadMode::Single);
+            assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+            app.apply_fullscreen_spread_mode(&ctx, 0, SpreadMode::RtlCover);
+            assert_eq!(app.spread_mode, SpreadMode::Rtl);
+            assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+            app.close_fullscreen();
+        }
+        assert!(matches!(app.folder_history_back_target(),
+            Some(super::super::FolderNavHistoryTarget::Path(path)) if path == &book));
+        app.dispatch_main_folder_history_input(super::super::FolderHistoryDirection::Back);
+        app.settle_open_path_classification_for_test();
+        app.finish_history_restore_preparation_for_test();
+        assert_eq!(app.current_folder.as_deref(), Some(book.as_path()));
+        assert!(matches!(app.projection_recipe, ProjectionRecipe::Book(_)));
+        assert_eq!(app.spread_mode, SpreadMode::RtlCover);
+        assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+        assert_eq!(app.reading_direction, ReadingDirection::Rtl);
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
     fn audit_collection_grid_readers_with_foreign_writers() {
         crate::page_edit_write_epoch::with_foreign_scoped_writers(|| {
             phase_a_collection_mask_is_projected_for_accepted_revision();
@@ -3761,6 +3935,7 @@ mod tests {
             app.poll_collection_ui(&ctx);
             app.poll_collection_grid(&ctx);
             app.poll_collection_history_transition(&ctx);
+            app.poll_sidecar_restore(&ctx);
             let ready = app
                 .top_level_grid_view
                 .collection_session()
@@ -3772,7 +3947,7 @@ mod tests {
                         )
                         && session.installed_items_generation == Some(app.items_generation)
                 });
-            if ready {
+            if ready && !app.sidecar_restore_active() {
                 return;
             }
             assert!(Instant::now() < deadline, "collection Grid did not settle");
@@ -3884,12 +4059,26 @@ mod tests {
                     session.observed_catalog_revision >= deleted.catalog_revision
                         && matches!(session.load, CollectionGridLoadState::Deleted { .. })
                 })
+                // The deleted surface and the ready catalog arrive independently.
+                // Snapshot history only after its legitimate deletion notice has applied.
+                && app
+                    .folder_nav_back_stack
+                    .iter()
+                    .chain(&app.folder_nav_forward_stack)
+                    .all(|entry| entry.collection_id() != Some(collection.collection_id()))
         });
-        // The catalog delete notice and history-prune notice may arrive in adjacent polls.
-        // Settle both before comparing the parked display with its resumed owner.
         let ctx = egui::Context::default();
-        app.poll_collection_ui(&ctx);
-        app.poll_collection_grid(&ctx);
+        // The physical child has an asynchronous page-identity preparation phase.
+        // Complete that accepted listing before parking it and testing keyboard navigation.
+        let preparation_deadline = Instant::now() + Duration::from_secs(5);
+        while app.sidecar_restore_active() {
+            assert!(
+                Instant::now() < preparation_deadline,
+                "physical child listing preparation did not finish"
+            );
+            app.poll_sidecar_restore(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
         let rows = app.items.clone();
         let address = app.address.clone();
         let selected = app.selected;
@@ -4094,12 +4283,13 @@ mod tests {
     fn poll_until(app: &mut App, message: &str, mut condition: impl FnMut(&App) -> bool) {
         let ctx = egui::Context::default();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !condition(app) {
+        while !condition(app) || app.sidecar_restore_active() {
             assert!(Instant::now() < deadline, "{message}");
             app.settle_open_path_classification_for_test();
             app.poll_collection_ui(&ctx);
             app.poll_collection_grid(&ctx);
             app.poll_collection_history_transition(&ctx);
+            app.poll_sidecar_restore(&ctx);
             std::thread::sleep(Duration::from_millis(2));
         }
     }
@@ -4284,6 +4474,17 @@ mod tests {
         modifiers: egui::Modifiers,
     ) -> Option<crate::ui_main::AddressBarNav> {
         let ctx = egui::Context::default();
+        // These history/input fixtures exercise a ready listing. Let the real index and
+        // metadata continuation finish before injecting the next user operation.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.sidecar_restore_active() {
+            assert!(
+                Instant::now() < deadline,
+                "listing preparation did not finish"
+            );
+            app.poll_sidecar_restore(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
         ctx.begin_pass(egui::RawInput {
             events: vec![egui::Event::Key {
                 key,
@@ -4398,9 +4599,10 @@ mod tests {
         app.enter_rating_view(3);
         let ctx = egui::Context::default();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while app.rating_view_pending.is_some() {
+        while app.rating_view_pending.is_some() || app.sidecar_restore_active() {
             assert!(Instant::now() < deadline, "Rating source did not settle");
             app.poll_rating_view();
+            app.poll_sidecar_restore(&ctx);
             std::thread::sleep(Duration::from_millis(2));
         }
         let owner = app.rating_view_physical_load_owner(&book).unwrap();
@@ -4493,10 +4695,12 @@ mod tests {
         let key = crate::adjustment_db::normalize_path(&child);
         app.rating_db.as_ref().unwrap().set(&key, 1).unwrap();
         app.enter_rating_view_from_menu(1);
+        let preparation_ctx = egui::Context::default();
         let deadline = Instant::now() + Duration::from_secs(15);
-        while app.rating_view_pending.is_some() {
+        while app.rating_view_pending.is_some() || app.sidecar_restore_active() {
             assert!(Instant::now() < deadline, "Rating root did not settle");
             app.poll_rating_view();
+            app.poll_sidecar_restore(&preparation_ctx);
             std::thread::sleep(Duration::from_millis(5));
         }
         let rating_root = app.current_folder.clone();
@@ -4568,6 +4772,11 @@ mod tests {
                 super::super::OpenRequestOwner::Navigation,
                 crate::app::StartupListIntent::ExplicitList,
             ));
+            poll_until(
+                &mut app,
+                "physical fixture hydration did not finish",
+                |_| true,
+            );
         }
         let child_target = app.folder_nav_current_target().expect("physical child");
         let parent_target = app.folder_history_back_target().cloned().expect("parent");
@@ -4703,6 +4912,7 @@ mod tests {
             app.poll_collection_history_transition(&ctx);
             seed_real_pdf_preflight_if_ready(app, pdf_pages, &mut seeded);
             app.poll_pdf_enumerate();
+            app.poll_sidecar_restore(&ctx);
             if app
                 .current_folder
                 .as_deref()
@@ -4716,6 +4926,7 @@ mod tests {
                     .is_none()
                     && app.rating_view_pending.is_none()
                     && app.pdf_enumerate_pending.is_none()
+                    && !app.sidecar_restore_active()
                 {
                     assert!(
                         pdf_pages.is_none() || seeded,
@@ -4829,6 +5040,121 @@ mod tests {
                 .expect("add request"),
         )
         .snapshot
+    }
+
+    #[test]
+    fn display_projection_preserves_full_snapshot_and_aligned_source_bindings() {
+        use crate::collection_store::{
+            CollectionDefinition, CollectionEntry, CollectionSourcePath,
+        };
+        use crate::file_type_visibility::{FileTypeCategory, FileTypeVisibility};
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("visible.jpg");
+        let hidden = temp.path().join("hidden.png");
+        let missing = temp.path().join("missing.png");
+        let directory = temp.path().join("directory.zip");
+        let unknown = temp.path().join("missing.unknown");
+        std::fs::write(&image, b"visible").unwrap();
+        std::fs::write(&hidden, b"hidden").unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        let collection_id = CollectionId::new();
+        let entries = [
+            (image, CollectionResolvedKind::Image),
+            (hidden, CollectionResolvedKind::Image),
+            (missing, CollectionResolvedKind::Image),
+            (directory, CollectionResolvedKind::Zip),
+            (unknown, CollectionResolvedKind::Unresolved),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (source_path, resolved_kind))| CollectionEntry {
+            id: CollectionEntryId::new(),
+            collection_id,
+            source_key: CollectionSourcePath::from_trusted(source_path.clone())
+                .unwrap()
+                .key()
+                .clone(),
+            source_path,
+            resolved_kind,
+            manual_position: index as u64,
+        })
+        .collect::<Vec<_>>();
+        let snapshot = crate::collection_store::CollectionSnapshot {
+            catalog_revision: 1,
+            definition: CollectionDefinition {
+                id: collection_id,
+                name: "Projection".into(),
+                order_mode: CollectionOrderMode::Manual,
+                standard_sort: crate::settings::SortOrder::FileName,
+                shuffle_seed: 0,
+                revision: 1,
+            },
+            entries: Arc::from(entries),
+        };
+        let full = prepare_collection_snapshot(
+            &snapshot,
+            &Default::default(),
+            &AtomicBool::new(false),
+            |_, _| {},
+        )
+        .unwrap();
+        let mut policy = FileTypeVisibility::default();
+        policy.excluded_extensions.insert("png".into());
+        policy.excluded_categories.insert(FileTypeCategory::Zip);
+        let projected = project_collection_display_snapshot(full.clone(), &policy);
+        assert_eq!(full.entries.len(), 5);
+        assert_eq!(projected.entries.len(), 3);
+        for (actual, expected_index) in projected.entries.iter().zip([0, 3, 4]) {
+            assert_eq!(actual, &full.entries[expected_index]);
+            assert_eq!(
+                actual.source_key,
+                snapshot.entries[expected_index].source_key
+            );
+            assert_eq!(actual.entry_id, snapshot.entries[expected_index].id);
+        }
+        assert_eq!(projected.auto_aspect_eligible_total, 2);
+        assert_eq!(full.auto_aspect_eligible_total, 3);
+    }
+
+    #[test]
+    fn visibility_collection_adoption_pairs_final_worker_map_and_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("visible.jpg");
+        std::fs::write(&image, b"image").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collections.db"));
+        let mut old_policy = crate::file_type_visibility::FileTypeVisibility::default();
+        old_policy.excluded_extensions.insert("jpg".into());
+        let old_map =
+            Arc::new(super::super::file_type_resume::PreparedPageIdentityIndex::empty(old_policy));
+        app.page_identity_index = Arc::clone(&old_map);
+        let mut policy = crate::file_type_visibility::FileTypeVisibility::default();
+        policy.excluded_extensions.insert("png".into());
+        app.settings.file_type_visibility = policy.clone();
+        let snapshot =
+            collection_with_sources(&client, &[(image.clone(), CollectionResolvedKind::Image)]);
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let accepted = app
+            .top_level_grid_view
+            .collection_session()
+            .unwrap()
+            .installed_presentation()
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &accepted.page_identity_index,
+            &app.page_identity_index
+        ));
+        assert_eq!(app.page_identity_index.policy, policy);
+        let position = crate::book_resume_db::ReadingPosition {
+            page: 99,
+            identity: crate::book_resume_db::PageIdentity::for_item(&GridItem::Image(image), None),
+        };
+        assert_eq!(
+            app.page_identity_index.resolve(&position),
+            super::super::file_type_resume::PositionResolution::Restored(0)
+        );
+        assert!(!Arc::ptr_eq(&old_map, &app.page_identity_index));
+        app.shutdown_collection_runtime_for_exit();
     }
 
     fn seed_search_or_snapshot_without_return_to(
@@ -5626,6 +5952,13 @@ mod tests {
         // Exercise the shared seed/fixup owner with a new, unpainted item generation.
         // No Collection session is bound: its denominator is published after installation.
         // Catalog entries must actually cause an immediate switch, not a mocked fixup.
+        let page_identity_index = Arc::new(
+            super::super::file_type_resume::PreparedPageIdentityIndex::prepare(
+                &items,
+                None,
+                app.settings.file_type_visibility.clone(),
+            ),
+        );
         app.install_collection_grid_items_with_thumbnail_sources(
             items,
             vec![Some((1, 5)); 120],
@@ -5637,6 +5970,7 @@ mod tests {
             None,
             120,
             None,
+            page_identity_index,
         );
         app.cancel_token.store(true, Ordering::Relaxed);
         assert_ne!(app.items_generation, old_generation);
@@ -5692,6 +6026,13 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        let page_identity_index = Arc::new(
+            super::super::file_type_resume::PreparedPageIdentityIndex::prepare(
+                std::slice::from_ref(&item),
+                None,
+                app.settings.file_type_visibility.clone(),
+            ),
+        );
         app.install_collection_grid_items_with_thumbnail_sources(
             vec![item],
             vec![Some((1, 5))],
@@ -5703,6 +6044,7 @@ mod tests {
             None,
             0,
             Some(prepared),
+            page_identity_index,
         );
         assert_eq!(app.page_path_key(0).as_deref(), Some(key.as_str()));
         assert!(
@@ -5738,6 +6080,10 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::channel();
         sender
             .send(Ok(CollectionGridPreparedInstall {
+                page_identity_index: prepare_collection_page_identity_index(
+                    &installed,
+                    app.settings.file_type_visibility.clone(),
+                ),
                 prepared: (*installed).clone(),
                 page_edits: Some((old_snapshot.clone(), old_projection)),
                 retained_page_edits: Some(Arc::new(old_snapshot)),
@@ -5845,6 +6191,7 @@ mod tests {
                 Arc::new(wrong_context),
                 installed.sources.clone(),
                 installed.reuse_key.clone(),
+                Arc::clone(&installed.page_identity_index),
             )));
         assert_eq!(
             app.auto_aspect_eligible_total(),
@@ -5861,6 +6208,7 @@ mod tests {
                 Arc::new(wrong_revision),
                 installed.sources.clone(),
                 installed.reuse_key.clone(),
+                Arc::clone(&installed.page_identity_index),
             )));
         assert_eq!(app.auto_aspect_eligible_total(), 0);
         let mut wrong_length = (*installed.prepared).clone();
@@ -5873,6 +6221,7 @@ mod tests {
                 Arc::new(wrong_length),
                 installed.sources.clone(),
                 installed.reuse_key.clone(),
+                Arc::clone(&installed.page_identity_index),
             )));
         assert_eq!(app.auto_aspect_eligible_total(), 0);
         app.top_level_grid_view
@@ -6089,11 +6438,22 @@ mod tests {
             source_key: anchor.source_key,
             path: child.clone(),
         };
-        app.current_folder = Some(child);
+        app.current_folder = Some(child.clone());
         app.items = vec![
             GridItem::Image(temp.path().join("b.jpg")),
             GridItem::Image(temp.path().join("a.jpg")),
         ];
+        // Physical source adoption replaces the root's extracted recipe together with rows.
+        app.projection_recipe = super::super::book_materialization::ProjectionRecipe::for_physical(
+            &app.settings,
+            &child,
+            &child,
+            &app.items,
+        );
+        assert!(matches!(
+            app.projection_recipe,
+            super::super::book_materialization::ProjectionRecipe::Book(_)
+        ));
         app.visible_indices = vec![0, 1];
         app.settings.details_sort_key = DetailsSortKey::Name;
         app.rebuild_details_order();
@@ -6539,6 +6899,7 @@ mod tests {
             order_mode: previous.order_mode,
             standard_sort: previous.standard_sort,
             auto_aspect_eligible_total: previous.auto_aspect_eligible_total,
+            registered_total: previous.registered_total,
             entries: Arc::from(entries.into_boxed_slice()),
         });
         app.apply_collection_grid_prepared(Arc::clone(&reordered), Some(previous));
@@ -7650,6 +8011,11 @@ mod tests {
             super::super::OpenRequestOwner::CollectionGridPhysical(owner),
             crate::app::StartupListIntent::ExplicitList,
         ));
+        poll_until(
+            &mut app,
+            "collection root child hydration did not finish",
+            |_| true,
+        );
         assert!(matches!(
             app.folder_history_back_target(),
             Some(super::super::FolderNavHistoryTarget::Collection(restore))
@@ -7841,10 +8207,12 @@ mod tests {
             let key = crate::adjustment_db::normalize_path(&source);
             app.rating_db.as_ref().unwrap().set(&key, 1).unwrap();
             app.enter_rating_view_from_menu(1);
+            let preparation_ctx = egui::Context::default();
             let deadline = Instant::now() + Duration::from_secs(15);
-            while app.rating_view_pending.is_some() {
+            while app.rating_view_pending.is_some() || app.sidecar_restore_active() {
                 assert!(Instant::now() < deadline, "Rating root did not settle");
                 app.poll_rating_view();
+                app.poll_sidecar_restore(&preparation_ctx);
                 std::thread::sleep(Duration::from_millis(5));
             }
             assert!(app.items_are_rating_view);
@@ -8056,6 +8424,7 @@ mod tests {
             .set_pdf_meta("warm-book.epub", generation_id, generation_size, 2, false)
             .unwrap();
         app.load_folder(temp.path().to_path_buf());
+        poll_until(&mut app, "EPUB parent hydration did not finish", |_| true);
         let source = app.folder_nav_current_target();
         assert!(app.peek_pdf_meta_cache(&epub, false).is_some());
         assert_eq!(
@@ -8093,6 +8462,11 @@ mod tests {
                     stamp: Some(stamp),
                 }),
             );
+        poll_until(
+            &mut app,
+            "warm placeholder hydration did not finish",
+            |_| true,
+        );
         app.poll_pdf_enumerate();
         assert_eq!(app.items_generation, placeholder_generation);
         assert!(Arc::ptr_eq(&app.cancel_token, &placeholder_workers));
@@ -8124,6 +8498,11 @@ mod tests {
             app.active_quick_folder_slot = None;
             app.settings.follow_document_reading_direction = true;
             app.load_folder(old.clone());
+            poll_until(
+                &mut app,
+                "ordinary EPUB parent hydration did not finish",
+                |_| true,
+            );
             app.folder_nav_back_stack.clear();
             app.folder_nav_forward_stack.clear();
             if back {
@@ -8169,6 +8548,7 @@ mod tests {
         let (mut app, _) = start_ready_app(&temp.path().join("collection.db"));
         app.settings.follow_document_reading_direction = true;
         app.load_folder(old.clone());
+        poll_until(&mut app, "EPUB slot A hydration did not finish", |_| true);
         app.set_quick_folder_slot_target(super::super::QuickFolderSlotId::A, old.clone());
         app.set_quick_folder_slot_target(super::super::QuickFolderSlotId::B, source.clone());
         app.active_quick_folder_slot = Some(super::super::QuickFolderSlotId::A);
@@ -8652,6 +9032,9 @@ mod tests {
             super::super::OpenRequestOwner::CollectionGridPhysical(owner),
             crate::app::StartupListIntent::ExplicitList,
         ));
+        poll_until(&mut app, "mutation child hydration did not finish", |_| {
+            true
+        });
         app.selected = app
             .items
             .iter()
@@ -8680,6 +9063,11 @@ mod tests {
             })
             .unwrap();
         refresh(&mut app, &folder);
+        poll_until(
+            &mut app,
+            "mutation refresh hydration did not finish",
+            |_| true,
+        );
         assert_eq!(app.folder_nav_current_target(), location);
         assert!(matches!(
             app.top_level_grid_view
@@ -8787,6 +9175,11 @@ mod tests {
             app.settings.stack_script_enabled = false;
             app.toggle_stack_mode();
             assert!(app.stack_mode_requested);
+            poll_until(
+                app,
+                "Stack toggle first list hydration did not settle",
+                |_| true,
+            );
             app.toggle_stack_mode();
             assert!(!app.stack_mode_requested);
         });
@@ -9302,6 +9695,11 @@ mod tests {
             request.selection,
             request.origin,
         );
+        poll_until(
+            &mut app,
+            "missing leaf selection hydration did not finish",
+            |_| true,
+        );
         assert!(matches!(
             app.top_level_grid_view.surface(),
             TopLevelGridSurface::Folder
@@ -9348,6 +9746,11 @@ mod tests {
             scan,
             request.selection,
             request.origin,
+        );
+        poll_until(
+            &mut app,
+            "placeholder selection hydration did not finish",
+            |_| true,
         );
         assert!(matches!(
             app.top_level_grid_view.surface(),
@@ -9423,6 +9826,7 @@ mod tests {
             super::super::folder_scan::scan_directory_with_settings(&folder, &app.settings)
                 .unwrap();
         app.load_folder_with_scan(folder.clone(), Some(initial));
+        poll_until(&mut app, "normal folder hydration did not finish", |_| true);
         let generation = app.items_generation;
         let menu_owner = app.capture_grid_context_menu_owner(0);
         app.context_menu_idx = Some(menu_owner);
@@ -9664,6 +10068,7 @@ mod tests {
             crate::app::StartupListIntent::ExplicitList,
         ));
         assert_eq!(app.current_folder.as_deref(), Some(nested.as_path()));
+        poll_until(&mut app, "nested child hydration did not finish", |_| true);
         assert!(matches!(
             app.collection_grid_parent_nav(),
             Some(crate::ui_main::AddressBarNav::Collection(_))
@@ -10303,6 +10708,10 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::channel();
         sender
             .send(Ok(CollectionGridPreparedInstall {
+                page_identity_index: prepare_collection_page_identity_index(
+                    &installed,
+                    app.settings.file_type_visibility.clone(),
+                ),
                 prepared: (*installed).clone(),
                 page_edits: None,
                 retained_page_edits: None,
@@ -10810,6 +11219,10 @@ mod tests {
 
         prepare_sender
             .send(Ok(CollectionGridPreparedInstall {
+                page_identity_index: prepare_collection_page_identity_index(
+                    &installed_prepared,
+                    app.settings.file_type_visibility.clone(),
+                ),
                 prepared: (*installed_prepared).clone(),
                 page_edits: Some((edits.snapshot, edits.projection)),
                 retained_page_edits: retained_edits,
@@ -10850,6 +11263,10 @@ mod tests {
         };
         late_sender
             .send(Ok(CollectionGridPreparedInstall {
+                page_identity_index: prepare_collection_page_identity_index(
+                    &installed_prepared,
+                    app.settings.file_type_visibility.clone(),
+                ),
                 prepared: (*installed_prepared).clone(),
                 page_edits: None,
                 retained_page_edits: None,

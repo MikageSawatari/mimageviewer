@@ -34,7 +34,8 @@ overlayの段階名と経過時間は常時timelineのmemory snapshotを使う�
 | `ctx.load_texture` (GPU アップロード) | 20MP RGBA で 26-58ms、1 フレームに複数来ると合算 | `fs_upload_backlog` にステージして 1 枚/frame |
 | `std::fs::read_dir` + **`Path::is_dir()` / `Path::is_file()`** per-entry | Windows では per-entry で `GetFileAttributes` syscall。500 ファイルで 500-1000ms | `DirEntry::file_type()` を使う (`FindFirstFile` のキャッシュ再利用) |
 | DFS フォルダ走査 (`navigate_folder_with_skip`) | HDD で 20-300ms、最悪 1s+ | 常に別スレッド (`spawn_folder_nav`) |
-| SQLite の `search()` (FTS クエリ) | インデックス小なら数 ms、大なら 100ms+ | `execute_favsearch` がバックグラウンド化 |
+| SQLite の名前/コンテナ検索 (Ctrl+S、FTS クエリ) | インデックス小なら数 ms、大なら 100ms+ | `execute_favsearch` がバックグラウンド化 |
+| Tantivy の全文検索 (Ctrl+G) | 文書数・検索条件・I/O に依存 | `global_search` の専用 worker が検索・ページ取得を実行 |
 | Windows Shell の `IContextMenu::QueryContextMenu` | シェル拡張が多い環境で 1.2〜1.4 秒 | 右クリック直後には呼ばず、既定では「Windows のメニュー」の `WM_INITMENUPOPUP` まで遅延する。同階層へ併記する設定では従来どおり同期コストを受け入れる |
 
 ### 1.1 Windows 固有: `Path::is_dir` は syscall、`DirEntry::file_type` はキャッシュ
@@ -166,6 +167,20 @@ process memory の毎フレーム sample は追加していない（page-fault �
 ---
 
 ## 2. 非同期 I/O の実装テンプレ
+
+### FTS 起動整理と失敗表示 (§1.367)
+
+metadata manager worker の所有範囲 cleanup/Failed reconciliation は supervisor spawn 前に行うが、
+`IndexerManager::new`、IndexerInit の result送信、overlay解除、Ctrl+G の manager 準備完了は
+その worker の完了を待たない。UI は manager の在メモリ maintenance snapshot と typed Full outcome
+だけで失敗/次回再構築を表示する。描画・toast確認のために SQLite pending の読取、SQL、I/O、
+wait/retry を追加しない。トレイで toast を見逃してもお気に入り編集で予約状態を確認できる。
+
+起動 count 点検は常時実行し、feature gate は撤去した。利用者承認の軽量A/Bを設計リードが
+実施し、観測した起動費用の差はノイズと判断して採用した。[採用記録 §7.4](fts-integrity-plan.md#74-起動点検の採用判断-2026-10-11)
+に条件・結果・未測定範囲を残す。worker配置や単発fixtureだけで全環境の「追加費用ゼロ」とは
+扱わない。他 workerとのCPU/I/O競合やFailed大量時の費用は残り、perf eventで追跡する。
+点検completionを待つ起動 barrier を足さない。
 
 EPUB の事前確認と変換もこの境界を使う。`EpubConvertState` が取消 token と結果 receiver を持ち、
 UI は `try_recv` で確認・進捗・完了を受け取る。`inspect` と `convert` の起動、元 EPUB の読み込み、
@@ -421,14 +436,23 @@ wipe/diff比較はpair生成時、360度パノラマはbase upload時だけ同�
 同時保持するerase / local-adjust / conceal / edit / final composite / comic / adjustment textureを
 TextureIdで重複排除して見積もり、補正レイヤーの比較previewも同じkeep-set evictionへ追従させる。
 
-### 3.2 サムネイルアップロードは per-frame スロットリング不要
+### 3.2 サムネイルアップロードは8枚/frameを維持
 
-`thumb.ready` の `upload_ms` は 1 枚 0.3-1ms 程度 (762×572 RGBA)。1 フレームに 50 枚来ても
-合計 50ms なので致命的ではない。サムネイルは特別なペーシングなしで OK。
+サムネイルの `load_texture` はGPU uploadを伴うため、既存の上限8枚/frameを維持する。
+上限超過のColorImageはcontext-localな `ThumbnailRequests` が要求と一緒に所有し、
+sourceのFinalizedが先に届いても画像の採用/破棄まで再enqueueを許可しない（§1.360）。
+表示がEvictedまたはLoaded高画質化中でも同じ契約であり、backlogを増やして予算を迂回しない。
+新しい同期I/O・decode・待機・timerは足さず、keep外動画retry全件の毎frame走査もしない。
 
 ---
 
 ## 4. 新機能追加時のチェックリスト
+
+本の構成editor（§1.242 G4、next-book）はsource列挙/保存前fingerprint/保存待ち/thumbnail decodeを
+workerへ置く。純粋UIは元ページ・unit・変更previewをvirtualizedで描き、可視thumbnail要求は最大24件。
+全ページの名前・参照map・hidden状態をframeごとに作り直さず、draft変更時のviewを再利用する。
+thumbnail結果はeditor寿命のownerへだけ採用し、背景viewerのqueue/cacheへ要求を混在させない。
+この設計説明は実測結果の代わりではなく、実行証拠は[本の構成計画](book-composition-plan.md)の検証記録を参照する。
 
 機能追加・変更で以下を触るときは、この順で確認する。
 
@@ -690,6 +714,20 @@ python scripts\analyze_perf.py $Perf collection # collection read lease の相�
 python scripts\analyze_perf.py $Perf hitches --ms 100  # 100ms 超フレームギャップ
 python scripts\analyze_perf.py $Perf dump <seq>  # 特定 input_seq のイベント列
 ```
+
+### 7.0 ログの配送と保存完了（§1.356）
+
+UI／stderr reader／workerの `logger::log` / `perf::event` は自身のtimestamp／tid付きで
+有界journalへ非blocking受付する。通常／perfのopen・write・flush・rotationは単一writerの仕事。
+UIから `flush()` を呼んでも待機しない。通常writerは到着batchを直ちにflush、perfだけ250ms周期。
+これにより、ログ保存先の停止がUIやchild stderr排出へ伝播する所有lockを除いた。
+OS側のwrite stall原因は未確定で、Storeの起動問題全体の修正保証ではない。
+
+保存完了が必要な診断ZIPは、Appの単一ownerからworkerを起動し、完了barrierを最大2秒待つ。
+UIは保存中／結果のpollだけ。過去dropは証拠不完全と知らせZIPを保存し、今回要求印drop・
+timeout・必須snapshotの読取り失敗は通知して失敗。解析gateもcheckpointなしをPASSにしない。
+panic.log／UI hang watchdogは直接writeのまま。終了時だけ一般／startup writer合計2秒待つ。
+[設計・利用者決定](async-log-writer-plan.md)を参照。
 
 ### 7.1 `pre_grid` 区間の内訳
 

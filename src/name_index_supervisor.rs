@@ -478,9 +478,7 @@ fn run_full_scan(
             Some(progress),
         ),
         Err(error) => {
-            crate::logger::log(format!(
-                "name_index[{favorite_id}]: scan marker invalidation failed: {error}"
-            ));
+            db.report_write_failure("Full prepare_full_scan", favorite_root, &error);
             BulkSummary {
                 had_error: true,
                 ..Default::default()
@@ -535,7 +533,7 @@ fn run_full_scan(
 }
 
 fn record_full_scan_outcome(
-    favorite_id: Uuid,
+    _favorite_id: Uuid,
     favorite_root: &Path,
     db: &SearchIndexDb,
     excluded_roots: &[PathBuf],
@@ -555,9 +553,7 @@ fn record_full_scan_outcome(
             &name_scan_fingerprint(favorite_root, excluded_roots),
         ) {
             // 印が失われても次回走査するだけ。稀な書込失敗は retry しない。
-            crate::logger::log(format!(
-                "name_index[{favorite_id}]: scan marker write failed: {error}"
-            ));
+            db.report_scan_marker_failure(favorite_root, &error);
         }
     }
     outcome
@@ -623,23 +619,23 @@ fn apply_single_change(
     progress.set(format!("更新: {}", changed_path.display()));
 
     // 2. try_exists() で分岐
-    match changed_path.try_exists() {
+    let outcome = match changed_path.try_exists() {
         Ok(false) => {
-            handle_missing_path(favorite_root, db, changed_path);
-            stats.lock().unwrap().updates_applied += 1;
+            if cancel.load(Ordering::Relaxed) {
+                SubtreeScanOutcome::Cancelled
+            } else {
+                handle_missing_path(favorite_root, db, changed_path)
+            }
         }
-        Ok(true) => {
-            handle_existing_path(
-                favorite_root,
-                db,
-                changed_path,
-                progress,
-                cancel,
-                activity_gate,
-                excluded_roots,
-            );
-            stats.lock().unwrap().updates_applied += 1;
-        }
+        Ok(true) => handle_existing_path(
+            favorite_root,
+            db,
+            changed_path,
+            progress,
+            cancel,
+            activity_gate,
+            excluded_roots,
+        ),
         Err(e) => {
             crate::logger::log(format!(
                 "name_index: try_exists failed for {} (kind={:?}): {e}",
@@ -647,9 +643,27 @@ fn apply_single_change(
                 kind
             ));
             // destructive cleanup なし
+            SubtreeScanOutcome::Errored
         }
+    };
+    if outcome == SubtreeScanOutcome::Completed {
+        stats.lock().unwrap().updates_applied += 1;
     }
     progress.clear();
+}
+
+fn delete_missing_subtree(
+    favorite_root: &Path,
+    db: &SearchIndexDb,
+    subtree: &Path,
+) -> SubtreeScanOutcome {
+    match db.delete_subtree(favorite_root, subtree) {
+        Ok(_) => SubtreeScanOutcome::Completed,
+        Err(error) => {
+            db.report_write_failure("watcher delete_subtree", subtree, &error);
+            SubtreeScanOutcome::Errored
+        }
+    }
 }
 
 /// `apply_single_change` の `try_exists() == Ok(false)` 分岐。
@@ -662,16 +676,14 @@ fn apply_single_change(
 /// `changed_path == favorite_root` の特殊ケース: ancestor chain では拾えないので
 /// `delete_subtree` で全消し (supervisor 自身の停止は `IndexerManager::sync_with_favorites`
 /// 経由で別途処理されるので、ここでは index データの掃除だけ責任を持つ)。
-fn handle_missing_path(favorite_root: &Path, db: &SearchIndexDb, changed_path: &Path) {
+fn handle_missing_path(
+    favorite_root: &Path,
+    db: &SearchIndexDb,
+    changed_path: &Path,
+) -> SubtreeScanOutcome {
     // 特殊ケース: changed_path == favorite_root
     if path_equals(changed_path, favorite_root) {
-        if let Err(e) = db.delete_subtree(favorite_root, favorite_root) {
-            crate::logger::log(format!(
-                "name_index: delete_subtree failed for {}: {e}",
-                favorite_root.display()
-            ));
-        }
-        return;
+        return delete_missing_subtree(favorite_root, db, favorite_root);
     }
 
     // ancestor chain を辿って最も浅い missing 祖先を見つける
@@ -686,13 +698,7 @@ fn handle_missing_path(favorite_root: &Path, db: &SearchIndexDb, changed_path: &
             match favorite_root.try_exists() {
                 Ok(false) => {
                     // favorite root も消えた → 全消し
-                    if let Err(e) = db.delete_subtree(favorite_root, favorite_root) {
-                        crate::logger::log(format!(
-                            "name_index: delete_subtree failed for {}: {e}",
-                            favorite_root.display()
-                        ));
-                    }
-                    return;
+                    return delete_missing_subtree(favorite_root, db, favorite_root);
                 }
                 Ok(true) => break, // favorite root は存在 → 現在の highest_missing で確定
                 Err(e) => {
@@ -722,12 +728,7 @@ fn handle_missing_path(favorite_root: &Path, db: &SearchIndexDb, changed_path: &
         }
     }
 
-    if let Err(e) = db.delete_subtree(favorite_root, &highest_missing) {
-        crate::logger::log(format!(
-            "name_index: delete_subtree failed for {}: {e}",
-            highest_missing.display()
-        ));
-    }
+    delete_missing_subtree(favorite_root, db, &highest_missing)
 }
 
 /// `apply_single_change` の `try_exists() == Ok(true)` 分岐。
@@ -749,7 +750,7 @@ fn handle_existing_path(
     cancel: &AtomicBool,
     activity_gate: Option<&crate::activity_gate::ActivityGate>,
     excluded_roots: &[PathBuf],
-) {
+) -> SubtreeScanOutcome {
     // 1. scan_start は最初に取る
     let scan_start = crate::search_index_db::next_write_stamp();
 
@@ -786,19 +787,29 @@ fn handle_existing_path(
         // prune は (a) subtree scan が clean に完了し、(b) parent refresh も成功している
         // ときのみ。どちらか欠けると「changed_path 自身の行が古い stamp のまま」「subtree が
         // 不完全観測」のいずれかで、prune が正当行を消す危険がある。
-        if outcome == SubtreeScanOutcome::Completed && parent_refresh_ok {
+        if outcome != SubtreeScanOutcome::Completed {
+            return outcome;
+        }
+        if parent_refresh_ok {
             match db.prune_stale_under_subtree(favorite_root, changed_path, scan_start) {
                 Ok(0) => {}
                 Ok(n) => crate::logger::log(format!(
                     "name_index: pruned {n} stale rows under {}",
                     changed_path.display()
                 )),
-                Err(e) => crate::logger::log(format!(
-                    "name_index: prune_stale_under_subtree failed for {}: {e}",
-                    changed_path.display()
-                )),
+                Err(e) => {
+                    db.report_write_failure("watcher prune_stale_under_subtree", changed_path, &e);
+                    return SubtreeScanOutcome::Errored;
+                }
             }
         }
+    }
+    if cancel.load(Ordering::Relaxed) {
+        SubtreeScanOutcome::Cancelled
+    } else if parent_refresh_ok {
+        SubtreeScanOutcome::Completed
+    } else {
+        SubtreeScanOutcome::Errored
     }
 }
 
@@ -872,10 +883,7 @@ fn refresh_parent_listing(
         return false;
     }
     if let Err(e) = db.upsert_children(favorite_root, parent, &children) {
-        crate::logger::log(format!(
-            "name_index: upsert_children failed for {}: {e}",
-            parent.display()
-        ));
+        db.report_write_failure("watcher parent upsert_children", parent, &e);
         return false;
     }
     true
@@ -972,10 +980,7 @@ fn run_subtree_scan(
         }
         if let Err(e) = db.upsert_children(favorite_root, folder, &children) {
             had_error = true;
-            crate::logger::log(format!(
-                "name_index: upsert_children failed for {}: {e}",
-                folder.display()
-            ));
+            db.report_write_failure("watcher subtree upsert_children", folder, &e);
         }
     }
 
@@ -1008,6 +1013,247 @@ mod tests {
     use std::fs;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[test]
+    fn long_full_failures_across_roots_and_drains_reserve_only_once() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("names.db");
+        let db = SearchIndexDb::open_at(&path).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE reservation_audit (attempt INTEGER);
+            CREATE TRIGGER audit_reservation BEFORE INSERT ON name_index_rebuild_state
+            BEGIN INSERT INTO reservation_audit VALUES (1); END;
+            CREATE TRIGGER deny_insert BEFORE INSERT ON entries
+            BEGIN SELECT RAISE(FAIL, 'Full write refused'); END;",
+        )
+        .unwrap();
+        for i in 0..2 {
+            let root = tmp.path().join(format!("root{i}"));
+            for n in 0..64 {
+                fs::create_dir_all(root.join(format!("child{n}/leaf"))).unwrap();
+            }
+            let stats = initial_scan_for_test(&root, &db, &[], false);
+            assert_eq!(stats.last_full_scan, Some(NameFullScanOutcome::Failed));
+            assert_eq!(db.count_for_favorite(&root).unwrap(), 0);
+            assert_eq!(
+                db.take_failure_notifications(),
+                if i == 0 {
+                    vec![crate::search_index_db::NAME_UPDATE_FAILURE_NOTICE]
+                } else {
+                    vec![]
+                }
+            );
+        }
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM reservation_audit", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn full_prune_failure_preserves_orphan_rows_and_requests_name_rebuild() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let path = tmp.path().join("names.db");
+        let db = SearchIndexDb::open_at(&path).unwrap();
+        db.upsert_children(
+            &root,
+            &root.join("missing"),
+            &[crate::search_index_db::IndexEntry {
+                path: root.join("missing/keep.zip"),
+                display_name: "keep.zip".into(),
+                kind: crate::search_index_db::IndexKind::ZipFile,
+                mtime: 0,
+            }],
+        )
+        .unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER deny_delete BEFORE DELETE ON entries
+            BEGIN SELECT RAISE(FAIL, 'prune refused'); END;",
+        )
+        .unwrap();
+        let stats = initial_scan_for_test(&root, &db, &[], false);
+        assert_eq!(stats.last_full_scan, Some(NameFullScanOutcome::Failed));
+        assert_eq!(db.count_for_favorite(&root).unwrap(), 1);
+        assert_eq!(
+            db.take_failure_notifications(),
+            vec![crate::search_index_db::NAME_UPDATE_FAILURE_NOTICE]
+        );
+        assert_eq!(
+            conn.query_row("SELECT pending FROM name_index_rebuild_state", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn complete_scan_marker_failure_only_notifies_once_without_rebuild() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("root");
+        fs::create_dir_all(root.join("child")).unwrap();
+        let path = tmp.path().join("names.db");
+        let db = SearchIndexDb::open_at(&path).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER deny_marker BEFORE INSERT ON scanned_once
+            BEGIN SELECT RAISE(FAIL, 'scan marker refused'); END;",
+        )
+        .unwrap();
+        for i in 0..2 {
+            let stats = initial_scan_for_test(&root, &db, &[], false);
+            assert_eq!(stats.last_full_scan, Some(NameFullScanOutcome::Complete));
+            assert_eq!(db.count_for_favorite(&root).unwrap(), 1);
+            assert_eq!(db.scanned_once_fingerprint(&root).unwrap(), None);
+            assert_eq!(
+                db.take_failure_notifications(),
+                if i == 0 {
+                    vec![crate::search_index_db::NAME_SCAN_MARKER_FAILURE_NOTICE]
+                } else {
+                    vec![]
+                }
+            );
+        }
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM name_index_rebuild_state", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn watcher_write_failures_keep_rows_do_not_count_success_and_notify_once() {
+        for case in ["root", "ancestor", "missing", "parent", "subtree", "prune"] {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path().join("root");
+            if case != "root" {
+                fs::create_dir_all(&root).unwrap();
+            }
+            let changed = match case {
+                "root" | "prune" => root.clone(),
+                "ancestor" => root.join("missing/deep/leaf"),
+                "missing" => root.join("missing"),
+                "parent" => {
+                    fs::create_dir_all(root.join("child/leaf")).unwrap();
+                    root.join("child")
+                }
+                "subtree" => {
+                    fs::create_dir_all(root.join("child/leaf")).unwrap();
+                    root.clone()
+                }
+                _ => unreachable!(),
+            };
+            let path = tmp.path().join("names.db");
+            let db = SearchIndexDb::open_at(&path).unwrap();
+            db.upsert_children(
+                &root,
+                &root.join("missing/deep"),
+                &[crate::search_index_db::IndexEntry {
+                    path: root.join("missing/deep/keep.zip"),
+                    display_name: "keep.zip".into(),
+                    kind: crate::search_index_db::IndexKind::ZipFile,
+                    mtime: 0,
+                }],
+            )
+            .unwrap();
+            let fts = crate::fts_meta::FtsMetaDb::open_at(&tmp.path().join("fts_meta.db")).unwrap();
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE reservation_audit (attempt INTEGER);
+                CREATE TRIGGER audit_reservation BEFORE INSERT ON name_index_rebuild_state
+                BEGIN INSERT INTO reservation_audit VALUES (1); END;",
+            )
+            .unwrap();
+            let rejection = match case {
+                "parent" => {
+                    "CREATE TRIGGER reject_write BEFORE INSERT ON entries WHEN NEW.display_name = 'child' BEGIN SELECT RAISE(FAIL, 'parent refused'); END;"
+                }
+                "subtree" => {
+                    "CREATE TRIGGER reject_write BEFORE INSERT ON entries WHEN NEW.display_name = 'leaf' BEGIN SELECT RAISE(FAIL, 'subtree refused'); END;"
+                }
+                _ => {
+                    "CREATE TRIGGER reject_write BEFORE DELETE ON entries WHEN OLD.display_name = 'keep.zip' BEGIN SELECT RAISE(FAIL, 'delete/prune refused'); END;"
+                }
+            };
+            conn.execute_batch(rejection).unwrap();
+            let stats = Mutex::new(NameIndexStats::default());
+            for i in 0..2 {
+                apply_single_change(
+                    &root,
+                    &db,
+                    &changed,
+                    ChangeKind::Upsert,
+                    &[],
+                    &ProgressReporter::new(),
+                    &stats,
+                    &AtomicBool::new(false),
+                    None,
+                );
+                assert_eq!(stats.lock().unwrap().updates_applied, 0, "{case}");
+                assert_eq!(
+                    db.take_failure_notifications(),
+                    if i == 0 {
+                        vec![crate::search_index_db::NAME_UPDATE_FAILURE_NOTICE]
+                    } else {
+                        vec![]
+                    },
+                    "{case}"
+                );
+            }
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM reservation_audit", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                1,
+                "{case}"
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM entries WHERE display_name = 'keep.zip'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1,
+                "{case}"
+            );
+            assert!(!fts.tantivy_rebuild_pending().unwrap(), "{case}");
+        }
+    }
+
+    #[test]
+    fn watcher_zero_row_delete_is_success_and_cancel_is_not_failure() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("missing");
+        let db = SearchIndexDb::open_in_memory().unwrap();
+        let stats = Mutex::new(NameIndexStats::default());
+        for cancelled in [true, false] {
+            apply_single_change(
+                &root,
+                &db,
+                &root,
+                ChangeKind::Remove,
+                &[],
+                &ProgressReporter::new(),
+                &stats,
+                &AtomicBool::new(cancelled),
+                None,
+            );
+            assert_eq!(
+                stats.lock().unwrap().updates_applied,
+                usize::from(!cancelled)
+            );
+            assert!(db.take_failure_notifications().is_empty());
+        }
+    }
 
     fn initial_scan_for_test(
         root: &Path,
@@ -1144,6 +1390,11 @@ mod tests {
         assert!(stats.initial_scan_done);
         assert_eq!(stats.last_full_scan, Some(NameFullScanOutcome::Failed));
         assert_eq!(db.scanned_once_fingerprint(&root).unwrap(), None);
+        assert_eq!(
+            db.take_failure_notifications(),
+            vec![crate::search_index_db::NAME_UPDATE_FAILURE_NOTICE]
+        );
+        assert!(db.name_rebuild_pending_for_test());
     }
 
     #[test]
@@ -1215,6 +1466,8 @@ mod tests {
             monitor.snapshot_stats().last_full_scan,
             Some(NameFullScanOutcome::Cancelled)
         );
+        assert!(db.take_failure_notifications().is_empty());
+        assert!(!db.name_rebuild_pending_for_test());
         drop(db);
         let reopened = SearchIndexDb::open_at(&path).unwrap();
         assert_eq!(
@@ -1252,6 +1505,11 @@ mod tests {
             db.scanned_once_fingerprint(&root).unwrap().as_deref(),
             Some(fingerprint.as_str())
         );
+        assert_eq!(
+            db.take_failure_notifications(),
+            vec![crate::search_index_db::NAME_REBUILD_REQUEST_FAILURE_NOTICE]
+        );
+        assert!(!db.name_rebuild_pending_for_test());
         drop(db);
         let reopened = SearchIndexDb::open_at(&path).unwrap();
         assert_eq!(reopened.count_for_favorite(&root).unwrap(), 1);
@@ -1344,6 +1602,8 @@ mod tests {
             db.scanned_once_fingerprint(&root).unwrap().as_deref(),
             Some(fingerprint.as_str())
         );
+        assert!(db.take_failure_notifications().is_empty());
+        assert!(!db.name_rebuild_pending_for_test());
     }
 
     /// 初期スキャン完了 + stats 反映を確認する最小 smoke test。
@@ -1663,5 +1923,7 @@ mod tests {
             after_total >= before_total - 1,
             "cancel 中の apply で索引が壊滅してはいけない (before={before_total}, after={after_total})"
         );
+        assert!(db.take_failure_notifications().is_empty());
+        assert!(!db.name_rebuild_pending_for_test());
     }
 }

@@ -19,12 +19,22 @@ pub(crate) enum FavoriteViewStoreCommand {
 }
 
 #[derive(Debug)]
-pub(crate) struct FavoriteViewStoreResult {
-    pub(crate) command: FavoriteViewStoreCommand,
-    pub(crate) result: Result<usize, String>,
+pub(crate) enum FavoriteViewStoreResult {
+    Persisted {
+        command: FavoriteViewStoreCommand,
+        result: Result<usize, String>,
+    },
+    /// A copy publishes a new UUID's saved state for adoption by the App owner.
+    /// Ordinary writes already changed that owner's memory before submission.
+    Copied { id: Uuid, state: FavoriteViewState },
 }
 
 enum WorkerMessage {
+    FolderZip(
+        Vec<(Uuid, Uuid)>,
+        crate::image_folder_zip_metadata::CopyPhase,
+        std::sync::mpsc::Sender<crate::image_folder_zip_metadata::CopyReply>,
+    ),
     Store(FavoriteViewStoreCommand),
     Shutdown,
 }
@@ -42,6 +52,24 @@ pub(crate) struct FavoriteViewStoreWriter {
 }
 
 impl FavoriteViewStoreWriter {
+    pub(crate) fn folder_zip_portal(
+        &self,
+        pairs: Vec<(Uuid, Uuid)>,
+    ) -> crate::image_folder_zip_metadata::CopyPortal {
+        let tx = self.tx.clone();
+        let submitted = Arc::clone(&self.submitted);
+        Arc::new(move |_, phase| {
+            let (reply, rx) = std::sync::mpsc::channel();
+            submitted.fetch_add(1, Ordering::Release);
+            if tx
+                .send(WorkerMessage::FolderZip(pairs.clone(), phase, reply))
+                .is_err()
+            {
+                submitted.fetch_sub(1, Ordering::Release);
+            }
+            rx
+        })
+    }
     pub(crate) fn spawn(db_path: PathBuf) -> std::io::Result<Self> {
         let (tx, rx) = unbounded();
         let (result_tx, result_rx) = unbounded();
@@ -97,6 +125,30 @@ fn run_store_worker(
 ) {
     let mut db: Option<crate::adjustment_db::AdjustmentDb> = None;
     while let Ok(message) = rx.recv() {
+        if let WorkerMessage::FolderZip(pairs, phase, reply) = message {
+            let result = (|| {
+                if db.is_none() {
+                    db = Some(
+                        crate::adjustment_db::AdjustmentDb::open_at(&db_path)
+                            .map_err(|e| e.to_string())?,
+                    );
+                }
+                let db = db.as_ref().unwrap();
+                let mut count = 0;
+                for (old, new) in pairs {
+                    count += db.copy_favorite_view_for_zip(old, new, phase)?;
+                    if phase == crate::image_folder_zip_metadata::CopyPhase::Apply
+                        && let Some(state) = db.favorite_view_for_copy(new)?
+                    {
+                        let _ = result_tx.send(FavoriteViewStoreResult::Copied { id: new, state });
+                    }
+                }
+                Ok(count)
+            })();
+            done.fetch_add(1, Ordering::Release);
+            let _ = reply.send(result);
+            continue;
+        }
         let WorkerMessage::Store(command) = message else {
             break;
         };
@@ -124,7 +176,7 @@ fn run_store_worker(
         })();
         // result を publish してから done を進める。UI 側が drain と busy 判定の間で
         // completion を取り逃がして repaint が止まる race を避ける。
-        let _ = result_tx.send(FavoriteViewStoreResult { command, result });
+        let _ = result_tx.send(FavoriteViewStoreResult::Persisted { command, result });
         done.fetch_add(1, Ordering::Release);
     }
 }
@@ -260,6 +312,223 @@ mod tests {
     use super::*;
     use crate::settings::Settings;
 
+    fn folder_zip_manifest(
+        temp: &tempfile::TempDir,
+    ) -> crate::image_folder_zip::ImageFolderManifest {
+        let source = temp.path().join("book");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("p1.jpg"), b"image bytes").unwrap();
+        crate::image_folder_zip::prepare_manifest(
+            &source,
+            None,
+            &crate::image_folder_zip::ConversionControl::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn folder_zip_favorite_flush_copies_all_fields_and_inheritance_to_fresh_uuids() {
+        use crate::image_folder_zip_metadata::CopyPhase;
+        use crate::settings::{
+            FullscreenSpecifiedScale, GridItemDisplayKind, GridViewMode, ReadingFlow, SortOrder,
+            SpecifiedScaleAxis, SpecifiedScaleAxisSetting, SpreadMode, ThumbAspect,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = folder_zip_manifest(&temp);
+        let path = temp.path().join("adjustment.db");
+        let writer = FavoriteViewStoreWriter::spawn(path.clone()).unwrap();
+        let mut debounce = FavoriteViewWriteDebounce::default();
+        let now = Instant::now();
+        let enabled = FullscreenSpecifiedScale {
+            width: SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::PercentTenths(1250)),
+            height: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::LogicalPixels(720)),
+        };
+        let disabled = FullscreenSpecifiedScale {
+            width: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(1750)),
+            height: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::LogicalPixels(900)),
+        };
+        let mut states = Vec::new();
+        let mut pairs = Vec::new();
+        for (index, (mode, scale)) in [
+            (SpreadMode::Single, None),
+            (SpreadMode::RtlCover, Some(disabled)),
+            (SpreadMode::SplitRtl, Some(enabled)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let old = Uuid::new_v4();
+            let new = Uuid::new_v4();
+            let mut state = FavoriteViewState::from_settings(&Settings::default());
+            state.grid_view_mode = GridViewMode::Details;
+            state.grid_cols = 3 + index;
+            state.thumb_aspect = ThumbAspect::Portrait2x3;
+            state.thumb_aspect_auto = false;
+            state
+                .grid_display_order
+                .assign(GridItemDisplayKind::Image, 3);
+            state.sort_order = SortOrder::NumericDesc;
+            state.default_spread_mode = mode;
+            state.default_reading_flow = ReadingFlow::Horizontal;
+            state.fullscreen_specified_scale = scale;
+            debounce.note_at(old, state.clone(), now);
+            states.push((old, new, state));
+            pairs.push((old, new));
+        }
+        let missing = (Uuid::new_v4(), Uuid::new_v4());
+        pairs.push(missing);
+        assert!(
+            debounce.take_due_at(now).is_empty(),
+            "debounce has not reached 500ms"
+        );
+        for (id, state) in debounce.take_all() {
+            writer
+                .submit(FavoriteViewStoreCommand::Set { id, state })
+                .unwrap();
+        }
+        let sibling = Uuid::new_v4();
+        let sibling_state = FavoriteViewState::from_settings(&Settings::default());
+        writer
+            .submit(FavoriteViewStoreCommand::Set {
+                id: sibling,
+                state: sibling_state.clone(),
+            })
+            .unwrap();
+        let portal = writer.folder_zip_portal(pairs);
+        assert_eq!(
+            portal(&manifest, CopyPhase::Check)
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap(),
+            Ok(3)
+        );
+        let db = crate::adjustment_db::AdjustmentDb::open_at(&path).unwrap();
+        let checked = db.load_all_favorite_view_states();
+        assert!(states.iter().all(|(_, new, _)| !checked.contains_key(new)));
+        assert_eq!(
+            portal(&manifest, CopyPhase::Apply)
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap(),
+            Ok(3)
+        );
+        // The regular result consumer receives new UUID states before copy completion.
+        let mut adopted = HashMap::new();
+        let mut copies = 0;
+        for _ in 0..7 {
+            let result = writer
+                .result_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            match result {
+                FavoriteViewStoreResult::Persisted {
+                    command: FavoriteViewStoreCommand::Set { id, state },
+                    result,
+                } => {
+                    assert_eq!(result, Ok(1));
+                    adopted.insert(id, state);
+                }
+                FavoriteViewStoreResult::Copied { id, state } => {
+                    assert!(states.iter().any(|(_, new, _)| *new == id));
+                    copies += 1;
+                    adopted.insert(id, state);
+                }
+                result => panic!("unexpected {result:?}"),
+            }
+        }
+        assert_eq!(copies, 3);
+        assert!(!writer.is_busy());
+        drop(portal);
+        drop(writer);
+        let persisted = db.load_all_favorite_view_states();
+        for (old, new, state) in states {
+            assert_eq!(persisted[&old], state);
+            assert_eq!(persisted[&new], state);
+            assert_eq!(adopted[&new], state);
+            let mut settings = Settings::default();
+            let inherited_scale = settings.common_fullscreen_specified_scale();
+            persisted[&new].apply_to_settings(&mut settings);
+            assert_eq!(settings.grid_view_mode, state.grid_view_mode);
+            assert_eq!(settings.grid_cols, state.grid_cols);
+            assert_eq!(settings.thumb_aspect, state.thumb_aspect);
+            assert_eq!(settings.thumb_aspect_auto, state.thumb_aspect_auto);
+            assert_eq!(settings.grid_display_order, state.grid_display_order);
+            assert_eq!(settings.sort_order, state.sort_order);
+            assert_eq!(settings.default_spread_mode, state.default_spread_mode);
+            assert_eq!(settings.default_reading_flow, state.default_reading_flow);
+            assert_eq!(
+                settings.fullscreen_specified_scale,
+                state.fullscreen_specified_scale.unwrap_or(inherited_scale)
+            );
+        }
+        assert_eq!(persisted[&sibling], sibling_state);
+        assert_eq!(adopted[&sibling], sibling_state);
+        assert!(!persisted.contains_key(&missing.0));
+        assert!(!persisted.contains_key(&missing.1));
+        assert!(!adopted.contains_key(&missing.1));
+    }
+
+    #[test]
+    fn folder_zip_favorite_fifo_remove_and_clear_do_not_resurrect_source_state() {
+        use crate::image_folder_zip_metadata::CopyPhase;
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = folder_zip_manifest(&temp);
+        let path = temp.path().join("adjustment.db");
+        let writer = FavoriteViewStoreWriter::spawn(path.clone()).unwrap();
+        let old = Uuid::new_v4();
+        let new = Uuid::new_v4();
+        let mut debounce = FavoriteViewWriteDebounce::default();
+        let now = Instant::now();
+        for command in [
+            FavoriteViewStoreCommand::Set {
+                id: old,
+                state: FavoriteViewState::from_settings(&Settings::default()),
+            },
+            FavoriteViewStoreCommand::Remove { id: old },
+            FavoriteViewStoreCommand::Set {
+                id: old,
+                state: FavoriteViewState::from_settings(&Settings::default()),
+            },
+            FavoriteViewStoreCommand::Clear,
+        ] {
+            debounce.defer_command_at(command, now);
+        }
+        assert!(debounce.take_due_deferred_at(now).is_empty());
+        for command in debounce.take_all_deferred() {
+            writer.submit(command).unwrap();
+        }
+        let portal = writer.folder_zip_portal(vec![(old, new)]);
+        assert_eq!(
+            portal(&manifest, CopyPhase::Check)
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap(),
+            Ok(0)
+        );
+        assert_eq!(
+            portal(&manifest, CopyPhase::Apply)
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap(),
+            Ok(0)
+        );
+        for _ in 0..4 {
+            let result = writer
+                .result_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            assert!(matches!(
+                result,
+                FavoriteViewStoreResult::Persisted { result: Ok(_), .. }
+            ));
+        }
+        assert!(
+            writer.try_recv().is_none(),
+            "absent source must not publish a copied state"
+        );
+        assert!(!writer.is_busy());
+        drop(portal);
+        drop(writer);
+        let db = crate::adjustment_db::AdjustmentDb::open_at(&path).unwrap();
+        assert!(db.load_all_favorite_view_states().is_empty());
+    }
+
     #[test]
     fn continuous_changes_collapse_to_one_write() {
         let id = Uuid::new_v4();
@@ -339,7 +608,10 @@ mod tests {
         // consumed.  Quiescence therefore samples busy before draining the result queue.
         assert!(writer.is_busy());
         let result = writer.try_recv().expect("done publishes a result first");
-        assert!(result.result.is_ok());
+        assert!(matches!(
+            result,
+            FavoriteViewStoreResult::Persisted { result: Ok(_), .. }
+        ));
         assert!(!writer.is_busy());
     }
 }

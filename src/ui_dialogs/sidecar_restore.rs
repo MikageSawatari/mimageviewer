@@ -21,6 +21,22 @@ impl App {
         if !self.sidecar_restore_blocks_projected_context() {
             return;
         }
+        if let Some(started_at) = self.spread_shift.retained_readoption_started_at() {
+            let remaining =
+                std::time::Duration::from_millis(100).saturating_sub(started_at.elapsed());
+            if !remaining.is_zero() {
+                ctx.request_repaint_after(remaining);
+                return;
+            }
+            draw_sidecar_restore_modal(
+                ctx,
+                crate::app::SidecarRestorePresentation {
+                    heading: "表示を準備中",
+                    detail: "保存された見開き調整を表示へ反映しています。",
+                },
+            );
+            return;
+        }
         let Some(state) = self.sidecar_restore.as_ref() else {
             return;
         };

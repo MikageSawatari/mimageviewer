@@ -28,19 +28,30 @@ RatingFolderBack records scrolled Rating folder/ZIP returns for every default hi
 [CmdletBinding()]
 param(
     [Alias('Suite')]
-    [ValidateSet('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort', 'RatingSortCollection', 'AudioTracks', 'FolderHistory', 'RatingFolderBack', 'AlwaysOnTop', 'ClipboardCapture')]
+    [ValidateSet('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort', 'RatingSortCollection', 'AudioTracks', 'FolderHistory', 'RatingFolderBack', 'AlwaysOnTop', 'ClipboardCapture', 'ReleaseChecks')]
     [string] $Scenario = 'MultiWindowPdf',
     [switch] $SkipBuild,
     [int] $TimeoutSeconds = 120,
     [ValidatePattern('^[0-9]+x[0-9]+$')]
     [string] $Idle198WindowSize = '1328x900',
-    [switch] $InteractiveApproved
+    [switch] $InteractiveApproved,
+    [switch] $IncludeFirstAi
 )
 
 if (-not $InteractiveApproved) {
     [Console]::Error.WriteLine(
         '[ui-smoke] interactive UI run requires explicit user approval; use -InteractiveApproved only after the user agrees to the scenario and expected duration.')
     exit 2
+}
+if ($IncludeFirstAi -and $Scenario -ne 'ReleaseChecks') {
+    [Console]::Error.WriteLine('[ui-smoke] IncludeFirstAi is valid only for ReleaseChecks.')
+    exit 2
+}
+if ($Scenario -eq 'ReleaseChecks') {
+    $suiteArgs = @{ InteractiveApproved = $true; SkipBuild = $SkipBuild; IncludeFirstAi = $IncludeFirstAi }
+    if ($PSBoundParameters.ContainsKey('TimeoutSeconds')) { $suiteArgs.TimeoutSeconds = $TimeoutSeconds }
+    & (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Run.ps1') @suiteArgs
+    exit $LASTEXITCODE
 }
 if ($Scenario -eq 'ClipboardCapture') {
     # Check every installation before preparation can launch anything. Another
@@ -540,15 +551,17 @@ function Invoke-UiSmokeCapturedProcess {
         [string] $StandardOutputPath,
         [string] $StandardErrorPath
     )
-    return Start-Process `
+    $capturedProcess = Start-Process `
         -FilePath $FilePath `
         -ArgumentList (Join-NativeArguments $ArgumentValues) `
         -WorkingDirectory $WorkingDirectory `
         -RedirectStandardOutput $StandardOutputPath `
         -RedirectStandardError $StandardErrorPath `
         -WindowStyle Hidden `
-        -Wait `
         -PassThru
+    $null = $capturedProcess.Handle # retain the handle before waiting for exit
+    $capturedProcess.WaitForExit()
+    return $capturedProcess
 }
 
 function Save-UiSmokeEvidence {
@@ -1776,6 +1789,7 @@ $arguments = @(
     else {
         $script:process = Start-Process -FilePath $exe -ArgumentList (Join-NativeArguments $arguments) -PassThru
     }
+    $null = $script:process.Handle # retain for both normal and button-helper launches
     $script:startedPid = $script:process.Id
     if ($Scenario -in @('NativeTopPanoramaClick', 'ClipboardCapture')) {
         $remainingAcceptMilliseconds = [long]$timeoutMilliseconds - $scenarioClock.ElapsedMilliseconds
@@ -1912,6 +1926,7 @@ $arguments = @(
             )
             Write-UiSmokeEvent 'always-on-top: restarting with the same disposable profile and an empty override'
             $script:process = Start-Process -FilePath $exe -ArgumentList (Join-NativeArguments $restartArguments) -PassThru
+            $null = $script:process.Handle # retain before the restart can exit
             $script:startedPid = $script:process.Id
             $script:restartAppPid = $script:startedPid
             Write-UiSmokeEvent "restart PID: $($script:startedPid)"
@@ -1928,7 +1943,11 @@ $arguments = @(
             }
             else {
                 $script:process.WaitForExit()
-                $script:appExitCode = [int]$script:process.ExitCode
+                $restartExitCode = $script:process.ExitCode
+                if ($null -eq $restartExitCode -or -not ($restartExitCode -is [int])) {
+                    throw '[ui-smoke] restart exited without an integer exit code'
+                }
+                $script:appExitCode = $restartExitCode
                 $script:restartAppExitCode = $script:appExitCode
                 $script:runExitCode = $script:appExitCode
                 $script:runPhase = if ($script:appExitCode -eq 0) { 'completed' } else { 'application-failed' }

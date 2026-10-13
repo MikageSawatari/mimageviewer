@@ -962,7 +962,7 @@ fn render_pdf_scan_page(task: &PdfPageTask, render_long_edge: u32) -> Result<Pdf
         None,
         None,
         JobPriority::Normal,
-        0,
+        pdf_loader::PdfRenderValidity::Unscoped,
         CancelWaitPolicy::AbortOnCancel,
     )
     .map_err(|error| {
@@ -1979,7 +1979,7 @@ fn render_pdf_page_signatures(
         None,
         None,
         JobPriority::Normal,
-        0,
+        pdf_loader::PdfRenderValidity::Unscoped,
         CancelWaitPolicy::AbortOnCancel,
     )
     .map_err(|error| {

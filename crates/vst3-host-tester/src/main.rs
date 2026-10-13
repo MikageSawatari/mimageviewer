@@ -274,7 +274,7 @@ impl TesterApp {
             };
             match Bridge::spawn(&self.bridge_exe_path, stderr_cb) {
                 Ok(mut br) => {
-                    // T09 (v0.9.0) round 4: PROTOCOL_VERSION は 2 にbump 済み。tester も
+                    // The tester uses the current frame-scoped GUI protocol.
                     // 同じ定数を使い、Ready の version を比較する (= stale bridge / 古い
                     // tester の組み合わせを早期検出)。
                     if let Err(e) = br.send(&Cmd::Hello {
@@ -285,11 +285,8 @@ impl TesterApp {
                     }
                     match br.recv() {
                         Ok(Event::Ready { version }) => {
-                            if version != bridge::PROTOCOL_VERSION {
-                                self.log(format!(
-                                    "bridge protocol version mismatch (bridge=v{version}, tester=v{})",
-                                    bridge::PROTOCOL_VERSION
-                                ));
+                            if let Err(reason) = bridge::require_current_protocol(version) {
+                                self.log(reason);
                                 return;
                             }
                             self.log(format!("bridge ready (protocol v{version})"));

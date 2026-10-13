@@ -50,6 +50,7 @@ all-features = true
 rustdoc-args = ["--generate-link-to-definition"]
 
 [features]
+miv-repaint-witness = []
 _override_unity = ["epaint/_override_unity"]
 accesskit = ["dep:accesskit"]
 bytemuck = ["epaint/bytemuck"]

@@ -1282,6 +1282,14 @@ test("an explicit portrait selection writes the selected mode, not effective Sin
   });
 });
 
+test("composition mode-only switching carries no binding direction or cover", () => {
+  const address = { path: "C:/books/book.pdf", subresource: { kind: "file" } };
+  for (const [selectedMode, mode] of [[SpreadMode.SINGLE, "single"], [SpreadMode.RTL_COVER, "spread"], [SpreadMode.SPLIT_RTL, "landscape_split"]]) {
+    const plan = planSpreadIntent({ address, selectedMode, currentDirection: ReadingDirection.RTL, modeOnly: true });
+    assert.deepEqual(plan.writeRequest, { kind: "set_view_mode", address, mode });
+  }
+});
+
 test("fit mode cycle and request width use the actual rendered image width", () => {
   assert.equal(nextFitMode(FitMode.PAGE), FitMode.WIDTH);
   assert.equal(nextFitMode(FitMode.WIDTH), FitMode.ORIGINAL);

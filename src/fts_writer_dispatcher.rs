@@ -115,6 +115,7 @@ const LOG_PREFIX: &str = "[fts-dispatcher]";
 pub struct FtsWriterDispatcher {
     queue: Arc<(Mutex<Queue>, Condvar)>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    reporter: Option<Arc<crate::fts_integrity::FailureReporter>>,
     #[cfg(test)]
     batch_gate: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
 }
@@ -123,18 +124,57 @@ impl FtsWriterDispatcher {
     /// dispatcher を起動する。`writer` の所有権を dispatcher スレッドに渡す。
     /// `fts` は commit 後の reader reload で使う (dispatcher スレッド内に move される)。
     pub fn start(writer: IndexWriter, fts: Arc<FtsIndex>) -> Arc<Self> {
+        Self::start_inner(writer, fts, None)
+    }
+
+    /// Manager-owned production entry: report jobs before replying and asynchronous merges
+    /// regardless of whether any consumer survives. The callback holds no Index/writer handles.
+    pub fn start_with_reporter(
+        writer: IndexWriter,
+        fts: Arc<FtsIndex>,
+        reporter: Arc<crate::fts_integrity::FailureReporter>,
+    ) -> Arc<Self> {
+        let merge_reporter = Arc::clone(&reporter);
+        writer.set_merge_failure_handler(move |error| {
+            merge_reporter.report("tantivy automatic merge/publication", error);
+        });
+        Self::start_inner(writer, fts, Some(reporter))
+    }
+
+    fn start_inner(
+        writer: IndexWriter,
+        fts: Arc<FtsIndex>,
+        reporter: Option<Arc<crate::fts_integrity::FailureReporter>>,
+    ) -> Arc<Self> {
         let queue = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
         let q_clone = Arc::clone(&queue);
+        let worker_reporter = reporter.clone();
         let thread = std::thread::Builder::new()
             .name("fts-writer-dispatcher".into())
-            .spawn(move || run_dispatcher(q_clone, writer, fts))
+            .spawn(move || run_dispatcher(q_clone, writer, fts, worker_reporter))
             .expect("fts-writer-dispatcher spawn");
         Arc::new(Self {
             queue,
             thread: Mutex::new(Some(thread)),
+            reporter,
             #[cfg(test)]
             batch_gate: Mutex::new(None),
         })
+    }
+
+    /// SQLite failures are reported at their origin; propagated Tantivy errors already were.
+    pub(crate) fn report_failure<E: std::fmt::Display + std::fmt::Debug + ?Sized>(
+        &self,
+        origin: &str,
+        error: &E,
+    ) {
+        if let Some(reporter) = &self.reporter {
+            reporter.report(origin, error);
+        } else {
+            crate::logger::log(format!(
+                "{LOG_PREFIX} {origin} failed: {error}; detail={error:?}"
+            ));
+        }
     }
 
     /// 1 件 upsert を依頼して完了を待つ。
@@ -174,8 +214,8 @@ impl FtsWriterDispatcher {
     }
 
     /// Submit a batch, but stop waiting when the owning worker is cancelled.
-    /// A submitted job may still complete; the next three-way scan reconciles
-    /// a partially observed Tantivy/SQLite boundary.
+    /// A submitted job may still complete. Errors are reported by the owner even after
+    /// cancellation abandons the reply; FS/SQLite scans do not prove Tantivy integrity.
     pub fn batch_cancellable(
         &self,
         upserts: Vec<IndexDoc>,
@@ -278,6 +318,14 @@ impl FtsWriterDispatcher {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_take_failure_notifications(&self) -> Vec<&'static str> {
+        self.reporter
+            .as_ref()
+            .map(|reporter| reporter.take_notifications())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_gate_next_batch(&self) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -315,7 +363,7 @@ impl FtsWriterDispatcher {
     }
 
     #[cfg(test)]
-    fn submit_test_mark(
+    pub(crate) fn submit_test_mark(
         &self,
         label: &'static str,
         completed: mpsc::Sender<&'static str>,
@@ -348,6 +396,7 @@ fn run_dispatcher(
     queue: Arc<(Mutex<Queue>, Condvar)>,
     mut writer: IndexWriter,
     fts: Arc<FtsIndex>,
+    reporter: Option<Arc<crate::fts_integrity::FailureReporter>>,
 ) {
     crate::logger::log(format!("{LOG_PREFIX} started"));
     loop {
@@ -368,14 +417,56 @@ fn run_dispatcher(
                 q = cv.wait(q).unwrap();
             }
         };
-        process_job(&mut writer, &fts, job);
+        process_job(&mut writer, &fts, job, reporter.as_deref());
     }
 }
 
-fn process_job(writer: &mut IndexWriter, fts: &FtsIndex, job: WriterJob) {
+fn observe<T>(
+    result: tantivy::Result<T>,
+    reporter: Option<&crate::fts_integrity::FailureReporter>,
+    context: &str,
+    phase: &str,
+) -> tantivy::Result<T> {
+    if let Err(error) = &result {
+        let origin = format!("{LOG_PREFIX} {context} phase={phase}");
+        if let Some(reporter) = reporter {
+            reporter.report(&origin, error);
+        } else {
+            crate::logger::log(format!("{origin} failed: {error}; detail={error:?}"));
+        }
+    }
+    result
+}
+
+fn commit_and_reload(
+    writer: &mut IndexWriter,
+    fts: &FtsIndex,
+    reload: bool,
+    reporter: Option<&crate::fts_integrity::FailureReporter>,
+    context: &str,
+) -> tantivy::Result<()> {
+    observe(writer.commit(), reporter, context, "commit")?;
+    if reload {
+        observe(reload_reader(fts), reporter, context, "reader_reload")?;
+    }
+    Ok(())
+}
+
+fn process_job(
+    writer: &mut IndexWriter,
+    fts: &FtsIndex,
+    job: WriterJob,
+    reporter: Option<&crate::fts_integrity::FailureReporter>,
+) {
     match job {
         WriterJob::Upsert { doc, reply } => {
-            let r = fts_index::upsert_doc(writer, fts.fields(), &doc);
+            let context = format!("job=upsert favorite={} batch=1", doc.favorite_id);
+            let r = observe(
+                fts_index::upsert_doc(writer, fts.fields(), &doc),
+                reporter,
+                &context,
+                "upsert",
+            );
             let _ = reply.send(r);
         }
         WriterJob::Delete { path, reply } => {
@@ -383,10 +474,7 @@ fn process_job(writer: &mut IndexWriter, fts: &FtsIndex, job: WriterJob) {
             let _ = reply.send(());
         }
         WriterJob::Commit { reload, reply } => {
-            let r = writer
-                .commit()
-                .map(|_| ())
-                .and_then(|()| if reload { reload_reader(fts) } else { Ok(()) });
+            let r = commit_and_reload(writer, fts, reload, reporter, "job=commit");
             let _ = reply.send(r);
         }
         WriterJob::PurgeFavorite { favorite_id, reply } => {
@@ -394,13 +482,12 @@ fn process_job(writer: &mut IndexWriter, fts: &FtsIndex, job: WriterJob) {
                 fts.fields().favorite_id,
                 &favorite_id.to_string(),
             ));
-            let result = writer
-                .commit()
-                .map(|_| ())
-                .and_then(|()| reload_reader(fts));
+            let context = format!("job=purge_favorite favorite={favorite_id}");
+            let result = commit_and_reload(writer, fts, true, reporter, &context);
             let _ = reply.send(result);
         }
         WriterJob::PurgePathRanges { ranges, reply } => {
+            let context = format!("job=purge_path_ranges ranges={}", ranges.len());
             let result = (|| {
                 for range in ranges {
                     let query = tantivy::query::RangeQuery::new(
@@ -413,10 +500,14 @@ fn process_job(writer: &mut IndexWriter, fts: &FtsIndex, job: WriterJob) {
                             &range.end,
                         )),
                     );
-                    writer.delete_query(Box::new(query))?;
+                    observe(
+                        writer.delete_query(Box::new(query)),
+                        reporter,
+                        &context,
+                        "delete_query",
+                    )?;
                 }
-                writer.commit()?;
-                reload_reader(fts)
+                commit_and_reload(writer, fts, true, reporter, &context)
             })();
             let _ = reply.send(result);
         }
@@ -434,6 +525,7 @@ fn process_job(writer: &mut IndexWriter, fts: &FtsIndex, job: WriterJob) {
                 deletes,
                 commit_after,
                 reload_after_commit,
+                reporter,
             );
             let _ = reply.send(r);
         }
@@ -466,18 +558,27 @@ fn process_batch(
     deletes: Vec<String>,
     commit_after: bool,
     reload_after_commit: bool,
+    reporter: Option<&crate::fts_integrity::FailureReporter>,
 ) -> tantivy::Result<()> {
+    let context = format!(
+        "job=batch upserts={} deletes={} favorite={:?}",
+        upserts.len(),
+        deletes.len(),
+        upserts.first().map(|doc| doc.favorite_id)
+    );
     for path in &deletes {
         fts_index::delete_doc(writer, fts.fields(), path);
     }
     for doc in &upserts {
-        fts_index::upsert_doc(writer, fts.fields(), doc)?;
+        observe(
+            fts_index::upsert_doc(writer, fts.fields(), doc),
+            reporter,
+            &context,
+            "upsert",
+        )?;
     }
     if commit_after {
-        writer.commit()?;
-        if reload_after_commit {
-            reload_reader(fts)?;
-        }
+        commit_and_reload(writer, fts, reload_after_commit, reporter, &context)?;
     }
     Ok(())
 }
@@ -504,6 +605,69 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
     use uuid::Uuid;
+
+    #[test]
+    fn every_publication_job_reports_once_even_when_reply_is_abandoned() {
+        let tmp = TempDir::new().unwrap();
+        let meta =
+            Arc::new(crate::fts_meta::FtsMetaDb::open_at(&tmp.path().join("meta.db")).unwrap());
+        let reporter = crate::fts_integrity::FailureReporter::new(meta.clone());
+        let fts = Arc::new(FtsIndex::open_at(&tmp.path().join("fts")).unwrap());
+        let dispatcher =
+            FtsWriterDispatcher::start_with_reporter(fts.writer().unwrap(), fts, reporter.clone());
+        dispatcher.test_set_reload_failure(true);
+        let ranges = crate::metadata_ownership::OwnedRange {
+            root: "c:/pictures".into(),
+            exclusions: Vec::new(),
+        }
+        .sql_ranges();
+        assert!(
+            dispatcher
+                .batch(
+                    Vec::new(),
+                    Vec::new(),
+                    true,
+                    true,
+                    WriterPriority::Background
+                )
+                .is_err()
+        );
+        assert_eq!(reporter.take_notifications().len(), 1);
+        assert!(
+            dispatcher
+                .purge_favorite(Uuid::new_v4(), WriterPriority::Background)
+                .is_err()
+        );
+        assert_eq!(reporter.take_notifications().len(), 1);
+        assert!(
+            dispatcher
+                .purge_path_ranges(ranges, WriterPriority::Background)
+                .is_err()
+        );
+        assert_eq!(reporter.take_notifications().len(), 1);
+        let (reply, abandoned) = mpsc::channel();
+        drop(abandoned);
+        dispatcher.submit(
+            WriterJob::Commit {
+                reload: true,
+                reply,
+            },
+            WriterPriority::Background,
+        );
+        let (completed, wait) = mpsc::channel();
+        dispatcher.submit_test_mark("finished", completed, WriterPriority::Background);
+        assert_eq!(
+            wait.recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap(),
+            "finished"
+        );
+        assert_eq!(reporter.take_notifications().len(), 1);
+        assert!(meta.tantivy_rebuild_pending().unwrap());
+        dispatcher.test_set_reload_failure(false);
+        dispatcher.commit(true, WriterPriority::Background).unwrap();
+        assert!(meta.tantivy_rebuild_pending().unwrap());
+        assert!(reporter.take_notifications().is_empty());
+    }
 
     fn setup() -> (TempDir, Arc<FtsIndex>, Arc<FtsWriterDispatcher>) {
         let tmp = TempDir::new().unwrap();

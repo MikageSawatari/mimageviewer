@@ -69,6 +69,7 @@ fn detached_binding_identity_pdf_load_poll_open_uses_published_window() {
     let main = app.projected_viewer_context_id();
     let generation = app.items_generation;
     app.with_active_viewer_context(|mounted| {
+        mounted.finish_page_identity_preparation_for_test();
         let meta = std::fs::metadata(&pdf).unwrap();
         let (tx, rx) = mpsc::channel();
         tx.send(Ok((0..2)
@@ -83,6 +84,7 @@ fn detached_binding_identity_pdf_load_poll_open_uses_published_window() {
         // deferred open, registry build/commit/mount and the real poll handler.
         mounted.pdf_enumerate_pending.as_mut().unwrap().2.rx = rx;
         mounted.poll_pdf_enumerate();
+        mounted.finish_page_identity_preparation_for_test();
         assert_eq!(mounted.fullscreen_idx, Some(0));
         assert_eq!(mounted.active_detached_window_id(), Some(window));
         assert_eq!(mounted.ensure_detached_viewer_window_id(), window);
@@ -112,6 +114,7 @@ fn detached_binding_identity_scanned_folder_opens_inside_build_with_reserved_win
     ));
     let window = app.active_detached_window_id().unwrap();
     app.with_active_viewer_context(|mounted| {
+        mounted.finish_page_identity_preparation_for_test();
         assert_eq!(mounted.fullscreen_idx, Some(0));
         assert_mounted_window(mounted, window);
     })
@@ -136,18 +139,24 @@ fn detached_binding_identity_zip_load_poll_open_uses_published_window() {
     let window = app.active_detached_window_id().unwrap();
     app.with_active_viewer_context(|mounted| {
         let (tx, rx) = mpsc::channel();
-        tx.send(Ok(crate::zip_loader::ZipEnumeration {
-            entries: vec![crate::zip_loader::ZipImageEntry {
-                entry_name: "page.jpg".into(),
-                uncompressed_size: 1,
-                mtime: 1,
-            }],
-            has_foreign_archives: false,
-            legacy_renames: Vec::new(),
-        }))
+        tx.send(Ok(crate::zip_loader::PreparedZipEnumeration::prepare(
+            zip.clone(),
+            crate::zip_loader::ZipEnumeration {
+                entries: vec![crate::zip_loader::ZipImageEntry {
+                    entry_name: "page.jpg".into(),
+                    uncompressed_size: 1,
+                    mtime: 1,
+                    container_ancestry: Vec::new(),
+                }],
+                has_foreign_archives: false,
+                legacy_renames: Vec::new(),
+            },
+            mounted.settings.file_type_visibility.clone(),
+        )))
         .unwrap();
         mounted.zip_enumerate_pending.as_mut().unwrap().rx = rx;
         mounted.poll_zip_enumerate();
+        mounted.finish_page_identity_preparation_for_test();
         assert_eq!(mounted.fullscreen_idx, Some(0));
         assert_mounted_window(mounted, window);
     })

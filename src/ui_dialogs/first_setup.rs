@@ -164,10 +164,7 @@ pub fn draw_first_setup_dialog(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use egui_kittest::{
-        Harness,
-        kittest::{NodeT, Queryable},
-    };
+    use egui_kittest::kittest::{NodeT, Queryable};
 
     #[test]
     fn first_setup_refits_after_viewport_shrinks() {
@@ -181,7 +178,7 @@ mod tests {
         for scale in [1.0, 2.0] {
             for max_passes in [1, 2] {
                 let mut fonts_ready = false;
-                let mut harness = Harness::builder()
+                let mut harness = crate::test_ui::builder()
                     .with_size(egui::vec2(1920.0, 1440.0))
                     .build_state(
                         move |ctx, state: &mut State| {
@@ -268,7 +265,7 @@ mod tests {
             egui::vec2(480.0, 360.0),
         ] {
             let mut fonts_ready = false;
-            let mut harness = Harness::builder().with_size(size).build_state(
+            let mut harness = crate::test_ui::builder().with_size(size).build_state(
                 move |ctx,
                       state: &mut (
                     crate::settings::Settings,

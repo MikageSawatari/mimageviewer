@@ -81,10 +81,11 @@ pub struct AdjustmentChange {
 /// 補正レイヤー 1 ページ分の変更記録。
 ///
 /// 空配列は「補正レイヤーなし」を表す。DB/sidecar への反映は
-/// `App::set_local_adjust_layers_for_idx` が担当する。
+/// `App::set_local_adjust_layers_for_target` が担当する。保存先は編集開始時の
+/// stable target で保持し、index の再利用で別ページへ付け替えない。
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocalAdjustmentChange {
-    pub idx: usize,
+    pub target: crate::app::PageAdjustmentTarget,
     pub before: local_adjust_core::LocalAdjustmentLayers,
     pub after: local_adjust_core::LocalAdjustmentLayers,
 }
@@ -123,6 +124,8 @@ pub struct TagChange {
 pub enum UndoEntry {
     Rating {
         changes: Vec<RatingChange>,
+        /// Stable viewer origin for Undo after a rating-induced move or grid return.
+        origin: Option<crate::rating_membership::RatingOrigin>,
         /// トースト表示用ラベル (例: "★3 を 5 件に付与")
         summary: String,
     },
@@ -239,6 +242,32 @@ impl UndoStack {
         self.redo.clear();
     }
 
+    /// Rating-induced navigation retains only rating history. Other entries may
+    /// carry page indices and must not cross the automatic landing/close.
+    pub fn retain_rating(&mut self) {
+        self.undo
+            .retain(|entry| matches!(entry, UndoEntry::Rating { .. }));
+        self.redo
+            .retain(|entry| matches!(entry, UndoEntry::Rating { .. }));
+    }
+
+    /// Manual selection wins over both later Undo and Redo in the same grid.
+    pub(crate) fn cancel_grid_rating_origins(&mut self, owner: u64, listing: &str) {
+        use crate::rating_membership::RatingOriginTarget;
+        for entry in self.undo.iter_mut().chain(self.redo.iter_mut()) {
+            if let UndoEntry::Rating {
+                origin: Some(origin),
+                ..
+            } = entry
+                && origin.owner == owner
+                && origin.listing_identity == listing
+                && matches!(origin.target, RatingOriginTarget::Grid(_))
+            {
+                origin.target = RatingOriginTarget::ValueOnly;
+            }
+        }
+    }
+
     /// 貼り付け / リセットで外部から置き換えたページについて、古い編集 Undo/Redo だけを
     /// 両スタックから除く。Rating / Tag、別ページ、Favorite / Global の補正履歴は残す。
     ///
@@ -267,7 +296,7 @@ impl UndoStack {
                     });
                 }
                 UndoEntry::LocalAdjustment { changes, .. } if local_adjustment => {
-                    changes.retain(|change| !page_indices.contains(&change.idx));
+                    changes.retain(|change| change.target.page_key != page_key);
                 }
                 _ => {}
             }
@@ -318,6 +347,16 @@ impl UndoStack {
 mod tests {
     use super::*;
 
+    fn page_target(page_key: &str, idx: usize) -> crate::app::PageAdjustmentTarget {
+        crate::app::PageAdjustmentTarget {
+            page_key: page_key.into(),
+            location_path: None,
+            sidecar_coords: None,
+            compiled_book: false,
+            idx_hint: crate::app::PageIndexHint::At(idx),
+        }
+    }
+
     fn rating_entry(path: &str, before: u8, after: u8) -> UndoEntry {
         UndoEntry::Rating {
             changes: vec![RatingChange {
@@ -329,6 +368,7 @@ mod tests {
                 after,
             }],
             summary: format!("★{after}"),
+            origin: None,
         }
     }
 
@@ -440,6 +480,7 @@ mod tests {
         s.push(UndoEntry::Rating {
             changes: vec![],
             summary: "noop".into(),
+            origin: None,
         });
         s.push(UndoEntry::Tag {
             changes: vec![],
@@ -499,6 +540,148 @@ mod tests {
     }
 
     #[test]
+    fn rating_grid_origin_cancellation_is_scoped_and_keeps_both_value_histories() {
+        use crate::rating_membership::{RatingOrigin, RatingOriginTarget};
+        let entry = |owner, listing: &str, target| {
+            let mut entry = rating_entry("c:/a.jpg", 3, 4);
+            let UndoEntry::Rating { origin, .. } = &mut entry else {
+                unreachable!()
+            };
+            *origin = Some(RatingOrigin {
+                owner,
+                listing_identity: listing.into(),
+                target,
+            });
+            entry
+        };
+        let grid = || RatingOriginTarget::Grid("a".into());
+        let viewer = RatingOriginTarget::Viewer {
+            key: "a".into(),
+            presentation: crate::app::ViewerPresentation::Fullscreen,
+        };
+        let mut stack = UndoStack::new();
+        stack.push(entry(17, "list", grid()));
+        stack.push(entry(18, "list", grid()));
+        stack.push(entry(17, "other", grid()));
+        stack.push(entry(17, "list", viewer.clone()));
+        stack.push(entry(17, "list", grid()));
+        let redo = stack.pop_undo().unwrap();
+        stack.push_redo(redo);
+        stack.cancel_grid_rating_origins(17, "list");
+        let targets = stack
+            .undo
+            .iter()
+            .chain(stack.redo.iter())
+            .map(|entry| {
+                let UndoEntry::Rating {
+                    origin: Some(origin),
+                    changes,
+                    ..
+                } = entry
+                else {
+                    unreachable!()
+                };
+                assert_eq!(changes[0].before, 3);
+                assert_eq!(changes[0].after, 4);
+                origin.target.clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            targets,
+            vec![
+                RatingOriginTarget::ValueOnly,
+                grid(),
+                grid(),
+                viewer,
+                RatingOriginTarget::ValueOnly
+            ]
+        );
+        assert_eq!(stack.undo_len(), 4);
+        assert_eq!(stack.redo_len(), 1);
+    }
+
+    #[test]
+    fn retain_rating_keeps_both_stack_orders_and_stable_origins() {
+        let origin = crate::rating_membership::RatingOrigin {
+            owner: 17,
+            listing_identity: "listing".into(),
+            target: crate::rating_membership::RatingOriginTarget::Viewer {
+                key: "origin-page".into(),
+                presentation: crate::app::ViewerPresentation::Fullscreen,
+            },
+        };
+        let mut with_origin = rating_entry("c:/a.jpg", 3, 4);
+        let UndoEntry::Rating { origin: stored, .. } = &mut with_origin else {
+            panic!("expected rating");
+        };
+        *stored = Some(origin.clone());
+        let non_rating = || {
+            vec![
+                tag_entry("c:/tag.jpg", vec!["a"], vec!["b"]),
+                adjust_entry(
+                    AdjustUndoScope::Page(2),
+                    None,
+                    Some(AdjustParams::default()),
+                ),
+                UndoEntry::LocalAdjustment {
+                    changes: vec![LocalAdjustmentChange {
+                        target: page_target("local-page", 2),
+                        before: local_adjust_core::LocalAdjustmentLayers::default(),
+                        after: local_adjust_core::LocalAdjustmentLayers::default(),
+                    }],
+                    summary: "local".into(),
+                },
+            ]
+        };
+        let mut s = UndoStack::new();
+        s.undo.push_back(with_origin.clone());
+        s.undo.extend(non_rating());
+        s.undo.push_back(rating_entry("c:/b.jpg", 1, 2));
+        s.redo.push_back(rating_entry("c:/c.jpg", 2, 3));
+        s.redo.extend(non_rating());
+        s.redo.push_back(with_origin);
+
+        s.retain_rating();
+
+        assert_eq!(s.undo_len(), 2);
+        assert_eq!(s.redo_len(), 2);
+        for (entry, expected_key, expected_origin) in [
+            (&s.undo[0], "c:/a.jpg", Some(&origin)),
+            (&s.undo[1], "c:/b.jpg", None),
+            (&s.redo[0], "c:/c.jpg", None),
+            (&s.redo[1], "c:/a.jpg", Some(&origin)),
+        ] {
+            let UndoEntry::Rating {
+                changes,
+                origin: stored,
+                ..
+            } = entry
+            else {
+                panic!("non-rating entry retained");
+            };
+            assert_eq!(changes[0].path_key, expected_key);
+            assert_eq!(stored.as_ref(), expected_origin);
+        }
+        s.retain_rating();
+        assert_eq!(s.undo_len(), 2);
+        assert_eq!(s.redo_len(), 2);
+    }
+
+    #[test]
+    fn retain_rating_drops_non_rating_only_stacks() {
+        let mut s = UndoStack::new();
+        s.undo.push_back(tag_entry("c:/tag.jpg", vec![], vec!["a"]));
+        s.redo.push_back(adjust_entry(
+            AdjustUndoScope::Page(0),
+            None,
+            Some(AdjustParams::default()),
+        ));
+        s.retain_rating();
+        assert!(!s.can_undo());
+        assert!(!s.can_redo());
+    }
+
+    #[test]
     fn edit_bundle_bulk_discard_keeps_metadata_and_other_page_changes() {
         let mut s = UndoStack::new();
         s.push(rating_entry("c:/rating.jpg", 0, 3));
@@ -539,7 +722,7 @@ mod tests {
         s.push(UndoEntry::LocalAdjustment {
             changes: vec![
                 LocalAdjustmentChange {
-                    idx: 7,
+                    target: page_target("remote-target", 7),
                     before: local_adjust_core::LocalAdjustmentLayers::default(),
                     after: local_adjust_core::LocalAdjustmentLayers::new(vec![
                         local_adjust_core::LocalAdjustmentLayer::new(
@@ -550,7 +733,8 @@ mod tests {
                     ]),
                 },
                 LocalAdjustmentChange {
-                    idx: 8,
+                    // A reused index cannot make another key part of the reset.
+                    target: page_target("other-local-page", 7),
                     before: local_adjust_core::LocalAdjustmentLayers::default(),
                     after: local_adjust_core::LocalAdjustmentLayers::new(vec![
                         local_adjust_core::LocalAdjustmentLayer::new(
@@ -581,7 +765,7 @@ mod tests {
         match &s.redo[0] {
             UndoEntry::LocalAdjustment { changes, .. } => {
                 assert_eq!(changes.len(), 1);
-                assert_eq!(changes[0].idx, 8);
+                assert_eq!(changes[0].target.page_key, "other-local-page");
             }
             _ => panic!("expected local adjustment"),
         }

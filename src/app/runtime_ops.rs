@@ -421,6 +421,9 @@ impl App {
         #[cfg(windows)]
         self.save_detached_video_resume_positions_for_exit();
         self.persist_window_state_and_flush(crate::app::PersistScope::ProcessIsStopping);
+        // Metadata cancellation has harvested its committed batch and the last normal
+        // resume has been enqueued. Only the outer process owner joins the shift FIFO.
+        self.transfer_spread_shift_exit_ownership();
         // Normal frames only enqueue latest-value journal snapshots. Exit is the one boundary
         // that waits for the writer so the next startup can recover every unfinished rename.
         if let Err(error) = self.flush_rename_migration_journal() {

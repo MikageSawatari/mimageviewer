@@ -128,7 +128,54 @@ pub fn get_video_thumbnail(
 
     #[cfg(windows)]
     {
-        get_video_thumbnail_win(path, shell_size)
+        get_video_thumbnail_win(path, shell_size, None)
+    }
+}
+
+/// The same Shell representative with a caller-specific raster allocation budget.
+pub(crate) fn get_video_thumbnail_bounded(
+    path: &Path,
+    shell_size: i32,
+    max_alloc: u64,
+) -> (Option<egui::ColorImage>, VideoThumbDiag) {
+    #[cfg(windows)]
+    {
+        get_video_thumbnail_win(path, shell_size, Some(max_alloc))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = max_alloc;
+        get_video_thumbnail(path, shell_size)
+    }
+}
+
+fn bitmap_buffer_len(width: i32, height: i32, max_alloc: Option<u64>) -> Option<usize> {
+    let width = usize::try_from(width).ok()?;
+    let height = usize::try_from(height.checked_abs()?).ok()?;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let len = width.checked_mul(height)?.checked_mul(4)?;
+    if max_alloc.is_some_and(|budget| len as u64 > budget) {
+        None
+    } else {
+        Some(len)
+    }
+}
+
+#[cfg(test)]
+mod bounded_bitmap_tests {
+    #[test]
+    fn shell_bitmap_budget_is_checked_before_allocation() {
+        use super::bitmap_buffer_len as len;
+        assert_eq!(
+            len(1024, -1024, Some(4 * 1024 * 1024)),
+            Some(4 * 1024 * 1024)
+        );
+        assert_eq!(len(1025, 1024, Some(4 * 1024 * 1024)), None);
+        assert_eq!(len(i32::MAX, i32::MAX, Some(160 * 1024 * 1024)), None);
+        assert_eq!(len(1, i32::MIN, None), None);
+        assert_eq!(len(0, 1, None), None);
     }
 }
 
@@ -136,6 +183,7 @@ pub fn get_video_thumbnail(
 fn get_video_thumbnail_win(
     path: &Path,
     shell_size: i32,
+    max_alloc: Option<u64>,
 ) -> (Option<egui::ColorImage>, VideoThumbDiag) {
     use windows::Win32::Foundation::SIZE;
     use windows::Win32::Graphics::Gdi::{
@@ -229,6 +277,12 @@ fn get_video_thumbnail_win(
             diag.fail_stage = Some(VideoThumbFailStage::InvalidBitmap);
             return (None, diag);
         }
+        let Some(buffer_len) = bitmap_buffer_len(bm.bmWidth, bm.bmHeight, max_alloc) else {
+            let _ = DeleteObject(hbmp.into());
+            diag.dims = Some((bm.bmWidth, bm.bmHeight));
+            diag.fail_stage = Some(VideoThumbFailStage::InvalidBitmap);
+            return (None, diag);
+        };
         let width = bm.bmWidth;
         let height = bm.bmHeight.unsigned_abs() as i32;
         diag.dims = Some((width, height));
@@ -249,7 +303,7 @@ fn get_video_thumbnail_win(
             ..Default::default()
         };
 
-        let mut pixels = vec![0u8; (width * height * 4) as usize];
+        let mut pixels = vec![0u8; buffer_len];
         let rows = GetDIBits(
             mem_dc,
             hbmp,

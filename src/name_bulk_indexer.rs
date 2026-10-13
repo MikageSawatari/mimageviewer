@@ -229,10 +229,7 @@ where
             Ok(false) => {}
             Err(e) => {
                 had_error = true;
-                crate::logger::log(format!(
-                    "name_bulk_indexer: upsert_children failed for {}: {e}",
-                    folder.display()
-                ));
+                db.report_write_failure("Full upsert_children_if_changed", &folder, &e);
             }
         }
     }
@@ -256,10 +253,7 @@ where
             )),
             Err(e) => {
                 summary.had_error = true;
-                crate::logger::log(format!(
-                    "name_bulk_indexer: prune_stale_for_favorite failed for {}: {e}",
-                    fav_path.display()
-                ));
+                db.report_write_failure("Full prune_stale_for_favorite", fav_path, &e);
             }
         }
     } else if summary.had_error {
@@ -666,6 +660,8 @@ mod tests {
         let cancel = AtomicBool::new(true); // 最初から立てておく
         let summary = run_bulk_name_index(&root, &db, None, &[], &cancel, None);
         assert!(summary.cancelled);
+        assert!(db.take_failure_notifications().is_empty());
+        assert!(!db.name_rebuild_pending_for_test());
     }
 
     #[test]
@@ -690,6 +686,8 @@ mod tests {
         assert!(!second.had_error);
         assert_eq!(reads.len(), 3);
         assert!(reads.values().all(|count| *count == 1));
+        assert!(db.take_failure_notifications().is_empty());
+        assert!(!db.name_rebuild_pending_for_test());
         assert_eq!(db.count_for_favorite(&root).unwrap(), 3);
     }
 
@@ -784,6 +782,8 @@ mod tests {
             assert!(summary.had_error);
             assert_eq!(summary.folders_written, 0);
             assert_eq!(db.count_for_favorite(&root).unwrap(), 2);
+            assert!(db.take_failure_notifications().is_empty());
+            assert!(!db.name_rebuild_pending_for_test());
         }
     }
 
@@ -802,6 +802,8 @@ mod tests {
                 std::fs::read_dir(path)
             });
         assert!(summary.cancelled);
+        assert!(db.take_failure_notifications().is_empty());
+        assert!(!db.name_rebuild_pending_for_test());
         assert_eq!(summary.folders_written, 0);
         assert_eq!(db.count_for_favorite(&root).unwrap(), 1);
     }
@@ -876,5 +878,7 @@ mod tests {
         assert!(summary.had_error);
         assert!(!summary.cancelled);
         assert!(db.count_for_favorite(&root).unwrap() >= 66);
+        assert!(db.take_failure_notifications().is_empty());
+        assert!(!db.name_rebuild_pending_for_test());
     }
 }

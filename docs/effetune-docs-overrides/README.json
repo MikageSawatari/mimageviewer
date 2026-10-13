@@ -2,8 +2,8 @@
   {
     "operation": "replace_paragraph",
     "anchor": "PCではヘッダー、モバイルでは **プレーヤー** タブ、デスクトップアプリでは **表示** メニューから **Visualizer** を開きます。組み込みプリセットを選ぶか **Edit** で音声グラフ、ジャケット画像、曲情報を配置できます。変更はすぐに反映され、次回起動時にも復元されます。名前を付けて残すにはプリセットダイアログで保存します。詳しくは[Visualizerガイド](visualizer.md)をご覧ください。",
-    "replacement": "EffeTune 画面のヘッダーにある **Visualizer** ボタンで開きます。組み込みプリセットを選ぶか **Edit** で音声グラフなどを配置できます。変更はすぐに反映され、次回起動時にも復元されます。名前を付けて残すにはプリセットダイアログで保存します。詳しくは[Visualizerガイド](visualizer.md)をご覧ください。",
-    "reason": "Bundled visualizerButton; standalone menus/player and track metadata absent (visualizer.json)."
+    "replacement": "EffeTune 画面のヘッダーにある **Visualizer** ボタンで開きます。組み込みプリセットを選ぶか **Edit** で音声グラフ、代表画像、曲情報を配置できます。音響調整を使用中はmImageViewerが再生中の情報を自動で渡します。変更はすぐに反映され、次回起動時にも復元されます。名前を付けて残すにはプリセットダイアログで保存します。詳しくは[Visualizerガイド](visualizer.md)をご覧ください。",
+    "reason": "Bundled visualizerButton and mIV Now Playing metadata; standalone menus/player absent."
   },
   {
     "operation": "replace_html",

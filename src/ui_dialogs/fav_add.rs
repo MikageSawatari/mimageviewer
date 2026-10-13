@@ -132,6 +132,7 @@ impl App {
         if apply {
             self.fav_add_error = None;
             if let Some(target) = self.fav_add_target.clone() {
+                let target = crate::path_key::normalize_input_path(&target);
                 let name = self.fav_add_name_input.trim().to_string();
                 match self.settings.try_add_favorite(name, target.clone()) {
                     Ok(()) => {

@@ -129,31 +129,37 @@ detached viewer (F12 別ウィンドウ / 複数ウィンドウ) は構造リワ
   扱う組み合わせが大きく減った。また設定変更時に表示中の一覧を EPUB 専用に作り直す処理が
   直すたびに別の問題を出し、既存の RAR 設定と同じ経路に揃えて解消した。
 
-### まれな失敗への対処で設計が複雑になるときは、雑に扱ってよいか利用者に相談する (2026-10-02 利用者指示)
+### まれな失敗は既定で割り切る (2026-10-02 利用者指示、2026-10-10 既定化)
 
-ディスク書き込み失敗・DB の異常・処理途中の強制終了など、**通常の使い方ではまず起きない失敗**に
-きちんと対処しようとして、再試行・途中状態の保持・失敗の種類分け・回復手順などの仕組みが
-増えそうなときは、その仕組みを作る前に利用者へ相談する。利用者は、こうしたケースを
-「再起動してください」「次回起動時に作り直します」「その操作はやり直してください」のような
-**運用上の割り切り**で扱うことを多くの場合望む。個人開発では、まれな失敗を実機で再現して
-確かめること自体が難しく、検証できない回復処理はかえって不具合の元になる。
+ディスク書き込み失敗・ディスクフル・DB の異常・処理途中の mIV 強制終了など、**通常の使い方では
+まず起きない失敗**は、**利用者に相談せず既定で割り切る**。再試行・途中状態の保持・失敗の
+種類分け・多段の回復手順・完了待ちのための待機などの仕組みを、設計にも実装にも足さない。
+利用者は「再起動してください」「次回起動時に作り直します」「その操作はやり直してください」の
+ような**運用上の割り切り**を望んでいる。個人開発では、まれな失敗を実機で再現して確かめること
+自体が難しく、検証できない回復処理はかえって不具合の元になる。
 
-- 相談のしかた: 起きる条件 (どの操作・どの失敗で)、どれくらいまれか、割り切った場合に
-  利用者から何が見えるか (検索結果が古い・再起動で直る 等)、きちんと扱う場合に増える仕組み、を
-  短く並べる。割り切り案を推奨として示してよい。
-- 割り切るときも、**黙って壊れたままにしない**。最低限、ログと利用者への通知、可能なら
+- 割り切り方: **黙って壊れたままにしない**。最低限、ログと利用者への通知を出し、可能なら
   「次回起動で作り直す」印のような単純な復旧の入口を 1 つ置く。索引・キャッシュなど作り直せる
-  データでは、作り直しを復旧手段にするのが基本。利用者が作ったデータ (設定・タグ・
-  コレクション等) が失われる場合は割り切らず、相談の段階でそのことを明示する。
-- **「例外への対処の中の例外」に入り始めたら止まる**。回復処理そのものが失敗した場合の対処、
-  その対処が終了をまたいだ場合の対処…と段が重なり出したら、それ以上設計を足さず相談する。
-- 独立レビュー・実装担当から「まれな失敗の組み合わせ」の指摘が続くときも同じ。指摘を
-  1 件ずつ仕組みで塞ぐ前に、割り切りで閉じられないかを利用者に確認する。
+  データでは、作り直しを復旧手段にするのが基本。保存済みのデータを失敗を理由に勝手に消したり
+  作り直したりしない (読めないなら原本を残して、その機能の書き込みを止める)。
+- **相談するのは次の 2 つだけ**:
+  1. 利用者が作ったデータ (設定・タグ・コレクション・本の構成・しおり等) が**失われる・壊れる**
+     場合。割り切り案で何が失われるかを明示して判断をもらう。
+  2. まれな失敗ではなく、**通常の操作でも起こり得る**場合 (例: 保存完了前に閉じてすぐ開き直す、
+     連続操作の順序)。これは割り切りの対象外で、構造で正しく扱う。「まれ」の判定に迷ったら相談する。
+- 設計書・実装 brief・レビュー依頼にこの方針を書く。設計書には「まれな失敗は割り切り
+  (ログ + 通知 [+ 作り直し])」と 1 行で書けばよく、失敗ごとの回復設計や利用者向けの質問は作らない。
+- **独立レビュー・実装担当の「まれな失敗の組み合わせ」の指摘は、仕組みで塞がない**。上の割り切りで
+  閉じ、指摘への回答に「既定の割り切り方針による」と書く。指摘が上の相談対象 1・2 に当たる場合だけ、
+  構造で直すか利用者に相談する。
+- **「例外への対処の中の例外」は作らない**。回復処理そのものが失敗した場合の対処、その対処が
+  終了をまたいだ場合の対処…という段の重なりは、方針違反として設計から外す。
 - 経緯: 2026-10-02、起動時索引スキャン軽減の設計で、お気に入りの構成変更中の書き込み失敗に
   対して、設計レビューの指摘を受けるたびに「書き込みを済ませて止める停止」「失敗の種類分け」
   「自動再試行 (5 秒・30 秒・5 分)」「削除前の無効化」を足し、さらに再試行中の失敗が終了を
   またぐ場合…と質問が続いた。利用者の判断で「失敗したら次回起動時に索引を作り直す + 通知」に
-  割り切り、これらをすべて外した。
+  割り切り、これらをすべて外した。2026-10-10、§1.364 の設計でも同種の質問を毎回出していたため、
+  利用者の指示で「毎回相談する」から「既定で割り切る」に改めた。
 
 ## 通常の使い方が不便になる変更は、着手前に利用者へ相談する
 
@@ -520,6 +526,14 @@ C:\home\mimageviewer_vendor_backup\
   ScrollArea 内へ戻すと、縦スクロールバーが × ボタンに重なる退行を起こす。
 - パネルが下端近くまで伸びる場合、クリック吸収 sink とキャンバス入力抑制 rect も
   同じ高さから動的に作る。固定 1000px は 1440p / 4K / 縦長ウィンドウで不足する。
+- 高さを行数などの計算で決めるなら、item_spacing・separator・padding・Frame の margin を
+  計算に含めるか、該当する間隔を 0 にする。`show_rows` は行間を内部で足すので、行高に
+  含めて二重に数えない。行内を `scope_builder` で描くと親カーソルが子の自然高へ戻るので、
+  仮想行の高さと実際の行の位置がずれないか確かめる。
+- 収まる画面ではスクロールバーが出ないこと、高さ不足では末尾まで届くことを
+  `tests/support/scroll_layout.rs` の共通 helper で検査する。snapshot は見た目の記録であり、
+  スクロールの要否の検査にはならない。監査と残件は
+  [docs/calculated-panel-height-audit.md](docs/calculated-panel-height-audit.md)。
 
 ### IME 対応 (日本語入力) ⚠️ 重要
 TextEdit を含むダイアログで Enter / Escape を拾うときは **必ず専用ヘルパーを使う**こと。
@@ -596,7 +610,7 @@ egui::Window::new("...").show(ctx, |ui| {
   次 = 最初の子 → 次の兄弟 → 祖先の次の兄弟（再帰）。
   前 = 前の兄弟の最後の子孫 → 親。
 - **BS key**: 親フォルダへ。
-- **Path comparison**: Windows の大文字小文字非区別に対応するため小文字化して比較。
+- **Path comparison**: `folder_tree::path_eq` は `path_key::eq_keep_drive` の再公開。ドライブを保持し、大文字小文字と `/`・`\` の表記差を無視する。受理する実パスは I/O なしの `path_key::normalize_input_path` で Windows 標準表記へ揃える。保存キーの規則は変えない。入口と例外は [docs/virtual-folders.md](docs/virtual-folders.md) の「実パスの比較と入力表記」を参照。
 - **AppleDouble 除外**: macOS/iPhone 由来の `._*` ファイルを自動除外。
 
 ### セキュリティ
@@ -617,21 +631,22 @@ egui::Window::new("...").show(ctx, |ui| {
 - 実例: `src/pdf_loader.rs` の `PdfWorkerPool` / `JobQueue` / `run_dispatcher`
 - `try_lock` 自体は「取れなければ今回は諦める」best-effort 用途のみ OK
 
-### PDF レンダ pool の context epoch (2026-05)
+### PDF レンダ pool の viewer-context epoch (2026-10-12、未リリース)
 
-`PdfWorkerPool` は **3 段階優先度** (`Critical / HighNormal / Normal`) + **context epoch**
-で管理されている。UI ナビゲーション (フォルダ移動 / Ctrl+G) で
-`pdf_loader::bump_render_context_epoch()` が呼ばれると、それ以前に enqueue された
-HighNormal/Normal ジョブが pool 内で stale 化 → bump 時の一括 prune + dispatcher pop 時の
-個別 stale 判定で skip される。これで PDF 多数フォルダを Ctrl+↑↓ で高速にめくっても、
-旧 PDF のページレンダリングが queue に溜まって新 PDF の cover を遅らせる事象を防ぐ。
+`PdfWorkerPool` は **3 段階優先度** (`Critical / HighNormal / Normal`) を維持し、
+PDF render失効はviewerごとの非Clone `PdfRenderEpochOwner` が所有する。
+App投影/bundleとwriterを移譲し、一覧採用で自身だけadvance、retire/dropで自身だけ終端する。
+UIはatomic publish＋容量1の非blocking wakeだけ。pool内の一つのmaintenance workerが
+HighNormal/Normalをpruneし、dispatcher popも各job ticketのstaleを検査する。
+同じPDF/pageを読む兄弟contextのjobsを失効させない。
 
-- `LoadRequest.context_epoch` を **UI スレッドの enqueue 時点で** 焼き付ける (TOCTOU 防止、
-  worker から `current_render_context_epoch()` を呼ばない)
-- `context_epoch=0` は background / Critical 用 sentinel (= プルーン対象外)
+- `LoadRequest.pdf_render_validity` のViewer ticketを **UI enqueue時点で** 捕捉し、派生要求は
+  immutable ticketをcloneする。workerはfresh化しない。
+- fullscreen本体/background/Remote/Similar/enumerateは明示 `Unscoped`（旧epoch=0）。
 - background 経路 (CatchupQueue / NeighborPrefetch / build_and_save_one_pdf / cache creator /
-  `get_document_info` / `enumerate_pages_with_cancel`) は全て epoch=0
-- 詳細: [docs/pdf-pool-context-epoch-plan.md](docs/pdf-pool-context-epoch-plan.md)
+  `get_document_info` / `enumerate_pages_with_cancel`) は全てUnscoped。
+- 詳細: [docs/pdf-render-epoch-ownership-plan.md](docs/pdf-render-epoch-ownership-plan.md)。
+  旧global整数epoch導入計画は履歴として残す。
 
 ### PDF レンダ pool の HarvestOnCancel (2026-05)
 
@@ -656,9 +671,10 @@ perf イベント: `pool_cancel_harvest_wait` (待ち開始時) / `pdf_thumb_cac
 `reload_queue` は毎フレーム re-tag されるが、**既に pdf_pool.normal に積まれたものは
 priority=False のまま居座る**。可視範囲到達後も Normal lane で処理されて 3 秒以上待たされる。
 
-対策: `pdf_loader::promote_to_high_normal(visible_keys)` を毎フレーム呼び、現可視 PDF の
-perf_key と match するジョブを Normal → HighNormal lane に移す。dedup は
-`last_promoted_visible_keys` で行い、lock 取得を最小化。
+対策: `pdf_loader::promote_to_high_normal(visible_keys, viewer_target)` がowner/要求世代/perf_keyを
+照合してNormal→HighNormalへ移す。dedup/retryはbundle-owned `PdfVisiblePromotionState` に集約する。
+兄弟の同keyをfoundと数えず、遅着した対象要求は既存frame再評価で昇格する。
+fullscreenの昇格targetはUnscoped固定で、Viewer seek thumbnailはその対象に含めない。
 
 新 perf イベント:
 - `ui/scroll_settle`: スクロール停止 (300ms) 検出。pool snapshot + target_count + already_loaded
@@ -1026,7 +1042,7 @@ rustc 経由の link.exe で機能しない (Delay Import Directory が空のま
 │   ├── mimageviewer-core.exe   (本体、ffmpeg-the-third を import library リンク)
 │   ├── mimageviewer-remote.exe (本体と remote-ipc protocol version を共有、Web UI 資産も内包)
 │   ├── mimageviewer-epub-pdf.exe (EPUB → PDF 変換器)
-│   ├── effetune/EffeTune Mixwright.vst3/ (全424ファイル、v0.12.0。入力は別の VERSION と計425ファイル)
+│   ├── effetune/EffeTune Mixwright.vst3/ (全448ファイル、v0.13.0。入力は別の VERSION と計449ファイル)
 │   ├── app-local VC runtime 4 DLL (Microsoft 署名を保持)
 │   ├── avcodec-61.dll
 │   ├── avformat-61.dll
@@ -1240,10 +1256,15 @@ Windows SDK hosting moduleのMIT原文を `crates/vst3-host/src/sdk/` に保持�
 UNC namespace markerは大小文字を区別しない。host内FS検査は拡張形式を維持する。
 `GetModuleFileNameW`が保持する `\\?\` とpluginが付加する `/` の組合せによるEffeTune missing-assetsを避ける。
 2026-10-02 R2ではhost PE内の `MIV_VST3_HOST_SOURCE_SHA256:` markerを、CMakeLists／include／src／testsの
-現ソースhashと照合する。APPDATA等から旧hostをimportするfallbackはない。
+現ソースhashと照合する。2026-10-12の音響調整窓対応では `src/*.rc`、baseの `assets/icon.ico`、
+専用 `assets/effetune.ico`、再生成用 `scripts/generate-effetune-icon.py` も対象に含める。
+APPDATA等から旧hostをimportするfallbackはない。
 identityは `scripts/vst3-host-identity.ps1` に計算を一本化し、CMakeも同scriptの
-`-HashSourceRoot` を使う。対象ファイルのCRLFだけをbyte単位でLFへ正規化し、他のbyteは保持する。
-ordinal順のslash相対名と各正規化SHA256を `name:hash\n` としてUTF-8/BOMなしで連結しSHA256化する。
+`-HashSourceRoot` を使う。text対象のCRLFだけをbyte単位でLFへ正規化し、他のbyteは保持する。
+二つのiconはbinaryのままraw SHA256を取り、host source rootからの相対名を使う。
+generatorは他のtextと同じLF正規化で検証する。`python scripts/generate-effetune-icon.py --check` で
+追跡ICOが再生成結果と一致することを確認できる（Pillowが必要、取得をbuildで行わない）。
+ordinal順のslash相対名と各SHA256を `name:hash\n` としてUTF-8/BOMなしで連結しSHA256化する。
 Gitの改行変換によるLF／CRLF checkout差を無視するが、未コミットのソース変更は検知する。
 SDK欠落時や `-SkipVst3Bridge` は現ソースと一致するvendor hostのみ再利用可能。不一致／欠落は復旧案内付きで停止する。
 build-release／build-distの署名前・core埋込前と、非portable coreのbare cargo release buildにも同じgateを通す。
@@ -1265,7 +1286,7 @@ cmake --build crates/vst3-host/build --config Release
 - 前提:
   - Visual Studio 2026 (18) BuildTools (MSVC C++ デスクトップ開発ワークロード)
   - CMake 3.20+
-  - 一度ビルドしたら、C++ ソースを変更しない限り再ビルド不要
+  - 一度ビルドしたら、identity対象のソース・RC・共有iconを変更しない限り再ビルド不要
 - CMakeは `vendor/vcrt/` の公式 `vcruntime140.dll` / `vcruntime140_1.dll` /
   `msvcp140.dll` / `msvcp140_1.dll` を `vendor/vst3-host/vcrt/` へcopy-if-differentで配置する。
   hostが再リンク不要でも配置targetは実行される。正本が欠けた場合は復旧案内付きでbuildを停止する。
@@ -1722,8 +1743,8 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
   保存済みセクション順は維持し、描画対象だけを除外する。通常版のbundle欠落は表示で隠さない。
   設計・保守方針 (CI guard 等) は [docs/portable-build-plan.md](docs/portable-build-plan.md)。
   `portable` feature の cfg 分岐は `.git/hooks/pre-push` の `cargo check --features portable` が番人。
-- **EffeTune 配布境界**: 単体exe版／インストーラ版は承認済み v0.12.0 の VERSION と全424ファイルを
-  `third_party/effetune-mixwright/v0.12.0/manifest.sha256` に固定し、署名前とlauncher build時に欠落・追加・
+- **EffeTune 配布境界**: 単体exe版／インストーラ版は承認済み v0.13.0 の VERSION と全448ファイルを
+  `third_party/effetune-mixwright/v0.13.0/manifest.sha256` に固定し、署名前とlauncher build時に欠落・追加・
   改変を拒否する。署名stageは固定target配下だけ許可し、PEのchecksum／証明書以外は原本と同一、
   指定発行元の有効署名があることも検証する。未署名の開発buildはraw原本の完全一致が必要。
   launcherは `runtime/<version>/effetune/<hash12>-<generation>/EffeTune Mixwright.vst3/` に
@@ -1744,7 +1765,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
   音響調整ボタンで既存load workerから再確認し、拒否世代とは別の公開済み世代だけ採用する。
   成功時も選択したgenerationをenvで渡し、coreはそのpathを一度解決して固定する。
   メタデータを保持した内容改変は既存asset shortcutと同様に検出範囲外。
-  通知原文とmanifestは `third_party/effetune-mixwright/v0.12.0/` に追跡し、`.gitattributes -text`で
+  通知原文とmanifestは `third_party/effetune-mixwright/v0.13.0/` に追跡し、`.gitattributes -text`で
   checkout時の改行変換を防ぐ。
 - **CRT 境界**: `.cargo/config.toml` で mIV 自身の x86_64 exe と Susie ワーカー (i686) は
   `+crt-static` を維持する。一方、Microsoft build の ONNX Runtime は動的 VC runtime を import
@@ -1786,6 +1807,24 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 実例 (2026-08): v3.0.0 のリモート閲覧追加時、`privacy.html` は正しく更新されたが製品ページの
 安心セクションが取り残され、「通信するのは 2 つだけ」「画像は外部に送信されません」が
 事実として誤りのまま 8 日間公開されていた。
+
+### 製品ページのカードは短く保つ (2026-10-11 利用者指示)
+
+製品ページ (`htdocs/mimageviewer/index.html`) の横に並ぶカード (`feature-card` / `trust-item` /
+`usecase-card` / `migration-card`) は、**見出し 1 つ + 本文 1 段落、本文は 150 字まで**
+(タグを除き空白を詰めた文字数)。1 枚が長いと同じ行の全カードが引き伸ばされ、ページの見た目が崩れる。
+
+- 機能を足したときに、カードへ説明を書き足さない。詳細はマニュアルの該当ページ、通信や保存場所は
+  `privacy.html` に書き、カードからはリンクする。カードを書き換えるのは、カードの主張そのもの
+  (「〜はありません」など) が変わるときだけ。
+- 書き換えるときは「足す」ではなく「置き換える」。上限を超えるなら、既存の文を削って収める。
+- 全称・否定の表現 (「〜だけ」「〜はありません」) は短くしても正しいままか確かめる
+  (下の「通信・データ保存に関わる機能を追加したときは 2 か所を突き合わせる」)。
+- 検査: `python scripts/check_site_cards.py` (違反があれば exit 1)。製品ページを変えたコミットの前と、
+  リリース手順 Phase 1 の手順 6 で必ず回す。上限を変えるときは、この節とスクリプトの `MAX_CHARS` を揃える。
+- 経緯: 2026-10-11、「安心して使えます」のカードに機能追加のたびに保存場所・通信の詳細が書き足され、
+  1 枚が数段落に伸びてページが大きく崩れているのを利用者が公開中のサイトで見つけた。機能紹介のカードも
+  7 枚が 170〜250 字に伸びていた。
 
 ### マニュアル・製品ページの記述方針
 
@@ -1945,7 +1984,8 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
    操作・既定の変更が無いリリースでは追記不要。追記したら
    `cargo test --lib version_highlights::` でテーブルがパースできることを確認。
 6. `htdocs/` 以下 — 新機能がマニュアル・製品ページに反映されていることを確認
-   - マニュアル左サイドバーを持つ通常ページ 31 ページでリンク一覧が揃っているか
+   - 製品ページのカードの長さを `python scripts/check_site_cards.py` で検査する (「製品ページのカードは短く保つ」)。
+   - マニュアル左サイドバーを持つ通常ページ 32 ページでリンク一覧が揃っているか
      `htdocs/mimageviewer/manual/` 配下で一括確認:
      ```bash
      cd htdocs/mimageviewer/manual && for f in *.html; do
@@ -1955,7 +1995,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
          | grep -E 'href="[a-z-]+\.html"' | wc -l
      done
      ```
-     各ページが 31 以外 (= いずれかのページ名リンクが抜けている) なら同期を合わせる。
+     各ページが 32 以外 (= いずれかのページ名リンクが抜けている) なら同期を合わせる。
      ページを増減したらこの数も更新する (数そのものより、**全ページが同じ数で揃っている**ことが要件)。
      `tut-*.html` など `sidebar-section` を持たないチュートリアルページは別レイアウトなので対象外。
      新規の通常ページを追加した際はサイドバーを持つ全ページを更新すること
@@ -2046,7 +2086,39 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
      `python scripts/check_bench_regression.py vendor/bench_baseline.json run1.json run2.json run3.json`。
      **ノイズと判断した場合に `--save` で baseline を上書きしない** (`--save` は 1 ファイルだけ受け付ける)。
 
-9.6. **perf smoke** (UI 周り / I/O 経路に変更を入れたリリースで実施):
+9.6. **perf smoke** (正規手順は idle 5ケースと合わせた ReleaseChecks suite。毎リリース実施):
+   利用者が repository root の PowerShell で実行する:
+   ```powershell
+   .\scripts\ui-smoke.ps1 -Scenario ReleaseChecks -InteractiveApproved
+   ```
+   - 診断portableのbuild、生成fixture／隔離dataのseed、5 idle、cached／uncached perf、通常終了・
+     証跡保存・解析まで逐次実行する。**9.7も同じ1回のsuiteで確認し、重複実行しない**。
+     FFmpeg CLI (`ffmpeg.exe`) がPATHに必要。初回buildは別に約7.5分かかった実績があり、
+     suiteはseed込み約5〜8分を見込む。AI追加は別途準備・実行時間を見積もる。
+   - **開始前に他アプリの窓を最小化し、build待ちを含め終了までPCに触れない**。
+     exact rootのforeground取得、runner所有窓への背面移行、測定中の状態を検証する。
+     foreground不成立時は記録を残して停止し、環境を整えた別runでやり直す。自動retryはしない。
+   - 同一ソースの診断artifactが検証できる場合だけ上記に `-SkipBuild` を追加できる。
+     buildを先に済ませる場合は `prepare-portable-smoke.ps1 -TestScript` を使う（起動しない）。
+     stale artifactの利用や設定保護の省略を認めるフラグではない。
+   - 結果は `target/ui-smoke/runs/<run-id>/summary.json` と `release-record.md`。
+     全必須caseの証跡と終了codeを確認する。0=PASS／PASS_WITH_WARNINGS、1=FAIL、2=SKIPPED／環境不成立。
+     警告はリリース記録に残し、FAIL／SKIPPEDをPASSに読み替えない。
+     `known-startup-first-frame` は測定操作前のstartup-overlay frame 1→2 gapだけ、上限500ms。
+     gap時間は別記され、超過や通常操作中の未知100ms超はFAIL。段別内訳不足も環境注記に残す。
+   - cached／uncachedで256個の異なるfolder-load、Ctrl+Down x5、Ctrl+G固定検索を検証する。
+     drawnは直前tailが厳密に `request_repaint` のgapだけ、暫定n≥200／<16ms比率97%はWARN目標、
+     raw `pre_grid.total_ms` p95≤0.3msは必須。通常sleepをhitchとして集計しない。
+   - AI／GPU経路変更版では同じ入口に `-IncludeFirstAi` を明示追加する。
+     UI／I/O経路変更版では普段のフォルダの短い手動確認も別に残す。生成fixtureの成功を
+     実データ・配布版の厳密性能・native入力／IMEの確認へ読み替えない。
+   - 採用は実行了承ではない。エージェント実行は [実行確認](docs/interactive-release-verification.md)
+     に従い対象・所要時間・desktop入力・使い捨てdata・AI有無への明示了承後だけ行う。
+     `-InteractiveApproved` は了承済みの実行assertion。normal-profile起動禁止と
+     本書「検証起動時の設定データ保護」は維持し、利用者の通常設定をseedにコピーしない。
+     full gate／buildへ自動連結しない。詳細・採用証跡は [自動化計画](docs/release-check-automation-plan.md)。
+
+   **手動fallback／診断** (利用者が通常releaseを起動。UI／I/O変更版の実データ確認にも使う):
    ```powershell
    .\scripts\perf_smoke.ps1
    ```
@@ -2056,9 +2128,11 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
      操作の合間の sleep がすべて「ヒッチ」として数えられる (実測: 通常操作 55 秒で 108 件、
      最大 16 秒)。判定は**大きいギャップ 1 件ずつ、直前の `ui.tail_repaint.action`** を見る:
      - `none` = repaint を要求していない (= 入力待ちで就寝) → **正常**
-     - `request_repaint_after_idle_upgrade` 等の遅延 wake → **正常** (予定どおりの起床)
+     - `request_repaint_after_idle_upgrade` の遅延 wake → 予定遅延との一致を確認した場合は**正常**
      - 上記以外で 100ms を超える → UI スレッド同期 I/O 退行の疑い
        (docs/ui-responsiveness.md §4)
+   - 遅いupdate自体はtail=`none`でも検査する。既知startup gapを認める場合も、
+     自動化計画§5と同じ証跡・frame 1→2・測定操作前・500ms上限を確認し、時間を別記する。
    - ⚠️ **「16ms 未満が 97% 以上」を全フレームで測らない。** この比率は**正しい就寝を
      ヒッチとして数える**ので、短い / 暇なセッションほど悪く出る。実際 v3.3.1 の計測では、
      健全そのものの 11 秒セッションが 91.4% になり、v3.3.0 の 97.3% (4,708 フレーム) と
@@ -2069,12 +2143,23 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
    - もう 1 つ見る値: `ui.pre_grid_breakdown` の `total_ms`。UI スレッドの各段の合計で、
      健全なら **p95 0.3ms 以下**。ここが膨らんでいれば同期 I/O 退行が濃厚で、
      どの段かも同じイベントの内訳で分かる。
-   - **先に `.\scripts\build-release.ps1` が要る** (idle health と同じく `target\release` の
-     core を起動する)。`build-dev.ps1` だけでは古い release バイナリが動く。
+   - **手動fallbackは先に `.\scripts\build-release.ps1` が要る** (`target\release` のcoreを起動する)。
+     `build-dev.ps1` だけでは古いreleaseバイナリが動く。エージェントはこの通常profileを起動しない。
    - `scripts/perf_smoke.sh` は同じ内容の bash 版。中身は「FFmpeg DLL を target/release へ
      コピー → perf log を退避 → core を起動 → 終了後に解析」なので、手で分けて実行してもよい。
 
 9.7. **idle health smoke** (毎リリース必須。静止中の高速 repaint / 再投入ループを検出):
+   **正規手順は9.6のReleaseChecks suiteの同一run**。static-foreground／static-background／
+   video-pin-background／tray-close-while-loading／tray-close-after-loadingの5ケースをすべて確認する。
+   生成fixture・停止済みseed復元・cached読取・tray格納時の要求寿命・source／Finalized-image-backlog、
+   exact PID／foreground／UTC測定境界を証明する。5秒warmup／15秒測定と既存閾値を維持する。
+   背面はrunner所有の専用窓へ移行するため利用者が他窓へ切り替える必要はない。
+   動画ピンは対象workとcached読取、`idle_upgrade_enqueue` **または** `idle_upgrade_ineligible` の
+   評価証跡を求める。ineligibleだけを唯一の成立条件にしない。評価未確認はsuiteではSKIPPED／環境不成立。
+
+   **手動fallback／原因診断** (以下はsuiteの正規コマンドではない。利用者が状態を準備する):
+   手動の場合も事前に `build-release.ps1` で通常releaseをbuildする。起動は利用者のみとし、
+   通常の実設定を開くことと設定保護のルールを確認する。
    ```powershell
    .\scripts\check-idle-health.ps1 -Scenario static-foreground
    .\scripts\check-idle-health.ps1 -NoLaunch -Scenario static-background
@@ -2095,10 +2180,27 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
      `target/idle-health/*-perf.json` の原因と反復 key を確認する。
    - **4 番目はトレイ常駐が既定 OFF** なので、環境設定 →「タスクトレイ常駐」を ON にしてから
      `[×]` で閉じる。最小化では成立しない (Win32 は最小化したウィンドウも `IsWindowVisible` が
-     真を返すため)。サムネイルが多いフォルダを読込完了前に閉じた状態で測る。
-   - `-Scenario` は上記4値だけを受け付ける。perf log の session PID と測定対象 PID が違えば失敗し、
-     空の測定窓は同一 session を確認できた場合だけ完全 sleep として扱う。動画ピンシナリオは
-     準備開始後の `thumb.idle_upgrade_ineligible` が無ければセットアップ不成立として失敗する。
+     真を返すため)。cache の無い Folder 代表を多数含む一覧で、**未完了要求が残る読込中**と
+     **通常ロード / idle upgrade 完了後**の 2 ケースを両方必須とし、同じ
+     `-Scenario tray-residency` を 2 回使う。前者は hide をまたぐ要求、後者は Loaded→Evicted の
+     GPU 解放後の再取得を検査する。利用者 cache / 設定を消さず、各ケースに使い捨て fixture・
+     隔離データまたは利用者が用意した cache 未作成の対象を使う。2 回目が cache hit のみなら
+     source の画像 / 保存完了の二通知を検査したことにはならないので cache 状態を分けて記録する。
+   - tray のケース名、対象、cache 状態、close 時の requested / backlog、hide から収束までの
+     時系列と各 report をリリース記録に残す。close は測定窓外に置き、直後からの work / backlog
+     経過も残す。warmup 5 秒 / 測定 15 秒、開始 / 終了の visible windows=0、PID / session と
+     閾値は維持する。正当な初回 load が測定中に残れば準備条件と収束時点を記録し、収束後も
+     同じケースで静止窓を測る。重複生成を warmup 延長で隠さない。読込中の時点を合わせにくい
+     ことを理由に完了後ケースを無効扱いしない。active media は静止ケースに混ぜない。
+   - `input.modifier_probe` のうち `trigger=heartbeat` / `keys=[]` / `wheel=false` が揃う
+     受動 snapshot だけは操作件数から除く (focus と修飾キーの値は問わない)。key / wheel / 他の
+     input、矛盾 heartbeat、欠損・未知形式は入力として FAIL。総 event 数と repaint / work の
+     反復検査には snapshot を残す。
+   - 手動scriptの `-Scenario` は上記4値だけを受け付ける。perf logのsession PIDと測定対象PIDが
+     違えば失敗し、空の測定窓は同一session・ログ完全性を確認できた場合だけ完全sleepと扱う。
+     動画ピンは最新folder-load以降の対象workが必須。`idle_upgrade_enqueue`／`idle_upgrade_ineligible`
+     の両方が無い場合、手動analyzerは評価未確認をwarningにするので、cached状態を作り直して再測定する。
+     正規suiteはcached読取と評価証跡の不足を環境不成立として止める。詳細はidle正本に従う。
    - ZIP / PDF / スマートフォルダ、AI、動画・音楽の非同期経路を変更した場合は、その処理が
      完了した静止状態も追加測定する。詳細は `docs/idle-health-check.md`。
 

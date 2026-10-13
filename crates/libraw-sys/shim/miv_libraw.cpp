@@ -143,6 +143,12 @@ extern "C" int miv_raw_preview_extract(void *opaque, uint32_t index, MivRawBuffe
 
 extern "C" int miv_raw_develop(void *opaque, int half, int bright_mode,
                                 MivRawProgress callback, void *user) {
+  return miv_raw_develop_bounded(opaque, half, bright_mode, callback, user, UINT64_MAX);
+}
+
+extern "C" int miv_raw_develop_bounded(void *opaque, int half, int bright_mode,
+                                        MivRawProgress callback, void *user,
+                                        uint64_t max_alloc_bytes) {
   try {
     if (!opaque) return LIBRAW_DATA_ERROR;
     auto *h = static_cast<Handle *>(opaque);
@@ -152,6 +158,13 @@ extern "C" int miv_raw_develop(void *opaque, int half, int bright_mode,
     if (decoder_result) return decoder_result;
     if (decoder.decoder_flags & LIBRAW_DECODER_UNSUPPORTED_FORMAT)
       return LIBRAW_NOT_IMPLEMENTED;
+    // LibRaw checks this limit before unpack allocates its full-resolution RAW store.
+    // half_size affects output only, so a Rust half-raster check cannot replace it.
+    // Round down, never up; retain the existing native limit for ordinary callers.
+    auto &memory_mb = h->raw.imgdata.rawparams.max_raw_memory_mb;
+    const uint64_t bounded_mb = max_alloc_bytes / (1024ull * 1024);
+    if (bounded_mb < memory_mb)
+      memory_mb = static_cast<unsigned>(bounded_mb);
     auto &params = h->raw.imgdata.params;
     params.use_camera_wb = 1;
     params.output_color = 1;

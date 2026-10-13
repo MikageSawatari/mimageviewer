@@ -20,7 +20,9 @@ use crate::snapshot::{
 /// `old_to_new` is deliberately built from exact [`SnapshotKey`] equality. It is not the
 /// owner-entry relation used by cross-container navigation: a `ZipImage` must never turn into
 /// its `ZipFile` container merely because both share a path prefix.
-struct SnapshotViewerIndexSwap {
+pub(crate) struct SnapshotViewerIndexSwap {
+    policy: ViewerIndexSwapPolicy,
+    old_items_generation: u64,
     old_fullscreen_idx: usize,
     new_fullscreen_idx: usize,
     old_to_new: HashMap<usize, usize>,
@@ -32,6 +34,14 @@ struct SnapshotViewerIndexSwap {
     last_sync_stamp_new_idx: Option<usize>,
     #[cfg(windows)]
     last_sync_stamp_existed: bool,
+}
+
+/// A snapshot transition changes the browsing surface; membership publication
+/// only remaps identities in the same surface and keeps live input ownership.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewerIndexSwapPolicy {
+    Snapshot,
+    Membership,
 }
 
 #[derive(Clone, Copy)]
@@ -199,6 +209,10 @@ impl App {
     }
 
     fn clear_snapshot_index_space_derived_state(&mut self) {
+        self.clear_viewer_index_space_derived_state(ViewerIndexSwapPolicy::Snapshot);
+    }
+
+    fn clear_viewer_index_space_derived_state(&mut self, policy: ViewerIndexSwapPolicy) {
         self.slideshow_scroll_range_cache = None;
         self.viewer_navigation_caches.invalidate();
         self.fs_vertical_cache_keep_set.clear();
@@ -208,19 +222,69 @@ impl App {
         self.analysis_hist_cache = None;
         self.analysis_sv_cache = None;
         self.fs_context_menu_idx = None;
-        self.fs_secondary_press.cancel();
         self.adjust_scope_selection_idx = None;
-        self.cancel_mouse_ring_flick();
-        self.mouse_ring_grid_target_idx = None;
-        self.mouse_gesture_grid_target_idx = None;
-        self.mouse_ring_suppress_context_menu_once = false;
+        if policy == ViewerIndexSwapPolicy::Snapshot {
+            self.fs_secondary_press.cancel();
+            self.cancel_mouse_ring_flick();
+            self.mouse_ring_grid_target_idx = None;
+            self.mouse_gesture_grid_target_idx = None;
+            self.mouse_ring_suppress_context_menu_once = false;
+        }
+    }
+
+    pub(super) fn capture_snapshot_viewing_state(&self) -> crate::snapshot::SnapshotViewingState {
+        crate::snapshot::SnapshotViewingState {
+            mode: self.spread_mode,
+            direction: self.reading_direction,
+            flow: self.reading_flow,
+            shift: self.spread_shift.fork_accepted(),
+            composition: self.book_composition.clone(),
+            final_cover: self.final_cover_spread_preference,
+            endpoints: self.singleton_spread_endpoint_preferences,
+            page_alone: self.page_alone_preferences,
+        }
+    }
+
+    fn restore_snapshot_viewing_state(&mut self, state: crate::snapshot::SnapshotViewingState) {
+        self.spread_mode = state.mode;
+        self.reading_direction = state.direction;
+        self.reading_flow = state.flow;
+        self.spread_shift = state.shift;
+        self.retire_book_presentation_permission();
+        self.book_composition = state.composition;
+        self.final_cover_spread_preference = state.final_cover;
+        self.singleton_spread_endpoint_preferences = state.endpoints;
+        self.page_alone_preferences = state.page_alone;
     }
 
     fn finish_snapshot_viewer_index_swap(&mut self, swap: Option<SnapshotViewerIndexSwap>) {
+        self.finish_viewer_index_swap(swap, ViewerIndexSwapPolicy::Snapshot);
+    }
+
+    /// Finish an exact-identity membership remap after installing the new items.
+    /// A missing anchor is handled by the caller's membership decision/teardown.
+    pub(crate) fn finish_rating_membership_viewer_swap(
+        &mut self,
+        swap: Option<SnapshotViewerIndexSwap>,
+    ) {
+        self.finish_viewer_index_swap(swap, ViewerIndexSwapPolicy::Membership);
+    }
+
+    fn finish_viewer_index_swap(
+        &mut self,
+        swap: Option<SnapshotViewerIndexSwap>,
+        policy: ViewerIndexSwapPolicy,
+    ) {
         let Some(mut swap) = swap else {
-            self.clear_snapshot_index_space_derived_state();
+            match policy {
+                ViewerIndexSwapPolicy::Snapshot => self.clear_snapshot_index_space_derived_state(),
+                ViewerIndexSwapPolicy::Membership => {
+                    self.clear_viewer_index_space_derived_state(policy)
+                }
+            }
             return;
         };
+        debug_assert_eq!(swap.policy, policy);
         let remap = |idx: usize| swap.old_to_new.get(&idx).copied();
 
         match self.try_own_fullscreen_epub_at(swap.new_fullscreen_idx) {
@@ -235,6 +299,7 @@ impl App {
             self.restore_fs_page_from_snapshot(swap.new_fullscreen_idx, transfer);
         }
         self.fullscreen_idx = Some(swap.new_fullscreen_idx);
+        self.align_page_edit_slots_with_exact_reader();
         self.video_audio_mode = self.video_audio_mode.and_then(&remap);
         self.video_audio_vst = self.video_audio_vst.take().and_then(|mut state| {
             remap(state.fs_idx).map(|new_idx| {
@@ -264,11 +329,26 @@ impl App {
             .collect();
 
         self.slideshow_anchor_idx = self.slideshow_anchor_idx.and_then(&remap);
-        self.spread_shift_anchor_idx = self.spread_shift_anchor_idx.and_then(&remap);
-        self.fs_zoom_pdf_rerender_idx = self.fs_zoom_pdf_rerender_idx.and_then(&remap);
+        self.fs_pdf_rerender_demand.remap_indices(&remap);
+        self.fs_continuous_fit_reference.remap_indices(&remap);
 
         self.finish_snapshot_platform_media_index_swap(&swap);
-        self.clear_snapshot_index_space_derived_state();
+        if policy == ViewerIndexSwapPolicy::Membership {
+            let owner = self.edit_request_owner_context();
+            self.fs_secondary_press.remap_owner(
+                owner,
+                swap.old_items_generation,
+                swap.old_fullscreen_idx,
+                self.items_generation,
+                swap.new_fullscreen_idx,
+            );
+        }
+        match policy {
+            ViewerIndexSwapPolicy::Snapshot => self.clear_snapshot_index_space_derived_state(),
+            ViewerIndexSwapPolicy::Membership => {
+                self.clear_viewer_index_space_derived_state(policy)
+            }
+        }
     }
 
     fn finish_snapshot_platform_media_index_swap(&mut self, swap: &SnapshotViewerIndexSwap) {
@@ -412,8 +492,78 @@ impl App {
         phase: &'static str,
         target_membership: &HashMap<SnapshotKey, usize>,
     ) -> Option<SnapshotViewerIndexSwap> {
-        self.cancel_media_navigation_pending_for_current_context("snapshot_items_swap");
-        self.cancel_pending_folder_nav();
+        self.prepare_viewer_index_swap(phase, target_membership, ViewerIndexSwapPolicy::Snapshot)
+    }
+
+    /// Preserve a still/media page when asynchronous rating/search membership
+    /// replaces its item slots. No navigation or close is started on a miss.
+    pub(crate) fn prepare_rating_membership_viewer_swap(
+        &mut self,
+        new_items: &[GridItem],
+    ) -> Option<SnapshotViewerIndexSwap> {
+        let membership = new_items
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, item)| snapshot_key_from_grid_item(item).map(|key| (key, idx)))
+            .collect();
+        self.prepare_viewer_index_swap(
+            "rating-membership",
+            &membership,
+            ViewerIndexSwapPolicy::Membership,
+        )
+    }
+
+    fn prepare_viewer_index_swap(
+        &mut self,
+        phase: &'static str,
+        target_membership: &HashMap<SnapshotKey, usize>,
+        policy: ViewerIndexSwapPolicy,
+    ) -> Option<SnapshotViewerIndexSwap> {
+        if policy == ViewerIndexSwapPolicy::Snapshot {
+            self.cancel_media_navigation_pending_for_current_context("snapshot_items_swap");
+            self.cancel_pending_folder_nav();
+        }
+
+        // The list owns the pairing anchor even after Esc closes its reader. Remap
+        // at the items-swap boundary for every outcome, exactly once.
+        let old_to_new = self.snapshot_exact_idx_map(target_membership);
+        self.spread_shift
+            .remap_with(&|idx| old_to_new.get(&idx).copied());
+        if policy == ViewerIndexSwapPolicy::Membership {
+            let remap = |idx: usize| old_to_new.get(&idx).copied();
+            let projected = self.projected_viewer_context_id();
+            let owns_drag = |owner| match owner {
+                crate::ring_shortcut::RightDragOwner::Root => {
+                    projected == self.viewer_context_main()
+                }
+                crate::ring_shortcut::RightDragOwner::DetachedWindow(window_id) => {
+                    #[cfg(windows)]
+                    {
+                        self.viewer_context_window(projected) == Some(window_id)
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        let _ = window_id;
+                        false
+                    }
+                }
+            };
+            let owns_flick = self
+                .mouse_ring_flick
+                .as_ref()
+                .is_some_and(|flick| owns_drag(flick.owner));
+            let owns_gesture = self
+                .mouse_gesture
+                .as_ref()
+                .is_some_and(|gesture| owns_drag(gesture.owner));
+            if owns_flick {
+                self.mouse_ring_grid_target_idx = self.mouse_ring_grid_target_idx.and_then(&remap);
+            }
+            if owns_gesture {
+                self.mouse_gesture_grid_target_idx =
+                    self.mouse_gesture_grid_target_idx.and_then(&remap);
+            }
+        }
 
         let Some(old_fullscreen_idx) = self.fullscreen_idx else {
             crate::logger::log(format!(
@@ -432,20 +582,32 @@ impl App {
             .get(old_fullscreen_idx)
             .and_then(snapshot_key_from_grid_item)
         else {
+            let outcome = match policy {
+                ViewerIndexSwapPolicy::Snapshot => "closing reader",
+                ViewerIndexSwapPolicy::Membership => "membership caller decides reader",
+            };
             crate::logger::log(format!(
-                "[snapshot] {phase}: closing reader, the open item has no snapshot key \
+                "[snapshot] {phase}: {outcome}, the open item has no snapshot key \
                  old_idx={old_fullscreen_idx} item={open_label}"
             ));
-            self.close_fullscreen();
+            if policy == ViewerIndexSwapPolicy::Snapshot {
+                self.close_fullscreen();
+            }
             return None;
         };
         let Some(&new_fullscreen_idx) = target_membership.get(&open_key) else {
+            let outcome = match policy {
+                ViewerIndexSwapPolicy::Snapshot => "closing reader",
+                ViewerIndexSwapPolicy::Membership => "membership caller decides reader",
+            };
             crate::logger::log(format!(
-                "[snapshot] {phase}: closing reader, the open item is outside the new list \
+                "[snapshot] {phase}: {outcome}, the open item is outside the new list \
                  old_idx={old_fullscreen_idx} target_len={} item={open_label}",
                 target_membership.len()
             ));
-            self.close_fullscreen();
+            if policy == ViewerIndexSwapPolicy::Snapshot {
+                self.close_fullscreen();
+            }
             return None;
         };
         crate::logger::log(format!(
@@ -455,7 +617,6 @@ impl App {
             target_membership.len()
         ));
 
-        let old_to_new = self.snapshot_exact_idx_map(target_membership);
         let opened_media_path = self
             .items
             .get(old_fullscreen_idx)
@@ -497,6 +658,8 @@ impl App {
         let preserved_fs_page = self.take_fs_page_for_snapshot(old_fullscreen_idx);
 
         Some(SnapshotViewerIndexSwap {
+            policy,
+            old_items_generation: self.items_generation,
             old_fullscreen_idx,
             new_fullscreen_idx,
             old_to_new,
@@ -512,13 +675,44 @@ impl App {
     }
 
     /// snapshot active 中か。
+    pub(crate) fn direct_media_basis_allows_index(&self, idx: usize) -> bool {
+        match self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| &snapshot.source_label)
+        {
+            Some(SnapshotSourceLabel::DirectMedia { target, policy, .. }) => {
+                match self.items.get(idx) {
+                    Some(GridItem::Image(path) | GridItem::Video(path) | GridItem::Audio(path)) => {
+                        !crate::path_key::eq_keep_drive(path, target)
+                            && policy.allows_physical_file(path)
+                    }
+                    _ => true,
+                }
+            }
+            _ => true,
+        }
+    }
+
+    pub(crate) fn direct_media_reader_active(&self) -> bool {
+        self.snapshot.as_ref().is_some_and(|snapshot| {
+            matches!(
+                snapshot.source_label,
+                SnapshotSourceLabel::DirectMedia { .. }
+            )
+        })
+    }
+
     pub(crate) fn is_snapshot_active(&self) -> bool {
-        self.snapshot.is_some()
+        self.snapshot.is_some() && !self.direct_media_reader_active()
     }
 
     /// snapshot 中の件数。inactive なら None。
     pub(crate) fn snapshot_count(&self) -> Option<usize> {
-        self.snapshot.as_ref().map(|s| s.items.len())
+        self.snapshot
+            .as_ref()
+            .filter(|_| !self.direct_media_reader_active())
+            .map(|s| s.items.len())
     }
 
     /// snapshot の起点フォルダ path。inactive なら None。
@@ -679,7 +873,59 @@ impl App {
     /// 3. **activate snapshot**: `self.snapshot = Some(SnapshotState { ... })`、
     ///    items / thumbnails / visible_indices / scroll_offset / selected を退避して
     ///    snapshot subset で置き換え
+    /// Compose the external reader with a normal fixed snapshot at its ownership
+    /// boundary. The prepared parent is a stable prefix; completed thumbnail and
+    /// metadata work survives while the explicit tail page leaves the ordinary basis.
+    fn normalize_direct_media_basis_for_snapshot(&mut self) {
+        if !self.direct_media_reader_active() {
+            return;
+        }
+        let direct = self.snapshot.take().expect("typed direct reader exists");
+        self.top_level_grid_view.take_return_origin();
+        self.top_level_grid_view
+            .replace_surface(super::top_level_grid_view::TopLevelGridSurface::Folder);
+        let parent_len = direct.list_view_items.len();
+        let membership = self
+            .items
+            .iter()
+            .take(parent_len)
+            .enumerate()
+            .filter_map(|(idx, item)| snapshot_key_from_grid_item(item).map(|key| (key, idx)))
+            .collect::<HashMap<_, _>>();
+        // Reconcile before removing the tail so the old player still has its exact
+        // identity. The consumed Direct owner cannot dispatch a competing reload.
+        let viewer_swap = self.prepare_snapshot_viewer_index_swap("direct-to-fixed", &membership);
+        self.items.truncate(parent_len);
+        self.thumbnails.truncate(parent_len);
+        self.image_metas.truncate(parent_len);
+        self.page_identity_index = direct.saved_page_identity_index;
+        self.projection_recipe = direct.saved_projection_recipe;
+        self.visible_indices.retain(|idx| *idx < parent_len);
+        self.details_order.retain(|idx| *idx < parent_len);
+        self.checked.retain(|idx| *idx < parent_len);
+        self.rating_cache.remove(&parent_len);
+        self.rotation_cache.remove(&parent_len);
+        self.zip_nav = direct.saved_zip_nav;
+        self.finish_snapshot_viewer_index_swap(viewer_swap);
+    }
+
     pub(crate) fn activate_snapshot(&mut self, source_label: SnapshotSourceLabel) {
+        if self.sidecar_restore_active() {
+            return;
+        }
+        if !self.visible_indices.iter().any(|&idx| {
+            self.direct_media_basis_allows_index(idx)
+                && self
+                    .items
+                    .get(idx)
+                    .and_then(snapshot_key_from_grid_item)
+                    .is_some()
+        }) {
+            self.show_feedback_toast("固定する items がありません".into());
+            return;
+        }
+        self.normalize_direct_media_basis_for_snapshot();
+        let accepted_policy = self.page_identity_index.policy.clone();
         let source_had_exact_page_edits = self.page_edit_snapshot.is_some();
         // Step 1: capture (= visible_indices から SnapshotEntry を構築)。
         let captured_entries: Vec<SnapshotEntry> = self
@@ -773,6 +1019,12 @@ impl App {
             membership.insert(entry.key.clone(), idx);
         }
 
+        // Park the original presentation before the index-swap helper remaps live state.
+        // Its book anchor stays on saved_items, even when the subset drops preceding rows.
+        let mut saved_viewing_state = self.capture_snapshot_viewing_state();
+        saved_viewing_state.shift = std::mem::take(&mut self.spread_shift);
+        saved_viewing_state.composition = std::mem::take(&mut self.book_composition);
+        saved_viewing_state.shift.cancel_retained_readoption();
         // Preserve or close the open viewer while the old index space and player are alive.
         let viewer_index_swap = self.prepare_snapshot_viewer_index_swap("activate", &membership);
 
@@ -800,6 +1052,13 @@ impl App {
         let list_view_items = captured_items_grid.clone();
         let list_view_thumbnails = captured_thumbnails.clone();
         let list_view_image_metas = captured_image_metas.clone();
+        let saved_page_identity_index = self.page_identity_index.clone();
+        let saved_projection_recipe = std::mem::replace(
+            &mut self.projection_recipe,
+            super::book_materialization::ProjectionRecipe::ExtractedResult(
+                super::book_materialization::ExtractedSurface::Snapshot,
+            ),
+        );
         let saved_items = std::mem::replace(&mut self.items, captured_items_grid);
         let saved_thumbnails = std::mem::replace(&mut self.thumbnails, captured_thumbnails);
         let saved_image_metas = std::mem::replace(&mut self.image_metas, captured_image_metas);
@@ -844,6 +1103,9 @@ impl App {
             source_label,
             generation_id,
             saved_items,
+            saved_page_identity_index,
+            saved_projection_recipe,
+            saved_viewing_state,
             saved_thumbnails,
             saved_image_metas,
             saved_visible_indices,
@@ -851,10 +1113,14 @@ impl App {
             saved_selected,
             saved_zip_nav,
             list_view_items,
+            list_view_projection_recipe: self.projection_recipe.clone(),
             list_view_thumbnails,
             list_view_image_metas,
+            list_view_page_identity_index: Default::default(),
             pre_snapshot_search_origin,
         });
+        // The original shift owner is parked above; the extracted list has no Book scope.
+        self.spread_shift.detach_book_scope_for_ordinary_list();
         let return_origin = top_level_return.map(|restore| {
             let route = self
                 .top_level_grid_view
@@ -879,7 +1145,10 @@ impl App {
         self.bump_items_generation();
         self.invalidate_idx_state_and_queues();
         self.invalidate_snapshot_details_index_state();
+        self.begin_extracted_result_view();
         self.finish_snapshot_viewer_index_swap(viewer_index_swap);
+        self.page_identity_index = Default::default();
+        self.prepare_snapshot_page_identity_index(accepted_policy);
         // tags_cache は invalidate 対象外なので手動 clear (= 既存 clear は冗長になるが
         // 残しておく方が安全、二重 clear は no-op)
         self.clear_tags_cache();
@@ -1030,7 +1299,9 @@ impl App {
             canonical.map(|origin| std::borrow::Cow::Owned(origin.restore)),
             || (path, subfolder_restore),
         );
-        self.show_feedback_toast("★固定を解除しました".into());
+        if !matches!(snap.source_label, SnapshotSourceLabel::DirectMedia { .. }) {
+            self.show_feedback_toast("★固定を解除しました".into());
+        }
         Some(super::top_level_grid_view::TopLevelGridOrigin {
             restore: return_context,
             route,
@@ -1190,12 +1461,12 @@ impl App {
                 }
             }
             self.items = snap.saved_items;
+            self.page_identity_index = snap.saved_page_identity_index;
+            self.projection_recipe = snap.saved_projection_recipe;
             self.thumbnails = merged_thumbnails;
             self.image_metas = snap.saved_image_metas;
             self.visible_indices = snap.saved_visible_indices;
             self.scroll_offset_y = snap.saved_scroll_offset_y;
-            self.selected = snap.saved_selected;
-            self.grid_click_selection_anchor = None;
             // ネスト ZIP 由来の snapshot: saved_items (= ZIP 階層の items) と対で
             // ナビ状態も復元する。これをしないと「ZIP items なのに nav なし」になり、
             // BS が階層を戻らず ZIP ごと抜ける / ZipDir セルの Enter が無反応になる。
@@ -1206,8 +1477,15 @@ impl App {
             // invalidate 後も保持される (= thumbnails 自体は invalidate 対象外)。
             self.bump_items_generation();
             self.invalidate_idx_state_and_queues();
+            self.move_grid_cursor(snap.saved_selected, crate::app::GridCursorIntent::Automatic);
             self.invalidate_snapshot_details_index_state();
             self.finish_snapshot_viewer_index_swap(viewer_index_swap);
+            // Complete this same retained-list adoption with the saved presentation. Its
+            // shift owner already belongs to saved_items and must not be subset-remapped.
+            // DirectMedia is an ordinary reader, so retain its existing return behavior.
+            if !matches!(snap.source_label, SnapshotSourceLabel::DirectMedia { .. }) {
+                self.restore_snapshot_viewing_state(snap.saved_viewing_state);
+            }
             self.clear_tags_cache();
             // items を saved (元フォルダ) に戻したので、ページ編集状態も元 idx で hydrate
             // し直す (= activate の subset hydrate と対称、Codex P1)。snapshot 中に編集した分は
@@ -1252,7 +1530,15 @@ impl App {
         // list_view_items / list_view_thumbnails は activate_snapshot 時に保存した clone を
         // 使う (= reconstruct だと folder 代表サムネが Pending に戻って「フォルダアイコン」
         // 表示になるユーザー報告対応)。
-        let (snap_origin, list_items, list_thumbs, list_image_metas, exact_page_edits) = {
+        let (
+            snap_origin,
+            list_items,
+            list_thumbs,
+            list_image_metas,
+            list_identity_index,
+            list_recipe,
+            exact_page_edits,
+        ) = {
             let Some(snap) = self.snapshot.as_ref() else {
                 return false;
             };
@@ -1261,6 +1547,8 @@ impl App {
                 snap.list_view_items.clone(),
                 snap.list_view_thumbnails.clone(),
                 snap.list_view_image_metas.clone(),
+                snap.list_view_page_identity_index.clone(),
+                snap.list_view_projection_recipe.clone(),
                 // 検索 view 由来 snapshot は origin が cross-folder prefix なので rehydrate せず
                 // clear のみ (= activate と同じ判定。pre_snapshot_search_origin Some が search 由来)。
                 snap.page_edit_source == crate::snapshot::SnapshotPageEditSource::PreparedExact,
@@ -1305,6 +1593,8 @@ impl App {
         }
         // items 入れ替え (= 保存したサムネ付き state を復帰)
         self.items = list_items;
+        self.page_identity_index = list_identity_index;
+        self.projection_recipe = list_recipe;
         self.thumbnails = list_thumbs;
         self.image_metas = list_image_metas;
         self.visible_indices = (0..n).collect();
@@ -1313,8 +1603,7 @@ impl App {
         self.address = snap_origin.display().to_string();
         self.scroll_offset_y = 0.0;
         self.pending_grid_scroll = None;
-        self.selected = None;
-        self.grid_click_selection_anchor = None;
+        self.move_grid_cursor(None, crate::app::GridCursorIntent::Automatic);
         // items_generation bump + invalidate (= Codex P1-1)
         self.bump_items_generation();
         self.invalidate_idx_state_and_queues();
@@ -1394,6 +1683,7 @@ impl App {
             GridItem::Folder(p)
             | GridItem::Image(p)
             | GridItem::Video(p)
+            | GridItem::Audio(p)
             | GridItem::ZipFile(p)
             | GridItem::PdfFile(p) => Some(p.clone()),
             GridItem::ConvertibleArchive { path, .. } => Some(path.clone()),
@@ -1989,17 +2279,14 @@ impl App {
             });
             return;
         }
-        let Some(idx) = self.resolve_required_snapshot_target_idx(&target) else {
-            self.finish_fs_navigation_sequence(
-                crate::app::FsNavigationSequenceFinish::RequestFailed,
-            );
-            self.show_feedback_toast("移動先の画像が見つかりません".to_string());
-            return;
-        };
-        self.open_fullscreen(idx, history_trigger);
-        self.selected = Some(idx);
-        self.scroll_to_selected = true;
-        self.update_last_selected_image();
+        self.complete_deferred_book_composition_open(crate::app::DeferredFsReopen {
+            history_trigger,
+            resume_slideshow: false,
+            target: crate::app::DeferredFsTarget::Required(target),
+            resume_to_last_page: false,
+            from_explicit_open: false,
+            preserve_after_password_prompt: true,
+        });
     }
 
     fn open_required_fullscreen_from_location_load(
@@ -2159,11 +2446,8 @@ impl App {
             if !direct && !converted_alias {
                 return None;
             }
-            let target = crate::book_bookmarks::resolve_archive_bookmark_target(
-                &nav.tree,
-                requested_entry,
-                &self.settings.grid_display_order,
-            )?;
+            let target =
+                crate::book_bookmarks::resolve_archive_bookmark_target(&nav.tree, requested_entry)?;
             (tree_path, target)
         };
         let already_materialized = self.zip_nav.as_ref().is_some_and(|nav| {
@@ -2576,6 +2860,19 @@ mod tests {
         app
     }
 
+    fn drain_snapshot_identity_preparation(app: &mut App) {
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.sidecar_restore_active() {
+            app.poll_sidecar_restore(&ctx);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "snapshot identity preparation did not settle"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
     fn legacy_later_rar_cache_fixture(app: &AppTestEnvForTest) -> (PathBuf, PathBuf) {
         use std::io::Write;
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2638,6 +2935,7 @@ mod tests {
         app.thumbnails = vec![ThumbnailState::Pending];
         app.visible_indices = vec![0];
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
         let generation = app.items_generation;
         let _ = app.snapshot_open_entry(0, false, crate::app::HistoryTrigger::UserChosen);
         drain_snapshot_archive_classification(&mut app);
@@ -2662,6 +2960,7 @@ mod tests {
         app.thumbnails = vec![ThumbnailState::Pending];
         app.visible_indices = vec![0];
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
         let generation = app.items_generation;
         let _ = app.snapshot_navigate_grid(true);
         drain_snapshot_archive_classification(&mut app);
@@ -2726,6 +3025,7 @@ mod tests {
         app.thumbnails = vec![ThumbnailState::Pending];
         app.visible_indices = vec![0];
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(app);
     }
 
     #[test]
@@ -2801,6 +3101,7 @@ mod tests {
         ));
         app.deactivate_snapshot();
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
         assert_ne!(app.snapshot.as_ref().unwrap().generation_id, old_snapshot);
         drain_snapshot_archive_adoption(&mut app);
         assert_eq!(app.current_folder, Some(origin));
@@ -2824,6 +3125,7 @@ mod tests {
         app.thumbnails = vec![ThumbnailState::Pending];
         app.visible_indices = vec![0];
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
         assert!(app.snapshot_open_entry(0, false, crate::app::HistoryTrigger::UserChosen));
         drain_snapshot_archive_classification(&mut app);
         // Classification admits the logical source; the cached ZIP owner adopts its pages.
@@ -2851,6 +3153,7 @@ mod tests {
         app.thumbnails = vec![ThumbnailState::Pending];
         app.visible_indices = vec![0];
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
         let generation = app.items_generation;
         assert!(app.snapshot_navigate_grid(true));
         drain_snapshot_archive_classification(&mut app);
@@ -2873,6 +3176,7 @@ mod tests {
         app.thumbnails = vec![ThumbnailState::Pending];
         app.visible_indices = vec![0];
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
         let generation = app.items_generation;
         assert!(app.snapshot_navigate_grid(true));
         app.snapshot.as_mut().unwrap().generation_id += 1;
@@ -2927,6 +3231,7 @@ mod tests {
                 entry_name: "page.png".into(),
                 uncompressed_size: 0,
                 mtime: 0,
+                container_ancestry: Vec::new(),
             }],
         ));
         app.zip_nav = Some(crate::zip_tree::ZipNavState::new(tree));
@@ -2998,6 +3303,238 @@ mod tests {
     }
 
     #[test]
+    fn rating_membership_swap_keeps_still_texture_picker_and_input_owner() {
+        use crate::ring_shortcut::{MouseFlickState, RightDragOwner, RingShortcutContext};
+
+        let mut app = test_app_with_items(vec![
+            GridItem::Image(PathBuf::from(r"E:\test\a.png")),
+            GridItem::Image(PathBuf::from(r"E:\test\b.png")),
+        ]);
+        app.fullscreen_idx = Some(1);
+        let ctx = egui::Context::default();
+        let pixels = std::sync::Arc::new(egui::ColorImage::filled([2, 3], egui::Color32::WHITE));
+        let tex = ctx.load_texture("membership-still", (*pixels).clone(), Default::default());
+        let texture_id = tex.id();
+        app.fs_cache.insert(
+            1,
+            crate::app::FsCacheEntry::Static {
+                tex,
+                pixels: pixels.clone(),
+                source_dims: Some([2, 3]),
+                load_seq: 41,
+                animation: crate::fs_animation::StaticAnimationState::Still,
+            },
+        );
+        let picker = app.build_ring_picker_state(RingShortcutContext::ImageFullscreen);
+        app.ring_picker = Some(picker.clone());
+        let now = std::time::Instant::now();
+        let pos = egui::pos2(100.0, 120.0);
+        app.mouse_ring_flick = Some(MouseFlickState::new(
+            RightDragOwner::Root,
+            RingShortcutContext::ImageFullscreen,
+            now,
+            pos,
+        ));
+        app.mouse_ring_grid_target_idx = Some(1);
+        app.mouse_gesture = Some(crate::ring_shortcut::MouseGestureState::new(
+            RightDragOwner::Root,
+            crate::ring_shortcut::RightDragContext::ImageFullscreen,
+            now,
+            pos,
+        ));
+        app.mouse_gesture_grid_target_idx = Some(0);
+        app.mouse_ring_suppress_context_menu_once = true;
+        let owner = app.edit_request_owner_context();
+        app.fs_secondary_press = crate::ui_fullscreen::FullscreenSecondaryPress::armed_for_test(
+            owner,
+            app.items_generation,
+            1,
+            crate::ring_shortcut::RightDragContext::ImageFullscreen,
+            now,
+            pos,
+        );
+        app.pending_folder_nav_steps = 3;
+        let replacement = vec![
+            GridItem::Image(PathBuf::from(r"E:\test\new.png")),
+            app.items[0].clone(),
+            app.items[1].clone(),
+        ];
+
+        let swap = app.prepare_rating_membership_viewer_swap(&replacement);
+        assert!(swap.is_some());
+        app.items = replacement;
+        app.visible_indices = vec![0, 1, 2];
+        app.bump_items_generation();
+        app.finish_rating_membership_viewer_swap(swap);
+
+        assert_eq!(app.fullscreen_idx, Some(2));
+        let Some(crate::app::FsCacheEntry::Static {
+            tex,
+            pixels: kept,
+            load_seq,
+            ..
+        }) = app.fs_cache.get(&2)
+        else {
+            panic!("current still page was not transferred");
+        };
+        assert_eq!(tex.id(), texture_id);
+        assert!(std::sync::Arc::ptr_eq(kept, &pixels));
+        assert_eq!(*load_seq, 41);
+        assert_eq!(app.ring_picker, Some(picker));
+        assert!(app.mouse_ring_flick.is_some());
+        assert_eq!(app.mouse_ring_grid_target_idx, Some(2));
+        assert_eq!(app.mouse_gesture_grid_target_idx, Some(1));
+        assert!(app.mouse_ring_suppress_context_menu_once);
+        assert_eq!(app.pending_folder_nav_steps, 3);
+        let generation = app.items_generation;
+        assert_eq!(
+            app.fs_secondary_press.finish_for_test(
+                owner,
+                generation,
+                2,
+                crate::ring_shortcut::RightDragContext::ImageFullscreen,
+                now + std::time::Duration::from_millis(10),
+                pos,
+                false,
+                true,
+            ),
+            Some(false),
+            "the same page's armed short tap follows its identity across generation/slot changes"
+        );
+    }
+
+    #[test]
+    fn rating_membership_swap_does_not_remap_sibling_pointer_targets() {
+        use crate::ring_shortcut::{
+            MouseFlickState, MouseGestureState, RightDragOwner, RingShortcutContext,
+        };
+
+        let mut app = test_app_with_items(vec![GridItem::Image(PathBuf::from(r"E:\test\a.png"))]);
+        app.fullscreen_idx = Some(0);
+        let now = std::time::Instant::now();
+        let pos = egui::pos2(100.0, 120.0);
+        app.mouse_ring_flick = Some(MouseFlickState::new(
+            RightDragOwner::DetachedWindow(77),
+            RingShortcutContext::ImageFullscreen,
+            now,
+            pos,
+        ));
+        app.mouse_gesture = Some(MouseGestureState::new(
+            RightDragOwner::DetachedWindow(77),
+            crate::ring_shortcut::RightDragContext::ImageFullscreen,
+            now,
+            pos,
+        ));
+        app.mouse_ring_grid_target_idx = Some(0);
+        app.mouse_gesture_grid_target_idx = Some(0);
+        let replacement = vec![
+            GridItem::Image(PathBuf::from(r"E:\test\new.png")),
+            app.items[0].clone(),
+        ];
+        let swap = app.prepare_rating_membership_viewer_swap(&replacement);
+        app.items = replacement;
+        app.bump_items_generation();
+        app.finish_rating_membership_viewer_swap(swap);
+        assert_eq!(app.fullscreen_idx, Some(1));
+        assert_eq!(app.mouse_ring_grid_target_idx, Some(0));
+        assert_eq!(app.mouse_gesture_grid_target_idx, Some(0));
+        assert_eq!(
+            app.mouse_ring_flick.as_ref().unwrap().owner,
+            RightDragOwner::DetachedWindow(77)
+        );
+        assert_eq!(
+            app.mouse_gesture.as_ref().unwrap().owner,
+            RightDragOwner::DetachedWindow(77)
+        );
+    }
+
+    #[test]
+    fn rating_membership_swap_keeps_exact_media_player_allocation() {
+        let path = PathBuf::from(r"E:\test\playing.mp4");
+        let mut app = test_app_with_items(vec![GridItem::Video(path.clone())]);
+        app.fullscreen_idx = Some(0);
+        let player = Box::new(crate::video::VideoPlayer::stream_ready_disconnected_for_test(path));
+        let original_player = std::ptr::from_ref(&*player);
+        app.fs_cache.insert(
+            0,
+            crate::app::FsCacheEntry::Video {
+                player,
+                load_seq: 19,
+            },
+        );
+        app.video_audio_mode = Some(0);
+        let replacement = vec![
+            GridItem::Image(PathBuf::from(r"E:\test\new.png")),
+            app.items[0].clone(),
+        ];
+        let swap = app.prepare_rating_membership_viewer_swap(&replacement);
+        app.items = replacement;
+        app.bump_items_generation();
+        app.finish_rating_membership_viewer_swap(swap);
+        let Some(crate::app::FsCacheEntry::Video { player, load_seq }) = app.fs_cache.get(&1)
+        else {
+            panic!("media player was not transferred");
+        };
+        assert_eq!(std::ptr::from_ref(&**player), original_player);
+        assert_eq!(*load_seq, 19);
+        assert_eq!(app.fullscreen_idx, Some(1));
+        assert_eq!(app.video_audio_mode, Some(1));
+    }
+
+    #[test]
+    fn rating_membership_missing_page_does_not_close_or_match_container() {
+        let archive = PathBuf::from(r"E:\test\book.zip");
+        let mut app = test_app_with_items(vec![GridItem::ZipImage {
+            zip_path: archive.clone(),
+            entry_name: "page.png".into(),
+        }]);
+        app.fullscreen_idx = Some(0);
+        app.fs_cache.insert(0, crate::app::FsCacheEntry::Failed);
+        app.pending_folder_nav_steps = 2;
+        assert!(
+            app.prepare_rating_membership_viewer_swap(&[GridItem::ZipFile(archive)])
+                .is_none()
+        );
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert!(app.fs_cache.get(&0).is_some());
+        assert_eq!(app.pending_folder_nav_steps, 2);
+    }
+
+    #[test]
+    fn snapshot_reindex_still_retires_live_pointer_sequence() {
+        use crate::ring_shortcut::{MouseFlickState, RightDragOwner, RingShortcutContext};
+
+        let mut app = test_app_with_items(vec![GridItem::Image(PathBuf::from(r"E:\test\a.png"))]);
+        app.fullscreen_idx = Some(0);
+        let now = std::time::Instant::now();
+        let pos = egui::pos2(100.0, 120.0);
+        app.mouse_ring_flick = Some(MouseFlickState::new(
+            RightDragOwner::Root,
+            RingShortcutContext::ImageFullscreen,
+            now,
+            pos,
+        ));
+        app.fs_secondary_press = crate::ui_fullscreen::FullscreenSecondaryPress::armed_for_test(
+            app.edit_request_owner_context(),
+            app.items_generation,
+            0,
+            crate::ring_shortcut::RightDragContext::ImageFullscreen,
+            now,
+            pos,
+        );
+        let membership = HashMap::from([(snapshot_key_from_grid_item(&app.items[0]).unwrap(), 0)]);
+        let swap = app.prepare_snapshot_viewer_index_swap("test", &membership);
+        app.bump_items_generation();
+        app.finish_snapshot_viewer_index_swap(swap);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert!(app.mouse_ring_flick.is_none());
+        assert_eq!(
+            app.fs_secondary_press,
+            crate::ui_fullscreen::FullscreenSecondaryPress::Idle
+        );
+    }
+
+    #[test]
     fn snapshot_index_space_change_retires_secondary_press_owner() {
         let mut app = setup_app_for_test();
         app.fullscreen_idx = Some(0);
@@ -3036,11 +3573,13 @@ mod tests {
                 entry_name: "bookA/p1.jpg".to_string(),
                 uncompressed_size: 0,
                 mtime: 0,
+                container_ancestry: Vec::new(),
             },
             crate::zip_loader::ZipImageEntry {
                 entry_name: "bookB/p1.jpg".to_string(),
                 uncompressed_size: 0,
                 mtime: 0,
+                container_ancestry: Vec::new(),
             },
         ];
         let tree = std::sync::Arc::new(crate::zip_tree::ZipTree::build(zip_path, entries));
@@ -3102,6 +3641,211 @@ mod tests {
     }
 
     #[test]
+    fn g1_snapshot_a2_deactivation_preserves_source_book_presentation() {
+        use crate::app::book_materialization::{BookScope, ExtractedSurface, ProjectionRecipe};
+        use crate::settings::{ReadingDirection, ReadingFlow, SpreadMode};
+        let mut app = setup_app_for_test();
+        let book = app.tmp.path().join("g1-snapshot-source-book");
+        std::fs::create_dir(&book).unwrap();
+        for name in ["01.png", "02.png"] {
+            image::RgbImage::new(2, 3).save(book.join(name)).unwrap();
+        }
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.settings.auto_fullscreen_image_folders = true;
+        app.settings.default_spread_mode = SpreadMode::LtrCover;
+        app.settings.default_reading_direction = ReadingDirection::Ltr;
+        app.settings.default_reading_flow = ReadingFlow::Horizontal;
+        let db_path = app.tmp.path().join("g1-snapshot-spread.db");
+        app.spread_db = Ok(crate::spread_db::SpreadDb::open_at(&db_path).unwrap());
+        app.spread_db
+            .as_ref()
+            .unwrap()
+            .set_presentation_state(
+                &book,
+                SpreadMode::RtlCover,
+                ReadingFlow::Vertical,
+                ReadingDirection::Rtl,
+                (
+                    SpreadMode::LtrCover,
+                    ReadingFlow::Horizontal,
+                    ReadingDirection::Ltr,
+                ),
+            )
+            .unwrap();
+        app.load_folder(book.clone());
+        app.settle_open_path_classification_for_test();
+        app.finish_page_identity_preparation_for_test();
+        let original_recipe = ProjectionRecipe::Book(BookScope::ImageFolder(book));
+        assert_eq!(app.projection_recipe, original_recipe);
+        app.set_spread_shift_anchor_for_test(Some(1));
+        let source_items = app.items.clone();
+        let before = app.capture_snapshot_viewing_state();
+        let observer = rusqlite::Connection::open(&db_path).unwrap();
+        let version: i64 = observer
+            .pragma_query_value(None, "data_version", |row| row.get(0))
+            .unwrap();
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
+        let recipe = ProjectionRecipe::ExtractedResult(ExtractedSurface::Snapshot);
+        assert_eq!(app.projection_recipe, recipe);
+        assert_eq!(app.spread_mode, SpreadMode::Single);
+        // HEAD^ activation swapped rows directly and retained the preceding flow.
+        assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+        assert_eq!(app.snapshot.as_ref().unwrap().saved_viewing_state, before);
+        let ctx = egui::Context::default();
+        for idx in [0, 1] {
+            assert!(app.snapshot_open_entry(idx, false, crate::app::HistoryTrigger::UserChosen));
+            assert_eq!(app.fullscreen_idx, Some(idx));
+            assert_eq!(app.projection_recipe, recipe);
+            assert_eq!(app.spread_mode, SpreadMode::Single);
+            assert_eq!(app.reading_direction, ReadingDirection::Ltr);
+            assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+            app.apply_fullscreen_spread_mode(&ctx, idx, SpreadMode::RtlCover);
+            assert_eq!(app.spread_mode, SpreadMode::Ltr);
+            assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+            if idx == 1 {
+                app.set_reading_flow_for_fullscreen(&ctx, idx, ReadingFlow::Horizontal);
+                assert_eq!(app.reading_flow, ReadingFlow::Horizontal);
+            }
+            app.close_fullscreen();
+        }
+        app.deactivate_snapshot();
+        assert_eq!(app.items, source_items);
+        assert_eq!(app.capture_snapshot_viewing_state(), before);
+        assert_eq!(app.projection_recipe, original_recipe);
+        assert_eq!(app.spread_mode, SpreadMode::RtlCover);
+        assert_eq!(app.reading_direction, ReadingDirection::Rtl);
+        assert_eq!(
+            observer
+                .pragma_query_value::<i64, _>(None, "data_version", |row| row.get(0))
+                .unwrap(),
+            version,
+            "snapshot opens and temporary modes/flow must not write spread.db"
+        );
+    }
+
+    #[test]
+    fn g1_snapshot_real_producer_classifies_cross_book_and_mixed_lists_as_a2() {
+        use crate::app::book_materialization::{ExtractedSurface, ProjectionRecipe};
+        use crate::settings::{ReadingFlow, SpreadMode};
+        for mixed in [false, true] {
+            let second = if mixed {
+                GridItem::Video(PathBuf::from(r"E:\book-b\clip.mp4"))
+            } else {
+                GridItem::Image(PathBuf::from(r"E:\book-b\page.png"))
+            };
+            let mut app = test_app_with_items(vec![
+                GridItem::Image(PathBuf::from(r"E:\book-a\page.png")),
+                second,
+            ]);
+            app.reading_flow = ReadingFlow::Vertical;
+            app.settings.default_spread_mode = SpreadMode::RtlCover;
+            app.activate_snapshot(SnapshotSourceLabel::Mixed);
+            drain_snapshot_identity_preparation(&mut app);
+            assert_eq!(
+                app.projection_recipe,
+                ProjectionRecipe::ExtractedResult(ExtractedSurface::Snapshot)
+            );
+            assert_eq!(app.snapshot_count(), Some(2));
+            assert_eq!(
+                app.items
+                    .iter()
+                    .any(|item| matches!(item, GridItem::Video(_))),
+                mixed
+            );
+            assert!(app.snapshot_open_entry(0, false, crate::app::HistoryTrigger::UserChosen));
+            assert_eq!(app.spread_mode, SpreadMode::Single);
+            assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+            app.close_fullscreen();
+            app.deactivate_snapshot();
+        }
+    }
+
+    #[test]
+    fn g1_snapshot_child_return_and_deactivation_restore_accepted_recipes() {
+        use crate::app::book_materialization::{BookScope, ExtractedSurface, ProjectionRecipe};
+        let items = vec![GridItem::Image(PathBuf::from(r"E:\test\page.png"))];
+        let mut app = test_app_with_items(items.clone());
+        let original = ProjectionRecipe::Book(BookScope::ImageFolder(PathBuf::from(r"E:\test")));
+        app.projection_recipe = original.clone();
+        app.spread_mode = crate::settings::SpreadMode::RtlCover;
+        app.set_spread_shift_anchor_for_test(Some(0));
+        let before = app.capture_snapshot_viewing_state();
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
+        let fixed = ProjectionRecipe::ExtractedResult(ExtractedSurface::Snapshot);
+        assert_eq!(app.projection_recipe, fixed);
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Single);
+        app.current_folder = Some(PathBuf::from(r"E:\test\child.pdf"));
+        app.projection_recipe =
+            ProjectionRecipe::Book(BookScope::Document(app.current_folder.clone().unwrap()));
+        app.items = vec![GridItem::PdfPage {
+            pdf_path: app.current_folder.clone().unwrap(),
+            page_num: 8,
+            content_type: None,
+        }];
+        let ctx = egui::Context::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                focused: true,
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Backspace,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                assert!(app.handle_keyboard(ctx).is_none());
+            },
+        );
+        assert_eq!(app.projection_recipe, fixed);
+        assert_eq!(app.items, items);
+        app.deactivate_snapshot();
+        assert_eq!(app.projection_recipe, original);
+        assert_eq!(app.items, items);
+        assert_eq!(app.capture_snapshot_viewing_state(), before);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn g1_f12_snapshot_fork_return_keeps_original_book_state_and_main_unchanged() {
+        use crate::app::book_materialization::{BookScope, ProjectionRecipe};
+        let mut app = test_app_with_items(vec![GridItem::Image(PathBuf::from(r"E:\test\01.png"))]);
+        app.projection_recipe =
+            ProjectionRecipe::Book(BookScope::ImageFolder(PathBuf::from(r"E:\test")));
+        app.spread_mode = crate::settings::SpreadMode::RtlCover;
+        app.set_spread_shift_anchor_for_test(Some(0));
+        let book_state = app.capture_snapshot_viewing_state();
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        app.apply_fullscreen_spread_mode(
+            &egui::Context::default(),
+            0,
+            crate::settings::SpreadMode::Ltr,
+        );
+        let main_state = app.capture_snapshot_viewing_state();
+        let main_generation = app.items_generation;
+        let mut fork = app.split_current_context_preserving_main_grid();
+        app.swap_viewer_context_bundle(&mut fork);
+        assert_eq!(
+            app.snapshot.as_ref().unwrap().saved_viewing_state,
+            book_state
+        );
+        app.deactivate_snapshot();
+        assert_eq!(app.capture_snapshot_viewing_state(), book_state);
+        assert!(matches!(app.projection_recipe, ProjectionRecipe::Book(_)));
+        app.swap_viewer_context_bundle(&mut fork);
+        drop(fork);
+        assert_eq!(app.capture_snapshot_viewing_state(), main_state);
+        assert_eq!(app.items_generation, main_generation);
+        assert!(app.is_snapshot_active());
+        app.deactivate_snapshot();
+        assert_eq!(app.capture_snapshot_viewing_state(), book_state);
+    }
+
+    #[test]
     fn deactivate_restores_saved_state() {
         let original_items = vec![
             GridItem::Folder(PathBuf::from(r"E:\original")),
@@ -3128,6 +3872,64 @@ mod tests {
         assert_eq!(app.items.len(), 2);
         assert_eq!(app.scroll_offset_y, 123.0);
         assert_eq!(app.selected, Some(1));
+    }
+
+    #[test]
+    fn g1_snapshot_restores_book_pairing_and_remaps_reader_target_exactly_once() {
+        use super::super::spread_shift_owner::ViewerShift;
+        use crate::spread_shift::{
+            ShiftPersistence, ShiftResolution, SpreadShiftPageRef, SpreadShiftState,
+        };
+
+        for reader_open in [false, true] {
+            let mut app = setup_app_for_test();
+            app.current_folder = Some(PathBuf::from("c:/books/book"));
+            app.projection_recipe = super::super::book_materialization::ProjectionRecipe::Book(
+                super::super::book_materialization::BookScope::ImageFolder(
+                    app.current_folder.clone().unwrap(),
+                ),
+            );
+            app.items = (0..6)
+                .map(|idx| GridItem::Image(PathBuf::from(format!("c:/books/book/{idx}.jpg"))))
+                .collect();
+            app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending; 6];
+            app.visible_indices = vec![1, 3, 5];
+            app.page_identity_index = std::sync::Arc::new(
+                super::super::file_type_resume::PreparedPageIdentityIndex::prepare(
+                    &app.items,
+                    None,
+                    Default::default(),
+                ),
+            );
+            app.spread_shift.scope =
+                Some(crate::book_scope::BookScopeKey::folder("c:/books/book").unwrap());
+            app.spread_shift.state = ViewerShift::Book(SpreadShiftState::Adjusted {
+                anchor_ref: SpreadShiftPageRef::RelativePath("3.jpg".into()),
+                resolution: ShiftResolution::Resolved(3),
+                persistence: ShiftPersistence::SessionOnly,
+            });
+            let original_shift = app.spread_shift.clone();
+            app.fullscreen_idx = reader_open.then_some(3);
+            app.activate_snapshot(SnapshotSourceLabel::Mixed);
+            assert!(app.extracted_result_surface().is_some());
+            assert_eq!(app.spread_mode, crate::settings::SpreadMode::Single);
+            assert_eq!(app.spread_shift.scope, None);
+            assert_eq!(app.spread_shift.state, ViewerShift::None);
+            assert_eq!(
+                app.snapshot.as_ref().unwrap().saved_viewing_state.shift,
+                original_shift,
+                "the book identity stays on the original row basis, outside A2",
+            );
+            assert_eq!(app.fullscreen_idx, reader_open.then_some(1));
+            drain_snapshot_identity_preparation(&mut app);
+            app.deactivate_snapshot();
+            assert_eq!(app.spread_shift, original_shift);
+            assert!(matches!(
+                app.projection_recipe,
+                super::super::book_materialization::ProjectionRecipe::Book(_)
+            ));
+            assert_eq!(app.fullscreen_idx, reader_open.then_some(3));
+        }
     }
 
     #[test]
@@ -3183,9 +3985,11 @@ mod tests {
     fn generation_id_advances_per_activate() {
         let mut app = test_app_with_items(vec![GridItem::Image(PathBuf::from(r"E:\a.png"))]);
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
         let gen1 = app.snapshot.as_ref().unwrap().generation_id;
         app.deactivate_snapshot();
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
         let gen2 = app.snapshot.as_ref().unwrap().generation_id;
         assert!(gen2 > gen1);
     }
@@ -3529,6 +4333,7 @@ mod tests {
             GridItem::Image(PathBuf::from(r"E:\test\b.png")),
         ]);
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
         // entry idx 1 (= b.png) を open する → items[1] が既にあるので open_fullscreen 直接呼び
         let result = app.snapshot_open_entry(
             1,
@@ -3650,6 +4455,7 @@ mod tests {
             GridItem::Image(PathBuf::from(r"E:\test\b.png")),
         ]);
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
         // a を fullscreen で開く (= 現 items 内なので直接 open)。
         assert!(app.snapshot_open_entry(
             0,
@@ -3704,6 +4510,7 @@ mod tests {
         ]);
         app.settings.archive_file_handling = crate::settings::ArchiveFileHandling::Ignore;
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
         app.fullscreen_idx = Some(0);
         let mut player =
             crate::video::VideoPlayer::stream_ready_disconnected_for_test(old_path.clone());
@@ -3775,6 +4582,7 @@ mod tests {
         );
         app.current_folder = Some(book);
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
         assert!(app.snapshot_open_entry(1, false, crate::app::HistoryTrigger::UserChosen,));
         assert_eq!(
             app.snapshot_owner_entry(&app.snapshot_current_fullscreen_path().unwrap()),
@@ -3809,6 +4617,7 @@ mod tests {
         );
         app.current_folder = Some(book);
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
         assert!(app.snapshot_open_entry(1, false, crate::app::HistoryTrigger::UserChosen));
         assert_eq!(
             app.snapshot_owner_entry(&app.snapshot_current_fullscreen_path().unwrap()),
@@ -3834,6 +4643,7 @@ mod tests {
             GridItem::Image(PathBuf::from(r"E:\test\b.png")),
         ]);
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
         assert!(app.snapshot_open_entry(
             0,
             /*resume_slideshow=*/ true,

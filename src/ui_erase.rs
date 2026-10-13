@@ -597,6 +597,7 @@ impl App {
     /// 通常のフルスクリーンショートカットをブロックし、消しゴム専用キーのみ有効にする。
     pub(crate) fn handle_erase_keys(&mut self, ctx: &egui::Context, fs_idx: usize) -> FsKeyAction {
         let action = FsKeyAction {
+            page_transition: Default::default(),
             close: false,
             close_to_page_list: false,
             page_nav: crate::ui_fullscreen::FsPageNav::None,

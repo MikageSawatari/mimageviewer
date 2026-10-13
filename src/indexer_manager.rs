@@ -83,6 +83,7 @@ pub struct IndexerManager {
     /// 再構成 worker が supervisor ハンドルと構成 snapshot を所有する。
     runtime: crate::metadata_reconfiguration::Runtime,
     startup_diag: StartupDiag,
+    reporter: Arc<crate::fts_integrity::FailureReporter>,
 }
 
 /// 起動時 reconciliation の統計スナップショット (UI 表示用)。
@@ -101,8 +102,9 @@ pub struct StartupDiag {
 /// fts_meta が INDEX_VERSION bump / 旧スキーマを検出して `files` テーブルを drop した場合、
 /// Tantivy 側も一緒に wipe しないと旧 key 形式 (例: `!` separator) で書かれた orphan doc が
 /// 残り続ける (post-filter で弾かれるが容量を食う、かつ将来リカバリ経路が増えたら顕在化し得る)。
-/// このため fts_meta open → durable rebuild pending チェック → 必要なら `fts_index`
-/// 削除 → fts open → pending clear の順で実行する。
+/// fts_meta open → pending read (pendingなら旧Tantivy probeを省略) → 非破壊probe →
+/// 必要なら SQLite inventory+scan reset+durable pendingをcommit → Tantivy wipe/create →
+/// 成功後にpending clear、の順序を1つのownerで実行する。
 ///
 /// 本番 `new()` とテスト用 `new_at()` の両方から呼ぶ (Codex P3 指摘: 旧コードでは
 /// `new_at` が wipe を再現していなかったため、version bump の挙動を統合テストで検証できず
@@ -143,6 +145,22 @@ fn open_stores_with_rebuild_sync_using(
     progress: Option<&StartupProgressHook>,
     remove_fts_dir: impl Fn(&std::path::Path) -> std::io::Result<()>,
 ) -> Result<(Arc<FtsMetaDb>, Arc<FtsIndex>), StoreOpenFailure> {
+    open_stores_with_rebuild_sync_using_probe(
+        data_dir,
+        log_tag,
+        progress,
+        remove_fts_dir,
+        FtsIndex::probe_at,
+    )
+}
+
+fn open_stores_with_rebuild_sync_using_probe(
+    data_dir: &std::path::Path,
+    log_tag: &str,
+    progress: Option<&StartupProgressHook>,
+    remove_fts_dir: impl Fn(&std::path::Path) -> std::io::Result<()>,
+    probe_fts: impl FnOnce(&std::path::Path) -> tantivy::Result<crate::fts_index::FtsIndexProbe>,
+) -> Result<(Arc<FtsMetaDb>, Arc<FtsIndex>), StoreOpenFailure> {
     if let Some(p) = progress {
         p("アイテム索引データベースを開いています…");
     }
@@ -178,12 +196,50 @@ fn open_stores_with_rebuild_sync_using(
         }
     };
     rebuild_read.finish(Outcome::Ok);
-    if rebuild_pending {
+    if !rebuild_pending {
         if let Some(p) = progress {
-            p("古いインデックスを削除しています…");
+            p("全文検索インデックスを開いています…");
+        }
+    }
+    let t_fts_open = std::time::Instant::now();
+    // Durable pending bypasses ALL old-index I/O, including corrupt/unreadable metadata.
+    let existing = if rebuild_pending {
+        None
+    } else {
+        match probe_fts(&fts_dir) {
+            Ok(crate::fts_index::FtsIndexProbe::Compatible(index)) => Some(index),
+            Ok(crate::fts_index::FtsIndexProbe::RebuildRequired) => None,
+            Err(error) => {
+                crate::logger::log(format!(
+                    "{log_tag}: non-destructive FtsIndex probe failed: {error}"
+                ));
+                return Err(StoreOpenFailure::Unavailable);
+            }
+        }
+    };
+    let rebuild_required = existing.is_none();
+    let fts = if let Some(index) = existing {
+        crate::perf::emit_ms("startup", "fts_index_open", 0, t_fts_open);
+        Arc::new(index)
+    } else {
+        let reset = span(Lane::Indexer, Stage::IndexerInventoryReset);
+        let reset_result = meta_db.prepare_tantivy_rebuild();
+        reset.finish(if reset_result.is_ok() {
+            Outcome::Ok
+        } else {
+            Outcome::Error
+        });
+        if let Err(error) = reset_result {
+            crate::logger::log(format!(
+                "{log_tag}: prepare Tantivy rebuild failed before destructive work: {error}"
+            ));
+            return Err(StoreOpenFailure::RebuildDeferred);
+        }
+        if let Some(p) = progress {
+            p("索引を作り直しています…");
         }
         crate::logger::log(format!(
-            "{log_tag}: durable rebuild pending → wiping Tantivy index dir {}",
+            "{log_tag}: inventory reset and durable pending committed → wiping Tantivy index dir {}",
             fts_dir.display()
         ));
         let t_wipe = std::time::Instant::now();
@@ -200,45 +256,24 @@ fn open_stores_with_rebuild_sync_using(
         }
         wipe.finish(Outcome::Ok);
         crate::perf::emit_ms("startup", "fts_index_wipe", 0, t_wipe);
-    }
-    let meta_db = Arc::new(meta_db);
-    if let Some(p) = progress {
-        p("全文検索インデックスを開いています…");
-    }
-    let t_fts = std::time::Instant::now();
-    let fts = match FtsIndex::open_at(&fts_dir) {
-        Ok(idx) => Arc::new(idx),
-        Err(e) => {
-            crate::logger::log(format!("{log_tag}: FtsIndex open failed: {e}"));
-            return Err(if rebuild_pending {
-                StoreOpenFailure::RebuildDeferred
-            } else {
-                StoreOpenFailure::Unavailable
-            });
+        if let Some(p) = progress {
+            p("全文検索インデックスを作り直しています…");
         }
-    };
-    crate::perf::emit_ms("startup", "fts_index_open", 0, t_fts);
-    if fts.recreated_on_open() {
-        let reset = span(Lane::Indexer, Stage::IndexerInventoryReset);
-        let reset_result = meta_db.reset_inventory_for_recreated_tantivy();
-        reset.finish(if reset_result.is_ok() {
-            Outcome::Ok
-        } else {
-            Outcome::Error
-        });
-        reset_result.map_err(|error| {
-            crate::logger::log(format!(
-                "{log_tag}: clear scan markers after store recreation failed: {error}"
-            ));
-            if let Err(pending_error) = meta_db.request_item_index_rebuild() {
+        let t_create = std::time::Instant::now();
+        let index = match FtsIndex::create_at(&fts_dir) {
+            Ok(index) => Arc::new(index),
+            Err(error) => {
                 crate::logger::log(format!(
-                    "{log_tag}: request rebuild failed: {pending_error}"
+                    "{log_tag}: FtsIndex create/open failed: {error}; rebuild remains pending"
                 ));
+                return Err(StoreOpenFailure::RebuildDeferred);
             }
-            StoreOpenFailure::RebuildDeferred
-        })?;
-    }
-    if rebuild_pending {
+        };
+        crate::perf::emit_ms("startup", "fts_index_open", 0, t_create);
+        index
+    };
+    let meta_db = Arc::new(meta_db);
+    if rebuild_required {
         let complete = span(Lane::Indexer, Stage::IndexerRebuildComplete);
         if let Err(e) = meta_db.complete_tantivy_rebuild() {
             complete.finish(Outcome::Error);
@@ -376,6 +411,7 @@ impl IndexerManager {
         skip_offline_change_scan: bool,
         shared_io_sem: Option<Arc<GlobalIoSemaphore>>,
     ) -> Option<Self> {
+        let reporter = crate::fts_integrity::FailureReporter::new(Arc::clone(&meta_db));
         // IndexWriter は dispatcher に owner として渡す (Tantivy は 1 Index 1 writer 制約)。
         // dispatcher が常駐スレッドで処理するので、reconciliation も submit ベースで行う。
         if let Some(p) = progress.as_ref() {
@@ -398,8 +434,11 @@ impl IndexerManager {
         let io_sem = shared_io_sem.unwrap_or_else(|| Arc::new(GlobalIoSemaphore::new(permits)));
 
         let dispatcher = span(Lane::Indexer, Stage::IndexerDispatcher);
-        let writer =
-            crate::fts_writer_dispatcher::FtsWriterDispatcher::start(raw_writer, Arc::clone(&fts));
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start_with_reporter(
+            raw_writer,
+            Arc::clone(&fts),
+            Arc::clone(&reporter),
+        );
         dispatcher.finish(Outcome::Ok);
 
         // === 起動時 reconciliation → supervisor spawn を同じ worker に渡す ===
@@ -417,6 +456,7 @@ impl IndexerManager {
                 io: Arc::clone(&io_sem),
                 gate: Arc::clone(&activity_gate),
                 similar: similar_notifier.clone(),
+                reporter: Arc::clone(&reporter),
             },
             {
                 let mut config = crate::metadata_reconfiguration::Configuration::new(
@@ -441,6 +481,7 @@ impl IndexerManager {
             io_sem,
             excluded_roots,
             runtime,
+            reporter,
             startup_diag: StartupDiag {
                 io_permits: permits,
                 ..StartupDiag::default()
@@ -524,7 +565,12 @@ impl IndexerManager {
         self.runtime.wait_full_check_dispatched_for_test();
     }
     pub fn take_notifications(&self) -> Vec<&'static str> {
-        std::mem::take(&mut self.runtime.shared.state.lock().unwrap().notifications)
+        self.reporter.take_notifications()
+    }
+
+    /// Short memory-only projection; the UI never queries the durable DB marker.
+    pub fn maintenance_state(&self) -> crate::fts_integrity::MaintenanceState {
+        self.reporter.snapshot()
     }
     /// S3 must bypass startup markers for these owner roots.
     pub fn must_scan_owner_roots(&self) -> std::collections::HashSet<String> {
@@ -714,7 +760,10 @@ pub(crate) fn run_reconciliation_via_dispatcher(
     let target_favs = crate::metadata_ownership::metadata_ownership(favorites, &[]).effective_ids();
     let not_ok = meta_db
         .list_not_ok_paths_for_favorites(&target_favs)
-        .map_err(|e| format!("list_not_ok_paths_for_favorites: {e}"))?;
+        .map_err(|e| {
+            writer.report_failure("reconciliation list_not_ok_paths_for_favorites", &e);
+            format!("list_not_ok_paths_for_favorites: {e}")
+        })?;
     // Failed cleanup invalidates the current owner and saved old roots in the delete transaction.
     let failed_ids: std::collections::HashSet<_> = not_ok.iter().map(|(_, id, _)| *id).collect();
     let failed_roots: std::collections::HashSet<_> = favorites
@@ -734,7 +783,10 @@ pub(crate) fn run_reconciliation_via_dispatcher(
                 &deletes_for_sqlite,
                 &failed_roots.into_iter().collect::<Vec<_>>(),
             )
-            .map_err(|e| format!("reconciliation delete_paths: {e}"))?;
+            .map_err(|e| {
+                writer.report_failure("reconciliation delete_paths", &e);
+                format!("reconciliation delete_paths: {e}")
+            })?;
         report.failed_cleaned = deletes_for_sqlite.len();
     }
     crate::logger::log(format!(
@@ -859,6 +911,7 @@ mod tests {
         gate: Arc<ActivityGate>,
         similar: Option<crate::similar_index::SimilarIndexNotifier>,
     ) -> IndexerManager {
+        let reporter = crate::fts_integrity::FailureReporter::new(Arc::clone(&meta));
         let runtime = crate::metadata_reconfiguration::Runtime::start(
             crate::metadata_reconfiguration::Stores {
                 meta: Arc::clone(&meta),
@@ -867,6 +920,7 @@ mod tests {
                 io: Arc::clone(&io),
                 gate: Arc::clone(&gate),
                 similar: similar.clone(),
+                reporter: Arc::clone(&reporter),
             },
             crate::metadata_reconfiguration::Configuration::new(&[], Vec::new()),
         )
@@ -879,7 +933,63 @@ mod tests {
             excluded_roots: Vec::new(),
             runtime,
             startup_diag: StartupDiag::default(),
+            reporter,
         }
+    }
+
+    #[test]
+    fn finalizer_commit_failure_survives_manager_drop_without_waiting_for_notification_ui() {
+        let tmp = TempDir::new().unwrap();
+        let manager = IndexerManager::new_at(
+            tmp.path(),
+            &[],
+            crate::settings::IndexerSpeedProfile::default(),
+            Arc::new(ActivityGate::new(0)),
+            Vec::new(),
+        )
+        .unwrap();
+        wait_until("startup runtime ready", || !manager.is_reconciling());
+        let writer = manager.clone_shared_writer();
+        let reporter = manager.reporter.clone();
+        writer.test_set_reload_failure(true);
+        let (started, release, done) =
+            writer.submit_test_block(crate::fts_writer_dispatcher::WriterPriority::Background);
+        started.recv_timeout(Duration::from_secs(10)).unwrap();
+        drop(manager);
+        wait_until("finalizer commit enqueued", || {
+            writer.pending_snapshot().1 != 0
+        });
+        let (completed, wait) = std::sync::mpsc::channel();
+        writer.submit_test_mark(
+            "finalized",
+            completed,
+            crate::fts_writer_dispatcher::WriterPriority::Background,
+        );
+        release.send(()).unwrap();
+        done.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(
+            wait.recv_timeout(Duration::from_secs(10)).unwrap(),
+            "finalized"
+        );
+        assert_eq!(
+            reporter.snapshot(),
+            crate::fts_integrity::MaintenanceState::RebuildOnRestart
+        );
+        assert_eq!(
+            reporter.take_notifications(),
+            vec![crate::fts_integrity::UPDATE_FAILURE_NOTICE]
+        );
+        let observer = rusqlite::Connection::open(tmp.path().join("fts_meta.db")).unwrap();
+        assert_eq!(
+            observer
+                .query_row(
+                    "SELECT value FROM index_state WHERE key='tantivy_rebuild_pending'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
     }
 
     fn mk_fav(name: &str, path: &std::path::Path, metadata: bool) -> FavoriteEntry {
@@ -1132,6 +1242,327 @@ mod tests {
                 .expect("next startup retries the pending wipe");
         assert!(!sentinel.exists());
         assert!(!meta.tantivy_rebuild_pending().unwrap());
+    }
+
+    fn assert_durable_reset_before_wipe(data_dir: &std::path::Path) {
+        let conn = rusqlite::Connection::open(data_dir.join("fts_meta.db")).unwrap();
+        for table in ["files", "scanned_once"] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "{table} must be reset before wipe"
+            );
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM index_state WHERE key='tantivy_rebuild_pending'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn all_rebuild_causes_commit_inventory_scan_reset_and_pending_before_wipe() {
+        for cause in [
+            "missing-dir",
+            "missing-meta",
+            "stale-schema",
+            "pending",
+            "migration",
+            "missing-db",
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let meta_path = tmp.path().join("fts_meta.db");
+            let fts_dir = tmp.path().join("fts_index");
+            let meta = FtsMetaDb::open_at(&meta_path).unwrap();
+            meta.upsert_meta_ok(
+                "c:/old.jpg",
+                Uuid::new_v4(),
+                std::path::Path::new("c:/"),
+                IndexKind::Image,
+                1,
+                1,
+            )
+            .unwrap();
+            meta.mark_scanned_once("c:/", "complete").unwrap();
+            drop(meta);
+            if cause != "missing-dir" {
+                if cause == "stale-schema" {
+                    std::fs::create_dir(&fts_dir).unwrap();
+                    let mut schema = tantivy::schema::Schema::builder();
+                    schema
+                        .add_text_field("path", tantivy::schema::STRING | tantivy::schema::STORED);
+                    drop(tantivy::Index::create_in_dir(&fts_dir, schema.build()).unwrap());
+                } else {
+                    seed_valid_fts_dir(tmp.path());
+                }
+            }
+            match cause {
+                "missing-meta" => std::fs::remove_file(fts_dir.join("meta.json")).unwrap(),
+                "missing-db" => std::fs::remove_file(&meta_path).unwrap(),
+                "pending" => {
+                    // Legacy pending can coexist with unchanged inventory and scan marks.
+                    let conn = rusqlite::Connection::open(&meta_path).unwrap();
+                    conn.execute(
+                        "INSERT INTO index_state(key,value) VALUES('tantivy_rebuild_pending',1)",
+                        [],
+                    )
+                    .unwrap();
+                }
+                "migration" => {
+                    let conn = rusqlite::Connection::open(&meta_path).unwrap();
+                    conn.execute_batch("PRAGMA user_version=9").unwrap();
+                }
+                _ => {}
+            }
+            // Closed SQLite fixtures use the actual user-store filenames and current
+            // record shapes. Byte equality catches any accidental open/migration/write
+            // as well as deletion; these stores are outside the FTS rebuild owner.
+            let user_stores = [
+                (
+                    "tags.db",
+                    "CREATE TABLE item_tags(item_key TEXT NOT NULL, tag TEXT NOT NULL, tag_key TEXT NOT NULL, applied_at INTEGER NOT NULL, PRIMARY KEY(item_key,tag_key));
+                     CREATE TABLE tag_item_state(item_key TEXT PRIMARY KEY, decided_at INTEGER NOT NULL, source TEXT NOT NULL);
+                     INSERT INTO item_tags VALUES('c:/user/book/page.jpg','UserTag','usertag',123);
+                     INSERT INTO tag_item_state VALUES('c:/user/book/page.jpg',123,'edit');",
+                ),
+                (
+                    // RatingDb::db_path() uses singular rating.db.
+                    "rating.db",
+                    "CREATE TABLE ratings(path TEXT PRIMARY KEY, stars INTEGER NOT NULL, rated_at_ms INTEGER, source_path TEXT, kind INTEGER, entry_name TEXT, page_num INTEGER, dir_prefix TEXT, archive_format TEXT, zipdir_is_archive INTEGER, zipdir_representative TEXT);
+                     INSERT INTO ratings(path,stars,rated_at_ms,source_path) VALUES('c:/user/book/page.jpg',5,123,'c:/user/book/page.jpg');",
+                ),
+                (
+                    "book_bookmarks.db",
+                    "CREATE TABLE book_bookmarks(id INTEGER PRIMARY KEY AUTOINCREMENT, container_key TEXT NOT NULL, container_path TEXT NOT NULL, container_kind TEXT NOT NULL, page_kind TEXT NOT NULL, page_value TEXT NOT NULL, page_key TEXT NOT NULL, page_index_hint INTEGER NOT NULL DEFAULT 0, created_at_ms INTEGER NOT NULL, title TEXT, UNIQUE(container_key,page_kind,page_key));
+                     INSERT INTO book_bookmarks(container_key,container_path,container_kind,page_kind,page_value,page_key,page_index_hint,created_at_ms,title) VALUES('c:/user/book','C:/User/Book','image_folder','relative_path','page.jpg','page.jpg',0,123,'User bookmark');",
+                ),
+                (
+                    "settings.db",
+                    "CREATE TABLE settings_kv(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                     CREATE TABLE favorites(id BLOB PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL, sort_index INTEGER NOT NULL, auto_index_structure INTEGER NOT NULL DEFAULT 0, auto_index_metadata INTEGER NOT NULL DEFAULT 0, auto_index_thumbs INTEGER NOT NULL DEFAULT 0, auto_index_similar INTEGER NOT NULL DEFAULT 0);
+                     INSERT INTO settings_kv VALUES('show_hidden_files','true');
+                     INSERT INTO favorites(id,name,path,sort_index,auto_index_metadata) VALUES(x'00000000000000000000000000000001','User favorite','C:/User/Book',0,1);",
+                ),
+            ];
+            let user_before = user_stores
+                .iter()
+                .map(|(name, fixture_sql)| {
+                    let path = tmp.path().join(name);
+                    let conn = rusqlite::Connection::open(&path).unwrap();
+                    conn.execute_batch(fixture_sql).unwrap();
+                    drop(conn);
+                    (path.clone(), std::fs::read(&path).unwrap())
+                })
+                .collect::<Vec<_>>();
+            let wiped = std::cell::Cell::new(0);
+            let result = open_stores_with_rebuild_sync_using(tmp.path(), cause, None, |path| {
+                assert_durable_reset_before_wipe(tmp.path());
+                wiped.set(wiped.get() + 1);
+                std::fs::remove_dir_all(path)
+            })
+            .unwrap();
+            assert_eq!(wiped.get(), 1, "{cause}");
+            assert!(!result.0.tantivy_rebuild_pending().unwrap(), "{cause}");
+            assert_eq!(result.1.searcher().num_docs(), 0, "{cause}");
+            for (path, before) in user_before {
+                assert_eq!(
+                    std::fs::read(&path).unwrap(),
+                    before,
+                    "{cause}: {} must remain byte-for-byte unchanged",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pending_corrupt_old_metadata_bypasses_probe_entirely() {
+        for corrupted in ["meta.json", ".managed.json"] {
+            let tmp = TempDir::new().unwrap();
+            let meta = FtsMetaDb::open_at(&tmp.path().join("fts_meta.db")).unwrap();
+            meta.upsert_meta_ok(
+                "c:/old.jpg",
+                Uuid::new_v4(),
+                std::path::Path::new("c:/"),
+                IndexKind::Image,
+                1,
+                1,
+            )
+            .unwrap();
+            meta.request_item_index_rebuild().unwrap();
+            drop(meta);
+            seed_valid_fts_dir(tmp.path());
+            let old = tmp.path().join("fts_index").join(corrupted);
+            std::fs::write(&old, b"{corrupt-unparseable-old-index").unwrap();
+            let (meta, fts) = open_stores_with_rebuild_sync_using_probe(
+                tmp.path(),
+                corrupted,
+                None,
+                |path| {
+                    assert_durable_reset_before_wipe(tmp.path());
+                    std::fs::remove_dir_all(path)
+                },
+                |_| panic!("pending must bypass ALL old-index probes"),
+            )
+            .unwrap();
+            assert!(!meta.tantivy_rebuild_pending().unwrap());
+            assert_eq!(fts.searcher().num_docs(), 0);
+        }
+    }
+
+    #[test]
+    fn corrupt_old_metadata_without_pending_is_non_destructive_error() {
+        for corrupted in ["meta.json", ".managed.json"] {
+            let tmp = TempDir::new().unwrap();
+            let meta = FtsMetaDb::open_at(&tmp.path().join("fts_meta.db")).unwrap();
+            meta.upsert_meta_ok(
+                "c:/old.jpg",
+                Uuid::new_v4(),
+                std::path::Path::new("c:/"),
+                IndexKind::Image,
+                1,
+                1,
+            )
+            .unwrap();
+            meta.mark_scanned_once("c:/", "complete").unwrap();
+            drop(meta);
+            seed_valid_fts_dir(tmp.path());
+            let old = tmp.path().join("fts_index").join(corrupted);
+            std::fs::write(&old, b"{corrupt-unparseable-old-index").unwrap();
+            let result = open_stores_with_rebuild_sync_using(tmp.path(), corrupted, None, |_| {
+                panic!("probe error must not wipe")
+            });
+            assert!(matches!(result, Err(StoreOpenFailure::Unavailable)));
+            assert_eq!(
+                std::fs::read(&old).unwrap(),
+                b"{corrupt-unparseable-old-index"
+            );
+            let meta = FtsMetaDb::open_at(&tmp.path().join("fts_meta.db")).unwrap();
+            assert!(!meta.tantivy_rebuild_pending().unwrap());
+            assert!(meta.get("c:/old.jpg").unwrap().is_some());
+            assert_eq!(
+                meta.scanned_once("c:/").unwrap().as_deref(),
+                Some("complete")
+            );
+        }
+    }
+
+    #[test]
+    fn rebuild_create_and_pending_clear_failures_keep_durable_marker() {
+        for checkpoint in ["create", "pending-clear"] {
+            let tmp = TempDir::new().unwrap();
+            let meta = FtsMetaDb::open_at(&tmp.path().join("fts_meta.db")).unwrap();
+            meta.request_item_index_rebuild().unwrap();
+            drop(meta);
+            let fts_dir = tmp.path().join("fts_index");
+            let result = open_stores_with_rebuild_sync_using(
+                tmp.path(),
+                checkpoint,
+                None,
+                |path| {
+                    assert_durable_reset_before_wipe(tmp.path());
+                    if checkpoint == "create" {
+                        std::fs::write(path, b"injected directory creation failure")?;
+                    } else {
+                        let conn =
+                            rusqlite::Connection::open(tmp.path().join("fts_meta.db")).unwrap();
+                        conn.execute_batch("CREATE TRIGGER deny_pending_clear BEFORE DELETE ON index_state BEGIN SELECT RAISE(FAIL, 'injected pending clear failure'); END;").unwrap();
+                    }
+                    Ok(())
+                },
+            );
+            assert!(matches!(result, Err(StoreOpenFailure::RebuildDeferred)));
+            let meta = FtsMetaDb::open_at(&tmp.path().join("fts_meta.db")).unwrap();
+            assert!(meta.tantivy_rebuild_pending().unwrap());
+            drop(meta);
+            // Remove only the injected obstruction. The next startup takes the same owner path.
+            if checkpoint == "create" {
+                std::fs::remove_file(&fts_dir).unwrap();
+            } else {
+                let conn = rusqlite::Connection::open(tmp.path().join("fts_meta.db")).unwrap();
+                conn.execute_batch("DROP TRIGGER deny_pending_clear")
+                    .unwrap();
+            }
+            let (meta, fts) =
+                open_stores_with_rebuild_sync(tmp.path(), "next-startup", None).unwrap();
+            assert!(!meta.tantivy_rebuild_pending().unwrap());
+            assert_eq!(fts.searcher().num_docs(), 0);
+        }
+    }
+
+    #[test]
+    fn unreadable_pending_marker_does_not_probe_or_wipe_old_index() {
+        let tmp = TempDir::new().unwrap();
+        let meta_path = tmp.path().join("fts_meta.db");
+        drop(FtsMetaDb::open_at(&meta_path).unwrap());
+        let sentinel = seed_valid_fts_dir(tmp.path());
+        let conn = rusqlite::Connection::open(&meta_path).unwrap();
+        conn.execute(
+            "INSERT INTO index_state(key,value) VALUES('tantivy_rebuild_pending',x'ff')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let result = open_stores_with_rebuild_sync_using_probe(
+            tmp.path(),
+            "invalid-pending",
+            None,
+            |_| panic!("pending read error must not wipe"),
+            |_| panic!("pending read error must not probe"),
+        );
+        assert!(matches!(result, Err(StoreOpenFailure::Unavailable)));
+        assert!(sentinel.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pending_read_denied_old_metadata_stops_at_wipe_with_marker_retained() {
+        use std::os::windows::fs::OpenOptionsExt;
+        for name in ["meta.json", ".managed.json"] {
+            let tmp = TempDir::new().unwrap();
+            let meta_path = tmp.path().join("fts_meta.db");
+            let meta = FtsMetaDb::open_at(&meta_path).unwrap();
+            meta.request_item_index_rebuild().unwrap();
+            drop(meta);
+            seed_valid_fts_dir(tmp.path());
+            let old = tmp.path().join("fts_index").join(name);
+            let blocking = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&old)
+                .unwrap();
+            assert!(
+                std::fs::read(&old).is_err(),
+                "fixture must actually deny file reads"
+            );
+            let result = open_stores_with_rebuild_sync_using_probe(
+                tmp.path(),
+                name,
+                None,
+                |path| {
+                    assert_durable_reset_before_wipe(tmp.path());
+                    std::fs::remove_dir_all(path)
+                },
+                |_| panic!("pending must bypass unreadable metadata probe"),
+            );
+            assert!(matches!(result, Err(StoreOpenFailure::RebuildDeferred)));
+            let meta = FtsMetaDb::open_at(&meta_path).unwrap();
+            assert!(meta.tantivy_rebuild_pending().unwrap());
+            drop(meta);
+            // This obstruction also denies deletion: it is deliberately not the
+            // corrupt-but-wipeable fixture covered by the probe-zero regression.
+            drop(blocking);
+            let (meta, fts) =
+                open_stores_with_rebuild_sync(tmp.path(), "unblocked-next-start", None).unwrap();
+            assert!(!meta.tantivy_rebuild_pending().unwrap());
+            assert_eq!(fts.searcher().num_docs(), 0);
+        }
     }
 
     #[test]

@@ -35,12 +35,45 @@ pub fn cache_root() -> PathBuf {
 /// キャッシュ ZIP 自身を開いたときに「入れ子アーカイブ検出 → 再変換提案」の
 /// ループに入らないためのガードに使う (v1.3.0)。
 pub fn is_under_cache_root(path: &Path) -> bool {
-    path.starts_with(cache_root())
+    crate::path_key::physical_path_is_within(path, &cache_root())
 }
 
 /// DB ファイルのパス。
 pub fn db_path() -> PathBuf {
     crate::data_dir::get().join("archive_cache.db")
+}
+
+/// Worker-only consistency check. A missing manifest must not turn a cache
+/// recorded by the new converter into an archive with no nested boundaries.
+/// Mark the rebuildable cache as legacy; the next policy-aware open reconverts.
+pub(crate) fn mark_missing_origin_manifest_for_reconversion(cache_path: &Path) -> bool {
+    let expected = ArchiveCacheDb::open_readonly()
+        .ok()
+        .and_then(|db| {
+            let conn = db.conn.lock().ok()?;
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM converted_archives WHERE cached_zip_path=?1 AND origin_manifest_version=1)",
+                [cache_path.to_string_lossy().as_ref()],
+                |row| row.get::<_, bool>(0),
+            ).ok()
+        })
+        .unwrap_or(false);
+    if expected {
+        crate::logger::log(format!(
+            "archive_cache: missing origin manifest: {}. Reconvert on next visibility-aware open.",
+            cache_path.display()
+        ));
+        if let Ok(db) = ArchiveCacheDb::open()
+            && let Ok(conn) = db.conn.lock()
+            && let Err(error) = conn.execute(
+                "UPDATE converted_archives SET origin_manifest_version=0 WHERE cached_zip_path=?1 AND origin_manifest_version=1",
+                [cache_path.to_string_lossy().as_ref()],
+            )
+        {
+            crate::logger::log(format!("archive_cache: could not mark missing manifest for reconversion: {error}"));
+        }
+    }
+    expected
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -133,7 +166,103 @@ pub struct ArchiveCacheDb {
     convert_lock: Mutex<()>,
 }
 
+/// Read-only mapping evidence for an aggregate worker. File existence alone never proves
+/// that a ZIP is a converted cache, or that its recorded source snapshot is still current.
+pub(crate) struct ConvertedArchiveSnapshot {
+    pub(crate) source_path: PathBuf,
+    pub(crate) cached_zip_path: PathBuf,
+    pub(crate) origin_manifest_version: i64,
+    source_mtime: i64,
+    source_size: i64,
+    cached_size: i64,
+    cached_modified: Option<std::time::SystemTime>,
+}
+
+impl ConvertedArchiveSnapshot {
+    pub(crate) fn is_current(&self) -> bool {
+        let Ok(source) = std::fs::metadata(&self.source_path) else {
+            return false;
+        };
+        let Ok(cached) = std::fs::metadata(&self.cached_zip_path) else {
+            return false;
+        };
+        source.is_file()
+            && cached.is_file()
+            && crate::ui_helpers::mtime_secs(&source) == self.source_mtime
+            && source.len() as i64 == self.source_size
+            && cached.len() as i64 == self.cached_size
+            && cached.modified().ok() == self.cached_modified
+    }
+}
+
 impl ArchiveCacheDb {
+    /// Worker-only lookup; no access-time updates, invalidation or cache deletion.
+    pub(crate) fn snapshot_for_source(&self, source: &Path) -> Option<ConvertedArchiveSnapshot> {
+        self.read_projection_snapshot("src_path_key", &crate::path_key::normalize(source))
+    }
+
+    pub(crate) fn snapshot_for_cached_zip(
+        &self,
+        cached: &Path,
+    ) -> Option<ConvertedArchiveSnapshot> {
+        let normal = crate::path_key::physical_path_spelling(cached)?;
+        let snapshot =
+            self.read_projection_snapshot("replace(cached_zip_path, char(92), '/')", &normal);
+        if snapshot.is_some() {
+            return snapshot;
+        }
+        // Match the other safe Windows spelling with a bounded lookup. Persisted
+        // source keys and stored paths remain unchanged; do not list the database.
+        let verbatim = if let Some(unc) = normal.strip_prefix("//") {
+            format!("//?/unc/{unc}")
+        } else if normal.as_bytes().get(1) == Some(&b':') {
+            format!("//?/{normal}")
+        } else {
+            return None;
+        };
+        self.read_projection_snapshot("replace(cached_zip_path, char(92), '/')", &verbatim)
+    }
+
+    fn read_projection_snapshot(
+        &self,
+        column: &str,
+        value: &str,
+    ) -> Option<ConvertedArchiveSnapshot> {
+        let conn = self.conn.lock().ok()?;
+        // Only the two fixed column expressions above reach this query. Old readonly databases
+        // may predate the origin column; their recorded conversions are legacy evidence.
+        let read = |version: &str| {
+            conn.query_row(
+                &format!("SELECT src_path, src_mtime, src_size, cached_zip_path, cached_zip_size, {version} FROM converted_archives WHERE {column}=?1 COLLATE NOCASE"),
+                [value],
+                |row| Ok(ConvertedArchiveSnapshot {
+                    source_path: PathBuf::from(row.get::<_, String>(0)?),
+                    source_mtime: row.get(1)?, source_size: row.get(2)?,
+                    cached_zip_path: PathBuf::from(row.get::<_, String>(3)?),
+                    cached_size: row.get(4)?, origin_manifest_version: row.get(5)?,
+                    cached_modified: None,
+                }),
+            )
+        };
+        let mut snapshot = read("origin_manifest_version")
+            .or_else(|error| {
+                if error
+                    .to_string()
+                    .contains("no such column: origin_manifest_version")
+                {
+                    read("0")
+                } else {
+                    Err(error)
+                }
+            })
+            .ok()?;
+        drop(conn);
+        snapshot.cached_modified = std::fs::metadata(&snapshot.cached_zip_path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
+        Some(snapshot)
+    }
+
     /// DB を開く (なければ作成)。`<data_dir>` 配下に書き込む。
     pub fn open() -> rusqlite::Result<Self> {
         let path = db_path();
@@ -232,6 +361,44 @@ impl ArchiveCacheDb {
         Some(zip_path)
     }
 
+    /// Older caches remain usable until a policy needs the original nested boundaries.
+    pub fn lookup_with_visibility(
+        &self,
+        src_path: &Path,
+        src_mtime: i64,
+        src_size: i64,
+        policy: &crate::file_type_visibility::FileTypeVisibility,
+    ) -> Option<PathBuf> {
+        if policy.requires_archive_origins() && !self.has_origin_manifest(src_path) {
+            return None;
+        }
+        self.lookup(src_path, src_mtime, src_size)
+    }
+
+    pub fn peek_with_visibility(
+        &self,
+        src_path: &Path,
+        src_mtime: i64,
+        src_size: i64,
+        policy: &crate::file_type_visibility::FileTypeVisibility,
+    ) -> Option<PathBuf> {
+        if policy.requires_archive_origins() && !self.has_origin_manifest(src_path) {
+            return None;
+        }
+        self.peek(src_path, src_mtime, src_size)
+    }
+
+    fn has_origin_manifest(&self, src_path: &Path) -> bool {
+        self.conn.lock().ok().and_then(|conn| {
+            conn.query_row(
+                "SELECT origin_manifest_version FROM converted_archives WHERE src_path_key=?1",
+                [crate::path_key::normalize(src_path)],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok()
+        }) == Some(1)
+    }
+
     /// [`Self::lookup`] の読み取り専用版。`last_access_at` を更新せず、無効エントリの
     /// 掃除もしない (SELECT + `exists()` のみ、書き込みトランザクションなし)。
     ///
@@ -280,8 +447,8 @@ impl ArchiveCacheDb {
         conn.execute(
             "INSERT OR REPLACE INTO converted_archives \
              (src_path_key, src_path, src_mtime, src_size, format, \
-              cached_zip_path, cached_zip_size, converted_at, last_access_at, image_count, password_required) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10)",
+              cached_zip_path, cached_zip_size, converted_at, last_access_at, image_count, password_required, origin_manifest_version) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10, 1)",
             params![
                 &key,
                 src_str,
@@ -571,6 +738,16 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     let _ = conn.execute_batch(
         "ALTER TABLE converted_archives ADD COLUMN password_required INTEGER NOT NULL DEFAULT 0;",
     );
+    let columns = conn
+        .prepare("PRAGMA table_info(converted_archives)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns
+        .iter()
+        .any(|column| column == "origin_manifest_version")
+    {
+        conn.execute_batch("ALTER TABLE converted_archives ADD COLUMN origin_manifest_version INTEGER NOT NULL DEFAULT 0")?;
+    }
     Ok(())
 }
 
@@ -623,6 +800,46 @@ fn remove_cache_file_and_dirs(zip_path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visibility_cache_root_and_projection_lookup_accept_physical_spellings() {
+        let guard = crate::data_dir::TestDataDirGuard::new();
+        let (_source, cached) = crate::archive_visibility::legacy_conversion_fixture(guard.path());
+        let canonical = std::fs::canonicalize(&cached).unwrap();
+        let root = cache_root();
+        assert!(is_under_cache_root(&cached));
+        assert!(is_under_cache_root(&canonical));
+        let upper_slash = PathBuf::from(cached.to_string_lossy().to_uppercase().replace('\\', "/"));
+        assert!(is_under_cache_root(&upper_slash));
+        assert!(!is_under_cache_root(
+            &root.with_file_name("archive_cache_other").join("book.zip")
+        ));
+        assert!(!is_under_cache_root(&root.join("..").join("outside.zip")));
+        let db = ArchiveCacheDb::open_readonly().unwrap();
+        for spelling in [&cached, &canonical, &upper_slash] {
+            let snapshot = db.snapshot_for_cached_zip(spelling).unwrap();
+            assert_eq!(snapshot.cached_zip_path, cached);
+        }
+        let conn = rusqlite::Connection::open(db_path()).unwrap();
+        conn.execute(
+            "UPDATE converted_archives SET cached_zip_path=?1",
+            [canonical.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+        for spelling in [&cached, &canonical, &upper_slash] {
+            let snapshot = db.snapshot_for_cached_zip(spelling).unwrap();
+            assert_eq!(snapshot.cached_zip_path, canonical);
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT cached_zip_path FROM converted_archives",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            canonical.to_string_lossy()
+        );
+    }
 
     #[test]
     fn schema_and_roundtrip() {
@@ -681,6 +898,79 @@ mod tests {
         assert_eq!(archive.total_size().unwrap(), 0);
         epub.retire_all_current().unwrap();
         assert_eq!(archive.total_size().unwrap(), 0);
+    }
+
+    #[test]
+    fn visibility_old_cache_requires_reconversion_only_when_origins_are_needed() {
+        use crate::file_type_visibility::{FileTypeCategory, FileTypeVisibility};
+        let guard = crate::data_dir::TestDataDirGuard::new();
+        let db = ArchiveCacheDb::open().unwrap();
+        let src = guard.path().join("book.7z");
+        let cached = guard.path().join("book.zip");
+        std::fs::write(&src, b"7z").unwrap();
+        std::fs::write(&cached, b"zip").unwrap();
+        let meta = std::fs::metadata(&src).unwrap();
+        let mtime = crate::ui_helpers::mtime_secs(&meta);
+        let size = meta.len() as i64;
+        db.record(
+            &src,
+            mtime,
+            size,
+            ArchiveFormat::SevenZ,
+            &cached,
+            3,
+            1,
+            false,
+        )
+        .unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE converted_archives SET origin_manifest_version=0",
+                [],
+            )
+            .unwrap();
+        let all = FileTypeVisibility::default();
+        assert_eq!(
+            db.peek_with_visibility(&src, mtime, size, &all),
+            Some(cached.clone())
+        );
+        let mut image_exclusion = all.clone();
+        image_exclusion.excluded_extensions.insert("png".into());
+        assert_eq!(
+            db.lookup_with_visibility(&src, mtime, size, &image_exclusion),
+            Some(cached.clone())
+        );
+        let mut nested_exclusion = all.clone();
+        nested_exclusion
+            .excluded_categories
+            .insert(FileTypeCategory::Zip);
+        assert!(
+            db.peek_with_visibility(&src, mtime, size, &nested_exclusion)
+                .is_none()
+        );
+        assert!(
+            db.lookup_with_visibility(&src, mtime, size, &nested_exclusion)
+                .is_none()
+        );
+        assert!(cached.exists());
+        assert_eq!(db.list_all().unwrap().len(), 1);
+        db.record(
+            &src,
+            mtime,
+            size,
+            ArchiveFormat::SevenZ,
+            &cached,
+            3,
+            1,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            db.peek_with_visibility(&src, mtime, size, &nested_exclusion),
+            Some(cached)
+        );
     }
 
     #[test]

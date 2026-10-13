@@ -141,10 +141,12 @@ const {
   ViewerAdjustmentPanel,
   ViewerImageUpdateExitReason,
   ViewerViewTrimPanel,
+  ViewerBookmarkPanel,
   VIEWER_MENU_MAX_ACTIONS,
   VIEWER_PANEL_TABS,
   activateFolderContainerForImage,
   applyContainerData,
+  applyCollectionData,
   applyRemoteSessionId,
   browserDoubleTapTelemetryEvent,
   commandTelemetryEvent,
@@ -156,6 +158,7 @@ const {
   enqueueVideoProgress,
   reportVideoProgressBeforePageHide,
   containerInitialImageIndex,
+  containerResumeRefusalNotice,
   createRemoteHomeDataRefreshCoordinator,
   createFavoriteSearchForm,
   createGridTile,
@@ -1184,6 +1187,7 @@ test("book bookmark rows preserve DB order and keep hint separate from resolved 
   };
   const list = normalizeRemoteBookBookmarkList({
     supported: true,
+    visibility_notice: "再変換後に表示できます",
     rows: [
       {
         id: 20,
@@ -1207,6 +1211,8 @@ test("book bookmark rows preserve DB order and keep hint separate from resolved 
   });
 
   assert.equal(list.supported, true);
+  assert.equal(list.visibilityNotice, "再変換後に表示できます");
+  assert.equal(normalizeRemoteBookBookmarkList({ supported: true, rows: [] }).visibilityNotice, null);
   assert.deepEqual(list.rows.map((row) => row.id), [20, 10]);
   assert.equal(remoteBookBookmarkDisplayPage(list.rows[0]), 5);
   assert.equal(remoteBookBookmarkDisplayPage(list.rows[1]), 8);
@@ -1252,6 +1258,16 @@ test("container opening resumes the matching page and otherwise falls back safel
     resumePage: images[1].address,
     images,
   }), -1);
+  for (const resumeRefusal of ["saved_page_unavailable", "legacy_position_unverified"]) {
+    assert.equal(containerInitialImageIndex({
+      openMode: "resume_page",
+      resumePage: null,
+      resumeRefusal,
+      images,
+    }), -1);
+    assert.match(containerResumeRefusalNotice(resumeRefusal), /一覧からページを選んでください/);
+  }
+  assert.equal(containerResumeRefusalNotice(null), "");
 });
 
 test("a collection root returns to its list without exposing a root kind", () => {
@@ -4697,6 +4713,85 @@ test("folder rating fallback notice is visible on the rendered grid", async () =
   }
 });
 
+test("visibility resume refusals remain on the grid with a visible selection notice", () => {
+  const previousResizeObserver = globalThis.ResizeObserver;
+  const previousHistory = globalThis.history;
+  globalThis.ResizeObserver = class { observe() {} disconnect() {} };
+  globalThis.history = { state: {} };
+  const address = { path: testPath("refused-book"), subresource: { kind: "file" } };
+  const entry = {
+    kind: "image",
+    name: "002.jpg",
+    address: { path: testPath("refused-book/002.jpg"), subresource: { kind: "file" } },
+  };
+  const findNotice = (node) => {
+    if (node.classList?.contains("grid-action-notice") ||
+        String(node.className ?? "").split(/\s+/).includes("grid-action-notice")) return node;
+    for (const child of node.children ?? []) {
+      const found = findNotice(child);
+      if (found) return found;
+    }
+    return null;
+  };
+  try {
+    for (const reason of ["saved_page_unavailable", "legacy_position_unverified"]) {
+      applyContainerData(address, {
+        kind: "folder",
+        effective_address: address,
+        entries: [entry],
+        page_groups: [{ anchor: entry.address, pages: [entry.address], slice: "full" }],
+        image_count: 1,
+        resume_page: null,
+        resume_refusal: reason,
+        open_mode: "grid",
+      }, false);
+      const installed = containerRuntimeStateForTest().container;
+      assert.equal(installed.resumeRefusal, reason);
+      assert.equal(containerInitialImageIndex({ ...installed, images: [entry] }), -1);
+      renderFolder();
+      const notice = findNotice(app);
+      assert.ok(notice);
+      assert.equal(notice.hidden, false);
+      assert.equal(notice.textContent, containerResumeRefusalNotice(reason));
+    }
+  } finally {
+    globalThis.ResizeObserver = previousResizeObserver;
+    globalThis.history = previousHistory;
+  }
+});
+
+test("archive visibility notices are visible in aggregate grid and in-book bookmarks", () => {
+  const noticeText = "古い変換キャッシュのため表示できない項目があります。本を開くか、キャッシュを作り直すと表示されます。";
+  const previousHistory = globalThis.history;
+  globalThis.history = { state: {} };
+  const find = (node, className) => {
+    if (node.classList?.contains(className) || String(node.className ?? "").split(/\s+/).includes(className)) return node;
+    for (const child of node.children ?? []) {
+      const found = find(child, className);
+      if (found) return found;
+    }
+    return null;
+  };
+  try {
+    for (const collectionKind of ["rating", "bookmarks"]) {
+      applyCollectionData({ collectionKind, value: "4" }, {
+        entries: [], visibility_notice: noticeText,
+      }, false);
+      renderFolder();
+      const notice = find(app, "grid-action-notice");
+      assert.ok(notice);
+      assert.equal(notice.hidden, false);
+      assert.equal(notice.textContent, noticeText);
+    }
+    const panel = new ViewerBookmarkPanel();
+    panel.list = normalizeRemoteBookBookmarkList({ supported: true, rows: [], visibility_notice: noticeText });
+    panel.render();
+    assert.ok(panel.content.children.some((node) => node.textContent === noticeText));
+  } finally {
+    globalThis.history = previousHistory;
+  }
+});
+
 test("Remote rating write keeps rendered folder rows fixed until explicit reload", async () => {
   const folder = testPath("rating-order");
   const before = ["b.jpg", "a.jpg"];
@@ -5679,4 +5774,45 @@ test("current audio decode failure remains terminal for its listing", async () =
     FakeElement.decodeHook = null;
     globalThis.fetch = oldFetch;
   }
+});
+
+
+test("G1 extracted view keys select only a session view kind", async () => {
+  const { extractedResultViewMode } = await import("./app.js");
+  for (const direction of ["ltr", "rtl"]) {
+    for (const requested of ["ltr", "ltr_cover", "rtl", "rtl_cover"]) {
+      assert.equal(extractedResultViewMode(requested, direction), direction);
+    }
+    assert.equal(extractedResultViewMode("single", direction), "single");
+    assert.equal(extractedResultViewMode("split_ltr", direction), `split_${direction}`);
+    assert.equal(extractedResultViewMode("split_rtl", direction), `split_${direction}`);
+  }
+});
+
+test("G1 extracted menu exposes the three temporary display choices", () => {
+  const menu = viewerMenuDefinitions({ hasContainer: true, barsVisible: true, extractedResult: true,
+    supportsFinalCoverSetting: true, supportsSingletonPlacementSetting: true, supportsPageAloneSetting: true });
+  assert.equal(menu.spread.actions.length, 4);
+  assert.deepEqual(menu.spread.actions.slice(1).map(([,label])=>label), ["1ページ表示","見開き","横長分割"]);
+  assert.match(menu.spread.title, /記憶しません/);
+});
+
+
+test("G1 Remote return adoption restores the book response after temporary A2 spread", () => {
+  const address = {path:testPath("Book"),subresource:{kind:"file"}};
+  const entries = [1,2,3].map((i)=>({kind:"image",name:`${i}.jpg`,path:testPath(`Book/${i}.jpg`)}));
+  const book = {entries,configured_spread_mode:"rtl_cover",effective_spread_mode:"rtl_cover",
+    reading_direction:"rtl",page_groups:[[0],[1,2]]};
+  applyContainerData(address,book,false);
+  const before = containerRuntimeStateForTest();
+  const route = {collectionKind:"rating",value:4};
+  for (const mode of ["single","ltr"]) {
+    applyCollectionData(route,{entries,configured_spread_mode:mode,effective_spread_mode:mode,
+      reading_direction:"ltr",page_groups:mode === "single" ? [[0],[1],[2]] : [[0,1],[2]]},false);
+    assert.equal(containerRuntimeStateForTest().container,null);
+  }
+  applyContainerData(address,book,false);
+  const after = containerRuntimeStateForTest();
+  assert.deepEqual(after.container,before.container);
+  assert.deepEqual(after.pageGroups,before.pageGroups);
 });

@@ -48,6 +48,7 @@ pub enum ContextMenuItemId {
     CutFiles,
     CopyFiles,
     OrganizeFiles,
+    ConvertImageFolderToZip,
     NewFolder,
     Paste,
     Rename,
@@ -81,6 +82,7 @@ impl ContextMenuItemId {
         Self::CutFiles,
         Self::CopyFiles,
         Self::OrganizeFiles,
+        Self::ConvertImageFolderToZip,
         Self::NewFolder,
         Self::Paste,
         Self::Rename,
@@ -114,6 +116,7 @@ impl ContextMenuItemId {
             Self::CutFiles => "CutFiles",
             Self::CopyFiles => "CopyFiles",
             Self::OrganizeFiles => "OrganizeFiles",
+            Self::ConvertImageFolderToZip => "ConvertImageFolderToZip",
             Self::NewFolder => "NewFolder",
             Self::Paste => "Paste",
             Self::Rename => "Rename",
@@ -162,6 +165,7 @@ impl ContextMenuItemId {
             Self::CutFiles => "切り取り",
             Self::CopyFiles => "コピー",
             Self::OrganizeFiles => "ファイル整理先…",
+            Self::ConvertImageFolderToZip => "ZIP に変換…",
             Self::NewFolder => "新しいフォルダ…",
             Self::Paste => "貼り付け",
             Self::Rename => "名前の変更…",
@@ -199,6 +203,7 @@ impl ContextMenuItemId {
             MenuCommand::CutFiles => Self::CutFiles,
             MenuCommand::CopyFiles => Self::CopyFiles,
             MenuCommand::OrganizeFiles => Self::OrganizeFiles,
+            MenuCommand::ConvertImageFolderToZip => Self::ConvertImageFolderToZip,
             MenuCommand::CopyPath => Self::CopyPath,
             MenuCommand::CopyFileName => Self::CopyFileName,
             MenuCommand::CopyPageName => Self::CopyPageName,
@@ -222,7 +227,8 @@ impl ContextMenuItemId {
             MenuCommand::RemoveFromCollection => Self::RemoveFromCollection,
             MenuCommand::Deselect => Self::Deselect,
             MenuCommand::RemoveReadingHistory => Self::RemoveReadingHistory,
-            MenuCommand::ConvertEpubToPdf
+            MenuCommand::EditBookComposition
+            | MenuCommand::ConvertEpubToPdf
             | MenuCommand::ExternalTool(_)
             | MenuCommand::OpenWithAssociation { .. } => return None,
         })
@@ -700,6 +706,8 @@ pub enum MenuNode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuCommand {
+    /// Dynamic current-book operation; it has no application key binding.
+    EditBookComposition,
     ConvertEpubToPdf,
     NewFolder,
     Paste,
@@ -707,6 +715,7 @@ pub enum MenuCommand {
     CutFiles,
     CopyFiles,
     OrganizeFiles,
+    ConvertImageFolderToZip,
     CopyPath,
     CopyFileName,
     CopyPageName,
@@ -1405,6 +1414,12 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
             ],
         );
     }
+    if input.surface == ContextMenuSurface::Grid && input.kind == ContextMenuItemKind::Folder {
+        push_group(
+            &mut nodes,
+            [item(MenuCommand::ConvertImageFolderToZip, "ZIP に変換…")],
+        );
+    }
     if input.surface == ContextMenuSurface::Grid && input.has_epub_target {
         push_group(&mut nodes, [epub_convert_submenu()]);
     }
@@ -1971,6 +1986,7 @@ mod tests {
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
+                    "ZIP に変換…",
                     "ゴミ箱へ移動 (タグ・評価も整理)",
                 ][..],
             ),
@@ -2388,7 +2404,12 @@ mod tests {
         folder.can_use_folder_commands = true;
         assert_labels(
             folder,
-            &["新しいフォルダ…", "貼り付け", "このフォルダのパスをコピー"],
+            &[
+                "新しいフォルダ…",
+                "貼り付け",
+                "このフォルダのパスをコピー",
+                "ZIP に変換…",
+            ],
         );
 
         let image = labels(&build_context_menu(&input(

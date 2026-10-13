@@ -156,7 +156,7 @@ fn parse_args() -> Args {
             }
             "--help" | "-h" => {
                 print_help();
-                std::process::exit(0);
+                exit_with_logs(0);
             }
             other => panic!("unknown arg: {other}"),
         }
@@ -209,7 +209,19 @@ fn print_help() {
     println!("  realcugan_4x, nmkd_siax_4x, denoise_realplksr");
 }
 
+struct LoggingShutdown;
+impl Drop for LoggingShutdown {
+    fn drop(&mut self) {
+        mimageviewer::finish_logs();
+    }
+}
+fn exit_with_logs(code: i32) -> ! {
+    mimageviewer::finish_logs();
+    std::process::exit(code)
+}
+
 fn main() {
+    let _logs = LoggingShutdown;
     // ロガー初期化 (DLL preload 等の診断ログを %APPDATA%/mimageviewer/logs/ に出す)
     mimageviewer::logger::init();
 
@@ -257,7 +269,7 @@ fn main() {
             eprintln!(
                 "  cargo build --release でメインバイナリも一緒にビルドしてから再実行してください。"
             );
-            std::process::exit(1);
+            exit_with_logs(1);
         }
         diagnostic_worker_exe = Some(main_exe.clone());
         AiRuntime::new_with_backend_and_worker_exe(AiBackend::DirectMl, main_exe)
@@ -287,7 +299,7 @@ fn main() {
                     "  TensorRT pack may be missing or broken at %APPDATA%/mimageviewer/tensorrt/."
                 );
                 eprintln!("  Run scripts/setup-tensorrt-pack.ps1 to install it, then retry.");
-                std::process::exit(1);
+                exit_with_logs(1);
             }
         }
     }

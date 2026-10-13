@@ -391,7 +391,7 @@ pub(crate) fn page_key_for_remote(
     }
 }
 
-fn page_key_for_pdf(path: &Path, page_number: u32) -> String {
+pub(crate) fn page_key_for_pdf(path: &Path, page_number: u32) -> String {
     crate::adjustment_db::zip_entry_key(path, &format!("page_{page_number}"))
 }
 

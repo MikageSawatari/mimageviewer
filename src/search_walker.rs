@@ -1,7 +1,7 @@
 //! 起動時差分走査 (docs/archive/search-metadata/search-expansion-design.md §7.4)。
 //!
 //! お気に入りルートを再帰的に walk し、現在の FS 状態と `fts_meta.db` の
-//! 登録状態を 3-way diff して「ingest すべき path」「削除すべき path」を返す。
+//! 登録状態を FS/SQLite comparison して「ingest すべき path」「削除すべき path」を返す。
 //!
 //! ## 重要な制約 (CLAUDE.md §UI スレッド同期 I/O)
 //!
@@ -13,7 +13,7 @@
 //!
 //! ## 本モジュールのスコープ (§16 step 6)
 //!
-//! - FS walker + 3-way diff の計算のみ
+//! - FS walker + FS/SQLite comparison の計算のみ
 //! - メタ抽出・Tantivy commit は **このモジュールの責務外**
 //!   (Ingest Worker = §16 step 9 に切り出す)
 //! - ZIP はアイテム索引 (Ctrl+G) の対象外なので候補に含めない
@@ -31,6 +31,30 @@ use crate::indexer_progress::ProgressReporter;
 use crate::io_semaphore::{GlobalIoSemaphore, IoPriority};
 use crate::search_index_db::normalize_path;
 
+/// Cancellation is a normal lifecycle outcome, not an index failure. Retain the cause
+/// from its producer so a concurrent stop cannot hide an actual metadata query error.
+#[derive(Debug)]
+pub enum ScanError {
+    Cancelled,
+    Metadata(rusqlite::Error),
+}
+impl std::fmt::Display for ScanError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => formatter.write_str("cancelled"),
+            Self::Metadata(error) => write!(formatter, "fts_meta list failed: {error}"),
+        }
+    }
+}
+impl std::error::Error for ScanError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Cancelled => None,
+            Self::Metadata(error) => Some(error),
+        }
+    }
+}
+
 /// 1 候補ファイル (通常画像 / PDF / 動画)。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CandidateFile {
@@ -44,7 +68,7 @@ pub struct CandidateFile {
     /// **表示用** file_size (画像本体)。
     pub file_size: i64,
     /// **差分用** mtime。画像はサイドカーを織り込んだ `max(画像, サイドカー)`。
-    /// fts_meta に保存され walker の 3-way diff で比較される。サイドカーの追加・編集を
+    /// fts_meta に保存され walker の FS/SQLite comparison で比較される。サイドカーの追加・編集を
     /// 「変化あり」として検出するため (docs/sidecar-metadata-ingest.md §14-3/§14-4)。
     pub diff_mtime: i64,
     /// **差分用** size。画像はサイドカーの size を加味した `画像 size + サイドカー size`
@@ -64,7 +88,7 @@ pub enum CandidateKind {
     Audio,
 }
 
-/// 3-way diff 結果。
+/// FS/SQLite comparison 結果。
 #[derive(Debug, Default)]
 pub struct ScanResult {
     /// FS にあり DB に無い、または mtime/size が変化したもの → ingest キュー対象
@@ -252,7 +276,7 @@ pub enum WalkerEvent {
     Error(String),
 }
 
-/// お気に入りルートを走査して 3-way diff を計算する。
+/// お気に入りルートを走査して FS/SQLite comparison を計算する。
 ///
 /// `io_sem` は read_dir 呼び出しの順番制御用。複数お気に入りを並列走査する場合は
 /// 同じセマフォを共有することでグローバル I/O 同時実行数を制御できる。
@@ -266,7 +290,7 @@ pub fn scan(
     io_sem: &GlobalIoSemaphore,
     priority: IoPriority,
     activity_gate: Option<&crate::activity_gate::ActivityGate>,
-) -> Result<ScanResult, String> {
+) -> Result<ScanResult, ScanError> {
     scan_with_io(params, db, io_sem, priority, activity_gate, &FsWalkerIo)
 }
 
@@ -277,7 +301,7 @@ fn scan_with_io(
     priority: IoPriority,
     activity_gate: Option<&crate::activity_gate::ActivityGate>,
     io: &impl WalkerIo,
-) -> Result<ScanResult, String> {
+) -> Result<ScanResult, ScanError> {
     let ScanParams {
         favorite_id,
         root,
@@ -305,7 +329,7 @@ fn scan_with_io(
         io,
     )?;
     if cancel.load(Ordering::Relaxed) {
-        return Err("cancelled".into());
+        return Err(ScanError::Cancelled);
     }
 
     // 2. DB 側の登録一覧を取得
@@ -317,9 +341,7 @@ fn scan_with_io(
             .map(|p| crate::metadata_ownership::root_key(p))
             .collect(),
     };
-    let db_entries = db
-        .list_range_files(&scope)
-        .map_err(|e| format!("fts_meta list failed: {e}"))?;
+    let db_entries = db.list_range_files(&scope).map_err(ScanError::Metadata)?;
     crate::perf::event(
         "indexer",
         "owned_range_query",
@@ -335,7 +357,7 @@ fn scan_with_io(
         .map(|row| (row.path.clone(), row))
         .collect();
 
-    // 3. 3-way diff
+    // 3. FS/SQLite comparison
     let mut result = ScanResult::default();
     result.total_scanned = fs_map.len();
     result.diag = diag;
@@ -343,7 +365,7 @@ fn scan_with_io(
 
     for (key, cand) in &fs_map {
         if cancel.load(Ordering::Relaxed) {
-            return Err("cancelled".into());
+            return Err(ScanError::Cancelled);
         }
         match db_map.get(key) {
             None => {
@@ -372,7 +394,7 @@ fn scan_with_io(
     if result.completeness == ObservationCompleteness::Complete {
         for key in db_map.keys() {
             if cancel.load(Ordering::Relaxed) {
-                return Err("cancelled".into());
+                return Err(ScanError::Cancelled);
             }
             if !fs_map.contains_key(key) {
                 result.to_delete.push(key.clone());
@@ -381,7 +403,7 @@ fn scan_with_io(
     }
 
     if cancel.load(Ordering::Relaxed) {
-        return Err("cancelled".into());
+        return Err(ScanError::Cancelled);
     }
 
     Ok(result)
@@ -401,7 +423,7 @@ fn walk_dir_recursive(
     visited: &mut std::collections::HashSet<String>,
     excluded_roots: &[PathBuf],
     io: &impl WalkerIo,
-) -> Result<(), String> {
+) -> Result<(), ScanError> {
     // 安全策: シンボリックループ対策 (深さ制限)。通常フォルダは 20 階層あれば十分
     const MAX_DEPTH: u32 = 40;
     if depth > MAX_DEPTH {
@@ -488,7 +510,7 @@ fn walk_dir_recursive(
             .to_ascii_lowercase();
 
         // ZIP はアイテム索引 (Ctrl+G) の対象外。候補に含めないことで、既存の ZIP doc は
-        // 3-way diff で「FS になし + DB あり」と判定され to_delete に落ちて Tantivy から
+        // FS/SQLite comparison で「FS になし + DB あり」と判定され to_delete に落ちて Tantivy から
         // 消える (docs/search-container-item-redesign.md §3.2)。
         // `is_recognized_image_ext` は Susie プラグインが申告した拡張子も画像扱いにする
         // ため、アーカイブ系 Susie プラグインが "zip" を申告しても確実に除外できるよう、
@@ -527,7 +549,7 @@ fn walk_dir_recursive(
         let file_size = metadata.len() as i64;
 
         // 差分用署名: 画像はサイドカー (同名 .json/.txt) の mtime/size を織り込む。
-        // これでサイドカーの追加・編集・削除が 3-way diff で検出される (§14-3/§14-4)。
+        // これでサイドカーの追加・編集・削除が FS/SQLite comparison で検出される (§14-3/§14-4)。
         // 候補の無いフォルダは 8.3 の別名になり得る <stem>.txt だけ stat する。
         let (diff_mtime, diff_size) = if kind == CandidateKind::Image {
             match directory_sidecar_signature(&path, has_possible_sidecar) {
@@ -1214,7 +1236,7 @@ mod tests {
     #[test]
     fn existing_zip_with_stale_db_row_goes_to_delete() {
         // 移行シナリオ: 旧版が索引した ZIP の fts_meta 行が残った状態で、ZIP ファイル
-        // 自体は FS に存在し続ける。walker は ZIP を候補にしないので 3-way diff で
+        // 自体は FS に存在し続ける。walker は ZIP を候補にしないので FS/SQLite comparison で
         // to_delete に落ち、ingest worker が Tantivy から掃除する (§3.2、Codex P3)。
         let fav = Uuid::new_v4();
         let (tmp, db) = tmp_db();
@@ -1369,7 +1391,7 @@ mod tests {
             IoPriority::Normal,
             None,
         );
-        assert_eq!(r.unwrap_err(), "cancelled");
+        assert!(matches!(r.unwrap_err(), ScanError::Cancelled));
     }
 
     #[test]

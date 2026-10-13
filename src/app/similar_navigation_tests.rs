@@ -43,6 +43,7 @@ fn grid_item_keys(items: &[GridItem]) -> Vec<String> {
 
 fn image_scan(paths: &[PathBuf]) -> ScannedDir {
     ScannedDir {
+        auxiliary_media: Default::default(),
         complete_audio_inventory: None,
         folders: Vec::new(),
         all_media: paths
@@ -550,6 +551,7 @@ fn book_relation_move_button_reaches_the_exact_physical_target() {
         .poll_folder_pane_open(&ctx)
         .expect("controlled scan ready");
     assert!(app.resolve_main_folder_open_ready(&ctx, ready).is_none());
+    app.finish_page_identity_preparation_for_test();
 
     let opened = app
         .fullscreen_idx
@@ -633,6 +635,20 @@ fn embedded_similar_move_update_pump_materializes_controlled_physical_scan() {
         &mut frame,
         root_update_input(Vec::new(), 0.2),
     );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.sidecar_restore_active() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "page preparation must finish through the update pump"
+        );
+        let _ = run_root_app_update(
+            &mut app,
+            &ctx,
+            &mut frame,
+            root_update_input(Vec::new(), 0.3),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
 
     assert!(app.folder_pane_open_pending.is_none());
     let opened = app
@@ -861,6 +877,7 @@ fn physical_similar_move_waits_for_scan_then_opens_only_the_requested_leaf() {
     app.fs_info_panel.locked = true;
     app.fs_info_panel.open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
     app.activate_snapshot(SnapshotSourceLabel::Mixed);
+    app.finish_page_identity_preparation_for_test();
 
     let hit = similar_file_hit(requested.clone());
     let trace = crate::app::SimilarMoveTrace::new(
@@ -894,6 +911,7 @@ fn physical_similar_move_waits_for_scan_then_opens_only_the_requested_leaf() {
         .poll_folder_pane_open(&ctx)
         .expect("controlled scan ready");
     assert!(app.resolve_main_folder_open_ready(&ctx, ready).is_none());
+    app.finish_page_identity_preparation_for_test();
 
     assert!(
         !app.is_snapshot_active(),
@@ -981,6 +999,7 @@ fn failed_physical_scan_keeps_existing_snapshot_page_and_panel_but_retires_old_d
     app.fs_info_panel.locked = true;
     app.fs_info_panel.open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
     app.activate_snapshot(SnapshotSourceLabel::Mixed);
+    app.finish_page_identity_preparation_for_test();
     app.capture_fs_nav_holdover(0);
     assert!(matches!(
         app.fs_holdover_tex,
@@ -1367,6 +1386,7 @@ fn similar_move_p2_rendition_failed_does_not_block_and_supersedes_old_trace() {
         PathBuf::from(r"C:\snapshot\b.jpg"),
     ]);
     app.activate_snapshot(SnapshotSourceLabel::Mixed);
+    app.finish_page_identity_preparation_for_test();
     app.fullscreen_idx = Some(0);
     let old_target = SnapshotTarget::Fs(PathBuf::from(r"C:\snapshot\a.jpg"));
     let old_trace = SimilarMoveTrace::new(SimilarMoveSource::ItemButton, Some(&old_target));
@@ -1669,6 +1689,7 @@ fn similar_hit_pdf_handler_polls_and_missing_required_page_never_falls_back() {
     app.top_level_grid_view
         .set_history_navigation_transition(Some(HistoryNavigationTransition::Physical(request)));
     app.poll_collection_history_transition(&ctx);
+    app.finish_page_identity_preparation_for_test();
 
     assert_eq!(app.fullscreen_idx, None);
     assert!(app.pdf_enumerate_pending.is_none());
@@ -1709,22 +1730,28 @@ fn similar_book_page_zip_handler_polls_then_materializes_real_case_and_exact_lea
     };
     *preflight = collection_navigation::PhysicalHistoryPreflight::ready_for_test(
         collection_navigation::PhysicalHistoryPreflightPayload::Zip(
-            crate::zip_loader::ZipEnumeration {
-                entries: vec![
-                    crate::zip_loader::ZipImageEntry {
-                        entry_name: "BookA/Sub/P01.JPG".to_owned(),
-                        uncompressed_size: 1,
-                        mtime: 0,
-                    },
-                    crate::zip_loader::ZipImageEntry {
-                        entry_name: "BookB/P02.JPG".to_owned(),
-                        uncompressed_size: 1,
-                        mtime: 0,
-                    },
-                ],
-                has_foreign_archives: false,
-                legacy_renames: Vec::new(),
-            },
+            crate::zip_loader::PreparedZipEnumeration::prepare(
+                zip_path.clone(),
+                crate::zip_loader::ZipEnumeration {
+                    entries: vec![
+                        crate::zip_loader::ZipImageEntry {
+                            entry_name: "BookA/Sub/P01.JPG".to_owned(),
+                            uncompressed_size: 1,
+                            mtime: 0,
+                            container_ancestry: Vec::new(),
+                        },
+                        crate::zip_loader::ZipImageEntry {
+                            entry_name: "BookB/P02.JPG".to_owned(),
+                            uncompressed_size: 1,
+                            mtime: 0,
+                            container_ancestry: Vec::new(),
+                        },
+                    ],
+                    has_foreign_archives: false,
+                    legacy_renames: Vec::new(),
+                },
+                app.settings.file_type_visibility.clone(),
+            ),
         ),
     );
     assert_eq!(
@@ -1736,6 +1763,7 @@ fn similar_book_page_zip_handler_polls_then_materializes_real_case_and_exact_lea
     app.top_level_grid_view
         .set_history_navigation_transition(Some(HistoryNavigationTransition::Physical(request)));
     app.poll_collection_history_transition(&ctx);
+    app.finish_page_identity_preparation_for_test();
 
     let opened = app
         .fullscreen_idx
@@ -1883,6 +1911,7 @@ fn detached_similar_book_page_handler_applies_in_its_bundle_and_true_close_unloc
             active.poll_detached_physical_folder_open(&ctx),
             DetachedPhysicalFolderOpenPoll::Applied
         ));
+        active.finish_page_identity_preparation_for_test();
         let opened = active
             .fullscreen_idx
             .and_then(|idx| active.items.get(idx))
@@ -1940,6 +1969,7 @@ fn required_scan_completion_is_applied_only_in_its_parked_viewer_context() {
                 .resolve_main_folder_open_ready(&ctx, ready)
                 .is_none()
         );
+        mounted.finish_page_identity_preparation_for_test();
         let opened = mounted
             .fullscreen_idx
             .and_then(|idx| mounted.items.get(idx))

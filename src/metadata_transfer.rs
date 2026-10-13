@@ -5,7 +5,7 @@
 //! 自動 sidecar の設定が OFF でも、この manifest 単体で別環境へ復元できる。
 //! このモジュールの公開 API は worker スレッドから呼ぶこと。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
@@ -22,9 +22,38 @@ pub const SIDECAR_FILENAME: &str = crate::fs_entry::PORTABLE_METADATA_BUNDLE_DIR
 /// v2.7.0では安定化のため非公開にしたが、v2.8.0の継続開発で再び有効化する。
 /// 未リリース機能を緊急にrelease buildから外す場合だけ、このgateをfalseへ戻す。
 pub(crate) const UI_ENABLED: bool = true;
+
+/// Worker-only semantic validation/backup reused by image-folder conversion.
+/// This reads a single page through the same typed family readers as transfer;
+/// it does not create a transfer bundle or copy source sync receipts.
+pub(crate) fn folder_zip_page_backup(
+    data_dir: &Path,
+    path: &Path,
+) -> Result<crate::sidecar::SidecarEntry, String> {
+    let cancel = AtomicBool::new(false);
+    let mut entries = vec![
+        make_enumerated(path, "page".into(), PortableEntryKind::File, &cancel)
+            .map_err(|e| e.to_string())?,
+    ];
+    attach_metadata(data_dir, &mut entries, &cancel, &mut |_| {}).map_err(|e| e.to_string())?;
+    let entry = entries.pop().unwrap().portable;
+    validate_page_state(&entry.page_state, "page").map_err(|e| e.to_string())?;
+    let state = entry.page_state;
+    Ok(crate::sidecar::SidecarEntry {
+        adjust: state.adjustment,
+        mask: state.mask,
+        conceal: state.conceal,
+        local_adjust_layers: state.local_adjust_layers.map(std::sync::Arc::new),
+        export_crop: state.export_crop,
+        comic: state.comic,
+        tags: None,
+    })
+}
 const FORMAT_NAME: &str = "mimageviewer-portable-metadata";
 const SHARD_FORMAT_NAME: &str = "mimageviewer-portable-metadata-shard";
-const FORMAT_VERSION: u32 = 9;
+const FORMAT_VERSION: u32 = 11;
+const SPREAD_SHIFT_FORMAT_VERSION: u32 = 10;
+const LEGACY_FORMAT_VERSION: u32 = 9;
 const PREVIOUS_FORMAT_VERSION: u32 = 8;
 const RELEASED_FORMAT_VERSION: u32 = 7;
 const BUNDLE_MANIFEST_FILENAME: &str = "manifest.json";
@@ -80,6 +109,8 @@ pub struct ExportSummary {
     pub book_bookmarks: usize,
     pub page_states: usize,
     pub container_states: usize,
+    pub spread_shifts: usize,
+    pub compositions: usize,
     pub thumbnail_pins: usize,
     /// セキュリティ上再帰しなかったjunction / symlink directoryの数。
     pub skipped_reparse_directories: usize,
@@ -98,6 +129,12 @@ pub struct ImportPreview {
     pub changed_files: usize,
     pub recursive: bool,
     pub exported_at_ms: i64,
+    pub spread_shift_additions: usize,
+    pub spread_shift_replacements: usize,
+    pub spread_shift_removals: usize,
+    pub composition_additions: usize,
+    pub composition_replacements: usize,
+    pub composition_removals: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -122,10 +159,22 @@ pub struct ImportSummary {
     pub transaction_batches: usize,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ImportCommittedChanges {
     pub video_pins: usize,
     pub folder_pins: usize,
+    pub spread_shift_additions: usize,
+    pub spread_shift_replacements: usize,
+    pub spread_shift_removals: usize,
+    /// Actual changed logical scope keys, published only after batch commit.
+    pub spread_shift_scopes: BTreeSet<String>,
+    /// Captured logical roots with committed Set additions/replacements.
+    pub spread_shift_observation_roots: BTreeSet<PathBuf>,
+    pub composition_additions: usize,
+    pub composition_replacements: usize,
+    pub composition_removals: usize,
+    pub composition_scopes: BTreeSet<String>,
+    pub composition_observation_roots: BTreeSet<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -142,6 +191,8 @@ pub struct ImportChangedSections {
     pub book_bookmarks: bool,
     pub page_state: bool,
     pub container_state: bool,
+    pub spread_shift: bool,
+    pub composition: bool,
     pub thumbnail_pins: bool,
 }
 
@@ -154,6 +205,8 @@ impl ManifestSections {
             book_bookmarks: self.book_bookmarks,
             page_state: self.page_state,
             container_state: self.container_state,
+            spread_shift: self.spread_shift,
+            composition: self.composition,
             thumbnail_pins: self.thumbnail_pins,
         }
     }
@@ -314,6 +367,10 @@ struct ManifestSections {
     #[serde(default)]
     container_state: bool,
     #[serde(default)]
+    spread_shift: bool,
+    #[serde(default)]
+    composition: bool,
+    #[serde(default)]
     thumbnail_pins: bool,
 }
 
@@ -326,6 +383,8 @@ impl Default for ManifestSections {
             book_bookmarks: true,
             page_state: true,
             container_state: true,
+            spread_shift: true,
+            composition: true,
             thumbnail_pins: true,
         }
     }
@@ -390,6 +449,10 @@ struct PortableEntry {
     page_state: PortablePageState,
     #[serde(default, skip_serializing_if = "PortableContainerState::is_empty")]
     container_state: PortableContainerState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    spread_shift_family: Option<PortableSpreadShiftFamily>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    composition_family: Option<PortableCompositionFamily>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     nested_containers: Vec<PortableNestedContainer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -493,6 +556,33 @@ struct PortableNestedContainer {
     member_key: String,
     #[serde(default)]
     state: PortableContainerState,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PortableSpreadShiftFamily {
+    coverage: crate::book_scope::BookScopeCoverage,
+    scopes: Vec<PortableSpreadShiftScope>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PortableSpreadShiftScope {
+    scope_prefix: String,
+    anchor_ref: crate::spread_shift::SpreadShiftPageRef,
+}
+
+/// Logical KeepDrive scopes, independent of the spread/trim source-cache origin.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortableCompositionFamily {
+    coverage: crate::book_scope::BookScopeCoverage,
+    scopes: Vec<PortableCompositionScope>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortableCompositionScope {
+    scope_prefix: String,
+    composition: crate::book_composition::BookComposition,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -656,6 +746,31 @@ where
 pub fn inspect_import_at<F>(
     root: &Path,
     cancel: &AtomicBool,
+    progress: F,
+) -> Result<ImportPreview, TransferError>
+where
+    F: FnMut(TransferProgress),
+{
+    inspect_import_impl(None, root, cancel, progress)
+}
+
+/// Include the covered shift additions/replacements/removals in the one confirmation.
+pub fn inspect_import_with_data_at<F>(
+    data_dir: &Path,
+    root: &Path,
+    cancel: &AtomicBool,
+    progress: F,
+) -> Result<ImportPreview, TransferError>
+where
+    F: FnMut(TransferProgress),
+{
+    inspect_import_impl(Some(data_dir), root, cancel, progress)
+}
+
+fn inspect_import_impl<F>(
+    data_dir: Option<&Path>,
+    root: &Path,
+    cancel: &AtomicBool,
     mut progress: F,
 ) -> Result<ImportPreview, TransferError>
 where
@@ -683,7 +798,30 @@ where
         let path = resolve_entry_path(root, &canonical_root, &entry.path)?;
         validate_bookmark_page_targets(&path, entry)?;
         match verify_target(&path, entry, cancel)? {
-            TargetState::Ready => preview.existing_entries += 1,
+            TargetState::Ready => {
+                preview.existing_entries += 1;
+                if manifest.sections.spread_shift
+                    && let Some(data_dir) = data_dir
+                    && let Some(family) = &entry.spread_shift_family
+                {
+                    let previous = read_spread_shift_family_at(data_dir, &path, &family.coverage)?;
+                    let changes = spread_shift_family_changes(&path, family, &previous)?;
+                    preview.spread_shift_additions += changes.additions;
+                    preview.spread_shift_replacements += changes.replacements;
+                    preview.spread_shift_removals += changes.removals;
+                }
+                if manifest.sections.composition
+                    && let Some(data_dir) = data_dir
+                    && let Some(family) = &entry.composition_family
+                {
+                    let previous = read_composition_family_at(data_dir, &path, &family.coverage)?;
+                    let changes =
+                        composition_family_changes(&path, entry.media_kind, family, &previous)?;
+                    preview.composition_additions += changes.additions;
+                    preview.composition_replacements += changes.replacements;
+                    preview.composition_removals += changes.removals;
+                }
+            }
             TargetState::Missing => preview.missing_entries += 1,
             TargetState::KindMismatch => preview.kind_mismatch_entries += 1,
             TargetState::Changed => preview.changed_files += 1,
@@ -796,6 +934,8 @@ where
     let mut batch_applied = 0usize;
     let mut batch_video_pin_changes = 0usize;
     let mut batch_folder_pin_changes = 0usize;
+    let mut batch_spread_shift_changes = SpreadShiftFamilyChanges::default();
+    let mut batch_composition_changes = CompositionFamilyChanges::default();
     let mut batch_started = std::time::Instant::now();
     let mut batch_active = false;
     let apply_started = std::time::Instant::now();
@@ -919,6 +1059,8 @@ where
                                 .saturating_add(usize::from(video_pin_changed));
                             batch_folder_pin_changes = batch_folder_pin_changes
                                 .saturating_add(usize::from(folder_pin_changed));
+                            batch_spread_shift_changes.merge(outcome.spread_shift);
+                            batch_composition_changes.merge(outcome.composition);
                         }
                         Err(error) => {
                             conn.execute_batch(
@@ -984,6 +1126,14 @@ where
                     .committed
                     .folder_pins
                     .saturating_add(batch_folder_pin_changes);
+                publish_spread_shift_changes(
+                    &mut summary.committed,
+                    std::mem::take(&mut batch_spread_shift_changes),
+                );
+                publish_composition_changes(
+                    &mut summary.committed,
+                    std::mem::take(&mut batch_composition_changes),
+                );
                 #[cfg(test)]
                 {
                     summary.transaction_batches += 1;
@@ -1048,6 +1198,8 @@ where
             .committed
             .folder_pins
             .saturating_add(batch_folder_pin_changes);
+        publish_spread_shift_changes(&mut summary.committed, batch_spread_shift_changes);
+        publish_composition_changes(&mut summary.committed, batch_composition_changes);
         #[cfg(test)]
         if batch_active {
             summary.transaction_batches += 1;
@@ -1409,6 +1561,8 @@ fn make_enumerated(
             book_bookmarks: Vec::new(),
             page_state: PortablePageState::default(),
             container_state: PortableContainerState::default(),
+            spread_shift_family: None,
+            composition_family: None,
             nested_containers: Vec::new(),
             video_pin: None,
             virtual_items: Vec::new(),
@@ -1968,6 +2122,8 @@ where
     )?;
 
     finalize_export_page_bases(entries, &page_index, &page_origins);
+    attach_spread_shift_metadata(data_dir, entries, cancel, &mut metadata_rows, progress)?;
+    attach_composition_metadata(data_dir, entries, cancel, &mut metadata_rows, progress)?;
     for entry in entries {
         entry
             .portable
@@ -1985,6 +2141,680 @@ where
         current_path: None,
     });
     Ok(())
+}
+
+fn attach_spread_shift_metadata<F>(
+    data_dir: &Path,
+    entries: &mut [EnumeratedEntry],
+    cancel: &AtomicBool,
+    metadata_rows: &mut usize,
+    progress: &mut F,
+) -> Result<(), TransferError>
+where
+    F: FnMut(TransferProgress),
+{
+    let db_path = data_dir.join("spread_shift.db");
+    let conn = if db_path.is_file() {
+        let conn = open_readonly(&db_path)?;
+        crate::spread_shift::validate_database_schema(&conn).map_err(TransferError::Database)?;
+        conn.execute_batch("BEGIN").map_err(db_error)?;
+        Some(conn)
+    } else {
+        None
+    };
+    for entry in entries {
+        check_cancel(cancel)?;
+        let coverage = match entry.portable.media_kind {
+            PortableMediaKind::Directory | PortableMediaKind::Pdf => {
+                crate::book_scope::BookScopeCoverage::Root
+            }
+            PortableMediaKind::Zip | PortableMediaKind::ConvertibleArchive => {
+                crate::book_scope::BookScopeCoverage::Family
+            }
+            _ => continue,
+        };
+        let previous = match &conn {
+            Some(conn) => read_spread_shift_family(conn, "spread_shifts", &entry.path, &coverage)?,
+            None => HashMap::new(),
+        };
+        let mut scopes = Vec::with_capacity(previous.len());
+        for (scope_prefix, anchor_ref) in previous {
+            report_metadata_progress(metadata_rows, &scope_prefix, progress);
+            scopes.push(PortableSpreadShiftScope {
+                scope_prefix,
+                anchor_ref,
+            });
+        }
+        scopes.sort_by(|left, right| left.scope_prefix.cmp(&right.scope_prefix));
+        let family = PortableSpreadShiftFamily { coverage, scopes };
+        validate_spread_shift_family(&family, entry.portable.media_kind)?;
+        // Explicit covered-empty families remove stale destination values too.
+        entry.portable.spread_shift_family = Some(family);
+    }
+    if let Some(conn) = conn {
+        conn.execute_batch("COMMIT").map_err(db_error)?;
+    }
+    Ok(())
+}
+
+fn validate_spread_shift_family(
+    family: &PortableSpreadShiftFamily,
+    media_kind: PortableMediaKind,
+) -> Result<(), TransferError> {
+    family.coverage.validate().map_err(TransferError::Invalid)?;
+    if family.scopes.len() > MAX_BOOKMARKS_PER_ENTRY {
+        return Err(TransferError::Invalid(
+            "見開き調整のscope数が上限を超えています".into(),
+        ));
+    }
+    let mut seen = HashSet::new();
+    for scope in &family.scopes {
+        let key = crate::book_scope::BookScopeKey::new(Path::new("scope"), &scope.scope_prefix)
+            .map_err(TransferError::Invalid)?;
+        if key.level_prefix != scope.scope_prefix
+            || !seen.insert(key.storage_key())
+            || !family.coverage.contains(&scope.scope_prefix)
+        {
+            return Err(TransferError::Invalid(
+                "見開き調整のscopeが重複またはcoverage外です".into(),
+            ));
+        }
+        scope
+            .anchor_ref
+            .validate()
+            .map_err(TransferError::Invalid)?;
+        match (&scope.anchor_ref, media_kind) {
+            (
+                crate::spread_shift::SpreadShiftPageRef::RelativePath(_),
+                PortableMediaKind::Directory,
+            )
+            | (
+                crate::spread_shift::SpreadShiftPageRef::DocumentPageIdentity(_),
+                PortableMediaKind::Pdf,
+            ) if scope.scope_prefix.is_empty() => {}
+            (
+                crate::spread_shift::SpreadShiftPageRef::ArchiveEntry(member),
+                PortableMediaKind::Zip | PortableMediaKind::ConvertibleArchive,
+            ) => {
+                let prefix = scope.scope_prefix.trim_end_matches('/').to_lowercase();
+                let member = member.replace('\\', "/").to_lowercase();
+                if !prefix.is_empty() && !member.starts_with(&format!("{prefix}/")) {
+                    return Err(TransferError::Invalid(
+                        "見開き調整の基点がscope外です".into(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(TransferError::Invalid(
+                    "見開き調整の本・ページ種別が一致しません".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+type StoredSpreadShiftFamily = HashMap<String, crate::spread_shift::SpreadShiftPageRef>;
+
+fn read_spread_shift_family_at(
+    data_dir: &Path,
+    root: &Path,
+    coverage: &crate::book_scope::BookScopeCoverage,
+) -> Result<StoredSpreadShiftFamily, TransferError> {
+    let path = data_dir.join("spread_shift.db");
+    if !path.is_file() {
+        return Ok(HashMap::new());
+    }
+    let conn = open_readonly(&path)?;
+    crate::spread_shift::validate_database_schema(&conn).map_err(TransferError::Database)?;
+    conn.execute_batch("BEGIN").map_err(db_error)?;
+    let result = read_spread_shift_family(&conn, "spread_shifts", root, coverage)?;
+    conn.execute_batch("COMMIT").map_err(db_error)?;
+    Ok(result)
+}
+
+fn read_spread_shift_family(
+    conn: &Connection,
+    table: &str,
+    root: &Path,
+    coverage: &crate::book_scope::BookScopeCoverage,
+) -> Result<StoredSpreadShiftFamily, TransferError> {
+    coverage.validate().map_err(TransferError::Invalid)?;
+    let root_key = crate::book_scope::BookScopeKey::new(root, "")
+        .map_err(TransferError::Invalid)?
+        .storage_key();
+    let mut values = HashMap::new();
+    let mut read_rows = |sql: &str, parameters: Vec<String>| -> Result<(), TransferError> {
+        let mut stmt = conn.prepare_cached(sql).map_err(db_error)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(parameters), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(db_error)?;
+        for row in rows {
+            let (key, json) = row.map_err(db_error)?;
+            let prefix = if key == root_key {
+                ""
+            } else {
+                key.strip_prefix(&format!("{root_key}/")).ok_or_else(|| {
+                    TransferError::Database("見開き調整のscope keyが不正です".into())
+                })?
+            };
+            let scope = crate::book_scope::BookScopeKey::new(root, prefix)
+                .map_err(TransferError::Database)?;
+            if scope.storage_key() != key || !coverage.contains(prefix) {
+                return Err(TransferError::Database(
+                    "見開き調整のscope keyが不正です".into(),
+                ));
+            }
+            let anchor: crate::spread_shift::SpreadShiftPageRef = serde_json::from_str(&json)
+                .map_err(|error| {
+                    TransferError::Database(format!("見開き調整の基点が不正です: {error}"))
+                })?;
+            anchor.validate().map_err(TransferError::Database)?;
+            values.insert(prefix.to_owned(), anchor);
+        }
+        Ok(())
+    };
+    match coverage {
+        crate::book_scope::BookScopeCoverage::Family => read_rows(
+            &format!(
+                "SELECT path, anchor_ref FROM {table} WHERE path = ?1 OR (path >= ?2 AND path < ?3)"
+            ),
+            vec![
+                root_key.clone(),
+                format!("{root_key}/"),
+                format!("{root_key}0"),
+            ],
+        )?,
+        crate::book_scope::BookScopeCoverage::Root => read_rows(
+            &format!("SELECT path, anchor_ref FROM {table} WHERE path = ?1"),
+            vec![root_key.clone()],
+        )?,
+        crate::book_scope::BookScopeCoverage::Prefixes(prefixes) => {
+            for prefix in prefixes {
+                let key = crate::book_scope::BookScopeKey::new(root, prefix)
+                    .map_err(TransferError::Invalid)?
+                    .storage_key();
+                read_rows(
+                    &format!("SELECT path, anchor_ref FROM {table} WHERE path = ?1"),
+                    vec![key],
+                )?;
+            }
+        }
+    }
+    Ok(values)
+}
+
+#[derive(Default)]
+struct SpreadShiftFamilyChanges {
+    additions: usize,
+    replacements: usize,
+    removals: usize,
+    scopes: BTreeSet<String>,
+    observation_roots: BTreeSet<PathBuf>,
+}
+
+impl SpreadShiftFamilyChanges {
+    fn merge(&mut self, other: Self) {
+        self.additions += other.additions;
+        self.replacements += other.replacements;
+        self.removals += other.removals;
+        self.scopes.extend(other.scopes);
+        self.observation_roots.extend(other.observation_roots);
+    }
+}
+
+fn publish_spread_shift_changes(
+    committed: &mut ImportCommittedChanges,
+    changes: SpreadShiftFamilyChanges,
+) {
+    committed.spread_shift_additions += changes.additions;
+    committed.spread_shift_replacements += changes.replacements;
+    committed.spread_shift_removals += changes.removals;
+    committed.spread_shift_scopes.extend(changes.scopes);
+    committed
+        .spread_shift_observation_roots
+        .extend(changes.observation_roots);
+}
+
+fn spread_shift_family_changes(
+    root: &Path,
+    family: &PortableSpreadShiftFamily,
+    previous: &StoredSpreadShiftFamily,
+) -> Result<SpreadShiftFamilyChanges, TransferError> {
+    let mut changes = SpreadShiftFamilyChanges::default();
+    let mut desired = HashMap::new();
+    for scope in &family.scopes {
+        let key = crate::book_scope::BookScopeKey::new(root, &scope.scope_prefix)
+            .map_err(TransferError::Invalid)?;
+        let prefix = key.level_prefix.to_lowercase();
+        desired.insert(prefix.clone(), &scope.anchor_ref);
+        match previous.get(&prefix) {
+            Some(old) if old == &scope.anchor_ref => continue,
+            Some(_) => changes.replacements += 1,
+            None => changes.additions += 1,
+        }
+        changes.scopes.insert(key.storage_key());
+        if !matches!(
+            scope.anchor_ref,
+            crate::spread_shift::SpreadShiftPageRef::RelativePath(_)
+        ) {
+            changes.observation_roots.insert(root.to_path_buf());
+        }
+    }
+    for prefix in previous.keys() {
+        if !desired.contains_key(prefix) {
+            changes.removals += 1;
+            changes.scopes.insert(
+                crate::book_scope::BookScopeKey::new(root, prefix)
+                    .map_err(TransferError::Invalid)?
+                    .storage_key(),
+            );
+        }
+    }
+    Ok(changes)
+}
+
+fn apply_spread_shift_family(
+    tx: &Connection,
+    root: &Path,
+    family: &PortableSpreadShiftFamily,
+) -> Result<SpreadShiftFamilyChanges, TransferError> {
+    let previous =
+        read_spread_shift_family(tx, "spread_shift.spread_shifts", root, &family.coverage)?;
+    let changes = spread_shift_family_changes(root, family, &previous)?;
+    if changes.scopes.is_empty() {
+        return Ok(changes);
+    }
+    // One item SAVEPOINT owns both covered omission removal and replacements.
+    for prefix in previous.keys() {
+        let key = crate::book_scope::BookScopeKey::new(root, prefix)
+            .map_err(TransferError::Invalid)?
+            .storage_key();
+        tx.prepare_cached("DELETE FROM spread_shift.spread_shifts WHERE path = ?1")
+            .map_err(db_error)?
+            .execute([key])
+            .map_err(db_error)?;
+    }
+    for scope in &family.scopes {
+        let key = crate::book_scope::BookScopeKey::new(root, &scope.scope_prefix)
+            .map_err(TransferError::Invalid)?
+            .storage_key();
+        let json = serde_json::to_string(&scope.anchor_ref)
+            .map_err(|error| TransferError::Invalid(error.to_string()))?;
+        tx.prepare_cached(
+            "INSERT INTO spread_shift.spread_shifts (path, anchor_ref) VALUES (?1, ?2)",
+        )
+        .map_err(db_error)?
+        .execute(params![key, json])
+        .map_err(db_error)?;
+    }
+    Ok(changes)
+}
+
+fn composition_domain(
+    media_kind: PortableMediaKind,
+    prefix: &str,
+) -> Result<crate::book_composition::PageDomain, TransferError> {
+    use crate::book_composition::PageDomain;
+    match media_kind {
+        PortableMediaKind::Directory if prefix.is_empty() => Ok(PageDomain::ImageFolder),
+        PortableMediaKind::Pdf if prefix.is_empty() => Ok(PageDomain::Document),
+        PortableMediaKind::Zip | PortableMediaKind::ConvertibleArchive => {
+            Ok(PageDomain::ArchiveLevel {
+                prefix: prefix.into(),
+            })
+        }
+        _ => Err(TransferError::Invalid(
+            "本の構成の本・scope種別が一致しません".into(),
+        )),
+    }
+}
+
+fn validate_composition_family(
+    family: &PortableCompositionFamily,
+    media_kind: PortableMediaKind,
+) -> Result<(), TransferError> {
+    family.coverage.validate().map_err(TransferError::Invalid)?;
+    composition_domain(media_kind, "")?;
+    let root_only = match &family.coverage {
+        crate::book_scope::BookScopeCoverage::Root => true,
+        crate::book_scope::BookScopeCoverage::Prefixes(prefixes) => {
+            prefixes.iter().all(String::is_empty)
+        }
+        crate::book_scope::BookScopeCoverage::Family => false,
+    };
+    if matches!(
+        media_kind,
+        PortableMediaKind::Directory | PortableMediaKind::Pdf
+    ) && !root_only
+    {
+        return Err(TransferError::Invalid(
+            "この本の構成はrootだけを対象にできます".into(),
+        ));
+    }
+    if family.scopes.len() > MAX_BOOKMARKS_PER_ENTRY {
+        return Err(TransferError::Invalid(
+            "本の構成のscope数が上限を超えています".into(),
+        ));
+    }
+    let mut seen = HashSet::new();
+    for scope in &family.scopes {
+        let normalized = crate::book_scope::normalize_level_prefix(&scope.scope_prefix)
+            .map_err(TransferError::Invalid)?;
+        if normalized != scope.scope_prefix
+            || !seen.insert(normalized)
+            || !family.coverage.contains(&scope.scope_prefix)
+        {
+            return Err(TransferError::Invalid(
+                "本の構成のscopeが重複またはcoverage外です".into(),
+            ));
+        }
+        let domain = composition_domain(media_kind, &scope.scope_prefix)?;
+        scope
+            .composition
+            .validate(&domain)
+            .map_err(|error| TransferError::Invalid(error.to_string()))?;
+    }
+    Ok(())
+}
+
+type StoredCompositionFamily = HashMap<String, crate::book_composition::store::StoredComposition>;
+
+fn read_composition_family_at(
+    data_dir: &Path,
+    root: &Path,
+    coverage: &crate::book_scope::BookScopeCoverage,
+) -> Result<StoredCompositionFamily, TransferError> {
+    let path = data_dir.join("book_composition.db");
+    if !path
+        .try_exists()
+        .map_err(|error| TransferError::Io(format!("{}: {error}", path.display())))?
+    {
+        return Ok(HashMap::new());
+    }
+    let conn = open_readonly(&path)?;
+    crate::book_composition::store::validate_database_schema(&conn)
+        .map_err(TransferError::Database)?;
+    conn.execute_batch("BEGIN").map_err(db_error)?;
+    let values = read_composition_family(&conn, "book_compositions", root, coverage)?;
+    conn.execute_batch("COMMIT").map_err(db_error)?;
+    Ok(values)
+}
+
+fn read_composition_family(
+    conn: &Connection,
+    table: &str,
+    root: &Path,
+    coverage: &crate::book_scope::BookScopeCoverage,
+) -> Result<StoredCompositionFamily, TransferError> {
+    coverage.validate().map_err(TransferError::Invalid)?;
+    let root_key = crate::book_scope::BookScopeKey::new(root, "")
+        .map_err(TransferError::Invalid)?
+        .storage_key();
+    let mut values = HashMap::new();
+    let mut read_rows = |sql: &str, parameters: Vec<String>| -> Result<(), TransferError> {
+        let mut stmt = conn.prepare_cached(sql).map_err(db_error)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(parameters), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(db_error)?;
+        for row in rows {
+            let (key, revision, schema, json) = row.map_err(db_error)?;
+            let prefix = if key == root_key {
+                ""
+            } else {
+                key.strip_prefix(&format!("{root_key}/")).ok_or_else(|| {
+                    TransferError::Database("本の構成のscope keyが不正です".into())
+                })?
+            };
+            let scope = crate::book_scope::BookScopeKey::new(root, prefix)
+                .map_err(TransferError::Database)?;
+            if scope.storage_key() != key || !coverage.contains(prefix) {
+                return Err(TransferError::Database(
+                    "本の構成のscope keyが不正です".into(),
+                ));
+            }
+            let stored = crate::book_composition::store::decode_row(&key, revision, schema, &json)
+                .map_err(TransferError::Database)?;
+            values.insert(prefix.to_owned(), stored);
+        }
+        Ok(())
+    };
+    let select =
+        format!("SELECT book_key, revision, schema_version, composition_json FROM {table}");
+    match coverage {
+        crate::book_scope::BookScopeCoverage::Family => read_rows(
+            &format!("{select} WHERE book_key = ?1 OR (book_key >= ?2 AND book_key < ?3)"),
+            vec![
+                root_key.clone(),
+                format!("{root_key}/"),
+                format!("{root_key}0"),
+            ],
+        )?,
+        crate::book_scope::BookScopeCoverage::Root => read_rows(
+            &format!("{select} WHERE book_key = ?1"),
+            vec![root_key.clone()],
+        )?,
+        crate::book_scope::BookScopeCoverage::Prefixes(prefixes) => {
+            for prefix in prefixes {
+                let key = crate::book_scope::BookScopeKey::new(root, prefix)
+                    .map_err(TransferError::Invalid)?
+                    .storage_key();
+                read_rows(&format!("{select} WHERE book_key = ?1"), vec![key])?;
+            }
+        }
+    }
+    Ok(values)
+}
+
+fn attach_composition_metadata<F>(
+    data_dir: &Path,
+    entries: &mut [EnumeratedEntry],
+    cancel: &AtomicBool,
+    metadata_rows: &mut usize,
+    progress: &mut F,
+) -> Result<(), TransferError>
+where
+    F: FnMut(TransferProgress),
+{
+    let db_path = data_dir.join("book_composition.db");
+    let conn = if db_path
+        .try_exists()
+        .map_err(|error| TransferError::Io(format!("{}: {error}", db_path.display())))?
+    {
+        let conn = open_readonly(&db_path)?;
+        crate::book_composition::store::validate_database_schema(&conn)
+            .map_err(TransferError::Database)?;
+        conn.execute_batch("BEGIN").map_err(db_error)?;
+        Some(conn)
+    } else {
+        None
+    };
+    for entry in entries {
+        check_cancel(cancel)?;
+        let coverage = match entry.portable.media_kind {
+            PortableMediaKind::Directory | PortableMediaKind::Pdf => {
+                crate::book_scope::BookScopeCoverage::Root
+            }
+            PortableMediaKind::Zip | PortableMediaKind::ConvertibleArchive => {
+                crate::book_scope::BookScopeCoverage::Family
+            }
+            _ => continue,
+        };
+        let previous = match &conn {
+            Some(conn) => {
+                read_composition_family(conn, "book_compositions", &entry.path, &coverage)?
+            }
+            None => HashMap::new(),
+        };
+        let mut scopes = Vec::with_capacity(previous.len());
+        for (scope_prefix, stored) in previous {
+            let domain = composition_domain(entry.portable.media_kind, &scope_prefix)?;
+            if domain != stored.domain {
+                return Err(TransferError::Database(format!(
+                    "本の構成の種類が不正です: {}",
+                    entry.path.display()
+                )));
+            }
+            report_metadata_progress(metadata_rows, &scope_prefix, progress);
+            scopes.push(PortableCompositionScope {
+                scope_prefix,
+                composition: stored.composition,
+            });
+        }
+        scopes.sort_by(|left, right| left.scope_prefix.cmp(&right.scope_prefix));
+        let family = PortableCompositionFamily { coverage, scopes };
+        validate_composition_family(&family, entry.portable.media_kind)?;
+        entry.portable.composition_family = Some(family);
+    }
+    if let Some(conn) = conn {
+        conn.execute_batch("COMMIT").map_err(db_error)?;
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct CompositionFamilyChanges {
+    additions: usize,
+    replacements: usize,
+    removals: usize,
+    scopes: BTreeSet<String>,
+    observation_roots: BTreeSet<PathBuf>,
+}
+
+impl CompositionFamilyChanges {
+    fn merge(&mut self, other: Self) {
+        self.additions += other.additions;
+        self.replacements += other.replacements;
+        self.removals += other.removals;
+        self.scopes.extend(other.scopes);
+        self.observation_roots.extend(other.observation_roots);
+    }
+}
+
+fn publish_composition_changes(
+    committed: &mut ImportCommittedChanges,
+    changes: CompositionFamilyChanges,
+) {
+    committed.composition_additions += changes.additions;
+    committed.composition_replacements += changes.replacements;
+    committed.composition_removals += changes.removals;
+    committed.composition_scopes.extend(changes.scopes);
+    committed
+        .composition_observation_roots
+        .extend(changes.observation_roots);
+}
+
+fn composition_family_changes(
+    root: &Path,
+    media_kind: PortableMediaKind,
+    family: &PortableCompositionFamily,
+    previous: &StoredCompositionFamily,
+) -> Result<CompositionFamilyChanges, TransferError> {
+    let mut changes = CompositionFamilyChanges::default();
+    for (prefix, stored) in previous {
+        if composition_domain(media_kind, prefix)? != stored.domain {
+            return Err(TransferError::Database(
+                "本の構成の保存種類が一致しません".into(),
+            ));
+        }
+    }
+    let mut desired = HashSet::new();
+    for scope in &family.scopes {
+        desired.insert(scope.scope_prefix.as_str());
+        match previous.get(&scope.scope_prefix) {
+            Some(old) if same_composition_content(&old.composition, &scope.composition) => continue,
+            Some(_) => changes.replacements += 1,
+            None => changes.additions += 1,
+        }
+        changes.scopes.insert(
+            crate::book_scope::BookScopeKey::new(root, &scope.scope_prefix)
+                .map_err(TransferError::Invalid)?
+                .storage_key(),
+        );
+        if media_kind != PortableMediaKind::Directory {
+            changes.observation_roots.insert(root.to_path_buf());
+        }
+    }
+    for prefix in previous.keys() {
+        if !desired.contains(prefix.as_str()) {
+            changes.removals += 1;
+            changes.scopes.insert(
+                crate::book_scope::BookScopeKey::new(root, prefix)
+                    .map_err(TransferError::Invalid)?
+                    .storage_key(),
+            );
+        }
+    }
+    Ok(changes)
+}
+
+fn apply_composition_family(
+    tx: &Connection,
+    root: &Path,
+    media_kind: PortableMediaKind,
+    family: &PortableCompositionFamily,
+) -> Result<CompositionFamilyChanges, TransferError> {
+    validate_composition_family(family, media_kind)?;
+    let previous = read_composition_family(
+        tx,
+        "book_composition.book_compositions",
+        root,
+        &family.coverage,
+    )?;
+    let changes = composition_family_changes(root, media_kind, family, &previous)?;
+    let desired: HashSet<_> = family
+        .scopes
+        .iter()
+        .map(|scope| scope.scope_prefix.as_str())
+        .collect();
+    for scope in &family.scopes {
+        let key = crate::book_scope::BookScopeKey::new(root, &scope.scope_prefix)
+            .map_err(TransferError::Invalid)?
+            .storage_key();
+        let domain = composition_domain(media_kind, &scope.scope_prefix)?;
+        crate::book_composition::store::replace_row_in(
+            tx,
+            "book_composition.book_compositions",
+            &key,
+            &domain,
+            &scope.composition,
+        )
+        .map_err(TransferError::Database)?;
+    }
+    for prefix in previous.keys() {
+        if !desired.contains(prefix.as_str()) {
+            let key = crate::book_scope::BookScopeKey::new(root, prefix)
+                .map_err(TransferError::Invalid)?
+                .storage_key();
+            crate::book_composition::store::remove_row_in(
+                tx,
+                "book_composition.book_compositions",
+                &key,
+            )
+            .map_err(TransferError::Database)?;
+        }
+    }
+    Ok(changes)
+}
+
+fn same_composition_content(
+    left: &crate::book_composition::BookComposition,
+    right: &crate::book_composition::BookComposition,
+) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    left.revision = 0;
+    right.revision = 0;
+    left == right
 }
 
 fn page_state_for_key_mut<'a>(
@@ -2945,6 +3775,14 @@ fn summarize_entry(summary: &mut ExportSummary, entry: &PortableEntry) {
     summary.book_bookmarks += entry.book_bookmarks.len();
     summary.page_states += usize::from(!entry.page_state.is_empty());
     summary.container_states += usize::from(entry.container_state.has_view_state());
+    summary.spread_shifts += entry
+        .spread_shift_family
+        .as_ref()
+        .map_or(0, |family| family.scopes.len());
+    summary.compositions += entry
+        .composition_family
+        .as_ref()
+        .map_or(0, |family| family.scopes.len());
     summary.container_states += entry
         .nested_containers
         .iter()
@@ -2985,7 +3823,7 @@ fn read_bundle_manifest(root: &Path, cancel: &AtomicBool) -> Result<BundleManife
         inner: reader,
         cancel,
     };
-    let manifest: BundleManifest = serde_json::from_reader(reader).map_err(|error| {
+    let mut manifest: BundleManifest = serde_json::from_reader(reader).map_err(|error| {
         if cancel.load(Ordering::Relaxed) {
             TransferError::Cancelled
         } else {
@@ -2993,6 +3831,11 @@ fn read_bundle_manifest(root: &Path, cancel: &AtomicBool) -> Result<BundleManife
         }
     })?;
     validate_bundle_manifest(&manifest)?;
+    // Earlier versions cannot authorize composition replacement, even when a
+    // producer retained an unknown field while rewriting an older bundle.
+    if manifest.version < FORMAT_VERSION {
+        manifest.sections.composition = false;
+    }
     let generation_dir = bundle_generation_dir(&bundle_dir, &manifest.generation);
     ensure_plain_directory(&generation_dir)?;
     ensure_plain_directory(&generation_dir.join(SHARDS_DIRNAME))?;
@@ -3202,13 +4045,20 @@ fn validate_bundle_manifest(manifest: &BundleManifest) -> Result<(), TransferErr
     if ![
         RELEASED_FORMAT_VERSION,
         PREVIOUS_FORMAT_VERSION,
+        LEGACY_FORMAT_VERSION,
+        SPREAD_SHIFT_FORMAT_VERSION,
         FORMAT_VERSION,
     ]
     .contains(&manifest.version)
     {
         return Err(TransferError::Invalid(format!(
-            "未対応のバージョンです: {}（v{} / v{} / v{}を受け入れます）",
-            manifest.version, RELEASED_FORMAT_VERSION, PREVIOUS_FORMAT_VERSION, FORMAT_VERSION
+            "未対応のバージョンです: {}（v{} / v{} / v{} / v{} / v{}を受け入れます）",
+            manifest.version,
+            RELEASED_FORMAT_VERSION,
+            PREVIOUS_FORMAT_VERSION,
+            LEGACY_FORMAT_VERSION,
+            SPREAD_SHIFT_FORMAT_VERSION,
+            FORMAT_VERSION
         )));
     }
     validate_generation(&manifest.generation)?;
@@ -3280,13 +4130,20 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), TransferError> {
     if ![
         RELEASED_FORMAT_VERSION,
         PREVIOUS_FORMAT_VERSION,
+        LEGACY_FORMAT_VERSION,
+        SPREAD_SHIFT_FORMAT_VERSION,
         FORMAT_VERSION,
     ]
     .contains(&manifest.version)
     {
         return Err(TransferError::Invalid(format!(
-            "未対応のバージョンです: {}（v{} / v{} / v{}を受け入れます）",
-            manifest.version, RELEASED_FORMAT_VERSION, PREVIOUS_FORMAT_VERSION, FORMAT_VERSION
+            "未対応のバージョンです: {}（v{} / v{} / v{} / v{} / v{}を受け入れます）",
+            manifest.version,
+            RELEASED_FORMAT_VERSION,
+            PREVIOUS_FORMAT_VERSION,
+            LEGACY_FORMAT_VERSION,
+            SPREAD_SHIFT_FORMAT_VERSION,
+            FORMAT_VERSION
         )));
     }
     let mut paths = HashSet::new();
@@ -3372,11 +4229,22 @@ fn validate_portable_entry(entry: &PortableEntry) -> Result<(), TransferError> {
             | PortableMediaKind::Pdf
             | PortableMediaKind::ConvertibleArchive
     );
-    if (!entry.container_state.is_empty() || !entry.book_bookmarks.is_empty()) && !is_container {
+    if (!entry.container_state.is_empty()
+        || !entry.book_bookmarks.is_empty()
+        || entry.spread_shift_family.is_some()
+        || entry.composition_family.is_some())
+        && !is_container
+    {
         return Err(TransferError::Invalid(format!(
             "本・コンテナ情報を保存できないファイル種別です: {}",
             entry.path
         )));
+    }
+    if let Some(family) = &entry.spread_shift_family {
+        validate_spread_shift_family(family, entry.media_kind)?;
+    }
+    if let Some(family) = &entry.composition_family {
+        validate_composition_family(family, entry.media_kind)?;
     }
     if !entry.virtual_items.is_empty()
         && !matches!(
@@ -3650,7 +4518,7 @@ fn validate_container_state(
     entry_path: &str,
 ) -> Result<(), TransferError> {
     if let Some(spread) = state.spread {
-        if !(0..=5).contains(&spread.mode)
+        if !crate::spread_db::valid_stored_mode(spread.mode)
             || !(0..=2).contains(&spread.flow)
             || !(0..=1).contains(&spread.direction)
         {
@@ -4017,6 +4885,40 @@ fn validate_bookmark_page_targets(
     container_path: &Path,
     entry: &PortableEntry,
 ) -> Result<(), TransferError> {
+    if let Some(family) = &entry.composition_family {
+        for scope in &family.scopes {
+            for page in scope.composition.pages() {
+                if let crate::book_composition::CompositionPageRef::RelativePath { path: relative } =
+                    page
+                    && matches!(
+                        crate::book_bookmarks::resolve_relative_page_path(container_path, relative),
+                        crate::book_bookmarks::RelativePagePathResolution::Unsafe
+                    )
+                {
+                    return Err(TransferError::Invalid(format!(
+                        "本の構成のページがコンテナ外を指しています: {} / {relative}",
+                        entry.path
+                    )));
+                }
+            }
+        }
+    }
+    if let Some(family) = &entry.spread_shift_family {
+        for scope in &family.scopes {
+            if let crate::spread_shift::SpreadShiftPageRef::RelativePath(relative) =
+                &scope.anchor_ref
+                && matches!(
+                    crate::book_bookmarks::resolve_relative_page_path(container_path, relative),
+                    crate::book_bookmarks::RelativePagePathResolution::Unsafe
+                )
+            {
+                return Err(TransferError::Invalid(format!(
+                    "見開き調整の基点がコンテナ外を指しています: {} / {relative}",
+                    entry.path
+                )));
+            }
+        }
+    }
     for bookmark in &entry.book_bookmarks {
         if bookmark.page_kind != "relative_path" {
             continue;
@@ -4132,6 +5034,10 @@ fn ensure_database_schemas(data_dir: &Path) -> Result<(), TransferError> {
         crate::spread_db::SpreadDb::open_at(&data_dir.join("spread.db"))
             .map_err(|error| schema_open_error("spread.db", error))?,
     );
+    crate::spread_shift::initialize_database_at(&data_dir.join("spread_shift.db"))
+        .map_err(TransferError::Database)?;
+    crate::book_composition::store::initialize_database_at(&data_dir.join("book_composition.db"))
+        .map_err(TransferError::Database)?;
     drop(
         crate::folder_thumb_pins::FolderThumbPinDb::open_at(&data_dir.join("folder_thumb_pins.db"))
             .map_err(|error| schema_open_error("folder_thumb_pins.db", error))?,
@@ -4296,6 +5202,8 @@ fn open_import_connection(data_dir: &Path) -> Result<Connection, TransferError> 
         ("view_trim", "view_trim.db"),
         ("rotation", "rotation.db"),
         ("spread", "spread.db"),
+        ("spread_shift", "spread_shift.db"),
+        ("book_composition", "book_composition.db"),
         ("folder_pin", "folder_thumb_pins.db"),
         ("video_pin", "video_pins.db"),
     ] {
@@ -4330,6 +5238,8 @@ fn open_import_connection(data_dir: &Path) -> Result<Connection, TransferError> 
         "view_trim",
         "rotation",
         "spread",
+        "spread_shift",
+        "book_composition",
         "folder_pin",
         "video_pin",
     ] {
@@ -4355,6 +5265,8 @@ struct ApplyEntryOutcome {
     skipped_folder_pins: Vec<ImportFailure>,
     video_pin_changed: bool,
     folder_pin_changed: bool,
+    spread_shift: SpreadShiftFamilyChanges,
+    composition: CompositionFamilyChanges,
 }
 
 fn apply_entry(
@@ -4700,6 +5612,16 @@ fn apply_entry(
                 &container.state,
             )?;
         }
+    }
+    if sections.spread_shift
+        && let Some(family) = &entry.spread_shift_family
+    {
+        outcome.spread_shift = apply_spread_shift_family(tx, path, family)?;
+    }
+    if sections.composition
+        && let Some(family) = &entry.composition_family
+    {
+        outcome.composition = apply_composition_family(tx, path, entry.media_kind, family)?;
     }
     if sections.thumbnail_pins {
         if supports_container {
@@ -5919,6 +6841,59 @@ impl<W: Write> Write for CancelWriter<'_, W> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn composition_view_mode_transfer_preserves_exact_codec_and_dormant_binding() {
+        use super::*;
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("ATTACH DATABASE ':memory:' AS spread;
+            CREATE TABLE spread.spreads(path TEXT PRIMARY KEY,mode INTEGER,flow INTEGER,direction INTEGER);").unwrap();
+        let mut modes = (0..=7).collect::<Vec<_>>();
+        for class in 1..=3 {
+            for binding in (0..=7).chain(std::iter::once(255)) {
+                for explicit_flow in [0, 8192] {
+                    modes.push(4096 | explicit_flow | (class << 8) | binding);
+                }
+            }
+        }
+        for mode in modes {
+            let source = PortableContainerState {
+                spread: Some(PortableSpreadState {
+                    mode,
+                    flow: 2,
+                    direction: 1,
+                }),
+                ..Default::default()
+            };
+            let json = serde_json::to_vec(&source).unwrap();
+            let restored: PortableContainerState = serde_json::from_slice(&json).unwrap();
+            validate_container_state(&restored, "book.pdf").unwrap();
+            let key = format!("book-{mode}.pdf");
+            insert_container_state(&conn, &key, &restored).unwrap();
+            let stored: (i32, i32, i32) = conn
+                .query_row(
+                    "SELECT mode,flow,direction FROM spread.spreads WHERE path=?1",
+                    [&key],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(stored, (mode, 2, 1));
+        }
+        for mode in [-1, 8, 4096, 4096 | 256 | 8, 4096 | 256 | 16384, 8192 | 256] {
+            let state = PortableContainerState {
+                spread: Some(PortableSpreadState {
+                    mode,
+                    flow: 0,
+                    direction: 0,
+                }),
+                ..Default::default()
+            };
+            assert!(
+                validate_container_state(&state, "book.pdf").is_err(),
+                "accepted invalid mode {mode}"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -5934,6 +6909,349 @@ mod tests {
     }
 
     fn no_progress(_: TransferProgress) {}
+
+    fn shift_family(
+        coverage: crate::book_scope::BookScopeCoverage,
+        scopes: &[(&str, &str)],
+    ) -> PortableSpreadShiftFamily {
+        PortableSpreadShiftFamily {
+            coverage,
+            scopes: scopes
+                .iter()
+                .map(|(prefix, member)| PortableSpreadShiftScope {
+                    scope_prefix: (*prefix).into(),
+                    anchor_ref: crate::spread_shift::SpreadShiftPageRef::ArchiveEntry(
+                        (*member).into(),
+                    ),
+                })
+                .collect(),
+        }
+    }
+
+    fn set_shift(data_dir: &Path, root: &Path, prefix: &str, member: &str) {
+        let key = crate::book_scope::BookScopeKey::new(root, prefix)
+            .unwrap()
+            .storage_key();
+        let value = serde_json::to_string(&crate::spread_shift::SpreadShiftPageRef::ArchiveEntry(
+            member.into(),
+        ))
+        .unwrap();
+        Connection::open(data_dir.join("spread_shift.db"))
+            .unwrap()
+            .execute(
+                "INSERT OR REPLACE INTO spread_shifts (path, anchor_ref) VALUES (?1, ?2)",
+                params![key, value],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn spread_shift_image_folder_with_archive_extension_has_no_file_observation() {
+        let family = PortableSpreadShiftFamily {
+            coverage: crate::book_scope::BookScopeCoverage::Root,
+            scopes: vec![PortableSpreadShiftScope {
+                scope_prefix: String::new(),
+                anchor_ref: crate::spread_shift::SpreadShiftPageRef::RelativePath(
+                    "page.jpg".into(),
+                ),
+            }],
+        };
+        let changes =
+            spread_shift_family_changes(Path::new("C:/books/folder.zip"), &family, &HashMap::new())
+                .unwrap();
+        assert_eq!(changes.additions, 1);
+        assert!(changes.observation_roots.is_empty());
+    }
+
+    #[test]
+    fn spread_shift_nonempty_family_removes_omitted_scope_and_preserves_adjacent_roots() {
+        let temp = tempfile::TempDir::new().unwrap();
+        init_data_dir(temp.path());
+        let root = Path::new("C:/books/a%_book.zip");
+        set_shift(temp.path(), root, "", "old.jpg");
+        set_shift(temp.path(), root, "chapter", "chapter/old.jpg");
+        set_shift(
+            temp.path(),
+            Path::new("C:/books/a%_book.zip2"),
+            "chapter",
+            "chapter/other.jpg",
+        );
+        let conn = open_import_connection(temp.path()).unwrap();
+        conn.execute_batch("BEGIN; SAVEPOINT item").unwrap();
+        let family = shift_family(
+            crate::book_scope::BookScopeCoverage::Family,
+            &[("", "new.jpg")],
+        );
+        let changes = apply_spread_shift_family(&conn, root, &family).unwrap();
+        assert_eq!(
+            (changes.additions, changes.replacements, changes.removals),
+            (0, 1, 1)
+        );
+        assert_eq!(
+            changes.observation_roots,
+            BTreeSet::from([root.to_path_buf()])
+        );
+        assert_eq!(
+            read_spread_shift_family(&conn, "spread_shift.spread_shifts", root, &family.coverage)
+                .unwrap()
+                .len(),
+            1
+        );
+        // Item failure restores both the replaced root and omitted chapter.
+        conn.execute_batch("ROLLBACK TO item; RELEASE item; COMMIT")
+            .unwrap();
+        let original = read_spread_shift_family_at(temp.path(), root, &family.coverage).unwrap();
+        assert_eq!(original.len(), 2);
+        assert_eq!(
+            original[""],
+            crate::spread_shift::SpreadShiftPageRef::ArchiveEntry("old.jpg".into())
+        );
+        assert_eq!(
+            read_spread_shift_family_at(
+                temp.path(),
+                Path::new("C:/books/a%_book.zip2"),
+                &family.coverage
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn spread_shift_explicit_coverage_preserves_nested_outside_and_empty_clears_without_observation()
+     {
+        let temp = tempfile::TempDir::new().unwrap();
+        init_data_dir(temp.path());
+        let root = Path::new("D:/book.zip");
+        set_shift(temp.path(), root, "chapter", "chapter/one.jpg");
+        set_shift(
+            temp.path(),
+            root,
+            "chapter/inner.zip",
+            "chapter/inner.zip/one.jpg",
+        );
+        let conn = open_import_connection(temp.path()).unwrap();
+        conn.execute_batch("BEGIN").unwrap();
+        let family = shift_family(
+            crate::book_scope::BookScopeCoverage::Prefixes(vec!["chapter".into()]),
+            &[],
+        );
+        let changes = apply_spread_shift_family(&conn, root, &family).unwrap();
+        assert_eq!(changes.removals, 1);
+        assert!(changes.observation_roots.is_empty());
+        conn.execute_batch("COMMIT").unwrap();
+        let remaining = read_spread_shift_family_at(
+            temp.path(),
+            root,
+            &crate::book_scope::BookScopeCoverage::Family,
+        )
+        .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert!(remaining.contains_key("chapter/inner.zip"));
+    }
+
+    #[test]
+    fn spread_shift_family_rejects_unsafe_duplicate_outside_and_wrong_page_kind() {
+        for family in [
+            shift_family(
+                crate::book_scope::BookScopeCoverage::Family,
+                &[("../chapter", "a.jpg")],
+            ),
+            shift_family(
+                crate::book_scope::BookScopeCoverage::Family,
+                &[("chapter", "chapter/a.jpg"), ("chapter", "chapter/b.jpg")],
+            ),
+            shift_family(
+                crate::book_scope::BookScopeCoverage::Root,
+                &[("chapter", "chapter/a.jpg")],
+            ),
+            shift_family(
+                crate::book_scope::BookScopeCoverage::Family,
+                &[("chapter", "another/a.jpg")],
+            ),
+            shift_family(
+                crate::book_scope::BookScopeCoverage::Family,
+                &[("chapter", "chapter/../a.jpg")],
+            ),
+        ] {
+            assert!(validate_spread_shift_family(&family, PortableMediaKind::Zip).is_err());
+        }
+        let family = shift_family(
+            crate::book_scope::BookScopeCoverage::Family,
+            &[("chapter/inner.zip", "chapter/inner.zip/cover.jpg")],
+        );
+        validate_spread_shift_family(&family, PortableMediaKind::Zip).unwrap();
+        assert!(validate_spread_shift_family(&family, PortableMediaKind::Pdf).is_err());
+    }
+
+    #[test]
+    fn spread_shift_import_cancel_commits_captured_roots_and_same_value_has_no_observation() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        for name in ["one.zip", "two.zip"] {
+            fs::write(source.join(name), b"same").unwrap();
+            fs::copy(source.join(name), destination.join(name)).unwrap();
+        }
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+        for name in ["one.zip", "two.zip"] {
+            set_shift(
+                &source_data,
+                &source.join(name),
+                "chapter",
+                "chapter/page.jpg",
+            );
+        }
+        let cancel = AtomicBool::new(false);
+        assert_eq!(
+            export_at(&source_data, &source, false, &cancel, no_progress)
+                .unwrap()
+                .spread_shifts,
+            2
+        );
+        copy_sidecar_bundle(&source, &destination);
+        let preview =
+            inspect_import_with_data_at(&destination_data, &destination, &cancel, no_progress)
+                .unwrap();
+        assert_eq!(preview.spread_shift_additions, 2);
+        let mut captured = None;
+        let summary = import_at(&destination_data, &destination, &cancel, |progress| {
+            if progress.phase == TransferPhase::Importing && progress.processed == 2 {
+                captured = progress.current_path.clone();
+                cancel.store(true, Ordering::Relaxed);
+            }
+        })
+        .unwrap();
+        assert!(summary.cancelled);
+        assert_eq!(summary.committed.spread_shift_additions, 1);
+        let changed_root = destination.join(captured.unwrap());
+        assert_eq!(
+            summary.committed.spread_shift_observation_roots,
+            BTreeSet::from([changed_root.clone()])
+        );
+        assert_eq!(
+            summary.committed.spread_shift_scopes,
+            BTreeSet::from([
+                crate::book_scope::BookScopeKey::new(&changed_root, "chapter")
+                    .unwrap()
+                    .storage_key()
+            ])
+        );
+        cancel.store(false, Ordering::Relaxed);
+        let summary = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert_eq!(summary.committed.spread_shift_additions, 1);
+        assert_eq!(summary.committed.spread_shift_replacements, 0);
+        assert!(
+            !summary
+                .committed
+                .spread_shift_observation_roots
+                .contains(&changed_root)
+        );
+        let noop = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert!(noop.committed.spread_shift_scopes.is_empty());
+        assert!(noop.committed.spread_shift_observation_roots.is_empty());
+        fs::remove_file(&changed_root).unwrap();
+        let skipped = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert_eq!(skipped.skipped_missing, 1);
+        assert!(skipped.committed.spread_shift_scopes.is_empty());
+        assert!(skipped.committed.spread_shift_observation_roots.is_empty());
+    }
+
+    #[test]
+    fn spread_shift_failed_item_rolls_back_coverage_delete_and_publishes_no_roots() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(source.join("book.zip"), b"same").unwrap();
+        fs::copy(source.join("book.zip"), destination.join("book.zip")).unwrap();
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+        set_shift(&source_data, &source.join("book.zip"), "", "new.jpg");
+        set_shift(
+            &destination_data,
+            &destination.join("book.zip"),
+            "chapter",
+            "chapter/old.jpg",
+        );
+        Connection::open(destination_data.join("spread_shift.db")).unwrap().execute_batch(
+            "CREATE TRIGGER refuse_shift_insert BEFORE INSERT ON spread_shifts BEGIN SELECT RAISE(ABORT, 'fixture rejection'); END;"
+        ).unwrap();
+        let cancel = AtomicBool::new(false);
+        export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        copy_sidecar_bundle(&source, &destination);
+        let summary = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert_eq!(summary.failed_entries, 1);
+        assert!(summary.committed.spread_shift_observation_roots.is_empty());
+        assert!(summary.committed.spread_shift_scopes.is_empty());
+        let retained = read_spread_shift_family_at(
+            &destination_data,
+            &destination.join("book.zip"),
+            &crate::book_scope::BookScopeCoverage::Family,
+        )
+        .unwrap();
+        assert_eq!(retained.len(), 1);
+        assert!(retained.contains_key("chapter"));
+    }
+
+    #[test]
+    fn spread_shift_absent_field_preserves_values_for_all_legacy_versions() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let data = temp.path().join("data");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("book.zip"), b"same").unwrap();
+        init_data_dir(&data);
+        set_shift(&data, &root.join("book.zip"), "chapter", "chapter/old.jpg");
+        let cancel = AtomicBool::new(false);
+        export_at(&data, &root, false, &cancel, no_progress).unwrap();
+        rewrite_root_shard_entries(&root, &cancel, |entry| entry.spread_shift_family = None);
+        for version in [7, 8, 9] {
+            let mut manifest = read_bundle_manifest(&root, &cancel).unwrap();
+            manifest.version = version;
+            manifest.sections.spread_shift = false;
+            let bundle = root.join(SIDECAR_FILENAME);
+            fs::write(
+                bundle.join(BUNDLE_MANIFEST_FILENAME),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            let shard_path = bundle_generation_dir(&bundle, &manifest.generation)
+                .join(SHARDS_DIRNAME)
+                .join(shard_filename("."));
+            let contents = fs::read_to_string(&shard_path).unwrap();
+            let mut lines = contents.lines();
+            let mut header: ShardHeader = serde_json::from_str(lines.next().unwrap()).unwrap();
+            header.version = version;
+            let rewritten = format!(
+                "{}\n{}\n",
+                serde_json::to_string(&header).unwrap(),
+                lines.collect::<Vec<_>>().join("\n")
+            );
+            fs::write(&shard_path, rewritten).unwrap();
+            let summary = import_at(&data, &root, &cancel, no_progress).unwrap();
+            assert!(summary.committed.spread_shift_scopes.is_empty());
+            assert_eq!(
+                read_spread_shift_family_at(
+                    &data,
+                    &root.join("book.zip"),
+                    &crate::book_scope::BookScopeCoverage::Family
+                )
+                .unwrap()
+                .len(),
+                1
+            );
+        }
+    }
 
     #[cfg(windows)]
     fn bundle_file_attributes(root: &Path) -> u32 {
@@ -6092,6 +7410,766 @@ mod tests {
         ensure_database_schemas(path).unwrap();
     }
 
+    fn transfer_composition(
+        page: crate::book_composition::CompositionPageRef,
+    ) -> crate::book_composition::BookComposition {
+        use crate::book_composition::*;
+        BookComposition::new(
+            ReadingDirection::Rtl,
+            vec![CompositionUnit::Single {
+                page,
+                placement: SinglePlacement::Leading,
+                companion: SingleCompanion::Blank,
+            }],
+        )
+    }
+
+    fn archive_composition(member: &str) -> crate::book_composition::BookComposition {
+        transfer_composition(crate::book_composition::CompositionPageRef::ArchiveEntry {
+            entry_name: member.into(),
+        })
+    }
+
+    fn set_composition(
+        data: &Path,
+        root: &Path,
+        prefix: &str,
+        media: PortableMediaKind,
+        composition: &crate::book_composition::BookComposition,
+    ) {
+        let key = crate::book_scope::BookScopeKey::new(root, prefix)
+            .unwrap()
+            .storage_key();
+        let domain = composition_domain(media, prefix).unwrap();
+        let mut conn = Connection::open(data.join("book_composition.db")).unwrap();
+        let tx = conn.transaction().unwrap();
+        crate::book_composition::store::replace_row_in(
+            &tx,
+            "book_compositions",
+            &key,
+            &domain,
+            composition,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn composition_transfer_exact_coverage_local_revision_and_savepoint_rollback() {
+        use crate::book_scope::BookScopeCoverage;
+        let temp = tempfile::TempDir::new().unwrap();
+        init_data_dir(temp.path());
+        let root = Path::new("C:/books/a%_book.zip");
+        for (prefix, member) in [
+            ("", "old.jpg"),
+            ("chapter", "chapter/old.jpg"),
+            ("chapter/inner.zip", "chapter/inner.zip/old.jpg"),
+        ] {
+            set_composition(
+                temp.path(),
+                root,
+                prefix,
+                PortableMediaKind::Zip,
+                &archive_composition(member),
+            );
+        }
+        for other in ["D:/books/a%_book.zip", "C:/books/a%_book.zip2"] {
+            set_composition(
+                temp.path(),
+                Path::new(other),
+                "",
+                PortableMediaKind::Zip,
+                &archive_composition("other.jpg"),
+            );
+        }
+        let mut replacement = archive_composition("new.jpg");
+        replacement.revision = u64::MAX;
+        let family = PortableCompositionFamily {
+            coverage: BookScopeCoverage::Prefixes(vec!["".into(), "chapter".into()]),
+            scopes: vec![PortableCompositionScope {
+                scope_prefix: "".into(),
+                composition: replacement,
+            }],
+        };
+        let conn = open_import_connection(temp.path()).unwrap();
+        conn.execute_batch("BEGIN; SAVEPOINT item").unwrap();
+        let changes =
+            apply_composition_family(&conn, root, PortableMediaKind::Zip, &family).unwrap();
+        assert_eq!(
+            (changes.additions, changes.replacements, changes.removals),
+            (0, 1, 1)
+        );
+        let current = read_composition_family(
+            &conn,
+            "book_composition.book_compositions",
+            root,
+            &BookScopeCoverage::Family,
+        )
+        .unwrap();
+        assert_eq!(current[""].composition.revision, 2);
+        assert!(current.contains_key("chapter/inner.zip"));
+        conn.execute_batch("ROLLBACK TO item; RELEASE item; COMMIT")
+            .unwrap();
+        assert_eq!(
+            read_composition_family_at(temp.path(), root, &BookScopeCoverage::Family)
+                .unwrap()
+                .len(),
+            3
+        );
+        conn.execute_batch("BEGIN").unwrap();
+        apply_composition_family(&conn, root, PortableMediaKind::Zip, &family).unwrap();
+        conn.execute_batch("COMMIT").unwrap();
+        let noop = apply_composition_family(&conn, root, PortableMediaKind::Zip, &family).unwrap();
+        assert!(noop.scopes.is_empty());
+        assert!(noop.observation_roots.is_empty());
+        for other in ["D:/books/a%_book.zip", "C:/books/a%_book.zip2"] {
+            assert_eq!(
+                read_composition_family_at(temp.path(), Path::new(other), &BookScopeCoverage::Root)
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        let clear = PortableCompositionFamily {
+            coverage: BookScopeCoverage::Family,
+            scopes: vec![],
+        };
+        let changes =
+            apply_composition_family(&conn, root, PortableMediaKind::Zip, &clear).unwrap();
+        assert_eq!(changes.removals, 2);
+        assert!(changes.observation_roots.is_empty());
+    }
+
+    #[test]
+    fn composition_transfer_validates_all_scope_and_model_contracts() {
+        use crate::book_scope::BookScopeCoverage;
+        let valid = PortableCompositionScope {
+            scope_prefix: "chapter".into(),
+            composition: archive_composition("chapter/page.jpg"),
+        };
+        let family = PortableCompositionFamily {
+            coverage: BookScopeCoverage::Family,
+            scopes: vec![valid.clone()],
+        };
+        validate_composition_family(&family, PortableMediaKind::Zip).unwrap();
+        for scopes in [
+            vec![valid.clone(), valid.clone()],
+            vec![PortableCompositionScope {
+                scope_prefix: "../chapter".into(),
+                ..valid.clone()
+            }],
+            vec![PortableCompositionScope {
+                scope_prefix: "CHAPTER".into(),
+                ..valid.clone()
+            }],
+            vec![PortableCompositionScope {
+                composition: archive_composition("chapter/sub/page.jpg"),
+                ..valid.clone()
+            }],
+            vec![PortableCompositionScope {
+                composition: archive_composition("chapter/../page.jpg"),
+                ..valid.clone()
+            }],
+            vec![PortableCompositionScope {
+                composition: archive_composition("D:/page.jpg"),
+                ..valid.clone()
+            }],
+            vec![PortableCompositionScope {
+                composition: transfer_composition(
+                    crate::book_composition::CompositionPageRef::PdfPage { page_num: 0 },
+                ),
+                ..valid.clone()
+            }],
+        ] {
+            assert!(
+                validate_composition_family(
+                    &PortableCompositionFamily {
+                        coverage: BookScopeCoverage::Family,
+                        scopes
+                    },
+                    PortableMediaKind::Zip
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            validate_composition_family(
+                &PortableCompositionFamily {
+                    coverage: BookScopeCoverage::Root,
+                    ..family.clone()
+                },
+                PortableMediaKind::Zip
+            )
+            .is_err()
+        );
+        assert!(validate_composition_family(&family, PortableMediaKind::Pdf).is_err());
+        for kind in [
+            PortableMediaKind::Directory,
+            PortableMediaKind::Pdf,
+            PortableMediaKind::Image,
+        ] {
+            assert!(
+                validate_composition_family(
+                    &PortableCompositionFamily {
+                        coverage: BookScopeCoverage::Family,
+                        scopes: vec![]
+                    },
+                    kind
+                )
+                .is_err()
+            );
+        }
+        let mut malformed = serde_json::to_value(&family).unwrap();
+        malformed["scopes"][0]["composition"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<PortableCompositionFamily>(malformed).is_err());
+        let mut unknown = family;
+        unknown.scopes[0].composition.schema_version += 1;
+        assert!(validate_composition_family(&unknown, PortableMediaKind::Zip).is_err());
+    }
+
+    #[test]
+    fn composition_transfer_folder_owner_and_document_number_round_trip() {
+        use crate::book_composition::CompositionPageRef;
+        use crate::book_scope::BookScopeCoverage;
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(source.join("folder")).unwrap();
+        fs::create_dir_all(destination.join("folder")).unwrap();
+        fs::write(source.join("page.jpg"), b"image").unwrap();
+        fs::write(source.join("folder/page.jpg"), b"image").unwrap();
+        for name in ["book.pdf", "book.epub"] {
+            fs::write(source.join(name), b"document").unwrap();
+            fs::copy(source.join(name), destination.join(name)).unwrap();
+        }
+        fs::copy(source.join("page.jpg"), destination.join("page.jpg")).unwrap();
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+        let folder = transfer_composition(CompositionPageRef::RelativePath {
+            path: "page.jpg".into(),
+        });
+        for root in [&source, &source.join("folder")] {
+            set_composition(
+                &source_data,
+                root,
+                "",
+                PortableMediaKind::Directory,
+                &folder,
+            );
+        }
+        for name in ["book.pdf", "book.epub"] {
+            let document = transfer_composition(CompositionPageRef::PdfPage { page_num: 23 });
+            set_composition(
+                &source_data,
+                &source.join(name),
+                "",
+                PortableMediaKind::Pdf,
+                &document,
+            );
+        }
+        let cancel = AtomicBool::new(false);
+        let exported = export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        assert_eq!(exported.compositions, 4);
+        let manifest = read_manifest(&source, &cancel).unwrap();
+        for owner in [".", "folder", "book.pdf", "book.epub"] {
+            assert_eq!(
+                manifest
+                    .entries
+                    .iter()
+                    .find(|entry| entry.path == owner)
+                    .unwrap()
+                    .composition_family
+                    .as_ref()
+                    .unwrap()
+                    .scopes
+                    .len(),
+                1
+            );
+        }
+        assert!(
+            manifest
+                .entries
+                .iter()
+                .find(|entry| entry.path == "page.jpg")
+                .unwrap()
+                .composition_family
+                .is_none()
+        );
+        assert!(
+            manifest
+                .entries
+                .iter()
+                .all(|entry| entry.path != "folder/page.jpg")
+        );
+        copy_sidecar_bundle(&source, &destination);
+        let imported = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert_eq!(imported.committed.composition_additions, 4);
+        assert_eq!(
+            imported.committed.composition_observation_roots,
+            BTreeSet::from([destination.join("book.pdf"), destination.join("book.epub")])
+        );
+        for root in [
+            &destination,
+            &destination.join("folder"),
+            &destination.join("book.pdf"),
+            &destination.join("book.epub"),
+        ] {
+            let restored =
+                read_composition_family_at(&destination_data, root, &BookScopeCoverage::Root)
+                    .unwrap();
+            assert_eq!(restored[""].composition.revision, 1);
+        }
+        assert!(!destination_data.join("reading_history.db").exists());
+        assert!(!destination_data.join("book_resume.db").exists());
+    }
+
+    #[test]
+    fn composition_transfer_old_absent_and_section_absent_keep_new_empty_clears() {
+        use crate::book_scope::BookScopeCoverage;
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let data = temp.path().join("data");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("book.zip"), b"same").unwrap();
+        init_data_dir(&data);
+        set_composition(
+            &data,
+            &root.join("book.zip"),
+            "chapter",
+            PortableMediaKind::Zip,
+            &archive_composition("chapter/old.jpg"),
+        );
+        let cancel = AtomicBool::new(false);
+        export_at(&data, &root, false, &cancel, no_progress).unwrap();
+        rewrite_root_shard_entries(&root, &cancel, |entry| entry.composition_family = None);
+        for version in [7, 8, 9, 10, FORMAT_VERSION] {
+            let mut manifest = read_bundle_manifest(&root, &cancel).unwrap();
+            manifest.version = version;
+            manifest.sections.composition = true;
+            let bundle = root.join(SIDECAR_FILENAME);
+            fs::write(
+                bundle.join(BUNDLE_MANIFEST_FILENAME),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            let shard = bundle_generation_dir(&bundle, &manifest.generation)
+                .join(SHARDS_DIRNAME)
+                .join(shard_filename("."));
+            let contents = fs::read_to_string(&shard).unwrap();
+            let mut lines = contents.lines();
+            let mut header: ShardHeader = serde_json::from_str(lines.next().unwrap()).unwrap();
+            header.version = version;
+            fs::write(
+                shard,
+                format!(
+                    "{}\n{}\n",
+                    serde_json::to_string(&header).unwrap(),
+                    lines.collect::<Vec<_>>().join("\n")
+                ),
+            )
+            .unwrap();
+            rewrite_root_shard_entries(&root, &cancel, |entry| {
+                if entry.path == "book.zip" && version < FORMAT_VERSION {
+                    // Legacy versions cannot turn a retained modern field into
+                    // permission to clear receiver data.
+                    entry.composition_family = Some(PortableCompositionFamily {
+                        coverage: BookScopeCoverage::Family,
+                        scopes: vec![],
+                    });
+                } else {
+                    entry.composition_family = None;
+                }
+            });
+            let imported = import_at(&data, &root, &cancel, no_progress).unwrap();
+            assert!(imported.committed.composition_scopes.is_empty());
+            assert_eq!(
+                read_composition_family_at(
+                    &data,
+                    &root.join("book.zip"),
+                    &BookScopeCoverage::Family
+                )
+                .unwrap()
+                .len(),
+                1
+            );
+        }
+        rewrite_root_shard_entries(&root, &cancel, |entry| {
+            if entry.path == "book.zip" {
+                entry.composition_family = Some(PortableCompositionFamily {
+                    coverage: BookScopeCoverage::Family,
+                    scopes: vec![],
+                });
+            }
+        });
+        let mut manifest = read_bundle_manifest(&root, &cancel).unwrap();
+        manifest.sections.composition = false;
+        fs::write(
+            root.join(SIDECAR_FILENAME).join(BUNDLE_MANIFEST_FILENAME),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            import_at(&data, &root, &cancel, no_progress)
+                .unwrap()
+                .committed
+                .composition_scopes
+                .is_empty()
+        );
+        manifest.sections.composition = true;
+        fs::write(
+            root.join(SIDECAR_FILENAME).join(BUNDLE_MANIFEST_FILENAME),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let preview = inspect_import_with_data_at(&data, &root, &cancel, no_progress).unwrap();
+        assert_eq!(preview.composition_removals, 1);
+        let imported = import_at(&data, &root, &cancel, no_progress).unwrap();
+        assert_eq!(imported.committed.composition_removals, 1);
+        assert!(imported.committed.composition_observation_roots.is_empty());
+        assert!(
+            read_composition_family_at(&data, &root.join("book.zip"), &BookScopeCoverage::Family)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn composition_transfer_cancel_publishes_only_committed_scope_and_noop_has_no_edit() {
+        use crate::book_scope::BookScopeCoverage;
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+        for name in ["one.zip", "two.zip"] {
+            fs::write(source.join(name), b"same").unwrap();
+            fs::copy(source.join(name), destination.join(name)).unwrap();
+            set_composition(
+                &source_data,
+                &source.join(name),
+                "chapter",
+                PortableMediaKind::Zip,
+                &archive_composition("chapter/page.jpg"),
+            );
+        }
+        let cancel = AtomicBool::new(false);
+        export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        copy_sidecar_bundle(&source, &destination);
+        assert_eq!(
+            inspect_import_with_data_at(&destination_data, &destination, &cancel, no_progress)
+                .unwrap()
+                .composition_additions,
+            2
+        );
+        let mut captured = None;
+        let imported = import_at(&destination_data, &destination, &cancel, |progress| {
+            if progress.phase == TransferPhase::Importing && progress.processed == 2 {
+                captured = progress.current_path.clone();
+                cancel.store(true, Ordering::Relaxed);
+            }
+        })
+        .unwrap();
+        assert!(imported.cancelled);
+        assert_eq!(imported.committed.composition_additions, 1);
+        let changed_root = destination.join(captured.unwrap());
+        assert_eq!(
+            imported.committed.composition_observation_roots,
+            BTreeSet::from([changed_root.clone()])
+        );
+        assert_eq!(
+            imported.committed.composition_scopes,
+            BTreeSet::from([
+                crate::book_scope::BookScopeKey::new(&changed_root, "chapter")
+                    .unwrap()
+                    .storage_key()
+            ])
+        );
+        assert_eq!(
+            read_composition_family_at(
+                &destination_data,
+                &changed_root,
+                &BookScopeCoverage::Family
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        cancel.store(false, Ordering::Relaxed);
+        assert_eq!(
+            import_at(&destination_data, &destination, &cancel, no_progress)
+                .unwrap()
+                .committed
+                .composition_additions,
+            1
+        );
+        let noop = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert!(noop.committed.composition_scopes.is_empty());
+        assert!(noop.committed.composition_observation_roots.is_empty());
+    }
+
+    #[test]
+    fn composition_transfer_failed_item_rolls_back_replacement_and_covered_removal() {
+        use crate::book_scope::BookScopeCoverage;
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(source.join("book.zip"), b"same").unwrap();
+        fs::copy(source.join("book.zip"), destination.join("book.zip")).unwrap();
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+        set_composition(
+            &source_data,
+            &source.join("book.zip"),
+            "",
+            PortableMediaKind::Zip,
+            &archive_composition("new.jpg"),
+        );
+        for (prefix, member) in [("", "old.jpg"), ("chapter", "chapter/old.jpg")] {
+            set_composition(
+                &destination_data,
+                &destination.join("book.zip"),
+                prefix,
+                PortableMediaKind::Zip,
+                &archive_composition(member),
+            );
+        }
+        Connection::open(destination_data.join("book_composition.db")).unwrap().execute_batch(
+            "CREATE TRIGGER refuse_composition_delete BEFORE DELETE ON book_compositions BEGIN SELECT RAISE(ABORT, 'fixture rejection'); END;"
+        ).unwrap();
+        let cancel = AtomicBool::new(false);
+        export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        copy_sidecar_bundle(&source, &destination);
+        let imported = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert_eq!(imported.failed_entries, 1);
+        assert!(imported.committed.composition_scopes.is_empty());
+        assert!(imported.committed.composition_observation_roots.is_empty());
+        let retained = read_composition_family_at(
+            &destination_data,
+            &destination.join("book.zip"),
+            &BookScopeCoverage::Family,
+        )
+        .unwrap();
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained[""].composition.revision, 1);
+        assert!(same_composition_content(
+            &retained[""].composition,
+            &archive_composition("old.jpg")
+        ));
+        assert!(retained.contains_key("chapter"));
+    }
+
+    #[test]
+    fn composition_transfer_missing_changed_and_kind_mismatch_keep_existing_rows() {
+        use crate::book_scope::BookScopeCoverage;
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+        for name in ["missing.zip", "changed.zip", "kind.zip"] {
+            fs::write(source.join(name), b"same").unwrap();
+            set_composition(
+                &source_data,
+                &source.join(name),
+                "",
+                PortableMediaKind::Zip,
+                &archive_composition("new.jpg"),
+            );
+            set_composition(
+                &destination_data,
+                &destination.join(name),
+                "",
+                PortableMediaKind::Zip,
+                &archive_composition("old.jpg"),
+            );
+        }
+        fs::write(destination.join("changed.zip"), b"different-size").unwrap();
+        fs::copy(source.join("kind.zip"), destination.join("kind.zip")).unwrap();
+        let cancel = AtomicBool::new(false);
+        export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        rewrite_root_shard_entries(&source, &cancel, |entry| {
+            if entry.path == "kind.zip" {
+                entry.media_kind = PortableMediaKind::Pdf;
+                entry.composition_family = Some(PortableCompositionFamily {
+                    coverage: BookScopeCoverage::Root,
+                    scopes: vec![PortableCompositionScope {
+                        scope_prefix: "".into(),
+                        composition: transfer_composition(
+                            crate::book_composition::CompositionPageRef::PdfPage { page_num: 0 },
+                        ),
+                    }],
+                });
+            }
+        });
+        copy_sidecar_bundle(&source, &destination);
+        let preview =
+            inspect_import_with_data_at(&destination_data, &destination, &cancel, no_progress)
+                .unwrap();
+        assert_eq!(
+            (
+                preview.missing_entries,
+                preview.changed_files,
+                preview.kind_mismatch_entries
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            (
+                preview.composition_additions,
+                preview.composition_replacements,
+                preview.composition_removals
+            ),
+            (0, 0, 0)
+        );
+        let imported = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert_eq!(
+            (
+                imported.skipped_missing,
+                imported.skipped_changed,
+                imported.skipped_kind_mismatch
+            ),
+            (1, 1, 1)
+        );
+        assert!(imported.committed.composition_scopes.is_empty());
+        for name in ["missing.zip", "changed.zip", "kind.zip"] {
+            let retained = read_composition_family_at(
+                &destination_data,
+                &destination.join(name),
+                &BookScopeCoverage::Root,
+            )
+            .unwrap();
+            assert!(same_composition_content(
+                &retained[""].composition,
+                &archive_composition("old.jpg")
+            ));
+        }
+    }
+
+    #[test]
+    fn composition_transfer_preview_counts_and_actual_counts_follow_destination_changes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+        for name in ["add.zip", "replace.zip", "clear.zip"] {
+            fs::write(source.join(name), b"same").unwrap();
+            fs::copy(source.join(name), destination.join(name)).unwrap();
+        }
+        for name in ["add.zip", "replace.zip"] {
+            set_composition(
+                &source_data,
+                &source.join(name),
+                "",
+                PortableMediaKind::Zip,
+                &archive_composition("new.jpg"),
+            );
+        }
+        for name in ["replace.zip", "clear.zip"] {
+            set_composition(
+                &destination_data,
+                &destination.join(name),
+                "",
+                PortableMediaKind::Zip,
+                &archive_composition("old.jpg"),
+            );
+        }
+        let cancel = AtomicBool::new(false);
+        export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        copy_sidecar_bundle(&source, &destination);
+        let preview =
+            inspect_import_with_data_at(&destination_data, &destination, &cancel, no_progress)
+                .unwrap();
+        assert_eq!(
+            (
+                preview.composition_additions,
+                preview.composition_replacements,
+                preview.composition_removals
+            ),
+            (1, 1, 1)
+        );
+        set_composition(
+            &destination_data,
+            &destination.join("add.zip"),
+            "",
+            PortableMediaKind::Zip,
+            &archive_composition("changed-after-preview.jpg"),
+        );
+        let imported = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert_eq!(
+            (
+                imported.committed.composition_additions,
+                imported.committed.composition_replacements,
+                imported.committed.composition_removals
+            ),
+            (0, 2, 1)
+        );
+        assert_eq!(imported.committed.composition_scopes.len(), 3);
+        assert_eq!(
+            imported.committed.composition_observation_roots,
+            BTreeSet::from([destination.join("add.zip"), destination.join("replace.zip")])
+        );
+    }
+
+    #[test]
+    fn composition_transfer_invalid_payload_preflight_preserves_all_destination_rows() {
+        use crate::book_scope::BookScopeCoverage;
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let data = temp.path().join("data");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("book.zip"), b"same").unwrap();
+        init_data_dir(&data);
+        set_composition(
+            &data,
+            &root.join("book.zip"),
+            "",
+            PortableMediaKind::Zip,
+            &archive_composition("old.jpg"),
+        );
+        let cancel = AtomicBool::new(false);
+        export_at(&data, &root, false, &cancel, no_progress).unwrap();
+        rewrite_root_shard_entries(&root, &cancel, |entry| {
+            if entry.path == "book.zip" {
+                entry.composition_family.as_mut().unwrap().scopes[0]
+                    .composition
+                    .schema_version = 999;
+            }
+        });
+        let before = fs::read(data.join("book_composition.db")).unwrap();
+        assert!(matches!(
+            import_at(&data, &root, &cancel, no_progress),
+            Err(TransferError::Invalid(_))
+        ));
+        assert_eq!(fs::read(data.join("book_composition.db")).unwrap(), before);
+        let retained =
+            read_composition_family_at(&data, &root.join("book.zip"), &BookScopeCoverage::Root)
+                .unwrap();
+        assert!(same_composition_content(
+            &retained[""].composition,
+            &archive_composition("old.jpg")
+        ));
+        assert_eq!(retained[""].composition.revision, 1);
+    }
+
     #[test]
     fn classify_tags_rollback_journal_attempt_accepts_delete() {
         assert_eq!(
@@ -6211,6 +8289,8 @@ mod tests {
             book_bookmarks: Vec::new(),
             page_state: PortablePageState::default(),
             container_state: PortableContainerState::default(),
+            spread_shift_family: None,
+            composition_family: None,
             nested_containers: Vec::new(),
             video_pin: None,
             virtual_items: Vec::new(),
@@ -6388,6 +8468,8 @@ mod tests {
                 }],
                 page_state: PortablePageState::default(),
                 container_state: PortableContainerState::default(),
+                spread_shift_family: None,
+                composition_family: None,
                 nested_containers: Vec::new(),
                 video_pin: None,
                 virtual_items: Vec::new(),
@@ -6971,6 +9053,21 @@ mod tests {
         fs::write(&destination_archive, b"same-rar").unwrap();
         init_data_dir(&source_data);
         init_data_dir(&destination_data);
+        set_shift(&source_data, &source_archive, "vol01", "vol01/cover.jpg");
+        set_composition(
+            &source_data,
+            &source_archive,
+            "",
+            PortableMediaKind::ConvertibleArchive,
+            &archive_composition("root.jpg"),
+        );
+        set_composition(
+            &source_data,
+            &source_archive,
+            "vol01",
+            PortableMediaKind::ConvertibleArchive,
+            &archive_composition("vol01/cover.jpg"),
+        );
 
         let source_cache_key = crate::path_key::normalize(
             &crate::archive_cache::cache_zip_path_for_data_dir(&source_data, &source_archive),
@@ -7008,6 +9105,7 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let exported = export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
         assert_eq!(exported.container_states, 2);
+        assert_eq!(exported.compositions, 2);
         let manifest = read_manifest(&source, &cancel).unwrap();
         let archive_entry = manifest
             .entries
@@ -7020,6 +9118,18 @@ mod tests {
         );
         assert!(archive_entry.container_state.spread.is_some());
         assert!(archive_entry.container_state.view_trim.is_some());
+        assert_eq!(
+            archive_entry
+                .composition_family
+                .as_ref()
+                .unwrap()
+                .scopes
+                .len(),
+            2
+        );
+        let shift_family = archive_entry.spread_shift_family.as_ref().unwrap();
+        assert_eq!(shift_family.scopes.len(), 1);
+        assert_eq!(shift_family.scopes[0].scope_prefix, "vol01");
         assert_eq!(archive_entry.nested_containers.len(), 1);
 
         let destination_source_key = crate::path_key::normalize(&destination_archive);
@@ -7053,6 +9163,43 @@ mod tests {
         let imported = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
         assert_eq!(imported.failed_entries, 0);
         assert_eq!(imported.skipped_kind_mismatch, 0);
+        assert_eq!(imported.committed.spread_shift_additions, 1);
+        assert_eq!(imported.committed.composition_additions, 2);
+        assert_eq!(
+            imported.committed.composition_observation_roots,
+            BTreeSet::from([destination_archive.clone()])
+        );
+        let logical_compositions = read_composition_family_at(
+            &destination_data,
+            &destination_archive,
+            &crate::book_scope::BookScopeCoverage::Family,
+        )
+        .unwrap();
+        assert!(logical_compositions.contains_key(""));
+        assert!(logical_compositions.contains_key("vol01"));
+        assert!(
+            read_composition_family_at(
+                &destination_data,
+                &crate::archive_cache::cache_zip_path_for_data_dir(
+                    &destination_data,
+                    &destination_archive
+                ),
+                &crate::book_scope::BookScopeCoverage::Family,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(
+            imported.committed.spread_shift_observation_roots,
+            BTreeSet::from([destination_archive.clone()])
+        );
+        let logical_shifts = read_spread_shift_family_at(
+            &destination_data,
+            &destination_archive,
+            &crate::book_scope::BookScopeCoverage::Family,
+        )
+        .unwrap();
+        assert!(logical_shifts.contains_key("vol01"));
         let destination_nested_key = join_container_key(&destination_cache_key, "vol01");
         assert_eq!(
             destination_spread
@@ -7943,6 +10090,8 @@ mod tests {
                 book_bookmarks: Vec::new(),
                 page_state: PortablePageState::default(),
                 container_state: PortableContainerState::default(),
+                spread_shift_family: None,
+                composition_family: None,
                 nested_containers: vec![PortableNestedContainer {
                     member_key: mixed_container.to_string(),
                     state: PortableContainerState {
@@ -8097,6 +10246,8 @@ mod tests {
                 book_bookmarks: Vec::new(),
                 page_state: PortablePageState::default(),
                 container_state: PortableContainerState::default(),
+                spread_shift_family: None,
+                composition_family: None,
                 nested_containers: Vec::new(),
                 video_pin: None,
                 virtual_items: vec![virtual_item("A/B"), virtual_item(r"A\B")],
@@ -8957,7 +11108,7 @@ mod tests {
     }
 
     #[test]
-    fn v6_and_older_bundles_are_rejected_with_v7_v8_v9_message() {
+    fn v6_and_older_bundles_are_rejected_with_supported_version_message() {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path().join("root");
         let data = temp.path().join("data");
@@ -8978,7 +11129,7 @@ mod tests {
                 Err(TransferError::Invalid(message))
                     if message.contains("未対応のバージョン")
                         && message.contains(&version.to_string())
-                        && message.contains("v7 / v8 / v9を受け入れます")
+                        && message.contains("v7 / v8 / v9 / v10 / v11を受け入れます")
             ));
         }
     }
@@ -10152,6 +12303,8 @@ mod tests {
                 book_bookmarks: Vec::new(),
                 page_state: PortablePageState::default(),
                 container_state: PortableContainerState::default(),
+                spread_shift_family: None,
+                composition_family: None,
                 nested_containers: Vec::new(),
                 video_pin: None,
                 virtual_items: Vec::new(),
@@ -10379,6 +12532,8 @@ mod tests {
                 book_bookmarks: Vec::new(),
                 page_state: PortablePageState::default(),
                 container_state: PortableContainerState::default(),
+                spread_shift_family: None,
+                composition_family: None,
                 nested_containers: Vec::new(),
                 video_pin: None,
                 virtual_items: Vec::new(),

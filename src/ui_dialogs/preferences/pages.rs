@@ -24,6 +24,19 @@ use crate::settings::{
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
 
+pub(super) fn draw_preferences_restore_position_setting(
+    ui: &mut egui::Ui,
+    settings: &mut Settings,
+) {
+    ui.checkbox(
+        &mut settings.preferences_restore_position,
+        "環境設定を開き直したときに前回の位置を復元する",
+    )
+    .on_hover_text(
+        "アプリを終了するまで、ページ、スクロール位置、選択項目や折りたたみ状態を覚えます。",
+    );
+}
+
 pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
     if state.transfer_feedback.is_some() {
         super::transfer::render_transfer_feedback(ui, state.transfer_feedback.as_ref());
@@ -74,6 +87,10 @@ pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
             )
             .weak(),
         );
+    });
+    ui.add_space(12.0);
+    anchored(ui, state, "general/restore-position", |ui, state| {
+        draw_preferences_restore_position_setting(ui, &mut state.settings);
     });
     ui.add_space(12.0);
     ui.label(
@@ -4872,9 +4889,16 @@ pub(super) fn page_menu_layout(ui: &mut egui::Ui, state: &mut PreferencesState) 
                 );
             });
 
-            egui::CollapsingHeader::new(format!("{} の項目", top.label()))
-                .id_salt(("menu_layout_top", top))
-                .default_open(top_visible)
+            // The view owner controls openness; egui only keeps rendering caches.
+            let open = state
+                .menu_expanded
+                .get(&top)
+                .copied()
+                .unwrap_or(top_visible);
+            let response = egui::CollapsingHeader::new(format!("{} の項目", top.label()))
+                .id_salt(("menu_layout_top", top, state.right_panel_scroll_generation))
+                .default_open(open)
+                .open(Some(open))
                 .show(ui, |ui| {
                     egui::Grid::new(("menu_layout_commands", top))
                         .num_columns(4)
@@ -4933,6 +4957,12 @@ pub(super) fn page_menu_layout(ui: &mut egui::Ui, state: &mut PreferencesState) 
                             }
                         });
                 });
+            state
+                .menu_expanded
+                .insert(top, open ^ response.header_response.clicked());
+            if response.header_response.clicked() {
+                ui.ctx().request_repaint();
+            }
         }
 
         if let Some(edit) = edit {
@@ -4947,6 +4977,8 @@ pub(super) fn page_context_menu_layout(ui: &mut egui::Ui, state: &mut Preference
             ui,
             &mut state.settings.context_menu_layout,
             &mut state.context_menu_preview_scenario,
+            &mut state.context_menu_expanded,
+            state.right_panel_scroll_generation,
         );
     });
 }
@@ -4955,6 +4987,8 @@ pub(super) fn draw_context_menu_layout_settings(
     ui: &mut egui::Ui,
     layout: &mut ContextMenuLayoutSettings,
     scenario: &mut ContextMenuPreviewScenario,
+    expanded: &mut HashMap<ContextMenuParentId, bool>,
+    view_generation: u64,
 ) {
     const ITEM_PREVIEW_WIDTH: f32 = 18.0;
     const ITEM_COLUMN_MIN_WIDTH: f32 = 260.0;
@@ -5019,9 +5053,14 @@ pub(super) fn draw_context_menu_layout_settings(
     for &parent in ContextMenuParentId::ALL {
         let order = snapshot.resolved_order(parent);
         ui.add_space(6.0);
-        egui::CollapsingHeader::new(parent.label())
-            .id_salt(("context_menu_layout_parent", parent))
-            .default_open(parent == ContextMenuParentId::Root)
+        let open = expanded
+            .get(&parent)
+            .copied()
+            .unwrap_or(parent == ContextMenuParentId::Root);
+        let response = egui::CollapsingHeader::new(parent.label())
+            .id_salt(("context_menu_layout_parent", parent, view_generation))
+            .default_open(open)
+            .open(Some(open))
             .show(ui, |ui| {
                 egui::Grid::new(("context_menu_layout_items", parent))
                     .num_columns(4)
@@ -5319,6 +5358,10 @@ pub(super) fn draw_context_menu_layout_settings(
                         }
                     });
             });
+        expanded.insert(parent, open ^ response.header_response.clicked());
+        if response.header_response.clicked() {
+            ui.ctx().request_repaint();
+        }
     }
     ui.small(
         "外部ツール、関連付けアプリ、そのサブメニューと Windows のメニューは固定枠です。\
@@ -8140,6 +8183,10 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
         draw_effetune_auto_open_settings(ui, &mut state.settings);
     });
     #[cfg(not(feature = "portable"))]
+    anchored(ui, state, "video/effetune-taskbar", |ui, state| {
+        draw_effetune_taskbar_settings(ui, &mut state.settings);
+    });
+    #[cfg(not(feature = "portable"))]
     anchored(ui, state, "video/effetune-minimized", |ui, state| {
         draw_effetune_minimized_settings(ui, &mut state.settings);
         ui.add_space(12.0);
@@ -8278,6 +8325,22 @@ pub(super) fn draw_effetune_auto_open_settings(ui: &mut egui::Ui, settings: &mut
          全画面・最小化・トレイ格納・リモート閲覧中は開きません。復帰しただけでは開きません。\n\
          音声ファイルは対象外です。OK を押すと反映します。再生中に ON にしても、その再生では開きません。\n\
          未起動の音響調整を開始した場合、窓を閉じても終了まで音の処理を続けます。",
+    );
+    #[cfg(feature = "portable")]
+    let _ = (ui, settings);
+}
+
+pub(super) fn draw_effetune_taskbar_settings(ui: &mut egui::Ui, settings: &mut Settings) {
+    #[cfg(not(feature = "portable"))]
+    ui.checkbox(
+        &mut settings.effetune_show_in_taskbar,
+        "音響調整の窓をタスクバーに表示する",
+    )
+    .on_hover_text(
+        "初期値は ON です。音響調整の窓をタスクバーから最小化・復元できます。\n\
+         OK を押すと、開いている窓にも反映します。閉じている窓は開きません。\n\
+         音響調整の窓を最小化・閉じる操作では、音の処理は続きます。\n\
+         メインウィンドウの最小化中は「表示したままにする」の設定に従い、リモート閲覧中は隠れます。",
     );
     #[cfg(feature = "portable")]
     let _ = (ui, settings);
@@ -8762,8 +8825,9 @@ pub(super) fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
         .collect();
     let available_height = ui.available_height().max(120.0);
     let mut clicked_add: Option<String> = None;
-    egui::ScrollArea::vertical()
+    let output = egui::ScrollArea::vertical()
         .id_salt("vst3-pref-page-picker-scroll")
+        .vertical_scroll_offset(state.vst3_picker_scroll_y)
         .max_height(available_height)
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -8809,6 +8873,7 @@ pub(super) fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 }
             }
         });
+    state.vst3_picker_scroll_y = output.state.offset.y;
     if let Some(path) = clicked_add {
         if state.settings.vst3_plugins.len() < MAX_CHAIN_LEN
             && !state.settings.vst3_plugins.iter().any(|e| e.path == path)
@@ -9090,13 +9155,113 @@ pub(super) fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
     });
 }
 
+pub(super) fn page_file_type_visibility(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    use crate::file_type_visibility::{FileTypeCategory, FileTypeVisibility, normalize_extension};
+    anchored(ui, state, "file-types/categories", |ui, state| {
+        ui.label("一覧に表示する種類を選んでください。");
+        ui.small(
+            "種類と拡張子の両方が許可された項目を表示します。フォルダ・ドライブは表示します。",
+        );
+        ui.small("評価・タグ・ブックマークなどの登録データは削除しません。");
+        egui::Grid::new("file_type_categories")
+            .num_columns(2)
+            .show(ui, |ui| {
+                for (index, category) in FileTypeCategory::ALL.into_iter().enumerate() {
+                    let mut visible = !state
+                        .settings
+                        .file_type_visibility
+                        .excluded_categories
+                        .contains(&category);
+                    if ui.checkbox(&mut visible, category.label()).changed() {
+                        if visible {
+                            state
+                                .settings
+                                .file_type_visibility
+                                .excluded_categories
+                                .remove(&category);
+                        } else {
+                            state
+                                .settings
+                                .file_type_visibility
+                                .excluded_categories
+                                .insert(category);
+                        }
+                    }
+                    if index % 2 == 1 {
+                        ui.end_row();
+                    }
+                }
+            });
+    });
+    ui.add_space(8.0);
+    anchored(ui, state, "file-types/extensions", |ui, state| {
+        ui.label("個別に非表示にする拡張子");
+        ui.small("例: png、cr2。別名拡張子は個別に指定します。");
+        ui.horizontal_wrapped(|ui| {
+            let input_width = 120.0_f32.min(ui.available_width().max(40.0));
+            crate::ime_focus::show_singleline(
+                ui,
+                &mut state.file_type_extension_input,
+                None,
+                |edit| edit.hint_text("拡張子").desired_width(input_width),
+            );
+            if ui.button("非表示に追加").clicked() {
+                match normalize_extension(&state.file_type_extension_input) {
+                    Ok(extension) => {
+                        state
+                            .settings
+                            .file_type_visibility
+                            .excluded_extensions
+                            .insert(extension);
+                        state.file_type_extension_input.clear();
+                        state.file_type_extension_error = None;
+                    }
+                    Err(error) => state.file_type_extension_error = Some(error),
+                }
+            }
+        });
+        if let Some(error) = state.file_type_extension_error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
+        let extensions: Vec<_> = state
+            .settings
+            .file_type_visibility
+            .excluded_extensions
+            .iter()
+            .cloned()
+            .collect();
+        let mut remove = None;
+        for extension in extensions {
+            ui.horizontal(|ui| {
+                ui.label(format!(".{extension}"));
+                if ui.small_button("表示する").clicked() {
+                    remove = Some(extension);
+                }
+            });
+        }
+        if let Some(extension) = remove {
+            state
+                .settings
+                .file_type_visibility
+                .excluded_extensions
+                .remove(&extension);
+        }
+    });
+    ui.add_space(8.0);
+    if ui.button("すべて表示に戻す").clicked() {
+        state.settings.file_type_visibility = FileTypeVisibility::default();
+        state.file_type_extension_error = None;
+    }
+    ui.small("OK で確定すると一覧を作り直します。検索結果・サブ展開は閉じます。");
+    ui.small(
+        "開いている本・再生中のメディアは終了まで継続します。登録・評価・タグは削除しません。",
+    );
+    ui.small("書庫の開封処理は「キャッシュ」の書庫・EPUB 設定に従います。");
+}
+
 pub(super) fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesState) {
     anchored(ui, state, "duplicate/archive-folder", |ui, state| {
-        let s = &mut state.settings;
-        ui.checkbox(
-            &mut s.skip_zip_if_folder_exists,
-            "同名の ZIP/PDF/EPUB/RAR/7z/LZH ファイルとフォルダがある場合、本側をスキップ",
-        );
+        draw_same_name_folder_book(ui, &mut state.settings.same_name_folder_book);
     });
     ui.add_space(4.0);
     anchored(ui, state, "duplicate/zip-archive", |ui, state| {
@@ -9142,9 +9307,10 @@ pub(super) fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesSta
                 let mut swap: Option<(usize, usize)> = None;
                 let len = state.settings.image_ext_priority.len();
 
-                egui::ScrollArea::vertical()
+                let output = egui::ScrollArea::vertical()
                     .max_height(200.0)
                     .id_salt("dup_ext_scroll")
+                    .vertical_scroll_offset(state.duplicate_priority_scroll_y)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         for i in 0..len {
@@ -9184,6 +9350,7 @@ pub(super) fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesSta
                         }
                     });
 
+                state.duplicate_priority_scroll_y = output.state.offset.y;
                 if let Some((a, b)) = swap {
                     state.settings.image_ext_priority.swap(a, b);
                 }
@@ -9194,6 +9361,19 @@ pub(super) fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesSta
                 }
             });
         }
+    });
+}
+
+pub(super) fn draw_same_name_folder_book(
+    ui: &mut egui::Ui,
+    policy: &mut crate::same_name_folder_book::SameNameFolderBookPolicy,
+) {
+    ui.label("同名のフォルダと本 (ZIP/PDF/EPUB/RAR/7z/LZH) がある場合");
+    ui.horizontal_wrapped(|ui| {
+        use crate::same_name_folder_book::SameNameFolderBookPolicy::*;
+        ui.radio_value(policy, PreferBook, "本を表示");
+        ui.radio_value(policy, PreferFolder, "フォルダを表示");
+        ui.radio_value(policy, ShowBoth, "両方表示");
     });
 }
 
@@ -9706,6 +9886,175 @@ pub(super) fn draw_fullscreen_fit_cycle_settings(
     ui.small("1つ以上選択してください。0キー・リング・ジェスチャ・マウスボタンの循環に適用します。直接選択メニューにはすべてのモードが表示されます。");
 }
 
+pub(super) fn draw_fullscreen_specified_scale_axis_controls(
+    ui: &mut egui::Ui,
+    axis: &mut crate::settings::SpecifiedScaleAxisSetting,
+    label: &str,
+    dark_popup: bool,
+) {
+    use crate::settings::SpecifiedScaleAxis;
+    let current = axis.value;
+    let (mut number, mut pixels) = match current {
+        SpecifiedScaleAxis::PercentTenths(value) => (value as f64 / 10.0, false),
+        SpecifiedScaleAxis::LogicalPixels(value) => (value as f64, true),
+    };
+    let range = if pixels {
+        SpecifiedScaleAxis::LOGICAL_PIXELS_MIN as f64
+            ..=SpecifiedScaleAxis::LOGICAL_PIXELS_MAX as f64
+    } else {
+        SpecifiedScaleAxis::PERCENT_TENTHS_MIN as f64 / 10.0
+            ..=SpecifiedScaleAxis::PERCENT_TENTHS_MAX as f64 / 10.0
+    };
+    let drag = egui::DragValue::new(&mut number)
+        .range(range)
+        .speed(if pixels { 1.0 } else { 0.1 })
+        .fixed_decimals(if pixels { 0 } else { 1 });
+    let response = if dark_popup {
+        ui.add_sized(egui::vec2(64.0_f32.min(ui.available_width()), 24.0), drag)
+    } else {
+        ui.add(drag)
+    };
+    if response.changed() {
+        axis.value = if pixels {
+            SpecifiedScaleAxis::LogicalPixels(number.round() as u32)
+        } else {
+            SpecifiedScaleAxis::PercentTenths((number * 10.0).round() as u32)
+        }
+        .sanitized();
+    }
+    // ComboBox itself contains an unmeasured horizontal child.
+    // Preallocate its real button dimensions so the outer wrapping
+    // row chooses a new line before that child is positioned.
+    let unit_text = if pixels { "px" } else { "％" };
+    let galley = ui.painter().layout_no_wrap(
+        unit_text.to_owned(),
+        egui::TextStyle::Button.resolve(ui.style()),
+        ui.visuals().text_color(),
+    );
+    let padding = ui.spacing().button_padding;
+    let unit_size = egui::vec2(
+        48.0_f32
+            .max(
+                galley.size().x
+                    + ui.spacing().icon_spacing
+                    + ui.spacing().icon_width
+                    + 2.0 * padding.x,
+            )
+            .ceil(),
+        ui.spacing()
+            .interact_size
+            .y
+            .max(galley.size().y.max(ui.spacing().icon_width) + 2.0 * padding.y)
+            .ceil(),
+    );
+    let _unit_response = ui
+        .allocate_ui_with_layout(
+            unit_size,
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                let combo = egui::ComboBox::from_id_salt("unit")
+                    .selected_text(unit_text)
+                    .width(unit_size.x);
+                let combo = if dark_popup {
+                    combo.popup_style(crate::os_theme::dark_popup_style(ui.ctx()))
+                } else {
+                    combo
+                };
+                combo.show_ui(ui, |ui| {
+                    ui.selectable_value(&mut pixels, false, "％");
+                    ui.selectable_value(&mut pixels, true, "px");
+                })
+            },
+        )
+        .inner;
+    #[cfg(test)]
+    ui.ctx().data_mut(|data| {
+        data.insert_temp(
+            egui::Id::new(("specified_scale_unit_response", label)),
+            _unit_response.response.rect,
+        );
+    });
+    if pixels != matches!(current, SpecifiedScaleAxis::LogicalPixels(_)) {
+        axis.value = axis.value.with_pixel_unit(pixels);
+    }
+}
+
+pub(super) fn draw_fullscreen_specified_scale_max_controls(
+    ui: &mut egui::Ui,
+    max_tenths: &mut u32,
+    dark_popup: bool,
+) -> bool {
+    use crate::settings::{
+        FULLSCREEN_SPECIFIED_SCALE_MAX_MAX_TENTHS, FULLSCREEN_SPECIFIED_SCALE_MAX_MIN_TENTHS,
+    };
+
+    let before = *max_tenths;
+    let mut number = before as f64 / 10.0;
+    let drag = egui::DragValue::new(&mut number)
+        .range(
+            FULLSCREEN_SPECIFIED_SCALE_MAX_MIN_TENTHS as f64 / 10.0
+                ..=FULLSCREEN_SPECIFIED_SCALE_MAX_MAX_TENTHS as f64 / 10.0,
+        )
+        .speed(0.1)
+        .fixed_decimals(1)
+        .suffix(" 倍");
+    let response = if dark_popup {
+        ui.add_sized(egui::vec2(72.0_f32.min(ui.available_width()), 24.0), drag)
+    } else {
+        ui.add(drag)
+    };
+    #[cfg(test)]
+    ui.ctx().data_mut(|data| {
+        data.insert_temp(egui::Id::new("specified_scale_max_response"), response.rect);
+    });
+    if response.changed() {
+        *max_tenths = ((number * 10.0).round() as u32).clamp(
+            FULLSCREEN_SPECIFIED_SCALE_MAX_MIN_TENTHS,
+            FULLSCREEN_SPECIFIED_SCALE_MAX_MAX_TENTHS,
+        );
+    }
+    *max_tenths != before
+}
+
+pub(super) fn draw_fullscreen_specified_scale_settings(
+    ui: &mut egui::Ui,
+    value: &mut crate::settings::FullscreenSpecifiedScale,
+    max_tenths: &mut u32,
+) -> bool {
+    use crate::settings::SpecifiedScaleAxisSetting;
+
+    fn axis_row(ui: &mut egui::Ui, label: &str, axis: &mut SpecifiedScaleAxisSetting) {
+        ui.push_id(label, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.checkbox(&mut axis.enabled, format!("{label}を指定する"));
+                // Keep numeric and unit controls as separate items of this
+                // wrapping row. A grouped child measures its width only after
+                // placement and can overflow the remaining row width.
+                if !axis.enabled {
+                    ui.disable();
+                }
+                draw_fullscreen_specified_scale_axis_controls(ui, axis, label, false);
+            });
+        });
+    }
+
+    let before = *value;
+    ui.label(egui::RichText::new("指定サイズ").strong());
+    axis_row(ui, "幅", &mut value.width);
+    axis_row(ui, "高さ", &mut value.height);
+    ui.small("％は画像表示領域を100％とします。pxは100％表示時の長さで、Windows・アプリの表示倍率に追従します。");
+    ui.small("範囲: 0.1〜1000.0％ / 1〜32768px。幅と高さの両方を指定すると、その枠に収まるように表示します。両方OFFならページ全体にフィットします。");
+    ui.small("OFFにしても数値と単位を記憶します。初期の幅・高さ80％は余白を残す設定例です。用途に合わせて変更できます。");
+    let mut max_changed = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.label("自動フィットの最大倍率（共通）");
+        max_changed = draw_fullscreen_specified_scale_max_controls(ui, max_tenths, false);
+    });
+    ui.small("指定サイズの自動フィットで、元画像を拡大する倍率の上限です。1.0〜20.0倍で指定でき、初期値は5.0倍です。すべての本で共通です。");
+    ui.small("AI拡大前の元画像サイズを基準にします。「縮小しない」は指定枠より優先します。手動ズーム・Zにはこの上限を適用しません。");
+    *value != before || max_changed
+}
+
 pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) {
     anchored(ui, state, "spread/chrome-suppression", |ui, state| {
         crate::ui_helpers::draw_fullscreen_chrome_suppression_setting(
@@ -9790,6 +10139,13 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
         );
         ui.small("本ごとに保存した見開き設定がある場合は、その設定を優先します。");
     });
+    anchored(ui, state, "spread/remember-adjustment", |ui, state| {
+        ui.checkbox(
+            &mut state.settings.remember_spread_shift_per_book,
+            "見開きの調整を本ごとに記憶する",
+        );
+        ui.small("Ctrl+左右で合わせ直した組み合わせを記憶します。OFFにしても今の表示と保存済み調整は残り、新しく開く本には適用しません。");
+    });
     anchored(ui, state, "spread/final-cover", |ui, state| {
         draw_final_cover_spread_setting(ui, &mut state.settings.final_cover_spread_enabled);
     });
@@ -9860,6 +10216,14 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
         });
     });
     ui.small("自動フィット時の倍率制限。ホイールなどの手動ズームは制限しません。");
+    ui.add_space(8.0);
+    anchored(ui, state, "spread/specified-scale", |ui, state| {
+        draw_fullscreen_specified_scale_settings(
+            ui,
+            &mut state.settings.fullscreen_specified_scale,
+            &mut state.settings.fullscreen_specified_scale_max_tenths,
+        );
+    });
     ui.add_space(8.0);
     anchored(ui, state, "spread/anime-limit", |ui, state| {
         let s = &mut state.settings;
@@ -10216,14 +10580,15 @@ mod context_menu_layout_settings_tests {
 
     #[test]
     fn fit_cycle_subset_ui_keeps_the_last_mode_enabled() {
-        use egui_kittest::{
-            Harness,
-            kittest::{NodeT, Queryable},
-        };
+        use egui_kittest::kittest::{NodeT, Queryable};
         let mut settings = crate::settings::Settings::default();
-        settings.fullscreen_fit_cycle_excluded =
-            vec!["Page".into(), "Width".into(), "Height".into()];
-        let mut harness = Harness::builder()
+        settings.fullscreen_fit_cycle_excluded = vec![
+            "Page".into(),
+            "Width".into(),
+            "Height".into(),
+            "SpecifiedScale".into(),
+        ];
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(480.0, 300.0))
             .build_state(
                 |ctx, (settings, fonts_ready)| {
@@ -10268,17 +10633,18 @@ mod context_menu_layout_settings_tests {
 
     #[test]
     fn actual_settings_ui_scrolls_and_edits_move_hide_show_all_and_reset() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
         let state = (
             ContextMenuLayoutSettings::default(),
             ContextMenuPreviewScenario::GridImageWithDynamicApps,
             false,
+            HashMap::new(),
         );
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(620.0, 420.0))
             .build_state(
-                |ctx, (layout, scenario, fonts_ready)| {
+                |ctx, (layout, scenario, fonts_ready, expanded)| {
                     if !*fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);
                         *fonts_ready = true;
@@ -10288,7 +10654,7 @@ mod context_menu_layout_settings_tests {
                     egui::CentralPanel::default().show(ctx, |ui| {
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            draw_context_menu_layout_settings(ui, layout, scenario);
+                            draw_context_menu_layout_settings(ui, layout, scenario, expanded, 0);
                         });
                     });
                 },
@@ -10631,6 +10997,53 @@ pub(super) fn page_susie_plugins(ui: &mut egui::Ui, state: &mut PreferencesState
     });
 }
 
+/// 本体とsnapshotで共用する描画。I/Oは提出後にworkerだけが行う。
+pub(super) fn draw_diagnostics_export(
+    ui: &mut egui::Ui,
+    view: &crate::diagnostics::ExportView,
+) -> (bool, Option<std::path::PathBuf>) {
+    use crate::diagnostics::ExportView;
+    let submit = ui
+        .add_enabled(
+            !matches!(view, ExportView::Running),
+            egui::Button::new("ログを zip にする"),
+        )
+        .clicked();
+    let mut open_folder = None;
+    match view {
+        ExportView::Running => {
+            ui.label("保存中…");
+        }
+        ExportView::Finished(Ok(saved)) => {
+            ui.add_space(6.0);
+            ui.colored_label(
+                egui::Color32::from_rgb(120, 200, 120),
+                format!("保存しました: {}", saved.path.display()),
+            );
+            if saved.evidence_incomplete {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    "証拠不完全: 一部のログが欠けています。残っているログを保存しました",
+                );
+            }
+            if let Some(parent) = saved.path.parent() {
+                if ui.button("保存先フォルダを開く").clicked() {
+                    open_folder = Some(parent.to_path_buf());
+                }
+            }
+        }
+        ExportView::Finished(Err(message)) => {
+            ui.add_space(6.0);
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("書き出しに失敗しました: {message}"),
+            );
+        }
+        ExportView::Idle => {}
+    }
+    (submit, open_folder)
+}
+
 /// 開発者 / 診断ページ。
 ///
 /// 普通の利用者が「再生できない」「重い」等の不具合をサポートに伝えるとき、
@@ -10652,34 +11065,12 @@ pub(super) fn page_developer(ui: &mut egui::Ui, state: &mut PreferencesState) {
         );
         ui.add_space(6.0);
 
-        if ui.button("ログを zip にする").clicked() {
-            // 利用者が明示的に押すボタンなので同期実行で問題ない
-            // (ログは通常数 MB、最大でも数十 MB で deflate 圧縮は速い)。
-            state.diag_export_result = Some(crate::diagnostics::export_diagnostics_zip());
+        let (submit, open_folder) = draw_diagnostics_export(ui, &state.diag_export_view);
+        if submit {
+            state.diag_export_submit = true;
         }
-
-        match &state.diag_export_result {
-            Some(Ok(path)) => {
-                ui.add_space(6.0);
-                ui.colored_label(
-                    egui::Color32::from_rgb(120, 200, 120),
-                    format!("保存しました: {}", path.display()),
-                );
-                let parent = path.parent().map(|p| p.to_path_buf());
-                if let Some(parent) = parent {
-                    if ui.button("保存先フォルダを開く").clicked() {
-                        open_in_explorer(&parent);
-                    }
-                }
-            }
-            Some(Err(msg)) => {
-                ui.add_space(6.0);
-                ui.colored_label(
-                    egui::Color32::from_rgb(230, 120, 120),
-                    format!("書き出しに失敗しました: {msg}"),
-                );
-            }
-            None => {}
+        if let Some(folder) = open_folder {
+            open_in_explorer(&folder);
         }
 
         ui.add_space(8.0);
@@ -10760,6 +11151,374 @@ mod tests {
         MouseGestureBinding, MouseGestureDirection, RightDragContext, RingActionId,
         RingShortcutContext, RingShortcutSettings,
     };
+
+    #[test]
+    fn specified_scale_editor_off_on_restores_pixel_and_percent_values() {
+        use crate::settings::{
+            FullscreenSpecifiedScale, SpecifiedScaleAxis, SpecifiedScaleAxisSetting,
+        };
+        use eframe::egui;
+        use egui_kittest::kittest::Queryable;
+
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(300.0, 540.0))
+            .build_state(
+                |ctx, (value, changed, fonts_ready)| {
+                    if !*fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        *fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let mut max_tenths = 50;
+                        *changed = super::draw_fullscreen_specified_scale_settings(
+                            ui,
+                            value,
+                            &mut max_tenths,
+                        );
+                    });
+                },
+                (
+                    FullscreenSpecifiedScale {
+                        width: SpecifiedScaleAxisSetting::enabled(
+                            SpecifiedScaleAxis::LogicalPixels(800),
+                        ),
+                        height: SpecifiedScaleAxisSetting::enabled(
+                            SpecifiedScaleAxis::PercentTenths(123),
+                        ),
+                    },
+                    false,
+                    false,
+                ),
+            );
+        harness.run();
+        assert!(!harness.state().1, "drawing alone must not edit the draft");
+        harness.get_by_label("幅を指定する").click();
+        harness.run();
+        assert_eq!(
+            harness.state().0.width,
+            SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::LogicalPixels(800))
+        );
+        assert_eq!(
+            harness.state().0.height,
+            SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::PercentTenths(123))
+        );
+        harness.get_by_label("高さを指定する").click();
+        harness.run();
+        assert_eq!(
+            harness.state().0,
+            FullscreenSpecifiedScale {
+                width: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::LogicalPixels(800)),
+                height: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(123))
+            }
+        );
+        harness.get_by_label("幅を指定する").click();
+        harness.run();
+        assert_eq!(
+            harness.state().0.width,
+            SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::LogicalPixels(800))
+        );
+        assert_eq!(
+            harness.state().0.height,
+            SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(123))
+        );
+        harness.get_by_label("高さを指定する").click();
+        harness.run();
+        assert_eq!(
+            harness.state().0.height,
+            SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::PercentTenths(123))
+        );
+    }
+
+    #[test]
+    fn specified_scale_editor_unit_change_preserves_number_and_rounds_pixels() {
+        use crate::settings::{
+            FullscreenSpecifiedScale, SpecifiedScaleAxis, SpecifiedScaleAxisSetting,
+        };
+        use eframe::egui;
+        use egui_kittest::kittest::Queryable;
+
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(400.0, 540.0))
+            .build_state(
+                |ctx, (value, fonts_ready)| {
+                    if !*fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        *fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let mut max_tenths = 50;
+                        super::draw_fullscreen_specified_scale_settings(ui, value, &mut max_tenths);
+                    });
+                },
+                (
+                    FullscreenSpecifiedScale {
+                        width: SpecifiedScaleAxisSetting::enabled(
+                            SpecifiedScaleAxis::PercentTenths(805),
+                        ),
+                        height: SpecifiedScaleAxisSetting::disabled(
+                            SpecifiedScaleAxis::PercentTenths(800),
+                        ),
+                    },
+                    false,
+                ),
+            );
+        harness.run();
+        harness
+            .get_by(|node| {
+                node.role() == egui::accesskit::Role::ComboBox
+                    && node.value().as_deref() == Some("％")
+                    && !node.is_disabled()
+            })
+            .click();
+        harness.run();
+        harness.get_by_label("px").click();
+        harness.run();
+        assert_eq!(
+            harness.state().0.width,
+            SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::LogicalPixels(81))
+        );
+        assert_eq!(
+            harness.state().0.height,
+            SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(800))
+        );
+    }
+
+    #[test]
+    fn specified_scale_editor_numeric_text_keeps_valid_axis_values() {
+        use crate::settings::{
+            FullscreenSpecifiedScale, SpecifiedScaleAxis, SpecifiedScaleAxisSetting,
+        };
+        use eframe::egui;
+        use egui_kittest::kittest::Queryable;
+
+        for (axis, text, expected) in [
+            (
+                SpecifiedScaleAxis::PercentTenths(800),
+                "12.5",
+                SpecifiedScaleAxis::PercentTenths(125),
+            ),
+            (
+                SpecifiedScaleAxis::LogicalPixels(800),
+                "12.5",
+                SpecifiedScaleAxis::LogicalPixels(13),
+            ),
+            (
+                SpecifiedScaleAxis::PercentTenths(800),
+                "0",
+                SpecifiedScaleAxis::PercentTenths(1),
+            ),
+            (
+                SpecifiedScaleAxis::LogicalPixels(800),
+                "0",
+                SpecifiedScaleAxis::LogicalPixels(1),
+            ),
+            (
+                SpecifiedScaleAxis::PercentTenths(800),
+                "1001",
+                SpecifiedScaleAxis::PercentTenths(10000),
+            ),
+            (
+                SpecifiedScaleAxis::LogicalPixels(800),
+                "32769",
+                SpecifiedScaleAxis::LogicalPixels(32768),
+            ),
+        ] {
+            let pixels = matches!(axis, SpecifiedScaleAxis::LogicalPixels(_));
+            let mut harness = crate::test_ui::builder()
+                .with_size(egui::vec2(400.0, 520.0))
+                .build_state(
+                    |ctx, (value, fonts_ready)| {
+                        if !*fonts_ready {
+                            crate::ui_fonts::configure_fonts(ctx);
+                            *fonts_ready = true;
+                            ctx.request_repaint();
+                            return;
+                        }
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            let mut max_tenths = 50;
+                            super::draw_fullscreen_specified_scale_settings(
+                                ui,
+                                value,
+                                &mut max_tenths,
+                            );
+                        });
+                    },
+                    (
+                        FullscreenSpecifiedScale {
+                            width: SpecifiedScaleAxisSetting::enabled(axis),
+                            height: SpecifiedScaleAxisSetting::disabled(
+                                SpecifiedScaleAxis::PercentTenths(800),
+                            ),
+                        },
+                        false,
+                    ),
+                );
+            harness.run();
+            let numeric = |node: &egui_kittest::kittest::AccessKitNode<'_>| {
+                node.min_numeric_value() == Some(if pixels { 1.0 } else { 0.1 })
+                    && node.max_numeric_value() == Some(if pixels { 32768.0 } else { 1000.0 })
+                    && !node.is_disabled()
+            };
+            harness.get_by(numeric).focus();
+            harness.run();
+            // An incomplete numeric edit stays in the stock DragValue editor;
+            // it must not publish an invalid typed setting.
+            harness.get_by(numeric).type_text("-");
+            harness.run();
+            assert_eq!(
+                harness.state().0.width,
+                SpecifiedScaleAxisSetting::enabled(axis)
+            );
+            harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+            harness.run();
+            harness.get_by(numeric).type_text(text);
+            harness.run();
+            harness.key_press(egui::Key::Enter);
+            harness.run();
+            assert_eq!(
+                harness.state().0.width,
+                SpecifiedScaleAxisSetting::enabled(expected),
+                "input={text}, pixels={pixels}"
+            );
+            assert!(harness.state().0.is_valid());
+            assert_eq!(
+                harness.state().0.height,
+                SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(800))
+            );
+        }
+    }
+
+    #[test]
+    fn specified_scale_max_editor_numeric_text_updates_common_cap_within_bounds() {
+        use crate::settings::FullscreenSpecifiedScale;
+        use eframe::egui;
+        use egui_kittest::kittest::Queryable;
+
+        for (text, expected) in [("2.5", 25), ("0", 10), ("20.1", 200), ("1.14", 11)] {
+            let mut harness = crate::test_ui::builder()
+                .with_size(egui::vec2(500.0, 560.0))
+                .build_state(
+                    |ctx, (value, max_tenths, changed, fonts_ready)| {
+                        crate::ime_focus::install_ime_input_policy(ctx);
+                        if !*fonts_ready {
+                            crate::ui_fonts::configure_fonts(ctx);
+                            *fonts_ready = true;
+                            ctx.request_repaint();
+                            return;
+                        }
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            *changed |= super::draw_fullscreen_specified_scale_settings(
+                                ui, value, max_tenths,
+                            );
+                        });
+                    },
+                    (FullscreenSpecifiedScale::default(), 50_u32, false, false),
+                );
+            harness.run();
+            assert!(!harness.state().2, "drawing must not edit the common cap");
+            let numeric = |node: &egui_kittest::kittest::AccessKitNode<'_>| {
+                node.min_numeric_value() == Some(1.0)
+                    && node.max_numeric_value() == Some(20.0)
+                    && !node.is_disabled()
+            };
+            harness.get_by(numeric).focus();
+            harness.run();
+            harness.get_by(numeric).type_text("-");
+            harness.run();
+            assert_eq!(harness.state().1, 50, "incomplete edits stay unpublished");
+            harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+            harness.run();
+            harness.get_by(numeric).type_text(text);
+            harness.run();
+            harness.key_press(egui::Key::Enter);
+            harness.run();
+            assert_eq!(harness.state().1, expected, "input={text}");
+            assert!(harness.state().2, "cap edits must notify the caller");
+            assert_eq!(harness.state().0, FullscreenSpecifiedScale::default());
+        }
+    }
+
+    #[test]
+    fn specified_scale_editor_narrow_controls_remain_visible_and_clickable() {
+        use crate::settings::{
+            FullscreenSpecifiedScale, SpecifiedScaleAxis, SpecifiedScaleAxisSetting,
+        };
+        use eframe::egui;
+        use egui_kittest::kittest::Queryable;
+
+        for width in [220.0, 280.0] {
+            let size = egui::vec2(width, 640.0);
+            let mut harness = crate::test_ui::builder().with_size(size).build_state(
+                |ctx, (value, fonts_ready)| {
+                    if !*fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        *fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                let mut max_tenths = 50;
+                                super::draw_fullscreen_specified_scale_settings(
+                                    ui,
+                                    value,
+                                    &mut max_tenths,
+                                );
+                            });
+                    });
+                },
+                (
+                    FullscreenSpecifiedScale {
+                        width: SpecifiedScaleAxisSetting::enabled(
+                            SpecifiedScaleAxis::PercentTenths(10000),
+                        ),
+                        height: SpecifiedScaleAxisSetting::enabled(
+                            SpecifiedScaleAxis::LogicalPixels(32768),
+                        ),
+                    },
+                    false,
+                ),
+            );
+            harness.run();
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            for label in ["幅を指定する", "高さを指定する"] {
+                assert!(
+                    screen.contains_rect(harness.get_by_label(label).rect()),
+                    "{width}: {label}"
+                );
+            }
+            for unit in ["％", "px"] {
+                let control = harness.get_by(|node| {
+                    node.role() == egui::accesskit::Role::ComboBox
+                        && node.value().as_deref() == Some(unit)
+                });
+                assert!(
+                    screen.contains_rect(control.rect()),
+                    "{width}: {unit}; screen={screen:?}, control={:?}",
+                    control.rect()
+                );
+            }
+            harness.get_by_label("高さを指定する").click();
+            harness.run();
+            assert_eq!(
+                harness.state().0.height,
+                SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::LogicalPixels(32768))
+            );
+            harness.get_by_label("高さを指定する").click();
+            harness.run();
+            assert_eq!(
+                harness.state().0.height,
+                SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::LogicalPixels(32768))
+            );
+        }
+    }
 
     #[test]
     fn single_export_bake_stage_row_updates_its_setting() {

@@ -3282,13 +3282,13 @@ mod tests {
 
     #[test]
     fn music_info_row_exposes_http_url_as_a_clickable_link() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
         use std::sync::{Arc, Mutex};
 
         let clicked = Arc::new(Mutex::new(None));
         let clicked_in_ui = Arc::clone(&clicked);
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(430.0, 120.0))
             .build(move |ctx| {
                 if !fonts_ready {
@@ -3455,7 +3455,6 @@ mod tests {
     fn music_audio_track_selector_open_dark_snapshot() {
         use crate::video::AudioTrackSelectionDisplayState;
         use crate::video::audio_track_ui::AudioTrackRow;
-        use egui_kittest::Harness;
 
         let rows = vec![
             AudioTrackRow {
@@ -3474,7 +3473,7 @@ mod tests {
             },
         ];
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(480.0, 280.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);

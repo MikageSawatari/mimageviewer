@@ -1,20 +1,67 @@
 # 表示パイプライン (サムネイル / フルスクリーン)
 
+### 本の構成と提示許可（§1.242 G3、2026-10-11）
+
+accepted構成のexplicit unitをSingle/Spread/Split/連結/portraitへ投影する。回転や寸法後着、休眠shiftで再pairしない。
+Blankはsource/readinessを持たず、補助はNavigation/resume/exportの実列へ追加しない。
+提示候補はcontext/世代/source/role/slot/sliceをworkerで確認し、相方はunit内でatomicに採用する。
+Checking/Hiddenはcached processed/raw/thumbnail/holdoverからもtexture選択・paint・transform/hit・読了traceへ渡さない。
+連結の測定extentと画像許可を分離し、bounded cacheの既知寸法だけで未許可画像を復活させない。
+scroll/reanchor/resizeで探索を更新しても、画面に残るoccurrenceの許可とChecking要求は保持する。
+測定された可視要求との差分だけで退出を破棄・新入場を照合し、cached画像も継続描画する。
+類似候補の長押しプレビューは、Single/Spread/連結それぞれの許可済み表示を一時的に置き換える。
+連結では通常の可視unit受付を共有し、Checking/Hiddenの元occurrenceをプレビューで迂回しない。
+候補自身のidentityも既存preview workerで共通resolverへ渡し、完了採用時に最新scope tokenを照合する。
+確認は共有serviceのFIFOへ受付し、初期化・maintenance・先行保存の後で返す。preview workerだけが
+その私有channelを待ち、押下時の未初期化snapshotから拒否を決めたりUIで待機したりしない。
+候補のcache/source更新証明だけを構成の許可証にせず、次の長押しでは新しく確認する。
+類似queryや候補thumbnailの生成には構成lookupを追加しない。
+非表示範囲は現在の要求内の最大20範囲と連続cursorへ限定し、退出・再入場では新しい許可を取得する。
+Single→SpreadのChecking中は、同じdisplay cacheのtyped transitionへ捕捉した旧Allowed descriptorだけを保持する。
+旧source/世代/tokenを照合し、新Pairの確定でatomicに置換する。新しい相方のcacheを先に表示しない。
+指定サイズはEの既存geometryを使い、新fit参照の選択は許可後だけ。scroll/texture退去/resizeの既存参照は保持し、
+構成更新/削除のidentity・role・slot・sliceが変わる場合は既存ownerで失効する。
+PDFのtarget・bbox・表示解像度の準備も、pagedでは許可済み投影、連結では許可済みの各unitだけを入力にする。
+Single→SpreadのChecking中は捕捉した旧表示を使い、新しい相方のPDF再描画要求を先に送らない。
+trim左右別は実slotへ適用し、Single modeはsingle margin。投影前の未保存補正と通常保存・resetは
+同じservice FIFOで既存view_trim.dbへ書き、受付から完了まで既存Edit ledgerのguardを保持する。
+UIでDBを開かず、古い投影処理による上書きを防ぐ。詳細は[本の構成](book-composition-plan.md#5-表示projection)。
+
 **これが一番事故が多い領域**。画像補正・AI アップスケール・回転・アニメーション・消しゴムマスクのすべてが、
 「どのテクスチャを画面に出すか」を巡って絡み合う。修正前にこのドキュメントを読むこと。
 
 ---
 
+PDF thumbnailの一覧失効・優先昇格はviewer owner/要求世代/keyに限定する
+（未リリースPDF-EPOCH-OWNERSHIP）。seek/hoverもViewer ticketをUI admissionで捕捉し、
+派生workerで更新しない。fullscreen本体はUnscoped＋既存fs_pending cancel/generation、
+そのpromotionはUnscoped jobsだけをfoundと数える。兄弟同PDF/pageの表示要求は失効しない。
+GPU upload、ThumbnailRequests、Canceled/SourcePixels/Finalizedの既存採用契約は維持する。
+[詳細](pdf-render-epoch-ownership-plan.md)。
+
 ### 音声セルの代表画像 (§1.347、2026-10-08)
+
+同名補助画像の採用は表示行の種類投影から独立している。画像種類を隠しても既存の候補順で
+選んだ表紙／動画sidecarを維持する。通常／Remoteは一覧sort、Smart／集約は既存走査順を使い、
+候補mapを表示画像で上書きしない（[候補採用規則](audio-album-art-plan.md)）。
+
 
 Audio は既存 worker / texture backlog に乗り、同名 sidecar → MP3 先頭 ID3v2 の前面表紙優先 → 音楽アイコンの順で表示する。`ThumbnailState::NoArt` は正常終端で、Failed とともに一覧世代内では再投入・hover repaint を続けない。Loaded の画像寸法を Auto 比率へ使い、画像のない音声を分母から除く。全音声が終端なら Auto 未確定も現在の比率で終わる。
 
-`ThumbMsgPayload` が Pixels / NoArt / Failed / Canceled / Finalized を一つに所有する。Audio は保存完了後に一通知を送り、既存の他媒体の Finalized 通知は維持する。音声マークは `AudioThumbnailIndicator` の音楽アイコン (既定) / 文字バッジ / なし。画像なしではどの設定でも音楽アイコンを描く。音声を補正対象の画像ページにせず、再生画面・入力操作は保持する。[詳細設計](audio-album-art-plan.md)。
+`ThumbMsgPayload` が Pixels / SourcePixels / ProvisionalPixels / NoArt / Failed / Canceled / Finalized を一つに所有する。Audio は保存完了後に終端 Pixels または画像なし終端を一通知で送り、source生成の二通知契約とは分ける。音声マークは `AudioThumbnailIndicator` の音楽アイコン (既定) / 文字バッジ / なし。画像なしではどの設定でも音楽アイコンを描く。音声を補正対象の画像ページにせず、再生画面・入力操作は保持する。[詳細設計](audio-album-art-plan.md)。
 
 
 ## 1. サムネイル表示パイプライン
 
 ### 1.1 状態機械
+
+表示状態と要求の寿命は別である。context-local な `ThumbnailRequests` が request ID / items
+generation・要求種別・未採用CPU画像を一体で所有し、sourceは `SourcePixels` の採用/破棄と
+workerの保存/保存省略終端 `Finalized` の両方まで再要求を拒否する。cache / Audio / video /
+直接画像の `Pixels` は採用/破棄だけで終了する。ドライブの `ProvisionalPixels` は検証終端を待つ。
+Pending / Evicted / Loaded高画質化の表示状態から終端を推測しない。
+uploadは既存の8枚/frameを維持し、範囲外動画はGridが採用、Rendition consumerが破棄する。
+hideのCPU画像解放も同ownerのdiscardを通す。[寿命計画と検証](thumbnail-request-lifecycle-plan.md)。
 
 `GridItem` 1 個につき 1 つの `ThumbnailState` (grid_item.rs) を持つ:
 
@@ -467,10 +514,10 @@ keep へ入れてから要求し、次の投影は現在の membership と実パ
 navigation / bookmark の ensure は既存 bbox と union してから worker へ公開する。
 離れた still seek ページは bbox を広げず、従来の exact set で読み込みを許可する。
 
-最後の利用元が離れたページだけを退去し、未処理キューやUI側のbacklog / finalize待ちから
-実際に取り除いた要求の `requested` を解除する。worker が既に pop して処理中の要求は、結果・cancel・error・finalized の
-既存通知で終える。`SourceGenerated` は画像到着後に Loaded となっても cache 確定通知まで
-requested を保持し、同じページの重複 decode を防ぐ。
+最後の利用元が離れたページだけを退去する。lock下で実行前queueから除いた一致するrequest IDは
+局所取消で終了する。未採用source画像のkeep外破棄は画像側終端だけであり、保存終端まで予約を残す。
+workerが既にpopした要求は相関済みの通知と画像採用/破棄で終える。VideoBatchの画像はkeep投影で
+捨てず、既存Grid / Rendition消費policyに渡す。世代・source失効だけが旧request namespaceを退役させる。
 
 しおり候補照合は loaded bookmark の typed HashSet と keep 候補を使い O(B+K) に留める。
 フォルダ本の適格性に必要な全画像分類は既存 `ViewerNavigationCaches` の context / source 世代で
@@ -660,6 +707,39 @@ continuous transition が実際に選ばれた場合も同イベントへ `branc
 フルスクリーンの先読み対象は、`items` 全体ではなく `visible_indices` 由来の display list から
 作る。★フィルタや Ctrl+F で一覧が疎になっているときも、スライドショー / 前後移動と同じ
 次候補を先読みし、フィルタで隠れた画像は対象にしない。
+
+評価変更による所属更新 (§1.371) は、各 viewer context の表示集合を採用する境界で読書位置まで
+調停する。現在ページが残れば同じ identity を保ち、外れれば旧読書順の次の残存ページ、なければ
+前へ一度だけ着地する。RTL でも読書順の ordinal が増える方向を「次」とし、raw index や左右キーで
+反転しない。読書対象がゼロなら既存 teardown で現在の絞り込み済みページ一覧へ戻り、親退出や
+filter 解除を行わない。strip / seek / ページ番号、見開き相方、連結 unit、先読みは同じ採用済み集合を使う。
+評価による landing / close は評価通知と評価 Undo を保持し、有効な Undo origin の復帰を通常近傍より
+優先して一度適用する。独立した `DetachedPhysical` は main の global filter に従わず、main の所属更新で
+移動・閉鎖しない。ContextTable の plan / execute / finish 中に publication を再入させず、設定投影済みの
+安定境界でその owner だけに公開する。
+
+リングの★は保存済み live preview のまま、その preview だけで離脱する既存行を picker 終端まで
+context の共有表示集合へ残す。全画面専用の例外ページ列は作らない。新しい検索 hit・件数・明示 sort は
+即時採用し、保留行を含む集合から可視件数と読書ページ数を毎回計算する。source 削除・非評価条件の離脱を
+復活させず、通常終端で保留だけを外して最終成功値から一度調停する。集合決定・非同期結果の採用前検証・
+Undo 復帰の取消は [評価変更と絞り込みの計画](rating-filter-fullscreen-plan.md) を参照。
+grid cursor の移動・解除は §1.370 の `App::move_grid_cursor` に適用し、scroll intent は集合採用callerが保持する。
+Grid起点の評価Undo/Redoは、元項目が現在集合へ戻れば同じownerからcursorとShift起点を戻す。
+明示選択は履歴内のGrid originをValueOnlyへ失効させ、live requestの復帰も取消す。Viewer originからの復帰と分け、Grid復帰ではreaderを開かない。
+同identityの再配置は移動とせず、selectedとShift+クリック起点をそれぞれpaired remapする。
+Searchの同一覧items交換では、readerのexact identity transferを完了してからvisible集合を再計算し、
+集合ownerが行先を一度適用する。交換前のreader idxを交換後のslotへ解釈してpickerのsource離脱を判定しない。
+ページidentity/sidecar準備でopenを待つ場合は、既存の遅延open要求にrating/Manualのmetadata境界を保持し、
+IndexOnlyと通常hydrationの両再開経路へ渡す。遅延を挟んだrating Undo復帰でもrating Redoを消さない。
+所有中のrating遅延targetは集合ownerの論理的な着地点とし、集合更新時のKeep/Move/Emptyを一度適用する。
+Keepは要求を継続し、Moveは置換、Emptyや手動操作はその要求だけを取消す。再開時に移動先を再決定しない。
+
+2026-10-11の利用者決定により、Rating/Searchのitems再採用に伴う編集の扱いは出荷済みboundaryの
+再利用へ限定する。Rating再採用は既存境界で編集を終了し、非rating Undoを落としてrating Undoだけを
+保持する。Searchは既存のclear/cancel方針を維持する。reader同identityとselected/Shift起点のpaired remapを
+保つ一方、loaded/global editorやidx-only Undoの新しい保持/remap、一般editor ownerの拡張は行わない。
+v4.5.0で既存のSearch streaming idx-only誤配送は別件・本修正の対象外であり、利用者がバックログへ
+記載する。根拠と受入範囲は [編集範囲の利用者決定](rating-filter-fullscreen-plan.md#stage-2-の編集範囲限定--利用者決定-2026-10-11) を参照。
 
 ### 2.2 ロードスレッド
 
@@ -1305,7 +1385,7 @@ PNG エンコードとファイル I/O は `pipeline-debug-export` worker で行
 1. 上記の優先順位で解決済みのページテクスチャと source / texture size
 2. 表示トリムの実効 content bbox
 3. 回転 (rotation_db, 0/90/180/270) と一時的なフリー回転
-4. viewport 固有の `pixels_per_point`、フィットモード、自動フィット倍率制限
+4. viewport 固有の `pixels_per_point`、型付き fit descriptor、自動フィット倍率制限
 5. Zoom / Pan、または Z ズームの確定済み placement
 6. 物理ピクセル境界へ整列済みの paint rect / hit rect / UV / source↔screen 写像 / total scale
 ```
@@ -1702,6 +1782,10 @@ fit 解像度のまま (画像見開きは問題なし。PDF 見開きズーム�
 `zip_spread_zoom_pan` の倍率・パン解決は 1 回だけ行う。`Original` 以外は従来の高さ合わせ
 composite をそのまま使う。
 
+指定サイズfitの PDF は通常 / 手動zoom / 単ページZ / 見開きZの解決済みページごとの
+full-page fit 枠から絶対需要を作る。上記の旧 `(idx, zoom)` 要求と PDF 見開きZの再レンダ制限は
+既存 4 方式の契約として維持する。新方式の一方向依存と要求比較は下の指定サイズfit節を参照。
+
 `settings.fullscreen_fit_mode` は <kbd>0</kbd> と割り当てたリング／ジェスチャ／マウスボタン／
 パッドリングで、同じ `cycle_fullscreen_fit_mode` を経由して循環する。
 `FullscreenFitMode::next_for_flow` は `fullscreen_fit_cycle_excluded` を除外して通常順に進む。
@@ -1710,7 +1794,7 @@ composite をそのまま使う。
 青でハイライトする (見開きボタンのポップアップと同型)。メニュー項目選択は
 `set_fullscreen_fit_mode_for_current` を直接呼び、<kbd>0</kbd> 循環 (`cycle_fullscreen_fit_mode`)
 とは別系統。メニュー候補は `FullscreenFitMode::selectable_for_flow` が返す
-(余白カットフィットを除く4モード)。ページ単位へ切り替えたときはページ全体、
+(余白カットフィットを除く5モード、Page → Width → Height → Original → SpecifiedScale)。ページ単位へ切り替えたときはページ全体、
 縦連結へ切り替えたときは横幅フィット、横連結へ切り替えたときは縦幅フィットに戻す。連結モード中は
 保存値が旧余白カットフィットでもページ全体フィットとして扱う。
 
@@ -1720,7 +1804,7 @@ composite をそのまま使う。
 中ボタンドラッグ、ゲームパッド等の手動ズームは制限しない。`縮小しない` が ON の場合は
 ページ全体フィットでも 100% 表示で画面外へはみ出すことがあるため、`fullscreen_fit_allows_drag_pan`
 も true 扱いにしてパンできるようにする。
-100% 判定の基準サイズは、単ページ / 見開きでは「今実際に描くテクスチャ」のサイズであり、
+既存 4 方式の100% 判定の基準サイズは、単ページ / 見開きでは「今実際に描くテクスチャ」のサイズであり、
 AI アップスケール完了後は `final_composite_cache` の寸法で再レイアウトする。
 連結読みではスクロール中の配置ジャンプを避けるため、processed テクスチャが raw と同じ
 アスペクト比なら raw/source サイズをレイアウト基準として保つ。別の処理で processed 側の
@@ -1861,7 +1945,7 @@ Spread モード (見開き) の場合は、`draw_fs_spread` が `resolve_spread
 `Video` / `Audio` はナビゲーション列に含まれる場合も必ず単独表示ユニットにし、静止画との混在でもペア化しない。
 
 組んだ `Vec<SpreadDisplayUnit>` は viewer context ごとの `SpreadDisplayUnitsCache` で再利用する。
-token は `items_generation`、`spread_mode`、`spread_shift_anchor_idx`、`landscape_epoch` と、
+token は `items_generation`、`spread_mode`、`spread_shift_anchor_idx()`で得るlive解決済みanchor、`landscape_epoch` と、
 **nav index 列そのもの**である。nav の完全一致を使うため、同じ items 世代でも絞り込み・並べ替え・
 ページ読みと連結読みの列切替を混同しない。
 
@@ -1882,12 +1966,65 @@ items 世代と連結方式は owner の source key でも照合する。owner �
 `FsPageNav::Boundary` として解決する。見開き末尾から次へ進む入力を raw page delta に戻さないため、
 内部 index が同じ見開きの片側へ移ることはなく、最初の入力で末尾ヒントを表示する。キー、ホイール、
 画面クリック、ゲームパッド、スライドショーはこの契約を共有する。
-Ctrl+←/→ の「1 ページずらし」は `spread_mode` を保存し直さず、セッション中の
-`spread_shift_anchor_idx` で一時的なペアリング開始位置を持つ。アンカーは単純な移動先ページではなく、
+Ctrl+←/→ の「1 ページずらし」は `spread_mode` を保存し直さず、
+`ViewerSpreadShift`が現在のペアリング開始位置を所有する。§1.364 D2の接続差分では、
+通常一覧は`ViewerShift::Ordinary(index)`のsession調整、本は
+`ViewerShift::Book(SpreadShiftState)`のPageRef・解決状態・保存状態に分ける。
+描画用indexは`spread_shift_anchor_idx()`の投影であり、独立に代入するraw fieldではない。
+記憶ONの適格なBookで明示ずらしを受けると、その実anchorのPageRefを専用serviceへ送る。
+保存replyは元操作の状態表示を更新するだけで、その後の現在ページや別窓の組を変えない。
+OFFはliveをsession扱いで保持し、新規入場で保存済み調整を使わない。明示解除はOFFでも保存値を消す。
+アンカーは単純な移動先ページではなく、
 移動先から前方向へ見て直近の横長ページ直後、または先頭まで戻した同じ偶奇の位置にする。
 これにより、表紙ありの本で一度ずらした後に前ページへ戻っても、アンカー直前のページだけが
 単独表示へ吸われず、先頭または横長ページ境界から一貫した見開き列として戻れる。
-横長ページ自体は単独ユニットのまま境界として扱い、自動的な表紙扱いにはしない:
+横長ページ自体は単独ユニットのまま境界として扱い、自動的な表紙扱いにはしない。
+
+Bookのitems/nav投影は`PreparedPageIdentityIndex`とnavのArcを対で保持し、変更時にPageRefを
+実ページへ解き直す。基点が欠落・filteredなら`NotInView`として保存refを保持し、描画へはNoneを渡す。
+slot削除やsnapshotのindex変換はowner内のlive resolutionだけをremapする。別の同indexページへ
+保存基点を置き換えない。解決済みanchorの変化は既存unit/cache失効点へ接続する。
+snapshot化はdurable scopeを切り離し、その時点のnumeric pairingをOrdinary sessionとして保持する。
+成功済みページ改名のmappingは同じ本のlive PageRefへpureに反映し、追加saveやmountを行わない。
+root改名の永続移行はD1が所有し、開いているcontextの参照元・items・prepared identity・pending load・
+addressとshift scopeは旧rootのまま保持する。mainの旧path再読込・F12の旧items保持を維持し、
+live追従や自動reopenを追加しない。新rootの保存値はそこから改めて開くときに使う（設計§11.6）。
+case/slash衝突のshift identityはD1と同じく受入列の先頭slotを決定的に選ぶ。
+snapshotのanchor remapはitems交換で行い、一覧から固定してもfullscreen時と同じ対応付けを使う。
+新規Restoreはsidecar continuation内で先行shift/resumeの完了証明を満たしてから同じ最終列へ
+解決し、位置復元・unit正規化・first-displayへ進む。retained ONの再採用は受入済みidentity indexを使い、
+待機をbundle内の`RetainedReadoption::Idle | Reading`に持たせる。global Commonの別context依存と
+併存させ、既存target-context semantic gate/dialogで対象窓だけを止める。兄弟窓を一括modalにしない。
+`ContextAsyncOwner::RetainedSpreadShift`でpoll/cancel-on-parkを登録し、parkではreceiverだけを
+dropしてaccepted sessionを保つ。再採用はfresh cutoffを捕捉し、forkはreceiverと元contextのwrite受付を複製しない。
+forkの保存待ち/失敗の調整はsession扱いとし、元contextだけがwrite完了を採用する。
+初回位置の`FencedResume`はopen continuationの初回採用完了時に終了し、後のresume参照へ持ち越さない。
+maintenanceで失効したshift readはrow不在の証明ではない。retainedのaccepted調整・projection・
+commandを保ち、unit/cache失効と現在ページの再正規化を起こさない。初回Commonはcapture時の
+調整なしと独立resumeを採用する。別本改名はscope stampを変えず、元のreadをそのまま採用できる。
+明示ON/OFFではretained待機を取り消してaccepted sessionを保ち、表示済みsiblingsへ旧保存値を
+適用しない。fresh-openは元のresume cutoffと捕捉済みopen scopeを保ったまま、新settings世代・
+現在のshift受付cutoffで依存を再受付する。世代不一致を理由にresume fenceまで破棄しない。
+OFFではlive調整を変更しない。retained/import採用は
+`adopt_shift_layout_without_navigation`で現在の実ページを含むunitへ正規化するだけで、
+resume/historyを書かない。metadata importはContextRequest workerの捕捉FIFO読取結果を
+context/items世代の採用後、current scope + ON + Automaticが一致するときだけ使う。
+HUDの`… → 見開きの調整`と見開きcontrol近くの印はこのownerの状態から作り、jumpは実re-pairing anchor、
+Clearと全体記憶設定は同じ操作ownerへ戻す。構成等の資格は`PairingEditAvailability`を共通受付へ渡す。
+RemoteのD3接続も、App serviceから登録されたread handleを通して保存PageRefを解決し、
+この共通Automatic resolverへoptional shiftを渡す。PCのlive indexを流用しない。
+scope/identityはresponse budgetで切り詰める前のfull本を使い、その後の応答で保存基点が
+見えなくてもMissingや本の末尾とみなさない。完全応答のgroupは同じrules・列のPC unitから
+anchor/画面順/slot/roleを派生する。bounded応答は既存のgroup生成・cap・ページアクセスを維持する。
+切詰め境界差はshiftなしのmasterにもある既存制限であり、省略ページの全寸法走査や境界group削除で
+変更しない。master証明とD3の検証結果は設計§11.10および`target/D-1364-d3-msg.txt`を参照する。
+記憶OFFのopenはshiftなし、force_single_pageとorientationは表示投影だけで保存値を変えない。
+Q3 SetSpreadの成功公開・group cache失効はshift Clearのcommit結果を同requestで受け取ってから行う。
+新しいWeb nudge/記憶UIは追加しない。D3時点ではG3構成consumerは未統合だった。
+2026-10-11のG3は共有C1–C12のadmission/restore規則を消費し、editor固有のC7/C9はG4で接続する。
+本記述は接続の実装箇所を記録し、完了検証・レビュー合格を主張しない。
+
+実際の配置は従来の次の手順を使う。
 
 1. フィット方式を先に解決し、`Original` なら各ページの固有寸法、それ以外なら高いページへ
    揃えた geometry を選ぶ
@@ -1900,7 +2037,7 @@ Ctrl+←/→ の「1 ページずらし」は `spread_mode` を保存し直さ�
 
 ページ単位表示のカラー化遷移も、この `SpreadDisplayUnit` / `resolve_spread_pair` と同じ境界を
 使う。表紙、末尾端数、横長ページは 1 ページ unit、通常見開きは画面順 2 ページ unit として
-旧表示を保持する。1 ページずらしの `spread_shift_anchor_idx` と LTR/RTL の画面順も同じ resolver
+旧表示を保持する。1 ページずらしのlive解決済みanchorと LTR/RTL の画面順も同じ resolver
 から得るため、遷移状態だけが別のペアを作ることはない。
 
 見開きのページ間隔は環境設定から変更でき、既定 4px、0px で左右ページを隙間なく接続する。
@@ -2002,6 +2139,66 @@ delta に適用するため、ドラッグ途中の Ctrl 押下 / 解放でも�
 ショートカットを押した場合も、同じ文言に機能名を付けた no-op 表示で理由を知らせる。
 
 ---
+
+### 2.4.2 指定サイズfit（§1.342、実装・検証中）
+
+決定仕様と検証の正本は [fullscreen-specified-scale-plan.md](fullscreen-specified-scale-plan.md)。
+以下は接続する所有境界を記録する。実装差分の独立レビュー・自動gate・実機確認は完了扱いにしない。
+
+`SpecifiedScale` は既存4方式に続く第5方式。各軸は `SpecifiedScaleAxisSetting { enabled, value }` で、
+valueは `PercentTenths` / `LogicalPixels`。OFF中も数値・単位を保持し、再ONで同じ値へ戻す。
+初期値は両軸ON・幅80％・高さ80％。％は描画先の現在の media rect、pxは100％時のpoint相当へ解く。
+片軸ONはその軸だけ、両軸ONは内接、両軸OFFはPage相当のfit式になる。pointを `/ppp` しない。
+最大倍率は共通Settingsの `fullscreen_specified_scale_max_tenths`（既定50＝5.0倍、10〜200＝1.0〜20.0倍、
+0.1倍刻み）。既存no_up / no_downの後に新方式だけ `(max_tenths / 10.0) / ppp` 上限を適用する。
+両軸OFFのPage相当にも適用し、no_upの1倍上限が勝つ。no_downの1倍下限は維持する。
+手動zoomはその後に掛けるため共通上限を超えられる。最大倍率はfavorite専用値に含めない。
+単ページZはPage・制限なしを維持し、見開きZの照準は選択fitと実効gapを使う。
+
+`FullscreenFitInput` は旧方式と指定値・共通最大倍率snapshot＋`FullscreenFitBasis` を型で分ける。
+Aは取得済みcanonical aspect、OはAI前の物理原寸で、Aの長辺をOの画素長辺へ正規化する。
+AI前寸法は既存edit / final AI / compositeのsource metadataへ対応付け、派生textureやGPU clamp後の
+寸法から逆算しない。PDFは検証済みpage boxとcontent typeから、Vectorは長辺4096px、Rasterは
+`min(4096, native_long_edge)` の固定Oを解く。既存source座標用のraster寸法は別用途のまま残す。
+
+`layout_full_image_rect` はこのA/Oから得るfull-page fit枠。実textureの整数丸めで縦横比が微妙に
+違ってもこの枠を変更せず、`from_layout_rect` がsampling用の `full_image_rect` を枠内へcontainする。
+paint / hit / UV / source写像は実際のcontained textureを共有し、PDF需要・合成layout・captureの
+fit枠は安定したcanonical extentを使う。descriptorと枠はcapture時の値を保存し、frozen / holdover
+replayやnavigatorから現在の指定値・共通最大倍率や新しいraster寸法を後読みしない。
+捕捉済みの `SpecifiedScale.max_tenths` をgeometryの再解決にも使い、live設定変更を混ぜない。
+
+見開きは既存高さ合わせと仮想slotを維持し、2枚＋gap全体をfitする。幅指定が極小なら表示だけ
+`gap = min(saved_gap, max(0, specified_width - 1/ppp))` とし、保存gapを書き換えない。
+連結の `ContinuousSpecifiedFitReference` は選択 / 明示値変更時の中央unitを保持し、scrollで
+基準を替えない。共通最大倍率だけの編集でも基準unitを選び直さず、保持sourceから再解決した
+同じunitのgeometryへ現在の共通上限を適用する。同じunitの確定済みAI前・非回転の元寸法は
+元texture / 派生cache退去後も保持する。
+現在のtrim / rotationからgeometryを各layoutで再解決し、fitと参照unit自身の配置に同じ値を使う。
+解決済みbboxを退去時の値に固定しない。resize / DPIでは同じunitへ再計算し、手動zoomは保持する。可視枚数上限では
+既存の遠いunit描画除外を使い、新方式のfit / fs_zoomを変更しない。旧4方式のper-unit fitと
+可視上限時のauto zoomは維持する。
+
+PDFの依存はmetadata → 固定A/O → fit枠 → 絶対需要 → raster結果の一方向とする。
+初回 `StaticPdf` と再レンダcompletionは同じcontext / source / generation検証の後でmetadataを採用し、
+既存retained PDF keyと一緒にsnapshotを保持する。同一metadataの再採用でOを更新しない。
+`PdfRerenderDemand` のLegacyは旧idx / zoom閾値、Absoluteはsource identity付き各ページのtargetを
+比較する。同じ需要で再送・in-flight cancelを増やさず、通常 / partner / manual / Zは新方式では
+この一つの絶対需要へ集約する。headroom・最小 / 最大・native capは既存helperで一度だけ適用する。
+凍結描画はlive siblingへ需要を送らない。
+
+回転＋trimの入力は今版も経路別例外を保つ。通常単ページは保存回転でもtrimを渡すが、見開き・
+連結unit・display-unit capture・暫定PDF bboxは回転ページのtrimを除く。分割優先と自由回転時の
+trim解除も維持し、全経路統一は別件§1.358へ残す。
+
+共通の指定値はSettings、favoriteの専用値は既存 `FavoriteViewState` / overlay / workerが所有する。
+favorite外側Optionの欠落は共通値継承、明示両軸OFFは保持値を含む専用指定である。
+共通・favorite、HUD・prefs、保存 / 再起動・転送は同じenabled＋valueを使う。未リリースの旧軸Option
+形式からのmigrationは作らない。最大倍率は共通設定として保存・転送し、live編集はメモリ更新だけで
+既存共通設定保存境界を使う。capture / idle reconcile / 離脱 / 終了は
+保存stateの欠落を保持し、継承解決だけで書込みを予約しない。専用値を作るのはlive popupの
+明示変更だけ。prefs / import / exportは共通値のrouteを使い、favorite専用行を上書きしない。
+新しいDB・worker・viewport生成・host lifecycleは設けない。
 
 ### 2.5 ページ送り中の表示規則 (実装の正本)
 

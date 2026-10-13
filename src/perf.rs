@@ -21,20 +21,16 @@
 //! - その他: 呼び出し側が任意キーで追加できる (extras)
 
 use serde_json::Value;
-use std::fs::File;
-use std::io::{BufWriter, Write};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) mod memory;
 pub(crate) mod stall;
-static HOLDER: stall::Holder = stall::Holder::new();
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static START: OnceLock<Instant> = OnceLock::new();
-static FILE: OnceLock<Mutex<BufWriter<File>>> = OnceLock::new();
 
 /// 直近何世代分の perf log を残すか。`perf_events.jsonl` (現在) +
 /// `perf_events.1.jsonl` 〜 `perf_events.{N-1}.jsonl` (過去) で N ファイル。
@@ -63,55 +59,31 @@ pub fn init_with_path(
     }
     let start = start_override.unwrap_or_else(Instant::now);
     START.set(start).ok();
-    let log_path = if let Some(path) = log_path_override {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+    let rotate = log_path_override.is_none();
+    let log_path =
+        log_path_override.unwrap_or_else(|| crate::data_dir::logs_dir().join("perf_events.jsonl"));
+    let t = START.get().unwrap().elapsed().as_secs_f64();
+    let mut session = serde_json::json!({"t":(t*1000.0).round()/1000.0,"tid":crate::logger::current_thread_id_num().unwrap_or(0),"cat":"session","kind":"start","pid":std::process::id()});
+    if let Some(created) = process_start_unix_ms() {
+        session["process_start_unix_ms"] = created.into();
+    }
+    if let Some(anchor) = wall_clock_anchor(SystemTime::now(), START.get().unwrap().elapsed()) {
+        for (k, v) in anchor {
+            session[k] = v;
         }
-        path
-    } else {
-        let log_dir = crate::data_dir::logs_dir();
-        let _ = std::fs::create_dir_all(&log_dir);
-        rotate_logs(&log_dir);
-        log_dir.join("perf_events.jsonl")
-    };
-    let mut opts = std::fs::OpenOptions::new();
-    opts.create(true).write(true).truncate(true);
-    allow_live_log_reading(&mut opts);
-    match opts.open(&log_path) {
-        Ok(f) => {
-            if FILE
-                .set(Mutex::new(BufWriter::with_capacity(64 * 1024, f)))
-                .is_ok()
-            {
-                stall::init();
-                ENABLED.store(true, Ordering::Release);
-                // A same-session witness lets external release gates reject a stale perf log
-                // or a different mimageviewer-core process while still allowing a correctly
-                // sleeping measurement window to contain no frame events.
-                let mut extras = vec![("pid", Value::from(std::process::id()))];
-                #[cfg(windows)]
-                if let Some(created) = process_start_unix_ms() {
-                    extras.push(("process_start_unix_ms", created.into()));
-                }
-                // Pair wall time with the monotonic log clock; session init can
-                // happen well after t=0 (for example, when enabled in settings).
-                if let Some(anchor) = wall_clock_anchor(SystemTime::now(), start.elapsed()) {
-                    extras.extend(anchor);
-                }
-                event("session", "start", None, 0, &extras);
-                flush();
-                memory::emit("perf_enabled", "milestone");
-                memory::start_sampler();
-                crate::logger::log(format!("perf: JSONL log enabled at {}", log_path.display()));
-            }
-        }
-        Err(e) => {
-            eprintln!(
-                "perf ログファイル作成失敗: {e} (path: {})",
-                log_path.display()
-            );
-            crate::logger::log(format!("perf: init failed: {e}"));
-        }
+    }
+    if crate::log_writer::configure_perf(crate::log_writer::PerfConfig {
+        path: log_path.clone(),
+        rotate,
+        start: *START.get().unwrap(),
+        session,
+    }) {
+        stall::init();
+        ENABLED.store(true, Ordering::Release);
+        flush();
+        memory::emit("perf_enabled", "milestone");
+        memory::start_sampler();
+        crate::logger::log(format!("perf: JSONL log enabled at {}", log_path.display()));
     }
 }
 
@@ -132,7 +104,7 @@ fn filetime_to_unix_ms(ticks: u64) -> Option<u64> {
 }
 
 #[cfg(windows)]
-fn process_start_unix_ms() -> Option<u64> {
+pub(crate) fn process_start_unix_ms() -> Option<u64> {
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
 
@@ -157,25 +129,15 @@ fn process_start_unix_ms() -> Option<u64> {
     }
 }
 
-fn allow_live_log_reading(opts: &mut std::fs::OpenOptions) {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-
-        const FILE_SHARE_READ: u32 = 0x0000_0001;
-        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
-        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
-
-        opts.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
-    }
-    #[cfg(not(windows))]
-    let _ = opts;
+#[cfg(not(windows))]
+pub(crate) fn process_start_unix_ms() -> Option<u64> {
+    None
 }
 
 /// `perf_events.jsonl` をローテーションする。current → `.1` → `.2` → ... と
 /// 番号をずらし、最古 (= `MAX_GENERATIONS - 1` 番) は削除する。`init()` から
 /// truncate-create する直前に呼ぶ。失敗は静かに無視 (perf-log は debug 用途)。
-fn rotate_logs(log_dir: &std::path::Path) {
+pub(crate) fn rotate_logs(log_dir: &std::path::Path) -> std::io::Result<()> {
     let path_for = |n: usize| -> std::path::PathBuf {
         if n == 0 {
             log_dir.join("perf_events.jsonl")
@@ -185,14 +147,15 @@ fn rotate_logs(log_dir: &std::path::Path) {
     };
     // 最古を消し、上から順番に下にずらす。
     let oldest = path_for(MAX_GENERATIONS - 1);
-    let _ = std::fs::remove_file(&oldest);
+    crate::logger::remove_old_generation(&oldest)?;
     for n in (0..MAX_GENERATIONS - 1).rev() {
         let from = path_for(n);
         let to = path_for(n + 1);
         if from.exists() {
-            let _ = std::fs::rename(&from, &to);
+            std::fs::rename(&from, &to)?;
         }
     }
+    Ok(())
 }
 
 /// ホットパスで先頭に挟むチェック関数。
@@ -206,6 +169,13 @@ pub fn is_enabled() -> bool {
 /// 計算するのに使う。無効時 / 未初期化時は `None`。
 pub fn program_start() -> Option<Instant> {
     START.get().copied()
+}
+
+#[cfg(test)]
+pub(crate) fn install_test_clock(start: Instant) {
+    assert!(START.set(start).is_ok());
+    stall::init();
+    ENABLED.store(true, Ordering::Release);
 }
 
 /// 共通ヘルパー: `t0.elapsed()` を `ms` として perf イベントを emit する。
@@ -230,7 +200,9 @@ pub fn event(cat: &str, kind: &str, key: Option<&str>, seq: u64, extras: &[(&str
         return;
     }
     let Some(start) = START.get() else { return };
-    let Some(file) = FILE.get() else { return };
+    let Some(publication) = crate::log_writer::publication(crate::log_writer::Sink::Perf) else {
+        return;
+    };
 
     let t = start.elapsed().as_secs_f64();
     let tid = crate::logger::current_thread_id_num().unwrap_or(0);
@@ -258,23 +230,7 @@ pub fn event(cat: &str, kind: &str, key: Option<&str>, seq: u64, extras: &[(&str
         Err(_) => return,
     };
 
-    let mut probe = stall::IoProbe::start("perf", "event", &HOLDER);
-    if let Ok(mut f) = file.lock() {
-        if let Some(p) = probe.as_mut() {
-            p.acquired(&HOLDER);
-        }
-        let at = stall::timer(&probe);
-        stall::drain(&mut *f);
-        let diagnostic_ms = stall::elapsed(at);
-        let at = stall::timer(&probe);
-        let _ = writeln!(f, "{line}");
-        let write_ms = stall::elapsed(at);
-        let ended = stall::retire(&HOLDER, &probe);
-        drop(f);
-        if let (Some(p), Some(ended)) = (probe, ended) {
-            p.finish(ended, write_ms, 0.0, diagnostic_ms);
-        }
-    }
+    publication.submit(format!("{line}\n"), t, tid, std::panic::Location::caller());
     // One process-memory query per startup marker, after releasing the log lock.
     // Memory events use their own category so they cannot recurse into this hook.
     if cat == "startup" {
@@ -282,30 +238,11 @@ pub fn event(cat: &str, kind: &str, key: Option<&str>, seq: u64, extras: &[(&str
     }
 }
 
-/// `BufWriter` を明示的にフラッシュする。フレーム境界で定期的に呼ぶ。
+/// Nonblocking delivery request. Completion is a separate worker-only API.
 #[track_caller]
 pub fn flush() {
-    if !is_enabled() {
-        return;
-    }
-    if let Some(file) = FILE.get() {
-        let mut probe = stall::IoProbe::start("perf", "flush", &HOLDER);
-        if let Ok(mut f) = file.lock() {
-            if let Some(p) = probe.as_mut() {
-                p.acquired(&HOLDER);
-            }
-            let at = stall::timer(&probe);
-            stall::drain(&mut *f);
-            let diagnostic_ms = stall::elapsed(at);
-            let at = stall::timer(&probe);
-            let _ = f.flush();
-            let flush_ms = stall::elapsed(at);
-            let ended = stall::retire(&HOLDER, &probe);
-            drop(f);
-            if let (Some(p), Some(ended)) = (probe, ended) {
-                p.finish(ended, 0.0, flush_ms, diagnostic_ms);
-            }
-        }
+    if is_enabled() {
+        crate::log_writer::request_flush();
     }
 }
 

@@ -300,14 +300,14 @@ mod tests {
 
     #[test]
     fn name_color_warning_matches_standard_and_strong_previews() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
         let standard_warning =
             "標準配色の名前色は4.5:1未満です。交互行やhoverでは読みにくくなる場合があります";
         let strong_warning = "強い配色のフォルダ色はhoverで4.5:1未満です";
         for contrast in [TextContrast::Standard, TextContrast::Strong] {
             let mut draft = Settings::default();
             draft.text_contrast = contrast;
-            let mut harness = Harness::builder()
+            let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(760.0, 1200.0))
                 .build_state(
                     |ctx, draft| {
@@ -326,7 +326,7 @@ mod tests {
 
     #[test]
     fn category_reset_and_all_reset_handlers_only_edit_the_draft() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
         let mut live = Settings::default();
         live.details_name_colors.enabled = false;
         live.details_name_colors.colors[0] = DetailsNameColor::Custom {
@@ -338,7 +338,7 @@ mod tests {
             dark: [180, 220, 140],
         };
         let before = live.details_name_colors.clone();
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(680.0, 1200.0))
             .build_state(
                 |ctx, draft| {

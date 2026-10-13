@@ -2226,7 +2226,9 @@ mod tests {
                 rotation,
                 free_rotation_rad: 0.0,
                 content_bbox: None,
-                fit_mode: crate::settings::FullscreenFitMode::Page,
+                fit_mode: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
+                    crate::settings::FullscreenFitMode::Page,
+                ),
                 fit_scale_limits:
                     crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
                 pixels_per_point: ppp,
@@ -2311,7 +2313,9 @@ mod tests {
                     rotation: crate::rotation_db::Rotation::None,
                     free_rotation_rad: 0.0,
                     content_bbox,
-                    fit_mode: crate::settings::FullscreenFitMode::Page,
+                    fit_mode: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
+                        crate::settings::FullscreenFitMode::Page,
+                    ),
                     fit_scale_limits:
                         crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
                     pixels_per_point: ppp,
@@ -2380,7 +2384,9 @@ mod tests {
                 crate::rotation_db::Rotation::None,
                 None,
                 0.0,
-                crate::settings::FullscreenFitMode::Page,
+                crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
+                    crate::settings::FullscreenFitMode::Page,
+                ),
                 crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
                 ppp,
                 None,

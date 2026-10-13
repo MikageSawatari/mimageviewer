@@ -13,6 +13,121 @@ use eframe::egui;
 
 use crate::grid_item::GridItem;
 
+/// Virtualized grids own the complete row slot (tile plus their explicit gap).
+/// egui's show_rows otherwise adds Ui item_spacing a second time.
+pub(crate) fn show_fixed_slot_rows<R>(
+    ui: &mut egui::Ui,
+    scroll: egui::ScrollArea,
+    slot_height: f32,
+    rows: usize,
+    draw: impl FnOnce(&mut egui::Ui, std::ops::Range<usize>) -> R,
+) -> egui::scroll_area::ScrollAreaOutput<R> {
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        scroll.show_rows(ui, slot_height, rows, draw)
+    })
+    .inner
+}
+
+#[cfg(test)]
+mod calculated_grid_height_tests {
+    use super::*;
+    use crate::test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
+
+    #[test]
+    fn calculated_reorder_grid_slots_fit_and_scroll_to_last_row() {
+        for height in [440.0, 140.0] {
+            let ctx = egui::Context::default();
+            let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, height));
+            let draw = |events| {
+                let mut measured = None;
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(viewport),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(ctx, |ui| {
+                                // Both reorder dialogs use 78pt tiles, 8pt explicit Grid gaps,
+                                // and calculate a complete 86pt slot for scrolling and End.
+                                ui.spacing_mut().item_spacing.y = 13.0; // unrelated ambient style
+                                let output = show_fixed_slot_rows(
+                                    ui,
+                                    egui::ScrollArea::vertical()
+                                        .max_height(430.0)
+                                        .auto_shrink([false, false]),
+                                    86.0,
+                                    5,
+                                    |ui, rows| {
+                                        egui::Grid::new("reorder")
+                                            .num_columns(2)
+                                            .spacing(egui::vec2(8.0, 8.0))
+                                            .show(ui, |ui| {
+                                                for _ in rows {
+                                                    for _ in 0..2 {
+                                                        ui.allocate_exact_size(
+                                                            egui::vec2(58.0, 78.0),
+                                                            egui::Sense::click(),
+                                                        );
+                                                    }
+                                                    ui.end_row();
+                                                }
+                                            });
+                                    },
+                                );
+                                measured = Some(ScrollLayout::from_output(&output));
+                            });
+                    },
+                );
+                measured.unwrap()
+            };
+            let mut before = draw(vec![]);
+            for _ in 0..3 {
+                before = draw(vec![]);
+            }
+            assert_eq!(
+                before.content.y, 430.0,
+                "virtual slots and keyboard content height agree"
+            );
+            before.assert_height(
+                if height > 400.0 {
+                    HeightExpectation::Fits
+                } else {
+                    HeightExpectation::Scrolls
+                },
+                viewport,
+                ctx.pixels_per_point(),
+            );
+            if height < 400.0 {
+                let mut after = before;
+                for frame in 0..40 {
+                    after = draw(if frame == 0 {
+                        vec![
+                            egui::Event::PointerMoved(before.inner.center()),
+                            egui::Event::MouseWheel {
+                                unit: egui::MouseWheelUnit::Point,
+                                delta: egui::vec2(0.0, -4000.0),
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ]
+                    } else {
+                        vec![]
+                    });
+                }
+                after.assert_scrolled_to_end(before, ctx.pixels_per_point());
+            }
+            assert_eq!(
+                ctx.style().spacing.item_spacing.y,
+                3.0,
+                "local row-slot style must not leak"
+            );
+        }
+    }
+}
+
 /// Partition a modal input shield around the exact controls drawn in this frame.
 /// No persistent hit-area state; both renderers pass their HUD drawing rectangles.
 pub(crate) fn modal_shield_rects(full: egui::Rect, allowed: &[egui::Rect]) -> Vec<egui::Rect> {

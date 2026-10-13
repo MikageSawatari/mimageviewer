@@ -5,8 +5,8 @@ use eframe::egui;
 #[cfg(windows)]
 use super::ViewerPresentation;
 use super::{
-    App, FolderNavMode, GridContainerOpenMode, GridCursorDirection, GridScrollIntent,
-    grid_cursor_nav_target_pos,
+    App, FolderNavMode, GridContainerOpenMode, GridCursorDirection, GridCursorMove,
+    GridScrollIntent, grid_cursor_nav_target_pos,
 };
 use crate::adjustment::{POST_FILTER_GROUPS, PostFilter};
 use crate::folder_pane::{FolderPaneCommand, FolderPaneTreeKey};
@@ -29,6 +29,13 @@ use crate::settings::{
     ThumbAspect, format_video_volume_db, step_video_volume_by_fader_key_step,
 };
 use crate::ui_main::AddressBarNav;
+
+enum RatingPickerTermination {
+    Release(crate::rating_membership::RatingAdoptionIntent),
+    /// A request owner is already preparing the replacement set. Ending the
+    /// recipe invalidates that Ready; only its latest request adopts afterward.
+    SourceAdoption,
+}
 
 /// この frame に発生した gamepad の操作。**配り先はまだ決まっていない。**
 ///
@@ -1756,85 +1763,25 @@ impl App {
         let painter = ui.painter();
         painter.rect_filled(full_rect, 0.0, egui::Color32::from_black_alpha(120));
 
-        let rows = picker_rows_for_context(picker.context);
-        let row_h = 32.0;
-        let drill = picker.drill;
-        let panel_w = (full_rect.width() * 0.60).clamp(340.0, 560.0);
-        let panel_h = if drill.is_some() {
-            let count = drill
-                .map(|list| self.picker_list_len(picker, list))
-                .unwrap_or(0)
-                .max(1);
-            (104.0 + row_h * count as f32).min(full_rect.height() - 32.0)
-        } else {
-            96.0 + row_h * rows.len() as f32
-        };
-        let panel_rect =
-            egui::Rect::from_center_size(full_rect.center(), egui::vec2(panel_w, panel_h));
-
-        egui::Area::new(egui::Id::new("gamepad_ring_picker_overlay"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(panel_rect.min)
-            .show(ui.ctx(), |ui| {
-                ui.set_min_size(panel_rect.size());
-                egui::Frame::new()
-                    .fill(egui::Color32::from_black_alpha(220))
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)))
-                    .corner_radius(egui::CornerRadius::same(8))
-                    .inner_margin(egui::Margin::same(14))
-                    .show(ui, |ui| {
-                        ui.set_width(panel_w - 28.0);
-                        ui.label(
-                            egui::RichText::new(format!("ピッカー / {}", picker.context.label()))
-                                .size(17.0)
-                                .color(egui::Color32::WHITE),
-                        );
-                        ui.add_space(6.0);
-                        if let Some(drill) = drill {
-                            self.draw_gamepad_picker_list(ui, picker, drill);
-                        } else {
-                            for (idx, &row) in rows.iter().enumerate() {
-                                let selected = idx == picker.current_row();
-                                let (rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(ui.available_width(), row_h),
-                                    egui::Sense::hover(),
-                                );
-                                let fill = if selected {
-                                    egui::Color32::from_rgb(56, 94, 138)
-                                } else {
-                                    egui::Color32::from_black_alpha(0)
-                                };
-                                ui.painter().rect_filled(rect, 5.0, fill);
-                                let label_pos = egui::pos2(rect.min.x + 10.0, rect.center().y);
-                                let value_pos = egui::pos2(rect.max.x - 10.0, rect.center().y);
-                                ui.painter().text(
-                                    label_pos,
-                                    egui::Align2::LEFT_CENTER,
-                                    row.label(),
-                                    egui::FontId::proportional(14.5),
-                                    egui::Color32::from_white_alpha(if selected {
-                                        245
-                                    } else {
-                                        205
-                                    }),
-                                );
-                                ui.painter().text(
-                                    value_pos,
-                                    egui::Align2::RIGHT_CENTER,
-                                    self.picker_value_text(picker, row),
-                                    egui::FontId::proportional(14.5),
-                                    egui::Color32::WHITE,
-                                );
-                            }
-                            ui.add_space(8.0);
-                            ui.label(
-                                egui::RichText::new("上下:選択  左右:変更  A:一覧  B/X:確定")
-                                    .size(12.0)
-                                    .color(egui::Color32::from_white_alpha(190)),
-                            );
-                        }
-                    });
-            });
+        let rows = picker_rows_for_context(picker.context)
+            .iter()
+            .map(|&row| (row.label().to_string(), self.picker_value_text(picker, row)))
+            .collect::<Vec<_>>();
+        let drill_items = picker
+            .drill
+            .map(|list| self.picker_list_items(picker, list));
+        let drill = picker
+            .drill
+            .zip(drill_items.as_deref())
+            .map(|(list, items)| (self.picker_list_title(list), items, list.selected));
+        draw_gamepad_ring_picker_overlay_layout(
+            ui.ctx(),
+            full_rect,
+            &format!("ピッカー / {}", picker.context.label()),
+            &rows,
+            picker.current_row(),
+            drill,
+        );
     }
 
     pub(crate) fn draw_gamepad_favorite_picker_overlay(
@@ -1849,156 +1796,42 @@ impl App {
         if self.dispatched_input_surface() != surface {
             return;
         }
-        let painter = ui.painter();
-        painter.rect_filled(full_rect, 0.0, egui::Color32::from_black_alpha(120));
-
+        ui.painter()
+            .rect_filled(full_rect, 0.0, egui::Color32::from_black_alpha(120));
         let tab = picker.tab;
-        let cursor = picker.active_cursor();
         let len = match tab {
             GamepadFavoritePickerTab::Favorites => self.settings.favorites.len(),
             GamepadFavoritePickerTab::SmartFolders => self.settings.smart_folders.len(),
         };
-        let row_h = 34.0;
-        let visible_rows = len.min(GAMEPAD_LIST_VISIBLE_ROWS).max(1);
-        let panel_w = (full_rect.width() * 0.62).clamp(360.0, 640.0);
-        let panel_h = 116.0 + row_h * visible_rows as f32;
-        let panel_rect =
-            egui::Rect::from_center_size(full_rect.center(), egui::vec2(panel_w, panel_h));
-        let selected = cursor.selected.min(len.saturating_sub(1));
-        let start = cursor.scroll_top.min(len.saturating_sub(visible_rows));
-        let end = (start + visible_rows).min(len);
-
-        egui::Area::new(egui::Id::new("gamepad_favorite_picker_overlay"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(panel_rect.min)
-            .show(ui.ctx(), |ui| {
-                ui.set_min_size(panel_rect.size());
-                egui::Frame::new()
-                    .fill(egui::Color32::from_black_alpha(224))
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)))
-                    .corner_radius(egui::CornerRadius::same(8))
-                    .inner_margin(egui::Margin::same(14))
-                    .show(ui, |ui| {
-                        ui.set_width(panel_w - 28.0);
-                        ui.horizontal(|ui| {
-                            for candidate in [
-                                GamepadFavoritePickerTab::Favorites,
-                                GamepadFavoritePickerTab::SmartFolders,
-                            ] {
-                                let active = candidate == tab;
-                                ui.label(
-                                    egui::RichText::new(candidate.label())
-                                        .size(if active { 17.0 } else { 15.0 })
-                                        .color(egui::Color32::from_white_alpha(if active {
-                                            255
-                                        } else {
-                                            180
-                                        }))
-                                        .background_color(if active {
-                                            egui::Color32::from_rgb(56, 94, 138)
-                                        } else {
-                                            egui::Color32::TRANSPARENT
-                                        }),
-                                );
-                                ui.add_space(10.0);
-                            }
-                        });
-                        ui.add_space(6.0);
-                        let mut first_row_rect = None;
-                        let mut last_row_rect = None;
-                        let has_scrollbar = len > visible_rows;
-                        let scrollbar_gutter = if has_scrollbar { 18.0 } else { 0.0 };
-                        if len == 0 {
-                            let (rect, _) = ui.allocate_exact_size(
-                                egui::vec2(ui.available_width(), row_h),
-                                egui::Sense::hover(),
-                            );
-                            ui.painter().text(
-                                rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                "登録されていません",
-                                egui::FontId::proportional(14.5),
-                                egui::Color32::from_white_alpha(180),
-                            );
-                        }
-                        for idx in start..end {
-                            let (label, value) = match tab {
-                                GamepadFavoritePickerTab::Favorites => {
-                                    let favorite = &self.settings.favorites[idx];
-                                    (favorite.name.clone(), favorite.path.display().to_string())
-                                }
-                                GamepadFavoritePickerTab::SmartFolders => {
-                                    let definition = &self.settings.smart_folders[idx];
-                                    (
-                                        definition.name.clone(),
-                                        smart_folder_picker_value(definition),
-                                    )
-                                }
-                            };
-                            let is_selected = idx == selected;
-                            let (rect, _) = ui.allocate_exact_size(
-                                egui::vec2(ui.available_width(), row_h),
-                                egui::Sense::hover(),
-                            );
-                            first_row_rect.get_or_insert(rect);
-                            last_row_rect = Some(rect);
-                            let row_rect = egui::Rect::from_min_max(
-                                rect.min,
-                                egui::pos2(
-                                    (rect.max.x - scrollbar_gutter).max(rect.min.x),
-                                    rect.max.y,
-                                ),
-                            );
-                            ui.painter().rect_filled(
-                                row_rect,
-                                5.0,
-                                if is_selected {
-                                    egui::Color32::from_rgb(56, 94, 138)
-                                } else {
-                                    egui::Color32::TRANSPARENT
-                                },
-                            );
-                            ui.painter().text(
-                                egui::pos2(row_rect.min.x + 10.0, row_rect.center().y),
-                                egui::Align2::LEFT_CENTER,
-                                truncate_ring_overlay_label(&label, 22),
-                                egui::FontId::proportional(if is_selected { 15.5 } else { 14.5 }),
-                                egui::Color32::from_white_alpha(if is_selected {
-                                    255
-                                } else {
-                                    220
-                                }),
-                            );
-                            let value_right = row_rect.max.x - 10.0;
-                            ui.painter().text(
-                                egui::pos2(value_right, row_rect.center().y),
-                                egui::Align2::RIGHT_CENTER,
-                                truncate_ring_overlay_label(&value, 34),
-                                egui::FontId::proportional(12.5),
-                                egui::Color32::from_white_alpha(if is_selected {
-                                    235
-                                } else {
-                                    180
-                                }),
-                            );
-                        }
-                        if let (Some(first), Some(last)) = (first_row_rect, last_row_rect) {
-                            draw_picker_scrollbar(
-                                ui.painter(),
-                                egui::Rect::from_min_max(first.min, last.max),
-                                len,
-                                visible_rows,
-                                start,
-                            );
-                        }
-                        ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new("左右:タブ切替  上下:選択  A:移動  B/Start:閉じる")
-                                .size(12.0)
-                                .color(egui::Color32::from_white_alpha(190)),
-                        );
-                    });
-            });
+        draw_gamepad_list_picker_overlay_layout(
+            ui.ctx(),
+            full_rect,
+            egui::Id::new("gamepad_favorite_picker_overlay"),
+            GamepadListPickerHeading::FavoriteTabs(tab),
+            "左右:タブ切替  上下:選択  A:移動  B/Start:閉じる",
+            len,
+            picker.active_cursor().clone(),
+            Some("登録されていません"),
+            |idx| {
+                let (label, value) = match tab {
+                    GamepadFavoritePickerTab::Favorites => {
+                        let favorite = &self.settings.favorites[idx];
+                        (favorite.name.clone(), favorite.path.display().to_string())
+                    }
+                    GamepadFavoritePickerTab::SmartFolders => {
+                        let definition = &self.settings.smart_folders[idx];
+                        (
+                            definition.name.clone(),
+                            smart_folder_picker_value(definition),
+                        )
+                    }
+                };
+                (
+                    truncate_ring_overlay_label(&label, 22),
+                    truncate_ring_overlay_label(&value, 34),
+                )
+            },
+        );
     }
 
     pub(crate) fn draw_gamepad_video_marker_picker_overlay(
@@ -2023,111 +1856,28 @@ impl App {
         if markers.is_empty() {
             return;
         }
-        let painter = ui.painter();
-        painter.rect_filled(full_rect, 0.0, egui::Color32::from_black_alpha(120));
-
-        let row_h = 34.0;
-        let visible_rows = markers.len().min(GAMEPAD_LIST_VISIBLE_ROWS).max(1);
-        let panel_w = (full_rect.width() * 0.62).clamp(360.0, 640.0);
-        let panel_h = 92.0 + row_h * visible_rows as f32;
-        let panel_rect =
-            egui::Rect::from_center_size(full_rect.center(), egui::vec2(panel_w, panel_h));
-        let selected = picker.selected.min(markers.len().saturating_sub(1));
-        let start = picker
-            .scroll_top
-            .min(markers.len().saturating_sub(visible_rows));
-        let end = (start + visible_rows).min(markers.len());
-
-        egui::Area::new(egui::Id::new("gamepad_video_marker_picker_overlay"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(panel_rect.min)
-            .show(ui.ctx(), |ui| {
-                ui.set_min_size(panel_rect.size());
-                egui::Frame::new()
-                    .fill(egui::Color32::from_black_alpha(224))
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)))
-                    .corner_radius(egui::CornerRadius::same(8))
-                    .inner_margin(egui::Margin::same(14))
-                    .show(ui, |ui| {
-                        ui.set_width(panel_w - 28.0);
-                        ui.label(
-                            egui::RichText::new("ブックマーク / チャプター")
-                                .size(17.0)
-                                .color(egui::Color32::WHITE),
-                        );
-                        ui.add_space(6.0);
-                        let mut first_row_rect = None;
-                        let mut last_row_rect = None;
-                        let has_scrollbar = markers.len() > visible_rows;
-                        let scrollbar_gutter = if has_scrollbar { 18.0 } else { 0.0 };
-                        for idx in start..end {
-                            let marker = &markers[idx];
-                            let is_selected = idx == selected;
-                            let (rect, _) = ui.allocate_exact_size(
-                                egui::vec2(ui.available_width(), row_h),
-                                egui::Sense::hover(),
-                            );
-                            first_row_rect.get_or_insert(rect);
-                            last_row_rect = Some(rect);
-                            let row_rect = egui::Rect::from_min_max(
-                                rect.min,
-                                egui::pos2(
-                                    (rect.max.x - scrollbar_gutter).max(rect.min.x),
-                                    rect.max.y,
-                                ),
-                            );
-                            ui.painter().rect_filled(
-                                row_rect,
-                                5.0,
-                                if is_selected {
-                                    egui::Color32::from_rgb(56, 94, 138)
-                                } else {
-                                    egui::Color32::TRANSPARENT
-                                },
-                            );
-                            ui.painter().text(
-                                egui::pos2(row_rect.min.x + 10.0, row_rect.center().y),
-                                egui::Align2::LEFT_CENTER,
-                                video_marker_primary_label(marker),
-                                egui::FontId::proportional(if is_selected { 15.5 } else { 14.5 }),
-                                egui::Color32::from_white_alpha(if is_selected {
-                                    255
-                                } else {
-                                    220
-                                }),
-                            );
-                            ui.painter().text(
-                                egui::pos2(row_rect.max.x - 10.0, row_rect.center().y),
-                                egui::Align2::RIGHT_CENTER,
-                                truncate_ring_overlay_label(
-                                    &video_marker_secondary_label(marker),
-                                    34,
-                                ),
-                                egui::FontId::proportional(12.5),
-                                egui::Color32::from_white_alpha(if is_selected {
-                                    235
-                                } else {
-                                    180
-                                }),
-                            );
-                        }
-                        if let (Some(first), Some(last)) = (first_row_rect, last_row_rect) {
-                            draw_picker_scrollbar(
-                                ui.painter(),
-                                egui::Rect::from_min_max(first.min, last.max),
-                                markers.len(),
-                                visible_rows,
-                                start,
-                            );
-                        }
-                        ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new("上下:選択  A:移動  B/Select:閉じる")
-                                .size(12.0)
-                                .color(egui::Color32::from_white_alpha(190)),
-                        );
-                    });
-            });
+        ui.painter()
+            .rect_filled(full_rect, 0.0, egui::Color32::from_black_alpha(120));
+        draw_gamepad_list_picker_overlay_layout(
+            ui.ctx(),
+            full_rect,
+            egui::Id::new("gamepad_video_marker_picker_overlay"),
+            GamepadListPickerHeading::Title("ブックマーク / チャプター"),
+            "上下:選択  A:移動  B/Select:閉じる",
+            markers.len(),
+            GamepadListCursor {
+                selected: picker.selected,
+                scroll_top: picker.scroll_top,
+            },
+            None,
+            |idx| {
+                let marker = &markers[idx];
+                (
+                    video_marker_primary_label(marker),
+                    truncate_ring_overlay_label(&video_marker_secondary_label(marker), 34),
+                )
+            },
+        );
     }
 
     pub(crate) fn draw_gamepad_location_picker_overlay(
@@ -2142,159 +1892,28 @@ impl App {
         if surface != crate::app::ActionSurface::MainWindow {
             return;
         }
-        let painter = ui.painter();
-        painter.rect_filled(full_rect, 0.0, egui::Color32::from_black_alpha(120));
-
-        let row_h = 34.0;
-        let visible_rows = picker.entries.len().min(GAMEPAD_LIST_VISIBLE_ROWS).max(1);
-        let panel_w = (full_rect.width() * 0.62).clamp(360.0, 640.0);
-        let panel_h = 92.0 + row_h * visible_rows as f32;
-        let panel_rect =
-            egui::Rect::from_center_size(full_rect.center(), egui::vec2(panel_w, panel_h));
-        let selected = picker.selected.min(picker.entries.len().saturating_sub(1));
-        let start = picker
-            .scroll_top
-            .min(picker.entries.len().saturating_sub(visible_rows));
-        let end = (start + visible_rows).min(picker.entries.len());
-
-        egui::Area::new(egui::Id::new("gamepad_location_picker_overlay"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(panel_rect.min)
-            .show(ui.ctx(), |ui| {
-                ui.set_min_size(panel_rect.size());
-                egui::Frame::new()
-                    .fill(egui::Color32::from_black_alpha(224))
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)))
-                    .corner_radius(egui::CornerRadius::same(8))
-                    .inner_margin(egui::Margin::same(14))
-                    .show(ui, |ui| {
-                        ui.set_width(panel_w - 28.0);
-                        ui.label(
-                            egui::RichText::new("場所")
-                                .size(17.0)
-                                .color(egui::Color32::WHITE),
-                        );
-                        ui.add_space(6.0);
-                        let mut first_row_rect = None;
-                        let mut last_row_rect = None;
-                        let has_scrollbar = picker.entries.len() > visible_rows;
-                        let scrollbar_gutter = if has_scrollbar { 18.0 } else { 0.0 };
-                        for idx in start..end {
-                            let entry = &picker.entries[idx];
-                            let is_selected = idx == selected;
-                            let (rect, _) = ui.allocate_exact_size(
-                                egui::vec2(ui.available_width(), row_h),
-                                egui::Sense::hover(),
-                            );
-                            first_row_rect.get_or_insert(rect);
-                            last_row_rect = Some(rect);
-                            let row_rect = egui::Rect::from_min_max(
-                                rect.min,
-                                egui::pos2(
-                                    (rect.max.x - scrollbar_gutter).max(rect.min.x),
-                                    rect.max.y,
-                                ),
-                            );
-                            ui.painter().rect_filled(
-                                row_rect,
-                                5.0,
-                                if is_selected {
-                                    egui::Color32::from_rgb(56, 94, 138)
-                                } else {
-                                    egui::Color32::TRANSPARENT
-                                },
-                            );
-                            ui.painter().text(
-                                egui::pos2(row_rect.min.x + 10.0, row_rect.center().y),
-                                egui::Align2::LEFT_CENTER,
-                                truncate_ring_overlay_label(&entry.label, 22),
-                                egui::FontId::proportional(if is_selected { 15.5 } else { 14.5 }),
-                                egui::Color32::from_white_alpha(if is_selected {
-                                    255
-                                } else {
-                                    220
-                                }),
-                            );
-                            ui.painter().text(
-                                egui::pos2(row_rect.max.x - 10.0, row_rect.center().y),
-                                egui::Align2::RIGHT_CENTER,
-                                truncate_ring_overlay_label(&entry.value, 34),
-                                egui::FontId::proportional(12.5),
-                                egui::Color32::from_white_alpha(if is_selected {
-                                    235
-                                } else {
-                                    180
-                                }),
-                            );
-                        }
-                        if let (Some(first), Some(last)) = (first_row_rect, last_row_rect) {
-                            draw_picker_scrollbar(
-                                ui.painter(),
-                                egui::Rect::from_min_max(first.min, last.max),
-                                picker.entries.len(),
-                                visible_rows,
-                                start,
-                            );
-                        }
-                        ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new("上下:選択  A:移動  B/Select:閉じる")
-                                .size(12.0)
-                                .color(egui::Color32::from_white_alpha(190)),
-                        );
-                    });
-            });
-    }
-
-    fn draw_gamepad_picker_list(
-        &self,
-        ui: &mut egui::Ui,
-        picker: &RingPickerState,
-        list: PickerListState,
-    ) {
-        let title = self.picker_list_title(list);
-        let items = self.picker_list_items(picker, list);
-        ui.label(
-            egui::RichText::new(title)
-                .size(14.0)
-                .color(egui::Color32::from_white_alpha(200)),
+        ui.painter()
+            .rect_filled(full_rect, 0.0, egui::Color32::from_black_alpha(120));
+        draw_gamepad_list_picker_overlay_layout(
+            ui.ctx(),
+            full_rect,
+            egui::Id::new("gamepad_location_picker_overlay"),
+            GamepadListPickerHeading::Title("場所"),
+            "上下:選択  A:移動  B/Select:閉じる",
+            picker.entries.len(),
+            GamepadListCursor {
+                selected: picker.selected,
+                scroll_top: picker.scroll_top,
+            },
+            None,
+            |idx| {
+                let entry = &picker.entries[idx];
+                (
+                    truncate_ring_overlay_label(&entry.label, 22),
+                    truncate_ring_overlay_label(&entry.value, 34),
+                )
+            },
         );
-        ui.add_space(8.0);
-        let row_h = 32.0;
-        let selected = list.selected.min(items.len().saturating_sub(1));
-        for (idx, item) in items.iter().enumerate() {
-            let is_selected = idx == selected;
-            let (rect, _) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width(), row_h),
-                egui::Sense::hover(),
-            );
-            ui.painter().rect_filled(
-                rect,
-                5.0,
-                if is_selected {
-                    egui::Color32::from_rgb(56, 94, 138)
-                } else {
-                    egui::Color32::TRANSPARENT
-                },
-            );
-            ui.painter().text(
-                egui::pos2(rect.min.x + 10.0, rect.center().y),
-                egui::Align2::LEFT_CENTER,
-                item,
-                egui::FontId::proportional(if is_selected { 15.5 } else { 14.5 }),
-                egui::Color32::from_white_alpha(if is_selected { 255 } else { 215 }),
-            );
-        }
-        ui.add_space(8.0);
-        ui.label(
-            egui::RichText::new("上下:選択  A:選択  B/X:確定して閉じる")
-                .size(12.0)
-                .color(egui::Color32::from_white_alpha(190)),
-        );
-    }
-
-    fn picker_list_len(&self, picker: &RingPickerState, list: PickerListState) -> usize {
-        picker_list_len_for_state(picker, list, self.settings.ai_feature_mode)
     }
 
     fn picker_list_title(&self, list: PickerListState) -> &'static str {
@@ -2532,19 +2151,10 @@ impl App {
     /// previewed or commit-only; dropping the picker keeps the former and does not synthesize the
     /// latter. All physical holds and overlays become terminal, so nothing can replay on resume.
     pub(crate) fn finish_gamepad_input_for_sidecar_restore(&mut self, ctx: &egui::Context) {
-        let picker = self.ring_picker.take();
-        if let Some(picker) = picker {
-            let (item_changes, container_record) =
-                self.published_live_picker_rating_changes(&picker);
-            self.commit_live_picker_undo(item_changes, container_record);
-            let owner = picker.owner;
-            let context = picker.context;
-            let _ = self.with_owner_viewer_context(owner, |app| {
-                if context == RingShortcutContext::VideoFullscreen {
-                    app.clear_native_video_picker_overlay(ctx);
-                }
-            });
-        }
+        self.finish_rating_picker_without_commit(
+            crate::rating_membership::RatingAdoptionIntent::Reconcile,
+            Some(ctx),
+        );
         self.release_gamepad_input_holds(ctx);
         self.gamepad_state.clear();
         self.gamepad_state.require_directional_neutral();
@@ -3047,6 +2657,7 @@ impl App {
         &mut self,
         context: RingShortcutContext,
     ) -> RingPickerState {
+        self.prepare_page_edit_history_boundary();
         let fs_idx = self.fullscreen_idx;
         let params = fs_idx.map(|idx| self.effective_params(idx).clone());
         let item_rating_records = self.current_picker_item_rating_records(context);
@@ -3159,6 +2770,8 @@ impl App {
             anchor: self.current_ring_picker_anchor(context),
             grid_sort_target,
             original,
+            preview_recipe: Default::default(),
+            rating_origin: self.capture_rating_origin(),
             row: 0,
             dirty_rows: Vec::new(),
             x_close_armed: false,
@@ -3731,8 +3344,11 @@ impl App {
     }
 
     fn close_stale_ring_picker(&mut self, ctx: &egui::Context) {
-        if self.ring_picker.take().is_some() {
-            self.clear_native_video_picker_overlay(ctx);
+        if self.ring_picker.is_some() {
+            self.finish_rating_picker_without_commit(
+                crate::rating_membership::RatingAdoptionIntent::Reconcile,
+                Some(ctx),
+            );
             self.gamepad_state.cancel_west_ring();
             self.gamepad_state.require_directional_neutral();
             ctx.request_repaint();
@@ -4097,8 +3713,23 @@ impl App {
                 });
                 continue;
             };
+            // A bound/no-op and final confirmation of an already saved preview
+            // must not submit another DB/XMP write or invent a successful receipt.
+            if self.get_rating(idx) == stars.min(5) {
+                continue;
+            }
+            let item = self.items[idx].clone();
             match self.set_rating_result_deferred(idx, stars) {
-                Ok(true) => touched.push(idx),
+                Ok(true) => {
+                    touched.push(idx);
+                    self.record_picker_rating_preview(
+                        picker,
+                        &target.path_key,
+                        item,
+                        target.before,
+                        stars.min(5),
+                    );
+                }
                 Ok(false) => {
                     first_error.get_or_insert_with(|| {
                         format!(
@@ -4116,6 +3747,44 @@ impl App {
             self.publish_current_context_rating_writes();
         }
         (touched, first_error)
+    }
+
+    fn record_picker_rating_preview(
+        &mut self,
+        operation: &RingPickerState,
+        key: &str,
+        item: GridItem,
+        before: u8,
+        after: u8,
+    ) {
+        let generation = self.rating_session_generation_for_key(key);
+        let Some(picker) = self
+            .ring_picker
+            .as_mut()
+            .filter(|picker| picker.owner == operation.owner && picker.anchor == operation.anchor)
+        else {
+            return;
+        };
+        if let Some(entry) = picker
+            .preview_recipe
+            .entries
+            .iter_mut()
+            .find(|entry| entry.key == key)
+        {
+            entry.after = after;
+            entry.write_generation = generation;
+        } else {
+            picker
+                .preview_recipe
+                .entries
+                .push(crate::rating_membership::RatingPreviewLeave {
+                    key: key.to_owned(),
+                    item,
+                    before,
+                    after,
+                    write_generation: generation,
+                });
+        }
     }
 
     pub(crate) fn preview_picker_item_rating(&mut self, picker: &RingPickerState, stars: u8) {
@@ -4749,17 +4418,160 @@ impl App {
     }
 
     pub(crate) fn commit_ring_picker(&mut self, ctx: &egui::Context) {
-        let Some(picker) = self.ring_picker.take() else {
+        let Some(picker) = self.ring_picker.clone() else {
             return;
         };
         // 物理側は App-global。パッドはもう無いかもしれないので mount に依存させない。
         self.gamepad_state.cancel_west_ring();
         self.gamepad_state.require_directional_neutral();
-        let (item_rating_changes, container_rating_record) =
-            self.finalize_live_picker_ratings(&picker);
-        self.commit_live_picker_undo(item_rating_changes, container_rating_record);
-        self.apply_ring_picker_state(ctx, picker);
+        let owner = picker.owner;
+        let applied = self.with_owner_viewer_context(owner, |app| {
+            let (item_rating_changes, container_rating_record) =
+                app.finalize_live_picker_ratings(&picker);
+            app.commit_live_picker_undo_with_origin(
+                item_rating_changes,
+                container_rating_record,
+                picker.rating_origin.clone(),
+            );
+            // Keep the successful preview policy installed for every final row.
+            // Removing it is one explicit adoption after non-rating rows finish.
+            let finalized = app.ring_picker.clone().unwrap_or_else(|| picker.clone());
+            let toast = Self::picker_success_rating_toast(&finalized);
+            app.apply_ring_picker_state_in_owner(ctx, finalized);
+            app.ring_picker.take();
+            app.release_rating_preview_membership(
+                crate::rating_membership::RatingAdoptionIntent::Reconcile,
+            );
+            if let Some(toast) = toast {
+                app.show_feedback_toast(toast);
+            }
+        });
+        if applied.is_none() {
+            self.finish_rating_picker_without_commit(
+                crate::rating_membership::RatingAdoptionIntent::Manual,
+                Some(ctx),
+            );
+        }
         ctx.request_repaint();
+    }
+
+    /// End only the mounted owner's operation before explicit navigation. A
+    /// temporary sibling mount/focus change does not end the opening picker.
+    pub(crate) fn finish_rating_picker_for_manual_navigation(&mut self) {
+        if self
+            .ring_picker
+            .as_ref()
+            .is_some_and(|picker| picker.owner == self.projected_viewer_context_id())
+        {
+            self.finish_rating_picker_without_commit(
+                crate::rating_membership::RatingAdoptionIntent::Manual,
+                None,
+            );
+        }
+    }
+
+    fn finish_rating_picker_without_commit(
+        &mut self,
+        intent: crate::rating_membership::RatingAdoptionIntent,
+        ctx: Option<&egui::Context>,
+    ) {
+        self.terminate_rating_picker(RatingPickerTermination::Release(intent), ctx);
+    }
+
+    pub(crate) fn finish_rating_picker_before_source_adoption(&mut self) {
+        if self
+            .ring_picker
+            .as_ref()
+            .is_some_and(|picker| picker.owner == self.projected_viewer_context_id())
+        {
+            self.terminate_rating_picker(RatingPickerTermination::SourceAdoption, None);
+        }
+    }
+
+    fn terminate_rating_picker(
+        &mut self,
+        terminal: RatingPickerTermination,
+        ctx: Option<&egui::Context>,
+    ) {
+        let Some(picker) = self.ring_picker.take() else {
+            return;
+        };
+        let (items, container) = self.published_live_picker_rating_changes(&picker);
+        let RatingPickerTermination::Release(intent) = terminal else {
+            // This boundary is already mounted and its request owner may be
+            // temporarily local to poll. Do not mount, rebuild, or navigate here.
+            self.commit_live_picker_undo_with_origin(
+                items,
+                container,
+                picker.rating_origin.clone(),
+            );
+            if let Some(toast) = Self::picker_success_rating_toast(&picker) {
+                self.show_feedback_toast(toast);
+            }
+            #[cfg(windows)]
+            self.set_native_video_ring_picker_overlay(None);
+            self.gamepad_state.cancel_west_ring();
+            self.gamepad_state.require_directional_neutral();
+            return;
+        };
+        let owner = picker.owner;
+        let toast = (!matches!(
+            intent,
+            crate::rating_membership::RatingAdoptionIntent::Manual
+        ))
+        .then(|| Self::picker_success_rating_toast(&picker))
+        .flatten();
+        let mut records = Some((items, container));
+        let applied = self.with_owner_viewer_context(owner, |app| {
+            let (items, container) = records.take().unwrap();
+            app.commit_live_picker_undo_with_origin(items, container, picker.rating_origin.clone());
+            if let Some(ctx) = ctx {
+                app.clear_native_video_picker_overlay(ctx);
+            } else {
+                #[cfg(windows)]
+                app.set_native_video_ring_picker_overlay(None);
+            }
+            app.release_rating_preview_membership(intent);
+            if let Some(toast) = toast {
+                app.show_feedback_toast(toast);
+            }
+        });
+        if applied.is_none() {
+            let (items, container) = records.take().unwrap();
+            // A retired owner still has durable stable-key writes. Keep their
+            // Undo record without dispatching any reader work to a sibling.
+            self.commit_live_picker_undo_with_origin(
+                items,
+                container,
+                picker.rating_origin.clone(),
+            );
+        }
+        self.gamepad_state.cancel_west_ring();
+        self.gamepad_state.require_directional_neutral();
+    }
+
+    fn picker_success_rating_toast(picker: &RingPickerState) -> Option<String> {
+        let receipt = picker
+            .preview_recipe
+            .entries
+            .iter()
+            .max_by_key(|entry| entry.write_generation)?;
+        let container = picker
+            .original
+            .container_rating_target
+            .as_ref()
+            .is_some_and(|target| target.path_key == receipt.key)
+            && !picker
+                .original
+                .item_rating_records
+                .iter()
+                .any(|target| target.path_key == receipt.key);
+        Some(match (container, receipt.after) {
+            (true, 0) => "[フォルダ★解除]".to_owned(),
+            (true, stars) => format!("[フォルダ{}]", "★".repeat(stars as usize)),
+            (false, 0) => "[★解除]".to_owned(),
+            (false, stars) => format!("[{}]", "★".repeat(stars as usize)),
+        })
     }
 
     /// Re-apply the selected final value, then return only durable changes from
@@ -4775,13 +4587,31 @@ impl App {
         let Some(target) = picker.original.container_rating_target.clone() else {
             return Ok(false);
         };
-        self.write_container_rating_for_target(
+        let item = (0..self.items.len())
+            .find_map(|idx| {
+                (self.rating_path_key(idx).as_deref() == Some(target.path_key.as_str()))
+                    .then(|| self.items[idx].clone())
+            })
+            .unwrap_or_else(|| GridItem::Folder(target.source_path.clone()));
+        let written = self.write_container_rating_for_target_with_publication(
             &target.path_key,
             &target.source_path,
             &target.meta,
             picker.container_rating,
             false,
-        )
+            false,
+        )?;
+        if written {
+            self.record_picker_rating_preview(
+                picker,
+                &target.path_key,
+                item,
+                picker.original.container_rating,
+                picker.container_rating,
+            );
+            self.publish_current_context_rating_writes();
+        }
+        Ok(written)
     }
 
     pub(crate) fn finalize_live_picker_ratings(
@@ -4828,6 +4658,11 @@ impl App {
         Vec<RatingChange>,
         Option<(crate::ring_shortcut::RingPickerContainerTarget, u8, u8)>,
     ) {
+        let operation = self
+            .ring_picker
+            .as_ref()
+            .filter(|live| live.owner == picker.owner && live.anchor == picker.anchor)
+            .unwrap_or(picker);
         let item_changes = if picker.dirty_rows.contains(&RingPickerRowId::ItemRating) {
             picker
                 .original
@@ -4835,10 +4670,8 @@ impl App {
                 .iter()
                 .filter_map(|target| {
                     let actual = self
-                        .rating_session_writes
-                        .get(&target.path_key)
-                        .filter(|write| write.generation > target.session_generation)
-                        .map(|write| write.stars)
+                        .receipt_for_picker_key(operation, &target.path_key)
+                        .map(|receipt| receipt.after)
                         .unwrap_or(target.before);
                     (target.before != actual).then(|| RatingChange {
                         path_key: target.path_key.clone(),
@@ -4863,9 +4696,8 @@ impl App {
                 .as_ref()
                 .and_then(|target| {
                     let actual = self
-                        .rating_session_writes
-                        .get(&target.path_key)
-                        .map(|write| write.stars)
+                        .receipt_for_picker_key(operation, &target.path_key)
+                        .map(|receipt| receipt.after)
                         .unwrap_or(picker.original.container_rating);
                     (picker.original.container_rating != actual)
                         .then(|| (target.clone(), picker.original.container_rating, actual))
@@ -4876,10 +4708,32 @@ impl App {
         (item_changes, container_record)
     }
 
+    fn receipt_for_picker_key<'a>(
+        &self,
+        picker: &'a RingPickerState,
+        key: &str,
+    ) -> Option<&'a crate::rating_membership::RatingPreviewLeave> {
+        picker
+            .preview_recipe
+            .entries
+            .iter()
+            .find(|receipt| receipt.key == key)
+    }
+
     pub(crate) fn commit_live_picker_undo(
         &mut self,
         item_changes: Vec<RatingChange>,
         container_record: Option<(crate::ring_shortcut::RingPickerContainerTarget, u8, u8)>,
+    ) {
+        let origin = self.capture_rating_origin();
+        self.commit_live_picker_undo_with_origin(item_changes, container_record, origin);
+    }
+
+    fn commit_live_picker_undo_with_origin(
+        &mut self,
+        item_changes: Vec<RatingChange>,
+        container_record: Option<(crate::ring_shortcut::RingPickerContainerTarget, u8, u8)>,
+        origin: Option<crate::rating_membership::RatingOrigin>,
     ) {
         if !item_changes.is_empty() {
             let common_after = item_changes
@@ -4899,7 +4753,7 @@ impl App {
             } else {
                 format!("★{}", common_after.unwrap_or_default())
             };
-            self.push_rating_undo_entry(item_changes, summary);
+            self.push_rating_undo_entry_with_origin(item_changes, summary, origin);
         }
         if let Some((target, before, after)) = container_record {
             // **Undo も開いた時点の保存先へ。** ここで引き直すと、別の窓のフォルダ宛てに
@@ -6459,11 +6313,17 @@ impl App {
             GridSelectionEdge::Last => self.current_grid_order().last(),
         }
         .copied();
-        let Some(target) = target else {
+        self.move_grid_cursor(
+            target,
+            if target.is_some() {
+                crate::app::GridCursorIntent::Explicit(GridCursorMove::Move)
+            } else {
+                crate::app::GridCursorIntent::ExplicitKeep
+            },
+        );
+        if target.is_none() {
             return;
-        };
-
-        self.selected = Some(target);
+        }
         self.scroll_to_selected = true;
         self.update_last_selected_image();
         self.bump_input_seq(
@@ -6743,7 +6603,15 @@ impl App {
         if !self.vertical_reading_supported_idx(fs_idx) {
             return None;
         }
-        let next = self.spread_mode.next_in_spread_cycle();
+        let next = if self.extracted_result_surface().is_some() {
+            if self.spread_mode.is_spread() {
+                crate::settings::SpreadMode::Single
+            } else {
+                crate::settings::SpreadMode::Ltr.with_reading_direction(self.reading_direction)
+            }
+        } else {
+            self.spread_mode.next_in_spread_cycle()
+        };
         self.apply_fullscreen_spread_mode(ctx, fs_idx, next);
         // Report only the state actually applied: a rejected write keeps the old mode.
         if self.spread_mode == next {
@@ -6801,6 +6669,9 @@ impl App {
         if !self.grid_item_input_allowed() {
             return;
         }
+        // Accepted manual input wins over a pending Undo landing, including
+        // empty sets and edge no-ops. Automatic moves do not pass this boundary.
+        self.move_grid_cursor(self.selected, crate::app::GridCursorIntent::ExplicitKeep);
         let display_order = self.current_grid_order().to_vec();
         let vi_len = display_order.len();
         if vi_len == 0 {
@@ -6830,7 +6701,10 @@ impl App {
             return;
         };
         if self.selected != Some(new_sel) {
-            self.selected = Some(new_sel);
+            self.move_grid_cursor(
+                Some(new_sel),
+                crate::app::GridCursorIntent::Explicit(GridCursorMove::Move),
+            );
             self.scroll_to_selected = true;
             self.update_last_selected_image();
             self.bump_input_seq("gamepad_grid_nav", Some(&format!("sel={new_sel}")));
@@ -7777,6 +7651,373 @@ fn truncate_ring_overlay_label(text: &str, max_chars: usize) -> String {
     out
 }
 
+#[allow(dead_code)] // Geometry is inspected by the headless layout regression.
+#[derive(Clone, Copy)]
+struct GamepadRingPickerDrawnLayout {
+    panel: egui::Rect,
+    actual_panel: egui::Rect,
+    content: egui::Rect,
+    selected: Option<egui::Rect>,
+    drawn_rows: usize,
+}
+
+// Pure drawing shared by the real picker and its headless fixture. Input and
+// draft ownership stay in App; pagination only projects the current selection.
+fn draw_gamepad_ring_picker_overlay_layout(
+    ctx: &egui::Context,
+    full_rect: egui::Rect,
+    title: &str,
+    rows: &[(String, String)],
+    selected_row: usize,
+    drill: Option<(&str, &[String], usize)>,
+) -> GamepadRingPickerDrawnLayout {
+    let frame = egui::Frame::new()
+        .fill(egui::Color32::from_black_alpha(220))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)))
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::same(14));
+    let frame_margin = frame.total_margin().sum();
+    let panel_w = (full_rect.width() * 0.60)
+        .clamp(340.0, 560.0)
+        .min((full_rect.width() - 32.0).max(120.0));
+    let inner_w = (panel_w - frame_margin.x).max(1.0);
+    let layout_text = |text: &str, size, color| {
+        ctx.fonts_mut(|fonts| {
+            fonts.layout(
+                text.to_string(),
+                egui::FontId::proportional(size),
+                color,
+                inner_w,
+            )
+        })
+    };
+    let heading = layout_text(title, 17.0, egui::Color32::WHITE);
+    let subtitle =
+        drill.map(|(title, _, _)| layout_text(title, 14.0, egui::Color32::from_white_alpha(200)));
+    let footer = layout_text(
+        if drill.is_some() {
+            "上下:選択  A:選択  B/X:確定して閉じる"
+        } else {
+            "上下:選択  左右:変更  A:一覧  B/X:確定"
+        },
+        12.0,
+        egui::Color32::from_white_alpha(190),
+    );
+    let row_h = 32.0;
+    let count = drill.map_or(rows.len(), |(_, items, _)| items.len());
+    // The exact galleys are drawn below, with zero inter-widget spacing.
+    let chrome_h = frame_margin.y
+        + heading.size().y
+        + 6.0
+        + footer.size().y
+        + 8.0
+        + subtitle
+            .as_ref()
+            .map_or(0.0, |galley| galley.size().y + 8.0);
+    let panel_h =
+        (chrome_h + row_h * count.max(1) as f32).min((full_rect.height() - 32.0).max(120.0));
+    let panel_rect = egui::Rect::from_center_size(full_rect.center(), egui::vec2(panel_w, panel_h));
+    let visible_rows = (((panel_h - chrome_h).max(row_h) / row_h).floor() as usize)
+        .max(1)
+        .min(count.max(1));
+    let selected = drill
+        .map_or(selected_row, |(_, _, selected)| selected)
+        .min(count.saturating_sub(1));
+    let start = selected
+        .saturating_sub(visible_rows / 2)
+        .min(count.saturating_sub(visible_rows));
+    let end = (start + visible_rows).min(count);
+    let scrollbar_gutter = if count > visible_rows { 18.0 } else { 0.0 };
+    let mut content_rect = egui::Rect::NOTHING;
+    let mut selected_rect = None;
+    let area = egui::Area::new(egui::Id::new("gamepad_ring_picker_overlay"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(panel_rect.min)
+        .show(ctx, |ui| {
+            ui.set_min_size(panel_rect.size());
+            frame.show(ui, |ui| {
+                ui.set_width(inner_w);
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.label(heading.clone());
+                ui.add_space(6.0);
+                if let Some(subtitle) = subtitle.as_ref() {
+                    ui.label(subtitle.clone());
+                    ui.add_space(8.0);
+                }
+                let mut first_row_rect = None;
+                let mut last_row_rect = None;
+                for idx in start..end {
+                    let is_selected = idx == selected;
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), row_h),
+                        egui::Sense::hover(),
+                    );
+                    first_row_rect.get_or_insert(rect);
+                    last_row_rect = Some(rect);
+                    if is_selected {
+                        selected_rect = Some(rect);
+                    }
+                    let row_rect = egui::Rect::from_min_max(
+                        rect.min,
+                        egui::pos2((rect.max.x - scrollbar_gutter).max(rect.min.x), rect.max.y),
+                    );
+                    ui.painter().rect_filled(
+                        row_rect,
+                        5.0,
+                        if is_selected {
+                            egui::Color32::from_rgb(56, 94, 138)
+                        } else {
+                            egui::Color32::TRANSPARENT
+                        },
+                    );
+                    if let Some((_, items, _)) = drill {
+                        ui.painter().text(
+                            egui::pos2(row_rect.min.x + 10.0, row_rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            &items[idx],
+                            egui::FontId::proportional(if is_selected { 15.5 } else { 14.5 }),
+                            egui::Color32::from_white_alpha(if is_selected { 255 } else { 215 }),
+                        );
+                    } else {
+                        ui.painter().text(
+                            egui::pos2(row_rect.min.x + 10.0, row_rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            &rows[idx].0,
+                            egui::FontId::proportional(14.5),
+                            egui::Color32::from_white_alpha(if is_selected { 245 } else { 205 }),
+                        );
+                        ui.painter().text(
+                            egui::pos2(row_rect.max.x - 10.0, row_rect.center().y),
+                            egui::Align2::RIGHT_CENTER,
+                            &rows[idx].1,
+                            egui::FontId::proportional(14.5),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                }
+                if let (Some(first), Some(last)) = (first_row_rect, last_row_rect) {
+                    draw_picker_scrollbar(
+                        ui.painter(),
+                        egui::Rect::from_min_max(first.min, last.max),
+                        count,
+                        visible_rows,
+                        start,
+                    );
+                }
+                ui.add_space(8.0);
+                ui.label(footer.clone());
+                content_rect = ui.min_rect();
+            });
+        });
+    GamepadRingPickerDrawnLayout {
+        panel: panel_rect,
+        actual_panel: area.response.rect,
+        content: content_rect,
+        selected: selected_rect,
+        drawn_rows: end - start,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum GamepadListPickerHeading<'a> {
+    Title(&'a str),
+    FavoriteTabs(GamepadFavoritePickerTab),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_gamepad_list_picker_overlay_layout(
+    ctx: &egui::Context,
+    full_rect: egui::Rect,
+    id: egui::Id,
+    heading: GamepadListPickerHeading<'_>,
+    footer: &str,
+    len: usize,
+    cursor: GamepadListCursor,
+    empty_label: Option<&str>,
+    mut row_text: impl FnMut(usize) -> (String, String),
+) -> GamepadRingPickerDrawnLayout {
+    let frame = egui::Frame::new()
+        .fill(egui::Color32::from_black_alpha(224))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)))
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::same(14));
+    let frame_margin = frame.total_margin().sum();
+    let panel_w = (full_rect.width() * 0.62)
+        .clamp(360.0, 640.0)
+        .min((full_rect.width() - 32.0).max(120.0));
+    let inner_w = (panel_w - frame_margin.x).max(1.0);
+    let text_galley = |text: &str, size, color, width| {
+        ctx.fonts_mut(|fonts| {
+            fonts.layout(
+                text.to_string(),
+                egui::FontId::proportional(size),
+                color,
+                width,
+            )
+        })
+    };
+    let style = ctx.style();
+    let headings = match heading {
+        GamepadListPickerHeading::Title(title) => {
+            vec![text_galley(title, 17.0, egui::Color32::WHITE, inner_w)]
+        }
+        GamepadListPickerHeading::FavoriteTabs(tab) => {
+            let mut remaining_w = inner_w;
+            [
+                GamepadFavoritePickerTab::Favorites,
+                GamepadFavoritePickerTab::SmartFolders,
+            ]
+            .iter()
+            .map(|candidate| {
+                let active = *candidate == tab;
+                let mut job = egui::text::LayoutJob::simple(
+                    candidate.label().to_string(),
+                    egui::FontId::proportional(if active { 17.0 } else { 15.0 }),
+                    egui::Color32::from_white_alpha(if active { 255 } else { 180 }),
+                    remaining_w.max(1.0),
+                );
+                if active {
+                    job.sections[0].format.background = egui::Color32::from_rgb(56, 94, 138);
+                }
+                let galley = ctx.fonts_mut(|fonts| fonts.layout_job(job));
+                remaining_w -= galley.size().x + style.spacing.item_spacing.x + 10.0;
+                galley
+            })
+            .collect()
+        }
+    };
+    let heading_h = headings
+        .iter()
+        .map(|galley| galley.size().y)
+        .fold(0.0_f32, f32::max)
+        .max(
+            if matches!(heading, GamepadListPickerHeading::FavoriteTabs(_)) {
+                style.spacing.interact_size.y
+            } else {
+                0.0
+            },
+        );
+    let footer = text_galley(footer, 12.0, egui::Color32::from_white_alpha(190), inner_w);
+    let chrome_h = frame_margin.y + heading_h + 6.0 + 8.0 + footer.size().y;
+    let row_h = 34.0;
+    let desired_rows = len.min(GAMEPAD_LIST_VISIBLE_ROWS).max(1);
+    let panel_h =
+        (chrome_h + row_h * desired_rows as f32).min((full_rect.height() - 32.0).max(120.0));
+    let panel = egui::Rect::from_center_size(full_rect.center(), egui::vec2(panel_w, panel_h));
+    let visible_rows = (((panel_h - chrome_h).max(row_h) / row_h).floor() as usize)
+        .max(1)
+        .min(desired_rows);
+    let selected = cursor.selected.min(len.saturating_sub(1));
+    // Preserve the existing cursor window where it fits. A smaller viewport
+    // changes only its projection, keeping the selected entry reachable.
+    let start = cursor
+        .scroll_top
+        .min(len.saturating_sub(visible_rows))
+        .min(selected)
+        .max(selected.saturating_sub(visible_rows - 1));
+    let end = (start + visible_rows).min(len);
+    let scrollbar_gutter = if len > visible_rows { 18.0 } else { 0.0 };
+    let mut content = egui::Rect::NOTHING;
+    let mut selected_rect = None;
+    let area = egui::Area::new(id)
+        .order(egui::Order::Foreground)
+        .fixed_pos(panel.min)
+        .show(ctx, |ui| {
+            ui.set_min_size(panel.size());
+            frame.show(ui, |ui| {
+                ui.set_width(inner_w);
+                ui.spacing_mut().item_spacing.y = 0.0;
+                if matches!(heading, GamepadListPickerHeading::FavoriteTabs(_)) {
+                    ui.horizontal(|ui| {
+                        for galley in &headings {
+                            ui.label(galley.clone());
+                            ui.add_space(10.0);
+                        }
+                    });
+                } else {
+                    ui.label(headings[0].clone());
+                }
+                ui.add_space(6.0);
+                let mut first_row_rect = None;
+                let mut last_row_rect = None;
+                if len == 0 {
+                    if let Some(label) = empty_label {
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), row_h),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            label,
+                            egui::FontId::proportional(14.5),
+                            egui::Color32::from_white_alpha(180),
+                        );
+                    }
+                }
+                for idx in start..end {
+                    let (label, value) = row_text(idx);
+                    let is_selected = idx == selected;
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), row_h),
+                        egui::Sense::hover(),
+                    );
+                    first_row_rect.get_or_insert(rect);
+                    last_row_rect = Some(rect);
+                    if is_selected {
+                        selected_rect = Some(rect);
+                    }
+                    let row_rect = egui::Rect::from_min_max(
+                        rect.min,
+                        egui::pos2((rect.max.x - scrollbar_gutter).max(rect.min.x), rect.max.y),
+                    );
+                    ui.painter().rect_filled(
+                        row_rect,
+                        5.0,
+                        if is_selected {
+                            egui::Color32::from_rgb(56, 94, 138)
+                        } else {
+                            egui::Color32::TRANSPARENT
+                        },
+                    );
+                    ui.painter().text(
+                        egui::pos2(row_rect.min.x + 10.0, row_rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        label,
+                        egui::FontId::proportional(if is_selected { 15.5 } else { 14.5 }),
+                        egui::Color32::from_white_alpha(if is_selected { 255 } else { 220 }),
+                    );
+                    ui.painter().text(
+                        egui::pos2(row_rect.max.x - 10.0, row_rect.center().y),
+                        egui::Align2::RIGHT_CENTER,
+                        value,
+                        egui::FontId::proportional(12.5),
+                        egui::Color32::from_white_alpha(if is_selected { 235 } else { 180 }),
+                    );
+                }
+                if let (Some(first), Some(last)) = (first_row_rect, last_row_rect) {
+                    draw_picker_scrollbar(
+                        ui.painter(),
+                        egui::Rect::from_min_max(first.min, last.max),
+                        len,
+                        visible_rows,
+                        start,
+                    );
+                }
+                ui.add_space(8.0);
+                ui.label(footer.clone());
+                content = ui.min_rect();
+            });
+        });
+    GamepadRingPickerDrawnLayout {
+        panel,
+        actual_panel: area.response.rect,
+        content,
+        selected: selected_rect,
+        drawn_rows: end - start,
+    }
+}
+
 fn draw_picker_scrollbar(
     painter: &egui::Painter,
     rows_rect: egui::Rect,
@@ -8299,6 +8540,514 @@ fn cycle_video_playback_speed(current: f64, delta: i32) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        GAMEPAD_LIST_VISIBLE_ROWS, GamepadListPickerHeading,
+        draw_gamepad_list_picker_overlay_layout, draw_gamepad_ring_picker_overlay_layout,
+    };
+
+    #[test]
+    fn calculated_gamepad_list_picker_siblings_fit_and_selected_end_is_reachable() {
+        use crate::test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
+        use std::sync::{Arc, Mutex};
+        for kind in 0..4 {
+            for len in [0_usize, 6, 20] {
+                for ppp in [1.0, 2.0] {
+                    for size in [egui::vec2(720.0, 900.0), egui::vec2(360.0, 240.0)] {
+                        let captured = Arc::new(Mutex::new(None));
+                        let captured_draw = Arc::clone(&captured);
+                        let mut fonts_ready = false;
+                        let mut harness = crate::test_ui::builder()
+                            .with_size(size)
+                            .with_pixels_per_point(ppp)
+                            .build(move |ctx| {
+                                if !fonts_ready {
+                                    crate::ui_fonts::configure_fonts(ctx);
+                                    fonts_ready = true;
+                                    ctx.request_repaint();
+                                    return;
+                                }
+                                let (heading, footer, empty) = match kind {
+                                    0 => (
+                                        GamepadListPickerHeading::FavoriteTabs(
+                                            GamepadFavoritePickerTab::Favorites,
+                                        ),
+                                        "左右:タブ切替  上下:選択  A:移動  B/Start:閉じる",
+                                        Some("登録されていません"),
+                                    ),
+                                    1 => (
+                                        GamepadListPickerHeading::FavoriteTabs(
+                                            GamepadFavoritePickerTab::SmartFolders,
+                                        ),
+                                        "左右:タブ切替  上下:選択  A:移動  B/Start:閉じる",
+                                        Some("登録されていません"),
+                                    ),
+                                    2 => (
+                                        GamepadListPickerHeading::Title(
+                                            "ブックマーク / チャプター",
+                                        ),
+                                        "上下:選択  A:移動  B/Select:閉じる",
+                                        None,
+                                    ),
+                                    _ => (
+                                        GamepadListPickerHeading::Title("場所"),
+                                        "上下:選択  A:移動  B/Select:閉じる",
+                                        None,
+                                    ),
+                                };
+                                *captured_draw.lock().unwrap() =
+                                    Some(draw_gamepad_list_picker_overlay_layout(
+                                        ctx,
+                                        egui::Rect::from_min_size(egui::Pos2::ZERO, size),
+                                        egui::Id::new("list_picker_geometry_fixture"),
+                                        heading,
+                                        footer,
+                                        len,
+                                        GamepadListCursor::new(len.saturating_sub(1)),
+                                        empty,
+                                        |idx| (format!("項目 {idx}"), "値".into()),
+                                    ));
+                            });
+                        harness.run();
+                        let layout = captured.lock().unwrap().unwrap();
+                        let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                        let inner = layout.panel.shrink(15.0);
+                        ScrollLayout {
+                            inner,
+                            content: layout.content.size(),
+                            offset: egui::Vec2::ZERO,
+                        }
+                        .assert_height(
+                            HeightExpectation::Fits,
+                            bounds,
+                            ppp,
+                        );
+                        assert!(
+                            inner.expand(1.0 / ppp).contains_rect(layout.content),
+                            "kind {kind}: content escaped calculated panel"
+                        );
+                        assert!(
+                            layout
+                                .panel
+                                .expand(1.0 / ppp)
+                                .contains_rect(layout.actual_panel),
+                            "kind {kind}: Area grew beyond calculated height"
+                        );
+                        if len == 0 {
+                            assert!(layout.selected.is_none());
+                            assert_eq!(layout.drawn_rows, 0);
+                        } else {
+                            let selected =
+                                layout.selected.expect("selected final entry must be drawn");
+                            // Area::fixed_pos snaps its origin to physical pixels.
+                            // In particular 720 * .62 yields a 446.4pt panel,
+                            // whose planned left edge is 136.8pt at 100%.
+                            // Apply the same one-pixel budget as the content and
+                            // Area checks; larger errors still indicate clipping.
+                            if !inner.contains_rect(selected) {
+                                eprintln!(
+                                    "picker pixel rounding: kind={kind}, len={len}, size={size:?}, ppp={ppp}, inner={inner:?}, selected={selected:?}, planned={:?}, actual={:?}",
+                                    layout.panel, layout.actual_panel
+                                );
+                            }
+                            assert!(
+                                inner.expand(1.0 / ppp).contains_rect(selected),
+                                "final entry clipped: kind={kind}, len={len}, size={size:?}, ppp={ppp}, inner={inner:?}, selected={selected:?}, planned={:?}, actual={:?}",
+                                layout.panel,
+                                layout.actual_panel,
+                            );
+                            if size.y == 900.0 {
+                                assert_eq!(
+                                    layout.drawn_rows,
+                                    len.min(GAMEPAD_LIST_VISIBLE_ROWS),
+                                    "ample space must keep the existing row limit"
+                                );
+                            } else {
+                                assert!(
+                                    (1..len).contains(&layout.drawn_rows),
+                                    "constrained picker must paginate"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn calculated_gamepad_ring_picker_height_fits_and_selected_end_is_reachable() {
+        use crate::test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
+        use std::sync::{Arc, Mutex};
+        for ppp in [1.0, 2.0] {
+            for size in [egui::vec2(720.0, 900.0), egui::vec2(360.0, 240.0)] {
+                for drill in [false, true] {
+                    let captured = Arc::new(Mutex::new(None));
+                    let captured_draw = Arc::clone(&captured);
+                    let rows = (0..14)
+                        .map(|idx| (format!("設定 {idx}"), "現在の値".into()))
+                        .collect::<Vec<_>>();
+                    let items = (0..14).map(|idx| format!("項目 {idx}")).collect::<Vec<_>>();
+                    let mut fonts_ready = false;
+                    let mut harness = crate::test_ui::builder()
+                        .with_size(size)
+                        .with_pixels_per_point(ppp)
+                        .build(move |ctx| {
+                            if !fonts_ready {
+                                crate::ui_fonts::configure_fonts(ctx);
+                                fonts_ready = true;
+                                ctx.request_repaint();
+                                return;
+                            }
+                            let full_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                            *captured_draw.lock().unwrap() =
+                                Some(draw_gamepad_ring_picker_overlay_layout(
+                                    ctx,
+                                    full_rect,
+                                    "ピッカー / 静止画の表示と補正と画質設定を確認する見出し",
+                                    &rows,
+                                    13,
+                                    drill.then_some((
+                                        "項目一覧の表示と補正と画質設定を確認する長い見出し",
+                                        items.as_slice(),
+                                        13,
+                                    )),
+                                ));
+                        });
+                    harness.run();
+                    let layout = captured.lock().unwrap().unwrap();
+                    if size.y == 900.0 {
+                        assert_eq!(layout.drawn_rows, 14, "ample space must show every row");
+                    } else {
+                        assert!(
+                            (1..14).contains(&layout.drawn_rows),
+                            "constrained picker must paginate"
+                        );
+                    }
+                    let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                    let inner = layout.panel.shrink(15.0);
+                    ScrollLayout {
+                        inner,
+                        content: layout.content.size(),
+                        offset: egui::Vec2::ZERO,
+                    }
+                    .assert_height(HeightExpectation::Fits, bounds, ppp);
+                    assert!(
+                        inner.expand(1.0 / ppp).contains_rect(layout.content),
+                        "content escaped calculated panel"
+                    );
+                    assert!(
+                        layout
+                            .panel
+                            .expand(1.0 / ppp)
+                            .contains_rect(layout.actual_panel),
+                        "Area grew beyond calculated height"
+                    );
+                    assert!(
+                        inner.contains_rect(
+                            layout.selected.expect("selected final item must be drawn")
+                        ),
+                        "final item clipped"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rating_grid_undo_and_redo_manual_pad_choice_wins_before_replay_in_both_views() {
+        use crate::app::rating_membership_tests::rating_grid_history_manual_input_case;
+        use crate::settings::GridViewMode;
+        for view in [GridViewMode::Thumbnail, GridViewMode::Details] {
+            for redo in [false, true] {
+                for dir in [PadDir::Left, PadDir::Right] {
+                    rating_grid_history_manual_input_case(view, redo, |app| {
+                        app.handle_gamepad_direction_for_grid(dir);
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rating_undo_grid_pad_moves_edges_and_empty_sets_cancel_held_restore() {
+        use crate::app::rating_membership_tests::rating_undo_grid_input_case;
+        use crate::settings::GridViewMode;
+        for view in [GridViewMode::Thumbnail, GridViewMode::Details] {
+            for (dir, start, target) in [
+                (PadDir::Right, 0, 1),
+                (PadDir::Right, 2, 2),
+                (PadDir::Left, 1, 0),
+                (PadDir::Left, 0, 0),
+                (PadDir::Down, 0, 1),
+                (PadDir::Down, 2, 2),
+                (PadDir::Up, 1, 0),
+                (PadDir::Up, 0, 0),
+            ] {
+                rating_undo_grid_input_case(view, Some(start), Some(target), true, |app| {
+                    app.handle_gamepad_direction_for_grid(dir);
+                });
+            }
+            for dir in [PadDir::Right, PadDir::Left, PadDir::Down, PadDir::Up] {
+                rating_undo_grid_input_case(view, None, None, true, |app| {
+                    app.handle_gamepad_direction_for_grid(dir);
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn rating_undo_grid_ring_edge_moves_and_noops_cancel_held_restore() {
+        use crate::app::rating_membership_tests::rating_undo_grid_input_case;
+        use crate::ring_shortcut::{RingActionId, RingShortcutContext};
+        use crate::settings::GridViewMode;
+        for view in [GridViewMode::Thumbnail, GridViewMode::Details] {
+            for (action, start, target) in [
+                (RingActionId::GridMoveFirst, Some(1), Some(0)),
+                (RingActionId::GridMoveFirst, Some(0), Some(0)),
+                (RingActionId::GridMoveLast, Some(1), Some(2)),
+                (RingActionId::GridMoveLast, Some(2), Some(2)),
+                (RingActionId::GridMoveFirst, None, None),
+                (RingActionId::GridMoveLast, None, None),
+            ] {
+                rating_undo_grid_input_case(view, start, target, true, |app| {
+                    let _ = app.apply_ring_action(
+                        &egui::Context::default(),
+                        RingShortcutContext::Grid,
+                        action,
+                        "rating-undo-grid-edge-test",
+                    );
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn rating_undo_grid_blocked_pad_and_ring_moves_keep_held_restore() {
+        use crate::app::rating_membership_tests::rating_undo_grid_input_case;
+        use crate::filename_stack::StackView;
+        use crate::filename_stack_ui::StackReturnState;
+        use crate::ring_shortcut::{RingActionId, RingShortcutContext};
+        use crate::settings::GridViewMode;
+        for ring in [false, true] {
+            rating_undo_grid_input_case(GridViewMode::Thumbnail, Some(1), Some(1), false, |app| {
+                let view = std::sync::Arc::new(StackView::build(
+                    std::path::PathBuf::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    app.settings.stack_separator,
+                    app.settings.sort_order,
+                ));
+                app.stack_view = Some(std::sync::Arc::clone(&view));
+                app.stack_return_state = Some(StackReturnState::Refreshing { view });
+                if ring {
+                    let _ = app.apply_ring_action(
+                        &egui::Context::default(),
+                        RingShortcutContext::Grid,
+                        RingActionId::GridMoveFirst,
+                        "rating-undo-blocked-grid-test",
+                    );
+                } else {
+                    app.handle_gamepad_direction_for_grid(PadDir::Right);
+                }
+                app.stack_return_state = None;
+                app.stack_view = None;
+            });
+        }
+    }
+
+    #[test]
+    fn rating_grid_ring_origin_is_cancelled_by_home_before_picker_commit_in_both_views() {
+        use super::*;
+        let _input_guard = crate::key_input::lock_test_input();
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        for view in [GridViewMode::Thumbnail, GridViewMode::Details] {
+            let mut app = crate::app::setup_app_for_test();
+            let paths = [app.tmp.path().join("a.png"), app.tmp.path().join("b.png")];
+            for path in &paths {
+                image::RgbaImage::from_pixel(4, 4, image::Rgba([90, 100, 110, 255]))
+                    .save(path)
+                    .unwrap();
+            }
+            app.items = paths.iter().cloned().map(GridItem::Image).collect();
+            app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending; 2];
+            app.visible_indices = vec![0, 1];
+            app.details_order = vec![0, 1];
+            app.settings.grid_view_mode = view;
+            app.settings.details_sort_key = crate::settings::DetailsSortKey::Name;
+            app.settings.rating_filter = [false, false, false, true, false, false];
+            app.move_grid_cursor(Some(1), crate::app::GridCursorIntent::Automatic);
+            for idx in 0..2 {
+                let key = app.rating_path_key(idx).unwrap();
+                app.rating_db.as_ref().unwrap().set(&key, 3).unwrap();
+                app.rating_cache.insert(idx, 3);
+            }
+            let mut picker = app.build_ring_picker_state(RingShortcutContext::Grid);
+            picker.item_rating = 0;
+            mark_picker_dirty(&mut picker, RingPickerRowId::ItemRating);
+            app.ring_picker = Some(picker.clone());
+            app.preview_picker_item_rating(&picker, 0);
+            assert_eq!(app.selected, Some(1));
+            assert_eq!(app.visible_indices, vec![0, 1]);
+            super::super::rating_membership_tests::press_grid_key(
+                &mut app,
+                egui::Key::Home,
+                egui::Modifiers::NONE,
+            );
+            assert_eq!(app.selected, Some(0));
+            assert!(matches!(
+                app.ring_picker
+                    .as_ref()
+                    .unwrap()
+                    .rating_origin
+                    .as_ref()
+                    .unwrap()
+                    .target,
+                crate::rating_membership::RatingOriginTarget::ValueOnly
+            ));
+            app.commit_ring_picker(&egui::Context::default());
+            assert_eq!(app.visible_indices, vec![0]);
+            app.apply_meta_undo();
+            assert_eq!(app.visible_indices, vec![0, 1]);
+            assert_eq!(app.selected, Some(0));
+            assert_eq!(app.grid_click_selection_anchor.unwrap().index, 0);
+            app.apply_meta_redo();
+            assert_eq!(app.selected, Some(0));
+            assert_eq!(app.grid_click_selection_anchor.unwrap().index, 0);
+        }
+    }
+
+    #[test]
+    fn rating_membership_ring_success_receipt_precedes_publication_and_final_noop() {
+        use super::*;
+        use crate::grid_item::ThumbnailState;
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let paths = [app.tmp.path().join("a.jpg"), app.tmp.path().join("b.jpg")];
+        for path in &paths {
+            std::fs::write(path, b"image").unwrap();
+        }
+        app.items = paths.iter().cloned().map(GridItem::Image).collect();
+        app.thumbnails = vec![ThumbnailState::Pending; 2];
+        app.visible_indices = vec![0, 1];
+        app.selected = Some(0);
+        app.settings.rating_filter = [false, false, false, true, false, false];
+        for idx in 0..2 {
+            let key = app.rating_path_key(idx).unwrap();
+            app.rating_db
+                .as_ref()
+                .unwrap()
+                .set_user_rating(&key, 3, app.rating_meta_for_idx(idx).as_ref())
+                .unwrap();
+            app.rating_cache.insert(idx, 3);
+        }
+        let mut picker = app.build_ring_picker_state(RingShortcutContext::Grid);
+        picker.item_rating = 0;
+        mark_picker_dirty(&mut picker, RingPickerRowId::ItemRating);
+        app.ring_picker = Some(picker.clone());
+        app.preview_picker_item_rating(&picker, 0);
+        assert_eq!(
+            app.visible_indices,
+            vec![0, 1],
+            "own receipt is installed before exclusion publication"
+        );
+        assert_eq!(app.rating_cache[&0], 0);
+        let generation = app.rating_session_write_generation;
+        let receipt = &app.ring_picker.as_ref().unwrap().preview_recipe.entries[0];
+        assert_eq!(
+            (receipt.before, receipt.after, receipt.write_generation),
+            (3, 0, generation)
+        );
+        app.commit_ring_picker(&egui::Context::default());
+        assert_eq!(
+            app.rating_session_write_generation, generation,
+            "confirm does not resave unchanged preview"
+        );
+        assert!(app.ring_picker.is_none());
+        assert_eq!(app.visible_indices, vec![1]);
+        assert_eq!(app.meta_undo.undo_len(), 1);
+    }
+
+    #[test]
+    fn rating_membership_forced_ring_end_records_only_own_success_after_external_write() {
+        use super::*;
+        use crate::grid_item::ThumbnailState;
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let path = app.tmp.path().join("a.jpg");
+        app.items = vec![GridItem::Image(path.clone())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        let key = crate::adjustment_db::normalize_path(&path);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&key, 3, None)
+            .unwrap();
+        app.rating_cache.insert(0, 3);
+        let mut picker = app.build_ring_picker_state(RingShortcutContext::Grid);
+        picker.item_rating = 0;
+        mark_picker_dirty(&mut picker, RingPickerRowId::ItemRating);
+        app.ring_picker = Some(picker.clone());
+        app.preview_picker_item_rating(&picker, 0);
+        app.write_user_rating_shared(&key, 2, None).unwrap();
+        let generation = app.rating_session_write_generation;
+        app.finish_rating_picker_for_manual_navigation();
+        assert_eq!(app.rating_session_write_generation, generation);
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 2);
+        let Some(crate::undo_stack::UndoEntry::Rating { changes, .. }) = app.meta_undo.peek_undo()
+        else {
+            panic!("own success needs Undo");
+        };
+        assert_eq!((changes[0].before, changes[0].after), (3, 0));
+        assert!(app.ring_picker.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mixed_path_favorite_picker_direct_navigation_preserves_saved_record() {
+        for folder_name in [
+            "mixed-input",
+            "mixed-input.zip",
+            "mixed-input.pdf",
+            "mixed-input.epub",
+            "mixed-input.7z",
+        ] {
+            crate::app::tests::assert_mixed_path_favorite_direct_navigation(
+                folder_name,
+                "gamepad-picker",
+                |app, ctx| {
+                    use super::{PadAction, PadActionKind};
+                    use crate::ring_shortcut::{
+                        GamepadFavoritePickerState, GamepadFavoritePickerTab, GamepadListCursor,
+                    };
+                    app.gamepad_favorite_picker = Some(GamepadFavoritePickerState {
+                        tab: GamepadFavoritePickerTab::Favorites,
+                        favorites: GamepadListCursor::new(0),
+                        smart_folders: GamepadListCursor::new(0),
+                    });
+                    // The real South-press handler, without the native foreground-window
+                    // gate in dispatch_gamepad_batch (this is a headless regression).
+                    let nav = app
+                        .dispatch_gamepad_favorite_picker_button(
+                            ctx,
+                            PadAction {
+                                button: crate::gamepad::PadButton::South,
+                                kind: PadActionKind::Press,
+                            },
+                        )
+                        .unwrap();
+                    let crate::ui_main::AddressBarNav::Direct(path, intent) = nav else {
+                        panic!("favorite confirmation must produce a direct navigation");
+                    };
+                    assert!(app.gamepad_favorite_picker.is_none());
+                    (path, intent)
+                },
+            );
+        }
+    }
+
     #[test]
     fn bookmark_picker_opens_on_its_supported_active_sort() {
         let mut app = crate::app::setup_app_for_test();
@@ -8608,26 +9357,40 @@ mod tests {
     fn sidecar_restore_ends_gamepad_picker_without_replaying_its_live_write() {
         use crate::gamepad::{PadAxis, PadEvent};
 
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let ctx = egui::Context::default();
         let mut app = crate::app::setup_app_for_test();
-        let key = "C:/fixture/page.jpg".to_string();
+        let path = app.tmp.path().join("page.jpg");
+        std::fs::write(&path, b"image").unwrap();
+        app.items = vec![crate::grid_item::GridItem::Image(path)];
+        app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        let key = app.rating_path_key(0).unwrap();
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&key, 1, app.rating_meta_for_idx(0).as_ref())
+            .unwrap();
+        app.rating_cache.insert(0, 1);
         let mut picker = app.build_ring_picker_state(RingShortcutContext::Grid);
         picker.dirty_rows.push(RingPickerRowId::ItemRating);
-        picker
-            .original
-            .item_rating_records
-            .push(RingPickerRatingTarget {
-                path_key: key.clone(),
-                source_path: std::path::PathBuf::from(&key),
-                meta: None,
-                xmp_target: None,
-                before: 1,
-                session_generation: 0,
-            });
         picker.item_rating = 4;
-        app.record_rating_session_write(key, 4, true);
+        app.ring_picker = Some(picker.clone());
+        app.preview_picker_item_rating(&picker, 4);
         let published_generation = app.rating_session_write_generation;
-        app.ring_picker = Some(picker);
+        assert_eq!(app.get_rating(0), 4);
+        assert_eq!(
+            app.ring_picker
+                .as_ref()
+                .unwrap()
+                .preview_recipe
+                .entries
+                .len(),
+            1,
+            "the real successful preview belongs to this picker"
+        );
         app.settings.gamepad_enabled = true;
         app.gamepad
             .push_for_test(PadEvent::ButtonPressed(PadButton::DPadRight));
@@ -8664,6 +9427,7 @@ mod tests {
             app.meta_undo.can_undo(),
             "the already-published live preview remains undoable"
         );
+        assert_eq!(app.meta_undo.undo_len(), 1);
 
         app.sidecar_restore = None;
         let resumed = app.dispatch_gamepad_batch(&ctx, GamepadFrameBatch::empty_for_test());
@@ -9626,20 +10390,45 @@ mod next_input_tests {
                 (
                     vec!["Width", "Height"],
                     FullscreenFitMode::Page,
-                    vec![FullscreenFitMode::Original, FullscreenFitMode::Page],
+                    vec![
+                        FullscreenFitMode::Original,
+                        FullscreenFitMode::SpecifiedScale,
+                        FullscreenFitMode::Page,
+                    ],
                 ),
                 (
                     vec!["Width", "Height"],
                     FullscreenFitMode::Width,
-                    vec![FullscreenFitMode::Page, FullscreenFitMode::Original],
+                    vec![
+                        FullscreenFitMode::Page,
+                        FullscreenFitMode::Original,
+                        FullscreenFitMode::SpecifiedScale,
+                    ],
                 ),
                 (
                     vec!["Page", "Width", "Height"],
                     FullscreenFitMode::Page,
-                    vec![FullscreenFitMode::Original, FullscreenFitMode::Original],
+                    vec![
+                        FullscreenFitMode::Original,
+                        FullscreenFitMode::SpecifiedScale,
+                        FullscreenFitMode::Original,
+                    ],
                 ),
                 (
                     vec!["Page", "Width", "Height"],
+                    FullscreenFitMode::Original,
+                    vec![
+                        FullscreenFitMode::SpecifiedScale,
+                        FullscreenFitMode::Original,
+                    ],
+                ),
+                (
+                    vec!["Page", "Width", "Height", "SpecifiedScale"],
+                    FullscreenFitMode::Page,
+                    vec![FullscreenFitMode::Original, FullscreenFitMode::Original],
+                ),
+                (
+                    vec!["Page", "Width", "Height", "SpecifiedScale"],
                     FullscreenFitMode::Original,
                     vec![FullscreenFitMode::Original, FullscreenFitMode::Original],
                 ),
@@ -9683,6 +10472,7 @@ mod next_input_tests {
                     FullscreenFitMode::Width,
                     FullscreenFitMode::Height,
                     FullscreenFitMode::Original,
+                    FullscreenFitMode::SpecifiedScale,
                     FullscreenFitMode::Page,
                 ] {
                     dispatch(

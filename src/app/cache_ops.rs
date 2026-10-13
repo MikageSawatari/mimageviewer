@@ -874,7 +874,7 @@ impl App {
                                 *pdf_file_size,
                             );
                             if page_count > 0 && !parent_present {
-                                // bulk cache creator は background なので epoch=0
+                                // bulk cache creator は background なので Unscoped
                                 // + AbortOnCancel (cancel = ユーザ明示中断意図)
                                 let rendered = if let Some(read) = epub_read.as_ref() {
                                     crate::pdf_loader::render_page_with_read_target(
@@ -885,7 +885,7 @@ impl App {
                                         pw_ref,
                                         None,
                                         crate::pdf_loader::JobPriority::Normal,
-                                        0,
+                                        crate::pdf_loader::PdfRenderValidity::Unscoped,
                                         crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
                                     )
                                 } else {
@@ -896,7 +896,7 @@ impl App {
                                         pw_ref,
                                         None,
                                         crate::pdf_loader::JobPriority::Normal,
-                                        0,
+                                        crate::pdf_loader::PdfRenderValidity::Unscoped,
                                         crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
                                     )
                                 };
@@ -969,7 +969,7 @@ impl App {
                                 continue;
                             }
                             // render_page がパスワード不正時に Err を返すのでそのままスキップ
-                            // bulk cache creator は background なので epoch=0 + AbortOnCancel
+                            // bulk cache creator は background なので Unscoped + AbortOnCancel
                             if let Ok(res) = if let Some(read) = epub_read.as_ref() {
                                 crate::pdf_loader::render_page_with_read_target(
                                     pdf_path,
@@ -979,7 +979,7 @@ impl App {
                                     pw_ref,
                                     None,
                                     crate::pdf_loader::JobPriority::Normal,
-                                    0,
+                                    crate::pdf_loader::PdfRenderValidity::Unscoped,
                                     crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
                                 )
                             } else {
@@ -990,7 +990,7 @@ impl App {
                                     pw_ref,
                                     None,
                                     crate::pdf_loader::JobPriority::Normal,
-                                    0,
+                                    crate::pdf_loader::PdfRenderValidity::Unscoped,
                                     crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
                                 )
                             } {

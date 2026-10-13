@@ -1407,6 +1407,7 @@ pub enum KeyAction {
     GlobalLocalSearch,
     GlobalFavSearch,
     GlobalMetadataSearch,
+    GlobalEverythingSearch,
     GlobalOpenFolder,
     ToggleDetachedViewerMode,
     ToggleAlwaysOnTop,
@@ -1727,6 +1728,8 @@ pub enum KeyAction {
     FsBgCycle,
     FsPin,
     FsSpreadSingle,
+    FsViewSpread,
+    FsViewLandscapeSplit,
     FsSpreadLtr,
     FsSpreadLtrCover,
     FsSpreadRtl,
@@ -1972,6 +1975,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GlobalLocalSearch,
     KeyAction::GlobalFavSearch,
     KeyAction::GlobalMetadataSearch,
+    KeyAction::GlobalEverythingSearch,
     KeyAction::GlobalOpenFolder,
     KeyAction::ToggleDetachedViewerMode,
     KeyAction::ToggleAlwaysOnTop,
@@ -2292,6 +2296,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsBgCycle,
     KeyAction::FsPin,
     KeyAction::FsSpreadSingle,
+    KeyAction::FsViewSpread,
+    KeyAction::FsViewLandscapeSplit,
     KeyAction::FsSpreadLtr,
     KeyAction::FsSpreadLtrCover,
     KeyAction::FsSpreadRtl,
@@ -2621,6 +2627,7 @@ pub enum MenuCommandId {
     FileOpenFolder,
     FileReadingHistory,
     FileLocalSearch,
+    GlobalEverythingSearch,
     FileReload,
     FileMetadataExport,
     FileMetadataImport,
@@ -2677,6 +2684,7 @@ impl MenuCommandId {
         Self::FileOpenFolder,
         Self::FileReadingHistory,
         Self::FileLocalSearch,
+        Self::GlobalEverythingSearch,
         Self::FileReload,
         Self::FileMetadataExport,
         Self::FileMetadataImport,
@@ -2733,6 +2741,7 @@ impl MenuCommandId {
             MenuCommandId::FileOpenFolder => "FileOpenFolder",
             MenuCommandId::FileReadingHistory => "FileReadingHistory",
             MenuCommandId::FileLocalSearch => "FileLocalSearch",
+            MenuCommandId::GlobalEverythingSearch => "GlobalEverythingSearch",
             MenuCommandId::FileReload => "FileReload",
             MenuCommandId::FileMetadataExport => "FileMetadataExport",
             MenuCommandId::FileMetadataImport => "FileMetadataImport",
@@ -2827,6 +2836,12 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
         parent: TopMenuId::File,
         label: "現在地フィルタ",
         action: Some(KeyAction::GlobalLocalSearch),
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::GlobalEverythingSearch,
+        parent: TopMenuId::File,
+        label: "Everything ファイル名検索…",
+        action: Some(KeyAction::GlobalEverythingSearch),
     },
     MenuCommandSpec {
         id: MenuCommandId::FileReload,
@@ -3969,6 +3984,7 @@ impl KeyAction {
             GlobalLocalSearch => "GlobalLocalSearch",
             GlobalFavSearch => "GlobalFavSearch",
             GlobalMetadataSearch => "GlobalMetadataSearch",
+            GlobalEverythingSearch => "GlobalEverythingSearch",
             GlobalOpenFolder => "GlobalOpenFolder",
             ToggleDetachedViewerMode => "ToggleDetachedViewerMode",
             ToggleAlwaysOnTop => "ToggleAlwaysOnTop",
@@ -4291,6 +4307,8 @@ impl KeyAction {
             FsBgCycle => "FsBgCycle",
             FsPin => "FsPin",
             FsSpreadSingle => "FsSpreadSingle",
+            FsViewSpread => "FsViewSpread",
+            FsViewLandscapeSplit => "FsViewLandscapeSplit",
             FsSpreadLtr => "FsSpreadLtr",
             FsSpreadLtrCover => "FsSpreadLtrCover",
             FsSpreadRtl => "FsSpreadRtl",
@@ -4691,6 +4709,7 @@ impl KeyAction {
             GlobalLocalSearch => "現在地の一覧を絞り込み検索する",
             GlobalFavSearch => "お気に入りフォルダを横断検索する",
             GlobalMetadataSearch => "全フォルダのメタデータを検索する",
+            GlobalEverythingSearch => "Everything でファイル名を検索する",
             GlobalOpenFolder => "フォルダを開くダイアログを表示する",
             ToggleDetachedViewerMode => "画像・動画ビューアの別ウィンドウモードを切り替える",
             ToggleAlwaysOnTop => "常に最前面を切り替える",
@@ -5021,6 +5040,8 @@ impl KeyAction {
             FsBgCycle => "透過背景色を切り替える",
             FsPin => "現在の項目を代表サムネイルに固定または解除する",
             FsSpreadSingle => "単ページ表示に切り替える",
+            FsViewSpread => "本の読む方向で見開き表示に切り替える",
+            FsViewLandscapeSplit => "本の読む方向で横長ページを分割表示する",
             FsSpreadLtr => "左開き見開き表示に切り替える",
             FsSpreadLtrCover => "左開き表紙単独の見開き表示に切り替える",
             FsSpreadRtl => "右開き見開き表示に切り替える",
@@ -5253,7 +5274,8 @@ impl KeyAction {
             | ToggleDetachedViewerMode
             | ToggleAlwaysOnTop
             | HelpShowContextShortcuts => KeyContext::Global,
-            GridFavoritePrev
+            GlobalEverythingSearch
+            | GridFavoritePrev
             | GridFavoriteNext
             | GridManageFavorites
             | GridBookPrev
@@ -5561,6 +5583,8 @@ impl KeyAction {
             | FsBgCycle
             | FsPin
             | FsSpreadSingle
+            | FsViewSpread
+            | FsViewLandscapeSplit
             | FsSpreadLtr
             | FsSpreadLtrCover
             | FsSpreadRtl
@@ -5757,6 +5781,7 @@ impl KeyAction {
             | ToggleDetachedViewerMode
             | ToggleAlwaysOnTop
             | HelpShowContextShortcuts
+            | GlobalEverythingSearch
             | GridFavoritePrev
             | GridFavoriteNext
             | GridManageFavorites
@@ -6069,6 +6094,8 @@ impl KeyAction {
             | FsBgCycle
             | FsPin
             | FsSpreadSingle
+            | FsViewSpread
+            | FsViewLandscapeSplit
             | FsSpreadLtr
             | FsSpreadLtrCover
             | FsSpreadRtl
@@ -6297,6 +6324,7 @@ impl KeyAction {
             GlobalLocalSearch => ChordList::one(Chord::ctrl(F)),
             GlobalFavSearch => ChordList::one(Chord::ctrl(S)),
             GlobalMetadataSearch => ChordList::one(Chord::ctrl(G)),
+            GlobalEverythingSearch => ChordList::one(Chord::ctrl(R)),
             GlobalOpenFolder => ChordList::one(Chord::ctrl(O)),
             ToggleDetachedViewerMode => ChordList::one(Chord::key(F12)),
             ToggleAlwaysOnTop => ChordList::EMPTY,
@@ -6610,6 +6638,7 @@ impl KeyAction {
             FsBgCycle => ChordList::one(Chord::shift(B)),
             FsPin => ChordList::one(Chord::key(P)),
             FsSpreadSingle => digit_pair(Num1, Numpad1),
+            FsViewSpread | FsViewLandscapeSplit => ChordList::EMPTY,
             FsSpreadLtr => digit_pair(Num2, Numpad2),
             FsSpreadLtrCover => digit_pair(Num3, Numpad3),
             FsSpreadRtl => digit_pair(Num4, Numpad4),
@@ -9694,6 +9723,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn generic_book_view_actions_are_assignable_without_default_bindings() {
+        let mut settings = KeymapSettings::default();
+        for (action, key) in [
+            (KeyAction::FsViewSpread, KeyName::F13),
+            (KeyAction::FsViewLandscapeSplit, KeyName::F14),
+        ] {
+            assert_eq!(action.context(), KeyContext::FsImage);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert_eq!(KeyAction::parse_ini_name(action.ini_name()), Some(action));
+            assert!(Keymap::default().effective_chords(action).is_empty());
+            assert!(
+                Keymap::default_reference_ini()
+                    .contains(&format!("# {} = none", action.ini_name()))
+            );
+            settings.set_override_chords(action, vec![Chord::key(key)]);
+            assert_eq!(
+                Keymap::from_settings(&settings).effective_chords(action),
+                &[Chord::key(key)]
+            );
+        }
+        assert_eq!(
+            Keymap::default().effective_chords(KeyAction::FsSpreadLtr),
+            &[Chord::key(KeyName::Num2), Chord::key(KeyName::Numpad2)]
+        );
+    }
+
+    #[test]
     fn hold_edge_keys_do_not_collapse_numpad_to_top_row() {
         // review-v2.3.0 hunt P2: KeyHold の fast-tap 救済で Numpad0-9 を上段 Num0-9 に
         // 畳まない (畳むとテンキー割当なのに上段数字キーで発火 / イベント消費する)。
@@ -10611,6 +10667,85 @@ mod tests {
     }
 
     #[test]
+    fn everything_search_has_grid_only_ctrl_r_contract() {
+        let action = KeyAction::GlobalEverythingSearch;
+        let chord = Chord::ctrl(KeyName::R);
+        let keymap = Keymap::empty();
+        assert!(KeyAction::all().contains(&action));
+        assert_eq!(KeyAction::parse_ini_name(action.ini_name()), Some(action));
+        assert_eq!(action.context(), KeyContext::Grid);
+        assert_eq!(action.trigger(), KeyTrigger::Press);
+        assert_eq!(keymap.effective_chords(action), vec![chord]);
+        assert_eq!(
+            keymap.resolve_first_action_for_chord(chord, GRID_ACTIVE_SCOPES, &[action]),
+            Some(action)
+        );
+        for scopes in [
+            FS_IMAGE_ACTIVE_SCOPES,
+            FS_VIDEO_ACTIVE_SCOPES,
+            &[KeyContext::Text],
+        ] {
+            assert_eq!(
+                keymap.resolve_first_action_for_chord(chord, scopes, &[action]),
+                None
+            );
+        }
+        assert!(!keymap.binding_conflicts().iter().any(|conflict| {
+            conflict.action == action || conflict.other_action == Some(action)
+        }));
+        assert!(Keymap::default_reference_ini().contains(
+            "[Grid] ; サムネイル一覧\n# GlobalEverythingSearch = Ctrl+R ; Everything でファイル名を検索する"
+        ));
+        assert_eq!(
+            keymap.menu_command_label(MenuCommandId::GlobalEverythingSearch),
+            "Everything ファイル名検索… (Ctrl+R)"
+        );
+
+        let rebound = Keymap::from_ini_str("[Grid]\nGlobalEverythingSearch = F24\n");
+        assert_eq!(
+            rebound.effective_chords(action),
+            vec![Chord::key(KeyName::F24)]
+        );
+        assert_eq!(
+            rebound.menu_command_label(MenuCommandId::GlobalEverythingSearch),
+            "Everything ファイル名検索… (F24)"
+        );
+        let disabled = Keymap::from_ini_str("[Grid]\nGlobalEverythingSearch = none\n");
+        assert!(disabled.effective_chords(action).is_empty());
+        let conflicting = Keymap::from_ini_str("[Grid]\nGlobalEverythingSearch = Ctrl+G\n");
+        assert!(conflicting.binding_conflicts().iter().any(|conflict| {
+            (conflict.action == action
+                && conflict.other_action == Some(KeyAction::GlobalMetadataSearch))
+                || (conflict.action == KeyAction::GlobalMetadataSearch
+                    && conflict.other_action == Some(action))
+        }));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_video_does_not_forward_everything_search() {
+        let _guard = crate::key_input::lock_test_input();
+        let mut event = crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
+            virtual_key: 0x52,
+            scan_code: 0,
+            extended: false,
+            shift: false,
+            ctrl: true,
+            alt: false,
+            repeat: false,
+        };
+        Keymap::empty().install_global_native_video_shortcuts();
+        assert!(!native_video_fullscreen_shortcut_key(&event));
+        let rebound = Keymap::from_ini_str("[Grid]\nGlobalEverythingSearch = F24\n");
+        rebound.install_global_native_video_shortcuts();
+        event.virtual_key = 0x87;
+        event.ctrl = false;
+        assert!(!native_video_fullscreen_shortcut_key(&event));
+        Keymap::empty().install_global_native_video_shortcuts();
+    }
+
+    #[test]
     fn adjustment_slot_actions_are_registered_and_have_unique_context_defaults() {
         let image_actions = [
             KeyAction::FsAdjustSlotDefault1,
@@ -10932,6 +11067,7 @@ mod tests {
                 MenuCommandId::FileQuit,
                 MenuCommandId::FileOpenFolder,
                 MenuCommandId::FileLocalSearch,
+                MenuCommandId::GlobalEverythingSearch,
                 MenuCommandId::FileReload,
                 MenuCommandId::FileMetadataExport,
                 MenuCommandId::FileMetadataImport,

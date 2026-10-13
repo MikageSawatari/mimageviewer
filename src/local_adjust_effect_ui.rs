@@ -10937,11 +10937,11 @@ mod tests {
 
     #[test]
     fn local_adjust_combo_popup_is_dark_inside_a_light_app() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
         let mut fonts_ready = false;
         let mut quality = RepairQuality::Standard;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(250.0, 220.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Light);

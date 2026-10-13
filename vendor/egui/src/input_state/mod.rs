@@ -595,6 +595,18 @@ impl InputState {
         self.viewport_rect - self.safe_area_insets
     }
 
+    /// Discard the remaining smoothed wheel input when its UI owner closes.
+    ///
+    /// Clearing this frame's public scroll deltas alone does not discard the
+    /// wheel delta already queued for future frames. Call this at the owner's
+    /// termination boundary, after letting it handle this frame's input. A new
+    /// wheel event in the next frame is processed normally. Touch gestures are
+    /// not affected.
+    pub fn discard_pending_scroll(&mut self) {
+        self.unprocessed_scroll_delta = Vec2::ZERO;
+        self.unprocessed_scroll_delta_for_zoom = 0.0;
+    }
+
     /// Returns the full area available to egui, including parts that might be partially covered,
     /// for example, by the OS status bar or notches (see [`Self::safe_area_insets`]).
     ///

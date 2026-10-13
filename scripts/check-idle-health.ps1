@@ -8,11 +8,45 @@ param(
     [switch]$NoLaunch,
     [switch]$SkipPrompt,
     [string]$ThresholdPath = "",
-    [string]$OutputDirectory = ""
+    [string]$OutputDirectory = "",
+    [switch]$PortableSmoke,
+    [switch]$InteractiveApproved,
+    [datetime]$ExpectedStartTimeUtc,
+    [string]$SleepEvidencePath = "",
+    [long]$RootHwnd = 0,
+    [long]$BackgroundHwnd = 0,
+    [int]$BackgroundProcessId = 0,
+    [string]$CaseId = ""
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 2.0
+
+# This branch cannot launch or attach by name, or fall back to APPDATA logs.
+# Reject before even compiling native helpers or creating output directories.
+if ($PortableSmoke) {
+    if (-not $InteractiveApproved -or $ProcessId -le 0 -or -not $SkipPrompt -or
+        -not $PSBoundParameters.ContainsKey('ExpectedStartTimeUtc') -or
+        [string]::IsNullOrWhiteSpace($SleepEvidencePath) -or
+        [string]::IsNullOrWhiteSpace($OutputDirectory) -or
+        -not [string]::IsNullOrWhiteSpace($ExePath) -or
+        -not [string]::IsNullOrWhiteSpace($ThresholdPath) -or $NoLaunch) {
+        [Console]::Error.WriteLine('PortableSmoke requires approval, exact PID/start time, SkipPrompt, sleep evidence and run output; executable/threshold overrides and NoLaunch are refused.')
+        exit 2
+    }
+    & (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Sampler.ps1') `
+        -Scenario $Scenario -TargetKey $TargetKey -ProcessId $ProcessId `
+        -ExpectedStartTimeUtc $ExpectedStartTimeUtc -SleepEvidencePath $SleepEvidencePath `
+        -OutputDirectory $OutputDirectory -RootHwnd $RootHwnd -BackgroundHwnd $BackgroundHwnd `
+        -BackgroundProcessId $BackgroundProcessId -CaseId $CaseId -InteractiveApproved
+    exit $LASTEXITCODE
+}
+if ($InteractiveApproved -or $PSBoundParameters.ContainsKey('ExpectedStartTimeUtc') -or
+    $PSBoundParameters.ContainsKey('SleepEvidencePath') -or $PSBoundParameters.ContainsKey('RootHwnd') -or
+    $PSBoundParameters.ContainsKey('BackgroundHwnd') -or $PSBoundParameters.ContainsKey('BackgroundProcessId') -or $PSBoundParameters.ContainsKey('CaseId')) {
+    [Console]::Error.WriteLine('ReleaseChecks execution options require -PortableSmoke; they do not authorize normal-profile launch.')
+    exit 2
+}
 
 if ($Scenario -eq "video-pin-background") {
     if ([string]::IsNullOrWhiteSpace($TargetKey)) {
@@ -108,6 +142,135 @@ public static class MivIdleHealthNative2 {
     }
 }
 '@
+}
+
+# The transport and prefix reader share bounded control/snapshot contracts.
+if (-not ("MivLogDelivery1" -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.IO.Pipes;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+public static class MivLogDelivery1 {
+    [StructLayout(LayoutKind.Sequential)]
+    struct Info {
+        public uint Attributes, CreationLow, CreationHigh, AccessLow, AccessHigh;
+        public uint WriteLow, WriteHigh, Volume, SizeHigh, SizeLow, Links, IndexHigh, IndexLow;
+    }
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool GetFileInformationByHandle(SafeFileHandle handle, out Info info);
+    static int Remaining(Stopwatch clock) {
+        int remaining = 2000 - (int)clock.ElapsedMilliseconds;
+        if (remaining <= 0) throw new TimeoutException("logging-control deadline expired");
+        return remaining;
+    }
+    static void Wait(IAsyncResult task, Stopwatch clock) {
+        if (!task.AsyncWaitHandle.WaitOne(Remaining(clock))) throw new TimeoutException("logging-control timeout");
+    }
+    static byte[] Read(PipeStream pipe, int length, Stopwatch clock) {
+        var bytes = new byte[length]; int offset = 0;
+        while (offset < length) {
+            var read = pipe.BeginRead(bytes, offset, length - offset, null, null);
+            Wait(read, clock); int count = pipe.EndRead(read); read.AsyncWaitHandle.Close();
+            if (count == 0) throw new EndOfStreamException("logging-control disconnected");
+            offset += count;
+        }
+        return bytes;
+    }
+    public static string Request(string name, string json) {
+        var clock = Stopwatch.StartNew();
+        using (var pipe = new NamedPipeClientStream(".", name, PipeDirection.InOut, PipeOptions.Asynchronous)) {
+            pipe.Connect(Remaining(clock));
+            byte[] payload = Encoding.UTF8.GetBytes(json);
+            byte[] packet = new byte[payload.Length + 4];
+            Buffer.BlockCopy(BitConverter.GetBytes((uint)payload.Length), 0, packet, 0, 4);
+            Buffer.BlockCopy(payload, 0, packet, 4, payload.Length);
+            var write = pipe.BeginWrite(packet, 0, packet.Length, null, null);
+            Wait(write, clock); pipe.EndWrite(write); write.AsyncWaitHandle.Close();
+            uint length = BitConverter.ToUInt32(Read(pipe, 4, clock), 0);
+            if (length == 0 || length > 65536) throw new InvalidDataException("invalid logging-control response size");
+            return new UTF8Encoding(false, true).GetString(Read(pipe, (int)length, clock));
+        }
+    }
+    public static string Identity(SafeFileHandle handle) {
+        Info info;
+        if (!GetFileInformationByHandle(handle, out info)) throw new IOException("cannot obtain perf file identity");
+        return info.Volume.ToString() + ":" + (((ulong)info.IndexHigh << 32) | info.IndexLow).ToString();
+    }
+    public static void Snapshot(string path, string identity, long length, string destination) {
+        if (length < 0) throw new InvalidDataException("invalid snapshot offset");
+        using (var source = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)) {
+            string actual = Identity(source.SafeFileHandle);
+            if (actual != identity || source.Length < length) throw new InvalidDataException("perf snapshot identity/length mismatch");
+            using (var target = new FileStream(destination, FileMode.CreateNew, FileAccess.Write, FileShare.Read)) {
+                var buffer = new byte[65536]; long remaining = length;
+                while (remaining > 0) {
+                    int count = source.Read(buffer, 0, (int)Math.Min(buffer.Length, remaining));
+                    if (count == 0) throw new EndOfStreamException("perf prefix disappeared");
+                    target.Write(buffer, 0, count); remaining -= count;
+                }
+            }
+        }
+    }
+}
+'@
+}
+
+function Get-DeliveryCheckpoint {
+    param($Session, [string]$RequestId)
+    if ($null -eq $Session -or $Session.log_delivery_schema -ne 1 -or
+        [string]::IsNullOrWhiteSpace([string]$Session.session_id)) {
+        throw "delivery-aware session.start is unavailable"
+    }
+    $request = [ordered]@{
+        schema = 1; request_id = $RequestId; pid = [uint32]$Session.pid
+        process_start_unix_ms = [uint64]$Session.process_start_unix_ms
+        session_id = [string]$Session.session_id
+    }
+    $name = "mimageviewer-log-$($Session.pid)-$($Session.process_start_unix_ms)"
+    $ack = [MivLogDelivery1]::Request($name, ($request | ConvertTo-Json -Compress)) | ConvertFrom-Json
+    if ($null -ne $ack.PSObject.Properties["error"]) { throw ([string]$ack.error) }
+    if ($ack.schema -ne 1 -or $ack.request_id -ne $RequestId -or
+        $ack.pid -ne $Session.pid -or $ack.session_id -ne $Session.session_id -or
+        $ack.process_start_unix_ms -ne $Session.process_start_unix_ms) {
+        throw "logging-control ACK identity/nonce mismatch"
+    }
+    return $ack
+}
+
+function Get-DeliveredLogGrowth {
+    param($Start, $End)
+    foreach ($field in @("session_id", "pid", "process_start_unix_ms")) {
+        if ($null -eq $Start.PSObject.Properties[$field] -or
+            $null -eq $End.PSObject.Properties[$field] -or $Start.$field -ne $End.$field) {
+            throw "log byte watermarks belong to different or unknown processes"
+        }
+    }
+    $growth = @{}
+    foreach ($sink in @("normal", "perf")) {
+        $field = $sink + "_written_bytes"
+        $status = $sink + "_status"
+        foreach ($checkpoint in @($Start, $End)) {
+            if ($null -eq $checkpoint.PSObject.Properties[$status] -or $checkpoint.$status -ne "ready" -or
+                $null -eq $checkpoint.PSObject.Properties[$field] -or
+                ($checkpoint.$field -isnot [int] -and $checkpoint.$field -isnot [long] -and $checkpoint.$field -isnot [uint64]) -or
+                [decimal]$checkpoint.$field -lt 0) {
+                throw "unknown or invalid completed log byte watermark: $field"
+            }
+        }
+        if ([decimal]$End.$field -lt [decimal]$Start.$field) { throw "log byte watermark regressed: $field" }
+        $growth[$sink] = [decimal]$End.$field - [decimal]$Start.$field
+    }
+    [pscustomobject]$growth
+}
+
+function Save-DeliveryPrefix {
+    param($Ack, [string]$Destination)
+    [MivLogDelivery1]::Snapshot([string]$Ack.perf_path, [string]$Ack.perf_file_identity,
+        [long]$Ack.perf_end_offset, $Destination)
 }
 
 function Get-FileLength {
@@ -371,12 +534,37 @@ if (-not $SkipPrompt) {
 Write-Host "Warmup: $WarmupSeconds seconds"
 Start-Sleep -Seconds $WarmupSeconds
 
+$DeliveryFailures = New-Object System.Collections.Generic.List[string]
+$StartCheckpoint = $null
+$EndCheckpoint = $null
+$MeasuredSession = $null
+try {
+    $MeasuredSession = Get-Content -LiteralPath $PerfLog -Encoding UTF8 -TotalCount 64 |
+        ForEach-Object { try { $_ | ConvertFrom-Json } catch { $null } } |
+        Where-Object { $null -ne $_ -and $_.cat -eq "session" -and $_.kind -eq "start" } |
+        Select-Object -First 1
+    if ($null -eq $MeasuredSession -or $MeasuredSession.pid -ne $Process.Id) {
+        throw "measured perf session PID mismatch"
+    }
+    $CreationUnixMs = [long][Math]::Floor(($Process.StartTime.ToUniversalTime().Ticks - 621355968000000000) / 10000.0)
+    if ([long]$MeasuredSession.process_start_unix_ms -ne $CreationUnixMs) {
+        throw "measured perf process creation time mismatch"
+    }
+    if ($null -eq $MeasuredSession.PSObject.Properties["wall_unix_ms"] -or
+        $null -eq $MeasuredSession.PSObject.Properties["wall_t"]) {
+        throw "perf monotonic/wall anchor is missing"
+    }
+    $StartCheckpoint = Get-DeliveryCheckpoint -Session $MeasuredSession -RequestId ([guid]::NewGuid().ToString("N"))
+}
+catch { $DeliveryFailures.Add("before measurement: " + $_.Exception.Message) }
 $Process = Get-LiveProcess -Id $Process.Id
 $StartWall = Get-Date
 $StartProcessElapsed = ($StartWall - $Process.StartTime).TotalSeconds
+if ($DeliveryFailures.Count -eq 0) {
+    $StartUnixMs = ($StartWall.ToUniversalTime().Ticks - 621355968000000000) / 10000.0
+    $StartProcessElapsed = [double]$MeasuredSession.wall_t + ($StartUnixMs - [double]$MeasuredSession.wall_unix_ms) / 1000.0
+}
 $StartCpu = $Process.TotalProcessorTime.TotalSeconds
-$StartAppLogBytes = Get-FileLength -Path $AppLog
-$StartPerfLogBytes = Get-FileLength -Path $PerfLog
 $StartForegroundProcessId = Get-ForegroundProcessId
 $StartWindowSummary = Get-ProcessTopLevelWindowSummary -Id $Process.Id
 $Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -388,9 +576,11 @@ $Stopwatch.Stop()
 $Process = Get-LiveProcess -Id $Process.Id
 $EndWall = Get-Date
 $EndProcessElapsed = ($EndWall - $Process.StartTime).TotalSeconds
+if ($DeliveryFailures.Count -eq 0) {
+    $EndUnixMs = ($EndWall.ToUniversalTime().Ticks - 621355968000000000) / 10000.0
+    $EndProcessElapsed = [double]$MeasuredSession.wall_t + ($EndUnixMs - [double]$MeasuredSession.wall_unix_ms) / 1000.0
+}
 $EndCpu = $Process.TotalProcessorTime.TotalSeconds
-$EndAppLogBytes = Get-FileLength -Path $AppLog
-$EndPerfLogBytes = Get-FileLength -Path $PerfLog
 $EndForegroundProcessId = Get-ForegroundProcessId
 $EndWindowSummary = Get-ProcessTopLevelWindowSummary -Id $Process.Id
 
@@ -398,19 +588,32 @@ $ElapsedSeconds = [Math]::Max($Stopwatch.Elapsed.TotalSeconds, 0.001)
 $CpuDeltaSeconds = [Math]::Max($EndCpu - $StartCpu, 0.0)
 # 1.0 means one logical core is fully occupied; do not divide by machine core count.
 $CpuCoreRatio = $CpuDeltaSeconds / $ElapsedSeconds
-$AppLogGrowth = [Math]::Max($EndAppLogBytes - $StartAppLogBytes, 0)
-$PerfLogGrowth = [Math]::Max($EndPerfLogBytes - $StartPerfLogBytes, 0)
+$AppLogGrowth = $null
+$PerfLogGrowth = $null
 
 $Timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $SafeScenario = $Scenario -replace "[^A-Za-z0-9_.-]", "_"
 $PerfReportPath = Join-Path $OutputDirectory "$Timestamp-$SafeScenario-perf.json"
 $ProcessReportPath = Join-Path $OutputDirectory "$Timestamp-$SafeScenario-process.json"
+$PerfPrefixPath = Join-Path $OutputDirectory "$Timestamp-$SafeScenario-prefix.jsonl"
+$DeliveryAckPath = Join-Path $OutputDirectory "$Timestamp-$SafeScenario-checkpoint.json"
+try {
+    $EndCheckpoint = Get-DeliveryCheckpoint -Session $MeasuredSession -RequestId ([guid]::NewGuid().ToString("N"))
+    if ($EndCheckpoint.coverage_t -lt $EndProcessElapsed) { throw "checkpoint coverage does not reach measurement end" }
+    Save-DeliveryPrefix -Ack $EndCheckpoint -Destination $PerfPrefixPath
+    $LogGrowth = Get-DeliveredLogGrowth -Start $StartCheckpoint -End $EndCheckpoint
+    $AppLogGrowth = $LogGrowth.normal
+    $PerfLogGrowth = $LogGrowth.perf
+    $EndCheckpoint | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $DeliveryAckPath -Encoding UTF8
+}
+catch { $DeliveryFailures.Add("after measurement: " + $_.Exception.Message) }
 
 $Python = Get-Command python -ErrorAction Stop
 $Analyzer = Join-Path $PSScriptRoot "analyze_perf.py"
+if ($null -eq $EndCheckpoint) { $EndCheckpoint = [pscustomobject]@{ request_id = "unconfirmed" } }
 $AnalyzerArgs = @(
     $Analyzer,
-    $PerfLog,
+    $PerfPrefixPath,
     "idle-health",
     "--start-t", (Format-Invariant -Value $StartProcessElapsed),
     "--end-t", (Format-Invariant -Value $EndProcessElapsed),
@@ -420,7 +623,9 @@ $AnalyzerArgs = @(
     "--max-same-work", ([string][int]$Thresholds.max_same_work),
     "--max-input-events", ([string][int]$Thresholds.max_input_events),
     "--expected-pid", ([string][int]$Process.Id),
-    "--json-out", $PerfReportPath
+    "--json-out", $PerfReportPath,
+    "--checkpoint-id", ([string]$EndCheckpoint.request_id),
+    "--delivery-ack", $DeliveryAckPath
 )
 if ($IdentityEvidence -eq "command_line") {
     $AnalyzerArgs += "--allow-sleeping-window"
@@ -432,8 +637,15 @@ if ($Scenario -eq "video-pin-background") {
 }
 
 Write-Host ""
-& $Python.Source @AnalyzerArgs
-$AnalyzerExitCode = $LASTEXITCODE
+$AnalyzerExitCode = 2
+if ($DeliveryFailures.Count -eq 0) {
+    & $Python.Source @AnalyzerArgs
+    $AnalyzerExitCode = $LASTEXITCODE
+}
+else {
+    [ordered]@{ status = "CannotJudge"; delivery_failures = @($DeliveryFailures) } |
+        ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $PerfReportPath -Encoding UTF8
+}
 
 $Failures = New-Object System.Collections.Generic.List[string]
 $Warnings = New-Object System.Collections.Generic.List[string]
@@ -493,7 +705,7 @@ if ($PerfLogGrowth -gt [long]$Thresholds.max_perf_log_growth_bytes) {
         "perf_events.jsonl grew by $PerfLogGrowth bytes (limit $($Thresholds.max_perf_log_growth_bytes))"
     )
 }
-if ($AnalyzerExitCode -ne 0) {
+if ($AnalyzerExitCode -ne 0 -and $AnalyzerExitCode -ne 2) {
     $Failures.Add("analyze_perf.py idle-health failed with exit code $AnalyzerExitCode")
 }
 
@@ -501,7 +713,10 @@ $Status = "pass"
 if ($Failures.Count -gt 0) {
     $Status = "fail"
 }
+if ($AnalyzerExitCode -eq 2) { $Status = "CannotJudge" }
 $ProcessReport = [ordered]@{
+    delivery_failures = @($DeliveryFailures)
+    delivery_checkpoint = $EndCheckpoint
     status = $Status
     scenario = $Scenario
     timestamp = $Timestamp
@@ -559,6 +774,7 @@ if ($Launched) {
     Write-Host "mImageViewer remains running (PID $($Process.Id)); exit it normally when checks are complete."
 }
 
+if ($Status -eq "CannotJudge") { exit 2 }
 if ($Failures.Count -gt 0) {
     exit 1
 }

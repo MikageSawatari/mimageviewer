@@ -8,7 +8,6 @@ use mimageviewer_ipc::{
     VideoStreamStartPayload, VideoStreamStatePayload,
 };
 
-use super::path_guard::{ResolveError, resolve_existing};
 use super::session::{PublishedVideoStream, SessionHandle};
 use crate::video::stream::session::{
     StreamGenerationMetrics, StreamGenerationStatus, StreamResource, StreamResourceError,
@@ -95,11 +94,22 @@ impl VideoStreamStartBudget {
         )
     }
 }
-pub(super) struct VideoStreamEngine;
+pub(super) struct VideoStreamEngine {
+    container: std::sync::Arc<super::container::ContainerEngine>,
+}
 
 impl VideoStreamEngine {
+    #[cfg(test)]
     pub(super) fn new() -> Self {
-        Self
+        Self::new_with_container_engine(std::sync::Arc::new(
+            super::container::ContainerEngine::new(crate::settings::Settings::default()),
+        ))
+    }
+
+    pub(super) fn new_with_container_engine(
+        container: std::sync::Arc<super::container::ContainerEngine>,
+    ) -> Self {
+        Self { container }
     }
 
     pub(super) fn resolve_start_address(
@@ -122,7 +132,18 @@ impl VideoStreamEngine {
                 "メディアストリーミングは実ファイルだけを受け付けます",
             ));
         }
-        let resolved = resolve_existing(&address.path).map_err(resolve_error)?;
+        let resolved = self.container.resolve_source(address).map_err(|error| {
+            let code = match error.code {
+                mimageviewer_ipc::MediaErrorCode::BadRequest
+                | mimageviewer_ipc::MediaErrorCode::PathRejected => {
+                    VideoStreamErrorCode::BadRequest
+                }
+                mimageviewer_ipc::MediaErrorCode::NotFound => VideoStreamErrorCode::NotFound,
+                mimageviewer_ipc::MediaErrorCode::Unsupported => VideoStreamErrorCode::Unsupported,
+                _ => VideoStreamErrorCode::Failed,
+            };
+            video_error(code, error.message)
+        })?;
         if !resolved
             .canonical
             .extension()
@@ -475,24 +496,6 @@ fn audio_processing_payload(
     }
 }
 
-fn resolve_error(error: ResolveError) -> VideoStreamError {
-    let (code, message) = match error {
-        ResolveError::InvalidPath => (
-            VideoStreamErrorCode::BadRequest,
-            "メディアアドレスの形式が正しくありません",
-        ),
-        ResolveError::NetworkPath => (
-            VideoStreamErrorCode::BadRequest,
-            mimageviewer_ipc::REMOTE_NETWORK_PATH_MESSAGE,
-        ),
-        ResolveError::Unavailable => (
-            VideoStreamErrorCode::NotFound,
-            "メディアファイルが見つかりません",
-        ),
-    };
-    video_error(code, message)
-}
-
 fn resource_error(error: StreamResourceError, kind: StreamResourceKind) -> VideoStreamError {
     match error {
         StreamResourceError::GenerationMismatch => video_error(
@@ -683,5 +686,62 @@ mod tests {
                 .code,
             VideoStreamErrorCode::Unsupported
         );
+    }
+
+    #[test]
+    fn start_admission_reads_current_video_and_audio_policy_before_player_submission() {
+        let guard = crate::settings_db::DataDirOverrideGuard::new();
+        assert!(
+            crate::settings_db::boot_settings_db(guard.path())
+                .db
+                .is_some()
+        );
+        let mut settings = crate::settings::Settings::default();
+        let engine = VideoStreamEngine::new_with_container_engine(std::sync::Arc::new(
+            super::super::container::ContainerEngine::new_with_session(
+                settings.clone(),
+                super::super::session::SessionHandle::new(),
+            ),
+        ));
+        for (name, category) in [
+            (
+                "movie.mp4",
+                crate::file_type_visibility::FileTypeCategory::Video,
+            ),
+            (
+                "song.mp3",
+                crate::file_type_visibility::FileTypeCategory::Audio,
+            ),
+        ] {
+            let path = guard.path().join(name);
+            std::fs::write(&path, b"not opened by a player").unwrap();
+            let address = RemoteAddress::file(path.to_string_lossy().into_owned());
+            for excluded in [false, true, false] {
+                settings.file_type_visibility.excluded_categories.clear();
+                if excluded {
+                    settings
+                        .file_type_visibility
+                        .excluded_categories
+                        .insert(category);
+                }
+                crate::settings_db::with_db_result(|db| db.save_full(&settings)).unwrap();
+                let result = engine.resolve_start_address(&address);
+                if excluded {
+                    assert_eq!(result.unwrap_err().code, VideoStreamErrorCode::Unsupported);
+                } else {
+                    assert!(result.is_ok());
+                }
+            }
+            settings
+                .file_type_visibility
+                .excluded_extensions
+                .insert(path.extension().unwrap().to_string_lossy().into_owned());
+            crate::settings_db::with_db_result(|db| db.save_full(&settings)).unwrap();
+            assert_eq!(
+                engine.resolve_start_address(&address).unwrap_err().code,
+                VideoStreamErrorCode::Unsupported
+            );
+            settings.file_type_visibility.excluded_extensions.clear();
+        }
     }
 }

@@ -1,8 +1,9 @@
-# 表示するファイル種類 — §1.345 / 履歴再入場のfacet退避 — §1.339
+﻿# 表示するファイル種類 — §1.345 / 履歴再入場のfacet退避 — §1.339
 
-作成: 2026-10-07、改訂: 2026-10-08（利用者決定の確定記録）、ラインA。
-状態: **仕様確定、§1.339/§1.345は未実装**。利用者決定とbf509352dの独立レビュー承認は§12に記録。
-本書の新しい型・APIは未実装の設計仕様であり、現行コードに存在するという主張ではない。
+作成: 2026-10-07、改訂: 2026-10-09（実装・検証記録、利用者決定は2026-10-08/09）、ラインA。
+状態: **仕様確定。§1.339はnext-navで実装済み、§1.345は実装・確認用ビルド済み。検収・実機確認待ち。先行lib実行のnative AVは未解明（§13）**。
+利用者決定とbf509352dの独立レビュー承認は§12に記録。本文の設計時点のコード事実と
+提案表記は設計の記録として残し、今回の実装・検証結果は§13に記録する。
 実アプリは起動していない。§1.339の観測者は利用者、原因の根拠は下記のコード調査。
 
 ## 1. 決定済みの範囲と今回の境界
@@ -12,8 +13,8 @@
 - §1.345は既存facetの継承拡張をやめ、mIV全体の「表示するファイル種類」設定に作り直す。
   一覧生成の最初の層で除く。同名処理・AppleDouble除去と同じ生成段に置き、退避・復元を持たない。
 - §1.339は既存facet退避の不具合として独立して直す。§1.345の実装・設定ONを前提にしない。
-- 本書は設計のみ。適用範囲・本判定・操作導線などの利用者判断は2026-10-08に確定した（§8）。
-  今回は決定の記録だけを行い、実装は追加しない。
+- 適用範囲・本判定・操作導線などの利用者判断は2026-10-08に確定した（§8）。
+  同日の§1.345実装ではこの確定仕様を使う。
 - §1.328の残り（閲覧履歴・サブフォルダ展開のopened-row anchor/scroll未保持）は別原因。
   §1.339で選択位置やaspectの保存ownerを代替・拡張しない。今回の実装対象ではない。
 
@@ -77,7 +78,7 @@ ZIP/RARの内部画像はmember名の拡張子、PDF/EPUBページは「描画�
 ### 3.1 内部書庫の来歴（r3追加、Q16）
 
 `zip_loader::enumerate_recursive`の実file entryを開く境界で、
-`ArchiveContainerOrigin`（未実装）を`ZipEnumeration`の列挙結果へ付ける確定仕様（Q16、2026-10-08）。
+`ArchiveContainerOrigin`を`ZipEnumeration`の列挙結果へ付ける確定仕様（Q16、2026-10-08、実装は§13）。
 外側からの実entry locator列（各central-directory indexと実member名）、形式、
 navigation prefix、各画像のcontainer ancestryを同じ列挙ownerが生成する。
 画像パスをsplitしただけでは実directoryか書庫かを判別できない。
@@ -86,8 +87,7 @@ navigation prefix、各画像のcontainer ancestryを同じ列挙ownerが生成�
 `ZipTree::build`は画像とoriginを一緒に受け取り、純粋な表示projectionは
 実書庫境界だけをFileTypeVisibilityへ通し、除外書庫の配下画像・代表・件数を除く。
 例えば実directory `notes.zip/cover.jpg`は残し、実file `book.zip`の中の画像はZIP除外で消す。
-同名directoryと実書庫が同じnavigation prefixへaliasする場合も、leafのlocator ancestryで
-書庫側だけを除く。実directoryの来歴があるnodeは通路として残し、実書庫だけのnodeは
+実directoryの来歴があるnodeは通路として残し、実書庫だけのnodeは
 その除外と共に消す。prefix単位の一括除去はしない。
 既存entry_name/永続keyは変えず、index列は列挙snapshot内の識別にだけ使う。
 Remoteの逐次candidate列挙にも実entry descentの同じownerを接続する。
@@ -97,6 +97,21 @@ Remoteの逐次candidate列挙にも実entry descentの同じownerを接続す�
 旧cacheにmanifestがなければsuffixから捏造せず、来歴が必要なときは再変換を求める
 確定仕様（Q16、2026-10-08）。内部書庫の形式除外を明示的に対象外にする案は採らず、
 未知来歴のまま「全対応」とは出荷しない。
+
+**2026-10-09 利用者決定（独立レビュー #5、選択肢(a)）:** 評価・検索・登録一覧で、
+内部形式の除外に来歴が必要なのに来歴のない旧変換ZIPを使う場合は、そのcacheに実在する
+項目を一時的に非表示にし、「古い変換キャッシュのため表示できない項目があります。
+本を開くか、キャッシュを作り直すと表示されます。」と通知する。評価・タグ・登録を保持し、
+実際に欠落した項目の従来の削除経路も保持する。自動再変換や復旧要求の機構は追加しない。
+既存の本を開く変換経路、またはキャッシュ管理での再生成後に一覧を再読込すると、
+新しい来歴に従って表示を復元する。外側の元形式を内部書庫の来歴として推測しない。
+**2026-10-09 利用者決定（再レビュー2、既知の制限として割り切り）:** データ保存先を移し、古い保存先を残したままの場合、DBが古い保存先の有効な変換キャッシュを指すことがある。現在の cache root の外にあるそのキャッシュでは、Remote の一覧・明示ページ・`/api/thumb`・RAW先読みが manifest を読まず、内部書庫の形式除外が効かない（除外した画像が見えるだけでデータは壊れない。本を変換し直すと現在の cache root に作り直されて直る）。再レビューで指摘が続いたため、利用者判断で DB 確認済みの backing 所有を各読み出しへ運ぶ追加の仕組みは作らない。
+**2026-10-09 再レビュー #5 の確認:** 元書庫への登録と、受入済みcache内の実在ページへの
+参照は区別する。後者の可視性は実cacheのmanifest、またはmanifest欠落時の上記旧cache
+規則で判定する。元書庫の削除・更新、DBに記録したcache size/versionの古さを理由に、
+実在ページを来歴不明として許可しない。前者で元書庫が欠落・更新している場合と、
+cache内でも実際に欠落したmemberは、従来の欠落登録の表示・削除経路を維持する。
+投影はworkerで実cacheを読み、自動再変換・再試行・新しい復旧状態を追加しない。
 来歴をpaintで再走査する案と、全ZipDirを常に残す案は、誤除外/適用漏れになるため不採用。
 
 ### 3.2 共通の投影順序
@@ -208,6 +223,14 @@ policy変更やrefresh後に古いVを新snapshotへmergeしない。rename/dele
 
 ### 5.5 ページidentityによる復元と旧raw記録（r3追加、Q15）
 
+**ネスト書庫の同名衝突の制限（利用者決定、2026-10-08、選択肢(a)）:**
+同じ外側書庫に実directory `book.zip/` とネスト書庫file `book.zip` が共存する構成は非対応。
+名前が衝突するときは既存readerのネスト書庫としての扱いを維持し、このケースのための
+来歴の識別・読出し・永続keyの追加配管は行わない。§3.1の来歴投影は衝突しない構成が対象で、
+拡張子の付いた実directory（例: `notes.zip/`）と別名の実書庫の区別は引き続き対象とする。
+PageIdentityの「論理元container＋完全entry_name」もこの非衝突の前提で同じページを照合する。
+衝突した二つの実体を別の読書位置として復元する保証はしない。
+
 現行resume_page_for_containerはidxが画像kindなら採用するだけ。
 `1.jpg / 2.png / 3.jpg`のraw index=1を保存後、PNGを除外して同じ1へ戻すと3.jpgに誤着地する。
 「現行検証で有効なものだけ採用」という以前の記載は撤回する。
@@ -301,6 +324,10 @@ collection/Smartは保存定義から既存再prepareできるのでその経路
 動画再生や開いている本を中断する既存挙動の削減になるため、この案は採用しない。
 開いているviewerの読書/再生contextと読順をその終了まで保持し、
 次の一覧生成/open/reloadから新policyを使う確定仕様（Q12、2026-10-08）。
+この寿命の区切りはPCのmounted/parked viewer contextを対象とする。
+Remoteは§6の確定した要求単位の扱いに従い、次のlist/readで最新policyを照合する。
+既に取得済みのRemote pageGroupsのページでも次の読出しが除外理由で拒否される場合がある。
+Remoteへ新しい読書grant・端末override・読書session APIは追加しない。
 新policyを適用した一覧へ戻る境界では除外済みのselected/checkを持ち越さない。
 この例外は「すべての新しい一覧生成には同policy」を維持し、開いているsessionの寿命だけを区切る。
 即時に全windowを更新する要求なら、既存context採用/worker cancel/cache所有境界を設計レビューしてから
@@ -343,7 +370,7 @@ IDは以前の議論と対応させ、仕様内容はr4の推奨から変更し�
 | Q6 | 動画除外で表示mediaがなくなったfolderをCtrl+上下でskipする | 従来skip_limit/fallbackを維持し、直接クリックでは空folderにも入れる |
 | Q7 | JPEG＋MP4のfolderで動画を除外すると、JPEGだけの本として自動open/畳み込みする | 非空の表示mediaが全画像で子コンテナなし。全画像除外なら非本。通常/Remote/page countを揃える |
 | Q11 | 種類設定の確定時、検索結果・サブ展開・一時snapshotを閉じて元場所へ戻す | 一時結果が失われる影響を受け入れ、既存reloadを使う。各producerの再実行案は採らない |
-| Q12 | 動画除外後も再生中の動画を継続し、開いている本の読順もsession終了まで保持する | 次の一覧生成/open/reloadから新policyを適用。全windowへの即時適用なら中断動作と所有変更を再相談 |
+| Q12 | PC viewerでは動画除外後も再生中の動画を継続し、開いている本の読順もsession終了まで保持する | 次の一覧生成/open/reloadから新policyを適用。Remoteは§6の次のlist/readで最新設定を照合する。全windowへの即時適用なら中断動作と所有変更を再相談 |
 | Q15 | ページidentityも保存し、identityのない旧記録・旧版で更新した記録は種類除外を適用する読書sessionで自動復元を見送る（§5.5） | 通知後に再選択・再記録が必要。追加optional永続列、raw-only失効trigger、新版→旧版→新版回帰を用意。raw-onlyで投影後indexを採用する案は不採用 |
 | Q16 | 内部書庫の列挙来歴を追加し、旧変換cacheの来歴が必要なときは再変換を求める（§3.1） | ZIP内book.zipを除外してnotes.zipという実folderは残す。旧cacheの再変換に時間がかかる影響を受け入れ、内部書庫を今回対象外にする案は不採用 |
 | Q17 | collection並べ替えは非表示entryの元slotを固定し、可視entryだけを入れ替える（§5.4）。A,H,B,J,C→C,H,A,J,B（H/JがPNG） | 全ID保存・revision検証を維持。編集画面だけ全登録を見せる例外案は不採用 |
@@ -807,7 +834,8 @@ aggregate producer → Remoteとcache/reloadの順でcoherent chunkに分ける�
 - data rowsとsidecar/tag/collection順が不変、local/Remoteの表示列・読順・count一致、Remote prepared cache更新。
 - 2.png保存→PNG除外で3.jpgへ誤復元しないこと、identity/旧raw/除外target/設定復帰、永続列の互換。
 - 新版identity保存→旧版raw-only更新→新版再open、同raw値の旧版再保存でも失効、以後の新版保存でidentity再確定（§5.5.1）。
-- 同suffix実directoryと実書庫、同prefix alias、複数段のcontainer ancestry、旧変換cache manifest欠落。
+- 同suffixの別名実directoryと実書庫、複数段のcontainer ancestry、旧変換cache manifest欠落。
+  同名実directory/ネスト書庫の衝突は§5.5の利用者決定により非対応とし、既存readerを変更しない。
 - collection全ID集合、非表示slot/相対順、可視drag後の全ID保存、設定変更・revision conflictで旧投影を保存しないこと。
 - headless UI snapshot（prefs・適用中表示・件数）、full lib、fmt、通常/portable core check、glyph。
 
@@ -842,3 +870,293 @@ Q1/Q2/Q4/Q8/Q9/Q10/Q13/Q14の設計既定もそのまま維持する。費用・
 bf509352d8240b6d14c368a8fb4511e6ee64e156）の実装・設計を承認したことを記録する。
 この記録作業は新たな独立レビューではない。今回の変更は決定・承認の記録のみで、
 設計内容・受入条件・実装順を変更せず、§1.339/§1.345の実装や製品起動も行わない。
+
+## 13. §1.345 実装・検証記録（2026-10-08〜09、next-visibility）
+
+基点はnext-navの`9662c97810667f0559c2fe95e014b0620f19d7dc`。§1.350と§1.339を保持して
+本項目を実装する。ユーザー指示によりcommitせず、英語commit messageを
+`target/A-1345-msg.txt`へ保存する。製品起動、build-dist、test-fullは実施しない。
+
+- 種類・拡張子の分類と採否の正本は`src/file_type_visibility.rs`。
+  通常scan、ZIP tree、直接RAR、文書、評価・タグ・bookmark、検索、Smart、サブ展開、
+  Collection、Remoteの生成worker/optionsへ同じimmutable policyを渡す。
+  同名除去、本判定、代表選定、集約、可視結果上限より前に投影する。索引と登録は保持する。
+- ZIPの実ネスト境界は`archive_origin.rs`、変換cacheの来歴manifestは`archive_converter.rs`。
+  通常ZIPの同名補助fileはmanifestと解釈しない。既存cacheは内部書庫の除外が必要なときだけ
+  来歴versionによって再変換する。新converterが記録したmanifestが欠落したcacheはworkerで
+  読込を失敗させてログを残し、来歴versionを旧扱いへ戻す。次の該当openで再変換する。
+  専用の回復stateや再試行loopは作らない。§5.5の同名衝突の非対応決定を維持する。
+- 読書位置の`PageIdentity`とraw-only失効triggerは`book_resume_db.rs`。
+  最終読順のidentity mapは既存sidecar hydration ownerの準備workerで作り、
+  context/source/items generationを照合して採用する。mapは各`ViewerContextBundle`で所有する。
+  除外済みidentityや未同定の旧rawから同じindexの別ページへ復元しない。
+- Collectionのroot・別窓、ファイル束のgrouped/flat、検索結果は、各準備workerが
+  最終行順とidentity mapを対で運ぶ。ZIP階層の切り替えは既存hydration ownerの
+  `IndexOnly`を使い、CurrentListingとSnapshotListViewの公開先を型で区別する。
+  検索の後続結果が同じcontextの古いIndexOnlyを置き換える場合だけ、source/generationを
+  照合して旧要求を破棄する。Liveや別contextのownerは破棄しない。
+  Smartの親一覧の退避・復帰にも同じimmutable mapを保持する。行削除は論理pathを
+  再探索せず、共有identity lookupを保持して整数slotだけを行と同じ規則で変換する。
+  評価による追加は既存workerで採用するtail位置へmergeし、元policyと既存identityを保つ。
+  準備workerの起動失敗・切断では準備前のmapで表示を再開せず、所有する表示継続を
+  中止して再読み込みを通知する。再試行loopや専用の回復stateは設けない。
+- 実map準備の非同期完了後にも再読み込みの選択を保持する。外部rescanは既存の
+  `select_after_load`を採用前に渡し、拒否時は元のhintへ戻す。操作由来の選択が優先するときも
+  同じloadの低優先hintを消費する。スタック集約のMemberPath/GroupKeyは最終候補のexact indexへ
+  解決し、既存`MainListAfterHydration`の型付き継続で履歴復元後に採用する。
+  同じ表示名の実folder/束やサブ展開memberを名前hintで代用しない。
+- 代表cache keyにはpolicyを含め、個別画像のdecode keyは維持する。除外されたpinを削除せず、
+  同じpolicyの自動代表へ切り替える。既定のZIP代表は従来の一回openを保持する。
+  動画sidecarの補助入力と更新検出は画像除外後も保持する。
+- 非同期準備中に履歴preflightや直接openの分類結果が届いても、採用可能になる前に
+  receiverを消費しない。physical/Collectionの既存typed requestと分類ownerをそのまま保持し、
+  source proof、context、取消の照合を維持して準備完了後に一度だけ採用する。
+  refreshとの交差を避けるために要求を遅延させるテストには置き換えない。
+  `IndexOnly`は採用済み一覧のexactページopenを待たせるownerで、一覧・cursorの採用を
+  replayするcontinuationは持たない。起動時復元先の更新ではLive/Discardedと区別し、
+  ZIP prefixの採用を落とさない。新しい一覧の採用と読書ページは引き続き準備完了を待つ。
+  bookmarkの新規media別窓も既存loading builderで公開し、exact deferred targetを照合して
+  同じhydration ownerから最終表示・失敗時の終了を行う（detached plan §11）。
+- 環境設定はdraftをOKで確定し、Cancelでは変更しない。任意toolbar項目は同じ設定を開く。
+  既存pending reloadとPC閲覧contextの所有を使ってQ12の読順維持を行う。
+  Remoteは§6に従い、次の一覧・読出しから最新設定を使う。
+  Collection並べ替えは`collection_visible_order.rs`のpure mergeで非表示slotを保つ。
+  bookmark/Collectionは「表示 X / 登録 Y」、Remote payloadも同じ登録総数を運ぶ。
+- 外部からの単体media指定だけはtyped `DirectMedia`として既存transient snapshot ownerへ乗せる。
+  指定targetをreaderへ明示採用し、親basis/facet/checkは除外後のまま保つ。
+  既存の★固定の制約と表示は適用しない。前後移動は採用済みの表示対象兄弟の順序を使い、
+  終了・次の外部openは既存のteardown/return-origin/request ownerを通す。
+  ★固定へ移るときは、空一覧の拒否をread-onlyで確認してから同じownerで親basisへ戻し、
+  通常snapshotを作る。materialized stillと再生中mediaの別窓化も共通forkで対を移送する。
+  PDFを含む次sourceへの移動は、既存の移送・parkを終えてから未移送ownerを終了する。
+
+独立Sol / xhigh reviewerは、producer・設定・Remote・cache・読書位置と、最後の
+DirectMedia / Snapshot / 多窓の影響経路を確認する。追加の一覧採用と行削除・追加の
+所有境界も構造レビューを受け、最終ソース確認では未解決の重要指摘なし。
+自動検証・確認用buildのgateは実装担当が集約する。
+設計担当の実装検収とは別の記録。
+
+### 自動検証・確認用build（2026-10-09）
+
+最終Rust sourceを固定して次を検証した。途中のfixture修正は、準備完了後の操作を
+実workerで待つための変更で、意図的なrefresh/preflight交差や取消・source proofのassertionは
+維持する。実classifier/Collection Readyを保持する2回帰も実workerとsource切替を使う。
+
+| 検証 | 結果 | ログ（`target/`内） |
+| --- | --- | --- |
+| visibility focused（producer・派生・設定・state transition） | 94成功 | `A-1345-focused-r3-visibility.log` |
+| resume focused | 151成功 | `A-1345-focused-r2-2-resume.log` |
+| snapshot focused | 312成功・2 ignored | `A-1345-focused-r2-3-snapshot.log` |
+| folder scan / 多窓 focused | 37成功 / 35成功 | `A-1345-focused-r2-6-folder_scan.log` / `A-1345-focused-r2-5-app-multiwindow_scenario_tests.log` |
+| Ready保持 / 分類・refresh交差 / 評価一覧の重複採用回帰 | 2成功 / 33成功 / 1成功 | `A-1345-retention-focused.log` / `A-1345-classification-focused-final.log` / `A-1345-rating-duplicate-focused-final.log` |
+| IPC lib / Remote Rust | 65成功 / 134成功・1 ignored | `A-1345-ipc-lib.log` / `A-1345-remote-rust.log` |
+| Remote JavaScript | 191成功 | `A1345-remote-resume-node.log` |
+| 全lib（全対象、`cargo test -p mimageviewer --lib -- --test-threads=8`） | 11,095成功・0失敗・52 ignored、1022.71秒 | `A-1345-lib-final-r7.log` |
+| 通常 / portable core check | 両方成功 | `A-1345-normal-core-final.log` / `A-1345-portable-core-final.log` |
+| `ui_snapshot`（追加2件を含む） | 105成功、追加画像は目視確認済み | `A-1345-ui-snapshot-final.log` |
+| `cargo fmt --all --check` / glyph lint | 成功 / dangerous glyph 0 | `A-1345-fmt-final.log` / `A-1345-glyphs-final.log` |
+| `scripts/build-dev.ps1 -PreserveRuntime` | 成功、通常featureのcore・Remote service・EPUB workerとDLLを配置、PE/runtime検査成功 | `A-1345-build-dev-final.log` |
+
+**検収時の要調査事項:** 先行の既定並列による全libが一度`STATUS_ACCESS_VIOLATION`
+（`0xc0000005`）で異常終了した（`A-1345-lib-final-r6.log`、約60秒、timeoutではない）。
+fault stack/dumpは得られていない。RAW・metadata関連73件の単独実行は成功し、CDBでの
+24並列監視約11分では再現しなかった。debuggerの遅延下で時間制限のあるテストが
+失敗したため、絶対pathを照合した自分のlib test processのみ明示停止した。
+この監視実行は全lib成功の証跡ではない。最終8並列は全対象を成功したが、原因の解消を
+証明しない。未変更の`RawCancellation::cancel`にはhandle利用とbinding/dropの競合候補が
+見つかったが、このcrashとの因果関係は未証明。推測によるRAW変更は加えず、
+「既存flakiness」「修正済み」とは扱わない。
+詳細は`target/A-1345-native-investigation.md`。機能ソースの独立確認と上記成功によって
+この未解明事項を解決済みとは扱わず、実装検収とは別に引き継ぐ。
+
+最終検証結果は`target/A-1345-verification.md`、英語commit messageは
+`target/A-1345-msg.txt`、手動確認9シナリオは`target/A-1345-manual.md`。
+製品起動、commit、build-dist、test-fullは実施していない。
+実UI、Windows native presenter、実IME、多窓の操作結果はエージェントの観測ではない。
+利用者の手動確認項目をhandoffに記載する。
+
+### 独立レビュー8件への修正（2026-10-09）
+
+- Q11/Q12: 閲覧中の設定OKは採用済みページ列を保持する。終了後の pending reload は
+  採用済みpolicyとの差を同じ設定適用ownerへ渡し、★固定を解除して元場所を読み直す。
+  同policyの通常Snapshot reloadは従来どおり。設定変更は旧スタック準備ownerを取消し、
+  Extracting/Groupingのpolicy不一致も同じWorkerScan入口へ戻す。
+- 本内ブックマーク: 各ViewerContextBundleが投影cache・typed requestを所有し、cacheは
+  container・採用済みpolicyで識別する。要求の採用は所有context・accepted items generationも
+  照合する。共有DB actorの応答は既存ContextRef/registryで要求元へ配送し、格納中の別窓も
+  そのownerだけで投影完了を採用する。通常のmount/depositでcacheや要求を取消さない。
+  DB actorの軽い読出し後、来歴投影は別workerで実行する。
+  既存pendingを ReadingRows/Projecting の単一ownerへ置換し、取消・source交換・書込時の
+  失効は所有containerに限定する。動画・音声や別本の登録変更で現在のcacheを消さない。
+  PC/Remote、全体登録一覧は同じ実書庫来歴を使い、除外された実在ページを欠落行にしない。
+- 旧変換cache: §3.1の利用者決定(a)に従う。通知は評価の初回採用・再読込、検索stream、
+  登録一覧、本内ブックマーク、Remoteにも伝える。検索の通知はquery拒否状態と分離し、
+  検索中の進捗を保つ。実再変換manifestによる復帰と登録・評価保持を検査する。
+  再変換の実publishだけが宛先の共有目次templateを退役し、Windowsの保持read handleに
+  よるatomic replace拒否を防ぐ。読取・画面切替と他書庫は保持し、no-clobber拒否時は
+  退役しない。既存active readerの終了は既存modal/lifecycleに従い、retryや待機は追加しない。
+- Remote: protocol 68、旧画像APIと動画・音声開始を最新policyの共通read-source境界へ通す。
+  RAW先読みではsource判定とmember判定を分け、直接項目だけを取消可能な中央directory/
+  manifestで照合する。先読み窓で入れ子の器を展開しない契約を維持する。
+
+設定OK→閲覧終了→再入場、準備中の同期scan回数、投影完了のsource交換・取消・登録更新、
+PC/Remoteの実来歴、旧cache通知→実再変換→復帰、旧HTTP sibling入口、media開始、
+RAWの取消・サイズ上限・入れ子展開なしをhandler/worker回帰で検査する。
+今回の検証証跡は `target/A-1345-fix-verification.md`、英語commit messageは
+`target/A-1345-fix-msg.txt` に集約する。製品起動・commitは行わない。
+
+**2026-10-09 一時中断とcoordinator決定(a):** 本内ブックマークの単一App-global cache/requestは、
+同じ本を異なる採用済みpolicyで表示するMain embedded readerと格納・復帰した別窓が
+同一frameでpanelを描く既存経路に対応できない。container+policyの正しいkeyを入れると
+要求を互いに置換・取消し、両panelの読込が完了しなくなる。要求元をreadonly ContextRefで
+照合する修正だけでは、複数の有効なconsumerを保持する問題を解消しない。
+独立Sol/xhighがmedia handoffによるlinked stillの格納、ZIP/PDF descriptorの独立contextへの
+復帰、Main側F12・設定変更・新policyでの同一本open、旧別窓の再有効化の経路を確認した。
+coordinatorは既存ViewerContextBundleに本内投影ownerを所属させる案(a)を選択した。
+各viewerのcreate/mutate/drain/invalidate/dropを同じownerへ揃え、同じ本・異なるpolicyの
+兄弟contextが互いに取消・上書きしない回帰を追加する。App-global投影や新しいregistryは作らない。
+中央共有投影の案(b)は採用しない。別窓リワーク§2との構造合意と変更範囲は同plan§11へ記録する。
+
+関連して、Full reloadは元書庫overrideを保持する一方、分類・admissionの対象にcache ZIPを
+渡すため、ZIP除外時に表示可能な元RAR/7zの再読込が拒否される。元書庫を開き直す案は、
+元書庫が欠落・変換不能になっていても受入済みcacheをF5で再列挙できる既存動作を失うため
+不採用とした。読出し・分類・scope・Collection/Rating physical ownerのtarget_pathは物理cache
+のまま保持し、共有open admissionの種類判定だけを論理sourceで行う。requested pathが
+同じcontextのcurrent_folderと一致する時に限り、そのownerのarchive_source_overrideを使い、
+別pathや兄弟contextへaliasを流用しない。既存SameLocation adoptionがcursor・canonical
+history・return・Refresh intentを保つ。独立Sol/xhighがこの所有境界と既存producerを確認した。
+停止時の履歴は `target/A-1345-fix-checkpoint.md`、再開後の結果は検証記録に記録する。
+
+本8件修正の最終自動検証（2026-10-09）は、重点 `visibility_` 105件、既存mutation refresh
+27件、全lib既定並列11124件（52 skip）、Remote 135件（1 skip）、IPC 66件、UI snapshot
+105件が成功した。Web DOM/PWA 192件の有効な結果も再利用した。fmt・glyph lint（危険文字0）・
+通常/portable core checkが成功し、`build-dev.ps1 -PreserveRuntime`で通常profileのcoreと
+protocol 68のRemote、EPUB workerを配置した（266.0秒、PE検査成功）。今回の全libではAVは
+再現せず、8-threadでの全lib再実行は不要だった。初回gateの失敗と修正・再実行の経緯、
+独立した所有境界レビュー、各logは `target/A-1345-fix-verification.md` に記録した。
+製品は起動せず、commitも行っていない。実機確認手順は `target/A-1345-fix-manual.md`。
+
+### 再レビューの残存2件への修正（2026-10-09、97bf8c653後）
+
+- #5: `ConvertedArchiveReference::{CachedZip,Source}`で参照の所有を分ける。
+  元書庫の欠落・更新を検証するのはSource参照のみ。CachedZip参照は実cacheの列挙／
+  manifestまたはLegacyの実在memberを証拠とし、元書庫の状態や記録size/versionで
+  Unknown（許可）へ戻さない。OtherArchive bookmarkもSource参照の共通ownerへ通す。
+  Legacy／manifest × 元書庫欠落／更新、実在／欠落member・prefix、cache欠落、
+  DB記録size不一致・旧versionにある実manifest、再変換後の復帰と登録保持を検査する。
+- #8とRemote代表: `archive_cache::is_under_cache_root`は`path_key`のpure物理パス
+  比較を使う。normal／verbatim drive・UNCのcase/slashとcomponent境界を同じhelperで
+  照合し、root外の`..`・別drive/share・device/volume namespaceを拒否する。
+  cache対応表のreadonly照合も同じ表記を最大2候補で使い、DBキー・schemaは変えない。
+  RAW識別・代表選択・Remote File／ZipDirectoryサムネイルは既存producerとこのownerを
+  共有し、入口ごとのguardは追加しない。実7z→converter→Remote archive jobの
+  result activation→canonical backing→実identify／thumbnail handlerで回帰を検査する。
+  RAW識別はpayload読出し0・入れ子展開なし・取消・manifest欠落を確認し、サムネイルは
+  File／ZipDirectoryで設定を除外→解除→除外と変え、返されたWebP寸法で来歴除外を確認する。
+
+独立Sol/xhighは参照の所有、共通パス比較、handler回帰の凍結差分を確認し、
+構造修正に合意した。自動検証は実装側が担当する。今回の結果・各log・先行失敗は
+`target/A-1345-fix2-verification.md`、英語commit messageは`target/A-1345-fix2-msg.txt`、
+実機確認手順は`target/A-1345-fix2-manual.md`。製品起動・commitは行わない。
+
+**一時停止の経緯:** 新しい実handler回帰で、Fileのforeground/prefetchとRAW識別は通過したが、
+`/api/page`のZipDirectoryは既存`remote_view_trim_keys`により代表選定より前に
+「コンテナ自体は表示トリム対象ではありません」で拒否されると確認した。
+render_contextありにもZipDirectory pageの受入分岐がない。依頼の実/page ZipDirectory
+成功前提との矛盾として、利用者指示に従いAPI動作を追加せず停止する。
+独立レビュアーは公開HTTPの`validate_page_address`もZipDirectoryと書庫Fileを拒否し、
+ZipDirectoryには編集page identityがないと確認した。core File/pageテストの成功は、
+公開HTTPで書庫File/pageが提供される証拠にはならない。現行の代表画像は/thumb経路を使う。
+選択肢(a)は現行APIを維持し、ZipDirectoryは実際の代表／サムネイル経路と/page拒否を
+検査する。選択肢(b)はZipDirectory/page対応の設計・レビュー範囲を拡大する。
+停止時の重点検証は111成功・上記1失敗だった。
+
+**2026-10-09 coordinator決定(a):** 現行APIを維持する。公開`/api/page`は書庫File／
+ZipDirectoryを拒否し、HTTPの実routeでその拒否を回帰に固定する。代表選択は
+実`/api/thumb`入口で検証する。HTTP認証・admissionの実routeと、実converter／書庫jobが
+解決したcanonical verbatim backingを読む本体thumbnail handlerをそれぞれ検査する。
+テスト用の新しいIPC server／callbackや製品起動は追加しない。公開addressは通常表記を
+保ち、内部canonical pathで共通cache-root判定へ到達する。page APIの拡張は行わない。
+
+残存2件修正の最終検証は、重点visibility 112件、RAW-window 6件、新HTTP route 2件、
+全lib既定並列11131件（52 skip、800.00秒）、Remote Rust 137件（1 skip）、IPC 66件、
+UI snapshot 105件が成功した。変更していないWeb DOM/PWA 192件の既存結果は再利用した。
+fmt・glyph lint（危険文字0）・通常/portable core checkが成功し、
+`build-dev.ps1 -PreserveRuntime`で通常featureのcore・Remote・EPUB workerを配置した
+（162.8秒、VCRT PE runtime=4 / pe=3成功）。今回AVとsimilar-index flakeは再発せず、
+8-threadの全lib再実行は不要だった。これは先行AVの原因解明・解消の証明ではない。
+API前提の停止、テストfixtureの隔離修正と先行失敗も今回の検証記録に保存した。
+製品起動・commit・build-dist・test-fullは実施していない。実機確認は手動手順へ引き継ぐ。
+
+
+## 14. v4.5.0 masterとの統合（2026-10-09）
+
+§1.345の独立レビュー承認済み `1c2fb00f1` に、出荷済みv4.5.0 `840c309ec` を統合する。
+§1.345はv4.5.0の公開機能には含めず、次版の利用者実機確認へ渡す。
+masterの§1.339 facet保存/復元のsource proofと採用境界、§1.350 RAR読書位置バー、
+§1.355後続RAR巻の拒否、§1.347音声artを維持し、共通FileTypeVisibilityを一覧生成の最初の層に適用する。
+画像非表示でも表示する動画・音声のsidecar補助画像は残し、非表示音声も既存cache pruningの
+complete inventoryからは除かない。全体bookmark buildはmasterのmain Surface ownerを維持し、
+採用した行・source map・登録総数・legacy通知を揃える。本内bookmarkは各viewer bundleの所有を維持する。
+IPCは共通base v66、feature v68、master v67から統合版v69（max+1）にする。
+設定はbase446項目＋§1.345の1項目＋masterの6項目で453項目
+（転送対象140、除外313、wire138）と全field分類を照合する。
+検証証跡と利用者確認手順は `target/B345-merge-verification.md` に記録する。
+Git index/merge stateは利用者が所有し、実装担当は作業ツリーだけを編集する。
+
+閲覧履歴のloading shellでもidentity準備を既存hydration ownerが担当するため、一覧workerの
+受信はその準備後に行う。既存Pendingは失効条件を照合しながら応答を保持し、busy時の
+採用拒否で完了結果を失わない。新しいpending ownerや一覧の再採用を加えない。
+
+空のloading shellからの即時ナビゲーションも出荷版のまま保つ。
+共通`begin_sidecar_restore`は、既存ownerのbusy判定後、`items.is_empty() && !restore_sidecar`
+ならI/Oの不要な`empty(policy)`を同期確定し、既存display continuationへ進む。
+特定pathを例外化せず、空でもsidecar復元対象なら元の復元手順を維持する。
+独立Sol / xhigh reviewerは、採用済み入力の同期処理であり継続の義務を失わない構造と確認した。
+受信延期の回帰は既存の`prepare_current_listing_page_identity_index`を同じshellに開始して実際の
+準備中を作り、保留応答の保持とその後の一度だけの採用を確認する。出荷版の即時reselect回帰も保持する。
+
+サブフォルダ展開は出荷版の「音声行を表示しないが、音声混在フォルダは本集約しない」を維持する。
+展開のsidecar/同名重複候補からAudioを先に除き、policy適用後の重複除去を一度だけ行う。
+policyで表示対象となるAudioの存在は本集約判定に残し、Audioを除外した場合は画像フォルダとして
+集約できる。同名画像の保持・動画sidecar・Audio除外による集約の回帰を合わせて確認する。
+独立Sol / xhigh reviewerも、両側の意味を保つ構造的統合と確認した。
+
+統合後の最終検証は全lib 11,553成功／52除外、ui_snapshot 142、audit test 36と実audit、
+Remote-web 140成功／1除外、IPC 67、fmt・glyph lint・通常／portable core checkが成功。
+初回の16件の統合失敗は非同期fixtureのpoll不足と音声重複処理の衝突として修正し、期待値は維持した。
+AV・既知similar-index flakeは今回再発せず、snapshot PNGは253枚すべてhash不変だった。
+検証用buildは旧vendor VST3 hostのidentity不一致で一度停止し、CLAUDE.mdの手順に従い
+masterの現ソース一致host＋公式CRT4本を実ファイル復元して再実行成功（389.9秒、VCRT runtime=4／PE=3）。
+source identityとCRT正本hashを照合し、APPDATA・runtime cacheはimportしていない。
+製品起動・Git index変更・commitは行わず、利用者のstage／commitと実機確認へ渡す。
+
+
+### 統合独立レビューP2: 補助画像の採用順（2026-10-09、b76c19e34後）
+
+レビューで、画像種類の除外後に可視候補を再採用し、保持済みの非表示候補を落とす経路が指摘された。
+表示投影とは独立した `AuxiliaryMediaCandidates` を既存の物理フォルダ走査から作り、
+動画・音声のsource採否だけを共通policyで判定する。画像は種類除外を適用せず補助入力として保持し、
+既存の派生動画判定後に、各producerの出荷済み候補順で一度だけ採用する。
+通常／Remote物理一覧は既存一覧sort、Smart／集約／サブ展開は既存走査順を維持する。
+表示行の同名除去は候補mapを書き換えず、非表示画像の更新も既存signatureで検出する。
+音声・動画自体が非表示ならその補助sourceを採用しない。Audioを表示しないサブ展開も既存契約を維持する。
+
+既存の一覧reload／worker成果物で完結するため、設定変更専用のlive再構築、待機状態、横断registry、
+追加I/Oは不要。表示可否の単一ownerは引き続きFileTypeVisibilityであり、補助画像は既存の例外を適用する。
+通常フォルダ、Smart、Rating workerを通る集約、Remote `folder_list` の実経路へ
+複数画像のうち採用候補だけを隠す回帰を追加する。通常／Remoteの名前昇順はPNG採用を固定し、
+Smart／集約の実workerはfilesystemの走査順を維持するためbaselineの採用候補を隠す。
+共通候補とSmartのproducerには固定したjpg→png／png→jpg順で採用PNG／JPGだけを隠す検査も置く。
+通常は名前降順・size昇降順と動画も検査し、
+サブ展開の動画、JSONが実在する派生動画の除外で元動画と補助画像が戻るケースも検査する。
+検証証跡は `target/B345-fix-verification.md`、引き継ぎ文は `target/B345-fix-msg.txt` に記録する。
+
+
+本修正の検証はfmt check・glyph lint・重点スイート・全lib（11,560成功／52除外、既定threads）・
+ui_snapshot 142・Remote-web 140成功／1除外・IPC 67・通常／portable core check・
+audit test 36と実auditが成功した。AV・既知similar-index flakeは再発せず、253枚のsnapshot PNGは
+hash不変で再生成画像はない。`build-dev.ps1 -PreserveRuntime` は272.8秒で成功し、
+VCRT PE gate（runtime=4／PE=3）も成功した。製品起動とGit index変更・commitは行っていない。
+補助候補・source採否・採用順・signatureの構造を独立Sol / xhighが読み取り専用でレビューし、
+追加P2以上の指摘はなかった。走査順依存のテストはbaseline比較と固定候補順検査に分け、再レビュー済み。

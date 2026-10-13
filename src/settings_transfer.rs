@@ -139,11 +139,17 @@ macro_rules! transfer_get {
     ($s:expr, $f:ident, plain) => {
         $s.$f.clone()
     };
+    ($s:expr, $f:ident, specified_scale) => {
+        $s.common_fullscreen_specified_scale()
+    };
     ($s:expr, $f:ident, archive) => {
         $s.archive_file_handling_resolved()
     };
 }
 macro_rules! transfer_set {
+    ($s:expr, $f:ident, $v:expr, specified_scale) => {
+        $s.set_common_fullscreen_specified_scale(*$v)
+    };
     ($s:expr, $f:ident, $v:expr, plain) => {
         $s.$f = $v.clone()
     };
@@ -207,7 +213,13 @@ macro_rules! preferences_policy {
         }
         fn parse_items(items: &Map<String, Value>) -> ParsedPreferences {
             let mut result = ParsedPreferences { accepted: Vec::new(), issues: Vec::new(), unknown_count: 0 };
-            for (key, raw) in items { match key.as_str() {
+            let mut items = items.clone();
+            if crate::same_name_folder_book::canonicalize(&mut items).is_err() {
+                items.remove(crate::same_name_folder_book::KEY);
+                items.remove(crate::same_name_folder_book::LEGACY_KEY);
+                result.issues.push(issue("同名のフォルダと本"));
+            }
+            for (key, raw) in &items { match key.as_str() {
                 $( stringify!($field) => match validated::<$ty>(raw, $check) {
                     Some(value) => result.accepted.push(Accepted::$field(value)),
                     None => result.issues.push(issue($label)),
@@ -225,7 +237,7 @@ macro_rules! preferences_policy {
                 let mut changed_fields = Vec::new();
                 for accepted in &self.accepted { match accepted {
                     $( Accepted::$field(value) => {
-                        if settings.$field != *value { changed_fields.push($label.into()); }
+                        if transfer_get!(settings, $field, $get) != *value { changed_fields.push($label.into()); }
                         transfer_set!(settings, $field, value, $set);
                     }, )*
                     Accepted::StillChrome(value) => {
@@ -252,6 +264,7 @@ macro_rules! preferences_policy {
 preferences_policy! {
     export {
         ui_theme: UiTheme => ("テーマ", |v, _raw| matches!(v, UiTheme::System | UiTheme::Light | UiTheme::Dark), plain, plain);
+        preferences_restore_position: bool => ("環境設定の前回位置を復元", |_, _| true, plain, plain);
         text_contrast: TextContrast => ("文字コントラスト", |v, _raw| matches!(v, TextContrast::Standard | TextContrast::Strong), plain, plain);
         raw_brightness: crate::raw::RawBrightness => ("RAW の明るさ", |v, _raw| matches!(v, crate::raw::RawBrightness::MatchPreview | crate::raw::RawBrightness::None), plain, plain);
         ai_feature_mode: AiFeatureMode => ("AI利用範囲", |_, _| true, plain, plain);
@@ -303,13 +316,14 @@ preferences_policy! {
         archive_file_handling: ArchiveFileHandling => ("アーカイブファイルの扱い", |v, _raw| matches!(v, ArchiveFileHandling::Ask | ArchiveFileHandling::Convert | ArchiveFileHandling::Ignore), archive, archive);
         epub_file_handling: EpubFileHandling => ("EPUBファイルの扱い", |_, _| true, plain, plain);
         show_hidden_files: bool => ("隠しファイルを表示", |_, _| true, plain, plain);
+        file_type_visibility: crate::file_type_visibility::FileTypeVisibility => ("表示するファイル種類", |_, _| true, plain, plain);
         folder_thumb_sort: SortOrder => ("フォルダ代表画像の選定順", |v, _raw| matches!(v, SortOrder::FileName | SortOrder::Numeric | SortOrder::DateAsc | SortOrder::DateDesc), plain, plain);
         folder_thumb_depth: u32 => ("フォルダ代表画像の探索深さ", |v, _raw| (0..=10).contains(v), plain, plain);
         folder_skip_limit: usize => ("画像なしフォルダを飛ばす上限", |v, _raw| (1..=30).contains(v), plain, plain);
         edit_restore_prompt_enabled: bool => ("編集の復元確認", |_, _| true, plain, plain);
         sidecar_backup_enabled: bool => ("編集データのサイドカーバックアップ", |_, _| true, plain, plain);
         tag_sidecar_backup_enabled: bool => ("タグのサイドカーバックアップ", |_, _| true, plain, plain);
-        skip_zip_if_folder_exists: bool => ("同名フォルダがあるZIPを省略", |_, _| true, plain, plain);
+        same_name_folder_book: crate::same_name_folder_book::SameNameFolderBookPolicy => ("同名のフォルダと本", |_, _| true, plain, plain);
         skip_archive_if_zip_exists: bool => ("同名ZIPがあるアーカイブを省略", |_, _| true, plain, plain);
         skip_epub_if_pdf_exists: bool => ("同名PDFがあるEPUBを省略", |_, _| true, plain, plain);
         skip_image_if_video_exists: bool => ("同名の動画・音声がある画像を省略", |_, _| true, plain, plain);
@@ -324,6 +338,7 @@ preferences_policy! {
         reading_history_enabled: bool => ("閲覧履歴を記録", |_, _| true, plain, plain);
         default_spread_mode: SpreadMode => ("標準の見開き設定", |v, _| SpreadMode::all().contains(v), plain, plain);
         follow_document_reading_direction: bool => ("文書の綴じ方向に従う", |_, _| true, plain, plain);
+        remember_spread_shift_per_book: bool => ("見開きの調整を本ごとに記憶する", |_, _| true, plain, plain);
         default_reading_flow: ReadingFlow => ("標準の読書フロー", |_, _| true, plain, plain);
         default_reading_direction: ReadingDirection => ("標準の読み方向", |_, _| true, plain, plain);
         final_cover_spread_enabled: bool => ("裏表紙の見開き", |_, _| true, plain, plain);
@@ -335,6 +350,8 @@ preferences_policy! {
         continuous_reading_gap_px: u32 => ("連結読書のページ間隔", |v, _raw| (0..=200).contains(v), plain, plain);
         fullscreen_image_margin_color: [u8; 3] => ("閲覧表示の余白色", |_, _| true, plain, plain);
         fullscreen_fit_mode: FullscreenFitMode => ("閲覧表示のフィット方法", |v, _raw| FullscreenFitMode::all().contains(v), plain, plain);
+        fullscreen_specified_scale: FullscreenSpecifiedScale => ("指定サイズの幅・高さ", |v, _| v.is_valid(), specified_scale, specified_scale);
+        fullscreen_specified_scale_max_tenths: u32 => ("指定サイズの最大倍率", |v, raw| raw.as_u64().is_some() && (FULLSCREEN_SPECIFIED_SCALE_MAX_MIN_TENTHS..=FULLSCREEN_SPECIFIED_SCALE_MAX_MAX_TENTHS).contains(v), plain, plain);
         fullscreen_fit_cycle_excluded: Vec<String> => ("フィット循環に含めるモード", |v, _| FullscreenFitMode::all().iter().any(|mode| mode.cycle_enabled(v)), plain, plain);
         fullscreen_fit_no_upscale: bool => ("フィットで拡大しない", |_, _| true, plain, plain);
         fullscreen_fit_no_downscale: bool => ("フィットで縮小しない", |_, _| true, plain, plain);
@@ -397,6 +414,7 @@ preferences_policy! {
         effetune_pre_limiter_enabled => "移行先の EffeTune/VST 導入状態と音声処理構成に依存する微調整";
         effetune_auto_open_on_video => "移行先の EffeTune 導入状態とウィンドウ運用に依存する表示方針";
         effetune_keep_visible_when_minimized => "移行先の EffeTune/VST 導入状態とウィンドウ運用に依存する表示方針";
+        effetune_show_in_taskbar => "移行先の EffeTune 導入状態とウィンドウ運用に依存する表示方針";
         grid_cols => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         grid_view_mode => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_sort_key => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -850,6 +868,44 @@ pub fn write_preferences(path: &Path, json: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn same_name_folder_book_legacy_transfer_partial_and_new_precedence() {
+        use crate::same_name_folder_book::{KEY, LEGACY_KEY, SameNameFolderBookPolicy as Policy};
+        for (old, expected) in [(true, Policy::PreferBook), (false, Policy::ShowBoth)] {
+            let parsed = parse_items(serde_json::json!({LEGACY_KEY: old}).as_object().unwrap());
+            let mut destination = Settings::default();
+            destination.same_name_folder_book = Policy::PreferFolder;
+            let report = parsed.apply_to(&mut destination);
+            assert_eq!(report.accepted_count, 1);
+            assert_eq!(report.unknown_count, 0);
+            assert!(report.issues.is_empty());
+            assert_eq!(destination.same_name_folder_book, expected);
+        }
+        let mut destination = Settings::default();
+        destination.same_name_folder_book = Policy::PreferFolder;
+        parse_items(&serde_json::Map::new()).apply_to(&mut destination);
+        assert_eq!(destination.same_name_folder_book, Policy::PreferFolder);
+        let parsed = parse_items(
+            serde_json::json!({KEY:"show_both",LEGACY_KEY:true})
+                .as_object()
+                .unwrap(),
+        );
+        assert_eq!(parsed.apply_to(&mut destination).accepted_count, 1);
+        assert_eq!(destination.same_name_folder_book, Policy::ShowBoth);
+        let parsed = parse_items(
+            serde_json::json!({KEY:"future",LEGACY_KEY:true,"slideshow_interval_secs":9.0})
+                .as_object()
+                .unwrap(),
+        );
+        let report = parsed.apply_to(&mut destination);
+        assert_eq!(report.issues.len(), 1);
+        assert_eq!(destination.same_name_folder_book, Policy::ShowBoth);
+        assert_eq!(destination.slideshow_interval_secs, 9.0);
+        let (map, _) = project(capture_export(&destination));
+        assert_eq!(map[KEY], "show_both");
+        assert!(!map.contains_key(LEGACY_KEY));
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -870,12 +926,25 @@ mod tests {
     }
     fn nondefault_source() -> Settings {
         let mut settings = Settings::default();
+        settings
+            .file_type_visibility
+            .excluded_categories
+            .insert(crate::file_type_visibility::FileTypeCategory::Raw);
+        settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("png".into());
         settings.details_name_colors.enabled = false;
         settings.details_name_colors.colors[0] =
             crate::details_name_colors::DetailsNameColor::Custom {
                 light: [80, 60, 0],
                 dark: [214, 186, 102],
             };
+        settings.fullscreen_specified_scale = FullscreenSpecifiedScale {
+            width: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(725)),
+            height: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::LogicalPixels(900)),
+        };
+        settings.fullscreen_specified_scale_max_tenths = 125;
         settings.raw_brightness = crate::raw::RawBrightness::None;
         settings.ui_theme = different_enum(
             &settings.ui_theme,
@@ -899,6 +968,7 @@ mod tests {
         settings.auto_fullscreen_image_folders = !settings.auto_fullscreen_image_folders;
         settings.fullfeature_media_window = !settings.fullfeature_media_window;
         settings.restore_last_cursor = !settings.restore_last_cursor;
+        settings.preferences_restore_position = !settings.preferences_restore_position;
         settings.startup_window_state = different_enum(
             &settings.startup_window_state,
             &[
@@ -1091,7 +1161,8 @@ mod tests {
         settings.edit_restore_prompt_enabled = !settings.edit_restore_prompt_enabled;
         settings.sidecar_backup_enabled = !settings.sidecar_backup_enabled;
         settings.tag_sidecar_backup_enabled = !settings.tag_sidecar_backup_enabled;
-        settings.skip_zip_if_folder_exists = !settings.skip_zip_if_folder_exists;
+        settings.same_name_folder_book =
+            crate::same_name_folder_book::SameNameFolderBookPolicy::PreferFolder;
         settings.skip_archive_if_zip_exists = !settings.skip_archive_if_zip_exists;
         settings.skip_epub_if_pdf_exists = !settings.skip_epub_if_pdf_exists;
         settings.skip_image_if_video_exists = !settings.skip_image_if_video_exists;
@@ -1114,6 +1185,7 @@ mod tests {
             ],
         );
         settings.follow_document_reading_direction = !settings.follow_document_reading_direction;
+        settings.remember_spread_shift_per_book = !settings.remember_spread_shift_per_book;
         settings.default_reading_flow = different_enum(
             &settings.default_reading_flow,
             &[
@@ -1591,13 +1663,147 @@ mod tests {
             copy.fullscreen_fit_cycle_excluded,
             settings.fullscreen_fit_cycle_excluded
         );
+        let legacy =
+            parse_preferences(&document(json!(["Page", "Width", "Height", "Original"]))).unwrap();
+        assert!(legacy.apply_to(&mut settings).issues.is_empty());
+        assert!(
+            FullscreenFitMode::SpecifiedScale
+                .cycle_enabled(&settings.fullscreen_fit_cycle_excluded)
+        );
         let before = settings.fullscreen_fit_cycle_excluded.clone();
         let parsed = parse_preferences(&document(serde_json::json!([
-            "Page", "Width", "Height", "Original"
+            "Page",
+            "Width",
+            "Height",
+            "Original",
+            "SpecifiedScale"
         ])))
         .unwrap();
         assert_eq!(parsed.apply_to(&mut settings).issues.len(), 1);
         assert_eq!(settings.fullscreen_fit_cycle_excluded, before);
+    }
+
+    #[test]
+    fn specified_scale_transfer_validates_complete_values_and_preserves_common_owner() {
+        let mut settings = Settings::default();
+        let common = FullscreenSpecifiedScale {
+            width: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(125)),
+            height: SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::LogicalPixels(800)),
+        };
+        settings.fullscreen_specified_scale = common;
+        settings.fullscreen_specified_scale_max_tenths = 125;
+        let explicit_disabled = FullscreenSpecifiedScale {
+            width: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::LogicalPixels(750)),
+            height: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(725)),
+        };
+        let mut favorite = FavoriteViewState::from_settings(&settings);
+        favorite.fullscreen_specified_scale = Some(explicit_disabled);
+        let id = uuid::Uuid::new_v4();
+        settings.apply_favorite_view_overlay(id, &favorite);
+        let exported = export_preferences(&settings).unwrap();
+        let wire: Value = serde_json::from_str(&exported.json).unwrap();
+        assert_eq!(
+            wire["preferences"]["fullscreen_specified_scale"],
+            serde_json::to_value(common).unwrap()
+        );
+        assert_eq!(
+            wire["preferences"]["fullscreen_specified_scale_max_tenths"],
+            125
+        );
+        assert!(!exported.json.contains(&id.to_string()));
+        let mut destination = Settings::default();
+        parse_preferences(&exported.json)
+            .unwrap()
+            .apply_to(&mut destination);
+        assert_eq!(destination.fullscreen_specified_scale, common);
+        assert_eq!(destination.fullscreen_specified_scale_max_tenths, 125);
+        parse_preferences(&document(json!({})))
+            .unwrap()
+            .apply_to(&mut settings);
+        assert_eq!(settings.common_fullscreen_specified_scale(), common);
+        let replacement = FullscreenSpecifiedScale {
+            width: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::LogicalPixels(32768)),
+            height: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(10000)),
+        };
+        let parsed = parse_preferences(&document(json!({
+            "fullscreen_specified_scale": replacement,
+            "fullscreen_specified_scale_max_tenths": 200
+        })))
+        .unwrap();
+        assert!(parsed.apply_to(&mut settings).issues.is_empty());
+        assert_eq!(settings.fullscreen_specified_scale, explicit_disabled);
+        assert_eq!(settings.common_fullscreen_specified_scale(), replacement);
+        assert_eq!(settings.fullscreen_specified_scale_max_tenths, 200);
+        assert_eq!(settings.active_favorite_view_id(), Some(id));
+        for invalid_axis in [
+            json!({"enabled":false,"value":{"PercentTenths":0}}),
+            json!({"enabled":false,"value":{"PercentTenths":10001}}),
+            json!({"enabled":false,"value":{"LogicalPixels":0}}),
+            json!({"enabled":false,"value":{"LogicalPixels":32769}}),
+            json!({"enabled":false,"value":{"LogicalPixels":1.5}}),
+            json!({"enabled":false,"value":{"FutureUnit":80}}),
+            json!({"enabled":false}),
+            json!({"value":{"PercentTenths":800}}),
+            json!({"enabled":null,"value":{"PercentTenths":800}}),
+            Value::Null,
+        ] {
+            let invalid = json!({"width":invalid_axis,"height":replacement.height});
+            let parsed =
+                parse_preferences(&document(json!({"fullscreen_specified_scale":invalid})))
+                    .unwrap();
+            assert_eq!(parsed.issues.len(), 1, "{invalid}");
+            parsed.apply_to(&mut settings);
+            assert_eq!(settings.common_fullscreen_specified_scale(), replacement);
+        }
+        let missing = parse_preferences(&document(json!({
+            "fullscreen_specified_scale":{"width":replacement.width}
+        })))
+        .unwrap();
+        assert_eq!(missing.issues.len(), 1);
+        // Unknown children remain forward-compatible, while recognized axes must be complete.
+        let mut extended = serde_json::to_value(explicit_disabled).unwrap();
+        extended
+            .as_object_mut()
+            .unwrap()
+            .insert("extra".into(), json!(true));
+        let parsed =
+            parse_preferences(&document(json!({"fullscreen_specified_scale":extended}))).unwrap();
+        assert!(parsed.apply_to(&mut destination).issues.is_empty());
+        assert_eq!(destination.fullscreen_specified_scale, explicit_disabled);
+        let reparsed = parse_preferences(&export_preferences(&destination).unwrap().json).unwrap();
+        let mut roundtrip = Settings::default();
+        assert!(reparsed.apply_to(&mut roundtrip).issues.is_empty());
+        assert_eq!(roundtrip.fullscreen_specified_scale, explicit_disabled);
+    }
+
+    #[test]
+    fn specified_scale_max_transfer_requires_integer_in_range() {
+        let mut settings = Settings::default();
+        for value in [10, 50, 200] {
+            let parsed = parse_preferences(&document(json!({
+                "fullscreen_specified_scale_max_tenths":value
+            })))
+            .unwrap();
+            assert!(parsed.apply_to(&mut settings).issues.is_empty());
+            assert_eq!(settings.fullscreen_specified_scale_max_tenths, value);
+        }
+        for invalid in [
+            json!(9),
+            json!(201),
+            json!(-1),
+            json!(10.0),
+            json!(50.5),
+            json!("50"),
+            json!(null),
+        ] {
+            let parsed = parse_preferences(&document(json!({
+                "fullscreen_specified_scale_max_tenths":invalid
+            })))
+            .unwrap();
+            assert_eq!(parsed.issues.len(), 1, "{invalid}");
+            parsed.apply_to(&mut settings);
+            assert_eq!(settings.fullscreen_specified_scale_max_tenths, 200);
+        }
     }
 
     #[test]
@@ -1663,15 +1869,57 @@ mod tests {
     }
 
     #[test]
+    fn spread_shift_memory_transfer_preserves_policy_and_rejects_wrong_type() {
+        let mut settings = Settings::default();
+        let parsed =
+            parse_preferences(&document(json!({"remember_spread_shift_per_book": false}))).unwrap();
+        assert!(parsed.apply_to(&mut settings).issues.is_empty());
+        assert!(!settings.remember_spread_shift_per_book);
+        let exported = export_preferences(&settings).unwrap();
+        let mut restored = Settings::default();
+        assert!(
+            parse_preferences(&exported.json)
+                .unwrap()
+                .apply_to(&mut restored)
+                .issues
+                .is_empty()
+        );
+        assert!(!restored.remember_spread_shift_per_book);
+        let missing = parse_preferences(&document(json!({}))).unwrap();
+        missing.apply_to(&mut settings);
+        assert!(!settings.remember_spread_shift_per_book);
+        let invalid = parse_preferences(&document(
+            json!({"remember_spread_shift_per_book": "invalid_boolean"}),
+        ))
+        .unwrap();
+        assert_eq!(invalid.apply_to(&mut settings).issues.len(), 1);
+        assert!(!settings.remember_spread_shift_per_book);
+        let value: Value = serde_json::from_str(&exported.json).unwrap();
+        assert_eq!(
+            value["preferences"]["remember_spread_shift_per_book"],
+            false
+        );
+        assert!(value["preferences"].get("spread_shift_anchor").is_none());
+        assert!(value["preferences"].get("spread_shifts").is_none());
+    }
+
+    #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 452);
+        assert_eq!(entries.len(), 458);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            139
+            144
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|(_, reason)| reason.is_some())
+                .count(),
+            314
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -1681,7 +1929,7 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 137);
+        assert_eq!(wire.len(), 142);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);
@@ -1699,17 +1947,118 @@ mod tests {
     }
 
     #[test]
+    fn preferences_restore_position_transfer_roundtrip_and_missing_preserves_value() {
+        for enabled in [false, true] {
+            let mut source = Settings::default();
+            source.preferences_restore_position = enabled;
+            let exported = export_preferences(&source).unwrap();
+            assert!(exported.issues.is_empty());
+            let mut destination = Settings::default();
+            destination.preferences_restore_position = !enabled;
+            let report = parse_preferences(&exported.json)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert!(report.issues.is_empty());
+            assert_eq!(destination.preferences_restore_position, enabled);
+            parse_preferences(INITIAL_V1)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(destination.preferences_restore_position, enabled);
+            let parsed =
+                parse_preferences(&document(json!({"preferences_restore_position": "false"})))
+                    .unwrap();
+            assert_eq!(parsed.issues.len(), 1);
+            parsed.apply_to(&mut destination);
+            assert_eq!(destination.preferences_restore_position, enabled);
+        }
+    }
+
+    #[test]
+    fn file_type_visibility_import_requires_canonical_values_and_preserves_invalid_input() {
+        // Settings and the preferences input normalize extensions. Transfer input retains
+        // its existing stricter contract: imports accept the canonical exported shape.
+        let normalized: crate::file_type_visibility::FileTypeVisibility =
+            serde_json::from_value(json!({
+                "excluded_categories": ["raw"], "excluded_extensions": [".PNG", "png"]
+            }))
+            .unwrap();
+        assert_eq!(
+            normalized
+                .excluded_extensions
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["png"]
+        );
+        let parsed =
+            parse_preferences(&document(json!({ "file_type_visibility": normalized }))).unwrap();
+        let mut destination = Settings::default();
+        let report = parsed.apply_to(&mut destination);
+        assert!(report.issues.is_empty(), "{:?}", report.issues);
+        assert!(
+            destination
+                .file_type_visibility
+                .excluded_categories
+                .contains(&crate::file_type_visibility::FileTypeCategory::Raw)
+        );
+        assert_eq!(
+            destination
+                .file_type_visibility
+                .excluded_extensions
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![&"png".to_string()]
+        );
+        let before = destination.file_type_visibility.clone();
+        for invalid in [
+            json!({"excluded_categories":["future"], "excluded_extensions":[]}),
+            json!({"excluded_categories":[], "excluded_extensions":["../png"]}),
+            json!({"excluded_categories":["raw"], "excluded_extensions":[".PNG", "png"]}),
+            json!({"excluded_categories":["raw"], "excluded_extensions":["png", "png"]}),
+            json!({"excluded_categories":["raw"]}),
+        ] {
+            let parsed =
+                parse_preferences(&document(json!({"file_type_visibility": invalid}))).unwrap();
+            assert!(!parsed.apply_to(&mut destination).issues.is_empty());
+            assert_eq!(destination.file_type_visibility, before);
+        }
+        let exported = export_preferences(&destination).unwrap();
+        let mut other = Settings::default();
+        parse_preferences(&exported.json)
+            .unwrap()
+            .apply_to(&mut other);
+        assert_eq!(other.file_type_visibility, before);
+    }
+
+    #[test]
     fn all_allowed_values_roundtrip_and_all_excluded_fields_preserve() {
         let source = nondefault_source();
         let exported = export_preferences(&source).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);
         let mut destination = private_destination();
+        // The overlay's common projection is transferable. Align it before this
+        // generic exclusion check, whose full runtime-owner equality stays strict.
+        // The focused specified-scale test covers importing a changed common value.
+        destination
+            .set_common_fullscreen_specified_scale(source.common_fullscreen_specified_scale());
         let before = destination.clone();
         let parsed = parse_preferences(&exported.json).unwrap();
         let report = parsed.apply_to(&mut destination);
         assert_eq!(report.accepted_count, wire_keys().len());
         assert!(report.issues.is_empty());
         assert_excluded_unchanged(&before, &destination);
+        assert_eq!(
+            destination.common_fullscreen_specified_scale(),
+            source.common_fullscreen_specified_scale()
+        );
+        assert_eq!(
+            destination.fullscreen_specified_scale,
+            before.fullscreen_specified_scale
+        );
+        assert_eq!(
+            destination.fullscreen_specified_scale_max_tenths,
+            source.fullscreen_specified_scale_max_tenths
+        );
         assert_eq!(
             export_preferences(&destination).unwrap().json,
             exported.json
@@ -1865,6 +2214,7 @@ mod tests {
         source.effetune_pre_limiter_enabled = false;
         source.effetune_auto_open_on_video = true;
         source.effetune_keep_visible_when_minimized = true;
+        source.effetune_show_in_taskbar = false;
         source.window_pos = Some([100.0, 200.0]);
         source.toolbar_section_order.reverse();
         let exported = export_preferences(&source).unwrap();
@@ -1881,6 +2231,7 @@ mod tests {
                 "effetune_keep_visible_when_minimized",
                 serde_json::json!(true),
             ),
+            ("effetune_show_in_taskbar", serde_json::json!(false)),
             ("window_pos", serde_json::json!([100.0, 200.0])),
             (
                 "toolbar_section_order",
@@ -1898,7 +2249,7 @@ mod tests {
         let before = destination.clone();
         let parsed = parse_preferences(&document.to_string()).unwrap();
         let report = parsed.apply_to(&mut destination);
-        assert_eq!(report.unknown_count, 12);
+        assert_eq!(report.unknown_count, 13);
         assert_eq!(destination.raw_brightness, crate::raw::RawBrightness::None);
         assert_excluded_unchanged(&before, &destination);
 
@@ -1908,6 +2259,35 @@ mod tests {
         assert_eq!(report.issues.len(), 1);
         assert_eq!(destination.raw_brightness, crate::raw::RawBrightness::None);
         assert_excluded_unchanged(&before, &destination);
+    }
+
+    #[test]
+    fn effetune_taskbar_transfer_excludes_and_preserves_destination_in_both_flavors() {
+        for destination_value in [false, true] {
+            let source = Settings {
+                effetune_show_in_taskbar: !destination_value,
+                ..Settings::default()
+            };
+            let exported = export_preferences(&source).unwrap();
+            let mut document: Value = serde_json::from_str(&exported.json).unwrap();
+            assert!(
+                document["preferences"]
+                    .get("effetune_show_in_taskbar")
+                    .is_none()
+            );
+            // An externally supplied excluded key must not change the destination either.
+            document["preferences"]["effetune_show_in_taskbar"] =
+                serde_json::json!(!destination_value);
+            let mut destination = Settings {
+                effetune_show_in_taskbar: destination_value,
+                ..Settings::default()
+            };
+            let report = parse_preferences(&document.to_string())
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(report.unknown_count, 1);
+            assert_eq!(destination.effetune_show_in_taskbar, destination_value);
+        }
     }
 
     #[test]

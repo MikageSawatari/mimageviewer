@@ -426,7 +426,10 @@ perf イベントで計測できるようにする (§12)。中断を速く見�
 
 並列数は固定の設定値で決め、**実行時の空きメモリで変えない** (プロジェクト方針)。高い設定値での
 メモリ不足は許容し、LibRaw のメモリ確保失敗は `RawError::OutOfMemory` として型付きで返す
-(プロセスを落とさない)。`imgdata.rawparams.max_raw_memory_mb` は LibRaw 既定 (2048) のまま。
+(プロセスを落とさない)。通常現像の `imgdata.rawparams.max_raw_memory_mb` は LibRaw 既定 (2048) のまま。
+§1.359 の Now Playing 用 bounded half 現像は例外で、要求の byte 予算を MiB 単位へ切り下げ、
+既定値以下の native 上限として unpack 前に設定する（160 MiB）。half 出力寸法だけでは制限できない
+元RAW bufferの割当前チェックを有効にする。これはnative RAW bufferの割当制限であり、process全体の peak 保証ではない。
 worker thread の stack は 1 MiB 以上 (LibRaw は 1 呼び出しで 130〜140 KB の stack を使う、API-notes.html)。
 
 ## 6. RAW ページの状態 (単一の持ち主)

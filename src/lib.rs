@@ -21,6 +21,11 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#[cfg(test)]
+#[path = "../tests/support/ui_harness.rs"]
+pub(crate) mod test_ui;
+mod wgpu_backend_policy;
+
 pub mod activity_gate;
 pub mod adjustment;
 pub mod adjustment_db;
@@ -43,12 +48,17 @@ pub use ui_dialogs::preferences::draw_file_organize_destinations_settings_snapsh
 #[doc(hidden)]
 pub use ui_dialogs::preferences::draw_fullscreen_fit_cycle_settings_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_grid_background_double_click_settings_snapshot_fixture;
+pub use ui_dialogs::preferences::draw_preferences_restore_position_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_preferences_transfer_explanation_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_preferences_transfer_settings_snapshot_fixture;
 pub use ui_dialogs::settings_restore::draw_preferences_transfer_disabled_entry_snapshot_fixture;
 pub use ui_dialogs::settings_restore::draw_preferences_transfer_entry_snapshot_fixture;
+#[cfg(windows)]
+#[doc(hidden)]
+pub use ui_main::draw_effetune_show_only_snapshot_fixture;
 pub mod archive_cache;
 pub mod archive_converter;
+pub mod archive_origin;
 pub(crate) mod audio_album_art;
 pub mod audio_decode;
 pub mod audio_normalize_db;
@@ -57,8 +67,10 @@ pub mod auto_aspect;
 pub mod auto_aspect_cache;
 pub mod bake_stage;
 pub mod book_bookmarks;
+pub mod book_composition;
 mod book_fs_journal;
 pub mod book_resume_db;
+pub(crate) mod book_scope;
 pub mod bookmark_browser;
 pub mod books;
 pub mod cache_maintenance;
@@ -97,14 +109,18 @@ pub mod dwm_iconic_thumbnail;
 #[cfg(windows)]
 pub mod dwm_transitions;
 mod empty_items_reason;
+pub mod file_type_visibility;
+mod fullscreen_specified_scale;
 mod gpu_anime4k;
 mod gpu_lanczos;
 pub mod metadata_transfer;
 #[cfg(windows)]
 pub(crate) mod presentation_observer;
+pub(crate) mod spread_shift;
 mod startup_window_geometry;
 #[cfg(windows)]
 mod startup_windows_diag;
+pub mod ui_composition_editor;
 mod window_activation;
 /// 非 Windows stub: DWM (Desktop Window Manager) は Windows 専用。HWND を取らず
 /// クロスプラットフォーム経路から呼ばれる helper だけ no-op を提供する
@@ -140,7 +156,13 @@ pub mod filename_sort;
 pub mod filename_stack;
 pub mod filename_stack_script;
 mod final_composite;
+mod image_folder_zip;
+mod image_folder_zip_job;
+mod image_folder_zip_metadata;
 // filename_stack_ui は private な App へ impl を追加する library-internal module。
+mod adjustment_parameter_edit;
+mod everything_ipc;
+mod everything_results;
 mod filename_stack_ui;
 pub mod folder_pane;
 pub mod folder_rating_counter;
@@ -151,11 +173,15 @@ pub mod fs_animation;
 pub mod fs_entry;
 mod fs_page_load_scheduler;
 pub mod fts_index;
+pub mod fts_integrity;
 pub mod fts_meta;
 pub mod fts_writer_dispatcher;
 pub mod gamepad;
 pub mod global_search;
 mod global_search_ui;
+pub use global_search_ui::{
+    draw_everything_progress_snapshot_fixture, draw_everything_search_snapshot_fixture,
+};
 pub mod gpu_info;
 #[cfg(any(test, feature = "dev-tools"))]
 pub mod gpu_lanczos_spike;
@@ -180,8 +206,12 @@ pub mod known_folders;
 pub mod local_adjust_catalog;
 pub mod local_adjust_db;
 pub mod local_adjust_effect_ui;
+pub(crate) mod local_adjust_parameter_edit;
 pub(crate) mod local_adjust_write_worker;
+pub(crate) mod log_writer;
 pub mod logger;
+#[doc(hidden)]
+pub use ui_dialogs::preferences::draw_diagnostics_export_snapshot_fixture;
 mod manual_mask_tools;
 pub mod margin_fit;
 pub mod mask_db;
@@ -233,6 +263,7 @@ pub(crate) mod page_edit_write_epoch;
 mod process_memory_test_support;
 pub mod rar_loader;
 pub mod rating_db;
+pub(crate) mod rating_membership;
 mod rating_sort;
 pub mod rating_view;
 pub mod rating_write_worker;
@@ -326,13 +357,16 @@ mod ui_folder_pane;
 pub mod ui_font_catalog;
 pub mod ui_fonts;
 mod ui_fullscreen;
+#[doc(hidden)]
+pub use ui_fullscreen::draw_composition_editor_hud_snapshot_fixture;
 pub mod ui_startup;
 #[doc(hidden)]
 pub use ui_fullscreen::{
+    draw_fs_extracted_result_view_snapshot_fixture, draw_fs_fit_popup_snapshot_fixture,
     draw_fs_page_wait_indicator_snapshot_fixture, draw_fs_prefetch_indicator_snapshot_fixture,
     draw_music_locked_panel_snapshot_fixture, draw_music_panel_reach_snapshot_fixture,
-    draw_still_panel_reach_snapshot_fixture, draw_still_seek_strip_snapshot_fixture,
-    draw_still_touch_first_run_help_snapshot_fixture,
+    draw_spread_shift_hud_snapshot_fixture, draw_still_panel_reach_snapshot_fixture,
+    draw_still_seek_strip_snapshot_fixture, draw_still_touch_first_run_help_snapshot_fixture,
 };
 mod ui_details_icon;
 pub mod ui_helpers;
@@ -520,8 +554,7 @@ fn install_panic_log_hook() {
             .unwrap_or_else(|| "unknown location".to_string());
         let bt = std::backtrace::Backtrace::force_capture();
         let msg = format!("PANIC at {location}: {payload}\n{bt}");
-        logger::log(&msg);
-        append_panic_log_entry(&msg);
+        write_critical_diagnostic(&msg, append_panic_log_entry, |message| logger::log(message));
     }));
 }
 
@@ -532,6 +565,15 @@ const MAX_PANIC_LOG_BYTES: u64 = 4 * 1024 * 1024;
 
 fn append_panic_log_entry(msg: &str) {
     let log_dir = data_dir::logs_dir();
+    append_panic_log_entry_in(&log_dir, msg);
+}
+
+fn write_critical_diagnostic(message: &str, direct: impl FnOnce(&str), normal: impl FnOnce(&str)) {
+    direct(message);
+    normal(message);
+}
+
+fn append_panic_log_entry_in(log_dir: &std::path::Path, msg: &str) {
     let _ = std::fs::create_dir_all(&log_dir);
     let panic_log = log_dir.join("panic.log");
     // 追記前にサイズを確認し、上限超過なら panic.log -> panic.log.bak へ
@@ -575,8 +617,9 @@ fn install_ui_heartbeat_watchdog() {
                 std::thread::sleep(Duration::from_secs(1));
                 #[cfg(windows)]
                 for message in crate::video::native_window_health::poll_native_window_watchdogs() {
-                    crate::logger::log(message.clone());
-                    append_panic_log_entry(&message);
+                    write_critical_diagnostic(&message, append_panic_log_entry, |message| {
+                        crate::logger::log(message)
+                    });
                 }
                 let now_ms = state.start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                 if state.suspended.load(Ordering::Acquire) {
@@ -1006,6 +1049,22 @@ fn exit_startup(code: i32) -> ! {
     } else {
         miv_startup::Outcome::Error
     });
+    exit_with_logs(code)
+}
+
+/// Final boundary only: all runtime producers have already stopped. Both
+/// writers share one total deadline; blocked file owners are never joined.
+pub fn finish_logs() {
+    static DEADLINE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let deadline =
+        *DEADLINE.get_or_init(|| std::time::Instant::now() + std::time::Duration::from_secs(2));
+    logger::log("logging shutdown requested");
+    let _ = log_writer::shutdown_until(deadline);
+    let _ = miv_startup::shutdown_until(deadline);
+}
+
+pub(crate) fn exit_with_logs(code: i32) -> ! {
+    finish_logs();
     std::process::exit(code)
 }
 
@@ -1255,6 +1314,16 @@ pub fn run() -> eframe::Result {
     let perf_enabled = std::env::args().any(|a| a == "--perf-log" || a == "--perf-log-path")
         || perf_log_path.is_some();
     perf::init_with_path(perf_enabled, Some(prog_start), perf_log_path);
+    #[cfg(all(feature = "test-script", windows))]
+    if test_script_path.is_some() {
+        if let Some(directory) = test_evidence_dir.as_deref() {
+            if let Err(error) = test_script::release_checks::arm_startup(directory) {
+                write_to_parent_console(&format!("error: {error}\n"));
+                entry_trace.finish(miv_startup::Outcome::Error);
+                exit_startup(2);
+            }
+        }
+    }
 
     // WASAPI can take over a second to create the first output stream on a cold
     // boot. Warm it in the background so the first video open does not freeze
@@ -1476,8 +1545,8 @@ pub fn run() -> eframe::Result {
     // wgpu 既定のスコアリングでは Vulkan が DX12 より優先選択される環境があるため、
     // カスタムアダプタセレクタで明示的に DX12 アダプタを最優先する。DX12 が無ければ
     // Vulkan、それも無ければ任意の adapter を返す (eframe / egui 自体は描画される)。
-    // 動画 GPU 経路は実行時に `cc.wgpu_render_state.adapter.get_info().backend` を見て
-    // DX12 のときだけ有効化、Vulkan ならスキップして CPU readback で再生する。
+    // native video は独立した D3D11 device、HUD は別の DX12 Instance を使い、
+    // root GUI の選択 backend に依存しない。
     let mut wgpu_options = egui_wgpu::WgpuConfiguration::default();
     configure_wgpu_presentation(&mut wgpu_options);
     wgpu_options.startup_diagnostics = Some(Arc::new(|event| {
@@ -1528,7 +1597,7 @@ pub fn run() -> eframe::Result {
         }
     }));
     if let egui_wgpu::WgpuSetup::CreateNew(create_new) = &mut wgpu_options.wgpu_setup {
-        create_new.instance_descriptor.backends = wgpu::Backends::DX12 | wgpu::Backends::VULKAN;
+        create_new.instance_descriptor.backends = wgpu_backend_policy::native_backends();
         create_new.native_adapter_selector = Some(std::sync::Arc::new(
             |adapters: &[wgpu::Adapter], _surface: Option<&wgpu::Surface<'_>>| {
                 if let Some(a) = adapters
@@ -1671,6 +1740,15 @@ pub fn run() -> eframe::Result {
 
     entry_trace.finish(miv_startup::Outcome::Ok);
     let native_trace = miv_startup::span(miv_startup::Lane::Core, miv_startup::Stage::RunNative);
+    // Join authority lives beyond App/eframe. UI callbacks only close admission.
+    let spread_shift_owner = Arc::new(std::sync::Mutex::new(
+        None::<spread_shift::SpreadShiftProcessOwner>,
+    ));
+    let creator_spread_shift_owner = Arc::clone(&spread_shift_owner);
+    let book_composition_owner = Arc::new(std::sync::Mutex::new(
+        None::<book_composition::BookCompositionProcessOwner>,
+    ));
+    let creator_book_composition_owner = Arc::clone(&book_composition_owner);
     let run_result = eframe::run_native(
         "mimageviewer",
         options,
@@ -1736,6 +1814,43 @@ pub fn run() -> eframe::Result {
                 }
                 Err(error) => app.install_collection_runtime_failure(error),
             }
+            match spread_shift::SpreadShiftService::spawn_at(
+                data_dir::get(),
+                app.content_identity_recorder
+                    .as_ref()
+                    .map(|recorder| recorder.producer()),
+            ) {
+                Ok((service, owner)) => {
+                    *creator_spread_shift_owner.lock().unwrap() = Some(owner);
+                    app.install_spread_shift_runtime(
+                        service,
+                        Arc::clone(&creator_spread_shift_owner),
+                    );
+                }
+                Err(error) => {
+                    logger::log(format!("spread_shift: worker startup failed: {error}"));
+                    app.show_feedback_toast(format!(
+                        "見開き調整の保存を開始できませんでした: {error}"
+                    ));
+                }
+            }
+            match book_composition::BookCompositionService::spawn_at(
+                data_dir::get(),
+                app.content_identity_recorder
+                    .as_ref()
+                    .map(|recorder| recorder.producer()),
+            ) {
+                Ok((service, owner)) => {
+                    *creator_book_composition_owner.lock().unwrap() = Some(owner);
+                    app.install_book_composition_runtime(service);
+                }
+                Err(error) => {
+                    logger::log(format!("book_composition: worker startup failed: {error}"));
+                    app.show_feedback_toast(format!(
+                        "本の構成の保存を開始できませんでした: {error}"
+                    ));
+                }
+            }
             #[cfg(windows)]
             {
                 let clipboard_repaint_ctx = cc.egui_ctx.clone();
@@ -1774,11 +1889,8 @@ pub fn run() -> eframe::Result {
             if let Some(rs) = cc.wgpu_render_state.clone() {
                 #[cfg(windows)]
                 {
-                    // 実際に選ばれた wgpu バックエンドを確認。動画 GPU 経路は
-                    // `wgpu_hal::api::Dx12` 経由で D3D11 NT shared texture を
-                    // import するので **DX12 でないと使えない**。Vulkan
-                    // (= リモートデスクトップ等の fallback) では GPU video device を
-                    // 作らず CPU readback + swscale 経路にフォールバックする。
+                    // root GUI の backend を診断用に記録する。native video の
+                    // 独立した D3D11 device 作成を、この値で制限しない。
                     let backend = rs.adapter.get_info().backend;
                     crate::logger::log(format!("wgpu backend selected: {backend:?}"));
                     // GpuVideoDevice は wgpu backend に依存せず独立した D3D11 device を
@@ -1869,6 +1981,16 @@ pub fn run() -> eframe::Result {
     if let Ok(runtime) = collection_runtime {
         runtime.shutdown_and_join();
     }
+    if let Some(owner) = book_composition_owner.lock().unwrap().take() {
+        owner.shutdown_and_join();
+    }
+    if let Some(owner) = spread_shift_owner.lock().unwrap().take() {
+        for result in owner.shutdown_and_join() {
+            if let Err(error) = result.status {
+                logger::log(format!("spread_shift: exit save failed: {error}"));
+            }
+        }
+    }
     // Rendering and normal shutdown are complete. Preserve the buffered tail for
     // every perf category without adding another periodic log write on the UI.
     perf::flush();
@@ -1879,6 +2001,7 @@ pub fn run() -> eframe::Result {
         } else {
             miv_startup::Outcome::Error
         });
+        finish_logs();
         test_script::exit_after_run_native();
     }
     miv_startup::terminal(if run_result.is_ok() {
@@ -1886,6 +2009,7 @@ pub fn run() -> eframe::Result {
     } else {
         miv_startup::Outcome::Error
     });
+    finish_logs();
     run_result
 }
 
@@ -1902,7 +2026,7 @@ fn run_trt_smoke_test() -> ! {
         }
         Err(e) => {
             eprintln!("[smoke] start failed: {e}");
-            std::process::exit(1);
+            exit_with_logs(1);
         }
     };
 
@@ -1916,7 +2040,7 @@ fn run_trt_smoke_test() -> ! {
             Ok(ms) => println!("[smoke] LoadModel {:?} OK in {ms} ms", kind),
             Err(e) => {
                 eprintln!("[smoke] LoadModel {:?} failed: {e}", kind);
-                std::process::exit(1);
+                exit_with_logs(1);
             }
         }
     }
@@ -1936,7 +2060,7 @@ fn run_trt_smoke_test() -> ! {
             );
             if out.len() != expected_total {
                 eprintln!("[smoke] FAIL: output len mismatch");
-                std::process::exit(1);
+                exit_with_logs(1);
             }
             // ゼロ入力の anime6b 出力は数値的にゼロ近傍のはず。
             // 値域 [0,1] (× 255 で 0-255 にスケール) で大きく外れていないかチェック。
@@ -1946,14 +2070,14 @@ fn run_trt_smoke_test() -> ! {
         }
         Err(e) => {
             eprintln!("[smoke] Infer failed: {e}");
-            std::process::exit(1);
+            exit_with_logs(1);
         }
     }
 
     println!("[smoke] shutdown (Drop)");
     drop(pool);
     println!("[smoke] all OK");
-    std::process::exit(0);
+    exit_with_logs(0);
 }
 
 fn parse_window_size_arg() -> Option<[f32; 2]> {
@@ -2052,12 +2176,14 @@ fn parse_startup_open_path_arg_from(args: &[std::ffi::OsString]) -> Option<std::
 }
 
 fn absolutize_startup_open_path(path: std::path::PathBuf) -> std::path::PathBuf {
+    let path = crate::path_key::normalize_input_path(&path);
     if path.is_absolute() {
         return path;
     }
-    std::env::current_dir()
+    let absolute = std::env::current_dir()
         .map(|cwd| cwd.join(&path))
-        .unwrap_or(path)
+        .unwrap_or(path);
+    crate::path_key::normalize_input_path(&absolute)
 }
 
 fn cli_flag_takes_value(flag: &str) -> bool {
@@ -2118,6 +2244,47 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::path::PathBuf;
+
+    #[test]
+    fn panic_and_watchdog_direct_log_remains_independent_of_full_stalled_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let writer = crate::log_writer::test_support::writer(directory.path(), 1, 65536);
+        let pause = writer.pause_write();
+        assert!(writer.submit_normal("occupy queue budget during disk stall"));
+        pause.entered();
+        let root = directory.path().to_owned();
+        let producer = writer.clone();
+        let (finished, received) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let unwind = std::panic::catch_unwind(|| {
+                write_critical_diagnostic(
+                    "PANIC witness",
+                    |message| append_panic_log_entry_in(&root, message),
+                    |message| {
+                        assert!(!producer.submit_normal(message));
+                    },
+                );
+                panic!("isolated panic fixture");
+            });
+            assert!(unwind.is_err());
+            // The UI-hang watchdog uses this direct sink without the general queue.
+            append_panic_log_entry_in(&root, "UI THREAD HANG witness");
+            finished.send(()).unwrap();
+        });
+        let complete = received
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .is_ok();
+        let direct = std::fs::read_to_string(directory.path().join("panic.log")).unwrap();
+        drop(pause);
+        thread.join().unwrap();
+        assert!(
+            complete,
+            "critical diagnostics waited on the general writer"
+        );
+        assert!(direct.contains("PANIC witness"));
+        assert!(direct.contains("UI THREAD HANG witness"));
+        assert!(writer.shutdown());
+    }
 
     fn os_args(args: &[&str]) -> Vec<OsString> {
         args.iter().map(OsString::from).collect()
@@ -2189,4 +2356,31 @@ mod tests {
         assert!(path.is_absolute());
         assert!(path.ends_with("book.zip"));
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn startup_open_path_standardizes_mixed_absolute_path() {
+        let args = os_args(&["mimageviewer.exe", r"g:/home/comfyui\genshin_random"]);
+        let path = absolutize_startup_open_path(parse_startup_open_path_arg_from(&args).unwrap());
+        assert_eq!(
+            path.as_os_str(),
+            std::ffi::OsStr::new(r"G:\home\comfyui\genshin_random")
+        );
+    }
 }
+
+pub use ui_dialogs::preferences::draw_file_type_visibility_snapshot_fixture;
+pub use ui_dialogs::preferences::{
+    draw_fullscreen_fit_cycle_settings, draw_fullscreen_specified_scale_live_settings,
+    draw_fullscreen_specified_scale_settings,
+};
+pub use ui_main::draw_file_type_visibility_status_snapshot_fixture;
+
+pub(crate) mod archive_visibility;
+
+pub mod same_name_folder_book;
+
+pub use ui_dialogs::preferences::draw_same_name_folder_book_settings_snapshot_fixture;
+
+mod ui_image_folder_zip;
+pub use ui_image_folder_zip::draw_snapshot as draw_image_folder_zip_snapshot;

@@ -1,4 +1,4 @@
-use super::{DetachedHostClaim, DetachedSessionLease, ViewerPresentation};
+use super::{DetachedHostClaim, DetachedSessionLease, FsMetadataBoundary, ViewerPresentation};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DetachedHostLease {
@@ -189,6 +189,7 @@ pub(crate) enum PresentationTransitionEvent {
         request_id: u64,
     },
     TerminalClose,
+    TerminalCloseForRatingMembership,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -234,19 +235,20 @@ pub(crate) enum PresentationTransitionEffect {
     TerminalSessionClose {
         request_id: u64,
         target: ViewerPresentation,
+        metadata_boundary: FsMetadataBoundary,
     },
     SetZOrderRecoveryPermit(bool),
 }
 
 /// terminal 効果の実行が、通常の teardown まで到達したか。
 ///
-/// `TerminalSessionClose` の実行は `close_fullscreen` を呼び、遷移が既に `Stable` なので
-/// そのまま `close_fullscreen_now` まで走る。**呼び出し側が「まだ閉じていない」と見なして
+/// `TerminalSessionClose` の実行は close の metadata boundary を保持して teardown まで
+/// 走る。**呼び出し側が「まだ閉じていない」と見なして
 /// 二度目を呼ぶと、初回 close が整えた状態を巻き戻す。**閉じたかどうかを bool ではなく
 /// 名前で返すのは、呼び出し側が「何を確かめて分岐したのか」を読めるようにするため。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PresentationEffectsOutcome {
-    /// 効果の実行中に `close_fullscreen` まで到達した。呼び出し側は再度閉じない。
+    /// 効果の実行中に fullscreen teardown まで到達した。呼び出し側は再度閉じない。
     ClosedFullscreen,
     /// 到達していない。閉じる責任は呼び出し側にある。
     DidNotClose,
@@ -424,6 +426,34 @@ impl PresentationTransitionOwner {
     }
 
     pub(crate) fn dispatch(&mut self, event: PresentationTransitionEvent) {
+        let metadata_boundary = match event {
+            PresentationTransitionEvent::TerminalClose => Some(FsMetadataBoundary::Manual),
+            PresentationTransitionEvent::TerminalCloseForRatingMembership => {
+                Some(FsMetadataBoundary::RatingMembership)
+            }
+            _ => None,
+        };
+        if let Some(metadata_boundary) = metadata_boundary {
+            // Closing supersedes forward work which has not left this owner. Cleanup for
+            // earlier requests still owns its resources, so feed it into terminal reduction
+            // for lease deduplication. A queued close is replaced by this explicit cause.
+            self.effects.retain(|effect| {
+                matches!(
+                    effect,
+                    PresentationTransitionEffect::AbortNative { .. }
+                        | PresentationTransitionEffect::DestroyHost { .. }
+                        | PresentationTransitionEffect::CloseDetachedSession { .. }
+                )
+            });
+            let (state, effects) = terminal_close(
+                self.state,
+                self.effects.drain(..).collect(),
+                metadata_boundary,
+            );
+            self.state = state;
+            self.effects.extend(effects);
+            return;
+        }
         let (state, effects) = reduce_presentation_transition(self.state, event);
         self.state = state;
         self.effects.extend(effects);
@@ -1075,7 +1105,12 @@ fn reduce_abort_transition(
                 effects,
             )
         }
-        (state, PresentationTransitionEvent::TerminalClose) => terminal_close(state, effects),
+        (state, PresentationTransitionEvent::TerminalClose) => {
+            terminal_close(state, effects, FsMetadataBoundary::Manual)
+        }
+        (state, PresentationTransitionEvent::TerminalCloseForRatingMembership) => {
+            terminal_close(state, effects, FsMetadataBoundary::RatingMembership)
+        }
         (state, _) => (state, effects),
     }
 }
@@ -1083,6 +1118,7 @@ fn reduce_abort_transition(
 fn terminal_close(
     state: PresentationTransitionState,
     mut effects: Vec<PresentationTransitionEffect>,
+    metadata_boundary: FsMetadataBoundary,
 ) -> (
     PresentationTransitionState,
     Vec<PresentationTransitionEffect>,
@@ -1146,7 +1182,11 @@ fn terminal_close(
         _ => request.unwrap().current,
     };
     let target = request.map_or(current, |request| request.target);
-    effects.push(PresentationTransitionEffect::TerminalSessionClose { request_id, target });
+    effects.push(PresentationTransitionEffect::TerminalSessionClose {
+        request_id,
+        target,
+        metadata_boundary,
+    });
     effects.push(PresentationTransitionEffect::SetZOrderRecoveryPermit(true));
     (PresentationTransitionState::Stable { current }, effects)
 }
@@ -1616,6 +1656,194 @@ mod tests {
         );
         assert!(owner.z_order_recovery_permitted());
         // Killing mutation: set aborted_candidate_host_hwnd to 0 in reduce_replaced_request.
+    }
+
+    #[test]
+    fn terminal_close_supersedes_queued_forward_work_and_preserves_lease_cleanup() {
+        for stage in 0..3 {
+            for forward_was_taken in [false, true] {
+                let mut owner = PresentationTransitionOwner::stable(ViewerPresentation::Fullscreen);
+                let request_id = request(
+                    &mut owner,
+                    ViewerPresentation::DetachedWindow,
+                    CANDIDATE_HOST,
+                );
+                owner.take_effects();
+                owner.drive();
+                if stage >= 1 {
+                    owner.take_effects();
+                    owner.dispatch(PresentationTransitionEvent::NativeReady {
+                        request_id,
+                        candidate: candidate(CANDIDATE_HOST),
+                    });
+                    owner.drive();
+                }
+                if stage >= 2 {
+                    owner.take_effects();
+                    owner.dispatch(PresentationTransitionEvent::NativeCommitted {
+                        request_id,
+                        candidate_generation: GENERATION,
+                    });
+                }
+                if forward_was_taken {
+                    owner.take_effects();
+                }
+                owner.dispatch(PresentationTransitionEvent::TerminalCloseForRatingMembership);
+                let effects = owner.take_effects();
+                assert!(
+                    !effects.iter().any(|effect| matches!(
+                        effect,
+                        PresentationTransitionEffect::PrepareNative { .. }
+                            | PresentationTransitionEffect::PublishNative { .. }
+                            | PresentationTransitionEffect::RetireOutgoing { .. }
+                            | PresentationTransitionEffect::ApplyPresentation { .. }
+                            | PresentationTransitionEffect::SetHostVisible { .. }
+                            | PresentationTransitionEffect::FocusHost { .. }
+                    )),
+                    "stage={stage}, forward_was_taken={forward_was_taken}"
+                );
+                assert_eq!(
+                    detached_cleanup_counts(
+                        &effects,
+                        DetachedSessionLease {
+                            window_id: CANDIDATE_WINDOW
+                        }
+                    ),
+                    (usize::from(stage == 2), 1),
+                    "stage={stage}, forward_was_taken={forward_was_taken}"
+                );
+                assert_eq!(
+                    effects
+                        .iter()
+                        .filter(|effect| matches!(
+                            effect,
+                            PresentationTransitionEffect::TerminalSessionClose {
+                                metadata_boundary: FsMetadataBoundary::RatingMembership,
+                                ..
+                            }
+                        ))
+                        .count(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn queued_terminal_close_keeps_cleanup_once_and_uses_latest_explicit_cause() {
+        let mut owner = PresentationTransitionOwner::stable(ViewerPresentation::DetachedWindow);
+        request(&mut owner, ViewerPresentation::Fullscreen, MAIN_HOST);
+        owner.drive();
+        owner.dispatch(PresentationTransitionEvent::TerminalClose);
+        owner.dispatch(PresentationTransitionEvent::TerminalCloseForRatingMembership);
+        let mut effects = owner.take_effects();
+        assert_eq!(
+            detached_cleanup_counts(
+                &effects,
+                DetachedSessionLease {
+                    window_id: OUTGOING_WINDOW
+                }
+            ),
+            (1, 1)
+        );
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(
+                    effect,
+                    PresentationTransitionEffect::TerminalSessionClose { .. }
+                ))
+                .count(),
+            1
+        );
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            PresentationTransitionEffect::TerminalSessionClose {
+                metadata_boundary: FsMetadataBoundary::RatingMembership,
+                ..
+            }
+        )));
+        // The reverse supersession must retain the same resource cleanup and honor Manual.
+        owner.effects.extend(effects.drain(..));
+        owner.dispatch(PresentationTransitionEvent::TerminalClose);
+        let effects = owner.take_effects();
+        assert_eq!(
+            detached_cleanup_counts(
+                &effects,
+                DetachedSessionLease {
+                    window_id: OUTGOING_WINDOW
+                }
+            ),
+            (1, 1)
+        );
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(
+                    effect,
+                    PresentationTransitionEffect::TerminalSessionClose {
+                        metadata_boundary: FsMetadataBoundary::Manual,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn rating_terminal_close_keeps_metadata_cause_through_native_abort_once() {
+        let mut manual = PresentationTransitionOwner::stable(ViewerPresentation::Fullscreen);
+        let request_id = request(
+            &mut manual,
+            ViewerPresentation::DetachedWindow,
+            CANDIDATE_HOST,
+        );
+        drive_to_native_wait(&mut manual);
+        let mut rating = manual.clone();
+        manual.dispatch(PresentationTransitionEvent::TerminalClose);
+        rating.dispatch(PresentationTransitionEvent::TerminalCloseForRatingMembership);
+        let manual_effects = manual.take_effects();
+        let rating_effects = rating.take_effects();
+        assert_eq!(manual.state(), rating.state());
+        assert!(!rating.is_transitioning());
+        assert_eq!(
+            rating_effects
+                .iter()
+                .filter(|effect| matches!(
+                    effect,
+                    PresentationTransitionEffect::TerminalSessionClose { .. }
+                ))
+                .count(),
+            1
+        );
+        assert!(
+            rating_effects.contains(&PresentationTransitionEffect::TerminalSessionClose {
+                request_id,
+                target: ViewerPresentation::DetachedWindow,
+                metadata_boundary: FsMetadataBoundary::RatingMembership,
+            })
+        );
+        let rating_as_manual: Vec<_> = rating_effects
+            .into_iter()
+            .map(|effect| match effect {
+                PresentationTransitionEffect::TerminalSessionClose {
+                    request_id, target, ..
+                } => PresentationTransitionEffect::TerminalSessionClose {
+                    request_id,
+                    target,
+                    metadata_boundary: FsMetadataBoundary::Manual,
+                },
+                effect => effect,
+            })
+            .collect();
+        assert_eq!(manual_effects, rating_as_manual);
+        rating.dispatch(PresentationTransitionEvent::NativeAborted { request_id });
+        rating.dispatch(PresentationTransitionEvent::NativeReady {
+            request_id,
+            candidate: candidate(CANDIDATE_HOST),
+        });
+        assert!(rating.take_effects().is_empty());
     }
 
     #[test]

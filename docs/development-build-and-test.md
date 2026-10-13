@@ -13,8 +13,18 @@
 | 実アプリ用の軽量ビルド | `.\scripts\build-dev.ps1` | core と remote service を `dev-runtime` でビルド |
 | 自動操作用の使い捨て環境を準備 | `.\scripts\prepare-portable-smoke.ps1 -TestScript` | 診断portableを別出力先でbuildし、固定sandboxへ配置。起動はしない |
 | 了承済みのリリース前実アプリ検証 | `.\scripts\ui-smoke.ps1 -Scenario <対象> -InteractiveApproved` | [実行確認](interactive-release-verification.md)後だけ。通常の開発反復・test-fullへ自動連結しない |
+| 毎リリースのidle／perf正規確認 | `.\scripts\ui-smoke.ps1 -Scenario ReleaseChecks -InteractiveApproved` | 2026-10-11採用。利用者がPowerShellで実行。隔離seed＋5 idle＋cached／uncached perf、全結果は `target/ui-smoke/runs/<run-id>/` |
 | リリース前の自動テスト一式 | `.\scripts\test-full.ps1` | workspace 全体 + テストを持つ補助 bin + 除外された vendor 3 crate の lib test |
 | 配布成果物を生成 | `.\scripts\build-dist.ps1` | 全体テスト、clean、release、installer、portable |
+
+ReleaseChecksは非対話テストではなく、desktopを使う了承済み検証枠で実行する。
+他アプリ窓を最小化し、build待ちを含め終了までPCに触れない。seed込み約5〜8分＋初回build、
+FFmpeg CLIがPATHに必要。同一ソースの診断artifactが検証できる場合だけ `-SkipBuild` を追加する。
+`prepare-portable-smoke.ps1 -TestScript` は事前buildのみで起動しない。
+suite採用後もエージェントのnormal-profile起動禁止、明示了承、使い捨てportable／設定保護を維持する。
+full gate／buildからの自動起動はしない。手動 `perf_smoke.ps1`／`check-idle-health.ps1` は
+fallback／診断として残す。[正規手順と採用証跡](release-check-automation-plan.md) と
+[idle条件・閾値](idle-health-check.md) を参照し、警告付きPASS・FAIL・環境不成立を区別して記録する。
 
 テスト名フィルタは実行するテストを絞るだけで、Cargo がコンパイルする target の種類は
 減らさない。反復を短くしたい場合は `--lib`、`--bin`、`--test` も指定して target を絞る。

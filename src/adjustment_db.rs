@@ -18,6 +18,40 @@ pub struct AdjustmentDb {
 }
 
 impl AdjustmentDb {
+    pub(crate) fn favorite_view_for_copy(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<FavoriteViewState>, String> {
+        use rusqlite::OptionalExtension;
+        self.conn
+            .query_row(
+                "SELECT state_json FROM favorite_view_states WHERE favorite_id=?1",
+                [id.to_string()],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .map(|json| serde_json::from_str(&json).map_err(|e| e.to_string()))
+            .transpose()
+    }
+    pub(crate) fn copy_favorite_view_for_zip(
+        &self,
+        old: Uuid,
+        new: Uuid,
+        phase: crate::image_folder_zip_metadata::CopyPhase,
+    ) -> crate::image_folder_zip_metadata::CopyReply {
+        self.favorite_view_for_copy(old)?;
+        self.favorite_view_for_copy(new)?;
+        crate::image_folder_zip_metadata::copy_rows_on(
+            &self.conn,
+            "favorite_view_states",
+            "favorite_id",
+            &old.to_string(),
+            &new.to_string(),
+            phase,
+            |_, _| Ok(()),
+        )
+    }
     /// DB を開く (なければ作成)。旧スキーマが残っていれば破棄して作り直す。
     pub fn open() -> Result<Self, rusqlite::Error> {
         Self::open_at(&Self::db_path())

@@ -15,6 +15,7 @@ pub(crate) enum DeliveryStage {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct HostSnapshot {
     pub attached: usize,
+    pub taskbar: bool,
     pub delivered: usize,
     pub requested: bool,
     pub visible: bool,
@@ -40,6 +41,9 @@ impl FakeHost {
         let (commands, command_rx, events) = Bridge::fake_host_for_test();
         let bridge = new_bridge();
         bridge.set_gui_gate(Arc::clone(&gate));
+        // load_worker installs the controller's failure owner before publication.
+        // Native user-hide must therefore be recorded without a second UI pipe write.
+        bridge.set_gui_failure_sink(controller.gui_failure_tx.clone());
         bridge.install_fake_host_for_test(Arc::clone(&commands));
         // Same dispatch ownership as load_worker, including recovery reconciliation.
         let tx = controller.host_tx.clone();
@@ -52,9 +56,63 @@ impl FakeHost {
         let worker = std::thread::spawn(move || {
             let mut state = HostSnapshot::default();
             let mut paused = false;
+            let mut metadata_revision = None;
             while let Ok(value) = command_rx.recv() {
                 let cmd = value["cmd"].as_str().unwrap();
                 match cmd {
+                    "set_now_playing" => {
+                        // RegisterBridge resends the current snapshot before GUI work.
+                        // Consume only its exact fire-and-forget wire shape: metadata
+                        // must neither synthesize an ACK nor alter GUI observations.
+                        let keys = value
+                            .as_object()
+                            .unwrap()
+                            .keys()
+                            .map(String::as_str)
+                            .collect::<std::collections::BTreeSet<_>>();
+                        assert_eq!(
+                            keys,
+                            [
+                                "cmd",
+                                "slot_id",
+                                "revision",
+                                "title",
+                                "album",
+                                "artist",
+                                "artwork",
+                                "artworkMimeType"
+                            ]
+                            .into_iter()
+                            .collect()
+                        );
+                        assert_eq!(value["slot_id"], 0);
+                        let revision = value["revision"].as_u64().unwrap();
+                        assert!(metadata_revision.is_none_or(|previous| revision >= previous));
+                        metadata_revision = Some(revision);
+                        for key in ["title", "album", "artist"] {
+                            let text = value[key].as_str().unwrap();
+                            assert!(text.encode_utf16().count() <= 4096 && !text.contains('\0'));
+                        }
+                        let artwork = value["artwork"].as_str().unwrap();
+                        let mime = value["artworkMimeType"].as_str().unwrap();
+                        if artwork.is_empty() {
+                            assert!(mime.is_empty());
+                        } else {
+                            use base64::Engine;
+                            assert!(matches!(
+                                mime,
+                                "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+                            ));
+                            assert!(artwork.len() <= 11_184_812);
+                            assert!(
+                                base64::engine::general_purpose::STANDARD
+                                    .decode(artwork)
+                                    .unwrap()
+                                    .len()
+                                    <= 8 * 1024 * 1024
+                            );
+                        }
+                    }
                     "query_gui_size" => events.emit(Event::GuiSize {
                         width: 640,
                         height: 480,
@@ -64,6 +122,7 @@ impl FakeHost {
                         assert_eq!(value["visible"], 0, "attach must remain hidden");
                         assert_eq!(value["unowned"], 1);
                         assert_eq!(value["gui_gate_name"], gate.name());
+                        state.taskbar = value["show_in_taskbar"].as_bool().unwrap();
                         state.attached += 1;
                         if stop == DeliveryStage::HiddenAttach && !paused {
                             reached_tx.send(stop).unwrap();
@@ -75,6 +134,7 @@ impl FakeHost {
                             height: 480,
                             slot_id: 0,
                             container_hwnd: 1,
+                            normal_rect: None,
                         });
                     }
                     "set_gui_visibility_checked" => {
@@ -119,6 +179,7 @@ impl FakeHost {
                             outcome,
                         });
                     }
+                    "set_gui_taskbar" => state.taskbar = value["value"].as_bool().unwrap(),
                     "set_gui_remote_session" => {}
                     "sync_gui_main_visibility" => {
                         // Suppression recovery can restore only an accepted visible intent.
@@ -130,6 +191,20 @@ impl FakeHost {
                             state.auto_activate += 1;
                         }
                     }
+                    "fixture_event" => {
+                        let event: Event = serde_json::from_value(value["event"].clone()).unwrap();
+                        if matches!(event, Event::GuiUserHidden { .. }) {
+                            state.requested = false;
+                            state.visible = false;
+                        }
+                        events.emit(event);
+                    }
+                    "query_state_concurrent" => events.emit(Event::PluginState {
+                        slot_id: 0,
+                        request_id: value["request_id"].as_u64(),
+                        state: String::new(),
+                        error: Some("interrupted".into()),
+                    }),
                     "fixture_fence" => snapshot_tx.send(state.clone()).unwrap(),
                     "shutdown" => break,
                     other => panic!("unexpected fake host command: {other}"),
@@ -144,6 +219,17 @@ impl FakeHost {
             commands,
             worker: Some(worker),
         }
+    }
+
+    pub(crate) fn publish_event(&self, controller: &EffetuneController, event: Event) {
+        controller
+            .host_tx
+            .send(HostCommand::Gui {
+                bridge: Arc::clone(&self.commands),
+                value: serde_json::json!({ "cmd": "fixture_event", "event": event }),
+            })
+            .unwrap();
+        self.fence(controller);
     }
 
     pub(crate) fn wait_stage(&self, stage: DeliveryStage) {
@@ -190,5 +276,29 @@ impl Drop for FakeHost {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn effetune_taskbar_worker_inherits_latest_loading_target_and_updates_attached_frame() {
+    let mut controller = EffetuneController::new();
+    controller.set_show_in_taskbar(false);
+    let host = FakeHost::new(&controller, DeliveryStage::Loading);
+    controller.runtime = EffetuneRuntime::Loading {
+        origin: LoadOrigin::Startup,
+        open_gui_when_ready: None,
+    };
+    controller.set_show_in_taskbar(true);
+    controller.set_show_in_taskbar(false);
+    controller.set_test_load_bridge_completion(Arc::clone(&host.bridge));
+    assert!(controller.poll());
+    controller.request_show_gui();
+    assert!(!host.fence(&controller).taskbar);
+    assert_eq!(host.fence(&controller).attached, 1);
+    for value in [true, false, true] {
+        controller.set_show_in_taskbar(value);
+        let state = host.fence(&controller);
+        assert_eq!(state.taskbar, value);
+        assert_eq!(state.attached, 1, "settings must not recreate the editor");
     }
 }

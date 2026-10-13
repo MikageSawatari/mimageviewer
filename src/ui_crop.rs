@@ -242,6 +242,7 @@ impl App {
         fs_idx: usize,
     ) -> crate::ui_fullscreen::FsKeyAction {
         let action = crate::ui_fullscreen::FsKeyAction {
+            page_transition: Default::default(),
             close: false,
             close_to_page_list: false,
             page_nav: crate::ui_fullscreen::FsPageNav::None,
@@ -799,7 +800,9 @@ mod tests {
                 rotation: crate::rotation_db::Rotation::None,
                 free_rotation_rad: 0.0,
                 content_bbox: None,
-                fit_mode: crate::settings::FullscreenFitMode::Page,
+                fit_mode: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
+                    crate::settings::FullscreenFitMode::Page,
+                ),
                 fit_scale_limits:
                     crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
                 pixels_per_point: 1.0,

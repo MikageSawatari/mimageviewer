@@ -111,8 +111,8 @@ env だけの案は core entry 前の停止に記録が残らないため不採�
   begin、end、watchdog event は短い buffer のまま放置せず writer 側で flush。`sync_all` は要求しない。
   disk が止まっても publisher/watchdog/UI は進める。watchdog と writer は別 thread とする。
 - launcher の handoff snapshot は journal の一度の非待機取得で作る。競合なら欠落数を付ける。
-  launcher exit に writer drain の待機を追加しない。末尾の未出力はあり得るが、core に渡った pre-spawn snapshot で補う。
-  core も終了時に writer の無期限 join / flush をしない。diagnostics の shutdown は best effort。
+  launcher/coreの最終終了境界だけは§10.4の単一deadlineで排出完了を待つ。
+  UI/publisher/watchdogは待たず、無期限joinや呼出元の同期flushはしない。
 - writer / watchdog の spawn error、disk-full / permission error は diagnostic-unavailable をメモリへ公開して終わる。
   通常 logger へ再入して報告しない。起動後に通常 UI が通知可能なら一度だけ「起動記録を保存できませんでした」と表示する。
   一度限りの通知はoverlay中・トレイ非表示中・OS最小化中には消費せず、通常UIが表示可能になった時点でtoastの期限を開始する。
@@ -126,7 +126,9 @@ LOCALAPPDATA 自体が redirected / 不可の場合の永続記録は保証し�
 記録を必ず残す保証には、別 process / 別 sink が必要で、今回は作らない。
 ログはローカルのみ。起動時 target / data path を含むので、共有時には利用者が内容を確認する。
 writer による診断ログだけの容量制限は 1 file 2 MiB / 最近 10 run を提案。
-保持数整理は新ログの記録後に行い、active writer のファイルは即時ロック確認で skip（待たない）。
+保持数整理は新ログの記録後に行い、active writer の同stem `.lock` sidecarは即時lease確認で skip（待たない）。
+writerはJSONL本体をbyte-range lockしない。旧v4.4.0 writerとの互換のため、整理側だけ本体lockも
+即時確認する。出荷不具合の原因・所有規則は§10.3。
 削除失敗は記録して終了し、設定・索引を掃除する処理とは共用しない。
 
 ### 3.3 data_dir と環境
@@ -817,3 +819,130 @@ fake clockで検証する。保存先はancestor probeを注入して`C:\link\da
 独立Sol/xhighの再レビューはready、追加指摘なし。新しいdetached predicate/viewport経路は変更していない。
 Phase Bの保留とmerge順は§10のまま。最終command・件数・exit code・build証拠は
 `target/planA-msg-A2.txt`へ記録する。
+
+### 10.3 v4.4.0 Windows timeline保存不具合（2026-10-08）
+
+ClaudeCodeが製品を起動せず確認したこのPCの通常startup-logsは、launcher/coreを含む10ファイルが
+すべて0 bytesだった。終了から数時間経ったrunも空で、Store実験のplan A証拠が記録できない。
+原因は`crates/startup-diagnostics/src/output.rs`のwriterがJSONL本体に取得する
+`fs4::FileExt::try_lock_shared`。fs4 0.13.1はWindowsで全byte範囲を共有`LockFileEx`し、
+共有lockは取得した自身のhandleのwriteも拒否する
+([Microsoft LockFileEx仕様](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-lockfileex))。
+`create_new`の直後、最初のheader writeがOS error 33となり、背景writerはunavailableを公開して終了していた。
+既存試験はmemory sinkとlock保持だけを試しており、実ファイルへのwriteを検証していなかった。
+
+lockの目的は同時writerの排他ではなく、retentionから稼働中logを守るlease。
+同時writerの所有は既存のrun/role/pid名と`create_new`が保証する。
+最小修正として同stem `.lock` sidecarに非blocking exclusive leaseを取得してからJSONLを作り、
+writer終了まで保持する。sidecarには内容を書かず、JSONLにはwriterのbyte-range lockを取得しない。
+本体をexclusive lockするだけの案は、停止中processの証拠も別handleから読めなくなるため採用しない。
+新しいprocess管理やPID生存判定、retry機構は追加しない。
+
+retentionは最新10 **run ID**（同runのlauncher/coreは1件）を維持し、削除候補のsidecar leaseを
+一度即時試験する。取得不能ならそのfileをskipし、稼働中runは一時的に上限を超えて残す。
+sidecarのない旧logも扱うため、整理側はsidecarを非truncateで作成できる。
+さらに旧v4.4.0 writerが保持するJSONL本体の共有lockもexclusive即時試験で確認し、
+両lockを保持したまま対象JSONLとsidecarを削除する。旧版の0 byte logも同じ保持規則で整理する。
+保存先、2 MiB上限、journal/publisher、watchdog、shutdown時の非join規則、launcher/core呼出し側は変更しない。
+
+workspace全体（vendorを含む）の`lock_shared` / `try_lock_shared` / `FileExt` / `LockFileEx`監査:
+
+- `src/runtime_locks.rs`の`.in-use.lock`とpublisher lock、launcherの
+  `effetune_bundle::wait_for_lock`は内容を書かない専用lease/publisher fileなので正常。
+  `runtime_cleanup`もこの専用fileをexclusive試験し、assetや実行fileに共有byte-range lockをかけない。
+- `src/epub_cache.rs`の`LockFileEx`は内容を書かない`.alive`の1 byteを共有/排他する。
+  cleanup/schema/SQLite/PDFは別fileであり、`AliveGuard`はleaseのみ保持するので正常。
+- `src/zip_loader.rs`のWindows/Unix `FileExt`は位置指定read APIで、file lockではない。
+- `scripts/setup-tensorrt-pack.ps1`の`ZipFileExtensions::ExtractToFile`は検索文字列の部分一致で、
+  ZIP展開API。docs内の一致は説明文であり、vendorを含めて他の実装経路はなかった。
+- 診断retentionの本体exclusive試験はwriteを行わず旧writerを保護するために残す。
+  旧共有lockを再現する試験を除き、診断writerがJSONL本体を共有lockする経路は撤去した。
+
+回帰試験は使い捨て実ファイルでlauncher/coreそれぞれのwriterを実行し、headerとbegin/endが
+non-emptyで全行parse可能なことを検証する。修正前は両試験がOS error 33で失敗した。
+両roleの稼働leaseを保持したまま別runのretentionを実行し、読取り・追記可能、非稼働の旧runと
+sidecarのみ削除、最新10runと無関係fileを保持、lease解放後に次の整理で削除することを確認する。
+旧共有lockとの共存と`create_new`による既存証拠の上書き防止も実ファイルで確認する。
+通常profileや既存logは試験で触らず、製品も起動しない。
+
+### 10.4 C1.356のstartup終了契約（2026-10-09）
+
+利用者決定と`async-log-writer-plan.md`§5を反映。`90a8a9353`のlease/sidecar修正と
+実ファイル回帰だけをこのbranchへportし、`0aad6cb95`のallocator flavorや
+`session_header` refactorは取り込まない。独立startup owner/writer/watchdogを維持する。
+
+`terminal(outcome)`は従来どおり非blockingで最初の実outcomeだけを採用する。
+terminal行はjournalに再投入せず、ownerの一度だけ公開するmetadataに保護する。
+journal満杯/短いlock競合でもterminalを失わず、writerが採用済みpending全体を64件batchで
+排出してから既存schemaの最終行を一度出す。seal後の通常publisherは採用せず、writerは
+journal lockを取得してseal直前のcritical section内で採用された分も排出する。
+固定長EventのJSON escapingを含むterminal用4KiBを既存2MiB上限の内側に予約する。
+途中記録がfile capに達した場合もterminalは書き、排出完了結果は成功と区別してfalseにする。
+
+`shutdown_until(std::time::Instant) -> bool`は最終process境界専用。
+呼出元が実terminal outcomeを公開した後、一般writerと共通の最大2秒deadlineを渡す。
+未公開の場合だけCancelledを公開し、未初期化なら即成功で戻る。最後のflushとJSONL/lease
+close後にwriterがcompletion ACKを公開する。open/write/flush失敗は失敗ACKで終了し、
+timeout時はwriterのI/O所有を残す。呼出元でjoin/flush/retry/fallbackはしない。
+
+回帰はlauncher/coreのWindows実ファイル、active/legacy leaseと10-run grouping、既存証拠保護、
+pending192件の順序と最終terminal一度、journal満杯/競合、file cap予約、writer自身のwrite/
+final flush stall中のpublisher進行とdeadline、失敗ACK、実ファイルflush/lease解放後ACKを検査する。
+
+
+### §1.356 実装レビューの終了境界補完（2026-10-09）
+
+launcherの正常returnとエラーexitを同じ`complete_launcher`へまとめ、terminal公開後に
+startup writerのflush／close ACKを最大2秒で待つ。エラー表示もこの境界の後に行う。
+TensorRT builderはusage／不正モデル／DirectML専用モデルのskipを含む全exitを
+coreの`exit_startup`へ接続し、一般writerとstartup writerで一つの2秒deadlineを共有する。
+正常・エラー・skipの実終了は、独立したunit-test executableの子processと一時LOCALAPPDATAで
+回帰確認する。製品binary・モデルruntimeを起動せず、pending記録と末尾terminalを検査する。
+
+### 10.5 §1.376 配布ビルド経路の照合（2026-10-12）
+
+`ea060b66e`には`642ed1ee5`で`90a8a9353`のsidecar修正と実ファイル回帰が移植済み。
+allocator flavorは取り込まれていない。利用者報告の空ログは10月11日19:25のrun
+`00023fa7fbc0cf83`と10月12日00:22のrun `000099d1756a58b6`のcore/launcher各1組。
+後者は利用者のbuild-dist実行時間00:14〜00:26と重なるが、それだけで原因とは判定しない。
+コード照合ではbuild-dist/build-release/build-portable、sign-filesの署名/verify、VCRT PE検査は
+製品launcher/coreを短時間起動しない。終了境界の回帰はテスト実行体を一時LOCALAPPDATAで
+起動するので、通常startup-logsへこの2組を作る経路ではない。既存の起動済みprocessを
+build-release/build-portableが`Stop-Process -Force`する経路はある（`-PreserveRuntime`では停止しない）
+が、当該2組がその対象だった証拠はない。正常終了は§10.4のflush/close
+ACKを待つ。強制終了やI/O失敗で記録を必ず残す保証はなく、当該2組の原因は未確定。
+空ログを配布ビルドの正常な仕様と扱わない。実アプリと通常profileのファイルは操作していない。
+
+Windows限定の実ファイル回帰を1件追加し、旧shared lock取得後の同handleへのheader書込が
+OS error 33で失敗して0 bytesを残し、unlock後は同handleで書けることをassertする。
+修正後のlauncher/core非空・全行JSON、稼働中lease、旧lock共存、10-run保持、上書き防止は
+既存回帰を維持。`cargo test -p miv-startup --lib`は36 passed / 0 failed / 0 ignored。
+原ログは`target/nextfix-1376-startup-tests.log`。これは非対話試験であり、利用者の2組の原因や
+v4.6.0実機起動の成功を証明するものではない。
+
+| §1.376 の非対話検証 | 結果 | 原ログ (`target/` 内) |
+| --- | --- | --- |
+| startup crate lib tests（追加1件を含む） | 36 passed / 0 failed / 0 ignored | `nextfix-1376-startup-tests.log` |
+| `cargo fmt --all -- --check` | exit 0（初回の新規testの行折返し差分を整形後） | `nextfix-1376-fmt.log` |
+| 通常 core check | exit 0、25m35s | `nextfix-1376-core-check.log` |
+| portable core check | exit 0、1m30s | `nextfix-1376-portable-check.log` |
+| `test-full.ps1 -SuppressCrashDialogs`（1回） | **未完了**、exit 101、テスト開始前で実行0件。launcherのrelease入力3 exe欠落 | `nextfix-1376-full.log` |
+
+初回target構築、`CARGO_BUILD_JOBS=1`、`RUST_TEST_THREADS=4`。full用のFFmpeg DLL6本は
+このworktreeの`vendor/ffmpeg/bin`から`target/debug/deps`へ実ファイルをコピーした。
+通常／portable checkの既存warningは230／233件。製品実装は変更していない。
+テストと文書のみの変更なので実機確認用buildは不要。アプリ起動・commit・backlog編集は行わない。
+
+fullの停止は`crates/launcher/build.rs`が要求する`target/release/mimageviewer-core.exe`、
+`mimageviewer-remote.exe`、`mimageviewer-epub-pdf.exe`が新規worktreeにないため。
+通常／portable core checkやstartup36件の失敗ではなく、全体gateのbuild前提不足である。
+compile済みtargetを全体test成功へ読み替えない。入力を用意した後のfull再実行は未実施。
+release build・署名・起動を追加せず、§1.369の事前設計レビュー区切りで引き渡す。
+
+上記は`f182037c2`の初回引渡し時点の記録。利用者の再開指示後、稼働中アプリを止めずに
+CLAUDE.mdの直接Cargo手順でrelease入力3本を作成した。RAWサンプル27件の前提も
+正本SHA-256／サイズで検証後、§1.369の項目末の`test-full.ps1 -SuppressCrashDialogs`は
+PASS／exit 0（主実行13,412成功／0失敗／63既存ignore）。
+原ログと前提修正・再実行理由は [name-index-write-failure-plan.md §6](name-index-write-failure-plan.md) を参照。
+OS error 33の独立レビューACCEPTとstartup36件の証拠を再利用し、単独試験の再実行はしていない。
+利用者の空ログ2組の原因を確定する新しい証拠ではない。allocator変更・アプリ起動・commitは行っていない。
