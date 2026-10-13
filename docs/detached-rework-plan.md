@@ -4919,3 +4919,5 @@ PDF ticket、native host/viewportのownerやpredicateは変更しない。共有
 entries/bytes上限を維持し、別contextのlive cache/pendingは変更しない。
 独立GPT-6.1 Sol / xhigh設計レビューは、需要の所有境界で直す構造修正であり症状パッチではない
 ことに合意。詳細・回帰・検証はpage-turn plan §26.8へ記録する。
+同日の§26.10では完成CPU画素の取得と、通常描画/先読みの共通unit cache・派生位置索引を
+同context owner内で修正する。main/F12のviewport/predicateは変えず、独立レビューも構造修正に合意。

@@ -20,6 +20,8 @@
 
 mod page_turn;
 #[cfg(test)]
+mod prefetch_revision_tests;
+#[cfg(test)]
 pub(crate) use page_turn::take_test_events as take_page_turn_test_events;
 pub(crate) use page_turn::{
     OperationPhase, PageTurnLeaseInventory, PageTurnPresentation, PresentationDestination,
@@ -15050,10 +15052,19 @@ struct SpreadDisplayUnitsToken {
     shift_anchor_idx: Option<usize>,
     landscape_epoch: u64,
     page_alone: crate::settings::PageAloneSettings,
-    nav: Vec<usize>,
+    nav: Arc<Vec<usize>>,
 }
 
 impl SpreadDisplayUnitsToken {
+    fn matches_nav(&self, nav: &[usize]) -> bool {
+        if self.nav.len() == nav.len() && self.nav.as_ptr() == nav.as_ptr() {
+            return true;
+        }
+        #[cfg(test)]
+        PREFETCH_NAV_COMPARISON_ELEMENTS.set(PREFETCH_NAV_COMPARISON_ELEMENTS.get() + nav.len());
+        self.nav.as_slice() == nav
+    }
+
     fn matches(
         &self,
         nav: &[usize],
@@ -15068,11 +15079,11 @@ impl SpreadDisplayUnitsToken {
             && self.shift_anchor_idx == shift_anchor_idx
             && self.landscape_epoch == landscape_epoch
             && self.page_alone == page_alone
-            && self.nav == nav
+            && self.matches_nav(nav)
     }
 
     fn identifies_nav(&self, nav: &[usize], items_generation: u64) -> bool {
-        self.items_generation == items_generation && self.nav == nav
+        self.items_generation == items_generation && self.matches_nav(nav)
     }
 }
 
@@ -15085,7 +15096,10 @@ impl SpreadDisplayUnitsToken {
 pub(crate) struct SpreadDisplayUnitsCache {
     token: Option<SpreadDisplayUnitsToken>,
     units: Arc<Vec<SpreadDisplayUnit>>,
-    tracked_indices: HashSet<usize>,
+    tracked_indices: HashMap<usize, usize>,
+    /// Sorted navigation-unit ordinals containing real still images. Derived with the token;
+    /// demand can jump over media intervals without inspecting their members every frame.
+    image_unit_positions: Vec<usize>,
     landscape_indices: HashSet<usize>,
     landscape_epoch: u64,
     /// Derived once with the unit token. This proves that `nav` is a complete permutation of
@@ -15143,12 +15157,13 @@ impl SpreadDisplayUnitsCache {
 
     fn install(
         &mut self,
-        nav: &[usize],
+        nav: Arc<Vec<usize>>,
         items_generation: u64,
         spread_mode: SpreadMode,
         shift_anchor_idx: Option<usize>,
         page_alone: crate::settings::PageAloneSettings,
         landscape_flags: &[bool],
+        image_flags: &[bool],
         units: Vec<SpreadDisplayUnit>,
     ) -> Arc<Vec<SpreadDisplayUnit>> {
         // Completeness depends on the item list and navigation order, not on late landscape
@@ -15157,7 +15172,7 @@ impl SpreadDisplayUnitsCache {
         let complete_page_permutation = self
             .token
             .as_ref()
-            .is_some_and(|token| token.identifies_nav(nav, items_generation))
+            .is_some_and(|token| token.identifies_nav(&nav, items_generation))
             .then_some(self.complete_page_permutation)
             .flatten();
         self.token = Some(SpreadDisplayUnitsToken {
@@ -15166,9 +15181,23 @@ impl SpreadDisplayUnitsCache {
             shift_anchor_idx,
             landscape_epoch: self.landscape_epoch,
             page_alone,
-            nav: nav.to_vec(),
+            nav: Arc::clone(&nav),
         });
-        self.tracked_indices = nav.iter().copied().collect();
+        self.tracked_indices.clear();
+        self.image_unit_positions.clear();
+        for (position, unit) in units.iter().enumerate() {
+            for &idx in &unit.pages {
+                self.tracked_indices.entry(idx).or_insert(position);
+            }
+            if (0..unit.pages.len()).any(|offset| {
+                image_flags
+                    .get(unit.nav_start + offset)
+                    .copied()
+                    .unwrap_or(false)
+            }) {
+                self.image_unit_positions.push(position);
+            }
+        }
         self.landscape_indices = nav
             .iter()
             .zip(landscape_flags)
@@ -15208,11 +15237,16 @@ impl SpreadDisplayUnitsCache {
         self.token
             .as_ref()
             .is_some_and(|token| token.items_generation == items_generation)
-            && self.tracked_indices.contains(&idx)
+            && self.tracked_indices.contains_key(&idx)
     }
 
     fn reconcile_landscape(&mut self, items_generation: u64, idx: usize, landscape: bool) {
-        if !self.tracks(items_generation, idx) {
+        if !self.tracks(items_generation, idx)
+            || self
+                .token
+                .as_ref()
+                .is_none_or(|token| !token.spread_mode.is_spread())
+        {
             return;
         }
         let was_landscape = self.landscape_indices.contains(&idx);
@@ -15228,17 +15262,20 @@ impl SpreadDisplayUnitsCache {
     }
 
     pub(crate) fn mark_rotation_for_recheck(&mut self, items_generation: u64, idx: usize) {
-        if self.tracks(items_generation, idx) {
+        if self.tracks(items_generation, idx)
+            && self
+                .token
+                .as_ref()
+                .is_some_and(|token| token.spread_mode.is_spread())
+        {
             self.rotation_recheck_indices.insert(idx);
         }
     }
 
     pub(crate) fn mark_all_rotations_for_recheck(&mut self, items_generation: u64) {
-        if self
-            .token
-            .as_ref()
-            .is_some_and(|token| token.items_generation == items_generation)
-        {
+        if self.token.as_ref().is_some_and(|token| {
+            token.items_generation == items_generation && token.spread_mode.is_spread()
+        }) {
             self.rotation_recheck_all = true;
             self.rotation_recheck_indices.clear();
         }
@@ -15266,8 +15303,12 @@ impl SpreadDisplayUnitsCache {
         self.token
             .as_ref()
             .filter(|token| token.items_generation == items_generation)
-            .map(|token| token.nav.clone())
+            .map(|token| token.nav.as_ref().clone())
             .unwrap_or_default()
+    }
+
+    fn unit_position(&self, idx: usize) -> Option<usize> {
+        self.tracked_indices.get(&idx).copied()
     }
 }
 
@@ -15329,6 +15370,9 @@ impl SpreadDisplayUnit {
 thread_local! {
     static SPREAD_DISPLAY_UNITS_BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static FINAL_COVER_ELIGIBILITY_SCAN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PREFETCH_NAV_COMPARISON_ELEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PREFETCH_POSITION_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PREFETCH_UNIT_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -15834,10 +15878,11 @@ fn find_spread_display_unit(
     units: &[SpreadDisplayUnit],
     idx: usize,
 ) -> Option<(usize, &SpreadDisplayUnit)> {
-    units
-        .iter()
-        .enumerate()
-        .find(|(_, unit)| unit.contains_idx(idx))
+    units.iter().enumerate().find(|(_, unit)| {
+        #[cfg(test)]
+        PREFETCH_POSITION_SCANS.set(PREFETCH_POSITION_SCANS.get() + 1);
+        unit.contains_idx(idx)
+    })
 }
 
 fn spread_seek_unit_fraction(unit_index: usize, unit_count: usize) -> f32 {
@@ -17447,7 +17492,17 @@ impl App {
     }
 
     fn build_spread_display_units_for_nav(&mut self, nav: &[usize]) -> Arc<Vec<SpreadDisplayUnit>> {
-        self.refresh_spread_rotation_rechecks(nav);
+        let nav_identity = [
+            self.viewer_navigation_caches.nav_indices.as_ref(),
+            self.viewer_navigation_caches.still_image_indices.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|indices| indices.len() == nav.len() && indices.as_ptr() == nav.as_ptr())
+        .map(Arc::clone);
+        if self.spread_mode.is_spread() {
+            self.refresh_spread_rotation_rechecks(nav);
+        }
         let requested_page_alone = self.page_alone_enabled_for_current_book();
         let needs_page_alone = self.spread_mode.has_cover()
             && (requested_page_alone.after_cover || requested_page_alone.last)
@@ -17469,42 +17524,76 @@ impl App {
             self.spread_shift_anchor_idx(),
             page_alone,
         ) {
+            // Equal contents under a freshly installed navigation owner still share
+            // that immutable allocation after the first exact validation.
+            if let Some(nav_identity) = nav_identity {
+                self.spread_display_units_cache.token.as_mut().unwrap().nav = nav_identity;
+            }
             return units;
         }
 
         // DB 未読の回転は nav 全体で一括取得し、idx cache へ memoize する。
-        let rotations = self.get_rotations_for_indices(nav);
-        let landscape_flags = nav
+        let landscape_flags = if self.spread_mode.is_spread() {
+            let rotations = self.get_rotations_for_indices(nav);
+            nav.iter()
+                .enumerate()
+                .map(|(nav_pos, &idx)| {
+                    is_spread_pairable_item(self.items.get(idx))
+                        && self.page_is_landscape(
+                            idx,
+                            rotations
+                                .get(nav_pos)
+                                .copied()
+                                .unwrap_or(crate::rotation_db::Rotation::None),
+                        )
+                })
+                .collect::<Vec<_>>()
+        } else {
+            // Single-page navigation needs no pairing/landscape metadata or rotation DB I/O.
+            vec![false; nav.len()]
+        };
+        let image_flags = nav
             .iter()
-            .enumerate()
-            .map(|(nav_pos, &idx)| {
-                is_spread_pairable_item(self.items.get(idx))
-                    && self.page_is_landscape(
-                        idx,
-                        rotations
-                            .get(nav_pos)
-                            .copied()
-                            .unwrap_or(crate::rotation_db::Rotation::None),
-                    )
-            })
+            .map(|&idx| is_spread_pairable_item(self.items.get(idx)))
             .collect::<Vec<_>>();
-        let units = build_spread_display_units_with_page_alone(
-            nav,
-            self.spread_mode,
-            self.spread_shift_anchor_idx(),
-            page_alone,
-            |nav_pos, _| landscape_flags.get(nav_pos).copied().unwrap_or(false),
-            |idx| is_spread_pairable_item(self.items.get(idx)),
-        );
+        let units = if self.spread_mode.is_spread() {
+            build_spread_display_units_with_page_alone(
+                nav,
+                self.spread_mode,
+                self.spread_shift_anchor_idx(),
+                page_alone,
+                |nav_pos, _| landscape_flags.get(nav_pos).copied().unwrap_or(false),
+                |idx| is_spread_pairable_item(self.items.get(idx)),
+            )
+        } else {
+            nav.iter()
+                .enumerate()
+                .map(|(position, &idx)| {
+                    SpreadDisplayUnit::singleton(
+                        position,
+                        idx,
+                        if image_flags[position] {
+                            SpreadDisplaySingletonCause::UnpairedSlot
+                        } else {
+                            SpreadDisplaySingletonCause::NonPairableBoundary
+                        },
+                    )
+                })
+                .collect()
+        };
+        // Retain the immutable navigation owner's allocation when available. Arbitrary
+        // slice callers keep an owned exact snapshot and the content-comparison fallback.
+        let nav_identity = nav_identity.unwrap_or_else(|| Arc::new(nav.to_vec()));
         #[cfg(test)]
         SPREAD_DISPLAY_UNITS_BUILD_COUNT.set(SPREAD_DISPLAY_UNITS_BUILD_COUNT.get() + 1);
         self.spread_display_units_cache.install(
-            nav,
+            nav_identity,
             self.items_generation,
             self.spread_mode,
             self.spread_shift_anchor_idx(),
             page_alone,
             &landscape_flags,
+            &image_flags,
             units,
         );
         if let Some(complete) = complete_proof {
@@ -17616,6 +17705,14 @@ impl App {
         anchor_idx: usize,
     ) -> SpreadDisplayComposition {
         if !self.spread_mode.is_spread() {
+            if self.page_turn_prefetch_policy_enabled()
+                && is_spread_pairable_item(self.items.get(anchor_idx))
+            {
+                let nav = self.get_nav_indices();
+                // Normal painting and prefetch must observe the same canonical topology
+                // before the outgoing proof captures its layout allocation.
+                self.build_spread_display_units_for_nav(&nav);
+            }
             return SpreadDisplayComposition::from_navigation_pages(anchor_idx, &[anchor_idx])
                 .expect("single-page composition contains its anchor");
         }
@@ -17624,6 +17721,34 @@ impl App {
         } else {
             self.get_nav_indices()
         };
+        let units = self.build_spread_display_units_for_nav(&nav);
+        let (final_cover_enabled, singleton_placement_enabled, eligible) =
+            self.spread_display_composition_policy_for_nav(&nav);
+        let composition = self
+            .spread_display_units_cache
+            .unit_position(anchor_idx)
+            .and_then(|unit_pos| {
+                resolve_spread_display_composition(
+                    &units,
+                    unit_pos,
+                    self.spread_mode,
+                    final_cover_enabled,
+                    singleton_placement_enabled,
+                    eligible,
+                )
+            });
+        composition
+            .and_then(|composition| composition.with_navigation_anchor(anchor_idx))
+            .unwrap_or_else(|| {
+                SpreadDisplayComposition::from_navigation_pages(anchor_idx, &[anchor_idx])
+                    .expect("fallback composition contains its anchor")
+            })
+    }
+
+    fn spread_display_composition_policy_for_nav(
+        &mut self,
+        nav: &[usize],
+    ) -> (bool, crate::settings::SingletonSpreadEndpointSettings, bool) {
         let final_cover_enabled = self.final_cover_spread_enabled_for_current_book();
         let mut singleton_placement_enabled =
             self.singleton_spread_placement_enabled_for_current_book();
@@ -17633,7 +17758,6 @@ impl App {
             singleton_placement_enabled.first = true;
             singleton_placement_enabled.last = true;
         }
-        let units = self.build_spread_display_units_for_nav(&nav);
         let eligible = ((self.spread_mode.has_cover() && final_cover_enabled)
             || singleton_placement_enabled.first
             || singleton_placement_enabled.last
@@ -17641,23 +17765,8 @@ impl App {
                 let page_alone = self.page_alone_enabled_for_current_book();
                 page_alone.after_cover || page_alone.last
             }))
-            && self.spread_complete_book_eligible(&nav);
-        let composition = find_spread_display_unit(&units, anchor_idx).and_then(|(unit_pos, _)| {
-            resolve_spread_display_composition(
-                &units,
-                unit_pos,
-                self.spread_mode,
-                final_cover_enabled,
-                singleton_placement_enabled,
-                eligible,
-            )
-        });
-        composition
-            .and_then(|composition| composition.with_navigation_anchor(anchor_idx))
-            .unwrap_or_else(|| {
-                SpreadDisplayComposition::from_navigation_pages(anchor_idx, &[anchor_idx])
-                    .expect("fallback composition contains its anchor")
-            })
+            && self.spread_complete_book_eligible(nav);
+        (final_cover_enabled, singleton_placement_enabled, eligible)
     }
 
     pub(crate) fn page_turn_prefetch_targets(
@@ -17667,129 +17776,78 @@ impl App {
         back: usize,
     ) -> Option<PagedPrefetchTargets> {
         if !self.page_turn_prefetch_policy_enabled()
-            || !matches!(
-                self.items.get(current_idx),
-                Some(GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. })
-            )
+            || !is_spread_pairable_item(self.items.get(current_idx))
         {
             return None;
         }
         let nav = self.get_nav_indices();
-        if !self.spread_mode.is_spread() {
-            let current_position = nav.iter().position(|&idx| idx == current_idx)?;
-            let mut targets = Vec::new();
-            let mut forward_left = forward;
-            let mut back_left = back;
-            for distance in 1..nav.len() {
-                if forward_left == 0 && back_left == 0 {
-                    break;
-                }
-                for position in [
-                    (forward_left > 0)
-                        .then(|| current_position.checked_add(distance))
-                        .flatten()
-                        .filter(|&position| position < nav.len()),
-                    (back_left > 0)
-                        .then(|| current_position.checked_sub(distance))
-                        .flatten(),
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    let idx = nav[position];
-                    if matches!(
-                        self.items.get(idx),
-                        Some(
-                            GridItem::Image(_)
-                                | GridItem::ZipImage { .. }
-                                | GridItem::PdfPage { .. }
-                        )
-                    ) {
-                        targets.push((position, idx));
-                        if position > current_position {
-                            forward_left -= 1;
-                        } else {
-                            back_left -= 1;
-                        }
+        let units = self.build_spread_display_units_for_nav(&nav);
+        let (final_cover, placement, eligible) = if self.spread_mode.is_spread() {
+            self.spread_display_composition_policy_for_nav(&nav)
+        } else {
+            (false, Default::default(), false)
+        };
+        let current_position = self.spread_display_units_cache.unit_position(current_idx)?;
+        let image_positions = &self.spread_display_units_cache.image_unit_positions;
+        let current_image = image_positions.binary_search(&current_position).ok()?;
+        let mut targets = Vec::new();
+        let mut seen = std::collections::HashSet::from([current_idx]);
+        let mut add_unit = |position: usize| {
+            #[cfg(test)]
+            PREFETCH_UNIT_VISITS.set(PREFETCH_UNIT_VISITS.get() + 1);
+            // Resolve this already acquired unit directly. Re-entering the anchor
+            // accessor would compare all navigation items and search from unit zero.
+            if let Some(composition) = resolve_spread_display_composition(
+                &units,
+                position,
+                self.spread_mode,
+                final_cover,
+                placement,
+                eligible,
+            ) {
+                for page in composition.pages_in_reading_order() {
+                    if is_spread_pairable_item(self.items.get(page.idx)) && seen.insert(page.idx) {
+                        targets.push((position, page.idx));
                     }
                 }
             }
-            return Some(PagedPrefetchTargets {
-                current_position,
-                targets,
-            });
-        }
-        let units = self.build_spread_display_units_for_nav(&nav);
-        let (current_position, _) = find_spread_display_unit(&units, current_idx)?;
-        let mut targets = Vec::new();
-        let mut seen = std::collections::HashSet::from([current_idx]);
-        let mut add_unit = |app: &mut App, position: usize| {
-            let composition =
-                app.spread_display_composition_for_anchor(units[position].anchor_idx());
-            for page in composition.pages_in_reading_order() {
-                if matches!(
-                    app.items.get(page.idx),
-                    Some(GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. })
-                ) && seen.insert(page.idx)
-                {
-                    targets.push((position, page.idx));
-                }
-            }
         };
-        // The displayed partner is not a speculative neighbour and consumes no budget.
-        add_unit(self, current_position);
+        add_unit(current_position);
         let mut forward_left = forward;
         let mut back_left = back;
-        let mut distance = 1;
-        while forward_left > 0 || back_left > 0 {
-            if forward_left > 0 {
-                if let Some(position) = current_position
-                    .checked_add(distance)
-                    .filter(|&position| position < units.len())
+        let mut next_image = current_image + 1;
+        let mut previous_image = current_image.checked_sub(1);
+        loop {
+            let next = (forward_left > 0)
+                .then(|| image_positions.get(next_image).copied())
+                .flatten();
+            let previous = (back_left > 0)
+                .then(|| previous_image.map(|rank| image_positions[rank]))
+                .flatten();
+            let (position, is_forward) = match (next, previous) {
+                (Some(next), Some(previous))
+                    if next - current_position <= current_position - previous =>
                 {
-                    add_unit(self, position);
-                    let image_pages = units[position]
-                        .pages
-                        .iter()
-                        .filter(|&&idx| {
-                            matches!(
-                                self.items.get(idx),
-                                Some(
-                                    GridItem::Image(_)
-                                        | GridItem::ZipImage { .. }
-                                        | GridItem::PdfPage { .. }
-                                )
-                            )
-                        })
-                        .count();
-                    forward_left = forward_left.saturating_sub(image_pages);
-                } else {
-                    forward_left = 0;
+                    (next, true)
                 }
+                (Some(_), Some(previous)) => (previous, false),
+                (Some(next), None) => (next, true),
+                (None, Some(previous)) => (previous, false),
+                (None, None) => break,
+            };
+            add_unit(position);
+            let navigation_images = units[position]
+                .pages
+                .iter()
+                .filter(|&&idx| is_spread_pairable_item(self.items.get(idx)))
+                .count();
+            if is_forward {
+                forward_left = forward_left.saturating_sub(navigation_images);
+                next_image += 1;
+            } else {
+                back_left = back_left.saturating_sub(navigation_images);
+                previous_image = previous_image.unwrap().checked_sub(1);
             }
-            if back_left > 0 {
-                if let Some(position) = current_position.checked_sub(distance) {
-                    add_unit(self, position);
-                    let image_pages = units[position]
-                        .pages
-                        .iter()
-                        .filter(|&&idx| {
-                            matches!(
-                                self.items.get(idx),
-                                Some(
-                                    GridItem::Image(_)
-                                        | GridItem::ZipImage { .. }
-                                        | GridItem::PdfPage { .. }
-                                )
-                            )
-                        })
-                        .count();
-                    back_left = back_left.saturating_sub(image_pages);
-                } else {
-                    back_left = 0;
-                }
-            }
-            distance += 1;
         }
         Some(PagedPrefetchTargets {
             current_position,
@@ -48637,6 +48695,15 @@ impl App {
                 })
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_capture_pixel_work_for_test(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Result<crate::capture::CapturePixelWork, String> {
+        self.prepare_capture_pixel_work(ctx, idx)
     }
 
     fn prepare_capture_pixel_job(

@@ -82932,15 +82932,13 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<(FinalCompositeKey, Arc<egui::ColorImage>)> {
+        if let Some((key, entry)) = self.exact_complete_final_composite_entry(idx) {
+            return Some((key, Arc::clone(&entry.pixels)));
+        }
         let texture = self.ensure_final_composite_texture(ctx, idx)?;
-        let _ = texture;
-        let (edit_key, edit_pixels) = self.ensure_edit_result_pixels(ctx, idx)?;
-        let params = self.effective_params(idx).clone();
-        let final_key = self.final_composite_key_for_pixels(edit_key, edit_pixels.size, &params);
-        self.final_composite_cache
-            .get(&final_key)
-            .filter(|entry| entry.complete)
-            .map(|entry| (final_key, Arc::clone(&entry.pixels)))
+        self.exact_complete_final_composite_entry(idx)
+            .filter(|(_, entry)| entry.texture.id() == texture.id())
+            .map(|(key, entry)| (key, Arc::clone(&entry.pixels)))
     }
 
     pub(crate) fn ensure_final_composite_pixels(
@@ -82977,13 +82975,26 @@ impl App {
         if !matches!(self.items.get(idx), Some(GridItem::PdfPage { .. })) {
             return None;
         }
+        self.exact_complete_final_composite_entry(idx)
+            .map(|(_, entry)| entry.texture.clone())
+    }
+
+    /// A completed live composite owns its pixels independently of raw/edit and
+    /// retained CPU caches. Display and pixel consumers share the same exact gate.
+    fn exact_complete_final_composite_entry(
+        &self,
+        idx: usize,
+    ) -> Option<(FinalCompositeKey, &FinalCompositeEntry)> {
+        if self.fs_entry_is_animated(idx) {
+            return None;
+        }
         let edit_key = self.current_edit_result_key(idx);
         let params = self.effective_params(idx);
         self.final_composite_cache.iter().find_map(|(key, entry)| {
             (entry.complete
                 && *key == self.final_composite_key_for_pixels(edit_key, entry.source_size, params)
                 && self.display_texture_matches_page(&entry.texture, idx))
-            .then(|| entry.texture.clone())
+            .then_some((*key, entry))
         })
     }
 
@@ -83250,6 +83261,20 @@ impl App {
         }
     }
 
+    /// Preserve canonical annotation coordinates after source-cache eviction.
+    /// Known unclamped source dimensions take precedence over the edit canvas.
+    fn comic_source_dims_for_idx(&self, idx: usize) -> Option<(f32, f32)> {
+        self.source_dims_for_idx(idx).or_else(|| {
+            let (_, entry) = self.exact_complete_final_composite_entry(idx)?;
+            let [w, h] = self
+                .page_dims_cache
+                .get(self.items_generation, idx)
+                .map(|(w, h)| [w as usize, h as usize])
+                .unwrap_or(entry.source_size);
+            Some((w.max(1) as f32, h.max(1) as f32))
+        })
+    }
+
     /// 注釈編集を確定したときに呼ぶ。`comic_generation` を進めて comic_cache の各 entry を
     /// 失効させ、次の `ensure_comic_composite_texture` で最新 `comic_docs` から再ベイク
     /// させる (§5.5 のキャッシュ無効化規約)。永続サムネイル preview の失効は
@@ -83438,7 +83463,7 @@ impl App {
         // の解像度なので、ソース→base の相似スケール S を掛けてから base 解像度で焼く
         // (§5.4)。AI OFF では base==source なので S=1 (= 従来と同一、退行なし)。
         let (src_w, src_h) = self
-            .source_dims_for_idx(idx)
+            .comic_source_dims_for_idx(idx)
             .unwrap_or((w as f32, h as f32));
         self.ensure_comic_doc_loaded(&key);
         let mut objects = self.comic_docs.get(&key).cloned().unwrap_or_default();
@@ -83671,7 +83696,7 @@ impl App {
             return None; // デモ有効でも永続注釈が無ければ export には焼かない
         }
         let (src_w, src_h) = self
-            .source_dims_for_idx(idx)
+            .comic_source_dims_for_idx(idx)
             .unwrap_or((w as f32, h as f32));
         // 参照フォントを含めてロード (Inc 4c)。objects は下で move されるので前に呼ぶ。
         let fonts = self.ensure_comic_fonts_for(&objects)?;
@@ -96739,6 +96764,8 @@ fn finite_video_target_secs(target_secs: f64, duration_secs: f64) -> f64 {
 
 // テスト専用。`ui_fullscreen` など兄弟モジュールのテストからも
 // `phase_c_support::setup_app` を使う (production 配線を通した回帰は App が要る)。
+#[cfg(test)]
+mod composite_pixels_revision_tests;
 #[cfg(test)]
 mod grid_cursor_tests;
 #[cfg(all(test, windows))]

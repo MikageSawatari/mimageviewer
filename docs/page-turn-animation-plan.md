@@ -2339,3 +2339,43 @@ test-fullは利用者指定で未実行。新field/pending/queue/owner、共有L
 scriptの保護でcompile前に停止した。利用者の終了待ちであり、アプリはagentから起動/停止しない。
 build完了後に結果を追記する。詳細・command/log・二冊の隔離確認手順は
 `target/A-1341-neighbor-msg.txt`へ記録する。コミットは行わない。
+
+### 26.10 2026-10-14 独立レビューの二件を修正する
+
+利用者はc8c343767の006末尾と表紙のめくりを実機でOKと報告した。独立レビューの
+REVISE二件は素材の所有境界で修正する。完成compositeはCPU pixelsとsource_sizeも所有するので、
+現在のedit/params/bypass/identityに一致する完成entryから画素を直接取得する。コピー・capture・
+注釈合成のために元画像を再ロードしない。古い/未完成/別contextのentryやanimationは拒否する。
+注釈の座標基準は既存source_dims、同generationのPageDimsCache pixel dims、完成素材の
+source_sizeの順で得る。8K clamp前の元頁寸法と編集/AI出力寸法を取り違えない。
+capture/exportは既存のNavigation頁のみの出力を維持し、補助表紙を出力へ追加しない。
+末尾頁と表紙の個別capture・注釈画素を退去前後で検査する。
+
+先読みは取得済みunitsとunit positionを共通pure composition resolverへ直接渡す。
+既存SpreadDisplayUnitsCacheにnav Arcの同一性、item→unit位置と画像unit位置の派生索引を持たせ、
+同じtokenで生成/失効/交換する。slice callerは内容比較fallbackを維持する。cold構築は一覧長に
+比例してよいが、warm需要は画像予算に比例し、長い動画区間を一頁ずつ再探索しない。
+単頁も同じ索引へ通し、current partner・Navigation画像予算・supplement・距離順を維持する。
+単頁の通常compositionもON対象で同じunit cacheを準備し、outgoingのpaint後に先読みだけで
+layout Arcを置き換えない。単頁unitの形はlandscape/rotationに依存しないため、寸法harvestや
+rotation再照合でそのtokenを失効させず、Spreadへ切り替えた時に最新metadataから再構築する。
+大きな動画区間でnav内容比較/位置探索/unit訪問を数える回帰と、CPU退去後のcapture/注釈を追加する。
+新owner/pending/queueを作らず、OFF・連結・Remoteの表示仕様や保存設定を変えない。
+
+§1.242はこのworktreeへ未統合。ここでは統合検証を行わず、**§1.242統合後に明示指定
+（Pair/Blank）・構成優先配置との検証が要る**ことを残件にする。fmt、normal/portable check、
+関連回帰、test-full一回と通常build-devを行う。アプリ起動・コミットは行わない。
+
+### 26.11 REVISE修正の検証記録
+
+完成CPU画素/個別capture/注釈/別contextの5件、nav索引/大きな動画区間/通常Single paintと
+harvestの3件が成功。既存paged_prefetch16、page_turn186、capture257、comic42件も成功した
+（comicの既存2件ignored）。normal/portable core check、fmt/glyph、context監査も成功。
+独立GPT-6.1 Sol/xhighの最終レビューはACCEPT、未解消P1/P2なし。
+
+通常build-dev -PreserveRuntimeはcore/Remote/EPUBとruntime4 DLL・PE3 binary検査までexit0。
+coreは2026-10-14 02:52:25、325,590,016 bytes、FileVersion4.6.0.0。portable featureを有効にせず、
+アプリ起動・停止・コミットは行っていない。test-full -SuppressCrashDialogsはjobs1/threads8で
+一回実行してexit0（PASS）。本体12,409成功/既存57ignored、UI snapshot163、vendorのegui25・
+egui-wgpu11・eframe18も成功した。command/log・binary情報・隔離確認手順は
+`target/A-1341-revise-msg.txt`を参照する。
