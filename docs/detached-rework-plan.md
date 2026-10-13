@@ -1455,6 +1455,23 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-13 §1.340 TILE12: 表示切替前の物理primary終端
+
+`945c21cf3`のTILErev7はREVISE（P2 1件）。TILE11の2指摘は解消確認済みで、独立reviewerは
+共通入力／案内の構造合意を維持している。利用者指定どおり、Esc／Oによる一覧取消とprimary
+releaseの同frame配送を、表示内容より前の共通入力寿命境界で処理する。
+実viewerのCentralPanel入口で既存primary helperをkey handler前に一度呼び、局所decisionを
+通常pointer／一覧へ渡す。終端frameのSuppressを保ったままpersistent PointerStreamを終え、
+次の通常clickへ抑止を残さない。Open／Closedごとのguard、pending field、別ownerは追加しない。
+rootのキー転送やpassive投影は別viewportの物理終端を採用せず、既存context／native ownerを保つ。
+既存focus grace／touch遷移、新規detached述語／viewport／registry／HWND policyは変更しない。
+物理primary PointerStreamの入力寿命を表示状態から分離する構造修正であり、症状パッチではない。
+限定独立設計／完了レビュー（Sol/xhigh）は各ACCEPT、完了レビューP1／P2／P3なし。
+新規実renderer回帰1件（6組）とoverview 102件、touch 126件ほかの関連回帰が成功。
+fmt・監査・通常／portable check・build-devが成功。最終test-full 1回はPASS／exit 0、
+親suite合計13,594 passed、0 failed、64 ignored。製品起動／git add／commitは行っていない。
+詳細・実renderer6組の回帰と最終証拠は[一覧設計書§24](detached-book-page-overview-plan.md#24-キー取消とprimary-releaseの同時配送-tile122026-10-13)へ記録する。
+
 ### 2026-10-13 §1.340 TILE11: 共通入力・案内のrenderer接続復元
 
 `13f70e9aa`の独立全体レビューはREVISE（P2 2件）。一覧のCentralPanel early returnが

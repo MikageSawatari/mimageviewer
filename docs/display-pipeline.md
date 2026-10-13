@@ -461,6 +461,9 @@ Selectの受理時だけ `land_still_page_navigation_target` の `LatestSeek` �
 一覧を描くCentralPanelのearly returnより前に、既存共通入力・案内へ到達する経路を持つ。
 `ui_fullscreen/viewer_chrome.rs`は通常viewerとactive一覧が共用するprimary suppression終端、
 右ドラッグ／gesture認識、中ボタン短押し、F11 borderless step、overlay／dialogの境界である。
+physical primaryはviewerのCentralPanel入口でkey handler前に一度advanceし、終端frameの
+抑止decisionを通常pointer／一覧へ渡す。Esc／Oで一覧が閉じてもPointerStreamのreleaseを
+取り逃さず、そのframeの背面clickを抑止したまま次の通常clickへ戻す（一覧設計書§24）。
 通常callerのguard・タイミング・描画順を維持し、一覧は保存済み割当を一覧設計書§4.1の実行可能集合へ配送する。
 mouse ring／gesture／X長押しring、feedback、既存job進捗・picker／modalは既存guardで描く。
 passive guideは描画元のimmutable `overview.executable_actions`を使い、activeな別窓の集合を流用しない。

@@ -912,10 +912,31 @@ impl App {
         ui: &mut egui::Ui,
         surface: egui::Rect,
     ) -> bool {
+        // Standalone surface entry (tests): only the actual owning viewport may
+        // advance its physical input. The full renderer supplies its pre-key snapshot.
+        let ctx = ui.ctx().clone();
+        let primary_suppression = if self.page_overview_view().is_some_and(|view| {
+            self.page_overview_active_context_serial() == Some(view.stamp.context_serial)
+                && ctx.viewport_id() == self.page_overview_viewer_viewport()
+        }) {
+            self.advance_viewer_primary_pointer_frame(&ctx)
+        } else {
+            FullscreenPrimarySuppressionDecision::Allow
+        };
+        self.render_page_overview_surface_with_primary_frame(ui, surface, primary_suppression)
+    }
+
+    pub(super) fn render_page_overview_surface_with_primary_frame(
+        &mut self,
+        ui: &mut egui::Ui,
+        surface: egui::Rect,
+        primary_suppression: FullscreenPrimarySuppressionDecision,
+    ) -> bool {
         self.render_page_overview_surface_with_pointer_phase(
             ui,
             surface,
             OverviewPointerPhase::Fresh,
+            primary_suppression,
         )
     }
 
@@ -928,6 +949,7 @@ impl App {
             ui,
             surface,
             OverviewPointerPhase::Consumed,
+            FullscreenPrimarySuppressionDecision::Allow,
         )
     }
 
@@ -970,6 +992,7 @@ impl App {
         ui: &mut egui::Ui,
         surface: egui::Rect,
         pointer_phase: OverviewPointerPhase,
+        primary_suppression: FullscreenPrimarySuppressionDecision,
     ) -> bool {
         let ctx = ui.ctx().clone();
         let Some(view) = self.page_overview_view() else {
@@ -979,10 +1002,8 @@ impl App {
         let owns_input_surface = pointer_phase == OverviewPointerPhase::Fresh
             && self.page_overview_active_context_serial() == Some(view.stamp.context_serial)
             && ctx.viewport_id() == self.page_overview_viewer_viewport();
-        let primary_suppressed = owns_input_surface
-            && self
-                .advance_viewer_primary_pointer_frame(&ctx)
-                .suppresses_current_frame();
+        let primary_suppressed =
+            owns_input_surface && primary_suppression.suppresses_current_frame();
         let mut close_requested = false;
         if owns_input_surface {
             let initial_geometry = crate::ui_page_overview::page_overview_geometry(

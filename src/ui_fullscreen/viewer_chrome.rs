@@ -40,7 +40,7 @@ impl App {
         }
         // Snapshot before releasing persistent ownership. The terminal frame
         // itself remains suppressed, while later early returns cannot strand
-        // the owner because this transition runs at the function boundary.
+        // the owner because the viewer calls this before key-driven surface changes.
         let primary_suppression =
             self.fs_primary_suppression
                 .apply(FullscreenPrimarySuppressionEvent::PointerFrame {

@@ -1357,3 +1357,88 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe -ArgumentList
 遷移中の背景が黒であることを確認する。native実機確認は未実施。
 `--data-dir`を省略すると通常`%APPDATA%/mimageviewer` profileを使い、実設定／dataを更新し得る。
 通常起動ではinstalled／tray常駐版を先に閉じる。
+
+## 24. キー取消とprimary releaseの同時配送 (TILE12、2026-10-13)
+
+### 24.1 根因と不変条件
+
+`945c21cf3`の独立再レビューTILErev7はREVISE（P1なし、P2 1件）。TILE11の右ドラッグ／
+gestureとX ring guideの接続は解消確認済みで、共通境界への構造合意は維持されている。
+右ドラッグを左button pressで取消すると、既存`FullscreenPrimarySuppression::PointerStream`が
+そのprimary streamを所有する。一覧のEsc／Oとprimary releaseが同frameに届くと、先行する
+key handlerが一覧を閉じ、Openがない一覧rendererと通常pointer phaseの両方を通らない。
+終端の`PointerFrame { released: true }`を採用できず、次の通常クリックまで抑止が残る。
+
+同じviewerの物理primary PointerStreamの終端は、表示内容のOpen／Closedに依存せず、そのviewerの入力passで
+一度処理する。終端frame自体の抑止結果は局所値として保持し、persistent ownerがIdleになった
+ことを理由にそのframeの背面clickへ再配送しない。次の新しいクリックは通常操作へ戻す。
+
+### 24.2 共通境界と簡素化
+
+実`render_fullscreen_viewport`のCentralPanel入口で、key handlerより前に既存
+`advance_viewer_primary_pointer_frame`を一度呼ぶ。戻り値の
+`FullscreenPrimarySuppressionDecision`を通常pointer handler／一覧rendererへ渡し、
+各描画内容の内部では物理primary終端を再採用しない。右drag取消と既存focus復帰graceも
+同helperのままで、touchの相関／TouchStreamの遷移と既存の局所overrideは維持する。
+一覧を開閉する各branchへのrelease処理、Appのpending field、別owner、遅延解除は追加しない。
+入力寿命を表示状態から分離する共通境界の修正で、開閉の状態組合せ自体を増やさない。
+
+単独handler／surfaceテストの入口は、既存の直接呼出しでも一度advanceして局所値を渡す。
+一覧の単独入口は既存active context／viewer viewportの照合を通った場合だけadvanceする。
+通常pointer配送後に描くConsumed一覧は物理edgeを再認識しない。root key forwardingはキーだけの
+既存配送であり、別viewportの物理入力をviewerのstream終端に使わない。passive windowの投影／
+入力、native video presenter、context registry／mount／park／HWND／foregroundは変更しない。
+
+### 24.3 回帰と検証
+
+headlessの実renderer回帰で通常fullscreen／メイン内閲覧／active detachedの3surfaceについて、
+Esc／Oの2key、計6組を通す。非currentセルで右dragを開始し、左pressで取消してPointerStreamを
+開始する。その左releaseとkey downを同frameへ配送し、一覧Closed、元ページ維持、抑止ownerの
+終端を直後に検査する。続く通常閲覧の新しい左clickが1ページ送りとして成立することも検査する。
+既存の「一覧Openのままrelease」回帰と通常touch／primary抑止回帰を併せて確認する。
+見た目／ラベルは変更せず、PNG／manual／KeyAction／iniの更新は不要。
+
+修正前の実renderer回帰はFullscreen／Escで「取消frameでownerが終端しない」と失敗した。
+修正後の初回runでは終端assertを通過したが、次clickのassertがfixtureの初回focus観測による
+別の300ms復帰クリック抑止に阻まれた。報告された既にfocus済みのreaderを再現するため、
+追加fixtureの`fs_prev_focused`をtrueで開始する。製品graceやsuppression gateは緩めない。
+TouchStreamの終端は既存touch recognizerのcompleted／cancelledの契約で、本修正の保証は
+PointerStreamに限定する。限定独立設計レビューはACCEPT（今回の移動によるtouch意味変更なし）。
+
+### 24.4 変更ファイルと検証結果
+
+7変更ファイル（Rust4、docs3）。`src/ui_fullscreen.rs`の共通pre-key入口と通常pointer引数、
+`src/ui_fullscreen/page_overview.rs`の受領／単独入口、`src/ui_fullscreen/viewer_chrome.rs`の
+説明、`src/app/gamepad_input.rs`の実renderer回帰を変更する。文書は本§24、
+`docs/detached-rework-plan.md`§11、`docs/display-pipeline.md`§1.6.1を更新する。
+
+| 検証 | 実数／結果 |
+| --- | --- |
+| lib 新規実renderer回帰（`pack-build-tools`） | 1 passed、0 failed／ignored。3surface×2keyの6組 |
+| lib `overview`（同feature） | 102 passed、0 failed／ignored。新規回帰と既存案内snapshot比較を含む |
+| lib `fullscreen_primary_suppression`／`touch_`（同feature） | 1／126 passed、各0 failed／ignored |
+| lib `right_drag`／`mouse_`／`viewer_context`（同feature） | 26／51／106 passed、各0 failed／ignored |
+| 独立限定設計／完了レビュー（Sol/xhigh） | 各ACCEPT。完了レビューP1／P2／P3なし |
+| `cargo fmt --check`／`git diff --check` | 各成功 |
+| `viewer_context_audit`／`check_ui_glyphs.py` | exit 0／危険glyph 0。監査登録・例外の変更なし |
+| 通常／portable core `cargo check` | 各成功（28.10秒／27.41秒） |
+| `build-dev.ps1 -PreserveRuntime` | 成功。通常feature／非portable。core 2分45秒、Remote／EPUB worker各0.27秒、runtime4／PE3検査成功 |
+| `test-full.ps1 -SuppressCrashDialogs` | 最終1回がPASS／exit 0。非filter親suiteの合計13,594 passed、0 failed、64 ignored。本体12,312 passed／57 ignored、UI snapshot integration170 passed、vendor egui／egui-wgpu／eframe各25／11／18 passed |
+
+filterは一部重なるため合算をunique test数としない。全体合計はfiltered outが0の親suiteだけを
+数え、内部の隔離child（filtered out 12,368）を二重計上しない。本体libの所要時間は1,301.98秒。
+release入力4本は既に揃っており、本修正はrelease-only／launcher／asset抽出に依存しないため
+追加release buildは0回。ログは`target/tile12-*.log`、build／fullはstdout／stderrを別ファイルへ保持する。
+製品起動、git add／commitは行っていない。
+
+利用者は古い確認用coreを閉じ、同じ隔離環境で次を実行する（agentは起動しない）:
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe -ArgumentList '--data-dir', 'G:\miv-iso\tile\data'
+```
+
+通常fullscreen／メイン内閲覧／active detachedのO一覧で右dragを始め、左buttonで取消す。
+その左buttonのreleaseとEsc／Oを同時に配送した場合、一覧だけが閉じ元ページを保ち、
+次の通常左clickがページ送りとして成立することを確認する。製品／native実機確認は未実施。
+`--data-dir`を省略すると通常`%APPDATA%/mimageviewer` profileを使い、実設定／dataを更新し得る。
+通常起動ではinstalled／tray常駐版を先に閉じる。

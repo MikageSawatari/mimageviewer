@@ -728,6 +728,103 @@ mod overview_viewer_chrome_tests {
     }
 
     #[test]
+    fn overview_real_viewer_key_cancel_and_primary_release_end_suppression_before_next_click() {
+        for mode in [Mode::Fullscreen, Mode::MainWindow, Mode::Detached] {
+            for key in [egui::Key::Escape, egui::Key::O] {
+                fixture(mode, |app, ctx| {
+                    app.spread_mode = SpreadMode::Single;
+                    // Start from an already focused reader, matching the reported use.
+                    // A headless fixture's first focus observation otherwise starts the
+                    // separate 300ms focus-restoration click suppression contract.
+                    app.fs_prev_focused = true;
+                    app.settings.ring_shortcuts.set_right_drag_mode(
+                        RightDragContext::ImageFullscreen,
+                        RightDragMode::RingShortcut,
+                    );
+                    frame(app, ctx, vec![]);
+                    let view = app.page_overview_view().unwrap();
+                    let layout = App::page_overview_cached_layout(ctx, &view).unwrap();
+                    let pos = layout.cell_rect(1, view.scroll_anchor).unwrap().center();
+                    frame(
+                        app,
+                        ctx,
+                        vec![
+                            egui::Event::PointerMoved(pos),
+                            pointer(pos, egui::PointerButton::Secondary, true),
+                        ],
+                    );
+                    assert!(app.mouse_ring_flick.is_some());
+                    frame(
+                        app,
+                        ctx,
+                        vec![
+                            pointer(pos, egui::PointerButton::Primary, true),
+                            pointer(pos, egui::PointerButton::Secondary, false),
+                        ],
+                    );
+                    assert!(app.mouse_ring_flick.is_none());
+                    assert!(app.fs_primary_suppression.is_active());
+                    frame(
+                        app,
+                        ctx,
+                        vec![
+                            egui::Event::Key {
+                                key,
+                                physical_key: Some(key),
+                                pressed: true,
+                                repeat: false,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                            pointer(pos, egui::PointerButton::Primary, false),
+                        ],
+                    );
+                    assert!(app.page_overview.session().is_none(), "{mode:?} {key:?}");
+                    assert_eq!(
+                        app.fullscreen_idx,
+                        Some(0),
+                        "cancel must not dispatch behind overview"
+                    );
+                    assert!(
+                        !app.fs_primary_suppression.is_active(),
+                        "{mode:?} {key:?}: release must end the owner in the cancel frame"
+                    );
+                    let next = egui::pos2(600., 360.);
+                    // Give the ordinary surface a pass to install its backing click response.
+                    frame(
+                        app,
+                        ctx,
+                        vec![
+                            egui::Event::Key {
+                                key,
+                                physical_key: Some(key),
+                                pressed: false,
+                                repeat: false,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                            egui::Event::PointerMoved(next),
+                        ],
+                    );
+                    frame(
+                        app,
+                        ctx,
+                        vec![pointer(next, egui::PointerButton::Primary, true)],
+                    );
+                    frame(
+                        app,
+                        ctx,
+                        vec![pointer(next, egui::PointerButton::Primary, false)],
+                    );
+                    assert_eq!(
+                        app.fullscreen_idx,
+                        Some(1),
+                        "{mode:?} {key:?}: the next ordinary click must turn the page"
+                    );
+                });
+            }
+        }
+    }
+
+    #[test]
     fn overview_real_viewer_primary_cancels_drag_without_selecting_tile() {
         fixture(Mode::MainWindow, |app, ctx| {
             app.settings.ring_shortcuts.set_right_drag_mode(

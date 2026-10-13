@@ -24040,11 +24040,17 @@ impl App {
                     .frame(egui::Frame::new().fill(canvas_color))
                     .show(ctx, |ui| {
                         let full_rect = ui.max_rect();
+                        // Physical stream lifetime belongs to this viewer pass, before keys
+                        // can replace its surface. Keep the terminal frame's suppression
+                        // decision even after the persistent owner has returned to Idle.
+                        let primary_suppression = self.advance_viewer_primary_pointer_frame(ctx);
                         if self.page_overview.session().is_some() {
                             let key_action = self.handle_fs_key_input(ctx, fs_idx, is_spread_double);
                             key_page_transition = key_action.page_transition;
                             if key_page_transition != FsKeyPageTransition::Closed {
-                                close_fs |= self.render_page_overview_surface(ui, full_rect);
+                                close_fs |= self.render_page_overview_surface_with_primary_frame(
+                                    ui, full_rect, primary_suppression,
+                                );
                                 // Pointer selection can also land after the key handler returned.
                                 key_page_transition = self.fs_page_transition_after_overview_input(fs_idx);
                             }
@@ -24237,7 +24243,9 @@ impl App {
                         let key_action = self.handle_fs_key_input(ctx, fs_idx, is_spread_double);
                         let overview_rendered = self.page_overview.session().is_some();
                         key_page_transition = if overview_rendered {
-                            close_fs |= self.render_page_overview_surface(ui, full_rect);
+                            close_fs |= self.render_page_overview_surface_with_primary_frame(
+                                ui, full_rect, primary_suppression,
+                            );
                             self.fs_page_transition_after_overview_input(fs_idx)
                         } else {
                             key_action.page_transition
@@ -24298,6 +24306,7 @@ impl App {
                             prev_foreground_hwnd,
                             &mut similar_preview_navigator_input,
                             hud_popup_wheel.as_ref(),
+                            primary_suppression,
                         );
                         if !wheel_nav.is_none() {
                             page_nav = wheel_nav;
@@ -33831,6 +33840,7 @@ impl App {
             .fullscreen_idx
             .map(|idx| self.still_seek_geometry_for_idx(full_rect, idx, state.is_video))
             .unwrap_or_else(StillSeekGeometry::bar_only);
+        let primary_suppression = self.advance_viewer_primary_pointer_frame(ctx);
         self.handle_fs_wheel_and_click_with_geometry(
             ui,
             ctx,
@@ -33841,6 +33851,7 @@ impl App {
             prev_foreground_hwnd,
             navigator_reservation,
             None,
+            primary_suppression,
         )
     }
 
@@ -33855,6 +33866,7 @@ impl App {
         prev_foreground_hwnd: usize,
         navigator_reservation: &mut Option<FsNavigatorInputReservation>,
         front_wheel_owner: Option<&FsHudPopupWheelInput>,
+        mut primary_suppression: FullscreenPrimarySuppressionDecision,
     ) -> (FsPageNav, bool) {
         *navigator_reservation = None;
         let mut navigator_frame_input = FsNavigatorFrameInput::for_current_pass(ctx);
@@ -33872,7 +33884,6 @@ impl App {
         let touch_tap_zones = self.fs_touch_tap_zones_enabled();
         let mut close = false;
         let pointer_primary_down = ctx.input(|input| input.pointer.primary_down());
-        let mut primary_suppression = self.advance_viewer_primary_pointer_frame(ctx);
 
         // レンダラが連続読みを描画しているか。クリックのページジャンプ抑制と、
         // 連結方向スクロール / 直交方向パンの振り分けに使う。
