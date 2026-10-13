@@ -172,6 +172,8 @@ Claude Code セッションを並行で動かす」節)。
 ## 7項目バッチの結果 — 大半が未完了 (要再実行)
 前回の「7項目一括」エージェントは重すぎて途中停止(完了通知なし)。実際に landed したのは:
 - **task1 IME 改行修正 ✅** (`consume_ime_enter` @ comic_lab main.rs:1083、`update` 先頭 :1125 で呼ぶ)
+  - 2026-10-14 I2 段 2a でこの対症療法は撤去。現在は egui-winit が IME 処理済み
+    Process press を遮断し、確定の改行を防ぎつつ通常 Enter の改行を維持する。
 - **task2 マーカー △ データのみ**: `default_markup_rules` を `[..]`=縦中横 / `{..}`=横倒し に変更、
   正立(`〔〕`/InlineDir::Upright のデフォルト)廃止。**ただし 3セット選択UIは未実装**。
   ※これで旧マーカー前提の 3 テストが壊れたが**修正済み**(layout.rs `markup_braces_make_sideways_run` /

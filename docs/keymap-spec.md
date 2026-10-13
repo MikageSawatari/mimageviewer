@@ -239,11 +239,12 @@ focus 方向を最初の focusable widget 登録前に `FocusDirection::None` �
 する。no-repeat の <kbd>Tab</kbd> は repeat event も発火させず除去する。
 `wants_keyboard_input()` の gate はこの消費より先に維持し、TextEdit / IME やフォーカス中 UI が
 キーボードを所有している間は KeySlot と egui event の双方を残す。
-ただし IME composition 中の <kbd>Esc</kbd> press だけは、各 egui Context の input plugin が
-`Memory::begin_pass` より前に RawInput から除去する。これは変換キャンセルを egui の focus
-navigation に見せず未確定文字の選択を保つためで、release は残す。続く `Disabled` に
-`Commit` が無い場合だけ、同じ plugin が空の `Preedit("")` を直前へ 1 回補う。
-非 composing 時と 300ms grace 中だけの Esc は除去せず、通常のパネル / モーダル操作へ渡す。
+IME が処理した `NamedKey::Process` の press / repeat は egui-winit が Key / Text /
+clipboard event にせず、native presenter も `VK_PROCESSKEY` を egui key にしない。
+release と Ime event は残す。composition 中という理由で通常の Esc press は除去しない。
+取消の `Disabled` / 空 `Commit` に非空 `Commit` が無い場合だけ、input plugin が
+空の `Preedit("")` を補い、未確定文字を取り消す。300ms grace によるアプリ操作抑止は
+I2 段 2b まで維持する。
 composition state は viewport ごとに独立し、main / fullscreen / detached を共有する App Context と
 native presenter Context の両方へ同じ plugin を登録する。
 IME 中は Windows の Alt+文字を含むキー処理で TextEdit の focus が一時的に外れる場合があるため、

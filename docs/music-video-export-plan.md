@@ -972,6 +972,46 @@ modal 化や live rebuild の追加は不要。
    利用者にも本体で確認を依頼する（detached viewer と、使っていれば MS-IME も）。trace は段 2b の確認にも使うので
    残す（既定無効）。
 
+**段 2a の実装記録（2026-10-14、`15fa526ef` 上の未コミット差分）。**
+
+- egui-winit の純関数 `should_forward_keyboard_input` を入口に置き、Process press / repeat を
+  Key / Text / Cut / Copy / Paste の生成前に遮断。release、Ime、EventResponse は維持。
+  trace は既定無効で残し、拒否した press の追加イベントは `egui=[None]` となる。
+- 本体 text_mode の Enter 除去、comic_lab の `consume_ime_enter` と専用状態、共有IME補正の
+  composing Esc press 除去と helper の IME Tab lock を撤去。空 Preedit 補完、矢印 lock、
+  全域 Tab policy、focus 復帰、`return_key(None)`、300ms grace と `dialog_*_pressed` は維持。
+- IME処理キーのfixtureを press なし・release あり・Ime列へ更新。通常キーと非IME focus回復、
+  clipboard / 非ラテンfallbackの検証は維持。本体の実 fullscreen 経路＋本文 TextEdit に
+  確定→すぐEnterの同一 / 別pass回帰2件、comic_lab本文にも回帰2件を追加。
+- `test-full.ps1` に egui-winit の無filter lib test を追加。環境差として、standalone manifest は
+  同梱upstream lockの旧 image / tiff（jpeg-decoder）がoffline cacheに無く実行不可だったため、
+  root graphの `cargo test -p egui-winit --lib` で同じvendored crate全件を実行する。
+  設計上の前提矛盾は無し。コミット・アプリ起動・実機確認は行わない。
+
+独立実装レビュー: 別 context の GPT-6.1 Sol / xhigh が **ACCEPT**（重要指摘なし）。
+通常入力の保存、本文2回帰が撤去対象のfullscreen closureを通ること、detached側への変更が
+症状パッチではないことも確認。実機確認と設計 lead の検収は別途必要。
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo test -p egui-winit --lib` | 16 passed（既存診断12＋新しいキー配送4） |
+| `cargo test -p egui-ime` | 17 passed |
+| `cargo test -p musicvideo-ui -p musicvideo_lab` | UI 121 / ラボ 75 passed |
+| `cargo test -p comic_lab` / `cargo check -p comic_lab` | 9 passed / check成功 |
+| `cargo test -p mimageviewer --lib ime_focus` | 12 passed |
+| `cargo test -p mimageviewer --lib egui_focus_policy` | 5 passed（`target/i2a-focus-policy.log`） |
+| `cargo test -p mimageviewer --lib ime` | 434 passed / 2 ignored（`target/i2a-ime.log`） |
+| `cargo test -p mimageviewer --lib text_mode` | 3 passed（本文の新しい2回帰を含む、`target/i2a-text-mode.log`） |
+| `cargo fmt --check` / vendor rustfmt check / `git diff --check` | 成功 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 成功 |
+| `.\scripts\build-dev.ps1 -PreserveRuntime` | 同worktreeの起動中core（PID 74036）で停止。停止許可はブリーフにあるが `Stop-Process` が Access is denied のため利用者の終了待ち（`MSBUILDDISABLENODEREUSE=1`） |
+| `cargo build --release -p musicvideo_lab` | 成功（40.26秒、`target/i2a-release-lab.log`） |
+| `.\scripts\test-release-build-safety.ps1` | PASS。egui-winit追加後の順序と5回実行に更新、追加差分も独立レビュー ACCEPT |
+| `.\scripts\test-full.ps1 -SuppressCrashDialogs` | exit 101。既知のAppサイズ制限失敗と、段1のログにもある `capture_region_focus_and_escape_terminals_preserve_event_order` のstack overflowで本体libが途中終了。ほかのworkspace targetは成功（`target/i2a-test-full.log`） |
+| 本体libの未完了範囲の補完 | `--list` と完了ログの差分2,717件を、同じpack-build-tools付きtest exeの `--exact` 複数filterで分割実行。2,704 passed / 13 ignored / 0 failed、exit 0。`RUST_MIN_STACK=67108864`。既存stack overflowのテストも成功。App構造・テスト上限・製品挙動は変更しない（`target/i2a-run-unfinished.ps1` / `i2a-unfinished-summary.log`） |
+| 全件照合 | 本体lib全12,691登録（重複登録3も照合）: 12,633 passed / 57 ignored / 1 failed、未確認0。失敗は既知のAppサイズ制限のみ。ほかのworkspace target: 1,584 passed / 7 ignored / 0 failed。原full gateのexit 101は維持し、full gate成功とは扱わない（`target/i2a-lib-coverage.json`） |
+| 追加vendor検証 | `cargo test --manifest-path vendor/egui/Cargo.toml --lib`: 25 passed（root graphは26 passed）。`cargo test --manifest-path vendor/egui-wgpu/Cargo.toml --features winit --lib`: 11 passed。`cargo test --manifest-path vendor/eframe/Cargo.toml --no-default-features --features wgpu --lib`: 18 passed |
+
 段 2b（設計は段 2a の実機確認後）: 300ms grace（`IME_EVENT_GRACE`）の文書上の理由は「Windows が
 `Disabled` と Esc / Enter を別フレームで届ける」ことで、その Esc / Enter は段 2a で egui へ届かなくなる。
 grace を composing だけの判定へ縮めると、各ダイアログでも「確定→すぐ Enter で決定」が通るようになる

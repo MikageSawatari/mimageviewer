@@ -545,12 +545,13 @@ TextEdit を含むダイアログで Enter / Escape を拾うときは **必ず�
 - **判定ロジック**: 各 egui Context に登録した `ime_focus` の input plugin が
   `ViewportId` ごとの composition 状態を単一 ownership で保持する。
   `App::ime_input_active(ctx)` は現在 composing、または同じ viewport で直近 300ms 以内に
-  Ime event があった場合に true。300ms グレースは App shortcut 抑止専用であり、
-  Esc event の除去条件には使わない。
+  Ime event があった場合に true。300ms グレースは App shortcut 抑止・focus 所有に
+  維持する（I2 段 2b で別途見直す）。本文 TextEdit の通常 Enter は除去しない。
 
 上記はアプリ操作を抑止する責務で、TextEdit の focus 復帰とは別。日本語を入力できる新しい
 single-line TextEdit は `crate::ime_focus` の helper 経由で描画すること。同 helper が IME の
-キー処理由来の一時的な focus loss の復帰と IME 候補選択中の Tab traversal 抑止を所有する。
+キー処理由来の一時的な focus loss の復帰と矢印の focus lock を所有する。
+Tab traversal はアプリ全体の Tab 方針が所有し、helper へ IME 専用 Tab lock は重ねない。
 helper-managed field が直前の pass で持っていた focus は 1 pass の typed recovery claim として
 keyboard owner にも渡し、TextEdit の復帰前に同じキーがアプリ shortcut へ漏れるのを防ぐ。
 pointer 入力を伴う正当な focus 移動は復帰しない。
@@ -570,8 +571,10 @@ viewport ごとに追跡する。`App::update_ime_state(ctx)` は helper-field �
 `ime_focus::ime_input_active_in_viewport` から共有 snapshot を読む。これは read-only の入口であり、
 対象 viewport の event queue や composition state を更新しない。更新は必ず所有 viewport の pass に残す。
 
-変換中の Esc press は同 plugin が RawInput から除去し、egui の `Focus::begin_pass` に
-見せない。release は残す。これにより TextEdit の未確定文字選択を保ったまま、Windows が
+IME が処理した `NamedKey::Process` の press（repeat を含む）は vendored egui-winit が
+Key / Text / Cut / Copy / Paste にしない。release と Ime event は残す。native presenter も
+`VK_PROCESSKEY` に egui key を割り当てない。通常のキーを composition / grace だけで
+取り除かない。TextEdit の未確定文字選択を保ったまま、Windows が
 空の `Preedit("")` を送らず `Disabled` だけを送る経路では、Commit の無い composing
 `Disabled` の直前だけ空 preedit を補える。composition が無い `Disabled` へは挿入せず、
 非 composing Esc と 300ms grace 中だけの Esc は通常入力として残す。

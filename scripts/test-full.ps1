@@ -61,6 +61,16 @@ public static class MivTestErrorMode
         }
 
         if ($gateExit -eq 0) {
+            # vendor/egui-winit is workspace-excluded. Exercise IME key routing and
+            # trace regressions without a filter, including future tests.
+            # Select the patched dependency from the root graph, keeping its
+            # versions aligned with the application and the offline cache.
+            Write-Host '[test-full] cargo test -p egui-winit --lib'
+            & cargo test -p egui-winit --lib
+            $gateExit = $LASTEXITCODE
+        }
+
+        if ($gateExit -eq 0) {
             # vendor/egui-wgpu is workspace-excluded, so the line above never reaches it. Run its
             # unit tests here, unfiltered: naming one test would silently drop every test added
             # later - which is the failure mode this step exists to prevent.

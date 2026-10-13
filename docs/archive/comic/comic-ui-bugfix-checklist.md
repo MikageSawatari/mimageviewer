@@ -39,6 +39,9 @@
   非重なり / 背面に設定 だと見た目が変わらない。→ ユーザーにテスト条件を確認中。
 
 ### ✅ B5. セリフ本文の IME 確定 Enter で改行が入る (`f8ff6391`)
+- 2026-10-14 I2 段 2a: 以下は当時の対症療法の記録。egui-winit が IME 処理済み
+  Process press を遮断する根の修正に置き換え、本文の Enter 除去とラボの
+  `consume_ime_enter` は撤去した。確定直後の通常 Enter は改行として通す。
 - 原因: multiline TextEdit で IME 確定 Enter が「確定(Ime::Commit)+改行(Key::Enter)」の二重処理。
 - 修正: text_mode かつ IME アクティブ (変換中 or 直近 300ms) の間 raw Key::Enter を除去。
   確定は Ime::Commit が行う。非変換時の Enter は通る。

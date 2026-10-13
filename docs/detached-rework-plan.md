@@ -4986,3 +4986,15 @@ main subclassの表示・最小化通知は維持し、Close/capture/通常矩�
 detached predicate/registry/viewport/scheduler/placementは変更せず、vendor egui/eframeも変更しない。
 設計担当の利用者決定と実装premise確認に基づく範囲を記録し、独立実装レビューACCEPTとは区別する。
 仕様と検証は音響調整計画§17.12、target/ET-1378-impl-msg.txtへ記録する。
+
+### §11 追補: I2 段 2a の IME 入力境界修正（2026-10-14、未コミット）
+
+設計 lead のブリーフと独立設計レビュー ACCEPT に従い、vendored egui-winit が
+`NamedKey::Process` の press / repeat を Key / Text / clipboard event にしない規則へ揃えた。
+実機記録で誤配送を確認した入力変換境界の修正で、native presenter の `VK_PROCESSKEY` 規則と一致する。
+`src/ui_fullscreen.rs` の既存 fullscreen closure から text_mode 中の Enter 除去だけを撤去し、
+確定後の通常 Enter を本文 TextEdit へ渡す。同じ実 fullscreen 経路の同一 / 別 pass 回帰を追加した。
+§2 を再読し、detached predicate、viewport 生成 / registry、host / placement / focus owner は変更しない。
+新しい状態・時間窓・geometry guard を足す症状パッチではなく、不要となった対症療法の撤去である。
+300ms grace 等の残す規則と自動検証結果は [I2 段 2a の記録](music-video-export-plan.md) に集約する。
+実機確認と設計 lead の検収は未実施。

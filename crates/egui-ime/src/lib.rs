@@ -31,13 +31,11 @@ impl ImeFocusState {
 
 /// Pre-`Memory::begin_pass` owner of IME composition state and input repair.
 ///
-/// egui clears keyboard focus when it sees an Escape press in
-/// `Focus::begin_pass`, before any application UI runs. During an active IME
-/// composition that Escape belongs to the IME, so this plugin removes only the
-/// press event (the harmless release is preserved). Windows can then finish the
-/// cancellation with `Disabled` but no empty preedit; in that case the plugin
-/// inserts the `Preedit("")` expected by `TextEdit` while its composition
-/// selection is still intact.
+/// The host input bridge excludes key presses handled by the IME (winit's
+/// `NamedKey::Process`); their releases and IME events still arrive here. Windows
+/// can finish cancellation with `Disabled` but no empty preedit. In that case
+/// this plugin inserts the `Preedit("")` expected by `TextEdit` while its
+/// composition selection is still intact. Ordinary key events are preserved.
 #[derive(Default)]
 struct ImeInputPlugin {
     viewports: HashMap<egui::ViewportId, ImeFocusState>,
@@ -93,19 +91,6 @@ fn normalize_ime_input(events: &mut Vec<egui::Event>, state: &mut ImeFocusState,
     let mut normalized = Vec::with_capacity(events.len().saturating_add(1));
 
     for event in std::mem::take(events) {
-        if composing
-            && matches!(
-                event,
-                egui::Event::Key {
-                    key: egui::Key::Escape,
-                    pressed: true,
-                    ..
-                }
-            )
-        {
-            continue;
-        }
-
         if let egui::Event::Ime(ime) = &event {
             saw_ime_event = true;
             // A composition ends without text either as `Disabled` or as an empty
@@ -336,9 +321,9 @@ pub fn recovering_text_input(ctx: &egui::Context) -> Option<egui::Id> {
 /// `focus_request` は、呼び出し側が初回フォーカス等に使う request latch があれば渡す。
 /// 復帰時は同 latch を次 frame 用に立て直す。latch を持たない欄では widget ID ごとの
 /// 一時 latch をこのモジュールが所有する。IME 中でもマウスクリック等、pointer event を
-/// 伴う正当なフォーカス移動は復帰しない。アプリ全体の Tab traversal 無効化は
-/// ホストの別責務であり、この field-level lock は IME 候補選択中の
-/// focus 保持を独立して保証する。
+/// 伴う正当なフォーカス移動は復帰しない。IME が処理したキーの press は入力 bridge が
+/// 渡さず、アプリ全体の Tab traversal 無効化はホストの別責務である。
+/// この helper は通常のカーソル矢印を field 内に保持し、keyboard focus loss を復帰する。
 /// `ime_active` は必ず `TextEdit` 構築前にこのモジュールで採取する。egui は focus 遷移と
 /// 同じ pass の Ime event を `TextEdit` 内部で queue から除去することがあり、描画後に読むと
 /// fullscreen viewport や native overlay を含む全 context で composition 開始を取り逃がすため。
@@ -367,7 +352,6 @@ fn restore_focus_for_ime_key(
             memory.set_focus_lock_filter(
                 response.id,
                 egui::EventFilter {
-                    tab: ime_active,
                     horizontal_arrows: true,
                     vertical_arrows: true,
                     ..Default::default()

@@ -462,12 +462,16 @@ pub(crate) fn ime_input_active(ctx: &egui::Context) -> bool {
 ///
 /// - main window と fullscreen viewport は winit / egui を通り、`Ime::Preedit` /
 ///   `Ime::Commit` / `Ime::Disabled` 相当の `egui::ImeEvent` を受ける。
+///   IME が処理した `NamedKey::Process` の press / repeat は egui-winit が
+///   Key / Text / clipboard event にせず、release と Ime event はそのまま渡す。
 /// - winit 管理外の独立 HWND である native video window は
 ///   `video/native_window.rs` で `WM_IME_STARTCOMPOSITION` /
 ///   `WM_IME_COMPOSITION` / `WM_IME_ENDCOMPOSITION` / `WM_IME_SETCONTEXT` を直接処理する。
 ///   `GCS_COMPSTR` と `GCS_RESULTSTR` を読み、`ISC_SHOWUICOMPOSITIONWINDOW` を落として OS の
 ///   composition window を抑止する。候補位置は `video/native_window_host.rs` が
 ///   `ImmSetCompositionWindow` / `ImmSetCandidateWindow` で設定する。
+///   この経路も `VK_PROCESSKEY` に egui key を割り当てない。共有 plugin は
+///   取消時の空 preedit 補完を所有し、300ms grace と focus 復帰は引き続き維持する。
 ///
 /// native 経路は `GCS_COMPATTR` / `GCS_COMPCLAUSE` を読まないため変換対象 clause を区別せず、
 /// egui へ渡す preedit 文字列にも caret range がない。`IMR_RECONVERTSTRING` による再変換も
@@ -1156,8 +1160,14 @@ mod tests {
             viewport_raw_input(
                 egui::ViewportId::ROOT,
                 vec![
-                    key_event(egui::Key::Escape),
                     egui::Event::Ime(egui::ImeEvent::Disabled),
+                    egui::Event::Key {
+                        key: egui::Key::Escape,
+                        physical_key: Some(egui::Key::Escape),
+                        pressed: false,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
                 ],
             ),
             |ctx| {

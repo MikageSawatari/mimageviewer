@@ -1,8 +1,8 @@
 # egui-winit 0.33.3 のローカル変更
 
 I2 段 1（2026-10-14）: IME が処理したキーの到着を調べる診断用 trace。
-キー・IME の変換、egui イベントの生成・消費、EventResponse は変更しない。
-段 2 の修正は未設計で、実 IME のログを見て診断コードの扱いも決める。
+段 1 はキー・IME の変換、egui イベントの生成・消費、EventResponse を変更しない。
+I2 段 2a（同日）: 実機記録に基づき、IME 処理済みキーの press を遮断する挙動変更を追加。
 
 ## 出典・取り込み
 
@@ -19,7 +19,8 @@ registry 管理用 `.cargo-ok` と生成された `target/` は取り込まな�
 root workspace の exclude と `[patch.crates-io]` に追加し、本体・ラボ・workspace メンバーの
 推移的依存も同じ path の egui-winit を使う。package の version / dependencies / features は不変。
 
-原本からの変更は `src/lib.rs` の観測 hook だけ。追加は
+段 1 の原本からの変更は `src/lib.rs` の観測 hook。段 2a は同ファイルに純粋な
+キー配送判定と単体テストを追加する。追加ファイルは
 `src/ime_key_trace.rs`（診断実装と単体テスト）、本書、ライセンス本文 2 ファイル。
 `Cargo.toml` / `Cargo.toml.orig` / 同梱 `Cargo.lock` も原本のまま保持する。
 root `Cargo.lock` の変更は egui-winit の source / checksum の除去だけ。
@@ -38,12 +39,12 @@ root `Cargo.lock` の変更は egui-winit の source / checksum の除去だけ�
 
 - `MIV_IME_KEY_TRACE=<絶対パス>` を最初の `State::new`（winit 統合の起動）で process 全体につき
   1 回だけ読む。未設定・空・相対パスなら完全に無効で、worker・ファイル I/O・イベントの走査・
-  文字列生成・時計読み取りは行わない。無効時のイベント処理は原本の match 本体をそのまま通す。
+文字列生成・時計読み取りは行わない。無効時も段 2a のキー配送規則は適用する。
 - 全 State / viewport は同じ worker と単調時計を共有する。`ms` は最初の State 初期化からの
   経過 ms。最初の State 構築より前の区間は観測できない。`viewport` は対象 State の `ViewportId` を
   省略なしの 64-bit hex で出す（egui の Debug は 16-bit の省略形なので使わない）。
 - `WindowEvent::KeyboardInput` / `Ime` の処理直前に時刻とイベント列の末尾位置を取る。
-  原本の処理後、新たに追加された実際のイベントだけを読み取る。変換結果の再計算はしない。
+  入力処理後、新たに追加された実際のイベントだけを読み取る。変換結果の再計算はしない。
   synthetic press の無視、Cut/Copy/Paste の early return、IME Enabled の重複抑止も観測できる。
 - 1 行 1 到着事象の UTF-8 テキスト。`egui=[...]` は追加順で、空なら `[None]`。
   Key の `repeat` は egui-winit が出した値（原本どおり false）であり、winit の repeat と区別する。
@@ -74,9 +75,10 @@ egui-winit 原本 `src/lib.rs:1117` / `:1125` の変換には Process が無く�
 `logical_key.or(physical_key)` が physical Enter へ fallback する見立ては一致する。
 これは発生条件のソース確認であり、実機で確認した範囲は次節に区別して記録する。
 
-## 利用者の実機記録（2026-10-14、Google 日本語入力・この PC）
+## 設計 lead の実機記録（2026-10-14、Google 日本語入力・この PC）
 
-修正前の段 1 trace に基づく利用者報告。本体の注釈本文欄とラボの歌詞欄の両方で、
+設計 lead が隔離データの本体とscratchpadのラボで操作した、修正前の段 1 trace。
+本体の注釈本文欄とラボの歌詞欄の両方で、
 変換確定の Enter・変換中の Escape・候補選択中の Tab・変換の Space の press は
 logical=Named(Process)、physical は対応する KeyCode で到着し、egui-winit は対応する Key の
 press を出していた。文字キーの press も logical=Named(Process) だった。
@@ -86,7 +88,29 @@ IME が開いていても変換していないときの Enter は logical=Named(
 raw VK / scan code の観測結果は含まない。他の IME・PC まで一般化しない。
 P2 修正後の trace は Space の種類を全経路で秘匿するが、logical=Named(Process) は保持する。
 
-## 検証
+## 段 2a のキー配送規則（2026-10-14、挙動変更）
+
+`on_keyboard_input` の入口で、`logical=NamedKey::Process` かつ press を
+`should_forward_keyboard_input` の純関数で拒否する。repeat も同じ入口を通るため、
+physical fallback、Text、Cut / Copy / Paste の全 producer より前に遮断される。
+release は Process であっても渡し、追跡集合や新しい入力状態は持たない。
+`EventResponse` と Ime イベント変換は変更しない。通常キー・非ラテン配列の physical
+fallback と clipboard shortcut は維持する。
+
+根拠は設計 lead が隔離データの本体注釈本文とラボ歌詞欄で記録した段 1 trace
+（Google 日本語入力・この PC）。Process press の fallback が確定 Enter を改行にし、
+本体の300ms除去が直後の通常Enterまで落としていた。native presenter の既存
+`VK_PROCESSKEY` に egui key を割り当てない規則と一致させる。他IME・PCの実機確認は未実施。
+trace は既定無効のまま残し、Process press の出力は実際の追加イベントが空なので
+`egui=[None]` となる。段 1 の記録と取り込み履歴は上記に保持する。
+
+単体テストは Process press 拒否、release 通過、通常 Enter / Esc / Tab / Space、
+非ラテン配列の physical fallback と clipboard 判定を固定する。
+workspace 外のため `scripts/test-full.ps1` に無 filter の lib test を追加する。
+同梱 upstream lock の旧 image / tiff 依存は offline cache に無いため、manifest 単独ではなく
+root graph の `cargo test -p egui-winit --lib` で、本体と同じ依存を使って全件実行する。
+
+## 段 1 の検証履歴
 
 root graph を使う `cargo test -p egui-winit --lib` で診断単体テストを実行する。
 KeyEvent は winit 0.30.13 `src/event.rs:655` の private `platform_specific` field により

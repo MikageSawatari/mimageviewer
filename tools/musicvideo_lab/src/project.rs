@@ -135,7 +135,7 @@ mod input_policy_tests {
                 egui::Event::Key {
                     key: egui::Key::Escape,
                     physical_key: None,
-                    pressed: true,
+                    pressed: false,
                     repeat: false,
                     modifiers: egui::Modifiers::NONE,
                 },

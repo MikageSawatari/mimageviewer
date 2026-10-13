@@ -173,6 +173,7 @@ Assert-OrderedText $testFull @(
     '$effectiveMode = [MivTestErrorMode]::GetErrorMode()',
     '& cargo test --workspace --features pack-build-tools --no-fail-fast',
     '& cargo test --manifest-path vendor/egui/Cargo.toml --lib',
+    '& cargo test -p egui-winit --lib',
     '& cargo test --manifest-path vendor/egui-wgpu/Cargo.toml --features winit --lib',
     '& cargo test --manifest-path vendor/eframe/Cargo.toml --no-default-features --features wgpu --lib',
     '[void][MivTestErrorMode]::SetErrorMode($modeBefore)',
@@ -265,7 +266,7 @@ exit $LASTEXITCODE
     $baselineExit = $LASTEXITCODE
     Assert-True ($baselineExit -eq 0) "test-full default success stub returned $baselineExit; output: $($baselineOutput -join ' | ')"
     $baselineCalls = @(Get-Content -LiteralPath $baselineLog -Encoding UTF8)
-    Assert-True ($baselineCalls.Count -eq 4) "test-full default path invoked cargo $($baselineCalls.Count) times"
+    Assert-True ($baselineCalls.Count -eq 5) "test-full default path invoked cargo $($baselineCalls.Count) times"
     Assert-True (-not (($baselineOutput -join "`n").Contains('crash-dialog suppression active'))) 'test-full default path enabled crash-dialog suppression'
 
     $successLog = Join-Path $testRootFull 'success.log'
@@ -273,7 +274,7 @@ exit $LASTEXITCODE
     $successExit = $LASTEXITCODE
     Assert-True ($successExit -eq 0) "test-full success stub returned $successExit; output: $($successOutput -join ' | ')"
     $successCalls = @(Get-Content -LiteralPath $successLog -Encoding UTF8)
-    Assert-True ($successCalls.Count -eq 4) "test-full success path invoked cargo $($successCalls.Count) times"
+    Assert-True ($successCalls.Count -eq 5) "test-full success path invoked cargo $($successCalls.Count) times"
     Assert-True ((@($successCalls | Where-Object { $_ -notmatch 'mode=0x[0-9A-Fa-f]{7}[37BFbf];' })).Count -eq 0) 'a success-path cargo child did not inherit both error-mode bits'
     Assert-True (($successOutput -join "`n").Contains('[test-full] process error mode restored:')) 'test-full success path did not report error-mode restoration'
 

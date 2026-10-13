@@ -152,26 +152,20 @@ fn empty_preedit_count(ctx: &egui::Context) -> usize {
 }
 
 #[test]
-fn composing_escape_press_is_removed_but_release_is_preserved() {
+fn composing_normal_key_presses_and_releases_are_preserved() {
     let ctx = test_context();
     let viewport_id = egui::ViewportId::from_hash_of("ime-escape-filter");
     establish_composition(&ctx, viewport_id);
 
-    ctx.begin_pass(viewport_raw_input(
-        viewport_id,
-        vec![
-            key_event_state(egui::Key::Escape, true),
-            key_event_state(egui::Key::Escape, false),
-        ],
-    ));
-    ctx.input(|input| {
-        assert_eq!(
-            input.events,
-            vec![key_event_state(egui::Key::Escape, false)]
-        );
-    });
-    assert_eq!(empty_preedit_count(&ctx), 0);
-    let _ = ctx.end_pass();
+    // These are ordinary bridge-delivered keys, not IME-handled Process presses.
+    // Composition by itself must not make the normalizer suppress them.
+    for key in [egui::Key::Enter, egui::Key::Escape, egui::Key::Tab] {
+        let events = vec![key_event_state(key, true), key_event_state(key, false)];
+        ctx.begin_pass(viewport_raw_input(viewport_id, events.clone()));
+        ctx.input(|input| assert_eq!(input.events, events));
+        assert_eq!(empty_preedit_count(&ctx), 0);
+        let _ = ctx.end_pass();
+    }
 }
 
 #[test]
@@ -244,9 +238,9 @@ fn composing_disabled_inserts_one_empty_preedit_before_disabled() {
     let _ = ctx.end_pass();
 }
 
-/// The sequence Windows actually delivers when Esc cancels a composition,
-/// captured from `[ime-raw]` tracing on 2026-08-01:
-/// `EscPress, Disabled, Disabled, Commit(""), Disabled, Disabled`.
+/// The cancellation sequence captured from `[ime-raw]` on 2026-08-01, with
+/// the Process press now excluded by egui-winit and the Esc release preserved:
+/// `Disabled, Disabled, Commit(""), Disabled, Disabled, EscRelease`.
 ///
 /// The empty commit is a cancellation, not a confirmation: egui's commit
 /// handler skips `delete_selected` for an empty prediction, so without the
@@ -260,12 +254,12 @@ fn windows_escape_cancel_sequence_clears_the_preedit() {
     ctx.begin_pass(viewport_raw_input(
         viewport_id,
         vec![
-            key_event(egui::Key::Escape),
             egui::Event::Ime(egui::ImeEvent::Disabled),
             egui::Event::Ime(egui::ImeEvent::Disabled),
             egui::Event::Ime(egui::ImeEvent::Commit(String::new())),
             egui::Event::Ime(egui::ImeEvent::Disabled),
             egui::Event::Ime(egui::ImeEvent::Disabled),
+            key_event_state(egui::Key::Escape, false),
         ],
     ));
     let _ = ime_input_active(&ctx);
@@ -286,6 +280,11 @@ fn windows_escape_cancel_sequence_clears_the_preedit() {
                 }
             )),
             "the cancelling Esc must not reach egui focus handling"
+        );
+        assert!(
+            input
+                .events
+                .contains(&key_event_state(egui::Key::Escape, false))
         );
         let first_ime = input
             .events
@@ -393,32 +392,22 @@ fn raw_multiline_text_edit_keeps_focus_and_cancels_preedit_across_delayed_disabl
     assert_eq!(body, "あ");
     assert_eq!(ctx.memory(|memory| memory.focused()), Some(field_id));
 
-    let mut escape_press_seen = true;
+    let mut escape_release_seen = false;
     let _ = ctx.run(
         viewport_raw_input(
             egui::ViewportId::ROOT,
-            vec![
-                key_event_state(egui::Key::Escape, true),
-                key_event_state(egui::Key::Escape, false),
-            ],
+            vec![key_event_state(egui::Key::Escape, false)],
         ),
         |ctx| {
-            escape_press_seen = ctx.input(|input| {
-                input.events.iter().any(|event| {
-                    matches!(
-                        event,
-                        egui::Event::Key {
-                            key: egui::Key::Escape,
-                            pressed: true,
-                            ..
-                        }
-                    )
-                })
+            escape_release_seen = ctx.input(|input| {
+                input
+                    .events
+                    .contains(&key_event_state(egui::Key::Escape, false))
             });
             draw(ctx, &mut body, &mut request_focus);
         },
     );
-    assert!(!escape_press_seen);
+    assert!(escape_release_seen);
     assert_eq!(ctx.memory(|memory| memory.focused()), Some(field_id));
 
     let mut cancel_preedit_count = 0;
@@ -454,7 +443,7 @@ fn draw_text_fields(
 }
 
 #[test]
-fn ime_tab_restores_the_editing_field_focus() {
+fn ime_candidate_tab_keeps_the_editing_field_focus() {
     let ctx = test_context();
     let first_id = egui::Id::new("ime_tab_first");
     let second_id = egui::Id::new("ime_tab_second");
@@ -493,7 +482,10 @@ fn ime_tab_restores_the_editing_field_focus() {
     );
     let _ = ctx.run(
         egui::RawInput {
-            events: vec![key_event(egui::Key::Tab)],
+            events: vec![
+                egui::Event::Ime(egui::ImeEvent::Preedit("亜".to_owned())),
+                key_event_state(egui::Key::Tab, false),
+            ],
             ..Default::default()
         },
         |ctx| {
@@ -510,6 +502,8 @@ fn ime_tab_restores_the_editing_field_focus() {
 
     assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
     assert!(ctx.wants_keyboard_input());
+    assert_eq!(first, "亜");
+    assert!(second.is_empty());
 }
 
 #[test]
@@ -584,7 +578,9 @@ fn ime_start_is_sampled_before_text_edit_consumes_events() {
     );
     assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
 
-    let _ = ctx.run(raw_input(vec![key_event(egui::Key::Tab)]), |ctx| {
+    // A normal Esc deliberately exercises the retained focus-recovery path.
+    // This is not the Process press used to cancel an IME composition.
+    let _ = ctx.run(raw_input(vec![key_event(egui::Key::Escape)]), |ctx| {
         draw_text_fields(
             ctx,
             first_id,
@@ -689,7 +685,7 @@ fn ime_activity_without_a_focus_key_does_not_undo_focus_change() {
 }
 
 #[test]
-fn ime_enter_and_escape_restore_the_editing_field_focus() {
+fn ime_enter_commit_and_escape_cancel_keep_the_editing_field_focus() {
     for key in [egui::Key::Enter, egui::Key::Escape] {
         let ctx = test_context();
         let first_id = egui::Id::new(("ime_focus_key_first", key));
@@ -707,6 +703,26 @@ fn ime_enter_and_escape_restore_the_editing_field_focus() {
                 &mut focus_request,
             );
         });
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::Ime(egui::ImeEvent::Enabled),
+                    egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                draw_text_fields(
+                    ctx,
+                    first_id,
+                    second_id,
+                    &mut first,
+                    &mut second,
+                    &mut focus_request,
+                );
+            },
+        );
+        assert_eq!(first, "あ");
         let terminal_ime_event = if key == egui::Key::Enter {
             egui::Event::Ime(egui::ImeEvent::Commit("あ".to_owned()))
         } else {
@@ -715,10 +731,9 @@ fn ime_enter_and_escape_restore_the_editing_field_focus() {
         let _ = ctx.run(
             egui::RawInput {
                 events: vec![
-                    egui::Event::Ime(egui::ImeEvent::Enabled),
-                    egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
-                    key_event(key),
                     terminal_ime_event,
+                    egui::Event::Ime(egui::ImeEvent::Disabled),
+                    key_event_state(key, false),
                 ],
                 ..Default::default()
             },
@@ -735,6 +750,8 @@ fn ime_enter_and_escape_restore_the_editing_field_focus() {
         );
 
         assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
+        assert_eq!(first, if key == egui::Key::Enter { "あ" } else { "" });
+        assert!(second.is_empty());
     }
 }
 

@@ -14,7 +14,7 @@
 | 自動操作用の使い捨て環境を準備 | `.\scripts\prepare-portable-smoke.ps1 -TestScript` | 診断portableを別出力先でbuildし、固定sandboxへ配置。起動はしない |
 | 了承済みのリリース前実アプリ検証 | `.\scripts\ui-smoke.ps1 -Scenario <対象> -InteractiveApproved` | [実行確認](interactive-release-verification.md)後だけ。通常の開発反復・test-fullへ自動連結しない |
 | 毎リリースのidle／perf正規確認 | `.\scripts\ui-smoke.ps1 -Scenario ReleaseChecks -InteractiveApproved` | 2026-10-11採用。利用者がPowerShellで実行。隔離seed＋5 idle＋cached／uncached perf、全結果は `target/ui-smoke/runs/<run-id>/` |
-| リリース前の自動テスト一式 | `.\scripts\test-full.ps1` | workspace 全体 + テストを持つ補助 bin + 除外された vendor 3 crate の lib test |
+| リリース前の自動テスト一式 | `.\scripts\test-full.ps1` | workspace 全体 + テストを持つ補助 bin + 除外された vendor 4 crate の lib test |
 | 配布成果物を生成 | `.\scripts\build-dist.ps1` | 全体テスト、clean、release、installer、portable |
 
 ReleaseChecksは非対話テストではなく、desktopを使う了承済み検証枠で実行する。
@@ -209,12 +209,16 @@ cargo run --release --features dev-tools --bin bench_search -- --docs 50000
 ```powershell
 cargo test --workspace --features pack-build-tools --no-fail-fast
 cargo test --manifest-path vendor/egui/Cargo.toml --lib
+cargo test -p egui-winit --lib
 cargo test --manifest-path vendor/egui-wgpu/Cargo.toml --features winit --lib
 cargo test --manifest-path vendor/eframe/Cargo.toml --no-default-features --features wgpu --lib
 ```
 
-vendor 3 crate は workspace から除外されているため、各 manifest から無 filter で lib test を実行する。
-egui の判定済み release 列 API、GPU mipmap、native repaint scheduler の回帰をこの経路で保持する。
+vendor 4 crate は workspace から除外されているため、追加コマンドで無 filter の lib test を実行する。
+egui-winit は同梱 upstream lock の旧 image / tiff 依存が offline cache に無いため、
+root graph の patched dependency を `-p egui-winit --lib` で無 filter 実行する。
+egui の判定済み release 列 API、IME 処理済み Process press の遮断と診断、GPU mipmap、
+native repaint scheduler の回帰をこの経路で保持する。
 `vendor/egui` は既存と同じ 0.33.3 に読み取り API だけを加えたもので、root と standalone の
 `vendor/eframe` / `vendor/egui-wgpu` に同じ path patch を置く。更新時は各 dependency graph が
 同じ local egui を参照することを確認し、直接依存と transitive 依存の型を分裂させない。
