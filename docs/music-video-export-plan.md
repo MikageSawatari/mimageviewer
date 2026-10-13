@@ -1027,7 +1027,7 @@ trace（scratchpad の `night\trace\main-2a.log` / `lab-2a.log`）では、本�
 18 件すべてが `egui=[None]`（egui へ何も渡していない）。未確認: detached viewer、MS-IME 等の他の IME、
 利用者の実機・実設定。
 
-**段 2b（設計案 第 3 版、2026-10-14 設計 lead。第 1 版 REVISE（P1 1・P2 2）、第 2 版 REVISE（P2 1・P3 1）。実装前）: 300ms grace を外し「変換中か」だけで判定する。**
+**段 2b（設計案 第 4 版、2026-10-14 設計 lead。第 1 版 REVISE（P1 1・P2 2）、第 2 版 REVISE（P2 1・P3 1）、第 3 版 REVISE（P1 1・P2 1）。実装前）: 300ms grace を外し「変換中か」だけで判定する。**
 
 経緯と理由: `IME_EVENT_GRACE`（300ms）は「Windows が IME 終了（`Disabled` / `Commit`）と、IME が処理した
 Esc / Enter を別フレームで届ける」ことの吸収として入った（`App::ime_input_active` の doc、CLAUDE.md の IME 対応節）。
@@ -1049,21 +1049,29 @@ Esc / Enter を別フレームで届ける」ことの吸収として入った�
    箇所（`should_close_fullscreen_on_enter`、検索バーの `handle_keyboard` 抑止 `app.rs` 53715 付近、
    specified-scale の数値 popup、削除確認の Y/N）は、Process 遮断後も意味が通るかを 1 つずつ確かめ、
    不要になったものはコメントと分岐を消す。
-2a. **focus 復帰は grace ではなく「この pass に IME が関わったか」で判定する（第 1 版 P1）。** helper の
-   `restore_focus_for_ime_key`（`crates/egui-ime` 363 付近）は `lost_focus && ime_active && keyboard-only 入力` で
-   focus を戻しており、Alt+J と `Disabled` が同じ pass に来て一時的に focus が外れる経路
-   （`ime_alt_focus_loss_keeps_bookmark_editor_ownership_and_blocks_panel_toggle`）は grace の `ime_active` に依存している。
-   composing だけにするとこの復帰が失われ、編集中の focus を失う退行になる。そこで復帰条件の `ime_active` を、
-   plugin が pre-pass で記録する「pass 開始時に composing だった、またはこの pass の入力に Ime event があった」
-   （時刻を持たない、その pass 限りの値）に置き換える。この値は helper 内部の focus 復帰にだけ使い、
-   ショートカット抑止やダイアログの決定には使わない。
-   **意図した focus の手放しは復帰しない（第 2 版 P2）。** 段 2a 以降、egui に届く Enter / Escape / Tab の press は
-   利用者が押した通常のキーで、egui はこれらで意図して focus を手放す（single-line TextEdit の Enter 完了
-   `builder.rs` 1016 付近、`Focus::begin_pass` の Escape、Tab）。復帰の条件 `keyboard_focus_recovery_input`
-   （いまは「pointer 無しで何かの key press がある」）を「pointer 無しで、Enter / Escape / Tab 以外の key press がある」に
-   変え、この pass に Enter / Escape / Tab の press があれば復帰しない。これで `[Commit, Disabled, 通常 Enter]` の pass では
-   検索欄・アドレス欄の Enter 完了（focus を手放し `lost_focus()` で決定）が通り、Alt+J のような IME 処理に伴う
-   一時的な focus 喪失だけが復帰する。pointer による focus 移動も今までどおり復帰しない。
+2a. **focus 復帰を「キーの所有」と「focus を戻すか」に分ける（第 1〜3 版の指摘、第 4 版）。** いまの helper は
+   1 つの判定（`keyboard_focus_recovery_input` と grace の `ime_active`）を 2 つの役割に使っている。
+   - **キーの所有（recovery claim、変えない）**: `recovering_text_input` は「直前の pass まで helper 管理の欄に focus があり、
+     この pass が pointer 無しの key press で、いま何にも focus が無い」とき、その欄にこの pass のキーを所有させる。
+     IME とは無関係で、欄で押した通常の Esc / Enter が同じ pass でアプリのショートカット（フルスクリーンを閉じる等）に
+     渡らないことを守っている（`focused_bookmark_title_escape_does_not_close_fullscreen`）。判定も対象キーもそのまま残す。
+   - **focus を戻すか（restore、作り直す）**: `restore_focus_for_ime_key` の条件を、時刻（grace）ではなく理由で決める。
+     戻すのは次をすべて満たすときだけ:
+     `lost_focus()`、pointer 無しの key press がある（今の `keyboard_focus_recovery_input`）、いま他の widget に focus が無い、
+     そして「**この pass の Ime を反映した後も composing**」または「**この pass に Enter / Escape の press が無い**」。
+     composing は plugin が pre-pass で今 pass の Ime 列まで反映した値で、helper が TextEdit 構築前に読む（今の `ime_active` の採取位置）。
+   - 何が変わるか（段 2a 以降、egui に届く Enter / Escape の press は利用者が押した通常のキー）:
+     - 確定と同じ pass・直後の pass の通常 Enter: single-line 欄は Enter で意図どおり focus を手放し（`builder.rs` 1016 付近）、
+       検索欄・アドレス欄は `lost_focus()` で決定する。いまは grace 中だと focus が戻され決定されない。
+     - 確定直後の通常 Esc: 欄から抜ける（間を空けたときと同じ）。いまは grace 中だと欄に戻る。同じ pass のキーは
+       recovery claim が欄に所有させるので、Esc がそのままフルスクリーンを閉じることはない。
+     - 変換中に通常の Esc / Enter が届いた場合（実機の Google / MS-IME では Process か配送なしで届かないが、テスト
+       `crates/egui-ime/src/tests.rs` 581 付近が扱う）: composing なので今までどおり欄に戻す。
+     - Alt+J と `Disabled` の pass で一時的に focus が外れる経路（`ime_alt_focus_loss_…`）: Enter / Esc が無いので戻す。
+       IME の有無を問わなくなるので、IME 無しで Alt+文字の処理により focus が外れた場合も戻す（同じ「一時的な喪失」）。
+     - Tab はアプリ全体の Tab 方針が traversal を止めて focus を動かさないので、条件に入れない。
+   - アプリのコードが意図して helper 欄の focus を外す箇所（`surrender_focus`）は、検索欄の Enter 決定後
+     （`ui_main.rs` 15553 付近、Enter の pass）とテストだけ（2026-10-14 grep）で、新しい条件と衝突しない。
 2b. **native presenter のタグ選択欄は、今 pass の状態で判定する（第 1 版 P2）。** `render_core.rs` 12521 付近は
    `egui_ctx.run` の前（plugin が今 pass の Ime 列を反映する前）に `tag_picker_ime_active` を取っているので、
    前 pass が composing・今 pass が `[Commit, Disabled, 通常 Enter]` のとき Enter を捨てる。
@@ -1108,23 +1116,16 @@ Esc / Enter を別フレームで届ける」ことの吸収として入った�
 利用者に見える変化: 日本語を確定した直後（300ms 以内）の Enter / Esc / ショートカットが、間を空けたときと同じに働く。
 変換中（未確定文字があるとき）の扱いは変わらない。
 
-**段 2b は第 3 版の独立レビューも REVISE（P1 1・P2 1）で、2026-10-14 早朝に保留した。** 指摘は回を追うごとに
-focus 復帰と「同じキーの所有」の組み合わせへ移っている（第 3 版: Enter / Esc / Tab を復帰条件から外すと、
-recovery claim も失われ、ブックマーク名欄の通常 Esc が同じ pass でフルスクリーンを閉じる
-`focused_bookmark_title_escape_does_not_close_fullscreen` に反する。変換中に届く通常 Esc で focus を保つ既存テスト
-`crates/egui-ime/src/tests.rs` 581 付近にも反する。Tab は全域 Tab 方針が traversal を止めるので理由づけも誤り）。
-CLAUDE.md「設計の簡素化」の経緯と同じ型なので、組み合わせを増やして塞ぐ前に範囲を利用者と決める。選択肢:
+**経緯**: 第 3 版の後に一度保留し、選択肢（A 狭い / B 全面 / C 見送り）を利用者に示した。2026-10-14 朝、利用者が
+**B（全面）** を選び、「今までが少しおかしい動きだったなら本来の動きに直るのは問題ない」とした（確定直後だけ Enter / Esc の
+結果が違う動きを揃える）。master へは音楽ビデオより先に入れる。
 
-- **A（狭い 2b）**: grace をショートカット抑止とダイアログの決定 / 取消（`ime_input_active`・`dialog_*_pressed`）からだけ外し、
-  helper の focus 復帰と recovery claim の判定は今の grace のまま残す（focus の挙動は変えない）。Win32 queue と native 生キーの
-  0xE5 遮断、native タグ選択欄の今 pass 判定は入れる。残る取りこぼし: helper 管理の single-line 欄で `lost_focus()` を
-  決定に使う欄（検索欄・アドレス欄）は、確定直後 300ms 以内の Enter で focus が戻されて決定されない。
-- **B（全面）**: focus 復帰を「復帰するか」と「同じキーを誰が所有するか」に分けて設計し直す。範囲が広く、
-  focus の挙動が変わるので、独立レビューを何回か要する見込み。
-- **C（見送り）**: 段 2a で止める。利用者報告（注釈本文）とラボの改行は直っている。ダイアログでの確定直後 300ms 以内の
-  Enter / Esc の取りこぼしは今までどおり残る。
-
-どの選択肢でも、前提条件 6（MS-IME での記録）は先に満たす。
+**前提条件 6 の記録（2026-10-14 朝、設計 lead が利用者の了承を得て MS-IME に切り替えて実施）**: 本体の注釈本文で
+MS-IME を使い、確定・確定→すぐ Enter・変換中 Esc・候補選択中 Tab・候補一覧の Enter・部分確定（Ctrl+↓）を記録した。
+IME が処理したキーは `Process` で届くか、**press 自体が届かない**（TSF の IME がキーを消費した場合、release だけが届く）の
+どちらかで、egui へ press として渡ったものは無かった。部分確定は `Process`（physical=ArrowDown）で、
+`Commit` の直後に `Enabled`・`Preedit` が続き composition が続く。確定直後の通常 Enter は通常キーで届き改行になった。
+MS-IME は候補一覧での Enter を候補の選択に使い、もう一度 Enter で確定する（どちらも Process）。
 
 このブランチ（musicvideo）で直すのは利用者の指示（2026-10-14）。本体側の修正も含むため、master への統合は
 音楽ビデオ機能とは別に先行させるかを、段 2a の確認後に利用者と決める。
