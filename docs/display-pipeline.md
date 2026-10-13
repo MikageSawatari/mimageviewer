@@ -458,6 +458,18 @@ RotationDb read-only open / SELECT 回数が増えないこと、未確定セル
 Selectの受理時だけ `land_still_page_navigation_target` の `LatestSeek` へ合流し、
 通常／連動のGrid追従、独立窓のmain非干渉を通常ページ移動と同じ時点・規則で扱う。
 
+一覧を描くCentralPanelのearly returnより前に、既存共通入力・案内へ到達する経路を持つ。
+`ui_fullscreen/viewer_chrome.rs`は通常viewerとactive一覧が共用するprimary suppression終端、
+右ドラッグ／gesture認識、中ボタン短押し、F11 borderless step、overlay／dialogの境界である。
+通常callerのguard・タイミング・描画順を維持し、一覧は保存済み割当を一覧設計書§4.1の実行可能集合へ配送する。
+mouse ring／gesture／X長押しring、feedback、既存job進捗・picker／modalは既存guardで描く。
+passive guideは描画元のimmutable `overview.executable_actions`を使い、activeな別窓の集合を流用しない。
+F11のPrimeBlackFrame→ApplyWindowMode→Settleも同じconsumerを使い、prime black frame中は
+一覧body／guideを描かない。通常の画像ページ送り、wheel pan／zoom、中ドラッグzoom、
+短右click／long-press画像menu、編集canvas／navigator／stripは一覧へ開放しない。
+接続漏れの根因・限定レビュー・実renderer検証は
+[一覧設計書§23](detached-book-page-overview-plan.md#23-一覧で省略された共通入力案内の接続tile112026-10-13)を参照する。
+
 画像は既存 `ThumbnailState::Loaded` と在メモリの `thumb_adjust_tex` を投影する。
 調整drag中は元のLoaded texture、それ以外は評価済みtextureを優先し、保存回転の確定値から
 寸法とUVを解く。描画でDB読取、補正texture生成、GPU upload、元画像decodeを始めない。

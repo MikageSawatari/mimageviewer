@@ -1455,6 +1455,29 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-13 §1.340 TILE11: 共通入力・案内のrenderer接続復元
+
+`13f70e9aa`の独立全体レビューはREVISE（P2 2件）。一覧のCentralPanel early returnが
+右ドラッグ／gestureの認識とgamepad X ring guideの描画を省略し、許可／禁止の実行gateと
+labelがあっても実rendererから到達しなかった。R5双方合意済みの共通入力／presentation契約を
+維持する構造修正として、[一覧設計書§23](detached-book-page-overview-plan.md#23-一覧で省略された共通入力案内の接続tile112026-10-13)の限定独立レビューはACCEPT。
+
+`src/ui_fullscreen/viewer_chrome.rs`へ既存primary suppression終端／右ドラッグ取消、
+右ドラッグrecognizer、中ボタン短押し、F11 borderless transition step、共通overlay／dialogを
+抽出し、通常callerのguard・タイミング・描画順を保持してactive一覧も同helperを使う。
+passive guide labelはそのimmutable `overview.executable_actions`から解き、現在の別ownerの
+modeを流用しない。通常ページ送り・pan／zoom・画像menuとstill-only描画を一覧へ開放せず、
+prime black frameではbody／guideを描かない。新owner／scope／state field、HWND捕捉・placement、
+native入力policy、追加の時間窓は導入しない。操作ごとの症状guardを追加する修正ではない。
+
+独立Sol/xhigh完了レビューと追補はACCEPT（P1／P2／P3なし）。right／middle配送後は同じ
+stamp／owner／viewport／pageとpresentationの境界を通し、surface切替後に旧phaseの局所
+navigation結果・同frameの別入力を再利用しない。OS closeを保持し、F11中の一覧を黒で塗る。
+新規10実renderer回帰、passive A／B対称回帰1、pure案内snapshot2を含むoverview 101件が成功。
+通常／portable check・fmt・監査・build-devと最終test-full 1回が成功。全体gateは13,593 passed、
+0 failed、64 ignored。最終gateの実数は[設計書§23](detached-book-page-overview-plan.md#23-一覧で省略された共通入力案内の接続tile112026-10-13)へ記録する。
+ラベルpure test／overview単体snapshotの成功を入力→paint→releaseの到達証明には使わない。
+
 ### 2026-10-13 §1.340: 一覧中の回転完了consumer接続漏れ
 
 `503e33d7b`の利用者／ClaudeCode実機報告を、型付き需要計装と修正前headless rendererで調査。

@@ -68,6 +68,15 @@ fixtureはApp・実ファイル・workerを使わず、全ページ生成や製�
 取消／選択／wheel消費と小面の戻る到達性はheadless handlerテストで別に検査する。
 PNG生成・目視確認・実行結果の記録は検証ownerが担当し、定義追加だけを実行済みと扱わない。
 
+TILE11の右ドラッグ／gesture認識とX長押しguideの接続漏れは、一覧rendererのearly returnが
+共通入力・overlayを飛ばしたため、labelのpure testや`draw_page_overview`単体snapshotでは
+検出できなかった。これらの検証とは別に、通常fullscreen／メイン内閲覧／active detachedの
+実rendererへ入力を注入し、認識→paintされたguide→許可／禁止slotのreleaseまで検査する。
+中ボタン短押し、primary取消／suppression終端、F11 stepとprime black frameの描画抑止も
+共有境界の回帰に含める。passive Aとactive Bでmode／集合が異なる場合は、Aのimmutable
+実行可能集合に基づくlabelを確認する。製品起動を伴わないheadless renderer回帰で補い、
+App全体のsnapshotへ置き換えない。実数・結果は[一覧設計書§23](detached-book-page-overview-plan.md#23-一覧で省略された共通入力案内の接続tile112026-10-13)に記録する。
+
 ## ディレクトリ構成
 
 ```

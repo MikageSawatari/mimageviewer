@@ -16,6 +16,15 @@
 `FsClose`／`FsBackToList`、背面の画像操作／評価／slideshow へ fallthrough しない。
 一覧を取消した後は通常の割当へ戻る。
 
+一覧のactive rendererも通常viewerと共通のpointer recognition／guide描画を通る。
+右ドラッグring／gestureと中ボタン短押しは既存の認識・取消・primary suppressionを使い、
+保存済み割当を上の有限集合へdispatchする。X長押しringは一覧中も案内を描き、
+許可slot／「無効」slotのlabelとrelease時の実行gateを一致させる。
+activeのlabelは現在ownerの集合、passiveのlabelはそのimmutable `overview.executable_actions`を使う。
+集合・scope・新規Actionは増やさず、短右click／画像long-press menu、中ドラッグzoom、
+通常ページ送り・wheel pan／zoomを一覧へ流さない。
+TILE11の接続修正・検証記録は[一覧設計書§23](detached-book-page-overview-plan.md#23-一覧で省略された共通入力案内の接続tile112026-10-13)を参照する。
+
 修飾なし矢印は一覧 cursor の固定ナビ、Esc は一覧取消の固定操作で keymap 対象外。
 どちらも通常 viewer と共通の固定入力／IME-safe 契約を保ち、TextInput／IME／modal を優先する。
 背景クリックでは取消しない。OS／タイトルバーの窓 close は従来の terminal close。

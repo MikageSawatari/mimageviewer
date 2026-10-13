@@ -60871,8 +60871,17 @@ impl App {
         apply_initial_placement: bool,
     ) -> DeferredDetachedImageWindowView {
         let owner = crate::ring_shortcut::RightDragOwner::DetachedWindow(window.id);
-        let right_drag_guide = self
-            .right_drag_guide_for_owner(owner, self.right_drag_context_for_window_id(window.id));
+        let overview_actions = match &window.display {
+            DetachedImageWindowDisplay::PageOverview(overview) => {
+                Some(overview.executable_actions.as_slice())
+            }
+            DetachedImageWindowDisplay::Still(_) => None,
+        };
+        let right_drag_guide = self.right_drag_guide_for_owner_with_actions(
+            owner,
+            self.right_drag_context_for_window_id(window.id),
+            overview_actions,
+        );
         let mut view = DeferredDetachedImageWindowView::from_snapshot(
             window,
             placement,

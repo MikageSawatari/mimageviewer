@@ -1207,3 +1207,153 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe -ArgumentList
 13〜40ページの画像が表示されることと、scroll先がplaceholderのまま残らないことを確認する。
 先読みLoadedは`LoadedAwaitingRotation`から`LoadedReady`へ、新規Pending／Evictedは
 `Enqueued`／`AlreadyRequested`からLoadedへ進む。loggerのidxは0基点（12が13ページ目）。
+
+## 23. 一覧で省略された共通入力・案内の接続（TILE11、2026-10-13）
+
+`13f70e9aa`の全体独立レビューはREVISE（P2 2件）。overviewを描画するCentralPanelの
+early returnが、右ドラッグ／gestureの認識とgamepad X ringの案内描画を飛ばしていた。
+禁止slotの実行gate／「無効」label自体はあるため、label単体・pure overview snapshotでは
+この到達性欠陥を検出できない。§4.1の集合・保存割当は変更せず、実rendererのframe経路を修正する。
+
+### 23.1 共通境界へ戻す範囲
+
+通常pointer handler全体を一覧へ流す案は採らない。通常のwheel pan／zoom・ページ送り・
+画像menu／編集canvasまで復活するためである。既存の処理を共有helperへ抽出し、通常の
+callerのタイミング・guardを維持したまま、active overview rendererも同じhelperを使う。
+early-return箇所へ操作ごとの新しい分岐や状態fieldを追加しない。
+
+- 共通pointer frameは既存primary suppressionの終端／右ドラッグ取消を処理する。
+  右ドラッグ開始・更新・release／短押し分類は既存recognizer／所有を使用し、
+  ring／gesture／中ボタン短押しの保存済み割当は既存§4.1の実行gateへ配送する。
+  一覧での短右click／画像long-press menuはpassiveと同じ非実行を維持する。
+  一覧のヘッダ・close等のchromeは一覧geometryから入力の除外領域を得る。
+- 既存detached borderless transitionのstepを共通presentation境界へ抽出する。
+  通常canvasと一覧が同じstepを呼び、F11のPrimeBlackFrame→ApplyWindowMode→Settleを進める。
+  primeによるblack frameではbody／guideを描かない。HWND／placement／transition ownerを変更しない。
+- 共通overlay helperはmouse ring／gesture／gamepad ring、既存picker、Viewer feedback、
+  既存job進捗・modal dialogを各既存guardで描く。通常のtouch初回guideと画像設定保存は
+  still-only側へ残し、通常callerのoverlay順を維持する。
+- guide labelは描画元surfaceの実行可能集合を使用する。activeは現在ownerの集合、
+  passiveは既存immutable `overview.executable_actions`から解く。新しいowner／scopeは作らず、
+  同じ集合で許可／禁止のlabelとdispatchを揃える。画像用short-click hintを一覧へ出さない。
+
+### 23.2 同じreturnで省略されていた処理の棚卸し
+
+| 分類 | 処理／一覧の扱い |
+| --- | --- |
+| 共通入力 | 右ドラッグ／gesture lifecycle、primaryによる取消とsuppression終端、中ボタン短押しの保存割当を接続。中ドラッグzoomは抑止 |
+| 共通表示 | mouse／gesture／X ring guide、Viewer feedback、既存job進捗・modal／picker／保存・export dialogを既存guardで接続 |
+| presentation | F11 borderless stepの唯一のconsumerが省略されていたため共通境界へ接続 |
+| 計測／test-script | 通常canvas用input／tail細分計測はstill-only側へ残し、一覧処理全体は既存central計測へ計上。action-pass終端をclosure後の共通境界へ戻す |
+| still-only入力 | 通常ページ送り、背景click終了、wheel pan／zoom、navigator、touch page-side／pinch、画像の短右click／long-press menuを抑止したまま維持 |
+| still-only描画・保存 | full image／spread／比較／panorama、編集canvas、loupe、navigator／strip、分析・補正・metadata panel、AI画像ステータス、通常hover bar／overflow、touch初回guide、回転choice適用・spread表示設定の保存は一覧へ開放しない |
+| return後も動く外側処理 | CentralPanel closure後のvisibility解放・window-command観測、cursor制御、VST管理、ヘルプ／Remote／変換／sidecar／external toolのmodalと起動ACKは元から到達しており変更しない |
+
+新たな独立owner・複数窓state・再構築・input lockは不要。R5の既存共通入力／presentation契約への
+接続復元として独立限定レビューを受けてから実装する。実renderer回帰で通常fullscreen／
+メイン内閲覧／active detachedの右ドラッグ・gesture・中ボタン、X保持案内と許可／禁止releaseを
+検査し、passive A／active Bのmodeが違う場合のlabelも確認する。test-fullは最後に1回、
+通常／portable check・fmt・監査・build-devを実施し、製品起動／git add／commitは行わない。
+
+### 23.3 同frameのsurface切替境界
+
+限定設計レビューはACCEPT。実装の独立レビューで、共通入力の到達を戻すだけでは、
+一覧toggle／migration後に同frameの別ボタンが通常画像の許可集合で配送されること、
+通常pointerから一覧を開く逆方向でも旧wheel／key navigationが残ることを確認した。
+
+physical middle edgeは右actionの前に認識・終端を消費し、その実行前には元overviewの
+stamp／context／viewport／pageを再照合する。切替があれば別入力を新surfaceへ再配送しない。
+F11のprimeが始まるpassも後続pointer配送を抑止する。正常な次frameの入力は通常どおり受け取る。
+通常pointerが一覧を開いたpassは、旧phaseの局所navigation結果を破棄し、
+`OverviewPointerPhase::Consumed`として新一覧を描画する。Appへpending／抑止fieldは追加しない。
+既に一覧が開いていた入口、キーで開いた入口、pointerで開いた入口のいずれも、
+描画後に既存`FsKeyPageTransition`へ着地を再照合し、Closed／Rebasedを後続consumerへ伝える。
+
+right／middleの各配送後は同じ`continue_page_overview_pointer_phase`境界で所有とpresentationを
+照合する。最初の評価で遷移がなければmiddleを配送し、その操作が新設したPrimeも同frameで
+消費する。blocked時は一度stepしてreturnするため同遷移を二度進めない。
+interludeの全面fillは通常callerでは従来のcanvas色、一覧ではBLACK固定とし、白い画像余白の
+設定でも一覧のPrime／Apply／Settleが白くならない。OSのclose要求はCentralPanel前の局所値を
+保持し、旧normal inputのnavigation／click close結果だけをsurface切替時に破棄する。
+
+### 23.4 完了レビューと回帰の証拠
+
+独立Sol/xhighの限定設計・完了追補レビューはいずれもACCEPT（P1／P2／P3なし）。
+追加のowner／HWND設計は不要で、R5の既存境界へ接続を戻す構造修正であることに合意。
+normal→overviewの旧navigation結果、OS close保持、中ボタンF11の同framePrime採用、
+白い画像余白での黒canvasも追補で確認した。
+
+新規10実renderer回帰は通常fullscreen／メイン内閲覧／active detachedの38入力sequenceを
+検査する。right ring／gesture／middleの許可・禁止、X保持paintとrelease、左button取消後の
+非current tile非選択、取消後middle再配送防止、O入場時Select後の既存frame memoのidx更新、
+通常phaseのkey／wheelを一覧入場へ持ち越さないこと、F11 prime／Apply／settleと
+middle F11＋同frameSelectの抑止を含む。passive A／active BのOpen／Closedを逆にした
+ring／gestureの4組は追加mapper回帰1件で検査する。
+
+新規pure案内snapshot2件は`page_overview_gamepad_ring_dark`と
+`page_overview_gesture_guide_dark`。暗色・無効label・短押し操作なし・選択色を目視確認し、
+再生成後にUPDATEなしの比較を実施。既存snapshotは変更しない。
+
+実renderer fixtureは通常Appのbegin-pass navigator入力hookと配送済みViewer surfaceを設定し、
+ページごとのtexture identityを分ける。省略したhook／複数ページで同じtextureを共有した
+fixtureは通常閲覧の契約assertへ達するため、実装のguardを緩めずfixtureを修正した。
+製品の起動／native input injectionによる実機確認は行わず、利用者による確認へ渡す。
+
+### 23.5 変更ファイルと最終検証
+
+| 変更ファイル | 内容 |
+| --- | --- |
+| `src/ui_fullscreen/viewer_chrome.rs`（新規） | 既存physical input／overlay／dialog／presentationの共通境界。test-onlyの既存frame memo観測 |
+| `src/ui_fullscreen.rs` | 通常callerを共通helperへ接続し、全overview入口で既存着地を再照合。旧phase結果破棄とOS close保持、action-pass終端 |
+| `src/ui_fullscreen/page_overview.rs` | active overviewの共通入力・案内・presentation接続、配送後の共通continue境界とFresh／Consumedの局所phase |
+| `src/app/gamepad_input.rs` | runtime labelの集合共有、gesture hint、10実renderer＋1passive mapper回帰 |
+| `src/app.rs` | passive案内をそのwindowのimmutable実行可能集合で構築 |
+| `src/app/gamepad_input/overview_guide_snapshots.rs`（新規） | Appを構築しないpure案内snapshot2件 |
+| `docs/detached-book-page-overview-plan.md` | §23の原因・設計・棚卸し・証拠 |
+| `docs/detached-rework-plan.md` | §11の合意／構造修正記録 |
+| `docs/display-pipeline.md` | 共通入力・案内・presentationの表示境界 |
+| `docs/keymap-spec.md` | 一覧の認識経路と共通実行可能集合 |
+| `docs/ui-snapshot-policy.md` | 実renderer到達性回帰とpure snapshotの役割 |
+| `htdocs/mimageviewer/manual/fullscreen.html` | 一覧中のright ring／gesture／middle、左button取消、短右click |
+| `htdocs/mimageviewer/manual/gamepad.html` | X保持中の案内と許可slotのrelease実行 |
+| `tests/snapshots/page_overview_gamepad_ring_dark.png`（新規） | 暗色X ring guide |
+| `tests/snapshots/page_overview_gesture_guide_dark.png`（新規） | 暗色gesture guide／短押しhint |
+
+15変更ファイル（Rust6、docs5、manual2、PNG2）。既存キー／ini／既定割当とCHANGELOG／versionは
+変更しない。新規App状態field、監査の登録・例外、PDF owner API、native focus／HWND policyも追加しない。
+
+| 検証 | 実数／結果 |
+| --- | --- |
+| lib `overview`（`pack-build-tools`） | 101 passed、0 failed／ignored。追加13件を含み、UPDATEなしのsnapshot比較も成功 |
+| lib `right_drag`／`mouse_`／`gamepad`（同feature） | 26／51／91 passed、各0 failed／ignored |
+| lib `fullscreen_primary_suppression`（同feature） | 1 passed、0 failed／ignored |
+| lib `viewer_context`（同feature） | 106 passed、0 failed／ignored |
+| `viewer_context_audit` | exit 0、違反0。登録／例外変更なし |
+| `cargo fmt --check`／`git diff --check` | 成功 |
+| 通常／portable core `cargo check` | 各成功（48.11秒／42.85秒） |
+| `check_ui_glyphs.py` | 危険glyph 0 |
+| 独立限定設計／完了追補レビュー（Sol/xhigh） | 各ACCEPT、P1／P2／P3なし |
+| `build-dev.ps1 -PreserveRuntime` | 成功。通常feature／非portable。core 3分47秒、Remote 0.35秒、EPUB worker 0.28秒。runtime4／PE3の検査成功 |
+| `test-full.ps1 -SuppressCrashDialogs` | 最終1回がPASS。workspace＋vendor3本の非filter suite合計13,593 passed、0 failed、64 ignored。app libは12,311 passed／57 ignored、UI snapshot integrationは170 passed、vendor egui／egui-wgpu／eframeは25／11／18 passed |
+
+targeted filterは一部重なるため合算をunique test数としない。全体合計はfiltered outが0の
+親suiteだけを数え、内部の隔離child test（filtered out 12,367）の2件を二重計上しない。
+app libの所要時間は1,477.09秒。`fs_primary`は一致0件だったため、
+正しい`fullscreen_primary_suppression` filterで既存所有終端回帰1件を実行した。
+release入力は既に揃っており、本変更はrelease-only／launcher／asset抽出に依存しないため
+release buildの追加実行は0回。製品起動／git add／commitは行わない。
+ログは`target/tile11-*.log`、build／full gateはstdout／stderrを別ファイルへ保持する。
+
+利用者は古い確認用coreを閉じ、同じ隔離環境で次を実行する（agentは起動しない）:
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe -ArgumentList '--data-dir', 'G:\miv-iso\tile\data'
+```
+
+画像／ZIP／PDFのOで、right ring／gestureに「本のページ一覧」を割り当てて取消できること、
+画像操作を割り当てたslotの「無効」表示と非実行、X保持中の案内とreleaseの一致を確認する。
+通常fullscreen／メイン内閲覧／active detachedで確認し、right drag途中の左button取消では
+非current tileを選択しないこと、detachedのF11／中button F11でも一覧と元ページが保持され
+遷移中の背景が黒であることを確認する。native実機確認は未実施。
+`--data-dir`を省略すると通常`%APPDATA%/mimageviewer` profileを使い、実設定／dataを更新し得る。
+通常起動ではinstalled／tray常駐版を先に閉じる。

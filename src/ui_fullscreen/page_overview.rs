@@ -171,6 +171,14 @@ fn consume_page_overview_action(
     None
 }
 
+/// The normal pointer pass may open overview; its physical edges belong to that
+/// original pass and are never dispatched a second time into the new surface.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OverviewPointerPhase {
+    Fresh,
+    Consumed,
+}
+
 impl App {
     pub(super) fn fs_page_transition_after_overview_input(
         &self,
@@ -904,11 +912,124 @@ impl App {
         ui: &mut egui::Ui,
         surface: egui::Rect,
     ) -> bool {
+        self.render_page_overview_surface_with_pointer_phase(
+            ui,
+            surface,
+            OverviewPointerPhase::Fresh,
+        )
+    }
+
+    pub(super) fn render_page_overview_after_pointer_dispatch(
+        &mut self,
+        ui: &mut egui::Ui,
+        surface: egui::Rect,
+    ) -> bool {
+        self.render_page_overview_surface_with_pointer_phase(
+            ui,
+            surface,
+            OverviewPointerPhase::Consumed,
+        )
+    }
+
+    fn page_overview_pointer_phase_matches(
+        &self,
+        ctx: &egui::Context,
+        stamp: crate::page_overview::PageOverviewStamp,
+        idx: Option<usize>,
+    ) -> bool {
+        self.page_overview_view()
+            .is_some_and(|view| view.stamp == stamp)
+            && self.page_overview_active_context_serial() == Some(stamp.context_serial)
+            && ctx.viewport_id() == self.page_overview_viewer_viewport()
+            && self.fullscreen_idx == idx
+    }
+
+    /// Each saved pointer action finishes at the same owner/presentation boundary.
+    /// A blocked transition advances once then returns; a later action can start
+    /// a new transition only after the earlier boundary observed no transition.
+    fn continue_page_overview_pointer_phase(
+        &mut self,
+        ui: &mut egui::Ui,
+        surface: egui::Rect,
+        stamp: crate::page_overview::PageOverviewStamp,
+        idx: Option<usize>,
+    ) -> bool {
+        let ctx = ui.ctx().clone();
+        self.page_overview_pointer_phase_matches(&ctx, stamp, idx)
+            && !self.paint_viewer_presentation_interlude(
+                ui,
+                surface,
+                &ctx,
+                self.viewer_session_is_detached(),
+                egui::Color32::BLACK,
+            )
+    }
+
+    fn render_page_overview_surface_with_pointer_phase(
+        &mut self,
+        ui: &mut egui::Ui,
+        surface: egui::Rect,
+        pointer_phase: OverviewPointerPhase,
+    ) -> bool {
         let ctx = ui.ctx().clone();
         let Some(view) = self.page_overview_view() else {
             return false;
         };
         trace_overview_surface(&ctx, view.stamp, OverviewSurfaceTrace::ActiveDemand);
+        let owns_input_surface = pointer_phase == OverviewPointerPhase::Fresh
+            && self.page_overview_active_context_serial() == Some(view.stamp.context_serial)
+            && ctx.viewport_id() == self.page_overview_viewer_viewport();
+        let primary_suppressed = owns_input_surface
+            && self
+                .advance_viewer_primary_pointer_frame(&ctx)
+                .suppresses_current_frame();
+        let mut close_requested = false;
+        if owns_input_surface {
+            let initial_geometry = crate::ui_page_overview::page_overview_geometry(
+                surface,
+                &view,
+                self.page_overview_direction(),
+            );
+            let pointer = fullscreen_pointer_pos_or(&ctx, surface, surface.center());
+            let in_chrome = initial_geometry.header.contains(pointer);
+            // Recognize the terminal middle edge before any action changes the surface.
+            // Dispatch it only while the original overview phase still owns this pass.
+            let middle_short_click = self.update_mouse_middle_short_click(
+                &ctx,
+                !in_chrome && !self.any_dialog_open(),
+                crate::app::ActionSurface::Viewer,
+            );
+            let initial_idx = self.fullscreen_idx;
+            close_requested |= self.handle_viewer_right_drag_frame(
+                &ctx,
+                surface,
+                false,
+                in_chrome,
+                self.fs_prev_foreground_hwnd,
+            );
+            if !self.continue_page_overview_pointer_phase(ui, surface, view.stamp, initial_idx) {
+                return close_requested;
+            }
+            if middle_short_click {
+                self.dispatch_viewer_middle_short_click(&ctx);
+            }
+            if !self.continue_page_overview_pointer_phase(ui, surface, view.stamp, initial_idx) {
+                return close_requested;
+            }
+        } else if self.paint_viewer_presentation_interlude(
+            ui,
+            surface,
+            &ctx,
+            self.viewer_session_is_detached(),
+            egui::Color32::BLACK,
+        ) {
+            return close_requested;
+        }
+        let Some(view) = self.page_overview_view() else {
+            self.draw_viewer_shared_overlays(ui, surface, &ctx);
+            self.draw_viewer_shared_dialogs(&ctx);
+            return close_requested;
+        };
         let direction = self.page_overview_direction();
         let geometry = crate::ui_page_overview::page_overview_geometry(surface, &view, direction);
         self.reflow_page_overview_to_surface(&ctx, ctx.viewport_id(), surface);
@@ -937,8 +1058,10 @@ impl App {
                     .into_owned()
             })
             .unwrap_or_else(|| "ページ一覧".into());
-        let enabled = !self.any_dialog_open()
+        let enabled = pointer_phase == OverviewPointerPhase::Fresh
+            && !self.any_dialog_open()
             && !self.remote_session_blocks_local_control()
+            && !primary_suppressed
             && self.page_overview_active_context_serial().is_some()
             && ctx.viewport_id() == self.page_overview_viewer_viewport();
         let output = crate::ui_page_overview::draw_page_overview(
@@ -980,7 +1103,10 @@ impl App {
                 self.page_overview_active_context_serial(),
             );
         }
-        Self::draw_page_overview_window_close(ui, surface) && enabled
+        close_requested |= Self::draw_page_overview_window_close(ui, surface) && enabled;
+        self.draw_viewer_shared_overlays(ui, surface, &ctx);
+        self.draw_viewer_shared_dialogs(&ctx);
+        close_requested
     }
 
     pub(crate) fn page_overview_thumbnail_projection(
