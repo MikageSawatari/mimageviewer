@@ -3,6 +3,17 @@
 use eframe::egui;
 
 impl crate::app::App {
+    pub(crate) fn reset_saved_rotations(&mut self) -> bool {
+        if self.rotation_db.is_none() || !self.admit_book_append_followup_mutation() {
+            return false;
+        }
+        let deleted = self.rotation_db.as_ref().unwrap().clear_all().unwrap_or(0);
+        self.rotation_cache.clear();
+        self.reconcile_spread_landscapes_from_rotation_cache();
+        crate::logger::log(format!("[rotation] Reset: {deleted} entries cleared"));
+        true
+    }
+
     pub(crate) fn show_rotation_reset_confirm_dialog(&mut self, ctx: &egui::Context) {
         if !self.show_rotation_reset_confirm {
             return;
@@ -24,15 +35,9 @@ impl crate::app::App {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("リセット").clicked() {
-                        if let Some(ref db) = self.rotation_db {
-                            let deleted = db.clear_all().unwrap_or(0);
-                            self.rotation_cache.clear();
-                            self.reconcile_spread_landscapes_from_rotation_cache();
-                            crate::logger::log(format!(
-                                "[rotation] Reset: {deleted} entries cleared"
-                            ));
+                        if self.reset_saved_rotations() {
+                            self.show_rotation_reset_confirm = false;
                         }
-                        self.show_rotation_reset_confirm = false;
                     }
                     if ui.button("キャンセル").clicked() || escape_pressed {
                         self.show_rotation_reset_confirm = false;

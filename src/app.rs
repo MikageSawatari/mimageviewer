@@ -540,6 +540,7 @@ pub(crate) use folder_scan::OmittedFolderEntryCounts;
 mod gamepad_input;
 pub(crate) use gamepad_input::{RightDragGuide, draw_right_drag_guide};
 mod grid_paint;
+mod media_metadata_mutation;
 pub(crate) mod metadata_import_refresh;
 mod metadata_ops;
 mod pin_materialization;
@@ -596,7 +597,7 @@ pub(crate) use subfolder_expansion::{
     SUBFOLDER_EXPANSION_FILTER_KINDS, SubfolderExpansionDepthChoice, SubfolderExpansionScanFilter,
 };
 #[cfg(test)]
-mod book_append_producer_tests;
+pub(crate) mod book_append_producer_tests;
 pub(crate) mod book_append_refresh;
 mod book_append_undo;
 mod startup_list_restore;
@@ -35594,6 +35595,9 @@ impl App {
         let Some(key) = self.items.get(idx).and_then(reading_history_key_for_item) else {
             return;
         };
+        if self.reading_history_db.is_some() && !self.admit_book_append_followup_mutation() {
+            return;
+        }
         let result = match self.reading_history_db.as_ref() {
             Some(db) => db.remove_key(&key).map_err(|e| e.to_string()),
             None => Err("閲覧履歴 DB を開けません".to_string()),
@@ -42338,8 +42342,11 @@ impl App {
         container: &std::path::Path,
         source: crate::folder_thumb_pins::FolderPinSource,
     ) -> bool {
-        let Some(db) = self.folder_thumb_pin_db.as_ref() else {
+        if self.folder_thumb_pin_db.is_none() {
             crate::logger::log("folder_thumb_pin: DB not open".to_string());
+            return false;
+        }
+        let Some(db) = self.user_folder_thumb_pin_db() else {
             return false;
         };
         match db.set(container, &source) {
@@ -42371,7 +42378,7 @@ impl App {
 
     /// 指定 container の代表サムネピンを解除する (該当行が無くてもエラーにしない)。
     pub(crate) fn remove_folder_thumb_pin(&mut self, container: &std::path::Path) -> bool {
-        let Some(db) = self.folder_thumb_pin_db.as_ref() else {
+        let Some(db) = self.user_folder_thumb_pin_db() else {
             return false;
         };
         match db.remove(container) {
@@ -42593,10 +42600,14 @@ impl App {
                 return;
             };
             if self.folder_thumb_pin_for(&book_key) == Some(&source) {
-                self.remove_folder_thumb_pin(&book_key);
+                if !self.remove_folder_thumb_pin(&book_key) {
+                    return;
+                }
                 self.show_feedback_toast("この本の代表サムネを解除しました".to_string());
             } else {
-                self.set_folder_thumb_pin(&book_key, source);
+                if !self.set_folder_thumb_pin(&book_key, source) {
+                    return;
+                }
                 self.show_feedback_toast("この本の代表サムネに設定しました".to_string());
             }
             // 設定対象 (本) のセルは親階層にあり現在のビューには無いので、ここでの
@@ -42964,7 +42975,9 @@ impl App {
         let Some(container) = self.pin_container_key() else {
             return;
         };
-        self.remove_folder_thumb_pin(&container);
+        if !self.remove_folder_thumb_pin(&container) {
+            return;
+        }
         // 本の中では対象セルが親階層にあり現ビューに無いので、再 materialize (scroll
         // リセット) は不要。dirty を消して読書位置を保つ。
         if in_zip {
@@ -48863,7 +48876,10 @@ impl App {
         &mut self,
         rows: &[crate::bookmark_browser::BookmarkBrowserRow],
     ) {
-        if !rows.is_empty() && self.bookmark_delete_pending.is_none() {
+        if !rows.is_empty()
+            && self.bookmark_delete_pending.is_none()
+            && self.admit_book_append_followup_mutation()
+        {
             self.bookmark_delete_pending = Some(crate::bookmark_browser::spawn_delete(rows));
         }
     }
@@ -86360,6 +86376,9 @@ impl App {
     }
 
     pub(crate) fn remove_favorite_view_state(&mut self, favorite_id: uuid::Uuid) -> bool {
+        if !self.admit_book_append_followup_mutation() {
+            return false;
+        }
         self.favorite_view_writes.remove(favorite_id);
         let existed = self.favorite_view_states.remove(&favorite_id).is_some();
         if let Err(error) = self.submit_favorite_view_store(
@@ -86385,6 +86404,9 @@ impl App {
     }
 
     pub(crate) fn clear_all_favorite_view_states(&mut self) -> usize {
+        if !self.admit_book_append_followup_mutation() {
+            return 0;
+        }
         let count = self.favorite_view_states.len();
         self.favorite_view_writes.clear();
         self.favorite_view_states.clear();

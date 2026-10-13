@@ -3392,7 +3392,9 @@ impl App {
             .is_some_and(|state| std::mem::take(&mut state.favorite_view_state_clear_requested));
         if clear_favorite_view_states_requested {
             let deleted = self.clear_all_favorite_view_states();
-            if let Some(state) = self.pref_state.as_mut() {
+            if !self.book_append_undo_in_progress()
+                && let Some(state) = self.pref_state.as_mut()
+            {
                 state.favorite_view_state_entry_count = self.favorite_view_states.len();
                 state.favorite_view_state_clear_result =
                     Some(format!("保存済みの表示状態を {deleted} 件クリアしました。"));
@@ -3457,7 +3459,7 @@ impl App {
                 clear_reading_history_requested = true;
             }
         }
-        if clear_reading_history_requested {
+        if clear_reading_history_requested && self.admit_book_append_followup_mutation() {
             let result = match self.reading_history_db.as_ref() {
                 Some(db) => match db.clear_all() {
                     Ok(deleted) => {

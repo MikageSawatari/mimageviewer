@@ -488,6 +488,9 @@ impl App {
     }
 
     fn execute_pending_settings_restore(&mut self, pending: PendingAction, ctx: &egui::Context) {
+        if !self.admit_book_append_followup_mutation() {
+            return;
+        }
         let dir = crate::data_dir::get();
         let action = match &pending {
             PendingAction::Restore(source) => {

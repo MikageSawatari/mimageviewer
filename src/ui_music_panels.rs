@@ -877,11 +877,10 @@ impl App {
             return;
         };
         let pos = secs.max(0.0);
-        let added = self
-            .video_bookmark_db
-            .as_ref()
-            .and_then(|db| db.add_if_no_duplicate(&path, pos, None, 1.0).ok())
-            .flatten();
+        let Some(db) = self.user_video_bookmark_db() else {
+            return;
+        };
+        let added = db.add_if_no_duplicate(&path, pos, None, 1.0).ok().flatten();
         self.reload_music_bookmarks(&path);
         // 境界集合が変わったのでブックマーク区間ループの target / baseline を再計算する
         // (でないと初回ブックマーク追加時に stale baseline で誤ループする、Codex P2)。
@@ -899,9 +898,10 @@ impl App {
         let Some(path) = self.fs_music_source_for_idx(fs_idx) else {
             return;
         };
-        if let Some(db) = self.video_bookmark_db.as_ref() {
-            let _ = db.remove(id);
-        }
+        let Some(db) = self.user_video_bookmark_db() else {
+            return;
+        };
+        let _ = db.remove(id);
         #[cfg(windows)]
         if self.music_bookmark_title_edit.as_ref().map(|e| e.id) == Some(id) {
             self.music_bookmark_title_edit = None;
@@ -921,9 +921,10 @@ impl App {
         } else {
             Some(trimmed)
         };
-        if let Some(db) = self.video_bookmark_db.as_ref() {
-            let _ = db.update_title(id, new_title);
-        }
+        let Some(db) = self.user_video_bookmark_db() else {
+            return;
+        };
+        let _ = db.update_title(id, new_title);
         self.reload_music_bookmarks(&path);
     }
 
@@ -942,12 +943,16 @@ impl App {
             .map(|(secs, title)| (*secs, Some(title.as_str())))
             .collect();
         // DB エラー / DB 未オープンは黙って捨てずに通知する (Codex P3、動画と同流儀)。
-        let result = self
-            .video_bookmark_db
-            .as_mut()
-            .map(|db| db.bulk_add_if_no_duplicate(&path, &refs, 1.0));
+        if self.video_bookmark_db.is_none() {
+            self.show_feedback_toast("ブックマーク DB を開けませんでした".to_string());
+            return;
+        }
+        let Some(db) = self.user_video_bookmark_db() else {
+            return;
+        };
+        let result = db.bulk_add_if_no_duplicate(&path, &refs, 1.0);
         match result {
-            Some(Ok(s)) => {
+            Ok(s) => {
                 self.reload_music_bookmarks(&path);
                 self.apply_music_loop_mode(fs_idx);
                 if s.added > 0 {
@@ -958,11 +963,8 @@ impl App {
                     s.added, s.skipped_duplicates, s.errors
                 ));
             }
-            Some(Err(e)) => {
+            Err(e) => {
                 self.show_feedback_toast(format!("ブックマークの保存に失敗しました: {e}"));
-            }
-            None => {
-                self.show_feedback_toast("ブックマーク DB を開けませんでした".to_string());
             }
         }
     }
@@ -995,10 +997,14 @@ impl App {
         let Some(path) = self.fs_music_source_for_idx(fs_idx) else {
             return;
         };
-        let result = self
-            .video_bookmark_db
-            .as_ref()
-            .map(|db| db.clear_for(&path));
+        if self.video_bookmark_db.is_none() {
+            self.show_feedback_toast("ブックマーク DB を開けませんでした".to_string());
+            return;
+        }
+        let Some(db) = self.user_video_bookmark_db() else {
+            return;
+        };
+        let result = db.clear_for(&path);
         #[cfg(windows)]
         {
             self.music_bookmark_title_edit = None;
@@ -1006,12 +1012,11 @@ impl App {
         self.reload_music_bookmarks(&path);
         self.apply_music_loop_mode(fs_idx);
         match result {
-            Some(Ok(())) => {
+            Ok(()) => {
                 self.notify_bookmarks_changed();
                 self.show_feedback_toast("ブックマークをすべて削除しました".to_string())
             }
-            Some(Err(e)) => self.show_feedback_toast(format!("削除に失敗しました: {e}")),
-            None => self.show_feedback_toast("ブックマーク DB を開けませんでした".to_string()),
+            Err(e) => self.show_feedback_toast(format!("削除に失敗しました: {e}")),
         }
     }
 
@@ -2664,6 +2669,77 @@ pub fn draw_music_normalize_snapshot_fixture(ui: &mut egui::Ui) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn section1373_music_bookmark_handlers_share_video_write_admission() {
+        use crate::app::book_append_producer_tests::{
+            FOLLOWUP_PHASES, assert_followup_terminal, followup_fixture,
+        };
+        for video_audio in [false, true] {
+            for action in ["add", "delete", "title", "bulk", "clear"] {
+                for phase in FOLLOWUP_PHASES {
+                    let (mut app, append, worker) = followup_fixture(phase);
+                    let path = app.tmp.path().join(if video_audio {
+                        "video.mp4"
+                    } else {
+                        "audio.wav"
+                    });
+                    let id = app
+                        .video_bookmark_db
+                        .as_ref()
+                        .unwrap()
+                        .add(&path, 1.0, Some("before"), &[])
+                        .unwrap();
+                    app.items = vec![if video_audio {
+                        crate::grid_item::GridItem::Video(path.clone())
+                    } else {
+                        crate::grid_item::GridItem::Audio(path.clone())
+                    }];
+                    app.fullscreen_idx = Some(0);
+                    if video_audio {
+                        app.video_audio_mode = Some(0);
+                    }
+                    match action {
+                        "add" => app.add_music_bookmark_at(0, 8.0),
+                        "delete" => app.delete_music_bookmark(0, id),
+                        "title" => app.rename_music_bookmark(0, id, "after"),
+                        "bulk" => app.bulk_add_music_bookmarks(0, vec![(8.0, "after".into())]),
+                        "clear" => app.clear_all_music_bookmarks(0),
+                        _ => unreachable!(),
+                    }
+                    let bookmarks = app.video_bookmark_db.as_ref().unwrap().list(&path);
+                    if phase == "undo" {
+                        assert_eq!(bookmarks.len(), 1);
+                        assert_eq!(bookmarks[0].title.as_deref(), Some("before"));
+                        assert!(app.music_bookmarks_loaded_for.is_none());
+                    } else {
+                        match action {
+                            "add" | "bulk" => assert_eq!(bookmarks.len(), 2),
+                            "delete" | "clear" => assert!(bookmarks.is_empty()),
+                            "title" => assert_eq!(bookmarks[0].title.as_deref(), Some("after")),
+                            _ => unreachable!(),
+                        }
+                    }
+                    assert_followup_terminal(&mut app, &append, worker, phase);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn section1373_music_empty_bulk_and_stale_target_preserve_append_receipt() {
+        use crate::app::book_append_producer_tests::followup_fixture;
+        let (mut app, append, _worker) = followup_fixture("ready");
+        let path = app.tmp.path().join("audio.wav");
+        app.items = vec![crate::grid_item::GridItem::Audio(path)];
+        app.bulk_add_music_bookmarks(0, vec![]);
+        app.add_music_bookmark_at(99, 8.0);
+        app.delete_music_bookmark(99, 1);
+        app.rename_music_bookmark(99, 1, "after");
+        app.clear_all_music_bookmarks(99);
+        assert_eq!(app.book_append_undo_revision, append.accepted_revision);
+        assert!(app.book_append_operation_matches_receipt(append.operation()));
+    }
+
     use super::*;
 
     #[test]

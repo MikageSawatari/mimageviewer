@@ -49485,7 +49485,10 @@ impl App {
                 }
                 _ => None,
             };
-            if let (Some((path, pts)), Some(db)) = (snapshot, self.video_bookmark_db.as_ref()) {
+            if let Some((path, pts)) = snapshot {
+                let Some(db) = self.user_video_bookmark_db() else {
+                    return;
+                };
                 if let Err(e) = db.add(&path, pts, None, &[]) {
                     crate::logger::log(format!("video bookmark add failed: {e}"));
                 } else {

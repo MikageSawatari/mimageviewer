@@ -419,6 +419,12 @@ impl App {
     /// 現在のマスク (ビットマップ + Shape) をスロットに保存する。
     /// スロット番号は 1 か 2 (`conceal_db::slot_key` 経由で `__slot_N` キーへ)。
     pub(crate) fn save_conceal_mask_to_slot(&mut self, slot: usize) {
+        if self.conceal_mask.is_some()
+            && self.conceal_db.is_some()
+            && !self.admit_book_append_followup_mutation()
+        {
+            return;
+        }
         let [w, h] = self.conceal_mask_size;
         let saved = if let (Some(mask), Some(db)) = (&self.conceal_mask, &self.conceal_db) {
             db.set_slot(slot, mask, &self.conceal_shapes, w, h).is_ok()

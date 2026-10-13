@@ -555,6 +555,12 @@ impl App {
 
     /// 現在のマスク (ビットマップ + ベクタ) をスロットに保存する。
     pub(crate) fn save_mask_to_slot(&mut self, slot: usize) {
+        if self.erase_mask.is_some()
+            && self.mask_db.is_some()
+            && !self.admit_book_append_followup_mutation()
+        {
+            return;
+        }
         let [w, h] = self.erase_mask_size;
         let saved = if let (Some(mask), Some(db)) = (&self.erase_mask, &self.mask_db) {
             db.set_slot(slot, mask, &self.erase_shapes, w, h).is_ok()

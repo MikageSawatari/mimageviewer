@@ -1,12 +1,13 @@
 ﻿# §1.373 本棚への追加直後の一回取り消し
 
 2026-10-13改訂、`next-list` / `ea060b66e` 設計基点、確認基点 `df20dba7b`。
-**R7（2026-10-13設計担当決定）: 八store初期化を各画像の作成前へ移す。同じAppend workerの順序で公開境界を作り、stagingは追加しない。実装・対象検証済み、独立実装レビューACCEPT。full gateは未成功（§7.9の前提矛盾）**。
+**R7（2026-10-13設計担当決定）: 八store初期化を各画像の作成前へ移す。同じAppend workerの順序で公開境界を作り、stagingは追加しない。§7.10のfullは13,493成功でPASS。全実装のLISTrev8はREVISE（P2受付漏れ一件／P3冒頭の状態記載一件）。§7.11で対応実装・検証を完了し、今回のfullは一回完走、13,503成功／0失敗／63 ignoredでPASS。差分の独立再レビューは未完了**。
 正本項目: [next-release-backlog.md §1.373](next-release-backlog.md#1373-本棚ツールバーの右クリックで本棚へ追加した操作を-ctrlz-で取り消す--利用者の要望-2026-10-11)。
 アプリは起動していない。R4判断前の未検証試作は製品への接続を撤回し、`target`へ退役した。
 R4の自動観測配送・ごみ箱Undo・UndoAppend限定排他は維持する。WIP `3e8178b31` の
 通常の後続編集上書きは§7.7のR7で修正し、独立構造レビューの合意を得て実装を再開した。
-最終検証・実装レビューと実機確認は未完了。下記の試作退役・停止checkpointは当時の履歴である。
+§7.10までと、LISTrev8追加修正の§7.11の自動検証は完了。差分の独立再レビューと実機確認は未完了。
+下記の試作退役・停止checkpointと中断記録は当時の履歴であり、現在のfull未成功を意味しない。
 
 `001a0dabf` の独立設計レビューは **REVISE**。本改訂は coordinator 判断を優先して
 P1-1 の過剰な同定を撤去し、P1-2 の既存 book operation owner への統合、P2 の失効入口を
@@ -172,12 +173,14 @@ maintenance lease は **既存受付済みmetadata workerの完了確認の代�
 leaseだけ取って後から旧queued書込みが削除pathへ着地する形は不可。
 一方、busyなwriterをUIで同期wait／sleepする形も不可。今回の短いUndo操作だけを既存境界で排他にする。
 
-### 3.2 失効 producer inventory (P2、実装前の確定範囲)
+### 3.2 失効 producer inventory (LISTrev8の受付監査を反映)
 
 失効は操作の**受付成功から最初のdraft変更／job投入までの間**に行う。
 `push_*_undo_entry` や非同期 completion だけでは遅い。受付共通 helper は
 「UndoAppendならBusy、それ以外の後続操作ならreceipt失効／受付revision更新」を
-行う。空target／入力拒否等の非操作はrevisionを進めない。以下を実装・回帰の対象とする。
+行う。空target／stale index／DB不存在等、受付前の入力拒否はrevisionを進めない。
+有効targetをDB操作へ受け付けた後の重複skip・書込み失敗は操作の結果であり、receiptを復活させない。
+重複判定のためにUIの追加SELECTを行わず、既存のDB内判定を維持する。以下を実装・回帰の対象とする。
 
 | producer群 | コード上の入口／捕捉位置 |
 | --- | --- |
@@ -186,17 +189,35 @@ leaseだけ取って後から旧queued書込みが削除pathへ着地する形�
 | 色補正／標準／ローカル調整 | `set_page_params_for_target`／`set_page_params`、`set_local_adjust_layers_for_idx`、`ui_adjustment_panel.rs` の標準値変更、shape key／drag／brushの最初のdraft mutation。prepare-only hydrationと実editを区別 |
 | 消しゴム／隠蔽／注釈／crop／rotation | mask／conceal／comic／crop等の最初のbrush・shape・text draft変更と、draftを経由しない確定入口 (`save_mask_with_sidecar`、`save_conceal_with_sidecar`、`save_comic_objects` 等)。保存helperだけに寄せない。readonly描画／decodeは除外 |
 | 本しおり／タイトル | `add_current_book_bookmark` (:47419)、remove／set_title、browser削除、Remoteのbookmark branch。service投入前。`clear_book_bookmark_title_edit` はhydration／破棄だけなら非mutation |
+| 代表ピン設定／解除 | 共通 `set_folder_thumb_pin`／`remove_folder_thumb_pin` → `media_metadata_mutation::user_folder_thumb_pin_db` → 既存受付helper。通常Folder／ZIP・nested ZIP・PDF／変換書庫、P／📌／context menu／ringはこの書込み境界に合流。ZIPのdirty消費や後続reloadに失効を依存しない |
+| 動画／音声しおり | 共通 `user_video_bookmark_db` → 既存受付helper。nativeの `add_native_video_bookmark`、`handle_native_video_{delete_bookmark,set_bookmark_title,bulk_add_bookmarks,clear_all_bookmarks}_command`、eguiの `handle_video_input`、musicの `add_music_bookmark_at`／delete／rename／bulk_add／clear_allを接続。musicには動画音声モードも含む |
+| 動画ピン設定／解除 | 共通 `user_video_pin_db` → 既存受付helper。`set_native_video_pin_with_webp` に通常HUD／選択tile／P／ring／menuが合流、解除は `handle_native_video_delete_pin_command`。target／DB確認後、書込み・dirty／pending更新前に受付 |
+| 横断しおり一覧削除 | `delete_bookmark_browser_rows` でnonempty／既存pending検査後、共通受付→`bookmark_browser::spawn_delete`。選択／check／context menuのBook・Video・Audioを同じworker入口で覆う |
 | 見開き／トリム／読書設定 | `app/spread_shift_owner.rs::set_live_spread_shift`／reset、fullscreenのspread／page-alone／final-cover設定、view trim永続化。setter／service投入前。通常read-only読書位置記録は後続ユーザー編集として失効させないが、未完了書込みは§3.1のbusyに含める |
 | 本の操作 | `start_book_append_to_named`／create／rename／delete／transfer、`ui_main.rs::move_selected_book_reorder_group` 等の最初のreorder draft変更。flush受付より前。管理一覧のreadonly refreshは一般除外せず、source一覧を置換するものは下記境界へ |
 | 実ファイル操作 | `start_delete_files`、rename dialog submit、file_organize submit、Shell paste・D&D copy の受付、native Shell操作へ制御を渡す時点。結果pollより前。ZIP/PDF内の拒否入力は操作でない |
+| マスクのスロット保存 | `save_mask_to_slot`／`save_conceal_mask_to_slot` のmask／DB確認後、既存受付→`set_slot`。既存のslot読込・適用の受付も維持 |
 | メタ Undo／Redo・編集専用 Undo | 通常のUndo/Redoが受理された時点。book receiptを消費するこの一回のUndoは別のmeta entryをpopしない |
 | 一覧／context 終了 | `clear_meta_undo`／そのrating move版、主一覧採用／検索置換、quick-folder切替、viewer真のclose、A/B交換／context破棄の共通受付。後から古いappend完了が届いてもrevision/context不一致でreceiptを公開しない |
 | Remote | acquire受付でsource contextのtoken失効、上記Remote write共通入口で受付revision更新。bookmark early branch、spread／rating／tag、Remote切断・context退役も含む。既存session ownershipを維持 |
-| metadata import／復元・設定 | metadata transferのwrite受付、content-identity復元の採用、本root変更／対象書込みに影響する設定変更。表示を読むだけのworkerは失効しない |
+| metadata import／復元・設定 | metadata transferのwrite受付、`start_content_identity_restore` のnonempty／pending検査後のworker投入前、本root変更／対象書込みに影響する設定変更。復元promptのUndo中の拒否はtake／設定保存前、dont-ask設定変更も既存受付へ。明示settings Restore／FullResetは `execute_pending_settings_restore` のpending破棄／worker投入前。表示を読むだけのworkerは失効しない |
+| 明示リセット／履歴削除 | `reset_saved_rotations`、`remove_reading_history_entry_for_idx`／preferencesの全履歴削除、`clear_book_resume_async`。通常の位置recordは除外したまま、利用者の明示clearだけを受付へ。favorite view stateのremove／reset／clearも最初のmap・queue変更前。favorite削除は後段のdefault清掃に頼らずsettingsからの除去前に受付 |
 | 自分のcopy／refresh | `Append` intentに捕捉した同一operation IDから配送されたedit/semantic copyと一覧refreshだけを除外。source path一致／時間窓／「本処理中」だけでは除外しない。異なるaccepted mutationは必ず失効 |
 
 同じreceiptに対する失効は冪等。producerごとに別pending／復活用snapshotを置かない。
 自分の刷新で一覧世代が変わっても同一operationの採用として扱い、後続の別更新は失効させる。
+
+3 storeの共通入口は既存App-owned DBを借用して返すだけで、別の受付state／queue／ownerは持たない。
+`admit_book_append_followup_mutation` がrevisionとUndoAppend限定Busyを一箇所で決める。
+キー／HUD／menuごとの独立した失効印や、完了時の二重失効による症状修正は採らない。
+
+機械的監査: `python scripts/check-book-append-mutation-admission.py`。
+producer関数と最初の書込み／投入位置を列挙し、受付が先にあることと、3 storeの新しい直接書込みを検出する。
+自動補完の `persist_native_video_marker_thumbnail`／`tick_pending_pin_thumb_refresh` は
+既に受理済みmarkerの再生成として明示除外する。readonly lookup／export／hydration、通常の読書位置record、
+favorite view stateのautomatic capture／flush、migration／purge、テストfixture／seedも後続ユーザーmutationではない。
+index・音量測定cacheの再生成／清掃や、対象metadataを変更しないお気に入り登録等の設定はこのinventoryの対象外。
+Append自身のcopy／refreshの除外は同一operation IDのまま。監査の除外を自己操作の新しい照合へ広げない。
 
 ## 4. 並べ替え・membership・実装範囲
 
@@ -716,6 +737,90 @@ workspace 13,439件、vendor egui 25件／egui-wgpu 11件／eframe 18件、
 [中断full（成功証拠ではない）](../target/section1373-rescan-fix/test-full-interrupted.log)、
 [最終full完走](../target/section1373-rescan-fix/test-full-final.log)、
 [full件数集計](../target/section1373-rescan-fix/full-summary.json)。
+
+### 7.11 LISTrev8追補: 後続mutationの共通受付漏れ（2026-10-13）
+
+基点は`13f2fc3e9`（§1.373のコードはレビュー基点`c903a369b`と同一）。
+全実装の独立レビューはREVISE、P1なし／P2一件／P3一件。
+P2は代表ピンと動画しおり／ピンのユーザー書込みが既存受付helperへ届かず、
+receiptが残ること。ZIPのピンはdirtyを消して帰るので後続reloadも失効を保証しない。
+守るべき不変条件は、最初のユーザー書込み・draft変更・worker投入前に同じ受付を通り、
+Append中はrevisionを進めて遅着receipt公開を拒否し、UndoAppend中だけ新規書込みを拒否すること。
+
+§3.2のproducer inventoryを実書込み入口で監査し、指定群に加えて音声／動画音声モードのしおり、
+egui動画の追加、横断しおり一覧の削除、マスクのslot保存、回転の全リセット、編集情報の復元、
+履歴と読書位置の明示削除、favorite表示状態の明示リセット／削除、favorite削除の先行settings変更、
+settings Restore／FullResetの投入に同型の漏れを確認して接続した。
+automatic cache補完・通常読書位置record・migration／purgeは元操作やreadonly lifecycleに属するため、
+これらを後続ユーザーmutationとして失効させない。対象storeを書かない設定まで排他を広げない。
+
+代表ピン／動画ピン／メディアしおりは既存App-owned storeを返す借用入口で共通helperへ接続。
+同じstoreへのnative・egui・音声・キー・HUD・menuの書込みを入口ごとのreceipt印へ分けず、
+新しいpending／owner／I/Oは追加しない。その他は既存の共通mutation handlerを受付へ接続した。
+通常SourceMutation／本削除中の受付規則は維持し、UndoAppend中の拒否と対で検査する。
+P3は冒頭の状態を§7.10の完走記録とLISTrev8の現在の判定へ揃えた。過去の中断記録は維持する。
+
+検証証跡は`target/section1373-listrev8/`へ集約する。今回の修正の検証・独立再レビューは、
+§7.10の既存成功証拠と区別して報告する。アプリ起動・コミットは行わない。
+
+変更ファイル（計16、§1.375設計書／manualは変更なし）:
+
+| 範囲 | ファイル |
+| --- | --- |
+| 共通受付とhandler | `src/app.rs`、`src/app/media_metadata_mutation.rs`（新規） |
+| 動画／音声 | `src/app/native_video.rs`、`src/ui_fullscreen.rs`、`src/ui_music_panels.rs` |
+| 兄弟mutation | `src/app/book_resume_meter.rs`、`src/app/content_identity_restore.rs`、`src/ui_erase.rs`、`src/ui_conceal.rs`、`src/ui_dialogs/favorites_editor.rs`、`src/ui_dialogs/preferences.rs`、`src/ui_dialogs/rotation_reset.rs`、`src/ui_dialogs/settings_restore.rs` |
+| 回帰／機械的監査／設計 | `src/app/book_append_producer_tests.rs`、`scripts/check-book-append-mutation-admission.py`（新規）、この設計書。動画／音声・復元ファイル内にも回帰を追加 |
+
+回帰10件を追加。receipt ready／Append pending／UndoAppend pending／SourceMutation／本Deleteの
+対照で、ZIPピンの実toggle、動画しおりの実handler、共有DB入口全書込みAPI、音声・動画音声モード、
+横断削除worker投入、slot／回転／表示状態／読書位置reset、復元worker投入を検査した。
+Append中は後続mutation後に実`poll_book_op_pending`へ古い成功結果を届け、receipt復活を拒否する。
+Undo中はDB・map・pending・revision不変、未受付のempty／stale／DB不存在も対照にした。
+
+| targeted filter（`pack-build-tools`／`RUST_TEST_THREADS=2`） | 成功件数 |
+| --- | ---: |
+| section1373 | 68 |
+| folder_pin | 17 |
+| native_video_bookmark | 1 |
+| music_bookmark | 1 |
+| content_identity_restore | 10 |
+| favorite_view | 18 |
+| settings_restore | 30 |
+| folder_mtime_rescan_tests | 9 |
+
+合計154実行、重複除外152件、失敗0件。
+機械的監査は15 media writer／13兄弟入口／3共通受付／2 automatic除外、
+srcの571 Rustファイル／22,313関数を走査してPASS。これは限定lexical監査であり、
+Rustの型・全control flow・macro／関数を跨いだaliasの証明ではなく、handler回帰と併用する。
+最終fmt checkと通常／portable core checkは成功。
+
+検証開始時の二回は再利用build scriptに`G:\home\miv-bisect`が埋め込まれたため
+LibRaw入力不足でexit101、実試験0件。現worktreeの入力実在を確認し、build scriptを再生成した。
+追加回帰helperの型／メソッド名の初期compile失敗二回も実試験0件で、上の成功件数へ加算しない。
+ツール側中断で停止したbuild-devは成功証拠にせず、状態・stdout／stderrを残す
+非表示の検証jobでbuild-dev→test-fullを順次実行した。製品のpending ownerは追加しない。
+指定Sol／xhighの独立差分レビューは二回ともmodel capacityエラーで未完了。
+新たなACCEPTを主張せず、修正差分をcoordinatorの独立再レビューへ渡す。
+
+最終`build-dev.ps1 -PreserveRuntime`は通常feature setでexit 0。core／remote／EPUB workerの
+3 exeを確認し、VCRT runtime 4件／PE 3件の配置検証も成功。アプリは起動していない。
+最終`test-full.ps1 -SuppressCrashDialogs`は`RUST_TEST_THREADS=2`で**一回完走、exit 0／PASS**。
+workspace 13,449成功、vendor egui 25件／egui-wgpu 11件／eframe 18件、
+合計**13,503成功・0失敗・既存ignored 63件**（doc-test等を含む）。
+通常rescanの旧退行試験 `visibility_external_rescan_restores_semantic_cursor_after_actual_hydration` も成功。
+最終差分check・§1.375設計書／manualの未変更確認が成功。実機確認と独立再レビューは別の未完了条件。
+コミット0件。今回の成功証拠へ、初期compile失敗やツール中断の結果を加算しない。
+
+証跡: [targeted68件](../target/section1373-listrev8/section1373-final.log)、
+[機械的監査](../target/section1373-listrev8/mutation-audit.log)、
+[fmt](../target/section1373-listrev8/fmt-check.log)、
+[通常check](../target/section1373-listrev8/core-check.log)、
+[portable check](../target/section1373-listrev8/portable-check.log)、
+[build／full stdout](../target/section1373-listrev8/verification.stdout.log)、
+[build／full stderr](../target/section1373-listrev8/verification.stderr.log)、
+[終了状態](../target/section1373-listrev8/verification-state.json)、
+[件数・ソースhash集計](../target/section1373-listrev8/verification-summary.json)。
 
 ### 退役記録と再開範囲（R7以前の履歴）
 
