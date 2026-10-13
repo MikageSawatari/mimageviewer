@@ -29528,8 +29528,18 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(crate) fn effetune_toolbar_click(&mut self, pointer_click: bool) {
-        let foreground = self.effetune.click_foreground(pointer_click);
+    pub(crate) fn effetune_toolbar_active(&self) -> bool {
+        matches!(
+            self.effetune.runtime,
+            crate::effetune::EffetuneRuntime::Running { .. }
+        ) && matches!(
+            self.effetune.effective_state(),
+            Some(crate::effetune::EffectiveState::Effective)
+        )
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn effetune_toolbar_click(&mut self) {
         if !self.effetune_toolbar_available() {
             return;
         }
@@ -29550,26 +29560,10 @@ impl App {
                 let Some(bridge) = self.effetune.bridge().cloned() else {
                     return;
                 };
-                use crate::effetune::{GuiButtonAction, gui_button_action};
-                let visible = bridge.slot(0).is_some_and(|slot| slot.gui_visible);
-                let action =
-                    gui_button_action(visible, bridge.slot_gui_is_foreground(0, foreground));
-                crate::logger::log(format!(
-                    "[EffeTune GUI] button decision visible={visible} action={action:?}"
-                ));
-                match action {
-                    GuiButtonAction::Hide => {
-                        self.save_effetune_gui_rect();
-                        self.effetune.request_hide_gui();
-                    }
-                    GuiButtonAction::Activate => self.effetune.request_show_gui(),
-                    GuiButtonAction::Show => {
-                        if let Some(hwnd) = self.main_hwnd {
-                            bridge.set_main_hwnd(hwnd as u64);
-                        }
-                        self.effetune.request_show_gui();
-                    }
+                if let Some(hwnd) = self.main_hwnd {
+                    bridge.set_main_hwnd(hwnd as u64);
                 }
+                self.effetune.request_show_gui();
             }
             _ => {}
         }
@@ -29580,29 +29574,25 @@ impl App {
         if self.remote_session_blocks_local_control() {
             return "リモート接続中は音響調整の窓を表示できません。接続が終了すると、表示していた窓が戻ります".into();
         }
-        use crate::effetune::{EffectiveState, EffetuneRuntime};
+        use crate::effetune::EffetuneRuntime;
         match &self.effetune.runtime {
             EffetuneRuntime::Unavailable(reason) if reason.preparation_retryable() => {
-                format!("音響調整を利用できません: {}\nクリックして準備を再確認します", reason.user_reason())
+                format!(
+                    "音響調整を利用できません: {}\nクリックして準備を再確認します",
+                    reason.user_reason()
+                )
             }
             EffetuneRuntime::Unavailable(reason) => {
                 format!("音響調整を利用できません: {}", reason.user_reason())
             }
-            EffetuneRuntime::Idle => "音響調整を開く".into(),
+            EffetuneRuntime::Idle => "音響調整の窓を表示して前面に出します".into(),
             EffetuneRuntime::Loading { .. } => "音響調整を読み込み中…".into(),
             EffetuneRuntime::Failed(reason) => {
                 format!("音響調整は停止しました: {}", reason.user_reason())
             }
-            EffetuneRuntime::Running { .. } => match self.effetune.effective_state() {
-                Some(EffectiveState::Effective) => {
-                    "音響調整は有効です (設定の窓を閉じた時点の内容で判定しています)".into()
-                }
-                Some(EffectiveState::Inert) => {
-                    "音響調整にエフェクトが無いか、全体バイパス中です (設定の窓を閉じた時点の内容で判定しています)".into()
-                }
-                Some(EffectiveState::Unparseable(_)) => "音響調整の設定を判定できません".into(),
-                None => "音響調整の設定を確認中です".into(),
-            },
+            EffetuneRuntime::Running { .. } => {
+                crate::effetune::running_gui_tooltip(self.effetune.effective_state())
+            }
         }
     }
 

@@ -53,6 +53,9 @@ pub use ui_dialogs::preferences::draw_preferences_transfer_explanation_snapshot_
 pub use ui_dialogs::preferences::draw_preferences_transfer_settings_snapshot_fixture;
 pub use ui_dialogs::settings_restore::draw_preferences_transfer_disabled_entry_snapshot_fixture;
 pub use ui_dialogs::settings_restore::draw_preferences_transfer_entry_snapshot_fixture;
+#[cfg(windows)]
+#[doc(hidden)]
+pub use ui_main::draw_effetune_show_only_snapshot_fixture;
 pub mod archive_cache;
 pub mod archive_converter;
 pub mod archive_origin;

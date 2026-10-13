@@ -57,23 +57,6 @@ mod effetune_policy_tests {
     use super::*;
 
     #[test]
-    fn foreground_predicate_matches_only_editor_and_its_nested_popups() {
-        assert!(editor_in_owner_chain(10, 10, |_| 0));
-        assert!(editor_in_owner_chain(10, 30, |window| match window {
-            30 => 20,
-            20 => 10,
-            _ => 0,
-        }));
-        assert!(!editor_in_owner_chain(10, 40, |_| 0));
-        assert!(!editor_in_owner_chain(0, 0, |_| 0));
-        assert!(!editor_in_owner_chain(10, 30, |window| if window == 30 {
-            20
-        } else {
-            30
-        }));
-    }
-
-    #[test]
     fn editor_bypass_chrome_defaults_on_and_effetune_can_hide_it() {
         let user = DspBridge::new();
         assert_eq!(user.gui_owner_policy, GuiOwnerPolicy::Auto);
@@ -384,30 +367,6 @@ impl GuiOwnerPolicy {
             Self::Auto | Self::FixedMain => hwnd != 0,
         }
     }
-}
-
-fn editor_in_owner_chain(editor: u64, root: u64, mut owner: impl FnMut(u64) -> u64) -> bool {
-    if editor == 0 {
-        return false;
-    }
-    let mut seen = std::collections::HashSet::new();
-    let mut window = root;
-    while window != 0 && seen.insert(window) {
-        if window == editor {
-            return true;
-        }
-        window = owner(window);
-    }
-    false
-}
-
-pub(crate) fn editor_owns_foreground(
-    editor: u64,
-    foreground: u64,
-    root: impl FnOnce(u64) -> u64,
-    owner: impl FnMut(u64) -> u64,
-) -> bool {
-    editor != 0 && foreground != 0 && editor_in_owner_chain(editor, root(foreground), owner)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1836,38 +1795,6 @@ impl DspBridge {
                 }),
             );
         }
-    }
-
-    /// Foreground editor or a popup whose owner chain reaches this exact editor.
-    pub fn slot_gui_is_foreground(&self, idx: usize, foreground: u64) -> bool {
-        use windows::Win32::Foundation::HWND;
-        use windows::Win32::UI::WindowsAndMessaging::{GA_ROOT, GW_OWNER, GetAncestor, GetWindow};
-        let editor = self
-            .inner
-            .lock()
-            .unwrap()
-            .slots
-            .get(idx)
-            .map(|s| s.gui_hwnd)
-            .unwrap_or(0);
-        if editor == 0 || foreground == 0 {
-            return false;
-        }
-        let root = unsafe { GetAncestor(HWND(foreground as *mut _), GA_ROOT) }.0 as u64;
-        let in_front = editor_owns_foreground(
-            editor,
-            foreground,
-            |_| root,
-            |window| {
-                unsafe { GetWindow(HWND(window as *mut _), GW_OWNER) }
-                    .unwrap_or_default()
-                    .0 as u64
-            },
-        );
-        crate::logger::log(format!(
-            "[EffeTune GUI] foreground editor=0x{editor:x} captured=0x{foreground:x} root=0x{root:x} in_front={in_front}"
-        ));
-        in_front
     }
 
     pub fn activate_slot_gui(&self, idx: usize) {

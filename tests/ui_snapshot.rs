@@ -30,6 +30,59 @@ use egui_kittest::{Harness, kittest::Queryable};
 #[path = "support/ui_harness.rs"]
 mod test_ui;
 
+#[cfg(windows)]
+#[test]
+fn effetune_show_only_active_tooltip_dark() {
+    effetune_show_only_tooltip_snapshot(
+        "effetune_show_only_active_tooltip_dark",
+        true,
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn effetune_show_only_inert_tooltip_light() {
+    effetune_show_only_tooltip_snapshot(
+        "effetune_show_only_inert_tooltip_light",
+        false,
+        mimageviewer::os_theme::ResolvedTheme::Light,
+    );
+}
+
+#[cfg(windows)]
+fn effetune_show_only_tooltip_snapshot(
+    name: &str,
+    active: bool,
+    theme: mimageviewer::os_theme::ResolvedTheme,
+) {
+    snapshot_with_theme_contrast_and_size_with_interaction(
+        name,
+        theme,
+        mimageviewer::settings::TextContrast::Standard,
+        egui::vec2(640.0, 260.0),
+        move |ui| {
+            ui.ctx()
+                .style_mut(|style| style.interaction.tooltip_delay = 0.0);
+            mimageviewer::draw_effetune_show_only_snapshot_fixture(ui, active);
+        },
+        |harness| {
+            harness.get_by_label("音響調整").hover();
+            harness.run();
+            assert!(
+                harness
+                    .query_by_label_contains("表示して前面に出します")
+                    .is_some()
+            );
+            assert!(
+                harness
+                    .query_by_label_contains("点灯は音響調整が有効")
+                    .is_some()
+            );
+        },
+    );
+}
+
 #[test]
 fn everything_search_bar_light() {
     everything_search_bar_snapshot(

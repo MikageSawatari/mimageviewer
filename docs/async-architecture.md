@@ -25,6 +25,13 @@ protocol v7のhello/readyで旧v6を拒否し、source identityとは独立にde
 一般VSTの矩形保存、owner、custom chromeは維持する。まれな失敗はログ＋通知、前の有効値を保持し、retryを追加しない。
 設計・実装台帳は[音響調整計画 §17](effetune-integration-plan.md)を参照。
 
+2026-10-13の利用者決定で、音響調整ボタンは表示・前面化だけを行う（計画§17.12）。
+mouse/keyboardとも既存host-control workerへManual Showを配送し、host GUI threadが表示/復元/activateする。
+前面判定・ClickForeground入力捕捉・ボタン専用Hide/pending_hideは撤去し、UIは可視結果やIPC完了を待たない。
+main subclassはmainの表示・最小化を既存GuiGateへ配送するだけにする。入力hookやvendor注釈はない。
+×/Shellのuser-hide通知と正常矩形snapshotは従来どおり採用し、Close由来のcapture_on_hideとDSPは維持する。
+ボタンの点灯はDSP EffectiveStateを示し、窓のvisibility ownerや開閉toggleにはしない。
+
 ## Everything の取得と共通Search採用（§1.374、未リリース）
 
 `GlobalSearchState.pending` の `SearchProducer` がMetadata/Everythingを排他に所有し、

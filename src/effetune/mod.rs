@@ -20,26 +20,25 @@ pub(crate) mod now_playing;
 mod window;
 pub(crate) use now_playing::{NowPlayingArtworkSource, NowPlayingInput, NowPlayingOwner};
 
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum GuiButtonAction {
-    Show,
-    Activate,
-    Hide,
-}
-
-pub(crate) fn gui_button_action(visible: bool, in_front: bool) -> GuiButtonAction {
-    if !visible {
-        GuiButtonAction::Show
-    } else if in_front {
-        GuiButtonAction::Hide
-    } else {
-        GuiButtonAction::Activate
-    }
-}
-
 const BUNDLE_NAME: &str = "EffeTune Mixwright.vst3";
 const INITIAL_CAPTURE_WAIT: Duration = Duration::from_secs(6);
 const EXIT_FENCE: Duration = Duration::from_secs(2);
+
+pub(crate) fn running_gui_tooltip(effective: Option<EffectiveState>) -> String {
+    let status = match effective {
+        Some(EffectiveState::Effective) => {
+            "音響調整は有効です (設定の窓を閉じた時点の内容で判定しています)"
+        }
+        Some(EffectiveState::Inert) => {
+            "音響調整にエフェクトが無いか、全体バイパス中です (設定の窓を閉じた時点の内容で判定しています)"
+        }
+        Some(EffectiveState::Unparseable(_)) => "音響調整の設定を判定できません",
+        None => "音響調整の設定を確認中です",
+    };
+    format!(
+        "音響調整の窓を表示して前面に出します。窓を隠すにはタイトルバーの × を押します。\n点灯は音響調整が有効なことを示します。\n{status}"
+    )
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum UnavailableReason {
@@ -338,10 +337,6 @@ enum HostCommand {
     Gui {
         bridge: Arc<crate::video::dsp::bridge::Bridge>,
         value: Value,
-    },
-    Hide {
-        bridge: Arc<DspBridge>,
-        reply: mpsc::Sender<Result<(), String>>,
     },
 }
 
@@ -978,7 +973,6 @@ pub struct EffetuneController {
     host_tx: mpsc::Sender<HostCommand>,
     #[cfg(test)]
     show_in_taskbar: bool,
-    pending_hide: Option<mpsc::Receiver<Result<(), String>>>,
     repaint_context: Arc<Mutex<Option<egui::Context>>>,
 }
 
@@ -1093,10 +1087,6 @@ impl EffetuneController {
                                 wake_ui(&host_repaint);
                             }
                         }
-                        HostCommand::Hide { bridge, reply } => {
-                            let _ = reply.send(bridge.hide_slot_gui_checked(0));
-                            wake_ui(&host_repaint);
-                        }
                     }
                 }
             })
@@ -1134,7 +1124,6 @@ impl EffetuneController {
             host_tx,
             #[cfg(test)]
             show_in_taskbar: true,
-            pending_hide: None,
             repaint_context,
         }
     }
@@ -1330,10 +1319,6 @@ impl EffetuneController {
         }
     }
 
-    pub fn click_foreground(&self, pointer_click: bool) -> u64 {
-        self.main_window.click_foreground(pointer_click)
-    }
-
     pub fn set_repaint_context(&self, ctx: &egui::Context) {
         let mut context = self.repaint_context.lock().unwrap();
         if context.is_none() {
@@ -1466,7 +1451,7 @@ impl EffetuneController {
     }
 
     pub fn has_pending_ui_work(&self) -> bool {
-        self.pending_load.is_some() || self.pending_hide.is_some() || self.pending_capture.is_some()
+        self.pending_load.is_some() || self.pending_capture.is_some()
     }
 
     #[cfg(test)]
@@ -1500,25 +1485,6 @@ impl EffetuneController {
         }
         if let Ok(failure) = self.failure_rx.try_recv() {
             self.fail(failure);
-        }
-        if let Some(rx) = self.pending_hide.as_ref() {
-            let completed = match rx.try_recv() {
-                Ok(result) => Some(result),
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    Some(Err("hide GUI worker disconnected".into()))
-                }
-                Err(mpsc::TryRecvError::Empty) => None,
-            };
-            if let Some(result) = completed {
-                self.pending_hide = None;
-                match result {
-                    Ok(()) if matches!(self.runtime, EffetuneRuntime::Running { .. }) => {
-                        self.capture_on_hide();
-                    }
-                    Ok(()) => {}
-                    Err(error) => self.fail(EffetuneFailure::GuiFailed(error)),
-                }
-            }
         }
         if let Some(rx) = self.pending_load.as_ref() {
             let result = match rx.try_recv() {
@@ -1576,27 +1542,6 @@ impl EffetuneController {
                 Err(error) => crate::logger::log(format!("[EffeTune] hide capture: {error}")),
             }
         }
-    }
-
-    pub fn request_hide_gui(&mut self) {
-        if self.pending_hide.is_some() || !matches!(self.runtime, EffetuneRuntime::Running { .. }) {
-            return;
-        }
-        let Some(bridge) = self.bridge.as_ref().cloned() else {
-            return;
-        };
-        let (reply, rx) = mpsc::channel();
-        if self
-            .host_tx
-            .send(HostCommand::Hide { bridge, reply })
-            .is_err()
-        {
-            self.fail(EffetuneFailure::GuiFailed(
-                "host control worker disconnected".into(),
-            ));
-            return;
-        }
-        self.pending_hide = Some(rx);
     }
 
     pub fn effective_state(&self) -> Option<EffectiveState> {
@@ -1673,7 +1618,6 @@ impl EffetuneController {
         self.now_playing.set_active(false);
         self.pending_load = None;
         self.pending_capture = None;
-        self.pending_hide = None;
         if let Some(bridge) = self.bridge.take() {
             if let Err(error) = self.host_tx.send(HostCommand::Disable(bridge)) {
                 if let HostCommand::Disable(bridge) = error.0 {
@@ -2064,11 +2008,94 @@ mod tests {
     }
 
     #[test]
-    fn gui_button_decides_hidden_front_and_behind() {
-        assert_eq!(gui_button_action(false, false), GuiButtonAction::Show);
-        assert_eq!(gui_button_action(false, true), GuiButtonAction::Show);
-        assert_eq!(gui_button_action(true, true), GuiButtonAction::Hide);
-        assert_eq!(gui_button_action(true, false), GuiButtonAction::Activate);
+    #[cfg(not(feature = "portable"))]
+    fn toolbar_only_shows_or_activates_and_close_preserves_position_and_dsp() {
+        use crate::video::dsp::bridge::{GuiVisibilityOutcome, NormalScreenRect};
+        let mut app = crate::app::setup_app_for_test();
+        let (host_tx, host_rx) = mpsc::channel();
+        app.effetune.host_tx = host_tx;
+        let bridge = new_bridge();
+        let (host, _commands, events) = crate::video::dsp::bridge::Bridge::fake_host_for_test();
+        bridge.install_fake_host_for_test(host);
+        bridge.mark_enabled_without_bridge_for_test();
+        bridge.set_gui_hwnd(0, 41);
+        app.effetune.publish_running(Arc::clone(&bridge));
+        assert!(matches!(
+            host_rx.try_recv(),
+            Ok(HostCommand::RegisterBridge(_))
+        ));
+        app.effetune.captures.latest.lock().unwrap().effective = Some(EffectiveState::Effective);
+
+        for (request_id, outcome, label) in [
+            (1, GuiVisibilityOutcome::Hidden, "hidden -> show"),
+            (2, GuiVisibilityOutcome::Shown, "visible behind -> activate"),
+            (
+                3,
+                GuiVisibilityOutcome::Shown,
+                "visible in front -> remain visible",
+            ),
+        ] {
+            events.emit(crate::video::dsp::Event::GuiVisibilityResult {
+                request_id,
+                slot_id: 0,
+                outcome,
+            });
+            bridge.pump_gui_signals();
+            let visible = bridge.slot(0).unwrap().gui_visible;
+            app.effetune_toolbar_click();
+            let Ok(HostCommand::Show {
+                bridge: requested,
+                permit: ShowIntent::Manual(_),
+            }) = host_rx.try_recv()
+            else {
+                panic!("{label}: expected one explicit Show/Activate request");
+            };
+            assert!(Arc::ptr_eq(&requested, &bridge));
+            assert!(host_rx.try_recv().is_err());
+            // UI dispatch never hides or publishes a pretend host result.
+            assert_eq!(bridge.slot(0).unwrap().gui_visible, visible, "{label}");
+            assert!(app.effetune_toolbar_active());
+        }
+
+        let normal_rect = NormalScreenRect {
+            x: -1700,
+            y: 160,
+            outer_width: 730,
+            outer_height: 550,
+        };
+        events.emit(crate::video::dsp::Event::GuiUserHidden {
+            slot_id: 0,
+            container_hwnd: 41,
+            normal_rect: Some(normal_rect),
+        });
+        let changes = bridge.pump_gui_signals();
+        assert_eq!(changes.user_hidden_paths, ["fake-host"]);
+        assert!(!bridge.slot(0).unwrap().gui_visible);
+        let position = bridge.snapshot_all_window_positions();
+        assert_eq!(position, [("fake-host".into(), -1700, 160, 730, 550)]);
+        assert!(app.effetune.slot.snapshot().is_some()); // Close only hides; DSP stays published.
+        assert!(app.effetune_toolbar_active());
+        assert!(
+            app.effetune_toolbar_tooltip()
+                .contains("表示して前面に出します")
+        );
+        assert!(app.effetune_toolbar_tooltip().contains("タイトルバーの ×"));
+        assert!(
+            app.effetune_toolbar_tooltip()
+                .contains("点灯は音響調整が有効")
+        );
+        app.effetune_toolbar_click();
+        assert!(matches!(host_rx.try_recv(), Ok(HostCommand::Show { .. })));
+        assert_eq!(bridge.snapshot_all_window_positions(), position);
+        events.emit(crate::video::dsp::Event::GuiVisibilityResult {
+            request_id: 4,
+            slot_id: 0,
+            outcome: GuiVisibilityOutcome::Shown,
+        });
+        bridge.pump_gui_signals();
+        assert!(bridge.slot(0).unwrap().gui_visible);
+        assert_eq!(bridge.snapshot_all_window_positions(), position);
+        assert!(app.effetune_toolbar_active());
     }
 
     #[test]
@@ -2533,33 +2560,6 @@ mod tests {
             Ok(HostCommand::RegisterBridge(_))
         ));
         assert!(matches!(host_rx.try_recv(), Ok(HostCommand::Disable(_))));
-    }
-
-    #[test]
-    fn asynchronous_hide_failure_is_applied_by_controller_poll() {
-        let mut controller = EffetuneController::new();
-        controller.publish_running(DspBridge::new());
-        controller.request_hide_gui();
-        assert!(matches!(
-            controller.runtime,
-            EffetuneRuntime::Running { .. }
-        ));
-        let result = controller
-            .pending_hide
-            .take()
-            .unwrap()
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap();
-        assert!(result.is_err());
-        let (reply, rx) = mpsc::channel();
-        reply.send(result).unwrap();
-        controller.pending_hide = Some(rx);
-        controller.poll();
-        assert!(matches!(
-            controller.runtime,
-            EffetuneRuntime::Failed(EffetuneFailure::GuiFailed(_))
-        ));
-        assert!(controller.slot.snapshot().is_none());
     }
 
     #[test]

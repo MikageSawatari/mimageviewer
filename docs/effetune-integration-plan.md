@@ -1479,6 +1479,9 @@ worker の hidden attach 前後と host GUI の表示直前でも成功時 revis
 
 ## 17. 音響調整窓のタスクバー表示（2026-10-12 設計メモ）
 
+**2026-10-13 利用者決定:** ボタン操作は§17.12の「表示・前面化だけ」を正本とする。
+以下の過去記録の「前面ならボタンでHide」は撤回した。taskbar/Close/通常矩形の契約は維持する。
+
 **状態: R2独立ACCEPT後の実装・実機確認を経て、§17.10の修正を実施。** 以下§17.1–§17.8は
 R2設計時の記録。現在のOFF時のtaskbar方式とiconは§17.10を正とする。
 設定ON/OFF・既定ON、mIVのAppUserModelID、shortcut、pin、Jump Listを変更しない範囲を維持する。
@@ -1901,3 +1904,52 @@ vendor egui25・egui-wgpu11・eframe18件も通過した。
 全result集計13,508 PASS / 0 FAIL / 64 ignored（65 target結果、fixture子実行を含む）。
 最終identity・差分チェックも通過。証拠は`target/ET-1378-EV13-P2-*`、引き渡しは`target/ET-1378-impl-msg.txt`。
 本体起動・外部backup更新・コミットは行っていない。実Shell/pluginと前面ボタンの実機再確認は利用者が行う。
+
+### 17.12 利用者決定: ボタンは表示・前面化だけ（2026-10-13、EV19）
+
+基点はfc5f83ae5（298c33ce8＋host VERSIONINFO表示名）。4bf209ba3のフック方式はrevert済み、
+EV17/EV18の未コミット候補も設計担当が破棄した。今後は音響調整ボタンを押すたびに既存の
+manual Show要求を送る。非表示なら表示し、表示中なら前面に出す。既に手前でも隠さない。
+閉じる操作はEffeTuneの×と既存Shell操作へ任せ、Close=user-hide、DSP継続、通常配置保持を維持する。
+
+経緯: foreground方式では別processからclick-activateされるとforeground/WM_ACTIVATE.otherが0となり、
+main subclassだけでは直前の前面窓を取得できなかった。before-queue LL hook方式は実機でHideを確認したが、
+未使用時もglobal input経路に入る範囲が広く、表示期間限定には未観測入力との対応付けの開始境界が残った。
+z-order案も検討した。その後、利用者が「前面かどうかによってボタン動作を変える」要件自体を撤回した。
+前面判定と別streamの対応付けをなくす単純化であり、時間推測や初回操作だけの制限で補わない。
+
+ボタンは引数なしの一入口にし、mouse/keyboardの違いで分岐しない。既存のhost-control workerへ
+ShowIntent::Manualを配送し、host GUI threadのset_gui_visibility_checked→activate_guiで表示・復元・前面化する。
+UIはFS/DB/IPCやhost完了を待たず、二番目のvisibility owner・foreground cache・入力hook・vendor注釈は不要。
+GuiButtonAction/Hide分岐、ClickForegroundとmouse/pointer/touch捕捉、未使用のDSP foreground predicate、
+ボタン専用HostCommand::Hide/pending_hide/request_hide_guiを撤去する。main subclassはmainの表示・最小化と
+GuiGate配送に必要なので残す。Close由来のcapture_on_hideとhost通常矩形保存、一般VSTの表示処理は残す。
+
+点灯は既存のEffectiveState=EffectiveというDSP状態を表し、窓の開閉toggleとはしない。
+×で閉じても有効なら点灯を維持する。tooltip/manualに表示・前面化、×によるhide、点灯の意味を明記する。
+専用KeyAction/リング項目、Remoteの窓表示/hide操作は存在せず、新しい入口やAPIは増やさない。
+Remote中のPCボタン抑止と「窓を表示できない/接続後に元の表示を戻す」説明、配信の音響調整は維持する。
+portable非表示、settings_transfer/設定field/保存書式は変更しない。privacy/製品ページの通信説明にも影響しない。
+
+回帰は実App toolbar入口→fake HostCommand境界でhidden/back/frontがすべてManual Showを一回だけ送り、
+host結果前にUIがvisibilityを変更しないこと、GuiUserHidden/正常矩形→再表示で位置とDSP/点灯が保たれることを確認する。
+既存のRemote permit、main最小化、Close/frame identity、host allocation/protocol v7の回帰は維持する。
+前面判定専用の旧回帰は要件撤回に合わせて撤去し、成功を装うskipや期待値の緩和に置き換えない。
+まれな保存/配送失敗は既定のlog＋通知、再起動等の単純な入口で扱い、多段回復やretry loopは追加しない。
+
+hostのRC表示名を含むCMake Release再生成とsource identity/CRT一致を確認し、関連試験・fmt・通常/portable check、
+build-release.ps1、test-fullの結果と隔離実機手順をtarget/ET-1378-impl-msg.txt / ET-1378-EV19-*へ記録する。
+実アプリの起動・実入力・外部backup更新・コミットは行わない。独立コードレビューと実機確認は別の受入として残す。
+
+EV19検証完了: EffeTune関連114件、共通tooltip snapshot2件（生成後の通常比較と目視確認）、fmt、glyph zero、
+通常/portable core check、CMake Release、CTest5件、source identityが成功した。build-release.ps1 -PreserveRuntimeを
+*>&1なしで完走しexit0、core10m15s/launcher22.39s。hostのFileDescription/ProductNameはEffeTune (mImageViewer)。
+markerは04e94b0d62c8d4eb0128a708aec1a70c7ecb2c7639d9899fc54f621098a869ad、host SHA256は
+d33d4cd04bcc547b104b825faa8e44893a55f335bc10cc6d0f1f93f9555dd968。CRT runtime4/pe4・内包pe12、
+最新host全byteのcore内包と最新core全byteのlauncher内包を確認した。test-fullは一回完走exit0 / PASS、
+本体lib12,217成功・57 ignored（1436.89s）、UI snapshot165件、vendor egui25/egui-wgpu11/eframe18件成功。
+65 result集計13,497成功・失敗0・64 ignored（fixture子実行を含む）。画像以外に新しい未追跡sourceはない。
+最初のCMake parallel2は診断なしexit1、serial1・/nr:falseへ切り替えて成功し、release script内の再buildも成功。
+製品テストのskip/期待値緩和、全体gateの追加rerun、アプリ起動は行っていない。差分は未コミット。
+証拠はtarget/ET-1378-EV19-final-gate-summary.json / final-test-full*.log / release-embed-final.jsonと
+target/ET-1378-impl-msg.txt。現物Shellの表示・前面化と×後の再表示は利用者が同じ隔離環境で確認する。
