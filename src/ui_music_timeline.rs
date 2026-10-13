@@ -1882,7 +1882,9 @@ fn timeline_metric_color(
                 (86.0 + value * 70.0 + bass_hint.confidence * 28.0).min(202.0) as u8,
             );
         }
-        TimelineMetricKind::LoudnessBassRoot => egui::Color32::from_rgb(188, 198, 92),
+        // No bass estimate (not yet computed, or no confident bass): neutral gray so it is not
+        // mistaken for a pitch-class color (the old olive-yellow resembled C#).
+        TimelineMetricKind::LoudnessBassRoot => egui::Color32::from_rgb(150, 156, 162),
         TimelineMetricKind::Key if key_hint.confidence > 0.0 => {
             let color_value = (0.36 + key_hint.confidence * 0.38).min(0.74);
             return color_with_alpha(
