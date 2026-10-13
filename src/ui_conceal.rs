@@ -90,7 +90,7 @@ impl App {
     /// 見開き表示中に呼ばれた場合は spread_mode を一時的に Single へ落とし
     /// (消しゴムと同じ振る舞い、`conceal_spread_ctx` に元状態を保存)、
     /// `reset_conceal_mode` で復元する。
-    pub(crate) fn enter_conceal_mode(&mut self, fs_idx: usize) {
+    pub(crate) fn enter_conceal_mode(&mut self, ctx: &egui::Context, fs_idx: usize) {
         if !self.fullscreen_edit_mode_entry_allowed(fs_idx) {
             return;
         }
@@ -102,6 +102,24 @@ impl App {
             crate::ui_fullscreen::SpreadPair::Double { left, .. } => left,
             crate::ui_fullscreen::SpreadPair::Single => fs_idx,
         };
+        self.cancel_original_material_entry_intents(None);
+        // A current edit-chain result is already the correct conceal input.
+        // Only hydrate the original when neither that result nor the input for
+        // the preceding local-adjustment stage is available.
+        if self.current_conceal_source_pixels(target_idx).is_none()
+            && self
+                .current_local_adjust_source_pixels(target_idx)
+                .is_none()
+            && !self.ensure_erase_stage_for_entry(
+                ctx,
+                target_idx,
+                crate::app::OriginalMaterialEntry::Conceal {
+                    requested_fs_idx: fs_idx,
+                },
+            )
+        {
+            return;
+        }
         if self.local_adjust_pages.contains(&target_idx)
             && !self.local_adjust_page_layers.contains_key(&target_idx)
             || self.has_active_local_adjust_layers(target_idx)
@@ -242,6 +260,7 @@ impl App {
     /// 空マスク経路に揃える)。表示パイプライン側の `conceal_cache` は次回の
     /// composite で自然に再生成されるため、ここでは触らない。
     pub(crate) fn reset_conceal_mode(&mut self) {
+        self.cancel_original_material_entry_intents(None);
         let restore_idx = self.fullscreen_idx;
         let was_conceal_mode = self.conceal_mode;
 
@@ -301,24 +320,59 @@ impl App {
 
     /// 見開き隠蔽加工中に「左ページ」「右ページ」ボタンで編集対象を切り替える。
     /// 現ページのマスクを保存してから単ページ状態のままもう一方へ入り直す。
-    pub(crate) fn switch_conceal_target_in_spread(&mut self, new_idx: usize) {
+    pub(crate) fn switch_conceal_target_in_spread(&mut self, ctx: &egui::Context, new_idx: usize) {
         if !self.raw_edit_target_entry_allowed(new_idx) {
             return;
         }
         if self.fullscreen_idx == Some(new_idx) {
             return;
         }
+        let Some(request) = self.page_edit_target_switch_request(
+            crate::app::PageEditTargetSwitchTool::Conceal,
+            new_idx,
+        ) else {
+            return;
+        };
+        self.cancel_original_material_entry_intents(None);
+        if self.current_conceal_source_pixels(new_idx).is_none()
+            && !self.ensure_erase_stage_for_entry(
+                ctx,
+                new_idx,
+                crate::app::OriginalMaterialEntry::Switch { request },
+            )
+        {
+            return;
+        }
+        self.maybe_start_conceal_materialize(
+            new_idx,
+            crate::app::ConcealMaterializePurpose::Switch { request },
+        );
+    }
+
+    pub(crate) fn complete_conceal_target_switch(
+        &mut self,
+        request: crate::app::PageEditTargetSwitchRequest,
+        pixels: Arc<egui::ColorImage>,
+        source_kind: &'static str,
+        mask: Vec<bool>,
+        shapes: Vec<crate::mask_db::Shape>,
+    ) -> bool {
+        if !self.page_edit_target_switch_is_current(request)
+            || !self.raw_edit_target_entry_allowed(request.target_idx)
+        {
+            return false;
+        }
         self.finish_conceal_edit_for_current("switch_save");
-        // 次ページの DB mask が worker から戻るまでは、前ページの in-memory mask を
-        // 新ページへ重ねず lower layer を表示する。
+        // Both source and saved target mask are ready: commit the old editor and
+        // install the new editor in the same pass.
         self.conceal_mode = false;
         self.conceal_preview_active = false;
         self.conceal_mask = None;
         self.conceal_mask_size = [0, 0];
         self.conceal_mask_texture = None;
         self.conceal_shapes.clear();
-        self.enter_page_edit_single_view(new_idx);
-        self.enter_conceal_mode(new_idx);
+        self.enter_page_edit_single_view(request.target_idx);
+        self.complete_conceal_mode_entry(request.target_idx, pixels, source_kind, mask, shapes)
     }
 
     // ── Undo ────────────────────────────────────────────────────────
@@ -2907,7 +2961,7 @@ impl App {
                 // は後勝ち) で widget が click を受け取れなくなる。
             });
         if let Some(target) = switch_to {
-            self.switch_conceal_target_in_spread(target);
+            self.switch_conceal_target_in_spread(ctx, target);
         }
         if should_close_after_draw {
             self.reset_conceal_mode();

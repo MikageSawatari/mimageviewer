@@ -22,6 +22,8 @@ mod page_turn;
 #[cfg(test)]
 mod prefetch_revision_tests;
 #[cfg(test)]
+mod retained_material_entry_tests;
+#[cfg(test)]
 pub(crate) use page_turn::take_test_events as take_page_turn_test_events;
 pub(crate) use page_turn::{
     OperationPhase, PageTurnLeaseInventory, PageTurnPresentation, PresentationDestination,
@@ -10127,6 +10129,13 @@ impl App {
             self.set_fs_pan_from_input(self.fs_zoom, proposed_pan);
         } else {
             // 通常→分析: ズーム/パンを引き継ぐ
+            self.cancel_original_material_entry_intents(None);
+            if let Some(idx) = self.fullscreen_idx {
+                self.ensure_original_material_for_entry(
+                    idx,
+                    crate::app::OriginalMaterialEntry::MaterialOnly,
+                );
+            }
             self.analysis_zoom = self.fs_zoom;
             self.analysis_pan = self.fs_pan;
             self.analysis_mode = true;
@@ -11472,6 +11481,10 @@ impl App {
         // ヒストグラム・グレースケール/拡大鏡オーバーレイは raw fs_cache を読むので、表示も raw に
         // 揃えることで「クリックした見た目の色 = 分析値」が一致する (Codex 指摘 + ユーザー要望)。
         if self.fs_display_bypasses_final_pipeline(original_preview_active) {
+            self.ensure_original_material_for_entry(
+                idx,
+                crate::app::OriginalMaterialEntry::MaterialOnly,
+            );
             return self.resolve_original_preview_tex(idx);
         }
 
@@ -17385,7 +17398,8 @@ impl App {
                 .map(|dims| (idx, dims))
         });
         if let Some((idx, dims)) = retained {
-            self.record_page_dims_for_spread(idx, dims);
+            // Retained edit canvas dimensions describe geometry, not canonical coordinates.
+            self.record_thumbnail_page_dims_for_spread(idx, dims);
         }
     }
 
@@ -17421,8 +17435,22 @@ impl App {
 
     /// 判明した pixel 寸法を保持し、cached nav 上の横長性が変わった場合だけ epoch を進める。
     pub(crate) fn record_page_dims_for_spread(&mut self, idx: usize, dims: (u32, u32)) {
-        self.page_dims_cache
-            .record(self.items_generation, idx, dims);
+        self.page_dims_cache.record(
+            self.items_generation,
+            idx,
+            crate::page_dims::PagePixelDimensions::Canonical(
+                crate::page_dims::CanonicalPageDimensions::new(dims.0, dims.1),
+            ),
+        );
+        self.reconcile_spread_landscape_for_idx(idx);
+    }
+
+    pub(crate) fn record_thumbnail_page_dims_for_spread(&mut self, idx: usize, dims: (u32, u32)) {
+        self.page_dims_cache.record(
+            self.items_generation,
+            idx,
+            crate::page_dims::PagePixelDimensions::Thumbnail(dims),
+        );
         self.reconcile_spread_landscape_for_idx(idx);
     }
 
@@ -28091,7 +28119,13 @@ impl App {
                     // まだ fs_cache が埋まっていない段階: ヘッダ解析済みなら原寸ヒントを使う。
                     // 原寸が GPU 上限超なら、本デコード完了後に clamp が発動することが
                     // 事前に判るのでこの時点で⚠ダウンスケール警告を出してよい。
-                    if let Some([sw, sh]) = self.fs_early_dims.get(&fs_idx).copied() {
+                    if let Some(dims) = self.canonical_source_dimensions(fs_idx) {
+                        let (sw, sh) = dims.as_tuple();
+                        let clamped = self
+                            .pre_ai_display_size_for_idx(fs_idx)
+                            .is_some_and(|size| size.x as u32 != sw || size.y as u32 != sh);
+                        (Some((sw, sh)), clamped)
+                    } else if let Some([sw, sh]) = self.fs_early_dims.get(&fs_idx).copied() {
                         let will_clamp =
                             sw > crate::app::MAX_TEXTURE_DIM || sh > crate::app::MAX_TEXTURE_DIM;
                         (Some((sw as u32, sh as u32)), will_clamp)
@@ -28393,7 +28427,13 @@ impl App {
                 false,
             ),
             _ => {
-                if let Some([w, h]) = self.fs_early_dims.get(&idx).copied() {
+                if let Some(dims) = self.canonical_source_dimensions(idx) {
+                    let (w, h) = dims.as_tuple();
+                    let downscaled = self
+                        .pre_ai_display_size_for_idx(idx)
+                        .is_some_and(|size| size.x as u32 != w || size.y as u32 != h);
+                    (Some((w, h)), downscaled)
+                } else if let Some([w, h]) = self.fs_early_dims.get(&idx).copied() {
                     (
                         Some((w as u32, h as u32)),
                         w > crate::app::MAX_TEXTURE_DIM || h > crate::app::MAX_TEXTURE_DIM,
@@ -32551,7 +32591,7 @@ impl App {
                 true,
                 FsContinuousReadingUnavailableFeature::LocalAdjust,
             ) {
-                self.enter_local_adjust_mode();
+                self.enter_local_adjust_mode(ctx);
             }
         }
 
@@ -32575,7 +32615,7 @@ impl App {
                 true,
                 FsContinuousReadingUnavailableFeature::Conceal,
             ) {
-                self.enter_conceal_mode(fs_idx);
+                self.enter_conceal_mode(ctx, fs_idx);
             }
         }
 
@@ -38740,6 +38780,12 @@ impl App {
     /// 余白カット用の中身 bbox を取得 (キャッシュ付き)。余白なし / pixels 未取得
     /// (アニメ等) なら None。補正前後で余白はほぼ不変なので raw fs_cache の pixels から検出する。
     pub(crate) fn cached_margin_bbox(&mut self, idx: usize) -> Option<egui::Rect> {
+        if !self.is_raw_page(idx) {
+            self.ensure_original_material_for_entry(
+                idx,
+                crate::app::OriginalMaterialEntry::MaterialOnly,
+            );
+        }
         let (load_seq, pixels_ptr, pixels) = match self.fs_cache.get(&idx) {
             Some(FsCacheEntry::RawPreview {
                 preview: Some(preview),
@@ -48175,6 +48221,7 @@ impl App {
             self.show_feedback_toast("比較画像が未設定です。X で設定してください".to_string());
             return;
         }
+        self.cancel_original_material_entry_intents(None);
         let next_mode = match self.compare_view_mode {
             crate::app::CompareViewMode::Wipe { .. } => crate::app::CompareViewMode::Off,
             _ => crate::app::CompareViewMode::wipe(0.5),
@@ -48200,6 +48247,7 @@ impl App {
             self.show_feedback_toast("比較画像が未設定です。X で設定してください".to_string());
             return;
         }
+        self.cancel_original_material_entry_intents(None);
         let next_mode = match self.compare_view_mode {
             crate::app::CompareViewMode::Diff => crate::app::CompareViewMode::Off,
             _ => crate::app::CompareViewMode::Diff,
@@ -49172,8 +49220,8 @@ impl App {
             let settings = self.export_crop_page_settings.get(&idx).copied();
             if settings.is_some_and(|settings| settings.valid_source_size().is_none()) {
                 let fallback_size = self
-                    .current_raw_source_pixels(idx)
-                    .map(|pixels| pixels.size);
+                    .canonical_source_dimensions(idx)
+                    .map(|dims| dims.as_size());
                 fallback_size
                     .and_then(|size| self.ensure_export_crop_source_size(idx, size))
                     .or(settings)
@@ -49686,6 +49734,7 @@ impl App {
             self.show_feedback_toast(message.to_string());
             return false;
         }
+        self.cancel_original_material_entry_intents(None);
         let target = match if sns_split_export {
             // 分割枠を作った 1 ページだけを worker 合成へ渡す。通常 Ctrl+E の
             // 見開き合成経路は変更しない。
@@ -49857,6 +49906,12 @@ impl App {
         // Ctrl+E を保留する。この同期準備の廃止は §1.177 の範囲。
         for &idx in indices {
             if self.mask_pages.contains(&idx) {
+                if self.current_erase_result_pixels(idx).is_none() {
+                    self.ensure_original_material_for_entry(
+                        idx,
+                        crate::app::OriginalMaterialEntry::MaterialOnly,
+                    );
+                }
                 let _ = self.ensure_erase_result_texture(ctx, idx);
                 if self.current_erase_result_pixels(idx).is_none() {
                     return Err(
@@ -49875,6 +49930,14 @@ impl App {
         indices: &[usize],
     ) -> Result<(), String> {
         for &idx in indices {
+            if (self.has_active_local_adjust_layers(idx) || self.local_adjust_pages.contains(&idx))
+                && self.current_local_adjust_pixels(idx).is_none()
+            {
+                self.ensure_original_material_for_entry(
+                    idx,
+                    crate::app::OriginalMaterialEntry::MaterialOnly,
+                );
+            }
             self.maybe_start_local_adjust_render(idx);
             if self.local_adjust_pages.contains(&idx)
                 && !self.local_adjust_page_layers.contains_key(&idx)
@@ -81620,6 +81683,7 @@ mod specified_scale_consumer_tests {
             },
         );
         app.final_ai_result_backlog.push(FinalAiResult::Ready {
+            canonical_dims: None,
             job_id: 77,
             key,
             retained_key: None,

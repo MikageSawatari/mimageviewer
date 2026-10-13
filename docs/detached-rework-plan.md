@@ -4930,3 +4930,15 @@ canonical flatから数える。非フォーカスwheelの元viewport配送を�
 continuationは既存の宛先/世代/receipt ownerでcommitする。host/placement/rect捕捉/生成述語を
 変更せず、新pending/bool/queue/時間窓を追加しない。独立GPT-6.1 Sol/xhigh事前レビューは
 所有境界を揃える構造修正でありdetached症状パッチではないことに合意した。詳細は§26.12。
+
+### 2026-10-14 §1.341 完成素材表示と元画素の取得
+
+§2を再確認。寸法の来歴を型で区別し、元画素を必要とする操作だけを既存fsロードownerへ
+Original purposeとして接続する。入場anchor／source target／items世代は同context内で確認し、
+取得は同sourceのmaterializationとして完成表示のkeyを維持する。新pending／queue／bool、
+viewport／host／生成述語を追加せず、RAW編集受付も変更しない。独立GPT-6.1 Sol/xhighの
+事前レビューはこの所有境界の修正に構造合意した。詳細・入口一覧はpage-turn plan §26.14。
+保存消しゴムstageと左右頁切替も同じ既存fs／inpaint／materializer ownerのtyped purposeへ
+接続し、準備中は旧編集targetを保持する。worker素材identityと単回操作を区別して通常Display
+への合流／取消を保ち、main/F12のviewport・host条件は変更しない。追加の構造合意と最終
+独立レビューACCEPTを得た。実context mount往復と入口／切替の回帰、viewer_context_auditが成功。

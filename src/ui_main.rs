@@ -28436,6 +28436,67 @@ mod decide_drag_payload_tests {
     use super::*;
     use std::collections::HashSet;
 
+    #[test]
+    fn retained_material_entry_native_drag_keeps_virtual_refusal_and_physical_paths() {
+        use crate::app::composite_pixels_revision_tests::{evict_pair_cpu, warm_final_pair};
+        use crate::page_dims::{CanonicalPageDimensions, PagePixelDimensions};
+
+        let ctx = egui::Context::default();
+        let (mut app, keys) = warm_final_pair(&ctx);
+        app.final_composite_cache
+            .get_mut(&keys[1])
+            .unwrap()
+            .canonical_dims = Some(CanonicalPageDimensions::new(1200, 1800));
+        app.page_dims_cache.clear();
+        let generation = app.items_generation;
+        app.page_dims_cache
+            .record(generation, 0, PagePixelDimensions::Thumbnail((160, 240)));
+        evict_pair_cpu(&mut app);
+        app.fullscreen_idx = Some(0);
+        let checked = HashSet::new();
+        match decide_drag_payload(&app.items, &checked, 0) {
+            DragDecision::ImmediateToast(message) => {
+                assert!(message.contains("ページ") && message.contains("ドラッグできません"));
+            }
+            _ => panic!("a displayed PDF composite must not become a native file-drag payload"),
+        }
+        let file = app.tmp.path().join("drag-original.png");
+        let file_idx = app.items.len();
+        app.items.push(GridItem::Image(file.clone()));
+        match decide_drag_payload(&app.items, &checked, file_idx) {
+            DragDecision::Start {
+                paths,
+                post_drag_toast,
+            } => {
+                assert_eq!(paths, vec![file.clone()]);
+                assert!(post_drag_toast.is_none());
+            }
+            _ => panic!("ordinary files retain their existing path-drag behavior"),
+        }
+        let checked = [0, file_idx].into_iter().collect();
+        match decide_drag_payload(&app.items, &checked, 0) {
+            DragDecision::Start {
+                paths,
+                post_drag_toast,
+            } => {
+                assert_eq!(paths, vec![file]);
+                assert!(post_drag_toast.is_some());
+            }
+            _ => panic!("mixed drag must exclude the virtual page and keep the real file"),
+        }
+        assert!(!app.fs_cache.contains_key(&0));
+        assert!(!app.fs_pending.contains_key(&0));
+        assert!(!app.fs_upload_backlog_contains(0));
+        assert!(
+            app.pending_native_drag.is_none(),
+            "this test must not queue an OS drag"
+        );
+        assert_eq!(
+            app.final_composite_cache.get(&keys[1]).unwrap().pixels.size,
+            [8, 12]
+        );
+    }
+
     fn img(p: &str) -> GridItem {
         GridItem::Image(PathBuf::from(p))
     }

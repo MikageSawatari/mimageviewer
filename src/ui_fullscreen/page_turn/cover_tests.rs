@@ -220,8 +220,9 @@ fn page_turn_paged_prefetch_retained_cover_before_accept_starts_and_finishes() {
         crate::app::paged_prefetch_tests::retain_pdf_ai(&mut app, 1);
         assert!(matches!(
             app.fs_page_load_state(0),
-            FsPageLoadState::NeedsLoad
+            FsPageLoadState::DisplayReady(crate::app::FsPageDisplaySource::ResidentFinalComposite)
         ));
+        assert!(app.current_raw_source_pixels(0).is_none());
         assert!(
             app.final_composite_cache
                 .get(&final_key)

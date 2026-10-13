@@ -3,7 +3,7 @@
 use super::paged_prefetch_tests::{complete_pending_composites, pdf_book, retain_pdf_ai};
 use super::*;
 
-fn warm_final_pair(ctx: &egui::Context) -> (AppTestEnvForTest, [FinalCompositeKey; 2]) {
+pub(crate) fn warm_final_pair(ctx: &egui::Context) -> (AppTestEnvForTest, [FinalCompositeKey; 2]) {
     let mut app = pdf_book(ctx);
     let keys = [retain_pdf_ai(&mut app, 21), retain_pdf_ai(&mut app, 0)];
     for _ in 0..2 {
@@ -19,7 +19,7 @@ fn warm_final_pair(ctx: &egui::Context) -> (AppTestEnvForTest, [FinalCompositeKe
     (app, keys)
 }
 
-fn evict_pair_cpu(app: &mut App) {
+pub(crate) fn evict_pair_cpu(app: &mut App) {
     app.settings.retained_final_ai_cache_max_entries = 1;
     retain_pdf_ai(app, 10);
     assert!(!app.has_retained_pdf_final_ai_for_current_params(0));
@@ -80,7 +80,7 @@ fn composite_pixels_revision_final_pair_navigation_capture_survives_retained_cpu
     assert!(app.final_effect_pending.is_empty());
 }
 
-fn seed_annotation(app: &mut App, source_dims: [usize; 2]) {
+pub(crate) fn seed_annotation(app: &mut App, source_dims: [usize; 2]) {
     // A filled bubble needs no font or stamp I/O, but uses the real annotation compositor.
     app.comic_font_registry_loaded = true;
     app.comic_fonts_loaded = true;
@@ -110,7 +110,7 @@ fn seed_annotation(app: &mut App, source_dims: [usize; 2]) {
     );
 }
 
-fn complete_comic(app: &mut App, ctx: &egui::Context) -> Arc<egui::ColorImage> {
+pub(crate) fn complete_comic(app: &mut App, ctx: &egui::Context) -> Arc<egui::ColorImage> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while !app.comic_bake_pending.is_empty() {
         app.poll_comic_bake(ctx);

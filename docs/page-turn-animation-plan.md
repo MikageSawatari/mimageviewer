@@ -2446,3 +2446,123 @@ PE3 binary検査までexit0。coreは2026-10-14 04:18:14、325,590,016 bytes、F
 test-full -SuppressCrashDialogsをjobs1/threads8で一回実行しexit0（PASS）。本体12,422成功/
 既存57ignored、UI snapshot163、vendor egui25・egui-wgpu11・eframe18も成功した。
 コマンド/ログ/隔離確認手順は`target/A-1341-automatic-input-msg.txt`を参照する。
+
+### 26.14 完成素材だけで表示するページの操作契約（2026-10-14）
+
+f33a93bb8の再レビューは、PDFサムネイル寸法を注釈座標に使う経路と、Ctrl+Eが元画像
+キャッシュ必須のまま残る経路をP2として指摘した。Retainedから先読みした完成素材は
+元画像キャッシュなしでも正規の表示素材であり、Retained CPU LRU退去後もこの契約を保つ。
+入口を個別に回避せず、表示素材・正準寸法・元画素をそれぞれ必要とする操作として揃える。
+
+`PagePixelDimensions`でThumbnailとCanonicalを区別する。PDFの小さいサムネイルrasterは
+形状判定だけに使い、正準座標へ昇格させない。PDF page boxも独立のlayout単位のままとする。
+正準寸法は元画像取得時点の回転前寸法（GPU縮小前）から保持し、完成素材まで渡す。
+AI出力寸法や縮小されたedit canvasの寸法から推測しない。正準寸法resolverを注釈・書き出し・
+各種座標参照で共有する。Thumbnailの後着でCanonicalを上書きせず、items世代が違う値は使わない。
+
+| 表示ページへの入口 | 必要素材・既存経路 |
+| --- | --- |
+| コピー、単頁／見開き／領域キャプチャ | 完成合成CPU画素を直接取得。元画素の再ロード不要。 |
+| 注釈の表示・焼込み・テキスト／吹き出し編集 | 完成素材と正準寸法。サムネイル寸法を座標に使わない。 |
+| Ctrl+E／SNS書き出し | UIは正準寸法と編集snapshot。元ファイルのdecodeは既存書き出しworker。 |
+| 保存消しゴム／局所補正を伴う書き出しの準備 | 従来のcommit／layer準備gateを維持。不足する元画素は通常ロード。§1.177の準備worker化は別件。 |
+| 外部ツールへの加工画像転送 | 正準寸法とsnapshot、既存materializer workerがdecode。 |
+| メタ情報表示 | 既存metadata worker。画像キャッシュを要求しない。 |
+| AI設定変更・再合成 | 既存最終合成pipeline。再生成に元画素が必要なら既存source loaderへ要求。完成素材を元画像として代用しない。 |
+| 消しゴム入場／保存マスク再適用、FsApplyErase1/2（F7/F8） | 元画素が必要。入場・slot適用要求をロードpurposeへ保持し、取得後に同じ入口を一度実行。 |
+| FsApplyConceal1/2（F9/F10）、マスク削除 | 保存済みslot／設定の変更は元画素不要。変更後の再合成に必要な原素材だけを既存pipelineから要求。 |
+| 隠蔽加工入場 | 現在keyの局所補正／消しゴム結果があればその編集段を使用。完成表示を編集入力に代用せず、不足時だけ元画素を取得して従来の編集段とmaterializerへ接続。 |
+| 局所補正入場・再計算 | 現在keyの消しゴム結果、または原素材が入力。段の素材が不足する場合だけ元画素を取得。単回入場のintentと既存layer materializationを維持。 |
+| 消しゴム／隠蔽／局所補正の左右頁切替 | 切替先の原素材・必要な編集段、隠蔽はマスク取得も完了するまで旧mode／target／pair／maskを保持。既存source／inpaint／materializerのpurposeへtyped switch intentを渡し、準備完了時だけ旧頁を確定して一度切替。 |
+| 回転 | 既存rotation設定とtransform。完成素材で操作可能。 |
+| 手動クロップ、SNS分割 | 正準寸法と完成表示。元画素の再ロード不要。 |
+| 自動クロップ、余白fit／自動表示trim | 検出は元画素。常時Autoは取得後に通常描画で再評価。明示「自動検出」／Auto→Manualの頁seedは同purposeに操作を保持し、見開き両頁が揃ってから一度確定。未取得を「余白なし」やゼロseedとしない。手動bboxは保存値から解決し、元画素不要。 |
+| 原画像preview、分析・色取得 | 元画素。既存mode／キー状態のまま取得を要求し、完成画像を原画像として提示しない。 |
+| 比較wipe／差分、pan／zoom／navigator、ルーペ | 完成素材と正準寸法。原画像比較を選んだ場合だけ元画素が必要。 |
+| ドラッグ書き出し | 現実装はgridの既存file pathのnative drag。表示合成の画素をドラッグ書き出す別入口はない。仮想頁の既存拒否契約を維持。 |
+| PDF指定倍率・最大倍率 | page box／content typeと正準寸法を使う既存倍率policy。元画像キャッシュの生存を寸法条件にしない。 |
+
+元画素が必要な操作は既存`FsLoadPurpose`へOriginalと開始操作を加え、同じfs pending／
+upload backlog／schedulerで所有する。別pending、queue、boolは増やさない。単にロードして
+returnすると再クリックが必要になるため、入場intentは要求時のnavigation anchorとともに保持する。
+末尾＋補助表紙ではanchorと実source targetが異なる。完了時は同context／世代、現在anchorと
+再解決した編集targetを確認してから元の入口を実行する。navigation／close／cancel／別入口選択で
+古いintentを適用しない。同じidxの不足要求は既存要求へ合流し、workerを重複発行しない。
+
+左右切替のintentはfrom／target／元pairを一つの型で保持し、先にtargetを切り替えてから
+準備待ちにしない。消しゴムで旧マスクの保存先だけが新頁になる経路や、隠蔽のmodeを先に
+落として通常reconcileが旧pivotへ戻る経路を排除する。必要なmaterializerまで同intentを渡し、
+全準備完了時に同じpassで旧頁の確定／新頁へのpivot／編集素材の採用を行う。失敗・取消は
+旧編集状態を保つ。同keyの通常Display要求が専用Switchを置換せず、mode終了・同頁再入でも
+古いSwitchを復活させない。Text／手動Crop／SNSの左右切替は正準寸法で進む既存経路を維持する。
+
+materializerへの通常Display合流では、worker返信の素材identityと操作継続を既存のtyped
+request内で区別する。items世代・投入時input_seq・source key・output contractを照合し、
+待機中の操作で変わるglobal input_seqそのものは採用条件にしない。取消は通常Displayの
+採用契約へ戻す。隠蔽のDisplay合成と編集mask取得は別output contractなので、同素材でも
+一つの返信へ読み替えず、通常合成の採用後に専用mask準備を要求する。通常採用の失効契約を
+維持し、cold Switchの素材準備だけ完成表示を保つ。
+
+保存消しゴムがあり中間結果も退去している場合、原素材の取得だけでは局所補正／隠蔽の
+編集入力は揃わない。既存inpaint jobのpurposeをPreview／Commit／素材準備と単回入口の
+継続へ型付けし、同じCommit laneで保存マスクから中間段を再準備する。保存マスクの取得も
+既存workerへ渡し、入口へ同期DB読取を追加しない。現在keyの中間段があれば再生成しない。
+自発の素材再準備は完成表示・注釈素材を保持し、既に通常Commitが進行している場合はその
+元の世代更新／invalidation契約を保持して操作だけ合流する。採用後は同じcontext／anchor／
+編集targetと操作の許可を確認して一度入場する。別操作・navigation・close・取消で継続を
+退役させる。これは新pendingや再クリック待ちを加える案より状態の組合せを少なくする。
+独立レビューは既存source／inpaint owner内の型付けとして構造合意した。
+
+Original取得は同sourceのmaterializationであり、reloadや編集変更ではない。成功／失敗で
+完成合成・注釈素材・表示keyを破棄せず、実編集の既存invalidationだけを後から行う。
+既に通常Display／Prefetchのreloadが進行している場合は、その既存要求へ操作intentだけを
+合流する。開始済みworkerのrender条件は変えられないため、通常reloadの採用・世代更新契約を
+Original materializationへ読み替えない。自分で発行した正準寸法でのOriginal取得だけを
+同sourceのmaterializationとして扱う。各操作の完了受付は元の入口に合わせ、表示トリムや
+閲覧中のslot適用へpixel編集mode専用の連結／独立window制限を拡張しない。
+表示トリムの正規化bboxは従来どおりRAW preview画素でも検出できる。これを消しゴムなどの
+正準画素編集許可へ読み替えない。見開きの取得完了callbackは同frameの全source採用後に行い、
+既にupload batchにある相方を未要求として重複ロードしない。
+PDFの通常display rerender demandでOriginal要求を取消・置換しない。RAW previewを編集許可へ
+昇格せず、RAWの既存develop gate、動画／animation、Remoteの既存契約は維持する。
+独立GPT-6.1 Sol/xhighの事前レビューはこの既存owner拡張を構造修正として合意した。
+失敗／取消では既存sourceロードの終端を利用する。未取消の受信切断も取得失敗として一度通知し、
+原画像preview／Auto表示から毎frameの再取得を繰り返さない。明示取消は通知せず、完成素材を保持する。
+Original取得中に変わったPDF absolute targetは実要求が可能になるまで発行済みとして記録しない。
+§1.242統合後に明示指定・構成優先配置との検証が要る（今回も統合検証しない）。
+
+### 26.15 完成素材の入口整合・検証記録
+
+通常／portable core check、fmt、glyph、viewer_context_auditが成功。元素材20、実操作入口25、
+完成CPU画素5、寸法13、先読み16、page_turn199、表示trim55の関連回帰が成功した。
+PDF thumbnail 160×240／正準1200×1800／edit canvas 4×6／完成8×12を分離し、
+実source capture→Retained→完成worker→CPU退去→注釈表示／export／captureまで検査した。
+Ctrl+Eは実dialog入口、外部ツールは実snapshot準備、native dragは既存path選択入口まで確認。
+原素材の単回操作、通常ロードへの合流、失敗／切断／取消、左右の完了順・同時完了、
+設定変更、既存RAW preview／表示trimとslot適用、実context mount往復の所有分離も回帰した。
+
+検証中に、AppTestEnvのprofile排他lockを二重取得するfixtureを修正した。二contextは
+一つのAppから実bundleをbuild／mountし、独立ケースはfixtureを順に解放する。
+表示readyの旧テストも、完成合成が残る状態をNeedsLoadとする旧前提を更新し、
+元画素が無くてもResidentFinalCompositeであることと、めくり開始／完走を維持して検査した。
+独立GPT-6.1 Sol/xhighの最終静的レビューはACCEPT、未解消P1/P2なし。
+test-fullはjobs1／threads8で一回実行した。本体12,462成功／2失敗／57ignoredでexit101。
+UI snapshot163とその他workspace targetは成功。vendor追加gateは本体失敗のため未実行。
+局所補正のpivot fixtureが原素材も編集段の素材も持たない点と、隠蔽入場が現在の消しゴム結果を
+持つ場合まで元画像取得を強制する点が見つかった。前者は実sourceをseedしてpivotのassertionを
+維持し、後者は適切な編集段があればそれを使う契約へ修正した。完成表示のCPU素材は編集段と
+異なるため、その代用は引き続き拒否する。Retained退去fixtureで局所補正／隠蔽への実入場と
+不要な再ロードがないことの回帰を追加した。全体gateの再実行は今回行わない。
+
+追加の独立レビューで左右切替の準備前pivotも見つけ、既存ownerのtyped Switchへ揃えた。
+原素材／保存消しゴムstage／隠蔽maskの取得中、旧mode・idx・pair・編集gestureを保持し、
+ready後の一回commit、失敗／取消／同頁再入、normal Display workerのready既着／input_seq進行後の
+合流と取消を実handlerの5回帰で確認した。stage素材完成後にrawを再退去しても切替が成立し、
+自発の再準備で完成表示・comicが保持されることも検査した。修正後の通常／portable checkと
+glyph／fmt／viewer_context_audit、上記関連回帰に加え旧失敗2件、inpaint10、erase52、
+local_adjust146、conceal80（既存1ignored）がすべて成功。最終の独立静的レビューもACCEPT、
+未解消P1/P2なし。test-only fixtureのtuple／ItemsGenerationMap参照の型誤りも修正済み。
+通常build-dev -PreserveRuntimeもexit0。core／Remote／EPUB workerを更新し、runtime4 DLL・
+PE3 binary検査が成功。coreは2026-10-14 07:44:07、325,638,656 bytes、FileVersion4.6.0.0。
+確認用coreの起動は検出されず、対象プロセスの停止・実アプリ起動・コミットは行っていない。
+コマンド／ログ／隔離確認手順は`target/A-1341-material-msg.txt`を参照する。
