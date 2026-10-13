@@ -462,6 +462,11 @@ Selectの受理時だけ `land_still_page_navigation_target` の `LatestSeek` �
 調整drag中は元のLoaded texture、それ以外は評価済みtextureを優先し、保存回転の確定値から
 寸法とUVを解く。描画でDB読取、補正texture生成、GPU upload、元画像decodeを始めない。
 回転は§1.6の既存workerを使い、未確定値を0°と推測しない。
+一覧のactive需要dispatcherはconsumer適格性を確認した後、同contextの既存回転workerの
+完了を`poll_still_seek_rotations`で回収してから要求・投影する。通常stripを描画しない一覧中も
+完了consumerを省略しない。Loaded済み／回転未確定は新規decodeではなく完了採用で解消する。
+通常ログ`[page-overview-demand]`はSurface経路、Admissionの型付き終了理由、
+requested／keep／表示可否と局所Pruneを記録し、同じAdmission観測の反復を抑える。
 passive投影は全実ページのimmutable metadataと可視近傍のtexture handleだけを保持し、
 resize／DPI変更後の新セルもmetadataからtargetを解決する。full-image textureを入場条件にしない。
 

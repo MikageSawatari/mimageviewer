@@ -541,6 +541,27 @@ enum ViewerForegroundThumbnailConsumer {
     Seek,
     PageOverview,
 }
+
+/// Admission diagnostics describe the actual priority producer's exit, not display guesses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PriorityThumbnailAdmission {
+    SidecarRestore,
+    AlreadyRequested,
+    MissingState,
+    Loaded,
+    NoArt,
+    Failed,
+    MissingMetadata,
+    NoLoadRequest,
+    MissingReloadQueue,
+    MissingHeavyQueue,
+    ReservationRejected,
+    Enqueued,
+    UnsupportedOverviewItem,
+    FrameBudget,
+    InactiveConsumer,
+    PrunedOutsideKeep,
+}
 #[cfg(test)]
 mod rar_archive_cache_tests;
 pub(crate) use facet_navigation::{FacetNavigationState, FacetRoute, FacetScope};
@@ -51697,6 +51718,14 @@ impl App {
             // Keep departure discards only images. A running source still owns its save terminal.
             self.requested.discard_images_outside(&self.keep_set);
             for (idx, request_id) in locally_canceled {
+                if self.page_overview.session().is_some() {
+                    crate::logger::log(format!(
+                        "[page-overview-demand] stage=Prune context={} items_generation={} idx={idx} request_id={request_id:?} reason={:?}",
+                        self.projected_viewer_context_id().serial(),
+                        self.items_generation,
+                        PriorityThumbnailAdmission::PrunedOutsideKeep
+                    ));
+                }
                 self.requested.cancel_queued(idx, request_id);
             }
         }
@@ -51892,7 +51921,22 @@ impl App {
     ) {
         let overview = consumer == ViewerForegroundThumbnailConsumer::PageOverview;
         if overview != self.page_overview.session().is_some() {
+            if overview {
+                self.trace_page_overview_thumbnail_demand(
+                    ctx,
+                    pages
+                        .iter()
+                        .map(|&idx| (idx, PriorityThumbnailAdmission::InactiveConsumer))
+                        .collect(),
+                );
+            }
             return;
+        }
+        if overview {
+            // The overview replaces the seek overlay, including its completion consumer.
+            // Drain this mounted owner's existing worker before restarting reads or projecting
+            // Loaded pixels; an unknown rotation must not remain a permanent placeholder.
+            self.poll_still_seek_rotations();
         }
         if pages.is_empty() {
             self.rotation_cache.cancel_still_seek_rotations();
@@ -51913,23 +51957,36 @@ impl App {
         }
         let enqueue_started = std::time::Instant::now();
         let mut new_requests = 0usize;
-        for idx in request_pages.iter().copied() {
+        let mut admissions = Vec::new();
+        for (offset, idx) in request_pages.iter().copied().enumerate() {
             if overview {
                 if !matches!(
                     self.items.get(idx),
                     Some(GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. })
                 ) {
+                    admissions.push((idx, PriorityThumbnailAdmission::UnsupportedOverviewItem));
                     continue;
                 }
                 if new_requests >= 32
                     || enqueue_started.elapsed() >= std::time::Duration::from_millis(2)
                 {
+                    admissions.extend(
+                        request_pages[offset..]
+                            .iter()
+                            .map(|&idx| (idx, PriorityThumbnailAdmission::FrameBudget)),
+                    );
                     break;
                 }
             }
             let existed = self.requested.contains_key(&idx);
-            self.enqueue_priority_thumbnail(idx);
+            let admission = self.enqueue_priority_thumbnail(idx);
+            if overview {
+                admissions.push((idx, admission));
+            }
             new_requests += usize::from(!existed && self.requested.contains_key(&idx));
+        }
+        if overview {
+            self.trace_page_overview_thumbnail_demand(ctx, admissions);
         }
         let pdf_keys = request_pages
             .iter()
@@ -51971,21 +52028,24 @@ impl App {
         self.enqueue_priority_thumbnail(idx);
     }
 
-    fn enqueue_priority_thumbnail(&mut self, idx: usize) {
+    fn enqueue_priority_thumbnail(&mut self, idx: usize) -> PriorityThumbnailAdmission {
         // The current items generation has no live thumbnail workers until the sidecar recovery
         // continuation creates fresh queues.  Enqueuing into the cancelled previous generation
         // would strand `requested[idx]` and prevent the first-display worker from retrying it.
         if self.sidecar_restore_active() {
-            return;
+            return PriorityThumbnailAdmission::SidecarRestore;
         }
         if self.requested.contains_key(&idx) {
-            return;
+            return PriorityThumbnailAdmission::AlreadyRequested;
         }
         let Some(state) = self.thumbnails.get(idx) else {
-            return;
+            return PriorityThumbnailAdmission::MissingState;
         };
-        if !matches!(state, ThumbnailState::Pending | ThumbnailState::Evicted) {
-            return;
+        match state {
+            ThumbnailState::Loaded { .. } => return PriorityThumbnailAdmission::Loaded,
+            ThumbnailState::NoArt => return PriorityThumbnailAdmission::NoArt,
+            ThumbnailState::Failed => return PriorityThumbnailAdmission::Failed,
+            ThumbnailState::Pending | ThumbnailState::Evicted => {}
         }
 
         let use_full_path_keys = self.use_full_path_cache_keys();
@@ -52008,7 +52068,7 @@ impl App {
                     matches!(self.items.get(idx), Some(GridItem::Audio(_))).then_some((0, 0))
                 })
             else {
-                return;
+                return PriorityThumbnailAdmission::MissingMetadata;
             };
             self.items.get(idx).and_then(|item| {
                 make_load_request_with_visibility(
@@ -52033,7 +52093,7 @@ impl App {
         };
 
         let Some(mut req) = req_opt else {
-            return;
+            return PriorityThumbnailAdmission::NoLoadRequest;
         };
         self.attach_edit_preview_to_request(&mut req);
         if !self.items_are_drive_list
@@ -52051,7 +52111,11 @@ impl App {
             self.reload_queue.clone()
         };
         let Some(queue_arc) = queue else {
-            return;
+            return if is_heavy {
+                PriorityThumbnailAdmission::MissingHeavyQueue
+            } else {
+                PriorityThumbnailAdmission::MissingReloadQueue
+            };
         };
         let edit_preview_epoch = self
             .edit_preview_cache
@@ -52063,7 +52127,7 @@ impl App {
             ThumbnailRequestKind::Normal,
             edit_preview_epoch,
         ) else {
-            return;
+            return PriorityThumbnailAdmission::ReservationRejected;
         };
         req.request_id = request_id;
         let (ref mtx, ref cvar) = *queue_arc;
@@ -52071,6 +52135,7 @@ impl App {
         q.push(req);
         drop(q);
         cvar.notify_one();
+        PriorityThumbnailAdmission::Enqueued
     }
 
     /// 段階 B: ページ単位先読み + eviction のメインロジック。

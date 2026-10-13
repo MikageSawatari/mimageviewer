@@ -6,6 +6,35 @@ use crate::ui_page_overview::{
     PageOverviewRenderInput, PageOverviewThumbnail, PageOverviewUiAction,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum OverviewSurfaceTrace {
+    ActiveDemand,
+    ReadonlyProjection,
+    PassiveProjection,
+}
+
+fn trace_overview_surface(
+    ctx: &egui::Context,
+    stamp: crate::page_overview::PageOverviewStamp,
+    route: OverviewSurfaceTrace,
+) {
+    let id = egui::Id::new(("overview-surface-trace", stamp.context_serial, route));
+    let changed = ctx.data_mut(|data| {
+        if data.get_temp::<crate::page_overview::PageOverviewStamp>(id) == Some(stamp) {
+            false
+        } else {
+            data.insert_temp(id, stamp);
+            true
+        }
+    });
+    if changed {
+        crate::logger::log(format!(
+            "[page-overview-demand] stage=Surface route={route:?} viewport={:?} stamp={stamp:?}",
+            ctx.viewport_id()
+        ));
+    }
+}
+
 fn page_overview_request_ordinals(
     layout: &crate::page_overview::PageOverviewLayout,
     anchor: crate::page_overview::PageOverviewScrollAnchor,
@@ -198,6 +227,11 @@ impl App {
     )> {
         use crate::app::DetachedPageOverviewInputProvenance::{Key, Pointer};
         let ctx = ui.ctx().clone();
+        trace_overview_surface(
+            &ctx,
+            overview.view.stamp,
+            OverviewSurfaceTrace::PassiveProjection,
+        );
         let ime = crate::ime_focus::ime_input_active(&ctx);
         let focused_text = crate::ime_focus::focused_text_input(&ctx);
         let owner = crate::keyboard_input::decide_keyboard_owner(
@@ -406,6 +440,11 @@ impl App {
         ui: &mut egui::Ui,
         view: &crate::page_overview::PageOverviewView,
     ) {
+        trace_overview_surface(
+            ui.ctx(),
+            view.stamp,
+            OverviewSurfaceTrace::ReadonlyProjection,
+        );
         let direction = self.page_overview_direction();
         let original = Self::page_overview_cached_layout(ui.ctx(), view);
         let effective_view = original.map(|original| {
@@ -869,6 +908,7 @@ impl App {
         let Some(view) = self.page_overview_view() else {
             return false;
         };
+        trace_overview_surface(&ctx, view.stamp, OverviewSurfaceTrace::ActiveDemand);
         let direction = self.page_overview_direction();
         let geometry = crate::ui_page_overview::page_overview_geometry(surface, &view, direction);
         self.reflow_page_overview_to_surface(&ctx, ctx.viewport_id(), surface);

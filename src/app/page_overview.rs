@@ -5,6 +5,29 @@ use crate::page_overview::{
     PageOverviewStamp, PageOverviewState, PageOverviewView,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OverviewThumbnailVisibility {
+    LoadedReady,
+    LoadedAwaitingRotation,
+    Pending,
+    Evicted,
+    Failed,
+    NoArt,
+    MissingState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OverviewThumbnailDemandTrace {
+    stamp: Option<PageOverviewStamp>,
+    pages: Vec<(
+        usize,
+        PriorityThumbnailAdmission,
+        bool,
+        bool,
+        OverviewThumbnailVisibility,
+    )>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PageOverviewCommand {
     Cancel {
@@ -57,6 +80,70 @@ impl PageOverviewCommand {
 }
 
 impl App {
+    /// Sparse normal-log diagnostics. The UI cache only suppresses identical observations;
+    /// it neither owns demand nor influences admission, cancellation, or worker completion.
+    pub(super) fn trace_page_overview_thumbnail_demand(
+        &self,
+        ctx: &egui::Context,
+        admissions: Vec<(usize, PriorityThumbnailAdmission)>,
+    ) {
+        let trace = OverviewThumbnailDemandTrace {
+            stamp: self.page_overview_view().map(|view| view.stamp),
+            pages: admissions
+                .into_iter()
+                .map(|(idx, admission)| {
+                    let visibility = match self.thumbnails.get(idx) {
+                        Some(ThumbnailState::Loaded { .. })
+                            if self.rotation_cache.contains_key(&idx) =>
+                        {
+                            OverviewThumbnailVisibility::LoadedReady
+                        }
+                        Some(ThumbnailState::Loaded { .. }) => {
+                            OverviewThumbnailVisibility::LoadedAwaitingRotation
+                        }
+                        Some(ThumbnailState::Pending) => OverviewThumbnailVisibility::Pending,
+                        Some(ThumbnailState::Evicted) => OverviewThumbnailVisibility::Evicted,
+                        Some(ThumbnailState::Failed) => OverviewThumbnailVisibility::Failed,
+                        Some(ThumbnailState::NoArt) => OverviewThumbnailVisibility::NoArt,
+                        None => OverviewThumbnailVisibility::MissingState,
+                    };
+                    (
+                        idx,
+                        admission,
+                        self.requested.contains_key(&idx),
+                        self.keep_set.contains(&idx),
+                        visibility,
+                    )
+                })
+                .collect(),
+        };
+        let id = egui::Id::new((
+            "overview-demand-trace",
+            self.projected_viewer_context_id().serial(),
+        ));
+        let changed = ctx.data_mut(|data| {
+            if data.get_temp::<OverviewThumbnailDemandTrace>(id).as_ref() == Some(&trace) {
+                false
+            } else {
+                data.insert_temp(id, trace.clone());
+                true
+            }
+        });
+        if changed {
+            let line = format!(
+                "[page-overview-demand] stage=Admission context={} viewport={:?} items_generation={} stamp={:?} page_tuple=(idx,reason,requested,kept,visibility) pages={:?}",
+                self.projected_viewer_context_id().serial(),
+                ctx.viewport_id(),
+                self.items_generation,
+                trace.stamp,
+                trace.pages
+            );
+            crate::logger::log(&line);
+            #[cfg(test)]
+            eprintln!("{line}");
+        }
+    }
+
     /// All entry points preserve the existing exclusive mode/picker owner.
     /// A refusal never commits a preview, drops a picker, or changes presentation.
     pub(crate) fn page_overview_unavailable_reason(&mut self) -> Option<&'static str> {

@@ -43,6 +43,130 @@ fn loaded_thumbnail(ctx: &egui::Context, name: &str) -> ThumbnailState {
     }
 }
 
+fn main_grid_to_overview_app(kind: &str, ctx: &egui::Context) -> AppTestEnvForTest {
+    let mut app = setup_thumbnail_app(40);
+    app.items = (0..40)
+        .map(|idx| match kind {
+            "image" => GridItem::Image(PathBuf::from(format!("C:/overview/book/p{idx:03}.jpg"))),
+            "zip" => GridItem::ZipImage {
+                zip_path: PathBuf::from("C:/overview/book.zip"),
+                entry_name: format!("p{idx:03}.jpg"),
+            },
+            "pdf" => GridItem::PdfPage {
+                pdf_path: PathBuf::from("C:/overview/book.pdf"),
+                page_num: idx as u32,
+                content_type: None,
+            },
+            _ => unreachable!(),
+        })
+        .collect();
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
+    app.settings.grid_cols = 4;
+    // The main grid painted twelve cells; source prefetch may already have loaded the rest.
+    // Rotation hydration belongs to the painted cells, independent of source pixels.
+    for idx in 0..12 {
+        app.thumbnails[idx] = loaded_thumbnail(ctx, &format!("main-grid-{kind}-{idx}"));
+        app.rotation_cache
+            .insert(idx, crate::rotation_db::Rotation::None);
+    }
+    install_overview_demand(&mut app);
+    app.page_overview.close();
+    app.viewer_presentation = ViewerPresentation::Fullscreen;
+    assert!(app.open_page_overview(
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200., 900.)),
+        Default::default(),
+    ));
+    app
+}
+
+fn draw_overview_frame(app: &mut App, ctx: &egui::Context) {
+    // Each test frame has one renderer pass, so a fast worker cannot be drained by an
+    // implicit egui discard pass before the explicit completion-wait checkpoint.
+    ctx.options_mut(|options| options.max_passes = 1.try_into().unwrap());
+    let _ = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200., 900.),
+            )),
+            ..Default::default()
+        },
+        |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| {
+                    app.render_page_overview_surface(ui, ui.max_rect());
+                });
+        },
+    );
+}
+
+#[test]
+fn overview_main_grid_prefetched_pixels_complete_rotation_without_seek_overlay() {
+    let mut results = Vec::new();
+    for kind in ["image", "zip", "pdf"] {
+        let ctx = egui::Context::default();
+        let mut app = main_grid_to_overview_app(kind, &ctx);
+        for idx in 12..40 {
+            app.thumbnails[idx] = loaded_thumbnail(&ctx, &format!("prefetched-{kind}-{idx}"));
+        }
+        draw_overview_frame(&mut app, &ctx);
+        assert!(
+            app.requested.is_empty(),
+            "loaded pixels must not be redundantly decoded"
+        );
+        assert!(
+            !app.page_overview_thumbnail_projection(&[12, 39])
+                .contains_key(&12)
+        );
+        app.rotation_cache.wait_for_result_for_test();
+        // This is the real overview frame path, never a manual rotation poll/strip draw.
+        draw_overview_frame(&mut app, &ctx);
+        let visible = app.page_overview_thumbnail_projection(&[12, 39]);
+        results.push((kind, visible.contains_key(&12), visible.contains_key(&39)));
+        assert!(app.requested.is_empty());
+    }
+    assert_eq!(
+        results,
+        vec![
+            ("image", true, true),
+            ("zip", true, true),
+            ("pdf", true, true)
+        ],
+        "completed rotations must be drained by the real overview path"
+    );
+}
+
+#[test]
+fn overview_main_grid_partial_load_enqueues_later_pages_on_real_surface() {
+    let ctx = egui::Context::default();
+    for kind in ["image", "zip", "pdf"] {
+        for state in [ThumbnailState::Pending, ThumbnailState::Evicted] {
+            let mut app = main_grid_to_overview_app(kind, &ctx);
+            app.thumbnails[12..].fill(state.clone());
+            for _ in 0..40 {
+                draw_overview_frame(&mut app, &ctx);
+                app.update_thumbnail_frame_bookkeeping(&ctx, std::time::Instant::now());
+                if (12..40).all(|idx| app.requested.contains_key(&idx)) {
+                    break;
+                }
+            }
+            assert!(
+                (12..40).all(|idx| app.requested.contains_key(&idx)),
+                "{kind}: pages 13-40 must be requested"
+            );
+            assert!((0..12).all(|idx| !app.requested.contains_key(&idx)));
+            let queue = app.reload_queue.as_ref().unwrap().0.lock().unwrap();
+            assert_eq!(queue.len(), 28, "{kind}: one reservation per later page");
+            assert!(
+                queue
+                    .iter()
+                    .all(|request| request.priority && app.keep_set.contains(&request.idx))
+            );
+        }
+    }
+}
+
 fn install_overview_demand(app: &mut App) {
     use crate::page_overview::{
         PageOverviewDirection, PageOverviewProjection, PageOverviewStamp, PageOverviewState,

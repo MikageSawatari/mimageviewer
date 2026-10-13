@@ -1112,3 +1112,98 @@ Light／Dark親で一覧が暗色のままであること、狭幅・RTL・白�
 通常profile／共有mutexの注意を継承する。Lightテーマで通常fullscreen／メイン内閲覧と
 detachedのO一覧を開き、黒ベース・広い窓での初期8列・＋／Ctrl+wheelで最大20列・
 小窓での実効列制限を確認する。取消後もメインがLightのままであることを確認対象に加える。
+
+## 22. 一覧の「未生成」が残る不具合（2026-10-13）
+
+### 22.1 観測・修正前の確定
+
+利用者／ClaudeCodeが`503e33d7b`の確認用coreを隔離`G:/miv-iso/tile/data`で操作した。
+JPEG40枚の画像フォルダとSTORED ZIPで、mainの4列×3行に見えていた1〜12ページだけが
+O一覧でも表示され、13〜40ページは20秒待機・mouse再描画・scroll後も「未生成」のまま。
+提供ログを読み取り確認したところ、114.745秒からmain先読みが13〜40ページをdecodeし、
+114.775秒までに40ページのtextureをpoll済みである。117.467秒にfullscreenへ移り、
+120.895秒のO以降は新しいload／poll_thumbnailsがない。従って「未生成」は新規decodeの
+停止だけを意味せず、既存Loadedの投影条件も調べる必要がある。
+
+修正を入れる前にpriority producerの全early returnを`PriorityThumbnailAdmission`で分類し、
+通常の非blocking loggerへ`[page-overview-demand]`を出す計装を追加した。
+Surfaceは`ActiveDemand`／`ReadonlyProjection`／`PassiveProjection`を識別する。
+Admissionはcontext・viewport・items generation・overview stampと
+`(idx, reason, requested, kept, visibility)`を記録する。同じ観測はeguiの診断cacheで抑制し、
+cacheを受付・取消・完了採用の判定に使わない。局所queue取消は`PrunedOutsideKeep`で記録する。
+`LoadedReady`／`LoadedAwaitingRotation`を分け、requested済み・state終端・metadata不足・
+queue不足・予約拒否・consumer不一致・frame予算・unsupported種別も型付き理由で区別する。
+
+headlessで実際の`render_page_overview_surface`を呼び、mainで12セルだけ回転が既知、
+残りは画像先読み済みの40ページ状態からfullscreen→通常の`open_page_overview`へ進めた。
+修正前ログはidx12〜39（13〜40ページ）が`Loaded, requested=false, kept=true,
+LoadedAwaitingRotation`。既存workerの完了をtest側で待った後も、**manual pollやstrip描画を
+挟まない**次のoverview frameでidx12／39が投影されず、画像／ZIP／PDFの3種類ともfalseだった。
+別の回帰はmainで1〜12だけLoaded、13〜40がPending／Evictedの各状態から実surfaceを描画し、
+3種類×2状態すべてで後半28ページのpriority要求がkeep内に残ることを確認した。
+
+修正前gateは2 tests中1 passed／1 failed（想定したred）。証拠は
+`target/tile-overview-admission-repro.log`。**実機で新計装を動かしたログは未取得**であり、
+今回の状態ログは同じproduction producer／rendererを通したheadless実験である。
+提供実機ログの全ページ先読み・可視12セルという境目と、この確定した欠陥が整合する。
+
+### 22.2 根因・契約の復元
+
+既存`poll_still_seek_rotations`の唯一のproduction callerは通常seek overlayの描画だった。
+overviewは自分のrenderer後にreturnしてoverlayを通らないが、`start_still_seek_rotations`と
+回転値を必須にするLoaded投影を使っている。このproducer／consumerの接続漏れにより、
+workerが正常完了しても結果が同contextのRotationCacheへ採用されない。
+pendingの同一要求dedupが正しく働くため、新しいreadにもならずplaceholderが残る。
+
+修正は共通foreground dispatcherで、overview consumerの適格性を確認した後、
+既存の同context `poll_still_seek_rotations`をrequest／rotation start／投影より前に呼ぶだけである。
+pollはtry_recvと世代照合、現在cache優先のメモリ採用であり、新規FS／DB I/OをUIに追加しない。
+第二worker owner・新規pending・force decode・0°の仮定・追加repaint loopを作らず、
+readonly／passiveは引き続き投影のみとする。close／park／fork／swap／世代取消を変更しない。
+既存契約の復元として独立Sol/xhighの根因／修正設計レビューはACCEPT。
+
+従来のownership fixtureはDetails／全Pendingとfake queueで`ensure_page_overview_requests`を
+直接呼び、新規要求の寿命だけを検査していた。rotation回帰は手動pollまたはstripの描画経路を
+使っており、「main先読みLoaded・回転は可視12セルのみ既知→overviewだけ描画」の
+producer／consumer組合せが欠けていた。今回の2回帰はこの差を埋め、Pending／Evictedの
+後半要求には通常のframe bookkeeping／keep-pruneも通す。
+
+### 22.3 検証・引き渡し
+
+| 検証 | 実数／結果 |
+| --- | --- |
+| lib `overview`（`pack-build-tools`） | 88 passed、0 failed／ignored。新規2回帰を含む |
+| lib `still_seek_thumbnail_ownership`（同feature） | 23 passed、0 failed／ignored |
+| lib `still_seek_rotation`（同feature） | 16 passed、0 failed、既存ignored 1 |
+| lib `viewer_context`（同feature） | 106 passed、0 failed／ignored |
+| `viewer_context_audit` | exit 0、違反0。登録／例外変更なし |
+| `cargo fmt --check`／`git diff --check` | 成功 |
+| 通常／portable core `cargo check` | 各成功（53.23秒／46.29秒） |
+| `check_ui_glyphs.py` | 危険glyph 0 |
+| 独立根因・修正設計／完了レビュー（Sol/xhigh） | 各ACCEPT、P1／P2／P3なし |
+| `build-dev.ps1 -PreserveRuntime` | 成功。通常feature／非portable。core 4分13秒、Remote 0.37秒、EPUB worker 0.33秒。ランタイム4／PE3の検査成功 |
+
+各test filterは一部重なるため上記件数を合算してunique test数としない。
+新回帰のframe helperだけ`max_passes=1`として、eguiのimplicit discard passが高速workerを
+明示の完了待ちcheckpointより前に採用し得るtest側の競合を除いた。productionのpass設定は変更しない。
+このtest-only補完も独立レビューACCEPTで、overview filterを再確認する。
+最終の再確認も88 passed、0 failed／ignored（6.89秒）。
+gateログは`target/tile-overview-admission-*.log`、修正前redは`*-repro.log`へ保持する。
+buildのstdout／stderrは`target/tile-overview-admission-build-dev.{stdout,stderr}.log`。
+変更7ファイル（Rust4、docs3）。test-full／release buildの再実行は0回。
+
+製品の起動とgit add／commitは行わない。今回の修正は見た目／キー／保存設定を変更せず、
+PNG／マニュアル／CHANGELOG／バージョン表記の更新は不要。実機での採用確認は利用者が行う。
+
+利用者は古い確認用coreを終了し、同じ隔離環境で次を手動実行する（agentは起動しない）:
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe -ArgumentList '--data-dir', 'G:\miv-iso\tile\data'
+```
+
+`--data-dir`を省略すると通常の`%APPDATA%/mimageviewer` profileを使用し、実設定／dataを更新し得る。
+通常profileを使う場合はinstalled／tray常駐版を先に閉じ、共有single-instance mutexに注意する。
+同じ画像フォルダ／ZIPのmainページ一覧→1ページ目fullscreen→O、PDFのOでも、
+13〜40ページの画像が表示されることと、scroll先がplaceholderのまま残らないことを確認する。
+先読みLoadedは`LoadedAwaitingRotation`から`LoadedReady`へ、新規Pending／Evictedは
+`Enqueued`／`AlreadyRequested`からLoadedへ進む。loggerのidxは0基点（12が13ページ目）。

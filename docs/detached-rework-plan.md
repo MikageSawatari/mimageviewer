@@ -1455,6 +1455,18 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-13 §1.340: 一覧中の回転完了consumer接続漏れ
+
+`503e33d7b`の利用者／ClaudeCode実機報告を、型付き需要計装と修正前headless rendererで調査。
+画像／ZIP／PDFとも、Loadedだが回転未確定のページがworker完了後もplaceholderになる回帰を確認した。
+唯一のproduction pollが一覧中に通らないstrip描画にあり、一覧のstart／投影に完了採用が欠けていた。
+R5の双方合意済みcontext-local worker／consumer契約へ戻す修正として、独立Sol/xhighの
+限定根因／修正設計レビューはACCEPT。同じ需要dispatcherのconsumer適格性確認後に既存pollを接続する。
+第二owner／状態field／force reload／追加repaint loopは作らず、passive／readonlyの投影、
+park／close／fork／swap／世代取消、detached述語・viewport・HWND・placementは変更しない。
+実機の新しい計装ログによる再確認は利用者が行う。証拠・回帰・検証結果は
+[一覧設計書§22](detached-book-page-overview-plan.md#22-一覧の未生成が残る不具合2026-10-13)に記録する。
+
 ### 2026-10-12 §1.340 R5: 双方の構造合意と実装開始
 
 利用者が提示した独立レビュー結果は `a3bb1775b` **ACCEPT（P1/P2/P3なし）**。
