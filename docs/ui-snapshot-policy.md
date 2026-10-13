@@ -130,6 +130,19 @@ Device / Renderer は独立し、並列性と画像比較は維持する。非 W
 
 ### 3. サイズは固定
 
+高さを計算で決めるパネル・popup・メニューでは、`item_spacing`・separator・padding・
+Frame の margin を式へ含めるか、該当する間隔を 0 にする。`show_rows` の引数は
+spacing を含まない行高であり、Grid が gap 込みの slot を所有する場合は親の縦 spacing を 0 にする。
+折り返す本文は固定の行数だけで高さを見積もらない。
+
+`tests/support/scroll_layout.rs` の共通 helper（lib は `crate::test_ui::scroll_layout`、
+integration は `test_ui::scroll_layout`）で、十分な高さでは `HeightExpectation::Fits` により
+`content_size.y <= inner_rect.height()`（丸め許容は1物理pixel）・offset 0 を検査する。
+高さ不足では `HeightExpectation::Scrolls` と、実際の wheel 等の入力後の
+`assert_scrolled_to_end` で末尾の到達性を検査する。screen/panel 内の viewport も併せて検査する。
+採取値は最終描画 pass の `ScrollAreaOutput` を使い、offset を直接書き換えて成功扱いにしない。
+**snapshot は見た目の記録であり、スクロールの要否の検査にはならない。**
+
 デフォルトは 480 × 360 px。理由:
 
 - サイズ可変だと差分検出が過敏になる (描画誤差の累積)

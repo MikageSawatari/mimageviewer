@@ -46056,7 +46056,9 @@ impl App {
                 + 2 * crate::settings::SingletonSpreadPlacementPreference::all().len()
                 + 2 * crate::settings::PageAlonePreference::all().len()
                 + 2;
-            let popup_content_h = 8.0 + 7.0 * 28.0 + popup_row_count as f32 * 36.0;
+            // Eight headings: composition, flow, direction, final cover,
+            // first/last singleton placement, and after-cover/last page alone.
+            let popup_content_h = 8.0 + 8.0 * 28.0 + popup_row_count as f32 * 36.0;
             let popup_h = popup_content_h
                 .min((ctx.available_rect().bottom() - popup_y - BAR_POPUP_SCREEN_MARGIN).max(1.0));
             let popup_rect = egui::Rect::from_min_size(
@@ -58325,6 +58327,7 @@ mod tests {
     struct SpreadPopupTestState {
         open: bool,
         extracted_result: bool,
+        composition_owned: bool,
         spread_mode: SpreadMode,
         reading_flow: ReadingFlow,
         reading_direction: ReadingDirection,
@@ -58338,6 +58341,7 @@ mod tests {
             Self {
                 open: true,
                 extracted_result: false,
+                composition_owned: false,
                 spread_mode: SpreadMode::Ltr,
                 reading_flow: ReadingFlow::Paged,
                 reading_direction: ReadingDirection::Ltr,
@@ -58345,6 +58349,73 @@ mod tests {
                 singleton_preference: crate::settings::SingletonSpreadEndpointPreferences::default(
                 ),
                 page_alone_preferences: crate::settings::PageAlonePreferences::default(),
+            }
+        }
+    }
+
+    #[test]
+    fn calculated_spread_popup_height_matches_real_rows() {
+        use crate::test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
+        for (extracted_result, composition_owned) in [(false, false), (true, false), (false, true)]
+        {
+            for height in [1800.0, 260.0] {
+                let ctx = egui::Context::default();
+                crate::ui_fonts::configure_fonts(&ctx);
+                let viewport =
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, height));
+                let mut state = SpreadPopupTestState {
+                    extracted_result,
+                    composition_owned,
+                    ..Default::default()
+                };
+                let target = crate::settings::SingletonSpreadPlacementPreference::FollowGlobal;
+                let read = || {
+                    let (_, offset, inner, content): (
+                        egui::Id,
+                        egui::Vec2,
+                        egui::Rect,
+                        egui::Vec2,
+                    ) = ctx.data(|data| {
+                        data.get_temp(egui::Id::new("fs_spread_popup_scroll_test_output"))
+                            .unwrap()
+                    });
+                    ScrollLayout {
+                        inner,
+                        content,
+                        offset,
+                    }
+                };
+                for _ in 0..4 {
+                    spread_popup_test_frame(&ctx, viewport, vec![], &mut state, target);
+                }
+                let before = read();
+                before.assert_height(
+                    if height > 1000.0 {
+                        HeightExpectation::Fits
+                    } else {
+                        HeightExpectation::Scrolls
+                    },
+                    viewport,
+                    ctx.pixels_per_point(),
+                );
+                if height < 1000.0 {
+                    for frame in 0..40 {
+                        let events = if frame == 0 {
+                            vec![
+                                egui::Event::PointerMoved(before.inner.center()),
+                                egui::Event::MouseWheel {
+                                    unit: egui::MouseWheelUnit::Point,
+                                    delta: egui::vec2(0.0, -4000.0),
+                                    modifiers: egui::Modifiers::NONE,
+                                },
+                            ]
+                        } else {
+                            vec![]
+                        };
+                        spread_popup_test_frame(&ctx, viewport, events, &mut state, target);
+                    }
+                    read().assert_scrolled_to_end(before, ctx.pixels_per_point());
+                }
             }
         }
     }
@@ -58419,7 +58490,7 @@ mod tests {
                         &mut panorama_projection_popup_open,
                         &mut panorama_projection_choice,
                         state.extracted_result,
-                        false,
+                        state.composition_owned,
                         &mut state.spread_mode,
                         &mut state.reading_flow,
                         &mut state.reading_direction,
@@ -58962,80 +59033,194 @@ mod tests {
         );
     }
 
-    fn snapshot_fullscreen_overflow_panel(name: &str, state: FsOverflowPanelState) {
-        let mut fonts_ready = false;
-        let mut harness = crate::test_ui::builder()
-            .with_size(egui::vec2(720.0, 440.0))
-            .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
-                    .show(ctx, |ui| {
-                        let root_rows = vec![
-                            FsOverflowPanelRow {
-                                item: FullscreenOverflowItemId::SpreadAdjustment,
-                                label: "見開きの調整".into(),
-                                status: "調整なし  >".into(),
-                                enabled: true,
-                                disabled_reason: None,
-                            },
-                            FsOverflowPanelRow {
-                                item: FullscreenOverflowItemId::NavigatorToggle,
-                                label: "ナビゲータ [Alt+N]".to_string(),
-                                status: "ON".to_string(),
-                                enabled: true,
-                                disabled_reason: None,
-                            },
-                            FsOverflowPanelRow {
-                                item: FullscreenOverflowItemId::NavigatorPosition,
-                                label: "ナビゲータ位置".to_string(),
-                                status: "右下  >".to_string(),
-                                enabled: true,
-                                disabled_reason: None,
-                            },
-                            FsOverflowPanelRow {
-                                item: FullscreenOverflowItemId::ImageAnalysis,
-                                label: "分析ツール [Shift+Z]".to_string(),
-                                status: "OFF".to_string(),
-                                enabled: false,
-                                disabled_reason: Some(
-                                    "分析ツールは見開きの2ページ表示中は使えません",
-                                ),
-                            },
-                            FsOverflowPanelRow {
-                                item: FullscreenOverflowItemId::PixelGrid,
-                                label: "ピクセルグリッド [G]".to_string(),
-                                status: "ON".to_string(),
-                                enabled: true,
-                                disabled_reason: None,
-                            },
-                            FsOverflowPanelRow {
-                                item: FullscreenOverflowItemId::LoupeLock,
-                                label: "ルーペ固定 [M]".to_string(),
-                                status: "OFF".to_string(),
-                                enabled: true,
-                                disabled_reason: None,
-                            },
-                        ];
-                        let view = FsOverflowPanelView {
-                            state,
-                            root_rows,
-                            navigator_corner: FullscreenNavigatorCorner::BottomRight,
-                            shift: Default::default(),
-                            composition_available: true,
-                            composition_managed: false,
-                        };
-                        let panel_rect = fs_overflow_panel_rect(ui.max_rect(), state).unwrap();
-                        let _ = draw_fs_overflow_panel_surface(ui, panel_rect, &view);
+    #[test]
+    fn calculated_overflow_panel_height_matches_all_states_and_scrolls_when_constrained() {
+        use crate::test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
+        for state in [
+            FsOverflowPanelState::Root,
+            FsOverflowPanelState::NavigatorPosition,
+            FsOverflowPanelState::SpreadAdjustment,
+        ] {
+            for size in [egui::vec2(1200.0, 800.0), egui::vec2(320.0, 200.0)] {
+                let ctx = egui::Context::default();
+                crate::ui_fonts::configure_fonts(&ctx);
+                let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                let panel = fs_overflow_panel_rect(viewport, state).unwrap();
+                let view = FsOverflowPanelView {
+                    state,
+                    root_rows: FullscreenOverflowItemId::fixed_order()
+                        .iter()
+                        .map(|&item| FsOverflowPanelRow {
+                            item,
+                            label: "機能名 [Alt+N]".into(),
+                            status: "ON >".into(),
+                            enabled: true,
+                            disabled_reason: None,
+                        })
+                        .collect(),
+                    navigator_corner: FullscreenNavigatorCorner::BottomRight,
+                    shift: SpreadShiftHudView {
+                        status: "保存した基点が現在の一覧にありません".into(),
+                        anchor: "基点: chapter/003.jpg（現在の一覧外）".into(),
+                        enabled: true,
+                        memory: true,
+                        clear_enabled: true,
+                        ..Default::default()
+                    },
+                    composition_available: true,
+                    composition_managed: true,
+                };
+                let draw = |events| {
+                    let _ = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(viewport),
+                            events,
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default().frame(egui::Frame::NONE).show(
+                                ctx,
+                                |ui| {
+                                    let _ = draw_fs_overflow_panel_surface(ui, panel, &view);
+                                },
+                            );
+                        },
+                    );
+                    let (inner, content, offset) = ctx.data(|data| {
+                        data.get_temp(egui::Id::new("fs_overflow_scroll_test_layout"))
+                            .unwrap()
                     });
-            });
+                    ScrollLayout {
+                        inner,
+                        content,
+                        offset,
+                    }
+                };
+                let mut before = draw(vec![]);
+                for _ in 0..3 {
+                    before = draw(vec![]);
+                }
+                before.assert_height(
+                    if size.y > 400.0 {
+                        HeightExpectation::Fits
+                    } else {
+                        HeightExpectation::Scrolls
+                    },
+                    panel.intersect(viewport),
+                    ctx.pixels_per_point(),
+                );
+                if size.y < 400.0 {
+                    let mut after = before;
+                    for frame in 0..40 {
+                        after = draw(if frame == 0 {
+                            vec![
+                                egui::Event::PointerMoved(before.inner.center()),
+                                egui::Event::MouseWheel {
+                                    unit: egui::MouseWheelUnit::Point,
+                                    delta: egui::vec2(0.0, -4000.0),
+                                    modifiers: egui::Modifiers::NONE,
+                                },
+                            ]
+                        } else {
+                            vec![]
+                        });
+                    }
+                    after.assert_scrolled_to_end(before, ctx.pixels_per_point());
+                }
+            }
+        }
+    }
+
+    fn snapshot_fullscreen_overflow_panel(
+        name: &str,
+        state: FsOverflowPanelState,
+        size: egui::Vec2,
+    ) {
+        let mut fonts_ready = false;
+        let mut harness = crate::test_ui::builder().with_size(size).build(move |ctx| {
+            crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+            if !fonts_ready {
+                crate::ui_fonts::configure_fonts(ctx);
+                fonts_ready = true;
+                ctx.request_repaint();
+                return;
+            }
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
+                .show(ctx, |ui| {
+                    let root_rows = vec![
+                        FsOverflowPanelRow {
+                            item: FullscreenOverflowItemId::SpreadAdjustment,
+                            label: "見開きの調整".into(),
+                            status: "調整なし  >".into(),
+                            enabled: true,
+                            disabled_reason: None,
+                        },
+                        FsOverflowPanelRow {
+                            item: FullscreenOverflowItemId::NavigatorToggle,
+                            label: "ナビゲータ [Alt+N]".to_string(),
+                            status: "ON".to_string(),
+                            enabled: true,
+                            disabled_reason: None,
+                        },
+                        FsOverflowPanelRow {
+                            item: FullscreenOverflowItemId::NavigatorPosition,
+                            label: "ナビゲータ位置".to_string(),
+                            status: "右下  >".to_string(),
+                            enabled: true,
+                            disabled_reason: None,
+                        },
+                        FsOverflowPanelRow {
+                            item: FullscreenOverflowItemId::ImageAnalysis,
+                            label: "分析ツール [Shift+Z]".to_string(),
+                            status: "OFF".to_string(),
+                            enabled: false,
+                            disabled_reason: Some("分析ツールは見開きの2ページ表示中は使えません"),
+                        },
+                        FsOverflowPanelRow {
+                            item: FullscreenOverflowItemId::PixelGrid,
+                            label: "ピクセルグリッド [G]".to_string(),
+                            status: "ON".to_string(),
+                            enabled: true,
+                            disabled_reason: None,
+                        },
+                        FsOverflowPanelRow {
+                            item: FullscreenOverflowItemId::LoupeLock,
+                            label: "ルーペ固定 [M]".to_string(),
+                            status: "OFF".to_string(),
+                            enabled: true,
+                            disabled_reason: None,
+                        },
+                    ];
+                    let view = FsOverflowPanelView {
+                        state,
+                        root_rows,
+                        navigator_corner: FullscreenNavigatorCorner::BottomRight,
+                        shift: Default::default(),
+                        composition_available: true,
+                        composition_managed: false,
+                    };
+                    let panel_rect = fs_overflow_panel_rect(ui.max_rect(), state).unwrap();
+                    let _ = draw_fs_overflow_panel_surface(ui, panel_rect, &view);
+                });
+        });
         harness.run();
+        if size.y >= 520.0 {
+            let (inner, content, offset) = harness.ctx.data(|data| {
+                data.get_temp(egui::Id::new("fs_overflow_scroll_test_layout"))
+                    .unwrap()
+            });
+            crate::test_ui::scroll_layout::ScrollLayout {
+                inner,
+                content,
+                offset,
+            }
+            .assert_height(
+                crate::test_ui::scroll_layout::HeightExpectation::Fits,
+                egui::Rect::from_min_size(egui::Pos2::ZERO, size),
+                harness.ctx.pixels_per_point(),
+            );
+        }
         harness.snapshot(name);
     }
 
@@ -59044,6 +59229,7 @@ mod tests {
         snapshot_fullscreen_overflow_panel(
             "fullscreen_overflow_panel_root",
             FsOverflowPanelState::Root,
+            egui::vec2(720.0, 440.0),
         );
     }
 
@@ -59052,6 +59238,16 @@ mod tests {
         snapshot_fullscreen_overflow_panel(
             "fullscreen_overflow_panel_navigator_submenu",
             FsOverflowPanelState::NavigatorPosition,
+            egui::vec2(720.0, 440.0),
+        );
+    }
+
+    #[test]
+    fn fullscreen_overflow_panel_snapshot_root_tall_without_scrollbar() {
+        snapshot_fullscreen_overflow_panel(
+            "fullscreen_overflow_panel_root_tall",
+            FsOverflowPanelState::Root,
+            egui::vec2(720.0, 520.0),
         );
     }
 
@@ -83362,6 +83558,7 @@ mod specified_scale_consumer_tests {
 
     #[test]
     fn specified_scale_popup_uses_available_height_and_scrolls_only_when_needed() {
+        use crate::test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
         for (size, should_scroll) in [
             (egui::vec2(1200.0, 1000.0), false),
             (egui::vec2(1093.0, 614.0), false),
@@ -83383,11 +83580,22 @@ mod specified_scale_consumer_tests {
                 ))
                 .unwrap()
             });
-            assert!(viewport.contains_rect(inner));
-            assert_eq!(
-                content.y > inner.height() + 0.5,
-                should_scroll,
-                "available space must determine scrolling: size={size:?}, inner={inner:?}, content={content:?}"
+            let before = ScrollLayout {
+                inner,
+                content,
+                offset: ctx.data(|data| {
+                    data.get_temp(egui::Id::new("fs_fit_popup_scroll_offset"))
+                        .unwrap()
+                }),
+            };
+            before.assert_height(
+                if should_scroll {
+                    HeightExpectation::Scrolls
+                } else {
+                    HeightExpectation::Fits
+                },
+                viewport,
+                ctx.pixels_per_point(),
             );
             assert!(painted_label(&output, "最大倍率（共通）").is_some() || should_scroll);
             fn popup_rect(shape: &egui::epaint::Shape) -> Option<egui::Rect> {
@@ -83439,13 +83647,22 @@ mod specified_scale_consumer_tests {
                         "short-window scroll reaches the bottom editors"
                     );
                 }
-                assert!(
-                    ctx.data(|data| data
-                        .get_temp::<egui::Vec2>(egui::Id::new("fs_fit_popup_scroll_offset")))
-                        .unwrap()
-                        .y
-                        > 0.0
-                );
+                let (inner, _, content) = ctx
+                    .data(|data| {
+                        data.get_temp::<(egui::Rect, egui::Rect, egui::Vec2)>(egui::Id::new(
+                            "fs_fit_popup_scroll_layout",
+                        ))
+                    })
+                    .unwrap();
+                ScrollLayout {
+                    inner,
+                    content,
+                    offset: ctx.data(|data| {
+                        data.get_temp(egui::Id::new("fs_fit_popup_scroll_offset"))
+                            .unwrap()
+                    }),
+                }
+                .assert_scrolled_to_end(before, ctx.pixels_per_point());
             }
         }
     }

@@ -1373,7 +1373,8 @@ fn show_virtualized_facet_choice_rows(
     }
 
     let spacing = ui.spacing();
-    let row_h = spacing.interact_size.y.max(22.0) + spacing.item_spacing.y;
+    // show_rows adds item_spacing itself; the drawing allocates only row_h.
+    let row_h = spacing.interact_size.y.max(22.0);
     let body_height = facet_choice_body_height(ui, choice_count);
     ui.allocate_ui_with_layout(
         egui::vec2(width, body_height),
@@ -1381,7 +1382,7 @@ fn show_virtualized_facet_choice_rows(
         |ui| {
             ui.set_min_height(body_height);
             ui.set_width(width);
-            egui::ScrollArea::vertical()
+            let output = egui::ScrollArea::vertical()
                 .max_height(body_height)
                 .auto_shrink([false, false])
                 .show_rows(ui, row_h, choice_count, |ui, row_range| {
@@ -1390,6 +1391,15 @@ fn show_virtualized_facet_choice_rows(
                         add_row(ui, idx);
                     }
                 });
+            #[cfg(test)]
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::new("facet_choice_scroll_layout"),
+                    (output.inner_rect, output.content_size, output.state.offset),
+                )
+            });
+            #[cfg(not(test))]
+            let _ = output;
         },
     );
 }
@@ -9503,12 +9513,16 @@ impl App {
                     |ui| {
                         ui.set_min_width(scroll_width);
                         ui.set_min_height(scroll_height);
-                        let scroll_output = egui::ScrollArea::vertical()
-                            .id_salt("book_reorder_thumb_scroll")
-                            .vertical_scroll_offset(state.scroll_offset_y)
-                            .max_height(scroll_height)
-                            .auto_shrink([false, false])
-                            .show_rows(ui, row_height, rows.max(1), |ui, row_range| {
+                        let scroll_output = crate::ui_helpers::show_fixed_slot_rows(
+                            ui,
+                            egui::ScrollArea::vertical()
+                                .id_salt("book_reorder_thumb_scroll")
+                                .vertical_scroll_offset(state.scroll_offset_y)
+                                .max_height(scroll_height)
+                                .auto_shrink([false, false]),
+                            row_height,
+                            rows.max(1),
+                            |ui, row_range| {
                                 egui::Grid::new("book_reorder_thumb_grid")
                                     .num_columns(cols)
                                     .spacing(egui::vec2(gap, gap))
@@ -9724,7 +9738,8 @@ impl App {
                                             ui.end_row();
                                         }
                                     });
-                            });
+                            },
+                        );
                         state.scroll_offset_y = scroll_output.state.offset.y;
                         if !busy
                             && !pointer_released
@@ -20620,6 +20635,74 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 #[cfg(test)]
 mod facet_filter_bar_tests {
     use super::*;
+
+    #[test]
+    fn calculated_facet_choice_height_uses_each_gap_once() {
+        use crate::test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(720.0, 900.0));
+        let draw = |events| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(viewport),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            show_virtualized_facet_choice_rows(ui, 360.0, 26, |ui, idx| {
+                                draw_facet_checkbox_choice(
+                                    ui,
+                                    &mut false,
+                                    format!("選択肢 {idx}"),
+                                    "",
+                                );
+                            });
+                        });
+                },
+            );
+            let (inner, content, offset) = ctx.data(|data| {
+                data.get_temp(egui::Id::new("facet_choice_scroll_layout"))
+                    .unwrap()
+            });
+            ScrollLayout {
+                inner,
+                content,
+                offset,
+            }
+        };
+        let mut before = draw(vec![]);
+        for _ in 0..3 {
+            before = draw(vec![]);
+        }
+        let spacing = ctx.style().spacing.clone();
+        let row_height = spacing.interact_size.y.max(22.0);
+        assert_eq!(
+            before.content.y,
+            26.0 * row_height + 25.0 * spacing.item_spacing.y
+        );
+        // This menu intentionally caps its viewport at 24 of the 26 choices.
+        before.assert_height(HeightExpectation::Scrolls, viewport, ctx.pixels_per_point());
+        let mut after = before;
+        for frame in 0..40 {
+            after = draw(if frame == 0 {
+                vec![
+                    egui::Event::PointerMoved(before.inner.center()),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -4000.0),
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]
+            } else {
+                vec![]
+            });
+        }
+        after.assert_scrolled_to_end(before, ctx.pixels_per_point());
+    }
     use crate::app::setup_app_for_test;
 
     #[test]
