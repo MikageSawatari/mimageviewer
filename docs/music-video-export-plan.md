@@ -1027,17 +1027,51 @@ trace（scratchpad の `night\trace\main-2a.log` / `lab-2a.log`）では、本�
 18 件すべてが `egui=[None]`（egui へ何も渡していない）。未確認: detached viewer、MS-IME 等の他の IME、
 利用者の実機・実設定。
 
-段 2b（設計は段 2a の実機確認後）: 300ms grace（`IME_EVENT_GRACE`）の文書上の理由は「Windows が
-`Disabled` と Esc / Enter を別フレームで届ける」ことで、その Esc / Enter は段 2a で egui へ届かなくなる。
-grace を composing だけの判定へ縮めると、各ダイアログでも「確定→すぐ Enter で決定」が通るようになる
-（いまは 300ms 以内の 2 回目が捨てられ、利用者報告と同じ型の取りこぼしがある）。利用箇所は
-`dialog_enter_pressed` 30、`dialog_escape_pressed` 68、直接の `ime_input_active` 約 50 と focus 所有
-（`TextInputPhase::ImeGrace`）・native presenter の判定。1 つの定義の変更で全体が変わるため、
-用途別（決定 Enter / 取消 Esc / ショートカット抑止 / focus 所有）に既存テストと実機手順を揃えて別に設計する。
-段 2b で合わせて見る既存挙動: egui 本家の `remove_ime_incompatible_events` は pass 開始時の `ime_enabled` で
-Backspace・矢印・repeat を Commit より前に除くため、Commit と同じ pass に入った通常の Backspace / 矢印も消える。
-Win32 キー queue の JIS 4 キーは scan code だけで一致し得る（`keymap.rs` 861 付近）ので、grace を縮めるときは
-IME 所有 gate との関係を確認する。
+**段 2b（設計案、2026-10-14 設計 lead。独立レビュー前・実装前）: 300ms grace を外し「変換中か」だけで判定する。**
+
+経緯と理由: `IME_EVENT_GRACE`（300ms）は「Windows が IME 終了（`Disabled` / `Commit`）と、IME が処理した
+Esc / Enter を別フレームで届ける」ことの吸収として入った（`App::ime_input_active` の doc、CLAUDE.md の IME 対応節）。
+段 2a で IME が処理したキーの press は egui へ届かなくなったので、grace 中に届く Enter / Esc は利用者が新たに押した
+通常のキーになった。grace はそれを捨てるだけになり、利用者報告と同じ型の取りこぼしを各所に残す
+（例: 名前・タグ・検索欄で確定→すぐ Enter で決定できない、確定→すぐ Esc で閉じない、確定直後のショートカット無視）。
+
+1. **判定を 1 つにする。** `egui-ime` の `ImeFocusState` から `last_event_at` と `IME_EVENT_GRACE` を外し、
+   `ime_input_active` / `ime_input_active_in_viewport` は「その viewport が composing か」だけを返す。
+   composing は pre-pass の plugin が今 pass の Ime 列まで反映した値なので、同じ pass の `[Commit, 通常 Enter]` は
+   決定として通り、`[Preedit]` の最中は抑止される。`ime_input_active_with_pending_events` は「未処理の Ime event がある
+   または composing」とし（native presenter 用、queue 内の Ime を先取りする意味は変えない）、
+   `ime_composing_with_pending_events` と同じ規則に揃えられるならそちらへ統合する。
+   `TextInputPhase::ImeGrace`（`src/keyboard_input.rs`）は「composing」へ名前と意味を変えるか、Focused / FocusRecovery に
+   吸収できるかを実装前に確認する（focus を持つ TextEdit は既に Focused で所有されるため）。
+2. **呼び出し側は原則変えない。** `dialog_enter_pressed`（30）・`dialog_escape_pressed`（68）・直接の
+   `ime_input_active`（約 50）・native presenter・gamepad・musicvideo-ui の履歴ショートカットは、定義の変更だけで
+   新しい規則になる。個別の分岐を足さない。grace を前提に「Commit と同じ pass の Enter を捨てる」ことを期待している
+   箇所（`should_close_fullscreen_on_enter`、検索バーの `handle_keyboard` 抑止 `app.rs` 53715 付近、
+   specified-scale の数値 popup、削除確認の Y/N）は、Process 遮断後も意味が通るかを 1 つずつ確かめ、
+   不要になったものはコメントと分岐を消す。
+3. **3 つ目の入力経路にも同じ規則を入れる。** Win32 キー queue（`src/key_input.rs` の `key_edge_from_message`）は
+   `VK_PROCESSKEY`（0xE5）の edge も記録し、`KeyName::matches_win32` は JIS の ^ @ ¥ ろ を scan code だけで照合する
+   （`src/keymap.rs` 861 付近）。変換中に打った ^ @ が grace / composing の gate の外でショートカットに一致しうる。
+   queue 側で 0xE5 の press を記録しない（egui-winit・native presenter と同じ「IME が処理したキーはアプリのキーではない」）。
+4. **段 2b の範囲外（残す）**: egui 本家の `remove_ime_incompatible_events`（pass 開始時の `ime_enabled` で
+   Backspace・矢印・repeat を Commit より前に除くため、Commit と同じ pass の通常 Backspace / 矢印も消える既存挙動。
+   upstream の不具合として別に扱う）、helper の focus 復帰と `return_key(None)`、空 Preedit の補い、アプリ全体の Tab 方針。
+5. **テスト**: grace を前提にしたテスト（`noncomposing_and_ime_grace_escape_presses_are_preserved` の grace 部分、
+   `ime_grace_is_text_input_even_with_generic_focused_ui`、specified-scale の「IME 終了＋キー」、
+   `history_shortcuts_preserve_events_and_project_during_composition_and_grace_without_focus` など）を、
+   「composing 中は抑止、Commit 後の同じ pass／次の pass の通常キーは通る」へ直す。代表ダイアログ（タグ編集・
+   フォルダを開く・パスワード）で「確定→すぐ Enter で決定」「確定→すぐ Esc で閉じる」を handler-level で固定する。
+   Win32 queue の 0xE5 は edge 変換の単体テストで固定する。
+6. **前提条件（実装前に満たす）: Google 日本語入力以外でも、確定の Enter・変換中の Esc が Process で届くこと。**
+   この PC には MS-IME（TIP `{03B5835F-…}`）も登録されている。段 1 の trace 手順で MS-IME の 5 シナリオを記録し、
+   確定の Enter が `logical=Named(Process)` で届くことを確かめる（通常の Enter で届く IME があると、grace を外すことで
+   「確定と同時にダイアログが決定される」退行になるため）。記録は利用者に依頼するか、利用者の了承を得て設計 lead が
+   入力方式を一時的に切り替えて行う（終わったら元に戻す）。
+7. **状態を減らす方針との関係**: 時刻つきの状態（`last_event_at`）と、それに依存する「grace 中か」の分岐が消える。
+   新しい状態は足さない。
+
+利用者に見える変化: 日本語を確定した直後（300ms 以内）の Enter / Esc / ショートカットが、間を空けたときと同じに働く。
+変換中（未確定文字があるとき）の扱いは変わらない。
 
 このブランチ（musicvideo）で直すのは利用者の指示（2026-10-14）。本体側の修正も含むため、master への統合は
 音楽ビデオ機能とは別に先行させるかを、段 2a の確認後に利用者と決める。
