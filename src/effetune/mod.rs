@@ -19,6 +19,7 @@ pub(crate) mod gui_gate;
 pub(crate) mod now_playing;
 mod window;
 pub(crate) use now_playing::{NowPlayingArtworkSource, NowPlayingInput, NowPlayingOwner};
+pub(crate) use window::{ForegroundFact, ForegroundRelation};
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum GuiButtonAction {
@@ -27,10 +28,25 @@ pub(crate) enum GuiButtonAction {
     Hide,
 }
 
+#[cfg(test)]
 pub(crate) fn gui_button_action(visible: bool, in_front: bool) -> GuiButtonAction {
+    gui_button_action_for_relation(
+        visible,
+        if in_front {
+            ForegroundRelation::InFront
+        } else {
+            ForegroundRelation::Other
+        },
+    )
+}
+
+pub(crate) fn gui_button_action_for_relation(
+    visible: bool,
+    relation: ForegroundRelation,
+) -> GuiButtonAction {
     if !visible {
         GuiButtonAction::Show
-    } else if in_front {
+    } else if relation == ForegroundRelation::InFront {
         GuiButtonAction::Hide
     } else {
         GuiButtonAction::Activate
@@ -1197,6 +1213,9 @@ impl EffetuneController {
     }
 
     pub fn set_main_hwnd(&self, hwnd: u64) {
+        if cfg!(feature = "portable") {
+            return;
+        }
         self.main_window.install(hwnd);
     }
 
@@ -1330,8 +1349,29 @@ impl EffetuneController {
         }
     }
 
-    pub fn click_foreground(&self, pointer_click: bool) -> u64 {
-        self.main_window.click_foreground(pointer_click)
+    pub(crate) fn begin_native_input(&self, raw: &egui::RawInput) {
+        self.main_window.begin_input(raw);
+    }
+
+    pub(crate) fn native_input_events(
+        &self,
+        source: eframe::NativeInputSource,
+        events: &[egui::Event],
+    ) {
+        self.main_window.native_input_events(source, events);
+    }
+
+    pub(crate) fn take_input_failure_notice(&self) -> bool {
+        self.main_window.take_failure_notice()
+    }
+
+    pub(crate) fn click_foreground(
+        &self,
+        pointer_click: bool,
+        release_index: Option<usize>,
+    ) -> ForegroundFact {
+        self.main_window
+            .click_foreground(pointer_click, release_index)
     }
 
     pub fn set_repaint_context(&self, ctx: &egui::Context) {

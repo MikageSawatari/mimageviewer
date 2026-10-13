@@ -2388,6 +2388,7 @@ impl Context {
                 let interact_widgets = self.write(|ctx| ctx.viewport().interact_widgets.clone());
                 let InteractionSnapshot {
                     clicked,
+                    clicked_primary_release_index: _,
                     long_touched: _,
                     drag_started: _,
                     dragged,

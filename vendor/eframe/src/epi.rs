@@ -133,6 +133,28 @@ impl CreationContext<'_> {
 
 // ----------------------------------------------------------------------------
 
+/// The native event that produced an observed batch of egui input events.
+///
+/// The source is independent of the batch: conversion may produce no events.
+#[cfg(all(not(target_arch = "wasm32"), any(feature = "glow", feature = "wgpu")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeInputSource {
+    /// A native left mouse-button release, including one filtered by conversion.
+    PrimaryMouseRelease,
+    /// An ended native touch contact with its exact source identity.
+    ///
+    /// This metadata is not assumed to be unique across native events.
+    ContactEnd {
+        /// The native contact ID.
+        id: u64,
+        /// The `f64::to_bits` values of the native x/y location in physical
+        /// client pixels, before conversion to egui coordinates or scaling.
+        location: [u64; 2],
+    },
+    /// Any other native window event.
+    Other,
+}
+
 /// Implement this trait to write apps that can be compiled for both web/wasm and desktop/native using [`eframe`](https://github.com/emilk/egui/tree/main/crates/eframe).
 pub trait App {
     /// Called each time the UI needs repainting, which may be many times per second.
@@ -244,6 +266,25 @@ pub trait App {
     ///
     /// This function does not return a value. Any changes to the input should be made directly to `_raw_input`.
     fn raw_input_hook(&mut self, _ctx: &egui::Context, _raw_input: &mut egui::RawInput) {}
+
+    /// Observe the egui events produced by one native window event.
+    ///
+    /// Called once after native-to-egui conversion with only the newly generated
+    /// events. The slice can be empty even for a release source. Observation does
+    /// not consume or modify input, and precedes [`Self::raw_input_hook`].
+    ///
+    /// This callback runs during native event dispatch while backend viewport
+    /// state is borrowed. Record data only: do not render, create viewports,
+    /// reenter the event loop, or perform blocking work. It is called for each
+    /// viewport; root-specific observers must check [`egui::ViewportId::ROOT`].
+    #[cfg(all(not(target_arch = "wasm32"), any(feature = "glow", feature = "wgpu")))]
+    fn native_input_events(
+        &mut self,
+        _viewport_id: egui::ViewportId,
+        _source: NativeInputSource,
+        _events: &[egui::Event],
+    ) {
+    }
 }
 
 /// Selects the level of hardware graphics acceleration.

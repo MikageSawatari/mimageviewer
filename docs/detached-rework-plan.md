@@ -1455,6 +1455,29 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-13 §1.378 EffeTune前面ボタンのnative入力所有（EV14、未コミット）
+
+利用者採取traceで、別processからmainへclick-activateされる途中にforeground/other HWNDが
+ともにNULLになる原因を確定した。利用者から所有境界に合う構造修正の選択を委任され、
+実装担当の設計判断とbounded Sol/xhighの構造設計確認が、before-queue immutable factと
+実producer/consumer対応付けの修正（症状パッチではない）に合意した。実装の独立ACCEPTを示す記録ではない。
+
+変更範囲はmain HWNDの専用input registration、`vendor/eframe`のnativeイベント変換後の
+data-only observer API、`vendor/egui`のclicked primary-release序数、main音響調整ボタンcaller。
+wgpu/glowの既存viewport IDから観測イベントを渡すだけで、viewport述語、scheduler、
+inline/deferred render、HWND同定、park/fork/promote/retire、placementとcontext registryは変更しない。
+App observerはROOT以外を無視し、main registrationの完成inputをROOT raw hookで一度だけ射影する。
+別viewportの入力/世代/状態/queueをコピー・取消・resetせず、新しいdetached bool/Optionは加えない。
+native→winit→eguiで省略されたreleaseもproducer境界で対応付け、UP A→DOWN BでAを取り違えない。
+timeは実packet照合項目であり、時間窓・最新focus cache・thread IDだけの所属推定は使わない。
+native hookの退役はstop eventで、UIでjoin/IPC/FS待機をしない。rare failureはlog＋再起動案内に留める。
+設計・回帰・最終gate台帳は[音響調整計画 §17.13](effetune-integration-plan.md)に記録する。
+
+R5のbounded設計確認では、native pendingとsource-bound readyの寿命を分離し、inline ROOT frameで
+後続source用pendingを退役しない契約、contact ID＋physical client位置bitsの照合と重複Unknown、
+capture失敗時のpending/ready失効へ同意した。producer callbackはdata-onlyのまま、viewport
+predicate・描画scheduler・RawInput・viewer context registryの振る舞いは変更しない。
+
 ### 2026-10-12 §1.374 Everything の共通Search接続（未コミット・独立実装レビュー待ち）
 
 利用者の実装指示と承認済みEverything計画、先行PDF ownershipの独立ACCEPT実装

@@ -969,6 +969,7 @@ impl WgpuWinitRunning<'_> {
     ) -> EventResult {
         let Self {
             integration,
+            app,
             shared,
             ..
         } = self;
@@ -1084,6 +1085,8 @@ impl WgpuWinitRunning<'_> {
             .and_then(|viewport_id| {
                 let viewport = shared.viewports.get_mut(&viewport_id)?;
                 Some(integration.on_window_event(
+                    app.as_mut(),
+                    viewport_id,
                     viewport.window.as_deref()?,
                     viewport.egui_winit.as_mut()?,
                     event,

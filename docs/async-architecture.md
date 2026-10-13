@@ -25,6 +25,25 @@ protocol v7のhello/readyで旧v6を拒否し、source identityとは独立にde
 一般VSTの矩形保存、owner、custom chromeは維持する。まれな失敗はログ＋通知、前の有効値を保持し、retryを追加しない。
 設計・実装台帳は[音響調整計画 §17](effetune-integration-plan.md)を参照。
 
+前面ボタンの入力はmain HWND registrationが所有する。専用`effetune-press-capture` threadの
+WH_MOUSE_LLがtarget queueへ入る前のmain client左押下だけを採取し、immutable foreground
+HWND/PID/root/owner-chainを512件上限のchannelへtry_sendする。callbackは入力を抑止せず、
+IPC・FS・log整形・待機をしない。main UIのWH_GETMESSAGEは実MSGのtime/ptを保持し、
+subclassの実mouse DOWNでinput-sourceとmetadata/extra infoを確認して同じpacketのfactを引き取る。
+送信された疑似mouse message、再入での別message取得（peekも含む）、欠落・重複はUnknownにする。
+timestampの時間閾値、最新foreground cache、host activation通知の遅着を判断に使わない。
+mouseとcontact ID別touchの完成releaseをROOT raw_input_hookで一度だけ射影し、eguiの
+clicked_primary_release_indexで実際のclicked widgetへ渡す。UP A→DOWN BでもAをBで上書きしない。
+eframeの実egui-winit変換直後のdata-only callbackでsourceと今回生成されたRawInput suffixを対応付ける。
+空suffixのmouse releaseもそのsourceの完了として消費し、後続の有効なclickを失わない。
+タッチは全contact/historyを読み、winit Touch Endのcontact ID＋physical client位置bitsと照合する。
+非PRIMARY contactのegui選択も保持し、同key重複はUnknown。native pendingはfuture source callbackまで
+有界ownerが保持する。inline ROOT frameで未到着sourceのpendingを消さず、sourceに対応したreadyだけを
+raw_input_hookで退役する。空suffixは対応payloadを消費し、capture/座標失敗は旧pending/readyを失効する。
+退役はUI hook解除とstop eventのsignalだけで、UIはworkerをjoinしない。旧registrationを移譲しない。
+入力hook/channel/journalのまれな失敗はログと一度の再起動案内、Unknownとして扱い、retryしない。
+portableでは捕捉hookを開始しない。詳細traceは既定OFFのMIV_EFFETUNE_INPUT_TRACEだけである。
+
 ## Everything の取得と共通Search採用（§1.374、未リリース）
 
 `GlobalSearchState.pending` の `SearchProducer` がMetadata/Everythingを排他に所有し、

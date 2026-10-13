@@ -6,6 +6,20 @@ egui のクリック判定と対応付けるために追加した、読み取り
 2026-10-10には、前面popup終了時に未配送のwheel平滑化分を破棄する限定APIを追加した。
 以下の元APIの検証・レビュー記録は当時の差分だけを示す。追加APIの境界は末尾に記録する。
 
+## InteractionSnapshot::clicked_primary_release_index（2026-10-13）
+
+音響調整ボタンのnative入力factを、eguiが実際にクリック対象としたwidgetのreleaseへ対応付ける。
+同一passにUP A→DOWN Bが入る場合、現在のpress Bや最後のreleaseだけではAのclickを識別できない。
+`src/interaction.rs`でclickedを代入する同じ場所から、全primary Released（click=Noneも含む）中の
+序数を公開する。clickedの後続secondary/middle/long-touch代入ではNoneへ置換する。
+読み取り専用の補助metadataであり、click/dragの条件・widget選択・入力生成/消費は変更しない。
+`src/context.rs`のdebug用snapshot分解にも追加fieldを明示する。
+callerはROOT raw-input projection・選択widget ID・同frame/passを検査して使う。
+keyboard/long-touchは序数を持たず、native releaseを流用しない。
+6件のheadless回帰でUP A→DOWN B、非click releaseを含む序数、secondary置換、
+後続無効release、frame境界、long-touchを検査する。filterは`clicked_primary_release_index`。
+依存更新時はこのmetadataと、既存release順序/scroll終端APIをそれぞれ保持する。
+
 ## 出典
 
 - crates.io package: `egui-0.33.3.crate`
