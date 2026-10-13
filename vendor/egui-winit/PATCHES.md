@@ -1,0 +1,86 @@
+# egui-winit 0.33.3 のローカル変更
+
+I2 段 1（2026-10-14）: IME が処理したキーの到着を調べる診断用 trace。
+キー・IME の変換、egui イベントの生成・消費、EventResponse は変更しない。
+段 2 の修正は未設計で、実 IME のログを見て診断コードの扱いも決める。
+
+## 出典・取り込み
+
+- crates.io package: `egui-winit-0.33.3.crate`
+- package SHA-256: `ec6687e5bb551702f4ad10ac428bab12acf9d53047ebb1082d4a0ed8c6251a29`
+- upstream repository: `https://github.com/emilk/egui`
+- `.cargo_vcs_info.json` の commit: `44cdd653e2317d300fb8a6c9c36b03f23991e803`
+- upstream package path: `crates/egui-winit`
+- 検証日: 2026-10-14
+
+Cargo registry の archive の SHA-256 は、取り込み前の root `Cargo.lock` の checksum と一致。
+archive 内の全 9 ファイルと展開済み registry source の bytes 一致を確認し、archive から取り込んだ。
+registry 管理用 `.cargo-ok` と生成された `target/` は取り込まない。
+root workspace の exclude と `[patch.crates-io]` に追加し、本体・ラボ・workspace メンバーの
+推移的依存も同じ path の egui-winit を使う。package の version / dependencies / features は不変。
+
+原本からの変更は `src/lib.rs` の観測 hook だけ。追加は
+`src/ime_key_trace.rs`（診断実装と単体テスト）、本書、ライセンス本文 2 ファイル。
+`Cargo.toml` / `Cargo.toml.orig` / 同梱 `Cargo.lock` も原本のまま保持する。
+root `Cargo.lock` の変更は egui-winit の source / checksum の除去だけ。
+
+## ライセンス
+
+`MIT OR Apache-2.0` 宣言を保持する。原本 archive はライセンス本文を含まないため、
+既存 `vendor/egui-wgpu` の本文を bytes 不変で同梱する（既存 egui の取り込みと同じ）。
+
+| コピー元 | SHA-256 |
+| --- | --- |
+| `../egui-wgpu/LICENSE-MIT` | `3fceb7b317f3c70451942b0e123723a2e250c7eaf970ce4b490a57a94c5588ff` |
+| `../egui-wgpu/LICENSE-APACHE` | `1ac50a5abd5cff5331d59928d83369b66b0099a88f0111dc2175526b3c666dec` |
+
+## trace の境界・出力形式
+
+- `MIV_IME_KEY_TRACE=<絶対パス>` を最初の `State::new`（winit 統合の起動）で process 全体につき
+  1 回だけ読む。未設定・空・相対パスなら完全に無効で、worker・ファイル I/O・イベントの走査・
+  文字列生成・時計読み取りは行わない。無効時のイベント処理は原本の match 本体をそのまま通す。
+- 全 State / viewport は同じ worker と単調時計を共有する。`ms` は最初の State 初期化からの
+  経過 ms。最初の State 構築より前の区間は観測できない。`viewport` は対象 State の `ViewportId` を
+  省略なしの 64-bit hex で出す（egui の Debug は 16-bit の省略形なので使わない）。
+- `WindowEvent::KeyboardInput` / `Ime` の処理直前に時刻とイベント列の末尾位置を取る。
+  原本の処理後、新たに追加された実際のイベントだけを読み取る。変換結果の再計算はしない。
+  synthetic press の無視、Cut/Copy/Paste の early return、IME Enabled の重複抑止も観測できる。
+- 1 行 1 到着事象の UTF-8 テキスト。`egui=[...]` は追加順で、空なら `[None]`。
+  Key の `repeat` は egui-winit が出した値（原本どおり false）であり、winit の repeat と区別する。
+- text / Preedit / Commit / Paste は `bytes`（UTF-8 byte 数）、`empty`、`newline`（CR または LF の有無）
+  だけを出す。Preedit の cursor は有無だけ。文字内容、cursor の位置、clipboard 内容は出さない。
+  logical Character / Dead / Unidentified の内容、文字に対応する physical / egui Key、
+  unknown な physical code もマスクする。
+  Enter / Escape / Tab / Process など非文字キーの種類は残す。
+- UI thread はメモリ上で秘匿した行を生成して非同期 channel へ送るだけ。
+  worker がファイルを create / append し、1 行ごとに write / flush する。open / write / flush / send /
+  worker 起動の失敗は黙って以後の記録を停止する。再試行・復旧・終了時の完了待ちは設けない。
+  強制終了や即時終了では未配送の末尾が残らない可能性があるため、再現後は少し待ってから終了する。
+
+## ソースで確認した見立ての範囲
+
+winit 0.30.13 `src/platform_impl/windows/keyboard_layout.rs:946` は `VK_PROCESSKEY` を
+`NamedKey::Process` に変換する。同ファイル `:210` の `get_key` はこの非文字キーを優先して返す。
+`src/platform_impl/windows/keyboard.rs:502-513` は lParam の scan code から physical key を作り、
+scan code が 0 なら virtual key から補う。したがって physical が必ず元の Enter とはソースだけで
+断定できない。実 IME が届ける scan code / イベントの組み合わせは実機ログで確認する。
+
+egui-winit 原本 `src/lib.rs:1117` / `:1125` の変換には Process が無く、`:815` の
+`logical_key.or(physical_key)` が physical Enter へ fallback する見立ては一致する。
+これは発生条件のソース確認であり、利用者の再現経路の確定ではない。
+
+## 検証
+
+root graph を使う `cargo test -p egui-winit --lib` で診断単体テストを実行する。
+KeyEvent は winit 0.30.13 `src/event.rs:655` の private `platform_specific` field により
+外部から安全に合成できないため、Process/Enter の元変換 helper と、キー metadata の射影を検証する。
+IME は合成でき、追加イベントだけの観測・複数 viewport・非改変・秘匿を検証する。
+writer の行ごとの flush、write / flush / channel 失敗時の停止も検証する。
+実 KeyboardInput 到着と実 IME の順序は利用者の記録待ち。独立レビュー完了は主張しない。
+
+2026-10-14 の検証: 上記診断単体 10 件、brief 指定の本体 core check / 共有 UI・ラボ・egui-ime /
+本体 ime_focus・egui_focus_policy、root fmt と vendor rustfmt が成功。依存 graph は本体・全ラボで
+本 path の一系統。release ラボのビルドも成功した。詳細ログは root `target/i2-*`。
+追加全体 gate は App のサイズ制限失敗と capture_region テストの stack overflow で失敗し、
+本体 lib は全件完走していない。本体 dev-runtime 更新は既存 core プロセスが出力 exe を保持するため
+利用者の終了待ち。これらを本 trace の変更に混ぜて修正せず、全体 gate / 本体 build 成功は主張しない。
