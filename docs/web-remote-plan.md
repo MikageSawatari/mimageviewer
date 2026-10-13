@@ -1,5 +1,19 @@
 # リモート閲覧 (Web) 機能 計画書
 
+## 本の構成（§1.242 B2、2026-10-13）
+
+strict IPCはv71。ContainerPayloadにaccepted `composition_revision`を持ち、実効address/generationと一緒に使う。
+ZIP/PDF/EPUBは共通pure投影で順序・hidden・新tailを適用してから既存件数/byte制限へ通す。
+寸法取得・組生成は返却itemsだけで、Singleは組のための寸法を読まない。
+不完全応答は自動表紙次/最終単独・端配置・末尾表紙を抑止し、範囲内の明示指定を保持する。
+PCとの組の差は通常本と共通の延期§1.368の制約として残す。
+明示白紙は一つのNavigation presentation slotに画面側を載せ、partnerを要求しない。
+Single/端末単ページ強制/Splitではその側を渡さず、通常本のsingleton trimも変更しない。
+構成本のWeb表示メニューは単ページ/見開き/横長分割。方向・表紙・Spread shiftはPC editorへ案内する。
+端配置・表紙次/最終単独・末尾表紙はqualified scopeのAutomaticRuleとして既存writerへ保存できる。
+構成record/revisionのwrite、全本寸法解決、省略相方の追加取得は行わない。
+以下のG段階のv70は当時の実装記録である。
+
 ## 抽出一覧の一時表示（§1.242 G1）
 
 評価・スマートフォルダ・保存コレクションの直接閲覧はA2の抽出一覧として扱う。

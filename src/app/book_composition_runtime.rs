@@ -89,7 +89,7 @@ pub(crate) enum ViewerBookComposition {
     Preparing {
         scope: BookScopeKey,
         receiver: mpsc::Receiver<CompositionPrepareReply>,
-        origin: ProjectionOrigin,
+        origin: Box<ProjectionOrigin>,
     },
     Projecting {
         scope: BookScopeKey,
@@ -97,7 +97,7 @@ pub(crate) enum ViewerBookComposition {
         record: Option<Arc<StoredComposition>>,
         source: BookCompositionSource,
         generation: u64,
-        origin: ProjectionOrigin,
+        origin: Box<ProjectionOrigin>,
         receiver: mpsc::Receiver<Result<BookProjectionReply, String>>,
     },
     Accepted {
@@ -311,32 +311,29 @@ impl App {
             identity: Some(identity),
         }) == crate::book_composition::PageStatus::HiddenByComposition
     }
-    pub(crate) fn canonical_raw_book_page(&self, index: usize) -> usize {
+    // The pending request retains its old presentation until atomic adoption.
+    // Keep that large origin on the heap, without a second state or owner.
+    fn retained_composed_projection(&self) -> Option<&AcceptedCompositionProjection> {
         match &self.book_composition {
             ViewerBookComposition::Accepted {
                 layout: CompositionProjectionOutcome::Composed(projection),
                 ..
-            }
-            | ViewerBookComposition::Preparing {
-                origin:
-                    ProjectionOrigin::Refresh {
-                        previous: Some(projection),
-                        ..
-                    },
-                ..
-            }
-            | ViewerBookComposition::Projecting {
-                origin:
-                    ProjectionOrigin::Refresh {
-                        previous: Some(projection),
-                        ..
-                    },
-                ..
-            } => projection
-                .canonical_raw_index_for_projected(index)
-                .unwrap_or(index),
-            _ => index,
+            } => Some(projection),
+            ViewerBookComposition::Preparing { origin, .. }
+            | ViewerBookComposition::Projecting { origin, .. } => match origin.as_ref() {
+                ProjectionOrigin::Refresh {
+                    previous: Some(projection),
+                    ..
+                } => Some(projection),
+                _ => None,
+            },
+            _ => None,
         }
+    }
+    pub(crate) fn canonical_raw_book_page(&self, index: usize) -> usize {
+        self.retained_composed_projection()
+            .and_then(|projection| projection.canonical_raw_index_for_projected(index))
+            .unwrap_or(index)
     }
     pub(crate) fn poll_and_remap_book_target(
         &mut self,
@@ -368,27 +365,10 @@ impl App {
         }
     }
     pub(crate) fn composed_book_has_cover(&self) -> bool {
+        if let Some(projection) = self.retained_composed_projection() {
+            return projection.cover_enabled;
+        }
         match &self.book_composition {
-            ViewerBookComposition::Preparing {
-                origin:
-                    ProjectionOrigin::Refresh {
-                        previous: Some(projection),
-                        ..
-                    },
-                ..
-            }
-            | ViewerBookComposition::Projecting {
-                origin:
-                    ProjectionOrigin::Refresh {
-                        previous: Some(projection),
-                        ..
-                    },
-                ..
-            } => projection.cover.is_some(),
-            ViewerBookComposition::Accepted {
-                layout: CompositionProjectionOutcome::Composed(projection),
-                ..
-            } => projection.cover.is_some(),
             ViewerBookComposition::Accepted {
                 record: Some(record),
                 ..
@@ -396,7 +376,7 @@ impl App {
             | ViewerBookComposition::Projecting {
                 record: Some(record),
                 ..
-            } => record.composition.cover.is_some(),
+            } => record.composition.cover_enabled,
             _ => false,
         }
     }
@@ -442,55 +422,13 @@ impl App {
     pub(crate) fn composed_book_layout(
         &self,
     ) -> Option<&crate::book_composition::ResolvedComposition> {
-        match &self.book_composition {
-            ViewerBookComposition::Accepted {
-                layout: CompositionProjectionOutcome::Composed(layout),
-                ..
-            } => Some(&layout.resolved),
-            ViewerBookComposition::Preparing {
-                origin:
-                    ProjectionOrigin::Refresh {
-                        previous: Some(layout),
-                        ..
-                    },
-                ..
-            }
-            | ViewerBookComposition::Projecting {
-                origin:
-                    ProjectionOrigin::Refresh {
-                        previous: Some(layout),
-                        ..
-                    },
-                ..
-            } => Some(&layout.resolved),
-            _ => None,
-        }
+        self.retained_composed_projection()
+            .map(|projection| &projection.resolved)
     }
 
     pub(crate) fn composed_layout_token(&self) -> Option<(BookScopeKey, CompositionToken)> {
-        match &self.book_composition {
-            ViewerBookComposition::Accepted {
-                layout: CompositionProjectionOutcome::Composed(layout),
-                ..
-            } => Some((layout.scope.clone(), layout.token)),
-            ViewerBookComposition::Preparing {
-                origin:
-                    ProjectionOrigin::Refresh {
-                        previous: Some(layout),
-                        ..
-                    },
-                ..
-            }
-            | ViewerBookComposition::Projecting {
-                origin:
-                    ProjectionOrigin::Refresh {
-                        previous: Some(layout),
-                        ..
-                    },
-                ..
-            } => Some((layout.scope.clone(), layout.token)),
-            _ => None,
-        }
+        self.retained_composed_projection()
+            .map(|projection| (projection.scope.clone(), projection.token))
     }
 
     pub(crate) fn pairing_edit_availability(&self) -> crate::spread_shift::PairingEditAvailability {
@@ -798,7 +736,7 @@ impl App {
                 // A new accepted source owns its own preparation; never apply old rows to it.
                 self.book_composition = ViewerBookComposition::Automatic;
             } else if requested_token != token
-                && !matches!(origin, ProjectionOrigin::IgnoreThisOpen { .. })
+                && !matches!(origin.as_ref(), ProjectionOrigin::IgnoreThisOpen { .. })
             {
                 self.book_composition = ViewerBookComposition::Preparing {
                     scope: scope.clone(),
@@ -813,7 +751,7 @@ impl App {
                             token,
                             record,
                             source,
-                            origin,
+                            *origin,
                             reply,
                             ctx,
                         );
@@ -862,7 +800,7 @@ impl App {
                 self.book_composition = ViewerBookComposition::Preparing {
                     scope: scope.clone(),
                     receiver: service.prepare(scope.clone(), domain.clone()),
-                    origin,
+                    origin: Box::new(origin),
                 };
             }
         }
@@ -892,7 +830,7 @@ impl App {
                             scope,
                             reply.token,
                             record.map(Arc::new),
-                            origin,
+                            *origin,
                             ctx,
                         ),
                         Err(error) => {
@@ -1061,7 +999,7 @@ impl App {
             record,
             source,
             generation: self.items_generation,
-            origin,
+            origin: Box::new(origin),
             receiver,
         };
         self.spread_shift.availability = crate::spread_shift::PairingEditAvailability::Unreadable;
@@ -1247,7 +1185,7 @@ impl App {
             if self.spread_mode.is_spread() {
                 let has_cover = record
                     .as_ref()
-                    .is_some_and(|record| record.composition.cover.is_some());
+                    .is_some_and(|record| record.composition.cover_enabled);
                 self.spread_mode = match (self.reading_direction, has_cover) {
                     (crate::settings::ReadingDirection::Ltr, false) => {
                         crate::settings::SpreadMode::Ltr

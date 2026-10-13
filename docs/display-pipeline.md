@@ -1,8 +1,11 @@
 # 表示パイプライン (サムネイル / フルスクリーン)
 
-### 本の構成と提示許可（§1.242 G3、2026-10-11）
+### 本の構成と提示許可（§1.242 B2、2026-10-13）
 
-accepted構成のexplicit unitをSingle/Spread/Split/連結/portraitへ投影する。回転や寸法後着、休眠shiftで再pairしない。
+accepted構成は方向・表紙・可視実列・ページ指定を渡し、通常の共通builderでSpread/連結/editor/Remoteの組を生成する。
+回転・寸法後着と実効自動規則を反映し、休眠shiftは適用しない。Single/Split/portraitは同じ実列を投影する。
+明示Aloneは中央単独、明示BlankOppositeは指定側+白紙。形成理由をresolverまで保持して末尾表紙に置換しない。
+自動強制単独の白紙置換は通常本と同じ。facet外の現在ページは単独の同builder入力として保持する。
 Blankはsource/readinessを持たず、補助はNavigation/resume/exportの実列へ追加しない。
 提示候補はcontext/世代/source/role/slot/sliceをworkerで確認し、相方はunit内でatomicに採用する。
 Checking/Hiddenはcached processed/raw/thumbnail/holdoverからもtexture選択・paint・transform/hit・読了traceへ渡さない。

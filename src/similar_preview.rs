@@ -2769,16 +2769,8 @@ mod tests {
         let mut composition = BookComposition::new(
             ReadingDirection::Ltr,
             vec![
-                CompositionUnit::Single {
-                    page: CompositionPageRef::PdfPage { page_num: 1 },
-                    placement: SinglePlacement::Center,
-                    companion: SingleCompanion::Vacant,
-                },
-                CompositionUnit::Single {
-                    page: CompositionPageRef::PdfPage { page_num: 0 },
-                    placement: SinglePlacement::Center,
-                    companion: SingleCompanion::Vacant,
-                },
+                CompositionPageRef::PdfPage { page_num: 1 },
+                CompositionPageRef::PdfPage { page_num: 0 },
             ],
         );
         composition
@@ -2801,14 +2793,7 @@ mod tests {
         let page = CompositionPageRef::RelativePath {
             path: "candidate.png".into(),
         };
-        let mut record = BookComposition::new(
-            ReadingDirection::Rtl,
-            vec![CompositionUnit::Single {
-                page: page.clone(),
-                placement: SinglePlacement::Center,
-                companion: SingleCompanion::Vacant,
-            }],
-        );
+        let mut record = BookComposition::new(ReadingDirection::Rtl, vec![page.clone()]);
         record.hidden_pages.push(page);
         service
             .save(scope.clone(), PageDomain::ImageFolder, record)

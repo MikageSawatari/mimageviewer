@@ -467,6 +467,12 @@ impl App {
         ) {
             return None;
         }
+        self.source_composition_candidate(idx)
+    }
+
+    /// Source identity is shared with output workers. The temporary viewing
+    /// ignore applies only to presentation, never to a new output acceptance.
+    pub(crate) fn source_composition_candidate(&self, idx: usize) -> Option<CandidatePage> {
         let item = self.items.get(idx)?;
         // Folder compositions are outside the viewing scope. Old/imported
         // ImageFolder rows remain stored, but ordinary images need no receipt.

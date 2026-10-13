@@ -30,6 +30,26 @@ pub struct BatchExportItem {
     pub dirname: String,
     pub source: crate::books::CompositeSource,
     pub edits: crate::books::BakedEditSnapshot,
+    pub(crate) composition_check: Option<crate::book_composition::CompositionOutputCheck>,
+}
+
+impl BatchExportItem {
+    /// Creates an item for callers without an App composition context.
+    /// App selection factories must attach their captured visibility check.
+    pub fn new(
+        filename: String,
+        dirname: String,
+        source: crate::books::CompositeSource,
+        edits: crate::books::BakedEditSnapshot,
+    ) -> Self {
+        Self {
+            filename,
+            dirname,
+            source,
+            edits,
+            composition_check: None,
+        }
+    }
 }
 
 pub struct BatchExportRequest {
@@ -174,6 +194,7 @@ fn run_batch_export(
     }
 
     let mut claimed: HashSet<PathBuf> = HashSet::new();
+    let mut resolver = crate::book_composition::CompositionOutputResolver::default();
     for (index, item) in request.items.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             let _ = tx.send(ExportEvent::Cancelled);
@@ -183,6 +204,19 @@ fn run_batch_export(
         let _ = tx.send(ExportEvent::Started {
             label: label.clone(),
         });
+        if let Some(check) = &item.composition_check {
+            let refusal = match check.permits_with(&mut resolver) {
+                Ok(true) => None,
+                Ok(false) => {
+                    Some(crate::book_composition::COMPOSITION_OUTPUT_HIDDEN_NOTICE.to_owned())
+                }
+                Err(reason) => Some(reason),
+            };
+            if let Some(message) = refusal {
+                let _ = tx.send(ExportEvent::Failed(ExportFailure { label, message }));
+                continue;
+            }
+        }
         let stem = resolve_item_stem(&request.template, item, index + 1);
         let path = match unique_target_path(
             &request.output_dir,
@@ -220,6 +254,7 @@ mod tests {
 
     fn item(filename: &str, dirname: &str) -> BatchExportItem {
         BatchExportItem {
+            composition_check: None,
             filename: filename.to_string(),
             dirname: dirname.to_string(),
             source: crate::books::CompositeSource::File {
@@ -289,5 +324,156 @@ mod tests {
         let b = unique_target_path(temp.path(), &b, "png", &mut claimed).unwrap();
 
         assert_ne!(a, b);
+    }
+    #[test]
+    fn worker_qualifies_captured_selection_against_latest_hidden_and_preserves_visible_order() {
+        use crate::book_composition::{
+            BookComposition, BookCompositionService, CandidatePage, CompositionOutputCheck,
+            CompositionPageRef, PageDomain, ReadingDirection,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("real.png");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([50, 60, 70, 255]))
+            .save(&input)
+            .unwrap();
+        let (service, owner) =
+            BookCompositionService::spawn_at(temp.path().join("data"), None).unwrap();
+        let scope = crate::book_scope::BookScopeKey::document("C:/selected.pdf").unwrap();
+        service
+            .prepare(scope.clone(), PageDomain::Document)
+            .recv()
+            .unwrap()
+            .status
+            .unwrap();
+        let mut items: Vec<_> = [2, 0, 1]
+            .into_iter()
+            .map(|page| {
+                let mut item = item(&format!("page-{page}"), "book");
+                item.source = crate::books::CompositeSource::File {
+                    path: input.clone(),
+                };
+                item.composition_check = Some(CompositionOutputCheck::new(
+                    service.clone(),
+                    CandidatePage {
+                        identity: crate::book_resume_db::PageIdentity::Document {
+                            container: "C:/selected.pdf".into(),
+                            page_num: page,
+                        },
+                        physical_archive: None,
+                        raw_tree: None,
+                    },
+                ));
+                item
+            })
+            .collect();
+        // A hidden selection may be nonexistent; admission must precede decode.
+        items[2].source = crate::books::CompositeSource::File {
+            path: temp.path().join("hidden-must-not-decode.png"),
+        };
+        let mut record = BookComposition::new(
+            ReadingDirection::Ltr,
+            (0..3)
+                .map(|page_num| CompositionPageRef::PdfPage { page_num })
+                .collect(),
+        );
+        record
+            .hidden_pages
+            .push(CompositionPageRef::PdfPage { page_num: 1 });
+        service
+            .save(scope, PageDomain::Document, record)
+            .recv()
+            .unwrap()
+            .status
+            .unwrap();
+        let output = temp.path().join("out");
+        let (tx, rx) = mpsc::channel();
+        run_batch_export(
+            BatchExportPlan {
+                output_dir: output.clone(),
+                template: "<num>_<filename>".into(),
+                scale: ExportScale::Full,
+                items,
+                raw: None,
+            },
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
+        let events: Vec<_> = rx.into_iter().collect();
+        let completed: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                ExportEvent::Completed(result) => Some(result.label.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(completed, vec!["page-2", "page-0"]);
+        assert!(events.iter().any(|event| matches!(event, ExportEvent::Failed(failure) if failure.label == "page-1" && failure.message == crate::book_composition::COMPOSITION_OUTPUT_HIDDEN_NOTICE)));
+        assert!(output.join("0001_page-2.png").exists());
+        assert!(output.join("0002_page-0.png").exists());
+        assert_eq!(std::fs::read_dir(output).unwrap().count(), 2);
+        owner.shutdown_and_join();
+    }
+
+    #[test]
+    fn worker_reports_unreadable_composition_without_reading_source_or_writing_page() {
+        use crate::book_composition::{
+            BookCompositionService, CandidatePage, CompositionOutputCheck, PageDomain,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(
+            data.join("book_composition.db"),
+            b"preserve unreadable composition",
+        )
+        .unwrap();
+        let (service, owner) = BookCompositionService::spawn_at(data.clone(), None).unwrap();
+        service
+            .prepare(
+                crate::book_scope::BookScopeKey::document("C:/selected.pdf").unwrap(),
+                PageDomain::Document,
+            )
+            .recv()
+            .unwrap();
+        let mut source = item("unreadable", "book");
+        source.composition_check = Some(CompositionOutputCheck::new(
+            service,
+            CandidatePage {
+                identity: crate::book_resume_db::PageIdentity::Document {
+                    container: "C:/selected.pdf".into(),
+                    page_num: 0,
+                },
+                physical_archive: None,
+                raw_tree: None,
+            },
+        ));
+        let output = temp.path().join("out");
+        let (tx, rx) = mpsc::channel();
+        run_batch_export(
+            BatchExportPlan {
+                output_dir: output.clone(),
+                template: "<filename>".into(),
+                scale: ExportScale::Full,
+                items: vec![source],
+                raw: None,
+            },
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
+        let events: Vec<_> = rx.into_iter().collect();
+        assert!(events.iter().any(
+            |event| matches!(event, ExportEvent::Failed(failure) if failure.label == "unreadable")
+        ));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ExportEvent::Completed(_)))
+        );
+        assert_eq!(std::fs::read_dir(output).unwrap().count(), 0);
+        owner.shutdown_and_join();
+        assert_eq!(
+            std::fs::read(data.join("book_composition.db")).unwrap(),
+            b"preserve unreadable composition"
+        );
     }
 }

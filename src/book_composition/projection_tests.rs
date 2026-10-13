@@ -36,10 +36,14 @@ fn composed(outcome: &CompositionProjectionOutcome) -> &AcceptedCompositionProje
 }
 
 #[test]
-fn g3_page_block_reorders_reindexes_helpers_targets_metadata_and_canonical_raw_together() {
-    let mut record = fixtures::editor_unit_edits(ReadingDirection::Rtl).with_cover_helper;
-    // Move C/D before the ordinary cover; the helper remains attached to D.
-    record.units.rotate_left(1);
+fn b_page_block_reorders_reindexes_overrides_targets_metadata_and_canonical_raw_together() {
+    let mut record = fixtures::four_page_book(ReadingDirection::Rtl);
+    record.cover_enabled = true;
+    record.page_overrides.push(PageOverrideEntry {
+        page: fixtures::document_page(3),
+        directive: PageOverride::Alone,
+    });
+    record.page_order.rotate_left(1);
     let snapshot = record.clone();
     let scope = BookScopeKey::document("C:/source/book.epub").unwrap();
     let manifest = fixtures::document_manifest(4)
@@ -63,7 +67,7 @@ fn g3_page_block_reorders_reindexes_helpers_targets_metadata_and_canonical_raw_t
     .unwrap();
     assert_eq!(result.output_to_input, [0, 2, 3, 4, 1, 5]);
     let accepted = composed(&result.outcome);
-    assert_eq!(accepted.cover, record.cover);
+    assert_eq!(accepted.cover_enabled, record.cover_enabled);
     assert_eq!(accepted.scope, scope);
     assert_eq!(accepted.token, token());
     assert_eq!(accepted.canonical_raw_index_for_projected(4), Some(1));
@@ -85,14 +89,10 @@ fn g3_page_block_reorders_reindexes_helpers_targets_metadata_and_canonical_raw_t
         }),
         PageStatus::Visible { item_index: 4 }
     );
-    assert!(matches!(
-        &accepted.resolved.units[2],
-        ResolvedUnit::Single {
-            page: ResolvedPage { item_index: 3, .. },
-            companion: ResolvedCompanion::FrontCoverSupplement(ResolvedPage { item_index: 4, .. }),
-            ..
-        }
-    ));
+    assert_eq!(
+        accepted.resolved.page_override(3),
+        Some(PageOverride::Alone)
+    );
     assert_eq!(record, snapshot);
     // The worker adapter publishes the same identity/metadata permutation for real PDF rows.
     let pages = (0..4)
@@ -126,7 +126,7 @@ fn g3_page_block_reorders_reindexes_helpers_targets_metadata_and_canonical_raw_t
 }
 
 #[test]
-fn g3_hidden_deletion_does_not_repair_ab_cd_and_keeps_saved_b_ref() {
+fn b_hidden_deletion_compacts_flat_order_and_keeps_saved_b_ref() {
     let original = fixtures::four_page_book(ReadingDirection::Ltr);
     let mut hidden = original.clone();
     hidden.hidden_pages.push(fixtures::document_page(1));
@@ -164,13 +164,14 @@ fn g3_hidden_deletion_does_not_repair_ab_cd_and_keeps_saved_b_ref() {
         accepted.position_for_projected(1).unwrap().identity,
         Some(fixtures::document_page(2).resume_identity(&scope.logical_root))
     );
-    assert!(
-        matches!(&accepted.resolved.units[0], ResolvedUnit::Single { page, placement: SinglePlacement::Leading,
-        companion: ResolvedCompanion::Vacant } if page.item_index == 0)
-    );
-    assert!(
-        matches!(&accepted.resolved.units[1], ResolvedUnit::Pair { first, second }
-        if (first.item_index, second.item_index) == (1, 2))
+    assert_eq!(
+        accepted
+            .resolved
+            .visible_pages
+            .iter()
+            .map(|page| page.page.clone())
+            .collect::<Vec<_>>(),
+        [0, 2, 3].map(fixtures::document_page)
     );
     let full = project_composition(
         scope,
@@ -198,13 +199,14 @@ fn g3_hidden_deletion_does_not_repair_ab_cd_and_keeps_saved_b_ref() {
         deleted.position_for_projected(1).unwrap().identity,
         Some(fixtures::document_page(2).resume_identity(&deleted.scope.logical_root))
     );
-    assert!(
-        matches!(&deleted.resolved.units[0], ResolvedUnit::Single { page, placement: SinglePlacement::Leading, .. }
-        if page.page == fixtures::document_page(0))
-    );
-    assert!(
-        matches!(&deleted.resolved.units[1], ResolvedUnit::Pair { first, second }
-        if (first.page.clone(), second.page.clone()) == (fixtures::document_page(2), fixtures::document_page(3)))
+    assert_eq!(
+        deleted
+            .resolved
+            .visible_pages
+            .iter()
+            .map(|page| page.page.clone())
+            .collect::<Vec<_>>(),
+        [0, 2, 3].map(fixtures::document_page)
     );
     assert_eq!(original.pages().count(), 4);
     let reloaded_manifest = [0, 2, 3]
@@ -269,16 +271,11 @@ fn g3_all_hidden_remains_empty_and_blank_tail_policy_facet_statuses_are_distinct
         PageStatus::FilteredOut
     );
     assert!(!projection.resolved.complete);
-    for unit in projection.resolved.units.iter().rev().take(2) {
-        assert!(matches!(
-            unit,
-            ResolvedUnit::Single {
-                placement: SinglePlacement::Center,
-                companion: ResolvedCompanion::Vacant,
-                ..
-            }
-        ));
-    }
+    assert_eq!(
+        projection.resolved.new_tail,
+        [fixtures::document_page(4), fixtures::document_page(5)]
+    );
+    assert_eq!(projection.resolved.visible_pages.len(), 3);
     assert_eq!(record, saved);
     record.hidden_pages = record.pages().cloned().collect();
     let empty = project_composition(
@@ -292,7 +289,7 @@ fn g3_all_hidden_remains_empty_and_blank_tail_policy_facet_statuses_are_distinct
     )
     .unwrap();
     assert!(empty.output_to_input.is_empty());
-    assert!(composed(&empty.outcome).resolved.units.is_empty());
+    assert!(composed(&empty.outcome).resolved.visible_pages.is_empty());
     assert!(composed(&empty.outcome).resolved.complete);
 }
 
@@ -333,11 +330,7 @@ fn g3_unsafe_and_ambiguous_actual_archives_preserve_legacy_rows_source_bytes_and
         };
         let mut stored = BookComposition::new(
             ReadingDirection::Ltr,
-            vec![CompositionUnit::Single {
-                page: CompositionPageRef::ArchiveEntry { entry_name: safe },
-                placement: SinglePlacement::Center,
-                companion: SingleCompanion::Vacant,
-            }],
+            vec![CompositionPageRef::ArchiveEntry { entry_name: safe }],
         );
         let database = dir.path().join("book_composition.db");
         store::initialize_database_at(&database).unwrap();
@@ -519,20 +512,13 @@ fn g3_uncomposed_preserves_exact_order_even_when_record_order_would_differ() {
 }
 
 #[test]
-fn g3_saved_cover_metadata_retains_exact_ref_when_hidden_missing_or_reindexed() {
+fn b_cover_flag_survives_hidden_missing_and_reindex() {
     let scope = BookScopeKey::archive("C:/cover.zip", &[]).unwrap();
     let page = CompositionPageRef::ArchiveEntry {
         entry_name: "FrontCover.JPG".into(),
     };
-    let mut record = BookComposition::new(
-        ReadingDirection::Rtl,
-        vec![CompositionUnit::Single {
-            page: page.clone(),
-            placement: SinglePlacement::Leading,
-            companion: SingleCompanion::Vacant,
-        }],
-    );
-    record.cover = Some(page.clone());
+    let mut record = BookComposition::new(ReadingDirection::Rtl, vec![page.clone()]);
+    record.cover_enabled = true;
     let raw = [CanonicalRawPage {
         page: page.clone(),
         raw_index: 0,
@@ -554,13 +540,13 @@ fn g3_saved_cover_metadata_retains_exact_ref_when_hidden_missing_or_reindexed() 
     )
     .unwrap();
     let projection = composed(&prepared.outcome);
-    assert_eq!(projection.cover, record.cover);
+    assert_eq!(projection.cover_enabled, record.cover_enabled);
     let deleted = projection
         .remap_removed_items(&[None], &[page.clone()])
         .unwrap();
-    assert_eq!(deleted.cover, Some(page.clone()));
+    assert!(deleted.cover_enabled);
     assert_eq!(deleted.resolved.page_status(&page), PageStatus::Missing);
-    assert!(deleted.resolved.units.is_empty());
+    assert!(deleted.resolved.visible_pages.is_empty());
     record.hidden_pages.push(page.clone());
     let hidden = project_composition(
         scope,
@@ -575,21 +561,16 @@ fn g3_saved_cover_metadata_retains_exact_ref_when_hidden_missing_or_reindexed() 
     )
     .unwrap();
     let hidden = composed(&hidden.outcome);
-    assert_eq!(hidden.cover, Some(page.clone()));
+    assert!(hidden.cover_enabled);
     assert_eq!(
         hidden.resolved.page_status(&page),
         PageStatus::HiddenByComposition
     );
-    assert!(hidden.resolved.units.is_empty());
-    assert_eq!(hidden.clone().cover, record.cover);
+    assert!(hidden.resolved.visible_pages.is_empty());
+    assert_eq!(hidden.clone().cover_enabled, record.cover_enabled);
     let reindexed = hidden.remap_removed_items(&[], &[]).unwrap();
-    assert_eq!(reindexed.cover, Some(page));
-    assert_eq!(
-        record.cover.as_ref().unwrap(),
-        &CompositionPageRef::ArchiveEntry {
-            entry_name: "FrontCover.JPG".into()
-        }
-    );
+    assert!(reindexed.cover_enabled);
+    assert_eq!(record.page_order, vec![page]);
 }
 
 #[test]
@@ -678,37 +659,22 @@ fn g3_navigation_retains_raw_level_when_policy_collapse_changes_display_prefix()
 }
 
 #[test]
-fn g3_initial_capture_freezes_oracle_topology_and_rejects_missing_or_duplicate_pages() {
-    let fixture = fixtures::editor_unit_edits(ReadingDirection::Rtl).with_cover_helper;
+fn b_initial_capture_binding_and_raw_order_without_frozen_units() {
     let pages = (0..4).map(fixtures::document_page).collect::<Vec<_>>();
-    let initial = capture_initial_composition(
-        &PageDomain::Document,
-        fixture.direction,
-        fixture.cover.clone(),
-        &fixture.units,
-        &pages,
-    )
-    .unwrap();
-    assert_eq!(initial, fixture);
+    let initial =
+        capture_initial_composition(&PageDomain::Document, ReadingDirection::Rtl, true, &pages)
+            .unwrap();
+    assert_eq!(initial.page_order, pages);
+    assert!(initial.cover_enabled);
+    assert!(initial.page_overrides.is_empty());
+    let mut duplicate = pages;
+    duplicate.push(fixtures::document_page(0));
     assert!(
         capture_initial_composition(
             &PageDomain::Document,
-            fixture.direction,
-            fixture.cover.clone(),
-            &fixture.units,
-            &pages[..3]
-        )
-        .is_err()
-    );
-    let mut duplicates = pages;
-    duplicates.push(fixtures::document_page(0));
-    assert!(
-        capture_initial_composition(
-            &PageDomain::Document,
-            fixture.direction,
-            fixture.cover.clone(),
-            &fixture.units,
-            &duplicates
+            ReadingDirection::Rtl,
+            true,
+            &duplicate
         )
         .is_err()
     );
@@ -731,21 +697,10 @@ fn g3_e_joint_scope_identity_and_opaque_composed_do_not_consume_dormant_shift() 
             _ => unreachable!(),
         })
         .collect::<Vec<_>>();
-    let units = vec![
-        CompositionUnit::Pair {
-            first: pages[0].clone(),
-            second: pages[1].clone(),
-        },
-        CompositionUnit::Pair {
-            first: pages[2].clone(),
-            second: pages[3].clone(),
-        },
-    ];
     let record = capture_initial_composition(
         &PageDomain::ImageFolder,
         ReadingDirection::Ltr,
-        None,
-        &units,
+        false,
         &pages,
     )
     .unwrap();

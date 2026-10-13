@@ -114,11 +114,7 @@ fn candidate_worker_checks_only_identity_and_adopts_fresh_scope_publication() {
     assert!(matches!(first, CandidatePermission::Allowed(Some(_))));
     let mut composition = BookComposition::new(
         ReadingDirection::Ltr,
-        vec![CompositionUnit::Single {
-            page: CompositionPageRef::PdfPage { page_num: 2 },
-            placement: SinglePlacement::Center,
-            companion: SingleCompanion::Vacant,
-        }],
+        vec![CompositionPageRef::PdfPage { page_num: 2 }],
     );
     composition
         .hidden_pages
@@ -241,11 +237,7 @@ fn mutation_boundary_rechecks_latest_hidden_and_binding_without_changing_rows() 
     assert!(admission.validate(&service.snapshot()).is_ok());
     let mut composition = BookComposition::new(
         ReadingDirection::Ltr,
-        vec![CompositionUnit::Single {
-            page: CompositionPageRef::PdfPage { page_num: 4 },
-            placement: SinglePlacement::Center,
-            companion: SingleCompanion::Vacant,
-        }],
+        vec![CompositionPageRef::PdfPage { page_num: 4 }],
     );
     composition
         .hidden_pages
@@ -547,5 +539,346 @@ fn queued_trim_admission_fences_page_edit_readers_until_each_worker_receipt() {
         completed,
         PAGE_EDIT_WRITES.sample()
     ));
+    owner.shutdown_and_join();
+}
+
+#[test]
+fn output_check_is_fresh_and_unrelated_archive_never_requires_source_enumeration() {
+    let temp = tempfile::tempdir().unwrap();
+    let (service, owner) = BookCompositionService::spawn_at(temp.path().into(), None).unwrap();
+    let scope = crate::book_scope::BookScopeKey::document("C:/output.pdf").unwrap();
+    service
+        .prepare(scope.clone(), PageDomain::Document)
+        .recv()
+        .unwrap()
+        .status
+        .unwrap();
+    let check = CompositionOutputCheck::new(service.clone(), document("C:/output.pdf", 1));
+    assert!(check.permits().unwrap());
+    let mut book = BookComposition::new(
+        ReadingDirection::Ltr,
+        vec![CompositionPageRef::PdfPage { page_num: 1 }],
+    );
+    book.hidden_pages = book.page_order.clone();
+    service
+        .save(scope.clone(), PageDomain::Document, book)
+        .recv()
+        .unwrap()
+        .status
+        .unwrap();
+    assert!(!check.permits().unwrap());
+    let unrelated = CompositionOutputCheck::new(
+        service.clone(),
+        CandidatePage {
+            identity: crate::book_resume_db::PageIdentity::Archive {
+                container: "C:/does-not-exist.zip".into(),
+                entry_name: "page.jpg".into(),
+            },
+            physical_archive: None,
+            raw_tree: None,
+        },
+    );
+    assert!(unrelated.permits().unwrap());
+    service
+        .remove(scope, PageDomain::Document)
+        .recv()
+        .unwrap()
+        .status
+        .unwrap();
+    assert!(check.permits().unwrap());
+    assert!(unrelated.permits().unwrap());
+    owner.shutdown_and_join();
+}
+
+#[test]
+fn output_check_unavailable_store_is_error_and_unsupported_source_keeps_ordinary_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let (service, owner) =
+        BookCompositionService::spawn_at(temp.path().join("unreadable"), None).unwrap();
+    let scope = crate::book_scope::BookScopeKey::document("C:/output.pdf").unwrap();
+    service
+        .prepare(scope, PageDomain::Document)
+        .recv()
+        .unwrap()
+        .status
+        .unwrap();
+    // Put an unrelated record in the snapshot so the unsupported archive path
+    // reaches the shared resolver only when that logical root has a saved scope.
+    let root = "C:/unsupported.zip";
+    let scope = crate::book_scope::BookScopeKey::archive(root, &[]).unwrap();
+    service
+        .save(
+            scope,
+            PageDomain::ArchiveLevel {
+                prefix: String::new(),
+            },
+            BookComposition::new(
+                ReadingDirection::Ltr,
+                vec![CompositionPageRef::ArchiveEntry {
+                    entry_name: "a.jpg".into(),
+                }],
+            ),
+        )
+        .recv()
+        .unwrap()
+        .status
+        .unwrap();
+    let tree = crate::zip_tree::ZipTree::build(
+        root.into(),
+        vec![crate::zip_loader::ZipImageEntry {
+            entry_name: "a.jpg".into(),
+            uncompressed_size: 0,
+            mtime: 0,
+            container_ancestry: vec![],
+        }],
+    );
+    let unsupported = CompositionOutputCheck::new(
+        service.clone(),
+        CandidatePage {
+            identity: crate::book_resume_db::PageIdentity::Archive {
+                container: root.into(),
+                entry_name: "../bad.jpg".into(),
+            },
+            physical_archive: None,
+            raw_tree: Some(Arc::new(tree)),
+        },
+    );
+    assert!(unsupported.permits().unwrap());
+    owner.shutdown_and_join();
+    let broken = temp.path().join("broken");
+    std::fs::create_dir_all(&broken).unwrap();
+    std::fs::write(
+        broken.join("book_composition.db"),
+        b"keep unreadable original",
+    )
+    .unwrap();
+    let (service, owner) = BookCompositionService::spawn_at(broken.clone(), None).unwrap();
+    service
+        .prepare(
+            crate::book_scope::BookScopeKey::document("C:/output.pdf").unwrap(),
+            PageDomain::Document,
+        )
+        .recv()
+        .unwrap();
+    assert!(
+        CompositionOutputCheck::new(service, document("C:/output.pdf", 0))
+            .permits()
+            .is_err()
+    );
+    owner.shutdown_and_join();
+    assert_eq!(
+        std::fs::read(broken.join("book_composition.db")).unwrap(),
+        b"keep unreadable original"
+    );
+}
+
+#[test]
+fn output_run_prepares_large_converted_archive_once_and_refreshes_hidden_by_scope_token() {
+    const COUNT: u32 = 10_000;
+    let temp = tempfile::tempdir().unwrap();
+    let (service, owner) = BookCompositionService::spawn_at(temp.path().into(), None).unwrap();
+    let logical = "D:/Books/source.rar";
+    let physical = std::path::PathBuf::from("C:/cache/converted.zip");
+    let prefix = "wrapper/chapter.zip/pages";
+    let page = |number| CompositionPageRef::ArchiveEntry {
+        entry_name: format!("{prefix}/{number}.jpg"),
+    };
+    let tree = Arc::new(crate::zip_tree::ZipTree::build(
+        physical.clone(),
+        (0..COUNT)
+            .map(|number| crate::zip_loader::ZipImageEntry {
+                entry_name: format!("{prefix}/{number}.jpg"),
+                uncompressed_size: 0,
+                mtime: 0,
+                container_ancestry: vec![],
+            })
+            .collect(),
+    ));
+    let scope = crate::book_scope::BookScopeKey::new(logical, prefix).unwrap();
+    let domain = PageDomain::ArchiveLevel {
+        prefix: prefix.into(),
+    };
+    let mut record = BookComposition::new(ReadingDirection::Ltr, (0..COUNT).map(page).collect());
+    record.hidden_pages = (0..COUNT)
+        .filter(|number| number % 2 == 0)
+        .map(page)
+        .collect();
+    service
+        .save(scope.clone(), domain.clone(), record.clone())
+        .recv()
+        .unwrap()
+        .status
+        .unwrap();
+    let check = |number| {
+        CompositionOutputCheck::new(
+            service.clone(),
+            CandidatePage {
+                identity: crate::book_resume_db::PageIdentity::Archive {
+                    container: logical.into(),
+                    entry_name: format!("{prefix}/{number}.jpg"),
+                },
+                physical_archive: Some(physical.clone()),
+                raw_tree: Some(Arc::clone(&tree)),
+            },
+        )
+    };
+    let mut resolver = CompositionOutputResolver::default();
+    for number in (0..COUNT).rev() {
+        assert_eq!(
+            check(number).permits_with(&mut resolver).unwrap(),
+            number % 2 != 0
+        );
+    }
+    assert_eq!(resolver.prepared_sources, 1);
+    assert_eq!(resolver.visited_pages, COUNT as usize);
+    record.hidden_pages.clear();
+    service
+        .save(scope.clone(), domain.clone(), record)
+        .recv()
+        .unwrap()
+        .status
+        .unwrap();
+    assert!(check(0).permits_with(&mut resolver).unwrap());
+    assert_eq!(resolver.prepared_sources, 1);
+    assert_eq!(resolver.visited_pages, COUNT as usize);
+    service
+        .remove(scope, domain)
+        .recv()
+        .unwrap()
+        .status
+        .unwrap();
+    assert!(check(0).permits_with(&mut resolver).unwrap());
+    owner.shutdown_and_join();
+}
+
+#[test]
+fn output_run_does_not_share_scope_index_between_captured_context_raw_trees() {
+    let temp = tempfile::tempdir().unwrap();
+    let (service, owner) = BookCompositionService::spawn_at(temp.path().into(), None).unwrap();
+    let root = "C:/same.zip";
+    let scope = crate::book_scope::BookScopeKey::archive(root, &[]).unwrap();
+    let mut record = BookComposition::new(
+        ReadingDirection::Ltr,
+        vec![CompositionPageRef::ArchiveEntry {
+            entry_name: "0.jpg".into(),
+        }],
+    );
+    record.hidden_pages = record.page_order.clone();
+    service
+        .save(
+            scope,
+            PageDomain::ArchiveLevel {
+                prefix: String::new(),
+            },
+            record,
+        )
+        .recv()
+        .unwrap()
+        .status
+        .unwrap();
+    let tree = |number| {
+        Arc::new(crate::zip_tree::ZipTree::build(
+            root.into(),
+            vec![crate::zip_loader::ZipImageEntry {
+                entry_name: format!("{number}.jpg"),
+                uncompressed_size: 0,
+                mtime: 0,
+                container_ancestry: vec![],
+            }],
+        ))
+    };
+    let first_tree = tree(0);
+    let second_tree = tree(1);
+    let check = |tree: Arc<crate::zip_tree::ZipTree>| {
+        CompositionOutputCheck::new(
+            service.clone(),
+            CandidatePage {
+                identity: crate::book_resume_db::PageIdentity::Archive {
+                    container: root.into(),
+                    entry_name: "0.jpg".into(),
+                },
+                physical_archive: None,
+                raw_tree: Some(tree),
+            },
+        )
+    };
+    let mut resolver = CompositionOutputResolver::default();
+    assert!(!check(first_tree).permits_with(&mut resolver).unwrap());
+    assert!(check(second_tree).permits_with(&mut resolver).is_err());
+    assert_eq!(resolver.prepared_sources, 2);
+    assert_eq!(resolver.visited_pages, 2);
+    owner.shutdown_and_join();
+}
+
+#[test]
+fn output_source_acceptance_reads_publication_after_archive_index_preparation() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("source.zip");
+    let mut writer = zip::ZipWriter::new(std::fs::File::create(&root).unwrap());
+    writer
+        .start_file("0.jpg", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    std::io::Write::write_all(&mut writer, b"real selected source").unwrap();
+    writer.finish().unwrap();
+    let (service, owner) =
+        BookCompositionService::spawn_at(temp.path().join("data"), None).unwrap();
+    let scope = crate::book_scope::BookScopeKey::archive(&root, &[]).unwrap();
+    let domain = PageDomain::ArchiveLevel {
+        prefix: String::new(),
+    };
+    let page = CompositionPageRef::ArchiveEntry {
+        entry_name: "0.jpg".into(),
+    };
+    let record = BookComposition::new(ReadingDirection::Ltr, vec![page.clone()]);
+    service
+        .save(scope.clone(), domain.clone(), record.clone())
+        .recv()
+        .unwrap()
+        .status
+        .unwrap();
+    let initial_snapshot = service.snapshot();
+    let candidate = CandidatePage {
+        identity: crate::book_resume_db::PageIdentity::Archive {
+            container: crate::path_key::normalize_keep_drive(&root),
+            entry_name: "0.jpg".into(),
+        },
+        physical_archive: Some(root.clone()),
+        raw_tree: None,
+    };
+    let mut resolver = CompositionOutputResolver::default();
+    // Model an editor commit during physical source preparation: the closure is
+    // called at source acceptance, after the disk-backed index has been prepared.
+    assert!(
+        !resolver
+            .permission(&initial_snapshot, &candidate, || {
+                let mut hidden = record.clone();
+                hidden.hidden_pages.push(page.clone());
+                service
+                    .save(scope.clone(), domain.clone(), hidden)
+                    .recv()
+                    .unwrap()
+                    .status
+                    .unwrap();
+                service.snapshot()
+            })
+            .unwrap()
+    );
+    assert_eq!(resolver.prepared_sources, 1);
+    assert_eq!(resolver.visited_pages, 1);
+    // The same acceptance boundary applies when source preparation is cached.
+    assert!(
+        resolver
+            .permission(&initial_snapshot, &candidate, || {
+                service
+                    .save(scope.clone(), domain.clone(), record)
+                    .recv()
+                    .unwrap()
+                    .status
+                    .unwrap();
+                service.snapshot()
+            })
+            .unwrap()
+    );
+    assert_eq!(resolver.prepared_sources, 1);
     owner.shutdown_and_join();
 }

@@ -1,15 +1,15 @@
 # §1.242 本の構成 — 設計案
 
-更新: 2026-10-13、B1（独立設計レビューP2-1/P2-2のREVISE対応、設計・マニュアルのみ）。`next-book`、照合tree `71a3c2228`（master `d73d62841` + カード表示修正）。
-**現在の実装は旧方式のまま。B1 `5e8049f5f`の独立設計レビューはREVISE（P2が2件）。
-本改訂は指摘対応の設計案であり、再レビュー未実施・未実装。設計書とマニュアルだけを変更し、コミットしない。**
+更新: 2026-10-14、B2実装・検証。`next-book`、採択設計 `4f3d160f3`。
+B1は独立設計レビューACCEPT後にコミット済み。B2は採択設計の実装と自動検証で、コミット・アプリ起動は行わない。
+実装・検証の記録は§13のB2に記載する。実機の受入確認は別途行う。
 §1.242と`book_composition.db`は未公開で、v4.6.0には含まれない。次の版に含める（2026-10-13利用者決定）。
 2026-10-11の「次々回」は履歴。旧保存unitsの移行処理は不要。
 
 現行契約は§1・§2.1/§2.2・§3〜§12・§13のB段階・§14の追記（Q25/Q26の設計担当決定を含む）。
 §2の従来調査表、§7.4、§13のG0〜G5・G0照合記録は旧方式の調査・実装・検証履歴として保持する。
 その固定Pair/Single、組変更確認、組ごとの手動補助指定、初期組の凍結、全pairing拒否はBの実装指示ではない。
-旧R6 ACCEPTは当時の設計に対するもの。本改訂を採択済み・検証済みとは扱わない。
+旧R6 ACCEPTは旧方式の設計に対するもの。B1のACCEPTとB2の実装検証・実機確認は区別する。
 設計履歴: R6は独立再レビューACCEPT、P3文言修正は `330e070f6`。G0照合treeは `76488f0ec`。
 Eの共有BookScopeKeyと§1.364はmerge `97c9b711d`で取り込み済み。G3の実装・検証結果は§13とhandoffへ記録し、受入とは区別する。
 
@@ -1416,13 +1416,13 @@ metadata bundleは可視一覧選択からの画像exportとは別で、**非表
 
 ## 13. 段階・担当範囲・受入テスト
 
-### B1: 設計改訂のみ（今回）
+### B1: 設計改訂のみ（採択済み）
 
 成果物は本書とhtdocs/mimageviewer/manual/books.html。製品コード/DB/実行時設定は変更しない。
 設計を書き終えて停止し別担当の独立設計レビューへ渡す。コミット/製品テスト/確認binary/UI起動は行わない。
-後続B段階のchunk/担当はレビュー後に設計leadが確定する。以下を今回開始しない。
+独立設計レビューACCEPT、`4f3d160f3`までコミット済み。以下のB2は2026-10-13に利用者が開始を指示した。
 
-### Bの後続実装・受入候補
+### B2: 実装と受入検証
 
 1. model/store/転送: 新record round-trip、重複/unsafe/上限拒否、旧units migrationなし。
    order/hidden/override改名、Missing/新tail、KeepDrive/scope/domain/内容ID/単一writer。
@@ -1460,6 +1460,68 @@ metadata bundleは可視一覧選択からの画像exportとは別で、**非表
 確認binary/承認済み隔離実機検証はAGENTS.mdの通常手順。B1の文書検査を製品検証として数えない。
 実装時はarchitecture/display/virtual-folders/web-remote/keymap/metadata/spec/manual関連を現行化し、
 detached経路変更前の構造合意/§11記録を守る。B1は他の正本/製品ページへ未実装変更を広げない。
+
+#### B2実装の接点と前提確認（2026-10-13）
+
+- `BookComposition`/DBはschema 2。direction/cover_enabled/page_order/hidden_pages/page_overridesを保存し、
+  旧schema・unitsを変換しない。読めないDBは既存の扱いで保持する。metadata v11も新record一つを運ぶ。
+- pure projectionは可視実列・指定・identityだけを解く。paged/連結/editor/Remoteは
+  `build_spread_display_units_with_overrides`と既存presentation resolverを共有する。
+  ExplicitAlone/ExplicitBlankOppositeの形成理由で自動白紙と区別する。
+  寸法後着と回転は共通cacheのepochへ従い、休眠shiftは適用しない。
+- エディターは直接draft操作とundo/redo。結果workerは未送信draftを最新へまとめ、古いgenerationを採用しない。
+  更新中は保存を止め、順序・非表示・指定・undo/redoは続けられる。hiddenは更新待ちの補助表紙にも表示しない。
+  右の行は画像・ラベル専用帯と、その隣の説明・印の実高の大きい方から決め、一回だけ親へallocateする。
+  本文と固定操作欄の自然高を分離し、操作欄は実文字/ボタンの寸法と幅から1行/2行を決める。
+  200%小画面は件数をタブに統合し、指定ボタン・左右選択・カード全体の実clip内到達も検査する。
+  master `f5bdab499`の`tests/support/scroll_layout.rs`を同じ内容で導入し、実矩形・隣接pitch・仮想切替を1x/2xで検査する。
+- 現在表示中のfacet外ページは、共通builderへ一枚だけ渡してpaged/連結に保持する。
+  明示白紙側を保ち、他のfacet外ページ・自動補助は持ち込まない。通常本のfacet挙動は変更しない。
+- Remoteはstrict IPC v71とaccepted `composition_revision`を使用。order/hidden適用後に既存件数/byte制限、
+  返却範囲だけの寸法取得と共通組生成。明示白紙は既存presentation slotに画面側を渡し、
+  Single/端末単ページ強制/Splitと通常本のsingleton trimは変更しない。§1.368の制限は保持する。
+- §11.3の全冊専用raw列挙→製本入口は現treeにない。全選択は構成後items→実Sourceを既に使うため、その経路を受入検査で固定した。
+  一方、結果列のselected出力のvisibility resolverは旧treeで未実装だった。
+  B2で製本/一括出力workerの実Source受付へ共通候補判定を接続した。hiddenは除外・通知、結果選択順は保持する。
+  出力runだけのsource/scope索引を一度準備し、各候補で最新snapshot/tokenを照合する。DB回復・全本寸法取得は追加しない。
+
+#### B2全体gateで見つかった関連修正（2026-10-14）
+
+- Appの既存スタック上限検査で110,264 bytesを観測。Preparing/Projectingが保持するProjectionOriginをBoxへ移し、
+  109,832 bytesへ減らして既存110,000 bytes未満の条件を維持した。旧表示参照を共通getterへまとめ、
+  scope/token/source/receiver/状態遷移・pendingのClone→Automaticは変えない。B2が増加を起こしたとは断定しない。
+- キャプチャ入力の既存テストは一関数に独立した4個のAppを置いてdebug stackを溢れさせた。
+  同じ入力列/時刻/期待値を4テストへ分け、各input mutexとcleanup、通常のstackサイズを維持した。製品入力処理は変更しない。
+- 保存形式を使うコピー検査の旧JSONパスをpage_orderへ追従し、App contextのない一括出力fixtureには生成関数を用意した。
+  Appの実出力factoryが付けるvisibility checkは維持する。
+- 通常HUDのspread-shift画像8枚は既存d73d628411のitem_spacing.y=0修正に未追従だった
+  （画像の旧更新は8bc7efc87）。製品HUDを変えず現行renderへ更新し、全8枚を目視した。
+
+#### B2自動検証記録（2026-10-14、4f3d160f3からの未コミット差分）
+
+| 検査 | 結果 / 証跡（target配下、再生成可能） |
+| --- | --- |
+| fmt / UI glyph / diff | `cargo fmt --all -- --check`、`python scripts/check_ui_glyphs.py`、`git diff --check`成功。b2-fmt.log / b2-glyph.log / b2-diff-check.log |
+| normal / portable core check | `cargo check -p mimageviewer --bin mimageviewer-core`、同`--features portable`成功。b2-check.log / b2-check-portable.log |
+| 構成・Remote・転送・出力の焦点検査 | 構成195、実Remote列挙3、metadata転送9、製本/一括出力4成功。b2-related-verification.log。後続の型保持変更は下のlib全件でも検証 |
+| 行 / UI snapshots | 行5、構成snapshot8、通常UI snapshot174成功。b2-row-layout-tests.log / b2-snapshots-update.log / b2-ui-snapshot-final.log。更新したPNG22枚を目視（構成14、既存HUD追従8） |
+| Remote JS | app-runtime 174成功。b2-remote-js.log。command-core 131成功はRemote担当の有効な実行結果を再利用 |
+| 全体gate | `scripts/test-full.ps1 -SuppressCrashDialogs`を一回実行。初回compileの出力fixture追従漏れを修正し、同等workspace/vendor gateを個別に続行。workspaceのlib以外は成功、UI旧画像差分は上の174件で解消。b2-test-full.log / b2-workspace-gate.log |
+| lib全件（修正後） | `cargo test -p mimageviewer --features pack-build-tools --lib`で12,635成功、0失敗、既存ignored 57。stack overflowで中断した分も全件再実行して確認。b2-lib-gate-final.log |
+| vendor全件 | egui 25、egui-wgpu 11、eframe 18成功。b2-vendor-egui.log / b2-vendor-egui-wgpu.log / b2-vendor-eframe.log |
+| 確認用build | `scripts/build-dev.ps1`成功、normal featuresのcore / Remote / EPUB workerをtarget/dev-runtimeへ配置。b2-build-dev.log。起動していない |
+| 独立レビュー | ソースと自動gateの範囲でACCEPT、未解消所見なし。実機受入は別途 |
+
+キャプチャ入力14件、Appサイズ検査、コピー検査の修正後成功はb2-capture-tests-final.log /
+b2-stack-bound-repair.log / b2-copy-path-repair.logにも残す。旧test executableを一度誤指定した再現確認は
+stale-binary logへ分離し、修正の成功証跡には数えない。
+
+実機確認はアプリを起動せず利用者へ引き継ぐ。隔離data-dirは`G:\miv-iso\book\data`、
+媒体は`G:\miv-iso\media\book_zip.zip` / `book_pdf.pdf`等。
+順序/hiddenの組み直し、Alone/白紙/末尾表紙の優先、undo/redo、200%時の行/操作欄、
+保存・再開位置/しおり/履歴・別窓、Remote、trim・転送・製本/出力を確認する。
+旧unitsの隔離データがある場合は削除せず退避し、新しい空の同data-dirで新形式を検査する。
+通常のAPPDATAは使わない。コミットは実施しない。
 
 ### 旧G段階の実装・採択・検証履歴
 

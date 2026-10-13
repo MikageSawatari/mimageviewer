@@ -749,8 +749,7 @@ fn g2_input_free_pending_read_wakes_root_until_fifo_reply_is_adopted() {
 #[test]
 fn g3_unsupported_source_notifies_once_and_keeps_original_rows_and_stored_bytes() {
     use crate::book_composition::{
-        BookComposition, CompositionPageRef, CompositionProjectionOutcome, CompositionUnit,
-        SingleCompanion, SinglePlacement,
+        BookComposition, CompositionPageRef, CompositionProjectionOutcome,
     };
     use std::io::Write;
     for names in [vec!["/b.jpg", "c.jpg"], vec!["B.jpg", "b.jpg", "c.jpg"]] {
@@ -798,12 +797,8 @@ fn g3_unsupported_source_notifies_once_and_keeps_original_rows_and_stored_bytes(
         let (service, owner) = runtime(&mut env, &data);
         let stored = BookComposition::new(
             ReadingDirection::Ltr,
-            vec![CompositionUnit::Single {
-                page: CompositionPageRef::ArchiveEntry {
-                    entry_name: "c.jpg".into(),
-                },
-                placement: SinglePlacement::Center,
-                companion: SingleCompanion::Vacant,
+            vec![CompositionPageRef::ArchiveEntry {
+                entry_name: "c.jpg".into(),
             }],
         );
         service
@@ -894,7 +889,7 @@ fn admit_projection(app: &mut App, service: &BookCompositionService, scope: &Boo
     app.book_composition = ViewerBookComposition::Preparing {
         scope: scope.clone(),
         receiver,
-        origin,
+        origin: Box::new(origin),
     };
     app.poll_book_composition_read(&egui::Context::default());
     assert!(matches!(
@@ -985,8 +980,10 @@ fn g3_document_reentry_keeps_physical_extent_after_composed_row_reorder() {
     let composition = crate::book_composition::BookComposition::new(
         ReadingDirection::Ltr,
         vec![
-            crate::book_composition::fixtures::pair(2, 3),
-            crate::book_composition::fixtures::pair(0, 1),
+            crate::book_composition::fixtures::document_page(2),
+            crate::book_composition::fixtures::document_page(3),
+            crate::book_composition::fixtures::document_page(0),
+            crate::book_composition::fixtures::document_page(1),
         ],
     );
     service
@@ -1033,8 +1030,10 @@ fn g3_bookmark_hint_uses_raw_position_and_composed_detail_order_is_locked() {
             crate::book_composition::BookComposition::new(
                 ReadingDirection::Ltr,
                 vec![
-                    crate::book_composition::fixtures::pair(2, 3),
-                    crate::book_composition::fixtures::pair(0, 1),
+                    crate::book_composition::fixtures::document_page(2),
+                    crate::book_composition::fixtures::document_page(3),
+                    crate::book_composition::fixtures::document_page(0),
+                    crate::book_composition::fixtures::document_page(1),
                 ],
             ),
         )
@@ -1069,14 +1068,22 @@ fn g3_bookmark_hint_uses_raw_position_and_composed_detail_order_is_locked() {
 #[test]
 fn g3_initial_moved_projection_preserves_raw_resume_identity_and_history_ordinal() {
     use super::file_type_resume::PositionResolution;
-    use crate::book_composition::{BookComposition, fixtures::pair};
+    use crate::book_composition::{BookComposition, fixtures::document_page};
     use crate::book_resume_db::{PageIdentity, ReadingPosition};
     let mut env = setup_app();
     let root = env.tmp.path().join("moved.pdf");
     let data = env.tmp.path().join("moved-data");
     let scope = install_document(&mut env, &root);
     let (service, owner) = runtime(&mut env, &data);
-    let composition = BookComposition::new(ReadingDirection::Rtl, vec![pair(2, 3), pair(0, 1)]);
+    let composition = BookComposition::new(
+        ReadingDirection::Rtl,
+        vec![
+            document_page(2),
+            document_page(3),
+            document_page(0),
+            document_page(1),
+        ],
+    );
     service
         .save(scope.clone(), PageDomain::Document, composition)
         .recv_timeout(WAIT)
@@ -1125,18 +1132,22 @@ fn g3_initial_moved_projection_preserves_raw_resume_identity_and_history_ordinal
 
 #[test]
 fn g3_initial_deferred_entry_waits_for_projection_then_opens_first_visible_real() {
-    use crate::book_composition::{
-        BookComposition,
-        fixtures::{document_page, pair},
-    };
+    use crate::book_composition::{BookComposition, fixtures::document_page};
     for hide_all in [false, true] {
         let mut env = setup_app();
         let root = env.tmp.path().join("first-entry.pdf");
         let data = env.tmp.path().join("first-entry-data");
         let scope = install_document(&mut env, &root);
         let (service, owner) = runtime(&mut env, &data);
-        let mut composition =
-            BookComposition::new(ReadingDirection::Rtl, vec![pair(2, 3), pair(0, 1)]);
+        let mut composition = BookComposition::new(
+            ReadingDirection::Rtl,
+            vec![
+                document_page(2),
+                document_page(3),
+                document_page(0),
+                document_page(1),
+            ],
+        );
         composition.hidden_pages = if hide_all {
             (0..4).map(document_page).collect()
         } else {
@@ -1381,7 +1392,7 @@ fn g3_hidden_refresh_follows_next_previous_first_and_closes_without_resume_write
 
 #[test]
 fn g3_refresh_keeps_latest_navigation_and_ignores_superseded_source_generation() {
-    use crate::book_composition::{BookComposition, fixtures::pair};
+    use crate::book_composition::{BookComposition, fixtures::document_page};
     let mut env = setup_app();
     let root = env.tmp.path().join("refresh-navigation.pdf");
     let data = env.tmp.path().join("refresh-navigation-data");
@@ -1394,7 +1405,15 @@ fn g3_refresh_keeps_latest_navigation_and_ignores_superseded_source_generation()
         .save(
             scope.clone(),
             PageDomain::Document,
-            BookComposition::new(ReadingDirection::Rtl, vec![pair(2, 3), pair(0, 1)]),
+            BookComposition::new(
+                ReadingDirection::Rtl,
+                vec![
+                    document_page(2),
+                    document_page(3),
+                    document_page(0),
+                    document_page(1),
+                ],
+            ),
         )
         .recv_timeout(WAIT)
         .unwrap()
@@ -1682,7 +1701,7 @@ fn g3_mode_only_removal_and_document_reentry_preserve_saved_rtl_direction() {
 
 #[test]
 fn g3_mode_only_archive_removal_and_reentry_preserve_inherited_rtl_cover() {
-    use crate::book_composition::{BookComposition, CompositionPageRef, CompositionUnit};
+    use crate::book_composition::{BookComposition, CompositionPageRef};
     use crate::settings::{ReadingDirection as Direction, ReadingFlow, SpreadMode};
     use crate::ui_fullscreen::FullscreenViewMode;
     use std::io::Write;
@@ -1747,14 +1766,9 @@ fn g3_mode_only_archive_removal_and_reentry_preserve_inherited_rtl_cover() {
     let (service, owner) = runtime(&mut env, &data);
     let composition = BookComposition::new(
         ReadingDirection::Ltr,
-        (0..2)
-            .map(|pair| CompositionUnit::Pair {
-                first: CompositionPageRef::ArchiveEntry {
-                    entry_name: format!("chapter/{}.jpg", pair * 2),
-                },
-                second: CompositionPageRef::ArchiveEntry {
-                    entry_name: format!("chapter/{}.jpg", pair * 2 + 1),
-                },
+        (0..4)
+            .map(|page| CompositionPageRef::ArchiveEntry {
+                entry_name: format!("chapter/{page}.jpg"),
             })
             .collect(),
     );

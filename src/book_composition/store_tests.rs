@@ -64,7 +64,7 @@ fn transaction_roundtrip_revisions_and_invalid_replacement_preserve_old_record()
     );
     let before = load_rows(&connection).unwrap();
     let mut invalid = book();
-    invalid.units.push(invalid.units[0].clone());
+    invalid.page_order.push(invalid.page_order[0].clone());
     let tx = connection.transaction().unwrap();
     assert!(
         replace_row_in(
@@ -189,12 +189,8 @@ fn archive_domain_matches_scope_and_preserves_original_member_spelling() {
     let scope = BookScopeKey::new("D:/Books/A.zip", "chapter").unwrap();
     let composition = BookComposition::new(
         ReadingDirection::Ltr,
-        vec![CompositionUnit::Single {
-            page: CompositionPageRef::ArchiveEntry {
-                entry_name: "Chapter/Page.JPG".into(),
-            },
-            placement: SinglePlacement::Center,
-            companion: SingleCompanion::Vacant,
+        vec![CompositionPageRef::ArchiveEntry {
+            entry_name: "Chapter/Page.JPG".into(),
         }],
     );
     validate_scope_domain(&scope, &domain).unwrap();
@@ -207,8 +203,8 @@ fn archive_domain_matches_scope_and_preserves_original_member_spelling() {
     assert_eq!(
         load_rows(&connection).unwrap()[&scope.storage_key()]
             .composition
-            .units,
-        composition.units
+            .page_order,
+        composition.page_order
     );
     assert!(
         validate_scope_domain(
@@ -235,12 +231,8 @@ fn service_archive_domain_case_and_slash_equivalence_preserves_refs_and_noop_tok
     };
     let composition = BookComposition::new(
         ReadingDirection::Rtl,
-        vec![CompositionUnit::Single {
-            page: CompositionPageRef::ArchiveEntry {
-                entry_name: "Chapter\\Sub\\Page.JPG".into(),
-            },
-            placement: SinglePlacement::Center,
-            companion: SingleCompanion::Vacant,
+        vec![CompositionPageRef::ArchiveEntry {
+            entry_name: "Chapter\\Sub\\Page.JPG".into(),
         }],
     );
     let saved = service
@@ -256,7 +248,7 @@ fn service_archive_domain_case_and_slash_equivalence_preserves_refs_and_noop_tok
     assert_eq!(prepared.domain, canonical);
     let record = prepared.status.unwrap().unwrap();
     assert_eq!(record.domain, canonical);
-    assert_eq!(record.composition.units, composition.units);
+    assert_eq!(record.composition.page_order, composition.page_order);
     let unchanged = service
         .save(scope.clone(), canonical.clone(), composition)
         .recv_timeout(Duration::from_secs(10))
@@ -295,7 +287,7 @@ fn service_archive_domain_case_and_slash_equivalence_preserves_refs_and_noop_tok
     let wire: serde_json::Value = serde_json::from_str(&wire).unwrap();
     assert_eq!(wire["domain"]["prefix"], "chapter/sub");
     assert_eq!(
-        wire["composition"]["units"][0]["page"]["entry_name"],
+        wire["composition"]["page_order"][0]["entry_name"],
         "Chapter\\Sub\\Page.JPG"
     );
 }
@@ -309,12 +301,8 @@ fn raw_spelled_valid_stored_archive_domain_reads_equivalently_without_rewriting_
     };
     let composition = BookComposition::new(
         ReadingDirection::Rtl,
-        vec![CompositionUnit::Single {
-            page: CompositionPageRef::ArchiveEntry {
-                entry_name: "Chapter/Sub/Page.JPG".into(),
-            },
-            placement: SinglePlacement::Center,
-            companion: SingleCompanion::Vacant,
+        vec![CompositionPageRef::ArchiveEntry {
+            entry_name: "Chapter/Sub/Page.JPG".into(),
         }],
     );
     set(
@@ -346,7 +334,7 @@ fn raw_spelled_valid_stored_archive_domain_reads_equivalently_without_rewriting_
     let token = prepared.token;
     let record = prepared.status.unwrap().unwrap();
     assert_eq!(record.domain, canonical);
-    assert_eq!(record.composition.units, composition.units);
+    assert_eq!(record.composition.page_order, composition.page_order);
     let unchanged = service
         .save(scope.clone(), canonical, composition)
         .recv_timeout(Duration::from_secs(10))
@@ -543,7 +531,7 @@ fn unreadable_maintenance_preserves_old_rows_blocks_reads_and_changes_token() {
     service.drain_changed_scope_keys();
     let lease = maintenance_at(temp.path()).unwrap();
     let connection = Connection::open(temp.path().join(DB_FILE)).unwrap();
-    connection.execute_batch("PRAGMA user_version=2").unwrap();
+    connection.execute_batch("PRAGMA user_version=999").unwrap();
     drop(connection);
     drop(lease);
     let read = prepare(&service, scope(), PageDomain::Document);
@@ -726,29 +714,20 @@ fn root_rename_destination_priority_page_purge_and_writer_fifo() {
 }
 
 #[test]
-fn page_migration_is_simultaneous_updates_cover_hidden_and_keeps_outside_move_missing() {
+fn page_migration_is_simultaneous_updates_order_hidden_overrides_and_keeps_outside_move_missing() {
     let (temp, mut connection) = database();
     let key = "c:/books/folder";
     let page = |name: &str| CompositionPageRef::RelativePath { path: name.into() };
-    let mut composition = BookComposition::new(
-        ReadingDirection::Rtl,
-        vec![
-            CompositionUnit::Single {
-                page: page("A.JPG"),
-                placement: SinglePlacement::Center,
-                companion: SingleCompanion::Vacant,
-            },
-            CompositionUnit::Single {
-                page: page("B.JPG"),
-                placement: SinglePlacement::Leading,
-                companion: SingleCompanion::FrontCoverSupplement {
-                    page: page("A.JPG"),
-                },
-            },
-        ],
-    );
-    composition.cover = Some(page("A.JPG"));
+    let mut composition =
+        BookComposition::new(ReadingDirection::Rtl, vec![page("A.JPG"), page("B.JPG")]);
+    composition.cover_enabled = true;
     composition.hidden_pages = vec![page("A.JPG")];
+    composition.page_overrides = vec![PageOverrideEntry {
+        page: page("B.JPG"),
+        directive: PageOverride::BlankOpposite {
+            page_side: PageSide::Trailing,
+        },
+    }];
     set(&mut connection, key, &PageDomain::ImageFolder, &composition);
     drop(connection);
     assert_eq!(
@@ -770,14 +749,17 @@ fn page_migration_is_simultaneous_updates_cover_hidden_and_keeps_outside_move_mi
     );
     let connection = open_existing(&temp.path().join(DB_FILE)).unwrap().unwrap();
     let row = load_rows(&connection).unwrap().remove(key).unwrap();
-    assert_eq!(row.composition.cover, Some(page("B.JPG")));
+    assert!(row.composition.cover_enabled);
     assert_eq!(row.composition.hidden_pages, vec![page("B.JPG")]);
     assert_eq!(
-        row.composition.units[0].pages().next(),
-        Some(&page("B.JPG"))
+        row.composition.page_order,
+        vec![page("B.JPG"), page("A.JPG")]
     );
-    assert!(
-        matches!(&row.composition.units[1],CompositionUnit::Single{page:actual,companion:SingleCompanion::FrontCoverSupplement{page:cover},..} if *actual==page("A.JPG") && *cover==page("B.JPG"))
+    assert_eq!(
+        row.composition.page_override(&page("A.JPG")),
+        Some(PageOverride::BlankOpposite {
+            page_side: PageSide::Trailing
+        })
     );
     drop(connection);
     assert_eq!(
@@ -816,12 +798,8 @@ fn composition_only_save_observes_captured_pdf_epub_zip_and_converted_outer_root
                 },
                 BookComposition::new(
                     ReadingDirection::Rtl,
-                    vec![CompositionUnit::Single {
-                        page: CompositionPageRef::ArchiveEntry {
-                            entry_name: "chapter/Page.JPG".into(),
-                        },
-                        placement: SinglePlacement::Center,
-                        companion: SingleCompanion::Vacant,
+                    vec![CompositionPageRef::ArchiveEntry {
+                        entry_name: "chapter/Page.JPG".into(),
                     }],
                 ),
             )
@@ -881,4 +859,37 @@ fn composition_only_save_observes_captured_pdf_epub_zip_and_converted_outer_root
             .iter()
             .all(|entry| entry.last_edit_at > 0 && entry.has_restorable_content)
     );
+}
+
+#[test]
+fn old_unpublished_schema_is_preserved_and_service_rejects_writes_without_migration() {
+    let (temp, mut connection) = database();
+    let key = scope().storage_key();
+    set(&mut connection, &key, &PageDomain::Document, &book());
+    connection.execute_batch("PRAGMA user_version=1").unwrap();
+    drop(connection);
+    let before = std::fs::read(temp.path().join(DB_FILE)).unwrap();
+    assert!(initialize_database_at(&temp.path().join(DB_FILE)).is_err());
+    let (service, owner) = BookCompositionService::spawn_at(temp.path().into(), None).unwrap();
+    assert!(
+        prepare(&service, scope(), PageDomain::Document)
+            .status
+            .is_err()
+    );
+    let reply = service
+        .save(scope(), PageDomain::Document, book())
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap();
+    assert!(reply.status.is_err());
+    assert!(!reply.changed);
+    assert!(
+        service
+            .remove(scope(), PageDomain::Document)
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .status
+            .is_err()
+    );
+    owner.shutdown_and_join();
+    assert_eq!(std::fs::read(temp.path().join(DB_FILE)).unwrap(), before);
 }

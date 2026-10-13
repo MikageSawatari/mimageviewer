@@ -1972,6 +1972,12 @@ Accepted/Blockedの同token読取は起床を予約しない。新しいpending 
 lease終了時のwriter再読込が実変更scopeだけを公開する。UI側でmaintenance待ちやDB/FS読取を追加しない。
 終了時はcomposition writerをjoinしてから、保持されたcontent-identity recorderを所有するshift ownerを終了し、捕捉済みEdit観測を落とさない。
 まれな失敗はログ＋通知。未知/破損は利用者作成recordを保持して書込停止し、新DBのmigration/recreate/自動retryを作らない。
+B2の編集結果はsession専用workerで生成し、未送信draftは最新にまとめる。結果generationが最新のときだけ保存可能。
+組生成には通常builderを使い、UI側にはI/Oと別pairing実装を置かない。
+製本/一括出力の構成資格は実Sourceを受け付けるworkerで確定する。
+出力runだけのarchive identity/scope索引を一回準備し、その後に最新service snapshot/tokenでhiddenを判定する。
+別窓のimmutable raw treeと物理sourceを区別し、hiddenの変更は索引再利用時も最新値を使う。
+
 
 ### G4 editorの非同期owner（next-book、2026-10-11）
 

@@ -2534,8 +2534,8 @@ mod tests {
     #[test]
     fn composition_only_save_external_move_detection_and_copy_preserve_scope_refs() {
         use crate::book_composition::{
-            BookComposition, BookCompositionService, CompositionPageRef, CompositionUnit,
-            PageDomain, ReadingDirection, SingleCompanion, SinglePlacement,
+            BookComposition, BookCompositionService, CompositionPageRef, PageDomain, PageOverride,
+            PageOverrideEntry, PageSide, ReadingDirection,
         };
         use crate::book_scope::BookScopeKey;
         use std::time::Duration;
@@ -2571,24 +2571,15 @@ mod tests {
                     let page = CompositionPageRef::ArchiveEntry {
                         entry_name: format!("{prefix}/Page.JPG"),
                     };
-                    let mut composition = BookComposition::new(
-                        ReadingDirection::Rtl,
-                        vec![
-                            CompositionUnit::Single {
-                                page: cover.clone(),
-                                placement: SinglePlacement::Center,
-                                companion: SingleCompanion::Vacant,
-                            },
-                            CompositionUnit::Single {
-                                page: page.clone(),
-                                placement: SinglePlacement::Trailing,
-                                companion: SingleCompanion::FrontCoverSupplement {
-                                    page: cover.clone(),
-                                },
-                            },
-                        ],
-                    );
-                    composition.cover = Some(cover);
+                    let mut composition =
+                        BookComposition::new(ReadingDirection::Rtl, vec![cover, page.clone()]);
+                    composition.cover_enabled = true;
+                    composition.page_overrides = vec![PageOverrideEntry {
+                        page: page.clone(),
+                        directive: PageOverride::BlankOpposite {
+                            page_side: PageSide::Trailing,
+                        },
+                    }];
                     composition.hidden_pages = vec![page];
                     (
                         BookScopeKey::new(&source, prefix).unwrap(),
@@ -2599,9 +2590,13 @@ mod tests {
                         composition,
                     )
                 } else {
-                    let composition =
-                        crate::book_composition::fixtures::editor_unit_edits(ReadingDirection::Rtl)
-                            .with_cover_helper;
+                    let mut composition =
+                        crate::book_composition::fixtures::four_page_book(ReadingDirection::Rtl);
+                    composition.cover_enabled = true;
+                    composition.page_overrides.push(PageOverrideEntry {
+                        page: CompositionPageRef::PdfPage { page_num: 3 },
+                        directive: PageOverride::Alone,
+                    });
                     (
                         BookScopeKey::document(&source).unwrap(),
                         BookScopeKey::document(&moved).unwrap(),

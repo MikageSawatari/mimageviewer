@@ -50396,21 +50396,26 @@ impl App {
                     summary.added,
                     summary.folder.display()
                 ));
+                let mut notice = format!(
+                    "「{}」に {} ページ追加しました",
+                    summary.book_name, summary.added
+                );
                 if summary.erase_fallback_pages > 0 {
-                    self.show_feedback_toast_with_duration(
-                        format!(
-                            "「{}」に {} ページ追加しました\n{} ページの消しゴム補完は簡易処理で再作成しました",
-                            summary.book_name,
-                            summary.added,
-                            summary.erase_fallback_pages,
-                        ),
-                        4.5,
-                    );
-                } else {
-                    self.show_feedback_toast(format!(
-                        "「{}」に {} ページ追加しました",
-                        summary.book_name, summary.added
+                    notice.push_str(&format!(
+                        "\n{} ページの消しゴム補完は簡易処理で再作成しました",
+                        summary.erase_fallback_pages
                     ));
+                }
+                if summary.skipped_hidden > 0 {
+                    notice.push_str(&format!(
+                        "\n本の構成で非表示の {} ページを除外しました",
+                        summary.skipped_hidden
+                    ));
+                }
+                if summary.erase_fallback_pages > 0 || summary.skipped_hidden > 0 {
+                    self.show_feedback_toast_with_duration(notice, 4.5);
+                } else {
+                    self.show_feedback_toast(notice);
                 }
                 if let Some(path) = summary.first_path {
                     crate::logger::log(format!("book append first page: {}", path.display()));

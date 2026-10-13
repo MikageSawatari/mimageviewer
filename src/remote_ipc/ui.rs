@@ -5198,14 +5198,7 @@ mod tests {
                     entry_name: "page.png".into(),
                 },
             };
-            let mut record = BookComposition::new(
-                ReadingDirection::Ltr,
-                vec![CompositionUnit::Single {
-                    page: page.clone(),
-                    placement: SinglePlacement::Center,
-                    companion: SingleCompanion::Vacant,
-                }],
-            );
+            let mut record = BookComposition::new(ReadingDirection::Ltr, vec![page.clone()]);
             record.hidden_pages.push(page);
             service
                 .save(scope.clone(), domain.clone(), record)

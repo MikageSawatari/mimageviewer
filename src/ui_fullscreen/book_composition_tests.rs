@@ -3,7 +3,7 @@
 use super::*;
 use crate::book_composition::ReadingDirection as CompositionDirection;
 use crate::book_composition::*;
-use crate::settings::ReadingDirection;
+use crate::settings::{PageAloneSettings, ReadingDirection, SingletonSpreadEndpointSettings};
 
 fn resolved(book: &BookComposition, count: u32) -> ResolvedComposition {
     resolve_composition(
@@ -61,46 +61,55 @@ fn composed_app(book: &BookComposition) -> crate::app::AppTestEnvForTest {
     app.image_metas = vec![None; app.items.len()];
     app.viewer_navigation_caches.invalidate();
     app.reading_direction = composition_view_direction(book.direction);
-    app.spread_mode = SpreadMode::Ltr.with_reading_direction(app.reading_direction);
+    app.spread_mode = (if book.cover_enabled {
+        SpreadMode::LtrCover
+    } else {
+        SpreadMode::Ltr
+    })
+    .with_reading_direction(app.reading_direction);
     app.install_composition_for_test(projection);
     app
 }
 
 #[test]
-fn composed_cache_never_observes_dormant_shift_or_late_landscape() {
+fn composed_cache_ignores_dormant_shift_but_rebuilds_for_landscape_and_automatic_rules() {
     let mut app = composed_app(&fixtures::four_page_book(CompositionDirection::Ltr));
     let nav = app.get_nav_indices();
     let original = app.build_spread_display_units_for_nav(&nav);
     assert_eq!(
-        original
-            .iter()
-            .map(|unit| unit.pages.clone())
-            .collect::<Vec<_>>(),
+        original.iter().map(|u| u.pages.clone()).collect::<Vec<_>>(),
         vec![vec![0, 1], vec![2, 3]]
     );
-    app.rotation_cache
-        .insert(1, crate::rotation_db::Rotation::Cw90);
-    app.record_page_dims_for_spread(1, (1000, 2000));
     app.spread_shift = crate::spread_shift::contract_fixtures::four_page_book("c:/dormant")
         .live_owner(1, crate::spread_shift::ShiftPersistence::Saved(91));
-    app.settings.page_after_cover_alone_enabled = true;
-    app.settings.last_page_alone_enabled = true;
-    app.settings.final_cover_spread_enabled = true;
-    let still = app.build_spread_display_units_for_nav(&nav);
-    assert!(Arc::ptr_eq(&original, &still));
+    assert!(Arc::ptr_eq(
+        &original,
+        &app.build_spread_display_units_for_nav(&nav)
+    ));
+    app.rotation_cache
+        .insert(1, crate::rotation_db::Rotation::None);
+    app.record_page_dims_for_spread(1, (2000, 1000));
+    let rebuilt = app.build_spread_display_units_for_nav(&nav);
+    assert!(!Arc::ptr_eq(&original, &rebuilt));
     assert_eq!(
-        app.resolve_spread_pair(0),
-        SpreadPair::Double { left: 0, right: 1 }
+        rebuilt.iter().map(|u| u.pages.clone()).collect::<Vec<_>>(),
+        vec![vec![0], vec![1], vec![2, 3]]
     );
-    let (continuous, _) = app.continuous_reading_units_and_pos(0).unwrap();
-    assert_eq!(
-        continuous[0]
-            .presentation
-            .iter()
-            .map(|page| page.idx)
-            .collect::<Vec<_>>(),
-        vec![0, 1]
-    );
+}
+
+fn specified_book(
+    direction: CompositionDirection,
+    directive: PageOverride,
+    page: u32,
+    cover: bool,
+) -> BookComposition {
+    let mut book = fixtures::four_page_book(direction);
+    book.cover_enabled = cover;
+    book.page_overrides.push(PageOverrideEntry {
+        page: fixtures::document_page(page),
+        directive,
+    });
+    book
 }
 
 #[test]
@@ -167,8 +176,14 @@ fn book_composition_rating_key_rebase_recomputes_paint_permission_and_masked_anc
 fn composed_blank_trim_uses_physical_slot_and_single_projection_uses_single_margin() {
     use crate::view_trim::{ViewTrimApplyMode, ViewTrimMargins, ViewTrimSpreadSide};
     for direction in [CompositionDirection::Ltr, CompositionDirection::Rtl] {
-        let fixture = fixtures::editor_unit_edits(direction);
-        let mut app = composed_app(&fixture.blank);
+        let mut app = composed_app(&specified_book(
+            direction,
+            PageOverride::BlankOpposite {
+                page_side: PageSide::Leading,
+            },
+            1,
+            false,
+        ));
         app.view_trim_book_settings.enabled = true;
         app.view_trim_apply_mode = ViewTrimApplyMode::Book;
         app.view_trim_book_settings.spread_separate = true;
@@ -243,130 +258,137 @@ fn legacy_binding_same_value_refuses_before_state_and_single_split_nudge_stays_n
 }
 
 #[test]
-fn explicit_units_share_paged_continuous_roles_slots_and_real_navigation() {
+fn automatic_and_specified_groups_share_paged_continuous_roles_and_real_navigation() {
     for direction in [CompositionDirection::Ltr, CompositionDirection::Rtl] {
-        let fixture = fixtures::editor_unit_edits(direction);
-        for book in [
-            &fixture.original,
-            &fixture.blank,
-            &fixture.with_cover_helper,
-            &fixture.hidden,
+        for directive in [
+            None,
+            Some(PageOverride::Alone),
+            Some(PageOverride::BlankOpposite {
+                page_side: PageSide::Leading,
+            }),
         ] {
-            let layout = resolved(book, 4);
-            let mut actual_navigation = Vec::new();
-            for unit in &layout.units {
-                let paged = SpreadDisplayComposition::from_composed_unit(unit, direction);
+            let mut book = fixtures::four_page_book(direction);
+            book.cover_enabled = true;
+            if let Some(directive) = directive {
+                book.page_overrides.push(PageOverrideEntry {
+                    page: fixtures::document_page(3),
+                    directive,
+                });
+            }
+            let mut app = composed_app(&book);
+            app.settings.final_cover_spread_enabled = true;
+            let nav = app.get_nav_indices();
+            let groups = app.build_spread_display_units_for_nav(&nav);
+            let mut seen = Vec::new();
+            for position in 0..groups.len() {
+                let paged = resolve_spread_display_composition(
+                    &groups,
+                    position,
+                    app.spread_mode,
+                    true,
+                    SingletonSpreadEndpointSettings::default(),
+                    true,
+                )
+                .unwrap();
                 let continuous =
-                    ContinuousReadingUnitSpec::composition(paged.clone(), SpreadMode::LtrCover);
+                    ContinuousReadingUnitSpec::composition(paged.clone(), app.spread_mode);
                 assert_eq!(
-                    paged.pages_in_screen_order(SpreadMode::LtrCover),
+                    paged.pages_in_screen_order(app.spread_mode),
                     continuous.presentation
                 );
-                assert_eq!(paged.singleton_placement(), continuous.singleton_placement);
-                actual_navigation.extend(paged.navigation_pages());
                 assert_eq!(
-                    paged.presentation_demand(SpreadMode::Rtl, crate::page_split::PageSlice::Full),
+                    paged.presentation_demand(app.spread_mode, crate::page_split::PageSlice::Full),
                     continuous.presentation_demand()
                 );
+                seen.extend(paged.navigation_pages());
             }
+            assert_eq!(&seen, nav.as_ref());
+            let last = app.spread_display_composition_for_anchor(3);
+            let has_cover = last
+                .pages_in_reading_order()
+                .iter()
+                .any(|p| p.role == SpreadPageRole::FrontCoverSupplement);
             assert_eq!(
-                actual_navigation,
-                layout
-                    .visible_pages
-                    .iter()
-                    .map(|page| page.item_index)
-                    .collect::<Vec<_>>()
+                has_cover,
+                !matches!(directive, Some(PageOverride::BlankOpposite { .. }))
             );
         }
     }
 }
 
 #[test]
-fn explicit_pair_direction_is_frozen_and_missing_keeps_original_slot() {
+fn missing_or_hidden_page_is_removed_before_pairing() {
     for direction in [CompositionDirection::Ltr, CompositionDirection::Rtl] {
-        let book = fixtures::four_page_book(direction);
-        let layout = resolved(&book, 4);
-        let pair = SpreadDisplayComposition::from_composed_unit(&layout.units[0], direction);
-        for mode in [
-            SpreadMode::Ltr,
-            SpreadMode::Rtl,
-            SpreadMode::LtrCover,
-            SpreadMode::RtlCover,
-        ] {
-            let screen = pair.pages_in_screen_order(mode);
-            assert_eq!(
-                screen.iter().map(|page| page.idx).collect::<Vec<_>>(),
-                if direction == CompositionDirection::Ltr {
-                    vec![0, 1]
-                } else {
-                    vec![1, 0]
-                }
-            );
-        }
+        let mut book = fixtures::four_page_book(direction);
+        book.hidden_pages.push(fixtures::document_page(1));
+        let mut app = composed_app(&book);
+        let nav = app.get_nav_indices();
+        assert_eq!(nav.as_slice(), &[0, 1, 2]);
+        assert_eq!(
+            app.build_spread_display_units_for_nav(&nav)
+                .iter()
+                .map(|u| u.pages.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![0, 1], vec![2]]
+        );
         let mut manifest = fixtures::document_manifest(4);
         manifest[1].availability = ManifestAvailability::FilteredOut;
+        book.hidden_pages.clear();
         let missing = resolve_composition(&book, &PageDomain::Document, &manifest).unwrap();
-        let single = SpreadDisplayComposition::from_composed_unit(&missing.units[0], direction);
-        assert_eq!(single.navigation_pages(), vec![0]);
-        assert_eq!(
-            single.singleton_placement(),
-            if direction == CompositionDirection::Ltr {
-                SingletonSpreadPlacement::Left
-            } else {
-                SingletonSpreadPlacement::Right
-            }
+        let nav = missing
+            .visible_pages
+            .iter()
+            .map(|p| p.item_index)
+            .collect::<Vec<_>>();
+        let groups = build_spread_display_units_with_overrides(
+            &nav,
+            app.spread_mode,
+            None,
+            PageAloneSettings::default(),
+            &missing.page_overrides,
+            |_, _| false,
+            |_| true,
         );
         assert_eq!(
-            missing.units[1]
-                .navigation_pages()
-                .map(|page| page.item_index)
-                .collect::<Vec<_>>(),
-            vec![2, 3]
+            groups.iter().map(|u| u.pages.clone()).collect::<Vec<_>>(),
+            vec![vec![0, 2], vec![3]]
         );
     }
 }
 
 #[test]
-fn hidden_permission_partner_keeps_physical_slot_and_helper_has_no_navigation() {
+fn permission_mask_keeps_physical_slot_and_automatic_cover_has_no_navigation() {
     for direction in [CompositionDirection::Ltr, CompositionDirection::Rtl] {
-        let fixture = fixtures::editor_unit_edits(direction);
-        let layout = resolved(&fixture.original, 4);
-        let pair = SpreadDisplayComposition::from_composed_unit(&layout.units[0], direction);
+        let mut app = composed_app(&fixtures::four_page_book(direction));
+        let pair = app.spread_display_composition_for_anchor(0);
         for allowed in [vec![true, false], vec![false, true]] {
             let paged = pair
-                .permitted_projection(SpreadMode::Ltr, &allowed)
+                .permitted_projection(app.spread_mode, &allowed)
                 .unwrap();
-            let unit = ContinuousReadingUnitSpec::composition(pair.clone(), SpreadMode::Ltr);
+            let unit = ContinuousReadingUnitSpec::composition(pair.clone(), app.spread_mode);
             let continuous = unit.permitted_projection(&allowed).unwrap();
             assert_eq!(paged.singleton_placement(), continuous.singleton_placement);
             assert_eq!(
-                paged.pages_in_screen_order(SpreadMode::Ltr),
+                paged.pages_in_screen_order(app.spread_mode),
                 continuous.presentation
-            );
-            assert_eq!(
-                paged.singleton_placement(),
-                if allowed[0] {
-                    SingletonSpreadPlacement::Left
-                } else {
-                    SingletonSpreadPlacement::Right
-                }
             );
         }
         assert!(
-            pair.permitted_projection(SpreadMode::Ltr, &[false, false])
+            pair.permitted_projection(app.spread_mode, &[false, false])
                 .is_none()
         );
-        let helper = resolved(&fixture.with_cover_helper, 4);
-        let unit =
-            SpreadDisplayComposition::from_composed_unit(helper.units.last().unwrap(), direction);
+        drop(app);
+        let mut helper = composed_app(&specified_book(direction, PageOverride::Alone, 3, true));
+        helper.settings.final_cover_spread_enabled = true;
+        let unit = helper.spread_display_composition_for_anchor(3);
         assert_eq!(unit.navigation_pages(), vec![3]);
-        let screen = unit.pages_in_screen_order(SpreadMode::Ltr);
-        let allow_helper_only = screen
+        let helper_only = unit
+            .pages_in_screen_order(helper.spread_mode)
             .iter()
-            .map(|page| page.role == SpreadPageRole::FrontCoverSupplement)
+            .map(|p| p.role == SpreadPageRole::FrontCoverSupplement)
             .collect::<Vec<_>>();
         assert!(
-            unit.permitted_projection(SpreadMode::Ltr, &allow_helper_only)
+            unit.permitted_projection(helper.spread_mode, &helper_only)
                 .is_none()
         );
     }
@@ -1144,7 +1166,7 @@ fn single_to_spread_actual_paint_retains_exact_old_surface_until_atomic_reply() 
                         external_record = external_record
                             .edited(
                                 &PageDomain::Document,
-                                UnitEdit::SetHidden {
+                                CompositionEdit::SetHidden {
                                     page: fixtures::document_page(1),
                                     hidden: true,
                                 },
@@ -1405,114 +1427,31 @@ fn single_to_spread_actual_paint_retains_exact_old_surface_until_atomic_reply() 
 }
 
 #[test]
-fn composed_facet_masks_original_slots_without_repairing_units_or_helpers() {
+fn composed_facet_rebuilds_visible_pairs_and_disables_incomplete_endpoint_rules() {
     for direction in [CompositionDirection::Ltr, CompositionDirection::Rtl] {
-        let mut app = composed_app(&fixtures::four_page_book(direction));
+        let mut app = composed_app(&specified_book(direction, PageOverride::Alone, 3, true));
         app.visible_indices = vec![0, 2, 3];
         app.details_order = app.visible_indices.clone();
         app.viewer_navigation_caches.invalidate();
-        app.fullscreen_idx = Some(0);
-        let paged = app.spread_display_composition_for_anchor(0);
-        assert_eq!(paged.navigation_pages(), vec![0]);
-        assert_eq!(
-            paged.singleton_placement(),
-            if direction == CompositionDirection::Ltr {
-                SingletonSpreadPlacement::Left
-            } else {
-                SingletonSpreadPlacement::Right
-            }
-        );
-        app.reading_flow = ReadingFlow::Vertical;
-        let (units, _) = app.continuous_reading_units_and_pos(0).unwrap();
-        assert_eq!(
-            units
+        app.settings.final_cover_spread_enabled = true;
+        let paged = app.spread_display_composition_for_anchor(3);
+        assert_eq!(paged.navigation_pages(), vec![3]);
+        assert!(
+            paged
+                .pages_in_reading_order()
                 .iter()
-                .map(|unit| unit
-                    .presentation
-                    .iter()
-                    .map(|page| page.idx)
-                    .collect::<Vec<_>>())
-                .collect::<Vec<_>>(),
-            vec![
-                vec![0],
-                if direction == CompositionDirection::Ltr {
-                    vec![2, 3]
-                } else {
-                    vec![3, 2]
-                }
-            ]
+                .all(|p| p.role != SpreadPageRole::FrontCoverSupplement)
         );
-        assert_eq!(units[0].singleton_placement, paged.singleton_placement());
-        assert_eq!(
-            units[1].anchor_idx, 2,
-            "facet masking retains the frozen reading anchor in both directions"
-        );
-        app.fullscreen_idx = Some(1);
-        let outside = app.spread_display_composition_for_anchor(1);
-        assert_eq!(
-            outside.navigation_pages(),
-            vec![1],
-            "an already shown facet-excluded anchor stays a qualified singleton"
-        );
-        assert_eq!(
-            outside.singleton_placement(),
-            if direction == CompositionDirection::Ltr {
-                SingletonSpreadPlacement::Right
-            } else {
-                SingletonSpreadPlacement::Left
-            }
-        );
-        let (outside_units, pos) = app.continuous_reading_units_and_pos(1).unwrap();
-        assert_eq!(
-            outside_units[pos].source_indices().collect::<Vec<_>>(),
-            vec![1]
-        );
-        assert_eq!(
-            outside_units[pos].singleton_placement,
-            outside.singleton_placement()
-        );
-        let data = tempfile::tempdir().unwrap();
-        let (service, owner) =
-            BookCompositionService::spawn_at(data.path().to_path_buf(), None).unwrap();
-        service
-            .prepare(
-                crate::book_scope::BookScopeKey::document("c:/g3-display.pdf").unwrap(),
-                PageDomain::Document,
-            )
-            .recv_timeout(std::time::Duration::from_secs(30))
-            .unwrap()
-            .status
-            .unwrap();
-        app.install_book_composition_runtime(service);
-        let held =
-            app.install_checking_presentation_for_test(&outside_units[pos].presentation_demand());
-        assert!(matches!(
-            app.book_presentation_allowed(&outside_units[pos].presentation_demand()),
-            PresentationDecision::Checking
-        ));
-        drop(held);
-        owner.shutdown_and_join();
-        drop(app);
-        let mut helper = composed_app(&fixtures::editor_unit_edits(direction).with_cover_helper);
-        helper.visible_indices = vec![1, 2, 3];
-        helper.details_order = helper.visible_indices.clone();
-        helper.viewer_navigation_caches.invalidate();
-        let last = helper.spread_display_composition_for_anchor(3);
-        assert_eq!(
-            last.pages_in_reading_order()
-                .iter()
-                .map(|page| page.idx)
-                .collect::<Vec<_>>(),
-            vec![3]
-        );
-        helper.reading_flow = ReadingFlow::Vertical;
-        let (units, _) = helper.continuous_reading_units_and_pos(3).unwrap();
+        let (units, _) = app.continuous_reading_units_and_pos(3).unwrap();
         assert!(
             units
                 .iter()
-                .flat_map(|unit| &unit.presentation)
-                .all(|page| page.idx != 0)
+                .flat_map(|u| &u.presentation)
+                .all(|p| p.idx != 1)
         );
+        app.fullscreen_idx = Some(1);
+        let outside = app.spread_display_composition_for_anchor(1);
+        assert_eq!(outside.navigation_pages(), vec![1]);
     }
 }
 
@@ -2182,4 +2121,238 @@ fn g3_similar_preview_continuous_routing_requires_admitted_anchor_occurrence() {
         drop(checking);
         owner.shutdown_and_join();
     }
+}
+
+#[test]
+fn explicit_directives_preserve_boundaries_and_blank_priority_for_all_automatic_rules() {
+    for mode in [
+        SpreadMode::Ltr,
+        SpreadMode::Rtl,
+        SpreadMode::LtrCover,
+        SpreadMode::RtlCover,
+    ] {
+        for count in 1..=9 {
+            let nav = (0..count).collect::<Vec<_>>();
+            for at in 0..count {
+                for directive in [
+                    PageOverride::Alone,
+                    PageOverride::BlankOpposite {
+                        page_side: PageSide::Leading,
+                    },
+                    PageOverride::BlankOpposite {
+                        page_side: PageSide::Trailing,
+                    },
+                ] {
+                    let overrides = HashMap::from([(at, directive)]);
+                    for flags in 0u8..32 {
+                        let page_alone = PageAloneSettings {
+                            after_cover: flags & 1 != 0,
+                            last: flags & 2 != 0,
+                        };
+                        let endpoints = SingletonSpreadEndpointSettings {
+                            first: flags & 4 != 0,
+                            last: flags & 8 != 0,
+                        };
+                        let units = build_spread_display_units_with_overrides(
+                            &nav,
+                            mode,
+                            None,
+                            page_alone,
+                            &overrides,
+                            |_, i| i == at,
+                            |_| true,
+                        );
+                        assert_eq!(
+                            units
+                                .iter()
+                                .flat_map(|u| u.pages.iter().copied())
+                                .collect::<Vec<_>>(),
+                            nav
+                        );
+                        let (pos, unit) = find_spread_display_unit(&units, at).unwrap();
+                        assert_eq!(unit.pages, vec![at]);
+                        let result = resolve_spread_display_composition(
+                            &units,
+                            pos,
+                            mode,
+                            flags & 16 != 0,
+                            endpoints,
+                            true,
+                        )
+                        .unwrap();
+                        match directive {
+                            PageOverride::BlankOpposite { page_side } => {
+                                let right = (page_side == PageSide::Leading) == mode.is_rtl();
+                                assert_eq!(
+                                    result.singleton_placement(),
+                                    if right {
+                                        SingletonSpreadPlacement::RightWhite
+                                    } else {
+                                        SingletonSpreadPlacement::LeftWhite
+                                    }
+                                );
+                                assert_eq!(result.pages_in_reading_order().len(), 1);
+                            }
+                            PageOverride::Alone => assert_eq!(
+                                result.singleton_placement(),
+                                SingletonSpreadPlacement::Center
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn hidden_first_and_last_redefine_automatic_cover_endpoints() {
+    let mut book = fixtures::four_page_book(CompositionDirection::Ltr);
+    book.cover_enabled = true;
+    book.hidden_pages = vec![fixtures::document_page(0), fixtures::document_page(3)];
+    let mut app = composed_app(&book);
+    app.settings.final_cover_spread_enabled = true;
+    let last = app.spread_display_composition_for_anchor(1);
+    assert_eq!(last.navigation_pages(), vec![1]);
+    assert_eq!(
+        last.pages_in_reading_order()
+            .iter()
+            .map(|p| (p.idx, p.role))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, SpreadPageRole::Navigation),
+            (0, SpreadPageRole::FrontCoverSupplement)
+        ]
+    );
+    assert_eq!(app.items.len(), 2);
+}
+
+#[test]
+fn current_outside_facet_keeps_explicit_white_side_in_paged_and_continuous() {
+    for direction in [CompositionDirection::Ltr, CompositionDirection::Rtl] {
+        for page_side in [PageSide::Leading, PageSide::Trailing] {
+            let mut app = composed_app(&specified_book(
+                direction,
+                PageOverride::BlankOpposite { page_side },
+                1,
+                true,
+            ));
+            app.visible_indices = vec![0, 2];
+            app.details_order = app.visible_indices.clone();
+            app.viewer_navigation_caches.invalidate();
+            let right =
+                (page_side == PageSide::Leading) == (direction == CompositionDirection::Rtl);
+            let expected = if right {
+                SingletonSpreadPlacement::RightWhite
+            } else {
+                SingletonSpreadPlacement::LeftWhite
+            };
+            for flow in [ReadingFlow::Vertical, ReadingFlow::Horizontal] {
+                app.reading_flow = flow;
+                let paged = app.spread_display_composition_for_anchor(1);
+                assert_eq!(paged.singleton_placement(), expected);
+                assert_eq!(paged.navigation_pages(), vec![1]);
+                let (units, pos) = app
+                    .continuous_reading_units_and_pos(1)
+                    .expect("shown facet-excluded anchor survives");
+                assert_eq!(units[pos].source_indices().collect::<Vec<_>>(), vec![1]);
+                assert_eq!(units[pos].singleton_placement, expected);
+                assert!(
+                    units
+                        .iter()
+                        .flat_map(|u| &u.presentation)
+                        .all(|p| p.idx != 3)
+                );
+                assert!(
+                    units[pos]
+                        .presentation
+                        .iter()
+                        .all(|p| p.role == SpreadPageRole::Navigation)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn composed_automatic_preference_writes_change_shared_rules_without_record_writes() {
+    let mut book = fixtures::four_page_book(CompositionDirection::Ltr);
+    book.cover_enabled = true;
+    let mut app = composed_app(&book);
+    app.fullscreen_idx = Some(1);
+    let before = app.composed_book_layout().unwrap().clone();
+    let token = app.composed_layout_token();
+    let ctx = egui::Context::default();
+    app.set_final_cover_spread_preference_for_fullscreen(
+        &ctx,
+        crate::settings::FinalCoverSpreadPreference::Off,
+    );
+    assert_eq!(
+        app.final_cover_spread_preference,
+        crate::settings::FinalCoverSpreadPreference::Off
+    );
+    let preferences = crate::settings::PageAlonePreferences {
+        after_cover: crate::settings::PageAlonePreference::On,
+        last: crate::settings::PageAlonePreference::On,
+    };
+    app.set_page_alone_preferences_for_fullscreen(&ctx, preferences);
+    assert_eq!(app.page_alone_preferences, preferences);
+    assert_eq!(
+        app.build_spread_display_units_for_nav(&[0, 1, 2, 3])
+            .iter()
+            .map(|u| u.pages.clone())
+            .collect::<Vec<_>>(),
+        vec![vec![0], vec![1], vec![2], vec![3]]
+    );
+    let endpoints = crate::settings::SingletonSpreadEndpointPreferences {
+        first: crate::settings::SingletonSpreadPlacementPreference::Place,
+        last: crate::settings::SingletonSpreadPlacementPreference::Place,
+    };
+    app.set_singleton_spread_endpoint_preferences_for_fullscreen(&ctx, endpoints);
+    assert_eq!(app.singleton_spread_endpoint_preferences, endpoints);
+    assert_eq!(app.composed_book_layout().unwrap(), &before);
+    assert_eq!(app.composed_layout_token(), token);
+    assert_eq!(app.fullscreen_idx, Some(1));
+    let key = app.spread_container_key_with_fallback().unwrap();
+    let db = app.spread_db.as_ref().unwrap();
+    assert_eq!(
+        db.get_final_cover_spread_preference(&key.exact),
+        Some(crate::settings::FinalCoverSpreadPreference::Off)
+    );
+    assert_eq!(
+        db.get_page_alone_preferences_with_fallback(&key.exact, None)
+            .unwrap(),
+        preferences
+    );
+}
+
+#[test]
+fn temporary_viewing_ignore_does_not_bypass_selected_output_visibility() {
+    let mut book = fixtures::four_page_book(CompositionDirection::Ltr);
+    let mut app = composed_app(&book);
+    let data = tempfile::tempdir().unwrap();
+    let (service, owner) =
+        BookCompositionService::spawn_at(data.path().to_path_buf(), None).unwrap();
+    let scope = crate::book_scope::BookScopeKey::document("c:/g3-display.pdf").unwrap();
+    book.hidden_pages.push(fixtures::document_page(1));
+    service
+        .save(scope.clone(), PageDomain::Document, book)
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap()
+        .status
+        .unwrap();
+    app.install_book_composition_runtime(service);
+    app.book_composition = crate::app::book_composition_runtime::ViewerBookComposition::Ignored {
+        scope,
+        source: crate::app::book_composition_runtime::BookCompositionSource::Unavailable,
+        generation: app.items_generation,
+    };
+    assert!(app.presentation_candidate(1).is_none());
+    let target = crate::ui_dialogs::export_batch::ExportBatchTarget::Item {
+        idx: 1,
+        page_key: app.page_path_key(1).unwrap(),
+    };
+    let item = app.batch_export_item_for_target(&target).unwrap().unwrap();
+    assert!(!item.composition_check.unwrap().permits().unwrap());
+    owner.shutdown_and_join();
 }

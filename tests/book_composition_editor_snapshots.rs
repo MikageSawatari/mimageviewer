@@ -3,7 +3,7 @@ use egui_kittest::{
     Harness,
     kittest::{NodeT, Queryable},
 };
-use mimageviewer::book_composition::{ReadingDirection, SinglePlacement};
+use mimageviewer::book_composition::{PageOverride, PageSide, ReadingDirection, SinglePlacement};
 use mimageviewer::ui_composition_editor::*;
 
 #[path = "support/ui_harness.rs"]
@@ -22,6 +22,15 @@ fn fixture(phase: EditorPhase) -> EditorView {
             missing: id == 8,
             excluded_by_policy: id == 9,
             thumbnail: None,
+            directive: if id == 1 {
+                Some(PageOverride::BlankOpposite {
+                    page_side: PageSide::Leading,
+                })
+            } else if id == 4 {
+                Some(PageOverride::Alone)
+            } else {
+                None
+            },
         })
         .collect();
     let mut units = vec![
@@ -55,7 +64,10 @@ fn fixture(phase: EditorPhase) -> EditorView {
         saved: true,
         phase,
         direction: ReadingDirection::Rtl,
+        cover_enabled: true,
         cover: Some(0),
+        page_order: (0..600).collect(),
+        results_updating: false,
         pages,
         units,
         can_undo: true,
@@ -66,7 +78,6 @@ fn fixture(phase: EditorPhase) -> EditorView {
         error: Some(
             "ページが変更されています。読み直してください。編集中の変更は保持しています。".into(),
         ),
-        pending_preview: None,
     }
 }
 
@@ -79,7 +90,6 @@ fn harness(
     let view = fixture(phase);
     let state = EditorUiState {
         selected_pages: vec![1],
-        selected_unit: Some(1),
         ..Default::default()
     };
     view_harness(physical, scale, theme, view, state)
@@ -139,8 +149,28 @@ fn composition_editor_small_screen_footer_and_snapshots() {
                         < 1.0
                 );
                 assert!((h.ctx.pixels_per_point() - scale).abs() < 0.01);
-                for label in ["保存", "キャンセル", "構成を解除"] {
+                for label in ["元に戻す", "やり直す", "保存", "キャンセル", "構成を解除"]
+                {
                     assert_control_inside(&h, label, &format!("{width}x{height} scale={scale}"));
+                }
+                assert_control_inside(
+                    &h,
+                    "Close window",
+                    &format!("{width}x{height} scale={scale}"),
+                );
+                for label in [
+                    "自動",
+                    "単独で表示",
+                    "隣を白紙にする",
+                    "左",
+                    "右",
+                    "1ページ",
+                ] {
+                    assert_control_inside(
+                        &h,
+                        label,
+                        &format!("result controls/card {width}x{height} scale={scale}"),
+                    );
                 }
                 let requests: Vec<_> = h
                     .state()
@@ -182,6 +212,10 @@ fn composition_editor_all_phases_keep_cancel_reachable() {
             phase,
         );
         h.run();
+        for label in ["元に戻す", "やり直す", "保存", "構成を解除"] {
+            assert_control_inside(&h, label, &format!("phase={phase:?}"));
+        }
+        assert_control_inside(&h, "Close window", &format!("phase={phase:?}"));
         let cancel = assert_control_inside(&h, "キャンセル", &format!("phase={phase:?}"));
         assert_eq!(
             cancel.enabled(),
@@ -216,7 +250,7 @@ fn composition_editor_confirmation_and_blocked_snapshots_at_200_percent() {
         (mimageviewer::os_theme::ResolvedTheme::Light, "light"),
         (mimageviewer::os_theme::ResolvedTheme::Dark, "dark"),
     ] {
-        for kind in ["blocked", "preview", "remove"] {
+        for kind in ["blocked", "updating", "remove"] {
             let mut view = fixture(if kind == "blocked" {
                 EditorPhase::Blocked
             } else {
@@ -225,22 +259,20 @@ fn composition_editor_confirmation_and_blocked_snapshots_at_200_percent() {
             let mut state = EditorUiState::default();
             if kind == "blocked" {
                 view.error = Some("保存された構成を読み取れません。元のデータは保持しています。読み直すか、今回は構成を使わず開いてください。".into());
-            } else if kind == "preview" {
-                view.pending_preview = Some(EditorChangePreview {
-                    explanation: "選択したページを組にすると、既存の見開きも変更されます。変更される組を確認してください。".into(),
-                    changed_units: (1..=100).map(|unit| format!("{unit}組目: 旧ページの組から新しい組へ変更 / 削除された組も確認できます")).collect(),
-                });
+            } else if kind == "updating" {
+                view.results_updating = true;
+                view.can_save = false;
             } else {
                 state.confirmation = EditorConfirmation::Remove;
             }
             let mut h = view_harness(egui::vec2(1093.0, 614.0), 2.0, theme, view, state);
             h.run_steps(8);
-            for label in ["保存", "キャンセル", "構成を解除"] {
+            for label in ["元に戻す", "やり直す", "保存", "キャンセル", "構成を解除"]
+            {
                 assert_control_inside(&h, label, &format!("{kind}/{name}"));
             }
-            if kind == "preview" {
-                assert_control_inside(&h, "変更する", &format!("{kind}/{name}"));
-            } else if kind == "remove" {
+            assert_control_inside(&h, "Close window", &format!("{kind}/{name}"));
+            if kind == "remove" {
                 assert_control_inside(&h, "解除する", &format!("{kind}/{name}"));
             }
             h.snapshot(format!("composition_editor_{kind}_1093_614_200_{name}"));

@@ -38,49 +38,11 @@ pub struct ResolvedPage {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ResolvedCompanion {
-    Vacant,
-    Blank,
-    /// Presentation only, never a second navigation/export occurrence.
-    FrontCoverSupplement(ResolvedPage),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ResolvedUnit {
-    Pair {
-        first: ResolvedPage,
-        second: ResolvedPage,
-    },
-    Single {
-        page: ResolvedPage,
-        placement: SinglePlacement,
-        companion: ResolvedCompanion,
-    },
-}
-
-impl ResolvedUnit {
-    /// Anchor is the first surviving real navigation page in reading order.
-    pub fn anchor(&self) -> &ResolvedPage {
-        match self {
-            Self::Pair { first, .. } => first,
-            Self::Single { page, .. } => page,
-        }
-    }
-
-    pub fn navigation_pages(&self) -> impl Iterator<Item = &ResolvedPage> {
-        let (first, second) = match self {
-            Self::Pair { first, second } => (first, Some(second)),
-            Self::Single { page, .. } => (page, None),
-        };
-        std::iter::once(first).chain(second)
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedComposition {
     pub revision: u64,
     pub direction: ReadingDirection,
-    pub units: Vec<ResolvedUnit>,
+    pub cover_enabled: bool,
+    pub page_overrides: HashMap<usize, PageOverride>,
     /// Single/Split, page counts and export use this real-only reading order.
     pub visible_pages: Vec<ResolvedPage>,
     /// Every unregistered raw page, in source order. Not automatically persisted.
@@ -92,6 +54,10 @@ pub struct ResolvedComposition {
 }
 
 impl ResolvedComposition {
+    pub fn page_override(&self, item_index: usize) -> Option<PageOverride> {
+        self.page_overrides.get(&item_index).copied()
+    }
+
     pub fn page_status(&self, page: &CompositionPageRef) -> PageStatus {
         self.statuses
             .get(&page.matching_key())
@@ -100,7 +66,7 @@ impl ResolvedComposition {
     }
 
     /// Pure deletion transaction: applies the same old -> new slots to navigation,
-    /// helpers, anchors and targets. Caller must adopt this with its rows/identity
+    /// directives and targets. Caller must adopt this with its rows/identity
     /// manifest in one generation, and retain the saved identity-based composition.
     /// Removed identities are required even for hidden/policy/facet pages, whose
     /// presentation status deliberately has no row index. They must describe the
@@ -162,7 +128,7 @@ impl ResolvedComposition {
 
     /// Reorder/filter materialized rows without declaring any real page Missing.
     /// Hidden/policy/facet rows may have no output slot, but all navigation and
-    /// helper occurrences must survive. The output is a dense permutation/filter
+    /// page occurrences must survive. The output is a dense permutation/filter
     /// of the input rows: exactly 0..count(Some), with no holes or new rows.
     /// This is not a Remote budget projection or a physical deletion operation.
     pub fn reindex_items(&self, old_to_new: &[Option<usize>]) -> CompositionResult<Self> {
@@ -180,8 +146,6 @@ impl ResolvedComposition {
                 ));
             }
         }
-        // A supplement is also a visible ordinary cover occurrence, so the
-        // real-only list above covers every presentation source as well.
         self.remap_slots(old_to_new)
     }
 
@@ -198,34 +162,17 @@ impl ResolvedComposition {
             }))
         };
         let mut result = self.clone();
-        result.units.clear();
-        for unit in &self.units {
-            let mapped = match unit {
-                ResolvedUnit::Pair { first, second } => {
-                    project_pair(remap_page(first)?, remap_page(second)?)
-                }
-                ResolvedUnit::Single {
-                    page,
-                    placement,
-                    companion,
-                } => {
-                    let mapped_companion = match companion {
-                        ResolvedCompanion::FrontCoverSupplement(cover) => remap_page(cover)?
-                            .map(ResolvedCompanion::FrontCoverSupplement)
-                            .unwrap_or(ResolvedCompanion::Vacant),
-                        other => other.clone(),
-                    };
-                    remap_page(page)?.map(|page| ResolvedUnit::Single {
-                        page,
-                        placement: *placement,
-                        companion: mapped_companion,
-                    })
-                }
-            };
-            if let Some(unit) = mapped {
-                result.units.push(unit);
-            }
-        }
+        result.page_overrides = self
+            .page_overrides
+            .iter()
+            .filter_map(|(old, directive)| {
+                old_to_new
+                    .get(*old)
+                    .copied()
+                    .flatten()
+                    .map(|new| (new, *directive))
+            })
+            .collect();
         result.visible_pages = self
             .visible_pages
             .iter()
@@ -249,25 +196,8 @@ impl ResolvedComposition {
     }
 }
 
-fn project_pair(first: Option<ResolvedPage>, second: Option<ResolvedPage>) -> Option<ResolvedUnit> {
-    match (first, second) {
-        (Some(first), Some(second)) => Some(ResolvedUnit::Pair { first, second }),
-        (Some(page), None) => Some(ResolvedUnit::Single {
-            page,
-            placement: SinglePlacement::Leading,
-            companion: ResolvedCompanion::Vacant,
-        }),
-        (None, Some(page)) => Some(ResolvedUnit::Single {
-            page,
-            placement: SinglePlacement::Trailing,
-            companion: ResolvedCompanion::Vacant,
-        }),
-        (None, None) => None,
-    }
-}
-
-/// Resolve only explicit topology. Dimensions, rotation, automatic rules, mode,
-/// shift and UI state are intentionally absent from this API.
+/// Resolve identity, visibility and flat reading order only. All automatic and
+/// explicit spread formation belongs to the common builder.
 pub fn resolve_composition(
     composition: &BookComposition,
     domain: &PageDomain,
@@ -334,48 +264,23 @@ pub fn resolve_composition(
             _ => None,
         }
     };
-    let mut units = Vec::with_capacity(composition.units.len() + new_tail.len());
-    for unit in &composition.units {
-        let projected = match unit {
-            CompositionUnit::Pair { first, second } => {
-                project_pair(resolve_page(first), resolve_page(second))
-            }
-            CompositionUnit::Single {
-                page,
-                placement,
-                companion,
-            } => resolve_page(page).map(|page| {
-                let companion = match companion {
-                    SingleCompanion::Vacant => ResolvedCompanion::Vacant,
-                    SingleCompanion::Blank => ResolvedCompanion::Blank,
-                    SingleCompanion::FrontCoverSupplement { page } => resolve_page(page)
-                        .map(ResolvedCompanion::FrontCoverSupplement)
-                        .unwrap_or(ResolvedCompanion::Vacant),
-                };
-                ResolvedUnit::Single {
-                    page,
-                    placement: *placement,
-                    companion,
-                }
-            }),
-        };
-        if let Some(unit) = projected {
-            units.push(unit);
-        }
-    }
-    for page in &new_tail {
-        if let Some(page) = resolve_page(page) {
-            units.push(ResolvedUnit::Single {
-                page,
-                placement: SinglePlacement::Center,
-                companion: ResolvedCompanion::Vacant,
-            });
-        }
-    }
-    let visible_pages = units
+    let visible_pages: Vec<_> = composition
+        .pages()
+        .chain(new_tail.iter())
+        .filter_map(resolve_page)
+        .collect();
+    let directives: HashMap<_, _> = composition
+        .page_overrides
         .iter()
-        .flat_map(ResolvedUnit::navigation_pages)
-        .cloned()
+        .map(|entry| (entry.page.matching_key(), entry.directive))
+        .collect();
+    let page_overrides = visible_pages
+        .iter()
+        .filter_map(|page| {
+            directives
+                .get(&page.page.matching_key())
+                .map(|directive| (page.item_index, *directive))
+        })
         .collect();
     let complete = !statuses
         .values()
@@ -383,7 +288,8 @@ pub fn resolve_composition(
     Ok(ResolvedComposition {
         revision: composition.revision,
         direction: composition.direction,
-        units,
+        cover_enabled: composition.cover_enabled,
+        page_overrides,
         visible_pages,
         new_tail,
         complete,

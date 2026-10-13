@@ -108,10 +108,18 @@ pub(crate) struct CompositionTarget {
     pub(crate) scope: BookScopeKey,
     pub(crate) page: CompositionPageRef,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum CompositionBindingWriteKind {
+    #[default]
+    Binding,
+    AutomaticRule,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CompositionWriteAdmission {
     pub(crate) targets: Vec<CompositionTarget>,
     pub(crate) binding_scope: Option<BookScopeKey>,
+    pub(crate) binding_kind: CompositionBindingWriteKind,
     /// Worker receipts from the exact source that cannot support composition.
     pub(crate) unsupported_scopes: Vec<ScopePermissionToken>,
     pub(crate) unsupported_pages: Vec<PageIdentity>,
@@ -132,13 +140,15 @@ impl CompositionWriteAdmission {
                 return Err("本の構成が更新されました。もう一度操作してください".into());
             }
         }
-        if self.binding_scope.as_ref().is_some_and(|scope| {
-            snapshot.rows.contains_key(&scope.storage_key())
-                && !self
-                    .unsupported_scopes
-                    .iter()
-                    .any(|proof| &proof.scope == scope)
-        }) {
+        if self.binding_kind == CompositionBindingWriteKind::Binding
+            && self.binding_scope.as_ref().is_some_and(|scope| {
+                snapshot.rows.contains_key(&scope.storage_key())
+                    && !self
+                        .unsupported_scopes
+                        .iter()
+                        .any(|proof| &proof.scope == scope)
+            })
+        {
             return Err("本の構成で設定されています".into());
         }
         for target in &self.targets {
@@ -275,56 +285,8 @@ pub(crate) fn resolve_candidate_scope(
                 .physical_archive
                 .as_deref()
                 .unwrap_or_else(|| std::path::Path::new(container));
-            let owned;
-            let tree = if let Some(tree) = candidate.raw_tree.as_deref().filter(|tree| {
-                crate::path_key::normalize_keep_drive(&tree.zip_path)
-                    == crate::path_key::normalize_keep_drive(physical)
-            }) {
-                tree.raw_source()
-            } else {
-                let entries = if physical.is_dir() && crate::path_key::normalize_keep_drive(physical) != crate::path_key::normalize_keep_drive(std::path::Path::new(container)) {
-                    crate::zip_loader::enumerate_converted_image_entries_detailed_readonly_with_cancel(physical, None)
-                } else { crate::zip_loader::enumerate_image_entries_detailed_readonly_with_cancel(physical, None) }
-                    .map_err(|error| CandidatePermissionError::Unavailable(error.to_string()))?;
-                owned = ZipTree::build(physical.to_owned(), entries.entries);
-                &owned
-            };
-            let key = entry_name.replace('\\', "/").to_lowercase();
-            fn find(
-                node: &crate::zip_tree::ZipTreeNode,
-                prefix: &mut Vec<String>,
-                key: &str,
-                found: &mut Vec<Vec<String>>,
-            ) {
-                for _ in node
-                    .images
-                    .iter()
-                    .filter(|entry| entry.entry_name.replace('\\', "/").to_lowercase() == key)
-                {
-                    found.push(prefix.clone());
-                }
-                for (name, child) in &node.dirs {
-                    prefix.push(name.clone());
-                    find(child, prefix, key, found);
-                    prefix.pop();
-                }
-            }
-            let mut found = Vec::new();
-            find(&tree.root, &mut Vec::new(), &key, &mut found);
-            if found.is_empty() {
-                return Err(CandidatePermissionError::Unavailable(
-                    "archive page owning level is unavailable".into(),
-                ));
-            }
-            if found.len() != 1 {
-                return Err("archive page has no unambiguous owning level".into());
-            }
-            let prefix = found.pop().unwrap();
-            let scope = BookScopeKey::archive(container, &prefix)?;
-            validate_archive_scope_in_tree(&scope, tree)?;
-            let domain = PageDomain::ArchiveLevel {
-                prefix: scope.level_prefix.clone(),
-            };
+            let index = prepare_archive_scope_index(candidate, container, physical)?;
+            let (scope, domain) = index.scope_for(entry_name)?;
             let page = CompositionPageRef::ArchiveEntry {
                 entry_name: entry_name.clone(),
             };
@@ -334,6 +296,145 @@ pub(crate) fn resolve_candidate_scope(
             Ok((scope, domain, page))
         }
     }
+}
+
+/// Identity-to-owning-scope index for one captured archive source. Every raw
+/// node/page is inspected once; direct-level validation is shared by its pages.
+struct ArchiveScopeIndex {
+    entries: std::collections::HashMap<String, Result<usize, CandidatePermissionError>>,
+    scopes: Vec<Result<(BookScopeKey, PageDomain), CandidatePermissionError>>,
+    #[cfg(test)]
+    visited_pages: usize,
+}
+
+impl ArchiveScopeIndex {
+    fn prepare(container: &str, tree: &ZipTree) -> Self {
+        fn walk(
+            index: &mut ArchiveScopeIndex,
+            container: &str,
+            node: &crate::zip_tree::ZipTreeNode,
+            prefix: &mut Vec<String>,
+            ambiguous: bool,
+        ) {
+            let result = (|| {
+                if ambiguous {
+                    return Err(CandidatePermissionError::UnsupportedSource(
+                        "archive level is ambiguous".into(),
+                    ));
+                }
+                let scope = BookScopeKey::archive(container, prefix)?;
+                let domain = PageDomain::ArchiveLevel {
+                    prefix: scope.level_prefix.clone(),
+                };
+                let mut identities = std::collections::HashSet::with_capacity(node.images.len());
+                for entry in &node.images {
+                    let page = CompositionPageRef::ArchiveEntry {
+                        entry_name: entry.entry_name.clone(),
+                    };
+                    domain
+                        .validate_page(&page)
+                        .map_err(|error| error.to_string())?;
+                    if !identities.insert(page.matching_key()) {
+                        return Err(CandidatePermissionError::UnsupportedSource(
+                            "archive pages have ambiguous normalized identities".into(),
+                        ));
+                    }
+                }
+                Ok((scope, domain))
+            })();
+            let scope_index = index.scopes.len();
+            index.scopes.push(result);
+            for entry in &node.images {
+                #[cfg(test)]
+                {
+                    index.visited_pages += 1;
+                }
+                let key = crate::book_bookmarks::normalize_page_path(&entry.entry_name);
+                index
+                    .entries
+                    .entry(key)
+                    .and_modify(|entry| {
+                        *entry = Err(CandidatePermissionError::UnsupportedSource(
+                            "archive page has no unambiguous owning level".into(),
+                        ))
+                    })
+                    .or_insert(Ok(scope_index));
+            }
+            let mut child_counts = std::collections::HashMap::<String, usize>::new();
+            for name in node.dirs.keys() {
+                *child_counts.entry(name.to_lowercase()).or_default() += 1;
+            }
+            for (name, child) in &node.dirs {
+                prefix.push(name.clone());
+                walk(
+                    index,
+                    container,
+                    child,
+                    prefix,
+                    ambiguous || child_counts[&name.to_lowercase()] > 1,
+                );
+                prefix.pop();
+            }
+        }
+        let mut index = Self {
+            entries: Default::default(),
+            scopes: Vec::new(),
+            #[cfg(test)]
+            visited_pages: 0,
+        };
+        walk(
+            &mut index,
+            container,
+            &tree.raw_source().root,
+            &mut Vec::new(),
+            false,
+        );
+        index
+    }
+    fn scope_for(
+        &self,
+        entry: &str,
+    ) -> Result<(BookScopeKey, PageDomain), CandidatePermissionError> {
+        let key = crate::book_bookmarks::normalize_page_path(entry);
+        let scope_index = self
+            .entries
+            .get(&key)
+            .ok_or_else(|| {
+                CandidatePermissionError::Unavailable(
+                    "archive page owning level is unavailable".into(),
+                )
+            })?
+            .clone()?;
+        self.scopes[scope_index].clone()
+    }
+}
+
+fn prepare_archive_scope_index(
+    candidate: &CandidatePage,
+    container: &str,
+    physical: &std::path::Path,
+) -> Result<ArchiveScopeIndex, CandidatePermissionError> {
+    if let Some(tree) = candidate.raw_tree.as_deref().filter(|tree| {
+        crate::path_key::normalize_keep_drive(&tree.zip_path)
+            == crate::path_key::normalize_keep_drive(physical)
+    }) {
+        return Ok(ArchiveScopeIndex::prepare(container, tree));
+    }
+    let entries = if physical.is_dir()
+        && crate::path_key::normalize_keep_drive(physical)
+            != crate::path_key::normalize_keep_drive(std::path::Path::new(container))
+    {
+        crate::zip_loader::enumerate_converted_image_entries_detailed_readonly_with_cancel(
+            physical, None,
+        )
+    } else {
+        crate::zip_loader::enumerate_image_entries_detailed_readonly_with_cancel(physical, None)
+    }
+    .map_err(|error| CandidatePermissionError::Unavailable(error.to_string()))?;
+    Ok(ArchiveScopeIndex::prepare(
+        container,
+        &ZipTree::build(physical.to_owned(), entries.entries),
+    ))
 }
 
 pub(crate) fn candidate_permission(
@@ -365,4 +466,182 @@ pub(crate) fn candidate_permission(
         }
     }
     Ok(CandidatePermission::Allowed(Some(proof)))
+}
+
+/// Output admission is checked in its worker when a real source is accepted.
+/// Capturing a source or displaying a cached thumbnail is not an output permit.
+#[derive(Clone)]
+pub struct CompositionOutputCheck {
+    service: super::BookCompositionService,
+    candidate: CandidatePage,
+}
+
+pub(crate) const COMPOSITION_OUTPUT_HIDDEN_NOTICE: &str =
+    "本の構成で非表示に設定されているため、出力から除外しました";
+
+impl CompositionOutputCheck {
+    pub(crate) fn new(service: super::BookCompositionService, candidate: CandidatePage) -> Self {
+        Self { service, candidate }
+    }
+
+    /// Single-candidate adapter; multi-page workers share a run resolver.
+    pub(crate) fn permits(&self) -> Result<bool, String> {
+        self.permits_with(&mut CompositionOutputResolver::default())
+    }
+
+    pub(crate) fn permits_with(
+        &self,
+        resolver: &mut CompositionOutputResolver,
+    ) -> Result<bool, String> {
+        let snapshot = self.service.snapshot();
+        snapshot.status.clone()?;
+        match resolver.permission(&snapshot, &self.candidate, || self.service.snapshot()) {
+            Ok(value) => Ok(value),
+            Err(CandidatePermissionError::UnsupportedSource(reason)) => {
+                crate::logger::log(format!(
+                    "composition output: unsupported source, preserving ordinary output: {reason}"
+                ));
+                Ok(true)
+            }
+            Err(CandidatePermissionError::Unavailable(reason)) => Err(reason),
+        }
+    }
+}
+
+/// Static source indexes and revision-scoped hidden sets belong to one output
+/// run. No permission result or source index is shared across worker lifetimes.
+#[derive(Default)]
+pub(crate) struct CompositionOutputResolver {
+    archives: std::collections::HashMap<(String, String, usize), PreparedOutputArchive>,
+    hidden: std::collections::HashMap<
+        String,
+        (
+            CompositionToken,
+            PageDomain,
+            std::collections::HashSet<CompositionPageRef>,
+        ),
+    >,
+    #[cfg(test)]
+    pub(crate) prepared_sources: usize,
+    #[cfg(test)]
+    pub(crate) visited_pages: usize,
+}
+
+struct PreparedOutputArchive {
+    // Keep the captured Arc alive alongside its pointer key; pointer reuse must
+    // never alias another context's raw source within a run.
+    _raw_tree: Option<Arc<ZipTree>>,
+    index: Result<ArchiveScopeIndex, CandidatePermissionError>,
+}
+
+impl CompositionOutputResolver {
+    pub(crate) fn permission(
+        &mut self,
+        snapshot: &CompositionSnapshot,
+        candidate: &CandidatePage,
+        fresh_snapshot: impl FnOnce() -> Arc<CompositionSnapshot>,
+    ) -> Result<bool, CandidatePermissionError> {
+        if snapshot.rows.is_empty() {
+            return Ok(true);
+        }
+        let (scope, domain, page) = if let PageIdentity::Archive {
+            container,
+            entry_name,
+        } = &candidate.identity
+        {
+            let root = crate::path_key::normalize_keep_drive(std::path::Path::new(container));
+            let prefix = format!("{root}/");
+            // BTreeMap's range gives O(log scopes) root membership, without
+            // scanning all stored books for every selected page.
+            let has_rows = snapshot.rows.contains_key(&root)
+                || snapshot
+                    .rows
+                    .range(prefix.clone()..)
+                    .next()
+                    .is_some_and(|(key, _)| key.starts_with(&prefix));
+            if !has_rows {
+                return Ok(true);
+            }
+            crate::book_scope::validate_relative_reference(entry_name)?;
+            let physical = candidate
+                .physical_archive
+                .as_deref()
+                .unwrap_or_else(|| std::path::Path::new(container));
+            let physical_key = crate::path_key::normalize_keep_drive(physical);
+            let tree_ptr = candidate
+                .raw_tree
+                .as_ref()
+                .filter(|tree| {
+                    crate::path_key::normalize_keep_drive(&tree.zip_path) == physical_key
+                })
+                .map_or(0, |tree| Arc::as_ptr(tree) as usize);
+            let key = (root, physical_key, tree_ptr);
+            if !self.archives.contains_key(&key) {
+                let index = prepare_archive_scope_index(candidate, container, physical);
+                #[cfg(test)]
+                {
+                    self.prepared_sources += 1;
+                    if let Ok(index) = &index {
+                        self.visited_pages += index.visited_pages;
+                    }
+                }
+                self.archives.insert(
+                    key.clone(),
+                    PreparedOutputArchive {
+                        _raw_tree: candidate.raw_tree.clone(),
+                        index,
+                    },
+                );
+            }
+            let index = self.archives[&key].index.as_ref().map_err(Clone::clone)?;
+            let (scope, domain) = index.scope_for(entry_name)?;
+            let page = CompositionPageRef::ArchiveEntry {
+                entry_name: entry_name.clone(),
+            };
+            domain
+                .validate_page(&page)
+                .map_err(|error| error.to_string())?;
+            (scope, domain, page)
+        } else {
+            resolve_candidate_scope(candidate)?
+        };
+        // Source preparation above may enumerate physical ZIP bytes. Accept the
+        // real output source only against the publication after that work, also
+        // when this run already owns an index. No pre-I/O permit is reused.
+        let snapshot = fresh_snapshot();
+        snapshot
+            .status
+            .clone()
+            .map_err(CandidatePermissionError::Unavailable)?;
+        let storage_key = scope.storage_key();
+        let Some(row) = snapshot.rows.get(&storage_key) else {
+            return Ok(true);
+        };
+        let token = snapshot.token_for(&scope);
+        if self
+            .hidden
+            .get(&storage_key)
+            .is_none_or(|(cached, _, _)| *cached != token)
+        {
+            self.hidden.insert(
+                storage_key.clone(),
+                (
+                    token,
+                    row.domain.clone(),
+                    row.composition
+                        .hidden_pages
+                        .iter()
+                        .map(CompositionPageRef::matching_key)
+                        .collect(),
+                ),
+            );
+        }
+        let (_, stored_domain, hidden) = &self.hidden[&storage_key];
+        if stored_domain != &domain {
+            return Err(CandidatePermissionError::Unavailable(
+                "saved composition kind does not match candidate".into(),
+            ));
+        }
+        Ok(!hidden.contains(&page.matching_key()))
+    }
 }

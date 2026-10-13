@@ -53,6 +53,8 @@ pub(crate) struct PreparedEditorSource {
     /// The full policy-admitted source rows, independent of facets and hidden.
     pub(crate) rows: MaterializedBookRows,
     pub(crate) fingerprint: SourceFingerprint,
+    pub(crate) result_source: std::sync::Arc<EditorResultSource>,
+    pub(crate) result: EditorResult,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -263,20 +265,36 @@ pub(crate) fn prepare(
     let (raw_pages, manifest, source_rows) = source_rows(input)?;
     // The adapter refuses unsafe/ambiguous references without modifying legacy rows.
     let rows = project_source_rows(input, None, source_rows)?;
-    let record = match saved {
-        Some(record) => record.clone(),
-        None => {
-            let mut resolved = input.clone();
-            if let Some(initial) = input.initial_binding {
-                let binding = read_initial_binding(input, initial)?;
-                resolved.rules.mode = binding.mode;
-                resolved.rules.direction = binding.direction;
-            }
-            freeze_automatic(&resolved, &rows.items, &raw_pages)?
-        }
-    };
+    let mut resolved_input = input.clone();
+    if saved.is_none()
+        && let Some(initial) = input.initial_binding
+    {
+        let binding = read_initial_binding(input, initial)?;
+        resolved_input.rules.mode = binding.mode;
+        resolved_input.rules.direction = binding.direction;
+    }
+    let record = saved.cloned().unwrap_or_else(|| {
+        let direction = match resolved_input.rules.direction {
+            crate::settings::ReadingDirection::Ltr => ReadingDirection::Ltr,
+            crate::settings::ReadingDirection::Rtl => ReadingDirection::Rtl,
+        };
+        let mut record = BookComposition::new(
+            direction,
+            raw_pages.iter().map(|r| r.page.clone()).collect(),
+        );
+        record.cover_enabled = resolved_input.rules.mode.has_cover();
+        record
+    });
     let draft = CompositionDraft::new(record, input.domain.clone(), manifest)
         .map_err(|error| error.to_string())?;
+    let result_source = std::sync::Arc::new(EditorResultSource {
+        landscape: read_landscape(input, &rows.items)?,
+        items: rows.items.clone(),
+        manifest: draft.manifest().to_vec(),
+        domain: input.domain.clone(),
+        rules: resolved_input.rules,
+    });
+    let result = derive_result(&result_source, draft.record(), draft.generation())?;
     let document_stamp = match &input.source {
         BookCompositionSource::Document { read_target, .. } => {
             read_target.as_ref().map(|read| read.stamp.clone())
@@ -296,6 +314,8 @@ pub(crate) fn prepare(
         raw_pages,
         rows,
         fingerprint,
+        result_source,
+        result,
     })
 }
 
@@ -443,65 +463,107 @@ pub(crate) fn verify_source(
     Ok(())
 }
 
-fn freeze_automatic(
-    input: &EditorSourceInput,
-    items: &[GridItem],
-    raw_pages: &[CanonicalRawPage],
-) -> Result<BookComposition, String> {
+#[derive(Clone, Debug)]
+pub(crate) struct EditorResultSource {
+    items: Vec<GridItem>,
+    landscape: Vec<bool>,
+    manifest: Vec<ManifestPage>,
+    domain: PageDomain,
+    rules: ResolvedAutomaticRules,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EditorResult {
+    pub(crate) generation: u64,
+    pub(crate) cover: Option<CompositionPageRef>,
+    pub(crate) groups: Vec<DerivedEditorGroup>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DerivedEditorGroup {
+    Pair(CompositionPageRef, CompositionPageRef),
+    Single {
+        page: CompositionPageRef,
+        placement: SinglePlacement,
+        companion: DerivedCompanion,
+    },
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DerivedCompanion {
+    Vacant,
+    Blank,
+    Cover(CompositionPageRef),
+}
+
+pub(crate) fn derive_result(
+    source: &EditorResultSource,
+    record: &BookComposition,
+    generation: u64,
+) -> Result<EditorResult, String> {
     use crate::{
         displayed_image_transform::SingletonSpreadPlacement as Side, ui_fullscreen::SpreadPageRole,
     };
-    if !input.rules.mode.is_spread() {
-        return Err("初期構成の見開き設定を確定できません".into());
-    }
-    let landscape = read_landscape(input, items)?;
-    let shift = input.shift.as_ref().map(|reference| match reference {
-        SpreadShiftPageRef::RelativePath(path) => {
-            CompositionPageRef::RelativePath { path: path.clone() }
-        }
-        SpreadShiftPageRef::ArchiveEntry(entry_name) => CompositionPageRef::ArchiveEntry {
-            entry_name: entry_name.clone(),
-        },
-        SpreadShiftPageRef::DocumentPageIdentity(page_num) => CompositionPageRef::PdfPage {
-            page_num: *page_num,
-        },
-    });
-    let shift_anchor = shift.and_then(|shift| {
-        items.iter().position(|item| {
-            page_for_item(item).is_some_and(|page| page.matching_key() == shift.matching_key())
-        })
-    });
-    let groups = crate::ui_fullscreen::build_remote_spread_page_groups_with_shift(
-        items,
-        input.rules.mode,
-        &landscape,
-        input.rules.final_cover,
-        input.rules.singleton_endpoints,
-        input.rules.page_alone,
-        true,
-        shift_anchor,
-    );
-    let direction = match input.rules.direction {
-        crate::settings::ReadingDirection::Ltr => ReadingDirection::Ltr,
-        crate::settings::ReadingDirection::Rtl => ReadingDirection::Rtl,
+    let resolved =
+        resolve_composition(record, &source.domain, &source.manifest).map_err(|e| e.to_string())?;
+    let indices: HashMap<_, _> = source
+        .items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| page_for_item(item).map(|page| (page.matching_key(), index)))
+        .collect();
+    let order: Vec<_> = resolved
+        .visible_pages
+        .iter()
+        .filter_map(|page| indices.get(&page.page.matching_key()).copied())
+        .collect();
+    let items: Vec<_> = order
+        .iter()
+        .map(|&index| source.items[index].clone())
+        .collect();
+    let landscape: Vec<_> = order.iter().map(|&index| source.landscape[index]).collect();
+    let mode = match (record.direction, record.cover_enabled) {
+        (ReadingDirection::Ltr, false) => crate::settings::SpreadMode::Ltr,
+        (ReadingDirection::Ltr, true) => crate::settings::SpreadMode::LtrCover,
+        (ReadingDirection::Rtl, false) => crate::settings::SpreadMode::Rtl,
+        (ReadingDirection::Rtl, true) => crate::settings::SpreadMode::RtlCover,
     };
-    let page_at = |index: usize| {
+    let overrides = order
+        .iter()
+        .enumerate()
+        .filter_map(|(index, original)| {
+            resolved
+                .page_overrides
+                .get(original)
+                .copied()
+                .map(|directive| (index, directive))
+        })
+        .collect();
+    let groups = crate::ui_fullscreen::build_remote_spread_page_groups_with_overrides(
+        &items,
+        mode,
+        &landscape,
+        source.rules.final_cover,
+        source.rules.singleton_endpoints,
+        source.rules.page_alone,
+        true,
+        None,
+        &overrides,
+    );
+    let page_at = |index| {
         items
             .get(index)
             .and_then(page_for_item)
-            .ok_or("自動構成の実ページがありません".to_owned())
+            .ok_or_else(|| "結果の実ページがありません".to_string())
     };
-    let mut units = Vec::with_capacity(groups.len());
+    let mut output = Vec::with_capacity(groups.len());
     for group in groups {
         let mut navigation = group.indices;
-        if input.rules.mode.is_rtl() && navigation.len() == 2 {
+        if mode.is_rtl() && navigation.len() == 2 {
             navigation.reverse();
         }
         match navigation.as_slice() {
-            [first, second] => units.push(CompositionUnit::Pair {
-                first: page_at(*first)?,
-                second: page_at(*second)?,
-            }),
+            [first, second] => output.push(DerivedEditorGroup::Pair(
+                page_at(*first)?,
+                page_at(*second)?,
+            )),
             [index] => {
                 let supplement = group.presentation.as_ref().and_then(|pages| {
                     pages
@@ -516,12 +578,12 @@ fn freeze_automatic(
                     }) {
                         Some(0) => Side::Left,
                         Some(1) => Side::Right,
-                        _ => return Err("表紙の補助表示の側を確定できません".into()),
+                        _ => return Err("結果の表紙側が不正です".into()),
                     }
                 } else {
                     group.singleton_placement.side()
                 };
-                let placement = match (side, direction) {
+                let placement = match (side, record.direction) {
                     (Side::Center, _) => SinglePlacement::Center,
                     (Side::Left, ReadingDirection::Ltr) | (Side::Right, ReadingDirection::Rtl) => {
                         SinglePlacement::Leading
@@ -529,54 +591,72 @@ fn freeze_automatic(
                     _ => SinglePlacement::Trailing,
                 };
                 let companion = if let Some(supplement) = supplement {
-                    SingleCompanion::FrontCoverSupplement {
-                        page: page_at(supplement.idx)?,
-                    }
+                    DerivedCompanion::Cover(page_at(supplement.idx)?)
                 } else if group.singleton_placement.has_white_companion() {
-                    SingleCompanion::Blank
+                    DerivedCompanion::Blank
                 } else {
-                    SingleCompanion::Vacant
+                    DerivedCompanion::Vacant
                 };
-                units.push(CompositionUnit::Single {
+                output.push(DerivedEditorGroup::Single {
                     page: page_at(*index)?,
                     placement,
                     companion,
                 });
             }
-            _ => return Err("自動構成のページ数が不正です".into()),
+            _ => return Err("結果のページ数が不正です".into()),
         }
     }
-    let cover = if input.rules.mode.has_cover() {
-        items.iter().find_map(page_for_item)
-    } else {
-        None
-    };
-    // Policy-excluded pages are still registered, without reading or decoding them.
-    let mut included: std::collections::HashSet<_> = units
-        .iter()
-        .flat_map(CompositionUnit::pages)
-        .map(CompositionPageRef::matching_key)
-        .collect();
-    for raw in raw_pages {
-        if included.insert(raw.page.matching_key()) {
-            units.push(CompositionUnit::Single {
-                page: raw.page.clone(),
-                placement: SinglePlacement::Center,
-                companion: SingleCompanion::Vacant,
-            });
-        }
+    Ok(EditorResult {
+        generation,
+        cover: record
+            .cover_enabled
+            .then(|| items.first().and_then(page_for_item))
+            .flatten(),
+        groups: output,
+    })
+}
+
+/// One session owns one mailbox. Superseded unsent drafts are replaced, and the
+/// receiver accepts only a result whose generation still matches its draft.
+pub(crate) struct EditorResultWorker {
+    latest: std::sync::Arc<std::sync::Mutex<Option<(u64, BookComposition)>>>,
+    wake: std::sync::mpsc::SyncSender<()>,
+    pub(crate) receiver: std::sync::mpsc::Receiver<(u64, Result<EditorResult, String>)>,
+}
+impl EditorResultWorker {
+    pub(crate) fn spawn(
+        source: std::sync::Arc<EditorResultSource>,
+        context: egui::Context,
+    ) -> Result<Self, String> {
+        let latest = std::sync::Arc::new(std::sync::Mutex::new(None::<(u64, BookComposition)>));
+        let mailbox = latest.clone();
+        let (wake, requests) = std::sync::mpsc::sync_channel(1);
+        let (results, receiver) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("composition-editor-results".into())
+            .spawn(move || {
+                while requests.recv().is_ok() {
+                    let request = mailbox.lock().unwrap().take();
+                    if let Some((generation, record)) = request {
+                        let result = derive_result(&source, &record, generation);
+                        if results.send((generation, result)).is_err() {
+                            break;
+                        }
+                        context.request_repaint_of(egui::ViewportId::ROOT);
+                    }
+                }
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            latest,
+            wake,
+            receiver,
+        })
     }
-    capture_initial_composition(
-        &input.domain,
-        direction,
-        cover,
-        &units,
-        &raw_pages
-            .iter()
-            .map(|raw| raw.page.clone())
-            .collect::<Vec<_>>(),
-    )
-    .map_err(|error| error.to_string())
+    pub(crate) fn request(&self, generation: u64, record: BookComposition) {
+        *self.latest.lock().unwrap() = Some((generation, record));
+        let _ = self.wake.try_send(());
+    }
 }
 
 #[cfg(test)]
@@ -761,16 +841,13 @@ mod tests {
         let resolve_counter = crate::pdf_loader::RemoteResolveTestCounter::for_path(&logical);
         let prepared = prepare(&input, None).unwrap();
         assert_eq!(prepared.draft.record().direction, ReadingDirection::Rtl);
-        assert_eq!(prepared.draft.record().cover, None);
+        assert_eq!(prepared.draft.record().cover_enabled, false);
         assert_eq!(
-            prepared.draft.record().units[0],
-            CompositionUnit::Pair {
-                first: pdf_page(0),
-                second: pdf_page(1)
-            }
+            prepared.result.groups[0],
+            DerivedEditorGroup::Pair(pdf_page(0), pdf_page(1))
         );
-        assert!(prepared.draft.record().units.iter().any(
-            |unit| matches!(unit, CompositionUnit::Single { page, .. } if *page == pdf_page(2))
+        assert!(prepared.result.groups.iter().any(
+            |unit| matches!(unit, DerivedEditorGroup::Single { page, .. } if *page == pdf_page(2))
         ));
         assert_eq!(prepared.raw_pages.len(), 4);
         assert_eq!(prepared.rows.items.len(), 4);
@@ -805,13 +882,10 @@ mod tests {
         let resolve_counter = crate::pdf_loader::RemoteResolveTestCounter::for_path(&logical);
         let prepared = prepare(&input, None).unwrap();
         assert_eq!(prepared.draft.record().direction, ReadingDirection::Rtl);
-        assert_eq!(prepared.draft.record().cover, Some(pdf_page(0)));
+        assert_eq!(prepared.result.cover, Some(pdf_page(0)));
         assert_eq!(
-            prepared.draft.record().units[1],
-            CompositionUnit::Pair {
-                first: pdf_page(1),
-                second: pdf_page(2)
-            }
+            prepared.result.groups[1],
+            DerivedEditorGroup::Pair(pdf_page(1), pdf_page(2))
         );
         assert_eq!(prepared.raw_pages.len(), 3);
         assert!(prepared.rows.items.iter().all(
@@ -863,18 +937,14 @@ mod tests {
         second.policy.excluded_extensions.insert("jpg".into());
         let mut saved = BookComposition::new(
             ReadingDirection::Ltr,
-            vec![
-                CompositionUnit::Single {
-                    page: page("A.PNG"),
-                    placement: SinglePlacement::Leading,
-                    companion: SingleCompanion::Blank,
-                },
-                CompositionUnit::Pair {
-                    first: page("B.JPG"),
-                    second: page("C.PNG"),
-                },
-            ],
+            vec![page("A.PNG"), page("B.JPG"), page("C.PNG")],
         );
+        saved.page_overrides.push(PageOverrideEntry {
+            page: page("A.PNG"),
+            directive: PageOverride::BlankOpposite {
+                page_side: PageSide::Leading,
+            },
+        });
         saved.hidden_pages.push(page("B.JPG"));
         let before = saved.clone();
         let all = prepare(&first, Some(&saved)).unwrap();
@@ -908,7 +978,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_freezes_full_book_with_saved_rotation_and_live_override() {
+    fn worker_derives_full_book_with_saved_rotation_and_live_override() {
         let root = tempfile::tempdir().unwrap();
         let mut input = archive_input(
             root.path(),
@@ -926,54 +996,46 @@ mod tests {
         let prepared = prepare(&input, None).unwrap();
         assert_eq!(prepared.raw_pages.len(), 4);
         assert!(
-            matches!(&prepared.draft.record().units[0], CompositionUnit::Single { page: first, .. } if *first == page("a.png"))
+            matches!(&prepared.result.groups[0], DerivedEditorGroup::Single { page: first, .. } if *first == page("a.png"))
         );
         assert!(
-            matches!(&prepared.draft.record().units[1], CompositionUnit::Single { page: second, .. } if *second == page("b.png"))
+            matches!(&prepared.result.groups[1], DerivedEditorGroup::Single { page: second, .. } if *second == page("b.png"))
         );
         input.rotations.insert(page("b.png"), Rotation::None);
         let prepared = prepare(&input, None).unwrap();
         assert_eq!(
-            prepared.draft.record().units[0],
-            CompositionUnit::Pair {
-                first: page("a.png"),
-                second: page("b.png")
-            }
+            prepared.result.groups[0],
+            DerivedEditorGroup::Pair(page("a.png"), page("b.png"))
         );
         assert_eq!(
-            prepared.draft.record().units[1],
-            CompositionUnit::Pair {
-                first: page("c.png"),
-                second: page("d.png")
-            }
+            prepared.result.groups[1],
+            DerivedEditorGroup::Pair(page("c.png"), page("d.png"))
         );
     }
 
     #[test]
-    fn worker_preserves_manual_units_missing_hidden_and_excluded_members() {
+    fn worker_preserves_order_overrides_missing_hidden_and_excluded_members() {
         let root = tempfile::tempdir().unwrap();
         let mut input = archive_input(root.path(), &[("a.png", 8, 16), ("b.png", 8, 16)]);
         input.policy.excluded_extensions.insert("png".into());
         let mut saved = BookComposition::new(
             ReadingDirection::Rtl,
-            vec![CompositionUnit::Pair {
-                first: page("missing.png"),
-                second: page("a.png"),
-            }],
+            vec![page("missing.png"), page("a.png")],
         );
         saved.hidden_pages.push(page("missing.png"));
+        saved.page_overrides.push(PageOverrideEntry {
+            page: page("missing.png"),
+            directive: PageOverride::Alone,
+        });
         let prepared = prepare(&input, Some(&saved)).unwrap();
         assert!(prepared.rows.items.is_empty());
-        assert_eq!(prepared.draft.record().units[0], saved.units[0]);
-        assert_eq!(prepared.draft.record().hidden_pages, saved.hidden_pages);
         assert_eq!(
-            prepared.draft.record().units[1],
-            CompositionUnit::Single {
-                page: page("b.png"),
-                placement: SinglePlacement::Center,
-                companion: SingleCompanion::Vacant
-            }
+            prepared.draft.record().page_order,
+            vec![page("missing.png"), page("a.png"), page("b.png")]
         );
+        assert_eq!(prepared.draft.record().hidden_pages, saved.hidden_pages);
+        assert_eq!(prepared.draft.record().page_overrides, saved.page_overrides);
+        assert!(prepared.result.groups.is_empty());
     }
 
     #[test]
@@ -991,7 +1053,119 @@ mod tests {
     }
 
     #[test]
-    fn worker_rtl_shift_is_live_and_does_not_re_read_saved_shift_store() {
+    fn result_generation_rebuilds_order_hidden_and_directives_without_mutating_record() {
+        let root = tempfile::tempdir().unwrap();
+        let input = archive_input(
+            root.path(),
+            &[
+                ("a.png", 8, 16),
+                ("b.png", 8, 16),
+                ("c.png", 8, 16),
+                ("d.png", 8, 16),
+                ("e.png", 8, 16),
+            ],
+        );
+        let mut prepared = prepare(&input, None).unwrap();
+        prepared
+            .draft
+            .apply(CompositionEdit::SetHidden {
+                page: page("b.png"),
+                hidden: true,
+            })
+            .unwrap();
+        let record = prepared.draft.record().clone();
+        let result = derive_result(
+            &prepared.result_source,
+            &record,
+            prepared.draft.generation(),
+        )
+        .unwrap();
+        assert_eq!(
+            result.groups,
+            vec![
+                DerivedEditorGroup::Pair(page("a.png"), page("c.png")),
+                DerivedEditorGroup::Pair(page("d.png"), page("e.png"))
+            ]
+        );
+        assert_eq!(prepared.draft.record(), &record);
+        prepared
+            .draft
+            .apply(CompositionEdit::SetOverride {
+                page: page("c.png"),
+                directive: Some(PageOverride::BlankOpposite {
+                    page_side: PageSide::Trailing,
+                }),
+            })
+            .unwrap();
+        let blank = derive_result(
+            &prepared.result_source,
+            prepared.draft.record(),
+            prepared.draft.generation(),
+        )
+        .unwrap();
+        assert!(
+            matches!(&blank.groups[1], DerivedEditorGroup::Single { page: p, placement: SinglePlacement::Trailing, companion: DerivedCompanion::Blank } if *p == page("c.png"))
+        );
+        prepared.draft.undo();
+        let undo = derive_result(
+            &prepared.result_source,
+            prepared.draft.record(),
+            prepared.draft.generation(),
+        )
+        .unwrap();
+        assert_eq!(undo.groups, result.groups);
+        prepared.draft.redo();
+        let redo = derive_result(
+            &prepared.result_source,
+            prepared.draft.record(),
+            prepared.draft.generation(),
+        )
+        .unwrap();
+        assert_eq!(redo.groups, blank.groups);
+        assert!(redo.generation > blank.generation);
+    }
+
+    #[test]
+    fn result_worker_coalesces_to_latest_generation_and_drops_with_session() {
+        let root = tempfile::tempdir().unwrap();
+        let input = archive_input(
+            root.path(),
+            &[("a.png", 8, 16), ("b.png", 8, 16), ("c.png", 8, 16)],
+        );
+        let mut prepared = prepare(&input, None).unwrap();
+        let worker =
+            EditorResultWorker::spawn(prepared.result_source.clone(), egui::Context::default())
+                .unwrap();
+        for hidden in [true, false, true] {
+            prepared
+                .draft
+                .apply(CompositionEdit::SetHidden {
+                    page: page("b.png"),
+                    hidden,
+                })
+                .unwrap();
+            worker.request(prepared.draft.generation(), prepared.draft.record().clone());
+        }
+        let latest = prepared.draft.generation();
+        loop {
+            let (generation, result) = worker
+                .receiver
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .unwrap();
+            if generation == latest {
+                let result = result.unwrap();
+                assert_eq!(
+                    result.groups,
+                    vec![DerivedEditorGroup::Pair(page("a.png"), page("c.png"))]
+                );
+                break;
+            }
+            assert!(generation < latest);
+        }
+    }
+
+    #[test]
+    fn worker_rtl_shift_is_not_frozen_and_does_not_re_read_saved_shift_store() {
         let root = tempfile::tempdir().unwrap();
         let mut input = archive_input(
             root.path(),
@@ -1008,11 +1182,8 @@ mod tests {
         let prepared = prepare(&input, None).unwrap();
         assert_eq!(prepared.draft.record().direction, ReadingDirection::Rtl);
         assert_eq!(
-            prepared.draft.record().units[1],
-            CompositionUnit::Pair {
-                first: page("b.png"),
-                second: page("c.png")
-            }
+            prepared.result.groups[0],
+            DerivedEditorGroup::Pair(page("a.png"), page("b.png"))
         );
         assert!(!root.path().join("spread_shift.db").exists());
     }
@@ -1038,18 +1209,18 @@ mod tests {
             input.rules.page_alone.after_cover = true;
             input.rules.page_alone.last = true;
             let blank = prepare(&input, None).unwrap();
-            assert_eq!(blank.draft.record().cover, Some(page("a.png")));
-            assert!(blank.draft.record().units.iter().any(|unit| matches!(
+            assert_eq!(blank.result.cover, Some(page("a.png")));
+            assert!(blank.result.groups.iter().any(|unit| matches!(
                 unit,
-                CompositionUnit::Single {
-                    companion: SingleCompanion::Blank,
+                DerivedEditorGroup::Single {
+                    companion: DerivedCompanion::Blank,
                     ..
                 }
             )));
             input.rules.final_cover = true;
             let supplement = prepare(&input, None).unwrap();
-            assert!(supplement.draft.record().units.iter().any(|unit| matches!(unit,
-                CompositionUnit::Single { companion: SingleCompanion::FrontCoverSupplement { page: cover }, .. } if *cover == page("a.png"))));
+            assert!(supplement.result.groups.iter().any(|unit| matches!(unit,
+                DerivedEditorGroup::Single { companion: DerivedCompanion::Cover(cover), .. } if *cover == page("a.png"))));
             let resolved = resolve_composition(
                 supplement.draft.record(),
                 supplement.draft.domain(),
@@ -1063,7 +1234,10 @@ mod tests {
                 4,
                 "cover helper is not a source row"
             );
-            assert_eq!(resolved.units.len(), supplement.draft.record().units.len());
+            assert!(
+                supplement.draft.record().page_overrides.is_empty(),
+                "automatic presentation is never persisted"
+            );
         }
     }
 
@@ -1115,13 +1289,10 @@ mod tests {
             input.rules.mode = crate::settings::SpreadMode::Ltr;
             let prepared = prepare(&input, None).unwrap();
             assert_eq!(prepared.draft.record().direction, ReadingDirection::Rtl);
-            assert_eq!(prepared.draft.record().cover, Some(page("a.png")));
+            assert_eq!(prepared.result.cover, Some(page("a.png")));
             assert_eq!(
-                prepared.draft.record().units[1],
-                CompositionUnit::Pair {
-                    first: page("b.png"),
-                    second: page("c.png")
-                }
+                prepared.result.groups[1],
+                DerivedEditorGroup::Pair(page("b.png"), page("c.png"))
             );
             assert_eq!(db.get_state_with_fallback(&path, None), before);
         }
@@ -1163,7 +1334,7 @@ mod tests {
         let before = db.get_state_with_fallback(&exact, Some(&physical));
         let prepared = prepare(&input, None).unwrap();
         assert_eq!(prepared.draft.record().direction, ReadingDirection::Rtl);
-        assert_eq!(prepared.draft.record().cover, Some(page("chapter/a.png")));
+        assert_eq!(prepared.result.cover, Some(page("chapter/a.png")));
         assert_eq!(db.get_state_with_fallback(&exact, Some(&physical)), before);
     }
 

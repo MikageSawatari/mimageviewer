@@ -31,7 +31,7 @@ pub(crate) struct EditorSession {
     input: EditorSourceInput,
     prepared: Result<PreparedEditorSource, String>,
     ui: ui::EditorUiState,
-    preview: Option<DraftEditPreview>,
+    result_worker: Option<preparation::EditorResultWorker>,
     error: Option<String>,
     saved: bool,
     pages: Vec<CompositionPageRef>,
@@ -84,7 +84,7 @@ impl EditorSession {
             input,
             prepared,
             ui: Default::default(),
-            preview: None,
+            result_worker: None,
             error: None,
             saved,
             pages,
@@ -100,6 +100,34 @@ impl EditorSession {
     }
     fn refresh_view(&mut self) {
         self.view = editor_view(self);
+    }
+    fn poll_results(&mut self) {
+        let Some(worker) = &self.result_worker else {
+            return;
+        };
+        let Ok(prepared) = &mut self.prepared else {
+            return;
+        };
+        let mut changed = false;
+        while let Ok((generation, result)) = worker.receiver.try_recv() {
+            if generation != prepared.draft.generation() {
+                continue;
+            }
+            match result {
+                Ok(result) => {
+                    prepared.result = result;
+                    self.error = None;
+                }
+                Err(error) => {
+                    crate::logger::log(format!("composition editor result: {error}"));
+                    self.error = Some(error);
+                }
+            }
+            changed = true;
+        }
+        if changed {
+            self.refresh_view();
+        }
     }
 }
 
@@ -216,31 +244,10 @@ impl App {
             }
             .with_reading_direction(self.reading_direction);
         }
-        let nav = self.get_still_image_indices();
-        let units = if self.composed_book_layout().is_none() {
-            std::sync::Arc::from(self.capture_effective_automatic_compositions(&nav, rules.mode))
-        } else {
-            std::sync::Arc::from([])
-        };
-        let frozen = crate::spread_shift::EffectiveLayoutSnapshot {
-            scope: scope.clone(),
-            context_id: self.projected_viewer_context_id(),
-            items_generation: self.items_generation,
-            nav_generation: self.items_generation,
-            settings_generation: rules.landscape_epoch,
-            rules,
-            live_shift: match &self.spread_shift.state {
-                super::spread_shift_owner::ViewerShift::Book(state) => state.clone(),
-                _ => crate::spread_shift::SpreadShiftState::None,
-            },
-            units,
-            layout_token: self.composed_layout_token(),
-        };
-        let captured = crate::spread_shift::capture_effective_automatic_layout(
-            crate::spread_shift::AutomaticContextToken { effective: &frozen },
-        );
-        let shift = match captured.live_shift {
-            crate::spread_shift::SpreadShiftState::Adjusted { anchor_ref, .. } => Some(anchor_ref),
+        let shift = match &self.spread_shift.state {
+            super::spread_shift_owner::ViewerShift::Book(
+                crate::spread_shift::SpreadShiftState::Adjusted { anchor_ref, .. },
+            ) => Some(anchor_ref.clone()),
             _ => None,
         };
         let rotations = self
@@ -261,7 +268,7 @@ impl App {
             policy: self.settings.file_type_visibility.clone(),
             placement: self.settings.grid_display_order.clone(),
             sort: super::BOOK_READING_PAGE_ORDER,
-            rules: captured.rules,
+            rules,
             shift,
             rotations,
             data_dir: crate::data_dir::get(),
@@ -335,7 +342,7 @@ impl App {
         // Clone the potentially large rotation snapshot before the session lock.
         let preparing_input = Box::new(input.clone());
         let handle = self.remote_session_handle().cloned();
-        let mut adopt = || {
+        let adopt = || {
             self.composition_editor_operations.owner = Some(owner.clone());
             self.composition_editor = CompositionEditorState::Preparing {
                 input: preparing_input,
@@ -413,6 +420,10 @@ impl App {
                             crate::logger::log(format!("composition editor prepare: {error}"));
                         }
                         if let Ok(prepared) = &session.prepared {
+                            session.result_worker = Some(preparation::EditorResultWorker::spawn(
+                                prepared.result_source.clone(),
+                                wake.clone(),
+                            )?);
                             session.thumbnails = Some(
                                 super::book_composition_editor_thumbnails::EditorThumbnails::spawn(
                                     session.input.clone(),
@@ -593,6 +604,10 @@ impl App {
                             CompositionEditorState::Closed
                         }
                     }
+                    CompositionEditorState::Editing(mut session) => {
+                        session.poll_results();
+                        CompositionEditorState::Editing(session)
+                    }
                     state => state,
                 };
                 matches!(app.composition_editor, CompositionEditorState::Closed)
@@ -650,6 +665,9 @@ impl App {
         }
     }
     fn save_local_composition_editor(&mut self, ctx: &egui::Context, remove: bool) {
+        if let CompositionEditorState::Editing(session) = &mut self.composition_editor {
+            session.poll_results();
+        }
         let Some(owner) = self.composition_editor_operations.owner.clone() else {
             return;
         };
@@ -666,7 +684,7 @@ impl App {
             self.composition_editor = CompositionEditorState::Editing(session);
             return;
         };
-        if session.preview.is_some() {
+        if !remove && prepared.result.generation != prepared.draft.generation() {
             self.composition_editor = CompositionEditorState::Editing(session);
             return;
         }
@@ -777,6 +795,7 @@ impl App {
         let mut state = std::mem::take(&mut self.composition_editor);
         let actions = match &mut state {
             CompositionEditorState::Editing(session) => {
+                session.poll_results();
                 if let Some(thumbnails) = &mut session.thumbnails {
                     for (page, texture) in thumbnails.poll() {
                         let key = page.matching_key();
@@ -879,11 +898,6 @@ impl App {
                 let Ok(prepared) = &mut session.prepared else {
                     return;
                 };
-                if session.preview.is_some()
-                    && !matches!(action, A::Undo | A::Redo | A::ConfirmEdit | A::DiscardEdit)
-                {
-                    return;
-                }
                 let draft = &mut prepared.draft;
                 let selected = session
                     .ui
@@ -891,108 +905,45 @@ impl App {
                     .first()
                     .and_then(|&id| session.pages.get(id))
                     .cloned()
-                    .map(DraftSelection::Page)
-                    .or_else(|| session.ui.selected_unit.map(DraftSelection::Unit));
-                if !matches!(action, A::Undo | A::Redo | A::ConfirmEdit | A::DiscardEdit) {
+                    .map(DraftSelection::Page);
+                if !matches!(action, A::Undo | A::Redo) {
                     let _ = draft.select(selected);
                 }
-                let blank_action = matches!(
-                    action,
-                    A::InsertBlank { .. }
-                        | A::SetCompanion {
-                            companion: ui::EditorCompanionView::Blank,
-                            ..
-                        }
-                );
+                let before = draft.generation();
                 let result = match action {
                     A::Undo => {
                         draft.undo();
-                        session.preview = None;
                         Ok(())
                     }
                     A::Redo => {
                         draft.redo();
-                        session.preview = None;
                         Ok(())
                     }
-                    A::ConfirmEdit => {
-                        if let Some(preview) = session.preview.take() {
-                            draft.apply(preview, true).map(|_| ())
-                        } else {
-                            Ok(())
-                        }
-                    }
-                    A::DiscardEdit => {
-                        session.preview = None;
-                        Ok(())
-                    }
-                    A::Rebuild => {
-                        let mut replacement = Vec::new();
-                        let pages = draft.record().pages().cloned().collect::<Vec<_>>();
-                        // Explicit editor-selected direction/cover, never global defaults.
-                        let mut cursor = 0;
-                        while cursor < pages.len() {
-                            if draft.record().cover.as_ref() == Some(&pages[cursor])
-                                || cursor + 1 == pages.len()
-                                || draft.record().cover.as_ref() == pages.get(cursor + 1)
-                            {
-                                replacement.push(CompositionUnit::Single {
-                                    page: pages[cursor].clone(),
-                                    placement: SinglePlacement::Center,
-                                    companion: SingleCompanion::Vacant,
-                                });
-                                cursor += 1;
-                            } else {
-                                replacement.push(CompositionUnit::Pair {
-                                    first: pages[cursor].clone(),
-                                    second: pages[cursor + 1].clone(),
-                                });
-                                cursor += 2;
-                            }
-                        }
-                        draft.preview_rebuild(replacement).map(|preview| {
-                            session.preview = Some(preview);
-                        })
-                    }
-                    action => editor_unit_edits(draft, &session.pages, &action)
-                        .and_then(|edits| draft.preview_edits(edits).map_err(|e| e.to_string()))
-                        .and_then(|preview| {
-                            if preview.requires_confirmation() {
-                                session.preview = Some(preview);
-                                Ok(())
-                            } else {
-                                draft
-                                    .apply(preview, false)
-                                    .map(|_| ())
-                                    .map_err(|e| e.to_string())
-                            }
-                        })
-                        .map_err(CompositionError::Json),
+                    action => editor_page_edits(draft, &session.pages, &action).and_then(|edits| {
+                        draft
+                            .apply_edits(edits)
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    }),
                 };
                 if let Err(error) = result {
-                    session.error = Some(if blank_action {
-                        "白紙には組になる実ページが必要です。白紙だけの組や連続した白紙は作れません"
-                            .into()
-                    } else {
-                        format!("構成を変更できません: {error}")
-                    });
+                    session.error = Some(format!("構成を変更できません: {error}"));
                 } else {
                     session.error = None;
                 }
                 session.ui.selected_pages.clear();
-                session.ui.selected_unit = None;
-                match draft.selection() {
-                    Some(DraftSelection::Page(page)) => {
-                        if let Some(id) = session
-                            .pages
-                            .iter()
-                            .position(|p| p.matching_key() == page.matching_key())
-                        {
-                            session.ui.selected_pages.push(id);
-                        }
-                    }
-                    Some(DraftSelection::Unit(unit)) => session.ui.selected_unit = Some(*unit),
-                    None => {}
+                if let Some(DraftSelection::Page(page)) = draft.selection()
+                    && let Some(id) = session
+                        .pages
+                        .iter()
+                        .position(|p| p.matching_key() == page.matching_key())
+                {
+                    session.ui.selected_pages.push(id);
+                }
+                if before != draft.generation()
+                    && let Some(worker) = &session.result_worker
+                {
+                    worker.request(draft.generation(), draft.record().clone());
                 }
                 session.refresh_view();
             }
@@ -1031,8 +982,11 @@ fn empty_editor_view(
         saved: false,
         phase,
         direction: ReadingDirection::Ltr,
+        cover_enabled: false,
         cover: None,
         pages: vec![],
+        page_order: vec![],
+        results_updating: false,
         units: vec![],
         can_undo: false,
         can_redo: false,
@@ -1040,7 +994,6 @@ fn empty_editor_view(
         can_remove: false,
         landing: "同じ本を開いている他の窓も移動することがあります".into(),
         error,
-        pending_preview: None,
     }
 }
 fn editor_view(session: &EditorSession) -> ui::EditorView {
@@ -1075,6 +1028,11 @@ fn editor_view(session: &EditorSession) -> ui::EditorView {
         .iter()
         .map(CompositionPageRef::matching_key)
         .collect::<std::collections::HashSet<_>>();
+    let overrides: std::collections::HashMap<_, _> = record
+        .page_overrides
+        .iter()
+        .map(|entry| (entry.page.matching_key(), entry.directive))
+        .collect();
     let pages = references
         .iter()
         .enumerate()
@@ -1097,6 +1055,7 @@ fn editor_view(session: &EditorSession) -> ui::EditorView {
                 missing: entry.is_none(),
                 excluded_by_policy: entry
                     .is_some_and(|m| m.availability == ManifestAvailability::ExcludedByPolicy),
+                directive: overrides.get(&page.matching_key()).copied(),
                 thumbnail: session
                     .textures
                     .get(&page.matching_key())
@@ -1104,15 +1063,37 @@ fn editor_view(session: &EditorSession) -> ui::EditorView {
             }
         })
         .collect();
-    let units = record
-        .units
+    let visible = |page: &CompositionPageRef| {
+        manifest
+            .get(&page.matching_key())
+            .is_some_and(|m| matches!(m.availability, ManifestAvailability::Present { .. }))
+            && !hidden.contains(&page.matching_key())
+    };
+    let units = prepared
+        .result
+        .groups
         .iter()
-        .map(|unit| match unit {
-            CompositionUnit::Pair { first, second } => ui::EditorUnitView::Pair {
+        .filter(|group| match group {
+            preparation::DerivedEditorGroup::Pair(first, second) => {
+                visible(first) && visible(second)
+            }
+            preparation::DerivedEditorGroup::Single {
+                page, companion, ..
+            } => {
+                visible(page)
+                    && match companion {
+                        preparation::DerivedCompanion::Cover(cover) => visible(cover),
+                        preparation::DerivedCompanion::Vacant
+                        | preparation::DerivedCompanion::Blank => true,
+                    }
+            }
+        })
+        .map(|group| match group {
+            preparation::DerivedEditorGroup::Pair(first, second) => ui::EditorUnitView::Pair {
                 first: id(first),
                 second: id(second),
             },
-            CompositionUnit::Single {
+            preparation::DerivedEditorGroup::Single {
                 page,
                 placement,
                 companion,
@@ -1120,15 +1101,16 @@ fn editor_view(session: &EditorSession) -> ui::EditorView {
                 page: id(page),
                 placement: *placement,
                 companion: match companion {
-                    SingleCompanion::Vacant => ui::EditorCompanionView::Vacant,
-                    SingleCompanion::Blank => ui::EditorCompanionView::Blank,
-                    SingleCompanion::FrontCoverSupplement { page } => {
+                    preparation::DerivedCompanion::Vacant => ui::EditorCompanionView::Vacant,
+                    preparation::DerivedCompanion::Blank => ui::EditorCompanionView::Blank,
+                    preparation::DerivedCompanion::Cover(page) => {
                         ui::EditorCompanionView::Cover(id(page))
                     }
                 },
             },
         })
         .collect();
+    let results_updating = prepared.result.generation != prepared.draft.generation();
     ui::EditorView {
         book_name: session
             .input
@@ -1141,59 +1123,23 @@ fn editor_view(session: &EditorSession) -> ui::EditorView {
         saved: session.saved,
         phase: ui::EditorPhase::Editing,
         direction: record.direction,
-        cover: record.cover.as_ref().map(id),
+        cover_enabled: record.cover_enabled,
+        cover: prepared
+            .result
+            .cover
+            .as_ref()
+            .filter(|page| visible(page))
+            .map(id),
+        page_order: record.page_order.iter().map(id).collect(),
+        results_updating,
         pages,
         units,
         can_undo: prepared.draft.can_undo(),
         can_redo: prepared.draft.can_redo(),
-        can_save: session.preview.is_none(),
+        can_save: !results_updating,
         can_remove: session.saved,
         landing: editor_landing_preview(session, record),
         error: session.error.clone(),
-        pending_preview: session
-            .preview
-            .as_ref()
-            .map(|preview| ui::EditorChangePreview {
-                explanation: "組・表紙・相方の表示への変更を適用しますか".into(),
-                changed_units: (0..record.units.len().max(preview.record().units.len()))
-                    .filter(|&index| record.units.get(index) != preview.record().units.get(index))
-                    .map(|index| {
-                        format!(
-                            "組{}: {} → {}",
-                            index + 1,
-                            describe_editor_unit(record.units.get(index)),
-                            describe_editor_unit(preview.record().units.get(index))
-                        )
-                    })
-                    .collect(),
-            }),
-    }
-}
-fn describe_editor_unit(unit: Option<&CompositionUnit>) -> String {
-    match unit {
-        None => "なし".into(),
-        Some(CompositionUnit::Pair { first, second }) => {
-            format!("{} / {}", page_label(first), page_label(second))
-        }
-        Some(CompositionUnit::Single {
-            page,
-            placement,
-            companion,
-        }) => {
-            let side = match placement {
-                SinglePlacement::Center => "中央",
-                SinglePlacement::Leading => "先頭側",
-                SinglePlacement::Trailing => "後尾側",
-            };
-            let companion = match companion {
-                SingleCompanion::Vacant => "".into(),
-                SingleCompanion::Blank => " + 白紙".into(),
-                SingleCompanion::FrontCoverSupplement { page } => {
-                    format!(" + 表紙 {}", page_label(page))
-                }
-            };
-            format!("{} ({side}){companion}", page_label(page))
-        }
     }
 }
 fn page_label(page: &CompositionPageRef) -> String {
@@ -1240,176 +1186,65 @@ fn editor_landing_preview(session: &EditorSession, record: &BookComposition) -> 
     }
 }
 
-fn editor_unit_edits(
+fn editor_page_edits(
     draft: &CompositionDraft,
     pages: &[CompositionPageRef],
     action: &ui::EditorUiAction,
-) -> Result<Vec<UnitEdit>, String> {
+) -> Result<Vec<CompositionEdit>, String> {
     use ui::EditorUiAction as A;
     let record = draft.record();
     let page = |id: usize| {
-        let selected = pages.get(id).ok_or("ページがありません".to_string())?;
-        record
-            .pages()
-            .find(|page| page.matching_key() == selected.matching_key())
+        pages
+            .get(id)
+            .and_then(|selected| {
+                record
+                    .pages()
+                    .find(|page| page.matching_key() == selected.matching_key())
+            })
             .cloned()
-            .ok_or("ページがありません".to_string())
+            .ok_or_else(|| "ページがありません".to_string())
     };
-    let unit_index = |page: &CompositionPageRef| {
+    let position = |page: &CompositionPageRef| {
         record
-            .units
+            .page_order
             .iter()
-            .position(|unit| unit.pages().any(|p| p == page))
-            .ok_or("ページがありません".to_string())
+            .position(|p| p.matching_key() == page.matching_key())
+            .ok_or_else(|| "ページがありません".to_string())
     };
     Ok(match *action {
-        A::InsertBlank {
-            page: id,
-            placement,
-        } => vec![UnitEdit::InsertBlank {
-            page: page(id)?,
-            placement,
-        }],
-        A::SetDirection(direction) => vec![UnitEdit::SetDirection(direction)],
-        A::SetCover(id) => vec![UnitEdit::SetCover(id.map(page).transpose()?)],
-        A::SetHidden { page: id, hidden } => vec![UnitEdit::SetHidden {
+        A::SetDirection(direction) => vec![CompositionEdit::SetDirection(direction)],
+        A::SetCover(enabled) => vec![CompositionEdit::SetCover(enabled)],
+        A::SetHidden { page: id, hidden } => vec![CompositionEdit::SetHidden {
             page: page(id)?,
             hidden,
         }],
-        A::MoveUnit { unit, to } => vec![UnitEdit::MoveUnit { from: unit, to }],
-        A::SplitUnit(unit) => vec![UnitEdit::SplitPair { unit }],
+        A::SetOverride {
+            page: id,
+            directive,
+        } => vec![CompositionEdit::SetOverride {
+            page: page(id)?,
+            directive,
+        }],
         A::MovePage { page: id, before } => {
             let moving = page(id)?;
-            let source = unit_index(&moving)?;
-            let target = unit_index(&page(before)?)?;
-            let removed = matches!(record.units[source], CompositionUnit::Single { .. });
-            vec![UnitEdit::MovePage {
+            let source = position(&moving)?;
+            let target = position(&page(before)?)?;
+            vec![CompositionEdit::MovePage {
                 page: moving,
-                to: target.saturating_sub(usize::from(removed && source < target)),
+                to: target.saturating_sub(usize::from(source < target)),
             }]
         }
         A::MovePageStep { page: id, forward } => {
             let moving = page(id)?;
-            let source = unit_index(&moving)?;
-            let removed = matches!(record.units[source], CompositionUnit::Single { .. });
-            let len = record.units.len() - usize::from(removed);
-            vec![UnitEdit::MovePage {
+            let from = position(&moving)?;
+            vec![CompositionEdit::MovePage {
                 page: moving,
                 to: if forward {
-                    (source + 1).min(len)
+                    (from + 1).min(record.page_order.len().saturating_sub(1))
                 } else {
-                    source.saturating_sub(1)
+                    from.saturating_sub(1)
                 },
             }]
-        }
-        A::Pair { first, second } => {
-            let a = page(first)?;
-            let b = page(second)?;
-            if a == b {
-                return Err("異なる2枚を選択してください".into());
-            }
-            let mut edits = vec![];
-            let mut candidate = record.clone();
-            if candidate.cover.as_ref() == Some(&a) || candidate.cover.as_ref() == Some(&b) {
-                let edit = UnitEdit::SetCover(None);
-                candidate = candidate
-                    .edited(draft.domain(), edit.clone())
-                    .map_err(|e| e.to_string())?;
-                edits.push(edit);
-            }
-            for selected in [&a, &b] {
-                let edit = UnitEdit::SetSingle {
-                    page: selected.clone(),
-                    placement: SinglePlacement::Center,
-                    companion: SingleCompanion::Vacant,
-                };
-                candidate = candidate
-                    .edited(draft.domain(), edit.clone())
-                    .map_err(|e| e.to_string())?;
-                edits.push(edit);
-            }
-            let aindex = candidate
-                .units
-                .iter()
-                .position(|u| u.pages().any(|p| p == &a))
-                .unwrap();
-            let bindex = candidate
-                .units
-                .iter()
-                .position(|u| u.pages().any(|p| p == &b))
-                .unwrap();
-            let to = aindex + usize::from(bindex > aindex);
-            let edit = UnitEdit::MovePage { page: b, to };
-            candidate = candidate
-                .edited(draft.domain(), edit.clone())
-                .map_err(|e| e.to_string())?;
-            edits.push(edit);
-            let first_unit = candidate
-                .units
-                .iter()
-                .position(|u| u.pages().any(|p| p == &a))
-                .unwrap();
-            edits.push(UnitEdit::PairSingles {
-                first_unit,
-                clear_cover: true,
-            });
-            edits
-        }
-        A::SetPlacement { unit, .. } | A::SetCompanion { unit, .. } => {
-            let Some(CompositionUnit::Single {
-                page: selected_page,
-                placement: old,
-                companion,
-            }) = record.units.get(unit)
-            else {
-                return Err("単ページを選択してください".into());
-            };
-            let mut placement = if let A::SetPlacement { placement, .. } = action {
-                *placement
-            } else {
-                *old
-            };
-            let mut companion = if let A::SetCompanion { companion, .. } = action {
-                match companion {
-                    ui::EditorCompanionView::Vacant => SingleCompanion::Vacant,
-                    ui::EditorCompanionView::Blank => SingleCompanion::Blank,
-                    ui::EditorCompanionView::Cover(id) => {
-                        SingleCompanion::FrontCoverSupplement { page: page(*id)? }
-                    }
-                }
-            } else {
-                companion.clone()
-            };
-            if matches!(
-                action,
-                A::SetPlacement {
-                    placement: SinglePlacement::Center,
-                    ..
-                }
-            ) {
-                companion = SingleCompanion::Vacant;
-            }
-            if placement == SinglePlacement::Center && companion != SingleCompanion::Vacant {
-                placement = SinglePlacement::Leading;
-            }
-            if matches!(
-                action,
-                A::SetCompanion {
-                    companion: ui::EditorCompanionView::Blank,
-                    ..
-                }
-            ) {
-                vec![UnitEdit::InsertBlank {
-                    page: selected_page.clone(),
-                    placement,
-                }]
-            } else {
-                vec![UnitEdit::SetSingle {
-                    page: selected_page.clone(),
-                    placement,
-                    companion,
-                }]
-            }
         }
         _ => vec![],
     })

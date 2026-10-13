@@ -5797,6 +5797,51 @@ test("G1 extracted menu exposes the three temporary display choices", () => {
   assert.match(menu.spread.title, /記憶しません/);
 });
 
+test("composed books offer mode-only choices and retain automatic preference controls", () => {
+  const menu = viewerMenuDefinitions({ hasContainer: true, barsVisible: true, compositionManaged: true,
+    supportsFinalCoverSetting: true, supportsSingletonPlacementSetting: true, supportsPageAloneSetting: true });
+  const choices = menu.spread.actions.filter(([name]) => name.startsWith("spread_"));
+  assert.deepEqual(choices.map(([, label]) => label), ["1ページ表示", "見開き", "横長分割"]);
+  assert.equal(choices[1][3].modeOnly, true);
+  assert.equal(choices[2][3].modeOnly, true);
+  assert.match(menu.spread.title, /方向・表紙はPCで編集/);
+  for (const page of ["final_cover", "singleton_placement", "singleton_placement_last", "page_alone"]) {
+    assert.ok(menu.spread.actions.some((action) => action[3]?.menuPage === page));
+  }
+  assert.equal(menu.final_cover.actions.length, 4);
+});
+
+test("explicit blank presentation carries its core trim side without a partner", () => {
+  const fileAddress = (path) => ({ path, subresource: { kind: "file" } });
+  const entry = { name: "page.jpg", address: fileAddress("book/page.jpg") };
+  const contextAddress = fileAddress("book");
+  const byAddress = new Map([[remoteAddressIdentity(entry.address), entry]]);
+  for (const [direction, pageSide, displaySlot] of [
+    ["ltr", "leading", "spread_left"], ["ltr", "trailing", "spread_right"],
+    ["rtl", "leading", "spread_right"], ["rtl", "trailing", "spread_left"],
+  ]) {
+    const presentationSlots = normalizePagePresentationSlots([
+      { address: entry.address, role: "navigation", display_slot: displaySlot },
+    ], [entry], byAddress, entry);
+    const group = { navigationEntries: [entry], presentationSlots, slice: "full" };
+    assert.deepEqual(pageRenderContextForSlot(group, 0, contextAddress), {
+      context_address: contextAddress, display_slot: displaySlot, spread_partner: null,
+    }, `${direction}/${pageSide}`);
+    assert.notEqual(pageGroupPresentationIdentity(group), pageGroupPresentationIdentity({ ...group,
+      presentationSlots: [{ entry, role: "navigation" }],
+    }));
+  }
+  for (const mode of ["single", "force_single", "split_ltr", "split_rtl", "ordinary_singleton"]) {
+    const group = { navigationEntries: [entry], presentationSlots: [{ entry, role: "navigation" }], slice: "full" };
+    assert.deepEqual(pageRenderContextForSlot(group, 0, contextAddress), {
+      context_address: contextAddress, display_slot: "single", spread_partner: null,
+    }, mode);
+  }
+  assert.equal(normalizePagePresentationSlots([
+    { address: entry.address, role: "navigation", display_slot: "bad" },
+  ], [entry], byAddress, entry), null);
+});
+
 
 test("G1 Remote return adoption restores the book response after temporary A2 spread", () => {
   const address = {path:testPath("Book"),subresource:{kind:"file"}};
