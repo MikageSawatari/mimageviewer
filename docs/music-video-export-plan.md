@@ -1027,7 +1027,7 @@ trace（scratchpad の `night\trace\main-2a.log` / `lab-2a.log`）では、本�
 18 件すべてが `egui=[None]`（egui へ何も渡していない）。未確認: detached viewer、MS-IME 等の他の IME、
 利用者の実機・実設定。
 
-**段 2b（設計案 第 2 版、2026-10-14 設計 lead。第 1 版は独立レビュー REVISE（P1 1・P2 2）。実装前）: 300ms grace を外し「変換中か」だけで判定する。**
+**段 2b（設計案 第 3 版、2026-10-14 設計 lead。第 1 版 REVISE（P1 1・P2 2）、第 2 版 REVISE（P2 1・P3 1）。実装前）: 300ms grace を外し「変換中か」だけで判定する。**
 
 経緯と理由: `IME_EVENT_GRACE`（300ms）は「Windows が IME 終了（`Disabled` / `Commit`）と、IME が処理した
 Esc / Enter を別フレームで届ける」ことの吸収として入った（`App::ime_input_active` の doc、CLAUDE.md の IME 対応節）。
@@ -1038,9 +1038,9 @@ Esc / Enter を別フレームで届ける」ことの吸収として入った�
 1. **判定を 1 つにする。** `egui-ime` の `ImeFocusState` から `last_event_at` と `IME_EVENT_GRACE` を外し、
    `ime_input_active` / `ime_input_active_in_viewport` は「その viewport が composing か」だけを返す。
    composing は pre-pass の plugin が今 pass の Ime 列まで反映した値なので、同じ pass の `[Commit, 通常 Enter]` は
-   決定として通り、`[Preedit]` の最中は抑止される。`ime_input_active_with_pending_events` は「未処理の Ime event がある
-   または composing」とし（native presenter 用、queue 内の Ime を先取りする意味は変えない）、
-   `ime_composing_with_pending_events` と同じ規則に揃えられるならそちらへ統合する。
+   決定として通り、`[Preedit]` の最中は抑止される。native presenter のように pass 前に queue を見る読み手は、
+   pending events を最終状態まで射影する `ime_composing_with_pending_events` だけを使う。「未処理の Ime event が
+   1 つでもあれば active」の `ime_input_active_with_pending_events` は廃止して射影版へ統合する（2b と同じ契約）。
    `TextInputPhase::ImeGrace`（`src/keyboard_input.rs`）は Focused / FocusRecovery に吸収せず、「composing」の段として
    名前と意味を変えて残す（focus も recovery claim も無いまま composition だけが残る場合があるため、レビュー指摘）。
 2. **呼び出し側は原則変えない。** `dialog_enter_pressed`（30）・`dialog_escape_pressed`（68）・直接の
@@ -1056,7 +1056,14 @@ Esc / Enter を別フレームで届ける」ことの吸収として入った�
    composing だけにするとこの復帰が失われ、編集中の focus を失う退行になる。そこで復帰条件の `ime_active` を、
    plugin が pre-pass で記録する「pass 開始時に composing だった、またはこの pass の入力に Ime event があった」
    （時刻を持たない、その pass 限りの値）に置き換える。この値は helper 内部の focus 復帰にだけ使い、
-   ショートカット抑止やダイアログの決定には使わない。通常の Enter 完了と pointer による focus 移動は今までどおり復帰しない。
+   ショートカット抑止やダイアログの決定には使わない。
+   **意図した focus の手放しは復帰しない（第 2 版 P2）。** 段 2a 以降、egui に届く Enter / Escape / Tab の press は
+   利用者が押した通常のキーで、egui はこれらで意図して focus を手放す（single-line TextEdit の Enter 完了
+   `builder.rs` 1016 付近、`Focus::begin_pass` の Escape、Tab）。復帰の条件 `keyboard_focus_recovery_input`
+   （いまは「pointer 無しで何かの key press がある」）を「pointer 無しで、Enter / Escape / Tab 以外の key press がある」に
+   変え、この pass に Enter / Escape / Tab の press があれば復帰しない。これで `[Commit, Disabled, 通常 Enter]` の pass では
+   検索欄・アドレス欄の Enter 完了（focus を手放し `lost_focus()` で決定）が通り、Alt+J のような IME 処理に伴う
+   一時的な focus 喪失だけが復帰する。pointer による focus 移動も今までどおり復帰しない。
 2b. **native presenter のタグ選択欄は、今 pass の状態で判定する（第 1 版 P2）。** `render_core.rs` 12521 付近は
    `egui_ctx.run` の前（plugin が今 pass の Ime 列を反映する前）に `tag_picker_ime_active` を取っているので、
    前 pass が composing・今 pass が `[Commit, Disabled, 通常 Enter]` のとき Enter を捨てる。
@@ -1085,7 +1092,9 @@ Esc / Enter を別フレームで届ける」ことの吸収として入った�
    タグ選択欄で、前 pass composing・今 pass `[Commit, Disabled, 通常 Enter]` と、Commit の次 pass の通常 Enter の両方を
    固定する。同じ ViewportId の viewport を閉じて開き直したときに composing が残らないこと（終端 event を失った場合）も
    テストで確かめ、残るなら viewport の破棄・focus 喪失で composing を落とす（grace の時間切れでは元々直らない既存の欠陥。
-   その場合は修正範囲を報告して判断を仰ぐ）。
+   その場合は修正範囲を報告して判断を仰ぐ）。検索欄・アドレス欄（`ui_main.rs` 15377 / 15550 付近）の実際の handler で、
+   `[Commit, Disabled, 通常 Enter]` の同じ pass と、Commit の次 pass の通常 Enter の両方について、決定が実行され
+   focus が手放されることを固定する。
 6. **前提条件（実装前に満たす）: Google 日本語入力以外でも、確定の Enter・変換中の Esc が Process で届くこと。**
    この PC には MS-IME（TIP `{03B5835F-…}`）も登録されている。段 1 の trace 手順で MS-IME の 5 シナリオを記録し、
    確定の Enter が `logical=Named(Process)` で届くことを確かめる（通常の Enter で届く IME があると、grace を外すことで
