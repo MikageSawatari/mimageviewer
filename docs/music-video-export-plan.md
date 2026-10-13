@@ -888,21 +888,92 @@ worker が追記・行ごとに flush し、UI thread でファイル I/O は行
 これは非同期入力の新しい状態機械を作る作業ではなく、原本の出力を読む診断だけであり、
 modal 化や live rebuild の追加は不要。
 
-**段 2 は未設計。** 実機・実 IME のログで根の候補を確認してから修正を設計し、独立レビューを通す。
-trace 自体も診断用で、段 2 で扱いを決める。取り込み・秘匿・出力形式・ソース確認の詳細は
+取り込み・秘匿・出力形式・ソース確認の詳細は
 [`vendor/egui-winit/PATCHES.md`](../vendor/egui-winit/PATCHES.md)、作業範囲と完了条件は
-[`brief-musicvideo-i2.md`](brief-musicvideo-i2.md) を参照。実機記録・検収は利用者と設計 lead が行う。
+[`brief-musicvideo-i2.md`](brief-musicvideo-i2.md) を参照。段 1 は `282f173c4` / `1cbe1888f`。
 
-段 1 の自動検証（2026-10-14、未コミット）: 原本 archive の全 9 ファイルの byte 照合、
-egui-winit 一系統の確認、本体 core check、共有 UI 121 / ラボ 75 / egui-ime 17、
-本体 ime_focus 12 / egui_focus_policy 5、診断単体 10、fmt / vendor rustfmt が成功。
-`cargo build --release -p musicvideo_lab` も成功した。ログは `target/i2-*`。
-追加の `test-full.ps1 -SuppressCrashDialogs` は exit 101: App のサイズ制限テストが
-110,600 bytes（上限は 110,000 未満）で失敗し、capture_region のイベント順序テストで
-`STATUS_STACK_OVERFLOW` により本体 lib の process が異常終了した。全件完走・全体 gate 成功は
-主張しない。本体の App 構造やテスト上限には触れず、設計 lead の別件判断へ渡す。
-本体 `build-dev.ps1 -PreserveRuntime` は出力先 core の既存プロセスを検出して exit 1。
-利用者の終了待ちで、core の診断 binary 更新は未完了。プロセス停止・アプリ起動・コミットは行っていない。
+段 1 の自動検証: 原本 archive の全 9 ファイルの byte 照合、egui-winit 一系統、本体 core check、
+共有 UI / ラボ / egui-ime、本体 ime_focus / egui_focus_policy、診断単体 12、fmt が成功。
+`test-full.ps1` は App のサイズ制限テストで失敗するが、master 単独のテスト binary
+（2026-10-14 01:40 build）でも App=110,264 bytes で同じテストが失敗しており、I2 とは無関係の既存失敗
+（別作業に切り出し済み）。
+
+**段 1 の実機記録（2026-10-14 深夜、設計 lead がエージェント操作で記録）。** 隔離データ
+（`--data-dir`）で起動した開発版本体の画像注釈テキスト本文欄と、scratchpad へコピーしたラボの歌詞欄で、
+この PC の IME（Google 日本語入力）を使って記録した。文字内容は記録していない。
+
+| 操作 | winit の到着 | egui-winit が egui へ渡したもの |
+| --- | --- | --- |
+| 変換中の文字キー・変換の Space | press: `logical=Named(Process)`, physical=実キー | `Key(A..Z / Space)` press |
+| 確定の Enter | press: `Process` / physical=Enter。同じ ms に続けて `Ime Preedit("")`→`Commit`→`Disabled` | `Key(Enter)` press（Commit より前）、`Ime.Disabled`, `Ime.Commit`, `Ime.Disabled` |
+| 変換中の Esc | press: `Process` / physical=Escape。続けて `Preedit("")`×2→`Commit("")`→`Disabled` | `Key(Escape)` press, `Ime.Disabled`… |
+| 候補選択中の Tab | press: `Process` / physical=Tab。続けて `Preedit` | `Key(Tab)` press |
+| 上記キーの release | `logical=Named(実キー)`（Process ではない） | `Key(実キー)` release |
+| IME 開状態・未変換の Enter | press: `logical=Named(Enter)`, text=改行 | `Key(Enter)` press |
+| 確定直後（約 35ms 後）の Enter | 同上（通常の Enter） | `Key(Enter)` press |
+
+観測された症状:
+
+- 本体（注釈本文）: 確定→すぐ Enter で 2 回目の改行が入らない（利用者報告と同じ）。2 回目の Enter は
+  通常キーとして届いており、text_mode の 300ms Enter 除去が捨てている。間を空ければ改行が入る。
+  変換中の Esc は変換だけ取り消し、欄・テキストモード・フルスクリーンは残る。候補選択中の Tab で
+  focus は移らない。
+- ラボ（歌詞）: **確定の Enter だけで改行が入る**（逆向きの症状）。ラボには 300ms 除去が無く、
+  Process 由来の `Key(Enter)` が multiline TextEdit に届くため。
+- 根の候補は実機で確認できた: Windows が IME の処理したキーを `VK_PROCESSKEY` で届け、winit が
+  `NamedKey::Process`（physical=実キー）とし、egui-winit が physical へ fallback して通常のキー press を
+  egui へ渡している。Enter / Esc / Tab / Space / 文字キーのすべてが同じ経路。
+- 未確認: Google 日本語入力以外の IME（MS-IME 等）。Windows の IMM32 / TSF はどちらも IME が処理した
+  キーを `VK_PROCESSKEY` で届けるのが規定の動作で、本体の動画 native presenter は以前から
+  `VK_PROCESSKEY`（0xE5）に egui キーを割り当てず捨てている（`egui_key_from_virtual_key`）。
+
+**段 2 の方針: IME が処理したキーを egui のキー入力として渡さない（根の修正）、その後に対症療法を外す。**
+2 つの段に分ける。段 2a は根の修正と、Process 由来のキーのためだけにある対症療法の撤去。段 2b は
+300ms grace の見直しで、利用箇所が約 160 と広いので別の段にする。
+
+段 2a（設計、独立レビュー前）:
+
+1. **vendored egui-winit の `on_keyboard_input` で、`logical == NamedKey::Process` の press を egui の
+   `Event::Key` にも `Text` / `Cut` / `Copy` / `Paste` にもしない。** 判定は既存の Cut/Copy/Paste 判定より前に置く
+   （IME が処理した Ctrl+V 等も IME のもの）。repeat も同じ。winit の `Ime` イベントは今までどおり渡す。
+   release（実キーとして届く）は**そのまま渡す**。対応する press を持たない release は egui の keys_down から
+   何も消さないだけで、`key_released` はリポジトリ内で使っていない（2026-10-14 grep）。
+   `key_down(Enter)` の利用は FsClose の押下継続抑止 1 か所（`ui_fullscreen.rs` 31157 付近）で、
+   IME の Enter は押下中に数えられなくなるが、閉じる判定は Enter の press イベントを要するので閉じる側には働かない。release を消すために
+   「Process だった物理キーの集合」を持つ案は、状態を 1 つ増やし focus 喪失時の掃除も要るので採らない
+   （状態の組み合わせを減らす方針）。`EventResponse` の計算は変えない。
+   これで winit 経路の規則が、動画 native presenter の `VK_PROCESSKEY` を捨てる規則と一致する
+   （入力経路が 2 つあっても「IME が処理したキーはアプリのキーではない」という規則は 1 つ）。
+2. **Process 由来のキーのためだけにある対症療法を外す。**
+   - 本体 `src/ui_fullscreen.rs` の text_mode 中の Enter 除去（`f8ff63911`）。**利用者報告の直接の修正**。
+   - `tools/comic_lab` の `consume_ime_enter`（同じ除去のラボ版）。
+   - `crates/egui-ime` の「変換中の Esc press を除く」処理。**空 Preedit の補い**（egui-winit が
+     `Preedit("")` を `Disabled` に変換するため、Esc 取消で preedit が残るのを防ぐ）は別の原因なので残す。
+   - `crates/egui-ime` helper の focus lock filter の `tab: ime_active`。Tab で focus を移さないのは
+     アプリ全体の Tab 方針（製品の選択、`tab_focus.rs`）が持っており、IME 用の上乗せは不要になる。
+     矢印の lock は製品の選択なので残す。
+   - 残すもの: egui 本家の `remove_ime_incompatible_events`（upstream、無害）、アプリ全体の Tab 方針、
+     focus 復帰（Alt 等の IME 以外の原因もある）、helper の `return_key(None)`。これらと 300ms grace は
+     段 2b で個別に見直す。
+3. **テスト。** winit の `KeyEvent` は外部から合成できないので、判定を「winit のキー情報 → 渡す／渡さない」の
+   純関数に切り出して単体テストする。IME の Enter / Esc / Tab を通常の `Key` press として流している既存テストは
+   旧入力のモデルなので、実機記録どおり（press なし・release あり・Ime 列）へ直す。特にラボの
+   `raw_lyrics_enter_keeps_native_newline_semantics_and_commits_only_once` は確定 Enter の改行を期待しており、
+   改行が入らない期待へ変える。本体の注釈本文で「確定→すぐ Enter で改行が入る」ことを
+   handler-level のテストで固定する（実機記録の Ime 列＋通常 Enter press）。
+4. **実機確認**は段 1 と同じ記録手順で、設計 lead が隔離データの本体とラボで 5 シナリオを再実行し、
+   利用者にも本体で確認を依頼する。trace は段 2b の確認にも使うので残す（既定無効）。
+
+段 2b（設計は段 2a の実機確認後）: 300ms grace（`IME_EVENT_GRACE`）の文書上の理由は「Windows が
+`Disabled` と Esc / Enter を別フレームで届ける」ことで、その Esc / Enter は段 2a で egui へ届かなくなる。
+grace を composing だけの判定へ縮めると、各ダイアログでも「確定→すぐ Enter で決定」が通るようになる
+（いまは 300ms 以内の 2 回目が捨てられ、利用者報告と同じ型の取りこぼしがある）。利用箇所は
+`dialog_enter_pressed` 30、`dialog_escape_pressed` 68、直接の `ime_input_active` 約 50 と focus 所有
+（`TextInputPhase::ImeGrace`）・native presenter の判定。1 つの定義の変更で全体が変わるため、
+用途別（決定 Enter / 取消 Esc / ショートカット抑止 / focus 所有）に既存テストと実機手順を揃えて別に設計する。
+
+このブランチ（musicvideo）で直すのは利用者の指示（2026-10-14）。本体側の修正も含むため、master への統合は
+音楽ビデオ機能とは別に先行させるかを、段 2a の確認後に利用者と決める。
 
 ### D11. 出力の既定値
 
