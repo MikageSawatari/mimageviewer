@@ -949,10 +949,11 @@ fn source_boundary_discards_index_owned_undo_before_new_rows_can_use_the_index()
     let ctx = egui::Context::default();
     let old = app.tmp.path().join("old.jpg");
     adopt(&mut app, &ctx, "old", dataset(vec![GridItem::Image(old)]));
+    let target = app.page_adjustment_target_for_idx(0).unwrap();
     app.meta_undo
         .push(crate::undo_stack::UndoEntry::LocalAdjustment {
             changes: vec![crate::undo_stack::LocalAdjustmentChange {
-                idx: 0,
+                target,
                 before: local_adjust_core::LocalAdjustmentLayers::default(),
                 after: local_adjust_core::LocalAdjustmentLayers::default(),
             }],
