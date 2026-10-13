@@ -923,15 +923,17 @@ modal 化や live rebuild の追加は不要。
 - 根の候補は実機で確認できた: Windows が IME の処理したキーを `VK_PROCESSKEY` で届け、winit が
   `NamedKey::Process`（physical=実キー）とし、egui-winit が physical へ fallback して通常のキー press を
   egui へ渡している。Enter / Esc / Tab / Space / 文字キーのすべてが同じ経路。
-- 未確認: Google 日本語入力以外の IME（MS-IME 等）。Windows の IMM32 / TSF はどちらも IME が処理した
-  キーを `VK_PROCESSKEY` で届けるのが規定の動作で、本体の動画 native presenter は以前から
+- 未確認: Google 日本語入力以外の IME（MS-IME 等）。IMM32 経路では IME が処理したキーを `VK_PROCESSKEY` で
+  届ける（`ImmGetVirtualKey` の文書）。TSF を直接使うアプリでは通常の VK のまま IME が配送を止める経路もあるが、
+  winit / 本体は IMM32 経路なので遮断設計の反証にはならない。ただし他の IME・TIP が、この経路へ届ける
+  消費済みキーをすべて Process にすることは未確認。本体の動画 native presenter は以前から
   `VK_PROCESSKEY`（0xE5）に egui キーを割り当てず捨てている（`egui_key_from_virtual_key`）。
 
 **段 2 の方針: IME が処理したキーを egui のキー入力として渡さない（根の修正）、その後に対症療法を外す。**
 2 つの段に分ける。段 2a は根の修正と、Process 由来のキーのためだけにある対症療法の撤去。段 2b は
 300ms grace の見直しで、利用箇所が約 160 と広いので別の段にする。
 
-段 2a（設計、独立レビュー前）:
+段 2a（設計。独立レビュー ACCEPT 2026-10-14、P1/P2 なし）:
 
 1. **vendored egui-winit の `on_keyboard_input` で、`logical == NamedKey::Process` の press を egui の
    `Event::Key` にも `Text` / `Cut` / `Copy` / `Paste` にもしない。** 判定は既存の Cut/Copy/Paste 判定より前に置く
@@ -946,13 +948,13 @@ modal 化や live rebuild の追加は不要。
    （入力経路が 2 つあっても「IME が処理したキーはアプリのキーではない」という規則は 1 つ）。
 2. **Process 由来のキーのためだけにある対症療法を外す。**
    - 本体 `src/ui_fullscreen.rs` の text_mode 中の Enter 除去（`f8ff63911`）。**利用者報告の直接の修正**。
-   - `tools/comic_lab` の `consume_ime_enter`（同じ除去のラボ版）。
+   - `tools/comic_lab` の `consume_ime_enter`（同じ除去のラボ版）。専用の `ime_composing` field と初期化も一緒に外す。
    - `crates/egui-ime` の「変換中の Esc press を除く」処理。**空 Preedit の補い**（egui-winit が
      `Preedit("")` を `Disabled` に変換するため、Esc 取消で preedit が残るのを防ぐ）は別の原因なので残す。
    - `crates/egui-ime` helper の focus lock filter の `tab: ime_active`。Tab で focus を移さないのは
      アプリ全体の Tab 方針（製品の選択、`tab_focus.rs`）が持っており、IME 用の上乗せは不要になる。
      矢印の lock は製品の選択なので残す。
-   - 残すもの: egui 本家の `remove_ime_incompatible_events`（upstream、無害）、アプリ全体の Tab 方針、
+   - 残すもの: egui 本家の `remove_ime_incompatible_events`（upstream）、アプリ全体の Tab 方針、
      focus 復帰（Alt 等の IME 以外の原因もある）、helper の `return_key(None)`。これらと 300ms grace は
      段 2b で個別に見直す。
 3. **テスト。** winit の `KeyEvent` は外部から合成できないので、判定を「winit のキー情報 → 渡す／渡さない」の
@@ -960,9 +962,15 @@ modal 化や live rebuild の追加は不要。
    旧入力のモデルなので、実機記録どおり（press なし・release あり・Ime 列）へ直す。特にラボの
    `raw_lyrics_enter_keeps_native_newline_semantics_and_commits_only_once` は確定 Enter の改行を期待しており、
    改行が入らない期待へ変える。本体の注釈本文で「確定→すぐ Enter で改行が入る」ことを
-   handler-level のテストで固定する（実機記録の Ime 列＋通常 Enter press）。
+   handler-level のテストで固定する（実機記録の Ime 列＋通常 Enter press）。Commit・release・直後の通常 Enter が
+   **同じ pass に入る場合と別 pass に入る場合の両方**を固定する。通常の Enter / Esc / Tab、IME 以外の focus 復帰、
+   clipboard、非ラテン配列の physical fallback のテストは残す（IME 中という理由だけで通常 press のテストを
+   書き換えない）。vendored egui-winit は workspace 外なので、その単体テスト
+   （`cargo test --manifest-path vendor/egui-winit/Cargo.toml --lib` 相当）を `scripts/test-full.ps1` の
+   追加実行対象に入れる。
 4. **実機確認**は段 1 と同じ記録手順で、設計 lead が隔離データの本体とラボで 5 シナリオを再実行し、
-   利用者にも本体で確認を依頼する。trace は段 2b の確認にも使うので残す（既定無効）。
+   利用者にも本体で確認を依頼する（detached viewer と、使っていれば MS-IME も）。trace は段 2b の確認にも使うので
+   残す（既定無効）。
 
 段 2b（設計は段 2a の実機確認後）: 300ms grace（`IME_EVENT_GRACE`）の文書上の理由は「Windows が
 `Disabled` と Esc / Enter を別フレームで届ける」ことで、その Esc / Enter は段 2a で egui へ届かなくなる。
@@ -971,6 +979,10 @@ grace を composing だけの判定へ縮めると、各ダイアログでも「
 `dialog_enter_pressed` 30、`dialog_escape_pressed` 68、直接の `ime_input_active` 約 50 と focus 所有
 （`TextInputPhase::ImeGrace`）・native presenter の判定。1 つの定義の変更で全体が変わるため、
 用途別（決定 Enter / 取消 Esc / ショートカット抑止 / focus 所有）に既存テストと実機手順を揃えて別に設計する。
+段 2b で合わせて見る既存挙動: egui 本家の `remove_ime_incompatible_events` は pass 開始時の `ime_enabled` で
+Backspace・矢印・repeat を Commit より前に除くため、Commit と同じ pass に入った通常の Backspace / 矢印も消える。
+Win32 キー queue の JIS 4 キーは scan code だけで一致し得る（`keymap.rs` 861 付近）ので、grace を縮めるときは
+IME 所有 gate との関係を確認する。
 
 このブランチ（musicvideo）で直すのは利用者の指示（2026-10-14）。本体側の修正も含むため、master への統合は
 音楽ビデオ機能とは別に先行させるかを、段 2a の確認後に利用者と決める。
