@@ -29528,12 +29528,8 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(crate) fn effetune_toolbar_click(
-        &mut self,
-        pointer_click: bool,
-        release_index: Option<usize>,
-    ) {
-        let foreground = self.effetune.click_foreground(pointer_click, release_index);
+    pub(crate) fn effetune_toolbar_click(&mut self, pointer_click: bool) {
+        let foreground = self.effetune.click_foreground(pointer_click);
         if !self.effetune_toolbar_available() {
             return;
         }
@@ -29554,12 +29550,12 @@ impl App {
                 let Some(bridge) = self.effetune.bridge().cloned() else {
                     return;
                 };
-                use crate::effetune::{GuiButtonAction, gui_button_action_for_relation};
+                use crate::effetune::{GuiButtonAction, gui_button_action};
                 let visible = bridge.slot(0).is_some_and(|slot| slot.gui_visible);
-                let relation = bridge.slot_gui_foreground_relation(0, &foreground);
-                let action = gui_button_action_for_relation(visible, relation);
+                let action =
+                    gui_button_action(visible, bridge.slot_gui_is_foreground(0, foreground));
                 crate::logger::log(format!(
-                    "[EffeTune GUI] button decision visible={visible} relation={relation:?} action={action:?}"
+                    "[EffeTune GUI] button decision visible={visible} action={action:?}"
                 ));
                 match action {
                     GuiButtonAction::Hide => {
@@ -94192,29 +94188,8 @@ impl eframe::App for App {
         main_window_clear_color(visuals)
     }
 
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
-        #[cfg(windows)]
-        self.effetune.begin_native_input(raw);
-    }
-
-    fn native_input_events(
-        &mut self,
-        viewport_id: egui::ViewportId,
-        source: eframe::NativeInputSource,
-        events: &[egui::Event],
-    ) {
-        #[cfg(windows)]
-        if viewport_id == egui::ViewportId::ROOT {
-            self.effetune.native_input_events(source, events);
-        }
-    }
-
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.diagnostics_export.poll();
-        #[cfg(windows)]
-        if self.window_visible && self.effetune.take_input_failure_notice() {
-            self.show_feedback_toast("音響調整の前面状態を確認できません。ボタンは表示・前面化を行います。mImageViewerを再起動してください".into());
-        }
         self.begin_grid_click_input_frame(ctx);
         static FIRST_UPDATE: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);

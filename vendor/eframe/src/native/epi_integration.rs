@@ -230,8 +230,6 @@ impl EpiIntegration {
 
     pub fn on_window_event(
         &mut self,
-        app: &mut dyn epi::App,
-        viewport_id: ViewportId,
         window: &winit::window::Window,
         egui_winit: &mut egui_winit::State,
         event: &winit::event::WindowEvent,
@@ -249,16 +247,7 @@ impl EpiIntegration {
             self.can_drag_window = true;
         }
 
-        let previous_event_count = egui_winit.egui_input().events.len();
-        let response = egui_winit.on_window_event(window, event);
-        notify_native_input_events(
-            app,
-            viewport_id,
-            native_input_source(event),
-            &egui_winit.egui_input().events,
-            previous_event_count,
-        );
-        response
+        egui_winit.on_window_event(window, event)
     }
 
     pub fn pre_update(&mut self) {
@@ -398,36 +387,6 @@ impl EpiIntegration {
     }
 }
 
-fn native_input_source(event: &winit::event::WindowEvent) -> epi::NativeInputSource {
-    use winit::event::{ElementState, MouseButton, TouchPhase, WindowEvent};
-    match event {
-        WindowEvent::MouseInput {
-            button: MouseButton::Left,
-            state: ElementState::Released,
-            ..
-        } => epi::NativeInputSource::PrimaryMouseRelease,
-        WindowEvent::Touch(touch) if touch.phase == TouchPhase::Ended => {
-            epi::NativeInputSource::ContactEnd {
-                id: touch.id,
-                location: [touch.location.x.to_bits(), touch.location.y.to_bits()],
-            }
-        }
-        _ => epi::NativeInputSource::Other,
-    }
-}
-
-fn notify_native_input_events(
-    app: &mut dyn epi::App,
-    viewport_id: ViewportId,
-    source: epi::NativeInputSource,
-    events: &[egui::Event],
-    previous_event_count: usize,
-) {
-    // Empty batches still retire native releases filtered by egui-winit. This
-    // borrows the producer's exact suffix without copying, consuming, or editing it.
-    app.native_input_events(viewport_id, source, &events[previous_event_count..]);
-}
-
 fn load_default_egui_icon() -> egui::IconData {
     profiling::function_scope!();
     crate::icon_data::from_png_bytes(&include_bytes!("../../data/icon.png")[..]).unwrap()
@@ -457,181 +416,4 @@ pub fn load_egui_memory(_storage: Option<&dyn epi::Storage>) -> Option<egui::Mem
     }
     #[cfg(not(feature = "persistence"))]
     None
-}
-
-#[cfg(test)]
-mod native_input_observer_tests {
-    use super::*;
-    use winit::event::{DeviceId, ElementState, MouseButton, Touch, TouchPhase, WindowEvent};
-
-    #[test]
-    fn native_input_source_maps_native_release_independently_of_raw_output() {
-        let mouse = |button, state| WindowEvent::MouseInput {
-            device_id: DeviceId::dummy(),
-            button,
-            state,
-        };
-        assert_eq!(
-            native_input_source(&mouse(MouseButton::Left, ElementState::Released)),
-            epi::NativeInputSource::PrimaryMouseRelease
-        );
-        for event in [
-            mouse(MouseButton::Left, ElementState::Pressed),
-            mouse(MouseButton::Right, ElementState::Released),
-            WindowEvent::CursorLeft {
-                device_id: DeviceId::dummy(),
-            },
-        ] {
-            assert_eq!(native_input_source(&event), epi::NativeInputSource::Other);
-        }
-
-        let touch = |phase| {
-            WindowEvent::Touch(Touch {
-                device_id: DeviceId::dummy(),
-                phase,
-                location: winit::dpi::PhysicalPosition::new(4.0, 5.0),
-                force: None,
-                id: u64::MAX,
-            })
-        };
-        assert_eq!(
-            native_input_source(&touch(TouchPhase::Ended)),
-            epi::NativeInputSource::ContactEnd {
-                id: u64::MAX,
-                location: [4.0_f64.to_bits(), 5.0_f64.to_bits()],
-            }
-        );
-        for phase in [
-            TouchPhase::Started,
-            TouchPhase::Moved,
-            TouchPhase::Cancelled,
-        ] {
-            assert_eq!(
-                native_input_source(&touch(phase)),
-                epi::NativeInputSource::Other
-            );
-        }
-    }
-
-    #[test]
-    fn native_input_source_contact_end_preserves_physical_location_bits() {
-        let location = [-0.0_f64, 12.3456789012345_f64];
-        let event = WindowEvent::Touch(Touch {
-            device_id: DeviceId::dummy(),
-            phase: TouchPhase::Ended,
-            location: winit::dpi::PhysicalPosition::new(location[0], location[1]),
-            force: None,
-            id: 17,
-        });
-        assert_eq!(
-            native_input_source(&event),
-            epi::NativeInputSource::ContactEnd {
-                id: 17,
-                location: location.map(f64::to_bits),
-            }
-        );
-    }
-
-    #[derive(Default)]
-    struct Observer {
-        calls: usize,
-        observed: Option<(
-            ViewportId,
-            epi::NativeInputSource,
-            usize,
-            *const egui::Event,
-        )>,
-    }
-
-    impl epi::App for Observer {
-        fn update(&mut self, _ctx: &egui::Context, _frame: &mut epi::Frame) {
-            panic!("native input observation must not run the UI");
-        }
-
-        fn native_input_events(
-            &mut self,
-            viewport_id: ViewportId,
-            source: epi::NativeInputSource,
-            events: &[egui::Event],
-        ) {
-            self.calls += 1;
-            self.observed = Some((viewport_id, source, events.len(), events.as_ptr()));
-        }
-    }
-
-    #[test]
-    fn native_input_observer_receives_exact_fresh_suffix_once_without_modification() {
-        let mut observer = Observer::default();
-        let viewport = ViewportId::from_hash_of("child observer");
-        let events = vec![
-            egui::Event::PointerGone,
-            egui::Event::PointerMoved(egui::pos2(4.0, 5.0)),
-            egui::Event::PointerButton {
-                pos: egui::pos2(4.0, 5.0),
-                button: egui::PointerButton::Primary,
-                pressed: false,
-                modifiers: egui::Modifiers::default(),
-            },
-        ];
-        let original = events.clone();
-        notify_native_input_events(
-            &mut observer,
-            viewport,
-            epi::NativeInputSource::PrimaryMouseRelease,
-            &events,
-            1,
-        );
-        assert_eq!(observer.calls, 1);
-        assert_eq!(
-            observer.observed,
-            Some((
-                viewport,
-                epi::NativeInputSource::PrimaryMouseRelease,
-                2,
-                events[1..].as_ptr()
-            ))
-        );
-        assert_eq!(events, original);
-    }
-
-    #[test]
-    fn native_input_observer_notifies_even_when_native_release_generated_no_raw_event() {
-        let events = vec![egui::Event::PointerGone];
-        for source in [
-            epi::NativeInputSource::PrimaryMouseRelease,
-            epi::NativeInputSource::ContactEnd {
-                id: 17,
-                location: [4.0_f64.to_bits(), 5.0_f64.to_bits()],
-            },
-            epi::NativeInputSource::Other,
-        ] {
-            let mut observer = Observer::default();
-            notify_native_input_events(&mut observer, ViewportId::ROOT, source, &events, 1);
-            assert_eq!(observer.calls, 1);
-            assert_eq!(
-                observer.observed,
-                Some((ViewportId::ROOT, source, 0, events[1..].as_ptr()))
-            );
-        }
-        assert_eq!(events, vec![egui::Event::PointerGone]);
-    }
-
-    #[test]
-    fn native_input_observer_default_callback_leaves_input_unchanged() {
-        struct DefaultObserver;
-        impl epi::App for DefaultObserver {
-            fn update(&mut self, _ctx: &egui::Context, _frame: &mut epi::Frame) {
-                panic!("the default native input observer must not run the UI");
-            }
-        }
-        let events = vec![egui::Event::PointerGone];
-        notify_native_input_events(
-            &mut DefaultObserver,
-            ViewportId::ROOT,
-            epi::NativeInputSource::PrimaryMouseRelease,
-            &events,
-            0,
-        );
-        assert_eq!(events, vec![egui::Event::PointerGone]);
-    }
 }

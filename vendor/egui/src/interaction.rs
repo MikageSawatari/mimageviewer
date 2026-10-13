@@ -14,13 +14,6 @@ pub struct InteractionSnapshot {
     /// The widget that got clicked this frame.
     pub clicked: Option<Id>,
 
-    /// The zero-based ordinal of the primary pointer release that assigned [`Self::clicked`].
-    ///
-    /// Counts all primary releases in this frame, including releases that were not clicks.
-    /// A subsequent press does not change this provenance. This is `None` when no widget was
-    /// clicked or when the assigned click came from another button or a long touch.
-    pub clicked_primary_release_index: Option<usize>,
-
     /// This widget was long-pressed on a touch screen,
     /// so trigger a secondary click on it (context menu).
     pub long_touched: Option<Id>,
@@ -67,7 +60,6 @@ impl InteractionSnapshot {
     pub fn ui(&self, ui: &mut crate::Ui) {
         let Self {
             clicked,
-            clicked_primary_release_index,
             long_touched,
             drag_started,
             dragged,
@@ -85,10 +77,6 @@ impl InteractionSnapshot {
         crate::Grid::new("interaction").show(ui, |ui| {
             ui.label("clicked");
             id_ui(ui, clicked);
-            ui.end_row();
-
-            ui.label("clicked_primary_release_index");
-            ui.label(format!("{clicked_primary_release_index:?}"));
             ui.end_row();
 
             ui.label("long_touched");
@@ -143,8 +131,6 @@ pub(crate) fn interact(
     }
 
     let mut clicked = None;
-    let mut clicked_primary_release_index = None;
-    let mut primary_release_count = 0;
     let mut dragged = prev_snapshot.dragged;
     let mut long_touched = None;
 
@@ -185,15 +171,7 @@ pub(crate) fn interact(
                 }
             }
 
-            PointerEvent::Released { click, button } => {
-                let primary_release_index = if *button == crate::PointerButton::Primary {
-                    let index = primary_release_count;
-                    primary_release_count += 1;
-                    Some(index)
-                } else {
-                    None
-                };
-
+            PointerEvent::Released { click, button: _ } => {
                 if click.is_some()
                     && !input.pointer.is_decidedly_dragging()
                     && let Some(widget) = interaction
@@ -201,7 +179,6 @@ pub(crate) fn interact(
                         .and_then(|id| widgets.get(id))
                 {
                     clicked = Some(widget.id);
-                    clicked_primary_release_index = primary_release_index;
                 }
 
                 interaction.potential_drag_id = None;
@@ -312,260 +289,11 @@ pub(crate) fn interact(
 
     InteractionSnapshot {
         clicked,
-        clicked_primary_release_index,
         long_touched,
         drag_started,
         dragged,
         drag_stopped,
         hovered,
         contains_pointer,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        Event, LayerId, Modifiers, PointerButton, RawInput, Rect, Sense, WidgetRect, pos2,
-    };
-
-    fn pointer_button(button: PointerButton, pressed: bool) -> Event {
-        Event::PointerButton {
-            pos: pos2(10.0, 10.0),
-            button,
-            pressed,
-            modifiers: Modifiers::default(),
-        }
-    }
-
-    fn next_input(input: InputState, time: f64, events: Vec<Event>) -> InputState {
-        input.begin_pass(
-            RawInput {
-                time: Some(time),
-                events,
-                ..Default::default()
-            },
-            false,
-            1.0,
-            Default::default(),
-        )
-    }
-
-    fn widgets_and_hits() -> (WidgetRects, WidgetHits, Id, Id) {
-        let a = Id::new("click a");
-        let b = Id::new("click b");
-        let layer_id = LayerId::background();
-        let rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(20.0, 20.0));
-        let widget = |id| WidgetRect {
-            id,
-            layer_id,
-            rect,
-            interact_rect: rect,
-            sense: Sense::click(),
-            enabled: true,
-        };
-        let mut widgets = WidgetRects::default();
-        widgets.insert(layer_id, widget(a));
-        widgets.insert(layer_id, widget(b));
-        let hits = WidgetHits {
-            click: Some(widget(b)),
-            ..Default::default()
-        };
-        (widgets, hits, a, b)
-    }
-
-    #[test]
-    fn clicked_primary_release_index_survives_next_press_in_same_frame() {
-        let (widgets, hits, a, b) = widgets_and_hits();
-        let input = next_input(
-            InputState::default(),
-            1.0,
-            vec![pointer_button(PointerButton::Primary, true)],
-        );
-        let input = next_input(
-            input,
-            1.1,
-            vec![
-                pointer_button(PointerButton::Primary, false),
-                pointer_button(PointerButton::Primary, true),
-            ],
-        );
-        let mut interaction = InteractionState {
-            potential_click_id: Some(a),
-            ..Default::default()
-        };
-
-        let snapshot = interact(
-            &InteractionSnapshot::default(),
-            &widgets,
-            &hits,
-            &input,
-            &mut interaction,
-        );
-
-        assert_eq!(snapshot.clicked, Some(a));
-        assert_eq!(snapshot.clicked_primary_release_index, Some(0));
-        assert_eq!(interaction.potential_click_id, Some(b));
-        assert_eq!(snapshot.dragged, None);
-    }
-
-    #[test]
-    fn clicked_primary_release_index_counts_non_click_releases() {
-        let (widgets, hits, _, b) = widgets_and_hits();
-        let input = next_input(
-            InputState::default(),
-            1.0,
-            vec![
-                pointer_button(PointerButton::Primary, false),
-                pointer_button(PointerButton::Primary, true),
-                pointer_button(PointerButton::Primary, false),
-            ],
-        );
-        assert!(matches!(
-            &input.pointer.pointer_events[0],
-            PointerEvent::Released { click: None, .. }
-        ));
-
-        let snapshot = interact(
-            &InteractionSnapshot::default(),
-            &widgets,
-            &hits,
-            &input,
-            &mut InteractionState::default(),
-        );
-
-        assert_eq!(snapshot.clicked, Some(b));
-        assert_eq!(snapshot.clicked_primary_release_index, Some(1));
-    }
-
-    #[test]
-    fn clicked_primary_release_index_cleared_by_secondary_click() {
-        let (widgets, hits, a, b) = widgets_and_hits();
-        let input = next_input(
-            InputState::default(),
-            1.0,
-            vec![pointer_button(PointerButton::Primary, true)],
-        );
-        let input = next_input(
-            input,
-            1.1,
-            vec![
-                pointer_button(PointerButton::Primary, false),
-                pointer_button(PointerButton::Secondary, true),
-                pointer_button(PointerButton::Secondary, false),
-            ],
-        );
-        let mut interaction = InteractionState {
-            potential_click_id: Some(a),
-            ..Default::default()
-        };
-
-        let snapshot = interact(
-            &InteractionSnapshot::default(),
-            &widgets,
-            &hits,
-            &input,
-            &mut interaction,
-        );
-
-        assert_eq!(snapshot.clicked, Some(b));
-        assert_eq!(snapshot.clicked_primary_release_index, None);
-    }
-
-    #[test]
-    fn clicked_primary_release_index_survives_later_non_click_release() {
-        let (widgets, hits, a, _) = widgets_and_hits();
-        let input = next_input(
-            InputState::default(),
-            1.0,
-            vec![pointer_button(PointerButton::Primary, true)],
-        );
-        let input = next_input(
-            input,
-            1.1,
-            vec![
-                pointer_button(PointerButton::Primary, false),
-                pointer_button(PointerButton::Primary, true),
-                Event::PointerMoved(pos2(100.0, 100.0)),
-                pointer_button(PointerButton::Primary, false),
-            ],
-        );
-        assert!(matches!(
-            input.pointer.pointer_events.last(),
-            Some(PointerEvent::Released { click: None, .. })
-        ));
-        let mut interaction = InteractionState {
-            potential_click_id: Some(a),
-            ..Default::default()
-        };
-
-        let snapshot = interact(
-            &InteractionSnapshot::default(),
-            &widgets,
-            &hits,
-            &input,
-            &mut interaction,
-        );
-
-        assert_eq!(snapshot.clicked, Some(a));
-        assert_eq!(snapshot.clicked_primary_release_index, Some(0));
-    }
-
-    #[test]
-    fn clicked_primary_release_index_not_carried_into_frame_without_click() {
-        let (widgets, hits, a, _) = widgets_and_hits();
-        let previous = InteractionSnapshot {
-            clicked: Some(a),
-            clicked_primary_release_index: Some(3),
-            ..Default::default()
-        };
-        let snapshot = interact(
-            &previous,
-            &widgets,
-            &hits,
-            &InputState::default(),
-            &mut InteractionState::default(),
-        );
-
-        assert_eq!(snapshot.clicked, None);
-        assert_eq!(snapshot.clicked_primary_release_index, None);
-    }
-
-    #[test]
-    fn clicked_primary_release_index_none_for_long_touch() {
-        let (widgets, hits, a, _) = widgets_and_hits();
-        let input = next_input(
-            InputState::default(),
-            1.0,
-            vec![
-                Event::Touch {
-                    device_id: crate::TouchDeviceId(0),
-                    id: crate::TouchId(0),
-                    phase: crate::TouchPhase::Start,
-                    pos: pos2(10.0, 10.0),
-                    force: None,
-                },
-                pointer_button(PointerButton::Primary, true),
-            ],
-        );
-        let input = next_input(input, 2.0, vec![]);
-        assert!(input.is_long_touch());
-        let mut interaction = InteractionState {
-            potential_click_id: Some(a),
-            ..Default::default()
-        };
-
-        let snapshot = interact(
-            &InteractionSnapshot::default(),
-            &widgets,
-            &hits,
-            &input,
-            &mut interaction,
-        );
-
-        assert_eq!(snapshot.clicked, Some(a));
-        assert_eq!(snapshot.long_touched, Some(a));
-        assert_eq!(snapshot.clicked_primary_release_index, None);
-        assert_eq!(snapshot.dragged, None);
     }
 }

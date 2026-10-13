@@ -852,13 +852,7 @@ impl GlowWinitRunning<'_> {
                 if let (Some(window), Some(egui_winit)) =
                     (&viewport.window, &mut viewport.egui_winit)
                 {
-                    event_response = self.integration.on_window_event(
-                        self.app.as_mut(),
-                        viewport_id,
-                        window,
-                        egui_winit,
-                        event,
-                    );
+                    event_response = self.integration.on_window_event(window, egui_winit, event);
                 }
             } else {
                 log::trace!("Ignoring event: no viewport for {viewport_id:?}");

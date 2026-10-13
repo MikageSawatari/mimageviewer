@@ -1839,33 +1839,6 @@ impl DspBridge {
     }
 
     /// Foreground editor or a popup whose owner chain reaches this exact editor.
-    pub(crate) fn slot_gui_foreground_relation(
-        &self,
-        idx: usize,
-        fact: &crate::effetune::ForegroundFact,
-    ) -> crate::effetune::ForegroundRelation {
-        use crate::effetune::{ForegroundFact, ForegroundRelation};
-        match fact {
-            ForegroundFact::Unknown | ForegroundFact::Window(0) => ForegroundRelation::Unknown,
-            ForegroundFact::Window(hwnd) => {
-                if self.slot_gui_is_foreground(idx, *hwnd) {
-                    ForegroundRelation::InFront
-                } else {
-                    ForegroundRelation::Other
-                }
-            }
-            ForegroundFact::BeforeInput(path) => {
-                let inner = self.inner.lock().unwrap();
-                inner
-                    .slots
-                    .get(idx)
-                    .map_or(ForegroundRelation::Unknown, |slot| {
-                        path.relation(slot.gui_hwnd, slot.bridge.process_id())
-                    })
-            }
-        }
-    }
-
     pub fn slot_gui_is_foreground(&self, idx: usize, foreground: u64) -> bool {
         use windows::Win32::Foundation::HWND;
         use windows::Win32::UI::WindowsAndMessaging::{GA_ROOT, GW_OWNER, GetAncestor, GetWindow};

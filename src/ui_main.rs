@@ -10385,11 +10385,7 @@ impl App {
                             .on_hover_text(format!("{}\n{lead_hint}", self.effetune_toolbar_tooltip()))
                             .on_disabled_hover_text(format!("{}\n{lead_hint}", self.effetune_toolbar_tooltip()));
                         if resp.clicked() {
-                            let release_index = ui.ctx().interaction_snapshot(|interaction| {
-                                (interaction.clicked == Some(resp.id))
-                                    .then_some(interaction.clicked_primary_release_index).flatten()
-                            });
-                            self.effetune_toolbar_click(resp.clicked_by(egui::PointerButton::Primary), release_index);
+                            self.effetune_toolbar_click(resp.clicked_by(egui::PointerButton::Primary));
                         }
                         self.finish_toolbar_section_lead(
                             ui,
