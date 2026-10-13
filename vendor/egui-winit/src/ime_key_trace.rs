@@ -175,6 +175,12 @@ fn keyboard_description(
         "KeyboardInput state={state} repeat={repeat} is_synthetic={synthetic} logical="
     );
     match logical {
+        Key::Named(winit::keyboard::NamedKey::Space) => {
+            // Use the same metadata as Character(" "), not a Space-specific label.
+            line.push_str("Character(");
+            text_description(line, " ");
+            line.push(')');
+        }
         Key::Named(key) => {
             let _ = write!(line, "Named({key:?})");
         }
@@ -212,8 +218,8 @@ fn keyboard_description(
 
 fn is_text_key(key: egui::Key) -> bool {
     use egui::Key::*;
-    // Key is Ord; these are the upstream contiguous punctuation/digit/letter groups.
-    (Colon..=Z).contains(&key)
+    // Space is text too, but is outside the contiguous punctuation/digit/letter groups.
+    key == Space || (Colon..=Z).contains(&key)
 }
 
 fn ime_description(line: &mut String, ime: &Ime) {
@@ -334,6 +340,92 @@ mod tests {
             line,
             "KeyboardInput state=released repeat=true is_synthetic=true logical=Named(Process) physical=Code(Enter,egui=Enter) text=Some(bytes=1,empty=false,newline=true)"
         );
+    }
+
+    #[test]
+    fn space_matches_other_character_keys_in_winit_metadata_and_keeps_process() {
+        for state in [ElementState::Pressed, ElementState::Released] {
+            for process in [false, true] {
+                for has_text in [false, true] {
+                    let mut space = String::new();
+                    let mut character = String::new();
+                    keyboard_description(
+                        &mut space,
+                        state,
+                        false,
+                        false,
+                        &Key::Named(if process {
+                            NamedKey::Process
+                        } else {
+                            NamedKey::Space
+                        }),
+                        PhysicalKey::Code(KeyCode::Space),
+                        has_text.then_some(" "),
+                    );
+                    keyboard_description(
+                        &mut character,
+                        state,
+                        false,
+                        false,
+                        &if process {
+                            Key::Named(NamedKey::Process)
+                        } else {
+                            Key::Character("x".into())
+                        },
+                        PhysicalKey::Code(KeyCode::KeyX),
+                        has_text.then_some("x"),
+                    );
+                    assert_eq!(space, character);
+                    assert!(!space.contains("Space"));
+                    assert_eq!(space.contains("logical=Named(Process)"), process);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn space_matches_other_character_keys_in_both_egui_key_fields() {
+        for pressed in [false, true] {
+            for (space_key, space_physical, character_key, character_physical) in [
+                (
+                    egui::Key::Space,
+                    Some(egui::Key::Enter),
+                    egui::Key::X,
+                    Some(egui::Key::Enter),
+                ),
+                (
+                    egui::Key::Enter,
+                    Some(egui::Key::Space),
+                    egui::Key::Enter,
+                    Some(egui::Key::X),
+                ),
+                (
+                    egui::Key::Space,
+                    Some(egui::Key::Space),
+                    egui::Key::X,
+                    Some(egui::Key::X),
+                ),
+                (egui::Key::Space, None, egui::Key::X, None),
+            ] {
+                let describe = |key, physical_key| {
+                    let mut line = String::new();
+                    appended_events(
+                        &mut line,
+                        &[egui::Event::Key {
+                            key,
+                            physical_key,
+                            pressed,
+                            repeat: false,
+                            modifiers: Default::default(),
+                        }],
+                    );
+                    line
+                };
+                let space = describe(space_key, space_physical);
+                assert_eq!(space, describe(character_key, character_physical));
+                assert!(!space.contains("Space"));
+            }
+        }
     }
 
     #[test]
