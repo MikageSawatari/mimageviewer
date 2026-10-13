@@ -59,7 +59,7 @@
 
 ### 1.373 本棚ツールバーの右クリックで本棚へ追加した操作を Ctrl+Z で取り消す — 利用者の要望 (2026-10-11)
 - **次の版に入れる (利用者 2026-10-12)**。
-- 状態 (2026-10-13、next-list): [設計書](section373-book-append-undo-plan.md) **R4設計ACCEPT、実装レビューREVISE・設計判断待ち（§7.7）**。明示reload／openで新ページへ後続編集を保存すると、独立metadata copyがDB正本を上書きする通常経路を確認した。既存八store共通FIFOはなく、receipt失効・cache cutでは不足。実装候補と回帰は保持し、公開とmetadata初期化の一体化または書込み序列化を再設計するまで完成とは扱わない。追加中の自動観測を既存Append終端へ配送するR4、ごみ箱の実移動確認・UndoAppend限定排他は維持。最終検証・実装ACCEPT・実機確認は未完了。瞬間的な同bytes差し替えは既定の割り切り方針による。membership DB／登録済みバッジは未実装のため今回追加しない。
+- 状態 (2026-10-13、next-list): [設計書](section373-book-append-undo-plan.md) **R7実装・対象検証済み、独立実装レビューACCEPT（§7.7–7.9）。full gateは前提矛盾により未成功**。各destinationの八store初期化を同じAppend workerで画像作成前に同期完了し、ファイルの出現を公開点にする。stagingなし。独立metadata worker／後着copy reportの値採用を撤去し、global存在集合は既存receiverの現在DB再取得へ接続する。初期化後の作成失敗のorphan行はログ・通知で割り切り、rollbackを追加しない。R4自動観測配送、ごみ箱実移動確認・UndoAppend限定排他は維持。対象58件・books 48件、DB時間計測、通常／portable checkと確認用／release buildは成功。fullは1回だけ実行し、通常rescanの選択復元回帰は単独でも失敗、既存HTTP fixtureは無期限accept待ちで停止。共有helperの静的検査は追従し単独成功、vendor 3 gateは個別54件成功。未レビューの§1.375／共通hydrationは変更せず、詳細と停止理由を§7.9に記録。瞬間的な同bytes差し替えは既定の割り切り方針による。membership DB／登録済みバッジは今回追加しない。
 - 要望 (利用者): 本棚ツールバーで項目を右クリックして本棚 (製本) へ追加したとき、たまに違う本棚に入れてしまう。今は本棚を開いてファイルを消すしかないので、Ctrl+Z で取り消したい。実ファイルの削除を伴うので、状態管理が大変なら「間違えた直後の 1 回だけ」の取り消しでもよい。
 - 着手時の調査範囲: 追加は本のフォルダへの番号付きページのコピー (必要なら焼き込み・再エンコード) ([compile-book-plan.md](compile-book-plan.md)、`src/bake_stage.rs` / `src/books.rs`)。登録済みバッジ (`book_membership_db`) の更新という起票時の前提は、現基点では未実装と確認済み。今回追加したコピーだけを直後一回の既存Ctrl+Z経路でごみ箱へ移す (利用者決定済み)。その後に本の中身が変わっていたら取り消さずに案内する。番号の詰め直しは行わない。複数ページ、並べ替えdraft、後続編集、外部変更、途中失敗とmetadata Undoの扱いは設計書を正本とする (まれな失敗は既定で割り切る)。
 - 規模 / 優先度: Small〜Medium / P3。

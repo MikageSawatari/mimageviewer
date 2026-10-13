@@ -101,12 +101,16 @@ live一覧のcursor／Shift起点は `App::move_grid_cursor(target, GridCursorIn
 **鉄則**: 上位レイヤーから下位レイヤーへの呼び出しは OK。逆方向（ワーカーが UI を直接触るなど）は禁止。
 ワーカーから UI への通知は必ず mpsc チャネルで行う。
 
-本追加の直後一回取消（[§1.373、R4実装候補・書込み順序の設計判断待ち](section373-book-append-undo-plan.md#77-実装で判明した後続編集の正本上書き設計判断停止点2026-10-13)）も、
+本追加の直後一回取消（[§1.373、R7実装・検証中](section373-book-append-undo-plan.md#77-r7-metadata初期化をファイル公開前へ移す設計担当決定2026-10-13)）も、
 実行中のownerは既存の `book_op_pending: Option<BookOpPending>` 一つだけ。
 `BookOpIntent::Append` がoperation ID・source context・受付revision・対象folderを捕捉し、
 ファイル追加、edit/semantic metadata copy、必要な一覧refreshの終端まで同じ要求を保持する。
 本rootや追加先の後続変更は元の出力先を付け替えず、受付時にreceiptを失効させrevisionを進める。
 処理の遅い成功が古いrevisionのreceiptを復活させることはない。
+R7では同じAppend workerが各destinationの八metadata storeを同期初期化し、commit／epoch終端後に
+画像を作成する。ファイルの出現が公開点で、後続ユーザー編集は常に初期化より後になる。
+copy reportの値でcontext cacheを上書きせず、global存在集合は既存stable readerで現在DBから
+worker再取得し、既存Append receiverが対象keyだけ更新する。context値・draftは変更しない。
 
 source contextは取消receiptの資格を決める。refreshの一覧採用資格は別に、各受け手の
 `BookAppendRefresh.adoption_owner`・items世代・folder・scan設定と同一operationへの所属で決める。

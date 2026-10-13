@@ -64,6 +64,58 @@ impl From<PathBuf> for FolderRefreshRequest {
 }
 
 impl App {
+    /// Read current durable presence through the same Append receiver. This is
+    /// not the copy report and never replaces a context's values or drafts.
+    pub(super) fn start_book_append_presence_prepare(
+        &mut self,
+        ctx: &egui::Context,
+        summary: crate::books::BookAppendSummary,
+    ) {
+        let available = page_edit_snapshot::PageEditAvailability::for_app(self);
+        let payload = Arc::new(std::sync::Mutex::new(Some(summary)));
+        let worker_payload = Arc::clone(&payload);
+        let (tx, rx) = mpsc::channel();
+        let fallback_tx = tx.clone();
+        let repaint = ctx.clone();
+        #[cfg(test)]
+        let test_epoch = crate::page_edit_write_epoch::TestEpochScope::capture();
+        let spawned = std::thread::Builder::new()
+            .name("book-append-refresh".into())
+            .spawn(move || {
+                #[cfg(test)]
+                let _scope = test_epoch.map(crate::page_edit_write_epoch::TestEpochScope::enter);
+                let summary = worker_payload
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("one Append preparation");
+                let presence =
+                    super::book_append_undo::load_book_append_edit_presence(&summary, available)
+                        .map(|prepared| prepared.map(crate::books::BookAppendEditPresence));
+                let _ = tx.send(Ok(crate::books::BookOpResult::AppendPresencePrepared {
+                    summary,
+                    presence,
+                }));
+                repaint.request_repaint();
+            });
+        self.book_op_pending
+            .as_mut()
+            .expect("existing Append owner")
+            .rx = rx;
+        if let Err(error) = spawned {
+            let summary = payload
+                .lock()
+                .unwrap()
+                .take()
+                .expect("failed spawn retains payload");
+            let _ = fallback_tx.send(Ok(crate::books::BookOpResult::AppendPresencePrepared {
+                summary,
+                presence: Err(error.to_string()),
+            }));
+            ctx.request_repaint();
+        }
+    }
+
     pub(super) fn book_append_refresh_request(
         &self,
         operation: AppendOperation,
@@ -540,6 +592,155 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    fn drain_append(app: &mut App, ctx: &egui::Context) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while app.book_op_pending.is_some() {
+            app.poll_book_op_pending(ctx);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Append preparation did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn section1373_non_target_terminal_reads_current_six_presence_and_keeps_parked_edits() {
+        use crate::book_append_undo::append_test_support::TestMetadata;
+        for clear in [false, true] {
+            let (mut app, receipt, mut summary) = fixture();
+            let destination = receipt.files.created[0].path.clone();
+            let key = crate::adjustment_db::normalize_path(&destination);
+            let source_folder = app.tmp.path().join("source-view");
+            std::fs::create_dir(&source_folder).unwrap();
+            let source = source_folder.join("original.jpg");
+            let source_key = crate::adjustment_db::normalize_path(&source);
+            let mut dbs = TestMetadata::open(&crate::data_dir::get());
+            dbs.set_all(&key, 5); // Initialized values already precede this visible result.
+            if clear {
+                dbs.clear_all(&key);
+            } else {
+                dbs.set_all(&key, 3);
+            }
+            let stars = if clear { 0 } else { 3 };
+            let tags = if clear {
+                vec![]
+            } else {
+                vec!["#v3".to_owned()]
+            };
+            let parked = app
+                .build_viewer_context("r7_destination", |owner, _| {
+                    owner.current_folder = Some(summary.folder.clone());
+                    owner.items = vec![GridItem::Image(destination.clone())];
+                    owner.rating_cache.insert(0, stars);
+                    owner.tags_cache.insert(key.clone(), tags.clone());
+                    owner.local_adjust_selected_layers.insert(0, 7);
+                    BuildOutcome::Commit
+                })
+                .unwrap();
+            app.current_folder = Some(source_folder.clone());
+            app.items = vec![GridItem::Image(source)];
+            app.rating_cache.insert(0, 2);
+            app.tags_cache
+                .insert(source_key.clone(), vec!["#source".into()]);
+            app.erase_mask = Some(vec![true, false]);
+            let owner: &mut App = &mut app;
+            for keys in [
+                &mut owner.adjusted_page_keys,
+                &mut owner.local_adjust_page_keys,
+                &mut owner.export_crop_page_keys,
+                &mut owner.mask_page_keys,
+                &mut owner.conceal_page_keys,
+                &mut owner.comic_page_keys,
+            ] {
+                keys.insert(source_key.clone());
+            }
+            summary.metadata_copy = crate::book_append_undo::BookAppendMetadataCopySummary {
+                adjusted: vec![key.clone()],
+                local_adjusted: vec![key.clone()],
+                cropped: vec![key.clone()],
+                erased: vec![key.clone()],
+                concealed: vec![key.clone()],
+                annotated: vec![key.clone()],
+                ratings: vec![key.clone()],
+                tags: vec![key.clone()],
+                ..Default::default()
+            };
+            let tx = hold(&mut app, &receipt);
+            app.admit_book_append_followup_mutation(); // Later edit expires only the Undo receipt.
+            let generation = app.items_generation;
+            tx.send(Ok(BookOpResult::Append(summary))).unwrap();
+            drain_append(&mut app, &egui::Context::default());
+            for keys in [
+                &app.adjusted_page_keys,
+                &app.local_adjust_page_keys,
+                &app.export_crop_page_keys,
+                &app.mask_page_keys,
+                &app.conceal_page_keys,
+                &app.comic_page_keys,
+            ] {
+                assert_eq!(keys.contains(&key), !clear);
+                assert!(keys.contains(&source_key));
+            }
+            assert_eq!(app.items_generation, generation);
+            assert_eq!(app.current_folder.as_ref(), Some(&source_folder));
+            assert_eq!(app.rating_cache.get(&0), Some(&2));
+            assert_eq!(
+                app.tags_cache.get(&source_key),
+                Some(&vec!["#source".into()])
+            );
+            assert_eq!(app.erase_mask.as_deref(), Some([true, false].as_slice()));
+            app.with_owner_viewer_context(parked, |owner| {
+                assert_eq!(owner.rating_cache.get(&0), Some(&stars));
+                assert_eq!(owner.tags_cache.get(&key), Some(&tags));
+                assert_eq!(owner.local_adjust_selected_layers.get(&0), Some(&7));
+            })
+            .unwrap();
+            assert!(app.book_append_undo_receipt.is_none());
+            assert!(app.external_rescan_pending.is_none());
+            dbs.assert_all(&key, if clear { None } else { Some(3) });
+        }
+    }
+
+    #[test]
+    fn section1373_stale_presence_receiver_reprepares_without_reinstating_later_clear() {
+        let (mut app, receipt, mut summary) = fixture();
+        let key = crate::adjustment_db::normalize_path(&receipt.files.created[0].path);
+        app.current_folder = Some(app.tmp.path().join("other-view"));
+        summary.metadata_copy.adjusted.push(key.clone());
+        app.adjustment_db
+            .as_ref()
+            .unwrap()
+            .set_page_params(&key, &crate::adjustment::AdjustParams::default())
+            .unwrap();
+        let prepared = super::super::book_append_undo::load_book_append_edit_presence(
+            &summary,
+            page_edit_snapshot::PageEditAvailability::for_app(&app),
+        )
+        .unwrap()
+        .unwrap();
+        app.adjustment_db
+            .as_ref()
+            .unwrap()
+            .remove_page_params(&key)
+            .unwrap();
+        let tx = hold(&mut app, &receipt);
+        app.admit_book_append_followup_mutation();
+        tx.send(Ok(BookOpResult::AppendPresencePrepared {
+            summary,
+            presence: Ok(Some(crate::books::BookAppendEditPresence(prepared))),
+        }))
+        .unwrap();
+        let writing = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin_for_key(&key);
+        app.poll_book_op_pending(&egui::Context::default());
+        assert!(app.book_op_pending.is_some());
+        drop(writing);
+        drain_append(&mut app, &egui::Context::default());
+        assert!(!app.adjusted_page_keys.contains(&key));
+        assert!(app.book_append_undo_receipt.is_none());
     }
 
     #[test]

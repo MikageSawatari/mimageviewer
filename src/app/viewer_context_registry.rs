@@ -3899,66 +3899,6 @@ impl App {
         self.viewer_contexts.table.other_ids()
     }
 
-    /// Refresh only cached exact append destinations. In particular an unchanged
-    /// sibling remains parked with its draft, selection and unrelated caches.
-    pub(in crate::app) fn publish_book_append_destination_metadata(
-        &mut self,
-        ratings: &std::collections::HashMap<String, u8>,
-        tags: &std::collections::HashMap<String, Vec<String>>,
-    ) {
-        fn update(
-            items: &[GridItem],
-            rating_cache: &mut std::collections::HashMap<usize, u8>,
-            tags_cache: &mut std::collections::HashMap<String, Vec<String>>,
-            details: &mut DetailsCellContentRevisions,
-            ratings: &std::collections::HashMap<String, u8>,
-            tags: &std::collections::HashMap<String, Vec<String>>,
-        ) {
-            // Uncached ratings use the existing App-global path publication
-            // overlay on first access. Avoid traversing or cloning all items.
-            for (idx, value) in rating_cache.iter_mut() {
-                if let Some(GridItem::Image(path)) = items.get(*idx)
-                    && let Some(stars) = ratings.get(&crate::adjustment_db::normalize_path(path))
-                {
-                    *value = *stars;
-                }
-            }
-            let mut changed = false;
-            for (key, value) in tags_cache.iter_mut() {
-                if let Some(copied) = tags.get(key)
-                    && value != copied
-                {
-                    *value = copied.clone();
-                    changed = true;
-                }
-            }
-            if changed {
-                DetailsCellContentRevisions::bump(&mut details.tags);
-            }
-        }
-        update(
-            &self.items,
-            &mut self.rating_cache,
-            &mut self.tags_cache,
-            &mut self.details_cell_content_revisions,
-            ratings,
-            tags,
-        );
-        for slot in self.viewer_contexts.table.slots.values_mut() {
-            let bundle = match slot {
-                Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
-            };
-            update(
-                &bundle.items,
-                &mut bundle.rating_cache,
-                &mut bundle.tags_cache,
-                &mut bundle.details_cell_content_revisions,
-                ratings,
-                tags,
-            );
-        }
-    }
-
     /// A global final-cover setting is shared by every viewer context, while the geometry and
     /// interaction owners it changes are context-local. Reset parked owners in place without
     /// mounting them or cancelling unrelated workers; their navigation demand is rebound by the
@@ -4727,64 +4667,162 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn section1373_exact_copy_publication_updates_parked_destination_without_mount_or_draft_reset()
-    {
-        let mut app = crate::app::tests::phase_c_support::setup_app();
-        let source = app.tmp.path().join("source.jpg");
-        let copy = app.tmp.path().join("0001_copy.jpg");
-        let source_key = crate::adjustment_db::normalize_path(&source);
-        let copy_key = crate::adjustment_db::normalize_path(&copy);
-        app.items = vec![GridItem::Image(source.clone())];
-        app.rating_cache.insert(0, 3);
-        app.tags_cache
-            .insert(source_key.clone(), vec!["#source".into()]);
-        app.erase_mask = Some(vec![true, false]);
-        let parked = app
-            .build_viewer_context("append_metadata_parked", |owner, _| {
-                owner.items = vec![GridItem::Image(copy), GridItem::Image(source)];
-                owner.rating_cache.insert(0, 0);
+    fn section1373_append_terminal_preserves_later_add_and_clear_in_mounted_and_parked_contexts() {
+        for edited in [true, false] {
+            let mut app = crate::app::tests::phase_c_support::setup_app();
+            let folder = app.tmp.path().join("append-terminal");
+            let destination = folder.join("0001_copy.jpg");
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(&destination, b"append output already visible").unwrap();
+            let source = app.tmp.path().join("source.jpg");
+            let key = crate::adjustment_db::normalize_path(&destination);
+            let source_key = crate::adjustment_db::normalize_path(&source);
+            let stars = if edited { 5 } else { 0 };
+            let tags = if edited {
+                vec!["#later".to_owned()]
+            } else {
+                Vec::new()
+            };
+            let seed = |owner: &mut App| {
+                owner.items = vec![
+                    GridItem::Image(destination.clone()),
+                    GridItem::Image(source.clone()),
+                ];
+                owner.rating_cache.insert(0, stars);
                 owner.rating_cache.insert(1, 3);
-                owner.tags_cache.insert(copy_key.clone(), Vec::new());
+                owner.tags_cache.insert(key.clone(), tags.clone());
                 owner
                     .tags_cache
                     .insert(source_key.clone(), vec!["#source".into()]);
-                owner.erase_mask = Some(vec![false, true]);
+                owner
+                    .adjustment_page_params
+                    .insert(1, crate::adjustment::AdjustParams::default());
                 owner.local_adjust_selected_layers.insert(1, 2);
                 owner.local_adjust_page_layers.insert(1, Vec::new().into());
-                BuildOutcome::Commit
-            })
-            .unwrap();
-        let projected = app.projected_viewer_context_id();
-        // Seed the mounted edit draft after constructing the parked fixture.
-        app.erase_mask = Some(vec![true, false]);
-        let current_tag_revision = app.details_cell_content_revisions.tags;
-        let ratings = [(copy_key.clone(), 4)].into();
-        let tags = [(copy_key.clone(), vec!["#copied".into()])].into();
-        app.publish_book_append_destination_metadata(&ratings, &tags);
-        assert_eq!(app.projected_viewer_context_id(), projected);
-        assert_eq!(app.rating_cache.get(&0), Some(&3));
-        assert_eq!(
-            app.tags_cache.get(&source_key),
-            Some(&vec!["#source".into()])
-        );
-        assert_eq!(app.erase_mask.as_deref(), Some([true, false].as_slice()));
-        assert_eq!(
-            app.details_cell_content_revisions.tags,
-            current_tag_revision
-        );
-        let bundle = app.viewer_contexts.table.at_rest_mut(parked).unwrap();
-        assert_eq!(bundle.rating_cache.get(&0), Some(&4));
-        assert_eq!(bundle.rating_cache.get(&1), Some(&3));
-        assert_eq!(
-            bundle.tags_cache.get(&copy_key),
-            Some(&vec!["#copied".into()])
-        );
-        assert_eq!(
-            bundle.tags_cache.get(&source_key),
-            Some(&vec!["#source".into()])
-        );
-        assert_eq!(bundle.local_adjust_selected_layers.get(&1), Some(&2));
-        assert!(bundle.local_adjust_page_layers.contains_key(&1));
+                for pages in [
+                    &mut owner.local_adjust_pages,
+                    &mut owner.export_crop_pages,
+                    &mut owner.mask_pages,
+                    &mut owner.conceal_pages,
+                    &mut owner.comic_pages,
+                ] {
+                    pages.insert(1);
+                    if edited {
+                        pages.insert(0);
+                    } else {
+                        pages.remove(&0);
+                    }
+                }
+                if edited {
+                    owner
+                        .adjustment_page_params
+                        .insert(0, crate::adjustment::AdjustParams::default());
+                } else {
+                    owner.adjustment_page_params.remove(&0);
+                }
+                owner.erase_mask = Some(vec![edited, !edited]);
+            };
+            seed(&mut app);
+            let parked = app
+                .build_viewer_context("append_later_edit", |owner, _| {
+                    seed(owner);
+                    BuildOutcome::Commit
+                })
+                .unwrap();
+            seed(&mut app);
+            // Represent a later accepted edit/clear after the output became visible,
+            // while the append result is still waiting for its UI poll.
+            let owner: &mut App = &mut app;
+            for keys in [
+                &mut owner.adjusted_page_keys,
+                &mut owner.local_adjust_page_keys,
+                &mut owner.export_crop_page_keys,
+                &mut owner.mask_page_keys,
+                &mut owner.conceal_page_keys,
+                &mut owner.comic_page_keys,
+            ] {
+                keys.insert(source_key.clone());
+                if edited {
+                    keys.insert(key.clone());
+                } else {
+                    keys.remove(&key);
+                }
+            }
+            app.record_rating_session_write(key.clone(), stars, true);
+            let generation = app.rating_session_write_generation;
+            let revision = app.details_cell_content_revisions.tags;
+            let projected = app.projected_viewer_context_id();
+            let summary = crate::books::BookAppendSummary {
+                book_name: "book".into(),
+                folder,
+                added: 1,
+                first_path: Some(destination),
+                edit_copies: Vec::new(),
+                semantic_copies: Vec::new(),
+                erase_fallback_pages: 0,
+                undo_files: None,
+                metadata_copy: crate::book_append_undo::BookAppendMetadataCopySummary {
+                    adjusted: vec![key.clone()],
+                    local_adjusted: vec![key.clone()],
+                    cropped: vec![key.clone()],
+                    erased: vec![key.clone()],
+                    concealed: vec![key.clone()],
+                    annotated: vec![key.clone()],
+                    ratings: vec![key.clone()],
+                    tags: vec![key.clone()],
+                    ..Default::default()
+                },
+            };
+            app.finish_book_append_metadata(&summary);
+            assert_eq!(app.projected_viewer_context_id(), projected);
+            assert_eq!(app.rating_session_write_generation, generation);
+            assert_eq!(app.details_cell_content_revisions.tags, revision);
+            assert_eq!(app.rating_cache.get(&0), Some(&stars));
+            assert_eq!(app.rating_cache.get(&1), Some(&3));
+            assert_eq!(app.tags_cache.get(&key), Some(&tags));
+            assert_eq!(
+                app.tags_cache.get(&source_key),
+                Some(&vec!["#source".into()])
+            );
+            assert_eq!(
+                app.erase_mask.as_deref(),
+                Some([edited, !edited].as_slice())
+            );
+            assert_eq!(app.adjustment_page_params.contains_key(&0), edited);
+            for keys in [
+                &app.adjusted_page_keys,
+                &app.local_adjust_page_keys,
+                &app.export_crop_page_keys,
+                &app.mask_page_keys,
+                &app.conceal_page_keys,
+                &app.comic_page_keys,
+            ] {
+                assert_eq!(keys.contains(&key), edited);
+                assert!(keys.contains(&source_key));
+            }
+            let bundle = app.viewer_contexts.table.at_rest_mut(parked).unwrap();
+            assert_eq!(bundle.rating_cache.get(&0), Some(&stars));
+            assert_eq!(bundle.rating_cache.get(&1), Some(&3));
+            assert_eq!(bundle.tags_cache.get(&key), Some(&tags));
+            assert_eq!(
+                bundle.tags_cache.get(&source_key),
+                Some(&vec!["#source".into()])
+            );
+            assert_eq!(bundle.adjustment_page_params.contains_key(&0), edited);
+            for pages in [
+                &bundle.local_adjust_pages,
+                &bundle.export_crop_pages,
+                &bundle.mask_pages,
+                &bundle.conceal_pages,
+                &bundle.comic_pages,
+            ] {
+                assert_eq!(pages.contains(&0), edited);
+                assert!(pages.contains(&1));
+            }
+            assert!(bundle.adjustment_page_params.contains_key(&1));
+            assert_eq!(bundle.local_adjust_selected_layers.get(&1), Some(&2));
+            assert!(bundle.local_adjust_page_layers.contains_key(&1));
+        }
     }
 
     #[cfg(windows)]

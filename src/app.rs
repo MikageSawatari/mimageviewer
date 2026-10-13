@@ -49904,14 +49904,39 @@ impl App {
             Arc::clone(&self.raw_develop_executor),
             self.settings.raw_brightness,
         );
+        let stores = crate::book_append_undo::AppendMetadataStores {
+            adjustment: self.adjustment_db.is_some(),
+            local_adjust: self.local_adjust_db.is_some(),
+            crop: self.export_crop_db.is_some(),
+            mask: self.mask_db.is_some(),
+            conceal: self.conceal_db.is_some(),
+            comic: self.comic_db.is_some(),
+            rating: self.rating_db.is_some(),
+            tags: self.tags_db.is_some(),
+        };
+        // Capture the existing source-write FIFO before handing off Append.
+        // The same worker waits before metadata initialization and publication.
+        let local_adjust_fence = self
+            .local_adjust_write_handle
+            .as_ref()
+            .map(|handle| handle.enqueue_fence());
         self.start_book_op(ctx, "book-append", intent, move || {
-            crate::books::append_pages_at_with_raw(data_dir, root, book_name, sources, Some(&raw))
-                .map(|result| match result {
-                    crate::books::BookOpResult::Append(summary) => {
-                        crate::books::BookOpResult::AppendFilesWritten(summary)
-                    }
-                    result => result,
-                })
+            if let Some(fence) = local_adjust_fence {
+                fence
+                    .and_then(|fence| fence.recv().map_err(|error| error.to_string()))
+                    .map_err(|error| {
+                        crate::logger::log(format!("book append source fence: {error}"));
+                        error
+                    })?;
+            }
+            crate::books::append_pages_at_with_raw(
+                data_dir,
+                root,
+                book_name,
+                sources,
+                stores,
+                Some(&raw),
+            )
         });
     }
 
@@ -50351,6 +50376,17 @@ impl App {
     }
 
     pub(crate) fn poll_book_op_pending(&mut self, ctx: &egui::Context) {
+        // Existing epoch completion wakes the UI. Keep a readonly Append
+        // preparation on its receiver while a durable edit is still writing.
+        if self.book_op_pending.as_ref().is_some_and(|pending| {
+            matches!(pending.intent, crate::books::BookOpIntent::Append { .. })
+        }) && crate::page_edit_write_epoch::PAGE_EDIT_WRITES
+            .sample()
+            .active_writers
+            != 0
+        {
+            return;
+        }
         let Some(pending) = self.book_op_pending.as_ref() else {
             return;
         };
@@ -50378,17 +50414,10 @@ impl App {
         if !retained {
             self.book_op_pending = None;
         }
-        // Metadata copying is global worker work and must finish even when its
-        // source window has closed. Visible terminals run in the captured owner.
+        // File and metadata initialization finish on the same Append worker,
+        // even when the source window closes. Visible terminals retain its owner.
         let source = match &intent {
-            crate::books::BookOpIntent::Append { source_context, .. }
-                if !matches!(
-                    result,
-                    Ok(crate::books::BookOpResult::AppendFilesWritten(_))
-                ) =>
-            {
-                Some(*source_context)
-            }
+            crate::books::BookOpIntent::Append { source_context, .. } => Some(*source_context),
             crate::books::BookOpIntent::UndoAppend { receipt } => Some(receipt.source_context),
             _ => None,
         };
@@ -50440,11 +50469,44 @@ impl App {
         intent: &crate::books::BookOpIntent,
     ) -> bool {
         match result {
-            Ok(crate::books::BookOpResult::AppendFilesWritten(summary)) => {
-                self.start_book_append_metadata_terminal(ctx, summary);
-                return true;
-            }
             Ok(crate::books::BookOpResult::Append(summary)) => {
+                if [
+                    &summary.metadata_copy.adjusted,
+                    &summary.metadata_copy.local_adjusted,
+                    &summary.metadata_copy.cropped,
+                    &summary.metadata_copy.erased,
+                    &summary.metadata_copy.concealed,
+                    &summary.metadata_copy.annotated,
+                ]
+                .iter()
+                .any(|keys| !keys.is_empty())
+                {
+                    self.start_book_append_presence_prepare(ctx, summary);
+                    return true;
+                }
+                if self.finish_book_append_terminal(ctx, summary, None) {
+                    return true;
+                }
+            }
+            Ok(crate::books::BookOpResult::AppendPresencePrepared {
+                mut summary,
+                presence,
+            }) => {
+                match presence {
+                    Ok(Some(prepared))
+                        if self.apply_book_append_edit_presence(&summary, &prepared.0) => {}
+                    Ok(_) => {
+                        self.start_book_append_presence_prepare(ctx, summary);
+                        return true;
+                    }
+                    Err(error) => {
+                        crate::logger::log(format!("book append metadata read: {error}"));
+                        self.show_feedback_toast(
+                            "本ページの編集情報を再読込できませんでした".into(),
+                        );
+                        summary.undo_files = None;
+                    }
+                }
                 if self.finish_book_append_terminal(ctx, summary, None) {
                     return true;
                 }

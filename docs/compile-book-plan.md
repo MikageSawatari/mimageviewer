@@ -12,8 +12,11 @@
 
 2026-10-12 の next-list (`ea060b66e` 基点) 調査では、§11 の membership DB／登録済みバッジは
 未実装。§1.373 の追加直後 Undo は [別設計書](section373-book-append-undo-plan.md) の
-R3/R4 ACCEPT 設計で実装を接続したが、2026-10-13 の実装レビューで通常の後続編集を
-metadata copyがDB正本から上書きする前提矛盾を確認し、§7.7の設計判断待ちで停止している。
+R3/R4 ACCEPT後の実装で後続編集をmetadata copyがDB正本から上書きする前提矛盾を確認した。
+2026-10-13のR7設計担当判断で、同じAppend workerが各画像の作成前に八storeを初期化する
+順序へ変更し、実装・対象検証と独立実装レビューACCEPT、確認用buildを完了した。
+full gateは通常rescanの選択復元回帰とHTTP fixtureの停止により未成功（別設計書§7.9）。
+stagingや新しいpending ownerは追加しない。
 今回作ったコピーだけをごみ箱へ移し、元ファイル・既存ページ・本フォルダを残す。一回取消で
 追加のRedoはない。新しいmembership DBを導入せず、既存のmetadata Undo履歴も維持する。
 

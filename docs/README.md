@@ -10,7 +10,7 @@
 | --- | --- |
 | [section353-zip-refresh-location-plan.md](section353-zip-refresh-location-plan.md) | §1.353 ZIP の更新位置。facet帰路・起動復元を修正、回帰9件追加、独立最終ACCEPT。targeted618実行／596件・vendor54件・fmt・通常／portable check・最新dev成功。full一回exit101の失敗48件を全補完、再実行なし |
 | [section375-operation-reconcile-plan.md](section375-operation-reconcile-plan.md) | §1.375 R6、利用者2026-10-13再レビュー反映。走査・一覧準備・全行比較は既存prepare ownerのworker、UIは世代／revision確認と同一／差分・差分prepared結果のみ。代表の選択キーだけ保持、選択先消失は監視でも再選定。CPU／GPU eviction不変、Stackはsource／context＋group key。共有投影基盤と大量一覧perf予定を明記。§1.314・context／通知契約を維持、未実装・独立再レビュー停止 |
-| [section373-book-append-undo-plan.md](section373-book-append-undo-plan.md) | §1.373 R4設計ACCEPT、実装レビューREVISE・設計判断待ち（§7.7）。明示reloadで露出した新ページへの後続編集をmetadata copyが正本から上書きする通常経路を確認。実装候補と回帰を保持し、完成とは扱わない。今回追加分だけのごみ箱Undo・実移動確認・UndoAppend限定排他は維持 |
+| [section373-book-append-undo-plan.md](section373-book-append-undo-plan.md) | §1.373 R7実装・対象検証済み、独立実装レビューACCEPT（§7.7–7.9）。同じAppend workerで各画像の作成前に八storeを初期化し、ファイル出現を公開点にする。stagingなし、copy report値のcache採用を撤去。既存receiverの現在DB再取得、ごみ箱Undo・UndoAppend限定排他は維持。確認用／release build成功。fullは通常rescanの選択復元回帰の単独失敗とHTTP fixtureの停止により未成功 |
 | [async-log-writer-plan.md](async-log-writer-plan.md) | §1.356 通常／perfの同期ログI/OによるUI・stderr reader停止。単一writer、有界queue・欠落、重要診断、終了flush、診断ZIP workerの完了barrier、解析gateの保存証明／判定不能。2026-10-09利用者決定済み・実装／検証記録 |
 | [details-name-color-plan.md](details-name-color-plan.md) | 詳細一覧の名前色。フォルダ黄系・六分類、標準カスタム/強め固定、選択/チェック共通色、切り取り不透明と設定保存・検証 |
 | [raw-libraw-plan.md](raw-libraw-plan.md) | RAW の内蔵現像、プレビュー差し替え・編集 gate・Remote・設定・配布を触るとき |

@@ -1,5 +1,39 @@
 use super::*;
 
+/// Fresh exact-key presence for the existing Append receiver. This runs only on
+/// its worker and reads current durable state, never the original copy values.
+pub(super) fn load_book_append_edit_presence(
+    summary: &crate::books::BookAppendSummary,
+    mut available: page_edit_snapshot::PageEditAvailability,
+) -> Result<Option<page_edit_snapshot::StablePageEditProjection>, String> {
+    let report = &summary.metadata_copy;
+    let mut keys = [
+        &report.adjusted,
+        &report.local_adjusted,
+        &report.cropped,
+        &report.erased,
+        &report.concealed,
+        &report.annotated,
+    ]
+    .into_iter()
+    .flatten()
+    .cloned()
+    .collect::<Vec<_>>();
+    keys.sort_unstable();
+    keys.dedup();
+    let items = keys
+        .into_iter()
+        .map(|key| GridItem::Image(PathBuf::from(key)))
+        .collect::<Vec<_>>();
+    // Append does not transfer view-trim state.
+    available.view_trim = false;
+    page_edit_snapshot::PageEditSnapshot::load_and_project_stable(
+        &items,
+        available,
+        &AtomicBool::new(false),
+    )
+}
+
 impl App {
     pub(crate) fn book_append_undo_in_progress(&self) -> bool {
         self.book_op_pending.as_ref().is_some_and(|pending| {
@@ -158,85 +192,58 @@ impl App {
         self.remote_session_ui.has_pending_bookmark_writes()
     }
 
-    pub(super) fn start_book_append_metadata_terminal(
+    /// Patch only the App-global rollup sets after a fresh DB read. Visible and
+    /// parked contexts already loaded initialized metadata after file creation;
+    /// their caches and edit drafts must retain any later accepted changes.
+    pub(super) fn apply_book_append_edit_presence(
         &mut self,
-        ctx: &egui::Context,
-        summary: crate::books::BookAppendSummary,
-    ) {
-        let fence = (!summary.edit_copies.is_empty())
-            .then(|| {
-                self.local_adjust_write_handle
-                    .as_ref()
-                    .map(|handle| handle.enqueue_fence())
-            })
-            .flatten();
-        let mut stores = crate::book_append_undo::AppendMetadataStores {
-            adjustment: self.adjustment_db.is_some(),
-            local_adjust: self.local_adjust_db.is_some(),
-            crop: self.export_crop_db.is_some(),
-            mask: self.mask_db.is_some(),
-            conceal: self.conceal_db.is_some(),
-            comic: self.comic_db.is_some(),
-            rating: self.rating_db.is_some(),
-            tags: self.tags_db.is_some(),
-        };
-        let data_dir = crate::data_dir::get();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let tx_worker = tx.clone();
-        // Move the payload once, without cloning thousands of page paths on UI.
-        // On spawn failure no worker exists, so the error branch can take it
-        // without waiting for a running worker or introducing another pending owner.
-        let payload = Arc::new(std::sync::Mutex::new(Some(summary)));
-        let worker_payload = Arc::clone(&payload);
-        let result = std::thread::Builder::new()
-            .name("book-append-metadata".into())
-            .spawn(move || {
-                let mut summary = worker_payload
-                    .lock()
-                    .unwrap()
-                    .take()
-                    .expect("one metadata payload");
-                let fence_error = match fence {
-                    None => None,
-                    Some(Err(error)) => Some(error),
-                    Some(Ok(fence)) => fence.recv().err().map(|error| error.to_string()),
-                };
-                if let Some(error) = fence_error {
-                    summary.undo_files = None;
-                    summary
-                        .metadata_copy
-                        .errors
-                        .push(format!("local_adjust fence: {error}"));
-                    stores.local_adjust = false;
-                }
-                crate::book_append_undo::copy_append_metadata_at(&data_dir, &mut summary, stores);
-                let _ = tx_worker.send(Ok(crate::books::BookOpResult::Append(summary)));
-            });
-        // Receiver handoff never retires the operation or its deferred observations.
-        self.book_op_pending
-            .as_mut()
-            .expect("append owns existing pending")
-            .rx = rx;
-        match result {
-            Ok(_) => {
-                ctx.request_repaint_after(std::time::Duration::from_millis(100));
-            }
-            Err(error) => {
-                crate::logger::log(format!("[book-append-undo] metadata worker spawn: {error}"));
-                let mut failed_summary = payload
-                    .lock()
-                    .unwrap()
-                    .take()
-                    .expect("failed spawn retains metadata payload");
-                failed_summary.undo_files = None;
-                failed_summary
-                    .metadata_copy
-                    .errors
-                    .push(format!("metadata worker: {error}"));
-                let _ = tx.send(Ok(crate::books::BookOpResult::Append(failed_summary)));
-                ctx.request_repaint();
+        summary: &crate::books::BookAppendSummary,
+        prepared: &page_edit_snapshot::StablePageEditProjection,
+    ) -> bool {
+        if !crate::page_edit_write_epoch::PAGE_EDIT_WRITES.accepts(prepared.stamp) {
+            return false;
+        }
+        let report = &summary.metadata_copy;
+        let read = &prepared.snapshot;
+        for key in &report.adjusted {
+            Self::set_page_key_presence(
+                &mut self.adjusted_page_keys,
+                key,
+                read.adjustment.contains_key(key),
+            );
+        }
+        for key in &report.local_adjusted {
+            // A queued local-adjust write can precede its DB write epoch. Its
+            // accepted UI presence remains authoritative until completion.
+            if !self.local_adjust_write_pending.contains_key(key) {
+                Self::set_page_key_presence(
+                    &mut self.local_adjust_page_keys,
+                    key,
+                    read.local_adjust.contains(key),
+                );
             }
         }
+        for key in &report.cropped {
+            Self::set_page_key_presence(
+                &mut self.export_crop_page_keys,
+                key,
+                read.export_crop.contains_key(key),
+            );
+        }
+        for key in &report.erased {
+            Self::set_page_key_presence(&mut self.mask_page_keys, key, read.mask.contains(key));
+        }
+        for key in &report.concealed {
+            Self::set_page_key_presence(
+                &mut self.conceal_page_keys,
+                key,
+                read.conceal.contains(key),
+            );
+        }
+        for key in &report.annotated {
+            Self::set_page_key_presence(&mut self.comic_page_keys, key, read.comic.contains(key));
+        }
+        true
     }
 
     pub(super) fn finish_book_append_metadata(
@@ -244,26 +251,9 @@ impl App {
         summary: &crate::books::BookAppendSummary,
     ) {
         let report = &summary.metadata_copy;
-        self.adjusted_page_keys
-            .extend(report.adjusted.iter().cloned());
-        self.local_adjust_page_keys
-            .extend(report.local_adjusted.iter().cloned());
-        self.export_crop_page_keys
-            .extend(report.cropped.iter().cloned());
-        self.mask_page_keys.extend(report.erased.iter().cloned());
-        self.conceal_page_keys
-            .extend(report.concealed.iter().cloned());
-        self.comic_page_keys
-            .extend(report.annotated.iter().cloned());
-        // A target may already have loaded these new paths while the metadata
-        // worker ran. Publish exact copied values without resetting its draft.
-        for (key, stars) in &report.ratings {
-            self.record_rating_session_write(key.clone(), *stars, false);
-        }
-        self.publish_book_append_destination_metadata(&report.ratings, &report.tags);
-        // Destinations are create_new outputs. Copy completion cannot erase
-        // a later draft in the source or an unchanged sibling's page caches;
-        // visible destination hydration has its own existing install boundary.
+        // Metadata is initialized on the append worker before the file is visible.
+        // This terminal carries changed keys only: a user may already have edited
+        // or cleared the destination. Fresh DB reads own cache/presence hydration.
         if !summary.edit_copies.is_empty() || !summary.semantic_copies.is_empty() {
             self.invalidate_rating_counts_cache();
         }
@@ -336,69 +326,6 @@ mod tests {
     };
     use crate::books::{BookOpIntent, BookOpPending, BookOpResult};
 
-    #[test]
-    fn section1373_manual_target_reload_before_metadata_updates_only_copied_cache_keys() {
-        let mut app = setup_app_for_test();
-        let receipt = receipt(&app);
-        let destination = receipt.files.created[0].path.clone();
-        let source = app.tmp.path().join("unchanged-source.jpg");
-        let destination_key = crate::adjustment_db::normalize_path(&destination);
-        let source_key = crate::adjustment_db::normalize_path(&source);
-        // The explicit target reload has already cached the newly created rows
-        // before the copy worker's SQLite terminal, so same-list refresh cannot
-        // repair these values through an items install.
-        app.items = vec![
-            crate::grid_item::GridItem::Image(destination.clone()),
-            crate::grid_item::GridItem::Image(source),
-        ];
-        app.rating_cache.insert(0, 0);
-        app.rating_cache.insert(1, 3);
-        app.tags_cache.insert(destination_key.clone(), Vec::new());
-        app.tags_cache
-            .insert(source_key.clone(), vec!["#source".into()]);
-        app.erase_mask = Some(vec![true, false]);
-        let before_generation = app.rating_session_write_generation;
-        let before_tags_revision = app.details_cell_content_revisions.tags;
-        let summary = crate::books::BookAppendSummary {
-            book_name: receipt.files.book_name.clone(),
-            folder: receipt.files.folder.clone(),
-            added: 1,
-            first_path: Some(destination.clone()),
-            edit_copies: Vec::new(),
-            semantic_copies: Vec::new(),
-            erase_fallback_pages: 0,
-            undo_files: Some(receipt.files),
-            metadata_copy: crate::book_append_undo::BookAppendMetadataCopySummary {
-                ratings: [(destination_key.clone(), 4)].into(),
-                tags: [(destination_key.clone(), vec!["#copied".into()])].into(),
-                ..Default::default()
-            },
-        };
-        app.finish_book_append_metadata(&summary);
-        assert_eq!(app.rating_cache.get(&0), Some(&4));
-        assert_eq!(
-            app.tags_cache.get(&destination_key),
-            Some(&vec!["#copied".into()])
-        );
-        assert_eq!(app.rating_cache.get(&1), Some(&3));
-        assert_eq!(
-            app.tags_cache.get(&source_key),
-            Some(&vec!["#source".into()])
-        );
-        assert_eq!(app.erase_mask.as_deref(), Some([true, false].as_slice()));
-        assert_eq!(
-            app.details_cell_content_revisions.tags,
-            before_tags_revision + 1
-        );
-        // Existing per-path publication also overlays a late prepared rating
-        // read and rejects a pre-copy XMP hydration result.
-        app.rating_cache.insert(0, 0);
-        app.overlay_rating_session_writes_since(before_generation);
-        assert_eq!(app.get_rating(0), 4);
-        app.hydrate_ratings_from_xmp(vec![(destination, 1, 0)]);
-        assert_eq!(app.get_rating(0), 4);
-    }
-
     fn receipt(app: &AppTestEnvForTest) -> BookAppendUndoReceipt {
         let root = app.tmp.path().join("undo-helper-books");
         let folder = root.join("book");
@@ -413,6 +340,132 @@ mod tests {
             source_context: app.projected_viewer_context_id(),
             accepted_revision: app.book_append_undo_revision,
         }
+    }
+
+    fn presence_summary(app: &AppTestEnvForTest) -> crate::books::BookAppendSummary {
+        let receipt = receipt(app);
+        let destination = receipt.files.created[0].path.clone();
+        let key = crate::adjustment_db::normalize_path(&destination);
+        crate::books::BookAppendSummary {
+            book_name: receipt.files.book_name.clone(),
+            folder: receipt.files.folder.clone(),
+            added: 1,
+            first_path: Some(destination),
+            edit_copies: Vec::new(),
+            semantic_copies: Vec::new(),
+            erase_fallback_pages: 0,
+            undo_files: Some(receipt.files),
+            metadata_copy: crate::book_append_undo::BookAppendMetadataCopySummary {
+                adjusted: vec![key.clone()],
+                local_adjusted: vec![key.clone()],
+                cropped: vec![key.clone()],
+                erased: vec![key.clone()],
+                concealed: vec![key.clone()],
+                annotated: vec![key],
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn section1373_fresh_presence_read_reflects_later_add_and_clear_without_unrelated_loss() {
+        let mut app = setup_app_for_test();
+        let summary = presence_summary(&app);
+        let key = summary.metadata_copy.adjusted[0].clone();
+        let other = "unrelated-edit.jpg".to_owned();
+        let owner: &mut App = &mut app;
+        for keys in [
+            &mut owner.adjusted_page_keys,
+            &mut owner.local_adjust_page_keys,
+            &mut owner.export_crop_page_keys,
+            &mut owner.mask_page_keys,
+            &mut owner.conceal_page_keys,
+            &mut owner.comic_page_keys,
+        ] {
+            keys.insert(other.clone());
+        }
+        let available = page_edit_snapshot::PageEditAvailability {
+            adjustment: true,
+            ..Default::default()
+        };
+        // File is already visible; later writes precede the existing Append
+        // receiver's fresh read. Original copy report remains unchanged.
+        for present in [true, false] {
+            if present {
+                app.adjustment_db
+                    .as_ref()
+                    .unwrap()
+                    .set_page_params(&key, &crate::adjustment::AdjustParams::default())
+                    .unwrap();
+            } else {
+                app.adjustment_db
+                    .as_ref()
+                    .unwrap()
+                    .remove_page_params(&key)
+                    .unwrap();
+            }
+            let prepared = load_book_append_edit_presence(&summary, available)
+                .unwrap()
+                .unwrap();
+            assert!(app.apply_book_append_edit_presence(&summary, &prepared));
+            assert_eq!(app.adjusted_page_keys.contains(&key), present);
+            for keys in [
+                &app.adjusted_page_keys,
+                &app.local_adjust_page_keys,
+                &app.export_crop_page_keys,
+                &app.mask_page_keys,
+                &app.conceal_page_keys,
+                &app.comic_page_keys,
+            ] {
+                assert!(keys.contains(&other));
+            }
+        }
+    }
+
+    #[test]
+    fn section1373_presence_read_rejects_later_edit_epoch_without_patching_globals() {
+        let mut app = setup_app_for_test();
+        let summary = presence_summary(&app);
+        let key = summary.metadata_copy.adjusted[0].clone();
+        let prepared = load_book_append_edit_presence(&summary, Default::default())
+            .unwrap()
+            .unwrap();
+        app.adjusted_page_keys.insert(key.clone());
+        let write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin_for_key(&key);
+        assert!(!app.apply_book_append_edit_presence(&summary, &prepared));
+        assert!(app.adjusted_page_keys.contains(&key));
+        drop(write);
+        assert!(!app.apply_book_append_edit_presence(&summary, &prepared));
+        assert!(app.adjusted_page_keys.contains(&key));
+    }
+
+    #[test]
+    fn section1373_presence_read_preserves_queued_local_adjust_add_and_clear() {
+        let mut app = setup_app_for_test();
+        let summary = presence_summary(&app);
+        let key = summary.metadata_copy.local_adjusted[0].clone();
+        let mut prepared = load_book_append_edit_presence(&summary, Default::default())
+            .unwrap()
+            .unwrap();
+        app.local_adjust_write_pending.insert(
+            key.clone(),
+            LocalAdjustWritePending {
+                generation: 1,
+                idx: 0,
+                sidecar: None,
+            },
+        );
+        for present in [true, false] {
+            App::set_page_key_presence(&mut app.local_adjust_page_keys, &key, present);
+            if present {
+                prepared.snapshot.local_adjust.remove(&key);
+            } else {
+                prepared.snapshot.local_adjust.insert(key.clone());
+            }
+            assert!(app.apply_book_append_edit_presence(&summary, &prepared));
+            assert_eq!(app.local_adjust_page_keys.contains(&key), present);
+        }
+        app.local_adjust_write_pending.remove(&key);
     }
 
     fn hold_append(
@@ -466,51 +519,5 @@ mod tests {
         assert!(app.book_op_pending.is_some());
         assert!(!app.book_append_operation_is_current(operation));
         assert!(!app.book_append_undo_in_progress());
-    }
-
-    #[test]
-    fn section1373_metadata_receiver_handoff_keeps_append_identity_and_observations() {
-        let mut app = setup_app_for_test();
-        let receipt = receipt(&app);
-        let _tx = hold_append(&mut app, &receipt);
-        let summary = crate::books::BookAppendSummary {
-            book_name: receipt.files.book_name.clone(),
-            folder: receipt.files.folder.clone(),
-            added: 1,
-            first_path: Some(receipt.files.created[0].path.clone()),
-            edit_copies: Vec::new(),
-            semantic_copies: Vec::new(),
-            erase_fallback_pages: 0,
-            undo_files: Some(receipt.files.clone()),
-            metadata_copy: Default::default(),
-        };
-        app.start_book_append_metadata_terminal(&egui::Context::default(), summary);
-        let pending = app.book_op_pending.as_ref().unwrap();
-        let BookOpIntent::Append {
-            operation_id,
-            source_context,
-            accepted_revision,
-            target_folder,
-            observations,
-        } = &pending.intent
-        else {
-            panic!("same append owner required");
-        };
-        assert_eq!(*operation_id, receipt.operation_id);
-        assert_eq!(*source_context, receipt.source_context);
-        assert_eq!(*accepted_revision, receipt.accepted_revision);
-        assert_eq!(target_folder, &receipt.files.folder);
-        assert_eq!(observations.contexts(), &[receipt.source_context]);
-        let result = pending
-            .rx
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .unwrap()
-            .unwrap();
-        let BookOpResult::Append(summary) = result else {
-            panic!("metadata terminal required");
-        };
-        assert!(summary.undo_files.is_some());
-        assert!(app.book_append_undo_receipt.is_none());
-        assert!(app.book_op_pending.is_some());
     }
 }

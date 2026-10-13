@@ -1,12 +1,12 @@
 ﻿# §1.373 本棚への追加直後の一回取り消し
 
 2026-10-13改訂、`next-list` / `ea060b66e` 設計基点、確認基点 `df20dba7b`。
-**利用者決定 (2026-10-12): R4案1を採用。R4設計はACCEPT、実装レビューは§7.7のP1によりREVISE・設計判断待ち (2026-10-13)**。
+**R7（2026-10-13設計担当決定）: 八store初期化を各画像の作成前へ移す。同じAppend workerの順序で公開境界を作り、stagingは追加しない。実装・対象検証済み、独立実装レビューACCEPT。full gateは未成功（§7.9の前提矛盾）**。
 正本項目: [next-release-backlog.md §1.373](next-release-backlog.md#1373-本棚ツールバーの右クリックで本棚へ追加した操作を-ctrlz-で取り消す--利用者の要望-2026-10-11)。
 アプリは起動していない。R4判断前の未検証試作は製品への接続を撤回し、`target`へ退役した。
-R4案1の独立設計レビューACCEPTを受けて既存ownerへの接続と回帰を実装したが、通常の後続編集を
-metadata copyが正本から上書きする前提矛盾が判明した。実装候補を保持して停止し、完成とは扱わない。
-最終検証・実装ACCEPT・実機確認は未完了。下記の試作退役・レビュー前停止は当時の履歴である。
+R4の自動観測配送・ごみ箱Undo・UndoAppend限定排他は維持する。WIP `3e8178b31` の
+通常の後続編集上書きは§7.7のR7で修正し、独立構造レビューの合意を得て実装を再開した。
+最終検証・実装レビューと実機確認は未完了。下記の試作退役・停止checkpointは当時の履歴である。
 
 `001a0dabf` の独立設計レビューは **REVISE**。本改訂は coordinator 判断を優先して
 P1-1 の過剰な同定を撤去し、P1-2 の既存 book operation owner への統合、P2 の失効入口を
@@ -270,6 +270,9 @@ R4の独立設計レビュー前は製品への接続を停止した。現在は
 
 ## 7. R4: 追加中の対象本への自動観測をAppend終端へ配送 (2026-10-12利用者決定、2026-10-13改訂)
 
+自動観測とreceiptの契約は維持する。R7ではmetadata／画像の順序だけを§7.7へ改訂し、
+独立metadata worker／`AppendFilesWritten`の二段引渡しは撤去する。
+
 ### コードから判明した通常経路
 
 `App::check_external_folder_changes`は、現在の実folderのmtime、またはwatcherのNotifiedを
@@ -339,7 +342,7 @@ boundedな記録とし、別のreceiver／App pending／「append監視停止」
 
 ### 7.3 metadata copy終端の全構成照合
 
-ファイル書込み → `AppendFilesWritten` → metadata copy → 最終構成照合の間は、
+R7では各destinationのmetadata初期化 → 画像作成を繰り返し → 最終構成照合の間は、
 **同じ `book_op_pending` のAppend intent／operation IDを保持する**。pollでreceiverを交代するとき
 pendingを一旦消して自動採用の入口を開けない。全構成の列挙・stamp取得・DB copyはworkerで行う。
 
@@ -420,7 +423,7 @@ metadata copy失敗・部分write・worker切断はtokenなし、生成済みfil
 - cutoff後の通知、copy失敗・scan不成立・worker切断で観測を一般経路へ返す。permanent delete0件、
   PostDeleteItemの実移動結果による成功pathだけのpurgeというR3回帰も維持。
 
-**R4提出時はここで停止した。R4設計はACCEPTだが、実装で§7.7の通常書込み順序の前提矛盾が判明し、設計判断のため停止している。ごみ箱方式の再承認は不要。**
+**R4提出時はここで停止した。R7の設計担当判断で書込み順序を確定し、実装・対象検証と確認用buildを完了した。全体gateの未成功は§7.9に記録する。ごみ箱方式の再承認は不要。**
 R4提出時点では追加・実行テスト0件、build0件、アプリ起動0回、コミット0件で、退役試作は再適用しなかった。
 これを現在の実装・検証の完了証拠として扱わない。
 
@@ -454,10 +457,10 @@ Undo受付はその元contextで行う。readonly取消は同じ本の旧scan／
 fullscreen終了等でreceiptが失効してもdeferred更新は一般causeへ返す。Undoによる取消と、
 通常失効後の最新表示更新を混同しない。新しいpending owner・Busy理由・時間窓は追加しない。
 
-### 7.7 実装で判明した後続編集の正本上書き（設計判断停止点、2026-10-13）
+### 7.7 R7: metadata初期化をファイル公開前へ移す（設計担当決定、2026-10-13）
 
-R4の「追加中も通常の明示reload／openとタグ・★・編集を受け付ける」と、ファイル作成後に
-八つのmetadata storeを独立workerで初期化する現実装は、書込みの順序を保証できない。
+WIP `3e8178b31` の「追加中も通常の明示reload／openとタグ・★・編集を受け付ける」と、ファイル作成後に
+八つのmetadata storeを独立workerで初期化する実装は、書込みの順序を保証できなかった。
 これは通常操作で到達でき、まれな失敗の割り切り対象ではない。独立実装レビューもP1／REVISEと確認した。
 
 具体的な順序は次のとおり。
@@ -476,17 +479,48 @@ local-adjust fenceもhandoff前のそのworkerのjobを待つだけで、後続d
 受付key追加はtokenやcacheの保護には使えるが、正本DBの上書きを防ぐ十分条件ではない。
 実装調査で見つかったexact destination cache更新は候補として残したが、全体の正しさの証明とは扱わない。
 
-次のどちらかの所有／公開境界を設計し、通常操作の費用を確認して独立レビューを受ける必要がある。
+WIP `3e8178b31` の上記P1／P2に対し、設計担当ClaudeCodeが次のR7を決定した。
+最初の調査で八storeすべてに`open_at`と同期copy／remove APIがあり、コピー先初期化に
+別ownerのFIFOを必須とするstoreはないと確認した。独立の早期構造レビューもACCEPT。
 
 | 方針 | 構造と通常操作への費用 |
 | --- | --- |
-| metadata完成まで新ページを公開しない | 既存Append ownerでファイル作成・metadata初期化・公開を一体化し、未完成destinationへの後続編集の組合せを除く。staging等の安全な物理公開、外部変更、部分失敗の境界を再設計する。明示reloadでも追加途中の新ページが現れないという表示時期の変更がある |
-| metadata初期化と後続destination書込みを序列化する | 八storeの初期化と後続ユーザー書込みを同じ所有／順序境界へ接続する。途中ページを開ける既存操作は維持するが、同期ratingや別workerを含む広い構造変更になる。古いreportの採用資格も同じ順序から決める |
+| metadata完成まで新ページを公開しない（採用） | 各destinationについて、八storeの初期化を同じAppend workerで同期完了し、その後に画像を`create_new`する。ファイルの出現を公開点にし、stagingは作らない。明示reloadで見える途中ページも既にmetadata完成済みとなる |
+| metadata初期化と後続destination書込みを序列化する（不採用） | 同期rating・別worker・他storeの通常書込みを広い共通ownerへ接続する必要がある。公開前に初期化すれば競合の組合せ自体を除けるため、新しい序列化owner／受付cutを導入する費用は不要 |
 
-現R4にはこの共通境界がなく、実装判断で新しいAppend Busy、画面露出の禁止、専用pending owner、
-rollback、時間窓を追加しない。今回の作業ツリーは実装候補・未完了のまま保持し、設計判断待ちとする。
-既知の正本上書き欠陥を残したまま最終full gate／確認用buildを完了証拠として提出しない。
-§1.375 R6はこの書込み所有とは独立した設計提出であり、表示比較方式の実装は始めていない。
+Appendの順序は以下で固定する。
+
+1. 受付で既存local-adjust writerのsource fenceと有効storeの情報を捕捉する。待機は同じAppend
+   workerだけで行い、UIに同期I/O／待ちを加えない。sourceタグの既存非同期FIFOについて、
+   今回新しい受付時snapshot保証は追加しない。
+2. 接続をAppend内で一回開き、各destinationの古いmetadataを初期化する。コピー対象のない値や
+   source rowの不在も既存remove APIで空へ確定し、Full copy／Semantic copyの既存範囲を保つ。
+3. そのdestinationの全store commitとepoch終端を完了してから`write_source`で画像を作る。
+   全Appendを一つのactive epochにせず、公開済みページの明示閲覧・後続編集を妨げない。
+4. 後続編集はファイル出現後なので、必ず初期化より後になる。画像ごとの未完成metadataと
+   その画像へのユーザー編集の組合せがなくなる。独立`book-append-metadata` workerと
+   `AppendFilesWritten`引渡しを撤去し、同じAppend ownerでreceiptの構成照合まで完了する。
+5. copy reportは変更キー・エラー・DB所要時間だけを返す。★・タグ・六種presenceの古い値を
+   UI終端からcacheへ書かず、新しいreport採用cut／資格台帳は作らない。
+
+通常の初回読込／明示reloadで新ページを見つけた時点で、DB初期化は済んでいるため既存の
+読込経路が現在値を取得する。mounted／parkedの後続編集cache・draftを終端で消去しない。
+件数等の既存派生cacheは通常の失効へ戻す。
+六つのApp-global編集存在集合には通常のphysical読込とは別のrollup用途があるため、変更キーだけを
+既存`PageEditSnapshot::load_and_project_stable`で現在DBからworker再取得する。このreadonly準備は
+copy reportと分離し、既存Append／refresh receiverが所有する。既存`PAGE_EDIT_WRITES`のstampで
+通常staleを拒否し同じreceiverで再準備する。新しいgeneration／受付cut／pending owner／Busyは追加しない。
+UI採用は対象keyのglobal存在集合だけに限定し、全体集合・contextの編集値／rating／tag cache・
+draftを置換しない。既存の保存待ちlocal-adjust keyは現在の受付済みpresenceを保ち、完了consumerへ任せる。
+readerのDB失敗はログ・通知して終端にし、まれな失敗のretry・回復待ちを追加しない。
+
+初期化失敗ならその画像を作らず既存エラー通知へ返す。初期化後の画像作成失敗では、存在しない
+destination keyの行を残す。既存orphan整理に任せ、新しいrollbackを作らない。
+これは**既定の割り切り方針による**。既に成功したページとsourceは削除しない。
+新しい番号付きファイルのkeyに残った古い行の上書きは設計担当承認済みである。
+DB時間は接続開始と各画像の初期化を計測し、1／100／1000枚で旧store単位のcopy相当と比較する。
+大量追加で通常操作の目立つ遅延が判明した場合は、最終完了扱いにせず設計担当へ返す。
+§1.375は別の独立再レビュー対象で、R7では変更しない。
 
 再設計の受入回帰では、制御channelでコピー前／コピー後／UI結果poll前の順序を固定する。
 明示reloadで新ページを開き、★変更・0への解除、タグ追加・削除・全解除、六つの画像編集storeの
@@ -494,7 +528,7 @@ rollback、時間窓を追加しない。今回の作業ツリーは実装候補
 検査する。sourceの同時編集、別destination、無関係な兄弟のdraft、部分copy失敗も対照にする。
 後着reportだけを抑止する試験を、正本の書込み順序の受入証拠として代用しない。
 
-### 7.8 停止checkpointの検証記録（2026-10-13）
+### 7.8 WIP `3e8178b31` 停止checkpointの検証記録（2026-10-13、R7以前の履歴）
 
 - 対象`section1373`は50件成功・失敗0件。途中のfixture不備2件を修正して同じ50件を再実行した。
   新規Undo、receipt／構成、Shell実移動結果、後続入力、Remote先着順、F12→Main実採用、
@@ -518,10 +552,97 @@ rollback、時間窓を追加しない。今回の作業ツリーは実装候補
 [context audit](../target/section1373-checkpoint-audit-final.log)。
 core check後のソース変更はfixture／audit登録のみで、製品codeは変えていない。
 
-### 退役記録と再開範囲
+### 7.9 R7の実装・検証記録（2026-10-13）
+
+八storeの同期APIを同じAppend workerへ接続し、各destinationについてmetadata初期化完了後に
+画像を作成する。独立metadata workerと`AppendFilesWritten`は撤去した。copy reportは変更key・
+エラー・DB時間だけを持ち、後続編集の値を終端でcacheへ上書きしない。現在DBからの六種presence
+読込は既存receiver／epochへ接続し、保存待ちのlocal-adjust keyとmounted／parkedのcache・draftを保つ。
+R7の独立実装レビューはACCEPT（P1／P2なし）。§1.375の製品code・設計・manualは変更していない。
+
+WIP `3e8178b31`からの変更は13ファイル。実装・試験は`src/books.rs`、
+`src/book_append_undo.rs`、`src/app.rs`、`src/app/book_append_refresh.rs`、
+`src/app/book_append_undo.rs`、`src/app/viewer_context_registry.rs`、`src/app/tests.rs`、
+`tools/viewer_context_audit/src/lib.rs`の8ファイル。文書は本書、`docs/README.md`、
+`docs/architecture-overview.md`、`docs/compile-book-plan.md`、
+`docs/next-release-backlog.md`の5ファイル。
+
+- `section1373`は58件成功・失敗0件。制御channelでmetadata前／画像作成前／公開後／結果poll前の
+  順序を固定し、八storeの後続追加・解除、sourceの後続変更、別destination、作成失敗のorphanを検査。
+  mounted／parked cache、実Append終端の現在DB読込、stale再準備、保存待ちpresenceの保持も含む。
+- `books::tests`は48件成功・失敗0件。上記との重複3件を除き、targetedは103種類・106実行が成功。
+- 通常／portableのcore cargo check、cargo fmt --all -- --check、git diff --checkが成功。
+  viewer_context_auditは違反0件、UI glyph検査は危険文字0件。退役したcache publication APIの
+  audit登録だけを外し、auditの検出規則は変更していない。
+- build-devは成功し、通常profileのcore／Remote／EPUB workerを生成した。build-releaseも成功し、
+  core／Remote／EPUB worker／launcherとruntime・embedded PE検査が通った。両buildは
+  `-PreserveRuntime`を使用し、常駐アプリ／通常profileのcacheを変更していない。
+  アプリ起動0回・コミット0件。build後の変更は静的検査と文書だけで、製品codeは変えていない。
+
+**全体検証の前提矛盾により、full成功として引き渡さない。** `test-full.ps1`は1回だけ実行した
+（44分09秒、EXIT 101）。core以外のworkspaceは1,215件成功・失敗0件・ignored 7件。
+coreの12,274件は最終集計に達していないため、その成功件数を推測しない。
+
+- coreログには既存2件のFAILEDが出た。close／retireの静的検査はWIPで処理が共有helperへ移った後も
+  wrapperだけを読んでいた。wrapperのManual委譲とretire前closure内の実completionを検査するよう
+  `src/app/tests.rs`を追従し、従来のWindows素close禁止・残余context終端・呼出箇所数を維持。
+  独立補完レビューはACCEPT、単独補完は1件成功・失敗0件。
+- `visibility_external_rescan_restores_semantic_cursor_after_actual_hydration`は、変更を加えずに単独補完しても
+  0.41秒で選択位置のassertion（`src/app/tests.rs:487`）に失敗した（0件成功・1件失敗）。5秒の
+  hydration期限超過ではない。Appendを開始せず、通常load／rescan／sidecar hydrationだけを通る。
+  R7のworker／presence reader／book pending guardとの直接交差がないことを独立読取で確認した。
+  この通常一覧更新の回帰が成立しないことを前提矛盾として設計担当へ返し、未レビューの§1.375の
+  更新処理や共通hydrationの所有をこのR7で変更しない。原因・修正方針の確定は未完了。
+- coreの最後に既存HTTP期限試験だけが残り、試験用TCPサーバーの無期限`accept`待ちで終了できなかった。
+  `src/clipboard_capture/fetch_tests.rs`のfixtureは期待回数の接続を受けるまで待つが、期限切れで
+  後続接続が来なければ`server.join()`も終わらない。自分のharnessのexact executable pathを照合し、
+  loopback待受1個／接続中clientなしを確認後、そのPIDだけを停止して残りworkspaceを完走させた。
+  この中断を製品のcrashやテストPASSと扱わない。HTTP試験は無変更の単独補完で1件成功（1.43秒）。
+  全体実行時のfixture停止を単独成功で置き換えず、Clipboardの製品code／fixtureを今回修正しない。
+- workspace非成功のためfullから未到達だったvendor gateを各1回だけ個別補完。
+  egui 25件、egui-wgpu 11件、eframe 18件が成功（合計54件・失敗0件）。全体再実行は0回。
+
+対象58件＋books 48件の成功とは別に、個別補完3件は2件成功・1件失敗。fullを含まないこれらの
+実行数は109件（108成功・1失敗）、重複を除いた種類数は106件。fullの既存FAILED二件については
+harness中断前にpanic詳細が出なかったため、hydrationの上記assertionは単独補完の結果である。
+
+同じSQLite DBに対し、接続をAppend中に再利用して実初期化時間を計測した。Fullは八storeに
+値があるsourceのコピー、旧方式相当はstore単位のcopyと存在集合読込。通常追加はコピー元metadataの
+mappingがなく、新しい番号付きdestinationの古い値を空へ初期化する場合である。
+
+| 枚数 | R7 Full DB時間／枚 | 旧方式相当／枚 | 差／枚 | R7通常追加DB時間／枚 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 41.472 ms | 17.426 ms | +24.046 ms | 0.466 ms |
+| 100 | 12.615 ms | 13.249 ms | −0.634 ms | 0.227 ms |
+| 1,000 | 12.480 ms | 11.735 ms | +0.745 ms | 0.219 ms |
+
+接続開始はAppend一回につき4.760–6.529 ms。並行buildのあるPCでの非interactive計測で、
+単発1枚は前の測定（R7 12.704 ms／旧11.896 ms）からも大きく変動した。100／1,000枚で見ると
+通常追加の追加費用は約0.22 ms／枚（1,000枚で0.219秒）、Fullの旧方式との差は1,000枚で
+0.745秒、DB部分の約6.3%。画像copy／decodeと実UIの体感時間はこの計測に含めない。
+大量追加で新しい大幅な遅延を示す結果は得られていないが、実機操作の確認とは区別する。
+metadata初期化後の作成失敗はログ・通知で閉じ、残ったorphanに新しいrollbackを作らない。
+これは**既定の割り切り方針による**。
+
+ログ: [対象58件・DB計測](../target/section1373-r7-targeted-complete.log)、
+[books 48件](../target/section1373-r7-books.log)、
+[通常core check](../target/section1373-r7-core.log)、
+[portable core check](../target/section1373-r7-portable.log)、
+[context audit（最終）](../target/section1373-r7-audit-final.log)、
+[確認用build](../target/section1373-r7-build-dev.log)、
+[release build](../target/section1373-r7-build-release.log)、
+[full一回・未成功](../target/section1373-r7-full.log)、
+[close静的検査補完](../target/section1373-r7-seam-followup.log)、
+[hydration単独失敗](../target/section1373-r7-hydration-followup.log)、
+[HTTP単独補完](../target/section1373-r7-http-followup.log)、
+[egui](../target/section1373-r7-vendor-egui.log)、
+[egui-wgpu](../target/section1373-r7-vendor-egui-wgpu.log)、
+[eframe](../target/section1373-r7-vendor-eframe.log)。
+
+### 退役記録と再開範囲（R7以前の履歴）
 
 設計判断前に試作のApp fields／Undo入口／producer gate／typed refresh接続を撤回した。
-撤回時の製品は既存の受付規則を維持した。現在は独立レビューACCEPT後、R4に沿って同じ既存ownerへ接続中。
+撤回時の製品は既存の受付規則を維持した。その後、独立レビューACCEPTを受けてR4に沿って同じ既存ownerへ接続した。
 退役記録は`target/section1373-integration-prototype.patch`と
 `target/section1373-prototype/`の実ファイルcopy。これは未検証の途中差分であり、
 製品仕様の正本・適用済み変更・検証証跡とは扱わない。
@@ -529,6 +650,6 @@ core check後のソース変更はfixture／audit登録のみで、製品codeは
 案の採否と費用は上記の利用者決定で確定済み。独立レビューでは§7.1–7.5の入口、先着scan、
 終端照合、deferred refreshへのID引渡しを確認する。退役差分をそのまま製品へ戻さない。
 
-退役前の worker／receipt／Shell 部分は独立コードレビューで重要所見なし。App接続は
-未完成・未検証であり、この部分レビューを製品の§1.373全体 ACCEPTとは扱わない。
+退役前の worker／receipt／Shell 部分は独立コードレビューで重要所見なし。当時のApp接続は
+未完成・未検証であり、この部分レビューを製品の§1.373全体 ACCEPTとは扱わなかった。
 瞬間的な同stamp差替えは既定の割り切り方針による。撤回時の製品差分には新Undo入口を残さなかった。

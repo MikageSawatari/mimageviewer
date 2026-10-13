@@ -101932,30 +101932,49 @@ fn the_close_and_retire_seam_finishes_the_transition_it_starts() {
 
     // rustfmt 済みなので、メソッドの終わりはインデント 4 の閉じ括弧の行。
     // 改行コードに依存しないよう行単位で切り出す。
-    const NEWLINE: &str = "
-";
-    let mut body = String::new();
-    let mut inside = false;
-    for line in src.lines() {
-        if line.contains("fn take_and_close_current_active_viewer_context(") {
-            inside = true;
-        }
-        if inside {
-            body.push_str(line);
-            body.push_str(NEWLINE);
-            if line == "    }" {
-                break;
+    let method_body = |name: &str| {
+        let start = format!("fn {name}(");
+        let mut body = String::new();
+        let mut inside = false;
+        for line in src.lines() {
+            if line.contains(&start) {
+                inside = true;
+            }
+            if inside {
+                body.push_str(line);
+                body.push('\n');
+                if line == "    }" {
+                    break;
+                }
             }
         }
-    }
+        assert!(!body.is_empty(), "seam {name} が見つからない");
+        body
+    };
+    // §1.373 の metadata 境界を持つ共有 seam へ移った後も、通常 close は
+    // Manual 境界でそこへ配送され、実際の retire closure が終端を完遂する。
+    let wrapper = method_body("take_and_close_current_active_viewer_context");
     assert!(
-        !body.is_empty(),
-        "seam が見つからない (改名したならこの検査も更新する)"
+        wrapper
+            .contains("self.take_and_close_current_active_viewer_context_with_metadata_boundary(")
+            && wrapper.contains("FsMetadataBoundary::Manual"),
+        "通常 close が metadata 境界付きの共有 seam を通っていない"
     );
+    let body = method_body("take_and_close_current_active_viewer_context_with_metadata_boundary");
     let body = body.as_str();
+    let terminal_closure = body
+        .split_once("self.close_and_retire_context(")
+        .expect("共有 seam が close-and-retire owner を通っていない")
+        .1
+        .split_once("|app| {")
+        .expect("retire 前の terminal closure がない")
+        .1
+        .split_once("|context| ClosedBookmarkSummary::read(")
+        .expect("retire 後の bookmark 読込がない")
+        .0;
 
     assert!(
-        body.contains("close_fullscreen_to_completion"),
+        terminal_closure.contains("app.close_fullscreen_to_completion(ctx)"),
         "遷移中に TerminalClose を出しただけで context を捨てている。 この closure を抜けた直後に bundle は retire されるので、 effects を実行する「後で」が無い"
     );
     // 非 Windows には遷移そのものが無いので、そちらの素の呼び出しは正しい。

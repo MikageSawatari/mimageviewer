@@ -48,177 +48,191 @@ pub(crate) struct AppendMetadataStores {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct BookAppendMetadataCopySummary {
+    /// All fields describe changed keys, including destinations cleared to empty.
     pub adjusted: Vec<String>,
     pub local_adjusted: Vec<String>,
     pub cropped: Vec<String>,
     pub erased: Vec<String>,
     pub concealed: Vec<String>,
     pub annotated: Vec<String>,
-    /// Worker-confirmed destination values, including empty/zero results.
-    pub ratings: std::collections::HashMap<String, u8>,
-    pub tags: std::collections::HashMap<String, Vec<String>>,
+    /// Changed destination keys only. Values and presence must be read from
+    /// the current stores, since users can edit a page before this report polls.
+    pub ratings: Vec<String>,
+    pub tags: Vec<String>,
     pub errors: Vec<String>,
+    pub database_elapsed: std::time::Duration,
 }
 
-pub(crate) fn copy_append_metadata_at(
-    data_dir: &Path,
-    summary: &mut crate::books::BookAppendSummary,
-    stores: AppendMetadataStores,
-) {
-    let mappings = |values: &[crate::books::BookPathMapping]| {
-        values
-            .iter()
-            .filter_map(|mapping| {
-                let from = crate::adjustment_db::normalize_path(&mapping.from);
-                let to = crate::adjustment_db::normalize_path(&mapping.to);
-                (from != to).then_some((from, to))
-            })
-            .collect::<Vec<_>>()
-    };
-    let edits = mappings(&summary.edit_copies);
-    let mut semantic = mappings(&summary.semantic_copies);
-    semantic.extend(edits.iter().cloned());
-    let keys = edits.iter().map(|(_, to)| to.clone()).collect::<Vec<_>>();
-    let key_refs = keys.iter().map(String::as_str).collect::<Vec<_>>();
-    let semantic_keys = semantic
-        .iter()
-        .map(|(_, to)| to.clone())
-        .collect::<Vec<_>>();
-    let report = &mut summary.metadata_copy;
-    // Existing copy helpers publish the same epochs as their UI predecessors.
-    // One epoch around the whole batch keeps readers from observing a half copy.
-    let _edit_epoch = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
-    let _rating_epoch = crate::rating_db::RATING_WRITES.begin();
-    let _tag_epoch = crate::tags_db::TAG_WRITES.begin();
-    macro_rules! copy_store {
-        ($enabled:expr, $name:literal, $db:ty, $pairs:expr, $method:ident, $after:expr) => {
-            if $enabled && !$pairs.is_empty() {
-                let path = data_dir.join(concat!($name, ".db"));
-                // Never silently recreate a store that disappeared after UI capture.
-                match fs::metadata(&path)
-                    .map_err(|error| error.to_string())
-                    .and_then(|_| <$db>::open_at(&path).map_err(|error| error.to_string()))
-                {
-                    Ok(mut db) => {
-                        #[allow(unused_mut)]
-                        let db = &mut db;
-                        for (from, to) in &$pairs {
-                            if let Err(error) = db.$method(from, to) {
-                                report.errors.push(format!("{}: {error}", $name));
-                            }
-                        }
-                        ($after)(db, report);
-                    }
-                    Err(error) => report.errors.push(format!("{}: {error}", $name)),
+impl AppendMetadataStores {
+    /// Worker-only discovery for entry points without an App store snapshot.
+    pub(crate) fn existing_at(data_dir: &Path) -> Self {
+        Self {
+            adjustment: data_dir.join("adjustment.db").is_file(),
+            local_adjust: data_dir.join("local_adjust.db").is_file(),
+            crop: data_dir.join("export_crop.db").is_file(),
+            mask: data_dir.join("mask.db").is_file(),
+            conceal: data_dir.join("conceal.db").is_file(),
+            comic: data_dir.join("comic.db").is_file(),
+            rating: data_dir.join("rating.db").is_file(),
+            tags: data_dir.join("tags.db").is_file(),
+        }
+    }
+}
+
+/// Connections belong to the existing Append worker and are reused for every
+/// destination. Metadata commits precede creation of the discoverable image.
+/// There is no later metadata initializer that can overwrite a user's edit.
+pub(crate) struct AppendMetadataWriter {
+    adjustment: Option<crate::adjustment_db::AdjustmentDb>,
+    local_adjust: Option<crate::local_adjust_db::LocalAdjustDb>,
+    crop: Option<crate::export_crop::CropDb>,
+    mask: Option<crate::mask_db::MaskDb>,
+    conceal: Option<crate::conceal_db::ConcealDb>,
+    comic: Option<crate::comic_db::ComicDb>,
+    rating: Option<crate::rating_db::RatingDb>,
+    tags: Option<crate::tags_db::TagsDb>,
+    report: BookAppendMetadataCopySummary,
+}
+
+impl AppendMetadataWriter {
+    pub(crate) fn open_at(data_dir: &Path, stores: AppendMetadataStores) -> Result<Self, String> {
+        let started = std::time::Instant::now();
+        macro_rules! open_store {
+            ($enabled:expr, $name:literal, $db:ty) => {
+                if $enabled {
+                    let path = data_dir.join(concat!($name, ".db"));
+                    // A captured store must still exist: never recreate lost data.
+                    fs::metadata(&path)
+                        .map_err(|error| metadata_initialization_error($name, error))?;
+                    Some(
+                        <$db>::open_at(&path)
+                            .map_err(|error| metadata_initialization_error($name, error))?,
+                    )
+                } else {
+                    None
                 }
-            }
+            };
+        }
+        let mut writer = Self {
+            adjustment: open_store!(
+                stores.adjustment,
+                "adjustment",
+                crate::adjustment_db::AdjustmentDb
+            ),
+            local_adjust: open_store!(
+                stores.local_adjust,
+                "local_adjust",
+                crate::local_adjust_db::LocalAdjustDb
+            ),
+            crop: open_store!(stores.crop, "export_crop", crate::export_crop::CropDb),
+            mask: open_store!(stores.mask, "mask", crate::mask_db::MaskDb),
+            conceal: open_store!(stores.conceal, "conceal", crate::conceal_db::ConcealDb),
+            comic: open_store!(stores.comic, "comic", crate::comic_db::ComicDb),
+            rating: open_store!(stores.rating, "rating", crate::rating_db::RatingDb),
+            tags: open_store!(stores.tags, "tags", crate::tags_db::TagsDb),
+            report: Default::default(),
         };
+        writer.report.database_elapsed = started.elapsed();
+        Ok(writer)
     }
-    copy_store!(
-        stores.adjustment,
-        "adjustment",
-        crate::adjustment_db::AdjustmentDb,
-        edits,
-        copy_page_params_key,
-        |db: &mut crate::adjustment_db::AdjustmentDb,
-         report: &mut BookAppendMetadataCopySummary| {
-            report
-                .adjusted
-                .extend(db.load_page_params_many(&key_refs).into_keys());
+
+    pub(crate) fn prepare_destination(
+        &mut self,
+        destination: &Path,
+        full_source: Option<&Path>,
+        semantic_source: Option<&Path>,
+    ) -> Result<(), String> {
+        let started = std::time::Instant::now();
+        let to = crate::adjustment_db::normalize_path(destination);
+        let full = full_source.map(crate::adjustment_db::normalize_path);
+        let semantic = semantic_source
+            .or(full_source)
+            .map(crate::adjustment_db::normalize_path);
+        // Preserve each store's global write epoch and publish all eight
+        // committed initial values before the physical file becomes visible.
+        let has_edit_store = self.adjustment.is_some()
+            || self.local_adjust.is_some()
+            || self.crop.is_some()
+            || self.mask.is_some()
+            || self.conceal.is_some()
+            || self.comic.is_some();
+        let _edit_epoch =
+            has_edit_store.then(|| crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin());
+        let _rating_epoch = self
+            .rating
+            .as_ref()
+            .map(|_| crate::rating_db::RATING_WRITES.begin());
+        let _tag_epoch = self
+            .tags
+            .as_ref()
+            .map(|_| crate::tags_db::TAG_WRITES.begin());
+        macro_rules! initialize_store {
+            ($field:ident, $name:literal, $clear:ident, $copy:ident, $source:expr, $changed:ident) => {
+                if let Some(db) = self.$field.as_mut() {
+                    db.$clear(&to)
+                        .map_err(|error| metadata_initialization_error($name, error))?;
+                    if let Some(from) = $source.as_deref() {
+                        db.$copy(from, &to)
+                            .map_err(|error| metadata_initialization_error($name, error))?;
+                    }
+                    self.report.$changed.push(to.clone());
+                }
+            };
         }
-    );
-    copy_store!(
-        stores.local_adjust,
-        "local_adjust",
-        crate::local_adjust_db::LocalAdjustDb,
-        edits,
-        copy_entry_key,
-        |db: &mut crate::local_adjust_db::LocalAdjustDb,
-         report: &mut BookAppendMetadataCopySummary| {
-            report
-                .local_adjusted
-                .extend(db.load_existing_layer_keys(&keys));
-        }
-    );
-    copy_store!(
-        stores.crop,
-        "export_crop",
-        crate::export_crop::CropDb,
-        edits,
-        copy_entry_key,
-        |db: &mut crate::export_crop::CropDb, report: &mut BookAppendMetadataCopySummary| {
-            report.cropped.extend(db.load_many(&key_refs).into_keys());
-        }
-    );
-    copy_store!(
-        stores.mask,
-        "mask",
-        crate::mask_db::MaskDb,
-        edits,
-        copy_entry_key,
-        |db: &mut crate::mask_db::MaskDb, report: &mut BookAppendMetadataCopySummary| {
-            report.erased.extend(db.load_existing_mask_keys(&key_refs));
-        }
-    );
-    copy_store!(
-        stores.conceal,
-        "conceal",
-        crate::conceal_db::ConcealDb,
-        edits,
-        copy_entry_key,
-        |db: &mut crate::conceal_db::ConcealDb, report: &mut BookAppendMetadataCopySummary| {
-            report
-                .concealed
-                .extend(db.load_existing_conceal_keys(&key_refs));
-        }
-    );
-    copy_store!(
-        stores.comic,
-        "comic",
-        crate::comic_db::ComicDb,
-        edits,
-        copy_entry_key,
-        |db: &mut crate::comic_db::ComicDb, report: &mut BookAppendMetadataCopySummary| {
-            report
-                .annotated
-                .extend(db.load_existing_comic_keys(&key_refs));
-        }
-    );
-    copy_store!(
-        stores.rating,
-        "rating",
-        crate::rating_db::RatingDb,
-        semantic,
-        copy_entry_key,
-        |db: &mut crate::rating_db::RatingDb, report: &mut BookAppendMetadataCopySummary| {
-            let mut ratings = db.get_many(&semantic_keys);
-            for key in &semantic_keys {
-                ratings.entry(key.clone()).or_insert(0);
+        initialize_store!(
+            adjustment,
+            "adjustment",
+            remove_page_params,
+            copy_page_params_key,
+            full,
+            adjusted
+        );
+        initialize_store!(
+            local_adjust,
+            "local_adjust",
+            remove_layers,
+            copy_entry_key,
+            full,
+            local_adjusted
+        );
+        initialize_store!(crop, "export_crop", remove, copy_entry_key, full, cropped);
+        initialize_store!(mask, "mask", delete, copy_entry_key, full, erased);
+        initialize_store!(conceal, "conceal", delete, copy_entry_key, full, concealed);
+        initialize_store!(comic, "comic", delete, copy_entry_key, full, annotated);
+        if let Some(db) = self.rating.as_mut() {
+            db.set(&to, 0)
+                .map_err(|error| metadata_initialization_error("rating", error))?;
+            if let Some(from) = semantic.as_deref() {
+                db.copy_entry_key(from, &to)
+                    .map_err(|error| metadata_initialization_error("rating", error))?;
             }
-            report.ratings.extend(ratings);
+            self.report.ratings.push(to.clone());
         }
-    );
-    copy_store!(
-        stores.tags,
-        "tags",
-        crate::tags_db::TagsDb,
-        semantic,
-        copy_item_key,
-        |db: &mut crate::tags_db::TagsDb, report: &mut BookAppendMetadataCopySummary| {
-            let mut tags = db.get_many_display_tags(&semantic_keys);
-            for key in &semantic_keys {
-                tags.entry(key.clone()).or_default();
+        if let Some(db) = self.tags.as_mut() {
+            if let Some(from) = semantic.as_deref() {
+                db.copy_item_key(from, &to)
+                    .map_err(|error| metadata_initialization_error("tags", error))?;
+            } else {
+                // Match a newly numbered page's original unset-tag semantics;
+                // do not create an EDIT decision for a source without tags.
+                db.prune_items(std::slice::from_ref(&to))
+                    .map_err(|error| metadata_initialization_error("tags", error))?;
             }
-            report.tags.extend(tags);
+            self.report.tags.push(to);
         }
-    );
-    if !report.errors.is_empty() {
-        summary.undo_files = None;
-        for error in &report.errors {
-            crate::logger::log(format!("[book-append-undo] metadata copy: {error}"));
-        }
+        self.report.database_elapsed += started.elapsed();
+        Ok(())
     }
-    finalize_append_receipt(summary);
+
+    pub(crate) fn finish(self) -> BookAppendMetadataCopySummary {
+        self.report
+    }
+}
+
+fn metadata_initialization_error(store: &str, error: impl std::fmt::Display) -> String {
+    let error = format!("ページのメタデータを初期化できません: {store}: {error}");
+    crate::logger::log(format!("[book-append-undo] {error}"));
+    error
 }
 
 #[derive(Clone, Debug)]
@@ -681,11 +695,7 @@ mod tests {
             metadata_copy: Default::default(),
         };
         fs::write(fixture.folder.join("physical-sidecar"), b"external").unwrap();
-        copy_append_metadata_at(
-            fixture.tmp.path(),
-            &mut summary,
-            AppendMetadataStores::default(),
-        );
+        finalize_append_receipt(&mut summary);
         assert!(summary.undo_files.is_none());
         assert_eq!(summary.added, 1);
         assert!(summary.first_path.unwrap().exists());
@@ -803,101 +813,351 @@ mod tests {
     fn section1373_metadata_copy_preserves_full_edit_and_semantic_only_routes() {
         let fixture = Fixture::new();
         let data = fixture.tmp.path().join("data");
-        fs::create_dir(&data).unwrap();
-        let receipt = fixture.receipt(2);
+        let mut dbs = append_test_support::TestMetadata::open(&data);
         let source = crate::adjustment_db::normalize_path(&fixture.source);
-        let full = crate::adjustment_db::normalize_path(&receipt.files.created[0].path);
-        let semantic = crate::adjustment_db::normalize_path(&receipt.files.created[1].path);
-        let adjustments =
-            crate::adjustment_db::AdjustmentDb::open_at(&data.join("adjustment.db")).unwrap();
-        adjustments
-            .set_page_params(&source, &crate::adjustment::AdjustParams::default())
+        dbs.set_all(&source, 4);
+        let full_path = fixture.folder.join("0001_full.jpg");
+        let semantic_path = fixture.folder.join("0002_semantic.jpg");
+        let full = crate::adjustment_db::normalize_path(&full_path);
+        let semantic = crate::adjustment_db::normalize_path(&semantic_path);
+        // Old rows for nonexistent destinations may be overwritten. Semantic
+        // copies must clear baked image edits rather than applying them twice.
+        dbs.set_all(&full, 2);
+        dbs.set_all(&semantic, 2);
+        let mut writer = AppendMetadataWriter::open_at(&data, dbs.stores()).unwrap();
+        writer
+            .prepare_destination(&full_path, Some(&fixture.source), None)
             .unwrap();
-        let ratings = crate::rating_db::RatingDb::open_at(data.join("rating.db")).unwrap();
-        ratings.set(&source, 4).unwrap();
-        let mut tags = crate::tags_db::TagsDb::open_at(&data.join("tags.db")).unwrap();
-        tags.set_item_tags(&source, ["copied"], "test").unwrap();
-        let mut summary = crate::books::BookAppendSummary {
-            book_name: "book".into(),
-            folder: fixture.folder.clone(),
-            added: 2,
-            first_path: Some(receipt.files.created[0].path.clone()),
-            edit_copies: vec![crate::books::BookPathMapping {
-                from: fixture.source.clone(),
-                to: receipt.files.created[0].path.clone(),
-            }],
-            semantic_copies: vec![crate::books::BookPathMapping {
-                from: fixture.source.clone(),
-                to: receipt.files.created[1].path.clone(),
-            }],
-            erase_fallback_pages: 0,
-            undo_files: Some(receipt.files),
-            metadata_copy: Default::default(),
-        };
-        copy_append_metadata_at(
-            &data,
-            &mut summary,
-            AppendMetadataStores {
-                adjustment: true,
-                rating: true,
-                tags: true,
-                ..Default::default()
-            },
-        );
-        assert!(
-            summary.metadata_copy.errors.is_empty(),
-            "{:?}",
-            summary.metadata_copy.errors
-        );
-        assert_eq!(summary.metadata_copy.adjusted, [full.clone()]);
-        assert!(adjustments.get_page_params(&full).is_some());
-        assert!(adjustments.get_page_params(&semantic).is_none());
-        assert_eq!(ratings.get(&full), 4);
-        assert_eq!(ratings.get(&semantic), 4);
-        assert_eq!(summary.metadata_copy.ratings.get(&full), Some(&4));
-        assert_eq!(summary.metadata_copy.ratings.get(&semantic), Some(&4));
-        let copied_tags = tags.get_many_display_tags(&[full, semantic]);
-        assert_eq!(summary.metadata_copy.tags, copied_tags);
-        assert_eq!(copied_tags.len(), 2);
-        assert!(
-            copied_tags
-                .values()
-                .all(|tags| tags.iter().map(String::as_str).eq(["#copied"]))
-        );
-        assert!(summary.undo_files.is_some());
+        writer
+            .prepare_destination(&semantic_path, None, Some(&fixture.source))
+            .unwrap();
+        assert!(!full_path.exists());
+        assert!(!semantic_path.exists());
+        dbs.assert_all(&full, Some(4));
+        dbs.assert_edits(&semantic, None);
+        assert_eq!(dbs.rating.get(&semantic), 4);
+        assert_eq!(dbs.tags.display_tags_for_item(&semantic), ["#v4"]);
+        let report = writer.finish();
+        assert_eq!(report.adjusted, [full.clone(), semantic.clone()]);
+        assert_eq!(report.ratings, [full.clone(), semantic.clone()]);
+        assert_eq!(report.tags, [full, semantic]);
+        assert!(report.errors.is_empty());
     }
 
     #[test]
-    fn section1373_missing_metadata_store_disables_receipt_without_recreating_data() {
+    fn section1373_metadata_database_cold_and_warm_per_file_benchmark() {
+        use std::time::Instant;
+        let fixture = Fixture::new();
+        let data = fixture.tmp.path().join("benchmark-data");
+        let mut dbs = append_test_support::TestMetadata::open(&data);
+        let source = crate::adjustment_db::normalize_path(&fixture.source);
+        dbs.set_all(&source, 4);
+        for count in [1usize, 100, 1000] {
+            let cold_started = Instant::now();
+            let mut writer = AppendMetadataWriter::open_at(&data, dbs.stores()).unwrap();
+            let cold = cold_started.elapsed();
+            writer
+                .prepare_destination(
+                    &fixture.folder.join(format!("warm-{count}.jpg")),
+                    Some(&fixture.source),
+                    None,
+                )
+                .unwrap();
+            let started = Instant::now();
+            for number in 0..count {
+                writer
+                    .prepare_destination(
+                        &fixture.folder.join(format!("r7-{count}-{number}.jpg")),
+                        Some(&fixture.source),
+                        None,
+                    )
+                    .unwrap();
+            }
+            let current = started.elapsed();
+            // Old equivalent: one connection per store per append, no per-file
+            // destination reset, store-at-a-time copies and bulk report reads.
+            let baseline_open = Instant::now();
+            let mut baseline = append_test_support::TestMetadata::open(&data);
+            let baseline_cold = baseline_open.elapsed();
+            baseline
+                .tags
+                .copy_item_key(&source, &format!("baseline-warm-{count}"))
+                .unwrap();
+            let keys = (0..count)
+                .map(|number| {
+                    crate::adjustment_db::normalize_path(
+                        &fixture.folder.join(format!("old-{count}-{number}.jpg")),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let key_refs = keys.iter().map(String::as_str).collect::<Vec<_>>();
+            let baseline_started = Instant::now();
+            for key in &keys {
+                baseline
+                    .adjustment
+                    .copy_page_params_key(&source, key)
+                    .unwrap();
+            }
+            for key in &keys {
+                baseline.local_adjust.copy_entry_key(&source, key).unwrap();
+            }
+            for key in &keys {
+                baseline.crop.copy_entry_key(&source, key).unwrap();
+            }
+            for key in &keys {
+                baseline.mask.copy_entry_key(&source, key).unwrap();
+            }
+            for key in &keys {
+                baseline.conceal.copy_entry_key(&source, key).unwrap();
+            }
+            for key in &keys {
+                baseline.comic.copy_entry_key(&source, key).unwrap();
+            }
+            for key in &keys {
+                baseline.rating.copy_entry_key(&source, key).unwrap();
+            }
+            for key in &keys {
+                baseline.tags.copy_item_key(&source, key).unwrap();
+            }
+            assert_eq!(
+                baseline.adjustment.load_page_params_many(&key_refs).len(),
+                count
+            );
+            assert_eq!(
+                baseline.local_adjust.load_existing_layer_keys(&keys).len(),
+                count
+            );
+            assert_eq!(baseline.crop.load_many(&key_refs).len(), count);
+            assert_eq!(
+                baseline.mask.load_existing_mask_keys(&key_refs).len(),
+                count
+            );
+            assert_eq!(
+                baseline.conceal.load_existing_conceal_keys(&key_refs).len(),
+                count
+            );
+            assert_eq!(
+                baseline.comic.load_existing_comic_keys(&key_refs).len(),
+                count
+            );
+            assert_eq!(baseline.rating.get_many(&keys).len(), count);
+            assert_eq!(baseline.tags.get_many_display_tags(&keys).len(), count);
+            let old = baseline_started.elapsed();
+            eprintln!(
+                "section1373 DB files={count} r7_cold_open_ms={:.3} old_cold_open_ms={:.3} r7_warm_total_ms={:.3} r7_warm_us_per_file={:.3} old_warm_total_ms={:.3} old_warm_us_per_file={:.3} delta_us_per_file={:.3}",
+                cold.as_secs_f64() * 1e3,
+                baseline_cold.as_secs_f64() * 1e3,
+                current.as_secs_f64() * 1e3,
+                current.as_secs_f64() * 1e6 / count as f64,
+                old.as_secs_f64() * 1e3,
+                old.as_secs_f64() * 1e6 / count as f64,
+                (current.as_secs_f64() - old.as_secs_f64()) * 1e6 / count as f64,
+            );
+        }
+    }
+
+    #[test]
+    fn section1373_missing_metadata_store_fails_before_output_without_recreating_data() {
         let fixture = Fixture::new();
         let data = fixture.tmp.path().join("missing-data");
-        let receipt = fixture.receipt(1);
-        let mut summary = crate::books::BookAppendSummary {
-            book_name: "book".into(),
-            folder: fixture.folder.clone(),
-            added: 1,
-            first_path: Some(receipt.files.created[0].path.clone()),
-            edit_copies: vec![crate::books::BookPathMapping {
-                from: fixture.source.clone(),
-                to: receipt.files.created[0].path.clone(),
-            }],
-            semantic_copies: Vec::new(),
-            erase_fallback_pages: 0,
-            undo_files: Some(receipt.files),
-            metadata_copy: Default::default(),
-        };
-        copy_append_metadata_at(
+        let result = AppendMetadataWriter::open_at(
             &data,
-            &mut summary,
             AppendMetadataStores {
                 adjustment: true,
                 ..Default::default()
             },
         );
-        assert_eq!(summary.metadata_copy.errors.len(), 1);
-        assert!(summary.undo_files.is_none());
+        assert!(result.is_err());
         assert!(!data.exists());
-        assert!(summary.first_path.unwrap().exists());
         assert!(fixture.source.exists());
+    }
+
+    #[test]
+    fn section1373_plain_page_initialization_preserves_unset_tags_and_measures_database_cost() {
+        use std::time::Instant;
+        let fixture = Fixture::new();
+        let data = fixture.tmp.path().join("plain-perf-data");
+        let mut dbs = append_test_support::TestMetadata::open(&data);
+        let old_key = crate::adjustment_db::normalize_path(&fixture.folder.join("orphan.jpg"));
+        dbs.set_all(&old_key, 3);
+        let mut writer = AppendMetadataWriter::open_at(&data, dbs.stores()).unwrap();
+        writer
+            .prepare_destination(&fixture.folder.join("orphan.jpg"), None, None)
+            .unwrap();
+        dbs.assert_all(&old_key, None);
+        assert!(!dbs.tags.has_item_state(&old_key));
+        for count in [1usize, 100, 1000] {
+            let started = Instant::now();
+            for index in 0..count {
+                writer
+                    .prepare_destination(
+                        &fixture.folder.join(format!("plain-{count}-{index}.jpg")),
+                        None,
+                        None,
+                    )
+                    .unwrap();
+            }
+            let elapsed = started.elapsed();
+            eprintln!(
+                "section1373 DB plain files={count} total_ms={:.3} us_per_file={:.3} old_copy_ms=0 (no mapping)",
+                elapsed.as_secs_f64() * 1e3,
+                elapsed.as_secs_f64() * 1e6 / count as f64
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod append_test_support {
+    use super::*;
+
+    pub(crate) struct TestMetadata {
+        pub adjustment: crate::adjustment_db::AdjustmentDb,
+        pub local_adjust: crate::local_adjust_db::LocalAdjustDb,
+        pub crop: crate::export_crop::CropDb,
+        pub mask: crate::mask_db::MaskDb,
+        pub conceal: crate::conceal_db::ConcealDb,
+        pub comic: crate::comic_db::ComicDb,
+        pub rating: crate::rating_db::RatingDb,
+        pub tags: crate::tags_db::TagsDb,
+    }
+
+    impl TestMetadata {
+        pub(crate) fn open(data: &Path) -> Self {
+            fs::create_dir_all(data).unwrap();
+            Self {
+                adjustment: crate::adjustment_db::AdjustmentDb::open_at(
+                    &data.join("adjustment.db"),
+                )
+                .unwrap(),
+                local_adjust: crate::local_adjust_db::LocalAdjustDb::open_at(
+                    &data.join("local_adjust.db"),
+                )
+                .unwrap(),
+                crop: crate::export_crop::CropDb::open_at(&data.join("export_crop.db")).unwrap(),
+                mask: crate::mask_db::MaskDb::open_at(&data.join("mask.db")).unwrap(),
+                conceal: crate::conceal_db::ConcealDb::open_at(&data.join("conceal.db")).unwrap(),
+                comic: crate::comic_db::ComicDb::open_at(&data.join("comic.db")).unwrap(),
+                rating: crate::rating_db::RatingDb::open_at(data.join("rating.db")).unwrap(),
+                tags: crate::tags_db::TagsDb::open_at(&data.join("tags.db")).unwrap(),
+            }
+        }
+
+        pub(crate) fn stores(&self) -> AppendMetadataStores {
+            AppendMetadataStores {
+                adjustment: true,
+                local_adjust: true,
+                crop: true,
+                mask: true,
+                conceal: true,
+                comic: true,
+                rating: true,
+                tags: true,
+            }
+        }
+
+        pub(crate) fn set_all(&mut self, key: &str, version: u8) {
+            let params = crate::adjustment::AdjustParams {
+                brightness: version as f32,
+                ..Default::default()
+            };
+            self.adjustment.set_page_params(key, &params).unwrap();
+            self.local_adjust
+                .set_layers(
+                    key,
+                    &[local_adjust_core::LocalAdjustmentLayer::new(
+                        format!("v{version}"),
+                        local_adjust_core::LocalMask::Full,
+                        local_adjust_core::LocalEffect::None,
+                    )],
+                )
+                .unwrap();
+            self.crop
+                .set(
+                    key,
+                    crate::export_crop::CropSettings {
+                        rect: crate::export_crop::CropRect {
+                            min_x: version as f32 / 10.0,
+                            min_y: 0.0,
+                            max_x: 0.9,
+                            max_y: 0.9,
+                        },
+                        aspect_mode: Default::default(),
+                        source_size: Some([2, 1]),
+                    },
+                )
+                .unwrap();
+            let bitmap = if version % 2 == 0 {
+                [true, false]
+            } else {
+                [false, true]
+            };
+            self.mask.set(key, &bitmap, &[], 2, 1).unwrap();
+            self.conceal.set(key, &bitmap, &[], 2, 1).unwrap();
+            self.comic
+                .set_raw(
+                    key,
+                    crate::comic_db::DOC_VERSION,
+                    &format!("[{{\"version\":{version}}}]"),
+                )
+                .unwrap();
+            self.rating.set(key, version).unwrap();
+            self.tags
+                .set_item_tags(key, [format!("v{version}")], "test")
+                .unwrap();
+        }
+
+        pub(crate) fn clear_all(&mut self, key: &str) {
+            self.adjustment.remove_page_params(key).unwrap();
+            self.local_adjust.remove_layers(key).unwrap();
+            self.crop.remove(key).unwrap();
+            self.mask.delete(key).unwrap();
+            self.conceal.delete(key).unwrap();
+            self.comic.delete(key).unwrap();
+            self.rating.set(key, 0).unwrap();
+            self.tags.clear_item_tags(key).unwrap();
+        }
+
+        pub(crate) fn assert_edits(&self, key: &str, version: Option<u8>) {
+            if let Some(version) = version {
+                assert_eq!(
+                    self.adjustment.get_page_params(key).unwrap().brightness,
+                    version as f32
+                );
+                assert_eq!(
+                    self.local_adjust.get_layers(key).unwrap()[0].name,
+                    format!("v{version}")
+                );
+                assert_eq!(
+                    self.crop.get(key).unwrap().rect.min_x,
+                    version as f32 / 10.0
+                );
+                let bitmap = if version % 2 == 0 {
+                    vec![true, false]
+                } else {
+                    vec![false, true]
+                };
+                assert_eq!(self.mask.get_full(key, 2, 1).unwrap().0, bitmap);
+                assert_eq!(self.conceal.get_full(key, 2, 1).unwrap().0, bitmap);
+                assert_eq!(
+                    self.comic.get_raw(key).unwrap().1,
+                    format!("[{{\"version\":{version}}}]")
+                );
+            } else {
+                assert!(self.adjustment.get_page_params(key).is_none());
+                assert!(self.local_adjust.get_layers(key).is_none());
+                assert!(self.crop.get(key).is_none());
+                assert!(self.mask.get_full(key, 2, 1).is_none());
+                assert!(self.conceal.get_full(key, 2, 1).is_none());
+                assert!(self.comic.get_raw(key).is_none());
+            }
+        }
+
+        pub(crate) fn assert_all(&self, key: &str, version: Option<u8>) {
+            self.assert_edits(key, version);
+            assert_eq!(self.rating.get(key), version.unwrap_or(0));
+            let expected = version.map(|v| vec![format!("#v{v}")]).unwrap_or_default();
+            assert_eq!(self.tags.display_tags_for_item(key), expected);
+        }
     }
 }
