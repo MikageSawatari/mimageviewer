@@ -54,7 +54,7 @@ const SINGLETON_ENDPOINT_MIGRATION_META_KEY: &str = "singleton_spread_endpoints_
 const REMOTE_LISTING_SETTINGS_SQL: &str = r#"SELECT key, value FROM settings_kv WHERE key IN (
     'file_type_visibility', 'sort_order', 'rating_sort_unrated_position', 'show_hidden_files', 'grid_display_order',
     'archive_file_handling', 'archive_convert_without_dialog', 'epub_file_handling',
-    'skip_zip_if_folder_exists', 'skip_archive_if_zip_exists', 'skip_epub_if_pdf_exists',
+    'same_name_folder_book', 'skip_zip_if_folder_exists', 'skip_archive_if_zip_exists', 'skip_epub_if_pdf_exists',
     'skip_image_if_video_exists', 'video_thumb_use_sidecar_image', 'audio_thumbnail_indicator',
     'skip_duplicate_images', 'image_ext_priority', 'book_root',
     'auto_fullscreen_zip_pdf', 'auto_fullscreen_image_folders',
@@ -301,7 +301,7 @@ pub(crate) struct RemoteListingSettings {
     archive_file_handling: crate::settings::ArchiveFileHandling,
     epub_file_handling: crate::settings::EpubFileHandling,
     archive_convert_without_dialog: bool,
-    skip_zip_if_folder_exists: bool,
+    same_name_folder_book: crate::same_name_folder_book::SameNameFolderBookPolicy,
     skip_archive_if_zip_exists: bool,
     skip_epub_if_pdf_exists: bool,
     skip_image_if_video_exists: bool,
@@ -370,7 +370,7 @@ impl RemoteListingSettings {
             archive_file_handling: settings.archive_file_handling,
             epub_file_handling: settings.epub_file_handling,
             archive_convert_without_dialog: settings.archive_convert_without_dialog,
-            skip_zip_if_folder_exists: settings.skip_zip_if_folder_exists,
+            same_name_folder_book: settings.same_name_folder_book,
             skip_archive_if_zip_exists: settings.skip_archive_if_zip_exists,
             skip_epub_if_pdf_exists: settings.skip_epub_if_pdf_exists,
             skip_image_if_video_exists: settings.skip_image_if_video_exists,
@@ -396,7 +396,7 @@ impl RemoteListingSettings {
         settings.archive_file_handling = self.archive_file_handling;
         settings.epub_file_handling = self.epub_file_handling;
         settings.archive_convert_without_dialog = self.archive_convert_without_dialog;
-        settings.skip_zip_if_folder_exists = self.skip_zip_if_folder_exists;
+        settings.same_name_folder_book = self.same_name_folder_book;
         settings.skip_archive_if_zip_exists = self.skip_archive_if_zip_exists;
         settings.skip_epub_if_pdf_exists = self.skip_epub_if_pdf_exists;
         settings.skip_image_if_video_exists = self.skip_image_if_video_exists;
@@ -1086,6 +1086,51 @@ impl SettingsDb {
         if slots_changed {
             inner.last_saved_vst3_slots = Some(settings.vst3_chain_slots.clone());
         }
+        Ok(())
+    }
+
+    /// Worker-only favorite additions through the existing Settings owner. Other
+    /// fields (including geometry changed while the modal is shown) are preserved.
+    pub(crate) fn copy_folder_zip_favorites(
+        &self,
+        pairs: &[(FavoriteEntry, FavoriteEntry)],
+        phase: crate::image_folder_zip_metadata::CopyPhase,
+    ) -> Result<(), SettingsDbError> {
+        let mut inner = self.inner.lock().map_err(|_| SettingsDbError::Poisoned)?;
+        let tx = inner.conn.transaction()?;
+        let mut current = read_favorites(&tx)?;
+        for (old, new) in pairs {
+            if !current
+                .iter()
+                .any(|f| favorite_entries_equal(std::slice::from_ref(f), std::slice::from_ref(old)))
+            {
+                return Err(SettingsDbError::Corrupted(
+                    "source favorite changed during conversion".into(),
+                ));
+            }
+            if let Some(existing) = current.iter().find(|f| {
+                crate::path_key::normalize_keep_drive(&f.path)
+                    == crate::path_key::normalize_keep_drive(&new.path)
+            }) {
+                if !favorite_entries_equal(
+                    std::slice::from_ref(existing),
+                    std::slice::from_ref(new),
+                ) {
+                    return Err(SettingsDbError::Corrupted(
+                        crate::image_folder_zip_metadata::CONFLICT.into(),
+                    ));
+                }
+            } else {
+                current.push(new.clone());
+            }
+        }
+        if current.len() > crate::settings::MAX_FAVORITES {
+            return Err(SettingsDbError::Corrupted("favorite limit exceeded".into()));
+        }
+        if phase == crate::image_folder_zip_metadata::CopyPhase::Apply {
+            write_favorites(&tx, &current)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -3130,7 +3175,20 @@ fn read_remote_listing_settings(
     let rows = stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    let rows = rows.collect::<Result<Vec<_>, _>>()?;
+    let mut values = serde_json::Map::new();
+    for (key, raw) in rows {
+        values.insert(
+            key,
+            serde_json::from_str(&raw).map_err(classify_settings_deserialization_error)?,
+        );
+    }
+    crate::same_name_folder_book::canonicalize(&mut values)
+        .map_err(SettingsDbError::Incompatible)?;
+    Ok(values
+        .into_iter()
+        .map(|(key, value)| (key, value.to_string()))
+        .collect())
 }
 
 fn apply_remote_listing_setting(
@@ -3153,7 +3211,7 @@ fn apply_remote_listing_setting(
         "archive_file_handling" => assign!(archive_file_handling),
         "epub_file_handling" => assign!(epub_file_handling),
         "archive_convert_without_dialog" => assign!(archive_convert_without_dialog),
-        "skip_zip_if_folder_exists" => assign!(skip_zip_if_folder_exists),
+        "same_name_folder_book" => assign!(same_name_folder_book),
         "skip_archive_if_zip_exists" => assign!(skip_archive_if_zip_exists),
         "skip_epub_if_pdf_exists" => assign!(skip_epub_if_pdf_exists),
         "skip_image_if_video_exists" => assign!(skip_image_if_video_exists),
@@ -5933,6 +5991,117 @@ mod tests {
     }
 
     #[test]
+    fn same_name_folder_book_released_db_and_copied_portable_db_migrate_once() {
+        use crate::same_name_folder_book::{KEY, LEGACY_KEY, SameNameFolderBookPolicy as Policy};
+        for (old, expected) in [(true, Policy::PreferBook), (false, Policy::ShowBoth)] {
+            let source = TempDir::new().unwrap();
+            let portable = TempDir::new().unwrap();
+            {
+                let db = SettingsDb::create_new(source.path()).unwrap();
+                let mut original = Settings::default();
+                original.grid_cols = 9;
+                original
+                    .favorites
+                    .push(FavoriteEntry::new("kept".into(), PathBuf::from("C:/kept")));
+                db.save_full(&original).unwrap();
+                let inner = db.inner.lock().unwrap();
+                inner
+                    .conn
+                    .execute("DELETE FROM settings_kv WHERE key=?1", [KEY])
+                    .unwrap();
+                inner
+                    .conn
+                    .execute(
+                        "INSERT INTO settings_kv(key,value) VALUES(?1,?2)",
+                        params![LEGACY_KEY, old.to_string()],
+                    )
+                    .unwrap();
+                inner
+                    .conn
+                    .execute(
+                        "UPDATE schema_meta SET value='4.5.0' WHERE key='app_version'",
+                        [],
+                    )
+                    .unwrap();
+            }
+            std::fs::copy(
+                source.path().join("settings.db"),
+                portable.path().join("settings.db"),
+            )
+            .unwrap();
+            for dir in [source.path(), portable.path()] {
+                let db = SettingsDb::open(dir).unwrap();
+                let loaded = db.load_into_settings().unwrap();
+                assert_eq!(loaded.same_name_folder_book, expected);
+                assert_eq!(loaded.grid_cols, 9);
+                assert_eq!(loaded.favorites.len(), 1);
+                let mut remote = Settings::default();
+                db.load_remote_listing_settings(&remote)
+                    .unwrap()
+                    .apply_to(&mut remote);
+                assert_eq!(remote.same_name_folder_book, expected);
+                db.save_full(&loaded).unwrap();
+                {
+                    let inner = db.inner.lock().unwrap();
+                    let legacy: i64 = inner
+                        .conn
+                        .query_row(
+                            "SELECT count(*) FROM settings_kv WHERE key=?1",
+                            [LEGACY_KEY],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(legacy, 0);
+                }
+                let mut changed = loaded;
+                changed.same_name_folder_book = Policy::PreferFolder;
+                db.save_full(&changed).unwrap();
+                drop(db);
+                assert_eq!(
+                    SettingsDb::open(dir)
+                        .unwrap()
+                        .load_into_settings()
+                        .unwrap()
+                        .same_name_folder_book,
+                    Policy::PreferFolder
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn same_name_folder_book_unknown_new_value_protects_db_and_remote() {
+        use crate::same_name_folder_book::{KEY, LEGACY_KEY};
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        db.save_full(&Settings::default()).unwrap();
+        {
+            let inner = db.inner.lock().unwrap();
+            inner
+                .conn
+                .execute(
+                    "UPDATE settings_kv SET value='\"future\"' WHERE key=?1",
+                    [KEY],
+                )
+                .unwrap();
+            inner
+                .conn
+                .execute(
+                    "INSERT INTO settings_kv(key,value) VALUES(?1,'false')",
+                    [LEGACY_KEY],
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            db.load_into_settings(),
+            Err(SettingsDbError::Incompatible(_))
+        ));
+        assert!(matches!(
+            db.load_remote_listing_settings(&Settings::default()),
+            Err(SettingsDbError::Incompatible(_))
+        ));
+    }
+
+    #[test]
     fn remote_listing_settings_overlay_reads_every_live_field_only() {
         use crate::settings::{
             ArchiveFileHandling, GridDisplayOrder, GridItemDisplayKind, SortOrder, ThumbAspect,
@@ -5952,7 +6121,8 @@ mod tests {
         live.archive_file_handling = ArchiveFileHandling::Ignore;
         live.epub_file_handling = crate::settings::EpubFileHandling::Convert;
         live.archive_convert_without_dialog = true;
-        live.skip_zip_if_folder_exists = false;
+        live.same_name_folder_book =
+            crate::same_name_folder_book::SameNameFolderBookPolicy::ShowBoth;
         live.skip_archive_if_zip_exists = false;
         live.skip_epub_if_pdf_exists = false;
         live.skip_image_if_video_exists = false;

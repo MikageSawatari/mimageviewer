@@ -1,5 +1,25 @@
 # 非同期・並列アーキテクチャ
 
+## 本の列生成の共通境界（§1.242 G1）
+
+`app/book_materialization`は既存のsource準備結果からZIP/PDF/EPUB/folder行を投影する。
+folder rating lookupは従来の準備worker経路を保ち、新しい列挙・待機・UI-thread I/Oは追加しない。
+cached documentの早期adoption、password/EPUB取消、policy/generationによるstale reply拒否は
+既存request ownerが担う。raw ZIP manifestと採用済みpolicyの表示列を混同しない。
+
+完成itemsと`ProjectionRecipe`を同じ採用境界で公開し、以後は同じViewerContextBundleで所有する。
+固定snapshotは元一覧と固定一覧それぞれのrecipeを保存し、子の物理本を離れた復帰で対応する
+保存列と同時に戻す。Smart rootも既存準備済みrootの復帰境界でExtractedResultを採用する。
+read-only mount/fork/closeから兄弟のgeneration/queue/cancel/cacheを変更しない。
+A2のmode切替は既存表示owner内のsession操作であり、新しいworker/store/失効通知は持たない。
+連結方式（flow）はA2のpairing初期化と分離し、各入口の従来の採用規則を維持する。タグ・お気に入り・評価・サブ展開・Smart新規rootは既存の保存flow（旧Vertical表現を含む）または従来の分類に対応するdefaults（通常はNON_BOOKのPaged）を採用し、GlobalSearch・Smart保存root復帰・Collection root・固定snapshotの直接列差し替えは既存flowを維持する。単ページ化・再openだけを理由にflowを変更せず、連結読みの操作を維持する。旧Vertical mode行はflow列に別値が残っていても従来どおり縦連結へ復元し、旧行は変更しない。
+元の本の列を保存する既存SnapshotStateは閲覧状態（mode/方向/flow/shift index/補助設定）も
+一緒に保持し、固定解除の同じadoption内で復元する。BSで固定列へ戻る場合はA2のまま。
+検索のback/BS・履歴の本への復帰は既存Book設定adoption、F12はcontext内snapshot/bundle、
+Remoteは本の通常responseから復元し、A2のSingle/一時Spreadを本へ保存しない。
+
+
+
 「どの処理がどのスレッド/プロセスで走るか」「どうやってキャンセルするか」「キャッシュ競合をどう避けるか」
 の一覧。並列処理を追加・変更するときの設計テンプレートとして使う。
 
@@ -1933,3 +1953,45 @@ Loading／host-control queue へ合流する。AutoVideo permit は成功時 rev
 設定OFF・root hide・全画面・最小化・Remote は各正本の境界で公開し、復帰でも古い permit は再利用しない。
 成功した手動表示も古い AutoVideo を失効させる。自動表示は非アクティブとし、既存 Manual と表示済み窓の
 visibility lifecycle、worker 数、owner=0 を維持する。
+
+## §1.242 G2B 本の構成worker（未リリース）
+
+`book_composition::BookCompositionService`はprocess所有の単一SQLite writer。
+front handleはPrepare/Save/Remove/root rename/purge/page移行をFIFOへ送るだけで、I/Oやjoinをしない。
+読み取りはimmutable Arc snapshotとscope token。viewerのAccepted recordはcontext bundle/snapshotへ所属し、
+Prepare receiverはそのcontextだけが回収する。Remote SessionHandleは同じserviceのread経路を登録する。
+構成serviceの通知drain/retained readは`eframe::App::update`の描画pass後、早期returnの外で処理する。
+mounted `ContextAsyncOwner::BookCompositionRead`はPreparingだけでなくAutomatic/Acceptedのscopeも照合し、
+専用fullscreenでも初回open・本切替・同scope更新の読取を開始する。
+Prepare応答は採用直前のscope tokenと一致した時だけAccepted/Blockedへ移す。不一致なら最新Prepareへ
+置換し、Preparingのまま既存context pollへ残す。変更通知を先に消化しても旧応答を採用しない。
+Preparing中は既存pending workerと同じ50ms遅延repaintをROOTへ予約する。rootは退避contextの完了も
+回収するため、専用viewportや一覧が静止していても利用者入力に依存しない。採用時は一度repaintし、
+Accepted/Blockedの同token読取は起床を予約しない。新しいpending fieldやworker側UI ownerは作らない。
+既存maintenance workerはEPUB→spread_shift→book_compositionの順でquiesceし、DB接続を解放してから共通rename/import/restore/cleanupを行う。
+lease終了時のwriter再読込が実変更scopeだけを公開する。UI側でmaintenance待ちやDB/FS読取を追加しない。
+終了時はcomposition writerをjoinしてから、保持されたcontent-identity recorderを所有するshift ownerを終了し、捕捉済みEdit観測を落とさない。
+まれな失敗はログ＋通知。未知/破損は利用者作成recordを保持して書込停止し、新DBのmigration/recreate/自動retryを作らない。
+
+### G4 editorの非同期owner（next-book、2026-10-11）
+
+`CompositionEditorOperations`の単一ownerはcontext/scope/requestを相関し、
+そのcontextの`CompositionEditorState`だけがPreparing/Editing/Saving/Reloadingを保持する。
+sessionのLocal phase確認とowner/ticketの採用は既存lifecycle mutex内の短い受付で行う。
+prepareのsource列挙、保存前fingerprint照合、writerの応答待ちは専用workerが担い、UI側はchannelを収穫する。
+長い操作をmodalにすることで、別open/history/context切替や複数draftとのsupersessionを作らない。
+
+Remote取得/窓closeが後から来ても、すでに送信したsave ticketの受取ownerはprocess側へ残す。
+その一回の終端を既存Remote close barrierへ含め、draft dropだけで完了を捨てない。
+metadata preview/import/exportとGeneric改名maintenanceも、同じticketの完了・採用まで開始を待つ。
+previewには既存WaitingForWritersの型付き待ち先を使い、追加のpending ownerやUI待機を作らない。
+G4Fは2026-10-12の利用者決定で切り離し。folder sidecar v1 restoreは構成maintenanceを使わず、開始条件を変更しない。
+DB成功後のreloadは保存済みrecordを使用する。reload失敗の再操作は利用者へ案内し、DB成功を巻き戻さない。
+捕捉した編集元のresume intentは保存完了ownerだけが一回記録し、兄弟/退避のreloadはresumeを追加記録しない。
+
+`EditorThumbnails`はeditorのsource/policyを固定した独立worker。一回の可視要求は24件まで、
+request/result channelは有界で、UIからの送信は非blocking。decode/回転DB読取はworkerで行い、
+結果とtextureはeditorにだけ返す。policy除外・Missingはdecodeせず、editor closeでcancel/dropする。
+元ページを表示するために、通常viewerのthumbnail queueをresetしたりhidden許可を書き換えたりしない。
+viewのページ名/状態/unitの投影はdraft変更時に更新し、静止中のUI frameではcacheを読む。
+詳細な受入条件・未実施の確認は[本の構成計画 G4](book-composition-plan.md)に記録する。

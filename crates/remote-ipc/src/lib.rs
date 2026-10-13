@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 69;
+pub const PROTOCOL_VERSION: u32 = 70;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -253,6 +253,15 @@ pub struct ContainerRequest {
     pub reading_direction: Option<RemoteReadingDirection>,
     /// 縦長 viewport 用の表示限定 Single。保存済みモードは変更しない。
     pub force_single_page: bool,
+}
+
+/// Pure display classification; no reading-direction, cover or pairing changes.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteViewMode {
+    Single,
+    Spread,
+    LandscapeSplit,
 }
 
 /// Web へ公開するページ構成。旧 DB 互換用 `Vertical` は本体側で `Single` へ解決してから返す。
@@ -601,6 +610,10 @@ impl RemoteGridScope {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RemoteWriteRequest {
+    SetViewMode {
+        address: RemoteAddress,
+        mode: RemoteViewMode,
+    },
     SetSpread {
         address: RemoteAddress,
         spread_mode: RemoteSpreadMode,
@@ -715,7 +728,8 @@ pub enum RemoteWriteRequest {
 impl RemoteWriteRequest {
     pub fn address(&self) -> Option<&RemoteAddress> {
         match self {
-            Self::SetSpread { address, .. }
+            Self::SetViewMode { address, .. }
+            | Self::SetSpread { address, .. }
             | Self::SetFinalCoverSpreadPreference { address, .. }
             | Self::SetSingletonSpreadPlacementPreference { address, .. }
             | Self::SetSingletonSpreadEndpointPreference { address, .. }
@@ -738,7 +752,8 @@ impl RemoteWriteRequest {
 
     pub fn address_mut(&mut self) -> Option<&mut RemoteAddress> {
         match self {
-            Self::SetSpread { address, .. }
+            Self::SetViewMode { address, .. }
+            | Self::SetSpread { address, .. }
             | Self::SetFinalCoverSpreadPreference { address, .. }
             | Self::SetSingletonSpreadPlacementPreference { address, .. }
             | Self::SetSingletonSpreadEndpointPreference { address, .. }
@@ -785,7 +800,8 @@ impl RemoteWriteRequest {
             | Self::GetViewTrimState {
                 context_address, ..
             } => Some(context_address),
-            Self::SetSpread { .. }
+            Self::SetViewMode { .. }
+            | Self::SetSpread { .. }
             | Self::SetFinalCoverSpreadPreference { .. }
             | Self::SetSingletonSpreadPlacementPreference { .. }
             | Self::SetSingletonSpreadEndpointPreference { .. }
@@ -824,7 +840,8 @@ impl RemoteWriteRequest {
             | Self::GetViewTrimState {
                 context_address, ..
             } => Some(context_address),
-            Self::SetSpread { .. }
+            Self::SetViewMode { .. }
+            | Self::SetSpread { .. }
             | Self::SetFinalCoverSpreadPreference { .. }
             | Self::SetSingletonSpreadPlacementPreference { .. }
             | Self::SetSingletonSpreadEndpointPreference { .. }
@@ -839,6 +856,7 @@ impl RemoteWriteRequest {
 
     pub fn kind_name(&self) -> &'static str {
         match self {
+            Self::SetViewMode { .. } => "set_view_mode",
             Self::SetSpread { .. } => "set_spread",
             Self::SetFinalCoverSpreadPreference { .. } => "set_final_cover_spread_preference",
             Self::SetSingletonSpreadPlacementPreference { .. } => {
@@ -1149,6 +1167,9 @@ pub struct ContainerPayload {
     pub open_mode: ContainerOpenMode,
     /// spread.db または session override から解決したモード。縦持ちでも保持する。
     pub configured_spread_mode: RemoteSpreadMode,
+    /// A derived core snapshot classification; layout payload parity is added in G5.
+    #[serde(default)]
+    pub composition_managed: bool,
     /// 実際に `page_groups` を構成したモード。縦持ちは `Single`。
     pub effective_spread_mode: RemoteSpreadMode,
     /// Single を含む物理的なページ送り方向。spread.db の reading direction を反映する。
@@ -3282,7 +3303,7 @@ mod tests {
 
     #[test]
     fn protocol_v67_registered_collection_total_round_trips_and_defaults() {
-        assert_eq!(PROTOCOL_VERSION, 69);
+        assert_eq!(PROTOCOL_VERSION, 70);
         let payload = PersistentCollectionSnapshotPayload {
             registered_total: 12,
             thumbnail_presentation: ThumbnailPresentation::default(),
@@ -3356,7 +3377,7 @@ mod tests {
             serde_json::from_str::<ThumbnailPresentation>("{}").unwrap(),
             ThumbnailPresentation::default()
         );
-        assert_eq!(PROTOCOL_VERSION, 69);
+        assert_eq!(PROTOCOL_VERSION, 70);
     }
 
     #[test]
@@ -3412,7 +3433,7 @@ mod tests {
 
     #[test]
     fn protocol_v63_audio_track_control_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 69);
+        assert_eq!(PROTOCOL_VERSION, 70);
         let action = VideoStreamControlAction::AudioTrack {
             stream_index: 3,
             position_secs: 42.5,
@@ -3562,7 +3583,7 @@ mod tests {
 
     #[test]
     fn protocol_v55_connection_info_round_trips_with_tailnet_prerequisites_without_credentials() {
-        assert_eq!(PROTOCOL_VERSION, 69);
+        assert_eq!(PROTOCOL_VERSION, 70);
         let expected = ClientMessage::RemoteWebConnectionInfo {
             id: 10,
             info: RemoteWebConnectionInfo {
@@ -3605,7 +3626,7 @@ mod tests {
 
     #[test]
     fn protocol_v62_raw_error_codes_round_trip() {
-        assert_eq!(PROTOCOL_VERSION, 69);
+        assert_eq!(PROTOCOL_VERSION, 70);
         for (code, wire) in [
             (MediaErrorCode::RawPrefetchSkipped, "raw_prefetch_skipped"),
             (MediaErrorCode::RawCapacity, "raw_capacity"),
@@ -3627,7 +3648,7 @@ mod tests {
 
     #[test]
     fn protocol_v65_raw_window_request_and_all_ack_outcomes_round_trip() {
-        assert_eq!(PROTOCOL_VERSION, 69);
+        assert_eq!(PROTOCOL_VERSION, 70);
         let expected = ClientMessage::RawPrefetchWindow {
             id: 65,
             owner: test_owner("window-client"),
@@ -3828,7 +3849,7 @@ mod tests {
 
     #[test]
     fn protocol_v55_remote_video_thumbnail_shape_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 69);
+        assert_eq!(PROTOCOL_VERSION, 70);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -3982,6 +4003,7 @@ mod tests {
         let expected = ServerMessage::Container {
             id: 44,
             response: ContainerResponse::Success(ContainerPayload {
+                composition_managed: false,
                 thumbnail_presentation: ThumbnailPresentation::default(),
                 title: "book.pdf".to_owned(),
                 root_name: "Fixture".to_owned(),
@@ -4161,6 +4183,10 @@ mod tests {
             subresource: RemoteSubresource::PdfPage { page_number: 2 },
         };
         let requests = [
+            RemoteWriteRequest::SetViewMode {
+                address: container.clone(),
+                mode: RemoteViewMode::Spread,
+            },
             RemoteWriteRequest::SetFinalCoverSpreadPreference {
                 address: container.clone(),
                 preference: RemoteFinalCoverSpreadPreference::FollowGlobal,
@@ -4763,7 +4789,7 @@ mod tests {
         assert_eq!(json["places"][0]["entries"][0]["name"], "保管");
         assert_eq!(json["places"][0]["entries"][1]["path"], "Z:/absent");
         assert_eq!(json["places"][0]["entries"][1]["kind"], "folder");
-        assert_eq!(PROTOCOL_VERSION, 69);
+        assert_eq!(PROTOCOL_VERSION, 70);
     }
 
     #[test]
@@ -4961,7 +4987,7 @@ mod tests {
 
     #[test]
     fn persistent_collection_shuffle_order_round_trips_on_protocol_59() {
-        assert_eq!(PROTOCOL_VERSION, 69);
+        assert_eq!(PROTOCOL_VERSION, 70);
         let encoded = serde_json::to_value(PersistentCollectionOrderSummary::Shuffle).unwrap();
         assert_eq!(encoded, serde_json::json!({ "kind": "shuffle" }));
         let decoded: PersistentCollectionOrderSummary = serde_json::from_value(encoded).unwrap();

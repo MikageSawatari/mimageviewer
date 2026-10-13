@@ -105,6 +105,16 @@ impl App {
             self.reject_activation_open_paths_for_remote(ctx);
             return;
         }
+        if self.composition_editor_modal_active() {
+            let rejected = self.activation_open_path_rx.try_iter().count();
+            if rejected != 0 {
+                crate::logger::log(format!(
+                    "composition editor: rejected {rejected} activation request(s)"
+                ));
+                self.show_feedback_toast("本の構成を編集中のため、別の本を開けません".into());
+            }
+            return;
+        }
         // Keep the channel queued while a document dialog owns local admission. Draining it
         // after terminal naturally applies the existing last-activation-wins rule.
         if self.document_open_modal_admission_blocked() {
@@ -207,6 +217,11 @@ impl App {
                     "リモート閲覧中のため、二重起動で渡されたパスを開けません".to_string(),
                 );
             }
+            return;
+        }
+        if self.composition_editor_modal_active() {
+            crate::logger::log("composition editor: rejected path open");
+            self.show_feedback_toast("本の構成を編集中のため、別の本を開けません".into());
             return;
         }
         if self.document_open_modal_admission_blocked() {
@@ -961,6 +976,7 @@ impl App {
                     matches!(
                         pending.stage,
                         crate::bookmark_browser::PendingBookOpenStage::Resolving
+                            | crate::bookmark_browser::PendingBookOpenStage::Qualifying(_)
                     )
                 })
                 .map(|pending| pending.request_id),
@@ -1125,6 +1141,7 @@ impl App {
             || archive_matches
             || pending_matches;
         if pending_matches {
+            self.retire_book_identity_permission(request_id.0);
             crate::logger::log(format!(
                 "[bookmark-open] finish request id={} reason={reason}",
                 request_id.0
@@ -1813,6 +1830,8 @@ impl App {
         });
         let policy = self.page_identity_index.policy.clone();
         let saved_page_identity_index = self.page_identity_index.clone();
+        let saved_projection_recipe = self.projection_recipe.clone();
+        let saved_viewing_state = self.capture_snapshot_viewing_state();
         let saved_items = self.items.clone();
         let saved_thumbnails = self.thumbnails.clone();
         let saved_image_metas = self.image_metas.clone();
@@ -1865,6 +1884,16 @@ impl App {
             crate::rating_sort::RatingSortKey::Unsupported => None,
         };
         self.items = reader_items;
+        // A direct audio/video exception makes the reader a mixed ordinary list. The saved
+        // grid recipe is restored by the existing DirectMedia snapshot on return.
+        if self.projection_recipe.extracted_surface().is_none()
+            && matches!(
+                self.items[target_idx],
+                GridItem::Video(_) | GridItem::Audio(_)
+            )
+        {
+            self.projection_recipe = super::book_materialization::ProjectionRecipe::OrdinaryList;
+        }
         self.image_metas = reader_metas;
         if let Some(stars) = target_rating {
             self.rating_cache.insert(target_idx, stars);
@@ -1900,6 +1929,8 @@ impl App {
             generation_id,
             saved_items: saved_items.clone(),
             saved_page_identity_index: saved_page_identity_index.clone(),
+            saved_projection_recipe: saved_projection_recipe.clone(),
+            saved_viewing_state,
             saved_thumbnails: saved_thumbnails.clone(),
             saved_image_metas: saved_image_metas.clone(),
             saved_visible_indices,
@@ -1910,6 +1941,7 @@ impl App {
             list_view_thumbnails: saved_thumbnails,
             list_view_image_metas: saved_image_metas,
             list_view_page_identity_index: saved_page_identity_index.clone(),
+            list_view_projection_recipe: saved_projection_recipe,
             pre_snapshot_search_origin: None,
         });
         self.top_level_grid_view.begin_with_origin(

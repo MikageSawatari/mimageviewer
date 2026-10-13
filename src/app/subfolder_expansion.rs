@@ -221,7 +221,7 @@ pub(crate) struct SubfolderExpansionOptions {
     pub(crate) file_type_visibility: crate::file_type_visibility::FileTypeVisibility,
     skip_image_if_video_exists: bool,
     skip_duplicate_images: bool,
-    skip_zip_if_folder_exists: bool,
+    same_name_folder_book: crate::same_name_folder_book::SameNameFolderBookPolicy,
     video_thumb_use_sidecar_image: bool,
     image_folder_books: bool,
     include_convertible_archives: bool,
@@ -237,7 +237,7 @@ impl From<&crate::settings::Settings> for SubfolderExpansionOptions {
             file_type_visibility: settings.file_type_visibility.clone(),
             skip_image_if_video_exists: settings.skip_image_if_video_exists,
             skip_duplicate_images: settings.skip_duplicate_images,
-            skip_zip_if_folder_exists: settings.skip_zip_if_folder_exists,
+            same_name_folder_book: settings.same_name_folder_book,
             video_thumb_use_sidecar_image: settings.video_thumb_use_sidecar_image,
             image_folder_books: settings.auto_fullscreen_image_folders_enabled(),
             include_convertible_archives: !settings.archive_file_handling_ignores_convertible(),
@@ -872,9 +872,20 @@ fn scan_one_directory(
         return;
     }
 
-    if options.skip_zip_if_folder_exists {
-        containers.retain(|entry| !real_folder_names.contains(&super::stem_lower(&entry.path)));
-    }
+    // Traversal and child book cells retain the existing recursive scope.
+    let folders: Vec<_> = real_folder_names
+        .iter()
+        .map(|name| dir.join(name))
+        .collect();
+    let mask = crate::same_name_folder_book::keep_mask(
+        options.same_name_folder_book,
+        folders
+            .iter()
+            .map(|path| (path.as_path(), true))
+            .chain(containers.iter().map(|entry| (entry.path.as_path(), false))),
+    );
+    let mut mask = mask.into_iter().skip(folders.len());
+    containers.retain(|_| mask.next().unwrap());
     containers.retain(|entry| {
         options
             .scan_filter
@@ -2651,7 +2662,11 @@ impl App {
             None,
             None,
             None,
-            VisibleInstallAuthority::Ordinary,
+            VisibleInstallAuthority::Projection {
+                recipe: super::book_materialization::ProjectionRecipe::ExtractedResult(
+                    super::book_materialization::ExtractedSurface::SubfolderExpansion,
+                ),
+            },
             token,
         );
         if let Some(generation) = rating_write_generation {
@@ -2985,6 +3000,114 @@ fn remove_paths_from_snapshot(
 mod tests {
     use super::*;
 
+    #[test]
+    fn g1_subfolder_real_handler_reopen_restores_legacy_flow_and_book_return() {
+        use crate::app::book_materialization::ExtractedSurface;
+        use crate::settings::{ReadingDirection, ReadingFlow, SpreadMode};
+        let ctx = egui::Context::default();
+        for saved_flow in [None, Some(ReadingFlow::Vertical)] {
+            let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+            let mut app = crate::app::setup_app_for_test();
+            app.active_quick_folder_slot = None;
+            app.settings.detached_viewer_open_images_in_window = false;
+            // Explicit compiled Books remain Books without making the extraction scan
+            // collapse every image-only directory into a Folder row.
+            app.settings.auto_fullscreen_image_folders = false;
+            app.settings.auto_fullscreen_zip_pdf = true;
+            app.settings.default_spread_mode = SpreadMode::RtlCover;
+            app.settings.default_reading_flow = ReadingFlow::Vertical;
+            app.settings.default_reading_direction = ReadingDirection::Rtl;
+            let books_root = app.tmp.path().join("books");
+            let book = books_root.join("subfolder-a2-original-book");
+            app.settings.book_root = Some(books_root);
+            std::fs::create_dir_all(&book).unwrap();
+            for name in ["a_1.png", "a_2.png"] {
+                image::RgbImage::new(2, 3).save(book.join(name)).unwrap();
+            }
+            let synthetic = subfolder_expansion_synthetic_path();
+            if let Some(flow) = saved_flow {
+                let db = app.spread_db.as_ref().unwrap();
+                db.set(
+                    &synthetic,
+                    SpreadMode::RtlCover,
+                    SpreadMode::Single,
+                    ReadingFlow::Paged,
+                    ReadingDirection::Ltr,
+                )
+                .unwrap();
+                db.set_flow(
+                    &synthetic,
+                    flow,
+                    ReadingDirection::Rtl,
+                    SpreadMode::Single,
+                    ReadingFlow::Paged,
+                    ReadingDirection::Ltr,
+                )
+                .unwrap();
+            }
+            let stored = app
+                .spread_db
+                .as_ref()
+                .unwrap()
+                .get_state_with_fallback(&synthetic, None);
+            app.load_folder(book.clone());
+            app.settle_open_path_classification_for_test();
+            app.finish_page_identity_preparation_for_test();
+            assert_eq!(app.spread_mode, SpreadMode::RtlCover);
+            assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+            app.start_subfolder_expansion_scan_roots(book.clone(), vec![book.clone()]);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !app.items_are_subfolder_expansion_view {
+                assert!(
+                    Instant::now() < deadline,
+                    "Subfolder A2 scan did not settle"
+                );
+                app.poll_subfolder_expansion(&ctx);
+                app.poll_sidecar_restore(&ctx);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            finish_list_hydration_for_test(&mut app);
+            assert_eq!(
+                app.extracted_result_surface(),
+                Some(ExtractedSurface::SubfolderExpansion)
+            );
+            // Like a new Smart root, this producer uses the legacy synthetic-key
+            // NON_BOOK restore: no saved flow means Paged after a Vertical Book.
+            let expected_flow = saved_flow.unwrap_or(ReadingFlow::Paged);
+            assert_eq!(app.reading_flow, expected_flow);
+            let index = app
+                .items
+                .iter()
+                .position(|item| matches!(item, GridItem::Image(_)))
+                .unwrap();
+            for _ in 0..2 {
+                app.open_fullscreen(index, crate::app::HistoryTrigger::UserChosen);
+                assert_eq!(app.fullscreen_idx, Some(index));
+                assert_eq!(app.spread_mode, SpreadMode::Single);
+                assert_eq!(app.reading_flow, expected_flow);
+                app.apply_fullscreen_spread_mode(&ctx, index, SpreadMode::RtlCover);
+                assert_eq!(app.spread_mode, SpreadMode::Rtl);
+                assert_eq!(app.reading_flow, expected_flow);
+                app.close_fullscreen();
+            }
+            assert_eq!(
+                app.spread_db
+                    .as_ref()
+                    .unwrap()
+                    .get_state_with_fallback(&synthetic, None),
+                stored
+            );
+            app.exit_subfolder_expansion_view();
+            app.settle_open_path_classification_for_test();
+            app.finish_page_identity_preparation_for_test();
+            assert_eq!(app.current_folder.as_deref(), Some(book.as_path()));
+            assert!(app.extracted_result_surface().is_none());
+            assert_eq!(app.spread_mode, SpreadMode::RtlCover);
+            assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+            assert_eq!(app.reading_direction, ReadingDirection::Rtl);
+        }
+    }
+
     fn finish_list_hydration_for_test(app: &mut App) {
         let ctx = egui::Context::default();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -3148,7 +3271,7 @@ mod tests {
             file_type_visibility: Default::default(),
             skip_image_if_video_exists: false,
             skip_duplicate_images: false,
-            skip_zip_if_folder_exists: false,
+            same_name_folder_book: crate::same_name_folder_book::SameNameFolderBookPolicy::ShowBoth,
             video_thumb_use_sidecar_image: true,
             image_folder_books,
             include_convertible_archives: false,
@@ -3616,7 +3739,8 @@ mod tests {
                 file_type_visibility: Default::default(),
                 skip_image_if_video_exists: false,
                 skip_duplicate_images: false,
-                skip_zip_if_folder_exists: false,
+                same_name_folder_book:
+                    crate::same_name_folder_book::SameNameFolderBookPolicy::ShowBoth,
                 video_thumb_use_sidecar_image: true,
                 image_folder_books: false,
                 include_convertible_archives: false,
@@ -3854,6 +3978,32 @@ mod tests {
     }
 
     #[test]
+    fn same_name_folder_book_subfolder_expansion_preserves_child_book_cells() {
+        use crate::same_name_folder_book::SameNameFolderBookPolicy as Policy;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let book = root.join("book");
+        std::fs::create_dir_all(&book).unwrap();
+        std::fs::write(book.join("page.jpg"), b"image").unwrap();
+        std::fs::write(root.join("book.zip"), b"zip").unwrap();
+        for policy in [Policy::PreferBook, Policy::PreferFolder, Policy::ShowBoth] {
+            let mut options = test_scan_options(true);
+            options.same_name_folder_book = policy;
+            let result = scan_test_root(&root, options);
+            assert!(result.entries.iter().any(
+                |entry| entry.path == book && entry.kind == SubfolderExpansionEntryKind::Folder
+            ));
+            assert_eq!(
+                result
+                    .entries
+                    .iter()
+                    .any(|entry| entry.path == root.join("book.zip")),
+                policy != Policy::PreferFolder
+            );
+        }
+    }
+
+    #[test]
     fn same_name_zip_is_hidden_in_favor_of_image_folder_book_when_configured() {
         let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -3863,7 +4013,8 @@ mod tests {
         std::fs::write(book.join("001.jpg"), b"image").unwrap();
         std::fs::write(root.join("volume.zip"), b"zip").unwrap();
         let mut options = test_scan_options(true);
-        options.skip_zip_if_folder_exists = true;
+        options.same_name_folder_book =
+            crate::same_name_folder_book::SameNameFolderBookPolicy::PreferFolder;
 
         let result = scan_test_root(&root, options);
 
@@ -3979,7 +4130,7 @@ mod tests {
             file_type_visibility: Default::default(),
             skip_image_if_video_exists: false,
             skip_duplicate_images: true,
-            skip_zip_if_folder_exists: false,
+            same_name_folder_book: crate::same_name_folder_book::SameNameFolderBookPolicy::ShowBoth,
             video_thumb_use_sidecar_image: true,
             image_folder_books: false,
             include_convertible_archives: false,

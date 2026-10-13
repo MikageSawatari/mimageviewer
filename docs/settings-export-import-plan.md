@@ -821,3 +821,20 @@ core check / settings_restore / ui_snapshot / glyph の成功を再利用した�
 `fullscreen_specified_scale`の各軸はenabledとvalue（単位・数値）を必須とし、OFF中も検証・転送する。
 未リリースOption形を破壊的に改訂しmigrationなし。favorite外側の欠落は継承のまま保持する。
 §1.365・§1.364結合後、音響調整のタスクバー表示追加（2026-10-12）の現行分類は458 / 144 / 314、互換項目をまとめたwireは142。共通値転送と専用値保持の回帰を追加する。
+
+### §1.242 G2 part B結合時の再確認（2026-10-11）
+
+本の構成はmetadata転送v11の独立familyで運び、preferences専用のsettings転送には追加しない。
+`cargo test -p mimageviewer --lib settings_transfer -j1`は24件成功（exit 0）。
+実際の分類gateは全457 / 対象144 / 除外313、wireキー142のassertionを通過した。
+過去の15件という検証記録はその時点の証拠として残す。
+ログは`target/G-1242-g2b-settings_transfer-final.log`、全gateの結果は`target/G-1242-g2b-msg.txt`。
+
+### §1.242 G4F切り離し時の再確認（2026-10-12）
+
+folder構成のadapter/sidecar v2を外し、既存metadata transfer v11とpreferences転送を維持する。
+今回の実行は`cargo test -p mimageviewer --lib settings_transfer`が24件、
+`cargo test -p mimageviewer --lib metadata_transfer`が108件成功（各exit 0）。
+分類assertは全457 / 対象144 / 除外313、wire142のまま。folderの新しい設定字段は追加していない。
+ログは`target/G-1242-g4f-detach-focused-settings_transfer.log`と
+`target/G-1242-g4f-detach-focused-metadata_transfer.log`。全体gateは今回のhandoffで別途記録する。

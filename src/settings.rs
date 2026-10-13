@@ -4358,6 +4358,7 @@ pub(crate) struct FavoriteViewOverlay {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[serde(remote = "Settings")]
 pub struct Settings {
     #[serde(default = "default_grid_cols")]
     pub grid_cols: usize,
@@ -4951,9 +4952,9 @@ pub struct Settings {
     /// 一覧生成前に適用する全体の種類設定。空の除外集合は全表示。
     #[serde(default)]
     pub file_type_visibility: crate::file_type_visibility::FileTypeVisibility,
-    /// 同名の ZIP ファイルとフォルダがある場合、ZIP をスキップする
-    #[serde(default = "default_true")]
-    pub skip_zip_if_folder_exists: bool,
+    /// 同名の実フォルダと本を、本優先・フォルダ優先・両方表示から選ぶ。
+    #[serde(default)]
+    pub same_name_folder_book: crate::same_name_folder_book::SameNameFolderBookPolicy,
     /// 同名の ZIP/CBZ がある場合、RAR/7z/LZH 側をスキップする
     #[serde(default = "default_true")]
     pub skip_archive_if_zip_exists: bool,
@@ -7659,7 +7660,7 @@ impl Default for Settings {
             thumb_tooltip_show_reading_history_last_read: true,
             thumb_tooltip_show_reading_history_progress: true,
             exif_hidden_tags: default_exif_hidden_tags(),
-            skip_zip_if_folder_exists: true,
+            same_name_folder_book: Default::default(),
             skip_archive_if_zip_exists: true,
             skip_epub_if_pdf_exists: true,
             skip_image_if_video_exists: true,
@@ -19348,5 +19349,20 @@ impl Settings {
             indexer_speed_profile: self.indexer_speed_profile,
             ..Self::default()
         }
+    }
+}
+
+impl serde::Serialize for Settings {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Settings::serialize(self, serializer)
+    }
+}
+impl<'de> serde::Deserialize<'de> for Settings {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+        if let Some(map) = value.as_object_mut() {
+            crate::same_name_folder_book::canonicalize(map).map_err(serde::de::Error::custom)?;
+        }
+        Settings::deserialize(value).map_err(serde::de::Error::custom)
     }
 }

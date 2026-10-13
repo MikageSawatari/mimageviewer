@@ -160,6 +160,9 @@ impl ViewerSpreadShift {
     }
 
     pub(crate) fn session_only(&mut self) {
+        if self.availability != PairingEditAvailability::Automatic {
+            return;
+        }
         self.cancel_retained_readoption();
         if let ViewerShift::Book(SpreadShiftState::Adjusted { persistence, .. }) = &mut self.state {
             *persistence = ShiftPersistence::SessionOnly;
@@ -171,6 +174,9 @@ impl ViewerSpreadShift {
         index: &Arc<file_type_resume::PreparedPageIdentityIndex>,
         nav: &Arc<Vec<usize>>,
     ) -> bool {
+        if self.availability != PairingEditAvailability::Automatic {
+            return false;
+        }
         if self
             .projection
             .as_ref()
@@ -210,6 +216,9 @@ impl ViewerSpreadShift {
     }
 
     pub(crate) fn remap_with(&mut self, remap: &impl Fn(usize) -> Option<usize>) {
+        if self.availability != PairingEditAvailability::Automatic {
+            return;
+        }
         match &mut self.state {
             ViewerShift::Ordinary(idx) => {
                 self.state = remap(*idx).map_or(ViewerShift::None, ViewerShift::Ordinary);
@@ -229,6 +238,9 @@ impl ViewerSpreadShift {
         reply: &ShiftWriteReply,
         memory: bool,
     ) -> Option<bool> {
+        if self.availability != PairingEditAvailability::Automatic {
+            return None;
+        }
         let ShiftCommand::Pending {
             sequence,
             operation,
@@ -264,6 +276,7 @@ pub(super) struct ViewerBookRestore {
     resume_key: Option<String>,
     memory: ShiftMemoryPolicy,
     cause: ShiftRestoreCause,
+    layout_eligibility: PairingEditAvailability,
 }
 
 impl ViewerBookRestore {
@@ -272,6 +285,7 @@ impl ViewerBookRestore {
         generation: u64,
         memory: bool,
         service: Option<&SpreadShiftService>,
+        availability: PairingEditAvailability,
     ) {
         self.receipt.settings_generation = generation;
         self.receipt.shift_cutoff = service.map_or(0, |service| service.watermarks().admitted);
@@ -280,14 +294,21 @@ impl ViewerBookRestore {
         } else {
             ShiftMemoryPolicy::SessionOnly
         };
-        self.reads
-            .refresh_shift_dependency(self.receipt.clone(), memory.then_some(service).flatten());
+        self.layout_eligibility = availability;
+        self.reads.refresh_shift_dependency(
+            self.receipt.clone(),
+            (memory && availability == PairingEditAvailability::Automatic)
+                .then_some(service)
+                .flatten(),
+        );
     }
 }
 
 impl App {
     pub(crate) fn begin_retained_shift_readoption(&mut self, ctx: &egui::Context) {
-        if !self.settings.remember_spread_shift_per_book {
+        if self.pairing_edit_availability() != PairingEditAvailability::Automatic
+            || !self.settings.remember_spread_shift_per_book
+        {
             return;
         }
         self.spread_shift.cancel_retained_readoption();
@@ -344,7 +365,10 @@ impl App {
         &self,
         changed: bool,
     ) -> Option<(BookScopeKey, std::sync::mpsc::Receiver<ShiftReadReply>)> {
-        if !changed || !self.settings.remember_spread_shift_per_book {
+        if self.pairing_edit_availability() != PairingEditAvailability::Automatic
+            || !changed
+            || !self.settings.remember_spread_shift_per_book
+        {
             return None;
         }
         let scope = self.current_spread_shift_scope()?;
@@ -354,34 +378,64 @@ impl App {
     }
 
     pub(super) fn adopt_imported_shift_read(&mut self, scope: BookScopeKey, read: ShiftReadReply) {
-        if !self.settings.remember_spread_shift_per_book
+        if self.pairing_edit_availability() != PairingEditAvailability::Automatic
+            || !self.settings.remember_spread_shift_per_book
             || self.current_spread_shift_scope().as_ref() != Some(&scope)
-            || self.spread_shift.availability != PairingEditAvailability::Automatic
         {
             return;
         }
+        let receipt = RestoreReceipt {
+            open_id: self
+                .frame_counter
+                .wrapping_add(self.input_seq)
+                .wrapping_add(1),
+            context_id: self.spread_shift_context_id(),
+            scope: scope.clone(),
+            items_generation: self.items_generation,
+            settings_generation: self.spread_shift_settings_generation,
+            shift_cutoff: read.cutoff,
+            resume_cutoff: 0,
+        };
+        let epoch = self
+            .spread_shift_service
+            .as_ref()
+            .map_or(0, |service| service.maintenance_epoch_for(&scope));
+        let state = match self.resolve_captured_automatic_shift(
+            receipt,
+            ShiftRestoreCause::RetainedReadoption,
+            ShiftMemoryPolicy::Remember,
+            Some(read),
+            epoch,
+        ) {
+            Ok(state) => state,
+            Err(error) => {
+                crate::logger::log(format!("imported spread shift restore rejected: {error}"));
+                return;
+            }
+        };
         self.spread_shift.scope = Some(scope);
+        self.spread_shift.availability = PairingEditAvailability::Automatic;
         self.spread_shift.projection = None;
         self.spread_shift.command = ShiftCommand::Idle;
-        self.spread_shift.state = read.row.map_or(ViewerShift::None, |anchor_ref| {
-            ViewerShift::Book(SpreadShiftState::Adjusted {
-                anchor_ref,
-                resolution: ShiftResolution::NotInView,
-                persistence: ShiftPersistence::Saved(read.completed_through),
-            })
-        });
-        let nav = self.get_nav_indices();
-        self.spread_shift.resolve(&self.page_identity_index, &nav);
+        self.spread_shift.state = if state == SpreadShiftState::None {
+            ViewerShift::None
+        } else {
+            ViewerShift::Book(state)
+        };
         self.invalidate_fullscreen_display_unit_owners();
         self.adopt_shift_layout_without_navigation();
     }
 
     pub(crate) fn spread_shift_anchor_idx(&self) -> Option<usize> {
+        if self.pairing_edit_availability() != PairingEditAvailability::Automatic {
+            return None;
+        }
         self.spread_shift.anchor_idx()
     }
 
     pub(crate) fn current_spread_shift_scope(&self) -> Option<BookScopeKey> {
-        if self.book_bookmark_view_is_synthetic()
+        if self.extracted_result_surface().is_some()
+            || self.book_bookmark_view_is_synthetic()
             || !self.page_order_locked_for_current_view()
             || self.snapshot.is_some()
         {
@@ -416,18 +470,72 @@ impl App {
         self.capture_book_shift_restore(open_id, false)
     }
 
+    /// A completed composition removal creates exactly one new Automatic readoption.
+    /// OFF ignores dormant storage; ON resolves its identity using E's current rules.
+    /// This transition carries no resume read or write and does not count as reading.
+    pub(super) fn begin_composition_removed_shift_restore(
+        &mut self,
+        open_id: u64,
+    ) -> Option<ViewerBookRestore> {
+        if self.pairing_edit_availability() != PairingEditAvailability::Automatic {
+            return None;
+        }
+        self.capture_shift_restore_for_cause(open_id, ShiftRestoreCause::CompositionRemoved)
+    }
+
+    pub(super) fn start_composition_removed_shift_restore(&mut self, open_id: u64) {
+        let Some(mut restore) = self.begin_composition_removed_shift_restore(open_id) else {
+            return;
+        };
+        self.spread_shift.cancel_retained_readoption();
+        match self.poll_book_shift_restore(&mut restore) {
+            Ok(true) => {}
+            Ok(false) => {
+                self.spread_shift.retained = RetainedReadoption::Reading {
+                    restore: Box::new(restore),
+                    started_at: std::time::Instant::now(),
+                };
+            }
+            Err(error) => {
+                crate::logger::log(format!("composition removed shift restore failed: {error}"));
+                self.show_feedback_toast(format!("見開き調整を復元できませんでした: {error}"));
+            }
+        }
+    }
+
     pub(super) fn capture_book_shift_restore(
         &mut self,
         open_id: u64,
         retained: bool,
     ) -> Option<ViewerBookRestore> {
+        self.capture_shift_restore_for_cause(
+            open_id,
+            if retained {
+                ShiftRestoreCause::RetainedReadoption
+            } else {
+                ShiftRestoreCause::FreshOpen
+            },
+        )
+    }
+
+    fn capture_shift_restore_for_cause(
+        &mut self,
+        open_id: u64,
+        cause: ShiftRestoreCause,
+    ) -> Option<ViewerBookRestore> {
+        let availability = self.pairing_edit_availability();
+        let retained = cause != ShiftRestoreCause::FreshOpen;
+        if retained && availability != PairingEditAvailability::Automatic {
+            return None;
+        }
         let scope = self.current_spread_shift_scope();
-        if !retained {
+        if !retained && availability == PairingEditAvailability::Automatic {
             self.spread_shift = ViewerSpreadShift {
                 scope: scope.clone(),
                 ..Default::default()
             };
         }
+        self.spread_shift.availability = availability;
         let scope = scope?;
         let receipt = RestoreReceipt {
             open_id,
@@ -455,7 +563,7 @@ impl App {
         let memory = self.settings.remember_spread_shift_per_book;
         let reads = RestoreReadDependencies::admit(
             receipt.clone(),
-            memory
+            (memory && availability == PairingEditAvailability::Automatic)
                 .then_some(self.spread_shift_service.as_ref())
                 .flatten(),
             (!retained)
@@ -472,11 +580,8 @@ impl App {
             } else {
                 ShiftMemoryPolicy::SessionOnly
             },
-            cause: if retained {
-                ShiftRestoreCause::RetainedReadoption
-            } else {
-                ShiftRestoreCause::FreshOpen
-            },
+            cause,
+            layout_eligibility: availability,
         })
     }
 
@@ -484,6 +589,17 @@ impl App {
         &mut self,
         restore: &mut ViewerBookRestore,
     ) -> Result<bool, String> {
+        let availability = self.pairing_edit_availability();
+        if restore.layout_eligibility != availability {
+            restore.layout_eligibility = availability;
+            restore.reads.refresh_shift_dependency(
+                restore.receipt.clone(),
+                (restore.memory == ShiftMemoryPolicy::Remember
+                    && availability == PairingEditAvailability::Automatic)
+                    .then_some(self.spread_shift_service.as_ref())
+                    .flatten(),
+            );
+        }
         let mut current = restore.receipt.clone();
         current.context_id = self.spread_shift_context_id();
         current.items_generation = self.items_generation;
@@ -500,29 +616,49 @@ impl App {
             .spread_shift_service
             .as_ref()
             .map_or(0, |s| s.maintenance_epoch_for(&current.scope));
+        // Classification owns shift-read admission. Keep this continuation (and
+        // its independently admitted resume fence) alive until it is classified.
+        if matches!(
+            self.book_composition,
+            book_composition_runtime::ViewerBookComposition::Preparing { .. }
+        ) {
+            if current != restore.receipt {
+                return Err("book restore receipt changed during classification".into());
+            }
+            return Ok(false);
+        }
         let Some(reads) = restore.reads.try_complete(&current, epoch)? else {
             return Ok(false);
         };
         // Fresh capture already seeded an empty session. Retained capture kept
         // its accepted session. Only a current read may replace either one;
         // an expired recipe is never evidence that the saved row is absent.
-        if restore.memory == ShiftMemoryPolicy::Remember
-            && let CompletedShiftRead::Captured(read) = reads.shift
+        if availability == PairingEditAvailability::Automatic
+            && (restore.memory == ShiftMemoryPolicy::SessionOnly
+                || matches!(reads.shift, CompletedShiftRead::Captured(_)))
         {
-            self.spread_shift.scope = Some(current.scope);
+            let read = match reads.shift {
+                CompletedShiftRead::Captured(read) => Some(read),
+                CompletedShiftRead::Unrequested | CompletedShiftRead::Expired => None,
+            };
+            let state = self.resolve_captured_automatic_shift(
+                current.clone(),
+                restore.cause,
+                restore.memory,
+                read,
+                epoch,
+            )?;
+            self.spread_shift.scope = Some(current.scope.clone());
+            self.spread_shift.availability = availability;
             self.spread_shift.projection = None;
             self.spread_shift.command = ShiftCommand::Idle;
-            self.spread_shift.state = read.row.map_or(ViewerShift::None, |anchor_ref| {
-                ViewerShift::Book(SpreadShiftState::Adjusted {
-                    anchor_ref,
-                    resolution: ShiftResolution::NotInView,
-                    persistence: ShiftPersistence::Saved(read.completed_through),
-                })
-            });
-            let nav = self.get_nav_indices();
-            self.spread_shift.resolve(&self.page_identity_index, &nav);
+            self.spread_shift.state = if state == SpreadShiftState::None {
+                ViewerShift::None
+            } else {
+                ViewerShift::Book(state)
+            };
             self.invalidate_fullscreen_display_unit_owners();
-            if restore.cause == ShiftRestoreCause::RetainedReadoption {
+            if restore.cause != ShiftRestoreCause::FreshOpen {
                 self.adopt_shift_layout_without_navigation();
             }
         }
@@ -537,6 +673,75 @@ impl App {
         Ok(true)
     }
 
+    /// Delegate policy, cause and saved/retained state to E. Only the actual saved
+    /// anchor needs an identity/member proof: E never resolves any other page in
+    /// this call. Narrowing the proof avoids an O(book-size) UI identity-map clone.
+    fn resolve_captured_automatic_shift(
+        &mut self,
+        receipt: RestoreReceipt,
+        cause: ShiftRestoreCause,
+        memory: ShiftMemoryPolicy,
+        read: Option<ShiftReadReply>,
+        maintenance_epoch: u64,
+    ) -> Result<SpreadShiftState, String> {
+        let retained_state = match &self.spread_shift.state {
+            ViewerShift::Book(state) => state.clone(),
+            _ => SpreadShiftState::None,
+        };
+        let anchor = if memory == ShiftMemoryPolicy::Remember {
+            read.as_ref().and_then(|read| read.row.as_ref())
+        } else if cause == ShiftRestoreCause::RetainedReadoption {
+            match &retained_state {
+                SpreadShiftState::Adjusted { anchor_ref, .. } => Some(anchor_ref),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let identity_and_slot = anchor.and_then(|reference| {
+            let identity = reference.to_identity(&receipt.scope).ok()?;
+            let slot = self.page_identity_index.resolve_shift_identity(&identity)?;
+            Some((identity, slot))
+        });
+        let identity_index =
+            ShiftIdentityIndex::prepare(&receipt.scope, identity_and_slot.clone())?;
+        let nav = self.get_nav_indices();
+        let anchor_member = identity_and_slot
+            .as_ref()
+            .map(|(_, slot)| *slot)
+            .filter(|slot| nav.contains(slot));
+        let request = ResolveShiftRequest {
+            scope: receipt.scope.clone(),
+            manifest: ShiftManifest {
+                generation: receipt.items_generation,
+            },
+            nav_order: ShiftNavOrder {
+                // This synchronous adoption consumes the accepted generation now;
+                // no delayed G reply or second navigation owner is introduced.
+                generation: self.items_generation,
+                indices: anchor_member.into_iter().collect::<Vec<_>>().into(),
+            },
+            identity_index,
+            rules: self.accepted_spread_shift_rules(),
+            cause,
+            memory_policy: memory,
+            layout_eligibility: self.pairing_edit_availability(),
+            receipt,
+        };
+        let BookLayoutSource::Automatic { shift, .. } = resolve_book_layout_source::<()>(
+            PreparedLayoutRecipe::Automatic {
+                shift_read: read,
+                retained_state,
+                maintenance_epoch,
+            },
+            request,
+        )?
+        else {
+            return Err("automatic shift resolver returned another recipe".into());
+        };
+        Ok(shift.state)
+    }
+
     fn next_shift_operation(&mut self) -> ShiftOperation {
         self.spread_shift.operation_sequence = self.spread_shift.operation_sequence.wrapping_add(1);
         ShiftOperation {
@@ -547,6 +752,9 @@ impl App {
     }
 
     fn persist_live_shift(&mut self, clear: bool) {
+        if self.pairing_edit_availability() != PairingEditAvailability::Automatic {
+            return;
+        }
         let Some(scope) = self.spread_shift.scope.clone() else {
             return;
         };
@@ -593,7 +801,7 @@ impl App {
     }
 
     pub(crate) fn set_live_spread_shift(&mut self, anchor_idx: usize) -> bool {
-        if self.spread_shift.availability != PairingEditAvailability::Automatic
+        if self.pairing_edit_availability() != PairingEditAvailability::Automatic
             || self.spread_shift.retained_readoption_pending()
         {
             return false;
@@ -635,7 +843,7 @@ impl App {
 
     /// Explicit reset after the existing synchronous base setter succeeds (Q3).
     pub(crate) fn reset_live_spread_shift(&mut self, explicit_clear: bool) -> bool {
-        if self.spread_shift.availability != PairingEditAvailability::Automatic {
+        if self.pairing_edit_availability() != PairingEditAvailability::Automatic {
             return false;
         }
         let had_shift = !matches!(self.spread_shift.state, ViewerShift::None);
@@ -660,14 +868,23 @@ impl App {
     }
 
     pub(crate) fn spread_shift_memory_setting_changed(&mut self, enabled: bool) {
+        if self.settings.remember_spread_shift_per_book == enabled {
+            return;
+        }
+        let availability = self.pairing_edit_availability();
         self.spread_shift_settings_generation =
             self.spread_shift_settings_generation.wrapping_add(1);
         self.settings.remember_spread_shift_per_book = enabled;
-        self.spread_shift.session_only();
+        if availability == PairingEditAvailability::Automatic {
+            self.spread_shift.session_only();
+        }
+        if let Some(snapshot) = self.snapshot.as_mut() {
+            snapshot.saved_viewing_state.shift.session_only();
+        }
         #[cfg(windows)]
         self.make_at_rest_spread_shifts_session_only();
         if enabled
-            && self.spread_shift.availability == PairingEditAvailability::Automatic
+            && availability == PairingEditAvailability::Automatic
             && matches!(
                 self.spread_shift.state,
                 ViewerShift::Book(SpreadShiftState::Adjusted { .. })
@@ -676,6 +893,25 @@ impl App {
             self.persist_live_shift(false);
         }
         self.refresh_pending_book_shift_memory_policy();
+    }
+
+    /// HUD memory changes are pairing actions. The global preferences hook above
+    /// remains available without changing this composed book's dormant adjustment.
+    pub(crate) fn set_spread_shift_memory_from_pairing(&mut self, enabled: bool) -> bool {
+        let availability = self.pairing_edit_availability();
+        let rules = self.accepted_spread_shift_rules();
+        if let PairingAdmission::Rejected(reason) = admit_pairing_action(
+            PairingContextToken {
+                rules: &rules,
+                availability,
+            },
+            PairingAction::SetMemoryPolicy,
+        ) {
+            self.show_feedback_toast(reason.into());
+            return false;
+        }
+        self.spread_shift_memory_setting_changed(enabled);
+        true
     }
 
     pub(super) fn fenced_book_resume(
@@ -695,4 +931,9 @@ impl App {
         self.spread_shift.projection = None;
         self.spread_shift.state = anchor.map_or(ViewerShift::None, ViewerShift::Ordinary);
     }
+}
+
+#[cfg(test)]
+mod composition_tests {
+    include!("spread_shift_composition_tests.rs");
 }

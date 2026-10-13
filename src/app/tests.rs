@@ -1750,7 +1750,14 @@ fn mutation_refresh_navigation_retires_pin_materialization_owner_and_keeps_sibli
             None,
             mounted.settings.file_type_visibility.clone(),
         ));
-        mounted.install_prepared_aggregate_items(items, vec![None], page_identity_index);
+        mounted.install_prepared_aggregate_items(
+            crate::app::book_materialization::ProjectionRecipe::ExtractedResult(
+                crate::app::book_materialization::ExtractedSurface::Collection,
+            ),
+            items,
+            vec![None],
+            page_identity_index,
+        );
         assert!(sibling_cancel.load(Ordering::Relaxed));
         assert!(!mounted.current_view_pin_refreshes.contains_key(&sibling));
         assert!(!successor_cancel.load(Ordering::Relaxed));
@@ -20394,6 +20401,47 @@ mod phase_c_folder_nav_history_tests {
                 .history
                 .forward_stack,
             vec![a_child]
+        );
+    }
+
+    #[test]
+    fn g1_history_back_from_a2_adopts_original_book_view_without_writing_a2() {
+        use crate::app::book_materialization::{ExtractedSurface, ProjectionRecipe};
+        use crate::settings::{ReadingDirection, ReadingFlow, SpreadMode};
+        let mut app = setup_app();
+        let book = app.tmp.path().join("g1-return-book");
+        std::fs::create_dir_all(&book).unwrap();
+        std::fs::write(book.join("01.jpg"), []).unwrap();
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.settings.auto_fullscreen_image_folders = true;
+        app.active_quick_folder_slot = None;
+        let db_path = app.tmp.path().join("g1-return-spread.db");
+        app.spread_db = Ok(crate::spread_db::SpreadDb::open_at(&db_path).unwrap());
+        app.spread_db
+            .as_ref()
+            .unwrap()
+            .set(
+                &book,
+                SpreadMode::RtlCover,
+                SpreadMode::Single,
+                ReadingFlow::Paged,
+                ReadingDirection::Rtl,
+            )
+            .unwrap();
+        app.current_folder = Some(super::rating_view_synthetic_path());
+        app.projection_recipe = ProjectionRecipe::ExtractedResult(ExtractedSurface::Rating);
+        app.begin_extracted_result_view();
+        app.apply_fullscreen_spread_mode(&egui::Context::default(), 0, SpreadMode::Ltr);
+        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(book.clone()).into()];
+        app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
+        finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(app.current_folder.as_ref(), Some(&book));
+        assert!(matches!(app.projection_recipe, ProjectionRecipe::Book(_)));
+        assert_eq!(app.spread_mode, SpreadMode::RtlCover);
+        assert_eq!(app.reading_direction, ReadingDirection::Rtl);
+        assert_eq!(
+            app.spread_db.as_ref().unwrap().get(&book),
+            Some(SpreadMode::RtlCover)
         );
     }
 
@@ -71966,6 +72014,17 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     #[test]
     fn remote_session_barriers_keep_modal_until_final_release() {
         let mut app = setup_app();
+        // App startup admits an asynchronous meter read. This test isolates the AI
+        // terminal lease, so first fence that independent work by its actual receipt.
+        // A single UI poll cannot promise that the writer has finished under load.
+        let writer = app.book_resume_writer.as_ref().expect("resume writer");
+        let cutoff = writer.watermarks().admitted;
+        let startup = writer
+            .read_position_after("remote-session-startup", cutoff)
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("startup resume read completion");
+        startup.status.expect("startup resume read succeeded");
+        assert!(startup.completed_through >= cutoff);
         let ctx = egui::Context::default();
         let handle = crate::remote_ipc::session::SessionHandle::new();
         app.set_remote_session_handle(handle.clone());
@@ -72034,6 +72093,73 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             after_later_poll.control_return_sequence,
             released.control_return_sequence
         );
+    }
+
+    #[test]
+    fn remote_session_barriers_wait_for_resume_read_after_local_worker_release() {
+        use crate::remote_ipc::session::RemoteControlPhase;
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let handle = crate::remote_ipc::session::SessionHandle::new();
+        app.set_remote_session_handle(handle.clone());
+        assert!(app.spread_shift_service.is_none());
+        assert!(app.book_composition_service.is_none());
+        assert!(app.composition_editor_acquire_ready());
+
+        // This is the same Read command used by BookResumeMeters::reload at startup.
+        // Hold its real worker before admission, without sleeps or UI-poll retries.
+        let writer = app.book_resume_writer.as_ref().expect("resume writer");
+        let release = writer.pause_for_test();
+        let read = writer.read_all();
+        let pending = writer.watermarks();
+        assert_eq!(pending.admitted, pending.completed_through + 1);
+
+        let local_ai_activity = app.local_ai_activity_lease();
+        handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
+            client_id: "phone".to_owned(),
+            peer: mimageviewer_ipc::SessionPeerInfo {
+                connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+                device_name: None,
+            },
+        });
+        app.poll_remote_session(&ctx);
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::AcquiringRemote);
+        drop(local_ai_activity);
+        assert!(app.local_ai_remote_barrier_snapshot().is_quiesced());
+        assert_eq!(
+            app.local_viewer_close_state(None),
+            crate::app::LocalViewerCloseState::Closed
+        );
+        app.poll_remote_session(&ctx);
+        assert_eq!(
+            handle.snapshot().phase,
+            RemoteControlPhase::AcquiringRemote,
+            "AI completion alone cannot release an outstanding resume read"
+        );
+        assert_eq!(
+            app.book_resume_writer.as_ref().unwrap().watermarks(),
+            pending
+        );
+        assert!(app.remote_session_blocks_local_control());
+        assert_eq!(handle.snapshot().acquisition_sequence, 1);
+        assert_eq!(handle.snapshot().control_return_sequence, 0);
+
+        release.send(()).unwrap();
+        read.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("held resume read completion")
+            .expect("held resume read succeeded");
+        let completed = app.book_resume_writer.as_ref().unwrap().watermarks();
+        assert_eq!(completed.admitted, pending.admitted);
+        assert_eq!(completed.completed_through, pending.admitted);
+        app.poll_remote_session(&ctx);
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::RemoteActive);
+
+        handle.local_disconnect();
+        app.poll_remote_session(&ctx);
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::Local);
+        assert_eq!(handle.snapshot().control_return_sequence, 1);
+        assert!(!app.remote_session_blocks_local_control());
     }
 
     #[test]
@@ -98872,6 +98998,7 @@ fn prepared_aggregate_installs_exact_per_item_edit_state() {
     };
 
     app.start_loading_subfolder_items(
+        crate::app::book_materialization::ExtractedSurface::SubfolderExpansion,
         PathBuf::from("__smart_folder__\\test"),
         vec![GridItem::Image(path)],
         vec![Some((1, 5))],

@@ -20,6 +20,19 @@ pub enum FileTypeCategory {
     Lzh,
 }
 
+/// Shared image-book predicate; callers determine their inventory before calling.
+/// Viewing applies its existing visibility policy first; saving supplies the full
+/// physical inventory, so a hidden obstacle cannot disappear from a ZIP operation.
+pub(crate) fn is_image_only_book_contents(
+    has_container: bool,
+    media: impl IntoIterator<Item = FileTypeCategory>,
+) -> bool {
+    let mut media = media.into_iter().peekable();
+    !has_container
+        && media.peek().is_some()
+        && media.all(|kind| matches!(kind, FileTypeCategory::Image | FileTypeCategory::Raw))
+}
+
 impl FileTypeCategory {
     pub const ALL: [Self; 10] = [
         Self::Image,

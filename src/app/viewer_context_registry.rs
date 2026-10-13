@@ -821,6 +821,7 @@ pub(in crate::app) struct ViewerContextBundle {
     stack_selection_target: Option<crate::filename_stack_ui::StackSelectionTarget>,
     items: Vec<GridItem>,
     page_identity_index: Arc<super::file_type_resume::PreparedPageIdentityIndex>,
+    projection_recipe: super::book_materialization::ProjectionRecipe,
     current_book_bookmarks: Vec<crate::book_bookmarks::BookBookmark>,
     current_book_bookmarks_key: Option<BookBookmarkProjectionKey>,
     current_book_bookmarks_request: Option<CurrentBookBookmarksRequest>,
@@ -1079,6 +1080,10 @@ pub(in crate::app) struct ViewerContextBundle {
     singleton_spread_endpoint_preferences: crate::settings::SingletonSpreadEndpointPreferences,
     page_alone_preferences: crate::settings::PageAlonePreferences,
     pub(super) spread_shift: super::spread_shift_owner::ViewerSpreadShift,
+    pub(super) book_composition: super::book_composition_runtime::ViewerBookComposition,
+    pub(super) composition_editor: super::book_composition_editor::CompositionEditorState,
+    pub(super) book_composition_permission:
+        super::book_composition_permission::ViewerPresentationPermission,
     reading_flow: crate::settings::ReadingFlow,
     reading_direction: crate::settings::ReadingDirection,
     slideshow_playing: bool,
@@ -1181,6 +1186,7 @@ pub(in crate::app) struct ContextRef<'a> {
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::app) enum ContextAsyncOwner {
+    BookCompositionRead,
     RetainedSpreadShift,
     PathClassification,
     HistoryTransition,
@@ -1212,7 +1218,8 @@ pub(in crate::app) enum ContextAsyncServicePhase {
 
 #[cfg(windows)]
 impl ContextAsyncOwner {
-    pub(in crate::app) const ALL: [Self; 20] = [
+    pub(in crate::app) const ALL: [Self; 21] = [
+        Self::BookCompositionRead,
         Self::RetainedSpreadShift,
         Self::EpubConversion,
         Self::PdfPassword,
@@ -1239,6 +1246,10 @@ impl ContextAsyncOwner {
         macro_rules! pending {
             ($owner:ident) => {
                 match self {
+                    Self::BookCompositionRead => {
+                        ($owner.book_composition.is_pending()
+                            || $owner.book_composition_permission.pending())
+                    }
                     Self::RetainedSpreadShift => $owner.spread_shift.retained_readoption_pending(),
                     Self::PathClassification => $owner
                         .top_level_grid_view
@@ -1287,7 +1298,7 @@ impl ContextAsyncOwner {
         }
     }
 
-    /// Collection/rating/bookmark polls also create or retire work from their visible surface.
+    /// Composition/collection/rating/bookmark polls also admit work from their current scope.
     /// All other owners need a live request before a mounted frame calls their worker service.
     pub(in crate::app) fn needs_mounted_service(self, context: ContextRef<'_>) -> bool {
         if matches!(self, Self::FullscreenDecode | Self::RawPages) {
@@ -1297,7 +1308,10 @@ impl ContextAsyncOwner {
         }
         matches!(
             self,
-            Self::CollectionGrid | Self::CollectionNavigation | Self::RatingNavigation
+            Self::BookCompositionRead
+                | Self::CollectionGrid
+                | Self::CollectionNavigation
+                | Self::RatingNavigation
         ) || self.is_pending(context)
     }
 
@@ -1320,6 +1334,7 @@ impl ContextAsyncOwner {
             return;
         }
         match self {
+            Self::BookCompositionRead => app.poll_book_composition_read(ctx),
             Self::RetainedSpreadShift => app.poll_retained_shift_readoption(ctx),
             Self::PathClassification => app.poll_open_path_classification(ctx),
             Self::HistoryTransition => app.poll_collection_history_transition(ctx),
@@ -1359,7 +1374,9 @@ impl ContextAsyncOwner {
             Self::EraseInpaint => app.poll_erase_inpaint(ctx),
             Self::SimilarPreview => {
                 let passwords = app.pdf_passwords.clone();
-                app.similar_panel.preview.poll_background(ctx, &passwords);
+                if let Some(notice) = app.similar_panel.preview.poll_background(ctx, &passwords) {
+                    app.show_feedback_toast(notice);
+                }
             }
             Self::FolderNavigation | Self::FolderPaneScan => {}
         }
@@ -1459,6 +1476,16 @@ impl ContextAsyncOwner {
                 }
             }
             Self::SimilarPreview => app.similar_panel.preview.terminate_on_park(),
+            Self::BookCompositionRead => {
+                app.retire_book_presentation_permission();
+                if matches!(
+                    app.book_composition,
+                    super::book_composition_runtime::ViewerBookComposition::Preparing { .. }
+                        | super::book_composition_runtime::ViewerBookComposition::Projecting { .. }
+                ) {
+                    app.book_composition = Default::default();
+                }
+            }
             Self::RetainedSpreadShift => app.spread_shift.cancel_retained_readoption(),
         }
     }
@@ -1874,6 +1901,7 @@ impl ViewerContextBundle {
             stack_selection_target: None,
             items: Vec::new(),
             page_identity_index: Default::default(),
+            projection_recipe: Default::default(),
             current_book_bookmarks: Vec::new(),
             current_book_bookmarks_key: None,
             current_book_bookmarks_request: None,
@@ -2068,6 +2096,9 @@ impl ViewerContextBundle {
                 crate::settings::SingletonSpreadEndpointPreferences::default(),
             page_alone_preferences: crate::settings::PageAlonePreferences::default(),
             spread_shift: Default::default(),
+            book_composition: Default::default(),
+            composition_editor: Default::default(),
+            book_composition_permission: Default::default(),
             reading_flow: crate::settings::ReadingFlow::default(),
             reading_direction: crate::settings::ReadingDirection::default(),
             slideshow_playing: false,
@@ -2193,6 +2224,9 @@ impl App {
         window_id: u64,
         idx: usize,
     ) {
+        if self.viewer_mutation_modal_active() {
+            return;
+        }
         match self.try_own_fullscreen_epub_at(idx) {
             super::OpenAdmission::Accepted => {}
             super::OpenAdmission::NotApplicable => return,
@@ -2249,6 +2283,7 @@ impl App {
             stack_selection_target,
             items,
             page_identity_index,
+            projection_recipe,
             current_book_bookmarks,
             current_book_bookmarks_key,
             current_book_bookmarks_request,
@@ -2436,6 +2471,9 @@ impl App {
             singleton_spread_endpoint_preferences,
             page_alone_preferences,
             spread_shift,
+            book_composition,
+            composition_editor,
+            book_composition_permission,
             reading_flow,
             reading_direction,
             slideshow_playing,
@@ -2525,6 +2563,7 @@ impl App {
         swap_field!(stack_selection_target);
         swap_field!(items);
         swap_field!(page_identity_index);
+        swap_field!(projection_recipe);
         swap_field!(current_book_bookmarks);
         swap_field!(current_book_bookmarks_key);
         swap_field!(current_book_bookmarks_request);
@@ -2723,6 +2762,9 @@ impl App {
         swap_field!(singleton_spread_endpoint_preferences);
         swap_field!(page_alone_preferences);
         swap_field!(spread_shift);
+        swap_field!(book_composition);
+        swap_field!(composition_editor);
+        swap_field!(book_composition_permission);
         swap_field!(reading_flow);
         swap_field!(reading_direction);
         swap_field!(slideshow_playing);
@@ -2869,6 +2911,7 @@ impl App {
             stack_selection_target,
             items,
             page_identity_index,
+            projection_recipe,
             current_book_bookmarks,
             current_book_bookmarks_key,
             current_book_bookmarks_request,
@@ -3056,6 +3099,9 @@ impl App {
             singleton_spread_endpoint_preferences,
             page_alone_preferences,
             spread_shift,
+            book_composition,
+            composition_editor,
+            book_composition_permission,
             reading_flow,
             reading_direction,
             slideshow_playing,
@@ -3150,6 +3196,7 @@ impl App {
             stack_selection_target,
             items,
             page_identity_index,
+            projection_recipe,
             bookmark_view_registered_total,
             items_generation,
             visible_indices,
@@ -3382,6 +3429,11 @@ impl App {
             singleton_spread_endpoint_preferences,
             page_alone_preferences,
             spread_shift,
+            book_composition,
+            // A fork keeps the exact editor request with its original context. Its new
+            // sibling starts Closed; the mount-independent operation owner never changes.
+            composition_editor,
+            book_composition_permission,
             reading_flow,
             reading_direction,
             pdf_enumerate_pending,
@@ -3437,6 +3489,7 @@ impl App {
             self.image_metas = std::mem::take(&mut snapshot.saved_image_metas);
             self.visible_indices = std::mem::take(&mut snapshot.saved_visible_indices);
             self.page_identity_index = snapshot.saved_page_identity_index.clone();
+            self.projection_recipe = snapshot.saved_projection_recipe.clone();
             self.scroll_offset_y = snapshot.saved_scroll_offset_y;
             self.zip_nav = snapshot.saved_zip_nav.take();
             self.top_level_grid_view = top_level_grid_view::TopLevelGridView::default();
@@ -3485,6 +3538,9 @@ impl App {
         detached.singleton_spread_endpoint_preferences = self.singleton_spread_endpoint_preferences;
         detached.page_alone_preferences = self.page_alone_preferences;
         detached.spread_shift = self.spread_shift.fork_accepted();
+        detached.book_composition = self.book_composition.clone();
+        detached.composition_editor = Default::default();
+        detached.book_composition_permission = self.book_composition_permission.clone();
         detached.reading_flow = self.reading_flow;
         detached.reading_direction = self.reading_direction;
 
@@ -3768,6 +3824,32 @@ impl App {
         self.viewer_contexts.table.residence(id)
     }
 
+    pub(in crate::app) fn book_composition_contexts_to_poll(
+        &self,
+        changed: &[String],
+    ) -> Vec<ViewerContextId> {
+        self.viewer_contexts
+            .table
+            .slots
+            .iter()
+            .filter_map(|(id, slot)| {
+                let Slot::AtRest(bundle) = slot else {
+                    return None;
+                };
+                let needs_read = matches!(
+                    bundle.book_composition,
+                    super::book_composition_runtime::ViewerBookComposition::Preparing { .. }
+                        | super::book_composition_runtime::ViewerBookComposition::Projecting { .. }
+                ) || bundle.book_composition_permission.pending()
+                    || bundle
+                        .book_composition
+                        .scope()
+                        .is_some_and(|scope| changed.contains(&scope.storage_key()));
+                needs_read.then_some(*id)
+            })
+            .collect()
+    }
+
     pub(in crate::app) fn deliver_spread_shift_reply_at_rest(
         &mut self,
         reply: &crate::spread_shift::ShiftWriteReply,
@@ -3779,6 +3861,14 @@ impl App {
                 bundle
                     .spread_shift
                     .accept_write_reply(reply, self.settings.remember_spread_shift_per_book)
+                    .or_else(|| {
+                        bundle
+                            .snapshot
+                            .as_mut()?
+                            .saved_viewing_state
+                            .shift
+                            .accept_write_reply(reply, self.settings.remember_spread_shift_per_book)
+                    })
             })
     }
 
@@ -3788,6 +3878,9 @@ impl App {
                 Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
             };
             bundle.spread_shift.session_only();
+            if let Some(snapshot) = bundle.snapshot.as_mut() {
+                snapshot.saved_viewing_state.shift.session_only();
+            }
         }
     }
 
@@ -3808,6 +3901,12 @@ impl App {
             if super::spread_shift_live_mappings::migrate(&mut bundle.spread_shift, mappings) {
                 bundle.fullscreen_navigator_interaction.invalidate();
                 bundle.similar_panel.preview.invalidate();
+            }
+            if let Some(snapshot) = bundle.snapshot.as_mut() {
+                super::spread_shift_live_mappings::migrate(
+                    &mut snapshot.saved_viewing_state.shift,
+                    mappings,
+                );
             }
         }
     }
@@ -4400,6 +4499,8 @@ impl App {
     ) -> Result<D, RetireError> {
         let reason = _reason;
         let retiring_window = self.viewer_contexts.table.window_for_context(id);
+        self.close_composition_editor_for_context(id);
+        self.cancel_image_folder_zip_for_context(id);
         self.viewer_contexts.table.begin_retire(id)?;
         self.cancel_rating_membership_restore_for_context(id);
         if retiring_window == self.active_detached_window_id() {
@@ -4930,6 +5031,8 @@ mod tests {
                 },
                 generation_id: app.items_generation,
                 saved_items: vec![basis.clone()],
+                saved_projection_recipe: app.projection_recipe.clone(),
+                saved_viewing_state: app.capture_snapshot_viewing_state(),
                 saved_page_identity_index: app.page_identity_index.clone(),
                 saved_thumbnails: vec![ThumbnailState::Pending],
                 saved_image_metas: vec![None],
@@ -4938,6 +5041,7 @@ mod tests {
                 saved_selected: Some(0),
                 saved_zip_nav: None,
                 list_view_items: vec![basis.clone(), direct],
+                list_view_projection_recipe: app.projection_recipe.clone(),
                 list_view_thumbnails: vec![ThumbnailState::Pending; 2],
                 list_view_image_metas: vec![None; 2],
                 list_view_page_identity_index: app.page_identity_index.clone(),
@@ -5267,6 +5371,71 @@ mod tests {
                 .iter()
                 .all(|event| event.seen_after == event.write_generation)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn g1_recipe_mount_fork_close_preserves_sibling_items_workers_and_cache() {
+        use super::super::book_materialization::{BookScope, ExtractedSurface, ProjectionRecipe};
+        let mut app = crate::app::setup_app_for_test();
+        let recipe = ProjectionRecipe::ExtractedResult(ExtractedSurface::Collection);
+        app.projection_recipe = recipe.clone();
+        app.spread_mode = crate::settings::SpreadMode::Rtl;
+        app.items = vec![GridItem::Image(PathBuf::from("C:/result/a.png"))];
+        let generation = app.items_generation;
+        let cancel = app.cancel_token.clone();
+        let sibling = app.build_window_context_for_test(9914, |owner| {
+            owner.projection_recipe =
+                ProjectionRecipe::Book(BookScope::Document(PathBuf::from("C:/sibling.pdf")));
+            owner.items = vec![GridItem::PdfPage {
+                pdf_path: PathBuf::from("C:/sibling.pdf"),
+                page_num: 80,
+                content_type: None,
+            }];
+            owner.fs_early_dims.insert(0, [123, 456]);
+            owner.reload_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+        });
+        let sibling_before = app
+            .with_viewer_context(sibling, |owner| {
+                (
+                    owner.projection_recipe.clone(),
+                    owner.items.clone(),
+                    owner.items_generation,
+                    owner.cancel_token.clone(),
+                    owner.reload_queue.clone(),
+                    owner.fs_early_dims.get(&0).copied(),
+                )
+            })
+            .unwrap();
+        let mut fork = app.split_current_context_preserving_main_grid();
+        assert_eq!(fork.projection_recipe, recipe);
+        app.swap_viewer_context_bundle(&mut fork);
+        app.begin_extracted_result_view();
+        app.swap_viewer_context_bundle(&mut fork);
+        drop(fork);
+        assert_eq!(app.projection_recipe, recipe);
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Rtl);
+        assert_eq!(app.items_generation, generation);
+        assert!(Arc::ptr_eq(&app.cancel_token, &cancel));
+        assert!(!cancel.load(Ordering::Relaxed));
+        app.with_viewer_context(sibling, |owner| {
+            assert_eq!(owner.projection_recipe, sibling_before.0);
+            assert_eq!(owner.items, sibling_before.1);
+            assert_eq!(owner.items_generation, sibling_before.2);
+            assert!(Arc::ptr_eq(&owner.cancel_token, &sibling_before.3));
+            assert!(!owner.cancel_token.load(Ordering::Relaxed));
+            assert!(Arc::ptr_eq(
+                owner.reload_queue.as_ref().unwrap(),
+                sibling_before.4.as_ref().unwrap()
+            ));
+            assert_eq!(
+                owner.reload_queue.as_ref().unwrap().0.lock().unwrap().len(),
+                0
+            );
+            assert_eq!(owner.fs_early_dims.get(&0).copied(), sibling_before.5);
+            assert_eq!(owner.fs_early_dims.len(), 1);
+        })
+        .unwrap();
     }
 
     #[cfg(windows)]

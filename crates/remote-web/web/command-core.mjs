@@ -1164,12 +1164,18 @@ export function planSpreadIntent({
   portraitSinglePage = true,
   viewportWidth = 0,
   viewportHeight = 0,
+  modeOnly = false,
 } = {}) {
   const forceSinglePage = Boolean(portraitSinglePage) &&
     isPortraitViewport(viewportWidth, viewportHeight);
   const validModes = Object.values(SpreadMode);
   const writeRequest = selectedMode !== null && validModes.includes(selectedMode)
-    ? {
+    ? modeOnly ? {
+        kind: "set_view_mode",
+        address,
+        mode: selectedMode === SpreadMode.SINGLE ? "single"
+          : [SpreadMode.SPLIT_LTR, SpreadMode.SPLIT_RTL].includes(selectedMode) ? "landscape_split" : "spread",
+      } : {
         kind: "set_spread",
         address,
         spread_mode: selectedMode,
