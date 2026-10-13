@@ -8,6 +8,8 @@ ACCEPT（P1／P2なし）、利用者の実装指示に従い実装・独立コ�
 R10提出時は設計書とmanualだけを変更した。実装工程では§6の回帰・性能検証を行い、
 §1.373の既存Append／Undo契約を維持する。アプリ起動・コミットは行わない。
 R8 ACCEPTや旧検証をR10の受入証拠にしない。
+実装基点`a73ea3750`の独立レビューはREVISE（P2一件／P3二件）。修正と今回の最終検証は§8.4に記録し、
+§8.2の初回実装検証とは区別する。
 正本項目: [next-release-backlog.md §1.375](next-release-backlog.md#1375-フォルダで-delete-キーで削除すると正しく消えた一覧がもう一度丸ごと読み直されてちらつく--利用者の実機報告-2026-10-12)。
 
 案B・自己操作operation ID・provenanceによる照合、代表選択保持・leaf付きcache key・選択付きpayload・
@@ -504,3 +506,52 @@ full実行は計2回（最初は3件失敗、修正後の完走は1回）。最�
 source 17ファイル（新規回帰module 1を含む）・docs 7ファイル。
 manualのgrid／shortcutsは提出済みR10の記述と照合し、追加変更はない。
 §1.373の設計書・manual、Cargo設定、ビルドscriptは変更しない。
+
+### 8.4 a73ea3750 独立実装レビューの修正（2026-10-14）
+
+P2は、成功Deleteが表示行と観測の除去記録だけを進め、StackViewのメンバー／aggregate→flat対応表と
+保持した集約投影を進めない所有境界の不整合だった。Equalは正しくinstallを省くため旧対応表が残る。
+成功集合の確定後、既存delete workerで元のgrouping／rating順snapshotから成功分だけを除去し、
+同じsurvivor候補から両対応表を再構築する。UIで全件clone・sort・DB読込みは行わない。
+保持投影がある場合はmaintenance lease解放後に既存Stack candidate読込みを行う。
+2枚Stack→単独Imageでは元の集約snapshotに生存画像のpage keyがないため、単純なindex remapを採らない。
+削除取消・部分失敗でも成功分だけを準備する。既存DeletePending／modalを同じ完了通知まで保持し、
+Stackの背景採用とclose reconcileは削除終端まで延期する。完了受理でcontext／generation／元view Arcを
+確認し、StackView／保持投影の交換と表示行の除去を同一frameで行う。兄弟の共有Arcは変更しない。
+旧payloadは既存retirement workerへ渡す。古いownerの結果は採らず、同sourceの置換済み一覧には
+観測不明から通常の準備を行う。保持投影の読込み失敗はログ＋通知と既存の一覧復帰時refreshで扱う。
+読込み失敗時は旧集約を復帰させず、flat survivorを保ったまま観測不明＋既存の一覧復帰時refreshへ渡す。
+未採用のflat列をaggregate modeに変えて既存Recoveringへ流す案は、対応表の前提が違うため採らない。
+新pending owner・自己操作ID・通知の時間窓・Equal側の強制installは追加しない。
+この削除完了境界とworker配置は独立のCodex設計確認で合意した。
+
+同型の初回分類（Extracting／Grouping／そのRetry）にも、成功Deleteで入力世代が変わった後に
+旧要求だけがstaleとなり、Equalが分類の再開を省く経路がある。表示済みStackと分け、
+初期要求のcontext／generation／件数／sequence／sourceとサブ展開snapshot Arcを削除前に照合する。
+成功visible idxがある場合だけ旧要求を取消・既存retirement workerへ渡す。
+通常Folderは未完成consumerの観測資格を不明に戻し、既存終端rescan→Differentで分類を再準備する。
+サブ展開は物理rescanを使わず、削除後のcurrent itemsと既存snapshot／tombstoneから、
+元のhydration intentを持つ既存分類入口を再開する。全件clone・sortはUIで行わない。
+成功ゼロは元の初期要求を保持する。新pending ownerや完了後のmode切替を追加しない。
+この初期入口とサブ展開の同型も独立の設計確認で合意し、両段階の成功／取消回帰を追加した。
+
+回帰は単独Image／先頭Folderの自己Delete→実worker Equal→残存Stackを開く対照と、
+flat member削除→単独Image復帰時の編集・★・対応表を含む。
+P3 cutoff試験は最初のworker結果を固定後に外部ファイル変更と後続通知を入れ、最初の受理では
+captured cutoffだけをackしdirtyが残ること、次の走査で追加ファイルが表示されることを検査する。
+P3保持試験は本番worker→Equal pollを通し、非既定の選択・check・scroll・進行中thumbnail要求と
+同世代の遅着画像の採用を直接検査する。旧§1.314のテスト専用早期returnには依存しない。
+新規回帰8件（handler 7件／純粋reducer 1件）と既存cutoff回帰の強化を行った。
+最終sourceの関連テストは272件成功／失敗0（§1.375 36、Stack reducer 28、Stack UI 24、
+Delete worker 17、行除去15、rescan 4、context 80、§1.373 68）。
+`cargo fmt --check`、通常／portableのcore `cargo check`、UI glyph検査はすべて成功。
+`build-dev.ps1 -PreserveRuntime`は通常機能セットのcore／remote／EPUB workerを生成しexit 0、
+VCRT検査もruntime 4／PE 3で成功した。共有Delete終端を変更したため`test-full.ps1`を今回1回実行し、
+13,539件成功／失敗0／既存ignored 63件、PASS。
+最終source 5ファイルのSHA-256は検証前後で一致する。独立の変更境界確認でも追加P1／P2はない。
+結果は[最終state](../target/section1375-review-final/state.json)、
+[full stdout](../target/section1375-review-final/full.stdout.log)／
+[stderr](../target/section1375-review-final/full.stderr.log)に保存した。
+今回の変更はsource 5ファイル（`app.rs`／`section375_tests.rs`／`delete_worker.rs`／
+`filename_stack.rs`／`filename_stack_ui.rs`）とdocs 3ファイル（本書／`filename-stack-plan.md`／
+`async-architecture.md`）。manual／§1.373設計／ビルドscriptは変更せず、コミット・アプリ起動は0件。

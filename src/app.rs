@@ -47602,10 +47602,12 @@ impl App {
                 }
             })
             .collect();
-        self.delete_pending = Some(crate::delete_worker::spawn(
+        let stack = self.capture_stack_deletion();
+        self.delete_pending = Some(crate::delete_worker::spawn_with_stack(
             paths,
             source_scopes,
             self.main_hwnd,
+            stack,
         ));
     }
 
@@ -47625,6 +47627,7 @@ impl App {
         let mut done = false;
         let mut canceled = false;
         let mut store_mutations = crate::rename_key_migration::StoreMutationEffects::default();
+        let mut stack_projection = None;
         loop {
             match pending.rx.try_recv() {
                 Ok(crate::delete_worker::DeleteMsg::Batch {
@@ -47649,6 +47652,17 @@ impl App {
                     store_mutations.merge(effects);
                     break;
                 }
+                Ok(crate::delete_worker::DeleteMsg::DoneWithStack {
+                    canceled: c,
+                    store_mutations: effects,
+                    projection,
+                }) => {
+                    done = true;
+                    canceled = c;
+                    store_mutations.merge(effects);
+                    stack_projection = Some(projection);
+                    break;
+                }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     done = true;
@@ -47666,6 +47680,9 @@ impl App {
         }
 
         let pending = self.delete_pending.take().expect("guarded above");
+        if let Some(projection) = stack_projection {
+            self.adopt_stack_deletion(*projection);
+        }
         self.apply_content_identity_store_mutations(store_mutations);
         let succeeded = pending.succeeded;
         let succeeded_scopes = pending
@@ -47757,7 +47774,11 @@ impl App {
             .collect();
         idxs.sort_unstable_by(|a, b| b.cmp(a));
         if !idxs.is_empty() {
+            let restart = self.retire_initial_stack_for_deletion();
             self.remove_items_batch(&idxs);
+            if let Some(restart) = restart {
+                self.resume_initial_stack_after_deletion(restart);
+            }
         }
         // Successful physical removals always request reconciliation, even with no visible row
         // and no notify delivery. Parent observation is acquired by that same worker.

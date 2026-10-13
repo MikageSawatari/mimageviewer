@@ -47,6 +47,12 @@ pub enum DeleteMsg {
         canceled: bool,
         store_mutations: crate::rename_key_migration::StoreMutationEffects,
     },
+    /// Same terminal, with the Stack survivor projection prepared by this worker.
+    DoneWithStack {
+        canceled: bool,
+        store_mutations: crate::rename_key_migration::StoreMutationEffects,
+        projection: Box<crate::filename_stack_ui::StackDeletionPrepared>,
+    },
 }
 
 /// UI スレッドが保持する worker ハンドル。
@@ -89,6 +95,15 @@ pub fn spawn(
     source_scopes: Vec<DeleteSourceScope>,
     hwnd: Option<isize>,
 ) -> DeletePending {
+    spawn_with_stack(paths, source_scopes, hwnd, None)
+}
+
+pub(crate) fn spawn_with_stack(
+    paths: Vec<PathBuf>,
+    source_scopes: Vec<DeleteSourceScope>,
+    hwnd: Option<isize>,
+    stack: Option<crate::filename_stack_ui::StackDeletionSource>,
+) -> DeletePending {
     let total = paths.len();
     let cancel = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
@@ -106,6 +121,7 @@ pub fn spawn(
                 hwnd.unwrap_or_default(),
                 cancel_worker,
                 tx_worker,
+                stack,
             );
         });
     if let Err(e) = spawn_result {
@@ -145,6 +161,7 @@ fn run_worker(
     hwnd: isize,
     cancel: Arc<AtomicBool>,
     tx: mpsc::Sender<DeleteMsg>,
+    stack: Option<crate::filename_stack_ui::StackDeletionSource>,
 ) {
     let data_dir = crate::data_dir::get();
     let purge_data_dir = data_dir.clone();
@@ -157,6 +174,7 @@ fn run_worker(
         cancel,
         tx,
         has_pdf_passwords,
+        stack,
         recycle_chunk,
         collect_pdf_paths_for_delete,
         |succeeded, pdf_paths, guard| {
@@ -181,6 +199,7 @@ fn run_worker_with_recycler_scoped<F, C, P, J>(
     cancel: Arc<AtomicBool>,
     tx: mpsc::Sender<DeleteMsg>,
     collect_pdf_paths: bool,
+    stack: Option<crate::filename_stack_ui::StackDeletionSource>,
     mut recycle: F,
     mut collect_pdfs: C,
     mut purge: P,
@@ -217,10 +236,7 @@ fn run_worker_with_recycler_scoped<F, C, P, J>(
                     purged_pdf_password_paths: Vec::new(),
                     purge_deferred: false,
                 });
-                let _ = tx.send(DeleteMsg::Done {
-                    canceled: false,
-                    store_mutations: Default::default(),
-                });
+                let _ = tx.send(completed_delete(false, Default::default(), stack, &[]));
                 return;
             }
         };
@@ -387,10 +403,33 @@ fn run_worker_with_recycler_scoped<F, C, P, J>(
             .is_ok();
     }
     if receiver_open {
-        let _ = tx.send(DeleteMsg::Done {
-            canceled: canceled || cancel.load(Ordering::Relaxed),
+        // Candidate reads use the ordinary DB read boundary after deletion maintenance.
+        drop(range_guard);
+        let _ = tx.send(completed_delete(
+            canceled || cancel.load(Ordering::Relaxed),
             store_mutations,
-        });
+            stack,
+            &succeeded_for_purge,
+        ));
+    }
+}
+
+pub(crate) fn completed_delete(
+    canceled: bool,
+    store_mutations: crate::rename_key_migration::StoreMutationEffects,
+    stack: Option<crate::filename_stack_ui::StackDeletionSource>,
+    succeeded: &[PathBuf],
+) -> DeleteMsg {
+    match stack.filter(|_| !succeeded.is_empty()) {
+        Some(source) => DeleteMsg::DoneWithStack {
+            canceled,
+            store_mutations,
+            projection: Box::new(source.prepare(succeeded)),
+        },
+        None => DeleteMsg::Done {
+            canceled,
+            store_mutations,
+        },
     }
 }
 
@@ -429,6 +468,7 @@ fn run_worker_with_recycler<F, C, P, J>(
         cancel,
         tx,
         collect_pdf_paths,
+        None,
         recycle,
         collect_pdfs,
         |scopes, pdf_paths, guard| {
@@ -1027,13 +1067,15 @@ mod worker_tests {
             DeleteMsg::Batch {
                 succeeded, failed, ..
             } => (succeeded.len(), failed.len()),
-            DeleteMsg::Done { .. } => panic!("expected Batch"),
+            DeleteMsg::Done { .. } | DeleteMsg::DoneWithStack { .. } => panic!("expected Batch"),
         }
     }
 
     fn done_canceled(msg: &DeleteMsg) -> bool {
         match msg {
-            DeleteMsg::Done { canceled, .. } => *canceled,
+            DeleteMsg::Done { canceled, .. } | DeleteMsg::DoneWithStack { canceled, .. } => {
+                *canceled
+            }
             DeleteMsg::Batch { .. } => panic!("expected Done"),
         }
     }
@@ -1375,6 +1417,7 @@ mod worker_tests {
                     Arc::new(AtomicBool::new(false)),
                     tx,
                     false,
+                    None,
                     |_hwnd, paths| DeleteChunkOutcome {
                         succeeded: paths.to_vec(),
                         failed: Vec::new(),
@@ -1483,6 +1526,7 @@ mod worker_tests {
                 Arc::new(AtomicBool::new(false)),
                 tx,
                 false,
+                None,
                 |_hwnd, paths| {
                     std::fs::remove_file(&worker_removed).unwrap();
                     shell_done_tx.send(()).unwrap();

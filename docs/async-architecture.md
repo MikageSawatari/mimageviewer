@@ -23,6 +23,13 @@ Stackの二度目のhydrationには既存GroupingSourceとInternalHydrationで�
 既消費のcursor／Append receipt／local searchを再適用しない。
 明示GridReload／通常openでは設定どおりsidecarを取り込む。
 operation IDの自己通知照合、代表保持、cache形式変更、新しいpending ownerは追加しない。
+自己Delete時のStack member／対応表と保持aggregateの準備も既存delete workerに属する。
+purge lease解放後にStack candidateを読み、同じ削除終端でowner／世代／元view Arcを照合して
+表示行除去と同時に受理する。背景Stack採用とclose reconcileはこの既存modalの終端まで延期する。
+共有された兄弟view Arcは変更せず、UIの全件clone・sort・同期I/Oは増やさない。
+初回Stack分類の入力変更では、元のtyped pendingの所有資格を確認して取消・workerへ退役させる。
+通常Folderは観測不明から既存rescanで再準備し、サブ展開は現在行とsnapshot／tombstoneから
+元のhydration intentを持つ既存分類入口へ戻す。成功ゼロは元要求を保持する。
 詳細は [section375-operation-reconcile-plan.md](section375-operation-reconcile-plan.md)。
 
 ## 本別見開き調整の永続化基盤とviewer/Remote接続（§1.364 D1–D3、2026-10-11）

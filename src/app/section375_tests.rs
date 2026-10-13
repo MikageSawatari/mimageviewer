@@ -48,6 +48,7 @@ fn fixture(names: &[&str]) -> (AppTestEnvForTest, PathBuf, egui::Context) {
 
 fn delete_terminal(app: &mut App, paths: Vec<PathBuf>) {
     let (tx, rx) = mpsc::channel();
+    let source = app.capture_stack_deletion();
     tx.send(DeleteMsg::Batch {
         succeeded: paths.clone(),
         failed: vec![],
@@ -55,11 +56,13 @@ fn delete_terminal(app: &mut App, paths: Vec<PathBuf>) {
         purge_deferred: false,
     })
     .unwrap();
-    tx.send(DeleteMsg::Done {
-        canceled: false,
-        store_mutations: Default::default(),
+    let succeeded = paths.clone();
+    let completed = std::thread::spawn(move || {
+        crate::delete_worker::completed_delete(false, Default::default(), source, &succeeded)
     })
+    .join()
     .unwrap();
+    tx.send(completed).unwrap();
     app.delete_pending = Some(DeletePending {
         cancel: Arc::new(AtomicBool::new(false)),
         rx,
@@ -74,6 +77,64 @@ fn delete_terminal(app: &mut App, paths: Vec<PathBuf>) {
             .collect(),
     });
     app.poll_delete_pending();
+}
+
+#[test]
+fn section1375_worker_equal_preserves_cursor_checks_scroll_and_late_thumbnail() {
+    let (mut app, folder, ctx) = fixture(&["a.jpg", "b.jpg", "c.jpg", "d.jpg"]);
+    // Isolate the in-flight request from fixture decoding workers, then deliver its
+    // actual correlated result only after the production Equal branch has run.
+    let (tx, rx) = mpsc::channel();
+    app.tx = tx;
+    app.rx = rx;
+    app.selected = Some(2);
+    app.checked = [1, 3].into_iter().collect();
+    app.scroll_offset_y = 237.0;
+    app.thumbnails[2] = ThumbnailState::Pending;
+    app.keep_set.insert(2);
+    app.keep_range = (0, 4);
+    app.requested.insert(2, false);
+    let generation = app.items_generation;
+    let previous_rows = app.folder_observation.as_ref().unwrap().rows.clone();
+    app.start_external_rescan(&ctx, folder, SystemTime::UNIX_EPOCH);
+    settle(&mut app, &ctx);
+    assert_eq!(app.items_generation, generation);
+    assert!(
+        !Arc::ptr_eq(
+            &previous_rows,
+            &app.folder_observation.as_ref().unwrap().rows
+        ),
+        "production Equal must adopt the new scan record, not reject the result"
+    );
+    assert_eq!(app.selected, Some(2));
+    assert_eq!(app.checked, [1, 3].into_iter().collect());
+    assert_eq!(app.scroll_offset_y, 237.0);
+    assert!(
+        app.requested.contains_key(&2),
+        "Equal must retain the request owner"
+    );
+    send_thumbnail_for_test!(
+        app,
+        crate::thumb_loader::ThumbMsg::from_legacy_parts(
+            2,
+            Some(egui::ColorImage::from_rgba_unmultiplied([2, 2], &[255; 16])),
+            crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+            false,
+            None,
+            Some((2, 2)),
+            None,
+            false,
+            false,
+            0,
+            generation,
+        )
+    )
+    .unwrap();
+    app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+    assert!(matches!(app.thumbnails[2], ThumbnailState::Loaded { .. }));
+    assert!(!app.requested.contains_key(&2));
+    assert_eq!(app.selected, Some(2));
+    assert_eq!(app.scroll_offset_y, 237.0);
 }
 
 #[test]
@@ -447,6 +508,325 @@ fn section1375_main_list_still_refreshes_with_detached_media_presentation() {
 }
 
 #[test]
+fn section1375_stack_self_delete_equal_opens_remaining_stack_after_image_or_folder() {
+    for folder_first in [false, true] {
+        let (mut app, folder, ctx) = fixture(&["a_1.jpg", "b_1.jpg", "b_2.jpg"]);
+        let removed = if folder_first {
+            // The default rule deliberately does not collapse a single media group.
+            // Keep the singleton so this is a real Folder + Image + Stack load.
+            let removed = folder.join("a-folder");
+            std::fs::create_dir(&removed).unwrap();
+            removed
+        } else {
+            folder.join("a_1.jpg")
+        };
+        app.stack_mode_requested = true;
+        app.load_folder(folder.clone());
+        settle(&mut app, &ctx);
+        let survivor_count = if folder_first { 2 } else { 1 };
+        assert_eq!(app.items.len(), survivor_count + 1);
+        assert_eq!(app.items[0].drag_source_path(), Some(removed.as_path()));
+        let sibling_view = app.stack_view.as_ref().unwrap().clone();
+        let previous_rows = app.folder_observation.as_ref().unwrap().rows.clone();
+        if folder_first {
+            std::fs::remove_dir(&removed).unwrap();
+        } else {
+            std::fs::remove_file(&removed).unwrap();
+        }
+        delete_terminal(&mut app, vec![removed.clone()]);
+        let generation = app.items_generation;
+        assert!(app.external_rescan_pending.is_some());
+        settle(&mut app, &ctx);
+        assert_eq!(
+            app.items_generation, generation,
+            "self Delete must reach Equal without install"
+        );
+        assert!(
+            !Arc::ptr_eq(
+                &previous_rows,
+                &app.folder_observation.as_ref().unwrap().rows
+            ),
+            "Equal must accept the worker record"
+        );
+        let stack_index = survivor_count - 1;
+        assert!(matches!(
+            app.items[stack_index],
+            GridItem::Stack { count: 2, .. }
+        ));
+        assert_eq!(
+            sibling_view.materialize_aggregated().0[0].drag_source_path(),
+            Some(removed.as_path()),
+            "shared sibling snapshot must remain unchanged"
+        );
+        assert!(app.stack_try_open_from_grid(&ctx, stack_index, false));
+        settle(&mut app, &ctx);
+        assert!(app.stack_showing_flat);
+        assert_eq!(app.fullscreen_idx, Some(stack_index));
+        assert_eq!(
+            app.items[stack_index].drag_source_path(),
+            Some(folder.join("b_1.jpg").as_path())
+        );
+        assert_eq!(app.items.len(), survivor_count + 1);
+        app.close_fullscreen();
+        app.stack_reconcile_after_fullscreen_close(&ctx);
+        settle(&mut app, &ctx);
+        assert_eq!(app.items.len(), survivor_count);
+        assert!(matches!(
+            app.items[stack_index],
+            GridItem::Stack { count: 2, .. }
+        ));
+    }
+}
+
+#[test]
+fn section1375_stack_flat_delete_rebuilds_retained_singleton_metadata_and_maps() {
+    let (mut app, folder, ctx) = fixture(&["a_1.jpg", "b_1.jpg", "b_2.jpg"]);
+    let key = crate::adjustment_db::normalize_path(&folder.join("b_2.jpg"));
+    app.mask_db
+        .as_ref()
+        .unwrap()
+        .set(&key, &[true], &[], 1, 1)
+        .unwrap();
+    app.rating_db.as_ref().unwrap().set(&key, 5).unwrap();
+    app.tags_db
+        .as_mut()
+        .unwrap()
+        .set_item_tags(&key, ["survivor-tag"], "test")
+        .unwrap();
+    app.stack_mode_requested = true;
+    app.load_folder(folder.clone());
+    settle(&mut app, &ctx);
+    assert!(app.stack_try_open_from_grid(&ctx, 1, false));
+    settle(&mut app, &ctx);
+    assert!(app.stack_showing_flat);
+    assert!(app.mask_pages.contains(&2));
+    std::fs::remove_file(folder.join("b_1.jpg")).unwrap();
+    delete_terminal(&mut app, vec![folder.join("b_1.jpg")]);
+    assert_eq!(app.stack_view.as_ref().unwrap().groups[1].members.len(), 1);
+    assert!(app.mask_pages.contains(&1));
+    settle(&mut app, &ctx);
+    app.close_fullscreen();
+    app.stack_reconcile_after_fullscreen_close(&ctx);
+    settle(&mut app, &ctx);
+    assert!(!app.stack_showing_flat);
+    assert_eq!(app.items.len(), 2);
+    assert_eq!(
+        app.items[1].drag_source_path(),
+        Some(folder.join("b_2.jpg").as_path())
+    );
+    assert!(
+        app.mask_pages.contains(&1),
+        "new singleton must inherit its saved edit"
+    );
+    assert_eq!(app.get_rating(1), 5);
+    assert_eq!(
+        app.tags_cache.get(&key),
+        Some(&vec!["#survivor-tag".to_owned()])
+    );
+    assert_eq!(
+        app.stack_view
+            .as_ref()
+            .unwrap()
+            .flat_index_for_aggregated(1),
+        Some(1)
+    );
+}
+
+#[test]
+fn section1375_stack_zero_success_keeps_view_and_pending_switch() {
+    let (mut app, folder, ctx) = fixture(&["a_1.jpg", "b_1.jpg", "b_2.jpg"]);
+    app.stack_mode_requested = true;
+    app.load_folder(folder.clone());
+    settle(&mut app, &ctx);
+    let original = app.stack_view.as_ref().unwrap().clone();
+    assert!(app.stack_try_open_from_grid(&ctx, 1, false));
+    assert!(app.stack_script_pending.is_some());
+    delete_terminal(&mut app, vec![]);
+    assert!(Arc::ptr_eq(&original, app.stack_view.as_ref().unwrap()));
+    settle(&mut app, &ctx);
+    assert!(app.stack_showing_flat);
+    assert_eq!(app.fullscreen_idx, Some(1));
+    assert_eq!(
+        app.items[1].drag_source_path(),
+        Some(folder.join("b_1.jpg").as_path())
+    );
+}
+
+#[test]
+fn section1375_delete_during_initial_stack_extraction_or_grouping_resumes_only_after_success() {
+    for grouping in [false, true] {
+        for succeeded in [false, true] {
+            let (mut app, folder, ctx) = fixture(&["a_1.jpg", "b_1.jpg", "b_2.jpg", "c_1.jpg"]);
+            app.stack_mode_requested = true;
+            app.load_folder(folder.clone());
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while app.sidecar_restore_active() {
+                app.poll_sidecar_restore(&ctx);
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            if grouping {
+                app.poll_stack_script(&ctx);
+                assert!(matches!(
+                    app.stack_script_pending,
+                    Some(crate::filename_stack_ui::StackPreparePending::Grouping(_))
+                ));
+            } else {
+                assert!(matches!(
+                    app.stack_script_pending,
+                    Some(crate::filename_stack_ui::StackPreparePending::Extracting(_))
+                ));
+            }
+            assert!(app.stack_view.is_none());
+            assert!(
+                app.grid_item_input_allowed(),
+                "initial grouping accepts ordinary Delete"
+            );
+            let generation = app.items_generation;
+            if succeeded {
+                let removed = folder.join("a_1.jpg");
+                std::fs::remove_file(&removed).unwrap();
+                delete_terminal(&mut app, vec![removed]);
+                assert!(
+                    app.folder_observation.is_none(),
+                    "unfinished consumer cannot authorize Equal after input changes"
+                );
+                assert!(
+                    app.external_rescan_pending
+                        .as_ref()
+                        .unwrap()
+                        .proof
+                        .as_ref()
+                        .unwrap()
+                        .baseline
+                        .is_none()
+                );
+            } else {
+                delete_terminal(&mut app, vec![]);
+                assert_eq!(app.items_generation, generation);
+                assert!(app.stack_script_pending.is_some());
+            }
+            settle(&mut app, &ctx);
+            assert!(app.stack_mode_requested);
+            assert!(
+                app.stack_view.is_some(),
+                "Stack intent must eventually materialize"
+            );
+            assert!(
+                app.items
+                    .iter()
+                    .any(|item| matches!(item, GridItem::Stack { count: 2, .. }))
+            );
+            assert_eq!(app.items.len(), if succeeded { 2 } else { 3 });
+            let stable = app.items_generation;
+            app.check_external_folder_changes(&ctx, ExternalChangeCheck::Notified);
+            settle(&mut app, &ctx);
+            assert_eq!(
+                app.items_generation, stable,
+                "completed grouping restores Equal eligibility"
+            );
+        }
+    }
+}
+
+#[test]
+fn section1375_delete_during_initial_subfolder_stack_uses_current_survivor_snapshot() {
+    for grouping in [false, true] {
+        let (mut app, folder, ctx) = fixture(&["a_1.jpg", "b_1.jpg", "b_2.jpg", "c_1.jpg"]);
+        app.start_subfolder_expansion_scan_roots(folder.clone(), vec![folder.clone()]);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !app.items_are_subfolder_expansion_view || app.sidecar_restore_active() {
+            app.poll_subfolder_expansion(&ctx);
+            app.poll_sidecar_restore(&ctx);
+            assert!(Instant::now() < deadline, "subfolder input did not settle");
+            std::thread::yield_now();
+        }
+        app.toggle_stack_mode();
+        if grouping {
+            app.poll_stack_script(&ctx);
+        }
+        assert!(app.stack_view.is_none());
+        assert!(app.stack_script_pending.is_some());
+        let shared_entries = app
+            .subfolder_expansion_snapshot
+            .as_ref()
+            .unwrap()
+            .entries
+            .clone();
+        let removed = folder.join("a_1.jpg");
+        std::fs::remove_file(&removed).unwrap();
+        delete_terminal(&mut app, vec![removed.clone()]);
+        assert!(
+            app.stack_script_pending.is_some(),
+            "synthetic input resumes through its existing grouping owner"
+        );
+        settle(&mut app, &ctx);
+        assert!(app.stack_mode_requested && app.items_are_subfolder_expansion_view);
+        assert!(app.stack_view.is_some());
+        assert_eq!(app.items.len(), 2);
+        assert!(
+            app.items
+                .iter()
+                .any(|item| matches!(item, GridItem::Stack { count: 2, .. }))
+        );
+        assert!(
+            !app.stack_view
+                .as_ref()
+                .unwrap()
+                .materialize_flat()
+                .0
+                .iter()
+                .any(|item| item.drag_source_path() == Some(removed.as_path()))
+        );
+        assert_eq!(
+            shared_entries.len(),
+            4,
+            "shared snapshot retains its original immutable entries"
+        );
+    }
+}
+
+#[test]
+fn section1375_stack_retained_read_failure_keeps_flat_until_ordinary_reload() {
+    let (mut app, folder, ctx) = fixture(&["a_1.jpg", "b_1.jpg", "b_2.jpg"]);
+    app.stack_mode_requested = true;
+    app.load_folder(folder.clone());
+    settle(&mut app, &ctx);
+    assert!(app.stack_try_open_from_grid(&ctx, 1, false));
+    settle(&mut app, &ctx);
+    let source = app.capture_stack_deletion().unwrap();
+    let removed = folder.join("b_1.jpg");
+    std::fs::remove_file(&removed).unwrap();
+    let mut prepared = std::thread::spawn(move || source.prepare(&[removed]))
+        .join()
+        .unwrap();
+    prepared.discard_retained_for_test();
+    app.adopt_stack_deletion(prepared);
+    // The successful terminal removes the visible flat member in the same frame.
+    app.remove_items_batch(&[1]);
+    assert!(app.folder_observation.is_none());
+    assert!(app.folder_refresh_pending.is_some());
+    app.close_fullscreen();
+    app.stack_reconcile_after_fullscreen_close(&ctx);
+    assert!(
+        app.stack_showing_flat,
+        "flat rows must not acquire aggregate navigation before install"
+    );
+    assert!(
+        app.stack_script_pending.is_none(),
+        "do not enter aggregate Recovering with flat rows"
+    );
+    app.consume_folder_refresh_pending(&ctx);
+    settle(&mut app, &ctx);
+    assert!(!app.stack_showing_flat);
+    assert_eq!(app.items.len(), 2);
+    assert_eq!(
+        app.items[1].drag_source_path(),
+        Some(folder.join("b_2.jpg").as_path())
+    );
+}
+
+#[test]
 fn section1375_stack_member_changes_and_equal_facet_details_keep_projection() {
     let (mut app, folder, ctx) =
         fixture(&["post_1.jpg", "post_2.jpg", "post_3.jpg", "other_1.jpg"]);
@@ -680,6 +1060,17 @@ fn section1375_cutoff_after_scan_notification_restarts_and_stale_never_acknowled
         .unwrap();
     watch.collect();
     app.start_external_rescan(&ctx, folder.clone(), SystemTime::UNIX_EPOCH);
+    // Freeze the first completed scan before the external mutation. Acknowledging
+    // the newest sequence instead of the captured cutoff must now fail below.
+    let pending = app.external_rescan_pending.as_mut().unwrap();
+    let first = pending.rx.recv_timeout(Duration::from_secs(20)).unwrap();
+    assert!(matches!(first, Some(ExternalRescanResult::Equal(..))));
+    let cutoff = pending.proof.as_ref().unwrap().subscription.unwrap().1;
+    assert_eq!(cutoff, sequence);
+    let (tx, rx) = mpsc::channel();
+    tx.send(first).unwrap();
+    pending.rx = rx;
+    std::fs::write(folder.join("later.jpg"), b"external-new-file").unwrap();
     let watch = app.current_folder_watch.as_mut().unwrap();
     let later = watch.sequence.fetch_add(1, Ordering::AcqRel) + 1;
     watch
@@ -689,7 +1080,28 @@ fn section1375_cutoff_after_scan_notification_restarts_and_stale_never_acknowled
             Ok(notify::Event::new(notify::EventKind::Any).add_path(folder.join("a.jpg"))),
         ))
         .unwrap();
+    app.poll_external_rescan(&ctx);
+    let watch = app.current_folder_watch.as_ref().unwrap();
+    assert_eq!(watch.acknowledged, cutoff);
+    assert!(
+        !watch.dirty.is_empty(),
+        "later notification must remain dirty"
+    );
+    assert!(
+        app.external_rescan_pending.is_some(),
+        "later notification requires another scan"
+    );
+    assert!(
+        !app.items
+            .iter()
+            .any(|item| item.drag_source_path() == Some(folder.join("later.jpg").as_path()))
+    );
     settle(&mut app, &ctx);
+    assert!(
+        app.items
+            .iter()
+            .any(|item| item.drag_source_path() == Some(folder.join("later.jpg").as_path()))
+    );
     assert!(app.current_folder_watch.as_ref().unwrap().acknowledged >= later);
     app.start_external_rescan(&ctx, folder.clone(), SystemTime::UNIX_EPOCH);
     app.external_rescan_pending
