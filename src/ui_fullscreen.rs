@@ -5671,6 +5671,11 @@ fn draw_fs_overflow_panel_surface(
         let mut body = child.new_child(egui::UiBuilder::new().max_rect(body_rect));
         body.set_clip_rect(body_rect);
         body.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+        // Rows are laid out back to back (each draws its own separator), and
+        // `fs_overflow_panel_rect` sizes the panel as rows x FS_OVERFLOW_PANEL_ROW_HEIGHT
+        // without gaps. The default item spacing made the content taller than the body,
+        // so a scrollbar appeared even when the whole menu fitted on screen.
+        body.spacing_mut().item_spacing.y = 0.0;
         let output = egui::ScrollArea::vertical()
             .id_salt("fs_overflow_panel_body")
             .max_height(body_rect.height())
