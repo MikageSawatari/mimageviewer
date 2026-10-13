@@ -1,11 +1,12 @@
 # §1.242 本の構成 — 設計案
 
-更新: 2026-10-13、B1（組の自動生成への設計改訂のみ、末尾表紙の説明訂正・利用者再決定を反映）。`next-book`、照合tree `71a3c2228`（master `d73d62841` + カード表示修正）。
-**現在の実装は旧方式のまま。本改訂は未実装・独立設計レビュー待ち。B1は本書とマニュアルだけを変更し、コミットしない。**
+更新: 2026-10-13、B1（独立設計レビューP2-1/P2-2のREVISE対応、設計・マニュアルのみ）。`next-book`、照合tree `71a3c2228`（master `d73d62841` + カード表示修正）。
+**現在の実装は旧方式のまま。B1 `5e8049f5f`の独立設計レビューはREVISE（P2が2件）。
+本改訂は指摘対応の設計案であり、再レビュー未実施・未実装。設計書とマニュアルだけを変更し、コミットしない。**
 §1.242と`book_composition.db`は未公開で、v4.6.0には含まれない。次の版に含める（2026-10-13利用者決定）。
 2026-10-11の「次々回」は履歴。旧保存unitsの移行処理は不要。
 
-現行契約は§1・§2.1・§3〜§12・§13のB段階・§14の追記。
+現行契約は§1・§2.1/§2.2・§3〜§12・§13のB段階・§14の追記（Q25/Q26の設計担当決定を含む）。
 §2の従来調査表、§7.4、§13のG0〜G5・G0照合記録は旧方式の調査・実装・検証履歴として保持する。
 その固定Pair/Single、組変更確認、組ごとの手動補助指定、初期組の凍結、全pairing拒否はBの実装指示ではない。
 旧R6 ACCEPTは当時の設計に対するもの。本改訂を採択済み・検証済みとは扱わない。
@@ -36,7 +37,8 @@ Bの正本は本書の2026-10-13改訂。2026-09-15/10-10の決定履歴と区�
   白紙は指定実ページの空き側で、独立ページ/ID/sourceにしない。Single/Split/実ページ数/出力に含めない。
 - 組ごとの手動`SingleCompanion::FrontCoverSupplement`指定と編集操作は持たない。
   構成あり本も「末尾の単ページへ表紙を添える」の全体既定/既存本別preferenceに通常本と同じ規則で従う。
-  添える表紙は構成適用後の先頭可視ページから派生し、recordへ補助指定を保存しない（§5.1）。
+  添える表紙は構成適用後の先頭可視ページから派生し、recordへ補助指定を保存しない。
+  末尾の明示BlankOppositeは白紙を優先し表紙を添えない。自動強制単独の白紙は従来どおり（§5.1）。
 - 操作ごとの組変更確認は廃止。右へ結果を直接表示しdraftの元に戻す/やり直すで戻す。
   保存前の着地説明・解除確認・外部変更検証は別の安全確認として残す（§8）。
 - 閲覧modeは独立。direction/cover/ページ指定はeditor、一ページずらしは構成本で使わない。
@@ -199,7 +201,7 @@ B1でアプリを起動・再現していない。まず通常builderの共用�
 | `book_composition/editor.rs::preview_edits/preview_rebuild`、`app/book_composition_editor.rs::editor_view`、`ui_composition_editor.rs::EditorChangePreview` | units差分から候補確認を生成。全体確認の原因。draft/undoを再利用しpending_preview/組差分確認を撤去 |
 | `projection.rs::position_for_projected/resolve_position/reading_ordinal`、App editor保存着地/resume、`app/book_composition_remap.rs` | 永続identity/raw互換は組から独立可能。unitsのanchorを共通Navigation anchorへ置換（§6） |
 | `ui_fullscreen.rs::composed_blank_spread_side`（29602）、`view_trim::stored_view_trim_bbox` | ResolvedUnitのBlankを探してQ8の側を解く。新指定/accepted presentationから側を取り、通常本trimを維持（§11） |
-| `remote_ipc/container.rs::spread_payload`、`ui.rs` binding admission、`spread_shift/model.rs::resolve_book_layout_source` | Remoteは通常builder/管理flagを使うが構成rows/units全体のPC parityはG5未接続。現在同PreparedBookが完成済みとは扱わない。Bで可視列+指定をcore共通経路へ |
+| `remote_ipc/container.rs::spread_payload`、`ui.rs` binding admission、`spread_shift/model.rs::resolve_book_layout_source` | Remoteは通常builder/管理flagを使い構成投影は未接続。Bではorder/hidden後の列を既存件数/byte制限へ通し、制限後の列+指定だけを共通builderへ渡す。切詰めPC parityは要求しない（§2.2/§10.2） |
 | `SessionHandle::with_local_composition_admission`（session.rs:1663）、`poll_remote_session`（ui.rs:1194）、App editor owner/tickets | G4で開始/保存と取得barrierが実装済み。旧G0の「helper/ticket未実装」は履歴でありBの追加作業ではない |
 | `book_composition/permission.rs::CompositionWriteAdmission::validate` | binding_scopeに構成行があれば一律拒否。許可する自動端/単独writeは型で目的を区別し、安全なscope/token/実体資格とHidden拒否を維持（§9.1） |
 | `metadata_transfer.rs::PortableCompositionScope`（584）、`FORMAT_VERSION`（54） | BookCompositionを埋め込むため新recordへの変更必須。現treeはv11、旧§2のv9調査を前提にしない（§7.3） |
@@ -220,6 +222,29 @@ exactの明示FollowGlobalはfallbackを遮る。`FinalCoverSpreadPreference::ef
 表不在も既存のFollowGlobal扱いとし、新しい本別値/構成用設定storeを作らない。
 PCの`final_cover_spread_enabled_for_current_book`とRemoteの実効値解決を同じ既存規則へ接続する。
 B1でG5完成や実行成功を主張しない。
+
+### 2.2 B1独立レビュー指摘の再照合（5e8049f5f、P2-1/P2-2）
+
+P2-1は§4.2/§5.1/§8/§11.1/§13で明示白紙優先へ訂正。設計担当決定は§14のQ25。
+自動白紙を表紙へ置換する現行resolverには明示/自動の形成理由を渡す必要がある（§5.1）。
+
+P2-2の現行経路を確認した（製品起動なし）:
+
+| コード | 成立している境界 / Bの扱い |
+| --- | --- |
+| container.rs::enumerate_zip（5937–5984） | source_itemsのメタ情報列から件数/byte budgetでbounded_itemsを作り、その列をspread_payload_with_readへ。Bはorder/hidden後の列に同じ制限を掛ける |
+| 同enumerate_pdf（6069–6111、EPUBも共通） | page countから件数/byte制限内の行を作り、そのitemsでcompleteを判定。構成順のPageRef/番号と可視件数はpureに解けるため、制限前の全寸法準備は不要 |
+| 同spread_payload_with_read（6313–6349） | Singleは横長判定なし。それ以外は返却itemsをcached_landscape_flags_with_readへ渡し同じitemsでgroups生成。full source_itemsはmetadata/identity用であり寸法入力にはしない |
+| ui_fullscreen.rs::build_remote_spread_page_groups_with_shift（15876） | incompleteなら自動page_aloneをdefaultへ、共通presentationでもendpoint/final_coverをcomplete条件で抑止。Bでもこの境界を維持 |
+| container.rs::cached_landscape_flags_with_read（7047）、collect_zip_entry_dims（2401） | 既存カタログ寸法を読み、渡されたitemsの未登録entryだけheaderを読む。full列へ拡大すると省略ページの追加I/Oを招くためBでは拡大しない |
+| 同catalog_free_dims（6958） | PDF/EPUBの既存page-size APIは必要時に文書全体のsizeを返す。これは既存経路であり、Bで呼出し条件/範囲/APIを増やさない。「省略ページに一切読取がない」とは主張しない |
+
+[§1.368](next-release-backlog.md)は次の版の後で検討する延期済みの既知制約。
+例（指定なし、可視列0..4、LTR表紙あり、after-cover On）: PCは[0],[1],[2,3],[4]、
+先頭4件へ切詰めたRemoteはcomplete=falseで[0],[1,2],[3]になり得る。
+構成ありでも同じ制限後列/complete境界を使い、この差をBで全本生成・相方追加取得・group削除で直さない。
+方針を成立させないコード上の障害は確認されなかった。全体のidentity/順序・可視件数の解決と、
+返却範囲の寸法/組生成を分ければ既存経路を再利用できる。§1.368の解決時に構成あり/なしを一緒に直す。
 
 ## 3. 所有境界と処理順 — items生成時の一回の投影
 
@@ -436,7 +461,9 @@ PageOverride = Alone | BlankOpposite { page_side: Leading | Trailing }
   既定Leading（LTR左/RTL右）、side選択は白紙指定の従属項目。独立した中央/片側指定は作らない。
   coverは先頭roleで扱い、そこにoverrideがあれば基礎配置はoverride優先だが表紙roleは変わらない。
   これらは組生成/基礎配置の指定。末尾表紙が適格ならその後に共通presentation resolverで表紙を添える。
-  Aloneも末尾なら添付対象、BlankOppositeの白紙は表紙に置換する。実ページ側を保ち、指定recordは変更しない（§5.1）。
+  Aloneも末尾なら添付対象。ただし明示BlankOppositeは白紙と指定実ページ側を優先し、末尾表紙を添えない。
+  自動after-cover/last/ForcedBoundaryで付いた白紙だけは通常本と同じく表紙へ置換できる。
+  明示/自動の由来を共通builderの単独形成理由へ載せresolverまで渡す。指定recordは変更しない（§5.1）。
 - 横長は指定なしで通常どおり中央Single。明示BlankOppositeなら片側+白紙、強制Pairにはしない。
   横長をPairへ強制する追加指定は不要（通常規則と競合し複雑になる）。「自動」は指定解除であり追加overrideではない。
 - 白紙にID/選択/sourceなし。指定実ページを隠せば白紙も出ない。連続する実ページへの白紙指定は許す。
@@ -496,36 +523,56 @@ append_spread_display_units_untilをページ指定の境界入力へ拡張す�
    自動page_alone直前の余りは既存ForcedBoundary配置。残りは通常presentation resolverの端/強制単独を適用。
 5. 最後に、通常本と同じ実効final_coverと適格条件で末尾Singleへ表紙を添える。
    Navigation membership/組数/anchorは変更せず、表示だけにSpreadPageRole::FrontCoverSupplementを加える。
-   白紙があれば通常の自動強制単独と同じく表紙へ置換。組ごとの手動補助指定は生成/保存しない。
+   明示BlankOppositeなら白紙を優先し添付しない。自動強制単独の白紙は従来どおり表紙へ置換。
+   組ごとの手動補助指定は生成/保存しない。
 
 complete proofは「scopeの採用orderからhidden/Missing/policyを適用した論理可視本全体」が基準。
 hiddenだけで末端設定を無効にするnav数=元manifest数の判定は使わない。facet/検索subsetやRemote切詰めをcomplete扱いしない。
 Book subsetは残る実列から再生成し、complete限定のendpoint/page_alone/final_coverは通常と同じく抑止する。
 
-**構成適用後の末尾表紙判定**（共通presentation resolver一か所）:
+**構成適用後の末尾表紙判定**（共通presentation resolver一か所。Remoteの制限後入力は§10.2）:
 
-- 順序/hidden/Missing/policyを適用した可視実列を共通builderで組み、その本全体の最初/最後のNavigation unitを使う。
+- 順序/hidden/Missing/policyを適用した可視実列を共通builderで組み、その入力列の最初/最後のNavigation unitを使う。
+  Remoteでは§10.2の制限後入力列であり、全本のunitを別途準備しない。
   保存orderの最後、旧unitsの最後、最後に操作したページ、Remote応答の最後から末尾を推測しない。
 - Spread閲覧、complete book、構成のcover_enabled=true、実効final_cover=true、
-  先頭unitと最後unitがともにNavigation実ページ一枚で、末尾実ページが表紙と異なる場合だけ添える。
+  先頭unitと最後unitがともにNavigation実ページ一枚で、末尾実ページが表紙と異なり、
+  末尾に明示BlankOppositeがない場合だけ添える。
   最後が実ページPairなら相方は埋まっているので添えない。0枚/表紙だけの1枚、coverなし、
   Single/Split/端末single強制、subsetは添えない。横長由来の末尾Singleにも通常本と同じ条件で添える。
-- 空き側は「二枚目のNavigation実ページがない側」。白紙は実ページではないため空き側に含む。
+- 空き側は「二枚目のNavigation実ページがない側」。ただし明示BlankOppositeの側は利用者が白紙に指定した面なので添付対象にしない。
+  自動強制単独の白紙だけは従来の空き側扱いを維持し、設定に従い表紙へ置換する。
   coverは現在の可視実列の先頭で、非表示/欠落/種類除外となった旧表紙を別sourceとして呼び戻さない。
-- 全scopeで判定してからRemoteのbudgetを適用し、途中切詰めにより生じた見かけのSingleへ追加しない。
+- PC/editor/連結は採用済みの本全体またはそのview入力で判定。Remoteは構成のorder/hidden適用後に
+  通常と同じ応答制限を掛けた列で生成し、切詰めならcomplete=falseで末尾表紙を抑止する。
+  切詰め前の全本の組/寸法を準備しない。完全応答のみ本全体の条件となる（§10.2、§1.368）。
 
 | 構成適用後の末尾状態 | 実効末尾表紙ONかつ上の適格条件成立時 | OFF/条件不成立時 |
 | --- | --- | --- |
 | 通常の端数/横長Single | 共通resolverの通常配置で表紙を添える | 通常の中央/端配置 |
 | 最後の元ページをhidden/Missing/policy除外 | 残りを繰り上げて再生成した真の最後がSingleなら添える。Pairなら添えない | 再生成結果の通常配置 |
 | 末尾にAlone指定 | Navigationは一枚のまま表紙を添える。通常のNavigation-first画面順を使用（LTRは末尾実ページ左/表紙右、RTLは鏡映） | 指定どおり中央Single |
-| 末尾にBlankOpposite指定 | 指定実ページ側を保ち、反対側の白紙を表紙へ置換。白紙と表紙を重ねない | 指定実ページ側+白紙 |
+| 末尾にBlankOpposite指定 | 明示指定を優先。指定実ページ側+白紙を保ち、表紙を添えない | 指定実ページ側+白紙 |
 | 自動after-cover/last/ForcedBoundaryによる末尾Single+白紙 | 通常本同様、実ページ側を保ち白紙を表紙へ置換 | 既存強制単独の側+白紙 |
 | 非末尾のAlone/BlankOpposite | 添えない。指定の中央/白紙を維持 | 同じ |
 
-Alone/BlankOppositeは実ページ一枚の組を作る指定であり、適格な末尾表紙を抑止する追加フラグではない。
-表紙を添えたくない場合は既存の本別末尾表紙preferenceをOffにする。別のページ単位「補助なし」指定を増やさない。
-右の自動結果にも派生表紙を表示し「末尾に添えた表紙」と区別する。独立選択/移動/override対象にはしない。
+Aloneは実ページ一枚の組を作る指定で、末尾表紙を抑止しない。BlankOppositeは反対側の白紙も明示するので末尾表紙より優先。
+その末尾だけ白紙にしたければBlankOpposite、本全体の自動末尾表紙を使わないなら既存本別preferenceをOffにする。
+独立した「補助なし」フラグは増やさない。
+
+**P2-1: 白紙の由来をresolverまで保持する**:
+
+現行compose_spread_navigation_unit（ui_fullscreen.rs:14995付近）はhas_white_companionを見て自動白紙を表紙へ置換する。
+同じLeftWhite/RightWhiteへ明示白紙を潰すと判断不能になるため、既存SpreadDisplayUnitFormation/SingletonCauseを
+排他的に拡張する（論理案: ExplicitAlone / ExplicitBlankOpposite(side) / 既存ForcedAfterCover・ForcedLast・ForcedBoundary等）。
+PageOverrideから共通builderが形成理由を生成し、共通presentation resolverはその同じunitの理由を読む。
+ExplicitBlankOppositeはfinal_cover分岐へ入れず指定側+白紙のpresentationを確定する。
+同じページが自動強制単独にも該当しても明示由来を採用し、設定On/Offやcomplete値で由来を変えない。
+独立bool、field presence、白い面の有無だけで由来を推測しない。保存型は既存PageOverrideのままで新字段なし。
+PC/editor/連結/Remoteは同じ形成理由で処理し、cache/holdoverもそのaccepted入力・presentationへ従う。
+構成なし本はExplicit由来を作らず、既存自動白紙→表紙の条件・配置を維持する。
+右の自動結果にも派生表紙を表示し「末尾に添えた表紙」と区別する。
+明示BlankOppositeの結果は指定側+白紙のまま、添付表紙を出さない。独立選択/移動/override対象にはしない。
 添えた表紙はNavigation/seek/実ページ数/resume/出力targetへ加えず、元の表紙の編集/trim/sourceを通常経路で読む。
 新しい添付sourceにも提示許可とsource readinessを要求し、一unitの二画像をatomicに提示する。
 
@@ -969,7 +1016,8 @@ UI modal判定だけをRemoteの確定境界とみなさない。現treeの確�
   実ページを選び「自動」「単独で表示」「隣を白紙にする」を指定。白紙には実ページ側選択を従属させる。
   指定ページに「単独」「白紙・左側/右側」の文字badgeを出し自動Singleと区別。表紙印はcover由来。
   横長/自動強制単独は補足説明で示す。白紙は空き側の半透明/破線placeholder、独立選択/dragなし。
-  末尾表紙も共通resolverの結果どおり表示し「末尾に添えた表紙」と説明。白紙を置換した結果を隠さず示す。
+  末尾表紙も共通resolverの結果どおり表示し「末尾に添えた表紙」と説明。
+  明示白紙は維持し、末尾表紙を添えない理由を説明する。自動強制単独の白紙だけは添付表紙に置き換わった結果を示す。
   添えた表紙には手動指定のbadgeを付けず、単独選択/移動/編集操作なし。
   「白紙は見開きだけに使い、単ページ・横長分割では表示しません」と説明する。
 - 下: 元に戻す/やり直す、保存、キャンセル、構成を解除。両一覧の選択をPageRefで対応付ける。
@@ -1160,15 +1208,45 @@ detached述語/viewportに触る前にはClaudeCodeと独立Codexレビューで
 
 ### 10.2 Remote
 
-coreのContainerEngine workerが同PreparedBookを生成する。Webは返されたentries/PageGroupを表示し、
+coreのContainerEngine workerが共通pure projectionで構成順/hidden/指定を解決し、
+通常本と同じ返却範囲の入力からPageGroupを生成する。全本の表示unit/寸法を持つPreparedBookを要求しない。
+Webは返されたentries/PageGroupを表示し、
 構成のorder/hidden/overrideや自動組を自前で再現しない。実addressは元root+entry/物理PDF・EPUBページ番号のまま。
 Bookには `has_composition`、revision/accepted layout identity、構成の実効bindingを追加する。
 §9.1の操作ごとの資格/理由を返し、direction/cover/shiftは無効、自動端/単独/末尾表紙変更とmode-onlyは有効にする。
 ExtractedResultには列種別/A2の固定操作資格/一時modeを返し、leaf hidden marker/構成依存を送らない。
 結果のthumbnailはそのまま、full-page/ナビ候補をcoreで遅延照合してskip/拒否する。列種別から生成し、
 既存presentation/anchor/singleton placementを共有する。白紙のaddressを発明しない。
-件数/response budgetで切詰める前にfull projectionを作り、切詰め後はcomplete=falseとする。
-Pairの片側が応答外なら残る実ページのslotを保ち、見かけの末尾へ表紙を付け足さない。
+**P2-2: 通常本と同じ制限付きの組立て**:
+
+```text
+既存source列挙 / page count + 構成record
+ → pureなorder/hidden適用、identity/可視件数/ページ指定の解決（寸法不要）
+ → 既存CONTAINER_ENTRY_LIMIT / ContainerEntryBudgetによる返却列
+ → 既存寸法/回転取得（返却itemsを渡す）
+ → 共通Remote builder / presentation（制限後nav + その範囲の指定 + 既存complete判定）
+ → entries/PageGroup/既存truncated情報
+```
+
+- 対象の本の並べ替え/hiddenは制限より先に適用する。返却をraw順で先に切ってから並べ替えたり、
+  hiddenを後から除いて返却数を不必要に減らしたりしない。子containerの既存位置/本scope境界は維持。
+  元manifest/PageRefと可視件数は既存列挙情報/文書page countからpureに解決するだけで、全ページのheader/寸法を準備しない。
+- 制限後itemsだけを現行cached_landscape_flags_with_read/catalog_free_dimsへ渡す。
+  カタログの既存一括読取・既存PDF/EPUB page-size APIを変更せず、省略ページへ新たなheader読取/寸法解決を足さない。
+  Singleの寸法取得省略も維持。新worker/第二group cache/隣相方の追加取得経路を増やさない。
+- completeは構成適用後の可視本全体を返せたかと通常の資格条件で判定。hiddenだけならincompleteではない。
+  件数/byte切詰めならfalse。自動after-cover/last、endpoint、final_coverは通常本同様に抑止する。
+  effective設定値がOnでも切詰め中に適用されない点を、保存値の変更や設定消失と扱わない。
+- 明示Alone/BlankOppositeは返却範囲に含むページの指定として渡し、complete=falseだけを理由に取り除かない。
+  応答外の指定ページを呼び寄せず、既存自動規則もその境界を越えて全本から再計算しない。
+  明示白紙は形成理由をresolverまで渡し常に白紙を優先。制限列の末尾へ表紙を追加しない。
+- 切詰め境界は通常本と同じに扱う。全本Pairの元slot保存や省略相方addressを追加する契約はBでは作らず、
+  制限後の列で組んだ最後のSingleも現行どおり閲覧可能にする。groupを削って表示可能ページを減らさない。
+
+**PCとの一致の範囲**: 取得列・実効規則・complete・寸法/回転・modeが同じなら共通builderの結果は一致する。
+制限により入力/completeが違う場合、構成本も通常本と同じくPCとPair membership/側/単独境界がずれ得る。
+これは[延期済み§1.368](next-release-backlog.md)と同じ既知制約。Bで別経路を作らず§1.368の解決時に一緒に直す。
+仕様・受入・manualにこの限界を明記し、全応答でPC parityを要求しない。
 
 構成editorの全体編集は今回はPCのみ (Q6決定)。Remoteは構成で読み、非表示を拒否する。
 方向/表紙/一ページずらしと構成record変更はcoreで拒否。
@@ -1248,7 +1326,9 @@ page overrideは従来どおりページ固有で、本設定との優先順位�
 Single+blank/片側配置も**spread閲覧中のslot側**で本別spread marginを選ぶ (Q8決定)。
 普通のSingle閲覧/編集pivotはsingle margin。blankにtrim/auto-trim/partner decodeを要求しない。
 Autoの二枚上下harmonizeは実partnerがあるPair/末尾に表紙を添えたpresentationに通常本と同じ規則で適用。
-末尾BlankOppositeの白紙を表紙へ置換しても指定実ページ側は保持する。添える表紙のsource/trimは元表紙の既存経路。
+末尾の明示BlankOppositeは指定実ページ側+白紙を維持し、表紙source/trim/partner需要と二枚harmonizeを発生させない。
+自動強制単独の白紙を表紙へ置換する場合は従来どおり実ページ側を保持。添付表紙のsource/trimは元表紙の既存経路。
+両者はaccepted unitの形成理由/presentationで区別し、白いcanvasの見た目だけで推測しない。
 Navigationは一枚のままで、補助をpage-edit pivotや出力targetへ増やさない。
 現行Single rendererはsingle bboxを使う経路があるので、単なるSpreadPair::Singleへの変換だけでは不十分。
 slot/presentation modeを共通trim resolverへ渡し、local/Remote/continuous/holdoverで揃える。
@@ -1305,7 +1385,9 @@ metadata bundleは可視一覧選択からの画像exportとは別で、**非表
 | 組変更candidate + draft + 全組差分承認/rebuild確認 | 即draft適用/右結果、一操作一undo。preview/承認phase撤去 |
 | 構成 + session shift + saved shift | ページ指定が境界owner、shift休眠、解除時のみEの現在規則 |
 | 全pairing禁止 + 自動規則追従の矛盾 | record編集はeditor、自動端/単独は既存設定owner、modeは閲覧owner。資格をactionで判定 |
-| 組ごとの手動補助指定 + final_cover自動追加 | 手動補助は保存しない。通常本と同じfinal_coverの実効値/共通条件から末尾だけ派生 |
+| 組ごとの手動補助指定 + final_cover自動追加 | 手動補助は保存しない。明示BlankOppositeの由来が白紙を優先、それ以外は通常final_cover条件で派生 |
+| 明示白紙と自動白紙の同一placement化 | 単独形成理由に由来を保持しresolverへ。明示Blankは添付禁止、自動白紙は既存置換を維持。別boolなし |
+| Remote切詰め + 全本組生成/省略ページ寸法取得 | order/hidden後に既存範囲制限、返却itemsだけ既存寸法/組生成へ。PCとの差は§1.368へ分離 |
 | mode/orientation/Splitのrecord変更 | 同実列のview projection。mode-only/端末強制は非構成write |
 | 編集/保存中のopen/history/F12/sibling操作 | 既存process modal。常時モデルレス/割込みdraft退避/再開なし |
 | editor/Remoteの別gate/二重write | 既存session境界・全窓close・ticket一回終端。後のRemote優先 |
@@ -1326,7 +1408,8 @@ metadata bundleは可視一覧選択からの画像exportとは別で、**非表
 - direction/coverの第二閲覧値: 保存指定と表示が食い違う。editor上部へ集約。
 - 構成本shiftの追加: 第二境界ownerを増やす。旧制限を残し通常本released shiftは維持。
 - 結果全件hidden除外/再pair: Q16の候補だけ照合/結果順/保存refreshなしを失う。Book繰り上げと区別。
-- 末尾表紙廃止/構成本だけの不適用: 誤説明を訂正した利用者再決定に反するため取り消し。全本同じ自動規則を使う。
+- 末尾表紙廃止/構成本だけの一律不適用: 訂正後の利用者再決定に反する。明示白紙だけは設計担当の優先決定に従い添付しない。
+- Remote全本先行組生成/省略相方の追加取得: 省略ページの寸法I/O/別経路を増やし延期§1.368を先取りする。通常本と同じ制限経路を維持。
 - 連結/Split/Remoteの一時無効化やPDF全件完了待ち: 既存機能を減らすため不採用。
 
 組立て統一とmodalを先に採用し、rollback/supersession/resumeを網羅する新しい機械を足さない。
@@ -1350,10 +1433,14 @@ metadata bundleは可視一覧選択からの画像exportとは別で、**非表
    指定直前/直後/cover/after-cover/lastとの重複・連続白紙指定で実ページ各一occurrence。
    通常本final-coverは不変、構成本も全体On/Off×本別FollowGlobal/On/Off（exact/fallbackを含む）で同じ出力。
    末尾hidden/Missing/policy、先頭表紙hidden、Alone/BlankOpposite/自動強制単独/横長、最後Pair/0枚/1枚/coverなし/subsetを検査。
-   末尾白紙は表紙へ置換し実ページ側保持、非末尾指定は不変。添付表紙はNavigationへ重複せず手動指定の保存ゼロ。
-   PC/editor/連結/Remote同入力で同組/最終presentation/anchor。
+   末尾の明示BlankOppositeは全体/本別final_coverがOnでも白紙/実ページ側を保持、補助occurrence・source需要ゼロ。
+   同じ画面側の自動ForcedLast等の白紙は既存条件で表紙へ置換。明示と自動が重なる場合は明示由来優先。
+   明示解除（自動へ戻す）後は通常添付条件へ戻り、設定On/Offで明示由来が消えない。非末尾指定は不変。
+   添付表紙はNavigationへ重複せず手動補助保存ゼロ。PC/editor/連結は同入力で一致、
+   Remoteは同取得列/complete/規則/寸法で一致を確認し、切詰めPC差は§1.368既知制約として別fixtureに固定。
 3. position/permission/trim/出力: PageIdentity/raw互換/ordinal、旧順の次→前→先頭→一覧、単一resume intent。
-   page override/左右trim/白紙・通常本trim不変。hidden target拒否/Q16遅延許可の回帰を弱めない。
+   page override/左右trim/白紙・通常本trim不変。末尾明示白紙は表紙partner需要/harmonizeなし、
+   自動白紙の表紙置換は従来どおり。hidden target拒否/Q16遅延許可の回帰を弱めない。
    出力は可視実列順、白紙/補助sourceなし、metadataはhidden/Missing/overrideを運ぶ。
 4. editor: 左だけorder/hidden、上部direction/cover、右だけ指定/badge、直接結果+undo/redo。
    組差分確認/pending_preview/rebuild/unit移動経路ゼロ。右にhiddenを出さず選択/scrollを維持。
@@ -1361,7 +1448,13 @@ metadata bundleは可視一覧選択からの画像exportとは別で、**非表
 5. operations/Remote/multi-context: direction/cover/Spread shift拒否、mode-only/端/単独/final-cover preference許可。
    キー/gamepad/IPC/setterの資格一致。自動規則変更でrecord/revision不変、groups cache更新。
    fork/mount/close/別scope不変、parked/stashed Bookの復帰鮮度、兄弟完了順によらない共有resume。
-   全scope投影をbudget前に生成、途中Pair元slot保持/偽末尾なし、orientation/force_single非構成write。
+   構成order/hiddenを適用後に既存件数/byte制限を掛け、返却itemsだけ既存寸法/組生成へ。
+   cap直前/直後のhidden・並べ替え・明示指定、0件/完全応答/件数切詰め/長名byte切詰めでtotal/truncated/completeを検査。
+   同じ可視列/制限/空overrideで通常本と同じgroups。切詰めafter-cover/last/endpoint/final_coverは非適用、明示指定は範囲内で維持。
+   カタログ未登録の返却ZIPだけheader probe、省略entryの追加header probeゼロ。Singleは横長判定の寸法解決呼出しゼロ。
+   既存PDF/EPUB寸法APIの呼出し条件/回数を増やさず、新しい全本寸法要求/隣相方取得/境界group削除なし。
+   full [0],[1],[2,3],[4]とbounded4 [0],[1,2],[3]等の§1.368制約を保持して試験し、後続解決の構成あり/なし共通fixtureへ引き継ぐ。
+   orientation/force_single非構成write。
 
 後続実装者がnarrow→共有gate/fmt/glyph/snapshotを所有し有効証跡を独立reviewerへ渡す。
 確認binary/承認済み隔離実機検証はAGENTS.mdの通常手順。B1の文書検査を製品検証として数えない。
@@ -1958,11 +2051,20 @@ Q14の以前の相談はA2で不要になった。質問の番号を振り直さ
 | --- | --- | --- |
 | Q18 保存する値と場所 | direction/cover on-off/order/hidden/ページ指定だけ、組は保存しない。上部に方向/表紙、左にorder/hidden、右に指定/印。離れたPair廃止、左で隣へ並べる | Q2/Q3/Q17・固定units/任意cover PageRef/二か所の移動 |
 | Q19 自動組と設定 | 指定なしは通常見開き規則。横長単独、中央/片側・強制単独等の利用者設定を尊重。表紙はcover on-off | 初期規則凍結/landscapeを無視するPair |
-| Q20 末尾の単ページへ表紙を添える（説明訂正後の決定、2026-10-13） | 構成あり本も通常本と同じ全体既定/既存本別final cover preferenceの規則に従う。構成適用後の真の末尾Singleへ自動で添える。組ごとの手動FrontCoverSupplementは保存しない | 旧Q20の「補助不要」とB1の構成本だけ不適用を取り消し。Q3の手動組補助は廃止 |
+| Q20 末尾の単ページへ表紙を添える（説明訂正後の決定、2026-10-13） | 構成あり本も通常本と同じ全体既定/既存本別final cover preferenceに従う。末尾明示白紙の優先は設計担当のQ25、Remote範囲制限はQ26に従う。組ごとの手動FrontCoverSupplementは保存しない | 旧Q20の「補助不要」とB1の構成本だけ不適用を取り消し。Q3の手動組補助は廃止 |
 | Q21 組変更確認 | 操作ごとの全組確認不要。右へ直接結果、undo/redo。組以外の安全確認は要否/理由を設計で判断 | G4候補/組差分確認/rebuild確認 |
 | Q22 非表示後の組 | 片側を隠せば残りを繰り上げて組み直す | hiddenでも元Pair/slotを保持 |
 | Q23 保存形式 | §1.242・book_composition.db未公開、v4.6.0対象外。形式作り直し可/移行不要 | 試作schemaの互換処理は作らない |
 | Q24 出荷と段階 | 次の版へ。B1は設計とmanualのみ、完了後停止/別担当が独立設計レビュー。コード変更/コミットなし | 2026-10-11「次々回」と旧G後続の進行 |
+
+### 2026-10-13 独立レビューREVISEへの設計担当の決定
+
+Q25/Q26は利用者の新しい回答ではなく、今回伝達された設計担当の決定/方針。利用者決定Q18〜Q24と区別する。
+
+| # | 設計担当の決定 / 方針 | 反映先 |
+| --- | --- | --- |
+| Q25 末尾の明示白紙（P2-1） | 末尾に「反対側を白紙」を明示した場合は白紙優先、末尾表紙を添えない。自動強制単独の白紙置換は維持。形成理由をresolverまで渡して区別 | §4.2/§5.1/§8/§11.1/§13/manual |
+| Q26 Remoteの範囲（P2-2） | 状態/経路を増やさず構成なし本と同じ取得制限・境界・寸法取得範囲。order/hidden後の列を制限して組み、新しい省略ページ寸法読取/全本寸法解決なし。PCとの差は延期§1.368の解決で一緒に直す | §2.2/§5.1/§10.2/§12/§13/manual |
 
 設計担当が「表紙の隣の空き側へ写しを薄く出す」と誤説明した経緯があり、正しい末尾添付の説明後、利用者がQ20を決め直した。
 
@@ -1972,7 +2074,8 @@ Q14の以前の相談はA2で不要になった。質問の番号を振り直さ
 利用者が個別採択済みとは書かない。Q18〜Q24は今回の明示指示の記録。
 
 独立レビューの主要論点は共通境界走査の優先順位/余りの配置、値ownerで分ける操作資格、
-Q16結果列とBook繰り上げの区別、末尾表紙の適格判定と白紙置換の共通化。
+Q16結果列とBook繰り上げの区別、明示/自動白紙の形成理由と末尾表紙判定、Remote制限付き生成と§1.368の境界。
+P2-1/P2-2の対応内容とコード根拠は§2.2。再レビューのACCEPTや製品検証を完了したとは扱わない。
 追加ページ指定は不要と判断。必須の利用者質問はないが、
 shift/direction/coverのeditor外変更も許す意図があれば実装前に確認する。
 その場合、通常本のreleased挙動を削らず、owner変更と費用を示して相談する。
