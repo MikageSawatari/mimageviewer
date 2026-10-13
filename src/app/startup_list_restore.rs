@@ -125,18 +125,18 @@ impl App {
     }
 
     pub(super) fn current_list_refresh_intent(&self) -> StartupListIntent {
-        let target = StartupListTarget::PhysicalList {
+        let physical_target = self.current_physical_refresh_target();
+        let cursor = physical_target
+            .as_ref()
+            .and_then(|target| self.current_main_list_cursor(target));
+        let target = physical_target.unwrap_or_else(|| StartupListTarget::PhysicalList {
             logical_path: self
                 .archive_source_override
                 .clone()
                 .or_else(|| self.current_folder.clone())
                 .unwrap_or_default(),
-            zip_prefix: self
-                .zip_nav
-                .as_ref()
-                .map(|nav| zip_prefix_string(nav.current())),
-        };
-        let cursor = self.current_main_list_cursor(&target);
+            zip_prefix: None,
+        });
         StartupListIntent::RefreshList {
             book_append_refresh: None,
             target,
@@ -144,6 +144,43 @@ impl App {
             local_search: self.submitted_local_search(),
             search_draft: self.show_search_bar.then(|| self.search_query.clone()),
         }
+    }
+
+    /// Current physical source for an accepted refresh, independently of whether this
+    /// presentation may update Main's startup record (notably a snapshot's folder child).
+    fn current_physical_refresh_target(&self) -> Option<StartupListTarget> {
+        let backing = self.current_folder.as_ref()?;
+        let logical_path = self.effective_folder()?;
+        if is_synthetic_view_path(&logical_path) {
+            return None;
+        }
+        let zip_prefix = if let Some(nav) = self.zip_nav.as_ref() {
+            if !crate::folder_tree::path_eq(backing, &nav.tree.zip_path) {
+                return None;
+            }
+            Some(zip_prefix_string(nav.current()))
+        } else {
+            None
+        };
+        Some(StartupListTarget::PhysicalList {
+            logical_path,
+            zip_prefix,
+        })
+    }
+
+    /// Hydration consumes refresh restoration in its existing selection-priority pass.
+    /// The adoption tail must not replay this lower-priority cursor afterwards.
+    pub(super) fn take_hydration_refresh_cursor(
+        &self,
+        intent: &mut StartupListIntent,
+    ) -> Option<ListCursorHint> {
+        let StartupListIntent::RefreshList { target, cursor, .. } = intent else {
+            return None;
+        };
+        let cursor = cursor.take()?;
+        self.current_physical_refresh_target()
+            .filter(|actual| same_list_target(target, actual))
+            .map(|_| cursor)
     }
 
     pub(crate) fn open_previous_startup_list(&mut self) {

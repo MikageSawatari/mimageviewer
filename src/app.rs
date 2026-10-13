@@ -25532,26 +25532,6 @@ impl App {
                 self.cancel_post_operation_selection("user_changed_selection");
             }
         }
-        // 物理一覧の選択名を保存 (非選択 / 対象外アイテムは None)。
-        // まだ 1 度も適用していない要求が生きている間は、そちらに任せて手を出さない
-        // (貼り付けの完了はこの自動再読込で拾うので、ここで元の選択へ戻すと打ち消し合う)。
-        // 適用済みなら「元の選択」はこちらが置いたものなので、通常どおり保存して戻す。
-        let selected_name = self
-            .post_operation_selection
-            .as_ref()
-            .is_none_or(|request| request.has_applied())
-            .then(|| self.selected)
-            .flatten()
-            .and_then(|idx| self.items.get(idx))
-            .and_then(|item| match item {
-                GridItem::Folder(_)
-                | GridItem::Image(_)
-                | GridItem::Video(_)
-                | GridItem::ZipFile(_)
-                | GridItem::PdfFile(_)
-                | GridItem::ConvertibleArchive { .. } => Some(item.name().into_owned()),
-                _ => None,
-            });
         if self
             .export_pending
             .as_ref()
@@ -25576,12 +25556,9 @@ impl App {
         }
         // 既に走らせた scan を pre_scan として渡し、UI スレッドで再 read_dir しない。
         let owner = self.current_folder_reload_owner(&folder);
-        // Cursor restoration belongs to the accepted hydration, after its history tail.
-        // This physical directory has unique item names, just like an explicit reload.
+        // Carry the old cursor only in the typed refresh intent. Existing explicit hints
+        // and operation outputs take priority in the accepted hydration's single pass.
         let previous_hint = self.select_after_load.clone();
-        if self.select_after_load.is_none() {
-            self.select_after_load = selected_name;
-        }
         let mut intent = self.current_list_refresh_intent();
         if let StartupListIntent::RefreshList {
             book_append_refresh,
@@ -25690,7 +25667,8 @@ impl App {
             return;
         }
         let previous_hint = self.select_after_load.clone();
-        self.preserve_cursor_hint_for_reload();
+        // RefreshList already captures the automatic cursor, including its viewport anchor.
+        // Do not duplicate it in select_after_load, which belongs to explicit callers.
         let saved_override = self.archive_source_override.clone();
         let owner = self.current_folder_reload_owner(&folder);
         let logical = saved_override.as_ref().unwrap_or(&folder).clone();
@@ -40238,7 +40216,7 @@ impl App {
             }
         }
         let sidecar_restore::SidecarLoadContinuation {
-            restore_intent,
+            mut restore_intent,
             first_display_action,
             navigation_after_hydration,
             audio_art_prune,
@@ -40664,6 +40642,9 @@ impl App {
         let history_state = (!detached_physical)
             .then(|| self.folder_history.get(&source_path).copied())
             .flatten();
+        let refresh_cursor = (!detached_physical)
+            .then(|| self.take_hydration_refresh_cursor(&mut restore_intent))
+            .flatten();
         // たった今の操作が作った項目があれば、そこへ移すのが最優先。名前ヒント
         // (`select_after_load`) も履歴も、そちらは「表示の都合」で決まる復元なので譲る。
         let from_operation = !detached_physical && self.apply_post_operation_selection();
@@ -40673,7 +40654,16 @@ impl App {
             self.select_after_load.take();
             true
         } else {
-            !detached_physical && self.try_select_after_load()
+            !detached_physical
+                && (self.try_select_after_load()
+                    || refresh_cursor.is_some_and(|cursor| {
+                        self.select_after_load = Some(cursor.name);
+                        let restored = self.try_select_after_load();
+                        if restored {
+                            self.scroll_selected_to_rows_above = cursor.rows_above;
+                        }
+                        restored
+                    }))
         };
         // 追加された項目を見せるのが目的なので、操作由来のときは履歴のスクロール位置へ
         // 戻さない (戻すと、選んだばかりの項目が画面外にある状態になる)。

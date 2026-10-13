@@ -419,10 +419,71 @@ mod folder_mtime_rescan_tests {
 
     #[test]
     fn visibility_external_rescan_restores_semantic_cursor_after_actual_hydration() {
-        for case in ["cursor", "explicit", "operation"] {
+        assert_refresh_restores_semantic_cursor_after_actual_hydration("external");
+    }
+
+    #[test]
+    fn visibility_manual_reload_restores_semantic_cursor_after_actual_hydration() {
+        assert_refresh_restores_semantic_cursor_after_actual_hydration("manual");
+    }
+
+    #[test]
+    fn visibility_append_external_rescan_restores_semantic_cursor_after_actual_hydration() {
+        assert_refresh_restores_semantic_cursor_after_actual_hydration("append_external");
+    }
+
+    #[test]
+    fn visibility_snapshot_child_rescan_restores_cursor_without_changing_fixed_root() {
+        assert_refresh_restores_semantic_cursor_after_actual_hydration("snapshot_external");
+    }
+
+    #[test]
+    fn visibility_refresh_capture_rejects_missing_synthetic_and_wrong_backing_sources() {
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("cursor-capture");
+        app.items = vec![GridItem::Image(folder.join("page.png"))];
+        app.selected = Some(0);
+        app.items_are_drive_list = false;
+        app.archive_source_override = None;
+        for case in ["missing", "synthetic", "wrong_backing"] {
+            app.current_folder = match case {
+                "missing" => None,
+                "synthetic" => Some(drive_list_synthetic_path()),
+                _ => Some(folder.clone()),
+            };
+            app.zip_nav = (case == "wrong_backing").then(|| {
+                crate::zip_tree::ZipNavState::new(Arc::new(crate::zip_tree::ZipTree::build(
+                    app.tmp.path().join("other.zip"),
+                    Vec::new(),
+                )))
+            });
+            assert!(
+                matches!(
+                    app.current_list_refresh_intent(),
+                    StartupListIntent::RefreshList { cursor: None, .. }
+                ),
+                "rejected {case} source must not capture a fallback cursor"
+            );
+        }
+        app.current_folder = Some(folder);
+        app.zip_nav = None;
+        assert!(matches!(
+            app.current_list_refresh_intent(),
+            StartupListIntent::RefreshList { cursor: Some(cursor), .. } if cursor.name == "page.png"
+        ));
+    }
+
+    fn assert_refresh_restores_semantic_cursor_after_actual_hydration(route: &str) {
+        for case in ["cursor", "explicit", "missing_explicit", "operation"] {
             let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
             let mut app = setup_app();
-            let folder = app.tmp.path().join("cursor-rescan");
+            let snapshot_parent = app.tmp.path().join("snapshot-rescan-root");
+            let folder = if route == "snapshot_external" {
+                std::fs::create_dir(&snapshot_parent).unwrap();
+                snapshot_parent.join("cursor-rescan")
+            } else {
+                app.tmp.path().join("cursor-rescan")
+            };
             std::fs::create_dir(&folder).unwrap();
             let page = folder.join("page.png");
             let later = folder.join("z.png");
@@ -431,7 +492,6 @@ mod folder_mtime_rescan_tests {
             }
             app.settings.sidecar_backup_enabled = false;
             app.settings.tag_sidecar_backup_enabled = false;
-            app.load_folder_with_scan(folder.clone(), None);
             let settle = |app: &mut App| {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
                 while app.sidecar_restore_active() {
@@ -443,15 +503,45 @@ mod folder_mtime_rescan_tests {
                     std::thread::yield_now();
                 }
             };
+            let snapshot_invariants = if route == "snapshot_external" {
+                assert!(app.load_folder_with_scan_owned(
+                    snapshot_parent,
+                    None,
+                    OpenRequestOwner::Navigation,
+                    StartupListIntent::ExplicitList,
+                ));
+                settle(&mut app);
+                app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+                app.finish_page_identity_preparation_for_test();
+                let snapshot = app.snapshot.as_ref().expect("captured Folder root");
+                Some((
+                    snapshot.generation_id,
+                    snapshot.origin.clone(),
+                    snapshot.list_view_items.clone(),
+                    snapshot
+                        .items
+                        .iter()
+                        .map(|entry| entry.key.clone())
+                        .collect::<Vec<_>>(),
+                    app.settings.startup_list_restore.clone(),
+                ))
+            } else {
+                None
+            };
+            app.load_folder_with_scan(folder.clone(), None);
             settle(&mut app);
             app.selected = app
                 .items
                 .iter()
                 .position(|item| matches!(item, GridItem::Image(path) if path == &page));
             app.scroll_offset_y = 125.0;
+            app.scroll_selected_to_rows_above = Some(2);
             let old_index = app.selected.unwrap();
             if case == "explicit" {
                 app.select_after_load = Some("z.png".into());
+            }
+            if case == "missing_explicit" {
+                app.select_after_load = Some("missing.png".into());
             }
             if case == "operation" {
                 app.request_post_operation_selection(
@@ -467,12 +557,45 @@ mod folder_mtime_rescan_tests {
                 .unwrap();
             let scan = folder_scan::scan_directory_with_settings(&folder, &app.settings).unwrap();
             let signature = signature_from_scan(&scan);
-            app.apply_external_rescan(
-                folder.clone(),
-                std::time::SystemTime::now(),
-                scan,
-                signature,
-            );
+            match route {
+                "external" | "snapshot_external" => app.apply_external_rescan(
+                    folder.clone(),
+                    std::time::SystemTime::now(),
+                    scan,
+                    signature,
+                ),
+                "append_external" => app.apply_external_rescan_with_cause(
+                    folder.clone(),
+                    std::time::SystemTime::now(),
+                    scan,
+                    signature,
+                    book_append_refresh::FolderRefreshCause::BookAppendExternal,
+                ),
+                "manual" => {
+                    app.reload_current_folder_preserving_override();
+                    assert!(
+                        app.top_level_grid_view
+                            .history_navigation_transition()
+                            .is_some(),
+                        "manual reload must exercise its staged producer"
+                    );
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    let ctx = egui::Context::default();
+                    while app
+                        .top_level_grid_view
+                        .history_navigation_transition()
+                        .is_some()
+                    {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "manual preflight timeout"
+                        );
+                        app.poll_collection_history_transition(&ctx);
+                        std::thread::yield_now();
+                    }
+                }
+                _ => unreachable!(),
+            }
             assert!(
                 app.sidecar_restore_active(),
                 "must exercise the actual asynchronous owner"
@@ -485,8 +608,13 @@ mod folder_mtime_rescan_tests {
                 _ => &page,
             };
             assert!(
-                matches!(&app.items[app.selected.unwrap()], GridItem::Image(path) if path == expected)
+                matches!(&app.items[app.selected.unwrap()], GridItem::Image(path) if path == expected),
+                "route={route} case={case}: selected={:?}, expected={expected:?}",
+                app.items[app.selected.unwrap()]
             );
+            if matches!(case, "cursor" | "missing_explicit") {
+                assert_eq!(app.scroll_selected_to_rows_above, Some(2));
+            }
             if case != "operation" {
                 assert_ne!(
                     app.selected,
@@ -499,8 +627,28 @@ mod folder_mtime_rescan_tests {
             }
             assert!(app.scroll_to_selected);
             assert!(app.select_after_load.is_none());
+            if let Some((generation, origin, root_items, root_keys, startup)) = snapshot_invariants
+            {
+                assert!(app.is_snapshot_active());
+                let snapshot = app.snapshot.as_ref().unwrap();
+                assert_eq!(snapshot.generation_id, generation);
+                assert_eq!(snapshot.origin, origin);
+                assert_eq!(snapshot.list_view_items, root_items);
+                assert_eq!(
+                    snapshot
+                        .items
+                        .iter()
+                        .map(|entry| entry.key.clone())
+                        .collect::<Vec<_>>(),
+                    root_keys
+                );
+                assert_eq!(app.settings.startup_list_restore, startup);
+            }
             if case == "operation" {
                 app.reload_current_folder_preserving_override();
+                super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(
+                    &mut app,
+                );
                 settle(&mut app);
                 assert!(
                     matches!(&app.items[app.selected.unwrap()], GridItem::Image(path) if path == &added)

@@ -639,6 +639,84 @@ metadata初期化後の作成失敗はログ・通知で閉じ、残ったorphan
 [egui-wgpu](../target/section1373-r7-vendor-egui-wgpu.log)、
 [eframe](../target/section1373-r7-vendor-eframe.log)。
 
+### 7.10 R7追補: 通常rescanの選択復元退行（2026-10-13）
+
+利用者の別worktreeでの切り分けは、`df20dba7b`で
+`visibility_external_rescan_restores_semantic_cursor_after_actual_hydration`成功、
+`3e8178b31`で同じ選択位置assertion失敗。間のdocs-only変更は原因ではなく、§1.373実装の退行とする。
+§7.9の「前提矛盾」は切り分け前の記録であり、テストの前提が古いという判断は撤回する。
+
+作用した差分は`apply_external_rescan`の`PreservePresentation`から`RefreshList`への変更。
+Appendの自己refresh情報を運ぶために通常rescanも同じintentへ変更したが、既存hydrationの
+操作選択／明示名前ヒントの復元後、`finish_main_list_open`が捕捉済みcursorをもう一度適用した。
+その結果、正しく復元した高優先度の選択を旧cursorへ戻した。sidecar worker自体の変更ではない。
+manual/full reload、Append終端fresh scan、deferred Append／一般Append refresh、
+Collection／Smart／Rating等の物理子も同じhydrationを通るため、通常rescanだけの分岐では直さない。
+
+不変条件は、受理された`resume_loading_items_after_sidecar`の既存選択復元で、
+**操作結果 → 有効な明示名前ヒント → 同じlogical source／ZIP prefixのRefresh cursor → 履歴／読書位置**
+を一度だけ解決すること。Refresh cursorは同じtyped intentからそこで消費し、後続の採用tailでは
+再適用しない。自動cursorを`select_after_load`へ重ねて保存するrescan／reload処理は外し、
+cursorと`rows_above`を既存Refresh要求に一緒に保持する。明示hintと操作要求は従来どおり優先し、
+上位が採用された場合は下位cursorを消費だけする。明示hintが消失した場合はRefresh cursorへ戻る。
+
+簡素化は、新しいrestore flag／pending／ownerや遅延を作らず、既存hydrationの選択確定点へ集約する。
+hydrateを通らないZIP階層内の採用、RestoreList／ResumeListの明示target契約は維持する。
+新しいUI同期I/O、待機、兄弟contextの失効は足さない。元の選択assertionは緩めず、manualと
+一般Append refreshの実handler、明示hint消失、viewport anchor、次回reloadへのhint漏れを回帰に追加する。
+§1.375の設計・manualはこの追補で変更しない。
+
+追加の独立確認で、起動復元用`restorable_current_main_list()`をRefresh cursorの照合に流用すると、
+★固定から開いたcaptured Folderの子が除外されることを確認した。これは通常の製品経路であり、
+起動復元の資格と、現在のphysical listのカーソル復元資格は同じではない。
+capture／consumeは共通のread-only physical source／prefix投影に揃える。current folder、logical alias、
+ZIP treeのbackingとの対応をI/Oなしで照合し、context／generationは受理済みsidecar ownerが照合する。
+startup recordのmain限定・snapshot除外は変更しない。★固定の実Folder子rescan回帰で選択に加え、
+固定rootの世代・origin・rows／keysとparentのstartup recordが不変であることを確認する。
+先の独立ACCEPTはこのfindingで撤回され、分離設計を再レビューしてACCEPT。最初のtest-fullは
+この追加findingで中断したため成功証拠にはしない。修正後に最後まで通るfull gateを一回実行する。
+
+最終差分の独立実装レビューはACCEPT、未解決指摘なし。capture拒否時はfallback targetから
+cursor資格を復活させず、source不明／synthetic／ZIP backing不一致と有効sourceの対照も回帰に追加した。
+元の選択期待は維持し、回帰4件追加。4入口×4条件の実hydrationと、拒否3条件＋有効対照を確認した。
+最終targetedは全体ゲートと同じ`pack-build-tools`条件・`RUST_TEST_THREADS=2`で次のとおり成功。
+
+| filter | 成功件数 |
+| --- | ---: |
+| folder_mtime_rescan_tests | 9 |
+| startup_restore_tests | 73 |
+| section1353 | 21 |
+| book_append | 42 |
+| post_operation_selection | 14 |
+| sidecar_restore | 61 |
+| section1373 | 58 |
+| total_deadline_covers_slow_headers_drip_bodies_and_redirect_remaining_time | 1 |
+
+合計279実行、重複除外237件、失敗0件。修正前の単独再現は0成功／1失敗として別に記録する。
+fmt checkは最終コードで成功。後述のfull完走と区別し、過去の中断結果を成功件数へ加算しない。
+
+最終通常／portable core check、`build-dev.ps1`が成功。確認用core／remote／EPUB workerの3 exeと
+runtime 4ファイル／PE 3件の配置確認が成功し、アプリは起動していない。
+最終`test-full.ps1 -SuppressCrashDialogs`は`RUST_TEST_THREADS=2`で**一回完走、exit 0／PASS**。
+workspace 13,439件、vendor egui 25件／egui-wgpu 11件／eframe 18件、
+合計13,493成功・0失敗・既存ignored 63件（doc-test等を含む）。追加findingで中断した一回は別記録であり、
+製品テスト失敗や成功証拠として数えない。最終完走中のソース3ファイルのSHA-256は開始時と一致。
+§1.375の設計書・manual変更0件、コミット0件。
+
+追補ログ: [修正前の単独再現](../target/section1373-rescan-fix/baseline.log)、
+[最終rescan 9件](../target/section1373-rescan-fix/folder_mtime_rescan_tests-final.log)、
+[最終起動復元73件](../target/section1373-rescan-fix/startup_restore_tests-final.log)、
+[最終§1.353 21件](../target/section1373-rescan-fix/section1353-final.log)、
+[最終§1.373 58件](../target/section1373-rescan-fix/section1373-final.log)、
+[最終sidecar 61件](../target/section1373-rescan-fix/sidecar_restore-final.log)、
+[fmt](../target/section1373-rescan-fix/fmt-check.log)、
+[通常check](../target/section1373-rescan-fix/core-check-final.log)、
+[portable check](../target/section1373-rescan-fix/portable-check-final.log)、
+[最終確認用build](../target/section1373-rescan-fix/build-dev-final.log)、
+[中断full（成功証拠ではない）](../target/section1373-rescan-fix/test-full-interrupted.log)、
+[最終full完走](../target/section1373-rescan-fix/test-full-final.log)、
+[full件数集計](../target/section1373-rescan-fix/full-summary.json)。
+
 ### 退役記録と再開範囲（R7以前の履歴）
 
 設計判断前に試作のApp fields／Undo入口／producer gate／typed refresh接続を撤回した。
