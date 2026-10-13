@@ -3,7 +3,7 @@
 ### 本の構成と提示許可（§1.242 B2、2026-10-13）
 
 accepted構成は方向・表紙・可視実列・ページ指定を渡し、通常の共通builderでSpread/連結/editor/Remoteの組を生成する。
-回転・寸法後着と実効自動規則を反映し、休眠shiftは適用しない。Single/Split/portraitは同じ実列を投影する。
+回転入力はitemsの投影workerで準備し、identityでlive memoを移して新facet列と同時に採用する。cold memoでも採用済みのページキー別入力を使い、UIからRotationDbを読まない。寸法後着と実効自動規則を反映し、休眠shiftは適用しない。Single/Split/portraitは同じ実列を投影する。
 明示Aloneは中央単独、明示BlankOppositeは指定側+白紙。形成理由をresolverまで保持して末尾表紙に置換しない。
 自動強制単独の白紙置換は通常本と同じ。facet外の現在ページは単独の同builder入力として保持する。
 Blankはsource/readinessを持たず、補助はNavigation/resume/exportの実列へ追加しない。

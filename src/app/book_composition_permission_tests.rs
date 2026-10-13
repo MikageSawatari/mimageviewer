@@ -1076,6 +1076,8 @@ fn all_hidden_zip_level_keeps_dfs_continuation_for_manual_and_slideshow() {
                 .send(Ok(BookProjectionReply {
                     rows,
                     landing: None,
+                    rotations: HashMap::new(),
+                    rotation_invalidation_revision: env.rotation_cache.invalidation_revision(),
                     edits: None,
                     automatic_preferences: None,
                     refresh_landings: HashMap::new(),

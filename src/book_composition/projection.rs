@@ -27,6 +27,8 @@ pub(crate) struct AcceptedCompositionProjection {
     pub(crate) token: CompositionToken,
     pub(crate) cover_enabled: bool,
     pub(crate) resolved: ResolvedComposition,
+    /// Worker-prepared transient geometry inputs; never part of the saved record.
+    pub(crate) prepared_rotations: Arc<HashMap<String, crate::rotation_db::Rotation>>,
     pub(crate) raw_pages: Arc<[CanonicalRawPage]>,
     raw_by_index: Arc<HashMap<usize, CompositionPageRef>>,
     projected_positions: Arc<HashMap<usize, ReadingPosition>>,
@@ -228,6 +230,7 @@ impl AcceptedCompositionProjection {
             token,
             cover_enabled,
             resolved,
+            prepared_rotations: Default::default(),
             raw_pages,
             raw_by_index: Arc::new(raw_by_index),
             projected_positions: Arc::new(projected_positions),
@@ -297,13 +300,16 @@ impl AcceptedCompositionProjection {
             })
             .collect::<Vec<_>>()
             .into();
-        Ok(Self::new(
+        let mut remapped = Self::new(
             self.scope.clone(),
             self.token,
             resolved,
             raw_pages,
             self.cover_enabled,
-        ))
+        );
+        // Geometry inputs are keyed by stable page identity, not dense slots.
+        remapped.prepared_rotations = Arc::clone(&self.prepared_rotations);
+        Ok(remapped)
     }
 }
 

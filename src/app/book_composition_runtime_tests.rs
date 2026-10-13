@@ -1853,3 +1853,294 @@ fn g3_mode_only_archive_removal_and_reentry_preserve_inherited_rtl_cover() {
 }
 
 include!("book_composition_revision_tests.rs");
+
+// These regressions exercise the production worker/save/adoption boundary, not
+// a synthetic already-adopted projection with an injected numeric rotation memo.
+fn save_reordered_document(service: &BookCompositionService, scope: &BookScopeKey, hidden: &[u32]) {
+    use crate::book_composition::{BookComposition, fixtures::document_page};
+    let mut composition = BookComposition::new(
+        ReadingDirection::Ltr,
+        [1, 2, 0, 3].into_iter().map(document_page).collect(),
+    );
+    composition.hidden_pages = hidden.iter().copied().map(document_page).collect();
+    service
+        .save(scope.clone(), PageDomain::Document, composition)
+        .recv_timeout(WAIT)
+        .unwrap()
+        .status
+        .unwrap();
+}
+
+fn hold_completed_rotation_projection(app: &mut App) {
+    let state = std::mem::take(&mut app.book_composition);
+    let ViewerBookComposition::Projecting {
+        scope,
+        token,
+        record,
+        source,
+        generation,
+        origin,
+        receiver,
+    } = state
+    else {
+        panic!("real projection worker must be admitted");
+    };
+    let reply = receiver.recv_timeout(WAIT).expect("worker completed");
+    let (deliver, receiver) = std::sync::mpsc::channel();
+    deliver.send(reply).unwrap();
+    app.book_composition = ViewerBookComposition::Projecting {
+        scope,
+        token,
+        record,
+        source,
+        generation,
+        origin,
+        receiver,
+    };
+}
+
+fn assert_projected_rotation_groups(app: &mut App, expected: Vec<Vec<usize>>) {
+    for index in 0..app.items.len() {
+        app.record_page_dims_for_spread(index, (600, 900));
+    }
+    let nav = app.get_nav_indices();
+    assert_eq!(app.spread_display_unit_pages_for_test(&nav), expected);
+}
+
+#[test]
+fn b2_projection_save_rebases_rotations_by_identity_and_cancels_old_reader() {
+    use crate::rotation_db::{Rotation, RotationDb};
+    let mut env = setup_app();
+    let root = env.tmp.path().join("rotation-reorder.pdf");
+    let scope = install_document(&mut env, &root);
+    let data = env.tmp.path().join("rotation-reorder-data");
+    env.rotation_db = Some(RotationDb::open_at(&data.join("rotation.db")).unwrap());
+    let (service, owner) = runtime(&mut env, &data);
+    // Exercise the real rotation handler, then save a newly reordered record.
+    env.set_image_rotation(0, Rotation::Cw90).unwrap();
+    let ctx = egui::Context::default();
+    let path = env.rotation_db.as_ref().unwrap().file_path().unwrap();
+    let key = env.page_path_key(1).unwrap();
+    let generation = env.items_generation;
+    env.rotation_cache
+        .start_still_seek_rotations(generation, vec![(1, key)], path, &ctx);
+    let cancel = env.rotation_cache.pending_cancel_for_test().unwrap();
+    save_reordered_document(&service, &scope, &[]);
+    let reads = crate::rotation_db::read_operations_for_test();
+    adopt(&mut env, &service, &scope);
+    assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+    assert_eq!(
+        env.get_rotations_for_indices(&[0, 1, 2, 3]),
+        vec![
+            Rotation::None,
+            Rotation::None,
+            Rotation::Cw90,
+            Rotation::None
+        ]
+    );
+    assert_projected_rotation_groups(&mut env, vec![vec![0, 1], vec![2], vec![3]]);
+    assert_eq!(crate::rotation_db::read_operations_for_test(), reads);
+    save_reordered_document(&service, &scope, &[1]);
+    adopt(&mut env, &service, &scope);
+    assert_eq!(
+        env.get_rotations_for_indices(&[0, 1, 2]),
+        vec![Rotation::None, Rotation::Cw90, Rotation::None]
+    );
+    assert_projected_rotation_groups(&mut env, vec![vec![0], vec![1], vec![2]]);
+    assert_eq!(crate::rotation_db::read_operations_for_test(), reads);
+    owner.shutdown_and_join();
+}
+
+#[test]
+fn b2_cold_composed_display_and_projection_adoption_never_read_rotation_db_on_ui() {
+    use crate::rotation_db::{Rotation, RotationDb};
+    let mut env = setup_app();
+    let root = env.tmp.path().join("cold-rotations.pdf");
+    let scope = install_document(&mut env, &root);
+    let data = env.tmp.path().join("cold-rotations-data");
+    env.rotation_db = Some(RotationDb::open_at(&data.join("rotation.db")).unwrap());
+    let key = env.page_path_key(0).unwrap();
+    env.rotation_db
+        .as_ref()
+        .unwrap()
+        .set_key(&key, Rotation::Cw90)
+        .unwrap();
+    env.rotation_cache.clear();
+    let (service, owner) = runtime(&mut env, &data);
+    save_reordered_document(&service, &scope, &[]);
+    let reads = crate::rotation_db::read_operations_for_test();
+    adopt(&mut env, &service, &scope);
+    assert_eq!(env.get_rotation(2), Rotation::Cw90);
+    // Sparse/cleared derived memo must use the adopted worker inputs as well.
+    env.rotation_cache.clear();
+    assert_projected_rotation_groups(&mut env, vec![vec![0, 1], vec![2], vec![3]]);
+    assert_eq!(env.get_rotation(2), Rotation::Cw90);
+    assert_eq!(env.book_target_presentation_demand(2).len(), 1);
+    assert_eq!(crate::rotation_db::read_operations_for_test(), reads);
+    assert!(
+        env.rotation_cache.is_empty(),
+        "retained inputs must not become a live overlay"
+    );
+    owner.shutdown_and_join();
+}
+
+#[test]
+fn b2_projection_requalifies_pending_explicit_target_after_rebuilding_facets() {
+    use super::book_composition_permission::BookTargetPurpose;
+    for outside_facet in [false, true] {
+        let mut env = setup_app();
+        let root = env.tmp.path().join("pending-facet.pdf");
+        let scope = install_document(&mut env, &root);
+        let data = env.tmp.path().join("pending-facet-data");
+        let (service, owner) = runtime(&mut env, &data);
+        save(&service, &scope, ReadingDirection::Ltr);
+        adopt(&mut env, &service, &scope);
+        // Warm persisted ratings, rather than injecting a post-adoption facet
+        // column or using session writes which can conceal stale numeric memo.
+        env.rating_db = Some(crate::rating_db::RatingDb::open_at(&data.join("rating.db")).unwrap());
+        let key = env.page_path_key(1).unwrap();
+        env.rating_db.as_ref().unwrap().set(&key, 3).unwrap();
+        env.rating_cache.clear();
+        for index in 0..4 {
+            let _ = env.get_rating(index);
+        }
+        env.settings.rating_filter = [false, false, false, true, false, false];
+        env.rebuild_visible_indices();
+        assert_eq!(env.visible_indices, vec![1]);
+        save_reordered_document(&service, &scope, &[]);
+        admit_projection(&mut env, &service, &scope);
+        let target = if outside_facet { 2 } else { 1 };
+        assert!(env.defer_book_composition_fullscreen_open(
+            target,
+            HistoryTrigger::UserChosen,
+            FsOpenMaterialization::DeferredPageTurn,
+            FsPageLoadContract::Sequential,
+            BookTargetPurpose::Explicit
+        ));
+        assert_eq!(
+            env.fullscreen_idx, None,
+            "captured explicit target is still pending at adoption"
+        );
+        let reads = crate::rotation_db::read_operations_for_test();
+        settle_projection(&mut env);
+        assert_eq!(env.visible_indices, vec![0]);
+        let new_target = if outside_facet { 1 } else { 0 };
+        let demand = env.pending_book_target_demand_for_test();
+        if demand.is_empty() {
+            // The service may already have completed while production poll ran.
+            assert_eq!(env.fullscreen_idx, Some(new_target));
+        } else {
+            assert!(
+                demand.iter().any(|entry| entry.item_index == new_target),
+                "pending demand: {demand:?}"
+            );
+        }
+        barrier(&service, &scope);
+        env.poll_book_composition_read(&egui::Context::default());
+        assert_eq!(env.fullscreen_idx, Some(new_target));
+        assert_eq!(env.book_target_presentation_demand(new_target).len(), 1);
+        assert_eq!(crate::rotation_db::read_operations_for_test(), reads);
+        owner.shutdown_and_join();
+    }
+}
+
+#[test]
+fn b2_projection_keeps_newer_rotation_and_reprepares_after_reset_or_restore() {
+    use crate::rotation_db::{Rotation, RotationDb};
+    let mut env = setup_app();
+    let root = env.tmp.path().join("rotation-invalidation.pdf");
+    let scope = install_document(&mut env, &root);
+    let data = env.tmp.path().join("rotation-invalidation-data");
+    env.rotation_db = Some(RotationDb::open_at(&data.join("rotation.db")).unwrap());
+    let (service, owner) = runtime(&mut env, &data);
+    save_reordered_document(&service, &scope, &[]);
+    admit_projection(&mut env, &service, &scope);
+    hold_completed_rotation_projection(&mut env);
+    env.set_image_rotation(0, Rotation::Cw90).unwrap();
+    settle_projection(&mut env);
+    assert_eq!(env.get_rotation(2), Rotation::Cw90);
+    // A reset after a worker read invalidates that reply; its successor reads None.
+    save_reordered_document(&service, &scope, &[3]);
+    admit_projection(&mut env, &service, &scope);
+    hold_completed_rotation_projection(&mut env);
+    env.rotation_db.as_ref().unwrap().clear_all().unwrap();
+    env.reset_rotation_cache_after_clear();
+    let reads = crate::rotation_db::read_operations_for_test();
+    settle_projection(&mut env);
+    assert!(env.book_composition.is_pending());
+    settle_projection(&mut env);
+    assert_eq!(env.get_rotation(2), Rotation::None);
+    // Restored durable rotations use the same projection worker. The old geometry
+    // remains authoritative during the refresh, without a synchronous UI SELECT.
+    let key = env.page_path_key(2).unwrap();
+    env.rotation_db
+        .as_ref()
+        .unwrap()
+        .set_key(&key, Rotation::Cw90)
+        .unwrap();
+    env.remove_rotation_cache_entry_for_reload(2);
+    assert!(env.book_composition.is_pending());
+    assert_eq!(env.get_rotation(2), Rotation::None);
+    barrier(&service, &scope);
+    env.poll_book_composition_read(&egui::Context::default());
+    settle_projection(&mut env);
+    assert_eq!(env.get_rotation(2), Rotation::Cw90);
+    assert_eq!(crate::rotation_db::read_operations_for_test(), reads);
+    owner.shutdown_and_join();
+}
+
+#[test]
+fn b2_deletion_keeps_latest_rotation_and_does_not_recreate_removed_rows() {
+    use crate::rotation_db::{Rotation, RotationDb};
+    let mut env = setup_app();
+    let root = env.tmp.path().join("rotation-deletion.pdf");
+    let scope = install_document(&mut env, &root);
+    let data = env.tmp.path().join("rotation-deletion-data");
+    env.rotation_db = Some(RotationDb::open_at(&data.join("rotation.db")).unwrap());
+    let (service, owner) = runtime(&mut env, &data);
+    save_reordered_document(&service, &scope, &[]);
+    adopt(&mut env, &service, &scope);
+    env.set_image_rotation(2, Rotation::Cw90).unwrap();
+    let reads = crate::rotation_db::read_operations_for_test();
+    env.remove_items_batch(&[0]);
+    assert_eq!(env.items.len(), 3);
+    assert_eq!(env.get_rotation(1), Rotation::Cw90);
+    assert_projected_rotation_groups(&mut env, vec![vec![0], vec![1], vec![2]]);
+    barrier(&service, &scope);
+    env.poll_book_composition_read(&egui::Context::default());
+    settle_projection(&mut env);
+    assert_eq!(env.items.len(), 3);
+    assert_eq!(env.get_rotation(1), Rotation::Cw90);
+    assert_eq!(crate::rotation_db::read_operations_for_test(), reads);
+    owner.shutdown_and_join();
+}
+
+#[test]
+fn b2_snapshot_return_uses_identity_rotation_inputs_without_ui_db_reads() {
+    use crate::rotation_db::{Rotation, RotationDb};
+    let mut env = setup_app();
+    let root = env.tmp.path().join("rotation-snapshot.pdf");
+    let scope = install_document(&mut env, &root);
+    let data = env.tmp.path().join("rotation-snapshot-data");
+    env.rotation_db = Some(RotationDb::open_at(&data.join("rotation.db")).unwrap());
+    let (service, owner) = runtime(&mut env, &data);
+    save_reordered_document(&service, &scope, &[]);
+    adopt(&mut env, &service, &scope);
+    env.visible_indices = vec![2];
+    env.viewer_navigation_caches.invalidate();
+    env.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+    assert_eq!(env.items.len(), 1);
+    env.set_image_rotation(0, Rotation::Cw90).unwrap();
+    let reads = crate::rotation_db::read_operations_for_test();
+    env.deactivate_snapshot();
+    assert_eq!(env.items.len(), 4);
+    assert_eq!(env.get_rotation(2), Rotation::Cw90);
+    assert_eq!(
+        env.visible_indices,
+        vec![2],
+        "return preserves the captured filtered column"
+    );
+    assert_projected_rotation_groups(&mut env, vec![vec![2]]);
+    assert_eq!(crate::rotation_db::read_operations_for_test(), reads);
+    owner.shutdown_and_join();
+}

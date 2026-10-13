@@ -1,7 +1,7 @@
 # §1.242 本の構成 — 設計案
 
 更新: 2026-10-14、B2実装・検証。`next-book`、採択設計 `4f3d160f3`。
-B1は独立設計レビューACCEPT後にコミット済み。B2は採択設計の実装と自動検証で、コミット・アプリ起動は行わない。
+B1は独立設計レビューACCEPT後にコミット済み。B2は`aeb55914d`としてコミット済みで、現在は外部独立レビューP2三件の修正・自動検証。今回の差分のコミット・アプリ起動は行わない。
 実装・検証の記録は§13のB2に記載する。実機の受入確認は別途行う。
 §1.242と`book_composition.db`は未公開で、v4.6.0には含まれない。次の版に含める（2026-10-13利用者決定）。
 2026-10-11の「次々回」は履歴。旧保存unitsの移行処理は不要。
@@ -1522,6 +1522,44 @@ stale-binary logへ分離し、修正の成功証跡には数えない。
 保存・再開位置/しおり/履歴・別窓、Remote、trim・転送・製本/出力を確認する。
 旧unitsの隔離データがある場合は削除せず退避し、新しい空の同data-dirで新形式を検査する。
 通常のAPPDATAは使わない。コミットは実施しない。
+
+#### B2 独立レビュー P2 対応（2026-10-14、aeb55914d からの差分）
+
+外部独立レビューはREVISE（P2三件）。旧indexの回転memo、新itemsに旧facet列を使う提示許可、
+構成のcold cacheからUI threadへ達する同期RotationDb読取を、同じ投影採用境界で修正する。
+
+- 既存projection workerが新itemsの全ページの回転（未登録は明示None）を準備する。
+  DB pathは既存connectionからI/Oなしで捕捉し、workerだけがread-only接続・一括SELECTする。
+  採用時には現在のmemoを旧ページidentityから新indexへ移し、新itemsと同時に置き換える。
+  旧世代の非同期回転readerは同じRotationCache ownerの置換で取消し、数値slotを流用しない。
+- 採用済projectionにstable page key別のtransient回転入力を保持する（record/DB/転送には保存しない）。
+  memoがcoldでも共通builder・描画・提示許可はその入力を使い、UIからDBを読まない。
+  fallbackはlive memoへ書き戻さず、準備中の新しい回転操作だけがidentity overlayとして優先される。
+- 回転の失効は既存のprojection準備経路へ戻す。準備中は以前の採用済入力を保持し、
+  cache ownerの失効revisionが変わった古いworker結果は同じ入口で再準備する。
+  全回転resetは明示None、metadata importはworkerが未登録Noneも準備し、
+  物理削除・元一覧復帰では同じstable keyの入力を保持する。固定一覧内の実編集も同じviewerの退避中の元本へCOWで反映し、別窓の入力は変更しない。index memo破棄はsource再列挙を起動せず、削除ページを再生成しない。別の回転refresh状態・worker経路は作らない。
+- 新items・回転・構成binding・着地・facet/navigation列を揃えた後にpending targetを再許可する。
+  投影専用の組立てhelperは削除し、通常の提示demand helperへ統一する。
+  facet内targetもfacet外の明示target（単独表示）も同じ経路を使う。
+
+構成なし本の既存DB/cache経路、schema 2、明示白紙・Remote制限・転送/出力資格は変更しない。
+保存/adoption、cold cache、pending explicit target＋保存済評価facet、準備中の回転/reset/restore・削除・固定一覧復帰の回帰で、
+UI thread-local RotationDb読取カウンターが増えないことを直接検査する。
+検証ownerは実装担当。以下はaeb55914dからのこの差分に対する結果（2026-10-14）。
+
+| 検査 | 結果 / target配下の証跡 |
+| --- | --- |
+| 新規採用境界回帰 | `cargo test -p mimageviewer --features pack-build-tools --lib b2_`、6成功・0失敗。b2-revise-focused-final.log |
+| 関連 | 同featuresの`--lib book_composition`で201成功、`--lib metadata_import_refresh`で9成功。b2-revise-related.log / b2-revise-import-tests.log |
+| fmt / glyph / diff | `cargo fmt --all -- --check`、glyph 0件、`git diff --check`成功。b2-revise-fmt-check.log / b2-revise-glyph.log / b2-revise-diff-check.log |
+| normal / portable check | `cargo check -p mimageviewer --bin mimageviewer-core`、同`--features portable`、ともにexit 0。b2-revise-check.log / b2-revise-check-portable.log |
+| snapshot | pack-build-toolsで編集画面8成功、通常UI174成功。PNG更新なし。b2-revise-editor-snapshots.log / b2-revise-ui-snapshots.log |
+| 全体gate | `scripts/test-full.ps1 -SuppressCrashDialogs`を1回実行しPASS、exit 0。workspace全件・補助bin・vendor 3対象まで完了。本体lib 12,641成功・57既存ignored・0失敗、vendor egui 25 / egui-wgpu 11 / eframe 18成功。b2-revise-test-full.log（scriptのstage/終了）、b2-revise-test-full-summary.log（取得したharness結果） |
+| 構造レビュー | 対象3件とreset/restore/import/削除/固定一覧復帰の限定ソースレビューACCEPT。上の自動gateは実装担当の結果 |
+| build-dev | 未実行。最終確認でも別ツリー`C:\home\mimageviewer-musicvideo\target\dev-runtime\mimageviewer-core.exe`、PID 74036が稼働中。利用者指示に従いビルドを保留し、processを停止していない |
+
+アプリ起動・コミットは行っていない。確認用binaryはこの差分で更新していない。
 
 ### 旧G段階の実装・採択・検証履歴
 

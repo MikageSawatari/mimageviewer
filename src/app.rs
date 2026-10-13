@@ -44783,7 +44783,10 @@ impl App {
                 || self.mask_pages.contains(&item_index)
                 || self.conceal_pages.contains(&item_index)
                 || self.comic_pages.contains(&item_index)
-                || self.rotation_cache.contains_key(&item_index);
+                || self
+                    .rotation_cache
+                    .get(&item_index)
+                    .is_some_and(|rotation| !rotation.is_none());
             let item = &self.items[item_index];
             let tag_key = tag_item_path(item).map(crate::tags_db::item_key_for_path);
             // Supplemental source rows can be displayed by search/Collection contexts with
@@ -45380,7 +45383,9 @@ impl App {
                 self.conceal_pages = page.conceal_pages;
                 self.comic_pages = page.comic_pages;
             }
-            self.rotation_cache = page.rotation_cache.into();
+            self.rotation_cache.replace_values(page.rotation_cache);
+            self.sync_prepared_composed_rotations_from_cache();
+            self.refresh_composed_rotation_inputs();
             self.reconcile_spread_landscapes_from_rotation_cache();
             self.adjustment_cache.clear();
             // thumbnail_reset_indices は旧/新いずれかのページ状態を持つ idx を網羅し、
@@ -70958,6 +70963,9 @@ impl App {
         if let Some(&rot) = self.rotation_cache.get(&idx) {
             return rot;
         }
+        if let Some(rotation) = self.prepared_composed_rotation(idx) {
+            return rotation;
+        }
         let Some(key) = self.rotation_key_for_idx(idx) else {
             return crate::rotation_db::Rotation::None;
         };
@@ -70970,8 +70978,24 @@ impl App {
         rot
     }
 
-    /// DB や items の外部更新により回転 memo を捨てる。cached nav が同じなら、次の参照で
-    /// 回転を一括再取得し、横長性が実際に変わったページがある場合だけ epoch を進める。
+    /// Global reset proves explicit None for current and parked composition inputs.
+    pub(crate) fn reset_rotation_cache_after_clear(&mut self) {
+        self.rotation_cache.clear();
+        self.reset_prepared_composed_rotations();
+        if self.composed_book_layout().is_some() {
+            // A successful reset proves every page is unrotated, even while a
+            // projection is being prepared. Explicit None wins over older inputs.
+            for index in 0..self.items.len() {
+                self.rotation_cache
+                    .insert(index, crate::rotation_db::Rotation::None);
+            }
+        }
+        self.sync_prepared_composed_rotations_from_cache();
+        self.reconcile_spread_landscapes_from_rotation_cache();
+    }
+
+    /// Discard derived numeric slots on source/reindex reload. A composed book's
+    /// keyed prepared inputs survive; this is not a durable rotation mutation.
     pub(crate) fn clear_rotation_cache_for_reload(&mut self) {
         self.rotation_cache.clear();
         self.spread_display_units_cache
@@ -70980,6 +71004,7 @@ impl App {
 
     pub(crate) fn remove_rotation_cache_entry_for_reload(&mut self, idx: usize) {
         self.rotation_cache.remove(&idx);
+        self.refresh_composed_rotation_inputs();
         self.spread_display_units_cache
             .mark_rotation_for_recheck(self.items_generation, idx);
     }
@@ -70998,6 +71023,10 @@ impl App {
         let mut missing = Vec::new();
         for (position, &idx) in indices.iter().enumerate() {
             if let Some(&rotation) = self.rotation_cache.get(&idx) {
+                rotations[position] = rotation;
+                continue;
+            }
+            if let Some(rotation) = self.prepared_composed_rotation(idx) {
                 rotations[position] = rotation;
                 continue;
             }
@@ -71089,6 +71118,7 @@ impl App {
                     .map_err(|error| format!("回転を保存できませんでした: {error}"))
             });
         self.rotation_cache.insert(idx, rot);
+        self.update_prepared_composed_rotation(idx, rot);
         self.reconcile_spread_landscape_with_rotation(idx, rot);
         Self::set_page_key_presence(&mut self.rotation_page_keys, &key, !rot.is_none());
         self.schedule_current_smart_folder_metadata_refresh(

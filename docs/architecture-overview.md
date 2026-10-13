@@ -8,7 +8,7 @@ source enumeration、policy、raw manifest、cache/lease、既存PreparedPageIde
 B2の`book_composition`はpure record・可視実列resolver・ページ指定編集を提供する。
 保存するのは方向・表紙on/off・順序・hidden・ページoverrideだけで、組は通常の共通builderから派生する。
 G2 part Bは単一workerの`book_composition.db`、lifecycle、metadata v11転送とread登録を追加する。
-G3はraw manifestと保存構成からworkerで共通projectionを作り、items・identity index・閲覧unitを同じ採用境界で更新する。
+G3はraw manifestと保存構成からworkerで共通projectionと回転入力を作る。items・identity index・回転・構成binding・着地・facet列を採用してから提示許可を作る。回転memoのcold時も採用済projectionのページキー別入力を使い、UIでRotationDbを読まない。
 G4の`app/book_composition_editor`はprocess共通の操作ownerと送信済みsave ticketを持ち、
 draft/phase/viewは一つのViewerContextBundleに所属する。一時mount/兄弟描画ではownerを移さない。
 `book_composition/editor`は純粋draft・undo/redo、`ui_composition_editor`はI/Oなしの

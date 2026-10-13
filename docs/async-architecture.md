@@ -8,6 +8,10 @@ cached documentの早期adoption、password/EPUB取消、policy/generationによ
 既存request ownerが担う。raw ZIP manifestと採用済みpolicyの表示列を混同しない。
 
 完成itemsと`ProjectionRecipe`を同じ採用境界で公開し、以後は同じViewerContextBundleで所有する。
+構成投影の回転入力は同じworkerで新itemsのindexへ準備する。UI採用はidentityでlive回転を移し、
+新items・回転・binding・着地・facetを揃えてからpending targetの提示許可を生成する。
+採用済みのページキー別回転入力はmemoのcold時にも使い、同期DB fallbackを構成表示へ持ち込まない。
+回転失効は既存projection準備へ戻し、準備中の旧入力をlive memoへ書き戻さない。
 固定snapshotは元一覧と固定一覧それぞれのrecipeを保存し、子の物理本を離れた復帰で対応する
 保存列と同時に戻す。Smart rootも既存準備済みrootの復帰境界でExtractedResultを採用する。
 read-only mount/fork/closeから兄弟のgeneration/queue/cancel/cacheを変更しない。
