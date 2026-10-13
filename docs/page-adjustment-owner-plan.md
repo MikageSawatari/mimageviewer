@@ -215,9 +215,12 @@ App共有のlocal writerは増設しない。各request/completionにenqueue時�
 sidecar座標・表示更新のowner contextとedit revisionを対応させる。
 旧completionのoriginをkeyごとの最新pendingから借りない。completionはcaptured keyの正本／mirrorへ配送する。
 遅い旧世代のCommittedも既存の順序付きmirror契約を維持する。最新completionだけが
-対応する保存pendingを畳む。volatile解除／cache更新は所有contextの同key・同revisionへ行い、
-現在mountedの別contextのsnapshotを変更しない。
-同ページを表示する他contextへの更新は、永続変更の同key publicationとして明示的に行う。
+対応する保存pendingを畳む。originは要求ごとのmirror配送先として保持するが、
+volatile解除をoriginだけに限定しない。enqueue成功直後と最新成功completionは同じ
+同key publicationを通し、未確定draftのない全contextのlayers／index presence／
+snapshot.local_adjustを最新受付文書へ揃える。volatileも既存shared pendingの有無へ揃える。
+非residentの同key ownerも含め、metadataだけの変化もedit revisionへ反映する（§11）。
+同ページを表示する他contextへの更新は、この明示的な同key publicationとして行う。
 兄弟の別keyのdraft・cache・workerは触らない。read-only open/closeはmutation-style invalidationを発行しない。
 同keyの別contextにactive draftがある場合、そのdraftはpublicationで上書きしない。
 表示中draftは各ownerで独立し、明示確定した文書は既存の同key writer順序で保存する。
@@ -478,3 +481,127 @@ coordinator基点HEAD `a5648d3cb` に対する未コミット差分として検�
 ```powershell
 Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 ```
+
+## 11. `2bf8943a2` 独立レビューP2追補（2026-10-13）
+
+P1なし、P2 2件。前節の検証では次の境界を覆えていなかったため修正する。
+
+1. pointer releaseは基点 `a5648d3cb` のkey確定→pointer登録をstable target経路でも維持する。
+   idx wrapperのkey-first契約をtarget終端へ揃え、key自身のtake-before-dispatchを保つ。
+   shared history boundaryへ再入しない。§9の混合after／Esc／gesture基点の既存意味は変えない。
+   shape／canvas／brushの実release handlerを通し、基点から得たbefore/after全文・履歴順・
+   直後Undo S1・後続idle・Redoを比較する。sourceの文字列監査だけで終端の維持を主張しない。
+2. local writerの最新受付文書を、同keyの非active contextのlayers/index presenceだけでなく
+   `PageEditSnapshot.local_adjust`／volatileにも一つのpublication境界で反映する。
+   volatileは独立したcontext保存予約ではなく、**そのcontextの未確定文書、または同keyの
+   最新受付文書が保存待ち**であることを表す。新しい保存状態やowner別pending mapは追加しない。
+   既存のkey→pending文書を使い、enqueue成功直後にも同じbatch publicationへ配送する。
+   最新成功completionではshared pendingが消えた後、同keyの非active全contextのpresenceを
+   最新文書へ揃え、volatileを解除する。旧originだけの解除へ限定しない。
+   古いcompletionはorigin付きmirrorを維持し、最新pending／兄弟の未確定draftを解除しない。
+   同keyの実key/shape/canvas/brush編集payloadがあるcontextは自身のdraftとvolatileを保持する。
+   未完点列だけは既存の「次入力で最新受付文書から新規run」契約を維持し、点列を取り消さない。
+   reindexで非residentになったownerや既存volatile keyも更新し、旧presenceが再採用されない。
+
+状態を減らす案として、key単位の既存pendingと既存snapshotへ受付／完了を揃える。
+新しいper-context保存台帳、retry、回復worker、UI同期DB読取、完了待ちは不要。
+まれな失敗は既存のログ＋通知で割り切り、回復経路内の追加失敗処理は作らない。
+
+回帰はAの書込を既存の試験用停止点で保持→Bが同key全削除をenqueue→A旧completionと
+B最新completionを順にdrain→Aの実reconciliationを通し、DB／sidecar／snapshot／index presenceが
+削除のまま、volatileが解除済みであることを確認する。同keyの未確定draftと別keyは保護する。
+独立方向確認と完成差分のコードレビューはともにACCEPT（P1／P2なし）。
+基点の終端順・未確定draft保護・旧completionのmirror・非resident更新・metadata-onlyの
+revision更新を確認済み。自動検証の実数と証拠は以下へ追記する。
+
+### 11.1 変更範囲と回帰のfixture
+
+基点HEADは `2bf8943a2`。未コミット差分はRust 7ファイル、文書3ファイル。
+
+| ファイル | 変更 |
+|---|---|
+| `src/undo_ops.rs` | stable target終端でも保留keyを先に確定 |
+| `src/app/page_edit_owner.rs` | enqueue成功時に最新受付文書を同key publicationへ配送 |
+| `src/app/viewer_context_registry.rs` | idle同key ownerのsnapshot／volatile／revisionを一つの境界で更新 |
+| `src/app.rs` | originだけのvolatile解除を廃止、release回帰moduleを登録 |
+| `src/ui_adjustment_panel.rs` | 試験限定の入口から実panel全削除handlerへ接続 |
+| `src/app/page_edit_release_tests.rs` | 実shape／canvas／brush release、各通常／reindexの6件を追加 |
+| `src/app/page_edit_owner_tests.rs` | writer停止中の別context全削除／非resident／live draft保護の3件を追加 |
+| `docs/page-adjustment-owner-plan.md` | §5の契約整合、§11に判断と証拠を記録 |
+| `docs/architecture-overview.md` | 同key受付／完了publicationとdraft保護を記録 |
+| `docs/detached-rework-plan.md` | 既存所有境界での追補と独立合意を記録 |
+
+初回targetedは全削除3件と通常release3件が成功し、reindex release3件がfixtureで失敗した。
+検索採用は編集中Aを再投影する一方、非編集Bの全文は遅延読込であり、試験が読込前の
+idx mapを直接参照していた。実DBのpresence→実prepared採用→既存全文hydrationをfixtureに
+接続し、期待値の書き戻しや製品コード修正は行っていない。Aの全文・owner・revision・
+選択・key before・履歴0件をhydration前後で検証し、兄弟のDB／sidecar検証も保持する。
+このtest-only修正の独立レビューもACCEPT（P1／P2なし）。初回失敗の証拠は
+`target/nextfix-1372-r4-release-first-fixture-failure.out.log`／`.err.log` に保持する。
+最終Rust sourceは `target/nextfix-1372-r4-source-manifest.json` のSHA-256で固定する。
+
+### 11.2 最終検証
+
+同一sourceでtargetedは次の通り成功した。filterは重複するため、単純合計を独立試験数と
+みなさない。新規回帰は計9件。全削除／非resident／未確定draft保護3件、release6件。
+
+| 対象（ログ名） | 成功 | 失敗 | ignore |
+|---|---:|---:|---:|
+| `foreign-delete` | 3 | 0 | 0 |
+| `release` | 6 | 0 | 0 |
+| `owner` | 23 | 0 | 0 |
+| `local` | 159 | 0 | 0 |
+| `viewer` | 99 | 0 | 0 |
+| `undo` | 107 | 0 | 0 |
+| `snapshot` | 348 | 0 | 2 |
+
+通常／portableのcore `cargo check`、`cargo fmt --all --check` はexit 0。
+`python scripts/check_ui_glyphs.py` は危険glyph 0件。証拠は
+`target/nextfix-1372-r4-<filter>.out.log`／`.err.log`、checkは
+`check-normal`／`check-portable`、fmtは `fmt`、glyphは `glyph`。
+集計は `target/nextfix-1372-r4-targeted-summary.json`。
+release core／remote／EPUB workerは既存成果物が揃っており、前提用build-releaseは不要だった。
+
+初回fullの本体は12,188成功／1失敗／56 ignore（1603.94秒）。失敗は
+`multiwindow_scenario_collection_root_detached_folder_child_restore` のscenario本体より前、
+`collection_order_fixture` の `add_batch().recv_timeout(3秒)`（1935行）でのTimeoutだった。
+今回のlocal補正編集／保存との直接接点はソース棚卸しで見つからず、独立確認も一致した。
+workspace全体は13,404成功／1失敗／63 ignore、vendor gateは失敗により未実行。
+証拠は `target/nextfix-1372-r4-full-first-fixture-timeout.out.log`／`.err.log` と
+`nextfix-1372-r4-full-first-fixture-timeout-summary.json`。子harness2結果は重複計上しない。
+同source・既存の待機時間／期待値・pack-build-tools featureでcollection-rootの関連12件を
+絞って確認し、12成功／0失敗／0 ignore（10.05秒）、Timeoutは再現しなかった。
+証拠は `target/nextfix-1372-r4-collection-root-recheck.out.log`／`.err.log`。
+製品コードやfixtureに変更は加えず、同PCの他buildとの競合を抑えるため最終fullの
+`RUST_TEST_THREADS` を4から2へ変更して再実行した。`CARGO_BUILD_JOBS=1`は維持する。
+これは試験実行の並列度の変更であり、Timeout原因の確定や待機条件の緩和ではない。
+
+最終fullはPASS（exit 0）、13,459成功／0失敗／63 ignore。
+本体は12,189成功／0失敗／56 ignore（1516.74秒）。vendorはegui25／egui-wgpu11／eframe18成功。
+本体内の子harness結果2件を除外し、65結果行からtop-level 63結果を集計した。
+証拠は `target/nextfix-1372-r4-full.out.log`／`.err.log` と
+`nextfix-1372-r4-full-summary.json`。先に成功したtargeted／通常・portable check／fmt／glyphと
+同一のRust 7ファイルのhash一致を再確認済み。初回fullのfixture Timeout記録は保持する。
+
+build-devは `-PreserveRuntime`、通常feature／dev-runtime profileで成功（exit 0）。
+coreは9分45秒、remote／EPUB workerは増分buildで各1.65／0.30秒。
+CRT/PE検査はruntime 4／PE 3成功、core／remote／EPUB workerと依存DLLをstage済み。
+証拠は `target/nextfix-1372-r4-build-dev.out.log`／`.err.log` と
+`target/vcrt-pe-reports/dev-runtime.json`。core実行ファイルの更新時刻は2026-10-13 09:58:35。
+remote／EPUB workerは未変更の増分成果物を利用する。HEADは `2bf8943a2` のまま、コミットなし。
+アプリ起動・実機確認は未実施。
+
+利用者確認は、形状キー編集を保留→pointer release→直後Undoでpointer前へ戻ること、
+検索結果の再配置を挟んでも同じ安定ページへUndo／Redoされること、および同key別contextで
+A編集の直後にBが全削除→Aへ戻っても補正presence／全文が復活しないことを対象とする。
+正常profileの確認を行う場合、先にインストール版／トレイ常駐mImageViewerを閉じる
+（single-instance mutex共有）。以下は通常の `%APPDATA%\mimageviewer` profileを使い、
+利用者の実際の設定・データを更新し得る。
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+最終full／build／台帳の独立照合もACCEPT（P1／P2なし）。source hash 7件、
+HEAD／変更10ファイル、full実数、成果物・CRT/FFmpeg・PE検査の一致を確認済み。
+実機確認は未実施のまま、coordinatorへ未コミット差分を引き渡す。

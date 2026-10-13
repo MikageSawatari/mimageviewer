@@ -13658,6 +13658,24 @@ impl App {
         );
     }
 
+    #[cfg(test)]
+    pub(crate) fn clear_local_adjust_layers_from_panel_for_test(&mut self, idx: usize) {
+        self.apply_local_adjust_panel_actions(
+            idx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+            LocalEffectPanelRequests::default(),
+        );
+    }
+
     pub(crate) fn apply_adjustment_panel_edit_frame(
         &mut self,
         fs_idx: usize,

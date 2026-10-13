@@ -564,6 +564,7 @@ impl App {
             !layers.is_empty(),
         );
         let layer_count = layers.len();
+        let key = target.page_key.clone();
         let submitted = self
             .local_adjust_write_handle
             .as_ref()
@@ -583,9 +584,13 @@ impl App {
                     LocalAdjustWritePending {
                         generation,
                         origin,
-                        layers,
+                        layers: layers.clone(),
                     },
                 );
+                // The accepted document is authoritative before completion.
+                // Publish its presence and pending status through the same
+                // boundary used by the latest successful completion.
+                self.publish_accepted_local_page_edits(&HashMap::from([(key, layers)]));
             }
             Err(outcome) => {
                 self.edit_store_write_succeeded("補正レイヤー", outcome);

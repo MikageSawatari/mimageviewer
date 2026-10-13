@@ -1469,6 +1469,9 @@ viewport、detachedの述語、HWND／focus制御は変更しない。読取moun
 pureなbundle所有統合が構造的修正であることに実装担当と独立reviewerが合意した。
 2026-10-13には通常Pageの同key受付値と代表source materializationを全所有contextへ配送する
 追補もACCEPT。mountによる副作用を使わず、既存のqueued/materialized退去契約を維持する。
+`2bf8943a2` の追補では、pointer releaseの基点の確定順を維持し、localの最新受付／完了を
+同keyの非active ownerのsnapshot／volatileへ揃える。独立コードレビューはACCEPT。
+新しい状態・待機やdetached述語／viewport／HWND変更はなく、既存publicationで更新する。
 自動検証の証拠は
 [page-adjustment-owner-plan.md](page-adjustment-owner-plan.md)へ記録する。
 

@@ -1635,3 +1635,296 @@ fn mounted_page_commit_refreshes_parked_container_representatives_before_they_mo
         .unwrap();
     }
 }
+
+fn assert_deleted(app: &App, target: &PageAdjustmentTarget) {
+    assert!(
+        app.local_adjust_db
+            .as_ref()
+            .unwrap()
+            .get_layers(&target.page_key)
+            .is_none()
+    );
+    let (folder, rel) = target.sidecar_coords.as_ref().unwrap();
+    assert!(
+        app.sidecars
+            .get(folder)
+            .unwrap()
+            .items()
+            .get(rel)
+            .and_then(|item| item.local_adjust_layers.as_ref())
+            .is_none()
+    );
+}
+
+#[cfg(windows)]
+fn foreign_delete_after_paused_write(nonresident_origin: bool) {
+    let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+    let (mut app, paths) = pages(&["shared", "unrelated"]);
+    let target = app.page_adjustment_target_for_idx(0).unwrap();
+    let unrelated_target = app.page_adjustment_target_for_idx(1).unwrap();
+    let unrelated = app.local_adjust_page_layers[&1].clone();
+    let initial = app.local_adjust_page_layers[&0].clone();
+    let stamp = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.sample();
+    app.page_edit_snapshot.as_mut().unwrap().stamp = Some(stamp);
+    let sibling = app.build_window_context_for_test(1372131, |owner| {
+        install(owner, &paths, &[initial.clone(), unrelated.clone()]);
+        let snapshot = owner.page_edit_snapshot.as_mut().unwrap();
+        snapshot
+            .local_adjust
+            .extend([target.page_key.clone(), unrelated_target.page_key.clone()]);
+        snapshot.stamp = Some(stamp);
+    });
+    let mut first_pause = WritePause::next(&mut app);
+    assert!(app.nudge_selected_local_adjust_shape_from_shortcut(0, 0.125, 0.0));
+    let accepted_a = app.local_adjust_page_layers[&0].clone();
+    app.persist_local_adjust_shape_key_edit();
+    first_pause.wait();
+    assert_saved(&app, &target, &initial);
+    if nonresident_origin {
+        // An accepted request outlives its resident slot. The context still
+        // owns its captured key, while the projected order contains only U.
+        install(&mut app, &paths[1..], std::slice::from_ref(&unrelated));
+        app.reproject_page_edit_owners();
+        app.page_edit_snapshot.as_mut().unwrap().stamp = Some(stamp);
+        app.refresh_pending_page_edit_projections();
+        assert!(
+            app.page_edit_snapshot
+                .as_ref()
+                .unwrap()
+                .local_adjust
+                .contains(&target.page_key)
+        );
+        assert!(
+            app.page_edit_snapshot
+                .as_ref()
+                .unwrap()
+                .volatile_keys
+                .contains(&target.page_key)
+        );
+    }
+    app.with_viewer_context(sibling, |owner| {
+        assert_eq!(owner.local_adjust_page_layers[&0], accepted_a);
+        owner.clear_local_adjust_layers_from_panel_for_test(0);
+        assert!(owner.local_adjust_shape_key_edit.is_none());
+        assert!(!owner.local_adjust_page_layers.contains_key(&0));
+        assert!(
+            !owner
+                .page_edit_snapshot
+                .as_ref()
+                .unwrap()
+                .local_adjust
+                .contains(&target.page_key)
+        );
+        assert!(
+            owner
+                .page_edit_snapshot
+                .as_ref()
+                .unwrap()
+                .volatile_keys
+                .contains(&target.page_key)
+        );
+        assert_eq!(owner.local_adjust_page_layers[&1], unrelated);
+    })
+    .unwrap();
+    assert!(
+        !app.page_edit_snapshot
+            .as_ref()
+            .unwrap()
+            .local_adjust
+            .contains(&target.page_key)
+    );
+    assert!(
+        app.page_edit_snapshot
+            .as_ref()
+            .unwrap()
+            .volatile_keys
+            .contains(&target.page_key)
+    );
+    let mut second_pause = WritePause::next(&mut app);
+    first_pause.release();
+    second_pause.wait();
+    app.poll_local_adjust_write_results();
+    assert_saved(&app, &target, &accepted_a);
+    assert!(
+        app.local_adjust_write_pending
+            .contains_key(&target.page_key)
+    );
+    // A's older success must not restore presence or clear the latest B hold.
+    assert!(
+        !app.page_edit_snapshot
+            .as_ref()
+            .unwrap()
+            .local_adjust
+            .contains(&target.page_key)
+    );
+    assert!(
+        app.page_edit_snapshot
+            .as_ref()
+            .unwrap()
+            .volatile_keys
+            .contains(&target.page_key)
+    );
+    let before_metadata_completion = app.page_edit_revision;
+    second_pause.release();
+    app.finish_local_adjust_writes();
+    assert_deleted(&app, &target);
+    assert_saved(&app, &unrelated_target, &unrelated);
+    assert!(
+        app.page_edit_revision > before_metadata_completion,
+        "metadata-only volatile release must invalidate the old read fence"
+    );
+    assert!(
+        !app.page_edit_snapshot
+            .as_ref()
+            .unwrap()
+            .local_adjust
+            .contains(&target.page_key)
+    );
+    assert!(
+        !app.page_edit_snapshot
+            .as_ref()
+            .unwrap()
+            .volatile_keys
+            .contains(&target.page_key)
+    );
+    app.with_viewer_context(sibling, |owner| {
+        assert!(
+            !owner
+                .page_edit_snapshot
+                .as_ref()
+                .unwrap()
+                .local_adjust
+                .contains(&target.page_key)
+        );
+        assert!(
+            !owner
+                .page_edit_snapshot
+                .as_ref()
+                .unwrap()
+                .volatile_keys
+                .contains(&target.page_key)
+        );
+        assert!(!owner.local_adjust_pages.contains(&0));
+        assert_eq!(owner.local_adjust_page_layers[&1], unrelated);
+    })
+    .unwrap();
+    // Force the legitimate earlier read stamp, then drive the real async
+    // reconciliation handler through its worker and adoption, not a helper
+    // that installs a pre-cleared synthetic projection.
+    app.page_edit_snapshot.as_mut().unwrap().stamp = Some(stamp);
+    let ctx = egui::Context::default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        app.poll_page_edit_reconciliation(&ctx);
+        let settled = app.page_edit_reconcile_pending.is_none()
+            && app
+                .page_edit_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.stamp)
+                .is_some_and(|stamp| crate::page_edit_write_epoch::PAGE_EDIT_WRITES.accepts(stamp));
+        if settled {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "A reconciliation must complete"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(
+        !app.page_edit_snapshot
+            .as_ref()
+            .unwrap()
+            .local_adjust
+            .contains(&target.page_key)
+    );
+    assert!(
+        !app.page_edit_snapshot
+            .as_ref()
+            .unwrap()
+            .volatile_keys
+            .contains(&target.page_key)
+    );
+    assert!(!app.local_adjust_page_keys.contains(&target.page_key));
+    let unrelated_idx = usize::from(!nonresident_origin);
+    if !nonresident_origin {
+        assert!(!app.local_adjust_pages.contains(&0));
+        assert!(!app.local_adjust_page_layers.contains_key(&0));
+    }
+    assert_eq!(app.local_adjust_page_layers[&unrelated_idx], unrelated);
+}
+
+#[cfg(windows)]
+#[test]
+fn foreign_delete_releases_older_owner_volatile_and_reconcile_keeps_last_layer_absent() {
+    foreign_delete_after_paused_write(false);
+}
+
+#[cfg(windows)]
+#[test]
+fn foreign_delete_updates_nonresident_owner_snapshot_before_reconciliation() {
+    foreign_delete_after_paused_write(true);
+}
+
+#[cfg(windows)]
+#[test]
+fn foreign_delete_completion_preserves_same_key_active_draft_and_its_volatile() {
+    let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+    let (mut app, paths) = pages(&["shared"]);
+    let target = app.page_adjustment_target_for_idx(0).unwrap();
+    let initial = app.local_adjust_page_layers[&0].clone();
+    let sibling = app.build_window_context_for_test(1372132, |owner| {
+        install(owner, &paths, std::slice::from_ref(&initial));
+    });
+    let mut pause = WritePause::next(&mut app);
+    assert!(app.nudge_selected_local_adjust_shape_from_shortcut(0, 0.125, 0.0));
+    app.persist_local_adjust_shape_key_edit();
+    pause.wait();
+    assert!(app.nudge_selected_local_adjust_shape_from_shortcut(0, 0.125, 0.0));
+    let active = app.local_adjust_page_layers[&0].clone();
+    app.with_viewer_context(sibling, |owner| {
+        // A later asynchronous/API receipt may arrive while A has a new live
+        // edit. It does not accept a history action that would finish A first.
+        owner.set_local_adjust_layers_for_target(&target, LocalAdjustmentLayers::default());
+    })
+    .unwrap();
+    assert_eq!(app.local_adjust_page_layers[&0], active);
+    pause.release();
+    app.finish_local_adjust_writes();
+    assert_deleted(&app, &target);
+    assert_eq!(app.local_adjust_page_layers[&0], active);
+    assert!(app.local_adjust_shape_key_edit.is_some());
+    assert!(
+        app.page_edit_snapshot
+            .as_ref()
+            .unwrap()
+            .local_adjust
+            .contains(&target.page_key)
+    );
+    assert!(
+        app.page_edit_snapshot
+            .as_ref()
+            .unwrap()
+            .volatile_keys
+            .contains(&target.page_key)
+    );
+    app.with_viewer_context(sibling, |owner| {
+        assert!(
+            !owner
+                .page_edit_snapshot
+                .as_ref()
+                .unwrap()
+                .local_adjust
+                .contains(&target.page_key)
+        );
+        assert!(
+            !owner
+                .page_edit_snapshot
+                .as_ref()
+                .unwrap()
+                .volatile_keys
+                .contains(&target.page_key)
+        );
+    })
+    .unwrap();
+}

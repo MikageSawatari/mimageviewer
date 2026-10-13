@@ -644,6 +644,11 @@ impl App {
         layers: local_adjust_core::LocalAdjustmentLayers,
         summary: String,
     ) {
+        // Keep the pre-owner release order: a pending key run is recorded
+        // before the pointer operation, using the current document as its after.
+        // The key terminal takes its session before entering this helper, so
+        // its own dispatch cannot recurse. Do not re-enter the history boundary.
+        self.persist_local_adjust_shape_key_edit();
         self.set_local_adjust_layers_for_target(target, layers.clone());
         self.capture_local_adjustment_undo_for_target(target.clone(), before, layers, summary);
     }

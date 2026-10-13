@@ -1205,44 +1205,40 @@ impl App {
         }
     }
 
-    pub(super) fn finish_page_edit_write_origin(
-        &mut self,
-        key: &str,
-        origin: &LocalAdjustWriteOrigin,
-    ) {
-        macro_rules! finish {
-            ($state:expr) => {{
-                let state = $state;
-                let newer_draft = matches!(&state.local_page_edit_document,
-                    LocalPageEditDocument::Editing { owner, revision, .. }
-                    if owner.target.page_key == key && *revision != origin.revision);
-                let live = state.local_adjust_shape_key_edit.is_some() || state.local_adjust_shape_drag.is_some()
-                    || state.local_adjust_canvas_drag.is_some() || state.local_adjust_mask_brush_stroke.is_some();
-                let live = live && matches!(&state.local_page_edit_document, LocalPageEditDocument::Editing { owner, .. } if owner.target.page_key == key);
-                if !newer_draft && !live && let Some(snapshot) = state.page_edit_snapshot.as_mut()
-                    && snapshot.volatile_keys.remove(key) {
-                    state.page_edit_revision = state.page_edit_revision.wrapping_add(1);
-                }
-            }};
-        }
-        if self.projected_viewer_context_id() == origin.context {
-            finish!(&mut *self);
-            return;
-        }
-        #[cfg(windows)]
-        if let Some(Slot::AtRest(bundle) | Slot::Retiring(bundle)) =
-            self.viewer_contexts.table.slots.get_mut(&origin.context)
-        {
-            finish!(bundle);
-        }
-    }
-
     pub(super) fn publish_accepted_local_page_edits(
         &mut self,
         documents: &HashMap<String, local_adjust_core::LocalAdjustmentLayers>,
     ) {
         if documents.is_empty() {
             return;
+        }
+        // Pending is key-owned. Idle contexts project the latest accepted
+        // document until that same key has no outstanding accepted write.
+        let pending_keys: std::collections::HashSet<&str> = documents
+            .keys()
+            .filter(|key| self.local_adjust_write_pending.contains_key(*key))
+            .map(String::as_str)
+            .collect();
+        fn update_snapshot(
+            snapshot: Option<&mut page_edit_snapshot::PageEditSnapshot>,
+            key: &str,
+            present: bool,
+            pending: bool,
+        ) -> bool {
+            let Some(snapshot) = snapshot else {
+                return false;
+            };
+            let changed = if present {
+                snapshot.local_adjust.insert(key.to_owned())
+            } else {
+                snapshot.local_adjust.remove(key)
+            };
+            let volatile_changed = if pending {
+                snapshot.volatile_keys.insert(key.to_owned())
+            } else {
+                snapshot.volatile_keys.remove(key)
+            };
+            changed || volatile_changed
         }
         macro_rules! publish {
             ($state:expr) => {{
@@ -1275,6 +1271,30 @@ impl App {
                         *revision = revision.wrapping_add(1);
                     }
                 }
+                let mut snapshot_changed = false;
+                // A captured owner, or a former volatile/present key, may be
+                // absent from the current item order after streaming/reindex.
+                let owner_key = match &state.local_page_edit_document {
+                    LocalPageEditDocument::Selection { owner, .. }
+                    | LocalPageEditDocument::Editing { owner, .. } => Some(&owner.target.page_key),
+                    LocalPageEditDocument::Idle => None,
+                };
+                for (key, layers) in documents {
+                    if live_key.as_ref() != Some(key)
+                        && (owner_key == Some(key)
+                            || state.page_edit_snapshot.as_ref().is_some_and(|snapshot| {
+                                snapshot.volatile_keys.contains(key)
+                                    || snapshot.local_adjust.contains(key)
+                            }))
+                    {
+                        snapshot_changed |= update_snapshot(
+                            state.page_edit_snapshot.as_mut(),
+                            key,
+                            !layers.is_empty(),
+                            pending_keys.contains(key.as_str()),
+                        );
+                    }
+                }
                 let mut changed = std::collections::HashSet::new();
                 for idx in 0..state.items.len() {
                     let key = if let Some(snapshot) = &state.page_edit_snapshot {
@@ -1289,11 +1309,19 @@ impl App {
                     let Some(layers) = documents.get(&key) else {
                         continue;
                     };
-                    if state
+                    snapshot_changed |= update_snapshot(
+                        state.page_edit_snapshot.as_mut(),
+                        &key,
+                        !layers.is_empty(),
+                        pending_keys.contains(key.as_str()),
+                    );
+                    if (state
                         .local_adjust_page_layers
                         .get(&idx)
                         .is_some_and(|old| old == layers)
-                        || (layers.is_empty() && !state.local_adjust_page_layers.contains_key(&idx))
+                        || (layers.is_empty()
+                            && !state.local_adjust_page_layers.contains_key(&idx)))
+                        && state.local_adjust_pages.contains(&idx) == !layers.is_empty()
                     {
                         continue;
                     }
@@ -1318,6 +1346,9 @@ impl App {
                 state
                     .local_adjust_cache
                     .retain(|key, _| !changed.contains(&key.idx));
+                if snapshot_changed || !changed.is_empty() {
+                    state.page_edit_revision = state.page_edit_revision.wrapping_add(1);
+                }
             }};
         }
         publish!(&mut *self);

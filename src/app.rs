@@ -571,6 +571,8 @@ mod page_edit_pivot;
 use page_edit_pivot::LocalPageEditSpreadPivot;
 #[cfg(test)]
 mod page_edit_owner_tests;
+#[cfg(test)]
+mod page_edit_release_tests;
 pub(crate) mod page_edit_snapshot;
 pub(crate) use page_edit_owner::{LocalPageEditDocument, PageEditOwner};
 mod prefetch_policy;
@@ -77948,9 +77950,6 @@ impl App {
             self.with_sidecar_coords_mut(sidecar.as_ref(), move |sc, rel| {
                 sc.set_local_adjust_layers(rel, mirrored)
             });
-        }
-        if latest {
-            self.finish_page_edit_write_origin(&key, &origin);
         }
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Edits,

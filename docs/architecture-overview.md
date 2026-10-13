@@ -48,6 +48,8 @@ live一覧のcursor／Shift起点は `App::move_grid_cursor(target, GridCursorIn
 同一覧の採用時にownerのslotを再解決し、入力中はその小さなslot集合へdraftを投影する。
 App共有のUndoへ次操作を受理する前に全contextの完了済み保留を確定する。
 local writerの最新受付済み全文を新規runのbeforeに使い、completionはrequestごとのoriginへ配送する。
+localの受付／最新成功完了は同keyのidle contextへsnapshot presenceとshared pending由来の
+volatileを反映する。非resident ownerも対象とし、同keyの未確定draftは上書きしない。
 通常Pageも受付成功を同keyの全contextへbatch反映し、parked代表サムネの更新通知を
 表示中contextだけで消費せず、既存退去境界で全所有contextへ配送する。
 通常終了は全contextの要求配送→既存writer停止→completion mirror→sidecar flushの順。
