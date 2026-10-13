@@ -122,6 +122,7 @@ mod tests {
         for (number, millis) in [(2, 250), (0, 251), (3, 500), (1, 501)] {
             let segment = TimelineBassSegment {
                 segment_index: number,
+                chroma: vec![[number as f32; 12]; 1000],
                 estimates: vec![
                     BassEstimate {
                         midi: 40 + number as u8,
@@ -141,7 +142,12 @@ mod tests {
                     let time = frame as f64 * 0.02;
                     if let Some(value) = old.at_secs(time) {
                         assert_eq!(current.at_secs(time), Some(value));
+                        assert_eq!(current.chroma_at_secs(time), old.chroma_at_secs(time));
                     }
+                    assert_eq!(
+                        current.at_secs(time).is_some(),
+                        current.chroma_at_secs(time).is_some()
+                    );
                 }
             }
             previous = Some(current);
@@ -203,6 +209,7 @@ mod tests {
                     super::super::MusicAnalysisMsg::Bass(track) => {
                         assert_eq!(timeline, want_analysis);
                         assert!(track.at_secs(0.0).is_some());
+                        assert!(track.chroma_at_secs(0.0).is_some());
                         bass += 1;
                     }
                     super::super::MusicAnalysisMsg::Timeline(Err(error)) => {

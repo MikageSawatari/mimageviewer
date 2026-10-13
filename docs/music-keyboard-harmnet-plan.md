@@ -705,8 +705,8 @@ headless 計測で、実アプリの描画時間は含まない。§13.7 P5 の�
 
 ## 14. 第 3 段階: タイムラインの調 (Key) 表示 (2026-10-13 追加)
 
-状態: 設計。利用者が方針を承認 (同じリリースに含める、精度の事前検証は簡単な合成音の確認でよい)。
-実装前の独立レビュー待ち。
+状態: 実装済み・合成音の精度条件未達で設計判断待ち。利用者が方針を承認 (同じリリースに含める、精度の事前検証は簡単な合成音の確認でよい)。
+実装前の独立レビューの反映は§14.6、実装・検証記録は§14.7。
 
 ### 14.1 背景と利用者の判断
 
@@ -768,3 +768,180 @@ GPT-6.1 Sol / xhigh (4 回目): ACCEPT WITH CHANGES。本節が §14.2〜14.3 �
 | P2 C3 と C7 の矛盾 | 旧 `bin.key_confidence` の重みは**必ず外す**。`transient` / `transient_density` の割り引きを残すかは実装者に任せる (合成音で比較し、理由を記録) |
 | P3 C6 の前提違い | 本番の Key 描画は既に `key_hint.confidence` で高さを決めている (`timeline_metric_value(Key)` は本番で未使用)。今の表示式を新しい hint にそのまま使い、未使用の旧信頼度の計算を整理する。C6 の「音量へ置き換え」は行わない |
 | P3 計測と chroma の検査 | 第 2 段階の bench を広げ、実サイズで保持量を数える (60 分で約 1.44MB → 約 10MB の見込み)。全窓が計算済みで Key の集計が実際に走るケースでもラスタの滞留を測る。テスト: MIDI→音名、オクターブの加算、高音域を含む 88 鍵、計算済みの無音、スナップショット内の bass と chroma の計算済み範囲の一致 |
+
+### 14.7 第3段階の実装・検証記録 (2026-10-14、pitch-lab、未コミット)
+
+`TimelineBassTrack` / `TimelineBassSegment` の名前は維持して、各フレームのbassと
+12音名chromaを保持する型へ広げた。head 3の同じ88鍵の出力から両方を作り、両配列の長さを
+検査してコピーした後で共通の計算済み印を立てる。単一公開者、250ms／完了公開、既存source
+判定、1 drainの最新結果採用、共通版数1本、LRU非保存はそのまま。
+
+KeyはPCMの実尺へ切り詰めた全幅6秒・左右3秒の窓の全フレーム完成を、音量等の重み省略より
+前に確認する。未計算は`None`、計算済みの調なしは`Some(default)`としてラスタ結果から
+row textureまで保持し、hoverは表示中の推定と未計算状態だけを読む。旧binのchromaと
+`key_confidence`は本体のKey表示に使わない。Key高さは§14.6どおり既存のhint信頼度式を維持し、
+未使用の旧信頼度計算を除去した。調なしの色はベースと同じ灰色。
+
+C9のベース高さは`loudness_db + 10·log10(band_energy[0])`を既存音量正規化へ渡し、
+低域エネルギー0は高さ0。推定の信頼度は高さへ掛けない。ベースの色／リズム投票の重みは維持し、
+音程を推定できない低音は灰色で残る。説明文とマニュアルも低域音量へ変更した。
+detached／parked-live、旧解析の保存形、音名の`key_color`は変更していない。
+
+UI応答性§4の点検: 新しいI/O・解析・配列cloneはUIへ追加していない。推論は既存の区間worker、
+調の集計と窓完成確認は既存ラスタworker。UIの追加処理は表示中の行のhint参照だけ。
+texture uploadの既存1frame予算、取消・source判定も維持した。
+状態の簡素化は§14.4のとおり既存経路と1つの完成判定を使い、別公開者・版数・回復機構を足さない。
+
+独立静的レビュー (GPT-6.1 Sol / xhigh): 実装のP1/P2なし。合成音の本番6秒窓と全8秒の
+切り分け結果を区別し、全8秒の合格を本番窓の合格へ読み替えないことを確認した。
+検証記録の保存先は`target/pitch-stage3-validation/`。検収は未完了。
+
+#### C3と合成和音の切り分け
+
+各和音2秒、10倍音・振幅`0.07·h^-1.3`・両端5ms線形fade、MIDI48からの和音を
+主音C／Dへ移調した8ケースを使用する。I-IV-V-I、I-vi-IV-V、i-iv-v-i、i-iv-V-i。
+本番と同じ全幅6秒の中央窓（1〜7秒）と、診断用の進行全体8秒を分けて記録する。
+
+旧`bin.key_confidence`の重みは必ず除去した。`transient` / `transient_density`の割り引きは
+**維持**する。割り引きあり／なしで8秒全体は8/8正解、本番6秒は6/8正解で同じ判定になり、
+除去による精度改善は確認できない。既存の過渡音の重みを維持し、変更をchromaの出どころと
+旧信頼度除去へ限定する。信頼度値の差はraw logに残す。
+
+| 進行／期待する調 | 本番6秒・新方式 | 本番6秒・旧方式（参考） | 全8秒・新方式（診断） | 全8秒・旧方式（参考） |
+| --- | --- | --- | --- | --- |
+| I-IV-V-I / C長調 | C長調 | G長調 | C長調 | G長調 |
+| I-IV-V-I / D長調 | D長調 | D長調 | D長調 | D長調 |
+| I-vi-IV-V / C長調 | A短調 | C長調 | C長調 | C長調 |
+| I-vi-IV-V / D長調 | B短調 | D長調 | D長調 | D長調 |
+| i-iv-v-i / C短調 | C短調 | C短調 | C短調 | C短調 |
+| i-iv-v-i / D短調 | D短調 | D短調 | D短調 | D短調 |
+| i-iv-V-i / C短調 | C短調 | C短調 | C短調 | C短調 |
+| i-iv-V-i / D短調 | D短調 | D短調 | D短調 | D短調 |
+
+**設計判断が必要な未達**: §14.3の本番窓で全ケース正しい調という条件は未達。
+中央6秒はIとVが各1秒、viとIVが各2秒になり、C長調の理想0/1 chromaでも
+現プロファイルのscoreはC長調0.849110／A短調0.837088と僅差になる。
+HarmNet確率・音量重みで順位が逆転するが、静的レビューでは入力の取り違え等の実装不具合は
+見つからなかった。窓・プロファイル・信頼度式は承認済み仕様のまま変更していない。
+fixtureの調整や全8秒だけの検査で合格に置き換えず、本番窓の不一致をテスト失敗として保持する。
+§14.1の精度低下許容方針でこの2例を許容するか、設計を改訂するかの判断待ち。
+
+#### 指定確認結果
+
+Cargoは全て`MSBUILDDISABLENODEREUSE=1`。raw logと各exit codeは
+`target/pitch-stage3-validation/final/`（`results.json`、`base-commit.txt`、
+`source-blobs.txt`はbass/core・app publisher・timelineの順）に保存。
+対象はこのworktreeの未コミット差分。最終フォント対応の前後は下記の限定確認として区別する。
+
+| コマンド | exit | 件数／結果 |
+| --- | ---: | --- |
+| `cargo fmt` | 0 | workspace全体、対象外ファイルの差分なし |
+| `cargo fmt --check` | 0 | 成功 |
+| `cargo test -p music-core` | 0 | lib21、bass12、HarmNet7、allocation1、計41成功。失敗0、doc test0 |
+| `cargo clippy -p music-core --all-targets` | 0 | 警告0 |
+| `cargo test -p mimageviewer --lib ui_music_spectrum::` | 0 | 28成功、失敗0、bench1 ignored |
+| `cargo test -p mimageviewer --lib ui_music_timeline:: -- --nocapture` | 101 | 25成功、合成和音の精度1失敗、bench1 ignored |
+| `cargo test -p mimageviewer --lib music` | 101 | 157成功、同じ精度1失敗、bench2 ignored |
+| `cargo test --test ui_snapshot` | 0 | 162成功、失敗0。integrationの既存PNG差分なし |
+| `cargo check -p mimageviewer --features portable` | 0 | check完了 |
+| `python scripts/check_ui_glyphs.py` | 0 | 危険glyph0 |
+| 限定snapshot生成 (`UPDATE_SNAPSHOTS=1`、lib `raster_snapshot`) | 0 | 2成功。続くtimeline/musicで通常比較も成功 |
+
+本体には既存警告がある（lib test 102件）。今回の作業で無関係な警告整理は行っていない。
+全て成功したとは扱わず、同一の精度失敗を両フィルタが検出した結果として記録する。
+
+PNGは`timeline_bass_partial_raster.png`を更新（240×80、1544 bytes）、
+`timeline_key_states_raster.png`を新規追加（660×80、7792 bytes）。更新前後と新規PNGを目視確認し、
+変更理由を`docs/ui-snapshot-policy.md`へ記録した。上段波形・未計算側へのベース色漏れ防止を維持し、
+Keyの未計算／調なしの灰色とC長調の色を確認。その他の既存PNGは変更しない。
+
+master／他worktree、通常設定、`target/dev-runtime`、製品起動、コミットには触れていない。
+検証用buildは利用者の明示的禁止に従って行わない。`CHANGELOG.md`と
+`docs/next-release-backlog.md`も未変更。実装の設計逸脱はなし、精度条件の検収は未完了。
+
+#### release計測
+
+coreは`cargo run --release -p music-core --example bass_track_benchmark -- --no-compare`
+（exit0）。48kHz stereo f32、20秒の合成音楽信号の繰り返し、4 worker、Windows
+BELOW_NORMAL、20秒区間と単一結合owner、250ms／完了公開を含む。
+本体のデコード・PCM read lock・UI poll・ラスタ・GPUは含まない。
+
+| PCM尺 | 全区間計算 | 最初の区間 | フレーム／区間 | 公開数 | snapshot clone累計 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 180秒 | 1941.340ms | 625.464ms | 9001／10 | 3 | 0.444ms |
+| 60分 | 37077.963ms | 627.665ms | 180001／181 | 46 | 150.836ms |
+
+| PCM尺 | PCM配列payload | track配列割当量1個 | mutable＋最新snapshot | 置換時のmutable＋旧／新snapshot最大 |
+| --- | ---: | ---: | ---: | ---: |
+| 180秒 | 69120000 bytes | 504066 bytes | 1008132 bytes | 1512198 bytes |
+| 60分 | 1382400000 bytes | 10080237 bytes | 20160474 bytes | 30240711 bytes |
+
+配列割当量は実capacity×`size_of`（bass1フレーム8 bytes、chroma48 bytes、計算済み印1 bytes）。
+理論上の未padding値や旧bass-onlyサイズではない。小さいtrack構造体、allocator管理領域、
+worker／キュー内の区間配列、HarmNet内部、プロセス全体はこの表の範囲外。
+本体ラスタbenchの保持量は生存snapshotの同じ`storage_bytes()`を使い、
+ラスタ／textureのpayload上界・16msプロセスメモリ標本とは区別する。
+全窓計算済みでKey集計を実行する`full_key=true`を、180秒／60分・0ms／250ms到着の
+各条件へ追加した。最新版のC長調・非ゼロ信頼度も確認する。
+raw logは`target/pitch-stage3-validation/release/`。
+
+本体releaseラスタbenchもexit0、1成功。releaseビルドは32分57秒、benchは5.15秒。
+4可視行、4版のsnapshot、実cache／FIFO raster worker、16msごとに1行のCPU texture採用を通す。
+`full_key=true`は集計負荷を確認する人工的な完全snapshot4版で、実際の区間公開の再現とは分ける。
+推論・PCM・デコード・native GPU upload/present・実アプリ描画はこの計測に含まない。
+
+| PCM尺 | 到着間隔 | 全窓計算済み | 要求／処理 | 最大滞留 | 最大queue待ち | 最新色反映（最後の到着から） | 生存snapshot配列最大 |
+| --- | ---: | --- | --- | ---: | ---: | ---: | ---: |
+| 180秒 | 0ms | いいえ | 16／16 | 16 | 275.013ms | 296.197ms | 2016264 bytes |
+| 180秒 | 0ms | はい | 16／16 | 16 | 400.232ms | 430.485ms | 2016264 bytes |
+| 180秒 | 250ms | いいえ | 16／16 | 4 | 71.041ms | 93.333ms | 504066 bytes |
+| 180秒 | 250ms | はい | 16／16 | 4 | 81.508ms | 118.525ms | 504066 bytes |
+| 60分 | 0ms | いいえ | 16／16 | 16 | 294.272ms | 319.334ms | 40320948 bytes |
+| 60分 | 0ms | はい | 16／16 | 16 | 506.605ms | 543.254ms | 40320948 bytes |
+| 60分 | 250ms | いいえ | 16／16 | 4 | 79.074ms | 100.757ms | 10080237 bytes |
+| 60分 | 250ms | はい | 16／16 | 4 | 108.049ms | 129.703ms | 10080237 bytes |
+
+ラスタ／texture payload上界は0ms到着の各条件16174720 bytes、250msの各条件8087360 bytes。
+この上界は未処理の全要求／結果に完全imageとhintがあると仮定したもので、実保持量ではない。
+16msプロセスメモリ標本は瞬間最大の保証ではなく、allocator再利用とケース実行順の影響を受ける。
+privateメモリ増分は180秒の各条件0〜19910656 bytes、60分の各条件14315520〜128385024 bytes。
+後者の最大には試験用の72MB timeline生成を含み、Keyの追加配列だけの増分と読み替えない。
+本体releaseのnative依存停止は発生しなかった。実曲・native GPUの計測は未実施。
+
+#### 最終snapshotフォント対応と証拠の再利用
+
+新規比較PNGのラベルにも本体フォントを適用するため、`timeline_key_states_raster_snapshot`の
+fixtureだけへ標準の初回`configure_fonts`／repaint／returnを追加した。
+製品コード全体（test module前）と`timeline_bass_raster_benchmark`のソースが
+release計測前と完全一致することを検査し、`final/font-source-equality.log`へ記録。
+独立レビューも当該fixtureの方針適合と製品／benchの証拠再利用を確認した（P1/P2なし）。
+上の指定gateの他テスト・portable check・release計測の証拠は有効で、無関係な再実行はしない。
+
+| 最終の限定確認 | exit／結果 |
+| --- | --- |
+| `cargo fmt`／`cargo fmt --check` | 各0 |
+| `UPDATE_SNAPSHOTS=1`、lib `raster_snapshot` | 0、2成功 |
+| 通常比較、lib `raster_snapshot` | 0、2成功 |
+| `python scripts/check_ui_glyphs.py` | 0、危険glyph0 |
+| `git diff --check` | 0 |
+
+raw log、`font-results.json`、最終ソース3本のGit blobは
+`target/pitch-stage3-validation/final/`（`source-blobs-final.txt`）に保存。
+最終PNGを再び目視確認し、サイズ合計9336 bytesをsnapshot方針へ記録した。
+未解決は本番6秒窓の2例の精度条件だけ。失敗テストを無効化したり期待値を緩めたりしていない。
+
+変更ファイル: `crates/music-core/{src/bass.rs,tests/bass.rs,examples/bass_track_benchmark.rs}`、
+`src/{app/music_bass.rs,ui_music_timeline.rs}`、
+`docs/{music-keyboard-harmnet-plan.md,music-integration-plan.md,ui-snapshot-policy.md}`、
+`htdocs/mimageviewer/manual/{music.html,tut-music.html}`、
+`tests/snapshots/{timeline_bass_partial_raster.png,timeline_key_states_raster.png}`。
+
+### 14.7 精度の受け入れ判断 (2026-10-14、ClaudeCode)
+
+合成 8 ケースのうち、I-vi-IV-V (C / D) の本番 6 秒窓だけが平行短調 (A 短調 / B 短調) になった。
+窓の中は I と V が各 1 秒、vi と IV が各 2 秒で、理想の 0/1 chroma でも C 長調 0.849 / A 短調 0.837 と
+ほぼ同点になる (構成音が同じ平行調を区別できる情報が窓に無い)。旧方式も 8 ケース中 6 ケース正解で、
+外したのは I-IV-V-I (C) を属調の G 長調にしたもの (倍音の混入による)。新方式の外れは平行調の曖昧さ、
+旧方式の外れは倍音の混入で、性質が違う。利用者の方針 (おまけ的な可視化なので特定のケースで精度が落ちても
+大きな問題ではない、鍵盤の構成音と調が合うことを優先) に従い、窓・プロファイル・信頼度式は変えずに
+受け入れる。テストはこの 2 例の本番窓に限り「正解または平行短調」を合格とし、他は完全一致を求める。

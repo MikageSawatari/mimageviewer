@@ -1,4 +1,4 @@
-//! Release-only measurement of four-worker timeline bass and marker agreement.
+//! Release-only measurement of four-worker timeline bass/chroma and marker agreement.
 //! cargo run --release -p music-core --example bass_track_benchmark
 //! --seconds 180 3600 selects durations; --compare-only skips performance runs.
 //! --pcm <48kHz-stereo-f32le-file> measures an independently decoded real song.
@@ -65,6 +65,7 @@ fn parallel_track(stereo: &[f32], label: &str) -> TimelineBassTrack {
     let mut clone_time = Duration::ZERO;
     let mut last_publish = start;
     let mut last_snapshot = None;
+    let mut peak_tracks_bytes = track.storage_bytes();
     std::thread::scope(|scope| {
         let (tx, rx) = mpsc::channel();
         for _ in 0..threads {
@@ -92,8 +93,19 @@ fn parallel_track(stereo: &[f32], label: &str) -> TimelineBassTrack {
             assert!(track.merge_segment(segment));
             if last_publish.elapsed() >= Duration::from_millis(250) || completed + 1 == segments {
                 let clone_start = Instant::now();
-                last_snapshot = Some(track.clone());
+                let snapshot = track.clone();
                 clone_time += clone_start.elapsed();
+                // Replacement temporarily retains the old snapshot too. Count
+                // actual capacities for bass, chroma and computed marks in each
+                // live track; this excludes worker/queue segments and the struct.
+                peak_tracks_bytes = peak_tracks_bytes.max(
+                    track.storage_bytes()
+                        + snapshot.storage_bytes()
+                        + last_snapshot
+                            .as_ref()
+                            .map_or(0, TimelineBassTrack::storage_bytes),
+                );
+                last_snapshot = Some(snapshot);
                 publications += 1;
                 last_publish = Instant::now();
             }
@@ -102,13 +114,16 @@ fn parallel_track(stereo: &[f32], label: &str) -> TimelineBassTrack {
     assert_eq!(track.computed_frames(), track.frame_count());
     let snapshot = last_snapshot.unwrap();
     assert_eq!(snapshot.computed_frames(), track.frame_count());
+    assert!(snapshot.window_is_computed(0.0, snapshot.duration_secs()));
     println!(
-        "performance,label={label},seconds={:.3},workers={threads},elapsed_ms={:.3},first_result_ms={:.3},frames={},segments={segments},pcm_bytes={},track_bytes={},two_tracks_bytes={},publications={publications},clone_ms={:.3}",
+        "performance,label={label},seconds={:.3},workers={threads},elapsed_ms={:.3},first_result_ms={:.3},frames={},segments={segments},pcm_bytes={},bass_frame_bytes={},chroma_frame_bytes={},track_bytes={},two_tracks_bytes={},peak_tracks_bytes={peak_tracks_bytes},publications={publications},clone_ms={:.3}",
         stereo.len() as f64 / (SR * 2) as f64,
         start.elapsed().as_secs_f64() * 1000.0,
         first_result.unwrap_or_default().as_secs_f64() * 1000.0,
         track.frame_count(),
         std::mem::size_of_val(stereo),
+        std::mem::size_of::<BassEstimate>(),
+        std::mem::size_of::<[f32; 12]>(),
         track.storage_bytes(),
         track.storage_bytes() + snapshot.storage_bytes(),
         clone_time.as_secs_f64() * 1000.0

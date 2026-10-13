@@ -1,3 +1,4 @@
+use music_core::bass::chroma_from_probabilities;
 use music_core::{
     BassEstimate, TIMELINE_BASS_SEGMENT_FRAMES, TimelineBassSegment, TimelineBassTrack,
     calculate_timeline_bass_segment, pitch_frame_at_secs, select_bass,
@@ -72,6 +73,131 @@ fn selector_uses_inclusive_endpoints_threshold_and_lowest_octave() {
 }
 
 #[test]
+fn chroma_maps_every_piano_key_to_c_based_pitch_classes() {
+    // MIDI 21 starts at A, while chroma starts at C.
+    let piano_octave = [9, 10, 11, 0, 1, 2, 3, 4, 5, 6, 7, 8];
+    for key in 0..88 {
+        let mut probabilities = [0.0; 88];
+        probabilities[key] = 0.25; // No thresholding: even sub-0.5 values contribute.
+        let mut expected = [0.0; 12];
+        expected[piano_octave[key % 12]] = 0.25;
+        assert_eq!(
+            chroma_from_probabilities(&probabilities),
+            expected,
+            "MIDI {}",
+            key + 21
+        );
+    }
+    // All octaves contribute, including the keys above the previous FFT cutoff.
+    let chroma = chroma_from_probabilities(&[0.25; 88]);
+    assert_eq!(
+        chroma,
+        [
+            2.0, 1.75, 1.75, 1.75, 1.75, 1.75, 1.75, 1.75, 1.75, 2.0, 2.0, 2.0
+        ]
+    );
+    let mut probabilities = [0.0; 88];
+    probabilities[24 - 21] = 0.5;
+    probabilities[36 - 21] = 0.75;
+    probabilities[96 - 21] = 0.25;
+    probabilities[108 - 21] = 0.5;
+    probabilities[107 - 21] = 0.125;
+    let chroma = chroma_from_probabilities(&probabilities);
+    assert_eq!(chroma[0], 2.0);
+    assert_eq!(chroma[11], 0.125);
+    assert_eq!(chroma.iter().sum::<f32>(), 2.125);
+}
+
+fn merge_silent_segment(track: &mut TimelineBassTrack, segment_index: usize) {
+    let len = (track.frame_count() - segment_index * TIMELINE_BASS_SEGMENT_FRAMES)
+        .min(TIMELINE_BASS_SEGMENT_FRAMES);
+    assert!(track.merge_segment(TimelineBassSegment {
+        segment_index,
+        estimates: vec![BassEstimate::default(); len],
+        chroma: vec![[0.0; 12]; len],
+    }));
+}
+
+#[test]
+fn computed_windows_clip_to_real_pcm_and_check_silent_segment_boundaries() {
+    let mut track = TimelineBassTrack::new(SR * 40, SR as u32);
+    assert!(!track.window_is_computed(-3.0, 3.0));
+    merge_silent_segment(&mut track, 0);
+    assert!(track.window_is_computed(-3.0, 3.0));
+    assert!(track.window_is_computed(0.0, 0.0));
+    assert!(track.window_is_computed(0.0, 19.989_999));
+    assert!(!track.window_is_computed(19.98, 20.02));
+    assert!(!track.window_is_computed(17.0, 23.0));
+    // The only pending data in this window is silent. Zero weight must not hide it.
+    merge_silent_segment(&mut track, 2);
+    assert!(!track.window_is_computed(17.0, 43.0));
+    assert!(!track.window_is_computed(37.0, 43.0));
+    merge_silent_segment(&mut track, 1);
+    assert!(track.window_is_computed(17.0, 23.0));
+    assert!(track.window_is_computed(37.0, 43.0));
+    assert!(track.window_is_computed(-3.0, 43.0));
+    for (start, end) in [
+        (f64::NAN, 1.0),
+        (0.0, f64::INFINITY),
+        (f64::NEG_INFINITY, 1.0),
+        (1.0, 0.0),
+        (-3.0, -0.1),
+        (40.0, 43.0),
+    ] {
+        assert!(
+            !track.window_is_computed(start, end),
+            "window [{start}, {end}]"
+        );
+    }
+    assert!(!TimelineBassTrack::new(0, SR as u32).window_is_computed(-3.0, 3.0));
+    // 20.0001s has an extra padding display frame in segment 1. At 19.989999s
+    // segment 0 suffices; a window reaching real EOF requires segment 1.
+    let mut fractional = TimelineBassTrack::new(SR * 20 + 5, SR as u32);
+    merge_silent_segment(&mut fractional, 0);
+    assert!(fractional.window_is_computed(-3.0, 19.989_999));
+    assert!(!fractional.window_is_computed(19.98, 25.0));
+    merge_silent_segment(&mut fractional, 1);
+    assert!(fractional.window_is_computed(19.98, 25.0));
+    let mut padding_only = TimelineBassTrack::new(SR * 20 - 955, SR as u32);
+    assert_eq!(padding_only.segment_count(), 2);
+    merge_silent_segment(&mut padding_only, 0);
+    assert!(padding_only.window_is_computed(-3.0, 25.0));
+    assert!(padding_only.computed_frames() < padding_only.frame_count());
+}
+
+#[test]
+fn segment_stores_bass_and_chroma_from_the_same_head3_output() {
+    use music_core::pitch::{HARMNET_HOP_SAMPLES, HARMNET_LONG_WINDOW_SAMPLES, HarmNetTracker};
+    let mut stereo = vec![0.0; SR / 4 * 2];
+    add_tones(&mut stereo, 0.0, 0.25, &[(40, 10, 1.0), (100, 1, 1.0)]);
+    let segment = calculate_timeline_bass_segment(&stereo, SR as u32, 0, &|| false).unwrap();
+    let mut tracker = HarmNetTracker::new(SR as u32);
+    let mut mono = vec![0.0; HARMNET_LONG_WINDOW_SAMPLES];
+    for inference_frame in 1..=segment.estimates.len() + 8 {
+        let end_sample = inference_frame * HARMNET_HOP_SAMPLES;
+        for (offset, sample) in mono.iter_mut().enumerate() {
+            let source =
+                end_sample as isize + offset as isize - HARMNET_LONG_WINDOW_SAMPLES as isize;
+            *sample = if source >= 0 && (source as usize) < stereo.len() / 2 {
+                (stereo[source as usize * 2] + stereo[source as usize * 2 + 1]) * 0.5
+            } else {
+                0.0
+            };
+        }
+        tracker.push_frame(&mono);
+        if inference_frame >= 9 {
+            let probabilities = tracker.probabilities(3);
+            let index = inference_frame - 9;
+            assert_eq!(segment.estimates[index], select_bass(&probabilities));
+            assert_eq!(
+                segment.chroma[index],
+                chroma_from_probabilities(&probabilities)
+            );
+        }
+    }
+}
+
+#[test]
 fn frame_rounding_matches_spectrum_formula_and_bounds() {
     for position in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 0.0] {
         assert_eq!(pitch_frame_at_secs(position), 1);
@@ -111,37 +237,63 @@ fn reversed_segment_completion_preserves_pending_silent_and_computed_frames() {
             };
             TIMELINE_BASS_SEGMENT_FRAMES
         ],
+        chroma: vec![[0.4; 12]; TIMELINE_BASS_SEGMENT_FRAMES],
     }));
     assert_eq!(track.computed_frames(), 1000);
     let snapshot = track.clone();
     assert_eq!(track.at_secs(25.0).unwrap().midi, 40);
+    assert_eq!(track.chroma_at_secs(25.0), Some([0.4; 12]));
     assert_eq!(track.at_secs(19.98), None);
     assert_eq!(track.at_secs(19.990_001).unwrap().midi, 40);
     assert!(track.merge_segment(TimelineBassSegment {
         segment_index: 0,
         estimates: vec![BassEstimate::default(); TIMELINE_BASS_SEGMENT_FRAMES],
+        chroma: vec![[0.0; 12]; TIMELINE_BASS_SEGMENT_FRAMES],
     }));
     assert_eq!(track.computed_frames(), 2000);
     assert_eq!(track.at_secs(1.0), Some(BassEstimate::default()));
     assert_eq!(snapshot.at_secs(1.0), None);
+    assert_eq!(snapshot.chroma_at_secs(1.0), None);
+    assert_eq!(track.chroma_at_secs(1.0), Some([0.0; 12]));
     assert!(track.merge_segment(TimelineBassSegment {
         segment_index: 2,
         estimates: vec![BassEstimate::default()],
+        chroma: vec![[0.0; 12]],
     }));
     assert_eq!(track.computed_frames(), frames);
     assert_eq!(track.at_secs(39.999), Some(BassEstimate::default()));
     for secs in [f64::NAN, f64::INFINITY, -0.01, 40.0, 40.1] {
         assert_eq!(track.at_secs(secs), None);
+        assert_eq!(track.chroma_at_secs(secs), None);
     }
     assert!(!track.merge_segment(TimelineBassSegment {
         segment_index: 0,
-        estimates: vec![]
+        estimates: vec![],
+        chroma: vec![],
     }));
     assert!(!track.merge_segment(TimelineBassSegment {
         segment_index: 3,
-        estimates: vec![]
+        estimates: vec![],
+        chroma: vec![],
     }));
-    assert!(track.storage_bytes() >= frames * std::mem::size_of::<BassEstimate>());
+    assert_eq!(
+        track.storage_bytes(),
+        frames * (std::mem::size_of::<BassEstimate>() + std::mem::size_of::<[f32; 12]>())
+            + track.segment_count() * std::mem::size_of::<bool>()
+    );
+    assert_eq!(track.clone().storage_bytes(), track.storage_bytes());
+    for index in 0..4000 {
+        let secs = index as f64 * 0.01;
+        assert_eq!(
+            snapshot.at_secs(secs).is_some(),
+            snapshot.chroma_at_secs(secs).is_some(),
+            "snapshot secs={secs}"
+        );
+        assert_eq!(
+            track.at_secs(secs).is_some(),
+            track.chroma_at_secs(secs).is_some()
+        );
+    }
 }
 
 #[test]
@@ -150,9 +302,21 @@ fn invalid_partial_segment_does_not_mark_any_frames_computed() {
     assert!(!track.merge_segment(TimelineBassSegment {
         segment_index: 0,
         estimates: vec![BassEstimate::default(); 20],
+        chroma: vec![[0.0; 12]; 20],
     }));
     assert_eq!(track.computed_frames(), 0);
     assert_eq!(track.at_secs(0.0), None);
+    assert_eq!(track.chroma_at_secs(0.0), None);
+    let count = track.frame_count();
+    for (bass_count, chroma_count) in [(count, count - 1), (count - 1, count)] {
+        assert!(!track.merge_segment(TimelineBassSegment {
+            segment_index: 0,
+            estimates: vec![BassEstimate::default(); bass_count],
+            chroma: vec![[0.0; 12]; chroma_count],
+        }));
+        assert_eq!(track.computed_frames(), 0);
+        assert_eq!(track.chroma_at_secs(0.0), None);
+    }
 }
 
 #[test]
@@ -162,6 +326,9 @@ fn silence_short_and_fractional_eof_are_computed_with_zero_padding() {
         let track = calculate(&stereo);
         assert_eq!(track.computed_frames(), track.frame_count());
         assert_eq!(track.at_secs(0.0), Some(BassEstimate::default()));
+        assert_eq!(track.chroma_at_secs(0.0), Some([0.0; 12]));
+        assert_eq!(track.duration_secs(), samples as f64 / SR as f64);
+        assert!(track.window_is_computed(-3.0, 3.0));
         assert_eq!(
             track.at_secs((samples as f64 - 0.01) / SR as f64),
             Some(BassEstimate::default())
@@ -178,6 +345,8 @@ fn silence_short_and_fractional_eof_are_computed_with_zero_padding() {
             .iter()
             .all(|bass| *bass == BassEstimate::default())
     );
+    assert_eq!(segment.estimates.len(), segment.chroma.len());
+    assert!(segment.chroma.iter().all(|chroma| *chroma == [0.0; 12]));
 }
 
 #[test]
@@ -210,6 +379,7 @@ fn synthetic_bass_chord_and_silence_recover_correct_notes() {
         assert_eq!(track.at_secs(secs).unwrap().midi, 40, "secs={secs}");
     }
     assert_eq!(track.at_secs(2.3), Some(BassEstimate::default()));
+    assert_eq!(track.chroma_at_secs(2.3), Some([0.0; 12]));
     for secs in [3.42, 5.0] {
         assert_eq!(track.at_secs(secs).unwrap().midi, 43, "secs={secs}");
     }
@@ -237,6 +407,7 @@ fn nonfinite_channels_match_spectrum_mono_sanitization() {
     let actual = calculate_timeline_bass_segment(&stereo, SR as u32, 0, &|| false).unwrap();
     let expected = calculate_timeline_bass_segment(&expected, SR as u32, 0, &|| false).unwrap();
     assert_eq!(actual.estimates, expected.estimates);
+    assert_eq!(actual.chroma, expected.chroma);
     assert!(actual.estimates.iter().any(|bass| bass.midi == 40));
 }
 

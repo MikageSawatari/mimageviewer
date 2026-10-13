@@ -27,6 +27,14 @@ UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot
 更新後は `tests/snapshots/*.png` の差分を必ず目視確認してからコミットする。
 git diff のバイナリ比較では変化の意図 (改善なのか回帰なのか) は判断できない。
 
+音楽タイムラインの調・低域音量（鍵盤設計§14、2026-10-14）は、libの純ラスタ描画で
+`timeline_bass_partial_raster`（240×80）と`timeline_key_states_raster`（660×80）を検査する。
+前者はベース高さの低域音量化とKey既定色の灰色化で更新（変更2798px、範囲x=8..207/y=23..39）。
+計算済み側のベース色と未計算側の灰色、上段波形が保たれることを更新前後のPNGで目視確認した。
+後者は新規で、未計算／計算済み調なし／C長調を横並びにし、前2つの灰色と推定調の色を確認する。
+新規PNGの説明ラベルも本体と同じ`ui_fonts::configure_fonts`で描く。
+2枚の合計は9336 bytes（1544＋7792）。実アプリ・Appの起動は行わない。
+
 本別見開き調整 (§1.364 D2) は`spread_shift_hud_{resolved,unresolved}_{normal,narrow}_{light,dark}`の
 8ケースを定義する。normalは720×500、narrowは320×480。実HUDの調整submenuと調整の印を
 使い、resolvedの基点jump・解除・全体checkboxの到達性を確認する。unresolvedはjumpのみ無効にし、

@@ -235,12 +235,13 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
 - 再生制御は §2.2 の公開メソッドをそのまま呼ぶ。`step_frame` は音声では使わない（seek で代替）。
 
 ### 5.3 解析ワーカー + in-memory LRU（UI スレッド外）
-- タイムラインのベース表示は `TimelineBassTrack` を独立して計算する
-  ([鍵盤設計 §13](music-keyboard-harmnet-plan.md))。デコード成功・取消なしを確認し、必要な
+- タイムラインのベースと調は、ベース推定と12音名のchromaを持つ `TimelineBassTrack` を独立して計算する
+  ([鍵盤設計 §13〜14](music-keyboard-harmnet-plan.md))。chromaはhead 3の全88鍵の基音確率を音名ごとに合計する。
+  デコード成功・取消なしを確認し、必要な
   `TimelineComplete` を送った後、最大 `min(4, available_parallelism)` 本の BELOW_NORMAL
   スレッドで20秒ごとの区間を助走付きで計算する。スコープの持ち主だけが結果を結合し、
   `MusicAnalysisMsg::Bass(Arc<TimelineBassTrack>)` を250ms以上の間隔と完了時に公開する。
-  LRUヒットでも毎回計算し、ベース結果はLRUへ保存しない。UIは既存のsource一致判定内で
+  ベースとchromaは同じ計算済み印を共有する。LRUヒットでも毎回計算し、この結果はLRUへ保存しない。UIは既存のsource一致判定内で
   1 drainの最新結果だけを採用し、タイムラインと共通の版数を1回進める。
   曲・適用済みトラックの変更とcloseで破棄し、同じ音源のpark／復帰では保持する。
 - `docs/async-architecture.md` のワーカーテンプレ（`XxxPending { cancel, rx }` + `start_xxx` /
@@ -1207,9 +1208,14 @@ placement に作り直す経路。headless→native の「presenter 無し→有
   `WaveformBin` に `peak_l/rms_l/peak_r/rms_r` を additive 追加（music-core §2.1、`#[serde(default)]`）。
   mono 素材は L==R で従来どおり対称。L/R が全ゼロの既定/旧 bin は mono にフォールバック描画。
   in-memory 化 (§6/D8) 済みなのでディスク増はゼロ。
-- [x] loudness+bass root レーン（高さ=loudness、色=`TimelineBassTrack` の計算済みbinのリズム投票。
+- [x] loudness+bass root レーン（高さ=250Hz以下の低域音量を既存の音量正規化へ。
+  `loudness_db + 10·log10(band_energy[0])`、低域エネルギー0は高さ0。
+  色=`TimelineBassTrack` の計算済みbinのリズム投票。
   未計算は既定色、tooltipは描画済みの同じ票）（鍵盤設計§13、旧binのbass値は本体表示に使わない）
-- [x] key レーン（`key_pitch_class` / `key_confidence`、低 confidence は淡色）（Inc 3b）
+- [x] key レーン（上記trackのchromaを全幅6秒・左右3秒で集計し、24調のプロファイルと既存の信頼度式で推定。
+  窓はPCM実尺へ切り詰め、重みを省略する前に全フレームの計算済みを確認する。
+  未計算は灰色・tooltipなし、計算済みの調なしも灰色。推定と未計算状態はrow textureと一緒に保持し、
+  hoverは表示中の値だけを読む。旧binのchroma・調信頼度は表示に使わない。高さは既存の新hint信頼度式を維持）
 - [x] 歌声目安レーンはキャンセル済み。`center_ratio` は汎用の stereo center metric として残す。
 - [x] Row 秒数切替（解析キャッシュ再生成せず raster のみ作り直し）（Inc 3b、上バー巡回）
 - [x] メトリクスレーンのホバー（レーン名/値/時刻/推定音名）（Inc 3b）
