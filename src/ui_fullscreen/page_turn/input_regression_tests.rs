@@ -53,6 +53,16 @@ fn viewer_frame(
     ctx: &egui::Context,
     viewport: egui::ViewportId,
     events: Vec<egui::Event>,
+    run: impl FnMut(&mut egui::Ui, &egui::Context),
+) {
+    viewer_frame_with_focus(ctx, viewport, true, events, run);
+}
+
+fn viewer_frame_with_focus(
+    ctx: &egui::Context,
+    viewport: egui::ViewportId,
+    focused: bool,
+    events: Vec<egui::Event>,
     mut run: impl FnMut(&mut egui::Ui, &egui::Context),
 ) {
     let mut raw = egui::RawInput {
@@ -62,13 +72,14 @@ fn viewer_frame(
             egui::vec2(600.0, 400.0),
         )),
         events,
+        focused,
         ..Default::default()
     };
     raw.viewports.insert(
         viewport,
         egui::ViewportInfo {
             parent: (viewport != egui::ViewportId::ROOT).then_some(egui::ViewportId::ROOT),
-            focused: Some(true),
+            focused: Some(focused),
             ..Default::default()
         },
     );
@@ -999,4 +1010,755 @@ fn real_root_and_viewer_keyboard_handlers_start_and_complete_thumbnail_turns() {
             keyboard_turn_with_resident_quality(route, mode, true);
         }
     }
+}
+
+fn raw_wheel(delta: egui::Vec2) -> Vec<egui::Event> {
+    vec![
+        egui::Event::PointerMoved(egui::pos2(300.0, 180.0)),
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta,
+            modifiers: egui::Modifiers::NONE,
+        },
+    ]
+}
+
+fn ready_wheel_viewer(
+    ctx: &egui::Context,
+    root: bool,
+    mode: SpreadMode,
+) -> (crate::app::AppTestEnvForTest, egui::ViewportId) {
+    install(ctx);
+    install_fs_navigator_input_tracking(ctx);
+    crate::key_input::install_operation_input_plugin(ctx);
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new("page_turn_input_enabled"), true));
+    let mut app = ready_app(ctx, mode);
+    app.settings.page_turn_animation_enabled = true;
+    app.settings.page_turn_animation_duration_ms = 600;
+    #[cfg(windows)]
+    {
+        app.native_video_in_window_active = root;
+    }
+    let viewport = if root {
+        egui::ViewportId::ROOT
+    } else {
+        app.fullscreen_viewport_id()
+    };
+    // Materialize the ordinary flat unit at each possible landing first.
+    for anchor in [3, 2, 1, 0] {
+        app.fullscreen_idx = Some(anchor);
+        viewer_frame(ctx, viewport, Vec::new(), |ui, ctx| {
+            app.begin_page_turn_viewer_frame(ctx, root, None);
+            draw_current(&mut app, ui, ctx);
+        });
+    }
+    (app, viewport)
+}
+
+fn accept_actual_wheel(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) -> ViewerOperationId {
+    let from = app.fullscreen_idx.unwrap();
+    let (navigation, close, operation) = actual_pointer_handler(app, ui, ctx);
+    assert!(!close);
+    assert!(
+        !navigation.is_none(),
+        "the ordinary wheel handler must navigate"
+    );
+    let operation = operation.expect("the delivered wheel retains its raw identity");
+    assert!(
+        matches!(operation, ViewerOperationId::Pointer { source, .. } if source == ctx.viewport_id())
+    );
+    app.handle_fs_navigation_with_operation(
+        ctx,
+        false,
+        false,
+        None,
+        None,
+        None,
+        navigation,
+        None,
+        from,
+        Some(operation),
+    );
+    operation
+}
+
+#[test]
+fn unfocused_viewer_and_root_wheels_start_and_finish_without_focus_level_cancellation() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    #[cfg(windows)]
+    crate::key_input::clear_test_frame();
+    for root in [false, true] {
+        for mode in [SpreadMode::Single, SpreadMode::Ltr, SpreadMode::Rtl] {
+            take_test_events();
+            let ctx = egui::Context::default();
+            let (mut app, viewport) = ready_wheel_viewer(&ctx, root, mode);
+            let target = if mode.is_spread() { 2 } else { 1 };
+            let mut operation = None;
+            viewer_frame_with_focus(
+                &ctx,
+                viewport,
+                false,
+                raw_wheel(egui::vec2(0.0, -120.0)),
+                |ui, ctx| {
+                    assert!(
+                        crate::keyboard_input::keyboard_input_permits(ctx)
+                            .current_level
+                            .is_none()
+                    );
+                    app.begin_page_turn_viewer_frame(ctx, root, None);
+                    operation = Some(accept_actual_wheel(&mut app, ui, ctx));
+                    assert_eq!(app.fullscreen_idx, Some(target));
+                    let (_, sources) = draw_current(&mut app, ui, ctx);
+                    let FsDisplayUnitSubmission::Paged(receipt) = sources.submission else {
+                        panic!("paged output")
+                    };
+                    assert!(receipt.curl);
+                },
+            );
+            let operation = operation.unwrap();
+            let tracker = match &app.page_turn_presentation.state {
+                PresentationState::Turning { offer, .. } => {
+                    assert_eq!(offer.fact.operation_id, operation);
+                    assert_eq!(offer.fact.source, viewport);
+                    assert_eq!(offer.fact.cause, "wheel");
+                    offer.submission.clone()
+                }
+                _ => panic!("unfocused delivered wheel must start"),
+            };
+            for _ in 0..2 {
+                viewer_frame_with_focus(&ctx, viewport, false, Vec::new(), |ui, ctx| {
+                    neutral_gamepad_poll(&mut app, ctx);
+                    app.begin_page_turn_viewer_frame(ctx, root, None);
+                    let (nav, close, _) = actual_pointer_handler(&mut app, ui, ctx);
+                    assert!(nav.is_none());
+                    assert!(!close);
+                    draw_current(&mut app, ui, ctx);
+                });
+                assert_eq!(tracker.status(), SubmissionStatus::Started);
+            }
+            if let PresentationState::Turning { offer, .. } = &mut app.page_turn_presentation.state
+            {
+                offer.accepted_at -= offer.duration + Duration::from_millis(1);
+            } else {
+                panic!("an unfocused level without a loss edge must preserve the turn");
+            }
+            viewer_frame_with_focus(&ctx, viewport, false, Vec::new(), |ui, ctx| {
+                app.begin_page_turn_viewer_frame(ctx, root, None);
+                let (_, sources) = draw_current(&mut app, ui, ctx);
+                let FsDisplayUnitSubmission::Paged(receipt) = sources.submission else {
+                    panic!("paged output")
+                };
+                assert!(!receipt.curl);
+            });
+            assert_eq!(tracker.status(), SubmissionStatus::Finished);
+            assert_completed_operation_events(operation);
+        }
+    }
+}
+
+#[test]
+fn real_focus_loss_edge_cancels_the_existing_turn_once() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    #[cfg(windows)]
+    crate::key_input::clear_test_frame();
+    take_test_events();
+    let ctx = egui::Context::default();
+    let (mut app, viewport) = ready_wheel_viewer(&ctx, false, SpreadMode::Single);
+    let mut operation = None;
+    viewer_frame(
+        &ctx,
+        viewport,
+        raw_wheel(egui::vec2(0.0, -120.0)),
+        |ui, ctx| {
+            app.begin_page_turn_viewer_frame(ctx, false, None);
+            operation = Some(accept_actual_wheel(&mut app, ui, ctx));
+            draw_current(&mut app, ui, ctx);
+        },
+    );
+    let tracker = match &app.page_turn_presentation.state {
+        PresentationState::Turning { offer, .. } => offer.submission.clone(),
+        _ => panic!("focused wheel starts"),
+    };
+    viewer_frame_with_focus(
+        &ctx,
+        viewport,
+        false,
+        vec![egui::Event::WindowFocused(false)],
+        |ui, ctx| {
+            app.begin_page_turn_viewer_frame(ctx, false, None);
+            assert!(app.page_turn_completion_active());
+            draw_current(&mut app, ui, ctx);
+        },
+    );
+    assert_eq!(tracker.status(), SubmissionStatus::Cancelled);
+    for _ in 0..2 {
+        viewer_frame_with_focus(&ctx, viewport, false, Vec::new(), |ui, ctx| {
+            app.begin_page_turn_viewer_frame(ctx, false, None);
+            draw_current(&mut app, ui, ctx);
+        });
+    }
+    let events = take_test_events();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|(fact, kind, _)| Some(fact.operation_id) == operation && *kind == "cancel")
+            .count(),
+        1,
+        "the loss delivery cancels only once: {events:?}"
+    );
+}
+
+#[test]
+fn unfocused_focus_edge_and_wheel_in_either_raw_order_retain_the_wheel_fact() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    #[cfg(windows)]
+    crate::key_input::clear_test_frame();
+    for loss_first in [false, true] {
+        take_test_events();
+        let ctx = egui::Context::default();
+        let (mut app, viewport) = ready_wheel_viewer(&ctx, false, SpreadMode::Single);
+        let mut input = raw_wheel(egui::vec2(0.0, -120.0));
+        if loss_first {
+            input.insert(0, egui::Event::WindowFocused(false));
+        } else {
+            input.push(egui::Event::WindowFocused(false));
+        }
+        viewer_frame_with_focus(&ctx, viewport, false, input, |ui, ctx| {
+            app.begin_page_turn_viewer_frame(ctx, false, None);
+            let operation = accept_actual_wheel(&mut app, ui, ctx);
+            let fact = app.page_turn_presentation.transaction.facts[0];
+            assert_eq!(fact.operation_id, operation);
+            assert_eq!(fact.source, viewport);
+            assert_eq!(fact.phase, OperationPhase::Press);
+            assert_eq!(fact.cause, "wheel");
+            draw_current(&mut app, ui, ctx);
+        });
+        viewer_frame_with_focus(&ctx, viewport, false, Vec::new(), |ui, ctx| {
+            app.begin_page_turn_viewer_frame(ctx, false, None);
+            draw_current(&mut app, ui, ctx);
+        });
+        assert!(matches!(
+            app.page_turn_presentation.state,
+            PresentationState::Turning { .. }
+        ));
+    }
+}
+
+#[test]
+fn unfocused_wheel_continuation_commits_after_adopted_flat_without_keyboard_permits() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    #[cfg(windows)]
+    crate::key_input::clear_test_frame();
+    take_test_events();
+    let ctx = egui::Context::default();
+    let (mut app, viewport) = ready_wheel_viewer(&ctx, false, SpreadMode::Single);
+    viewer_frame_with_focus(
+        &ctx,
+        viewport,
+        false,
+        raw_wheel(egui::vec2(0.0, -120.0)),
+        |ui, ctx| {
+            app.begin_page_turn_viewer_frame(ctx, false, None);
+            accept_actual_wheel(&mut app, ui, ctx);
+            draw_current(&mut app, ui, ctx);
+        },
+    );
+    assert_eq!(app.fullscreen_idx, Some(1));
+    let mut operation = None;
+    let mut canonical = None;
+    viewer_frame_with_focus(
+        &ctx,
+        viewport,
+        false,
+        raw_wheel(egui::vec2(0.0, -120.0)),
+        |ui, ctx| {
+            let permits = crate::keyboard_input::keyboard_input_permits(ctx);
+            assert!(permits.discrete.is_none() && permits.current_level.is_none());
+            app.begin_page_turn_viewer_frame(ctx, false, None);
+            operation = Some(accept_actual_wheel(&mut app, ui, ctx));
+            assert_eq!(
+                app.fullscreen_idx,
+                Some(1),
+                "the canonical flat precedes navigation"
+            );
+            let PresentationState::Completing {
+                continuation: Some(command),
+                ..
+            } = &app.page_turn_presentation.state
+            else {
+                panic!("the second real wheel must own the continuation")
+            };
+            assert_eq!(Some(command.fact.operation_id), operation);
+            assert_eq!(command.fact.source, viewport);
+            let (composition, sources) = draw_current(&mut app, ui, ctx);
+            let FsDisplayUnitSubmission::Paged(receipt) = &sources.submission else {
+                panic!("paged canonical output")
+            };
+            assert!(!receipt.curl);
+            canonical = Some(receipt.clone());
+            assert!(app.fs_navigation_sequence_blocks_new_target());
+            // Normal rendering publishes this receipt to the navigation observer.
+            // Drawing the flat alone cannot retire the previous accepted target.
+            app.emit_fs_page_turn_ready_for_display_unit(
+                ctx,
+                &composition,
+                FsPageTurnDecision::normal(),
+                &sources,
+            );
+            assert!(!app.commit_page_turn_continuation(ctx));
+        },
+    );
+    assert!(canonical.unwrap().was_accepted());
+    viewer_frame_with_focus(&ctx, viewport, false, Vec::new(), |ui, ctx| {
+        let permits = crate::keyboard_input::keyboard_input_permits(ctx);
+        assert!(permits.discrete.is_none() && permits.current_level.is_none());
+        let entry = app.begin_page_turn_viewer_frame(ctx, false, None);
+        assert!(matches!(
+            entry,
+            PageTurnFrameEntry::Continue {
+                committed: true,
+                ..
+            }
+        ));
+        assert_eq!(app.fullscreen_idx, Some(2));
+        draw_current(&mut app, ui, ctx);
+    });
+    viewer_frame_with_focus(&ctx, viewport, false, Vec::new(), |ui, ctx| {
+        app.begin_page_turn_viewer_frame(ctx, false, None);
+        assert_eq!(app.fullscreen_idx, Some(2));
+        draw_current(&mut app, ui, ctx);
+    });
+    let events = take_test_events();
+    let committed: Vec<_> = events
+        .iter()
+        .filter(|(_, kind, reason)| *kind == "skip" && *reason == "stage1_continuation_instant")
+        .collect();
+    assert_eq!(
+        committed.len(),
+        1,
+        "one already-resolved continuation: {events:?}"
+    );
+    assert_eq!(Some(committed[0].0.operation_id), operation);
+    assert_eq!(committed[0].0.source, viewport);
+    assert_eq!(committed[0].0.cause, "wheel");
+}
+
+#[test]
+fn horizontal_wheel_and_sibling_delivery_do_not_turn_the_owner_page() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    #[cfg(windows)]
+    crate::key_input::clear_test_frame();
+    take_test_events();
+    let ctx = egui::Context::default();
+    let (mut app, viewport) = ready_wheel_viewer(&ctx, false, SpreadMode::Single);
+    viewer_frame_with_focus(
+        &ctx,
+        viewport,
+        false,
+        raw_wheel(egui::vec2(-120.0, 0.0)),
+        |ui, ctx| {
+            app.begin_page_turn_viewer_frame(ctx, false, None);
+            assert!(
+                app.page_turn_pointer_navigation_operation(ctx, "wheel")
+                    .is_some()
+            );
+            let (nav, close, _) = actual_pointer_handler(&mut app, ui, ctx);
+            assert!(nav.is_none());
+            assert!(!close);
+            assert_eq!(app.fullscreen_idx, Some(0));
+            draw_current(&mut app, ui, ctx);
+        },
+    );
+    let sibling = egui::ViewportId::from_hash_of("unfocused-wheel-sibling");
+    viewer_frame_with_focus(
+        &ctx,
+        sibling,
+        false,
+        raw_wheel(egui::vec2(0.0, -120.0)),
+        |_, ctx| {
+            observe_pointer_transaction(ctx);
+            let id = egui::Id::new(("page_turn_pointer_transaction", sibling));
+            let transaction = ctx
+                .data(|data| data.get_temp::<PointerTransaction>(id))
+                .unwrap();
+            assert_eq!(transaction.facts.len(), 1);
+            let operation = transaction.facts[0].0.id().unwrap();
+            assert!(
+                matches!(operation, ViewerOperationId::Pointer { source, .. } if source == sibling)
+            );
+            let destination = app.page_turn_destination();
+            let delivery = transaction.facts[0].0.route(destination).unwrap();
+            let mut other = destination;
+            other.viewport = sibling;
+            assert!(
+                delivery.route(other).is_none(),
+                "a delivered operation cannot be rebound"
+            );
+        },
+    );
+    viewer_frame_with_focus(&ctx, viewport, false, Vec::new(), |ui, ctx| {
+        app.begin_page_turn_viewer_frame(ctx, false, None);
+        assert!(
+            app.page_turn_pointer_navigation_operation(ctx, "wheel")
+                .is_none()
+        );
+        let (nav, close, _) = actual_pointer_handler(&mut app, ui, ctx);
+        assert!(nav.is_none());
+        assert!(!close);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        draw_current(&mut app, ui, ctx);
+    });
+    assert!(
+        !take_test_events()
+            .iter()
+            .any(|(_, kind, _)| *kind == "start")
+    );
+}
+
+#[test]
+fn replayed_focus_loss_does_not_cancel_the_wheel_accepted_after_that_delivery() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    #[cfg(windows)]
+    crate::key_input::clear_test_frame();
+    take_test_events();
+    let ctx = egui::Context::default();
+    let (mut app, viewport) = ready_wheel_viewer(&ctx, false, SpreadMode::Single);
+    let mut input = raw_wheel(egui::vec2(0.0, -120.0));
+    input.insert(0, egui::Event::WindowFocused(false));
+    let mut operation = None;
+    let mut passes = 0;
+    viewer_frame_with_focus(&ctx, viewport, false, input, |ui, ctx| {
+        app.begin_page_turn_viewer_frame(ctx, false, None);
+        if operation.is_none() {
+            operation = Some(accept_actual_wheel(&mut app, ui, ctx));
+        }
+        assert_eq!(app.fullscreen_idx, Some(1));
+        let (_, sources) = draw_current(&mut app, ui, ctx);
+        let FsDisplayUnitSubmission::Paged(receipt) = sources.submission else {
+            panic!("paged output")
+        };
+        assert!(
+            receipt.curl,
+            "replay cannot apply the same focus-loss delivery again"
+        );
+        passes += 1;
+        if passes == 1 {
+            ctx.request_discard("replay the unfocused wheel delivery");
+        }
+    });
+    assert!(passes >= 2, "the fixture must execute an egui replay");
+    let tracker = match &app.page_turn_presentation.state {
+        PresentationState::Turning { offer, .. } => {
+            assert_eq!(Some(offer.fact.operation_id), operation);
+            offer.submission.clone()
+        }
+        _ => panic!("the adopted replay must retain the new turn"),
+    };
+    assert_eq!(tracker.status(), SubmissionStatus::Started);
+    let events = take_test_events();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|(fact, kind, _)| Some(fact.operation_id) == operation && *kind == "start")
+            .count(),
+        1
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|(fact, kind, _)| Some(fact.operation_id) == operation && *kind == "cancel")
+    );
+}
+
+#[test]
+fn root_focus_loss_forwarding_cannot_cancel_the_child_turn() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    #[cfg(windows)]
+    crate::key_input::clear_test_frame();
+    take_test_events();
+    let ctx = egui::Context::default();
+    let root_ctx = egui::Context::default();
+    install(&root_ctx);
+    let (mut app, viewport) = ready_wheel_viewer(&ctx, false, SpreadMode::Single);
+    viewer_frame(
+        &ctx,
+        viewport,
+        raw_wheel(egui::vec2(0.0, -120.0)),
+        |ui, ctx| {
+            app.begin_page_turn_viewer_frame(ctx, false, None);
+            accept_actual_wheel(&mut app, ui, ctx);
+            draw_current(&mut app, ui, ctx);
+        },
+    );
+    let tracker = match &app.page_turn_presentation.state {
+        PresentationState::Turning { offer, .. } => offer.submission.clone(),
+        _ => panic!("the child must own its started turn"),
+    };
+    viewer_frame_with_focus(
+        &root_ctx,
+        egui::ViewportId::ROOT,
+        false,
+        vec![egui::Event::WindowFocused(false)],
+        |_, root| {
+            app.handle_fullscreen_root_key_input(root);
+            assert_eq!(tracker.status(), SubmissionStatus::Started);
+            let input = FullscreenRootFrameInput {
+                context: root.clone(),
+                destination: app.page_turn_destination(),
+            };
+            viewer_frame_with_focus(&ctx, viewport, false, Vec::new(), |ui, ctx| {
+                app.begin_page_turn_viewer_frame(ctx, false, Some(&input));
+                let (_, sources) = draw_current(&mut app, ui, ctx);
+                let FsDisplayUnitSubmission::Paged(receipt) = sources.submission else {
+                    panic!("child paged output")
+                };
+                assert!(receipt.curl);
+            });
+        },
+    );
+    assert_eq!(tracker.status(), SubmissionStatus::Started);
+    assert!(
+        !take_test_events()
+            .iter()
+            .any(|(_, kind, _)| *kind == "cancel")
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn mounted_sibling_focus_loss_cancels_only_its_own_turn() {
+    let _serial = crate::key_input::lock_test_input();
+    crate::key_input::clear_test_frame();
+    take_test_events();
+    let ctx = egui::Context::default();
+    let (mut app, main_viewport) = ready_wheel_viewer(&ctx, true, SpreadMode::Single);
+    viewer_frame(
+        &ctx,
+        main_viewport,
+        raw_wheel(egui::vec2(0.0, -120.0)),
+        |ui, ctx| {
+            app.begin_page_turn_viewer_frame(ctx, true, None);
+            accept_actual_wheel(&mut app, ui, ctx);
+            draw_current(&mut app, ui, ctx);
+        },
+    );
+    let (main_operation, main_tracker) = match &app.page_turn_presentation.state {
+        PresentationState::Turning { offer, .. } => {
+            (offer.fact.operation_id, offer.submission.clone())
+        }
+        _ => panic!("main started turn"),
+    };
+    let main_context = app.page_turn_destination().context;
+    let items = app.items.clone();
+    let sibling = app.build_window_context_for_test(13419, |owner| {
+        owner.items = items;
+        owner.visible_indices = vec![0, 1, 2, 3];
+        owner.fullscreen_idx = Some(0);
+        owner.spread_mode = SpreadMode::Single;
+        owner.reading_flow = ReadingFlow::Paged;
+        owner.viewer_presentation = crate::app::ViewerPresentation::DetachedWindow;
+        owner.native_video_in_window_active = false;
+        owner.transition_detached_window_state(
+            13419,
+            crate::app::DetachedWindowState::Active,
+            "focus_loss_owner_test",
+        );
+        for idx in 0..4 {
+            let image = egui::ColorImage::filled([80, 120], egui::Color32::LIGHT_BLUE);
+            let tex = ctx.load_texture(
+                format!("focus-sibling-{idx}"),
+                image.clone(),
+                egui::TextureOptions::LINEAR,
+            );
+            owner.fs_cache.insert(
+                idx,
+                FsCacheEntry::Static {
+                    tex,
+                    pixels: Arc::new(image),
+                    source_dims: Some([80, 120]),
+                    load_seq: 1,
+                    animation: crate::fs_animation::StaticAnimationState::Still,
+                },
+            );
+            owner.record_page_dims_for_spread(idx, (80, 120));
+        }
+    });
+    assert_eq!(main_tracker.status(), SubmissionStatus::Started);
+    let mut sibling_operation = None;
+    app.with_window_context_for_test(sibling, |owner| {
+        let destination = owner.page_turn_destination();
+        assert_eq!(destination.context, sibling);
+        assert_ne!(destination.context, main_context);
+        assert_ne!(destination.viewport, main_viewport);
+        let viewport = destination.viewport;
+        for anchor in [1, 0] {
+            owner.fullscreen_idx = Some(anchor);
+            viewer_frame(&ctx, viewport, Vec::new(), |ui, ctx| {
+                owner.begin_page_turn_viewer_frame(ctx, false, None);
+                draw_current(owner, ui, ctx);
+            });
+        }
+        viewer_frame(
+            &ctx,
+            viewport,
+            raw_wheel(egui::vec2(0.0, -120.0)),
+            |ui, ctx| {
+                owner.begin_page_turn_viewer_frame(ctx, false, None);
+                sibling_operation = Some(accept_actual_wheel(owner, ui, ctx));
+                draw_current(owner, ui, ctx);
+            },
+        );
+        let tracker = match &owner.page_turn_presentation.state {
+            PresentationState::Turning { offer, .. } => offer.submission.clone(),
+            _ => panic!("sibling started turn"),
+        };
+        viewer_frame_with_focus(
+            &ctx,
+            viewport,
+            false,
+            vec![egui::Event::WindowFocused(false)],
+            |ui, ctx| {
+                owner.begin_page_turn_viewer_frame(ctx, false, None);
+                draw_current(owner, ui, ctx);
+            },
+        );
+        assert_eq!(tracker.status(), SubmissionStatus::Cancelled);
+        assert_eq!(main_tracker.status(), SubmissionStatus::Started);
+    });
+    assert_eq!(app.page_turn_destination().context, main_context);
+    assert_eq!(app.fullscreen_idx, Some(1));
+    assert_eq!(main_tracker.status(), SubmissionStatus::Started);
+    let events = take_test_events();
+    assert_eq!(
+        events
+            .iter()
+            .filter(
+                |(fact, kind, _)| Some(fact.operation_id) == sibling_operation && *kind == "cancel"
+            )
+            .count(),
+        1
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|(fact, kind, _)| fact.operation_id == main_operation && *kind == "cancel")
+    );
+}
+
+fn accepted_unfocused_nonpointer_continuation_commits_once(native_key: bool) {
+    take_test_events();
+    let ctx = egui::Context::default();
+    let (mut app, viewport) = ready_wheel_viewer(&ctx, false, SpreadMode::Single);
+    viewer_frame_with_focus(
+        &ctx,
+        viewport,
+        false,
+        raw_wheel(egui::vec2(0.0, -120.0)),
+        |ui, ctx| {
+            app.begin_page_turn_viewer_frame(ctx, false, None);
+            accept_actual_wheel(&mut app, ui, ctx);
+            draw_current(&mut app, ui, ctx);
+        },
+    );
+    let events = if native_key {
+        vec![key_event(true), key_event(false)]
+    } else {
+        Vec::new()
+    };
+    let mut operation = None;
+    let mut receipt = None;
+    viewer_frame_with_focus(&ctx, viewport, false, events, |ui, ctx| {
+        #[cfg(windows)]
+        if native_key {
+            install_native_press(viewport);
+        }
+        app.begin_page_turn_viewer_frame(ctx, false, None);
+        if native_key {
+            let mut id = None;
+            let action = app.handle_fs_key_input_with_operation(ctx, 1, false, &mut id);
+            assert!(!action.page_nav.is_none());
+            assert!(matches!(id, Some(ViewerOperationId::Key(_))));
+            accept_key_action_on_outer_root(&mut app, ctx, 1, &action, id);
+        } else {
+            // This producer creates the accepted timer delivery and uses the
+            // same canonical-flat navigation owner as an elapsed slideshow.
+            app.open_fullscreen_from_slideshow_navigation(ctx, 2);
+        }
+        let PresentationState::Completing {
+            continuation: Some(command),
+            ..
+        } = &app.page_turn_presentation.state
+        else {
+            panic!("an accepted native-key/slideshow command must be retained")
+        };
+        operation = Some(command.fact.operation_id);
+        assert_eq!(command.fact.source, viewport);
+        assert_eq!(
+            command.fact.cause,
+            if native_key { "key" } else { "slideshow" }
+        );
+        assert_eq!(app.fullscreen_idx, Some(1));
+        let (composition, sources) = draw_current(&mut app, ui, ctx);
+        let FsDisplayUnitSubmission::Paged(flat) = &sources.submission else {
+            panic!("canonical flat")
+        };
+        assert!(!flat.curl);
+        receipt = Some(flat.clone());
+        app.emit_fs_page_turn_ready_for_display_unit(
+            ctx,
+            &composition,
+            FsPageTurnDecision::normal(),
+            &sources,
+        );
+        assert!(!app.commit_page_turn_continuation(ctx));
+    });
+    assert!(receipt.unwrap().was_accepted());
+    #[cfg(windows)]
+    crate::key_input::clear_test_frame();
+    for first in [true, false] {
+        viewer_frame_with_focus(&ctx, viewport, false, Vec::new(), |ui, ctx| {
+            let permits = crate::keyboard_input::keyboard_input_permits(ctx);
+            assert!(permits.discrete.is_none() && permits.current_level.is_none());
+            let entry = app.begin_page_turn_viewer_frame(ctx, false, None);
+            assert!(
+                matches!(entry, PageTurnFrameEntry::Continue { committed, .. } if committed == first)
+            );
+            assert_eq!(app.fullscreen_idx, Some(2));
+            draw_current(&mut app, ui, ctx);
+        });
+    }
+    let events = take_test_events();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|(fact, kind, reason)| Some(fact.operation_id) == operation
+                && *kind == "skip"
+                && *reason == "stage1_continuation_instant")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn accepted_slideshow_continuation_commits_once_in_an_unfocused_frame() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    #[cfg(windows)]
+    crate::key_input::clear_test_frame();
+    accepted_unfocused_nonpointer_continuation_commits_once(false);
+}
+
+#[cfg(windows)]
+#[test]
+fn accepted_native_key_continuation_commits_once_after_its_discrete_permit_expires() {
+    let _serial = crate::key_input::lock_test_input();
+    crate::key_input::clear_test_frame();
+    accepted_unfocused_nonpointer_continuation_commits_once(true);
 }

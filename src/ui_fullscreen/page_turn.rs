@@ -18,6 +18,8 @@ mod nonfinal_tests;
 #[cfg(test)]
 mod roi_tests;
 #[cfg(test)]
+mod slideshow_regression_tests;
+#[cfg(test)]
 mod spine_budget_tests;
 use barrier::{FlatCompletion, ResolvedPageTurnNavigation};
 
@@ -69,7 +71,8 @@ pub(crate) struct ViewerOperationFact {
     pub(crate) diagnostic_input_seq: u64,
 }
 
-/// The original transaction survives consumers and egui replay; passive input creates no fact.
+/// Raw pointer and focus-loss deliveries survive consumers and egui replay.
+/// Passive hover creates no operation, and focus-loss is never a navigation candidate.
 #[derive(Clone, Default)]
 struct PointerTransaction {
     frame: u64,
@@ -150,6 +153,9 @@ fn observe_pointer_transaction(ctx: &egui::Context) {
                     }
                 }
                 egui::Event::MouseWheel { .. } => Some((delivery, OperationPhase::Press, "wheel")),
+                egui::Event::WindowFocused(false) => {
+                    Some((delivery, OperationPhase::Continuous, "focus_lost"))
+                }
                 egui::Event::PointerMoved(_) if i.pointer.any_down() => {
                     Some((delivery, OperationPhase::Continuous, "drag"))
                 }
@@ -198,7 +204,7 @@ fn observe_pointer_transaction(ctx: &egui::Context) {
                 _ => None,
             };
             if let Some(fact) = fact {
-                if fact.0.id() == Some(operation_id) {
+                if fact.2 != "focus_lost" && fact.0.id() == Some(operation_id) {
                     crate::key_input::trace_page_turn_operation_ingress(
                         || format!("{operation_id:?}"),
                         viewport,
@@ -1195,11 +1201,9 @@ impl App {
         let keyboard_owner = self.keyboard_owner_for_pass(ctx);
         observe_pointer_transaction(ctx);
         if ctx.viewport_id() == self.page_turn_destination().viewport
-            && ctx.input(|i| {
-                i.viewport().minimized.unwrap_or(false) || !i.viewport().focused.unwrap_or(true)
-            })
+            && ctx.input(|i| i.viewport().minimized.unwrap_or(false))
         {
-            self.page_turn_presentation.cancel("hidden_or_focus_lost");
+            self.page_turn_presentation.cancel("hidden");
             return;
         }
         if self.fs_loupe_locked || self.page_turn_loupe_hold(ctx) {
@@ -1237,6 +1241,21 @@ impl App {
                 .data(|d| d.get_temp::<PointerPresses>(press_id))
                 .unwrap_or_default();
             for (delivery, phase, cause) in &mut transaction.facts {
+                if *cause == "focus_lost" {
+                    // Lifecycle belongs to the receiving window, not a forwarded
+                    // key destination. Mark the real delivery once so a replay
+                    // cannot cancel a new wheel accepted while still unfocused.
+                    if source == destination.viewport {
+                        let fresh = matches!(delivery, PointerDelivery::Unrouted(_));
+                        if let Some(routed) = delivery.route(destination) {
+                            *delivery = routed;
+                            if fresh {
+                                self.page_turn_presentation.cancel("focus_lost");
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let Some(routed) = delivery.route(destination) else {
                     continue;
                 };
@@ -1997,16 +2016,7 @@ impl App {
                                     == p.resource.source_generation()
                                 && source.content == self.page_turn_content(p.occurrence.idx)
                         });
-                let deadline_allows = !self.slideshow_playing
-                    || slideshow_deadline_allows_turn(
-                        offer.accepted_at,
-                        offer.duration,
-                        self.slideshow_next_at,
-                    );
-                if matching
-                    && deadline_allows
-                    && now.saturating_duration_since(offer.accepted_at) < offer.duration
-                {
+                if matching && now.saturating_duration_since(offer.accepted_at) < offer.duration {
                     match prepare_leaf(&outgoing, &unit, offer.forward) {
                         Ok(projection) => {
                             // Include the ordinary prepared native ROI as well as
@@ -2056,16 +2066,7 @@ impl App {
                     }
                 } else {
                     offer.submission.end();
-                    emit(
-                        &offer.fact,
-                        "skip",
-                        if deadline_allows {
-                            "offer_mismatch_or_expired"
-                        } else {
-                            "slideshow_deadline_shorter_than_turn"
-                        },
-                        &[],
-                    );
+                    emit(&offer.fact, "skip", "offer_mismatch_or_expired", &[]);
                     PresentationState::Flat(unit.clone())
                 }
             }
@@ -2580,16 +2581,6 @@ fn stage_one_shape_reason(
         None
     }
 }
-fn slideshow_deadline_allows_turn(
-    accepted_at: Instant,
-    duration: Duration,
-    deadline: Instant,
-) -> bool {
-    accepted_at
-        .checked_add(duration)
-        .is_some_and(|end| end <= deadline)
-}
-
 fn rect_diagnostics(rect: egui::Rect) -> [f32; 4] {
     [rect.min.x, rect.min.y, rect.max.x, rect.max.y]
 }
@@ -3786,24 +3777,16 @@ mod tests {
         assert!(matches!(proof.pages, ReceiptPages::Single(_)));
     }
     #[test]
-    fn slideshow_policy_uses_adopted_interval_and_incoming_anchor_deadline() {
-        let now = Instant::now();
+    fn slideshow_policy_uses_adopted_interval() {
         let duration = Duration::from_millis(200);
         assert!(!slideshow_interval_allows_turn(
             duration,
             Duration::from_millis(199)
         ));
         assert!(slideshow_interval_allows_turn(duration, duration));
-        assert!(!slideshow_deadline_allows_turn(now, duration, now));
-        assert!(slideshow_deadline_allows_turn(
-            now,
+        assert!(slideshow_interval_allows_turn(
             duration,
-            now + duration
-        ));
-        assert!(!slideshow_deadline_allows_turn(
-            now,
-            duration,
-            now + Duration::from_millis(199)
+            Duration::from_secs(3)
         ));
     }
 

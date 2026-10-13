@@ -30414,7 +30414,6 @@ impl App {
             return PageTurnFrameEntry::ExitViewer;
         }
         let root = root_input.filter(|root| root.destination == self.page_turn_destination());
-        let permits = crate::keyboard_input::keyboard_input_permits(ctx);
         let root_permitted = root.is_some_and(|root| {
             crate::keyboard_input::keyboard_input_permits(&root.context)
                 .discrete
@@ -30519,9 +30518,10 @@ impl App {
             self.page_turn_pre_draw(&root.context);
         }
         self.page_turn_pre_draw(ctx);
-        let committed =
-            (permits.discrete.is_some() || root_permitted || permits.current_level.is_some())
-                && self.commit_page_turn_continuation(ctx);
+        // This is already accepted, recipient-bound navigation. Committing its
+        // canonical flat receipt does not sample fresh keys or current levels;
+        // a keyboard permit would strand unfocused wheel/slideshow continuations.
+        let committed = self.commit_page_turn_continuation(ctx);
         if committed {
             let current_idx = self.fullscreen_idx;
             if current_idx.is_none() {
@@ -37050,6 +37050,13 @@ impl App {
         state: &FsFrameState,
     ) {
         if !self.slideshow_playing {
+            return;
+        }
+        // The interval is time to view the adopted flat page. Keep the existing
+        // anchor unarmed while its turn/flat receipt is pending; no extra timer
+        // or completion queue is needed, and short intervals still skip the turn.
+        if self.page_turn_barrier_active() {
+            self.slideshow_anchor_idx = None;
             return;
         }
         // 動画でスライドショーを止めない (ユーザー設定: 動画はスキップして継続)。

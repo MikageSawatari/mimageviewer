@@ -456,7 +456,7 @@ Q1は2026-10-10にC方向・旧/新が見える実際のpage-turnとして採択
 
 1. **Q2: 最終時間は動きを見てから決める。** 評価用の仮スライダーは100〜600ms・既定200ms。新内容は最初のready frameから見え、全面表示は選択した時間内。新入力/held/seekで即終了する。
 2. **Q3: 既定OFF採択済み。** 2026-10-11の利用者判断は「速度が売り」。従来の瞬時切替を初期値に保ち、希望する方がONにできる。ONでも読込待ち・連打には演出を付けない。
-3. **Q4: slideshowにも同じ効果を適用する。** 即ready条件と§6のduration/deadline条件を使い、intervalや次ページ提示を遅くしない。個別toggleは追加しない。
+3. **Q4: slideshowにも同じ効果を適用する。** 即ready条件と§6のduration/deadline条件を使い、intervalや次ページ提示を遅くしない。個別toggleは追加しない。この旧期限方針は2026-10-14の§26.12で改訂し、めくり完了後の全面表示時間を保存間隔どおり確保する。
 4. **2026-10-11の実機再評価: A0の動きは不合格。** 利用者は「本のページをめくるように見えること」を要求し、RTL forwardでは旧左頁だけを持ち上げて右へ返すこと、普通のscanの寸法/配置差で省略しないことを明示した。新しいmotionのR4案を§15へ記録する。§15の通知契約・数値・instant範囲まで採択されたとは扱わない。
 
 次々回への延期許容は品質と正しさのための工程判断であり、通常の入力を遅くする、既存機能を外す、ready提示を停止する許可ではない。
@@ -2379,3 +2379,70 @@ coreは2026-10-14 02:52:25、325,590,016 bytes、FileVersion4.6.0.0。portable f
 一回実行してexit0（PASS）。本体12,409成功/既存57ignored、UI snapshot163、vendorのegui25・
 egui-wgpu11・eframe18も成功した。command/log・binary情報・隔離確認手順は
 `target/A-1341-revise-msg.txt`を参照する。
+
+### 26.12 2026-10-14 スライドショー期限と非フォーカスの受信入力
+
+f33a93bb8で§26.10の修正はコミット済み。利用者がアニメーションONでもスライドショー・
+非フォーカスのホイールでめくれないと報告した。隔離DBの現在の保存間隔は3.0秒、めくりは
+200ms（現在の有効設定保存値はOFFであり、診断ログ時点のONとは区別する）。
+通常スライドショーは旧頁期限に達してから次頁を受理するが、projection準備がその旧期限と
+受理時刻＋めくり時間を比較していた。新頁のanchorを設定するのは描画後なので、次頁の
+表示時間を判定したつもりで、既に過ぎた旧頁期限により毎回skipしていた。
+
+§6/§10の「deadlineを延長しない」方針をここで置き換える。間隔がめくり時間未満なら従来の
+瞬時切替とし、めくり時間を短縮せず、短い間隔の自動送りをめくり待ちにしない。
+間隔以上なら通常のめくりを開始する。通常描画がOfferedをTurning/Flatへ解決してからtimerを
+同期し、Turning/Completing中は既存slideshow_anchor_idxを未設定とする。採用済みcanonical flatになった後、既存schedulerが
+保存間隔の全時間を数え始める。手動移動中のスライドショーにも同じ全面表示時間を適用する。
+これにより新頁の表示時間から演出時間を差し引かず、ON時の周期は演出＋保存表示時間になる。
+OFF/読込待ち/短間隔/連結読みは既存のready-anchor/continuous waitを使う。旧deadlineの
+二重admissionを撤去し、新timer/queue/pending/boolを追加しない。
+
+非フォーカスwheelは受信HWNDのWM_MOUSEWHEEL/HWHEELからwinitのWindowEventを経て、
+対応viewport固有のegui raw eventとして届く。通常wheel handlerはfocusを要求しないのに、
+page_turn_pre_drawはframe-final focus=falseで配送情報のrouting前にreturnしていた。
+同levelによる毎frame取消も、非フォーカスで開始しためくりを次frameで止めていた。
+minimizedは従来の取消を維持し、focusは実WindowFocused(false)のloss edgeで旧presentationを
+一度だけ取消す。既存PointerTransaction/PointerDeliveryがraw ordinalと宛先を保持して
+loss edgeもrouting済みとして記録し、replayが新しいwheelを再取消しない。focus edgeは
+navigation候補・press/contact継承・navigation診断へ含めない。ROOTのlossでchildを取消さず、
+受信元とpresentation viewportが同じ時だけ適用する。受信済みwheel/keyが同batchにある場合は
+loss前後の順序によらず新しい離散配送として通常通り受理する。
+
+native stamped keyの離散受理とcurrent-levelのfocus permitは従来のkeymap契約を維持する。
+受理済みtyped continuationのcommitに新しいkeyboard permitを要求していた外側gateも撤去する。
+close/modal/IME/keyboard ownerと、宛先・世代・layout・origin・canonical receipt・次frameの
+既存commit検査は維持し、兄弟からraw eventを収集しない。左右クリック・middleの既存受付と
+focus復帰クリック抑止、touch Start→Endのcontact/宛先継承は変更しない。横wheelはfactのみで
+通常の頁送りをしない。Extra1/2・browser履歴移動は従来のfocus条件とinstantのまま。
+
+利用者ログ36.197秒のUnattributedNavigation(5638)は、直前のfolder_history_backに対応する
+戻る側ボタンのcontext移動であり、wheel頁送りの証拠ではない。19.889/20.155/20.247/20.616秒の
+no_outgoing_paintはPointer IDが既に付いており、incoming resident素材確認後に現在unitの
+採用済みFlat snapshotが無かった別の拒否理由である。PDFのretained miss/LoadPendingと
+相方のthumbnail_not_loadedが直前にあり、表示合成のpaint未成立と整合する。ログにはfocusと
+receiptの証拠がないため、四件とfocus不具合の因果は断定しない。素材/receipt待ちを増やさず、
+adopt済みflatの無いケースを瞬時切替とする契約は維持する。
+
+変更は既存表示時計・raw配送・context presentationの所有境界を揃える構造修正であり、
+detached症状パッチではない。独立GPT-6.1 Sol/xhighの事前レビューで構造合意を得た。
+期限経過からの実slideshow開始/完走・全面表示間隔、手動送り中の間隔、短間隔/OFF/連結と、
+非フォーカスの実wheel・無入力frame・focusloss順序/replay・横wheel・兄弟宛先・continuationを回帰する。
+§1.242統合後の残件は§26.10のままとし、今回も統合検証しない。
+
+### 26.13 スライドショー・非フォーカス入力の検証記録
+
+新規13件を含むpage_turn199、実input handler20、slideshow16、keyboard_input16が成功。
+スライドショーはSingle/LTR/RTLの自動/手動送り、全面表示からの3秒、0.5秒<600msの瞬時切替、
+OFF/連結の既存時計を検査した。非フォーカスはROOT/child×Single/LTR/RTLの開始/完走、
+focusloss順序/replay、横wheelと兄弟source、実mountした兄弟の取消分離、受理済みPointer/
+Slideshow/native stamped-Keyの採用flat後・permit消滅後の一回commitを検査した。
+continuationの初回fixtureが通常のready通知を省略して失敗したため、productionと同じemitを
+追加した。同frame待機・observer退役・採用receipt・次frame commitのgateは緩めていない。
+normal/portable core check、fmt/glyph、viewer_context_auditも成功。独立GPT-6.1 Sol/xhighの
+最終レビューは承認、未解消P1/P2なし。通常build-devはcore/Remote/EPUBとruntime4 DLL・
+PE3 binary検査までexit0。coreは2026-10-14 04:18:14、325,590,016 bytes、FileVersion4.6.0.0。
+対象プロセスの停止・アプリ起動・コミットは行っていない。前回f33a93bb8の修正を含む現ソースで
+test-full -SuppressCrashDialogsをjobs1/threads8で一回実行しexit0（PASS）。本体12,422成功/
+既存57ignored、UI snapshot163、vendor egui25・egui-wgpu11・eframe18も成功した。
+コマンド/ログ/隔離確認手順は`target/A-1341-automatic-input-msg.txt`を参照する。

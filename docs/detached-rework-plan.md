@@ -4921,3 +4921,12 @@ entries/bytes上限を維持し、別contextのlive cache/pendingは変更しな
 ことに合意。詳細・回帰・検証はpage-turn plan §26.8へ記録する。
 同日の§26.10では完成CPU画素の取得と、通常描画/先読みの共通unit cache・派生位置索引を
 同context owner内で修正する。main/F12のviewport/predicateは変えず、独立レビューも構造修正に合意。
+
+### 2026-10-14 §1.341 スライドショーと非フォーカスの受信入力
+
+§2を再確認。旧頁deadlineを新頁のめくりadmissionへ流用せず、既存slideshow anchorを採用済み
+canonical flatから数える。非フォーカスwheelの元viewport配送を通常handlerと一致させ、
+既存PointerDeliveryで実focus-loss edgeを一度だけ処理する。ROOT lossはchildへ転送せず、
+continuationは既存の宛先/世代/receipt ownerでcommitする。host/placement/rect捕捉/生成述語を
+変更せず、新pending/bool/queue/時間窓を追加しない。独立GPT-6.1 Sol/xhigh事前レビューは
+所有境界を揃える構造修正でありdetached症状パッチではないことに合意した。詳細は§26.12。
