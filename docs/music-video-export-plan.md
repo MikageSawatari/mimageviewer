@@ -1027,7 +1027,7 @@ trace（scratchpad の `night\trace\main-2a.log` / `lab-2a.log`）では、本�
 18 件すべてが `egui=[None]`（egui へ何も渡していない）。未確認: detached viewer、MS-IME 等の他の IME、
 利用者の実機・実設定。
 
-**段 2b（設計案 第 4 版、2026-10-14 設計 lead。第 1 版 REVISE（P1 1・P2 2）、第 2 版 REVISE（P2 1・P3 1）、第 3 版 REVISE（P1 1・P2 1）。実装前）: 300ms grace を外し「変換中か」だけで判定する。**
+**段 2b（設計案 第 5 版、2026-10-14 設計 lead。第 1 版 REVISE（P1 1・P2 2）、第 2 版 REVISE（P2 1・P3 1）、第 3 版 REVISE（P1 1・P2 1）、第 4 版 REVISE（P2 1）。実装前）: 300ms grace を外し「変換中か」だけで判定する。**
 
 経緯と理由: `IME_EVENT_GRACE`（300ms）は「Windows が IME 終了（`Disabled` / `Commit`）と、IME が処理した
 Esc / Enter を別フレームで届ける」ことの吸収として入った（`App::ime_input_active` の doc、CLAUDE.md の IME 対応節）。
@@ -1072,6 +1072,21 @@ Esc / Enter を別フレームで届ける」ことの吸収として入った�
      - Tab はアプリ全体の Tab 方針が traversal を止めて focus を動かさないので、条件に入れない。
    - アプリのコードが意図して helper 欄の focus を外す箇所（`surrender_focus`）は、検索欄の Enter 決定後
      （`ui_main.rs` 15553 付近、Enter の pass）とテストだけ（2026-10-14 grep）で、新しい条件と衝突しない。
+   - **次 pass の再要求（retry latch）も同じ条件に従わせる（第 4 版 P2）。** いまの helper は復帰に成功すると
+     「次の pass でもう一度 `request_focus()`」の印を立て、次 pass で TextEdit の入力処理の後に無条件で使う
+     （`crates/egui-ime` 340 / 366 付近）。印は呼び出し側の `focus_request`（初回 focus 用の latch）があればそれに、
+     無ければ helper 所有の一時値に立てる。このため、復帰の次 pass に利用者が押した Enter / Esc で欄が focus を手放しても、
+     印が focus を取り戻し、検索欄の決定（`lost_focus()`）や Esc で抜ける動きが失われる。他の widget へ移った focus も奪う。
+     直し方: (1) helper は復帰の印を**呼び出し側の `focus_request` に書かない**。印は常に helper 所有の一時値
+     （viewport と widget の id で引く、今の `focus_retry_id`）に立てる。呼び出し側の `focus_request` は呼び出し側が明示した
+     初回 focus 等の要求としてだけ消費し、今までどおり無条件に `request_focus()` する。(2) helper 所有の印を次 pass で使うのは、
+     その pass でも上の復帰条件のうち「`lost_focus()`」以外（pointer 無し、他の widget に focus が無い、composing でなければ
+     Enter / Escape の press が無い）を満たし、かつ欄がまだ focus を持っていないときだけ。満たさなければ印を捨てる。
+     印は 1 pass 限りで、使っても捨てても消える（今と同じ寿命）。
+   - テスト: 復帰（Alt+J / `Disabled`）→ 次 pass の通常 Enter（検索欄で決定され focus を手放す）、→ 次 pass の通常 Esc
+     （欄を抜ける。同じ pass のキーは recovery claim が欄に所有させる）、→ 次 pass で他の widget が focus を取る、の 3 つを、
+     呼び出し側が `focus_request` を渡す欄（検索欄・native 欄）と渡さない欄（ラボの欄）の両方で固定する。呼び出し側の
+     初回 focus 要求が今までどおり効くことも固定する。
 2b. **native presenter のタグ選択欄は、今 pass の状態で判定する（第 1 版 P2）。** `render_core.rs` 12521 付近は
    `egui_ctx.run` の前（plugin が今 pass の Ime 列を反映する前）に `tag_picker_ime_active` を取っているので、
    前 pass が composing・今 pass が `[Commit, Disabled, 通常 Enter]` のとき Enter を捨てる。
