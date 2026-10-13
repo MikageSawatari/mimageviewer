@@ -1027,7 +1027,7 @@ trace（scratchpad の `night\trace\main-2a.log` / `lab-2a.log`）では、本�
 18 件すべてが `egui=[None]`（egui へ何も渡していない）。未確認: detached viewer、MS-IME 等の他の IME、
 利用者の実機・実設定。
 
-**段 2b（設計案、2026-10-14 設計 lead。独立レビュー前・実装前）: 300ms grace を外し「変換中か」だけで判定する。**
+**段 2b（設計案 第 2 版、2026-10-14 設計 lead。第 1 版は独立レビュー REVISE（P1 1・P2 2）。実装前）: 300ms grace を外し「変換中か」だけで判定する。**
 
 経緯と理由: `IME_EVENT_GRACE`（300ms）は「Windows が IME 終了（`Disabled` / `Commit`）と、IME が処理した
 Esc / Enter を別フレームで届ける」ことの吸収として入った（`App::ime_input_active` の doc、CLAUDE.md の IME 対応節）。
@@ -1041,18 +1041,37 @@ Esc / Enter を別フレームで届ける」ことの吸収として入った�
    決定として通り、`[Preedit]` の最中は抑止される。`ime_input_active_with_pending_events` は「未処理の Ime event がある
    または composing」とし（native presenter 用、queue 内の Ime を先取りする意味は変えない）、
    `ime_composing_with_pending_events` と同じ規則に揃えられるならそちらへ統合する。
-   `TextInputPhase::ImeGrace`（`src/keyboard_input.rs`）は「composing」へ名前と意味を変えるか、Focused / FocusRecovery に
-   吸収できるかを実装前に確認する（focus を持つ TextEdit は既に Focused で所有されるため）。
+   `TextInputPhase::ImeGrace`（`src/keyboard_input.rs`）は Focused / FocusRecovery に吸収せず、「composing」の段として
+   名前と意味を変えて残す（focus も recovery claim も無いまま composition だけが残る場合があるため、レビュー指摘）。
 2. **呼び出し側は原則変えない。** `dialog_enter_pressed`（30）・`dialog_escape_pressed`（68）・直接の
    `ime_input_active`（約 50）・native presenter・gamepad・musicvideo-ui の履歴ショートカットは、定義の変更だけで
    新しい規則になる。個別の分岐を足さない。grace を前提に「Commit と同じ pass の Enter を捨てる」ことを期待している
    箇所（`should_close_fullscreen_on_enter`、検索バーの `handle_keyboard` 抑止 `app.rs` 53715 付近、
    specified-scale の数値 popup、削除確認の Y/N）は、Process 遮断後も意味が通るかを 1 つずつ確かめ、
    不要になったものはコメントと分岐を消す。
-3. **3 つ目の入力経路にも同じ規則を入れる。** Win32 キー queue（`src/key_input.rs` の `key_edge_from_message`）は
+2a. **focus 復帰は grace ではなく「この pass に IME が関わったか」で判定する（第 1 版 P1）。** helper の
+   `restore_focus_for_ime_key`（`crates/egui-ime` 363 付近）は `lost_focus && ime_active && keyboard-only 入力` で
+   focus を戻しており、Alt+J と `Disabled` が同じ pass に来て一時的に focus が外れる経路
+   （`ime_alt_focus_loss_keeps_bookmark_editor_ownership_and_blocks_panel_toggle`）は grace の `ime_active` に依存している。
+   composing だけにするとこの復帰が失われ、編集中の focus を失う退行になる。そこで復帰条件の `ime_active` を、
+   plugin が pre-pass で記録する「pass 開始時に composing だった、またはこの pass の入力に Ime event があった」
+   （時刻を持たない、その pass 限りの値）に置き換える。この値は helper 内部の focus 復帰にだけ使い、
+   ショートカット抑止やダイアログの決定には使わない。通常の Enter 完了と pointer による focus 移動は今までどおり復帰しない。
+2b. **native presenter のタグ選択欄は、今 pass の状態で判定する（第 1 版 P2）。** `render_core.rs` 12521 付近は
+   `egui_ctx.run` の前（plugin が今 pass の Ime 列を反映する前）に `tag_picker_ime_active` を取っているので、
+   前 pass が composing・今 pass が `[Commit, Disabled, 通常 Enter]` のとき Enter を捨てる。
+   pending events を最終状態まで射影する `ime_composing_with_pending_events` を使うか、closure 内で plugin の
+   今 pass の値を読む。「未処理の Ime event が 1 つでもあれば active」の `ime_input_active_with_pending_events` は
+   射影版と意味が違うので、射影版へ統合する。
+3. **Win32 の生キー経路にも同じ規則を入れる。** Win32 キー queue（`src/key_input.rs` の `key_edge_from_message`）は
    `VK_PROCESSKEY`（0xE5）の edge も記録し、`KeyName::matches_win32` は JIS の ^ @ ¥ ろ を scan code だけで照合する
    （`src/keymap.rs` 861 付近）。変換中に打った ^ @ が grace / composing の gate の外でショートカットに一致しうる。
-   queue 側で 0xE5 の press を記録しない（egui-winit・native presenter と同じ「IME が処理したキーはアプリのキーではない」）。
+   queue 側で 0xE5 の press / repeat を記録しない（release は残す。押下保持の後始末に使うため）。
+   **native presenter の生キー経路も同じ（第 1 版 P2）**: `src/video/native_window.rs` 2223 付近は 0xE5 を含むすべての
+   key-down を公開し、`keymap.rs` の scan-code 照合（8341 / 9452 付近）へ届く。egui event への変換は
+   `egui_key_from_virtual_key` が 0xE5 を捨てているが、生キーのショートカット経路は捨てていない。ここでも
+   0xE5 の press / repeat を公開しない。これで「IME が処理したキーはアプリのキーではない」が egui-winit・
+   本体 Win32 queue・native presenter の egui 変換と生キーの 4 か所で同じになる。
 4. **段 2b の範囲外（残す）**: egui 本家の `remove_ime_incompatible_events`（pass 開始時の `ime_enabled` で
    Backspace・矢印・repeat を Commit より前に除くため、Commit と同じ pass の通常 Backspace / 矢印も消える既存挙動。
    upstream の不具合として別に扱う）、helper の focus 復帰と `return_key(None)`、空 Preedit の補い、アプリ全体の Tab 方針。
@@ -1061,11 +1080,18 @@ Esc / Enter を別フレームで届ける」ことの吸収として入った�
    `history_shortcuts_preserve_events_and_project_during_composition_and_grace_without_focus` など）を、
    「composing 中は抑止、Commit 後の同じ pass／次の pass の通常キーは通る」へ直す。代表ダイアログ（タグ編集・
    フォルダを開く・パスワード）で「確定→すぐ Enter で決定」「確定→すぐ Esc で閉じる」を handler-level で固定する。
-   Win32 queue の 0xE5 は edge 変換の単体テストで固定する。
+   Win32 queue と native 生キー経路の 0xE5（press / repeat は捨て release は残す、JIS ^ @ ¥ ろ の scan-code 照合に
+   届かない）を routing のテストで固定する。Alt/IME の focus 復帰テストは期待を変えずに残す。native presenter の
+   タグ選択欄で、前 pass composing・今 pass `[Commit, Disabled, 通常 Enter]` と、Commit の次 pass の通常 Enter の両方を
+   固定する。同じ ViewportId の viewport を閉じて開き直したときに composing が残らないこと（終端 event を失った場合）も
+   テストで確かめ、残るなら viewport の破棄・focus 喪失で composing を落とす（grace の時間切れでは元々直らない既存の欠陥。
+   その場合は修正範囲を報告して判断を仰ぐ）。
 6. **前提条件（実装前に満たす）: Google 日本語入力以外でも、確定の Enter・変換中の Esc が Process で届くこと。**
    この PC には MS-IME（TIP `{03B5835F-…}`）も登録されている。段 1 の trace 手順で MS-IME の 5 シナリオを記録し、
    確定の Enter が `logical=Named(Process)` で届くことを確かめる（通常の Enter で届く IME があると、grace を外すことで
-   「確定と同時にダイアログが決定される」退行になるため）。記録は利用者に依頼するか、利用者の了承を得て設計 lead が
+   「確定と同時にダイアログが決定される」退行になるため）。あわせて、文節を区切っての部分確定・予測候補の選択・
+   Alt を含む操作でも、IME が処理したキーが Process で届き、確定後に IME の候補が残っていてもキーが通常キーとして
+   漏れないことを記録で確かめる（composing は受け取った Ime event の写しで、候補ウィンドウの表示までは追わないため）。記録は利用者に依頼するか、利用者の了承を得て設計 lead が
    入力方式を一時的に切り替えて行う（終わったら元に戻す）。
 7. **状態を減らす方針との関係**: 時刻つきの状態（`last_event_at`）と、それに依存する「grace 中か」の分岐が消える。
    新しい状態は足さない。
