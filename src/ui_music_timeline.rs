@@ -1530,18 +1530,18 @@ fn vote_bass_root_hint(
     best_pitch_hint(votes, count)
 }
 
-fn vote_key_hint(bins: &[WaveformBin], track: &TimelineBassTrack) -> TimelineKeyHint {
+fn vote_key_hint(bins: &[WaveformBin], track: &TimelineBassTrack) -> Option<TimelineKeyHint> {
     let mut chroma = [0.0_f32; 12];
     let mut presence = [0.0_f32; 12];
     let mut total_weight = 0.0_f32;
     for bin in bins {
+        // Every selected bin is an input, even when its weight is zero. A
+        // missing frame must not turn an incomplete vote into a computed hint.
+        let frame_chroma = track.chroma_at_secs(bin.start_secs)?;
         let weight = key_chroma_bin_weight(bin);
         if weight <= 1.0e-5 {
             continue;
         }
-        let Some(frame_chroma) = track.chroma_at_secs(bin.start_secs) else {
-            continue;
-        };
         let bin_max = frame_chroma.iter().copied().fold(0.0_f32, f32::max);
         for (pc, value) in frame_chroma.iter().copied().enumerate() {
             let value = value.max(0.0);
@@ -1552,7 +1552,7 @@ fn vote_key_hint(bins: &[WaveformBin], track: &TimelineBassTrack) -> TimelineKey
         }
         total_weight += weight;
     }
-    profile_key_hint(chroma, presence, total_weight)
+    Some(profile_key_hint(chroma, presence, total_weight))
 }
 
 fn key_hint_at_time(
@@ -1565,14 +1565,19 @@ fn key_hint_at_time(
     }
     let window_start = time_secs - TIMELINE_KEY_WINDOW_SECS * 0.5;
     let window_end = time_secs + TIMELINE_KEY_WINDOW_SECS * 0.5;
-    // Validate every real frame before omitting silent/zero-weight bins.
-    // The track clips this interval to the actual PCM duration, including EOF rounding.
-    if !track.window_is_computed(window_start, window_end) {
-        return None;
-    }
     let start_idx = bins.partition_point(|bin| bin.start_secs + bin.duration_secs <= window_start);
     let end_idx = bins.partition_point(|bin| bin.start_secs < window_end);
-    Some(vote_key_hint(&bins[start_idx..end_idx], track))
+    let window_bins = &bins[start_idx..end_idx];
+    // The first overlapping bin reads chroma at its start, which can precede
+    // the seconds window and round to the previous segment. Include that
+    // reference as well as every real frame in the clipped six-second window.
+    let reference_start = window_bins
+        .first()
+        .map_or(window_start, |bin| window_start.min(bin.start_secs));
+    if !track.window_is_computed(reference_start, window_end) {
+        return None;
+    }
+    vote_key_hint(window_bins, track)
 }
 
 fn key_chroma_bin_weight(bin: &WaveformBin) -> f32 {
@@ -2623,6 +2628,98 @@ mod tests {
     }
 
     #[test]
+    fn key_window_production_bins_wait_for_referenced_segment_in_reverse_order() {
+        use music_core::bass::pitch_frame_at_secs;
+        const SAMPLE_RATE: usize = 48_000;
+        const PCM_FRAMES: usize = 40 * SAMPLE_RATE;
+        let frames_per_bin = (MUSIC_ANALYSIS_BIN_SECS.max(0.01) * SAMPLE_RATE as f64)
+            .round()
+            .max(1.0) as usize;
+        // Use analyze_stereo_timeline's sample-index division, not i * bin_secs:
+        // these differ at the half-hop boundary in floating-point arithmetic.
+        let mut bins: Vec<_> = (0..PCM_FRAMES)
+            .step_by(frames_per_bin)
+            .map(|frame_start| WaveformBin {
+                start_secs: frame_start as f64 / SAMPLE_RATE as f64,
+                duration_secs: ((frame_start + frames_per_bin).min(PCM_FRAMES) - frame_start)
+                    as f64
+                    / SAMPLE_RATE as f64,
+                loudness_db: -12.0,
+                ..Default::default()
+            })
+            .collect();
+        let center = 22.995;
+        let window_start = center - TIMELINE_KEY_WINDOW_SECS * 0.5;
+        let window_end = center + TIMELINE_KEY_WINDOW_SECS * 0.5;
+        let first = bins.partition_point(|bin| bin.start_secs + bin.duration_secs <= window_start);
+        assert_eq!(first, 1999);
+        assert_eq!(
+            (pitch_frame_at_secs(bins[first].start_secs) - 1) as usize,
+            999
+        );
+        assert_eq!((pitch_frame_at_secs(window_start) - 1) as usize, 1000);
+
+        for first_loudness in [-12.0, -100.0] {
+            bins[first].loudness_db = first_loudness;
+            let mut track = TimelineBassTrack::new(PCM_FRAMES, SAMPLE_RATE as u32);
+            assert!(track.merge_segment(key_segment(&track, 1, 2)));
+            // The second segment covers the rounded seconds window, but not the
+            // first overlapping bin's reference. Silence must not hide that gap.
+            assert!(track.window_is_computed(window_start, window_end));
+            assert!(track.chroma_at_secs(bins[first].start_secs).is_none());
+            assert!(key_hint_at_time(&bins, &track, center).is_none());
+
+            assert!(track.merge_segment(key_segment(&track, 0, 0)));
+            let completed = key_hint_at_time(&bins, &track, center).unwrap();
+            assert_eq!(
+                (completed.pitch_class, completed.mode),
+                (2, TimelineKeyMode::Major)
+            );
+            assert!(completed.confidence > 0.0);
+            assert!(track.merge_segment(key_segment(&track, 2, 7)));
+            let unchanged = key_hint_at_time(&bins, &track, center).unwrap();
+            assert_eq!(
+                (completed.pitch_class, completed.mode, completed.confidence),
+                (unchanged.pitch_class, unchanged.mode, unchanged.confidence)
+            );
+        }
+    }
+
+    #[test]
+    fn key_vote_rejects_missing_input_before_zero_weight_omission() {
+        let bins = [
+            WaveformBin {
+                start_secs: 19.98,
+                loudness_db: -12.0,
+                ..Default::default()
+            },
+            WaveformBin {
+                start_secs: 20.0,
+                loudness_db: -100.0,
+                ..Default::default()
+            },
+        ];
+        let mut track = TimelineBassTrack::new(40 * 48_000, 48_000);
+        assert!(track.merge_segment(key_segment(&track, 0, 2)));
+        assert!(vote_key_hint(&bins[..1], &track).is_some());
+        assert_eq!(key_chroma_bin_weight(&bins[1]), 0.0);
+        assert!(track.chroma_at_secs(bins[1].start_secs).is_none());
+        // Reject the whole vote even after accumulating a positive-weight bin.
+        assert!(vote_key_hint(&bins, &track).is_none());
+        assert!(track.merge_segment(key_segment(&track, 1, 0)));
+        let completed = vote_key_hint(&bins, &track).unwrap();
+        let weighted_only = vote_key_hint(&bins[..1], &track).unwrap();
+        assert_eq!(
+            (completed.pitch_class, completed.mode, completed.confidence),
+            (
+                weighted_only.pitch_class,
+                weighted_only.mode,
+                weighted_only.confidence
+            )
+        );
+    }
+
+    #[test]
     fn key_raster_distinguishes_pending_silent_and_pitched_without_old_chroma() {
         let mut track = TimelineBassTrack::new(40 * 48_000, 48_000);
         assert!(track.merge_segment(key_segment(&track, 0, 0)));
@@ -2967,7 +3064,7 @@ mod tests {
                     ));
                 }
                 let window_hint = key_hint_at_time(&analysis.bins, &track, 4.0).unwrap();
-                let hint = vote_key_hint(&analysis.bins, &track);
+                let hint = vote_key_hint(&analysis.bins, &track).unwrap();
                 let start = analysis
                     .bins
                     .partition_point(|bin| bin.start_secs + bin.duration_secs <= 1.0);
@@ -2983,7 +3080,7 @@ mod tests {
                         ..*bin
                     })
                     .collect();
-                let unpenalized = vote_key_hint(&no_percussion, &track);
+                let unpenalized = vote_key_hint(&no_percussion, &track).unwrap();
                 let unpenalized_window = key_hint_at_time(&no_percussion, &track, 4.0).unwrap();
                 println!(
                     "key_progression {label} root={root} expected={mode:?} full_new={hint:?} full_no_percussion={unpenalized:?} full_legacy={legacy:?} window_new={window_hint:?} window_no_percussion={unpenalized_window:?} window_legacy={legacy_window:?}"
