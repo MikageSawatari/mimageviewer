@@ -6071,15 +6071,18 @@ mod tests {
         harness.snapshot("preferences_final_cover_spread_setting");
     }
 
-    #[test]
-    fn singleton_spread_placement_setting_snapshot() {
-        let mut first_enabled = true;
-        let mut last_enabled = false;
+    fn singleton_spread_placement_setting_snapshot_with_theme(
+        name: &str,
+        theme: crate::os_theme::ResolvedTheme,
+        animation_enabled: bool,
+    ) {
+        let mut first_enabled = false;
+        let mut last_enabled = true;
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
-            .with_size(egui::vec2(540.0, 130.0))
+            .with_size(egui::vec2(540.0, 180.0))
             .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                crate::os_theme::apply_resolved(ctx, theme);
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
                     fonts_ready = true;
@@ -6092,11 +6095,48 @@ mod tests {
                         ui,
                         &mut first_enabled,
                         &mut last_enabled,
+                        animation_enabled,
                     );
                 });
             });
         harness.run();
-        harness.snapshot("preferences_singleton_spread_placement_setting");
+        harness.snapshot(name);
+    }
+
+    #[test]
+    fn singleton_spread_placement_setting_snapshot() {
+        singleton_spread_placement_setting_snapshot_with_theme(
+            "preferences_singleton_spread_placement_setting",
+            crate::os_theme::ResolvedTheme::Dark,
+            false,
+        );
+    }
+
+    #[test]
+    fn singleton_spread_placement_setting_snapshot_light_off() {
+        singleton_spread_placement_setting_snapshot_with_theme(
+            "preferences_singleton_spread_placement_setting_light_off",
+            crate::os_theme::ResolvedTheme::Light,
+            false,
+        );
+    }
+
+    #[test]
+    fn singleton_spread_placement_setting_snapshot_light_on() {
+        singleton_spread_placement_setting_snapshot_with_theme(
+            "preferences_singleton_spread_placement_setting_light_on",
+            crate::os_theme::ResolvedTheme::Light,
+            true,
+        );
+    }
+
+    #[test]
+    fn singleton_spread_placement_setting_snapshot_dark_on() {
+        singleton_spread_placement_setting_snapshot_with_theme(
+            "preferences_singleton_spread_placement_setting_dark_on",
+            crate::os_theme::ResolvedTheme::Dark,
+            true,
+        );
     }
 
     fn still_seek_strip_height_settings_snapshot(size: egui::Vec2, name: &str) {

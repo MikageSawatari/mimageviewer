@@ -1,6 +1,6 @@
 # ページめくりアニメーション設計案 — backlog §1.341
 
-2026-10-13改訂：単頁サイズ差は共通の黒い紙、local pagedの先頭配置はアニメーションON時の実効ON（§26）を優先する。§25の暫定単頁spine比較は撤去する。
+2026-10-13改訂：単頁サイズ差は共通の黒い紙、local pagedの先頭・末尾配置はアニメーションON時の実効ON（§26）を優先する。両端の配置UIは実効値で無効化し、末尾の補助表紙Pairも対象にする。§25の暫定単頁spine比較は撤去する。
 
 2026-10-11 / **R7設計ACCEPT（`fa5119c19`、Stage 1自動検証・確認用build済、実機評価待ち・§19）**。採択済みR7に従い、まず通常単頁と二実頁Pairのleaf・陰影・per-page geometryを既存A0へ接続し、利用者のmotion評価用buildを作った。§19時点ではcover/中央単頁/split等の対応を後段に残した。§24で通常の中央/片側singletonと横長への対応を追加する。R3統合後のA0は利用者の実機評価で不合格。R4 `afc474d8d`・R5 `c73f0d857`・R6 `29291d496`はREVISE、R7の独立設計レビューACCEPTは利用者から伝達された。§1〜17は履歴で、衝突箇所は§18、段階実装の範囲は§19を優先する。既定OFF・仮時間・F12所有・VRAM会計を維持。readinessは2026-10-11利用者決定の§22でresident displayableへ置換し、Pairの移動背とpin上限は§23、横長・通常singletonは§24を正本とする。実装の独立完了レビュー・実機motion/性能受入れ・最終時間は未了。2026-10-11の次の次の版への延期を、2026-10-12利用者決定で次の版を目指して継続する方針へ改訂した（採用は進捗を見て判断、§24）。
 
@@ -2124,9 +2124,9 @@ core・remote service・EPUB workerの生成とruntime 4 DLL / PE 3 binary検査
 アプリ起動・実設定操作・git add/commitは行わず、mergeの登録とコミットはcoordinatorへ引き継ぐ。
 利用者の隔離`--data-dir .\target\dev-runtime\data --perf-log`比較手順は今回の記録に用意した。
 
-## 26. 2026-10-13 採用改訂：共通の黒い紙と実効先頭配置
+## 26. 2026-10-13 採用改訂：共通の黒い紙と実効両端配置
 
-本節を単頁サイズ差と先頭配置の現行仕様とする。§25の案A / Movingは比較の履歴であり、
+本節を単頁サイズ差と両端配置の現行仕様とする。§25の案A / Movingは比較の履歴であり、
 両方とも撤去する。利用者の実機確認で、広い頁から狭い頁へMovingで移る変形に違和感があった。
 異なる背・紙サイズ・floor移動の組み合わせを増やすより、同じ大きさの紙に揃えて状態を減らす。
 
@@ -2150,14 +2150,17 @@ core・remote service・EPUB workerの生成とruntime 4 DLL / PE 3 binary検査
 暫定`page_turn_single_spine`、`SinglePageTurnSpine`、比較UI/検索・説明・比較snapshotは撤去する。
 未リリース設定なのでmigrationは作らず、古い保存keyは通常の未知keyとして読み捨てる。
 
-### 26.2 local pagedの先頭配置を実効ONにする
+### 26.2 local pagedの両端配置を実効ONにする
 
-local paged見開きのcomposition構築だけで、アニメーションON時にendpoint.firstをtrueにする。
+local paged見開きのcomposition構築だけで、アニメーションON時にendpoint.first/lastをtrueにする。
 全体保存値・本別FollowGlobal/Place/Centerを変更しない。OFFでは保存値による実効値へ戻る。
 既存complete-book / UnpairedSlotの適格条件は維持する。shared resolver、連結読み、Remote、
-本別設定getterは保存値を扱うままにする。末尾は強制しない。
-環境設定とマニュアルに「ページめくりアニメーションが ON の間は先頭は本来の側に置きます」
-を表示し、PCのページ表示に適用する範囲も説明する。
+本別設定getterは保存値を扱うままにする。2026-10-13の利用者決定で末尾も先頭と揃える。
+環境設定の両端checkboxはON中に実効trueを表示して無効化する。表示用の値を保存値へ戻さない。
+OFFでは保存値の表示・操作へ戻る。本別HUDの両端指定もlocal paged/ON中は実効Placeを表示して
+無効化し、FollowGlobal/Place/Centerの保存値を変更しない。他の見開き調整は維持する。
+理由を近くに表示し、検索・マニュアル・snapshotを揃える。連結読み/Remoteの本別指定は
+強制の対象外なので、その保存値を扱うUIも変更しない。
 
 ON/OFFはcomposition geometry変更として既存の全context設定取消へ集約する。
 mounted/parkedの未配送readyと旧Flatを退役し、Completingの採用済receiptもNeedFlatへ戻す。
@@ -2175,13 +2178,15 @@ accept / outgoing canonical / incoming canonical / recipeのどこで拒否す�
 変更前の表紙guardは中央/sideともcanonical化で`stage1_portrait_cover`を返していた。
 強制sideだけではこのguardは消えないため、実builderのfirst unit、UnpairedSlot、cover mode、
 Navigation occurrenceの一致と通常compositionが解いたRight/Leftに基づいて表紙を許可する。
-中央の未証明表紙へbody用fallbackの左右を当てはめない。補助頁/white、分割、未適格構成の
-既存拒否は保持する。軽い通常ログは一操作のskip時だけ理由/sub_checkを記録し毎frame出さない。
+中央の未証明表紙へbody用fallbackの左右を当てはめない。white、分割、未適格構成の
+既存拒否は保持する。補助表紙の受理は§26.6で改訂する。軽い通常ログは一操作のskip時だけ
+理由/sub_checkを記録し毎frame出さない。
 
 実builder回帰は表紙LTR/RTL×前後、ON/OFF保存値・本別設定保持、連結/Remote非変更、
 縦長⇔横長×LTR/RTL×前後、黒余白/画像UV/可視性/終端を検査する。画像は利用者の本を縮小した
 12頁fixture（4/7/8横長）を使い、末尾singleton確認には11頁派生を使う。
-末尾は中央/side×補助ON/OFFで同じ診断を行い、強制変更せず原因と実際のrecipe結果だけを報告する。
+末尾は中央/side×補助ON/OFFで同じ診断を行う。前回の診断結果は§26.4に履歴として残し、
+今回の実効末尾配置・補助表紙付きPairの回帰は§26.6へ記録する。
 独立設計レビュー後に実装し、関連回帰・snapshot・fmt/check・glyph・全体gate・通常build-devを行う。
 コミットと実機採択はcoordinator/利用者へ残し、エージェントはアプリを起動しない。
 
@@ -2219,3 +2224,59 @@ core/remote/EPUBとruntime4 DLL / PE3 binary検査を通した。coreは2026-10-
 325,658,112 bytes / FileVersion4.6.0.0。portable featureを有効にせず、起動もしない。
 command/feature/profile/結果と隔離確認手順は`target/A-1341-black-paper-msg.txt`に記録する。
 コミット・アプリ起動・実データ変更は行わない。motion/性能の採択はcoordinator/利用者へ残す。
+
+### 26.6 2026-10-13 末尾配置・UI・補助表紙の追加採用
+
+前回の共通黒paperと表紙の実効配置について、利用者は実機で「アニメーションよさそう」と
+報告した。今回も状態の組み合わせを減らす方針を継続し、末尾も本来の側へ揃える。
+旧§26.4の「末尾は強制しない」「補助は拒否」は前回時点の診断であり、現行仕様ではない。
+
+共通builderの補助条件は、表紙ありmode・補助設定ON・完全な単本のcanonical列・現在が末尾unit・
+先頭unitと末尾unitがともに一枚・現在のnavigation頁が末尾unitと一致・表紙idxが末尾anchorと
+異なること。単に最終画像が一枚という条件ではない。横長等のsingletonもこの判定に含まれ、
+ForcedLastの白い相手枠には表紙が入り、通常のsingletonでは読書方向どおりの二枚を構成する。
+この既存条件を今回変更しない。navigation/seek列は一枚の末尾anchorを保持する。
+
+アニメーション受理はNavigation一枚＋FrontCoverSupplement一枚の実画像Pairを許可する。
+通常描画のrole/occurrence・resident source・texture leaseをそのまま使い、recipe/投影/receiptも
+通常Pairと共通にする。補助idxをnavigationへ変換しない。同じ表紙textureを再利用しても役割と
+末尾anchorを保持する。受理時に未residentなら既存readiness規則でinstantとし、UI同期decodeや
+専用upload/pending/queue/ownerを追加しない。whiteや他のcompanionの拒否は維持する。
+
+実builderから前のunit→補助付き末尾Pairと逆方向をLTR/RTLで通常描画・実handler・完走まで
+検査する。補助表紙のtexture/role、末尾anchor・visibility・終端通常flat、白companion拒否を
+回帰に含める。両端ON/OFF・全体/本別保存値保持・連結読み/Remote非変更、環境設定とHUDの
+無効化・実効表示・OFF復帰を検査する。独立レビュー、関連回帰/snapshot、fmt/check/glyph、
+通常build-devの後、最後にtest-fullを一回行う。アプリ起動とコミットはしない。
+
+### 26.7 2026-10-14 末尾追補の実装・検証記録
+
+local paged compositionでfirst/lastをともに実効ONにし、全体と本別の保存getterは変更しない。
+環境設定は一時的なtrueをdisabled checkboxへ渡し、paged本別HUDは保存choiceを保持したまま
+実効Placeをdisabledで示す。OFFで保存値の表示・操作を復帰する。連結HUD/Remoteは保存値を扱う。
+検索索引の実ラベルとの一致と両端/無効化/保存値/Remoteの検索到達性も回帰で確認した。
+
+補助PairはNavigation一枚＋FrontCoverSupplement一枚・共通anchor・Navigation idx=anchor・
+異なるsource idx・cover modeを、受理/retained outgoing/Offered matchingの同じpredicateで証明する。
+builderの補助適格条件は§26.6のままで、既存通常描画が生成したprocessed/fallbackのresident素材を
+使う。raw decode cacheのtexture IDと同一とは仮定しない。追加decode/uploadやownerを作らない。
+実builderの11頁末尾16経路、横長/ForcedLast、2頁の同じ表紙textureの役割別再利用、canonical
+receipt/visibility/終端を確認した。12頁本の末尾は通常Pair、whiteは引き続き拒否する。
+両端global独立boolと本別独立3choiceの72fixtureでOFF→ON→OFF、実layoutと連結/Remoteを検査した。
+
+関連page_turn182件、singleton11件、preferences181件が成功。設定4枚とHUD4枚のgoldenを生成し、
+独立レビューでも目視確認した。標準disabled opacityを二重に薄くせず、HUDの最終行まで収める。
+非UPDATEのUI snapshot全163件、normal/portable core check、fmt/glyph、context監査が成功した。
+独立GPT-6.1 Sol / xhighの設計・最終レビューはACCEPT、P1/P2無し。
+
+normal `build-dev.ps1 -PreserveRuntime`は通信中断後の再実行でexit0。core/Remote/EPUBとruntime
+検査まで成功し、coreは2026-10-13 23:23:51、325,668,864 bytes、FileVersion4.6.0.0。
+アプリ起動・コミットは行わず、隔離data-dirと11頁コピーの場所を検証台帳へ記録した。
+
+最後の`test-full.ps1 -SuppressCrashDialogs`はjobs1/threads8で一回実行し、exit101。
+本体12,386成功・1失敗・57ignored、UI snapshot163成功、他のworkspace/integration/docは成功した。
+変更していない音声の`zero_start_pump_trims_latency_and_preserves_samples_through_eos_loop_and_seek`
+がrate=48000/phase=0でaudio_tail_completeの3秒待機期限に達した。同テストの単独一回は0.34秒で
+成功したが、全体失敗の原因確定や全体PASSとは扱わない。音声sourceや待機期限は変更していない。
+workspace非ゼロによりscript後半のvendor gateは今回は未実行。全体gateの再実行はしない。
+詳細・コマンド・ログ・binary SHAと隔離確認手順は`target/A-1341-terminal-msg.txt`を参照する。

@@ -108,6 +108,43 @@ fn cover_side(mode: SpreadMode) -> SingletonSpreadPlacement {
     }
 }
 
+fn tail_side(mode: SpreadMode) -> SingletonSpreadPlacement {
+    if mode.is_rtl() {
+        SingletonSpreadPlacement::Right
+    } else {
+        SingletonSpreadPlacement::Left
+    }
+}
+
+fn assert_resident_preparation(app: &mut App, unit: &PaintedUnit, anchor: usize) {
+    let composition = app.spread_display_composition_for_anchor(anchor);
+    let screen = composition.pages_in_screen_order(app.spread_mode);
+    assert_eq!(composition.navigation_anchor_idx(), anchor);
+    assert_eq!(unit.pages.len(), screen.len());
+    for (page, occurrence) in unit.pages.iter().zip(screen) {
+        assert_eq!(page.occurrence, occurrence);
+        assert_eq!(page.occurrence.navigation_anchor_idx, anchor);
+        // Ordinary drawing can already have published a processed final source;
+        // the resident selector, rather than the raw decode cache, owns identity.
+        let (tex, _) = app
+            .page_turn_resident_source(occurrence.idx)
+            .unwrap_or_else(|| panic!("resident ordinary source for {occurrence:?}"));
+        assert_eq!(page.resource.source_texture_id(), tex.id());
+        assert!(page.transform.paint_rect.area() > 0.0);
+    }
+}
+
+fn assert_canonical_receipt(receipt: &SubmittedUnitReceipt, unit: &PaintedUnit) {
+    assert!(!receipt.curl);
+    assert_eq!(receipt.pages().len(), unit.pages.len());
+    for ((occurrence, source, native, area), page) in receipt.pages().iter().zip(&unit.pages) {
+        assert_eq!(*occurrence, page.occurrence);
+        assert_eq!(*source, page.resource.source_texture_id());
+        assert_eq!(*native, page.resource.paint_texture_id());
+        assert!(*area > 0.0, "each real occurrence must be visible");
+    }
+}
+
 fn actual_side(transform: &DisplayedImageTransform) -> SingletonSpreadPlacement {
     match transform.placement {
         ResolvedDisplayPlacement::SingletonSpread { side, .. } => side,
@@ -131,10 +168,7 @@ fn diagnosis(outgoing: &PaintedUnit, incoming: &PaintedUnit) -> BoundaryDiagnosi
     for (unit, target) in [(incoming, true), (outgoing, false)] {
         if let Some(reason) = stage_one_shape_reason(
             unit.mode,
-            unit.pages.len(),
-            unit.pages
-                .iter()
-                .any(|p| p.occurrence.role != SpreadPageRole::Navigation),
+            unit.pages.iter().map(|p| p.occurrence),
             unit.white.is_some(),
         ) {
             return if target {
@@ -163,6 +197,8 @@ fn navigate(
 ) {
     let incoming = capture(ctx, app, to);
     let outgoing = capture(ctx, app, from);
+    assert_resident_preparation(app, &incoming, to);
+    assert_resident_preparation(app, &outgoing, from);
     assert_eq!(diagnosis(&outgoing, &incoming), expected, "{from}->{to}");
     take_test_events();
     let operation = ViewerOperationId::Slideshow(next_operation_batch());
@@ -202,9 +238,26 @@ fn navigate(
     });
     // Started is adopted by the final-output hook, after ctx.run returns.
     let tracker = if expected == BoundaryDiagnosis::Ready {
-        let PresentationState::Turning { offer, .. } = &mut app.page_turn_presentation.state else {
+        let PresentationState::Turning {
+            incoming: actual,
+            offer,
+            ..
+        } = &mut app.page_turn_presentation.state
+        else {
             panic!("started turn {from}->{to}");
         };
+        assert_eq!(
+            actual
+                .pages
+                .iter()
+                .map(|p| p.occurrence)
+                .collect::<Vec<_>>(),
+            incoming
+                .pages
+                .iter()
+                .map(|p| p.occurrence)
+                .collect::<Vec<_>>()
+        );
         assert_eq!(offer.forward, forward);
         assert_eq!(offer.submission.status(), SubmissionStatus::Started);
         offer.accepted_at -= offer.duration + Duration::from_millis(1);
@@ -220,6 +273,8 @@ fn navigate(
                 panic!("canonical finish");
             };
             assert!(!receipt.curl);
+            assert_canonical_receipt(&receipt, &incoming);
+            assert_eq!(app.fullscreen_idx, Some(to));
         });
         assert_eq!(tracker.status(), SubmissionStatus::Finished);
     }
@@ -240,6 +295,14 @@ fn navigate(
                 !events
                     .iter()
                     .any(|(_, k, _)| matches!(*k, "skip" | "cancel"))
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|(_, k, _)| *k == "first_visible")
+                    .count(),
+                incoming.pages.len(),
+                "visibility must include every real presentation occurrence: {events:?}"
             );
         }
         BoundaryDiagnosis::OutgoingCanonical(_) | BoundaryDiagnosis::IncomingCanonical(_) => {
@@ -340,7 +403,7 @@ fn page_turn_reported_twelve_page_tail_remains_pair_with_or_without_supplement()
 }
 
 #[test]
-fn page_turn_tail_singleton_supplement_diagnoses_admission_without_changing_builder() {
+fn page_turn_tail_singleton_and_supplement_sixteen_routes_start_and_complete() {
     let mut routes = 0;
     for mode in [SpreadMode::LtrCover, SpreadMode::RtlCover] {
         for side in [false, true] {
@@ -350,8 +413,12 @@ fn page_turn_tail_singleton_supplement_diagnoses_admission_without_changing_buil
                     let mut app = book(&ctx, mode, 11, side, side, supplement);
                     let units =
                         app.build_spread_display_units_for_nav(&(0..11).collect::<Vec<_>>());
+                    assert_eq!(units.first().unwrap().pages, vec![0]);
                     assert_eq!(units.last().unwrap().pages, vec![10]);
+                    assert!(app.spread_complete_book_eligible(&(0..11).collect::<Vec<_>>()));
                     let tail = app.spread_display_composition_for_anchor(10);
+                    assert_eq!(tail.navigation_anchor_idx(), 10);
+                    assert_eq!(tail.navigation_pages(), vec![10]);
                     assert_eq!(
                         tail.pages_in_reading_order().len(),
                         if supplement { 2 } else { 1 }
@@ -362,20 +429,25 @@ fn page_turn_tail_singleton_supplement_diagnoses_admission_without_changing_buil
                             .any(|p| p.role == SpreadPageRole::FrontCoverSupplement),
                         supplement
                     );
-                    let expected = if !supplement {
-                        BoundaryDiagnosis::Ready
-                    } else if forward {
-                        BoundaryDiagnosis::TargetAdmission("stage1_cover_or_single_companion")
+                    if supplement {
+                        assert_eq!(
+                            tail.pages_in_reading_order(),
+                            &[
+                                SpreadPageOccurrence::navigation(10, 10),
+                                SpreadPageOccurrence::final_cover_supplement(0, 10),
+                            ]
+                        );
+                        assert_eq!(tail.singleton_placement(), SingletonSpreadPlacement::Center);
                     } else {
-                        BoundaryDiagnosis::OutgoingAdmission("stage1_cover_or_single_companion")
-                    };
+                        assert_eq!(tail.singleton_placement(), tail_side(mode));
+                    }
                     navigate(
                         &ctx,
                         &mut app,
                         if forward { 8 } else { 10 },
                         if forward { 10 } else { 8 },
                         forward,
-                        expected,
+                        BoundaryDiagnosis::Ready,
                     );
                     routes += 1;
                 }
@@ -386,82 +458,243 @@ fn page_turn_tail_singleton_supplement_diagnoses_admission_without_changing_buil
 }
 
 #[test]
-fn page_turn_first_placement_override_keeps_saved_global_and_book_values_and_other_readers() {
+fn page_turn_supplemented_landscape_and_forced_last_preserve_builder_roles() {
+    for mode in [SpreadMode::LtrCover, SpreadMode::RtlCover] {
+        for landscape in [false, true] {
+            for forced_last in [false, true] {
+                let ctx = egui::Context::default();
+                let mut app = book(&ctx, mode, 11, false, false, false);
+                // The book override also admits supplementation while the
+                // global setting is OFF, without changing either saved value.
+                app.final_cover_spread_preference = crate::settings::FinalCoverSpreadPreference::On;
+                app.settings.last_page_alone_enabled = forced_last;
+                if landscape {
+                    let image = egui::ColorImage::filled([170, 120], egui::Color32::BLUE);
+                    let tex = ctx.load_texture(
+                        "landscape-tail",
+                        image.clone(),
+                        egui::TextureOptions::LINEAR,
+                    );
+                    app.fs_cache.insert(
+                        10,
+                        FsCacheEntry::Static {
+                            tex,
+                            pixels: Arc::new(image),
+                            source_dims: Some([170, 120]),
+                            load_seq: 1,
+                            animation: crate::fs_animation::StaticAnimationState::Still,
+                        },
+                    );
+                    app.record_page_dims_for_spread(10, (170, 120));
+                    app.reconcile_spread_landscapes_from_rotation_cache();
+                }
+                let nav = (0..11).collect::<Vec<_>>();
+                let units = app.build_spread_display_units_for_nav(&nav);
+                assert!(app.spread_complete_book_eligible(&nav));
+                assert_eq!(units.first().unwrap().pages, vec![0]);
+                assert_eq!(units.last().unwrap().pages, vec![10]);
+                let tail = app.spread_display_composition_for_anchor(10);
+                assert_eq!(tail.navigation_pages(), vec![10]);
+                assert_eq!(
+                    tail.pages_in_reading_order(),
+                    &[
+                        SpreadPageOccurrence::navigation(10, 10),
+                        SpreadPageOccurrence::final_cover_supplement(0, 10),
+                    ]
+                );
+                assert_eq!(tail.singleton_placement(), SingletonSpreadPlacement::Center);
+                if forced_last {
+                    let SpreadDisplayUnitFormation::Singleton(
+                        SpreadDisplaySingletonCause::ForcedLast(side),
+                    ) = units.last().unwrap().formation
+                    else {
+                        panic!("the real builder must retain ForcedLast");
+                    };
+                    assert_eq!(tail.supplemented_navigation_side, Some(side));
+                    let screen = tail.pages_in_screen_order(mode);
+                    assert_eq!(
+                        screen[usize::from(side == SingletonSpreadPlacement::Right)].idx,
+                        10
+                    );
+                } else {
+                    assert_eq!(tail.supplemented_navigation_side, None);
+                    assert_eq!(
+                        tail.pages_in_screen_order(mode)[usize::from(mode.is_rtl())].idx,
+                        10
+                    );
+                }
+                for (from, to, forward) in [(8, 10, true), (10, 8, false)] {
+                    navigate(&ctx, &mut app, from, to, forward, BoundaryDiagnosis::Ready);
+                }
+                assert!(!app.settings.final_cover_spread_enabled);
+                assert_eq!(
+                    app.final_cover_spread_preference,
+                    crate::settings::FinalCoverSpreadPreference::On
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn page_turn_two_page_book_reuses_cover_texture_without_reusing_occurrence() {
+    for mode in [SpreadMode::LtrCover, SpreadMode::RtlCover] {
+        let ctx = egui::Context::default();
+        let mut app = book(&ctx, mode, 2, false, false, true);
+        let cover = capture(&ctx, &mut app, 0);
+        let tail = capture(&ctx, &mut app, 1);
+        let supplement = tail
+            .pages
+            .iter()
+            .find(|p| p.occurrence.role == SpreadPageRole::FrontCoverSupplement)
+            .unwrap();
+        assert_eq!(
+            cover.pages[0].occurrence,
+            SpreadPageOccurrence::navigation(0, 0)
+        );
+        assert_eq!(
+            supplement.occurrence,
+            SpreadPageOccurrence::final_cover_supplement(0, 1)
+        );
+        assert_eq!(
+            cover.pages[0].resource.source_texture_id(),
+            supplement.resource.source_texture_id()
+        );
+        for (from, to, forward) in [(0, 1, true), (1, 0, false)] {
+            navigate(&ctx, &mut app, from, to, forward, BoundaryDiagnosis::Ready);
+        }
+    }
+}
+
+#[test]
+fn page_turn_white_forced_last_companion_remains_rejected() {
+    for mode in [SpreadMode::LtrCover, SpreadMode::RtlCover] {
+        let ctx = egui::Context::default();
+        let mut app = book(&ctx, mode, 11, false, false, false);
+        app.settings.last_page_alone_enabled = true;
+        let tail = app.spread_display_composition_for_anchor(10);
+        assert!(tail.singleton_placement().has_white_companion());
+        assert_eq!(
+            tail.pages_in_reading_order(),
+            &[SpreadPageOccurrence::navigation(10, 10)]
+        );
+        navigate(
+            &ctx,
+            &mut app,
+            10,
+            8,
+            false,
+            BoundaryDiagnosis::OutgoingAdmission("stage1_cover_or_single_companion"),
+        );
+    }
+}
+
+#[test]
+fn page_turn_endpoint_override_keeps_saved_global_and_book_values_and_other_readers() {
     use crate::settings::SingletonSpreadPlacementPreference::{Center, FollowGlobal, Place};
     for mode in [SpreadMode::LtrCover, SpreadMode::RtlCover] {
         for saved_first in [false, true] {
-            for first_preference in [FollowGlobal, Place, Center] {
-                let ctx = egui::Context::default();
-                let mut app = book(&ctx, mode, 12, saved_first, true, false);
-                app.singleton_spread_endpoint_preferences.first = first_preference;
-                app.singleton_spread_endpoint_preferences.last = Center;
-                let saved_preferences = app.singleton_spread_endpoint_preferences;
-                let saved_effective_first = first_preference.effective(saved_first);
-                let saved_side = if saved_effective_first {
-                    cover_side(mode)
-                } else {
-                    SingletonSpreadPlacement::Center
-                };
-                for enabled in [false, true, false] {
-                    let mut settings = app.settings.clone();
-                    settings.page_turn_animation_enabled = enabled;
-                    app.install_preferences_settings(settings);
-                    app.reading_flow = ReadingFlow::Paged;
-                    let expected = if enabled {
-                        cover_side(mode)
-                    } else {
-                        saved_side
-                    };
-                    assert_eq!(
-                        app.spread_display_composition_for_anchor(0)
-                            .singleton_placement(),
-                        expected
-                    );
-                    frame(&ctx, |ui, ctx| {
-                        app.begin_page_turn_viewer_frame(ctx, false, None);
-                        draw_observed(&mut app, ui, ctx);
-                        assert_eq!(
-                            actual_side(
-                                &app.fullscreen_page_layout.single_page().unwrap().transform
-                            ),
-                            expected
-                        );
-                    });
-                    assert_eq!(app.settings.singleton_spread_first_enabled, saved_first);
-                    assert!(app.settings.singleton_spread_last_enabled);
-                    assert_eq!(app.singleton_spread_endpoint_preferences, saved_preferences);
-                    let saved_endpoints = app.singleton_spread_placement_enabled_for_current_book();
-                    assert_eq!(saved_endpoints.first, saved_effective_first);
-                    assert!(!saved_endpoints.last);
-
-                    let remote = build_remote_spread_page_groups_with_shift(
-                        &app.items,
-                        mode,
-                        &(0..12)
-                            .map(|idx| [3, 6, 7].contains(&idx))
-                            .collect::<Vec<_>>(),
-                        false,
-                        saved_endpoints,
-                        crate::settings::PageAloneSettings::default(),
-                        true,
-                        None,
-                    );
-                    assert_eq!(remote[0].indices, vec![0]);
-                    assert_eq!(remote[0].singleton_placement, saved_side);
-                    for flow in [ReadingFlow::Vertical, ReadingFlow::Horizontal] {
-                        app.reading_flow = flow;
-                        assert!(app.continuous_reading_active_for_idx(0));
-                        assert_eq!(
-                            app.spread_display_composition_for_anchor(0)
-                                .singleton_placement(),
-                            saved_side
-                        );
-                        let (units, pos) = app.continuous_reading_units_and_pos(0).unwrap();
-                        assert_eq!(pos, 0);
-                        assert_eq!(units[0].anchor_idx, 0);
-                        assert_eq!(units[0].singleton_placement, saved_side);
+            for saved_last in [false, true] {
+                for first_preference in [FollowGlobal, Place, Center] {
+                    for last_preference in [FollowGlobal, Place, Center] {
+                        let ctx = egui::Context::default();
+                        let mut app = book(&ctx, mode, 11, saved_first, saved_last, false);
+                        app.singleton_spread_endpoint_preferences.first = first_preference;
+                        app.singleton_spread_endpoint_preferences.last = last_preference;
+                        let saved_preferences = app.singleton_spread_endpoint_preferences;
+                        let saved_sides = [
+                            if first_preference.effective(saved_first) {
+                                cover_side(mode)
+                            } else {
+                                SingletonSpreadPlacement::Center
+                            },
+                            if last_preference.effective(saved_last) {
+                                tail_side(mode)
+                            } else {
+                                SingletonSpreadPlacement::Center
+                            },
+                        ];
+                        for enabled in [false, true, false] {
+                            let mut settings = app.settings.clone();
+                            settings.page_turn_animation_enabled = enabled;
+                            app.install_preferences_settings(settings);
+                            app.reading_flow = ReadingFlow::Paged;
+                            for (endpoint, anchor) in [0, 10].into_iter().enumerate() {
+                                app.fullscreen_idx = Some(anchor);
+                                let expected = if enabled {
+                                    [cover_side(mode), tail_side(mode)][endpoint]
+                                } else {
+                                    saved_sides[endpoint]
+                                };
+                                assert_eq!(
+                                    app.spread_display_composition_for_anchor(anchor)
+                                        .singleton_placement(),
+                                    expected
+                                );
+                                frame(&ctx, |ui, ctx| {
+                                    app.begin_page_turn_viewer_frame(ctx, false, None);
+                                    draw_observed(&mut app, ui, ctx);
+                                    assert_eq!(
+                                        actual_side(
+                                            &app.fullscreen_page_layout
+                                                .single_page()
+                                                .unwrap()
+                                                .transform
+                                        ),
+                                        expected
+                                    );
+                                });
+                            }
+                            assert_eq!(app.settings.singleton_spread_first_enabled, saved_first);
+                            assert_eq!(app.settings.singleton_spread_last_enabled, saved_last);
+                            assert_eq!(
+                                app.singleton_spread_endpoint_preferences,
+                                saved_preferences
+                            );
+                            let saved_endpoints =
+                                app.singleton_spread_placement_enabled_for_current_book();
+                            assert_eq!(
+                                saved_endpoints.first,
+                                first_preference.effective(saved_first)
+                            );
+                            assert_eq!(saved_endpoints.last, last_preference.effective(saved_last));
+                            let remote = build_remote_spread_page_groups_with_shift(
+                                &app.items,
+                                mode,
+                                &(0..11)
+                                    .map(|idx| [3, 6, 7].contains(&idx))
+                                    .collect::<Vec<_>>(),
+                                false,
+                                saved_endpoints,
+                                crate::settings::PageAloneSettings::default(),
+                                true,
+                                None,
+                            );
+                            assert_eq!(remote[0].indices, vec![0]);
+                            assert_eq!(remote[0].singleton_placement, saved_sides[0]);
+                            assert_eq!(remote.last().unwrap().indices, vec![10]);
+                            assert_eq!(remote.last().unwrap().singleton_placement, saved_sides[1]);
+                            for flow in [ReadingFlow::Vertical, ReadingFlow::Horizontal] {
+                                app.reading_flow = flow;
+                                for (endpoint, anchor) in [0, 10].into_iter().enumerate() {
+                                    assert!(app.continuous_reading_active_for_idx(anchor));
+                                    assert_eq!(
+                                        app.spread_display_composition_for_anchor(anchor)
+                                            .singleton_placement(),
+                                        saved_sides[endpoint]
+                                    );
+                                    let (units, pos) =
+                                        app.continuous_reading_units_and_pos(anchor).unwrap();
+                                    assert_eq!(units[pos].anchor_idx, anchor);
+                                    assert_eq!(
+                                        units[pos].singleton_placement,
+                                        saved_sides[endpoint]
+                                    );
+                                }
+                            }
+                            app.reading_flow = ReadingFlow::Paged;
+                        }
                     }
-                    app.reading_flow = ReadingFlow::Paged;
                 }
             }
         }

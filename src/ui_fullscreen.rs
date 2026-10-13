@@ -7566,6 +7566,184 @@ fn allocate_spread_popup_row(ui: &mut egui::Ui) -> egui::Rect {
     egui::Rect::from_min_size(row_rect.min, egui::vec2(row_rect.width(), 32.0))
 }
 
+fn draw_singleton_spread_endpoint_popup(
+    ui: &mut egui::Ui,
+    saved: &mut crate::settings::SingletonSpreadEndpointPreferences,
+    animation_forces_sides: bool,
+) -> bool {
+    use crate::settings::SingletonSpreadPlacementPreference;
+    if animation_forces_sides {
+        ui.label(
+            egui::RichText::new(
+                "ページめくりアニメーションが ON の間は先頭・末尾を本来の側に置きます。",
+            )
+            .color(egui::Color32::from_gray(220)),
+        );
+    }
+    let mut selected = false;
+    ui.add_enabled_ui(!animation_forces_sides, |ui| {
+        for endpoint in 0..2 {
+            draw_spread_popup_heading(
+                ui,
+                if endpoint == 0 {
+                    "先頭の単ページ配置"
+                } else {
+                    "末尾の単ページ配置"
+                },
+            );
+            let saved_value = if endpoint == 0 {
+                &mut saved.first
+            } else {
+                &mut saved.last
+            };
+            let current = if animation_forces_sides {
+                SingletonSpreadPlacementPreference::Place
+            } else {
+                *saved_value
+            };
+            for &preference in SingletonSpreadPlacementPreference::all() {
+                let rect = allocate_spread_popup_row(ui);
+                let response = ui.interact(
+                    rect,
+                    egui::Id::new(format!(
+                        "singleton_spread_placement_popup_{endpoint}_{}",
+                        preference.to_int()
+                    )),
+                    egui::Sense::click(),
+                );
+                let bg = if current == preference {
+                    if animation_forces_sides {
+                        egui::Color32::from_gray(60)
+                    } else {
+                        egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
+                    }
+                } else if response.hovered() {
+                    egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200)
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+                ui.painter().rect_filled(rect, 4.0, bg);
+                ui.painter().text(
+                    egui::pos2(rect.min.x + 16.0, rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    preference.label(),
+                    egui::FontId::proportional(13.0),
+                    // add_enabled_ui applies the normal disabled opacity once.
+                    egui::Color32::from_gray(220),
+                );
+                if response.clicked() {
+                    *saved_value = preference;
+                    selected = true;
+                }
+            }
+        }
+    });
+    selected
+}
+
+/// The same endpoint selector as the fullscreen book popup, with retained saved
+/// Center choices so snapshots distinguish the effective ON display from OFF.
+pub fn draw_singleton_spread_endpoint_popup_snapshot_fixture(ui: &mut egui::Ui, animation: bool) {
+    let mut saved = crate::settings::SingletonSpreadPlacementPreference::Center.into();
+    draw_singleton_spread_endpoint_popup(ui, &mut saved, animation);
+}
+
+#[cfg(test)]
+mod singleton_spread_endpoint_popup_tests {
+    use super::*;
+    use crate::settings::{SingletonSpreadEndpointPreferences, SingletonSpreadPlacementPreference};
+
+    fn frame(
+        ctx: &egui::Context,
+        saved: &mut SingletonSpreadEndpointPreferences,
+        animation: bool,
+        events: Vec<egui::Event>,
+    ) -> bool {
+        let mut selected = false;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(400.0, 500.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    selected = draw_singleton_spread_endpoint_popup(ui, saved, animation);
+                });
+            },
+        );
+        selected
+    }
+
+    #[test]
+    fn animation_locks_both_book_endpoints_without_replacing_saved_choices() {
+        let ctx = egui::Context::default();
+        let original = SingletonSpreadEndpointPreferences {
+            first: SingletonSpreadPlacementPreference::Center,
+            last: SingletonSpreadPlacementPreference::FollowGlobal,
+        };
+        let mut saved = original;
+        for animation in [true, false] {
+            frame(&ctx, &mut saved, animation, vec![]);
+            frame(&ctx, &mut saved, animation, vec![]);
+            for endpoint in 0..2 {
+                let response = ctx
+                    .read_response(egui::Id::new(format!(
+                        "singleton_spread_placement_popup_{endpoint}_{}",
+                        SingletonSpreadPlacementPreference::Place.to_int()
+                    )))
+                    .unwrap();
+                assert_eq!(response.enabled(), !animation);
+                let pos = response.rect.center();
+                frame(
+                    &ctx,
+                    &mut saved,
+                    animation,
+                    vec![egui::Event::PointerMoved(pos)],
+                );
+                frame(
+                    &ctx,
+                    &mut saved,
+                    animation,
+                    vec![egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+                let selected = frame(
+                    &ctx,
+                    &mut saved,
+                    animation,
+                    vec![egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+                assert_eq!(selected, !animation);
+                if animation {
+                    assert_eq!(saved, original);
+                } else {
+                    assert_eq!(
+                        if endpoint == 0 {
+                            saved.first
+                        } else {
+                            saved.last
+                        },
+                        SingletonSpreadPlacementPreference::Place
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// 上バーのボタンから吊り下がるポップアップを画面内へ収める。
 ///
 /// ボタンは右端から左へ並ぶので、**右寄りのボタンでは左寄せのままだと画面外へ出る**
@@ -17446,6 +17624,7 @@ impl App {
         // preferences, continuous reading and Remote keep their normal resolver.
         if self.reading_flow.is_paged() && self.settings.page_turn_animation_enabled {
             singleton_placement_enabled.first = true;
+            singleton_placement_enabled.last = true;
         }
         let units = self.build_spread_display_units_for_nav(&nav);
         let eligible = ((self.spread_mode.has_cover() && final_cover_enabled)
@@ -25477,6 +25656,7 @@ impl App {
                                 &mut self.reading_direction,
                                 &mut self.final_cover_spread_preference,
                                 &mut self.singleton_spread_endpoint_preferences,
+                                self.settings.page_turn_animation_enabled,
                                 &mut self.page_alone_preferences,
                                 &mut self.spread_popup_open,
                                 is_spread_double,
@@ -44521,6 +44701,7 @@ impl App {
         final_cover_spread_preference: &mut crate::settings::FinalCoverSpreadPreference,
         singleton_spread_endpoint_preferences:
             &mut crate::settings::SingletonSpreadEndpointPreferences,
+        page_turn_animation_enabled: bool,
         page_alone_preferences: &mut crate::settings::PageAlonePreferences,
         spread_popup_open: &mut bool,
         is_spread_double: bool,
@@ -45420,7 +45601,14 @@ impl App {
                 + 2 * crate::settings::SingletonSpreadPlacementPreference::all().len()
                 + 2 * crate::settings::PageAlonePreference::all().len()
                 + 2;
-            let popup_content_h = 8.0 + 7.0 * 28.0 + popup_row_count as f32 * 36.0;
+            let popup_content_h = 8.0
+                + 7.0 * 28.0
+                + popup_row_count as f32 * 36.0
+                + if page_turn_animation_enabled && reading_flow.is_paged() {
+                    60.0
+                } else {
+                    0.0
+                };
             let popup_h = popup_content_h
                 .min((ctx.available_rect().bottom() - popup_y - BAR_POPUP_SCREEN_MARGIN).max(1.0));
             let popup_rect = egui::Rect::from_min_size(
@@ -45637,57 +45825,12 @@ impl App {
                                 }
                             }
 
-                            for endpoint in 0..2 {
-                                draw_spread_popup_heading(
-                                    scroll_ui,
-                                    if endpoint == 0 {
-                                        "先頭の単ページ配置"
-                                    } else {
-                                        "末尾の単ページ配置"
-                                    },
-                                );
-                                for &preference in
-                                    crate::settings::SingletonSpreadPlacementPreference::all()
-                                {
-                                    let item_rect = allocate_spread_popup_row(scroll_ui);
-                                    let item_resp = scroll_ui.interact(
-                                        item_rect,
-                                        egui::Id::new(format!(
-                                            "singleton_spread_placement_popup_{endpoint}_{}",
-                                            preference.to_int()
-                                        )),
-                                        egui::Sense::click(),
-                                    );
-                                    let current = if endpoint == 0 {
-                                        singleton_spread_endpoint_preferences.first
-                                    } else {
-                                        singleton_spread_endpoint_preferences.last
-                                    };
-                                    let bg = if current == preference {
-                                        egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
-                                    } else if item_resp.hovered() {
-                                        egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200)
-                                    } else {
-                                        egui::Color32::TRANSPARENT
-                                    };
-                                    scroll_ui.painter().rect_filled(item_rect, 4.0, bg);
-                                    scroll_ui.painter().text(
-                                        egui::pos2(item_rect.min.x + 16.0, item_rect.center().y),
-                                        egui::Align2::LEFT_CENTER,
-                                        preference.label(),
-                                        egui::FontId::proportional(13.0),
-                                        egui::Color32::from_gray(220),
-                                    );
-                                    if item_resp.clicked() {
-                                        if endpoint == 0 {
-                                            singleton_spread_endpoint_preferences.first =
-                                                preference;
-                                        } else {
-                                            singleton_spread_endpoint_preferences.last = preference;
-                                        }
-                                        *spread_popup_open = false;
-                                    }
-                                }
+                            if draw_singleton_spread_endpoint_popup(
+                                scroll_ui,
+                                singleton_spread_endpoint_preferences,
+                                page_turn_animation_enabled && reading_flow.is_paged(),
+                            ) {
+                                *spread_popup_open = false;
                             }
                             for endpoint in 0..2 {
                                 draw_spread_popup_heading(
@@ -57619,6 +57762,7 @@ mod tests {
                         &mut reading_direction,
                         &mut final_cover_spread_preference,
                         &mut singleton_spread_endpoint_preferences,
+                        false,
                         &mut page_alone_preferences,
                         &mut spread_popup_open,
                         is_spread_double,
@@ -57768,6 +57912,7 @@ mod tests {
                         &mut reading_direction,
                         &mut final_cover_spread_preference,
                         &mut state.singleton_preference,
+                        false,
                         &mut page_alone_preferences,
                         &mut state.open,
                         false,
@@ -81426,6 +81571,7 @@ mod specified_scale_consumer_tests {
                         &mut reading_direction,
                         &mut final_cover_spread_preference,
                         &mut crate::settings::SingletonSpreadEndpointPreferences::default(),
+                        false,
                         &mut page_alone_preferences,
                         &mut false,
                         false,

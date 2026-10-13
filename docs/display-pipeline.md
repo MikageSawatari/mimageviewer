@@ -3093,12 +3093,15 @@ Pair↔横長・横長↔横長は同じBookLeaf/移動背時計で着地し、�
 提示receiptは横長二面の実面積を一つのsource occurrenceへ合算し、面ごとの保守的short spanを使う。
 pin/lease/dedupはactual resourceのまま。OFFの通常layout・page count/seek/historyは変更しない。
 
-### §1.341 共通の黒い紙と先頭の実効配置（2026-10-13）
+### §1.341 共通の黒い紙と両端の実効配置（2026-10-13）
 
 [page-turn plan §26](page-turn-animation-plan.md)が単頁の暫定spine比較を置換する。
 old/newの画像rectを覆う共通paperに黒余白を加え、紙端の固定背で一leafをめくる。
 画像rect/UV/underlayは保持し、下頁は静止する。紙全体の遮蔽と画像自身のvisibilityを区別する。
 黒paddingは新textureやsource occurrenceを作らず、終端は保存背景色の通常canonical描画へ戻る。
-local paged見開きのcompositionは演出ON時だけ先頭配置を実効ONにする。保存値・本別指定、
-連結読み・Remote・末尾の設定は保持する。ON/OFFによるgeometry変更では同じpresentation ownerの
+local paged見開きのcompositionは演出ON時だけ先頭・末尾配置を実効ONにする。保存値・本別指定、
+連結読み・Remoteは保持する。環境設定とlocal pagedの本別HUDは実効値を表示して両端指定を
+無効化し、OFFで保存値の表示・操作へ戻る。末尾Navigation＋FrontCoverSupplementの実画像Pairは
+通常Pairと同じtexture/role付きreceiptでめくり、白companionの拒否は維持する。
+ON/OFFによるgeometry変更では同じpresentation ownerの
 旧flat/ready/receiptを失効し、一件のcontinuationを新canonical採用まで保持する。

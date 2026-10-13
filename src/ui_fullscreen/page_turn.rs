@@ -1702,14 +1702,9 @@ impl App {
         }
         let composition = self.spread_display_composition_for_anchor(target);
         let occurrences = composition.pages_in_screen_order(self.spread_mode);
-        if let Some(reason) = stage_one_shape_reason(
-            self.spread_mode,
-            occurrences.len(),
-            occurrences
-                .iter()
-                .any(|o| o.role != SpreadPageRole::Navigation),
-            false,
-        ) {
+        if let Some(reason) =
+            stage_one_shape_reason(self.spread_mode, occurrences.iter().copied(), false)
+        {
             emit(&fact, "skip", reason, &[]);
             return;
         }
@@ -1796,11 +1791,7 @@ impl App {
         }
         if let Some(reason) = stage_one_shape_reason(
             outgoing.mode,
-            outgoing.pages.len(),
-            outgoing
-                .pages
-                .iter()
-                .any(|p| p.occurrence.role != SpreadPageRole::Navigation),
+            outgoing.pages.iter().map(|p| p.occurrence),
             outgoing.white.is_some(),
         ) {
             emit(&fact, "skip", reason, &[]);
@@ -1980,13 +1971,18 @@ impl App {
                     && outgoing.reading_rtl == unit.reading_rtl
                     && outgoing.slice == unit.slice
                     && Arc::ptr_eq(&outgoing.layout, &unit.layout)
-                    && outgoing
-                        .pages
-                        .iter()
-                        .chain(&unit.pages)
-                        .all(|page| page.occurrence.role == SpreadPageRole::Navigation)
-                    && outgoing.white.is_none()
-                    && unit.white.is_none()
+                    && stage_one_shape_reason(
+                        outgoing.mode,
+                        outgoing.pages.iter().map(|page| page.occurrence),
+                        outgoing.white.is_some(),
+                    )
+                    .is_none()
+                    && stage_one_shape_reason(
+                        unit.mode,
+                        unit.pages.iter().map(|page| page.occurrence),
+                        unit.white.is_some(),
+                    )
+                    .is_none()
                     && offer.ready_sources.0.len() == unit.pages.len()
                     && offer
                         .ready_sources
@@ -2539,13 +2535,42 @@ fn slideshow_interval_allows_turn(duration: Duration, interval: Duration) -> boo
 /// This boundary is about composition, never a guess from fitted aspect ratios.
 fn stage_one_shape_reason(
     mode: SpreadMode,
-    real_pages: usize,
-    supplement: bool,
+    occurrences: impl IntoIterator<Item = SpreadPageOccurrence>,
     white: bool,
 ) -> Option<&'static str> {
+    let mut real_pages = 0;
+    let mut navigation = None;
+    let mut cover = None;
+    let mut navigation_count = 0;
+    let mut cover_count = 0;
+    for page in occurrences {
+        real_pages += 1;
+        match page.role {
+            SpreadPageRole::Navigation => {
+                navigation_count += 1;
+                navigation = Some(page);
+            }
+            SpreadPageRole::FrontCoverSupplement => {
+                cover_count += 1;
+                cover = Some(page);
+            }
+        }
+    }
+    // A supplemented terminal unit keeps its single navigation anchor, but its
+    // two real presentation occurrences are an ordinary pair. Prove the roles
+    // and anchor here for both incoming composition and retained outgoing paint.
+    let cover_pair = mode.has_cover()
+        && real_pages == 2
+        && navigation_count == 1
+        && cover_count == 1
+        && navigation.zip(cover).is_some_and(|(navigation, cover)| {
+            navigation.idx == navigation.navigation_anchor_idx
+                && cover.navigation_anchor_idx == navigation.navigation_anchor_idx
+                && cover.idx != navigation.idx
+        });
     if mode.is_split() {
         Some("stage1_split_step")
-    } else if supplement || white {
+    } else if white || (cover_count != 0 && !cover_pair) {
         Some("stage1_cover_or_single_companion")
     } else if !(1..=2).contains(&real_pages) {
         Some("invalid_actual_page_count")
@@ -3784,29 +3809,65 @@ mod tests {
 
     #[test]
     fn stage_one_shape_scope_keeps_pairs_in_cover_books_and_logs_other_shapes() {
+        let navigation = |idx| SpreadPageOccurrence {
+            idx,
+            role: SpreadPageRole::Navigation,
+            navigation_anchor_idx: 1,
+        };
+        let cover = SpreadPageOccurrence {
+            idx: 0,
+            role: SpreadPageRole::FrontCoverSupplement,
+            navigation_anchor_idx: 1,
+        };
         for mode in [
             SpreadMode::Ltr,
             SpreadMode::Rtl,
             SpreadMode::LtrCover,
             SpreadMode::RtlCover,
         ] {
-            assert_eq!(stage_one_shape_reason(mode, 2, false, false), None);
-            assert_eq!(stage_one_shape_reason(mode, 1, false, false), None);
             assert_eq!(
-                stage_one_shape_reason(mode, 2, true, false),
+                stage_one_shape_reason(mode, [navigation(1), navigation(2)], false),
+                None
+            );
+            assert_eq!(stage_one_shape_reason(mode, [navigation(1)], false), None);
+            assert_eq!(
+                stage_one_shape_reason(mode, [navigation(1), cover], false),
+                (!mode.has_cover()).then_some("stage1_cover_or_single_companion")
+            );
+            for invalid in [
+                vec![cover],
+                vec![cover, cover],
+                vec![navigation(1), navigation(2), cover],
+                vec![navigation(2), cover],
+                vec![navigation(1), SpreadPageOccurrence { idx: 1, ..cover }],
+                vec![
+                    navigation(1),
+                    SpreadPageOccurrence {
+                        navigation_anchor_idx: 2,
+                        ..cover
+                    },
+                ],
+            ] {
+                assert_eq!(
+                    stage_one_shape_reason(mode, invalid, false),
+                    Some("stage1_cover_or_single_companion")
+                );
+            }
+            assert_eq!(
+                stage_one_shape_reason(mode, [navigation(1), cover], true),
                 Some("stage1_cover_or_single_companion")
             );
         }
         assert_eq!(
-            stage_one_shape_reason(SpreadMode::Single, 1, false, false),
+            stage_one_shape_reason(SpreadMode::Single, [navigation(1)], false),
             None
         );
         assert_eq!(
-            stage_one_shape_reason(SpreadMode::SplitRtl, 1, false, false),
+            stage_one_shape_reason(SpreadMode::SplitRtl, [navigation(1)], false),
             Some("stage1_split_step")
         );
         assert_eq!(
-            stage_one_shape_reason(SpreadMode::Ltr, 1, false, true),
+            stage_one_shape_reason(SpreadMode::Ltr, [navigation(1)], true),
             Some("stage1_cover_or_single_companion")
         );
     }

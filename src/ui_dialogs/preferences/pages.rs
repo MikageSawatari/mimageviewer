@@ -10132,6 +10132,7 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
             ui,
             &mut state.settings.singleton_spread_first_enabled,
             &mut state.settings.singleton_spread_last_enabled,
+            state.settings.page_turn_animation_enabled,
         );
     });
     anchored(ui, state, "spread/page-alone", |ui, state| {
@@ -10538,7 +10539,7 @@ mod page_turn_animation_settings_tests {
 
     #[test]
     fn page_turn_animation_settings_toggle_preserves_singleton_preferences() {
-        use egui_kittest::kittest::Queryable;
+        use egui_kittest::kittest::{NodeT, Queryable};
         let settings = crate::settings::Settings {
             singleton_spread_first_enabled: false,
             singleton_spread_last_enabled: true,
@@ -10564,25 +10565,50 @@ mod page_turn_animation_settings_tests {
                             ui,
                             &mut settings.singleton_spread_first_enabled,
                             &mut settings.singleton_spread_last_enabled,
+                            settings.page_turn_animation_enabled,
                         );
                     });
                 },
                 (settings, false),
             );
         harness.run();
+        let first_label = "見開き先頭の単ページを片側に配置";
+        let last_label = "見開き末尾の単ページを片側に配置";
         for enabled in [true, false] {
             harness.get_by_label("ページめくりアニメーション").click();
             harness.run();
             assert_eq!(harness.state().0.page_turn_animation_enabled, enabled);
             assert!(!harness.state().0.singleton_spread_first_enabled);
             assert!(harness.state().0.singleton_spread_last_enabled);
+            for (label, saved) in [(first_label, false), (last_label, true)] {
+                let node = harness.get_by_label(label).accesskit_node();
+                assert_eq!(node.is_disabled(), enabled);
+                assert_eq!(
+                    node.toggled(),
+                    Some(if enabled || saved {
+                        egui::accesskit::Toggled::True
+                    } else {
+                        egui::accesskit::Toggled::False
+                    })
+                );
+                if enabled {
+                    // Headless pointer input still reaches the disabled widget's
+                    // location; it must not update either persisted setting.
+                    harness.get_by_label(label).click();
+                    harness.run();
+                    assert!(!harness.state().0.singleton_spread_first_enabled);
+                    assert!(harness.state().0.singleton_spread_last_enabled);
+                }
+            }
         }
-        harness
-            .get_by_label("見開き先頭の単ページを片側に配置")
-            .click();
+        harness.get_by_label(first_label).click();
         harness.run();
         assert!(harness.state().0.singleton_spread_first_enabled);
         assert!(harness.state().0.singleton_spread_last_enabled);
+        harness.get_by_label(last_label).click();
+        harness.run();
+        assert!(harness.state().0.singleton_spread_first_enabled);
+        assert!(!harness.state().0.singleton_spread_last_enabled);
     }
 }
 
@@ -10839,11 +10865,34 @@ pub(super) fn draw_singleton_spread_placement_setting(
     ui: &mut egui::Ui,
     first: &mut bool,
     last: &mut bool,
+    animation_enabled: bool,
 ) {
-    ui.checkbox(first, "見開き先頭の単ページを片側に配置");
-    ui.small("ページめくりアニメーションが ON の間は先頭は本来の側に置きます。");
-    ui.checkbox(last, "見開き末尾の単ページを片側に配置");
-    ui.small("本の端に単独で残るページだけを、見開きで本来ある側へ配置します。本ごとの設定が優先されます。");
+    // ON displays the local paged effective placement without changing either
+    // stored preference, which continuous reading and Remote still use.
+    let mut effective_first = true;
+    let mut effective_last = true;
+    ui.add_enabled_ui(!animation_enabled, |ui| {
+        ui.checkbox(
+            if animation_enabled {
+                &mut effective_first
+            } else {
+                first
+            },
+            "見開き先頭の単ページを片側に配置",
+        );
+        ui.checkbox(
+            if animation_enabled {
+                &mut effective_last
+            } else {
+                last
+            },
+            "見開き末尾の単ページを片側に配置",
+        );
+    });
+    ui.small("ページめくりアニメーションが ON の間は、PCのページ単位の見開きで先頭・末尾を本来の側に置きます。OFFにすると保存済み設定へ戻ります。連結読みとmIV Remoteは保存済み設定に従います。");
+    ui.small(
+        "本の端に単独で残るページだけが対象です。保存済み設定では本ごとの指定が優先されます。",
+    );
 }
 
 pub(super) fn page_playback_resume(ui: &mut egui::Ui, state: &mut PreferencesState) {
