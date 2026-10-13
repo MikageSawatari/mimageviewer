@@ -128,10 +128,6 @@ fn started_and_finished(ctx: &egui::Context, app: &mut App, from: usize, to: usi
         } => {
             assert_eq!(offer.forward, forward);
             assert_eq!(offer.submission.status(), SubmissionStatus::Started);
-            assert_eq!(
-                projection.recipe.single_spine,
-                app.settings.page_turn_single_spine
-            );
             if actual_count == 1 {
                 assert_eq!(
                     projection.incoming.pages.len(),
@@ -276,26 +272,20 @@ fn page_turn_landscape_faces_aggregate_into_one_physical_visibility_receipt() {
 #[test]
 fn page_turn_single_portrait_landscape_eight_routes_start_and_complete() {
     let mut completed = 0;
-    for single_spine in [
-        crate::settings::SinglePageTurnSpine::OwnPage,
-        crate::settings::SinglePageTurnSpine::Moving,
-    ] {
-        for reading_direction in [ReadingDirection::Ltr, ReadingDirection::Rtl] {
-            let ctx = egui::Context::default();
-            let mut app = book(&ctx, SpreadMode::Single, false, None);
-            app.reading_direction = reading_direction;
-            app.settings.page_turn_single_spine = single_spine;
-            for (from, to, forward) in [(3, 4, true), (4, 3, false), (4, 5, true), (5, 4, false)] {
-                started_and_finished(&ctx, &mut app, from, to, forward);
-                completed += 1;
-            }
+    for reading_direction in [ReadingDirection::Ltr, ReadingDirection::Rtl] {
+        let ctx = egui::Context::default();
+        let mut app = book(&ctx, SpreadMode::Single, false, None);
+        app.reading_direction = reading_direction;
+        for (from, to, forward) in [(3, 4, true), (4, 3, false), (4, 5, true), (5, 4, false)] {
+            started_and_finished(&ctx, &mut app, from, to, forward);
+            completed += 1;
         }
     }
-    assert_eq!(completed, 16);
+    assert_eq!(completed, 8);
 }
 
 #[test]
-fn page_turn_single_spine_preferences_change_cancels_through_existing_flat_completion() {
+fn page_turn_duration_preferences_change_cancels_through_existing_flat_completion() {
     use crate::ui_fullscreen::page_turn_submission_tests::seed_leaf;
     let ctx = egui::Context::default();
     let mut app = ready_app(&ctx, SpreadMode::Single);
@@ -305,7 +295,7 @@ fn page_turn_single_spine_preferences_change_cancels_through_existing_flat_compl
         _ => panic!("active leaf"),
     };
     let mut edited = app.settings.clone();
-    edited.page_turn_single_spine = crate::settings::SinglePageTurnSpine::Moving;
+    edited.page_turn_animation_duration_ms += 100;
     app.install_preferences_settings(edited);
     assert_eq!(tracker.status(), SubmissionStatus::Cancelled);
     assert!(app.page_turn_completion_active());

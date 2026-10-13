@@ -8635,11 +8635,16 @@ impl App {
     /// A setting change ends the effect, but cannot discard an ON-origin flat
     /// completion and its one already-resolved continuation.
     pub(crate) fn cancel_all_page_turn_effects_for_settings(&mut self) {
-        self.page_turn_presentation.cancel_for_settings();
+        self.pending_fs_page_turn_ready = None;
+        self.page_turn_presentation
+            .cancel_for_settings(&mut self.page_turn_leases);
         #[cfg(windows)]
         for id in self.viewer_contexts.table.other_ids() {
             if let Some(bundle) = self.viewer_contexts.table.at_rest_mut(id) {
-                bundle.page_turn_presentation.cancel_for_settings();
+                bundle.pending_fs_page_turn_ready = None;
+                bundle
+                    .page_turn_presentation
+                    .cancel_for_settings(&mut self.page_turn_leases);
             }
         }
     }

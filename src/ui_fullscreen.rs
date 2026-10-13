@@ -17440,8 +17440,13 @@ impl App {
             self.get_nav_indices()
         };
         let final_cover_enabled = self.final_cover_spread_enabled_for_current_book();
-        let singleton_placement_enabled =
+        let mut singleton_placement_enabled =
             self.singleton_spread_placement_enabled_for_current_book();
+        // Presentation policy is local to paged composition. Stored book/global
+        // preferences, continuous reading and Remote keep their normal resolver.
+        if self.reading_flow.is_paged() && self.settings.page_turn_animation_enabled {
+            singleton_placement_enabled.first = true;
+        }
         let units = self.build_spread_display_units_for_nav(&nav);
         let eligible = ((self.spread_mode.has_cover() && final_cover_enabled)
             || singleton_placement_enabled.first

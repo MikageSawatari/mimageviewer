@@ -822,7 +822,16 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         "spread/singleton-placement",
         SpreadMode,
         "見開き先頭の単ページを片側に配置",
-        ["単ページ", "先頭", "末尾", "片側", "本ごとの設定"]
+        [
+            "単ページ",
+            "先頭",
+            "末尾",
+            "片側",
+            "本ごとの設定",
+            "ページめくり",
+            "アニメーション",
+            "本来の側"
+        ]
     ),
     entry!(
         "spread/page-alone",

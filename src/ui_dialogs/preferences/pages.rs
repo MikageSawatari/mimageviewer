@@ -10125,7 +10125,6 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
             ui,
             &mut state.settings.page_turn_animation_enabled,
             &mut state.settings.page_turn_animation_duration_ms,
-            &mut state.settings.page_turn_single_spine,
         );
     });
     anchored(ui, state, "spread/singleton-placement", |ui, state| {
@@ -10475,7 +10474,6 @@ pub(super) fn draw_page_turn_animation_setting(
     ui: &mut egui::Ui,
     enabled: &mut bool,
     duration_ms: &mut u32,
-    single_spine: &mut crate::settings::SinglePageTurnSpine,
 ) {
     ui.checkbox(enabled, "ページめくりアニメーション");
     ui.small("単発のページ送りとスライドショーで紙をめくる効果。連打・読込待ち・連結読みには適用しません。");
@@ -10492,36 +10490,16 @@ pub(super) fn draw_page_turn_animation_setting(
         });
     });
     ui.small("時間は動きを確認してから決定します。");
-    ui.add_enabled_ui(*enabled, |ui| {
-        ui.label("単頁の綴じ目（比較用・暫定）");
-        ui.radio_value(
-            single_spine,
-            crate::settings::SinglePageTurnSpine::OwnPage,
-            "案A：自身の綴じ目（既定）",
-        );
-        ui.radio_value(
-            single_spine,
-            crate::settings::SinglePageTurnSpine::Moving,
-            "比較案：綴じ目を移動",
-        );
-        ui.small("両案とも下の頁は最終位置で静止します。比較後に一方を削除します。");
-    });
 }
 
 #[cfg(test)]
 mod page_turn_animation_settings_tests {
     use super::*;
 
-    fn snapshot(
-        name: &str,
-        theme: crate::os_theme::ResolvedTheme,
-        enabled: bool,
-        single_spine: crate::settings::SinglePageTurnSpine,
-    ) {
+    fn snapshot(name: &str, theme: crate::os_theme::ResolvedTheme, enabled: bool) {
         let mut fonts_ready = false;
         let mut enabled = enabled;
         let mut duration_ms = 200;
-        let mut single_spine = single_spine;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(320.0, 320.0))
             .build(move |ctx| {
@@ -10533,12 +10511,7 @@ mod page_turn_animation_settings_tests {
                     return;
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    draw_page_turn_animation_setting(
-                        ui,
-                        &mut enabled,
-                        &mut duration_ms,
-                        &mut single_spine,
-                    );
+                    draw_page_turn_animation_setting(ui, &mut enabled, &mut duration_ms);
                 });
             });
         harness.run();
@@ -10551,7 +10524,6 @@ mod page_turn_animation_settings_tests {
             "page_turn_animation_settings_light_on",
             crate::os_theme::ResolvedTheme::Light,
             true,
-            crate::settings::SinglePageTurnSpine::OwnPage,
         );
     }
 
@@ -10561,18 +10533,56 @@ mod page_turn_animation_settings_tests {
             "page_turn_animation_settings_dark_off",
             crate::os_theme::ResolvedTheme::Dark,
             false,
-            crate::settings::SinglePageTurnSpine::OwnPage,
         );
     }
 
     #[test]
-    fn page_turn_animation_settings_snapshot_dark_moving() {
-        snapshot(
-            "page_turn_animation_settings_dark_moving",
-            crate::os_theme::ResolvedTheme::Dark,
-            true,
-            crate::settings::SinglePageTurnSpine::Moving,
-        );
+    fn page_turn_animation_settings_toggle_preserves_singleton_preferences() {
+        use egui_kittest::kittest::Queryable;
+        let settings = crate::settings::Settings {
+            singleton_spread_first_enabled: false,
+            singleton_spread_last_enabled: true,
+            ..crate::settings::Settings::default()
+        };
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(540.0, 320.0))
+            .build_state(
+                |ctx, (settings, fonts_ready)| {
+                    if !*fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        *fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        draw_page_turn_animation_setting(
+                            ui,
+                            &mut settings.page_turn_animation_enabled,
+                            &mut settings.page_turn_animation_duration_ms,
+                        );
+                        draw_singleton_spread_placement_setting(
+                            ui,
+                            &mut settings.singleton_spread_first_enabled,
+                            &mut settings.singleton_spread_last_enabled,
+                        );
+                    });
+                },
+                (settings, false),
+            );
+        harness.run();
+        for enabled in [true, false] {
+            harness.get_by_label("ページめくりアニメーション").click();
+            harness.run();
+            assert_eq!(harness.state().0.page_turn_animation_enabled, enabled);
+            assert!(!harness.state().0.singleton_spread_first_enabled);
+            assert!(harness.state().0.singleton_spread_last_enabled);
+        }
+        harness
+            .get_by_label("見開き先頭の単ページを片側に配置")
+            .click();
+        harness.run();
+        assert!(harness.state().0.singleton_spread_first_enabled);
+        assert!(harness.state().0.singleton_spread_last_enabled);
     }
 }
 
@@ -10831,6 +10841,7 @@ pub(super) fn draw_singleton_spread_placement_setting(
     last: &mut bool,
 ) {
     ui.checkbox(first, "見開き先頭の単ページを片側に配置");
+    ui.small("ページめくりアニメーションが ON の間は先頭は本来の側に置きます。");
     ui.checkbox(last, "見開き末尾の単ページを片側に配置");
     ui.small("本の端に単独で残るページだけを、見開きで本来ある側へ配置します。本ごとの設定が優先されます。");
 }

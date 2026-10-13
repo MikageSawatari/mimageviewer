@@ -1,5 +1,7 @@
 # ページめくりアニメーション設計案 — backlog §1.341
 
+2026-10-13改訂：単頁サイズ差は共通の黒い紙、local pagedの先頭配置はアニメーションON時の実効ON（§26）を優先する。§25の暫定単頁spine比較は撤去する。
+
 2026-10-11 / **R7設計ACCEPT（`fa5119c19`、Stage 1自動検証・確認用build済、実機評価待ち・§19）**。採択済みR7に従い、まず通常単頁と二実頁Pairのleaf・陰影・per-page geometryを既存A0へ接続し、利用者のmotion評価用buildを作った。§19時点ではcover/中央単頁/split等の対応を後段に残した。§24で通常の中央/片側singletonと横長への対応を追加する。R3統合後のA0は利用者の実機評価で不合格。R4 `afc474d8d`・R5 `c73f0d857`・R6 `29291d496`はREVISE、R7の独立設計レビューACCEPTは利用者から伝達された。§1〜17は履歴で、衝突箇所は§18、段階実装の範囲は§19を優先する。既定OFF・仮時間・F12所有・VRAM会計を維持。readinessは2026-10-11利用者決定の§22でresident displayableへ置換し、Pairの移動背とpin上限は§23、横長・通常singletonは§24を正本とする。実装の独立完了レビュー・実機motion/性能受入れ・最終時間は未了。2026-10-11の次の次の版への延期を、2026-10-12利用者決定で次の版を目指して継続する方針へ改訂した（採用は進捗を見て判断、§24）。
 
 R3設計時の参照treeは `next-prefs` / `1ee3e178288f2eff119da16b672d546cc3c9992c`（R2文書commit、開始時clean）。当時の製品コードはmaster `cb00930011323cacd7088ae70c37835141aad58a` と同じだった。
@@ -2121,3 +2123,99 @@ workspaceの残りとdoc-tests、vendor egui 25件・egui-wgpu 11件・eframe 18
 core・remote service・EPUB workerの生成とruntime 4 DLL / PE 3 binary検査を完了した。
 アプリ起動・実設定操作・git add/commitは行わず、mergeの登録とコミットはcoordinatorへ引き継ぐ。
 利用者の隔離`--data-dir .\target\dev-runtime\data --perf-log`比較手順は今回の記録に用意した。
+
+## 26. 2026-10-13 採用改訂：共通の黒い紙と実効先頭配置
+
+本節を単頁サイズ差と先頭配置の現行仕様とする。§25の案A / Movingは比較の履歴であり、
+両方とも撤去する。利用者の実機確認で、広い頁から狭い頁へMovingで移る変形に違和感があった。
+異なる背・紙サイズ・floor移動の組み合わせを増やすより、同じ大きさの紙に揃えて状態を減らす。
+
+### 26.1 単頁は一つの紙サイズへ揃える
+
+同一viewportにおける旧・新のcanonical画像rectのunionを共通paper rectとする。
+通常の中央fitでは大きい方の幅・高さを持つ紙となる。丸めを含め両rectを覆う最小rectを使う。
+軸はLTRならその左端、RTLなら右端に固定し、紙の幅・高さ・背を補間しない。
+画像自身のrect、UV、元texture、underlayは保持し、紙内の印刷領域として投影する。
+余白は既定fullscreen canvasと同じBLACK。めくる面も下の面も同じ紙全体を黒で埋める。
+新texture、decode、uploadは作らない。陰影・厚み・角度・終端採用は既存同サイズ単頁と共通にする。
+
+前進は旧画像を印刷した紙だけがめくれて去り、新画像の紙は最初から最終位置で静止する。
+後退は前頁の紙だけが降りて重なり、旧画像の紙は静止する。下の画像のrectは補間しない。
+投影の遮蔽・影は紙の全領域、first_visible/visibility/receiptは実画像の印刷領域で計算する。
+黒余白を頁提示の面積に数えない。終端で通常のcanonical画像へ戻る余白は既定の黒canvasと一致する。
+カスタム余白色の保存値は変更しない。効果中の紙は黒、終端はその保存済背景色の通常描画へ戻る。
+非黒canvasでは黒paperの消失が見えるが、終端に黒paperを残留させない。
+共通paperの距離・高さをfocal/error boundにも使い、従来のmesh誤差と予算の制限を保持する。
+
+暫定`page_turn_single_spine`、`SinglePageTurnSpine`、比較UI/検索・説明・比較snapshotは撤去する。
+未リリース設定なのでmigrationは作らず、古い保存keyは通常の未知keyとして読み捨てる。
+
+### 26.2 local pagedの先頭配置を実効ONにする
+
+local paged見開きのcomposition構築だけで、アニメーションON時にendpoint.firstをtrueにする。
+全体保存値・本別FollowGlobal/Place/Centerを変更しない。OFFでは保存値による実効値へ戻る。
+既存complete-book / UnpairedSlotの適格条件は維持する。shared resolver、連結読み、Remote、
+本別設定getterは保存値を扱うままにする。末尾は強制しない。
+環境設定とマニュアルに「ページめくりアニメーションが ON の間は先頭は本来の側に置きます」
+を表示し、PCのページ表示に適用する範囲も説明する。
+
+ON/OFFはcomposition geometry変更として既存の全context設定取消へ集約する。
+mounted/parkedの未配送readyと旧Flatを退役し、Completingの採用済receiptもNeedFlatへ戻す。
+既存ownerにある一件のresolved continuationは保持し、新設定の通常canonical flatの採用まで
+解放しない。新pending、bool、queue、context ownerは増やさない。通常mountの兄弟変更はしない。
+時間だけの変更も同じ安全な設定採用境界を通す。表示経路・texture sourceは通常描画で再採用する。
+Turning/Completingの品質変更だけによるgeometry freezeは維持する。
+通常prepareのplacementが変わった場合はreal geometry変更としてfreezeを外し、
+Completingを現在のCenter/Sideへ再bindする。未採用evidenceは旧hookと共有しない新しい証明へ置換する。
+
+### 26.3 表紙と末尾の実builder診断・回帰
+
+変更前は実builderの表紙→Pair / Pair→表紙をLTR/RTL×中央/sideで組み、
+accept / outgoing canonical / incoming canonical / recipeのどこで拒否するかを型付きで区別する。
+変更前の表紙guardは中央/sideともcanonical化で`stage1_portrait_cover`を返していた。
+強制sideだけではこのguardは消えないため、実builderのfirst unit、UnpairedSlot、cover mode、
+Navigation occurrenceの一致と通常compositionが解いたRight/Leftに基づいて表紙を許可する。
+中央の未証明表紙へbody用fallbackの左右を当てはめない。補助頁/white、分割、未適格構成の
+既存拒否は保持する。軽い通常ログは一操作のskip時だけ理由/sub_checkを記録し毎frame出さない。
+
+実builder回帰は表紙LTR/RTL×前後、ON/OFF保存値・本別設定保持、連結/Remote非変更、
+縦長⇔横長×LTR/RTL×前後、黒余白/画像UV/可視性/終端を検査する。画像は利用者の本を縮小した
+12頁fixture（4/7/8横長）を使い、末尾singleton確認には11頁派生を使う。
+末尾は中央/side×補助ON/OFFで同じ診断を行い、強制変更せず原因と実際のrecipe結果だけを報告する。
+独立設計レビュー後に実装し、関連回帰・snapshot・fmt/check・glyph・全体gate・通常build-devを行う。
+コミットと実機採択はcoordinator/利用者へ残し、エージェントはアプリを起動しない。
+
+### 26.4 実装・回帰で確認した所有とpolygonの補正
+
+変更前の表紙8経路は実builder/通常描画/実handlerでcanonical拒否を確認した。
+先頭side強制だけでは解消しないため、§26.3のproofを使ってcover guardを置換した。
+12頁fixtureの末尾はPair [11,12]。11頁派生の末尾singletonは補助OFFなら中央/sideとも
+前後にめくれ、補助ONでは`stage1_cover_or_single_companion`でaccept拒否される。
+末尾は強制しない。補助/whiteの対応を先取りしない。
+
+独立実装レビューで、設定取消時のevidence置換とOFF通常prepareのgeometry再bindが生成する
+fresh PaintedUnitのWeakをglobal lease inventoryへ登録する必要を確認した。
+両生成境界で既存inventoryへ登録し、旧output batch退役後もmounted/parked Completingの
+retained/pin bytesを会計する。旧Arcを強参照で残さない回帰で両境界と最終予約解除を検査する。
+
+新しいdense pose回帰では、紙と印刷域を重ねて二度subtractする実装の不備を発見した。
+一つのvisibility faceに実画像のvisible polygonと全紙のocclusion polygonを持たせて一度だけ引く。
+また既存clip_halfはscissor角で同一点を連続出力し得る。subtract_polygonがそのzero-length edgeを
+inside/outside両方として扱うと残りpolygonが重複計上されるため、正確な空edgeを除外する。
+退化coverは遮蔽しない。面積の許容を緩めず、重複corner/退化coverと全poseを回帰にする。
+この数学的修正は通常のclipped Spreadにも共通に適用し、関連回帰と全体gateで確認する。
+
+### 26.5 自動検証と確認用buildの引き継ぎ
+
+独立GPT-6.1 Sol / xhighの完了レビューはACCEPT、全指摘を解消した。生成16goldenを目視し、
+共通paper12枚・設定2枚・先頭notice1枚と、本文が一致するpreferences scrollthumb1枚を更新した。
+非UPDATEのfocused179件、設定転送26件、normal/portable core check、fmt/glyph、context監査が成功。
+撤去設定1件分の分類/許可/wireの期待件数だけを修正し、除外/unique/export集合の検査は維持した。
+
+`test-full.ps1 -SuppressCrashDialogs`はbuild jobs1 / test threads8で一回PASS。
+本体12,379件成功・57件ignored・失敗0、UI snapshot162件、vendor54件、残りworkspace /
+integration / doc-testsも成功した。normalの`build-dev.ps1 -PreserveRuntime`もexit0で完了し、
+core/remote/EPUBとruntime4 DLL / PE3 binary検査を通した。coreは2026-10-13 21:58:30の
+325,658,112 bytes / FileVersion4.6.0.0。portable featureを有効にせず、起動もしない。
+command/feature/profile/結果と隔離確認手順は`target/A-1341-black-paper-msg.txt`に記録する。
+コミット・アプリ起動・実データ変更は行わない。motion/性能の採択はcoordinator/利用者へ残す。

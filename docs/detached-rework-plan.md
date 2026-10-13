@@ -1455,6 +1455,18 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-10-13 §1.341 黒paperと先頭配置の設定採用
+
+利用者採用の[page-turn plan §26](page-turn-animation-plan.md)に従い、local pagedの演出ON時だけ
+先頭配置を実効ONにする。保存値・連結・Remoteは保持する。ON/OFF geometry変更は既存の
+全context設定取消に集約し、各mounted/parked ownerの未配送ready・旧Flat・採用済completion
+receiptを退役する。一件のcontinuationは同ownerに保持し、新canonical flat採用まで解放しない。
+単頁はrect/UVを保った共通黒paperに揃える。品質変更だけのfreezeは保持し、
+Center/Side等のplacement変更をreal geometry変更として通常prepareへ再bindする。
+独立GPT-6.1 Sol / xhighは既存owner境界での構造修正として合意。新pending/state owner、
+viewport/host述語、mount/deposit/worker世代、native focus/placement経路は追加・変更しない。
+通常mountの兄弟取消は行わない。実機採択はcoordinator/利用者へ残す。
+
 ### 2026-10-11 §1.341 Pairの移動背とpin枠（構造確認待ち）
 
 利用者option Aによりprojectionのframe-local H/static poseを共通progressで移す。canonical destination clipは既存transform viewportとpainter clipの交差から捕捉する。context resource、normal mount/deposit/fork、native viewport dispatch/placementは変更しない。pin gateを共通helperへまとめ、測定に基づき固定128 MiB capを撤去（有限fullscreen10%、無制限1 GiB）。shared weak inventory/dedup/batch leaseとcontext別退役を維持し、兄弟contextを消さない。これはprojectionと既存pin admissionの構造変更であり、独立確認・実機受入れは未了。

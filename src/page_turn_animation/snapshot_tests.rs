@@ -981,7 +981,6 @@ fn snapshot_single_portrait_landscape(
     portrait_to_landscape: bool,
     reading_rtl: bool,
     forward: bool,
-    single_spine: SinglePageTurnSpine,
 ) -> egui_kittest::SnapshotResults {
     use SpreadFixtureKind::{Landscape, Portrait};
     const SINGLE_POSES: [f32; 7] = [0.0, 0.0001, 0.25, 0.5, 0.75, 0.9999, 1.0];
@@ -992,14 +991,9 @@ fn snapshot_single_portrait_landscape(
         "landscape_to_portrait"
     };
     let name = format!(
-        "page_turn_projection_single_{transition}_{}_{}{}",
+        "page_turn_projection_single_{transition}_{}_{}",
         if reading_rtl { "rtl" } else { "ltr" },
-        if forward { "forward" } else { "back" },
-        if single_spine == SinglePageTurnSpine::Moving {
-            "_moving"
-        } else {
-            ""
-        }
+        if forward { "forward" } else { "back" }
     );
     let canonical_endpoint = Arc::new(AtomicBool::new(false));
     let endpoint_flag = canonical_endpoint.clone();
@@ -1024,10 +1018,9 @@ fn snapshot_single_portrait_landscape(
                 pos2(10.0, 8.0),
                 egui::Align2::LEFT_TOP,
                 format!(
-                    "SINGLE / {transition} / {} / {} / one moving page; original canonical old and new at outside columns{}",
+                    "SINGLE / {transition} / {} / {} / one common black paper; canonical old and new outside",
                     if reading_rtl { "RTL" } else { "LTR" },
-                    if forward { "FORWARD" } else { "BACK" },
-                    if single_spine == SinglePageTurnSpine::Moving { "; MOVING SPINE" } else { "" }
+                    if forward { "FORWARD" } else { "BACK" }
                 ),
                 egui::FontId::monospace(13.0),
                 Color32::WHITE,
@@ -1057,7 +1050,7 @@ fn snapshot_single_portrait_landscape(
                     );
                     // The user's real book: 900x1300 portrait and 1600x900
                     // landscape, each page fitted independently in one 16:9
-                    // canvas. Its own reading-side edge is the binding.
+                    // canvas. Both prints share its fixed reading-side edge.
                     let viewport = Rect::from_center_size(cell.center(), vec2(WIDTH, WIDTH * 9.0 / 16.0));
                     let source = if matches!(kind, Landscape) { vec2(1600.0, 900.0) } else { vec2(900.0, 1300.0) };
                     let scale = (viewport.width() / source.x).min(viewport.height() / source.y);
@@ -1083,10 +1076,10 @@ fn snapshot_single_portrait_landscape(
                     egui::FontId::monospace(12.0),
                     Color32::WHITE,
                 );
-                let (moving, stationary) = if forward {
-                    (&old.pages[0], &new.pages[0])
+                let stationary = if forward {
+                    &new.pages[0]
                 } else {
-                    (&new.pages[0], &old.pages[0])
+                    &old.pages[0]
                 };
                 // Cyan is the stationary page's full canonical footprint at
                 // every pose; the texture's unequal colored edge stripes and
@@ -1097,24 +1090,17 @@ fn snapshot_single_portrait_landscape(
                     egui::Stroke::new(1.0, Color32::from_rgb(75, 217, 225)),
                     egui::StrokeKind::Outside,
                 );
-                let spine = if single_spine == SinglePageTurnSpine::Moving {
-                    let sign = if reading_rtl { -1.0 } else { 1.0 };
-                    let p = match column { 0 => 0.0, 8 => 1.0, _ => SINGLE_POSES[column - 1] };
-                    moving_hinge(super::spine(&old, sign), super::spine(&new, sign), p)
-                } else if reading_rtl {
-                    moving.rect.right()
-                } else {
-                    moving.rect.left()
-                };
+                let paper = old.pages[0].rect.union(new.pages[0].rect);
+                let spine = if reading_rtl { paper.right() } else { paper.left() };
                 painter.line_segment(
                     [
-                        pos2(spine, moving.rect.top() - 6.0),
-                        pos2(spine, moving.rect.bottom() + 6.0),
+                        pos2(spine, paper.top() - 6.0),
+                        pos2(spine, paper.bottom() + 6.0),
                     ],
                     egui::Stroke::new(1.0, Color32::from_rgb(241, 92, 104)),
                 );
                 painter.text(
-                    pos2(spine, moving.rect.bottom() + 8.0),
+                    pos2(spine, paper.bottom() + 8.0),
                     egui::Align2::CENTER_TOP,
                     "SPINE",
                     egui::FontId::monospace(10.0),
@@ -1128,7 +1114,7 @@ fn snapshot_single_portrait_landscape(
                     paint_canonical(&painter, &new);
                 } else {
                     let direction = TurnDirection { reading_rtl, forward };
-                    let recipe = prepare_turn_with_single_spine(&old, &new, direction, single_spine).unwrap();
+                    let recipe = prepare_turn(&old, &new, direction).unwrap();
                     let projection = project_prepared(
                         &old,
                         &new,
@@ -1149,12 +1135,10 @@ fn snapshot_single_portrait_landscape(
             painter.text(
                 pos2(10.0, 274.0),
                 egui::Align2::LEFT_TOP,
-                if single_spine == SinglePageTurnSpine::Moving {
-                    "Cyan = full stationary floor. Pink = shared smooth old-to-new spine trajectory; only the bound leaf translates while turning."
-                } else if forward {
-                    "Cyan = full incoming rect from the first pose; pink = outgoing own spine. Print/edges stay fixed beneath the departing page."
+                if forward {
+                    "Cyan = static incoming image. Pink = common paper spine. Old print departs with BLACK padding; image placement and UV stay intact."
                 } else {
-                    "Cyan = full outgoing rect while the previous page arrives; pink = incoming own spine. Current print/edges stay fixed beneath it."
+                    "Cyan = static outgoing image. Pink = common paper spine. Incoming print arrives with BLACK padding; image placement and UV stay intact."
                 },
                 egui::FontId::monospace(12.0),
                 Color32::from_rgb(206, 216, 228),
@@ -1194,25 +1178,6 @@ fn page_turn_projection_snapshot_single_portrait_landscape_eight_routes() {
                     portrait_to_landscape,
                     reading_rtl,
                     forward,
-                    SinglePageTurnSpine::OwnPage,
-                ));
-            }
-        }
-    }
-    snapshots.unwrap();
-}
-
-#[test]
-fn page_turn_projection_snapshot_single_portrait_landscape_moving_spine_eight_routes() {
-    let mut snapshots = egui_kittest::SnapshotResults::default();
-    for portrait_to_landscape in [false, true] {
-        for reading_rtl in [false, true] {
-            for forward in [false, true] {
-                snapshots.extend(snapshot_single_portrait_landscape(
-                    portrait_to_landscape,
-                    reading_rtl,
-                    forward,
-                    SinglePageTurnSpine::Moving,
                 ));
             }
         }

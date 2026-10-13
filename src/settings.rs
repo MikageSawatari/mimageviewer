@@ -4360,14 +4360,6 @@ pub(crate) struct FavoriteViewOverlay {
     pub(crate) common: FavoriteViewState,
 }
 
-/// Temporary single-page motion comparison; remove one option after acceptance.
-#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum SinglePageTurnSpine {
-    #[default]
-    OwnPage,
-    Moving,
-}
-
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct Settings {
     #[serde(default = "default_grid_cols")]
@@ -5157,9 +5149,6 @@ pub struct Settings {
     /// 動きを評価するための仮の演出時間 (ms)。100..=600 に制限する。
     #[serde(default = "default_page_turn_animation_duration_ms")]
     pub page_turn_animation_duration_ms: u32,
-    /// 暫定比較: 自身の綴じ目 (既定) / 旧→新の綴じ目移動。
-    #[serde(default)]
-    pub page_turn_single_spine: SinglePageTurnSpine,
     /// デフォルトの連結方式
     #[serde(default)]
     pub default_reading_flow: ReadingFlow,
@@ -7710,7 +7699,6 @@ impl Default for Settings {
             remember_spread_shift_per_book: true,
             page_turn_animation_enabled: false,
             page_turn_animation_duration_ms: default_page_turn_animation_duration_ms(),
-            page_turn_single_spine: SinglePageTurnSpine::default(),
             default_reading_flow: ReadingFlow::default(),
             default_reading_direction: ReadingDirection::default(),
             final_cover_spread_enabled: true,
@@ -14714,13 +14702,9 @@ mod tests {
         for settings in [Settings::default(), serde_json::from_str("{}").unwrap()] {
             assert!(!settings.page_turn_animation_enabled);
             assert_eq!(settings.page_turn_animation_duration_ms, 200);
-            assert_eq!(
-                settings.page_turn_single_spine,
-                SinglePageTurnSpine::OwnPage
-            );
         }
         let settings: Settings = serde_json::from_str(
-            r#"{"page_turn_animation_enabled":true,"page_turn_animation_duration_ms":350,"page_turn_single_spine":"Moving"}"#,
+            r#"{"page_turn_animation_enabled":true,"page_turn_animation_duration_ms":350}"#,
         )
         .unwrap();
         let restored: Settings =
@@ -14730,8 +14714,38 @@ mod tests {
         let snapshot = restored.preferences_snapshot();
         assert!(snapshot.page_turn_animation_enabled);
         assert_eq!(snapshot.page_turn_animation_duration_ms, 350);
-        assert_eq!(restored.page_turn_single_spine, SinglePageTurnSpine::Moving);
-        assert_eq!(snapshot.page_turn_single_spine, SinglePageTurnSpine::Moving);
+    }
+
+    #[test]
+    fn removed_single_page_turn_spine_is_ignored_and_not_saved() {
+        for legacy_value in [
+            serde_json::json!("OwnPage"),
+            serde_json::json!("Moving"),
+            serde_json::json!("FutureMode"),
+            serde_json::json!(true),
+            serde_json::Value::Null,
+        ] {
+            let settings: Settings = serde_json::from_value(serde_json::json!({
+                "page_turn_animation_enabled": true,
+                "page_turn_animation_duration_ms": 350,
+                "page_turn_single_spine": legacy_value,
+            }))
+            .unwrap();
+            assert!(settings.page_turn_animation_enabled);
+            assert_eq!(settings.page_turn_animation_duration_ms, 350);
+            assert!(
+                serde_json::to_value(&settings)
+                    .unwrap()
+                    .get("page_turn_single_spine")
+                    .is_none()
+            );
+            assert!(
+                serde_json::to_value(settings.preferences_snapshot())
+                    .unwrap()
+                    .get("page_turn_single_spine")
+                    .is_none()
+            );
+        }
     }
 
     #[test]

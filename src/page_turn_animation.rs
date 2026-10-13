@@ -1,6 +1,5 @@
 //! Pure book-leaf projection. Materials and canonical placements are immutable;
 //! this module performs no source resolution, decoding, upload or I/O.
-use crate::settings::SinglePageTurnSpine;
 use egui::{Color32, Mesh, Pos2, Rect, TextureId, pos2};
 
 pub(crate) const MAX_PROJECTION_VERTICES: usize = 4096;
@@ -212,7 +211,6 @@ pub(crate) struct TurnRecipe {
     grid_u: usize,
     grid_v: usize,
     cost: ProjectionCost,
-    pub(crate) single_spine: SinglePageTurnSpine,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProjectionFailure {
@@ -260,6 +258,10 @@ struct Leaf<'a> {
     center_y: f32,
     clip: Rect,
     back: bool,
+    /// Printed image in the paper's display coordinates. Its material keeps
+    /// the original UV basis; black padding owns no page occurrence.
+    image_domain: Rect,
+    black_paper: bool,
 }
 impl Leaf<'_> {
     fn position(&self, u: f32, v: f32) -> Pos2 {
@@ -279,13 +281,28 @@ impl Leaf<'_> {
         };
         pos2(u, v)
     }
+    fn image_parameters(&self) -> Rect {
+        let domain = self.image_domain;
+        if (self.sign < 0.0) != self.back {
+            Rect::from_min_max(
+                pos2(1.0 - domain.right(), domain.top()),
+                pos2(1.0 - domain.left(), domain.bottom()),
+            )
+        } else {
+            domain
+        }
+    }
     fn silhouette(&self) -> Vec<Pos2> {
-        let mut p = vec![
-            self.position(0.0, 0.0),
-            self.position(1.0, 0.0),
-            self.position(1.0, 1.0),
-            self.position(0.0, 1.0),
-        ];
+        self.domain_silhouette(unit_uv())
+    }
+    fn image_silhouette(&self) -> Vec<Pos2> {
+        self.domain_silhouette(self.image_parameters())
+    }
+    fn domain_silhouette(&self, domain: Rect) -> Vec<Pos2> {
+        let mut p: Vec<_> = rectangle(domain)
+            .iter()
+            .map(|p| self.position(p.x, p.y))
+            .collect();
         if signed_area(&p) < 0.0 {
             p.reverse();
         }
@@ -296,6 +313,8 @@ struct Scene<'a> {
     surfaces: Vec<Surface<'a>>,
     leaf: Option<Leaf<'a>>,
     shadow: f32,
+    /// Full common paper below the stationary actual image.
+    black_floor: Option<(Rect, Rect)>,
 }
 
 #[cfg(test)]
@@ -320,19 +339,10 @@ pub(crate) fn project_turn_measured(
     let recipe = prepare_turn(old, new, direction)?;
     project_prepared(old, new, direction, recipe, progress, measure)
 }
-#[cfg(test)]
 pub(crate) fn prepare_turn(
     old: &CanonicalUnit,
     new: &CanonicalUnit,
     direction: TurnDirection,
-) -> Result<TurnRecipe, ProjectionFailure> {
-    prepare_turn_with_single_spine(old, new, direction, SinglePageTurnSpine::OwnPage)
-}
-pub(crate) fn prepare_turn_with_single_spine(
-    old: &CanonicalUnit,
-    new: &CanonicalUnit,
-    direction: TurnDirection,
-    single_spine: SinglePageTurnSpine,
 ) -> Result<TurnRecipe, ProjectionFailure> {
     preflight(old, new)?;
     let cost = admission(old, new, direction)?;
@@ -342,7 +352,7 @@ pub(crate) fn prepare_turn_with_single_spine(
         let mut accepted = None;
         for degrees in [30.0_f32, 45.0, 60.0] {
             let angle = degrees.to_radians();
-            let scene = scene_with_single_spine(old, new, direction, 0.0, angle, single_spine);
+            let scene = scene(old, new, direction, 0.0, angle);
             let receipt = visibility(&scene, new, old);
             if meaningful(&receipt) {
                 accepted = Some(angle);
@@ -376,7 +386,6 @@ pub(crate) fn prepare_turn_with_single_spine(
         grid_u: grid.0,
         grid_v: grid.1,
         cost,
-        single_spine,
     })
 }
 pub(crate) fn project_prepared(
@@ -392,14 +401,7 @@ pub(crate) fn project_prepared(
         return Err(ProjectionFailure::InvalidProgress);
     }
     let mut cost = recipe.cost;
-    let scene = scene_with_single_spine(
-        old,
-        new,
-        direction,
-        progress,
-        recipe.lift,
-        recipe.single_spine,
-    );
+    let scene = scene(old, new, direction, progress, recipe.lift);
     if let Some(start) = start {
         cost.outer_mask_cpu_ms = start.elapsed().as_secs_f64() * 1000.0;
     }
@@ -414,6 +416,14 @@ pub(crate) fn project_prepared(
     }
     let mesh_start = measure.then(std::time::Instant::now);
     let mut meshes = Vec::with_capacity(24);
+    if let Some((paper, clip)) = scene.black_floor {
+        let mut mesh = Mesh::default();
+        append_solid_polygon(&mut mesh, &rectangle(paper.intersect(clip)), Color32::BLACK);
+        meshes.push(ProjectedMesh {
+            mesh,
+            clip_rect: clip,
+        });
+    }
     for surface in &scene.surfaces {
         flat_surface(&mut meshes, surface);
     }
@@ -445,20 +455,10 @@ pub(crate) fn project_prepared(
             } else {
                 0.0
             },
-            if old.layout == UnitLayout::Single
-                && recipe.single_spine == SinglePageTurnSpine::OwnPage
-            {
-                spine(
-                    if direction.forward { old } else { new },
-                    direction.single_leaf_sign(),
-                )
+            if old.layout == UnitLayout::Single {
+                paper_hinge(single_paper(old, new), direction.single_leaf_sign())
             } else {
-                let sign = if old.layout == UnitLayout::Single {
-                    direction.single_leaf_sign()
-                } else {
-                    1.0
-                };
-                moving_hinge(spine(old, sign), spine(new, sign), progress)
+                moving_hinge(spine(old, 1.0), spine(new, 1.0), progress)
             },
             false,
         ),
@@ -478,18 +478,7 @@ pub(crate) fn project_prepared(
 /// trajectory. This includes triangle interpolation between rows, not only
 /// subdivision of the silhouette edge. Convert to destination physical pixels.
 fn mesh_error_bound(old: &CanonicalUnit, new: &CanonicalUnit, nu: usize, nv: usize) -> f32 {
-    let width = old
-        .pages
-        .iter()
-        .chain(&new.pages)
-        .map(|p| p.rect.width())
-        .fold(1.0_f32, f32::max);
-    let height = old
-        .pages
-        .iter()
-        .chain(&new.pages)
-        .map(|p| p.rect.height())
-        .fold(1.0_f32, f32::max);
+    let (width, height) = paper_extent(old, new);
     let distance = max_leaf_distance(old, new);
     let focal = width.max(height).max(distance) * 8.0;
     let near = focal - distance;
@@ -508,19 +497,43 @@ fn meaningful(receipt: &VisibilityReceipt) -> bool {
         .iter()
         .any(|p| p.fraction() >= MIN_VISIBLE_FRACTION && p.short_edge >= MIN_VISIBLE_SHORT_EDGE)
 }
+/// The common single paper covers both canonical placements, including
+/// non-nested rectangles and independent paint-edge rounding.
+fn single_paper(old: &CanonicalUnit, new: &CanonicalUnit) -> Rect {
+    old.pages[0].rect.union(new.pages[0].rect)
+}
+fn paper_hinge(paper: Rect, sign: f32) -> f32 {
+    if sign > 0.0 {
+        paper.left()
+    } else {
+        paper.right()
+    }
+}
+fn paper_extent(old: &CanonicalUnit, new: &CanonicalUnit) -> (f32, f32) {
+    if old.layout == UnitLayout::Single {
+        let paper = single_paper(old, new);
+        (paper.width(), paper.height())
+    } else {
+        old.pages
+            .iter()
+            .chain(&new.pages)
+            .fold((1.0_f32, 1.0_f32), |(w, h), p| {
+                (w.max(p.rect.width()), h.max(p.rect.height()))
+            })
+    }
+}
 fn max_leaf_distance(old: &CanonicalUnit, new: &CanonicalUnit) -> f32 {
+    if old.layout == UnitLayout::Single {
+        return single_paper(old, new).width();
+    }
     [old, new]
         .into_iter()
         .map(|unit| {
-            if unit.layout == UnitLayout::Spread {
-                let h = spine(unit, 1.0);
-                unit.pages
-                    .iter()
-                    .flat_map(|p| [(p.rect.left() - h).abs(), (p.rect.right() - h).abs()])
-                    .fold(1.0_f32, f32::max)
-            } else {
-                unit.pages[0].rect.width()
-            }
+            let h = spine(unit, 1.0);
+            unit.pages
+                .iter()
+                .flat_map(|p| [(p.rect.left() - h).abs(), (p.rect.right() - h).abs()])
+                .fold(1.0_f32, f32::max)
         })
         .fold(1.0_f32, f32::max)
 }
@@ -528,7 +541,7 @@ fn smooth(p: f32) -> f32 {
     let p = p.clamp(0.0, 1.0);
     p * p * (3.0 - 2.0 * p)
 }
-/// Shared by spread option A and the temporary single-page comparison.
+/// Binding trajectory for spread option A.
 fn moving_hinge(h0: f32, h1: f32, progress: f32) -> f32 {
     h0 + (h1 - h0) * smooth(progress)
 }
@@ -584,23 +597,12 @@ fn outer_gate(old: Rect, new: Rect, p: f32) -> Rect {
         ),
     )
 }
-#[cfg(test)]
 fn scene<'a>(
     old: &'a CanonicalUnit,
     new: &'a CanonicalUnit,
     d: TurnDirection,
     p: f32,
     lift: f32,
-) -> Scene<'a> {
-    scene_with_single_spine(old, new, d, p, lift, SinglePageTurnSpine::OwnPage)
-}
-fn scene_with_single_spine<'a>(
-    old: &'a CanonicalUnit,
-    new: &'a CanonicalUnit,
-    d: TurnDirection,
-    p: f32,
-    lift: f32,
-    single_spine: SinglePageTurnSpine,
 ) -> Scene<'a> {
     let mut surfaces = Vec::with_capacity(6);
     if p == 1.0 {
@@ -613,6 +615,7 @@ fn scene_with_single_spine<'a>(
             surfaces,
             leaf: None,
             shadow: 0.0,
+            black_floor: None,
         };
     }
     let pair = old.layout == UnitLayout::Spread;
@@ -644,12 +647,11 @@ fn scene_with_single_spine<'a>(
     };
     let h0 = spine(old, sign);
     let h1 = spine(new, sign);
-    let hinge = if pair || single_spine == SinglePageTurnSpine::Moving {
+    let paper = (!pair).then(|| single_paper(old, new));
+    let hinge = if pair {
         moving_hinge(h0, h1, p)
-    } else if d.forward {
-        h0
     } else {
-        h1
+        paper_hinge(paper.unwrap(), sign)
     };
     let mut leaf_clip = front.clip_rect;
     if !pair {
@@ -739,18 +741,10 @@ fn scene_with_single_spine<'a>(
             interpolate(front.rect.bottom(), back.rect.bottom()),
         )
     } else {
-        let rect = page.rect;
-        // Each single leaf remains bound at its own inner edge. Moving H
-        // translates that binding; subtracting H from the canonical rect
-        // would instead stretch an unbound strip between H and the page.
-        (0.0, rect.width(), rect.top(), rect.bottom())
+        let paper = paper.unwrap();
+        (0.0, paper.width(), paper.top(), paper.bottom())
     };
-    let envelope = old
-        .pages
-        .iter()
-        .chain(&new.pages)
-        .map(|p| p.rect.width().max(p.rect.height()))
-        .fold(1.0_f32, f32::max);
+    let (width, height) = paper_extent(old, new);
     let leaf = Leaf {
         page,
         owner,
@@ -761,15 +755,29 @@ fn scene_with_single_spine<'a>(
         outer,
         top,
         bottom,
-        focal: envelope.max(max_leaf_distance(old, new)) * 8.0,
+        focal: width.max(height).max(max_leaf_distance(old, new)) * 8.0,
         center_y: (top + bottom) * 0.5,
         clip: leaf_clip,
         back: is_back,
+        image_domain: paper.map_or_else(unit_uv, |paper| {
+            Rect::from_min_max(
+                pos2(
+                    (page.rect.left() - paper.left()) / paper.width(),
+                    (page.rect.top() - paper.top()) / paper.height(),
+                ),
+                pos2(
+                    (page.rect.right() - paper.left()) / paper.width(),
+                    (page.rect.bottom() - paper.top()) / paper.height(),
+                ),
+            )
+        }),
+        black_paper: paper.is_some(),
     };
     Scene {
         surfaces,
         leaf: (!vacant(page)).then_some(leaf),
         shadow: if vacant(page) { 0.0 } else { theta.sin().abs() },
+        black_floor: paper.map(|paper| (paper, front.clip_rect)),
     }
 }
 fn surface(page: &CanonicalPage, rect: Rect, owner: FaceOwner, alpha: f32) -> Surface<'_> {
@@ -932,16 +940,42 @@ pub(crate) fn static_surface_loss(
     ProjectionCost::default()
 }
 fn visibility(scene: &Scene<'_>, new: &CanonicalUnit, old: &CanonicalUnit) -> VisibilityReceipt {
-    let mut faces: Vec<(Vec<Pos2>, FaceOwner)> = scene
-        .surfaces
-        .iter()
-        .filter(|s| !vacant(s.page) && s.alpha > 0.0 && !s.polygon.is_empty())
-        .map(|s| (s.polygon.clone(), s.owner))
-        .collect();
+    // One physical face can have less printed content than its opaque paper.
+    // Subtract its occlusion once; separately subtracting its printed subset
+    // re-splits coplanar boundaries and can duplicate f32 polygon fragments.
+    struct VisibilityFace {
+        visible: Vec<Pos2>,
+        occlusion: Vec<Pos2>,
+        owner: FaceOwner,
+    }
+    let mut faces = Vec::with_capacity(scene.surfaces.len() + 2);
+    if let Some((paper, clip)) = scene.black_floor {
+        faces.push(VisibilityFace {
+            visible: Vec::new(),
+            occlusion: rectangle(paper.intersect(clip)),
+            owner: FaceOwner::Other,
+        });
+    }
+    faces.extend(
+        scene
+            .surfaces
+            .iter()
+            .filter(|s| !vacant(s.page) && s.alpha > 0.0 && !s.polygon.is_empty())
+            .map(|s| VisibilityFace {
+                visible: s.polygon.clone(),
+                occlusion: s.polygon.clone(),
+                owner: s.owner,
+            }),
+    );
     if let Some(leaf) = &scene.leaf {
-        let polygon = leaf.silhouette();
-        if polygon_area(&polygon) > 0.001 {
-            faces.push((polygon, leaf.owner));
+        let visible = leaf.image_silhouette();
+        let occlusion = leaf.silhouette();
+        if polygon_area(&occlusion) > 0.001 {
+            faces.push(VisibilityFace {
+                visible,
+                occlusion,
+                owner: leaf.owner,
+            });
         }
     }
     let mut receipt = VisibilityReceipt {
@@ -966,16 +1000,16 @@ fn visibility(scene: &Scene<'_>, new: &CanonicalUnit, old: &CanonicalUnit) -> Vi
             .map(|p| area(p.rect.intersect(p.clip_rect)))
             .sum(),
     };
-    for (i, (poly, owner)) in faces.iter().enumerate() {
-        let mut pieces = vec![poly.clone()];
-        for (cover, _) in &faces[i + 1..] {
+    for (i, face) in faces.iter().enumerate() {
+        let mut pieces = vec![face.visible.clone()];
+        for cover in &faces[i + 1..] {
             pieces = pieces
                 .into_iter()
-                .flat_map(|p| subtract_polygon(&p, cover))
+                .flat_map(|p| subtract_polygon(&p, &cover.occlusion))
                 .collect();
         }
         for polygon in pieces {
-            match owner {
+            match &face.owner {
                 FaceOwner::Incoming(id) => {
                     if let Some(v) = receipt.incoming.iter_mut().find(|v| v.occurrence == *id) {
                         v.visible_area += polygon_area(&polygon);
@@ -1046,8 +1080,8 @@ fn leaf_meshes(meshes: &mut Vec<ProjectedMesh>, leaf: &Leaf<'_>, grid_u: usize, 
     if vacant(leaf.page) {
         return;
     }
-    // Neutral paper belongs only to the unknown reverse/edge. It never borrows
-    // black/checker background and does not change the printed face's alpha.
+    // Preserve the existing neutral thickness/edge and printed-face shading.
+    // Single-page padding is an opaque black paper below the original image.
     let silhouette = leaf.silhouette();
     let paper = PageMaterial::Blank {
         color: Color32::from_rgb(238, 236, 230),
@@ -1068,30 +1102,52 @@ fn leaf_meshes(meshes: &mut Vec<ProjectedMesh>, leaf: &Leaf<'_>, grid_u: usize, 
     if silhouette.len() < 3 {
         return;
     }
-    let materials: Vec<&PageMaterial> = if leaf.theta.cos().abs() < 0.00001 {
-        vec![&paper]
+    let black = PageMaterial::Blank {
+        color: Color32::BLACK,
+    };
+    let mut materials = Vec::with_capacity(3);
+    if leaf.black_paper {
+        materials.push((&black, unit_uv()));
+    }
+    if leaf.theta.cos().abs() < 0.00001 {
+        materials.push((&paper, unit_uv()));
     } else {
-        leaf.page
+        for material in leaf
+            .page
             .underlay
             .iter()
             .chain(std::iter::once(&leaf.page.material))
-            .collect()
-    };
-    for material in materials {
+        {
+            materials.push((material, leaf.image_parameters()));
+        }
+    }
+    for (material, domain) in materials {
         let (texture, color) = material_style(material);
         let mut mesh = Mesh::with_texture(texture);
-        // Interior mesh is clipped by the same destination/aperture as silhouette.
-        // egui's scissor handles clipping; UVs preserve each material's own basis.
+        // Subdivide only this printed domain, with the same whole-paper light
+        // basis. Grid-local display coordinates preserve original ROI corners
+        // exactly instead of roundtripping through the normalized paper rect.
         for y in 0..=grid_v {
             for x in 0..=grid_u {
-                let u = x as f32 / grid_u as f32;
-                let v = y as f32 / grid_v as f32;
+                let local_u = x as f32 / grid_u as f32;
+                let local_v = y as f32 / grid_v as f32;
+                let interpolate = |a: f32, b: f32, t: f32| {
+                    if t == 0.0 {
+                        a
+                    } else if t == 1.0 {
+                        b
+                    } else {
+                        a + (b - a) * t
+                    }
+                };
+                let u = interpolate(domain.left(), domain.right(), local_u);
+                let v = interpolate(domain.top(), domain.bottom(), local_v);
                 let light = (0.84 + 0.16 * leaf.theta.cos().abs()
                     - 0.10 * leaf.theta.sin().abs() * u)
                     .max(0.72);
                 mesh.vertices.push(egui::epaint::Vertex {
                     pos: leaf.position(u, v),
-                    uv: material_uv(material, leaf.display(u, v)),
+                    uv: material_uv(material, leaf.display(local_u, local_v)),
                     color: shade_color(color, light),
                 });
             }
@@ -1119,8 +1175,17 @@ fn shadow(meshes: &mut Vec<ProjectedMesh>, scene: &Scene<'_>, leaf: &Leaf<'_>) {
         return;
     }
     let center = pos2(leaf.hinge, leaf.center_y);
-    // Six low-alpha rings approximate a soft contact shadow. Each is clipped
-    // to actual visible receiving surfaces, including the outer-expansion gate.
+    // Six low-alpha rings approximate a soft contact shadow. Single turns
+    // receive on the full paper; spreads retain their actual outer gates.
+    let receivers: Vec<_> = if let Some((paper, clip)) = scene.black_floor {
+        vec![(rectangle(paper.intersect(clip)), 1.0)]
+    } else {
+        scene
+            .surfaces
+            .iter()
+            .map(|s| (s.polygon.clone(), s.alpha))
+            .collect()
+    };
     let mut mesh = Mesh::default();
     for ring in (0..6).rev() {
         let spread = (ring as f32 + 1.0) * 1.8 * scene.shadow;
@@ -1131,15 +1196,15 @@ fn shadow(meshes: &mut Vec<ProjectedMesh>, scene: &Scene<'_>, leaf: &Leaf<'_>) {
                     + egui::vec2(-leaf.sign * scene.shadow * 7.0, scene.shadow * 5.0)
             })
             .collect();
-        for receiver in &scene.surfaces {
-            if receiver.alpha <= 0.0 {
+        for (receiver, alpha) in &receivers {
+            if *alpha <= 0.0 {
                 continue;
             }
-            let poly = clip_polygon(&shifted, &receiver.polygon);
+            let poly = clip_polygon(&shifted, receiver);
             append_solid_polygon(
                 &mut mesh,
                 &poly,
-                Color32::from_black_alpha((6.0 * scene.shadow * receiver.alpha) as u8),
+                Color32::from_black_alpha((6.0 * scene.shadow * alpha) as u8),
             );
         }
     }
@@ -1183,7 +1248,6 @@ fn incoming_owner(page: &CanonicalPage) -> FaceOwner {
     page.occurrence
         .map_or(FaceOwner::Other, FaceOwner::Incoming)
 }
-#[cfg(test)]
 fn unit_uv() -> Rect {
     Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0))
 }
@@ -1257,12 +1321,21 @@ fn clip_rect(poly: &[Pos2], rect: Rect) -> Vec<Pos2> {
     clip_polygon(poly, &rectangle(rect))
 }
 fn subtract_polygon(poly: &[Pos2], cover: &[Pos2]) -> Vec<Vec<Pos2>> {
-    if cover.len() < 3 {
+    // Match the physical-face visibility gate: empty or degenerate cover
+    // has no opaque interior and cannot remove a polygon.
+    if cover.len() < 3 || polygon_area(cover) <= 0.001 {
         return vec![poly.to_vec()];
     }
     let mut remaining = poly.to_vec();
     let mut result = Vec::with_capacity(cover.len());
     for (a, b) in edges(cover) {
+        // Scissor intersections can repeat a corner. A zero-length edge has
+        // dp == 0 for every point, so inside and outside would both retain the
+        // entire remainder and incorrectly count it twice. It defines no
+        // half-plane; ignore it rather than adding an epsilon or moving edges.
+        if a == b {
+            continue;
+        }
         let outside = clip_half(&remaining, a, b, false);
         if polygon_area(&outside) > 0.001 {
             result.push(outside);
@@ -1488,11 +1561,8 @@ mod tests {
                     } else {
                         &new.pages[0]
                     };
-                    let hinge = if reading_rtl {
-                        moving.rect.right()
-                    } else {
-                        moving.rect.left()
-                    };
+                    let paper = single_paper(&old, &new);
+                    let hinge = paper_hinge(paper, direction.single_leaf_sign());
                     let mut previous_angle = if forward { 0.0 } else { 90.0 };
                     let mut previous_free_x: Option<f32> = None;
                     for step in 0..200 {
@@ -1500,8 +1570,8 @@ mod tests {
                         let pose = scene(&old, &new, direction, progress, recipe.lift);
                         let leaf = pose.leaf.as_ref().unwrap();
                         assert_eq!(leaf.hinge, hinge);
-                        assert_eq!(leaf.position(0.0, 0.0), pos2(hinge, moving.rect.top()));
-                        assert_eq!(leaf.position(0.0, 1.0), pos2(hinge, moving.rect.bottom()));
+                        assert_eq!(leaf.position(0.0, 0.0), pos2(hinge, paper.top()));
+                        assert_eq!(leaf.position(0.0, 1.0), pos2(hinge, paper.bottom()));
                         assert!(!leaf.back);
                         assert!(std::ptr::eq(leaf.page, moving));
                         assert!(matches!(leaf.owner, FaceOwner::OutgoingFront) == forward);
@@ -1516,7 +1586,7 @@ mod tests {
                         if let Some(previous) = previous_free_x {
                             // Dense adjacent clock poses must move the same free
                             // edge continuously, without swapping hinges or sheets.
-                            assert!((free_x - previous).abs() < moving.rect.width() * 0.025);
+                            assert!((free_x - previous).abs() < paper.width() * 0.025);
                         }
                         previous_free_x = Some(free_x);
                         let screen_left_u = if reading_rtl { 1.0 } else { 0.0 };
@@ -1559,91 +1629,216 @@ mod tests {
         }
     }
     #[test]
-    fn single_portrait_landscape_both_spines_move_only_the_leaf_and_keep_the_whole_floor_static() {
+    fn single_common_paper_preserves_actual_image_and_static_floor_in_eight_routes() {
         let mut poses = 0;
         let viewport = Rect::from_min_max(pos2(0.0, 44.0), pos2(1600.0, 944.0));
         let portrait = Rect::from_min_max(pos2(488.5, 44.0), pos2(1111.5, 944.0));
-        let landscape = Rect::from_min_max(pos2(0.0, 44.0), pos2(1600.0, 944.0));
+        let landscape = viewport;
+        let basis = [
+            pos2(0.17, 0.83),
+            pos2(0.17, 0.11),
+            pos2(0.91, 0.11),
+            pos2(0.91, 0.83),
+        ];
         for (old_rect, new_rect) in [(portrait, landscape), (landscape, portrait)] {
             let (mut old, mut new) = fixture(false);
             old.pages[0].rect = old_rect;
             new.pages[0].rect = new_rect;
-            old.pages[0].clip_rect = viewport;
-            new.pages[0].clip_rect = viewport;
+            for page in old.pages.iter_mut().chain(&mut new.pages) {
+                page.clip_rect = viewport;
+                if let PageMaterial::Texture { uv, .. } = &mut page.material {
+                    *uv = basis;
+                }
+            }
             for reading_rtl in [false, true] {
                 for forward in [false, true] {
                     let d = TurnDirection {
                         reading_rtl,
                         forward,
                     };
-                    for single_spine in [SinglePageTurnSpine::OwnPage, SinglePageTurnSpine::Moving]
+                    let recipe = prepare_turn(&old, &new, d).unwrap();
+                    let (moving, floor) = if forward {
+                        (&old.pages[0], &new.pages[0])
+                    } else {
+                        (&new.pages[0], &old.pages[0])
+                    };
+                    let paper = old_rect.union(new_rect);
+                    let hinge = paper_hinge(paper, d.single_leaf_sign());
+                    for progress in [0.0, 0.000001, 0.0001]
+                        .into_iter()
+                        .chain((1..200).map(|i| i as f32 / 200.0))
+                        .chain([0.999999])
                     {
-                        let recipe =
-                            prepare_turn_with_single_spine(&old, &new, d, single_spine).unwrap();
-                        let (moving, floor) = if forward {
-                            (&old.pages[0], &new.pages[0])
-                        } else {
-                            (&new.pages[0], &old.pages[0])
+                        let pose = scene(&old, &new, d, progress, recipe.lift);
+                        assert_eq!(pose.black_floor, Some((paper, viewport)));
+                        assert_eq!(pose.surfaces.len(), 1, "only one stationary actual image");
+                        let rest = &pose.surfaces[0];
+                        assert!(std::ptr::eq(rest.page, floor));
+                        assert_eq!(rest.rect, floor.rect);
+                        assert_eq!(rest.polygon, rectangle(floor.rect.intersect(viewport)));
+                        assert_eq!(rest.alpha, 1.0);
+                        let leaf = pose.leaf.as_ref().unwrap();
+                        assert!(std::ptr::eq(leaf.page, moving));
+                        assert!(leaf.black_paper);
+                        assert_eq!(leaf.top, paper.top());
+                        assert_eq!(leaf.bottom, paper.bottom());
+                        assert_eq!(leaf.outer - leaf.inner, paper.width());
+                        assert_eq!(leaf.hinge, hinge);
+                        assert_eq!(leaf.inner, 0.0);
+                        let domain = leaf.image_domain;
+                        assert!(
+                            (paper.left() + domain.left() * paper.width() - moving.rect.left())
+                                .abs()
+                                < 0.001
+                        );
+                        assert!(
+                            (paper.right()
+                                - (1.0 - domain.right()) * paper.width()
+                                - moving.rect.right())
+                            .abs()
+                                < 0.001
+                        );
+                        assert!(matches!(leaf.owner, FaceOwner::OutgoingFront) == forward);
+                        let projection =
+                            project_prepared(&old, &new, d, recipe, progress, false).unwrap();
+                        assert!(!projection.finished);
+                        // Black meshes have no borrowed texture; original image
+                        // grid spans only its domain and uses original UV corners.
+                        let texture = match moving.material {
+                            PageMaterial::Texture { texture_id, .. } => texture_id,
+                            _ => unreachable!(),
                         };
-                        for progress in [0.0, 0.000001, 0.0001]
-                            .into_iter()
-                            .chain((1..200).map(|i| i as f32 / 200.0))
-                            .chain([0.999999])
+                        if let Some(printed) = projection
+                            .meshes
+                            .iter()
+                            .find(|m| m.mesh.texture_id == texture)
                         {
-                            let pose = scene_with_single_spine(
-                                &old,
-                                &new,
-                                d,
-                                progress,
-                                recipe.lift,
-                                single_spine,
-                            );
-                            assert_eq!(pose.surfaces.len(), 1, "only one stationary floor");
-                            let rest = &pose.surfaces[0];
-                            assert!(std::ptr::eq(rest.page, floor));
-                            assert_eq!(rest.rect, floor.rect);
-                            assert_eq!(rest.polygon, rectangle(floor.rect.intersect(viewport)));
-                            assert_eq!(rest.alpha, 1.0, "floor neither fades nor expands");
-                            let leaf = pose.leaf.as_ref().unwrap();
-                            assert!(std::ptr::eq(leaf.page, moving));
-                            assert_eq!(leaf.top, moving.rect.top());
-                            assert_eq!(leaf.bottom, moving.rect.bottom());
-                            assert_eq!(leaf.outer - leaf.inner, moving.rect.width());
-                            assert_eq!(
-                                leaf.hinge,
-                                if single_spine == SinglePageTurnSpine::Moving {
-                                    moving_hinge(
-                                        spine(&old, d.single_leaf_sign()),
-                                        spine(&new, d.single_leaf_sign()),
-                                        progress,
-                                    )
-                                } else if reading_rtl {
-                                    moving.rect.right()
-                                } else {
-                                    moving.rect.left()
-                                }
-                            );
-                            assert_eq!(leaf.inner, 0.0, "leaf edge stays bound to H");
-                            assert!(matches!(leaf.owner, FaceOwner::OutgoingFront) == forward);
-                            if let FaceOwner::Incoming(id) = leaf.owner {
-                                assert_eq!(Some(id), moving.occurrence);
+                            let params = leaf.image_parameters();
+                            for (index, uv, parameter) in [
+                                (
+                                    0,
+                                    if reading_rtl { basis[1] } else { basis[0] },
+                                    params.left_top(),
+                                ),
+                                (
+                                    recipe.grid_u,
+                                    if reading_rtl { basis[0] } else { basis[1] },
+                                    params.right_top(),
+                                ),
+                                (
+                                    recipe.grid_v * (recipe.grid_u + 1),
+                                    if reading_rtl { basis[2] } else { basis[3] },
+                                    params.left_bottom(),
+                                ),
+                                (
+                                    (recipe.grid_v + 1) * (recipe.grid_u + 1) - 1,
+                                    if reading_rtl { basis[3] } else { basis[2] },
+                                    params.right_bottom(),
+                                ),
+                            ] {
+                                assert_eq!(printed.mesh.vertices[index].uv, uv);
+                                assert_eq!(
+                                    printed.mesh.vertices[index].pos,
+                                    leaf.position(parameter.x, parameter.y)
+                                );
                             }
-                            let projection =
-                                project_prepared(&old, &new, d, recipe, progress, false).unwrap();
-                            assert!(!projection.finished);
-                            poses += 1;
+                        } else {
+                            assert!(leaf.theta.cos().abs() < 0.00001);
                         }
-                        let landed =
-                            scene_with_single_spine(&old, &new, d, 1.0, recipe.lift, single_spine);
-                        assert!(landed.leaf.is_none());
-                        assert_eq!(landed.surfaces.len(), 1);
-                        assert!(std::ptr::eq(landed.surfaces[0].page, &new.pages[0]));
-                        assert_eq!(landed.surfaces[0].rect, new_rect);
+                        assert_eq!(projection.meshes[0].mesh.vertices.len(), 4);
+                        assert!(
+                            projection.meshes[0]
+                                .mesh
+                                .vertices
+                                .iter()
+                                .all(|v| v.color == Color32::BLACK)
+                        );
+                        let receipt = &projection.visibility;
+                        if forward {
+                            assert!(
+                                (receipt.outgoing_front_area
+                                    - polygon_area(&leaf.image_silhouette()))
+                                .abs()
+                                    < 0.1
+                            );
+                            let expected: f32 = subtract_polygon(&rest.polygon, &leaf.silhouette())
+                                .iter()
+                                .map(|p| polygon_area(p))
+                                .sum();
+                            assert!((receipt.incoming[0].visible_area - expected).abs() < 0.5);
+                            assert!(
+                                receipt.incoming[0].visible_area
+                                    <= receipt.incoming[0].canonical_visible_area + 0.5,
+                                "static floor visibility cannot gain area from polygon subdivision"
+                            );
+                        } else {
+                            assert!(
+                                (receipt.incoming[0].visible_area
+                                    - polygon_area(&leaf.image_silhouette()))
+                                .abs()
+                                    < 0.5
+                            );
+                        }
+                        poses += 1;
                     }
+                    let landed = scene(&old, &new, d, 1.0, recipe.lift);
+                    assert!(landed.leaf.is_none());
+                    assert!(
+                        landed.black_floor.is_none(),
+                        "no black paper remains over a customized canvas at terminal"
+                    );
+                    assert_eq!(landed.surfaces.len(), 1);
+                    assert!(std::ptr::eq(landed.surfaces[0].page, &new.pages[0]));
+                    assert_eq!(landed.surfaces[0].rect, new_rect);
                 }
             }
         }
-        assert_eq!(poses, 16 * 203);
+        assert_eq!(poses, 8 * 203);
+    }
+    #[test]
+    fn single_padding_occludes_floor_without_counting_as_printed_visibility() {
+        let (mut old, mut new) = fixture(false);
+        old.pages[0].rect = Rect::from_min_max(pos2(488.5, 44.0), pos2(1111.5, 944.0));
+        new.pages[0].rect = Rect::from_min_max(pos2(0.0, 44.0), pos2(1600.0, 944.0));
+        let d = TurnDirection {
+            reading_rtl: false,
+            forward: true,
+        };
+        let recipe = prepare_turn(&old, &new, d).unwrap();
+        let pose = scene(&old, &new, d, 0.0, recipe.lift);
+        let leaf = pose.leaf.as_ref().unwrap();
+        let actual = polygon_area(&leaf.image_silhouette());
+        let paper = polygon_area(&leaf.silhouette());
+        assert!(paper > actual * 2.0);
+        let receipt = visibility(&pose, &new, &old);
+        assert!((receipt.outgoing_front_area - actual).abs() < 0.1);
+        let image_only_reveal: f32 =
+            subtract_polygon(&pose.surfaces[0].polygon, &leaf.image_silhouette())
+                .iter()
+                .map(|p| polygon_area(p))
+                .sum();
+        assert!(image_only_reveal > receipt.incoming[0].visible_area + 10000.0);
+    }
+    #[test]
+    fn single_shifted_image_rect_union_bounds_perspective_and_mesh_error() {
+        let (mut old, mut new) = fixture(false);
+        old.pages[0].rect = Rect::from_min_max(pos2(100.0, 60.0), pos2(460.0, 600.0));
+        new.pages[0].rect = Rect::from_min_max(pos2(500.0, 180.0), pos2(860.0, 720.0));
+        let paper = single_paper(&old, &new);
+        assert_eq!(paper_extent(&old, &new), (760.0, 660.0));
+        assert_eq!(max_leaf_distance(&old, &new), paper.width());
+        for reading_rtl in [false, true] {
+            let d = TurnDirection {
+                reading_rtl,
+                forward: false,
+            };
+            let recipe = prepare_turn(&old, &new, d).unwrap();
+            assert!(mesh_error_bound(&old, &new, recipe.grid_u, recipe.grid_v) <= 0.5);
+            let pose = scene(&old, &new, d, 0.2, recipe.lift);
+            let leaf = pose.leaf.unwrap();
+            assert_eq!(leaf.focal, paper.width() * 8.0);
+            assert_eq!(leaf.hinge, paper_hinge(paper, d.single_leaf_sign()));
+        }
     }
     #[test]
     fn unequal_scan_and_height_are_admitted_but_a_spine_outside_its_gap_is_not() {
@@ -1743,6 +1938,40 @@ mod tests {
         let pieces = subtract_polygon(&rect, &triangle);
         assert!((pieces.iter().map(|p| polygon_area(p)).sum::<f32>() - 5000.0).abs() < 0.01);
         assert!(pieces.iter().all(|p| inscribed_short_edge(p) < 100.0));
+    }
+    #[test]
+    fn polygon_occlusion_ignores_repeated_scissor_corners_without_duplicate_fragments() {
+        let subject = rectangle(Rect::from_min_max(pos2(0.0, 0.0), pos2(100.0, 100.0)));
+        let cover = rectangle(Rect::from_min_max(pos2(50.0, 0.0), pos2(100.0, 100.0)));
+        let repeated: Vec<_> = cover.iter().flat_map(|p| [*p, *p]).collect();
+        let expected = subtract_polygon(&subject, &cover);
+        let actual = subtract_polygon(&subject, &repeated);
+        assert_eq!(actual, expected);
+        assert!((actual.iter().map(|p| polygon_area(p)).sum::<f32>() - 5000.0).abs() < 0.01);
+        // Exercise the producer too: clipping a boundary point can emit the
+        // same corner for both retained endpoint and crossing intersection.
+        let clipped = clip_rect(
+            &rectangle(Rect::from_min_max(pos2(50.0, -10.0), pos2(100.0, 110.0))),
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(100.0, 100.0)),
+        );
+        let actual = subtract_polygon(&subject, &clipped);
+        assert!((actual.iter().map(|p| polygon_area(p)).sum::<f32>() - 5000.0).abs() < 0.01);
+    }
+    #[test]
+    fn empty_or_degenerate_occlusion_preserves_the_subject() {
+        let subject = rectangle(Rect::from_min_max(pos2(0.0, 0.0), pos2(100.0, 100.0)));
+        for cover in [
+            vec![],
+            vec![pos2(50.0, 50.0); 4],
+            vec![
+                pos2(20.0, 20.0),
+                pos2(50.0, 50.0),
+                pos2(80.0, 80.0),
+                pos2(20.0, 20.0),
+            ],
+        ] {
+            assert_eq!(subtract_polygon(&subject, &cover), vec![subject.clone()]);
+        }
     }
     #[test]
     fn visibility_is_identical_at_two_independent_tessellation_densities() {

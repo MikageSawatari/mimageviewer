@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 
 mod barrier;
 #[cfg(test)]
+mod cover_tests;
+#[cfg(test)]
 mod input_regression_tests;
 #[cfg(test)]
 mod landscape_tests;
@@ -823,7 +825,6 @@ fn prepare_leaf(
     outgoing: &PaintedUnit,
     incoming: &PaintedUnit,
     forward: bool,
-    single_spine: crate::settings::SinglePageTurnSpine,
 ) -> Result<PreparedLeaf, &'static str> {
     let start = crate::perf::is_enabled().then(Instant::now);
     let outgoing = canonical_unit(outgoing)?;
@@ -832,13 +833,8 @@ fn prepare_leaf(
         reading_rtl: incoming.reading_rtl,
         forward,
     };
-    let recipe = crate::page_turn_animation::prepare_turn_with_single_spine(
-        &outgoing,
-        &input,
-        direction,
-        single_spine,
-    )
-    .map_err(|e| e.sub_check())?;
+    let recipe = crate::page_turn_animation::prepare_turn(&outgoing, &input, direction)
+        .map_err(|e| e.sub_check())?;
     Ok(PreparedLeaf {
         outgoing,
         incoming: input,
@@ -929,8 +925,26 @@ impl PageTurnPresentation {
     pub(crate) fn has_flat_completion(&self) -> bool {
         matches!(self.state, PresentationState::Completing { .. })
     }
-    pub(crate) fn cancel_for_settings(&mut self) {
+    pub(crate) fn cancel_for_settings(&mut self, leases: &mut PageTurnLeaseInventory) {
         self.cancel("settings_changed");
+        match &mut self.state {
+            PresentationState::Flat(_) => self.state = PresentationState::Inactive,
+            PresentationState::Completing {
+                incoming,
+                completion,
+                ..
+            } => {
+                // The old output's hook can still accept its receipt later.
+                // Give the next canonical geometry its own acceptance evidence.
+                *incoming = Arc::new(PaintedUnit {
+                    evidence: AcceptanceEvidence::Deferred(Arc::new(AtomicBool::new(false))),
+                    ..(**incoming).clone()
+                });
+                leases.register(incoming);
+                *completion = FlatCompletion::NeedFlat;
+            }
+            _ => {}
+        }
         // A continuation has its own immutable fact. Old raw input is not
         // eligible for a new offer when the setting is turned on again.
         self.transaction = OperationTransaction::default();
@@ -1098,6 +1112,17 @@ fn emit(
 ) {
     #[cfg(test)]
     TEST_EVENTS.with(|events| events.borrow_mut().push((*fact, kind, reason)));
+    if kind == "skip" {
+        let sub_check = extra
+            .iter()
+            .find(|(key, _)| *key == "sub_check")
+            .and_then(|(_, value)| value.as_str())
+            .unwrap_or(reason);
+        crate::logger::log(format!(
+            "[page-turn] skip reason={reason} sub_check={sub_check} operation={:?} context={:?}",
+            fact.operation_id, fact.destination.context
+        ));
+    }
     if !crate::perf::is_enabled() {
         return;
     }
@@ -1143,8 +1168,8 @@ pub(crate) fn take_test_events() -> Vec<(ViewerOperationFact, &'static str, &'st
 impl App {
     /// Preferences and HUD adopt the same global setting before any next turn.
     pub(crate) fn adopt_page_turn_animation_settings(&mut self, enabled: bool, duration_ms: u32) {
-        if self.settings.page_turn_animation_enabled
-            && (!enabled || self.settings.page_turn_animation_duration_ms != duration_ms)
+        if self.settings.page_turn_animation_enabled != enabled
+            || (enabled && self.settings.page_turn_animation_duration_ms != duration_ms)
         {
             self.cancel_all_page_turn_effects_for_settings();
         }
@@ -1578,6 +1603,7 @@ impl App {
         // Only raster quality/layout metadata may change during the frozen turn.
         // A real viewport/view change remains ordinary cancellation/rebinding.
         if a.viewport_rect != b.viewport_rect
+            || a.placement != b.placement
             || a.pixels_per_point != b.pixels_per_point
             || a.rotation != b.rotation
             || a.free_rotation_rad != b.free_rotation_rad
@@ -1985,12 +2011,7 @@ impl App {
                     && deadline_allows
                     && now.saturating_duration_since(offer.accepted_at) < offer.duration
                 {
-                    match prepare_leaf(
-                        &outgoing,
-                        &unit,
-                        offer.forward,
-                        self.settings.page_turn_single_spine,
-                    ) {
+                    match prepare_leaf(&outgoing, &unit, offer.forward) {
                         Ok(projection) => {
                             // Include the ordinary prepared native ROI as well as
                             // the accepted source, globally deduplicated.
@@ -2212,7 +2233,7 @@ impl App {
                             outer_mask_ms: projection.cost.outer_mask_cpu_ms,
                             visible_pages: actual_visibility.iter().fold(0, |mask, v| if v.fraction() >= 0.05 && v.short_edge >= 8.0 { mask | (1 << v.occurrence) } else { mask }),
                             proof: crate::perf::is_enabled()
-                                .then(||serde_json::json!({"recipe":if unit.mode.is_spread() { "BookLeaf" } else if offer.forward { "SingleDeparture" } else { "SingleArrival" },"single_spine":format!("{:?}",prepared.recipe.single_spine),"angle_degrees":projection.angle_degrees,"hinge_x":projection.hinge_x,"face":if projection.showing_back {"back"} else {"front"},"recipe_prepare_cpu_ms":prepared.prepare_cpu_ms,"mesh":mesh_stats,"static_clip_loss_fraction":projection.cost.static_clip_loss_fraction,"static_support_loss_fraction":projection.cost.static_support_loss_fraction,"visible":actual_visibility.iter().map(|v|serde_json::json!({"occurrence":v.occurrence,"area":v.visible_area,"fraction":v.fraction(),"short_edge":v.short_edge})).collect::<Vec<_>>(),"projection_faces":projection.visibility.incoming.iter().map(|v|serde_json::json!({"face":v.occurrence,"area":v.visible_area,"fraction":v.fraction(),"short_edge":v.short_edge})).collect::<Vec<_>>(),"incoming":unit_diagnostics(incoming,offer),"outgoing":unit_diagnostics(outgoing,offer)})),
+                                .then(||serde_json::json!({"recipe":if unit.mode.is_spread() { "BookLeaf" } else if offer.forward { "SingleDeparture" } else { "SingleArrival" },"angle_degrees":projection.angle_degrees,"hinge_x":projection.hinge_x,"face":if projection.showing_back {"back"} else {"front"},"recipe_prepare_cpu_ms":prepared.prepare_cpu_ms,"mesh":mesh_stats,"static_clip_loss_fraction":projection.cost.static_clip_loss_fraction,"static_support_loss_fraction":projection.cost.static_support_loss_fraction,"visible":actual_visibility.iter().map(|v|serde_json::json!({"occurrence":v.occurrence,"area":v.visible_area,"fraction":v.fraction(),"short_edge":v.short_edge})).collect::<Vec<_>>(),"projection_faces":projection.visibility.incoming.iter().map(|v|serde_json::json!({"face":v.occurrence,"area":v.visible_area,"fraction":v.fraction(),"short_edge":v.short_edge})).collect::<Vec<_>>(),"incoming":unit_diagnostics(incoming,offer),"outgoing":unit_diagnostics(outgoing,offer)})),
                         });
                         curl = true;
                         ctx.request_repaint();
@@ -2388,6 +2409,9 @@ impl App {
         if incoming.same_material_and_geometry(&fresh) {
             return;
         }
+        // OFF also retains the source through canonical adoption. Geometry
+        // rebinding replaces the Arc, so keep its weak global inventory binding.
+        self.page_turn_leases.register(&fresh);
         if let PresentationState::Completing {
             incoming,
             completion,
@@ -2586,7 +2610,12 @@ fn emit_projection_failure(
     if !crate::perf::is_enabled() {
         // Keep the light event observable by handler tests without constructing
         // geometry diagnostics or enabling the process-wide perf logger.
-        emit(&offer.fact, kind, "geometry_visibility_or_roi", &[]);
+        emit(
+            &offer.fact,
+            kind,
+            "geometry_visibility_or_roi",
+            &[("sub_check", reason.into())],
+        );
         return;
     }
     let loss = canonical_unit(outgoing)
@@ -2725,16 +2754,6 @@ fn canonical_unit(
         let window = if displayed_landscape(&page.transform) {
             SpreadWindow::Landscape
         } else {
-            // A cover's physical mapping is a separate stage. Body and tail
-            // singleton shapes keep their normal placement and vacant slot.
-            if unit.mode.has_cover()
-                && unit
-                    .layout
-                    .first()
-                    .is_some_and(|first| first.pages.first() == Some(&page.occurrence.idx))
-            {
-                return Err("stage1_portrait_cover");
-            }
             let (side, gap) = match page.transform.placement {
                 ResolvedDisplayPlacement::SingletonSpread { side, gap, .. } => (side, gap),
                 ResolvedDisplayPlacement::Z {
@@ -2744,6 +2763,35 @@ fn canonical_unit(
                 } => (singleton_side, singleton_gap),
                 ResolvedDisplayPlacement::Normal { .. } => (SingletonSpreadPlacement::Center, 0.0),
             };
+            if unit.mode.has_cover()
+                && unit
+                    .layout
+                    .first()
+                    .is_some_and(|first| first.pages.first() == Some(&page.occurrence.idx))
+            {
+                let first = &unit.layout[0];
+                let cover_side = if unit.mode.is_rtl() {
+                    SingletonSpreadPlacement::Left
+                } else {
+                    SingletonSpreadPlacement::Right
+                };
+                // A raw cover index can also be a supplement or a shifted unit.
+                // Only the builder's real first unpaired Navigation leaf on its
+                // resolved cover side establishes a physical front cover.
+                if first.pages != [page.occurrence.idx]
+                    || !matches!(
+                        first.formation,
+                        SpreadDisplayUnitFormation::Singleton(
+                            SpreadDisplaySingletonCause::UnpairedSlot
+                        )
+                    )
+                    || page.occurrence.role != SpreadPageRole::Navigation
+                    || page.occurrence.navigation_anchor_idx != page.occurrence.idx
+                    || side != cover_side
+                {
+                    return Err("cover_side_not_proven");
+                }
+            }
             SpreadWindow::Side {
                 right: match side.side() {
                     SingletonSpreadPlacement::Right => true,
@@ -2970,6 +3018,118 @@ mod tests {
                 .sub_check(),
             "destination_clip_changed"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn page_turn_settings_retire_receipts_and_ready_in_mounted_and_parked_owners() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        let texture = ctx.load_texture(
+            "settings-owner",
+            egui::ColorImage::filled([4, 4], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let expected_bytes = crate::vram_budget::texture_size_texels([4, 4], true) as u64 * 4;
+        let seed = |owner: &mut App, batch: u64| {
+            let destination = owner.page_turn_destination();
+            let accepted = Arc::new(AtomicBool::new(true));
+            let incoming = Arc::new(PaintedUnit {
+                destination,
+                evidence: AcceptanceEvidence::Deferred(accepted.clone()),
+                reserved_bytes: Arc::new(AtomicU64::new(expected_bytes)),
+                ..(*unit(&ctx, texture.clone(), batch)).clone()
+            });
+            owner.page_turn_leases.register(&incoming);
+            let fact = ViewerOperationFact {
+                destination,
+                source: destination.viewport,
+                ..fact(batch)
+            };
+            owner.fullscreen_idx = Some(0);
+            owner.page_turn_presentation.state = PresentationState::Completing {
+                incoming: incoming.clone(),
+                completion: FlatCompletion::NeedFlat,
+                continuation: None,
+                diagnostics: CompletionDiagnostics {
+                    fact,
+                    tracker: Arc::new(SubmissionTracker::new()),
+                    accepted_at: Instant::now(),
+                },
+            };
+            owner.page_turn_external_operation(
+                &ctx,
+                fact.operation_id,
+                OperationPhase::Press,
+                "test",
+            );
+            assert!(owner.page_turn_defer_navigation(
+                &ctx,
+                1,
+                None,
+                crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                Some(fact.operation_id),
+            ));
+            let mut receipt = flat_receipt(destination, &ctx, &incoming.pages, true);
+            receipt.accepted = incoming.evidence.clone();
+            if let PresentationState::Completing { completion, .. } =
+                &mut owner.page_turn_presentation.state
+            {
+                *completion = FlatCompletion::Submitted(receipt.clone());
+            }
+            owner.pending_fs_page_turn_ready = Some(PendingFsPageTurnReady {
+                items_generation: owner.items_generation,
+                units: owner.spread_display_units_cache.units.clone(),
+                mode: owner.spread_mode,
+                slice: owner.fullscreen_page_slice,
+                composition: SpreadDisplayComposition::from_navigation_pages(0, &[0]).unwrap(),
+                layout: owner.fullscreen_page_layout.clone(),
+                decision: FsPageTurnDecision::normal(),
+                source_policy: FsSubmittedSourcePolicy::Normal,
+                sources: FsNavigatorTextureSources {
+                    pages: Vec::new(),
+                    submission: FsDisplayUnitSubmission::Paged(receipt),
+                },
+            });
+            accepted
+        };
+        let main_acceptance = seed(&mut app, 871);
+        let mut parked_acceptance = None;
+        let sibling = app.build_window_context_for_test(91345, |owner| {
+            parked_acceptance = Some(seed(owner, 872));
+        });
+        assert_eq!(app.page_turn_leases.reserved_bytes(), expected_bytes);
+        app.cancel_all_page_turn_effects_for_settings();
+        assert_eq!(app.page_turn_leases.reserved_bytes(), expected_bytes);
+        let mut accountant = crate::vram_budget::VramAccountant::default();
+        app.page_turn_leases.account(&mut accountant);
+        assert_eq!(accountant.finish().total_bytes(), expected_bytes);
+        let check = |owner: &App, batch: u64, old: &AtomicBool| {
+            assert!(owner.pending_fs_page_turn_ready.is_none());
+            let PresentationState::Completing {
+                incoming,
+                completion: FlatCompletion::NeedFlat,
+                ..
+            } = &owner.page_turn_presentation.state
+            else {
+                panic!("settings must require a new canonical flat");
+            };
+            // A late old hook cannot adopt the new geometry's evidence.
+            old.store(true, Ordering::Relaxed);
+            assert!(!incoming.evidence.was_accepted());
+            assert_eq!(
+                owner
+                    .page_turn_presentation
+                    .continuation_operation_for_test(),
+                Some((ViewerOperationId::Pad { batch, ordinal: 0 }, 1))
+            );
+        };
+        check(&app, 871, &main_acceptance);
+        assert_eq!(app.page_turn_leases.reserved_bytes(), expected_bytes);
+        app.with_window_context_for_test(sibling, |owner| {
+            check(owner, 872, parked_acceptance.as_ref().unwrap());
+        });
+        check(&app, 871, &main_acceptance);
     }
 
     #[test]
@@ -3525,13 +3685,7 @@ mod tests {
             );
             let old_fact = app.page_turn_presentation.take_candidate().unwrap();
             app.page_turn_presentation.state = PresentationState::Turning {
-                projection: prepare_leaf(
-                    &outgoing,
-                    &incoming,
-                    true,
-                    crate::settings::SinglePageTurnSpine::OwnPage,
-                )
-                .unwrap(),
+                projection: prepare_leaf(&outgoing, &incoming, true).unwrap(),
                 outgoing: outgoing.clone(),
                 incoming: incoming.clone(),
                 offer: AcceptedOffer {
