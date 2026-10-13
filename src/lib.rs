@@ -53,6 +53,9 @@ pub use ui_dialogs::preferences::draw_preferences_transfer_explanation_snapshot_
 pub use ui_dialogs::preferences::draw_preferences_transfer_settings_snapshot_fixture;
 pub use ui_dialogs::settings_restore::draw_preferences_transfer_disabled_entry_snapshot_fixture;
 pub use ui_dialogs::settings_restore::draw_preferences_transfer_entry_snapshot_fixture;
+#[cfg(windows)]
+#[doc(hidden)]
+pub use ui_main::draw_effetune_show_only_snapshot_fixture;
 pub mod archive_cache;
 pub mod archive_converter;
 pub mod archive_origin;
@@ -65,6 +68,7 @@ pub mod auto_aspect_cache;
 pub mod bake_stage;
 pub(crate) mod book_append_undo;
 pub mod book_bookmarks;
+pub mod book_composition;
 mod book_fs_journal;
 pub mod book_resume_db;
 pub(crate) mod book_scope;
@@ -117,6 +121,7 @@ pub(crate) mod spread_shift;
 mod startup_window_geometry;
 #[cfg(windows)]
 mod startup_windows_diag;
+pub mod ui_composition_editor;
 mod window_activation;
 /// 非 Windows stub: DWM (Desktop Window Manager) は Windows 専用。HWND を取らず
 /// クロスプラットフォーム経路から呼ばれる helper だけ no-op を提供する
@@ -152,7 +157,13 @@ pub mod filename_sort;
 pub mod filename_stack;
 pub mod filename_stack_script;
 mod final_composite;
+mod image_folder_zip;
+mod image_folder_zip_job;
+mod image_folder_zip_metadata;
 // filename_stack_ui は private な App へ impl を追加する library-internal module。
+mod adjustment_parameter_edit;
+mod everything_ipc;
+mod everything_results;
 mod filename_stack_ui;
 pub mod folder_pane;
 pub mod folder_rating_counter;
@@ -169,6 +180,9 @@ pub mod fts_writer_dispatcher;
 pub mod gamepad;
 pub mod global_search;
 mod global_search_ui;
+pub use global_search_ui::{
+    draw_everything_progress_snapshot_fixture, draw_everything_search_snapshot_fixture,
+};
 pub mod gpu_info;
 #[cfg(any(test, feature = "dev-tools"))]
 pub mod gpu_lanczos_spike;
@@ -193,6 +207,7 @@ pub mod known_folders;
 pub mod local_adjust_catalog;
 pub mod local_adjust_db;
 pub mod local_adjust_effect_ui;
+pub(crate) mod local_adjust_parameter_edit;
 pub(crate) mod local_adjust_write_worker;
 pub(crate) mod log_writer;
 pub mod logger;
@@ -343,14 +358,16 @@ mod ui_folder_pane;
 pub mod ui_font_catalog;
 pub mod ui_fonts;
 mod ui_fullscreen;
+#[doc(hidden)]
+pub use ui_fullscreen::draw_composition_editor_hud_snapshot_fixture;
 pub mod ui_startup;
 #[doc(hidden)]
 pub use ui_fullscreen::{
-    draw_fs_fit_popup_snapshot_fixture, draw_fs_page_wait_indicator_snapshot_fixture,
-    draw_fs_prefetch_indicator_snapshot_fixture, draw_music_locked_panel_snapshot_fixture,
-    draw_music_panel_reach_snapshot_fixture, draw_spread_shift_hud_snapshot_fixture,
-    draw_still_panel_reach_snapshot_fixture, draw_still_seek_strip_snapshot_fixture,
-    draw_still_touch_first_run_help_snapshot_fixture,
+    draw_fs_extracted_result_view_snapshot_fixture, draw_fs_fit_popup_snapshot_fixture,
+    draw_fs_page_wait_indicator_snapshot_fixture, draw_fs_prefetch_indicator_snapshot_fixture,
+    draw_music_locked_panel_snapshot_fixture, draw_music_panel_reach_snapshot_fixture,
+    draw_spread_shift_hud_snapshot_fixture, draw_still_panel_reach_snapshot_fixture,
+    draw_still_seek_strip_snapshot_fixture, draw_still_touch_first_run_help_snapshot_fixture,
 };
 mod ui_details_icon;
 pub mod ui_helpers;
@@ -1729,6 +1746,10 @@ pub fn run() -> eframe::Result {
         None::<spread_shift::SpreadShiftProcessOwner>,
     ));
     let creator_spread_shift_owner = Arc::clone(&spread_shift_owner);
+    let book_composition_owner = Arc::new(std::sync::Mutex::new(
+        None::<book_composition::BookCompositionProcessOwner>,
+    ));
+    let creator_book_composition_owner = Arc::clone(&book_composition_owner);
     let run_result = eframe::run_native(
         "mimageviewer",
         options,
@@ -1811,6 +1832,23 @@ pub fn run() -> eframe::Result {
                     logger::log(format!("spread_shift: worker startup failed: {error}"));
                     app.show_feedback_toast(format!(
                         "見開き調整の保存を開始できませんでした: {error}"
+                    ));
+                }
+            }
+            match book_composition::BookCompositionService::spawn_at(
+                data_dir::get(),
+                app.content_identity_recorder
+                    .as_ref()
+                    .map(|recorder| recorder.producer()),
+            ) {
+                Ok((service, owner)) => {
+                    *creator_book_composition_owner.lock().unwrap() = Some(owner);
+                    app.install_book_composition_runtime(service);
+                }
+                Err(error) => {
+                    logger::log(format!("book_composition: worker startup failed: {error}"));
+                    app.show_feedback_toast(format!(
+                        "本の構成の保存を開始できませんでした: {error}"
                     ));
                 }
             }
@@ -1943,6 +1981,9 @@ pub fn run() -> eframe::Result {
     }
     if let Ok(runtime) = collection_runtime {
         runtime.shutdown_and_join();
+    }
+    if let Some(owner) = book_composition_owner.lock().unwrap().take() {
+        owner.shutdown_and_join();
     }
     if let Some(owner) = spread_shift_owner.lock().unwrap().take() {
         for result in owner.shutdown_and_join() {
@@ -2337,3 +2378,10 @@ pub use ui_dialogs::preferences::{
 pub use ui_main::draw_file_type_visibility_status_snapshot_fixture;
 
 pub(crate) mod archive_visibility;
+
+pub mod same_name_folder_book;
+
+pub use ui_dialogs::preferences::draw_same_name_folder_book_settings_snapshot_fixture;
+
+mod ui_image_folder_zip;
+pub use ui_image_folder_zip::draw_snapshot as draw_image_folder_zip_snapshot;

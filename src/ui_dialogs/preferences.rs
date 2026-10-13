@@ -16,6 +16,19 @@ use crate::ring_shortcut::{
 };
 use crate::settings::{Parallelism, Settings};
 
+pub(crate) fn draw_same_name_folder_book_settings(
+    ui: &mut egui::Ui,
+    policy: &mut crate::same_name_folder_book::SameNameFolderBookPolicy,
+) {
+    pages::draw_same_name_folder_book(ui, policy);
+}
+
+#[doc(hidden)]
+pub fn draw_same_name_folder_book_settings_snapshot_fixture(ui: &mut egui::Ui) {
+    let mut policy = Default::default();
+    draw_same_name_folder_book_settings(ui, &mut policy);
+}
+
 #[doc(hidden)]
 pub fn draw_diagnostics_export_snapshot_fixture(ui: &mut egui::Ui, state: &str) {
     use crate::diagnostics::{ExportView, SavedExport};
@@ -175,6 +188,7 @@ pub fn draw_file_organize_destinations_settings_snapshot_fixture(ui: &mut egui::
 pub fn draw_effetune_input_limit_snapshot_fixture(ui: &mut egui::Ui) {
     pages::draw_effetune_input_limit_settings(ui, &mut Settings::default());
     pages::draw_effetune_auto_open_settings(ui, &mut Settings::default());
+    pages::draw_effetune_taskbar_settings(ui, &mut Settings::default());
     pages::draw_effetune_minimized_settings(ui, &mut Settings::default());
 }
 
@@ -2470,6 +2484,8 @@ impl App {
                 self.settings.effetune_keep_visible_when_minimized,
             );
             self.effetune
+                .set_show_in_taskbar(self.settings.effetune_show_in_taskbar);
+            self.effetune
                 .slot
                 .set_pre_limiter_enabled(self.settings.effetune_pre_limiter_enabled);
         }
@@ -2486,6 +2502,9 @@ impl App {
     }
 
     pub(crate) fn open_preferences_request(&mut self, request: PreferencesOpenRequest) {
+        if self.composition_editor_modal_active() {
+            return;
+        }
         if self.preferences_transfer_busy() || self.collection_reorder_open() {
             return;
         }
@@ -2685,7 +2704,7 @@ impl App {
         name_colors::clear_hex_editor(ctx);
         if let Some(mut state) = self.pref_state.take() {
             let old_dup = (
-                self.settings.skip_zip_if_folder_exists,
+                self.settings.same_name_folder_book,
                 self.settings.skip_archive_if_zip_exists,
                 self.settings.skip_epub_if_pdf_exists,
                 self.settings.skip_image_if_video_exists,
@@ -2998,7 +3017,7 @@ impl App {
             // (Phase 5.3: video_thumb_use_sidecar_image も含む — 切り替え時に
             // video_thumb_overrides を作り直すため)
             let new_dup = (
-                self.settings.skip_zip_if_folder_exists,
+                self.settings.same_name_folder_book,
                 self.settings.skip_archive_if_zip_exists,
                 self.settings.skip_epub_if_pdf_exists,
                 self.settings.skip_image_if_video_exists,
@@ -7351,14 +7370,15 @@ mod tests {
         for close in ["ok", "cancel", "window", "escape"] {
             let mut harness = preferences_position_harness();
             let position = harness.state().preferences_view_position.clone();
-            let old = harness.state().settings.skip_zip_if_folder_exists;
+            let old = harness.state().settings.same_name_folder_book;
             harness
                 .state_mut()
                 .pref_state
                 .as_mut()
                 .unwrap()
                 .settings
-                .skip_zip_if_folder_exists = !old;
+                .same_name_folder_book =
+                crate::same_name_folder_book::SameNameFolderBookPolicy::PreferFolder;
             match close {
                 "ok" => harness.get_by_label("  OK  ").click(),
                 "cancel" => harness.get_by_label("キャンセル").click(),
@@ -7381,8 +7401,12 @@ mod tests {
             assert!(!harness.state().show_preferences);
             assert!(harness.state().pref_state.is_none());
             assert_eq!(
-                harness.state().settings.skip_zip_if_folder_exists,
-                if close == "ok" { !old } else { old }
+                harness.state().settings.same_name_folder_book,
+                if close == "ok" {
+                    crate::same_name_folder_book::SameNameFolderBookPolicy::PreferFolder
+                } else {
+                    old
+                }
             );
             harness.state_mut().show_preferences = true;
             harness.run();
@@ -8351,6 +8375,103 @@ mod tests {
         let after = harness.state().effetune.auto_reader().unwrap().snapshot();
         assert!(!after.allowed);
         assert_ne!(after.revision, before.revision);
+    }
+
+    #[test]
+    #[cfg(all(windows, not(feature = "portable")))]
+    fn effetune_taskbar_preferences_cancel_ok_save_reload() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = crate::app::setup_app_for_test();
+        assert!(app.settings.effetune_show_in_taskbar);
+        assert!(app.effetune.show_in_taskbar());
+        app.open_preferences_request(PreferencesOpenRequest::anchored(
+            PreferencesPage::Video,
+            "video/effetune-taskbar",
+        ));
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(1100.0, 850.0))
+            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+        for (cancel, enabled) in [(true, false), (false, false), (false, true)] {
+            if !harness.state().show_preferences {
+                harness
+                    .state_mut()
+                    .open_preferences_request(PreferencesOpenRequest::anchored(
+                        PreferencesPage::Video,
+                        "video/effetune-taskbar",
+                    ));
+            }
+            harness.run_steps(5);
+            harness.state_mut().pref_state.as_mut().unwrap().highlight = None;
+            harness.run();
+            harness
+                .get_by_label("音響調整の窓をタスクバーに表示する")
+                .click();
+            harness.run();
+            assert_eq!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .effetune_show_in_taskbar,
+                enabled
+            );
+            assert_eq!(harness.state().settings.effetune_show_in_taskbar, !enabled);
+            assert_eq!(harness.state().effetune.show_in_taskbar(), !enabled);
+            harness
+                .get_by_label(if cancel { "キャンセル" } else { "  OK  " })
+                .click();
+            harness.run();
+            if cancel {
+                assert!(harness.state().show_preferences_discard_confirm);
+                assert!(harness.state().effetune.show_in_taskbar());
+                harness.get_by_label("破棄して閉じる").click();
+                harness.run();
+            }
+            assert!(!harness.state().show_preferences);
+            let expected = if cancel { !enabled } else { enabled };
+            assert_eq!(harness.state().settings.effetune_show_in_taskbar, expected);
+            assert_eq!(harness.state().effetune.show_in_taskbar(), expected);
+            if !cancel {
+                let reloaded = Settings::load();
+                assert_eq!(reloaded.effetune_show_in_taskbar, enabled);
+                assert_eq!(
+                    crate::app::App::new_from_settings(reloaded)
+                        .effetune
+                        .show_in_taskbar(),
+                    enabled
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(all(windows, feature = "portable"))]
+    fn effetune_taskbar_preferences_portable_hides_control_and_keeps_value() {
+        use egui_kittest::kittest::Queryable;
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let settings = Settings {
+            effetune_show_in_taskbar: false,
+            ..Settings::default()
+        };
+        let mut state = preferences_state_for_test(&settings);
+        state.selected = PreferencesPage::Video;
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(600.0, 2400.0))
+            .build_state(
+                |ctx, state| {
+                    egui::CentralPanel::default().show(ctx, |ui| draw_page(ui, state, false));
+                },
+                state,
+            );
+        harness.run();
+        assert!(
+            harness
+                .query_by_label("音響調整の窓をタスクバーに表示する")
+                .is_none()
+        );
+        assert!(!harness.state().settings.effetune_show_in_taskbar);
     }
 
     #[test]

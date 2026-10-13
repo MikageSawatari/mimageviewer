@@ -202,7 +202,13 @@ leaseだけ取って後から旧queued書込みが削除pathへ着地する形�
 | Remote | acquire受付でsource contextのtoken失効、上記Remote write共通入口で受付revision更新。bookmark early branch、spread／rating／tag、Remote切断・context退役も含む。既存session ownershipを維持 |
 | metadata import／復元・設定 | metadata transferのwrite受付、`start_content_identity_restore` のnonempty／pending検査後のworker投入前、本root変更／対象書込みに影響する設定変更。復元promptのUndo中の拒否はtake／設定保存前、dont-ask設定変更も既存受付へ。明示settings Restore／FullResetは `execute_pending_settings_restore` のpending破棄／worker投入前。表示を読むだけのworkerは失効しない |
 | 明示リセット／履歴削除 | `reset_saved_rotations`、`remove_reading_history_entry_for_idx`／preferencesの全履歴削除、`clear_book_resume_async`。通常の位置recordは除外したまま、利用者の明示clearだけを受付へ。favorite view stateのremove／reset／clearも最初のmap・queue変更前。favorite削除は後段のdefault清掃に頼らずsettingsからの除去前に受付 |
+| 本構成draft／保存・解除（master統合） | 有効なdraft編集・専用Undo／Redoの受理で既存受付を通す。保存／解除はRemoteのlocal admission内で、既存保存ticket登録／workerへの開始通知より前に受付。選択・preview・取消・無変更は除外。送信済ticketは既存writer-busy分類へ登録し、owner退役後も終端まで保持 |
+| 画像folder→ZIP（master統合） | 有効manifestの受理後、既存ZIP worker入口のtrim移譲・portal／metadata投入前に受付。確認画面前にも補完importが走るためConvertボタンまで遅らせない。manifest探索／案内だけはreadonlyであり失効しない |
 | 自分のcopy／refresh | `Append` intentに捕捉した同一operation IDから配送されたedit/semantic copyと一覧refreshだけを除外。source path一致／時間窓／「本処理中」だけでは除外しない。異なるaccepted mutationは必ず失効 |
+
+master統合（2026-10-14）ではmetadata転送の`WaitingForWriters(Preview)`は従来のLoadingPreviewと
+同じreadonlyとしてUndoのwriter-busyへ含めず、Transfer待ち以降の既存範囲を維持する。
+Remoteの未回収reading writeはShiftClear／ViewSetting／ViewTrimを数え、resume readは除外する。
 
 同じreceiptに対する失効は冪等。producerごとに別pending／復活用snapshotを置かない。
 自分の刷新で一覧世代が変わっても同一operationの採用として扱い、後続の別更新は失効させる。

@@ -1,5 +1,11 @@
 # PDF worker pool への context epoch 導入計画 (Codex round 4 反映版・実装 ready)
 
+> 2026-10-12: 本文は旧global整数epoch導入時の履歴。
+> 未リリースPDF-EPOCH-OWNERSHIPでは非Cloneのviewer ownerとimmutable ticket、
+> 明示Unscopedへ置換し、同期pruneをpool内maintenance workerへ移す。
+> 昇格/foundはViewer owner/要求世代/key、fullscreenはUnscoped/keyに限定する。
+> 現行契約と回帰は [pdf-render-epoch-ownership-plan.md](pdf-render-epoch-ownership-plan.md)。
+
 ## 背景・問題
 
 `%APPDATA%\mimageviewer\logs\perf_events.jsonl` の解析 (2026-05-23) で、

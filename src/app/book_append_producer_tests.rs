@@ -558,12 +558,23 @@ fn section1373_uncollected_writer_completion_and_pending_flush_keep_receipt_avai
         let operation = append.operation();
         app.book_append_undo_receipt = Some(append);
         if case == "local_adjust_completion" {
+            let context = app.projected_viewer_context_id();
             app.local_adjust_write_pending.insert(
                 "pending.jpg".into(),
                 super::LocalAdjustWritePending {
                     generation: 1,
-                    idx: 0,
-                    sidecar: None,
+                    origin: super::LocalAdjustWriteOrigin {
+                        context,
+                        target: super::PageAdjustmentTarget {
+                            page_key: "pending.jpg".into(),
+                            location_path: None,
+                            sidecar_coords: None,
+                            compiled_book: false,
+                            idx_hint: super::PageIndexHint::Absent,
+                        },
+                        revision: 0,
+                    },
+                    layers: Default::default(),
                 },
             );
         } else {

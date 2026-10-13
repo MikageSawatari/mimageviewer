@@ -4834,12 +4834,16 @@ impl App {
                     egui::vec2(scroll_width, scroll_height),
                     egui::Layout::top_down(egui::Align::LEFT),
                     |ui| {
-                        let scroll_output = egui::ScrollArea::vertical()
-                            .id_salt("collection_reorder_thumb_scroll")
-                            .vertical_scroll_offset(state.scroll_offset_y)
-                            .max_height(scroll_height)
-                            .auto_shrink([false, false])
-                            .show_rows(ui, row_height, rows, |ui, row_range| {
+                        let scroll_output = crate::ui_helpers::show_fixed_slot_rows(
+                            ui,
+                            egui::ScrollArea::vertical()
+                                .id_salt("collection_reorder_thumb_scroll")
+                                .vertical_scroll_offset(state.scroll_offset_y)
+                                .max_height(scroll_height)
+                                .auto_shrink([false, false]),
+                            row_height,
+                            rows,
+                            |ui, row_range| {
                                 egui::Grid::new("collection_reorder_thumb_grid")
                                     .num_columns(columns)
                                     .spacing(egui::vec2(gap, gap))
@@ -5026,7 +5030,8 @@ impl App {
                                             ui.end_row();
                                         }
                                     });
-                            });
+                            },
+                        );
                         state.scroll_offset_y = scroll_output.state.offset.y;
                         if !busy
                             && !pointer_released

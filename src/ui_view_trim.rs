@@ -908,6 +908,9 @@ impl App {
     }
 
     pub(crate) fn view_trim_single_content_bbox(&mut self, idx: usize) -> Option<egui::Rect> {
+        if let Some(side) = self.composed_blank_spread_side(idx) {
+            return self.view_trim_spread_content_bbox(idx, side);
+        }
         match self.effective_view_trim_apply_mode_for_idx(idx) {
             ViewTrimApplyMode::None => None,
             ViewTrimApplyMode::Auto => self.view_trim_auto_content_bbox(idx, "single"),

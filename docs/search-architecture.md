@@ -1,6 +1,6 @@
 # 検索アーキテクチャ
 
-mimageviewer の検索システム (Ctrl+S / Ctrl+F / Ctrl+G + タグ機能) の全体像。
+mimageviewer の検索システム (Ctrl+S / Ctrl+F / Ctrl+G / Ctrl+R + タグ機能) の全体像。
 修正作業の前に必ず読むこと。実装詳細・個別の仕様選択の掘り下げは
 [archive/search-metadata/search-expansion-design.md](archive/search-metadata/search-expansion-design.md) と
 [archive/search-metadata/tag-feature.md](archive/search-metadata/tag-feature.md) を参照。
@@ -9,10 +9,10 @@ mimageviewer の検索システム (Ctrl+S / Ctrl+F / Ctrl+G + タグ機能) の
 
 ## 1. 全体像
 
-### 1.1 3 つの検索モード
+### 1.1 4 つの検索モード
 
-検索は「コンテナを探す」「アイテムを探す」「今いる場所を絞る」の 3 軸に整理
-されている。設計の意図と全体方針は
+既存の検索は「コンテナを探す」「アイテムを探す」「今いる場所を絞る」の 3 軸に整理し、
+Everythingは別の名前索引から同じSearch surfaceへ結果を供給する。既存検索の設計の意図と全体方針は
 [search-container-item-redesign.md](search-container-item-redesign.md) が正典。
 
 | ショートカット | 呼称 | 用途 | スコープ | 実装経路 |
@@ -20,6 +20,7 @@ mimageviewer の検索システム (Ctrl+S / Ctrl+F / Ctrl+G + タグ機能) の
 | **Ctrl+S** | コンテナ検索 | フォルダ / ZIP / PDF を名前で横断検索 | お気に入り配下 (再帰) | コンテナ索引 `search_index.db` (SQLite LIKE) |
 | **Ctrl+F** | 現在地フィルタ | 現グリッドの表示中アイテムを名前 / メタ情報で絞り込み | 現在グリッド (非再帰・索引なし) | worker 上の on-demand 判定 |
 | **Ctrl+G** | アイテム検索 | 画像 / PDF / 動画 / 音声を名前 / EXIF / AI プロンプト等で横断検索 | お気に入り配下 (再帰) | アイテム索引 (Tantivy bigram) 候補絞り込み + STORED 原文 post-filter の streaming |
+| **Ctrl+R** | Everything ファイル名検索 | Everything の構文で対応する実ファイルを探す | Everything の索引範囲（お気に入り外も含む） | worker-only の直接 QUERY2 IPC → 完成dataset → 共通Search prepare/adopt |
 
 - **動画はコンテナ索引 (Ctrl+S) の対象外** — 動画はアイテムなので Ctrl+G で扱う。
 - **音声はコンテナ索引 (Ctrl+S) の対象外** — 音声はアイテムなので Ctrl+G でファイル名を扱う。
@@ -33,10 +34,11 @@ mimageviewer の検索システム (Ctrl+S / Ctrl+F / Ctrl+G + タグ機能) の
   その場で判定する。構造アイテム (Folder / ZIP / PDF) もファイル名で一貫して
   絞り込む (§5.2)。
 
-3 つは UI 上で排他表示される (同時に 2 本開かない)。回帰ガードは
+4 つは UI 上で排他表示される (同時に 2 本開かない)。Ctrl+G/R は同じ検索ownerのsource切替。
+従来経路の回帰ガードは
 `src/app.rs::phase_c_key_tests`。
 
-### 1.2 クエリ構文 (全モード共通)
+### 1.2 クエリ構文 (Ctrl+S / Ctrl+F / Ctrl+G 共通)
 
 [src/search_query.rs](../src/search_query.rs) が担当:
 
@@ -54,6 +56,42 @@ mimageviewer の検索システム (Ctrl+S / Ctrl+F / Ctrl+G + タグ機能) の
 - 英数字のみ → 3 文字以上 (bigram の爆発的ヒット回避)
 - NOT-only (正トークン 0) は **Ctrl+G では拒否** (全件 scan になるため)。Ctrl+F は
   対象件数が小さいので許可。
+
+Ctrl+R はこのparser、正規化、最小文字数、OR toggle、FTS post-filterを通さず、
+非空queryをそのままEverythingへ明示送信する。自動`ext:`追記も行わない。
+folder/非対応形式を含むraw先頭10,000件の後で、対応形式・表示種類・EPUB/変換書庫設定を適用する。
+
+#### 1.2.1 Everything の共通Search所有（§1.374、未リリース）
+
+`GlobalSearchState` はdraft側の `SearchSource`、未採用要求の `SearchProducer`、表示中の
+`SearchAccepted` を分ける。Metadata/Everythingのproducerは一つのpending欄で排他にし、
+完成行を `SearchProjection` として既存の `SearchPageEditPrepare` へ渡す。
+`SubmittedEverything` のquery/run、main context、items generation、送信時policyを照合し、
+旧完了や別contextの結果を採用しない。draftを編集/別sourceへ切り替えても、未実行の条件が
+採用済み一覧の出所を上書きしない。取得中は取消可能なmain modalで組合せを制限する。
+
+`everything_results` は対応候補だけをworkerでstatし、正規化した実path、mtime/size、sort metadataと
+raw/除外/読取不能/重複/上限の件数をimmutable `EverythingDataset` に保持する。
+Folder、unsafe path、未対応形式、非表示種類は除外し、stat失敗をゼロstampに置き換えない。
+同名collapseやsidecar探索で検索hitを別のファイルへ置換しない。通常sort/★/tag/編集準備は
+共通workerで行い、UIは完成したitems/metasと副作用を一つのadoption closureでinstallする。
+Everythingの動画pin WebPもprepare workerのreadonly DBで取得し、完成Arcマップを
+動画thumbnail workerへ渡す。採用時の`lookup_webps_many`やBLOB再取得は行わない。
+pin変更stampが古ければ同じprepareで再準備する。Ctrl+Gの既存同期bulk lookupは確認済みだが、
+EverythingのP2修正とは別件として残す（[対応範囲](everything-search-plan.md#16-p2-動画pinのworker準備2026-10-12)）。
+
+採用済みEverythingの位置は `EverythingPosition::Root` / `PhysicalChild`。
+ZIP/PDF/EPUB/変換書庫の物理表示が受理された境界だけでlogical source/return anchor/routeを保持し、
+取消や失敗で未採用のchildへ進めない。結果へ戻ると保持datasetを共通prepareで再投影し、IPCを再送しない。
+既存thumbnail ownerを利用し、F12 fork/park/promoteではmain検索ownerを複製しない。
+PDF先行改修は `4510346f5`（master統合 `c1e66f589`）のcontext-owned render epochを前提とする。
+
+Remote query endpoint/result共有、新しい永続設定/索引/検索履歴は追加しない。
+取得/本からの帰路はRemote sessionの非Clone local-modal leaseでacquireと排他にする。
+これは受付所有権だけの変更で、Remoteの公開phase・IPC protocol・Collection enumは変更しない。
+query/result一覧はmIVの永続データ・診断ログへ残さず、通常open/tag/★/cacheの保存は既存契約を維持する。
+自動gate、最新実装の独立レビュー、確認build、利用者の実Everything確認は未完了。
+受入証拠は[Everything計画 §14](everything-search-plan.md#14-実装記録2026-10-12)へ集約する。
 
 ### 1.3 タグ機能との関係
 
@@ -81,9 +119,11 @@ facet のタグ値は表示 `#タグ` ではなく、`tags.db` と同じ `tag_ke
 | モジュール | 役割 |
 | --- | --- |
 | [search_query.rs](../src/search_query.rs) | トークナイザ + AST + `matches` / `matches_with_mode` / `decide_partial` / `MatchMode` |
-| [search_norm.rs](../src/search_norm.rs) | `normalize_for_match(s) -> String` — 全経路で共有する唯一の正規化関数 |
+| [search_norm.rs](../src/search_norm.rs) | `normalize_for_match(s) -> String` — Ctrl+S/F/Gのtoken検索で共有する唯一の正規化関数。Everythingのqueryは通さない |
 | [global_search.rs](../src/global_search.rs) | Ctrl+G のクエリワーカー (streaming、Searcher snapshot 固定) |
-| [global_search_ui.rs](../src/global_search_ui.rs) | Ctrl+G の検索バー・drill-down ビュー・結果集約 |
+| [global_search_ui.rs](../src/global_search_ui.rs) / [everything.rs](../src/global_search_ui/everything.rs) | Metadata/Everythingの単一Search owner、検索バー、共通prepare/adopt、物理childの帰路 |
+| [everything_ipc.rs](../src/everything_ipc.rs) / [native.rs](../src/everything_ipc/native.rs) | bounded QUERY2 codecと不可視reply-window transport。UIから直接呼ばない |
+| [everything_results.rs](../src/everything_results.rs) | worker内の対応形式分類・path検査・stat・immutable dataset。DB書込み/デコードなし |
 
 Ctrl+S / Ctrl+F の UI は [ui_main.rs](../src/ui_main.rs) の
 `render_favsearch_bar` / `render_search_bar`、実行部は [app.rs](../src/app.rs) の
@@ -233,8 +273,14 @@ FTS の Incomplete は「確認未完了」、Stopped/Cancelled は「確認中�
 新しい Full の実行中は「スキャン中」、正常完走と正常な起動確認省略は従来の「監視中」。
 外側/重複のお気に入りも実効所有者集合の失敗を表示する。FTS の共有 maintenance snapshot は
 次回起動再構築の予約、または予約自体の失敗をダイアログ全体に残す。UI は SQL/I/O/待機をしない。
-名前索引の Full 表示訂正は、DB 書込失敗の通知/marker 接続を直したという意味ではない。
-その対応は [バックログ §1.369](next-release-backlog.md#1369-名前コンテナ索引-ctrls-の書込失敗が通知再構築へ揃っていない--1367からの引き継ぎコード調査-2026-10-11) に残る。
+名前索引の DB 更新／削除失敗は、Full／watcher／clear の共通出口から
+`SearchIndexDb` 所有の通知と既存の次回起動再構築印へ送る（§1.369）。
+同じ DB インスタンスの起動中に予約試行と通知をそれぞれ1回に限り、各失敗のログは残す。
+完走印だけの保存失敗は専用通知のみ。未変更、削除0行、取消、FS 不完全観測は再構築へ送らない。
+watcher の成功件数は必要な親更新・subtree 走査・prune が完了した場合だけ増やす。
+名前通知は起動オーバーレイ中・非表示・最小化中に保持し、通常 UI へ復帰したとき5秒表示する。
+UI の drain は通知専用 mutex だけを取り、SQLite／同期 I/O／worker 待機を行わない。
+停止後の保持・全出口・回帰と検証記録は [名前索引の書込失敗計画](name-index-write-failure-plan.md) を参照。
 
 metadata の所有範囲は `metadata_ownership` が純関数で決める。最深 root が所有し、
 同じ正規化 root は UUID 文字列順の最小値で決着する。共通除外と内側の所有 root を

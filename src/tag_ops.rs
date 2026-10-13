@@ -230,6 +230,7 @@ impl App {
         if !self.precheck_tag_write_available("toggle") {
             return;
         }
+        self.prepare_page_edit_history_boundary();
         // 複数選択は all-or-nothing: 全対象に付与済みなら全削除、それ以外は全付与。
         // 結果は `poll_tag_write_results` が完了時にまとめてトースト表示する。
         // ラベルは worker キュー全体で共有する 1 フィールドなので、**バリデーション通過後**
@@ -353,6 +354,7 @@ impl App {
         if !self.precheck_tag_write_available(if add { "add" } else { "remove" }) {
             return;
         }
+        self.prepare_page_edit_history_boundary();
         self.hydrate_tags_cache_for_paths(&paths);
 
         let with_hash = crate::tags_db::format_display_tag(&name);
@@ -413,6 +415,7 @@ impl App {
         if !self.precheck_tag_write_available("clear") {
             return;
         }
+        self.prepare_page_edit_history_boundary();
         // ラベル/発火面はバリデーション通過後に設定する (toggle/add と同じ規約。
         // 早期 return 経路で上書きすると in-flight の前バッチの完了トーストが
         // 誤った面/ラベルで表示される — Codex P3)。

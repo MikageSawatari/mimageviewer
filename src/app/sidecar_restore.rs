@@ -666,6 +666,7 @@ impl App {
     /// A global memory change supersedes only the shift dependency of an unopened Book.
     /// Its original resume cutoff remains mandatory; an already shown sibling keeps its session.
     pub(super) fn refresh_pending_book_shift_memory_policy(&mut self) {
+        let availability = self.pairing_edit_availability();
         if let Some(restore) = self
             .sidecar_restore
             .as_mut()
@@ -675,6 +676,7 @@ impl App {
                 self.spread_shift_settings_generation,
                 self.settings.remember_spread_shift_per_book,
                 self.spread_shift_service.as_ref(),
+                availability,
             );
         }
     }
@@ -1820,6 +1822,31 @@ impl App {
     }
 
     /// Advance the restore state without waiting. Called once per root frame.
+    #[cfg(test)]
+    pub(crate) fn settle_snapshot_page_index_for_test(&mut self) {
+        let Some(state) = self.sidecar_restore.as_mut() else {
+            return;
+        };
+        if let Phase::PreparingPageIndex(preparing) = &mut state.phase {
+            assert!(matches!(
+                preparing.next,
+                PageIndexContinuation::PrepareOnly(_)
+            ));
+            let index = preparing
+                .rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("snapshot identity worker completion");
+            let (sender, receiver) = mpsc::channel();
+            sender.send(index).unwrap();
+            preparing.rx = receiver;
+        }
+        self.poll_sidecar_restore(&egui::Context::default());
+        assert!(
+            !self.sidecar_restore_active(),
+            "snapshot identity publication must reach terminal"
+        );
+    }
+
     pub(crate) fn poll_sidecar_restore(&mut self, ctx: &egui::Context) {
         self.poll_retained_shift_readoption(ctx);
         let Some(mut state) = self.sidecar_restore.take() else {
@@ -2224,8 +2251,21 @@ impl App {
                         .map(|writer| std::iter::from_fn(|| writer.try_recv()).collect())
                         .unwrap_or_default();
                     for result in prior_results {
-                        if result.result.is_err() {
-                            state.common.favorite_failures.push(result.command);
+                        match result {
+                            crate::favorite_view_state::FavoriteViewStoreResult::Persisted {
+                                command,
+                                result,
+                            } => {
+                                if result.is_err() {
+                                    state.common.favorite_failures.push(command);
+                                }
+                            }
+                            crate::favorite_view_state::FavoriteViewStoreResult::Copied {
+                                id,
+                                state,
+                            } => {
+                                self.favorite_view_states.insert(id, state);
+                            }
                         }
                     }
                     for (id, favorite_state) in self.favorite_view_writes.take_all() {
@@ -2255,8 +2295,21 @@ impl App {
                     .map(|writer| std::iter::from_fn(|| writer.try_recv()).collect())
                     .unwrap_or_default();
                 for result in results {
-                    if result.result.is_err() {
-                        state.common.favorite_failures.push(result.command);
+                    match result {
+                        crate::favorite_view_state::FavoriteViewStoreResult::Persisted {
+                            command,
+                            result,
+                        } => {
+                            if result.is_err() {
+                                state.common.favorite_failures.push(command);
+                            }
+                        }
+                        crate::favorite_view_state::FavoriteViewStoreResult::Copied {
+                            id,
+                            state,
+                        } => {
+                            self.favorite_view_states.insert(id, state);
+                        }
                     }
                 }
                 if let Some(error) = terminal_error {

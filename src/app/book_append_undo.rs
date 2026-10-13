@@ -112,6 +112,7 @@ impl App {
             || !self.view_trim_dirty_page_overrides.is_empty()
             || self.tag_maintenance_rx.is_some()
             || self.new_folder_pending.is_some()
+            || self.composition_editor_writes_pending()
             || self.metadata_transfer_book_append_writers_busy()
             || self.book_reorder.as_ref().is_some_and(|state| {
                 state.flush_pending.is_some() || state.transfer_pending.is_some()
@@ -447,15 +448,35 @@ mod tests {
         let mut prepared = load_book_append_edit_presence(&summary, Default::default())
             .unwrap()
             .unwrap();
+        let context = app.projected_viewer_context_id();
         app.local_adjust_write_pending.insert(
             key.clone(),
             LocalAdjustWritePending {
+                origin: LocalAdjustWriteOrigin {
+                    context,
+                    target: PageAdjustmentTarget {
+                        page_key: key.clone(),
+                        location_path: None,
+                        sidecar_coords: None,
+                        compiled_book: true,
+                        idx_hint: PageIndexHint::Absent,
+                    },
+                    revision: 1,
+                },
+                layers: Default::default(),
                 generation: 1,
-                idx: 0,
-                sidecar: None,
             },
         );
         for present in [true, false] {
+            app.local_adjust_write_pending.get_mut(&key).unwrap().layers = if present {
+                Arc::new(vec![local_adjust_core::LocalAdjustmentLayer::new(
+                    "queued add",
+                    local_adjust_core::LocalMask::Full,
+                    local_adjust_core::LocalEffect::None,
+                )])
+            } else {
+                Default::default()
+            };
             App::set_page_key_presence(&mut app.local_adjust_page_keys, &key, present);
             if present {
                 prepared.snapshot.local_adjust.remove(&key);

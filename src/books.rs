@@ -1546,7 +1546,7 @@ pub(crate) fn decode_composite_source_for_materialization_with_target(
                     password.as_deref(),
                     Some(Arc::clone(&cancel)),
                     crate::pdf_loader::JobPriority::Critical,
-                    0,
+                    crate::pdf_loader::PdfRenderValidity::Unscoped,
                     crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
                 )
             } else {
@@ -1557,7 +1557,7 @@ pub(crate) fn decode_composite_source_for_materialization_with_target(
                     password.as_deref(),
                     Some(Arc::clone(&cancel)),
                     crate::pdf_loader::JobPriority::Critical,
-                    0,
+                    crate::pdf_loader::PdfRenderValidity::Unscoped,
                     crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
                 )
             }

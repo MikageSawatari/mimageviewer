@@ -15,7 +15,7 @@ fn color_filter_item_supported(item: &crate::grid_item::GridItem) -> bool {
         || color_filter_representative_supported(item)
 }
 
-fn color_filter_representative_supported(item: &GridItem) -> bool {
+pub(super) fn color_filter_representative_supported(item: &GridItem) -> bool {
     match item {
         GridItem::ZipFile(_) => true,
         // PdfFile also represents converted EPUBs; do not expand the requested scope.
@@ -785,8 +785,7 @@ impl App {
             self.listing_file_type_visibility(),
         )?;
         req.relative_page_provenance = self.relative_page_provenance_for_idx(idx);
-        req.context_epoch = crate::pdf_loader::current_render_context_epoch();
-        req.input_seq = self.input_seq;
+        self.attach_viewer_thumbnail_context(&mut req);
         Some((self.color_identity_for_idx(idx)?.0, req))
     }
 
@@ -1886,5 +1885,23 @@ mod tests {
                 0.0,
             )
         );
+    }
+
+    #[test]
+    fn color_request_admission_keeps_projected_viewer_ticket() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        app.items = vec![GridItem::PdfPage {
+            pdf_path: PathBuf::from(r"C:\books\shared.pdf"),
+            page_num: 0,
+            content_type: None,
+        }];
+        app.image_metas = vec![Some((10, 20))];
+        let (_, request) = app.color_work_identity_for_idx(0).unwrap();
+        assert!(request.pdf_render_validity.same_request(
+            &crate::pdf_loader::PdfRenderValidity::Viewer(app.pdf_render_epoch.snapshot())
+        ));
+        assert_eq!(request.items_gen, app.items_generation);
+        app.bump_render_epoch_only();
+        assert!(request.pdf_render_validity.is_stale());
     }
 }

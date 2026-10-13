@@ -124,6 +124,11 @@ impl TagsDb {
         crate::data_dir::get().join("tags.db")
     }
 
+    /// An initialized store's exact path for a worker-owned readonly connection.
+    pub(crate) fn read_path(&self) -> &Path {
+        &self.path
+    }
+
     fn apply_pragmas(conn: &Connection) -> Result<(), rusqlite::Error> {
         let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
         conn.execute_batch(

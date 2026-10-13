@@ -4358,6 +4358,7 @@ pub(crate) struct FavoriteViewOverlay {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[serde(remote = "Settings")]
 pub struct Settings {
     #[serde(default = "default_grid_cols")]
     pub grid_cols: usize,
@@ -4951,9 +4952,9 @@ pub struct Settings {
     /// 一覧生成前に適用する全体の種類設定。空の除外集合は全表示。
     #[serde(default)]
     pub file_type_visibility: crate::file_type_visibility::FileTypeVisibility,
-    /// 同名の ZIP ファイルとフォルダがある場合、ZIP をスキップする
-    #[serde(default = "default_true")]
-    pub skip_zip_if_folder_exists: bool,
+    /// 同名の実フォルダと本を、本優先・フォルダ優先・両方表示から選ぶ。
+    #[serde(default)]
+    pub same_name_folder_book: crate::same_name_folder_book::SameNameFolderBookPolicy,
     /// 同名の ZIP/CBZ がある場合、RAR/7z/LZH 側をスキップする
     #[serde(default = "default_true")]
     pub skip_archive_if_zip_exists: bool,
@@ -5983,6 +5984,9 @@ pub struct Settings {
     /// メイン最小化中も、表示していた音響調整の窓を残す。
     #[serde(default)]
     pub effetune_keep_visible_when_minimized: bool,
+    /// 音響調整の窓を Windows のタスクバーに表示する。確定時に controller へ公開する。
+    #[serde(default = "default_true")]
+    pub effetune_show_in_taskbar: bool,
     /// EffeTune GUI の最後の位置と外枠サイズ。
     #[serde(default)]
     pub effetune_gui_pos: Option<(i32, i32)>,
@@ -7656,7 +7660,7 @@ impl Default for Settings {
             thumb_tooltip_show_reading_history_last_read: true,
             thumb_tooltip_show_reading_history_progress: true,
             exif_hidden_tags: default_exif_hidden_tags(),
-            skip_zip_if_folder_exists: true,
+            same_name_folder_book: Default::default(),
             skip_archive_if_zip_exists: true,
             skip_epub_if_pdf_exists: true,
             skip_image_if_video_exists: true,
@@ -7942,6 +7946,7 @@ impl Default for Settings {
             effetune_pre_limiter_enabled: true,
             effetune_auto_open_on_video: false,
             effetune_keep_visible_when_minimized: false,
+            effetune_show_in_taskbar: true,
             effetune_gui_pos: None,
             effetune_gui_size: None,
             vst3_video_compact: false,
@@ -14502,6 +14507,24 @@ mod tests {
     }
 
     #[test]
+    fn effetune_taskbar_default_missing_and_false_roundtrip() {
+        assert!(Settings::default().effetune_show_in_taskbar);
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert!(missing.effetune_show_in_taskbar);
+        let configured = Settings {
+            effetune_show_in_taskbar: false,
+            ..missing
+        };
+        let restored: Settings =
+            serde_json::from_value(serde_json::to_value(&configured).unwrap()).unwrap();
+        assert!(!restored.effetune_show_in_taskbar);
+
+        let mut draft = configured;
+        draft.overwrite_non_preferences_from(&mut Settings::default());
+        assert!(!draft.effetune_show_in_taskbar);
+    }
+
+    #[test]
     fn effetune_runtime_window_rect_survives_preference_apply() {
         let mut edited = Settings::default();
         let mut live = Settings::default();
@@ -19323,7 +19346,23 @@ impl Settings {
             skip_duplicate_images: self.skip_duplicate_images,
             image_ext_priority: self.image_ext_priority.clone(),
             susie_enabled: self.susie_enabled,
+            indexer_speed_profile: self.indexer_speed_profile,
             ..Self::default()
         }
+    }
+}
+
+impl serde::Serialize for Settings {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Settings::serialize(self, serializer)
+    }
+}
+impl<'de> serde::Deserialize<'de> for Settings {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+        if let Some(map) = value.as_object_mut() {
+            crate::same_name_folder_book::canonicalize(map).map_err(serde::de::Error::custom)?;
+        }
+        Settings::deserialize(value).map_err(serde::de::Error::custom)
     }
 }

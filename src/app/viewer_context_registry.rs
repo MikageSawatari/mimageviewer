@@ -716,6 +716,660 @@ fn reset_audio_art_terminal_rows(
 }
 
 impl App {
+    pub(super) fn take_parked_page_edit_commits(&mut self) -> Vec<page_edit_owner::PageEditCommit> {
+        let mut commits = Vec::new();
+        #[cfg(windows)]
+        for slot in self.viewer_contexts.table.slots.values_mut() {
+            let bundle = match slot {
+                Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
+            };
+            commits
+                .extend(bundle.take_page_edit_commits(page_edit_owner::PageEditBoundary::History));
+        }
+        commits
+    }
+
+    pub(super) fn take_parked_page_edit_exit_commits(
+        &mut self,
+    ) -> Vec<page_edit_owner::PageEditCommit> {
+        let mut commits = Vec::new();
+        #[cfg(windows)]
+        for slot in self.viewer_contexts.table.slots.values_mut() {
+            let bundle = match slot {
+                Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
+            };
+            commits.extend(bundle.take_page_edit_commits(page_edit_owner::PageEditBoundary::Exit));
+        }
+        commits
+    }
+
+    pub(crate) fn has_page_edit_producers(&self) -> bool {
+        if self.local_adjust_lut_pending.is_some()
+            || self.local_adjust_segmentation_pending.is_some()
+        {
+            return true;
+        }
+        #[cfg(windows)]
+        for slot in self.viewer_contexts.table.slots.values() {
+            let bundle = match slot {
+                Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
+            };
+            if bundle.local_adjust_lut_pending.is_some()
+                || bundle.local_adjust_segmentation_pending.is_some()
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(crate) fn poll_all_page_edit_producers(&mut self, ctx: &egui::Context) {
+        self.poll_local_adjust_lut_load(ctx);
+        self.poll_local_adjust_segmentation(ctx);
+        #[cfg(windows)]
+        {
+            let owners = self
+                .viewer_contexts
+                .table
+                .slots
+                .iter()
+                .filter_map(|(id, slot)| {
+                    let bundle = match slot {
+                        Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
+                    };
+                    (bundle.local_adjust_lut_pending.is_some()
+                        || bundle.local_adjust_segmentation_pending.is_some())
+                    .then_some(*id)
+                })
+                .collect::<Vec<_>>();
+            for owner in owners {
+                self.with_owner_viewer_context(owner, |app| {
+                    app.poll_local_adjust_lut_load(ctx);
+                    app.poll_local_adjust_segmentation(ctx);
+                });
+            }
+        }
+    }
+
+    pub(super) fn cancel_superseded_page_edit_producers(
+        &mut self,
+        key: &str,
+        layers: &local_adjust_core::LocalAdjustmentLayers,
+        accepted: bool,
+    ) {
+        let mut cancelled = false;
+        macro_rules! cancel {
+            ($state:expr) => {{
+                let state = $state;
+                if state
+                    .local_adjust_lut_pending
+                    .as_ref()
+                    .is_some_and(|p| p.owner.target.page_key == key && p.document != *layers)
+                {
+                    state.local_adjust_lut_pending = None;
+                    cancelled = true;
+                }
+                if state
+                    .local_adjust_segmentation_pending
+                    .as_ref()
+                    .is_some_and(|p| p.owner.target.page_key == key && p.document != *layers)
+                {
+                    state.local_adjust_segmentation_pending = None;
+                    cancelled = true;
+                }
+            }};
+        }
+        cancel!(&mut *self);
+        #[cfg(windows)]
+        if accepted {
+            for slot in self.viewer_contexts.table.slots.values_mut() {
+                let bundle = match slot {
+                    Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
+                };
+                cancel!(bundle);
+            }
+        }
+        if cancelled {
+            crate::logger::log(format!(
+                "local-adjust producer superseded by content change: key={key}"
+            ));
+            self.show_feedback_toast(
+                "LUT／マスク生成結果を破棄しました。レイヤーが変更されています".to_owned(),
+            );
+        }
+    }
+
+    /// Publish accepted page parameters in place; live drags keep their own projection.
+    pub(crate) fn publish_accepted_adjustment_page_edits(
+        &mut self,
+        documents: &HashMap<String, Option<crate::adjustment::AdjustParams>>,
+    ) {
+        if documents.is_empty() {
+            return;
+        }
+        let mut color_keys = std::collections::HashSet::new();
+        let mut adjustment_keys = std::collections::HashSet::new();
+        macro_rules! publish {
+            ($state:expr, $default:expr) => {{
+                let state = $state;
+                let live = state
+                    .adjustment_drag_session
+                    .as_ref()
+                    .map(|session| (session.owner.target.page_key.clone(), session.draft.clone()));
+                let mut changed = false;
+                let mut changed_indices = Vec::new();
+                // One item pass for the entire batch, including duplicate slots.
+                for idx in 0..state.items.len() {
+                    let key = if let Some(snapshot) = &state.page_edit_snapshot {
+                        snapshot.order.key_at(idx).map(str::to_owned)
+                    } else {
+                        crate::edit_source::page_key_for_grid_item(&state.items[idx])
+                    };
+                    let Some(key) = key else { continue };
+                    let Some(accepted) = documents.get(&key) else {
+                        continue;
+                    };
+                    if let Some(snapshot) = state.page_edit_snapshot.as_mut()
+                        && snapshot.adjustment.get(&key) != accepted.as_ref()
+                    {
+                        if let Some(params) = accepted {
+                            snapshot.adjustment.insert(key.clone(), params.clone());
+                        } else {
+                            snapshot.adjustment.remove(&key);
+                        }
+                        changed = true;
+                    }
+                    let projected = live
+                        .as_ref()
+                        .filter(|(live_key, _)| live_key == &key)
+                        .map(|(_, draft)| draft)
+                        .unwrap_or(accepted);
+                    if state.adjustment_page_params.get(&idx) == projected.as_ref() {
+                        continue;
+                    }
+                    let default = ($default)(state, idx);
+                    let old = state.adjustment_page_params.get(&idx).unwrap_or(&default);
+                    let new = projected.as_ref().unwrap_or(&default);
+                    if old != new {
+                        let final_only =
+                            old.ai_settings_eq(new) && old.differs_only_in_final_stage(new);
+                        let ai_changed = !old.ai_settings_eq(new);
+                        if !old.color_settings_eq(new) {
+                            color_keys.insert(key.clone());
+                        }
+                        adjustment_keys.insert(key.clone());
+                        changed_indices.push((idx, final_only, ai_changed));
+                    }
+                    if let Some(params) = projected {
+                        state.adjustment_page_params.insert(idx, params.clone());
+                    } else {
+                        state.adjustment_page_params.remove(&idx);
+                    }
+                    changed = true;
+                }
+                // A retained drag may be absent from the current item order.
+                if let Some((key, _)) = &live
+                    && let Some(accepted) = documents.get(key)
+                    && let Some(snapshot) = state.page_edit_snapshot.as_mut()
+                    && snapshot.adjustment.get(key) != accepted.as_ref()
+                {
+                    if let Some(params) = accepted {
+                        snapshot.adjustment.insert(key.clone(), params.clone());
+                    } else {
+                        snapshot.adjustment.remove(key);
+                    }
+                    changed = true;
+                }
+                let affected: std::collections::HashSet<_> =
+                    changed_indices.iter().map(|(idx, _, _)| *idx).collect();
+                let upstream: std::collections::HashSet<_> = changed_indices
+                    .iter()
+                    .filter_map(|(idx, final_only, _)| (!final_only).then_some(*idx))
+                    .collect();
+                if !affected.is_empty() {
+                    state
+                        .adjustment_cache
+                        .retain(|idx, _| !affected.contains(idx));
+                    state
+                        .final_composite_cache
+                        .retain_with_drop_reason("accepted_adjustment_page_edit", |key, _| {
+                            !affected.contains(&key.edit_key.idx)
+                        });
+                    state.final_effect_pending.retain(|key, pending| {
+                        if affected.contains(&key.edit_key.idx) {
+                            pending.cancel.store(true, Ordering::Relaxed);
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    // Final-only controls leave final AI inputs and jobs unchanged.
+                    state
+                        .final_ai_cache
+                        .retain(|key, _| !upstream.contains(&key.edit_key.idx));
+                    state
+                        .final_ai_failed
+                        .retain(|key| !upstream.contains(&key.edit_key.idx));
+                    state.final_ai_pending.retain(|key, pending| {
+                        if upstream.contains(&key.edit_key.idx) {
+                            pending.cancel.store(true, Ordering::Relaxed);
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    state.comic_cache.retain(|idx, _| !affected.contains(idx));
+                    state.comic_bake_pending.retain(|idx, pending| {
+                        if affected.contains(idx) {
+                            pending.cancel.store(true, Ordering::Relaxed);
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                }
+                if changed {
+                    state.page_edit_revision = state.page_edit_revision.wrapping_add(1);
+                }
+                changed_indices
+            }};
+        }
+        let mounted_changes = publish!(&mut *self, |state: &App, idx| {
+            state.effective_default_for_idx(idx).clone()
+        });
+        for (idx, _, ai_changed) in mounted_changes {
+            self.invalidate_compare_prepared_for_idx(idx);
+            if ai_changed {
+                // Legacy AI state is App-owned. Purge only the matching mounted slot.
+                self.purge_upscale_for_idx(idx);
+            }
+        }
+        #[cfg(windows)]
+        {
+            let book_root = self.book_root_path();
+            let settings = &self.settings;
+            let favorites = &self.adjustment_favorite_params;
+            for slot in self.viewer_contexts.table.slots.values_mut() {
+                let bundle = match slot {
+                    Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
+                };
+                let _ = publish!(bundle, |state: &ViewerContextBundle, idx| {
+                    let item = &state.items[idx];
+                    let location = match item {
+                        GridItem::Image(path) => {
+                            if path.parent().is_some_and(|parent| {
+                                crate::books::is_direct_book_folder(&book_root, parent)
+                            }) {
+                                return App::book_page_default_adjust_params().clone();
+                            }
+                            path.parent()
+                        }
+                        GridItem::ZipImage { zip_path, .. } => Some(zip_path.as_path()),
+                        GridItem::PdfPage { pdf_path, .. } => Some(pdf_path.as_path()),
+                        _ => None,
+                    };
+                    location
+                        .and_then(|path| {
+                            crate::final_composite::active_favorite_default_id_for_path(
+                                path,
+                                &settings.favorites,
+                                None,
+                                |id| favorites.contains_key(&id),
+                            )
+                        })
+                        .and_then(|id| favorites.get(&id))
+                        .unwrap_or(&settings.global_preset)
+                        .clone()
+                });
+            }
+        }
+        for key in adjustment_keys {
+            let generation = self.adjustment_generation.entry(key).or_default();
+            *generation = generation.saturating_add(1);
+        }
+        self.invalidate_thumb_adjust_for_page_keys(&color_keys);
+    }
+
+    /// Only cached cells are inspected, including representatives of this page.
+    pub(crate) fn invalidate_thumb_adjust_for_page_key(&mut self, key: &str) {
+        self.invalidate_thumb_adjust_for_page_keys(&std::collections::HashSet::from([
+            key.to_owned()
+        ]));
+    }
+
+    fn invalidate_thumb_adjust_for_page_keys(&mut self, keys: &std::collections::HashSet<String>) {
+        if keys.is_empty() {
+            return;
+        }
+        macro_rules! invalidate {
+            ($state:expr) => {{
+                let state = $state;
+                state.thumb_adjust_tex.retain(|idx, _| {
+                    !state
+                        .thumb_edit_preview_keys
+                        .get(idx)
+                        .is_some_and(|preview| keys.contains(preview))
+                        && !state
+                            .items
+                            .get(*idx)
+                            .and_then(crate::edit_source::page_key_for_grid_item)
+                            .is_some_and(|key| keys.contains(&key))
+                });
+            }};
+        }
+        invalidate!(&mut *self);
+        #[cfg(windows)]
+        for slot in self.viewer_contexts.table.slots.values_mut() {
+            let bundle = match slot {
+                Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
+            };
+            invalidate!(bundle);
+        }
+        self.pinned_adjustment_refresh_keys
+            .extend(keys.iter().cloned());
+    }
+
+    /// Reopen baked representatives in every owner before consuming the shared refresh keys.
+    pub(super) fn evict_pinned_adjustment_materializations(
+        &mut self,
+        keys: &std::collections::HashSet<String>,
+    ) {
+        if keys.is_empty() {
+            return;
+        }
+        let main = self.viewer_context_main();
+        let mounted_is_main = self.projected_viewer_context_id() == main;
+        let mut color_filter_keys = std::collections::HashSet::new();
+        macro_rules! evict {
+            ($state:expr, $is_main:expr) => {{
+                let state = $state;
+                let matching: std::collections::HashSet<_> = state
+                    .thumb_edit_preview_keys
+                    .iter()
+                    .filter_map(|(&idx, key)| {
+                        (keys.contains(key)
+                            && state
+                                .items
+                                .get(idx)
+                                .is_some_and(|item| !item.has_page_data()))
+                        .then_some(idx)
+                    })
+                    .collect();
+                if !matching.is_empty() {
+                    // The queues belong to this payload. Cancel matching queued requests in
+                    // one pass per queue; other contexts and non-grid requests remain intact.
+                    for queue in [&state.reload_queue, &state.heavy_io_queue]
+                        .into_iter()
+                        .flatten()
+                    {
+                        if let Ok(mut pending) = queue.0.lock() {
+                            pending.retain(|request| {
+                                !request
+                                    .grid_index()
+                                    .is_some_and(|idx| matching.contains(&idx))
+                            });
+                        }
+                    }
+                    for idx in matching {
+                        if $is_main
+                            && let Some(item) = state.items.get(idx)
+                            && super::color_filter::color_filter_representative_supported(item)
+                        {
+                            color_filter_keys.insert(item.perf_key());
+                        }
+                        // Recorded representative keys follow the existing reload path and
+                        // remain until a newly loaded representative updates them.
+                        state.requested.remove(&idx);
+                        state.thumb_pixels.remove(&idx);
+                        state.thumb_edit_preview_layers.remove(&idx);
+                        state.thumb_adjust_tex.remove(&idx);
+                        state.idle_upgrade_cache_bypass_ineligible.remove(&idx);
+                        if let Some(thumbnail) = state.thumbnails.get_mut(idx) {
+                            *thumbnail = ThumbnailState::Evicted;
+                        }
+                    }
+                }
+            }};
+        }
+        evict!(&mut *self, mounted_is_main);
+        #[cfg(windows)]
+        for (id, slot) in self.viewer_contexts.table.slots.iter_mut() {
+            let bundle = match slot {
+                Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
+            };
+            evict!(bundle, *id == main);
+        }
+        // Color filtering is shared main-grid state, even while main is parked.
+        if !color_filter_keys.is_empty() {
+            for key in color_filter_keys {
+                let revision = self
+                    .color_filter
+                    .palettes
+                    .representative_revisions
+                    .entry(key)
+                    .or_default();
+                *revision = revision.wrapping_add(1);
+            }
+            self.mark_color_filter_scope_dirty();
+        }
+    }
+
+    pub(super) fn publish_finished_adjustment_page_edit(
+        &mut self,
+        owner: &PageEditOwner,
+        params: &Option<crate::adjustment::AdjustParams>,
+    ) {
+        macro_rules! publish {
+            ($state:expr) => {{
+                let state = $state;
+                if state.items_generation != owner.items_generation {
+                    return;
+                }
+                let mut changed = false;
+                for idx in &owner.slots {
+                    if state.adjustment_page_params.get(idx) == params.as_ref() {
+                        continue;
+                    }
+                    if let Some(params) = params {
+                        state.adjustment_page_params.insert(*idx, params.clone());
+                    } else {
+                        state.adjustment_page_params.remove(idx);
+                    }
+                    state.adjustment_cache.remove(idx);
+                    state.thumb_adjust_tex.remove(idx);
+                    changed = true;
+                }
+                if changed {
+                    if let Some(snapshot) = state.page_edit_snapshot.as_mut() {
+                        if let Some(params) = params {
+                            snapshot
+                                .adjustment
+                                .insert(owner.target.page_key.clone(), params.clone());
+                        } else {
+                            snapshot.adjustment.remove(&owner.target.page_key);
+                        }
+                    }
+                    state.page_edit_revision = state.page_edit_revision.wrapping_add(1);
+                }
+            }};
+        }
+        if self.projected_viewer_context_id() == owner.context {
+            publish!(&mut *self);
+            return;
+        }
+        #[cfg(windows)]
+        if let Some(Slot::AtRest(bundle) | Slot::Retiring(bundle)) =
+            self.viewer_contexts.table.slots.get_mut(&owner.context)
+        {
+            publish!(bundle);
+        }
+    }
+
+    pub(super) fn publish_accepted_local_page_edits(
+        &mut self,
+        documents: &HashMap<String, local_adjust_core::LocalAdjustmentLayers>,
+    ) {
+        if documents.is_empty() {
+            return;
+        }
+        // Pending is key-owned. Idle contexts project the latest accepted
+        // document until that same key has no outstanding accepted write.
+        let pending_keys: std::collections::HashSet<&str> = documents
+            .keys()
+            .filter(|key| self.local_adjust_write_pending.contains_key(*key))
+            .map(String::as_str)
+            .collect();
+        fn update_snapshot(
+            snapshot: Option<&mut page_edit_snapshot::PageEditSnapshot>,
+            key: &str,
+            present: bool,
+            pending: bool,
+        ) -> bool {
+            let Some(snapshot) = snapshot else {
+                return false;
+            };
+            let changed = if present {
+                snapshot.local_adjust.insert(key.to_owned())
+            } else {
+                snapshot.local_adjust.remove(key)
+            };
+            let volatile_changed = if pending {
+                snapshot.volatile_keys.insert(key.to_owned())
+            } else {
+                snapshot.volatile_keys.remove(key)
+            };
+            changed || volatile_changed
+        }
+        macro_rules! publish {
+            ($state:expr) => {{
+                let state = $state;
+                let live = state.local_adjust_shape_key_edit.is_some()
+                    || state.local_adjust_shape_drag.is_some()
+                    || state.local_adjust_canvas_drag.is_some()
+                    || state.local_adjust_mask_brush_stroke.is_some();
+                let live_key = if live {
+                    match &state.local_page_edit_document {
+                        LocalPageEditDocument::Editing { owner, .. } => {
+                            Some(owner.target.page_key.clone())
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if let LocalPageEditDocument::Editing {
+                    owner,
+                    layers,
+                    revision,
+                    ..
+                } = &mut state.local_page_edit_document
+                    && live_key.as_ref() != Some(&owner.target.page_key)
+                    && let Some(accepted) = documents.get(&owner.target.page_key)
+                {
+                    if layers != accepted {
+                        *layers = accepted.clone();
+                        *revision = revision.wrapping_add(1);
+                    }
+                }
+                let mut snapshot_changed = false;
+                // A captured owner, or a former volatile/present key, may be
+                // absent from the current item order after streaming/reindex.
+                let owner_key = match &state.local_page_edit_document {
+                    LocalPageEditDocument::Selection { owner, .. }
+                    | LocalPageEditDocument::Editing { owner, .. } => Some(&owner.target.page_key),
+                    LocalPageEditDocument::Idle => None,
+                };
+                for (key, layers) in documents {
+                    if live_key.as_ref() != Some(key)
+                        && (owner_key == Some(key)
+                            || state.page_edit_snapshot.as_ref().is_some_and(|snapshot| {
+                                snapshot.volatile_keys.contains(key)
+                                    || snapshot.local_adjust.contains(key)
+                            }))
+                    {
+                        snapshot_changed |= update_snapshot(
+                            state.page_edit_snapshot.as_mut(),
+                            key,
+                            !layers.is_empty(),
+                            pending_keys.contains(key.as_str()),
+                        );
+                    }
+                }
+                let mut changed = std::collections::HashSet::new();
+                for idx in 0..state.items.len() {
+                    let key = if let Some(snapshot) = &state.page_edit_snapshot {
+                        snapshot.order.key_at(idx).map(str::to_owned)
+                    } else {
+                        crate::edit_source::page_key_for_grid_item(&state.items[idx])
+                    };
+                    let Some(key) = key else { continue };
+                    if live_key.as_ref() == Some(&key) {
+                        continue;
+                    }
+                    let Some(layers) = documents.get(&key) else {
+                        continue;
+                    };
+                    snapshot_changed |= update_snapshot(
+                        state.page_edit_snapshot.as_mut(),
+                        &key,
+                        !layers.is_empty(),
+                        pending_keys.contains(key.as_str()),
+                    );
+                    if (state
+                        .local_adjust_page_layers
+                        .get(&idx)
+                        .is_some_and(|old| old == layers)
+                        || (layers.is_empty()
+                            && !state.local_adjust_page_layers.contains_key(&idx)))
+                        && state.local_adjust_pages.contains(&idx) == !layers.is_empty()
+                    {
+                        continue;
+                    }
+                    if layers.is_empty() {
+                        state.local_adjust_page_layers.remove(&idx);
+                        state.local_adjust_pages.remove(&idx);
+                    } else {
+                        state.local_adjust_page_layers.insert(idx, layers.clone());
+                        state.local_adjust_pages.insert(idx);
+                    }
+                    let generation = state.local_adjust_generation.entry(idx).or_default();
+                    *generation = generation.wrapping_add(1);
+                    changed.insert(idx);
+                }
+                if let LocalPageEditDocument::Selection {
+                    owner, revision, ..
+                } = &mut state.local_page_edit_document
+                    && owner.slots.iter().any(|idx| changed.contains(idx))
+                {
+                    *revision = revision.wrapping_add(1);
+                }
+                state
+                    .local_adjust_cache
+                    .retain(|key, _| !changed.contains(&key.idx));
+                if snapshot_changed || !changed.is_empty() {
+                    state.page_edit_revision = state.page_edit_revision.wrapping_add(1);
+                }
+            }};
+        }
+        publish!(&mut *self);
+        #[cfg(windows)]
+        for slot in self.viewer_contexts.table.slots.values_mut() {
+            let bundle = match slot {
+                Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
+            };
+            publish!(bundle);
+        }
+    }
+
+    pub(super) fn refresh_pending_page_edit_projections(&mut self) {
+        let pending = self
+            .local_adjust_write_pending
+            .iter()
+            .map(|(key, p)| (key.clone(), p.layers.clone()))
+            .collect();
+        self.publish_accepted_local_page_edits(&pending);
+    }
+
     /// A global fit-mode change ends each context's selected continuous unit.
     /// Do this at the setting boundary: a parked context may not draw between
     /// two changes, so observing a later layout frame cannot detect the exit.
@@ -821,12 +1475,15 @@ pub(in crate::app) struct ViewerContextBundle {
     stack_selection_target: Option<crate::filename_stack_ui::StackSelectionTarget>,
     items: Vec<GridItem>,
     page_identity_index: Arc<super::file_type_resume::PreparedPageIdentityIndex>,
+    projection_recipe: super::book_materialization::ProjectionRecipe,
     current_book_bookmarks: Vec<crate::book_bookmarks::BookBookmark>,
     current_book_bookmarks_key: Option<BookBookmarkProjectionKey>,
     current_book_bookmarks_request: Option<CurrentBookBookmarksRequest>,
     book_bookmark_title_edit: Option<BookBookmarkTitleEdit>,
     bookmark_view_registered_total: usize,
     items_generation: u64,
+    pdf_render_epoch: crate::pdf_loader::PdfRenderEpochOwner,
+    pdf_visible_promotion: super::PdfVisiblePromotionState,
     visible_indices: Vec<usize>,
     /// `items` と同じ添字の正規化済み basename と、その worker lifecycle。
     /// query / tokens / debounce は App 全体で同じ絞り込み条件を使うため swap しないが、
@@ -1082,6 +1739,10 @@ pub(in crate::app) struct ViewerContextBundle {
     singleton_spread_endpoint_preferences: crate::settings::SingletonSpreadEndpointPreferences,
     page_alone_preferences: crate::settings::PageAlonePreferences,
     pub(super) spread_shift: super::spread_shift_owner::ViewerSpreadShift,
+    pub(super) book_composition: super::book_composition_runtime::ViewerBookComposition,
+    pub(super) composition_editor: super::book_composition_editor::CompositionEditorState,
+    pub(super) book_composition_permission:
+        super::book_composition_permission::ViewerPresentationPermission,
     reading_flow: crate::settings::ReadingFlow,
     reading_direction: crate::settings::ReadingDirection,
     slideshow_playing: bool,
@@ -1093,7 +1754,7 @@ pub(in crate::app) struct ViewerContextBundle {
     pdf_current_password: Option<String>,
     pdf_password_pending_save: Option<(PathBuf, String)>,
     pdf_enumerate_pending: Option<super::PdfEnumeratePending>,
-    epub_convert: Option<crate::ui_dialogs::epub_convert::EpubConvertState>,
+    epub_convert: Option<Box<crate::ui_dialogs::epub_convert::EpubConvertState>>,
     zip_enumerate_pending: Option<ZipEnumeratePending>,
     fs_nav_after_pdf_enumerate: Option<DeferredFsReopen>,
     pending_auto_fs_open: bool,
@@ -1116,6 +1777,41 @@ pub(in crate::app) struct ViewerContextBundle {
     thumb_edit_preview_keys: std::collections::HashMap<usize, String>,
     thumb_adjust_tex: std::collections::HashMap<usize, egui::TextureHandle>,
     passthrough_rendition_cache: PassthroughRenditionCache,
+    page_edit_revision: u64,
+    local_page_edit_document: LocalPageEditDocument,
+    local_adjust_spread_ctx: Option<LocalPageEditSpreadPivot>,
+    adjustment_drag_session: Option<AdjustmentDragSession>,
+    adjustment_standard_drag_session: Option<AdjustmentStandardDragSession>,
+    adjustment_dragging: bool,
+    thumb_adjust_drag_color_dirty: bool,
+    adjustment_mode: crate::ui_helpers::MetadataPanelOpenState,
+    adjust_spread_target: AdjustSpreadTarget,
+    adjust_scope_selection: AdjustScopeSelection,
+    adjust_scope_selection_idx: Option<usize>,
+    local_adjust_mode: bool,
+    local_adjust_show_mask: bool,
+    local_adjust_selected_shape: Option<usize>,
+    local_adjust_shape_drag: Option<LocalAdjustMaskShapeDrag>,
+    local_adjust_canvas_drag: Option<LocalAdjustCanvasDrag>,
+    local_adjust_mask_brush_stroke: Option<LocalAdjustMaskBrushStroke>,
+    local_adjust_shape_drag_before_layers: Option<local_adjust_core::LocalAdjustmentLayers>,
+    local_adjust_canvas_drag_before_layers: Option<local_adjust_core::LocalAdjustmentLayers>,
+    local_adjust_mask_brush_before_layers: Option<local_adjust_core::LocalAdjustmentLayers>,
+    local_adjust_shape_key_edit: Option<LocalAdjustShapeKeyEdit>,
+    local_adjust_mask_lasso_points: Vec<[f32; 2]>,
+    local_adjust_mask_shape_drag_start: Option<[f32; 2]>,
+    local_adjust_mask_shape_drag_end: Option<[f32; 2]>,
+    local_adjust_mask_edit_target: LocalAdjustMaskEditTarget,
+    local_adjust_brush_deferred_render: Option<LocalAdjustBrushDeferredRender>,
+    local_adjust_rgb_pick_active: Option<crate::local_adjust_effect_ui::RgbPickTarget>,
+    local_adjust_repair_point_pick_active:
+        Option<crate::local_adjust_effect_ui::RepairPointPickTarget>,
+    local_adjust_selective_color_pick_active: bool,
+    local_adjust_add_layer_dialog_open: bool,
+    local_adjust_change_mask_dialog_open: bool,
+    local_adjust_effect_picker_dialog_open: bool,
+    local_adjust_lut_pending: Option<LocalAdjustLutLoadPending>,
+    local_adjust_segmentation_pending: Option<LocalAdjustSegmentationPending>,
     adjustment_page_params: std::collections::HashMap<usize, crate::adjustment::AdjustParams>,
     local_adjust_page_layers:
         std::collections::HashMap<usize, local_adjust_core::LocalAdjustmentLayers>,
@@ -1164,6 +1860,105 @@ pub(in crate::app) struct ViewerContextBundle {
 }
 
 #[cfg(windows)]
+impl ViewerContextBundle {
+    fn take_page_edit_commits(
+        &mut self,
+        boundary: page_edit_owner::PageEditBoundary,
+    ) -> Vec<page_edit_owner::PageEditCommit> {
+        use page_edit_owner::PageEditCommit;
+        let mut commits = Vec::new();
+        // Match the mounted terminal order, including the legacy legal
+        // pointer/key overlap. No new same-page termination policy is imposed.
+        macro_rules! local_commit {
+            ($owner:expr, $before:expr, $summary:expr, $compact:expr) => {{
+                let owner = $owner;
+                let LocalPageEditDocument::Editing {
+                    owner: document_owner,
+                    layers,
+                    revision,
+                    ..
+                } = &mut self.local_page_edit_document
+                else {
+                    panic!("local gesture has no owning document");
+                };
+                assert_eq!(document_owner.context, owner.context);
+                assert_eq!(document_owner.target.page_key, owner.target.page_key);
+                let mut after = layers.clone();
+                if let Some(layer_idx) = $compact {
+                    crate::ui_adjustment_panel::compact_local_adjust_manual_override_in(
+                        &mut after, layer_idx,
+                    );
+                }
+                let before = $before.unwrap_or_else(|| after.clone());
+                *layers = after.clone();
+                commits.push(PageEditCommit::Local {
+                    origin: LocalAdjustWriteOrigin {
+                        context: owner.context,
+                        target: owner.target,
+                        revision: *revision,
+                    },
+                    before,
+                    after,
+                    summary: $summary.to_owned(),
+                });
+            }};
+        }
+        if let Some(session) = self.local_adjust_shape_key_edit.take() {
+            local_commit!(
+                session.owner,
+                Some(session.before),
+                session.summary,
+                None::<usize>
+            );
+        }
+        if let Some(drag) = self.local_adjust_shape_drag.take() {
+            local_commit!(
+                drag.owner,
+                self.local_adjust_shape_drag_before_layers.take(),
+                "補正レイヤー図形マスク編集",
+                Some(drag.layer_idx)
+            );
+        }
+        if let Some(drag) = self.local_adjust_canvas_drag.take() {
+            local_commit!(
+                drag.owner,
+                self.local_adjust_canvas_drag_before_layers.take(),
+                "補正レイヤーキャンバス操作",
+                None::<usize>
+            );
+        }
+        if let Some(stroke) = self.local_adjust_mask_brush_stroke.take() {
+            let before = self.local_adjust_mask_brush_before_layers.take();
+            if stroke.applied {
+                local_commit!(
+                    stroke.owner,
+                    before,
+                    "補正レイヤー手描きマスク",
+                    Some(stroke.layer_idx)
+                );
+            }
+        }
+        self.local_adjust_shape_drag_before_layers = None;
+        self.local_adjust_canvas_drag_before_layers = None;
+        self.local_adjust_mask_brush_before_layers = None;
+        if boundary == page_edit_owner::PageEditBoundary::Exit {
+            self.local_adjust_mask_lasso_points.clear();
+            self.local_adjust_mask_shape_drag_start = None;
+            self.local_adjust_mask_shape_drag_end = None;
+        }
+        self.local_adjust_brush_deferred_render = None;
+        if let Some(session) = self.adjustment_drag_session.take() {
+            commits.push(PageEditCommit::Page(session));
+        }
+        if let Some(session) = self.adjustment_standard_drag_session.take() {
+            commits.push(PageEditCommit::Standard(session));
+        }
+        self.adjustment_dragging = false;
+        commits
+    }
+}
+
+#[cfg(windows)]
 #[derive(Clone, Copy)]
 enum ContextRefSource<'a> {
     Mounted(&'a App),
@@ -1185,6 +1980,7 @@ pub(in crate::app) struct ContextRef<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::app) enum ContextAsyncOwner {
     FolderObservation,
+    BookCompositionRead,
     RetainedSpreadShift,
     PathClassification,
     HistoryTransition,
@@ -1216,8 +2012,9 @@ pub(in crate::app) enum ContextAsyncServicePhase {
 
 #[cfg(windows)]
 impl ContextAsyncOwner {
-    pub(in crate::app) const ALL: [Self; 21] = [
+    pub(in crate::app) const ALL: [Self; 22] = [
         Self::FolderObservation,
+        Self::BookCompositionRead,
         Self::RetainedSpreadShift,
         Self::EpubConversion,
         Self::PdfPassword,
@@ -1245,6 +2042,10 @@ impl ContextAsyncOwner {
             ($owner:ident) => {
                 match self {
                     Self::FolderObservation => $owner.external_rescan_pending.is_some(),
+                    Self::BookCompositionRead => {
+                        ($owner.book_composition.is_pending()
+                            || $owner.book_composition_permission.pending())
+                    }
                     Self::RetainedSpreadShift => $owner.spread_shift.retained_readoption_pending(),
                     Self::PathClassification => $owner
                         .top_level_grid_view
@@ -1293,7 +2094,7 @@ impl ContextAsyncOwner {
         }
     }
 
-    /// Collection/rating/bookmark polls also create or retire work from their visible surface.
+    /// Composition/collection/rating/bookmark polls also admit work from their current scope.
     /// All other owners need a live request before a mounted frame calls their worker service.
     pub(in crate::app) fn needs_mounted_service(self, context: ContextRef<'_>) -> bool {
         if matches!(self, Self::FullscreenDecode | Self::RawPages) {
@@ -1304,6 +2105,7 @@ impl ContextAsyncOwner {
         matches!(
             self,
             Self::FolderObservation
+                | Self::BookCompositionRead
                 | Self::CollectionGrid
                 | Self::CollectionNavigation
                 | Self::RatingNavigation
@@ -1333,6 +2135,7 @@ impl ContextAsyncOwner {
                 app.poll_current_folder_watch(ctx);
                 app.poll_external_rescan(ctx);
             }
+            Self::BookCompositionRead => app.poll_book_composition_read(ctx),
             Self::RetainedSpreadShift => app.poll_retained_shift_readoption(ctx),
             Self::PathClassification => app.poll_open_path_classification(ctx),
             Self::HistoryTransition => app.poll_collection_history_transition(ctx),
@@ -1372,7 +2175,9 @@ impl ContextAsyncOwner {
             Self::EraseInpaint => app.poll_erase_inpaint(ctx),
             Self::SimilarPreview => {
                 let passwords = app.pdf_passwords.clone();
-                app.similar_panel.preview.poll_background(ctx, &passwords);
+                if let Some(notice) = app.similar_panel.preview.poll_background(ctx, &passwords) {
+                    app.show_feedback_toast(notice);
+                }
             }
             Self::FolderNavigation | Self::FolderPaneScan => {}
         }
@@ -1473,6 +2278,16 @@ impl ContextAsyncOwner {
                 }
             }
             Self::SimilarPreview => app.similar_panel.preview.terminate_on_park(),
+            Self::BookCompositionRead => {
+                app.retire_book_presentation_permission();
+                if matches!(
+                    app.book_composition,
+                    super::book_composition_runtime::ViewerBookComposition::Preparing { .. }
+                        | super::book_composition_runtime::ViewerBookComposition::Projecting { .. }
+                ) {
+                    app.book_composition = Default::default();
+                }
+            }
             Self::RetainedSpreadShift => app.spread_shift.cancel_retained_readoption(),
         }
     }
@@ -1545,8 +2360,8 @@ impl<'a> ContextRef<'a> {
         self,
     ) -> Option<&'a crate::ui_dialogs::epub_convert::EpubConvertState> {
         match self.source {
-            ContextRefSource::Mounted(app) => app.epub_convert.as_ref(),
-            ContextRefSource::AtRest(bundle) => bundle.epub_convert.as_ref(),
+            ContextRefSource::Mounted(app) => app.epub_convert.as_deref(),
+            ContextRefSource::AtRest(bundle) => bundle.epub_convert.as_deref(),
         }
     }
 
@@ -1764,6 +2579,8 @@ impl ViewerContextBundle {
         }
         self.current_folder_watch = None;
         self.folder_refresh_pending = None;
+        self.pdf_render_epoch.retire();
+        self.pdf_visible_promotion = super::PdfVisiblePromotionState::Idle;
         self.current_book_bookmarks_request = None;
         crate::thumb_loader::cancel_raw_thumb_tickets(&self.raw_thumb_develop);
         self.cancel_token.store(true, Ordering::Relaxed);
@@ -1891,12 +2708,15 @@ impl ViewerContextBundle {
             stack_selection_target: None,
             items: Vec::new(),
             page_identity_index: Default::default(),
+            projection_recipe: Default::default(),
             current_book_bookmarks: Vec::new(),
             current_book_bookmarks_key: None,
             current_book_bookmarks_request: None,
             book_bookmark_title_edit: None,
             bookmark_view_registered_total: 0,
             items_generation: 0,
+            pdf_render_epoch: crate::pdf_loader::PdfRenderEpochOwner::fresh(),
+            pdf_visible_promotion: super::PdfVisiblePromotionState::default(),
             visible_indices: Vec::new(),
             facet_name_cache: Vec::new(),
             facet_name_cache_generation: None,
@@ -2088,6 +2908,9 @@ impl ViewerContextBundle {
                 crate::settings::SingletonSpreadEndpointPreferences::default(),
             page_alone_preferences: crate::settings::PageAlonePreferences::default(),
             spread_shift: Default::default(),
+            book_composition: Default::default(),
+            composition_editor: Default::default(),
+            book_composition_permission: Default::default(),
             reading_flow: crate::settings::ReadingFlow::default(),
             reading_direction: crate::settings::ReadingDirection::default(),
             slideshow_playing: false,
@@ -2119,6 +2942,40 @@ impl ViewerContextBundle {
             thumb_edit_preview_keys: std::collections::HashMap::new(),
             thumb_adjust_tex: std::collections::HashMap::new(),
             passthrough_rendition_cache: PassthroughRenditionCache::default(),
+            page_edit_revision: 0,
+            local_page_edit_document: LocalPageEditDocument::default(),
+            local_adjust_spread_ctx: None,
+            adjustment_drag_session: None,
+            adjustment_standard_drag_session: None,
+            adjustment_dragging: false,
+            thumb_adjust_drag_color_dirty: false,
+            adjustment_mode: crate::ui_helpers::MetadataPanelOpenState::Closed,
+            adjust_spread_target: AdjustSpreadTarget::Left,
+            adjust_scope_selection: AdjustScopeSelection::Standard,
+            adjust_scope_selection_idx: None,
+            local_adjust_mode: false,
+            local_adjust_show_mask: true,
+            local_adjust_selected_shape: None,
+            local_adjust_shape_drag: None,
+            local_adjust_canvas_drag: None,
+            local_adjust_mask_brush_stroke: None,
+            local_adjust_shape_drag_before_layers: None,
+            local_adjust_canvas_drag_before_layers: None,
+            local_adjust_mask_brush_before_layers: None,
+            local_adjust_shape_key_edit: None,
+            local_adjust_mask_lasso_points: Vec::new(),
+            local_adjust_mask_shape_drag_start: None,
+            local_adjust_mask_shape_drag_end: None,
+            local_adjust_mask_edit_target: LocalAdjustMaskEditTarget::None,
+            local_adjust_brush_deferred_render: None,
+            local_adjust_rgb_pick_active: None,
+            local_adjust_repair_point_pick_active: None,
+            local_adjust_selective_color_pick_active: false,
+            local_adjust_add_layer_dialog_open: false,
+            local_adjust_change_mask_dialog_open: false,
+            local_adjust_effect_picker_dialog_open: false,
+            local_adjust_lut_pending: None,
+            local_adjust_segmentation_pending: None,
             adjustment_page_params: std::collections::HashMap::new(),
             local_adjust_page_layers: std::collections::HashMap::new(),
             local_adjust_pages: std::collections::HashSet::new(),
@@ -2212,6 +3069,9 @@ impl App {
         window_id: u64,
         idx: usize,
     ) {
+        if self.viewer_mutation_modal_active() {
+            return;
+        }
         match self.try_own_fullscreen_epub_at(idx) {
             super::OpenAdmission::Accepted => {}
             super::OpenAdmission::NotApplicable => return,
@@ -2268,12 +3128,15 @@ impl App {
             stack_selection_target,
             items,
             page_identity_index,
+            projection_recipe,
             current_book_bookmarks,
             current_book_bookmarks_key,
             current_book_bookmarks_request,
             book_bookmark_title_edit,
             bookmark_view_registered_total,
             items_generation,
+            pdf_render_epoch,
+            pdf_visible_promotion,
             visible_indices,
             facet_name_cache,
             facet_name_cache_generation,
@@ -2458,6 +3321,9 @@ impl App {
             singleton_spread_endpoint_preferences,
             page_alone_preferences,
             spread_shift,
+            book_composition,
+            composition_editor,
+            book_composition_permission,
             reading_flow,
             reading_direction,
             slideshow_playing,
@@ -2489,6 +3355,40 @@ impl App {
             thumb_edit_preview_keys,
             thumb_adjust_tex,
             passthrough_rendition_cache,
+            page_edit_revision,
+            local_page_edit_document,
+            local_adjust_spread_ctx,
+            adjustment_drag_session,
+            adjustment_standard_drag_session,
+            adjustment_dragging,
+            thumb_adjust_drag_color_dirty,
+            adjustment_mode,
+            adjust_spread_target,
+            adjust_scope_selection,
+            adjust_scope_selection_idx,
+            local_adjust_mode,
+            local_adjust_show_mask,
+            local_adjust_selected_shape,
+            local_adjust_shape_drag,
+            local_adjust_canvas_drag,
+            local_adjust_mask_brush_stroke,
+            local_adjust_shape_drag_before_layers,
+            local_adjust_canvas_drag_before_layers,
+            local_adjust_mask_brush_before_layers,
+            local_adjust_shape_key_edit,
+            local_adjust_mask_lasso_points,
+            local_adjust_mask_shape_drag_start,
+            local_adjust_mask_shape_drag_end,
+            local_adjust_mask_edit_target,
+            local_adjust_brush_deferred_render,
+            local_adjust_rgb_pick_active,
+            local_adjust_repair_point_pick_active,
+            local_adjust_selective_color_pick_active,
+            local_adjust_add_layer_dialog_open,
+            local_adjust_change_mask_dialog_open,
+            local_adjust_effect_picker_dialog_open,
+            local_adjust_lut_pending,
+            local_adjust_segmentation_pending,
             adjustment_page_params,
             local_adjust_page_layers,
             local_adjust_pages,
@@ -2547,12 +3447,15 @@ impl App {
         swap_field!(stack_selection_target);
         swap_field!(items);
         swap_field!(page_identity_index);
+        swap_field!(projection_recipe);
         swap_field!(current_book_bookmarks);
         swap_field!(current_book_bookmarks_key);
         swap_field!(current_book_bookmarks_request);
         swap_field!(book_bookmark_title_edit);
         swap_field!(bookmark_view_registered_total);
         swap_field!(items_generation);
+        swap_field!(pdf_render_epoch);
+        swap_field!(pdf_visible_promotion);
         swap_field!(visible_indices);
         swap_field!(facet_name_cache);
         swap_field!(facet_name_cache_generation);
@@ -2748,6 +3651,9 @@ impl App {
         swap_field!(singleton_spread_endpoint_preferences);
         swap_field!(page_alone_preferences);
         swap_field!(spread_shift);
+        swap_field!(book_composition);
+        swap_field!(composition_editor);
+        swap_field!(book_composition_permission);
         swap_field!(reading_flow);
         swap_field!(reading_direction);
         swap_field!(slideshow_playing);
@@ -2779,6 +3685,40 @@ impl App {
         swap_field!(thumb_edit_preview_keys);
         swap_field!(thumb_adjust_tex);
         swap_field!(passthrough_rendition_cache);
+        swap_field!(page_edit_revision);
+        swap_field!(local_page_edit_document);
+        swap_field!(local_adjust_spread_ctx);
+        swap_field!(adjustment_drag_session);
+        swap_field!(adjustment_standard_drag_session);
+        swap_field!(adjustment_dragging);
+        swap_field!(thumb_adjust_drag_color_dirty);
+        swap_field!(adjustment_mode);
+        swap_field!(adjust_spread_target);
+        swap_field!(adjust_scope_selection);
+        swap_field!(adjust_scope_selection_idx);
+        swap_field!(local_adjust_mode);
+        swap_field!(local_adjust_show_mask);
+        swap_field!(local_adjust_selected_shape);
+        swap_field!(local_adjust_shape_drag);
+        swap_field!(local_adjust_canvas_drag);
+        swap_field!(local_adjust_mask_brush_stroke);
+        swap_field!(local_adjust_shape_drag_before_layers);
+        swap_field!(local_adjust_canvas_drag_before_layers);
+        swap_field!(local_adjust_mask_brush_before_layers);
+        swap_field!(local_adjust_shape_key_edit);
+        swap_field!(local_adjust_mask_lasso_points);
+        swap_field!(local_adjust_mask_shape_drag_start);
+        swap_field!(local_adjust_mask_shape_drag_end);
+        swap_field!(local_adjust_mask_edit_target);
+        swap_field!(local_adjust_brush_deferred_render);
+        swap_field!(local_adjust_rgb_pick_active);
+        swap_field!(local_adjust_repair_point_pick_active);
+        swap_field!(local_adjust_selective_color_pick_active);
+        swap_field!(local_adjust_add_layer_dialog_open);
+        swap_field!(local_adjust_change_mask_dialog_open);
+        swap_field!(local_adjust_effect_picker_dialog_open);
+        swap_field!(local_adjust_lut_pending);
+        swap_field!(local_adjust_segmentation_pending);
         swap_field!(adjustment_page_params);
         swap_field!(local_adjust_page_layers);
         swap_field!(local_adjust_pages);
@@ -2894,12 +3834,15 @@ impl App {
             stack_selection_target,
             items,
             page_identity_index,
+            projection_recipe,
             current_book_bookmarks,
             current_book_bookmarks_key,
             current_book_bookmarks_request,
             book_bookmark_title_edit,
             bookmark_view_registered_total,
             items_generation,
+            pdf_render_epoch,
+            pdf_visible_promotion,
             visible_indices,
             facet_name_cache,
             facet_name_cache_generation,
@@ -3084,6 +4027,9 @@ impl App {
             singleton_spread_endpoint_preferences,
             page_alone_preferences,
             spread_shift,
+            book_composition,
+            composition_editor,
+            book_composition_permission,
             reading_flow,
             reading_direction,
             slideshow_playing,
@@ -3152,6 +4098,7 @@ impl App {
             music_bookmarks,
             music_bookmarks_loaded_for,
             last_loop_pos,
+            ..
         } = parked.as_mut();
 
         // EOF 連続再生 / 前後ファイル移動が参照する一覧 identity は parked にも複製する。
@@ -3178,6 +4125,7 @@ impl App {
             stack_selection_target,
             items,
             page_identity_index,
+            projection_recipe,
             bookmark_view_registered_total,
             items_generation,
             visible_indices,
@@ -3357,6 +4305,8 @@ impl App {
             // receiver だけは複製できないため、元の main context に残す。
             stack_script_pending,
             facet_name_cache_pending,
+            pdf_render_epoch,
+            pdf_visible_promotion,
             requested,
             raw_thumb_develop,
             metadata_import_refresh_index,
@@ -3413,6 +4363,11 @@ impl App {
             singleton_spread_endpoint_preferences,
             page_alone_preferences,
             spread_shift,
+            book_composition,
+            // A fork keeps the exact editor request with its original context. Its new
+            // sibling starts Closed; the mount-independent operation owner never changes.
+            composition_editor,
+            book_composition_permission,
             reading_flow,
             reading_direction,
             pdf_enumerate_pending,
@@ -3479,6 +4434,7 @@ impl App {
             self.image_metas = std::mem::take(&mut snapshot.saved_image_metas);
             self.visible_indices = std::mem::take(&mut snapshot.saved_visible_indices);
             self.page_identity_index = snapshot.saved_page_identity_index.clone();
+            self.projection_recipe = snapshot.saved_projection_recipe.clone();
             self.scroll_offset_y = snapshot.saved_scroll_offset_y;
             self.zip_nav = snapshot.saved_zip_nav.take();
             self.top_level_grid_view = top_level_grid_view::TopLevelGridView::default();
@@ -3488,6 +4444,7 @@ impl App {
             if record_matches_basis {
                 self.folder_observation.as_mut().unwrap().generation = self.items_generation;
             }
+            self.bump_render_epoch_only();
             self.move_grid_cursor(
                 snapshot.saved_selected,
                 crate::app::GridCursorIntent::Automatic,
@@ -3532,6 +4489,9 @@ impl App {
         detached.singleton_spread_endpoint_preferences = self.singleton_spread_endpoint_preferences;
         detached.page_alone_preferences = self.page_alone_preferences;
         detached.spread_shift = self.spread_shift.fork_accepted();
+        detached.book_composition = self.book_composition.clone();
+        detached.composition_editor = Default::default();
+        detached.book_composition_permission = self.book_composition_permission.clone();
         detached.reading_flow = self.reading_flow;
         detached.reading_direction = self.reading_direction;
 
@@ -3857,6 +4817,32 @@ impl App {
         }
     }
 
+    pub(in crate::app) fn book_composition_contexts_to_poll(
+        &self,
+        changed: &[String],
+    ) -> Vec<ViewerContextId> {
+        self.viewer_contexts
+            .table
+            .slots
+            .iter()
+            .filter_map(|(id, slot)| {
+                let Slot::AtRest(bundle) = slot else {
+                    return None;
+                };
+                let needs_read = matches!(
+                    bundle.book_composition,
+                    super::book_composition_runtime::ViewerBookComposition::Preparing { .. }
+                        | super::book_composition_runtime::ViewerBookComposition::Projecting { .. }
+                ) || bundle.book_composition_permission.pending()
+                    || bundle
+                        .book_composition
+                        .scope()
+                        .is_some_and(|scope| changed.contains(&scope.storage_key()));
+                needs_read.then_some(*id)
+            })
+            .collect()
+    }
+
     pub(in crate::app) fn deliver_spread_shift_reply_at_rest(
         &mut self,
         reply: &crate::spread_shift::ShiftWriteReply,
@@ -3868,6 +4854,14 @@ impl App {
                 bundle
                     .spread_shift
                     .accept_write_reply(reply, self.settings.remember_spread_shift_per_book)
+                    .or_else(|| {
+                        bundle
+                            .snapshot
+                            .as_mut()?
+                            .saved_viewing_state
+                            .shift
+                            .accept_write_reply(reply, self.settings.remember_spread_shift_per_book)
+                    })
             })
     }
 
@@ -3877,6 +4871,9 @@ impl App {
                 Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
             };
             bundle.spread_shift.session_only();
+            if let Some(snapshot) = bundle.snapshot.as_mut() {
+                snapshot.saved_viewing_state.shift.session_only();
+            }
         }
     }
 
@@ -3897,6 +4894,12 @@ impl App {
             if super::spread_shift_live_mappings::migrate(&mut bundle.spread_shift, mappings) {
                 bundle.fullscreen_navigator_interaction.invalidate();
                 bundle.similar_panel.preview.invalidate();
+            }
+            if let Some(snapshot) = bundle.snapshot.as_mut() {
+                super::spread_shift_live_mappings::migrate(
+                    &mut snapshot.saved_viewing_state.shift,
+                    mappings,
+                );
             }
         }
     }
@@ -4489,7 +5492,16 @@ impl App {
     ) -> Result<D, RetireError> {
         let reason = _reason;
         let retiring_window = self.viewer_contexts.table.window_for_context(id);
+        self.close_composition_editor_for_context(id);
+        self.cancel_image_folder_zip_for_context(id);
         self.viewer_contexts.table.begin_retire(id)?;
+        let commits = self
+            .viewer_contexts
+            .table
+            .retiring_slot_mut(id)
+            .unwrap()
+            .take_page_edit_commits(page_edit_owner::PageEditBoundary::Exit);
+        self.deliver_page_edit_commits(commits);
         self.cancel_rating_membership_restore_for_context(id);
         if retiring_window == self.active_detached_window_id() {
             self.begin_active_detached_session_close(reason);
@@ -4729,6 +5741,346 @@ mod tests {
     use std::cell::RefCell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::rc::Rc;
+
+    #[cfg(windows)]
+    fn pdf_promotion_for_test(
+        ticket: &crate::pdf_loader::PdfRenderEpochTicket,
+        retry_needed: bool,
+    ) -> super::super::PdfVisiblePromotionState {
+        super::super::PdfVisiblePromotionState::Tracking {
+            ticket: ticket.clone(),
+            keys: std::collections::HashSet::from(["same.pdf:p:0@256".to_owned()]),
+            retry_needed,
+        }
+    }
+
+    #[cfg(windows)]
+    fn assert_pdf_promotion_for_test(
+        state: &super::super::PdfVisiblePromotionState,
+        expected: &crate::pdf_loader::PdfRenderEpochTicket,
+        expected_retry: bool,
+    ) {
+        let super::super::PdfVisiblePromotionState::Tracking {
+            ticket,
+            keys,
+            retry_needed,
+        } = state
+        else {
+            panic!("promotion tracking must travel with its viewer");
+        };
+        assert!(ticket.same_request(expected));
+        assert_eq!(
+            keys,
+            &std::collections::HashSet::from(["same.pdf:p:0@256".to_owned()])
+        );
+        assert_eq!(*retry_needed, expected_retry);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pdf_epoch_registry_empty_drop_and_swap_keep_only_their_own_writer() {
+        let mut app = crate::app::setup_app_for_test();
+        let main = app.pdf_render_epoch.snapshot();
+        app.pdf_visible_promotion = pdf_promotion_for_test(&main, false);
+        let empty = ViewerContextBundle::empty();
+        let empty_ticket = empty.pdf_render_epoch.snapshot();
+        assert!(!empty_ticket.same_request(&main));
+        drop(empty);
+        assert!(empty_ticket.is_stale());
+        assert!(!main.is_stale());
+
+        let mut sibling = ViewerContextBundle::empty();
+        let other = sibling.pdf_render_epoch.snapshot();
+        sibling.pdf_visible_promotion = pdf_promotion_for_test(&other, true);
+        app.swap_viewer_context_bundle(&mut sibling);
+        assert!(app.pdf_render_epoch.snapshot().same_request(&other));
+        assert_pdf_promotion_for_test(&app.pdf_visible_promotion, &other, true);
+        assert_pdf_promotion_for_test(&sibling.pdf_visible_promotion, &main, false);
+        assert!(!main.is_stale());
+        assert!(!other.is_stale());
+        app.swap_viewer_context_bundle(&mut sibling);
+        assert!(app.pdf_render_epoch.snapshot().same_request(&main));
+        assert_pdf_promotion_for_test(&app.pdf_visible_promotion, &main, false);
+        sibling.cancel_all_context_work();
+        sibling.cancel_all_context_work();
+        assert!(matches!(
+            sibling.pdf_visible_promotion,
+            super::super::PdfVisiblePromotionState::Idle
+        ));
+        drop(sibling);
+        assert!(other.is_stale());
+        assert!(!main.is_stale());
+        drop(app);
+        assert!(main.is_stale());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pdf_epoch_registry_build_commit_abort_promote_and_retire_are_context_local() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let main = app.pdf_render_epoch.snapshot();
+        app.pdf_visible_promotion = pdf_promotion_for_test(&main, false);
+        let mut committed_ticket = None;
+        let committed = app
+            .build_viewer_context("pdf_epoch_commit", |owner, _| {
+                let ticket = owner.pdf_render_epoch.snapshot();
+                assert!(!ticket.same_request(&main));
+                assert!(matches!(
+                    owner.pdf_visible_promotion,
+                    super::super::PdfVisiblePromotionState::Idle
+                ));
+                owner.pdf_visible_promotion = pdf_promotion_for_test(&ticket, true);
+                committed_ticket = Some(ticket);
+                BuildOutcome::Commit
+            })
+            .unwrap();
+        let committed_ticket = committed_ticket.unwrap();
+        assert!(app.pdf_render_epoch.snapshot().same_request(&main));
+        assert_pdf_promotion_for_test(&app.pdf_visible_promotion, &main, false);
+        app.with_viewer_context(committed, |owner| {
+            assert!(
+                owner
+                    .pdf_render_epoch
+                    .snapshot()
+                    .same_request(&committed_ticket)
+            );
+            assert_pdf_promotion_for_test(&owner.pdf_visible_promotion, &committed_ticket, true);
+        })
+        .unwrap();
+
+        let mut aborted_ticket = None;
+        assert_eq!(
+            app.build_viewer_context("pdf_epoch_abort", |owner, _| {
+                let ticket = owner.pdf_render_epoch.snapshot();
+                owner.pdf_visible_promotion = pdf_promotion_for_test(&ticket, true);
+                aborted_ticket = Some(ticket);
+                BuildOutcome::Abort("test")
+            }),
+            None
+        );
+        assert!(aborted_ticket.unwrap().is_stale());
+        assert!(!main.is_stale());
+        assert!(!committed_ticket.is_stale());
+        assert_pdf_promotion_for_test(&app.pdf_visible_promotion, &main, false);
+
+        let old_main = app.stash_mounted_and_start_fresh("pdf_epoch_promote");
+        let fresh = app.pdf_render_epoch.snapshot();
+        assert!(!fresh.same_request(&main));
+        assert!(matches!(
+            app.pdf_visible_promotion,
+            super::super::PdfVisiblePromotionState::Idle
+        ));
+        app.with_viewer_context(old_main, |owner| {
+            assert!(owner.pdf_render_epoch.snapshot().same_request(&main));
+            assert_pdf_promotion_for_test(&owner.pdf_visible_promotion, &main, false);
+        })
+        .unwrap();
+        app.retire_context(committed, "pdf_epoch_retire", |_| ())
+            .unwrap();
+        assert!(committed_ticket.is_stale());
+        assert!(!main.is_stale());
+        assert!(!fresh.is_stale());
+        app.retire_context(old_main, "pdf_epoch_old_main_retire", |_| ())
+            .unwrap();
+        assert!(main.is_stale());
+        assert!(!fresh.is_stale());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pdf_epoch_registry_ordinary_park_resume_preserves_ticket_and_same_key_tracking() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let mut ticket = None;
+        let parked = app
+            .build_viewer_context("pdf_epoch_park", |owner, _| {
+                let current = owner.pdf_render_epoch.snapshot();
+                owner.pdf_visible_promotion = pdf_promotion_for_test(&current, true);
+                ticket = Some(current);
+                BuildOutcome::Commit
+            })
+            .unwrap();
+        let ticket = ticket.unwrap();
+        let main = app.pdf_render_epoch.snapshot();
+        app.with_viewer_context(parked, |owner| {
+            owner.pause_mounted_background_work_keep_current_frame();
+            assert!(owner.pdf_render_epoch.snapshot().same_request(&ticket));
+            assert_pdf_promotion_for_test(&owner.pdf_visible_promotion, &ticket, true);
+        })
+        .unwrap();
+        assert!(!ticket.is_stale());
+        app.bump_render_epoch_only();
+        assert!(main.is_stale());
+        assert!(!ticket.is_stale());
+        let new_main = app.pdf_render_epoch.snapshot();
+        app.with_viewer_context(parked, |owner| {
+            assert!(owner.pdf_render_epoch.snapshot().same_request(&ticket));
+            assert_pdf_promotion_for_test(&owner.pdf_visible_promotion, &ticket, true);
+            owner.bump_render_epoch_only();
+            assert!(ticket.is_stale());
+            assert!(!new_main.is_stale());
+            assert!(matches!(
+                owner.pdf_visible_promotion,
+                super::super::PdfVisiblePromotionState::Idle
+            ));
+        })
+        .unwrap();
+        assert!(app.pdf_render_epoch.snapshot().same_request(&new_main));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pdf_epoch_registry_both_fork_policies_keep_source_writer_and_fork_fresh_idle() {
+        for live in [false, true] {
+            let mut app = crate::app::tests::phase_c_support::setup_app();
+            let root = app.tmp.path().join("pdf-epoch-fork");
+            app.current_folder = Some(root.clone());
+            app.items = vec![GridItem::PdfPage {
+                pdf_path: root.join("same.pdf"),
+                page_num: 0,
+                content_type: None,
+            }];
+            app.thumbnails = vec![ThumbnailState::Pending];
+            app.image_metas = vec![None];
+            app.visible_indices = vec![0];
+            app.fullscreen_idx = Some(0);
+            let main = app.pdf_render_epoch.snapshot();
+            app.pdf_visible_promotion = pdf_promotion_for_test(&main, true);
+            let generation = app.items_generation;
+            let request_id = app
+                .requested
+                .begin(
+                    0,
+                    generation,
+                    super::super::ThumbnailRequestKind::Normal,
+                    None,
+                )
+                .unwrap();
+            let queued = LoadRequest {
+                idx: 0,
+                pdf_render_validity: crate::pdf_loader::PdfRenderValidity::Viewer(main.clone()),
+                ..Default::default()
+            };
+            let queue = Arc::new((Mutex::new(vec![queued]), Condvar::new()));
+            app.reload_queue = Some(queue.clone());
+            let cancel = app.cancel_token.clone();
+            let fork = if live {
+                let main = app.viewer_context_main();
+                app.bind_window(main, 8131).unwrap();
+                app.fork_mounted_live_media_context(8131)
+            } else {
+                app.fork_materialized_still_context(&root, 0)
+            };
+            assert!(app.pdf_render_epoch.snapshot().same_request(&main));
+            assert_pdf_promotion_for_test(&app.pdf_visible_promotion, &main, true);
+            assert_eq!(app.requested.id(0), Some(request_id));
+            assert!(Arc::ptr_eq(app.reload_queue.as_ref().unwrap(), &queue));
+            assert!(Arc::ptr_eq(&app.cancel_token, &cancel));
+            assert!(!cancel.load(Ordering::Relaxed));
+            assert_eq!(queue.0.lock().unwrap().len(), 1);
+            let fork_ticket = app
+                .with_viewer_context(fork, |owner| {
+                    let ticket = owner.pdf_render_epoch.snapshot();
+                    assert!(!ticket.same_request(&main));
+                    assert!(matches!(
+                        owner.pdf_visible_promotion,
+                        super::super::PdfVisiblePromotionState::Idle
+                    ));
+                    assert!(owner.requested.is_empty());
+                    assert!(owner.reload_queue.is_none());
+                    assert!(owner.heavy_io_queue.is_none());
+                    ticket
+                })
+                .unwrap();
+            assert!(!main.is_stale());
+            app.retire_context(fork, "pdf_epoch_fork_retire", |_| ())
+                .unwrap();
+            assert!(fork_ticket.is_stale());
+            assert!(!main.is_stale());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pdf_epoch_registry_direct_reader_basis_restore_advances_only_main() {
+        for materialized in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let root = app.tmp.path().join("pdf-epoch-direct");
+            let basis = GridItem::PdfPage {
+                pdf_path: root.join("same.pdf"),
+                page_num: 0,
+                content_type: None,
+            };
+            let direct = GridItem::Image(root.join("direct.png"));
+            app.current_folder = Some(root.clone());
+            app.items = vec![basis.clone(), direct.clone()];
+            app.thumbnails = vec![ThumbnailState::Pending; 2];
+            app.image_metas = vec![None; 2];
+            app.visible_indices = vec![0, 1];
+            app.fullscreen_idx = Some(1);
+            app.snapshot = Some(crate::snapshot::SnapshotState {
+                page_edit_source: crate::snapshot::SnapshotPageEditSource::PhysicalPrefix,
+                items: Vec::new(),
+                membership: Default::default(),
+                origin: root.clone(),
+                filter_at_capture: crate::snapshot::FilterState::from_rating([true; 6]),
+                source_label: crate::snapshot::SnapshotSourceLabel::DirectMedia {
+                    target: root.join("direct.png"),
+                    policy: app.settings.file_type_visibility.clone(),
+                    reader_order: vec![0, 1],
+                    details_sort: None,
+                    basis_generation: app.items_generation,
+                },
+                generation_id: app.items_generation,
+                saved_items: vec![basis.clone()],
+                saved_projection_recipe: app.projection_recipe.clone(),
+                saved_viewing_state: app.capture_snapshot_viewing_state(),
+                saved_page_identity_index: app.page_identity_index.clone(),
+                saved_thumbnails: vec![ThumbnailState::Pending],
+                saved_image_metas: vec![None],
+                saved_visible_indices: vec![0],
+                saved_scroll_offset_y: 0.0,
+                saved_selected: Some(0),
+                saved_zip_nav: None,
+                list_view_items: vec![basis.clone(), direct],
+                list_view_projection_recipe: app.projection_recipe.clone(),
+                list_view_thumbnails: vec![ThumbnailState::Pending; 2],
+                list_view_image_metas: vec![None; 2],
+                list_view_page_identity_index: app.page_identity_index.clone(),
+                pre_snapshot_search_origin: None,
+            });
+            let main = app.pdf_render_epoch.snapshot();
+            app.pdf_visible_promotion = pdf_promotion_for_test(&main, true);
+            let sibling = ViewerContextBundle::empty();
+            let sibling_ticket = sibling.pdf_render_epoch.snapshot();
+            let fork = if materialized {
+                app.split_materialized_physical_context_for_detached_scope(&root, 1, 991)
+            } else {
+                app.split_current_context_preserving_main_grid()
+            };
+            assert_eq!(app.items, vec![basis]);
+            assert!(!app.direct_media_reader_active());
+            assert!(
+                main.is_stale(),
+                "restoring the physical idx basis invalidates old main work"
+            );
+            assert!(!app.pdf_render_epoch.snapshot().is_stale());
+            assert!(matches!(
+                app.pdf_visible_promotion,
+                super::super::PdfVisiblePromotionState::Idle
+            ));
+            assert!(!sibling_ticket.is_stale());
+            let fork_ticket = fork.pdf_render_epoch.snapshot();
+            assert!(!fork_ticket.is_stale());
+            assert!(!fork_ticket.same_request(&app.pdf_render_epoch.snapshot()));
+            assert!(matches!(
+                fork.pdf_visible_promotion,
+                super::super::PdfVisiblePromotionState::Idle
+            ));
+            app.bump_render_epoch_only();
+            assert!(!fork_ticket.is_stale());
+            assert!(!sibling_ticket.is_stale());
+        }
+    }
 
     #[cfg(windows)]
     struct RatingBoundaryTrace;
@@ -5180,6 +6532,71 @@ mod tests {
                 .iter()
                 .all(|event| event.seen_after == event.write_generation)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn g1_recipe_mount_fork_close_preserves_sibling_items_workers_and_cache() {
+        use super::super::book_materialization::{BookScope, ExtractedSurface, ProjectionRecipe};
+        let mut app = crate::app::setup_app_for_test();
+        let recipe = ProjectionRecipe::ExtractedResult(ExtractedSurface::Collection);
+        app.projection_recipe = recipe.clone();
+        app.spread_mode = crate::settings::SpreadMode::Rtl;
+        app.items = vec![GridItem::Image(PathBuf::from("C:/result/a.png"))];
+        let generation = app.items_generation;
+        let cancel = app.cancel_token.clone();
+        let sibling = app.build_window_context_for_test(9914, |owner| {
+            owner.projection_recipe =
+                ProjectionRecipe::Book(BookScope::Document(PathBuf::from("C:/sibling.pdf")));
+            owner.items = vec![GridItem::PdfPage {
+                pdf_path: PathBuf::from("C:/sibling.pdf"),
+                page_num: 80,
+                content_type: None,
+            }];
+            owner.fs_early_dims.insert(0, [123, 456]);
+            owner.reload_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+        });
+        let sibling_before = app
+            .with_viewer_context(sibling, |owner| {
+                (
+                    owner.projection_recipe.clone(),
+                    owner.items.clone(),
+                    owner.items_generation,
+                    owner.cancel_token.clone(),
+                    owner.reload_queue.clone(),
+                    owner.fs_early_dims.get(&0).copied(),
+                )
+            })
+            .unwrap();
+        let mut fork = app.split_current_context_preserving_main_grid();
+        assert_eq!(fork.projection_recipe, recipe);
+        app.swap_viewer_context_bundle(&mut fork);
+        app.begin_extracted_result_view();
+        app.swap_viewer_context_bundle(&mut fork);
+        drop(fork);
+        assert_eq!(app.projection_recipe, recipe);
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Rtl);
+        assert_eq!(app.items_generation, generation);
+        assert!(Arc::ptr_eq(&app.cancel_token, &cancel));
+        assert!(!cancel.load(Ordering::Relaxed));
+        app.with_viewer_context(sibling, |owner| {
+            assert_eq!(owner.projection_recipe, sibling_before.0);
+            assert_eq!(owner.items, sibling_before.1);
+            assert_eq!(owner.items_generation, sibling_before.2);
+            assert!(Arc::ptr_eq(&owner.cancel_token, &sibling_before.3));
+            assert!(!owner.cancel_token.load(Ordering::Relaxed));
+            assert!(Arc::ptr_eq(
+                owner.reload_queue.as_ref().unwrap(),
+                sibling_before.4.as_ref().unwrap()
+            ));
+            assert_eq!(
+                owner.reload_queue.as_ref().unwrap().0.lock().unwrap().len(),
+                0
+            );
+            assert_eq!(owner.fs_early_dims.get(&0).copied(), sibling_before.5);
+            assert_eq!(owner.fs_early_dims.len(), 1);
+        })
+        .unwrap();
     }
 
     #[cfg(windows)]
@@ -5843,6 +7260,11 @@ mod tests {
         // established mounted frame and resume lifecycles remain separate from park terminal.
         let cache_or_write = [
             "folder_refresh_pending",
+            // Edit producers retain their request/claim while parked. Existing mounted
+            // polls resume them; bundle apply drains them through the all-context poll.
+            // Parking must not use the document-open cancellation inventory for them.
+            "local_adjust_lut_pending",
+            "local_adjust_segmentation_pending",
             "stack_script_pending",
             "facet_name_cache_pending",
             "details_meta_pending",
@@ -6073,8 +7495,14 @@ mod tests {
             ),
             super::super::PdfOpenFailureRoute::ConversionDialogOpened,
         );
+        let allocation = std::ptr::from_ref(ContextRef::mounted(&app).epub_convert().unwrap());
         let stashed = app.stash_mounted_and_start_fresh("epub_test_stash");
         assert!(app.epub_convert.is_none());
+        let bundle = app.viewer_contexts.table.at_rest(stashed).unwrap();
+        assert_eq!(
+            std::ptr::from_ref(ContextRef::at_rest(bundle).epub_convert().unwrap()),
+            allocation
+        );
         // A Smart request in the fresh main context cannot supersede the stashed viewer's
         // conversion. Exercise the actual dialog poll after mounting that viewer again.
         app.smart_folder_transition_sequence += 1;
@@ -6082,6 +7510,10 @@ mod tests {
             .with_viewer_context(stashed, |app| {
                 let ctx = egui::Context::default();
                 let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+                assert_eq!(
+                    std::ptr::from_ref(ContextRef::mounted(app).epub_convert().unwrap()),
+                    allocation
+                );
                 app.epub_convert
                     .as_ref()
                     .is_some_and(|state| state.src_path == path)

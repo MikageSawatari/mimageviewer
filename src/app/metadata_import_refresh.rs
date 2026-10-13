@@ -78,9 +78,7 @@ pub(crate) struct ContextResult {
 }
 
 pub(crate) struct ContainerStateResult {
-    pub(crate) spread_mode: Option<crate::settings::SpreadMode>,
-    pub(crate) reading_flow: Option<crate::settings::ReadingFlow>,
-    pub(crate) reading_direction: Option<crate::settings::ReadingDirection>,
+    pub(crate) spread: crate::spread_db::StoredSpreadState,
     pub(crate) final_cover_spread_preference: crate::settings::FinalCoverSpreadPreference,
     pub(crate) singleton_spread_endpoint_preferences:
         crate::settings::SingletonSpreadEndpointPreferences,
@@ -564,9 +562,6 @@ fn build_context_result(
                 let stored = spread_db
                     .map(|db| db.get_state_with_fallback(path, fallback))
                     .unwrap_or_default();
-                let spread_mode = stored.mode;
-                let reading_flow = stored.flow;
-                let reading_direction = stored.direction;
                 let final_cover_spread_preference = spread_db
                     .map(|db| db.get_final_cover_spread_preference_with_fallback(path, fallback))
                     .unwrap_or_default();
@@ -598,9 +593,7 @@ fn build_context_result(
                 };
                 let view_trim = container_trim_db.and_then(|db| db.get_book_state(path));
                 Some(ContainerStateResult {
-                    spread_mode,
-                    reading_flow,
-                    reading_direction,
+                    spread: stored,
                     final_cover_spread_preference,
                     singleton_spread_endpoint_preferences,
                     page_alone_preferences,

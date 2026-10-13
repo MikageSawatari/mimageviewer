@@ -61,12 +61,15 @@ enum RemoteAcquireBarrierDecision {
 fn remote_acquire_barrier_decision(
     close_state: crate::app::LocalViewerCloseState,
     ai_quiesced: bool,
+    composition_editor_quiesced: bool,
     elapsed: std::time::Duration,
 ) -> RemoteAcquireBarrierDecision {
     use crate::app::LocalViewerCloseState;
     match close_state {
         LocalViewerCloseState::Failed(_) => RemoteAcquireBarrierDecision::AbortCloseFailure,
-        LocalViewerCloseState::Closed if ai_quiesced => RemoteAcquireBarrierDecision::Finish,
+        LocalViewerCloseState::Closed if ai_quiesced && composition_editor_quiesced => {
+            RemoteAcquireBarrierDecision::Finish
+        }
         _ if elapsed >= REMOTE_ACQUIRE_BARRIER_ABORT_AFTER => {
             RemoteAcquireBarrierDecision::AbortTimeout
         }
@@ -97,7 +100,7 @@ pub(crate) struct RemoteSessionUiState {
     pending_fullscreen_restore: Option<PendingFullscreenRestore>,
     paused_animation_restore_key: Option<String>,
     pending_bookmark_writes: std::collections::HashMap<u64, PendingRemoteBookmarkWrite>,
-    pending_shift_resets: std::collections::HashMap<u64, ClaimedRemoteWrite>,
+    pending_reading_writes: Vec<PendingRemoteReadingWrite>,
     pending_resume_reads: Vec<PendingRemoteResumeRead>,
     connection_dialog: Option<RemoteConnectionDialogState>,
     // Unlike the dialog-owned PIN and tailscale receivers, logout completion must outlive the
@@ -116,7 +119,7 @@ impl RemoteSessionUiState {
                 pending.kind,
                 PendingRemoteBookmarkWriteKind::ReadState { .. }
             )
-        }) || !self.pending_shift_resets.is_empty()
+        }) || !self.pending_reading_writes.is_empty()
     }
 }
 
@@ -134,7 +137,7 @@ impl Drop for RemoteSessionUiState {
             video_stream: self.video_stream.take(),
             pending_bookmark_writes: std::mem::take(&mut self.pending_bookmark_writes),
             pending_fullscreen_restore: self.pending_fullscreen_restore.take(),
-            pending_shift_resets: std::mem::take(&mut self.pending_shift_resets),
+            pending_reading_writes: std::mem::take(&mut self.pending_reading_writes),
             pending_resume_reads: std::mem::take(&mut self.pending_resume_reads),
             handle,
             generation,
@@ -756,8 +759,32 @@ struct RemoteAppDrainLease {
     video_stream: Option<AppRemoteVideoStreamState>,
     pending_bookmark_writes: std::collections::HashMap<u64, PendingRemoteBookmarkWrite>,
     pending_fullscreen_restore: Option<PendingFullscreenRestore>,
-    pending_shift_resets: std::collections::HashMap<u64, ClaimedRemoteWrite>,
+    pending_reading_writes: Vec<PendingRemoteReadingWrite>,
     pending_resume_reads: Vec<PendingRemoteResumeRead>,
+}
+
+enum PendingRemoteReadingWrite {
+    ShiftClear {
+        sequence: u64,
+        pending: ClaimedRemoteWrite,
+    },
+    ViewSetting {
+        pending: ClaimedRemoteWrite,
+        receiver: std::sync::mpsc::Receiver<Result<(), String>>,
+    },
+    ViewTrim {
+        pending: ClaimedRemoteWrite,
+        receiver: std::sync::mpsc::Receiver<Result<crate::view_trim::ViewTrimBookState, String>>,
+    },
+}
+impl PendingRemoteReadingWrite {
+    fn into_pending(self) -> ClaimedRemoteWrite {
+        match self {
+            Self::ShiftClear { pending, .. }
+            | Self::ViewSetting { pending, .. }
+            | Self::ViewTrim { pending, .. } => pending,
+        }
+    }
 }
 
 struct PendingRemoteResumeRead {
@@ -777,7 +804,8 @@ impl Drop for RemoteAppDrainLease {
                 "アプリを終了しています",
             )));
         }
-        for (_, pending) in self.pending_shift_resets.drain() {
+        for pending in self.pending_reading_writes.drain(..) {
+            let pending = pending.into_pending();
             pending.complete(UiWriteOutcome::Write(write_error(
                 RemoteWriteErrorCode::UiTimeout,
                 "アプリを終了しています",
@@ -914,6 +942,7 @@ impl crate::app::App {
         ));
         handle.install_archive_cache_db(self.archive_cache_db.clone());
         handle.install_spread_shift_service(self.spread_shift_service.clone());
+        handle.install_book_composition_service(self.book_composition_service.clone());
         #[cfg(windows)]
         self.effetune
             .set_remote_session_source(Some(handle.clone()));
@@ -943,7 +972,9 @@ impl crate::app::App {
                 &mut self.remote_session_ui.pending_bookmark_writes,
             ),
             pending_fullscreen_restore: self.remote_session_ui.pending_fullscreen_restore.take(),
-            pending_shift_resets: std::mem::take(&mut self.remote_session_ui.pending_shift_resets),
+            pending_reading_writes: std::mem::take(
+                &mut self.remote_session_ui.pending_reading_writes,
+            ),
             pending_resume_reads: std::mem::take(&mut self.remote_session_ui.pending_resume_reads),
             handle,
             generation,
@@ -1125,6 +1156,11 @@ impl crate::app::App {
         if remote_phase == super::session::RemoteControlPhase::AcquiringRemote
             && let (Some(handle), Some(snapshot)) = (handle.as_ref(), snapshot.as_ref())
         {
+            // The editor belongs to its global operation owner, independently of whichever
+            // context is mounted and whether any fullscreen/detached viewer surface exists.
+            self.close_local_composition_editor(
+                crate::app::CompositionEditorCloseReason::RemoteAcquire,
+            );
             self.remote_session_ui.pending_fullscreen_restore = None;
             self.remote_session_ui.paused_animation_restore_key = None;
             self.invalidate_local_viewer_open_intents_for_remote();
@@ -1165,9 +1201,13 @@ impl crate::app::App {
                     let watermarks = writer.watermarks();
                     watermarks.admitted == watermarks.completed_through
                 });
+            // Sent saves outlive terminal editor close. The existing composition completion
+            // poll must harvest success/failure before the global ticket owner reports ready.
+            let composition_editor_ready = self.composition_editor_acquire_ready();
             match remote_acquire_barrier_decision(
                 close_state,
                 barrier.is_quiesced() && book_io_ready,
+                composition_editor_ready,
                 elapsed,
             ) {
                 RemoteAcquireBarrierDecision::Finish => {
@@ -1182,7 +1222,7 @@ impl crate::app::App {
                 }
                 RemoteAcquireBarrierDecision::AbortTimeout => {
                     crate::logger::log(format!(
-                        "remote_ipc: acquire_barrier_timeout generation={} elapsed_ms={} blockers={} close_state={close_state:?}",
+                        "remote_ipc: acquire_barrier_timeout generation={} elapsed_ms={} blockers={} close_state={close_state:?} composition_editor_ready={composition_editor_ready}",
                         snapshot.generation,
                         elapsed.as_millis(),
                         barrier.blocker_summary()
@@ -1196,7 +1236,7 @@ impl crate::app::App {
                         .should_log(snapshot.generation, elapsed) =>
                 {
                     crate::logger::log(format!(
-                        "remote_ipc: acquire_barrier_wait generation={} elapsed_ms={} blockers={} close_state={close_state:?}",
+                        "remote_ipc: acquire_barrier_wait generation={} elapsed_ms={} blockers={} close_state={close_state:?} composition_editor_ready={composition_editor_ready}",
                         snapshot.generation,
                         elapsed.as_millis(),
                         barrier.blocker_summary()
@@ -1237,7 +1277,8 @@ impl crate::app::App {
         }
         // The App frame poll drains Clear replies. Keep the existing Remote
         // tick prompt until its claimed request consumes the completion.
-        if !self.remote_session_ui.pending_shift_resets.is_empty() {
+        self.poll_remote_reading_writes();
+        if !self.remote_session_ui.pending_reading_writes.is_empty() {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         } else if matches!(
             self.remote_session_ui.video_stream.as_ref(),
@@ -2059,17 +2100,68 @@ impl crate::app::App {
         }
     }
 
+    fn poll_remote_reading_writes(&mut self) {
+        let mut waiting = Vec::new();
+        for write in std::mem::take(&mut self.remote_session_ui.pending_reading_writes) {
+            match write {
+                PendingRemoteReadingWrite::ViewSetting { pending, receiver } => {
+                    let result = match receiver.try_recv() {
+                        Ok(result) => result,
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            waiting
+                                .push(PendingRemoteReadingWrite::ViewSetting { pending, receiver });
+                            continue;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            Err("表示設定の保存 worker が停止しました".into())
+                        }
+                    };
+                    let response = match result {
+                        Ok(()) => RemoteWriteResponse::Success(RemoteWriteResult::applied()),
+                        Err(error) => write_error(RemoteWriteErrorCode::PersistenceFailed, error),
+                    };
+                    pending.complete(UiWriteOutcome::Write(response));
+                }
+                PendingRemoteReadingWrite::ViewTrim { pending, receiver } => {
+                    let ownership = pending.ownership_response();
+                    if ownership.status != SessionStatus::Active {
+                        pending.complete(UiWriteOutcome::Session(ownership));
+                        continue;
+                    }
+                    let result = match receiver.try_recv() {
+                        Ok(result) => result,
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            waiting.push(PendingRemoteReadingWrite::ViewTrim { pending, receiver });
+                            continue;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            Err("view trim worker stopped".into())
+                        }
+                    };
+                    let response = match result {
+                        Ok(state) => self.complete_remote_view_trim_write(state),
+                        Err(error) => write_error(RemoteWriteErrorCode::PersistenceFailed, error),
+                    };
+                    pending.complete(UiWriteOutcome::Write(response));
+                }
+                other => waiting.push(other),
+            }
+        }
+        self.remote_session_ui.pending_reading_writes = waiting;
+    }
+
     pub(crate) fn complete_remote_shift_reset(
         &mut self,
         reply: &crate::spread_shift::ShiftWriteReply,
     ) -> bool {
-        let Some(pending) = self
-            .remote_session_ui
-            .pending_shift_resets
-            .remove(&reply.sequence)
-        else {
+        let Some(pos) = self.remote_session_ui.pending_reading_writes.iter().position(|write| matches!(write, PendingRemoteReadingWrite::ShiftClear { sequence, .. } if *sequence == reply.sequence)) else {
             return false;
         };
+        let pending = self
+            .remote_session_ui
+            .pending_reading_writes
+            .remove(pos)
+            .into_pending();
         let response = match &reply.status {
             Ok(()) => {
                 self.show_feedback_toast("見開き調整を解除しました".into());
@@ -2445,6 +2537,91 @@ impl crate::app::App {
             ctx.request_repaint();
             return;
         }
+        if let Some(service) = &self.book_composition_service
+            && let Err(error) = pending
+                .composition_admission()
+                .validate(&service.snapshot())
+        {
+            pending.complete(UiWriteOutcome::Write(write_error(
+                RemoteWriteErrorCode::Unsupported,
+                error,
+            )));
+            return;
+        }
+        if let RemoteWriteRequest::SetViewMode { address, mode } = pending.request() {
+            let result = remote_shift_scope(address).and_then(|scope| {
+                let service = self
+                    .book_composition_service
+                    .clone()
+                    .ok_or("composition service unavailable")?;
+                let mode = match mode {
+                    mimageviewer_ipc::RemoteViewMode::Single => crate::settings::SpreadMode::Single,
+                    mimageviewer_ipc::RemoteViewMode::Spread => crate::settings::SpreadMode::Ltr,
+                    mimageviewer_ipc::RemoteViewMode::LandscapeSplit => {
+                        crate::settings::SpreadMode::SplitLtr
+                    }
+                };
+                if !self.admit_book_append_followup_mutation() {
+                    return Err("本への追加を取り消しています".to_owned());
+                }
+                service.set_view_mode(scope, mode)
+            });
+            match result {
+                Ok(receiver) => self
+                    .remote_session_ui
+                    .pending_reading_writes
+                    .push(PendingRemoteReadingWrite::ViewSetting { pending, receiver }),
+                Err(error) => pending.complete(UiWriteOutcome::Write(write_error(
+                    RemoteWriteErrorCode::PersistenceFailed,
+                    error,
+                ))),
+            }
+            ctx.request_repaint();
+            return;
+        }
+        if let Some(service) = self.book_composition_service.clone()
+            && let RemoteWriteRequest::SetViewTrim {
+                context_address,
+                state,
+                ..
+            } = pending.request()
+        {
+            let result = (|| {
+                let state =
+                    serde_json::from_value::<crate::view_trim::ViewTrimBookState>(state.clone())
+                        .map_err(|_| {
+                            RemoteWriteError::new(
+                                RemoteWriteErrorCode::BadRequest,
+                                "表示トリム設定が正しくありません",
+                            )
+                        })?;
+                let key = remote_spread_key(context_address)?;
+                if self.view_trim_db.is_none() {
+                    return Err(RemoteWriteError::new(
+                        RemoteWriteErrorCode::PersistenceFailed,
+                        "view_trim.db を利用できません",
+                    ));
+                }
+                if !self.admit_book_append_followup_mutation() {
+                    return Err(RemoteWriteError::new(
+                        RemoteWriteErrorCode::Busy,
+                        "本への追加を取り消しています",
+                    ));
+                }
+                Ok(service.set_view_trim_book(key, state, pending.composition_admission().clone()))
+            })();
+            match result {
+                Ok(receiver) => self
+                    .remote_session_ui
+                    .pending_reading_writes
+                    .push(PendingRemoteReadingWrite::ViewTrim { pending, receiver }),
+                Err(error) => {
+                    pending.complete(UiWriteOutcome::Write(RemoteWriteResponse::Error(error)))
+                }
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            return;
+        }
         let _settings_family_lease = if remote_write_uses_settings_family(pending.request()) {
             match crate::settings_db::acquire_settings_family_read_lease() {
                 Ok(lease) => Some(lease),
@@ -2495,7 +2672,10 @@ impl crate::app::App {
             )));
             return;
         }
-        let response = self.apply_remote_write(pending.request());
+        let response = self.apply_remote_write_with_composition_admission(
+            pending.request(),
+            pending.composition_admission(),
+        );
         if matches!(response, RemoteWriteResponse::Success(_))
             && self.settings.remember_spread_shift_per_book
             && let RemoteWriteRequest::SetSpread { address, .. } = pending.request()
@@ -2521,8 +2701,8 @@ impl crate::app::App {
             match result {
                 Ok(sequence) => {
                     self.remote_session_ui
-                        .pending_shift_resets
-                        .insert(sequence, pending);
+                        .pending_reading_writes
+                        .push(PendingRemoteReadingWrite::ShiftClear { sequence, pending });
                 }
                 Err(error) => {
                     crate::logger::log(format!(
@@ -2541,8 +2721,66 @@ impl crate::app::App {
         ctx.request_repaint();
     }
 
+    #[cfg(test)]
+    fn qualify_remote_write_for_test(
+        &self,
+        request: &RemoteWriteRequest,
+    ) -> Result<crate::book_composition::CompositionWriteAdmission, RemoteWriteError> {
+        // Unqualified fixture calls use the same worker admission as IPC. The
+        // product UI always receives a qualified request and performs no FS I/O.
+        if let Some(service) = self.book_composition_service.clone() {
+            let request = request.clone();
+            std::thread::spawn(move || {
+                let session = SessionHandle::new();
+                session.install_book_composition_service(Some(service));
+                let engine = super::container::ContainerEngine::new_with_session(
+                    Default::default(),
+                    session,
+                );
+                engine.composition_write_admission(&request)
+            })
+            .join()
+            .expect("remote composition qualification worker")
+        } else {
+            Ok(crate::book_composition::CompositionWriteAdmission::default())
+        }
+    }
+
+    #[cfg(test)]
     fn apply_remote_write(&mut self, request: &RemoteWriteRequest) -> RemoteWriteResponse {
+        let admission = self.qualify_remote_write_for_test(request);
+        match admission {
+            Ok(admission) => {
+                self.apply_remote_write_with_composition_admission(request, &admission)
+            }
+            Err(error) => RemoteWriteResponse::Error(error),
+        }
+    }
+
+    fn apply_remote_write_with_composition_admission(
+        &mut self,
+        request: &RemoteWriteRequest,
+        qualified: &crate::book_composition::CompositionWriteAdmission,
+    ) -> RemoteWriteResponse {
+        if matches!(
+            request,
+            RemoteWriteRequest::SetSpread { .. }
+                | RemoteWriteRequest::SetFinalCoverSpreadPreference { .. }
+                | RemoteWriteRequest::SetSingletonSpreadPlacementPreference { .. }
+                | RemoteWriteRequest::SetSingletonSpreadEndpointPreference { .. }
+                | RemoteWriteRequest::SetPageAlonePreference { .. }
+        ) {
+            if let Some(service) = self.book_composition_service.as_ref() {
+                if let Err(error) = qualified.validate(&service.snapshot()) {
+                    return write_error(RemoteWriteErrorCode::Unsupported, error);
+                }
+            }
+        }
         match request {
+            RemoteWriteRequest::SetViewMode { .. } => write_error(
+                RemoteWriteErrorCode::Internal,
+                "表示モードの非同期経路が使われませんでした",
+            ),
             RemoteWriteRequest::SetSpread {
                 address,
                 spread_mode,
@@ -3349,6 +3587,13 @@ impl crate::app::App {
                 "view_trim.db への保存に失敗しました",
             );
         }
+        self.complete_remote_view_trim_write(state)
+    }
+
+    fn complete_remote_view_trim_write(
+        &mut self,
+        state: crate::view_trim::ViewTrimBookState,
+    ) -> RemoteWriteResponse {
         if matches!(
             self.settings.fullscreen_fit_mode,
             crate::settings::FullscreenFitMode::MarginFit
@@ -4376,7 +4621,8 @@ fn remote_write_uses_settings_family(request: &RemoteWriteRequest) -> bool {
     match request {
         RemoteWriteRequest::SetSortOrder { .. }
         | RemoteWriteRequest::RecordVideoProgress { .. } => true,
-        RemoteWriteRequest::SetSpread { .. }
+        RemoteWriteRequest::SetViewMode { .. }
+        | RemoteWriteRequest::SetSpread { .. }
         | RemoteWriteRequest::SetFinalCoverSpreadPreference { .. }
         | RemoteWriteRequest::SetSingletonSpreadPlacementPreference { .. }
         | RemoteWriteRequest::SetSingletonSpreadEndpointPreference { .. }
@@ -4793,7 +5039,7 @@ pub(super) fn core_reading_direction(
     }
 }
 
-fn write_error(code: RemoteWriteErrorCode, message: &'static str) -> RemoteWriteResponse {
+fn write_error(code: RemoteWriteErrorCode, message: impl Into<String>) -> RemoteWriteResponse {
     RemoteWriteResponse::Error(RemoteWriteError::new(code, message))
 }
 
@@ -4978,6 +5224,186 @@ mod tests {
     use super::*;
 
     include!("spread_shift_ui_tests.rs");
+
+    #[test]
+    fn detached_folder_composition_allows_qualified_and_fallback_remote_binding_writes() {
+        use crate::book_composition::*;
+        let mut app = crate::app::setup_app_for_test();
+        let data = tempfile::tempdir().unwrap();
+        app.spread_db =
+            Ok(crate::spread_db::SpreadDb::open_at(&data.path().join("spread.db")).unwrap());
+        let (service, owner) =
+            BookCompositionService::spawn_at(data.path().join("composition"), None).unwrap();
+        app.install_book_composition_runtime(service.clone());
+        for (name, domain) in [
+            ("image-book", PageDomain::ImageFolder),
+            ("directory.pdf", PageDomain::ImageFolder),
+            ("directory.zip", PageDomain::ImageFolder),
+            ("replaced.pdf", PageDomain::Document),
+            ("replaced.epub", PageDomain::Document),
+            (
+                "replaced.zip",
+                PageDomain::ArchiveLevel {
+                    prefix: String::new(),
+                },
+            ),
+        ] {
+            let root = data.path().join(name);
+            if domain == PageDomain::ImageFolder {
+                std::fs::create_dir(&root).unwrap();
+            } else {
+                std::fs::write(&root, b"former document/archive").unwrap();
+            }
+            let scope = crate::book_scope::BookScopeKey::folder(&root).unwrap();
+            let page = match domain {
+                PageDomain::ImageFolder => CompositionPageRef::RelativePath {
+                    path: "page.png".into(),
+                },
+                PageDomain::Document => CompositionPageRef::PdfPage { page_num: 0 },
+                PageDomain::ArchiveLevel { .. } => CompositionPageRef::ArchiveEntry {
+                    entry_name: "page.png".into(),
+                },
+            };
+            let mut record = BookComposition::new(
+                ReadingDirection::Ltr,
+                vec![CompositionUnit::Single {
+                    page: page.clone(),
+                    placement: SinglePlacement::Center,
+                    companion: SingleCompanion::Vacant,
+                }],
+            );
+            record.hidden_pages.push(page);
+            service
+                .save(scope.clone(), domain.clone(), record)
+                .recv()
+                .unwrap()
+                .status
+                .unwrap();
+            let before = service.snapshot();
+            if domain != PageDomain::ImageFolder {
+                std::fs::remove_file(&root).unwrap();
+                std::fs::create_dir(&root).unwrap();
+            }
+            let address =
+                mimageviewer_ipc::RemoteAddress::file(root.to_string_lossy().into_owned());
+            for use_worker_admission in [false, true] {
+                let request = RemoteWriteRequest::SetSpread {
+                    address: address.clone(),
+                    spread_mode: RemoteSpreadMode::RtlCover,
+                    reading_direction: RemoteReadingDirection::Rtl,
+                };
+                let response = if use_worker_admission {
+                    let admission = app.qualify_remote_write_for_test(&request).unwrap();
+                    assert!(admission.binding_scope.is_none());
+                    app.apply_remote_write_with_composition_admission(&request, &admission)
+                } else {
+                    app.apply_remote_write(&request)
+                };
+                assert!(
+                    matches!(response, RemoteWriteResponse::Success(_)),
+                    "{response:?}"
+                );
+                let key = remote_spread_key(&address).unwrap().exact;
+                assert_eq!(
+                    app.spread_db.as_ref().unwrap().get(&key),
+                    Some(crate::settings::SpreadMode::RtlCover)
+                );
+                assert_eq!(
+                    app.spread_db.as_ref().unwrap().get_direction(&key),
+                    Some(crate::settings::ReadingDirection::Rtl)
+                );
+            }
+            if domain == PageDomain::ImageFolder && name == "directory.pdf" {
+                // Future folder values also remain inert if an external action
+                // replaces the folder with an actual document file.
+                std::fs::remove_dir(&root).unwrap();
+                std::fs::write(&root, b"%PDF-1.4\n").unwrap();
+                let request = RemoteWriteRequest::SetSpread {
+                    address: address.clone(),
+                    spread_mode: RemoteSpreadMode::LtrCover,
+                    reading_direction: RemoteReadingDirection::Ltr,
+                };
+                let admission = app.qualify_remote_write_for_test(&request).unwrap();
+                assert!(admission.binding_scope.is_none());
+                assert!(matches!(
+                    app.apply_remote_write_with_composition_admission(&request, &admission),
+                    RemoteWriteResponse::Success(_)
+                ));
+                assert!(matches!(
+                    app.apply_remote_write(&request),
+                    RemoteWriteResponse::Success(_)
+                ));
+                assert_eq!(
+                    app.spread_db
+                        .as_ref()
+                        .unwrap()
+                        .get(&remote_spread_key(&address).unwrap().exact),
+                    Some(crate::settings::SpreadMode::LtrCover)
+                );
+            }
+            assert_eq!(service.snapshot().rows, before.rows);
+            assert_eq!(
+                service.snapshot().token_for(&scope),
+                before.token_for(&scope)
+            );
+        }
+        owner.shutdown_and_join();
+    }
+
+    #[test]
+    fn detached_folder_remote_binding_ignores_unavailable_store_and_document_fails_closed() {
+        use crate::book_composition::*;
+        let mut app = crate::app::setup_app_for_test();
+        let data = tempfile::tempdir().unwrap();
+        let composition_data = data.path().join("composition");
+        std::fs::create_dir(&composition_data).unwrap();
+        let broken_path = composition_data.join("book_composition.db");
+        let original = b"invalid composition database";
+        std::fs::write(&broken_path, original).unwrap();
+        let root = data.path().join("image-book");
+        std::fs::create_dir(&root).unwrap();
+        let document = data.path().join("book.pdf");
+        std::fs::write(&document, b"no document decoding").unwrap();
+        app.spread_db =
+            Ok(crate::spread_db::SpreadDb::open_at(&data.path().join("spread.db")).unwrap());
+        let (service, owner) = BookCompositionService::spawn_at(composition_data, None).unwrap();
+        assert!(
+            service
+                .prepare(
+                    crate::book_scope::BookScopeKey::document(&document).unwrap(),
+                    PageDomain::Document
+                )
+                .recv()
+                .unwrap()
+                .status
+                .is_err()
+        );
+        app.install_book_composition_runtime(service.clone());
+        let request = |root: &std::path::Path| RemoteWriteRequest::SetSpread {
+            address: mimageviewer_ipc::RemoteAddress::file(root.to_string_lossy().into_owned()),
+            spread_mode: RemoteSpreadMode::Rtl,
+            reading_direction: RemoteReadingDirection::Rtl,
+        };
+        for qualified in [None, Some(CompositionWriteAdmission::default())] {
+            assert!(matches!(
+                match qualified {
+                    Some(admission) => app
+                        .apply_remote_write_with_composition_admission(&request(&root), &admission),
+                    None => app.apply_remote_write(&request(&root)),
+                },
+                RemoteWriteResponse::Success(_)
+            ));
+        }
+        assert!(matches!(
+            app.apply_remote_write(&request(&document)),
+            RemoteWriteResponse::Error(RemoteWriteError {
+                code: RemoteWriteErrorCode::Unsupported,
+                ..
+            })
+        ));
+        assert_eq!(std::fs::read(broken_path).unwrap(), original);
+        owner.shutdown_and_join();
+    }
 
     fn ready_unharvested_remote_audio_stream() -> (
         crate::app::AppTestEnvForTest,
@@ -5430,6 +5856,91 @@ mod tests {
     }
 
     #[test]
+    fn section1372_1373_remote_reading_early_writes_admit_before_enqueue() {
+        for trim in [false, true] {
+            for busy in [false, true] {
+                let mut app = crate::app::setup_app_for_test();
+                let data = tempfile::tempdir().unwrap();
+                let book = data.path().join("book.pdf");
+                std::fs::write(&book, b"reading-setting fixture without decoding").unwrap();
+                let (service, process) = crate::book_composition::BookCompositionService::spawn_at(
+                    data.path().into(),
+                    None,
+                )
+                .unwrap();
+                app.install_book_composition_runtime(service);
+                app.view_trim_db = Some(
+                    crate::view_trim_db::ViewTrimDb::open_at(&data.path().join("view_trim.db"))
+                        .unwrap(),
+                );
+                let (handle, owner, _) = active_session();
+                app.set_remote_session_handle(handle.clone());
+                let receipt = section1373_remote_receipt(&app);
+                app.book_append_undo_receipt = Some(receipt.clone());
+                if busy {
+                    let (_tx, rx) = std::sync::mpsc::channel();
+                    app.book_op_pending = Some(crate::books::BookOpPending {
+                        rx,
+                        intent: crate::books::BookOpIntent::UndoAppend { receipt },
+                    });
+                }
+                let revision = app.book_append_undo_revision;
+                let address =
+                    mimageviewer_ipc::RemoteAddress::file(book.to_string_lossy().into_owned());
+                let request = if trim {
+                    RemoteWriteRequest::SetViewTrim {
+                        address: address.clone(),
+                        context_address: address,
+                        state: serde_json::to_value(crate::view_trim::ViewTrimBookState::default())
+                            .unwrap(),
+                    }
+                } else {
+                    RemoteWriteRequest::SetViewMode {
+                        address,
+                        mode: mimageviewer_ipc::RemoteViewMode::LandscapeSplit,
+                    }
+                };
+                let operation = handle
+                    .begin_operation(&owner, "reading-admission".into())
+                    .unwrap();
+                let (pending, response) = ClaimedRemoteWrite::for_test(operation, request);
+                app.apply_pending_remote_write(pending, &egui::Context::default());
+                if busy {
+                    assert!(matches!(
+                        response.try_recv().unwrap(),
+                        UiWriteOutcome::Write(RemoteWriteResponse::Error(RemoteWriteError {
+                            code: RemoteWriteErrorCode::Busy,
+                            ..
+                        }))
+                    ));
+                    assert!(app.remote_session_ui.pending_reading_writes.is_empty());
+                    assert_eq!(app.book_append_undo_revision, revision);
+                    assert!(app.book_append_undo_receipt.is_some());
+                } else {
+                    assert_eq!(app.remote_session_ui.pending_reading_writes.len(), 1);
+                    assert!(app.remote_session_ui.has_pending_bookmark_writes());
+                    assert!(app.book_append_undo_revision > revision);
+                    assert!(app.book_append_undo_receipt.is_none());
+                    assert!(matches!(
+                        response.try_recv(),
+                        Err(std::sync::mpsc::TryRecvError::Empty)
+                    ));
+                }
+                process.shutdown_and_join();
+                if !busy {
+                    app.poll_remote_reading_writes();
+                    assert!(matches!(
+                        response.try_recv().unwrap(),
+                        UiWriteOutcome::Write(RemoteWriteResponse::Success(_))
+                    ));
+                    assert!(app.remote_session_ui.pending_reading_writes.is_empty());
+                    assert!(!app.remote_session_ui.has_pending_bookmark_writes());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn section1373_remote_acquire_first_blocks_undo_then_expires_ready_receipt() {
         let mut app = crate::app::setup_app_for_test();
         app.book_append_undo_receipt = Some(section1373_remote_receipt(&app));
@@ -5785,7 +6296,7 @@ mod tests {
                 dsp_admission_deadline: std::time::Instant::now(),
             })),
             pending_bookmark_writes,
-            pending_shift_resets: Default::default(),
+            pending_reading_writes: Default::default(),
             pending_resume_reads: Default::default(),
             pending_fullscreen_restore: Some(PendingFullscreenRestore {
                 item_key: "resume".to_owned(),
@@ -5987,20 +6498,21 @@ mod tests {
 
         let before = REMOTE_ACQUIRE_BARRIER_ABORT_AFTER - std::time::Duration::from_millis(1);
         assert_eq!(
-            remote_acquire_barrier_decision(LocalViewerCloseState::Closed, true, before),
+            remote_acquire_barrier_decision(LocalViewerCloseState::Closed, true, true, before),
             Finish
         );
         assert_eq!(
-            remote_acquire_barrier_decision(LocalViewerCloseState::Closed, false, before),
+            remote_acquire_barrier_decision(LocalViewerCloseState::Closed, false, true, before),
             Wait
         );
         assert_eq!(
-            remote_acquire_barrier_decision(LocalViewerCloseState::InProgress, true, before),
+            remote_acquire_barrier_decision(LocalViewerCloseState::InProgress, true, true, before),
             Wait
         );
         assert_eq!(
             remote_acquire_barrier_decision(
                 LocalViewerCloseState::Failed(LocalViewerCloseFailure::PassiveContextRetire),
+                true,
                 true,
                 before,
             ),
@@ -6010,6 +6522,7 @@ mod tests {
             remote_acquire_barrier_decision(
                 LocalViewerCloseState::InProgress,
                 true,
+                true,
                 REMOTE_ACQUIRE_BARRIER_ABORT_AFTER,
             ),
             AbortTimeout
@@ -6017,6 +6530,33 @@ mod tests {
         assert_eq!(
             remote_acquire_barrier_decision(
                 LocalViewerCloseState::Closed,
+                false,
+                true,
+                REMOTE_ACQUIRE_BARRIER_ABORT_AFTER,
+            ),
+            AbortTimeout
+        );
+    }
+
+    #[test]
+    fn acquire_decision_waits_for_composition_editor_and_harvested_save_terminal() {
+        use crate::app::LocalViewerCloseState;
+        use RemoteAcquireBarrierDecision::{AbortTimeout, Finish, Wait};
+
+        let before = REMOTE_ACQUIRE_BARRIER_ABORT_AFTER - std::time::Duration::from_millis(1);
+        // Closed viewer surfaces and idle AI do not imply a terminal editor/save operation.
+        assert_eq!(
+            remote_acquire_barrier_decision(LocalViewerCloseState::Closed, true, false, before),
+            Wait
+        );
+        assert_eq!(
+            remote_acquire_barrier_decision(LocalViewerCloseState::Closed, true, true, before),
+            Finish
+        );
+        assert_eq!(
+            remote_acquire_barrier_decision(
+                LocalViewerCloseState::Closed,
+                true,
                 false,
                 REMOTE_ACQUIRE_BARRIER_ABORT_AFTER,
             ),

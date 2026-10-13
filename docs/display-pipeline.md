@@ -1,9 +1,43 @@
 # 表示パイプライン (サムネイル / フルスクリーン)
 
+### 本の構成と提示許可（§1.242 G3、2026-10-11）
+
+accepted構成のexplicit unitをSingle/Spread/Split/連結/portraitへ投影する。回転や寸法後着、休眠shiftで再pairしない。
+Blankはsource/readinessを持たず、補助はNavigation/resume/exportの実列へ追加しない。
+提示候補はcontext/世代/source/role/slot/sliceをworkerで確認し、相方はunit内でatomicに採用する。
+Checking/Hiddenはcached processed/raw/thumbnail/holdoverからもtexture選択・paint・transform/hit・読了traceへ渡さない。
+連結の測定extentと画像許可を分離し、bounded cacheの既知寸法だけで未許可画像を復活させない。
+scroll/reanchor/resizeで探索を更新しても、画面に残るoccurrenceの許可とChecking要求は保持する。
+測定された可視要求との差分だけで退出を破棄・新入場を照合し、cached画像も継続描画する。
+類似候補の長押しプレビューは、Single/Spread/連結それぞれの許可済み表示を一時的に置き換える。
+連結では通常の可視unit受付を共有し、Checking/Hiddenの元occurrenceをプレビューで迂回しない。
+候補自身のidentityも既存preview workerで共通resolverへ渡し、完了採用時に最新scope tokenを照合する。
+確認は共有serviceのFIFOへ受付し、初期化・maintenance・先行保存の後で返す。preview workerだけが
+その私有channelを待ち、押下時の未初期化snapshotから拒否を決めたりUIで待機したりしない。
+候補のcache/source更新証明だけを構成の許可証にせず、次の長押しでは新しく確認する。
+類似queryや候補thumbnailの生成には構成lookupを追加しない。
+非表示範囲は現在の要求内の最大20範囲と連続cursorへ限定し、退出・再入場では新しい許可を取得する。
+Single→SpreadのChecking中は、同じdisplay cacheのtyped transitionへ捕捉した旧Allowed descriptorだけを保持する。
+旧source/世代/tokenを照合し、新Pairの確定でatomicに置換する。新しい相方のcacheを先に表示しない。
+指定サイズはEの既存geometryを使い、新fit参照の選択は許可後だけ。scroll/texture退去/resizeの既存参照は保持し、
+構成更新/削除のidentity・role・slot・sliceが変わる場合は既存ownerで失効する。
+PDFのtarget・bbox・表示解像度の準備も、pagedでは許可済み投影、連結では許可済みの各unitだけを入力にする。
+Single→SpreadのChecking中は捕捉した旧表示を使い、新しい相方のPDF再描画要求を先に送らない。
+trim左右別は実slotへ適用し、Single modeはsingle margin。投影前の未保存補正と通常保存・resetは
+同じservice FIFOで既存view_trim.dbへ書き、受付から完了まで既存Edit ledgerのguardを保持する。
+UIでDBを開かず、古い投影処理による上書きを防ぐ。詳細は[本の構成](book-composition-plan.md#5-表示projection)。
+
 **これが一番事故が多い領域**。画像補正・AI アップスケール・回転・アニメーション・消しゴムマスクのすべてが、
 「どのテクスチャを画面に出すか」を巡って絡み合う。修正前にこのドキュメントを読むこと。
 
 ---
+
+PDF thumbnailの一覧失効・優先昇格はviewer owner/要求世代/keyに限定する
+（未リリースPDF-EPOCH-OWNERSHIP）。seek/hoverもViewer ticketをUI admissionで捕捉し、
+派生workerで更新しない。fullscreen本体はUnscoped＋既存fs_pending cancel/generation、
+そのpromotionはUnscoped jobsだけをfoundと数える。兄弟同PDF/pageの表示要求は失効しない。
+GPU upload、ThumbnailRequests、Canceled/SourcePixels/Finalizedの既存採用契約は維持する。
+[詳細](pdf-render-epoch-ownership-plan.md)。
 
 ### 音声セルの代表画像 (§1.347、2026-10-08)
 
@@ -1986,7 +2020,8 @@ anchor/画面順/slot/roleを派生する。bounded応答は既存のgroup生成
 変更しない。master証明とD3の検証結果は設計§11.10および`target/D-1364-d3-msg.txt`を参照する。
 記憶OFFのopenはshiftなし、force_single_pageとorientationは表示投影だけで保存値を変えない。
 Q3 SetSpreadの成功公開・group cache失効はshift Clearのcommit結果を同requestで受け取ってから行う。
-新しいWeb nudge/記憶UIは追加せず、G3構成consumerは未統合のまま共有C1–C12 fixtureだけを供給する。
+新しいWeb nudge/記憶UIは追加しない。D3時点ではG3構成consumerは未統合だった。
+2026-10-11のG3は共有C1–C12のadmission/restore規則を消費し、editor固有のC7/C9はG4で接続する。
 本記述は接続の実装箇所を記録し、完了検証・レビュー合格を主張しない。
 
 実際の配置は従来の次の手順を使う。

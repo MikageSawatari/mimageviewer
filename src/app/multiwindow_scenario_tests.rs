@@ -1690,29 +1690,31 @@ fn run_multiwindow_rar_tree_nav(
         .expect("main context remains mountable");
     let _main_conversion_sender = if pending_main_conversion {
         let (tx, rx) = mpsc::channel();
-        app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
-            restore_intent: crate::app::StartupListIntent::ExplicitList,
+        app.archive_convert = Some(Box::new(
+            crate::ui_dialogs::archive_convert::ArchiveConvertState {
+                restore_intent: crate::app::StartupListIntent::ExplicitList,
 
-            src_path: app.tmp.path().join("pending-main.7z"),
-            input_seq: 0,
-            format: crate::archive_converter::ArchiveFormat::SevenZ,
-            password: None,
-            password_input: String::new(),
-            phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
-            cancel: Arc::new(AtomicBool::new(false)),
-            rx,
-            pending_nav: None,
-            pending_direct_nav: None,
-            allow_direct_read: false,
-            completion:
-                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
-            pending_sibling_output: None,
+                src_path: app.tmp.path().join("pending-main.7z"),
+                input_seq: 0,
+                format: crate::archive_converter::ArchiveFormat::SevenZ,
+                password: None,
+                password_input: String::new(),
+                phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+                cancel: Arc::new(AtomicBool::new(false)),
+                rx,
+                pending_nav: None,
+                pending_direct_nav: None,
+                allow_direct_read: false,
+                completion:
+                    crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
+                pending_sibling_output: None,
 
-            auto_fullscreen: false,
-            deferred_fullscreen: None,
-            suppress_confirm: false,
-            suppress_confirm_next_time: false,
-        });
+                auto_fullscreen: false,
+                deferred_fullscreen: None,
+                suppress_confirm: false,
+                suppress_confirm_next_time: false,
+            },
+        ));
         Some(tx)
     } else {
         None
@@ -3181,7 +3183,14 @@ fn multiwindow_scenario_collection_parked_live_eof_owner_poll() {
         let source = first.clone();
         app.push_window_context_for_test(&ctx, window_id, move |owner| {
             owner.top_level_grid_view = grid;
-            owner.install_prepared_aggregate_items(items, metas, page_identity_index);
+            owner.install_prepared_aggregate_items(
+                crate::app::book_materialization::ProjectionRecipe::ExtractedResult(
+                    crate::app::book_materialization::ExtractedSurface::Collection,
+                ),
+                items,
+                metas,
+                page_identity_index,
+            );
             owner
                 .top_level_grid_view
                 .collection_session_mut()

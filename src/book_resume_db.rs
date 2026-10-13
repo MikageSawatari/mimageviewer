@@ -499,6 +499,14 @@ fn normalize_path(path: &Path) -> String {
 /// の「UI スレッドの同期 I/O は worker 化」)。メーターの移行/全行読込/clearも同じFIFO。
 /// Released raw/meter APIs remain available; new restores use the fenced read.
 enum Command {
+    FolderZip(
+        PathBuf,
+        PathBuf,
+        Vec<String>,
+        Option<Vec<String>>,
+        crate::image_folder_zip_metadata::CopyPhase,
+        mpsc::Sender<crate::image_folder_zip_metadata::CopyReply>,
+    ),
     Record(
         PathBuf,
         usize,
@@ -611,6 +619,31 @@ impl BookResumeWriter {
                             let mut state = worker_state.lock().unwrap();
                             state.snapshot = Some(publication);
                             state.watermarks.completed_through = seq;
+                        }
+                        Command::FolderZip(source, destination, members, legacy, phase, reply) => {
+                            let result = crate::image_folder_zip_metadata::clone_resume_on(
+                                &db.conn,
+                                &source,
+                                &destination,
+                                &members,
+                                legacy.as_deref(),
+                                phase,
+                            );
+                            let seq = position_fence_seq.expect("conversion read/write is fenced");
+                            let values = db.read_positions();
+                            {
+                                let mut state = worker_state.lock().unwrap();
+                                let mut snapshot = state.snapshot.take().unwrap();
+                                let current = Arc::make_mut(&mut snapshot);
+                                match values {
+                                    Ok(values) => current.values = values,
+                                    Err(error) => current.status = Err(error),
+                                }
+                                current.completed_through = seq;
+                                state.snapshot = Some(snapshot);
+                                state.watermarks.completed_through = seq;
+                            }
+                            let _ = reply.send(result);
                         }
                         Command::Read(tx) => {
                             let result = if meter_ready {
@@ -726,7 +759,7 @@ impl BookResumeWriter {
         // fence later receipts just like Record/Clear, even though it writes no DB row.
         let position_fence_seq = matches!(
             command,
-            Command::Record(..) | Command::Read(..) | Command::Clear(..)
+            Command::Record(..) | Command::Read(..) | Command::Clear(..) | Command::FolderZip(..)
         )
         .then(|| {
             state
@@ -823,6 +856,57 @@ impl BookResumeWriter {
         rx
     }
 
+    pub(crate) fn folder_zip_portal(
+        &self,
+        source: PathBuf,
+        destination: PathBuf,
+        sort: crate::settings::SortOrder,
+        columns: Vec<Arc<Vec<String>>>,
+    ) -> crate::image_folder_zip_metadata::CopyPortal {
+        let tx = self.tx.clone();
+        let state = Arc::clone(&self.state);
+        let pending = Arc::clone(&self.pending);
+        Arc::new(move |manifest, phase| {
+            let members = crate::image_folder_zip_metadata::target_order(manifest, sort);
+            let member_set: std::collections::HashSet<_> = members.iter().collect();
+            let mut candidates = columns
+                .iter()
+                .filter(|column| column.iter().all(|name| member_set.contains(name)))
+                .map(|column| column.as_ref().clone());
+            let legacy = candidates
+                .next()
+                .filter(|first| candidates.all(|other| other == *first));
+            let (reply, rx) = mpsc::channel();
+            let mut state = state.lock().unwrap();
+            let seq = state
+                .watermarks
+                .admitted
+                .checked_add(1)
+                .expect("resume sequence exhausted");
+            pending.fetch_add(1, Ordering::AcqRel);
+            let sent = tx.as_ref().is_some_and(|tx| {
+                tx.send(QueuedCommand {
+                    position_fence_seq: Some(seq),
+                    command: Command::FolderZip(
+                        source.clone(),
+                        destination.clone(),
+                        members,
+                        legacy,
+                        phase,
+                        reply,
+                    ),
+                })
+                .is_ok()
+            });
+            if sent {
+                state.watermarks.admitted = seq;
+            } else {
+                pending.fetch_sub(1, Ordering::Release);
+            }
+            rx
+        })
+    }
+
     pub(crate) fn clear(&self) -> mpsc::Receiver<Result<usize, String>> {
         let (tx, rx) = mpsc::channel();
         self.send(Command::Clear(tx));
@@ -861,6 +945,190 @@ impl Drop for BookResumeWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn folder_zip_fixture() -> (
+        tempfile::TempDir,
+        crate::image_folder_zip::ImageFolderManifest,
+    ) {
+        let files = tempfile::tempdir().unwrap();
+        let source = files.path().join("book");
+        std::fs::create_dir(&source).unwrap();
+        for name in ["p1.jpg", "p2.jpg", "p10.jpg"] {
+            std::fs::write(source.join(name), b"image bytes").unwrap();
+        }
+        let manifest = crate::image_folder_zip::prepare_manifest(
+            &source,
+            None,
+            &crate::image_folder_zip::ConversionControl::default(),
+        )
+        .unwrap();
+        (files, manifest)
+    }
+
+    #[test]
+    fn folder_zip_resume_fifo_remaps_identity_hint_and_meter_for_real_consumer() {
+        use crate::app::file_type_resume::{PositionResolution, PreparedPageIdentityIndex};
+        use crate::image_folder_zip_metadata::CopyPhase;
+        let (files, manifest) = folder_zip_fixture();
+        let writer = BookResumeWriter::spawn_at(files.path().join("resume.db")).unwrap();
+        let portal = writer.folder_zip_portal(
+            manifest.source.clone(),
+            manifest.destination.clone(),
+            crate::settings::SortOrder::NumericDesc,
+            Vec::new(),
+        );
+        let source_identity = PageIdentity::Image {
+            path: path_key::normalize_keep_drive(&manifest.source.join("p1.jpg")),
+        };
+        let sibling = files.path().join("sibling.zip");
+        assert!(writer.record(&sibling, 7, ReadingMeterValue::new(8, 10)));
+        let release = writer.pause_for_test();
+        assert!(writer.record_identity(
+            &manifest.source,
+            0,
+            ReadingMeterValue::new(1, 3),
+            Some(source_identity.clone()),
+        ));
+        let checked = portal(&manifest, CopyPhase::Check);
+        let copied = portal(&manifest, CopyPhase::Apply);
+        let retained_source = writer.read_position_after(
+            &normalize_path(&manifest.source),
+            writer.watermarks().admitted,
+        );
+        assert!(writer.record(&manifest.source, 99, None));
+        assert!(matches!(copied.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        release.send(()).unwrap();
+        assert_eq!(
+            checked.recv_timeout(Duration::from_secs(10)).unwrap(),
+            Ok(1)
+        );
+        assert_eq!(copied.recv_timeout(Duration::from_secs(10)).unwrap(), Ok(1));
+        assert_eq!(
+            retained_source
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .position,
+            Some(ReadingPosition {
+                page: 0,
+                identity: Some(source_identity)
+            })
+        );
+        let cutoff = writer.watermarks().admitted;
+        let target = position_reply(&writer, &manifest.destination, cutoff)
+            .position
+            .unwrap();
+        assert_eq!(target.page, 2);
+        assert_eq!(
+            target.identity,
+            Some(PageIdentity::Archive {
+                container: path_key::normalize_keep_drive(&manifest.destination),
+                entry_name: "p1.jpg".into(),
+            })
+        );
+        let rows: Vec<_> = ["p10.jpg", "p2.jpg", "p1.jpg"]
+            .into_iter()
+            .map(|name| crate::grid_item::GridItem::ZipImage {
+                zip_path: manifest.destination.clone(),
+                entry_name: name.into(),
+            })
+            .collect();
+        let consumer = PreparedPageIdentityIndex::prepare(&rows, None, Default::default());
+        assert_eq!(consumer.resolve(&target), PositionResolution::Restored(2));
+        let meters = writer
+            .read_all()
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            meters.values[&normalize_path(&manifest.destination)],
+            ReadingMeterValue::new(3, 3)
+        );
+        assert_eq!(
+            meters.values[&normalize_path(&sibling)],
+            ReadingMeterValue::new(8, 10)
+        );
+        assert_eq!(
+            position_reply(&writer, &manifest.source, cutoff)
+                .position
+                .unwrap(),
+            ReadingPosition {
+                page: 99,
+                identity: None
+            }
+        );
+        assert_eq!(
+            position_reply(&writer, &sibling, cutoff)
+                .position
+                .unwrap()
+                .page,
+            7
+        );
+    }
+
+    #[test]
+    fn folder_zip_resume_legacy_identity_requires_unambiguous_captured_column() {
+        use crate::image_folder_zip_metadata::CopyPhase;
+        let (files, manifest) = folder_zip_fixture();
+        let valid = Arc::new(vec!["p1.jpg".into(), "p2.jpg".into(), "p10.jpg".into()]);
+        let conflicting = Arc::new(vec!["p10.jpg".into(), "p2.jpg".into(), "p1.jpg".into()]);
+        for (case, columns, page, expected_identity, expected_page) in [
+            ("none", Vec::new(), 0, None, 0),
+            (
+                "proven",
+                vec![Arc::clone(&valid), Arc::clone(&valid)],
+                0,
+                Some("p1.jpg"),
+                2,
+            ),
+            (
+                "ambiguous",
+                vec![Arc::clone(&valid), conflicting],
+                0,
+                None,
+                0,
+            ),
+            ("out_of_range", vec![valid], 99, None, 99),
+        ] {
+            let writer =
+                BookResumeWriter::spawn_at(files.path().join(format!("{case}.db"))).unwrap();
+            assert!(writer.record(&manifest.source, page, ReadingMeterValue::new(1, 3)));
+            let portal = writer.folder_zip_portal(
+                manifest.source.clone(),
+                manifest.destination.clone(),
+                crate::settings::SortOrder::NumericDesc,
+                columns,
+            );
+            assert_eq!(
+                portal(&manifest, CopyPhase::Apply)
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap(),
+                Ok(1)
+            );
+            let cutoff = writer.watermarks().admitted;
+            let target = position_reply(&writer, &manifest.destination, cutoff)
+                .position
+                .unwrap();
+            assert_eq!(target.page, expected_page, "{case}");
+            assert_eq!(
+                target.identity,
+                expected_identity.map(|name| PageIdentity::Archive {
+                    container: path_key::normalize_keep_drive(&manifest.destination),
+                    entry_name: name.into(),
+                }),
+                "{case}"
+            );
+            assert_eq!(
+                position_reply(&writer, &manifest.source, cutoff)
+                    .position
+                    .unwrap(),
+                ReadingPosition {
+                    page,
+                    identity: None
+                },
+                "{case}"
+            );
+        }
+    }
 
     fn position_reply(writer: &BookResumeWriter, book: &Path, cutoff: u64) -> PositionReadReply {
         writer

@@ -81,11 +81,11 @@
   <main class="content">
     <h1 class="page-title">検索機能</h1>
     <p class="page-desc">
-      mImageViewer には 4 種類の検索モード (<kbd>Ctrl</kbd>+<kbd>S</kbd> / <kbd>Ctrl</kbd>+<kbd>F</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd> / <kbd>Ctrl</kbd>+<kbd>T</kbd>) があります。
-      「S はフォルダ・ZIP・PDF・EPUB を探す / G は画像・PDF・EPUB・動画・音声 1 件ずつを探す / F は今見ている場所を絞る / T はタグで探す」と覚えると使い分けが簡単です。
+      mImageViewer には 5 種類の検索モード (<kbd>Ctrl</kbd>+<kbd>S</kbd> / <kbd>Ctrl</kbd>+<kbd>F</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd> / <kbd>Ctrl</kbd>+<kbd>T</kbd> / <kbd>Ctrl</kbd>+<kbd>R</kbd>) があります。
+      「S はフォルダ・ZIP・PDF・EPUB を探す / G はお気に入りのメタ情報を探す / F は今見ている場所を絞る / T はタグで探す / R は Everything でファイルを探す」と覚えると使い分けが簡単です。
     </p>
 
-    <h2 id="overview">1. 4 つの検索モードの使い分け</h2>
+    <h2 id="overview">1. 5 つの検索モードの使い分け</h2>
 
     <div class="scroll-x">
       <table>
@@ -121,6 +121,13 @@
             <td>お気に入り横断で画像やメディアを掘り出す</td>
           </tr>
           <tr>
+            <td><kbd>Ctrl</kbd>+<kbd>R</kbd></td>
+            <td><strong>Everything ファイル名検索</strong></td>
+            <td>Everything が索引を持つ<strong>実ファイル</strong>（お気に入り外・別ドライブを含む）</td>
+            <td>Everything の検索構文</td>
+            <td>PC 内の対応画像・本・動画・音声を名前で探す</td>
+          </tr>
+          <tr>
             <td><kbd>Ctrl</kbd>+<kbd>T</kbd></td>
             <td><strong>タグビュー</strong></td>
             <td><strong>mIV タグ付き項目</strong></td>
@@ -140,6 +147,7 @@
           <li>今開いている場所の中で絞り込みたい → <kbd>Ctrl</kbd>+<kbd>F</kbd> (現在地フィルタ)</li>
           <li>お気に入り全体から画像・動画・音声 1 件を見つけたい → <kbd>Ctrl</kbd>+<kbd>G</kbd> (アイテム検索)</li>
           <li>タグで横断的に探したい → <kbd>Ctrl</kbd>+<kbd>T</kbd> (タグビュー)</li>
+          <li>お気に入り外も含めてファイル名で探したい → <kbd>Ctrl</kbd>+<kbd>R</kbd> (Everything ファイル名検索)</li>
         </ul>
       </div>
     </div>
@@ -256,7 +264,51 @@
     </ul>
     <p>詳しい使い方は<a href="tags.html">タグ機能</a>を参照してください。</p>
 
-    <h2 id="query-syntax">6. 検索クエリ構文 (Ctrl+S / Ctrl+F / Ctrl+G 共通)</h2>
+    <h2 id="ctrl-r">6. Ctrl+R: Everything ファイル名検索</h2>
+    <p>PC にインストールした <a href="https://www.voidtools.com/">Everything</a> の索引で実ファイルを探し、
+      mImageViewer のサムネイル一覧に表示します。mImageViewer の検索索引を有効にする必要はありません。
+      Everything の<strong>通常版 1.4.1 以降の検索クライアント</strong>を起動してください。
+      サービスだけの起動、Lite 版、IPC 検索を無効にした状態では利用できません。
+      既定のインスタンスに接続します。名前付きインスタンスの選択には対応していません。</p>
+    <p>大きな索引や検索条件によって、Everything からの結果取得に時間がかかることがあります。
+      待機中も「取消」や <kbd>Esc</kbd> で元の一覧へ戻れます。
+      応答はしていても処理が遅い・混雑している場合は、クライアント未起動とは別の案内を表示します。
+      しばらく待つか条件を絞って再検索してください。mImageViewer は Everything の設定を変更しません。</p>
+    <p>ファイルの件数が多い環境では、Everything の起動直後や索引の更新中に、しばらく応答しないことがあります。
+      その間は mImageViewer から検索できません。Everything の画面が「応答なし」になっていないか確認し、
+      処理が落ち着いてからもう一度検索してください。</p>
+    <p>ビルド出力など頻繁に書き換わるフォルダーを、Everything のオプションの「除外」に入れると、
+      処理が軽くなる場合があります。検索したいファイルまで除外しないよう、必要な範囲で設定してください。</p>
+    <ol>
+      <li>メインウィンドウの一覧で <kbd>Ctrl</kbd>+<kbd>R</kbd>、または「ファイル」→「Everything ファイル名検索…」を選びます。
+        操作カスタマイズでキーを変更・解除できます。フルスクリーンや別ウィンドウからは起動しません。</li>
+      <li>検索文字列を入力し、日本語の変換を確定してから <kbd>Enter</kbd> または「検索」を押します。
+        入力中や変換確定だけでは問い合わせません。
+        <kbd>Ctrl</kbd>+<kbd>R</kbd> で検索欄を開き直すと、前の検索語を全選択するので、そのまま入力して置き換えられます。</li>
+      <li>結果の取得と準備がすべて終わると、一覧をまとめて表示します。取得中は「取消」で取り消せます。
+        取り消しや失敗で、検索前に表示していた一覧は失われません。</li>
+      <li>画像・本・動画・音声を通常どおり開けます。本を開いた後も検索結果へ戻れます。
+        検索バーの × または <kbd>Esc</kbd> で検索を閉じます。</li>
+    </ol>
+    <p>入力した文字列は Everything にそのまま渡します。<code>ext:jpg;png</code>、ワイルドカード、
+      引用符、パス指定、正規表現などは <a href="https://www.voidtools.com/support/everything/search_syntax/">Everything の検索構文</a>に従います。
+      mImageViewer の AND/OR チェック、検索対象のドロップダウン、EXIF・AI プロンプト・タグ・★の検索構文は使いません。
+      拡張子条件を自動で付け加えることもありません。</p>
+    <p>Everything から受け取るのは<strong>先頭 10,000 件まで</strong>です。その後で対応形式と「表示するファイル種類」、
+      EPUB・書庫変換の設定に従って絞ります。フォルダや非対応ファイルもこの 10,000 件を消費するため、
+      表示件数が少なくても上限に達している場合があります。検索バーで取得件数と表示件数を確認し、必要なら
+      <code>ext:jpg;png</code> などで条件を狭めて再検索してください。追加取得や次ページの表示はありません。</p>
+    <p>結果は一つの一覧で、詳細表示・並べ替え・★やタグによる絞り込みを使えます。
+      アイテム検索のフォルダ別集約・ヒット件数順・全文検索の絞り込みは使いません。
+      ZIP 内の画像や PDF の各ページは検索結果にならず、本体ファイルを開いて閲覧します。
+      結果は取得時点の索引に基づき、自動更新されません。Everything の索引範囲や更新状況により、
+      見つからないファイルや、すでに移動・削除されたファイルが含まれることがあります。</p>
+    <p>問い合わせは同じ PC の Everything とのローカル IPC だけを使い、検索語や結果を外部の検索サービスへ送信しません。
+      検索語と結果一覧は mImageViewer の履歴や診断ログに保存しません。
+      Everything 自身の検索履歴設定は変更しません。結果から開いたファイルの閲覧履歴や、明示的に付けたタグ・★は通常どおり保存します。
+      リモート閲覧からの Everything 検索や、検索結果一覧の共有には対応していません。</p>
+
+    <h2 id="query-syntax">7. 検索クエリ構文 (Ctrl+S / Ctrl+F / Ctrl+G 共通)</h2>
 
     <div class="scroll-x">
       <table>
@@ -312,7 +364,7 @@
       </div>
     </div>
 
-    <h2 id="filters">7. 絞り込みドロップダウン</h2>
+    <h2 id="filters">8. 絞り込みドロップダウン</h2>
     <p>検索バー右側のドロップダウンで、検索範囲をさらに狭めることができます。
     どのバーがどのドロップダウンを持つかは下表のとおり:</p>
     <p>Ctrl+G の検索バーは横幅が足りないと折り返して表示されます。Ctrl+G のドロップダウンを
@@ -369,7 +421,7 @@
     <p>mIV タグは全文検索の検索対象には含まれません。タグで探す場合は <kbd>Ctrl</kbd>+<kbd>T</kbd> のタグビュー、
     またはグリッドのスマートフィルタのタグ欄を使います。</p>
 
-    <h2 id="results">8. 結果の読み方</h2>
+    <h2 id="results">9. 結果の読み方</h2>
 
     <h3>Ctrl+F の結果表示</h3>
     <ul>
@@ -398,7 +450,7 @@
       <li>大量ヒット時は 10000 件で打ち切られます (検索バーに「絞り込みキーワードを追加してください」と出ます)。</li>
     </ul>
 
-    <h2 id="search-index">9. 検索索引の作成と保守</h2>
+    <h2 id="search-index">10. 検索索引の作成と保守</h2>
     <p>mImageViewer は 3 種類の索引を持ちます。いずれも<strong>既定では OFF</strong>で、
     お気に入りダイアログで個別に ON にする必要があります。</p>
 
@@ -480,7 +532,7 @@
       </li>
     </ul>
 
-    <h2 id="shortcuts">10. 関連ショートカット</h2>
+    <h2 id="shortcuts">11. 関連ショートカット</h2>
 
     <div class="scroll-x">
       <table>
@@ -491,6 +543,7 @@
           <tr><td><kbd>Ctrl</kbd>+<kbd>S</kbd></td><td>コンテナ検索を開く / 閉じる</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>F</kbd></td><td>現在地フィルタを開く / 閉じる (PDF ページ表示中は無効)</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>G</kbd></td><td>アイテム検索を開く / 閉じる</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>R</kbd></td><td>Everything ファイル名検索を開く（メインの一覧だけ。操作カスタマイズで変更可）</td></tr>
           <tr><td><kbd>Enter</kbd></td><td>検索を実行 (テキスト欄にフォーカス中)</td></tr>
           <tr><td><kbd>Esc</kbd></td><td>検索バーを閉じて検索前のフォルダへ戻る (検索バーの <span aria-hidden="true">×</span> ボタンや <kbd>Ctrl</kbd>+<kbd>G</kbd> / <kbd>Ctrl</kbd>+<kbd>S</kbd> の再押下でも閉じます)</td></tr>
           <tr><td><kbd>BS</kbd></td><td>ドリルイン中は 1 階層戻る。集約 / 結果一覧 (最上位) では何もしない (検索ごと閉じたいときは <kbd>Esc</kbd> か検索バーの <span aria-hidden="true">×</span> ボタン)</td></tr>
@@ -513,7 +566,7 @@
       <span class="box-icon">ℹ️</span>
       <div class="box-body">
         IME 変換中の <kbd>Enter</kbd> (変換確定) や <kbd>Esc</kbd> (変換キャンセル) は検索バーが奪わないようになっています。
-        日本語をそのまま入力して変換確定するだけで検索できます。
+        Everything 検索では、変換確定後にもう一度 <kbd>Enter</kbd> を押すか「検索」を選びます。
       </div>
     </div>
   </main>

@@ -25,6 +25,40 @@ use crate::settings::{
 };
 use crate::tag_view::{TagViewMenuChoice, tag_view_menu_sections};
 use crate::ui_details_icon::{DetailsIconKind, details_icon_kind, draw_details_preview_icon};
+
+#[cfg(windows)]
+fn effetune_toolbar_button(
+    ui: &mut egui::Ui,
+    active: bool,
+    available: bool,
+    drag_enabled: bool,
+    tooltip: &str,
+) -> egui::Response {
+    ui.add_enabled(
+        available,
+        egui::Button::new("音響調整")
+            .selected(active)
+            .sense(if drag_enabled {
+                egui::Sense::click_and_drag()
+            } else {
+                egui::Sense::click()
+            }),
+    )
+    .on_hover_text(tooltip)
+    .on_disabled_hover_text(tooltip)
+}
+
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn draw_effetune_show_only_snapshot_fixture(ui: &mut egui::Ui, active: bool) {
+    let effective = if active {
+        crate::effetune::EffectiveState::Effective
+    } else {
+        crate::effetune::EffectiveState::Inert
+    };
+    let tooltip = crate::effetune::running_gui_tooltip(Some(effective));
+    let _ = effetune_toolbar_button(ui, active, true, false, &tooltip);
+}
 // open_external_player はグリッドからは使わなくなった (動画はフルスクリーン化 →
 // インライン再生)。フォルダ系は別途同モジュールから直接呼んでいる箇所がある。
 
@@ -1339,7 +1373,8 @@ fn show_virtualized_facet_choice_rows(
     }
 
     let spacing = ui.spacing();
-    let row_h = spacing.interact_size.y.max(22.0) + spacing.item_spacing.y;
+    // show_rows adds item_spacing itself; the drawing allocates only row_h.
+    let row_h = spacing.interact_size.y.max(22.0);
     let body_height = facet_choice_body_height(ui, choice_count);
     ui.allocate_ui_with_layout(
         egui::vec2(width, body_height),
@@ -1347,7 +1382,7 @@ fn show_virtualized_facet_choice_rows(
         |ui| {
             ui.set_min_height(body_height);
             ui.set_width(width);
-            egui::ScrollArea::vertical()
+            let output = egui::ScrollArea::vertical()
                 .max_height(body_height)
                 .auto_shrink([false, false])
                 .show_rows(ui, row_h, choice_count, |ui, row_range| {
@@ -1356,6 +1391,15 @@ fn show_virtualized_facet_choice_rows(
                         add_row(ui, idx);
                     }
                 });
+            #[cfg(test)]
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::new("facet_choice_scroll_layout"),
+                    (output.inner_rect, output.content_size, output.state.offset),
+                )
+            });
+            #[cfg(not(test))]
+            let _ = output;
         },
     );
 }
@@ -7354,6 +7398,7 @@ impl App {
         let help_about_menu_label = self.keymap.menu_command_label(MenuCommandId::HelpAbout);
 
         egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
+            if self.composition_editor_modal_active() { ui.disable(); }
             egui::MenuBar::new().ui(ui, |ui| {
                 let mut top_menu_responses = Vec::with_capacity(9);
 
@@ -7456,6 +7501,13 @@ impl App {
                                                 self.request_application_quit(ctx);
                                             }
                                         }
+                                        MenuCommandId::GlobalEverythingSearch => {
+                                            let label = self.keymap.menu_command_label(MenuCommandId::GlobalEverythingSearch);
+                                            if ui.add_enabled(self.everything_search_entry_allowed(), egui::Button::new(label)).clicked() {
+                                                self.open_everything_search();
+                                                ui.close();
+                                            }
+                                        }
                                         _ => {}
                                     }
                                 }
@@ -7527,6 +7579,13 @@ impl App {
                                             if ui.button(&metadata_search_menu_label).clicked() {
                                                 // 相互排他は toggle_global_search 内で
                                                 self.toggle_global_search();
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::GlobalEverythingSearch => {
+                                            let label = self.keymap.menu_command_label(MenuCommandId::GlobalEverythingSearch);
+                                            if ui.add_enabled(self.everything_search_entry_allowed(), egui::Button::new(label)).clicked() {
+                                                self.open_everything_search();
                                                 ui.close();
                                             }
                                         }
@@ -7640,6 +7699,17 @@ impl App {
                             let response = ui.menu_button(TopMenuId::Books.label(), |ui| {
                                 let active_name = self.active_book_name();
                                 ui.label(format!("追加先の本: {active_name}"));
+                                // Current reader scope, independent of selection and page
+                                // count: an empty/all-hidden book still has this entrance.
+                                let can_edit_composition = self.composition_editor_available();
+                                if ui.add_enabled(can_edit_composition, egui::Button::new("本の構成を編集"))
+                                    .on_disabled_hover_text("現在開いている書庫・PDF・EPUB の本で使えます")
+                                    .clicked()
+                                {
+                                    self.start_local_composition_editor(ctx);
+                                    ui.close();
+                                }
+                                ui.separator();
                                 let has_selection = self.grid_item_input_allowed()
                                     && (self.selected.is_some() || !self.checked.is_empty());
                                 for &command in books_menu_commands {
@@ -9482,12 +9552,16 @@ impl App {
                     |ui| {
                         ui.set_min_width(scroll_width);
                         ui.set_min_height(scroll_height);
-                        let scroll_output = egui::ScrollArea::vertical()
-                            .id_salt("book_reorder_thumb_scroll")
-                            .vertical_scroll_offset(state.scroll_offset_y)
-                            .max_height(scroll_height)
-                            .auto_shrink([false, false])
-                            .show_rows(ui, row_height, rows.max(1), |ui, row_range| {
+                        let scroll_output = crate::ui_helpers::show_fixed_slot_rows(
+                            ui,
+                            egui::ScrollArea::vertical()
+                                .id_salt("book_reorder_thumb_scroll")
+                                .vertical_scroll_offset(state.scroll_offset_y)
+                                .max_height(scroll_height)
+                                .auto_shrink([false, false]),
+                            row_height,
+                            rows.max(1),
+                            |ui, row_range| {
                                 egui::Grid::new("book_reorder_thumb_grid")
                                     .num_columns(cols)
                                     .spacing(egui::vec2(gap, gap))
@@ -9703,7 +9777,8 @@ impl App {
                                             ui.end_row();
                                         }
                                     });
-                            });
+                            },
+                        );
                         state.scroll_offset_y = scroll_output.state.offset.y;
                         if !busy
                             && !pointer_released
@@ -10214,6 +10289,7 @@ impl App {
             Vec::new();
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+            if self.composition_editor_modal_active() { ui.disable(); }
             if toolbar_section_order.first() != Some(&crate::settings::ToolbarSectionId::Folder) {
                 ui.add_space(2.0);
             }
@@ -10392,29 +10468,12 @@ impl App {
                 TS::EffeTune => {
                     #[cfg(windows)]
                     {
-                        let active = matches!(
-                            self.effetune.runtime,
-                            crate::effetune::EffetuneRuntime::Running { .. }
-                        ) && matches!(
-                            self.effetune.effective_state(),
-                            Some(crate::effetune::EffectiveState::Effective)
-                        );
+                        let active = self.effetune_toolbar_active();
                         let available = self.effetune_toolbar_available();
-                        let resp = ui
-                            .add_enabled(
-                                available,
-                                egui::Button::selectable(active, "音響調整").sense(
-                                    if drag_enabled {
-                                        egui::Sense::click_and_drag()
-                                    } else {
-                                        egui::Sense::click()
-                                    },
-                                ),
-                            )
-                            .on_hover_text(format!("{}\n{lead_hint}", self.effetune_toolbar_tooltip()))
-                            .on_disabled_hover_text(format!("{}\n{lead_hint}", self.effetune_toolbar_tooltip()));
+                        let tooltip = format!("{}\n{lead_hint}", self.effetune_toolbar_tooltip());
+                        let resp = effetune_toolbar_button(ui, active, available, drag_enabled, &tooltip);
                         if resp.clicked() {
-                            self.effetune_toolbar_click(resp.clicked_by(egui::PointerButton::Primary));
+                            self.effetune_toolbar_click();
                         }
                         self.finish_toolbar_section_lead(
                             ui,
@@ -12529,6 +12588,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let mut sort_reload_requested = false;
         let mut sort_popup_open = false;
         egui::TopBottomPanel::top("facet_filter_bar").show(ctx, |ui| {
+            if self.composition_editor_modal_active() { ui.disable(); }
             ui.add_space(1.0);
             ui.horizontal_wrapped(|ui| {
                 let filter_label = egui::Label::new(egui::RichText::new("絞り込み:").small())
@@ -14437,7 +14497,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             self.show_search_bar || self.search_filter.is_some() || self.search_pending.is_some();
         // 検索の仮想階層でドリルイン中か (= ⬆ で 1 段戻れる / ▲▼ で前後ヒットへ
         // 動ける状態。最上位ではこれらを disabled にする条件)。
-        let search_drilled_in = (self.global_search.active && self.global_search.drill.is_some())
+        let search_drilled_in = (self.global_search.active
+            && (self.global_search.drill.is_some() || self.everything_has_physical_child()))
             || (self.favsearch.active && !self.favsearch.nav_stack.is_empty())
             || (self.tag_view.active && !self.tag_view.nav_stack.is_empty());
         let search_tree_drilled_in = (self.global_search.active
@@ -15495,6 +15556,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             .keymap
             .first_chord_action_label("現在地フィルタ", KeyAction::GlobalLocalSearch);
         egui::TopBottomPanel::top("search_bar").show(ctx, |ui| {
+            if self.composition_editor_modal_active() {
+                ui.disable();
+            }
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.label("検索:").on_hover_text(format!(
@@ -15685,6 +15749,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let mut query_changed = false;
 
         egui::TopBottomPanel::top("favsearch_bar").show(ctx, |ui| {
+            if self.composition_editor_modal_active() {
+                ui.disable();
+            }
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.label("コンテナ検索:");
@@ -15848,6 +15915,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let mut clicked_tag: Option<String> = None;
 
         egui::TopBottomPanel::top("tag_view_bar").show(ctx, |ui| {
+            if self.composition_editor_modal_active() {
+                ui.disable();
+            }
             ui.add_space(2.0);
             ui.horizontal_wrapped(|ui| {
                 ui.label("タグビュー:");
@@ -20606,6 +20676,74 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 #[cfg(test)]
 mod facet_filter_bar_tests {
     use super::*;
+
+    #[test]
+    fn calculated_facet_choice_height_uses_each_gap_once() {
+        use crate::test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(720.0, 900.0));
+        let draw = |events| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(viewport),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            show_virtualized_facet_choice_rows(ui, 360.0, 26, |ui, idx| {
+                                draw_facet_checkbox_choice(
+                                    ui,
+                                    &mut false,
+                                    format!("選択肢 {idx}"),
+                                    "",
+                                );
+                            });
+                        });
+                },
+            );
+            let (inner, content, offset) = ctx.data(|data| {
+                data.get_temp(egui::Id::new("facet_choice_scroll_layout"))
+                    .unwrap()
+            });
+            ScrollLayout {
+                inner,
+                content,
+                offset,
+            }
+        };
+        let mut before = draw(vec![]);
+        for _ in 0..3 {
+            before = draw(vec![]);
+        }
+        let spacing = ctx.style().spacing.clone();
+        let row_height = spacing.interact_size.y.max(22.0);
+        assert_eq!(
+            before.content.y,
+            26.0 * row_height + 25.0 * spacing.item_spacing.y
+        );
+        // This menu intentionally caps its viewport at 24 of the 26 choices.
+        before.assert_height(HeightExpectation::Scrolls, viewport, ctx.pixels_per_point());
+        let mut after = before;
+        for frame in 0..40 {
+            after = draw(if frame == 0 {
+                vec![
+                    egui::Event::PointerMoved(before.inner.center()),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -4000.0),
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]
+            } else {
+                vec![]
+            });
+        }
+        after.assert_scrolled_to_end(before, ctx.pixels_per_point());
+    }
     use crate::app::setup_app_for_test;
 
     #[test]

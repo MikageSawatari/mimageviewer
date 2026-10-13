@@ -114,6 +114,7 @@ impl App {
     /// 中の画像移動など「コンテキストが切り替わる境界」で呼ぶ。
     pub(crate) fn clear_meta_undo(&mut self) {
         self.invalidate_book_append_undo();
+        self.prepare_page_edit_history_boundary();
         self.cancel_rating_membership_restore();
         if self.meta_undo.can_undo() || self.meta_undo.can_redo() {
             crate::logger::log(format!(
@@ -143,66 +144,12 @@ impl App {
     /// Index-scoped editing entries and unfinished drag/tag sessions still end.
     pub(crate) fn clear_meta_undo_for_rating_move(&mut self) {
         self.invalidate_book_append_undo();
+        self.prepare_page_edit_history_boundary();
         self.meta_undo.retain_rating();
         self.finish_meta_undo_boundary_cleanup();
     }
 
     fn finish_meta_undo_boundary_cleanup(&mut self) {
-        // ドラッグ中に境界を跨いだ場合 (フォルダ移動・フルスクリーン遷移・消しゴム遷移)、
-        // 進行中のセッションを安全に終了させる。
-        //
-        // ドラッグ中は DB / sidecar / settings.save をスキップしているため、ページ map
-        // または標準値はドラッグ最後の値をメモリにだけ持つ可能性がある。ここで対象の
-        // 通常書き込み API へ 1 回だけ流し、「ドラッグ中に画面が切り替わってしまっても
-        // 操作は失われない」挙動を保証する。
-        // Undo エントリは積まない (= boundary を跨ぐ操作は redo 不可) — Undo スタック自体を
-        // クリアする処理の最中なので一貫性が取れる。
-        let mut interrupted_adjustment_drag = false;
-        let mut interrupted_page_idx = None;
-        if let Some(session) = self.adjustment_drag_session.take() {
-            interrupted_adjustment_drag = true;
-            interrupted_page_idx = Some(session.fs_idx);
-            if let Some(p) = self.adjustment_page_params.get(&session.fs_idx).cloned() {
-                if Some(&p) != session.before.as_ref() {
-                    self.set_page_params(session.fs_idx, p);
-                }
-            }
-        }
-        if let Some(session) = self.adjustment_standard_drag_session.take() {
-            interrupted_adjustment_drag = true;
-            let after = match session.scope {
-                crate::app::AdjustmentStandardScope::Favorite(id) => self
-                    .adjustment_favorite_params
-                    .get(&id)
-                    .cloned()
-                    .unwrap_or_else(|| self.settings.global_preset.clone()),
-                crate::app::AdjustmentStandardScope::Global => self.settings.global_preset.clone(),
-            };
-            if session.before != after {
-                match session.scope {
-                    crate::app::AdjustmentStandardScope::Favorite(id) => {
-                        // ドラッグ中の map はプレビュー値。通常 release と同じく
-                        // before へ戻してから永続化し、AI 影響判定と prune の前後差を保つ。
-                        self.adjustment_favorite_params.insert(id, session.before);
-                        self.set_favorite_default(id, after)
-                    }
-                    crate::app::AdjustmentStandardScope::Global => {
-                        self.settings.global_preset = session.before;
-                        self.copy_params_to_global(after)
-                    }
-                }
-            }
-        }
-        if interrupted_adjustment_drag {
-            // 中断したページドラッグだけ、同じキーを使うセルを失効させる。
-            // 標準ドラッグは通常の永続化 API が必要な範囲を失効させる。
-            if self.thumb_adjust_drag_color_dirty {
-                if let Some(idx) = interrupted_page_idx {
-                    self.invalidate_thumb_adjust_for_dragged_page(idx);
-                }
-            }
-            self.thumb_adjust_drag_color_dirty = false;
-        }
         // 進行中のタグ操作の保留 Undo entry を破棄する。worker 結果は引き続き来るが、
         // poll_tag_write_results 側で「対応する pending が無い」ことを検出して
         // tags_cache 更新だけ行い undo push をスキップする。boundary を跨いだ操作の
@@ -221,6 +168,14 @@ impl App {
     /// Ctrl+Z ハンドラ。スタック先頭を取り出し、`before` 状態を再適用してから
     /// Redo スタックへ移す。スタックが空なら no-op。
     pub(crate) fn apply_meta_undo(&mut self) {
+        if self.book_append_undo_in_progress() {
+            self.admit_book_append_followup_mutation();
+            return;
+        }
+        self.prepare_page_edit_history_boundary();
+        self.local_adjust_mask_lasso_points.clear();
+        self.local_adjust_mask_shape_drag_start = None;
+        self.local_adjust_mask_shape_drag_end = None;
         if !self.meta_undo.can_undo() || !self.admit_book_append_followup_mutation() {
             return;
         }
@@ -264,11 +219,23 @@ impl App {
                 //  古い Favorite 標準で発火して entry が消える事故が起きる。Codex P1)
                 let mut order: Vec<usize> = (0..changes.len()).collect();
                 order.sort_by_key(|&i| adjust_scope_priority(&changes[i].scope));
+                let mut documents = std::collections::HashMap::new();
                 for i in order {
-                    self.apply_adjustment_change_to_app(&changes[i], true);
+                    // Publish each contiguous Page segment before a later
+                    // standard change can prune its overrides (notably Redo).
+                    if !matches!(
+                        changes[i].scope,
+                        AdjustUndoScope::Page(_) | AdjustUndoScope::PageKey(_)
+                    ) {
+                        self.publish_accepted_adjustment_page_edits(&documents);
+                        documents.clear();
+                    }
+                    self.apply_adjustment_change_to_app(&changes[i], true, &mut documents);
                 }
+                self.publish_accepted_adjustment_page_edits(&documents);
             }
             UndoEntry::LocalAdjustment { changes, .. } => {
+                self.resolve_local_restore_targets(changes);
                 for c in changes {
                     self.apply_local_adjustment_change_to_app(c, true);
                 }
@@ -285,6 +252,14 @@ impl App {
     /// Ctrl+Y / Ctrl+Shift+Z ハンドラ。Redo スタック先頭を取り出し、`after` 状態を
     /// 再適用してから Undo スタックへ戻す。
     pub(crate) fn apply_meta_redo(&mut self) {
+        if self.book_append_undo_in_progress() {
+            self.admit_book_append_followup_mutation();
+            return;
+        }
+        self.prepare_page_edit_history_boundary();
+        self.local_adjust_mask_lasso_points.clear();
+        self.local_adjust_mask_shape_drag_start = None;
+        self.local_adjust_mask_shape_drag_end = None;
         if self.meta_undo.can_redo() && !self.admit_book_append_followup_mutation() {
             return;
         }
@@ -328,11 +303,23 @@ impl App {
                 // Redo は元操作の自然順 (Page → Favorite → Global、つまり下層から上層)
                 let mut order: Vec<usize> = (0..changes.len()).collect();
                 order.sort_by_key(|&i| std::cmp::Reverse(adjust_scope_priority(&changes[i].scope)));
+                let mut documents = std::collections::HashMap::new();
                 for i in order {
-                    self.apply_adjustment_change_to_app(&changes[i], false);
+                    // Publish each contiguous Page segment before a later
+                    // standard change can prune its overrides (notably Redo).
+                    if !matches!(
+                        changes[i].scope,
+                        AdjustUndoScope::Page(_) | AdjustUndoScope::PageKey(_)
+                    ) {
+                        self.publish_accepted_adjustment_page_edits(&documents);
+                        documents.clear();
+                    }
+                    self.apply_adjustment_change_to_app(&changes[i], false, &mut documents);
                 }
+                self.publish_accepted_adjustment_page_edits(&documents);
             }
             UndoEntry::LocalAdjustment { changes, .. } => {
+                self.resolve_local_restore_targets(changes);
                 for c in changes {
                     self.apply_local_adjustment_change_to_app(c, false);
                 }
@@ -471,7 +458,12 @@ impl App {
     /// `clear_favorite_default` / `copy_params_to_global`) に流す — これらは
     /// すべて DB / settings / キャッシュクリアの副作用を含むので、Undo 用に
     /// 別経路を組まずに既存の書き込み API を再利用する。
-    fn apply_adjustment_change_to_app(&mut self, c: &AdjustmentChange, use_before: bool) {
+    fn apply_adjustment_change_to_app(
+        &mut self,
+        c: &AdjustmentChange,
+        use_before: bool,
+        documents: &mut std::collections::HashMap<String, Option<crate::adjustment::AdjustParams>>,
+    ) {
         let target = if use_before { &c.before } else { &c.after };
         match &c.scope {
             AdjustUndoScope::Page(idx) => match target {
@@ -489,7 +481,7 @@ impl App {
                 }
             },
             AdjustUndoScope::PageKey(page_target) => {
-                self.restore_page_params_for_target(page_target, target.clone());
+                self.restore_page_params_for_target_collect(page_target, target.clone(), documents);
             }
             AdjustUndoScope::Favorite(id) => match target {
                 Some(p) => self.set_favorite_default(*id, p.clone()),
@@ -510,7 +502,7 @@ impl App {
         use_before: bool,
     ) {
         let target = if use_before { &c.before } else { &c.after };
-        self.set_local_adjust_layers_for_idx(c.idx, target.clone());
+        self.set_local_adjust_layers_for_target(&c.target, target.clone());
     }
 
     /// 補正 Undo の **ページ側の復元先**。index ではなくページの識別子で持つ。
@@ -594,6 +586,33 @@ impl App {
             .collect()
     }
 
+    /// Resolve local documents once against the current list, just like the
+    /// existing PageKey adjustment path. Undo/Redo never reuse an old slot hint.
+    fn resolve_local_restore_targets(&self, changes: &mut [LocalAdjustmentChange]) {
+        use crate::app::PageIndexHint;
+        let wanted: std::collections::HashSet<&str> = changes
+            .iter()
+            .map(|change| change.target.page_key.as_str())
+            .collect();
+        let mut found: std::collections::HashMap<String, Vec<usize>> =
+            std::collections::HashMap::new();
+        for idx in 0..self.items.len() {
+            let Some(key) = self.page_path_key(idx) else {
+                continue;
+            };
+            if wanted.contains(key.as_str()) {
+                found.entry(key).or_default().push(idx);
+            }
+        }
+        for change in changes {
+            change.target.idx_hint = match found.get(&change.target.page_key).map(Vec::as_slice) {
+                Some([idx]) => PageIndexHint::At(*idx),
+                Some(_) => PageIndexHint::Unresolved,
+                None => PageIndexHint::Absent,
+            };
+        }
+    }
+
     /// 単一スコープの単一変更を Undo スタックに積む共通ヘルパー。`before == after`
     /// は捨てられるので、呼び出し側で抑止判定を書かなくて済む。
     pub(crate) fn capture_adjustment_undo(
@@ -620,10 +639,49 @@ impl App {
         after: local_adjust_core::LocalAdjustmentLayers,
         summary: String,
     ) {
+        let Some(target) = self.page_adjustment_target_for_idx(idx) else {
+            return;
+        };
+        self.capture_local_adjustment_undo_for_target(target, before, after, summary);
+    }
+
+    /// Record an already owned document without resolving its former index or
+    /// re-entering the shared history boundary from an edit-session finish.
+    pub(crate) fn capture_local_adjustment_undo_for_target(
+        &mut self,
+        mut target: crate::app::PageAdjustmentTarget,
+        before: local_adjust_core::LocalAdjustmentLayers,
+        after: local_adjust_core::LocalAdjustmentLayers,
+        summary: String,
+    ) {
+        target.idx_hint = crate::app::PageIndexHint::Unresolved;
         self.push_local_adjustment_undo_entry(
-            vec![LocalAdjustmentChange { idx, before, after }],
+            vec![LocalAdjustmentChange {
+                target,
+                before,
+                after,
+            }],
             summary,
         );
+    }
+
+    /// Finish a captured edit with its own before/after document. This low-level
+    /// dispatch is also used by history-boundary cleanup and must not call that
+    /// boundary again.
+    pub(crate) fn set_local_adjust_layers_for_target_with_undo(
+        &mut self,
+        target: &crate::app::PageAdjustmentTarget,
+        before: local_adjust_core::LocalAdjustmentLayers,
+        layers: local_adjust_core::LocalAdjustmentLayers,
+        summary: String,
+    ) {
+        // Keep the pre-owner release order: a pending key run is recorded
+        // before the pointer operation, using the current document as its after.
+        // The key terminal takes its session before entering this helper, so
+        // its own dispatch cannot recurse. Do not re-enter the history boundary.
+        self.persist_local_adjust_shape_key_edit();
+        self.set_local_adjust_layers_for_target(target, layers.clone());
+        self.capture_local_adjustment_undo_for_target(target.clone(), before, layers, summary);
     }
 
     pub(crate) fn set_local_adjust_layers_for_idx_with_undo(
@@ -640,13 +698,10 @@ impl App {
         // セッションの確定自身もここへ来るが、あちらは先に `take` してから呼ぶので
         // ここでは `None` を見て即戻る (再入しない)。
         self.persist_local_adjust_shape_key_edit();
-        self.set_local_adjust_layers_for_idx(idx, layers);
-        let after = self
-            .local_adjust_page_layers
-            .get(&idx)
-            .cloned()
-            .unwrap_or_default();
-        self.capture_local_adjustment_undo(idx, before, after, summary);
+        let Some(target) = self.page_adjustment_target_for_idx(idx) else {
+            return;
+        };
+        self.set_local_adjust_layers_for_target_with_undo(&target, before, layers, summary);
     }
 
     /// 補正書き込み操作の **直前 → 直後** で 3 層 (Page / Favorite / Global) すべての
@@ -689,6 +744,7 @@ impl App {
     ) where
         F: FnOnce(&mut App),
     {
+        self.prepare_page_edit_history_boundary();
         let pages_before = self.adjustment_page_params.clone();
         let favs_before = self.adjustment_favorite_params.clone();
         let global_before = self.settings.global_preset.clone();
@@ -824,6 +880,161 @@ fn adjust_scope_priority(scope: &AdjustUndoScope) -> u8 {
         AdjustUndoScope::Global => 0,
         AdjustUndoScope::Favorite(_) => 1,
         AdjustUndoScope::Page(_) | AdjustUndoScope::PageKey(_) => 2,
+    }
+}
+
+#[cfg(test)]
+mod local_adjustment_target_tests {
+    use super::*;
+    use crate::app::PageIndexHint;
+    use local_adjust_core::{LocalAdjustmentLayer, LocalAdjustmentLayers, LocalEffect, LocalMask};
+
+    fn document(name: &str) -> LocalAdjustmentLayers {
+        LocalAdjustmentLayers::new(vec![LocalAdjustmentLayer::new(
+            name,
+            LocalMask::Full,
+            LocalEffect::None,
+        )])
+    }
+
+    fn assert_saved_document(
+        app: &App,
+        db: &crate::local_adjust_db::LocalAdjustDb,
+        target: &crate::app::PageAdjustmentTarget,
+        expected: &LocalAdjustmentLayers,
+    ) {
+        assert_eq!(
+            db.get_layers(&target.page_key).as_deref(),
+            Some(expected.as_slice())
+        );
+        let (folder, item_key) = target.sidecar_coords.as_ref().unwrap();
+        assert_eq!(
+            app.sidecars
+                .get(folder)
+                .unwrap()
+                .items()
+                .get(item_key)
+                .and_then(|item| item.local_adjust_layers.as_ref()),
+            Some(expected),
+        );
+    }
+
+    #[test]
+    fn local_undo_redo_keeps_captured_target_when_index_moves_or_disappears() {
+        for resident in [true, false] {
+            let mut app = crate::app::tests::phase_c_support::setup_app();
+            app.settings.sidecar_backup_enabled = true;
+            let folder_a = app.tmp.path().join("a");
+            let folder_b = app.tmp.path().join("b");
+            std::fs::create_dir_all(&folder_a).unwrap();
+            std::fs::create_dir_all(&folder_b).unwrap();
+            let path_a = folder_a.join("page.png");
+            let path_b = folder_b.join("page.png");
+            std::fs::write(&path_a, b"a").unwrap();
+            std::fs::write(&path_b, b"b").unwrap();
+            app.items = vec![
+                crate::grid_item::GridItem::Image(path_a.clone()),
+                crate::grid_item::GridItem::Image(path_b.clone()),
+            ];
+            app.image_metas = vec![None, None];
+            app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending; 2];
+            let target_a = app.page_adjustment_target_for_idx(0).unwrap();
+            let target_b = app.page_adjustment_target_for_idx(1).unwrap();
+            let before = document("a-before");
+            let after = document("a-after");
+            let sibling = document("b-unchanged");
+            app.set_local_adjust_layers_for_target(&target_a, before.clone());
+            app.set_local_adjust_layers_for_target(&target_b, sibling.clone());
+            app.set_local_adjust_layers_for_target_with_undo(
+                &target_a,
+                before.clone(),
+                after.clone(),
+                "stable local".into(),
+            );
+            let UndoEntry::LocalAdjustment { changes, .. } = app.meta_undo.peek_undo().unwrap()
+            else {
+                panic!("local entry expected");
+            };
+            assert_eq!(changes[0].target.page_key, target_a.page_key);
+            assert_eq!(changes[0].target.idx_hint, PageIndexHint::Unresolved);
+
+            // Simulate an adopted projection: B reuses A's old index, while A
+            // either moves to another slot or is no longer in this list.
+            app.items = vec![crate::grid_item::GridItem::Image(path_b)];
+            if resident {
+                app.items.push(crate::grid_item::GridItem::Image(path_a));
+            }
+            app.local_adjust_page_layers.clear();
+            app.local_adjust_pages.clear();
+            app.set_local_adjust_layers_for_idx_memory_only(0, sibling.clone());
+            if resident {
+                app.set_local_adjust_layers_for_idx_memory_only(1, after.clone());
+            }
+
+            app.apply_meta_undo();
+            app.finish_local_adjust_writes();
+            let db = crate::local_adjust_db::LocalAdjustDb::open_at(
+                &app.tmp.path().join("local_adjust.db"),
+            )
+            .unwrap();
+            assert_saved_document(&app, &db, &target_a, &before);
+            assert_saved_document(&app, &db, &target_b, &sibling);
+            assert_eq!(app.local_adjust_page_layers.get(&0), Some(&sibling));
+            if resident {
+                assert_eq!(app.local_adjust_page_layers.get(&1), Some(&before));
+            }
+            assert_eq!(app.meta_undo.redo_len(), 1);
+
+            app.apply_meta_redo();
+            app.finish_local_adjust_writes();
+            assert_saved_document(&app, &db, &target_a, &after);
+            assert_saved_document(&app, &db, &target_b, &sibling);
+            assert_eq!(app.local_adjust_page_layers.get(&0), Some(&sibling));
+            if resident {
+                assert_eq!(app.local_adjust_page_layers.get(&1), Some(&after));
+            }
+            assert_eq!(app.meta_undo.undo_len(), 1);
+        }
+    }
+
+    #[test]
+    fn local_restore_targets_resolve_duplicate_and_absent_keys_in_current_list() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let path_a = app.tmp.path().join("a.png");
+        let path_b = app.tmp.path().join("b.png");
+        app.items = vec![
+            crate::grid_item::GridItem::Image(path_a.clone()),
+            crate::grid_item::GridItem::Image(path_b.clone()),
+        ];
+        let target_a = app.page_adjustment_target_for_idx(0).unwrap();
+        let target_b = app.page_adjustment_target_for_idx(1).unwrap();
+        let mut changes = vec![target_a, target_b]
+            .into_iter()
+            .map(|target| LocalAdjustmentChange {
+                target,
+                before: document("before"),
+                after: document("after"),
+            })
+            .collect::<Vec<_>>();
+        app.items = vec![
+            crate::grid_item::GridItem::Image(path_a.clone()),
+            crate::grid_item::GridItem::Image(path_a),
+        ];
+        app.resolve_local_restore_targets(&mut changes);
+        assert_eq!(changes[0].target.idx_hint, PageIndexHint::Unresolved);
+        assert_eq!(changes[1].target.idx_hint, PageIndexHint::Absent);
+    }
+
+    #[test]
+    fn local_undo_capture_without_page_key_does_not_push_history() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        app.capture_local_adjustment_undo(
+            0,
+            document("before"),
+            document("after"),
+            "absent".into(),
+        );
+        assert_eq!(app.meta_undo.undo_len(), 0);
     }
 }
 

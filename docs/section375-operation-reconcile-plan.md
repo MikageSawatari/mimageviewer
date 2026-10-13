@@ -555,3 +555,80 @@ VCRT検査もruntime 4／PE 3で成功した。共有Delete終端を変更した
 今回の変更はsource 5ファイル（`app.rs`／`section375_tests.rs`／`delete_worker.rs`／
 `filename_stack.rs`／`filename_stack_ui.rs`）とdocs 3ファイル（本書／`filename-stack-plan.md`／
 `async-architecture.md`）。manual／§1.373設計／ビルドscriptは変更せず、コミット・アプリ起動は0件。
+
+### 8.5 masterとの統合（2026-10-14）
+
+利用者報告の独立ACCEPT `7a7041412`へ、設計担当が`master e5f3905ff`をno-commit mergeした。
+16ファイルの競合を両側の意図を保持して解消した。indexへのadd、merge commit、アプリ起動は行わない。
+既存設計の接続を維持し、新pending ownerや通常Appendの排他を追加しない。
+
+| 競合ファイル | 解消方針 |
+| --- | --- |
+| `docs/README.md` | §1.353／§1.373／§1.375とmaster側の設計索引をすべて併記 |
+| `docs/async-architecture.md` | context別Folder観測とEverything／PDF／本構成の非同期契約を併記 |
+| `docs/detached-rework-plan.md` | 両側の§11変更記録を原文保持し、既存context所有の統合を記録 |
+| `src/app.rs` | modal条件を併合し、typed refresh originとdefer、観測世代とrecipe、安定targetの受付→保存→publicationを保持 |
+| `src/app/folder_scan.rs` | masterの共通生成境界への移設を採用し、走査記録生成も移設先へ引継ぎ |
+| `src/app/spread_shift_owner.rs` | masterの同値no-op／実効permissionを保持し、実変更前に既存mutation受付 |
+| `src/app/startup_ops.rs` | fork用basis世代、recipe、閲覧状態の保存をすべて保持 |
+| `src/app/viewer_context_registry.rs` | FolderObservationとBookCompositionReadを両登録し、観測資源とPDF ownerの独立移譲／終端を保持 |
+| `src/filename_stack_ui.rs` | recipeとhydration intentを併せて配送し、Stack採用後に観測世代を再束縛 |
+| `src/global_search_ui.rs` | accepted dataset退役、更新時drill保持、Everything優先配送とmetadata検索の完了時照合を両立 |
+| `src/remote_ipc/ui.rs` | UndoAppend限定拒否とcomposition資格照合を併合し、新しいreading書込みのenqueue前へ既存受付を接続 |
+| `src/tag_ops.rs` | 非空tagの可用性・mutation受付後、masterの先行ページ編集確定を維持 |
+| `src/ui_adjustment_panel.rs` | stable draftの変更／非同期producerへ既存受付を接続し、PreparedOnlyとno-opは失効させない |
+| `src/ui_dialogs/metadata_transfer.rs` | append writer分類とmasterの公開helperを保持し、readonly Preview待ちとTransfer待ちを区別 |
+| `src/ui_text.rs` | append受付回帰2件とfont-card高さ／終端到達回帰をすべて保持 |
+| `src/undo_ops.rs` | UndoAppend拒否を先に行い、先行編集確定→履歴判定→通常Undo／Redo受付の順序を保持 |
+
+マーカー外の接点も照合する。`book_materialization`へ精密stamp／row recordを移し、
+投影fingerprintはmasterの同名Folder／book policyへ追随する。ZIPのfacet用実効階層は
+`ZipNavLevel.display`から取得し、masterのraw book scopeを置き換えない。
+Remoteの未回収reading書込みは新vectorの全write variantを数え、readonly resume readは含めない。
+安定local target、slider、保留編集Undo、Remote早期writeの統合回帰を追加する。
+本構成draft／save／解除とZIP変換の新producerも既存§1.373受付へ接続し、
+新owner・追加の待機・全windowの再初期化で統合を回避しない。
+
+追加回帰は10件（補正／Remote 4、本構成／ZIP変換5、ZIP display／raw scope分離1）。
+旧fixtureも新しい監視sequence・search producer・stable target・snapshot basis世代へ追随し、
+期待値やsnapshot基準は緩めていない。初回の型／fixtureコンパイル失敗は修正後に再検証した。
+fmt、通常／portableのcore checkは成功。後述の格納修正後にも両checkを実行し、
+`target/merge-master-7a7041412-heap`の成功を確認した。最後の変更は`cfg(test)` fixtureの型参照だけのため、
+両checkの結果を再利用する。
+関連テストは延べ1,104件成功／失敗0／既存ignored 2件、UI snapshotは176件成功／失敗0。
+mutation受付の機械監査はmedia writer 15／その他writer 16／accessor 3／maintenance除外2でPASS、
+UI glyph検査も成功した。
+
+指定の`test-full.ps1`は今回1回だけ実行し、exit 101。本体libのAppサイズ回帰で113,200 bytes
+（上限110,000）が判明し、同libの`capture_region_focus_and_escape_terminals_preserve_event_order`で
+`STATUS_STACK_OVERFLOW`となった。libは中断したため成功件数を推定せず、残りworkspace targetの
+完走と区別する。ログは`target/merge-master-7a7041412-complete/full.{stdout,stderr}.log`に保存した。
+上限・thread stack・試験期待値は緩めない。既存の書庫／EPUB変換stateをBoxへ移す格納修正を
+独立確認し、owner／modal／receiver／lease／取消・終端を変えず、変換開始時の1 allocationへ寄せる。
+新owner・state・待機は追加しない。修正後は失敗targetのlibと変換／contextを再検証し、
+full scriptは再実行せず、それ以外の有効なworkspace結果を再利用する。
+修正後のAppは108,072 bytesで既存上限110,000を満たし、同じcapture試験も成功した。
+この2件の再検証では通常stackと期待値を変更していない。
+lib全体の再検証は12,782件成功／3件失敗／既存ignored 57件で完走した。
+失敗3件はすべてEffeTune native hostの共通Hello／Ready入口（`bridge.rs:2033`）で、
+worktreeの旧vendor hostが現ソースidentityと一致していなかった。master worktreeの成果物は
+現ソースhash `04e94b0d62c8d4eb0128a708aec1a70c7ecb2c7639d9899fc54f621098a869ad`と一致するため、
+既存手順でhostと公式CRT4本を実ファイルでコピーし、コピー前後のSHA-256とコピー先の一致を確認した。
+この復元で製品ソース・テスト期待値・通常APPDATAは変更しない。
+host PEのsize／SHA-256は[復元記録](../target/merge-master-7a7041412-heap-final/vst-host-restored.json)に保存した。
+復元後の当該3件は成功した。未実行だったvendorはegui 25／egui-wgpu 11／eframe 18件すべて成功。
+full初回で完走した他のworkspace targetは1,246件成功／既存ignored 7件で、格納のみの修正のため再利用する。
+子processが出した重複summary 2件とtargeted再実行の重複は集計へ加えない。
+これらとlibの成功12,782＋復元後3件を合わせ、gate構成targetは14,085件成功／未解決失敗0／既存ignored 64件。
+full scriptの初回exit 101はそのまま記録し、script全体のPASSへ置き換えない。script実行回数は1回のまま。
+修正後のlib・vendor・native hostのログはそれぞれ
+[heap再検証](../target/merge-master-7a7041412-heap-final/state.json)と
+[native／vendor検証](../target/merge-master-7a7041412-native-final/state.json)に保存した。
+`build-dev.ps1 -PreserveRuntime`はexit 0で通常機能セットのcore／remote／EPUB workerを生成し、
+VCRT／PE検査もruntime 4／PE 3で成功した。mIVアプリ起動は0件。
+検証前後のsource／script 1,471ファイルのSHA-256は一致し、競合マーカーは0件。
+indexは要求どおり16ファイル／48 unmerged entriesのまま、HEAD `7a7041412`と
+MERGE_HEAD `e5f3905ff`は変更していない。add／commitは0件。
+結果は[native／vendor／build-dev最終state](../target/merge-master-7a7041412-native-final/state.json)と
+[最終source／index照合](../target/merge-master-7a7041412-native-final/final-source-state.json)に保存した。
+`git diff --check`は既存CRLFを改行として扱う設定で成功。独立の接続確認にも追加P1／P2はなかった。

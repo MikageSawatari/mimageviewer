@@ -40,6 +40,7 @@ pub(crate) struct ContentRestoreReport {
     pub(crate) rows: usize,
     pub(crate) committed_thumbnail_pins: usize,
     pub(crate) database_opens: usize,
+    pub(crate) store_mutations: crate::rename_key_migration::StoreMutationEffects,
     pub(crate) errors: Vec<String>,
     pub(crate) sidecar_mirrors: Vec<RestoreSidecarMirror>,
     pub(crate) sidecar_bases: Vec<crate::sidecar::SidecarFile>,
@@ -181,7 +182,7 @@ pub(crate) fn restore_candidates_at_with_progress(
                 return ContentRestoreReport {
                     requested_restores: selected.len(),
                     requested_declines: declined.len(),
-                    errors: vec![format!("spread_shift: {error}")],
+                    errors: vec![format!("store maintenance: {error}")],
                     ..Default::default()
                 };
             }
@@ -258,6 +259,7 @@ fn restore_candidates_with_maintenance(
         rows: copied.rows,
         committed_thumbnail_pins: copied.committed_thumbnail_pins,
         database_opens: copied.database_opens,
+        store_mutations: copied.store_mutations,
         errors: copied.errors,
         ..ContentRestoreReport::default()
     };
@@ -323,6 +325,7 @@ fn restore_candidates_with_maintenance(
                 );
             // A later store/promotion may fail after a pin store committed.
             report.committed_thumbnail_pins += copied.committed_thumbnail_pins;
+            report.store_mutations.merge(copied.store_mutations);
             if !copied.errors.is_empty() {
                 return Err(copied.errors.join("; "));
             }
@@ -1581,6 +1584,11 @@ mod tests {
             .iter()
             .filter(|descriptor| descriptor.unique && descriptor.file != "content_identity.db")
         {
+            if descriptor.file == "book_composition.db" {
+                crate::book_composition::initialize_database_at(&data_dir.join(descriptor.file))
+                    .unwrap();
+                continue;
+            }
             if descriptor.file == "spread_shift.db" {
                 crate::spread_shift::initialize_database_at(&data_dir.join(descriptor.file))
                     .unwrap();
@@ -1690,6 +1698,8 @@ mod tests {
         );
         drop(crate::spread_db::SpreadDb::open_at(&data_dir.join("spread.db")).unwrap());
         crate::spread_shift::initialize_database_at(&data_dir.join("spread_shift.db")).unwrap();
+        crate::book_composition::initialize_database_at(&data_dir.join("book_composition.db"))
+            .unwrap();
         drop(
             crate::reading_history_db::ReadingHistoryDb::open_at(
                 data_dir.join("reading_history.db"),
@@ -2140,8 +2150,8 @@ mod tests {
         let hundred = measure_batch_database_opens(100);
 
         assert_eq!(
-            one, 35,
-            "26 store copy + 1 origin batch + 8 runtime reads, including endpoint, page-alone and shift placement"
+            one, 36,
+            "27 store copy + 1 origin batch + 8 runtime reads, including endpoint, page-alone and shift placement"
         );
         assert_eq!(hundred, one, "DB open 回数を候補数に比例させない");
     }
@@ -2570,6 +2580,69 @@ mod tests {
                 &crate::path_key::normalize_keep_drive(&pending_target)
             )
             .unwrap()
+        );
+    }
+    #[test]
+    fn composition_restore_uses_logical_source_family_without_cache_payload_rewrite() {
+        use crate::book_composition::{
+            BookComposition, CompositionPageRef, CompositionUnit, PageDomain, ReadingDirection,
+            SingleCompanion, SinglePlacement,
+        };
+        let data = tempfile::tempdir().unwrap();
+        let old = PathBuf::from(r"C:\Books\source.rar");
+        let new = PathBuf::from(r"D:\Books\copy.rar");
+        crate::book_composition::initialize_database_at(&data.path().join("book_composition.db"))
+            .unwrap();
+        let connection =
+            rusqlite::Connection::open(data.path().join("book_composition.db")).unwrap();
+        let source_scope = crate::book_scope::BookScopeKey::new(&old, "chapter").unwrap();
+        let target_scope = crate::book_scope::BookScopeKey::new(&new, "chapter").unwrap();
+        let composition = BookComposition::new(
+            ReadingDirection::Rtl,
+            vec![CompositionUnit::Single {
+                page: CompositionPageRef::ArchiveEntry {
+                    entry_name: "chapter/Page.jpg".into(),
+                },
+                placement: SinglePlacement::Leading,
+                companion: SingleCompanion::Blank,
+            }],
+        );
+        crate::book_composition::store::replace_row_in(
+            &connection,
+            "book_compositions",
+            &source_scope.storage_key(),
+            &PageDomain::ArchiveLevel {
+                prefix: "chapter".into(),
+            },
+            &composition,
+        )
+        .unwrap();
+        let before = crate::book_composition::store::load_rows(&connection).unwrap();
+        let (candidate, source) = candidate(
+            old.clone(),
+            new.clone(),
+            ContentKind::Convertible,
+            "same-hash",
+        );
+        let report = crate::rename_key_migration::copy_stores_at(
+            data.path(),
+            &restore_copy_mappings(data.path(), &candidate, &source),
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.rows, 1);
+        let after = crate::book_composition::store::load_rows(&connection).unwrap();
+        assert_eq!(
+            after[&source_scope.storage_key()],
+            before[&source_scope.storage_key()]
+        );
+        assert_eq!(
+            after[&target_scope.storage_key()],
+            before[&source_scope.storage_key()]
+        );
+        assert_eq!(
+            after.len(),
+            2,
+            "cache mappings do not create a composition family"
         );
     }
 }

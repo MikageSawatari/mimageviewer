@@ -1636,8 +1636,10 @@ mod local_adjust_segmentation_tests {
                     let mut add_layer_dialog_open = false;
                     let mut select_layer: Option<usize> = None;
                     let mut set_enabled: Option<(usize, bool)> = None;
-                    let mut update_layer: Option<(usize, local_adjust_core::LocalAdjustmentLayer)> =
-                        None;
+                    let mut update_layer: Option<(
+                        usize,
+                        crate::local_adjust_parameter_edit::LocalLayerParameterEdit,
+                    )> = None;
                     let mut move_layer: Option<(usize, usize)> = None;
                     let mut duplicate_layer: Option<usize> = None;
                     let mut delete_layer: Option<usize> = None;
@@ -1754,8 +1756,10 @@ mod local_adjust_segmentation_tests {
                 let mut add_layer_dialog_open = false;
                 let mut select_layer: Option<usize> = None;
                 let mut set_enabled: Option<(usize, bool)> = None;
-                let mut update_layer: Option<(usize, local_adjust_core::LocalAdjustmentLayer)> =
-                    None;
+                let mut update_layer: Option<(
+                    usize,
+                    crate::local_adjust_parameter_edit::LocalLayerParameterEdit,
+                )> = None;
                 let mut move_layer: Option<(usize, usize)> = None;
                 let mut duplicate_layer: Option<usize> = None;
                 let mut delete_layer: Option<usize> = None;
@@ -2372,6 +2376,137 @@ mod local_adjust_canvas_edit_contract_tests {
         app.local_adjust_page_layers[&0][0].name.clone()
     }
 
+    fn seam_append_receipt(
+        app: &crate::app::AppTestEnvForTest,
+    ) -> crate::book_append_undo::BookAppendUndoReceipt {
+        static NEXT_RECEIPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let serial = NEXT_RECEIPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = app
+            .tmp
+            .path()
+            .join(format!("adjustment-append-books-{serial}"));
+        let folder = root.join("book");
+        std::fs::create_dir_all(&folder).unwrap();
+        let mut builder =
+            crate::book_append_undo::AppendReceiptBuilder::begin(&root, &folder, "book".into())
+                .unwrap();
+        let page = folder.join("0001_page.jpg");
+        std::fs::write(&page, b"generated page").unwrap();
+        builder.record(&page).unwrap();
+        crate::book_append_undo::BookAppendUndoReceipt {
+            files: builder.finish().unwrap(),
+            operation_id: 1,
+            source_context: app.virtual_list_context_id(),
+            accepted_revision: app.book_append_undo_revision,
+        }
+    }
+
+    fn seam_install_undo_append(app: &mut crate::app::AppTestEnvForTest) {
+        let receipt = seam_append_receipt(app);
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.book_op_pending = Some(crate::books::BookOpPending {
+            rx,
+            intent: crate::books::BookOpIntent::UndoAppend { receipt },
+        });
+    }
+
+    #[test]
+    fn section1372_1373_slider_draft_admission_precedes_release_and_busy_is_unchanged() {
+        for scope in [AdjustScopeSelection::Page, AdjustScopeSelection::Standard] {
+            for busy in [false, true] {
+                let mut app = seam_test_app();
+                app.book_append_undo_receipt = Some(seam_append_receipt(&app));
+                if busy {
+                    seam_install_undo_append(&mut app);
+                }
+                let revision = app.book_append_undo_revision;
+                let original = app.effective_params(0).clone();
+                let mut edited = original.clone();
+                edited.brightness += 0.1;
+                app.apply_adjustment_panel_edit_frame(
+                    0,
+                    scope,
+                    original.clone(),
+                    edited,
+                    true,
+                    true,
+                    false,
+                );
+                if busy {
+                    assert_eq!(app.book_append_undo_revision, revision);
+                    assert!(app.book_append_undo_receipt.is_some());
+                    assert!(!app.adjustment_dragging);
+                    assert!(app.adjustment_drag_session.is_none());
+                    assert!(app.adjustment_standard_drag_session.is_none());
+                    assert_eq!(app.effective_params(0), &original);
+                } else {
+                    assert!(app.book_append_undo_revision > revision);
+                    assert!(app.book_append_undo_receipt.is_none());
+                    assert!(app.adjustment_dragging);
+                    assert_eq!(app.meta_undo.undo_len(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn section1372_1373_nonresident_local_write_uses_stable_target_admission() {
+        let mut app = seam_test_app();
+        let target = app.page_adjustment_target_for_idx(0).unwrap();
+        let layers = app.local_adjust_page_layers[&0].clone();
+        app.items.clear();
+        app.local_adjust_page_layers.clear();
+        app.book_append_undo_receipt = Some(seam_append_receipt(&app));
+        let revision = app.book_append_undo_revision;
+        app.set_local_adjust_layers_for_target(&target, layers.clone());
+        assert!(app.book_append_undo_revision > revision);
+        assert!(app.book_append_undo_receipt.is_none());
+        assert_eq!(
+            app.local_adjust_write_pending[&target.page_key].layers,
+            layers
+        );
+        app.finish_local_adjust_writes();
+
+        seam_install_undo_append(&mut app);
+        let revision = app.book_append_undo_revision;
+        app.set_local_adjust_layers_for_target(&target, Arc::new(Vec::new()));
+        assert_eq!(app.book_append_undo_revision, revision);
+        assert!(app.local_adjust_write_pending.is_empty());
+    }
+
+    #[test]
+    fn section1372_1373_pending_key_undo_commits_before_pop_but_busy_changes_nothing() {
+        for busy in [false, true] {
+            let mut app = seam_app_with_shape();
+            let before = app.local_adjust_page_layers[&0].clone();
+            assert!(app.nudge_selected_local_adjust_shape_from_shortcut(0, 0.01, 0.0));
+            let after = app.local_adjust_page_layers[&0].clone();
+            assert_eq!(app.meta_undo.undo_len(), 0);
+            if busy {
+                seam_install_undo_append(&mut app);
+            }
+            let revision = app.book_append_undo_revision;
+            app.apply_meta_undo();
+            if busy {
+                assert_eq!(app.book_append_undo_revision, revision);
+                assert!(app.local_adjust_shape_key_edit.is_some());
+                assert_eq!(app.local_adjust_page_layers[&0], after);
+                assert_eq!(app.meta_undo.redo_len(), 0);
+                assert!(app.local_adjust_write_pending.is_empty());
+                app.apply_meta_redo();
+                assert_eq!(app.book_append_undo_revision, revision);
+                assert!(app.local_adjust_shape_key_edit.is_some());
+            } else {
+                assert!(app.local_adjust_shape_key_edit.is_none());
+                assert_eq!(app.local_adjust_page_layers[&0], before);
+                assert_eq!(app.meta_undo.redo_len(), 1);
+                app.apply_meta_redo();
+                assert_eq!(app.local_adjust_page_layers[&0], after);
+                assert_eq!(app.meta_undo.undo_len(), 1);
+            }
+        }
+    }
+
     /// 保存経路を通ったか。`set_local_adjust_layers_for_idx` が presence を立てるので、
     /// DB を開けたかどうかに依らず判定できる。
     fn seam_took_the_save_path(app: &App) -> bool {
@@ -2548,8 +2683,9 @@ mod local_adjust_canvas_edit_contract_tests {
         );
     }
 
-    fn brush_stroke(applied: bool) -> crate::app::LocalAdjustMaskBrushStroke {
+    fn brush_stroke(app: &App, applied: bool) -> crate::app::LocalAdjustMaskBrushStroke {
         crate::app::LocalAdjustMaskBrushStroke {
+            owner: app.capture_page_edit_owner(0).expect("editable test page"),
             fs_idx: 0,
             layer_idx: 0,
             target: LocalAdjustMaskEditTarget::OverrideAdd,
@@ -2572,7 +2708,7 @@ mod local_adjust_canvas_edit_contract_tests {
         app.local_adjust_mask_brush_before_layers = Some(Arc::new(vec![layer_with_mask(
             local_adjust_core::LocalMask::Full,
         )]));
-        app.local_adjust_mask_brush_stroke = Some(brush_stroke(false));
+        app.local_adjust_mask_brush_stroke = Some(brush_stroke(&app, false));
 
         app.persist_local_adjust_mask_brush_stroke();
 
@@ -2591,7 +2727,7 @@ mod local_adjust_canvas_edit_contract_tests {
         app.local_adjust_mask_brush_before_layers = Some(Arc::new(vec![layer_with_mask(
             local_adjust_core::LocalMask::Full,
         )]));
-        app.local_adjust_mask_brush_stroke = Some(brush_stroke(true));
+        app.local_adjust_mask_brush_stroke = Some(brush_stroke(&app, true));
 
         app.persist_local_adjust_mask_brush_stroke();
 
@@ -2926,6 +3062,7 @@ mod local_adjust_canvas_edit_contract_tests {
         let before =
             local_adjust_core::LocalAdjustmentLayers::clone(&app.local_adjust_page_layers[&0]);
         app.local_adjust_canvas_drag = Some(crate::app::LocalAdjustCanvasDrag {
+            owner: app.capture_page_edit_owner(0).expect("editable test page"),
             fs_idx: 0,
             layer_idx: 0,
             kind: crate::app::LocalAdjustCanvasDragKind::LinearGradientStart,
@@ -3024,7 +3161,7 @@ mod local_adjust_canvas_edit_contract_tests {
         app.local_adjust_mask_brush_before_layers = Some(Arc::new(vec![layer_with_mask(
             local_adjust_core::LocalMask::Full,
         )]));
-        app.local_adjust_mask_brush_stroke = Some(brush_stroke(true));
+        app.local_adjust_mask_brush_stroke = Some(brush_stroke(&app, true));
 
         app.persist_local_adjust_mask_brush_stroke();
 
@@ -3045,7 +3182,7 @@ mod local_adjust_canvas_edit_contract_tests {
         app.local_adjust_mask_brush_before_layers = Some(Arc::new(vec![layer_with_mask(
             local_adjust_core::LocalMask::Full,
         )]));
-        app.local_adjust_mask_brush_stroke = Some(brush_stroke(true));
+        app.local_adjust_mask_brush_stroke = Some(brush_stroke(&app, true));
 
         app.persist_local_adjust_mask_brush_stroke();
 
@@ -3278,6 +3415,9 @@ mod local_adjust_fold_audit {
             "persist_local_adjust_canvas_drag",
             "persist_local_adjust_mask_brush_stroke",
             "cancel_local_adjust_canvas_edit_from_shortcut",
+            // Parked bundle owner: take each gesture into its stable-target commit,
+            // then discard only orphaned before payloads, like the mounted terminal.
+            "take_page_edit_commits",
             // キャンバス入力ハンドラ。ジェスチャ自体の開始 / 終了を書く。
             "handle_local_adjust_canvas_input",
             "handle_local_adjust_canvas_pointer",
@@ -3413,7 +3553,7 @@ fn local_adjust_target_raster_vector_mask_ref(
 /// 判定せずに `Arc::make_mut` を呼ぶと、落とすものが無い通常のケース (= 図形も筆も
 /// 中身を残して終わったとき) でも原寸マスクを 1 枚複製することになる。文書はマップが
 /// 常に 1 つ握っているので、`make_mut` は必ず実複製になる点に注意。
-fn compact_local_adjust_manual_override_in(
+pub(crate) fn compact_local_adjust_manual_override_in(
     layers: &mut local_adjust_core::LocalAdjustmentLayers,
     layer_idx: usize,
 ) {
@@ -3498,7 +3638,10 @@ fn draw_local_adjust_left_panel(
     effect_picker_dialog_open: &mut bool,
     select_layer: &mut Option<usize>,
     set_enabled: &mut Option<(usize, bool)>,
-    update_layer: &mut Option<(usize, local_adjust_core::LocalAdjustmentLayer)>,
+    update_layer: &mut Option<(
+        usize,
+        crate::local_adjust_parameter_edit::LocalLayerParameterEdit,
+    )>,
     move_layer: &mut Option<(usize, usize)>,
     duplicate_layer: &mut Option<usize>,
     delete_layer: &mut Option<usize>,
@@ -3628,7 +3771,10 @@ fn draw_local_adjust_layer_list(
     add_layer_dialog_open: &mut bool,
     select_layer: &mut Option<usize>,
     set_enabled: &mut Option<(usize, bool)>,
-    update_layer: &mut Option<(usize, local_adjust_core::LocalAdjustmentLayer)>,
+    update_layer: &mut Option<(
+        usize,
+        crate::local_adjust_parameter_edit::LocalLayerParameterEdit,
+    )>,
     move_layer: &mut Option<(usize, usize)>,
     duplicate_layer: &mut Option<usize>,
     delete_layer: &mut Option<usize>,
@@ -3717,7 +3863,13 @@ fn draw_local_adjust_layer_list(
                             {
                                 let mut edited = layer.clone();
                                 edited.mask_before_effect = !edited.mask_before_effect;
-                                *update_layer = Some((idx, edited));
+                                *update_layer = Some((
+                                    idx,
+                                    crate::local_adjust_parameter_edit::LocalLayerParameterEdit {
+                                        before: layer.clone(),
+                                        after: edited,
+                                    },
+                                ));
                             }
                             let after = draw_local_mask_application_button(
                                 ui,
@@ -3730,7 +3882,13 @@ fn draw_local_adjust_layer_list(
                             {
                                 let mut edited = layer.clone();
                                 edited.mask_after_effect = !edited.mask_after_effect;
-                                *update_layer = Some((idx, edited));
+                                *update_layer = Some((
+                                    idx,
+                                    crate::local_adjust_parameter_edit::LocalLayerParameterEdit {
+                                        before: layer.clone(),
+                                        after: edited,
+                                    },
+                                ));
                             }
                         });
                     });
@@ -3887,7 +4045,10 @@ fn draw_local_adjust_manual_tool_selector(
     btn_size: egui::Vec2,
     selected_layer: usize,
     layer: Option<&local_adjust_core::LocalAdjustmentLayer>,
-    update_layer: &mut Option<(usize, local_adjust_core::LocalAdjustmentLayer)>,
+    update_layer: &mut Option<(
+        usize,
+        crate::local_adjust_parameter_edit::LocalLayerParameterEdit,
+    )>,
     mask_edit_target: &mut LocalAdjustMaskEditTarget,
     mask_paint_add: &mut bool,
     mask_tool: &mut LocalAdjustMaskTool,
@@ -4059,7 +4220,13 @@ fn draw_local_adjust_manual_tool_selector(
                         }
                         _ => {}
                     }
-                    *update_layer = Some((selected_layer, edited));
+                    *update_layer = Some((
+                        selected_layer,
+                        crate::local_adjust_parameter_edit::LocalLayerParameterEdit {
+                            before: layer.clone(),
+                            after: edited,
+                        },
+                    ));
                 }
             });
     } else {
@@ -4334,7 +4501,10 @@ fn draw_selected_local_adjust_layer_editor(
     layer: &local_adjust_core::LocalAdjustmentLayer,
     image_dims: (usize, usize),
     selected_shape: Option<usize>,
-    update_layer: &mut Option<(usize, local_adjust_core::LocalAdjustmentLayer)>,
+    update_layer: &mut Option<(
+        usize,
+        crate::local_adjust_parameter_edit::LocalLayerParameterEdit,
+    )>,
     effect_clipboard_available: bool,
     selective_color_pick_active: bool,
     rgb_pick_active: Option<crate::local_adjust_effect_ui::RgbPickTarget>,
@@ -4586,7 +4756,13 @@ fn draw_selected_local_adjust_layer_editor(
         }
     });
     if changed {
-        *update_layer = Some((layer_idx, edited));
+        *update_layer = Some((
+            layer_idx,
+            crate::local_adjust_parameter_edit::LocalLayerParameterEdit {
+                before: layer.clone(),
+                after: edited,
+            },
+        ));
     }
 }
 
@@ -4865,7 +5041,7 @@ fn local_adjust_subject_refined_alpha(
     alpha
 }
 
-fn apply_local_adjust_subject_refinement(
+pub(crate) fn apply_local_adjust_subject_refinement(
     mask: &mut local_adjust_core::SubjectMask,
     refinement: local_adjust_core::SubjectMaskRefinement,
 ) {
@@ -8947,21 +9123,7 @@ fn draw_local_mask_editor(
                 .on_hover_text("ONにすると、生成直後の元マットから境界向けのマスクを再生成します。")
                 .changed()
             {
-                if refinement_enabled {
-                    apply_local_adjust_subject_refinement(
-                        mask,
-                        local_adjust_core::SubjectMaskRefinement {
-                            enabled: true,
-                            threshold: mask.refinement.threshold,
-                            expand_px: mask.refinement.expand_px,
-                            feather_px: mask.refinement.feather_px.max(0),
-                        },
-                    );
-                } else {
-                    let source = mask.source_alpha.as_ref().unwrap_or(&mask.alpha).clone();
-                    mask.alpha = source;
-                    mask.refinement.enabled = false;
-                }
+                mask.refinement.enabled = refinement_enabled;
                 changed = true;
             }
 
@@ -8977,7 +9139,7 @@ fn draw_local_mask_editor(
                 });
             });
             if let Some(refinement) = preset_refinement {
-                apply_local_adjust_subject_refinement(mask, refinement);
+                mask.refinement = refinement;
                 changed = true;
             }
 
@@ -9009,15 +9171,12 @@ fn draw_local_mask_editor(
                     || expand_response.changed()
                     || feather_response.changed())
             {
-                apply_local_adjust_subject_refinement(
-                    mask,
-                    local_adjust_core::SubjectMaskRefinement {
-                        enabled: true,
-                        threshold,
-                        expand_px: expand,
-                        feather_px: feather.max(0),
-                    },
-                );
+                mask.refinement = local_adjust_core::SubjectMaskRefinement {
+                    enabled: true,
+                    threshold,
+                    expand_px: expand,
+                    feather_px: feather.max(0),
+                };
                 changed = true;
             }
 
@@ -10922,7 +11081,7 @@ impl App {
                 return;
             }
             if let Some(pivot) = pivot {
-                self.local_adjust_spread_ctx = Some(pivot);
+                self.local_adjust_spread_ctx = self.capture_local_page_edit_pivot(pivot);
                 self.enter_page_edit_single_view(target_idx);
             }
         }
@@ -11037,6 +11196,16 @@ impl App {
             self.show_feedback_toast("本への追加を取り消しています".to_string());
             return false;
         }
+        if !self.begin_local_page_edit(fs_idx) {
+            return false;
+        }
+        if self
+            .local_adjust_page_layers
+            .get(&fs_idx)
+            .is_none_or(|layers| layer_idx >= layers.len())
+        {
+            return false;
+        }
         // Undo 用の複製は保存する回だけ作る。ドラッグ中は毎フレームここを通り、
         // レイヤー文書には**画像原寸**のラスターマスク (`Vec<f32>`) が入っているので、
         // 使わない複製が 1 枚 24MP で 27.7ms / 96 MB になる (2026-08-29 実測)。
@@ -11053,8 +11222,7 @@ impl App {
             // 文書は共有所有。Undo 履歴や worker が前の姿を握っている間だけ、ここで
             // 1 回だけ実複製を払う (`Arc::make_mut`)。握られていなければ複製は起きない。
             let Some(layer) = self
-                .local_adjust_page_layers
-                .get_mut(&fs_idx)
+                .local_page_edit_layers_mut(fs_idx)
                 .and_then(|layers| Arc::make_mut(layers).get_mut(layer_idx))
             else {
                 return false;
@@ -11065,12 +11233,15 @@ impl App {
             outcome.resolve(layer)
         };
         if !outcome.touched_document() {
+            self.restore_local_page_edit_document_projection();
             return false;
         }
         if outcome.did_apply() {
-            self.invalidate_book_append_undo();
+            self.admit_book_append_followup_mutation();
         }
-        self.local_adjust_selected_layers.insert(fs_idx, layer_idx);
+        self.note_local_page_edit_document_changed();
+        self.project_local_page_edit_document(fs_idx);
+        self.select_local_page_edit_layer(fs_idx, layer_idx);
         if outcome.did_apply()
             && let Some(before_layers) = before_layers
         {
@@ -11232,7 +11403,7 @@ impl App {
 
     fn apply_local_adjust_gradient_drag(
         &mut self,
-        drag: crate::app::LocalAdjustCanvasDrag,
+        drag: &crate::app::LocalAdjustCanvasDrag,
         norm: [f32; 2],
         persist: bool,
     ) -> bool {
@@ -11576,6 +11747,9 @@ impl App {
         target: LocalAdjustMaskEditTarget,
         points: Vec<[f32; 2]>,
     ) -> bool {
+        if !self.begin_local_page_edit(fs_idx) {
+            return false;
+        }
         if points.len() < 3 {
             return false;
         }
@@ -11666,16 +11840,16 @@ impl App {
         if let Some(drag) = shape_drag
             && let Some(before) = self.local_adjust_shape_drag_before_layers.take()
         {
-            self.set_local_adjust_layers_for_idx_memory_only(drag.fs_idx, before);
+            self.set_local_adjust_layers_for_target_memory_only(&drag.owner.target, before);
         }
         if let Some(drag) = canvas_drag
             && let Some(before) = self.local_adjust_canvas_drag_before_layers.take()
         {
-            self.set_local_adjust_layers_for_idx_memory_only(drag.fs_idx, before);
+            self.set_local_adjust_layers_for_target_memory_only(&drag.owner.target, before);
         }
         if let Some(stroke) = brush_stroke {
             if let Some(before) = self.local_adjust_mask_brush_before_layers.take() {
-                self.set_local_adjust_layers_for_idx_memory_only(stroke.fs_idx, before);
+                self.set_local_adjust_layers_for_target_memory_only(&stroke.owner.target, before);
             }
             self.cancel_deferred_local_adjust_brush_render(stroke.fs_idx);
         }
@@ -11711,6 +11885,12 @@ impl App {
         undo_summary: &'static str,
         mut update: impl FnMut(local_adjust_core::MaskShape) -> local_adjust_core::MaskShape,
     ) -> bool {
+        if !self.begin_local_page_edit(fs_idx) {
+            return false;
+        }
+        let Some(owner) = self.capture_page_edit_owner(fs_idx) else {
+            return false;
+        };
         let Some(selected) = self.local_adjust_selected_shape else {
             return false;
         };
@@ -11734,7 +11914,8 @@ impl App {
             .local_adjust_shape_key_edit
             .as_ref()
             .is_some_and(|session| {
-                session.fs_idx != fs_idx
+                session.owner.context != owner.context
+                    || session.owner.target.page_key != owner.target.page_key
                     || session.layer_idx != layer_idx
                     || session.target != target
                     || session.shape_idx != selected
@@ -11781,6 +11962,7 @@ impl App {
                 }
                 None => {
                     self.local_adjust_shape_key_edit = Some(crate::app::LocalAdjustShapeKeyEdit {
+                        owner,
                         fs_idx,
                         layer_idx,
                         target,
@@ -11800,16 +11982,12 @@ impl App {
         let Some(session) = self.local_adjust_shape_key_edit.take() else {
             return;
         };
-        let layers = self
-            .local_adjust_page_layers
-            .get(&session.fs_idx)
-            .cloned()
-            .unwrap_or_default();
+        let layers = self.local_page_edit_layers_for_target(&session.owner.target);
         if session.before == layers {
             return;
         }
-        self.set_local_adjust_layers_for_idx_with_undo(
-            session.fs_idx,
+        self.set_local_adjust_layers_for_target_with_undo(
+            &session.owner.target,
             session.before,
             layers,
             session.summary.to_string(),
@@ -11838,6 +12016,9 @@ impl App {
         &mut self,
         fs_idx: usize,
     ) -> bool {
+        if !self.begin_local_page_edit(fs_idx) {
+            return false;
+        }
         let Some(selected) = self.local_adjust_selected_shape else {
             return false;
         };
@@ -11932,6 +12113,9 @@ impl App {
         target: LocalAdjustMaskEditTarget,
         shape: local_adjust_core::MaskShape,
     ) -> bool {
+        if !self.begin_local_page_edit(fs_idx) {
+            return false;
+        }
         let image_dims = local_adjust_image_dims(self, fs_idx);
         let before = self
             .local_adjust_page_layers
@@ -12010,7 +12194,7 @@ impl App {
 
     fn apply_local_adjust_shape_drag_from_canvas(
         &mut self,
-        drag: LocalAdjustMaskShapeDrag,
+        drag: &LocalAdjustMaskShapeDrag,
         point: [f32; 2],
         modifiers: egui::Modifiers,
     ) -> bool {
@@ -12039,9 +12223,7 @@ impl App {
         let Some(drag) = self.local_adjust_shape_drag.take() else {
             return;
         };
-        let Some(mut layers) = self.local_adjust_page_layers.get(&drag.fs_idx).cloned() else {
-            return;
-        };
+        let mut layers = self.local_page_edit_layers_for_target(&drag.owner.target);
         compact_local_adjust_manual_override_in(&mut layers, drag.layer_idx);
         let before = self
             .local_adjust_shape_drag_before_layers
@@ -12050,11 +12232,12 @@ impl App {
         if before == layers {
             return;
         }
-        self.local_adjust_selected_layers
-            .insert(drag.fs_idx, drag.layer_idx);
+        if self.page_path_key(drag.fs_idx).as_deref() == Some(drag.owner.target.page_key.as_str()) {
+            self.select_local_page_edit_layer(drag.fs_idx, drag.layer_idx);
+        }
         self.local_adjust_selected_shape = Some(drag.shape_idx);
-        self.set_local_adjust_layers_for_idx_with_undo(
-            drag.fs_idx,
+        self.set_local_adjust_layers_for_target_with_undo(
+            &drag.owner.target,
             before,
             layers,
             "補正レイヤー図形マスク編集".to_string(),
@@ -12075,19 +12258,19 @@ impl App {
             self.cancel_deferred_local_adjust_brush_render(stroke.fs_idx);
             return;
         }
-        let Some(mut layers) = self.local_adjust_page_layers.get(&stroke.fs_idx).cloned() else {
-            self.cancel_deferred_local_adjust_brush_render(stroke.fs_idx);
-            return;
-        };
+        let mut layers = self.local_page_edit_layers_for_target(&stroke.owner.target);
         compact_local_adjust_manual_override_in(&mut layers, stroke.layer_idx);
-        self.local_adjust_selected_layers
-            .insert(stroke.fs_idx, stroke.layer_idx);
+        if self.page_path_key(stroke.fs_idx).as_deref()
+            == Some(stroke.owner.target.page_key.as_str())
+        {
+            self.select_local_page_edit_layer(stroke.fs_idx, stroke.layer_idx);
+        }
         let before = self
             .local_adjust_mask_brush_before_layers
             .take()
             .unwrap_or_else(|| layers.clone());
-        self.set_local_adjust_layers_for_idx_with_undo(
-            stroke.fs_idx,
+        self.set_local_adjust_layers_for_target_with_undo(
+            &stroke.owner.target,
             before,
             layers,
             "補正レイヤー手描きマスク".to_string(),
@@ -12150,15 +12333,13 @@ impl App {
         let Some(drag) = self.local_adjust_canvas_drag.take() else {
             return;
         };
-        let Some(layers) = self.local_adjust_page_layers.get(&drag.fs_idx).cloned() else {
-            return;
-        };
+        let layers = self.local_page_edit_layers_for_target(&drag.owner.target);
         let before = self
             .local_adjust_canvas_drag_before_layers
             .take()
             .unwrap_or_else(|| layers.clone());
-        self.set_local_adjust_layers_for_idx_with_undo(
-            drag.fs_idx,
+        self.set_local_adjust_layers_for_target_with_undo(
+            &drag.owner.target,
             before,
             layers,
             "補正レイヤーキャンバス操作".to_string(),
@@ -12207,6 +12388,11 @@ impl App {
             });
         }
         changed
+    }
+
+    fn begin_local_adjust_pointer_edit(&mut self, idx: usize) -> Option<crate::app::PageEditOwner> {
+        self.begin_local_page_edit(idx).then_some(())?;
+        self.capture_page_edit_owner(idx)
     }
 
     pub(crate) fn handle_local_adjust_canvas_input(
@@ -12371,7 +12557,7 @@ impl App {
             return;
         }
 
-        if let Some(mut stroke) = self.local_adjust_mask_brush_stroke {
+        if let Some(mut stroke) = self.local_adjust_mask_brush_stroke.clone() {
             if primary_down {
                 if let Some(pos) = pointer_pos
                     && let Some(norm) = local_adjust_screen_to_norm(pos, transform, false)
@@ -12398,7 +12584,7 @@ impl App {
             self.local_adjust_mask_brush_stroke = None;
         }
 
-        if let Some(drag) = self.local_adjust_canvas_drag {
+        if let Some(drag) = self.local_adjust_canvas_drag.clone() {
             if primary_down {
                 if let Some(pos) = pointer_pos
                     && let Some(norm) = if drag.kind
@@ -12409,7 +12595,7 @@ impl App {
                         local_adjust_screen_to_norm(pos, transform, false)
                     }
                 {
-                    self.apply_local_adjust_gradient_drag(drag, norm, false);
+                    self.apply_local_adjust_gradient_drag(&drag, norm, false);
                     let cursor = if matches!(
                         drag.kind,
                         crate::app::LocalAdjustCanvasDragKind::LinearGradientStart
@@ -12479,16 +12665,20 @@ impl App {
                         local_adjust_screen_to_norm(pos, transform, false)
                     };
                     if let Some(norm) = drag_norm {
+                        let Some(owner) = self.begin_local_adjust_pointer_edit(fs_idx) else {
+                            return;
+                        };
                         self.local_adjust_canvas_drag_before_layers =
                             self.local_adjust_page_layers.get(&fs_idx).cloned();
                         let drag = crate::app::LocalAdjustCanvasDrag {
+                            owner,
                             fs_idx,
                             layer_idx,
                             kind,
                             start: norm,
                         };
-                        self.local_adjust_canvas_drag = Some(drag);
-                        self.apply_local_adjust_gradient_drag(drag, norm, false);
+                        self.local_adjust_canvas_drag = Some(drag.clone());
+                        self.apply_local_adjust_gradient_drag(&drag, norm, false);
                         ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
                         ctx.request_repaint();
                     }
@@ -12507,11 +12697,11 @@ impl App {
                 effective_local_mask_edit_target(layer, self.local_adjust_mask_edit_target)
             });
 
-        if let Some(drag) = self.local_adjust_shape_drag
+        if let Some(drag) = self.local_adjust_shape_drag.clone()
             && primary_down
         {
             let point = local_adjust_norm_to_pixel(norm, image_dims.0, image_dims.1);
-            self.apply_local_adjust_shape_drag_from_canvas(drag, [point.0, point.1], modifiers);
+            self.apply_local_adjust_shape_drag_from_canvas(&drag, [point.0, point.1], modifiers);
             ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
             ctx.request_repaint();
             return;
@@ -12648,16 +12838,20 @@ impl App {
                 .and_then(|layers| layers.get(layer_idx))
                 .and_then(|layer| local_adjust_gradient_handle_hit(layer, pos, transform))
             {
+                let Some(owner) = self.begin_local_adjust_pointer_edit(fs_idx) else {
+                    return;
+                };
                 self.local_adjust_canvas_drag_before_layers =
                     self.local_adjust_page_layers.get(&fs_idx).cloned();
                 let drag = crate::app::LocalAdjustCanvasDrag {
+                    owner,
                     fs_idx,
                     layer_idx,
                     kind,
                     start: norm,
                 };
-                self.local_adjust_canvas_drag = Some(drag);
-                self.apply_local_adjust_gradient_drag(drag, norm, false);
+                self.local_adjust_canvas_drag = Some(drag.clone());
+                self.apply_local_adjust_gradient_drag(&drag, norm, false);
                 ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
                 return;
             }
@@ -12671,16 +12865,20 @@ impl App {
                         local_adjust_tilt_shift_range_create_pending(&layer.effect)
                     });
                 if tilt_shift_range_pending {
+                    let Some(owner) = self.begin_local_adjust_pointer_edit(fs_idx) else {
+                        return;
+                    };
                     self.local_adjust_canvas_drag_before_layers =
                         self.local_adjust_page_layers.get(&fs_idx).cloned();
                     let drag = crate::app::LocalAdjustCanvasDrag {
+                        owner,
                         fs_idx,
                         layer_idx,
                         kind: crate::app::LocalAdjustCanvasDragKind::TiltShiftRange,
                         start: norm,
                     };
-                    self.local_adjust_canvas_drag = Some(drag);
-                    self.apply_local_adjust_gradient_drag(drag, norm, false);
+                    self.local_adjust_canvas_drag = Some(drag.clone());
+                    self.apply_local_adjust_gradient_drag(&drag, norm, false);
                     ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
                     return;
                 }
@@ -12692,16 +12890,20 @@ impl App {
                         local_adjust_tilt_shift_handle_hit_transform(&layer.effect, pos, transform)
                     });
                 if let Some(kind) = tilt_shift_handle {
+                    let Some(owner) = self.begin_local_adjust_pointer_edit(fs_idx) else {
+                        return;
+                    };
                     self.local_adjust_canvas_drag_before_layers =
                         self.local_adjust_page_layers.get(&fs_idx).cloned();
                     let drag = crate::app::LocalAdjustCanvasDrag {
+                        owner,
                         fs_idx,
                         layer_idx,
                         kind,
                         start: norm,
                     };
-                    self.local_adjust_canvas_drag = Some(drag);
-                    self.apply_local_adjust_gradient_drag(drag, norm, false);
+                    self.local_adjust_canvas_drag = Some(drag.clone());
+                    self.apply_local_adjust_gradient_drag(&drag, norm, false);
                     ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
                     return;
                 }
@@ -12717,16 +12919,20 @@ impl App {
                         )
                     });
                 if let Some(kind) = effect_gradient_handle {
+                    let Some(owner) = self.begin_local_adjust_pointer_edit(fs_idx) else {
+                        return;
+                    };
                     self.local_adjust_canvas_drag_before_layers =
                         self.local_adjust_page_layers.get(&fs_idx).cloned();
                     let drag = crate::app::LocalAdjustCanvasDrag {
+                        owner,
                         fs_idx,
                         layer_idx,
                         kind,
                         start: norm,
                     };
-                    self.local_adjust_canvas_drag = Some(drag);
-                    self.apply_local_adjust_gradient_drag(drag, norm, false);
+                    self.local_adjust_canvas_drag = Some(drag.clone());
+                    self.apply_local_adjust_gradient_drag(&drag, norm, false);
                     ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
                     return;
                 }
@@ -12738,16 +12944,20 @@ impl App {
                     .and_then(|(center, _)| local_adjust_norm_to_screen(center, transform))
                     .is_some_and(|center| center.distance(pos) <= 14.0);
                 if center_hit {
+                    let Some(owner) = self.begin_local_adjust_pointer_edit(fs_idx) else {
+                        return;
+                    };
                     self.local_adjust_canvas_drag_before_layers =
                         self.local_adjust_page_layers.get(&fs_idx).cloned();
                     let drag = crate::app::LocalAdjustCanvasDrag {
+                        owner,
                         fs_idx,
                         layer_idx,
                         kind: crate::app::LocalAdjustCanvasDragKind::EffectCenter,
                         start: norm,
                     };
-                    self.local_adjust_canvas_drag = Some(drag);
-                    self.apply_local_adjust_gradient_drag(drag, norm, false);
+                    self.local_adjust_canvas_drag = Some(drag.clone());
+                    self.apply_local_adjust_gradient_drag(&drag, norm, false);
                     ctx.set_cursor_icon(egui::CursorIcon::Grab);
                     return;
                 }
@@ -12776,6 +12986,9 @@ impl App {
                         == LocalAdjustMaskTool::Select
                         || !matches!(handle, crate::vector_edit::HoverTarget::Body);
                     if should_begin_shape_drag {
+                        let Some(owner) = self.begin_local_adjust_pointer_edit(fs_idx) else {
+                            return;
+                        };
                         self.local_adjust_shape_drag_before_layers =
                             self.local_adjust_page_layers.get(&fs_idx).cloned();
                         self.local_adjust_selected_shape = Some(shape_idx);
@@ -12789,6 +13002,7 @@ impl App {
                         {
                             let vector_shape = local_adjust_shape_to_vector_shape(shape);
                             self.local_adjust_shape_drag = Some(LocalAdjustMaskShapeDrag {
+                                owner,
                                 fs_idx,
                                 layer_idx,
                                 target,
@@ -12820,6 +13034,9 @@ impl App {
                     LocalAdjustMaskTool::Brush
                     | LocalAdjustMaskTool::EdgeBrush
                     | LocalAdjustMaskTool::GapFillBrush => {
+                        let Some(owner) = self.begin_local_adjust_pointer_edit(fs_idx) else {
+                            return;
+                        };
                         self.local_adjust_mask_brush_before_layers =
                             self.local_adjust_page_layers.get(&fs_idx).cloned();
                         let tool = self.local_adjust_mask_tool;
@@ -12827,6 +13044,7 @@ impl App {
                             .then(|| sample_local_adjust_rgb(self, fs_idx, norm))
                             .flatten();
                         let stroke = crate::app::LocalAdjustMaskBrushStroke {
+                            owner,
                             fs_idx,
                             layer_idx,
                             target,
@@ -12953,16 +13171,20 @@ impl App {
                         .and_then(|layers| layers.get(layer_idx))
                         .is_some_and(local_adjust_gradient_create_pending);
                     if create_pending {
+                        let Some(owner) = self.begin_local_adjust_pointer_edit(fs_idx) else {
+                            return;
+                        };
                         self.local_adjust_canvas_drag_before_layers =
                             self.local_adjust_page_layers.get(&fs_idx).cloned();
                         let drag = crate::app::LocalAdjustCanvasDrag {
+                            owner,
                             fs_idx,
                             layer_idx,
                             kind: crate::app::LocalAdjustCanvasDragKind::LinearGradient,
                             start: norm,
                         };
-                        self.local_adjust_canvas_drag = Some(drag);
-                        self.apply_local_adjust_gradient_drag(drag, norm, false);
+                        self.local_adjust_canvas_drag = Some(drag.clone());
+                        self.apply_local_adjust_gradient_drag(&drag, norm, false);
                         ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
                     }
                 }
@@ -12973,16 +13195,20 @@ impl App {
                         .and_then(|layers| layers.get(layer_idx))
                         .is_some_and(local_adjust_gradient_create_pending);
                     if create_pending {
+                        let Some(owner) = self.begin_local_adjust_pointer_edit(fs_idx) else {
+                            return;
+                        };
                         self.local_adjust_canvas_drag_before_layers =
                             self.local_adjust_page_layers.get(&fs_idx).cloned();
                         let drag = crate::app::LocalAdjustCanvasDrag {
+                            owner,
                             fs_idx,
                             layer_idx,
                             kind: crate::app::LocalAdjustCanvasDragKind::RadialGradient,
                             start: norm,
                         };
-                        self.local_adjust_canvas_drag = Some(drag);
-                        self.apply_local_adjust_gradient_drag(drag, norm, false);
+                        self.local_adjust_canvas_drag = Some(drag.clone());
+                        self.apply_local_adjust_gradient_drag(&drag, norm, false);
                         ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
                     }
                 }
@@ -13557,6 +13783,199 @@ impl App {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn apply_local_adjust_parameter_edit_for_test(
+        &mut self,
+        idx: usize,
+        layer_idx: usize,
+        edit: crate::local_adjust_parameter_edit::LocalLayerParameterEdit,
+    ) {
+        self.apply_local_adjust_panel_actions(
+            idx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some((layer_idx, edit)),
+            None,
+            None,
+            None,
+            false,
+            LocalEffectPanelRequests::default(),
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_local_adjust_layers_from_panel_for_test(&mut self, idx: usize) {
+        self.apply_local_adjust_panel_actions(
+            idx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+            LocalEffectPanelRequests::default(),
+        );
+    }
+
+    pub(crate) fn apply_adjustment_panel_edit_frame(
+        &mut self,
+        fs_idx: usize,
+        effective_scope_selection_after: AdjustScopeSelection,
+        mut original: AdjustParams,
+        mut edit_params: AdjustParams,
+        changed: bool,
+        is_dragging: bool,
+        reset_all_params: bool,
+    ) {
+        let was_dragging = self.adjustment_dragging;
+        if (changed || is_dragging || was_dragging) && self.book_append_undo_in_progress() {
+            self.admit_book_append_followup_mutation();
+            return;
+        }
+        if changed {
+            if effective_scope_selection_after == AdjustScopeSelection::Page
+                && self.capture_page_edit_owner(fs_idx).is_none()
+            {
+                return;
+            }
+            if !self.admit_book_append_followup_mutation() {
+                return;
+            }
+        }
+        // ドラッグセッションのライフサイクル管理 (slider drag → release で 1 回だけ commit)
+        let drag_just_started = is_dragging && !was_dragging;
+        if drag_just_started || (changed && !is_dragging && !was_dragging) {
+            self.prepare_page_edit_history_boundary();
+            let latest = match effective_scope_selection_after {
+                AdjustScopeSelection::Page => self.effective_params(fs_idx).clone(),
+                AdjustScopeSelection::Standard => self.adjustment_standard_params_for_scope(
+                    self.adjustment_standard_scope_for_idx(fs_idx),
+                ),
+            };
+            if !reset_all_params {
+                let mut rebased = latest.clone();
+                crate::adjustment_parameter_edit::AdjustmentParameterEdit {
+                    before: original,
+                    after: edit_params,
+                }
+                .apply(&mut rebased);
+                edit_params = rebased;
+            }
+            original = latest;
+        }
+        self.adjustment_dragging = is_dragging;
+        if drag_just_started {
+            match effective_scope_selection_after {
+                AdjustScopeSelection::Page => {
+                    let Some(owner) = self.capture_page_edit_owner(fs_idx) else {
+                        return;
+                    };
+                    let before = self.adjustment_page_params.get(&fs_idx).cloned();
+                    self.adjustment_drag_session = Some(crate::app::AdjustmentDragSession {
+                        owner,
+                        fs_idx,
+                        draft: before.clone(),
+                        before,
+                    });
+                    self.adjustment_standard_drag_session = None;
+                }
+                AdjustScopeSelection::Standard => {
+                    let scope = self.adjustment_standard_scope_for_idx(fs_idx);
+                    self.adjustment_standard_drag_session = Some(AdjustmentStandardDragSession {
+                        scope,
+                        before: self.adjustment_standard_params_for_scope(scope),
+                        draft: self.adjustment_standard_params_for_scope(scope),
+                    });
+                    self.adjustment_drag_session = None;
+                }
+            }
+        }
+        // ── スライダー変更を選択中スコープへ反映 ──
+        // ドラッグ中はページ / 標準とも in-memory のみ。release で 1 回だけ永続化する。
+        // 非ドラッグのラジオ・コンボボックス・リセットは即時通常パスへ流す。
+        if changed {
+            if is_dragging || was_dragging {
+                if let Some(session) = self.adjustment_standard_drag_session.as_mut() {
+                    session.draft = edit_params.clone();
+                    // scope はドラッグ開始時に固定し、途中の UI 状態変化に追従させない。
+                    let scope = session.scope;
+                    self.set_adjustment_standard_params_in_memory(scope, edit_params.clone());
+                } else if let Some(session) = self.adjustment_drag_session.as_mut() {
+                    session.draft = Some(edit_params.clone());
+                    self.project_adjustment_page_edit_document();
+                }
+            } else {
+                match effective_scope_selection_after {
+                    AdjustScopeSelection::Page => {
+                        let before = self.adjustment_page_params.get(&fs_idx).cloned();
+                        self.set_page_params(fs_idx, edit_params.clone());
+                        let after = self.adjustment_page_params.get(&fs_idx).cloned();
+                        self.capture_adjustment_undo(
+                            self.page_adjust_undo_scope(fs_idx),
+                            before,
+                            after,
+                            "ページ個別の補正".to_string(),
+                        );
+                    }
+                    AdjustScopeSelection::Standard => {
+                        let scope = self.adjustment_standard_scope_for_idx(fs_idx);
+                        let label = self.adjustment_standard_label_for_scope(scope);
+                        let params = edit_params.clone();
+                        self.capture_adjust_full(format!("{label}の補正"), |app| {
+                            app.persist_adjustment_standard_params(scope, params)
+                        });
+                        let remaining = self.page_override_toast_suffix(None);
+                        self.show_feedback_toast(format!("{label}を更新{remaining}"));
+                    }
+                }
+            }
+            // 差分内容で clear を振り分け (AI 変更 / シャープ化のみ / 色調・post_filter)。
+            self.clear_caches_for_param_change(fs_idx, &original, &edit_params);
+            // ドラッグ中に色調が動いたら、release 時の対象ページの失効を予約する。
+            if (is_dragging || was_dragging) && !original.color_settings_eq(&edit_params) {
+                self.thumb_adjust_drag_color_dirty = true;
+            }
+        }
+
+        // ドラッグ終了 (release) フレーム: changed が立たないことが多いので別経路で確定。
+        let drag_just_ended = !is_dragging && was_dragging;
+        if drag_just_ended {
+            if let Some(session) = self.adjustment_standard_drag_session.take() {
+                let after = session.draft;
+                if session.before != after {
+                    // capture_adjust_full が正しい before を取れるよう、プレビューだけに
+                    // 書いた値を一瞬戻してから通常の永続化 API へ最終値を渡す。
+                    self.set_adjustment_standard_params_in_memory(session.scope, session.before);
+                    let label = self.adjustment_standard_label_for_scope(session.scope);
+                    self.capture_adjust_full(format!("{label}の補正"), |app| {
+                        app.persist_adjustment_standard_params(session.scope, after)
+                    });
+                    let remaining = self.page_override_toast_suffix(None);
+                    self.show_feedback_toast(format!("{label}を更新{remaining}"));
+                }
+            } else if let Some(session) = self.adjustment_drag_session.take() {
+                let in_memory = session.draft;
+                if self.thumb_adjust_drag_color_dirty
+                    && self.page_path_key(session.fs_idx).as_deref()
+                        == Some(session.owner.target.page_key.as_str())
+                {
+                    self.invalidate_thumb_adjust_for_dragged_page(session.fs_idx);
+                }
+                self.commit_adjustment_page_edit_session(crate::app::AdjustmentDragSession {
+                    draft: in_memory,
+                    ..session
+                });
+            }
+        }
+    }
+
     fn apply_local_adjust_panel_actions(
         &mut self,
         fs_idx: usize,
@@ -13565,18 +13984,35 @@ impl App {
         set_layer_effect: Option<(usize, EffectKind)>,
         select_layer: Option<usize>,
         set_enabled: Option<(usize, bool)>,
-        update_layer: Option<(usize, local_adjust_core::LocalAdjustmentLayer)>,
+        update_layer: Option<(
+            usize,
+            crate::local_adjust_parameter_edit::LocalLayerParameterEdit,
+        )>,
         move_layer: Option<(usize, usize)>,
         duplicate_layer: Option<usize>,
         delete_layer: Option<usize>,
         clear_layers: bool,
         effect_requests: LocalEffectPanelRequests,
     ) {
+        let changes_document = add_layer_mask.is_some()
+            || change_layer_mask.is_some()
+            || set_layer_effect.is_some()
+            || set_enabled.is_some()
+            || update_layer.is_some()
+            || move_layer.is_some()
+            || duplicate_layer.is_some()
+            || delete_layer.is_some()
+            || clear_layers
+            || effect_requests.paste_effect.is_some()
+            || effect_requests.reset_effect.is_some();
+        if changes_document && !self.begin_local_page_edit(fs_idx) {
+            return;
+        }
         if let Some(layer_idx) = select_layer {
             if let Some(layers) = self.local_adjust_page_layers.get(&fs_idx)
                 && layer_idx < layers.len()
             {
-                self.local_adjust_selected_layers.insert(fs_idx, layer_idx);
+                self.select_local_page_edit_layer(fs_idx, layer_idx);
             }
         }
 
@@ -13662,7 +14098,7 @@ impl App {
         if let Some((layer_idx, layer)) = update_layer
             && layer_idx < layers.len()
         {
-            Arc::make_mut(&mut layers)[layer_idx] = layer;
+            layer.apply(&mut Arc::make_mut(&mut layers)[layer_idx]);
             selected_after = Some(layer_idx);
             changed = true;
             undo_summary.get_or_insert_with(|| "補正レイヤー編集".to_string());
@@ -13756,7 +14192,7 @@ impl App {
                     .get(&fs_idx)
                     .is_some_and(|layers| selected < layers.len())
                 {
-                    self.local_adjust_selected_layers.insert(fs_idx, selected);
+                    self.select_local_page_edit_layer(fs_idx, selected);
                 }
             }
         }
@@ -13852,6 +14288,14 @@ impl App {
         if !self.admit_book_append_followup_mutation() {
             return;
         }
+        self.prepare_page_edit_history_boundary();
+        if !self.begin_local_page_edit(fs_idx) {
+            return;
+        }
+        let Some(owner) = self.capture_page_edit_owner(fs_idx) else {
+            return;
+        };
+        let document = self.local_page_edit_layers_for_target(&owner.target);
         let (tx, rx) = std::sync::mpsc::channel();
         let spawn_result = std::thread::Builder::new()
             .name("local-adjust-lut-load".to_string())
@@ -13864,13 +14308,10 @@ impl App {
         match spawn_result {
             Ok(_) => {
                 self.local_adjust_lut_pending = Some(crate::app::LocalAdjustLutLoadPending {
+                    owner,
                     fs_idx,
                     layer_idx,
-                    generation: self
-                        .local_adjust_generation
-                        .get(&fs_idx)
-                        .copied()
-                        .unwrap_or(0),
+                    document,
                     path: path.clone(),
                     rx,
                 });
@@ -13894,22 +14335,17 @@ impl App {
                 let Some(pending) = self.local_adjust_lut_pending.take() else {
                     return;
                 };
-                let current_generation = self
-                    .local_adjust_generation
-                    .get(&pending.fs_idx)
-                    .copied()
-                    .unwrap_or(0);
-                if pending.generation != current_generation {
+                if !self.page_edit_owner_is_current(&pending.owner)
+                    || self.local_page_edit_document_for_producer(&pending.owner, &pending.document)
+                        != pending.document
+                {
                     self.show_feedback_toast(
                         "LUT読み込み結果を破棄しました。レイヤーが変更されています".to_string(),
                     );
                     return;
                 }
-                let mut layers = self
-                    .local_adjust_page_layers
-                    .get(&pending.fs_idx)
-                    .cloned()
-                    .unwrap_or_default();
+                let mut layers =
+                    self.local_page_edit_document_for_producer(&pending.owner, &pending.document);
                 let before_layers = local_adjust_core::LocalAdjustmentLayers::clone(&layers);
                 if !layers.get(pending.layer_idx).is_some_and(|layer| {
                     matches!(layer.effect, local_adjust_core::LocalEffect::CubeLut(_))
@@ -13923,10 +14359,13 @@ impl App {
                 let size = params.size;
                 Arc::make_mut(&mut layers)[pending.layer_idx].effect =
                     local_adjust_core::LocalEffect::CubeLut(params);
-                self.local_adjust_selected_layers
-                    .insert(pending.fs_idx, pending.layer_idx);
-                self.set_local_adjust_layers_for_idx_with_undo(
-                    pending.fs_idx,
+                if self.page_path_key(pending.fs_idx).as_deref()
+                    == Some(pending.owner.target.page_key.as_str())
+                {
+                    self.select_local_page_edit_layer(pending.fs_idx, pending.layer_idx);
+                }
+                self.set_local_adjust_layers_for_target_with_undo(
+                    &pending.owner.target,
                     before_layers,
                     layers,
                     "補正レイヤーLUT読み込み".to_string(),
@@ -14056,11 +14495,14 @@ impl App {
         if !self.admit_book_append_followup_mutation() {
             return;
         }
-        let generation = self
-            .local_adjust_generation
-            .get(&fs_idx)
-            .copied()
-            .unwrap_or(0);
+        self.prepare_page_edit_history_boundary();
+        if !self.begin_local_page_edit(fs_idx) {
+            return;
+        }
+        let Some(owner) = self.capture_page_edit_owner(fs_idx) else {
+            return;
+        };
+        let document = self.local_page_edit_layers_for_target(&owner.target);
         let (tx, rx) = std::sync::mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_worker = Arc::clone(&cancel);
@@ -14089,9 +14531,10 @@ impl App {
             Ok(_) => {
                 self.local_adjust_segmentation_pending =
                     Some(crate::app::LocalAdjustSegmentationPending {
+                        owner,
                         fs_idx,
                         layer_idx,
-                        generation,
+                        document,
                         cancel,
                         rx,
                     });
@@ -14145,11 +14588,14 @@ impl App {
         let edge_threshold = self.local_adjust_boundary_edge_threshold.clamp(0.0, 255.0);
         let ink_threshold = self.local_adjust_boundary_ink_threshold.clamp(0.0, 255.0);
         let gap_px = self.local_adjust_boundary_gap_px.round().clamp(0.0, 8.0) as usize;
-        let generation = self
-            .local_adjust_generation
-            .get(&fs_idx)
-            .copied()
-            .unwrap_or(0);
+        self.prepare_page_edit_history_boundary();
+        if !self.begin_local_page_edit(fs_idx) {
+            return;
+        }
+        let Some(owner) = self.capture_page_edit_owner(fs_idx) else {
+            return;
+        };
+        let document = self.local_page_edit_layers_for_target(&owner.target);
         let (tx, rx) = std::sync::mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let spawn_result = std::thread::Builder::new()
@@ -14172,9 +14618,10 @@ impl App {
             Ok(_) => {
                 self.local_adjust_segmentation_pending =
                     Some(crate::app::LocalAdjustSegmentationPending {
+                        owner,
                         fs_idx,
                         layer_idx,
-                        generation,
+                        document,
                         cancel,
                         rx,
                     });
@@ -14198,22 +14645,17 @@ impl App {
                 let Some(pending) = self.local_adjust_segmentation_pending.take() else {
                     return;
                 };
-                let current_generation = self
-                    .local_adjust_generation
-                    .get(&pending.fs_idx)
-                    .copied()
-                    .unwrap_or(0);
-                if pending.generation != current_generation {
+                if !self.page_edit_owner_is_current(&pending.owner)
+                    || self.local_page_edit_document_for_producer(&pending.owner, &pending.document)
+                        != pending.document
+                {
                     self.show_feedback_toast(
                         "マスク生成結果を破棄しました。レイヤーが変更されています".to_string(),
                     );
                     return;
                 }
-                let mut layers = self
-                    .local_adjust_page_layers
-                    .get(&pending.fs_idx)
-                    .cloned()
-                    .unwrap_or_default();
+                let mut layers =
+                    self.local_page_edit_document_for_producer(&pending.owner, &pending.document);
                 let before_layers = local_adjust_core::LocalAdjustmentLayers::clone(&layers);
                 let Some(layer) = Arc::make_mut(&mut layers).get_mut(pending.layer_idx) else {
                     self.show_feedback_toast(
@@ -14250,10 +14692,13 @@ impl App {
                         return;
                     }
                 };
-                self.local_adjust_selected_layers
-                    .insert(pending.fs_idx, pending.layer_idx);
-                self.set_local_adjust_layers_for_idx_with_undo(
-                    pending.fs_idx,
+                if self.page_path_key(pending.fs_idx).as_deref()
+                    == Some(pending.owner.target.page_key.as_str())
+                {
+                    self.select_local_page_edit_layer(pending.fs_idx, pending.layer_idx);
+                }
+                self.set_local_adjust_layers_for_target_with_undo(
+                    &pending.owner.target,
                     before_layers,
                     layers,
                     "補正レイヤーマスク生成".to_string(),
@@ -14700,7 +15145,10 @@ impl App {
         let mut set_layer_effect: Option<(usize, EffectKind)> = None;
         let mut select_layer: Option<usize> = None;
         let mut set_enabled: Option<(usize, bool)> = None;
-        let mut update_layer: Option<(usize, local_adjust_core::LocalAdjustmentLayer)> = None;
+        let mut update_layer: Option<(
+            usize,
+            crate::local_adjust_parameter_edit::LocalLayerParameterEdit,
+        )> = None;
         let mut move_layer: Option<(usize, usize)> = None;
         let mut duplicate_layer: Option<usize> = None;
         let mut delete_layer: Option<usize> = None;
@@ -15311,9 +15759,15 @@ impl App {
                                 );
                                 if resolution.target_item_index.is_none() {
                                     ui.label(
-                                        egui::RichText::new("ページが見つかりません")
-                                            .small()
-                                            .color(egui::Color32::from_rgb(240, 170, 90)),
+                                        egui::RichText::new(
+                                            if self.composition_hides_bookmark(bookmark) {
+                                                "本の構成で非表示になっています"
+                                            } else {
+                                                "ページが見つかりません"
+                                            },
+                                        )
+                                        .small()
+                                        .color(egui::Color32::from_rgb(240, 170, 90)),
                                     );
                                 }
                                 if title_edit.as_ref().map(|edit| edit.id) != Some(bookmark.id) {
@@ -16050,6 +16504,7 @@ impl App {
             AdjustScopeSelection::Page => self.effective_params(fs_idx).clone(),
         };
         let original = edit_params.clone();
+        let mut reset_all_params = false;
 
         // サイズ上限以上ならスキップされる → その場合は「無効」を UI に反映する
         let ai_denoise_disabled_limit = match image_dims {
@@ -16271,6 +16726,7 @@ impl App {
                             .clicked()
                         {
                             edit_params = AdjustParams::default();
+                            reset_all_params = true;
                             slider_result.0 = true;
                         }
 
@@ -16341,7 +16797,6 @@ impl App {
             },
         );
         let (changed, is_dragging, settings_changed) = scroll_output.inner;
-        let was_dragging = self.adjustment_dragging;
         // モアレ抑制の強さ等の settings_changed は drag_stopped の release フレームでだけ立つ。
         // `was_dragging` まで除外するとその最終値を失うため、現在ドラッグ中かだけを見る。
         if should_save_settings(settings_changed, is_dragging) {
@@ -16390,122 +16845,15 @@ impl App {
             }
         }
 
-        // ドラッグセッションのライフサイクル管理 (slider drag → release で 1 回だけ commit)
-        self.adjustment_dragging = is_dragging;
-        let drag_just_started = is_dragging && !was_dragging;
-        if drag_just_started {
-            match effective_scope_selection_after {
-                AdjustScopeSelection::Page => {
-                    self.adjustment_drag_session = Some(crate::app::AdjustmentDragSession {
-                        fs_idx,
-                        before: self.adjustment_page_params.get(&fs_idx).cloned(),
-                    });
-                    self.adjustment_standard_drag_session = None;
-                }
-                AdjustScopeSelection::Standard => {
-                    let scope = self.adjustment_standard_scope_for_idx(fs_idx);
-                    self.adjustment_standard_drag_session = Some(AdjustmentStandardDragSession {
-                        scope,
-                        before: self.adjustment_standard_params_for_scope(scope),
-                    });
-                    self.adjustment_drag_session = None;
-                }
-            }
-        }
-        // セッションが存在するが fs_idx がズレている (= ページ移動した) 場合は破棄。
-        // 通常は open_fullscreen での clear_meta_undo が落とすが念のため。
-        if let Some(s) = &self.adjustment_drag_session {
-            if s.fs_idx != fs_idx {
-                self.adjustment_drag_session = None;
-            }
-        }
-
-        // ── スライダー変更を選択中スコープへ反映 ──
-        // ドラッグ中はページ / 標準とも in-memory のみ。release で 1 回だけ永続化する。
-        // 非ドラッグのラジオ・コンボボックス・リセットは即時通常パスへ流す。
-        if changed && self.admit_book_append_followup_mutation() {
-            if is_dragging || was_dragging {
-                if let Some(session) = self.adjustment_standard_drag_session.as_ref() {
-                    // scope はドラッグ開始時に固定し、途中の UI 状態変化に追従させない。
-                    let scope = session.scope;
-                    self.set_adjustment_standard_params_in_memory(scope, edit_params.clone());
-                } else {
-                    self.adjustment_page_params
-                        .insert(fs_idx, edit_params.clone());
-                }
-            } else {
-                match effective_scope_selection_after {
-                    AdjustScopeSelection::Page => {
-                        let before = self.adjustment_page_params.get(&fs_idx).cloned();
-                        self.set_page_params(fs_idx, edit_params.clone());
-                        let after = self.adjustment_page_params.get(&fs_idx).cloned();
-                        self.capture_adjustment_undo(
-                            self.page_adjust_undo_scope(fs_idx),
-                            before,
-                            after,
-                            "ページ個別の補正".to_string(),
-                        );
-                    }
-                    AdjustScopeSelection::Standard => {
-                        let scope = self.adjustment_standard_scope_for_idx(fs_idx);
-                        let label = self.adjustment_standard_label_for_scope(scope);
-                        let params = edit_params.clone();
-                        self.capture_adjust_full(format!("{label}の補正"), |app| {
-                            app.persist_adjustment_standard_params(scope, params)
-                        });
-                        let remaining = self.page_override_toast_suffix(None);
-                        self.show_feedback_toast(format!("{label}を更新{remaining}"));
-                    }
-                }
-            }
-            // 差分内容で clear を振り分け (AI 変更 / シャープ化のみ / 色調・post_filter)。
-            self.clear_caches_for_param_change(fs_idx, &original, &edit_params);
-            // ドラッグ中に色調が動いたら、release 時の対象ページの失効を予約する。
-            if (is_dragging || was_dragging) && !original.color_settings_eq(&edit_params) {
-                self.thumb_adjust_drag_color_dirty = true;
-            }
-        }
-
-        // ドラッグ終了 (release) フレーム: changed が立たないことが多いので別経路で確定。
-        let drag_just_ended = !is_dragging && was_dragging;
-        if drag_just_ended {
-            if let Some(session) = self.adjustment_standard_drag_session.take() {
-                let after = self.adjustment_standard_params_for_scope(session.scope);
-                if session.before != after {
-                    // capture_adjust_full が正しい before を取れるよう、プレビューだけに
-                    // 書いた値を一瞬戻してから通常の永続化 API へ最終値を渡す。
-                    self.set_adjustment_standard_params_in_memory(session.scope, session.before);
-                    let label = self.adjustment_standard_label_for_scope(session.scope);
-                    self.capture_adjust_full(format!("{label}の補正"), |app| {
-                        app.persist_adjustment_standard_params(session.scope, after)
-                    });
-                    let remaining = self.page_override_toast_suffix(None);
-                    self.show_feedback_toast(format!("{label}を更新{remaining}"));
-                }
-            } else if let Some(session) = self.adjustment_drag_session.take() {
-                let in_memory = self.adjustment_page_params.get(&fs_idx).cloned();
-                if self.thumb_adjust_drag_color_dirty {
-                    self.invalidate_thumb_adjust_for_dragged_page(session.fs_idx);
-                }
-                if session.before != in_memory {
-                    // in-memory に書いた最終値を `set_page_params` で永続化
-                    // (matches_default の正規化もここで走る)
-                    if let Some(p) = in_memory.clone() {
-                        self.set_page_params(fs_idx, p);
-                    } else {
-                        // ありえない (before != in_memory なのに in_memory が None) が念のため
-                        self.clear_page_params(fs_idx);
-                    }
-                    let after = self.adjustment_page_params.get(&fs_idx).cloned();
-                    self.capture_adjustment_undo(
-                        self.page_adjust_undo_scope(fs_idx),
-                        session.before,
-                        after,
-                        "ページ個別の補正".to_string(),
-                    );
-                }
-            }
-        }
+        self.apply_adjustment_panel_edit_frame(
+            fs_idx,
+            effective_scope_selection_after,
+            original,
+            edit_params,
+            changed,
+            is_dragging,
+            reset_all_params,
+        );
 
         // ── アクションボタン処理 ──
         if copy_global_to_favorite_clicked {

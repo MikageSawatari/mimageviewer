@@ -71,6 +71,12 @@ MAINTENANCE = {
 # Other homologous user writers found during LISTrev8. Keep the first mutation
 # token explicit so admission cannot silently drift to the completion side.
 DIRECT_WRITERS = {
+    ("src/app/page_edit_owner.rs", "set_local_adjust_layers_for_target"):
+        "self.set_local_adjust_layers_for_target_memory_only(",
+    ("src/app/book_composition_editor.rs", "save_local_composition_editor"):
+        "self.composition_editor_operations.tickets.push(",
+    ("src/app/image_folder_zip_operation.rs", "start_image_zip_worker"):
+        "app.take_pending_view_trim_transfer(",
     ("src/app.rs", "delete_bookmark_browser_rows"): "crate::bookmark_browser::spawn_delete(",
     ("src/app.rs", "remove_reading_history_entry_for_idx"): ".remove_key(",
     ("src/app.rs", "remove_favorite_view_state"): "self.favorite_view_writes.remove(",

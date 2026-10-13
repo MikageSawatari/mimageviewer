@@ -8,6 +8,7 @@ pub(crate) struct FakeHostEvents {
     visibility_tx: crossbeam_channel::Sender<GuiVisibilitySignal>,
     bypass_tx: crossbeam_channel::Sender<u64>,
     pending: PendingGuiRequests,
+    state_pending: PendingStateQueries,
 }
 
 impl FakeHostEvents {
@@ -15,8 +16,16 @@ impl FakeHostEvents {
         // Keep the event schema and ordered GUI/ACK router used by the stdout pump.
         let event: Event = serde_json::from_slice(&serde_json::to_vec(&event).unwrap()).unwrap();
         match event {
+            Event::PluginState {
+                request_id: Some(id),
+                state,
+                error,
+                ..
+            } => route_concurrent_state_result(&self.state_pending, id, Some(state), error),
             Event::GuiVisibilityResult { .. }
             | Event::GuiUserHidden { .. }
+            | Event::GuiNormalRect { .. }
+            | Event::GuiWarning { .. }
             | Event::GuiBypassToggle { .. } => route_gui_event(
                 &event,
                 &self.visibility_tx,
@@ -41,11 +50,13 @@ impl Bridge {
         let (visibility_tx, gui_visibility_rx) = crossbeam_channel::unbounded();
         let (bypass_tx, gui_bypass_toggle_rx) = crossbeam_channel::bounded(64);
         let pending_gui_requests = Arc::new(Mutex::new(HashMap::new()));
+        let pending_state_queries = Arc::new(Mutex::new(HashMap::new()));
         let events = FakeHostEvents {
             event_tx,
             visibility_tx,
             bypass_tx,
             pending: Arc::clone(&pending_gui_requests),
+            state_pending: Arc::clone(&pending_state_queries),
         };
         (
             Arc::new(Self {
@@ -62,7 +73,7 @@ impl Bridge {
                 gui_bypass_toggle_rx,
                 next_reset_id: AtomicU64::new(0),
                 next_request_id: AtomicU64::new(0),
-                pending_state_queries: Arc::new(Mutex::new(HashMap::new())),
+                pending_state_queries,
                 pending_gui_requests,
                 #[cfg(windows)]
                 shm: None,

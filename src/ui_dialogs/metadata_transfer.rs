@@ -26,11 +26,17 @@ enum Operation {
     Import,
 }
 
+#[derive(Clone, Copy)]
+enum WriterWaitTarget {
+    Preview,
+    Transfer,
+}
+
 enum Stage {
     ExportOptions,
     LoadingPreview,
     ImportConfirm(ImportPreview),
-    WaitingForWriters,
+    WaitingForWriters(WriterWaitTarget),
     Running,
     WaitingForEditPreviewClear(Receiver<Result<(), String>>),
     WaitingForSpreadShiftReload,
@@ -152,7 +158,7 @@ impl MetadataTransferState {
         matches!(
             &self.stage,
             Stage::LoadingPreview
-                | Stage::WaitingForWriters
+                | Stage::WaitingForWriters(_)
                 | Stage::Running
                 | Stage::WaitingForEditPreviewClear(_)
                 | Stage::WaitingForSpreadShiftReload
@@ -184,7 +190,7 @@ impl MetadataTransferState {
             root,
             operation: Operation::Import,
             recursive: false,
-            stage: Stage::LoadingPreview,
+            stage: Stage::WaitingForWriters(WriterWaitTarget::Preview),
             progress: None,
             cancel: Arc::new(AtomicBool::new(false)),
             refresh_cancel: Arc::new(AtomicBool::new(false)),
@@ -287,9 +293,7 @@ impl App {
             self.show_feedback_toast("実フォルダを表示しているときに使用できます".to_string());
             return;
         };
-        let mut state = MetadataTransferState::import(root);
-        start_preview_worker(&mut state);
-        self.metadata_transfer = Some(state);
+        self.metadata_transfer = Some(MetadataTransferState::import(root));
     }
 
     /// 転送 worker と同じ DB を書き換え得る既存処理が完全に着地したか。
@@ -329,7 +333,7 @@ impl App {
             matches!(state.operation, Operation::Import)
                 && matches!(
                     state.stage,
-                    Stage::WaitingForWriters
+                    Stage::WaitingForWriters(WriterWaitTarget::Transfer)
                         | Stage::Running
                         | Stage::WaitingForEditPreviewClear(_)
                         | Stage::WaitingForSpreadShiftReload
@@ -339,10 +343,17 @@ impl App {
         })
     }
 
-    fn metadata_transfer_writers_busy(
+    pub(crate) fn metadata_transfer_writers_busy(
         &mut self,
         release_tag_db_for_import: bool,
     ) -> Result<bool, String> {
+        // A sent save survives its viewer closing. Its worker may still be
+        // validating the source before submitting to the composition service,
+        // or its completion may still await the sole UI receipt consumer.
+        // Maintenance cannot begin until that existing ticket is harvested.
+        if self.composition_editor_writes_pending() {
+            return Ok(true);
+        }
         self.metadata_transfer_writers_busy_for_sidecar_restore(release_tag_db_for_import)
     }
 
@@ -364,26 +375,34 @@ impl App {
         self.metadata_transfer = Some(state);
     }
 
-    pub(crate) fn show_metadata_transfer_dialog(&mut self, ctx: &egui::Context) {
-        if self.metadata_transfer.is_none() {
+    fn advance_metadata_transfer_writer_wait(&mut self) {
+        let Some(wait_target) =
+            self.metadata_transfer
+                .as_ref()
+                .and_then(|state| match state.stage {
+                    Stage::WaitingForWriters(target) => Some(target),
+                    _ => None,
+                })
+        else {
             return;
-        }
-        self.poll_metadata_transfer_worker();
-
-        let waiting_for_writers = self
-            .metadata_transfer
-            .as_ref()
-            .is_some_and(|state| matches!(state.stage, Stage::WaitingForWriters));
+        };
         let operation = self
             .metadata_transfer
             .as_ref()
             .map(|state| state.operation)
             .expect("state checked above");
-        let writer_status = waiting_for_writers
-            .then(|| self.metadata_transfer_writers_busy(matches!(operation, Operation::Import)));
+        let writer_status = match wait_target {
+            // Preview only reads the bundle, but it acquires the same global
+            // composition maintenance lease as the transfer body. Context/tag
+            // writer quiescing remains the responsibility of the body stage.
+            WriterWaitTarget::Preview => Ok(self.composition_editor_writes_pending()),
+            WriterWaitTarget::Transfer => {
+                self.metadata_transfer_writers_busy(matches!(operation, Operation::Import))
+            }
+        };
         let writers_ready = match writer_status {
-            Some(Ok(false)) => true,
-            Some(Err(error)) => {
+            Ok(false) => true,
+            Err(error) => {
                 if let Some(state) = self.metadata_transfer.as_mut() {
                     state.stage = Stage::Result(match operation {
                         Operation::Export => ResultState::Export(Err(error)),
@@ -392,8 +411,14 @@ impl App {
                 }
                 false
             }
-            Some(Ok(true)) | None => false,
+            Ok(true) => false,
         };
+        if matches!(wait_target, WriterWaitTarget::Preview) {
+            if writers_ready && let Some(state) = self.metadata_transfer.as_mut() {
+                start_preview_worker(state);
+            }
+            return;
+        }
         let should_start_worker = writers_ready;
         if should_start_worker {
             // writer の結果反映で view-trim が再び dirty になり得るため、実行直前の
@@ -446,6 +471,14 @@ impl App {
                 self.abort_metadata_import_terminal_refresh();
             }
         }
+    }
+
+    pub(crate) fn show_metadata_transfer_dialog(&mut self, ctx: &egui::Context) {
+        if self.metadata_transfer.is_none() {
+            return;
+        }
+        self.poll_metadata_transfer_worker();
+        self.advance_metadata_transfer_writer_wait();
         let refresh_target = self.metadata_transfer.as_ref().and_then(|state| {
             matches!(state.stage, Stage::RefreshPreparing)
                 .then(|| (state.root.clone(), state.recursive))
@@ -484,7 +517,7 @@ impl App {
                     return;
                 }
                 if let Some(state) = self.metadata_transfer.as_mut() {
-                    state.stage = Stage::WaitingForWriters;
+                    state.stage = Stage::WaitingForWriters(WriterWaitTarget::Transfer);
                     state.progress = None;
                 }
             }
@@ -493,7 +526,7 @@ impl App {
                     return;
                 }
                 if let Some(state) = self.metadata_transfer.as_mut() {
-                    state.stage = Stage::WaitingForWriters;
+                    state.stage = Stage::WaitingForWriters(WriterWaitTarget::Transfer);
                     state.progress = None;
                 }
             }
@@ -503,7 +536,7 @@ impl App {
                         state.stage,
                         Stage::ExportOptions
                             | Stage::ImportConfirm(_)
-                            | Stage::WaitingForWriters
+                            | Stage::WaitingForWriters(_)
                             | Stage::Result(_)
                     )
                 });
@@ -531,7 +564,7 @@ impl App {
             matches!(
                 state.stage,
                 Stage::LoadingPreview
-                    | Stage::WaitingForWriters
+                    | Stage::WaitingForWriters(_)
                     | Stage::Running
                     | Stage::WaitingForEditPreviewClear(_)
                     | Stage::WaitingForSpreadShiftReload
@@ -911,6 +944,12 @@ fn draw_dialog(
                     preview.spread_shift_replacements,
                     preview.spread_shift_removals,
                 ));
+                ui.label(format!(
+                    "本の構成: 追加 {} / 置換 {} / 解除 {}",
+                    preview.composition_additions,
+                    preview.composition_replacements,
+                    preview.composition_removals,
+                ));
                 if preview.missing_entries > 0 {
                     ui.label(format!(
                         "見つからないためスキップ: {} 件",
@@ -937,6 +976,7 @@ fn draw_dialog(
                 ui.small(
                     "評価・タグ・ブックマーク・見開き・表示トリム・回転・ページ編集・代表サムネを含みます。",
                 );
+                ui.small("構成なしと記録された本では、取り込み先の構成を解除します。");
                 ui.small("このメタ情報に記載がない項目の既存メタ情報は保持します。");
                 ui.small("見開きの調整は搬送範囲を上書きし、範囲内の未記載の本・章は解除します。旧形式で調整の記載がない場合は保持します。");
                 ui.add_space(10.0);
@@ -953,7 +993,7 @@ fn draw_dialog(
                     action = DialogAction::Cancel;
                 }
             }
-            Stage::WaitingForWriters => {
+            Stage::WaitingForWriters(_) => {
                 ui.label("実行中のメタ情報書き込みが完了するのを待っています…");
                 ui.spinner();
                 ui.small("待機中も安全にキャンセルできます。");
@@ -1089,7 +1129,7 @@ fn draw_result(ui: &mut egui::Ui, result: &ResultState, recursive: bool) {
                 "このフォルダ直下のみ"
             };
             ui.label(format!(
-                "{} 項目（走査範囲: {scope}） / 評価 {} / タグ付き {} / 時刻ブックマーク {} / 本ブックマーク {} / ページ設定 {} / 本・フォルダ設定 {} / 見開き調整 {} / サムネピン {}",
+                "{} 項目（走査範囲: {scope}） / 評価 {} / タグ付き {} / 時刻ブックマーク {} / 本ブックマーク {} / ページ設定 {} / 本・フォルダ設定 {} / 見開き調整 {} / 本の構成 {} / サムネピン {}",
                 summary.entries,
                 summary.ratings,
                 summary.tagged_items,
@@ -1098,6 +1138,7 @@ fn draw_result(ui: &mut egui::Ui, result: &ResultState, recursive: bool) {
                 summary.page_states,
                 summary.container_states,
                 summary.spread_shifts,
+                summary.compositions,
                 summary.thumbnail_pins,
             ));
             if summary.skipped_reparse_directories > 0 {
@@ -1144,6 +1185,12 @@ fn draw_result(ui: &mut egui::Ui, result: &ResultState, recursive: bool) {
                 summary.committed.spread_shift_replacements,
                 summary.committed.spread_shift_removals,
             ));
+            ui.label(format!(
+                "本の構成: 追加 {} / 置換 {} / 解除 {}",
+                summary.committed.composition_additions,
+                summary.committed.composition_replacements,
+                summary.committed.composition_removals,
+            ));
             if summary.skipped_kind_mismatch > 0 {
                 ui.colored_label(
                     ui.visuals().warn_fg_color,
@@ -1189,7 +1236,9 @@ fn start_preview_worker(state: &mut MetadataTransferState) {
         .spawn(move || {
             let mut progress_relay = ProgressRelay::new(tx.clone());
             let lease = crate::spread_shift::maintenance_at(&data_dir);
+            let composition_lease = crate::book_composition::maintenance_at(&data_dir);
             let result = lease.as_ref().map_err(Clone::clone).and_then(|_| {
+                composition_lease.as_ref().map_err(Clone::clone)?;
                 crate::metadata_transfer::inspect_import_with_data_at(
                     &data_dir,
                     &root,
@@ -1200,6 +1249,7 @@ fn start_preview_worker(state: &mut MetadataTransferState) {
                 )
                 .map_err(|error| error.to_string())
             });
+            drop(composition_lease);
             drop(lease);
             let _ = tx.send(WorkerMessage::Preview(result));
         });
@@ -1229,9 +1279,11 @@ fn start_export_worker(
         .spawn(move || {
             let mut progress_relay = ProgressRelay::new(tx.clone());
             let lease = crate::spread_shift::maintenance_at(&data_dir);
+            let composition_lease = crate::book_composition::maintenance_at(&data_dir);
             let preparation = lease
                 .as_ref()
                 .map_err(Clone::clone)
+                .and_then(|_| composition_lease.as_ref().map(|_| ()).map_err(Clone::clone))
                 .and_then(|_| flush_view_trim_batch(&data_dir, view_trim_batch.as_ref(), "export"));
             let view_trim_saved = preparation.is_ok();
             let result = preparation.and_then(|()| {
@@ -1246,6 +1298,7 @@ fn start_export_worker(
                 )
                 .map_err(|error| error.to_string())
             });
+            drop(composition_lease);
             drop(lease);
             let _ = tx.send(WorkerMessage::Export {
                 result,
@@ -1312,9 +1365,11 @@ fn start_import_worker_with_progress(
             let mut progress_relay = ProgressRelay::new(tx.clone());
             let preparation_started = std::time::Instant::now();
             let lease = crate::spread_shift::maintenance_at(&data_dir);
+            let composition_lease = crate::book_composition::maintenance_at(&data_dir);
             let view_trim_result = lease
                 .as_ref()
                 .map_err(Clone::clone)
+                .and_then(|_| composition_lease.as_ref().map(|_| ()).map_err(Clone::clone))
                 .and_then(|_| flush_view_trim_batch(&data_dir, view_trim_batch.as_ref(), "import"));
             let view_trim_saved = view_trim_result.is_ok();
             let flush_result = view_trim_result.and_then(|()| flush_import_sidecars(&resources));
@@ -1363,7 +1418,11 @@ fn start_import_worker_with_progress(
                 );
             }
             if let (Some(observer), Ok(summary)) = (&observer, &result) {
-                for root in &summary.committed.spread_shift_observation_roots {
+                for root in summary
+                    .committed
+                    .spread_shift_observation_roots
+                    .union(&summary.committed.composition_observation_roots)
+                {
                     observer.record_for_path(
                         root,
                         crate::content_identity::ContentIdentityTrigger::Edit,
@@ -1376,6 +1435,7 @@ fn start_import_worker_with_progress(
             // and validation errors precede writes. Lease release reloads the
             // actual committed rows, stamps only their changed scopes, and uses
             // the owner's global fallback only if that snapshot is unreadable.
+            drop(composition_lease);
             drop(lease);
             let _ = tx.send(WorkerMessage::Import {
                 result,
@@ -1539,6 +1599,70 @@ fn flush_import_sidecars(resources: &Arc<Mutex<ImportWorkerResources>>) -> Resul
 }
 
 #[cfg(test)]
+pub(crate) mod save_ticket_test_support {
+    use super::*;
+
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum Entry {
+        Preview,
+        Import,
+        Export,
+    }
+
+    pub(crate) fn open(app: &mut App, entry: Entry) {
+        match entry {
+            Entry::Preview | Entry::Import => app.open_metadata_import_dialog(),
+            Entry::Export => app.open_metadata_export_dialog(),
+        }
+        if !matches!(entry, Entry::Preview) {
+            // The confirmation buttons submit this same existing transfer stage.
+            app.metadata_transfer.as_mut().unwrap().stage =
+                Stage::WaitingForWriters(WriterWaitTarget::Transfer);
+        }
+    }
+
+    pub(crate) fn advance(app: &mut App) {
+        app.advance_metadata_transfer_writer_wait();
+    }
+
+    pub(crate) fn waiting_without_worker(app: &App) -> bool {
+        app.metadata_transfer.as_ref().is_some_and(|state| {
+            matches!(state.stage, Stage::WaitingForWriters(_))
+                && state.rx.is_none()
+                && state.handle.is_none()
+        })
+    }
+
+    pub(crate) fn finish_worker(app: &mut App) {
+        let state = app.metadata_transfer.as_mut().unwrap();
+        let rx = state.rx.take().expect("transfer worker must have started");
+        let terminal = loop {
+            let message = rx
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .expect("actual transfer worker completion");
+            match &message {
+                WorkerMessage::Progress(_) => continue,
+                WorkerMessage::Preview(result) => assert!(result.is_ok(), "{result:?}"),
+                WorkerMessage::Export { .. } | WorkerMessage::Import { .. } => {}
+                WorkerMessage::Refresh(_) => panic!("expected transfer terminal"),
+            }
+            break message;
+        };
+        match &terminal {
+            WorkerMessage::Export { result, .. } => assert!(result.is_ok(), "{result:?}"),
+            WorkerMessage::Import { result, .. } => assert!(result.is_ok(), "{result:?}"),
+            _ => {}
+        }
+        state.handle.take().unwrap().join().unwrap();
+        // Preserve the real completion and use the production terminal consumer.
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(terminal).unwrap();
+        state.rx = Some(rx);
+        app.poll_metadata_transfer_worker();
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1554,13 +1678,14 @@ mod tests {
         app.metadata_transfer = Some(MetadataTransferState::import(app.tmp.path().to_path_buf()));
         for stage in [
             Stage::LoadingPreview,
+            Stage::WaitingForWriters(WriterWaitTarget::Preview),
             Stage::ImportConfirm(ImportPreview::default()),
         ] {
             app.metadata_transfer.as_mut().unwrap().stage = stage;
             assert!(!app.metadata_transfer_book_append_writers_busy());
         }
         for stage in [
-            Stage::WaitingForWriters,
+            Stage::WaitingForWriters(WriterWaitTarget::Transfer),
             Stage::Running,
             Stage::RefreshPreparing,
             Stage::Refreshing,
@@ -1575,7 +1700,7 @@ mod tests {
     use egui_kittest::kittest::Queryable;
 
     #[test]
-    fn import_shift_confirmation_keeps_counts_and_actions_reachable() {
+    fn import_shift_and_composition_confirmation_keeps_counts_and_actions_reachable() {
         let state = std::rc::Rc::new(std::cell::RefCell::new(MetadataTransferState::import(
             PathBuf::from("C:/Pictures"),
         )));
@@ -1588,6 +1713,9 @@ mod tests {
             spread_shift_additions: 2,
             spread_shift_replacements: 3,
             spread_shift_removals: 4,
+            composition_additions: 5,
+            composition_replacements: 6,
+            composition_removals: 7,
             ..ImportPreview::default()
         });
         let render_state = std::rc::Rc::clone(&state);
@@ -1598,6 +1726,8 @@ mod tests {
             });
         harness.run();
         harness.get_by_label("見開きの調整: 追加 2 / 置換 3 / 解除 4");
+        harness.get_by_label("本の構成: 追加 5 / 置換 6 / 解除 7");
+        harness.get_by_label("構成なしと記録された本では、取り込み先の構成を解除します。");
         for label in ["インポート", "キャンセル"] {
             let rect = harness.get_by_label(label).rect();
             assert!(
@@ -1918,7 +2048,7 @@ mod tests {
 
         state.stage = Stage::LoadingPreview;
         assert!(state.has_active_worker_or_refresh());
-        state.stage = Stage::WaitingForWriters;
+        state.stage = Stage::WaitingForWriters(WriterWaitTarget::Transfer);
         assert!(state.has_active_worker_or_refresh());
         state.stage = Stage::Running;
         assert!(state.has_active_worker_or_refresh());

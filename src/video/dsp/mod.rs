@@ -57,23 +57,6 @@ mod effetune_policy_tests {
     use super::*;
 
     #[test]
-    fn foreground_predicate_matches_only_editor_and_its_nested_popups() {
-        assert!(editor_in_owner_chain(10, 10, |_| 0));
-        assert!(editor_in_owner_chain(10, 30, |window| match window {
-            30 => 20,
-            20 => 10,
-            _ => 0,
-        }));
-        assert!(!editor_in_owner_chain(10, 40, |_| 0));
-        assert!(!editor_in_owner_chain(0, 0, |_| 0));
-        assert!(!editor_in_owner_chain(10, 30, |window| if window == 30 {
-            20
-        } else {
-            30
-        }));
-    }
-
-    #[test]
     fn editor_bypass_chrome_defaults_on_and_effetune_can_hide_it() {
         let user = DspBridge::new();
         assert_eq!(user.gui_owner_policy, GuiOwnerPolicy::Auto);
@@ -93,6 +76,90 @@ mod effetune_policy_tests {
         assert_eq!(effect.latency_policy, LatencyPolicy::ReportOnly);
         assert!(effect.strict_state);
         assert!(!effect.show_editor_bypass_button);
+    }
+
+    #[test]
+    fn effetune_taskbar_normal_snapshot_is_frame_scoped_and_close_is_causal() {
+        use bridge::{GuiVisibilityOutcome, NormalScreenRect};
+        let (host, _commands, events) = Bridge::fake_host_for_test();
+        let effect = crate::effetune::new_bridge();
+        effect.install_fake_host_for_test(Arc::clone(&host));
+        effect.mark_enabled_without_bridge_for_test();
+        effect.set_gui_hwnd(0, 41);
+        let first = NormalScreenRect {
+            x: -1800,
+            y: 80,
+            outer_width: 710,
+            outer_height: 530,
+        };
+        events.emit(Event::GuiNormalRect {
+            slot_id: 0,
+            container_hwnd: 41,
+            normal_rect: first,
+        });
+        effect.pump_gui_signals();
+        assert_eq!(
+            effect.snapshot_all_window_positions(),
+            vec![("fake-host".into(), -1800, 80, 710, 530)]
+        );
+        let close = NormalScreenRect {
+            x: -1700,
+            y: 160,
+            outer_width: 730,
+            outer_height: 550,
+        };
+        // Minimized native bounds are never queried. Close carries the host's immutable normal rect.
+        events.emit(Event::GuiUserHidden {
+            slot_id: 0,
+            container_hwnd: 41,
+            normal_rect: Some(close),
+        });
+        let changes = effect.pump_gui_signals();
+        assert_eq!(changes.user_hidden_paths, vec!["fake-host"]);
+        assert_eq!(
+            effect.snapshot_all_window_positions()[0],
+            ("fake-host".into(), -1700, 160, 730, 550)
+        );
+        // The frame is retired; even a same-slot old close cannot hide/update its replacement.
+        effect.set_gui_hwnd(0, 42);
+        events.emit(Event::GuiVisibilityResult {
+            request_id: 1,
+            slot_id: 0,
+            outcome: GuiVisibilityOutcome::Shown,
+        });
+        events.emit(Event::GuiNormalRect {
+            slot_id: 0,
+            container_hwnd: 42,
+            normal_rect: first,
+        });
+        events.emit(Event::GuiUserHidden {
+            slot_id: 0,
+            container_hwnd: 41,
+            normal_rect: Some(close),
+        });
+        events.emit(Event::GuiNormalRect {
+            slot_id: 0,
+            container_hwnd: 42,
+            normal_rect: NormalScreenRect {
+                outer_width: 0,
+                ..close
+            },
+        });
+        assert!(effect.pump_gui_signals().user_hidden_paths.is_empty());
+        assert!(effect.slots()[0].gui_visible);
+        assert_eq!(
+            effect.snapshot_all_window_positions()[0],
+            ("fake-host".into(), -1800, 80, 710, 530)
+        );
+        // Obsolete slot is likewise rejected; changes in exstyle cannot reinterpret received pixels.
+        events.emit(Event::GuiNormalRect {
+            slot_id: 9,
+            container_hwnd: 42,
+            normal_rect: close,
+        });
+        effect.pump_gui_signals();
+        assert_eq!(effect.snapshot_all_window_positions()[0].1, -1800);
+        assert!(!DspBridge::new().gui_show_in_taskbar.load(Ordering::Acquire));
     }
 
     #[test]
@@ -171,6 +238,7 @@ pub struct SlotInfo {
 #[derive(Debug, Default)]
 pub struct GuiSignalChanges {
     pub user_hidden_paths: Vec<String>,
+    pub warnings: Vec<String>,
     pub bypass_updates: Vec<(String, bool)>,
 }
 
@@ -210,6 +278,7 @@ pub struct DspBridge {
     latency_policy: LatencyPolicy,
     strict_state: bool,
     show_editor_bypass_button: bool,
+    gui_show_in_taskbar: AtomicBool,
     gui_failure_sink: Mutex<Option<std::sync::mpsc::Sender<GuiFailure>>>,
     gui_result_wake: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     gui_command_dispatch: Mutex<Option<Arc<dyn Fn(Arc<Bridge>, serde_json::Value) + Send + Sync>>>,
@@ -300,21 +369,6 @@ impl GuiOwnerPolicy {
     }
 }
 
-fn editor_in_owner_chain(editor: u64, root: u64, mut owner: impl FnMut(u64) -> u64) -> bool {
-    if editor == 0 {
-        return false;
-    }
-    let mut seen = std::collections::HashSet::new();
-    let mut window = root;
-    while window != 0 && seen.insert(window) {
-        if window == editor {
-            return true;
-        }
-        window = owner(window);
-    }
-    false
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LatencyPolicy {
     AutoBypass,
@@ -349,6 +403,8 @@ pub(crate) struct PluginSlot {
     /// プラグイン重い処理 (Pro-Q 4 / Insight2 等) を 1 回に抑え、DAW 並みの
     /// 高速トグルを実現する。
     pub gui_hwnd: u64,
+    /// Only the host GUI thread produces this canonical normal-screen snapshot.
+    pub normal_screen_rect: Option<bridge::NormalScreenRect>,
     /// プラグイン GUI が現在可視か (= ShowWindow の状態を mIV 側で覚えておく)。
     /// `gui_hwnd != 0 && !gui_visible` = ウィンドウは作成済みだが SW_HIDE 状態。
     pub gui_visible: bool,
@@ -425,6 +481,7 @@ impl DspBridge {
             latency_policy,
             strict_state,
             show_editor_bypass_button,
+            gui_show_in_taskbar: AtomicBool::new(false),
             gui_failure_sink: Mutex::new(None),
             gui_result_wake: Mutex::new(None),
             gui_command_dispatch: Mutex::new(None),
@@ -1032,6 +1089,7 @@ impl DspBridge {
             latency_samples: 0,
             bypass: false,
             gui_hwnd: 0,
+            normal_screen_rect: None,
             gui_visible: false,
             user_hidden: false,
             auto_bypassed_for_latency: false,
@@ -1166,11 +1224,7 @@ impl DspBridge {
                         // Codex P2 round 6: 単に Err を返すだけだと per-plugin skip 扱いで
                         // chain が is_enabled() のまま放置される。明示的に
                         // `disable_with_reason` してセッション全体を止める。
-                        if version != crate::video::dsp::bridge::PROTOCOL_VERSION {
-                            let reason = format!(
-                                "VST3 bridge protocol version mismatch (bridge reported {version}, mIV expects {})",
-                                crate::video::dsp::bridge::PROTOCOL_VERSION
-                            );
+                        if let Err(reason) = bridge::require_current_protocol(version) {
                             self.disable_with_reason(Some(reason.clone()));
                             return Err(reason);
                         }
@@ -1316,6 +1370,7 @@ impl DspBridge {
             latency_samples,
             bypass,
             gui_hwnd: 0,
+            normal_screen_rect: None,
             gui_visible: false,
             user_hidden,
             auto_bypassed_for_latency: false,
@@ -1475,13 +1530,29 @@ impl DspBridge {
         }
     }
 
-    /// 全 Loaded スロットのプラグイン GUI ウィンドウ位置 + 外枠サイズを取得する。
-    /// 戻り値: `(plugin_path, x, y, w, h)` のリスト。HWND が無い slot
-    /// (= 一度も GUI を開かなかった) や `GetWindowRect` 失敗の slot は含めない。
-    ///
-    /// **path をキーにする**: settings との突合せ用 (= bridge slot idx と settings idx の
-    /// ズレを避ける、Codex P2、2026-05-01)。
-    /// 軽量同期処理で UI スレッドから呼んで OK (= GetWindowRect は ~us)。
+    /// The host-control worker owns this setting and the pipe writes. The atomic
+    /// snapshot also configures future editor creation before Show.
+    pub(crate) fn set_gui_show_in_taskbar(&self, value: bool) {
+        self.gui_show_in_taskbar.store(value, Ordering::Release);
+        let targets: Vec<_> = self
+            .inner
+            .lock()
+            .unwrap()
+            .slots
+            .iter()
+            .filter(|s| s.gui_hwnd != 0)
+            .map(|s| (Arc::clone(&s.bridge), s.slot_id))
+            .collect();
+        for (bridge, slot_id) in targets {
+            if let Err(error) = bridge.send_value(&serde_json::json!({ "cmd": "set_gui_taskbar", "slot_id": slot_id, "value": value })) {
+                self.report_gui_failure(format!("taskbar setting: {error}"));
+            }
+        }
+    }
+
+    /// Return path-keyed outer positions/sizes. EffeTune reads only the host's
+    /// completed normal-screen snapshot, including while iconic. Generic VST
+    /// retains its existing GetWindowRect path. Drain GUI signals before saving.
     pub fn snapshot_all_window_positions(&self) -> Vec<(String, i32, i32, u32, u32)> {
         if !self.is_enabled() {
             return Vec::new();
@@ -1492,8 +1563,20 @@ impl DspBridge {
             .iter()
             .filter(|s| s.gui_hwnd != 0)
             .filter_map(|s| {
-                gui::get_window_rect(s.gui_hwnd)
-                    .map(|(x, y, w, h)| (s.plugin_path.clone(), x, y, w, h))
+                if self.gui_owner_policy == GuiOwnerPolicy::Unowned {
+                    s.normal_screen_rect.map(|r| {
+                        (
+                            s.plugin_path.clone(),
+                            r.x,
+                            r.y,
+                            r.outer_width,
+                            r.outer_height,
+                        )
+                    })
+                } else {
+                    gui::get_window_rect(s.gui_hwnd)
+                        .map(|(x, y, w, h)| (s.plugin_path.clone(), x, y, w, h))
+                }
             })
             .collect()
     }
@@ -1712,29 +1795,6 @@ impl DspBridge {
                 }),
             );
         }
-    }
-
-    /// Foreground editor or a popup whose owner chain reaches this exact editor.
-    pub fn slot_gui_is_foreground(&self, idx: usize, foreground: u64) -> bool {
-        use windows::Win32::Foundation::HWND;
-        use windows::Win32::UI::WindowsAndMessaging::{GA_ROOT, GW_OWNER, GetAncestor, GetWindow};
-        let editor = self
-            .inner
-            .lock()
-            .unwrap()
-            .slots
-            .get(idx)
-            .map(|s| s.gui_hwnd)
-            .unwrap_or(0);
-        if editor == 0 || foreground == 0 {
-            return false;
-        }
-        let root = unsafe { GetAncestor(HWND(foreground as *mut _), GA_ROOT) }.0 as u64;
-        editor_in_owner_chain(editor, root, |window| {
-            unsafe { GetWindow(HWND(window as *mut _), GW_OWNER) }
-                .unwrap_or_default()
-                .0 as u64
-        })
     }
 
     pub fn activate_slot_gui(&self, idx: usize) {
@@ -2103,6 +2163,7 @@ impl DspBridge {
                 "height": pref_h,
                 "resizable": if resizable { 1 } else { 0 },
                 "hide_bypass_button": if self.show_editor_bypass_button { 0 } else { 1 },
+                "show_in_taskbar": self.gui_show_in_taskbar.load(Ordering::Acquire),
                 "has_initial_pos": if initial_pos.is_some() { 1 } else { 0 },
                 "x": initial_pos.map(|p| p.0).unwrap_or(0),
                 "y": initial_pos.map(|p| p.1).unwrap_or(0),
@@ -2113,14 +2174,17 @@ impl DspBridge {
             }))
             .map_err(|e| format!("send ShowGui: {e}"))?;
         let mut hwnd = 0_u64;
+        let mut attached_normal_rect = None;
         match bridge_arc.recv_timeout(std::time::Duration::from_secs(6)) {
             Ok(Event::GuiAttached {
                 width: _,
                 height: _,
                 slot_id: got_slot,
                 container_hwnd,
+                normal_rect,
             }) if got_slot == slot_id => {
                 hwnd = container_hwnd;
+                attached_normal_rect = normal_rect.filter(|rect| rect.valid());
                 if hwnd == 0 {
                     return Err("bridge did not return editor HWND".to_string());
                 }
@@ -2155,6 +2219,7 @@ impl DspBridge {
         let mut inner = self.inner.lock().unwrap();
         if let Some(slot) = inner.slots.get_mut(idx) {
             slot.gui_hwnd = hwnd;
+            slot.normal_screen_rect = attached_normal_rect;
             slot.gui_visible = visible;
             // 起動後 settings から復元された user_hidden=true 状態でも、明示的な
             // show_slot_gui (= パネル「GUI」ボタン押下) で初めて作成された window
@@ -2202,22 +2267,6 @@ impl DspBridge {
         // editor の前にいるはずだが、念のため再アサート)。
         self.refresh_editor_hwnds_snapshot();
         self.fire_hud_raise_hook();
-    }
-
-    /// EffeTune uses this from its controller worker. Keep the slot visible
-    /// until the pipe write succeeds so the UI observes the completed command.
-    pub fn hide_slot_gui_checked(&self, idx: usize) -> Result<(), String> {
-        let (bridge, slot_id, hwnd) = {
-            let inner = self.inner.lock().unwrap();
-            let slot = inner.slots.get(idx).ok_or("GUI slot is missing")?;
-            (Arc::clone(&slot.bridge), slot.slot_id, slot.gui_hwnd)
-        };
-        if hwnd != 0 {
-            bridge
-                .set_gui_visibility_checked(slot_id, false, 0, 0)
-                .map_err(|error| error.to_string())?;
-        }
-        Ok(())
     }
 
     fn record_user_hidden_from_host(&self, idx: usize) {
@@ -2567,6 +2616,7 @@ impl DspBridge {
     /// ため (Codex P2 2026-05-01)。
     pub fn pump_gui_signals(&self) -> GuiSignalChanges {
         let mut visibility_changed = false;
+        let mut warnings = Vec::new();
         let (bridge_user_hidden_slot_ids, bridge_bypass_toggle_slot_ids): (Vec<u64>, Vec<u64>) = {
             let bridges: Vec<Arc<Bridge>> = {
                 let inner = self.inner.lock().unwrap();
@@ -2587,27 +2637,67 @@ impl DspBridge {
                 for signal in bridge.drain_gui_visibility() {
                     use bridge::GuiVisibilitySignal;
                     if self.gui_owner_policy == GuiOwnerPolicy::Unowned {
+                        if let GuiVisibilitySignal::Warning {
+                            slot_id,
+                            container_hwnd,
+                            detail,
+                        } = &signal
+                        {
+                            if self.inner.lock().unwrap().slots.iter().any(|slot| {
+                                slot.slot_id == *slot_id
+                                    && Arc::ptr_eq(&slot.bridge, &bridge)
+                                    && slot.gui_hwnd != 0
+                                    && slot.gui_hwnd == *container_hwnd
+                            }) {
+                                crate::logger::log(format!("[EffeTune GUI] {detail}"));
+                                warnings.push(detail.clone());
+                            }
+                            continue;
+                        }
+                        let frame = match &signal {
+                            GuiVisibilitySignal::Closed {
+                                slot_id,
+                                container_hwnd,
+                                normal_rect,
+                            } => Some((*slot_id, *container_hwnd, *normal_rect)),
+                            GuiVisibilitySignal::NormalRect {
+                                slot_id,
+                                container_hwnd,
+                                normal_rect,
+                            } => Some((*slot_id, *container_hwnd, Some(*normal_rect))),
+                            _ => None,
+                        };
+                        let mut inner = self.inner.lock().unwrap();
+                        if let Some((slot_id, hwnd, rect)) = frame {
+                            let Some(slot) = inner.slots.iter_mut().find(|slot| {
+                                slot.slot_id == slot_id
+                                    && Arc::ptr_eq(&slot.bridge, &bridge)
+                                    && slot.gui_hwnd != 0
+                                    && slot.gui_hwnd == hwnd
+                            }) else {
+                                continue;
+                            };
+                            if let Some(rect) = rect.filter(|rect| rect.valid()) {
+                                slot.normal_screen_rect = Some(rect);
+                            }
+                        }
                         let Some((slot_id, visible, user_hidden)) = signal.projection() else {
                             continue;
                         };
-                        if let Some(slot) = self
-                            .inner
-                            .lock()
-                            .unwrap()
-                            .slots
-                            .iter_mut()
-                            .find(|slot| slot.slot_id == slot_id)
-                        {
-                            slot.gui_visible = visible;
-                            slot.user_hidden = user_hidden;
-                            visibility_changed = true;
-                        }
+                        let Some(slot) = inner.slots.iter_mut().find(|slot| {
+                            slot.slot_id == slot_id && Arc::ptr_eq(&slot.bridge, &bridge)
+                        }) else {
+                            continue;
+                        };
+                        slot.gui_visible = visible;
+                        slot.user_hidden = user_hidden;
+                        visibility_changed = true;
                         if user_hidden {
                             user_hidden_slot_ids.push(slot_id);
                         } else {
                             user_hidden_slot_ids.retain(|id| *id != slot_id);
                         }
-                    } else if let GuiVisibilitySignal::Closed(slot_id) = signal {
+                    } else if let GuiVisibilitySignal::Closed { slot_id, .. } = signal {
                         user_hidden_slot_ids.push(slot_id);
                     }
                 }
@@ -2824,6 +2914,7 @@ impl DspBridge {
             bypass_updates.push((path, actual_bypass));
         }
         GuiSignalChanges {
+            warnings,
             user_hidden_paths,
             bypass_updates,
         }
@@ -2959,6 +3050,9 @@ impl DspBridge {
     pub fn set_gui_hwnd(&self, idx: usize, hwnd_u64: u64) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(slot) = inner.slots.get_mut(idx) {
+            if slot.gui_hwnd != hwnd_u64 {
+                slot.normal_screen_rect = None;
+            }
             slot.gui_hwnd = hwnd_u64;
         }
     }
