@@ -4768,3 +4768,14 @@ cfg(test) でない製品コード、detached 述語 / viewport / mount / drop �
 ログは `target/ci-v460-*.log`。7 変更ファイルの CRLF を維持し、製品側 5 ファイルは
 test cfg 追加だけ、監査側は `PUBLIC_API_ALLOWLIST` 内だけの差分であることも機械照合した。
 別セッションの `docs/next-release-backlog.md` は変更せず、アプリ起動・コミットは行っていない。
+
+### 2026-10-13 §1.378 利用者決定による前面判定の撤去（EV19）
+
+利用者が音響調整ボタンを「表示・前面化だけ」へ変更し、HideはEffeTuneの×/Shell操作へ限定した。
+mainのClickForeground/mouse/pointer/touch捕捉、専用Hide worker結果とpending_hide、前面判定の
+未使用DSP helperを撤去する。既存ShowIntent/GuiGateとhost GUI threadの表示・activate経路を使う。
+新しいinput owner/viewport分岐や判定guardを足す対症処置ではなく、不要になった所有境界の撤去である。
+main subclassの表示・最小化通知は維持し、Close/capture/通常矩形とDSP lifetimeは変更しない。
+detached predicate/registry/viewport/scheduler/placementは変更せず、vendor egui/eframeも変更しない。
+設計担当の利用者決定と実装premise確認に基づく範囲を記録し、独立実装レビューACCEPTとは区別する。
+仕様と検証は音響調整計画§17.12、target/ET-1378-impl-msg.txtへ記録する。

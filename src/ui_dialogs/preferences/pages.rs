@@ -8183,6 +8183,10 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
         draw_effetune_auto_open_settings(ui, &mut state.settings);
     });
     #[cfg(not(feature = "portable"))]
+    anchored(ui, state, "video/effetune-taskbar", |ui, state| {
+        draw_effetune_taskbar_settings(ui, &mut state.settings);
+    });
+    #[cfg(not(feature = "portable"))]
     anchored(ui, state, "video/effetune-minimized", |ui, state| {
         draw_effetune_minimized_settings(ui, &mut state.settings);
         ui.add_space(12.0);
@@ -8321,6 +8325,22 @@ pub(super) fn draw_effetune_auto_open_settings(ui: &mut egui::Ui, settings: &mut
          全画面・最小化・トレイ格納・リモート閲覧中は開きません。復帰しただけでは開きません。\n\
          音声ファイルは対象外です。OK を押すと反映します。再生中に ON にしても、その再生では開きません。\n\
          未起動の音響調整を開始した場合、窓を閉じても終了まで音の処理を続けます。",
+    );
+    #[cfg(feature = "portable")]
+    let _ = (ui, settings);
+}
+
+pub(super) fn draw_effetune_taskbar_settings(ui: &mut egui::Ui, settings: &mut Settings) {
+    #[cfg(not(feature = "portable"))]
+    ui.checkbox(
+        &mut settings.effetune_show_in_taskbar,
+        "音響調整の窓をタスクバーに表示する",
+    )
+    .on_hover_text(
+        "初期値は ON です。音響調整の窓をタスクバーから最小化・復元できます。\n\
+         OK を押すと、開いている窓にも反映します。閉じている窓は開きません。\n\
+         音響調整の窓を最小化・閉じる操作では、音の処理は続きます。\n\
+         メインウィンドウの最小化中は「表示したままにする」の設定に従い、リモート閲覧中は隠れます。",
     );
     #[cfg(feature = "portable")]
     let _ = (ui, settings);

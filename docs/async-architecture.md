@@ -5,6 +5,33 @@
 
 ---
 
+## EffeTuneのタスクバー設定・通常矩形（§1.378、未リリース）
+
+Preferences OKと起動時は`effetune-host-control`へ設定を配送するだけで、UIはIPCを送信しない。
+workerの一つの最新targetをRegisterBridgeで将来attachへ継承し、作成済みframeは同じhost GUI threadで
+通常caption/exstyleを保ったままITaskbarListへAddTab/DeleteTabする。正当な表示/復元と
+TaskbarButtonCreatedも同じGUI threadで現在の設定を適用する。
+再attach、新しいvisibility owner、minimized bool、復帰queueは追加しない。
+Shell Restoreも既存GuiVisibility permitを通し、Closeとtaskbar OFF時の最小化はuser-hideでDSPを維持する。
+通常配置のwriterもhost GUI threadであり、WINDOWPLACEMENTをscreen物理pxに正規化した
+immutable snapshotを初回attach・移動/resize完了・最小化前・Hide前に公開する。
+native Closeは同じ通知にframe identityと通常矩形を載せ、coreはbridge/slot/current HWNDを照合して
+矩形を適用してからuser-hidden処理を行う。checked Hideは通常矩形の公開後にACKを返す。
+音響調整の全保存callerはFIFOの完成通知をdrainしてsnapshotを読むだけで、同期geometry取得や完了待機をしない。
+pluginへのサイズ通知もhost GUI threadの通常client確認入口が所有する。iconic中は復元配置だけを更新し、
+child layout/`onSize`/最終寸法を更新しない。SW_SHOWNAの再表示/Remote復帰はiconicを維持し得るため、
+明示Restore/通常WM_SIZEでallocationが確定してから通知する。hidden normalの初回attachは維持する。
+protocol v7のhello/readyで旧v6を拒否し、source identityとは独立にdebug buildでも互換性を検査する。
+一般VSTの矩形保存、owner、custom chromeは維持する。まれな失敗はログ＋通知、前の有効値を保持し、retryを追加しない。
+設計・実装台帳は[音響調整計画 §17](effetune-integration-plan.md)を参照。
+
+2026-10-13の利用者決定で、音響調整ボタンは表示・前面化だけを行う（計画§17.12）。
+mouse/keyboardとも既存host-control workerへManual Showを配送し、host GUI threadが表示/復元/activateする。
+前面判定・ClickForeground入力捕捉・ボタン専用Hide/pending_hideは撤去し、UIは可視結果やIPC完了を待たない。
+main subclassはmainの表示・最小化を既存GuiGateへ配送するだけにする。入力hookやvendor注釈はない。
+×/Shellのuser-hide通知と正常矩形snapshotは従来どおり採用し、Close由来のcapture_on_hideとDSPは維持する。
+ボタンの点灯はDSP EffectiveStateを示し、窓のvisibility ownerや開閉toggleにはしない。
+
 ## Everything の取得と共通Search採用（§1.374、未リリース）
 
 `GlobalSearchState.pending` の `SearchProducer` がMetadata/Everythingを排他に所有し、

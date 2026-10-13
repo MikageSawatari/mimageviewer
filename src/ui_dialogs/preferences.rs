@@ -175,6 +175,7 @@ pub fn draw_file_organize_destinations_settings_snapshot_fixture(ui: &mut egui::
 pub fn draw_effetune_input_limit_snapshot_fixture(ui: &mut egui::Ui) {
     pages::draw_effetune_input_limit_settings(ui, &mut Settings::default());
     pages::draw_effetune_auto_open_settings(ui, &mut Settings::default());
+    pages::draw_effetune_taskbar_settings(ui, &mut Settings::default());
     pages::draw_effetune_minimized_settings(ui, &mut Settings::default());
 }
 
@@ -2418,6 +2419,8 @@ impl App {
             self.effetune.set_keep_visible_when_minimized(
                 self.settings.effetune_keep_visible_when_minimized,
             );
+            self.effetune
+                .set_show_in_taskbar(self.settings.effetune_show_in_taskbar);
             self.effetune
                 .slot
                 .set_pre_limiter_enabled(self.settings.effetune_pre_limiter_enabled);
@@ -8202,6 +8205,103 @@ mod tests {
         let after = harness.state().effetune.auto_reader().unwrap().snapshot();
         assert!(!after.allowed);
         assert_ne!(after.revision, before.revision);
+    }
+
+    #[test]
+    #[cfg(all(windows, not(feature = "portable")))]
+    fn effetune_taskbar_preferences_cancel_ok_save_reload() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = crate::app::setup_app_for_test();
+        assert!(app.settings.effetune_show_in_taskbar);
+        assert!(app.effetune.show_in_taskbar());
+        app.open_preferences_request(PreferencesOpenRequest::anchored(
+            PreferencesPage::Video,
+            "video/effetune-taskbar",
+        ));
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(1100.0, 850.0))
+            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+        for (cancel, enabled) in [(true, false), (false, false), (false, true)] {
+            if !harness.state().show_preferences {
+                harness
+                    .state_mut()
+                    .open_preferences_request(PreferencesOpenRequest::anchored(
+                        PreferencesPage::Video,
+                        "video/effetune-taskbar",
+                    ));
+            }
+            harness.run_steps(5);
+            harness.state_mut().pref_state.as_mut().unwrap().highlight = None;
+            harness.run();
+            harness
+                .get_by_label("音響調整の窓をタスクバーに表示する")
+                .click();
+            harness.run();
+            assert_eq!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .effetune_show_in_taskbar,
+                enabled
+            );
+            assert_eq!(harness.state().settings.effetune_show_in_taskbar, !enabled);
+            assert_eq!(harness.state().effetune.show_in_taskbar(), !enabled);
+            harness
+                .get_by_label(if cancel { "キャンセル" } else { "  OK  " })
+                .click();
+            harness.run();
+            if cancel {
+                assert!(harness.state().show_preferences_discard_confirm);
+                assert!(harness.state().effetune.show_in_taskbar());
+                harness.get_by_label("破棄して閉じる").click();
+                harness.run();
+            }
+            assert!(!harness.state().show_preferences);
+            let expected = if cancel { !enabled } else { enabled };
+            assert_eq!(harness.state().settings.effetune_show_in_taskbar, expected);
+            assert_eq!(harness.state().effetune.show_in_taskbar(), expected);
+            if !cancel {
+                let reloaded = Settings::load();
+                assert_eq!(reloaded.effetune_show_in_taskbar, enabled);
+                assert_eq!(
+                    crate::app::App::new_from_settings(reloaded)
+                        .effetune
+                        .show_in_taskbar(),
+                    enabled
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(all(windows, feature = "portable"))]
+    fn effetune_taskbar_preferences_portable_hides_control_and_keeps_value() {
+        use egui_kittest::kittest::Queryable;
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let settings = Settings {
+            effetune_show_in_taskbar: false,
+            ..Settings::default()
+        };
+        let mut state = preferences_state_for_test(&settings);
+        state.selected = PreferencesPage::Video;
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(600.0, 2400.0))
+            .build_state(
+                |ctx, state| {
+                    egui::CentralPanel::default().show(ctx, |ui| draw_page(ui, state, false));
+                },
+                state,
+            );
+        harness.run();
+        assert!(
+            harness
+                .query_by_label("音響調整の窓をタスクバーに表示する")
+                .is_none()
+        );
+        assert!(!harness.state().settings.effetune_show_in_taskbar);
     }
 
     #[test]

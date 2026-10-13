@@ -49,6 +49,16 @@ Light／Dark × 標準／強い、計8枚を保持する。前者は六分類・
 `preferences_restore_position_dark_off_narrow` の2枚で、本体と共通のチェック項目を描く。
 既定 ON のライト表示と、OFF のダーク表示・狭い幅での折り返しを確認する。
 
+音響調整のタスクバー表示 (§1.378) は既存の`preferences_effetune_input_limit_dark` /
+`preferences_effetune_auto_open_light`と、追加した320px幅の`preferences_effetune_taskbar_narrow_dark`で確認する。
+本体と共通の描画helperを使い、既定ONのcheckbox、明暗の文字コントラスト、狭幅での折り返しと到達性を検査する。
+native caption / taskbarの実Shell表示はこれらegui PNGの範囲外であり、利用者の実機確認で確定する。
+
+2026-10-13の表示・前面化専用ボタン (§1.378) は`effetune_show_only_active_tooltip_dark`と
+`effetune_show_only_inert_tooltip_light`で確認する。本体と共通のbutton/tooltip helperを使い、
+点灯はDSP状態、操作は表示・前面化、hideは×という説明の折り返しと明暗コントラストを検査する。
+App全体やhostを構築せず、単純な描画fixtureで生成する。2枚の基準PNGは目視確認済み。
+
 ## ディレクトリ構成
 
 ```

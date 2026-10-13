@@ -166,10 +166,20 @@ void send_event_error(const std::string& detail) {
     write_message(msg);
 }
 
-void send_event_gui_user_hidden(uint64_t slot_id) {
+void send_event_gui_user_hidden(uint64_t slot_id, uint64_t container_hwnd, const std::optional<NormalScreenRect>& normal) {
     std::string msg = "{\"event\":\"gui_user_hidden\",\"slot_id\":" +
-                      std::to_string(slot_id) + "}";
+                      std::to_string(slot_id) + ",\"container_hwnd\":" + std::to_string(container_hwnd) +
+                      normal_rect_json_member(normal) + "}";
     write_message(msg);
+}
+
+void send_event_gui_normal_rect(uint64_t slot_id, uint64_t container_hwnd, const NormalScreenRect& normal) {
+    write_message("{\"event\":\"gui_normal_rect\",\"slot_id\":" + std::to_string(slot_id) +
+                  ",\"container_hwnd\":" + std::to_string(container_hwnd) + normal_rect_json_member(normal) + "}");
+}
+
+void send_event_gui_warning(uint64_t slot_id, uint64_t container_hwnd, const std::string& detail) {
+    write_message(gui_warning_json(slot_id, container_hwnd, detail));
 }
 
 void send_event_gui_bypass_toggle(uint64_t slot_id) {
@@ -704,6 +714,16 @@ private:
         return v;
     }
 
+    static bool extract_bool_field(const std::string& json, const std::string& key) {
+        auto pos = json.find("\"" + key + "\"");
+        if (pos == std::string::npos) return false;
+        pos = json.find(':', pos);
+        if (pos == std::string::npos) return false;
+        ++pos;
+        while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) ++pos;
+        return json.compare(pos, 4, "true") == 0 || extract_number_field(json, key) != 0;
+    }
+
     static int64_t extract_i64_field(const std::string& json, const std::string& key) {
         std::string needle = "\"" + key + "\"";
         auto pos = json.find(needle);
@@ -928,6 +948,7 @@ private:
             options.slot_id = slot_id;
             options.owner_hwnd = reinterpret_cast<void*>(extract_number_field(msg, "owner_hwnd"));
             options.unowned = extract_number_field(msg, "unowned") != 0;
+            options.show_in_taskbar = extract_bool_field(msg, "show_in_taskbar");
             options.gui_gate_name = extract_string_field(msg, "gui_gate_name");
             options.main_hwnd = reinterpret_cast<void*>(extract_number_field(msg, "main_hwnd"));
             if (options.unowned) {
@@ -953,7 +974,8 @@ private:
             options.title = extract_string_field(msg, "title");
             const bool visible = extract_number_field(msg, "visible") != 0;
             std::string err;
-            if (!loader->show_gui(options, visible, err)) {
+            std::optional<NormalScreenRect> normal;
+            if (!loader->show_gui(options, visible, err, &normal)) {
                 send_event_error("show_gui: " + err);
                 return true;
             }
@@ -965,19 +987,28 @@ private:
                                     std::to_string(w) + ",\"height\":" +
                                     std::to_string(h) +
                                     ",\"slot_id\":" + std::to_string(slot_id) +
-                                    ",\"container_hwnd\":" + std::to_string(container_hwnd) + "}";
+                                    ",\"container_hwnd\":" + std::to_string(container_hwnd) + normal_rect_json_member(normal) + "}";
                 write_message(reply);
             } else {
                 std::string reply = "{\"event\":\"gui_attached\",\"width\":0,\"height\":0,\"slot_id\":" +
                                     std::to_string(slot_id) +
-                                    ",\"container_hwnd\":" + std::to_string(container_hwnd) + "}";
+                                    ",\"container_hwnd\":" + std::to_string(container_hwnd) + normal_rect_json_member(normal) + "}";
                 write_message(reply);
+            }
+            if (options.unowned && !normal) {
+                std::fprintf(stderr, "[BRIDGE] attached EffeTune normal geometry unavailable\n");
+                send_event_gui_warning(slot_id, container_hwnd, "EffeTune window position could not be read; previous saved position retained");
             }
             return true;
         }
         if (cmd == "hide_gui") {
             if (PluginLoader* loader = loader_for_message(msg)) loader->hide_gui();
             write_message("{\"event\":\"gui_detached\"}");
+            return true;
+        }
+        if (cmd == "set_gui_taskbar") {
+            if (PluginLoader* loader = loader_for_message(msg))
+                loader->set_gui_taskbar(extract_bool_field(msg, "value"));
             return true;
         }
         if (cmd == "set_gui_remote_session") {

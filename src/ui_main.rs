@@ -25,6 +25,40 @@ use crate::settings::{
 };
 use crate::tag_view::{TagViewMenuChoice, tag_view_menu_sections};
 use crate::ui_details_icon::{DetailsIconKind, details_icon_kind, draw_details_preview_icon};
+
+#[cfg(windows)]
+fn effetune_toolbar_button(
+    ui: &mut egui::Ui,
+    active: bool,
+    available: bool,
+    drag_enabled: bool,
+    tooltip: &str,
+) -> egui::Response {
+    ui.add_enabled(
+        available,
+        egui::Button::new("音響調整")
+            .selected(active)
+            .sense(if drag_enabled {
+                egui::Sense::click_and_drag()
+            } else {
+                egui::Sense::click()
+            }),
+    )
+    .on_hover_text(tooltip)
+    .on_disabled_hover_text(tooltip)
+}
+
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn draw_effetune_show_only_snapshot_fixture(ui: &mut egui::Ui, active: bool) {
+    let effective = if active {
+        crate::effetune::EffectiveState::Effective
+    } else {
+        crate::effetune::EffectiveState::Inert
+    };
+    let tooltip = crate::effetune::running_gui_tooltip(Some(effective));
+    let _ = effetune_toolbar_button(ui, active, true, false, &tooltip);
+}
 // open_external_player はグリッドからは使わなくなった (動画はフルスクリーン化 →
 // インライン再生)。フォルダ系は別途同モジュールから直接呼んでいる箇所がある。
 
@@ -10363,29 +10397,12 @@ impl App {
                 TS::EffeTune => {
                     #[cfg(windows)]
                     {
-                        let active = matches!(
-                            self.effetune.runtime,
-                            crate::effetune::EffetuneRuntime::Running { .. }
-                        ) && matches!(
-                            self.effetune.effective_state(),
-                            Some(crate::effetune::EffectiveState::Effective)
-                        );
+                        let active = self.effetune_toolbar_active();
                         let available = self.effetune_toolbar_available();
-                        let resp = ui
-                            .add_enabled(
-                                available,
-                                egui::Button::selectable(active, "音響調整").sense(
-                                    if drag_enabled {
-                                        egui::Sense::click_and_drag()
-                                    } else {
-                                        egui::Sense::click()
-                                    },
-                                ),
-                            )
-                            .on_hover_text(format!("{}\n{lead_hint}", self.effetune_toolbar_tooltip()))
-                            .on_disabled_hover_text(format!("{}\n{lead_hint}", self.effetune_toolbar_tooltip()));
+                        let tooltip = format!("{}\n{lead_hint}", self.effetune_toolbar_tooltip());
+                        let resp = effetune_toolbar_button(ui, active, available, drag_enabled, &tooltip);
                         if resp.clicked() {
-                            self.effetune_toolbar_click(resp.clicked_by(egui::PointerButton::Primary));
+                            self.effetune_toolbar_click();
                         }
                         self.finish_toolbar_section_lead(
                             ui,

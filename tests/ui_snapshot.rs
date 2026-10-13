@@ -30,6 +30,59 @@ use egui_kittest::{Harness, kittest::Queryable};
 #[path = "support/ui_harness.rs"]
 mod test_ui;
 
+#[cfg(windows)]
+#[test]
+fn effetune_show_only_active_tooltip_dark() {
+    effetune_show_only_tooltip_snapshot(
+        "effetune_show_only_active_tooltip_dark",
+        true,
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn effetune_show_only_inert_tooltip_light() {
+    effetune_show_only_tooltip_snapshot(
+        "effetune_show_only_inert_tooltip_light",
+        false,
+        mimageviewer::os_theme::ResolvedTheme::Light,
+    );
+}
+
+#[cfg(windows)]
+fn effetune_show_only_tooltip_snapshot(
+    name: &str,
+    active: bool,
+    theme: mimageviewer::os_theme::ResolvedTheme,
+) {
+    snapshot_with_theme_contrast_and_size_with_interaction(
+        name,
+        theme,
+        mimageviewer::settings::TextContrast::Standard,
+        egui::vec2(640.0, 260.0),
+        move |ui| {
+            ui.ctx()
+                .style_mut(|style| style.interaction.tooltip_delay = 0.0);
+            mimageviewer::draw_effetune_show_only_snapshot_fixture(ui, active);
+        },
+        |harness| {
+            harness.get_by_label("音響調整").hover();
+            harness.run();
+            assert!(
+                harness
+                    .query_by_label_contains("表示して前面に出します")
+                    .is_some()
+            );
+            assert!(
+                harness
+                    .query_by_label_contains("点灯は音響調整が有効")
+                    .is_some()
+            );
+        },
+    );
+}
+
 #[test]
 fn everything_search_bar_light() {
     everything_search_bar_snapshot(
@@ -1764,6 +1817,28 @@ fn preferences_effetune_auto_open_light() {
         "preferences_effetune_auto_open_light",
         mimageviewer::os_theme::ResolvedTheme::Light,
         mimageviewer::draw_effetune_input_limit_snapshot_fixture,
+    );
+}
+
+#[test]
+#[cfg(not(feature = "portable"))]
+fn preferences_effetune_taskbar_narrow_dark() {
+    let size = egui::vec2(320.0, 360.0);
+    snapshot_with_theme_contrast_and_size_with_interaction(
+        "preferences_effetune_taskbar_narrow_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::Standard,
+        size,
+        mimageviewer::draw_effetune_input_limit_snapshot_fixture,
+        |harness| {
+            let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            for label in [
+                "音響調整の窓をタスクバーに表示する",
+                "メインウィンドウを最小化しても音響調整の窓を表示したままにする",
+            ] {
+                assert!(viewport.contains_rect(harness.get_by_label(label).rect()));
+            }
+        },
     );
 }
 

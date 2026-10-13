@@ -1,6 +1,7 @@
 // VST3 IHostApplication / IComponentHandler 最小実装
 
 #include "host_app.h"
+#include "gui_frame.h"
 
 #include <algorithm>
 #include <cstring>
@@ -158,7 +159,13 @@ tresult PLUGIN_API PlugFrame::resizeView(Steinberg::IPlugView* view,
                      static_cast<WPARAM>(std::max<int32>(1, w)),
                      static_cast<LPARAM>(std::max<int32>(1, h)));
     }
-    view->onSize(newSize);
+    // A plugin request may update restore geometry while minimized, but the
+    // iconic client is never an editor allocation or onSize acknowledgement.
+    // Preserve normal/suppressed and pre-host attach acknowledgements.
+    if (host_hwnd_)
+        notify_normal_editor_view(reinterpret_cast<HWND>(host_hwnd_), [&] { view->onSize(newSize); });
+    else
+        view->onSize(newSize);
     return kResultOk;
 }
 

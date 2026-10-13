@@ -224,11 +224,7 @@ fn probe_plugin_with_bridge(exe: &Path, plugin_path: &Path) -> Result<ProbeResul
     match bridge.recv_timeout(std::time::Duration::from_secs(3)) {
         Ok(Event::Ready { version }) => {
             // T09 (v0.9.0): protocol mismatch を握りつぶさない
-            if version != PROTOCOL_VERSION {
-                return Err(format!(
-                    "VST3 bridge protocol version mismatch (bridge reported {version}, mIV expects {PROTOCOL_VERSION})"
-                ));
-            }
+            super::bridge::require_current_protocol(version)?;
         }
         Ok(Event::Error { detail }) => {
             return Err(format!("VST3 bridge handshake error: {detail}"));

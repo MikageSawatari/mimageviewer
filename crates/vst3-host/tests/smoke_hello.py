@@ -48,7 +48,7 @@ def read_msg(proc: subprocess.Popen, timeout_sec: float = 5.0) -> str:
 
 def main() -> int:
     here = os.path.dirname(os.path.abspath(__file__))
-    bridge_exe = os.path.normpath(
+    bridge_exe = sys.argv[1] if len(sys.argv) > 1 else os.path.normpath(
         os.path.join(here, "..", "..", "..", "vendor", "vst3-host",
                       "mimageviewer-vst3-host.exe")
     )
@@ -65,14 +65,14 @@ def main() -> int:
         stderr=subprocess.PIPE,
     )
     try:
-        # hello → ready (protocol v6: bounded Now Playing notification)
-        write_msg(proc, '{"cmd":"hello","version":6}')
+        # v7 is required for frame-scoped GUI close/geometry and presentation.
+        write_msg(proc, '{"cmd":"hello","version":7}')
         reply = read_msg(proc)
         print(f"<- {reply}")
         if '"event":"ready"' not in reply:
             print(f"unexpected reply: {reply}", file=sys.stderr)
             return 2
-        if '"version":6' not in reply:
+        if '"version":7' not in reply:
             print(f"version mismatch: {reply}", file=sys.stderr)
             return 3
 
@@ -102,18 +102,20 @@ def main() -> int:
         if proc.stdout.read() != b"":
             raise AssertionError("metadata unexpectedly emitted a reply event")
 
-        stale = subprocess.Popen([bridge_exe], stdin=subprocess.PIPE,
-                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        try:
-            write_msg(stale, '{"cmd":"hello","version":5}')
-            rejection = read_msg(stale)
-            assert '"event":"error"' in rejection and "bridge speaks v6" in rejection, rejection
-            assert stale.wait(timeout=5) == 0
-            print("old v5 handshake rejected")
-        finally:
-            if stale.poll() is None:
-                stale.kill()
-                stale.wait()
+        for old_version in (5, 6):
+            stale = subprocess.Popen([bridge_exe], stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                write_msg(stale, '{"cmd":"hello","version":' + str(old_version) + '}')
+                rejection = read_msg(stale)
+                assert '"event":"error"' in rejection and "bridge speaks v7" in rejection, rejection
+                assert stale.wait(timeout=5) == 0
+                assert stale.stdout.read() == b"", "old client received an extra event"
+                print(f"old v{old_version} handshake rejected")
+            finally:
+                if stale.poll() is None:
+                    stale.kill()
+                    stale.wait()
 
         print("PASS")
         return 0
