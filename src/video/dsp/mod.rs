@@ -2269,22 +2269,6 @@ impl DspBridge {
         self.fire_hud_raise_hook();
     }
 
-    /// EffeTune uses this from its controller worker. Keep the slot visible
-    /// until the pipe write succeeds so the UI observes the completed command.
-    pub fn hide_slot_gui_checked(&self, idx: usize) -> Result<(), String> {
-        let (bridge, slot_id, hwnd) = {
-            let inner = self.inner.lock().unwrap();
-            let slot = inner.slots.get(idx).ok_or("GUI slot is missing")?;
-            (Arc::clone(&slot.bridge), slot.slot_id, slot.gui_hwnd)
-        };
-        if hwnd != 0 {
-            bridge
-                .set_gui_visibility_checked(slot_id, false, 0, 0)
-                .map_err(|error| error.to_string())?;
-        }
-        Ok(())
-    }
-
     fn record_user_hidden_from_host(&self, idx: usize) {
         if let Some(slot) = self.inner.lock().unwrap().slots.get_mut(idx) {
             slot.gui_visible = false;
