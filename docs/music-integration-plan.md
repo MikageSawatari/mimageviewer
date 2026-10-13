@@ -514,6 +514,12 @@ cargo fmt / fmt --check、通常 / portable core check、glyph lint（危険glyp
   再選択は行わず、残光は維持する。タイムラインはリズム区間ごとの音量・低域エネルギー付き
   投票で色を決め、ツールチップにも描画済みの同じ票を使う。未計算部分は既定色のままで、
   計算済み側の票を未計算側へ広げない。鍵盤と全曲解析の助走履歴が異なるため完全一致は保証しない。
+- 音名の配色は `music_note_color` に集約する（[鍵盤設計 §15](music-keyboard-harmnet-plan.md)）。
+  C=赤、5度圏順（既定）／半音順の2方式とし、暗い音名だけ同じ強さの明度中央値へ上げる。
+  上部「…」の共有overflowパネルから変更し、`music_note_color_scheme` を保存する。
+  環境設定draft適用時も最新の配色を保持する。鍵盤は次の描画、タイムラインは既存
+  `music_analysis_version` の進行による再ラスタで反映し、要求ごとに方式を値で渡す。
+  再ラスタ中は表示中textureを保持する。parked-liveのボタンは非表示で、配色は共有設定から参照する。
 - 常駐 spectrum worker が `SpectrumAnalyzer` と music-core の `pitch::HarmNetTracker` を所有する。
   棒グラフと倍音比率は従来どおり再生位置周辺 ±1 秒の PCM 窓から FFT で求め、鍵盤の中央は
   **HarmNet L の基音確率 × 既存の音量ゲート（Norm ゲイン反映）**で光る。上下端は中央の明るさに

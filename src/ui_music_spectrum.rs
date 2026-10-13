@@ -20,6 +20,8 @@
 //! 描画 (`draw`) のピクセル/カラー計算はラボ実装を字面どおり移植している (ラボが機能の正本、
 //! §2.1「再利用する」原則)。egui 依存があるため music-core には置けず本体側モジュールとして持つ。
 
+use crate::music_note_color::{MusicNoteColorScheme, note_color};
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -56,7 +58,7 @@ const KEY_PITCH_GAMMA: f32 = 1.0;
 const KEY_HARMONIC_SMOOTH: f32 = 0.45;
 /// Layer ④ 縦グラデで倍音の伸びをどこまで許すか (上下端 = center × factor.clamp(0, これ))。
 const KEY_GRADIENT_SPREAD: f32 = 1.0;
-/// Bass 音マーカー (▼) のパラメータ。上の Bass 表示と同じ配色 (key_color) + afterglow 減衰。
+/// Bass 音マーカー (▼) のパラメータ。上の Bass 表示と同じ配色 (note_color) + afterglow 減衰。
 const BASS_MARKER_MIN_CONF: f32 = 0.5;
 /// 明るさ用に信頼度を持ち上げる係数。
 const BASS_MARKER_CONF_GAIN: f32 = 1.6;
@@ -453,7 +455,13 @@ impl MusicSpectrumState {
 
     /// 下段スペクトラム + ピッチ鍵盤を `rect` に描く。ラボの `draw_spectrum` を本体向けに
     /// 移植したもの (描画状態 trail/onset/note は `self` に持つ)。
-    pub fn draw(&mut self, ui: &egui::Ui, rect: egui::Rect, norm_gain_db: f32) {
+    pub fn draw(
+        &mut self,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        norm_gain_db: f32,
+        scheme: MusicNoteColorScheme,
+    ) {
         let response = ui.interact(
             rect,
             ui.id().with("music_spectrum_panel"),
@@ -503,6 +511,7 @@ impl MusicSpectrumState {
                 &mut self.note_even,
                 &mut self.note_odd,
                 norm_gain_db,
+                scheme,
             );
             // まだデコード中 (窓が取れない) 間はプロット領域に「解析中」を出し、無反応に見せない。
             // デコード完了後にバンドが空 = 無音区間なので、その場合はラベルを出さない。
@@ -511,6 +520,7 @@ impl MusicSpectrumState {
                 keyboard_rect,
                 &mut self.bass_marker_trail,
                 select_bass(self.pitch_probabilities.as_deref().unwrap_or(&[])),
+                scheme,
             );
             if self.source_present && !self.source_complete {
                 painter.text(
@@ -606,6 +616,7 @@ impl MusicSpectrumState {
             &mut self.note_even,
             &mut self.note_odd,
             norm_gain_db,
+            scheme,
         );
         // 鍵盤と同じ確率から最低音を選ぶ (残光は保持、明るさ=確率)。
         draw_bass_marker(
@@ -613,6 +624,7 @@ impl MusicSpectrumState {
             keyboard_rect,
             &mut self.bass_marker_trail,
             select_bass(self.pitch_probabilities.as_deref().unwrap_or(&[])),
+            scheme,
         );
     }
 }
@@ -854,6 +866,7 @@ fn draw_pitch_keyboard(
     note_even: &mut Vec<f32>,
     note_odd: &mut Vec<f32>,
     norm_gain_db: f32,
+    scheme: MusicNoteColorScheme,
 ) {
     // 鍵盤矩形でクリップし、均等幅で描いた鍵の軸外はみ出しを表示上でカットする。
     let painter = painter.with_clip_rect(rect);
@@ -904,15 +917,15 @@ fn draw_pitch_keyboard(
             let corner = if want_black { 1.0 } else { 0.0 };
             let real_key = (SPECTRUM_NOTE_MIN_MIDI..=SPECTRUM_NOTE_MAX_MIDI).contains(&midi);
             if real_key {
-                // Layer ④ 縦グラデ: 中央=基音 / 上端=奇数倍音 / 下端=偶数倍音。色相は key_color が
+                // Layer ④ 縦グラデ: 中央=基音 / 上端=奇数倍音 / 下端=偶数倍音。色相は note_color が
                 // ピッチクラスで決めるので維持され、明るさ (濃さ) だけが倍音で変わる。
                 let idx = (midi - SPECTRUM_NOTE_MIN_MIDI) as usize;
                 let center_val = note_trail[idx];
                 let even_factor = note_even[idx].clamp(0.0, KEY_GRADIENT_SPREAD);
                 let odd_factor = note_odd[idx].clamp(0.0, KEY_GRADIENT_SPREAD);
-                let mid_color = key_fill(midi, center_val, want_black);
-                let top_color = key_fill(midi, center_val * odd_factor, want_black);
-                let bottom_color = key_fill(midi, center_val * even_factor, want_black);
+                let mid_color = key_fill(midi, center_val, want_black, scheme);
+                let top_color = key_fill(midi, center_val * odd_factor, want_black, scheme);
+                let bottom_color = key_fill(midi, center_val * even_factor, want_black, scheme);
                 fill_key_gradient(&painter, key_rect, top_color, mid_color, bottom_color);
             } else {
                 painter.rect_filled(key_rect, corner, unlit_key_base(want_black, false));
@@ -936,6 +949,7 @@ fn draw_bass_marker(
     keyboard_rect: egui::Rect,
     trail: &mut Vec<f32>,
     bass_marker: BassEstimate,
+    scheme: MusicNoteColorScheme,
 ) {
     let note_count = (SPECTRUM_NOTE_MAX_MIDI - SPECTRUM_NOTE_MIN_MIDI + 1) as usize;
     if trail.len() != note_count {
@@ -964,7 +978,7 @@ fn draw_bass_marker(
         let cx = key_rect.center().x;
         let base_y = keyboard_rect.top() - 1.0;
         let m = intensity.clamp(0.0, 1.0);
-        let base = key_color(60 + midi % 12, 0.75 + 0.25 * m);
+        let base = note_color(60 + midi % 12, 0.75 + 0.25 * m, scheme);
         let alpha =
             (BASS_MARKER_ALPHA_MIN + (BASS_MARKER_ALPHA_MAX - BASS_MARKER_ALPHA_MIN) * m) as u8;
         let color = color_with_alpha(base, alpha);
@@ -992,10 +1006,10 @@ fn unlit_key_base(black: bool, real: bool) -> egui::Color32 {
     }
 }
 
-/// 鍵の点灯色。色相 (ピッチクラス) は `key_color` が保持し、`value` で消灯ベースから blend する。
-fn key_fill(midi: u8, value: f32, black: bool) -> egui::Color32 {
+/// 鍵の点灯色。色相 (ピッチクラス) は `note_color` が保持し、`value` で消灯ベースから blend する。
+fn key_fill(midi: u8, value: f32, black: bool, scheme: MusicNoteColorScheme) -> egui::Color32 {
     let base = unlit_key_base(black, true);
-    let active = key_color(midi, value);
+    let active = note_color(midi, value, scheme);
     let blend = (value * if black { 0.96 } else { 0.94 }).clamp(0.0, 1.0);
     lerp_color(base, active, blend)
 }
@@ -1297,37 +1311,6 @@ fn is_black_key(midi: u8) -> bool {
     matches!(midi % 12, 1 | 3 | 6 | 8 | 10)
 }
 
-fn key_color(midi: u8, value: f32) -> egui::Color32 {
-    let pitch_class = midi % 12;
-    let fifth_index = ((pitch_class as usize * 7) % 12) as f32;
-    let hue = (fifth_index / 12.0 + 0.57) % 1.0;
-    let saturation = 0.62 + value.clamp(0.0, 1.0) * 0.28;
-    let brightness = 0.38 + value.clamp(0.0, 1.0) * 0.58;
-    hsv_to_rgb(hue, saturation, brightness)
-}
-
-fn hsv_to_rgb(h: f32, s: f32, v: f32) -> egui::Color32 {
-    let h = h.rem_euclid(1.0) * 6.0;
-    let i = h.floor() as i32;
-    let f = h - i as f32;
-    let p = v * (1.0 - s);
-    let q = v * (1.0 - s * f);
-    let t = v * (1.0 - s * (1.0 - f));
-    let (r, g, b) = match i.rem_euclid(6) {
-        0 => (v, t, p),
-        1 => (q, v, p),
-        2 => (p, v, t),
-        3 => (p, q, v),
-        4 => (t, p, v),
-        _ => (v, p, q),
-    };
-    egui::Color32::from_rgb(
-        (r.clamp(0.0, 1.0) * 255.0) as u8,
-        (g.clamp(0.0, 1.0) * 255.0) as u8,
-        (b.clamp(0.0, 1.0) * 255.0) as u8,
-    )
-}
-
 fn spectrum_color(index: usize, total: usize, value: f32) -> egui::Color32 {
     let t = if total <= 1 {
         0.0
@@ -1410,6 +1393,7 @@ mod tests {
                     egui::Rect::from_min_size(egui::pos2(0.0, 50.0), egui::vec2(1200.0, 34.0)),
                     &mut trail,
                     selected,
+                    MusicNoteColorScheme::default(),
                 );
                 painted = (0..trail.len()).filter(|&i| trail[i] > 0.0).collect();
             });
@@ -1421,6 +1405,7 @@ mod tests {
                     egui::Rect::from_min_size(egui::pos2(0.0, 50.0), egui::vec2(1200.0, 34.0)),
                     &mut trail,
                     BassEstimate::default(),
+                    MusicNoteColorScheme::default(),
                 );
             });
             assert!((trail[painted[0]] - old * BASS_MARKER_DECAY).abs() < 1e-6);

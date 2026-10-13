@@ -14928,7 +14928,7 @@ pub(crate) struct NormalFolderOmittedEntries {
     pub(crate) counts: folder_scan::OmittedFolderEntryCounts,
 }
 
-/// 静止画フルスクリーンの「その他の機能」パネルが所有する排他的な表示状態。
+/// 静止画・音楽フルスクリーンの「その他の機能」パネルが所有する排他的な表示状態。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum FsOverflowPanelState {
     #[default]
@@ -14936,6 +14936,7 @@ pub(crate) enum FsOverflowPanelState {
     Root,
     NavigatorPosition,
     SpreadAdjustment,
+    MusicNoteColor,
 }
 
 impl FsOverflowPanelState {
@@ -73278,6 +73279,9 @@ impl App {
     }
 
     pub(crate) fn clear_music_view_state(&mut self) {
+        if self.fs_overflow_panel_state == FsOverflowPanelState::MusicNoteColor {
+            self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+        }
         self.cancel_music_analysis();
         self.music_timeline_cache.clear();
         self.music_spectrum.clear();

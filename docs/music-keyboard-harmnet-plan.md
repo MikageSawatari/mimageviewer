@@ -979,7 +979,7 @@ raw log、`font-results.json`、最終ソース3本のGit blobは
 
 ## 15. 第 4 段階: 音名の配色と、音楽ビューの「…」メニュー (2026-10-14 追加)
 
-状態: 設計。利用者が方針を承認。実装前の独立レビュー待ち。
+状態: §15.5 の独立設計レビューと利用者の実装指示に基づき、pitch-lab で実装・自動検証完了。未コミット、利用者検収待ち。
 
 ### 15.1 背景と利用者の判断
 
@@ -1038,3 +1038,80 @@ GPT-6.1 Sol / xhigh (5 回目): ACCEPT WITH CHANGES (P1 なし)。本節が §15
 | P3 D5 の非同期切り替えと HUD 配置 | テストを足す: 旧方式の要求の処理中に切り替える、短時間に往復で切り替える、一時停止中に切り替える。最終的に最新の方式へ収束し、既存のテクスチャを保持して表示が欠けないこと。HUD のスナップショットは通常幅に加えて狭い幅で、「…」・Row・タイトル・閉じるボタンが重ならないこと |
 
 設計担当 (ClaudeCode) も D7 の変更が detached の述語・所有を変えない構造的な追加であることに同意する。
+
+### 15.6 実装記録（2026-10-14、pitch-lab、未コミット）
+
+配色は `music_note_color` に集約し、鍵盤・▼とタイムラインのベース／調へ方式を値で渡す。
+純計算の生成元は `src/music_note_color/compute.rs`、再生成用は
+`scripts/generate_music_note_colors.rs`。sRGB線形化→OKLab→OKLCH、中央2色のLの平均、
+低いLだけ補正、L／色相固定のchroma二分探索、最後に8bit量子化の順序を共有する。
+表生成だけを `Instant` で計測（ファイル出力を含まない）し、standalone Rust の
+`rustc --edition 2024 -O` は0.687ms、最適化なしは3.147msだった（初回は各0.580／2.891ms）。
+1msを超える条件があるため、初回UI生成を行わず事前生成したコンパイル時の定数表を採用する。
+配色表の参照ではUIにOKLab計算やI/Oを追加しない。全エントリと量子化境界で最終Color32のL誤差0.004を検査する。
+
+状態の簡素化は§15.5の共有パネルを採用し、静止画用と音楽用を排他的variantで分ける。
+配色変更のためのmodal／専用再構築・別版数は追加しない。表示の好み変更を既存の
+解析版数による再ラスタへ乗せれば、再生・一時停止・処理中の変更を既存cache ownerで扱えるため。
+再ラスタ中は表示済みtextureを保持する。まれな失敗は既定の割り切り方針とし、回復機構を足さない。
+
+`settings_transfer` の全Settingsフィールド分類にも新項目の登録が必要なため、既存のHUD設定と同じ
+非環境設定の除外項目へ登録した。転送元と転送先の配色を異なる値にし、転送先の配色保持も検査する。
+転送の対象を拡張する設計変更は行っていない。
+
+背面の音楽描画だけを常設の子UIで無効化し、親UIで描くメニューの操作性を保つ。
+子UIのIDは`UiBuilder::id_salt`と同じ規則の共通helperを使い、音声トラックpopupの
+producer／共通入力handler／既存HUDテストの参照を一致させる。
+通常wheelは既存の音量操作、Ctrl+wheelはRow、middle-dragはタイムラインという実経路で
+所有中・閉じるframe・閉鎖後のfresh入力を検査する。製品の通常wheel仕様は変更しない。
+
+検証のownerは実装担当。指定gateのログと結果を `target/pitch-stage4-validation/` に保存する。
+実アプリ起動・通常設定操作・`target/dev-runtime`への操作・コミットは、利用者の指定に従って行わない。
+`CHANGELOG.md` と `docs/next-release-backlog.md` は未変更。独立実装レビューと最終結果は本節へ追記する。
+
+#### UI画像の確認
+
+| PNG | 寸法／bytes | 変更理由・確認 |
+| --- | --- | --- |
+| `timeline_bass_partial_raster.png` | 240×80／1544 | ベース音の配色を共通表へ変更。1820px、x=8..147/y=23..35のみ変更。波形と未計算の灰色は保持 |
+| `timeline_key_states_raster.png` | 660×80／7799 | C長調を青から赤へ変更。3400px、x=424..623/y=47..63のみ変更。未計算／調なしは灰色のまま |
+| `music_overflow_hud_normal.png` | 820×300／15910 | 新規。全操作・Row・タイトル・「…」を通常幅で確認 |
+| `music_overflow_hud_narrow.png` | 320×300／8363 | 新規。既存操作を残し、タイトルのclipと操作の非重複を確認 |
+| `music_overflow_panel.png` | 820×300／22604 | 新規。「音名の色」、2択、選択中、閉じる操作の表示を確認 |
+
+5枚合計56220 bytes（新規3枚46877 bytes）。更新前後と新規PNGを実装担当・独立レビュー担当が目視確認した。
+狭幅compactは通常のメニューボタン付きHUDだけへ限定し、parked-liveの従来配置は維持する。
+実入力回帰はdisposable App fixture、画像は共通純描画関数を使うlib harnessで検査し、実アプリ確認とは区別する。
+
+#### 最終の自動確認
+
+全Cargo実行に`MSBUILDDISABLENODEREUSE=1`を付けた。ログと全実行履歴は
+`target/pitch-stage4-validation/`（`results.json`）。最終の成功結果は以下。
+
+| コマンド | exit／成功件数／ignored |
+| --- | --- |
+| `cargo fmt` | 0 |
+| `cargo fmt --check` | 0 |
+| `cargo test -p music-core` | 0／41／0（doc test 0） |
+| `cargo test -p mimageviewer --lib ui_music_spectrum::` | 0／28／1 |
+| `cargo test -p mimageviewer --lib ui_music_timeline::` | 0／31／1 |
+| `cargo test -p mimageviewer --lib music` | 0／183／2 |
+| `cargo test -p mimageviewer --lib ui_fullscreen` | 0／708／1 |
+| `cargo test -p mimageviewer --lib settings` | 0／570／13 |
+| `cargo test --test ui_snapshot` | 0／162／0 |
+| `cargo check -p mimageviewer --features portable` | 0 |
+| `python scripts/check_ui_glyphs.py` | 0／危険glyph 0 |
+
+追加の焦点確認は共通配色5件、既存の実音楽HUD12件、新メニュー14件が各exit0。
+新メニュー14件には純描画PNG3枚と、実音声トラックpopupの通常wheel（音量／ファイル移動）抑止を含む。
+新しいテストはignoredにしていない。PNGは更新時の2件／12件成功後、通常比較でも確認した。
+
+途中で見つかった分類登録・fixture型／viewport・子UI ID参照・分類総数の不備を修正し、
+影響範囲を再実行した。設計の期待値や製品の機能を緩めて合格させていない。
+最後の修正は分類件数のtest-only更新（全458／除外314、転送144は維持）のみで、
+無変更の製品コードと既に成功した関連テストの証拠を再利用する。native依存のビルド停止は発生していない。
+検証用実行ファイルのbuild／実機起動は`target/dev-runtime`禁止の利用者指定に従って行わない。
+設計逸脱なし。独立実装レビュー（GPT-6.1 Sol／xhigh）は **ACCEPT**、未解決のP1/P2なし。
+配色・設定保持・非同期再ラスタ・入力所有と終了経路・HUD・parked-liveの既存配置保持、
+音声トラックpopupの実入力回帰、最終gateログと5枚のPNGを確認した。
+最後の分類件数テストだけの変更に対する、他の成功証拠の再利用も確認済み。

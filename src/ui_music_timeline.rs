@@ -13,6 +13,8 @@
 //! HarmNet track を使い、リズム区間の投票と既存の重みを維持する。投票結果は texture と
 //! 一緒に保持して、ホバーの音名を表示中の色と一致させる。egui 依存があるため本体側で持つ。
 
+use crate::music_note_color::{MusicNoteColorScheme, note_color};
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -140,6 +142,7 @@ struct TimelineRasterRequest {
     /// 数千 bin をコピーしない)。
     analysis: Arc<TimelineAnalysis>,
     bass: Option<Arc<TimelineBassTrack>>,
+    scheme: MusicNoteColorScheme,
     #[cfg(test)]
     queued_at: std::time::Instant,
 }
@@ -308,6 +311,7 @@ impl TimelineTextureCache {
         row: usize,
         row_secs: f64,
         key: TimelineTextureCacheKey,
+        scheme: MusicNoteColorScheme,
     ) -> (Option<(&egui::TextureHandle, usize)>, bool) {
         self.ensure(key);
         if row >= self.rows.len() {
@@ -341,6 +345,7 @@ impl TimelineTextureCache {
                     key,
                     analysis: Arc::clone(analysis),
                     bass: bass.clone(),
+                    scheme,
                     #[cfg(test)]
                     queued_at: std::time::Instant::now(),
                 };
@@ -407,6 +412,17 @@ fn run_timeline_raster_worker(
     result_tx: mpsc::Sender<TimelineRasterResult>,
     cancel: Arc<AtomicBool>,
 ) {
+    run_timeline_raster_worker_with_publish_hook(request_rx, result_tx, cancel, |_| {});
+}
+
+// The production worker uses a no-op hook. Tests pause publication to exercise
+// a real old-palette request deterministically, without product timing/sleeps.
+fn run_timeline_raster_worker_with_publish_hook(
+    request_rx: mpsc::Receiver<TimelineRasterRequest>,
+    result_tx: mpsc::Sender<TimelineRasterResult>,
+    cancel: Arc<AtomicBool>,
+    before_publish: impl Fn(&TimelineRasterResult),
+) {
     while !cancel.load(Ordering::Relaxed) {
         let request = match request_rx.recv() {
             Ok(request) => request,
@@ -435,26 +451,26 @@ fn run_timeline_raster_worker(
             request.key.gap_px,
             request.key.metrics_h_px,
             request.key.dark,
+            request.scheme,
         );
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        if result_tx
-            .send(TimelineRasterResult {
-                generation: request.generation,
-                row_version: request.row_version,
-                row: request.row,
-                key: request.key,
-                image,
-                represented_bins,
-                bass_hints,
-                #[cfg(test)]
-                queue_wait,
-                #[cfg(test)]
-                raster_time: raster_started.elapsed(),
-            })
-            .is_err()
-        {
+        let result = TimelineRasterResult {
+            generation: request.generation,
+            row_version: request.row_version,
+            row: request.row,
+            key: request.key,
+            image,
+            represented_bins,
+            bass_hints,
+            #[cfg(test)]
+            queue_wait,
+            #[cfg(test)]
+            raster_time: raster_started.elapsed(),
+        };
+        before_publish(&result);
+        if result_tx.send(result).is_err() {
             break;
         }
     }
@@ -502,6 +518,7 @@ pub fn draw_music_timeline(
     // ラベルをパネルトリガ帯 (= seek 不要領域) に載せ、波形は中央領域を全幅使う
     // (実機 FB 2026-07)。ラベルは波形左端に右寄せで描く。
     left_label_w: f32,
+    scheme: MusicNoteColorScheme,
 ) -> MusicTimelineOutcome {
     let mut seek_request = None;
     let row_secs = row_secs.max(1.0);
@@ -636,7 +653,8 @@ pub fn draw_music_timeline(
         if !cache.row_is_fresh(row, texture_key) {
             pending_raster = true;
         }
-        let (_, request_sent) = cache.row_texture(analysis, bass, row, row_secs, texture_key);
+        let (_, request_sent) =
+            cache.row_texture(analysis, bass, row, row_secs, texture_key, scheme);
         if request_sent {
             pending_raster = true;
         }
@@ -649,7 +667,7 @@ pub fn draw_music_timeline(
             pending_raster = true;
         }
         let (row_texture, request_sent) =
-            cache.row_texture(analysis, bass, row, row_secs, texture_key);
+            cache.row_texture(analysis, bass, row, row_secs, texture_key, scheme);
         if request_sent {
             pending_raster = true;
         }
@@ -1053,7 +1071,17 @@ pub(crate) fn render_timeline_row_image(
     _dark: bool,
 ) -> (egui::ColorImage, usize) {
     let (image, represented_bins, _) = render_timeline_row_with_hints(
-        row_start, row_secs, bins, bass, seek_strip, width, waveform_h, gap_h, metrics_h, _dark,
+        row_start,
+        row_secs,
+        bins,
+        bass,
+        seek_strip,
+        width,
+        waveform_h,
+        gap_h,
+        metrics_h,
+        _dark,
+        MusicNoteColorScheme::default(),
     );
     (image, represented_bins)
 }
@@ -1070,6 +1098,7 @@ fn render_timeline_row_with_hints(
     gap_h: usize,
     metrics_h: usize,
     _dark: bool,
+    scheme: MusicNoteColorScheme,
 ) -> (egui::ColorImage, usize, Vec<TimelineBassDisplayBin>) {
     let height = waveform_h + gap_h + metrics_h;
     let bg = timeline_bg();
@@ -1281,6 +1310,7 @@ fn render_timeline_row_with_hints(
             bin,
             bass_hints[visible_idx].unwrap_or_default(),
             key_hints[visible_idx].unwrap_or_default(),
+            scheme,
         );
     }
 
@@ -1733,6 +1763,7 @@ fn draw_timeline_metric_bins(
     bin: &WaveformBin,
     bass_hint: TimelinePitchHint,
     key_hint: TimelineKeyHint,
+    scheme: MusicNoteColorScheme,
 ) {
     if metrics_h == 0 {
         return;
@@ -1757,7 +1788,7 @@ fn draw_timeline_metric_bins(
             bar_top,
             x1,
             lane_bottom,
-            timeline_metric_color(kind, value, bin, bass_hint, key_hint),
+            timeline_metric_color(kind, value, bin, bass_hint, key_hint, scheme),
         );
         if idx > 0 {
             fill_rect_f32(
@@ -1904,6 +1935,7 @@ fn timeline_metric_color(
     _bin: &WaveformBin,
     bass_hint: TimelinePitchHint,
     key_hint: TimelineKeyHint,
+    scheme: MusicNoteColorScheme,
 ) -> egui::Color32 {
     let value = value.clamp(0.0, 1.0);
     let base = match kind {
@@ -1911,7 +1943,7 @@ fn timeline_metric_color(
             let color_value = (bass_hint.confidence * 0.78).clamp(0.32, 0.74);
             return color_with_alpha(
                 brighten_color(
-                    key_color(60 + bass_hint.pitch_class % 12, color_value),
+                    note_color(60 + bass_hint.pitch_class % 12, color_value, scheme),
                     0.86 + value * 0.16 + bass_hint.confidence * 0.12,
                 ),
                 (86.0 + value * 70.0 + bass_hint.confidence * 28.0).min(202.0) as u8,
@@ -1924,7 +1956,7 @@ fn timeline_metric_color(
             let color_value = (0.36 + key_hint.confidence * 0.38).min(0.74);
             return color_with_alpha(
                 brighten_color(
-                    key_color(60 + key_hint.pitch_class % 12, color_value),
+                    note_color(60 + key_hint.pitch_class % 12, color_value, scheme),
                     0.78 + key_hint.confidence * 0.30,
                 ),
                 (70.0 + key_hint.confidence * 120.0).min(190.0) as u8,
@@ -2253,37 +2285,6 @@ fn pitch_class_name(pitch_class: u8) -> &'static str {
     NAMES[pitch_class as usize % 12]
 }
 
-fn key_color(midi: u8, value: f32) -> egui::Color32 {
-    let pitch_class = midi % 12;
-    let fifth_index = ((pitch_class as usize * 7) % 12) as f32;
-    let hue = (fifth_index / 12.0 + 0.57) % 1.0;
-    let saturation = 0.62 + value.clamp(0.0, 1.0) * 0.28;
-    let brightness = 0.38 + value.clamp(0.0, 1.0) * 0.58;
-    hsv_to_rgb(hue, saturation, brightness)
-}
-
-fn hsv_to_rgb(h: f32, s: f32, v: f32) -> egui::Color32 {
-    let h = h.rem_euclid(1.0) * 6.0;
-    let i = h.floor() as i32;
-    let f = h - i as f32;
-    let p = v * (1.0 - s);
-    let q = v * (1.0 - s * f);
-    let t = v * (1.0 - s * (1.0 - f));
-    let (r, g, b) = match i.rem_euclid(6) {
-        0 => (v, t, p),
-        1 => (q, v, p),
-        2 => (p, v, t),
-        3 => (p, q, v),
-        4 => (t, p, v),
-        _ => (v, p, q),
-    };
-    egui::Color32::from_rgb(
-        (r.clamp(0.0, 1.0) * 255.0) as u8,
-        (g.clamp(0.0, 1.0) * 255.0) as u8,
-        (b.clamp(0.0, 1.0) * 255.0) as u8,
-    )
-}
-
 fn spectral_weights(band: [f32; 3]) -> [f32; 3] {
     let low = (band[0] * 0.95).sqrt().clamp(0.0, 1.0);
     let mid = (band[1] * 0.88).sqrt().clamp(0.0, 1.0);
@@ -2460,6 +2461,7 @@ mod tests {
             0,
             20,
             true,
+            MusicNoteColorScheme::default(),
         )
     }
 
@@ -2750,14 +2752,16 @@ mod tests {
                 0.0,
                 bin,
                 Default::default(),
-                Default::default()
+                Default::default(),
+                MusicNoteColorScheme::default()
             ),
             timeline_metric_color(
                 TimelineMetricKind::LoudnessBassRoot,
                 0.0,
                 bin,
                 Default::default(),
-                Default::default()
+                Default::default(),
+                MusicNoteColorScheme::default()
             )
         );
         let absent = bass_boundary_raster(None).0;
@@ -2902,6 +2906,178 @@ mod tests {
     }
 
     #[test]
+    fn note_color_scheme_switch_during_old_request_retains_texture_and_converges() {
+        exercise_note_color_switch(&[MusicNoteColorScheme::Chromatic]);
+    }
+
+    #[test]
+    fn note_color_scheme_rapid_roundtrip_converges_to_latest_request() {
+        exercise_note_color_switch(&[
+            MusicNoteColorScheme::Chromatic,
+            MusicNoteColorScheme::Fifths,
+            MusicNoteColorScheme::Chromatic,
+        ]);
+    }
+
+    fn exercise_note_color_switch(schemes: &[MusicNoteColorScheme]) {
+        use std::time::{Duration, Instant};
+        let timeout = Duration::from_secs(10);
+        let analysis = Arc::new(TimelineAnalysis {
+            bins: bass_boundary_bins(),
+            ..Default::default()
+        });
+        let mut track = TimelineBassTrack::new(40 * 48_000, 48_000);
+        assert!(track.merge_segment(bass_segment(&track, 0, 45)));
+        let bass = Some(Arc::new(track));
+        let ctx = egui::Context::default();
+        let mut cache = TimelineTextureCache::default();
+        let mut key = measurement_key(1, 30.0);
+        key.width_px = 200;
+        cache.ensure(key);
+        cache.cancel_worker();
+        let (request_tx, request_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        cache.raster_tx = Some(request_tx);
+        cache.raster_rx = Some(result_rx);
+        cache.raster_cancel = Some(Arc::clone(&cancel));
+        let worker = std::thread::spawn(move || {
+            run_timeline_raster_worker_with_publish_hook(request_rx, result_tx, cancel, |result| {
+                ready_tx
+                    .send((result.row_version, result.image.clone()))
+                    .unwrap();
+                release_rx.recv_timeout(timeout).unwrap();
+            });
+        });
+        let expected_image = |scheme| {
+            render_timeline_row_with_hints(
+                0.0,
+                30.0,
+                &analysis.bins,
+                bass.as_deref(),
+                None,
+                key.width_px,
+                key.waveform_h_px,
+                key.gap_px,
+                key.metrics_h_px,
+                key.dark,
+                scheme,
+            )
+            .0
+        };
+        let adopt_next = |cache: &mut TimelineTextureCache| {
+            let received_before = cache.raster_measurement.received;
+            release_tx.send(()).unwrap();
+            let deadline = Instant::now() + timeout;
+            while cache.raster_measurement.received == received_before {
+                assert!(Instant::now() < deadline, "publication stalled");
+                cache.poll_finished_rows(&ctx, 1);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+
+        cache.note_analysis_identity(1);
+        cache.row_texture(&analysis, &bass, 0, 30.0, key, MusicNoteColorScheme::Fifths);
+        let (_, first_image) = ready_rx.recv_timeout(timeout).unwrap();
+        assert_eq!(
+            first_image.pixels,
+            expected_image(MusicNoteColorScheme::Fifths).pixels
+        );
+        adopt_next(&mut cache);
+        let first_texture_id = cache.rows[0].as_ref().unwrap().texture.id();
+
+        // A real old-scheme raster is processing; its publication is held by the
+        // hook while newer requests are submitted through the production cache.
+        cache.note_analysis_identity(2);
+        cache.row_texture(&analysis, &bass, 0, 30.0, key, MusicNoteColorScheme::Fifths);
+        let (_, old_image) = ready_rx.recv_timeout(timeout).unwrap();
+        assert_eq!(old_image.pixels, first_image.pixels);
+        for (index, &scheme) in schemes.iter().enumerate() {
+            cache.note_analysis_identity(index as u64 + 3);
+            let (shown, sent) = cache.row_texture(&analysis, &bass, 0, 30.0, key, scheme);
+            assert!(sent);
+            assert_eq!(shown.unwrap().0.id(), first_texture_id);
+            assert_eq!(
+                cache.generation, 1,
+                "palette change must not clear the cache"
+            );
+        }
+        adopt_next(&mut cache);
+        assert!(!cache.row_is_fresh(0, key));
+        for (index, &scheme) in schemes.iter().enumerate() {
+            let (row_version, image) = ready_rx.recv_timeout(timeout).unwrap();
+            assert_eq!(row_version, index as u64 + 3);
+            assert_eq!(image.pixels, expected_image(scheme).pixels);
+            assert!(cache.rows[0].is_some());
+            adopt_next(&mut cache);
+        }
+        assert!(cache.row_is_fresh(0, key));
+        assert_eq!(
+            cache.rows[0].as_ref().unwrap().row_version,
+            schemes.len() as u64 + 2
+        );
+        cache.clear();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn note_color_scheme_paused_draw_keeps_existing_rows_and_requests_new_palette() {
+        use std::time::{Duration, Instant};
+        let analysis = Arc::new(TimelineAnalysis {
+            bins: bass_boundary_bins(),
+            ..Default::default()
+        });
+        let mut track = TimelineBassTrack::new(40 * 48_000, 48_000);
+        assert!(track.merge_segment(bass_segment(&track, 0, 45)));
+        let bass = Some(Arc::new(track));
+        let ctx = egui::Context::default();
+        let mut cache = TimelineTextureCache::default();
+        let frame = |cache: &mut TimelineTextureCache, version, scheme| {
+            let mut drawn = 0;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(600.0, 400.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let outcome = draw_music_timeline(
+                        ui, &analysis, &bass, version, 30.0, 20.0, false, false, cache, 30.0, true,
+                        0.0, scheme,
+                    );
+                    drawn = outcome.displayed_texture_rows;
+                });
+            });
+            drawn
+        };
+        frame(&mut cache, 1, MusicNoteColorScheme::Fifths);
+        let key = cache.key.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !cache.row_is_fresh(0, key) {
+            assert!(Instant::now() < deadline);
+            cache.poll_finished_rows(&ctx, 1);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let old_texture = cache.rows[0].as_ref().unwrap().texture.id();
+        assert_eq!(frame(&mut cache, 2, MusicNoteColorScheme::Chromatic), 1);
+        assert_eq!(cache.rows[0].as_ref().unwrap().texture.id(), old_texture);
+        assert!(!cache.row_is_fresh(0, key));
+        assert!(cache.pending[0].is_some());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !cache.row_is_fresh(0, key) {
+            assert!(Instant::now() < deadline);
+            cache.poll_finished_rows(&ctx, 1);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_ne!(cache.rows[0].as_ref().unwrap().texture.id(), old_texture);
+        assert_eq!(frame(&mut cache, 2, MusicNoteColorScheme::Chromatic), 1);
+    }
+
+    #[test]
     fn bass_worker_cache_keeps_hover_vote_with_displayed_texture() {
         let analysis = Arc::new(TimelineAnalysis {
             bins: bass_boundary_bins(),
@@ -2913,7 +3089,14 @@ mod tests {
         let ctx = egui::Context::default();
         let mut cache = TimelineTextureCache::default();
         let key = measurement_key(1, 30.0);
-        cache.row_texture(&analysis, &bass, 0, 30.0, key);
+        cache.row_texture(
+            &analysis,
+            &bass,
+            0,
+            30.0,
+            key,
+            MusicNoteColorScheme::default(),
+        );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !cache.row_is_fresh(0, key) {
             assert!(
@@ -2944,7 +3127,14 @@ mod tests {
         let key = measurement_key(1, 30.0);
         let adopt = |cache: &mut TimelineTextureCache, track: &TimelineBassTrack, version| {
             cache.note_analysis_identity(version);
-            cache.row_texture(&analysis, &Some(Arc::new(track.clone())), 0, 30.0, key);
+            cache.row_texture(
+                &analysis,
+                &Some(Arc::new(track.clone())),
+                0,
+                30.0,
+                key,
+                MusicNoteColorScheme::default(),
+            );
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while !cache.row_is_fresh(0, key) {
                 assert!(std::time::Instant::now() < deadline);
@@ -3150,6 +3340,7 @@ mod tests {
                 key.gap_px,
                 key.metrics_h_px,
                 key.dark,
+                MusicNoteColorScheme::default(),
             );
             bass_display_hint_at_time(&hints, 65.0)
         };
@@ -3246,7 +3437,14 @@ mod tests {
                             cache.ensure(key);
                             cache.note_analysis_identity(arrivals as u64);
                             for &row in &request_rows {
-                                cache.row_texture(&analysis, &bass, row, row_secs, key);
+                                cache.row_texture(
+                                    &analysis,
+                                    &bass,
+                                    row,
+                                    row_secs,
+                                    key,
+                                    MusicNoteColorScheme::default(),
+                                );
                             }
                         }
                         let backlog =

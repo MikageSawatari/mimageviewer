@@ -5896,6 +5896,9 @@ pub struct Settings {
     /// (位置復元マトリクス「音声 × 移動」。既定 = 最初から。誤って別曲へ行って戻っても頭から)
     #[serde(default = "default_resume_from_start")]
     pub music_nav_resume: ResumeMode,
+    /// Pitch-class palette selected from the music HUD.
+    #[serde(default)]
+    pub music_note_color_scheme: crate::music_note_color::MusicNoteColorScheme,
     /// ユーザーが開いた本 / 動画 / 音声を閲覧履歴に記録するか。
     #[serde(default = "default_true")]
     pub reading_history_enabled: bool,
@@ -7923,6 +7926,7 @@ impl Default for Settings {
             book_nav_resume: ResumeMode::FromStart,
             music_open_resume: ResumeMode::FromStart,
             music_nav_resume: ResumeMode::FromStart,
+            music_note_color_scheme: Default::default(),
             reading_history_enabled: true,
             reading_history_limit: default_reading_history_limit(),
             video_hw_decode: true,
@@ -10286,6 +10290,8 @@ impl Settings {
         // UI 表示倍率は設定メニューから即時変更するため、環境設定ダイアログを開いたまま
         // 変更しても OK 押下時の古い snapshot で巻き戻さない。
         self.ui_scale_factor = src.ui_scale_factor;
+        // Music HUD edits must survive an older preferences snapshot.
+        self.music_note_color_scheme = src.music_note_color_scheme;
         // ── ツールバー カスタマイズ (v2.0.0: 環境設定ではなくツールバー右クリックで編集) ──
         // 表示/非表示・並び順・行頭・表示形式・出す項目は、環境設定ダイアログを開いている
         // 間にも右クリックメニューから変更できる。OK 押下時に旧 snapshot で巻き戻らないよう、
@@ -10908,6 +10914,39 @@ mod tests {
             stored.image_ext_priority,
             loaded.settings.image_ext_priority
         );
+    }
+
+    #[test]
+    fn music_note_color_defaults_roundtrips_and_survives_preferences_merge() {
+        use crate::music_note_color::MusicNoteColorScheme;
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.music_note_color_scheme, MusicNoteColorScheme::Fifths);
+        assert_eq!(
+            Settings::default().music_note_color_scheme,
+            MusicNoteColorScheme::Fifths
+        );
+        for scheme in [
+            MusicNoteColorScheme::Fifths,
+            MusicNoteColorScheme::Chromatic,
+        ] {
+            let mut live = Settings {
+                music_note_color_scheme: scheme,
+                ..Settings::default()
+            };
+            let restored: Settings =
+                serde_json::from_str(&serde_json::to_string(&live).unwrap()).unwrap();
+            assert_eq!(restored.music_note_color_scheme, scheme);
+            let mut stale_draft = Settings {
+                music_note_color_scheme: if scheme == MusicNoteColorScheme::Fifths {
+                    MusicNoteColorScheme::Chromatic
+                } else {
+                    MusicNoteColorScheme::Fifths
+                },
+                ..Settings::default()
+            };
+            stale_draft.overwrite_non_preferences_from(&mut live);
+            assert_eq!(stale_draft.music_note_color_scheme, scheme);
+        }
     }
 
     #[test]
