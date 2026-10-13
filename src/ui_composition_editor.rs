@@ -768,7 +768,18 @@ fn unit_list(
     thumbnails: &mut Vec<usize>,
 ) {
     ui.label(format!("編集する見開き ({}組)", view.units.len()));
-    let row_height = 110.0;
+    // The row holds the "N組目" heading and one line of page cards; both heights
+    // come from the current fonts so the cards never spill into the next row.
+    let label_height = ui
+        .painter()
+        .layout_no_wrap("0".to_owned(), page_card_label_font(), Color32::WHITE)
+        .size()
+        .y;
+    let row_height = 12.0
+        + ui.text_style_height(&egui::TextStyle::Body)
+        + ui.spacing().item_spacing.y
+        + page_card_height(label_height)
+        + 6.0;
     egui::ScrollArea::vertical()
         .id_salt("composition_units")
         .max_height(height)
@@ -845,6 +856,18 @@ fn unit_list(
         });
 }
 
+const PAGE_CARD_WIDTH: f32 = 76.0;
+const PAGE_CARD_THUMB_HEIGHT: f32 = 52.0;
+const PAGE_CARD_LABEL_GAP: f32 = 3.0;
+
+fn page_card_label_font() -> egui::FontId {
+    egui::FontId::proportional(12.0)
+}
+
+fn page_card_height(label_height: f32) -> f32 {
+    PAGE_CARD_THUMB_HEIGHT + PAGE_CARD_LABEL_GAP + label_height
+}
+
 fn page_card(
     ui: &mut egui::Ui,
     view: &EditorView,
@@ -856,22 +879,41 @@ fn page_card(
     let Some(page) = view.pages.get(id) else {
         return;
     };
-    let (rect, r) = ui.allocate_exact_size(egui::vec2(76.0, 70.0), Sense::click_and_drag());
+    // The label gets its own band under the thumbnail, sized from the laid-out
+    // text. A fixed card height let the label overlap the image with larger fonts.
+    let label = ui.painter().layout_no_wrap(
+        if page.missing {
+            "見つからないページ".to_owned()
+        } else {
+            format!("{}ページ", page.physical_number)
+        },
+        page_card_label_font(),
+        ui.visuals().text_color(),
+    );
+    let width = PAGE_CARD_WIDTH.max(label.size().x);
+    let (rect, r) = ui.allocate_exact_size(
+        egui::vec2(width, page_card_height(label.size().y)),
+        Sense::click_and_drag(),
+    );
+    let thumb_rect = egui::Rect::from_min_size(rect.min, egui::vec2(width, PAGE_CARD_THUMB_HEIGHT));
     if let Some((texture, size)) = page
         .thumbnail
         .filter(|_| !page.excluded_by_policy && !page.missing)
     {
-        let fit =
-            size * (rect.width() / size.x.max(1.0)).min((rect.height() - 17.0) / size.y.max(1.0));
+        let fit = size
+            * (thumb_rect.width() / size.x.max(1.0)).min(thumb_rect.height() / size.y.max(1.0));
         ui.painter().image(
             texture,
-            egui::Rect::from_center_size(rect.center() - egui::vec2(0.0, 8.0), fit),
+            egui::Rect::from_center_size(thumb_rect.center(), fit),
             egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
             Color32::WHITE,
         );
     } else {
-        ui.painter()
-            .rect_filled(rect.shrink(1.0), 3.0, ui.visuals().widgets.inactive.bg_fill);
+        ui.painter().rect_filled(
+            thumb_rect.shrink(1.0),
+            3.0,
+            ui.visuals().widgets.inactive.bg_fill,
+        );
         if !page.excluded_by_policy
             && !page.missing
             && thumbnails.len() < 24
@@ -880,17 +922,12 @@ fn page_card(
             thumbnails.push(id);
         }
     }
-    ui.painter().text(
-        rect.center_bottom() - egui::vec2(0.0, 2.0),
-        egui::Align2::CENTER_BOTTOM,
-        if page.missing {
-            "見つからないページ".to_owned()
-        } else {
-            format!("{}ページ", page.physical_number)
-        },
-        egui::FontId::proportional(12.0),
-        ui.visuals().text_color(),
+    let label_pos = egui::pos2(
+        rect.center().x - label.size().x / 2.0,
+        thumb_rect.bottom() + PAGE_CARD_LABEL_GAP,
     );
+    ui.painter()
+        .galley(label_pos, label, ui.visuals().text_color());
     if state.selected_pages.contains(&id) {
         ui.painter().rect_stroke(
             rect,
