@@ -14,10 +14,32 @@ enum Completion {
     List { folder: Option<PathBuf> },
     Viewer,
 }
+#[derive(Debug)]
 enum Exit {
     None,
     Root,
+    #[cfg(windows)]
+    TrayHide,
     OwnerRetired,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaitReason {
+    Manifest,
+    PriorSaves,
+    SourceColumn,
+    MetadataPreparation,
+    Confirmation,
+    ImageCopy,
+    MetadataSaves,
+    SourceKeys,
+    SourceReads,
+    SourceAdoption,
+    ResumeRead,
+    FavoriteCopy,
+    ParentScan,
+    ParentHydration,
+    Terminal,
 }
 enum WorkerView {
     Preparing,
@@ -143,7 +165,8 @@ enum Phase {
     AwaitCaches {
         result: Result<(), String>,
     },
-    Selecting,
+    ParentScan(super::FolderPaneOpenPending),
+    ParentHydration(mpsc::Receiver<()>),
     Result {
         message: String,
         success: bool,
@@ -153,12 +176,12 @@ pub(crate) struct Operation {
     owner: ViewerContextId,
     purpose: Purpose,
     completion: Completion,
-    generation: u64,
     source: PathBuf,
     destination: PathBuf,
     control: Arc<zip::ConversionControl>,
     _lease: Option<crate::remote_ipc::session::LocalModalLease>,
     exit: Exit,
+    last_wait: Option<WaitReason>,
     phase: Phase,
 }
 impl App {
@@ -209,12 +232,12 @@ impl App {
             } else {
                 Purpose::FolderContext
             },
-            generation: self.items_generation,
             source,
             destination,
             control: Default::default(),
             _lease: lease,
             exit: Exit::None,
+            last_wait: None,
             phase: Phase::Result {
                 message: String::new(),
                 success: false,
@@ -239,7 +262,23 @@ impl App {
         if ctx.input(|input| input.viewport().close_requested()) {
             if let Some(op) = self.image_folder_zip_operation.as_mut() {
                 op.exit = Exit::Root;
+                #[cfg(windows)]
+                if self.settings.minimize_to_tray_on_close
+                    && self
+                        .tray_controller
+                        .as_ref()
+                        .is_some_and(|tc| !tc.is_quit_requested())
+                    && !self
+                        .shutdown_requested
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    op.exit = Exit::TrayHide;
+                }
                 op.cancel();
+                crate::logger::log(format!(
+                    "folder_zip_close owner={:?} wait={:?} exit={:?}",
+                    op.owner, op.last_wait, op.exit,
+                ));
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             }
         }
@@ -425,7 +464,7 @@ impl App {
                             self.notify_bookmarks_changed();
                             self.invalidate_tag_apply_suggestions();
                         }
-                        self.begin_metadata_import_terminal_refresh();
+                        self.begin_image_zip_terminal_refresh();
                         Phase::RefreshIndex {
                             result: result.map(|_| ()),
                             keys,
@@ -459,7 +498,7 @@ impl App {
                 keys,
                 edits,
             } => {
-                if !self.advance_metadata_import_terminal_refresh(&op.source, false) {
+                if !self.advance_image_zip_terminal_refresh(&keys) {
                     Phase::RefreshIndex {
                         result,
                         keys,
@@ -561,58 +600,34 @@ impl App {
                     self.finish_image_zip_adoption(ctx, &op, result)
                 }
             }
-            Phase::Selecting => {
-                // Consume our own already-admitted scan through the same navigation tail.
-                // The operation is temporarily owned here, so only this continuation can open.
-                if let Some(ready) = self.poll_folder_pane_open(ctx) {
-                    if let Some(ready) = self.resolve_main_folder_open_ready(ctx, ready) {
-                        self.open_direct_navigation_target(
-                            ready.path,
-                            Some(ready.scan),
-                            super::OpenRequestOwner::Navigation,
-                            ready.navigation,
-                            ready.epub_restore,
-                            ready.restore_intent,
-                        );
+            Phase::ParentScan(mut pending) => {
+                if !matches!(op.exit, Exit::None) {
+                    pending.cancel_with_diagnostic("folder_zip_close");
+                    op.success()
+                } else {
+                    match pending.rx.try_recv() {
+                        Ok(Ok(scan)) => self.adopt_image_zip_parent_scan(&op, pending, scan),
+                        Ok(Err(error)) => op.failed(format!("親一覧の読取: {error}")),
+                        Err(mpsc::TryRecvError::Empty) => Phase::ParentScan(pending),
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            op.failed("親のフォルダを読み取れませんでした。".into())
+                        }
                     }
                 }
-
-                let ready = self
-                    .with_viewer_context_ref(op.owner, |viewer| {
-                        viewer.items_generation() != op.generation
-                            && viewer.current_folder() == op.source.parent()
-                    })
-                    .unwrap_or(false);
-                if ready
-                    && !self.folder_open_preparation_pending()
-                    && !self.sidecar_restore_active()
-                {
-                    let _ = self.with_viewer_context(op.owner, |app| {
-                        if let Some(idx) = app.visible_indices.iter().copied().find(|&idx| {
-                            app.items
-                                .get(idx)
-                                .and_then(|item| item.container_path())
-                                .is_some_and(|path| {
-                                    crate::folder_tree::path_eq(path, &op.destination)
-                                })
-                        }) {
-                            app.selected = Some(idx);
-                            app.checked.clear();
-                            app.scroll_to_selected = true;
-                        }
-                    });
-                    op.success()
-                } else if matches!(
-                    self.viewer_context_residence(op.owner),
-                    super::ContextResidence::Mounted | super::ContextResidence::AtRest
-                ) {
-                    Phase::Selecting
-                } else {
+            }
+            Phase::ParentHydration(completed) => match completed.try_recv() {
+                Ok(()) => op.success(),
+                Err(mpsc::TryRecvError::Empty) => Phase::ParentHydration(completed),
+                Err(mpsc::TryRecvError::Disconnected) if !matches!(op.exit, Exit::None) => {
                     op.success()
                 }
-            }
+                Err(mpsc::TryRecvError::Disconnected) => op.failed(
+                    "親の一覧の更新を完了できませんでした。作成先を開き直してください。".into(),
+                ),
+            },
             phase => phase,
         };
+        op.log_wait(self);
         if matches!(op.phase, Phase::Result { .. }) && !matches!(op.exit, Exit::None) {
             self.resume_metadata_transfer_context_readers();
             if let Phase::Result { message, .. } = &op.phase {
@@ -620,6 +635,10 @@ impl App {
             }
             if matches!(op.exit, Exit::Root) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            #[cfg(windows)]
+            if matches!(op.exit, Exit::TrayHide) {
+                self.hide_to_tray(ctx);
             }
         } else {
             if !matches!(op.phase, Phase::Result { .. }) {
@@ -703,6 +722,7 @@ impl App {
             let mut target = source.clone();
             target.id = uuid::Uuid::new_v4();
             target.path = op.destination.clone();
+            target.name = format!("{} (ZIP)", source.name);
             if let Some(existing) = self
                 .settings
                 .favorites
@@ -784,10 +804,80 @@ impl App {
                     app.close_fullscreen();
                     app.start_folder_pane_open(op.source.parent().unwrap().to_owned());
                 });
-                return Phase::Selecting;
+                // Move the accepted scan owner, including its navigation proof, into this
+                // operation. The normal navigation tail never sees or consumes its receiver.
+                return match self.folder_pane_open_pending.take() {
+                    Some(pending) => Phase::ParentScan(pending),
+                    None => op.failed("親のフォルダの読取を開始できませんでした。".into()),
+                };
             }
         }
         op.success()
+    }
+
+    fn adopt_image_zip_parent_scan(
+        &mut self,
+        op: &Operation,
+        pending: super::FolderPaneOpenPending,
+        scan: super::ScannedDir,
+    ) -> Phase {
+        use super::*;
+        if op.owner != self.projected_viewer_context_id() {
+            return op.failed("一覧の表示先が変更されました。作成先を開き直してください。".into());
+        }
+        let Some(mut navigation) = pending.navigation else {
+            return op.failed("親一覧の移動先を確認できませんでした。".into());
+        };
+        navigation.history =
+            MainHistoryOperation::Direct(DirectNavigationPurpose::ExitTemporaryView {
+                selection: crate::ui_dialogs::context_menu::JumpToFolderSelection::None,
+            });
+        let path = pending.path;
+        let destination = self.main_list_requested_destination(
+            &navigation,
+            FolderNavHistoryTarget::Path(path.clone()),
+            None,
+        );
+        let Some(adoption) = self.prepare_main_list_adoption(navigation, destination) else {
+            return op.failed("元の一覧が変更されました。作成先を開き直してください。".into());
+        };
+        // A successful directory scan is the classification proof. Suffixes such as .epub
+        // do not create a second classifier whose poll would be blocked by this modal.
+        let now = std::time::Instant::now();
+        let prepared = self.prepare_scanned_folder_listing_with_cache_keys(
+            path.clone(),
+            scan,
+            FolderListingMetrics {
+                seq: self.input_seq,
+                started: now,
+                scan_started: now,
+                pre_scanned: true,
+                path_display: String::new(),
+            },
+            StartupListIntent::ExplicitList,
+            use_full_path_cache_keys_for_folder(&path),
+        );
+        let token = match self.prepare_visible_install(&path, &prepared.items, None) {
+            Ok(token) => token,
+            Err(reason) => return op.failed(format!("親一覧の採用: {reason:?}")),
+        };
+        let (completed, receipt) = mpsc::channel();
+        self.adopt_main_list_navigation_with_completion(
+            adoption,
+            move |app| {
+                app.install_admitted_physical_surface(&path, &OpenRequestOwner::Navigation, None);
+                app.install_prepared_scanned_folder_listing(
+                    prepared,
+                    VisibleInstallAuthority::Ordinary,
+                    token,
+                )
+            },
+            Some(MainListAfterHydration::ImageFolderZip {
+                destination: op.destination.clone(),
+                completed,
+            }),
+        );
+        Phase::ParentHydration(receipt)
     }
     fn apply_image_zip_source_chunk(&mut self, chunk: SourceChunk) {
         let _ = self.with_viewer_context(chunk.context, |app| {
@@ -876,7 +966,8 @@ impl App {
             | Phase::Refresh { .. }
             | Phase::Apply { .. }
             | Phase::AwaitCaches { .. }
-            | Phase::Selecting => ui::Phase::Adopting,
+            | Phase::ParentScan(..)
+            | Phase::ParentHydration(..) => ui::Phase::Adopting,
             Phase::Result { message, success } => ui::Phase::Result {
                 message,
                 success: *success,
@@ -889,7 +980,8 @@ impl App {
                     | Phase::Refresh { .. }
                     | Phase::Apply { .. }
                     | Phase::AwaitCaches { .. }
-                    | Phase::Selecting
+                    | Phase::ParentScan(..)
+                    | Phase::ParentHydration(..)
             );
         let draw = || {
             ui::draw(
@@ -936,6 +1028,38 @@ impl App {
     }
 }
 impl Operation {
+    fn log_wait(&mut self, app: &App) {
+        let reason = match &self.phase {
+            Phase::Preparing(..) => WaitReason::Manifest,
+            Phase::Waiting(..) => WaitReason::PriorSaves,
+            Phase::Capture { .. } => WaitReason::SourceColumn,
+            Phase::Worker { view, .. } => match view {
+                WorkerView::Preparing => WaitReason::MetadataPreparation,
+                WorkerView::Confirm(..) => WaitReason::Confirmation,
+                WorkerView::Copying(..) => WaitReason::ImageCopy,
+                WorkerView::Saving => WaitReason::MetadataSaves,
+            },
+            Phase::RefreshIndex { .. } => WaitReason::SourceKeys,
+            Phase::Refresh { .. } => WaitReason::SourceReads,
+            Phase::Apply { .. } => WaitReason::SourceAdoption,
+            Phase::AwaitCaches { .. } if app.book_resume_meters.read_pending() => {
+                WaitReason::ResumeRead
+            }
+            Phase::AwaitCaches { .. } => WaitReason::FavoriteCopy,
+            Phase::ParentScan(..) => WaitReason::ParentScan,
+            Phase::ParentHydration(..) => WaitReason::ParentHydration,
+            Phase::Result { .. } => WaitReason::Terminal,
+        };
+        if self.last_wait != Some(reason) {
+            crate::logger::log(format!(
+                "folder_zip_adoption owner={:?} wait={reason:?} exit={:?} destination={}",
+                self.owner,
+                self.exit,
+                self.destination.display(),
+            ));
+            self.last_wait = Some(reason);
+        }
+    }
     fn prepare(&mut self, ctx: &egui::Context, settings: &crate::settings::Settings) {
         let wake = ctx.clone();
         self.phase = match zip::spawn_prepare(
@@ -990,6 +1114,427 @@ mod tests {
     use crate::grid_item::GridItem;
     use crate::same_name_folder_book::SameNameFolderBookPolicy as SameNameFolderBook;
 
+    fn pump_until(app: &mut App, ctx: &egui::Context, ready: impl Fn(&App) -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !ready(app) {
+            app.poll_sidecar_restore(ctx);
+            app.poll_favorite_view_writes(ctx);
+            app.poll_image_folder_zip(ctx);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "ZIP adoption did not reach its terminal receipt"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    fn finish_actual_worker(app: &mut App, ctx: &egui::Context, source: PathBuf, cancel: bool) {
+        assert!(app.start_image_folder_zip(ctx, source.clone(), false));
+        let mut op = app.image_folder_zip_operation.take().unwrap();
+        let manifest = zip::prepare_manifest(&source, None, &op.control).unwrap();
+        op.phase = app
+            .start_image_zip_worker(ctx, &op, manifest, vec![])
+            .unwrap();
+        let Phase::Worker { worker, .. } = &mut op.phase else {
+            unreachable!()
+        };
+        let summary = match worker
+            .events
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap()
+        {
+            job::Event::Confirm(summary) => summary,
+            job::Event::Finished { result, .. } => panic!("preparation failed: {result:?}"),
+            _ => panic!("unexpected event before confirmation"),
+        };
+        assert!(summary.images > 0);
+        if cancel {
+            op.control.cancel();
+            worker.commands.send(job::Command::Cancel).unwrap();
+        } else {
+            worker.commands.send(job::Command::Convert).unwrap();
+        }
+        let terminal = loop {
+            let event = worker
+                .events
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap();
+            if let job::Event::Finished { result, .. } = &event {
+                assert_eq!(result.is_ok(), !cancel, "{result:?}");
+                break event;
+            }
+        };
+        // Fix the receive order using the real worker's terminal payload/resources. No
+        // synthetic generation, Selecting phase, sleep or operation retry is involved.
+        let (sent, receive) = mpsc::channel();
+        sent.send(terminal).unwrap();
+        worker.events = receive;
+        app.image_folder_zip_operation = Some(op);
+    }
+
+    #[test]
+    fn image_folder_zip_real_parent_scan_has_one_owner_with_watcher_and_suffix_directory() {
+        for suffix in [
+            "library",
+            "写真.epub",
+            "library.7z",
+            "library.pdf",
+            "library.zip",
+        ] {
+            for watcher_first in [true, false] {
+                let mut app = setup_app_for_test();
+                let parent = app.tmp.path().join(suffix);
+                let source = parent.join("comicA");
+                std::fs::create_dir_all(&source).unwrap();
+                std::fs::create_dir(parent.join("comicB")).unwrap();
+                std::fs::write(parent.join("comicB.zip"), b"neighbor").unwrap();
+                for i in 0..10 {
+                    std::fs::write(source.join(format!("p{i:02}.jpg")), b"image bytes").unwrap();
+                }
+                app.current_folder = Some(parent.clone());
+                app.current_folder_last_mtime =
+                    Some(std::fs::metadata(&parent).unwrap().modified().unwrap());
+                app.items = vec![
+                    GridItem::Folder(source.clone()),
+                    GridItem::ZipFile(parent.join("comicB.zip")),
+                ];
+                app.visible_indices = vec![0, 1];
+                let ctx = egui::Context::default();
+                app.ensure_current_folder_watch(&ctx);
+                assert!(app.current_folder_watch.is_some());
+                finish_actual_worker(&mut app, &ctx, source.clone(), false);
+                // Use an actual notify completion and advance its existing debounce boundary
+                // explicitly; the regression does not wait a guessed number of milliseconds.
+                let event = loop {
+                    let event = app
+                        .current_folder_watch
+                        .as_ref()
+                        .unwrap()
+                        .rx
+                        .recv_timeout(std::time::Duration::from_secs(30))
+                        .unwrap();
+                    if event
+                        .as_ref()
+                        .is_ok_and(App::current_folder_watch_event_relevant)
+                    {
+                        break event;
+                    }
+                };
+                let (sent, receive) = crossbeam_channel::unbounded();
+                sent.send(event).unwrap();
+                app.current_folder_watch.as_mut().unwrap().rx = receive;
+                app.poll_current_folder_watch(&ctx);
+                app.current_folder_watch.as_mut().unwrap().debounce_until =
+                    Some(std::time::Instant::now());
+                app.poll_current_folder_watch(&ctx);
+                // The same request used by the watcher: hold its completed scan until the
+                // conversion's accepted parent scan is ready, then test both consumer orders.
+                let pending = app.external_rescan_pending.as_mut().unwrap();
+                let result = pending
+                    .rx
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .unwrap();
+                let (sent, receive) = mpsc::channel();
+                sent.send(result).unwrap();
+                pending.rx = receive;
+                pump_until(&mut app, &ctx, |app| {
+                    matches!(
+                        app.image_folder_zip_operation.as_ref().unwrap().phase,
+                        Phase::ParentScan(..)
+                    )
+                });
+                let op = app.image_folder_zip_operation.as_mut().unwrap();
+                let Phase::ParentScan(pending) = &mut op.phase else {
+                    unreachable!()
+                };
+                let scan = pending
+                    .rx
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .unwrap();
+                let (sent, receive) = mpsc::channel();
+                sent.send(scan).unwrap();
+                pending.rx = receive;
+                // The ordinary frame's poll runs first and cannot steal the reply.
+                assert!(app.poll_folder_pane_open(&ctx).is_none());
+                if watcher_first {
+                    app.poll_external_rescan(&ctx);
+                }
+                app.poll_image_folder_zip(&ctx);
+                assert!(matches!(
+                    app.image_folder_zip_operation.as_ref().unwrap().phase,
+                    Phase::ParentHydration(..)
+                ));
+                assert!(app.top_level_grid_view.open_path_classification().is_none());
+                if !watcher_first {
+                    app.poll_external_rescan(&ctx);
+                }
+                pump_until(&mut app, &ctx, |app| {
+                    matches!(
+                        app.image_folder_zip_operation.as_ref().unwrap().phase,
+                        Phase::Result { .. }
+                    )
+                });
+                assert!(matches!(
+                    app.image_folder_zip_operation.as_ref().unwrap().phase,
+                    Phase::Result { success: true, .. }
+                ));
+                let destination = source.with_extension("zip");
+                assert_eq!(
+                    app.items[app.selected.unwrap()].container_path(),
+                    Some(destination.as_path())
+                );
+                assert!(
+                    !app.items
+                        .iter()
+                        .any(|row| matches!(row, GridItem::Folder(path) if path == &source))
+                );
+                assert!(source.exists());
+                assert_eq!(
+                    app.image_folder_zip_operation.as_ref().unwrap().last_wait,
+                    Some(WaitReason::Terminal)
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn image_folder_zip_dat_cancel_refreshes_aggregate_and_matching_sibling_only() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = setup_app_for_test();
+        let source = app.tmp.path().join("book");
+        std::fs::create_dir(&source).unwrap();
+        let page = source.join("a.jpg");
+        let other = app.tmp.path().join("other.jpg");
+        std::fs::write(&page, b"image").unwrap();
+        std::fs::write(&other, b"image").unwrap();
+        let mut params = crate::adjustment::AdjustParams::default();
+        params.brightness = 0.32;
+        app.current_folder = None;
+        app.items = vec![
+            GridItem::Image(page.clone()),
+            GridItem::Image(other.clone()),
+        ];
+        app.visible_indices = vec![0, 1];
+        app.fullscreen_idx = Some(0);
+        let sibling = app.fork_materialized_still_context(&source, 0);
+        app.with_window_context_for_test(sibling, |viewer| {
+            viewer.current_folder = None;
+        });
+        let unrelated = app.fork_materialized_still_context(&source, 1);
+        app.with_window_context_for_test(unrelated, |viewer| {
+            viewer.current_folder = None;
+            viewer.items = vec![GridItem::Image(other.clone())];
+            viewer.mask_pages.insert(0);
+        });
+        app.fullscreen_idx = None;
+        let key = crate::path_key::normalize_keep_drive(&page);
+        let mut dat = crate::sidecar::SidecarFile::load(&source);
+        dat.set_tags("a.jpg", ["fromDAT"]);
+        dat.set_adjust("a.jpg", params.clone());
+        assert!(dat.flush_blocking());
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "source-before-DAT",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+            Default::default(),
+        );
+        let cached = crate::grid_item::ThumbnailState::Loaded {
+            tex: texture,
+            origin: crate::thumb_loader::ThumbLoadOrigin::FinalCache,
+            from_edit_preview: true,
+            rendered_at_px: 1,
+            source_dims: Some((1, 1)),
+            layout_dims: None,
+        };
+        app.thumbnails = vec![cached.clone(), cached.clone()];
+        app.with_window_context_for_test(sibling, |viewer| {
+            viewer.thumbnails = vec![cached.clone()];
+        });
+        app.with_window_context_for_test(unrelated, |viewer| {
+            viewer.thumbnails = vec![cached.clone()];
+        });
+        finish_actual_worker(&mut app, &ctx, source.clone(), true);
+        let db =
+            crate::tags_db::TagsDb::open_readonly(&app.rename_migration_data_dir().join("tags.db"))
+                .unwrap();
+        assert_eq!(
+            db.get_many_display_tags(std::slice::from_ref(&key))
+                .get(&key)
+                .unwrap(),
+            &["#fromDAT"]
+        );
+        pump_until(&mut app, &ctx, |app| {
+            matches!(
+                app.image_folder_zip_operation.as_ref().unwrap().phase,
+                Phase::Result { .. }
+            )
+        });
+        assert_eq!(app.tags_cache.get(&key).unwrap(), &["#fromDAT"]);
+        assert_eq!(app.adjustment_page_params.get(&0), Some(&params));
+        assert!(matches!(
+            app.thumbnails[0],
+            crate::grid_item::ThumbnailState::Evicted
+        ));
+        assert!(app.thumbnails[1].has_pixels());
+        app.with_window_context_for_test(sibling, |viewer| {
+            assert_eq!(viewer.tags_cache.get(&key).unwrap(), &["#fromDAT"]);
+            assert_eq!(viewer.adjustment_page_params.get(&0), Some(&params));
+            assert!(matches!(
+                viewer.thumbnails[0],
+                crate::grid_item::ThumbnailState::Evicted
+            ));
+        });
+        app.with_window_context_for_test(unrelated, |viewer| {
+            assert!(viewer.mask_pages.contains(&0));
+            assert!(viewer.tags_cache.get(&key).is_none());
+            assert!(viewer.adjustment_page_params.is_empty());
+            assert!(viewer.thumbnails[0].has_pixels());
+        });
+        assert!(!source.with_extension("zip").exists());
+        app.image_folder_zip_operation = None;
+        app.retire_context(sibling, "zip_refresh_test", |_| ())
+            .unwrap();
+        app.retire_context(unrelated, "zip_refresh_test", |_| ())
+            .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn image_folder_zip_close_finishes_accepted_save_then_exits_or_hides_without_parent_wait() {
+        for tray in [false, true] {
+            for stage in 0..4 {
+                let committed = stage != 0;
+                let mut app = setup_app_for_test();
+                let source = app.tmp.path().join("book");
+                std::fs::create_dir(&source).unwrap();
+                std::fs::write(source.join("a.jpg"), b"image").unwrap();
+                app.current_folder = Some(app.tmp.path().to_owned());
+                app.settings.minimize_to_tray_on_close = tray;
+                if tray {
+                    app.tray_controller = Some(crate::tray::TrayController::controller_for_test());
+                }
+                let ctx = egui::Context::default();
+                if committed {
+                    finish_actual_worker(&mut app, &ctx, source.clone(), false);
+                } else {
+                    assert!(app.start_image_folder_zip(&ctx, source.clone(), false));
+                    let mut op = app.image_folder_zip_operation.take().unwrap();
+                    let manifest = zip::prepare_manifest(&source, None, &op.control).unwrap();
+                    op.phase = app
+                        .start_image_zip_worker(&ctx, &op, manifest, vec![])
+                        .unwrap();
+                    let Phase::Worker { worker, .. } = &op.phase else {
+                        unreachable!()
+                    };
+                    assert!(matches!(
+                        worker
+                            .events
+                            .recv_timeout(std::time::Duration::from_secs(30))
+                            .unwrap(),
+                        job::Event::Confirm(..)
+                    ));
+                    app.image_folder_zip_operation = Some(op);
+                }
+                if stage >= 2 {
+                    pump_until(&mut app, &ctx, |app| {
+                        matches!(
+                            app.image_folder_zip_operation.as_ref().unwrap().phase,
+                            Phase::ParentScan(..)
+                        )
+                    });
+                }
+                if stage == 3 {
+                    let op = app.image_folder_zip_operation.as_mut().unwrap();
+                    let Phase::ParentScan(pending) = &mut op.phase else {
+                        unreachable!()
+                    };
+                    let scan = pending
+                        .rx
+                        .recv_timeout(std::time::Duration::from_secs(30))
+                        .unwrap();
+                    let (sent, receive) = mpsc::channel();
+                    sent.send(scan).unwrap();
+                    pending.rx = receive;
+                    app.poll_image_folder_zip(&ctx);
+                    assert!(matches!(
+                        app.image_folder_zip_operation.as_ref().unwrap().phase,
+                        Phase::ParentHydration(..)
+                    ));
+                }
+                let mut input = egui::RawInput::default();
+                input
+                    .viewports
+                    .get_mut(&egui::ViewportId::ROOT)
+                    .unwrap()
+                    .events
+                    .push(egui::ViewportEvent::Close);
+                ctx.begin_pass(input);
+                assert!(!app.maybe_intercept_close(&ctx));
+                app.defer_image_folder_zip_root_close(&ctx);
+                assert_eq!(
+                    matches!(
+                        app.image_folder_zip_operation.as_ref().unwrap().exit,
+                        Exit::TrayHide
+                    ),
+                    tray
+                );
+                assert!(app.window_visible);
+                let requested = ctx.end_pass();
+                assert!(
+                    requested.viewport_output[&egui::ViewportId::ROOT]
+                        .commands
+                        .contains(&egui::ViewportCommand::CancelClose)
+                );
+                ctx.begin_pass(egui::RawInput::default());
+                pump_until(&mut app, &ctx, |app| {
+                    app.image_folder_zip_operation.is_none()
+                });
+                let terminal = ctx.end_pass();
+                assert_eq!(
+                    terminal.viewport_output[&egui::ViewportId::ROOT]
+                        .commands
+                        .contains(&egui::ViewportCommand::Close),
+                    !tray
+                );
+                assert_eq!(app.window_visible, !tray);
+                assert!(app.folder_pane_open_pending.is_none());
+                assert_eq!(source.with_extension("zip").exists(), committed);
+            }
+        }
+    }
+
+    #[test]
+    fn image_folder_zip_actual_favorite_copy_names_only_destination() {
+        let mut app = setup_app_for_test();
+        let source = app.tmp.path().join("book");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("a.jpg"), b"image").unwrap();
+        let favorite = crate::settings::FavoriteEntry::new("私の本".into(), source.clone());
+        let old_id = favorite.id;
+        app.settings.favorites.push(favorite.clone());
+        crate::settings_db::with_db_result(|db| db.save_full(&app.settings)).unwrap();
+        let ctx = egui::Context::default();
+        finish_actual_worker(&mut app, &ctx, source.clone(), false);
+        app.poll_image_folder_zip(&ctx);
+        let original = app
+            .settings
+            .favorites
+            .iter()
+            .find(|f| f.id == old_id)
+            .unwrap();
+        assert_eq!(original.name, "私の本");
+        assert_eq!(original.path, source);
+        let copied = app
+            .settings
+            .favorites
+            .iter()
+            .find(|f| f.path == source.with_extension("zip"))
+            .unwrap();
+        assert_eq!(copied.name, "私の本 (ZIP)");
+        assert_ne!(copied.id, old_id);
+    }
+
     #[test]
     fn image_folder_zip_main_selects_only_visible_destination_for_all_policies() {
         for policy in [
@@ -1019,8 +1564,15 @@ mod tests {
                     vec![1]
                 };
                 app.selected = app.visible_indices.first().copied();
-                app.items_generation += 1;
-                app.image_folder_zip_operation.as_mut().unwrap().phase = Phase::Selecting;
+                let (completed, receipt) = mpsc::channel();
+                app.finish_main_list_after_hydration(
+                    super::super::MainListAfterHydration::ImageFolderZip {
+                        destination,
+                        completed,
+                    },
+                );
+                app.image_folder_zip_operation.as_mut().unwrap().phase =
+                    Phase::ParentHydration(receipt);
                 app.poll_image_folder_zip(&ctx);
                 assert_eq!(
                     app.selected,
@@ -1079,8 +1631,8 @@ mod tests {
         assert!(app.start_image_folder_zip(&ctx, source, true));
         let op = app.image_folder_zip_operation.take().unwrap();
         let phase = app.finish_image_zip_adoption(&ctx, &op, Ok(()));
-        assert!(matches!(phase, Phase::Selecting));
-        assert!(app.folder_open_preparation_pending());
+        assert!(matches!(phase, Phase::ParentScan(_)));
+        assert!(!app.folder_open_preparation_pending());
     }
 
     #[test]

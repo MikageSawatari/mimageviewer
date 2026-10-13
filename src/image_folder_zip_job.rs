@@ -232,12 +232,17 @@ fn wait_portals(
     portals: &[CopyPortal],
     manifest: &ImageFolderManifest,
     phase: CopyPhase,
+    control: &ConversionControl,
 ) -> Result<usize, String> {
     let mut count = 0;
     for portal in portals {
+        control.check()?;
+        // Once accepted, a copy/check receipt must be drained before releasing
+        // the resources. Cancellation prevents the next request, not this wait.
         count += portal(manifest, phase)
             .recv()
             .map_err(|_| "保存処理が終了しました。元のフォルダは残っています。")??;
+        control.check()?;
     }
     Ok(count)
 }
@@ -330,9 +335,6 @@ fn run(
         return Err("余白や編集の保存を完了できませんでした。".into());
     }
     validate_source_directory(resources, &input.manifest)?;
-    // Existing completion owners were drained by the UI before these leases.
-    let shift = crate::spread_shift::maintenance_at(&input.data_dir)?;
-    let _composition = crate::book_composition::maintenance_at(&input.data_dir)?;
     for batch in &input.trims {
         crate::view_trim_db::ViewTrimDb::open_at(&input.data_dir.join("view_trim.db"))
             .map_err(|e| e.to_string())?
@@ -340,8 +342,18 @@ fn run(
             .map_err(|e| e.to_string())?;
         resources.saved_trims += 1;
     }
+    // Captured user saves above must finish even when cancellation arrived while
+    // they were pending. The remaining work only prepares this conversion.
+    control.check()?;
+    // Existing completion owners were drained by the UI before these leases.
+    let shift = crate::spread_shift::maintenance_at(&input.data_dir)?;
+    control.check()?;
+    let _composition = crate::book_composition::maintenance_at(&input.data_dir)?;
+    control.check()?;
     restore_source(resources, &input.manifest.source, &input.data_dir)?;
+    control.check()?;
     load_parent(resources, &input.manifest.source, &input.data_dir)?;
+    control.check()?;
     match crate::sidecar::SidecarFile::load_for_import(&input.manifest.source) {
         crate::sidecar::SidecarImportLoad::Loaded(loaded) => {
             let (sidecar, proof) = loaded.into_parts();
@@ -369,15 +381,22 @@ fn run(
         &manifest,
         input.settings.write_rating_to_xmp,
         &input.session_ratings,
+        control,
     )?;
-    let actor_rows = wait_portals(&input.portals, &manifest, CopyPhase::Check)?;
+    let actor_rows = wait_portals(&input.portals, &manifest, CopyPhase::Check, control)?;
     let mut favorite_rows = input.favorite_pairs.len();
     if !input.favorite_pairs.is_empty() {
+        control.check()?;
         crate::settings_db::with_db_result(|db| {
             db.copy_folder_zip_favorites(&input.favorite_pairs, CopyPhase::Check)
         })
         .map_err(|e| e.to_string())?;
-        favorite_rows += favorite_params(&input.data_dir, &input.favorite_pairs, CopyPhase::Check)?;
+        favorite_rows += favorite_params(
+            &input.data_dir,
+            &input.favorite_pairs,
+            CopyPhase::Check,
+            control,
+        )?;
     }
     check_backups(
         &input.data_dir,
@@ -386,7 +405,9 @@ fn run(
         resources,
         &input.settings,
         false,
+        control,
     )?;
+    control.check()?;
     notify(Event::Confirm(Summary {
         images: manifest.members.len(),
         bytes: manifest.total_bytes,
@@ -399,12 +420,13 @@ fn run(
     let zip = crate::image_folder_zip::write_zip(&manifest, control, |images, bytes| {
         notify(Event::Progress { images, bytes })
     })?;
-    wait_portals(&input.portals, &manifest, CopyPhase::Check)?;
+    wait_portals(&input.portals, &manifest, CopyPhase::Check, control)?;
     metadata::prepare_metadata(
         &input.data_dir,
         &manifest,
         input.settings.write_rating_to_xmp,
         &input.session_ratings,
+        control,
     )?;
     let keys = manifest
         .members
@@ -423,9 +445,14 @@ fn run(
     let copied = (|| {
         metadata::apply_metadata(&input.data_dir, &manifest, &plan)?;
         shift.invalidate_root_family(&manifest.destination);
-        wait_portals(&input.portals, &manifest, CopyPhase::Apply)?;
+        wait_portals(&input.portals, &manifest, CopyPhase::Apply, control)?;
         if !input.favorite_pairs.is_empty() {
-            favorite_params(&input.data_dir, &input.favorite_pairs, CopyPhase::Apply)?;
+            favorite_params(
+                &input.data_dir,
+                &input.favorite_pairs,
+                CopyPhase::Apply,
+                control,
+            )?;
             crate::settings_db::with_db_result(|db| {
                 db.copy_folder_zip_favorites(&input.favorite_pairs, CopyPhase::Apply)
             })
@@ -439,6 +466,7 @@ fn run(
             resources,
             &input.settings,
             true,
+            control,
         )?;
         if let Some(observer) = &input.observer {
             observer.record_for_path(
@@ -503,7 +531,9 @@ fn favorite_params(
         crate::settings::FavoriteEntry,
     )],
     phase: CopyPhase,
+    control: &ConversionControl,
 ) -> Result<usize, String> {
+    control.check()?;
     let path = data_dir.join("adjustment.db");
     if !path.try_exists().map_err(|e| e.to_string())? {
         return Ok(0);
@@ -511,6 +541,7 @@ fn favorite_params(
     let conn = rusqlite::Connection::open(path).map_err(|e| e.to_string())?;
     let mut count = 0;
     for (old, new) in pairs {
+        control.check()?;
         count += metadata::copy_rows_on(
             &conn,
             "favorite_params",
@@ -542,7 +573,9 @@ fn check_backups(
     resources: &mut Resources,
     settings: &crate::settings::Settings,
     apply: bool,
+    control: &ConversionControl,
 ) -> Result<(), String> {
+    control.check()?;
     let parent = manifest.destination.parent().unwrap();
     if !resources.sidecars.contains_key(parent) {
         let sidecar = match crate::sidecar::SidecarFile::load_for_import(parent) {
@@ -561,6 +594,7 @@ fn check_backups(
         .unwrap()
         .to_lowercase();
     for member in &manifest.members {
+        control.check()?;
         let entry = crate::metadata_transfer::folder_zip_page_backup(data_dir, &member.path)?;
         let key = format!("{body}::{}", member.entry.to_lowercase());
         if let Some(existing) = sidecar.items().get(&key)
@@ -573,6 +607,7 @@ fn check_backups(
             sidecar.replace_edit_bundle(&key, entry);
         }
     }
+    control.check()?;
     if let Some(existing) = sidecar.items().get(&body) {
         let mut without_tags = existing.clone();
         without_tags.tags = None;
@@ -866,6 +901,56 @@ mod tests {
         assert!(db.get_page_params(&fixture.target_key("a.jpg")).is_none());
         let resources = worker.resources.lock().unwrap();
         assert!(resources.source_keys.contains(&fixture.source_key("a.jpg")));
+        assert!(
+            resources
+                .source_edits
+                .contains(&fixture.source_key("a.jpg"))
+        );
+        assert!(resources.sidecars[&fixture.manifest.source].written_to_disk());
+    }
+
+    #[test]
+    fn folder_zip_worker_preparation_cancel_drains_accepted_check_and_stops_next_request() {
+        let _scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let fixture = Fixture::new();
+        let (called, calls) = mpsc::channel();
+        let mut input = fixture.input();
+        for index in 0..2 {
+            let called = called.clone();
+            input.portals.push(Arc::new(move |_, phase| {
+                let (reply, receive) = mpsc::channel();
+                called.send((index, phase, reply)).unwrap();
+                receive
+            }));
+        }
+        drop(called);
+        let (worker, control) = fixture.start(
+            input,
+            HashMap::from([(fixture.manifest.source.clone(), dirty_source(&fixture))]),
+        );
+        let (index, phase, reply) = calls.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert_eq!(index, 0);
+        assert!(phase == CopyPhase::Check);
+        assert!(control.cancel());
+        // The in-flight Check still owns its receipt/resources until the reply.
+        assert!(matches!(
+            worker.events.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(worker.resources.try_lock().is_err());
+        reply.send(Ok(0)).unwrap();
+        assert!(finish(&worker).unwrap_err().contains("取り消しました"));
+        assert!(matches!(
+            calls.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        fixture.assert_no_destination();
+        assert_eq!(
+            tags(fixture.data.path(), &fixture.source_key("a.jpg")),
+            ["one", "shared"]
+        );
+        assert!(tags(fixture.data.path(), &fixture.target_key("a.jpg")).is_empty());
+        let resources = worker.resources.lock().unwrap();
         assert!(
             resources
                 .source_edits

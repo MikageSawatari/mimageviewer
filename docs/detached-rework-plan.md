@@ -1484,6 +1484,12 @@ root/F12 closeと取消は同operationの完了境界へ送り、保存票や利
 これは新機能の操作寿命と既存contextへの採用を接続する構造変更であり、detachedの既存症状へ
 guard/retry/repaintを足すパッチではない。完了時レビューではこの判断と所有境界を独立に確認する。
 
+ZIPrev3修正（2026-10-13、設計担当の今回指示に基づく構造変更）: 親scanをprocess operationへ
+移譲し、selection/terminalを既存hydration continuationの票へ接続する。F12は親一覧へ変更せず、
+source補充の採用だけを実際のitem keyとcontext世代で行う。closeは同operationの保存/返却境界を
+維持し、rootの既存終了/トレイ設定へ終端後に渡す。兄弟の退役・items/cacheへの一括変更はしない。
+詳細と実worker順序fixtureは画像folder→ZIP計画§11.3と修正検証記録へ記載する。
+
 ### 2026-10-12 §1.374 Everything の共通Search接続（未コミット・独立実装レビュー待ち）
 
 利用者の実装指示と承認済みEverything計画、先行PDF ownershipの独立ACCEPT実装

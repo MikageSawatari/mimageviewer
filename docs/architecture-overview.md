@@ -24,6 +24,9 @@ Eのframe-local wheel ownerを使う。保存完了ownerは各窓のreloadと共
 `image_folder_zip_job` が既存FIFO/service owner経由で利用者データを複製し、Stored出力をno-clobber公開する。
 元folderの補充だけをgeneration/key限定のbounded refreshで採用し、F12起点では元の閲覧を維持する。
 一覧を持つ起点だけ親一覧を更新し、可視なZIPを選択する。Collectionは元の画像を指したまま。
+親の受付済みpane scan ownerはoperationのParentScanへ移譲し、通常frameと応答を共有しない。
+成功scanの実directory判定をprepared adoptionへ渡し、選択/完了票は既存hydration continuationが所有する。
+監視reloadはmodal中の既存pendingへ留め、source補充refreshは集約面も含めitem/page keyで対象を決める。
 取消・稀な失敗では元データを巻き戻さず、destination公開と複製を止める。詳細は [画像folder→ZIP設計](image-folder-to-zip-plan.md)。
 共通model/storeのfolder値は保持するが、物理画像の提示・類似preview・Remoteはその構成行を消費しない。
 Eのfolder scope/shiftは引き続き使用し、構成管理の表示や操作拒否へ流用しない。

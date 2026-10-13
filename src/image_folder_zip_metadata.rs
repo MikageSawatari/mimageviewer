@@ -91,9 +91,11 @@ fn copy_store_rows(
     manifest: &crate::image_folder_zip::ImageFolderManifest,
     phase: CopyPhase,
     supplemental: &HashMap<String, u8>,
+    check: &mut impl FnMut() -> Result<(), String>,
 ) -> CopyReply {
     let mut count = 0;
     for descriptor in crate::rename_key_migration::STORES {
+        check()?;
         let pages = matches!(
             descriptor.table,
             "page_params"
@@ -140,6 +142,7 @@ fn copy_store_rows(
         let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
         if pages || descriptor.table == "ratings" {
             for member in &manifest.members {
+                check()?;
                 if descriptor.table == "ratings"
                     && supplemental
                         .contains_key(&crate::path_key::normalize_keep_drive(&member.path))
@@ -163,6 +166,7 @@ fn copy_store_rows(
             }
         }
         if container || descriptor.table == "ratings" {
+            check()?;
             count += copy_rows_on(
                 &tx,
                 descriptor.table,
@@ -233,6 +237,7 @@ fn copy_store_rows(
         tx.commit().map_err(|e| e.to_string())?;
     }
     // Dormant G4F rows must never be resurrected as a ZIP composition.
+    check()?;
     if let Some(conn) = open_existing(&data_dir.join("book_composition.db"))? {
         crate::book_composition::validate_database_schema(&conn)?;
         let key = crate::book_scope::BookScopeKey::new(&manifest.destination, "")?;
@@ -257,13 +262,36 @@ pub(crate) fn prepare_metadata(
     manifest: &crate::image_folder_zip::ImageFolderManifest,
     read_xmp: bool,
     session_ratings: &HashMap<String, u8>,
+    control: &crate::image_folder_zip::ConversionControl,
 ) -> Result<ZipMetadataPlan, String> {
+    prepare_metadata_inner(
+        data_dir,
+        manifest,
+        read_xmp,
+        session_ratings,
+        control,
+        |_| {},
+    )
+}
+
+fn prepare_metadata_inner(
+    data_dir: &Path,
+    manifest: &crate::image_folder_zip::ImageFolderManifest,
+    read_xmp: bool,
+    session_ratings: &HashMap<String, u8>,
+    control: &crate::image_folder_zip::ConversionControl,
+    mut before_member: impl FnMut(&Path),
+) -> Result<ZipMetadataPlan, String> {
+    control.check()?;
     let mut union = BTreeMap::<String, crate::tags_db::ItemTag>::new();
     let mut decided = false;
     let tags = open_existing(&data_dir.join("tags.db"))?;
+    control.check()?;
     let ratings = open_existing(&data_dir.join("rating.db"))?;
     let mut supplemental_ratings = HashMap::new();
     for path in std::iter::once(&manifest.source).chain(manifest.members.iter().map(|m| &m.path)) {
+        before_member(path);
+        control.check()?;
         let key = crate::path_key::normalize_keep_drive(path);
         if let Some(conn) = &tags {
             let state = conn
@@ -286,6 +314,7 @@ pub(crate) fn prepare_metadata(
                 .map_err(|e| e.to_string())?;
             decided |= state.is_some();
             for item in items {
+                control.check()?;
                 let item = item.map_err(|e| e.to_string())?;
                 if item.tag_key != crate::tags_db::normalize_tag_key(&item.tag) {
                     return Err("invalid saved tag key".into());
@@ -300,7 +329,9 @@ pub(crate) fn prepare_metadata(
             }
         }
         if path != &manifest.source {
+            control.check()?;
             crate::metadata_transfer::folder_zip_page_backup(data_dir, path)?;
+            control.check()?;
             let db_present = ratings
                 .as_ref()
                 .map(|conn| {
@@ -322,8 +353,15 @@ pub(crate) fn prepare_metadata(
             }
         }
     }
-    let mut rows = copy_store_rows(data_dir, manifest, CopyPhase::Check, &supplemental_ratings)?;
+    let mut rows = copy_store_rows(
+        data_dir,
+        manifest,
+        CopyPhase::Check,
+        &supplemental_ratings,
+        &mut || control.check(),
+    )?;
     for member in &manifest.members {
+        control.check()?;
         if let Some(&stars) =
             supplemental_ratings.get(&crate::path_key::normalize_keep_drive(&member.path))
         {
@@ -334,6 +372,7 @@ pub(crate) fn prepare_metadata(
         }
     }
     if let Some(conn) = &tags {
+        control.check()?;
         let prefix = format!(
             "{}::%",
             crate::tags_db::escape_like_pattern(&crate::path_key::normalize_keep_drive(
@@ -346,6 +385,7 @@ pub(crate) fn prepare_metadata(
         }
     }
     let body_tags = decided.then(|| union.into_values().collect::<Vec<_>>());
+    control.check()?;
     let body_present = check_body_tags(
         tags.as_ref(),
         &crate::path_key::normalize_keep_drive(&manifest.destination),
@@ -354,6 +394,7 @@ pub(crate) fn prepare_metadata(
     if !body_present && let Some(tags) = &body_tags {
         rows += tags.len() + 1; // The explicit decision is a durable row, including empty tags.
     }
+    control.check()?;
     Ok(ZipMetadataPlan {
         body_tags,
         supplemental_ratings,
@@ -441,6 +482,7 @@ pub(crate) fn apply_metadata(
         manifest,
         CopyPhase::Apply,
         &plan.supplemental_ratings,
+        &mut || Ok(()),
     )?;
     if let Some(tags) = &plan.body_tags {
         let db = crate::tags_db::TagsDb::open_at(&data_dir.join("tags.db"))
@@ -820,6 +862,73 @@ mod tests {
     }
 
     #[test]
+    fn folder_zip_metadata_cancel_between_images_stops_preparation_before_next_image() {
+        use crate::image_folder_zip::ConversionControl;
+        use std::time::Duration;
+
+        let (data, _files, manifest) = fixture();
+        drop(crate::tags_db::TagsDb::open_at(&data.path().join("tags.db")).unwrap());
+        let conn = Connection::open(data.path().join("tags.db")).unwrap();
+        // If preparation starts the second page, its corrupt saved tag must fail.
+        // Cancellation must return before that read, while keeping all source rows.
+        let second = &manifest.members[1].path;
+        let second_key = crate::path_key::normalize_keep_drive(second);
+        conn.execute(
+            "INSERT INTO item_tags VALUES(?1,'second','invalid-key',17)",
+            [&second_key],
+        )
+        .unwrap();
+        let control = Arc::new(ConversionControl::default());
+        let (reached, boundary) = mpsc::channel();
+        let (resume, released) = mpsc::channel();
+        let (complete, result) = mpsc::channel();
+        let worker_control = Arc::clone(&control);
+        let worker_data = data.path().to_owned();
+        let worker_manifest = manifest.clone();
+        let worker = std::thread::spawn(move || {
+            let mut visited = vec![];
+            let result = prepare_metadata_inner(
+                &worker_data,
+                &worker_manifest,
+                false,
+                &HashMap::new(),
+                &worker_control,
+                |path| {
+                    visited.push(path.to_owned());
+                    if path == worker_manifest.members[1].path {
+                        // This boundary is reached only after the first page's
+                        // backup/rating preparation has returned.
+                        reached.send(()).unwrap();
+                        released.recv().unwrap();
+                    }
+                },
+            );
+            complete.send((result.map(|_| ()), visited)).unwrap();
+        });
+        boundary.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert!(control.cancel());
+        resume.send(()).unwrap();
+        let (result, visited) = result.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert!(result.unwrap_err().contains("取り消しました"));
+        assert_eq!(
+            visited,
+            [
+                manifest.source.clone(),
+                manifest.members[0].path.clone(),
+                second.clone()
+            ]
+        );
+        worker.join().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM item_tags", [], |r| r
+                .get::<_, usize>(0))
+                .unwrap(),
+            1
+        );
+        assert!(!manifest.destination.exists());
+    }
+
+    #[test]
     fn folder_zip_tags_union_preserves_earliest_time_and_never_creates_page_tags() {
         let (data, _files, manifest) = fixture();
         let db = crate::tags_db::TagsDb::open_at(&data.path().join("tags.db")).unwrap();
@@ -839,7 +948,14 @@ mod tests {
             conn.execute("INSERT INTO tag_item_state VALUES(?1,1,'edit')", [key])
                 .unwrap();
         }
-        let plan = prepare_metadata(data.path(), &manifest, false, &HashMap::new()).unwrap();
+        let plan = prepare_metadata(
+            data.path(),
+            &manifest,
+            false,
+            &HashMap::new(),
+            &crate::image_folder_zip::ConversionControl::default(),
+        )
+        .unwrap();
         assert_eq!(plan.body_tags.as_ref().unwrap()[0].applied_at, 10);
         assert_eq!(plan.rows, 2);
         assert_eq!(apply_metadata(data.path(), &manifest, &plan).unwrap(), 2);
@@ -896,11 +1012,25 @@ mod tests {
                 0,
             ),
         ]);
-        let plan = prepare_metadata(data.path(), &manifest, false, &session).unwrap();
+        let plan = prepare_metadata(
+            data.path(),
+            &manifest,
+            false,
+            &session,
+            &crate::image_folder_zip::ConversionControl::default(),
+        )
+        .unwrap();
         assert_eq!(plan.body_tags.as_deref(), Some([].as_slice()));
         assert_eq!(plan.rows, 2); // A nonzero rating and a durable empty tag decision.
         assert_eq!(apply_metadata(data.path(), &manifest, &plan).unwrap(), 2);
-        let already = prepare_metadata(data.path(), &manifest, false, &session).unwrap();
+        let already = prepare_metadata(
+            data.path(),
+            &manifest,
+            false,
+            &session,
+            &crate::image_folder_zip::ConversionControl::default(),
+        )
+        .unwrap();
         assert_eq!(already.rows, 0);
         assert_eq!(apply_metadata(data.path(), &manifest, &already).unwrap(), 0);
         let rating = crate::rating_db::RatingDb::open_at(data.path().join("rating.db")).unwrap();
@@ -931,7 +1061,14 @@ mod tests {
             crate::adjustment_db::zip_entry_key(&manifest.destination, &manifest.members[0].entry);
         let params = crate::adjustment::AdjustParams::default();
         db.set_page_params(&source, &params).unwrap();
-        let plan = prepare_metadata(data.path(), &manifest, false, &HashMap::new()).unwrap();
+        let plan = prepare_metadata(
+            data.path(),
+            &manifest,
+            false,
+            &HashMap::new(),
+            &crate::image_folder_zip::ConversionControl::default(),
+        )
+        .unwrap();
         apply_metadata(data.path(), &manifest, &plan).unwrap();
         assert_eq!(db.get_page_params(&source), db.get_page_params(&target));
         let conn = Connection::open(data.path().join("adjustment.db")).unwrap();
@@ -940,7 +1077,16 @@ mod tests {
             [target],
         )
         .unwrap();
-        assert!(prepare_metadata(data.path(), &manifest, false, &HashMap::new()).is_err());
+        assert!(
+            prepare_metadata(
+                data.path(),
+                &manifest,
+                false,
+                &HashMap::new(),
+                &crate::image_folder_zip::ConversionControl::default()
+            )
+            .is_err()
+        );
         assert_eq!(db.get_page_params(&source), Some(params));
     }
 
@@ -951,7 +1097,14 @@ mod tests {
         let source = crate::path_key::normalize_keep_drive(&manifest.members[0].path);
         db.set(&source, 4).unwrap();
         let old = db.row_for_key(&source).unwrap().unwrap();
-        let plan = prepare_metadata(data.path(), &manifest, false, &HashMap::new()).unwrap();
+        let plan = prepare_metadata(
+            data.path(),
+            &manifest,
+            false,
+            &HashMap::new(),
+            &crate::image_folder_zip::ConversionControl::default(),
+        )
+        .unwrap();
         apply_metadata(data.path(), &manifest, &plan).unwrap();
         let target =
             crate::adjustment_db::zip_entry_key(&manifest.destination, &manifest.members[0].entry);

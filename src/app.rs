@@ -921,6 +921,10 @@ enum PreparedSyntheticSurface {
 }
 
 pub(super) enum MainListAfterHydration {
+    ImageFolderZip {
+        destination: PathBuf,
+        completed: mpsc::Sender<()>,
+    },
     DirectMedia(startup_ops::DirectMediaPrepared),
     StackSelection {
         select: usize,
@@ -23588,6 +23592,15 @@ impl App {
         adoption: MainListAdoption,
         install: impl FnOnce(&mut Self) -> MainListHydration,
     ) -> bool {
+        self.adopt_main_list_navigation_with_completion(adoption, install, None)
+    }
+
+    fn adopt_main_list_navigation_with_completion(
+        &mut self,
+        adoption: MainListAdoption,
+        install: impl FnOnce(&mut Self) -> MainListHydration,
+        completion: Option<MainListAfterHydration>,
+    ) -> bool {
         let MainListAdoption {
             navigation,
             destination,
@@ -23620,6 +23633,13 @@ impl App {
                 self.set_active_folder_nav_suppress_record_once(false);
             }
             MainHistoryOperation::SameLocation => {}
+        }
+        if let Some(action) = completion {
+            if let Some((continuation, _)) = hydration.as_mut() {
+                continuation.navigation_after_hydration = Some(action);
+            } else {
+                self.finish_main_list_after_hydration(action);
+            }
         }
         self.hydrate_installed_main_list(hydration);
         true
@@ -25358,6 +25378,13 @@ impl App {
         {
             self.current_folder_signature = Some(new_sig);
             self.current_folder_last_mtime = Some(new_mtime);
+            return;
+        }
+        // A conversion already owns the successor parent listing. Watch notifications may
+        // arrive before its scan, but cannot replace that accepted request or its hydration.
+        if self.image_folder_zip_operation.is_some() {
+            self.folder_refresh_pending = Some(folder);
+            crate::logger::log("external_rescan: deferred to folder ZIP adoption owner");
             return;
         }
         if self.viewer_session_blocks_main_window() {
@@ -40610,6 +40637,21 @@ impl App {
 
     fn finish_main_list_after_hydration(&mut self, action: MainListAfterHydration) {
         match action {
+            MainListAfterHydration::ImageFolderZip {
+                destination,
+                completed,
+            } => {
+                if let Some(index) = self.visible_indices.iter().copied().find(|&index| {
+                    self.items
+                        .get(index)
+                        .and_then(GridItem::container_path)
+                        .is_some_and(|path| crate::folder_tree::path_eq(path, &destination))
+                }) {
+                    self.checked.clear();
+                    self.select_item_after_load(index);
+                }
+                let _ = completed.send(());
+            }
             MainListAfterHydration::StackSelection { select } => {
                 self.move_grid_cursor(Some(select), crate::app::GridCursorIntent::Automatic);
                 self.scroll_to_selected = true;
@@ -42684,7 +42726,7 @@ impl App {
     /// メイン viewer 中に `load_folder` すると表示が閉じてしまうため、呼び出し側は
     /// `viewer_session_blocks_main_window()` が false のときだけ実行する。
     pub(crate) fn consume_folder_refresh_pending(&mut self) {
-        if self.sidecar_restore_active() {
+        if self.sidecar_restore_active() || self.image_folder_zip_operation.is_some() {
             return;
         }
         // .take() より先にガードを評価する。検索ビュー中やフォルダ未確定の状態で
@@ -44526,14 +44568,56 @@ impl App {
         import_root: &Path,
         recursive: bool,
     ) -> bool {
+        self.advance_metadata_import_terminal_refresh_target(import_root, recursive, None)
+    }
+
+    fn advance_image_zip_terminal_refresh(&mut self, keys: &HashSet<String>) -> bool {
+        self.advance_metadata_import_terminal_refresh_target(Path::new(""), false, Some(keys))
+    }
+
+    fn begin_image_zip_terminal_refresh(&mut self) {
+        // Retained aggregate/quick-slot contexts need not currently own a viewport.
+        // Clear and enumerate through the context table, rather than its visible windows.
+        for id in self.viewer_context_ids() {
+            let _ = self.with_viewer_context(id, |app| app.metadata_import_refresh_index = None);
+        }
+    }
+
+    fn advance_metadata_import_terminal_refresh_target(
+        &mut self,
+        import_root: &Path,
+        recursive: bool,
+        changed_keys: Option<&HashSet<String>>,
+    ) -> bool {
         const MAX_ITEMS_PER_FRAME: usize = 2_048;
         const MAX_TIME_PER_FRAME: std::time::Duration = std::time::Duration::from_millis(3);
 
         let deadline = std::time::Instant::now() + MAX_TIME_PER_FRAME;
         let mut remaining = MAX_ITEMS_PER_FRAME;
+        if changed_keys.is_some() {
+            for id in self.viewer_context_ids() {
+                if remaining == 0 || std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                let complete = self.with_viewer_context(id, |app| {
+                    app.advance_current_metadata_import_terminal_index(
+                        import_root,
+                        recursive,
+                        changed_keys,
+                        &mut remaining,
+                        deadline,
+                    )
+                });
+                if !matches!(complete, Ok(true)) {
+                    return false;
+                }
+            }
+            return true;
+        }
         let mut complete = self.advance_current_metadata_import_terminal_index(
             import_root,
             recursive,
+            changed_keys,
             &mut remaining,
             deadline,
         );
@@ -44544,6 +44628,7 @@ impl App {
                     app.advance_current_metadata_import_terminal_index(
                         import_root,
                         recursive,
+                        changed_keys,
                         &mut remaining,
                         deadline,
                     )
@@ -44569,6 +44654,7 @@ impl App {
                         app.advance_current_metadata_import_terminal_index(
                             import_root,
                             recursive,
+                            changed_keys,
                             &mut remaining,
                             deadline,
                         )
@@ -44597,6 +44683,7 @@ impl App {
         &mut self,
         import_root: &Path,
         recursive: bool,
+        changed_keys: Option<&HashSet<String>>,
         remaining: &mut usize,
         deadline: std::time::Instant,
     ) -> bool {
@@ -44605,11 +44692,13 @@ impl App {
             .as_ref()
             .is_none_or(|index| index.items_generation != self.items_generation);
         if restart {
-            let affected = self.current_folder.as_deref().is_some_and(|path| {
-                metadata_import_context_path_is_affected(path, import_root, recursive)
-            }) || self.archive_source_override.as_deref().is_some_and(|path| {
-                metadata_import_context_path_is_affected(path, import_root, recursive)
-            });
+            let affected = changed_keys.is_some()
+                || self.current_folder.as_deref().is_some_and(|path| {
+                    metadata_import_context_path_is_affected(path, import_root, recursive)
+                })
+                || self.archive_source_override.as_deref().is_some_and(|path| {
+                    metadata_import_context_path_is_affected(path, import_root, recursive)
+                });
             let current_rating_key = self
                 .current_container_rating_key_and_source()
                 .map(|(key, _)| key);
@@ -44657,6 +44746,17 @@ impl App {
                 || self.rotation_cache.contains_key(&item_index);
             let item = &self.items[item_index];
             let tag_key = tag_item_path(item).map(crate::tags_db::item_key_for_path);
+            // Supplemental source rows can be displayed by search/Collection contexts with
+            // no current folder. Membership is the item's identity, not the surface location.
+            if changed_keys.is_some_and(|keys| {
+                !rating_key.as_ref().is_some_and(|key| keys.contains(key))
+                    && !tag_key.as_ref().is_some_and(|key| keys.contains(key))
+                    && !page_key.as_ref().is_some_and(|key| keys.contains(key))
+            }) {
+                index.next_item += 1;
+                *remaining -= 1;
+                continue;
+            }
             let folder_pin_target = self.folder_pin_lookup_target_for_item(item);
             let container_path = folder_pin_target.as_ref().map(|target| target.path.clone());
             if let Some(container) = &container_path {

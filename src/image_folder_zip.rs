@@ -59,7 +59,7 @@ impl ConversionControl {
             .map(|_| ())
             .map_err(|_| "変換を取り消しました。".to_owned())
     }
-    fn check(&self) -> Result<()> {
+    pub(crate) fn check(&self) -> Result<()> {
         if self.is_cancelled() {
             Err("変換を取り消しました。".into())
         } else {

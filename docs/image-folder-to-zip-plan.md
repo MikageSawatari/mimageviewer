@@ -2,7 +2,7 @@
 
 作成: 2026-10-12。初回調査基準: `next-book` / `05f7783cd`。
 改訂: `53e90f8ef`への独立設計レビューREVISE（P2 5件・P3 2件）と2026-10-12利用者決定を反映。
-状態: **設計R3の独立レビューACCEPT（利用者報告、対象`7346683c6`）。P3のRemoteタグ試験文言を訂正。ZIP変換の製品入口・利用者データの複製・同名3択・マニュアルを接続済み。最終test-fullはPASS。実装の独立レビュー・実機確認は未実施。検証記録は`target/G-1242-zip-msg.txt`。**
+状態: **設計R3の独立レビューACCEPT（利用者報告、対象`7346683c6`）。実装`866c01f68`のZIPrev3はREVISE（P1 1 / P2 3 / P3 1）、隔離実機でも親一覧採用待ちを確認。指摘を修正し、関連試験・normal/portable check・build-dev・test-full（lib 12,566 / 0、全summary合計13,859 / 0 / 64 ignore、exit 0）を完了。元実装の検証は`target/G-1242-zip-msg.txt`、今回の記録は`target/G-1242-zip-fix-msg.txt`。修正の独立受入と実機再確認は未実施。**
 
 G4F切り離し後の独立した機能。本の構成のfolder adapter、folder構成の保存・復元、
 sidecar v2を復活させない。G1〜G4のZIP/PDF/EPUBと、既存のfolder閲覧・編集を維持する。
@@ -709,3 +709,40 @@ schema_versionの値は旧readerが比較しないため、markerだけを上げ
 Gの新しい版番号で既存app_version gateを働かせること。DBへ架空の未来版を保存したり、
 旧boolとの二重保存を加えたりしない。利用者に渡す確認手順は全て`--data-dir`付きとする。
 旧DB/旧transfer/portableの読取り互換と、将来版の既存保存保護の試験は別々に記録する。
+
+### 11.3 ZIPrev3と隔離実機の完了採用修正（2026-10-13）
+
+通常frameと変換operationが同じpane scanを回収していたため、通常側のopenがmodal受付で
+拒否された後、operationの世代待ちに完了producerがなくなった。監視のreloadも同じ受付で
+拒否され得た。実機ログの104.483sのrefresh完了、104.497sの親復帰開始、104.892sの監視reloadは
+この順序と一致するが、旧ログにはscan consumerの記録がなく、先着consumerはログだけでは特定できない。
+
+修正は受付済み`FolderPaneOpenPending`（receiver/cancel/navigation proof）をoperationの
+`ParentScan`へ移譲する。通常ナビゲーションのreceiverとは並立させない。directory scanの成功を
+実体判定として既存のprepared install / main navigation adoptionへ渡し、`.epub`等のsuffixで
+分類workerを再発行しない。後続の可視ZIP選択と完了票は既存`MainListAfterHydration`に所属させる。
+`ParentHydration`はその票を回収し、破棄・失敗もsender切断で終端にする。items世代の変化を成功の
+代用品にしない。監視完了はconversion modal中、既存`folder_refresh_pending`へ留め、採用ownerを
+置換しない。終端後の通常reloadは従来の可視cursor保持を使う。
+
+待機理由は`WaitReason`でmanifest、先行保存、metadata準備/保存、source index/read/adoption、
+resume/favorite、親scan/hydration、terminalを区別し、変化時に`folder_zip_adoption`へ記録する。
+閉じる要求もowner/待機理由/exitを`folder_zip_close`へ記録する。時間切れ・再試行は追加しない。
+×/Alt+F4/WM_CLOSEは同じCloseRequested受付で、commit前の取消または保存receipt採用を完了してから
+従来の終了/トレイ設定へ進む。トレイ移行もreceipt前に窓を隠さず、親一覧の新規scanは終了時に開始しない。
+
+source DAT補充は表示場所ではなく変更したitem/page keyで全contextの有界indexを作る。
+Collection/検索の`current_folder=None`も同じkeyを表示すれば対象、無関係な兄弟は不変。
+metadata/store/backup準備の画像・batch境界は既存ConversionControlを確認し、新しい読取を止める。
+受理済みFIFO保存/actor応答とsource補充は回収して保持し、取消用の巻戻しownerを追加しない。
+
+同名候補のHidden/System資格は`show_hidden_files`を捕捉したFolderTreeOptionsと通常scanで一致させる。
+資格は「他の行を省略できる候補」に限定し、従来Ctrl移動で到達できた隠し項目は残す。
+お気に入り複製はdestinationだけ「元の名前 (ZIP)」とし、source UUID/path/名前を保持する。
+
+回帰は実workerのscan/metadata終端をchannelで固定し、実notify監視、既存同名ZIPの隣接、
+通常poll先着、監視先着/後着、書庫suffixの実directory、source DAT補充後取消と集約/兄弟、
+closeのcommit前後とトレイ有無、metadata途中取消、Hidden/System横断、複製名を検査する。
+人工的なitems世代更新や待機時間・再試行で完了を作らない。
+修正後の一回の最終test-fullはPASS。既存の動画EOF試験もこのrunでは成功したが、
+その不安定さを修正したという主張はしない。UI snapshot integrationは171件成功。
