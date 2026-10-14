@@ -41,6 +41,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'build-output-safety.ps1')
+Assert-MivFixedCargoOutput -WorkingDirectory (Join-Path $PSScriptRoot '..')
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $outputDir = Join-Path $repoRoot 'target\dev-runtime'
 $coreExe = Join-Path $outputDir 'mimageviewer-core.exe'

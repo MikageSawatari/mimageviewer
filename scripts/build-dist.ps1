@@ -42,6 +42,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'build-output-safety.ps1')
+Assert-MivFixedCargoOutput
 $repoRoot = (Get-Location).Path
 $scripts = Join-Path $repoRoot 'scripts'
 $expectedRepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
@@ -63,19 +65,6 @@ $null = Assert-MivEffetuneSource -SourceRoot (Join-Path $repoRoot 'vendor\effetu
 if ($PreserveRuntime) {
     if (-not $repoRoot.Equals($expectedRepoRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "[build-dist] -PreserveRuntime must be run from the repository root: $expectedRepoRoot"
-    }
-    $configuredTarget = if ($env:CARGO_TARGET_DIR) {
-        $targetCandidate = if ([System.IO.Path]::IsPathRooted($env:CARGO_TARGET_DIR)) {
-            $env:CARGO_TARGET_DIR
-        } else {
-            Join-Path $repoRoot $env:CARGO_TARGET_DIR
-        }
-        [System.IO.Path]::GetFullPath($targetCandidate)
-    } else {
-        [System.IO.Path]::GetFullPath($workspaceTargetDir)
-    }
-    if (-not $configuredTarget.Equals([System.IO.Path]::GetFullPath($workspaceTargetDir), [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "[build-dist] -PreserveRuntime refuses a Cargo target outside the repository target directory: $configuredTarget"
     }
     foreach ($targetPath in @($workspaceTargetDir, $portableTargetDir)) {
         if (Test-Path -LiteralPath $targetPath) {
@@ -151,7 +140,7 @@ Write-Host '[build-dist]       VST3 host source-identity regression tests'
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] VST3 host identity tests failed (exit {0})" -f $LASTEXITCODE) }
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts 'test-vst3-host-vcrt.ps1')
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] VST3 host CRT preflight tests failed (exit {0})" -f $LASTEXITCODE) }
-foreach ($testScript in @('test-build-dev-safety.ps1', 'test-release-build-safety.ps1', 'test-musicvideo-build-safety.ps1')) {
+foreach ($testScript in @('test-build-dev-safety.ps1', 'test-release-build-safety.ps1', 'test-musicvideo-build-safety.ps1', 'test-build-output-safety.ps1')) {
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts $testScript)
     if ($LASTEXITCODE -ne 0) { throw ("[build-dist] {0} failed (exit {1})" -f $testScript, $LASTEXITCODE) }
 }

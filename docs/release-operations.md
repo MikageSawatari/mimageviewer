@@ -65,7 +65,7 @@ VST3 SDK は `vX.Y.Z_build_N` の版・build 番号を比較して最大のタ�
   テスト通過後に**ワークスペースパッケージを `cargo clean --release`**
   してから実コンパイルするので stale 出荷が構造的に起きない。署名は既定 ON。
 - **通常の開発反復とcore内Windows native挙動の実機確認は
-  `scripts/build-dev.ps1`** (core + remote + EPUB worker、軽量Cargo profile、通常のAPPDATA profile、
+  `scripts/build-dev.ps1`** (core + remote + EPUB worker + editor、軽量Cargo profile、通常のAPPDATA profile、
   launcher省略用FFmpeg DLLだけloose配置)。launcher／release最適化／埋め込みasset／
   変更したVST3 bridgeなどrelease構成依存の確認だけ `scripts/build-release.ps1` 単体を使う
   (cleanなし・署名は `-Sign` 指定時のみ)。**どちらも配布物の生成には使わない**。
@@ -119,6 +119,8 @@ VST3 SDK は `vX.Y.Z_build_N` の版・build 番号を比較して最大のタ�
   または (B) cargo 5 段を直接実行する。どちらも stderr をリダイレクトしない。
 
 ### 2.3 5 段ビルドの正しいコマンド (順序不変: core → remote → EPUB worker → editor → launcher)
+
+先頭の core／remote／EPUB worker／editor の release exe 4 本が launcher の build.rs の前提となる。
 
 署名時の補足: SimplySignログイン済みでも、制限された実行環境のsigntoolが
 `No certificates were found that met all the given criteria`で失敗する場合がある。
@@ -205,7 +207,7 @@ perf/idle検証および実アプリsmokeの実行前に適用する。必須検
 ### 3.1 全 PE と app-local VC runtime gate
 
 `build-dist.ps1` は installer と portable の生成後、DONE 表示前に
-`scripts/check-vcrt-pe-dependencies.ps1` を実行する。release の launcher / core / remote / EPUB worker、
+`scripts/check-vcrt-pe-dependencies.ps1` を実行する。release の launcher / core / remote / EPUB worker / music-video editor、
 installer wrapper、portable directory 配下、および埋め込み元 PDFium / DirectML ORT / FFmpeg /
 Susie / VST host / EffeTune plugin PE (`.vst3` を含む) を検査対象にする。各 input の SHA-256、machine、linker version、direct imports は
 `target/vcrt-pe-reports/` の JSON に残る。

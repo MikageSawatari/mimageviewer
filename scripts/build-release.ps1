@@ -25,6 +25,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'build-output-safety.ps1')
+Assert-MivFixedCargoOutput -CargoArgs $CargoArgs
 
 # Optional code signing (Certum / SimplySign). Imported only when -Sign is set.
 # Assert the certificate is available (SimplySign Desktop logged in) up front so
@@ -109,19 +111,6 @@ if ($PreserveRuntime) {
         throw "[build-release] -PreserveRuntime must be run from the repository root: $expectedRepoRoot"
     }
     $expectedTarget = [System.IO.Path]::GetFullPath((Join-Path $repoRoot 'target'))
-    $configuredTarget = if ($env:CARGO_TARGET_DIR) {
-        $targetCandidate = if ([System.IO.Path]::IsPathRooted($env:CARGO_TARGET_DIR)) {
-            $env:CARGO_TARGET_DIR
-        } else {
-            Join-Path $repoRoot $env:CARGO_TARGET_DIR
-        }
-        [System.IO.Path]::GetFullPath($targetCandidate)
-    } else {
-        $expectedTarget
-    }
-    if (-not $configuredTarget.Equals($expectedTarget, [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "[build-release] -PreserveRuntime refuses a Cargo target outside the repository target directory: $configuredTarget"
-    }
     if (Test-Path -LiteralPath $expectedTarget) {
         $targetItem = Get-Item -LiteralPath $expectedTarget -Force
         if (($targetItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {

@@ -3230,7 +3230,7 @@ GUI起動・実機検収と対応後の独立再レビューは未実施。コ�
 | **P4b** 実装完了・実機確認待ち（P4b-1〜4 すべて独立レビュー ACCEPT、2026-10-14。上書きの競合は利用者が許容。5 分 1080p60 は完走済み・速度は参考値で静かな環境での再計測が残る。音・GUI の実機確認は利用者へ依頼） | ホストの製品化（D16。段の分け方は D16 の「P4b の設計」）: ラボを `crates/musicvideo-editor` へ移し、FFmpeg デコードへ統一、スナップショット入力の MP4 書き出し（モーダル・進捗・キャンセル）、未保存の編集の確認、音声スレッドが stream を所有する再生と f32 以外の出力形式対応 | **P4b-3（2026-10-14、未コミット）**: 指定ゲート 365 passed、追加 18 件すべての変異失敗確認、既存 editor 101 件維持。共通 snapshot／解析／較正／PCM view AAC／原子的公開／モーダル終端を接続し、製品 editor・通常 CLI・dev CLI の release build 成功。編集済み 5 分 1080p60 を dev CLI で 18,000 frames 完走、184.441 秒／1.6265x（背景 Codex 4 件あり、参考値）。詳細は D16 の P4b-3 記録。P4b-2 の実機の音・GUI・H3b は未確認。**P4b-4（2026-10-14、未コミット）**: session 所属の単一意図、歌詞の先行解決、保存後のフレーム末尾の再判定、先行読込の receiver 退役、新規、CancelClose／承認済み Close と書き出し中止の終端待ちを実装。指定ゲート **396 passed**、追加 **31 件**すべて変異失敗確認。初回レビュー REVISE の P2／P3 に対応し、LRC モーダルの実クリック回帰、Project／保存完了の両順序、歌詞取消と同フレームの旧完了を検査。今回 3 件追加・既存 1 件補強、各テストの変異失敗確認、指定テスト **399 passed**。詳細は D16 の P4b-4 記録。修正後の独立レビュー・実機確認・H3b は未完了 |
 | **P4c** 実装完了・実機確認待ち（独立レビュー ACCEPT、2026-10-15） | 起動引数と診断（D10）: `--audio` / `--project` / `--data-dir`、最近使ったプロジェクト、ログ・panic ログ、引数エラーの画面表示、runtime shared lease と取得失敗の表示 | **初回2026-10-14**: 追加21件の変異検証記録あり。**2026-10-15、未コミット修正**: P2のUI出力全経路9か所をworker配送、追加6件すべてで同期出力の変異失敗、P3の実機未完了表記を訂正。指定gate **516 passed / 0 failed / 1 ignored**、fmt／glyph0／製品release build成功。再レビュー・実機検収未実施。詳細は「P4c 実装記録」の独立レビュー1回目対応 |
 | **P4d** 実装完了・実機確認待ち（独立レビュー ACCEPT、2026-10-15） | mIV 側の入口: 音楽ビュー・音声ファイルの右クリックから「音楽ビデオを作成」でエディタを起動 | Grid／Fullscreenの単一実Audioだけ。static ID／非表示設定、worker起動、絶対path引数、失敗通知、build-dev同梱を実装。既存保存順のstatic／動的枠を保つ末尾追加。追加8件の成功と各変異失敗、全対象14560 passed／0 failed／66 ignored、fmt／glyph0、通常featureの4exe確認build成功を記録済み。`261b10359`の独立レビューP2に対応し製品binのGUI属性／Subsystem gateを追加。製品GUI起動／実機検収／対応のcommitなし。詳細は「P4d実装記録」 |
-| **P4e** | 配布（下の表）: launcher 内包・runtime 展開・署名・portable 同梱・全 PE / VC runtime gate・build スクリプト・test-full 前提 | **実装・非対話検証済（2026-10-15）**。build-dist -NoSign の全段成功、全体 gate 14,562 passed / 0 failed / 66 ignored。editor 25,504,768 bytes、launcher 増分も同値。清掃は editor を含む fixture で検査し D10 の割り切りを維持。署名実行・GUI 検収・独立レビューは未実施。詳細は末尾「P4e 実装記録」 |
+| **P4e** | 配布（下の表）: launcher 内包・runtime 展開・署名・portable 同梱・全 PE / VC runtime gate・build スクリプト・test-full 前提 | **実装・非対話検証済（2026-10-15）**。build-dist -NoSign の全段成功、全体 gate 14,562 passed / 0 failed / 66 ignored。editor 25,504,768 bytes、launcher 増分も同値。清掃は editor を含む fixture で検査し D10 の割り切りを維持。`8e0172a0e` の独立レビュー 1 回目は REVISE、P2／P3 対応と指定検証済・再レビュー待ち。署名実行・GUI 検収は未実施。詳細は末尾「P4e 実装記録」 |
 | **P4f** | 文書: マニュアル・製品ページ・keymap-spec（固定ショートカットの理由）・privacy（通信なし・保存先） | CLAUDE.md「コード修正時のドキュメント同時更新」 |
 
 L1 自動検証記録（2026-10-09）:
@@ -3855,3 +3855,52 @@ portable **3 分 13 秒**（Cargo 表示。通常版は core の依存準備後�
 | safety | 新規 `scripts/musicvideo-build-safety.ps1`、新規 `scripts/test-musicvideo-build-safety.ps1`、`scripts/test-build-dev-safety.ps1`、`scripts/test-release-build-safety.ps1` |
 | cleanup／診断 portable | `src/runtime_cleanup.rs`（fixture のみ）、`scripts/ui-smoke/release-checks/Support.ps1` |
 | 文書 | `CLAUDE.md`、`docs/development-build-and-test.md`、`docs/release-operations.md`、`docs/portable-build-plan.md`、`docs/music-video-export-plan.md` |
+
+#### 独立レビュー 1 回目 REVISE と対応（2026-10-15、未コミット）
+
+対象: `8e0172a0e047be27451f8ebf8fc01bf29d38deef`。上の初回実装記録はコミット前の検証記録として保持する。
+利用者から提示された **GPT-6.1 Sol / xhigh の独立レビューは REVISE**（P2: Cargo 出力先と保護・署名・内包先の不一致、P3: 前提・対象一覧の更新漏れ）。
+以下は実装担当の修正と自己検証であり、独立再レビューの結果ではない。
+
+- **P2**: 設計担当の「出力先を変える設定を受け付けない」判断に従い、4 本の PowerShell build スクリプトが共通 guard を最初に呼ぶ。
+  `-PreserveRuntime` に関係なく、署名確認・プロセス操作・テスト・clean・build より前に ASCII の理由付きで中止する。
+  `CARGO_TARGET_DIR`／`CARGO_BUILD_TARGET_DIR`／`CARGO_BUILD_BUILD_DIR`／`CARGO_BUILD_TARGET` 等、
+  `build.target-dir`／`build.build-dir`／`build.target`、`--target-dir`／`--target`／`--profile` 等の出力変更引数、
+  `--config` の inline／file と出力名・場所を変える rustflags を拒否する。同じ `target` を指定しても拒否する。
+  TOML は Python 3.11 以降の標準 `tomllib` で読む。引用・dotted key・inline table・include・`[env]` を含めて検査し、
+  caller／祖先／CARGO_HOME の config を Cargo と同じ legacy-file 優先で読む。
+  dev／portable は実際の Cargo 実行場所である repo root を検査する。
+  設定探索とキーの正本は [Cargo configuration](https://doc.rust-lang.org/cargo/reference/config.html)。
+  通常の linker／CRT rustflags、portable 自身の固定 `--target-dir target-portable`（診断版も既存固定値）、
+  companion の停止 policy、editor を自動終了しない保護、D10 の割り切りは維持する。
+- **P3**: launcher の Cargo.toml、CLAUDE.md、開発／リリース手順を「前提 4 本・Rust build 5 段・editor を含む対象一覧」に統一。
+  CLAUDE.md の先頭の内包説明・dev 出力一覧、現行 EffeTune 計画の署名順、P4e brief の順序表記も補正した。
+  過去の検証件数・過去版の手順記録は改変しない。出力先固定の制約は CLAUDE.md の配布ビルドと開発手順に各 1 行で追加した。
+
+追加ファイル: `scripts/build-output-safety.ps1`、`scripts/check_build_output_config.py`、
+`scripts/test-build-output-safety.ps1`、`scripts/test_build_output_config.py`。
+変更: build 4 本、launcher Cargo.toml、CLAUDE.md、development-build-and-test、release-operations、
+effetune-now-playing-plan、brief-musicvideo-p4e、本記録（計 15 本）。dist の安全性 gate に新テストを追加した。
+
+すべて `MSBUILDDISABLENODEREUSE=1`。build スクリプトの本体は実行せず、実際の最初の guard 呼出しだけを
+偽の環境／設定で評価した。プロセス停止・署名・GUI 起動・実 `%APPDATA%/mimageviewer` 操作はない。
+
+| 検証 | 結果 | 証跡（`target/p4e-evidence/`） |
+| --- | --- | --- |
+| 既存 safety 3 本 | dev／release／musicvideo とも PASS | `review1-safety-{dev,release,editor}.{json,log,stderr.log}` |
+| 出力先 safety | PASS、4 scripts × PreserveRuntime 両方。別 target の環境変数・CLI・偽 CARGO_HOME config、実 Cargo cwd を検査。TOML 等 10 unit tests 成功 | `review1-safety-output-final.{json,log,stderr.log}` |
+| 変異 15 ケース | すべて exit 1、各回 byte 復元、復元後 exit 0 | `review1-script-mutations.json`、`review1-mutation-*`、`review1-mutations-restored.*` |
+| launcher 全テスト | 42 passed / 0 failed / 1 ignored（22.673 秒） | `review1-launcher-tests.{json,log,stderr.log}` |
+| `cargo fmt`／`cargo fmt --check` | 適用済み・exit 0 | `review1-fmt.*`、`review1-fmt-check.*` |
+| UI glyph | 危険 glyph 0 | `review1-glyphs.*` |
+| 変更 PowerShell 6 本 | 構文・ASCII とも PASS、diff whitespace 検査成功 | `review1-syntax-ascii.*` |
+
+変異は各 build の guard 削除 4 件、PreserveRuntime 限定、release 引数の転送削除、dev／portable の誤った cwd 2 件、
+検査失敗の無視、環境変数／config／CLI の target-dir 許可、CARGO_HOME／include の無視、出力変更 rustflags の許可。
+各失敗は対応する回帰 assert で確認し、元に戻して再成功した。
+初回のテスト準備は Python 3.13 の private temp ACL と synthetic scriptblock の PSScriptRoot により失敗したため、
+偽データを workspace 配下へ作り ACL を継承し、実 script root を評価へ渡して修正した。製品ビルドの失敗ではない。
+
+利用者の指示により build-dist の再通しは行わず、上の既存 full gate・配布 byte 一致・サイズ／時間の証拠は初回分として再利用する。
+今回の変更後の配布生成・実署名・Bash 実行・GUI 検収は実行していない。独立再レビュー／設計担当の再検収は未完了。
+HEAD は `8e0172a0e` のまま、コミットなし、未追跡 `out.mp4` は操作なし。
