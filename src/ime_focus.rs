@@ -464,6 +464,7 @@ pub(crate) fn ime_input_active(ctx: &egui::Context) -> bool {
 ///   `Ime::Commit` / `Ime::Disabled` 相当の `egui::ImeEvent` を受ける。
 ///   IME が処理した `NamedKey::Process` の press / repeat は egui-winit が
 ///   Key / Text / clipboard event にせず、対応する物理キー release も遮断する。
+///   通常 press / repeat を配送した物理キーは記録から除去し、以後の release も渡す。
 ///   記録済み release は allow_ime にかかわらず記録から除去して捨て、focus 喪失時は記録を空にする。
 ///   記録のない release と Ime event はそのまま渡す。
 /// - winit 管理外の独立 HWND である native video window は

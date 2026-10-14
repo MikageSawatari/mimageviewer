@@ -112,8 +112,8 @@ pub struct State {
     allow_ime: bool,
     ime_rect_px: Option<egui::Rect>,
 
-    /// Physical keys whose IME-processed release must also be filtered.
-    /// Based on upstream #7967; releases are tracked across IME permission changes.
+    /// Physical keys whose current press egui has not yet seen.
+    /// Based on upstream #7967; forwarding a press ends its release suppression.
     #[cfg(target_os = "windows")]
     pressed_processed_physical_keys: HashSet<winit::keyboard::PhysicalKey>,
 }
@@ -1148,7 +1148,7 @@ fn append_keyboard_input(
     true
 }
 
-/// Based on upstream 0.34.0, with recorded releases removed regardless of allow_ime.
+/// Based on upstream 0.34.0, tracking only presses egui has not yet seen.
 /// KeyEvent's public parts let delivery tests use the production path.
 /// https://github.com/emilk/egui/pull/7967
 #[cfg(target_os = "windows")]
@@ -1162,13 +1162,16 @@ fn try_on_ime_processed_keyboard_input(
     if state == ElementState::Released && pressed_processed_physical_keys.remove(&physical_key) {
         // egui never saw this press, even if IME permission has changed since then.
         true
-    } else if !allow_ime {
-        false
-    } else if *logical_key == winit::keyboard::NamedKey::Process {
+    } else if allow_ime && *logical_key == winit::keyboard::NamedKey::Process {
         // winit maps VK_PROCESSKEY to Process for IME-consumed presses.
         pressed_processed_physical_keys.insert(physical_key);
         true
     } else {
+        if state == ElementState::Pressed {
+            // A forwarded press (including a repeat) gives egui ownership of this
+            // physical hold. Its final release must reach egui as well.
+            pressed_processed_physical_keys.remove(&physical_key);
+        }
         false
     }
 }
@@ -1537,14 +1540,6 @@ mod keyboard_input_tests {
     fn disabled_ime_forwards_unrecorded_input_but_removes_recorded_releases() {
         let physical = PhysicalKey::Code(KeyCode::KeyV);
         let mut processed = HashSet::from([physical]);
-        assert!(!try_on_ime_processed_keyboard_input(
-            false,
-            &mut processed,
-            &Key::Named(NamedKey::Process),
-            physical,
-            ElementState::Pressed,
-        ));
-        assert_eq!(processed, HashSet::from([physical]));
         let mut input = egui::RawInput {
             modifiers: egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
             ..Default::default()
@@ -1664,6 +1659,148 @@ mod keyboard_input_tests {
             }
         }
         State::new(ctx, viewport_id, &NoDisplay, None, None, None)
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn forwarded_repeat_after_process_press_keeps_release_and_next_press() {
+        for use_state in [false, true] {
+            for (ordinary_allowed, ordinary_key) in [
+                (false, NamedKey::Enter),
+                (true, NamedKey::Enter),
+                // allow_ime=false keeps upstream's physical fallback for Process.
+                (false, NamedKey::Process),
+            ] {
+                let ctx = egui::Context::default();
+                let mut state = headless_state(ctx.clone(), ViewportId::ROOT);
+                state.on_focused(true);
+                let mut raw_input = egui::RawInput::default();
+                let mut processed = HashSet::new();
+                let physical = PhysicalKey::Code(KeyCode::Enter);
+                for (logical, element, allowed, repeat, forwarded, egui_repeat) in [
+                    (
+                        NamedKey::Process,
+                        ElementState::Pressed,
+                        true,
+                        false,
+                        false,
+                        false,
+                    ),
+                    (
+                        ordinary_key,
+                        ElementState::Pressed,
+                        ordinary_allowed,
+                        true,
+                        true,
+                        false,
+                    ),
+                    (
+                        ordinary_key,
+                        ElementState::Pressed,
+                        ordinary_allowed,
+                        true,
+                        true,
+                        true,
+                    ),
+                    (
+                        NamedKey::Enter,
+                        ElementState::Released,
+                        ordinary_allowed,
+                        false,
+                        true,
+                        false,
+                    ),
+                    (
+                        NamedKey::Enter,
+                        ElementState::Pressed,
+                        true,
+                        false,
+                        true,
+                        false,
+                    ),
+                    (
+                        NamedKey::Enter,
+                        ElementState::Released,
+                        true,
+                        false,
+                        true,
+                        false,
+                    ),
+                ] {
+                    let delivered = if use_state {
+                        state.allow_ime = allowed;
+                        state.on_keyboard_input_parts(
+                            &Key::Named(logical),
+                            physical,
+                            None,
+                            element,
+                            repeat,
+                        )
+                    } else {
+                        append_keyboard_input(
+                            &mut raw_input,
+                            &Key::Named(logical),
+                            physical,
+                            None,
+                            element,
+                            repeat,
+                            allowed,
+                            &mut processed,
+                            || panic!("Enter must not read clipboard"),
+                        )
+                    };
+                    assert_eq!(delivered, forwarded);
+                    let tracked = if use_state {
+                        &state.pressed_processed_physical_keys
+                    } else {
+                        &processed
+                    };
+                    assert_eq!(tracked.contains(&physical), !forwarded);
+                    let input = if use_state {
+                        state.egui_input.take()
+                    } else {
+                        raw_input.take()
+                    };
+                    let _ = ctx.run(input, |ctx| {
+                        ctx.input(|input| {
+                            assert_eq!(
+                                input.key_down(egui::Key::Enter),
+                                forwarded && element == ElementState::Pressed
+                            );
+                            let keys: Vec<_> = input
+                                .events
+                                .iter()
+                                .filter_map(|event| {
+                                    if let egui::Event::Key {
+                                        key,
+                                        pressed,
+                                        repeat,
+                                        ..
+                                    } = event
+                                    {
+                                        Some((*key, *pressed, *repeat))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            assert_eq!(
+                                keys,
+                                if forwarded {
+                                    vec![(
+                                        egui::Key::Enter,
+                                        element == ElementState::Pressed,
+                                        egui_repeat,
+                                    )]
+                                } else {
+                                    vec![]
+                                }
+                            );
+                        });
+                    });
+                }
+            }
+        }
     }
 
     #[cfg(target_os = "windows")]

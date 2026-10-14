@@ -35,16 +35,18 @@ I1 段 2a（`367f9c9d3`）と段 2b の本体部分（`fde3e819e`）は先行独
 | 段 1：`282f173c4` / `1cbe1888f` | egui-winit 0.33.3 を vendor に取り込み、既定無効の `MIV_IME_KEY_TRACE` で winit 入力と実際の egui 出力を観測。文字と Space は秘匿し、ファイル I/O は worker に置く。入力挙動を変更しない |
 | 段 2a：`62bc9f47c` / `29367ba4d` | Process press / repeat を Key・Text・clipboard producer の前で遮断。本体 text_mode / comic_lab の Enter 除去、共有 plugin の composing Esc 除去、helper の IME 専用 Tab lock を撤去。実配送関数 `append_keyboard_input` で回帰検証する |
 | 段 2b：`291dbf8e5` / `efce16eb0` | 300ms grace と timestamp、pending-event 有無版 API を撤去。今 pass の Ime 列を反映した composing と、queue 最終状態の投影へ統一。Win32 queue / native 生キー公開は 0xE5 press / repeat を生成境界で捨て、release は保持する |
-| 本家への整合と独立レビュー修正 | Windows の `allow_ime` が true のとき、Process を遮断して `pressed_processed_physical_keys: HashSet<PhysicalKey>` に記録する。記録済み release は allow_ime にかかわらず remove して遮断する。focus 喪失で集合を空にし、記録のない release は通す |
+| 本家への整合と独立レビュー修正 | Windows の `allow_ime` が true のとき、Process を遮断して `pressed_processed_physical_keys: HashSet<PhysicalKey>` に記録する。配送する press / repeat は集合から除去する。記録済み release は allow_ime にかかわらず remove して遮断する。focus 喪失で集合を空にし、記録のない release は通す |
 
 段 2a の「release を通し、集合を持たない」判断は履歴であり、現在は press / release の整合性を優先する。
 本家 [PR #7967](https://github.com/emilk/egui/pull/7967) の egui-winit 0.34.0 を基にする。
 [本家実装](https://raw.githubusercontent.com/emilk/egui/0.34.0/crates/egui-winit/src/lib.rs) に対して、
 独立レビュー P2 の設計 lead 決定により、記録済み release は allow_ime 判定より先に除去・遮断し、
-`WindowEvent::Focused(false)` では当該 State の集合を空にする。この 2 点のみが挙動差分。
-egui が見ていない press の release を渡さず、古い記録が次の通常 release を捨てて keys_down を残すことを防ぐ。
+配送する press / repeat は集合から除去し、`WindowEvent::Focused(false)` では当該 State の集合を空にする。
+この 3 点が挙動差分。不変条件は「集合には、今の押下について egui がまだ press を見ていない物理キーだけが入る」。
+通常リピートが届いて egui が press を見ると、その後の release も配送する。
+allow_ime=false で配送する Process press も同じ扱いにする。古い記録による release 遮断・keys_down 残留を防ぐ。
 処理済みキーの EventResponse も本家同様、repaint=false / consumed=wants_keyboard_input とする。
-時間窓は設けない。trace は既定無効で保持する。egui 更新時は上記 2 点の本家での解決を確認し、
+時間窓は設けない。trace は既定無効で保持する。egui 更新時は上記 3 点の本家での解決を確認し、
 未解決なら差分を維持する（詳細は `vendor/egui-winit/PATCHES.md`）。
 
 focus のキー所有と復帰は別責務。直前 pass の helper 欄に対する recovery claim は維持する。
@@ -143,11 +145,11 @@ Git 管理領域が作業ディレクトリ外のため、この実行環境で�
 コミット履歴は `target/ime-port/git` の bundle から設計 lead が取り込み済み（HEAD `874e9b2c1`）。
 今回のレビュー修正はユーザー指示によりコミットせず作業ツリーへ残す。
 
-## 独立レビュー REVISE の修正・検証（2026-10-14）
+## 初回独立レビュー REVISE の修正・検証（2026-10-14）
 
 P2 は記録済み release の無条件除去・遮断と focus 喪失時の集合クリアを実装し、
 配送と State の回帰テストを追加。P3 は winit fixture から対応 release も除去し、facade 説明を修正した。
-本家との差分・理由・更新時の確認事項を PATCHES.md に記録した。実機確認と正式再レビューは未実施。
+本家との差分・理由・更新時の確認事項を PATCHES.md に記録した。この検証時点では実機確認と正式再レビューは未実施。
 
 | コマンド | 結果 |
 | --- | --- |
@@ -161,3 +163,27 @@ P2 は記録済み release の無条件除去・遮断と focus 喪失時の集�
 `MSBUILDDISABLENODEREUSE=1`、`RUST_MIN_STACK=67108864`、`CARGO_BUILD_JOBS=4`、`RUST_TEST_THREADS=4`。
 vendor の依存は 1 系統、build safety check も exit 0。今回は指定の検証範囲を実行し、上記の旧 full gate は再実行していない。
 成果物は `target/dev-runtime/mimageviewer-core.exe`。起動コマンド・実プロファイルの注意事項は前節を参照。
+
+## 再レビュー REVISE P2 の修正・検証（2026-10-14）
+
+前回修正は設計 lead が `dee11153e` にコミット済み。再レビューでは、Process press の記録後に
+通常リピートを配送すると、最後の release が遮断されて keys_down が残る P2 を受領した。
+設計 lead の不変条件に従い、配送する press / repeat の時点で physical を集合から除去する。
+記録済み release の無条件除去・遮断、focus 喪失時の全消去、許可された Process の遮断・記録は維持する。
+
+配送経路と State の両方で、true の Process press → false / true の通常リピート →同じ allow_ime の release を固定した。
+記録の除去、release の配送、keys_down の解除、次の新規 press が repeat にならないことを確認する。
+allow_ime=false で配送する Process の physical fallback も同じ不変条件で検証した。
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo fmt --check` / vendor `rustfmt --edition 2024 --check` / glyph check | すべて exit 0、危険 glyph 0 |
+| `cargo test -p egui-winit --lib` / `cargo test -p egui-ime` | 27 / 22 passed、失敗なし |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0 |
+| `scripts/build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | exit 0（38.81 秒）。通常 feature / dev-runtime の core と companion を staging、起動なし |
+
+ログと command / exit code は `target/ime-port/review2-verification/*.log` / `*.json`。
+環境設定は前回と同じ。vendor の依存は 1 系統、build safety check も exit 0。
+今回の指定範囲を実行し、前回の本体 filter tests / full gate は再実行していない。
+修正はコミットせず作業ツリーに残す。アプリ起動・実機確認と正式再レビューは行っていない。
+成果物・起動コマンドと実プロファイルの注意事項は前節を参照。

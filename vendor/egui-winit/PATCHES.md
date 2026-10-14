@@ -9,23 +9,26 @@ I2 段 2a（同日）: 実機記録に基づき、IME 処理済みキーの pres
 出典は [PR #7967](https://github.com/emilk/egui/pull/7967) と
 [egui-winit 0.34.0 の実装](https://raw.githubusercontent.com/emilk/egui/0.34.0/crates/egui-winit/src/lib.rs)
 （`try_on_ime_processed_keyboard_input`）。独立レビューの P2 を受け、設計 lead は本家との一致より
-「egui が見ていない press の release も渡さない」整合性を優先した。
+「集合には、今の押下について egui がまだ press を見ていない物理キーだけが入る」整合性を優先した。
 
 Windows の `allow_ime` が true の場合だけ、logical Process を遮断して
 `State::pressed_processed_physical_keys: HashSet<PhysicalKey>` に記録する。
 対応する release は logical が元のキーに戻るため、同集合から physical を remove して遮断する。
-本家との差分は次の 2 点のみ。状態は State（viewport）ごとに所有し、期限は設けない。
+通常 press / repeat を配送したら、その physical は集合から除去し、以後の release も配送する。
+allow_ime=false で通過する Process press も、配送する press として同じ扱いにする。
+本家との差分は次の 3 点。状態は State（viewport）ごとに所有し、期限は設けない。
 
 | 本家との差分 | 理由 | egui 更新時の確認 |
 | --- | --- | --- |
 | 記録済み physical の release は allow_ime 判定より先に必ず remove して遮断する | allow_ime=false 中に release が届いても記録を残さず、次の通常 release を誤って捨てて keys_down を残すことを防ぐ | true の Process press → false の release → true の通常 press/release を配送し、記録が空、keys_down が解除され、次の press が repeat にならないこと |
+| 配送する press / repeat の physical は集合から remove する | Process press 後に通常リピートを egui が見ると、最後の release を渡さなければ keys_down が残る | true の Process press → false / true の通常リピート →同じ allow_ime の release が配送され、keys_down が解除され、次の新規 press が repeat にならないこと。配送経路と State の両方で固定 |
 | WindowEvent::Focused(false) で当該 State の集合を空にする | focus 喪失中の release が別窓へ届いても、古い記録で復帰後の通常 release を捨てない | focus 喪失・復帰後の通常 press/release と sibling State の記録が独立すること |
 
 記録のない release は従来どおり渡す。allow_ime=false の Process press の扱いも本家どおり。
 遮断時の EventResponse も本家同様 repaint=false / consumed=wants_keyboard_input とする。
 Ime 変換と通常 Key / Text / clipboard producer、秘匿 trace は保持する。
 
-egui 更新時は上記 2 点が本家で解決済みか実装と回帰テストで確認する。未解決なら差分を維持する。
+egui 更新時は上記 3 点が本家で解決済みか実装と回帰テストで確認する。未解決なら差分を維持する。
 解決済みで診断 trace も不要になった時点で `vendor/egui-winit`、workspace exclude と path patch を削除し、本家へ戻す。
 
 KeyEvent は private field を持つため、その公開部品を受ける同名の状態遷移 helper に判定を置く。
