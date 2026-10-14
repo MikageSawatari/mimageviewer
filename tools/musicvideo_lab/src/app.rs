@@ -538,6 +538,8 @@ pub struct MusicVideoLabApp {
     audio: Option<Arc<AudioData>>,
     waveform: Option<TimelineWaveform>,
     audio_player: Option<AudioPlayer>,
+    #[cfg(test)]
+    audio_player_factory: fn(Arc<AudioData>) -> Result<AudioPlayer, String>,
     audio_error: Option<String>,
     document: DocumentSession,
     image_errors: HashMap<ImageId, String>,
@@ -566,6 +568,8 @@ pub struct MusicVideoLabApp {
     lrc_load: LrcLoadState,
     lrc_save_pending: Option<LrcSavePending>,
     preview_benchmark_target: Option<usize>,
+    #[cfg(test)]
+    drop_cleanup_observer: Option<Box<dyn FnOnce()>>,
 }
 
 impl MusicVideoLabApp {
@@ -599,6 +603,8 @@ impl MusicVideoLabApp {
             audio: None,
             waveform: None,
             audio_player: None,
+            #[cfg(test)]
+            audio_player_factory: AudioPlayer::new,
             audio_error: None,
             document: DocumentSession::default(),
             image_errors: HashMap::new(),
@@ -627,6 +633,8 @@ impl MusicVideoLabApp {
             lrc_load: LrcLoadState::Idle,
             lrc_save_pending: None,
             preview_benchmark_target: None,
+            #[cfg(test)]
+            drop_cleanup_observer: None,
         }
     }
 
@@ -1159,7 +1167,13 @@ impl MusicVideoLabApp {
             (Some(player), Some(audio)) => {
                 player.replace_audio(Arc::clone(audio), self.position_secs);
             }
-            (None, Some(audio)) => match AudioPlayer::new(Arc::clone(audio)) {
+            (None, Some(audio)) => match {
+                #[cfg(test)]
+                let create_player = self.audio_player_factory;
+                #[cfg(not(test))]
+                let create_player = AudioPlayer::new;
+                create_player(Arc::clone(audio))
+            } {
                 Ok(player) => self.audio_player = Some(player),
                 Err(error) => playback_error = Some(error),
             },
@@ -2577,7 +2591,10 @@ impl Drop for MusicVideoLabApp {
             let empty_assets = Arc::new(self.assets.fork_retain_images(&[]));
             let old_assets = std::mem::replace(&mut self.assets, empty_assets);
             let old_editor = std::mem::take(&mut self.editor_state);
-            let old_timeline = Arc::clone(&self.preview_timeline);
+            let old_timeline = std::mem::replace(
+                &mut self.preview_timeline,
+                Arc::new(Mutex::new(AnalysisTimeline::default())),
+            );
             let old_runtime = std::mem::replace(
                 &mut self.runtime_resources,
                 RuntimeResourceState::Ready(ResourceManifest::default()),
@@ -2588,6 +2605,10 @@ impl Drop for MusicVideoLabApp {
                 ProjectLoadState::Idle => {}
             }
             store.defer_drop((old_assets, old_editor, old_runtime, old_timeline));
+        }
+        #[cfg(test)]
+        if let Some(observer) = self.drop_cleanup_observer.take() {
+            observer();
         }
     }
 }
@@ -2633,6 +2654,294 @@ mod tests {
             .unwrap();
         app.preview_pending = None;
         result
+    }
+
+    fn h3a_spectrum_bits(frame: &SpectrumFrame) -> Vec<u32> {
+        let mut bits = vec![
+            u32::from(frame.note_min_midi),
+            u32::from(frame.keyboard.note_min_midi),
+        ];
+        bits.extend(frame.bands.iter().chain(&frame.notes).map(|v| v.to_bits()));
+        for level in &frame.keyboard.levels {
+            bits.extend([
+                level.center.to_bits(),
+                level.even.to_bits(),
+                level.odd.to_bits(),
+            ]);
+        }
+        for band in &frame.miv_spectrum.bands {
+            bits.extend([
+                band.value.to_bits(),
+                band.trail.to_bits(),
+                band.onset.to_bits(),
+            ]);
+        }
+        for value in &frame.modulators {
+            bits.extend([
+                value.id.0 as u32,
+                (value.id.0 >> 32) as u32,
+                value.value.to_bits(),
+            ]);
+        }
+        bits
+    }
+
+    #[test]
+    fn h3a_drop_moves_last_timeline_owner_to_cleanup_before_fields_drop() {
+        struct CleanupProbe {
+            original: std::sync::Weak<Mutex<AnalysisTimeline<ResourceRevision>>>,
+            tx: mpsc::Sender<(usize, String)>,
+        }
+        impl Drop for CleanupProbe {
+            fn drop(&mut self) {
+                self.tx
+                    .send((
+                        self.original.strong_count(),
+                        std::thread::current().name().unwrap_or("").to_owned(),
+                    ))
+                    .unwrap();
+            }
+        }
+
+        let mut app = h3a_app();
+        // Populate the original allocation synchronously, with no worker Arc.
+        let audio = app.audio.as_ref().unwrap();
+        let pcm = pcm_view(&audio.stereo_pcm, audio.sample_rate, 0.5).unwrap();
+        let key = AnalysisKey::new(
+            app.editor_state
+                .resource_manifest()
+                .audio()
+                .unwrap()
+                .revision(),
+            audio.sample_rate,
+            pcm.logical_frames,
+            FrameGrid::new(60.0, 0.5).unwrap(),
+            16,
+            Smoothing::default(),
+            &[],
+            &[],
+            0.0,
+        )
+        .unwrap();
+        app.preview_timeline
+            .lock()
+            .unwrap()
+            .frame(&key, pcm, 29, &|| false)
+            .unwrap();
+        assert_eq!(Arc::strong_count(&app.preview_timeline), 1);
+        let original = Arc::downgrade(&app.preview_timeline);
+        let store = app.resource_store.clone().unwrap();
+        app.drop_cleanup_observer = Some(Box::new(move || {
+            // FIFO cleanup completes while Drop still holds all app fields.
+            // With a cloned owner, the original field remains the last Arc here.
+            let (tx, rx) = mpsc::channel();
+            store.defer_drop(CleanupProbe { original, tx });
+            let (remaining, thread) = rx.recv_timeout(Duration::from_secs(20)).unwrap();
+            assert_eq!(thread, "musicvideo-resource-cleanup");
+            assert_eq!(
+                remaining, 0,
+                "the original allocation must be released by cleanup before app fields drop"
+            );
+        }));
+        drop(app);
+    }
+
+    #[test]
+    fn h3a_audio_commit_undo_restores_through_host_handlers_and_rejects_stale_completion() {
+        let ctx = egui::Context::default();
+        let mut app = h3a_app();
+        app.audio_player_factory = |_| Err("headless test: no audio device".to_owned());
+        let store = app.resource_store.clone().unwrap();
+        let initial_audio = app.audio.clone().unwrap();
+        let mut initial_manifest = ResourceManifest::default();
+        initial_manifest.set_audio(Some(
+            store
+                .store_audio(PathBuf::from("original.wav"), &initial_audio)
+                .unwrap(),
+        ));
+        app.editor_state
+            .reset_for_project_with_resources(&app.project, initial_manifest.clone());
+        app.runtime_resources = RuntimeResourceState::Ready(initial_manifest.clone());
+
+        // Control only completion scheduling; request(), cancel(), and polling
+        // remain the real resource-restore host path.
+        let (restore_tx, restore_rx) = mpsc::channel();
+        app.restore_worker = Some(ResourceRestoreWorker {
+            queue: Arc::new(RestoreQueue::default()),
+            rx: restore_rx,
+            next_generation: 1,
+            active_cancel: None,
+        });
+        let take_request = |app: &mut MusicVideoLabApp| {
+            app.restore_worker
+                .as_ref()
+                .unwrap()
+                .queue
+                .state
+                .lock()
+                .unwrap()
+                .latest
+                .take()
+                .unwrap()
+                .0
+        };
+        // Model a completed decode whose delivery can be delayed past cancellation.
+        let complete = |request: RestoreRequest| RestoreCompletion {
+            generation: request.generation,
+            session: request.session,
+            manifest: request.manifest.clone(),
+            result: Ok((
+                restore_manifest(&store, request.manifest, &AtomicBool::new(false)).unwrap(),
+                None,
+            )),
+        };
+        let owner = Arc::clone(&app.preview_timeline);
+        app.position_secs = 0.205;
+        let initial = h3a_request(&mut app, &ctx);
+        let initial_key = initial.analysis_key.clone().unwrap();
+        let initial_pcm = pcm_view(
+            &initial_audio.stereo_pcm,
+            initial_audio.sample_rate,
+            app.project.duration_secs,
+        )
+        .unwrap();
+        let original_bits = h3a_spectrum_bits(
+            owner
+                .lock()
+                .unwrap()
+                .frame(&initial_key, initial_pcm, initial.frame_index, &|| false)
+                .unwrap(),
+        );
+
+        let replacement = Arc::new(AudioData {
+            stereo_pcm: (0..8_000)
+                .map(|n| ((n / 2) as f32 * 0.19).sin() * 0.7)
+                .collect(),
+            sample_rate: 8_000,
+            duration_secs: 0.5,
+        });
+        let lease = store
+            .store_audio(PathBuf::from("replacement.wav"), &replacement)
+            .unwrap();
+        app.commit_audio(
+            PathBuf::from("replacement.wav"),
+            replacement.clone(),
+            TimelineWaveform::new(0.5, vec![[0.7, 0.7]]),
+            lease,
+            &ctx,
+        );
+        assert!(app.runtime_resources_ready());
+        assert!(Arc::ptr_eq(app.audio.as_ref().unwrap(), &replacement));
+        assert!(app.audio_player.is_none());
+        assert!(Arc::ptr_eq(&owner, &app.preview_timeline));
+        let replacement_result = h3a_request(&mut app, &ctx);
+        let replacement_key = replacement_result.analysis_key.clone().unwrap();
+        assert!(
+            replacement_key != initial_key,
+            "new PCM must reject the old analysis key"
+        );
+        assert!(owner.lock().unwrap().key() == Some(&replacement_key));
+        let replacement_pcm =
+            pcm_view(&replacement.stereo_pcm, replacement.sample_rate, 0.5).unwrap();
+        assert_ne!(
+            original_bits,
+            h3a_spectrum_bits(
+                owner
+                    .lock()
+                    .unwrap()
+                    .frame(&replacement_key, replacement_pcm, 12, &|| false)
+                    .unwrap()
+            )
+        );
+
+        assert!(app.editor_state.undo(&mut app.project));
+        app.handle_editor_response(EditorResponse {
+            project_changed: true,
+            history_changed: true,
+            ..EditorResponse::default()
+        });
+        app.sync_runtime_resources(&ctx);
+        assert!(matches!(
+            app.runtime_resources,
+            RuntimeResourceState::Restoring { .. }
+        ));
+        assert!(
+            app.audio.is_none(),
+            "Undo must clear the replaced decoded PCM"
+        );
+        assert!(
+            Arc::ptr_eq(&owner, &app.preview_timeline),
+            "Undo resource clearing must preserve the session owner"
+        );
+        assert!(owner.lock().unwrap().key() == Some(&replacement_key));
+        let stale_request = take_request(&mut app);
+
+        // Redo then Undo supersedes an in-flight restore for the same manifest.
+        assert!(app.editor_state.redo(&mut app.project));
+        app.handle_editor_response(EditorResponse {
+            project_changed: true,
+            history_changed: true,
+            ..EditorResponse::default()
+        });
+        app.sync_runtime_resources(&ctx);
+        let superseded = take_request(&mut app);
+        assert!(stale_request.cancel.load(Ordering::Relaxed));
+        assert!(app.editor_state.undo(&mut app.project));
+        app.handle_editor_response(EditorResponse {
+            project_changed: true,
+            history_changed: true,
+            ..EditorResponse::default()
+        });
+        app.sync_runtime_resources(&ctx);
+        let current_request = take_request(&mut app);
+        let current_generation = current_request.generation;
+        assert!(superseded.cancel.load(Ordering::Relaxed));
+        assert_eq!(current_request.manifest, initial_manifest);
+        restore_tx.send(complete(stale_request)).unwrap();
+        app.poll_resource_restore();
+        assert!(
+            matches!(app.runtime_resources, RuntimeResourceState::Restoring { generation, .. } if generation == current_generation)
+        );
+        assert!(
+            app.audio.is_none(),
+            "stale same-manifest completion must not install PCM"
+        );
+        restore_tx.send(complete(current_request)).unwrap();
+        app.poll_resource_restore();
+        assert!(app.runtime_resources_ready());
+        assert_eq!(app.editor_state.resource_manifest(), &initial_manifest);
+        assert!(Arc::ptr_eq(&owner, &app.preview_timeline));
+        assert!(
+            owner.lock().unwrap().key() == Some(&replacement_key),
+            "restore completion must leave analysis rebuilding to the next request"
+        );
+        selection_deliver(&mut app, &ctx, replacement_result);
+        assert!(
+            app.displayed_preview.is_none(),
+            "old PCM preview must not be adopted after Undo"
+        );
+        let restored = h3a_request(&mut app, &ctx);
+        assert!(restored.analysis_key.as_ref() == Some(&initial_key));
+        assert!(owner.lock().unwrap().key() != Some(&replacement_key));
+        let restored_bits = h3a_spectrum_bits(
+            owner
+                .lock()
+                .unwrap()
+                .frame(&initial_key, initial_pcm, restored.frame_index, &|| false)
+                .unwrap(),
+        );
+        let mut reference = AnalysisTimeline::default();
+        let mut reference_bits = Vec::new();
+        for n in 0..=restored.frame_index {
+            reference_bits = h3a_spectrum_bits(
+                reference
+                    .frame(&initial_key, initial_pcm, n, &|| false)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(restored_bits, original_bits);
+        assert_eq!(restored_bits, reference_bits);
+        assert_eq!(restored.image.pixels, initial.image.pixels);
     }
 
     #[test]
@@ -2737,13 +3046,10 @@ mod tests {
     }
 
     #[test]
-    fn h3a_preview_state_survives_error_stale_result_seek_switch_audio_and_undo() {
+    fn h3a_preview_state_survives_error_stale_result_seek_and_project_switch() {
         let ctx = egui::Context::default();
         let mut app = h3a_app();
         let owner = Arc::clone(&app.preview_timeline);
-        let initial_project = app.project.clone();
-        let initial_audio = app.audio.clone();
-        let initial_manifest = app.editor_state.resource_manifest().clone();
         app.position_secs = 0.205;
         let result = h3a_request(&mut app, &ctx);
         assert_eq!(result.frame_index, 12);
@@ -2786,6 +3092,19 @@ mod tests {
         app.seek_to(0.05);
         assert_eq!(owner.lock().unwrap().processed_frame(), Some(12));
         assert_eq!(h3a_request(&mut app, &ctx).frame_index, 3);
+        let checkpoint = app.editor_state.begin_external_edit(&app.project);
+        app.project.display_gain_db = 6.0;
+        app.editor_state
+            .finish_external_edit(&app.project, checkpoint);
+        assert!(h3a_request(&mut app, &ctx).analysis_key.as_ref() != Some(&first_key));
+        assert!(app.editor_state.undo(&mut app.project));
+        app.handle_editor_response(EditorResponse {
+            project_changed: true,
+            history_changed: true,
+            ..EditorResponse::default()
+        });
+        app.sync_runtime_resources(&ctx);
+        assert!(h3a_request(&mut app, &ctx).analysis_key.as_ref() == Some(&first_key));
         // A project replacement does not replace the session timeline owner.
         app.apply_loaded_project(LoadedProject {
             path: PathBuf::from("switch.mivmv.json"),
@@ -2799,42 +3118,6 @@ mod tests {
         });
         assert!(Arc::ptr_eq(&owner, &app.preview_timeline));
         assert!(owner.lock().unwrap().key() == Some(&first_key));
-        // Record an audio replacement in real editor history without starting an audio device.
-        app.project = initial_project;
-        app.editor_state
-            .reset_for_project_with_resources(&app.project, initial_manifest.clone());
-        app.audio = initial_audio.clone();
-        let checkpoint = app.editor_state.begin_external_edit(&app.project);
-        let fixture = h3a_app();
-        let replacement = fixture.editor_state.resource_manifest().clone();
-        app.project.audio.as_mut().unwrap().path = PathBuf::from("replacement.wav");
-        app.editor_state.finish_external_edit_with_resources(
-            &app.project,
-            checkpoint,
-            replacement.clone(),
-        );
-        app.runtime_resources = RuntimeResourceState::Ready(replacement);
-        app.audio = fixture.audio.clone();
-        let new_result = h3a_request(&mut app, &ctx);
-        assert!(new_result.analysis_key.as_ref() != Some(&first_key));
-        assert_eq!(owner.lock().unwrap().processed_frame(), Some(0));
-        let new_key = new_result.analysis_key.clone().unwrap();
-        let checkpoint = app.editor_state.begin_external_edit(&app.project);
-        app.project.display_gain_db = 6.0;
-        app.editor_state
-            .finish_external_edit(&app.project, checkpoint);
-        assert!(h3a_request(&mut app, &ctx).analysis_key.as_ref() != Some(&new_key));
-        assert!(app.editor_state.undo(&mut app.project));
-        assert!(h3a_request(&mut app, &ctx).analysis_key.as_ref() == Some(&new_key));
-        assert!(
-            app.editor_state.undo(&mut app.project),
-            "undo audio replacement"
-        );
-        assert_eq!(app.editor_state.resource_manifest(), &initial_manifest);
-        app.audio = initial_audio;
-        app.runtime_resources = RuntimeResourceState::Ready(initial_manifest);
-        assert!(h3a_request(&mut app, &ctx).analysis_key.as_ref() == Some(&first_key));
-        assert!(Arc::ptr_eq(&owner, &app.preview_timeline));
     }
 
     #[test]

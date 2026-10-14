@@ -596,6 +596,69 @@ mod tests {
         assert!(timeline.key() == Some(&key));
         assert_eq!(timeline.processed_frame(), Some(179));
     }
+
+    #[test]
+    fn parallel_cancellation_retains_committed_segments_and_resumes_exactly() {
+        // Two threads force a two-segment raw batch even on single-core CI.
+        // All raw-task cancellation probes finish before ordered merging starts,
+        // so the probe count selects an exact committed boundary without sleeps
+        // or depending on the order in which Rayon schedules those tasks.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let pcm = samples();
+            let view = PcmView::new(&pcm, 32_000);
+            let grid = FrameGrid::new(60.0, 4.0).unwrap();
+            let mut key = key(1, grid, 0.0);
+            key.logical_frames = view.logical_frames;
+            let expected = reference(&key, view);
+            for (cancel_after, committed) in [(5, 59), (6, 119)] {
+                let mut timeline = AnalysisTimeline::default();
+                let probes = AtomicUsize::new(0);
+                // Preflight + loop + two raw segments + first merge = 5 probes.
+                // Cancel at the second merge, or at the next batch boundary.
+                let cancelled = timeline.frame_impl(
+                    &key,
+                    view,
+                    239,
+                    &|| probes.fetch_add(1, Ordering::SeqCst) >= cancel_after,
+                    true,
+                );
+                assert!(matches!(cancelled, Err(AnalysisTimelineError::Cancelled)));
+                assert_eq!(probes.load(Ordering::SeqCst), cancel_after + 1);
+                assert_eq!(timeline.processed_frame(), Some(committed));
+                assert!(timeline.key() == Some(&key));
+                let checkpoint_indices = timeline.checkpoints.keys().copied().collect::<Vec<_>>();
+                assert_eq!(
+                    checkpoint_indices,
+                    (59..=committed).step_by(60).collect::<Vec<_>>()
+                );
+                for checkpoint in timeline.checkpoints.values() {
+                    assert_eq!(
+                        bits(&checkpoint.state.frame),
+                        expected[checkpoint.index as usize],
+                    );
+                }
+                assert_eq!(
+                    bits(timeline.frame(&key, view, committed, &|| false).unwrap()),
+                    expected[committed as usize],
+                );
+                // The first case resumes through another parallel batch; both
+                // cases then finish via the same step as the sequential oracle.
+                assert_eq!(
+                    bits(timeline.frame(&key, view, 239, &|| false).unwrap()),
+                    expected[239],
+                );
+                assert_eq!(
+                    bits(timeline.frame(&key, view, 59, &|| false).unwrap()),
+                    expected[59],
+                );
+            }
+        });
+    }
+
     fn key_with_gain(k: &AnalysisKey<u64>, gain: f32) -> AnalysisKey<u64> {
         let mut k = k.clone();
         k.gain_bits = gain.to_bits();

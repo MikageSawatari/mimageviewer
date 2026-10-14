@@ -394,11 +394,10 @@ key／進捗汚染を検出し、経路検査は host 側の 1 箇所だけの�
 `cargo fmt`／`cargo fmt --check`、glyph check（危険文字 0）、`git diff --check` も成功。
 すべての build／test に `MSBUILDDISABLENODEREUSE=1` を設定した。
 
-独立実装レビューは GPT-6.1 Sol / xhigh が source 11 ファイルの凍結 snapshot を確認し **ACCEPT**、修正必須の指摘なし。
-入力の論理長、既定方式の維持、bitwise key、checkpoint 復帰、並列区間の結合順と単一 step、
-共有 owner／取消／worker 受付／revision の採否、共通入口と回帰テストの意味を確認した。
-レビュー担当は build／test／計測を重複実行せず、この実装記録の検証証跡を使用する。
-証跡は `target/h3a-evidence/independent-review.txt` と同 `review-snapshot/`。
+前回の実装担当が作業中に別 context へ依頼した確認は**自己確認**として扱う。
+正式な独立実装レビューの通過記録は取り下げる。正式な独立レビューと検収は設計 lead が別セッションで依頼する。
+`b473603cc` に対する正式な独立実装レビュー 1 回目（利用者提示、GPT-6.1 Sol / xhigh）は **REVISE**。
+指摘 3 件と対応は下の「独立レビュー 1 回目 REVISE と対応」に記録する。
 設計との相違は上記の利用者が承認した A6 の目安改訂のみ。P4b／H3b の実 decoder 統一と製品画素検証は範囲外のまま。
 
 確認用ビルドは `MSBUILDDISABLENODEREUSE=1` を設定し、`scripts/build-dev.ps1 -PreserveRuntime` で成功。
@@ -408,6 +407,55 @@ portable feature は有効にしていない。agent は本体・lab GUI・生�
 `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。
 この core は既定で実際の `%APPDATA%\mimageviewer` を使用し、設定／データを更新し得る。
 single-instance mutex を共有するため、起動前にインストール版／tray 常駐版 mImageViewer を終了する。
+
+##### 独立レビュー 1 回目 REVISE と対応（`b473603cc`、2026-10-14）
+
+正式な独立実装レビューは利用者が別セッションで実施した GPT-6.1 Sol / xhigh の **REVISE**。
+P2 2 件・P3 1 件を受領した。前回の別 context での自己確認は正式レビューの通過として扱わず、
+H3a 行と本文の通過記録を訂正した。以下は `b473603cc` に対する未コミットの修正で、正式な再レビューは未実施。
+
+| 指摘 | 確認した原因／検証不足 | 対応 |
+| --- | --- | --- |
+| P2: timeline の最終解放先 | `Drop` が cleanup worker へ Arc の複製を渡し、元の field を残していた。worker が先に複製を解放すると、field の自動 Drop が UI 上の最終解放になる | `mem::replace` で空の timeline に置き換え、元の Arc 自体を既存 cleanup worker に移譲。実行時の待機・新しい worker・回復機構は追加しない |
+| P2: A1b 音声差し替え／Undo の handler 検証不足 | 旧テストは `audio`／`runtime_resources` を直接代入して音声変更と復元を模擬していたため、Undo の実際の clear／restore 経路の退行を検出できなかった | 実際の `commit_audio`、Undo／Redo → `handle_editor_response` → `sync_runtime_resources` → `poll_resource_restore` を通す独立した host テストへ置換。実 blob の PCM 復元と完了順を制御し、同じ manifest の古い generation の破棄、owner 保持、旧 PCM key／preview の排除、復元後の全 SpectrumFrame ビット一致を検証 |
+| P3: 並列区間の取消・再開の未検証 | 既存取消テストが `frame_impl(..., false)` の逐次経路だけだった | 専用 2-thread Rayon pool と `frame_impl(..., true)` で 2 区間の raw batch を強制。最初の区間確定後の結合途中（c=59）と次 batch 境界（c=119）で取消し、確定状態と checkpoint を保持して再開。frame239 と保存済み frame59 の全ビットを逐次参照と比較 |
+
+変更ファイルは `tools/musicvideo_lab/src/app.rs`（解放先修正・host regression）、
+`crates/musicvideo-core/src/analysis_timeline.rs`（並列取消 regression のみ）、本設計書の 3 ファイル。
+UI 上で cleanup を待つ処理は追加していない。解放先の競合は `cfg(test)` の end-of-Drop observer が
+field の自動 Drop 前に cleanup FIFO の完了を待ち、元 allocation の `Weak::strong_count() == 0` と
+cleanup thread 名を検査することで、cleanup が UI より先に終わる順序を決定的に作る。
+音声デバイスを開かず実 handler を通す factory 注入も `cfg(test)` のみで、通常 build は従来どおり `AudioPlayer::new` を呼ぶ。
+既存の gain 編集／Undo、描画エラー、revision 不一致、seek、project 切替の回帰検査は維持した。
+
+失敗確認は次のとおり。すべてコンパイル成功後の対象テスト失敗（exit 101）であり、
+修正／変異除去後は同じテストが成功（exit 0）した。ログと再現コマンドは `target/h3a-revise1/` に保存する。
+
+| ケース | 修正前または変異での失敗 | 復元後の確認 |
+| --- | --- | --- |
+| Drop の旧 clone 実装 | `h3a_drop_moves_last_timeline_owner_to_cleanup_before_fields_drop`: 元 allocation の残る strong count が 1（期待 0）。`lab-drop-old-clone-red.log` | mem::replace 修正後、H3a 対象 9 件で成功 |
+| Undo clear で owner を置換する変異 | `h3a_audio_commit_undo_restores_through_host_handlers_and_rejects_stale_completion`: `Undo resource clearing must preserve the session owner`。`lab-audio-undo-reset-mutant-red.log` | 同テストの初回 green と変異除去後 green、lab 全 84 件成功 |
+| 並列 merge 取消で確定状態と checkpoint を捨てる変異 | `parallel_cancellation_retains_committed_segments_and_resumes_exactly` が processed frame の保持検査で失敗。`p3-merge-cancel-discards-state-red.log` | 変異除去後、同じ 1 件成功 |
+| 並列 merge 取消で checkpoint だけ捨てる変異 | 同テストが保存済み checkpoint 番号列の検査で失敗。`p3-merge-cancel-discards-checkpoints-red.log` | 変異除去後、同じ 1 件成功 |
+| 並列経路を無効にする変異 | 同テストが確定位置の検査で失敗し、逐次経路だけでは新テストを通せないことを確認。`p3-disabled-parallel-path-red.log` | 変異除去後、同じ 1 件成功 |
+
+host 側コマンドと結果は `lab-commands.txt`、P3 の変異 script／各終了値は
+`p3_mutations.py`／`p3_mutations.json`、新しい P3 テストの初回成功は `p3-baseline-green.log`。
+3 件の指摘のうち実行時の不具合修正は解放先の P2 のみで、残る 2 件は要求された検証不足の補強。
+music-core の解析方式・格子・較正・step の演算・書き出し経路は変更しておらず、先行 A5／A6 の証跡を維持する。
+
+修正後の最終検証（`MSBUILDDISABLENODEREUSE=1`、test profile、`b473603cc`＋本差分）は
+`cargo test -p musicvideo-core -p musicvideo-ui -p musicvideo_lab` が **323 件成功・失敗 0**
+（core 117 = unit115＋経路2、UI 122、lab 84、exit 0）。新規は core 1 件・lab 2 件。
+ログは `target-tests-final.log`。`cargo fmt`／`cargo fmt --check`、glyph check（危険文字 0）、
+`git diff --check` も成功した。変更していない music-core と本体 mvexport は、利用者提示の
+`b473603cc` 上の 69 件／8 件成功を有効な証跡として再利用し、新たな実行件数には加算していない。
+
+通常 build の `cfg(not(test))` 分岐も `cargo build --release -p musicvideo_lab` で確認した
+（34.02 秒、exit 0、`lab-release-build.log`）。成果物は `target/release/musicvideo_lab.exe`。
+本段の本番変更は lab の終了時所有移譲だけで、本体 core の再ビルドは行わない。
+アプリ／lab GUI／成果物は未起動、コミットなし。既存の未追跡 `out.mp4` は保持した。
+3 件の対応と対象自動検証は完了。**正式な独立再レビュー／検収は待ち**であり、自己確認を通過判定として記録しない。
 
 ### D4. ラスタライザは CPU から始める（`comic-core` を土台にする）
 
@@ -2116,7 +2164,7 @@ frame n → t = n/fps → evaluate → rasterize(CPU, rayon) → RGBA→NV12/YUV
 | **L3** 実装済み・追加P3修正の再検収待ち | 状態で動かない上部とステータス（D14 末尾）: ツールバー 1 段・固定 1 行のステータスバー・読込衝突はモーダル・未解決素材と診断は別ウィンドウ・素材パスはプロジェクトタブ | 初版 `e958226a9`（254件）。キャンセル領域/未保存の印/タイトル送信の3件を修正した `a5c05ef65`（258件）は独立再レビューで条件付きACCEPT。**追加P3「詳細メニューのID変化」を修正・自動検証済み**（2026-10-09、未コミット差分）: ステータスの子UI4領域を用途ごとの固定IDにする。新規lab 1件、500/1400pt×書出/画像読込/保存完了の7組合せ、計14ケースでメニュー維持とメニュー内の未解決素材操作を実描画/実クリックで検査。修正前と詳細IDだけを戻す変異で失敗確認。復元後 core 80 / UI 105 / lab 74、計259件成功。禁止依存なし、fmt/glyph成功、releaseラボ再build成功（30.53秒）。L1/L2・H1/H2・非同期採否順序は維持。根拠・ログは下記L3追加P3記録。アプリ起動・停止、コミットなし |
 | **T1** | 文字装飾（D15）: comic-core既存装飾をText / TimeText / Lyricsに共通接続 | 初版fce65bb15、巨大確保・昇格・clip修正f54b6e5b6、準備共有・旧注釈22hash固定338a38899は条件付きACCEPT。保持64MiB = 静的RGBA24 / 補間RGBA8 / 準備32、1焼成RGBA8MiB以下。straight RGBA修正は検収採用済み。今回P3: eviction前後・再準備のglyph RGBA比較、旧非空判定への復帰変異も検出。計測器をscripts/musicvideo/t1-measure.pyへ保存し、前/中のCPU・新規PID・終了後CPU・短命PID通知を監視、取得不可も棄却。16ケース各3回＋5分全補間/混在、3枠保持とOSメモリ時系列・合否目安・所要時間をJSON/表へ。core104 / UI121 / lab75 / Python15、計315件成功、計測feature付きeviction1件も成功。既存4hash・fmt維持、release headless例build成功。**P2正式性能計測は利用者指定で今回は未実施、後日利用者が python scripts/musicvideo/t1-measure.py を実行**。smokeは競合/WMI拒否で不採用。初回4.274ms等を現行の採用値にしない。今回comic-core変更・commit・アプリ起動・build-devなし。手順・旧経路未測定理由はD15参照 |
 | **I1 段 2a / 2b 実装・自動検証済み／実機確認待ち** | IME 補正の共有（D10「設定・入力」）: 本体 `ime_focus` の egui 依存部分（入力補正 plugin・single-line helper）を共有クレートへ挙動不変で切り出し、本体とエディタのホストが policy を登録する | **段 2a（2026-10-09、`367f9c9d3`・独立実装レビュー ACCEPT）**: `egui-ime` と本体 facade、既存呼び出し元を維持。既存 23 件は共有 16 / 本体 7 に配置、raw 禁止・adapter を追加（共有 17 / 本体 12 passed）。full gate 12,681 passed / 58 ignored、fmt / glyph、通常 profile の確認用 build 成功。**段 2b（同日、未コミット）**: 全域 Tab policy を挙動不変で共有化、本体 facade・既存 5 テストを維持。エディタの登録入口・5 欄 helper・Undo gate・raw 禁止を実装、歌詞 buffer / widget ID / native Undo と Hz DragValue を維持。利用者承認でモジュレータ見出しを不変 ID に固定し、同型箇所も調査。追加 13 テスト、UI 117 / ラボ 75 / core 80 / 共有 17 passed、既存 L1〜L3 全件維持、変異 6 件を検出。本体 Tab / IME / 関連・snapshot も通過。full gate **12,694 passed / 58 ignored / 0 failed**、fmt / glyph / 依存検査、ラボ release build 成功。独立実装レビュー **ACCEPT、指摘なし**。build-dev 再実行・コミット・アプリ起動なし。詳細は D10「I1 設計」§7・§8。**実装・自動検証は完了、実機確認・最終受け入れは未完了**。本体の確認用 exe は更新せず、ラボの確認用 exe は `target/release/musicvideo_lab.exe` |
-| **H3a** 実装・指定自動検証完了（独立実装レビュー ACCEPT） | 共通格子／PCM view／タイムライン所有／較正を接続。A6 は設計担当判断で約 0.7 秒以内（並列）を採用し、生の値のキャッシュは追加しない | D3 の H3a 実装記録を参照。変異 32 ケースの失敗・復元後成功、本体 lib 全体＋関連 4 crate 計 13,108 件成功（既存 ignored 59）、変更後速度／RGBA hash 比較、確認用 core build 完了。P4b／H3b は別段。アプリ／lab GUI 未起動、未コミット |
+| **H3a** 独立レビュー 1 回目 REVISE の 3 件対応・対象自動検証済み／再レビュー待ち | 共通格子／PCM view／タイムライン所有／較正を接続。A6 は設計担当判断で約 0.7 秒以内（並列）を採用し、生の値のキャッシュは追加しない | D3 の H3a 実装記録を参照。`b473603cc` の解放先 P2／音声 Undo handler 検証 P2／並列取消検証 P3 に対応。旧 clone＋変異 4 ケースで失敗確認、修正／復元後 323 件成功、fmt／glyph／lab release build 成功。前回の別 context 確認は自己確認へ訂正。未コミット・GUI 未起動。P4b／H3b は別段 |
 | **H3b** | 一致の検証（P4b 接続後） | プレビューで表示したフレームが、同じ時刻の書き出しフレームと一致する: 表示フレームの欠落、前後への seek、直接 seek、音源より短い / 長い出力尺。これが通るまで H3 を完了扱いにしない |
 | **P4a** ✅ | 方式の設計確定: 本書 D10 / D14〜D16 の独立レビュー | GPT-6.1 Sol / xhigh の設計レビューで blocking 指摘なし。**完了**（2026-10-09）: 3 回目で条件付き ACCEPT（残った P3 の文言は反映済み）。runtime 競合の割り切りはユーザー判断で確定 |
 | **P4b** | ホストの製品化（D16）: ラボを `crates/musicvideo-editor` へ移し、FFmpeg デコードへ統一、スナップショット入力の MP4 書き出し（モーダル・進捗・キャンセル）、未保存の編集の確認、音声スレッドが stream を所有する再生と f32 以外の出力形式対応 | 書き出しがファイルを読み直さず、プレビューと同じ PCM・素材を使う（元ファイル変更・Undo 後の書き出しをテスト）。未保存確認の開く / 新規 / 最近 / 閉じる × 保存成功 / 失敗 / キャンセル、**保存は成功したが完了時点で再び未保存**、保存中・書き出し中の終了を handler テストで固定。書き出しの進捗・キャンセル・失敗が UI を止めない（[ui-responsiveness.md](ui-responsiveness.md) §4）。編集済みプロジェクトの 5 分 1080p60 完走と実測 |
