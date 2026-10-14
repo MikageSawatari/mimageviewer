@@ -16,6 +16,10 @@ impl MusicVideoLabApp {
                     .set_file_name("musicvideo.mp4")
                     .save_file()
                     .map(|path| {
+                        // rfd does not report whether the OS dialog's overwrite prompt was approved,
+                        // so a path that exists right after the dialog returns is treated as approved.
+                        // Another process creating the same name between the dialog closing and this
+                        // check is accepted as a rare failure (plan: P4b-3 record, design lead decision).
                         let replace_existing = path.exists();
                         (path, replace_existing)
                     });
