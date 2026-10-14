@@ -799,3 +799,243 @@ fn page_turn_merge_master_slideshow_barrier_commits_grid_and_deadline_once() {
         );
     }
 }
+
+// Saved schema-2 input from the user's 2026-10-14 coverless PDF report.
+// Page numbers in this fixture are raw, zero-based, not projected indices.
+fn saved_coverless_book() -> BookComposition {
+    serde_json::from_str(include_str!(
+        "../../../tests/fixtures/book_composition_coverless.json"
+    ))
+    .unwrap()
+}
+
+fn saved_pdf_viewer(ctx: &egui::Context, book: &BookComposition) -> crate::app::AppTestEnvForTest {
+    let mut app = composed_app(ctx, book, 40);
+    app.spread_mode = if book.cover_enabled {
+        SpreadMode::LtrCover
+    } else {
+        SpreadMode::Ltr
+    }
+    .with_reading_direction(composition_view_direction(book.direction));
+    app.native_video_in_window_active = true;
+    app.viewer_presentation = crate::app::ViewerPresentation::MainWindow;
+    app.settings.video_in_window_mode = true;
+    app.settings.singleton_spread_first_enabled = false;
+    app.settings.singleton_spread_last_enabled = false;
+    app.settings.fullscreen_fit_mode = FullscreenFitMode::Page;
+    app.settings.fullscreen_navigator_visible = false;
+    app.settings.still_seek_strip_visible = false;
+    for idx in 0..app.items.len() {
+        let image = Arc::new(egui::ColorImage::filled([80, 113], egui::Color32::GREEN));
+        let tex = ctx.load_texture(
+            format!("saved-coverless-{idx}"),
+            image.clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                tex,
+                pixels: image,
+                source_dims: Some([576, 816]),
+                load_seq: 1,
+                animation: crate::fs_animation::StaticAnimationState::Still,
+            },
+        );
+        app.record_page_dims_for_spread(idx, (576, 816));
+        app.record_page_layout_dims_for_spread(idx, (576, 816));
+        app.rotation_cache
+            .insert(idx, crate::rotation_db::Rotation::None);
+    }
+    app
+}
+
+fn saved_pdf_index(app: &App, raw_page: u32) -> usize {
+    app.composed_book_layout()
+        .unwrap()
+        .visible_pages
+        .iter()
+        .position(|page| page.page == fixtures::document_page(raw_page))
+        .unwrap()
+}
+
+fn paint_saved_pdf_viewport(
+    app: &mut App,
+    ctx: &egui::Context,
+) -> Vec<crate::app::paint_record_test_support::PaintRecord> {
+    let output = crate::app::paint_record_test_support::with_capture(|| {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1093.0, 614.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.render_fullscreen_viewport(ctx),
+        )
+    });
+    crate::app::paint_record_test_support::paint_records(egui::ViewportId::ROOT, &output)
+}
+
+fn assert_saved_pdf_alone_paint(
+    app: &mut App,
+    ctx: &egui::Context,
+    raw_page: u32,
+    side: SingletonSpreadPlacement,
+) {
+    let idx = saved_pdf_index(app, raw_page);
+    // The production frame trims the fixture's overfull 38-page cache to
+    // its ordinary resident window. Model the already decoded target before
+    // each observation, rather than dispatching I/O to a nonexistent PDF.
+    if !matches!(app.fs_cache.get(&idx), Some(FsCacheEntry::Static { .. })) {
+        let pixels = Arc::new(egui::ColorImage::filled([80, 113], egui::Color32::GREEN));
+        let tex = ctx.load_texture(
+            format!("saved-ready-{idx}"),
+            pixels.clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                tex,
+                pixels,
+                source_dims: Some([576, 816]),
+                load_seq: 1,
+                animation: crate::fs_animation::StaticAnimationState::Still,
+            },
+        );
+    }
+    app.fullscreen_idx = Some(idx);
+    let composition = app.spread_display_composition_for_anchor(idx);
+    assert_eq!(composition.navigation_pages(), vec![idx]);
+    assert_eq!(
+        composition.singleton_placement(),
+        side,
+        "builder raw={raw_page}"
+    );
+    let demand = app.book_target_presentation_demand(idx);
+    app.install_allowed_presentation_for_test(&demand);
+    paint_saved_pdf_viewport(app, ctx);
+    let records = paint_saved_pdf_viewport(app, ctx);
+    let transform = app
+        .fullscreen_page_layout
+        .single_page()
+        .unwrap_or_else(|| {
+            panic!(
+                "actual viewport singleton raw={raw_page}, mode={:?}, animation={}, first={:?}/{}",
+                app.spread_mode,
+                app.settings.page_turn_animation_enabled,
+                app.singleton_spread_endpoint_preferences.first,
+                app.settings.singleton_spread_first_enabled
+            )
+        })
+        .transform;
+    assert_eq!(transform.page_idx, idx);
+    let actual_side = match transform.placement {
+        ResolvedDisplayPlacement::SingletonSpread { side, .. } => side,
+        ResolvedDisplayPlacement::Normal { .. } => SingletonSpreadPlacement::Center,
+        other => panic!("ordinary PDF viewport: {other:?}"),
+    };
+    assert_eq!(actual_side, side, "paint raw={raw_page}");
+    let proof = app.test_paint_provenance_for_idx(idx).unwrap();
+    let real = records
+        .iter()
+        .find(|record| record.provenance == proof)
+        .expect("source-owned image primitive");
+    let painted = egui::Rect::from_points(&real.vertices.iter().map(|v| v.pos).collect::<Vec<_>>());
+    assert_eq!(
+        painted, transform.paint_rect,
+        "actual primitive, not only layout metadata"
+    );
+    let delta = painted.center().x - transform.viewport_rect.center().x;
+    match side {
+        SingletonSpreadPlacement::Right => assert!(delta > 10.0, "raw={raw_page}, {transform:?}"),
+        SingletonSpreadPlacement::Left => assert!(delta < -10.0, "raw={raw_page}, {transform:?}"),
+        SingletonSpreadPlacement::Center => {
+            assert!(delta.abs() <= 1.0, "raw={raw_page}, {transform:?}")
+        }
+        _ => panic!("Alone has no explicit white companion"),
+    }
+}
+
+#[test]
+fn page_turn_saved_coverless_alone_actual_viewport_placement() {
+    let _serial = crate::key_input::lock_test_input();
+    let book = saved_coverless_book();
+    assert!(!book.cover_enabled);
+    assert_eq!(book.page_order.len(), 40);
+    let ctx = egui::Context::default();
+    install(&ctx);
+    install_fs_navigator_input_tracking(&ctx);
+    let _pdf_rerender = crate::app::PdfRerenderRequestProbe::start();
+    let mut app = saved_pdf_viewer(&ctx, &book);
+    assert_eq!(app.items.len(), 38);
+    assert_eq!(saved_pdf_index(&app, 10), 8);
+    assert_eq!(saved_pdf_index(&app, 11), 9);
+    assert_eq!(saved_pdf_index(&app, 17), 15);
+    // Warm the real builder, then use the actual prepared presentation and
+    // ordinary viewport draw for consecutive Alone and later Alone pages.
+    app.spread_display_composition_for_anchor(0);
+    for raw_page in [10, 11, 17] {
+        assert_saved_pdf_alone_paint(&mut app, &ctx, raw_page, SingletonSpreadPlacement::Right);
+    }
+    let next = saved_pdf_index(&app, 12);
+    assert_eq!(
+        app.spread_display_composition_for_anchor(next)
+            .navigation_pages(),
+        vec![next, saved_pdf_index(&app, 13)]
+    );
+    app.fullscreen_idx = Some(next);
+    let demand = app.book_target_presentation_demand(next);
+    app.install_allowed_presentation_for_test(&demand);
+    paint_saved_pdf_viewport(&mut app, &ctx);
+    assert_eq!(app.fullscreen_page_layout.displayed_pages().count(), 2);
+}
+
+#[test]
+fn page_turn_saved_coverless_alone_viewport_endpoint_matrix() {
+    use crate::settings::SingletonSpreadPlacementPreference as Pref;
+    let _serial = crate::key_input::lock_test_input();
+    let _pdf_rerender = crate::app::PdfRerenderRequestProbe::start();
+    for direction in [CompositionDirection::Ltr, CompositionDirection::Rtl] {
+        for cover in [false, true] {
+            let mut book = saved_coverless_book();
+            book.direction = direction;
+            book.cover_enabled = cover;
+            book.page_overrides.push(PageOverrideEntry {
+                page: fixtures::document_page(39),
+                directive: PageOverride::Alone,
+            });
+            let ctx = egui::Context::default();
+            install(&ctx);
+            install_fs_navigator_input_tracking(&ctx);
+            let mut app = saved_pdf_viewer(&ctx, &book);
+            // Keep the terminal Alone a real single leaf; supplement behavior
+            // has separate regressions and is unavailable without a cover.
+            app.settings.final_cover_spread_enabled = false;
+            app.settings.singleton_spread_last_enabled = true;
+            for animation in [true, false] {
+                app.settings.page_turn_animation_enabled = animation;
+                for global in [false, true] {
+                    app.settings.singleton_spread_first_enabled = global;
+                    for preference in [Pref::FollowGlobal, Pref::Center, Pref::Place] {
+                        app.singleton_spread_endpoint_preferences.first = preference;
+                        let side = if animation || preference.effective(global) {
+                            if direction == CompositionDirection::Ltr {
+                                SingletonSpreadPlacement::Right
+                            } else {
+                                SingletonSpreadPlacement::Left
+                            }
+                        } else {
+                            SingletonSpreadPlacement::Center
+                        };
+                        for raw_page in [10, 11, 17, 39] {
+                            assert_saved_pdf_alone_paint(&mut app, &ctx, raw_page, side);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

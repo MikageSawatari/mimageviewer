@@ -2838,6 +2838,8 @@ core生成日時は2026-10-14 17:47:52、329,547,776 bytes、FileVersion 4.6.0.0
 
 **Alone**: 組み直しの起点を表紙（先頭の単ページ）と同じ性質として配置する。
 本来の側はLTRなら画面右、RTLなら画面左。cover on/offや途中の位置から別の側を推測しない。
+表紙なしでも読む方向だけから表紙ありと同じ側を決める。連続Aloneでは毎ページ同じ側を使い、
+その直後の無指定ページから通常pairを再開する。末尾Aloneも同じ規則を使う。
 local paged見開きのアニメONでは既存§26.2の実効first=trueを共通resolverへ渡す。
 OFFではsingleton_spread_first_enabledと本別先頭preferenceの実効値に従い、保存値は変更しない。
 先頭・途中・末尾の縦長Aloneすべて同じ。末尾endpointでは上書きしない。横長単独は中央。
@@ -2920,3 +2922,34 @@ egui25／egui-winit29／egui-wgpu11／eframe18が成功（vendor-*.log）。
 横長の中央も確認する。明示白紙の前後進／末尾白紙、構成なしの表紙次／最終単独の白面も同じくめくる。
 自動末尾白面を見る場合は末尾表紙をOFFにする。明示末尾白面は末尾表紙ONでも表紙を添えない。
 引数なしのnormal coreは実APPDATAを使うので、通常起動時はinstalled／常駐版を閉じ、実設定／データの更新に注意する。
+
+### 26.22 表紙なしAloneの実機報告の追跡（2026-10-14）
+
+327d67b8b／f04fbfbc1後、利用者からLTR・アニメONでもAloneが中央に見えるとの報告を受けた。
+指定された一時JSONは取得時点で存在しなかったため、隔離book_composition.dbをmode=roで読み、
+schema 2の構成だけを`tests/fixtures/book_composition_coverless.json`へ記録した。利用者DBは変更していない。
+40ページ、表紙なし、hidden raw 4／2、Alone raw 10／11／17、白紙raw 15 leading／16 trailing／18 trailing。
+rawは0始まりで、画面のPage 11／12／18に対応し、投影後indexは8／9／15。
+隔離設定はPaged・アニメON・先頭／末尾の片側設定OFF。PDFの対象ページは576×816の縦長で、回転の保存値はない。
+
+新しい回帰は保存recordを実project_compositionへ通し、hidden適用後の実builderをwarmにしてから、
+許可済みの通常render_fullscreen_viewport・画像primitiveを観測する。
+縦長PDFのcached rasterをfixtureから供給し、存在しないfixture PDFへの再decode要求は既存probeで抑止する。
+descriptorの側だけではなく、表示中のsource identity・transform・実mesh頂点の矩形とviewport中心からの位置を検査する。
+連続Aloneの直後raw 12／13が通常Pairへ戻ることも確認する。
+追加matrixは表紙on/off×LTR/RTL×アニメON/OFF×全体先頭on/off×本別FollowGlobal/Center/Place、
+各raw 10／11／17と追加した末尾raw 39の192配置を検査する。末尾設定は片側へ置き、先頭規則との混同を検出する。
+末尾表紙はmatrixだけOFFにし、元の保存構成ケースでは全体の既定ONを維持する。
+
+現行コードのままで元の保存構成と192配置は成功した。表紙なしを理由に中央にする条件は確認できていない。
+したがってこの追跡では製品コードを変更せず、「修正済み」とは扱わない。
+実機で観測したページ名・表示モード・継続的な中央表示か一瞬かの確認を依頼した。
+headlessのcached raster描画は実機観測を否定する証拠ではなく、native提示を含む再現条件の差は未確定。
+設計上の配置規則は§26.21を維持する。推測による表紙条件の追加や別配置経路は作らない。
+
+検証（target/coverless-*.log）: fmt／通常・portable core check／glyph成功、危険glyph 0件。
+保存構成・実描画matrix 2件、ページめくり関連213件、本の構成関連212件、UI snapshot 177件成功。PNG変更なし。
+test-fullは今回の指示どおり実行していない。build-devはPreserveRuntime付きで成功し、アプリ起動・停止・commitなし。
+当初はcore 6プロセスの稼働を確認したが、ビルド直前の再確認では0件だった。
+初回buildはPowerShell内のstderrリダイレクトがCargoの警告を終了エラー化して中断。
+同じscriptを別PowerShellプロセスで直接呼び、外側でログを捕捉して正常完了した（build-dev.exit=0）。
