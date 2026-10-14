@@ -1,5 +1,38 @@
 # リモート閲覧 (Web) 機能 計画書
 
+## 抽出一覧の一時表示（§1.242 G1）
+
+評価・スマートフォルダ・保存コレクションの直接閲覧はA2の抽出一覧として扱う。
+新規閲覧はSingle、directionは全体既定を閲覧sessionへ取り込み、一時Spread/Splitはその方向で
+coverなしに投影する。本を開いた後のcontainerは従来の本別表示を使う。
+Webの既存方向/表紙付きキーは抽出一覧では表示種別だけへroutingし、表示メニューは
+単ページ・見開き・横長分割の三択。一時表示要求は既存collection取得/navigation経路へ送り、
+`SetSpread`の書込みを起動しない。保存コレクションの新規route取得では前sessionのmodeを送らない。
+件数/byte上限、policy、navigationのexact snapshot proofは保持する。通常ZIP一覧の子container位置も維持する。
+構成本の`SetViewMode`/binding拒否契約はbook-composition-plan §9.2を参照する。
+2026-10-11 G3でstrict protocolを**v70**へ更新し、`SetViewMode`とderived `composition_managed`を追加した。
+構成あり本の結合`SetSpread`はworkerの最新snapshotで拒否し、Webは表示分類だけ切り替える。
+mode-onlyの本別保存は既存spread.db worker、抽出結果は非永続の表示投影。構成/shift writerを呼ばない。
+mode-onlyの読取は休眠bindingと閲覧分類を分離し、親/全体と文書由来の既定方向・表紙を解決してから分類を適用する。
+表示分類は文書方向の読取を止めず、Single/Spread/Splitとも同じ解決済み方向を使う。
+文書情報は要求が所有するReadTargetから取得し、PDFの方向列挙は既存worker経路に留める。
+PCの解除・再入場と同じ純粋resolverを使う内部読取修正で、wire字段とprotocol v70は変更しない。
+非対応ページ名では構成を使わず従来の操作を維持し、通知とlogを出す。書庫や保存構成を変更しない。
+この段でRemote構成editorやG5の表示/export全体を実装済みとはしない。
+2026-10-12の利用者決定でG4Fを切り離す。物理File画像/folderの保存構成は、
+read/write候補・binding受付（qualified/fallback）・`composition_managed`へ使用しない。
+既存のfolder一覧・個別編集・Eのshift scope/saved anchor/grouping・読む方向は保持する。
+保存行は削除せず、pure model/store/明示転送の値として残す。書庫/PDF/EPUBの資格/proofは維持する。
+完全空のwrite admissionは保護対象がないため構成snapshotのエラーに依存せず、非空は従来どおり拒否する。
+wire字段・owner・writer・公開addressを変更せず、protocol v70を維持する。
+構成の受付資格はwrite/read workerが既存の実体分類（metadataのfile/dir）から決める。
+`.pdf`/`.epub`/`.zip`名の実folderは、以前のDocument/Archive行が同じkeyに残っていても対象外。
+通常のwrite検証・binding admission・構成管理表示は同じfile資格を使い、行のdomainではfolderを推測しない。
+実体fileの資格を確定した後も、将来用ImageFolder保存値を現在のfile構成として消費しない既存分岐は維持する。
+UI採用はworkerのadmissionを必須引数として再検証し、拡張子からのfallbackを持たない。
+未修飾のtest-only入口も同じworkerへ通す。UIへの同期FS I/O、追加owner、wire変更はない。
+
+
 v3.0.0 の目玉として、外出先のスマートフォン / タブレット / PC のブラウザから
 自宅 PC の mIV ライブラリを閲覧できるようにする。本書がこの機能の正本。
 
@@ -63,6 +96,19 @@ snapshot/FIFO読取を使う。Remote専用の`spread_shift.db`接続やPC viewe
 §1.364 D3の取得continuationは、閉鎖前に受理済みのshift/resume writeの完了とread snapshot公開も
 FinishAcquireの前提に含める。viewer close自体はshift保存を発生させない。完了readinessをpollし、
 UI threadのDB待機やjoinを追加しない。Remote返却後は既存一覧reloadと次のBook openで保存値を解く。
+
+§1.242 G4のPC構成editor開始/保存は、`SessionHandle::with_local_composition_admission`で
+既存BeginAcquireと同じ`session.inner` mutexへ入り、Local確認とApp共通owner/ticketの採用を
+短い処理で確定する。session側へeditor状態や第二ownerを追加しない。lock内はowner登録と
+非blocking送信だけとし、service状態lock・DB・context mount・worker完了待ちは置かない。
+後のBeginAcquireはeditor中でも受け付け、AcquiringRemoteの全窓closeはfullscreenの有無や
+一時mount先に依存せずglobal editor ownerを閉じる。Preparing/Editingの未保存draftは破棄し、
+Savingの送信済ticketはApp共通の完了管理へ残す。既存UI pollで保存成功/失敗を収穫した後、
+editor ownerとticketがともに終端であることをFinishAcquireの条件へ加える。
+Remoteの最初のread/writeは既存`wait_until_active`でこの終端まで待つ。30秒watchdogと
+取得abort後の既存drainを保ち、旧replyからeditorを復活させない。詳細は
+[本の構成計画 §8.1 / §10.2](book-composition-plan.md#81-開始の確定境界と終了のowner)。
+この接続はcore内部の受付/完了境界だけを変更し、IPC wireとstrict protocol v70は維持する。
 
 - ダイアログには `tailscale status --json` の `Peer.TailscaleIPs` と接続元 IP の照合結果から
   direct / relay と対向端末名を表示する。CLI 失敗・未照合時は「取得できません」と明示する

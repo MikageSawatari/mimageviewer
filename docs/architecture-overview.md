@@ -1,5 +1,66 @@
 # アーキテクチャ概観
 
+## 本のitems生成境界（§1.242 G1）
+
+`app/book_materialization`に既存ZIP階層、PDF/EPUB page row、folder listingの生成を集約する。
+source enumeration、policy、raw manifest、cache/lease、既存PreparedPageIdentityIndexとadoptionは
+従来のownerを保つ。ZIPは直下ページblockだけがsurface間で一致し、子containerの位置は従来どおり。
+G2 part Aの`book_composition`はApp/UI/I/Oを持たないpure model・resolver・unit編集を提供する。
+G2 part Bは単一workerの`book_composition.db`、lifecycle、metadata v11転送とread登録を追加する。
+G3はraw manifestと保存構成からworkerで共通projectionを作り、items・identity index・閲覧unitを同じ採用境界で更新する。
+G4の`app/book_composition_editor`はprocess共通の操作ownerと送信済みsave ticketを持ち、
+draft/phase/viewは一つのViewerContextBundleに所属する。一時mount/兄弟描画ではownerを移さない。
+`book_composition/editor`は純粋draft・undo/redo・変更preview、`ui_composition_editor`はI/Oなしの
+virtualized一覧と固定操作行を担当する。source準備/保存前照合は専用worker、thumbnailはeditor寿命の
+独立worker/channel/cancelへ分け、背景viewerのitems/cache/queueを編集プレビュー用に変更しない。
+main「製本」menuとHUD overflowの入口は同じ開始受付へ通す。後者はキーより前のroot surface受付と
+Eのframe-local wheel ownerを使う。保存完了ownerは各窓のreloadと共有resume intentの一回writeを分ける。
+送信済保存票は所有窓の退役後もmetadata preview/import/exportとGeneric改名の開始を保護し、
+同じ完了ownerの採用後だけmaintenanceへ進む。folder sidecar restoreの従来開始条件は変更しない。
+§1.242はnext-bookで開発中、利用者決定の次々回release向け。G4Fは2026-10-12に切り離し、
+画像だけのfolderは構成対象外。folder閲覧・個別編集・sidecar v1は維持する。
+画像folderのZIP変換は、process単位の `app/image_folder_zip_operation` が一つのmodalとRemote admission leaseを所有する。
+先に受理した保存票・writerの完了を採用してから、既存sidecar/tag resourcesを単一workerへ移す。
+`image_folder_zip_job` が既存FIFO/service owner経由で利用者データを複製し、Stored出力をno-clobber公開する。
+元folderの補充だけをgeneration/key限定のbounded refreshで採用し、F12起点では元の閲覧を維持する。
+一覧を持つ起点だけ親一覧を更新し、可視なZIPを選択する。Collectionは元の画像を指したまま。
+親の受付済みpane scan ownerはoperationのParentScanへ移譲し、通常frameと応答を共有しない。
+成功scanの実directory判定をprepared adoptionへ渡し、選択/完了票は既存hydration continuationが所有する。
+監視reloadはmodal中の既存pendingへ留め、source補充refreshは集約面も含めitem/page keyで対象を決める。
+取消・稀な失敗では元データを巻き戻さず、destination公開と複製を止める。詳細は [画像folder→ZIP設計](image-folder-to-zip-plan.md)。
+共通model/storeのfolder値は保持するが、物理画像の提示・類似preview・Remoteはその構成行を消費しない。
+Eのfolder scope/shiftは引き続き使用し、構成管理の表示や操作拒否へ流用しない。
+G5は別stage。
+明示targetは番号の採用前にidentityを捕捉し、表示候補だけをcontext所有の非同期permission ownerへ渡す。
+列挙待ちの再開要求はsource完了境界が所有し、完了後の構成待ちだけ提示許可ownerへ移す。
+構成pollは未完成のsource要求を消費せず、採用時にscope/context/旧世代を照合して継続する。
+required HiddenもMissingと同じ所有context限定の初回open終端へ通し、detached session/runtimeを終了する。
+mode-onlyは休眠bindingと表示分類を分離して読取り、方向列・親表紙・文書由来の既定を解決した後で分類を適用する。
+構成解除・PC再入場・Remote再入場は同じ純粋resolverからmodeと方向を受け取り、Singleにも方向を保持する。
+EPUBの解除はsourceが保持するReadTarget/世代leaseの方向、PDFは投影workerの列挙結果を使う。
+通常のAutomatic再採用は構成解除causeを発行せず、snapshot復帰のsession shiftを保持する。
+Checking/Hiddenはcached textureも描画に使わず、抽出結果の行生成/thumbnailに構成lookupを追加しない。
+類似候補の長押しプレビューは既存preview ownerで候補のidentityをservice FIFOへ渡し、
+workerで受け取った許可tokenをtexture採用前に照合する。連結でも通常の可視unit受付を共有する。
+投影前の未保存trimと通常trim保存・reset、Remoteのtrim変更は同じservice FIFOへ送り、既存view_trim.dbへ保存する。
+Remoteは要求ownerがworkerの保存結果を受け取ってから成功を返し、既存の左右連動切替と応答値を維持する。
+キュー受付から完了まで既存Edit ledgerのguardを保持し、古い投影workerによる新しい編集の上書きを防ぐ。
+保存キー`BookScopeKey`はラインEの所有であり、
+このmodelはキーを定義せず、参照種類/直下階層の検証用`PageDomain`だけを受け取る。
+
+itemsの採用時に排他的な`ProjectionRecipe`を確定する。抽出結果かどうかを現在のanchorや
+synthetic pathから推定しない。recipeはViewerContextBundleのmount/forkとsnapshot保存列へ登録し、
+物理本へのdrillと抽出rootへの復帰を区別する。A2の表示種別は既存spread/continuous ownerが担い、
+新規openはSingle、一時表示の方向はsession snapshot、表示設定DBには結果用keyを生成しない。
+連結方式（flow）はA2のpairing初期化と分離し、各入口の従来の採用規則を維持する。タグ・お気に入り・評価・サブ展開・Smart新規rootは既存の保存flow（旧Vertical表現を含む）または従来の分類に対応するdefaults（通常はNON_BOOKのPaged）を採用し、GlobalSearch・Smart保存root復帰・Collection root・固定snapshotの直接列差し替えは既存flowを維持する。単ページ化・再openだけを理由にflowを変更せず、連結読みの操作を維持する。旧Vertical mode行はflow列に別値が残っていても従来どおり縦連結へ復元し、旧行は変更しない。
+元の本の列を保存する既存SnapshotStateは閲覧状態（mode/方向/flow/shift index/補助設定）も
+一緒に保持し、固定解除の同じadoption内で復元する。BSで固定列へ戻る場合はA2のまま。
+検索のback/BS・履歴の本への復帰は既存Book設定adoption、F12はcontext内snapshot/bundle、
+Remoteは本の通常responseから復元し、A2のSingle/一時Spreadを本へ保存しない。
+
+
+## Everything検索の所有（§1.374）
+
 Everything ファイル名検索（§1.374、実装中・検証待ち）は `everything_ipc`
 （pure codec / Windows不可視reply-window transport）と`everything_results`
 （対応形式/pathの検査とworker stat）を追加し、一覧のownerは既存 `GlobalSearchState` と
@@ -16,6 +77,8 @@ raw10,000件・明示送信・完了後一括採用・mainの取消可能modal�
 PDF共有poolの失効は先行改修 `4510346f5` / master `c1e66f589` のviewer-context ownerを使う。
 最新実装の独立レビューと自動/実機検証の受入は未完了。
 [仕様・履歴・検証台帳](everything-search-plan.md#14-実装記録2026-10-12検証待ち)。
+
+## PDF render epochのviewer-context所有（§1.377）
 
 未リリースPDF-EPOCH-OWNERSHIP: PDF renderの失効権限は非Cloneの
 `PdfRenderEpochOwner` としてApp投影/ViewerContextBundleが一つずつ所有する。
@@ -67,11 +130,23 @@ live一覧のcursor／Shift起点は `App::move_grid_cursor(target, GridCursorIn
 計算し、このownerへ渡す。identity remap／contextの値転送は対を保つ既存非navigation経路。
 詳細と全caller分類は [評価filterのfullscreen整合](rating-filter-fullscreen-plan.md)。
 
+ページ補正の編集内容・選択レイヤー・gestureは `ViewerContextBundle` が所有する。
+`PageEditOwner` の安定した `PageAdjustmentTarget` が保存先を決め、items番号は描画投影だけに使う。
+同一覧の採用時にownerのslotを再解決し、入力中はその小さなslot集合へdraftを投影する。
+App共有のUndoへ次操作を受理する前に全contextの完了済み保留を確定する。
+local writerの最新受付済み全文を新規runのbeforeに使い、completionはrequestごとのoriginへ配送する。
+localの受付／最新成功完了は同keyのidle contextへsnapshot presenceとshared pending由来の
+volatileを反映する。非resident ownerも対象とし、同keyの未確定draftは上書きしない。
+通常Pageも受付成功を同keyの全contextへbatch反映し、parked代表サムネの更新通知を
+表示中contextだけで消費せず、既存退去境界で全所有contextへ配送する。
+通常終了は全contextの要求配送→既存writer停止→completion mirror→sidecar flushの順。
+詳細は [ページ補正の所有設計](page-adjustment-owner-plan.md)。
+
 ---
 
 ### 音声サムネイル (§1.347、2026-10-08)
 
-`audio_album_art` は先頭 ID3v2 タグ限定の bounded PIC/APIC reader、`audio_thumbnail` は worker stat・選定・decode・catalog を共通化する。動画の同名 sidecar discovery / 設定を Audio に拡張し、一覧出所は既存 `video_thumb_overrides` に統一する。Local / Remote は共通 I/O owner と catalog admission を使い、再生 decoder は変更しない。Remote IPC は統合版 v69（§1.345 v68＋master v67）、永続コレクションも snapshot / navigation 準備で thumbnail address を確定する。Web の NoArt / Failed は DOM 外の一覧 owner が持ち、明示 refresh で epoch と HTTP URL を更新する。[詳細設計](audio-album-art-plan.md)。
+`audio_album_art` は先頭 ID3v2 タグ限定の bounded PIC/APIC reader、`audio_thumbnail` は worker stat・選定・decode・catalog を共通化する。動画の同名 sidecar discovery / 設定を Audio に拡張し、一覧出所は既存 `video_thumb_overrides` に統一する。Local / Remote は共通 I/O owner と catalog admission を使い、再生 decoder は変更しない。Remote IPC は統合版 v70（§1.345 v68＋master v67）、永続コレクションも snapshot / navigation 準備で thumbnail address を確定する。Web の NoArt / Failed は DOM 外の一覧 owner が持ち、明示 refresh で epoch と HTTP URL を更新する。[詳細設計](audio-album-art-plan.md)。
 
 
 ## 1. レイヤー構造
@@ -158,6 +233,7 @@ fit 基準へ戻さない。連結の基準 unit と PDF の絶対需要比較�
 | `app/viewer_context_registry.rs` | main / detached / parked viewer context の唯一の bundle 保管先。`ViewerContextId`、`ContextResidence`、window binding の双方向表と、mount / build / fork / retire / promote の 5 transaction を所有する。`App` の viewer field 群は常に registry が選んだ 1 context の投影であり、active / parked は bundle の保管場所ではなく detached window runtime state が表す。窓 ID は App / bundle に保存せず、mounted binding（build 中は非公開の予約）から導出するため、一覧差し替えや表示終了で所有窓が変わらない |
 | `app/vram_accounting.rs` | `App` が所有する全 GPU テクスチャキャッシュを、実寸・mip chain・`TextureId` 重複排除で横断集計する。サブシステム別会計、モード判定、共有予算の参照、1 秒間隔の perf 計装を担当する |
 | `app/folder_scan.rs` | 通常実フォルダの列挙と、1 物理フォルダ内に限定した同名メディア / コンテナ正規化の所有者。動画 + sidecar 画像、実フォルダ + ZIP/PDF/対応アーカイブ、ZIP + 変換元アーカイブ、画像拡張子優先度の規則を通常一覧・サブ展開・スマートフォルダで共有する |
+| `same_name_folder_book.rs` | 同名の実folder/本の「本を表示 / フォルダを表示 / 両方表示」を適格な候補へ適用するpure policy。通常一覧・Smart・サブ展開・Ctrl+↑↓/DFS・Remoteで共用し、再帰探索を刈らない。旧`skip_zip_if_folder_exists`のON→本表示/OFF→両方表示を、Settings・Remote subset・preferences transferの共通decoderで読み替える |
 | `app/startup_list_restore.rs` | 「前回終了した場所」の明示一覧 record と唯一の reducer。main の採用済み物理一覧／本／Drive の適格性を投影し、明示一覧採用、既存一覧の表示要求受理、同じ一覧の cursor 捕捉を分ける。直接読書・内部 load・合成 root・F12 表示先切替・independent viewer は target を更新しない。既存 typed request が intent を運び、ZIP prefix を含む restore hydration は最初の materialization に渡す。詳細と検証状況は [起動復元の所有設計](startup-restore-target-plan.md) |
 | `app/native_video.rs` | Windows native video presenter から戻る overlay event / key / mouse / marker / VST3 操作の App 側処理。native Touch は render overlay 内で完結し、App の legacy mouse 操作へは再注入しない |
 | `touch_input.rs` | 静止画 egui viewport と native video presenter が共有する、接点集合・所有・tap zone・pinch/pan/scroll の純粋な認識器 |
@@ -339,7 +415,7 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 | --- | --- |
 | `ui_adjustment_panel.rs` | 画像フルスクリーン左パネル。`画像補正 / 表示トリム / ブックマーク` の 3 タブを持つ。画像補正はプリセット切替・AI 設定・保存スロットを扱い、ヘッダーの 消しゴム / 補正レイヤー / 隠蔽加工 / 切り取り アイコンからそれぞれ `×` 付き独立左パネルを開く。ブックマークは現在の本のサムネイル一覧、ページ移動、DB 行削除を扱う。エクスポートアイコンは `Ctrl+E` と同じダイアログへ合流する。補正レイヤーは `local_adjust_lab` と同じ左パネル + 右ツールパネル構成で、効果 UI、マスク編集、U²-Netp 被写体生成、クラシック領域分割生成を UI thread 外の worker 経由で扱う |
 | `ui_crop.rs` | 切り取り (crop) モードの独立左パネル。比率選択 / 有効化・解除 / 自動クロップ / X・Y・W・H 数値入力、crop 外暗転 overlay、ハンドルドラッグ、見開きから Single への pivot を扱う。実際の切り出しは capture / export の最終段 (`export_crop.rs`) |
-| `ui_view_trim.rs` / `view_trim.rs` / `view_trim_db.rs` | 表示トリム (読みながら使う表示専用の余白カット)。フルスクリーン左ホバーパネルの `画像補正 / 表示トリム / ブックマーク` タブから、`トリムなし / 自動余白カット（本全体） / 手動設定` をラジオで選ぶ。`手動設定` のときだけスライダーの直上に `適用範囲：[本全体][このページ]` を出し、enabled なページ個別行の有無から選択を導出する。手動設定では単ページ / 見開き連動 / 見開き左右別の 0〜20% トリムを調整する。`draw_fs_image` / `draw_fs_spread` の fit 基準 bbox と描画 UV を変え、bbox 外は背景に落とす。見開き中央側のトリムは左右の見える端を gap に合わせて再配置し、操作判定は見える rect を使う。モード / 本全体設定は本キー、ページ個別設定は `page_path_key` で `view_trim.db` に保存する。表示解決は `idx` ごとにページ個別設定を優先し、無ければ本全体へ戻す。トリムなし / 自動余白カットはページ個別設定を参照しない。mIV Remote の Page worker は DB を read-only で開き、container address・物理表示 slot・見開き相手から同じキーと `None` / `Book` / `Page` / `Auto` の bbox を解決して、端末用 JPEG の resize 前だけ crop する。Remote の変更要求は本体 UI thread が所有する `ViewTrimDb` へ正規の `ViewTrimBookState` のまま保存し、core の clamp と共通 generation 無効化を通す。Remote からページ個別設定は作らない。Auto の見開き相手は待たず raw decode し、上下を本体と同じ規則で調停する。保存 / エクスポート / crop DB には影響しない |
+| `ui_view_trim.rs` / `view_trim.rs` / `view_trim_db.rs` | 表示トリム (読みながら使う表示専用の余白カット)。フルスクリーン左ホバーパネルの `画像補正 / 表示トリム / ブックマーク` タブから、`トリムなし / 自動余白カット（本全体） / 手動設定` をラジオで選ぶ。`手動設定` のときだけスライダーの直上に `適用範囲：[本全体][このページ]` を出し、enabled なページ個別行の有無から選択を導出する。手動設定では単ページ / 見開き連動 / 見開き左右別の 0〜20% トリムを調整する。`draw_fs_image` / `draw_fs_spread` の fit 基準 bbox と描画 UV を変え、bbox 外は背景に落とす。見開き中央側のトリムは左右の見える端を gap に合わせて再配置し、操作判定は見える rect を使う。モード / 本全体設定は本キー、ページ個別設定は `page_path_key` で `view_trim.db` に保存する。表示解決は `idx` ごとにページ個別設定を優先し、無ければ本全体へ戻す。トリムなし / 自動余白カットはページ個別設定を参照しない。mIV Remote の Page worker は DB を read-only で開き、container address・物理表示 slot・見開き相手から同じキーと `None` / `Book` / `Page` / `Auto` の bbox を解決して、端末用 JPEG の resize 前だけ crop する。Remote の変更要求は既存要求ownerがreceiptを待ち、composition serviceのFIFO workerから既存 `ViewTrimDb` へ正規の `ViewTrimBookState` のまま保存し、core の clamp と共通 generation 無効化を通す。Remote からページ個別設定は作らない。Auto の見開き相手は待たず raw decode し、上下を本体と同じ規則で調停する。保存 / エクスポート / crop DB には影響しない |
 | `book_bookmarks.rs` / `bookmark_browser.rs` | 本ページの安定 identity を `book_bookmarks.db` へ非同期保存し、既存 `video_bookmarks.db` と合わせた全メディア横断 read model を構築する。アプリ内の本 / ページのリネーム、製本ページの並べ替え・別本移動は旧 path → 新 path mapping を専用 transaction で identity へ反映する（missing 行保持のため共通 hard-purge store には含めない）。横断一覧は専用ダイアログを持たず `TopLevelGridSurface::Bookmarks` として通常の `App.items` / facet / details 表示へ載せ、ID・位置・登録日時・欠落状態を sidecar row に保持する。SQLite、存在確認、動画 WebP decode、ZIP / PDF 列挙、削除は worker 側で、ZIP / PDF の missing inventory は一覧構築中にコンテナ単位で共有する。削除は DB 行だけを対象にし、元メディアへ filesystem 操作を行わない。横断一覧から開く要求は単調増加 request ID と target identity を path resolver、RAR / 7z / LZH の `ArchiveConvertState`、viewer 待機まで運ぶ。元アーカイブ → 直接 RAR / 変換キャッシュ ZIP は owner 付き内部遷移とし、navigation / activation / cancel / disconnect / timeout は一致する owner と変換 receiver だけを終了して stale completion を表示へ適用しない |
 | `ui_analysis_panel.rs` | 画像分析パネル (右端オーバーレイ)。色情報・ヒストグラム |
 | `ui_metadata_panel.rs` | 右情報パネル (AI メタデータ + EXIF + XMP ツイート情報 + 類似画像)。類似タブ・照会表示・サムネイル要求と完了channelは `ViewerContextBundle` が所有する。可視カードとhoverページ帯の需要だけを描画後に処理し、workerは4枠、GPU uploadは1フレーム1件、派生キャッシュは512件以内に保つ。要求IDと内容stampを照合して退避・取消後の古い完了を拒否する |
@@ -471,6 +547,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `comic_user_stamps.db` | Ctrl+T スタンプピッカーのユーザー画像履歴。配置時の長辺 1024px 上限 PNG を再利用用 MRU として保持する。履歴から選んでも配置先には `Embedded` をコピーするため、履歴削除は既存注釈に影響しない | `comic_user_stamps.rs` + `ui_text.rs` |
 | `spread.db` | フォルダ別表示モード (ページ構成、連結方式、綴じ方向、末尾表紙補助、見開き端の単ページ配置) | `spread_db.rs` |
 | `spread_shift.db`（§1.364 D1–D3、未リリース） | 論理本scopeごとの相対PageRef。KeepDriveのroot＋実効ZIP prefix、一冊一行。schema v1。新規storeのためmigrationなし、不正schema/JSONは原本を保って書込停止。既存spread設定・resumeとは独立 | `book_scope.rs`、`spread_shift/{model,service,store}.rs`、`app/spread_shift_owner.rs` |
+| `book_composition.db`（§1.242 G2、未リリース） | `book_compositions(book_key PRIMARY KEY, revision, schema_version, composition_json)`、schema 1。一行のJSONに検証domainと構成を持つ。KeepDrive共有BookScopeKey、local revision、単一writer・immutable snapshot・worker-only maintenance。新storeのmigrationなし。未知/破損は原本保持・書込停止。STORESのrename/purge/copy/probe/cleanup、内容ID Edit観測、明示metadata v11専用family、確認済み完全resetへ登録。Folder sidecarはG4F | `book_composition/{store,service}.rs` |
 | `book_resume.db` | コンテナpathとraw items indexで位置を復元。記録時のHUD読み順ordinal/totalをnullable列に保存し、通常Folder/ZIP/PDF一覧の下端メーターに常に左から右へ表示。旧2列DBへのALTERと一覧全行読込は既存writerで実行。App共通メモリmapを記録受付時にも更新し、描画はmap参照のみ。動画/音声の同じ帯は既存video_resume_positionsと取得済みvideo_metaを読み、別の位置map/DB列は作らない。Remoteは補助列NULL (IPC不変) | `book_resume_db.rs`, `app/book_resume_meter.rs`, [設計・割り切り](book-resume-meter-plan.md) |
 | `reading_history.db` | ユーザー操作で開いた画像フォルダ / ZIP / PDF / 変換アーカイブと動画・音声ファイルの MRU。既存 kind 文字列を維持し、`video` / `audio` と専用の `media_position_ms` / `media_duration_ms` を追加する。未知 kind は行ごと読み飛ばす。保持件数は 1..=1000 | `reading_history_db.rs` + `App::record_reading_history` |
 | `folder_thumb_pins.db` | 親コンテナ (Folder/ZipFile/PdfFile/ConvertibleArchive) の代表サムネ手動ピン。container_key 主キー (= normalize_keep_drive 済みパス) で 1 行 1 コンテナ、source は kind + container 相対 rel + (zipentry の) entry / (pdfpage の) page。`apply_folder_thumb_pin` と変換アーカイブの `archivethumb:*#pin:*` が cache key suffix `#pin:{source_id}` で identity を表現し、cascade 時は途中コンテナを含む経路 hash を source_id に加える | `folder_thumb_pins.rs` |
@@ -569,7 +646,8 @@ commit成功後にwrite success/generation/group cacheを公開する。UI threa
 Remoteのnudge/記憶設定UIは増やさない。wire/address/slot/roleの契約を変えないためIPC v69・Web asset tokenを維持する。
 変換書庫のRemote baseは元書庫のlogical keyを保持し、PCのcache側baseへの移行を行わない。
 この既存差と切詰め境界のmaster証明・D3検証記録は設計§11.10と`target/D-1364-d3-msg.txt`を参照する。
-G3は未統合で、C1–C12共有fixtureの供給だけを構成consumerの統合・検収証拠としない。
+D3時点ではG3は未統合だった。2026-10-11のG3は共有C1–C12を既存admission/restore ownerへ接続し、
+strict IPC v70のmode-only入口を追加した。構成editor固有のC7/C9はG4で接続する。
 本記述は実装の所有境界を示し、自動検証・独立完了レビュー・利用者確認の完了を主張しない。
 
 ### フォルダ側サイドカー (`mimageviewer.dat`)

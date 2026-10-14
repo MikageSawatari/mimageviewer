@@ -62,3 +62,22 @@ master比較の根拠とD3検証記録は[実装計画 §11.10](spread-shift-mem
 焦点実行: `cargo test -p mimageviewer --lib spread_shift::contract_fixtures`。
 全体 gate / 利用者確認用 build / 独立完了レビュー / 実アプリ検証は root の別工程。
 この文書の作成だけで検証成功を表さない。
+
+## next-book G3 consumer（2026-10-11）
+
+上記はE供給時点の履歴。next-bookではG3のsemantic scope adapter、Composed/Unreadable/A2の実admission、
+独立resume fence、休眠shiftを除くbuilder/cache、解除後の既存read owner、mode-only setterを接続した。
+`spread_shift_composition_tests`と`ui_fullscreen/book_composition_tests`がC1–C6/C8/C11/C12の実consumerを検証し、
+初期化oracleにはEの実canonical compositionと`preparing_snapshot`を使う。
+G2のstore/metadata familyがC10を所有する。G4 editorの作成/取消/保存phase（C7/C9）は次段であり、
+Eのpure fixture成功で代用しない。検証実数/exit/logは`target/G-1242-g3-msg.txt`を参照する。
+
+### G4 editorの接続（2026-10-11、next-book）
+
+C7は`app::book_composition_editor::tests`の実ZIP・service・SQLiteで、
+作成/編集/取消/保存/保存失敗とEの行・write watermark不変を検証する。
+C9のPC入口は実HUDのoverflowでeditor開始とwheel/閉じるkeyを同frameに渡し、
+背面のmetadata/nav/navigator、modal終了後の新入力を検証する。
+Remote側は既存の構成lock/PC編集案内を維持し、取得順反転・送信済saveの一回終端は
+同じeditor handlerとsession admissionの回帰で検査する。pure fixtureの成功とは区別し、
+実行数・exit・logは`target/G-1242-g4-msg.txt`へ記録する。

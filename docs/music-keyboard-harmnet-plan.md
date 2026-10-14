@@ -1205,3 +1205,111 @@ Spread8枚の差分はy=338..411の下端だけで、本文・marker・操作・
 設計逸脱なし。製品起動・`target/dev-runtime`への操作・コミットは行っていない。
 独立最終レビュー（GPT-6.1 Sol／xhigh）は **ACCEPT**。P2/P3の未解決指摘なし。
 実入力の所有と再表示境界、48条件の実clip検査、11枚のPNG、全指定gateの最終成功ログを確認した。
+
+### 15.8 pitch-labとmasterのマージ解消（2026-10-14）
+
+利用者の実機受入後、HEAD `456820e05` へmaster `c7c76d239`を取り込む進行中マージのファイル内容を解消。
+共通高さは利用者指定どおりmasterの `d73d62841` / `113cf9711` を正とする。
+§15.7のP3独自実装は統合前の履歴であり、本文の行間0・固定48pt行高の共通計算へ統一する。
+新しい状態・非同期処理・回復経路は作らない。両側の入力意図に矛盾がないことを独立確認した。
+
+| 元の競合 | 解消方針 |
+| --- | --- |
+| `FsOverflowPanelView` | 音楽配色と構成編集の可否・管理状態を両方保持 |
+| `FsOverflowPanelAction` / `FsRootOverflowFrame` | 配色変更と構成編集アクション、Rootのフレーム入力境界を保持 |
+| `draw_fs_overflow_panel_surface` | masterの行間0・共通高さを採用。独自fit/bar制御を撤去 |
+| 調整HUD snapshot fixtureのView | 両側のフィールドを保持し、共通矩形計算を使用 |
+| 描画末尾のoverflow分岐 | RootフレームのAbsent判定と音楽／静止画別表示条件を保持 |
+| `fullscreen_overflow_panel_view` | 配色と構成可否・管理状態の投影を両方保持 |
+| パネル描画メソッド | 音楽の配色変更／描画と静止画foreground描画を両方保持 |
+| 高さ・配置検査 | masterのRoot396pt／Navigator300ptの期待値を採用 |
+| 共通高さ検査・snapshot | masterのScrollLayout／サイズ指定snapshotを採用し、MusicNoteColorを補充 |
+
+独自の `fs_overflow_panel_natural_body_height`、`fs_overflow_panel_rect_for_view`、
+`fs_overflow_shift_memory_galley`、`fs_overflow_text_galley`、Appの`fullscreen_overflow_panel_rect`を撤去。
+P3専用の自然高検査2本は共通`calculated_overflow_panel_height_matches_all_states_and_scrolls_when_constrained`
+へ統合し、Root／Navigator／調整／音楽の4variantを同じ`ScrollLayout` helperで検査する。
+長い保存基点名の固定高さに関するmaster側の既知残件は[監査記録](calculated-panel-height-audit.md)のまま。
+今回のマージでその既知残件を修正済みとは扱わない。
+
+音楽の入力所有、キー閉鎖後の開始済みpointer/touchの寿命、メニュー内の端hover抑止は保持する。
+Rootのキー前受付・EditorAdopted・構成編集・foreground入力境界も保持する。
+async-architecture／detached-rework-plan／keymap-specの3競合は、両側の独立した節を残した。
+detachedの記録は既存変更の記述を保全するもので、新たな述語・viewport・park経路の変更はない。
+
+静止画Root／Navigatorの2枚、見開き調整HUDの8枚はmaster側PNGを採用した。
+全10枚のmaster blobとの一致と比較画像を目視確認し、master方式の既存見た目を保持する。
+`music_overflow_panel.png`だけを通常比較の候補生成→更新前の目視→採用の順で更新した。
+第2行と下端が3pt上がり、行間0で全高159→156ptになる。選択表示・×・HUDは維持する。
+正確な画素差は2049px（x=408..807、y=169..214）。kittestの許容差込み検出は1768px。
+PNGの寸法820×300とbytes22472は同じ。通常幅／320pt幅HUDの2枚は通常比較に一致し未変更。
+
+自動mergeの追加確認で、設定分類の両追加が共存する一方、固定期待値は両parent共通の458/314のまま
+残っていた。実テストで全459対期待458の失敗を確認し、期待値だけを全459／除外315へ修正。
+対象144／wire142、両設定の除外登録・取り込み先値保持は変えず、説明の現行件数も合わせた。
+検証ログ・元画像・比較画像は `target/merge-validation/` に保存する。
+
+#### 合算後のAppサイズ
+
+最初のfullscreen全検査では、既存の切り取り入力のevent順序検査が標準テストthread上で
+`STATUS_STACK_OVERFLOW`（exit `0xc00000fd`）となった。両parentと同じテスト／fixtureであることを確認し、
+既存の`history_transition_storage_keeps_app_stack_footprint_bounded`を実行するとApp110344bytesで
+既存の110000未満の上限に失敗した。上限やthread stackを引き上げず、既存のheap収納方針へ合わせる。
+
+独立の構造確認を経て、`filename_stack_ui.rs`の`StackReturnState::Ready.prepared`だけを
+`Box<StackPreparedItems>`へ収納し、唯一の生成と復帰で同じ値を一度だけ移譲する。
+外側のstate型、App／bundleのフィールド型、所有・stamp・取消・復帰の判定は維持し、
+registry／viewport／park経路の変更や新しい状態・回復機構は追加しない。
+大きな値の収納と破棄は元のstateの寿命に従う。型・構造の変更はこの3点だけ。
+サイズ検査、失敗した切り取り入力、スタック往復・既存多窓回帰、fullscreen全検査で再確認する。
+
+収納後のAppは109336bytes（1008bytes減）で上限検査に成功。ただし切り取り入力の単独実行は
+exit0でもfirst-chance stack例外を印字し、fullscreen全検査では再び異常終了したため解決とは扱わなかった。
+既存のテスト実行体をCDBで捕捉し、通常heap（`-hd`）でも最初のfixture生成／Settings DB初期化中に
+約2MiBの標準stackを使い切ることを確認した。入力handlerにはまだ到達していない。
+4回のAppTestEnv返り値を持つテストcallerだけで約1.2MiBを予約していた。
+
+独立確認の上、capture専用`setup_capture_region_input_test`の返り値とtuple生成の2点だけを
+`Box<AppTestEnvForTest>`へ変更した。4ケース・event順序・assert・明示dropのテスト本体は両parentと同一。
+global fixtureや実製品入力を変えず、同じfixtureの所有・安全なdrop順を保った収納境界の修正である。
+Appサイズ上限と上記本体の収納修正は維持し、thread stackの引き上げや検査の弱化は行っていない。
+再実行の単独captureは例外の印字なしで成功した。CDB診断ログも同じ検証ディレクトリに保存する。
+
+#### 統合後の確認と引き継ぎ
+
+全Cargoに`MSBUILDDISABLENODEREUSE=1`を設定。snapshot更新後は環境変数を外して通常比較した。
+最終変更と関係しない検証は既存の検証再利用方針に従って再利用し、収納変更の影響箇所は再実行した。
+
+| コマンド | exit／成功／ignored |
+| --- | --- |
+| `cargo fmt --check` | 0 |
+| `cargo check -p mimageviewer --lib` | 0 |
+| `cargo test -p music-core` | 0／41／0（unit 21、bass 12、harmnet 7、allocation 1、doc 0） |
+| `cargo test -p mimageviewer --lib ui_fullscreen` | 0／746／1 |
+| `cargo test -p mimageviewer --lib music` | 0／189／2 |
+| `cargo test -p mimageviewer --lib settings` | 0／579／13 |
+| `cargo test -p mimageviewer --lib overflow` | 0／54／1 |
+| `cargo test --test ui_snapshot` | 0／176／0 |
+| `cargo check -p mimageviewer --features portable` | 0 |
+| `python scripts/check_ui_glyphs.py` | 0／危険glyph 0 |
+| `cargo test -p mimageviewer --lib calculated_` | 0／10／0 |
+
+追加のAppサイズ上限1件、capture入力順序1件、filename_stack_ui 25件、多窓35件、
+stack contextの往復・stale return 8件もexit0。CDBの通常heap検査もexit0でcapture 1件成功、
+first-chance stack overflowは0件（`capture-first-chance-clean-final.log`）。
+中間失敗を含む履歴は`results.json`に残し、修正後の成功と混同しない。
+
+共有state収納変更に伴う追加の`test-full.ps1 -SuppressCrashDialogs`はexit101、テスト開始0件。
+launcherのビルド入力であるrelease core／remote／EPUB workerの3実行ファイルが存在せず停止した。
+process内のcrash dialog設定はscriptが復元済み。指定gateのnative依存ビルド停止はない。
+不足入力の追加ビルド・代替経路は実施せず、全体gateは未完了として引き継ぐ。
+
+ファイル内の競合markerと`git diff --check`は解消済みだが、`git add`は
+`C:/home/mimageviewer/.git/worktrees/mimageviewer-pitchlab/index.lock`のPermission deniedで失敗した。
+worktreeのGit indexが今回の書き込み許可範囲外にあるため、index上の14ファイルは未解消扱いのまま。
+indexの迂回・許可変更・別worktreeへの操作はせず、利用者側のステージングを残す。
+マージコミット、製品起動、`target/dev-runtime`への操作は行っていない。
+
+独立最終レビュー（GPT-6.1 Sol／xhigh）はファイル内容の解消を受理し、新規findingなし。
+指定gateの成功、PNG目視、最終CDBログ、masterの入力境界と音楽側の保持を確認した。
+ステージング不可と追加全体gate未完了を含むため、マージ全体の完了・全検証成功とは扱わない。

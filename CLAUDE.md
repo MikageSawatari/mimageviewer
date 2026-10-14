@@ -526,6 +526,14 @@ C:\home\mimageviewer_vendor_backup\
   ScrollArea 内へ戻すと、縦スクロールバーが × ボタンに重なる退行を起こす。
 - パネルが下端近くまで伸びる場合、クリック吸収 sink とキャンバス入力抑制 rect も
   同じ高さから動的に作る。固定 1000px は 1440p / 4K / 縦長ウィンドウで不足する。
+- 高さを行数などの計算で決めるなら、item_spacing・separator・padding・Frame の margin を
+  計算に含めるか、該当する間隔を 0 にする。`show_rows` は行間を内部で足すので、行高に
+  含めて二重に数えない。行内を `scope_builder` で描くと親カーソルが子の自然高へ戻るので、
+  仮想行の高さと実際の行の位置がずれないか確かめる。
+- 収まる画面ではスクロールバーが出ないこと、高さ不足では末尾まで届くことを
+  `tests/support/scroll_layout.rs` の共通 helper で検査する。snapshot は見た目の記録であり、
+  スクロールの要否の検査にはならない。監査と残件は
+  [docs/calculated-panel-height-audit.md](docs/calculated-panel-height-audit.md)。
 
 ### IME 対応 (日本語入力) ⚠️ 重要
 TextEdit を含むダイアログで Enter / Escape を拾うときは **必ず専用ヘルパーを使う**こと。
@@ -1248,10 +1256,15 @@ Windows SDK hosting moduleのMIT原文を `crates/vst3-host/src/sdk/` に保持�
 UNC namespace markerは大小文字を区別しない。host内FS検査は拡張形式を維持する。
 `GetModuleFileNameW`が保持する `\\?\` とpluginが付加する `/` の組合せによるEffeTune missing-assetsを避ける。
 2026-10-02 R2ではhost PE内の `MIV_VST3_HOST_SOURCE_SHA256:` markerを、CMakeLists／include／src／testsの
-現ソースhashと照合する。APPDATA等から旧hostをimportするfallbackはない。
+現ソースhashと照合する。2026-10-12の音響調整窓対応では `src/*.rc`、baseの `assets/icon.ico`、
+専用 `assets/effetune.ico`、再生成用 `scripts/generate-effetune-icon.py` も対象に含める。
+APPDATA等から旧hostをimportするfallbackはない。
 identityは `scripts/vst3-host-identity.ps1` に計算を一本化し、CMakeも同scriptの
-`-HashSourceRoot` を使う。対象ファイルのCRLFだけをbyte単位でLFへ正規化し、他のbyteは保持する。
-ordinal順のslash相対名と各正規化SHA256を `name:hash\n` としてUTF-8/BOMなしで連結しSHA256化する。
+`-HashSourceRoot` を使う。text対象のCRLFだけをbyte単位でLFへ正規化し、他のbyteは保持する。
+二つのiconはbinaryのままraw SHA256を取り、host source rootからの相対名を使う。
+generatorは他のtextと同じLF正規化で検証する。`python scripts/generate-effetune-icon.py --check` で
+追跡ICOが再生成結果と一致することを確認できる（Pillowが必要、取得をbuildで行わない）。
+ordinal順のslash相対名と各SHA256を `name:hash\n` としてUTF-8/BOMなしで連結しSHA256化する。
 Gitの改行変換によるLF／CRLF checkout差を無視するが、未コミットのソース変更は検知する。
 SDK欠落時や `-SkipVst3Bridge` は現ソースと一致するvendor hostのみ再利用可能。不一致／欠落は復旧案内付きで停止する。
 build-release／build-distの署名前・core埋込前と、非portable coreのbare cargo release buildにも同じgateを通す。
@@ -1273,7 +1286,7 @@ cmake --build crates/vst3-host/build --config Release
 - 前提:
   - Visual Studio 2026 (18) BuildTools (MSVC C++ デスクトップ開発ワークロード)
   - CMake 3.20+
-  - 一度ビルドしたら、C++ ソースを変更しない限り再ビルド不要
+  - 一度ビルドしたら、identity対象のソース・RC・共有iconを変更しない限り再ビルド不要
 - CMakeは `vendor/vcrt/` の公式 `vcruntime140.dll` / `vcruntime140_1.dll` /
   `msvcp140.dll` / `msvcp140_1.dll` を `vendor/vst3-host/vcrt/` へcopy-if-differentで配置する。
   hostが再リンク不要でも配置targetは実行される。正本が欠けた場合は復旧案内付きでbuildを停止する。
@@ -2007,6 +2020,13 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
      いなかったので、腐る以外の道が無かった。
 
 ### Phase 2: 依存物の確認 + 性能回帰チェック
+
+6.3. **依存物の更新確認**: `.\scripts\check-dependency-updates.ps1` を実行し、
+   標準出力と `target/dependency-updates/<日付>.md` の一覧を見て、上げるかを判断する。
+   問い合わせ専用で依存物の取得・変更・インストールは行わない。手を入れているクレートを
+   上げるときは、表にある変更記録 (`PATCHES.md` / `MIV-PATCH.md` / README の patch 節等) に
+   従って変更を付け直す。月 1 回の自動実行もある。既存の PDFium 等の個別手順も引き続き行う。
+   詳細は [リリース運用メモ](docs/release-operations.md#依存物の更新確認) を参照。
 
 6.4. **記録済みクラッシュの棚卸し (最初に回す)**:
 

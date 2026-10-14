@@ -30,6 +30,297 @@ mod spread_shift_d3 {
         }
     }
 
+    #[test]
+    fn composition_remote_core_refuses_binding_but_completes_mode_only_worker_write() {
+        use crate::book_composition::{
+            BookCompositionService, PageDomain, ReadingDirection, fixtures::four_page_book,
+        };
+        let mut app = crate::app::setup_app_for_test();
+        let data = tempfile::tempdir().unwrap();
+        let book = data.path().join("book.pdf");
+        std::fs::write(&book, b"no page decoding in mode-only fixture").unwrap();
+        let scope = BookScopeKey::document(&book).unwrap();
+        let db = crate::spread_db::SpreadDb::open_at(&data.path().join("spread.db")).unwrap();
+        db.set(
+            &book,
+            crate::settings::SpreadMode::RtlCover,
+            crate::settings::SpreadMode::Single,
+            crate::settings::ReadingFlow::Paged,
+            crate::settings::ReadingDirection::Ltr,
+        )
+        .unwrap();
+        app.spread_db = Ok(db);
+        let (service, process) =
+            BookCompositionService::spawn_at(data.path().into(), None).unwrap();
+        service
+            .save(
+                scope.clone(),
+                PageDomain::Document,
+                four_page_book(ReadingDirection::Ltr),
+            )
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap()
+            .status
+            .unwrap();
+        let snapshot = service.snapshot();
+        app.install_book_composition_runtime(service.clone());
+        let address = mimageviewer_ipc::RemoteAddress::file(book.to_string_lossy().into_owned());
+        assert!(matches!(
+            app.apply_remote_write(&set_spread(address.clone())),
+            RemoteWriteResponse::Error(RemoteWriteError {
+                code: RemoteWriteErrorCode::Unsupported,
+                ..
+            })
+        ));
+        assert_eq!(
+            app.spread_db.as_ref().unwrap().get(&book),
+            Some(crate::settings::SpreadMode::RtlCover)
+        );
+        let (handle, owner, _) = active_session();
+        app.set_remote_session_handle(handle.clone());
+        let (pending, reply) = ClaimedRemoteWrite::for_test(
+            handle.begin_operation(&owner, "mode-only".into()).unwrap(),
+            RemoteWriteRequest::SetViewMode {
+                address,
+                mode: mimageviewer_ipc::RemoteViewMode::LandscapeSplit,
+            },
+        );
+        app.apply_pending_remote_write(pending, &egui::Context::default());
+        let PendingRemoteReadingWrite::ViewSetting { pending, receiver } = app
+            .remote_session_ui
+            .pending_reading_writes
+            .pop()
+            .expect("worker owns completion")
+        else {
+            panic!("mode-only typed completion");
+        };
+        let completion = receiver.recv_timeout(Duration::from_secs(30)).unwrap();
+        let (deliver, receiver) = std::sync::mpsc::channel();
+        deliver.send(completion).unwrap();
+        app.remote_session_ui
+            .pending_reading_writes
+            .push(PendingRemoteReadingWrite::ViewSetting { pending, receiver });
+        assert!(matches!(
+            reply.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        app.poll_remote_reading_writes();
+        assert!(matches!(
+            reply.recv_timeout(Duration::from_secs(1)).unwrap(),
+            UiWriteOutcome::Write(RemoteWriteResponse::Success(_))
+        ));
+        assert_eq!(
+            app.spread_db.as_ref().unwrap().get(&book),
+            Some(crate::settings::SpreadMode::SplitRtl)
+        );
+        assert_eq!(service.snapshot().rows, snapshot.rows);
+        assert_eq!(
+            service.snapshot().token_for(&scope),
+            snapshot.token_for(&scope)
+        );
+        assert!(app.remote_session_ui.pending_reading_writes.is_empty());
+        process.shutdown_and_join();
+    }
+
+    #[test]
+    fn remote_trim_fifo_reads_queued_toggle_state_and_retires_claim_before_late_reply() {
+        use crate::book_composition::{
+            BookCompositionService, PageDomain, ReadingDirection, fixtures::four_page_book,
+        };
+        use crate::view_trim::{
+            ViewTrimApplyMode, ViewTrimBookSettings, ViewTrimBookState, ViewTrimLinkedMargins,
+            ViewTrimMargins,
+        };
+        use crate::view_trim_db::{ViewTrimDb, ViewTrimWriteBatch};
+        for cancel_before_receipt in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let data = tempfile::tempdir().unwrap();
+            let book = data.path().join("remote-trim.pdf");
+            std::fs::write(&book, b"remote trim admission requires no page decode").unwrap();
+            let scope = BookScopeKey::document(&book).unwrap();
+            let (service, process) =
+                BookCompositionService::spawn_at(data.path().into(), None).unwrap();
+            service
+                .save(
+                    scope.clone(),
+                    PageDomain::Document,
+                    four_page_book(ReadingDirection::Ltr),
+                )
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap()
+                .status
+                .unwrap();
+            let before = service.snapshot();
+            app.view_trim_db =
+                Some(ViewTrimDb::open_at(&data.path().join("view_trim.db")).unwrap());
+            app.install_book_composition_runtime(service.clone());
+            app.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::MarginFit;
+            app.settings.margin_fit_enabled = true;
+            let address =
+                mimageviewer_ipc::RemoteAddress::file(book.to_string_lossy().into_owned());
+            let key = remote_spread_key(&address).unwrap();
+            let older = ViewTrimBookState {
+                apply_mode: ViewTrimApplyMode::Book,
+                book_settings: ViewTrimBookSettings {
+                    enabled: true,
+                    spread_separate: true,
+                    ..Default::default()
+                },
+            };
+            let requested = ViewTrimBookState {
+                apply_mode: ViewTrimApplyMode::Page,
+                book_settings: ViewTrimBookSettings {
+                    enabled: true,
+                    spread_separate: false,
+                    spread_linked: ViewTrimLinkedMargins {
+                        top: 0.19,
+                        ..Default::default()
+                    },
+                    spread_left: ViewTrimMargins {
+                        top: 0.06,
+                        right: 0.03,
+                        ..Default::default()
+                    },
+                    spread_right: ViewTrimMargins {
+                        top: 0.10,
+                        left: 0.07,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            };
+            let mut expected = requested;
+            expected.apply_mode = ViewTrimApplyMode::None;
+            expected.book_settings.spread_separate = true;
+            expected.book_settings = expected.book_settings.with_spread_separate(false);
+            let (entered, release) = service.hold_worker_for_test();
+            entered.recv_timeout(Duration::from_secs(30)).unwrap();
+            drop(service.save_view_trim(ViewTrimWriteBatch {
+                book: Some((key.exact.clone(), older)),
+                pages: vec![],
+            }));
+            let (handle, owner, _) = active_session();
+            app.set_remote_session_handle(handle.clone());
+            let (pending, reply) = ClaimedRemoteWrite::for_test(
+                handle
+                    .begin_operation(&owner, "remote trim FIFO".into())
+                    .unwrap(),
+                RemoteWriteRequest::SetViewTrim {
+                    address: address.clone(),
+                    context_address: address,
+                    state: serde_json::to_value(requested).unwrap(),
+                },
+            );
+            let ctx = egui::Context::default();
+            app.apply_pending_remote_write(pending, &ctx);
+            assert!(
+                app.view_trim_db
+                    .as_ref()
+                    .unwrap()
+                    .get_book_state(&key.exact)
+                    .is_none(),
+                "Remote must enqueue rather than write ahead of the held projection batch"
+            );
+            assert!(matches!(
+                reply.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            let PendingRemoteReadingWrite::ViewTrim {
+                pending,
+                receiver: actual_worker,
+            } = app
+                .remote_session_ui
+                .pending_reading_writes
+                .pop()
+                .expect("typed Remote trim owner")
+            else {
+                panic!("Remote trim continuation");
+            };
+            let (deliver, receiver) = std::sync::mpsc::channel();
+            app.remote_session_ui
+                .pending_reading_writes
+                .push(PendingRemoteReadingWrite::ViewTrim { pending, receiver });
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                app.poll_remote_session(ctx)
+            });
+            assert!(
+                output.viewport_output[&egui::ViewportId::ROOT].repaint_delay
+                    <= Duration::from_millis(16)
+            );
+            assert_eq!(app.remote_session_ui.pending_reading_writes.len(), 1);
+            assert!(
+                app.settings.margin_fit_enabled,
+                "legacy migration waits for a successful current claim's receipt"
+            );
+            if cancel_before_receipt {
+                handle.local_disconnect();
+                app.poll_remote_reading_writes();
+                assert!(
+                    matches!(reply.recv_timeout(Duration::from_secs(1)).unwrap(), UiWriteOutcome::Session(response) if response.status != SessionStatus::Active)
+                );
+                assert!(app.remote_session_ui.pending_reading_writes.is_empty());
+            }
+            release.send(()).unwrap();
+            service
+                .prepare(scope.clone(), PageDomain::Document)
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap()
+                .status
+                .unwrap();
+            let completion = actual_worker.recv_timeout(Duration::from_secs(30)).unwrap();
+            assert_eq!(
+                completion.as_ref().unwrap(),
+                &expected,
+                "spread toggle conversion reads the queued older state inside the worker"
+            );
+            assert_eq!(
+                app.view_trim_db
+                    .as_ref()
+                    .unwrap()
+                    .get_book_state(&key.exact),
+                Some(expected)
+            );
+            if cancel_before_receipt {
+                assert!(
+                    deliver.send(completion).is_err(),
+                    "a late receipt cannot revive its retired Remote claim"
+                );
+                app.poll_remote_reading_writes();
+                assert!(app.settings.margin_fit_enabled);
+                assert_eq!(
+                    app.settings.fullscreen_fit_mode,
+                    crate::settings::FullscreenFitMode::MarginFit
+                );
+                assert!(matches!(
+                    reply.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected)
+                ));
+            } else {
+                deliver.send(completion).unwrap();
+                app.poll_remote_reading_writes();
+                let UiWriteOutcome::Write(RemoteWriteResponse::Success(result)) =
+                    reply.recv_timeout(Duration::from_secs(1)).unwrap()
+                else {
+                    panic!("successful Remote trim terminal response");
+                };
+                assert_eq!(
+                    result.view_trim_state,
+                    Some(serde_json::to_value(expected).unwrap())
+                );
+                assert!(!app.settings.margin_fit_enabled);
+                assert_eq!(
+                    app.settings.fullscreen_fit_mode,
+                    crate::settings::FullscreenFitMode::Page
+                );
+                assert!(app.remote_session_ui.pending_reading_writes.is_empty());
+            }
+            let after = service.snapshot();
+            assert_eq!(before.rows, after.rows);
+            assert_eq!(before.token_for(&scope), after.token_for(&scope));
+            process.shutdown_and_join();
+        }
+    }
+
     fn zip_effective_address(
         app: &crate::app::App,
         path: &std::path::Path,
@@ -101,7 +392,7 @@ mod spread_shift_d3 {
             app.spread_db.as_ref().unwrap().get(&key.exact),
             Some(crate::settings::SpreadMode::RtlCover)
         );
-        assert!(app.remote_session_ui.pending_shift_resets.is_empty());
+        assert!(app.remote_session_ui.pending_reading_writes.is_empty());
     }
 
     #[test]
@@ -211,7 +502,7 @@ mod spread_shift_d3 {
         assert_eq!(handle.snapshot().active.unwrap().completed_count, before);
         assert_eq!(service.watermarks().admitted, base + 1);
         assert_eq!(service.watermarks().completed_through, base);
-        assert_eq!(app.remote_session_ui.pending_shift_resets.len(), 1);
+        assert_eq!(app.remote_session_ui.pending_reading_writes.len(), 1);
         assert!(app.fs_feedback_toast.is_none());
         release.send(()).unwrap();
         assert_eq!(row(&service, &scope), None);
@@ -243,7 +534,7 @@ mod spread_shift_d3 {
             handle.snapshot().active.unwrap().completed_count,
             before + 1
         );
-        assert!(app.remote_session_ui.pending_shift_resets.is_empty());
+        assert!(app.remote_session_ui.pending_reading_writes.is_empty());
         drop(process);
     }
 
@@ -281,7 +572,7 @@ mod spread_shift_d3 {
         ));
         assert_eq!(row(&service, &scope), Some(saved));
         assert_eq!(service.watermarks(), before);
-        assert!(app.remote_session_ui.pending_shift_resets.is_empty());
+        assert!(app.remote_session_ui.pending_reading_writes.is_empty());
         drop(process);
     }
 
@@ -323,7 +614,7 @@ mod spread_shift_d3 {
         ));
         assert_eq!(service.watermarks(), before);
         assert_eq!(row(&service, &scope), Some(saved));
-        assert!(app.remote_session_ui.pending_shift_resets.is_empty());
+        assert!(app.remote_session_ui.pending_reading_writes.is_empty());
         drop(process);
     }
 
@@ -501,7 +792,7 @@ mod spread_shift_d3 {
                 reply.try_recv(),
                 Err(std::sync::mpsc::TryRecvError::Empty)
             ));
-            assert_eq!(app.remote_session_ui.pending_shift_resets.len(), 1);
+            assert_eq!(app.remote_session_ui.pending_reading_writes.len(), 1);
         }
         app.retire_remote_resources_for_final_exit();
         assert!(matches!(
@@ -515,7 +806,7 @@ mod spread_shift_d3 {
             reply.try_recv(),
             Err(std::sync::mpsc::TryRecvError::Disconnected)
         ));
-        assert!(app.remote_session_ui.pending_shift_resets.is_empty());
+        assert!(app.remote_session_ui.pending_reading_writes.is_empty());
         assert_eq!(
             handle.snapshot().phase,
             super::super::super::session::RemoteControlPhase::Local

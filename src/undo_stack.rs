@@ -81,10 +81,11 @@ pub struct AdjustmentChange {
 /// 補正レイヤー 1 ページ分の変更記録。
 ///
 /// 空配列は「補正レイヤーなし」を表す。DB/sidecar への反映は
-/// `App::set_local_adjust_layers_for_idx` が担当する。
+/// `App::set_local_adjust_layers_for_target` が担当する。保存先は編集開始時の
+/// stable target で保持し、index の再利用で別ページへ付け替えない。
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocalAdjustmentChange {
-    pub idx: usize,
+    pub target: crate::app::PageAdjustmentTarget,
     pub before: local_adjust_core::LocalAdjustmentLayers,
     pub after: local_adjust_core::LocalAdjustmentLayers,
 }
@@ -295,7 +296,7 @@ impl UndoStack {
                     });
                 }
                 UndoEntry::LocalAdjustment { changes, .. } if local_adjustment => {
-                    changes.retain(|change| !page_indices.contains(&change.idx));
+                    changes.retain(|change| change.target.page_key != page_key);
                 }
                 _ => {}
             }
@@ -345,6 +346,16 @@ impl UndoStack {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn page_target(page_key: &str, idx: usize) -> crate::app::PageAdjustmentTarget {
+        crate::app::PageAdjustmentTarget {
+            page_key: page_key.into(),
+            location_path: None,
+            sidecar_coords: None,
+            compiled_book: false,
+            idx_hint: crate::app::PageIndexHint::At(idx),
+        }
+    }
 
     fn rating_entry(path: &str, before: u8, after: u8) -> UndoEntry {
         UndoEntry::Rating {
@@ -614,7 +625,7 @@ mod tests {
                 ),
                 UndoEntry::LocalAdjustment {
                     changes: vec![LocalAdjustmentChange {
-                        idx: 2,
+                        target: page_target("local-page", 2),
                         before: local_adjust_core::LocalAdjustmentLayers::default(),
                         after: local_adjust_core::LocalAdjustmentLayers::default(),
                     }],
@@ -711,7 +722,7 @@ mod tests {
         s.push(UndoEntry::LocalAdjustment {
             changes: vec![
                 LocalAdjustmentChange {
-                    idx: 7,
+                    target: page_target("remote-target", 7),
                     before: local_adjust_core::LocalAdjustmentLayers::default(),
                     after: local_adjust_core::LocalAdjustmentLayers::new(vec![
                         local_adjust_core::LocalAdjustmentLayer::new(
@@ -722,7 +733,8 @@ mod tests {
                     ]),
                 },
                 LocalAdjustmentChange {
-                    idx: 8,
+                    // A reused index cannot make another key part of the reset.
+                    target: page_target("other-local-page", 7),
                     before: local_adjust_core::LocalAdjustmentLayers::default(),
                     after: local_adjust_core::LocalAdjustmentLayers::new(vec![
                         local_adjust_core::LocalAdjustmentLayer::new(
@@ -753,7 +765,7 @@ mod tests {
         match &s.redo[0] {
             UndoEntry::LocalAdjustment { changes, .. } => {
                 assert_eq!(changes.len(), 1);
-                assert_eq!(changes[0].idx, 8);
+                assert_eq!(changes[0].target.page_key, "other-local-page");
             }
             _ => panic!("expected local adjustment"),
         }

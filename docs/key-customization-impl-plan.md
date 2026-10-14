@@ -1,5 +1,8 @@
 # キーカスタマイズ機能 実装プラン (簡易版 / テキスト ini)
 
+2026-10-11 §1.242 G3: `FsViewSpread` / `FsViewLandscapeSplit`を通常のfullscreen Action登録へ追加。
+既定キーなし、保存済みbindingの移行なし。構成本/A2では閲覧mode-only、通常本では既存表示ownerへ渡す。
+
 > ステータス: **実装済み / 保守メモ**。v1.1.0+。
 > 設計の経緯・調査・代替案は [archive/ui-input/key-customization-plan.md](archive/ui-input/key-customization-plan.md) に残す。
 > 簡易版の実装判断は本書を優先し、差異が出たら本書へ集約する。

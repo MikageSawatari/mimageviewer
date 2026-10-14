@@ -1357,13 +1357,26 @@ fn write_worker_loop(
                             response: RemoteWriteResponse::Error(error),
                         }
                     } else {
-                        match session.submit_write(request, session_operation) {
-                            UiWriteOutcome::Write(response) => {
-                                ServerMessage::Write { id, response }
+                        match container_engine.composition_write_admission(&request) {
+                            Err(error) => {
+                                session_operation.finish(false);
+                                ServerMessage::Write {
+                                    id,
+                                    response: RemoteWriteResponse::Error(error),
+                                }
                             }
-                            UiWriteOutcome::Session(response) => {
-                                ServerMessage::Session { id, response }
-                            }
+                            Ok(admission) => match session.submit_write_with_composition(
+                                request,
+                                session_operation,
+                                admission,
+                            ) {
+                                UiWriteOutcome::Write(response) => {
+                                    ServerMessage::Write { id, response }
+                                }
+                                UiWriteOutcome::Session(response) => {
+                                    ServerMessage::Session { id, response }
+                                }
+                            },
                         }
                     }
                 }
@@ -2067,6 +2080,7 @@ fn operation_description(message: &ClientMessage) -> String {
         ClientMessage::RemoteArchivePassword { .. } => "アーカイブ認証情報を送信中".to_owned(),
         ClientMessage::RemoteArchiveResult { .. } => "アーカイブ準備結果を取得中".to_owned(),
         ClientMessage::Write { request, .. } => match request {
+            RemoteWriteRequest::SetViewMode { .. } => "表示モードを書き込み中",
             RemoteWriteRequest::SetSpread { .. } => "見開き設定を書き込み中",
             RemoteWriteRequest::SetFinalCoverSpreadPreference { .. } => {
                 "末尾の表紙見開き設定を書き込み中"

@@ -579,7 +579,20 @@ fn open_for_scan(
         open_readonly(path).map_err(|error| error.to_string())
     };
     match connection {
-        Ok(connection) => Some(connection),
+        Ok(connection) => {
+            if descriptor.file == "book_composition.db" {
+                if let Err(error) = crate::book_composition::validate_database_schema(&connection)
+                    .and_then(|()| crate::book_composition::validate_database_rows(&connection))
+                {
+                    state
+                        .report
+                        .errors
+                        .push(format!("{}: {error}", descriptor.file));
+                    return None;
+                }
+            }
+            Some(connection)
+        }
         Err(error) => {
             state
                 .report
@@ -780,6 +793,13 @@ where
             return report;
         }
     };
+    let _composition_maintenance = match crate::book_composition::maintenance_at(data_dir) {
+        Ok(lease) => lease,
+        Err(error) => {
+            report.errors.push(format!("book_composition: {error}"));
+            return report;
+        }
+    };
     let mut deleted = BTreeMap::<String, usize>::new();
     let mut protected = BTreeMap::<String, usize>::new();
     // One cleanup request can delete from several stores. Keep a prepare from
@@ -901,6 +921,14 @@ fn delete_descriptor<F>(
             }
         }
     }
+    if descriptor.file == "book_composition.db" {
+        if let Err(error) = crate::book_composition::validate_database_schema(&connection)
+            .and_then(|()| crate::book_composition::validate_database_rows(&connection))
+        {
+            report.errors.push(format!("{}: {error}", descriptor.file));
+            return;
+        }
+    }
     let _rating_write =
         (descriptor.file == "rating.db").then(|| crate::rating_db::RATING_WRITES.begin());
     let _tag_write = (descriptor.file == "tags.db").then(|| crate::tags_db::TAG_WRITES.begin());
@@ -972,7 +1000,9 @@ fn delete_descriptor<F>(
         ));
         return;
     }
-    report.store_mutations.record_completed(descriptor);
+    report
+        .store_mutations
+        .record_rows_changed(descriptor, committed.iter().map(|(_, rows, _)| *rows).sum());
     for (key, rows, store) in committed {
         *deleted.entry(store).or_default() += rows;
         report.deleted_keys.push(key);
@@ -1049,6 +1079,7 @@ fn excluded_to_vec(counts: BTreeMap<(String, String), usize>) -> Vec<ExcludedSto
 
 fn store_label(descriptor: &StoreDescriptor) -> &'static str {
     match descriptor.file {
+        "book_composition.db" => "本の構成",
         "rating.db" => "レーティング",
         "adjustment.db" => "補正",
         "mask.db" => "消しゴム",
@@ -1135,6 +1166,11 @@ mod tests {
     }
 
     fn create_table(data_dir: &Path, descriptor: &StoreDescriptor) -> rusqlite::Connection {
+        if descriptor.file == "book_composition.db" {
+            crate::book_composition::initialize_database_at(&data_dir.join(descriptor.file))
+                .unwrap();
+            return rusqlite::Connection::open(data_dir.join(descriptor.file)).unwrap();
+        }
         if descriptor.file == "spread_shift.db" {
             crate::spread_shift::initialize_database_at(&data_dir.join(descriptor.file)).unwrap();
             return rusqlite::Connection::open(data_dir.join(descriptor.file)).unwrap();
@@ -1158,6 +1194,20 @@ mod tests {
     fn insert_key(data_dir: &Path, index: usize, key: &str) {
         let descriptor = &STORES[index];
         let connection = create_table(data_dir, descriptor);
+        if descriptor.file == "book_composition.db" {
+            let composition = crate::book_composition::fixtures::four_page_book(
+                crate::book_composition::ReadingDirection::Ltr,
+            );
+            crate::book_composition::store::replace_row_in(
+                &connection,
+                "book_compositions",
+                key,
+                &crate::book_composition::PageDomain::Document,
+                &composition,
+            )
+            .unwrap();
+            return;
+        }
         if descriptor.file == "spread_shift.db" {
             let reference =
                 crate::spread_shift::SpreadShiftPageRef::ArchiveEntry("missing.jpg".into());
@@ -1553,5 +1603,34 @@ mod tests {
         assert!(!finished_early, "unknown restored scope must wait as Tree");
         assert_eq!(report.purged, 1);
         assert_eq!(report.remaining, 0);
+    }
+    #[test]
+    fn composition_cleanup_uses_production_schema_and_changed_effect() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let book = temp.path().join("missing.pdf");
+        let key = crate::path_key::normalize_keep_drive(&book);
+        let index = descriptor_index("book_composition.db", "book_compositions");
+        insert_key(&data, index, &key);
+        let cancel = AtomicBool::new(false);
+        let scan = run_scan_at(&data, Path::new(""), &cancel, &progress(PHASE_SCANNING)).unwrap();
+        assert!(scan.errors.is_empty(), "{:?}", scan.errors);
+        assert_eq!(scan.candidates.len(), 1);
+        let report = run_delete_at(
+            &data,
+            Path::new(""),
+            &scan,
+            &cancel,
+            &progress(PHASE_DELETING),
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(report.store_mutations.book_composition_changed());
+        let connection = create_table(&data, &STORES[index]);
+        assert!(
+            crate::book_composition::store::load_rows(&connection)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

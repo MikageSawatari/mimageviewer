@@ -248,7 +248,8 @@ BS／親移動は Everything position を経由し、book 内の既存 prefix pa
 | Lite／IPC 無効／QUERY2 拒否／古い版 | 「この Everything では IPC 検索を利用できません。通常版の 1.4.1 以降と IPC 設定を確認してください」。lite 検出を version だけで断定しない |
 | DB 未ロード／再構築中 | 成功の 0 件を採用しない。「Everything の索引を準備中です。準備後にもう一度検索してください」。自動 wait/retry はしない |
 | DB loaded だが folder index が更新途中 | 得られた時点の snapshot を表示。全ドライブ／全 folder の完走や最新性を保証しない。loaded は全索引更新完了の証明ではない |
-| 応答 deadline／hung | log＋「Everything の処理が遅いか、混雑しています。しばらく待つか、検索条件を絞って再検索してください」。未起動案内にまとめない |
+| 送信失敗時に Windows が対象 HWND を応答なしと判定 | `NotResponding`。log＋「Everything が応答していません。起動直後の索引の読み込みや更新などの処理が終わるまで待ってから、もう一度検索してください」。検索条件の絞り込みを勧めない |
+| 応答 deadline／送信timeout（応答なしと判定されない） | `Busy`／`Timeout`。log＋「Everything の処理が遅いか、混雑しています。しばらく待つか、検索条件を絞って再検索してください」。未起動案内にまとめない |
 | 終了／UIPI 拒否等 | log＋「Everything から結果を取得できませんでした。起動状態・権限を確認して再検索してください」。mIV を勝手に elevate しない |
 | malformed／byte limit／互換 wire 不一致 | その reply を全体で拒否。log＋通知／条件を絞る案内。QUERY1／SDK／FS 全走査への silent fallback なし |
 | worker spawn／prepare／DB read のまれな失敗 | log＋通知。未採用一覧を公開せず、元の accepted view を保持。新 recovery state／retry loop／DB 再作成を設計しない |
@@ -587,7 +588,7 @@ callerにもstatus4回＋query60秒＋cleanupを含む65秒の上限を置く。
 run/channel/eventは作成した検索だけが持ち、一覧、App/bundle field、Remote API、PDF epoch ownerは増やさない。
 元のrun/context/generationによる旧完了棄却とcontext退役の契約を保持する。
 
-timeout/ERROR_TIMEOUTと実hungは`Busy`/`Timeout`として同じ「処理が遅いか、混雑しています」案内へ接続。
+当時はtimeout/ERROR_TIMEOUTと実hungを`Busy`/`Timeout`として同じ「処理が遅いか、混雑しています」案内へ接続した。2026-10-14の分類分離は§19参照。
 HWND不在のclient起動案内、索引未ロード、拒否/権限等の案内とは区別する。
 失敗logはmessage/status/errorにbudget/elapsedだけを追加し、queryやpathを出さない。
 まれなspawn/event/native失敗はlog＋既存通知。partial結果/回復owner/retry loopを追加しない。
@@ -639,3 +640,56 @@ master `71e6b4c83` のincoming 17ファイルを共通ancestorから衝突なく
 `test-full.ps1` を1回実行し、workspaceとvendor 3 crateがPASS（本体lib 12,214 passed / 0 failed / 57 ignored）。
 最後に `build-dev.ps1 -PreserveRuntime` を完了し、normal featureのcore/Remote/EPUB workerを構築。
 未コミットで引き渡す。agentによるmIVのUI起動は行っていない。
+
+## 19. Everything側の応答なしと遅い検索の案内分離（2026-10-14）
+
+利用者の操作と設計担当の読み取り専用process観測による追加確認:
+
+- Everything 1.4.1.1032の約2,800万件・約1 GBの索引環境で、起動・スキャン後に
+  約6分間Responding=Falseとなり、CPU 1コアを使用し続けた。
+- この間のmIV検索はWM_USER（0x400）のABORTIFHUNG付き版照会が約0.03 msで失敗するか、
+  queryのWM_COPYDATAが60秒でerror1460となり、従来はいずれもBusyの案内だった。
+  読取ログの出どころは`G:\miv-iso\view\data\logs\mimageviewer.log`のeverything行。
+  今回の実装agentは実Everythingへの追加probeや当該process/logの追加観測を行っていない。
+- Everythingが落ち着いた後は`mist`・`妹`とも検索成功した（利用者の観測）。
+  内部の処理内容をIPCで特定したという意味ではない。
+
+利用者決定に従い、送信失敗直後の対象HWNDに対して既存Windows API
+[IsHungAppWindow](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-ishungappwindow)
+を一度呼び、trueなら型付き`EverythingError::NotResponding`を返す。
+Win32 errorはAPI呼出し前に保存し、error0の状態照会即時失敗とerror1460のquery timeoutを
+同じ失敗境界で分類する。falseのerror1460は従来どおりBusy、返信待ちdeadlineはTimeoutのまま。
+Windowsの応答なし判定を通知するもので、Everything内部の停止理由を断定しない。
+
+送信失敗logへ分類名を加え、query/pathは記録しない。新たなretry・待機・pollingは追加しない。
+status失敗時はquery/取消を送らず、query失敗時は既存の一回・100 msのbest-effort取消と
+correlation失効・RAII破棄を維持する。検索owner・一覧・旧結果保持・main modalは変更しない。
+既存のmodalと有限deadlineで組合せを抑える設計を維持し、新たな回復状態は不要。
+
+fake endpointはerror0/1460とWindows判定の組合せを注入し、分類から案内への伝播、
+応答なし・遅いだけ・未起動の文言分離、status失敗の未送信、query失敗の取消一回を検査する。
+応答なし案内の狭幅dark検索bar PNGを1枚追加し、生成後に目視確認する。
+マニュアルのEverything節へ、多数のファイルがある環境の起動直後／索引更新中の応答停止、
+画面の「応答なし」の確認と処理完了後の再検索、頻繁に更新されるフォルダーの除外が
+処理負荷を軽くする場合があることを追記する。
+
+### 19.1 検証記録
+
+master `f5bdab499` 上の今回の未コミット差分で、以下はすべてexit 0。
+
+- `cargo fmt --all -- --check`、通常／`--features portable`のcore check、
+  `python scripts/check_ui_glyphs.py`（危険文字0）、`git diff --check`が成功。
+- `cargo test -p mimageviewer --lib everything`: **68 passed / 0 failed / 1 ignored**
+  （実Everything probeは実行しない）。新しい分類／案内のfake回帰を含む。
+- `cargo test -p mimageviewer --lib global_search_ui`: **85 passed / 0 failed**。
+  新PNGは更新指定で1 passed、その後の上記2 filterでは更新指定なしで比較成功。
+  狭幅darkの案内全体と検索／閉じるボタンのviewport内配置を検査し、PNGを目視確認済み。
+  追加1枚は38,209 bytes。既存`--test ui_snapshot everything`も**5 passed / 0 failed**。
+- `scripts/build-dev.ps1 -PreserveRuntime`が成功。通常featureのdev-runtime core／Remote service／
+  EPUB PDF workerをbuild/stageし、VCRT gateはruntime=4 / pe=3で成功。
+  アプリは起動していない。コミットしていない。
+
+各検証の記録は`target/EV-1374-hung-{fmt,glyph,check-normal,check-portable,everything-tests,search-tests,ui-tests,snapshot-update}.log`。
+build完了と成果物の記録は`target/EV-1374-hung-build-dev.log`（JSON）。
+変更はprivate transportの失敗分類と案内に限定し、今回はfull gateを実行していない。
+実Everythingが応答しない間の新案内と、応答回復後の再検索は利用者確認待ち。

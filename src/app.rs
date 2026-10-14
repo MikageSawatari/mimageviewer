@@ -535,6 +535,7 @@ pub(crate) mod file_type_resume;
 #[cfg(test)]
 mod rar_archive_cache_tests;
 pub(crate) use facet_navigation::{FacetNavigationState, FacetRoute, FacetScope};
+pub(crate) mod book_materialization;
 pub(crate) mod folder_scan;
 #[cfg(test)]
 mod media_resume_meter_tests;
@@ -567,8 +568,24 @@ use presentation_transition::{
 };
 #[cfg(all(windows, test))]
 use presentation_transition::{PreparingProgress, PresentationTransitionState};
+pub(crate) mod book_composition_editor;
+mod book_composition_editor_prepare;
+mod book_composition_editor_thumbnails;
+pub(crate) mod book_composition_permission;
+mod book_composition_remap;
+pub(crate) mod book_composition_runtime;
+mod image_folder_zip_operation;
+pub(crate) use book_composition_editor::CompositionEditorCloseReason;
 pub(crate) mod normalize;
+mod page_edit_owner;
+mod page_edit_pivot;
+use page_edit_pivot::LocalPageEditSpreadPivot;
+#[cfg(test)]
+mod page_edit_owner_tests;
+#[cfg(test)]
+mod page_edit_release_tests;
 pub(crate) mod page_edit_snapshot;
+pub(crate) use page_edit_owner::{LocalPageEditDocument, PageEditOwner};
 mod prefetch_policy;
 mod recursive_snapshot_scan;
 mod runtime_ops;
@@ -914,6 +931,10 @@ enum PreparedSyntheticSurface {
 }
 
 pub(super) enum MainListAfterHydration {
+    ImageFolderZip {
+        destination: PathBuf,
+        completed: mpsc::Sender<()>,
+    },
     DirectMedia(startup_ops::DirectMediaPrepared),
     StackSelection {
         select: usize,
@@ -4352,7 +4373,7 @@ pub(crate) enum FolderNavMode {
 /// `target` は未展開 ZIP/PDF 内の特定 leaf を開きに行く場合に使う。★固定 navigation は
 /// `Preferred`、detached の明示 leaf open は `Required` とし、後者だけ target 消失時に
 /// 別ページへ fallback しない。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DeferredFsReopen {
     pub history_trigger: HistoryTrigger,
     /// true なら reopen 後にスライドショーを再開する (SlideshowNext 由来のときだけ)。
@@ -4385,8 +4406,10 @@ pub(crate) enum DeferredFsTarget {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DeferredFsOpenOutcome {
     Opened,
+    WaitingComposition,
     NoPlayableItem,
     RequiredTargetMissing,
+    RequiredTargetHidden,
 }
 
 pub(crate) struct PdfPasswordRequest {
@@ -4595,6 +4618,9 @@ pub(crate) enum GridAspectLayout {
 /// cloneable, while the Smart adoption permit owns a potentially large offscreen root payload.
 enum VisibleInstallAuthority<'a> {
     Ordinary,
+    Projection {
+        recipe: book_materialization::ProjectionRecipe,
+    },
     Rating {
         stars: u8,
     },
@@ -5315,17 +5341,19 @@ pub(crate) enum EditMaterializeResult {
 }
 
 pub(crate) struct LocalAdjustLutLoadPending {
+    pub(crate) owner: PageEditOwner,
     pub(crate) fs_idx: usize,
     pub(crate) layer_idx: usize,
-    pub(crate) generation: u64,
+    pub(crate) document: local_adjust_core::LocalAdjustmentLayers,
     pub(crate) path: PathBuf,
     pub(crate) rx: mpsc::Receiver<Result<local_adjust_core::CubeLutParams, String>>,
 }
 
 pub(crate) struct LocalAdjustSegmentationPending {
+    pub(crate) owner: PageEditOwner,
     pub(crate) fs_idx: usize,
     pub(crate) layer_idx: usize,
-    pub(crate) generation: u64,
+    pub(crate) document: local_adjust_core::LocalAdjustmentLayers,
     pub(crate) cancel: Arc<AtomicBool>,
     pub(crate) rx: mpsc::Receiver<Result<LocalAdjustGeneratedMask, String>>,
 }
@@ -5387,8 +5415,9 @@ pub(crate) enum LocalAdjustCanvasDragKind {
     TiltShiftOuterY,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct LocalAdjustCanvasDrag {
+    pub(crate) owner: PageEditOwner,
     pub(crate) fs_idx: usize,
     pub(crate) layer_idx: usize,
     pub(crate) kind: LocalAdjustCanvasDragKind,
@@ -5520,8 +5549,9 @@ pub(crate) enum LocalAdjustMaskTool {
     Ellipse,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct LocalAdjustMaskShapeDrag {
+    pub(crate) owner: PageEditOwner,
     pub(crate) fs_idx: usize,
     pub(crate) layer_idx: usize,
     pub(crate) target: LocalAdjustMaskEditTarget,
@@ -5529,8 +5559,9 @@ pub(crate) struct LocalAdjustMaskShapeDrag {
     pub(crate) vector_drag: crate::vector_edit::DragState,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct LocalAdjustMaskBrushStroke {
+    pub(crate) owner: PageEditOwner,
     pub(crate) fs_idx: usize,
     pub(crate) layer_idx: usize,
     pub(crate) target: LocalAdjustMaskEditTarget,
@@ -12010,7 +12041,6 @@ impl App {
             (!self.text_mode, &mut self.text_spread_ctx),
             (!self.export_crop_mode, &mut self.export_crop_spread_ctx),
             (self.sns_split.is_none(), &mut self.sns_split_spread_ctx),
-            (!self.local_adjust_mode, &mut self.local_adjust_spread_ctx),
         ]
         .into_iter()
         .filter_map(|(mode_is_off, slot)| mode_is_off.then(|| slot.take()).flatten())
@@ -12018,6 +12048,7 @@ impl App {
         for pivot in stale {
             self.leave_page_edit_single_view(Some(pivot));
         }
+        self.reconcile_local_page_edit_spread_pivot();
     }
 
     /// 編集ツールで倒す前の見開きペア。**倒した後も左右の切り替えを出すために使う。**
@@ -12030,8 +12061,8 @@ impl App {
             .or(self.text_spread_ctx)
             .or(self.export_crop_spread_ctx)
             .or(self.sns_split_spread_ctx)
-            .or(self.local_adjust_spread_ctx)
             .map(|pivot| pivot.pair)
+            .or_else(|| self.local_adjust_spread_ctx.as_ref().and_then(|p| p.pair()))
     }
 
     fn page_edit_navigation_anchor_idx(&self) -> Option<usize> {
@@ -12040,8 +12071,12 @@ impl App {
             .or(self.text_spread_ctx)
             .or(self.export_crop_spread_ctx)
             .or(self.sns_split_spread_ctx)
-            .or(self.local_adjust_spread_ctx)
             .map(|pivot| pivot.navigation_anchor_idx)
+            .or_else(|| {
+                self.local_adjust_spread_ctx
+                    .as_ref()
+                    .and_then(|p| p.anchor())
+            })
     }
 
     /// 退避しておいた見開きへ戻す。
@@ -12113,6 +12148,8 @@ pub(crate) struct VirtualFolderWriteback {
 #[derive(Debug, Clone)]
 pub(crate) struct AdjustmentDragSession {
     pub fs_idx: usize,
+    pub owner: PageEditOwner,
+    pub draft: Option<crate::adjustment::AdjustParams>,
     pub before: Option<crate::adjustment::AdjustParams>,
 }
 
@@ -12168,6 +12205,7 @@ pub(crate) enum AdjustmentStandardScope {
 /// 変えずに、標準側だけを release 時の 1 回書き込みへまとめる。
 #[derive(Debug, Clone)]
 pub(crate) struct AdjustmentStandardDragSession {
+    pub draft: crate::adjustment::AdjustParams,
     pub scope: AdjustmentStandardScope,
     pub before: crate::adjustment::AdjustParams,
 }
@@ -12213,6 +12251,7 @@ pub(crate) enum EditStoreOutcome {
 /// **畳むときに捨ててはいけない。**ドラッグ中のブラシと違い、キー編集は 1 回ごとが
 /// 完了した編集で、捨てると利用者の操作がそのまま消える。
 pub(crate) struct LocalAdjustShapeKeyEdit {
+    pub owner: PageEditOwner,
     pub fs_idx: usize,
     /// 対象のレイヤー。同じ数値の図形 index は別レイヤーにも在るので、これが無いと
     /// 無関係なレイヤーの編集が 1 つのセッションに混ざる。
@@ -12237,13 +12276,18 @@ pub(crate) struct LocalAdjustShapeKeyEdit {
 ///
 /// key ごとに**最後に積んだ 1 件**だけを持つ。同じ key の古い完了もこの座標でミラーして
 /// よい (key が同じなら指すページも同じ)。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LocalAdjustWriteOrigin {
+    pub context: ViewerContextId,
+    pub target: PageAdjustmentTarget,
+    pub revision: u64,
+}
+
 pub(crate) struct LocalAdjustWritePending {
+    pub origin: LocalAdjustWriteOrigin,
+    pub layers: local_adjust_core::LocalAdjustmentLayers,
     /// この key について最後に積んだ generation。記録を畳む時期を決めるのに使う。
     pub generation: u64,
-    /// 積んだ時点の一覧 idx。
-    pub idx: usize,
-    /// 積んだ時点で固定したミラー先。`None` は製本ページかサイドカー座標なし。
-    pub sidecar: Option<(std::path::PathBuf, String)>,
 }
 
 /// メタ操作 (タグ付与など) を発火させた UI 面。
@@ -12748,23 +12792,20 @@ impl SpreadRestoreDefaults {
     }
 }
 
+#[cfg(test)]
 fn default_spread_for_document_direction(
     mode: crate::settings::SpreadMode,
     follow: bool,
     direction: Option<crate::pdf_loader::PdfReadingDirection>,
 ) -> crate::settings::SpreadMode {
-    if !follow {
-        return mode;
-    }
-    match direction {
-        Some(crate::pdf_loader::PdfReadingDirection::R2L) => {
-            mode.with_reading_direction(crate::settings::ReadingDirection::Rtl)
-        }
-        Some(crate::pdf_loader::PdfReadingDirection::L2R) => {
-            mode.with_reading_direction(crate::settings::ReadingDirection::Ltr)
-        }
-        None => mode,
-    }
+    crate::spread_db::StoredSpreadState::default()
+        .resolve_reading(
+            mode,
+            crate::settings::ReadingDirection::Ltr,
+            follow,
+            direction,
+        )
+        .mode
 }
 
 pub(crate) fn pdf_meta_placeholder_allowed(
@@ -15006,6 +15047,7 @@ pub struct App {
     pub(crate) normal_folder_omitted_entries: Option<NormalFolderOmittedEntries>,
     pub(crate) navigation_scope: ViewerNavigationScope,
     pub(crate) items: Vec<GridItem>,
+    pub(crate) projection_recipe: book_materialization::ProjectionRecipe,
     pub(crate) page_identity_index: Arc<file_type_resume::PreparedPageIdentityIndex>,
     /// Hands out content identities. Process-wide on purpose: it maps content to identity and
     /// holds no per-viewer state, so sharing it lets the same page keep one id across every
@@ -15419,6 +15461,9 @@ pub struct App {
     pub(crate) content_identity_recorder: Option<crate::content_identity::ContentIdentityRecorder>,
     pub(crate) spread_shift_settings_generation: u64,
     pub(crate) spread_shift_service: Option<crate::spread_shift::SpreadShiftService>,
+    pub(crate) book_composition_service: Option<crate::book_composition::BookCompositionService>,
+    pub(crate) image_folder_zip_operation: Option<Box<image_folder_zip_operation::Operation>>,
+    pub(crate) composition_editor_operations: book_composition_editor::CompositionEditorOperations,
     spread_shift_process_owner:
         Option<Arc<std::sync::Mutex<Option<crate::spread_shift::SpreadShiftProcessOwner>>>>,
     pub(crate) content_identity_index_load_pending:
@@ -16676,6 +16721,10 @@ pub struct App {
     /// この viewer の見開き調整と、保存・復元に対する受付済み依存。
     /// 描画用 index は identity/nav 投影から取得し、durable rows は共有 service が所有する。
     pub(crate) spread_shift: ViewerSpreadShift,
+    pub(crate) book_composition: book_composition_runtime::ViewerBookComposition,
+    pub(crate) composition_editor: book_composition_editor::CompositionEditorState,
+    pub(crate) book_composition_permission:
+        book_composition_permission::ViewerPresentationPermission,
     /// 現在の連結方式（ページ単位 / 縦連結 / 横連結）。
     pub(crate) reading_flow: crate::settings::ReadingFlow,
     /// 横連結時の読書方向。
@@ -17318,7 +17367,7 @@ pub struct App {
     /// 補正レイヤーを見開きから開いたときの退避。**当時の 5 つの編集ツールで唯一これが無く**、
     /// 見開きのまま入ると canvas 用 transform が作られずマスク編集が一切効かなかった
     /// (2026-08-26 の利用者報告)。
-    pub(crate) local_adjust_spread_ctx: Option<PageEditSpreadPivot>,
+    pub(crate) local_adjust_spread_ctx: Option<LocalPageEditSpreadPivot>,
     /// 補正レイヤーパネルで選択中のレイヤー index。ページごとに保持する。
     pub(crate) local_adjust_selected_layers: std::collections::HashMap<usize, usize>,
     /// 補正レイヤー追加時のマスク種類選択ダイアログ。
@@ -17411,6 +17460,7 @@ pub struct App {
         Option<local_adjust_core::LocalAdjustmentLayers>,
     /// キーボードでの図形移動 / 回転の保留。Undo と保存をセッション単位にまとめる。
     pub(crate) local_adjust_shape_key_edit: Option<LocalAdjustShapeKeyEdit>,
+    pub(crate) local_page_edit_document: LocalPageEditDocument,
     /// 手描きブラシ中の重い補正レイヤー再計算を少し遅らせるための保留状態。
     pub(crate) local_adjust_brush_deferred_render: Option<LocalAdjustBrushDeferredRender>,
     /// 補正レイヤー自身の世代番号。レイヤー追加 / 削除 / パラメータ変更で idx 単位に +1 する。
@@ -18593,6 +18643,7 @@ pub struct App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        self.close_local_composition_editor(CompositionEditorCloseReason::Shutdown);
         self.pdf_render_epoch.retire();
         self.transfer_spread_shift_exit_ownership();
         self.diagnostics_export.retire();
@@ -18643,6 +18694,16 @@ impl App {
             let accepted = if result.operation.context_id == self.spread_shift_context_id() {
                 self.spread_shift
                     .accept_write_reply(&result, self.settings.remember_spread_shift_per_book)
+                    .or_else(|| {
+                        self.snapshot
+                            .as_mut()?
+                            .saved_viewing_state
+                            .shift
+                            .accept_write_reply(
+                                &result,
+                                self.settings.remember_spread_shift_per_book,
+                            )
+                    })
             } else {
                 #[cfg(windows)]
                 {
@@ -18691,6 +18752,9 @@ impl App {
     }
 
     fn transfer_spread_shift_exit_ownership(&mut self) {
+        if let Some(service) = &self.book_composition_service {
+            service.close_admission();
+        }
         if let Some(service) = &self.spread_shift_service {
             service.close_admission();
         }
@@ -19505,6 +19569,7 @@ impl App {
             normal_folder_omitted_entries: None,
             navigation_scope: ViewerNavigationScope::Main,
             items: Vec::new(),
+            projection_recipe: Default::default(),
             page_identity_index: Default::default(),
             item_id_interner: std::cell::RefCell::default(),
             texture_identity: std::cell::RefCell::default(),
@@ -19647,6 +19712,9 @@ impl App {
             content_identity_recorder,
             spread_shift_settings_generation: 0,
             spread_shift_service: None,
+            book_composition_service: None,
+            image_folder_zip_operation: None,
+            composition_editor_operations: Default::default(),
             spread_shift_process_owner: None,
             content_identity_index_load_pending,
             content_identity_index: crate::content_identity::ContentIdentityIndex::default(),
@@ -20120,6 +20188,9 @@ impl App {
                 crate::settings::SingletonSpreadEndpointPreferences::default(),
             page_alone_preferences: crate::settings::PageAlonePreferences::default(),
             spread_shift: Default::default(),
+            book_composition: Default::default(),
+            composition_editor: Default::default(),
+            book_composition_permission: Default::default(),
             reading_flow: crate::settings::ReadingFlow::default(),
             reading_direction: crate::settings::ReadingDirection::default(),
             spread_popup_open: false,
@@ -20390,6 +20461,7 @@ impl App {
             local_adjust_canvas_drag_before_layers: None,
             local_adjust_mask_brush_before_layers: None,
             local_adjust_shape_key_edit: None,
+            local_page_edit_document: LocalPageEditDocument::default(),
             local_adjust_brush_deferred_render: None,
             local_adjust_generation: std::collections::HashMap::new(),
             mask_pages: std::collections::HashSet::new(),
@@ -20822,6 +20894,8 @@ impl App {
             app.publish_effetune_auto_fullscreen();
             app.effetune
                 .set_keep_visible_when_minimized(app.settings.effetune_keep_visible_when_minimized);
+            app.effetune
+                .set_show_in_taskbar(app.settings.effetune_show_in_taskbar);
             app.effetune
                 .slot
                 .set_pre_limiter_enabled(app.settings.effetune_pre_limiter_enabled);
@@ -22109,6 +22183,10 @@ impl App {
     ///
     /// main / fullscreen で別々の一覧を持つと、新規ダイアログ追加時に片方だけ漏れて
     /// wheel・キーが背面へ伝播するため、モーダル相当の状態は必ずここへ集約する。
+    pub(crate) fn viewer_mutation_modal_active(&self) -> bool {
+        self.image_folder_zip_operation.is_some() || self.composition_editor_modal_active()
+    }
+
     pub(crate) fn common_modal_dialog_open(&self) -> bool {
         self.modal_dialog_block_reason().is_some()
     }
@@ -22149,6 +22227,8 @@ impl App {
             };
         }
         first![
+            self.image_folder_zip_operation.is_some() => "image_folder_zip",
+            self.composition_editor_modal_active() => "book_composition_editor",
             self.everything_search_progress_visible() => "everything_search",
             self.capture_selection_open() => "clipboard_capture_selection",
             self.sidecar_restore_active() => "sidecar_restore",
@@ -23553,6 +23633,15 @@ impl App {
         adoption: MainListAdoption,
         install: impl FnOnce(&mut Self) -> MainListHydration,
     ) -> bool {
+        self.adopt_main_list_navigation_with_completion(adoption, install, None)
+    }
+
+    fn adopt_main_list_navigation_with_completion(
+        &mut self,
+        adoption: MainListAdoption,
+        install: impl FnOnce(&mut Self) -> MainListHydration,
+        completion: Option<MainListAfterHydration>,
+    ) -> bool {
         let MainListAdoption {
             navigation,
             destination,
@@ -23585,6 +23674,13 @@ impl App {
                 self.set_active_folder_nav_suppress_record_once(false);
             }
             MainHistoryOperation::SameLocation => {}
+        }
+        if let Some(action) = completion {
+            if let Some((continuation, _)) = hydration.as_mut() {
+                continuation.navigation_after_hydration = Some(action);
+            } else {
+                self.finish_main_list_after_hydration(action);
+            }
         }
         self.hydrate_installed_main_list(hydration);
         true
@@ -25325,6 +25421,13 @@ impl App {
             self.current_folder_last_mtime = Some(new_mtime);
             return;
         }
+        // A conversion already owns the successor parent listing. Watch notifications may
+        // arrive before its scan, but cannot replace that accepted request or its hydration.
+        if self.image_folder_zip_operation.is_some() {
+            self.folder_refresh_pending = Some(folder);
+            crate::logger::log("external_rescan: deferred to folder ZIP adoption owner");
+            return;
+        }
         if self.viewer_session_blocks_main_window() {
             // 一覧へ適用すると load_folder_with_scan -> close_fullscreen まで進むため、
             // App::update の一覧側 consumer と同じ述語で、既存の再読み込みへ先送りする。
@@ -25956,6 +26059,9 @@ impl App {
     pub(crate) fn spread_container_key_with_fallback(
         &self,
     ) -> Option<crate::spread_db::SpreadContainerKey> {
+        if self.extracted_result_surface().is_some() {
+            return None;
+        }
         if let Some(nav) = self.zip_nav.as_ref() {
             Some(crate::spread_db::container_key_with_fallback(
                 &nav.tree.zip_path,
@@ -25972,6 +26078,9 @@ impl App {
     }
 
     pub(crate) fn final_cover_spread_enabled_for_current_book(&self) -> bool {
+        if self.extracted_result_surface().is_some() {
+            return false;
+        }
         self.final_cover_spread_preference
             .effective(self.settings.final_cover_spread_enabled)
     }
@@ -25979,6 +26088,12 @@ impl App {
     pub(crate) fn singleton_spread_placement_enabled_for_current_book(
         &self,
     ) -> crate::settings::SingletonSpreadEndpointSettings {
+        if self.extracted_result_surface().is_some() {
+            return crate::settings::SingletonSpreadEndpointSettings {
+                first: false,
+                last: false,
+            };
+        }
         self.singleton_spread_endpoint_preferences.effective(
             crate::settings::SingletonSpreadEndpointSettings {
                 first: self.settings.singleton_spread_first_enabled,
@@ -25988,6 +26103,12 @@ impl App {
     }
 
     pub(crate) fn page_alone_enabled_for_current_book(&self) -> crate::settings::PageAloneSettings {
+        if self.extracted_result_surface().is_some() {
+            return crate::settings::PageAloneSettings {
+                after_cover: false,
+                last: false,
+            };
+        }
         self.page_alone_preferences
             .effective(crate::settings::PageAloneSettings {
                 after_cover: self.settings.page_after_cover_alone_enabled,
@@ -26068,6 +26189,19 @@ impl App {
     ) -> Result<(), String> {
         let db = self.spread_db.as_ref().map_err(Clone::clone)?;
         let stored = db.get_state_with_fallback(key, fallback);
+        if self.extracted_result_surface().is_some() {
+            // A2 changes pairing, not the entrance's existing continuous-reading policy.
+            // Legacy Vertical is a flow encoding and overrides a retained flow column,
+            // exactly as in the normal restore below. Other synthetic pairing settings
+            // must not configure the result session.
+            self.reading_flow = stored.flow.unwrap_or(defaults.reading_flow);
+            if stored.mode.unwrap_or(defaults.spread_mode) == crate::settings::SpreadMode::Vertical
+            {
+                self.reading_flow = crate::settings::ReadingFlow::Vertical;
+            }
+            self.begin_extracted_result_view();
+            return Ok(());
+        }
         let final_cover_preference =
             db.get_final_cover_spread_preference_with_fallback(key, fallback);
         let endpoint_preferences = db
@@ -26079,44 +26213,15 @@ impl App {
         self.final_cover_spread_preference = final_cover_preference;
         self.singleton_spread_endpoint_preferences = endpoint_preferences;
         self.page_alone_preferences = page_alone_preferences;
-        let applied_document_direction = if self.settings.follow_document_reading_direction
-            && stored.mode.is_none()
-            && stored.direction.is_none()
-        {
-            document_direction.map(|direction| match direction {
-                crate::pdf_loader::PdfReadingDirection::R2L => {
-                    crate::settings::ReadingDirection::Rtl
-                }
-                crate::pdf_loader::PdfReadingDirection::L2R => {
-                    crate::settings::ReadingDirection::Ltr
-                }
-            })
-        } else {
-            None
-        };
-        // A saved mode fixes its own direction. A direction-only row rotates the default mode.
-        // Single has no embedded direction and keeps the saved/document/default direction.
-        let preferred_direction = stored
-            .direction
-            .or(applied_document_direction)
-            .unwrap_or(defaults.reading_direction);
-        let stored_spread = stored.mode.unwrap_or_else(|| {
-            if stored.direction.is_some() {
-                defaults
-                    .spread_mode
-                    .with_reading_direction(preferred_direction)
-            } else {
-                default_spread_for_document_direction(
-                    defaults.spread_mode,
-                    self.settings.follow_document_reading_direction,
-                    document_direction,
-                )
-            }
-        });
+        let resolved = stored.resolve_reading(
+            defaults.spread_mode,
+            defaults.reading_direction,
+            self.settings.follow_document_reading_direction,
+            document_direction,
+        );
+        let stored_spread = resolved.mode;
         self.reading_flow = stored.flow.unwrap_or(defaults.reading_flow);
-        self.reading_direction = stored_spread
-            .reading_direction()
-            .unwrap_or(preferred_direction);
+        self.reading_direction = resolved.direction;
         if stored_spread == crate::settings::SpreadMode::Vertical {
             self.spread_mode = crate::settings::SpreadMode::Single;
             self.reading_flow = crate::settings::ReadingFlow::Vertical;
@@ -26175,7 +26280,12 @@ impl App {
                     apply_mode: self.view_trim_apply_mode,
                     book_settings: self.view_trim_book_settings,
                 };
-                if let Err(err) = db.set_book_state(key, migrated) {
+                if let Some(service) = &self.book_composition_service {
+                    let _ = service.save_view_trim(crate::view_trim_db::ViewTrimWriteBatch {
+                        book: Some((key.to_owned(), migrated)),
+                        pages: vec![],
+                    });
+                } else if let Err(err) = db.set_book_state(key, migrated) {
                     crate::logger::log(format!(
                         "view_trim: failed to migrate legacy margin fit for book: {err}"
                     ));
@@ -26197,6 +26307,20 @@ impl App {
             },
             book_settings: self.view_trim_book_settings,
         };
+        if let Some(service) = &self.book_composition_service {
+            let receipt = service.save_view_trim(crate::view_trim_db::ViewTrimWriteBatch {
+                book: Some((key, state)),
+                pages: vec![],
+            });
+            if let Ok(Err(error)) = receipt.try_recv() {
+                crate::logger::log(format!("view_trim: failed to enqueue book state: {error}"));
+            } else {
+                self.record_current_container_content_identity(
+                    crate::content_identity::ContentIdentityTrigger::Edit,
+                );
+            }
+            return;
+        }
         if let Err(err) = db.set_book_state(&key, state) {
             crate::logger::log(format!("view_trim: failed to save book state: {err}"));
         } else {
@@ -26214,6 +26338,24 @@ impl App {
         let (Some(db), Some(key)) = (&self.view_trim_db, self.page_path_key(idx)) else {
             return;
         };
+        if let Some(service) = &self.book_composition_service {
+            let receipt = service.save_view_trim(crate::view_trim_db::ViewTrimWriteBatch {
+                book: None,
+                pages: vec![(key, page_override)],
+            });
+            if let Ok(Err(error)) = receipt.try_recv() {
+                crate::logger::log(format!(
+                    "view_trim: failed to enqueue page override idx={idx}: {error}"
+                ));
+            } else {
+                self.record_content_identity_for_idx(
+                    idx,
+                    crate::content_identity::ContentIdentityTrigger::Edit,
+                );
+            }
+            self.invalidate_smart_folder_resort_metadata();
+            return;
+        }
         if let Err(err) = db.set_page_override(&key, page_override) {
             crate::logger::log(format!(
                 "view_trim: failed to save page override idx={idx}: {err}"
@@ -26231,6 +26373,21 @@ impl App {
         let (Some(db), Some(key)) = (&self.view_trim_db, self.page_path_key(idx)) else {
             return;
         };
+        if let Some(service) = &self.book_composition_service {
+            let receipt = service.remove_view_trim_page(key);
+            if let Ok(Err(error)) = receipt.try_recv() {
+                crate::logger::log(format!(
+                    "view_trim: failed to enqueue page override removal idx={idx}: {error}"
+                ));
+            } else {
+                self.record_content_identity_for_idx(
+                    idx,
+                    crate::content_identity::ContentIdentityTrigger::Edit,
+                );
+            }
+            self.invalidate_smart_folder_resort_metadata();
+            return;
+        }
         if let Err(err) = db.remove_page_override(&key) {
             crate::logger::log(format!(
                 "view_trim: failed to remove page override idx={idx}: {err}"
@@ -26419,6 +26576,7 @@ impl App {
         self.zip_enumerate_pending = None;
         self.fs_nav_after_pdf_enumerate = None;
         self.virtual_folder_writeback = None;
+        self.retire_book_deferred_open();
         self.pdf_prefetch_grace_until = None;
 
         let items: Vec<GridItem> = crate::known_folders::available_drives()
@@ -28033,6 +28191,7 @@ impl App {
                 _ => Some(self.projected_viewer_context_id()),
             };
             if owner_context == Some(self.projected_viewer_context_id()) {
+                self.retire_book_deferred_open();
                 self.top_level_grid_view.set_open_path_classification(None);
                 let retire_cold = self.pdf_enumerate_pending.as_ref().is_some_and(|pending| {
                     matches!(pending.5, PdfOpenPhase::ColdCandidate { .. })
@@ -29492,9 +29651,23 @@ impl App {
 
     #[cfg(windows)]
     fn save_effetune_gui_rect(&mut self) {
-        let Some(bridge) = self.effetune.bridge() else {
+        let Some(bridge) = self.effetune.bridge().cloned() else {
             return;
         };
+        // Host snapshots are already complete; draining never waits for IPC.
+        let changes = bridge.pump_gui_signals();
+        if !changes.warnings.is_empty() {
+            self.show_feedback_toast("音響調整の窓の表示・配置を更新できませんでした。".into());
+        }
+        if !changes.user_hidden_paths.is_empty() {
+            self.effetune.capture_on_hide();
+        }
+        if !changes.bypass_updates.is_empty() {
+            self.effetune
+                .fail(crate::effetune::EffetuneFailure::ProcessFailed(
+                    "unexpected editor bypass event".into(),
+                ));
+        }
         let Some((_, x, y, width, height)) =
             bridge.snapshot_all_window_positions().into_iter().next()
         else {
@@ -29523,8 +29696,18 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(crate) fn effetune_toolbar_click(&mut self, pointer_click: bool) {
-        let foreground = self.effetune.click_foreground(pointer_click);
+    pub(crate) fn effetune_toolbar_active(&self) -> bool {
+        matches!(
+            self.effetune.runtime,
+            crate::effetune::EffetuneRuntime::Running { .. }
+        ) && matches!(
+            self.effetune.effective_state(),
+            Some(crate::effetune::EffectiveState::Effective)
+        )
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn effetune_toolbar_click(&mut self) {
         if !self.effetune_toolbar_available() {
             return;
         }
@@ -29545,21 +29728,10 @@ impl App {
                 let Some(bridge) = self.effetune.bridge().cloned() else {
                     return;
                 };
-                use crate::effetune::{GuiButtonAction, gui_button_action};
-                let visible = bridge.slot(0).is_some_and(|slot| slot.gui_visible);
-                match gui_button_action(visible, bridge.slot_gui_is_foreground(0, foreground)) {
-                    GuiButtonAction::Hide => {
-                        self.save_effetune_gui_rect();
-                        self.effetune.request_hide_gui();
-                    }
-                    GuiButtonAction::Activate => self.effetune.request_show_gui(),
-                    GuiButtonAction::Show => {
-                        if let Some(hwnd) = self.main_hwnd {
-                            bridge.set_main_hwnd(hwnd as u64);
-                        }
-                        self.effetune.request_show_gui();
-                    }
+                if let Some(hwnd) = self.main_hwnd {
+                    bridge.set_main_hwnd(hwnd as u64);
                 }
+                self.effetune.request_show_gui();
             }
             _ => {}
         }
@@ -29570,29 +29742,25 @@ impl App {
         if self.remote_session_blocks_local_control() {
             return "リモート接続中は音響調整の窓を表示できません。接続が終了すると、表示していた窓が戻ります".into();
         }
-        use crate::effetune::{EffectiveState, EffetuneRuntime};
+        use crate::effetune::EffetuneRuntime;
         match &self.effetune.runtime {
             EffetuneRuntime::Unavailable(reason) if reason.preparation_retryable() => {
-                format!("音響調整を利用できません: {}\nクリックして準備を再確認します", reason.user_reason())
+                format!(
+                    "音響調整を利用できません: {}\nクリックして準備を再確認します",
+                    reason.user_reason()
+                )
             }
             EffetuneRuntime::Unavailable(reason) => {
                 format!("音響調整を利用できません: {}", reason.user_reason())
             }
-            EffetuneRuntime::Idle => "音響調整を開く".into(),
+            EffetuneRuntime::Idle => "音響調整の窓を表示して前面に出します".into(),
             EffetuneRuntime::Loading { .. } => "音響調整を読み込み中…".into(),
             EffetuneRuntime::Failed(reason) => {
                 format!("音響調整は停止しました: {}", reason.user_reason())
             }
-            EffetuneRuntime::Running { .. } => match self.effetune.effective_state() {
-                Some(EffectiveState::Effective) => {
-                    "音響調整は有効です (設定の窓を閉じた時点の内容で判定しています)".into()
-                }
-                Some(EffectiveState::Inert) => {
-                    "音響調整にエフェクトが無いか、全体バイパス中です (設定の窓を閉じた時点の内容で判定しています)".into()
-                }
-                Some(EffectiveState::Unparseable(_)) => "音響調整の設定を判定できません".into(),
-                None => "音響調整の設定を確認中です".into(),
-            },
+            EffetuneRuntime::Running { .. } => {
+                crate::effetune::running_gui_tooltip(self.effetune.effective_state())
+            }
         }
     }
 
@@ -29811,19 +29979,8 @@ impl App {
         if self.effetune.has_pending_ui_work() {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
-        if let Some(bridge) = self.effetune.bridge().cloned() {
-            let changes = bridge.pump_gui_signals();
-            if !changes.user_hidden_paths.is_empty() {
-                self.save_effetune_gui_rect();
-                self.effetune.capture_on_hide();
-            }
-            if !changes.bypass_updates.is_empty() {
-                self.effetune
-                    .fail(crate::effetune::EffetuneFailure::ProcessFailed(
-                        "unexpected editor bypass event".into(),
-                    ));
-            }
-        }
+        // Same snapshot path for user-hide, checked button Hide, and exit saving.
+        self.save_effetune_gui_rect();
         if !was_failed
             && matches!(
                 self.effetune.runtime,
@@ -30547,12 +30704,19 @@ impl App {
     }
 
     /// worker で確定した再起動案内を既存の全画面トーストへ届ける。
-    fn poll_indexer_notifications(&mut self) {
-        let notifications = self
+    fn poll_indexer_notifications(&mut self, minimized: bool) {
+        let mut notifications = self
             .indexer_init
             .as_ref()
             .map(|manager| manager.take_notifications())
             .unwrap_or_default();
+        // Do not start the one-shot name notice's toast clock until normal UI
+        // can draw it. This projection never acquires the SQLite connection.
+        if !self.indexer_init.overlay_active() && self.window_visible && !minimized {
+            if let Some(db) = &self.search_index_db {
+                notifications.extend(db.take_failure_notifications());
+            }
+        }
         if !notifications.is_empty() {
             self.show_feedback_toast_with_duration(notifications.join("\n"), 5.0);
         }
@@ -31133,7 +31297,10 @@ impl App {
         {
             self.tag_view_subfolder_restore = Some(restore_state);
         }
-        self.start_loading_items(
+        self.start_loading_extracted_items(
+            book_materialization::ExtractedSurface::Search(
+                top_level_grid_view::TopLevelSearchView::Tag,
+            ),
             search_results_synthetic_path(),
             items,
             image_metas,
@@ -31492,7 +31659,10 @@ impl App {
         {
             self.favsearch_subfolder_restore = Some(restore_state);
         }
-        self.start_loading_items(
+        self.start_loading_extracted_items(
+            book_materialization::ExtractedSurface::Search(
+                top_level_grid_view::TopLevelSearchView::Favorite,
+            ),
             synthetic,
             items,
             image_metas,
@@ -32204,6 +32374,7 @@ impl App {
     /// An accepted staged request inherits the location before any unfinished direct book open.
     /// Retire an unfinished direct owner before admitting a staged request from its visible source.
     fn retire_direct_document_open_for_history_admission(&mut self) {
+        self.retire_book_deferred_open();
         let Some(mut pending) = self.pdf_enumerate_pending.take() else {
             return;
         };
@@ -34033,7 +34204,7 @@ impl App {
                     }
                 };
                 let (items, image_metas, existing_keys) =
-                    Self::build_pdf_page_rows(&path, &pages.pages);
+                    book_materialization::materialize_document_rows(&path, &pages.pages);
                 PreparedPhysicalListing::Pdf {
                     path: path.clone(),
                     source,
@@ -35502,6 +35673,7 @@ impl App {
         self.zip_enumerate_pending = None;
         self.pdf_enumerate_pending = None;
         self.fs_nav_after_pdf_enumerate = None;
+        self.retire_book_deferred_open();
         self.archive_auto_fs_paint_trace = None;
         // 自動 1 ページ目フルスクリーン (環境設定 ON で grid から ZIP を開いた) の予約を、
         // enumerate 完了で先頭ページを開く既存 deferred 機構へ載せ替える。
@@ -35886,12 +36058,11 @@ impl App {
                 }))
         {
             prepared.nav.enter(&pending.dir_prefix);
-            let (mut items, mut metas) = prepared.nav.materialize_current(BOOK_READING_PAGE_ORDER);
-            crate::grid_item::arrange_grid_items(
-                &mut items,
-                &mut metas,
-                &self.settings.grid_display_order,
-                Some(BOOK_READING_PAGE_ORDER),
+            let (items, metas) = book_materialization::materialize_archive_level(
+                &prepared.nav.tree,
+                prepared.nav.current(),
+                BOOK_READING_PAGE_ORDER,
+                Some(&self.settings.grid_display_order),
             );
             prepared.items = items;
             prepared.image_metas = metas;
@@ -35924,12 +36095,11 @@ impl App {
                 .unwrap_or_else(|| crate::zip_tree::ZipNavState::new(tree)),
             _ => crate::zip_tree::ZipNavState::new(tree),
         };
-        let (mut items, mut image_metas) = nav.materialize_current(sort);
-        crate::grid_item::arrange_grid_items(
-            &mut items,
-            &mut image_metas,
-            grid_display_order,
-            Some(sort),
+        let (items, image_metas) = book_materialization::materialize_archive_level(
+            &nav.tree,
+            nav.current(),
+            sort,
+            Some(grid_display_order),
         );
         PreparedZipGrid {
             nav,
@@ -36095,6 +36265,7 @@ impl App {
         }
         // start_loading_items が zip_nav を None にした後で、新しいツリーナビを設定する。
         self.zip_nav = Some(nav);
+        self.adopt_archive_recipe();
         // アドレス欄をパンくず表示に更新 (単一ラッパー ZIP は collapse 済み実効 prefix を反映)。
         self.update_zip_nav_address();
         // ルート本の見開き設定を本ごとのキー (zip_path + 実効 prefix) で読み直す。
@@ -36305,12 +36476,11 @@ impl App {
             let Some(nav) = self.zip_nav.as_ref() else {
                 return;
             };
-            let (mut items, mut metas) = nav.materialize_current(sort);
-            crate::grid_item::arrange_grid_items(
-                &mut items,
-                &mut metas,
-                &display_order,
-                Some(sort),
+            let (items, metas) = book_materialization::materialize_archive_level(
+                &nav.tree,
+                nav.current(),
+                sort,
+                Some(&display_order),
             );
             (items, metas, nav.tree.zip_path.clone())
         };
@@ -36430,6 +36600,7 @@ impl App {
             .collect();
         // items / image_metas / thumbnails 差し替え + items_generation bump。
         self.install_new_items(items, metas);
+        self.adopt_archive_recipe();
         // idx ベース状態 + in-flight キューを破棄 (replace_search_view_items / snapshot と同じ)。
         self.invalidate_idx_state_and_queues();
         if self.color_filter.enabled {
@@ -36731,10 +36902,13 @@ impl App {
         self.zip_nav_show_current_level(StartupListIntent::PageContinuation);
         // 新しい本の先頭画像をフルスクリーンで開く (Ctrl+↑↓ 慣習: 常に先頭着地)。
         if let Some(new_idx) = self.find_fullscreen_nav_target_filtered(true) {
-            self.open_fullscreen(new_idx, crate::app::HistoryTrigger::UserChosen);
-            self.move_grid_cursor(Some(new_idx), crate::app::GridCursorIntent::Automatic);
-            self.scroll_to_selected = true;
-            self.update_last_selected_image();
+            let continuation = if sequence_ctx.is_some() {
+                book_composition_permission::BookDfsContinuation::Navigation { forward }
+            } else {
+                book_composition_permission::BookDfsContinuation::Slideshow
+            };
+            let ctx = sequence_ctx.cloned().unwrap_or_default();
+            self.complete_book_zip_dfs_target(&ctx, new_idx, continuation);
         } else {
             // 直下画像はあるがレーティングフィルタで全 hidden のケース。
             // open_fullscreen に到達しないまま放置すると、
@@ -37292,6 +37466,7 @@ impl App {
         {
             return FolderOpenOutcome::Ignored;
         }
+        self.retire_book_deferred_open();
         let mut previous_pdf_enumerate = self.pdf_enumerate_pending.take();
         let mut retained_source = None;
         if let Some(previous) = previous_pdf_enumerate.as_mut() {
@@ -37420,7 +37595,7 @@ impl App {
             || {
                 self.spread_db.as_ref().is_ok_and(|db| {
                     let stored = db.get_state_with_fallback(&pdf_path, None);
-                    stored.mode.is_some() || stored.direction.is_some()
+                    !stored.needs_document_direction(true)
                 })
             },
         );
@@ -37458,7 +37633,9 @@ impl App {
                 .as_mut()
                 .and_then(|restore| restore.adoption.take());
             let (items, image_metas, existing_keys) =
-                Self::build_pdf_meta_placeholder_rows(&pdf_path, page_count, mtime, file_size);
+                book_materialization::materialize_cached_document_rows(
+                    &pdf_path, page_count, mtime, file_size,
+                );
             if !self.adopt_direct_pdf_rows(
                 &pdf_path,
                 &owner,
@@ -37598,6 +37775,12 @@ impl App {
         &mut self,
         deferred: DeferredFsReopen,
     ) -> DeferredFsOpenOutcome {
+        let ctx = self.edit_preview_repaint_ctx.clone().unwrap_or_default();
+        self.poll_book_composition_read(&ctx);
+        if self.book_composition.is_pending() {
+            self.defer_book_projection_open(deferred);
+            return DeferredFsOpenOutcome::WaitingComposition;
+        }
         let collection_continuation = match &deferred.target {
             DeferredFsTarget::CollectionNavigation(continuation) => Some(continuation.clone()),
             _ => None,
@@ -37611,6 +37794,9 @@ impl App {
             DeferredFsTarget::Required(target) => {
                 let resolved = self.resolve_required_snapshot_target_idx(target);
                 if resolved.is_none() {
+                    if self.composition_hides_snapshot_target(target) {
+                        return DeferredFsOpenOutcome::RequiredTargetHidden;
+                    }
                     crate::logger::log(format!("detached deferred target missing: {target:?}"));
                     return DeferredFsOpenOutcome::RequiredTargetMissing;
                 }
@@ -37627,9 +37813,22 @@ impl App {
             }
         }
         if new_idx.is_none() {
-            new_idx = self.find_fullscreen_nav_target_filtered(!deferred.resume_slideshow);
+            new_idx = match self.composed_book_layout() {
+                Some(layout) => layout.visible_pages.first().map(|page| page.item_index),
+                None => self.find_fullscreen_nav_target_filtered(!deferred.resume_slideshow),
+            };
         }
         if let Some(new_idx) = new_idx {
+            let purpose = if matches!(deferred.target, DeferredFsTarget::None)
+                && !deferred.resume_to_last_page
+            {
+                book_composition_permission::BookTargetPurpose::FirstInBook
+            } else {
+                book_composition_permission::BookTargetPurpose::Explicit
+            };
+            if self.defer_book_composition_deferred_open(new_idx, deferred.clone(), purpose) {
+                return DeferredFsOpenOutcome::WaitingComposition;
+            }
             if deferred.from_explicit_open {
                 self.fs_open_intent_from_grid = true;
             }
@@ -37650,9 +37849,14 @@ impl App {
         }
     }
 
+    pub(crate) fn complete_deferred_book_composition_open(&mut self, deferred: DeferredFsReopen) {
+        let outcome = self.open_deferred_fullscreen_after_enumerate(deferred);
+        self.handle_deferred_fs_open_outcome(outcome);
+    }
+
     fn handle_deferred_fs_open_outcome(&mut self, outcome: DeferredFsOpenOutcome) {
         match outcome {
-            DeferredFsOpenOutcome::Opened => {}
+            DeferredFsOpenOutcome::Opened | DeferredFsOpenOutcome::WaitingComposition => {}
             DeferredFsOpenOutcome::NoPlayableItem => {
                 self.finish_visible_container_fs_nav_failed();
                 #[cfg(windows)]
@@ -37666,6 +37870,14 @@ impl App {
                 #[cfg(windows)]
                 self.terminate_active_detached_open_before_viewport(
                     "deferred_open_required_target_missing",
+                );
+            }
+            DeferredFsOpenOutcome::RequiredTargetHidden => {
+                self.finish_visible_container_fs_nav_failed();
+                self.show_feedback_toast("このページは本の構成で非表示になっています".into());
+                #[cfg(windows)]
+                self.terminate_active_detached_open_before_viewport(
+                    "deferred_open_required_target_hidden",
                 );
             }
         }
@@ -37742,55 +37954,6 @@ impl App {
         }
 
         Some((page_count, mtime, file_size))
-    }
-
-    fn build_pdf_meta_placeholder_rows(
-        pdf_path: &Path,
-        page_count: u32,
-        mtime: i64,
-        file_size: u64,
-    ) -> (
-        Vec<GridItem>,
-        Vec<Option<(i64, i64)>>,
-        std::collections::HashSet<String>,
-    ) {
-        let mut items: Vec<GridItem> = Vec::with_capacity(page_count as usize);
-        let mut image_metas: Vec<Option<(i64, i64)>> = Vec::with_capacity(page_count as usize);
-        let mut existing_keys: std::collections::HashSet<String> =
-            std::collections::HashSet::with_capacity(page_count as usize);
-        for i in 0..page_count {
-            items.push(GridItem::PdfPage {
-                pdf_path: pdf_path.to_path_buf(),
-                page_num: i,
-                content_type: None, // 実際の render 時に解析
-            });
-            image_metas.push(Some((mtime, file_size as i64)));
-            existing_keys.insert(crate::grid_item::pdf_page_cache_key(i));
-        }
-        (items, image_metas, existing_keys)
-    }
-
-    fn build_pdf_page_rows(
-        pdf_path: &Path,
-        pages: &[crate::pdf_loader::PdfPageEntry],
-    ) -> (
-        Vec<GridItem>,
-        Vec<Option<(i64, i64)>>,
-        std::collections::HashSet<String>,
-    ) {
-        let mut items = Vec::with_capacity(pages.len());
-        let mut image_metas = Vec::with_capacity(pages.len());
-        let mut existing_keys = std::collections::HashSet::with_capacity(pages.len());
-        for page in pages {
-            existing_keys.insert(crate::grid_item::pdf_page_cache_key(page.page_num));
-            items.push(GridItem::PdfPage {
-                pdf_path: pdf_path.to_path_buf(),
-                page_num: page.page_num,
-                content_type: None,
-            });
-            image_metas.push(Some((page.mtime, page.file_size as i64)));
-        }
-        (items, image_metas, existing_keys)
     }
 
     /// Apply a proven PDF/EPUB enumeration at the visible adoption boundary.
@@ -37943,7 +38106,7 @@ impl App {
 
         if need_rebuild {
             let (items, image_metas, existing_keys) =
-                Self::build_pdf_page_rows(&pdf_path, &pages.pages);
+                book_materialization::materialize_document_rows(&pdf_path, &pages.pages);
 
             self.start_loading_items(
                 pdf_path.clone(),
@@ -38127,7 +38290,7 @@ impl App {
                         .as_mut()
                         .and_then(|restore| restore.adoption.take());
                     let (items, image_metas, existing_keys) =
-                        Self::build_pdf_page_rows(&pdf_path, &pages.pages);
+                        book_materialization::materialize_document_rows(&pdf_path, &pages.pages);
                     if !self.adopt_direct_pdf_rows(
                         &pdf_path,
                         &owner,
@@ -38383,7 +38546,9 @@ impl App {
     }
 
     pub(crate) fn document_open_modal_admission_blocked(&self) -> bool {
-        self.capture_selection_open()
+        self.image_folder_zip_operation.is_some()
+            || self.composition_editor_modal_active()
+            || self.capture_selection_open()
             || self.epub_convert_pending_in_any_context()
             || self.pdf_password_request_pending_in_any_context()
             || self.smart_pdf_password_dialog_path().is_some()
@@ -38891,11 +39056,40 @@ impl App {
         );
     }
 
+    pub(crate) fn start_loading_extracted_items(
+        &mut self,
+        surface: book_materialization::ExtractedSurface,
+        source_path: PathBuf,
+        items: Vec<GridItem>,
+        image_metas: Vec<Option<(i64, i64)>>,
+        catalog_existing_keys: std::collections::HashSet<String>,
+        video_items: Vec<(usize, PathBuf, u64)>,
+        folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
+    ) {
+        self.start_loading_items_inner(
+            source_path,
+            items,
+            image_metas,
+            catalog_existing_keys,
+            video_items,
+            folder_signature,
+            None,
+            None,
+            None,
+            None,
+            None,
+            VisibleInstallAuthority::Projection {
+                recipe: book_materialization::ProjectionRecipe::ExtractedResult(surface),
+            },
+        );
+    }
+
     /// Stack grouping has already prepared its candidate order and all bulk display lookups on
     /// the worker. Keep the normal loader's video/thumbnail lifecycle without cold UI reads.
     pub(crate) fn start_loading_stack_items(
         &mut self,
         source_path: PathBuf,
+        recipe: book_materialization::ProjectionRecipe,
         prepared: crate::filename_stack_ui::StackPreparedItems,
         existing_keys: std::collections::HashSet<String>,
         folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
@@ -38930,7 +39124,7 @@ impl App {
             Some(pin_map),
             Some((rating_cache, tags_cache)),
             None,
-            VisibleInstallAuthority::Ordinary,
+            VisibleInstallAuthority::Projection { recipe },
             prepared_visible,
         );
         if let Some((continuation, _)) = hydration.as_mut() {
@@ -38942,6 +39136,7 @@ impl App {
 
     pub(crate) fn start_loading_subfolder_items(
         &mut self,
+        surface: book_materialization::ExtractedSurface,
         source_path: PathBuf,
         items: Vec<GridItem>,
         image_metas: Vec<Option<(i64, i64)>>,
@@ -38960,7 +39155,9 @@ impl App {
             None,
             None,
             None,
-            VisibleInstallAuthority::Ordinary,
+            VisibleInstallAuthority::Projection {
+                recipe: book_materialization::ProjectionRecipe::ExtractedResult(surface),
+            },
         );
     }
 
@@ -39193,7 +39390,9 @@ impl App {
     ) -> MainListHydration {
         let detached_physical = self.navigation_scope.is_detached_physical();
         let smart_open_path = match &authority {
-            VisibleInstallAuthority::Ordinary | VisibleInstallAuthority::Rating { .. } => None,
+            VisibleInstallAuthority::Ordinary
+            | VisibleInstallAuthority::Projection { .. }
+            | VisibleInstallAuthority::Rating { .. } => None,
             VisibleInstallAuthority::StagedArchive { logical_source } => {
                 Some((*logical_source).to_path_buf())
             }
@@ -39206,6 +39405,7 @@ impl App {
         } = prepared_visible;
         let preserve_smart_folder_session = match &authority {
             VisibleInstallAuthority::Ordinary
+            | VisibleInstallAuthority::Projection { .. }
             | VisibleInstallAuthority::Rating { .. }
             | VisibleInstallAuthority::StagedArchive { .. } => {
                 !detached_physical
@@ -39521,7 +39721,22 @@ impl App {
         let has_prepared_aggregate = prepared_subfolder
             .as_ref()
             .is_some_and(|metadata| metadata.aggregate.is_some());
+        let projection_recipe = match &authority {
+            VisibleInstallAuthority::Projection { recipe } => recipe.clone(),
+            VisibleInstallAuthority::Rating { .. } => {
+                book_materialization::ProjectionRecipe::ExtractedResult(
+                    book_materialization::ExtractedSurface::Rating,
+                )
+            }
+            _ => book_materialization::ProjectionRecipe::for_physical(
+                &self.settings,
+                &source_path,
+                smart_open_path.as_deref().unwrap_or(&source_path),
+                &items,
+            ),
+        };
         self.install_new_items_inner(items, image_metas, !has_prepared_aggregate);
+        self.projection_recipe = projection_recipe;
         if let Some(pin_map) = prepared_pin_map {
             self.folder_pin_map = pin_map;
         }
@@ -40468,6 +40683,21 @@ impl App {
 
     fn finish_main_list_after_hydration(&mut self, action: MainListAfterHydration) {
         match action {
+            MainListAfterHydration::ImageFolderZip {
+                destination,
+                completed,
+            } => {
+                if let Some(index) = self.visible_indices.iter().copied().find(|&index| {
+                    self.items
+                        .get(index)
+                        .and_then(GridItem::container_path)
+                        .is_some_and(|path| crate::folder_tree::path_eq(path, &destination))
+                }) {
+                    self.checked.clear();
+                    self.select_item_after_load(index);
+                }
+                let _ = completed.send(());
+            }
             MainListAfterHydration::StackSelection { select } => {
                 self.move_grid_cursor(Some(select), crate::app::GridCursorIntent::Automatic);
                 self.scroll_to_selected = true;
@@ -40598,11 +40828,13 @@ impl App {
     /// the UI thread. The aggregate owner supplies the aligned metadata and refresh lifecycle.
     pub(crate) fn install_prepared_aggregate_items(
         &mut self,
+        recipe: book_materialization::ProjectionRecipe,
         items: Vec<GridItem>,
         image_metas: Vec<Option<(i64, i64)>>,
         page_identity_index: Arc<file_type_resume::PreparedPageIdentityIndex>,
     ) {
         self.install_new_items_inner(items, image_metas, false);
+        self.projection_recipe = recipe;
         let previous = std::mem::replace(&mut self.page_identity_index, page_identity_index);
         self.retire_smart_folder_payloads([
             Box::new(previous) as smart_folder::RetiredSmartFolderPayload
@@ -40622,6 +40854,7 @@ impl App {
         }
         self.persist_pending_view_trim_state();
         self.items = items;
+        self.projection_recipe = Default::default();
         self.image_metas = image_metas;
         self.thumb_edit_preview_keys.clear();
         self.idle_upgrade_cache_bypass_ineligible.clear();
@@ -42539,7 +42772,7 @@ impl App {
     /// メイン viewer 中に `load_folder` すると表示が閉じてしまうため、呼び出し側は
     /// `viewer_session_blocks_main_window()` が false のときだけ実行する。
     pub(crate) fn consume_folder_refresh_pending(&mut self) {
-        if self.sidecar_restore_active() {
+        if self.sidecar_restore_active() || self.image_folder_zip_operation.is_some() {
             return;
         }
         // .take() より先にガードを評価する。検索ビュー中やフォルダ未確定の状態で
@@ -42779,6 +43012,7 @@ impl App {
         if let Some(p) = self.stamp_embed_pending.take() {
             p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        self.reproject_page_edit_owners();
     }
 
     pub(crate) fn virtual_list_context_id(&self) -> ViewerContextId {
@@ -42804,6 +43038,7 @@ impl App {
         self.conceal_pages = projection.conceal;
         self.comic_pages = projection.comic;
         self.local_adjust_pages = projection.local_adjust;
+        self.reproject_page_edit_owners();
     }
 
     /// Reconcile only the mounted bundle. Parked bundles retain their compact order and check
@@ -43257,6 +43492,8 @@ impl App {
         for index in changed {
             self.bump_erase_mask_generation(index);
         }
+        self.project_adjustment_page_edit_document();
+        self.project_local_page_edit_document(0);
     }
 
     /// Rebuild an exact-key owner after a virtual list changes its index space without going
@@ -43609,6 +43846,16 @@ impl App {
         // 各残存 old_idx に対する new_idx を partition_point で O(log K) 算出。
         let mut sorted_asc: Vec<usize> = sorted_desc_idxs.to_vec();
         sorted_asc.sort_unstable();
+        let composition_remap = match self.prepare_book_composition_item_removal(&sorted_asc) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                crate::logger::log(format!("book_composition: item removal refused: {error}"));
+                self.show_feedback_toast(
+                    "ページの削除に合わせて本の構成を更新できませんでした".into(),
+                );
+                return;
+            }
+        };
         let shift = |old: usize| -> Option<usize> {
             let p = sorted_asc.partition_point(|&x| x < old);
             if sorted_asc.get(p) == Some(&old) {
@@ -43649,6 +43896,7 @@ impl App {
             }
         }
         self.bump_items_generation();
+        self.adopt_book_composition_item_removal(composition_remap);
         self.remove_paths_from_subfolder_expansion_snapshot(&removed_snapshot_paths);
         self.remove_paths_from_smart_folder_snapshots(&removed_snapshot_paths);
 
@@ -44032,6 +44280,7 @@ impl App {
             self.rebuild_auto_aspect_samples_from_loaded();
             self.maybe_apply_auto_aspect(false);
         }
+        self.reproject_page_edit_owners();
     }
 
     /// 削除 / リネームで消える path を表示・再生中の viewer サーフェス (メイン fullscreen /
@@ -44370,14 +44619,56 @@ impl App {
         import_root: &Path,
         recursive: bool,
     ) -> bool {
+        self.advance_metadata_import_terminal_refresh_target(import_root, recursive, None)
+    }
+
+    fn advance_image_zip_terminal_refresh(&mut self, keys: &HashSet<String>) -> bool {
+        self.advance_metadata_import_terminal_refresh_target(Path::new(""), false, Some(keys))
+    }
+
+    fn begin_image_zip_terminal_refresh(&mut self) {
+        // Retained aggregate/quick-slot contexts need not currently own a viewport.
+        // Clear and enumerate through the context table, rather than its visible windows.
+        for id in self.viewer_context_ids() {
+            let _ = self.with_viewer_context(id, |app| app.metadata_import_refresh_index = None);
+        }
+    }
+
+    fn advance_metadata_import_terminal_refresh_target(
+        &mut self,
+        import_root: &Path,
+        recursive: bool,
+        changed_keys: Option<&HashSet<String>>,
+    ) -> bool {
         const MAX_ITEMS_PER_FRAME: usize = 2_048;
         const MAX_TIME_PER_FRAME: std::time::Duration = std::time::Duration::from_millis(3);
 
         let deadline = std::time::Instant::now() + MAX_TIME_PER_FRAME;
         let mut remaining = MAX_ITEMS_PER_FRAME;
+        if changed_keys.is_some() {
+            for id in self.viewer_context_ids() {
+                if remaining == 0 || std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                let complete = self.with_viewer_context(id, |app| {
+                    app.advance_current_metadata_import_terminal_index(
+                        import_root,
+                        recursive,
+                        changed_keys,
+                        &mut remaining,
+                        deadline,
+                    )
+                });
+                if !matches!(complete, Ok(true)) {
+                    return false;
+                }
+            }
+            return true;
+        }
         let mut complete = self.advance_current_metadata_import_terminal_index(
             import_root,
             recursive,
+            changed_keys,
             &mut remaining,
             deadline,
         );
@@ -44388,6 +44679,7 @@ impl App {
                     app.advance_current_metadata_import_terminal_index(
                         import_root,
                         recursive,
+                        changed_keys,
                         &mut remaining,
                         deadline,
                     )
@@ -44413,6 +44705,7 @@ impl App {
                         app.advance_current_metadata_import_terminal_index(
                             import_root,
                             recursive,
+                            changed_keys,
                             &mut remaining,
                             deadline,
                         )
@@ -44441,6 +44734,7 @@ impl App {
         &mut self,
         import_root: &Path,
         recursive: bool,
+        changed_keys: Option<&HashSet<String>>,
         remaining: &mut usize,
         deadline: std::time::Instant,
     ) -> bool {
@@ -44449,11 +44743,13 @@ impl App {
             .as_ref()
             .is_none_or(|index| index.items_generation != self.items_generation);
         if restart {
-            let affected = self.current_folder.as_deref().is_some_and(|path| {
-                metadata_import_context_path_is_affected(path, import_root, recursive)
-            }) || self.archive_source_override.as_deref().is_some_and(|path| {
-                metadata_import_context_path_is_affected(path, import_root, recursive)
-            });
+            let affected = changed_keys.is_some()
+                || self.current_folder.as_deref().is_some_and(|path| {
+                    metadata_import_context_path_is_affected(path, import_root, recursive)
+                })
+                || self.archive_source_override.as_deref().is_some_and(|path| {
+                    metadata_import_context_path_is_affected(path, import_root, recursive)
+                });
             let current_rating_key = self
                 .current_container_rating_key_and_source()
                 .map(|(key, _)| key);
@@ -44501,6 +44797,17 @@ impl App {
                 || self.rotation_cache.contains_key(&item_index);
             let item = &self.items[item_index];
             let tag_key = tag_item_path(item).map(crate::tags_db::item_key_for_path);
+            // Supplemental source rows can be displayed by search/Collection contexts with
+            // no current folder. Membership is the item's identity, not the surface location.
+            if changed_keys.is_some_and(|keys| {
+                !rating_key.as_ref().is_some_and(|key| keys.contains(key))
+                    && !tag_key.as_ref().is_some_and(|key| keys.contains(key))
+                    && !page_key.as_ref().is_some_and(|key| keys.contains(key))
+            }) {
+                index.next_item += 1;
+                *remaining -= 1;
+                continue;
+            }
             let folder_pin_target = self.folder_pin_lookup_target_for_item(item);
             let container_path = folder_pin_target.as_ref().map(|target| target.path.clone());
             if let Some(container) = &container_path {
@@ -45107,15 +45414,21 @@ impl App {
             self.reprepare_page_edits_for_existing_virtual_order();
         }
         if let Some(container) = result.container_state.take() {
-            let stored_spread = container
-                .spread_mode
-                .unwrap_or(self.settings.default_spread_mode);
-            self.reading_flow = container
-                .reading_flow
-                .unwrap_or(self.settings.default_reading_flow);
-            self.reading_direction = container
-                .reading_direction
+            let preferred_direction = container
+                .spread
+                .direction
                 .unwrap_or(self.settings.default_reading_direction);
+            let stored_spread = container.spread.resolve_mode(
+                self.settings
+                    .default_spread_mode
+                    .with_reading_direction(preferred_direction),
+                preferred_direction,
+            );
+            self.reading_flow = container
+                .spread
+                .flow
+                .unwrap_or(self.settings.default_reading_flow);
+            self.reading_direction = preferred_direction;
             if stored_spread == crate::settings::SpreadMode::Vertical {
                 self.spread_mode = crate::settings::SpreadMode::Single;
                 self.reading_flow = crate::settings::ReadingFlow::Vertical;
@@ -45841,6 +46154,9 @@ impl App {
 
     /// Called only at mIV-owned filesystem mutation producers, before a worker or viewer release.
     pub(crate) fn admit_rename_migration_source_change(&mut self, ctx: &egui::Context) -> bool {
+        if self.viewer_mutation_modal_active() {
+            return false;
+        }
         if self.ensure_rename_migration_journal_loaded() {
             return true;
         }
@@ -46053,7 +46369,8 @@ impl App {
             return;
         };
         if job.generic_pending {
-            if self.rename_migration_writers_busy()
+            if self.composition_editor_writes_pending()
+                || self.rename_migration_writers_busy()
                 || self.rename_migration_source_changes_pending()
                 || self.metadata_cleanup_pending.is_some()
                 || self.delete_purge_retry_pending.is_some()
@@ -46860,6 +47177,15 @@ impl App {
     ///
     /// 完了時のフォルダ再読み込みは `poll_file_drop_pending` が `pending_reload` を立てて行う。
     pub(crate) fn handle_external_file_drop(&mut self, paths: Vec<PathBuf>) {
+        if self.viewer_mutation_modal_active() {
+            crate::logger::log("viewer mutation modal: rejected external file drop");
+            self.show_feedback_toast(if self.image_folder_zip_operation.is_some() {
+                "ZIP を作成中のため、ファイルを操作できません".into()
+            } else {
+                "本の構成を編集中のため、ファイルを操作できません".into()
+            });
+            return;
+        }
         let paths: Vec<_> = paths
             .iter()
             .map(|path| crate::path_key::normalize_input_path(path))
@@ -47348,6 +47674,12 @@ impl App {
 
     /// 現在のビュー用ラッパー。判定本体は読み込み前にも使える items 引数付き述語へ集約する。
     pub(crate) fn page_order_locked_for_current_view(&self) -> bool {
+        if self.extracted_result_surface().is_some() {
+            return false;
+        }
+        if self.composed_book_layout().is_some() {
+            return true;
+        }
         if self.items_are_reading_history_view && self.current_folder.is_none() {
             return true;
         }
@@ -47457,7 +47789,7 @@ impl App {
             container_path,
             container_kind,
             page_identity,
-            page_index_hint: idx,
+            page_index_hint: self.canonical_raw_book_page(idx),
         })
     }
 
@@ -48009,21 +48341,28 @@ impl App {
         if !crate::path_key::eq_keep_drive(&nav.tree.zip_path, &bookmark.container_path) {
             return None;
         }
-        crate::book_bookmarks::resolve_archive_bookmark_target(
-            &nav.tree,
-            entry_name,
-            &self.settings.grid_display_order,
-        )
+        crate::book_bookmarks::resolve_archive_bookmark_target(&nav.tree, entry_name)
     }
 
     pub(crate) fn book_bookmark_panel_resolution(
         &self,
         bookmark: &crate::book_bookmarks::BookBookmark,
     ) -> BookBookmarkPanelResolution {
+        if self.composition_hides_bookmark(bookmark) {
+            return BookBookmarkPanelResolution {
+                current_item_index: None,
+                target_item_index: None,
+            };
+        }
         let current_item_index = self.book_bookmark_item_idx(bookmark);
         let target_item_index = current_item_index.or_else(|| {
-            self.resolve_current_archive_bookmark_target(bookmark)
-                .map(|target| target.item_index)
+            let target = self.resolve_current_archive_bookmark_target(bookmark)?;
+            let nav = self.zip_nav.as_ref()?;
+            book_materialization::resolve_archive_target_index(
+                &nav.tree,
+                &target,
+                &self.settings.grid_display_order,
+            )
         });
         BookBookmarkPanelResolution {
             current_item_index,
@@ -48036,6 +48375,11 @@ impl App {
         ctx: &egui::Context,
         bookmark: &crate::book_bookmarks::BookBookmark,
     ) {
+        self.poll_book_composition_read(ctx);
+        if self.composition_hides_bookmark(bookmark) {
+            self.show_feedback_toast("このページは本の構成で非表示になっています".into());
+            return;
+        }
         let mut item_idx = self.book_bookmark_item_idx(bookmark);
         if item_idx.is_none() && self.enter_book_bookmark_archive_prefix(bookmark) {
             item_idx = self.book_bookmark_item_idx(bookmark);
@@ -48838,61 +49182,95 @@ impl App {
                         return;
                     }
                 };
-                let target = crate::bookmark_browser::BookmarkViewReturnTarget::Book(
-                    bookmark.container_path.clone(),
-                );
-                self.bookmark_view_state = Some(BookmarkViewState::Opening {
-                    target: target.clone(),
-                    grid: return_grid,
-                });
-                crate::logger::log(format!(
-                    "[bookmark-open] request book container={} page={} presentation={:?}",
-                    bookmark.container_path.display(),
-                    bookmark.page_identity.display_name(),
-                    self.viewer_presentation
-                ));
-                let pending = crate::bookmark_browser::PendingBookmarkOpen::Book(
-                    crate::bookmark_browser::PendingBookOpen {
-                        request_id,
-                        bookmark: bookmark.clone(),
-                        bookmark_source,
-                        relative_page_provenance: row.relative_page_provenance.clone(),
-                        started_at: std::time::Instant::now(),
-                        stage: crate::bookmark_browser::PendingBookOpenStage::Resolving,
-                    },
-                );
-                #[cfg(windows)]
-                if self.settings.detached_viewer_open_images_in_window {
-                    if !self.start_detached_bookmark_loading_context(
+                let pending = crate::bookmark_browser::PendingBookOpen {
+                    request_id,
+                    bookmark: bookmark.clone(),
+                    bookmark_source,
+                    relative_page_provenance: row.relative_page_provenance.clone(),
+                    started_at: std::time::Instant::now(),
+                    stage: crate::bookmark_browser::PendingBookOpenStage::Resolving,
+                };
+                if self.book_composition_service.is_some()
+                    && matches!(
+                        bookmark.container_kind,
+                        crate::book_bookmarks::BookContainerKind::Zip
+                            | crate::book_bookmarks::BookContainerKind::Pdf
+                    )
+                {
+                    let mut pending = pending;
+                    pending.stage = crate::bookmark_browser::PendingBookOpenStage::Qualifying(
+                        Box::new(crate::bookmark_browser::BookOpenQualification {
+                            navigation,
+                            return_grid,
+                        }),
+                    );
+                    self.bookmark_open_pending =
+                        Some(crate::bookmark_browser::PendingBookmarkOpen::Book(pending));
+                    self.poll_bookmark_book_open(ctx);
+                } else {
+                    self.start_qualified_bookmark_book_request(
                         ctx,
                         pending,
-                        target,
-                        DetachedSource::Book,
-                        bookmark.container_path.clone(),
-                    ) {
-                        self.clear_bookmark_view_return_state();
-                    }
-                    return;
+                        return_grid,
+                        navigation,
+                    );
                 }
-                self.bookmark_open_pending = Some(pending);
-                let navigation = navigation.map(|mut navigation| {
-                    let StartupOpenPathOwner::Bookmark(owner) = self
-                        .startup_open_path_owner(StartupOpenPathSource::Bookmark)
-                        .expect("accepted bookmark request")
-                    else {
-                        unreachable!()
-                    };
-                    navigation.source_proof = MainListSourceProof::Bookmark(owner);
-                    navigation
-                });
-                self.start_startup_open_path_resolution_owned_with_navigation(
-                    bookmark.container_path.clone(),
-                    StartupOpenPathSource::Bookmark,
-                    ctx,
-                    navigation,
-                );
             }
         }
+    }
+
+    fn start_qualified_bookmark_book_request(
+        &mut self,
+        ctx: &egui::Context,
+        pending: crate::bookmark_browser::PendingBookOpen,
+        return_grid: BookmarkViewReturnGridState,
+        navigation: Option<MainListNavigation>,
+    ) {
+        let bookmark = pending.bookmark.clone();
+        let target = crate::bookmark_browser::BookmarkViewReturnTarget::Book(
+            bookmark.container_path.clone(),
+        );
+        self.bookmark_view_state = Some(BookmarkViewState::Opening {
+            target: target.clone(),
+            grid: return_grid,
+        });
+        crate::logger::log(format!(
+            "[bookmark-open] request book container={} page={} presentation={:?}",
+            bookmark.container_path.display(),
+            bookmark.page_identity.display_name(),
+            self.viewer_presentation
+        ));
+        let pending = crate::bookmark_browser::PendingBookmarkOpen::Book(pending);
+        #[cfg(windows)]
+        if self.settings.detached_viewer_open_images_in_window {
+            if !self.start_detached_bookmark_loading_context(
+                ctx,
+                pending,
+                target,
+                DetachedSource::Book,
+                bookmark.container_path.clone(),
+            ) {
+                self.clear_bookmark_view_return_state();
+            }
+            return;
+        }
+        self.bookmark_open_pending = Some(pending);
+        let navigation = navigation.map(|mut navigation| {
+            let StartupOpenPathOwner::Bookmark(owner) = self
+                .startup_open_path_owner(StartupOpenPathSource::Bookmark)
+                .expect("accepted bookmark request")
+            else {
+                unreachable!()
+            };
+            navigation.source_proof = MainListSourceProof::Bookmark(owner);
+            navigation
+        });
+        self.start_startup_open_path_resolution_owned_with_navigation(
+            bookmark.container_path.clone(),
+            StartupOpenPathSource::Bookmark,
+            ctx,
+            navigation,
+        );
     }
 
     pub(crate) fn poll_bookmark_browser(&mut self, ctx: &egui::Context) {
@@ -49211,6 +49589,67 @@ impl App {
         }
 
         let (started_at, mut entered_archive_prefix) = match &pending.stage {
+            crate::bookmark_browser::PendingBookOpenStage::Qualifying(continuation) => {
+                if continuation
+                    .navigation
+                    .as_ref()
+                    .is_some_and(|nav| !self.main_list_navigation_is_current(nav))
+                {
+                    self.cancel_bookmark_open_request(
+                        pending.request_id,
+                        "book_identity_source_changed",
+                    );
+                    return;
+                }
+                let container =
+                    crate::path_key::normalize_keep_drive(&pending.bookmark.container_path);
+                let (identity, physical_archive) = match &pending.bookmark.page_identity {
+                    crate::book_bookmarks::PageIdentity::ArchiveEntry(entry_name) => (
+                        crate::book_resume_db::PageIdentity::Archive {
+                            container,
+                            entry_name: entry_name.clone(),
+                        },
+                        Some(pending.bookmark.container_path.clone()),
+                    ),
+                    crate::book_bookmarks::PageIdentity::PdfPage(page_num) => (
+                        crate::book_resume_db::PageIdentity::Document {
+                            container,
+                            page_num: *page_num as usize,
+                        },
+                        None,
+                    ),
+                    _ => return,
+                };
+                let candidate = crate::book_composition::CandidatePage {
+                    identity,
+                    physical_archive,
+                    raw_tree: None,
+                };
+                match self.qualify_book_identity_permission(ctx, pending.request_id.0, candidate) {
+                    book_composition_permission::BookIdentityPermission::Checking => return,
+                    book_composition_permission::BookIdentityPermission::Hidden
+                    | book_composition_permission::BookIdentityPermission::Refused => {
+                        self.cancel_bookmark_open_request(
+                            pending.request_id,
+                            "book_identity_refused",
+                        );
+                        return;
+                    }
+                    book_composition_permission::BookIdentityPermission::Allowed => {
+                        let continuation = continuation.clone();
+                        pending.stage = crate::bookmark_browser::PendingBookOpenStage::Resolving;
+                        self.bookmark_open_pending = None;
+                        self.retire_book_presentation_permission();
+                        self.start_qualified_bookmark_book_request(
+                            ctx,
+                            pending,
+                            continuation.return_grid,
+                            continuation.navigation,
+                        );
+                        return;
+                    }
+                }
+            }
             crate::bookmark_browser::PendingBookOpenStage::AwaitingPage {
                 started_at,
                 entered_archive_prefix,
@@ -49249,6 +49688,15 @@ impl App {
             crate::folder_tree::path_eq(&path, &pending.bookmark.container_path)
         });
         if !same_container {
+            return;
+        }
+        self.poll_book_composition_read(ctx);
+        if self.book_composition.is_pending() {
+            return;
+        }
+        if self.composition_hides_bookmark(&pending.bookmark) {
+            self.cancel_bookmark_open_request(pending.request_id, "book_page_composition_hidden");
+            self.show_feedback_toast("このページは本の構成で非表示になっています".into());
             return;
         }
         if let Some(idx) = self.book_bookmark_item_idx(&pending.bookmark) {
@@ -49608,11 +50056,37 @@ impl App {
                 ));
             }
         }
+        if let Some(service) = &self.book_composition_service {
+            let admission = if let Some((source, target)) = collection_tree_migration {
+                service.rename_book_root(source, target)
+            } else {
+                service.migrate_page_paths(
+                    mappings
+                        .iter()
+                        .map(|mapping| (mapping.from.clone(), mapping.to.clone()))
+                        .collect(),
+                )
+            };
+            if let Err(error) = admission {
+                crate::logger::log(format!(
+                    "book_composition: page mapping admission failed: {error}"
+                ));
+                self.show_feedback_toast(format!(
+                    "本の構成のページ移動を反映できませんでした: {error}"
+                ));
+            }
+        }
         // Book-root rename preserves the released stale-view behavior. Its saved
         // rows move in the service FIFO above; accepted context scopes stay old.
         if collection_tree_migration.is_none() {
             if spread_shift_live_mappings::migrate(&mut self.spread_shift, mappings) {
                 self.invalidate_fullscreen_display_unit_owners();
+            }
+            if let Some(snapshot) = self.snapshot.as_mut() {
+                spread_shift_live_mappings::migrate(
+                    &mut snapshot.saved_viewing_state.shift,
+                    mappings,
+                );
             }
             #[cfg(windows)]
             self.migrate_at_rest_spread_shifts(mappings, collection_tree_migration);
@@ -50050,6 +50524,16 @@ impl App {
                     ));
                     self.show_feedback_toast(format!(
                         "削除した本の見開き調整を消去できませんでした: {error}"
+                    ));
+                }
+                if let Some(service) = &self.book_composition_service
+                    && let Err(error) = service.purge_book_root(&path)
+                {
+                    crate::logger::log(format!(
+                        "book_composition: book purge admission failed: {error}"
+                    ));
+                    self.show_feedback_toast(format!(
+                        "削除した本の構成を消去できませんでした: {error}"
                     ));
                 }
                 if self.settings.active_book_name == name {
@@ -54143,6 +54627,7 @@ impl App {
     }
 
     pub(crate) fn cancel_pending_folder_nav(&mut self) {
+        self.retire_book_deferred_open();
         if let Some(pending) = self.folder_nav_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
@@ -54176,6 +54661,9 @@ impl App {
         forward: bool,
         mode: FolderNavMode,
     ) {
+        if self.viewer_mutation_modal_active() {
+            return;
+        }
         // Repeated Ctrl traversal extends the staged request's virtual step count. No second
         // DFS may start from the still-visible previous folder before the first child lands.
         if self.accumulate_staged_smart_folder_dfs_step(forward, &mode) {
@@ -57424,6 +57912,9 @@ impl App {
             PathBuf,
         ),
     ) {
+        if self.viewer_mutation_modal_active() {
+            return;
+        }
         let on_search_results = self.items_are_global_search_view
             || self.favsearch.on_results_grid()
             || self.items_are_tag_view
@@ -57468,6 +57959,18 @@ impl App {
     /// 現在のフルスクリーンページを「最後に読んだページ」として永続記録する。
     /// 画像本のページのみ対象。dedup 付きで連続ページ送り中の重複書き込みを抑える。
     pub(crate) fn record_book_resume(&mut self, idx: usize) {
+        if self.viewer_mutation_modal_active() {
+            return;
+        }
+        if matches!(
+            self.book_composition,
+            book_composition_runtime::ViewerBookComposition::Accepted {
+                cause: book_composition_runtime::ProjectionAdoptionCause::ProjectionRefresh,
+                ..
+            }
+        ) {
+            return;
+        }
         if !self.is_readable_page_idx(idx) {
             return;
         }
@@ -57491,11 +57994,22 @@ impl App {
                 self.archive_source_override.as_deref(),
             )
         });
-        if self.last_book_resume.as_ref() == Some(&(folder.clone(), idx, meter, identity.clone())) {
+        let writer_available = self.book_resume_writer.is_some();
+        let raw_index = match &self.book_composition {
+            book_composition_runtime::ViewerBookComposition::Accepted {
+                layout: crate::book_composition::CompositionProjectionOutcome::Composed(projection),
+                ..
+            } => projection
+                .canonical_raw_index_for_projected(idx)
+                .unwrap_or(idx),
+            _ => idx,
+        };
+        if self.last_book_resume.as_ref()
+            == Some(&(folder.clone(), raw_index, meter, identity.clone()))
+        {
             return;
         }
-        let writer_available = self.book_resume_writer.is_some();
-        self.persist_book_resume_with_identity(folder, idx, meter, identity);
+        self.persist_book_resume_with_identity(folder, raw_index, meter, identity);
         if writer_available {
             self.record_current_container_content_identity(
                 crate::content_identity::ContentIdentityTrigger::ViewingState,
@@ -57601,6 +58115,16 @@ impl App {
     }
 
     fn current_reading_history_page_position(&self, idx: usize) -> Option<(i64, i64)> {
+        if let book_composition_runtime::ViewerBookComposition::Accepted {
+            layout: crate::book_composition::CompositionProjectionOutcome::Composed(projection),
+            ..
+        } = &self.book_composition
+        {
+            return Some((
+                projection.reading_ordinal(idx)? as i64,
+                projection.resolved.visible_pages.len() as i64,
+            ));
+        }
         let mut page_count = 0_i64;
         let mut page_pos = None;
         for &candidate in self.current_reader_order() {
@@ -57683,7 +58207,7 @@ impl App {
             })
             .is_some_and(|position| {
                 matches!(
-                    self.page_identity_index.resolve(&position),
+                    self.resolve_current_book_position(&position),
                     file_type_resume::PositionResolution::HiddenIdentity
                         | file_type_resume::PositionResolution::LegacyWithExclusions
                 )
@@ -57701,7 +58225,7 @@ impl App {
                 .as_ref()
                 .and_then(|db| db.get_position(folder))
         })?;
-        match self.page_identity_index.resolve(&position) {
+        match self.resolve_current_book_position(&position) {
             file_type_resume::PositionResolution::Restored(index)
                 if self.is_readable_page_idx(index) =>
             {
@@ -58396,6 +58920,7 @@ impl App {
         self.pdf_enumerate_pending = None;
         self.zip_enumerate_pending = None;
         self.fs_nav_after_pdf_enumerate = None;
+        self.retire_book_presentation_permission();
         self.archive_auto_fs_paint_trace = None;
 
         let bookmark_request = self
@@ -58907,28 +59432,7 @@ impl App {
 
     #[cfg(windows)]
     fn finish_adjustment_drag_for_detached_pause(&mut self) {
-        self.adjustment_dragging = false;
-        if let Some(session) = self.adjustment_drag_session.take() {
-            if self.thumb_adjust_drag_color_dirty {
-                self.invalidate_thumb_adjust_for_dragged_page(session.fs_idx);
-                self.thumb_adjust_drag_color_dirty = false;
-            }
-            let in_memory = self.adjustment_page_params.get(&session.fs_idx).cloned();
-            if session.before != in_memory {
-                if let Some(params) = in_memory.clone() {
-                    self.set_page_params(session.fs_idx, params);
-                } else {
-                    self.clear_page_params(session.fs_idx);
-                }
-                let after = self.adjustment_page_params.get(&session.fs_idx).cloned();
-                self.capture_adjustment_undo(
-                    self.page_adjust_undo_scope(session.fs_idx),
-                    session.before,
-                    after,
-                    "ページ個別の補正".to_string(),
-                );
-            }
-        }
+        self.finish_adjustment_drag_context_boundary();
     }
 
     #[cfg(windows)]
@@ -58998,6 +59502,7 @@ impl App {
         &mut self,
         ctx: &egui::Context,
     ) -> Result<bool, LocalViewerCloseFailure> {
+        self.close_local_composition_editor(CompositionEditorCloseReason::OwnerClosed);
         let had_detached = self.active_detached_context_is_at_rest()
             || !self.other_viewer_context_ids().is_empty()
             || self.active_detached_session.is_some()
@@ -60267,6 +60772,7 @@ impl App {
     /// Retire local document opens at the same typed terminals used when their context is parked.
     /// Remote may acquire while classification, navigation, or a conversion modal is in flight.
     fn retire_local_document_open_intents_for_remote(&mut self) {
+        self.retire_book_deferred_open();
         #[cfg(windows)]
         for owner in [
             viewer_context_registry::ContextAsyncOwner::EpubConversion,
@@ -61315,6 +61821,9 @@ impl App {
                     .map(|entry| entry.display_meta)
                     .collect();
                 app.install_prepared_aggregate_items(
+                    crate::app::book_materialization::ProjectionRecipe::ExtractedResult(
+                        crate::app::book_materialization::ExtractedSurface::Collection,
+                    ),
                     items,
                     image_metas,
                     Arc::clone(&plan.page_identity_index),
@@ -65886,6 +66395,20 @@ impl App {
             self.finish_rating_picker_for_manual_navigation();
             self.cancel_rating_membership_restore();
         }
+        let composition_ctx = self.edit_preview_repaint_ctx.clone().unwrap_or_default();
+        let Some(idx) = self.poll_and_remap_book_target(&composition_ctx, idx) else {
+            return;
+        };
+        if self.defer_book_composition_fullscreen_open_with_metadata_boundary(
+            idx,
+            history_trigger,
+            requested_materialization,
+            load_contract,
+            book_composition_permission::BookTargetPurpose::Explicit,
+            boundary,
+        ) {
+            return;
+        }
         if self.defer_sidecar_restore_fullscreen_with_metadata_boundary(
             idx,
             history_trigger,
@@ -66047,6 +66570,9 @@ impl App {
             .filter(|&previous_idx| previous_idx != idx)
         {
             self.cleanup_normalize_state_for_fs_idx(previous_idx);
+        }
+        if self.fullscreen_idx.is_none() && self.extracted_result_surface().is_some() {
+            self.begin_extracted_result_view();
         }
         self.fullscreen_idx = Some(idx);
         #[cfg(windows)]
@@ -68279,7 +68805,11 @@ impl App {
         folders: &mut Vec<GridItem>,
         folder_metas: &mut Vec<Option<(i64, i64)>>,
     ) -> usize {
-        crate::app::folder_scan::filter_virtual_folder_duplicates(folders, folder_metas)
+        crate::app::folder_scan::filter_virtual_folder_duplicates(
+            crate::same_name_folder_book::SameNameFolderBookPolicy::PreferFolder,
+            folders,
+            folder_metas,
+        )
     }
 
     /// Prefer native ZIP/CBZ over a same-stem RAR/7z/LZH archive.
@@ -69549,7 +70079,7 @@ impl App {
 
     pub(crate) fn details_header_sort_active(&self) -> bool {
         self.settings.grid_view_mode == crate::settings::GridViewMode::Details
-            && !self.current_folder_is_book_folder()
+            && (self.extracted_result_surface().is_some() || !self.current_folder_is_book_folder())
             && !self.items_are_reading_history_view
             && self.details_header_sort_lock_reason().is_none()
             && self.settings.details_sort_key != crate::settings::DetailsSortKey::Toolbar
@@ -70952,7 +71482,7 @@ impl App {
     }
 
     /// 正本が受理したときだけ真。偽なら sidecar ミラーを書かずに戻ること。
-    fn edit_store_write_succeeded(
+    pub(crate) fn edit_store_write_succeeded(
         &mut self,
         what: &'static str,
         outcome: EditStoreOutcome,
@@ -71124,6 +71654,7 @@ impl App {
     /// レーティング対象外アイテムの場合は何もしない。
     /// フォルダ / ZIP / PDF ファイル本体も対象 (コンテナレーティング)。
     pub(crate) fn set_rating(&mut self, idx: usize, stars: u8) -> bool {
+        self.prepare_page_edit_history_boundary();
         let stars = stars.min(5);
         let before = self.get_rating(idx);
         if before == stars {
@@ -71985,6 +72516,9 @@ impl App {
             .current_container_rating_target()
             .is_some_and(|(current, _, _)| current == key);
         let stars = stars.min(5);
+        if capture_undo {
+            self.prepare_page_edit_history_boundary();
+        }
         // Undo 用に変更前の値をキャッシュ or DB から取得 (なければ 0)。
         let before = showing_this_container
             .then_some(self.current_folder_rating_cache)
@@ -72671,6 +73205,7 @@ impl App {
         }
         // DB write に成功した項目だけを Undo / 派生ビュー更新の対象にする。失敗項目を
         // optimistic cache や undo stack へ公開しない。
+        self.prepare_page_edit_history_boundary();
         let mut pending_records: Vec<(usize, u8, u8)> = Vec::with_capacity(targets.len());
         for &idx in &targets {
             let before = self.rating_cache.get(&idx).copied().unwrap_or(0);
@@ -74849,6 +75384,9 @@ impl App {
     /// 通常のナビ (load → 内部で close_fullscreen) を発行する。BS は階層を 1 段だけ戻す
     /// (= 常に L2) ので本関数を通さず `close_fullscreen` を直接呼ぶ (ui_fullscreen 側)。
     pub(crate) fn handle_fullscreen_close_request(&mut self) {
+        if self.viewer_mutation_modal_active() {
+            return;
+        }
         self.finish_fullscreen_navigation_for_true_close();
         // Detached bookmark viewers never navigate their own bundle to the bookmark surface: the
         // origin grid is still mounted in main. Embedded viewers instead use the normal Bookmarks
@@ -75048,6 +75586,7 @@ impl App {
     /// `keep_fullscreen_viewport_alive` がこのフラグを見て Visible(false) を
     /// 送信し、その直後に false に落とす。ここで先に落とすと送信が抑止される。
     pub(crate) fn close_fullscreen(&mut self) {
+        self.retire_book_presentation_permission();
         self.finish_rating_picker_for_manual_navigation();
         self.cancel_rating_membership_restore();
         // A staged Ctrl traversal still leaves the old fullscreen visible. If that fullscreen
@@ -75110,7 +75649,8 @@ impl App {
         if let Some(failure) = failure {
             return LocalViewerCloseState::Failed(failure);
         }
-        if self.viewer_context_ids().len() > 1
+        if !self.composition_editor_acquire_ready()
+            || self.viewer_context_ids().len() > 1
             || self.fullscreen_idx.is_some()
             || self
                 .fs_cache
@@ -75139,7 +75679,8 @@ impl App {
         if let Some(failure) = failure {
             return LocalViewerCloseState::Failed(failure);
         }
-        if self.fullscreen_idx.is_some()
+        if !self.composition_editor_acquire_ready()
+            || self.fullscreen_idx.is_some()
             || self
                 .fs_cache
                 .values()
@@ -75157,6 +75698,7 @@ impl App {
     }
 
     fn close_fullscreen_for_rating_membership(&mut self) {
+        self.retire_book_presentation_permission();
         self.cancel_sidecar_restore_rating_deferred_target();
         let toast = self.fs_feedback_toast.clone();
         #[cfg(windows)]
@@ -77296,23 +77838,7 @@ impl App {
         // the current DB value, so retaining unmatched page keys would grow this set for every
         // ordinary page adjustment during the process lifetime.
         let keys = std::mem::take(&mut self.pinned_adjustment_refresh_keys);
-        for key in keys {
-            let matching: Vec<usize> = self
-                .thumb_edit_preview_keys
-                .iter()
-                .filter_map(|(&idx, preview_key)| {
-                    (preview_key == &key
-                        && self
-                            .items
-                            .get(idx)
-                            .is_some_and(|item| !item.has_page_data()))
-                    .then_some(idx)
-                })
-                .collect();
-            for idx in matching {
-                self.evict_thumbnail_for_reload(idx);
-            }
-        }
+        self.evict_pinned_adjustment_materializations(&keys);
     }
 
     fn poll_edit_preview_cache(&mut self, ctx: &egui::Context) {
@@ -77655,6 +78181,14 @@ impl App {
         self.settings.window_maximized = self
             .startup_window_geometry
             .maximized_to_save(self.last_window_maximized);
+        self.prepare_page_edit_history_boundary();
+        if scope.waits_for_sidecar_writer() {
+            let commits = self.take_parked_page_edit_exit_commits();
+            self.deliver_page_edit_commits(commits);
+        }
+        self.local_adjust_mask_lasso_points.clear();
+        self.local_adjust_mask_shape_drag_start = None;
+        self.local_adjust_mask_shape_drag_end = None;
         self.settings.save();
         // **まず確定する。**保留のままの編集は、メモリにしか無いのでここで消える。
         self.commit_local_adjust_pending_edits();
@@ -77905,71 +78439,11 @@ impl App {
         idx: usize,
         layers: local_adjust_core::LocalAdjustmentLayers,
     ) {
-        let key = match self.page_path_key(idx) {
-            Some(key) => key,
-            None => return,
+        let Some(mut target) = self.page_adjustment_target_for_idx(idx) else {
+            return;
         };
-        self.invalidate_edit_preview_cache_for_key(&key);
-        // presence は「画面に出ている状態」を表す。保存の成否ではないので、同期版と
-        // 同じく結果を待たずに立てる (失敗しても編集は画面に残す)。
-        Self::set_page_key_presence(&mut self.local_adjust_page_keys, &key, !layers.is_empty());
-        self.set_local_adjust_layers_for_idx_memory_only(
-            idx,
-            local_adjust_core::LocalAdjustmentLayers::clone(&layers),
-        );
-        self.submit_local_adjust_write(idx, key, layers);
-    }
-
-    /// 保存要求を worker へ積み、完了時にミラー先を復元するための座標を控える。
-    ///
-    /// **サイドカー座標は積む時点で固定する。**完了が返る頃には一覧の idx が別のページを
-    /// 指し得るので、そのとき解決し直すと無関係なページへミラーする。
-    fn submit_local_adjust_write(
-        &mut self,
-        idx: usize,
-        key: String,
-        layers: local_adjust_core::LocalAdjustmentLayers,
-    ) {
-        self.ensure_local_adjust_write_handle();
-        let layer_count = layers.len();
-        let submitted = match self.local_adjust_write_handle.as_ref() {
-            Some(handle) => handle.submit(key.clone(), layers),
-            None => Err(EditStoreOutcome::Failed(
-                "保存ワーカーを起動できません".to_string(),
-            )),
-        };
-        let generation = match submitted {
-            Ok(generation) => generation,
-            Err(outcome) => {
-                // worker が受け取らなかった = 正本には何も書かれない。黙って積んだ
-                // ことにすると、画面には編集が残ったまま保存されない状態が続く。
-                // 他の失敗と同じ扱い (ミラーを書かず、利用者へ伝える) にする。
-                debug_assert!(!matches!(outcome, EditStoreOutcome::Committed));
-                let _ = self.edit_store_write_succeeded("補正レイヤー", outcome);
-                self.local_adjust_write_pending.remove(&key);
-                return;
-            }
-        };
-        crate::perf::event(
-            "local_adjust",
-            "save_enqueue",
-            Some(&key),
-            generation,
-            &[("layers", serde_json::Value::from(layer_count))],
-        );
-        let sidecar = if self.idx_is_compiled_book_page(idx) {
-            None
-        } else {
-            self.sidecar_coords(idx)
-        };
-        self.local_adjust_write_pending.insert(
-            key,
-            LocalAdjustWritePending {
-                generation,
-                idx,
-                sidecar,
-            },
-        );
+        target.idx_hint = PageIndexHint::Unresolved;
+        self.set_local_adjust_layers_for_target(&target, layers);
     }
 
     pub(crate) fn ensure_local_adjust_write_handle(&mut self) {
@@ -77990,9 +78464,7 @@ impl App {
                 completions.push(completion);
             }
         }
-        for completion in completions {
-            self.apply_local_adjust_write_completion(completion);
-        }
+        self.apply_local_adjust_write_completions(completions);
     }
 
     /// 終了時: worker を止めて在庫を書き切らせ、その結果をミラーへ反映する。
@@ -78004,9 +78476,7 @@ impl App {
         let Some(handle) = self.local_adjust_write_handle.take() else {
             return;
         };
-        for completion in handle.shutdown_and_collect() {
-            self.apply_local_adjust_write_completion(completion);
-        }
+        self.apply_local_adjust_write_completions(handle.shutdown_and_collect());
     }
 
     /// 積んである保存が着地するまで待ち、結果を反映する。
@@ -78018,9 +78488,8 @@ impl App {
         let Some(handle) = self.local_adjust_write_handle.as_ref() else {
             return;
         };
-        for completion in handle.drain_blocking() {
-            self.apply_local_adjust_write_completion(completion);
-        }
+        let completions = handle.drain_blocking();
+        self.apply_local_adjust_write_completions(completions);
     }
 
     /// 保存結果 1 件を UI 状態へ反映する。**R-26 の境界はここ。**
@@ -78039,54 +78508,72 @@ impl App {
         &mut self,
         completion: crate::local_adjust_write_worker::LocalAdjustWriteCompletion,
     ) {
+        self.apply_local_adjust_write_completions([completion]);
+    }
+
+    fn apply_local_adjust_write_completions(
+        &mut self,
+        completions: impl IntoIterator<
+            Item = crate::local_adjust_write_worker::LocalAdjustWriteCompletion,
+        >,
+    ) {
+        let mut documents = std::collections::HashMap::new();
+        for completion in completions {
+            if let Some((key, layers)) = self.apply_local_adjust_write_completion_inner(completion)
+            {
+                documents.insert(key, layers);
+            }
+        }
+        self.publish_accepted_local_page_edits(&documents);
+    }
+
+    fn apply_local_adjust_write_completion_inner(
+        &mut self,
+        completion: crate::local_adjust_write_worker::LocalAdjustWriteCompletion,
+    ) -> Option<(String, local_adjust_core::LocalAdjustmentLayers)> {
         let crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
             key,
             generation,
             layers,
             outcome,
+            origin,
         } = completion;
-        let Some(pending) = self.local_adjust_write_pending.get(&key) else {
-            return;
-        };
-        let sidecar = pending.sidecar.clone();
-        let idx = pending.idx;
-        // 記録を畳むのは最新の完了だけ。古い完了で畳むと、後から届く最新の完了が
-        // ミラー先を失う。
-        if pending.generation == generation {
+        let latest = self
+            .local_adjust_write_pending
+            .get(&key)
+            .is_some_and(|pending| pending.generation == generation);
+        if latest {
             self.local_adjust_write_pending.remove(&key);
         }
-
         if !self.edit_store_write_succeeded("補正レイヤー", outcome) {
-            // 画面には残す。durable な mirror だけ書かない。
-            return;
+            return None;
         }
-        if !self.local_adjust_write_pending.contains_key(&key)
-            && let Some(snapshot) = self.page_edit_snapshot.as_mut()
-        {
-            if snapshot.volatile_keys.remove(&key) {
-                self.page_edit_revision = self.page_edit_revision.wrapping_add(1);
-            }
-        }
+        let Some(origin) = origin else {
+            return None;
+        };
+        let sidecar = origin.target.sidecar_coords.clone();
         if layers.is_empty() {
             self.with_sidecar_coords_mut(sidecar.as_ref(), |sc, rel| {
                 sc.remove_local_adjust_layers(rel)
             });
         } else {
+            let mirrored = layers.clone();
             self.with_sidecar_coords_mut(sidecar.as_ref(), move |sc, rel| {
-                sc.set_local_adjust_layers(rel, layers)
+                sc.set_local_adjust_layers(rel, mirrored)
             });
         }
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Edits,
         );
-        // idx は完了までに別のページを指し得る。同じ key を指したままのときだけ
-        // idx 依存の後続処理を走らせる。
-        if self.page_path_key(idx).as_deref() == Some(key.as_str()) {
-            self.record_content_identity_for_idx(
-                idx,
-                crate::content_identity::ContentIdentityTrigger::Edit,
-            );
+        if origin.context == self.projected_viewer_context_id() {
+            for idx in self.page_adjustment_indices(&origin.target) {
+                self.record_content_identity_for_idx(
+                    idx,
+                    crate::content_identity::ContentIdentityTrigger::Edit,
+                );
+            }
         }
+        latest.then_some((key, layers))
     }
 
     /// 指定 idx の補正レイヤー配列を in-memory state だけに反映する。
@@ -78096,6 +78583,19 @@ impl App {
         idx: usize,
         layers: local_adjust_core::LocalAdjustmentLayers,
     ) {
+        if let Some(key) = self.page_path_key(idx)
+            && let LocalPageEditDocument::Editing {
+                owner,
+                layers: draft,
+                revision,
+                ..
+            } = &mut self.local_page_edit_document
+            && owner.target.page_key == key
+            && *draft != layers
+        {
+            *draft = layers.clone();
+            *revision = revision.wrapping_add(1);
+        }
         self.set_local_adjust_layers_for_idx_memory_only_inner(idx, layers);
         self.bump_local_adjust_generation(idx);
     }
@@ -78114,6 +78614,9 @@ impl App {
         idx: usize,
         layers: local_adjust_core::LocalAdjustmentLayers,
     ) {
+        if let Some(key) = self.page_path_key(idx) {
+            self.cancel_superseded_page_edit_producers(&key, &layers, false);
+        }
         if layers.is_empty() {
             self.local_adjust_page_layers.remove(&idx);
             self.local_adjust_pages.remove(&idx);
@@ -84255,7 +84758,11 @@ impl App {
     /// 本文長による自動計算を使わず、一定時間を保証したい案内向け。
     pub(crate) fn show_feedback_toast_with_duration(&mut self, text: String, duration_secs: f32) {
         #[cfg(windows)]
-        self.show_native_video_overlay_toast(text.clone(), false);
+        self.show_native_video_overlay_toast_with_linger(
+            text.clone(),
+            false,
+            Some(std::time::Duration::from_secs_f32(duration_secs)),
+        );
         self.fs_feedback_toast = Some((text, std::time::Instant::now(), duration_secs));
         self.fs_feedback_toast_reveal_path = None;
         // 発火面不明の従来経路: 全面に描く (単面表示は show_feedback_toast_on を使う)。
@@ -84712,6 +85219,24 @@ impl App {
         target: &PageAdjustmentTarget,
         params: crate::adjustment::AdjustParams,
     ) -> EditStoreOutcome {
+        let result = self.set_page_params_for_target_store(target, params.clone());
+        if result == EditStoreOutcome::Committed {
+            let document = Some(params);
+            let document = document
+                .filter(|params| *params != self.adjustment_standard_params_for_target(target));
+            self.publish_accepted_adjustment_page_edits(&HashMap::from([(
+                target.page_key.clone(),
+                document,
+            )]));
+        }
+        result
+    }
+
+    fn set_page_params_for_target_store(
+        &mut self,
+        target: &PageAdjustmentTarget,
+        params: crate::adjustment::AdjustParams,
+    ) -> EditStoreOutcome {
         // 固定代表サムネは、親コンテナだけが mounted で参照元ページ自体は items に
         // 無い場合がある。親セルの refresh 判定は idx ではなく page key の実効値で行う。
         let old_effective_for_key = self.effective_params_for_target(target);
@@ -84808,6 +85333,21 @@ impl App {
         &mut self,
         target: &PageAdjustmentTarget,
     ) -> EditStoreOutcome {
+        let result = self.clear_page_params_for_target_store(target);
+        if result == EditStoreOutcome::Committed {
+            let document = None;
+            self.publish_accepted_adjustment_page_edits(&HashMap::from([(
+                target.page_key.clone(),
+                document,
+            )]));
+        }
+        result
+    }
+
+    fn clear_page_params_for_target_store(
+        &mut self,
+        target: &PageAdjustmentTarget,
+    ) -> EditStoreOutcome {
         // set と同様、未 mounted の固定代表参照元も key 単位で変化を検出する。
         let old_effective_for_key = self.effective_params_for_target(target);
         let fallback = self.adjustment_standard_params_for_target(target);
@@ -84875,6 +85415,17 @@ impl App {
         target: &PageAdjustmentTarget,
         params: Option<crate::adjustment::AdjustParams>,
     ) {
+        let mut documents = HashMap::new();
+        self.restore_page_params_for_target_collect(target, params, &mut documents);
+        self.publish_accepted_adjustment_page_edits(&documents);
+    }
+
+    pub(crate) fn restore_page_params_for_target_collect(
+        &mut self,
+        target: &PageAdjustmentTarget,
+        params: Option<crate::adjustment::AdjustParams>,
+        documents: &mut HashMap<String, Option<crate::adjustment::AdjustParams>>,
+    ) {
         match params {
             Some(params) => {
                 let old_by_idx = self
@@ -84882,15 +85433,23 @@ impl App {
                     .into_iter()
                     .map(|idx| (idx, self.effective_params(idx).clone()))
                     .collect::<Vec<_>>();
-                let result = self.set_page_params_for_target(target, params.clone());
-                let _ = self.edit_store_write_succeeded("補正", result);
+                let result = self.set_page_params_for_target_store(target, params.clone());
+                let committed = self.edit_store_write_succeeded("補正", result);
                 for (idx, old) in old_by_idx {
                     self.clear_caches_for_param_change(idx, &old, &params);
                 }
+                if committed {
+                    let value = (params != self.adjustment_standard_params_for_target(target))
+                        .then_some(params);
+                    documents.insert(target.page_key.clone(), value);
+                }
             }
             None => {
-                let result = self.clear_page_params_for_target(target);
-                let _ = self.edit_store_write_succeeded("補正の解除", result);
+                let result = self.clear_page_params_for_target_store(target);
+                let committed = self.edit_store_write_succeeded("補正の解除", result);
+                if committed {
+                    documents.insert(target.page_key.clone(), None);
+                }
             }
         }
     }
@@ -84991,6 +85550,9 @@ impl App {
             );
             Self::set_page_keys_presence(&mut self.adjusted_page_keys, &keys, false);
             if self.edit_store_write_succeeded("補正の一括解除", written) {
+                self.publish_accepted_adjustment_page_edits(
+                    &keys.iter().map(|key| (key.clone(), None)).collect(),
+                );
                 for (folder, rels) in sidecar_coords {
                     if let Some(sc) = self.sidecar_mut(&folder) {
                         sc.remove_adjust_bulk(rels);
@@ -85009,6 +85571,12 @@ impl App {
             );
             Self::set_page_keys_presence(&mut self.adjusted_page_keys, &keys, true);
             if self.edit_store_write_succeeded("補正の一括適用", written) {
+                self.publish_accepted_adjustment_page_edits(
+                    &keys
+                        .iter()
+                        .map(|key| (key.clone(), Some(params.clone())))
+                        .collect(),
+                );
                 for (folder, rels) in sidecar_coords {
                     if let Some(sc) = self.sidecar_mut(&folder) {
                         sc.set_adjust_bulk(rels, &params);
@@ -85050,6 +85618,9 @@ impl App {
         );
         Self::set_page_keys_presence(&mut self.adjusted_page_keys, &keys, false);
         if self.edit_store_write_succeeded("補正の全解除", written) {
+            self.publish_accepted_adjustment_page_edits(
+                &keys.iter().map(|key| (key.clone(), None)).collect(),
+            );
             for (folder, rels) in sidecar_coords {
                 if let Some(sc) = self.sidecar_mut(&folder) {
                     sc.remove_adjust_bulk(rels);
@@ -85121,9 +85692,20 @@ impl App {
                         .is_some_and(|p| p == self.effective_default_for_idx(*idx))
             })
             .collect();
-        for idx in redundant {
-            self.clear_page_params(idx);
+        self.clear_page_params_for_indices(&redundant);
+    }
+
+    fn clear_page_params_for_indices(&mut self, indices: &[usize]) {
+        let mut documents = HashMap::new();
+        for &idx in indices {
+            if let Some(target) = self.page_adjustment_target_for_idx(idx) {
+                let result = self.clear_page_params_for_target_store(&target);
+                if self.edit_store_write_succeeded("補正の解除", result) {
+                    documents.insert(target.page_key, None);
+                }
+            }
         }
+        self.publish_accepted_adjustment_page_edits(&documents);
     }
 
     /// 指定パラメータを settings.global_preset にコピーして保存する。
@@ -85652,11 +86234,23 @@ impl App {
             .map(|writer| std::iter::from_fn(|| writer.try_recv()).collect())
             .unwrap_or_default();
         for outcome in results {
-            let Err(error) = outcome.result else {
+            let (command, result) = match outcome {
+                crate::favorite_view_state::FavoriteViewStoreResult::Copied { id, state } => {
+                    // The ZIP modal owns admission through FIFO copy adoption.
+                    // Normal persistence replies do not replace newer in-memory intent.
+                    self.favorite_view_states.insert(id, state);
+                    continue;
+                }
+                crate::favorite_view_state::FavoriteViewStoreResult::Persisted {
+                    command,
+                    result,
+                } => (command, result),
+            };
+            let Err(error) = result else {
                 continue;
             };
             crate::logger::log(format!("favorite view state store failed: {error}"));
-            match outcome.command {
+            match command {
                 crate::favorite_view_state::FavoriteViewStoreCommand::Set { id, state } => {
                     // この Set より後に reset / clear / 新しい変更が入っていれば、古い
                     // failure を再送して現在の意図を巻き戻してはならない。
@@ -85886,14 +86480,24 @@ impl App {
         };
 
         let mut any_ai_changed = false;
+        let mut documents = HashMap::new();
         for &idx in &targets {
             let old_params = self.effective_params(idx).clone();
             if !old_params.ai_settings_eq(&slot.params) {
                 any_ai_changed = true;
             }
-            self.set_page_params(idx, slot.params.clone());
+            if let Some(target) = self.page_adjustment_target_for_idx(idx) {
+                let result = self.set_page_params_for_target_store(&target, slot.params.clone());
+                if self.edit_store_write_succeeded("補正", result) {
+                    let params = (slot.params
+                        != self.adjustment_standard_params_for_target(&target))
+                    .then(|| slot.params.clone());
+                    documents.insert(target.page_key, params);
+                }
+            }
             self.clear_caches_for_param_change(idx, &old_params, &slot.params);
         }
+        self.publish_accepted_adjustment_page_edits(&documents);
         // AI 設定が変わった target が 1 件でもあれば AI キャッシュ / 進行中 pending を
         // 全体単位で畳む (AI キャッシュは item idx キーでフラグメント化できないため)。
         if any_ai_changed {
@@ -85930,9 +86534,7 @@ impl App {
             self.show_feedback_toast("[個別設定なし]".to_string());
             return;
         }
-        for &idx in &to_clear {
-            self.clear_page_params(idx);
-        }
+        self.clear_page_params_for_indices(&to_clear);
         let count = to_clear.len();
         if count == 1 {
             self.show_feedback_toast("[個別設定を解除]".to_string());
@@ -86175,24 +86777,7 @@ impl App {
             self.thumb_adjust_tex.remove(&idx);
             return;
         };
-        // 補正 tex のある keep セルだけ調べる。全 items の path を release 時に
-        // 作り直すと、大きな一覧では単一ページ操作でも UI を止めてしまう。
-        let affected: Vec<usize> = self
-            .thumb_adjust_tex
-            .keys()
-            .copied()
-            .filter(|&candidate| {
-                self.page_path_key(candidate).as_deref() == Some(key.as_str())
-                    || self
-                        .thumb_edit_preview_keys
-                        .get(&candidate)
-                        .is_some_and(|preview_key| preview_key == &key)
-            })
-            .collect();
-        for affected in affected {
-            self.thumb_adjust_tex.remove(&affected);
-        }
-        self.pinned_adjustment_refresh_keys.insert(key);
+        self.invalidate_thumb_adjust_for_page_key(&key);
     }
 
     /// フルスクリーン補正キャッシュとサムネ補正テクスチャを同時に全クリアする。
@@ -91797,7 +92382,9 @@ impl App {
         // IndexerManager の重い初期化はバックグラウンドスレッドで実行する。
         // 進行中は中央に「起動中…」+ 現在ステップを表示し、× ボタン以外の
         // 入力イベントを破棄する。完了したら通常 update に進む。
-        self.poll_indexer_notifications();
+        self.poll_indexer_notifications(
+            ctx.input(|input| input.viewport().minimized.unwrap_or(false)),
+        );
         self.poll_housekeeping_arm();
         // VST3 起動時の bridge enable + 自動ロードは専用 worker で走らせる。
         // 画像閲覧だけの起動では通常 UI を先に出し、動画を開いた時点でまだロード中なら
@@ -92777,7 +93364,8 @@ impl App {
         self.poll_rating_write_results();
         self.poll_video_upscale_queue(ctx);
 
-        let main_viewer_blocked = self.viewer_session_blocks_main_window();
+        let main_viewer_blocked =
+            self.viewer_session_blocks_main_window() || self.viewer_mutation_modal_active();
 
         // ── ダイアログ群 ─────────────────────────────────────────────
         self.show_favorites_editor_dialog(ctx);
@@ -94257,15 +94845,30 @@ impl eframe::App for App {
         // process-exit root close until that exact worker reaches terminal; ordinary tray-hide
         // remains under the established close policy.
         self.defer_settings_family_root_close(ctx);
+        self.defer_composition_editor_root_close(ctx);
+        self.defer_image_folder_zip_root_close(ctx);
         #[cfg(not(windows))]
         {
             // Non-Windows builds have one mounted viewer context and therefore no
             // ViewerContextRegistry. Keep polling that context's draining preview
             // worker so cancellation/late completion retains the Windows lifecycle.
             let passwords = self.pdf_passwords.clone();
-            self.similar_panel.preview.poll_background(ctx, &passwords);
+            if let Some(notice) = self.similar_panel.preview.poll_background(ctx, &passwords) {
+                self.show_feedback_toast(notice);
+            }
         }
+        self.poll_image_folder_zip(ctx);
         self.update_frame(ctx, frame);
+        // Composition publications and Prepare completions belong to the
+        // display-independent async boundary. Run after the presentation pass
+        // so a newly adopted book also starts its read in an early-return frame.
+        // Dedicated viewers additionally admit reads through their mounted owner.
+        self.poll_composition_editor_operations(ctx);
+        self.poll_book_composition_service(ctx);
+        if self.fullscreen_idx.is_none() || self.fullscreen_embedded_still_active() {
+            self.show_local_composition_editor(ctx);
+            self.show_image_folder_zip(ctx);
+        }
         #[cfg(windows)]
         self.sync_clipboard_capture(ctx);
         self.show_capture_selection_dialog(ctx);
@@ -94356,6 +94959,7 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.close_local_composition_editor(CompositionEditorCloseReason::Shutdown);
         self.diagnostics_export.retire();
         self.retire_pending_startup_result();
         self.epub_convert = None;
@@ -96524,6 +97128,9 @@ mod spread_shift_lifecycle_tests;
 pub(crate) mod tests;
 
 #[cfg(test)]
+mod composition_detach_tests;
+
+#[cfg(test)]
 #[path = "app/tests/still_seek_thumbnail_ownership.rs"]
 mod still_seek_thumbnail_ownership;
 
@@ -96846,6 +97453,10 @@ mod now_playing_lifecycle_tests {
 }
 
 #[cfg(test)]
+#[path = "app/tests/g1_extracted_handlers.rs"]
+mod g1_extracted_handlers;
+
+#[cfg(test)]
 mod index_full_check_tests {
     use super::*;
 
@@ -96899,6 +97510,79 @@ mod index_full_check_tests {
         let shown_at = toast.1;
         app.poll_startup_diagnostics_notice(false, take_notice);
         assert_eq!(app.fs_feedback_toast.as_ref().unwrap().1, shown_at);
+    }
+
+    #[test]
+    fn name_index_failure_notice_waits_for_drawable_ui_and_survives_drains_once() {
+        let mut env = setup_app_for_test();
+        let app = &mut env.app;
+        let db = Arc::new(crate::search_index_db::SearchIndexDb::open_in_memory().unwrap());
+        app.search_index_db = Some(db.clone());
+        db.report_write_failure(
+            "fixture",
+            std::path::Path::new("C:/root"),
+            &rusqlite::Error::InvalidQuery,
+        );
+        let (_tx, rx) = mpsc::channel();
+        app.indexer_init = IndexerInit::Pending(StartupInitPending {
+            rx,
+            started_at: Instant::now(),
+            full_check_requested: false,
+            disposal_witness: None,
+        });
+        app.window_visible = true;
+        app.poll_indexer_notifications(false);
+        assert!(app.fs_feedback_toast.is_none(), "overlay keeps the notice");
+        // The name DB is independent of the FTS manager's availability.
+        app.indexer_init = IndexerInit::Unavailable;
+        app.window_visible = false;
+        app.poll_indexer_notifications(false);
+        assert!(app.fs_feedback_toast.is_none(), "tray keeps the notice");
+        app.window_visible = true;
+        app.poll_indexer_notifications(true);
+        assert!(
+            app.fs_feedback_toast.is_none(),
+            "minimized UI keeps the notice"
+        );
+        #[cfg(windows)]
+        let native_probe = {
+            let mut player = crate::video::VideoPlayer::local_ready_disconnected_for_test(
+                PathBuf::from("fixture.mp4"),
+            );
+            let probe = player.install_native_ui_probe_for_test();
+            app.fullscreen_idx = Some(0);
+            app.fs_cache.insert(
+                0,
+                FsCacheEntry::Video {
+                    player: Box::new(player),
+                    load_seq: 0,
+                },
+            );
+            probe
+        };
+        let before = Instant::now();
+        app.poll_indexer_notifications(false);
+        let toast = app.fs_feedback_toast.as_ref().unwrap();
+        assert_eq!(toast.0, crate::search_index_db::NAME_UPDATE_FAILURE_NOTICE);
+        assert!(toast.1 >= before);
+        assert_eq!(toast.2, 5.0);
+        #[cfg(windows)]
+        assert_eq!(
+            native_probe.drain_toasts(),
+            vec![(
+                crate::search_index_db::NAME_UPDATE_FAILURE_NOTICE.to_owned(),
+                Some(std::time::Duration::from_secs(5)),
+            )]
+        );
+        let shown_at = toast.1;
+        db.report_write_failure(
+            "later root",
+            std::path::Path::new("C:/other"),
+            &rusqlite::Error::InvalidQuery,
+        );
+        app.poll_indexer_notifications(false);
+        assert_eq!(app.fs_feedback_toast.as_ref().unwrap().1, shown_at);
+        assert!(db.take_failure_notifications().is_empty());
     }
 
     #[test]
@@ -98197,3 +98881,6 @@ mod specified_scale_contract_tests {
         assert_eq!(app.pdf_specified_basis_for_idx(0), previous_basis);
     }
 }
+
+#[cfg(test)]
+mod book_composition_runtime_tests;

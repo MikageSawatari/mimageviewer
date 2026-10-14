@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use crate::view_trim::{ViewTrimBookState, ViewTrimPageOverride};
 use rusqlite::OpenFlags;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ViewTrimWriteBatch {
     pub book: Option<(PathBuf, ViewTrimBookState)>,
     pub pages: Vec<(String, ViewTrimPageOverride)>,

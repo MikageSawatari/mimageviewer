@@ -17,6 +17,7 @@
 #include <windows.h>
 
 #include "gui_visibility.h"
+#include "gui_frame.h"
 #include "host_app.h"  // PlugFrame, HostApplication, ComponentHandler の完全型
 #include "pluginterfaces/gui/iplugview.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
@@ -53,6 +54,7 @@ struct GuiWindowOptions {
     uint64_t slot_id = 0;
     void* owner_hwnd = nullptr;
     bool unowned = false;
+    bool show_in_taskbar = false;
     void* main_hwnd = nullptr; // DPI/minimize reference, never an owner
     std::string gui_gate_name;
     uint32_t width = 0;
@@ -149,7 +151,15 @@ public:
     bool query_gui_size_at_dpi(uint32_t dpi, uint32_t& width_out, uint32_t& height_out,
                                 bool& resizable_out);
     /// 指定 HWND にプラグイン GUI をアタッチする。失敗時は false。
-    bool show_gui(const GuiWindowOptions& options, bool visible, std::string& error_out);
+    bool show_gui(const GuiWindowOptions& options, bool visible, std::string& error_out,
+                  std::optional<NormalScreenRect>* normal_out = nullptr);
+    void set_gui_taskbar(bool value);
+    void publish_gui_normal_rect();
+    void user_hide_gui();
+    void handle_editor_dpi_change(uint32_t dpi, const RECT* suggested);
+    bool editor_native_caption() const { return view_main_hwnd_ != nullptr; }
+    bool editor_show_in_taskbar() const { return !gui_taskbar_ || gui_taskbar_->enabled(); }
+    void sync_gui_taskbar(bool shell_recreated = false);
     /// Already-attached GUI surface visibility toggle. Keeps the VST3 view
     /// attached and only hides/shows the bridge-owned top-level surface.
     void set_gui_visible(bool visible);
@@ -249,6 +259,8 @@ private:
     void quarantine_editor(const char* reason);
     void abandon_gui_thread(const char* reason);
     void refresh_gui_surface(void* container_hwnd);
+    bool notify_gui_client(bool force_notify);
+    void show_gui_surface(int command);
 
     Steinberg::IPtr<HostApplication> host_app_;
     Steinberg::IPtr<ComponentHandler> component_handler_;
@@ -272,6 +284,7 @@ private:
     std::atomic<bool> editor_show_bypass_button_{true};
     GuiVisibility gui_visibility_;
     std::unique_ptr<GuiGateReader> gui_gate_;
+    std::unique_ptr<EditorTaskbar> gui_taskbar_;
     bool gui_app_active_ = true;
     uint32_t last_gui_width_ = 0;
     uint32_t last_gui_height_ = 0;

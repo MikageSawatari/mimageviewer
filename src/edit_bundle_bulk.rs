@@ -720,9 +720,7 @@ impl App {
     }
 
     fn next_local_adjust_drain_stage(&self) -> Result<Option<LocalAdjustDrainStage>, String> {
-        if self.local_adjust_lut_pending.is_some()
-            || self.local_adjust_segmentation_pending.is_some()
-        {
+        if self.has_page_edit_producers() {
             return Ok(Some(LocalAdjustDrainStage::Producers));
         }
         if self.local_adjust_write_pending.is_empty() {
@@ -743,7 +741,7 @@ impl App {
         &mut self,
         request: crate::edit_bundle::EditBundlePasteRequest,
     ) -> bool {
-        self.commit_local_adjust_pending_edits();
+        self.prepare_page_edit_history_boundary();
         match self.next_local_adjust_drain_stage() {
             Ok(None) => false,
             Ok(Some(stage)) => {
@@ -789,7 +787,7 @@ impl App {
         if op.needs_bundle_worker() {
             // 直前の補正レイヤー編集と、LUT / mask producer の結果を先に durable にする。
             // これを待たないと bulk transaction の後から古い保存が着地して上書きする。
-            self.commit_local_adjust_pending_edits();
+            self.prepare_page_edit_history_boundary();
             match self.next_local_adjust_drain_stage() {
                 Ok(None) => {}
                 Ok(Some(stage)) => {
@@ -1127,18 +1125,16 @@ impl App {
         if waiting_for_local_adjust {
             // producer 完了が新しい保存を enqueue し得るため、producer → write result の順で
             // 進めてからフェンス状態を判定する。
-            self.poll_local_adjust_lut_load(ctx);
-            self.poll_local_adjust_segmentation(ctx);
+            self.poll_all_page_edit_producers(ctx);
             self.poll_local_adjust_write_results();
         }
+        let producers_pending = self.has_page_edit_producers();
         let action = match self.edit_bundle_bulk_pending.as_mut() {
             Some(BulkPageEditPending {
                 phase: BulkPageEditPhase::WaitingForLocalAdjust(wait),
             }) => match &wait.stage {
                 LocalAdjustDrainStage::Producers => {
-                    if self.local_adjust_lut_pending.is_none()
-                        && self.local_adjust_segmentation_pending.is_none()
-                    {
+                    if !producers_pending {
                         Some(BulkPollAction::LocalAdjustFenceReady)
                     } else {
                         None

@@ -77,6 +77,73 @@ fn persistence(app: &App) -> ShiftPersistence {
     persistence.clone()
 }
 
+#[test]
+fn g1_snapshot_parks_book_shift_receipt_and_restores_identity_without_extracted_writes() {
+    let mut env = setup_app();
+    let root = env.tmp.path().join("books/snapshot-shift");
+    let data = env.tmp.path().join("shift-data");
+    install_book(&mut env, &root);
+    env.projection_recipe = super::book_materialization::ProjectionRecipe::Book(
+        super::book_materialization::BookScope::ImageFolder(root.clone()),
+    );
+    let scope = env.current_spread_shift_scope().unwrap();
+    let (service, owner) = runtime(&mut env, &data);
+    let pause = service.pause_for_test();
+    assert!(env.set_live_spread_shift(1));
+    let sequence = service.watermarks().admitted;
+    assert_eq!(persistence(&env), ShiftPersistence::Saving(sequence));
+    env.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+    assert!(env.extracted_result_surface().is_some());
+    assert_eq!(env.current_spread_shift_scope(), None);
+    assert_eq!(env.spread_shift_anchor_idx(), None);
+    let fork = env.snapshot.as_ref().unwrap().clone();
+    assert!(matches!(
+        fork.saved_viewing_state.shift.state,
+        ViewerShift::Book(SpreadShiftState::Adjusted {
+            persistence: ShiftPersistence::SessionOnly,
+            ..
+        })
+    ));
+    // The worker pause and fenced read prove completion; no sleep or retry loop.
+    pause.send(()).unwrap();
+    assert_eq!(
+        row(&service, &scope),
+        Some(SpreadShiftPageRef::RelativePath("1.png".into()))
+    );
+    env.poll_spread_shift_service();
+    let saved = &env.snapshot.as_ref().unwrap().saved_viewing_state.shift;
+    assert_eq!(saved.scope.as_ref(), Some(&scope));
+    assert_eq!(saved.anchor_idx(), Some(1));
+    assert!(
+        matches!(saved.state, ViewerShift::Book(SpreadShiftState::Adjusted {
+        persistence: ShiftPersistence::Saved(value), ..
+    }) if value == sequence)
+    );
+    assert_eq!(env.spread_shift_anchor_idx(), None);
+    env.apply_fullscreen_spread_mode(
+        &egui::Context::default(),
+        0,
+        crate::settings::SpreadMode::LtrCover,
+    );
+    env.spread_shift_memory_setting_changed(false);
+    env.spread_shift_memory_setting_changed(true);
+    assert_eq!(
+        service.watermarks().admitted,
+        sequence,
+        "A2 changes must not Set/Clear the parked book"
+    );
+    env.deactivate_snapshot();
+    assert_eq!(env.spread_shift.scope.as_ref(), Some(&scope));
+    assert_eq!(env.spread_shift_anchor_idx(), Some(1));
+    assert_eq!(persistence(&env), ShiftPersistence::SessionOnly);
+    assert_eq!(
+        row(&service, &scope),
+        Some(SpreadShiftPageRef::RelativePath("1.png".into()))
+    );
+    assert_eq!(service.watermarks().admitted, sequence);
+    owner.shutdown_and_join();
+}
+
 fn finish_restore(app: &mut App, restore: &mut ViewerBookRestore) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !app.poll_book_shift_restore(restore).unwrap() {
@@ -439,9 +506,49 @@ fn q3_failed_base_setter_does_not_clear_live_or_saved_shift() {
 #[test]
 fn pairing_gate_rejects_shift_and_clear_but_preserves_single_page_fallback() {
     let mut env = setup_app();
-    let root = env.tmp.path().join("books/qualification");
+    let root = env.tmp.path().join("books/qualification.pdf");
     let data = env.tmp.path().join("shift-data");
     install_book(&mut env, &root);
+    // Eligibility is derived from the accepted composition/recipe owner in G3;
+    // mutating a cached availability field no longer qualifies a real source.
+    env.items = (0..6)
+        .map(|page_num| GridItem::PdfPage {
+            pdf_path: root.clone(),
+            page_num,
+            content_type: None,
+        })
+        .collect();
+    env.page_identity_index = Arc::new(file_type_resume::PreparedPageIdentityIndex::prepare(
+        &env.items,
+        Some(&root),
+        env.settings.file_type_visibility.clone(),
+    ));
+    let book_recipe = book_materialization::ProjectionRecipe::Book(
+        book_materialization::BookScope::Document(root.clone()),
+    );
+    env.projection_recipe = book_recipe.clone();
+    let scope = env.current_spread_shift_scope().unwrap();
+    env.spread_shift.scope = Some(scope.clone());
+    let token = crate::book_composition::CompositionToken {
+        service_epoch: 1,
+        publication_sequence: 1,
+    };
+    let prepared = book_materialization::project_document_composition(
+        &root,
+        6,
+        (env.items.clone(), env.image_metas.clone()),
+        env.settings.file_type_visibility.clone(),
+        token,
+        Some(&crate::book_composition::fixtures::four_page_book(
+            crate::book_composition::ReadingDirection::Ltr,
+        )),
+    )
+    .unwrap();
+    let crate::book_composition::CompositionProjectionOutcome::Composed(projection) =
+        prepared.composition
+    else {
+        panic!("real composed source qualification");
+    };
     let (service, owner) = runtime(&mut env, &data);
     env.settings.remember_spread_shift_per_book = false;
     env.set_live_spread_shift(1);
@@ -450,7 +557,27 @@ fn pairing_gate_rejects_shift_and_clear_but_preserves_single_page_fallback() {
         PairingEditAvailability::Unreadable,
         PairingEditAvailability::ExtractedResult,
     ] {
+        env.projection_recipe = book_recipe.clone();
+        match availability {
+            PairingEditAvailability::Composed => {
+                env.install_composition_for_test(projection.clone())
+            }
+            PairingEditAvailability::Unreadable => {
+                env.book_composition = book_composition_runtime::ViewerBookComposition::Blocked {
+                    scope: scope.clone(),
+                    token,
+                    error: "fixture unreadable store".into(),
+                };
+            }
+            PairingEditAvailability::ExtractedResult => {
+                env.projection_recipe = book_materialization::ProjectionRecipe::ExtractedResult(
+                    book_materialization::ExtractedSurface::Rating,
+                );
+            }
+            _ => unreachable!(),
+        }
         env.spread_shift.availability = availability;
+        assert_eq!(env.pairing_edit_availability(), availability);
         env.spread_mode = crate::settings::SpreadMode::Ltr;
         let state = env.spread_shift.clone();
         let mut action = crate::ui_fullscreen::FsKeyAction::default();

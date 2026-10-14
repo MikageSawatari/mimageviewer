@@ -242,6 +242,12 @@ impl App {
         prepared: PreparedPageEditBundle,
     ) {
         let old_params = idx.map(|idx| self.effective_params(idx).clone());
+        // The worker already committed this document. Publish the accepted value
+        // before another context can start a new run from its old projection.
+        self.publish_accepted_adjustment_page_edits(&std::collections::HashMap::from([(
+            key.to_owned(),
+            prepared.adjust.clone(),
+        )]));
         if prepared.adjust.is_some() {
             self.adjusted_page_keys.insert(key.to_string());
         } else {
