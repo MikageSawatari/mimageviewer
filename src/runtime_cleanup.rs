@@ -24,7 +24,12 @@ use crate::runtime_locks;
 #[cfg(all(windows, not(feature = "portable")))]
 pub(crate) fn pin_running_version() -> io::Result<Option<fs::File>> {
     let exe = std::env::current_exe()?;
-    pin_version_at(&exe, env!("CARGO_PKG_VERSION"))
+    pin_running_version_at(&exe)
+}
+
+#[cfg(windows)]
+fn pin_running_version_at(exe: &Path) -> io::Result<Option<fs::File>> {
+    pin_version_at(exe, env!("CARGO_PKG_VERSION"))
 }
 
 #[cfg(windows)]
@@ -45,6 +50,52 @@ fn pin_version_at(exe: &Path, running_version: &str) -> io::Result<Option<fs::Fi
     // Lease identity follows the executable's real directory. Redirected APPDATA
     // remains runnable; cleanup's stricter ancestor refusal only skips deletion.
     runtime_locks::shared(&fs::canonicalize(version)?).map(Some)
+}
+
+#[cfg(all(test, windows, not(feature = "portable")))]
+mod companion_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_companion_lease_uses_core_version_and_holds_until_drop() {
+        let temp = tempfile::tempdir().unwrap();
+        let version = temp.path().join("runtime").join(env!("CARGO_PKG_VERSION"));
+        fs::create_dir_all(&version).unwrap();
+        let lease = pin_running_version_at(&version.join("mimageviewer-musicvideo.exe"))
+            .unwrap()
+            .unwrap();
+        assert!(runtime_locks::exclusive(&version, runtime_locks::IN_USE).is_err());
+        drop(lease);
+        assert!(runtime_locks::exclusive(&version, runtime_locks::IN_USE).is_ok());
+        assert_ne!(env!("CARGO_PKG_VERSION"), "0.1.0");
+    }
+
+    #[test]
+    fn runtime_companion_skips_loose_and_other_version_without_io() {
+        let temp = tempfile::tempdir().unwrap();
+        for path in [
+            "dev/mimageviewer-musicvideo.exe",
+            "portable/mimageviewer-musicvideo.exe",
+            "runtime/0.1.0/mimageviewer-musicvideo.exe",
+            "other/3.0.0/mimageviewer-musicvideo.exe",
+        ] {
+            assert!(
+                pin_running_version_at(&temp.path().join(path))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn runtime_companion_lease_failure_is_returned_without_waiting() {
+        let temp = tempfile::tempdir().unwrap();
+        let version = temp.path().join("runtime").join(env!("CARGO_PKG_VERSION"));
+        fs::create_dir_all(&version).unwrap();
+        let _exclusive = runtime_locks::exclusive(&version, runtime_locks::IN_USE).unwrap();
+        assert!(pin_running_version_at(&version.join("mimageviewer-musicvideo.exe")).is_err());
+    }
 }
 
 #[cfg(all(windows, not(feature = "portable"), not(test)))]

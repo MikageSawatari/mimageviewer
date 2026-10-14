@@ -133,7 +133,7 @@ fn resolve_path(base: &Path, stored: &Path) -> PathBuf {
     }
 }
 
-fn absolute_lexical(path: &Path) -> Result<PathBuf, String> {
+pub(crate) fn absolute_lexical(path: &Path) -> Result<PathBuf, String> {
     if path.is_absolute() {
         Ok(normalize_lexical(path))
     } else {

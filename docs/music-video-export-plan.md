@@ -1,6 +1,6 @@
 # 音楽ビデオ書き出し (Music Video Export) — 設計計画
 
-Status: P1〜P3j、P4b-1〜4 の実装・非対話検証あり。H3a の契約と H3b の画素一致は非対話検証済み。P4c 以降は未完了。
+Status: P1〜P3j、P4b-1〜4 の実装・非対話検証あり。H3a の契約と H3b の画素一致は非対話検証済み。P4c の実装・非対話検証あり。P4d 以降は未完了。
 2026-10-09 に P4 の方式を「別 exe のエディタ」へ改訂（D10 / D16）、
 画面構成（D14）と文字装飾の初版範囲（D15）を追加。改訂は GPT-6.1 Sol / xhigh の独立レビュー 3 回で
 条件付き ACCEPT（P4a 完了、2026-10-09）。
@@ -12,7 +12,7 @@ Status: P1〜P3j、P4b-1〜4 の実装・非対話検証あり。H3a の契約�
 実機目視 = ユーザー。2026-09-07〜09-09 の Astra / Sol 体制の記録は
 [引き継ぎ監査](music-video-handoff-20260907.md) に残す。本書の過去の完了記録は当時の記録であり、
 監査で挙がった未解決事項の解消を意味しない。
-H3（H3a + H3b）の解析・画素一致は非対話検証済み（下記 H3b 検証記録）。P4 の実機検収・P4c 以降は未完了。
+H3（H3a + H3b）の解析・画素一致は非対話検証済み（下記 H3b 検証記録）。P4 の実機検収・P4c の実装・非対話検証あり。P4d 以降は未完了。
 開発場所 = 別 worktree `C:\home\mimageviewer-musicvideo`（ブランチ `musicvideo`）。
 最終着地点 = **mIV に同梱して配布し、mIV から起動する機能**（ラボ止まりにしない。D10）。
 
@@ -2683,6 +2683,105 @@ UI **2 件**。今回の 3 件と補強した歌詞取消の 1 件は、上記�
 
 ---
 
+**P4c 実装記録（2026-10-14、未コミット差分）**
+
+正本は D10 と §7 P4c、実装 brief は `docs/brief-musicvideo-p4c.md`。
+対象は `musicvideo` worktree、基点 HEAD `922727457330e82bf941b5c645dfcf599b1c164b`。
+以下は実装者自身によるコード確認・非対話検証の記録であり、独立レビューではない。
+**実装・指定自動 gate 完了。独立実装レビュー／実機検収は未実施。**
+
+- 製品入口は `args_os` を純粋な `parse_args(args, cwd)` に渡す。3 引数の値・重複・組み合わせ・
+  未知引数を検査し、相対パスを cwd 基準の絶対パスへ解決する。解析エラー時は読込を開始せず、
+  空のプロジェクトとウィンドウ内の理由を表示する。存在確認は既存の Project／音声読込 worker の
+  ファイル読取で行う。起動 Project は利用者入力前に既存 `start_project_load` へ渡す
+  （新規 session は保存先を持たず dirty なので、起動引数に未保存確認を挟まない）。起動後の編集は
+  H1 の generation／Ready 採用規則で保護する。音声は既存 `start_audio_load` に渡す。
+- 最近一覧は `<data_dir>/musicvideo/recent-projects.json`。`apply_loaded_project` の採用境界と
+  保存 worker 成功の checkpoint だけから worker へ配送する。新規の空 path、開始・取消・失敗・
+  破棄された読込は登録しない。読込／保存の使用 path も絶対パスへ解決し、上限10・同 path の先頭移動・
+  固有の一時ファイルからの置換を worker が所有する。古い項目は落とす。同時更新は最後の成功書込が残る。
+- 一覧は既存のステータス「詳細」メニューに置く。「開く」は `DocumentIntent::Open(path)` へ合流し、
+  専用の未保存判定を作らない。存在確認も既存 Project 読込 worker に合流する。無い項目の理由を表示し、
+  「一覧から外す」を worker へ渡せる。data-dir 無しではメニューを無効にし、一覧を読まず・書かない。
+  一覧の読取不能／壊れた JSON は空としてログに残す。書込失敗は通知とログのみで、プロジェクトの
+  保存成功・保存基準・使用 path を覆さない。
+- `musicvideo-persistence` が最近一覧と診断の単一 I/O owner。UI は channel 配送／try_recv と
+  表示だけを行い、一覧の read／write／stat、ログ・stderr の追記で待たない。
+  `<data_dir>/logs/musicvideo.log` は追記、起動時に **4 MiB 超**だけ `.1` へ1世代退避する。
+  自前 panic hook は同じ worker へ配送し `musicvideo-panic.log` に追記する。
+  最終ログ drain は `run_native` が終了した後に外側 guard が行う。data-dir 無しでは stderr のみ。
+  worker 切断・書込失敗は画面へ理由を通知する。再試行・復旧・IPC は追加していない。
+- 本体 lib の公開入口 `pin_companion_runtime()` は既存の `pin_running_version` に委譲する。
+  判定・shared lease は既存と同じで、**本体 crate の `CARGO_PKG_VERSION`** を使う。
+  起動最初に取得し、外側の Arc owner が GUI 終了後の診断 drain まで保持する。
+  runtime 外の開発／portable 配置は取得しない。失敗は型付き Blocked として空の画面で理由と
+  「mIV から開き直す」案内を表示し、入力・読込・プレビュー worker を開始しない。
+- mIV の設定／cache／logger 初期化入口 `mimageviewer::run()`、`Settings::load`、`data_dir::get`
+  を editor から呼ばない。今回の公開 lease 入口もそれらを初期化せず、exe に属する runtime lock
+  だけを操作する。既存の音声経路は `audio_decode`／`mvexport`、素材履歴は匿名一時 blob のまま。
+  editor 永続化の保存先は明示 data-dir の上記3ファイルに限定する。
+  一時 data-dir に置いた mIV `mimageviewer.log`／`panic.log`、settings.db／cache DB の sentinel が
+  不変であることも検査した。`%APPDATA%\mimageviewer` に触れていない。
+
+追加テストは **editor 18件（引数2・host handler8・worker8）＋本体 lease3件＝21件**。
+起動の誤りと案内の headless 描画、既存読込入口、一覧の採用／破棄／失敗／取消・保存成功と
+一覧書込失敗、共通 Open 意図、worker 切断、絶対パス／重複／上限／削除、壊れた一覧、
+data-dir 無し、原子的な同時書込、4 MiB 境界・追記・panic hook の実出力を検査した。
+panic hook は子の**テスト harness**で登録し、他テストの global hook を変えない。
+本体の lease3件は loose／portable／異なる版、shared lease の保持と解放、排他 lease 中の失敗を検査する。
+
+**21件すべて**が次の9変異のいずれかで失敗した。コンパイル失敗は検出に数えず、各変異を finally で復元。
+各テスト名の対応は `target/p4c-validation/mutations.json`、ログは同ディレクトリの `mutation-*.log`。
+行の検出数は重複を含み、和を追加テスト総数として扱わない。
+
+| 変異 | 壊した実装 | 検出した追加テスト数 |
+| --- | --- | ---: |
+| `args` | 引数解析が結果を返さない | 3 |
+| `startup_and_render` | 起動読込／エラー本文／編集 gate を壊す | 2 |
+| `recent_admission` | 読込採用・保存成功から一覧更新を外す | 2 |
+| `intent_and_diagnostics` | 一覧の Open 意図と状態ログの配送を外す | 2 |
+| `recent_io` | 重複除去・壊れた一覧のログ・一覧保存を外す | 5 |
+| `log_io` | data-dir 無しのファイルログ・退避・panic 配送・失敗通知を壊す | 4 |
+| `runtime_core_version` | 本体の版番号を editor の 0.1.0 に取り違える | 3 |
+| `runtime_layout` | runtime／版ディレクトリの判定を外す | 1 |
+| `disabled_recent` | 最近一覧の無効状態でも更新する | 1 |
+
+初回検証で最近一覧ボタンの追加による既存歌詞入力レイアウトの回帰を検出し、既存「詳細」メニュー内に
+移して既存テストを維持した。取消後の receiver は H2 の解放 worker が所有するため、送信失敗を期待する
+ハーネスを、取消前に完了を送って採用されないことを検査する形に修正した。
+Windows の原子的置換を40回連続競合させると native のアクセス拒否が返り得ることを確認した。
+一時 writer を閉じてから置換し、失敗は D10 の通知・ログ規則で扱う。ストレステストは全置換の成功を
+要求せず、成功書込が存在すること、完全な一覧だけが残ること、最後の成功書込と一時ファイルの解放を検査する。
+まれな書込失敗用の retry／復旧機構は作らない。正本の仕様との相違はない。
+
+復元後の指定 gate（全 Cargo コマンドで `MSBUILDDISABLENODEREUSE=1`）:
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo test -p musicvideo-editor` | **171 passed / 0 failed**（既存153＋追加18） |
+| `cargo check -p musicvideo-editor --features dev-tools --bins` | exit 0 |
+| `cargo test -p musicvideo-core -p musicvideo-ui` | core **115**＋経路監査 **2**＋UI **124 passed / 0 failed** |
+| `cargo test -p mimageviewer --lib runtime_` | **98 passed / 0 failed / 1 ignored**（既存 ignored を維持） |
+| `cargo fmt --check` | exit 0、`cargo fmt` 実行済み |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険 glyph **0** |
+| `cargo build --release -p musicvideo-editor --bin mimageviewer-musicvideo` | exit 0、製品 exe 生成（起動なし） |
+
+指定テストの合計は **510 passed / 0 failed / 1 ignored**。
+既存 H1／H2／H3／I1／L1〜L3／P4b-1〜4 のテストをすべて維持した。
+command／環境／exit／件数／所要時間とソース SHA-256 は `target/p4c-validation/gates.json`、
+通常ログは同ディレクトリの `editor,check,core-ui,runtime,fmt,glyphs,release.log`。
+製品成果物は `target/release/mimageviewer-musicvideo.exe`、25,366,016 bytes、
+SHA-256 `4be14e7a899807ca6dac6f13abc11dd607a6d54b9cf7e47ba9a588448e010ac7`。
+アプリ／エディタ GUI の起動、実機入力、コミットは行っていない。既存 untracked `out.mp4` は未変更。
+P4d／P4e／P4f は範囲外のまま。
+
+変更ファイル:
+
+- `crates/musicvideo-editor/src/lib.rs`、`app.rs`、`project_file.rs`。
+- `crates/musicvideo-editor/src/app/chrome.rs`、`document_intent.rs`、`startup.rs`、`startup_tests.rs`。
+- `crates/musicvideo-editor/src/startup.rs`、`persistence.rs`、`persistence/tests.rs`。
+- `src/lib.rs`、`src/runtime_cleanup.rs`、`docs/music-video-export-plan.md`。
+
 ## 4. データモデル（v1）
 
 ```
@@ -2833,7 +2932,7 @@ frame n → t = n/fps → evaluate → rasterize(CPU, rayon) → RGBA→NV12/YUV
 | **H3（H3a + H3b）** 非対話検証完了 | 解析の契約と製品画素の一致 | H3a の共有格子／view／timeline／較正に、H3b の実 preview と snapshot export の画素検証を接続。実機 GUI／音声 transport の検収とは区別する |
 | **P4a** ✅ | 方式の設計確定: 本書 D10 / D14〜D16 の独立レビュー | GPT-6.1 Sol / xhigh の設計レビューで blocking 指摘なし。**完了**（2026-10-09）: 3 回目で条件付き ACCEPT（残った P3 の文言は反映済み）。runtime 競合の割り切りはユーザー判断で確定 |
 | **P4b** 実装完了・実機確認待ち（P4b-1〜4 すべて独立レビュー ACCEPT、2026-10-14。上書きの競合は利用者が許容。5 分 1080p60 は完走済み・速度は参考値で静かな環境での再計測が残る。音・GUI の実機確認は利用者へ依頼） | ホストの製品化（D16。段の分け方は D16 の「P4b の設計」）: ラボを `crates/musicvideo-editor` へ移し、FFmpeg デコードへ統一、スナップショット入力の MP4 書き出し（モーダル・進捗・キャンセル）、未保存の編集の確認、音声スレッドが stream を所有する再生と f32 以外の出力形式対応 | **P4b-3（2026-10-14、未コミット）**: 指定ゲート 365 passed、追加 18 件すべての変異失敗確認、既存 editor 101 件維持。共通 snapshot／解析／較正／PCM view AAC／原子的公開／モーダル終端を接続し、製品 editor・通常 CLI・dev CLI の release build 成功。編集済み 5 分 1080p60 を dev CLI で 18,000 frames 完走、184.441 秒／1.6265x（背景 Codex 4 件あり、参考値）。詳細は D16 の P4b-3 記録。P4b-2 の実機の音・GUI・H3b は未確認。**P4b-4（2026-10-14、未コミット）**: session 所属の単一意図、歌詞の先行解決、保存後のフレーム末尾の再判定、先行読込の receiver 退役、新規、CancelClose／承認済み Close と書き出し中止の終端待ちを実装。指定ゲート **396 passed**、追加 **31 件**すべて変異失敗確認。初回レビュー REVISE の P2／P3 に対応し、LRC モーダルの実クリック回帰、Project／保存完了の両順序、歌詞取消と同フレームの旧完了を検査。今回 3 件追加・既存 1 件補強、各テストの変異失敗確認、指定テスト **399 passed**。詳細は D16 の P4b-4 記録。修正後の独立レビュー・実機確認・H3b は未完了 |
-| **P4c** | 起動引数と診断（D10）: `--audio` / `--project` / `--data-dir`、最近使ったプロジェクト、ログ・panic ログ、引数エラーの画面表示、runtime の shared lease と取得失敗の表示 | 引数解析の単体テスト。最近使った一覧: 壊れた JSON・無いファイル・上限・取消 / 失敗 / 破棄された読込を入れない・一覧の書込失敗で保存成功が覆らない。`--data-dir` 無しで最近一覧とファイルログを永続化しないこと。mIV の設定・DB・ログに触れないこと |
+| **P4c** 実装・指定自動 gate 完了／独立実装レビュー・実機検収待ち | 起動引数と診断（D10）: `--audio` / `--project` / `--data-dir`、最近使ったプロジェクト、ログ・panic ログ、引数エラーの画面表示、runtime の shared lease と取得失敗の表示 | **2026-10-14、未コミット差分**: editor18＋本体lease3の追加21件すべてで変異失敗を確認。指定gate **510 passed / 0 failed / 1 ignored**、fmt／glyph0／製品release build成功。data-dir無しで一覧・ファイルログなし、mIVの設定・DB・ログ未接触。実装者の非対話検証であり独立レビューではない。詳細は「P4c 実装記録」 |
 | **P4d** | mIV 側の入口: 音楽ビュー・音声ファイルの右クリックから「音楽ビデオを作成」でエディタを起動 | 起動は非同期で UI を止めない。exe 不在・起動失敗は理由付きで通知。閲覧側の退行なし |
 | **P4e** | 配布（下の表）: launcher 内包・runtime 展開・署名・portable 同梱・全 PE / VC runtime gate・build スクリプト・test-full 前提 | build-dist 相当の通しビルド。runtime 清掃: 旧版 core 終了後にエディタだけ稼働 / 起動との競合 / エディタ終了後の清掃。release のエディタ exe サイズとビルド時間を記録 |
 | **P4f** | 文書: マニュアル・製品ページ・keymap-spec（固定ショートカットの理由）・privacy（通信なし・保存先） | CLAUDE.md「コード修正時のドキュメント同時更新」 |

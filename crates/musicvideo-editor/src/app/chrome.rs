@@ -9,6 +9,8 @@ pub(super) enum ChromeAction {
     CancelIntent,
     StopExportAndClose,
     OpenProject,
+    OpenRecent(PathBuf),
+    RemoveRecent(PathBuf),
     SaveProject,
     SaveProjectAs,
     OpenAudio,
@@ -364,6 +366,7 @@ impl MusicVideoLabApp {
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
         menu_ui.menu_button(menu_label, |ui| {
+            self.host.draw_recent(ui, actions);
             ui.set_max_width((ui.ctx().content_rect().width() - 24.0).clamp(80.0, 500.0));
             ui.label(egui::RichText::new(self.project_caption()).strong())
                 .on_hover_text(self.project_caption());
@@ -570,6 +573,9 @@ impl MusicVideoLabApp {
     ) -> bool {
         let mut reset_perf = false;
         for action in actions {
+            if !self.editing_admitted() {
+                continue;
+            }
             if matches!(
                 action,
                 ChromeAction::SaveIntent
@@ -600,6 +606,12 @@ impl MusicVideoLabApp {
                 "modal input reached dispatch"
             );
             match action {
+                ChromeAction::OpenRecent(path) => {
+                    self.accept_document_intent(DocumentIntent::Open(path))
+                }
+                ChromeAction::RemoveRecent(path) => {
+                    self.send_host(crate::persistence::Command::Remove(path))
+                }
                 ChromeAction::NewProject => self.accept_document_intent(DocumentIntent::New),
                 ChromeAction::SaveIntent
                 | ChromeAction::DiscardIntent

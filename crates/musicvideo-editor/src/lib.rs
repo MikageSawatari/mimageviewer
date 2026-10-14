@@ -12,10 +12,12 @@ mod app;
 mod decode;
 mod export;
 mod mp4;
+mod persistence;
 mod playback;
 mod project;
 mod project_file;
 mod resource_blobs;
+mod startup;
 
 /// 開発用 bin の入口。診断の本体とテストは共通ホストに置く。
 pub fn run_dev() {
@@ -179,6 +181,35 @@ pub fn run() {
 }
 
 fn run_gui() -> eframe::Result {
+    // Acquire before creating the native window or starting document work.
+    let runtime = Arc::new(startup::RuntimeAdmission::acquire(
+        mimageviewer::pin_companion_runtime,
+    ));
+    // The outer owner outlives run_native and the final persistence drain.
+    let gui_runtime = Arc::clone(&runtime);
+    let args = match std::env::current_dir() {
+        Ok(cwd) => startup::parse_args(std::env::args_os().skip(1), &cwd),
+        Err(error) => startup::StartupArgs {
+            error: Some(format!("現在のフォルダーを取得できません: {error}")),
+            ..Default::default()
+        },
+    };
+    let services = persistence::Persistence::start(args.data_dir.clone());
+    let (services, _worker_guard, service_error) = match services {
+        Ok((services, guard)) => (Some(services), Some(guard), None),
+        Err(error) => (
+            None,
+            None,
+            Some(format!("診断ワーカーを開始できません: {error}")),
+        ),
+    };
+    let previous_hook = std::panic::take_hook();
+    if let Some(services) = &services {
+        std::panic::set_hook(Box::new(persistence::panic_hook(services.tx.clone())));
+        let _ = services.tx.send(persistence::Command::Log(
+            "音楽ビデオエディタを起動します".into(),
+        ));
+    }
     let font = project::load_default_font();
     let assets = project::create_assets(font.as_ref()).unwrap_or_else(|error| {
         eprintln!("{error}");
@@ -188,12 +219,22 @@ fn run_gui() -> eframe::Result {
         viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 820.0]),
         ..Default::default()
     };
-    eframe::run_native(
+    let result = eframe::run_native(
         "mIV 音楽ビデオ ラボ",
         options,
         Box::new(move |creation| {
             project::setup_egui(&creation.egui_ctx, font.as_ref());
-            Ok(Box::new(app::MusicVideoLabApp::new(assets)))
+            let mut app = app::MusicVideoLabApp::new(assets);
+            app.configure_startup(
+                args,
+                gui_runtime,
+                services,
+                service_error,
+                &creation.egui_ctx,
+            );
+            Ok(Box::new(app))
         }),
-    )
+    );
+    std::panic::set_hook(previous_hook);
+    result
 }

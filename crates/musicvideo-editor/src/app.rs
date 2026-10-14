@@ -9,6 +9,9 @@ mod mp4;
 mod mp4_tests;
 #[cfg(test)]
 mod parity_tests;
+mod startup;
+#[cfg(test)]
+mod startup_tests;
 
 use chrome::{ChromeAction, ToolbarState};
 use document_intent::{DocumentIntent, DocumentIntentState};
@@ -602,6 +605,7 @@ impl ExportState {
 }
 
 pub struct MusicVideoLabApp {
+    host: startup::Host,
     assets: Arc<Assets>,
     runtime_resources: RuntimeResourceState,
     resource_store: Option<ResourceBlobStore>,
@@ -669,6 +673,7 @@ impl MusicVideoLabApp {
             }
         };
         Self {
+            host: startup::Host::default(),
             assets,
             runtime_resources: RuntimeResourceState::Ready(ResourceManifest::default()),
             resource_store,
@@ -944,11 +949,15 @@ impl MusicVideoLabApp {
         let spawned = std::thread::Builder::new()
             .name("musicvideo-audio-load".to_owned())
             .spawn(move || {
-                let result = decode_audio(&worker_path, &worker_cancel).and_then(|audio| {
-                    let waveform = analyze_waveform(&audio, &worker_cancel)?;
-                    let lease = store.store_audio(worker_path.clone(), &audio)?;
-                    Ok((worker_path, Arc::new(audio), waveform, lease))
-                });
+                let result = decode_audio(&worker_path, &worker_cancel)
+                    .map_err(|error| {
+                        format!("音声を開けません ({}): {error}", worker_path.display())
+                    })
+                    .and_then(|audio| {
+                        let waveform = analyze_waveform(&audio, &worker_cancel)?;
+                        let lease = store.store_audio(worker_path.clone(), &audio)?;
+                        Ok((worker_path, Arc::new(audio), waveform, lease))
+                    });
                 if !worker_cancel.load(Ordering::Relaxed) {
                     let _ = tx.send(result);
                     worker_ctx.request_repaint();
@@ -1076,6 +1085,7 @@ impl MusicVideoLabApp {
             Some(Ok(Err(error))) => {
                 let pending = self.audio_pending.take().expect("audio request exists");
                 if !pending.cancel.load(Ordering::Relaxed) {
+                    self.host.notices.push(error.clone());
                     self.status = error;
                 }
                 self.start_queued_audio(pending.queued, ctx);
@@ -1317,6 +1327,17 @@ impl MusicVideoLabApp {
     /// Shared production frame boundary: all input and note_edit calls must
     /// precede completion admission. Headless input tests use this same entry.
     fn process_editor_frame(&mut self, ctx: &egui::Context) -> bool {
+        self.poll_host();
+        if !self.editing_admitted() {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                if let crate::startup::RuntimeAdmission::Blocked(error) = &*self.host.runtime {
+                    ui.heading("音楽ビデオエディタを開始できません");
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                }
+            });
+            return false;
+        }
+        self.draw_host_notices(ctx);
         self.handle_close_request(ctx);
         let input_enabled = !self.load_choice_open()
             && !self.intent_pending()
@@ -1383,6 +1404,7 @@ impl MusicVideoLabApp {
         self.poll_mp4_choice(ctx);
         self.sync_runtime_resources(ctx);
         self.finish_document_intent_frame(ctx);
+        self.log_status();
         let title = format!("{} - mIV 音楽ビデオ", self.project_caption());
         if title != self.last_sent_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
@@ -2043,6 +2065,14 @@ impl MusicVideoLabApp {
         if self.project_save_pending.is_some() {
             return;
         }
+        let path = match crate::project_file::absolute_lexical(&path) {
+            Ok(path) => path,
+            Err(error) => {
+                self.status = error;
+                self.project_save_failed();
+                return;
+            }
+        };
         let checkpoint = self.document.begin_save(path.clone(), &self.project);
         let project = checkpoint.project().clone();
         let worker_ctx = ctx.clone();
@@ -2106,6 +2136,7 @@ impl MusicVideoLabApp {
                 if let Some(next_path) = pending.queued {
                     self.spawn_project_load(next_path, ctx);
                 } else if !pending.cancel.load(Ordering::Relaxed) {
+                    self.host.notices.push(error.clone());
                     self.status = error;
                 }
             }
@@ -2137,6 +2168,7 @@ impl MusicVideoLabApp {
                     unreachable!()
                 };
                 let path = pending.checkpoint.path().to_path_buf();
+                self.remember_project(path.clone());
                 if self.document.complete_save(pending.checkpoint) {
                     self.status = format!("プロジェクトを保存しました: {}", path.display());
                 } else {
@@ -2168,6 +2200,7 @@ impl MusicVideoLabApp {
     }
 
     fn apply_loaded_project(&mut self, loaded: LoadedProject) {
+        self.remember_project(loaded.path.clone());
         self.document_intent = DocumentIntentState::Idle;
         self.cancel_pending_resource_loads();
         if let Some(worker) = &mut self.restore_worker {
@@ -2458,6 +2491,7 @@ pub(crate) fn load_project_bundle(
     store: &ResourceBlobStore,
     cancel: &AtomicBool,
 ) -> Result<LoadedProject, String> {
+    let path = crate::project_file::absolute_lexical(&path)?;
     let project = load_project(&path)?;
     let mut images = Vec::new();
     let mut resources = ResourceManifest::default();
@@ -2597,6 +2631,10 @@ fn unresolved_image_notices(
 
 impl eframe::App for MusicVideoLabApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.editing_admitted() {
+            self.process_editor_frame(ctx);
+            return;
+        }
         let update_started = Instant::now();
         self.poll_loads(ctx);
         self.poll_resource_restore();

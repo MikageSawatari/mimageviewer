@@ -40,6 +40,9 @@ impl MusicVideoLabApp {
     }
 
     pub(super) fn accept_document_intent(&mut self, intent: DocumentIntent) {
+        if !self.editing_admitted() {
+            return;
+        }
         if matches!(self.document_intent, DocumentIntentState::CloseApproved) {
             return;
         }

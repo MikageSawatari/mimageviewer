@@ -276,6 +276,16 @@ pub mod rotation_db;
 mod runtime_cleanup;
 #[cfg(any(not(feature = "portable"), test))]
 mod runtime_locks;
+
+/// Pin the launcher runtime containing this executable for a companion process.
+/// This uses the core package version and never initializes settings or logging.
+/// Keep the returned file alive until process exit. Loose/portable layouts return None.
+pub fn pin_companion_runtime() -> std::io::Result<Option<std::fs::File>> {
+    #[cfg(all(windows, not(feature = "portable")))]
+    return runtime_cleanup::pin_running_version();
+    #[cfg(not(all(windows, not(feature = "portable"))))]
+    Ok(None)
+}
 pub mod save_with_metadata;
 pub mod search_index_db;
 pub mod search_norm;
