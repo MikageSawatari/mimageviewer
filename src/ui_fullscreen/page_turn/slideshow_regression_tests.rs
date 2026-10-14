@@ -101,6 +101,7 @@ fn slideshow_regression_expired_outgoing_deadline_turns_and_preserves_full_displ
                         0,
                         &mut None,
                         None,
+                        false,
                         &mut operation,
                     );
                     assert!(matches!(operation, Some(ViewerOperationId::Pointer { .. })));

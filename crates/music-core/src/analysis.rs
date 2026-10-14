@@ -67,6 +67,9 @@ pub struct SpectrumAnalysis {
     pub bands: Vec<f32>,
     pub notes: Vec<f32>,
     pub note_min_midi: u8,
+    /// MIDI 21..=108 fundamental probabilities; None until pitch lookahead is decoded.
+    #[serde(default)]
+    pub pitch_probabilities: Option<Vec<f32>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -521,6 +524,7 @@ impl SpectrumAnalyzer {
                 bands: vec![0.0; bands],
                 notes: vec![0.0; SPECTRUM_NOTE_BANDS],
                 note_min_midi: SPECTRUM_NOTE_MIN_MIDI,
+                pitch_probabilities: None,
             };
         }
 
@@ -569,6 +573,7 @@ impl SpectrumAnalyzer {
             bands: values,
             notes,
             note_min_midi: SPECTRUM_NOTE_MIN_MIDI,
+            pitch_probabilities: None,
         }
     }
 
@@ -764,7 +769,7 @@ fn fft_power_window_into(
     let half = window_frames / 2;
     let scale = window.hann_sum.max(1.0);
     for (idx, value) in window.samples.iter().take(half + 1).enumerate() {
-        let mirror_scale = if idx == 0 || (window_frames % 2 == 0 && idx == half) {
+        let mirror_scale = if idx == 0 || (window_frames.is_multiple_of(2) && idx == half) {
             1.0
         } else {
             2.0
@@ -1074,19 +1079,19 @@ fn analyze_chroma_frame(
     let scale = hann_sum.max(1.0);
     let mut bass_chroma = [0.0_f32; TIMELINE_CHROMA_CLASSES];
     let mut chroma = [0.0_f32; TIMELINE_CHROMA_CLASSES];
-    for idx in 1..=half {
+    for (idx, sample) in samples.iter().enumerate().take(half + 1).skip(1) {
         let hz = idx as f32 * bin_hz;
         if hz > TIMELINE_CHROMA_MAX_HZ {
             break;
         }
-        let mirror_scale = if idx == half && window_frames % 2 == 0 {
+        let mirror_scale = if idx == half && window_frames.is_multiple_of(2) {
             1.0
         } else {
             2.0
         };
-        let amp = samples[idx].norm() * mirror_scale / scale;
+        let amp = sample.norm() * mirror_scale / scale;
         let compressed = amp.max(0.0).powf(0.62);
-        if hz >= TIMELINE_BASS_MIN_HZ && hz <= TIMELINE_BASS_MAX_HZ {
+        if (TIMELINE_BASS_MIN_HZ..=TIMELINE_BASS_MAX_HZ).contains(&hz) {
             let pc = pitch_class_for_hz(hz);
             let focus = 1.0 - smoothstep(210.0, TIMELINE_BASS_MAX_HZ, hz) * 0.35;
             bass_chroma[pc] += compressed * focus;
@@ -1224,7 +1229,7 @@ fn apply_novelty_scores(
     }
     let radius = (1.20 / bin_secs.max(0.01)).round().max(2.0) as usize;
     let mut raw = vec![0.0_f32; bins.len()];
-    for i in 0..bins.len() {
+    for (i, value) in raw.iter_mut().enumerate() {
         if i % ABORT_CHECK_STRIDE == 0 && should_abort() {
             return false;
         }
@@ -1243,7 +1248,7 @@ fn apply_novelty_scores(
             + (prev.bass - next.bass).abs() * 0.42
             + (prev.brightness - next.brightness).abs() * 0.72
             + (prev.transient_density - next.transient_density).abs() * 0.70;
-        raw[i] = smoothstep(0.12, 0.56, scalar_delta + chroma_delta + bass_delta);
+        *value = smoothstep(0.12, 0.56, scalar_delta + chroma_delta + bass_delta);
     }
     let smooth_radius = (0.12 / bin_secs.max(0.01)).round().max(1.0) as usize;
     for i in 0..bins.len() {

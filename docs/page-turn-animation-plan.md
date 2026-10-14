@@ -2728,3 +2728,40 @@ src/video/native_window_pump.rs:2012で使い捨てeditor子processのHWND通知
 単独失敗ログはtarget/A-1341-permission-r4-focus-isolated.log、vendorログは同prefixのvendor-*.log。
 修正・検証・隔離確認手順はtarget/A-1341-permission-r4-msg.txtに記録した。
 アプリ起動・停止、git add／commitは行っていない。
+
+### 26.19 pitch-lab/masterの結合（2026-10-14）
+
+§1.341は利用者の実機確認がすべてOKとの報告を受けた（利用者の観測）。
+PDF／ZIP、先頭表紙・末尾、slideshow、非focus wheel、末尾の組でのコピー／Ctrl+E／
+注釈／capture、「…」パネルを確認した。自動gateの結果とは区別する。
+masterの音楽HarmNet・配色メニューと計算高パネル修正を取り込む。音楽パネルのpointer所有と
+§1.341のoperation factは同じ入力受付に接続し、背面への入力抑止と出どころの記録を両立する。
+履歴・keymapの両機能の記述、音楽配色の転送除外とページめくりの転送対象を保持する。
+overflowは実本文の行間と高さ式を照合し、共通scroll_layout helperで十分な高さ／狭い高さ・
+末尾到達を検査する。bodyの行間が0の場合に環境の行間を高さへ加算しない。
+masterのmin_scrolled_height(0)を保持し、既定最小高64ptが狭い本文をはみ出す退行を防ぐ。
+next-book統合後の構成優先配置等の残件（§26.18）は引き続き残す。
+独立Sol/xhighの静的レビューはACCEPT。両stageの機能・文書と、ページめくりsubmissionの
+17テスト／音楽overflowの20テストを保持し、全callerの引数整合を確認した。
+通常／portable check、fmt、glyph0、diff checkとviewer_context_audit（単体36件＋実行）は成功。
+App size1、page_turn206、overflow58（1ignored）、設定転送28、keymap169、構成202、
+registry89、音楽UI82（2ignored）、配色6、低域6、music-core41、共通scroll helper3件が成功。
+高さ回帰は4状態×3画面高×ambient spacing0／13の24条件で成功した。
+UI snapshot177／構成editor snapshot10件も成功し、PNG更新は不要。
+Root／高さ十分のRoot／音楽メニュー／狭い音楽HUD／timeline調表示のPNGを目視した。
+test-fullはjobs1／threads4／SuppressCrashDialogsで一回実行し、exit101で終了した。
+本体は12990成功／0失敗／59ignored。前回失敗したnative HWND focus回帰も今回は成功。
+後続のbook_composition_editor_snapshots targetはfooter snapshot一件が進まず、
+CPU時間もほぼ増えないまま15分の検査予算を超えた。identity／開始時刻を確認した
+この検査processだけを16分7秒で終了し、--no-fail-fastで残りのworkspace targetを続行した。
+利用者のcoreは停止していない。原因は未確定で、assertionや製品コードは変更していない。
+同じpack-build-tools binaryの該当caseはexact単独で6.29秒成功したが、全体成功の代用にはしない。
+workspace64 targetは完了サマリー分のみ14247成功／0 assertion失敗／66ignored、
+構成editor一targetはINCOMPLETE（その完了件数は不明）。省略されたvendor3 gateを補足し、
+egui25／egui-wgpu11／eframe18成功。合計67 target中66完了、14301成功／0 assertion失敗／66ignored。
+全体gateは未完了とし、PASSとは記録しない。全target一覧はtarget/A-1341-pitch-merge-r5-full-results.txt、
+通しログは同prefixのfull.log、単独確認はeditor-isolated.log。test-fullの二回目は実行していない。
+通常build-dev -PreserveRuntimeはexit0。core／Remote／EPUB worker、runtime4／PE3の検査が成功。
+coreは2026-10-14 15:37:21生成、329141248 bytes、FileVersion=4.6.0.0。
+アプリ起動・停止、git add／commitは行っていない。競合マーカーは解消済みで、
+indexのUUは設計担当のgit addまで残す。今回の解消方針・確認手順はtarget/A-1341-pitch-merge-r5-msg.txt。

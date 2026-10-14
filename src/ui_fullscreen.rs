@@ -5506,6 +5506,7 @@ struct FsOverflowPanelView {
     root_rows: Vec<FsOverflowPanelRow>,
     navigator_corner: FullscreenNavigatorCorner,
     shift: SpreadShiftHudView,
+    music_note_color_scheme: crate::music_note_color::MusicNoteColorScheme,
     composition_available: bool,
     composition_managed: bool,
 }
@@ -5549,6 +5550,7 @@ enum FsOverflowPanelAction {
     JumpShiftAnchor(usize),
     ClearShift,
     SetShiftMemory(bool),
+    SetMusicNoteColor(crate::music_note_color::MusicNoteColorScheme),
     EditComposition,
 }
 
@@ -5572,6 +5574,7 @@ fn fs_overflow_panel_body_row_count(state: FsOverflowPanelState) -> usize {
         FsOverflowPanelState::Root => FullscreenOverflowItemId::fixed_order().len() + 1,
         FsOverflowPanelState::NavigatorPosition => 1 + FullscreenNavigatorCorner::ALL.len(),
         FsOverflowPanelState::SpreadAdjustment => 6,
+        FsOverflowPanelState::MusicNoteColor => 2,
     }
 }
 
@@ -5600,6 +5603,182 @@ fn fs_overflow_panel_rect(
     ))
 }
 
+/// Captured before keyboard handling; a begun stream outlives the menu that owned it.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct MusicOverflowFrameInput {
+    owns_pointer: bool,
+    dismiss: bool,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+struct MusicTimelinePanProbe {
+    clip: egui::Rect,
+    pointer: Option<egui::Pos2>,
+    delta: egui::Vec2,
+    middle: bool,
+    enabled: bool,
+    bins: usize,
+    pending_scroll: f32,
+    manual_scroll: bool,
+    auto_scrolled: bool,
+    offset: egui::Vec2,
+    content: egui::Vec2,
+}
+
+#[derive(Clone, Debug, Default)]
+enum MusicOverflowPointerStream {
+    #[default]
+    Idle,
+    Captured {
+        context: crate::app::ViewerContextId,
+        buttons: u8,
+        touches: Vec<(egui::TouchDeviceId, egui::TouchId)>,
+    },
+}
+
+impl MusicOverflowPointerStream {
+    fn update(
+        &mut self,
+        event: &egui::Event,
+        context: crate::app::ViewerContextId,
+        panel_open: bool,
+    ) {
+        let start = matches!(
+            event,
+            egui::Event::PointerButton { pressed: true, .. }
+                | egui::Event::Touch {
+                    phase: egui::TouchPhase::Start,
+                    ..
+                }
+        );
+        if matches!(self, Self::Idle) && panel_open && start {
+            *self = Self::Captured {
+                context,
+                buttons: 0,
+                touches: Vec::new(),
+            };
+        }
+        if let Self::Captured {
+            buttons, touches, ..
+        } = self
+        {
+            match event {
+                egui::Event::PointerButton {
+                    button, pressed, ..
+                } => {
+                    let mask = 1 << (*button as u8);
+                    if *pressed {
+                        *buttons |= mask;
+                    } else {
+                        *buttons &= !mask;
+                    }
+                }
+                egui::Event::Touch {
+                    device_id,
+                    id,
+                    phase,
+                    ..
+                } => {
+                    let contact = (*device_id, *id);
+                    match phase {
+                        egui::TouchPhase::Start if !touches.contains(&contact) => {
+                            touches.push(contact)
+                        }
+                        egui::TouchPhase::End | egui::TouchPhase::Cancel => {
+                            touches.retain(|touch| *touch != contact)
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+            if *buttons == 0 && touches.is_empty() {
+                *self = Self::Idle;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct MusicOverflowInputRouter {
+    stream: MusicOverflowPointerStream,
+    frame: Option<(
+        u64,
+        u64,
+        crate::app::ViewerContextId,
+        MusicOverflowFrameInput,
+    )>,
+}
+
+fn music_overflow_frame_input(
+    ctx: &egui::Context,
+    full_rect: egui::Rect,
+    context: crate::app::ViewerContextId,
+    music_active: bool,
+    panel_open: bool,
+) -> MusicOverflowFrameInput {
+    let id = egui::Id::new(("music_overflow_input_router", ctx.viewport_id()));
+    let mut router = ctx
+        .data(|data| data.get_temp::<MusicOverflowInputRouter>(id))
+        .unwrap_or_default();
+    let frame_nr = ctx.cumulative_frame_nr();
+    let root_frame_nr = ctx.cumulative_frame_nr_for(egui::ViewportId::ROOT);
+    if let Some((frame, root_frame, owner, input)) = router.frame {
+        if frame == frame_nr && root_frame == root_frame_nr && owner == context {
+            return input;
+        }
+        // Normal active music is drawn synchronously in each ROOT update, including its
+        // immediate child viewport. An intervening ROOT frame without this surface ends its
+        // input lease; child frame counters alone stop advancing when a window is closed.
+        // Parked-live cannot capture this menu. Do not reuse this lease for future R4 deferred UI.
+        if root_frame_nr > root_frame.saturating_add(1) {
+            router.stream = MusicOverflowPointerStream::Idle;
+        }
+    }
+    let input = ctx.input(|input| {
+        if !music_active || !input.focused {
+            router.stream = MusicOverflowPointerStream::Idle;
+            return MusicOverflowFrameInput::default();
+        }
+        let captured = matches!(router.stream, MusicOverflowPointerStream::Captured { context: owner, .. } if owner == context);
+        if !captured { router.stream = MusicOverflowPointerStream::Idle; }
+        let rect = fs_overflow_panel_rect(full_rect, FsOverflowPanelState::MusicNoteColor);
+        let inside = rect.is_some_and(|rect| input.pointer.hover_pos().is_some_and(|pos| rect.contains(pos)));
+        let touch_inside = rect.is_some_and(|rect| input.events.iter().any(|event| {
+            matches!(event, egui::Event::Touch { pos, .. } if rect.contains(*pos))
+        }));
+        let outside_click = panel_open && input.pointer.any_click() && !inside;
+        // Reduce ordered edges: the last release ends ownership before a new press in the
+        // same frame. A closed menu must not adopt that new backing stream on later frames.
+        let mut owned_stream = captured;
+        for event in &input.events {
+            router.stream.update(event, context, panel_open);
+            owned_stream |= matches!(router.stream, MusicOverflowPointerStream::Captured { .. });
+        }
+        // Current egui levels also clear lost terminal edges. PointerGone alone is not
+        // cancellation: a held drag may leave and reenter the window.
+        if let MusicOverflowPointerStream::Captured { buttons, touches, .. } = &mut router.stream {
+            for button in [egui::PointerButton::Primary, egui::PointerButton::Secondary,
+                egui::PointerButton::Middle, egui::PointerButton::Extra1, egui::PointerButton::Extra2] {
+                if !input.pointer.button_down(button) { *buttons &= !(1 << (button as u8)); }
+            }
+            if !input.any_touches() { touches.clear(); }
+            if *buttons == 0 && touches.is_empty() { router.stream = MusicOverflowPointerStream::Idle; }
+        }
+        MusicOverflowFrameInput {
+            owns_pointer: owned_stream || (panel_open && (inside || touch_inside || input.pointer.any_down() || input.pointer.any_pressed() || outside_click)),
+            dismiss: outside_click,
+        }
+    });
+    // A release/cancel frame replays its ownership across egui layout passes, but the next frame
+    // starts Idle. Context changes and leaving music mode cancel without reviving an old owner.
+    router.frame = Some((frame_nr, root_frame_nr, context, input));
+    ctx.data_mut(|data| data.insert_temp(id, router));
+    input
+}
+
+#[cfg(test)]
 fn append_fs_overflow_touch_exclusion(
     excluded: &mut Vec<egui::Rect>,
     full_rect: egui::Rect,
@@ -5732,6 +5911,7 @@ fn draw_fs_overflow_panel_surface(
         FsOverflowPanelState::Root => "その他の機能",
         FsOverflowPanelState::NavigatorPosition => "ナビゲータ位置",
         FsOverflowPanelState::SpreadAdjustment => "見開きの調整",
+        FsOverflowPanelState::MusicNoteColor => "音名の色",
         FsOverflowPanelState::Closed => return None,
     };
     child.painter().text(
@@ -5793,9 +5973,17 @@ fn draw_fs_overflow_panel_surface(
         body.spacing_mut().item_spacing.y = 0.0;
         let output = egui::ScrollArea::vertical()
             .id_salt("fs_overflow_panel_body")
+            .min_scrolled_height(0.0)
             .max_height(body_rect.height())
             .auto_shrink([false, false])
             .show(&mut body, |ui| {
+                #[cfg(test)]
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(
+                        egui::Id::new("fs_overflow_scroll_test_clip"),
+                        ui.clip_rect(),
+                    );
+                });
                 ui.set_width(ui.available_width());
                 match view.state {
                     FsOverflowPanelState::Root => {
@@ -5875,6 +6063,16 @@ fn draw_fs_overflow_panel_surface(
                         if ui.add_enabled(view.shift.enabled, egui::Checkbox::new(&mut memory, "見開きの調整を本ごとに記憶する"))
                             .on_hover_text("全冊に効く設定です。OFFでも保存済み調整は保持し、次回ONの再入場で使います").changed() {
                             action = Some(FsOverflowPanelAction::SetShiftMemory(memory));
+                        }
+                    }
+                    FsOverflowPanelState::MusicNoteColor => {
+                        use crate::music_note_color::MusicNoteColorScheme;
+                        for (scheme, label) in [(MusicNoteColorScheme::Fifths, "5 度圏順"), (MusicNoteColorScheme::Chromatic, "半音順")] {
+                            let selected = scheme == view.music_note_color_scheme;
+                            if draw_fs_overflow_panel_row(ui, ("music_note_color", scheme == MusicNoteColorScheme::Fifths), label,
+                                if selected { "選択中" } else { "" }, selected, true, None).clicked() {
+                                action = Some(FsOverflowPanelAction::SetMusicNoteColor(scheme));
+                            }
                         }
                     }
                     FsOverflowPanelState::Closed => {}
@@ -7118,6 +7316,15 @@ fn music_panel_open_state_after_reach(
         }
         MusicPanelReachSource::TouchHandle => crate::ui_helpers::open_side_panel_by_touch(state),
     }
+}
+
+const MUSIC_VIEW_BACKING_UI_SALT: &str = "music_view_backing";
+
+/// UiBuilder hashes the salt into an Id before mixing it with its parent's Id.
+/// Input consumers must use that same route rather than hashing the raw string
+/// directly into the parent, so they observe the actual child popup/widget IDs.
+fn music_view_backing_ui_id(parent: egui::Id) -> egui::Id {
+    parent.with(egui::Id::new(MUSIC_VIEW_BACKING_UI_SALT))
 }
 
 // HUD drawing and widget hit areas share the original viewport, never the
@@ -9973,6 +10180,283 @@ pub(crate) struct MusicChromeViewState {
     pub(crate) show_close: bool,
 }
 
+#[cfg(windows)]
+fn draw_music_top_chrome_surface(
+    ui: &mut egui::Ui,
+    top_rect: egui::Rect,
+    fs_idx: usize,
+    chrome: &MusicChromeViewState,
+    fg: egui::Color32,
+    accent: egui::Color32,
+    interactive: bool,
+    show_overflow: bool,
+    overflow_open: bool,
+    side_panel_mode: crate::settings::FsSidePanelMode,
+    keymap: &crate::keymap::Keymap,
+) -> MusicTopChromeResponse {
+    use crate::video::native_presenter::overlay_draw::{
+        draw_overlay_close_icon, draw_overlay_video_icon, draw_overlay_vst3_top_icon,
+        draw_overlay_window_toggle_icon,
+    };
+
+    let painter = ui.painter_at(top_rect);
+    painter.rect_filled(
+        top_rect,
+        0.0,
+        egui::Color32::from_rgba_unmultiplied(0, 0, 0, if interactive { 90 } else { 132 }),
+    );
+    let fg = App::music_chrome_dim_color(fg, interactive);
+    let accent = App::music_chrome_dim_color(accent, interactive);
+
+    let compact = show_overflow && top_rect.width() < 520.0;
+    let button_size = if compact {
+        20.0
+    } else {
+        MUSIC_CHROME_TOP_BUTTON_SIZE
+    };
+    let button_gap = if compact {
+        4.0
+    } else {
+        MUSIC_CHROME_TOP_BUTTON_GAP
+    };
+    let top_btn_cy = top_rect.center().y;
+    let top_btn_bg = |hovered: bool| {
+        if interactive && hovered {
+            accent
+        } else {
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, if interactive { 22 } else { 16 })
+        }
+    };
+    let sense = App::music_chrome_click_sense(interactive);
+    let mut response = MusicTopChromeResponse::default();
+    let mut top_rx = top_rect.right() - MUSIC_CHROME_RIGHT_MARGIN;
+    let mut first_right_control_left = top_rx;
+
+    if chrome.show_close {
+        let rect = App::music_chrome_close_slot_rect(top_rect);
+        first_right_control_left = first_right_control_left.min(rect.left());
+        top_rx = rect.left() - button_gap;
+        let resp = ui
+            .interact(
+                rect,
+                ui.id().with(("music_top_close", fs_idx)),
+                egui::Sense::click(),
+            )
+            .hover_tip_dark("閉じる".to_string());
+        painter.rect_filled(rect, 4.0, top_btn_bg(resp.hovered()));
+        draw_overlay_close_icon(&painter, rect);
+        App::paint_music_chrome_button_dim(&painter, rect, interactive);
+        response.close_clicked = resp.clicked();
+    }
+
+    if show_overflow {
+        let rect = egui::Rect::from_center_size(
+            egui::pos2(top_rx - button_size * 0.5, top_btn_cy),
+            egui::vec2(button_size, button_size),
+        );
+        first_right_control_left = first_right_control_left.min(rect.left());
+        top_rx -= button_size + button_gap;
+        let resp = ui
+            .interact(rect, ui.id().with(("music_top_overflow", fs_idx)), sense)
+            .hover_tip_dark("音名の色".to_string());
+        painter.rect_filled(
+            rect,
+            4.0,
+            if overflow_open {
+                accent
+            } else {
+                top_btn_bg(resp.hovered())
+            },
+        );
+        for offset in [-0.22, 0.0, 0.22] {
+            painter.circle_filled(
+                rect.center() + egui::vec2(rect.width() * offset, 0.0),
+                1.5,
+                fg,
+            );
+        }
+        response.overflow_clicked = interactive && resp.clicked();
+        #[cfg(test)]
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(egui::Id::new("music_overflow_button_rect"), rect));
+    }
+
+    if chrome.show_window_toggle {
+        let rect = egui::Rect::from_center_size(
+            egui::pos2(top_rx - button_size * 0.5, top_btn_cy),
+            egui::vec2(button_size, button_size),
+        );
+        first_right_control_left = first_right_control_left.min(rect.left());
+        top_rx -= button_size + button_gap;
+        let resp = ui
+            .interact(rect, ui.id().with(("music_top_window", fs_idx)), sense)
+            .hover_tip_dark("ウィンドウ / 全画面 切り替え".to_string());
+        painter.rect_filled(rect, 4.0, top_btn_bg(resp.hovered()));
+        draw_overlay_window_toggle_icon(&painter, rect);
+        App::paint_music_chrome_button_dim(&painter, rect, interactive);
+        response.window_clicked = interactive && resp.clicked();
+    }
+
+    // 左右パネル表示モード。ParkedLive でも同じ slot を描画してボタン位置を維持する。
+    // 非操作 chrome では他のボタンと同様に減光し、クリック結果だけを無効化する。
+    if chrome.show_side_panel_mode {
+        let rect = egui::Rect::from_center_size(
+            egui::pos2(top_rx - button_size * 0.5, top_btn_cy),
+            egui::vec2(button_size, button_size),
+        );
+        first_right_control_left = first_right_control_left.min(rect.left());
+        top_rx -= button_size + button_gap;
+        let side_panel_mode = side_panel_mode.normalized();
+        let click_to_show = side_panel_mode == crate::settings::FsSidePanelMode::ClickToShow;
+        let tip = format!(
+            "パネル表示: {}\nクリックで「{}」に切り替え",
+            side_panel_mode.label(),
+            side_panel_mode.toggled().label()
+        );
+        let resp = ui
+            .interact(
+                rect,
+                ui.id().with(("music_top_side_panel_mode", fs_idx)),
+                sense,
+            )
+            .hover_tip_dark(keymap.chord_list_bracket_label(&tip, KeyAction::FsToggleMetadata));
+        let button_bg = if click_to_show && !(interactive && resp.hovered()) {
+            egui::Color32::from_rgba_unmultiplied(45, 100, 170, 180)
+        } else {
+            top_btn_bg(resp.hovered())
+        };
+        painter.rect_filled(rect, 4.0, button_bg);
+        if click_to_show {
+            draw_info_click_icon(&painter, rect.center(), rect.width() * 0.29);
+        } else {
+            draw_info_icon(&painter, rect.center(), rect.width() * 0.29);
+        }
+        App::paint_music_chrome_button_dim(&painter, rect, interactive);
+        response.side_panel_mode_clicked = interactive && resp.clicked();
+    }
+
+    if chrome.show_back_to_video {
+        let rect = egui::Rect::from_center_size(
+            egui::pos2(top_rx - button_size * 0.5, top_btn_cy),
+            egui::vec2(button_size, button_size),
+        );
+        first_right_control_left = first_right_control_left.min(rect.left());
+        top_rx -= button_size + button_gap;
+        let back_tip = match keymap.first_chord_label(KeyAction::VideoToggleAudioMode) {
+            Some(chord) => format!("動画表示に戻る ({chord})"),
+            None => "動画表示に戻る".to_string(),
+        };
+        let resp = ui
+            .interact(
+                rect,
+                ui.id().with(("music_top_back_to_video", fs_idx)),
+                sense,
+            )
+            .hover_tip_dark(back_tip);
+        painter.rect_filled(rect, 4.0, top_btn_bg(resp.hovered()));
+        draw_overlay_video_icon(&painter, rect);
+        App::paint_music_chrome_button_dim(&painter, rect, interactive);
+        response.back_to_video_clicked = interactive && resp.clicked();
+    }
+
+    let vst_left = if chrome.show_vst {
+        let rect = egui::Rect::from_center_size(
+            egui::pos2(top_rx - button_size * 0.5, top_btn_cy),
+            egui::vec2(button_size, button_size),
+        );
+        first_right_control_left = first_right_control_left.min(rect.left());
+        top_rx -= button_size + button_gap;
+        let resp = ui
+            .interact(rect, ui.id().with(("music_top_vst", fs_idx)), sense)
+            .hover_tip_dark("VST プラグイン画面を開く".to_string());
+        painter.rect_filled(rect, 4.0, top_btn_bg(resp.hovered()));
+        draw_overlay_vst3_top_icon(&painter, rect);
+        App::paint_music_chrome_button_dim(&painter, rect, interactive);
+        response.vst_clicked = interactive && resp.clicked();
+        top_rx
+    } else {
+        top_rx
+    };
+
+    if chrome.show_row_stepper {
+        let btn = if compact { 20.0 } else { 26.0 };
+        let gap = if compact { 4.0 } else { 6.0 };
+        let label_w = if compact { 50.0 } else { 84.0 };
+        let group_w = btn * 2.0 + gap * 2.0 + label_w;
+        let cx = vst_left - (if compact { 4.0 } else { 20.0 }) - group_w * 0.5;
+        let cy = top_rect.center().y;
+        first_right_control_left = first_right_control_left.min(cx - group_w * 0.5);
+        let minus_rect = egui::Rect::from_center_size(
+            egui::pos2(cx - group_w * 0.5 + btn * 0.5, cy),
+            egui::vec2(btn, btn),
+        );
+        let plus_rect = egui::Rect::from_center_size(
+            egui::pos2(cx + group_w * 0.5 - btn * 0.5, cy),
+            egui::vec2(btn, btn),
+        );
+        let minus_resp = ui.interact(minus_rect, ui.id().with(("music_row_minus", fs_idx)), sense);
+        let plus_resp = ui.interact(plus_rect, ui.id().with(("music_row_plus", fs_idx)), sense);
+        painter.rect_filled(minus_rect, 4.0, top_btn_bg(minus_resp.hovered()));
+        let m = minus_rect.center();
+        painter.line_segment(
+            [
+                egui::pos2(m.x - btn * 0.22, m.y),
+                egui::pos2(m.x + btn * 0.22, m.y),
+            ],
+            egui::Stroke::new(2.0, fg),
+        );
+        App::paint_music_chrome_button_dim(&painter, minus_rect, interactive);
+        painter.text(
+            egui::pos2(cx, cy),
+            egui::Align2::CENTER_CENTER,
+            format!(
+                "Row {}",
+                crate::ui_music_timeline::format_row_secs(chrome.row_secs)
+            ),
+            egui::FontId::proportional(if compact { 10.0 } else { 13.0 }),
+            fg,
+        );
+        painter.rect_filled(plus_rect, 4.0, top_btn_bg(plus_resp.hovered()));
+        let p = plus_rect.center();
+        painter.line_segment(
+            [
+                egui::pos2(p.x - btn * 0.22, p.y),
+                egui::pos2(p.x + btn * 0.22, p.y),
+            ],
+            egui::Stroke::new(2.0, fg),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(p.x, p.y - btn * 0.22),
+                egui::pos2(p.x, p.y + btn * 0.22),
+            ],
+            egui::Stroke::new(2.0, fg),
+        );
+        App::paint_music_chrome_button_dim(&painter, plus_rect, interactive);
+        if interactive && plus_resp.clicked() {
+            response.row_delta = -1;
+        }
+        if interactive && minus_resp.clicked() {
+            response.row_delta = 1;
+        }
+    }
+
+    let mut title_clip = App::music_chrome_title_clip_rect(top_rect, first_right_control_left);
+    if compact {
+        title_clip.max.x =
+            (first_right_control_left - 4.0).clamp(title_clip.left(), top_rect.right());
+    }
+    painter.with_clip_rect(title_clip).text(
+        egui::pos2(top_rect.left() + 14.0, top_rect.top() + 20.0),
+        egui::Align2::LEFT_CENTER,
+        &chrome.title,
+        egui::FontId::proportional(15.0),
+        fg,
+    );
+
+    response
+}
+
 // 純データ (bool/i32 のみ)。非 Windows でも draw_fs_music_view が
 // draw_music_top_chrome stub の戻り値として使うため cfg(windows) を付けない。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -9982,6 +10466,7 @@ struct MusicTopChromeResponse {
     side_panel_mode_clicked: bool,
     back_to_video_clicked: bool,
     vst_clicked: bool,
+    overflow_clicked: bool,
     row_delta: i32,
 }
 
@@ -17564,6 +18049,7 @@ pub fn draw_spread_shift_hud_snapshot_fixture(ui: &mut egui::Ui, unresolved: boo
         root_rows: Vec::new(),
         navigator_corner: FullscreenNavigatorCorner::BottomRight,
         shift,
+        music_note_color_scheme: Default::default(),
         composition_available: false,
         composition_managed: false,
     };
@@ -17586,6 +18072,7 @@ pub fn draw_composition_editor_hud_snapshot_fixture(
         shift: SpreadShiftHudView::default(),
         composition_available: available,
         composition_managed: managed,
+        music_note_color_scheme: Default::default(),
     };
     let rect = egui::Rect::from_min_size(
         ui.max_rect().min,
@@ -20677,6 +21164,7 @@ impl App {
         _fg: egui::Color32,
         _accent: egui::Color32,
         _interactive: bool,
+        _show_overflow: bool,
     ) -> MusicTopChromeResponse {
         MusicTopChromeResponse::default()
     }
@@ -20691,233 +21179,21 @@ impl App {
         fg: egui::Color32,
         accent: egui::Color32,
         interactive: bool,
+        show_overflow: bool,
     ) -> MusicTopChromeResponse {
-        use crate::video::native_presenter::overlay_draw::{
-            draw_overlay_close_icon, draw_overlay_video_icon, draw_overlay_vst3_top_icon,
-            draw_overlay_window_toggle_icon,
-        };
-
-        let painter = ui.painter_at(top_rect);
-        painter.rect_filled(
+        draw_music_top_chrome_surface(
+            ui,
             top_rect,
-            0.0,
-            egui::Color32::from_rgba_unmultiplied(0, 0, 0, if interactive { 90 } else { 132 }),
-        );
-        let fg = Self::music_chrome_dim_color(fg, interactive);
-        let accent = Self::music_chrome_dim_color(accent, interactive);
-
-        let top_btn_cy = top_rect.center().y;
-        let top_btn_bg = |hovered: bool| {
-            if interactive && hovered {
-                accent
-            } else {
-                egui::Color32::from_rgba_unmultiplied(
-                    255,
-                    255,
-                    255,
-                    if interactive { 22 } else { 16 },
-                )
-            }
-        };
-        let sense = Self::music_chrome_click_sense(interactive);
-        let mut response = MusicTopChromeResponse::default();
-        let mut top_rx = top_rect.right() - MUSIC_CHROME_RIGHT_MARGIN;
-        let mut first_right_control_left = top_rx;
-
-        if chrome.show_close {
-            let rect = Self::music_chrome_close_slot_rect(top_rect);
-            first_right_control_left = first_right_control_left.min(rect.left());
-            top_rx = rect.left() - MUSIC_CHROME_TOP_BUTTON_GAP;
-            let resp = ui
-                .interact(
-                    rect,
-                    ui.id().with(("music_top_close", fs_idx)),
-                    egui::Sense::click(),
-                )
-                .hover_tip_dark("閉じる".to_string());
-            painter.rect_filled(rect, 4.0, top_btn_bg(resp.hovered()));
-            draw_overlay_close_icon(&painter, rect);
-            Self::paint_music_chrome_button_dim(&painter, rect, interactive);
-            response.close_clicked = resp.clicked();
-        }
-
-        if chrome.show_window_toggle {
-            let rect = egui::Rect::from_center_size(
-                egui::pos2(top_rx - MUSIC_CHROME_TOP_BUTTON_SIZE * 0.5, top_btn_cy),
-                egui::vec2(MUSIC_CHROME_TOP_BUTTON_SIZE, MUSIC_CHROME_TOP_BUTTON_SIZE),
-            );
-            first_right_control_left = first_right_control_left.min(rect.left());
-            top_rx -= MUSIC_CHROME_TOP_BUTTON_SIZE + MUSIC_CHROME_TOP_BUTTON_GAP;
-            let resp = ui
-                .interact(rect, ui.id().with(("music_top_window", fs_idx)), sense)
-                .hover_tip_dark("ウィンドウ / 全画面 切り替え".to_string());
-            painter.rect_filled(rect, 4.0, top_btn_bg(resp.hovered()));
-            draw_overlay_window_toggle_icon(&painter, rect);
-            Self::paint_music_chrome_button_dim(&painter, rect, interactive);
-            response.window_clicked = interactive && resp.clicked();
-        }
-
-        // 左右パネル表示モード。ParkedLive でも同じ slot を描画してボタン位置を維持する。
-        // 非操作 chrome では他のボタンと同様に減光し、クリック結果だけを無効化する。
-        if chrome.show_side_panel_mode {
-            let rect = egui::Rect::from_center_size(
-                egui::pos2(top_rx - MUSIC_CHROME_TOP_BUTTON_SIZE * 0.5, top_btn_cy),
-                egui::vec2(MUSIC_CHROME_TOP_BUTTON_SIZE, MUSIC_CHROME_TOP_BUTTON_SIZE),
-            );
-            first_right_control_left = first_right_control_left.min(rect.left());
-            top_rx -= MUSIC_CHROME_TOP_BUTTON_SIZE + MUSIC_CHROME_TOP_BUTTON_GAP;
-            let side_panel_mode = self.settings.fullscreen_side_panel_mode.normalized();
-            let click_to_show = side_panel_mode == crate::settings::FsSidePanelMode::ClickToShow;
-            let tip = format!(
-                "パネル表示: {}\nクリックで「{}」に切り替え",
-                side_panel_mode.label(),
-                side_panel_mode.toggled().label()
-            );
-            let resp = ui
-                .interact(
-                    rect,
-                    ui.id().with(("music_top_side_panel_mode", fs_idx)),
-                    sense,
-                )
-                .hover_tip_dark(
-                    self.keymap
-                        .chord_list_bracket_label(&tip, KeyAction::FsToggleMetadata),
-                );
-            let button_bg = if click_to_show && !(interactive && resp.hovered()) {
-                egui::Color32::from_rgba_unmultiplied(45, 100, 170, 180)
-            } else {
-                top_btn_bg(resp.hovered())
-            };
-            painter.rect_filled(rect, 4.0, button_bg);
-            if click_to_show {
-                draw_info_click_icon(&painter, rect.center(), rect.width() * 0.29);
-            } else {
-                draw_info_icon(&painter, rect.center(), rect.width() * 0.29);
-            }
-            Self::paint_music_chrome_button_dim(&painter, rect, interactive);
-            response.side_panel_mode_clicked = interactive && resp.clicked();
-        }
-
-        if chrome.show_back_to_video {
-            let rect = egui::Rect::from_center_size(
-                egui::pos2(top_rx - MUSIC_CHROME_TOP_BUTTON_SIZE * 0.5, top_btn_cy),
-                egui::vec2(MUSIC_CHROME_TOP_BUTTON_SIZE, MUSIC_CHROME_TOP_BUTTON_SIZE),
-            );
-            first_right_control_left = first_right_control_left.min(rect.left());
-            top_rx -= MUSIC_CHROME_TOP_BUTTON_SIZE + MUSIC_CHROME_TOP_BUTTON_GAP;
-            let back_tip = match self
-                .keymap
-                .first_chord_label(KeyAction::VideoToggleAudioMode)
-            {
-                Some(chord) => format!("動画表示に戻る ({chord})"),
-                None => "動画表示に戻る".to_string(),
-            };
-            let resp = ui
-                .interact(
-                    rect,
-                    ui.id().with(("music_top_back_to_video", fs_idx)),
-                    sense,
-                )
-                .hover_tip_dark(back_tip);
-            painter.rect_filled(rect, 4.0, top_btn_bg(resp.hovered()));
-            draw_overlay_video_icon(&painter, rect);
-            Self::paint_music_chrome_button_dim(&painter, rect, interactive);
-            response.back_to_video_clicked = interactive && resp.clicked();
-        }
-
-        let vst_left = if chrome.show_vst {
-            let rect = egui::Rect::from_center_size(
-                egui::pos2(top_rx - MUSIC_CHROME_TOP_BUTTON_SIZE * 0.5, top_btn_cy),
-                egui::vec2(MUSIC_CHROME_TOP_BUTTON_SIZE, MUSIC_CHROME_TOP_BUTTON_SIZE),
-            );
-            first_right_control_left = first_right_control_left.min(rect.left());
-            top_rx -= MUSIC_CHROME_TOP_BUTTON_SIZE + MUSIC_CHROME_TOP_BUTTON_GAP;
-            let resp = ui
-                .interact(rect, ui.id().with(("music_top_vst", fs_idx)), sense)
-                .hover_tip_dark("VST プラグイン画面を開く".to_string());
-            painter.rect_filled(rect, 4.0, top_btn_bg(resp.hovered()));
-            draw_overlay_vst3_top_icon(&painter, rect);
-            Self::paint_music_chrome_button_dim(&painter, rect, interactive);
-            response.vst_clicked = interactive && resp.clicked();
-            top_rx
-        } else {
-            top_rx
-        };
-
-        if chrome.show_row_stepper {
-            let btn = 26.0;
-            let gap = 6.0;
-            let label_w = 84.0;
-            let group_w = btn * 2.0 + gap * 2.0 + label_w;
-            let cx = vst_left - 20.0 - group_w * 0.5;
-            let cy = top_rect.center().y;
-            first_right_control_left = first_right_control_left.min(cx - group_w * 0.5);
-            let minus_rect = egui::Rect::from_center_size(
-                egui::pos2(cx - group_w * 0.5 + btn * 0.5, cy),
-                egui::vec2(btn, btn),
-            );
-            let plus_rect = egui::Rect::from_center_size(
-                egui::pos2(cx + group_w * 0.5 - btn * 0.5, cy),
-                egui::vec2(btn, btn),
-            );
-            let minus_resp =
-                ui.interact(minus_rect, ui.id().with(("music_row_minus", fs_idx)), sense);
-            let plus_resp = ui.interact(plus_rect, ui.id().with(("music_row_plus", fs_idx)), sense);
-            painter.rect_filled(minus_rect, 4.0, top_btn_bg(minus_resp.hovered()));
-            let m = minus_rect.center();
-            painter.line_segment(
-                [
-                    egui::pos2(m.x - btn * 0.22, m.y),
-                    egui::pos2(m.x + btn * 0.22, m.y),
-                ],
-                egui::Stroke::new(2.0, fg),
-            );
-            Self::paint_music_chrome_button_dim(&painter, minus_rect, interactive);
-            painter.text(
-                egui::pos2(cx, cy),
-                egui::Align2::CENTER_CENTER,
-                format!(
-                    "Row {}",
-                    crate::ui_music_timeline::format_row_secs(chrome.row_secs)
-                ),
-                egui::FontId::proportional(13.0),
-                fg,
-            );
-            painter.rect_filled(plus_rect, 4.0, top_btn_bg(plus_resp.hovered()));
-            let p = plus_rect.center();
-            painter.line_segment(
-                [
-                    egui::pos2(p.x - btn * 0.22, p.y),
-                    egui::pos2(p.x + btn * 0.22, p.y),
-                ],
-                egui::Stroke::new(2.0, fg),
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(p.x, p.y - btn * 0.22),
-                    egui::pos2(p.x, p.y + btn * 0.22),
-                ],
-                egui::Stroke::new(2.0, fg),
-            );
-            Self::paint_music_chrome_button_dim(&painter, plus_rect, interactive);
-            if interactive && plus_resp.clicked() {
-                response.row_delta = -1;
-            }
-            if interactive && minus_resp.clicked() {
-                response.row_delta = 1;
-            }
-        }
-
-        let title_clip = Self::music_chrome_title_clip_rect(top_rect, first_right_control_left);
-        painter.with_clip_rect(title_clip).text(
-            egui::pos2(top_rect.left() + 14.0, top_rect.top() + 20.0),
-            egui::Align2::LEFT_CENTER,
-            &chrome.title,
-            egui::FontId::proportional(15.0),
+            fs_idx,
+            chrome,
             fg,
-        );
-
-        response
+            accent,
+            interactive,
+            show_overflow,
+            self.fs_overflow_panel_state == FsOverflowPanelState::MusicNoteColor,
+            self.settings.fullscreen_side_panel_mode,
+            &self.keymap,
+        )
     }
 
     #[cfg(windows)]
@@ -20945,6 +21221,7 @@ impl App {
             &chrome,
             egui::Color32::from_gray(220),
             egui::Color32::from_rgb(90, 150, 220),
+            false,
             false,
         );
         if chrome_response.close_clicked {
@@ -20989,16 +21266,12 @@ impl App {
         let spectrum_rect = layout.spectrum_rect;
         if layout.show_spectrum && spectrum_rect.width() >= 180.0 && spectrum_rect.height() >= 60.0
         {
-            let bass_marker = self.music_analysis.as_ref().and_then(|analysis| {
-                let idx =
-                    (info.position_secs.max(0.0) / analysis.config.bin_secs.max(1.0e-3)) as usize;
-                analysis
-                    .bins
-                    .get(idx)
-                    .map(|bin| (bin.bass_pitch_class, bin.bass_pitch_confidence))
-            });
-            self.music_spectrum
-                .draw(ui, spectrum_rect, 0.0, bass_marker);
+            self.music_spectrum.draw(
+                ui,
+                spectrum_rect,
+                0.0,
+                self.settings.music_note_color_scheme,
+            );
         }
 
         let hud_h = crate::ui_music_panels::MUSIC_HUD_HEIGHT;
@@ -25379,8 +25652,9 @@ impl App {
                         let full_rect = ui.max_rect();
                         // Determine this frame's front owner before keys can close it and before
                         // any backing raw-input consumer or ScrollArea handles its wheel.
+                        let music_overflow_input = self.begin_music_overflow_frame_input(ctx, full_rect, fs_idx);
                         let mut hud_popup_wheel = self
-                            .fullscreen_front_popup_wheel_target(ctx, full_rect, fs_idx)
+                            .fullscreen_front_popup_wheel_target(ctx, full_rect, fs_idx, music_overflow_input)
                             .map(|target| FsHudPopupWheelInput::take(ctx, target));
                         // Root-menu actions precede backing keys. A click that opens
                         // the editor owns even an Escape delivered in that same frame.
@@ -25659,6 +25933,7 @@ impl App {
                             prev_foreground_hwnd,
                             &mut similar_preview_navigator_input,
                             hud_popup_wheel.as_ref(),
+                            music_overflow_input.owns_pointer,
                             &mut navigation_operation,
                         );
                         if !continuation_committed && !wheel_nav.is_none() {
@@ -25857,6 +26132,7 @@ impl App {
                                             reserved_panel_width,
                                             paint_idx,
                                             key_action.music_ctrl_wheel_gate_reached,
+                                            music_overflow_input,
                                         );
                                         // 上バーの閉じる× は描画中の直呼びを避け遅延フラグ経由で
                                         // ここで close_fs に合流させる (動画の close_requested と同じ)。
@@ -26970,12 +27246,18 @@ impl App {
                             wheel.restore_at(ctx, FsHudPopupWheelTarget::Overflow);
                         }
                         if self.fs_overflow_panel_state.is_open() && root_overflow_frame == FsRootOverflowFrame::Absent {
-                            let overflow_available = !state.is_video
-                                && !is_music_view
-                                && !panorama_mode_active_now
-                                && self.fullscreen_top_bar_chrome_allowed(fs_idx);
+                            let overflow_available = if self.fs_overflow_panel_state == FsOverflowPanelState::MusicNoteColor {
+                                self.fs_music_view_active(fs_idx)
+                            } else {
+                                !state.is_video && !is_music_view && !panorama_mode_active_now
+                                    && self.fullscreen_top_bar_chrome_allowed(fs_idx)
+                            };
                             if overflow_available {
-                                self.draw_fs_overflow_panel_foreground(ui, ctx, full_rect, is_spread_double);
+                                if self.fs_overflow_panel_state == FsOverflowPanelState::MusicNoteColor {
+                                    self.draw_music_overflow_panel(ui, ctx, full_rect);
+                                } else {
+                                    self.draw_fs_overflow_panel_foreground(ui, ctx, full_rect, is_spread_double);
+                                }
                             } else {
                                 self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
                             }
@@ -34487,6 +34769,7 @@ impl App {
             root_rows,
             navigator_corner: self.settings.fullscreen_navigator_corner.normalized(),
             shift: self.spread_shift_hud_view(),
+            music_note_color_scheme: self.settings.music_note_color_scheme,
             composition_available: self.composition_editor_available(),
             composition_managed: self.pairing_edit_availability()
                 == crate::spread_shift::PairingEditAvailability::Composed,
@@ -34592,16 +34875,39 @@ impl App {
         }
     }
 
-    /// Select the front consumer before key handling and backing input. This is frame-local routing;
-    /// overflow remains modeless and owns only its existing painted/hit rectangle.
+    fn begin_music_overflow_frame_input(
+        &mut self,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        fs_idx: usize,
+    ) -> MusicOverflowFrameInput {
+        let input = music_overflow_frame_input(
+            ctx,
+            full_rect,
+            self.virtual_list_context_id(),
+            self.fs_music_view_active(fs_idx),
+            self.fs_overflow_panel_state == FsOverflowPanelState::MusicNoteColor,
+        );
+        if input.dismiss {
+            self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+        }
+        input
+    }
+
+    /// Route before key handling and backing input. Modeless overflow owns its rectangle
+    /// and any pointer stream it began, including frames after the panel has closed.
     fn fullscreen_front_popup_wheel_target(
         &self,
         ctx: &egui::Context,
         full_rect: egui::Rect,
         fs_idx: usize,
+        music_overflow_input: MusicOverflowFrameInput,
     ) -> Option<FsHudPopupWheelTarget> {
         if fs_still_seek_strip_popup_open(ctx) {
             return Some(FsHudPopupWheelTarget::SeekStrip);
+        }
+        if self.fs_music_view_active(fs_idx) && music_overflow_input.owns_pointer {
+            return Some(FsHudPopupWheelTarget::Overflow);
         }
         if !self.fullscreen_top_bar_chrome_allowed(fs_idx) {
             return None;
@@ -34643,6 +34949,47 @@ impl App {
         }
     }
 
+    fn set_music_note_color_scheme(
+        &mut self,
+        scheme: crate::music_note_color::MusicNoteColorScheme,
+    ) {
+        if self.settings.music_note_color_scheme != scheme {
+            self.settings.music_note_color_scheme = scheme;
+            self.music_analysis_version = self.music_analysis_version.wrapping_add(1);
+            self.settings.save();
+        }
+    }
+
+    fn draw_music_overflow_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+    ) {
+        let Some(rect) = fs_overflow_panel_rect(full_rect, self.fs_overflow_panel_state) else {
+            return;
+        };
+        let view = FsOverflowPanelView {
+            state: FsOverflowPanelState::MusicNoteColor,
+            root_rows: Vec::new(),
+            navigator_corner: FullscreenNavigatorCorner::BottomRight,
+            shift: Default::default(),
+            music_note_color_scheme: self.settings.music_note_color_scheme,
+            composition_available: false,
+            composition_managed: false,
+        };
+        match draw_fs_overflow_panel_surface(ui, rect, &view) {
+            Some(FsOverflowPanelAction::Close) => {
+                self.fs_overflow_panel_state = FsOverflowPanelState::Closed
+            }
+            Some(FsOverflowPanelAction::SetMusicNoteColor(scheme)) => {
+                self.set_music_note_color_scheme(scheme)
+            }
+            _ => return,
+        }
+        ctx.request_repaint();
+    }
+
     fn draw_fs_overflow_panel_foreground(
         &mut self,
         _ui: &mut egui::Ui,
@@ -34678,11 +35025,10 @@ impl App {
     ) {
         let nav = self.get_nav_indices();
         self.spread_shift.resolve(&self.page_identity_index, &nav);
-        let Some(panel_rect) = fs_overflow_panel_rect(full_rect, self.fs_overflow_panel_state)
-        else {
+        let view = self.fullscreen_overflow_panel_view(is_spread_double);
+        let Some(panel_rect) = fs_overflow_panel_rect(full_rect, view.state) else {
             return;
         };
-        let view = self.fullscreen_overflow_panel_view(is_spread_double);
         let Some(action) = draw_fs_overflow_panel_surface(ui, panel_rect, &view) else {
             return;
         };
@@ -34763,6 +35109,9 @@ impl App {
                     self.reset_live_spread_shift(true);
                     self.normalize_spread_position(ctx);
                 }
+            }
+            FsOverflowPanelAction::SetMusicNoteColor(scheme) => {
+                self.set_music_note_color_scheme(scheme);
             }
             FsOverflowPanelAction::SetShiftMemory(enabled) => {
                 if view.shift.enabled {
@@ -36187,6 +36536,7 @@ impl App {
             prev_foreground_hwnd,
             navigator_reservation,
             None,
+            false,
         )
     }
 
@@ -36201,6 +36551,7 @@ impl App {
         prev_foreground_hwnd: usize,
         navigator_reservation: &mut Option<FsNavigatorInputReservation>,
         front_wheel_owner: Option<&FsHudPopupWheelInput>,
+        music_front_pointer_owned: bool,
     ) -> (FsPageNav, bool) {
         self.handle_fs_wheel_and_click_with_geometry_and_operation(
             ui,
@@ -36212,6 +36563,7 @@ impl App {
             prev_foreground_hwnd,
             navigator_reservation,
             front_wheel_owner,
+            music_front_pointer_owned,
             &mut None,
         )
     }
@@ -36227,6 +36579,7 @@ impl App {
         prev_foreground_hwnd: usize,
         navigator_reservation: &mut Option<FsNavigatorInputReservation>,
         front_wheel_owner: Option<&FsHudPopupWheelInput>,
+        music_front_pointer_owned: bool,
         navigation_operation: &mut Option<ViewerOperationId>,
     ) -> (FsPageNav, bool) {
         *navigator_reservation = None;
@@ -36274,6 +36627,17 @@ impl App {
                 .apply(FullscreenPrimarySuppressionEvent::PointerFrame {
                     released: primary_released,
                 });
+
+        // Music menu input was claimed at frame start, before a key or outside click
+        // could close it. Complete primary release bookkeeping above, then leave the
+        // claimed pointer to the menu rather than running media/backing input routes.
+        if music_front_pointer_owned
+            && self
+                .fullscreen_idx
+                .is_some_and(|idx| self.fs_music_view_active(idx))
+        {
+            return (FsPageNav::None, false);
+        }
 
         // レンダラが連続読みを描画しているか。クリックのページジャンプ抑制と、
         // 連結方向スクロール / 直交方向パンの振り分けに使う。
@@ -36892,12 +37256,8 @@ impl App {
         }
         // 右上の overflow panel はページ送り面ではない。panel state と同じ純粋な矩形計算を
         // touch classifier に渡し、行・戻る・閉じる操作を PageSide へ再分類させない。
-        if self.fs_overflow_panel_state.is_open() {
-            append_fs_overflow_touch_exclusion(
-                &mut touch_excluded,
-                full_rect,
-                self.fs_overflow_panel_state,
-            );
+        if let Some(rect) = fs_overflow_panel_rect(full_rect, self.fs_overflow_panel_state) {
+            touch_excluded.push(rect);
         }
         // ナビゲータは画像の上に浮く widget であって、ページ送りの当たり判定ではない。
         // 除外しないと、隅ボタンも閉じるボタンも押せないまま、触れた指がページを送る。
@@ -37192,7 +37552,7 @@ impl App {
                     };
                     Some(crate::ui_music_panels::music_audio_track_popup_open(
                         ctx,
-                        ui.id(),
+                        music_view_backing_ui_id(ui.id()),
                         idx,
                         player.path(),
                     ))
@@ -53890,7 +54250,17 @@ impl App {
         reserved_info_panel_w: f32,
         fs_idx: usize,
         music_ctrl_wheel_key_gate_reached: bool,
+        overflow_input: MusicOverflowFrameInput,
     ) -> MusicViewFrameUiState {
+        let mut backing_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt(MUSIC_VIEW_BACKING_UI_SALT)
+                .max_rect(ui.max_rect()),
+        );
+        let ui = &mut backing_ui;
+        #[cfg(test)]
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(egui::Id::new("music_backing_drawn_ui_id"), ui.id()));
         // 音楽ビューは動画フルスクリーンと同じく黒背景ベースで統一する。App テーマが Light でも
         // ここは常にダーク配色にする (CLAUDE.md「フルスクリーン内は黒背景ベース統一」、実機 FB:
         // 上下バーが Light 基調で中央のダーク波形と食い違っていた)。
@@ -54049,6 +54419,11 @@ impl App {
         // (背後クリック漏れ防止 + モーダルへ集中、Inc 5c-A / Norm系)。
         let music_modal_open =
             self.music_bookmark_modal_open() || self.music_normalize_modal_active(fs_idx);
+        // The foreground music menu owns hover within the same rectangle used by input
+        // routing. Filter only passive hover; explicit and locked panels retain their state.
+        let overflow_rect = (self.fs_overflow_panel_state == FsOverflowPanelState::MusicNoteColor)
+            .then(|| fs_overflow_panel_rect(full_rect, FsOverflowPanelState::MusicNoteColor))
+            .flatten();
         let hover_pos = ctx.input(|i| {
             if self.cursor_hidden() {
                 None
@@ -54056,6 +54431,8 @@ impl App {
                 i.pointer.hover_pos()
             }
         });
+        let panel_hover_pos =
+            hover_pos.filter(|pos| !overflow_rect.is_some_and(|rect| rect.contains(*pos)));
         // Hover は左右パネルの二段判定 (実機 FB 2026-07):
         //  - 開くトリガ = 画面端の細いストリップ (PANEL_EDGE_TRIGGER_WIDTH)。パネル幅ぶんの
         //    広い当たり判定にすると中央の全幅波形 seek の左右端 (left_w / right_w) が押せなく
@@ -54078,14 +54455,16 @@ impl App {
         );
         let side_panel_mode = self.settings.fullscreen_side_panel_mode.normalized();
         if side_panel_mode == crate::settings::FsSidePanelMode::Hover && !music_modal_open {
-            let left_open =
-                hover_pos.is_some_and(|p| p.x <= content_rect.left() + trigger_w && in_band(p));
+            let left_open = panel_hover_pos
+                .is_some_and(|p| p.x <= content_rect.left() + trigger_w && in_band(p));
             let right_open =
-                hover_pos.is_some_and(|p| p.x >= panel_right_edge - trigger_w && in_band(p));
+                panel_hover_pos.is_some_and(|p| p.x >= panel_right_edge - trigger_w && in_band(p));
             let left_sustain = self.music_left_panel_active
-                && hover_pos.is_some_and(|p| left_panel_rect.expand(sustain_margin).contains(p));
+                && panel_hover_pos
+                    .is_some_and(|p| left_panel_rect.expand(sustain_margin).contains(p));
             let right_sustain = self.music_right_panel_active
-                && hover_pos.is_some_and(|p| right_panel_rect.expand(sustain_margin).contains(p));
+                && panel_hover_pos
+                    .is_some_and(|p| right_panel_rect.expand(sustain_margin).contains(p));
             self.music_left_panel_active = left_open || left_sustain;
             self.music_right_panel_active = right_open || right_sustain;
         } else {
@@ -54118,6 +54497,40 @@ impl App {
                 ))
             })
             .unwrap_or(false);
+        // The menu keeps its original input; the backing music view sees no pointer/touch
+        // events in an owned frame, including outside-dismiss and keyboard-close frames.
+        if overflow_input.owns_pointer {
+            ui.disable();
+        }
+        let backing_pointer_input = overflow_input.owns_pointer.then(|| {
+            ctx.input_mut(|input| {
+                let pointer = std::mem::take(&mut input.pointer);
+                let events: Vec<_> = input
+                    .events
+                    .iter()
+                    .filter(|event| {
+                        matches!(
+                            event,
+                            egui::Event::PointerMoved(_)
+                                | egui::Event::PointerButton { .. }
+                                | egui::Event::PointerGone
+                                | egui::Event::Touch { .. }
+                        )
+                    })
+                    .cloned()
+                    .collect();
+                input.events.retain(|event| {
+                    !matches!(
+                        event,
+                        egui::Event::PointerMoved(_)
+                            | egui::Event::PointerButton { .. }
+                            | egui::Event::PointerGone
+                            | egui::Event::Touch { .. }
+                    )
+                });
+                (pointer, events)
+            })
+        });
         let pointer_over_panel = left_hover
             || right_hover
             || music_modal_open
@@ -54220,10 +54633,30 @@ impl App {
                 .is_none_or(|t| now >= t);
             let cache = &mut self.music_timeline_cache;
             let mut outcome = crate::ui_music_timeline::MusicTimelineOutcome::default();
+            #[cfg(test)]
+            let mut pan_probe = None;
             let sa_output = egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .id_salt(("music_timeline", fs_idx))
                 .show(&mut child, |ui| {
+                    #[cfg(test)]
+                    {
+                        pan_probe = Some(MusicTimelinePanProbe {
+                            clip: ui.clip_rect(),
+                            pointer: ui.input(|input| input.pointer.hover_pos()),
+                            delta: ui.input(|input| input.pointer.delta()),
+                            middle: ui.input(|input| {
+                                input.pointer.button_down(egui::PointerButton::Middle)
+                            }),
+                            enabled: ui.is_enabled(),
+                            bins: analysis.bins.len(),
+                            pending_scroll,
+                            manual_scroll: false,
+                            auto_scrolled: false,
+                            offset: egui::Vec2::ZERO,
+                            content: egui::Vec2::ZERO,
+                        });
+                    }
                     if pending_scroll != 0.0 {
                         // egui 0.33: 正の delta.y = 先頭方向 (上) へスクロール (Codex 確認済)。
                         // ▲=正 (page) / ▼=負 (-page)。即時スクロール (ScrollAnimation::none) で
@@ -54236,6 +54669,7 @@ impl App {
                     outcome = crate::ui_music_timeline::draw_music_timeline(
                         ui,
                         analysis,
+                        &self.music_bass,
                         analysis_version,
                         timeline_dur,
                         pos,
@@ -54245,8 +54679,18 @@ impl App {
                         row_secs,
                         dark,
                         content_gutter,
+                        self.settings.music_note_color_scheme,
                     );
                 });
+            #[cfg(test)]
+            if let Some(mut probe) = pan_probe {
+                probe.manual_scroll = outcome.manual_scroll;
+                probe.auto_scrolled = outcome.auto_scrolled;
+                probe.offset = sa_output.state.offset;
+                probe.content = sa_output.content_size;
+                let probe_id = egui::Id::new(("music_pan_probe", ctx.viewport_id()));
+                ctx.data_mut(|data| data.insert_temp(probe_id, probe));
+            }
             const SCROLL_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(1);
             // scrollbar ドラッグ検出: ScrollArea の縦 offset が前フレームから変化し、かつ
             // その変化がプログラム起因 (▲▼ の scroll_with_delta / 追従の scroll_to_rect) でない
@@ -54343,16 +54787,14 @@ impl App {
             let pcm = self.music_pcm.clone();
             // Norm (ラウドネス正規化) 適用中のゲインを鍵盤の明るさ (presence) に反映する。未適用は 0dB。
             let norm_gain_db = self.normalize_ui_state_for_player(fs_idx).applied_gain_db();
-            // 上の Bass グラフと同じ推定 (ピッチクラス + 信頼度) を playhead から取り、鍵盤上の ▼ に渡す。
-            let bass_marker = self.music_analysis.as_ref().and_then(|a| {
-                let idx = (pos.max(0.0) / a.config.bin_secs.max(1.0e-3)) as usize;
-                a.bins
-                    .get(idx)
-                    .map(|b| (b.bass_pitch_class, b.bass_pitch_confidence))
-            });
+            // ▼はspectrum自身が鍵盤と同じ基音確率から選ぶ。
             self.music_spectrum.update(ctx, pcm.as_ref(), pos, playing);
-            self.music_spectrum
-                .draw(ui, spectrum_rect, norm_gain_db, bass_marker);
+            self.music_spectrum.draw(
+                ui,
+                spectrum_rect,
+                norm_gain_db,
+                self.settings.music_note_color_scheme,
+            );
         }
 
         // ── 左右パネル (Inc 5 FB / §1.15) ── 表示モードに従ってオーバーレイ表示する。
@@ -54381,8 +54823,24 @@ impl App {
 
         // 上情報バー (常時): ファイル名 (左) + Row ステッパー (中央、timeline 時) +
         // 左右パネル表示モード i。位置/長さ・音量・再生などは下 HUD に集約する。
-        let top_response =
-            self.draw_music_top_chrome(ui, top_rect, fs_idx, &active_chrome, fg, accent, true);
+        let top_response = self.draw_music_top_chrome(
+            ui,
+            top_rect,
+            fs_idx,
+            &active_chrome,
+            fg,
+            accent,
+            true,
+            true,
+        );
+        if top_response.overflow_clicked {
+            self.fs_overflow_panel_state =
+                if self.fs_overflow_panel_state == FsOverflowPanelState::MusicNoteColor {
+                    FsOverflowPanelState::Closed
+                } else {
+                    FsOverflowPanelState::MusicNoteColor
+                };
+        }
         if top_response.close_clicked {
             self.music_view_close_requested = true;
         }
@@ -54447,6 +54905,12 @@ impl App {
         // 再生中は毎フレーム再描画して位置/シークバーを更新する。
         if playing {
             ctx.request_repaint();
+        }
+        if let Some((pointer, events)) = backing_pointer_input {
+            ctx.input_mut(|input| {
+                input.pointer = pointer;
+                input.events.extend(events);
+            });
         }
         frame_ui
     }
@@ -54876,8 +55340,21 @@ mod music_full_width_hud_tests {
                             full.min,
                             full.max - egui::vec2(reserved, 0.0),
                         );
-                        app.draw_fs_music_view(ui, ctx, full, content, reserved, 0, false);
-                        let response = |name| ctx.read_response(ui.id().with((name, 0usize)));
+                        app.draw_fs_music_view(
+                            ui,
+                            ctx,
+                            full,
+                            content,
+                            reserved,
+                            0,
+                            false,
+                            MusicOverflowFrameInput::default(),
+                        );
+                        let response = |name| {
+                            ctx.read_response(
+                                music_view_backing_ui_id(ui.id()).with((name, 0usize)),
+                            )
+                        };
                         let panel = response("music_right_bg");
                         probe = Some(Probe {
                             time: egui::Rect::NOTHING,
@@ -61093,92 +61570,136 @@ mod tests {
             FsOverflowPanelState::Root,
             FsOverflowPanelState::NavigatorPosition,
             FsOverflowPanelState::SpreadAdjustment,
+            FsOverflowPanelState::MusicNoteColor,
         ] {
-            for size in [egui::vec2(1200.0, 800.0), egui::vec2(320.0, 200.0)] {
-                let ctx = egui::Context::default();
-                crate::ui_fonts::configure_fonts(&ctx);
-                let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
-                let panel = fs_overflow_panel_rect(viewport, state).unwrap();
-                let view = FsOverflowPanelView {
-                    state,
-                    root_rows: FullscreenOverflowItemId::fixed_order()
-                        .iter()
-                        .map(|&item| FsOverflowPanelRow {
-                            item,
-                            label: "機能名 [Alt+N]".into(),
-                            status: "ON >".into(),
+            for size in [
+                egui::vec2(1200.0, 800.0),
+                egui::vec2(320.0, 200.0),
+                egui::vec2(320.0, 180.0),
+            ] {
+                for ambient_spacing in [0.0, 13.0] {
+                    let ctx = egui::Context::default();
+                    ctx.style_mut(|style| style.spacing.item_spacing.y = ambient_spacing);
+                    crate::ui_fonts::configure_fonts(&ctx);
+                    let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                    let panel = fs_overflow_panel_rect(viewport, state).unwrap();
+                    let view = FsOverflowPanelView {
+                        state,
+                        root_rows: FullscreenOverflowItemId::fixed_order()
+                            .iter()
+                            .map(|&item| FsOverflowPanelRow {
+                                item,
+                                label: "機能名 [Alt+N]".into(),
+                                status: "ON >".into(),
+                                enabled: true,
+                                disabled_reason: None,
+                            })
+                            .collect(),
+                        navigator_corner: FullscreenNavigatorCorner::BottomRight,
+                        shift: SpreadShiftHudView {
+                            status: "保存した基点が現在の一覧にありません".into(),
+                            anchor: "基点: chapter/003.jpg（現在の一覧外）".into(),
                             enabled: true,
-                            disabled_reason: None,
-                        })
-                        .collect(),
-                    navigator_corner: FullscreenNavigatorCorner::BottomRight,
-                    shift: SpreadShiftHudView {
-                        status: "保存した基点が現在の一覧にありません".into(),
-                        anchor: "基点: chapter/003.jpg（現在の一覧外）".into(),
-                        enabled: true,
-                        memory: true,
-                        clear_enabled: true,
-                        ..Default::default()
-                    },
-                    composition_available: true,
-                    composition_managed: true,
-                };
-                let draw = |events| {
-                    let _ = ctx.run(
-                        egui::RawInput {
-                            screen_rect: Some(viewport),
-                            events,
+                            memory: true,
+                            clear_enabled: true,
                             ..Default::default()
                         },
-                        |ctx| {
-                            egui::CentralPanel::default().frame(egui::Frame::NONE).show(
-                                ctx,
-                                |ui| {
-                                    let _ = draw_fs_overflow_panel_surface(ui, panel, &view);
-                                },
-                            );
-                        },
-                    );
-                    let (inner, content, offset) = ctx.data(|data| {
-                        data.get_temp(egui::Id::new("fs_overflow_scroll_test_layout"))
-                            .unwrap()
-                    });
-                    ScrollLayout {
-                        inner,
-                        content,
-                        offset,
-                    }
-                };
-                let mut before = draw(vec![]);
-                for _ in 0..3 {
-                    before = draw(vec![]);
-                }
-                before.assert_height(
-                    if size.y > 400.0 {
-                        HeightExpectation::Fits
-                    } else {
-                        HeightExpectation::Scrolls
-                    },
-                    panel.intersect(viewport),
-                    ctx.pixels_per_point(),
-                );
-                if size.y < 400.0 {
-                    let mut after = before;
-                    for frame in 0..40 {
-                        after = draw(if frame == 0 {
-                            vec![
-                                egui::Event::PointerMoved(before.inner.center()),
-                                egui::Event::MouseWheel {
-                                    unit: egui::MouseWheelUnit::Point,
-                                    delta: egui::vec2(0.0, -4000.0),
-                                    modifiers: egui::Modifiers::NONE,
-                                },
-                            ]
-                        } else {
-                            vec![]
+                        composition_available: true,
+                        composition_managed: true,
+                        music_note_color_scheme: Default::default(),
+                    };
+                    let draw = |events| {
+                        let _ = ctx.run(
+                            egui::RawInput {
+                                screen_rect: Some(viewport),
+                                events,
+                                ..Default::default()
+                            },
+                            |ctx| {
+                                egui::CentralPanel::default().frame(egui::Frame::NONE).show(
+                                    ctx,
+                                    |ui| {
+                                        let _ = draw_fs_overflow_panel_surface(ui, panel, &view);
+                                    },
+                                );
+                            },
+                        );
+                        let (inner, content, offset) = ctx.data(|data| {
+                            data.get_temp(egui::Id::new("fs_overflow_scroll_test_layout"))
+                                .unwrap()
                         });
+                        let clip = ctx.data(|data| {
+                            data.get_temp::<egui::Rect>(egui::Id::new(
+                                "fs_overflow_scroll_test_clip",
+                            ))
+                            .unwrap()
+                        });
+                        (
+                            ScrollLayout {
+                                inner,
+                                content,
+                                offset,
+                            },
+                            clip,
+                        )
+                    };
+                    let (mut before, mut clip) = draw(vec![]);
+                    for _ in 0..3 {
+                        (before, clip) = draw(vec![]);
                     }
-                    after.assert_scrolled_to_end(before, ctx.pixels_per_point());
+                    before.assert_height(
+                        if size.y > 400.0 {
+                            HeightExpectation::Fits
+                        } else {
+                            HeightExpectation::Scrolls
+                        },
+                        clip.intersect(panel).intersect(viewport),
+                        ctx.pixels_per_point(),
+                    );
+                    if size.y > 400.0 && state != FsOverflowPanelState::SpreadAdjustment {
+                        // These states allocate fixed 48pt rows without gaps. Check actual
+                        // content as well as viewport height: Fits alone would also accept
+                        // a budget that accidentally counts the ambient spacing twice.
+                        let expected_body = fs_overflow_panel_body_row_count(state) as f32
+                            * FS_OVERFLOW_PANEL_ROW_HEIGHT;
+                        let tolerance = 1.0 / ctx.pixels_per_point();
+                        assert!(
+                            (before.content.y - expected_body).abs() <= tolerance,
+                            "fixed rows changed height: state={state:?}, spacing={ambient_spacing}, layout={before:?}"
+                        );
+                        assert!(
+                            (before.inner.height() - expected_body).abs() <= tolerance,
+                            "body budget counted extra spacing: state={state:?}, spacing={ambient_spacing}, layout={before:?}"
+                        );
+                    }
+                    if size.y < 400.0 {
+                        let (mut after, mut after_clip) = (before, clip);
+                        for frame in 0..40 {
+                            (after, after_clip) = draw(if frame == 0 {
+                                vec![
+                                    egui::Event::PointerMoved(before.inner.center()),
+                                    egui::Event::MouseWheel {
+                                        unit: egui::MouseWheelUnit::Point,
+                                        delta: egui::vec2(0.0, -4000.0),
+                                        modifiers: egui::Modifiers::NONE,
+                                    },
+                                ]
+                            } else {
+                                vec![]
+                            });
+                        }
+                        after.assert_height(
+                            HeightExpectation::Scrolls,
+                            after_clip.intersect(panel).intersect(viewport),
+                            ctx.pixels_per_point(),
+                        );
+                        after.assert_scrolled_to_end(before, ctx.pixels_per_point());
+                        let content_bottom = after.inner.top() + after.content.y - after.offset.y;
+                        assert!(
+                            content_bottom <= after_clip.bottom() + 1.0 / ctx.pixels_per_point(),
+                            "last content is clipped: state={state:?}, size={size:?}, layout={after:?}, clip={after_clip:?}"
+                        );
+                    }
                 }
             }
         }
@@ -61264,6 +61785,7 @@ mod tests {
                         shift: Default::default(),
                         composition_available: true,
                         composition_managed: false,
+                        music_note_color_scheme: Default::default(),
                     };
                     let panel_rect = fs_overflow_panel_rect(ui.max_rect(), state).unwrap();
                     let _ = draw_fs_overflow_panel_surface(ui, panel_rect, &view);
@@ -80758,7 +81280,12 @@ mod tests {
 
     fn setup_capture_region_input_test(
         ctx: &egui::Context,
-    ) -> (crate::app::AppTestEnvForTest, egui::Rect, egui::Rect, usize) {
+    ) -> (
+        Box<crate::app::AppTestEnvForTest>,
+        egui::Rect,
+        egui::Rect,
+        usize,
+    ) {
         install_fs_navigator_input_tracking(ctx);
         let mut app = crate::app::setup_app_for_test();
         let fs_idx = app.items.len();
@@ -80812,7 +81339,7 @@ mod tests {
         app.fullscreen_page_layout
             .begin(FullscreenPageLayoutKind::Single);
         app.fullscreen_page_layout.push(transform);
-        (app, full_rect, image_rect, fs_idx)
+        (Box::new(app), full_rect, image_rect, fs_idx)
     }
 
     fn arm_capture_region_for_test(
@@ -87820,6 +88347,7 @@ pub(crate) mod page_turn_submission_tests {
                             0,
                             &mut None,
                             None,
+                            false,
                             &mut operation,
                         );
                         assert!(!wheel.is_none());
@@ -88280,5 +88808,1584 @@ pub(crate) mod page_turn_submission_tests {
             }
         }
         snapshots.unwrap();
+    }
+}
+
+#[cfg(all(test, windows))]
+mod music_overflow_tests {
+    use super::*;
+    use crate::music_note_color::MusicNoteColorScheme;
+
+    fn chrome() -> MusicChromeViewState {
+        MusicChromeViewState {
+            title: "音楽の配色・長いタイトル.flac".to_owned(),
+            position_secs: 30.0,
+            duration_secs: 120.0,
+            playing: false,
+            video_audio_mode: true,
+            playback_speed: 1.0,
+            volume: 1.0,
+            muted: false,
+            loop_mode: Default::default(),
+            continuous_mode: Default::default(),
+            row_secs: 30.0,
+            normalize_ui_state: Default::default(),
+            bookmark_secs: Vec::new(),
+            bookmarks_loaded: true,
+            show_row_stepper: true,
+            show_side_panel_mode: true,
+            show_back_to_video: true,
+            show_vst: true,
+            show_window_toggle: true,
+            show_close: true,
+        }
+    }
+
+    fn surface(ui: &mut egui::Ui, show_overflow: bool, panel: bool) {
+        let full = ui.max_rect();
+        ui.painter()
+            .rect_filled(full, 0.0, crate::ui_music_timeline::MUSIC_VIEW_BG);
+        let keymap = crate::keymap::Keymap::from_settings(&Default::default());
+        draw_music_top_chrome_surface(
+            ui,
+            music_hud_rects(full)[0],
+            0,
+            &chrome(),
+            egui::Color32::from_gray(220),
+            egui::Color32::from_rgb(90, 150, 220),
+            true,
+            show_overflow,
+            panel,
+            crate::settings::FsSidePanelMode::ClickToShow,
+            &keymap,
+        );
+        if panel {
+            let view = FsOverflowPanelView {
+                state: FsOverflowPanelState::MusicNoteColor,
+                root_rows: Vec::new(),
+                navigator_corner: FullscreenNavigatorCorner::BottomRight,
+                shift: Default::default(),
+                music_note_color_scheme: MusicNoteColorScheme::Fifths,
+                composition_available: false,
+                composition_managed: false,
+            };
+            let rect = fs_overflow_panel_rect(full, view.state).unwrap();
+            draw_fs_overflow_panel_surface(ui, rect, &view);
+        }
+    }
+
+    fn snapshot(name: &str, width: f32, panel: bool) {
+        let mut fonts_ready = false;
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(width, 300.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| surface(ui, true, panel));
+            });
+        harness.run();
+        harness.snapshot(name);
+    }
+
+    #[test]
+    fn music_overflow_snapshot_hud_normal() {
+        snapshot("music_overflow_hud_normal", 820.0, false);
+    }
+    #[test]
+    fn music_overflow_snapshot_hud_narrow() {
+        snapshot("music_overflow_hud_narrow", 320.0, false);
+    }
+    #[test]
+    fn music_overflow_snapshot_panel() {
+        snapshot("music_overflow_panel", 820.0, true);
+    }
+
+    #[test]
+    fn music_overflow_top_chrome_all_controls_title_and_row_do_not_overlap() {
+        for width in [300.0, 320.0, 519.0, 520.0, 820.0] {
+            let ctx = egui::Context::default();
+            crate::ui_fonts::configure_fonts(&ctx);
+            for _ in 0..3 {
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 300.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(ctx, |ui| {
+                                surface(ui, true, false);
+                                let controls: Vec<_> = [
+                                    "music_top_close",
+                                    "music_top_overflow",
+                                    "music_top_window",
+                                    "music_top_side_panel_mode",
+                                    "music_top_back_to_video",
+                                    "music_top_vst",
+                                    "music_row_minus",
+                                    "music_row_plus",
+                                ]
+                                .into_iter()
+                                .map(|name| {
+                                    ctx.read_response(ui.id().with((name, 0usize)))
+                                        .unwrap()
+                                        .rect
+                                })
+                                .collect();
+                                for (i, rect) in controls.iter().enumerate() {
+                                    assert!(
+                                        ui.max_rect().contains_rect(*rect),
+                                        "{width}: {rect:?}"
+                                    );
+                                    for other in &controls[i + 1..] {
+                                        assert!(!rect.intersects(*other), "{width}");
+                                    }
+                                }
+                            });
+                    },
+                );
+                let title = output
+                    .shapes
+                    .iter()
+                    .find(|shape| {
+                        matches!(&shape.shape,
+                    egui::epaint::Shape::Text(text) if text.galley.text() == chrome().title)
+                    })
+                    .unwrap();
+                let row = output
+                    .shapes
+                    .iter()
+                    .find(|shape| {
+                        matches!(&shape.shape,
+                    egui::epaint::Shape::Text(text) if text.galley.text().starts_with("Row "))
+                    })
+                    .unwrap();
+                assert!(title.clip_rect.width() >= 12.0, "visible title at {width}");
+                if let egui::epaint::Shape::Text(text) = &row.shape {
+                    let row_rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+                    assert!(
+                        !title.clip_rect.intersects(row_rect),
+                        "title/Row at {width}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn music_overflow_parked_hud_has_no_overflow_widget() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                surface(ui, false, false);
+                assert!(
+                    ctx.read_response(ui.id().with(("music_top_overflow", 0usize)))
+                        .is_none()
+                );
+                assert!(
+                    ctx.read_response(ui.id().with(("music_top_close", 0usize)))
+                        .is_some()
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn music_overflow_parked_hud_retains_existing_narrow_control_geometry() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(320.0, 300.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        surface(ui, false, false);
+                        let names = [
+                            "music_top_close",
+                            "music_top_window",
+                            "music_top_side_panel_mode",
+                            "music_top_back_to_video",
+                            "music_top_vst",
+                        ];
+                        let rects: Vec<_> = names
+                            .into_iter()
+                            .map(|name| {
+                                ctx.read_response(ui.id().with((name, 0usize)))
+                                    .unwrap()
+                                    .rect
+                            })
+                            .collect();
+                        for rect in &rects {
+                            assert_eq!(rect.width(), 28.0);
+                        }
+                        for pair in rects.windows(2) {
+                            assert_eq!(pair[0].left() - pair[1].right(), 8.0);
+                        }
+                        for name in ["music_row_minus", "music_row_plus"] {
+                            assert_eq!(
+                                ctx.read_response(ui.id().with((name, 0usize)))
+                                    .unwrap()
+                                    .rect
+                                    .width(),
+                                26.0
+                            );
+                        }
+                    });
+            },
+        );
+    }
+
+    #[test]
+    fn music_overflow_backing_id_matches_real_ui_builder_in_owned_and_normal_frames() {
+        let ctx = egui::Context::default();
+        for disabled in [false, true, false] {
+            let _ = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        let mut builder = egui::UiBuilder::new()
+                            .id_salt(MUSIC_VIEW_BACKING_UI_SALT)
+                            .max_rect(ui.max_rect());
+                        if disabled {
+                            builder = builder.disabled();
+                        }
+                        let child = ui.new_child(builder);
+                        assert_eq!(child.id(), music_view_backing_ui_id(ui.id()));
+                    });
+            });
+        }
+    }
+
+    fn install_fixture_media(app: &mut App, path: std::path::PathBuf) {
+        app.items = vec![GridItem::Audio(path.clone())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = ViewerPresentation::MainWindow;
+        app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
+        app.fs_info_panel.locked = false;
+        app.settings.ring_shortcuts.video_normal_wheel_action =
+            crate::ring_shortcut::VideoNormalWheelActionId::AdjustVolume;
+        let mut player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(path);
+        player.set_position_for_test(30.0);
+        player.set_duration_for_test(3600.0);
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        let owner_context_id = crate::app::ViewerContextId::for_test(0);
+        let source = match app.fs_cache.get(&0).unwrap() {
+            FsCacheEntry::Video { player, load_seq } => crate::app::MusicAnalysisSource {
+                owner_context_id,
+                fs_idx: 0,
+                player_addr: player.as_ref() as *const crate::video::VideoPlayer as usize,
+                load_seq: *load_seq,
+                path: player.path().clone(),
+                stream_index: player
+                    .applied_audio_stream_index()
+                    .expect("ready stream fixture"),
+            },
+            _ => unreachable!(),
+        };
+        app.music_analysis_source = Some(source);
+        let mut analysis = music_core::TimelineAnalysis::default();
+        analysis.stream.duration_secs = 3600.0;
+        analysis.bins = (0..120)
+            .map(|index| music_core::WaveformBin {
+                start_secs: index as f64 * 30.0,
+                duration_secs: 30.0,
+                peak: 0.5,
+                rms: 0.2,
+                ..Default::default()
+            })
+            .collect();
+        app.music_analysis = Some(std::sync::Arc::new(analysis));
+    }
+
+    fn fixture() -> (crate::app::AppTestEnvForTest, egui::Context) {
+        let mut app = crate::app::setup_app_for_test();
+        let path = app.tmp.path().join("music-overflow.flac");
+        install_fixture_media(&mut app, path);
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        install_fs_navigator_input_tracking(&ctx);
+        (app, ctx)
+    }
+
+    fn frame(
+        app: &mut App,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        modifiers: egui::Modifiers,
+    ) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(820.0, 600.0),
+                )),
+                events,
+                modifiers,
+                ..Default::default()
+            },
+            |ctx| app.render_fullscreen_viewport(ctx),
+        )
+    }
+
+    fn click(pos: egui::Pos2, touch: bool) -> Vec<egui::Event> {
+        let mut events = vec![egui::Event::PointerMoved(pos)];
+        for pressed in [true, false] {
+            if touch {
+                events.push(egui::Event::Touch {
+                    device_id: egui::TouchDeviceId(791),
+                    id: egui::TouchId(1),
+                    phase: if pressed {
+                        egui::TouchPhase::Start
+                    } else {
+                        egui::TouchPhase::End
+                    },
+                    pos,
+                    force: None,
+                });
+            }
+            events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        events
+    }
+
+    fn label(output: &egui::FullOutput, label: &str) -> egui::Rect {
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.text() == label => {
+                    Some(egui::Rect::from_min_size(text.pos, text.galley.size()))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing painted label {label}"))
+    }
+
+    fn open(app: &mut App, ctx: &egui::Context) -> egui::FullOutput {
+        for _ in 0..3 {
+            let _ = frame(app, ctx, vec![], egui::Modifiers::NONE);
+        }
+        // Read the actually painted HUD button rather than calculating an independent target.
+        let button: egui::Rect = ctx
+            .data(|data| data.get_temp(egui::Id::new("music_overflow_button_rect")))
+            .expect("actual music menu button");
+        let _ = frame(
+            app,
+            ctx,
+            vec![egui::Event::PointerMoved(button.center())],
+            egui::Modifiers::NONE,
+        );
+        let _ = frame(
+            app,
+            ctx,
+            click(button.center(), false),
+            egui::Modifiers::NONE,
+        );
+        assert_eq!(
+            app.fs_overflow_panel_state,
+            FsOverflowPanelState::MusicNoteColor
+        );
+        frame(app, ctx, vec![], egui::Modifiers::NONE)
+    }
+
+    fn music_pan_probe(ctx: &egui::Context) -> MusicTimelinePanProbe {
+        let id = egui::Id::new(("music_pan_probe", ctx.viewport_id()));
+        ctx.data(|data| data.get_temp(id))
+            .expect("the real timeline ScrollArea was rendered")
+    }
+
+    fn music_input_router(ctx: &egui::Context) -> MusicOverflowInputRouter {
+        let id = egui::Id::new(("music_overflow_input_router", ctx.viewport_id()));
+        ctx.data(|data| data.get_temp(id))
+            .expect("the music input router was driven")
+    }
+
+    fn assert_fresh_pan_input(
+        ctx: &egui::Context,
+        pos: egui::Pos2,
+        delta: egui::Vec2,
+        manual: bool,
+    ) {
+        let probe = music_pan_probe(ctx);
+        assert_eq!(probe.pointer, Some(pos), "{probe:?}");
+        assert_eq!(probe.delta, delta, "{probe:?}");
+        assert!(
+            probe.middle && probe.enabled && probe.clip.contains(pos),
+            "{probe:?}"
+        );
+        assert_eq!(
+            probe.bins, 120,
+            "analysis remains installed in the actual timeline"
+        );
+        assert!(
+            probe.content.y > probe.clip.height(),
+            "the actual timeline has pan range: {probe:?}"
+        );
+        assert_eq!(probe.manual_scroll, manual, "{probe:?}");
+        assert!(
+            !probe.auto_scrolled,
+            "manual pan is not replaced by playhead following"
+        );
+        assert_eq!(
+            probe.pending_scroll, 0.0,
+            "no pending programmatic scroll masks this gesture"
+        );
+    }
+
+    fn position(app: &App) -> f64 {
+        match app.fs_cache.get(&0).unwrap() {
+            FsCacheEntry::Video { player, .. } => player.position(),
+            _ => unreachable!(),
+        }
+    }
+
+    fn volume(app: &App) -> f64 {
+        match app.fs_cache.get(&0).unwrap() {
+            FsCacheEntry::Video { player, .. } => player.volume(),
+            _ => unreachable!(),
+        }
+    }
+
+    fn wheel(pos: egui::Pos2, modifiers: egui::Modifiers) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -120.0),
+                modifiers,
+            },
+        ]
+    }
+
+    fn side_panel_hover_frame(
+        app: &mut App,
+        ctx: &egui::Context,
+        size: egui::Vec2,
+        pos: egui::Pos2,
+    ) -> MusicViewFrameUiState {
+        let mut state = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events: vec![egui::Event::PointerMoved(pos)],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        let full = ui.max_rect();
+                        let reserved = if app.resolved_still_chrome().info_locked {
+                            crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH.min(full.width() * 0.5)
+                        } else {
+                            0.0
+                        };
+                        let content = egui::Rect::from_min_max(
+                            full.min,
+                            full.max - egui::vec2(reserved, 0.0),
+                        );
+                        let input = app.begin_music_overflow_frame_input(ctx, full, 0);
+                        state =
+                            Some(app.draw_fs_music_view(
+                                ui, ctx, full, content, reserved, 0, false, input,
+                            ));
+                        app.draw_music_overflow_panel(ui, ctx, full);
+                    });
+            },
+        );
+        state.expect("actual music view handler returned panel visibility")
+    }
+
+    #[test]
+    fn music_overflow_hover_blocks_both_side_panels_only_inside_menu() {
+        // At 320pt the menu overlaps both edge triggers, so also exercise the left side.
+        for width in [320.0, 820.0] {
+            let (mut app, ctx) = fixture();
+            app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::Hover;
+            app.fs_overflow_panel_state = FsOverflowPanelState::MusicNoteColor;
+            let size = egui::vec2(width, 600.0);
+            let full = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            let menu = fs_overflow_panel_rect(full, FsOverflowPanelState::MusicNoteColor).unwrap();
+            for right in [false, true] {
+                let edge_x = if right { width - 1.0 } else { 1.0 };
+                let outside = egui::pos2(edge_x, menu.center().y);
+                assert!(!menu.contains(outside));
+                let state = side_panel_hover_frame(&mut app, &ctx, size, outside);
+                assert_eq!(state.left_panel_visible, !right);
+                assert_eq!(state.right_panel_visible, right);
+
+                let inside_x = if right {
+                    menu.right() - 2.0
+                } else {
+                    menu.left() + 2.0
+                };
+                let inside = egui::pos2(inside_x, menu.center().y);
+                assert!(menu.contains(inside));
+                let state = side_panel_hover_frame(&mut app, &ctx, size, inside);
+                assert!(!state.left_panel_visible && !state.right_panel_visible);
+                assert!(!app.music_left_panel_active && !app.music_right_panel_active);
+                assert_eq!(
+                    app.fs_overflow_panel_state,
+                    FsOverflowPanelState::MusicNoteColor
+                );
+
+                let state = side_panel_hover_frame(&mut app, &ctx, size, outside);
+                assert_eq!(state.left_panel_visible, !right);
+                assert_eq!(state.right_panel_visible, right);
+
+                // Being at an edge below the menu must keep the usual hover behavior too.
+                let below = egui::pos2(edge_x, menu.bottom() + 20.0);
+                assert!(!menu.contains(below));
+                let state = side_panel_hover_frame(&mut app, &ctx, size, below);
+                assert_eq!(state.left_panel_visible, !right);
+                assert_eq!(state.right_panel_visible, right);
+            }
+        }
+    }
+
+    #[test]
+    fn music_overflow_hover_preserves_locked_and_explicit_side_panels() {
+        use crate::ui_helpers::MetadataPanelOpenState::{ByTouchHandle, Closed};
+        for locked in [false, true] {
+            let (mut app, ctx) = fixture();
+            app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::Hover;
+            app.fs_info_panel.locked = locked;
+            app.fs_overflow_panel_state = FsOverflowPanelState::MusicNoteColor;
+            let size = egui::vec2(820.0, 600.0);
+            let full = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            let menu = fs_overflow_panel_rect(full, FsOverflowPanelState::MusicNoteColor).unwrap();
+            for pos in [egui::pos2(819.0, menu.center().y), menu.center()] {
+                let state = side_panel_hover_frame(&mut app, &ctx, size, pos);
+                assert_eq!(state.right_panel_visible, locked || !menu.contains(pos));
+                assert_eq!(app.fs_info_panel.locked, locked);
+            }
+            app.music_left_panel_open = ByTouchHandle;
+            app.fs_info_panel.open = ByTouchHandle;
+            let state = side_panel_hover_frame(&mut app, &ctx, size, menu.center());
+            assert!(state.left_panel_visible && state.right_panel_visible);
+            assert_eq!(app.music_left_panel_open, ByTouchHandle);
+            assert_eq!(app.fs_info_panel.open, ByTouchHandle);
+            app.music_left_panel_open = Closed;
+            app.fs_info_panel.open = Closed;
+            app.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+            let pos = egui::pos2(menu.right() - 2.0, menu.center().y);
+            let state = side_panel_hover_frame(&mut app, &ctx, size, pos);
+            assert!(
+                state.right_panel_visible,
+                "closed menu leaves edge hover unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn music_overflow_real_menu_mouse_touch_select_save_and_close() {
+        for touch in [false, true] {
+            let (mut app, ctx) = fixture();
+            let output = open(&mut app, &ctx);
+            let before = app.music_analysis_version;
+            let row = label(&output, "半音順");
+            let _ = frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerMoved(row.center())],
+                egui::Modifiers::NONE,
+            );
+            let _ = frame(
+                &mut app,
+                &ctx,
+                click(row.center(), touch),
+                egui::Modifiers::NONE,
+            );
+            assert_eq!(
+                app.settings.music_note_color_scheme,
+                MusicNoteColorScheme::Chromatic
+            );
+            assert_eq!(app.music_analysis_version, before.wrapping_add(1));
+            assert_eq!(
+                app.fs_overflow_panel_state,
+                FsOverflowPanelState::MusicNoteColor
+            );
+            let saved = crate::settings::Settings::load();
+            assert_eq!(
+                saved.music_note_color_scheme,
+                MusicNoteColorScheme::Chromatic
+            );
+            let close = ctx
+                .read_response(egui::Id::new("fs_overflow_panel_close"))
+                .unwrap()
+                .rect;
+            let _ = frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerMoved(close.center())],
+                egui::Modifiers::NONE,
+            );
+            let _ = frame(
+                &mut app,
+                &ctx,
+                click(close.center(), touch),
+                egui::Modifiers::NONE,
+            );
+            assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+        }
+    }
+
+    #[test]
+    fn music_overflow_real_input_wheel_ctrl_wheel_and_close_frame_do_not_leak() {
+        for modifiers in [egui::Modifiers::NONE, egui::Modifiers::CTRL] {
+            let (mut app, ctx) = fixture();
+            let _ = open(&mut app, &ctx);
+            let panel =
+                fs_overflow_panel_rect(ctx.content_rect(), app.fs_overflow_panel_state).unwrap();
+            let before = (
+                app.music_timeline_last_scroll_offset,
+                app.music_timeline_row_secs,
+                position(&app),
+                volume(&app),
+            );
+            let _ = frame(&mut app, &ctx, wheel(panel.center(), modifiers), modifiers);
+            for _ in 0..20 {
+                let _ = frame(&mut app, &ctx, vec![], modifiers);
+            }
+            assert_eq!(
+                (
+                    app.music_timeline_last_scroll_offset,
+                    app.music_timeline_row_secs,
+                    position(&app),
+                    volume(&app)
+                ),
+                before
+            );
+            let close = ctx
+                .read_response(egui::Id::new("fs_overflow_panel_close"))
+                .unwrap()
+                .rect
+                .center();
+            let mut events = click(close, false);
+            events.extend(wheel(close, modifiers));
+            let _ = frame(&mut app, &ctx, events, modifiers);
+            assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+            for _ in 0..20 {
+                let _ = frame(&mut app, &ctx, vec![], modifiers);
+            }
+            assert_eq!(
+                (
+                    app.music_timeline_last_scroll_offset,
+                    app.music_timeline_row_secs,
+                    position(&app),
+                    volume(&app)
+                ),
+                before
+            );
+            let outside = egui::pos2(300.0, 260.0);
+            let _ = frame(&mut app, &ctx, wheel(outside, modifiers), modifiers);
+            for _ in 0..20 {
+                let _ = frame(&mut app, &ctx, vec![], modifiers);
+            }
+            if modifiers.ctrl {
+                assert_ne!(app.music_timeline_row_secs, before.1);
+            } else {
+                assert_ne!(
+                    volume(&app),
+                    before.3,
+                    "fresh wheel returns to the existing volume action"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn music_overflow_real_outside_mouse_touch_dismiss_is_spent_and_keys_continue() {
+        for touch in [false, true] {
+            let (mut app, ctx) = fixture();
+            let _ = open(&mut app, &ctx);
+            let before = position(&app);
+            let outside = egui::pos2(300.0, 260.0);
+            let _ = frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerMoved(outside)],
+                egui::Modifiers::NONE,
+            );
+            let _ = frame(&mut app, &ctx, click(outside, touch), egui::Modifiers::NONE);
+            assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+            assert_eq!(position(&app), before, "dismiss must not seek");
+            let _ = open(&mut app, &ctx);
+            let panel =
+                fs_overflow_panel_rect(ctx.content_rect(), app.fs_overflow_panel_state).unwrap();
+            let before_row = app.music_timeline_row_secs;
+            let mut events = wheel(panel.center(), egui::Modifiers::CTRL);
+            events.push(egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            let _ = frame(&mut app, &ctx, events, egui::Modifiers::CTRL);
+            assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+            assert_eq!(
+                app.fullscreen_idx, None,
+                "Escape retains its fullscreen-close operation"
+            );
+            assert_eq!(app.music_timeline_row_secs, before_row);
+        }
+    }
+
+    #[test]
+    fn music_overflow_music_lifecycle_close_preserves_still_state() {
+        let (mut app, _) = fixture();
+        app.fs_overflow_panel_state = FsOverflowPanelState::MusicNoteColor;
+        app.clear_music_view_state();
+        assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+        app.fs_overflow_panel_state = FsOverflowPanelState::Root;
+        app.clear_music_view_state();
+        assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Root);
+        app.fs_overflow_panel_state = FsOverflowPanelState::MusicNoteColor;
+        app.reset_fs_side_panel_runtime_for_file_change();
+        assert_eq!(
+            app.fs_overflow_panel_state,
+            FsOverflowPanelState::Closed,
+            "the existing file-change ownership boundary closes the music menu"
+        );
+    }
+
+    #[test]
+    fn music_overflow_audio_popup_real_producer_blocks_common_normal_wheel_and_restores_volume() {
+        use crate::ring_shortcut::VideoNormalWheelActionId;
+        for action in [
+            VideoNormalWheelActionId::AdjustVolume,
+            VideoNormalWheelActionId::NavigateItems,
+        ] {
+            let (mut app, ctx) = fixture();
+            let path = match app.fs_cache.get_mut(&0).unwrap() {
+                FsCacheEntry::Video { player, .. } => {
+                    // Keep the applied stream at 1 while adding a second real selector row.
+                    player.set_opened_audio_stream_for_test(2, 1);
+                    player.set_opened_audio_stream_for_test(1, 1);
+                    player.path().clone()
+                }
+                _ => unreachable!(),
+            };
+            // A leaked NavigateItems action has an actual next item to move to.
+            let next_path = app.tmp.path().join("music-overflow-next.flac");
+            app.items.push(GridItem::Audio(next_path));
+            app.thumbnails.push(ThumbnailState::Pending);
+            app.visible_indices.push(1);
+            app.settings.ring_shortcuts.video_normal_wheel_action = action;
+            for _ in 0..3 {
+                let _ = frame(&mut app, &ctx, vec![], egui::Modifiers::NONE);
+            }
+            let backing_id: egui::Id = ctx
+                .data(|data| data.get_temp(egui::Id::new("music_backing_drawn_ui_id")))
+                .expect("actual backing UI producer ID");
+            let selector_id =
+                crate::ui_music_panels::music_audio_track_selector_id(backing_id, 0, &path);
+            let button = ctx
+                .read_response(selector_id.with("button"))
+                .expect("actual two-track HUD selector button")
+                .rect;
+            let _ = frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerMoved(button.center())],
+                egui::Modifiers::NONE,
+            );
+            let _ = frame(
+                &mut app,
+                &ctx,
+                click(button.center(), false),
+                egui::Modifiers::NONE,
+            );
+            for _ in 0..3 {
+                let _ = frame(&mut app, &ctx, vec![], egui::Modifiers::NONE);
+            }
+            assert!(crate::ui_music_panels::music_audio_track_popup_open(
+                &ctx, backing_id, 0, &path
+            ));
+            let popup_row = ctx
+                .read_response(selector_id.with("popup").with(0usize))
+                .expect("actual painted audio-track popup row");
+            assert!(popup_row.enabled());
+            let before = (
+                volume(&app),
+                app.fullscreen_idx,
+                app.music_timeline_row_secs,
+                position(&app),
+                app.music_timeline_last_scroll_offset,
+            );
+            let _ = frame(
+                &mut app,
+                &ctx,
+                wheel(popup_row.rect.center(), egui::Modifiers::NONE),
+                egui::Modifiers::NONE,
+            );
+            for _ in 0..30 {
+                let _ = frame(&mut app, &ctx, vec![], egui::Modifiers::NONE);
+            }
+            assert_eq!(
+                (
+                    volume(&app),
+                    app.fullscreen_idx,
+                    app.music_timeline_row_secs,
+                    position(&app),
+                    app.music_timeline_last_scroll_offset
+                ),
+                before,
+                "real HUD popup must block the common {action:?} wheel route before its own draw"
+            );
+            assert!(crate::ui_music_panels::music_audio_track_popup_open(
+                &ctx, backing_id, 0, &path
+            ));
+            // Close through the same real HUD button, then a fresh wheel resumes the released volume route.
+            let _ = frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerMoved(button.center())],
+                egui::Modifiers::NONE,
+            );
+            let _ = frame(
+                &mut app,
+                &ctx,
+                click(button.center(), false),
+                egui::Modifiers::NONE,
+            );
+            assert!(!crate::ui_music_panels::music_audio_track_popup_open(
+                &ctx, backing_id, 0, &path
+            ));
+            app.settings.ring_shortcuts.video_normal_wheel_action =
+                VideoNormalWheelActionId::AdjustVolume;
+            let before_volume = volume(&app);
+            let _ = frame(
+                &mut app,
+                &ctx,
+                wheel(egui::pos2(300.0, 260.0), egui::Modifiers::NONE),
+                egui::Modifiers::NONE,
+            );
+            assert_ne!(
+                volume(&app),
+                before_volume,
+                "fresh wheel after close returns to the existing volume action"
+            );
+            assert_eq!(app.fullscreen_idx, Some(0));
+        }
+    }
+
+    #[test]
+    fn music_overflow_real_middle_drag_keeps_owner_outside_panel() {
+        let (mut app, ctx) = fixture();
+        let _ = open(&mut app, &ctx);
+        assert_eq!(
+            app.music_analysis
+                .as_ref()
+                .map(|analysis| analysis.bins.len()),
+            Some(120),
+            "the real opened music view retains the analysis fixture"
+        );
+        let panel =
+            fs_overflow_panel_rect(ctx.content_rect(), app.fs_overflow_panel_state).unwrap();
+        let before = (
+            app.music_timeline_last_scroll_offset,
+            app.music_timeline_row_secs,
+            position(&app),
+        );
+        let start = panel.center();
+        let outside = egui::pos2(300.0, 260.0);
+        let _ = frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(start),
+                egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Middle,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            egui::Modifiers::NONE,
+        );
+        let old_loop = app.settings.video_loop_mode;
+        let _ = frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::L,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            egui::Modifiers::NONE,
+        );
+        assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+        assert_ne!(app.settings.video_loop_mode, old_loop);
+        for point in [outside, outside - egui::vec2(0.0, 70.0)] {
+            let _ = frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerMoved(point)],
+                egui::Modifiers::NONE,
+            );
+            assert_eq!(
+                (
+                    app.music_timeline_last_scroll_offset,
+                    app.music_timeline_row_secs,
+                    position(&app)
+                ),
+                before,
+                "menu-started middle drag remains owned outside its rectangle"
+            );
+        }
+        let end = outside - egui::vec2(0.0, 70.0);
+        let _ = frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerButton {
+                pos: end,
+                button: egui::PointerButton::Middle,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            egui::Modifiers::NONE,
+        );
+        assert_eq!(
+            (
+                app.music_timeline_last_scroll_offset,
+                app.music_timeline_row_secs,
+                position(&app)
+            ),
+            before
+        );
+        // Move while the button is up, then press at the parked cursor position. This is
+        // gesture ordering, not a timing wait; moving and pressing together creates a false down-drag.
+        let _ = frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(outside)],
+            egui::Modifiers::NONE,
+        );
+        let _ = frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerButton {
+                    pos: outside,
+                    button: egui::PointerButton::Middle,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerMoved(outside),
+            ],
+            egui::Modifiers::NONE,
+        );
+        assert_fresh_pan_input(&ctx, outside, egui::Vec2::ZERO, false);
+        let _ = frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(end)],
+            egui::Modifiers::NONE,
+        );
+        assert_fresh_pan_input(&ctx, end, egui::vec2(0.0, -70.0), true);
+        let router = music_input_router(&ctx);
+        assert!(matches!(router.stream, MusicOverflowPointerStream::Idle));
+        assert!(
+            app.music_timeline_scroll_cooldown_until.is_some(),
+            "fresh drag reached timeline manual-pan handling"
+        );
+        // ScrollArea can expose its requested offset on the next frame even with no animation.
+        let _ = frame(&mut app, &ctx, vec![], egui::Modifiers::NONE);
+        assert!(app.music_analysis_source.is_some());
+        assert_eq!(
+            app.music_analysis
+                .as_ref()
+                .map(|analysis| analysis.bins.len()),
+            Some(120)
+        );
+        assert_eq!(
+            music_pan_probe(&ctx).offset.y,
+            app.music_timeline_last_scroll_offset
+        );
+        assert_ne!(
+            app.music_timeline_last_scroll_offset,
+            before.0,
+            "fresh middle drag after release returns to timeline panning; source={} analysis={:?} probes={:#?}",
+            app.music_analysis_source.is_some(),
+            app.music_analysis
+                .as_ref()
+                .map(|analysis| analysis.bins.len()),
+            music_pan_probe(&ctx)
+        );
+    }
+
+    #[test]
+    fn music_overflow_real_fullscreen_close_reopen_returns_fresh_pan() {
+        let (mut app, ctx) = fixture();
+        let _ = open(&mut app, &ctx);
+        assert_eq!(
+            app.music_analysis
+                .as_ref()
+                .map(|analysis| analysis.bins.len()),
+            Some(120)
+        );
+        let start = fs_overflow_panel_rect(ctx.content_rect(), app.fs_overflow_panel_state)
+            .unwrap()
+            .center();
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Middle,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let _ = frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(start), button(start, true)],
+            egui::Modifiers::NONE,
+        );
+        app.close_fullscreen();
+        assert!(app.fullscreen_idx.is_none());
+        // The root UI still consumes release while the fullscreen routing surface is absent.
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![button(start, false)],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |_ui| {});
+            },
+        );
+        // Reinstall only the disposable disconnected media fixture; no decoder/file open is run.
+        let path = app.tmp.path().join("music-overflow-reopened.flac");
+        install_fixture_media(&mut app, path);
+        let fresh = egui::pos2(300.0, 260.0);
+        // The unheld movement is part of a new gesture, rather than a timer/settling frame.
+        let _ = frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(fresh)],
+            egui::Modifiers::NONE,
+        );
+        let hover_router = music_input_router(&ctx);
+        assert!(
+            !hover_router.frame.unwrap().3.owns_pointer,
+            "an absent fullscreen lease cannot consume the first new unheld movement"
+        );
+        let _ = frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(fresh), button(fresh, true)],
+            egui::Modifiers::NONE,
+        );
+        assert_fresh_pan_input(&ctx, fresh, egui::Vec2::ZERO, false);
+        let router = music_input_router(&ctx);
+        assert!(
+            matches!(router.stream, MusicOverflowPointerStream::Idle),
+            "closed fullscreen ownership cannot adopt a fresh gesture after reopen"
+        );
+        let _ = frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(fresh - egui::vec2(0.0, 70.0))],
+            egui::Modifiers::NONE,
+        );
+        assert_fresh_pan_input(
+            &ctx,
+            fresh - egui::vec2(0.0, 70.0),
+            egui::vec2(0.0, -70.0),
+            true,
+        );
+        let _ = frame(&mut app, &ctx, vec![], egui::Modifiers::NONE);
+        assert!(app.music_analysis_source.is_some());
+        assert_eq!(
+            app.music_analysis
+                .as_ref()
+                .map(|analysis| analysis.bins.len()),
+            Some(120)
+        );
+        assert_eq!(
+            music_pan_probe(&ctx).offset.y,
+            app.music_timeline_last_scroll_offset
+        );
+        assert!(
+            app.music_timeline_last_scroll_offset > 0.0,
+            "fresh reopened timeline accepts middle panning; source={} analysis={:?} probes={:#?}",
+            app.music_analysis_source.is_some(),
+            app.music_analysis
+                .as_ref()
+                .map(|analysis| analysis.bins.len()),
+            music_pan_probe(&ctx)
+        );
+    }
+
+    #[test]
+    fn music_overflow_pointer_stream_root_lease_preserves_child_replay_and_isolation() {
+        let ctx = egui::Context::default();
+        let owner = crate::app::ViewerContextId::for_test(11);
+        let child = egui::ViewportId::from_hash_of("music-owner-child");
+        let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(820.0, 600.0));
+        let pos = fs_overflow_panel_rect(full, FsOverflowPanelState::MusicNoteColor)
+            .unwrap()
+            .center();
+        let button = |button, pressed| egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let child_frame = |events, open| {
+            let mut owned = false;
+            let mut raw = egui::RawInput {
+                viewport_id: child,
+                screen_rect: Some(full),
+                events,
+                ..Default::default()
+            };
+            raw.viewports.insert(
+                child,
+                egui::ViewportInfo {
+                    parent: Some(egui::ViewportId::ROOT),
+                    ..Default::default()
+                },
+            );
+            let _ = ctx.run(raw, |ctx| {
+                let first = music_overflow_frame_input(ctx, full, owner, true, open);
+                let replay = music_overflow_frame_input(ctx, full, owner, true, false);
+                assert_eq!(first.owns_pointer, replay.owns_pointer);
+                owned = first.owns_pointer;
+            });
+            owned
+        };
+        let _ = ctx.run(Default::default(), |_ctx| {});
+        assert!(child_frame(
+            vec![button(egui::PointerButton::Middle, true)],
+            true
+        ));
+        assert!(
+            child_frame(vec![egui::Event::PointerMoved(pos)], false),
+            "child passes preserve an active lease while ROOT has not advanced"
+        );
+        for _ in 0..2 {
+            let _ = ctx.run(Default::default(), |ctx| {
+                assert!(
+                    !music_overflow_frame_input(ctx, full, owner, true, false).owns_pointer,
+                    "child ownership cannot suppress the ROOT viewport"
+                );
+            });
+        }
+        assert!(
+            !child_frame(
+                vec![
+                    button(egui::PointerButton::Middle, false),
+                    button(egui::PointerButton::Primary, true)
+                ],
+                false
+            ),
+            "an absent child surface loses its old lease before a fresh press"
+        );
+    }
+
+    #[test]
+    fn music_overflow_pointer_stream_release_cancel_focus_context_and_replay() {
+        let ctx = egui::Context::default();
+        let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(820.0, 600.0));
+        let owner = crate::app::ViewerContextId::for_test(11);
+        let sibling = crate::app::ViewerContextId::for_test(12);
+        let pos = fs_overflow_panel_rect(full, FsOverflowPanelState::MusicNoteColor)
+            .unwrap()
+            .center();
+        let run = |events, focused, context, active, open| {
+            let mut result = MusicOverflowFrameInput::default();
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(full),
+                    events,
+                    focused,
+                    ..Default::default()
+                },
+                |ctx| {
+                    result = music_overflow_frame_input(ctx, full, context, active, open);
+                    let replay = music_overflow_frame_input(ctx, full, context, active, false);
+                    assert_eq!(replay.owns_pointer, result.owns_pointer);
+                    assert_eq!(replay.dismiss, result.dismiss);
+                },
+            );
+            result.owns_pointer
+        };
+        let mouse = |button, pressed| egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        assert!(run(
+            vec![mouse(egui::PointerButton::Middle, true)],
+            true,
+            owner,
+            true,
+            true
+        ));
+        assert!(
+            run(vec![egui::Event::PointerGone], true, owner, true, false),
+            "leaving the window with a held button keeps ownership"
+        );
+        assert!(run(
+            vec![mouse(egui::PointerButton::Primary, true)],
+            true,
+            owner,
+            true,
+            false
+        ));
+        assert!(run(
+            vec![mouse(egui::PointerButton::Middle, false)],
+            true,
+            owner,
+            true,
+            false
+        ));
+        assert!(
+            run(vec![], true, owner, true, false),
+            "other held button still owns the stream"
+        );
+        assert!(run(
+            vec![mouse(egui::PointerButton::Primary, false)],
+            true,
+            owner,
+            true,
+            false
+        ));
+        assert!(
+            !run(
+                vec![mouse(egui::PointerButton::Middle, true)],
+                true,
+                owner,
+                true,
+                false
+            ),
+            "fresh backing gesture is not reclassified after release"
+        );
+        assert!(
+            run(vec![], true, owner, true, true),
+            "existing open-menu frame suppression stays"
+        );
+        assert!(
+            !run(vec![], true, owner, true, false),
+            "opening during an old backing hold did not capture it"
+        );
+        let _ = run(
+            vec![mouse(egui::PointerButton::Middle, false)],
+            true,
+            owner,
+            true,
+            false,
+        );
+        assert!(run(
+            vec![mouse(egui::PointerButton::Middle, true)],
+            true,
+            owner,
+            true,
+            true
+        ));
+        assert!(run(
+            vec![
+                mouse(egui::PointerButton::Middle, false),
+                mouse(egui::PointerButton::Primary, true)
+            ],
+            true,
+            owner,
+            true,
+            false
+        ));
+        assert!(
+            !run(vec![], true, owner, true, false),
+            "fresh press after the last release is not captured"
+        );
+        let _ = run(
+            vec![mouse(egui::PointerButton::Primary, false)],
+            true,
+            owner,
+            true,
+            false,
+        );
+        let touch = |id, phase| egui::Event::Touch {
+            device_id: egui::TouchDeviceId(791),
+            id: egui::TouchId(id),
+            phase,
+            pos,
+            force: None,
+        };
+        let outside = egui::pos2(20.0, 260.0);
+        let outside_touch = |phase| egui::Event::Touch {
+            device_id: egui::TouchDeviceId(791),
+            id: egui::TouchId(3),
+            phase,
+            pos: outside,
+            force: None,
+        };
+        assert!(
+            run(
+                vec![
+                    egui::Event::PointerMoved(outside),
+                    outside_touch(egui::TouchPhase::Start)
+                ],
+                true,
+                owner,
+                true,
+                true
+            ),
+            "raw outside Touch Start owns its starting frame without a Primary mirror"
+        );
+        assert!(run(
+            vec![outside_touch(egui::TouchPhase::Cancel)],
+            true,
+            owner,
+            true,
+            false
+        ));
+        assert!(!run(vec![], true, owner, true, false));
+        assert!(
+            run(
+                vec![
+                    outside_touch(egui::TouchPhase::Start),
+                    outside_touch(egui::TouchPhase::End)
+                ],
+                true,
+                owner,
+                true,
+                true
+            ),
+            "same-frame raw touch stream owns its start and end"
+        );
+        assert!(!run(vec![], true, owner, true, false));
+        assert!(run(
+            vec![touch(1, egui::TouchPhase::Start)],
+            true,
+            owner,
+            true,
+            true
+        ));
+        assert!(run(
+            vec![touch(2, egui::TouchPhase::Start)],
+            true,
+            owner,
+            true,
+            false
+        ));
+        assert!(run(
+            vec![touch(1, egui::TouchPhase::End)],
+            true,
+            owner,
+            true,
+            false
+        ));
+        assert!(run(
+            vec![touch(2, egui::TouchPhase::Move)],
+            true,
+            owner,
+            true,
+            false
+        ));
+        assert!(run(
+            vec![touch(2, egui::TouchPhase::Cancel)],
+            true,
+            owner,
+            true,
+            false
+        ));
+        assert!(!run(vec![], true, owner, true, false));
+        assert!(run(
+            vec![mouse(egui::PointerButton::Middle, true)],
+            true,
+            owner,
+            true,
+            true
+        ));
+        assert!(
+            !run(vec![], false, owner, true, false),
+            "focus loss cancels"
+        );
+        assert!(!run(vec![], true, owner, true, false));
+        let _ = run(
+            vec![mouse(egui::PointerButton::Middle, false)],
+            true,
+            owner,
+            true,
+            false,
+        );
+        assert!(run(
+            vec![mouse(egui::PointerButton::Middle, true)],
+            true,
+            owner,
+            true,
+            true
+        ));
+        assert!(
+            !run(vec![], true, sibling, true, false),
+            "sibling context has no ownership"
+        );
+        assert!(
+            !run(vec![], true, owner, true, false),
+            "revisiting cannot revive canceled context"
+        );
+        let _ = run(
+            vec![mouse(egui::PointerButton::Middle, false)],
+            true,
+            owner,
+            true,
+            false,
+        );
+        assert!(run(
+            vec![mouse(egui::PointerButton::Middle, true)],
+            true,
+            owner,
+            true,
+            true
+        ));
+        assert!(
+            !run(vec![], true, owner, false, false),
+            "leaving music mode cancels"
+        );
+        assert!(!run(vec![], true, owner, true, false));
+    }
+
+    #[test]
+    fn music_overflow_real_touch_key_close_owns_move_through_cancel() {
+        let (mut app, ctx) = fixture();
+        let _ = open(&mut app, &ctx);
+        let pos = fs_overflow_panel_rect(ctx.content_rect(), app.fs_overflow_panel_state)
+            .unwrap()
+            .center();
+        let before = (
+            app.music_timeline_last_scroll_offset,
+            app.music_timeline_row_secs,
+            position(&app),
+        );
+        let touch = |phase, pos| egui::Event::Touch {
+            device_id: egui::TouchDeviceId(791),
+            id: egui::TouchId(1),
+            phase,
+            pos,
+            force: None,
+        };
+        let _ = frame(
+            &mut app,
+            &ctx,
+            vec![touch(egui::TouchPhase::Start, pos)],
+            egui::Modifiers::NONE,
+        );
+        let _ = frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::L,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            egui::Modifiers::NONE,
+        );
+        assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+        let outside = egui::pos2(300.0, 260.0);
+        for phase in [egui::TouchPhase::Move, egui::TouchPhase::Cancel] {
+            let _ = frame(
+                &mut app,
+                &ctx,
+                vec![touch(phase, outside)],
+                egui::Modifiers::NONE,
+            );
+            assert_eq!(
+                (
+                    app.music_timeline_last_scroll_offset,
+                    app.music_timeline_row_secs,
+                    position(&app)
+                ),
+                before
+            );
+        }
+        let old_volume = volume(&app);
+        let _ = frame(
+            &mut app,
+            &ctx,
+            wheel(outside, egui::Modifiers::NONE),
+            egui::Modifiers::NONE,
+        );
+        assert_ne!(
+            volume(&app),
+            old_volume,
+            "fresh input resumes after touch cancel"
+        );
+    }
+
+    #[test]
+    fn music_overflow_real_key_close_forwards_loop_without_wheel_tail() {
+        let (mut app, ctx) = fixture();
+        let _ = open(&mut app, &ctx);
+        let panel =
+            fs_overflow_panel_rect(ctx.content_rect(), app.fs_overflow_panel_state).unwrap();
+        let before = (
+            app.music_timeline_last_scroll_offset,
+            app.music_timeline_row_secs,
+            position(&app),
+        );
+        let old_loop = app.settings.video_loop_mode;
+        let mut events = wheel(panel.center(), egui::Modifiers::CTRL);
+        for pressed in [true, false] {
+            events.push(egui::Event::Key {
+                key: egui::Key::L,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        let _ = frame(&mut app, &ctx, events, egui::Modifiers::CTRL);
+        assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert_ne!(
+            app.settings.video_loop_mode, old_loop,
+            "dismissing key reaches existing loop operation"
+        );
+        for _ in 0..20 {
+            let _ = frame(&mut app, &ctx, vec![], egui::Modifiers::CTRL);
+        }
+        assert_eq!(
+            (
+                app.music_timeline_last_scroll_offset,
+                app.music_timeline_row_secs,
+                position(&app)
+            ),
+            before
+        );
     }
 }

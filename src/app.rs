@@ -1,3 +1,5 @@
+mod music_bass;
+
 // Evaluate old fixture payloads before borrowing AppTestEnv through DerefMut.
 #[cfg(test)]
 macro_rules! send_thumbnail_for_test {
@@ -13850,6 +13852,8 @@ mod music_analysis_lru_tests {
 
 /// 音楽ビュー解析ワーカー → UI スレッドのメッセージ (Inc 3b timeline + Inc 4 spectrum PCM)。
 pub(crate) enum MusicAnalysisMsg {
+    /// Independently inferred bass snapshot, never cached in the LRU.
+    Bass(Arc<music_core::bass::TimelineBassTrack>),
     /// progressive 途中経過のタイムライン (成功=部分解析 / 失敗=メッセージ)。display 専用で
     /// LRU には入れない (途中まで解析した prefix なので確定版ではない)。
     Timeline(Result<music_core::TimelineAnalysis, String>),
@@ -14042,6 +14046,10 @@ fn run_music_analysis(
         }
     }
     // Pcm は既にデコード開始前に送信済み (共有 Arc に append してきた)。ここでは再送しない。
+    // Only a successful, uncancelled decode starts bass, also on LRU hits.
+    music_bass::run(&pcm, cancel, |bass| {
+        tx.send(MusicAnalysisMsg::Bass(bass)).is_ok()
+    });
 }
 
 /// 削除 / リネームされた path 群に対する正規化キー一致判定 closure を作る
@@ -15139,7 +15147,7 @@ pub(crate) struct NormalFolderOmittedEntries {
     pub(crate) counts: folder_scan::OmittedFolderEntryCounts,
 }
 
-/// 静止画フルスクリーンの「その他の機能」パネルが所有する排他的な表示状態。
+/// 静止画・音楽フルスクリーンの「その他の機能」パネルが所有する排他的な表示状態。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum FsOverflowPanelState {
     #[default]
@@ -15147,6 +15155,7 @@ pub(crate) enum FsOverflowPanelState {
     Root,
     NavigatorPosition,
     SpreadAdjustment,
+    MusicNoteColor,
 }
 
 impl FsOverflowPanelState {
@@ -17814,12 +17823,13 @@ pub struct App {
     /// `Arc` で保持し、row raster worker へは refcount のクローンだけ渡す (Codex P2)。
     /// 代入は必ず `set_music_analysis` を通す (下の版数を進めるため)。
     pub(crate) music_analysis: Option<std::sync::Arc<music_core::TimelineAnalysis>>,
-    /// `music_analysis` を差し替えるたびに進む版数 (1 始まり、0 は timeline cache 側の
+    /// `music_analysis` / `music_bass` の採用をまとめた1 drainごとに進む版数 (0 は timeline cache 側の
     /// 「未取得」sentinel)。行ラスタの「解析が変わったか」判定はこの版数で行う。
     /// `Arc::as_ptr` の identity 比較は、複数メッセージを 1 drain で連続適用したとき
     /// 旧 Arc の drop 直後に新 Arc が同アドレスへ確保される ABA で「変わっていない」と
     /// 誤認し、確定解析への再ラスタが不発になる (review-v2.3.0 P2-4)。
     pub(crate) music_analysis_version: u64,
+    pub(crate) music_bass: Option<Arc<music_core::bass::TimelineBassTrack>>,
     /// 直近 N 曲のタイムライン解析結果を保持する in-memory LRU (先頭が最新)。永続 DB
     /// (旧 `audio_analysis.db`) はやめた: どのみち spectrum 用に毎回全尺デコードするので永続
     /// キャッシュの実利は薄く、セッション内の A/B 切替を即時にする効果だけで十分 (§D9)。
@@ -20703,6 +20713,7 @@ impl App {
             music_analysis_source: None,
             music_analysis: None,
             music_analysis_version: 0,
+            music_bass: None,
             music_analysis_lru: Vec::new(),
             music_analysis_error: None,
             music_analysis_pending: None,
@@ -73697,6 +73708,7 @@ impl App {
         self.music_timeline_scroll_req = 0.0;
         self.music_timeline_reanchor_playhead_once = false;
         self.set_music_analysis(None);
+        self.music_bass = None;
         self.music_pcm = None;
         self.music_probe = None;
         self.music_analysis_error = None;
@@ -73865,6 +73877,8 @@ impl App {
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             return;
         }
+        let mut latest_analysis = None;
+        let mut latest_bass = None;
         let mut got_any = false;
         let mut disconnected = false;
         loop {
@@ -73875,11 +73889,11 @@ impl App {
                         match msg {
                             // progressive 途中経過: 表示だけ更新 (LRU には載せない)。
                             MusicAnalysisMsg::Timeline(Ok(analysis)) => {
-                                self.set_music_analysis(Some(std::sync::Arc::new(analysis)));
+                                latest_analysis = Some(Some(Arc::new(analysis)));
                                 self.music_analysis_error = None;
                             }
                             MusicAnalysisMsg::Timeline(Err(e)) => {
-                                self.set_music_analysis(None);
+                                latest_analysis = Some(None);
                                 self.music_analysis_error = Some(e);
                             }
                             // 全尺デコード後の確定版: 表示更新 + in-memory LRU に載せる。
@@ -73888,7 +73902,7 @@ impl App {
                             // code P2)。meta が None (stat 失敗 / size=0) ならキャッシュしない。
                             MusicAnalysisMsg::TimelineComplete { analysis, meta } => {
                                 let arc = std::sync::Arc::new(analysis);
-                                self.set_music_analysis(Some(arc.clone()));
+                                latest_analysis = Some(Some(arc.clone()));
                                 self.music_analysis_error = None;
                                 if let Some((mtime, size)) = meta {
                                     let key = MusicAnalysisKey {
@@ -73901,6 +73915,9 @@ impl App {
                                     };
                                     self.music_analysis_lru_insert(key, arc);
                                 }
+                            }
+                            MusicAnalysisMsg::Bass(bass) => {
+                                latest_bass = Some(bass);
                             }
                             MusicAnalysisMsg::Pcm(pcm) => {
                                 self.music_pcm = Some(pcm);
@@ -73917,6 +73934,16 @@ impl App {
                     break;
                 }
             }
+        }
+
+        // Timeline and bass share a single version increment per drain.
+        if let Some(analysis) = latest_analysis {
+            self.set_music_analysis(analysis);
+        } else if latest_bass.is_some() {
+            self.music_analysis_version = self.music_analysis_version.wrapping_add(1);
+        }
+        if let Some(bass) = latest_bass {
+            self.music_bass = Some(bass);
         }
 
         if disconnected {
@@ -73988,10 +74015,14 @@ impl App {
     }
 
     pub(crate) fn clear_music_view_state(&mut self) {
+        if self.fs_overflow_panel_state == FsOverflowPanelState::MusicNoteColor {
+            self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+        }
         self.cancel_music_analysis();
         self.music_timeline_cache.clear();
         self.music_spectrum.clear();
         self.set_music_analysis(None);
+        self.music_bass = None;
         // LRU 本体 (直近 N 曲) はセッション中保持して音声への再入を即時にする。キーは
         // path+stream index+size+mtime + ワーカーの fresh stat 検証で再利用先を限定する。
         self.music_pcm = None;

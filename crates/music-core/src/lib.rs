@@ -5,8 +5,10 @@
 //! to these small contracts without pulling lab-only code into the hot path.
 
 pub mod analysis;
+pub mod bass;
 pub mod beat;
 pub mod effects;
+pub mod pitch;
 pub mod playback;
 pub mod timeline;
 
@@ -17,6 +19,10 @@ pub use analysis::{
     analyze_stereo_timeline, analyze_stereo_timeline_cancellable,
     analyze_stereo_waveform_cancellable, apply_display_gain_db, resample_linear_stereo,
     spectrum_analysis_from_stereo_window, spectrum_bands_from_stereo_window,
+};
+pub use bass::{
+    BassEstimate, TIMELINE_BASS_SEGMENT_FRAMES, TimelineBassSegment, TimelineBassTrack,
+    calculate_timeline_bass_segment, pitch_frame_at_secs, select_bass,
 };
 pub use beat::{BarMarker, BeatGrid, BeatMarker, BeatTrackingStatus};
 pub use effects::{AudioProcessBlock, EffectChain, EffectChainStats, EffectError, NoopEffectChain};

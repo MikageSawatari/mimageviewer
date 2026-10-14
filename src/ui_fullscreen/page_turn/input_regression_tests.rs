@@ -392,6 +392,7 @@ fn actual_pointer_handler(
         0,
         &mut None,
         None,
+        false,
         &mut operation,
     );
     (navigation, close, operation)

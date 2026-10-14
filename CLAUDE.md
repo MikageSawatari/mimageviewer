@@ -2021,6 +2021,13 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 
 ### Phase 2: 依存物の確認 + 性能回帰チェック
 
+6.3. **依存物の更新確認**: `.\scripts\check-dependency-updates.ps1` を実行し、
+   標準出力と `target/dependency-updates/<日付>.md` の一覧を見て、上げるかを判断する。
+   問い合わせ専用で依存物の取得・変更・インストールは行わない。手を入れているクレートを
+   上げるときは、表にある変更記録 (`PATCHES.md` / `MIV-PATCH.md` / README の patch 節等) に
+   従って変更を付け直す。月 1 回の自動実行もある。既存の PDFium 等の個別手順も引き続き行う。
+   詳細は [リリース運用メモ](docs/release-operations.md#依存物の更新確認) を参照。
+
 6.4. **記録済みクラッシュの棚卸し (最初に回す)**:
 
    ```powershell

@@ -27,6 +27,45 @@ UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot
 更新後は `tests/snapshots/*.png` の差分を必ず目視確認してからコミットする。
 git diff のバイナリ比較では変化の意図 (改善なのか回帰なのか) は判断できない。
 
+音楽タイムラインの調・低域音量（鍵盤設計§14、2026-10-14）は、libの純ラスタ描画で
+`timeline_bass_partial_raster`（240×80）と`timeline_key_states_raster`（660×80）を検査する。
+前者はベース高さの低域音量化とKey既定色の灰色化で更新（変更2798px、範囲x=8..207/y=23..39）。
+計算済み側のベース色と未計算側の灰色、上段波形が保たれることを更新前後のPNGで目視確認した。
+後者は新規で、未計算／計算済み調なし／C長調を横並びにし、前2つの灰色と推定調の色を確認する。
+新規PNGの説明ラベルも本体と同じ`ui_fonts::configure_fonts`で描く。
+第3段階時点の2枚の合計は9336 bytes（1544＋7792）。実アプリ・Appの起動は行わない。
+
+音名配色と音楽メニュー（鍵盤設計§15、2026-10-14）は、上記2枚の音名色を更新する。
+C=赤と暗い音名だけの明度補正を鍵盤・ベース／調で共有する変更による。
+上段の波形や未計算／調なしの灰色は維持する。
+`music_overflow_hud_normal`（820×300）と`music_overflow_hud_narrow`（320×300）は
+本体と共通の純粋な上部HUD描画を使い、「…」・Row・タイトル・閉じる操作が重ならないことを確認する。
+`music_overflow_panel`（820×300）は共通overflow surfaceの「音名の色」の2択と選択中表示を確認する。
+これら3枚は本体フォントを設定したlib harnessで生成し、App全体をsnapshot対象にしない。
+実入力回帰は別のdisposable App fixtureで本体の`render_fullscreen_viewport`を通す。
+第4段階の既存2枚は計9343 bytes（1544＋7799）、新規3枚は計46877 bytes、5枚合計56220 bytes。
+既存2枚の変更はベース音の1820px（x=8..147/y=23..35）とC長調の3400px（x=424..623/y=47..63）だけ。
+更新前後と新規3枚を目視確認し、波形・灰色の保持、文字表示、HUDと操作の非重複を確認した。
+実行結果は鍵盤設計§15.6へ記録する。
+
+第4段階の追加レビュー修正（鍵盤設計§15.7）は、共通パネルの行間3pxを高さ算定に含める。
+`fullscreen_overflow_panel_root`（720×440）と`fullscreen_overflow_panel_navigator_submenu`（720×440）、
+`music_overflow_panel`（820×300）は、基準画像を変更せずに通常比較で候補PNGを生成し、
+更新前に左右比較を目視した。不要なbarが消え、パネル高がそれぞれ15／12／3px増え、
+最終行と選択行が切れずに収まる。行間・文字・HUDは維持する。
+3枚の変更は9883／10231／2883px、新しいbytesは29893／15285／22472。
+通常幅／狭幅の音楽HUD画像は変更しない。確認画像と統計は`target/review-fixes-validation/`に保存する。
+`spread_shift_hud_{resolved,unresolved}_{normal,narrow}_{light,dark}`の8枚も、
+更新前の左右比較で目視確認した。本文は同じ自然な高さを保ち、余分な下部空白を除いて
+パネル高を348→282pxへ縮める。差分はy=338..411の下端だけで、本文・marker・disabled表示・
+チェック欄は一致する。normalは各26832px、narrowは各18792pxが変化し、画像寸法とbytesは維持する。
+
+pitch-labのmaster統合では、上記P3の高さ・行間修正をmasterの共通実装へ統一する。
+本文の行間は0、固定行高48ptで計算し、音楽の2択も同じ計算と
+`test_ui::scroll_layout::ScrollLayout`の収まり／実入力による末尾到達検査を使う。
+上記P3の画像説明は統合前の履歴。静止画Root／Navigatorと見開き調整HUD8枚はmaster側PNGを採用し、
+以後の通常比較で維持を確認する。音楽パネルの更新前後は目視確認し、変更は鍵盤設計§15.8へ記録する。
+
 本別見開き調整 (§1.364 D2) は`spread_shift_hud_{resolved,unresolved}_{normal,narrow}_{light,dark}`の
 8ケースを定義する。normalは720×500、narrowは320×480。実HUDの調整submenuと調整の印を
 使い、resolvedの基点jump・解除・全体checkboxの到達性を確認する。unresolvedはjumpのみ無効にし、
