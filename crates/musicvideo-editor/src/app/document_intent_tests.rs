@@ -35,6 +35,133 @@ fn confirmed(app: &MusicVideoLabApp) -> bool {
     )
 }
 
+fn lyrics_app() -> (MusicVideoLabApp, LayerId, Vec<LyricLine>) {
+    let mut app = app();
+    let mut layer = musicvideo_core::new_lyrics_layer(&app.project);
+    let id = layer.id;
+    let lines = vec![
+        LyricLine {
+            text: "A".into(),
+            time_secs: Some(1.0),
+        },
+        LyricLine {
+            text: "B".into(),
+            time_secs: Some(2.0),
+        },
+    ];
+    if let LayerKind::Lyrics(lyrics) = &mut layer.kind {
+        lyrics.lines = lines.clone();
+    }
+    app.project.layers.push(layer);
+    app.editor_state.reset_for_project(&app.project);
+    app.editor_state
+        .select_layer(&app.project, app.project.layers.len() - 1);
+    (app, id, lines)
+}
+
+fn pending_lyrics(
+    app: &mut MusicVideoLabApp,
+    ctx: &egui::Context,
+) -> (egui::Id, egui::text::CCursorRange) {
+    let pos = rendered_editor_text(app, ctx, "A\nB", true);
+    editor_input(app, ctx, pointer_input(pos, true));
+    editor_input(app, ctx, pointer_input(pos, false));
+    let widget = ctx.memory(|memory| memory.focused()).unwrap();
+    let selection =
+        egui::text::CCursorRange::two(egui::text::CCursor::new(1), egui::text::CCursor::new(2));
+    let mut native = egui::text_edit::TextEditState::load(ctx, widget).unwrap();
+    native.cursor.set_char_range(Some(selection));
+    native.store(ctx, widget);
+    frame(app, ctx);
+    editor_input(app, ctx, vec![egui::Event::Cut]);
+    assert!(app.editor_state.has_pending_lyrics_edit());
+    (widget, selection)
+}
+
+fn click(app: &mut MusicVideoLabApp, ctx: &egui::Context, label: &str) {
+    let pos = rendered_editor_text(app, ctx, label, true);
+    editor_input(app, ctx, pointer_input(pos, true));
+    editor_input(app, ctx, pointer_input(pos, false));
+}
+
+#[test]
+fn p4b4_lrc_ready_during_lyrics_confirmation_returns_after_intent_cancel() {
+    for apply in [false, true] {
+        let ctx = crate::project::test_context();
+        let (mut app, id, original) = lyrics_app();
+        let (tx, rx) = mpsc::channel();
+        app.lrc_load = LrcLoadState::Loading {
+            owner: LrcLoadOwner {
+                session: app.document.id(),
+                layer: id,
+                target_lifetime: app.editor_state.layer_target_lifetime(id).unwrap(),
+                baseline: original.clone(),
+            },
+            rx,
+        };
+        pending_lyrics(&mut app, &ctx);
+        // Resolve an unselected layer, and avoid confusing its disabled inspector's
+        // same-labelled cancel button with the active modal button in shape lookup.
+        app.editor_state.select_layer(&app.project, 0);
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .events
+            .push(egui::ViewportEvent::Close);
+        let _ = ctx.run(input, |ctx| {
+            app.process_editor_frame(ctx);
+        });
+        assert!(app.intent_pending());
+        assert!(app.editor_state.has_pending_lyrics_edit());
+        tx.send(Ok((
+            "loaded.lrc".into(),
+            parse_lrc(b"[00:03.00]loaded\n").unwrap(),
+        )))
+        .unwrap();
+        frame(&mut app, &ctx);
+        assert!(matches!(app.lrc_load, LrcLoadState::Ready { .. }));
+        // Real pointer input must reach the lyrics decision even after a later modal
+        // would otherwise claim the foreground. Do not dispatch the action directly.
+        click(&mut app, &ctx, "変更を取り消す");
+        assert!(
+            !app.editor_state.has_pending_lyrics_edit(),
+            "lyrics cancel click was blocked by the LRC modal"
+        );
+        assert!(confirmed(&app));
+        assert!(matches!(app.lrc_load, LrcLoadState::Ready { .. }));
+        assert_eq!(app.current_lyrics(id).unwrap(), original);
+        click(&mut app, &ctx, "キャンセル");
+        assert!(
+            !app.intent_pending(),
+            "intent cancel click was blocked by the LRC modal"
+        );
+        assert!(matches!(app.lrc_load, LrcLoadState::Ready { .. }));
+        click(
+            &mut app,
+            &ctx,
+            if apply {
+                "LRC の内容へ置換（現在の歌詞変更を破棄）"
+            } else {
+                "現在の歌詞を保持"
+            },
+        );
+        assert!(matches!(app.lrc_load, LrcLoadState::Idle));
+        assert_eq!(
+            app.current_lyrics(id).unwrap(),
+            if apply {
+                vec![LyricLine {
+                    text: "loaded".into(),
+                    time_secs: Some(3.0),
+                }]
+            } else {
+                original
+            }
+        );
+    }
+}
+
 fn executed(app: &MusicVideoLabApp, intent: &DocumentIntent, previous: DocumentSessionId) {
     match intent {
         DocumentIntent::Open(path) => {
@@ -251,7 +378,7 @@ fn p4b4_material_completion_during_save_reconfirms() {
 }
 
 #[test]
-fn p4b4_received_queued_and_ready_project_results_are_retired_in_both_orders() {
+fn p4b4_received_queued_and_ready_project_results_are_retired_on_intent() {
     for ready in [false, true] {
         for load_first in [false, true] {
             let ctx = crate::project::test_context();
@@ -295,6 +422,62 @@ fn p4b4_received_queued_and_ready_project_results_are_retired_in_both_orders() {
             ));
         }
     }
+}
+
+fn project_and_save_completion_order(load_first: bool) {
+    let ctx = crate::project::test_context();
+    let mut app = app();
+    let session = app.document.id();
+    let original = app.project.clone();
+    let save_tx = saving(&mut app);
+    let (load_tx, rx) = mpsc::channel();
+    app.project_load = ProjectLoadState::Loading(ProjectLoadPending {
+        started_at: app.document.edit_generation(),
+        cancel: Arc::new(AtomicBool::new(false)),
+        rx,
+        queued: None,
+    });
+    app.accept_document_intent(DocumentIntent::Close);
+    if load_first {
+        // A retired receiver may already have been dropped by cleanup. Sending an old
+        // completion can then fail; neither a queued result nor that failure may be adopted.
+        let _ = load_tx.send(Ok(loaded_project("intruder.json", 99.0)));
+        frame(&mut app, &ctx);
+        assert!(app.intent_pending());
+        assert!(!confirmed(&app));
+        assert_eq!(app.document.id(), session);
+        assert_eq!(app.project, original);
+        save_tx.send(Ok(())).unwrap();
+        frame(&mut app, &ctx);
+    } else {
+        save_tx.send(Ok(())).unwrap();
+        frame(&mut app, &ctx);
+        assert!(matches!(
+            app.document_intent,
+            DocumentIntentState::CloseApproved
+        ));
+        assert_eq!(app.document.id(), session);
+        // This completion is sent only AFTER the save has been consumed in a frame.
+        let _ = load_tx.send(Ok(loaded_project("intruder.json", 99.0)));
+        frame(&mut app, &ctx);
+    }
+    assert_eq!(app.document.id(), session);
+    assert_eq!(app.project, original);
+    assert!(matches!(app.project_load, ProjectLoadState::Idle));
+    assert!(matches!(
+        app.document_intent,
+        DocumentIntentState::CloseApproved
+    ));
+}
+
+#[test]
+fn p4b4_project_completion_before_save_is_retired() {
+    project_and_save_completion_order(true);
+}
+
+#[test]
+fn p4b4_project_completion_after_save_is_retired() {
+    project_and_save_completion_order(false);
 }
 
 #[test]
@@ -479,40 +662,10 @@ fn p4b4_modal_blocks_toolbar_and_editor_input_while_saving() {
 }
 
 #[test]
-fn p4b4_lyrics_cancel_before_intent_resumes_and_received_project_cannot_win() {
+fn p4b4_lyrics_cancel_frame_rejects_late_project_completion() {
     let ctx = crate::project::test_context();
-    let mut app = app();
-    let mut layer = musicvideo_core::new_lyrics_layer(&app.project);
-    let id = layer.id;
-    let lines = vec![
-        LyricLine {
-            text: "A".into(),
-            time_secs: Some(1.0),
-        },
-        LyricLine {
-            text: "B".into(),
-            time_secs: Some(2.0),
-        },
-    ];
-    if let LayerKind::Lyrics(lyrics) = &mut layer.kind {
-        lyrics.lines = lines.clone();
-    }
-    app.project.layers.push(layer);
-    app.editor_state.reset_for_project(&app.project);
-    app.editor_state
-        .select_layer(&app.project, app.project.layers.len() - 1);
-    let pos = rendered_editor_text(&mut app, &ctx, "A\nB", true);
-    editor_input(&mut app, &ctx, pointer_input(pos, true));
-    editor_input(&mut app, &ctx, pointer_input(pos, false));
-    let widget = ctx.memory(|memory| memory.focused()).unwrap();
-    let selection =
-        egui::text::CCursorRange::two(egui::text::CCursor::new(1), egui::text::CCursor::new(2));
-    let mut native = egui::text_edit::TextEditState::load(&ctx, widget).unwrap();
-    native.cursor.set_char_range(Some(selection));
-    native.store(&ctx, widget);
-    frame(&mut app, &ctx);
-    editor_input(&mut app, &ctx, vec![egui::Event::Cut]);
-    assert!(app.editor_state.has_pending_lyrics_edit());
+    let (mut app, id, lines) = lyrics_app();
+    let (widget, selection) = pending_lyrics(&mut app, &ctx);
     let (tx, rx) = mpsc::channel();
     app.project_load = ProjectLoadState::Loading(ProjectLoadPending {
         started_at: app.document.edit_generation(),
@@ -520,7 +673,6 @@ fn p4b4_lyrics_cancel_before_intent_resumes_and_received_project_cannot_win() {
         rx,
         queued: None,
     });
-    tx.send(Ok(loaded_project("unwanted.json", 99.0))).unwrap();
     app.accept_document_intent(DocumentIntent::Close);
     frame(&mut app, &ctx);
     assert!(!confirmed(&app));
@@ -528,6 +680,10 @@ fn p4b4_lyrics_cancel_before_intent_resumes_and_received_project_cannot_win() {
     app.editor_state.select_layer(&app.project, 0);
     let pos = rendered_editor_text(&mut app, &ctx, "変更を取り消す", true);
     editor_input(&mut app, &ctx, pointer_input(pos, true));
+    assert!(app.editor_state.has_pending_lyrics_edit());
+    // Deliver the old worker result immediately before the pointer-release frame.
+    // Lyrics cancellation is handled before poll_projects in this exact frame.
+    let _ = tx.send(Ok(loaded_project("unwanted.json", 99.0)));
     editor_input(&mut app, &ctx, pointer_input(pos, false));
     assert!(!app.editor_state.has_pending_lyrics_edit());
     assert!(confirmed(&app));

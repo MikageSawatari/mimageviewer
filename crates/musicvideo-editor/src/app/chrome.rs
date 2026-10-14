@@ -448,6 +448,11 @@ impl MusicVideoLabApp {
 
     pub(super) fn draw_load_choice(&self, ctx: &egui::Context) -> Vec<ChromeAction> {
         let mut actions = Vec::new();
+        // Intent/lyrics decisions own the modal while their dispatch gate is active.
+        // Keep Ready results untouched so cancelling the intent resumes this decision.
+        if self.intent_pending() {
+            return actions;
+        }
         // One decision at a time. Keep both Ready payloads; Project replacement already
         // invalidates LRC via the existing session boundary, whereas discard preserves it.
         if matches!(self.project_load, ProjectLoadState::Ready(_)) {
