@@ -56,7 +56,9 @@ fn explicit_viewport_ime_read_is_read_only_and_viewport_isolated() {
             plugin.viewports.get(&viewport_id).copied().unwrap()
         })
         .unwrap();
-    ctx.begin_pass(viewport_raw_input(egui::ViewportId::ROOT, Vec::new()));
+    let mut root_input = viewport_raw_input(egui::ViewportId::ROOT, Vec::new());
+    root_input.viewports.insert(viewport_id, Default::default());
+    ctx.begin_pass(root_input);
     assert!(ime_input_active_in_viewport(&ctx, viewport_id));
     let after_read = ctx
         .with_plugin(|plugin: &mut ImeInputPlugin| {
@@ -106,11 +108,6 @@ fn pending_native_events_project_without_mutating_plugin_state() {
     let pending = vec![egui::Event::Ime(egui::ImeEvent::Commit("あ".to_owned()))];
 
     assert!(!ime_composing_with_pending_events(
-        &ctx,
-        egui::ViewportId::ROOT,
-        &pending,
-    ));
-    assert!(ime_input_active_with_pending_events(
         &ctx,
         egui::ViewportId::ROOT,
         &pending,
@@ -169,46 +166,60 @@ fn composing_normal_key_presses_and_releases_are_preserved() {
 }
 
 #[test]
-fn noncomposing_and_ime_grace_escape_presses_are_preserved() {
+fn noncomposing_and_post_commit_keys_are_preserved_without_activity() {
+    for same_pass in [true, false] {
+        for key in [egui::Key::Enter, egui::Key::Escape, egui::Key::J] {
+            let ctx = test_context();
+            establish_composition(&ctx, egui::ViewportId::ROOT);
+            let mut events = vec![
+                egui::Event::Ime(egui::ImeEvent::Commit("確定".to_owned())),
+                egui::Event::Ime(egui::ImeEvent::Disabled),
+            ];
+            if same_pass {
+                events.push(key_event(key));
+            } else {
+                ctx.begin_pass(viewport_raw_input(egui::ViewportId::ROOT, events));
+                assert!(!ime_input_active(&ctx));
+                let _ = ctx.end_pass();
+                events = vec![key_event(key)];
+            }
+            ctx.begin_pass(viewport_raw_input(egui::ViewportId::ROOT, events));
+            assert!(!ime_input_active(&ctx));
+            assert!(ctx.input(|input| input.events.contains(&key_event(key))));
+            assert_eq!(empty_preedit_count(&ctx), 0);
+            let _ = ctx.end_pass();
+        }
+    }
+}
+
+#[test]
+fn viewport_destroy_and_focus_loss_discard_unterminated_composition() {
     let ctx = test_context();
-    let viewport_id = egui::ViewportId::from_hash_of("ime-escape-grace");
-
-    ctx.begin_pass(viewport_raw_input(
-        viewport_id,
-        vec![key_event(egui::Key::Escape)],
-    ));
-    assert!(ctx.input(|input| input.events == vec![key_event(egui::Key::Escape)]));
-    assert_eq!(empty_preedit_count(&ctx), 0);
+    let child = egui::ViewportId::from_hash_of("reopened-ime");
+    establish_composition(&ctx, child);
+    // A ROOT pass reports the child no longer exists, with no terminal IME event.
+    ctx.begin_pass(viewport_raw_input(egui::ViewportId::ROOT, vec![]));
+    assert!(!ime_input_active_in_viewport(&ctx, child));
+    let _ = ctx.end_pass();
+    ctx.begin_pass(viewport_raw_input(child, vec![]));
+    assert!(!ime_input_active(&ctx));
     let _ = ctx.end_pass();
 
-    establish_composition(&ctx, viewport_id);
-    ctx.begin_pass(viewport_raw_input(
-        viewport_id,
-        vec![egui::Event::Ime(egui::ImeEvent::Disabled)],
-    ));
-    assert_eq!(empty_preedit_count(&ctx), 1);
-    assert!(ime_input_active(&ctx), "Disabled starts the shortcut grace");
-    assert!(
-        !ctx.with_plugin(|plugin: &mut ImeInputPlugin| {
-            plugin.viewports.get(&viewport_id).unwrap().composing
-        })
-        .unwrap()
-    );
-    let mut grace_state = ctx
-        .with_plugin(|plugin: &mut ImeInputPlugin| *plugin.viewports.get(&viewport_id).unwrap())
-        .unwrap();
-    let _ = ctx.end_pass();
-
-    let mut events = vec![key_event(egui::Key::Escape)];
-    assert!(
-        grace_state.input_active_at(Instant::now()),
-        "the 300ms grace is still active"
-    );
-    normalize_ime_input(&mut events, &mut grace_state, Instant::now());
-    assert_eq!(events, vec![key_event(egui::Key::Escape)]);
-    assert!(!events.iter().any(
-        |event| matches!(event, egui::Event::Ime(egui::ImeEvent::Preedit(text)) if text.is_empty())
-    ));
+    for event_only in [false, true] {
+        establish_composition(&ctx, child);
+        let mut input = viewport_raw_input(child, vec![]);
+        if event_only {
+            input.events.push(egui::Event::WindowFocused(false));
+        } else {
+            input.focused = false;
+        }
+        ctx.begin_pass(input);
+        assert!(!ime_input_active(&ctx));
+        let _ = ctx.end_pass();
+        ctx.begin_pass(viewport_raw_input(child, vec![]));
+        assert!(!ime_input_active(&ctx));
+        let _ = ctx.end_pass();
+    }
 }
 
 #[test]
@@ -345,13 +356,17 @@ fn disabled_without_local_composition_preserves_events_and_other_viewport() {
     let composing_viewport = egui::ViewportId::from_hash_of("ime-isolated-composing");
     establish_composition(&ctx, composing_viewport);
 
-    ctx.begin_pass(viewport_raw_input(
+    let mut root_input = viewport_raw_input(
         egui::ViewportId::ROOT,
         vec![
             key_event(egui::Key::Escape),
             egui::Event::Ime(egui::ImeEvent::Disabled),
         ],
-    ));
+    );
+    root_input
+        .viewports
+        .insert(composing_viewport, Default::default());
+    ctx.begin_pass(root_input);
     let _ = ime_input_active(&ctx);
     assert_eq!(empty_preedit_count(&ctx), 0);
     assert!(ctx.input(|input| input.events.contains(&key_event(egui::Key::Escape))));
@@ -752,6 +767,129 @@ fn ime_enter_commit_and_escape_cancel_keep_the_editing_field_focus() {
         assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
         assert_eq!(first, if key == egui::Key::Enter { "あ" } else { "" });
         assert!(second.is_empty());
+    }
+}
+
+fn draw_recovery_field(
+    ctx: &egui::Context,
+    id: egui::Id,
+    text: &mut String,
+    request: Option<&mut bool>,
+    lose_focus: bool,
+) -> egui::Response {
+    egui::CentralPanel::default()
+        .show(ctx, |ui| {
+            show_singleline(ui, text, request, |edit| {
+                if lose_focus {
+                    ctx.memory_mut(|memory| memory.surrender_focus(id));
+                }
+                edit.id(id)
+            })
+            .response
+        })
+        .inner
+}
+
+fn recover_with_alt_disabled(ctx: &egui::Context, id: egui::Id, text: &mut String) {
+    let mut alt_j = key_event(egui::Key::J);
+    if let egui::Event::Key { modifiers, .. } = &mut alt_j {
+        modifiers.alt = true;
+    }
+    let _ = ctx.run(
+        viewport_raw_input(
+            egui::ViewportId::ROOT,
+            vec![egui::Event::Ime(egui::ImeEvent::Disabled), alt_j],
+        ),
+        |ctx| {
+            let response = draw_recovery_field(ctx, id, text, None, true);
+            assert!(response.has_focus(), "transient Alt loss must be restored");
+            assert_eq!(
+                ctx.data(|data| data.get_temp::<u64>(focus_retry_id(ctx.viewport_id(), id))),
+                Some(ctx.cumulative_pass_nr())
+            );
+        },
+    );
+}
+
+#[test]
+fn focus_retry_preserves_normal_enter_escape_and_other_widget_focus() {
+    for external_latch in [false, true] {
+        for next in [egui::Key::Enter, egui::Key::Escape, egui::Key::J] {
+            let ctx = test_context();
+            let id = egui::Id::new(("retry-field", external_latch, next));
+            let other = egui::Id::new("other-field");
+            let mut text = "text".to_owned();
+            let mut caller_request = true;
+            let _ = ctx.run(Default::default(), |ctx| {
+                draw_recovery_field(ctx, id, &mut text, Some(&mut caller_request), false);
+            });
+            assert!(!caller_request);
+            assert_eq!(ctx.memory(|memory| memory.focused()), Some(id));
+            recover_with_alt_disabled(&ctx, id, &mut text);
+            let _ = ctx.run(
+                viewport_raw_input(egui::ViewportId::ROOT, vec![key_event(next)]),
+                |ctx| {
+                    if next == egui::Key::J {
+                        ctx.memory_mut(|memory| memory.request_focus(other));
+                    }
+                    let request = external_latch.then_some(&mut caller_request);
+                    let response = draw_recovery_field(ctx, id, &mut text, request, false);
+                    assert!(!response.has_focus());
+                    if next == egui::Key::J {
+                        assert_eq!(ctx.memory(|memory| memory.focused()), Some(other));
+                    } else {
+                        assert!(response.lost_focus());
+                        assert!(ctx.memory(|memory| memory.focused()).is_none());
+                    }
+                    assert!(!caller_request);
+                    let retry = ctx
+                        .data(|data| data.get_temp::<u64>(focus_retry_id(ctx.viewport_id(), id)));
+                    assert!(retry.is_none());
+                    // Explicit caller requests remain unconditional, even on Enter/Escape.
+                    caller_request = true;
+                },
+            );
+            let _ = ctx.run(Default::default(), |ctx| {
+                draw_recovery_field(ctx, id, &mut text, Some(&mut caller_request), false);
+                assert_eq!(ctx.memory(|memory| memory.focused()), Some(id));
+            });
+            assert!(!caller_request);
+        }
+    }
+}
+
+#[test]
+fn focus_retry_expires_when_field_is_hidden_before_next_pass() {
+    for external_latch in [false, true] {
+        let ctx = test_context();
+        let id = egui::Id::new(("hidden-retry-field", external_latch));
+        let mut text = "text".to_owned();
+        let mut caller_request = true;
+        let _ = ctx.run(Default::default(), |ctx| {
+            draw_recovery_field(ctx, id, &mut text, Some(&mut caller_request), false);
+        });
+        recover_with_alt_disabled(&ctx, id, &mut text);
+        for _ in 0..2 {
+            let _ = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |_| {});
+            });
+        }
+        let _ = ctx.run(
+            viewport_raw_input(egui::ViewportId::ROOT, vec![key_event(egui::Key::J)]),
+            |ctx| {
+                let request = external_latch.then_some(&mut caller_request);
+                let response = draw_recovery_field(ctx, id, &mut text, request, false);
+                assert!(
+                    !response.has_focus(),
+                    "a stale retry must not refocus a reopened field"
+                );
+                assert!(
+                    ctx.data(|data| data.get_temp::<u64>(focus_retry_id(ctx.viewport_id(), id)))
+                        .is_none()
+                );
+            },
+        );
+        assert!(!caller_request);
     }
 }
 

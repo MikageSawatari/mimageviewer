@@ -538,8 +538,34 @@ fn ordinary_enter_finishes_singleline_and_lyrics_enter_after_commit_still_insert
 }
 
 #[test]
-fn history_shortcuts_preserve_events_and_project_during_composition_and_grace_without_focus() {
-    for composing in [false, true] {
+fn history_shortcuts_preserve_events_and_project_during_composition_without_focus() {
+    for (key_code, modifiers) in [
+        (Key::Z, Modifiers::CTRL),
+        (Key::Y, Modifiers::CTRL),
+        (Key::Z, Modifiers::CTRL | Modifiers::SHIFT),
+    ] {
+        let mut h = Harness::new(Field::Text);
+        h.seed_project_history();
+        h.frame(start_preedit());
+        assert!(egui_ime::ime_input_active(&h.context));
+        let before = h.project.clone();
+        let resources = h.state.resources.clone();
+        let depths = h.state.history_depths();
+        let event = key(key_code, modifiers, true, false);
+        h.frame(vec![event.clone()]);
+        assert!(!h.wants_keyboard_before_shortcut);
+        assert_eq!(h.recovery_before_shortcut, None);
+        assert!(h.events_after_shortcut.contains(&event));
+        assert_eq!(h.project, before);
+        assert_eq!(h.state.resources, resources);
+        assert_eq!(h.state.history_depths(), depths);
+        assert!(!h.response.history_changed);
+    }
+}
+
+#[test]
+fn history_shortcuts_apply_immediately_after_commit_same_and_next_pass_without_focus() {
+    for same_pass in [false, true] {
         for (key_code, modifiers) in [
             (Key::Z, Modifiers::CTRL),
             (Key::Y, Modifiers::CTRL),
@@ -548,30 +574,27 @@ fn history_shortcuts_preserve_events_and_project_during_composition_and_grace_wi
             let mut h = Harness::new(Field::Text);
             h.seed_project_history();
             h.frame(start_preedit());
-            if !composing {
-                h.frame(vec![ime(egui::ImeEvent::Disabled)]);
-            }
-            assert!(egui_ime::ime_input_active(&h.context));
-            assert_eq!(
-                egui_ime::ime_composing_with_pending_events(
-                    &h.context,
-                    h.context.viewport_id(),
-                    &[]
-                ),
-                composing
-            );
             let before = h.project.clone();
-            let resources = h.state.resources.clone();
-            let depths = h.state.history_depths();
-            let event = key(key_code, modifiers, true, false);
-            h.frame(vec![event.clone()]);
+            let mut events = vec![
+                ime(egui::ImeEvent::Commit("committed".into())),
+                ime(egui::ImeEvent::Disabled),
+            ];
+            if !same_pass {
+                h.frame(events);
+                assert!(!egui_ime::ime_input_active(&h.context));
+                events = vec![];
+            }
+            events.push(key(key_code, modifiers, true, false));
+            h.frame(events);
             assert!(!h.wants_keyboard_before_shortcut);
             assert_eq!(h.recovery_before_shortcut, None);
-            assert!(h.events_after_shortcut.contains(&event));
-            assert_eq!(h.project, before);
-            assert_eq!(h.state.resources, resources);
-            assert_eq!(h.state.history_depths(), depths);
-            assert!(!h.response.history_changed);
+            assert!(!egui_ime::ime_input_active(&h.context));
+            assert!(h.response.history_changed);
+            assert_ne!(h.project, before);
+            assert!(
+                !h.events_after_shortcut
+                    .contains(&key(key_code, modifiers, true, false))
+            );
         }
     }
 }

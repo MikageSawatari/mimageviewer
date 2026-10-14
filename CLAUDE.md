@@ -544,9 +544,10 @@ TextEdit を含むダイアログで Enter / Escape を拾うときは **必ず�
 - **キャンセル用**: `self.dialog_escape_pressed(ctx)` — IME 変換中は常に false
 - **判定ロジック**: 各 egui Context に登録した `ime_focus` の input plugin が
   `ViewportId` ごとの composition 状態を単一 ownership で保持する。
-  `App::ime_input_active(ctx)` は現在 composing、または同じ viewport で直近 300ms 以内に
-  Ime event があった場合に true。300ms グレースは App shortcut 抑止・focus 所有に
-  維持する（I2 段 2b で別途見直す）。本文 TextEdit の通常 Enter は除去しない。
+  `App::ime_input_active(ctx)` は今 pass の Ime 列を反映した後も composing のときだけ true。
+  Commit / Disabled 後の通常 Enter / Escape / shortcut は同じ pass から直ちに通す。
+  native presenter の pass 前判定は `ime_composing_with_pending_events` で最終状態を射影する。
+  viewport 消滅・focus 喪失では、その viewport の composing を落とす。
 
 上記はアプリ操作を抑止する責務で、TextEdit の focus 復帰とは別。日本語を入力できる新しい
 single-line TextEdit は `crate::ime_focus` の helper 経由で描画すること。同 helper が IME の
@@ -554,7 +555,11 @@ single-line TextEdit は `crate::ime_focus` の helper 経由で描画するこ�
 Tab traversal はアプリ全体の Tab 方針が所有し、helper へ IME 専用 Tab lock は重ねない。
 helper-managed field が直前の pass で持っていた focus は 1 pass の typed recovery claim として
 keyboard owner にも渡し、TextEdit の復帰前に同じキーがアプリ shortcut へ漏れるのを防ぐ。
-pointer 入力を伴う正当な focus 移動は復帰しない。
+focus 復帰は `lost_focus()`、pointer 無しの key press、他 widget の focus 無し、かつ
+「今 pass 反映後も composing、または Enter / Escape press 無し」のときだけ行う。
+helper の retry は viewport / widget ごとに次 pass 限りで、`lost_focus()` 以外の同条件を満たし
+欄が focus を持たない場合だけ使う。初回要求用の呼び出し側 latch には書き込まない。
+pointer 入力や他 widget への正当な focus 移動を優先する。
 raw TextEdit は理由付き allowlist を検査する unit test で禁止している。TSF を採用しない理由、
 IMM32 の 2 経路と未対応範囲の正本は [src/ime_focus.rs](src/ime_focus.rs) の helper doc comment を参照。
 
@@ -573,11 +578,12 @@ viewport ごとに追跡する。`App::update_ime_state(ctx)` は helper-field �
 
 IME が処理した `NamedKey::Process` の press（repeat を含む）は vendored egui-winit が
 Key / Text / Cut / Copy / Paste にしない。release と Ime event は残す。native presenter も
-`VK_PROCESSKEY` に egui key を割り当てない。通常のキーを composition / grace だけで
+`VK_PROCESSKEY` に egui key を割り当てない。本体 Win32 queue と native 生キー公開も
+同じく 0xE5 の press / repeat を捨て、release は残す。通常のキーを composition だけで
 取り除かない。TextEdit の未確定文字選択を保ったまま、Windows が
 空の `Preedit("")` を送らず `Disabled` だけを送る経路では、Commit の無い composing
 `Disabled` の直前だけ空 preedit を補える。composition が無い `Disabled` へは挿入せず、
-非 composing Esc と 300ms grace 中だけの Esc は通常入力として残す。
+非 composing Esc は通常入力として残す。
 
 **借用の注意**:
 `egui::Window::show(ctx, |ui| {...})` の closure 内で `self` 経由のメソッド呼び出しは

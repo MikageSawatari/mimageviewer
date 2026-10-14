@@ -53,7 +53,7 @@ KeyboardOwner =
   | ApplicationShortcut { scope }
   | Unclaimed
 
-TextInputPhase = PendingFocus | Focused | FocusRecovery | ImeGrace
+TextInputPhase = PendingFocus | Focused | FocusRecovery | ImeComposing
 ```
 
 - `PendingFocus` は「編集を開始したが最初の `request_focus` がまだ効いていない」1 pass ぶんの
@@ -61,7 +61,9 @@ TextInputPhase = PendingFocus | Focused | FocusRecovery | ImeGrace
 - `FocusRecovery` は helper 管理欄が直前 pass で持っていた focus を、IME / egui の
   begin-pass key 処理が handler より先に一時解除した pass の所有。pointer による移動や別 widget の
   focus は優先し、編集 draft の有無は根拠にしない
-- `ImeGrace` は既存の 300ms グレース相当。変換確定直後の取りこぼしを吸収する
+- `ImeComposing` は今 pass の Ime 列を反映した後も composition が続く場合の所有。
+  focus / recovery claim が無くても残す。I2 段 2b で旧 `ImeGrace` と 300ms grace を撤去し、
+  Commit 後の通常キーは同じ pass から通す。以下の旧実装記録は当時の規則を示す
 - `Modal` は既存のモーダル述語を集約する
 
 ### 2.2 消費の許可

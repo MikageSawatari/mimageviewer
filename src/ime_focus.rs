@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub(crate) use egui_ime::{
     focused_text_input, ime_composing_with_pending_events, ime_input_active_in_viewport,
-    ime_input_active_with_pending_events, install_ime_input_policy, recovering_text_input,
+    install_ime_input_policy, recovering_text_input,
 };
 
 const TEXT_INPUT_KEY_DIAGNOSTIC_ID: &str = "miv_text_input_key_diagnostic";
@@ -119,7 +119,7 @@ fn diagnostic_owner_phase(owner: Option<crate::keyboard_input::KeyboardOwner>) -
             crate::keyboard_input::TextInputPhase::PendingFocus => "PendingFocus",
             crate::keyboard_input::TextInputPhase::Focused => "Focused",
             crate::keyboard_input::TextInputPhase::FocusRecovery => "FocusRecovery",
-            crate::keyboard_input::TextInputPhase::ImeGrace => "ImeGrace",
+            crate::keyboard_input::TextInputPhase::ImeComposing => "ImeComposing",
         },
         Some(crate::keyboard_input::KeyboardOwner::Modal) => "Modal",
         Some(crate::keyboard_input::KeyboardOwner::FocusedUi { .. }) => "FocusedUi",
@@ -471,7 +471,7 @@ pub(crate) fn ime_input_active(ctx: &egui::Context) -> bool {
 ///   composition window を抑止する。候補位置は `video/native_window_host.rs` が
 ///   `ImmSetCompositionWindow` / `ImmSetCandidateWindow` で設定する。
 ///   この経路も `VK_PROCESSKEY` に egui key を割り当てない。共有 plugin は
-///   取消時の空 preedit 補完を所有し、300ms grace と focus 復帰は引き続き維持する。
+///   取消時の空 preedit 補完、composition の追跡と理由に基づく focus 復帰を所有する。
 ///
 /// native 経路は `GCS_COMPATTR` / `GCS_COMPCLAUSE` を読まないため変換対象 clause を区別せず、
 /// egui へ渡す preedit 文字列にも caret range がない。`IMR_RECONVERTSTRING` による再変換も
@@ -1039,8 +1039,9 @@ mod tests {
                     vec![
                         egui::Event::Ime(egui::ImeEvent::Enabled),
                         egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
+                        // An ordinary Enter while still composing exercises restoration.
+                        // IME-handled Process presses never reach this event queue.
                         key_event(egui::Key::Enter),
-                        egui::Event::Ime(egui::ImeEvent::Commit("あ".to_owned())),
                     ],
                 ),
                 |ctx| {
@@ -1053,7 +1054,10 @@ mod tests {
                     });
                     assert_eq!(ctx.memory(|memory| memory.focused()), Some(field_id));
                     if external_latch {
-                        assert!(request_focus);
+                        assert!(
+                            !request_focus,
+                            "helper retries never write the caller's latch"
+                        );
                     }
                     assert_eq!(
                         egui_ime::text_focus_contract_snapshot(ctx)
@@ -1083,17 +1087,21 @@ mod tests {
         let field_id = egui::Id::new("facade-root-field");
         let mut text = "abc".to_owned();
         let mut request_focus = true;
-        let _ = ctx.run(Default::default(), |ctx| {
+        let mut root_input = viewport_raw_input(egui::ViewportId::ROOT, vec![]);
+        root_input.viewports.insert(child, Default::default());
+        let _ = ctx.run(root_input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 add_singleline(ui, &mut text, Some(&mut request_focus), |edit| {
                     edit.id(field_id)
                 });
             });
         });
-        ctx.begin_pass(viewport_raw_input(
+        let mut root_input = viewport_raw_input(
             egui::ViewportId::ROOT,
             vec![key_event(egui::Key::ArrowLeft)],
-        ));
+        );
+        root_input.viewports.insert(child, Default::default());
+        ctx.begin_pass(root_input);
         let pass = ctx.cumulative_pass_nr();
         let events_before = ctx.input(|input| input.events.clone());
         let contract_before = egui_ime::text_focus_contract_snapshot(&ctx);
@@ -1103,7 +1111,7 @@ mod tests {
             child,
             &[egui::Event::Ime(egui::ImeEvent::Disabled)]
         ));
-        assert!(ime_input_active_with_pending_events(&ctx, child, &[]));
+        assert!(ime_composing_with_pending_events(&ctx, child, &[]));
         assert!(!ime_input_active_in_viewport(&ctx, egui::ViewportId::ROOT));
         for viewport in [egui::ViewportId::ROOT, child] {
             assert_ne!(

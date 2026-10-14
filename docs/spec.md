@@ -1749,6 +1749,9 @@ c:\folder-1\a を表示中に Ctrl+↑ → c:\folder-1 へ（最初の子なの�
 
 ## 7. キーボード操作
 
+日本語 IME が処理したキーはアプリ操作へ渡さない。変換中は決定・取消・ショートカットを抑止するが、
+変換確定後に押した通常 Enter / Escape / ショートカットは待ち時間なしで受け付ける。
+
 一部のキーボード操作は設定メニュー「操作カスタマイズ…」で変更できる。設定は
 `Settings.keymap` として `%APPDATA%\mimageviewer\settings.db` に保存する。旧形式の
 `%APPDATA%\mimageviewer\keymap.ini` が残っている場合は、初回起動時に 1 回だけ読み込んで

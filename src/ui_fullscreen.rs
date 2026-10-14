@@ -7972,7 +7972,8 @@ fn shift_held_via_os(_permit: crate::keyboard_input::FocusedKeyStatePermit) -> b
 ///   Enter=トグル / Esc=閉じる)。既定キーでは VideoPlayPause が Enter を先取り消費
 ///   するので此処に来ないが、キーカスタマイズで VideoPlayPause から Enter を外す /
 ///   FsClose を別キーに変える等でも音声が image 経路で閉じないよう明示除外する (Codex P2)。
-/// - IME 変換中: Enter は IME 確定キーなので奪わない
+/// - While composing, suppress ordinary Enter as an application shortcut too.
+///   Ordinary Enter after Commit / Disabled is accepted in the same pass.
 /// - フルスクリーン context menu 表示中: メニュー側の Enter 選択操作を優先
 /// - グリッド Enter で open した直後の押下: `suppress_until_release` が立っている間は
 ///   抑止 (= 同フレーム内に残った Enter event を拾って即 close する事故を防ぐ)。
@@ -81250,7 +81251,7 @@ mod tests {
         assert!(!should_close_fullscreen_on_enter(true, false, false, false));
     }
 
-    /// IME 変換中の Enter は IME 確定キーなので奪わない (= 日本語入力中の事故防止)。
+    /// Ordinary Enter is still suppressed as an application shortcut while composing.
     #[test]
     fn enter_does_not_close_fs_during_ime_composition() {
         assert!(!should_close_fullscreen_on_enter(false, true, false, false));
@@ -84530,7 +84531,7 @@ mod specified_scale_consumer_tests {
             )],
         );
         let edit_id = egui::Id::new(("comic_text_edit", 1_u64));
-        let draw = |app: &mut App, events, time, expect_grace| {
+        let draw = |app: &mut App, events, time, expect_committed| {
             let _ = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
@@ -84543,8 +84544,11 @@ mod specified_scale_consumer_tests {
                 },
                 |ctx| {
                     app.update_ime_state(ctx);
-                    if expect_grace {
-                        assert!(app.ime_input_active(ctx), "exercise Enter within IME grace");
+                    if expect_committed {
+                        assert!(
+                            !app.ime_input_active(ctx),
+                            "Commit ends shortcut suppression immediately"
+                        );
                     }
                     // Includes fullscreen input handling and src/ui_text.rs's actual body TextEdit.
                     app.render_fullscreen_viewport(ctx);
@@ -84632,7 +84636,12 @@ mod specified_scale_consumer_tests {
     }
 
     #[cfg(windows)]
-    fn run_specified_scale_real_numeric_ime_popup(key: egui::Key, size: egui::Vec2) {
+    fn run_specified_scale_real_numeric_ime_popup(
+        key: egui::Key,
+        size: egui::Vec2,
+        same_pass: bool,
+        with_ime: bool,
+    ) {
         let ctx = egui::Context::default();
         install_fs_navigator_input_tracking(&ctx);
         crate::ime_focus::install_ime_input_policy(&ctx);
@@ -84655,6 +84664,12 @@ mod specified_scale_consumer_tests {
                     // The installed plugin normalizes input before egui focus handling.
                     // Embedded fullscreen then uses the same App entry as update().
                     app.update_ime_state(ctx);
+                    if app.ime_input_active(ctx) {
+                        assert!(matches!(
+                            app.keyboard_owner_for_pass(ctx),
+                            crate::keyboard_input::KeyboardOwner::TextInput { .. }
+                        ));
+                    }
                     app.render_fullscreen_viewport(ctx);
                 },
             )
@@ -84695,23 +84710,21 @@ mod specified_scale_consumer_tests {
             "focus must belong to the real DragValue text buffer"
         );
         let before = app.settings.common_fullscreen_specified_scale();
-        draw(
-            &mut app,
-            vec![
-                egui::Event::Ime(egui::ImeEvent::Enabled),
-                egui::Event::Ime(egui::ImeEvent::Preedit("１２５".into())),
-            ],
-        );
-        assert!(app.ime_input_active(&ctx));
-        assert!(matches!(
-            app.keyboard_owner_for_pass(&ctx),
-            crate::keyboard_input::KeyboardOwner::TextInput { .. }
-        ));
-        assert_eq!(
-            ctx.data(|data| data.get_temp::<String>(edit_id)),
-            Some("１２５".to_owned()),
-            "the numeric TextEdit must receive real IME preedit"
-        );
+        if with_ime {
+            draw(
+                &mut app,
+                vec![
+                    egui::Event::Ime(egui::ImeEvent::Enabled),
+                    egui::Event::Ime(egui::ImeEvent::Preedit("１２５".into())),
+                ],
+            );
+            assert!(app.ime_input_active(&ctx));
+            assert_eq!(
+                ctx.data(|data| data.get_temp::<String>(edit_id)),
+                Some("１２５".to_owned()),
+                "the numeric TextEdit must receive real IME preedit"
+            );
+        }
         let key_event = |pressed| egui::Event::Key {
             key,
             physical_key: Some(key),
@@ -84720,7 +84733,9 @@ mod specified_scale_consumer_tests {
             modifiers: egui::Modifiers::NONE,
         };
         // The IME consumes the press. egui-winit forwards only IME events and the release.
-        let end_events = if key == egui::Key::Enter {
+        let mut end_events = if !with_ime {
+            vec![key_event(false)]
+        } else if key == egui::Key::Enter {
             vec![
                 egui::Event::Ime(egui::ImeEvent::Disabled),
                 egui::Event::Ime(egui::ImeEvent::Commit("125".into())),
@@ -84736,37 +84751,59 @@ mod specified_scale_consumer_tests {
                 key_event(false),
             ]
         };
+        if same_pass {
+            end_events.push(key_event(true));
+        }
         draw(&mut app, end_events);
+        assert!(!app.ime_input_active(&ctx));
         assert_eq!(
             app.fullscreen_idx,
-            Some(0),
-            "IME end + {key:?} must not close fullscreen"
+            if same_pass && key == egui::Key::Escape {
+                None
+            } else {
+                Some(0)
+            }
         );
-        assert!(
-            app.fit_popup_open,
-            "IME end + {key:?} must retain the popup"
-        );
-        assert!(app.ime_input_active(&ctx));
-        assert_eq!(
-            ctx.memory(|memory| memory.focused()),
-            Some(edit_id),
-            "IME {key:?} changes composition without ending numeric editing"
-        );
-        assert_eq!(
-            ctx.data(|data| data.get_temp::<String>(edit_id)),
-            Some(if key == egui::Key::Enter { "125" } else { "" }.to_owned()),
-            "the real numeric TextEdit commits or clears its preedit"
-        );
-        // A subsequent ordinary press keeps DragValue's released Enter/Esc behavior.
-        draw(&mut app, vec![key_event(true)]);
+        assert_eq!(app.fit_popup_open, !(same_pass && key == egui::Key::Escape));
+        if !same_pass {
+            assert_eq!(
+                ctx.memory(|memory| memory.focused()),
+                Some(edit_id),
+                "IME end without an ordinary press keeps numeric editing"
+            );
+            assert_eq!(
+                ctx.data(|data| data.get_temp::<String>(edit_id)),
+                Some(
+                    if !with_ime {
+                        "80.0"
+                    } else if key == egui::Key::Enter {
+                        "125"
+                    } else {
+                        ""
+                    }
+                    .to_owned()
+                ),
+                "the real numeric TextEdit commits or clears its preedit"
+            );
+            // No timed grace: the very next pass's ordinary key ends numeric editing.
+            draw(&mut app, vec![key_event(true)]);
+        }
         assert_ne!(ctx.memory(|memory| memory.focused()), Some(edit_id));
-        assert_eq!(app.fullscreen_idx, Some(0));
-        assert!(app.fit_popup_open);
+        // Raw DragValue has no helper focus contract: ordinary Esc clears focus
+        // at begin-pass and closes fullscreen, with or without preceding IME.
+        // I2b preserves that released behavior rather than retaining a grace exception.
+        let expected_idx = (key != egui::Key::Escape).then_some(0);
+        assert_eq!(app.fullscreen_idx, expected_idx);
+        assert_eq!(app.fit_popup_open, expected_idx.is_some());
         let after = app.settings.common_fullscreen_specified_scale();
         if key == egui::Key::Enter {
             assert_eq!(
                 after.width.active(),
-                Some(SpecifiedScaleAxis::PercentTenths(1250)),
+                Some(SpecifiedScaleAxis::PercentTenths(if with_ime {
+                    1250
+                } else {
+                    800
+                })),
                 "Enter confirms the actual numeric value"
             );
         } else {
@@ -84776,23 +84813,34 @@ mod specified_scale_consumer_tests {
             );
         }
         draw(&mut app, vec![key_event(false)]);
-        assert_eq!(app.fullscreen_idx, Some(0));
-        assert!(app.fit_popup_open);
+        assert_eq!(app.fullscreen_idx, expected_idx);
+        assert_eq!(app.fit_popup_open, expected_idx.is_some());
     }
 
     #[cfg(windows)]
     #[test]
     fn specified_scale_real_numeric_ime_enter_is_owned_by_popup() {
         for size in [egui::vec2(1093.0, 614.0), egui::vec2(320.0, 320.0)] {
-            run_specified_scale_real_numeric_ime_popup(egui::Key::Enter, size);
+            for same_pass in [true, false] {
+                run_specified_scale_real_numeric_ime_popup(egui::Key::Enter, size, same_pass, true);
+            }
         }
     }
 
     #[cfg(windows)]
     #[test]
-    fn specified_scale_real_numeric_ime_escape_is_owned_by_popup() {
+    fn specified_scale_real_numeric_ime_escape_matches_ordinary_fullscreen_close() {
         for size in [egui::vec2(1093.0, 614.0), egui::vec2(320.0, 320.0)] {
-            run_specified_scale_real_numeric_ime_popup(egui::Key::Escape, size);
+            for same_pass in [true, false] {
+                for with_ime in [true, false] {
+                    run_specified_scale_real_numeric_ime_popup(
+                        egui::Key::Escape,
+                        size,
+                        same_pass,
+                        with_ime,
+                    );
+                }
+            }
         }
     }
 

@@ -241,20 +241,24 @@ focus 方向を最初の focusable widget 登録前に `FocusDirection::None` �
 キーボードを所有している間は KeySlot と egui event の双方を残す。
 IME が処理した `NamedKey::Process` の press / repeat は egui-winit が Key / Text /
 clipboard event にせず、native presenter も `VK_PROCESSKEY` を egui key にしない。
+本体 Win32 queue と native 生キー公開も 0xE5 の press / repeat を捨てるため、JIS 記号の
+scan-code shortcut に IME 処理済みキーが一致することはない。
 release と Ime event は残す。composition 中という理由で通常の Esc press は除去しない。
 取消の `Disabled` / 空 `Commit` に非空 `Commit` が無い場合だけ、input plugin が
-空の `Preedit("")` を補い、未確定文字を取り消す。300ms grace によるアプリ操作抑止は
-I2 段 2b まで維持する。
+空の `Preedit("")` を補い、未確定文字を取り消す。アプリ操作の抑止は今 pass の Ime 列を
+反映した後の composing だけで決まり、Commit 後の通常 Enter / Escape / shortcut は即座に通る。
 composition state は viewport ごとに独立し、main / fullscreen / detached を共有する App Context と
-native presenter Context の両方へ同じ plugin を登録する。
+native presenter Context の両方へ同じ plugin を登録する。viewport 消滅・focus 喪失は当該状態を終了する。
 IME 中は Windows の Alt+文字を含むキー処理で TextEdit の focus が一時的に外れる場合があるため、
 `ime_focus` が直前 pass の helper-managed field を 1 pass の `FocusRecovery` owner として保持する。
-この owner は TextEdit の再描画前から keymap を抑止し、同じ pass で field の focus を復帰する。
-pointer 入力を伴う focus 移動は優先して復帰しない。アプリ全体の Tab traversal 無効化、IME field の
+この owner は TextEdit の再描画前から keymap を抑止する。focus 復帰は別判定で、`lost_focus()`、
+pointer 無しの key press、他 widget の focus 無し、かつ composing または Enter / Escape press 無しの場合だけ行う。
+helper の retry は同条件（`lost_focus()` 以外）で次 pass 限り有効で、初回要求用の呼び出し側 latch には書かない。
+pointer 入力や他 widget への focus 移動を優先する。アプリ全体の Tab traversal 無効化、IME field の
 focus 保持、keymap の操作発火抑止は別責務であり、同じ event をそれぞれの ownership 境界で扱う。
 Hover で出す side panel 内の helper-managed field が実際に focus を持つ間は、その field を次 pass
 にも登録できるよう panel lifetime を keyboard focus でも維持する。これは focus を取り戻す処理ではなく、
-pointer 等で focus が正当に移れば次 pass の通常 hover 判定へ戻る。IME を条件にした 1-pass
+pointer 等で focus が正当に移れば次 pass の通常 hover 判定へ戻る。1-pass
 `FocusRecovery` の条件と上限は変更しない。
 
 診断は通常 logger の `[text-input-key]` として恒久的に残す。helper field が focused または直前 pass で

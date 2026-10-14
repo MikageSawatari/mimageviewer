@@ -8,25 +8,13 @@ mod tab_focus;
 pub use tab_focus::{cancel_tab_focus_traversal, install_tab_shortcut_focus_policy};
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
 
 const IME_FOCUS_RETRY_ID: &str = "miv_ime_focus_retry";
 const IME_TEXT_FOCUS_CONTRACT_ID: &str = "miv_ime_text_focus_contract";
-const IME_EVENT_GRACE: Duration = Duration::from_millis(300);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ImeFocusState {
     composing: bool,
-    last_event_at: Option<Instant>,
-}
-
-impl ImeFocusState {
-    fn input_active_at(self, now: Instant) -> bool {
-        self.composing
-            || self
-                .last_event_at
-                .is_some_and(|at| now.saturating_duration_since(at) < IME_EVENT_GRACE)
-    }
 }
 
 /// Pre-`Memory::begin_pass` owner of IME composition state and input repair.
@@ -42,14 +30,6 @@ struct ImeInputPlugin {
 }
 
 impl ImeInputPlugin {
-    fn input_active_in_viewport(&self, viewport_id: egui::ViewportId, now: Instant) -> bool {
-        self.viewports
-            .get(&viewport_id)
-            .copied()
-            .unwrap_or_default()
-            .input_active_at(now)
-    }
-
     fn composing_in_viewport(&self, viewport_id: egui::ViewportId) -> bool {
         self.viewports
             .get(&viewport_id)
@@ -63,8 +43,15 @@ impl egui::Plugin for ImeInputPlugin {
     }
 
     fn input_hook(&mut self, input: &mut egui::RawInput) {
+        // RawInput lists all live viewports. A destroyed viewport must not leave
+        // composition behind when its id is reused without a terminal event.
+        self.viewports
+            .retain(|id, _| input.viewports.contains_key(id));
         let state = self.viewports.entry(input.viewport_id).or_default();
-        normalize_ime_input(&mut input.events, state, Instant::now());
+        normalize_ime_input(&mut input.events, state);
+        if !input.focused {
+            state.composing = false;
+        }
     }
 }
 
@@ -76,7 +63,7 @@ pub fn install_ime_input_policy(ctx: &egui::Context) {
     ctx.add_plugin(ImeInputPlugin::default());
 }
 
-fn normalize_ime_input(events: &mut Vec<egui::Event>, state: &mut ImeFocusState, now: Instant) {
+fn normalize_ime_input(events: &mut Vec<egui::Event>, state: &mut ImeFocusState) {
     // Only a *non-empty* commit confirms text. Windows ends a cancelled composition
     // with an empty `Commit("")` (observed sequence on Esc:
     // `Disabled, Disabled, Commit(""), Disabled, Disabled`), and egui's commit handler
@@ -87,12 +74,13 @@ fn normalize_ime_input(events: &mut Vec<egui::Event>, state: &mut ImeFocusState,
         |event| matches!(event, egui::Event::Ime(egui::ImeEvent::Commit(text)) if !text.is_empty()),
     );
     let mut composing = state.composing;
-    let mut saw_ime_event = false;
     let mut normalized = Vec::with_capacity(events.len().saturating_add(1));
 
     for event in std::mem::take(events) {
+        if matches!(event, egui::Event::WindowFocused(false)) {
+            composing = false;
+        }
         if let egui::Event::Ime(ime) = &event {
-            saw_ime_event = true;
             // A composition ends without text either as `Disabled` or as an empty
             // `Commit("")`, depending on the IME. Whichever arrives first is the point
             // where the preedit is still selected, so that is where the cancel belongs.
@@ -108,9 +96,6 @@ fn normalize_ime_input(events: &mut Vec<egui::Event>, state: &mut ImeFocusState,
     }
 
     state.composing = composing;
-    if saw_ime_event {
-        state.last_event_at = Some(now);
-    }
     *events = normalized;
 }
 
@@ -179,15 +164,14 @@ pub fn text_focus_contract_snapshot(ctx: &egui::Context) -> Option<TextFocusCont
     })
 }
 
-/// Sample and return IME activity for the current viewport.
+/// Return whether the current viewport is composing after this pass's IME events.
 ///
 /// The pre-input plugin owns viewport-local composition state. This function is
 /// a read-only projection for App shortcut gates and TextEdit helpers; it does not
 /// start host diagnostics or consume input events.
 pub fn ime_input_active(ctx: &egui::Context) -> bool {
     let viewport_id = ctx.viewport_id();
-    let now = Instant::now();
-    ctx.with_plugin(|plugin: &mut ImeInputPlugin| plugin.input_active_in_viewport(viewport_id, now))
+    ctx.with_plugin(|plugin: &mut ImeInputPlugin| plugin.composing_in_viewport(viewport_id))
         .unwrap_or(false)
 }
 
@@ -197,8 +181,7 @@ pub fn ime_input_active(ctx: &egui::Context) -> bool {
 /// The plugin updates this shared state before the selected viewport's pass.
 /// Cross-viewport consumers may then inspect the same Context-owned snapshot.
 pub fn ime_input_active_in_viewport(ctx: &egui::Context, viewport_id: egui::ViewportId) -> bool {
-    let now = Instant::now();
-    ctx.with_plugin(|plugin: &mut ImeInputPlugin| plugin.input_active_in_viewport(viewport_id, now))
+    ctx.with_plugin(|plugin: &mut ImeInputPlugin| plugin.composing_in_viewport(viewport_id))
         .unwrap_or(false)
 }
 
@@ -221,18 +204,6 @@ pub fn ime_composing_with_pending_events(
         }
     }
     composing
-}
-
-/// Return IME activity including native events queued before the next egui pass.
-pub fn ime_input_active_with_pending_events(
-    ctx: &egui::Context,
-    viewport_id: egui::ViewportId,
-    pending_events: &[egui::Event],
-) -> bool {
-    pending_events
-        .iter()
-        .any(|event| matches!(event, egui::Event::Ime(_)))
-        || ime_input_active_in_viewport(ctx, viewport_id)
 }
 
 /// Return the helper-managed TextEdit that currently owns egui focus.
@@ -319,8 +290,8 @@ pub fn recovering_text_input(ctx: &egui::Context) -> Option<egui::Id> {
 /// IME 中のキー入力による `TextEdit` の一時的なフォーカス離脱を防止・復帰する。
 ///
 /// `focus_request` は、呼び出し側が初回フォーカス等に使う request latch があれば渡す。
-/// 復帰時は同 latch を次 frame 用に立て直す。latch を持たない欄では widget ID ごとの
-/// 一時 latch をこのモジュールが所有する。IME 中でもマウスクリック等、pointer event を
+/// helper は呼び出し側の latch を書き換えず、viewport / widget ID ごとの次 pass 限りの
+/// retry を所有する。変換終了後の通常 Enter / Escape は focus を手放す。pointer event を
 /// 伴う正当なフォーカス移動は復帰しない。IME が処理したキーの press は入力 bridge が
 /// 渡さず、アプリ全体の Tab traversal 無効化はホストの別責務である。
 /// この helper は通常のカーソル矢印を field 内に保持し、keyboard focus loss を復帰する。
@@ -332,18 +303,33 @@ fn restore_focus_for_ime_key(
     ctx: &egui::Context,
     response: &egui::Response,
     ime_active: bool,
-    mut focus_request: Option<&mut bool>,
+    focus_request: Option<&mut bool>,
     diagnostic_key_policy: TextInputDiagnosticKeyPolicy,
 ) -> bool {
     let viewport_id = ctx.viewport_id();
     let retry_id = focus_retry_id(viewport_id, response.id);
-    let retry_requested = match focus_request.as_deref_mut() {
-        Some(request) => std::mem::take(request),
-        None => ctx
-            .data_mut(|data| data.remove_temp::<bool>(retry_id))
-            .unwrap_or(false),
-    };
-    if retry_requested {
+    let pass = ctx.cumulative_pass_nr();
+    let retry_requested = ctx.data_mut(|data| data.remove_temp::<u64>(retry_id));
+    let may_restore = keyboard_focus_recovery_input(ctx)
+        && ctx.memory(|memory| memory.focused()).is_none()
+        && (ime_active
+            || !ctx.input(|input| {
+                input.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key {
+                            key: egui::Key::Enter | egui::Key::Escape,
+                            pressed: true,
+                            ..
+                        }
+                    )
+                })
+            }));
+    if focus_request.is_some_and(std::mem::take)
+        || (retry_requested
+            .is_some_and(|requested_pass| requested_pass.checked_add(1) == Some(pass))
+            && may_restore)
+    {
         response.request_focus();
     }
 
@@ -360,14 +346,10 @@ fn restore_focus_for_ime_key(
         });
     }
 
-    let restored = response.lost_focus() && ime_active && keyboard_focus_recovery_input(ctx);
+    let restored = response.lost_focus() && may_restore;
     if restored {
         response.request_focus();
-        if let Some(request) = focus_request {
-            *request = true;
-        } else {
-            ctx.data_mut(|data| data.insert_temp(retry_id, true));
-        }
+        ctx.data_mut(|data| data.insert_temp(retry_id, pass));
         ctx.request_repaint();
     }
 

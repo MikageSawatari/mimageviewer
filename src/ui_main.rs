@@ -30135,6 +30135,167 @@ mod section207_tests {
         assert!(app.borrow().address_has_focus);
     }
 
+    fn run_ime_committed_bar_enter(address: bool, same_pass: bool, recover_focus: bool) {
+        let mut env = crate::app::setup_app_for_test();
+        only_folder_and_tree(&mut env);
+        let target = env.tmp.path().join("committed-target");
+        std::fs::create_dir_all(&target).unwrap();
+        if address {
+            env.address.clear();
+        } else {
+            env.show_search_bar = true;
+            env.search_query.clear();
+            env.search_focus_request = true;
+        }
+        let app = Rc::new(RefCell::new(env));
+        let render = Rc::clone(&app);
+        let nav = Rc::new(RefCell::new(Vec::new()));
+        let nav_render = Rc::clone(&nav);
+        let force_focus_loss = Rc::new(Cell::new(false));
+        let force_focus_loss_render = Rc::clone(&force_focus_loss);
+        let fonts = Cell::new(false);
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(1200.0, 280.0))
+            .build(move |ctx| {
+                crate::ime_focus::install_ime_input_policy(ctx);
+                if !fonts.replace(true) {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    ctx.request_repaint();
+                    return;
+                }
+                let mut app = render.borrow_mut();
+                app.update_ime_state(ctx);
+                if force_focus_loss_render.replace(false) {
+                    ctx.memory_mut(|memory| {
+                        if let Some(id) = memory.focused() {
+                            memory.surrender_focus(id);
+                        }
+                    });
+                }
+                if address {
+                    if let Some(value) = app.render_toolbar(ctx).1 {
+                        nav_render.borrow_mut().push(value);
+                    }
+                } else {
+                    app.render_search_bar(ctx);
+                }
+            });
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .click();
+        harness.run();
+        let edit_id = harness.ctx.memory(|memory| memory.focused()).unwrap();
+        // input_mut feeds the whole event sequence to ONE egui pass; Harness::event
+        // would run separate passes for each event and miss the same-pass regression.
+        harness.input_mut().events = vec![
+            egui::Event::Ime(egui::ImeEvent::Enabled),
+            egui::Event::Ime(egui::ImeEvent::Preedit("preedit".into())),
+        ];
+        harness.step();
+        assert!(app.borrow().ime_input_active(&harness.ctx));
+        assert!(nav.borrow().is_empty());
+        assert!(app.borrow().search_pending.is_none());
+        let committed = if address {
+            target.to_string_lossy().to_string()
+        } else {
+            "committed-search".to_owned()
+        };
+        let mut events = vec![
+            egui::Event::Ime(egui::ImeEvent::Commit(committed.clone())),
+            egui::Event::Ime(egui::ImeEvent::Disabled),
+        ];
+        if !same_pass {
+            harness.input_mut().events = std::mem::take(&mut events);
+            harness.step();
+            assert_eq!(harness.ctx.memory(|memory| memory.focused()), Some(edit_id));
+            assert!(nav.borrow().is_empty());
+            assert!(app.borrow().search_pending.is_none());
+            if recover_focus {
+                force_focus_loss.set(true);
+                harness.input_mut().events = vec![
+                    egui::Event::Ime(egui::ImeEvent::Disabled),
+                    egui::Event::Key {
+                        key: egui::Key::J,
+                        physical_key: Some(egui::Key::J),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::ALT,
+                    },
+                ];
+                harness.step();
+                assert_eq!(harness.ctx.memory(|memory| memory.focused()), Some(edit_id));
+                assert!(!app.borrow().search_focus_request);
+                assert!(nav.borrow().is_empty());
+                assert!(app.borrow().search_pending.is_none());
+            }
+        }
+        events.push(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: Some(egui::Key::Enter),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.input_mut().events = events;
+        harness.step();
+        assert!(!app.borrow().ime_input_active(&harness.ctx));
+        assert_ne!(harness.ctx.memory(|memory| memory.focused()), Some(edit_id));
+        if address {
+            assert!(
+                matches!(nav.borrow().as_slice(), [AddressBarNav::Direct(path, _)] if path == &target)
+            );
+            assert!(!app.borrow().address_has_focus);
+        } else {
+            assert_eq!(app.borrow().search_query, committed);
+            assert!(
+                app.borrow().search_pending.is_some(),
+                "the real search handler submits the committed query"
+            );
+            assert!(!app.borrow().search_has_focus);
+            assert!(!app.borrow().search_focus_request);
+        }
+        harness.input_mut().events = vec![egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: Some(egui::Key::Enter),
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }];
+        harness.step();
+        assert_ne!(harness.ctx.memory(|memory| memory.focused()), Some(edit_id));
+    }
+
+    #[test]
+    fn address_ime_commit_and_immediate_enter_same_pass_navigates_and_releases_focus() {
+        run_ime_committed_bar_enter(true, true, false);
+    }
+
+    #[test]
+    fn address_ime_commit_and_immediate_enter_next_pass_navigates_and_releases_focus() {
+        run_ime_committed_bar_enter(true, false, false);
+    }
+
+    #[test]
+    fn search_ime_commit_and_immediate_enter_same_pass_submits_and_releases_focus() {
+        run_ime_committed_bar_enter(false, true, false);
+    }
+
+    #[test]
+    fn search_ime_commit_and_immediate_enter_next_pass_submits_and_releases_focus() {
+        run_ime_committed_bar_enter(false, false, false);
+    }
+
+    #[test]
+    fn address_bar_focus_recovery_then_enter_navigates_and_releases_focus() {
+        run_ime_committed_bar_enter(true, false, true);
+    }
+
+    #[test]
+    fn search_bar_focus_recovery_then_enter_submits_and_releases_focus() {
+        run_ime_committed_bar_enter(false, false, true);
+    }
+
     #[test]
     fn section207_toolbar_reset_and_drag_order_include_the_whole_folder_section() {
         let mut app = crate::app::setup_app_for_test();
