@@ -36,6 +36,7 @@ pub struct BookAppendSummary {
     pub edit_copies: Vec<BookPathMapping>,
     pub semantic_copies: Vec<BookPathMapping>,
     pub erase_fallback_pages: usize,
+    pub skipped_hidden: usize,
     pub(crate) undo_files: Option<crate::book_append_undo::AppendFilesReceipt>,
     pub(crate) metadata_copy: crate::book_append_undo::BookAppendMetadataCopySummary,
 }
@@ -265,6 +266,11 @@ impl BookOpIntent {
 }
 
 pub enum BookPageSource {
+    /// A worker admission wrapper; it never becomes an output page or source image.
+    Qualified {
+        source: Box<BookPageSource>,
+        check: crate::book_composition::CompositionOutputCheck,
+    },
     File {
         src: PathBuf,
         original_name: String,
@@ -297,6 +303,37 @@ pub enum BookPageSource {
         format: crate::capture::CaptureFormat,
         jpeg_matte: crate::capture::JpegMatte,
     },
+}
+
+impl BookPageSource {
+    pub(crate) fn qualify(
+        self,
+        check: Option<crate::book_composition::CompositionOutputCheck>,
+    ) -> Self {
+        match check {
+            Some(check) => Self::Qualified {
+                source: Box::new(self),
+                check,
+            },
+            None => self,
+        }
+    }
+
+    fn permitted_source(
+        self,
+        resolver: &mut crate::book_composition::CompositionOutputResolver,
+    ) -> Result<Option<Self>, String> {
+        match self {
+            Self::Qualified { source, check } => {
+                if check.permits_with(resolver)? {
+                    source.permitted_source(resolver)
+                } else {
+                    Ok(None)
+                }
+            }
+            source => Ok(Some(source)),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -849,6 +886,21 @@ fn append_pages_at_with_raw_observed(
     if sources.is_empty() {
         return Err("追加するページがありません".to_string());
     }
+    // Resolve every selected source before creating/mutating the destination.
+    // This is output admission, separate from result membership/thumbnail ordering.
+    let mut accepted = Vec::with_capacity(sources.len());
+    let mut skipped_hidden = 0;
+    let mut resolver = crate::book_composition::CompositionOutputResolver::default();
+    for source in sources {
+        match source.permitted_source(&mut resolver)? {
+            Some(source) => accepted.push(source),
+            None => skipped_hidden += 1,
+        }
+    }
+    if accepted.is_empty() {
+        return Err(crate::book_composition::COMPOSITION_OUTPUT_HIDDEN_NOTICE.into());
+    }
+    let sources = accepted;
     let added = sources.len();
     let book_name = normalize_book_name(&book_name);
     let folder = book_folder(&root, &book_name);
@@ -957,6 +1009,7 @@ fn append_pages_at_with_raw_observed(
         edit_copies,
         semantic_copies,
         erase_fallback_pages,
+        skipped_hidden,
         undo_files,
         metadata_copy: metadata.finish(),
     };
@@ -1308,6 +1361,7 @@ fn write_source(
     raw: Option<&crate::raw::RawDecodeContext>,
 ) -> Result<bool, String> {
     match source {
+        BookPageSource::Qualified { .. } => Err("output source was not admitted".into()),
         BookPageSource::File { src, .. } => {
             copy_file_snapshot(&src, dest)?;
             Ok(false)
@@ -2384,6 +2438,7 @@ fn destination_for_source(
     source: &BookPageSource,
 ) -> Result<PathBuf, String> {
     let raw_name = match source {
+        BookPageSource::Qualified { .. } => return Err("output source was not admitted".into()),
         BookPageSource::File { original_name, .. } => sanitize_filename(original_name, "page"),
         BookPageSource::ZipEntry { original_name, .. } => sanitize_filename(original_name, "page"),
         BookPageSource::Composited {
@@ -4224,5 +4279,158 @@ mod tests {
                 ),
             ]
         );
+    }
+    #[test]
+    fn qualified_append_filters_latest_hidden_preserves_selection_order_and_dense_numbering() {
+        use crate::book_composition::{
+            BookComposition, BookCompositionService, CandidatePage, CompositionOutputCheck,
+            CompositionPageRef, PageDomain, ReadingDirection,
+        };
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("input.zip");
+        let mut writer = zip::ZipWriter::new(fs::File::create(&archive).unwrap());
+        for page in 0..4 {
+            writer
+                .start_file(
+                    format!("{page}.jpg"),
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .unwrap();
+            writer.write_all(format!("page {page}").as_bytes()).unwrap();
+        }
+        writer.finish().unwrap();
+        let tree = Arc::new(crate::zip_tree::ZipTree::build(
+            archive.clone(),
+            crate::zip_loader::enumerate_image_entries(&archive).unwrap(),
+        ));
+        let data = temp.path().join("data");
+        let (service, owner) = BookCompositionService::spawn_at(data.clone(), None).unwrap();
+        let scope = crate::book_scope::BookScopeKey::archive(&archive, &[]).unwrap();
+        service
+            .prepare(
+                scope.clone(),
+                PageDomain::ArchiveLevel {
+                    prefix: String::new(),
+                },
+            )
+            .recv()
+            .unwrap()
+            .status
+            .unwrap();
+        let checks = [2, 0, 1, 3].map(|page| {
+            CompositionOutputCheck::new(
+                service.clone(),
+                CandidatePage {
+                    identity: crate::book_resume_db::PageIdentity::Archive {
+                        container: crate::path_key::normalize_keep_drive(&archive),
+                        entry_name: format!("{page}.jpg"),
+                    },
+                    physical_archive: Some(archive.clone()),
+                    raw_tree: Some(Arc::clone(&tree)),
+                },
+            )
+        });
+        let mut record = BookComposition::new(
+            ReadingDirection::Ltr,
+            (0..4)
+                .map(|page| CompositionPageRef::ArchiveEntry {
+                    entry_name: format!("{page}.jpg"),
+                })
+                .collect(),
+        );
+        record.hidden_pages.push(CompositionPageRef::ArchiveEntry {
+            entry_name: "1.jpg".into(),
+        });
+        service
+            .save(
+                scope,
+                PageDomain::ArchiveLevel {
+                    prefix: String::new(),
+                },
+                record,
+            )
+            .recv()
+            .unwrap()
+            .status
+            .unwrap();
+        let sources = [2, 0, 1, 3]
+            .into_iter()
+            .zip(checks)
+            .map(|(page, check)| {
+                BookPageSource::ZipEntry {
+                    zip_path: archive.clone(),
+                    entry_name: format!("{page}.jpg"),
+                    original_name: format!("{page}.jpg"),
+                }
+                .qualify(Some(check))
+            })
+            .collect();
+        let root = temp.path().join("books");
+        let BookOpResult::Append(summary) =
+            append_pages_at(data, root.clone(), "out".into(), sources).unwrap()
+        else {
+            panic!("append expected");
+        };
+        assert_eq!(summary.added, 3);
+        assert_eq!(summary.skipped_hidden, 1);
+        for (number, page) in [2, 0, 3].into_iter().enumerate() {
+            assert_eq!(
+                fs::read(
+                    root.join("out")
+                        .join(format!("{:04}_{page}.jpg", number + 1))
+                )
+                .unwrap(),
+                format!("page {page}").as_bytes()
+            );
+        }
+        assert_eq!(fs::read_dir(root.join("out")).unwrap().count(), 3);
+        owner.shutdown_and_join();
+    }
+
+    #[test]
+    fn all_hidden_qualified_append_does_not_create_book_folder() {
+        use crate::book_composition::{
+            BookComposition, BookCompositionService, CandidatePage, CompositionOutputCheck,
+            CompositionPageRef, PageDomain, ReadingDirection,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let (service, owner) = BookCompositionService::spawn_at(data.clone(), None).unwrap();
+        let scope = crate::book_scope::BookScopeKey::document("C:/all-hidden.pdf").unwrap();
+        let page = CompositionPageRef::PdfPage { page_num: 0 };
+        let mut record = BookComposition::new(ReadingDirection::Ltr, vec![page.clone()]);
+        record.hidden_pages.push(page);
+        service
+            .save(scope, PageDomain::Document, record)
+            .recv()
+            .unwrap()
+            .status
+            .unwrap();
+        let check = CompositionOutputCheck::new(
+            service,
+            CandidatePage {
+                identity: crate::book_resume_db::PageIdentity::Document {
+                    container: "C:/all-hidden.pdf".into(),
+                    page_num: 0,
+                },
+                physical_archive: None,
+                raw_tree: None,
+            },
+        );
+        let source = BookPageSource::File {
+            src: temp.path().join("never-read.jpg"),
+            original_name: "hidden.jpg".into(),
+        }
+        .qualify(Some(check));
+        let root = temp.path().join("books");
+        assert_eq!(
+            append_pages_at(data, root.clone(), "out".into(), vec![source])
+                .err()
+                .unwrap(),
+            crate::book_composition::COMPOSITION_OUTPUT_HIDDEN_NOTICE
+        );
+        assert!(!root.exists());
+        owner.shutdown_and_join();
     }
 }

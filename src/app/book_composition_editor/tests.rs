@@ -75,25 +75,24 @@ fn section1373_composition_draft_history_invalidates_only_accepted_changes() {
 }
 
 #[test]
-fn section1373_composition_preview_is_readonly_and_confirmation_invalidates() {
+fn section1373_composition_direct_cover_invalidates_only_accepted_change() {
     let mut f = fixture();
     let ctx = egui::Context::default();
     start_editing(&mut f.app, &ctx);
-    let before = draft_record(&f);
+    let enabled = !draft_record(&f).cover_enabled;
     f.app.book_append_undo_receipt = Some(section1373_receipt(&f.app));
     let revision = f.app.book_append_undo_revision;
     f.app
-        .apply_editor_ui_action(&ctx, ui::EditorUiAction::SetCover(Some(1)));
-    assert_eq!(draft_record(&f), before);
-    assert_eq!(f.app.book_append_undo_revision, revision);
-    assert!(f.app.book_append_undo_receipt.is_some());
-    assert!(matches!(&f.app.composition_editor,
-        CompositionEditorState::Editing(session) if session.preview.is_some()));
-    f.app
-        .apply_editor_ui_action(&ctx, ui::EditorUiAction::ConfirmEdit);
-    assert_ne!(draft_record(&f), before);
+        .apply_editor_ui_action(&ctx, ui::EditorUiAction::SetCover(enabled));
+    assert_eq!(draft_record(&f).cover_enabled, enabled);
     assert!(f.app.book_append_undo_revision > revision);
     assert!(f.app.book_append_undo_receipt.is_none());
+    f.app.book_append_undo_receipt = Some(section1373_receipt(&f.app));
+    let revision = f.app.book_append_undo_revision;
+    f.app
+        .apply_editor_ui_action(&ctx, ui::EditorUiAction::SetCover(enabled));
+    assert_eq!(f.app.book_append_undo_revision, revision);
+    assert!(f.app.book_append_undo_receipt.is_some());
 }
 
 #[test]
@@ -288,155 +287,341 @@ fn draft_record(f: &Fixture) -> BookComposition {
 }
 
 #[test]
-fn real_pair_button_requires_preview_cancel_and_one_undo_preserves_prior_draft() {
+fn real_page_directive_is_immediate_and_one_undo_preserves_prior_draft() {
     use egui_kittest::kittest::Queryable;
     let mut f = fixture();
     let ctx = egui::Context::default();
     start_editing(&mut f.app, &ctx);
-    let CompositionEditorState::Editing(session) = &mut f.app.composition_editor else {
-        panic!("Editing");
-    };
-    let pages = session.pages.clone();
-    let record = BookComposition::new(
-        ReadingDirection::Ltr,
-        vec![
-            CompositionUnit::Pair {
-                first: pages[0].clone(),
-                second: pages[1].clone(),
-            },
-            CompositionUnit::Pair {
-                first: pages[2].clone(),
-                second: pages[3].clone(),
-            },
-        ],
-    );
-    let prepared = session.prepared.as_mut().unwrap();
-    prepared.draft =
-        CompositionDraft::new(record, f.domain.clone(), prepared.draft.manifest().to_vec())
-            .unwrap();
-    session.ui.selected_pages = vec![1, 2];
-    session.refresh_view();
     f.app.apply_editor_ui_action(
         &ctx,
         ui::EditorUiAction::SetDirection(ReadingDirection::Rtl),
     );
-    let before = draft_record(&f);
-    let (f, mut h) = editor_harness(f);
-    h.run();
-    h.get_by_label("2: b.png").click();
-    h.run();
-    h.get_by_label("3: c.png")
-        .click_modifiers(egui::Modifiers::CTRL);
-    h.run();
-    h.get_by_label("この2枚を組にする").click();
-    h.run();
-    assert_eq!(draft_record(&f.borrow()), before);
-    assert!(
-        matches!(&f.borrow().app.composition_editor, CompositionEditorState::Editing(session) if session.preview.is_some())
-    );
-    h.get_by_label("変更しない").click();
-    h.run();
-    assert_eq!(draft_record(&f.borrow()), before);
-    h.get_by_label("2: b.png").click();
-    h.run();
-    h.get_by_label("3: c.png")
-        .click_modifiers(egui::Modifiers::CTRL);
-    h.run();
-    h.get_by_label("この2枚を組にする").click();
-    h.run();
-    h.get_by_label("変更する").click();
-    h.run();
-    assert_eq!(
-        draft_record(&f.borrow()).units,
-        vec![
-            CompositionUnit::Single {
-                page: pages[0].clone(),
-                placement: SinglePlacement::Leading,
-                companion: SingleCompanion::Vacant
-            },
-            CompositionUnit::Pair {
-                first: pages[1].clone(),
-                second: pages[2].clone()
-            },
-            CompositionUnit::Single {
-                page: pages[3].clone(),
-                placement: SinglePlacement::Trailing,
-                companion: SingleCompanion::Vacant
-            },
-        ]
-    );
-    h.get_by_label("元に戻す").click();
-    h.run();
-    assert_eq!(
-        draft_record(&f.borrow()),
-        before,
-        "the whole confirmed pairing is one undo"
-    );
-    assert!(
-        matches!(&f.borrow().app.composition_editor, CompositionEditorState::Editing(session) if session.prepared.as_ref().unwrap().draft.can_undo())
-    );
-}
-
-#[test]
-fn real_escape_discards_blank_removal_preview_without_discarding_prior_draft() {
-    use egui_kittest::kittest::Queryable;
-    let mut f = fixture();
-    let ctx = egui::Context::default();
-    start_editing(&mut f.app, &ctx);
-    let original = draft_record(&f);
-    f.app.apply_editor_ui_action(
-        &ctx,
-        ui::EditorUiAction::InsertBlank {
-            page: 1,
-            placement: SinglePlacement::Leading,
-        },
-    );
-    f.app
-        .apply_editor_ui_action(&ctx, ui::EditorUiAction::ConfirmEdit);
+    finish_editor_results(&mut f.app);
     let before = draft_record(&f);
     let CompositionEditorState::Editing(session) = &mut f.app.composition_editor else {
         panic!("Editing");
     };
-    session.ui.selected_pages.clear();
-    session.ui.selected_unit = Some(
-        before
-            .units
-            .iter()
-            .position(|unit| {
-                matches!(
-                    unit,
-                    CompositionUnit::Single {
-                        companion: SingleCompanion::Blank,
-                        ..
-                    }
-                )
-            })
-            .unwrap(),
+    session.ui.selected_pages = vec![1];
+    session.refresh_view();
+    let (f, mut h) = editor_harness(f);
+    h.run();
+    h.get_by_label("単独で表示").click();
+    h.step();
+    let record = draft_record(&f.borrow());
+    assert_eq!(
+        record.page_override(&record.page_order[1]),
+        Some(PageOverride::Alone)
+    );
+    assert_eq!(record.direction, before.direction);
+    assert!(h.query_by_label("変更する").is_none());
+    h.run(); // Publish the updated UI tree before clicking the next control.
+    h.get_by_label("元に戻す").click();
+    h.step();
+    assert_eq!(draft_record(&f.borrow()), before);
+}
+
+#[test]
+fn real_escape_cancels_direct_draft_without_a_second_confirmation_phase() {
+    let mut f = fixture();
+    let ctx = egui::Context::default();
+    start_editing(&mut f.app, &ctx);
+    f.app.apply_editor_ui_action(
+        &ctx,
+        ui::EditorUiAction::SetOverride {
+            page: 1,
+            directive: Some(PageOverride::BlankOpposite {
+                page_side: PageSide::Leading,
+            }),
+        },
+    );
+    assert!(
+        draft_record(&f)
+            .page_override(&draft_record(&f).page_order[1])
+            .is_some()
     );
     let (f, mut h) = editor_harness(f);
     h.run();
-    h.get_by_label("白紙を取り除く").click();
-    // The preview keeps requesting its ScrollArea anchor. Process the actual
-    // queued press/release, rather than requiring the whole UI to stop repainting.
-    h.step();
-    assert!(
-        matches!(&f.borrow().app.composition_editor, CompositionEditorState::Editing(session) if session.preview.is_some())
-    );
     h.key_press(egui::Key::Escape);
     h.step();
-    assert_eq!(draft_record(&f.borrow()), before);
-    assert!(
-        matches!(&f.borrow().app.composition_editor, CompositionEditorState::Editing(session) if session.preview.is_none() && session.prepared.as_ref().unwrap().draft.can_undo())
+    assert!(!f.borrow().app.composition_editor_modal_active());
+    assert!(stored(&f.borrow()).is_none());
+}
+
+#[test]
+fn confirmation_keyboard_uses_ime_helpers_and_escape_only_dismisses_the_front_dialog() {
+    for confirmation in [
+        ui::EditorConfirmation::Remove,
+        ui::EditorConfirmation::Reload,
+    ] {
+        let mut f = fixture();
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        crate::ime_focus::install_ime_input_policy(&ctx);
+        start_editing(&mut f.app, &ctx);
+        let before = draft_record(&f);
+        let CompositionEditorState::Editing(session) = &mut f.app.composition_editor else {
+            panic!("editing");
+        };
+        session.ui.confirmation = confirmation;
+        let frame = |f: &mut Fixture, events| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1093.0, 614.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    f.app.update_ime_state(ctx);
+                    f.app.show_local_composition_editor(ctx);
+                },
+            );
+        };
+        frame(&mut f, vec![]);
+        frame(&mut f, vec![]);
+        for key in [egui::Key::Enter, egui::Key::Escape] {
+            frame(
+                &mut f,
+                vec![
+                    egui::Event::Ime(egui::ImeEvent::Enabled),
+                    egui::Event::Ime(egui::ImeEvent::Preedit("未確定".into())),
+                    egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            assert!(f.app.ime_input_active(&ctx));
+            assert!(
+                matches!(&f.app.composition_editor, CompositionEditorState::Editing(session) if session.ui.confirmation == confirmation)
+            );
+            assert_eq!(draft_record(&f), before);
+            frame(
+                &mut f,
+                vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        }
+        frame(
+            &mut f,
+            vec![egui::Event::Ime(egui::ImeEvent::Commit("".into()))],
+        );
+        frame(
+            &mut f,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(
+            matches!(&f.app.composition_editor, CompositionEditorState::Editing(session) if session.ui.confirmation == ui::EditorConfirmation::None)
+        );
+        assert_eq!(draft_record(&f), before);
+        // Qualified Enter confirms exactly the current choice.
+        frame(
+            &mut f,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let CompositionEditorState::Editing(session) = &mut f.app.composition_editor else {
+            panic!("editing");
+        };
+        session.ui.confirmation = confirmation;
+        let request = f
+            .app
+            .composition_editor_operations
+            .owner
+            .as_ref()
+            .unwrap()
+            .request_id;
+        frame(&mut f, vec![]);
+        frame(&mut f, vec![]);
+        frame(
+            &mut f,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        if confirmation == ui::EditorConfirmation::Remove {
+            assert!(f.app.composition_editor_writes_pending());
+        } else {
+            assert_ne!(
+                f.app
+                    .composition_editor_operations
+                    .owner
+                    .as_ref()
+                    .unwrap()
+                    .request_id,
+                request
+            );
+        }
+    }
+}
+
+pub(super) fn finish_editor_results(app: &mut App) {
+    let CompositionEditorState::Editing(session) = &mut app.composition_editor else {
+        return;
+    };
+    let generation = session.prepared.as_ref().unwrap().draft.generation();
+    while session.prepared.as_ref().unwrap().result.generation != generation {
+        let (received, result) = session
+            .result_worker
+            .as_ref()
+            .unwrap()
+            .receiver
+            .recv_timeout(WAIT)
+            .unwrap();
+        if received == generation {
+            session.prepared.as_mut().unwrap().result = result.unwrap();
+        }
+    }
+    session.refresh_view();
+}
+
+#[test]
+fn stale_result_cannot_replace_latest_draft_selection_or_enable_save() {
+    let mut f = fixture();
+    let ctx = egui::Context::default();
+    start_editing(&mut f.app, &ctx);
+    let CompositionEditorState::Editing(session) = &mut f.app.composition_editor else {
+        panic!("Editing");
+    };
+    let (sender, receiver) = mpsc::channel();
+    session.result_worker.as_mut().unwrap().receiver = receiver;
+    session.ui.selected_pages = vec![1];
+    let stale = session.prepared.as_ref().unwrap().result.clone();
+    f.app.apply_editor_ui_action(
+        &ctx,
+        ui::EditorUiAction::MovePageStep {
+            page: 1,
+            forward: true,
+        },
     );
-    assert!(f.borrow().app.composition_editor_modal_active());
-    f.borrow_mut()
-        .app
-        .apply_editor_ui_action(&ctx, ui::EditorUiAction::Undo);
-    assert_eq!(
-        draft_record(&f.borrow()),
-        original,
-        "Escape did not add an undo checkpoint"
+    let CompositionEditorState::Editing(session) = &mut f.app.composition_editor else {
+        panic!("Editing");
+    };
+    let prepared = session.prepared.as_ref().unwrap();
+    let generation = prepared.draft.generation();
+    let current =
+        preparation::derive_result(&prepared.result_source, prepared.draft.record(), generation)
+            .unwrap();
+    sender.send((stale.generation, Ok(stale.clone()))).unwrap();
+    session.poll_results();
+    assert_eq!(session.prepared.as_ref().unwrap().result, stale);
+    assert_eq!(session.ui.selected_pages, vec![1]);
+    assert!(session.view.results_updating);
+    assert!(!session.view.can_save);
+    sender.send((generation, Ok(current.clone()))).unwrap();
+    session.poll_results();
+    assert_eq!(session.prepared.as_ref().unwrap().result, current);
+    assert!(session.view.can_save);
+    assert_eq!(session.ui.selected_pages, vec![1]);
+}
+
+#[test]
+fn hidden_cover_is_not_presented_or_requested_while_latest_result_is_delayed() {
+    let mut f = fixture();
+    let ctx = egui::Context::default();
+    start_editing(&mut f.app, &ctx);
+    let CompositionEditorState::Editing(session) = &mut f.app.composition_editor else {
+        panic!("Editing");
+    };
+    let mut record = session.prepared.as_ref().unwrap().draft.record().clone();
+    record.cover_enabled = true;
+    session.input.rules.final_cover = true;
+    session.prepared = Ok(preparation::prepare(&session.input, Some(&record)).unwrap());
+    let cover_id = session
+        .pages
+        .iter()
+        .position(|p| p.matching_key() == record.page_order[0].matching_key())
+        .unwrap();
+    session.refresh_view();
+    assert!(session.view.units.iter().any(|unit| matches!(unit,
+        ui::EditorUnitView::Single { companion: ui::EditorCompanionView::Cover(id), .. } if *id == cover_id
+    )), "fixture must start with a real derived final-cover supplement");
+    // Hold the session's result receiver. The original worker may finish, but
+    // its reply cannot reach this owner until the explicit latest reply below.
+    let (sender, receiver) = mpsc::channel();
+    session.result_worker.as_mut().unwrap().receiver = receiver;
+    f.app.apply_editor_ui_action(
+        &ctx,
+        ui::EditorUiAction::SetHidden {
+            page: cover_id,
+            hidden: true,
+        },
     );
+    let CompositionEditorState::Editing(session) = &mut f.app.composition_editor else {
+        panic!("Editing");
+    };
+    session.poll_results();
+    assert!(session.view.results_updating);
+    assert!(session.view.pages[cover_id].hidden);
+    assert_eq!(session.view.cover, None);
+    assert!(session.view.units.iter().all(|unit| match unit {
+        ui::EditorUnitView::Pair { first, second } => *first != cover_id && *second != cover_id,
+        ui::EditorUnitView::Single {
+            page, companion, ..
+        } =>
+            *page != cover_id
+                && !matches!(companion, ui::EditorCompanionView::Cover(id) if *id == cover_id),
+    }));
+    let mut actions = Vec::new();
+    for _ in 0..3 {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(620.0, 440.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    // The result tab isolates right-side thumbnail demand. Hidden
+                    // pages remain valid thumbnail sources in the left list.
+                    session.ui.panel = ui::EditorPanel::Units;
+                    actions = ui::render(ui, &session.view, &mut session.ui);
+                });
+            },
+        );
+        assert!(
+            actions.iter().all(|action| !matches!(action,
+                ui::EditorUiAction::RequestThumbnails(ids) if ids.contains(&cover_id)
+            )),
+            "a hidden auxiliary cover must not request a right-side thumbnail"
+        );
+    }
+    let prepared = session.prepared.as_ref().unwrap();
+    let generation = prepared.draft.generation();
+    let current =
+        preparation::derive_result(&prepared.result_source, prepared.draft.record(), generation)
+            .unwrap();
+    sender.send((generation, Ok(current))).unwrap();
+    session.poll_results();
+    assert!(!session.view.results_updating);
+    assert_ne!(session.view.cover, Some(cover_id));
 }
 
 #[test]
@@ -839,6 +1024,7 @@ fn c7_editor_create_edit_cancel_save_and_db_failure_never_write_shift() {
             hidden: true,
         },
     );
+    finish_editor_results(&mut f.app);
     f.app.save_local_composition_editor(&ctx, false);
     assert!(buffer_save_completion(&mut f.app));
     f.app.poll_composition_editor_operations(&ctx);
@@ -871,6 +1057,7 @@ fn c7_editor_create_edit_cancel_save_and_db_failure_never_write_shift() {
         panic!("Editing");
     };
     let draft = session.prepared.as_ref().unwrap().draft.record().clone();
+    finish_editor_results(&mut f.app);
     f.app.save_local_composition_editor(&ctx, false);
     assert!(!buffer_save_completion(&mut f.app));
     f.app.poll_composition_editor_operations(&ctx);
@@ -955,6 +1142,7 @@ fn source_changed_save_retains_draft_and_record_without_writing_shift() {
         .unwrap()
         .write_all(b"source changed after editor preparation")
         .unwrap();
+    finish_editor_results(&mut f.app);
     f.app.save_local_composition_editor(&ctx, false);
     assert!(!buffer_save_completion(&mut f.app));
     f.app.poll_composition_editor_operations(&ctx);
@@ -1080,8 +1268,8 @@ fn corrupt_saved_record_blocks_save_remove_and_ignore_is_this_open_only() {
     }
     assert!(!f.app.composition_editor_modal_active());
     assert!(matches!(&f.app.book_composition,
-        ViewerBookComposition::Projecting { scope, origin: ProjectionOrigin::IgnoreThisOpen { .. }, .. }
-        if scope == &f.scope));
+        ViewerBookComposition::Projecting { scope, origin, .. }
+        if scope == &f.scope && matches!(origin.as_ref(), ProjectionOrigin::IgnoreThisOpen { .. })));
     finish_projection(&mut f.app, &ctx);
     assert_eq!(
         f.app
@@ -1237,6 +1425,7 @@ fn remote_save_barrier_waits_for_harvested_success_and_failure_once() {
         let handle = remote(&mut f.app);
         let (entered, release) = f.service.hold_worker_for_test();
         entered.recv_timeout(WAIT).unwrap();
+        finish_editor_results(&mut f.app);
         f.app.save_local_composition_editor(&ctx, false);
         assert!(matches!(
             f.app.composition_editor,
@@ -1399,6 +1588,7 @@ fn saved_receipt_records_resume_once_before_reload_and_failed_save_records_none(
             .unwrap()
             .watermarks()
             .admitted;
+        finish_editor_results(&mut f.app);
         f.app.save_local_composition_editor(&ctx, false);
         assert_eq!(buffer_save_completion(&mut f.app), !failure);
         assert_eq!(
@@ -1512,6 +1702,7 @@ fn shared_book_owner_save_reanchors_a20_b80_in_both_reload_completion_orders() {
         // old rows until the sole editor-save receipt has been harvested.
         let (entered, release) = f.service.hold_worker_for_test();
         entered.recv_timeout(WAIT).unwrap();
+        finish_editor_results(&mut f.app);
         f.app.save_local_composition_editor(&ctx, false);
         f.app.poll_book_composition_service_for_test(&ctx);
         assert_eq!(f.app.items.len(), 100);
@@ -1695,6 +1886,7 @@ fn retired_owner_save_receipt_records_once_without_reviving_owner_or_touching_ma
                         hidden: true,
                     },
                 );
+                finish_editor_results(app);
                 app.save_local_composition_editor(&ctx, false);
             })
             .unwrap();
@@ -1791,4 +1983,36 @@ fn modal_owner_rejects_external_activation_and_file_drop_during_temporary_mount(
         f.app.startup_open_path_resolve_pending.is_none(),
         "rejected activation was consumed"
     );
+}
+
+#[test]
+fn undo_and_redo_accept_immediate_draft_changes_while_result_is_pending() {
+    let mut f = fixture();
+    let ctx = egui::Context::default();
+    start_editing(&mut f.app, &ctx);
+    let before = draft_record(&f);
+    let CompositionEditorState::Editing(session) = &mut f.app.composition_editor else {
+        panic!("Editing");
+    };
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    session.result_worker.as_mut().unwrap().receiver = receiver;
+    f.app.apply_editor_ui_action(
+        &ctx,
+        ui::EditorUiAction::SetOverride {
+            page: 1,
+            directive: Some(PageOverride::Alone),
+        },
+    );
+    let edited = draft_record(&f);
+    assert_ne!(edited, before);
+    f.app.apply_editor_ui_action(&ctx, ui::EditorUiAction::Undo);
+    assert_eq!(draft_record(&f), before);
+    f.app.apply_editor_ui_action(&ctx, ui::EditorUiAction::Redo);
+    assert_eq!(draft_record(&f), edited);
+    let CompositionEditorState::Editing(session) = &f.app.composition_editor else {
+        panic!("Editing");
+    };
+    assert!(session.view.results_updating);
+    assert!(session.view.can_undo);
+    assert!(!session.view.can_save);
 }

@@ -1420,14 +1420,14 @@ mod tests {
                 let composition_conn = Connection::open(&composition_path).unwrap();
                 let dormant = crate::book_composition::BookComposition::new(
                     crate::book_composition::ReadingDirection::Rtl,
-                    vec![crate::book_composition::CompositionUnit::Pair {
-                        first: crate::book_composition::CompositionPageRef::RelativePath {
+                    vec![
+                        crate::book_composition::CompositionPageRef::RelativePath {
                             path: "a.jpg".into(),
                         },
-                        second: crate::book_composition::CompositionPageRef::RelativePath {
+                        crate::book_composition::CompositionPageRef::RelativePath {
                             path: "b.jpg".into(),
                         },
-                    }],
+                    ],
                 );
                 crate::book_composition::store::replace_row_in(
                     &composition_conn,

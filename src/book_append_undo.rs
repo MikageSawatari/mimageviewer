@@ -691,6 +691,7 @@ mod tests {
             edit_copies: Vec::new(),
             semantic_copies: Vec::new(),
             erase_fallback_pages: 0,
+            skipped_hidden: 0,
             undo_files: Some(receipt.files),
             metadata_copy: Default::default(),
         };

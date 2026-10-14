@@ -1,7 +1,8 @@
-//! Pure composition-editor presentation. The caller owns modal admission, IME
-//! filtering, draft mutations, and thumbnail workers; this module performs no I/O.
-
-use crate::book_composition::{ReadingDirection, ScreenSlot, SinglePlacement};
+//! Pure editor presentation. Only the left list owns order/hidden mutations.
+//! Result groups are derived by the owning session worker; this module has no I/O.
+use crate::book_composition::{
+    PageOverride, PageSide, ReadingDirection, ScreenSlot, SinglePlacement,
+};
 use egui::{Color32, RichText, Sense};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12,20 +13,17 @@ pub enum EditorPhase {
     Reloading,
     Blocked,
 }
-
 #[derive(Clone, Debug)]
 pub struct EditorPageView {
-    /// Stable within this draft; never an items index from another viewer.
     pub id: usize,
     pub name: String,
     pub physical_number: usize,
     pub hidden: bool,
     pub missing: bool,
     pub excluded_by_policy: bool,
-    /// Already uploaded by the owning context. Excluded pages never request one.
     pub thumbnail: Option<(egui::TextureId, egui::Vec2)>,
+    pub directive: Option<PageOverride>,
 }
-
 #[derive(Clone, Copy, Debug)]
 pub enum EditorUnitView {
     Pair {
@@ -38,78 +36,59 @@ pub enum EditorUnitView {
         companion: EditorCompanionView,
     },
 }
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EditorCompanionView {
     Vacant,
     Blank,
     Cover(usize),
 }
-
 #[derive(Clone, Debug)]
 pub struct EditorView {
     pub book_name: String,
     pub saved: bool,
     pub phase: EditorPhase,
     pub direction: ReadingDirection,
+    pub cover_enabled: bool,
     pub cover: Option<usize>,
-    /// Page ids equal offsets in this array, assembled by the draft adapter.
     pub pages: Vec<EditorPageView>,
+    pub page_order: Vec<usize>,
     pub units: Vec<EditorUnitView>,
+    pub results_updating: bool,
     pub can_undo: bool,
     pub can_redo: bool,
     pub can_save: bool,
     pub can_remove: bool,
     pub landing: String,
     pub error: Option<String>,
-    /// The draft owns the proposed operation. Rendering never applies it.
-    pub pending_preview: Option<EditorChangePreview>,
 }
-
-#[derive(Clone, Debug)]
-pub struct EditorChangePreview {
-    pub explanation: String,
-    pub changed_units: Vec<String>,
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum EditorPanel {
     Sources,
     #[default]
     Units,
 }
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum EditorConfirmation {
     #[default]
     None,
     Remove,
-    Rebuild,
+    Reload,
 }
-
 #[derive(Clone, Debug, Default)]
 pub struct EditorUiState {
     pub selected_pages: Vec<usize>,
-    pub selected_unit: Option<usize>,
     pub panel: EditorPanel,
     pub confirmation: EditorConfirmation,
 }
-
-/// Only IME-filtered dialog helpers may supply these values.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DialogKeys {
     pub enter: bool,
     pub escape: bool,
 }
-
 #[derive(Clone, Debug, PartialEq)]
 pub enum EditorUiAction {
-    InsertBlank {
-        page: usize,
-        placement: SinglePlacement,
-    },
     SetDirection(ReadingDirection),
-    SetCover(Option<usize>),
+    SetCover(bool),
     SetHidden {
         page: usize,
         hidden: bool,
@@ -122,43 +101,21 @@ pub enum EditorUiAction {
         page: usize,
         forward: bool,
     },
-    /// `to` is the final unit index, after removing the source unit.
-    MoveUnit {
-        unit: usize,
-        to: usize,
-    },
-    Pair {
-        first: usize,
-        second: usize,
-    },
-    SplitUnit(usize),
-    SetPlacement {
-        unit: usize,
-        placement: SinglePlacement,
-    },
-    SetCompanion {
-        unit: usize,
-        companion: EditorCompanionView,
+    SetOverride {
+        page: usize,
+        directive: Option<PageOverride>,
     },
     Undo,
     Redo,
-    Rebuild,
     Reload,
     IgnoreComposition,
-    ConfirmEdit,
-    DiscardEdit,
     Save,
     Cancel,
     Remove,
     RequestThumbnails(Vec<usize>),
 }
-
 #[derive(Clone, Copy)]
-enum DragItem {
-    Page(usize),
-    Unit(usize),
-}
-
+struct DragItem(usize);
 /// Reusable resizable, draggable window. The owner must call it only in its
 /// viewport and keep background keyboard/wheel/open admission blocked.
 pub fn show_window(
@@ -174,12 +131,19 @@ pub fn show_window(
         (screen.size() - egui::vec2(margin * 2.0, margin * 2.0)).max(egui::vec2(240.0, 140.0));
     let mut open = true;
     let mut actions = Vec::new();
-    ctx.memory_mut(|memory| {
-        memory.set_modal_layer(egui::LayerId::new(egui::Order::Foreground, id))
-    });
+    if view.phase != EditorPhase::Editing {
+        state.confirmation = EditorConfirmation::None;
+    }
+    let confirmation_at_start = state.confirmation;
+    if confirmation_at_start == EditorConfirmation::None {
+        ctx.memory_mut(|memory| {
+            memory.set_modal_layer(egui::LayerId::new(egui::Order::Foreground, id))
+        });
+    }
     egui::Window::new("本の構成を編集")
         .id(id)
         .order(egui::Order::Foreground)
+        .enabled(confirmation_at_start == EditorConfirmation::None)
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
@@ -192,21 +156,45 @@ pub fn show_window(
             ui.set_max_height((screen.bottom() - ui.min_rect().top() - margin).max(80.0));
             actions = render(ui, view, state);
         });
-    let can_close = !matches!(view.phase, EditorPhase::Saving | EditorPhase::Reloading);
-    if (!open || keys.escape) && can_close {
-        if state.confirmation != EditorConfirmation::None {
+    if state.confirmation != EditorConfirmation::None {
+        // A click opening a confirmation must not also accept it with a key
+        // from the same input pass. Keys are already qualified by App's IME helpers.
+        let confirmation_keys = if confirmation_at_start == state.confirmation {
+            keys
+        } else {
+            DialogKeys::default()
+        };
+        if let Some(choice) = show_confirmation(
+            ctx,
+            id.with("confirmation"),
+            view,
+            state.confirmation,
+            confirmation_keys,
+        ) {
+            let confirmation = state.confirmation;
             state.confirmation = EditorConfirmation::None;
-        } else if keys.escape && view.pending_preview.is_some() {
-            actions.push(EditorUiAction::DiscardEdit);
-        } else if !actions.contains(&EditorUiAction::Cancel) {
-            actions.push(EditorUiAction::Cancel);
+            if choice {
+                actions.push(match confirmation {
+                    EditorConfirmation::Remove => EditorUiAction::Remove,
+                    EditorConfirmation::Reload => EditorUiAction::Reload,
+                    EditorConfirmation::None => unreachable!(),
+                });
+            }
         }
+        return actions;
+    }
+    // A cancellation only dismisses the front confirmation, never the editor.
+    if confirmation_at_start != EditorConfirmation::None {
+        return actions;
+    }
+    let can_close = !matches!(view.phase, EditorPhase::Saving | EditorPhase::Reloading);
+    if (!open || keys.escape) && can_close && !actions.contains(&EditorUiAction::Cancel) {
+        actions.push(EditorUiAction::Cancel);
     }
     if keys.enter
+        && !keys.escape
         && view.phase == EditorPhase::Editing
         && view.can_save
-        && view.pending_preview.is_none()
-        && state.confirmation == EditorConfirmation::None
         && !ctx.memory(|m| m.focused().is_some())
         && actions
             .iter()
@@ -217,8 +205,131 @@ pub fn show_window(
     actions
 }
 
-/// Render within a bounded UI. Only the body scrolls, so Save/Cancel/Remove stay
-/// reachable at small screen sizes and after resizing. Index lookups are O(1).
+/// One bounded overlay for destructive editor choices. Header and actions stay
+/// outside the scrollable explanation, including long external-change errors.
+fn show_confirmation(
+    ctx: &egui::Context,
+    id: egui::Id,
+    view: &EditorView,
+    confirmation: EditorConfirmation,
+    keys: DialogKeys,
+) -> Option<bool> {
+    let (title, explanation, accept) = match confirmation {
+        EditorConfirmation::Remove => (
+            "構成を解除しますか",
+            "保存済みのページ順・非表示・ページごとの指定と、読む方向・表紙の指定を解除し、通常の本ごとの設定に戻します。原本のページは削除しません。".to_owned(),
+            "解除する",
+        ),
+        EditorConfirmation::Reload => (
+            "ページを読み直しますか",
+            format!("読み直すと、編集中の変更を破棄して、現在のページと保存済みの構成を読み込みます。\n\n{}", view.error.as_deref().unwrap_or("ページを読み直します。")),
+            "読み直す",
+        ),
+        EditorConfirmation::None => return None,
+    };
+    // egui also turns raw Enter into a click on a focused button. Suppress that
+    // route when the IME helper (or the opening input pass) denied Enter.
+    if !keys.enter {
+        ctx.input_mut(|input| {
+            input.events.retain(|event| {
+                !matches!(
+                    event,
+                    egui::Event::Key {
+                        key: egui::Key::Enter,
+                        pressed: true,
+                        ..
+                    }
+                )
+            });
+        });
+    }
+    let screen = ctx.content_rect();
+    let frame = egui::Frame::popup(&ctx.style());
+    let margin = frame.total_margin();
+    let size = (screen.size() - margin.sum() - egui::vec2(24.0, 24.0)).max(egui::vec2(1.0, 1.0));
+    let mut choice = None;
+    let response = egui::Modal::new(id).frame(frame).show(ctx, |ui| {
+        ui.set_width(size.x.min(420.0));
+        let heading = ui.add(egui::Label::new(RichText::new(title).heading()).wrap());
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        let row_height = [accept, "キャンセル"]
+            .into_iter()
+            .map(|text| {
+                ui.painter()
+                    .layout_no_wrap(text.to_owned(), font.clone(), ui.visuals().text_color())
+                    .size()
+                    .y
+                    + 2.0 * ui.spacing().button_padding.y
+            })
+            .fold(ui.spacing().interact_size.y, f32::max);
+        let width = ui.available_width();
+        let scroll = &mut ui.spacing_mut().scroll;
+        scroll.floating_allocated_width = scroll.bar_inner_margin + scroll.bar_width;
+        let natural = ui
+            .painter()
+            .layout(
+                explanation.clone(),
+                egui::TextStyle::Body.resolve(ui.style()),
+                ui.visuals().text_color(),
+                (width - ui.spacing().scroll.floating_allocated_width).max(1.0),
+            )
+            .size()
+            .y;
+        let budget =
+            (size.y - heading.rect.height() - row_height - 2.0 * ui.spacing().item_spacing.y)
+                .max(0.0);
+        let body_height = natural.min(budget);
+        ui.allocate_ui_with_layout(
+            egui::vec2(width, body_height),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(body_height)
+                    .min_scrolled_height(0.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.add(egui::Label::new(&explanation).wrap());
+                    });
+            },
+        );
+        let _buttons = ui.horizontal(|ui| {
+            let accept = ui.button(accept);
+            let cancel = ui.button("キャンセル");
+            if accept.clicked() {
+                choice = Some(true);
+            }
+            if cancel.clicked() {
+                choice = Some(false);
+            }
+            (accept, cancel)
+        });
+        #[cfg(test)]
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                id.with("geometry"),
+                (
+                    heading.rect,
+                    _buttons.inner.0.rect,
+                    _buttons.inner.0.interact_rect,
+                    _buttons.inner.1.rect,
+                    _buttons.inner.1.interact_rect,
+                    ui.min_rect(),
+                ),
+            )
+        });
+    });
+    // ModalResponse::should_close consumes raw Esc; use only the IME-qualified keys.
+    if response.is_top_modal && keys.escape {
+        Some(false)
+    } else if choice.is_some() {
+        choice
+    } else if response.is_top_modal && keys.enter && !ctx.memory(|m| m.focused().is_some()) {
+        Some(true)
+    } else {
+        None
+    }
+}
+
 pub fn render(
     ui: &mut egui::Ui,
     view: &EditorView,
@@ -226,186 +337,251 @@ pub fn render(
 ) -> Vec<EditorUiAction> {
     let mut actions = Vec::new();
     let mut thumbnails = Vec::new();
+    if state.confirmation != EditorConfirmation::None {
+        ui.disable();
+    }
     let editing = view.phase == EditorPhase::Editing;
-    let row_height =
-        ui.spacing().interact_size.y.max(
-            ui.text_style_height(&egui::TextStyle::Button) + 2.0 * ui.spacing().button_padding.y,
-        );
-    // The body and separator each advance the vertical layout by item_spacing.
-    // Reserve both gaps as well as the separator's actual six-point height.
-    let footer_height = row_height + 2.0 * ui.spacing().item_spacing.y + 6.0;
-    let body_height = (ui.available_height() - footer_height).max(24.0);
-    ui.allocate_ui_with_layout(
-        egui::vec2(ui.available_width(), body_height),
-        egui::Layout::top_down(egui::Align::Min),
-        |ui| {
+    let narrow = ui.available_width() < 680.0;
+    let landing = format!("保存後の元の窓: {}", view.landing);
+    // Font style height does not include a taller Japanese fallback glyph.
+    // Reserve the actual laid-out text and button padding used by these widgets,
+    // rounding each independent row up to a physical pixel before summing.
+    let pixels_per_point = ui.pixels_per_point();
+    let ceil_pixel = |height: f32| (height * pixels_per_point).ceil() / pixels_per_point;
+    let button_font = egui::TextStyle::Button.resolve(ui.style());
+    let button_text_sizes: Vec<_> = ["元に戻す", "やり直す", "保存", "キャンセル", "構成を解除"]
+        .iter()
+        .map(|label| {
+            ui.painter()
+                .layout_no_wrap(
+                    (*label).to_owned(),
+                    button_font.clone(),
+                    ui.visuals().text_color(),
+                )
+                .size()
+        })
+        .collect();
+    let button_text_height = button_text_sizes
+        .iter()
+        .map(|size| size.y)
+        .fold(0.0_f32, f32::max);
+    let button_row_width = button_text_sizes
+        .iter()
+        .map(|size| size.x + 2.0 * ui.spacing().button_padding.x)
+        .sum::<f32>()
+        + 4.0 * ui.spacing().item_spacing.x;
+    let footer_narrow = ui.available_width() < button_row_width;
+    let row = ceil_pixel(
+        ui.spacing()
+            .interact_size
+            .y
+            .max(button_text_height + 2.0 * ui.spacing().button_padding.y),
+    );
+    let landing_height = ceil_pixel(
+        ui.painter()
+            .layout_no_wrap(
+                landing.clone(),
+                egui::TextStyle::Body.resolve(ui.style()),
+                ui.visuals().text_color(),
+            )
+            .size()
+            .y,
+    );
+    let footer_height = row * if footer_narrow { 2.0 } else { 1.0 }
+        + landing_height
+        + if footer_narrow { 3.0 } else { 2.0 } * ui.spacing().item_spacing.y
+        + 6.0;
+    // Allocate the entire bounded surface once. Natural child content must not
+    // move the footer, and Window's resizable inner size must not extend the
+    // interactive content beyond the current screen.
+    let available = ui
+        .available_rect_before_wrap()
+        .intersect(ui.ctx().content_rect().shrink(12.0));
+    let (surface, _) = ui.allocate_exact_size(available.size(), Sense::hover());
+    let footer_top = (((surface.bottom() - footer_height) * pixels_per_point).floor()
+        / pixels_per_point)
+        .max(surface.top());
+    let body_rect = egui::Rect::from_min_max(surface.min, egui::pos2(surface.right(), footer_top));
+    let footer_rect = egui::Rect::from_min_max(egui::pos2(surface.left(), footer_top), surface.max);
+    let mut body = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt("editor_body")
+            .max_rect(body_rect),
+    );
+    body.set_clip_rect(ui.clip_rect().intersect(body_rect));
+    {
+        let ui = &mut body;
+        ui.horizontal(|ui| {
+            if editing && let Some(error) = &view.error {
+                if ui
+                    .button(RichText::new("ページを読み直す").color(ui.visuals().error_fg_color))
+                    .on_hover_text(error)
+                    .clicked()
+                {
+                    state.confirmation = EditorConfirmation::Reload;
+                }
+            }
+            ui.add(egui::Label::new(RichText::new(&view.book_name).strong()).truncate())
+                .on_hover_text(&view.book_name);
+        });
+        if editing {
+            ui.horizontal_wrapped(|ui| {
+                ui.weak(if view.saved {
+                    "保存済みの構成"
+                } else {
+                    "新しい構成"
+                })
+                .on_hover_text(
+                    "ページ順と指定から自動生成します。見開きずらしは構成に保存しません",
+                );
+                for (direction, name) in [
+                    (ReadingDirection::Rtl, "右開き"),
+                    (ReadingDirection::Ltr, "左開き"),
+                ] {
+                    if ui
+                        .selectable_label(view.direction == direction, name)
+                        .clicked()
+                    {
+                        actions.push(EditorUiAction::SetDirection(direction));
+                    }
+                }
+                let mut cover = view.cover_enabled;
+                if ui.checkbox(&mut cover, "表紙あり").changed() {
+                    actions.push(EditorUiAction::SetCover(cover));
+                }
+            });
+            ui.add_enabled_ui(state.confirmation == EditorConfirmation::None, |ui| {
+                if !narrow {
+                    let height = ui.available_height().max(0.0);
+                    ui.columns(2, |columns| {
+                        source_list(
+                            &mut columns[0],
+                            view,
+                            state,
+                            height,
+                            true,
+                            &mut actions,
+                            &mut thumbnails,
+                        );
+                        unit_list(
+                            &mut columns[1],
+                            view,
+                            state,
+                            height,
+                            true,
+                            &mut actions,
+                            &mut thumbnails,
+                        );
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut state.panel,
+                            EditorPanel::Sources,
+                            format!("元ページ一覧 ({}ページ)", view.pages.len()),
+                        );
+                        ui.selectable_value(
+                            &mut state.panel,
+                            EditorPanel::Units,
+                            format!(
+                                "自動で組んだ結果 ({}組){}",
+                                view.units.len(),
+                                if view.results_updating {
+                                    " / 更新中"
+                                } else {
+                                    ""
+                                }
+                            ),
+                        )
+                        .on_hover_text(
+                            "白紙は見開きだけに使い、単ページ・横長分割では表示しません",
+                        );
+                    });
+                    let height = ui.available_height().max(0.0);
+                    match state.panel {
+                        EditorPanel::Sources => source_list(
+                            ui,
+                            view,
+                            state,
+                            height,
+                            false,
+                            &mut actions,
+                            &mut thumbnails,
+                        ),
+                        EditorPanel::Units => {
+                            unit_list(
+                                ui,
+                                view,
+                                state,
+                                height,
+                                false,
+                                &mut actions,
+                                &mut thumbnails,
+                            );
+                        }
+                    }
+                }
+            });
+        } else {
             let scroll = &mut ui.spacing_mut().scroll;
             scroll.floating_allocated_width = scroll.bar_inner_margin + scroll.bar_width;
             egui::ScrollArea::vertical()
-                .id_salt("composition_body")
-                .max_height(body_height)
-                .auto_shrink([false, false])
+                .auto_shrink([false, true])
+                .max_height(ui.available_height().max(0.0))
                 .show(ui, |ui| {
-                    ui.heading(&view.book_name);
-                    ui.weak(if view.saved {
-                        "保存済みの構成"
-                    } else {
-                        "新しい構成"
-                    });
                     if let Some(error) = &view.error {
                         ui.label(RichText::new(error).color(ui.visuals().error_fg_color));
                     }
-                    match view.phase {
-                        EditorPhase::Preparing => {
-                            ui.label("本のページを準備しています");
+                    ui.label(match view.phase {
+                        EditorPhase::Preparing => "本のページを準備しています",
+                        EditorPhase::Saving => "構成を保存しています",
+                        EditorPhase::Reloading => "保存した構成で本を読み直しています",
+                        _ => "構成を読み取れません。保存データを保持しています。",
+                    });
+                    if view.phase == EditorPhase::Blocked {
+                        if ui.button("読み直す").clicked() {
+                            actions.push(EditorUiAction::Reload);
                         }
-                        EditorPhase::Saving => {
-                            ui.label("構成を保存しています");
-                        }
-                        EditorPhase::Reloading => {
-                            ui.label("保存した構成で本を読み直しています");
-                        }
-                        EditorPhase::Blocked => {
-                            ui.label("構成を読み取れません。保存データを保持しています。");
-                            if ui.button("読み直す").clicked() {
-                                actions.push(EditorUiAction::Reload);
-                            }
-                            if ui.button("今回は構成を使わず開く").clicked() {
-                                actions.push(EditorUiAction::IgnoreComposition);
-                            }
-                        }
-                        EditorPhase::Editing => {
-                            if let Some(preview) = &view.pending_preview {
-                                let prompt = egui::Frame::group(ui.style()).show(ui, |ui| {
-                                    ui.label(&preview.explanation);
-                                    let row = ui.spacing().interact_size.y;
-                                    egui::ScrollArea::vertical()
-                                        .id_salt("composition_edit_preview")
-                                        .max_height(row * 4.0)
-                                        .auto_shrink([false, true])
-                                        .show_rows(
-                                            ui,
-                                            row,
-                                            preview.changed_units.len(),
-                                            |ui, range| {
-                                                for index in range {
-                                                    ui.add_sized(
-                                                        egui::vec2(ui.available_width(), row),
-                                                        egui::Label::new(
-                                                            &preview.changed_units[index],
-                                                        )
-                                                        .truncate(),
-                                                    );
-                                                }
-                                            },
-                                        );
-                                    ui.horizontal_wrapped(|ui| {
-                                        if ui.button("変更する").clicked() {
-                                            actions.push(EditorUiAction::ConfirmEdit);
-                                        }
-                                        if ui.button("変更しない").clicked() {
-                                            actions.push(EditorUiAction::DiscardEdit);
-                                        }
-                                    });
-                                });
-                                ui.scroll_to_rect(prompt.response.rect, Some(egui::Align::Min));
-                            }
-                            if view.error.is_some() && ui.button("ページを読み直す").clicked()
-                            {
-                                actions.push(EditorUiAction::Reload);
-                            }
-                            ui.add_enabled_ui(
-                                view.pending_preview.is_none()
-                                    && state.confirmation == EditorConfirmation::None,
-                                |ui| settings(ui, view, state, &mut actions),
-                            );
-                            if state.confirmation != EditorConfirmation::None {
-                                confirmation(ui, state, &mut actions);
-                            }
-                            ui.label(
-                                "白紙は見開きの組だけに使います。単ページ表示では飛ばします。",
-                            );
-                            ui.add_enabled_ui(
-                                view.pending_preview.is_none()
-                                    && state.confirmation == EditorConfirmation::None,
-                                |ui| selected_controls(ui, view, state, &mut actions),
-                            );
-                            ui.separator();
-                            // Two independent virtual lists on wide screens. On narrow
-                            // screens tabs preserve their usable width without clipping.
-                            ui.add_enabled_ui(
-                                view.pending_preview.is_none()
-                                    && state.confirmation == EditorConfirmation::None,
-                                |ui| {
-                                    let list_height = (body_height * 0.64).max(110.0);
-                                    if ui.available_width() >= 680.0 {
-                                        ui.columns(2, |cols| {
-                                            source_list(
-                                                &mut cols[0],
-                                                view,
-                                                state,
-                                                list_height,
-                                                &mut actions,
-                                                &mut thumbnails,
-                                            );
-                                            unit_list(
-                                                &mut cols[1],
-                                                view,
-                                                state,
-                                                list_height,
-                                                &mut actions,
-                                                &mut thumbnails,
-                                            );
-                                        });
-                                    } else {
-                                        ui.horizontal(|ui| {
-                                            ui.selectable_value(
-                                                &mut state.panel,
-                                                EditorPanel::Sources,
-                                                "元ページ一覧",
-                                            );
-                                            ui.selectable_value(
-                                                &mut state.panel,
-                                                EditorPanel::Units,
-                                                "編集する見開き",
-                                            );
-                                        });
-                                        match state.panel {
-                                            EditorPanel::Sources => source_list(
-                                                ui,
-                                                view,
-                                                state,
-                                                list_height,
-                                                &mut actions,
-                                                &mut thumbnails,
-                                            ),
-                                            EditorPanel::Units => unit_list(
-                                                ui,
-                                                view,
-                                                state,
-                                                list_height,
-                                                &mut actions,
-                                                &mut thumbnails,
-                                            ),
-                                        }
-                                    }
-                                },
-                            );
-                            ui.separator();
-                            ui.label(format!("保存後の元の窓: {}", view.landing));
+                        if ui.button("今回は構成を使わず開く").clicked() {
+                            actions.push(EditorUiAction::IgnoreComposition);
                         }
                     }
                 });
-        },
+        }
+    }
+    let mut footer = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt("editor_footer")
+            .max_rect(footer_rect),
     );
+    footer.set_clip_rect(ui.clip_rect().intersect(footer_rect));
+    let ui = &mut footer;
     ui.separator();
-    ui.horizontal_wrapped(|ui| {
+    ui.add(egui::Label::new(landing).truncate());
+    let undo_redo = |ui: &mut egui::Ui, actions: &mut Vec<EditorUiAction>| {
+        if ui
+            .add_enabled(editing && view.can_undo, egui::Button::new("元に戻す"))
+            .clicked()
+        {
+            actions.push(EditorUiAction::Undo);
+        }
+        if ui
+            .add_enabled(editing && view.can_redo, egui::Button::new("やり直す"))
+            .clicked()
+        {
+            actions.push(EditorUiAction::Redo);
+        }
+    };
+    if footer_narrow {
+        ui.horizontal(|ui| undo_redo(ui, &mut actions));
+    }
+    ui.horizontal(|ui| {
+        if !footer_narrow {
+            undo_redo(ui, &mut actions);
+        }
         if ui
             .add_enabled(
-                editing
-                    && view.can_save
-                    && view.pending_preview.is_none()
-                    && state.confirmation == EditorConfirmation::None,
+                editing && view.can_save && state.confirmation == EditorConfirmation::None,
                 egui::Button::new("保存"),
             )
             .clicked()
@@ -422,13 +598,7 @@ pub fn render(
             actions.push(EditorUiAction::Cancel);
         }
         if ui
-            .add_enabled(
-                editing
-                    && view.can_remove
-                    && view.pending_preview.is_none()
-                    && state.confirmation == EditorConfirmation::None,
-                egui::Button::new("構成を解除"),
-            )
+            .add_enabled(editing && view.can_remove, egui::Button::new("構成を解除"))
             .clicked()
         {
             state.confirmation = EditorConfirmation::Remove;
@@ -437,246 +607,97 @@ pub fn render(
     if !thumbnails.is_empty() {
         actions.push(EditorUiAction::RequestThumbnails(thumbnails));
     }
+    #[cfg(test)]
+    ui.ctx().data_mut(|data| {
+        data.insert_temp(
+            egui::Id::new("composition_editor_geometry"),
+            EditorGeometry {
+                surface,
+                body: body_rect,
+                footer: footer_rect,
+                actual_footer: ui.min_rect(),
+                footer_clip: ui.clip_rect(),
+            },
+        )
+    });
     actions
 }
 
-fn settings(
-    ui: &mut egui::Ui,
-    view: &EditorView,
-    state: &mut EditorUiState,
-    actions: &mut Vec<EditorUiAction>,
-) {
-    ui.horizontal_wrapped(|ui| {
-        ui.label("読む方向:");
-        for (value, name) in [
-            (ReadingDirection::Rtl, "右開き"),
-            (ReadingDirection::Ltr, "左開き"),
-        ] {
-            if ui.selectable_label(view.direction == value, name).clicked() {
-                actions.push(EditorUiAction::SetDirection(value));
-            }
-        }
-        ui.label(if view.cover.is_some() {
-            "表紙あり"
-        } else {
-            "表紙なし"
-        });
-        if ui
-            .add_enabled(view.cover.is_some(), egui::Button::new("表紙を解除"))
-            .clicked()
-        {
-            actions.push(EditorUiAction::SetCover(None));
-        }
-    });
-    ui.horizontal_wrapped(|ui| {
-        if ui
-            .add_enabled(view.can_undo, egui::Button::new("元に戻す"))
-            .clicked()
-        {
-            actions.push(EditorUiAction::Undo);
-        }
-        if ui
-            .add_enabled(view.can_redo, egui::Button::new("やり直す"))
-            .clicked()
-        {
-            actions.push(EditorUiAction::Redo);
-        }
-        if ui.button("編集中の条件で組を作り直す").clicked() {
-            state.confirmation = EditorConfirmation::Rebuild;
-        }
-    });
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct EditorGeometry {
+    surface: egui::Rect,
+    body: egui::Rect,
+    footer: egui::Rect,
+    actual_footer: egui::Rect,
+    footer_clip: egui::Rect,
 }
-
-fn confirmation(ui: &mut egui::Ui, state: &mut EditorUiState, actions: &mut Vec<EditorUiAction>) {
-    let remove = state.confirmation == EditorConfirmation::Remove;
-    let prompt = egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.label(if remove { "本全体の構成を解除します。ページの非表示と並び順を取り除き、自動規則へ戻します。元ファイルは変更しません。" } else { "編集中のページ順・方向・表紙を使って、隣り合うページの組を作り直します。全体の既定や見開きの自動調整は適用し直しません。変更される組は次の確認画面で表示します。" });
-        ui.horizontal_wrapped(|ui| {
-            if ui.button(if remove { "解除する" } else { "作り直す" }).clicked() {
-                actions.push(if remove { EditorUiAction::Remove } else { EditorUiAction::Rebuild });
-                state.confirmation = EditorConfirmation::None;
-            }
-            if ui.button("編集を続ける").clicked() { state.confirmation = EditorConfirmation::None; }
-        });
-    });
-    ui.scroll_to_rect(prompt.response.rect, Some(egui::Align::Min));
+fn select_page(state: &mut EditorUiState, page: usize) {
+    state.selected_pages = vec![page];
 }
-
-fn selected_controls(
-    ui: &mut egui::Ui,
-    view: &EditorView,
-    state: &EditorUiState,
-    actions: &mut Vec<EditorUiAction>,
-) {
-    ui.horizontal_wrapped(|ui| {
-        if let Some(&page) = state
-            .selected_pages
-            .first()
-            .filter(|_| state.selected_pages.len() == 1)
-            && let Some(p) = view.pages.get(page)
-        {
-            if ui
-                .button(if p.hidden {
-                    "表示に戻す"
-                } else {
-                    "非表示"
-                })
-                .clicked()
-            {
-                actions.push(EditorUiAction::SetHidden {
-                    page,
-                    hidden: !p.hidden,
-                });
-            }
-            if ui.button("白紙を挿入").clicked() {
-                actions.push(EditorUiAction::InsertBlank {
-                    page,
-                    placement: SinglePlacement::Leading,
-                });
-            }
-            if ui
-                .add_enabled(
-                    !p.hidden && !p.missing && !p.excluded_by_policy,
-                    egui::Button::new("表紙に指定"),
-                )
-                .clicked()
-            {
-                actions.push(EditorUiAction::SetCover(Some(page)));
-            }
-        }
-        if state.selected_pages.len() == 2 {
-            if ui.button("この2枚を組にする").clicked() {
-                actions.push(EditorUiAction::Pair {
-                    first: state.selected_pages[0],
-                    second: state.selected_pages[1],
-                });
-            }
-        } else {
-            ui.weak("ページを選択。Ctrlを押して2枚選ぶと組にできます。");
-        }
-    });
-    if let Some(unit) = state.selected_unit.filter(|&i| i < view.units.len()) {
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .add_enabled(unit > 0, egui::Button::new("前へ"))
-                .clicked()
-            {
-                actions.push(EditorUiAction::MoveUnit { unit, to: unit - 1 });
-            }
-            if ui
-                .add_enabled(unit + 1 < view.units.len(), egui::Button::new("後へ"))
-                .clicked()
-            {
-                actions.push(EditorUiAction::MoveUnit { unit, to: unit + 1 });
-            }
-            match &view.units[unit] {
-                EditorUnitView::Pair { .. } => {
-                    if ui.button("単ページにする").clicked() {
-                        actions.push(EditorUiAction::SplitUnit(unit));
-                    }
-                }
-                EditorUnitView::Single {
-                    placement,
-                    companion,
-                    ..
-                } => {
-                    for (value, name) in [
-                        (SinglePlacement::Center, "中央"),
-                        (SinglePlacement::Leading, "読む順の先頭側"),
-                        (SinglePlacement::Trailing, "読む順の後ろ側"),
-                    ] {
-                        if ui.selectable_label(*placement == value, name).clicked() {
-                            actions.push(EditorUiAction::SetPlacement {
-                                unit,
-                                placement: value,
-                            });
-                        }
-                    }
-                    if ui
-                        .button(if *companion == EditorCompanionView::Blank {
-                            "白紙を取り除く"
-                        } else {
-                            "白紙を挿入"
-                        })
-                        .clicked()
-                    {
-                        actions.push(EditorUiAction::SetCompanion {
-                            unit,
-                            companion: if *companion == EditorCompanionView::Blank {
-                                EditorCompanionView::Vacant
-                            } else {
-                                EditorCompanionView::Blank
-                            },
-                        });
-                    }
-                    let is_cover = matches!(companion, EditorCompanionView::Cover(_));
-                    if ui
-                        .add_enabled(
-                            view.cover.is_some() || is_cover,
-                            egui::Button::new(if is_cover {
-                                "表紙の補助表示を外す"
-                            } else {
-                                "表紙の補助表示"
-                            }),
-                        )
-                        .clicked()
-                    {
-                        actions.push(EditorUiAction::SetCompanion {
-                            unit,
-                            companion: if is_cover {
-                                EditorCompanionView::Vacant
-                            } else {
-                                EditorCompanionView::Cover(view.cover.unwrap())
-                            },
-                        });
-                    }
-                }
-            }
-        });
-    }
-}
-
-fn select_page(state: &mut EditorUiState, page: usize, additive: bool) {
-    state.selected_unit = None;
-    if additive {
-        if let Some(at) = state.selected_pages.iter().position(|&p| p == page) {
-            state.selected_pages.remove(at);
-        } else {
-            if state.selected_pages.len() == 2 {
-                state.selected_pages.remove(0);
-            }
-            state.selected_pages.push(page);
-        }
-    } else {
-        state.selected_pages = vec![page];
-    }
-}
-
 fn source_list(
     ui: &mut egui::Ui,
     view: &EditorView,
     state: &mut EditorUiState,
     height: f32,
+    show_heading: bool,
     actions: &mut Vec<EditorUiAction>,
     thumbnails: &mut Vec<usize>,
 ) {
-    ui.label(format!("元ページ一覧 ({}ページ)", view.pages.len()));
-    let row = ui.spacing().interact_size.y;
+    if show_heading {
+        ui.label(format!("元ページ一覧 ({}ページ)", view.pages.len()));
+    }
+    ui.horizontal(|ui| {
+        let selected = state
+            .selected_pages
+            .first()
+            .and_then(|&id| view.pages.get(id));
+        let position = selected.and_then(|p| view.page_order.iter().position(|&id| id == p.id));
+        for (forward, name, enabled) in [
+            (false, "ページを前へ", position.is_some_and(|p| p > 0)),
+            (
+                true,
+                "ページを後へ",
+                position.is_some_and(|p| p + 1 < view.page_order.len()),
+            ),
+        ] {
+            if ui.add_enabled(enabled, egui::Button::new(name)).clicked() {
+                actions.push(EditorUiAction::MovePageStep {
+                    page: selected.unwrap().id,
+                    forward,
+                });
+            }
+        }
+        if ui
+            .add_enabled(
+                selected.is_some(),
+                egui::Button::new(if selected.is_some_and(|p| p.hidden) {
+                    "表示に戻す"
+                } else {
+                    "非表示"
+                }),
+            )
+            .clicked()
+        {
+            let page = selected.unwrap();
+            actions.push(EditorUiAction::SetHidden {
+                page: page.id,
+                hidden: !page.hidden,
+            });
+        }
+    });
+    let row =
+        ui.spacing().interact_size.y.max(
+            ui.text_style_height(&egui::TextStyle::Button) + 2.0 * ui.spacing().button_padding.y,
+        );
+    let height = ui.available_height().min(height).max(0.0);
     egui::ScrollArea::vertical()
         .id_salt("composition_sources")
         .max_height(height)
         .auto_shrink([false, false])
-        .show_rows(ui, row, view.pages.len(), |ui, range| {
+        .show_rows(ui, row, view.page_order.len(), |ui, range| {
             for index in range {
-                let page = &view.pages[index];
-                if page.thumbnail.is_none()
-                    && !page.excluded_by_policy
-                    && !page.missing
-                    && thumbnails.len() < 24
-                    && !thumbnails.contains(&page.id)
-                {
-                    thumbnails.push(page.id);
-                }
+                let page = &view.pages[view.page_order[index]];
                 let suffix = if page.excluded_by_policy {
                     " / ファイル種類の設定で非表示"
                 } else if page.missing {
@@ -691,11 +712,14 @@ fn source_list(
                     .thumbnail
                     .filter(|_| !page.excluded_by_policy && !page.missing)
                 {
+                    let thumb = (row - 2.0 * ui.spacing().button_padding.y).max(1.0);
                     egui::Button::image_and_text(
-                        egui::Image::new((texture, size)).fit_to_exact_size(egui::vec2(row, row)),
+                        egui::Image::new((texture, size))
+                            .fit_to_exact_size(egui::vec2(thumb, thumb)),
                         label,
                     )
                 } else {
+                    request_thumbnail(page, thumbnails);
                     egui::Button::new(label)
                 };
                 let r = ui.add_sized(
@@ -706,124 +730,228 @@ fn source_list(
                         .sense(Sense::click_and_drag()),
                 );
                 if r.clicked() {
-                    select_page(state, page.id, ui.input(|i| i.modifiers.ctrl));
+                    select_page(state, page.id);
                 }
-                r.dnd_set_drag_payload(DragItem::Page(page.id));
+                r.dnd_set_drag_payload(DragItem(page.id));
                 if let Some(payload) = r.dnd_release_payload::<DragItem>()
-                    && let DragItem::Page(from) = *payload
-                    && from != page.id
+                    && payload.0 != page.id
                 {
                     actions.push(EditorUiAction::MovePage {
-                        page: from,
+                        page: payload.0,
                         before: page.id,
                     });
                 }
                 r.on_hover_text(format!("{}{}", page.name, suffix));
             }
         });
-    if let Some(&page) = state
-        .selected_pages
-        .first()
-        .filter(|_| state.selected_pages.len() == 1)
+}
+fn request_thumbnail(page: &EditorPageView, thumbnails: &mut Vec<usize>) {
+    if page.thumbnail.is_none()
+        && !page.excluded_by_policy
+        && !page.missing
+        && thumbnails.len() < 24
+        && !thumbnails.contains(&page.id)
     {
-        ui.horizontal_wrapped(|ui| {
-            let unit = view.units.iter().position(|u| match *u {
-                EditorUnitView::Pair { first, second } => page == first || page == second,
-                EditorUnitView::Single { page: p, .. } => page == p,
-            });
-            if ui
-                .add_enabled(
-                    unit.is_some_and(|u| u > 0),
-                    egui::Button::new("ページを前へ"),
-                )
-                .clicked()
-            {
-                actions.push(EditorUiAction::MovePageStep {
-                    page,
-                    forward: false,
-                });
-            }
-            if ui
-                .add_enabled(
-                    unit.is_some_and(|u| u + 1 < view.units.len()),
-                    egui::Button::new("ページを後へ"),
-                )
-                .clicked()
-            {
-                actions.push(EditorUiAction::MovePageStep {
-                    page,
-                    forward: true,
-                });
-            }
-        });
+        thumbnails.push(page.id);
     }
 }
-
+fn directive_controls(
+    ui: &mut egui::Ui,
+    view: &EditorView,
+    state: &EditorUiState,
+    actions: &mut Vec<EditorUiAction>,
+) {
+    let selected = state
+        .selected_pages
+        .first()
+        .and_then(|&id| view.pages.get(id))
+        .filter(|p| !p.hidden && !p.missing && !p.excluded_by_policy);
+    ui.add_enabled_ui(selected.is_some(), |ui| {
+        ui.horizontal_wrapped(|ui| {
+            for (directive, name) in [
+                (None, "自動"),
+                (Some(PageOverride::Alone), "単独で表示"),
+                (
+                    Some(PageOverride::BlankOpposite {
+                        page_side: PageSide::Leading,
+                    }),
+                    "隣を白紙にする",
+                ),
+            ] {
+                let chosen = selected.is_some_and(|p| {
+                    if matches!(directive, Some(PageOverride::BlankOpposite { .. })) {
+                        matches!(p.directive, Some(PageOverride::BlankOpposite { .. }))
+                    } else {
+                        p.directive == directive
+                    }
+                });
+                if ui
+                    .selectable_label(chosen, name)
+                    .on_hover_text("白紙は見開きだけに使い、単ページ・横長分割では表示しません")
+                    .clicked()
+                {
+                    actions.push(EditorUiAction::SetOverride {
+                        page: selected.unwrap().id,
+                        directive,
+                    });
+                }
+            }
+            if let Some(p) = selected
+                && let Some(PageOverride::BlankOpposite { page_side }) = p.directive
+            {
+                ui.weak("実ページ側:");
+                for (left, name) in [(true, "左"), (false, "右")] {
+                    let side = if left == (view.direction == ReadingDirection::Ltr) {
+                        PageSide::Leading
+                    } else {
+                        PageSide::Trailing
+                    };
+                    if ui
+                        .selectable_label(page_side == side, name)
+                        .on_hover_text(if left {
+                            "実ページを左に置く"
+                        } else {
+                            "実ページを右に置く"
+                        })
+                        .clicked()
+                    {
+                        actions.push(EditorUiAction::SetOverride {
+                            page: p.id,
+                            directive: Some(PageOverride::BlankOpposite { page_side: side }),
+                        });
+                    }
+                }
+            }
+        });
+    });
+}
+fn badge(view: &EditorView, id: usize) -> String {
+    let page = &view.pages[id];
+    let specified = match page.directive {
+        None => "",
+        Some(PageOverride::Alone) => "単独",
+        Some(PageOverride::BlankOpposite { page_side }) => match (page_side, view.direction) {
+            (PageSide::Leading, ReadingDirection::Ltr)
+            | (PageSide::Trailing, ReadingDirection::Rtl) => "白紙・左側",
+            _ => "白紙・右側",
+        },
+    };
+    if view.cover == Some(id) {
+        format!("表紙 {specified}")
+    } else {
+        specified.into()
+    }
+}
+fn result_row_height(ui: &egui::Ui) -> f32 {
+    let label_height = ui
+        .painter()
+        .layout_no_wrap("0ページ".into(), page_card_label_font(), Color32::WHITE)
+        .size()
+        .y;
+    let description_height = ui
+        .painter()
+        .layout_no_wrap(
+            "0組目 / 白紙・右側".into(),
+            egui::TextStyle::Body.resolve(ui.style()),
+            ui.visuals().text_color(),
+        )
+        .size()
+        .y;
+    // The tallest actual content owns the row. Vertical separation belongs to
+    // show_rows' item_spacing; an inset here would consume the minimum viewport
+    // needed to show one entire thumbnail and its Japanese label band.
+    page_card_height(label_height).max(2.0 * description_height + ui.spacing().item_spacing.y)
+}
 fn unit_list(
     ui: &mut egui::Ui,
     view: &EditorView,
     state: &mut EditorUiState,
     height: f32,
+    show_heading: bool,
     actions: &mut Vec<EditorUiAction>,
     thumbnails: &mut Vec<usize>,
-) {
-    ui.label(format!("編集する見開き ({}組)", view.units.len()));
-    let row_height = 110.0;
+) -> egui::scroll_area::ScrollAreaOutput<Vec<(usize, egui::Rect)>> {
+    if show_heading {
+        ui.label(format!(
+            "自動で組んだ結果 ({}組){}",
+            view.units.len(),
+            if view.results_updating {
+                " / 更新中"
+            } else {
+                ""
+            }
+        ))
+        .on_hover_text("白紙は見開きだけに使い、単ページ・横長分割では表示しません");
+    }
+    directive_controls(ui, view, state, actions);
+    let row_height = result_row_height(ui);
+    let height = ui.available_height().min(height).max(0.0);
     egui::ScrollArea::vertical()
         .id_salt("composition_units")
         .max_height(height)
         .auto_shrink([false, false])
         .show_rows(ui, row_height, view.units.len(), |ui, range| {
+            let mut rectangles = Vec::new();
             for unit in range {
-                let (rect, response) = ui.allocate_exact_size(
+                let (rect, _) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), row_height),
-                    Sense::click_and_drag(),
+                    Sense::hover(),
                 );
-                ui.painter().rect_filled(
-                    rect.shrink(2.0),
-                    4.0,
-                    if state.selected_unit == Some(unit) {
-                        ui.visuals().selection.bg_fill
-                    } else {
-                        ui.visuals().faint_bg_color
-                    },
+                let content_rect = rect.shrink2(egui::vec2(2.0, 0.0));
+                ui.painter()
+                    .rect_filled(content_rect, 4.0, ui.visuals().faint_bg_color);
+                // new_child does not advance the parent's cursor a second time. The
+                // only parent allocation is the exact row used by show_rows above.
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .id_salt(("result", unit))
+                        .max_rect(content_rect),
                 );
-                if response.clicked() {
-                    state.selected_unit = Some(unit);
-                    state.selected_pages.clear();
+                child.set_clip_rect(rect.intersect(ui.clip_rect()));
+                if view.results_updating || !ui.is_enabled() {
+                    child.disable();
                 }
-                response.dnd_set_drag_payload(DragItem::Unit(unit));
-                if let Some(payload) = response.dnd_release_payload::<DragItem>()
-                    && let DragItem::Unit(from) = *payload
-                    && from != unit
-                {
-                    actions.push(EditorUiAction::MoveUnit {
-                        unit: from,
-                        to: unit,
-                    });
-                }
-                ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink(6.0)), |ui| {
-                    ui.set_clip_rect(rect.shrink(2.0).intersect(ui.clip_rect()));
-                    let placement = match view.units[unit] {
-                        EditorUnitView::Pair { .. } => "見開き",
-                        EditorUnitView::Single { placement, .. } => {
-                            match placement.screen_slot(view.direction) {
-                                ScreenSlot::Center => "中央",
-                                ScreenSlot::Left => "左側",
-                                ScreenSlot::Right => "右側",
-                            }
-                        }
-                    };
-                    ui.label(format!("{}組目 / {}", unit + 1, placement));
-                    ui.horizontal(|ui| match view.units[unit] {
+                let (ids, description) = match view.units[unit] {
+                    EditorUnitView::Pair { first, second } => (vec![first, second], "見開き"),
+                    EditorUnitView::Single {
+                        page,
+                        companion: EditorCompanionView::Cover(_),
+                        ..
+                    } => (vec![page], "末尾に添えた表紙"),
+                    EditorUnitView::Single {
+                        page,
+                        companion: EditorCompanionView::Blank,
+                        ..
+                    } => (
+                        vec![page],
+                        if matches!(
+                            view.pages[page].directive,
+                            Some(PageOverride::BlankOpposite { .. })
+                        ) {
+                            "指定した白紙（末尾表紙より優先）"
+                        } else {
+                            "自動の単独・白紙"
+                        },
+                    ),
+                    EditorUnitView::Single { page, .. } => (
+                        vec![page],
+                        if view.pages[page].directive == Some(PageOverride::Alone) {
+                            "単独指定"
+                        } else {
+                            "自動の単独（横長・端など）"
+                        },
+                    ),
+                };
+                child.horizontal(|ui| {
+                    match view.units[unit] {
                         EditorUnitView::Pair { first, second } => {
                             let (left, right) = if view.direction == ReadingDirection::Ltr {
                                 (first, second)
                             } else {
                                 (second, first)
                             };
-                            page_card(ui, view, state, left, actions, thumbnails);
-                            page_card(ui, view, state, right, actions, thumbnails);
+                            page_card(ui, view, state, left, false, actions, thumbnails);
+                            page_card(ui, view, state, right, false, actions, thumbnails);
                         }
                         EditorUnitView::Single {
                             page,
@@ -834,15 +962,45 @@ fn unit_list(
                             if slot == ScreenSlot::Right {
                                 companion_card(ui, view, state, companion, actions, thumbnails);
                             }
-                            page_card(ui, view, state, page, actions, thumbnails);
+                            page_card(ui, view, state, page, false, actions, thumbnails);
                             if slot != ScreenSlot::Right {
                                 companion_card(ui, view, state, companion, actions, thumbnails);
                             }
                         }
+                    };
+
+                    ui.vertical(|ui| {
+                        ui.add(
+                            egui::Label::new(format!("{}組目 / {description}", unit + 1))
+                                .truncate(),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                ids.into_iter()
+                                    .map(|id| badge(view, id))
+                                    .filter(|s| !s.is_empty())
+                                    .collect::<Vec<_>>()
+                                    .join(" / "),
+                            )
+                            .truncate(),
+                        );
                     });
                 });
+                rectangles.push((unit, rect.union(child.min_rect())));
             }
-        });
+            rectangles
+        })
+}
+const PAGE_CARD_WIDTH: f32 = 76.0;
+const PAGE_CARD_THUMB_HEIGHT: f32 = 52.0;
+const PAGE_CARD_LABEL_GAP: f32 = 3.0;
+
+fn page_card_label_font() -> egui::FontId {
+    egui::FontId::proportional(12.0)
+}
+
+fn page_card_height(label_height: f32) -> f32 {
+    PAGE_CARD_THUMB_HEIGHT + PAGE_CARD_LABEL_GAP + label_height
 }
 
 fn page_card(
@@ -850,28 +1008,59 @@ fn page_card(
     view: &EditorView,
     state: &mut EditorUiState,
     id: usize,
-    actions: &mut Vec<EditorUiAction>,
+    supplement: bool,
+    _actions: &mut Vec<EditorUiAction>,
     thumbnails: &mut Vec<usize>,
 ) {
     let Some(page) = view.pages.get(id) else {
         return;
     };
-    let (rect, r) = ui.allocate_exact_size(egui::vec2(76.0, 70.0), Sense::click_and_drag());
+    // The label gets its own band under the thumbnail, sized from the laid-out
+    // text. A fixed card height let the label overlap the image with larger fonts.
+    let label = ui.painter().layout_no_wrap(
+        if page.missing {
+            "見つからないページ".to_owned()
+        } else {
+            format!("{}ページ", page.physical_number)
+        },
+        page_card_label_font(),
+        ui.visuals().text_color(),
+    );
+    let width = PAGE_CARD_WIDTH.max(label.size().x);
+    let (rect, r) = ui.allocate_exact_size(
+        egui::vec2(width, page_card_height(label.size().y)),
+        Sense::click(),
+    );
+    r.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            if supplement {
+                format!("末尾に添えた表紙: {}ページ", page.physical_number)
+            } else {
+                format!("{}ページ", page.physical_number)
+            },
+        )
+    });
+    let thumb_rect = egui::Rect::from_min_size(rect.min, egui::vec2(width, PAGE_CARD_THUMB_HEIGHT));
     if let Some((texture, size)) = page
         .thumbnail
         .filter(|_| !page.excluded_by_policy && !page.missing)
     {
-        let fit =
-            size * (rect.width() / size.x.max(1.0)).min((rect.height() - 17.0) / size.y.max(1.0));
+        let fit = size
+            * (thumb_rect.width() / size.x.max(1.0)).min(thumb_rect.height() / size.y.max(1.0));
         ui.painter().image(
             texture,
-            egui::Rect::from_center_size(rect.center() - egui::vec2(0.0, 8.0), fit),
+            egui::Rect::from_center_size(thumb_rect.center(), fit),
             egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
             Color32::WHITE,
         );
     } else {
-        ui.painter()
-            .rect_filled(rect.shrink(1.0), 3.0, ui.visuals().widgets.inactive.bg_fill);
+        ui.painter().rect_filled(
+            thumb_rect.shrink(1.0),
+            3.0,
+            ui.visuals().widgets.inactive.bg_fill,
+        );
         if !page.excluded_by_policy
             && !page.missing
             && thumbnails.len() < 24
@@ -880,17 +1069,12 @@ fn page_card(
             thumbnails.push(id);
         }
     }
-    ui.painter().text(
-        rect.center_bottom() - egui::vec2(0.0, 2.0),
-        egui::Align2::CENTER_BOTTOM,
-        if page.missing {
-            "見つからないページ".to_owned()
-        } else {
-            format!("{}ページ", page.physical_number)
-        },
-        egui::FontId::proportional(12.0),
-        ui.visuals().text_color(),
+    let label_pos = egui::pos2(
+        rect.center().x - label.size().x / 2.0,
+        thumb_rect.bottom() + PAGE_CARD_LABEL_GAP,
     );
+    ui.painter()
+        .galley(label_pos, label, ui.visuals().text_color());
     if state.selected_pages.contains(&id) {
         ui.painter().rect_stroke(
             rect,
@@ -900,19 +1084,7 @@ fn page_card(
         );
     }
     if r.clicked() {
-        select_page(state, id, ui.input(|i| i.modifiers.ctrl));
-    }
-    r.dnd_set_drag_payload(DragItem::Page(id));
-    if let Some(payload) = r.dnd_release_payload::<DragItem>()
-        && let DragItem::Page(from) = *payload
-        && from != id
-    {
-        // Page reorder is returned by the owning card list; selection itself is
-        // unchanged here. The adapter handles canonical reading-order placement.
-        actions.push(EditorUiAction::MovePage {
-            page: from,
-            before: id,
-        });
+        select_page(state, id);
     }
     r.on_hover_text(format!(
         "{}{}",
@@ -941,7 +1113,7 @@ fn companion_card(
             // Auxiliary copies do not become selection or drag sources.
             let saved_selection = state.selected_pages.clone();
             ui.add_enabled_ui(false, |ui| {
-                page_card(ui, view, state, id, actions, thumbnails)
+                page_card(ui, view, state, id, true, actions, thumbnails)
             });
             state.selected_pages = saved_selection;
             ui.weak("補助");
@@ -967,6 +1139,373 @@ fn companion_card(
                 "この見開きの\n空き側",
                 egui::FontId::proportional(11.0),
                 ui.visuals().weak_text_color(),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/support/scroll_layout.rs"]
+mod scroll_layout;
+
+#[cfg(test)]
+mod row_tests {
+    use super::scroll_layout::{HeightExpectation, ScrollLayout};
+    use super::*;
+
+    fn fixture(count: usize) -> EditorView {
+        EditorView {
+            book_name: "row geometry".into(),
+            saved: true,
+            phase: EditorPhase::Editing,
+            direction: ReadingDirection::Rtl,
+            cover_enabled: true,
+            cover: Some(0),
+            pages: (0..count)
+                .map(|id| EditorPageView {
+                    id,
+                    name: format!("page-{id}"),
+                    physical_number: id + 1,
+                    hidden: false,
+                    missing: false,
+                    excluded_by_policy: false,
+                    thumbnail: None,
+                    directive: Some(PageOverride::BlankOpposite {
+                        page_side: PageSide::Leading,
+                    }),
+                })
+                .collect(),
+            page_order: (0..count).collect(),
+            units: (0..count)
+                .map(|page| EditorUnitView::Single {
+                    page,
+                    placement: SinglePlacement::Leading,
+                    companion: EditorCompanionView::Blank,
+                })
+                .collect(),
+            results_updating: false,
+            can_undo: true,
+            can_redo: true,
+            can_save: true,
+            can_remove: true,
+            landing: String::new(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn confirmation_denied_enter_does_not_activate_focused_button() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        for accept in [true, false] {
+            let view = fixture(2);
+            let mut state = EditorUiState {
+                confirmation: EditorConfirmation::Remove,
+                ..Default::default()
+            };
+            let mut fonts_ready = false;
+            let mut h = crate::test_ui::builder()
+                .with_size(egui::vec2(1093.0, 614.0))
+                .build_state(
+                    move |ctx, actions: &mut Vec<EditorUiAction>| {
+                        if !fonts_ready {
+                            crate::ui_fonts::configure_fonts(ctx);
+                            fonts_ready = true;
+                            ctx.request_repaint();
+                            return;
+                        }
+                        *actions = show_window(
+                            ctx,
+                            egui::Id::new("denied_enter"),
+                            &view,
+                            &mut state,
+                            DialogKeys::default(),
+                        );
+                    },
+                    Vec::new(),
+                );
+            h.run_steps(6);
+            let node = h
+                .get_all_by_label(if accept {
+                    "解除する"
+                } else {
+                    "キャンセル"
+                })
+                .find(|node| {
+                    let id =
+                        unsafe { egui::Id::from_high_entropy_bits(node.accesskit_node().id().0) };
+                    h.ctx
+                        .read_response(id)
+                        .is_some_and(|response| response.enabled())
+                })
+                .unwrap();
+            node.focus();
+            h.step();
+            assert!(h.ctx.memory(|memory| memory.focused().is_some()));
+            h.key_press(egui::Key::Enter);
+            h.step();
+            assert!(
+                h.state()
+                    .iter()
+                    .all(|action| matches!(action, EditorUiAction::RequestThumbnails(_))),
+                "helper-denied Enter: {:?}",
+                h.state()
+            );
+            assert!(h.query_by_label("解除する").is_some());
+        }
+    }
+
+    #[test]
+    fn confirmation_modal_bounds_keep_actions_outside_long_scroll_body() {
+        for physical in [egui::vec2(1093.0, 614.0), egui::vec2(1366.0, 728.0)] {
+            for scale in [1.0, 2.0] {
+                for confirmation in [EditorConfirmation::Remove, EditorConfirmation::Reload] {
+                    let ctx = egui::Context::default();
+                    crate::ui_fonts::configure_fonts(&ctx);
+                    crate::settings::apply_ui_scale_factor(&ctx, scale);
+                    let mut view = fixture(8);
+                    view.error = Some("長いエラーの説明と変更された書庫のパス。".repeat(200));
+                    let mut state = EditorUiState {
+                        confirmation,
+                        ..Default::default()
+                    };
+                    let id = egui::Id::new("confirmation_bounds");
+                    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, physical / scale);
+                    for _ in 0..6 {
+                        let _ = ctx.run(
+                            egui::RawInput {
+                                screen_rect: Some(screen),
+                                ..Default::default()
+                            },
+                            |ctx| {
+                                show_window(ctx, id, &view, &mut state, DialogKeys::default());
+                            },
+                        );
+                    }
+                    let (heading, accept, accept_hit, cancel, cancel_hit, actual) = ctx
+                        .data(|data| {
+                            data.get_temp::<(
+                                egui::Rect,
+                                egui::Rect,
+                                egui::Rect,
+                                egui::Rect,
+                                egui::Rect,
+                                egui::Rect,
+                            )>(
+                                id.with("confirmation").with("geometry")
+                            )
+                        })
+                        .unwrap();
+                    assert!(
+                        screen.shrink(4.0).contains_rect(actual),
+                        "{physical:?}/{scale}/{confirmation:?}: {actual:?}"
+                    );
+                    assert!(screen.contains_rect(heading));
+                    assert!(screen.contains_rect(accept) && accept_hit.contains_rect(accept));
+                    assert!(screen.contains_rect(cancel) && cancel_hit.contains_rect(cancel));
+                    assert!(heading.bottom() < accept.top());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_footer_is_contained_when_body_natural_height_overflows() {
+        for (width, height) in [(1093.0, 614.0), (1366.0, 728.0)] {
+            for scale in [1.0, 2.0] {
+                for phase in [
+                    EditorPhase::Preparing,
+                    EditorPhase::Editing,
+                    EditorPhase::Saving,
+                    EditorPhase::Reloading,
+                    EditorPhase::Blocked,
+                ] {
+                    for confirmation in [EditorConfirmation::None, EditorConfirmation::Remove] {
+                        let ctx = egui::Context::default();
+                        ctx.set_pixels_per_point(scale);
+                        crate::ui_fonts::configure_fonts(&ctx);
+                        let mut view = fixture(600);
+                        view.phase = phase;
+                        view.error = Some(
+                            "長いエラー文とパスを含む本文が操作行を押し出さないことを確認します。"
+                                .repeat(80),
+                        );
+                        let mut state = EditorUiState {
+                            confirmation,
+                            selected_pages: vec![1],
+                            ..Default::default()
+                        };
+                        let screen = egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width / scale, height / scale),
+                        );
+                        for _ in 0..5 {
+                            let _ = ctx.run(
+                                egui::RawInput {
+                                    screen_rect: Some(screen),
+                                    ..Default::default()
+                                },
+                                |ctx| {
+                                    show_window(
+                                        ctx,
+                                        egui::Id::new("footer_geometry_window"),
+                                        &view,
+                                        &mut state,
+                                        DialogKeys::default(),
+                                    );
+                                },
+                            );
+                        }
+                        let geometry = ctx
+                            .data(|data| {
+                                data.get_temp::<EditorGeometry>(egui::Id::new(
+                                    "composition_editor_geometry",
+                                ))
+                            })
+                            .unwrap();
+                        assert!(
+                            screen.contains_rect(geometry.surface),
+                            "surface escapes screen: {phase:?}/{confirmation:?} scale={scale}"
+                        );
+                        assert!(
+                            geometry.footer.contains_rect(geometry.actual_footer),
+                            "natural footer escapes its budget: {phase:?}/{confirmation:?} scale={scale}: {:?} vs {:?}",
+                            geometry.actual_footer,
+                            geometry.footer
+                        );
+                        assert!(
+                            geometry.footer_clip.contains_rect(geometry.actual_footer),
+                            "footer interactions clipped: {phase:?}/{confirmation:?} scale={scale}"
+                        );
+                        assert!(
+                            geometry.body.bottom() <= geometry.footer.top(),
+                            "body and footer overlap"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn short_result_list_fits_without_unnecessary_scroll() {
+        let ctx = egui::Context::default();
+        let view = fixture(2);
+        let mut state = EditorUiState::default();
+        for _ in 0..3 {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(620.0, 640.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let output =
+                            unit_list(ui, &view, &mut state, 540.0, true, &mut vec![], &mut vec![]);
+                        ScrollLayout::from_output(&output).assert_height(
+                            HeightExpectation::Fits,
+                            ctx.content_rect(),
+                            ctx.pixels_per_point(),
+                        );
+                        assert_eq!(output.inner.len(), 2);
+                        assert!(output.inner[0].1.bottom() <= output.inner[1].1.top());
+                    });
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn result_rows_have_one_allocation_and_do_not_overlap_across_virtual_transitions() {
+        for scale in [1.0, 2.0] {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(scale);
+            ctx.style_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
+            let view = fixture(100);
+            let mut state = EditorUiState::default();
+            let mut previous_layout = None;
+            let mut origin: Option<f32> = None;
+            let mut first_indices = Vec::new();
+            for frame in 0..12 {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(620.0, 420.0),
+                        )),
+                        events: if frame >= 4 {
+                            vec![
+                                egui::Event::PointerMoved(egui::pos2(300.0, 250.0)),
+                                egui::Event::MouseWheel {
+                                    unit: egui::MouseWheelUnit::Point,
+                                    delta: egui::vec2(0.0, -800.0),
+                                    modifiers: egui::Modifiers::NONE,
+                                },
+                            ]
+                        } else {
+                            vec![]
+                        },
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            ui.spacing_mut().item_spacing.y = 13.0;
+                            let pitch = result_row_height(ui) + ui.spacing().item_spacing.y;
+                            // egui draws from begin()'s loaded offset, and only
+                            // applies this frame's wheel in end(). Output.state
+                            // therefore describes the next render's offset.
+                            let rendered_offset = egui::scroll_area::State::load(ctx, ui.make_persistent_id(egui::Id::new("composition_units")))
+                                .unwrap_or_default().offset.y;
+                            let output =
+                                unit_list(ui, &view, &mut state, 360.0, true, &mut vec![], &mut vec![]);
+                            let layout = ScrollLayout::from_output(&output);
+                            layout.assert_height(
+                                HeightExpectation::Scrolls,
+                                ctx.content_rect(),
+                                ctx.pixels_per_point(),
+                            );
+                            for pair in output.inner.windows(2) {
+                                assert!(
+                                    pair[0].1.bottom() <= pair[1].1.top(),
+                                    "adjacent actual content overlaps: {pair:?}"
+                                );
+                                assert!(
+                                    (pair[1].1.top() - pair[0].1.top() - pitch).abs() < 1.0 / scale,
+                                    "actual pitch differs from virtual row pitch"
+                                );
+                            }
+                            if let Some(&(index, rect)) = output.inner.first() {
+                                first_indices.push(index);
+                                let current_origin =
+                                    rect.top() + rendered_offset - index as f32 * pitch;
+                                assert!((current_origin - layout.inner.top()).abs() <= 1.0 / scale,
+                                    "drawn rows do not match the actual viewport origin: {current_origin} vs {:?}", layout.inner);
+                                if frame >= 3 {
+                                    if let Some(origin) = origin {
+                                        assert!(
+                                            (current_origin - origin).abs() <= 1.0 / scale,
+                                            "virtual row transition shifted content"
+                                        );
+                                    } else {
+                                        origin = Some(current_origin);
+                                    }
+                                }
+                            }
+                            if frame == 3 {
+                                previous_layout = Some(layout);
+                            }
+                            if frame == 11 {
+                                assert!(layout.offset.y > previous_layout.unwrap().offset.y);
+                            }
+                        });
+                    },
+                );
+            }
+            assert!(
+                first_indices.iter().any(|&index| index > 0),
+                "wheel never crossed a virtual row boundary"
             );
         }
     }

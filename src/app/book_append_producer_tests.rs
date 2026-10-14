@@ -96,6 +96,7 @@ pub(crate) fn assert_followup_terminal(
                     edit_copies: vec![],
                     semantic_copies: vec![],
                     erase_fallback_pages: 0,
+                    skipped_hidden: 0,
                     undo_files: Some(append.files.clone()),
                     metadata_copy: Default::default(),
                 })))

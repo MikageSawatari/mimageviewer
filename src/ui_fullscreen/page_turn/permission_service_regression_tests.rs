@@ -41,32 +41,26 @@ fn book_fixture(
         }
     };
     if composed {
-        // Centered first singleton followed by an explicit pair: exercise P2-2
-        // ownership as well as the immediate permission boundary.
+        // Explicit Alone first singleton followed by an automatic pair:
+        // exercise common-builder ownership and immediate permission admission.
+        let mut book = BookComposition::new(
+            if mode.is_rtl() {
+                crate::book_composition::ReadingDirection::Rtl
+            } else {
+                crate::book_composition::ReadingDirection::Ltr
+            },
+            (0..4).map(page).collect(),
+        );
+        book.cover_enabled = mode.has_cover();
+        book.page_overrides = [0, 3]
+            .into_iter()
+            .map(|n| PageOverrideEntry {
+                page: page(n),
+                directive: PageOverride::Alone,
+            })
+            .collect();
         service
-            .save(
-                scope.clone(),
-                domain.clone(),
-                BookComposition::new(
-                    crate::book_composition::ReadingDirection::Ltr,
-                    vec![
-                        CompositionUnit::Single {
-                            page: page(0),
-                            placement: SinglePlacement::Center,
-                            companion: SingleCompanion::Vacant,
-                        },
-                        CompositionUnit::Pair {
-                            first: page(1),
-                            second: page(2),
-                        },
-                        CompositionUnit::Single {
-                            page: page(3),
-                            placement: SinglePlacement::Center,
-                            companion: SingleCompanion::Vacant,
-                        },
-                    ],
-                ),
-            )
+            .save(scope.clone(), domain.clone(), book)
             .recv_timeout(Duration::from_secs(30))
             .unwrap()
             .status
@@ -231,11 +225,21 @@ fn permission_service_handlers_pdf_zip_automatic_and_composed_turn_on_receipt() 
     crate::key_input::clear_test_frame();
     for zip in [false, true] {
         for composed in [false, true] {
-            for mode in [SpreadMode::Single, SpreadMode::Ltr] {
+            for mode in [
+                SpreadMode::Single,
+                SpreadMode::Ltr,
+                SpreadMode::Rtl,
+                SpreadMode::LtrCover,
+                SpreadMode::RtlCover,
+            ] {
                 let ctx = egui::Context::default();
                 let (mut app, _temp, owner) = book_fixture(&ctx, zip, composed, mode);
                 seed_outgoing(&mut app, &ctx);
-                let forward = if !composed && mode.is_spread() { 2 } else { 1 };
+                let forward = if !composed && mode.is_spread() && !mode.has_cover() {
+                    2
+                } else {
+                    1
+                };
                 for target in [forward, 0] {
                     let current = app.fullscreen_idx.unwrap();
                     frame(&ctx, |ui, ctx| {

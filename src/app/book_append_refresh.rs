@@ -385,6 +385,12 @@ impl App {
                 summary.erase_fallback_pages
             ));
         }
+        if summary.skipped_hidden > 0 {
+            message.push_str(&format!(
+                "\n本の構成で非表示の {} ページを除外しました",
+                summary.skipped_hidden,
+            ));
+        }
         if summary.undo_files.is_none() {
             message.push_str("\nこの追加は取り消せません");
         }
@@ -571,6 +577,7 @@ mod tests {
             added: 1,
             first_path: Some(page),
             erase_fallback_pages: 0,
+            skipped_hidden: 0,
             edit_copies: vec![],
             semantic_copies: vec![],
             undo_files: Some(receipt.files.clone()),

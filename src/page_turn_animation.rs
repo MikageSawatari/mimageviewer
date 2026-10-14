@@ -1466,6 +1466,129 @@ mod tests {
         (old, new)
     }
     #[test]
+    fn page_turn_white_paper_projects_all_routes_and_never_adds_real_visibility() {
+        for old_white in [None, Some(0), Some(1)] {
+            for new_white in [None, Some(0), Some(1)] {
+                if old_white.is_none() && new_white.is_none() {
+                    continue;
+                }
+                let (mut old, mut new) = fixture(true);
+                for (unit, white) in [(&mut old, old_white), (&mut new, new_white)] {
+                    if let Some(slot) = white {
+                        unit.pages[slot].occurrence = None;
+                        unit.pages[slot].material = PageMaterial::Blank {
+                            color: Color32::WHITE,
+                        };
+                        unit.pages[slot].underlay = None;
+                    }
+                }
+                for reading_rtl in [false, true] {
+                    for forward in [false, true] {
+                        let direction = TurnDirection {
+                            reading_rtl,
+                            forward,
+                        };
+                        let recipe = prepare_turn(&old, &new, direction).unwrap();
+                        let expected = new
+                            .pages
+                            .iter()
+                            .filter_map(|p| p.occurrence)
+                            .collect::<Vec<_>>();
+                        for step in 0..=96 {
+                            let projection = project_prepared(
+                                &old,
+                                &new,
+                                direction,
+                                recipe,
+                                step as f32 / 96.0,
+                                false,
+                            )
+                            .unwrap();
+                            let projected_scene =
+                                scene(&old, &new, direction, step as f32 / 96.0, recipe.lift);
+                            assert_eq!(
+                                projection
+                                    .visibility
+                                    .incoming
+                                    .iter()
+                                    .map(|p| p.occurrence)
+                                    .collect::<Vec<_>>(),
+                                expected
+                            );
+                            for visible in &projection.visibility.incoming {
+                                assert!(visible.visible_area >= 0.0);
+                                // Perspective can enlarge a near-flat leaf beyond
+                                // its canonical rectangle. Occlusion must never
+                                // duplicate the actual projected printed area.
+                                let owned = |owner: FaceOwner| matches!(owner, FaceOwner::Incoming(id) if id == visible.occurrence);
+                                let surface_area: f32 = projected_scene
+                                    .surfaces
+                                    .iter()
+                                    .filter(|surface| {
+                                        owned(surface.owner)
+                                            && surface.alpha > 0.0
+                                            && !vacant(surface.page)
+                                    })
+                                    .map(|surface| polygon_area(&surface.polygon))
+                                    .sum();
+                                let leaf_area = projected_scene
+                                    .leaf
+                                    .as_ref()
+                                    .filter(|leaf| owned(leaf.owner) && !vacant(leaf.page))
+                                    .map_or(0.0, |leaf| polygon_area(&leaf.image_silhouette()));
+                                let projected_area = surface_area + leaf_area;
+                                assert!(
+                                    visible.visible_area <= projected_area + 0.1,
+                                    "old_white={old_white:?}/new_white={new_white:?}/rtl={reading_rtl}/forward={forward}/step={step}/progress={:.8}/occurrence={}/visible={:.8}/canonical={:.8}/projected={projected_area:.8}/angle={:.8}",
+                                    step as f32 / 96.0,
+                                    visible.occurrence,
+                                    visible.visible_area,
+                                    visible.canonical_visible_area,
+                                    projection.angle_degrees,
+                                );
+                                if step == 96 {
+                                    assert_eq!(
+                                        visible.visible_area,
+                                        visible.canonical_visible_area
+                                    );
+                                }
+                            }
+                            assert!(
+                                !projection.meshes.is_empty(),
+                                "white is opaque paper even when it occupies both leaf faces"
+                            );
+                            for draw in &projection.meshes {
+                                if draw.mesh.texture_id == TextureId::default() {
+                                    assert!(
+                                        draw.mesh
+                                            .vertices
+                                            .iter()
+                                            .all(|v| v.uv == egui::epaint::WHITE_UV)
+                                    );
+                                }
+                            }
+                            if step == 96 {
+                                assert!(meaningful(&projection.visibility));
+                                if new_white.is_some() {
+                                    assert!(
+                                        projection.meshes.iter().any(|draw| draw.mesh.texture_id
+                                            == TextureId::default()
+                                            && draw
+                                                .mesh
+                                                .vertices
+                                                .iter()
+                                                .all(|v| v.color == Color32::WHITE)),
+                                        "normal white endpoint color is preserved"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
     fn four_routes_move_one_leaf_and_hide_unseen_incoming_back() {
         let (old, new) = fixture(true);
         for rtl in [false, true] {

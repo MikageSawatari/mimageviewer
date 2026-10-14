@@ -237,14 +237,7 @@ fn saved_folder_hidden_row_is_ignored_by_book_ordinary_and_extracted_image_consu
     let page = CompositionPageRef::RelativePath {
         path: "hidden.png".into(),
     };
-    let mut record = BookComposition::new(
-        ReadingDirection::Rtl,
-        vec![CompositionUnit::Single {
-            page: page.clone(),
-            placement: SinglePlacement::Center,
-            companion: SingleCompanion::Vacant,
-        }],
-    );
+    let mut record = BookComposition::new(ReadingDirection::Rtl, vec![page.clone()]);
     record.hidden_pages.push(page);
     service
         .save(scope.clone(), PageDomain::ImageFolder, record)
@@ -935,8 +928,7 @@ fn all_hidden_zip_level_keeps_dfs_continuation_for_manual_and_slideshow() {
         file_type_resume::PreparedPageIdentityIndex,
     };
     use crate::book_composition::{
-        BookComposition, CompositionPageRef, CompositionUnit, PageDomain, ReadingDirection,
-        SingleCompanion, SinglePlacement,
+        BookComposition, CompositionPageRef, PageDomain, ReadingDirection,
     };
     use crate::grid_item::ThumbnailState;
     use std::{
@@ -1006,14 +998,7 @@ fn all_hidden_zip_level_keeps_dfs_continuation_for_manual_and_slideshow() {
         let page = CompositionPageRef::ArchiveEntry {
             entry_name: "b-hidden/b.jpg".into(),
         };
-        let mut composition = BookComposition::new(
-            ReadingDirection::Ltr,
-            vec![CompositionUnit::Single {
-                page: page.clone(),
-                placement: SinglePlacement::Center,
-                companion: SingleCompanion::Vacant,
-            }],
-        );
+        let mut composition = BookComposition::new(ReadingDirection::Ltr, vec![page.clone()]);
         composition.hidden_pages.push(page);
         let (service, process) =
             BookCompositionService::spawn_at(env.tmp.path().join("dfs-data"), None).unwrap();
@@ -1091,6 +1076,8 @@ fn all_hidden_zip_level_keeps_dfs_continuation_for_manual_and_slideshow() {
                 .send(Ok(BookProjectionReply {
                     rows,
                     landing: None,
+                    rotations: HashMap::new(),
+                    rotation_invalidation_revision: env.rotation_cache.invalidation_revision(),
                     edits: None,
                     automatic_preferences: None,
                     refresh_landings: HashMap::new(),
@@ -1108,7 +1095,7 @@ fn all_hidden_zip_level_keeps_dfs_continuation_for_manual_and_slideshow() {
                 display_prefix: prefix,
             },
             generation,
-            origin: ProjectionOrigin::Fresh,
+            origin: Box::new(ProjectionOrigin::Fresh),
             receiver,
         };
         let ctx = egui::Context::default();

@@ -364,12 +364,12 @@ pub use ui_fullscreen::draw_composition_editor_hud_snapshot_fixture;
 pub mod ui_startup;
 #[doc(hidden)]
 pub use ui_fullscreen::{
-    draw_fs_extracted_result_view_snapshot_fixture, draw_fs_fit_popup_snapshot_fixture,
-    draw_fs_page_wait_indicator_snapshot_fixture, draw_fs_prefetch_indicator_snapshot_fixture,
-    draw_music_locked_panel_snapshot_fixture, draw_music_panel_reach_snapshot_fixture,
-    draw_singleton_spread_endpoint_popup_snapshot_fixture, draw_spread_shift_hud_snapshot_fixture,
-    draw_still_panel_reach_snapshot_fixture, draw_still_seek_strip_snapshot_fixture,
-    draw_still_touch_first_run_help_snapshot_fixture,
+    draw_fs_composed_view_snapshot_fixture, draw_fs_extracted_result_view_snapshot_fixture,
+    draw_fs_fit_popup_snapshot_fixture, draw_fs_page_wait_indicator_snapshot_fixture,
+    draw_fs_prefetch_indicator_snapshot_fixture, draw_music_locked_panel_snapshot_fixture,
+    draw_music_panel_reach_snapshot_fixture, draw_singleton_spread_endpoint_popup_snapshot_fixture,
+    draw_spread_shift_hud_snapshot_fixture, draw_still_panel_reach_snapshot_fixture,
+    draw_still_seek_strip_snapshot_fixture, draw_still_touch_first_run_help_snapshot_fixture,
 };
 mod ui_details_icon;
 pub mod ui_helpers;

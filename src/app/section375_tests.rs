@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::*;
 use crate::delete_worker::{DeleteMsg, DeletePending};
 use std::time::{Duration, Instant, SystemTime};

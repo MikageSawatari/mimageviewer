@@ -467,6 +467,12 @@ impl App {
         ) {
             return None;
         }
+        self.source_composition_candidate(idx)
+    }
+
+    /// Source identity is shared with output workers. The temporary viewing
+    /// ignore applies only to presentation, never to a new output acceptance.
+    pub(crate) fn source_composition_candidate(&self, idx: usize) -> Option<CandidatePage> {
         let item = self.items.get(idx)?;
         // Folder compositions are outside the viewing scope. Old/imported
         // ImageFolder rows remain stored, but ordinary images need no receipt.
@@ -603,6 +609,19 @@ impl App {
     ) -> PresentationDecision {
         self.book_presentation_allowed(demand)
     }
+    #[cfg(test)]
+    pub(crate) fn pending_book_target_demand_for_test(&self) -> Vec<PresentationOccurrence> {
+        match &self.book_composition_permission.open {
+            OpenPermission::Checking { candidates, .. }
+            | OpenPermission::Ready { candidates, .. }
+            | OpenPermission::Resuming { candidates, .. } => candidates
+                .iter()
+                .map(|candidate| candidate.occurrence())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
     pub(crate) fn book_presentation_demand_snapshot(&self) -> Vec<PresentationOccurrence> {
         self.book_composition_permission
             .occurrences
@@ -980,8 +999,7 @@ impl App {
             {
                 intent.idx = item_index;
                 intent.items_generation = new_generation;
-                let demand =
-                    self.book_target_presentation_demand_from_projection(projection, item_index);
+                let demand = self.book_target_presentation_demand(item_index);
                 self.begin_qualified_book_unit(intent, demand);
             } else if let BookTargetRoute::ZipDfs(continuation) = &intent.route {
                 self.book_composition_permission.open = OpenPermission::ContinueDfs(*continuation);
@@ -1002,8 +1020,7 @@ impl App {
             PageStatus::Visible { item_index } => {
                 intent.idx = item_index;
                 intent.items_generation = new_generation;
-                let demand =
-                    self.book_target_presentation_demand_from_projection(projection, item_index);
+                let demand = self.book_target_presentation_demand(item_index);
                 self.begin_qualified_book_unit(intent, demand);
             }
             PageStatus::HiddenByComposition if intent.purpose == BookTargetPurpose::Explicit => {
@@ -1030,8 +1047,7 @@ impl App {
                     intent.clear_skipped_source_slice();
                     intent.idx = item_index;
                     intent.items_generation = new_generation;
-                    let demand = self
-                        .book_target_presentation_demand_from_projection(projection, item_index);
+                    let demand = self.book_target_presentation_demand(item_index);
                     self.begin_qualified_book_unit(intent, demand);
                 } else {
                     self.close_fullscreen();

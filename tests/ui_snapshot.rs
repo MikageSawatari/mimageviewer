@@ -3908,6 +3908,36 @@ fn g1_extracted_result_view_snapshot(name: &str, theme: mimageviewer::os_theme::
 }
 
 #[test]
+fn composed_view_ltr_no_cover() {
+    composed_view_snapshot("composed_view_ltr_no_cover", false, false);
+}
+
+#[test]
+fn composed_view_ltr_cover() {
+    composed_view_snapshot("composed_view_ltr_cover", false, true);
+}
+
+#[test]
+fn composed_view_rtl_no_cover() {
+    composed_view_snapshot("composed_view_rtl_no_cover", true, false);
+}
+
+#[test]
+fn composed_view_rtl_cover() {
+    composed_view_snapshot("composed_view_rtl_cover", true, true);
+}
+
+fn composed_view_snapshot(name: &str, rtl: bool, cover: bool) {
+    snapshot_with_theme_at_size(
+        name,
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(270.0, 215.0),
+        None,
+        move |ui| mimageviewer::draw_fs_composed_view_snapshot_fixture(ui, rtl, cover),
+    );
+}
+
+#[test]
 fn same_name_folder_book_light() {
     snapshot_with_theme_at_size(
         "same_name_folder_book_light",

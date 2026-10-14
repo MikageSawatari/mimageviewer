@@ -66,6 +66,9 @@ impl ProjectionOrigin {
 pub(crate) struct BookProjectionReply {
     pub(crate) rows: super::book_materialization::MaterializedBookRows,
     pub(crate) landing: Option<usize>,
+    /// Complete, including unrotated pages, in the prepared rows' index domain.
+    pub(crate) rotations: std::collections::HashMap<usize, crate::rotation_db::Rotation>,
+    pub(crate) rotation_invalidation_revision: u64,
     pub(crate) edits: Option<super::page_edit_snapshot::StablePageEditProjection>,
     pub(crate) automatic_preferences: Option<AutomaticBookPreferences>,
     pub(crate) refresh_landings: std::collections::HashMap<usize, Option<usize>>,
@@ -89,7 +92,7 @@ pub(crate) enum ViewerBookComposition {
     Preparing {
         scope: BookScopeKey,
         receiver: mpsc::Receiver<CompositionPrepareReply>,
-        origin: ProjectionOrigin,
+        origin: Box<ProjectionOrigin>,
     },
     Projecting {
         scope: BookScopeKey,
@@ -97,7 +100,7 @@ pub(crate) enum ViewerBookComposition {
         record: Option<Arc<StoredComposition>>,
         source: BookCompositionSource,
         generation: u64,
-        origin: ProjectionOrigin,
+        origin: Box<ProjectionOrigin>,
         receiver: mpsc::Receiver<Result<BookProjectionReply, String>>,
     },
     Accepted {
@@ -311,32 +314,145 @@ impl App {
             identity: Some(identity),
         }) == crate::book_composition::PageStatus::HiddenByComposition
     }
-    pub(crate) fn canonical_raw_book_page(&self, index: usize) -> usize {
+    // The pending request retains its old presentation until atomic adoption.
+    // Keep that large origin on the heap, without a second state or owner.
+    fn retained_composed_projection(&self) -> Option<&AcceptedCompositionProjection> {
         match &self.book_composition {
             ViewerBookComposition::Accepted {
                 layout: CompositionProjectionOutcome::Composed(projection),
                 ..
-            }
-            | ViewerBookComposition::Preparing {
-                origin:
-                    ProjectionOrigin::Refresh {
-                        previous: Some(projection),
-                        ..
-                    },
-                ..
-            }
-            | ViewerBookComposition::Projecting {
-                origin:
-                    ProjectionOrigin::Refresh {
-                        previous: Some(projection),
-                        ..
-                    },
-                ..
-            } => projection
-                .canonical_raw_index_for_projected(index)
-                .unwrap_or(index),
-            _ => index,
+            } => Some(projection),
+            ViewerBookComposition::Preparing { origin, .. }
+            | ViewerBookComposition::Projecting { origin, .. } => match origin.as_ref() {
+                ProjectionOrigin::Refresh {
+                    previous: Some(projection),
+                    ..
+                } => Some(projection),
+                _ => None,
+            },
+            _ => None,
         }
+    }
+    fn retained_composed_projection_mut(
+        state: &mut ViewerBookComposition,
+    ) -> Option<&mut AcceptedCompositionProjection> {
+        let projection = match state {
+            ViewerBookComposition::Accepted {
+                layout: CompositionProjectionOutcome::Composed(projection),
+                ..
+            } => projection,
+            ViewerBookComposition::Preparing { origin, .. }
+            | ViewerBookComposition::Projecting { origin, .. } => match origin.as_mut() {
+                ProjectionOrigin::Refresh {
+                    previous: Some(projection),
+                    ..
+                } => projection,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        Some(Arc::make_mut(projection))
+    }
+
+    fn merge_prepared_composed_rotation_inputs(
+        &mut self,
+        values: &[(String, crate::rotation_db::Rotation)],
+    ) {
+        let apply = |state: &mut ViewerBookComposition| {
+            if let Some(projection) = Self::retained_composed_projection_mut(state) {
+                let inputs = Arc::make_mut(&mut projection.prepared_rotations);
+                for (key, rotation) in values {
+                    if let Some(value) = inputs.get_mut(key) {
+                        *value = *rotation;
+                    }
+                }
+            }
+        };
+        apply(&mut self.book_composition);
+        // An extracted snapshot temporarily parks its original book in this same
+        // viewer owner. Actual edits to a shared page must survive its return.
+        if let Some(snapshot) = &mut self.snapshot {
+            apply(&mut snapshot.saved_viewing_state.composition);
+        }
+    }
+
+    pub(crate) fn update_prepared_composed_rotation(
+        &mut self,
+        index: usize,
+        rotation: crate::rotation_db::Rotation,
+    ) {
+        if let Some(key) = self.rotation_key_for_idx(index) {
+            self.merge_prepared_composed_rotation_inputs(&[(key, rotation)]);
+        }
+    }
+
+    pub(crate) fn sync_prepared_composed_rotations_from_cache(&mut self) {
+        let values = self
+            .rotation_cache
+            .iter()
+            .filter_map(|(&index, &rotation)| Some((self.rotation_key_for_idx(index)?, rotation)))
+            .collect::<Vec<_>>();
+        self.merge_prepared_composed_rotation_inputs(&values);
+    }
+
+    pub(crate) fn reset_prepared_composed_rotations(&mut self) {
+        let reset = |state: &mut ViewerBookComposition| {
+            if let Some(projection) = Self::retained_composed_projection_mut(state) {
+                for value in Arc::make_mut(&mut projection.prepared_rotations).values_mut() {
+                    *value = crate::rotation_db::Rotation::None;
+                }
+            }
+        };
+        reset(&mut self.book_composition);
+        if let Some(snapshot) = &mut self.snapshot {
+            reset(&mut snapshot.saved_viewing_state.composition);
+        }
+    }
+
+    /// Retain the accepted geometry while the usual projection worker refreshes
+    /// invalidated rotations. A running worker checks the cache revision itself.
+    pub(crate) fn refresh_composed_rotation_inputs(&mut self) {
+        let ViewerBookComposition::Accepted {
+            scope,
+            generation,
+            layout: CompositionProjectionOutcome::Composed(_),
+            ..
+        } = &self.book_composition
+        else {
+            return;
+        };
+        if *generation != self.items_generation {
+            return;
+        }
+        let scope = scope.clone();
+        let Some(service) = self.book_composition_service.as_ref() else {
+            return;
+        };
+        let Some((_, domain)) = self.composition_scope_domain() else {
+            return;
+        };
+        let receiver = service.prepare(scope.clone(), domain);
+        let origin = self.composition_origin(&scope);
+        self.book_composition = ViewerBookComposition::Preparing {
+            scope,
+            receiver,
+            origin: Box::new(origin),
+        };
+    }
+
+    pub(crate) fn prepared_composed_rotation(
+        &self,
+        index: usize,
+    ) -> Option<crate::rotation_db::Rotation> {
+        let projection = self.retained_composed_projection()?;
+        let key = self.rotation_key_for_idx(index)?;
+        projection.prepared_rotations.get(&key).copied()
+    }
+
+    pub(crate) fn canonical_raw_book_page(&self, index: usize) -> usize {
+        self.retained_composed_projection()
+            .and_then(|projection| projection.canonical_raw_index_for_projected(index))
+            .unwrap_or(index)
     }
     pub(crate) fn poll_and_remap_book_target(
         &mut self,
@@ -368,27 +484,10 @@ impl App {
         }
     }
     pub(crate) fn composed_book_has_cover(&self) -> bool {
+        if let Some(projection) = self.retained_composed_projection() {
+            return projection.cover_enabled;
+        }
         match &self.book_composition {
-            ViewerBookComposition::Preparing {
-                origin:
-                    ProjectionOrigin::Refresh {
-                        previous: Some(projection),
-                        ..
-                    },
-                ..
-            }
-            | ViewerBookComposition::Projecting {
-                origin:
-                    ProjectionOrigin::Refresh {
-                        previous: Some(projection),
-                        ..
-                    },
-                ..
-            } => projection.cover.is_some(),
-            ViewerBookComposition::Accepted {
-                layout: CompositionProjectionOutcome::Composed(projection),
-                ..
-            } => projection.cover.is_some(),
             ViewerBookComposition::Accepted {
                 record: Some(record),
                 ..
@@ -396,7 +495,7 @@ impl App {
             | ViewerBookComposition::Projecting {
                 record: Some(record),
                 ..
-            } => record.composition.cover.is_some(),
+            } => record.composition.cover_enabled,
             _ => false,
         }
     }
@@ -442,55 +541,13 @@ impl App {
     pub(crate) fn composed_book_layout(
         &self,
     ) -> Option<&crate::book_composition::ResolvedComposition> {
-        match &self.book_composition {
-            ViewerBookComposition::Accepted {
-                layout: CompositionProjectionOutcome::Composed(layout),
-                ..
-            } => Some(&layout.resolved),
-            ViewerBookComposition::Preparing {
-                origin:
-                    ProjectionOrigin::Refresh {
-                        previous: Some(layout),
-                        ..
-                    },
-                ..
-            }
-            | ViewerBookComposition::Projecting {
-                origin:
-                    ProjectionOrigin::Refresh {
-                        previous: Some(layout),
-                        ..
-                    },
-                ..
-            } => Some(&layout.resolved),
-            _ => None,
-        }
+        self.retained_composed_projection()
+            .map(|projection| &projection.resolved)
     }
 
     pub(crate) fn composed_layout_token(&self) -> Option<(BookScopeKey, CompositionToken)> {
-        match &self.book_composition {
-            ViewerBookComposition::Accepted {
-                layout: CompositionProjectionOutcome::Composed(layout),
-                ..
-            } => Some((layout.scope.clone(), layout.token)),
-            ViewerBookComposition::Preparing {
-                origin:
-                    ProjectionOrigin::Refresh {
-                        previous: Some(layout),
-                        ..
-                    },
-                ..
-            }
-            | ViewerBookComposition::Projecting {
-                origin:
-                    ProjectionOrigin::Refresh {
-                        previous: Some(layout),
-                        ..
-                    },
-                ..
-            } => Some((layout.scope.clone(), layout.token)),
-            _ => None,
-        }
+        self.retained_composed_projection()
+            .map(|projection| (projection.scope.clone(), projection.token))
     }
 
     pub(crate) fn pairing_edit_availability(&self) -> crate::spread_shift::PairingEditAvailability {
@@ -808,7 +865,7 @@ impl App {
                 // A new accepted source owns its own preparation; never apply old rows to it.
                 self.book_composition = ViewerBookComposition::Automatic;
             } else if requested_token != token
-                && !matches!(origin, ProjectionOrigin::IgnoreThisOpen { .. })
+                && !matches!(origin.as_ref(), ProjectionOrigin::IgnoreThisOpen { .. })
             {
                 self.book_composition = ViewerBookComposition::Preparing {
                     scope: scope.clone(),
@@ -823,7 +880,7 @@ impl App {
                             token,
                             record,
                             source,
-                            origin,
+                            *origin,
                             reply,
                             ctx,
                         );
@@ -872,7 +929,7 @@ impl App {
                 self.book_composition = ViewerBookComposition::Preparing {
                     scope: scope.clone(),
                     receiver: service.prepare(scope.clone(), domain.clone()),
-                    origin,
+                    origin: Box::new(origin),
                 };
             }
         }
@@ -902,7 +959,7 @@ impl App {
                             scope,
                             reply.token,
                             record.map(Arc::new),
-                            origin,
+                            *origin,
                             ctx,
                         ),
                         Err(error) => {
@@ -1021,6 +1078,8 @@ impl App {
         let worker_record = record.clone();
         let worker_origin = origin.clone();
         let data_dir = crate::data_dir::get();
+        let rotation_db_path = self.rotation_db.as_ref().and_then(|db| db.file_path());
+        let rotation_invalidation_revision = self.rotation_cache.invalidation_revision();
         let follow_document_direction = self.settings.follow_document_reading_direction;
         let document_password = self.pdf_open_password(&scope.logical_root);
         let pending_trim = self.pending_composition_trim_batch();
@@ -1053,6 +1112,8 @@ impl App {
                     policy,
                     available_edits,
                     &data_dir,
+                    rotation_db_path.as_deref(),
+                    rotation_invalidation_revision,
                     pending_trim,
                     trim_receipt,
                     follow_document_direction,
@@ -1071,7 +1132,7 @@ impl App {
             record,
             source,
             generation: self.items_generation,
-            origin,
+            origin: Box::new(origin),
             receiver,
         };
         self.spread_shift.availability = crate::spread_shift::PairingEditAvailability::Unreadable;
@@ -1096,7 +1157,8 @@ impl App {
             CompositionProjectionOutcome::Composed(_)
         ));
         if replaces_rows
-            && (reply.saved_trim != self.pending_composition_trim_batch()
+            && (reply.rotation_invalidation_revision != self.rotation_cache.invalidation_revision()
+                || reply.saved_trim != self.pending_composition_trim_batch()
                 || reply.edits.as_ref().is_some_and(|prepared| {
                     !crate::page_edit_write_epoch::PAGE_EDIT_WRITES.accepts(prepared.stamp)
                 }))
@@ -1107,7 +1169,7 @@ impl App {
         let super::book_materialization::MaterializedBookRows {
             items,
             metas,
-            composition,
+            mut composition,
             page_identities,
         } = reply.rows;
         match &composition {
@@ -1211,9 +1273,38 @@ impl App {
             .into_iter()
             .filter_map(|(old, value)| Some((new_index(old)?, value)))
             .collect();
+        // Facet ratings are also index memos. They must belong to the new rows
+        // before rebuilding the final navigation column and qualifying a target.
+        let ratings = self
+            .rating_cache
+            .iter()
+            .filter_map(|(&old, &value)| Some((new_index(old)?, value)))
+            .collect();
+        let mut rotations = reply.rotations;
+        // The old memo is meaningful only for old identities, never for new slots.
+        // This also preserves newer local rotations (including a reset to None).
+        for (&old, &rotation) in self.rotation_cache.iter() {
+            if let Some(index) = new_index(old) {
+                rotations.insert(index, rotation);
+            }
+        }
         let selected = self.selected.and_then(new_index);
         let previous_generation = self.items_generation;
         self.install_prepared_aggregate_items(recipe, items, metas, page_identities);
+        // Replacement cancels the old generation's asynchronous reader as well.
+        if let CompositionProjectionOutcome::Composed(projection) = &mut composition {
+            let projection = Arc::make_mut(projection);
+            projection.prepared_rotations = Arc::new(
+                rotations
+                    .iter()
+                    .filter_map(|(&index, &rotation)| {
+                        Some((self.rotation_key_for_idx(index)?, rotation))
+                    })
+                    .collect(),
+            );
+        }
+        self.rotation_cache = rotations.into();
+        self.rating_cache = ratings;
         self.clear_page_edit_state();
         if let Some(edits) = reply.edits {
             self.install_prepared_page_edits(edits);
@@ -1240,12 +1331,6 @@ impl App {
         self.fs_continuous_fit_reference =
             crate::ui_fullscreen::ContinuousSpecifiedFitReference::Legacy;
         if let CompositionProjectionOutcome::Composed(projection) = &composition {
-            self.remap_after_book_projection(
-                projection,
-                previous_generation,
-                self.items_generation,
-                &reply.refresh_landings,
-            );
             self.reading_direction = match projection.resolved.direction {
                 crate::book_composition::ReadingDirection::Ltr => {
                     crate::settings::ReadingDirection::Ltr
@@ -1257,7 +1342,7 @@ impl App {
             if self.spread_mode.is_spread() {
                 let has_cover = record
                     .as_ref()
-                    .is_some_and(|record| record.composition.cover.is_some());
+                    .is_some_and(|record| record.composition.cover_enabled);
                 self.spread_mode = match (self.reading_direction, has_cover) {
                     (crate::settings::ReadingDirection::Ltr, false) => {
                         crate::settings::SpreadMode::Ltr
@@ -1332,7 +1417,30 @@ impl App {
             };
             self.start_composition_removed_shift_restore(self.frame_counter.wrapping_add(1));
         }
-        self.rebuild_visible_indices();
+        if was_fullscreen {
+            self.fullscreen_idx = landing;
+        }
+        // This is source adoption, not a filter-change navigation event. Do not
+        // capture/reconcile rating endpoints against the old numeric facet column.
+        self.rebuild_visible_indices_impl(
+            true,
+            false,
+            if was_fullscreen {
+                super::VisibleSelectionPolicy::RatingMembership
+            } else {
+                super::VisibleSelectionPolicy::General
+            },
+        );
+        // Permission demand must see the accepted rows, rotations, binding and
+        // facet/navigation column together; no numeric continuation runs between.
+        if let Some(projection) = self.retained_composed_projection().cloned() {
+            self.remap_after_book_projection(
+                &projection,
+                previous_generation,
+                self.items_generation,
+                &reply.refresh_landings,
+            );
+        }
         if was_fullscreen {
             if let Some(index) = landing {
                 self.fullscreen_idx = Some(index);
@@ -1410,6 +1518,8 @@ fn prepare_book_projection(
     policy: crate::file_type_visibility::FileTypeVisibility,
     available_edits: super::page_edit_snapshot::PageEditAvailability,
     data_dir: &std::path::Path,
+    rotation_db_path: Option<&std::path::Path>,
+    rotation_invalidation_revision: u64,
     pending_trim: Option<crate::view_trim_db::ViewTrimWriteBatch>,
     trim_receipt: Option<mpsc::Receiver<Result<(), String>>>,
     follow_document_direction: bool,
@@ -1579,6 +1689,40 @@ fn prepare_book_projection(
     } else {
         None
     };
+    // Read durable rotation inputs on this same worker and in the new rows' domain.
+    // Known in-session values are rebased by identity at adoption, so a rotation
+    // made while this worker runs cannot be overwritten by its earlier read.
+    let rotation_keys = rows
+        .items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            Some((index, crate::edit_source::page_key_for_grid_item(item)?))
+        })
+        .collect::<Vec<_>>();
+    let loaded_rotations = if is_replacement {
+        if let Some(path) = rotation_db_path {
+            let db = crate::rotation_db::RotationDb::open_readonly_at(path)
+                .map_err(|error| format!("本の回転入力を読み込めませんでした: {error}"))?;
+            db.get_many(rotation_keys.iter().map(|(_, key)| key.as_str()))
+        } else {
+            Default::default()
+        }
+    } else {
+        Default::default()
+    };
+    let rotations = rotation_keys
+        .into_iter()
+        .map(|(index, key)| {
+            (
+                index,
+                loaded_rotations
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(crate::rotation_db::Rotation::None),
+            )
+        })
+        .collect();
     let automatic_preferences = if composition.is_none() && is_replacement {
         let segments = match source {
             BookCompositionSource::Archive { display_prefix, .. } => display_prefix.as_slice(),
@@ -1628,6 +1772,8 @@ fn prepare_book_projection(
     Ok(BookProjectionReply {
         rows,
         landing,
+        rotations,
+        rotation_invalidation_revision,
         edits,
         automatic_preferences,
         refresh_landings,

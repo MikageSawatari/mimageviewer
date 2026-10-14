@@ -8,6 +8,10 @@ cached documentの早期adoption、password/EPUB取消、policy/generationによ
 既存request ownerが担う。raw ZIP manifestと採用済みpolicyの表示列を混同しない。
 
 完成itemsと`ProjectionRecipe`を同じ採用境界で公開し、以後は同じViewerContextBundleで所有する。
+構成投影の回転入力は同じworkerで新itemsのindexへ準備する。UI採用はidentityでlive回転を移し、
+新items・回転・binding・着地・facetを揃えてからpending targetの提示許可を生成する。
+採用済みのページキー別回転入力はmemoのcold時にも使い、同期DB fallbackを構成表示へ持ち込まない。
+回転失効は既存projection準備へ戻し、準備中の旧入力をlive memoへ書き戻さない。
 固定snapshotは元一覧と固定一覧それぞれのrecipeを保存し、子の物理本を離れた復帰で対応する
 保存列と同時に戻す。Smart rootも既存準備済みrootの復帰境界でExtractedResultを採用する。
 read-only mount/fork/closeから兄弟のgeneration/queue/cancel/cacheを変更しない。
@@ -2019,6 +2023,12 @@ Accepted/Blockedの同token読取は起床を予約しない。新しいpending 
 lease終了時のwriter再読込が実変更scopeだけを公開する。UI側でmaintenance待ちやDB/FS読取を追加しない。
 終了時はcomposition writerをjoinしてから、保持されたcontent-identity recorderを所有するshift ownerを終了し、捕捉済みEdit観測を落とさない。
 まれな失敗はログ＋通知。未知/破損は利用者作成recordを保持して書込停止し、新DBのmigration/recreate/自動retryを作らない。
+B2の編集結果はsession専用workerで生成し、未送信draftは最新にまとめる。結果generationが最新のときだけ保存可能。
+組生成には通常builderを使い、UI側にはI/Oと別pairing実装を置かない。
+製本/一括出力の構成資格は実Sourceを受け付けるworkerで確定する。
+出力runだけのarchive identity/scope索引を一回準備し、その後に最新service snapshot/tokenでhiddenを判定する。
+別窓のimmutable raw treeと物理sourceを区別し、hiddenの変更は索引再利用時も最新値を使う。
+
 
 ### G4 editorの非同期owner（next-book、2026-10-11）
 

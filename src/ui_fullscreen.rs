@@ -7799,10 +7799,12 @@ fn draw_spread_mode_rows(
     spread_popup_open: &mut bool,
     extracted_result: bool,
     composition_owned: bool,
+    composition_spread_mode: Option<SpreadMode>,
 ) {
     let result_modes = [
         SpreadMode::Single,
-        SpreadMode::Ltr.with_reading_direction(*reading_direction),
+        composition_spread_mode
+            .unwrap_or_else(|| SpreadMode::Ltr.with_reading_direction(*reading_direction)),
         SpreadMode::SplitLtr.with_reading_direction(*reading_direction),
     ];
     let modes = if extracted_result || composition_owned {
@@ -7817,7 +7819,13 @@ fn draw_spread_mode_rows(
             egui::Id::new(format!("spread_popup_{}", mode.to_int())),
             egui::Sense::click(),
         );
-        let is_current = *spread_mode == mode;
+        let is_current = if composition_owned && mode.is_spread() {
+            spread_mode.is_spread()
+        } else if composition_owned && mode.is_split() {
+            spread_mode.is_split()
+        } else {
+            *spread_mode == mode
+        };
         let bg = if is_current {
             egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
         } else if item_resp.hovered() {
@@ -7847,7 +7855,7 @@ fn draw_spread_mode_rows(
         );
 
         if let Some(shortcut_label) =
-            spread_mode_key_action(mode).and_then(|action| keymap.first_chord_label(action))
+            spread_mode_row_shortcut(keymap, mode, composition_owned, composition_spread_mode)
         {
             scroll_ui.painter().text(
                 egui::pos2(item_rect.max.x - 8.0, item_rect.center().y),
@@ -7868,6 +7876,24 @@ fn draw_spread_mode_rows(
             *spread_popup_open = false;
         }
     }
+}
+
+fn spread_mode_row_shortcut(
+    keymap: &Keymap,
+    mode: SpreadMode,
+    composition_owned: bool,
+    composition_spread_mode: Option<SpreadMode>,
+) -> Option<String> {
+    if composition_owned && mode.is_split() {
+        return keymap.first_chord_label(KeyAction::FsViewLandscapeSplit);
+    }
+    if composition_owned && mode.is_spread() {
+        return composition_spread_mode
+            .and_then(spread_mode_key_action)
+            .and_then(|action| keymap.first_chord_label(action))
+            .or_else(|| keymap.first_chord_label(KeyAction::FsViewSpread));
+    }
+    spread_mode_key_action(mode).and_then(|action| keymap.first_chord_label(action))
 }
 
 fn draw_extracted_result_view_notice(ui: &mut egui::Ui) {
@@ -7893,8 +7919,40 @@ pub fn draw_fs_extracted_result_view_snapshot_fixture(ui: &mut egui::Ui) {
                 &mut true,
                 true,
                 false,
+                None,
             );
             draw_extracted_result_view_notice(ui);
+        });
+}
+
+#[doc(hidden)]
+pub fn draw_fs_composed_view_snapshot_fixture(ui: &mut egui::Ui, rtl: bool, cover: bool) {
+    let direction = if rtl {
+        crate::book_composition::ReadingDirection::Rtl
+    } else {
+        crate::book_composition::ReadingDirection::Ltr
+    };
+    let expected = crate::book_composition::composition_spread_mode(direction, cover);
+    let mut selected = expected;
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgba_unmultiplied(30, 30, 30, 240))
+        .inner_margin(4.0)
+        .show(ui, |ui| {
+            ui.set_width(230.0);
+            ui.spacing_mut().item_spacing.y = 0.0;
+            draw_spread_popup_heading(ui, "ページ構成");
+            draw_spread_mode_rows(
+                ui,
+                &Keymap::default(),
+                &mut selected,
+                &mut composition_view_direction(direction),
+                &mut true,
+                false,
+                true,
+                Some(expected),
+            );
+            ui.label("構成あり");
+            ui.label("読む方向と表紙は構成を編集してください");
         });
 }
 
@@ -15406,7 +15464,6 @@ pub(crate) fn fs_cache_entry_page_dims(entry: &FsCacheEntry) -> Option<(u32, u32
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SpreadDisplaySingletonCause {
     /// The accepted explicit composition owns this slot and placement.
-    ExplicitComposition,
     /// The canonical segment ended before a partner slot could be filled.
     UnpairedSlot,
     /// This page, or the page that would otherwise partner it, is landscape.
@@ -15419,6 +15476,11 @@ enum SpreadDisplaySingletonCause {
     ForcedLast(SingletonSpreadPlacement),
     /// A real page left alone at a forced pairing boundary.
     ForcedBoundary(SingletonSpreadPlacement),
+    /// Page-specific boundary, independent of automatic complete-book settings.
+    ExplicitAlone,
+    ExplicitBlankOpposite(SingletonSpreadPlacement),
+    /// The preceding segment ends because the next real page has a directive.
+    OverrideBoundaryRemainder,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15566,60 +15628,6 @@ impl SpreadDisplayComposition {
                 })
                 .collect::<Vec<_>>(),
         )
-    }
-
-    /// Adapt G's already resolved unit; no automatic pairing inputs enter here.
-    fn from_composed_unit(
-        unit: &crate::book_composition::ResolvedUnit,
-        direction: crate::book_composition::ReadingDirection,
-    ) -> Self {
-        use crate::book_composition::{ResolvedCompanion, ResolvedUnit, SinglePlacement};
-        let direction = composition_view_direction(direction);
-        let anchor = unit.anchor().item_index;
-        let mut result = Self::from_navigation_pages(
-            anchor,
-            &unit
-                .navigation_pages()
-                .map(|page| page.item_index)
-                .collect::<Vec<_>>(),
-        )
-        .expect("resolved composition preserves its real anchor");
-        result.composed_direction = Some(direction);
-        if let ResolvedUnit::Single {
-            placement,
-            companion,
-            ..
-        } = unit
-        {
-            let side = match placement {
-                SinglePlacement::Center => SingletonSpreadPlacement::Center,
-                SinglePlacement::Leading if direction == ReadingDirection::Rtl => {
-                    SingletonSpreadPlacement::Right
-                }
-                SinglePlacement::Trailing if direction == ReadingDirection::Ltr => {
-                    SingletonSpreadPlacement::Right
-                }
-                _ => SingletonSpreadPlacement::Left,
-            };
-            result.singleton_placement = side;
-            match companion {
-                ResolvedCompanion::Vacant => {}
-                ResolvedCompanion::Blank => {
-                    result.singleton_placement = side.with_white_companion()
-                }
-                ResolvedCompanion::FrontCoverSupplement(page) => {
-                    result
-                        .pages
-                        .push(SpreadPageOccurrence::final_cover_supplement(
-                            page.item_index,
-                            anchor,
-                        ));
-                    result.supplemented_navigation_side = Some(side);
-                    result.singleton_placement = SingletonSpreadPlacement::Center;
-                }
-            }
-        }
-        result
     }
 
     fn from_navigation_pages(navigation_anchor_idx: usize, pages: &[usize]) -> Option<Self> {
@@ -15823,6 +15831,15 @@ fn compose_spread_navigation_unit(
     let last_unit_pages = last_unit.pages.as_slice();
     let mut base =
         SpreadDisplayComposition::from_navigation_pages(navigation_anchor_idx, navigation_pages)?;
+    match unit.formation {
+        SpreadDisplayUnitFormation::Singleton(
+            SpreadDisplaySingletonCause::ExplicitBlankOpposite(side),
+        ) => {
+            base.singleton_placement = side.with_white_companion();
+            return Some(base);
+        }
+        _ => {}
+    }
     if complete_book_eligible && spread_mode.has_cover() {
         if let SpreadDisplayUnitFormation::Singleton(
             SpreadDisplaySingletonCause::ForcedAfterCover(side)
@@ -15853,6 +15870,35 @@ fn compose_spread_navigation_unit(
                 navigation_anchor_idx,
             });
         }
+    }
+    // An explicit Alone restarts pairing like the front cover. Resolve the
+    // terminal cover pair first: its existing two-page layout takes precedence.
+    // Explicit directives also apply to a bounded Remote/facet projection.
+    if spread_mode.is_spread()
+        && base.pages.len() == 1
+        && unit.formation
+            == SpreadDisplayUnitFormation::Singleton(SpreadDisplaySingletonCause::ExplicitAlone)
+        && singleton_placement_enabled.first
+    {
+        base.singleton_placement = if spread_mode.is_rtl() {
+            SingletonSpreadPlacement::Left
+        } else {
+            SingletonSpreadPlacement::Right
+        };
+    }
+    if spread_mode.is_spread()
+        && base.pages.len() == 1
+        && unit.formation
+            == SpreadDisplayUnitFormation::Singleton(
+                SpreadDisplaySingletonCause::OverrideBoundaryRemainder,
+            )
+        && singleton_placement_enabled.last
+    {
+        base.singleton_placement = if spread_mode.is_rtl() {
+            SingletonSpreadPlacement::Right
+        } else {
+            SingletonSpreadPlacement::Left
+        };
     }
     if spread_mode.is_spread()
         && (singleton_placement_enabled.first || singleton_placement_enabled.last)
@@ -15948,8 +15994,7 @@ impl SpreadDisplayUnitsToken {
         landscape_epoch: u64,
         page_alone: crate::settings::PageAloneSettings,
     ) -> bool {
-        self.composed.is_none()
-            && self.items_generation == items_generation
+        self.items_generation == items_generation
             && self.spread_mode == spread_mode
             && self.shift_anchor_idx == shift_anchor_idx
             && self.landscape_epoch == landscape_epoch
@@ -15975,8 +16020,6 @@ pub(crate) struct SpreadDisplayUnitsCache {
     /// Sorted navigation-unit ordinals containing real still images. Derived with the token;
     /// demand can jump over media intervals without inspecting their members every frame.
     image_unit_positions: Vec<usize>,
-    /// Explicit layout lookup derived with the composed token, shared by paint and prefetch.
-    composed_unit_positions: HashMap<usize, usize>,
     landscape_indices: HashSet<usize>,
     landscape_epoch: u64,
     /// Derived once with the unit token. This proves that `nav` is a complete permutation of
@@ -16145,17 +16188,41 @@ impl SpreadDisplayUnitsCache {
         shift_anchor_idx: Option<usize>,
         page_alone: crate::settings::PageAloneSettings,
     ) -> Option<Arc<Vec<SpreadDisplayUnit>>> {
+        self.get_with_source(
+            nav,
+            items_generation,
+            spread_mode,
+            shift_anchor_idx,
+            page_alone,
+            None,
+        )
+    }
+
+    fn get_with_source(
+        &self,
+        nav: &[usize],
+        items_generation: u64,
+        spread_mode: SpreadMode,
+        shift_anchor_idx: Option<usize>,
+        page_alone: crate::settings::PageAloneSettings,
+        composed: Option<(
+            crate::book_scope::BookScopeKey,
+            crate::book_composition::CompositionToken,
+            ReadingDirection,
+        )>,
+    ) -> Option<Arc<Vec<SpreadDisplayUnit>>> {
         self.token
             .as_ref()
             .is_some_and(|token| {
-                token.matches(
-                    nav,
-                    items_generation,
-                    spread_mode,
-                    shift_anchor_idx,
-                    self.landscape_epoch,
-                    page_alone,
-                )
+                token.composed == composed
+                    && token.matches(
+                        nav,
+                        items_generation,
+                        spread_mode,
+                        shift_anchor_idx,
+                        self.landscape_epoch,
+                        page_alone,
+                    )
             })
             .then(|| Arc::clone(&self.units))
     }
@@ -16191,7 +16258,6 @@ impl SpreadDisplayUnitsCache {
         });
         self.tracked_indices.clear();
         self.image_unit_positions.clear();
-        self.composed_unit_positions.clear();
         for (position, unit) in units.iter().enumerate() {
             for &idx in &unit.pages {
                 self.tracked_indices.entry(idx).or_insert(position);
@@ -16439,6 +16505,46 @@ fn build_spread_display_units_with_page_alone(
     spread_mode: SpreadMode,
     shift_anchor_idx: Option<usize>,
     page_alone: crate::settings::PageAloneSettings,
+    is_landscape_idx: impl FnMut(usize, usize) -> bool,
+    is_pairable_idx: impl FnMut(usize) -> bool,
+) -> Vec<SpreadDisplayUnit> {
+    build_spread_display_units_with_overrides(
+        nav,
+        spread_mode,
+        shift_anchor_idx,
+        page_alone,
+        &HashMap::new(),
+        is_landscape_idx,
+        is_pairable_idx,
+    )
+}
+
+fn explicit_singleton_cause(
+    directive: crate::book_composition::PageOverride,
+    mode: SpreadMode,
+    is_landscape: bool,
+) -> SpreadDisplaySingletonCause {
+    use crate::book_composition::{PageOverride, PageSide};
+    match directive {
+        PageOverride::Alone if is_landscape => SpreadDisplaySingletonCause::LandscapeBoundary,
+        PageOverride::Alone => SpreadDisplaySingletonCause::ExplicitAlone,
+        PageOverride::BlankOpposite { page_side } => {
+            let right = matches!(page_side, PageSide::Leading) == mode.is_rtl();
+            SpreadDisplaySingletonCause::ExplicitBlankOpposite(if right {
+                SingletonSpreadPlacement::Right
+            } else {
+                SingletonSpreadPlacement::Left
+            })
+        }
+    }
+}
+
+fn build_spread_display_units_with_overrides(
+    nav: &[usize],
+    spread_mode: SpreadMode,
+    shift_anchor_idx: Option<usize>,
+    page_alone: crate::settings::PageAloneSettings,
+    overrides: &HashMap<usize, crate::book_composition::PageOverride>,
     mut is_landscape_idx: impl FnMut(usize, usize) -> bool,
     mut is_pairable_idx: impl FnMut(usize) -> bool,
 ) -> Vec<SpreadDisplayUnit> {
@@ -16449,7 +16555,14 @@ fn build_spread_display_units_with_page_alone(
         spread_mode.has_cover() && nav.len() > 1 && (page_alone.after_cover || page_alone.last);
     if forced {
         let first = nav[0];
-        let cover_cause = if !is_pairable_idx(first) {
+        let cover_cause = if let Some(directive) = overrides.get(&first) {
+            explicit_singleton_cause(
+                *directive,
+                spread_mode,
+                *directive == crate::book_composition::PageOverride::Alone
+                    && is_landscape_idx(0, first),
+            )
+        } else if !is_pairable_idx(first) {
             SpreadDisplaySingletonCause::NonPairableBoundary
         } else if is_landscape_idx(0, first) {
             SpreadDisplaySingletonCause::LandscapeBoundary
@@ -16467,7 +16580,17 @@ fn build_spread_display_units_with_page_alone(
             units.push(SpreadDisplayUnit::singleton(
                 1,
                 nav[1],
-                SpreadDisplaySingletonCause::ForcedAfterCover(side),
+                overrides
+                    .get(&nav[1])
+                    .map(|value| {
+                        explicit_singleton_cause(
+                            *value,
+                            spread_mode,
+                            *value == crate::book_composition::PageOverride::Alone
+                                && is_landscape_idx(1, nav[1]),
+                        )
+                    })
+                    .unwrap_or(SpreadDisplaySingletonCause::ForcedAfterCover(side)),
             ));
             pos = 2;
         }
@@ -16485,6 +16608,8 @@ fn build_spread_display_units_with_page_alone(
                 &mut units,
                 &mut pos,
                 anchor_pos,
+                spread_mode,
+                overrides,
                 &mut is_landscape_idx,
                 &mut is_pairable_idx,
             );
@@ -16496,6 +16621,8 @@ fn build_spread_display_units_with_page_alone(
             &mut units,
             &mut pos,
             body_end,
+            spread_mode,
+            overrides,
             &mut is_landscape_idx,
             &mut is_pairable_idx,
         );
@@ -16514,6 +16641,7 @@ fn build_spread_display_units_with_page_alone(
                             SpreadDisplaySingletonCause::UnpairedSlot,
                         )
                     && (forced_last || page_alone.after_cover)
+                    && (!forced_last || !overrides.contains_key(&nav[body_end]))
             });
         if let Some(unit) = boundary_leftover {
             unit.formation = SpreadDisplayUnitFormation::Singleton(
@@ -16539,7 +16667,17 @@ fn build_spread_display_units_with_page_alone(
             units.push(SpreadDisplayUnit::singleton(
                 body_end,
                 nav[body_end],
-                SpreadDisplaySingletonCause::ForcedLast(side),
+                overrides
+                    .get(&nav[body_end])
+                    .map(|value| {
+                        explicit_singleton_cause(
+                            *value,
+                            spread_mode,
+                            *value == crate::book_composition::PageOverride::Alone
+                                && is_landscape_idx(body_end, nav[body_end]),
+                        )
+                    })
+                    .unwrap_or(SpreadDisplaySingletonCause::ForcedLast(side)),
             ));
         }
         return units;
@@ -16548,7 +16686,14 @@ fn build_spread_display_units_with_page_alone(
 
     if spread_mode.has_cover() && prefix_end > 0 {
         let first = nav[0];
-        let cause = if !is_pairable_idx(first) {
+        let cause = if let Some(directive) = overrides.get(&first) {
+            explicit_singleton_cause(
+                *directive,
+                spread_mode,
+                *directive == crate::book_composition::PageOverride::Alone
+                    && is_landscape_idx(0, first),
+            )
+        } else if !is_pairable_idx(first) {
             SpreadDisplaySingletonCause::NonPairableBoundary
         } else if is_landscape_idx(0, first) {
             SpreadDisplaySingletonCause::LandscapeBoundary
@@ -16564,6 +16709,8 @@ fn build_spread_display_units_with_page_alone(
         &mut units,
         &mut pos,
         prefix_end,
+        spread_mode,
+        overrides,
         &mut is_landscape_idx,
         &mut is_pairable_idx,
     );
@@ -16575,6 +16722,8 @@ fn build_spread_display_units_with_page_alone(
             &mut units,
             &mut pos,
             nav.len(),
+            spread_mode,
+            overrides,
             &mut is_landscape_idx,
             &mut is_pairable_idx,
         );
@@ -16745,6 +16894,31 @@ pub(crate) fn build_remote_spread_page_groups_with_shift(
     complete_book_eligible: bool,
     shift_anchor_idx: Option<usize>,
 ) -> Vec<RemotePageGroupSpec> {
+    build_remote_spread_page_groups_with_overrides(
+        items,
+        spread_mode,
+        is_landscape,
+        final_cover_enabled,
+        singleton_placement_enabled,
+        page_alone,
+        complete_book_eligible,
+        shift_anchor_idx,
+        &HashMap::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_remote_spread_page_groups_with_overrides(
+    items: &[GridItem],
+    spread_mode: SpreadMode,
+    is_landscape: &[bool],
+    final_cover_enabled: bool,
+    singleton_placement_enabled: impl Into<crate::settings::SingletonSpreadEndpointSettings>,
+    page_alone: crate::settings::PageAloneSettings,
+    complete_book_eligible: bool,
+    shift_anchor_idx: Option<usize>,
+    overrides: &HashMap<usize, crate::book_composition::PageOverride>,
+) -> Vec<RemotePageGroupSpec> {
     let singleton_placement_enabled = singleton_placement_enabled.into();
     let visible = (0..items.len()).collect::<Vec<_>>();
     let nav = build_image_reading_indices(items, &visible);
@@ -16769,7 +16943,7 @@ pub(crate) fn build_remote_spread_page_groups_with_shift(
             .map(|idx| RemotePageGroupSpec::whole(vec![idx]))
             .collect();
     }
-    let units = build_spread_display_units_with_page_alone(
+    let units = build_spread_display_units_with_overrides(
         &nav,
         spread_mode,
         shift_anchor_idx,
@@ -16778,6 +16952,7 @@ pub(crate) fn build_remote_spread_page_groups_with_shift(
         } else {
             crate::settings::PageAloneSettings::default()
         },
+        overrides,
         |_, idx| is_landscape.get(idx).copied().unwrap_or(false),
         |idx| is_spread_pairable_item(items.get(idx)),
     );
@@ -16827,11 +17002,27 @@ fn append_spread_display_units_until(
     units: &mut Vec<SpreadDisplayUnit>,
     pos: &mut usize,
     end_pos: usize,
+    spread_mode: SpreadMode,
+    overrides: &HashMap<usize, crate::book_composition::PageOverride>,
     is_landscape_idx: &mut impl FnMut(usize, usize) -> bool,
     is_pairable_idx: &mut impl FnMut(usize) -> bool,
 ) {
     while *pos < end_pos {
         let current = nav[*pos];
+        if let Some(directive) = overrides.get(&current) {
+            units.push(SpreadDisplayUnit::singleton(
+                *pos,
+                current,
+                explicit_singleton_cause(
+                    *directive,
+                    spread_mode,
+                    *directive == crate::book_composition::PageOverride::Alone
+                        && is_landscape_idx(*pos, current),
+                ),
+            ));
+            *pos += 1;
+            continue;
+        }
         if !is_pairable_idx(current) {
             units.push(SpreadDisplayUnit::singleton(
                 *pos,
@@ -16853,7 +17044,13 @@ fn append_spread_display_units_until(
 
         if *pos + 1 < end_pos {
             let partner = nav[*pos + 1];
-            if !is_pairable_idx(partner) {
+            if overrides.contains_key(&partner) {
+                units.push(SpreadDisplayUnit::singleton(
+                    *pos,
+                    current,
+                    SpreadDisplaySingletonCause::OverrideBoundaryRemainder,
+                ));
+            } else if !is_pairable_idx(partner) {
                 units.push(SpreadDisplayUnit::singleton(
                     *pos,
                     current,
@@ -16874,7 +17071,16 @@ fn append_spread_display_units_until(
             units.push(SpreadDisplayUnit::singleton(
                 *pos,
                 current,
-                SpreadDisplaySingletonCause::UnpairedSlot,
+                if nav
+                    .get(*pos + 1)
+                    .is_some_and(|partner| overrides.contains_key(partner))
+                {
+                    // A forced-last segment can stop just before the directive;
+                    // its unfilled slot still belongs to the explicit boundary.
+                    SpreadDisplaySingletonCause::OverrideBoundaryRemainder
+                } else {
+                    SpreadDisplaySingletonCause::UnpairedSlot
+                },
             ));
         }
         *pos += 1;
@@ -18589,116 +18795,10 @@ impl App {
         .flatten()
         .find(|indices| indices.len() == nav.len() && indices.as_ptr() == nav.as_ptr())
         .map(Arc::clone);
-        if let Some((scope, token)) = self.composed_layout_token() {
-            let layout = self
-                .composed_book_layout()
-                .expect("composition token owns resolved layout");
-            let direction = composition_view_direction(layout.direction);
-            let composed = Some((scope, token, direction));
-            if let Some(cached) = &self.spread_display_units_cache.token
-                && cached.composed == composed
-                && cached.items_generation == self.items_generation
-                && cached.spread_mode == self.spread_mode
-                && cached.matches_nav(nav)
-            {
-                if let Some(nav_identity) = nav_identity {
-                    self.spread_display_units_cache.token.as_mut().unwrap().nav = nav_identity;
-                }
-                return Arc::clone(&self.spread_display_units_cache.units);
-            }
-            let admitted = nav.iter().copied().collect::<HashSet<_>>();
-            let mut nav_start = 0;
-            let composed_unit_positions = layout
-                .units
-                .iter()
-                .enumerate()
-                .flat_map(|(position, unit)| {
-                    unit.navigation_pages()
-                        .map(move |page| (page.item_index, position))
-                })
-                .collect();
-            let units = if self.spread_mode.is_spread() {
-                layout
-                    .units
-                    .iter()
-                    .filter_map(|unit| {
-                        let pages = unit
-                            .navigation_pages()
-                            .filter_map(|page| {
-                                admitted
-                                    .contains(&page.item_index)
-                                    .then_some(page.item_index)
-                            })
-                            .collect::<Vec<_>>();
-                        let result = match pages.as_slice() {
-                            [first, second] => {
-                                Some(SpreadDisplayUnit::paired(nav_start, *first, *second))
-                            }
-                            [page] => Some(SpreadDisplayUnit::singleton(
-                                nav_start,
-                                *page,
-                                SpreadDisplaySingletonCause::ExplicitComposition,
-                            )),
-                            _ => None,
-                        };
-                        nav_start += pages.len();
-                        result
-                    })
-                    .collect::<Vec<_>>()
-            } else {
-                nav.iter()
-                    .enumerate()
-                    .map(|(position, &idx)| {
-                        SpreadDisplayUnit::singleton(
-                            position,
-                            idx,
-                            SpreadDisplaySingletonCause::UnpairedSlot,
-                        )
-                    })
-                    .collect()
-            };
-            #[cfg(test)]
-            SPREAD_DISPLAY_UNITS_BUILD_COUNT.set(SPREAD_DISPLAY_UNITS_BUILD_COUNT.get() + 1);
-            self.spread_display_units_cache.token = Some(SpreadDisplayUnitsToken {
-                items_generation: self.items_generation,
-                spread_mode: self.spread_mode,
-                nav: nav_identity
-                    .clone()
-                    .unwrap_or_else(|| Arc::new(nav.to_vec())),
-                composed,
-                shift_anchor_idx: None,
-                landscape_epoch: 0,
-                page_alone: crate::settings::PageAloneSettings::default(),
-            });
-            self.spread_display_units_cache.composed_unit_positions = composed_unit_positions;
-            self.spread_display_units_cache.tracked_indices.clear();
-            self.spread_display_units_cache.image_unit_positions.clear();
-            for (position, unit) in units.iter().enumerate() {
-                for &idx in &unit.pages {
-                    self.spread_display_units_cache
-                        .tracked_indices
-                        .entry(idx)
-                        .or_insert(position);
-                }
-                if unit
-                    .pages
-                    .iter()
-                    .any(|&idx| is_spread_pairable_item(self.items.get(idx)))
-                {
-                    self.spread_display_units_cache
-                        .image_unit_positions
-                        .push(position);
-                }
-            }
-            self.spread_display_units_cache.units = Arc::new(units);
-            self.spread_display_units_cache.landscape_indices.clear();
-            self.spread_display_units_cache
-                .rotation_recheck_indices
-                .clear();
-            self.spread_display_units_cache.rotation_recheck_all = false;
-            self.spread_display_units_cache.complete_page_permutation = None;
-            return Arc::clone(&self.spread_display_units_cache.units);
-        }
+        let composed = self.composed_layout_token().and_then(|(scope, token)| {
+            self.composed_book_layout()
+                .map(|layout| (scope, token, composition_view_direction(layout.direction)))
+        });
         if self.spread_mode.is_spread() {
             self.refresh_spread_rotation_rechecks(nav);
         }
@@ -18716,12 +18816,13 @@ impl App {
         } else {
             crate::settings::PageAloneSettings::default()
         };
-        if let Some(units) = self.spread_display_units_cache.get(
+        if let Some(units) = self.spread_display_units_cache.get_with_source(
             nav,
             self.items_generation,
             self.spread_mode,
             self.spread_shift_anchor_idx(),
             page_alone,
+            composed.clone(),
         ) {
             // Equal contents under a freshly installed navigation owner still share
             // that immutable allocation after the first exact validation.
@@ -18756,11 +18857,17 @@ impl App {
             .map(|&idx| is_spread_pairable_item(self.items.get(idx)))
             .collect::<Vec<_>>();
         let units = if self.spread_mode.is_spread() {
-            build_spread_display_units_with_page_alone(
+            let automatic_overrides = HashMap::new();
+            let overrides = self
+                .composed_book_layout()
+                .map(|layout| &layout.page_overrides)
+                .unwrap_or(&automatic_overrides);
+            build_spread_display_units_with_overrides(
                 nav,
                 self.spread_mode,
                 self.spread_shift_anchor_idx(),
                 page_alone,
+                overrides,
                 |nav_pos, _| landscape_flags.get(nav_pos).copied().unwrap_or(false),
                 |idx| is_spread_pairable_item(self.items.get(idx)),
             )
@@ -18780,8 +18887,6 @@ impl App {
                 })
                 .collect()
         };
-        // Retain the immutable navigation owner's allocation when available. Arbitrary
-        // slice callers keep an owned exact snapshot and the content-comparison fallback.
         let nav_identity = nav_identity.unwrap_or_else(|| Arc::new(nav.to_vec()));
         #[cfg(test)]
         SPREAD_DISPLAY_UNITS_BUILD_COUNT.set(SPREAD_DISPLAY_UNITS_BUILD_COUNT.get() + 1);
@@ -18795,17 +18900,23 @@ impl App {
             &image_flags,
             units,
         );
+        self.spread_display_units_cache
+            .token
+            .as_mut()
+            .expect("installed unit source")
+            .composed = composed.clone();
         if let Some(complete) = complete_proof {
             self.spread_display_units_cache
                 .set_complete_page_permutation(nav, self.items_generation, complete);
         }
         self.spread_display_units_cache
-            .get(
+            .get_with_source(
                 nav,
                 self.items_generation,
                 self.spread_mode,
                 self.spread_shift_anchor_idx(),
                 page_alone,
+                composed.clone(),
             )
             .expect("installed spread unit token")
     }
@@ -18816,6 +18927,18 @@ impl App {
         #[cfg(test)]
         FINAL_COVER_ELIGIBILITY_SCAN_COUNT
             .set(FINAL_COVER_ELIGIBILITY_SCAN_COUNT.get().saturating_add(1));
+        if let Some(layout) = self.composed_book_layout() {
+            if !layout.complete || nav.len() != layout.visible_pages.len() {
+                return false;
+            }
+            let expected = layout
+                .visible_pages
+                .iter()
+                .map(|page| page.item_index)
+                .collect::<HashSet<_>>();
+            let actual = nav.iter().copied().collect::<HashSet<_>>();
+            return actual.len() == nav.len() && actual == expected;
+        }
         if nav.len() != self.smart_folder_rule_total()
             || !nav.iter().all(|&idx| {
                 self.smart_folder_rule_qualifies_index(idx)
@@ -18908,8 +19031,6 @@ impl App {
                 && is_spread_pairable_item(self.items.get(anchor_idx))
             {
                 let nav = self.get_nav_indices();
-                // Normal painting and prefetch must observe the same canonical topology
-                // before the outgoing proof captures its layout allocation.
                 self.build_spread_display_units_for_nav(&nav);
             }
             return SpreadDisplayComposition::from_navigation_pages(anchor_idx, &[anchor_idx])
@@ -18923,18 +19044,6 @@ impl App {
         let units = self.build_spread_display_units_for_nav(&nav);
         let (final_cover_enabled, singleton_placement_enabled, eligible) =
             self.spread_display_composition_policy_for_nav(&nav);
-        if self.composed_book_layout().is_some() {
-            return self
-                .spread_display_composition_for_cached_unit(
-                    &units,
-                    0,
-                    anchor_idx,
-                    final_cover_enabled,
-                    singleton_placement_enabled,
-                    eligible,
-                )
-                .expect("accepted composition contains its live real anchor");
-        }
         let composition = self
             .spread_display_units_cache
             .unit_position(anchor_idx)
@@ -18950,10 +19059,47 @@ impl App {
             });
         composition
             .and_then(|composition| composition.with_navigation_anchor(anchor_idx))
-            .unwrap_or_else(|| {
-                SpreadDisplayComposition::from_navigation_pages(anchor_idx, &[anchor_idx])
-                    .expect("fallback composition contains its anchor")
-            })
+            .unwrap_or_else(|| self.facet_outside_composition(anchor_idx))
+    }
+
+    /// A currently shown page may outlive a temporary facet. Keep that one real
+    /// page without importing excluded neighbors or automatic endpoint companions.
+    fn facet_outside_composition(&self, idx: usize) -> SpreadDisplayComposition {
+        let directive = self
+            .composed_book_layout()
+            .and_then(|layout| layout.page_override(idx));
+        let overrides = directive
+            .map(|value| HashMap::from([(idx, value)]))
+            .unwrap_or_default();
+        let units = build_spread_display_units_with_overrides(
+            &[idx],
+            self.spread_mode,
+            None,
+            crate::settings::PageAloneSettings::default(),
+            &overrides,
+            |_, page| {
+                // No DB read: a facet-excluded shown page uses the same adopted
+                // rotation inputs as the composed navigation builder.
+                let rotation = self
+                    .rotation_cache
+                    .get(&page)
+                    .copied()
+                    .or_else(|| self.prepared_composed_rotation(page))
+                    .unwrap_or(crate::rotation_db::Rotation::None);
+                directive == Some(crate::book_composition::PageOverride::Alone)
+                    && self.page_is_landscape(page, rotation)
+            },
+            |_| true,
+        );
+        resolve_spread_display_composition(
+            &units,
+            0,
+            self.spread_mode,
+            false,
+            self.spread_singleton_display_endpoint_settings(),
+            false,
+        )
+        .expect("facet singleton contains its anchor")
     }
 
     fn spread_display_composition_for_cached_unit(
@@ -18965,37 +19111,6 @@ impl App {
         placement: crate::settings::SingletonSpreadEndpointSettings,
         eligible: bool,
     ) -> Option<SpreadDisplayComposition> {
-        if let Some(layout) = self.composed_book_layout() {
-            let explicit_position = *self
-                .spread_display_units_cache
-                .composed_unit_positions
-                .get(&anchor_idx)?;
-            let unit = layout.units.get(explicit_position)?;
-            if !self.spread_mode.is_spread() {
-                return SpreadDisplayComposition::from_navigation_pages(anchor_idx, &[anchor_idx]);
-            }
-            let composition = SpreadDisplayComposition::from_composed_unit(unit, layout.direction);
-            let current_in_facet = self
-                .spread_display_units_cache
-                .tracked_indices
-                .contains_key(&anchor_idx);
-            let allowed = composition
-                .pages_in_screen_order(self.spread_mode)
-                .iter()
-                .map(|page| {
-                    if current_in_facet {
-                        self.spread_display_units_cache
-                            .tracked_indices
-                            .contains_key(&page.idx)
-                    } else {
-                        page.idx == anchor_idx && page.role == SpreadPageRole::Navigation
-                    }
-                })
-                .collect::<Vec<_>>();
-            return composition
-                .permitted_projection(self.spread_mode, &allowed)
-                .and_then(|unit| unit.with_navigation_anchor(anchor_idx));
-        }
         resolve_spread_display_composition(
             units,
             position,
@@ -19004,13 +19119,12 @@ impl App {
             placement,
             eligible,
         )
+        .and_then(|composition| composition.with_navigation_anchor(anchor_idx))
     }
 
-    fn spread_display_composition_policy_for_nav(
-        &mut self,
-        nav: &[usize],
-    ) -> (bool, crate::settings::SingletonSpreadEndpointSettings, bool) {
-        let final_cover_enabled = self.final_cover_spread_enabled_for_current_book();
+    fn spread_singleton_display_endpoint_settings(
+        &self,
+    ) -> crate::settings::SingletonSpreadEndpointSettings {
         let mut singleton_placement_enabled =
             self.singleton_spread_placement_enabled_for_current_book();
         // Presentation policy is local to paged composition. Stored book/global
@@ -19019,6 +19133,15 @@ impl App {
             singleton_placement_enabled.first = true;
             singleton_placement_enabled.last = true;
         }
+        singleton_placement_enabled
+    }
+
+    fn spread_display_composition_policy_for_nav(
+        &mut self,
+        nav: &[usize],
+    ) -> (bool, crate::settings::SingletonSpreadEndpointSettings, bool) {
+        let final_cover_enabled = self.final_cover_spread_enabled_for_current_book();
+        let singleton_placement_enabled = self.spread_singleton_display_endpoint_settings();
         let eligible = ((self.spread_mode.has_cover() && final_cover_enabled)
             || singleton_placement_enabled.first
             || singleton_placement_enabled.last
@@ -19122,33 +19245,6 @@ impl App {
     ) -> Vec<crate::book_composition::PresentationOccurrence> {
         self.spread_display_composition_for_anchor(idx)
             .presentation_demand(self.spread_mode, crate::page_split::PageSlice::Full)
-    }
-
-    pub(crate) fn book_target_presentation_demand_from_projection(
-        &self,
-        projection: &crate::book_composition::AcceptedCompositionProjection,
-        idx: usize,
-    ) -> Vec<crate::book_composition::PresentationOccurrence> {
-        if !self.spread_mode.is_spread() {
-            return SpreadDisplayComposition::from_navigation_pages(idx, &[idx])
-                .map(|unit| {
-                    unit.presentation_demand(self.spread_mode, crate::page_split::PageSlice::Full)
-                })
-                .unwrap_or_default();
-        }
-        projection
-            .resolved
-            .units
-            .iter()
-            .find(|unit| unit.navigation_pages().any(|page| page.item_index == idx))
-            .map(|unit| {
-                SpreadDisplayComposition::from_composed_unit(unit, projection.resolved.direction)
-            })
-            .and_then(|unit| unit.with_navigation_anchor(idx))
-            .map(|unit| {
-                unit.presentation_demand(self.spread_mode, crate::page_split::PageSlice::Full)
-            })
-            .unwrap_or_default()
     }
 
     fn fs_navigation_display_demand_for_anchor(
@@ -27036,8 +27132,8 @@ impl App {
                                 wheel.restore_at(ctx, FsHudPopupWheelTarget::TopBar);
                             }
                             let extracted_result = self.extracted_result_surface().is_some();
-                            let composition_owned = self.pairing_edit_availability() != crate::spread_shift::PairingEditAvailability::Automatic
-                                && !extracted_result;
+                            let pairing_availability = self.pairing_edit_availability();
+                            let composition_spread_mode = self.composed_spread_mode();
                             let shift_view = self.spread_shift_hud_view();
                             Self::draw_fs_hover_bar(
                                 ui,
@@ -27065,7 +27161,8 @@ impl App {
                                 &mut self.panorama_projection_popup_open,
                                 &mut panorama_projection_choice,
                                 extracted_result,
-                                composition_owned,
+                                pairing_availability,
+                                composition_spread_mode,
                                 &mut self.spread_mode,
                                 &mut self.reading_flow,
                                 &mut self.reading_direction,
@@ -30735,36 +30832,30 @@ impl App {
             .collect()
     }
 
-    /// Q8 applies only to explicit Blank companions in composed Spread units.
+    /// Explicit white companions use their real page's screen-side spread trim.
+    /// The directive is context-owned; automatic singleton trim remains unchanged.
     pub(crate) fn composed_blank_spread_side(
         &self,
         idx: usize,
     ) -> Option<crate::view_trim::ViewTrimSpreadSide> {
+        use crate::book_composition::{PageOverride, PageSide};
         if !self.spread_mode.is_spread() {
             return None;
         }
         let layout = self.composed_book_layout()?;
-        let unit = layout
-            .units
-            .iter()
-            .find(|unit| unit.anchor().item_index == idx)?;
-        if !matches!(
-            unit,
-            crate::book_composition::ResolvedUnit::Single {
-                companion: crate::book_composition::ResolvedCompanion::Blank,
-                ..
-            }
-        ) {
+        let PageOverride::BlankOpposite { page_side } = layout.page_override(idx)? else {
             return None;
-        }
-        match SpreadDisplayComposition::from_composed_unit(unit, layout.direction)
-            .singleton_placement()
-            .side()
-        {
-            SingletonSpreadPlacement::Left => Some(crate::view_trim::ViewTrimSpreadSide::Left),
-            SingletonSpreadPlacement::Right => Some(crate::view_trim::ViewTrimSpreadSide::Right),
-            _ => None,
-        }
+        };
+        let right = matches!(page_side, PageSide::Leading)
+            == matches!(
+                layout.direction,
+                crate::book_composition::ReadingDirection::Rtl
+            );
+        Some(if right {
+            crate::view_trim::ViewTrimSpreadSide::Right
+        } else {
+            crate::view_trim::ViewTrimSpreadSide::Left
+        })
     }
 
     pub(crate) fn fullscreen_cursor_state(&self) -> FullscreenCursorState {
@@ -33625,11 +33716,12 @@ impl App {
         };
 
         if let Some(mode) = new_spread {
-            if mode == SpreadMode::Single {
+            let accepted = if mode == SpreadMode::Single {
                 self.apply_fullscreen_view_mode(ctx, fs_idx, FullscreenViewMode::Single);
+                self.spread_mode == mode
             } else {
-                self.apply_fullscreen_spread_mode(ctx, fs_idx, mode);
-            }
+                self.apply_fullscreen_spread_mode(ctx, fs_idx, mode)
+            };
             // Report only the state actually applied after persistence.
             let key_num = if key_1 {
                 1
@@ -33646,7 +33738,7 @@ impl App {
             } else {
                 9
             };
-            if self.spread_mode == mode {
+            if accepted && self.spread_mode == mode {
                 self.show_feedback_toast(format!("[{}:{}]", key_num, mode.label()));
             }
         }
@@ -41410,7 +41502,7 @@ impl App {
         ctx: &egui::Context,
         preference: crate::settings::FinalCoverSpreadPreference,
     ) {
-        if self.refuse_composition_pairing_edit() {
+        if self.refuse_composition_automatic_rule_edit() {
             return;
         }
         if self.extracted_result_surface().is_some() {
@@ -41469,7 +41561,7 @@ impl App {
         ctx: &egui::Context,
         preference: crate::settings::SingletonSpreadEndpointPreferences,
     ) {
-        if self.refuse_composition_pairing_edit() {
+        if self.refuse_composition_automatic_rule_edit() {
             return;
         }
         if self.extracted_result_surface().is_some() {
@@ -41493,7 +41585,7 @@ impl App {
         ctx: &egui::Context,
         preferences: crate::settings::PageAlonePreferences,
     ) {
-        if self.refuse_composition_pairing_edit() {
+        if self.refuse_composition_automatic_rule_edit() {
             return;
         }
         if self.extracted_result_surface().is_some() {
@@ -41777,17 +41869,34 @@ impl App {
 
     /// 見開きモード (`SpreadMode`) を適用する。キーボードのショートカット 1〜5 と
     /// ゲームパッド Select の両方から呼ぶ共通処理 (連結方式 `reading_flow` の切替とは別物)。
-    /// トースト表示は呼び出し側で行う。
+    /// Returns acceptance, so a refused already-current request cannot emit a success toast.
     pub(crate) fn apply_fullscreen_spread_mode(
         &mut self,
         ctx: &egui::Context,
         fs_idx: usize,
         mode: SpreadMode,
-    ) {
-        // This legacy API is a binding edit even when the requested value is
-        // unchanged. Refuse before persistence, shift clears or normalization.
+    ) -> bool {
+        if self.composition_owns_view_settings() {
+            if mode == SpreadMode::Single || self.composed_spread_mode() == Some(mode) {
+                self.apply_fullscreen_view_mode(ctx, fs_idx, FullscreenViewMode::from_legacy(mode));
+                return self.spread_mode == mode;
+            }
+            if let Some(expected) = self.composed_spread_mode() {
+                let shortcut =
+                    spread_mode_row_shortcut(&self.keymap, expected, true, Some(expected));
+                let entry = shortcut.map_or_else(
+                    || "表示モードの「見開き」".to_owned(),
+                    |key| format!("[{key}]"),
+                );
+                self.show_feedback_toast(format!(
+                    "この本の見開きは{entry}で表示できます。読む方向と表紙を変えるには本の構成を編集してください"
+                ));
+                return false;
+            }
+        }
+        // Unreadable and unsupported composition owners retain the binding refusal.
         if self.refuse_composition_pairing_edit() {
-            return;
+            return false;
         }
         let mode = if self.extracted_result_surface().is_some() {
             crate::app::book_materialization::extracted_view_mode(mode, self.reading_direction)
@@ -41798,13 +41907,13 @@ impl App {
             if self.reset_live_spread_shift(false) {
                 self.normalize_spread_position(ctx);
             }
-            return;
+            return true;
         }
         let previous_surface = self.capture_book_mode_transition(mode);
         let direction = mode.reading_direction().unwrap_or(self.reading_direction);
         if let Err(error) = self.persist_spread_presentation(mode, self.reading_flow, direction) {
             crate::logger::log(format!("spread: failed to save mode: {error}"));
-            return;
+            return false;
         }
         self.invalidate_similar_preview();
         self.spread_mode = mode;
@@ -41831,6 +41940,31 @@ impl App {
                 ContinuousAdmissionEpisode::ModeTransition(previous);
         }
         self.normalize_spread_position(ctx);
+        true
+    }
+
+    pub(crate) fn composed_spread_mode(&self) -> Option<SpreadMode> {
+        if self.pairing_edit_availability()
+            != crate::spread_shift::PairingEditAvailability::Composed
+        {
+            return None;
+        }
+        self.composed_book_layout().map(|layout| {
+            crate::book_composition::composition_spread_mode(
+                layout.direction,
+                self.composed_book_has_cover(),
+            )
+        })
+    }
+
+    fn refuse_composition_automatic_rule_edit(&mut self) -> bool {
+        if self.pairing_edit_availability()
+            != crate::spread_shift::PairingEditAvailability::Unreadable
+        {
+            return false;
+        }
+        self.show_feedback_toast("本の構成を読み込めないため見開き設定を変更できません".into());
+        true
     }
 
     pub(crate) fn refuse_composition_pairing_edit(&mut self) -> bool {
@@ -42233,34 +42367,7 @@ impl App {
         let image_indices = self.get_still_image_indices();
         let mut image_units = Vec::new();
 
-        if self.spread_mode.is_spread() && self.composed_book_layout().is_some() {
-            let admitted = image_indices.iter().copied().collect::<HashSet<_>>();
-            let current_outside_facet = !admitted.contains(&idx);
-            let layout = self
-                .composed_book_layout()
-                .expect("checked composed layout");
-            image_units.extend(layout.units.iter().filter_map(|unit| {
-                let unit = SpreadDisplayComposition::from_composed_unit(unit, layout.direction);
-                let current_unit_outside_facet = current_outside_facet
-                    && unit
-                        .pages
-                        .iter()
-                        .any(|page| page.idx == idx && page.role == SpreadPageRole::Navigation);
-                let allowed = unit
-                    .pages_in_screen_order(self.spread_mode)
-                    .iter()
-                    .map(|page| {
-                        if current_unit_outside_facet {
-                            page.idx == idx && page.role == SpreadPageRole::Navigation
-                        } else {
-                            admitted.contains(&page.idx)
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                unit.permitted_projection(self.spread_mode, &allowed)
-                    .map(|unit| ContinuousReadingUnitSpec::composition(unit, self.spread_mode))
-            }));
-        } else if let Some(steps) = self.build_presentation_steps_for_nav(&image_indices) {
+        if let Some(steps) = self.build_presentation_steps_for_nav(&image_indices) {
             // 分割中は 1 つの元ページが 2 段になる。**並べる順序はページ送りと同じもの**
             // なので、同じステップ列から作る (連結用に別の列を持たない)。
             image_units.extend(steps.into_iter().map(|step| {
@@ -42301,6 +42408,22 @@ impl App {
                     .iter()
                     .copied()
                     .map(|idx| ContinuousReadingUnitSpec::pages(idx, vec![idx])),
+            );
+        }
+
+        if self.spread_mode.is_spread()
+            && self.composed_book_layout().is_some()
+            && !image_indices.contains(&idx)
+            && self.continuous_reading_supported_idx(idx)
+        {
+            let composition = self.facet_outside_composition(idx);
+            let at = image_units
+                .iter()
+                .position(|unit| unit.anchor_idx > idx)
+                .unwrap_or(image_units.len());
+            image_units.insert(
+                at,
+                ContinuousReadingUnitSpec::composition(composition, self.spread_mode),
             );
         }
 
@@ -47579,7 +47702,8 @@ impl App {
         panorama_projection_popup_open: &mut bool,
         panorama_projection_choice: &mut Option<crate::panorama::PanoProjection>,
         extracted_result: bool,
-        composition_owned: bool,
+        pairing_availability: crate::spread_shift::PairingEditAvailability,
+        composition_spread_mode: Option<SpreadMode>,
         spread_mode: &mut SpreadMode,
         reading_flow: &mut ReadingFlow,
         reading_direction: &mut ReadingDirection,
@@ -47644,6 +47768,17 @@ impl App {
         shift_view: Option<&SpreadShiftHudView>,
         pre_resolved_close: Option<BarButtonResponse>,
     ) {
+        let composition_owned = matches!(
+            pairing_availability,
+            crate::spread_shift::PairingEditAvailability::Composed
+                | crate::spread_shift::PairingEditAvailability::Unreadable
+        );
+        let automatic_rules_allowed = matches!(
+            pairing_availability,
+            crate::spread_shift::PairingEditAvailability::Automatic
+                | crate::spread_shift::PairingEditAvailability::Composed
+        );
+
         let popup_wheel_owned = *fit_popup_open
             || *spread_popup_open
             || *slideshow_popup_open
@@ -48436,10 +48571,27 @@ impl App {
                 spread_active,
                 |p, c, r| draw_spread_icon(p, c, r, sm),
             );
-            let spread_keys = SpreadMode::all()
+            let managed_modes = [
+                SpreadMode::Single,
+                composition_spread_mode
+                    .unwrap_or_else(|| SpreadMode::Ltr.with_reading_direction(*reading_direction)),
+                SpreadMode::SplitLtr.with_reading_direction(*reading_direction),
+            ];
+            let advertised_modes = if composition_owned {
+                managed_modes.as_slice()
+            } else {
+                SpreadMode::all()
+            };
+            let spread_keys = advertised_modes
                 .iter()
-                .filter_map(|&mode| spread_mode_key_action(mode))
-                .filter_map(|action| keymap.first_chord_label(action))
+                .filter_map(|&mode| {
+                    spread_mode_row_shortcut(
+                        keymap,
+                        mode,
+                        composition_owned,
+                        composition_spread_mode,
+                    )
+                })
                 .collect::<Vec<_>>();
             let mut spread_tip_parts = Vec::new();
             if spread_keys.is_empty() {
@@ -48452,7 +48604,11 @@ impl App {
             } else {
                 spread_tip_parts.push("連結方式".to_owned());
             }
-            if let Some(key_label) = keymap.first_chord_label(KeyAction::FsReadingDirectionToggle) {
+            if composition_owned {
+                spread_tip_parts.push("読む方向と表紙は構成を編集".to_owned());
+            } else if let Some(key_label) =
+                keymap.first_chord_label(KeyAction::FsReadingDirectionToggle)
+            {
                 spread_tip_parts.push(format!("横方向 [{key_label}]"));
             } else {
                 spread_tip_parts.push("横方向".to_owned());
@@ -48540,6 +48696,7 @@ impl App {
                                 spread_popup_open,
                                 extracted_result,
                                 composition_owned,
+                                composition_spread_mode,
                             );
 
                             draw_spread_popup_heading(scroll_ui, "連結方式");
@@ -48594,8 +48751,8 @@ impl App {
                             if composition_owned {
                                 scroll_ui
                                     .label("構成あり")
-                                    .on_hover_text("本の構成で設定されています");
-                                scroll_ui.label("本の構成で設定されています");
+                                    .on_hover_text("読む方向と表紙は本の構成で設定されています");
+                                scroll_ui.label("読む方向と表紙は構成を編集してください");
                             }
                             scroll_ui.add_enabled_ui(
                                 !extracted_result && !composition_owned,
@@ -48651,7 +48808,11 @@ impl App {
                                             *spread_popup_open = false;
                                         }
                                     }
-
+                                },
+                            );
+                            scroll_ui.add_enabled_ui(
+                                !extracted_result && automatic_rules_allowed,
+                                |scroll_ui| {
                                     draw_spread_popup_heading(scroll_ui, "末尾に表紙を添える");
                                     for &preference in
                                         crate::settings::FinalCoverSpreadPreference::all()
@@ -51941,6 +52102,16 @@ impl App {
         })
     }
 
+    fn output_composition_check(
+        &self,
+        idx: usize,
+    ) -> Option<crate::book_composition::CompositionOutputCheck> {
+        Some(crate::book_composition::CompositionOutputCheck::new(
+            self.book_composition_service.as_ref()?.clone(),
+            self.source_composition_candidate(idx)?,
+        ))
+    }
+
     fn book_page_source_for_idx(
         &mut self,
         _ctx: &egui::Context,
@@ -51982,6 +52153,7 @@ impl App {
             self.export_crop_pages.contains(&idx),
             self.settings.bake_stage_book,
         );
+        let composition_check = self.output_composition_check(idx);
         match item {
             GridItem::Image(path) => {
                 let original_name = path
@@ -52070,6 +52242,7 @@ impl App {
             }
             _ => Err("このアイテムは本へ追加できません".to_string()),
         }
+        .map(|source| source.qualify(composition_check))
     }
 
     /// グリッド選択を一括エクスポートの入力へ変換する。戻り値は
@@ -52196,6 +52369,7 @@ impl App {
             dirname,
             source,
             edits,
+            composition_check: self.output_composition_check(idx),
         }))
     }
 
@@ -52226,6 +52400,7 @@ impl App {
                 path: path.to_path_buf(),
             },
             edits,
+            composition_check: None,
         })
     }
 
@@ -60783,7 +60958,8 @@ mod tests {
                         &mut panorama_projection_popup_open,
                         &mut panorama_projection_choice,
                         false,
-                        false,
+                        crate::spread_shift::PairingEditAvailability::Automatic,
+                        None,
                         &mut spread_mode,
                         &mut reading_flow,
                         &mut reading_direction,
@@ -61020,7 +61196,12 @@ mod tests {
                         &mut panorama_projection_popup_open,
                         &mut panorama_projection_choice,
                         state.extracted_result,
-                        state.composition_owned,
+                        if state.composition_owned {
+                            crate::spread_shift::PairingEditAvailability::Composed
+                        } else {
+                            crate::spread_shift::PairingEditAvailability::Automatic
+                        },
+                        state.composition_owned.then_some(SpreadMode::Ltr),
                         &mut state.spread_mode,
                         &mut state.reading_flow,
                         &mut state.reading_direction,
@@ -81564,42 +81745,44 @@ mod tests {
         assert!(app.capture_region_selection.is_none());
     }
 
+    fn begin_capture_region_drag_for_test(
+        app: &mut App,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        image_rect: egui::Rect,
+        fs_idx: usize,
+    ) -> egui::Pos2 {
+        arm_capture_region_for_test(app, ctx, fs_idx, navigator_ordered_input(Vec::new(), 0.0));
+        let start = image_rect.min + egui::vec2(50.0, 50.0);
+        let finish = image_rect.center();
+        let (effect, _) = run_capture_region_input_frame(
+            app,
+            ctx,
+            full_rect,
+            fs_idx,
+            navigator_ordered_input(
+                vec![
+                    navigator_button_event(start, egui::PointerButton::Primary, true),
+                    egui::Event::PointerMoved(finish),
+                ],
+                0.1,
+            ),
+        );
+        assert!(effect.is_none());
+        finish
+    }
+
+    // One App per test keeps independent event-order scenarios off one large debug stack frame.
     #[test]
     fn capture_region_focus_and_escape_terminals_preserve_event_order() {
-        fn begin_drag(
-            app: &mut App,
-            ctx: &egui::Context,
-            full_rect: egui::Rect,
-            image_rect: egui::Rect,
-            fs_idx: usize,
-        ) -> egui::Pos2 {
-            arm_capture_region_for_test(app, ctx, fs_idx, navigator_ordered_input(Vec::new(), 0.0));
-            let start = image_rect.min + egui::vec2(50.0, 50.0);
-            let finish = image_rect.center();
-            let (effect, _) = run_capture_region_input_frame(
-                app,
-                ctx,
-                full_rect,
-                fs_idx,
-                navigator_ordered_input(
-                    vec![
-                        navigator_button_event(start, egui::PointerButton::Primary, true),
-                        egui::Event::PointerMoved(finish),
-                    ],
-                    0.1,
-                ),
-            );
-            assert!(effect.is_none());
-            finish
-        }
-
         #[cfg(windows)]
         let _serial = crate::key_input::lock_test_input();
         #[cfg(windows)]
         let _cleanup = ClearTestKeyFrame;
         let ctx = egui::Context::default();
         let (mut app, full_rect, image_rect, fs_idx) = setup_capture_region_input_test(&ctx);
-        let finish = begin_drag(&mut app, &ctx, full_rect, image_rect, fs_idx);
+        let finish =
+            begin_capture_region_drag_for_test(&mut app, &ctx, full_rect, image_rect, fs_idx);
         let (effect, _) = run_capture_region_input_frame(
             &mut app,
             &ctx,
@@ -81615,10 +81798,18 @@ mod tests {
         );
         assert_eq!(effect, Some(CaptureRegionTerminalEffect::Cancel));
         drop(app);
+    }
 
+    #[test]
+    fn capture_region_release_before_focus_loss_copies() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::lock_test_input();
+        #[cfg(windows)]
+        let _cleanup = ClearTestKeyFrame;
         let ctx = egui::Context::default();
         let (mut app, full_rect, image_rect, fs_idx) = setup_capture_region_input_test(&ctx);
-        let finish = begin_drag(&mut app, &ctx, full_rect, image_rect, fs_idx);
+        let finish =
+            begin_capture_region_drag_for_test(&mut app, &ctx, full_rect, image_rect, fs_idx);
         let (effect, _) = run_capture_region_input_frame(
             &mut app,
             &ctx,
@@ -81634,10 +81825,18 @@ mod tests {
         );
         let _ = expect_capture_copy(effect, fs_idx);
         drop(app);
+    }
 
+    #[test]
+    fn capture_region_escape_before_release_stays_cancelled() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::lock_test_input();
+        #[cfg(windows)]
+        let _cleanup = ClearTestKeyFrame;
         let ctx = egui::Context::default();
         let (mut app, full_rect, image_rect, fs_idx) = setup_capture_region_input_test(&ctx);
-        let finish = begin_drag(&mut app, &ctx, full_rect, image_rect, fs_idx);
+        let finish =
+            begin_capture_region_drag_for_test(&mut app, &ctx, full_rect, image_rect, fs_idx);
         #[cfg(windows)]
         {
             crate::key_input::set_test_frame(vec![crate::key_input::KeyEdge {
@@ -81681,10 +81880,18 @@ mod tests {
         );
         assert!(effect.is_none());
         drop(app);
+    }
 
+    #[test]
+    fn capture_region_focus_round_trip_before_release_cancels() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::lock_test_input();
+        #[cfg(windows)]
+        let _cleanup = ClearTestKeyFrame;
         let ctx = egui::Context::default();
         let (mut app, full_rect, image_rect, fs_idx) = setup_capture_region_input_test(&ctx);
-        let finish = begin_drag(&mut app, &ctx, full_rect, image_rect, fs_idx);
+        let finish =
+            begin_capture_region_drag_for_test(&mut app, &ctx, full_rect, image_rect, fs_idx);
         let _ = ctx.run(
             navigator_ordered_input(vec![egui::Event::WindowFocused(false)], 0.2),
             |_| {},
@@ -85231,7 +85438,8 @@ mod specified_scale_consumer_tests {
                         &mut panorama_projection_popup_open,
                         &mut panorama_projection_choice,
                         false,
-                        false,
+                        crate::spread_shift::PairingEditAvailability::Automatic,
+                        None,
                         &mut spread_mode,
                         &mut reading_flow,
                         &mut reading_direction,

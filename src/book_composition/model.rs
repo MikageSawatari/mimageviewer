@@ -3,10 +3,42 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 pub const MAX_PAGES: usize = 100_000;
 pub const MAX_REFERENCE_BYTES: usize = 32_768;
 pub const MAX_JSON_BYTES: usize = 16 * 1024 * 1024;
+
+/// The composition owns binding; a matching legacy request only selects Spread viewing.
+pub(crate) fn composition_spread_mode(
+    direction: ReadingDirection,
+    cover_enabled: bool,
+) -> crate::settings::SpreadMode {
+    use crate::settings::SpreadMode;
+    match (direction, cover_enabled) {
+        (ReadingDirection::Ltr, false) => SpreadMode::Ltr,
+        (ReadingDirection::Ltr, true) => SpreadMode::LtrCover,
+        (ReadingDirection::Rtl, false) => SpreadMode::Rtl,
+        (ReadingDirection::Rtl, true) => SpreadMode::RtlCover,
+    }
+}
+
+#[cfg(test)]
+mod legacy_spread_mode_tests {
+    use super::*;
+
+    #[test]
+    fn composition_spread_mode_uses_direction_and_cover_only() {
+        use crate::settings::SpreadMode;
+        for (direction, cover, expected) in [
+            (ReadingDirection::Ltr, false, SpreadMode::Ltr),
+            (ReadingDirection::Ltr, true, SpreadMode::LtrCover),
+            (ReadingDirection::Rtl, false, SpreadMode::Rtl),
+            (ReadingDirection::Rtl, true, SpreadMode::RtlCover),
+        ] {
+            assert_eq!(composition_spread_mode(direction, cover), expected);
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CompositionError {
@@ -257,36 +289,43 @@ impl SinglePlacement {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum SingleCompanion {
-    Vacant,
-    Blank,
-    FrontCoverSupplement { page: CompositionPageRef },
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PageSide {
+    Leading,
+    Trailing,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum CompositionUnit {
-    Pair {
-        first: CompositionPageRef,
-        second: CompositionPageRef,
-    },
-    Single {
-        page: CompositionPageRef,
-        placement: SinglePlacement,
-        companion: SingleCompanion,
-    },
+pub enum PageOverride {
+    Alone,
+    BlankOpposite { page_side: PageSide },
 }
 
-impl CompositionUnit {
-    pub fn pages(&self) -> impl Iterator<Item = &CompositionPageRef> {
-        let (first, second) = match self {
-            Self::Pair { first, second } => (first, Some(second)),
-            Self::Single { page, .. } => (page, None),
-        };
-        std::iter::once(first).chain(second)
+// serde's internally tagged unit variants otherwise ignore unknown fields.
+// The empty struct wire variant enforces the same strict shape as BlankOpposite.
+impl<'de> Deserialize<'de> for PageOverride {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+        enum Wire {
+            Alone {},
+            BlankOpposite { page_side: PageSide },
+        }
+        Ok(match Wire::deserialize(deserializer)? {
+            Wire::Alone {} => Self::Alone,
+            Wire::BlankOpposite { page_side } => Self::BlankOpposite { page_side },
+        })
     }
+}
+
+/// A sequence on the wire makes duplicate normalized keys observable during validation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PageOverrideEntry {
+    pub page: CompositionPageRef,
+    pub directive: PageOverride,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -295,26 +334,35 @@ pub struct BookComposition {
     pub schema_version: u32,
     pub revision: u64,
     pub direction: ReadingDirection,
-    pub cover: Option<CompositionPageRef>,
-    pub units: Vec<CompositionUnit>,
-    /// Set semantics validated using the same normalized identity as units.
+    pub cover_enabled: bool,
+    pub page_order: Vec<CompositionPageRef>,
     pub hidden_pages: Vec<CompositionPageRef>,
+    pub page_overrides: Vec<PageOverrideEntry>,
 }
 
 impl BookComposition {
-    pub fn new(direction: ReadingDirection, units: Vec<CompositionUnit>) -> Self {
+    pub fn new(direction: ReadingDirection, page_order: Vec<CompositionPageRef>) -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
             revision: 0,
             direction,
-            cover: None,
-            units,
+            cover_enabled: false,
+            page_order,
             hidden_pages: Vec::new(),
+            page_overrides: Vec::new(),
         }
     }
 
     pub fn pages(&self) -> impl Iterator<Item = &CompositionPageRef> {
-        self.units.iter().flat_map(CompositionUnit::pages)
+        self.page_order.iter()
+    }
+
+    pub fn page_override(&self, page: &CompositionPageRef) -> Option<PageOverride> {
+        let key = page.matching_key();
+        self.page_overrides
+            .iter()
+            .find(|entry| entry.page.matching_key() == key)
+            .map(|entry| entry.directive)
     }
 
     pub fn validate(&self, domain: &PageDomain) -> CompositionResult<()> {
@@ -322,74 +370,19 @@ impl BookComposition {
             return Err(CompositionError::UnknownSchema(self.schema_version));
         }
         domain.validate()?;
-        if self.units.len() > MAX_PAGES || self.hidden_pages.len() > MAX_PAGES {
+        if self.page_order.len() > MAX_PAGES
+            || self.hidden_pages.len() > MAX_PAGES
+            || self.page_overrides.len() > MAX_PAGES
+        {
             return Err(CompositionError::Limit("page count"));
         }
-        let mut registered = HashSet::new();
-        let mut previous_blank = false;
-        for unit in &self.units {
-            for page in unit.pages() {
-                domain.validate_page(page)?;
-                if !registered.insert(page.matching_key()) {
-                    return Err(CompositionError::Invalid(
-                        "duplicate ordinary page occurrence",
-                    ));
-                }
-                if registered.len() > MAX_PAGES {
-                    return Err(CompositionError::Limit("page count"));
-                }
-            }
-            match unit {
-                CompositionUnit::Pair { first, second } => {
-                    if self.cover.as_ref().is_some_and(|cover| {
-                        cover.matching_key() == first.matching_key()
-                            || cover.matching_key() == second.matching_key()
-                    }) {
-                        return Err(CompositionError::Invalid(
-                            "cover must have a Single occurrence",
-                        ));
-                    }
-                    previous_blank = false;
-                }
-                CompositionUnit::Single {
-                    page,
-                    placement,
-                    companion,
-                } => {
-                    if *placement == SinglePlacement::Center
-                        && *companion != SingleCompanion::Vacant
-                    {
-                        return Err(CompositionError::Invalid(
-                            "center placement requires a vacant companion",
-                        ));
-                    }
-                    if let SingleCompanion::FrontCoverSupplement { page: supplement } = companion {
-                        domain.validate_page(supplement)?;
-                        if self
-                            .cover
-                            .as_ref()
-                            .is_none_or(|cover| cover.matching_key() != supplement.matching_key())
-                            || page.matching_key() == supplement.matching_key()
-                        {
-                            return Err(CompositionError::Invalid(
-                                "supplement must reference the distinct designated cover",
-                            ));
-                        }
-                    }
-                    // Expand reading slots, independent of the direction's screen mirror.
-                    // Trailing + Blank starts with blank; Leading + Blank ends with blank.
-                    let blank = *companion == SingleCompanion::Blank;
-                    if previous_blank && blank && *placement == SinglePlacement::Trailing {
-                        return Err(CompositionError::Invalid("consecutive blank slots"));
-                    }
-                    previous_blank = blank && *placement == SinglePlacement::Leading;
-                }
-            }
-        }
-        if let Some(cover) = &self.cover {
-            domain.validate_page(cover)?;
-            if !registered.contains(&cover.matching_key()) {
-                return Err(CompositionError::Invalid("cover is not registered"));
+        let mut registered = HashSet::with_capacity(self.page_order.len());
+        for page in &self.page_order {
+            domain.validate_page(page)?;
+            if !registered.insert(page.matching_key()) {
+                return Err(CompositionError::Invalid(
+                    "duplicate ordinary page occurrence",
+                ));
             }
         }
         let mut hidden = HashSet::new();
@@ -402,7 +395,16 @@ impl BookComposition {
                 ));
             }
         }
-        // Count serialized bytes without allocating a second whole record.
+        let mut overrides = HashSet::new();
+        for entry in &self.page_overrides {
+            domain.validate_page(&entry.page)?;
+            let key = entry.page.matching_key();
+            if !registered.contains(&key) || !overrides.insert(key) {
+                return Err(CompositionError::Invalid(
+                    "override keys must be a unique subset of registered pages",
+                ));
+            }
+        }
         let mut count = JsonByteCount(0);
         serde_json::to_writer(&mut count, self)
             .map_err(|_| CompositionError::Limit("JSON bytes"))?;

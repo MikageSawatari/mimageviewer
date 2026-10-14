@@ -5,19 +5,21 @@
 `app/book_materialization`に既存ZIP階層、PDF/EPUB page row、folder listingの生成を集約する。
 source enumeration、policy、raw manifest、cache/lease、既存PreparedPageIdentityIndexとadoptionは
 従来のownerを保つ。ZIPは直下ページblockだけがsurface間で一致し、子containerの位置は従来どおり。
-G2 part Aの`book_composition`はApp/UI/I/Oを持たないpure model・resolver・unit編集を提供する。
+B2の`book_composition`はpure record・可視実列resolver・ページ指定編集を提供する。
+保存するのは方向・表紙on/off・順序・hidden・ページoverrideだけで、組は通常の共通builderから派生する。
 G2 part Bは単一workerの`book_composition.db`、lifecycle、metadata v11転送とread登録を追加する。
-G3はraw manifestと保存構成からworkerで共通projectionを作り、items・identity index・閲覧unitを同じ採用境界で更新する。
+G3はraw manifestと保存構成からworkerで共通projectionと回転入力を作る。items・identity index・回転・構成binding・着地・facet列を採用してから提示許可を作る。回転memoのcold時も採用済projectionのページキー別入力を使い、UIでRotationDbを読まない。
 G4の`app/book_composition_editor`はprocess共通の操作ownerと送信済みsave ticketを持ち、
 draft/phase/viewは一つのViewerContextBundleに所属する。一時mount/兄弟描画ではownerを移さない。
-`book_composition/editor`は純粋draft・undo/redo・変更preview、`ui_composition_editor`はI/Oなしの
+`book_composition/editor`は純粋draft・undo/redo、`ui_composition_editor`はI/Oなしの
 virtualized一覧と固定操作行を担当する。source準備/保存前照合は専用worker、thumbnailはeditor寿命の
-独立worker/channel/cancelへ分け、背景viewerのitems/cache/queueを編集プレビュー用に変更しない。
+独立worker/channel/cancelへ分け、背景viewerのitems/cache/queueを変更しない。
+結果生成はsession workerが最新generationだけを採用し、編集中のundo/redoを止めない。
 main「製本」menuとHUD overflowの入口は同じ開始受付へ通す。後者はキーより前のroot surface受付と
 Eのframe-local wheel ownerを使う。保存完了ownerは各窓のreloadと共有resume intentの一回writeを分ける。
 送信済保存票は所有窓の退役後もmetadata preview/import/exportとGeneric改名の開始を保護し、
 同じ完了ownerの採用後だけmaintenanceへ進む。folder sidecar restoreの従来開始条件は変更しない。
-§1.242はnext-bookで開発中、利用者決定の次々回release向け。G4Fは2026-10-12に切り離し、
+§1.242はnext-bookで開発中、2026-10-13利用者決定の次のrelease向け。G4Fは2026-10-12に切り離し、
 画像だけのfolderは構成対象外。folder閲覧・個別編集・sidecar v1は維持する。
 画像folderのZIP変換は、process単位の `app/image_folder_zip_operation` が一つのmodalとRemote admission leaseを所有する。
 先に受理した保存票・writerの完了を採用してから、既存sidecar/tag resourcesを単一workerへ移す。
@@ -595,7 +597,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `comic_user_stamps.db` | Ctrl+T スタンプピッカーのユーザー画像履歴。配置時の長辺 1024px 上限 PNG を再利用用 MRU として保持する。履歴から選んでも配置先には `Embedded` をコピーするため、履歴削除は既存注釈に影響しない | `comic_user_stamps.rs` + `ui_text.rs` |
 | `spread.db` | フォルダ別表示モード (ページ構成、連結方式、綴じ方向、末尾表紙補助、見開き端の単ページ配置) | `spread_db.rs` |
 | `spread_shift.db`（§1.364 D1–D3、未リリース） | 論理本scopeごとの相対PageRef。KeepDriveのroot＋実効ZIP prefix、一冊一行。schema v1。新規storeのためmigrationなし、不正schema/JSONは原本を保って書込停止。既存spread設定・resumeとは独立 | `book_scope.rs`、`spread_shift/{model,service,store}.rs`、`app/spread_shift_owner.rs` |
-| `book_composition.db`（§1.242 G2、未リリース） | `book_compositions(book_key PRIMARY KEY, revision, schema_version, composition_json)`、schema 1。一行のJSONに検証domainと構成を持つ。KeepDrive共有BookScopeKey、local revision、単一writer・immutable snapshot・worker-only maintenance。新storeのmigrationなし。未知/破損は原本保持・書込停止。STORESのrename/purge/copy/probe/cleanup、内容ID Edit観測、明示metadata v11専用family、確認済み完全resetへ登録。Folder sidecarはG4F | `book_composition/{store,service}.rs` |
+| `book_composition.db`（§1.242 G2、未リリース） | `book_compositions(book_key PRIMARY KEY, revision, schema_version, composition_json)`、schema 2。一行のJSONに検証domainと方向・表紙・順序・hidden・overrideを持つ。未公開旧units移行なし。KeepDrive共有BookScopeKey、local revision、単一writer・immutable snapshot・worker-only maintenance。新storeのmigrationなし。未知/破損は原本保持・書込停止。STORESのrename/purge/copy/probe/cleanup、内容ID Edit観測、明示metadata v11専用family、確認済み完全resetへ登録。Folder sidecarはG4F | `book_composition/{store,service}.rs` |
 | `book_resume.db` | コンテナpathとraw items indexで位置を復元。記録時のHUD読み順ordinal/totalをnullable列に保存し、通常Folder/ZIP/PDF一覧の下端メーターに常に左から右へ表示。旧2列DBへのALTERと一覧全行読込は既存writerで実行。App共通メモリmapを記録受付時にも更新し、描画はmap参照のみ。動画/音声の同じ帯は既存video_resume_positionsと取得済みvideo_metaを読み、別の位置map/DB列は作らない。Remoteは補助列NULL (IPC不変) | `book_resume_db.rs`, `app/book_resume_meter.rs`, [設計・割り切り](book-resume-meter-plan.md) |
 | `reading_history.db` | ユーザー操作で開いた画像フォルダ / ZIP / PDF / 変換アーカイブと動画・音声ファイルの MRU。既存 kind 文字列を維持し、`video` / `audio` と専用の `media_position_ms` / `media_duration_ms` を追加する。未知 kind は行ごと読み飛ばす。保持件数は 1..=1000 | `reading_history_db.rs` + `App::record_reading_history` |
 | `folder_thumb_pins.db` | 親コンテナ (Folder/ZipFile/PdfFile/ConvertibleArchive) の代表サムネ手動ピン。container_key 主キー (= normalize_keep_drive 済みパス) で 1 行 1 コンテナ、source は kind + container 相対 rel + (zipentry の) entry / (pdfpage の) page。`apply_folder_thumb_pin` と変換アーカイブの `archivethumb:*#pin:*` が cache key suffix `#pin:{source_id}` で identity を表現し、cascade 時は途中コンテナを含む経路 hash を source_id に加える | `folder_thumb_pins.rs` |

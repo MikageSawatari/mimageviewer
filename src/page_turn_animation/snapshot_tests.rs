@@ -1592,6 +1592,133 @@ macro_rules! route_test {
     };
 }
 
+fn snapshot_white_paper(reading_rtl: bool, forward: bool) -> egui_kittest::SnapshotResults {
+    let name = format!(
+        "page_turn_projection_white_paper_{}_{}",
+        if reading_rtl { "rtl" } else { "ltr" },
+        if forward { "forward" } else { "back" },
+    );
+    let canonical_endpoint = Arc::new(AtomicBool::new(false));
+    let endpoint_flag = canonical_endpoint.clone();
+    let mut textures = None;
+    let mut harness = crate::test_ui::builder()
+        .with_size(vec2(SIZE.x, 530.0))
+        .build(move |ctx| {
+            if textures.is_none() {
+                crate::ui_fonts::configure_fonts(ctx);
+                textures = Some(load_textures(ctx, true, false));
+                ctx.request_repaint();
+                return;
+            }
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            painter.rect_filled(ctx.content_rect(), 0.0, Color32::BLACK);
+            painter.text(
+                pos2(12.0, 12.0),
+                egui::Align2::LEFT_TOP,
+                format!(
+                    "WHITE PAPER / {} / {} / white has no texture or page occurrence",
+                    if reading_rtl { "RTL" } else { "LTR" },
+                    if forward { "FORWARD" } else { "BACK" }
+                ),
+                egui::FontId::monospace(14.0),
+                Color32::WHITE,
+            );
+            for old_white in 0..2 {
+                let offset = vec2(0.0, old_white as f32 * 238.0);
+                for (column, progress) in POSES.into_iter().enumerate() {
+                    let cell = Rect::from_min_size(
+                        pos2(12.0 + column as f32 * CELL_WIDTH, 48.0),
+                        vec2(CELL_WIDTH, 208.0),
+                    );
+                    let (mut old, mut new) = units(textures.as_ref().unwrap(), true, cell);
+                    for unit in [&mut old, &mut new] {
+                        for page in &mut unit.pages {
+                            page.rect = page.rect.translate(offset);
+                            page.clip_rect = page.clip_rect.translate(offset);
+                        }
+                    }
+                    for (unit, slot) in [(&mut old, old_white), (&mut new, 1 - old_white)] {
+                        let paper = &mut unit.pages[slot];
+                        paper.occurrence = None;
+                        paper.material = PageMaterial::Blank {
+                            color: Color32::WHITE,
+                        };
+                        paper.underlay = None;
+                    }
+                    painter.text(
+                        pos2(cell.center().x, cell.top() + offset.y),
+                        egui::Align2::CENTER_TOP,
+                        format!(
+                            "old white {} / {progress:.2}",
+                            if old_white == 0 { "left" } else { "right" }
+                        ),
+                        egui::FontId::monospace(12.0),
+                        Color32::WHITE,
+                    );
+                    if progress == 1.0 && endpoint_flag.load(Ordering::Relaxed) {
+                        for page in &new.pages {
+                            if let PageMaterial::Blank { color } = page.material {
+                                let mut mesh = Mesh::default();
+                                mesh.add_colored_rect(page.rect, color);
+                                painter
+                                    .with_clip_rect(page.clip_rect)
+                                    .add(egui::Shape::mesh(mesh));
+                            } else {
+                                paint_canonical(
+                                    &painter,
+                                    &CanonicalUnit {
+                                        pages: vec![page.clone()],
+                                        ..new.clone()
+                                    },
+                                );
+                            }
+                        }
+                    } else {
+                        let projection = project_turn(
+                            &old,
+                            &new,
+                            TurnDirection {
+                                reading_rtl,
+                                forward,
+                            },
+                            progress,
+                        )
+                        .unwrap();
+                        assert_eq!(projection.visibility.incoming.len(), 1);
+                        for draw in projection.meshes {
+                            painter
+                                .with_clip_rect(draw.clip_rect)
+                                .add(egui::Shape::mesh(draw.mesh));
+                        }
+                    }
+                }
+            }
+        });
+    harness.run();
+    harness.snapshot(&name);
+    let projected = harness.render().unwrap();
+    canonical_endpoint.store(true, Ordering::Relaxed);
+    harness.step();
+    harness.run();
+    let canonical = harness.render().unwrap();
+    assert!(
+        projected == canonical,
+        "white paper closes onto the normal solid-white endpoint: {name}"
+    );
+    harness.take_snapshot_results()
+}
+
+#[test]
+fn page_turn_projection_snapshot_white_paper_four_routes() {
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    for reading_rtl in [false, true] {
+        for forward in [false, true] {
+            snapshots.extend(snapshot_white_paper(reading_rtl, forward));
+        }
+    }
+    snapshots.unwrap();
+}
+
 route_test!(
     page_turn_projection_snapshot_single_ltr_forward,
     false,

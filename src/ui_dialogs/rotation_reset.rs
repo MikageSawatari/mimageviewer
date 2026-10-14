@@ -8,8 +8,7 @@ impl crate::app::App {
             return false;
         }
         let deleted = self.rotation_db.as_ref().unwrap().clear_all().unwrap_or(0);
-        self.rotation_cache.clear();
-        self.reconcile_spread_landscapes_from_rotation_cache();
+        self.reset_rotation_cache_after_clear();
         crate::logger::log(format!("[rotation] Reset: {deleted} entries cleared"));
         true
     }
