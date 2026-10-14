@@ -216,7 +216,7 @@ cargo build --release -p musicvideo-editor --bin mimageviewer-musicvideo
 ```
 
 launcher はこの 4 本の後にビルドする。`musicvideo-editor` は workspace 全体テストに含まれる。
-build-release／build-dist／build-portable／build-dev は `CARGO_TARGET_DIR` 等の環境変数・Cargo 設定・引数による出力先変更を `-PreserveRuntime` に関係なく開始前に拒否する（設定検査に Python 3.11 以降が必要、portable 自身の固定 `--target-dir` は維持）。
+build-release／build-dist／build-portable／build-dev は開始前に実際の Cargo 実行場所・環境で `cargo metadata --format-version 1 --no-deps --offline` の `target_directory` を固定出力先と照合し、不一致と `CARGO_BUILD_TARGET` を `-PreserveRuntime` に関係なく拒否する（portable 自身の固定 `--target-dir` は維持、設定ファイルの `build.target` は検査対象外）。
 配布は test-full → clean → core → remote → EPUB worker → editor → launcher → installer → portable。
 エディタは全 build スクリプトで自動終了しない。出力先が使用中なら、保存・終了後に再実行する。
 portable の配布フォルダ置換は `-SkipBuild` / `-KeepRunning` でも同じ保護対象となる。

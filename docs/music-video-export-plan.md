@@ -3230,7 +3230,7 @@ GUI起動・実機検収と対応後の独立再レビューは未実施。コ�
 | **P4b** 実装完了・実機確認待ち（P4b-1〜4 すべて独立レビュー ACCEPT、2026-10-14。上書きの競合は利用者が許容。5 分 1080p60 は完走済み・速度は参考値で静かな環境での再計測が残る。音・GUI の実機確認は利用者へ依頼） | ホストの製品化（D16。段の分け方は D16 の「P4b の設計」）: ラボを `crates/musicvideo-editor` へ移し、FFmpeg デコードへ統一、スナップショット入力の MP4 書き出し（モーダル・進捗・キャンセル）、未保存の編集の確認、音声スレッドが stream を所有する再生と f32 以外の出力形式対応 | **P4b-3（2026-10-14、未コミット）**: 指定ゲート 365 passed、追加 18 件すべての変異失敗確認、既存 editor 101 件維持。共通 snapshot／解析／較正／PCM view AAC／原子的公開／モーダル終端を接続し、製品 editor・通常 CLI・dev CLI の release build 成功。編集済み 5 分 1080p60 を dev CLI で 18,000 frames 完走、184.441 秒／1.6265x（背景 Codex 4 件あり、参考値）。詳細は D16 の P4b-3 記録。P4b-2 の実機の音・GUI・H3b は未確認。**P4b-4（2026-10-14、未コミット）**: session 所属の単一意図、歌詞の先行解決、保存後のフレーム末尾の再判定、先行読込の receiver 退役、新規、CancelClose／承認済み Close と書き出し中止の終端待ちを実装。指定ゲート **396 passed**、追加 **31 件**すべて変異失敗確認。初回レビュー REVISE の P2／P3 に対応し、LRC モーダルの実クリック回帰、Project／保存完了の両順序、歌詞取消と同フレームの旧完了を検査。今回 3 件追加・既存 1 件補強、各テストの変異失敗確認、指定テスト **399 passed**。詳細は D16 の P4b-4 記録。修正後の独立レビュー・実機確認・H3b は未完了 |
 | **P4c** 実装完了・実機確認待ち（独立レビュー ACCEPT、2026-10-15） | 起動引数と診断（D10）: `--audio` / `--project` / `--data-dir`、最近使ったプロジェクト、ログ・panic ログ、引数エラーの画面表示、runtime shared lease と取得失敗の表示 | **初回2026-10-14**: 追加21件の変異検証記録あり。**2026-10-15、未コミット修正**: P2のUI出力全経路9か所をworker配送、追加6件すべてで同期出力の変異失敗、P3の実機未完了表記を訂正。指定gate **516 passed / 0 failed / 1 ignored**、fmt／glyph0／製品release build成功。再レビュー・実機検収未実施。詳細は「P4c 実装記録」の独立レビュー1回目対応 |
 | **P4d** 実装完了・実機確認待ち（独立レビュー ACCEPT、2026-10-15） | mIV 側の入口: 音楽ビュー・音声ファイルの右クリックから「音楽ビデオを作成」でエディタを起動 | Grid／Fullscreenの単一実Audioだけ。static ID／非表示設定、worker起動、絶対path引数、失敗通知、build-dev同梱を実装。既存保存順のstatic／動的枠を保つ末尾追加。追加8件の成功と各変異失敗、全対象14560 passed／0 failed／66 ignored、fmt／glyph0、通常featureの4exe確認build成功を記録済み。`261b10359`の独立レビューP2に対応し製品binのGUI属性／Subsystem gateを追加。製品GUI起動／実機検収／対応のcommitなし。詳細は「P4d実装記録」 |
-| **P4e** | 配布（下の表）: launcher 内包・runtime 展開・署名・portable 同梱・全 PE / VC runtime gate・build スクリプト・test-full 前提 | **実装・非対話検証済（2026-10-15）**。build-dist -NoSign の全段成功、全体 gate 14,562 passed / 0 failed / 66 ignored。editor 25,504,768 bytes、launcher 増分も同値。清掃は editor を含む fixture で検査し D10 の割り切りを維持。`8e0172a0e` の独立レビュー 1 回目は REVISE、P2／P3 対応と指定検証済・再レビュー待ち。署名実行・GUI 検収は未実施。詳細は末尾「P4e 実装記録」 |
+| **P4e** | 配布（下の表）: launcher 内包・runtime 展開・署名・portable 同梱・全 PE / VC runtime gate・build スクリプト・test-full 前提 | **実装・非対話検証済（2026-10-15）**。build-dist -NoSign の全段成功、全体 gate 14,562 passed / 0 failed / 66 ignored。editor 25,504,768 bytes、launcher 増分も同値。清掃は editor を含む fixture で検査し D10 の割り切りを維持。独立レビュー 1・2 回目は REVISE、2 回目の P2／P3 対応と指定検証済・再レビュー待ち。署名実行・GUI 検収は未実施。詳細は末尾「P4e 実装記録」 |
 | **P4f** | 文書: マニュアル・製品ページ・keymap-spec（固定ショートカットの理由）・privacy（通信なし・保存先） | CLAUDE.md「コード修正時のドキュメント同時更新」 |
 
 L1 自動検証記録（2026-10-09）:
@@ -3867,20 +3867,20 @@ portable **3 分 13 秒**（Cargo 表示。通常版は core の依存準備後�
   `CARGO_TARGET_DIR`／`CARGO_BUILD_TARGET_DIR`／`CARGO_BUILD_BUILD_DIR`／`CARGO_BUILD_TARGET` 等、
   `build.target-dir`／`build.build-dir`／`build.target`、`--target-dir`／`--target`／`--profile` 等の出力変更引数、
   `--config` の inline／file と出力名・場所を変える rustflags を拒否する。同じ `target` を指定しても拒否する。
-  TOML は Python 3.11 以降の標準 `tomllib` で読む。引用・dotted key・inline table・include・`[env]` を含めて検査し、
+  初回実装の TOML 検査は Python の標準 `tomllib` で行った（2 回目対応で廃止）。引用・dotted key・inline table・include・`[env]` を含めて検査し、
   caller／祖先／CARGO_HOME の config を Cargo と同じ legacy-file 優先で読む。
   dev／portable は実際の Cargo 実行場所である repo root を検査する。
   設定探索とキーの正本は [Cargo configuration](https://doc.rust-lang.org/cargo/reference/config.html)。
   通常の linker／CRT rustflags、portable 自身の固定 `--target-dir target-portable`（診断版も既存固定値）、
   companion の停止 policy、editor を自動終了しない保護、D10 の割り切りは維持する。
 - **P3**: launcher の Cargo.toml、CLAUDE.md、開発／リリース手順を「前提 4 本・Rust build 5 段・editor を含む対象一覧」に統一。
-  CLAUDE.md の先頭の内包説明・dev 出力一覧、現行 EffeTune 計画の署名順、P4e brief の順序表記も補正した。
+  CLAUDE.md の先頭の内包説明・dev 出力一覧も補正した。EffeTune 計画と P4e brief の変更は設計担当が意図的に戻し、修正コミットには含めなかった。
   過去の検証件数・過去版の手順記録は改変しない。出力先固定の制約は CLAUDE.md の配布ビルドと開発手順に各 1 行で追加した。
 
 追加ファイル: `scripts/build-output-safety.ps1`、`scripts/check_build_output_config.py`、
 `scripts/test-build-output-safety.ps1`、`scripts/test_build_output_config.py`。
 変更: build 4 本、launcher Cargo.toml、CLAUDE.md、development-build-and-test、release-operations、
-effetune-now-playing-plan、brief-musicvideo-p4e、本記録（計 15 本）。dist の安全性 gate に新テストを追加した。
+本記録（計 13 本、修正コミット `126c6cc17` の内容に訂正）。dist の安全性 gate に新テストを追加した。
 
 すべて `MSBUILDDISABLENODEREUSE=1`。build スクリプトの本体は実行せず、実際の最初の guard 呼出しだけを
 偽の環境／設定で評価した。プロセス停止・署名・GUI 起動・実 `%APPDATA%/mimageviewer` 操作はない。
@@ -3904,3 +3904,55 @@ effetune-now-playing-plan、brief-musicvideo-p4e、本記録（計 15 本）。d
 利用者の指示により build-dist の再通しは行わず、上の既存 full gate・配布 byte 一致・サイズ／時間の証拠は初回分として再利用する。
 今回の変更後の配布生成・実署名・Bash 実行・GUI 検収は実行していない。独立再レビュー／設計担当の再検収は未完了。
 HEAD は `8e0172a0e` のまま、コミットなし、未追跡 `out.mp4` は操作なし。
+
+#### 独立レビュー 2 回目 REVISE と対応（2026-10-15、未コミット）
+
+対象: `musicvideo` / `126c6cc17c0b929a4c276d86eaaf6af46d33f516`。
+利用者提示の **GPT-6.1 Sol / xhigh の独立再レビューは REVISE**（P2: 相対 CARGO_HOME の検査漏れと正常な BOM 付き TOML の誤拒否、P3: 記録とコミット内容の不一致）。
+以下は設計担当の新判断に沿った実装担当の修正・自己検証であり、独立再レビューではない。
+
+- **P2**: Python による設定探索／TOML 検査を廃止し、`check_build_output_config.py` と `test_build_output_config.py` を削除した。
+  追加されていた Python の必須条件を CLAUDE.md／開発手順から撤去した。
+  4 本の先頭 guard は、実際の Cargo 作業ディレクトリへ移り、環境を変更せず
+  `cargo metadata --format-version 1 --no-deps --offline` の `target_directory` と固定出力先を照合する。
+  BOM／CARGO_HOME／環境変数／設定ファイル探索は Cargo 自身が処理する。
+  出力先不一致、metadata 失敗／不正 JSON は ASCII の理由で中止する。caller の作業ディレクトリと stdout の文字コードは復元する。
+  通常 build に合わせ既定で `--locked` は追加せず、release の追加引数に `--locked`／`--frozen` があれば metadata へも渡す。
+  追加引数の `--config` は内容を解釈せず Cargo へ転送し、直接の `--target-dir`／`--target`／`--profile` 等は従来どおり拒否する。
+- **portable の metadata**: Cargo 1.94.1 の [metadata コマンド](https://doc.rust-lang.org/cargo/commands/cargo-metadata.html) は `--target-dir` を受け付けないため、
+  metadata にだけ `--config build.target-dir=<固定値>` を渡す。通常は `target-portable`、診断は既存の `target-portable-test-script`。
+  実 build の固定 `--target-dir` は変更しない。legacy `CARGO_TARGET_DIR` は metadata の CLI config より優先するため、
+  別 target が指定されていると portable でも中止する。その他の config／`CARGO_BUILD_TARGET_DIR` は固定 CLI config が勝つ場合、
+  実 build と同じ固定出力先として通過する。
+- **build.target の割り切り**: `CARGO_BUILD_TARGET` は全 4 本で拒否するが、設定ファイルの `build.target` はまれな構成として検査せず、既存の「exe が生成されない」検査で多くは止まる方針を受け入れる。
+- **P3**: 1 回目記録の「EffeTune 計画と P4e brief も補正」は、設計担当が意図的に元へ戻してコミットから除外した事実へ訂正し、
+  変更ファイル数を実際の `126c6cc17` の **13 本**へ訂正した。その 2 文書は今回も変更しない。
+  `review1-source-freeze.json` はコミット前 15 本の snapshot であり、コミット内容を表す証拠としては扱わない。
+
+今回の変更は **8 本**: CLAUDE.md、development-build-and-test、本記録、build-output-safety、build-portable、
+test-build-output-safety、Python 2 本の削除。release／dist／dev は既存の先頭呼出しを通じて新 guard を使う。
+editor の自動終了禁止、既存 companion の停止 policy、署名順・対象、D10 は変更しない。
+
+すべて `MSBUILDDISABLENODEREUSE=1`。偽 workspace は `target/miv-output-<unique>/` 配下の依存なし package で、
+実 Cargo の metadata のみ実行し、テスト後に回収した。dev／portable は caller と repo を分け、両方に別の相対 CARGO_HOME を用意する。
+repo の BOM 付き jobs 設定は通過し、BOM 付き出力設定／相対 CARGO_HOME の出力変更は Cargo の実効値で判定する。
+日本語を含む fake repo path の metadata JSON を UTF-8 で読むことも検査した。製品・偽 package とも cargo build は実行しない。
+
+| 検証 | 結果 | 証跡（`target/p4e-evidence/`） |
+| --- | --- | --- |
+| 既存 safety 3 本 | dev／release／musicvideo とも PASS | `review2-safety-{dev,release,editor}.{json,log,stderr.log}` |
+| 出力先 safety | 実 Cargo 74 ケース PASS（4 scripts、両 runtime policy、BOM 正常／出力変更、相対 CARGO_HOME、環境変数、CLI config、locked、StrictMode での引数省略）。偽 Cargo の command／cwd／失敗と portable 通常／診断の実呼出しも PASS | `review2-safety-output-final.*` |
+| 実 worktree の先頭 guard | 両 runtime policy と診断 portable を含む 10 ケース PASS、metadata のみ | `review2-real-preflight.*` |
+| 変異 19 ケース | すべて exit 1、各回 byte 復元、復元後 exit 0 | `review2-script-mutations.json`、`review2-mutation-*`、`review2-mutations-restored.*` |
+| launcher 全テスト | 42 passed / 0 failed / 1 ignored、8.471 秒 | `review2-launcher-tests.*` |
+| fmt／fmt check／glyph | すべて exit 0、危険 glyph 0 | `review2-fmt.*`、`review2-fmt-check.*`、`review2-glyphs.*` |
+| PowerShell 構文／ASCII | 変更 3 本を含む build／helper／test 6 本 PASS、diff whitespace 検査成功 | `review2-syntax-ascii.*` |
+
+変異は先頭 guard 削除 4 件、PreserveRuntime 限定、引数省略処理の削除、release 引数転送削除、dev の誤 cwd、portable の固定／診断引数削除、
+metadata の誤 cwd、相対 CARGO_HOME を caller 基準で固定、cross target の許可、target 比較削除／prefix 比較、
+offline 削除、metadata exit 無視、CLI config／portable config の無視。
+相対 CARGO_HOME の変異は `build-dev.ps1 relative CARGO_HOME output config` の拒否 assert で失敗した。
+
+build-dist／全体 gate の再実行、配布生成、実署名、GUI／launcher 起動、実 `%APPDATA%/mimageviewer` 操作は行わない。
+以前の配布サイズ・byte 一致・full gate は初回実装の証拠として保持する。今回の変更後の配布 build の成功とは扱わない。
+独立再レビュー／設計担当の再検収は未完了。HEAD は `126c6cc17` のまま、コミットなし、未追跡 `out.mp4` は操作なし。

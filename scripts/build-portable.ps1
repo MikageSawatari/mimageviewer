@@ -27,7 +27,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'build-output-safety.ps1')
-Assert-MivFixedCargoOutput -WorkingDirectory (Join-Path $PSScriptRoot '..')
+Assert-MivFixedCargoOutput -WorkingDirectory (Join-Path $PSScriptRoot '..') -Portable -SmokeTestScript:$SmokeTestScript
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
 if ($SmokeTestScript -and $Sign) {

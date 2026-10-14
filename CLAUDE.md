@@ -1743,7 +1743,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 - **配布ビルド**: `.\scripts\build-dist.ps1` (全体テスト → clean → core → remote → EPUB worker → editor → launcher → ISCC → portable を 1 コマンド、
   stale 配布物を構造的に防ぐ)。開発中の素早い反復だけ `.\scripts\build-release.ps1` 単体を使う
   (配布用の clean／全体テストゲートがないので配布物には使わない)。
-- **出力先固定**: build-release／build-dist／build-portable／build-dev は `CARGO_TARGET_DIR` 等の環境変数・Cargo 設定・引数による出力先変更を `-PreserveRuntime` に関係なく開始前に拒否する（設定検査に Python 3.11 以降が必要、portable 自身の固定 `--target-dir` は維持）。
+- **出力先固定**: build-release／build-dist／build-portable／build-dev は開始前に実際の Cargo 実行場所・環境で `cargo metadata --format-version 1 --no-deps --offline` の `target_directory` を固定出力先と照合し、不一致と `CARGO_BUILD_TARGET` を `-PreserveRuntime` に関係なく拒否する（portable 自身の固定 `--target-dir` は維持、設定ファイルの `build.target` は検査対象外）。
 - **出力**: `installer/Output/mImageViewer_setup.exe`
 - **Vector 申請用 zip**: `mImageViewer_installer_v<VERSION>.zip` に `mImageViewer_setup.exe` と
   `installer/readme.txt` を同梱する (v1.1.0 で `mImageViewer_v<VERSION>.zip` から改名。ポータブル
