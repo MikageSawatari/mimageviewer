@@ -249,7 +249,8 @@ Rust (edition 2024、MSVC) + eframe / egui 0.33 (wgpu)。画像は `image` crate
 - **並行処理**: `try_lock` 失敗 → sleep → 再試行のループを書かない。`Mutex + Condvar` の優先度キュー +
   ディスパッチャーにする (`src/pdf_loader.rs` の `PdfWorkerPool` が実例)。
 - **UI スレッドで同期 I/O をしない**: ファイル全体の読み込み、`read_dir` + `Path::is_dir()` (代わりに
-  `entry.file_type()`)、1 フレームに複数の `ctx.load_texture`、DB の cold open、DFS 走査は worker 化する。
+  `entry.file_type()`)、DB の cold open、DFS 走査は worker 化する。GPU アップロード (`ctx.load_texture`) は
+  `fs_upload_backlog` で 1 フレーム 1 枚に制限し、現在ページだけ即時にする。
   新機能では [docs/ui-responsiveness.md](docs/ui-responsiveness.md) §4 のチェックリストを通し、区間に
   `perf::event` を入れる。レビューでも UI スレッドから同期到達しないかを呼び出し元まで追う。
 - **perf-log の解析を頼まれたら** `%APPDATA%\mimageviewer\logs\` の最新 `perf_*.jsonl` を
@@ -304,6 +305,9 @@ UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot  # 意図的な見た目変更�
   日本語の説明は Markdown 側に置く
 
 ## 開発中のビルド・テスト選択
+
+mIV は Windows 専用。非 Windows でのコンパイル検査は行わず、2026-09-29 に廃止した ubuntu の
+`cargo check` CI job を復活させない。
 
 通常の編集ループで毎回 `cargo test --workspace` を実行しない。まず変更範囲に応じて
 次の最小targetを使い、共有境界を変更したときや最終確認時だけ範囲を広げる。
@@ -415,10 +419,13 @@ VST3 bridge、署名、packagingなどrelease構成そのものを確認する�
 - **通信・データ保存・権限に関わる機能を足したら**、製品ページの「安心して使えます」と `privacy.html` の
   「ネットワーク通信」「端末内に保存されるデータ」を両方確かめる。「〜だけ」「〜はありません」は機能追加で偽になる。
 - **製品ページのカード**は見出し 1 つ + 本文 1 段落、本文 150 字まで。`python scripts/check_site_cards.py`。
-- マニュアル・製品ページに**バージョン表記と実装用語を書かない** (言い換え表は詳細文書)。
+- マニュアル・製品ページに**バージョン固有の説明と実装用語を書かない** (言い換え表は詳細文書)。
+  版番号は製品ページのダウンロード欄のバッジ 1 か所に集約する。
 - **外部ダウンローダの名前・URL・使用例**を公開文書・コミットメッセージ・設計文書に書かない。
 - **モザイク関連**の UI・公開文書に、特定の画像投稿サイト名・基準名・基準への適合判定を書かない。
   モードの説明は評価語ではなく処理内容で書く。
+- AI 生成画像のメタデータは標準仕様の用語 (PNG tEXt チャンク・EXIF UserComment 等) で説明する。
+  生成ツール固有の形式名はパーサ内部に限り、UI に出さない。
 
 ## タグとリモート調査の要点
 
@@ -429,6 +436,8 @@ VST3 bridge、署名、packagingなどrelease構成そのものを確認する�
 - **mIV Remote の不具合は、推測の前に** `%APPDATA%\mimageviewer-remote\remote-web-log.jsonl`
   (data_dir の兄弟 `<data_dir>-remote`、ポータブルは `<exe_dir>\data-remote\`) を開く。端末側の例外や遷移も
   ここに記録されている。詳細: [docs/remote-debugging.md](docs/remote-debugging.md)
+
+<a id="リリース手順チェックリスト"></a>
 
 ## リリース作業
 
@@ -544,8 +553,13 @@ VST3 bridge、署名、packagingなどrelease構成そのものを確認する�
 | モザイク・成人向け画像処理の表記ポリシー | [docs/public-wording-policies.md](docs/public-wording-policies.md) |
 | Distribution | [docs/release-checklist.md](docs/release-checklist.md) |
 | コード修正時のドキュメント同時更新 | [docs/public-wording-policies.md](docs/public-wording-policies.md) |
-| リリース手順チェックリスト | [docs/release-checklist.md](docs/release-checklist.md) |
+| リリース手順チェックリスト (Phase 0〜6) | [docs/release-checklist.md](docs/release-checklist.md) |
 | Codex CLI レビュー | [docs/codex-cli-usage.md](docs/codex-cli-usage.md) |
 | 実機検証用バイナリの準備 (Windows ネイティブ機能) | [docs/development-build-and-test-native.md](docs/development-build-and-test-native.md) |
 | Formatting | [docs/git-workflow.md](docs/git-workflow.md) |
 | Git Workflow | [docs/git-workflow.md](docs/git-workflow.md) |
+| 「マニュアル・製品ページの記述方針」(「コード修正時のドキュメント同時更新」の下位節) | [docs/public-wording-policies.md](docs/public-wording-policies.md) |
+| 「検証起動時の設定データ保護」(「実機検証用バイナリの準備」の下位節) | [docs/development-build-and-test-native.md](docs/development-build-and-test-native.md) |
+| 「worktree + Windows junction の地雷」「複数の Claude Code セッションを並行で動かす」(「Git Workflow」の下位節) | [docs/git-workflow.md](docs/git-workflow.md) |
+| 「開発時に core を直接起動したいとき」「FFmpeg ライセンス対応」(「FFmpeg LGPL DLL 管理」の下位節) | [docs/native-dependencies.md](docs/native-dependencies.md) |
+| 「IME 対応」「UI スレッドでの同期 I/O」「並行処理」(「Key Design Decisions」の下位節) | [docs/coding-conventions.md](docs/coding-conventions.md) |

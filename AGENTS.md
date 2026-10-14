@@ -259,7 +259,7 @@ always-active guidance.
   build gates. Existing normal-profile launch prohibitions still apply.
 - The canonical release idle/perf procedure is the user-run PowerShell command
   `scripts/ui-smoke.ps1 -Scenario ReleaseChecks -InteractiveApproved`; see
-  `CLAUDE.md` Phase 2 9.6/9.7 and `docs/release-check-automation-plan.md`.
+  `docs/release-checklist.md` Phase 2 9.6/9.7 and `docs/release-check-automation-plan.md`.
   Minimize other application windows before starting and leave the PC untouched
   through build and run. Adoption does not grant agent launch approval or relax
   disposable-portable and real-settings protection; manual scripts remain the
