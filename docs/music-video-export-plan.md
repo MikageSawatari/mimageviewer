@@ -1,6 +1,6 @@
 # 音楽ビデオ書き出し (Music Video Export) — 設計計画
 
-Status: P1〜P3j、P4b-1〜4 の実装・非対話検証あり。H3a の契約と H3b の画素一致は非対話検証済み。P4c・P4d の実装・非対話検証あり。P4d の独立レビュー1回目はREVISE、対応後の再レビュー・実機検収は未完了。P4e は実装・非対話配布検証済み（独立レビュー・GUI 検収は未実施）。P4f は未完了。
+Status: P1〜P3j、P4b-1〜4 の実装・非対話検証あり。H3a の契約と H3b の画素一致は非対話検証済み。P4c・P4d の実装・非対話検証あり。P4d の独立レビュー1回目はREVISE、対応後の再レビュー・実機検収は未完了。P4e は実装・非対話配布検証済み（独立レビュー・GUI 検収は未実施）。P4f は文書作成・執筆担当の静的検査済み、独立レビュー・検収待ち（末尾の実施記録）。
 2026-10-09 に P4 の方式を「別 exe のエディタ」へ改訂（D10 / D16）、
 画面構成（D14）と文字装飾の初版範囲（D15）を追加。改訂は GPT-6.1 Sol / xhigh の独立レビュー 3 回で
 条件付き ACCEPT（P4a 完了、2026-10-09）。
@@ -12,7 +12,7 @@ Status: P1〜P3j、P4b-1〜4 の実装・非対話検証あり。H3a の契約�
 実機目視 = ユーザー。2026-09-07〜09-09 の Astra / Sol 体制の記録は
 [引き継ぎ監査](music-video-handoff-20260907.md) に残す。本書の過去の完了記録は当時の記録であり、
 監査で挙がった未解決事項の解消を意味しない。
-H3（H3a + H3b）の解析・画素一致は非対話検証済み（下記 H3b 検証記録）。P4 の実機検収は未完了。P4c・P4d の実装・非対話検証あり。P4d の独立レビュー1回目はREVISE、対応後の再レビューは未完了。P4e は実装・非対話配布検証済み、独立レビューは未実施。P4f は未完了。
+H3（H3a + H3b）の解析・画素一致は非対話検証済み（下記 H3b 検証記録）。P4 の実機検収は未完了。P4c・P4d の実装・非対話検証あり。P4d の独立レビュー1回目はREVISE、対応後の再レビューは未完了。P4e は実装・非対話配布検証済み、独立レビューは未実施。P4f は文書作成・執筆担当の静的検査済み、独立レビュー・検収待ち。
 開発場所 = 別 worktree `C:\home\mimageviewer-musicvideo`（ブランチ `musicvideo`）。
 最終着地点 = **mIV に同梱して配布し、mIV から起動する機能**（ラボ止まりにしない。D10）。
 
@@ -3231,7 +3231,7 @@ GUI起動・実機検収と対応後の独立再レビューは未実施。コ�
 | **P4c** 実装完了・実機確認待ち（独立レビュー ACCEPT、2026-10-15） | 起動引数と診断（D10）: `--audio` / `--project` / `--data-dir`、最近使ったプロジェクト、ログ・panic ログ、引数エラーの画面表示、runtime shared lease と取得失敗の表示 | **初回2026-10-14**: 追加21件の変異検証記録あり。**2026-10-15、未コミット修正**: P2のUI出力全経路9か所をworker配送、追加6件すべてで同期出力の変異失敗、P3の実機未完了表記を訂正。指定gate **516 passed / 0 failed / 1 ignored**、fmt／glyph0／製品release build成功。再レビュー・実機検収未実施。詳細は「P4c 実装記録」の独立レビュー1回目対応 |
 | **P4d** 実装完了・実機確認待ち（独立レビュー ACCEPT、2026-10-15） | mIV 側の入口: 音楽ビュー・音声ファイルの右クリックから「音楽ビデオを作成」でエディタを起動 | Grid／Fullscreenの単一実Audioだけ。static ID／非表示設定、worker起動、絶対path引数、失敗通知、build-dev同梱を実装。既存保存順のstatic／動的枠を保つ末尾追加。追加8件の成功と各変異失敗、全対象14560 passed／0 failed／66 ignored、fmt／glyph0、通常featureの4exe確認build成功を記録済み。`261b10359`の独立レビューP2に対応し製品binのGUI属性／Subsystem gateを追加。製品GUI起動／実機検収／対応のcommitなし。詳細は「P4d実装記録」 |
 | **P4e** 実装完了（独立レビュー 4 回目で ACCEPT、2026-10-15。build-dist -NoSign の通しは修正前の版で成功、最終版での通しは統合前の最終確認で行う） | 配布（下の表）: launcher 内包・runtime 展開・署名・portable 同梱・全 PE / VC runtime gate・build スクリプト・test-full 前提 | **実装・非対話検証済（2026-10-15）**。build-dist -NoSign の全段成功、全体 gate 14,562 passed / 0 failed / 66 ignored。editor 25,504,768 bytes、launcher 増分も同値。清掃は editor を含む fixture で検査し D10 の割り切りを維持。独立レビュー 1〜3 回目は REVISE。3 回目の指摘は OUT_DIR 導出で対応し、追加発見の build-dir 分離も設計回答に従い開始前に拒否する。指定検証・release 5 段は成功、独立再検収待ち。署名実行・GUI 検収は未実施。詳細は末尾「P4e 実装記録」 |
-| **P4f** | 文書: マニュアル・製品ページ・keymap-spec（固定ショートカットの理由）・privacy（通信なし・保存先） | CLAUDE.md「コード修正時のドキュメント同時更新」 |
+| **P4f** 文書作成・執筆担当の静的検査済み（独立レビュー・検収待ち） | マニュアル新ページと通常33ページのサイドバー・目次、製品紹介カード、keymap-spec（固定ショートカットの理由）、privacy（通信なし・保存先） | **2026-10-15、未コミット**。カード50枚で上限違反0、glyph検査成功、33ページ各33リンクの数・順序・active一致、HTML構造とリンク検査成功。各記述のコード根拠・D11との差分は末尾「P4f 実施記録」。アプリ／エディタ未起動、独立レビュー未実施。サイトマップはhtdocsコミット後に生成するため今回は未実行 |
 
 L1 自動検証記録（2026-10-09）:
 
@@ -4048,3 +4048,107 @@ portable／診断 portable もそれぞれの固定 target に一致させる。
 （`review3-builddir-source-freeze.json`）。追加の設計前提は対応済み、独立再検収待ち。
 
 実署名・build-dist／全体 gate の再実行・GUI 検収・コミットはなし。HEAD は `a1550d08b` のまま。
+
+### P4f 実施記録（2026-10-15、執筆担当によるコード照合・静的検査）
+
+対象 brief: [brief-musicvideo-p4f.md](brief-musicvideo-p4f.md)。作業場所は
+`C:\home\mimageviewer-musicvideo`、branch `musicvideo`、参照した HEAD は
+`95fc6247e8bfb456dd1c12ec38c93a107c5d09bc`。未追跡の `out.mp4` は変更していない。
+本記録は執筆担当自身によるソース照合と静的検査であり、独立レビューではない。
+アプリ・エディタ・ブラウザは起動せず、スクリーンショットも作成していない。
+実行時の画面・操作を観測したという主張はしない。独立レビューと設計担当の検収は未実施。
+
+**変更範囲**
+
+- `htdocs/mimageviewer/manual/music-video.html` を新設。通常ページの `video.html` から
+  header／パンくず／sidebar／footer と SEO メタデータの構成を引き継ぎ、既存 `style.css` を使う。
+- 通常ページ全33本のサイドバーで「音楽再生」の次に「音楽ビデオの作成」を置き、
+  `manual/index.html` の目次カードも同じ位置に追加。
+  `manual/changelog.html` は直接編集せず `python scripts/gen-changelog-html.py` で再生成した。
+- 製品ページの機能紹介に1カード追加。「安心して使えます」の通信・保存カードを置換して
+  音楽ビデオの扱いを記載し、詳細はマニュアル／privacyへのリンクにした。
+- `privacy.html` の日本語と、同じページ内の英語の対応箇所に保存物・保存先・通信なしを記載。
+  表示上の呼称は「動作記録」「エラーログ」。ファイル名中の `panic` は実際の名前を保持する。
+- `docs/keymap-spec.md` に固定ショートカット3種類とD10の利用者判断、本体の右クリック入口が
+  keymap外である理由を追記。`CLAUDE.md` のリリース手順6にあるページ数・リンク数を32から33へ更新。
+  Rust、設定、ビルド、リリースメタデータは変更していない。
+
+**文ごとの根拠一覧（すべてコードからの照合。実行時の観測ではない）**
+
+表の「記載箇所」は新ページの節・段落・表の行に対応する。同じ根拠を使う製品カード、目次カード、
+privacyの日英の文も併記する。リンクの行番号は上記HEADのコードに対するもの。
+
+| 記載箇所・事実文 | 根拠のコード参照 |
+| --- | --- |
+| 冒頭、目次・製品の紹介カード: 音声に画像・スペクトラム・鍵盤・文字・歌詞を重ね、MP4を作る別ウィンドウのエディタ | [本体の別exe起動](../src/musicvideo_launch.rs#L21) `LaunchCommand::resolve`、[製品エディタ入口](../crates/musicvideo-editor/src/lib.rs#L213) `run_gui`、[追加要素の一覧](../crates/musicvideo-ui/src/lib.rs#L795) `NEW_LAYER_PRESETS`、[MP4開始](../crates/musicvideo-editor/src/app/mp4.rs#L106) `begin_mp4_export` |
+| 「エディタを開く」: 一覧の音声と音楽ビューの右クリック「音楽ビデオを作成」、選んだ音声の読込 | [メニューの音声条件と表示名](../src/context_menu_model.rs#L1606)、[実行分岐](../src/ui_dialogs/context_menu.rs#L1867)、[fullscreenの共通メニュー入口](../src/ui_dialogs/context_menu.rs#L2081)、[本体からの引数](../src/musicvideo_launch.rs#L21)、[音声の起動時読込](../crates/musicvideo-editor/src/app/startup.rs#L24) `configure_startup` |
+| 「画面の構成」上部・左右・中央・下部の配置、基本の作り方のボタンと再生・時刻指定 | [領域配置](../crates/musicvideo-editor/src/app.rs#L1422) `draw_editing_panels`、[上部のラベルと再生・シーク](../crates/musicvideo-editor/src/app/chrome.rs#L64) `ToolbarState::draw`、[プレビュー](../crates/musicvideo-ui/src/preview.rs#L34) `draw_preview` |
+| 左レイヤー表・基本操作2〜3: 選択、上が奥／下が手前、追加・順序変更・削除確認とラベル | [レイヤー一覧](../crates/musicvideo-ui/src/lib.rs#L945) `EditorFrame::layer_list`、[削除の確認](../crates/musicvideo-ui/src/lib.rs#L1295) `draw_layer_delete_confirmation` |
+| 中央プレビュー表: 「選択レイヤーの枠」と書き出す映像には入らない枠 | [チェック欄](../crates/musicvideo-ui/src/lib.rs#L830) `preview_controls`、[画像表示の上に枠を描く](../crates/musicvideo-ui/src/preview.rs#L34) `draw_preview`。出力側は [合成フレーム](../src/video/mvexport/driver.rs#L154) のみを使い、このUI描画を呼ばない |
+| 右レイヤー表・動きの節: 種類別のプロパティ、位置・大きさ・不透明度 | [タブ](../crates/musicvideo-ui/src/lib.rs#L1082) `inspector_with_project_path`、[種類別の編集](../crates/musicvideo-ui/src/lib.rs#L1385) `edit_layer_properties`、[値の編集](../crates/musicvideo-ui/src/lib.rs#L1513) `edit_animation_value` |
+| 右モジュレータ表・プロジェクト表: 音に反応する設定、表示ゲインは鍵盤だけ、音量は変えない、素材パス参照 | [各タブの分岐](../crates/musicvideo-ui/src/lib.rs#L1099)、[表示ゲインと説明](../crates/musicvideo-ui/src/lib.rs#L1145)、[パス一覧](../crates/musicvideo-ui/src/lib.rs#L1339) `draw_project_paths`、[表示ゲインのモデル契約](../crates/musicvideo-core/src/model.rs#L30) |
+| タイムライン表・基本操作4: 音声波形、キーフレームと歌詞の表示、クリック／ドラッグで移動 | [タイムライン](../crates/musicvideo-ui/src/timeline.rs#L52) `draw_timeline`、[波形入力](../crates/musicvideo-ui/src/timeline.rs#L166) `draw_waveform_lane`、[プロパティ行](../crates/musicvideo-ui/src/timeline.rs#L254)、[歌詞行](../crates/musicvideo-ui/src/timeline.rs#L385) |
+| ステータス表: プロジェクト名・未保存・進捗・結果、「詳細」とその中の最近使ったプロジェクト／未解決の素材 | [下部バー](../crates/musicvideo-editor/src/app/chrome.rs#L212) `draw_status_bar` / `draw_status_row`、[進捗](../crates/musicvideo-editor/src/app/chrome.rs#L440)、[最近使ったプロジェクト](../crates/musicvideo-editor/src/app/startup.rs#L141) `draw_recent` |
+| 基本の作り方1〜5: 音声・背景を開く、レイヤー追加、再生、プロジェクト保存からMP4へ | [上部のラベル](../crates/musicvideo-editor/src/app/chrome.rs#L64)、[ボタンの処理](../crates/musicvideo-editor/src/app/chrome.rs#L569) `apply_chrome_actions`、[レイヤー一覧](../crates/musicvideo-ui/src/lib.rs#L945)、[保存](../crates/musicvideo-editor/src/app/document_intent.rs#L275)、[MP4設定](../crates/musicvideo-editor/src/app/mp4.rs#L212) |
+| 基本の作り方末尾: 追加できる11種類の要素の名前 | [NEW_LAYER_PRESETS](../crates/musicvideo-ui/src/lib.rs#L795) と [生成分岐](../crates/musicvideo-ui/src/lib.rs#L1023)。1項目からスペクトラムと鍵盤の2レイヤーを追加する場合を含む |
+| 同末尾: テキスト・時間表示・歌詞の装飾7項目 | [文字スタイルの共通編集](../crates/musicvideo-ui/src/lib.rs#L1513) `edit_animation_value` と [text_style::edit](../crates/musicvideo-ui/src/text_style.rs#L4)。D15の内部実装名や性能数値は載せない |
+| キーフレーム段落: 「◆ 現在にキー」、時刻ごとの値、◆の選択・ドラッグ・数値修正、補間方法、「キーを削除」「定数に戻す」 | [プロパティ内の追加・定数化](../crates/musicvideo-ui/src/lib.rs#L1448) `draw_animatable_property`、[時刻移動](../crates/musicvideo-ui/src/timeline.rs#L254) `draw_property_row`、[数値・補間・削除](../crates/musicvideo-ui/src/timeline.rs#L504) `draw_key_inspector` |
+| モジュレータ操作1〜2: 追加ボタン、「反応するもの」「範囲指定」、Hz／音名 | [draw_modulators](../crates/musicvideo-ui/src/modulators.rs#L34)、[edit_source](../crates/musicvideo-ui/src/modulators.rs#L92) |
+| モジュレータ操作3〜4: 「変調の割り当て」「＋ 割り当てを追加」、対象・使用元・量 | [draw_bindings](../crates/musicvideo-ui/src/modulators.rs#L532)、[target_label](../crates/musicvideo-ui/src/modulators.rs#L687)。音への反応を紹介する製品・目次カードもこの根拠を使う |
+| 歌詞の第1段落: 入力・貼付、「次の行へ」で未設定行に現在時刻、空行で消す、行ごとの修正とタイムライン | [edit_lyrics](../crates/musicvideo-ui/src/lib.rs#L1765)、[歌詞行入力](../crates/musicvideo-ui/src/timeline.rs#L385)、[空行の表示判定](../crates/musicvideo-core/src/lyrics.rs#L68) `active_lyric_at` |
+| 歌詞の第2段落: LRC読込／書出のラベル、UTF-8／Shift_JIS読込、UTF-8書出、時刻未設定行を除外、プロジェクトへの歌詞保存 | [LRC操作](../crates/musicvideo-ui/src/lib.rs#L1866)、[decode_lrc](../crates/musicvideo-core/src/lyrics.rs#L208)、[write_lrc](../crates/musicvideo-core/src/lyrics.rs#L170)、[UTF-8の保存](../crates/musicvideo-editor/src/app.rs#L2319) `start_lrc_save`、[ProjectとLayerKindのserialize](../crates/musicvideo-core/src/model.rs#L23) |
+| 保存の第1段落: 保存・別名保存・開く、拡張子、最近使った一覧、一覧から外しても元ファイルを消さない | [保存要求](../crates/musicvideo-editor/src/app/document_intent.rs#L275) `request_project_save`、[拡張子](../crates/musicvideo-editor/src/project_file.rs#L7) `ensure_project_extension`、[上部操作](../crates/musicvideo-editor/src/app/chrome.rs#L569)、[履歴UI](../crates/musicvideo-editor/src/app/startup.rs#L141)、[一覧の追加／削除だけを保存](../crates/musicvideo-editor/src/persistence.rs#L165) `run_worker` |
+| 保存の第2段落、privacy日英: 素材の場所を記録し埋め込まない、別PCには素材も必要 | [Project・AudioRef・ImageRef](../crates/musicvideo-core/src/model.rs#L23)、[JSON保存](../crates/musicvideo-editor/src/project_file.rs#L29) `save_project` と [project_for_storage](../crates/musicvideo-editor/src/project_file.rs#L93) |
+| 保存の第3段落: 新規・開く・閉じるの未保存確認、保存／破棄／キャンセル。自動保存・異常終了後の編集復元なし | [単一の文書意図受付](../crates/musicvideo-editor/src/app/document_intent.rs#L42) `accept_document_intent` と [確認UI](../crates/musicvideo-editor/src/app/document_intent.rs#L200) `draw_document_intent`、[明示的保存だけの処理](../crates/musicvideo-editor/src/app/document_intent.rs#L275)、[終了は取消・解放](../crates/musicvideo-editor/src/app.rs#L2775) `Drop`。起動時には [明示指定ファイルのみ開く](../crates/musicvideo-editor/src/app/startup.rs#L24)。D10の自動保存なしとも照合 |
+| MP4冒頭: 新規出力1920×1080／60fps、設定画面にはプロジェクト値を表示 | [DEFAULT_OUTPUT](../crates/musicvideo-core/src/preset.rs#L11)、[ホストの新規プロジェクト](../crates/musicvideo-editor/src/project.rs#L1)、[draw_mp4_dialogs](../crates/musicvideo-editor/src/app/mp4.rs#L212) |
+| MP4操作1〜2: 自動エンコーダ、NVENC／QSV／AMFの選択、映像ビットレート12000000 bps | [ExportSettings::default](../crates/musicvideo-editor/src/mp4.rs#L22)、[設定UI・encoder_label](../crates/musicvideo-editor/src/app/mp4.rs#L224)。エンコーダの性能・全PCでの可用性は約束しない |
+| MP4操作3: 保存先選択と既存ファイルの上書き確認 | [choose_mp4_output](../crates/musicvideo-editor/src/app/mp4.rs#L6) のOS保存ダイアログ、[置換／非置換の書込](../src/video/mvexport/driver.rs#L795) `PartialOutput::commit`。OSダイアログ後の作成競合の割り切りはP4b-3の既存判断のまま |
+| MP4操作4・注意枠: 進捗の段階とフレーム数、中止、書出中は他操作を受け付けない、閉じる確認から中止・未保存確認へ | [進捗・中止](../crates/musicvideo-editor/src/app/mp4.rs#L272) `draw_mp4_dialogs`、[入力無効化](../crates/musicvideo-editor/src/app.rs#L1345) `process_editor_frame`、[終了の確認と遷移](../crates/musicvideo-editor/src/app/document_intent.rs#L42) / [確認ラベル](../crates/musicvideo-editor/src/app/document_intent.rs#L228) |
+| MP4末尾: 書出設定を次回起動用に保存しない、連番PNG書出。privacyと安全カードの作品の保存先 | [開始ごとのExportSettings::default](../crates/musicvideo-editor/src/app/chrome.rs#L620)、[保存するコマンドの全体](../crates/musicvideo-editor/src/persistence.rs#L12)、[PNGの選択先](../crates/musicvideo-editor/src/app/chrome.rs#L668) と [export_png_sequence](../crates/musicvideo-editor/src/export.rs#L547)。PNGは選択フォルダ内の新しい子フォルダに保存 |
+| キー操作全体とkeymap-spec: Ctrl+Z／Ctrl+Y／Ctrl+Shift+Zの3種だけがエディタの専用shortcut、文字入力・IMEを優先、上部ボタンも利用可 | [history_action_for_event](../crates/musicvideo-ui/src/lib.rs#L1215)、[apply_history_shortcut](../crates/musicvideo-ui/src/lib.rs#L1246)、[上部の履歴ボタン](../crates/musicvideo-ui/src/lib.rs#L889)。製品ホスト・共有UIのキーイベント処理を検索し、保存・再生等の専用キーはないことをソースで照合 |
+| キーカスタマイズ不可、本体設定を引き継がない、起動操作にキーなしの理由 | D10の2026-10-09利用者判断（方針の出所）。実装は [ホスト設定](../crates/musicvideo-editor/src/lib.rs#L213) `run_gui`、[固定キー](../crates/musicvideo-ui/src/lib.rs#L1215)、[右クリック分岐](../src/ui_dialogs/context_menu.rs#L1867) と本体 `src/keymap.rs` の `KeyAction` に当該起動操作がないことを照合 |
+| 素材が見つからない節: 詳細→未解決の素材、画像／音声／フォントの理由、画像差替・音声再選択 | [draw_tool_windows](../crates/musicvideo-editor/src/app/chrome.rs#L497)、[draw_missing_images](../crates/musicvideo-ui/src/lib.rs#L1354)、[素材操作の実行](../crates/musicvideo-editor/src/app/chrome.rs#L644)。読込時の欠落は [start_project_load](../crates/musicvideo-editor/src/app.rs#L2013) の素材読込経路 |
+| 通信とデータ節・製品の安全カード・privacy日英: 通信しない、解析・プレビュー・書出はPC内、開発者へログ等を自動送信しない | [製品の起動経路](../crates/musicvideo-editor/src/lib.rs#L213) `run_gui`、[素材の読込](../crates/musicvideo-editor/src/decode.rs#L13) `decode_audio`、[プレビューのローカル合成](../crates/musicvideo-editor/src/app.rs#L1800)、[MP4書出](../crates/musicvideo-editor/src/mp4.rs#L61) `export_snapshot` → [driver::export](../src/video/mvexport/driver.rs#L44)、[ログのファイル書込](../crates/musicvideo-editor/src/persistence.rs#L76)。この経路に更新確認・HTTP・Remote起動・送信処理を追加していない |
+| 同上: 本体と同じデータフォルダ、recent-projects.jsonのパス一覧、musicvideo.log／musicvideo-panic.log、ログに素材・プロジェクト・保存先のパス | [本体がdata-dirを渡す](../src/musicvideo_launch.rs#L21)、[本体の保存先](../src/data_dir.rs#L260)、[Diagnostics::open / write](../crates/musicvideo-editor/src/persistence.rs#L76)、[recentの保存先と更新](../crates/musicvideo-editor/src/persistence.rs#L165)、[log_status](../crates/musicvideo-editor/src/app/startup.rs#L108)、[音声読込のパス通知](../crates/musicvideo-editor/src/app.rs#L970)、[MP4保存先通知](../crates/musicvideo-editor/src/app/mp4.rs#L192)、[プロジェクト読込通知](../crates/musicvideo-editor/src/app.rs#L2108) |
+| 同上: 音声・画像のUndo用一時データはOS一時領域、プロジェクト／MP4保存時の同じ保存先内の一時ファイル | [ResourceBlobStore::store_image / store_audio](../crates/musicvideo-editor/src/resource_blobs.rs#L37) と [temporary_blob](../crates/musicvideo-editor/src/resource_blobs.rs#L237)、[プロジェクトのNamedTempFile::new_in](../crates/musicvideo-editor/src/project_file.rs#L29)、[MP4のPartialOutput::new](../src/video/mvexport/driver.rs#L772) |
+| privacy日英: 指定した保存先が共有／同期先ならその場所の動作に従う、データフォルダ外の作品や素材はデータフォルダ削除後も残る | [選んだPathへのプロジェクト保存](../crates/musicvideo-editor/src/project_file.rs#L29)、[LRCのfs::write](../crates/musicvideo-editor/src/app.rs#L2345)、[MP4保存先](../crates/musicvideo-editor/src/app/mp4.rs#L6)、[PNG出力](../crates/musicvideo-editor/src/export.rs#L547)。作品の保存先をdata-dirへ強制せず、ファイル保存自体がOSのパス解決に従うことからの記述。ネットワーク／同期動作の実測ではない |
+
+**設計との相違・文言の判断**
+
+1. D11は「解像度・fpsは書き出しダイアログで変更できる」としているが、現行
+   `draw_mp4_dialogs` は `ui.label` で値を表示するだけで、変更用の入力欄はない。
+   右の「プロジェクト」タブも表示ゲインとパス一覧だけである。マニュアルでは新規既定値と
+   設定画面の表示を説明し、解像度・fpsの変更操作は案内していない。実装追加・D11の決定変更は行わず、
+   この差分を設計担当へ返す。
+2. briefの保存物3種に加え、現行の上部に「連番 PNG を書き出す」がある。
+   保存物を3種だけと断定しないため、マニュアル・privacy日英にPNGを含め、製品の安全カードは
+   「作品」と表現した。PNG書出を非表示にしたり機能を変えたりしていない。
+3. 通信・保存の説明を製品ページとprivacyで突き合わせた。エディタの通信経路・送信は追加されず、
+   従来のAI／広告解析／アカウント不要の否定表現を変える要因はない。保存カードの
+   「アンインストール時にまとめて削除」は任意保存先の作品まで含めて読めるため外し、
+   詳細へリンクした。「データフォルダを削除しても作品は残る」はフォルダ外に保存したものに限定。
+   OSの共有／同期先への保存と、エディタ独自のネットワーク通信を混同しないようprivacyに補足した。
+4. キーフレームとモジュレータは機能名として使い、その他は画面上のラベルと一般語にした。
+   内部ライブラリ名・worker・チェックポイント等や版タグ、性能の数値約束は追加しない。
+   エンコーダ欄はUIの選択肢のうちNVENC／QSV／AMFを例示し、内部ライブラリの説明はしない。
+   外部ダウンローダ名・特定の配信サイト名を新規の利用者向け説明に追加していない。
+
+**執筆担当の確認結果**
+
+| 検査 | 結果 |
+| --- | --- |
+| `python scripts/gen-changelog-html.py` | 成功、62版分を再生成。差分はサイドバーのリンク1行のみ |
+| `python scripts/check_site_cards.py` | 50 cards checked, 0 over the limit。新カード・安全カードは見出し1つ＋本文1段落、本文150字以内 |
+| `python scripts/check_ui_glyphs.py` | 成功、危険glyphなし |
+| サイドバー一括検査 | CLAUDE.md手順6と同じ抽出範囲（`sidebar-section`〜`</nav>`）・同じ正規表現 `href="[a-z-]+\.html"` をPythonで全通常ページに適用。33ページすべて33リンク。全hrefの順序、重複なし、リンク先の存在、activeがそのページ1つであることも検査済み |
+| HTML静的検査 | 新ページのタグ対応・重複idなし・既存CSSクラス・パンくず・メタデータ・相対リンクを検査し成功。新ページへの相対リンク37本も解決可能。ブラウザでの描画・狭幅での見た目は未観測 |
+| `git diff --check` | 成功 |
+
+補助の静的検査スクリプトは `target/p4f-check-html.py` に保存（配布物やソースには含めない）。
+ドキュメントだけの変更のため、Rustテスト・ビルド・確認用バイナリ作成は実施していない。
+`scripts/gen-sitemap-xml.py` は実行していない。htdocsの変更をコミットした後に実行が必要。
+コミット・アプリ起動・エディタ起動・実機操作は行っていない。
+
+利用者／設計担当に見てほしい点は、D11との差分の扱い、モジュレータの説明の分かりやすさ、
+未保存確認と素材持ち運びの注意書き、保存先の説明である。画像を追加するなら「画面の構成」の
+配置が分かる全体図と、MP4の設定画面が候補。今回は画像がなくても操作をたどれる本文とし、撮影は未実施。
