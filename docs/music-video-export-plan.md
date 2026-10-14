@@ -1,6 +1,6 @@
 # 音楽ビデオ書き出し (Music Video Export) — 設計計画
 
-Status: P1〜P3j、P4b-1〜4 の実装・非対話検証あり。H3a の契約と H3b の画素一致は非対話検証済み。P4c・P4d の実装・非対話検証あり。P4d の独立レビュー・実機検収、P4e 以降は未完了。
+Status: P1〜P3j、P4b-1〜4 の実装・非対話検証あり。H3a の契約と H3b の画素一致は非対話検証済み。P4c・P4d の実装・非対話検証あり。P4d の独立レビュー1回目はREVISE、対応後の再レビュー・実機検収、P4e 以降は未完了。
 2026-10-09 に P4 の方式を「別 exe のエディタ」へ改訂（D10 / D16）、
 画面構成（D14）と文字装飾の初版範囲（D15）を追加。改訂は GPT-6.1 Sol / xhigh の独立レビュー 3 回で
 条件付き ACCEPT（P4a 完了、2026-10-09）。
@@ -12,7 +12,7 @@ Status: P1〜P3j、P4b-1〜4 の実装・非対話検証あり。H3a の契約�
 実機目視 = ユーザー。2026-09-07〜09-09 の Astra / Sol 体制の記録は
 [引き継ぎ監査](music-video-handoff-20260907.md) に残す。本書の過去の完了記録は当時の記録であり、
 監査で挙がった未解決事項の解消を意味しない。
-H3（H3a + H3b）の解析・画素一致は非対話検証済み（下記 H3b 検証記録）。P4 の実機検収は未完了。P4c・P4d の実装・非対話検証あり。P4d の独立レビューと P4e 以降は未完了。
+H3（H3a + H3b）の解析・画素一致は非対話検証済み（下記 H3b 検証記録）。P4 の実機検収は未完了。P4c・P4d の実装・非対話検証あり。P4d の独立レビュー1回目はREVISE、対応後の再レビューと P4e 以降は未完了。
 開発場所 = 別 worktree `C:\home\mimageviewer-musicvideo`（ブランチ `musicvideo`）。
 最終着地点 = **mIV に同梱して配布し、mIV から起動する機能**（ラボ止まりにしない。D10）。
 
@@ -801,6 +801,9 @@ native presenter は使わない。
   portable は `<exe_dir>\data`、`--data-dir` 指定起動ならその値）。エディタは自分で data dir を
   推測しない。`--data-dir` 無しの直接起動（開発時）は「最近使ったプロジェクト」とファイルのログを
   永続化せず、ログは標準エラーだけに出す（ユーザーが選んだプロジェクト・MP4・LRC の保存は通常どおり）。
+  Windows の製品 GUI bin はコンソールを持たず、標準エラーを明示的に捕捉しない直接起動では診断ログが見えない。
+  開発診断には console の `musicvideo-dev` を使う。通常操作の失敗は画面内でも通知するが、GUI自体の
+  起動失敗やpanicは `--data-dir` 無しではファイルにも残らない。data dirを推測する代替経路は追加しない。
 - 引数の誤り（存在しないパス、両方指定など）はエディタのウィンドウ内で理由を表示し、空のプロジェクトで
   開く。終了コードだけで知らせない（GUI subsystem のため）。
 
@@ -3010,7 +3013,7 @@ frame n → t = n/fps → evaluate → rasterize(CPU, rayon) → RGBA→NV12/YUV
 
 正本は D10「起動と引数」と §7 P4d、実装 brief は `docs/brief-musicvideo-p4d.md`。
 対象はブランチ `musicvideo`、基点 `6729628cd80ea4ce2c6e3fb9c20b470a1fb41074` の未コミット差分。
-以下は実装担当の非対話検証記録であり、独立レビューと実機検収は未実施。
+以下は初回実装担当の非対話検証記録。コミット `261b10359` に対する独立レビューと対応は末尾に追記する。
 
 **実装**
 
@@ -3027,7 +3030,9 @@ frame n → t = n/fps → evaluate → rasterize(CPU, rayon) → RGBA→NV12/YUV
   UIはpathと使用中の `data_dir` のsnapshotを渡すだけ。worker内で `current_exe()` の兄弟
   `mimageviewer-musicvideo.exe` を解決し、音声・data dirを `std::path::absolute` で絶対化する。
   exeの存在確認とspawnもworker内で行い、`--audio`／`--data-dir`をOS文字列のまま渡す。
-  子プロセスは待たずに切り離す。GUI subsystemのためconsole用flagは追加しない。
+  子プロセスは待たずに切り離し、console用flagは追加しなかった。初回記録の「GUI subsystemなので
+  コンソールは出ない」は誤りで、製品binの属性が欠落し実際のPEはConsoleだった。独立レビュー1回目の
+  指摘を受け、製品binのGUI属性とPE検査を追加した（末尾の対応記録）。
   成功時は無通知、exe不在／spawn失敗／worker切断は理由付きtoastとログ。再試行や復旧機構は追加しない。
 - 起動要求は互いを置き換えない。複数エディタを許すD10に従い、連打は独立したworkerになる。
   ナビゲーションやfullscreen終了で起動要求を取消しない。結果は閲覧状態を変更せず、Appのpollで通知だけを行う。
@@ -3141,6 +3146,52 @@ binaryへ固定したdata dirではない。利用者が通常環境で起動す
 snapshot差分は設定画面2枚（新規なし）、更新前後を実装担当が目視した。
 詳細は `docs/ui-snapshot-policy.md`。正本／briefとの仕様上の相違はない。
 
+**独立レビュー 1 回目 REVISE と対応（2026-10-15）**
+
+利用者から提示された独立実装レビュー（GPT-6.1 Sol / xhigh、対象コミット `261b10359`）は
+REVISE。P2「エディタ起動時にコンソール窓が開く」1件で、その他のP1／P2／P3指摘はない。
+以下は実装担当による対応・非対話検証であり、新たな独立レビューではない。
+
+- `crates/musicvideo-editor/src/main.rs` に本体 `src/main.rs` と同じ
+  `#![windows_subsystem = "windows"]` を追加。製品binだけを対象とし、CLI出力を使う
+  `src/bin/musicvideo-dev.rs` とmIVのspawn／既存メニュー／外部ツールの経路は変更しない。
+- `scripts/check-vcrt-pe-dependencies.ps1` にdumpbin headersのSubsystem解析と報告を追加。
+  製品 `mimageviewer-musicvideo.exe` は2（GUI）、開発 `musicvideo-dev.exe` は3（Console）を必須とする。
+  既存のbuild-dev最終PE gateから自動適用し、release成果物も同じgateで検査する。
+  self-testは両profileの正しい値を受け入れ、逆の値とSubsystem欠落を拒否し、他のexeには新条件を適用しない。
+- stderrの確認: `persistence::Diagnostics::write` はworkerからstderrへ書き、data-dir無しでは
+  ファイルログと最近使ったプロジェクトを作らない。引数誤り／runtime保護の失敗／読込・保存・MP4・
+  音声workerの失敗はstatus／notice／error snapshotとして画面へ出るので、通常操作の通知を失わない。
+  既存のdata-dir無しの描画テストと診断配送テストでこの経路を確認した。
+  GUI自体を起動できない場合とpanicの診断は、直接起動・data-dir無しでは見えなくなる制約がある。
+  D10の開発用直接起動はconsoleの `musicvideo-dev`、mIV経由では必ず渡されるdata-dirの
+  `logs/musicvideo.log`／`musicvideo-panic.log` を使う。推測した通常profileへの書込みや
+  コンソール再生成は追加しない。D10へこの制約を明記した。
+- 失敗確認: 修正前release成果物（Subsystem=3）を新gateが `expected=2 actual=3` で拒否した。
+  拒否条件を無効化した一時scriptのself-testも「wrong subsystem」で失敗した。製品sourceには変異を残していない。
+  記録は `target/p4d-review1-console-rejection.log`、`target/p4d-review1-pe-mutation.log`。
+
+対応後の検証（すべてexit 0。Cargo／buildは `MSBUILDDISABLENODEREUSE=1`、
+APPDATAは本worktreeの `target/p4d-review1-sandbox/appdata` に限定）:
+
+| コマンド／対象 | 結果 | 証跡 |
+| --- | --- | --- |
+| `cargo test -p musicvideo-editor` | 177 passed／0 failed、bin／docは0件。data-dir無しのエラー描画と診断配送の既存回帰を含む | `target/p4d-review1-editor.{log,stderr.log}` |
+| `cargo test -p mimageviewer --lib context_menu_musicvideo_` | 8 passed／0 failed | `target/p4d-review1-launch-tests.{log,stderr.log}` |
+| `scripts/check-vcrt-pe-dependencies.ps1 -SelfTest` | parser／両profileのSubsystem条件と既存PE／CRT self-test成功。拒否条件無効化の変異は失敗 | 実行出力、`target/p4d-review1-pe-mutation.log` |
+| `scripts/test-build-dev-safety.ps1` | PASS。process操作はmockのみ | 実行出力 |
+| `cargo fmt`、`cargo fmt --check`、`python scripts/check_ui_glyphs.py` | fmt適用／check clean、glyph 0 | 実行出力 |
+| `cargo build --release -p musicvideo-editor --bin mimageviewer-musicvideo` | 成功（2分47秒）。製品PE Subsystem=2 | `target/p4d-review1-release.{log,stderr.log}`、`target/p4d-review1-release-pe.json` |
+| `scripts/build-dev.ps1 -PreserveRuntime`（`*>&1`なし） | 成功。通常featureの4exe、runtime=4／PE=4。製品PE Subsystem=2 | `target/p4d-review1-build-dev.log`、`target/vcrt-pe-reports/dev-runtime.json` |
+| `cargo build --profile dev-runtime -p musicvideo-editor --bin musicvideo-dev --features dev-tools` | 成功（7.48秒）。CLI PE Subsystem=3 | `target/p4d-review1-cli.{log,stderr.log}` |
+| 両製品exe＋開発CLIへ同じPE gateを適用 | runtime=4／PE=3。release製品=2、dev-runtime製品=2、開発CLI=3、SHA-256を記録 | `target/p4d-review1-pe.json` |
+
+変更は製品bin、PE script、本設計書の3ファイル。Rust新規テストとsnapshot変更はない。
+実装担当による再実行はRust計185件／0 failed。元の全体gate（14560 passed／0 failed／66 ignored）は独立レビューで
+再集計・source freeze／成果物hash一致を確認済み。今回の変更は製品bin属性・PE検査・文書に限定されるため、
+本体の共有実装・snapshotに変更はなく、その全体gateを再利用し、変更箇所の検証と両profileのbuildを行う。
+GUI起動・実機検収と対応後の独立再レビューは未実施。コミットは行わない。
+
 ## 7. インクリメントと受け入れ基準
 
 | # | 内容 | 受け入れ基準 |
@@ -3178,7 +3229,7 @@ snapshot差分は設定画面2枚（新規なし）、更新前後を実装担�
 | **P4a** ✅ | 方式の設計確定: 本書 D10 / D14〜D16 の独立レビュー | GPT-6.1 Sol / xhigh の設計レビューで blocking 指摘なし。**完了**（2026-10-09）: 3 回目で条件付き ACCEPT（残った P3 の文言は反映済み）。runtime 競合の割り切りはユーザー判断で確定 |
 | **P4b** 実装完了・実機確認待ち（P4b-1〜4 すべて独立レビュー ACCEPT、2026-10-14。上書きの競合は利用者が許容。5 分 1080p60 は完走済み・速度は参考値で静かな環境での再計測が残る。音・GUI の実機確認は利用者へ依頼） | ホストの製品化（D16。段の分け方は D16 の「P4b の設計」）: ラボを `crates/musicvideo-editor` へ移し、FFmpeg デコードへ統一、スナップショット入力の MP4 書き出し（モーダル・進捗・キャンセル）、未保存の編集の確認、音声スレッドが stream を所有する再生と f32 以外の出力形式対応 | **P4b-3（2026-10-14、未コミット）**: 指定ゲート 365 passed、追加 18 件すべての変異失敗確認、既存 editor 101 件維持。共通 snapshot／解析／較正／PCM view AAC／原子的公開／モーダル終端を接続し、製品 editor・通常 CLI・dev CLI の release build 成功。編集済み 5 分 1080p60 を dev CLI で 18,000 frames 完走、184.441 秒／1.6265x（背景 Codex 4 件あり、参考値）。詳細は D16 の P4b-3 記録。P4b-2 の実機の音・GUI・H3b は未確認。**P4b-4（2026-10-14、未コミット）**: session 所属の単一意図、歌詞の先行解決、保存後のフレーム末尾の再判定、先行読込の receiver 退役、新規、CancelClose／承認済み Close と書き出し中止の終端待ちを実装。指定ゲート **396 passed**、追加 **31 件**すべて変異失敗確認。初回レビュー REVISE の P2／P3 に対応し、LRC モーダルの実クリック回帰、Project／保存完了の両順序、歌詞取消と同フレームの旧完了を検査。今回 3 件追加・既存 1 件補強、各テストの変異失敗確認、指定テスト **399 passed**。詳細は D16 の P4b-4 記録。修正後の独立レビュー・実機確認・H3b は未完了 |
 | **P4c** 実装完了・実機確認待ち（独立レビュー ACCEPT、2026-10-15） | 起動引数と診断（D10）: `--audio` / `--project` / `--data-dir`、最近使ったプロジェクト、ログ・panic ログ、引数エラーの画面表示、runtime shared lease と取得失敗の表示 | **初回2026-10-14**: 追加21件の変異検証記録あり。**2026-10-15、未コミット修正**: P2のUI出力全経路9か所をworker配送、追加6件すべてで同期出力の変異失敗、P3の実機未完了表記を訂正。指定gate **516 passed / 0 failed / 1 ignored**、fmt／glyph0／製品release build成功。再レビュー・実機検収未実施。詳細は「P4c 実装記録」の独立レビュー1回目対応 |
-| **P4d** 実装・非対話検証済み（独立レビュー・実機確認待ち） | mIV 側の入口: 音楽ビュー・音声ファイルの右クリックから「音楽ビデオを作成」でエディタを起動 | Grid／Fullscreenの単一実Audioだけ。static ID／非表示設定、worker起動、絶対path引数、失敗通知、build-dev同梱を実装。既存保存順のstatic／動的枠を保つ末尾追加。追加8件の成功と各変異失敗、全対象14560 passed／0 failed／66 ignored、fmt／glyph0、通常featureの4exe確認build成功を記録済み。独立レビュー／製品GUI起動／実機検収／commitなし。詳細は「P4d実装記録」 |
+| **P4d** 実装・非対話検証済み（独立レビュー1回目REVISE対応・再レビュー／実機確認待ち） | mIV 側の入口: 音楽ビュー・音声ファイルの右クリックから「音楽ビデオを作成」でエディタを起動 | Grid／Fullscreenの単一実Audioだけ。static ID／非表示設定、worker起動、絶対path引数、失敗通知、build-dev同梱を実装。既存保存順のstatic／動的枠を保つ末尾追加。追加8件の成功と各変異失敗、全対象14560 passed／0 failed／66 ignored、fmt／glyph0、通常featureの4exe確認build成功を記録済み。`261b10359`の独立レビューP2に対応し製品binのGUI属性／Subsystem gateを追加。製品GUI起動／実機検収／対応のcommitなし。詳細は「P4d実装記録」 |
 | **P4e** | 配布（下の表）: launcher 内包・runtime 展開・署名・portable 同梱・全 PE / VC runtime gate・build スクリプト・test-full 前提 | build-dist 相当の通しビルド。runtime 清掃: 旧版 core 終了後にエディタだけ稼働 / 起動との競合 / エディタ終了後の清掃。release のエディタ exe サイズとビルド時間を記録 |
 | **P4f** | 文書: マニュアル・製品ページ・keymap-spec（固定ショートカットの理由）・privacy（通信なし・保存先） | CLAUDE.md「コード修正時のドキュメント同時更新」 |
 

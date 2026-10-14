@@ -29,6 +29,29 @@ function Get-DumpbinPath {
     return $candidates[0].FullName
 }
 
+function Get-PeSubsystem {
+    param([string[]] $Headers)
+    foreach ($line in $Headers) {
+        if ($line -match '^\s*([0-9A-Fa-f]+) subsystem(?:\s|$)') {
+            return [Convert]::ToInt32($Matches[1], 16)
+        }
+    }
+    throw '[vcrt-pe] missing or unknown subsystem in PE headers'
+}
+
+function Assert-MusicVideoSubsystem {
+    param([object] $Pe)
+    $name = [System.IO.Path]::GetFileName($Pe.path).ToLowerInvariant()
+    $expected = switch ($name) {
+        'mimageviewer-musicvideo.exe' { 2 }
+        'musicvideo-dev.exe' { 3 }
+        default { return }
+    }
+    if ($Pe.subsystem -ne $expected) {
+        throw "[vcrt-pe] unexpected subsystem for $($Pe.path): expected=$expected actual=$($Pe.subsystem)"
+    }
+}
+
 function Get-PeInfo {
     param([string] $Path, [string] $Dumpbin)
     $headers = @(& $Dumpbin /nologo /headers $Path)
@@ -56,6 +79,7 @@ function Get-PeInfo {
         path = [System.IO.Path]::GetFullPath($Path)
         machine = $machine
         linker_version = $linker
+        subsystem = Get-PeSubsystem -Headers $headers
         imports = $imports
     }
 }
@@ -134,6 +158,7 @@ function Assert-CanonicalRuntimeFile {
         path = $pe.path
         machine = $pe.machine
         linker_version = $pe.linker_version
+        subsystem = $pe.subsystem
         imports = $pe.imports
         sha256 = $hash
         version = $version
@@ -143,6 +168,36 @@ function Assert-CanonicalRuntimeFile {
 }
 
 if ($SelfTest) {
+    $guiSubsystem = Get-PeSubsystem -Headers @('  14.50 linker version', '               2 subsystem (Windows GUI)')
+    $consoleSubsystem = Get-PeSubsystem -Headers @('               3 subsystem (Windows CUI)')
+    if ($guiSubsystem -ne 2 -or $consoleSubsystem -ne 3) {
+        throw 'self-test parsed the wrong subsystem'
+    }
+    $rejected = $false
+    try { $null = Get-PeSubsystem -Headers @('  14.50 linker version') } catch {
+        if ($_.Exception.Message -notmatch 'missing or unknown subsystem') { throw }
+        $rejected = $true
+    }
+    if (-not $rejected) { throw 'self-test accepted headers without a subsystem' }
+    # Both product build profiles must reject Console; the development CLI
+    # must retain Console so its diagnostic output remains available.
+    foreach ($profile in @('release', 'dev-runtime')) {
+        foreach ($case in @(
+            @{ name = 'mimageviewer-musicvideo.exe'; good = $guiSubsystem; bad = $consoleSubsystem },
+            @{ name = 'musicvideo-dev.exe'; good = $consoleSubsystem; bad = $guiSubsystem }
+        )) {
+            $pe = [pscustomobject]@{ path = "target\$profile\$($case.name)"; subsystem = $case.good }
+            Assert-MusicVideoSubsystem -Pe $pe
+            $pe.subsystem = $case.bad
+            $rejected = $false
+            try { Assert-MusicVideoSubsystem -Pe $pe } catch {
+                if ($_.Exception.Message -notmatch 'unexpected subsystem') { throw }
+                $rejected = $true
+            }
+            if (-not $rejected) { throw "self-test accepted the wrong subsystem: $($pe.path)" }
+        }
+    }
+    Assert-MusicVideoSubsystem -Pe ([pscustomobject]@{ path = 'other.exe'; subsystem = $consoleSubsystem })
     foreach ($name in $allowedRuntime) {
         if (-not (Test-VcRuntimeImportName $name)) { throw "self-test rejected $name" }
     }
@@ -257,6 +312,7 @@ foreach ($file in $inputFiles) {
         throw "[vcrt-pe] unexpected machine for $($file.FullName): expected=$expectedMachine actual=$($pe.machine)"
     }
     Assert-AllowedVcImports -Pe $pe
+    Assert-MusicVideoSubsystem -Pe $pe
     $version = $null
     $signatureStatus = $null
     $signerSubject = $null
@@ -286,6 +342,7 @@ foreach ($file in $inputFiles) {
         path = $pe.path
         machine = $pe.machine
         linker_version = $pe.linker_version
+        subsystem = $pe.subsystem
         imports = $pe.imports
         sha256 = $hash
         version = $version
