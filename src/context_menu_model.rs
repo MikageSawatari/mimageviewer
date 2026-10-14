@@ -75,6 +75,7 @@ pub enum ContextMenuItemId {
     RemoveFromCollection,
     RemoveReadingHistory,
     Deselect,
+    CreateMusicVideo,
 }
 
 impl ContextMenuItemId {
@@ -109,6 +110,7 @@ impl ContextMenuItemId {
         Self::RemoveFromCollection,
         Self::RemoveReadingHistory,
         Self::Deselect,
+        Self::CreateMusicVideo,
     ];
 
     pub const fn stable_name(self) -> &'static str {
@@ -136,6 +138,7 @@ impl ContextMenuItemId {
             Self::RotateLeft => "RotateLeft",
             Self::RotateRight => "RotateRight",
             Self::SetCurrentVideoFrameThumbnail => "SetCurrentVideoFrameThumbnail",
+            Self::CreateMusicVideo => "CreateMusicVideo",
             Self::ToggleRepresentativeThumb => "ToggleRepresentativeThumb",
             Self::OpenFolderInExplorer => "OpenFolderInExplorer",
             Self::OpenExternalToolSettings => "OpenExternalToolSettings",
@@ -185,6 +188,7 @@ impl ContextMenuItemId {
             Self::RotateLeft => "左に回転",
             Self::RotateRight => "右に回転",
             Self::SetCurrentVideoFrameThumbnail => "現在のフレームを動画サムネに設定",
+            Self::CreateMusicVideo => "音楽ビデオを作成",
             Self::ToggleRepresentativeThumb => "代表サムネに固定 / 解除",
             Self::OpenFolderInExplorer => "このフォルダをエクスプローラで開く",
             Self::OpenExternalToolSettings => "外部ツールの設定…",
@@ -221,6 +225,7 @@ impl ContextMenuItemId {
             MenuCommand::RotateRight => Self::RotateRight,
             MenuCommand::ToggleRepresentativeThumb => Self::ToggleRepresentativeThumb,
             MenuCommand::SetCurrentVideoFrameThumbnail => Self::SetCurrentVideoFrameThumbnail,
+            MenuCommand::CreateMusicVideo => Self::CreateMusicVideo,
             MenuCommand::OpenFolderInExplorer => Self::OpenFolderInExplorer,
             MenuCommand::OpenExternalToolSettings => Self::OpenExternalToolSettings,
             MenuCommand::MoveToRecycleBin => Self::MoveToRecycleBin,
@@ -404,6 +409,8 @@ pub(crate) enum ContextMenuPreviewScenario {
     GridCollectionItem,
     FullscreenImage,
     FullscreenVideo,
+    GridAudio,
+    FullscreenAudio,
 }
 
 impl ContextMenuPreviewScenario {
@@ -419,6 +426,8 @@ impl ContextMenuPreviewScenario {
         Self::GridCollectionItem,
         Self::FullscreenImage,
         Self::FullscreenVideo,
+        Self::GridAudio,
+        Self::FullscreenAudio,
     ];
 
     pub(crate) const fn label(self) -> &'static str {
@@ -436,6 +445,8 @@ impl ContextMenuPreviewScenario {
             Self::GridCollectionItem => "一覧：コレクションの項目",
             Self::FullscreenImage => "フルスクリーン：画像",
             Self::FullscreenVideo => "フルスクリーン：動画",
+            Self::GridAudio => "一覧：音声ファイル",
+            Self::FullscreenAudio => "フルスクリーン：音声",
         }
     }
 
@@ -462,6 +473,8 @@ impl ContextMenuPreviewScenario {
             }
             Self::FullscreenImage => (ContextMenuItemKind::Image, ContextMenuSurface::Fullscreen),
             Self::FullscreenVideo => (ContextMenuItemKind::Video, ContextMenuSurface::Fullscreen),
+            Self::GridAudio => (ContextMenuItemKind::Audio, ContextMenuSurface::Grid),
+            Self::FullscreenAudio => (ContextMenuItemKind::Audio, ContextMenuSurface::Fullscreen),
         };
         let is_folder_context = self == Self::GridFolderBackground;
         let has_checked = self == Self::GridCheckedRealFiles;
@@ -733,6 +746,8 @@ pub enum MenuCommand {
     RotateRight,
     ToggleRepresentativeThumb,
     SetCurrentVideoFrameThumbnail,
+    /// Context-menu-only operation for a single real audio file; no key binding.
+    CreateMusicVideo,
     OpenFolderInExplorer,
     ExternalTool(ExternalToolId),
     OpenWithAssociation {
@@ -1588,6 +1603,16 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
         );
     }
 
+    // Append both this item and its catalog ID. For layouts saved before it
+    // existed, sorting must leave every old slot (including dynamic groups)
+    // intact, even when the user moved or hid other static items.
+    if input.kind == ContextMenuItemKind::Audio && !input.is_folder_context {
+        push_group(
+            &mut nodes,
+            [item(MenuCommand::CreateMusicVideo, "音楽ビデオを作成")],
+        );
+    }
+
     apply_context_menu_layout(nodes, ContextMenuParentId::Root, &input.layout)
 }
 
@@ -1621,6 +1646,172 @@ pub fn normalize_menu(nodes: Vec<MenuNode>) -> Vec<MenuNode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_menu_musicvideo_only_single_real_audio_on_both_surfaces() {
+        for surface in [ContextMenuSurface::Grid, ContextMenuSurface::Fullscreen] {
+            for kind in [
+                ContextMenuItemKind::Audio,
+                ContextMenuItemKind::Image,
+                ContextMenuItemKind::Video,
+                ContextMenuItemKind::Folder,
+                ContextMenuItemKind::ZipFile,
+                ContextMenuItemKind::PdfFile,
+                ContextMenuItemKind::ConvertibleArchive,
+                ContextMenuItemKind::ZipImage,
+                ContextMenuItemKind::PdfPage,
+                ContextMenuItemKind::Stack,
+                ContextMenuItemKind::ZipDir,
+                ContextMenuItemKind::SearchContainer,
+                ContextMenuItemKind::CollectionPlaceholder,
+            ] {
+                for (checked, folder) in [(false, false), (true, false), (false, true)] {
+                    let mut input = input(kind, surface);
+                    input.has_checked = checked;
+                    input.checked_count = if checked { 2 } else { 0 };
+                    input.is_folder_context = folder;
+                    let state =
+                        command_state(&build_context_menu(&input), MenuCommand::CreateMusicVideo);
+                    assert_eq!(
+                        state.is_some(),
+                        kind == ContextMenuItemKind::Audio && !checked && !folder,
+                        "{surface:?} {kind:?} checked={checked} folder={folder}"
+                    );
+                    if let Some((label, enabled, reason)) = state {
+                        assert_eq!(label, "音楽ビデオを作成");
+                        assert!(enabled);
+                        assert!(reason.is_none());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn context_menu_musicvideo_saved_order_and_hidden_preserve_existing_items() {
+        let id = ContextMenuItemId::CreateMusicVideo;
+        assert_eq!(
+            ContextMenuItemId::parse_stable_name("CreateMusicVideo"),
+            Some(id)
+        );
+        assert_eq!(id.label(), "音楽ビデオを作成");
+        assert_eq!(id.parent(), ContextMenuParentId::Root);
+        let canonical = ContextMenuLayoutSettings::canonical_order(ContextMenuParentId::Root);
+        let old: Vec<_> = canonical
+            .iter()
+            .copied()
+            .filter(|item| *item != id)
+            .collect();
+        let mut trash_first = old.clone();
+        trash_first.retain(|item| *item != ContextMenuItemId::MoveToRecycleBin);
+        trash_first.insert(0, ContextMenuItemId::MoveToRecycleBin);
+        let mut reversed = old.clone();
+        reversed.reverse();
+        let mut orders = vec![trash_first, old.clone(), reversed];
+        for index in 0..old.len() {
+            for front in [true, false] {
+                let mut order = old.clone();
+                let item = order.remove(index);
+                if front {
+                    order.insert(0, item);
+                } else {
+                    order.push(item);
+                }
+                if !orders.contains(&order) {
+                    orders.push(order);
+                }
+            }
+        }
+        for old_order in orders {
+            let mut layout = ContextMenuLayoutSettings::default();
+            layout.set_order(ContextMenuParentId::Root, &old_order);
+            let resolved = layout.resolved_order(ContextMenuParentId::Root);
+            assert_eq!(
+                resolved
+                    .iter()
+                    .copied()
+                    .filter(|item| *item != id)
+                    .collect::<Vec<_>>(),
+                old_order
+            );
+            assert_eq!(
+                resolved.iter().position(|item| *item == id),
+                canonical.iter().position(|item| *item == id)
+            );
+            for surface in [ContextMenuSurface::Grid, ContextMenuSurface::Fullscreen] {
+                for visibility in 0..3 {
+                    let mut input = input(ContextMenuItemKind::Audio, surface);
+                    input.has_explorer_folder = true;
+                    input.pin = Some(ContextMenuActionState {
+                        label: "existing pin".into(),
+                        enabled: true,
+                        disabled_reason: None,
+                    });
+                    input.external_tools = vec![
+                        ExternalToolMenuEntry {
+                            tool_id: ExternalToolId(7),
+                            label: "existing tool".into(),
+                            enabled: true,
+                            disabled_reason: None,
+                        },
+                        ExternalToolMenuEntry {
+                            tool_id: ExternalToolId(8),
+                            label: "existing disabled tool".into(),
+                            enabled: false,
+                            disabled_reason: Some("existing reason".into()),
+                        },
+                    ];
+                    input.associated_apps = vec![
+                        AssociatedAppMenuEntry {
+                            display_name: "recommended app".into(),
+                            handler_id: "recommended".into(),
+                            is_recommended: true,
+                        },
+                        AssociatedAppMenuEntry {
+                            display_name: "other app".into(),
+                            handler_id: "other".into(),
+                            is_recommended: false,
+                        },
+                    ];
+                    input.layout = layout.clone();
+                    input
+                        .layout
+                        .set_visible(ContextMenuItemId::OpenFolderInExplorer, visibility != 0);
+                    input.layout.set_visible(
+                        ContextMenuItemId::ToggleRepresentativeThumb,
+                        visibility == 2,
+                    );
+                    let shown = build_context_menu(&input);
+                    assert!(command_state(&shown, MenuCommand::CreateMusicVideo).is_some());
+                    input.layout.set_visible(id, false);
+                    let hidden = build_context_menu(&input);
+                    assert!(command_state(&hidden, MenuCommand::CreateMusicVideo).is_none());
+                    let without_new = normalize_menu(
+                        shown
+                            .into_iter()
+                            .filter(|node| {
+                                !matches!(
+                                    node,
+                                    MenuNode::Item {
+                                        command: MenuCommand::CreateMusicVideo,
+                                        ..
+                                    }
+                                )
+                            })
+                            .collect(),
+                    );
+                    assert_eq!(
+                        hidden, without_new,
+                        "order={old_order:?}, surface={surface:?}, visibility={visibility}"
+                    );
+                    assert!(
+                        command_state(&hidden, MenuCommand::ExternalTool(ExternalToolId(7)))
+                            .is_some()
+                    );
+                }
+            }
+        }
+    }
 
     fn input(kind: ContextMenuItemKind, surface: ContextMenuSurface) -> ContextMenuInput {
         ContextMenuInput {
@@ -1975,6 +2166,7 @@ mod tests {
                     "アプリケーションで開く…",
                     "外部ツールの設定…",
                     "ゴミ箱へ移動 (タグ・評価も整理)",
+                    "音楽ビデオを作成",
                 ][..],
             ),
             (

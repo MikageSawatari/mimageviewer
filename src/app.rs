@@ -17238,6 +17238,7 @@ pub struct App {
     pub(crate) external_tool_modal_owner_drawn_frame: Option<u64>,
     /// ネットワーク EXE / 20 件超の個別起動を、起動計画ごと保持する確認要求。
     pub(crate) external_tool_operation: crate::external_tool::ExternalOperation,
+    pub(crate) musicvideo_launches: Vec<crate::musicvideo_launch::MusicVideoLaunchPending>,
 
     // ── viewer navigation の導出一覧キャッシュ ──────────────────
     /// nav / 静止画 / seek 情報を一括失効する context-local owner。
@@ -20368,6 +20369,7 @@ impl App {
             external_tool_modal_viewport: egui::ViewportId::ROOT,
             external_tool_modal_owner_drawn_frame: None,
             external_tool_operation: crate::external_tool::ExternalOperation::Idle,
+            musicvideo_launches: Vec::new(),
             viewer_navigation_caches: crate::ui_fullscreen::ViewerNavigationCaches::default(),
 
             // AI (settings から復元)
@@ -92647,6 +92649,7 @@ impl App {
         self.poll_epub_batch_convert();
         self.poll_file_drop_pending();
         self.poll_external_tool_launch(ctx);
+        self.poll_musicvideo_launches(ctx);
         self.poll_new_folder_pending(ctx);
         self.poll_rename_pending(ctx);
         self.poll_file_organize(ctx);

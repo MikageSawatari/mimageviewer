@@ -1,6 +1,6 @@
 # 音楽ビデオ書き出し (Music Video Export) — 設計計画
 
-Status: P1〜P3j、P4b-1〜4 の実装・非対話検証あり。H3a の契約と H3b の画素一致は非対話検証済み。P4c の実装・非対話検証あり。P4d 以降は未完了。
+Status: P1〜P3j、P4b-1〜4 の実装・非対話検証あり。H3a の契約と H3b の画素一致は非対話検証済み。P4c・P4d の実装・非対話検証あり。P4d の独立レビュー・実機検収、P4e 以降は未完了。
 2026-10-09 に P4 の方式を「別 exe のエディタ」へ改訂（D10 / D16）、
 画面構成（D14）と文字装飾の初版範囲（D15）を追加。改訂は GPT-6.1 Sol / xhigh の独立レビュー 3 回で
 条件付き ACCEPT（P4a 完了、2026-10-09）。
@@ -12,7 +12,7 @@ Status: P1〜P3j、P4b-1〜4 の実装・非対話検証あり。H3a の契約�
 実機目視 = ユーザー。2026-09-07〜09-09 の Astra / Sol 体制の記録は
 [引き継ぎ監査](music-video-handoff-20260907.md) に残す。本書の過去の完了記録は当時の記録であり、
 監査で挙がった未解決事項の解消を意味しない。
-H3（H3a + H3b）の解析・画素一致は非対話検証済み（下記 H3b 検証記録）。P4 の実機検収は未完了。P4c の実装・非対話検証あり。P4d 以降は未完了。
+H3（H3a + H3b）の解析・画素一致は非対話検証済み（下記 H3b 検証記録）。P4 の実機検収は未完了。P4c・P4d の実装・非対話検証あり。P4d の独立レビューと P4e 以降は未完了。
 開発場所 = 別 worktree `C:\home\mimageviewer-musicvideo`（ブランチ `musicvideo`）。
 最終着地点 = **mIV に同梱して配布し、mIV から起動する機能**（ラボ止まりにしない。D10）。
 
@@ -3006,6 +3006,141 @@ frame n → t = n/fps → evaluate → rasterize(CPU, rayon) → RGBA→NV12/YUV
 
 ---
 
+### P4d 実装記録（2026-10-15）
+
+正本は D10「起動と引数」と §7 P4d、実装 brief は `docs/brief-musicvideo-p4d.md`。
+対象はブランチ `musicvideo`、基点 `6729628cd80ea4ce2c6e3fb9c20b470a1fb41074` の未コミット差分。
+以下は実装担当の非対話検証記録であり、独立レビューと実機検収は未実施。
+
+**実装**
+
+- `src/context_menu_model.rs`: 静的 `CreateMusicVideo` の command / 永続 ID / stable name /
+  label / ALL / from_command / 既定順を追加。単一の実 `Audio`、Grid / Fullscreen のみで表示する。
+  既定位置は末尾。catalogのALLと生メニューの両方へ末尾追加し、既存の保存順で動的固定枠をまたぐ
+  既存項目の移動を防ぐ。checked／フォルダ文脈／他の全kindでは出さない。
+  既存 `resolved_order` を利用し、移行は追加しない。非表示・並べ替えは既存設定を使う。
+  設定の確認場面に一覧／全画面の音声を追加した。既存の画像・動画等の項目と順序は維持する。
+- `src/ui_dialogs/context_menu.rs`: 既存の入力ゲートと同じ位置で dispatch し、音声pathだけを起動要求へ渡す。
+  フォルダ文脈の入力ゲート許可リストへは足さない。既存のclipboard／外部ツールdispatchは同じ引数・経路を維持する。
+  テストではlauncherを差し替え、製品GUIや子プロセスを起動しない。
+- `src/musicvideo_launch.rs`、`src/app.rs`、`src/lib.rs`: 起動ごとのworker／receiver／取消tokenをAppが所有する。
+  UIはpathと使用中の `data_dir` のsnapshotを渡すだけ。worker内で `current_exe()` の兄弟
+  `mimageviewer-musicvideo.exe` を解決し、音声・data dirを `std::path::absolute` で絶対化する。
+  exeの存在確認とspawnもworker内で行い、`--audio`／`--data-dir`をOS文字列のまま渡す。
+  子プロセスは待たずに切り離す。GUI subsystemのためconsole用flagは追加しない。
+  成功時は無通知、exe不在／spawn失敗／worker切断は理由付きtoastとログ。再試行や復旧機構は追加しない。
+- 起動要求は互いを置き換えない。複数エディタを許すD10に従い、連打は独立したworkerになる。
+  ナビゲーションやfullscreen終了で起動要求を取消しない。結果は閲覧状態を変更せず、Appのpollで通知だけを行う。
+  App終了ではpendingのDropが取消tokenを立て、既存外部ツール同様に未起動の処理を止める。
+  起動済みの子は止めず、workerのjoinもしない。
+- 設計簡素化: 別exeで閲覧／編集状態を共有しないD10の境界を維持する。起動をモーダルにすると
+  閲覧と複数起動を制限するため採らず、IPC／世代／rollback／live rebuildを追加しない。
+- `scripts/build-dev.ps1`: 通常featureの製品editorを `dev-runtime` へ追加build。
+  他の3exeと同じexact-pathの停止／`-PreserveRuntime`、成果物存在確認、PE／CRT検査、出力案内へ含める。
+  scriptはASCIIのみ。`scripts/test-build-dev-safety.ps1` も4exe／4Cargo呼び出しとeditorのprofile／binを検査する。
+  release／launcher／portable／署名は変更しない（P4e）。manual／製品ページ／keymap-specは変更しない（P4f）。
+
+**追加テストと変異検証**
+
+追加Rustテストは8件。すべて `context_menu_musicvideo_` を名前に含め、通常実装で8 passed／0 failed。
+意図的な変更は実装へ入れ、compile成功後のテスト失敗を検査し、元のバイト列へ復元した。
+配置訂正後も変異Aは7 failed／1 passed（順序テストも対象判定の変異で失敗）、変異Bは2 failed／6 passed。
+拡張した順序テストは、中間配置へ戻す変異Cで0 passed／1 failedになり、右回転が動的tool枠を
+またぐ退行を検出した。全変異は元のバイト列へ復元済み。
+
+| 追加テスト（共通prefixを省略） | 検査対象 | 検出した変異 |
+| --- | --- | --- |
+| `only_single_real_audio_on_both_surfaces` | 13kind × 2surface × 単一／checked／フォルダ文脈、label／enabled | AudioをVideoへ変更（A） |
+| `saved_order_and_hidden_preserve_existing_items` | 新IDなしの既定／逆順／各既存IDの先頭・末尾移動、既知ID順と既定slot、Explorer／pin／新項目の非表示、2tool・2関連付けappと区切りを含む全既存node | commandの永続ID対応をCopyPathへ変更（B）、新IDと生メニューを中間挿入へ戻す（C） |
+| `dispatch_uses_launcher_seam_and_input_gate` | 両surface、音声／動画、checked／背景、入力ゲート、fullscreen維持 | launcher呼び出しを削除（A） |
+| `arguments_are_absolute_and_keep_os_paths` | exe兄弟、4引数、相対／絶対data dir、日本語・空白path | data dirの絶対化を削除（A） |
+| `worker_is_nonblocking_and_allows_multiple_launches` | UIと別thread、使用中data dir、2起動保持、成功無通知、外部tool状態不変 | 新要求時に既存pendingをclear（B） |
+| `missing_exe_and_spawn_failure_notify_with_reason` | exe不在と注入spawn失敗、path／理由付きtoast | pollの失敗通知を削除（A） |
+| `disconnected_worker_notifies_and_finishes` | 切断の通知とpendingの終端 | pollの失敗通知を削除（A） |
+| `drop_cancels_without_waiting_or_spawning` | worker待機中のpending Drop、取消後spawn抑止、joinなし | Dropの取消tokenをfalseへ変更（A） |
+
+ビルドscriptの既存回帰も更新した。editorのexact-pathをcoreへ誤指定する変異と、editorのCargo呼び出しを
+remoteへ誤指定する変異は、それぞれscript-only検査でexit 1になった。scriptも元のバイト列へ復元した。
+プロセス操作はmockであり、製品の起動・停止を行わない。
+ログは `target/p4d-added-tests.{log,stderr.log}`、`target/p4d-mutation-{A,B}.{log,stderr.log}`、
+`target/p4d-build-mutation-{process-policy,build-command}.log`。
+
+**非対話gateと確認build**
+
+初回の中間配置を実装担当が追加点検したところ、「ゴミ箱を先頭へ移動」「Explorer／pinが
+非表示」の既存保存順では、追加によって既存の右回転が外部tool枠の前へ移るケースがあった。
+`resolved_order` 自体は既知のstatic ID順を保っていたが、生メニューのstatic slotが増え、
+動的固定枠を挟む割当が変わるためである。briefは新項目の既定位置を指定していないので、
+新IDと生メニューの両方を末尾追加へ訂正した。既存のlayout resolver／外部tool実装は変更しない。
+上記の保存順テストを拡張し、区切りや動的groupの内部まで含め、新項目を除いた全nodeが
+新項目を非表示にした旧メニューとexact一致することを検査する。
+sourceに基づく中間配置の再現は `target/p4d-order-premise.log`、訂正後の変異Cのログは
+`target/p4d-mutation-C.{log,stderr.log}`。訂正後の検証を以下に記録する。
+
+配置訂正前の全体gate（`RUST_TEST_THREADS=1`）はexit 101。本体12736 passed／1 failed／59 ignoredで、
+失敗は既存 `hud_focus_claim_uses_registered_editor_and_preserves_presenter_return` のHWND通知待ちだった。
+実装担当が追加した直列設定により、libtestの表示が子の `MIV_FOCUS_WINDOWS` 通知の行頭へ付き、
+既存readerの `strip_prefix` で読めないことをGUIなしの小さなlibtestプローブで検査した。
+ログは `target/p4d-stdout-{serial,parallel}.log`。これはコマンド実行時間切れや製品の起動失敗ではない。
+直列指定を外して当該テストと最終gateを再実行し、native実装／テストの期待値は変更しない。
+初回全体gateのログは `target/p4d-full.{log,stderr.log}`。
+
+配置訂正後の既定並列gateもexit 101（本体12736 passed／1 failed／59 ignored）。
+失敗は既存 `import_uses_bounded_outer_transactions_instead_of_per_item_commits` の3 batch期待に対する
+4 batchだった。実装の256件／64MiBに加え500msの時間上限でもcommitするため、並列負荷で
+余分なbatchが生じ得る。取り込みコード／期待値を変更せず、親libtestだけCLI
+`--test-threads=1` で直列化し、`RUST_TEST_THREADS` は未設定のままで全体gateを再実行する。
+これにより子のHWND通知は既定の並列形式を保つ。全対象・assert・vendor gateは省略しない。
+実行ラッパーは `target/p4d-full-serial-parent.ps1`（repositoryの実行scriptは変更しない）。
+既定並列のログは `target/p4d-full-final.{log,stderr.log}`、親だけ直列のログは
+`target/p4d-full-serial-parent.{log,stderr.log}`。初回ラッパーのPowerShell変数scope誤りはCargo開始前に
+訂正した。コマンドrunnerの中断／timeoutによるproduct failureとしては数えない。
+
+最終の親だけ直列gateはexit 0、**14560 passed／0 failed／66 ignored**。
+workspace／integration／doc／vendorの全対象を含み、ネストしたhelper subprocessのfiltered結果2件は
+合計へ二重計上しない（79 summary）。集計は `target/p4d-full-summary.json`。
+metadataのbatch数テストとnative HWND通知テストは、この全体gate内で両方成功した。
+error modeは終了時に元の値へ復帰した。native／metadataの製品コード・テストの期待値は未変更。
+
+| 検証コマンド | 結果 | 記録 |
+| --- | --- | --- |
+| `cargo test -p mimageviewer --lib context_menu` | 最終138 passed／0 failed | `target/p4d-context-final.{log,stderr.log}` |
+| `cargo test -p mimageviewer --lib external_tool` | 最終97 passed／0 failed | `target/p4d-external-final.{log,stderr.log}` |
+| `cargo test -p mimageviewer --lib` | 初回12737 passed／0 failed／59 ignored。配置訂正後の最終全体gateでも同じ本体12737 passed／0 failed／59 ignored（1916.28s） | `target/p4d-main-lib.{log,stderr.log}`、`target/p4d-full-serial-parent.{log,stderr.log}` |
+| `cargo test -p musicvideo-editor` | 最終177 passed／0 failed、bin／docは0件 | `target/p4d-editor-final.{log,stderr.log}` |
+| `cargo test -p mimageviewer --test ui_snapshot` | 最終176 passed／0 failed | `target/p4d-ui-snapshot-final.{log,stderr.log}` |
+| `cargo fmt`、`cargo fmt --check` | 適用済み、最終check exit 0 | `target/p4d-format-apply.log`、`target/p4d-fmt-final.log` |
+| `python scripts/check_ui_glyphs.py` | 最終不足0、exit 0 | `target/p4d-glyph-final.log` |
+| `scripts/test-build-dev-safety.ps1` | mockによる4exe検査PASS、exit 0 | `target/p4d-build-script-final.log` |
+| `scripts/test-full.ps1 -SuppressCrashDialogs`（上記親CLI直列ラッパー） | 全対象14560 passed／0 failed／66 ignored、exit 0 | `target/p4d-full-serial-parent.{log,stderr.log}` |
+
+最終の追加8件と変異A／B再検証、C、snapshot更新、各gateのコマンド・終了コードは
+`target/p4d-final-gates.json`（最後の既定並列fullは上記の失敗記録）に残す。
+最終source／script／PNGの9ファイルは `target/p4d-source-freeze.json` にSHA-256を保存し、
+全体gate後に同一であることを照合した。文書更新は検証を無効にするinclude対象ではない。
+確認buildは `scripts/build-dev.ps1 -PreserveRuntime` を `*>&1` なしで実行し、exit 0。
+core／remote／EPUB worker／製品editorの4exeが `target/dev-runtime` に揃い、PE／CRT検査は
+`runtime=4 pe=4` で成功した（`target/vcrt-pe-reports/dev-runtime.json`）。portable featureは付けない。
+coreは2026-10-15 03:28:06 JST、SHA-256
+`3F064E4683EB281CD1B798B4BE33177C93A2956609904C70E60125C2B98E5639`。
+editorは同03:28:17 JST、SHA-256
+`96CBBDF698D84D4E7C25517743710DC89CAD1F0A068C32B879A0D3B5F088B1E6`。
+4成果物のsize／時刻／hashは `target/p4d-build-artifacts.json`。
+build時もAPPDATAを作業ツリー内sandboxへ向けたが、これは親の一時的な環境設定であり、
+binaryへ固定したdata dirではない。利用者が通常環境で起動すると通常 `%APPDATA%/mimageviewer` を使う。
+生成物は起動していない。独立レビュー・実機検収は未実施のまま。
+
+利用者の確認手順: installed／tray常駐mIVを終了してから、本worktreeで
+`Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。
+通常profileなので実設定／dataを更新し得る。実音声fileの一覧／音楽ビューの右クリック末尾から
+「音楽ビデオを作成」でその音声のeditorが開くこと、画像／動画（動画→音声mode含む）／checkedでは
+項目が出ないこと、非表示設定と既存外部toolの動作を利用者が確認する。
+全build／Cargo検証に `MSBUILDDISABLENODEREUSE=1` を設定。
+テストのAPPDATAは `target/p4d-sandbox/appdata`、App fixtureのdata dirは既存の一時ディレクトリ。
+通常 `%APPDATA%/mimageviewer`、既存untracked `out.mp4` は変更しない。コミットと製品GUIの起動は行わない。
+snapshot差分は設定画面2枚（新規なし）、更新前後を実装担当が目視した。
+詳細は `docs/ui-snapshot-policy.md`。正本／briefとの仕様上の相違はない。
+
 ## 7. インクリメントと受け入れ基準
 
 | # | 内容 | 受け入れ基準 |
@@ -3043,7 +3178,7 @@ frame n → t = n/fps → evaluate → rasterize(CPU, rayon) → RGBA→NV12/YUV
 | **P4a** ✅ | 方式の設計確定: 本書 D10 / D14〜D16 の独立レビュー | GPT-6.1 Sol / xhigh の設計レビューで blocking 指摘なし。**完了**（2026-10-09）: 3 回目で条件付き ACCEPT（残った P3 の文言は反映済み）。runtime 競合の割り切りはユーザー判断で確定 |
 | **P4b** 実装完了・実機確認待ち（P4b-1〜4 すべて独立レビュー ACCEPT、2026-10-14。上書きの競合は利用者が許容。5 分 1080p60 は完走済み・速度は参考値で静かな環境での再計測が残る。音・GUI の実機確認は利用者へ依頼） | ホストの製品化（D16。段の分け方は D16 の「P4b の設計」）: ラボを `crates/musicvideo-editor` へ移し、FFmpeg デコードへ統一、スナップショット入力の MP4 書き出し（モーダル・進捗・キャンセル）、未保存の編集の確認、音声スレッドが stream を所有する再生と f32 以外の出力形式対応 | **P4b-3（2026-10-14、未コミット）**: 指定ゲート 365 passed、追加 18 件すべての変異失敗確認、既存 editor 101 件維持。共通 snapshot／解析／較正／PCM view AAC／原子的公開／モーダル終端を接続し、製品 editor・通常 CLI・dev CLI の release build 成功。編集済み 5 分 1080p60 を dev CLI で 18,000 frames 完走、184.441 秒／1.6265x（背景 Codex 4 件あり、参考値）。詳細は D16 の P4b-3 記録。P4b-2 の実機の音・GUI・H3b は未確認。**P4b-4（2026-10-14、未コミット）**: session 所属の単一意図、歌詞の先行解決、保存後のフレーム末尾の再判定、先行読込の receiver 退役、新規、CancelClose／承認済み Close と書き出し中止の終端待ちを実装。指定ゲート **396 passed**、追加 **31 件**すべて変異失敗確認。初回レビュー REVISE の P2／P3 に対応し、LRC モーダルの実クリック回帰、Project／保存完了の両順序、歌詞取消と同フレームの旧完了を検査。今回 3 件追加・既存 1 件補強、各テストの変異失敗確認、指定テスト **399 passed**。詳細は D16 の P4b-4 記録。修正後の独立レビュー・実機確認・H3b は未完了 |
 | **P4c** 実装完了・実機確認待ち（独立レビュー ACCEPT、2026-10-15） | 起動引数と診断（D10）: `--audio` / `--project` / `--data-dir`、最近使ったプロジェクト、ログ・panic ログ、引数エラーの画面表示、runtime shared lease と取得失敗の表示 | **初回2026-10-14**: 追加21件の変異検証記録あり。**2026-10-15、未コミット修正**: P2のUI出力全経路9か所をworker配送、追加6件すべてで同期出力の変異失敗、P3の実機未完了表記を訂正。指定gate **516 passed / 0 failed / 1 ignored**、fmt／glyph0／製品release build成功。再レビュー・実機検収未実施。詳細は「P4c 実装記録」の独立レビュー1回目対応 |
-| **P4d** | mIV 側の入口: 音楽ビュー・音声ファイルの右クリックから「音楽ビデオを作成」でエディタを起動 | 起動は非同期で UI を止めない。exe 不在・起動失敗は理由付きで通知。閲覧側の退行なし |
+| **P4d** 実装・非対話検証済み（独立レビュー・実機確認待ち） | mIV 側の入口: 音楽ビュー・音声ファイルの右クリックから「音楽ビデオを作成」でエディタを起動 | Grid／Fullscreenの単一実Audioだけ。static ID／非表示設定、worker起動、絶対path引数、失敗通知、build-dev同梱を実装。既存保存順のstatic／動的枠を保つ末尾追加。追加8件の成功と各変異失敗、全対象14560 passed／0 failed／66 ignored、fmt／glyph0、通常featureの4exe確認build成功を記録済み。独立レビュー／製品GUI起動／実機検収／commitなし。詳細は「P4d実装記録」 |
 | **P4e** | 配布（下の表）: launcher 内包・runtime 展開・署名・portable 同梱・全 PE / VC runtime gate・build スクリプト・test-full 前提 | build-dist 相当の通しビルド。runtime 清掃: 旧版 core 終了後にエディタだけ稼働 / 起動との競合 / エディタ終了後の清掃。release のエディタ exe サイズとビルド時間を記録 |
 | **P4f** | 文書: マニュアル・製品ページ・keymap-spec（固定ショートカットの理由）・privacy（通信なし・保存先） | CLAUDE.md「コード修正時のドキュメント同時更新」 |
 
