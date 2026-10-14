@@ -539,7 +539,8 @@ pub struct MusicVideoLabApp {
     waveform: Option<TimelineWaveform>,
     audio_player: Option<AudioPlayer>,
     #[cfg(test)]
-    audio_player_factory: fn(Arc<AudioData>) -> Result<AudioPlayer, String>,
+    audio_player_factory: fn(Arc<AudioData>, ResourceRevision, f64) -> Result<AudioPlayer, String>,
+    playback_error: Option<String>,
     audio_error: Option<String>,
     document: DocumentSession,
     image_errors: HashMap<ImageId, String>,
@@ -604,7 +605,8 @@ impl MusicVideoLabApp {
             waveform: None,
             audio_player: None,
             #[cfg(test)]
-            audio_player_factory: AudioPlayer::new,
+            audio_player_factory: AudioPlayer::new_headless,
+            playback_error: None,
             audio_error: None,
             document: DocumentSession::default(),
             image_errors: HashMap::new(),
@@ -655,10 +657,14 @@ impl MusicVideoLabApp {
             sample_rate: SAMPLE_RATE,
             duration_secs: DURATION_SECS,
         });
-        let player = AudioPlayer::new(Arc::clone(&audio))?;
-        let _ = player.toggle();
         let mut manifest = ResourceManifest::default();
         manifest.set_audio(Some(ResourceLease::new(Arc::clone(&audio))));
+        let mut player = AudioPlayer::new(
+            Arc::clone(&audio),
+            manifest.audio().unwrap().revision(),
+            0.0,
+        )?;
+        player.toggle();
         app.editor_state
             .reset_for_project_with_resources(&app.project, manifest.clone());
         app.runtime_resources = RuntimeResourceState::Ready(manifest);
@@ -806,13 +812,21 @@ impl MusicVideoLabApp {
 
     fn seek_to(&mut self, position_secs: f64) {
         let requested = position_secs.clamp(0.0, self.project.duration_secs.max(0.0));
-        self.position_secs = if self.audio_transport_ready()
-            && let Some(player) = &self.audio_player
-        {
-            player.seek(requested).position_secs
+        self.position_secs = if self.audio_transport_ready() {
+            self.audio.as_ref().map_or(requested, |audio| {
+                (requested * f64::from(audio.sample_rate))
+                    .round()
+                    .clamp(0.0, (audio.stereo_pcm.len() / 2) as f64)
+                    / f64::from(audio.sample_rate.max(1))
+            })
         } else {
             requested
         };
+        if self.audio_transport_ready()
+            && let Some(player) = &mut self.audio_player
+        {
+            player.seek(self.position_secs);
+        }
         self.mark_preview_dirty();
     }
 
@@ -1163,29 +1177,37 @@ impl MusicVideoLabApp {
         waveform: Option<TimelineWaveform>,
     ) -> Option<String> {
         let mut playback_error = None;
-        match (&self.audio_player, &audio) {
+        let revision = self
+            .editor_state
+            .resource_manifest()
+            .audio()
+            .map(ResourceLease::revision);
+        match (&mut self.audio_player, &audio) {
             (Some(player), Some(audio)) => {
-                player.replace_audio(Arc::clone(audio), self.position_secs);
+                player.replace_audio(
+                    Some((
+                        Arc::clone(audio),
+                        revision.expect("adopted PCM has a revision"),
+                    )),
+                    self.position_secs,
+                );
             }
             (None, Some(audio)) => match {
                 #[cfg(test)]
                 let create_player = self.audio_player_factory;
                 #[cfg(not(test))]
                 let create_player = AudioPlayer::new;
-                create_player(Arc::clone(audio))
+                create_player(
+                    Arc::clone(audio),
+                    revision.expect("adopted PCM has a revision"),
+                    self.position_secs,
+                )
             } {
                 Ok(player) => self.audio_player = Some(player),
                 Err(error) => playback_error = Some(error),
             },
             (Some(player), None) => {
-                player.replace_audio(
-                    Arc::new(AudioData {
-                        stereo_pcm: Vec::new(),
-                        sample_rate: 48_000,
-                        duration_secs: 0.0,
-                    }),
-                    0.0,
-                );
+                player.replace_audio(None, 0.0);
             }
             (None, None) => {}
         }
@@ -1372,8 +1394,36 @@ impl MusicVideoLabApp {
         self.audio.is_some() && self.audio_player.is_some() && self.runtime_resources_ready()
     }
 
-    fn clear_decoded_resources(&mut self) {
+    fn playback_snapshot_for_ui(&self) -> PlaybackSnapshot {
+        playback_snapshot_for_ui(
+            self.position_secs,
+            self.audio_transport_ready(),
+            self.audio_player.as_ref().map(AudioPlayer::snapshot),
+            self.audio_player
+                .as_ref()
+                .map_or(0, AudioPlayer::last_operation),
+            self.editor_state
+                .resource_manifest()
+                .audio()
+                .map(ResourceLease::revision),
+        )
+    }
+
+    fn poll_playback_error(&mut self, ctx: &egui::Context) {
         if let Some(player) = &self.audio_player {
+            player.set_repaint_context(ctx);
+            let error = player.snapshot().error;
+            if error != self.playback_error {
+                if let Some(error) = &error {
+                    self.status = format!("音声を再生できません: {error}");
+                }
+                self.playback_error = error;
+            }
+        }
+    }
+
+    fn clear_decoded_resources(&mut self) {
+        if let Some(player) = &mut self.audio_player {
             player.pause();
         }
         let _ = self.install_audio(None, None);
@@ -2014,12 +2064,12 @@ impl MusicVideoLabApp {
         self.document
             .replace_with_loaded(loaded.path, &self.project);
         self.position_secs = 0.0;
-        let playback_error = self.install_audio(loaded.audio, loaded.waveform);
-        self.audio_error = loaded.audio_error.clone();
-        self.image_errors = loaded.image_errors;
         self.editor_state
             .reset_for_project_with_resources(&self.project, loaded.resources.clone());
         self.runtime_resources = RuntimeResourceState::Ready(loaded.resources);
+        let playback_error = self.install_audio(loaded.audio, loaded.waveform);
+        self.audio_error = loaded.audio_error.clone();
+        self.image_errors = loaded.image_errors;
         self.preview_report = RenderReport::default();
         self.invalidate_modulator_calibration();
         let issue_count = self.image_errors.len() + usize::from(loaded.audio_error.is_some());
@@ -2433,11 +2483,8 @@ impl eframe::App for MusicVideoLabApp {
         self.poll_export();
 
         let audio_sync_started = Instant::now();
-        let playback = playback_snapshot_for_ui(
-            self.position_secs,
-            self.audio_transport_ready(),
-            self.audio_player.as_ref().map(AudioPlayer::snapshot),
-        );
+        self.poll_playback_error(ctx);
+        let playback = self.playback_snapshot_for_ui();
         if self.audio_transport_ready()
             && (playback.position_secs - self.position_secs).abs() > 0.000_001
         {
@@ -2524,13 +2571,20 @@ fn playback_snapshot_for_ui(
     current_position_secs: f64,
     audio_ready: bool,
     player_snapshot: Option<PlaybackSnapshot>,
+    last_operation: u64,
+    revision: Option<ResourceRevision>,
 ) -> PlaybackSnapshot {
-    if audio_ready {
-        player_snapshot.unwrap_or_default()
+    if audio_ready
+        && let Some(snapshot) = player_snapshot
+        && snapshot.applied_operation >= last_operation
+        && snapshot.resource_revision == revision
+    {
+        snapshot
     } else {
         PlaybackSnapshot {
             position_secs: current_position_secs,
             playing: false,
+            ..Default::default()
         }
     }
 }
@@ -2750,7 +2804,7 @@ mod tests {
     fn h3a_audio_commit_undo_restores_through_host_handlers_and_rejects_stale_completion() {
         let ctx = egui::Context::default();
         let mut app = h3a_app();
-        app.audio_player_factory = |_| Err("headless test: no audio device".to_owned());
+        app.audio_player_factory = AudioPlayer::new_headless;
         let store = app.resource_store.clone().unwrap();
         let initial_audio = app.audio.clone().unwrap();
         let mut initial_manifest = ResourceManifest::default();
@@ -2832,7 +2886,17 @@ mod tests {
         );
         assert!(app.runtime_resources_ready());
         assert!(Arc::ptr_eq(app.audio.as_ref().unwrap(), &replacement));
-        assert!(app.audio_player.is_none());
+        assert!(app.audio_player.is_some());
+        let replacement_playback = app.audio_player.as_ref().unwrap().wait_applied();
+        assert_eq!(
+            replacement_playback.resource_revision,
+            app.editor_state
+                .resource_manifest()
+                .audio()
+                .map(ResourceLease::revision)
+        );
+        assert!(!replacement_playback.playing);
+        assert_eq!(replacement_playback.position_secs, app.position_secs);
         assert!(Arc::ptr_eq(&owner, &app.preview_timeline));
         let replacement_result = h3a_request(&mut app, &ctx);
         let replacement_key = replacement_result.analysis_key.clone().unwrap();
@@ -2910,6 +2974,13 @@ mod tests {
         app.poll_resource_restore();
         assert!(app.runtime_resources_ready());
         assert_eq!(app.editor_state.resource_manifest(), &initial_manifest);
+        let restored_playback = app.audio_player.as_ref().unwrap().wait_applied();
+        assert_eq!(
+            restored_playback.resource_revision,
+            initial_manifest.audio().map(ResourceLease::revision)
+        );
+        assert!(!restored_playback.playing);
+        assert!(restored_playback.applied_operation > replacement_playback.applied_operation);
         assert!(Arc::ptr_eq(&owner, &app.preview_timeline));
         assert!(
             owner.lock().unwrap().key() == Some(&replacement_key),
@@ -4638,13 +4709,83 @@ mod tests {
         let dormant = PlaybackSnapshot {
             position_secs: 0.0,
             playing: true,
+            ..Default::default()
         };
         assert_eq!(
-            playback_snapshot_for_ui(7.5, false, Some(dormant)),
+            playback_snapshot_for_ui(7.5, false, Some(dormant), 0, None),
             PlaybackSnapshot {
                 position_secs: 7.5,
                 playing: false,
+                ..Default::default()
             }
+        );
+    }
+
+    fn acknowledged_snapshot(
+        operation: u64,
+        revision: ResourceRevision,
+        position: f64,
+    ) -> PlaybackSnapshot {
+        PlaybackSnapshot {
+            applied_operation: operation,
+            resource_revision: Some(revision),
+            position_secs: position,
+            playing: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn p4b2_replacement_rejects_old_position_until_its_operation_is_applied() {
+        let old = ResourceLease::new(Arc::new(())).revision();
+        let new = ResourceLease::new(Arc::new(())).revision();
+        let stale = acknowledged_snapshot(3, old, 0.9);
+        assert_eq!(
+            playback_snapshot_for_ui(0.25, true, Some(stale), 4, Some(new)).position_secs,
+            0.25
+        );
+        let fresh = acknowledged_snapshot(4, new, 0.3);
+        assert_eq!(
+            playback_snapshot_for_ui(0.25, true, Some(fresh), 4, Some(new)).position_secs,
+            0.3
+        );
+    }
+
+    #[test]
+    fn p4b2_undo_rejects_a_previously_applied_snapshot_of_the_same_pcm() {
+        let restored = ResourceLease::new(Arc::new(())).revision();
+        // Revision equality alone is insufficient when Undo returns to this PCM.
+        let stale = acknowledged_snapshot(1, restored, 0.9);
+        assert_eq!(
+            playback_snapshot_for_ui(0.25, true, Some(stale), 5, Some(restored)).position_secs,
+            0.25
+        );
+    }
+
+    #[test]
+    fn p4b2_consecutive_seeks_reject_intermediate_positions_for_the_same_pcm() {
+        let revision = ResourceLease::new(Arc::new(())).revision();
+        let intermediate = acknowledged_snapshot(6, revision, 0.2);
+        assert_eq!(
+            playback_snapshot_for_ui(0.7, true, Some(intermediate), 7, Some(revision))
+                .position_secs,
+            0.7
+        );
+        let fresh = acknowledged_snapshot(7, revision, 0.7);
+        assert_eq!(
+            playback_snapshot_for_ui(0.7, true, Some(fresh), 7, Some(revision)).position_secs,
+            0.7
+        );
+    }
+
+    #[test]
+    fn p4b2_snapshot_of_another_revision_cannot_drive_preview_analysis_time() {
+        let current = ResourceLease::new(Arc::new(())).revision();
+        let other = ResourceLease::new(Arc::new(())).revision();
+        let wrong_pcm = acknowledged_snapshot(4, other, 0.9);
+        assert_eq!(
+            playback_snapshot_for_ui(0.25, true, Some(wrong_pcm), 4, Some(current)).position_secs,
+            0.25
         );
     }
 
@@ -4660,5 +4801,40 @@ mod tests {
 
         assert!(app.runtime_resources_ready());
         assert!(!app.audio_transport_ready());
+    }
+
+    #[test]
+    fn p4b2_device_open_failure_keeps_the_host_play_command_available() {
+        let ctx = egui::Context::default();
+        let mut app = MusicVideoLabApp::new(Arc::new(Assets::default()));
+        app.audio_player_factory = AudioPlayer::new_failing_headless;
+        let pcm = Arc::new(AudioData {
+            stereo_pcm: vec![0.25; 96_000],
+            sample_rate: 48_000,
+            duration_secs: 1.0,
+        });
+        app.position_secs = 0.25;
+        app.commit_audio(
+            PathBuf::from("test.wav"),
+            pcm.clone(),
+            TimelineWaveform::new(1.0, vec![]),
+            ResourceLease::new(pcm),
+            &ctx,
+        );
+        let player = app.audio_player.as_ref().unwrap();
+        assert_eq!(
+            player.wait_applied().error.as_deref(),
+            Some("headless: no device")
+        );
+        assert!(app.audio_transport_ready());
+        app.apply_chrome_actions(&ctx, vec![ChromeAction::TogglePlayback]);
+        let player = app.audio_player.as_ref().unwrap();
+        let snapshot = player.wait_applied();
+        assert_eq!(snapshot.applied_operation, 2);
+        assert_eq!(snapshot.error.as_deref(), Some("headless: no device"));
+        assert!(!snapshot.playing);
+        assert!(app.audio_transport_ready());
+        app.poll_playback_error(&ctx);
+        assert!(app.status.contains("headless: no device"));
     }
 }

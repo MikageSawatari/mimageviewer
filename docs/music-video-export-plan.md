@@ -2231,6 +2231,78 @@ Copy-Item .\vendor\ffmpeg\bin\*.dll .\target\release\
 独立実装レビュー（`d4f1f4447`、GPT-6.1 Sol / xhigh）: **ACCEPT with conditions**。実装上の P1/P2 なし。
 条件（P3）: I1 の検証計画に残っていた `cargo test -p musicvideo_lab` を `musicvideo-editor` に更新した（設計担当が修正）。
 
+
+#### P4b-2 実装記録（2026-10-14）
+
+対象は `musicvideo` の `4cdfd247e27600c043c0ebd2918728cdd6c013e1` 上の未コミット差分。
+正本は本節の P4b-2 と D10「音声再生の所有」、実装 brief は
+[brief-musicvideo-p4b2.md](brief-musicvideo-p4b2.md)。独立実装レビュー・実機確認は別担当へ引き継ぐ。
+
+- `playback.rs` の `AudioPlayer` はコマンド送信口・操作番号・公開 snapshot・repaint 通知先だけを持つ。
+  `musicvideo-audio` がデバイス照会・stream の生成／維持／drop と再生状態を所有する。
+  UI に stream・callback の `PlayerState`・`JoinHandle` は渡さない。終了は FIFO の `Shutdown` を送るだけで、
+  UI は待たない。WASAPI の内部 join を含む stream drop と再生 owner の PCM 解放は音声スレッド内。
+- 音声の差し替えは PCM の `Arc` と `ResourceRevision` の対・位置を同じ `Replace` コマンドへ渡す。
+  音声無しへの切替も同じコマンドで扱う。差し替えは停止・anchor 消去。Toggle／Pause／Seek／Shutdown にも
+  UI が送信時に操作番号を付け、音声スレッドは channel の FIFO 順で適用する。
+- snapshot は適用済み操作番号・PCM revision・聞こえている位置・再生状態・直近のエラーを公開する。
+  callback の PCM lock と snapshot の lock は別で、publisher は両方を同時に保持しない。
+  UI は最後に送った操作番号未満、または現在の PCM revision と違う位置を採用せず、自身の位置を保持する。
+  再生 anchor の時刻／書込済み上限による時計と、H3a の `index_at` へ渡す位置の経路は維持した。
+- cpal 0.16 の全 11 出力形式（f32／f64、i8／i16／I24／i32／i64、u8／u16／u32／u64）を
+  同じ generic callback で充填する。整数は正規化範囲へ clamp して変換し、unsigned の無音は中点。
+  出力 sample rate には既存の分数ステップ・線形補間を維持し、追加の resample 方針や PCM バッファは設けない。
+- 最初の音声採用時のデバイス初期化を音声スレッドへ移した。初期化失敗・デバイス喪失はログと画面の通知にし、
+  再生操作だけで再び開く。seek・pause・snapshot 公開では再試行しない。
+  drop 済み stream の遅れて届いたエラーは、その stream の番号で排除する。
+  停止中はコマンド／デバイスエラーの channel を待ち、再生中だけ 10ms 間隔で時計を公開する。
+  操作適用とエラー公開では egui に repaint を通知する。
+- `app.rs`／`app/chrome.rs` の音声採用・履歴復元・プロジェクト読込・seek・再生操作・終了を接続した。
+  プロジェクト読込は manifest を採用してから、その revision を音声コマンドへ渡す。
+  デバイスを使わない factory は初期化成功／失敗の両方を用意し、本番と同じスレッド loop・FIFO 適用・snapshot
+  公開を通す。既存 A1b の H3a handler テストは実際の音声コマンド acknowledgement と、差し替え／Undo 後の
+  revision・停止・位置・操作番号の前進も検証する。試験の待機は test-only で、製品 UI には入らない。
+
+検証ログと集計は `target/p4b2/`。ビルド・check・テストには `MSBUILDDISABLENODEREUSE=1` を設定。
+既存 **87 件を同名のまま全件維持**（H1／H2／H3a／I1／L1〜L3 を含む）、追加 **14 件**でエディタは
+**101 passed / 0 failed / 0 ignored**。`comparison.json` に旧テストの欠落 0 と追加テストの名前を記録した。
+
+追加テストの検査対象と、実際に失敗を検出した不正実装（いずれも cargo の exit 101、コンパイル失敗ではない）:
+
+| 検査対象 | 不正実装 | 失敗確認ログ |
+| --- | --- | --- |
+| Undo 後の同一 PCM／連続 seek の古い位置（2 件） | 操作番号の比較を撤去 | `mutation-stale-operation.log` |
+| 差し替え直後の古い位置 | 操作番号・PCM revision の比較を撤去 | `mutation-stale-replacement.log` |
+| 別 revision の位置が H3a の時計に入らない | PCM revision の比較を撤去 | `mutation-wrong-revision.log` |
+| Replace→Seek／Seek→Replace の FIFO | Seek の適用を捨てる | `mutation-discard-seek.log` |
+| 差し替え後の停止・anchor 消去・revision 公開 | 差し替え後も playing にする | `mutation-replacement-playing.log` |
+| Pause の聞こえている位置と Seek の操作番号 | Pause が書込カーソルを保持する | `mutation-pause-cursor.log` |
+| f32／i16／u16 の PCM と無音の充填（3 件） | PCM を常に無音へ変換 | `mutation-silent-conversion.log` |
+| PCM lock を保持しても UI 読取可能、その逆も可能 | UI snapshot が callback と同じ PCM lock を取る | `mutation-ui-waits-pcm.log` |
+| 初期化失敗→次の再生だけで再試行、喪失通知、古い stream エラーの排除 | 再生時の初期化再試行を撤去 | `mutation-no-play-retry.log` |
+| デバイス失敗後もホストの再生操作を受付・通知 | 画面へのエラー通知を撤去 | `mutation-no-host-notification.log` |
+| `!Send` の代替 stream の生成／drop が音声スレッド、終了時 UI は待たず PCM を解放 | Shutdown を無視 | `mutation-no-shutdown.log` |
+
+`mutations.json` と `comparison.json` で、**追加 14 件すべての失敗確認がある**ことを照合済み。
+lock 分離テストは保持側を解放してから失敗を報告するため、不正実装でもデッドロックのまま残らない。
+終了テストは stream の drop を channel で意図的に止め、UI の Drop がその解除前に戻ることを確かめる。
+各不正実装はソースの byte 列へ復元し、その後に最終テストと release build を実行した。
+
+| 指定コマンド | 結果 | ログ |
+| --- | --- | --- |
+| `cargo test -p musicvideo-editor` | 101 passed / 0 failed / 0 ignored | `editor-test.log` |
+| `cargo check -p musicvideo-editor --features dev-tools --bins` | exit 0 | `dev-check.log` |
+| `cargo test -p musicvideo-core -p musicvideo-ui` | core 117（unit 115＋経路 2）／UI 122、計 239 passed / 0 failed / 0 ignored | `shared-test.log` |
+| `cargo fmt`／`cargo fmt --check` | exit 0 | `fmt.log`／`fmt-check.log` |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険 glyph 0 | `glyphs.log` |
+| `cargo build --release -p musicvideo-editor --bin mimageviewer-musicvideo` | exit 0、48.33 秒、exe 24,823,808 bytes | `release-build.log`／`release-build.json` |
+
+自動テストは合計 **340 passed / 0 failed / 0 ignored**。コマンド・時間・終了コードは `verification.json`。
+成果物は `target/release/mimageviewer-musicvideo.exe`。このビルドの測定は既存 target キャッシュを使った実測で、
+cold build の推測ではない。依存 DLL の配置条件は上の P4b-1 記録と同じ。
+正本との仕様上の相違はない。P4b-3／4 は未実装、独立実装レビューと実機での音声確認は未実施。
+本体アプリ・製品エディタ・lab GUI の起動、コミットは行っていない。未追跡の `out.mp4` は変更していない。
+
 ---
 
 ## 4. データモデル（v1）
@@ -2381,7 +2453,7 @@ frame n → t = n/fps → evaluate → rasterize(CPU, rayon) → RGBA→NV12/YUV
 | **H3a** ✅ | 解析契約の確定と実装: 共通格子／PCM view／解析タイムライン（チェックポイント・型付き key）／較正入力を、プレビュー・書き出し・PNG・ベンチマークで共有 | **完了**（2026-10-14、`b473603cc` + `b913d9408`）。設計は実装前レビュー 3 回目で ACCEPT、実装は独立レビュー 1 回目 REVISE（P2 2・P3 1）を修正し 2 回目で ACCEPT。A6 は設計担当判断で 4 分位置 約 0.7 秒以内（並列）を採用、生の値のキャッシュなし。解析を使う書き出しの RGBA ハッシュは予定どおり変化、無変調ハッシュ維持。詳細は D3 の H3a 実装記録。画素の一致の確認は H3b（P4b 後） |
 | **H3b** | 一致の検証（P4b 接続後） | プレビューで表示したフレームが、同じ時刻の書き出しフレームと一致する: 表示フレームの欠落、前後への seek、直接 seek、音源より短い / 長い出力尺。これが通るまで H3 を完了扱いにしない |
 | **P4a** ✅ | 方式の設計確定: 本書 D10 / D14〜D16 の独立レビュー | GPT-6.1 Sol / xhigh の設計レビューで blocking 指摘なし。**完了**（2026-10-09）: 3 回目で条件付き ACCEPT（残った P3 の文言は反映済み）。runtime 競合の割り切りはユーザー判断で確定 |
-| **P4b** 設計 ACCEPT・P4b-1 完了（`d4f1f4447`、独立レビュー ACCEPT with conditions）・P4b-2 へ | ホストの製品化（D16。段の分け方は D16 の「P4b の設計」）: ラボを `crates/musicvideo-editor` へ移し、FFmpeg デコードへ統一、スナップショット入力の MP4 書き出し（モーダル・進捗・キャンセル）、未保存の編集の確認、音声スレッドが stream を所有する再生と f32 以外の出力形式対応 | 書き出しがファイルを読み直さず、プレビューと同じ PCM・素材を使う（元ファイル変更・Undo 後の書き出しをテスト）。未保存確認の開く / 新規 / 最近 / 閉じる × 保存成功 / 失敗 / キャンセル、**保存は成功したが完了時点で再び未保存**、保存中・書き出し中の終了を handler テストで固定。書き出しの進捗・キャンセル・失敗が UI を止めない（[ui-responsiveness.md](ui-responsiveness.md) §4）。編集済みプロジェクトの 5 分 1080p60 完走と実測 |
+| **P4b** 設計 ACCEPT・P4b-1 完了（`d4f1f4447`、独立レビュー ACCEPT with conditions）・P4b-2 実装／自動検証済み（未コミット、独立実装レビュー・実機確認待ち） | ホストの製品化（D16。段の分け方は D16 の「P4b の設計」）: ラボを `crates/musicvideo-editor` へ移し、FFmpeg デコードへ統一、スナップショット入力の MP4 書き出し（モーダル・進捗・キャンセル）、未保存の編集の確認、音声スレッドが stream を所有する再生と f32 以外の出力形式対応 | 書き出しがファイルを読み直さず、プレビューと同じ PCM・素材を使う（元ファイル変更・Undo 後の書き出しをテスト）。未保存確認の開く / 新規 / 最近 / 閉じる × 保存成功 / 失敗 / キャンセル、**保存は成功したが完了時点で再び未保存**、保存中・書き出し中の終了を handler テストで固定。書き出しの進捗・キャンセル・失敗が UI を止めない（[ui-responsiveness.md](ui-responsiveness.md) §4）。編集済みプロジェクトの 5 分 1080p60 完走と実測 |
 | **P4c** | 起動引数と診断（D10）: `--audio` / `--project` / `--data-dir`、最近使ったプロジェクト、ログ・panic ログ、引数エラーの画面表示、runtime の shared lease と取得失敗の表示 | 引数解析の単体テスト。最近使った一覧: 壊れた JSON・無いファイル・上限・取消 / 失敗 / 破棄された読込を入れない・一覧の書込失敗で保存成功が覆らない。`--data-dir` 無しで最近一覧とファイルログを永続化しないこと。mIV の設定・DB・ログに触れないこと |
 | **P4d** | mIV 側の入口: 音楽ビュー・音声ファイルの右クリックから「音楽ビデオを作成」でエディタを起動 | 起動は非同期で UI を止めない。exe 不在・起動失敗は理由付きで通知。閲覧側の退行なし |
 | **P4e** | 配布（下の表）: launcher 内包・runtime 展開・署名・portable 同梱・全 PE / VC runtime gate・build スクリプト・test-full 前提 | build-dist 相当の通しビルド。runtime 清掃: 旧版 core 終了後にエディタだけ稼働 / 起動との競合 / エディタ終了後の清掃。release のエディタ exe サイズとビルド時間を記録 |

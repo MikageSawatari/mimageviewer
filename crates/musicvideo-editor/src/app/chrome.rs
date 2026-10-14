@@ -46,12 +46,7 @@ impl ToolbarState {
                 && app.runtime_resources_ready()
                 && app.export_pending.is_none(),
             can_play: app.audio_transport_ready(),
-            playing: playback_snapshot_for_ui(
-                app.position_secs,
-                app.audio_transport_ready(),
-                app.audio_player.as_ref().map(AudioPlayer::snapshot),
-            )
-            .playing,
+            playing: app.playback_snapshot_for_ui().playing,
             position_secs: app.position_secs,
             duration_secs: app.project.duration_secs,
         }
@@ -604,8 +599,8 @@ impl MusicVideoLabApp {
                     }
                 }
                 ChromeAction::TogglePlayback => {
-                    if let Some(player) = &self.audio_player {
-                        self.position_secs = player.toggle().position_secs;
+                    if let Some(player) = &mut self.audio_player {
+                        player.toggle();
                         reset_perf = true;
                         self.schedule_playback_preview();
                     }
