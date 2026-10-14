@@ -1009,7 +1009,7 @@ plugin 未登録 Context の従来動作、現在 viewport の診断と explicit
 段 2a は `cargo test -p egui-ime --lib` → `cargo test -p mimageviewer --lib ime_focus::tests` →
 `cargo test -p mimageviewer --lib egui_focus_policy::tests` / 関連 keymap・App / native テスト →
 `cargo check -p mimageviewer --bin mimageviewer-core` の順。
-段 2b は `cargo test -p musicvideo-ui --lib` と `cargo test -p musicvideo_lab`、ホストの check を加える。
+段 2b は `cargo test -p musicvideo-ui --lib` と `cargo test -p musicvideo-editor`（P4b-1 以前は `musicvideo_lab`）、ホストの check を加える。
 本体 helper の利用が広いので、段 2a の区切りで
 `cargo test -p mimageviewer --test ui_snapshot` と `.\scripts\test-full.ps1` を必須とする。
 段 2b 完了時も追加された共有 UI / ホストを含む全体 gate を通す。
@@ -2158,7 +2158,7 @@ P4b-4 と H3b を検収に残す。
 歌詞の取消と読込完了が同じフレームになる順序、Ready / 待機中の読込がある状態での意図受理を加える。
 3 回目（同日）: 指摘なし、ACCEPT。実装では取消フラグだけで済ませず、既に受信可能になった成功結果も採用しないこと。
 
-#### P4b-1 実装記録（2026-10-14、未コミット）
+#### P4b-1 実装記録（2026-10-14）
 
 対象は `musicvideo` の `01f16465264f6c4b95ab862c3141db43cb59c723` 上の差分。
 `tools/musicvideo_lab` を `crates/musicvideo-editor` に移動し、旧ホストは残していない。
@@ -2227,6 +2227,9 @@ Copy-Item .\vendor\ffmpeg\bin\*.dll .\target\release\
 テスト用の FFmpeg DLL は既に `target/debug/deps/` に配置済みで、追加コピーは不要だった。
 正本の P4b-1 との仕様上の相違はない。独立実装レビューは別担当に引き継ぐ。
 コミット・本体アプリ・製品エディタ・旧ラボ GUI の起動は行っていない。
+
+独立実装レビュー（`d4f1f4447`、GPT-6.1 Sol / xhigh）: **ACCEPT with conditions**。実装上の P1/P2 なし。
+条件（P3）: I1 の検証計画に残っていた `cargo test -p musicvideo_lab` を `musicvideo-editor` に更新した（設計担当が修正）。
 
 ---
 
@@ -2378,7 +2381,7 @@ frame n → t = n/fps → evaluate → rasterize(CPU, rayon) → RGBA→NV12/YUV
 | **H3a** ✅ | 解析契約の確定と実装: 共通格子／PCM view／解析タイムライン（チェックポイント・型付き key）／較正入力を、プレビュー・書き出し・PNG・ベンチマークで共有 | **完了**（2026-10-14、`b473603cc` + `b913d9408`）。設計は実装前レビュー 3 回目で ACCEPT、実装は独立レビュー 1 回目 REVISE（P2 2・P3 1）を修正し 2 回目で ACCEPT。A6 は設計担当判断で 4 分位置 約 0.7 秒以内（並列）を採用、生の値のキャッシュなし。解析を使う書き出しの RGBA ハッシュは予定どおり変化、無変調ハッシュ維持。詳細は D3 の H3a 実装記録。画素の一致の確認は H3b（P4b 後） |
 | **H3b** | 一致の検証（P4b 接続後） | プレビューで表示したフレームが、同じ時刻の書き出しフレームと一致する: 表示フレームの欠落、前後への seek、直接 seek、音源より短い / 長い出力尺。これが通るまで H3 を完了扱いにしない |
 | **P4a** ✅ | 方式の設計確定: 本書 D10 / D14〜D16 の独立レビュー | GPT-6.1 Sol / xhigh の設計レビューで blocking 指摘なし。**完了**（2026-10-09）: 3 回目で条件付き ACCEPT（残った P3 の文言は反映済み）。runtime 競合の割り切りはユーザー判断で確定 |
-| **P4b** 設計 ACCEPT・P4b-1 実装／指定自動検証済み・独立レビュー待ち（P4b-2〜4 未実装） | ホストの製品化（D16。段の分け方は D16 の「P4b の設計」）: ラボを `crates/musicvideo-editor` へ移し、FFmpeg デコードへ統一、スナップショット入力の MP4 書き出し（モーダル・進捗・キャンセル）、未保存の編集の確認、音声スレッドが stream を所有する再生と f32 以外の出力形式対応 | 書き出しがファイルを読み直さず、プレビューと同じ PCM・素材を使う（元ファイル変更・Undo 後の書き出しをテスト）。未保存確認の開く / 新規 / 最近 / 閉じる × 保存成功 / 失敗 / キャンセル、**保存は成功したが完了時点で再び未保存**、保存中・書き出し中の終了を handler テストで固定。書き出しの進捗・キャンセル・失敗が UI を止めない（[ui-responsiveness.md](ui-responsiveness.md) §4）。編集済みプロジェクトの 5 分 1080p60 完走と実測 |
+| **P4b** 設計 ACCEPT・P4b-1 完了（`d4f1f4447`、独立レビュー ACCEPT with conditions）・P4b-2 へ | ホストの製品化（D16。段の分け方は D16 の「P4b の設計」）: ラボを `crates/musicvideo-editor` へ移し、FFmpeg デコードへ統一、スナップショット入力の MP4 書き出し（モーダル・進捗・キャンセル）、未保存の編集の確認、音声スレッドが stream を所有する再生と f32 以外の出力形式対応 | 書き出しがファイルを読み直さず、プレビューと同じ PCM・素材を使う（元ファイル変更・Undo 後の書き出しをテスト）。未保存確認の開く / 新規 / 最近 / 閉じる × 保存成功 / 失敗 / キャンセル、**保存は成功したが完了時点で再び未保存**、保存中・書き出し中の終了を handler テストで固定。書き出しの進捗・キャンセル・失敗が UI を止めない（[ui-responsiveness.md](ui-responsiveness.md) §4）。編集済みプロジェクトの 5 分 1080p60 完走と実測 |
 | **P4c** | 起動引数と診断（D10）: `--audio` / `--project` / `--data-dir`、最近使ったプロジェクト、ログ・panic ログ、引数エラーの画面表示、runtime の shared lease と取得失敗の表示 | 引数解析の単体テスト。最近使った一覧: 壊れた JSON・無いファイル・上限・取消 / 失敗 / 破棄された読込を入れない・一覧の書込失敗で保存成功が覆らない。`--data-dir` 無しで最近一覧とファイルログを永続化しないこと。mIV の設定・DB・ログに触れないこと |
 | **P4d** | mIV 側の入口: 音楽ビュー・音声ファイルの右クリックから「音楽ビデオを作成」でエディタを起動 | 起動は非同期で UI を止めない。exe 不在・起動失敗は理由付きで通知。閲覧側の退行なし |
 | **P4e** | 配布（下の表）: launcher 内包・runtime 展開・署名・portable 同梱・全 PE / VC runtime gate・build スクリプト・test-full 前提 | build-dist 相当の通しビルド。runtime 清掃: 旧版 core 終了後にエディタだけ稼働 / 起動との競合 / エディタ終了後の清掃。release のエディタ exe サイズとビルド時間を記録 |
