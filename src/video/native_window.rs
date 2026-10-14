@@ -16,7 +16,7 @@ use windows::Win32::UI::Input::Ime::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
-    VK_CONTROL, VK_MENU, VK_SHIFT,
+    VK_CONTROL, VK_MENU, VK_PROCESSKEY, VK_SHIFT,
 };
 use windows::Win32::UI::Input::Pointer::{
     GetPointerInfo, GetPointerType, POINTER_FLAG_CANCELED, POINTER_INFO,
@@ -2221,8 +2221,9 @@ unsafe extern "system" fn wnd_proc(
             }
         }
         WM_KEYDOWN | WM_SYSKEYDOWN => {
-            if let Some(sink) = window_state(hwnd).and_then(|s| s.event_sink.as_ref()) {
-                let key = native_key_event(hwnd, msg, wparam, lparam);
+            if let Some(sink) = window_state(hwnd).and_then(|s| s.event_sink.as_ref())
+                && let Some(key) = native_key_event(hwnd, msg, wparam, lparam)
+            {
                 crate::key_debug::record_native_video_key(key, true);
                 sink.send(NativeVideoWindowEvent::KeyDown(key));
             }
@@ -2246,8 +2247,9 @@ unsafe extern "system" fn wnd_proc(
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_KEYUP | WM_SYSKEYUP => {
-            if let Some(sink) = window_state(hwnd).and_then(|s| s.event_sink.as_ref()) {
-                let key = native_key_event(hwnd, msg, wparam, lparam);
+            if let Some(sink) = window_state(hwnd).and_then(|s| s.event_sink.as_ref())
+                && let Some(key) = native_key_event(hwnd, msg, wparam, lparam)
+            {
                 crate::key_debug::record_native_video_key(key, false);
                 sink.send(NativeVideoWindowEvent::KeyUp(key));
             }
@@ -2729,14 +2731,25 @@ fn ime_composition_string(hwnd: HWND, mode: IME_COMPOSITION_STRING) -> Option<St
     }
 }
 
-fn native_key_event(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> NativeVideoKeyEvent {
+fn native_key_event(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> Option<NativeVideoKeyEvent> {
+    // This boundary owns both raw shortcut publication and its debug receipt.
+    // IME-owned presses (including repeats) are not application keys. Preserve
+    // releases for any held-key cleanup in the consumers.
+    if matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN) && wparam.0 as u32 == u32::from(VK_PROCESSKEY.0) {
+        return None;
+    }
     // The native presenter WndProc is a separate input route and is explicitly
     // outside the app-side synthetic timeline.
     let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
     let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
     let alt = unsafe { GetKeyState(VK_MENU.0 as i32) } < 0;
     let raw = lparam.0 as u64;
-    NativeVideoKeyEvent {
+    Some(NativeVideoKeyEvent {
         receipt: crate::mouse_seek_debug::win32_key_receipt(
             NativeVideoWindowSource::Presenter,
             hwnd.0 as usize as u64,
@@ -2749,7 +2762,7 @@ fn native_key_event(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Nat
         ctrl,
         alt,
         repeat: ((lparam.0 as u64) & (1 << 30)) != 0,
-    }
+    })
 }
 
 fn native_mouse_event(wparam: WPARAM, lparam: LPARAM) -> NativeVideoMouseEvent {
@@ -3172,6 +3185,83 @@ mod tests {
         assert_eq!(receipt_id(&render_mouse), 77);
         assert_eq!(pump_mouse.sequence, 2);
         assert_eq!(render_mouse.sequence, 1);
+        assert!(!overflow.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn processkey_presses_do_not_publish_jis_shortcuts_but_releases_remain() {
+        use crate::keymap::KeyName;
+
+        let overflow = Arc::new(AtomicBool::new(false));
+        let (pump_route, pump_rx) = native_window_event_route(8, Arc::clone(&overflow));
+        let (render_route, render_rx) = native_window_event_route(8, Arc::clone(&overflow));
+        let sink = NativeVideoWindowEventSink::new(
+            9,
+            9,
+            NativeVideoWindowSource::Presenter,
+            pump_route,
+            render_route,
+        );
+        for (key, scan_code) in [
+            (KeyName::JisCaret, 0x0d),
+            (KeyName::JisAt, 0x1a),
+            (KeyName::IntlYen, 0x7d),
+            (KeyName::IntlRo, 0x73),
+        ] {
+            for msg in [WM_KEYDOWN, WM_SYSKEYDOWN] {
+                for repeat in [false, true] {
+                    let lparam = LPARAM((scan_code << 16) | (isize::from(repeat) << 30));
+                    let ordinary = native_key_event(
+                        HWND::default(),
+                        msg,
+                        WPARAM(key.to_vk() as usize),
+                        lparam,
+                    )
+                    .expect("ordinary JIS press remains publishable");
+                    assert_eq!(ordinary.repeat, repeat);
+                    assert!(key.matches_win32(
+                        ordinary.virtual_key,
+                        ordinary.scan_code,
+                        ordinary.extended
+                    ));
+                    sink.send(NativeVideoWindowEvent::KeyDown(ordinary));
+                    assert!(pump_rx.drain().is_empty());
+                    let events = render_rx.drain();
+                    assert!(matches!(events.as_slice(), [envelope]
+                        if matches!(&envelope.event, NativeVideoWindowEvent::KeyDown(event)
+                            if key.matches_win32(event.virtual_key, event.scan_code, event.extended))));
+
+                    let processed = native_key_event(HWND::default(), msg, WPARAM(0xE5), lparam);
+                    assert!(processed.is_none(), "IME-owned {key:?} repeat={repeat}");
+                    if let Some(event) = processed {
+                        sink.send(NativeVideoWindowEvent::KeyDown(event));
+                    }
+                    assert!(pump_rx.drain().is_empty());
+                    assert!(render_rx.drain().is_empty());
+                }
+            }
+            for msg in [WM_KEYUP, WM_SYSKEYUP] {
+                let release = native_key_event(
+                    HWND::default(),
+                    msg,
+                    WPARAM(0xE5),
+                    LPARAM((scan_code << 16) | (1 << 30) | (1 << 31)),
+                )
+                .expect("IME-owned release remains publishable for held-key cleanup");
+                assert_eq!(release.virtual_key, 0xE5);
+                assert!(key.matches_win32(
+                    release.virtual_key,
+                    release.scan_code,
+                    release.extended
+                ));
+                sink.send(NativeVideoWindowEvent::KeyUp(release));
+                assert!(pump_rx.drain().is_empty());
+                let events = render_rx.drain();
+                assert!(matches!(events.as_slice(), [envelope]
+                    if matches!(&envelope.event, NativeVideoWindowEvent::KeyUp(event)
+                        if key.matches_win32(event.virtual_key, event.scan_code, event.extended))));
+            }
+        }
         assert!(!overflow.load(Ordering::Acquire));
     }
 

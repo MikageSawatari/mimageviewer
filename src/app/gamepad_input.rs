@@ -10207,8 +10207,24 @@ mod tests {
         assert!(crate::ime_focus::ime_input_active(&ctx));
         let _ = ctx.end_pass();
 
-        ctx.begin_pass(viewport_raw_input(egui::ViewportId::ROOT, Vec::new()));
+        // RawInput reports every live viewport, including a sibling whose
+        // composition is read by this ROOT pass without consuming its queue.
+        let mut root_input = viewport_raw_input(egui::ViewportId::ROOT, Vec::new());
+        root_input
+            .viewports
+            .insert(fullscreen_viewport, Default::default());
+        ctx.begin_pass(root_input);
         assert!(gamepad_text_input_active(
+            &ctx,
+            Some(fullscreen_viewport),
+            no_presenter_input,
+        ));
+        let _ = ctx.end_pass();
+
+        // Omitting the viewer now explicitly models its destruction. Its stale
+        // composition must no longer block the gamepad on a surviving surface.
+        ctx.begin_pass(viewport_raw_input(egui::ViewportId::ROOT, Vec::new()));
+        assert!(!gamepad_text_input_active(
             &ctx,
             Some(fullscreen_viewport),
             no_presenter_input,

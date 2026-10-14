@@ -4300,6 +4300,20 @@ fn adjusted_book_reorder_group_insert_index(
     insert_index.saturating_sub(removed_before)
 }
 
+fn book_reorder_group_move_changes_order(
+    state: &crate::app::BookReorderState,
+    insert_index: usize,
+) -> bool {
+    let indices = selected_book_reorder_indices(&state.entries, &state.selected_keys);
+    let Some(&first) = indices.first() else {
+        return false;
+    };
+    let contiguous = indices.windows(2).all(|pair| pair[1] == pair[0] + 1);
+    !contiguous
+        || adjusted_book_reorder_group_insert_index(&indices, insert_index, state.entries.len())
+            != first
+}
+
 fn move_selected_book_reorder_group(
     state: &mut crate::app::BookReorderState,
     insert_index: usize,
@@ -7780,9 +7794,7 @@ impl App {
                                                     format!("{} ({}p)", row.name, row.page_count)
                                                 };
                                                 if ui.button(label).clicked() {
-                                                    self.settings.active_book_name = row.name.clone();
-                                                    self.settings.save();
-                                                    self.book_manager_rename_name = row.name;
+                                                    self.select_book_append_target(row.name);
                                                     ui.close();
                                                 }
                                             }
@@ -8660,6 +8672,27 @@ impl App {
         (fav_nav, sort_changed)
     }
 
+    /// Accepted target changes share a boundary across menu, manager, and
+    /// toolbar. Reselecting the same effective folder is a read-only no-op.
+    pub(crate) fn select_book_append_target(&mut self, name: String) -> bool {
+        let name = crate::books::normalize_book_name(&name);
+        if name.is_empty()
+            || crate::folder_tree::path_eq(
+                &crate::books::book_folder(&self.book_root_path(), &name),
+                &self.active_book_folder_path(),
+            )
+        {
+            return false;
+        }
+        if !self.admit_book_append_followup_mutation() {
+            return false;
+        }
+        self.settings.active_book_name = name.clone();
+        self.settings.save();
+        self.book_manager_rename_name = name;
+        true
+    }
+
     pub(crate) fn open_book_reorder_from_current(&mut self) {
         let Some(folder) = self.current_folder.clone() else {
             self.show_feedback_toast("本フォルダを開いてから並べ替えてください".to_string());
@@ -8965,9 +8998,7 @@ impl App {
             }
         }
         if let Some(name) = set_active_request {
-            self.settings.active_book_name = name.clone();
-            self.settings.save();
-            self.book_manager_rename_name = name;
+            self.select_book_append_target(name);
         }
         if let Some(name) = pin_toggle_request {
             if let Some(pos) = self.settings.pinned_books.iter().position(|b| b == &name) {
@@ -9274,6 +9305,12 @@ impl App {
             })
             .unwrap_or_else(|| "ページ並べ替え".to_string());
         let mut window_open = true;
+        // The window borrows its document locally so successful draft changes
+        // can use App admission before mutation. Admission only checks the
+        // existing book intent and expires the receipt; it cannot re-enter UI.
+        let Some(mut reorder_state) = self.book_reorder.take() else {
+            return;
+        };
         egui::Window::new(title)
             .id(egui::Id::new("book_reorder_window"))
             .open(&mut window_open)
@@ -9288,9 +9325,7 @@ impl App {
                 BOOK_REORDER_MIN_WINDOW_H,
             ))
             .show(ctx, |ui| {
-                let Some(state) = self.book_reorder.as_mut() else {
-                    return;
-                };
+                let state = &mut reorder_state;
                 let busy = state.flush_pending.is_some() || state.transfer_pending.is_some();
                 ensure_book_reorder_selection(state);
                 if let Some(err) = &state.error {
@@ -9316,7 +9351,9 @@ impl App {
                         .on_hover_text("左へ移動")
                         .clicked()
                     {
-                        if move_selected_book_reorder_by(state, -1) {
+                        if self.admit_book_append_followup_mutation()
+                            && move_selected_book_reorder_by(state, -1)
+                        {
                             state.dirty = true;
                         }
                     }
@@ -9325,7 +9362,9 @@ impl App {
                         .on_hover_text("右へ移動")
                         .clicked()
                     {
-                        if move_selected_book_reorder_by(state, 1) {
+                        if self.admit_book_append_followup_mutation()
+                            && move_selected_book_reorder_by(state, 1)
+                        {
                             state.dirty = true;
                         }
                     }
@@ -9766,7 +9805,10 @@ impl App {
                 if let Some((src, insert_index)) = move_request {
                     let len = state.entries.len();
                     if src < len {
-                        if move_selected_book_reorder_group(state, insert_index) {
+                        if book_reorder_group_move_changes_order(state, insert_index)
+                            && self.admit_book_append_followup_mutation()
+                            && move_selected_book_reorder_group(state, insert_index)
+                        {
                             state.dirty = true;
                         }
                     }
@@ -9779,6 +9821,7 @@ impl App {
                     state.drag_insert_index = None;
                 }
             });
+        self.book_reorder = Some(reorder_state);
         if !window_open
             && save_request.is_none()
             && !close
@@ -11381,9 +11424,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         }
 
         if let Some(name) = toolbar_book_target_name {
-            self.settings.active_book_name = name.clone();
-            self.settings.save();
-            self.book_manager_rename_name = name;
+            self.select_book_append_target(name);
         }
         if toolbar_book_add && self.grid_item_input_allowed() {
             self.add_grid_selection_to_active_book(ctx);
@@ -22066,6 +22107,73 @@ mod rating_filter_op_tests {
 }
 
 #[cfg(test)]
+mod book_append_target_tests {
+    use super::*;
+
+    fn install_receipt(app: &mut crate::app::AppTestEnvForTest) {
+        let root = app.tmp.path().join("target-select-books");
+        let folder = root.join("Current");
+        std::fs::create_dir_all(&folder).unwrap();
+        let mut builder =
+            crate::book_append_undo::AppendReceiptBuilder::begin(&root, &folder, "Current".into())
+                .unwrap();
+        let page = folder.join("0001_page.jpg");
+        std::fs::write(&page, b"generated page").unwrap();
+        builder.record(&page).unwrap();
+        app.settings.book_root = Some(root);
+        app.settings.active_book_name = "Current".into();
+        app.book_append_undo_receipt = Some(crate::book_append_undo::BookAppendUndoReceipt {
+            files: builder.finish().unwrap(),
+            operation_id: 1,
+            source_context: app.virtual_list_context_id(),
+            accepted_revision: app.book_append_undo_revision,
+        });
+    }
+
+    #[test]
+    fn section1373_reselecting_the_same_book_target_preserves_receipt_and_revision() {
+        let mut app = crate::app::setup_app_for_test();
+        install_receipt(&mut app);
+        let revision = app.book_append_undo_revision;
+        assert!(!app.select_book_append_target("Current".into()));
+        assert_eq!(app.settings.active_book_name, "Current");
+        assert_eq!(app.book_append_undo_revision, revision);
+        assert!(app.book_append_undo_receipt.is_some());
+    }
+
+    #[test]
+    fn section1373_target_change_rejects_only_undo_append_before_setting_write() {
+        for undo_pending in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            install_receipt(&mut app);
+            let receipt = app.book_append_undo_receipt.as_ref().unwrap().clone();
+            let (_tx, rx) = std::sync::mpsc::channel();
+            app.book_op_pending = Some(crate::books::BookOpPending {
+                rx,
+                intent: if undo_pending {
+                    crate::books::BookOpIntent::UndoAppend { receipt }
+                } else {
+                    crate::books::BookOpIntent::SourceMutation
+                },
+            });
+            let revision = app.book_append_undo_revision;
+            assert!(!app.select_book_append_target("Current".into()));
+            assert_eq!(app.book_append_undo_revision, revision);
+            assert_eq!(app.select_book_append_target("Next".into()), !undo_pending);
+            if undo_pending {
+                assert_eq!(app.settings.active_book_name, "Current");
+                assert_eq!(app.book_append_undo_revision, revision);
+                assert!(app.book_append_undo_receipt.is_some());
+            } else {
+                assert_eq!(app.settings.active_book_name, "Next");
+                assert_eq!(app.book_append_undo_revision, revision + 1);
+                assert!(app.book_append_undo_receipt.is_none());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod book_reorder_drag_tests {
     use super::*;
 
@@ -22289,6 +22397,26 @@ mod book_reorder_drag_tests {
             ),
             1500.0
         );
+    }
+
+    #[test]
+    fn group_move_admission_ignores_same_order_and_empty_selection() {
+        for (selected, insertion, changed) in [
+            (vec!["b", "c"], 1, false),
+            (vec!["b", "c"], 2, false),
+            (vec!["b", "c"], 3, false),
+            (vec!["b", "c"], 4, true),
+            (vec!["a", "c"], 1, true),
+        ] {
+            let state = reorder_state(&["a", "b", "c", "d"], &selected);
+            assert_eq!(
+                book_reorder_group_move_changes_order(&state, insertion),
+                changed
+            );
+        }
+        let mut state = reorder_state(&["a", "b", "c", "d"], &[]);
+        state.selected_keys.clear();
+        assert!(!book_reorder_group_move_changes_order(&state, 4));
     }
 
     #[test]
@@ -30196,6 +30324,167 @@ mod section207_tests {
         assert!(app.borrow().address_has_focus);
     }
 
+    fn run_ime_committed_bar_enter(address: bool, same_pass: bool, recover_focus: bool) {
+        let mut env = crate::app::setup_app_for_test();
+        only_folder_and_tree(&mut env);
+        let target = env.tmp.path().join("committed-target");
+        std::fs::create_dir_all(&target).unwrap();
+        if address {
+            env.address.clear();
+        } else {
+            env.show_search_bar = true;
+            env.search_query.clear();
+            env.search_focus_request = true;
+        }
+        let app = Rc::new(RefCell::new(env));
+        let render = Rc::clone(&app);
+        let nav = Rc::new(RefCell::new(Vec::new()));
+        let nav_render = Rc::clone(&nav);
+        let force_focus_loss = Rc::new(Cell::new(false));
+        let force_focus_loss_render = Rc::clone(&force_focus_loss);
+        let fonts = Cell::new(false);
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(1200.0, 280.0))
+            .build(move |ctx| {
+                crate::ime_focus::install_ime_input_policy(ctx);
+                if !fonts.replace(true) {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    ctx.request_repaint();
+                    return;
+                }
+                let mut app = render.borrow_mut();
+                app.update_ime_state(ctx);
+                if force_focus_loss_render.replace(false) {
+                    ctx.memory_mut(|memory| {
+                        if let Some(id) = memory.focused() {
+                            memory.surrender_focus(id);
+                        }
+                    });
+                }
+                if address {
+                    if let Some(value) = app.render_toolbar(ctx).1 {
+                        nav_render.borrow_mut().push(value);
+                    }
+                } else {
+                    app.render_search_bar(ctx);
+                }
+            });
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .click();
+        harness.run();
+        let edit_id = harness.ctx.memory(|memory| memory.focused()).unwrap();
+        // input_mut feeds the whole event sequence to ONE egui pass; Harness::event
+        // would run separate passes for each event and miss the same-pass regression.
+        harness.input_mut().events = vec![
+            egui::Event::Ime(egui::ImeEvent::Enabled),
+            egui::Event::Ime(egui::ImeEvent::Preedit("preedit".into())),
+        ];
+        harness.step();
+        assert!(app.borrow().ime_input_active(&harness.ctx));
+        assert!(nav.borrow().is_empty());
+        assert!(app.borrow().search_pending.is_none());
+        let committed = if address {
+            target.to_string_lossy().to_string()
+        } else {
+            "committed-search".to_owned()
+        };
+        let mut events = vec![
+            egui::Event::Ime(egui::ImeEvent::Commit(committed.clone())),
+            egui::Event::Ime(egui::ImeEvent::Disabled),
+        ];
+        if !same_pass {
+            harness.input_mut().events = std::mem::take(&mut events);
+            harness.step();
+            assert_eq!(harness.ctx.memory(|memory| memory.focused()), Some(edit_id));
+            assert!(nav.borrow().is_empty());
+            assert!(app.borrow().search_pending.is_none());
+            if recover_focus {
+                force_focus_loss.set(true);
+                harness.input_mut().events = vec![
+                    egui::Event::Ime(egui::ImeEvent::Disabled),
+                    egui::Event::Key {
+                        key: egui::Key::J,
+                        physical_key: Some(egui::Key::J),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::ALT,
+                    },
+                ];
+                harness.step();
+                assert_eq!(harness.ctx.memory(|memory| memory.focused()), Some(edit_id));
+                assert!(!app.borrow().search_focus_request);
+                assert!(nav.borrow().is_empty());
+                assert!(app.borrow().search_pending.is_none());
+            }
+        }
+        events.push(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: Some(egui::Key::Enter),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.input_mut().events = events;
+        harness.step();
+        assert!(!app.borrow().ime_input_active(&harness.ctx));
+        assert_ne!(harness.ctx.memory(|memory| memory.focused()), Some(edit_id));
+        if address {
+            assert!(
+                matches!(nav.borrow().as_slice(), [AddressBarNav::Direct(path, _)] if path == &target)
+            );
+            assert!(!app.borrow().address_has_focus);
+        } else {
+            assert_eq!(app.borrow().search_query, committed);
+            assert!(
+                app.borrow().search_pending.is_some(),
+                "the real search handler submits the committed query"
+            );
+            assert!(!app.borrow().search_has_focus);
+            assert!(!app.borrow().search_focus_request);
+        }
+        harness.input_mut().events = vec![egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: Some(egui::Key::Enter),
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }];
+        harness.step();
+        assert_ne!(harness.ctx.memory(|memory| memory.focused()), Some(edit_id));
+    }
+
+    #[test]
+    fn address_ime_commit_and_immediate_enter_same_pass_navigates_and_releases_focus() {
+        run_ime_committed_bar_enter(true, true, false);
+    }
+
+    #[test]
+    fn address_ime_commit_and_immediate_enter_next_pass_navigates_and_releases_focus() {
+        run_ime_committed_bar_enter(true, false, false);
+    }
+
+    #[test]
+    fn search_ime_commit_and_immediate_enter_same_pass_submits_and_releases_focus() {
+        run_ime_committed_bar_enter(false, true, false);
+    }
+
+    #[test]
+    fn search_ime_commit_and_immediate_enter_next_pass_submits_and_releases_focus() {
+        run_ime_committed_bar_enter(false, false, false);
+    }
+
+    #[test]
+    fn address_bar_focus_recovery_then_enter_navigates_and_releases_focus() {
+        run_ime_committed_bar_enter(true, false, true);
+    }
+
+    #[test]
+    fn search_bar_focus_recovery_then_enter_submits_and_releases_focus() {
+        run_ime_committed_bar_enter(false, false, true);
+    }
+
     #[test]
     fn section207_toolbar_reset_and_drag_order_include_the_whole_folder_section() {
         let mut app = crate::app::setup_app_for_test();
@@ -30482,6 +30771,26 @@ mod section292_tests {
         refresh.click();
         harness.run();
         SORT_CONTROL_TEST_RELOADS.with(|count| assert_eq!(count.get(), 1));
+        {
+            let mut app = app.borrow_mut();
+            let ctx = egui::Context::default();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while app
+                .top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+                || app.sidecar_restore_active()
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "refresh did not settle"
+                );
+                app.settle_open_path_classification_for_test();
+                app.poll_sidecar_restore(&ctx);
+                app.poll_history_navigation_transition_for_test(&ctx);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
         app.borrow_mut().finish_page_identity_preparation_for_test();
         assert!(
             app.borrow()

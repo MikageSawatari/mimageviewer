@@ -226,6 +226,61 @@ fn store_page_scope_overrides(
 mod tests {
     use super::*;
 
+    #[test]
+    fn section1373_pending_trim_flush_and_removal_reject_only_undo_without_dropping_drafts() {
+        for undo_pending in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let root = app.tmp.path().join("trim-append-books");
+            let folder = root.join("book");
+            std::fs::create_dir_all(&folder).unwrap();
+            let mut builder =
+                crate::book_append_undo::AppendReceiptBuilder::begin(&root, &folder, "book".into())
+                    .unwrap();
+            let page = folder.join("0001_page.jpg");
+            std::fs::write(&page, b"generated page").unwrap();
+            builder.record(&page).unwrap();
+            let receipt = crate::book_append_undo::BookAppendUndoReceipt {
+                files: builder.finish().unwrap(),
+                operation_id: 1,
+                source_context: app.virtual_list_context_id(),
+                accepted_revision: app.book_append_undo_revision,
+            };
+            app.book_append_undo_receipt = Some(receipt.clone());
+            app.items = vec![crate::grid_item::GridItem::Image(page)];
+            let override_value = ViewTrimPageOverride::from_margins(ViewTrimMargins {
+                top: 0.15,
+                ..Default::default()
+            });
+            app.view_trim_page_overrides.insert(0, override_value);
+            app.view_trim_dirty_page_overrides.insert(0);
+            app.view_trim_save_pending = true;
+            let (_tx, rx) = std::sync::mpsc::channel();
+            app.book_op_pending = Some(crate::books::BookOpPending {
+                rx,
+                intent: if undo_pending {
+                    crate::books::BookOpIntent::UndoAppend { receipt }
+                } else {
+                    crate::books::BookOpIntent::SourceMutation
+                },
+            });
+            let revision = app.book_append_undo_revision;
+            app.persist_pending_view_trim_state();
+            app.remove_view_trim_page_overrides_for_spread(0, SpreadPair::Single);
+            if undo_pending {
+                assert!(app.view_trim_save_pending);
+                assert!(app.view_trim_dirty_page_overrides.contains(&0));
+                assert_eq!(app.view_trim_page_overrides.get(&0), Some(&override_value));
+                assert_eq!(app.book_append_undo_revision, revision);
+            } else {
+                assert!(!app.view_trim_save_pending);
+                assert!(app.view_trim_dirty_page_overrides.is_empty());
+                assert!(!app.view_trim_page_overrides.contains_key(&0));
+                assert!(app.book_append_undo_revision > revision);
+                assert!(app.book_append_undo_receipt.is_none());
+            }
+        }
+    }
+
     fn assert_close(actual: f32, expected: f32) {
         assert!(
             (actual - expected).abs() < 1e-6,
@@ -1271,6 +1326,13 @@ impl App {
             SpreadPair::Single => vec![editor_root_idx],
             SpreadPair::Double { left, right } => vec![left, right],
         };
+        if indices
+            .iter()
+            .any(|idx| self.view_trim_page_overrides.contains_key(idx))
+            && !self.admit_book_append_followup_mutation()
+        {
+            return;
+        }
         for idx in indices {
             self.remove_view_trim_page_override(idx);
             self.view_trim_page_overrides.remove(&idx);
@@ -1281,6 +1343,9 @@ impl App {
 
     pub(crate) fn persist_pending_view_trim_state(&mut self) {
         if !self.view_trim_save_pending {
+            return;
+        }
+        if !self.admit_book_append_followup_mutation() {
             return;
         }
         self.persist_current_view_trim_book_state();
@@ -1420,11 +1485,15 @@ impl App {
         let mut clear_page_requested = false;
         let mut create_page_requested = false;
         let mut page_values_changed = false;
+        let append_undo_pending = self.book_append_undo_in_progress();
 
         egui::ScrollArea::vertical()
             .max_height(body_height.max(160.0))
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                if append_undo_pending {
+                    ui.disable();
+                }
                 ui.set_min_width(body_width);
                 ui.set_max_width(body_width);
 
@@ -1596,6 +1665,9 @@ impl App {
             });
 
         if base_mode_changed {
+            if !self.admit_book_append_followup_mutation() {
+                return;
+            }
             changed = true;
             match base_apply_mode {
                 ViewTrimApplyMode::Book => {
@@ -1667,6 +1739,15 @@ impl App {
                 }
                 (ViewTrimApplyMode::None | ViewTrimApplyMode::Auto, _) => {}
             }
+        }
+        // Controls, auto detection, and reset above edit only local values.
+        // Admit a successful edit before its first live draft/publication.
+        // A mode change already admitted before its legacy fit migration.
+        if (changed || clear_page_requested)
+            && !base_mode_changed
+            && !self.admit_book_append_followup_mutation()
+        {
+            return;
         }
         if clear_page_requested {
             self.remove_view_trim_page_overrides_for_spread(fs_idx, spread_pair);

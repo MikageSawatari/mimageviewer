@@ -1,4 +1,4 @@
-# docs/ — ドキュメント索引
+﻿# docs/ — ドキュメント索引
 
 修正作業の前に、関連するドキュメントを読んで全体設計を把握すること。
 
@@ -8,11 +8,15 @@
 
 | ドキュメント | 読むべきタイミング |
 | --- | --- |
+| [section353-zip-refresh-location-plan.md](section353-zip-refresh-location-plan.md) | §1.353 ZIP の更新位置。facet帰路・起動復元を修正、回帰9件追加、独立最終ACCEPT。targeted618実行／596件・vendor54件・fmt・通常／portable check・最新dev成功。full一回exit101の失敗48件を全補完、再実行なし |
+| [section375-operation-reconcile-plan.md](section375-operation-reconcile-plan.md) | §1.375 R10、LISTrev13独立設計ACCEPT・実装／独立コードレビュー／自動検証完了。前回／今回の走査の行signature一致時だけinstall・世代・thumb再要求を省く。自動sidecar取込なし、未反映DB値／外部sidecarは明示更新・開き直しで反映。fork独立購読、§1.314・context別dirty／cutoffを維持。targeted406実行／391件、fmt・通常／portable check・最新dev成功。full最終13,531成功／失敗0／ignored63。初回3失敗と修正・性能測定は§8.2、実機確認待ち |
+| [section373-book-append-undo-plan.md](section373-book-append-undo-plan.md) | §1.373 R7実装・独立ACCEPT、通常rescanの選択復元退行も修正済み（§7.10）。同じAppend workerで画像作成前に八storeを初期化し、copy report値のcache採用を撤去。ごみ箱Undo・UndoAppend限定排他は維持。Refresh cursorは受理済みhydrationで一度だけ優先解決し、★固定の物理子の復元資格と起動復元資格を分離。最終targeted279実行／237件、fmt・通常／portable check・確認用build成功。full最終完走一回は13,493成功／0失敗／既存ignored63件。追加findingによる中断一回は成功証拠に含めない |
 | [everything-search-plan.md](everything-search-plan.md) | §1.374 Everythingファイル名検索。Stage1履歴と§14の実装台帳、直接IPCの公式wire根拠、単一Search owner/完了採用/main modal、raw10,000件、Root/PhysicalChild帰路、Ctrl+R、PDF prerequisite。実装中・自動gate/独立レビュー/実機確認待ち |
 | [async-log-writer-plan.md](async-log-writer-plan.md) | §1.356 通常／perfの同期ログI/OによるUI・stderr reader停止。単一writer、有界queue・欠落、重要診断、終了flush、診断ZIP workerの完了barrier、解析gateの保存証明／判定不能。2026-10-09利用者決定済み・実装／検証記録 |
 | [details-name-color-plan.md](details-name-color-plan.md) | 詳細一覧の名前色。フォルダ黄系・六分類、標準カスタム/強め固定、選択/チェック共通色、切り取り不透明と設定保存・検証 |
 | [raw-libraw-plan.md](raw-libraw-plan.md) | RAW の内蔵現像、プレビュー差し替え・編集 gate・Remote・設定・配布を触るとき |
 | [libraw-source-distribution.md](libraw-source-distribution.md) | LibRaw の対応ソース・checksum・notice の準備と公開手順 |
+| [ime-process-keys-plan.md](ime-process-keys-plan.md) | IME 処理済みキーの根本修正。I1 共有化、I2 の経緯・Google / MS-IME の先行実機記録、300ms grace 撤去、focus 所有、egui 本家 #7967 との整合と移植検証 |
 | [architecture-overview.md](architecture-overview.md) | 全体像の把握。レイヤー構造・モジュールマップ・永続化ストア一覧 |
 | [book-composition-plan.md](book-composition-plan.md) | §1.242 本の構成。利用者決定・G1〜G5の契約、G2のmodel/store/lifecycle、G3の共通projection・表示許可・mode-only・E接続。G4Fは2026-10-12に切り離し、画像folderは構成対象外。画像folder→Stored ZIP変換は独立計画で実装中。次々回リリース向けnext-bookで開発 |
 | [image-folder-to-zip-plan.md](image-folder-to-zip-plan.md) | §1.242 の独立した画像folder→Stored ZIP変換の設計R3（対象7346683c6、独立レビューACCEPTは利用者報告）、実装中。画像タグのZIP本体集約、XMP評価補充、favorite表示状態FIFO、取消/完了選択、既存再帰範囲。2026-10-12利用者決定でCollectionは元参照を保持し、型拡張・容量検査・複製を除外。同名3択と旧ON→本表示/旧OFF→両方表示は決定済み |

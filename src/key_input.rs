@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 use std::sync::mpsc;
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, VK_CONTROL, VK_MENU, VK_PROCESSKEY, VK_SHIFT,
+};
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_NCDESTROY, WM_SYSKEYDOWN, WM_SYSKEYUP,
@@ -3937,6 +3939,11 @@ fn key_edge_from_message(msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<Raw
     if !pressed && !matches!(msg, WM_KEYUP | WM_SYSKEYUP) {
         return None;
     }
+    // IME-owned presses must never reach scan-code shortcut matching. Keep
+    // releases so a physical key held before composition can still be cleared.
+    if pressed && wparam.0 as u32 == u32::from(VK_PROCESSKEY.0) {
+        return None;
+    }
     let raw = lparam.0 as u64;
     Some(RawKeyEdge {
         virtual_key: wparam.0 as u32,
@@ -3981,6 +3988,66 @@ unsafe extern "system" fn main_key_input_subclass_proc(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn processkey_presses_do_not_route_to_jis_shortcuts_but_releases_remain() {
+        use super::{WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, key_edge_from_message};
+        use crate::keymap::KeyName;
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+
+        let _serial = lock_test_input();
+        let viewport = egui::ViewportId::ROOT;
+        for (key, scan_code) in [
+            (KeyName::JisCaret, 0x0d),
+            (KeyName::JisAt, 0x1a),
+            (KeyName::IntlYen, 0x7d),
+            (KeyName::IntlRo, 0x73),
+        ] {
+            for msg in [WM_KEYDOWN, WM_SYSKEYDOWN] {
+                for repeat in [false, true] {
+                    let lparam = LPARAM((scan_code << 16) | (isize::from(repeat) << 30));
+                    let ordinary = key_edge_from_message(msg, WPARAM(key.to_vk() as usize), lparam)
+                        .expect("ordinary JIS press remains routable");
+                    assert_eq!(ordinary.repeat, repeat);
+                    set_test_routed_frame(vec![ordinary.with_source(1, viewport)]);
+                    assert!(pressed_key_down(viewport, |edge| key.matches_win32(
+                        edge.virtual_key,
+                        edge.scan_code,
+                        edge.extended
+                    )));
+
+                    let processed = key_edge_from_message(msg, WPARAM(0xE5), lparam);
+                    assert!(processed.is_none(), "IME-owned {key:?} repeat={repeat}");
+                    set_test_routed_frame(
+                        processed
+                            .into_iter()
+                            .map(|edge| edge.with_source(1, viewport))
+                            .collect(),
+                    );
+                    assert!(!pressed_key_down(viewport, |edge| key.matches_win32(
+                        edge.virtual_key,
+                        edge.scan_code,
+                        edge.extended
+                    )));
+                }
+            }
+            for msg in [WM_KEYUP, WM_SYSKEYUP] {
+                let release = key_edge_from_message(
+                    msg,
+                    WPARAM(0xE5),
+                    LPARAM((scan_code << 16) | (1 << 30) | (1 << 31)),
+                )
+                .expect("IME-owned release remains available for held-key cleanup");
+                assert!(!release.pressed);
+                assert_eq!(release.virtual_key, 0xE5);
+                assert!(key.matches_win32(
+                    release.virtual_key,
+                    release.scan_code,
+                    release.extended
+                ));
+            }
+        }
+    }
+
     #[test]
     fn diagnostic_g_maps_to_the_physical_ctrl_g_key_without_text() {
         let key = super::SyntheticNavigationKey::G;

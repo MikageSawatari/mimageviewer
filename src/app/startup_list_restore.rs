@@ -15,6 +15,15 @@ pub(crate) enum StartupListIntent {
     PageContinuation,
     ClassifyFolder,
     PreservePresentation,
+    /// Re-enumerate an adopted physical list, retaining its logical ZIP level and cursor.
+    RefreshList {
+        automatic_observation: bool,
+        book_append_refresh: Option<super::book_append_refresh::BookAppendRefresh>,
+        target: StartupListTarget,
+        cursor: Option<ListCursorHint>,
+        local_search: Option<Arc<LocalSearchSubmission>>,
+        search_draft: Option<String>,
+    },
     RestoreList {
         target: StartupListTarget,
         cursor: Option<ListCursorHint>,
@@ -27,6 +36,26 @@ pub(crate) enum StartupListIntent {
 }
 
 impl StartupListIntent {
+    pub(super) fn imports_sidecars(&self) -> bool {
+        !matches!(
+            self.materialization_intent(),
+            Self::RefreshList {
+                automatic_observation: true,
+                ..
+            }
+        )
+    }
+    pub(super) fn book_append_refresh(
+        &self,
+    ) -> Option<&super::book_append_refresh::BookAppendRefresh> {
+        match self.materialization_intent() {
+            Self::RefreshList {
+                book_append_refresh,
+                ..
+            } => book_append_refresh.as_ref(),
+            _ => None,
+        }
+    }
     pub(crate) fn captures_list_departure(&self) -> bool {
         matches!(
             self,
@@ -89,6 +118,82 @@ enum MainListRestoreEvent {
 }
 
 impl App {
+    pub(super) fn capture_refresh_search(
+        &self,
+        mut intent: StartupListIntent,
+    ) -> StartupListIntent {
+        if let StartupListIntent::RefreshList {
+            local_search,
+            search_draft,
+            ..
+        } = &mut intent
+        {
+            *local_search = self.submitted_local_search();
+            *search_draft = self.show_search_bar.then(|| self.search_query.clone());
+        }
+        intent
+    }
+
+    pub(super) fn current_list_refresh_intent(&self) -> StartupListIntent {
+        let physical_target = self.current_physical_refresh_target();
+        let cursor = physical_target
+            .as_ref()
+            .and_then(|target| self.current_main_list_cursor(target));
+        let target = physical_target.unwrap_or_else(|| StartupListTarget::PhysicalList {
+            logical_path: self
+                .archive_source_override
+                .clone()
+                .or_else(|| self.current_folder.clone())
+                .unwrap_or_default(),
+            zip_prefix: None,
+        });
+        StartupListIntent::RefreshList {
+            automatic_observation: false,
+            book_append_refresh: None,
+            target,
+            cursor,
+            local_search: self.submitted_local_search(),
+            search_draft: self.show_search_bar.then(|| self.search_query.clone()),
+        }
+    }
+
+    /// Current physical source for an accepted refresh, independently of whether this
+    /// presentation may update Main's startup record (notably a snapshot's folder child).
+    fn current_physical_refresh_target(&self) -> Option<StartupListTarget> {
+        let backing = self.current_folder.as_ref()?;
+        let logical_path = self.effective_folder()?;
+        if is_synthetic_view_path(&logical_path) {
+            return None;
+        }
+        let zip_prefix = if let Some(nav) = self.zip_nav.as_ref() {
+            if !crate::folder_tree::path_eq(backing, &nav.tree.zip_path) {
+                return None;
+            }
+            Some(zip_prefix_string(nav.current()))
+        } else {
+            None
+        };
+        Some(StartupListTarget::PhysicalList {
+            logical_path,
+            zip_prefix,
+        })
+    }
+
+    /// Hydration consumes refresh restoration in its existing selection-priority pass.
+    /// The adoption tail must not replay this lower-priority cursor afterwards.
+    pub(super) fn take_hydration_refresh_cursor(
+        &self,
+        intent: &mut StartupListIntent,
+    ) -> Option<ListCursorHint> {
+        let StartupListIntent::RefreshList { target, cursor, .. } = intent else {
+            return None;
+        };
+        let cursor = cursor.take()?;
+        self.current_physical_refresh_target()
+            .filter(|actual| same_list_target(target, actual))
+            .map(|_| cursor)
+    }
+
     pub(crate) fn open_previous_startup_list(&mut self) {
         let StartupListRestore::V1 { target, cursor } = self
             .settings
@@ -377,6 +482,28 @@ impl App {
         self.close_fullscreen();
     }
 
+    pub(super) fn finish_refresh_search(&mut self, intent: &StartupListIntent) {
+        // PDF page search remains outside the released Ctrl+F scope.
+        if self.grid_is_pdf_pages() {
+            return;
+        }
+        if let StartupListIntent::RefreshList {
+            local_search,
+            search_draft,
+            ..
+        } = intent
+        {
+            if let Some(draft) = search_draft {
+                self.show_search_bar = true;
+                self.search_query = draft.clone();
+            }
+            if let Some(submitted) = local_search {
+                let ctx = self.edit_preview_repaint_ctx.clone().unwrap_or_default();
+                self.execute_submitted_local_search(&ctx, submitted.clone());
+            }
+        }
+    }
+
     pub(crate) fn finish_main_list_open(&mut self, intent: StartupListIntent) {
         if matches!(
             intent,
@@ -394,6 +521,11 @@ impl App {
         if let StartupListIntent::ResumeList {
             target: requested,
             cursor,
+        }
+        | StartupListIntent::RefreshList {
+            target: requested,
+            cursor,
+            ..
         } = &intent
             && same_list_target(requested, &target)
             && let Some(cursor) = cursor
@@ -406,6 +538,8 @@ impl App {
             intent,
             StartupListIntent::ExplicitList | StartupListIntent::RestoreList { .. }
         ) {
+            // Refreshes retain the explicit startup target; cursor capture belongs to
+            // the existing same-target departure/exit boundary, as for PreservePresentation.
             self.settings.save();
             return;
         }

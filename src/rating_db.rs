@@ -5,11 +5,30 @@
 //! 0 (未評価) 〜 5 の星数を記録する。キーは `App::rating_path_key` が返す
 //! 正規化キーを使う (`adjustment_db::normalize_path` と同じ規則で統一)。
 
+#[cfg(test)]
+thread_local! {
+    static READ_OPERATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static POINT_READ_OPERATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+pub(crate) fn point_read_operations_for_test() -> usize {
+    POINT_READ_OPERATIONS.with(std::cell::Cell::get)
+}
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::OptionalExtension;
+
+#[cfg(test)]
+pub(crate) fn read_operations_for_test() -> usize {
+    READ_OPERATIONS.with(std::cell::Cell::get)
+}
+#[cfg(test)]
+fn count_reads_for_test(count: usize) {
+    READ_OPERATIONS.with(|calls| calls.set(calls.get() + count));
+}
 
 /// ratings.kind に保存する GridItem 種別。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -257,6 +276,10 @@ impl RatingDb {
 
     /// 指定キーのレーティングを取得。未登録なら 0。
     pub fn get(&self, key: &str) -> u8 {
+        #[cfg(test)]
+        count_reads_for_test(1);
+        #[cfg(test)]
+        POINT_READ_OPERATIONS.with(|calls| calls.set(calls.get() + 1));
         let mut stmt = match self
             .conn
             .prepare_cached("SELECT stars FROM ratings WHERE path = ?1")
@@ -274,6 +297,8 @@ impl RatingDb {
     /// 複数キーをまとめて取得する。フォルダ読み込み直後のキャッシュプリウォーム用。
     /// 結果に含まれないキーは未登録 (=0) を意味する。
     pub fn get_many(&self, keys: &[String]) -> std::collections::HashMap<String, u8> {
+        #[cfg(test)]
+        count_reads_for_test(keys.len().div_ceil(500));
         let mut out = std::collections::HashMap::new();
         if keys.is_empty() {
             return out;
@@ -316,6 +341,8 @@ impl RatingDb {
         keys: &[String],
         write_generation: u64,
     ) -> Result<CompleteRatingFacts, rusqlite::Error> {
+        #[cfg(test)]
+        count_reads_for_test(keys.len().div_ceil(500));
         #[cfg(test)]
         {
             self.read_complete_chunks(keys, write_generation, None, None)
@@ -564,6 +591,8 @@ impl RatingDb {
 
     /// 指定★の行を一覧用に取得する。
     pub fn list_by_stars(&self, stars: u8) -> Result<Vec<RatingRow>, rusqlite::Error> {
+        #[cfg(test)]
+        count_reads_for_test(1);
         let stars = stars.clamp(1, 5);
         let mut stmt = self.conn.prepare(
             "SELECT path, stars, rated_at_ms, source_path, kind, entry_name, page_num,
@@ -578,6 +607,8 @@ impl RatingDb {
 
     /// ★0〜★5 の件数。index 0 は未評価ではなく常に 0 (DB 行が無いため)。
     pub fn count_by_stars(&self) -> Result<[usize; 6], rusqlite::Error> {
+        #[cfg(test)]
+        count_reads_for_test(1);
         let mut out = [0usize; 6];
         let mut stmt = self
             .conn
@@ -598,6 +629,8 @@ impl RatingDb {
 
     /// 指定キーの 1 行を一覧復元用に取得する。
     pub fn row_for_key(&self, key: &str) -> Result<Option<RatingRow>, rusqlite::Error> {
+        #[cfg(test)]
+        count_reads_for_test(1);
         self.conn
             .query_row(
                 "SELECT path, stars, rated_at_ms, source_path, kind, entry_name, page_num,
@@ -618,6 +651,8 @@ impl RatingDb {
 
     /// 登録件数。
     pub fn count(&self) -> usize {
+        #[cfg(test)]
+        count_reads_for_test(1);
         self.conn
             .query_row("SELECT COUNT(*) FROM ratings", [], |row| row.get(0))
             .unwrap_or(0)

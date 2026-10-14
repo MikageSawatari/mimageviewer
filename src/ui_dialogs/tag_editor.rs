@@ -193,8 +193,12 @@ impl App {
                 return;
             }
             let previous = previous_tag_defs_by_id(&self.settings.tags);
-            let draft = std::mem::take(&mut self.tag_editor_draft);
+            let draft = self.tag_editor_draft.clone();
             let (cleaned, retag_ops) = build_tag_editor_apply_plan(draft, &previous);
+            if !retag_ops.is_empty() && !self.admit_book_append_followup_mutation() {
+                return;
+            }
+            self.tag_editor_draft.clear();
             self.settings.tags = cleaned;
             self.settings.save();
             // タグ定義が変わったら、タグ候補 / 動画 native overlay 用キャッシュを必ず破棄する。

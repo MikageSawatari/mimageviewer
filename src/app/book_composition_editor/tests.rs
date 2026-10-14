@@ -8,6 +8,179 @@ use std::{io::Write, sync::Arc, time::Duration};
 
 const WAIT: Duration = Duration::from_secs(15);
 
+fn section1373_receipt(app: &AppTestEnv) -> crate::book_append_undo::BookAppendUndoReceipt {
+    let root = app.tmp.path().join(format!(
+        "composition-append-books-{}",
+        app.book_append_undo_revision,
+    ));
+    let folder = root.join("book");
+    std::fs::create_dir_all(&folder).unwrap();
+    let mut builder =
+        crate::book_append_undo::AppendReceiptBuilder::begin(&root, &folder, "book".into())
+            .unwrap();
+    let page = folder.join("0001_page.jpg");
+    std::fs::write(&page, b"generated page").unwrap();
+    builder.record(&page).unwrap();
+    crate::book_append_undo::BookAppendUndoReceipt {
+        files: builder.finish().unwrap(),
+        operation_id: 1373,
+        source_context: app.projected_viewer_context_id(),
+        accepted_revision: app.book_append_undo_revision,
+    }
+}
+
+#[test]
+fn section1373_composition_draft_history_invalidates_only_accepted_changes() {
+    let mut f = fixture();
+    let ctx = egui::Context::default();
+    start_editing(&mut f.app, &ctx);
+    let before = draft_record(&f);
+    f.app.book_append_undo_receipt = Some(section1373_receipt(&f.app));
+    let revision = f.app.book_append_undo_revision;
+    for action in [
+        ui::EditorUiAction::Undo,
+        ui::EditorUiAction::Redo,
+        ui::EditorUiAction::SetHidden {
+            page: usize::MAX,
+            hidden: true,
+        },
+    ] {
+        f.app.apply_editor_ui_action(&ctx, action);
+        assert_eq!(f.app.book_append_undo_revision, revision);
+        assert!(f.app.book_append_undo_receipt.is_some());
+        assert_eq!(draft_record(&f), before);
+    }
+    f.app.apply_editor_ui_action(
+        &ctx,
+        ui::EditorUiAction::SetHidden {
+            page: 1,
+            hidden: true,
+        },
+    );
+    let after = draft_record(&f);
+    assert_ne!(after, before);
+    assert!(f.app.book_append_undo_revision > revision);
+    assert!(f.app.book_append_undo_receipt.is_none());
+    for (action, expected) in [
+        (ui::EditorUiAction::Undo, before),
+        (ui::EditorUiAction::Redo, after),
+    ] {
+        f.app.book_append_undo_receipt = Some(section1373_receipt(&f.app));
+        let revision = f.app.book_append_undo_revision;
+        f.app.apply_editor_ui_action(&ctx, action);
+        assert!(f.app.book_append_undo_revision > revision);
+        assert!(f.app.book_append_undo_receipt.is_none());
+        assert_eq!(draft_record(&f), expected);
+    }
+}
+
+#[test]
+fn section1373_composition_preview_is_readonly_and_confirmation_invalidates() {
+    let mut f = fixture();
+    let ctx = egui::Context::default();
+    start_editing(&mut f.app, &ctx);
+    let before = draft_record(&f);
+    f.app.book_append_undo_receipt = Some(section1373_receipt(&f.app));
+    let revision = f.app.book_append_undo_revision;
+    f.app
+        .apply_editor_ui_action(&ctx, ui::EditorUiAction::SetCover(Some(1)));
+    assert_eq!(draft_record(&f), before);
+    assert_eq!(f.app.book_append_undo_revision, revision);
+    assert!(f.app.book_append_undo_receipt.is_some());
+    assert!(matches!(&f.app.composition_editor,
+        CompositionEditorState::Editing(session) if session.preview.is_some()));
+    f.app
+        .apply_editor_ui_action(&ctx, ui::EditorUiAction::ConfirmEdit);
+    assert_ne!(draft_record(&f), before);
+    assert!(f.app.book_append_undo_revision > revision);
+    assert!(f.app.book_append_undo_receipt.is_none());
+}
+
+#[test]
+fn section1373_composition_save_remove_admission_rejects_busy_without_mutation() {
+    for remove in [false, true] {
+        for busy in [0, 1, 2, 3, 4] {
+            let mut f = fixture();
+            let ctx = egui::Context::default();
+            let handle = remote(&mut f.app);
+            start_editing(&mut f.app, &ctx);
+            let before = draft_record(&f);
+            let receipt = section1373_receipt(&f.app);
+            f.app.book_append_undo_receipt = Some(receipt.clone());
+            if busy == 1 {
+                let (_tx, rx) = mpsc::channel();
+                f.app.book_op_pending = Some(crate::books::BookOpPending {
+                    rx,
+                    intent: crate::books::BookOpIntent::UndoAppend { receipt },
+                });
+            } else if busy == 2 {
+                acquire(&handle);
+            } else if busy == 3 || busy == 4 {
+                let (_tx, rx) = mpsc::channel();
+                let intent = if busy == 3 {
+                    crate::books::BookOpIntent::SourceMutation
+                } else {
+                    crate::books::BookOpIntent::Append {
+                        operation_id: receipt.operation_id,
+                        source_context: receipt.source_context,
+                        accepted_revision: receipt.accepted_revision,
+                        target_folder: receipt.files.folder.clone(),
+                        observations: Default::default(),
+                    }
+                };
+                f.app.book_op_pending = Some(crate::books::BookOpPending { rx, intent });
+            }
+            let revision = f.app.book_append_undo_revision;
+            f.app.save_local_composition_editor(&ctx, remove);
+            if busy == 0 || busy == 3 || busy == 4 {
+                assert!(f.app.book_append_undo_revision > revision);
+                assert!(f.app.book_append_undo_receipt.is_none());
+                assert!(f.app.composition_editor_writes_pending());
+                assert!(buffer_save_completion(&mut f.app));
+                f.app.poll_composition_editor_operations(&ctx);
+            } else {
+                assert_eq!(f.app.book_append_undo_revision, revision);
+                assert!(f.app.book_append_undo_receipt.is_some());
+                assert!(!f.app.composition_editor_writes_pending());
+                assert_eq!(draft_record(&f), before);
+                if busy == 1 {
+                    f.app.apply_editor_ui_action(
+                        &ctx,
+                        ui::EditorUiAction::SetHidden {
+                            page: 1,
+                            hidden: true,
+                        },
+                    );
+                    assert_eq!(f.app.book_append_undo_revision, revision);
+                    assert_eq!(draft_record(&f), before);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn section1373_composition_sent_ticket_blocks_append_undo_after_editor_close() {
+    let mut f = fixture();
+    let ctx = egui::Context::default();
+    start_editing(&mut f.app, &ctx);
+    let owner = f.app.composition_editor_operations.owner.clone().unwrap();
+    let (_tx, receiver) = mpsc::channel();
+    f.app
+        .composition_editor_operations
+        .tickets
+        .push(SentSaveTicket { owner, receiver });
+    f.app
+        .close_local_composition_editor(CompositionEditorCloseReason::Cancel);
+    assert!(!f.app.composition_editor_modal_active());
+    f.app.book_append_undo_receipt = Some(section1373_receipt(&f.app));
+    let revision = f.app.book_append_undo_revision;
+    assert!(f.app.try_undo_book_append(&ctx));
+    assert_eq!(f.app.book_append_undo_revision, revision);
+    assert!(f.app.book_append_undo_receipt.is_some());
+    assert!(!f.app.book_append_undo_in_progress());
+}
+
 #[test]
 fn image_folder_editor_entry_only_guides_and_preserves_existing_reader() {
     let mut f = fixture();

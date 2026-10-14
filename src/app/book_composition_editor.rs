@@ -656,6 +656,10 @@ impl App {
         if owner.context_id != self.projected_viewer_context_id() {
             return;
         }
+        if self.book_append_undo_in_progress() {
+            self.admit_book_append_followup_mutation();
+            return;
+        }
         let intent = self.capture_editor_resume_intent(&owner);
         let state = std::mem::take(&mut self.composition_editor);
         let CompositionEditorState::Editing(session) = state else {
@@ -712,6 +716,11 @@ impl App {
         let handle = self.remote_session_handle().cloned();
         let mut retained = Some(session);
         let adopt = || {
+            // Session admission has succeeded. Invalidate before publishing a
+            // sent ticket or letting the worker begin its source/store work.
+            if !self.admit_book_append_followup_mutation() {
+                return false;
+            }
             let ticket = SentSaveTicket {
                 owner: owner.clone(),
                 receiver: reply_rx,
@@ -873,17 +882,37 @@ impl App {
             }
             A::RequestThumbnails(pages) => self.request_editor_thumbnails(&pages),
             action => {
-                let CompositionEditorState::Editing(session) = &mut self.composition_editor else {
+                if self
+                    .composition_editor_operations
+                    .owner
+                    .as_ref()
+                    .is_none_or(|owner| owner.context_id != self.projected_viewer_context_id())
+                {
+                    return;
+                }
+                if self.book_append_undo_in_progress() {
+                    self.admit_book_append_followup_mutation();
+                    return;
+                }
+                let state = std::mem::take(&mut self.composition_editor);
+                let CompositionEditorState::Editing(mut session) = state else {
+                    self.composition_editor = state;
                     return;
                 };
                 let Ok(prepared) = &mut session.prepared else {
+                    self.composition_editor = CompositionEditorState::Editing(session);
                     return;
                 };
                 if session.preview.is_some()
                     && !matches!(action, A::Undo | A::Redo | A::ConfirmEdit | A::DiscardEdit)
                 {
+                    self.composition_editor = CompositionEditorState::Editing(session);
                     return;
                 }
+                // Pure draft operations cannot enqueue work or re-enter App.
+                // Keep this session unpublished while checking their outcome,
+                // so rejected/stale/no-op inputs do not invalidate the receipt.
+                let mut accepted_mutation = false;
                 let draft = &mut prepared.draft;
                 let selected = session
                     .ui
@@ -906,18 +935,20 @@ impl App {
                 );
                 let result = match action {
                     A::Undo => {
-                        draft.undo();
+                        accepted_mutation = draft.undo();
                         session.preview = None;
                         Ok(())
                     }
                     A::Redo => {
-                        draft.redo();
+                        accepted_mutation = draft.redo();
                         session.preview = None;
                         Ok(())
                     }
                     A::ConfirmEdit => {
                         if let Some(preview) = session.preview.take() {
-                            draft.apply(preview, true).map(|_| ())
+                            draft.apply(preview, true).map(|changed| {
+                                accepted_mutation = changed;
+                            })
                         } else {
                             Ok(())
                         }
@@ -963,7 +994,9 @@ impl App {
                             } else {
                                 draft
                                     .apply(preview, false)
-                                    .map(|_| ())
+                                    .map(|changed| {
+                                        accepted_mutation = changed;
+                                    })
                                     .map_err(|e| e.to_string())
                             }
                         })
@@ -995,6 +1028,10 @@ impl App {
                     None => {}
                 }
                 session.refresh_view();
+                if accepted_mutation {
+                    self.admit_book_append_followup_mutation();
+                }
+                self.composition_editor = CompositionEditorState::Editing(session);
             }
         }
     }

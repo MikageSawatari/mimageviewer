@@ -68,6 +68,9 @@ impl App {
             match validate_new_folder_name(&entered) {
                 Ok(name) => {
                     self.clear_new_folder_dialog_state();
+                    if !self.admit_book_append_followup_mutation() {
+                        return;
+                    }
                     self.new_folder_pending = Some(spawn_new_folder(parent, name));
                     ctx.request_repaint();
                     return;

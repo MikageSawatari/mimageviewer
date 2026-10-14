@@ -568,8 +568,16 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
   `None` へ戻す。Tab traversal はアプリ全体で無効だが event は後段の Keymap まで残すため、
   Tab chord は引き続き任意の KeyAction へ割り当て可能。KeySlot と egui event queue の同一押下は
   Keymap ownership 境界で一緒に consume する。no-repeat の Tab repeat も発火させず除去する。
-  TextEdit / IME の keyboard owner gate は先に維持し、IME 中の field-level focus lock / 復帰と
+  TextEdit / IME の keyboard owner gate は先に維持し、矢印の field-level focus lock / 復帰と
   直前 pass の helper-managed field に対する `FocusRecovery` claim は `ime_focus` が別に所有する。
+  Windows の allow_ime が true の場合、egui-winit は IME 処理済み Process press を遮断する。
+  本家 0.34.0 #7967 の HashSet を物理キーごとの Hidden / Forwarded に置換し、配送済みは Process repeat でも維持する。
+  release は allow_ime にかかわらず状態を除去して Hidden のみ遮断し、focus 喪失で全状態を消す。
+  helper の IME 専用 Tab lock は置かない。
+  本体 Win32 queue / native 生キーも 0xE5 の press / repeat を公開せず release を維持する。
+  IME gate は今 pass 反映後の composing のみで、Commit 後の通常キーは直ちに通す。
+  focus 復帰は所有 claim と分離し、pointer 無し・他 widget focus 無し・composing または Enter / Escape 無しを
+  条件とする。helper retry は次 pass 限りで同条件に従い、呼び出し側の初回 focus latch には書かない。
   Hover side panel 内の helper field が実 focus を持つ間は panel lifetime も維持し、widget を描かなかった
   ことによる egui end-pass の dead-man focus clear を起こさない。これは非 IME の focus recovery ではなく、
   focus が別 widget へ移れば解除される。`[text-input-key]` の通常ログには helper field の id 継続、focus 前後、
@@ -604,7 +612,10 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - FsAdjustSlot1..10 `Ctrl+1`..`Ctrl+0` (P) ★ / FsClearAdjust `Ctrl+Backspace` ★
 - FsPin `P` ★ / FsApplyErase1/2 `F7/F8` / FsApplyConceal1/2 `F9/F10`
   (family・予約候補)
-- FsMetaUndo/Redo (handle_meta_undo_keys、family・実コード確認) /
+- `UndoLastAction` (Global / Press、既定 `Ctrl+Z`) はグリッド・画像ビューア共通の本追加一回取消 / メタデータUndo入口。
+  有効な追加receiptを先に扱い、処理中・失効検出を含め同じ入力で古いメタUndoへ続けない。
+  編集専用UndoとTextEdit / IME / dialogの所有を優先する。追加自体のRedoはない。
+  メタRedo (`Ctrl+Y` / `Ctrl+Shift+Z`) は従来の固定入力を維持 /
   FsPipelineDebug `Ctrl+Alt+Shift+D` (固定)
 
 ### FsVideo (Ph5、VK 経路)

@@ -1510,6 +1510,53 @@ detachedの述語、viewport所有、park／復帰、配置・フォーカス・
 通常ビューのメニューは既存の排他的 `FsOverflowPanelState` と閉じる経路を使う。
 独立実装レビューと検証結果は鍵盤設計の今回の検証記録へ集約する。
 
+### 2026-10-14 next-list／masterの既存所有境界の統合
+
+利用者指示のno-commit mergeで、§1.375のcontext別Folder観測とmasterのPDF render owner／
+BookCompositionReadを同じ既存bundleへ保持する。両ownerのcreate／fork／mount／park／終端を
+独立に維持し、direct-readerのmain basis復元では観測世代の再束縛とmainだけのPDF失効を行う。
+§1.373のmutation受付はmasterの安定PageAdjustmentTargetへ接続し、readonly mountでは失効させない。
+両側の承認済み構造を接続する統合であり、detached症状へのguard／時間窓／再openを追加しない。
+viewport／geometry／HWND／focus／recreate述語は変更しない。境界のread-only照合でも追加の設計選択はなく、
+統合差分の検証は[§1.375 §8.5](section375-operation-reconcile-plan.md#85-masterとの統合2026-10-14)へ記録する。
+
+### 2026-10-13 §1.375: Folder観測を一覧と同じcontextへ揃える
+
+設計担当のR10と独立設計再レビューLISTrev13 ACCEPTに従い、App-globalだった
+watch／rescan／一覧復帰要求を既存ViewerContextBundleへ移す構造修正である。
+前回行記録を両fork入口で継承し、新contextのsource／世代／投影条件へ束縛し直す。
+元contextの購読・dirty・cutoff・pendingは元ownerに残し、新ownerは独立購読を開始する。
+park／mount／closeもそのownerの資源だけに作用し、Aの一致でBの通知をackしない。
+症状を隠すguard・時間窓や新しいdetached stateを足す修正ではなく、一覧と観測の所有境界を
+一致させる。viewport、geometry、HWND同定、placement、focus／recreate機構は変更しない。
+§1.373のAppendへの自動観測配送は捕捉済みcontextごとの既存要求へ接続し、
+専用owner／新しい配送台帳を作らない。実装・検証の記録は
+[§1.375の設計書](section375-operation-reconcile-plan.md)へ残す。アプリ起動は行わない。
+
+fullで検索画像が閉じた根因は、正規化前scanの `/` と登録後scanの `\` を生文字列hashで
+別row keyにしたこと。共通Path hashへ統一し、既存paint試験と実scan／Delete表記回帰で検証する。
+新しい独立physical観測の実差分も、そのownerがfullscreenを持つ間は既存FolderRefreshRequestへ
+deferする。Mainの別窓動画／音声中の一覧更新は従来どおり採用する。既存のMain-blocking述語を
+変更せず、自動一覧採用の所有資格だけをDetachedPhysicalへ接続する構造修正として独立レビューで合意。
+新pending／再open／時間窓を追加せず、一覧復帰で消費、元contextのcloseで破棄する。
+
+### 2026-10-13 §1.373: 本追加Undoの終端と既存context境界
+
+利用者が提示したR4案1の独立設計レビューACCEPTに従い、既存BookOpPendingへ
+Append／UndoAppendを接続する。追加元のcontextとRoot pollのMain投影を混同せず、
+捕捉したownerの通常終端へ配送する。独立実装レビューで、operationと採用先ownerを分けた
+型付きrefresh資格（ID・受付revision、owner、exact folder、generation/options、worker構成stamp）
+を既存payloadへ載せる方針にも合意した。詳細は
+[section373-book-append-undo-plan.md §7.6](section373-book-append-undo-plan.md#76-実装時の所有資格の具体化2026-10-13)。
+
+既存の窓activation受付で本追加receiptを失効させ、一時的なreadonly mountでは失効させない。
+UndoAppend中だけ既存modal gateで拒否し、他の本操作の受付規則は変えない。
+同operationのrefresh／Undo前readonly解放だけ`FsMetadataBoundary::BookAppend`を使い、
+元receiptの失効と既存metadata Undoの掃除を区別する。detached述語、viewport配置、HWND同定、
+focus/recreate機構には変更を加えず、無関係な兄弟のitems・cache・generation・scanを触らない。
+source ownerのF12終端、Mainへの同本refresh、旧generation／設定のscan拒否、source close後の
+成功通知・draft保持をheadless回帰で検査する。実機起動は行わない。
+
 ### 2026-10-13 §1.242 G: 画像folder→ZIPのprocess modalとcontext限定採用（実装中）
 
 画像folder→ZIP設計R3の独立ACCEPTは利用者報告（対象`7346683c6`）として記録済み。
@@ -5197,3 +5244,26 @@ grid／deadline ownerへ戻す。局所補正の新しい内容identity pivotは
 App／bundleともBoxで持つ。context間のswap／無効化／dropを変えず、viewportや入力ownerは
 追加しない。実context mount往復でcacheの値とheap所有先が保存される回帰を追加し、独立
 GPT-6.1 Sol/xhighのACCEPTとregistry89件・監査実行の成功を得た。
+
+### §11 追補: I2 段 2a の IME 入力境界修正（2026-10-14、未コミット）
+
+設計 lead のブリーフと独立設計レビュー ACCEPT に従い、vendored egui-winit が
+`NamedKey::Process` の press / repeat を Key / Text / clipboard event にしない規則へ揃えた。
+実機記録で誤配送を確認した入力変換境界の修正で、native presenter の `VK_PROCESSKEY` 規則と一致する。
+`src/ui_fullscreen.rs` の既存 fullscreen closure から text_mode 中の Enter 除去だけを撤去し、
+確定後の通常 Enter を本文 TextEdit へ渡す。同じ実 fullscreen 経路の同一 / 別 pass 回帰を追加した。
+§2 を再読し、detached predicate、viewport 生成 / registry、host / placement / focus owner は変更しない。
+新しい状態・時間窓・geometry guard を足す症状パッチではなく、不要となった対症療法の撤去である。
+段 2a 時点の規則（grace は後の段 2b で撤去）と自動検証結果は [I2 段 2a の記録](ime-process-keys-plan.md) に集約する。
+実機確認と設計 lead の検収は未実施。
+
+### §11 追補: I2 段 2b の共有 IME 所有境界（2026-10-14、未コミット）
+
+設計 lead の第5版と独立設計レビュー ACCEPT、および brief の小範囲修正許可に従い、
+共有 `egui-ime` の時刻 grace を撤去し、今 pass 反映後の composing に統一した。
+終端 event を失ったまま同じ viewport ID を再利用すると composing が残ることを回帰テストで確認したため、
+plugin が `RawInput.viewports` の生存集合で破棄済み viewport の状態を落とし、所有 viewport の focus 喪失では shortcut claim を終了する。終端待ちは `UnfocusedComposition` として保持し、後続の取消補完を保つ。
+生存する兄弟 viewport の read-only 参照では変更しない。helper retry は既存 latch を pass 番号へ置換し、
+欄が消えた後へ復帰要求を持ち越さない。detached predicate / registry / 生成 / placement は変更しない。
+§2 の所有境界に沿う修正であり、遅延・時間窓・geometry guard を足す症状パッチではないことを実装側でも確認した。
+自動検証結果は [I2 段 2b の記録](ime-process-keys-plan.md) に集約し、正式な実装レビューと実機確認は別途とする。

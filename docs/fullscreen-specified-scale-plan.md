@@ -1000,6 +1000,18 @@ P2を確認した。§18の描画fixtureは数値編集にフォーカスせず�
 全画面とpopupの継続、IME keyboard owner、数値の確定／取消を確認する。
 DragValueのEnterによる編集終了はwidgetの既存動作として区別し、popup／全画面終了とは扱わない。
 
+2026-10-14 I2 段 2a: 上記は旧入力モデルでの検証履歴。現在の両回帰は実機記録に合わせ、
+IME 確定／取消を press なし・Ime 列＋release で渡し、実bufferとfocusの維持を確認する。
+続く通常 Enter／Esc による数値編集の終了・値の確定／取消も別に検証する。
+
+2026-10-14 I2 段 2b: grace を撤去し、確定／取消後の通常キーを同じ pass と次 pass の両方で検証する。
+前提照合で、raw DragValue の通常 Esc は IME 無しでも begin-pass の focus 解除後に fullscreen を閉じる
+既存経路であることを確認した。従来テストの「直後の Esc でも fullscreen 継続」は grace に依存していた。
+利用者承認済みの「確定直後も通常時と同じ」に合わせ、IME 無しの対照も同じ実 handler に通して終了を確認する。
+数値欄の所有設計を変更する修正は混ぜない。IME の終端 event だけなら欄・fullscreen を維持する。
+また、旧 fixture の pass 終了後の `keyboard_owner_for_pass` 呼び出しは次 pass に古い composing owner を
+キャッシュしていたため、owner の検証は実際の pass 内へ移した。
+
 検出力はAppのclose経路へキー所有権を迂回する一時mutationを入れて確認した。
 Enterは変換中、EscはDisabledと同frameのキーで`fullscreen_idx=None`となり、両テストが
 失敗した（exit 101、`target/E-1342-ui2-ime-leak-red.log`）。このmutationを撤去した状態で両回帰のgreen（exit 0）も確認した。
