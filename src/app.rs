@@ -73697,14 +73697,19 @@ impl App {
                 pending.purpose.cancel_entry();
             }
         }
-        let mut cancel_switch_jobs = Vec::new();
+        let mut cancel_entry_jobs = Vec::new();
         for (&idx, pending) in &mut self.local_adjust_pending {
             match &mut pending.request.kind {
                 EditMaterializeKind::Local { continuation, .. } => match *continuation {
+                    LocalMaterializeContinuation::EnterConceal { requested_fs_idx }
+                        if keep_requested_idx != Some(requested_fs_idx) =>
+                    {
+                        cancel_entry_jobs.push(idx)
+                    }
                     LocalMaterializeContinuation::SwitchConceal { request }
                         if keep_requested_idx != Some(request.from_idx) =>
                     {
-                        cancel_switch_jobs.push(idx)
+                        cancel_entry_jobs.push(idx)
                     }
                     LocalMaterializeContinuation::ResumeAfterDisplaySwitchConceal { request }
                         if keep_requested_idx != Some(request.from_idx) =>
@@ -73714,10 +73719,15 @@ impl App {
                     _ => {}
                 },
                 EditMaterializeKind::Conceal { purpose, .. } => match *purpose {
+                    ConcealMaterializePurpose::EnterMode { requested_fs_idx }
+                        if keep_requested_idx != Some(requested_fs_idx) =>
+                    {
+                        cancel_entry_jobs.push(idx)
+                    }
                     ConcealMaterializePurpose::Switch { request }
                         if keep_requested_idx != Some(request.from_idx) =>
                     {
-                        cancel_switch_jobs.push(idx)
+                        cancel_entry_jobs.push(idx)
                     }
                     ConcealMaterializePurpose::ResumeAfterDisplaySwitch { request }
                         if keep_requested_idx != Some(request.from_idx) =>
@@ -73728,7 +73738,7 @@ impl App {
                 },
             }
         }
-        for idx in cancel_switch_jobs {
+        for idx in cancel_entry_jobs {
             self.cancel_local_adjust_pending_for_idx(idx);
         }
     }
@@ -77494,6 +77504,46 @@ impl App {
             if !params.colorize.is_enabled() && creative_lut.is_none() {
                 continue;
             }
+            if self.exact_complete_final_composite_entry(idx).is_some() {
+                continue;
+            }
+            if let Some(size) = self.final_ai_prefetch_input_size(idx, &params) {
+                let edit_key = self.current_edit_result_key(idx);
+                let final_key = self.final_composite_key_for_pixels(edit_key, size, &params);
+                if self.final_effect_pending.contains_key(&final_key) {
+                    continue;
+                }
+                if let Some(ai_key) = self.final_ai_key_for_pixels(edit_key, size, &params) {
+                    if let Some(entry) = self.final_ai_cache.get(&ai_key).cloned() {
+                        let plan = build_final_composite_plan_after_ai(
+                            &params,
+                            creative_lut,
+                            entry.used_upscale,
+                        );
+                        if self.spawn_final_effect_job(
+                            ctx,
+                            final_key,
+                            entry.pixels,
+                            entry.source_size,
+                            plan,
+                            true,
+                            true,
+                        ) {
+                            return;
+                        }
+                        continue;
+                    }
+                    if !self.final_ai_failed.contains(&ai_key) {
+                        continue;
+                    }
+                }
+            } else if self.effective_upscale_request(&params).is_some()
+                || self.effective_denoise_request(&params).is_some()
+            {
+                // The AI producer must establish its input and result first.
+                // Do not hydrate an input for an effect which cannot run yet.
+                continue;
+            }
             let Some((edit_key, edit_pixels)) = self.ensure_edit_result_pixels_cpu(ctx, idx) else {
                 continue;
             };
@@ -77564,9 +77614,8 @@ impl App {
     /// - 同時起動は 1 ジョブのみ (= 旧設計の `current_done &&
     ///   ai_upscale_pending.is_empty()` 条件を踏襲)。これで一括 spawn による
     ///   ai_runtime の競合 / VRAM 不足を防ぐ。
-    /// - 各 idx ごとに `ensure_edit_result_pixels_cpu` を呼ぶため、隣接ページの source
-    ///   pixels が `fs_cache` に乗っていなければそのターゲットは skip される
-    ///   (= fs_prefetch の完了を毎フレ retry で待つ、コスト軽い)。これで **edit_result の
+    /// - ページ固有のAI・完成素材・既存job・入力寸法で先に作業要否を決める。
+    ///   必要な入力だけ既存source loaderへ要求する。これで **edit_result の
     ///   表示テクスチャ** の前倒し upload は避ける (F2、表示時に lazy upload)。
     ///   ただし編集済みページ (隠蔽 / 局所補正 / 消しゴム) は `assemble_edit_result_pixels`
     ///   内で各 layer の texture を UI スレッドで upload しうる (R2-5 既知残、別途・中規模)。
@@ -77598,23 +77647,45 @@ impl App {
             if self.has_uncancelled_final_ai_pending() {
                 return;
             }
+            let params = self.effective_params(idx).clone();
+            if self.effective_upscale_request(&params).is_none()
+                && self.effective_denoise_request(&params).is_none()
+            {
+                continue;
+            }
+            if let Some((key, size)) = self.retained_final_ai_matches_current(idx, &params)
+                && let Some(entry) = self.lookup_retained_final_ai(idx, key, size)
+            {
+                self.final_ai_cache.insert(key, entry);
+                continue;
+            }
             // Raster PDF の現行 display-fit 結果が AI 用 native 入力と異なるページは、
             // 現行結果に AI 先読みを流しても native 再レンダで捨てられる。
             // 代わりに native 再レンダを **通常レーンで先に起動** (visible を妨げない) し、
             // AI 先読みは native 着地まで保留する。これで画像の先読みと同様、移動時に
             // native + final AI が揃って即表示できる。
             if self.pdf_prefetch_should_defer_ai(idx) {
-                if let Some((key, entry, _)) =
-                    self.lookup_retained_pdf_final_ai(idx, "prefetch_final_ai")
-                {
-                    self.final_ai_cache.insert(key, entry);
-                    continue;
-                }
                 // 既に再レンダ中なら二重起動しない (cancel→respawn ループ防止)。
                 if !self.fs_pending.contains_key(&idx) && !self.fs_upload_backlog_contains(idx) {
                     self.request_pdf_rerender(idx, 1.0, false);
                 }
                 continue;
+            }
+            if self.exact_complete_final_composite_entry(idx).is_some() {
+                continue;
+            }
+            if let Some(size) = self.final_ai_prefetch_input_size(idx, &params) {
+                let Some(key) =
+                    self.final_ai_key_for_pixels(self.current_edit_result_key(idx), size, &params)
+                else {
+                    continue;
+                };
+                if self.final_ai_cache.contains_key(&key)
+                    || self.final_ai_pending.contains_key(&key)
+                    || self.final_ai_failed.contains(&key)
+                {
+                    continue;
+                }
             }
             // 先読みは edit_result の表示テクスチャを前倒し upload しない (F2)。AI 入力は CPU
             // ピクセルで足りる。表示に入った時に ensure_edit_result_pixels が lazy アップロード
@@ -77623,7 +77694,6 @@ impl App {
             let Some((edit_key, edit_pixels)) = self.ensure_edit_result_pixels_cpu(ctx, idx) else {
                 continue;
             };
-            let params = self.effective_params(idx).clone();
             let Some(key) = self.final_ai_key_for_pixels(edit_key, edit_pixels.size, &params)
             else {
                 continue;
@@ -77643,6 +77713,81 @@ impl App {
             // prefetch 経路は戻り値不要 (composite を作らないので complete 判定がない)。
             let _ = self.maybe_start_final_ai(idx, key, edit_pixels, params, false);
         }
+    }
+
+    /// Query existing exact edit-canvas metadata without producing pixels. Canonical
+    /// source dimensions and thumbnail dimensions are not AI input dimensions.
+    fn final_ai_prefetch_input_size(
+        &self,
+        idx: usize,
+        params: &crate::adjustment::AdjustParams,
+    ) -> Option<[usize; 2]> {
+        let edit_key = self.current_edit_result_key(idx);
+        if let Some(entry) = self.edit_result_cache.get(&edit_key) {
+            return Some(entry.pixels.size);
+        }
+        if let Some(pixels) = self.current_raw_source_pixels(idx) {
+            return Some(pixels.size);
+        }
+        if let Some(size) = self
+            .final_ai_cache
+            .iter()
+            .find_map(|(key, entry)| (key.edit_key == edit_key).then_some(entry.source_size))
+        {
+            return Some(size);
+        }
+        if let Some(size) = self
+            .final_composite_cache
+            .iter()
+            .find_map(|(key, entry)| (key.edit_key == edit_key).then_some(entry.source_size))
+        {
+            return Some(size);
+        }
+        if let Some(size) = self
+            .final_effect_pending
+            .iter()
+            .find_map(|(key, pending)| (key.edit_key == edit_key).then_some(pending.source_size))
+        {
+            return Some(size);
+        }
+        if let Some(size) = self.final_ai_pending.iter().find_map(|(key, pending)| {
+            (key.edit_key == edit_key)
+                .then(|| {
+                    pending
+                        .retained_key
+                        .as_ref()
+                        .map(|retained| retained.edit_size)
+                })
+                .flatten()
+        }) {
+            return Some(size);
+        }
+        self.retained_final_ai_matches_current(idx, params)
+            .map(|(_, size)| size)
+    }
+
+    fn retained_final_ai_matches_current(
+        &self,
+        idx: usize,
+        params: &crate::adjustment::AdjustParams,
+    ) -> Option<(FinalAiKey, [usize; 2])> {
+        self.retained_final_ai_budget()?;
+        if matches!(self.items.get(idx), Some(GridItem::PdfPage { .. })) {
+            return self.retained_pdf_final_ai_matches_current(idx);
+        }
+        let edit_key = self.current_edit_result_key(idx);
+        let item_key = self.metadata_cache_key(idx)?;
+        self.retained_final_ai_cache.keys().find_map(|retained| {
+            if retained.item_key != item_key {
+                return None;
+            }
+            let key = self.final_ai_key_for_pixels(edit_key, retained.edit_size, params)?;
+            (self
+                .retained_final_ai_key_for(idx, key, retained.edit_size)
+                .as_ref()
+                == Some(retained))
+            .then_some((key, retained.edit_size))
+        })
     }
 
     // ── 画像補正 ──────────────────────────────────────────────────
@@ -79527,6 +79672,20 @@ impl App {
             return;
         }
         let Some(source) = self.current_local_adjust_source_pixels(idx) else {
+            // Without source there is no new resize evidence. A current stage
+            // or known inactive layers require no producer or original load.
+            if self.current_local_adjust_pixels(idx).is_some()
+                || self
+                    .local_adjust_page_layers
+                    .get(&idx)
+                    .is_some_and(|layers| {
+                        !layers
+                            .iter()
+                            .any(|layer| layer.enabled && layer.opacity > 0.0)
+                    })
+            {
+                return;
+            }
             if self.exact_complete_final_composite_entry(idx).is_none()
                 && !self.has_retained_pdf_final_ai_for_current_params(idx)
             {
@@ -83471,9 +83630,10 @@ impl App {
         if matches!(
             self.fs_page_load_state(idx),
             FsPageLoadState::DisplayReady(FsPageDisplaySource::RetainedPdfFinalAi)
-        ) && let Some(texture) = self.restore_retained_pdf_final_ai_composite(ctx, idx)
-        {
-            return Some(texture);
+        ) {
+            // A pending effect already owns the retained AI input. Falling through
+            // would hydrate an unused original while that same output is being built.
+            return self.restore_retained_pdf_final_ai_composite(ctx, idx);
         }
         let (edit_key, edit_pixels) = self.ensure_edit_result_pixels(ctx, idx)?;
         let fc_edit_ms = fc_build_start.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
@@ -97646,6 +97806,8 @@ fn finite_video_target_secs(target_secs: f64, duration_secs: f64) -> f64 {
 pub(crate) mod composite_pixels_revision_tests;
 #[cfg(test)]
 mod grid_cursor_tests;
+#[cfg(test)]
+mod material_demand_revision_tests;
 #[cfg(all(test, windows))]
 pub(crate) mod multiwindow_scenario_tests;
 #[cfg(test)]

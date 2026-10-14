@@ -6,6 +6,204 @@ use crate::page_dims::{CanonicalPageDimensions, PagePixelDimensions};
 
 const CANONICAL: [usize; 2] = [1200, 1800];
 
+#[derive(Debug, Clone, Copy)]
+enum SupersedingConcealEntry {
+    Text,
+    Crop,
+    Analysis,
+    Export,
+}
+
+fn select_superseding_conceal_entry(
+    app: &mut App,
+    ctx: &egui::Context,
+    entry: SupersedingConcealEntry,
+) {
+    match entry {
+        SupersedingConcealEntry::Text => app.enter_text_mode(0),
+        SupersedingConcealEntry::Crop => app.enter_export_crop_mode(0),
+        SupersedingConcealEntry::Analysis => app.toggle_analysis_mode(),
+        SupersedingConcealEntry::Export => app.open_export_dialog_for_current(ctx, 0),
+    }
+}
+
+fn assert_superseding_conceal_entry(app: &App, entry: SupersedingConcealEntry) {
+    assert!(
+        !app.conceal_mode,
+        "late initial Conceal entry survived {entry:?}"
+    );
+    match entry {
+        SupersedingConcealEntry::Text => assert!(app.text_mode),
+        SupersedingConcealEntry::Crop => assert!(app.export_crop_mode),
+        SupersedingConcealEntry::Analysis => assert!(app.analysis_mode),
+        SupersedingConcealEntry::Export => assert!(app.export_dialog.is_some()),
+    }
+}
+
+#[test]
+fn retained_material_entry_initial_conceal_materializers_cancel_on_another_real_entry() {
+    use crate::app::{
+        ConcealMaterializePurpose, EditMaterializeKind, EditMaterializePayload,
+        EditMaterializeRequest, EditMaterializeResult, LocalAdjustRenderPending,
+        LocalMaterializeContinuation,
+    };
+
+    let ctx = egui::Context::default();
+    for local_stage in [false, true] {
+        for ready in [false, true] {
+            for entry in [
+                SupersedingConcealEntry::Text,
+                SupersedingConcealEntry::Crop,
+                SupersedingConcealEntry::Analysis,
+                SupersedingConcealEntry::Export,
+            ] {
+                let mut app = final_only_page(&ctx);
+                let final_texture = app.current_final_composite_texture(0).unwrap().id();
+                let request = EditMaterializeRequest {
+                    items_generation: app.items_generation,
+                    input_seq: app.input_seq,
+                    kind: if local_stage {
+                        EditMaterializeKind::Local {
+                            key: app.current_local_adjust_key(0),
+                            continuation: LocalMaterializeContinuation::EnterConceal {
+                                requested_fs_idx: 0,
+                            },
+                        }
+                    } else {
+                        EditMaterializeKind::Conceal {
+                            key: app.current_edit_result_key(0),
+                            purpose: ConcealMaterializePurpose::EnterMode {
+                                requested_fs_idx: 0,
+                            },
+                        }
+                    },
+                };
+                let source = Arc::new(egui::ColorImage::filled([4, 6], egui::Color32::GREEN));
+                let payload = if local_stage {
+                    EditMaterializePayload::LocalReady {
+                        layers: Arc::new(vec![local_adjust_core::LocalAdjustmentLayer::new(
+                            "completed-for-conceal",
+                            local_adjust_core::LocalMask::Full,
+                            local_adjust_core::LocalEffect::None,
+                        )]),
+                        image: (*source).clone(),
+                    }
+                } else {
+                    EditMaterializePayload::ConcealEnter {
+                        source,
+                        source_kind: "local_adjust",
+                        mask: vec![false; 24],
+                        shapes: Vec::new(),
+                    }
+                };
+                let result = EditMaterializeResult::Ready { request, payload };
+                let (sender, rx) = std::sync::mpsc::channel();
+                let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                app.local_adjust_pending.insert(
+                    0,
+                    LocalAdjustRenderPending {
+                        request,
+                        cancel: Arc::clone(&cancel),
+                        rx,
+                        ready: None,
+                    },
+                );
+                let late_result = if ready {
+                    app.local_adjust_pending.get_mut(&0).unwrap().ready = Some(result);
+                    None
+                } else {
+                    Some(result)
+                };
+
+                select_superseding_conceal_entry(&mut app, &ctx, entry);
+
+                assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+                assert!(
+                    app.local_adjust_pending.is_empty(),
+                    "{local_stage}/{ready}/{entry:?}"
+                );
+                if let Some(result) = late_result {
+                    assert!(
+                        sender.send(result).is_err(),
+                        "cancelled entry still owns its receiver"
+                    );
+                }
+                app.frame_counter += 1;
+                app.poll_local_adjust_render(&ctx);
+                assert_superseding_conceal_entry(&app, entry);
+                assert_eq!(
+                    app.current_final_composite_texture(0).unwrap().id(),
+                    final_texture
+                );
+                match entry {
+                    SupersedingConcealEntry::Analysis => {
+                        assert_eq!(app.fs_pending.len(), 1);
+                        assert_eq!(
+                            app.fs_pending.get(&0).unwrap().purpose,
+                            crate::app::FsLoadPurpose::Original {
+                                entry: crate::app::OriginalMaterialEntry::MaterialOnly,
+                            }
+                        );
+                    }
+                    _ => assert!(
+                        app.fs_pending.is_empty(),
+                        "unexpected source request: {local_stage}/{ready}/{entry:?}"
+                    ),
+                }
+                assert!(app.fs_upload_backlog.is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn retained_material_entry_initial_conceal_materializers_keep_requested_anchor_only() {
+    use crate::app::{
+        ConcealMaterializePurpose, EditMaterializeKind, EditMaterializeRequest,
+        LocalAdjustRenderPending, LocalMaterializeContinuation,
+    };
+    let ctx = egui::Context::default();
+    for local_stage in [false, true] {
+        let mut app = final_only_page(&ctx);
+        let request = EditMaterializeRequest {
+            items_generation: app.items_generation,
+            input_seq: app.input_seq,
+            kind: if local_stage {
+                EditMaterializeKind::Local {
+                    key: app.current_local_adjust_key(0),
+                    continuation: LocalMaterializeContinuation::EnterConceal {
+                        requested_fs_idx: 21,
+                    },
+                }
+            } else {
+                EditMaterializeKind::Conceal {
+                    key: app.current_edit_result_key(0),
+                    purpose: ConcealMaterializePurpose::EnterMode {
+                        requested_fs_idx: 21,
+                    },
+                }
+            },
+        };
+        let (_sender, rx) = std::sync::mpsc::channel();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        app.local_adjust_pending.insert(
+            0,
+            LocalAdjustRenderPending {
+                request,
+                cancel: Arc::clone(&cancel),
+                rx,
+                ready: None,
+            },
+        );
+        app.cancel_original_material_entry_intents(Some(21));
+        assert_eq!(app.local_adjust_pending.get(&0).unwrap().request, request);
+        assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+        app.cancel_original_material_entry_intents(Some(0));
+        assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(app.local_adjust_pending.is_empty());
+    }
+}
+
 /// Actual Retained restoration followed by CPU eviction, with three different
 /// pixel bases. Thumbnail pixels must never become annotation coordinates.
 fn final_only_page(ctx: &egui::Context) -> crate::app::AppTestEnvForTest {

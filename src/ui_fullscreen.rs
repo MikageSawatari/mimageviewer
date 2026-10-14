@@ -49930,8 +49930,10 @@ impl App {
         indices: &[usize],
     ) -> Result<(), String> {
         for &idx in indices {
-            if (self.has_active_local_adjust_layers(idx) || self.local_adjust_pages.contains(&idx))
-                && self.current_local_adjust_pixels(idx).is_none()
+            if (self.has_active_local_adjust_layers(idx)
+                && self.current_local_adjust_pixels(idx).is_none())
+                || (self.local_adjust_pages.contains(&idx)
+                    && !self.local_adjust_page_layers.contains_key(&idx))
             {
                 self.ensure_original_material_for_entry(
                     idx,

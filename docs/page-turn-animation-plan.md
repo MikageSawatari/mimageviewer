@@ -2566,3 +2566,47 @@ local_adjust146、conceal80（既存1ignored）がすべて成功。最終の独
 PE3 binary検査が成功。coreは2026-10-14 07:44:07、325,638,656 bytes、FileVersion4.6.0.0。
 確認用coreの起動は検出されず、対象プロセスの停止・実アプリ起動・コミットは行っていない。
 コマンド／ログ／隔離確認手順は`target/A-1341-material-msg.txt`を参照する。
+
+### 26.16 素材要求前の作業判定と初回入場の取消（d10b1501f 再レビュー）
+
+AI先読みがeffective AI・完成cacheの確認前にCPU入力を要求し、初回隠蔽入場の継続が
+materializer段で統一取消から漏れていた。入口の素材要求は実行可能な作業を判定した後だけにし、
+単回操作の取消はその操作を所有する全段へ接続する。別pending・queue・boolは増やさない。
+
+| §26.14 の入口群 | 素材要求前の確認／取消の再点検 |
+| --- | --- |
+| AI先読み | ページ固有のeffective AI、既存target枚数／同時job予算、Retained AI、必要なPDF native入力、現在keyの完成composite、resident AI／pending／failed、保持済みの正確なedit canvas寸法でのサイズ上限を先に判定。fit rasterが上限超過でもnativeが対象なら従来のnative再描画を要求する。不明な寸法・分類を必要なAI作業で解決するときだけ通常sourceを要求。正準寸法やthumbnail／AI拡大後の寸法を入力サイズとして代用しない。 |
+| final-effect先読み | 既存prepare帯・VRAM予算、colorize／LUT有効性、完成composite／pending、必要なAI結果を確認してからCPU入力を要求。完成AI画素があればその画素と保持済みsource_sizeだけで既存effect workerへ渡し、raw／editを再取得しない。AI入力が不明でAI結果待ちならAI producerへ準備を任せる。 |
+| Retained PDFの通常描画 | Retained AIを入力としてeffect workerへ渡した後のNoneは既存非同期処理の待機。完成素材を作る同workerが入力を所有しているため、原画像要求へfallthroughしない。 |
+| 局所補正の表示／Ctrl+E準備 | 現在の完成local stageや既知のinactive layerなら原画像を要求しない。原素材がある場合のmaskサイズ変更の再検査は従来どおり。未読layer／未完成stageだけ既存producerへ接続。 |
+| 初回隠蔽入場・左右切替 | FS pending／upload、inpaint、Local materializer、Conceal mask materializerを統一取消へ接続。専用EnterConceal／EnterMode jobは取消・除去し、mask返信をDisplay合成へ読み替えない。既存通常Display合流のResumeだけはDisplayへ戻す。 |
+| コピー／キャプチャ／注釈、Ctrl+E／SNS／外部転送、メタ情報、回転／手動crop／drag | 完成素材・正準寸法・既存workerで足りる入口の原画像要求を増やさない。明示別入口の選択は統一取消で旧初回入場を退役させる。 |
+| 明示AI再生成、消しゴム／slot／局所補正／隠蔽、自動crop／trim、原画像preview／分析 | 作業と許可を確認して不足素材を要求する既存契約を維持。FS／inpaintの単回intentとmaterializerへ渡ったintentを同じ取消へ接続。失敗／cancel／navigation／closeの所有境界を保つ。 |
+
+初回入場を別modeにする手で割込みの組合せを減らす案は、通常の別ツール選択を制限するため
+採用しない。既存ownerの専用intentを取消するだけで組合せを減らす。AI予算ゼロでも対象になる
+現在の見開き相方は既存仕様として保持し、全体の枚数ゼロだけで先読み処理を止めない。
+Remoteとdetachedのviewport／host条件は変更しない。§1.242の統合検証は前節の残件のまま。
+
+通常／portable core check、fmt、glyph、viewer_context_auditが成功した。作業判定14、
+実操作入口27、Original20、final AI26、final effect9、local adjustment146、conceal82
+（既存1ignored）、paged prefetch16、page turn199の関連テストが成功した。
+取消回帰はLocal／Concealの両段×待機／返信到着済み×Text／Crop／分析／Ctrl+Eの16通りと、
+表示anchorが実sourceと異なる場合、実context bundle往復を検査する。分析が必要とする
+MaterialOnlyのOriginal要求は残し、旧隠蔽入場だけを退役させる。AI回帰はeffective無効、
+完成Retained、入力サイズと正準／完成寸法の相違、予算ゼロ、native PDFのfit超過、
+完成AIを使うcolorize／LUT、表示中のeffect待機で不要なsource要求がないことを検査した。
+テスト中の正準寸法fixtureと分析用Original要求のassertionを修正し、製品契約を弱めず再実行した。
+独立GPT-6.1 Sol/xhighの最終静的レビューはACCEPT、未解消P1/P2なし。
+
+通常build-dev -PreserveRuntimeはexit0。core／Remote／EPUB workerとruntime4 DLL・PE3 binaryの
+検査が成功した。coreは2026-10-14 08:42:25、325,643,264 bytes、FileVersion4.6.0.0。
+確認用プロセスを停止せず、実アプリの起動・コミットも行っていない。
+
+最後にtest-fullをjobs1／threads8、SuppressCrashDialogsで一回通し実行し、exit0／PASS。
+workspace 60 targetは13,710成功／0失敗／64ignored、本体は12,489成功／0失敗／57ignored、
+UI snapshot163件も成功した。vendor追加gateもegui25、egui-wgpu11、eframe18件がすべて成功。
+合計63 target、13,764成功／0失敗／64ignoredで、前節の旧失敗2件も今回の全体実行で通過した。
+全63 targetの結果は`target/A-1341-entry-r2-full-results.txt`、全ログは
+`target/A-1341-entry-r2-full.log`、修正・コマンド・隔離確認手順は
+`target/A-1341-entry-r2-msg.txt`に記録した。
