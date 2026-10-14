@@ -89,10 +89,17 @@ impl MivSpectrumState {
     /// Adopt one newly completed live analysis, including revised input at the same time.
     ///
     /// The live result owner calls this once per accepted result; painting reads `frame()`.
-    /// Export callers keep `frame_at()`'s repeated-time cache contract.
+    /// Time-based callers keep `frame_at()`'s repeated-time cache contract.
     pub fn adopt_analysis_at(&mut self, bands: &[f32], t_secs: f64) -> &MivSpectrumFrame {
         let t = self.normalize_time(t_secs);
         self.advance_at(bands, t);
+        &self.frame
+    }
+
+    /// Advance exactly one output frame when a timeline owns sequencing and seeks.
+    /// No time-based cache or gap reset applies, including at low frame rates.
+    pub fn advance_frame(&mut self, bands: &[f32]) -> &MivSpectrumFrame {
+        self.advance(bands);
         &self.frame
     }
 
@@ -378,6 +385,24 @@ mod tests {
         assert_eq!(primitives[3].alpha_override, Some(92));
         assert_eq!(primitives[3].brightness_scale, 1.18);
         assert!((primitives[2].rect.bottom - 238.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn explicit_frames_advance_without_time_cache_or_gap_resets() {
+        let mut state = MivSpectrumState::default();
+        let mut timed = MivSpectrumState::default();
+        for (index, bands) in [[0.8, 0.1], [0.1, 0.7], [0.1, 0.7]].iter().enumerate() {
+            assert_eq!(
+                state.advance_frame(bands),
+                timed.frame_at(bands, index as f64 / 60.0),
+            );
+        }
+        assert_eq!(state.last_t, None);
+        assert_eq!(
+            state.frame().bands[0].trail,
+            0.8 * SPECTRUM_TRAIL_DECAY * SPECTRUM_TRAIL_DECAY
+        );
+        assert_eq!(state.frame().bands[1].onset, SPECTRUM_ONSET_DECAY);
     }
 
     #[test]

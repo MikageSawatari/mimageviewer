@@ -7,6 +7,7 @@
 
 pub mod anim;
 pub mod assets;
+pub mod frame_grid;
 pub mod lyrics;
 pub mod model;
 pub mod preset;
@@ -22,6 +23,7 @@ pub use anim::{Interpolate, easing_amount, evaluate_track};
 pub use assets::{
     AssetError, Assets, ImageAsset, MAX_SCALED_IMAGE_CACHE_ENTRIES, ScaledImageCacheStats,
 };
+pub use frame_grid::{FrameGrid, FrameGridError, PcmView, pcm_view};
 pub use lyrics::{
     ActiveLyric, LrcEncoding, LrcParseError, LrcParseReport, LrcWriteReport, active_lyric_at,
     parse_lrc, write_lrc,
@@ -53,9 +55,10 @@ pub use scene::{
     format_time,
 };
 pub use spectrum::{
-    BandFeature, MAX_SEQUENTIAL_GAP_SECS, MAX_SPECTRUM_BANDS, MODULATOR_CALIBRATION_HZ,
-    ModulatorCalibration, ModulatorCalibrationError, ModulatorCalibrationRequest, Smoothing,
-    SpectrumSource, SpectrumSourceError, calibrate_modulators, modulator_calibration_requests,
+    AnalysisKey, AnalysisTimeline, AnalysisTimelineError, BandFeature, MAX_SEQUENTIAL_GAP_SECS,
+    MAX_SPECTRUM_BANDS, MODULATOR_CALIBRATION_HZ, ModulatorCalibration, ModulatorCalibrationError,
+    ModulatorCalibrationRequest, Smoothing, SpectrumSource, SpectrumSourceError,
+    calibrate_modulators, calibrate_modulators_view, modulator_calibration_requests,
 };
 
 pub use text::{MAX_TEXT_CACHE_BYTES, MAX_TEXT_RASTER_BYTES, TextCacheStats};

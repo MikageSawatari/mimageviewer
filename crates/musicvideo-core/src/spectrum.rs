@@ -1,5 +1,9 @@
 use std::fmt;
 
+#[path = "analysis_timeline.rs"]
+mod timeline;
+pub use timeline::{AnalysisKey, AnalysisTimeline, AnalysisTimelineError};
+
 use music_core::{
     KeyboardAnimationState, MivSpectrumState, SpectrumAnalysis, SpectrumAnalyzer, SpectrumRange,
     SpectrumRangeRequest, SpectrumWeighting, apply_display_gain_db, prepare_keyboard_frame_into,
@@ -395,6 +399,87 @@ pub fn calibrate_modulators(
             *previous = Some(gained);
             distribution.push(value);
         }
+    }
+
+    Ok(requests
+        .into_iter()
+        .zip(distributions)
+        .map(|(request, mut values)| {
+            values.sort_by(f32::total_cmp);
+            let floor = percentile(&values, request.low_percentile);
+            let ceiling = percentile(&values, request.high_percentile);
+            let (floor, ceiling) = non_empty_range(floor, ceiling);
+            ModulatorCalibration {
+                request,
+                floor,
+                ceiling,
+                sample_count: values.len(),
+            }
+        })
+        .collect())
+}
+
+/// Calibrates the requested output's PCM view at fixed 60 Hz, excluding the
+/// zero extension after the source ends. Both durations describe the original
+/// request and source, rather than a duration inferred from materialized PCM.
+pub fn calibrate_modulators_view(
+    pcm: music_core::PcmView<'_>,
+    sample_rate: u32,
+    requested_duration: f64,
+    source_duration: f64,
+    modulators: &[Modulator],
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<Vec<ModulatorCalibration>, ModulatorCalibrationError> {
+    if sample_rate == 0 {
+        return Err(ModulatorCalibrationError::InvalidSampleRate);
+    }
+    if !requested_duration.is_finite()
+        || requested_duration < 0.0
+        || !source_duration.is_finite()
+        || source_duration < 0.0
+        || !modulators_are_valid(modulators)
+    {
+        return Err(ModulatorCalibrationError::InvalidRequest);
+    }
+    let requests = modulator_calibration_requests(modulators);
+    if requests.is_empty() {
+        return Ok(Vec::new());
+    }
+    let range_requests = requests
+        .iter()
+        .map(|request| spectrum_range_request(request.range, request.weighting))
+        .collect::<Vec<_>>();
+    let end_secs = requested_duration.min(source_duration);
+    let mut distributions = vec![Vec::new(); requests.len()];
+    let mut previous = vec![None; requests.len()];
+    let mut analyzer =
+        SpectrumAnalyzer::with_refresh_mode(1, music_core::SpectrumRefreshMode::FrameGrid);
+    let mut index = 0usize;
+    loop {
+        let t_secs = index as f64 / MODULATOR_CALIBRATION_HZ;
+        // Multiplying the duration and rounding up can include a sample whose
+        // actual k/60 time equals the endpoint (for example, k = 31).
+        if t_secs >= end_secs {
+            break;
+        }
+        if should_cancel() {
+            return Err(ModulatorCalibrationError::Cancelled);
+        }
+        let values = analyzer
+            .analyze_with_ranges_view(pcm, sample_rate, t_secs, &range_requests)
+            .range_values;
+        for (((request, raw), previous), distribution) in requests
+            .iter()
+            .zip(values)
+            .zip(previous.iter_mut())
+            .zip(distributions.iter_mut())
+        {
+            let gained = apply_display_gain_db(raw, request.gain_db);
+            let value = feature_input(request.feature, gained, *previous, ONSET_REFERENCE_SECS);
+            *previous = Some(gained);
+            distribution.push(value);
+        }
+        index += 1;
     }
 
     Ok(requests
@@ -1093,6 +1178,266 @@ mod tests {
         let modulator = crate::new_band_energy_modulator(&project);
         assert_eq!(
             calibrate_modulators(&tone(), 48_000, &[modulator], &|| true),
+            Err(ModulatorCalibrationError::Cancelled)
+        );
+    }
+
+    fn calibration_modulators() -> Vec<Modulator> {
+        let energy = Modulator {
+            source: ModulatorSource::BandEnergy {
+                range: BandRange::Hz {
+                    low_hz: 40.0,
+                    high_hz: 120.0,
+                },
+                weighting: BandWeighting::Raw,
+                gain_db: 0.0,
+                floor: 0.0,
+                ceiling: 1.0,
+                calibration: BandCalibration::Auto {
+                    low_percentile: 5.0,
+                    high_percentile: 95.0,
+                },
+                smoothing: Smoothing::None,
+                threshold: 0.0,
+            },
+            ..a4_modulator(Smoothing::None)
+        };
+        let onset = Modulator {
+            id: ModulatorId(energy.id.0 + 1),
+            source: match energy.source {
+                ModulatorSource::BandEnergy {
+                    range,
+                    weighting,
+                    gain_db,
+                    floor,
+                    ceiling,
+                    calibration,
+                    ..
+                } => ModulatorSource::BandOnset {
+                    range,
+                    weighting,
+                    gain_db,
+                    floor,
+                    ceiling,
+                    calibration,
+                    smoothing: Smoothing::None,
+                    threshold: 0.0,
+                },
+                _ => unreachable!(),
+            },
+            ..energy.clone()
+        };
+        vec![energy, onset]
+    }
+
+    fn assert_calibration_bits_equal(
+        actual: &[ModulatorCalibration],
+        expected: &[ModulatorCalibration],
+    ) {
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_eq!(actual.request, expected.request);
+            assert_eq!(actual.sample_count, expected.sample_count);
+            assert_eq!(actual.floor.to_bits(), expected.floor.to_bits());
+            assert_eq!(actual.ceiling.to_bits(), expected.ceiling.to_bits());
+        }
+    }
+
+    fn reference_view_calibration(
+        pcm: music_core::PcmView<'_>,
+        rate: u32,
+        duration: f64,
+        modulators: &[Modulator],
+    ) -> Vec<ModulatorCalibration> {
+        modulator_calibration_requests(modulators)
+            .into_iter()
+            .map(|request| {
+                let range = spectrum_range_request(request.range, request.weighting);
+                let mut previous = None;
+                let mut values = (0..)
+                    .map(|k| k as f64 / 60.0)
+                    .take_while(|time| *time < duration)
+                    .map(|time| {
+                        // A fresh analyzer at every sample independently verifies
+                        // the FrameGrid mode chosen by the calibration sequence.
+                        let mut analyzer = SpectrumAnalyzer::with_refresh_mode(
+                            1,
+                            music_core::SpectrumRefreshMode::FrameGrid,
+                        );
+                        let raw = analyzer
+                            .analyze_with_ranges_view(pcm, rate, time, &[range])
+                            .range_values[0];
+                        let gained = apply_display_gain_db(raw, request.gain_db);
+                        let value =
+                            feature_input(request.feature, gained, previous, ONSET_REFERENCE_SECS);
+                        previous = Some(gained);
+                        value
+                    })
+                    .collect::<Vec<_>>();
+                values.sort_by(f32::total_cmp);
+                let (floor, ceiling) = non_empty_range(
+                    percentile(&values, request.low_percentile),
+                    percentile(&values, request.high_percentile),
+                );
+                ModulatorCalibration {
+                    request,
+                    floor,
+                    ceiling,
+                    sample_count: values.len(),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn view_calibration_matches_materialized_output_for_all_duration_relations() {
+        let rate = 8_000;
+        let source_frames = 3_680;
+        let pcm = (0..source_frames)
+            .flat_map(|frame| {
+                let t = frame as f32 / rate as f32;
+                let amplitude = if frame % 900 < 260 { 0.9 } else { 0.07 };
+                let value = (std::f32::consts::TAU * 80.0 * t).sin() * amplitude;
+                [value, value]
+            })
+            .collect::<Vec<_>>();
+        let source_duration = source_frames as f64 / rate as f64;
+        let modulators = calibration_modulators();
+        for requested_duration in [0.2, source_duration, 0.7] {
+            let logical_frames = (requested_duration * rate as f64).round() as usize;
+            let mut materialized = pcm.clone();
+            materialized.resize(logical_frames * 2, 0.0);
+            let preview = calibrate_modulators_view(
+                music_core::PcmView::new(&pcm, logical_frames),
+                rate,
+                requested_duration,
+                source_duration,
+                &modulators,
+                &|| false,
+            )
+            .unwrap();
+            let export = calibrate_modulators_view(
+                music_core::PcmView::new(&materialized, logical_frames),
+                rate,
+                requested_duration,
+                source_duration,
+                &modulators,
+                &|| false,
+            )
+            .unwrap();
+            assert_calibration_bits_equal(&preview, &export);
+            let reference = reference_view_calibration(
+                music_core::PcmView::new(&materialized, logical_frames),
+                rate,
+                requested_duration.min(source_duration),
+                &modulators,
+            );
+            assert_calibration_bits_equal(&preview, &reference);
+            let expected_count = (0..)
+                .take_while(|k| *k as f64 / 60.0 < requested_duration.min(source_duration))
+                .count();
+            assert!(
+                preview
+                    .iter()
+                    .all(|value| value.sample_count == expected_count)
+            );
+        }
+    }
+
+    #[test]
+    fn view_calibration_ignores_source_audio_after_the_output_end() {
+        let rate = 8_000;
+        let logical_frames = 1_600;
+        let mut with_loud_tail = vec![0.0; logical_frames * 2];
+        with_loud_tail.extend((0..8_000).flat_map(|frame| {
+            let value = (std::f32::consts::TAU * 80.0 * frame as f32 / rate as f32).sin();
+            [value, value]
+        }));
+        let modulators = calibration_modulators();
+        let with_tail = calibrate_modulators_view(
+            music_core::PcmView::new(&with_loud_tail, logical_frames),
+            rate,
+            0.2,
+            1.2,
+            &modulators,
+            &|| false,
+        )
+        .unwrap();
+        let silence = calibrate_modulators_view(
+            music_core::PcmView::new(&[], logical_frames),
+            rate,
+            0.2,
+            1.2,
+            &modulators,
+            &|| false,
+        )
+        .unwrap();
+        assert_calibration_bits_equal(&with_tail, &silence);
+    }
+
+    #[test]
+    fn view_calibration_empty_and_tiny_duration_have_fixed_results() {
+        let modulators = calibration_modulators();
+        for (requested, source, count) in [(0.0, 2.0, 0), (2.0, 0.0, 0), (1.0e-12, 2.0, 1)] {
+            let result = calibrate_modulators_view(
+                music_core::PcmView::new(&[], 0),
+                48_000,
+                requested,
+                source,
+                &modulators,
+                &|| false,
+            )
+            .unwrap();
+            for calibration in result {
+                assert_eq!(calibration.sample_count, count);
+                assert_eq!(calibration.floor.to_bits(), 0.0f32.to_bits());
+                assert_eq!(calibration.ceiling.to_bits(), 1.0e-4f32.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn view_calibration_compares_actual_sample_time_at_the_endpoint() {
+        let duration = 31.0 / 60.0;
+        assert_eq!((duration * 60.0_f64).ceil() as usize, 32);
+        for (requested, source) in [(duration, 1.0), (1.0, duration)] {
+            let result = calibrate_modulators_view(
+                music_core::PcmView::new(&[], 4_800),
+                8_000,
+                requested,
+                source,
+                &calibration_modulators(),
+                &|| false,
+            )
+            .unwrap();
+            assert!(
+                result
+                    .iter()
+                    .all(|calibration| calibration.sample_count == 31)
+            );
+        }
+    }
+
+    #[test]
+    fn view_calibration_rejects_invalid_durations_and_honors_cancellation() {
+        let pcm = music_core::PcmView::new(&[], 0);
+        let modulators = calibration_modulators();
+        for duration in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            for (requested, source) in [(duration, 1.0), (1.0, duration)] {
+                assert_eq!(
+                    calibrate_modulators_view(pcm, 48_000, requested, source, &modulators, &|| {
+                        false
+                    }),
+                    Err(ModulatorCalibrationError::InvalidRequest)
+                );
+            }
+        }
+        assert_eq!(
+            calibrate_modulators_view(pcm, 0, 1.0, 1.0, &modulators, &|| false),
+            Err(ModulatorCalibrationError::InvalidSampleRate)
+        );
+        assert_eq!(
+            calibrate_modulators_view(pcm, 48_000, 1.0, 1.0, &modulators, &|| true),
             Err(ModulatorCalibrationError::Cancelled)
         );
     }

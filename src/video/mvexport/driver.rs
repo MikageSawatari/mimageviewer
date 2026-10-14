@@ -6,8 +6,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use ffmpeg::util::frame::video::Video;
 use ffmpeg_the_third as ffmpeg;
 use musicvideo_core::{
-    Frame, LayerKind, RenderReport, Smoothing, SpectrumSource, UnresolvedAsset,
-    calibrate_modulators, evaluate, render_frame,
+    AnalysisKey, AnalysisTimeline, Frame, FrameGrid, LayerKind, RenderReport, Smoothing,
+    UnresolvedAsset, calibrate_modulators_view, evaluate, pcm_view, render_frame,
 };
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
@@ -33,6 +33,7 @@ const FFMPEG_EAGAIN: i32 = 11;
 const CONVERTER_HALO_ROWS: u32 = 8;
 
 struct ExportPlan {
+    grid: FrameGrid,
     frames: u64,
     frame_rate: FrameRate,
     spectrum_bands: usize,
@@ -65,6 +66,8 @@ pub(super) fn export(
     })?;
     let audio_decode_secs = audio_decode_started.elapsed().as_secs_f64();
     check_cancel(cancel)?;
+    let source_duration_secs =
+        (decoded.stereo_samples.len() / 2) as f64 / f64::from(decoded.info.sample_rate);
     fit_audio_to_duration(
         &mut decoded.stereo_samples,
         decoded.info.sample_rate,
@@ -107,9 +110,17 @@ pub(super) fn export(
         cancel,
     )?);
     let aac_encode_secs = aac_encode_started.elapsed().as_secs_f64();
-    let calibrations = calibrate_modulators(
+    let view = pcm_view(
         &decoded.stereo_samples,
         decoded.info.sample_rate,
+        request.project.duration_secs,
+    )
+    .map_err(|error| ExportError::InvalidRequest(error.to_string()))?;
+    let calibrations = calibrate_modulators_view(
+        view,
+        decoded.info.sample_rate,
+        request.project.duration_secs,
+        source_duration_secs,
         &request.project.modulators,
         &|| cancel.load(Ordering::Relaxed),
     )
@@ -122,19 +133,21 @@ pub(super) fn export(
             ))
         }
     })?;
-    let mut spectrum = SpectrumSource::new(
+    let key = AnalysisKey::new(
+        0_u64,
         decoded.info.sample_rate,
+        view.logical_frames,
+        plan.grid,
         plan.spectrum_bands,
         Smoothing::default(),
+        &request.project.modulators,
+        &calibrations,
+        request.project.display_gain_db,
     )
     .map_err(|error| {
         ExportError::InvalidRequest(format!("スペクトラム解析を初期化できません: {error}"))
     })?;
-    spectrum
-        .configure_modulators_with_calibrations(&request.project.modulators, &calibrations)
-        .map_err(|error| {
-            ExportError::InvalidRequest(format!("モジュレータを初期化できません: {error}"))
-        })?;
+    let mut spectrum = AnalysisTimeline::default();
     let mut rgba = Frame::new(request.project.output.width, request.project.output.height)
         .map_err(|error| ExportError::Render(format!("RGBA フレームを確保できません: {error}")))?;
     let mut converter = RgbaConverter::new(
@@ -150,15 +163,12 @@ pub(super) fn export(
 
     for frame_index in 0..plan.frames {
         check_cancel(cancel)?;
-        let t_secs = frame_index as f64 * plan.frame_rate.denominator as f64
-            / plan.frame_rate.numerator as f64;
+        let t_secs = plan.grid.time(frame_index);
 
         let render_started = Instant::now();
-        let spectrum_frame = spectrum.full_frame_at(
-            &decoded.stereo_samples,
-            t_secs,
-            request.project.display_gain_db,
-        );
+        let spectrum_frame = spectrum
+            .frame(&key, view, frame_index, &|| cancel.load(Ordering::Relaxed))
+            .map_err(|_| ExportError::Cancelled)?;
         let scene = evaluate(&request.project, t_secs, spectrum_frame);
         let report = render_frame(&scene, &request.assets, &mut rgba).map_err(|error| {
             ExportError::Render(format!(
@@ -307,13 +317,10 @@ fn validate_request(request: &MusicVideoExportRequest) -> Result<ExportPlan, Exp
         )));
     }
 
-    let frame_rate = rational_frame_rate(output.fps)?;
-    let frame_count = (request.project.duration_secs * output.fps).round();
-    if !frame_count.is_finite() || frame_count < 1.0 || frame_count > i64::MAX as f64 {
-        return Err(ExportError::InvalidRequest(
-            "書き出しフレーム数を表現できません".to_owned(),
-        ));
-    }
+    let grid = FrameGrid::new(output.fps, request.project.duration_secs)
+        .map_err(|error| ExportError::InvalidRequest(error.to_string()))?;
+    let frame_rate = FrameRate::new(grid.numerator(), grid.denominator())
+        .map_err(ExportError::InvalidRequest)?;
     let spectrum_bands = request
         .project
         .layers
@@ -326,7 +333,8 @@ fn validate_request(request: &MusicVideoExportRequest) -> Result<ExportPlan, Exp
         .unwrap_or(1);
 
     Ok(ExportPlan {
-        frames: frame_count as u64,
+        grid,
+        frames: grid.frames(),
         frame_rate,
         spectrum_bands,
     })
@@ -336,36 +344,6 @@ fn has_mp4_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|value| value.to_str())
         .is_some_and(|value| value.eq_ignore_ascii_case("mp4"))
-}
-
-fn rational_frame_rate(fps: f64) -> Result<FrameRate, ExportError> {
-    const SCALE: u64 = 1_000_000;
-    let scaled = (fps * SCALE as f64).round();
-    if !scaled.is_finite() || scaled < 1.0 || scaled > u64::MAX as f64 {
-        return Err(ExportError::InvalidRequest(
-            "fps を FFmpeg の有理数で表現できません".to_owned(),
-        ));
-    }
-    let numerator = scaled as u64;
-    let divisor = gcd(numerator, SCALE);
-    let numerator = numerator / divisor;
-    let denominator = SCALE / divisor;
-    let numerator = u32::try_from(numerator).map_err(|_| {
-        ExportError::InvalidRequest("fps の分子が FFmpeg の範囲を超えています".to_owned())
-    })?;
-    let denominator = u32::try_from(denominator).map_err(|_| {
-        ExportError::InvalidRequest("fps の分母が FFmpeg の範囲を超えています".to_owned())
-    })?;
-    FrameRate::new(numerator, denominator).map_err(ExportError::InvalidRequest)
-}
-
-const fn gcd(mut left: u64, mut right: u64) -> u64 {
-    while right != 0 {
-        let remainder = left % right;
-        left = right;
-        right = remainder;
-    }
-    left
 }
 
 fn stream_encoder_preference(preference: EncoderPreference) -> StreamEncoderPreference {
@@ -1066,18 +1044,6 @@ mod tests {
     }
 
     #[test]
-    fn frame_rate_is_reduced_without_changing_common_values() {
-        assert_eq!(
-            rational_frame_rate(60.0).unwrap(),
-            FrameRate::new(60, 1).unwrap()
-        );
-        assert_eq!(
-            rational_frame_rate(59.94).unwrap(),
-            FrameRate::new(2997, 50).unwrap()
-        );
-    }
-
-    #[test]
     fn audio_is_truncated_or_zero_padded_to_project_duration() {
         let mut long = vec![1.0; 24];
         fit_audio_to_duration(&mut long, 4, 2.0).unwrap();
@@ -1095,12 +1061,6 @@ mod tests {
         assert_eq!(percentile(&[], 0.95), 0.0);
         assert_eq!(percentile(&[5.0, 1.0, 4.0, 2.0, 3.0], 0.8), 4.0);
         assert_eq!(percentile(&[5.0, 1.0, 4.0, 2.0, 3.0], 0.95), 5.0);
-    }
-
-    #[test]
-    fn gcd_reduces_frame_rate_fraction() {
-        assert_eq!(gcd(60_000_000, 1_000_000), 1_000_000);
-        assert_eq!(gcd(59_940_000, 1_000_000), 20_000);
     }
 
     #[test]

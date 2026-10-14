@@ -111,11 +111,41 @@ struct MultiResolutionWindowSpec {
     refresh_secs: f64,
 }
 
+/// Read-only interleaved stereo PCM, truncated or zero-extended to a logical length.
+///
+/// Only complete stereo frames in `samples` are read. Analyzer window geometry
+/// uses `logical_frames`, so no materialized padding or truncated copy is needed.
+#[derive(Clone, Copy, Debug)]
+pub struct PcmView<'a> {
+    pub samples: &'a [f32],
+    pub logical_frames: usize,
+}
+
+impl<'a> PcmView<'a> {
+    pub const fn new(samples: &'a [f32], logical_frames: usize) -> Self {
+        Self {
+            samples,
+            logical_frames,
+        }
+    }
+}
+
+/// Determines how each FFT window reuses its previous calculation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SpectrumRefreshMode {
+    /// Preserve the live music view's minimum distance from the previous center.
+    #[default]
+    Elapsed,
+    /// Snap centers to each window's refresh interval, independent of call order.
+    FrameGrid,
+}
+
 pub struct SpectrumAnalyzer {
     bands: usize,
     sample_rate: u32,
     frame_count: usize,
     windows: Vec<SpectrumFftWindow>,
+    refresh_mode: SpectrumRefreshMode,
 }
 
 struct SpectrumFftWindow {
@@ -531,11 +561,16 @@ pub fn spectrum_analysis_from_stereo_window(
 
 impl SpectrumAnalyzer {
     pub fn new(bands: usize) -> Self {
+        Self::with_refresh_mode(bands, SpectrumRefreshMode::default())
+    }
+
+    pub fn with_refresh_mode(bands: usize, refresh_mode: SpectrumRefreshMode) -> Self {
         Self {
             bands: bands.clamp(1, 128),
             sample_rate: 0,
             frame_count: 0,
             windows: Vec::new(),
+            refresh_mode,
         }
     }
 
@@ -553,6 +588,16 @@ impl SpectrumAnalyzer {
             .spectrum
     }
 
+    pub fn analyze_view(
+        &mut self,
+        pcm: PcmView<'_>,
+        sample_rate: u32,
+        center_secs: f64,
+    ) -> SpectrumAnalysis {
+        self.analyze_with_ranges_view(pcm, sample_rate, center_secs, &[])
+            .spectrum
+    }
+
     /// Produces the ordinary spectrum plus arbitrary range values after one FFT
     /// window update. Range integration never performs another analysis pass.
     pub fn analyze_with_ranges(
@@ -562,8 +607,25 @@ impl SpectrumAnalyzer {
         center_secs: f64,
         range_requests: &[SpectrumRangeRequest],
     ) -> SpectrumAnalysisWithRanges {
+        self.analyze_with_ranges_view(
+            PcmView::new(stereo_samples, stereo_samples.len() / 2),
+            sample_rate,
+            center_secs,
+            range_requests,
+        )
+    }
+
+    /// Analyze one immutable PCM source through its logical output length.
+    /// Recreate the analyzer when the source contents change at the same length.
+    pub fn analyze_with_ranges_view(
+        &mut self,
+        pcm: PcmView<'_>,
+        sample_rate: u32,
+        center_secs: f64,
+        range_requests: &[SpectrumRangeRequest],
+    ) -> SpectrumAnalysisWithRanges {
         let bands = self.bands;
-        let frame_count = stereo_samples.len() / 2;
+        let frame_count = pcm.logical_frames;
         if sample_rate == 0 || frame_count == 0 {
             return SpectrumAnalysisWithRanges {
                 spectrum: SpectrumAnalysis {
@@ -576,7 +638,7 @@ impl SpectrumAnalyzer {
             };
         }
 
-        self.update_windows(stereo_samples, sample_rate, center_secs);
+        self.update_windows(pcm, sample_rate, center_secs);
         let max_hz = spectrum_max_hz(sample_rate);
 
         let mut values = Vec::with_capacity(bands);
@@ -651,8 +713,8 @@ impl SpectrumAnalyzer {
         }
     }
 
-    fn update_windows(&mut self, stereo_samples: &[f32], sample_rate: u32, center_secs: f64) {
-        let frame_count = stereo_samples.len() / 2;
+    fn update_windows(&mut self, pcm: PcmView<'_>, sample_rate: u32, center_secs: f64) {
+        let frame_count = pcm.logical_frames;
         let center_frame = if center_secs.is_finite() {
             (center_secs.max(0.0) * sample_rate.max(1) as f64).round() as usize
         } else {
@@ -665,12 +727,19 @@ impl SpectrumAnalyzer {
             let refresh_frames = (window.spec.refresh_secs * sample_rate.max(1) as f64)
                 .round()
                 .max(1.0) as usize;
-            let needs_update = window.last_center_frame.is_none_or(|last| {
-                let distance = center_frame.abs_diff(last);
-                distance >= refresh_frames || distance >= sample_rate.max(1) as usize / 4
-            });
+            let window_center = match self.refresh_mode {
+                SpectrumRefreshMode::Elapsed => center_frame,
+                SpectrumRefreshMode::FrameGrid => center_frame / refresh_frames * refresh_frames,
+            };
+            let needs_update = match self.refresh_mode {
+                SpectrumRefreshMode::Elapsed => window.last_center_frame.is_none_or(|last| {
+                    let distance = window_center.abs_diff(last);
+                    distance >= refresh_frames || distance >= sample_rate.max(1) as usize / 4
+                }),
+                SpectrumRefreshMode::FrameGrid => window.last_center_frame != Some(window_center),
+            };
             if needs_update {
-                fft_power_window_into(stereo_samples, center_frame, window);
+                fft_power_window_into(pcm, window_center, window);
             }
         }
     }
@@ -823,12 +892,10 @@ fn low_secondary_mix(hz: f32) -> f32 {
     }
 }
 
-fn fft_power_window_into(
-    stereo_samples: &[f32],
-    center_frame: usize,
-    window: &mut SpectrumFftWindow,
-) {
-    let frame_count = stereo_samples.len() / 2;
+fn fft_power_window_into(pcm: PcmView<'_>, center_frame: usize, window: &mut SpectrumFftWindow) {
+    let stereo_samples = pcm.samples;
+    let frame_count = pcm.logical_frames;
+    let available_frames = stereo_samples.len() / 2;
     let window_frames = window.samples.len();
     let max_start = frame_count.saturating_sub(window_frames);
     let start_frame = center_frame
@@ -840,7 +907,7 @@ fn fft_power_window_into(
         // 呼び出し元は空入力を渡さないが、library API としての頑健性。review-v2.3.0 hunt P3)。
         // NaN/Inf サンプルの除去は bin 集計側と同じ理由 (FFT に NaN が入ると窓全体の
         // スペクトラムが NaN になる)。
-        let mono = if frame_idx < frame_count && frame_idx * 2 + 1 < stereo_samples.len() {
+        let mono = if frame_idx < frame_count && frame_idx < available_frames {
             let l = finite_or_zero(stereo_samples[frame_idx * 2]);
             let r = finite_or_zero(stereo_samples[frame_idx * 2 + 1]);
             ((l + r) * 0.5).clamp(-1.0, 1.0)
@@ -1780,6 +1847,144 @@ mod tests {
         assert!(result.range_values[0] > 0.5);
         assert!(result.range_values[1] > 0.5);
         assert!(result.range_values[2] < result.range_values[0] * 0.25);
+    }
+
+    fn grid_test_pcm(frames: usize) -> Vec<f32> {
+        (0..frames)
+            .flat_map(|i| {
+                let time = i as f32 / 48_000.0;
+                let envelope = 0.1 + 0.25 * (time * 31.0).sin().abs();
+                let value = (time * (87.0 + 800.0 * time) * std::f32::consts::TAU).sin() * envelope;
+                [value, value * 0.75]
+            })
+            .collect()
+    }
+
+    fn fft_power_bits(analyzer: &SpectrumAnalyzer) -> Vec<Vec<u32>> {
+        analyzer
+            .windows
+            .iter()
+            .map(|window| window.powers.iter().map(|value| value.to_bits()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn grid_fft_raw_powers_are_independent_of_query_order() {
+        let samples = grid_test_pcm(48_000);
+        let pcm = PcmView::new(&samples, 48_000);
+        let mut sequential =
+            SpectrumAnalyzer::with_refresh_mode(64, SpectrumRefreshMode::FrameGrid);
+        let expected: Vec<_> = (0..60)
+            .map(|n| {
+                sequential.update_windows(pcm, 48_000, n as f64 / 60.0);
+                fft_power_bits(&sequential)
+            })
+            .collect();
+        let mut shuffled: Vec<_> = (0..60).rev().collect();
+        shuffled.extend([0, 1, 59, 1, 17, 17, 18, 42, 0]);
+        let mut seed = 0x13af_06d9_u32;
+        for _ in 0..80 {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            shuffled.push(seed as usize % 60);
+        }
+        let mut queried = SpectrumAnalyzer::with_refresh_mode(64, SpectrumRefreshMode::FrameGrid);
+        for n in shuffled {
+            queried.update_windows(pcm, 48_000, n as f64 / 60.0);
+            assert_eq!(fft_power_bits(&queried), expected[n], "frame {n}");
+        }
+    }
+
+    #[test]
+    fn grid_fft_centers_snap_after_rounding_and_logical_end_clamp() {
+        let samples = grid_test_pcm(48_000);
+        let pcm = PcmView::new(&samples, 35_017);
+        let mut analyzer = SpectrumAnalyzer::with_refresh_mode(64, SpectrumRefreshMode::FrameGrid);
+        for center in [624, 1_200, 34_999, 35_016, 90_000] {
+            analyzer.update_windows(pcm, 48_000, center as f64 / 48_000.0);
+            for window in &analyzer.windows {
+                let refresh_frames = (window.spec.refresh_secs * 48_000.0).round() as usize;
+                let expected = center.min(35_016) / refresh_frames * refresh_frames;
+                assert_eq!(window.last_center_frame, Some(expected));
+            }
+        }
+        analyzer.update_windows(pcm, 48_000, 0.013);
+        let bits = fft_power_bits(&analyzer);
+        analyzer.update_windows(pcm, 48_000, 0.01299);
+        assert_eq!(fft_power_bits(&analyzer), bits);
+    }
+
+    #[test]
+    fn grid_fft_view_equals_materialized_truncation_and_padding() {
+        let source = grid_test_pcm(48_000);
+        let requests = [
+            SpectrumRangeRequest {
+                range: SpectrumRange::Hz {
+                    low_hz: 40.0,
+                    high_hz: 120.0,
+                },
+                weighting: SpectrumWeighting::None,
+            },
+            SpectrumRangeRequest {
+                range: SpectrumRange::Midi {
+                    low_midi: 60,
+                    high_midi: 80,
+                },
+                weighting: SpectrumWeighting::Display,
+            },
+        ];
+        for (available_frames, logical_frames) in [
+            (12_000, 36_000),
+            (48_000, 36_000),
+            (1_024, 4_096),
+            (8_192, 4_096),
+            (0, 4_096),
+            (1, 1),
+            (1, 0),
+        ] {
+            let samples = &source[..available_frames * 2];
+            let mut materialized = samples[..samples.len().min(logical_frames * 2)].to_vec();
+            materialized.resize(logical_frames * 2, 0.0);
+            for mode in [SpectrumRefreshMode::Elapsed, SpectrumRefreshMode::FrameGrid] {
+                let mut viewed = SpectrumAnalyzer::with_refresh_mode(SPECTRUM_BAND_COUNT, mode);
+                let mut copied = SpectrumAnalyzer::with_refresh_mode(SPECTRUM_BAND_COUNT, mode);
+                for time in [
+                    0.0,
+                    0.0001,
+                    0.02,
+                    logical_frames as f64 / 48_000.0 - 0.001,
+                    2.0,
+                ] {
+                    let actual = viewed.analyze_with_ranges_view(
+                        PcmView::new(samples, logical_frames),
+                        48_000,
+                        time,
+                        &requests,
+                    );
+                    let expected =
+                        copied.analyze_with_ranges(&materialized, 48_000, time, &requests);
+                    assert_eq!(
+                        actual, expected,
+                        "available={available_frames}, logical={logical_frames}, time={time}, mode={mode:?}"
+                    );
+                    assert_eq!(fft_power_bits(&viewed), fft_power_bits(&copied));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn default_fft_refresh_preserves_elapsed_center_behavior() {
+        let samples = grid_test_pcm(48_000);
+        let pcm = PcmView::new(&samples, 48_000);
+        let mut analyzer = SpectrumAnalyzer::new(64);
+        analyzer.update_windows(pcm, 48_000, 0.013);
+        assert_eq!(analyzer.windows[0].last_center_frame, Some(624));
+        let first = fft_power_bits(&analyzer);
+        analyzer.update_windows(pcm, 48_000, 0.014);
+        assert_eq!(analyzer.windows[0].last_center_frame, Some(624));
+        assert_eq!(fft_power_bits(&analyzer), first);
+        analyzer.update_windows(pcm, 48_000, 0.04);
+        assert_eq!(analyzer.windows[0].last_center_frame, Some(1_920));
     }
 
     #[test]

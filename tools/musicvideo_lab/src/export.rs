@@ -9,13 +9,13 @@ use music_core::{
     analyze_stereo_timeline_cancellable, prepare_keyboard_frame_into,
 };
 use musicvideo_core::{
-    Animatable, Assets, BAND_ENERGY_CALIBRATION_HIGH_PERCENTILE,
-    BAND_ENERGY_CALIBRATION_LOW_PERCENTILE, BandCalibration, Frame, ImageId, LayerKind,
+    AnalysisKey, AnalysisTimeline, Animatable, Assets, BAND_ENERGY_CALIBRATION_HIGH_PERCENTILE,
+    BAND_ENERGY_CALIBRATION_LOW_PERCENTILE, BandCalibration, Frame, FrameGrid, ImageId, LayerKind,
     MODULATOR_CALIBRATION_HZ, ModulationBinding, ModulationCurve, ModulationTarget, ModulatorId,
     ModulatorSource, NormRect, Project, RenderReport, Rgba8, ScaledImageCacheStats, Scene,
-    SceneItemKind, Smoothing, SpectrumFrame, SpectrumSource, UnresolvedAsset, calibrate_modulators,
-    evaluate, new_band_energy_modulator, new_lyrics_layer, new_miv_spectrum_keyboard_layers,
-    new_solid_layer, norm_rect_to_pixels, render_frame,
+    SceneItemKind, Smoothing, SpectrumFrame, UnresolvedAsset, calibrate_modulators_view, evaluate,
+    new_band_energy_modulator, new_lyrics_layer, new_miv_spectrum_keyboard_layers, new_solid_layer,
+    norm_rect_to_pixels, pcm_view, render_frame,
 };
 
 use crate::decode::AudioData;
@@ -39,6 +39,66 @@ const STATIONARY_TONE_CENTER_SECS: f64 = 1.0;
 const KICK_RESPONSE_FPS: f64 = 60.0;
 const KICK_RESPONSE_DURATION_SECS: f64 = 2.0;
 const KICK_ONSET_SECS: f64 = 0.8;
+
+/// Each headless operation owns one immutable PCM snapshot (local identity 1).
+struct LabAnalysis<'a> {
+    grid: FrameGrid,
+    pcm: music_core::PcmView<'a>,
+    key: AnalysisKey<u64>,
+    timeline: AnalysisTimeline<u64>,
+}
+
+impl<'a> LabAnalysis<'a> {
+    fn new(
+        project: &Project,
+        samples: &'a [f32],
+        rate: u32,
+        smoothing: Smoothing,
+        cancel: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Self, String> {
+        let grid = FrameGrid::new(project.output.fps, project.duration_secs)
+            .map_err(|error| error.to_string())?;
+        let pcm =
+            pcm_view(samples, rate, project.duration_secs).map_err(|error| error.to_string())?;
+        let calibrations = calibrate_modulators_view(
+            pcm,
+            rate,
+            project.duration_secs,
+            samples.len() as f64 / 2.0 / rate as f64,
+            &project.modulators,
+            cancel,
+        )
+        .map_err(|error| format!("モジュレータの反応範囲を自動調整できません: {error}"))?;
+        let key = AnalysisKey::new(
+            1,
+            rate,
+            pcm.logical_frames,
+            grid,
+            spectrum_band_count(project),
+            smoothing,
+            &project.modulators,
+            &calibrations,
+            project.display_gain_db,
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(Self {
+            grid,
+            pcm,
+            key,
+            timeline: AnalysisTimeline::default(),
+        })
+    }
+
+    fn frame(
+        &mut self,
+        n: u64,
+        cancel: &(dyn Fn() -> bool + Sync),
+    ) -> Result<&SpectrumFrame, String> {
+        self.timeline
+            .frame(&self.key, self.pcm, n, cancel)
+            .map_err(|error| error.to_string())
+    }
+}
 
 pub fn run_project_modulator_response(project_path: &Path) -> Result<(), String> {
     let project = load_project(project_path)?;
@@ -83,9 +143,16 @@ pub fn run_project_modulator_response(project_path: &Path) -> Result<(), String>
         }
     };
     let modulators = [level, onset];
-    let calibrations =
-        calibrate_modulators(&audio.stereo_pcm, audio.sample_rate, &modulators, &|| false)
-            .map_err(|error| format!("実素材の自動調整に失敗しました: {error}"))?;
+    let calibrations = calibrate_modulators_view(
+        pcm_view(&audio.stereo_pcm, audio.sample_rate, project.duration_secs)
+            .map_err(|error| error.to_string())?,
+        audio.sample_rate,
+        project.duration_secs,
+        audio.stereo_pcm.len() as f64 / 2.0 / audio.sample_rate as f64,
+        &modulators,
+        &|| false,
+    )
+    .map_err(|error| format!("実素材の自動調整に失敗しました: {error}"))?;
     for calibration in &calibrations {
         println!(
             "calibration id={} feature={:?} percentiles={:.1}-{:.1} range={:.6}-{:.6} samples={}",
@@ -99,20 +166,19 @@ pub fn run_project_modulator_response(project_path: &Path) -> Result<(), String>
         );
     }
 
-    let mut source = SpectrumSource::new(
+    let mut response_project = project.clone();
+    response_project.output.fps = MODULATOR_CALIBRATION_HZ;
+    response_project.modulators = modulators.to_vec();
+    let mut source = LabAnalysis::new(
+        &response_project,
+        &audio.stereo_pcm,
         audio.sample_rate,
-        spectrum_band_count(&project),
         Smoothing::Average { factor: 0.7 },
-    )
-    .map_err(|error| format!("実素材のスペクトラム解析を初期化できません: {error}"))?;
-    source
-        .configure_modulators_with_calibrations(&modulators, &calibrations)
-        .map_err(|error| format!("実素材のモジュレータを初期化できません: {error}"))?;
-    let sample_count = (audio.duration_secs * MODULATOR_CALIBRATION_HZ).ceil() as usize;
-    let mut values = Vec::with_capacity(sample_count);
-    for index in 0..sample_count {
-        let time = index as f64 / MODULATOR_CALIBRATION_HZ;
-        let frame = source.full_frame_at(&audio.stereo_pcm, time, project.display_gain_db);
+        &|| false,
+    )?;
+    let mut values = Vec::with_capacity(source.grid.frames() as usize);
+    for index in 0..source.grid.frames() {
+        let frame = source.frame(index, &|| false)?;
         let level_value = frame
             .modulators
             .iter()
@@ -469,20 +535,12 @@ pub enum ExportOutcome {
 }
 
 pub fn frame_count(project: &Project) -> Result<usize, String> {
-    if !project.output.fps.is_finite() || project.output.fps <= 0.0 {
-        return Err("fps は 0 より大きい有限値である必要があります".to_owned());
-    }
-    if !project.duration_secs.is_finite() || project.duration_secs <= 0.0 {
-        return Err("書き出し時間が 0 秒です".to_owned());
-    }
     if !project.display_gain_db.is_finite() {
         return Err("表示ゲインは有限値にしてください".to_owned());
     }
-    let count = (project.duration_secs * project.output.fps).ceil();
-    if count > usize::MAX as f64 {
-        return Err("書き出しフレーム数が大きすぎます".to_owned());
-    }
-    Ok(count as usize)
+    let grid = FrameGrid::new(project.output.fps, project.duration_secs)
+        .map_err(|error| error.to_string())?;
+    usize::try_from(grid.frames()).map_err(|_| "書き出しフレーム数が大きすぎます".to_owned())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -497,22 +555,13 @@ pub fn export_png_sequence(
 ) -> Result<ExportOutcome, String> {
     let total_frames = frame_count(&project)?;
     let output_dir = create_output_dir(output_root)?;
-    let mut spectrum = SpectrumSource::new(
-        audio.sample_rate,
-        spectrum_band_count(&project),
-        Smoothing::Average { factor: 0.7 },
-    )
-    .map_err(|error| format!("スペクトラム解析を初期化できません: {error}"))?;
-    let calibrations = calibrate_modulators(
+    let mut spectrum = LabAnalysis::new(
+        &project,
         &audio.stereo_pcm,
         audio.sample_rate,
-        &project.modulators,
+        Smoothing::Average { factor: 0.7 },
         &|| cancel.load(Ordering::Relaxed),
-    )
-    .map_err(|error| format!("モジュレータの反応範囲を自動調整できません: {error}"))?;
-    spectrum
-        .configure_modulators_with_calibrations(&project.modulators, &calibrations)
-        .map_err(|error| format!("モジュレータを初期化できません: {error}"))?;
+    )?;
     let mut frame = Frame::new(project.output.width, project.output.height)
         .map_err(|error| format!("出力フレームを確保できません: {error}"))?;
     let mut analysis_ms = Vec::with_capacity(total_frames);
@@ -528,11 +577,21 @@ pub fn export_png_sequence(
                 completed_frames: index,
             });
         }
-        let time = index as f64 / project.output.fps;
+        let time = spectrum.grid.time(index as u64);
         let total_started = Instant::now();
         let analysis_started = Instant::now();
-        let spectrum_frame =
-            spectrum.full_frame_at(&audio.stereo_pcm, time, project.display_gain_db);
+        let spectrum_frame = match spectrum.frame(index as u64, &|| cancel.load(Ordering::Relaxed))
+        {
+            Ok(frame) => frame,
+            Err(_) if cancel.load(Ordering::Relaxed) => {
+                notify();
+                return Ok(ExportOutcome::Cancelled {
+                    output_dir,
+                    completed_frames: index,
+                });
+            }
+            Err(error) => return Err(error),
+        };
         let analyzed_ms = analysis_started.elapsed().as_secs_f64() * 1000.0;
         let composition_started = Instant::now();
         let scene = evaluate(&project, time, spectrum_frame);
@@ -686,14 +745,16 @@ pub fn render_sample_frame(output: &Path, font: &FontData) -> Result<(), String>
     let mut project = default_project(10.0);
     project.layers.push(new_pitch_keyboard_layer(&project));
     let pcm = synthetic_chirp_pcm(11.0);
-    let mut spectrum = SpectrumSource::new(
+    let mut spectrum = LabAnalysis::new(
+        &project,
+        &pcm,
         BENCHMARK_SAMPLE_RATE,
-        spectrum_band_count(&project),
         Smoothing::Average { factor: 0.7 },
-    )
-    .map_err(|error| format!("サンプル用の解析を初期化できません: {error}"))?;
-    let time = 5.0;
-    let spectrum_frame = spectrum.full_frame_at(&pcm, time, project.display_gain_db);
+        &|| false,
+    )?;
+    let n = spectrum.grid.index_at(5.0);
+    let time = spectrum.grid.time(n);
+    let spectrum_frame = spectrum.frame(n, &|| false)?;
     let scene = evaluate(&project, time, spectrum_frame);
     let mut frame = Frame::new(project.output.width, project.output.height)
         .map_err(|error| format!("サンプル画像を確保できません: {error}"))?;
@@ -830,40 +891,35 @@ fn benchmark_once(
         miv_spectrum_enabled,
     );
     let pcm = synthetic_chirp_pcm(project.duration_secs + 1.0);
-    let mut spectrum = SpectrumSource::new(
+    let mut spectrum = LabAnalysis::new(
+        &project,
+        &pcm,
         BENCHMARK_SAMPLE_RATE,
-        spectrum_band_count(&project),
         Smoothing::Average { factor: 0.7 },
-    )
-    .map_err(|error| format!("ベンチマーク解析を初期化できません: {error}"))?;
-    let calibrations =
-        calibrate_modulators(&pcm, BENCHMARK_SAMPLE_RATE, &project.modulators, &|| false)
-            .map_err(|error| format!("ベンチマークの自動調整に失敗しました: {error}"))?;
-    spectrum
-        .configure_modulators_with_calibrations(&project.modulators, &calibrations)
-        .map_err(|error| format!("ベンチマークのモジュレータを初期化できません: {error}"))?;
+        &|| false,
+    )?;
     let mut frame = Frame::new(project.output.width, project.output.height)
         .map_err(|error| format!("ベンチマーク用フレームを確保できません: {error}"))?;
 
-    for index in 0..BENCHMARK_WARMUP_FRAMES {
-        let time = index as f64 / project.output.fps;
-        let spectrum_frame = spectrum.full_frame_at(&pcm, time, project.display_gain_db);
+    for index in 0..BENCHMARK_WARMUP_FRAMES.min(spectrum.grid.frames() as usize) {
+        let time = spectrum.grid.time(index as u64);
+        let spectrum_frame = spectrum.frame(index as u64, &|| false)?;
         let scene = evaluate(&project, time, spectrum_frame);
         let report = render_frame(&scene, &assets, &mut frame)
             .map_err(|error| format!("ウォームアップ合成に失敗しました: {error}"))?;
         ensure_resolved(&report, "ウォームアップ")?;
     }
     let cache_after_warmup = assets.scaled_image_cache_stats();
-    spectrum.reset();
+    spectrum.timeline.reset();
 
     let mut analysis_ms = Vec::with_capacity(frames);
     let mut composition_ms = Vec::with_capacity(frames);
     let mut total_ms = Vec::with_capacity(frames);
     for index in 0..frames {
-        let time = index as f64 / project.output.fps;
+        let time = spectrum.grid.time(index as u64);
         let total_started = Instant::now();
         let analysis_started = Instant::now();
-        let spectrum_frame = spectrum.full_frame_at(&pcm, time, project.display_gain_db);
+        let spectrum_frame = spectrum.frame(index as u64, &|| false)?;
         let analyzed_ms = analysis_started.elapsed().as_secs_f64() * 1000.0;
         let composition_started = Instant::now();
         let scene = evaluate(&project, time, spectrum_frame);
@@ -1165,20 +1221,20 @@ fn measure_kick_envelope_response() -> Result<Vec<KickResponseSample>, String> {
     };
 
     let pcm = synthetic_kick_pcm(KICK_RESPONSE_DURATION_SECS, KICK_ONSET_SECS);
-    let mut source = SpectrumSource::new(
+    let mut response_project = project;
+    response_project.output.fps = KICK_RESPONSE_FPS;
+    response_project.modulators = vec![raw, average, envelope];
+    let mut source = LabAnalysis::new(
+        &response_project,
+        &pcm,
         BENCHMARK_SAMPLE_RATE,
-        musicvideo_core::DEFAULT_SPECTRUM_BANDS,
         Smoothing::None,
-    )
-    .map_err(|error| format!("キック応答の解析を初期化できません: {error}"))?;
-    source
-        .configure_modulators(&[raw, average, envelope])
-        .map_err(|error| format!("キック応答の変調を初期化できません: {error}"))?;
-    let frame_count = (KICK_RESPONSE_DURATION_SECS * KICK_RESPONSE_FPS).round() as usize;
-    let mut samples = Vec::with_capacity(frame_count + 1);
-    for index in 0..=frame_count {
-        let time_secs = index as f64 / KICK_RESPONSE_FPS;
-        let values = &source.full_frame_at(&pcm, time_secs, 0.0).modulators;
+        &|| false,
+    )?;
+    let mut samples = Vec::with_capacity(source.grid.frames() as usize);
+    for index in 0..source.grid.frames() {
+        let time_secs = source.grid.time(index);
+        let values = &source.frame(index, &|| false)?.modulators;
         if values.len() != 3 {
             return Err("キック応答の変調値が 3 系統そろいませんでした".to_owned());
         }
@@ -1401,6 +1457,15 @@ fn keyboard_distribution_ranges() -> Vec<(&'static str, u8, u8)> {
 mod tests {
     use super::*;
     use musicvideo_core::LayerKind;
+
+    #[test]
+    fn h3a_png_frame_count_uses_shared_grid_round_and_rejects_zero() {
+        let mut project = default_project(1.01);
+        project.output.fps = 30.0;
+        assert_eq!(frame_count(&project).unwrap(), 30);
+        project.duration_secs = 0.001;
+        assert!(frame_count(&project).is_err());
+    }
 
     #[test]
     fn benchmark_scene_includes_the_pitch_keyboard_path() {

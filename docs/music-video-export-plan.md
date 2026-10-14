@@ -243,8 +243,9 @@ Rotation / SVG Filters（上級者向け、実プロジェクトでは未使用�
 - 不採用: 後段を有限の窓（直近 W フレームだけで決まる形）に作り直す案。長いリリース時間の見た目が変わり、
   書き出しも 1 フレームごとに W フレーム分の計算が要る。
 - 保留（計測で決める）: 生の値をフレームごとに保持するキャッシュ。後段だけの編集（平滑化・しきい値・
-  表示ゲインなど）でも、遠い位置では 0 から生の値を計算し直す。4 分の位置で並列再計算 0.5 秒以内を
-  目安とし、超えた場合だけ追加する。
+  表示ゲインなど）でも、遠い位置では 0 から生の値を計算し直す。2026-10-14 の設計担当判断で、
+  4 分位置で約 0.7 秒以内（並列）を目安とし、生の値のキャッシュは追加しない。
+  後段だけの編集が遅いと実利用で分かった時点で、キャッシュの採否を別途判断する。
 
 **操作感への影響。** 再生位置が曲の後半にあるとき、解析の設定（モジュレータ・表示ゲイン・平滑化）を
 変えると、プレビューの更新に 0 からの再計算の時間がかかる。自動較正のモジュレータは今でも
@@ -262,7 +263,7 @@ Rotation / SVG Filters（上級者向け、実プロジェクトでは未使用�
 | A3 | 較正: 出力尺が音源より短い・長い・同じの 3 通りで、プレビュー側の view と書き出し側の切り詰め／延長済み PCM の較正結果が一致する。延長した無音が標本に入らず、出力尺より後の音が窓に入らないこと |
 | A4 | 書き出し driver とラボの PNG 書き出し・プレビュー・ベンチマーク（`benchmark_once`）が同じ格子型・同じ view・同じタイムラインを使う（格子の重複実装が無い） |
 | A5 | 無変調のフレームハッシュが変わらない |
-| A6 | 計測: 1 フレームの解析時間（変更前後）、5 分の素材で 4 分の位置への冷えた状態からの移動と後段だけの編集の再計算時間（逐次。0.5 秒を超えたら並列化、さらに必要なら生の値のキャッシュ）、書き出し速度が変更前と同程度 |
+| A6 | 計測: 1 フレームの解析時間（変更前後）、5 分の素材で 4 分の位置への冷えた状態からの移動と後段だけの編集の再計算時間。逐次から必要に応じ区間並列化し、4 分位置で約 0.7 秒以内（並列）を目安とする。生の値のキャッシュは追加しない（2026-10-14 設計担当判断）。書き出し速度が変更前と同程度 |
 
 H3b（P4b 接続後）は、製品エディタの実際のプレビューで表示した画素と書き出しフレームの一致を確かめる。
 
@@ -274,6 +275,139 @@ P2: チェックポイントの内容と再開位置、key の型と PCM の識�
 レビューで確認された前提: evaluate・文字キャッシュ・鍵盤レイアウトに追加の履歴依存は無い。中心の量子化は
 論理長から窓の大きさと開始位置を求めれば呼出し順に依存しない。無変調ハッシュの検査は解析器を通らない。
 
+
+#### H3a 実装記録（2026-10-14）
+
+`24937705b` を基点に `musicvideo` worktree へ未コミットの差分を作成した。
+**A6 の設計担当判断（2026-10-14）:** 区間並列で観測した 4 分位置 0.54〜0.70 秒を採用する。
+0.5 秒は設計時の仮の目安であり、計測環境も静穏でなかったため、目安を「4 分位置で約 0.7 秒以内（並列）」へ改めた。
+生の値のキャッシュは追加しない。後段だけの編集が遅いと実利用で分かった時点で別途判断する。
+この判断に基づき残る受け入れ作業を再開した。実アプリ／lab GUI 起動なし・コミットなしを維持する。
+
+- `crates/music-core/src/{analysis,lib,spectrum_visual}.rs`: 論理長付き `PcmView`、選択式の
+  `SpectrumRefreshMode::FrameGrid`、時刻キャッシュを通さない `advance_frame`。既定の Elapsed 方式は保持。
+- `crates/musicvideo-core/src/{frame_grid,analysis_timeline}.rs`（新規）と `{spectrum,lib}.rs`:
+  共通格子、ビット比較の型付き key、未処理／処理済み状態、1 秒ごとのチェックポイント、取消時の状態保持、
+  出力尺と元音源長を明示する較正入口。FFT は区間ごとに並列計算でき、後段は同じ step で順番に適用する。
+  並列結果は bounded batch の一時領域だけに置き、永続的な生の値のキャッシュは持たない。
+- `src/video/mvexport/driver.rs`: 格子・view・タイムライン・新較正入口へ接続。
+  AAC の `fit_audio_to_duration` は変更せず、その前に元音源長を保持する。
+  `mvexport_cli` は従来どおりこの driver を利用する（CLI 自体のソース変更なし）。
+- `tools/musicvideo_lab/src/{app,export}.rs`: 編集セッションの共有タイムライン所有、worker 内だけでの
+  lock と取得直後の取消確認、描画前のフレーム複製と unlock、格子時刻でのプレビュー、
+  PCM revision・要求尺ビットを含む較正 key。PNG、benchmark、従来の SpectrumSource 利用診断を共通入口へ接続。
+- ヘッドレス計測用に `crates/musicvideo-core/examples/{h3a_legacy_measure,h3a_measure}.rs` を追加。
+- `crates/musicvideo-core/tests/analysis_routes.rs`（新規）で driver・CLI・lab の共通入口と
+  warmup／計測双方のタイムライン利用、lock 後の取消確認順を検査する。
+  lab には格子フレームと PNG の画素一致を実 worker 経由で確認するテストを追加した。
+
+計測条件: release、合成 PCM 5 分・stereo 48kHz、60fps、118 帯域、Average 0.7、要求フレーム 14,400（4 分）。
+出力は `target/h3a-evidence/` に保存した（コミット対象外）。
+
+| 経路 | 4 分までの計算 | 表示ゲイン 0→3dB の再計算 |
+| --- | ---: | ---: |
+| 変更前の参照順実行（0..=14,400） | 2.074924 秒 | 未計測 |
+| H3a 逐次 | 2.605951 秒 | 2.580358 秒 |
+| H3a 区間並列・初回 | 0.575282 秒 | 0.537510 秒 |
+| H3a 区間並列・再実行 1 | 0.698727 秒 | 0.575340 秒 |
+| H3a 区間並列・再実行 2 | 0.686084 秒 | 0.630077 秒 |
+| H3a 区間並列・再開後の最終計測 | 0.534035 秒 | 0.489301 秒 |
+
+手動範囲の計測は自動較正を無効にした onset モジュレータ 1 件を使い、同じ PCM／格子／118 帯域で
+manual floor 0.03 の冷状態が 0.444852 秒、floor 0.03→0.08 編集後の再計算が **0.459336 秒**。
+`h3a_measure` 内で明示的に Manual を設定し、較正走査の時間を含めていない。
+
+旧方式の直接 seek は 0.001185 秒だが、過去フレームを処理しない別の意味論なので採否比較には使えない。
+初回並列計測には別の cargo 処理が重なった。担当内の cargo を止めて再実行しても閾値超過を観測したが、
+OS のプロセス照会はアクセス拒否で、環境全体の静穏性は保証できていない。
+設計担当はこの計測上の制約を踏まえて上表の区間並列値を採用した。キャッシュは追加しない。
+
+変更前後の lab ヘッドレス benchmark はどちらも 600 フレーム、1920×1080、60fps、背景 3000×1687、
+keyboard/on、warmup 10 フレーム。同じ `--benchmark 600` の 4 条件を順に計測した。
+
+| 条件（glow／modulation／mIV horizontal） | 変更前 解析平均／p95 (ms) | 変更後 解析平均／p95 (ms) | 変更前→後 合計平均 (ms) |
+| --- | ---: | ---: | ---: |
+| off／off／off | 0.220／0.393 | 0.262／0.389 | 2.513→2.573 |
+| on／off／off | 0.175／0.311 | 0.223／0.309 | 3.339→3.326 |
+| on／on／off | 0.202／0.390 | 0.237／0.348 | 3.683→3.450 |
+| on／on／on | 0.196／0.365 | 0.282／0.393 | 3.977→4.524 |
+
+FFT 窓の格子更新で解析回数が増えるため解析平均は増えたが、1 フレーム 0.223〜0.282ms。
+計測中は担当内の build／test を止めた一方、別の `rustc` 1 件を観測しており、環境全体の静穏性は保証しない。
+後述の書き出しは同程度の速度を維持した。背景負荷の異なる測定から厳密な高速化率は主張しない。
+
+CLI 書き出し条件は変更前後とも 10 秒、同じ合成 chirp WAV・`htdocs/mimageviewer/ogp.jpg`、
+1920×1080／60fps／NVENC、RGBA hash 有効、600 フレーム。
+`target/h3a-evidence/` の DLL 同居ディレクトリへ比較用 exe を配置して計測した。
+最初の変更後 CLI 実行は release ディレクトリの DLL 不足で起動できなかったため、変更前と同じ配置に揃えて再実行した。
+
+| 経路 | wall (秒) | 実時間比 | render 平均 (ms) | RGBA SHA-256 |
+| --- | ---: | ---: | ---: | --- |
+| 変更前 | 4.306 | 2.323x | 2.850 | `c4e9d25f7d723967fcc4c68ff3667d8d781be43f960465e2bbdd75ad5de13071` |
+| 変更後 | 3.651 | 2.739x | 2.465 | `8a634eae61114e49a3f5bb3eb2caf5a145564239725a80ba8f02fda6c8f0e283` |
+| 変更後の同一条件再実行 | 3.635 | 2.751x | 2.430 | `8a634eae61114e49a3f5bb3eb2caf5a145564239725a80ba8f02fda6c8f0e283` |
+
+解析を使う書き出しのハッシュ変更を実測し、FFT 中心の格子合わせによる契約上の予定どおりの変更として扱う。
+変更後の 2 回は全 RGBA フレーム列の SHA-256 が一致した。どちらも MP4 再検証で 600 フレーム、
+映像 10.000000 秒、音声 10.005333 秒、差 0.005333 秒を確認した。無変調の固定 SpectrumFrame の golden は更新しない。
+入力 WAV の SHA-256 は `1d774e968f589b8d47ef9248c458ebc0f2e1a15d49173f8981b939734fee95d2`、
+背景 JPEG は `3518ea212eb3372458eaef08a5815b207a23044b262d99e5acb89cd136a3d198`。
+生ログは `lab-{before,after}.txt`、`export-{before,after,after-repeat}.txt`、`timeline-final.txt`。
+
+追加テスト: music-core 5 件、musicvideo-core 12 件（格子 2・タイムライン 3・較正 5・経路 2）、lab 7 件。
+先行確認では music-core 69 件（unit49・integration20）、musicvideo-core unit 114 件、UI 122 件、lab 81 件が成功。
+再開後の lab は全 82 件、経路検査は 2 件成功（本体 lib 全体を含む最終結果は後述）。
+`selection_unmodulated_render_hash_is_unchanged` も成功し、既存無変調ハッシュは維持。
+FFT の格子合わせ削除／旧更新方式化／物理長による開始位置／残光キャッシュ化と、較正の ceil 化／元音源長無視／
+論理長無視／旧解析方式化／検証省略の計 9 種の意図的変異で対象テストが失敗し、復元後に成功した。
+残る A1/A1b/A2b/A4 は次の意図的変異でコンパイル成功後に対象テストが失敗（assert／panic、exit 101）すること、
+復元後に成功（exit 0）することを確認した。先行 9 ケースと合わせて 32 ケース。
+
+| 対象 | 変異と検出結果 |
+| --- | --- |
+| A1（4 ケース） | checkpoint の処理済み番号を +1、key が変わっても状態を再利用、gain の `+0.0/-0.0` を数値比較、取消時に進捗破棄。乱数要求列・key 変更・取消再開の対象テストで失敗し、復元後成功 |
+| A1b／lab（7 ケース） | worker 実行中の受付抑止削除、lock 待機後の取消と下流の取消確認を無効化、描画エラー時に共有 owner を置換、較正 key の尺欠落（key 検査と古い完了の採用拒否の 2 ケース）、PCM revision 固定、浮動小数点の符号付きゼロ消去。handler テストで失敗し、復元後成功 |
+| A2b（3 ケース） | `index_at` の境界補正削除、round を ceil 化、0 フレームの許可。格子の境界／入力検証テストで失敗し、復元後成功 |
+| A4（9 ケース） | driver の独自時刻計算・物理長 view・timeline 迂回、CLI 内の格子計算重複、PNG ceil 化、preview の生位置使用、scene だけ生位置で評価、benchmark warmup だけ timeline 迂回、host の lock 直後の取消確認だけ削除。経路検査または画素／handler テストで失敗し、復元後成功 |
+
+lock 後の取消は host と timeline の両方で守られているため、behavioral test は両方の保護を外した場合の
+key／進捗汚染を検出し、経路検査は host 側の 1 箇所だけの削除も検出する。
+初回の warmup-only 迂回変異は経路検査を通過したため、warmup と計測の両方を検査するよう補強し、
+同じ変異で失敗することを再確認した。
+再現コマンドとケースは `target/h3a-evidence/{mutate-core.py,lab_mutations.py,lab-mutation-results.json}`、
+失敗／復元後ログは同ディレクトリの `a1-*`／`a2b-*`／`a4-*`／`lab-*` に保存（コミット対象外）。
+`cargo fmt` 実施、`cargo fmt --check`・glyph check（危険文字 0）・`git diff --check` 成功。
+本体 mvexport の限定テスト 8 件成功に加え、再開後は FFmpeg DLL を `target/debug/` と
+`target/debug/deps/` へ配置し、`cargo test -p mimageviewer --lib` 全体が **12,719 件成功・59 件 ignored・失敗 0**
+（1,396.17 秒、exit 0）で完了した。ignored は既存設定のままで、新たな無効化・除外・filter は加えていない。
+一部の snapshot／seek テストに出た 60 秒超表示は、共有 App fixture の `data_dir::test_override_lock()` 待機も含む。
+該当テストと実 decoder の EOF ループテストはいずれも最終的に成功し、runner の打ち切り・再実行は行っていない。
+
+| コマンド | 成功件数 | ログ（`target/h3a-evidence/`） |
+| --- | ---: | --- |
+| `cargo test -p mimageviewer --lib` | 12,719（既存 ignored 59） | `mimageviewer-lib-final.txt` |
+| `cargo test -p music-core` | 69（unit49＋integration20） | `music-core-final.txt` |
+| `cargo test -p musicvideo-core -p musicvideo-ui` | core 116（unit114＋経路2）／UI 122 | `core-ui-final.txt` |
+| `cargo test -p musicvideo_lab --no-fail-fast` | 82 | `lab-full-restored-green.log` |
+
+指定検証の合計は **13,108 件成功・59 件 ignored・失敗 0**。限定テストや変異の復元後再実行は重複加算していない。
+`cargo fmt`／`cargo fmt --check`、glyph check（危険文字 0）、`git diff --check` も成功。
+すべての build／test に `MSBUILDDISABLENODEREUSE=1` を設定した。
+
+独立実装レビューは GPT-6.1 Sol / xhigh が source 11 ファイルの凍結 snapshot を確認し **ACCEPT**、修正必須の指摘なし。
+入力の論理長、既定方式の維持、bitwise key、checkpoint 復帰、並列区間の結合順と単一 step、
+共有 owner／取消／worker 受付／revision の採否、共通入口と回帰テストの意味を確認した。
+レビュー担当は build／test／計測を重複実行せず、この実装記録の検証証跡を使用する。
+証跡は `target/h3a-evidence/independent-review.txt` と同 `review-snapshot/`。
+設計との相違は上記の利用者が承認した A6 の目安改訂のみ。P4b／H3b の実 decoder 統一と製品画素検証は範囲外のまま。
+
+確認用ビルドは `MSBUILDDISABLENODEREUSE=1` を設定し、`scripts/build-dev.ps1 -PreserveRuntime` で成功。
+通常 feature の core と remote／EPUB PDF companion を生成し、VCRT 検査も成功した（ログ `build-dev-final.log`）。
+portable feature は有効にしていない。agent は本体・lab GUI・生成した確認用 core を起動しておらず、コミットも行っていない。
+利用者が後日本体の既定音楽ビュー（スペクトラム／鍵盤）が従来どおり動くことを確認する場合のコマンドは
+`Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。
+この core は既定で実際の `%APPDATA%\mimageviewer` を使用し、設定／データを更新し得る。
+single-instance mutex を共有するため、起動前にインストール版／tray 常駐版 mImageViewer を終了する。
 
 ### D4. ラスタライザは CPU から始める（`comic-core` を土台にする）
 
@@ -1982,7 +2116,7 @@ frame n → t = n/fps → evaluate → rasterize(CPU, rayon) → RGBA→NV12/YUV
 | **L3** 実装済み・追加P3修正の再検収待ち | 状態で動かない上部とステータス（D14 末尾）: ツールバー 1 段・固定 1 行のステータスバー・読込衝突はモーダル・未解決素材と診断は別ウィンドウ・素材パスはプロジェクトタブ | 初版 `e958226a9`（254件）。キャンセル領域/未保存の印/タイトル送信の3件を修正した `a5c05ef65`（258件）は独立再レビューで条件付きACCEPT。**追加P3「詳細メニューのID変化」を修正・自動検証済み**（2026-10-09、未コミット差分）: ステータスの子UI4領域を用途ごとの固定IDにする。新規lab 1件、500/1400pt×書出/画像読込/保存完了の7組合せ、計14ケースでメニュー維持とメニュー内の未解決素材操作を実描画/実クリックで検査。修正前と詳細IDだけを戻す変異で失敗確認。復元後 core 80 / UI 105 / lab 74、計259件成功。禁止依存なし、fmt/glyph成功、releaseラボ再build成功（30.53秒）。L1/L2・H1/H2・非同期採否順序は維持。根拠・ログは下記L3追加P3記録。アプリ起動・停止、コミットなし |
 | **T1** | 文字装飾（D15）: comic-core既存装飾をText / TimeText / Lyricsに共通接続 | 初版fce65bb15、巨大確保・昇格・clip修正f54b6e5b6、準備共有・旧注釈22hash固定338a38899は条件付きACCEPT。保持64MiB = 静的RGBA24 / 補間RGBA8 / 準備32、1焼成RGBA8MiB以下。straight RGBA修正は検収採用済み。今回P3: eviction前後・再準備のglyph RGBA比較、旧非空判定への復帰変異も検出。計測器をscripts/musicvideo/t1-measure.pyへ保存し、前/中のCPU・新規PID・終了後CPU・短命PID通知を監視、取得不可も棄却。16ケース各3回＋5分全補間/混在、3枠保持とOSメモリ時系列・合否目安・所要時間をJSON/表へ。core104 / UI121 / lab75 / Python15、計315件成功、計測feature付きeviction1件も成功。既存4hash・fmt維持、release headless例build成功。**P2正式性能計測は利用者指定で今回は未実施、後日利用者が python scripts/musicvideo/t1-measure.py を実行**。smokeは競合/WMI拒否で不採用。初回4.274ms等を現行の採用値にしない。今回comic-core変更・commit・アプリ起動・build-devなし。手順・旧経路未測定理由はD15参照 |
 | **I1 段 2a / 2b 実装・自動検証済み／実機確認待ち** | IME 補正の共有（D10「設定・入力」）: 本体 `ime_focus` の egui 依存部分（入力補正 plugin・single-line helper）を共有クレートへ挙動不変で切り出し、本体とエディタのホストが policy を登録する | **段 2a（2026-10-09、`367f9c9d3`・独立実装レビュー ACCEPT）**: `egui-ime` と本体 facade、既存呼び出し元を維持。既存 23 件は共有 16 / 本体 7 に配置、raw 禁止・adapter を追加（共有 17 / 本体 12 passed）。full gate 12,681 passed / 58 ignored、fmt / glyph、通常 profile の確認用 build 成功。**段 2b（同日、未コミット）**: 全域 Tab policy を挙動不変で共有化、本体 facade・既存 5 テストを維持。エディタの登録入口・5 欄 helper・Undo gate・raw 禁止を実装、歌詞 buffer / widget ID / native Undo と Hz DragValue を維持。利用者承認でモジュレータ見出しを不変 ID に固定し、同型箇所も調査。追加 13 テスト、UI 117 / ラボ 75 / core 80 / 共有 17 passed、既存 L1〜L3 全件維持、変異 6 件を検出。本体 Tab / IME / 関連・snapshot も通過。full gate **12,694 passed / 58 ignored / 0 failed**、fmt / glyph / 依存検査、ラボ release build 成功。独立実装レビュー **ACCEPT、指摘なし**。build-dev 再実行・コミット・アプリ起動なし。詳細は D10「I1 設計」§7・§8。**実装・自動検証は完了、実機確認・最終受け入れは未完了**。本体の確認用 exe は更新せず、ラボの確認用 exe は `target/release/musicvideo_lab.exe` |
-| **H3a** 設計 ACCEPT・実装中 | 解析契約の確定: 正規の較正区間（出力尺に合わせた PCM か全尺か）と解析の時刻列・seek 復帰の規則を決める | [引き継ぎ監査](music-video-handoff-20260907.md) §3 H3。可変時刻列と較正入力差をテストで固定。無変調ハッシュ維持 |
+| **H3a** 実装・指定自動検証完了（独立実装レビュー ACCEPT） | 共通格子／PCM view／タイムライン所有／較正を接続。A6 は設計担当判断で約 0.7 秒以内（並列）を採用し、生の値のキャッシュは追加しない | D3 の H3a 実装記録を参照。変異 32 ケースの失敗・復元後成功、本体 lib 全体＋関連 4 crate 計 13,108 件成功（既存 ignored 59）、変更後速度／RGBA hash 比較、確認用 core build 完了。P4b／H3b は別段。アプリ／lab GUI 未起動、未コミット |
 | **H3b** | 一致の検証（P4b 接続後） | プレビューで表示したフレームが、同じ時刻の書き出しフレームと一致する: 表示フレームの欠落、前後への seek、直接 seek、音源より短い / 長い出力尺。これが通るまで H3 を完了扱いにしない |
 | **P4a** ✅ | 方式の設計確定: 本書 D10 / D14〜D16 の独立レビュー | GPT-6.1 Sol / xhigh の設計レビューで blocking 指摘なし。**完了**（2026-10-09）: 3 回目で条件付き ACCEPT（残った P3 の文言は反映済み）。runtime 競合の割り切りはユーザー判断で確定 |
 | **P4b** | ホストの製品化（D16）: ラボを `crates/musicvideo-editor` へ移し、FFmpeg デコードへ統一、スナップショット入力の MP4 書き出し（モーダル・進捗・キャンセル）、未保存の編集の確認、音声スレッドが stream を所有する再生と f32 以外の出力形式対応 | 書き出しがファイルを読み直さず、プレビューと同じ PCM・素材を使う（元ファイル変更・Undo 後の書き出しをテスト）。未保存確認の開く / 新規 / 最近 / 閉じる × 保存成功 / 失敗 / キャンセル、**保存は成功したが完了時点で再び未保存**、保存中・書き出し中の終了を handler テストで固定。書き出しの進捗・キャンセル・失敗が UI を止めない（[ui-responsiveness.md](ui-responsiveness.md) §4）。編集済みプロジェクトの 5 分 1080p60 完走と実測 |

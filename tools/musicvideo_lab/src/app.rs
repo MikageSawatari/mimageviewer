@@ -13,10 +13,11 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use music_core::{AnalysisConfig, analyze_stereo_waveform_cancellable};
 use musicvideo_core::{
-    Assets, AudioRef, Frame, ImageAsset, ImageId, ImageRef, LayerId, LayerKind, LrcParseReport,
-    LyricLine, ModulatorCalibration, ModulatorCalibrationRequest, ModulatorValue, Project,
-    RenderReport, Smoothing, SpectrumFrame, SpectrumSource, UnresolvedAsset, calibrate_modulators,
-    evaluate, modulator_calibration_requests, new_image_layer, parse_lrc, render_frame, write_lrc,
+    AnalysisKey, AnalysisTimeline, Assets, AudioRef, Frame, FrameGrid, ImageAsset, ImageId,
+    ImageRef, LayerId, LayerKind, LrcParseReport, LyricLine, ModulatorCalibration,
+    ModulatorCalibrationRequest, ModulatorValue, Project, RenderReport, Smoothing, SpectrumFrame,
+    UnresolvedAsset, calibrate_modulators_view, evaluate, modulator_calibration_requests,
+    new_image_layer, parse_lrc, pcm_view, render_frame, write_lrc,
 };
 use musicvideo_ui::{
     DocumentSession, DocumentSessionId, EditGeneration, EditTargetLifetime, EditorCommand,
@@ -76,7 +77,8 @@ struct PreviewResult {
     image: egui::ColorImage,
     render_ms: f64,
     report: RenderReport,
-    spectrum: Option<SpectrumSource>,
+    analysis_key: Option<AnalysisKey<ResourceRevision>>,
+    frame_index: u64,
     modulator_values: Vec<ModulatorValue>,
     timings: PreviewWorkerTimings,
 }
@@ -437,9 +439,85 @@ struct PreviewPending {
     rx: mpsc::Receiver<Result<PreviewResult, String>>,
 }
 
+/// Calibration depends on the immutable PCM identity and the requested output interval.
+/// Float fields use bits, matching the analysis timeline key contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CalibrationKey {
+    pcm_id: ResourceRevision,
+    duration_bits: u64,
+    requests: Vec<Vec<u64>>,
+}
+
+impl CalibrationKey {
+    fn new(
+        pcm_id: ResourceRevision,
+        duration: f64,
+        requests: &[ModulatorCalibrationRequest],
+    ) -> Self {
+        let requests = requests
+            .iter()
+            .map(|request| {
+                let range = match request.range {
+                    musicvideo_core::BandRange::Hz { low_hz, high_hz } => {
+                        [0, u64::from(low_hz.to_bits()), u64::from(high_hz.to_bits())]
+                    }
+                    musicvideo_core::BandRange::Semitone {
+                        low_midi,
+                        high_midi,
+                    } => [1, u64::from(low_midi), u64::from(high_midi)],
+                };
+                vec![
+                    request.id.0,
+                    request.feature as u64,
+                    range[0],
+                    range[1],
+                    range[2],
+                    request.weighting as u64,
+                    u64::from(request.gain_db.to_bits()),
+                    u64::from(request.low_percentile.to_bits()),
+                    u64::from(request.high_percentile.to_bits()),
+                ]
+            })
+            .collect();
+        Self {
+            pcm_id,
+            duration_bits: duration.to_bits(),
+            requests,
+        }
+    }
+}
+
+/// Only the worker acquires this lock. The session retains ownership through
+/// cancellation, render failures, and discarded UI results.
+fn analyze_preview(
+    timeline: &Mutex<AnalysisTimeline<ResourceRevision>>,
+    key: &AnalysisKey<ResourceRevision>,
+    pcm: music_core::PcmView<'_>,
+    n: u64,
+    cancel: &AtomicBool,
+) -> Result<SpectrumFrame, String> {
+    let mut state = match timeline.lock() {
+        Ok(state) => state,
+        Err(poisoned) => {
+            *poisoned.into_inner() = AnalysisTimeline::default();
+            timeline.clear_poison();
+            eprintln!("musicvideo preview: poisoned analysis timeline was reset");
+            return Err("解析ワーカーの異常により解析状態を作り直しました".to_owned());
+        }
+    };
+    // Check after waiting for the lock and before inspecting or replacing a key.
+    if cancel.load(Ordering::Relaxed) {
+        return Err("プレビューをキャンセルしました".to_owned());
+    }
+    state
+        .frame(key, pcm, n, &|| cancel.load(Ordering::Relaxed))
+        .cloned()
+        .map_err(|error| error.to_string())
+}
+
 struct CalibrationPending {
     cancel: Arc<AtomicBool>,
-    request: Vec<ModulatorCalibrationRequest>,
+    key: CalibrationKey,
     rx: mpsc::Receiver<Result<Vec<ModulatorCalibration>, String>>,
 }
 
@@ -475,9 +553,9 @@ pub struct MusicVideoLabApp {
     displayed_preview: Option<DisplayedPreview>,
     preview_render_ms: f64,
     preview_report: RenderReport,
-    preview_spectrum: Option<SpectrumSource>,
+    preview_timeline: Arc<Mutex<AnalysisTimeline<ResourceRevision>>>,
     modulator_calibrations: Vec<ModulatorCalibration>,
-    calibration_request: Vec<ModulatorCalibrationRequest>,
+    calibration_key: Option<CalibrationKey>,
     calibration_pending: Option<CalibrationPending>,
     preview_perf: PreviewPerfTracker,
     export_pending: Option<ExportPending>,
@@ -536,9 +614,9 @@ impl MusicVideoLabApp {
             displayed_preview: None,
             preview_render_ms: 0.0,
             preview_report: RenderReport::default(),
-            preview_spectrum: None,
+            preview_timeline: Arc::new(Mutex::new(AnalysisTimeline::default())),
             modulator_calibrations: Vec::new(),
-            calibration_request: Vec::new(),
+            calibration_key: None,
             calibration_pending: None,
             preview_perf: PreviewPerfTracker::default(),
             export_pending: None,
@@ -571,6 +649,11 @@ impl MusicVideoLabApp {
         });
         let player = AudioPlayer::new(Arc::clone(&audio))?;
         let _ = player.toggle();
+        let mut manifest = ResourceManifest::default();
+        manifest.set_audio(Some(ResourceLease::new(Arc::clone(&audio))));
+        app.editor_state
+            .reset_for_project_with_resources(&app.project, manifest.clone());
+        app.runtime_resources = RuntimeResourceState::Ready(manifest);
         app.audio = Some(audio);
         app.audio_player = Some(player);
         app.status = "鍵盤入りプレビューを計測しています".to_owned();
@@ -599,28 +682,40 @@ impl MusicVideoLabApp {
         if let Some(pending) = self.calibration_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
-        self.calibration_request.clear();
+        self.calibration_key = None;
         self.modulator_calibrations.clear();
-        self.preview_spectrum = None;
+    }
+
+    fn current_calibration_key(&self) -> Option<CalibrationKey> {
+        self.audio.as_ref()?;
+        let pcm_id = self.editor_state.resource_manifest().audio()?.revision();
+        Some(CalibrationKey::new(
+            pcm_id,
+            self.project.duration_secs,
+            &modulator_calibration_requests(&self.project.modulators),
+        ))
     }
 
     fn start_calibration_if_needed(&mut self, ctx: &egui::Context) {
-        let request = modulator_calibration_requests(&self.project.modulators);
-        if request == self.calibration_request {
+        let key = self.current_calibration_key();
+        if key == self.calibration_key {
             return;
         }
         if let Some(pending) = self.calibration_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
-        self.calibration_request = request.clone();
+        self.calibration_key = key.clone();
         self.modulator_calibrations.clear();
-        self.preview_spectrum = None;
-        if request.is_empty() {
+        let Some(key) = key else {
+            return;
+        };
+        if key.requests.is_empty() {
             return;
         }
         let Some(audio) = self.audio.clone() else {
             return;
         };
+        let duration_secs = self.project.duration_secs;
         let modulators = self.project.modulators.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
@@ -629,13 +724,19 @@ impl MusicVideoLabApp {
         let spawned = std::thread::Builder::new()
             .name("musicvideo-modulator-calibration".to_owned())
             .spawn(move || {
-                let result = calibrate_modulators(
-                    &audio.stereo_pcm,
-                    audio.sample_rate,
-                    &modulators,
-                    &|| worker_cancel.load(Ordering::Relaxed),
-                )
-                .map_err(|error| format!("曲全体の反応範囲を計算できません: {error}"));
+                let result = pcm_view(&audio.stereo_pcm, audio.sample_rate, duration_secs)
+                    .map_err(|error| error.to_string())
+                    .and_then(|view| {
+                        calibrate_modulators_view(
+                            view,
+                            audio.sample_rate,
+                            duration_secs,
+                            audio.stereo_pcm.len() as f64 / 2.0 / audio.sample_rate as f64,
+                            &modulators,
+                            &|| worker_cancel.load(Ordering::Relaxed),
+                        )
+                        .map_err(|error| format!("曲全体の反応範囲を計算できません: {error}"))
+                    });
                 if !worker_cancel.load(Ordering::Relaxed) {
                     let _ = tx.send(result);
                     worker_ctx.request_repaint();
@@ -644,11 +745,7 @@ impl MusicVideoLabApp {
         match spawned {
             Ok(_) => {
                 self.status = "曲全体からモジュレータの反応範囲を計算しています".to_owned();
-                self.calibration_pending = Some(CalibrationPending {
-                    cancel,
-                    request,
-                    rx,
-                });
+                self.calibration_pending = Some(CalibrationPending { cancel, key, rx });
             }
             Err(error) => {
                 self.status = format!("自動調整ワーカーを開始できません: {error}");
@@ -666,9 +763,8 @@ impl MusicVideoLabApp {
                 let Some(pending) = self.calibration_pending.take() else {
                     return;
                 };
-                if pending.request == modulator_calibration_requests(&self.project.modulators) {
+                if Some(pending.key) == self.current_calibration_key() {
                     self.modulator_calibrations = calibrations;
-                    self.preview_spectrum = None;
                     self.status = "曲全体に合わせて反応範囲を自動調整しました".to_owned();
                     self.mark_preview_dirty();
                 }
@@ -686,8 +782,11 @@ impl MusicVideoLabApp {
 
     fn calibration_ready(&self) -> bool {
         self.audio.is_none()
-            || self.calibration_request.is_empty()
-            || self.modulator_calibrations.len() == self.calibration_request.len()
+            || self.current_calibration_key().is_none_or(|key| {
+                key.requests.is_empty()
+                    || (self.calibration_key.as_ref() == Some(&key)
+                        && self.modulator_calibrations.len() == key.requests.len())
+            })
     }
 
     fn schedule_playback_preview(&mut self) {
@@ -706,7 +805,6 @@ impl MusicVideoLabApp {
         } else {
             requested
         };
-        self.preview_spectrum = None;
         self.mark_preview_dirty();
     }
 
@@ -1087,7 +1185,6 @@ impl MusicVideoLabApp {
         {
             store.defer_drop(old_waveform);
         }
-        self.preview_spectrum = None;
         playback_error
     }
 
@@ -1454,7 +1551,12 @@ impl MusicVideoLabApp {
             })
             .collect();
         let audio = self.audio.clone();
-        let previous_spectrum = self.preview_spectrum.take();
+        let timeline = Arc::clone(&self.preview_timeline);
+        let audio_revision = self
+            .editor_state
+            .resource_manifest()
+            .audio()
+            .map(ResourceLease::revision);
         let calibrations = self.modulator_calibrations.clone();
         let assets = Arc::clone(&self.assets);
         let cancel = Arc::new(AtomicBool::new(false));
@@ -1470,77 +1572,83 @@ impl MusicVideoLabApp {
                 let worker_started = Instant::now();
                 let band_count = spectrum_band_count(&project);
                 let analysis_started = Instant::now();
-                let spectrum_frame = match audio {
-                    Some(audio) => (|| {
-                        let mut source = match previous_spectrum
-                            .filter(|source| source.band_count() == band_count)
-                        {
-                            Some(source) => source,
-                            None => SpectrumSource::new(
+                let spectrum_frame = (|| {
+                    let grid = FrameGrid::new(project.output.fps, project.duration_secs)
+                        .map_err(|error| error.to_string())?;
+                    let n = grid.index_at(position_secs);
+                    let time = grid.time(n);
+                    match audio {
+                        Some(audio) => {
+                            let pcm_id = audio_revision
+                                .ok_or_else(|| "音声素材の識別情報がありません".to_owned())?;
+                            let view = pcm_view(
+                                &audio.stereo_pcm,
                                 audio.sample_rate,
+                                project.duration_secs,
+                            )
+                            .map_err(|error| error.to_string())?;
+                            let key = AnalysisKey::new(
+                                pcm_id,
+                                audio.sample_rate,
+                                view.logical_frames,
+                                grid,
                                 band_count,
                                 Smoothing::Average { factor: 0.7 },
-                            )
-                            .map_err(|error| format!("スペクトラム解析に失敗しました: {error}"))?,
-                        };
-                        source
-                            .configure_modulators_with_calibrations(
                                 &project.modulators,
                                 &calibrations,
-                            )
-                            .map_err(|error| format!("モジュレータを初期化できません: {error}"))?;
-                        let frame = source
-                            .full_frame_at(
-                                &audio.stereo_pcm,
-                                position_secs,
                                 project.display_gain_db,
                             )
-                            .clone();
-                        Ok((frame, Some(source)))
-                    })(),
-                    None => Ok((SpectrumFrame::new(vec![0.0; band_count]), None)),
-                };
-                let analysis_ms = analysis_started.elapsed().as_secs_f64() * 1000.0;
-                let result = spectrum_frame.and_then(|(spectrum_frame, spectrum)| {
-                    if worker_cancel.load(Ordering::Relaxed) {
-                        return Err("プレビューをキャンセルしました".to_owned());
+                            .map_err(|error| error.to_string())?;
+                            let frame = analyze_preview(&timeline, &key, view, n, &worker_cancel)?;
+                            Ok((frame, Some(key), n, time))
+                        }
+                        None => Ok((SpectrumFrame::new(vec![0.0; band_count]), None, n, time)),
                     }
-                    let scene_composition_started = Instant::now();
-                    let modulator_values = spectrum_frame.modulators.clone();
-                    let scene = evaluate(&project, position_secs, &spectrum_frame);
-                    let mut frame = Frame::new(project.output.width, project.output.height)
-                        .map_err(|error| format!("プレビューを確保できません: {error}"))?;
-                    let started = Instant::now();
-                    let report = render_frame(&scene, &assets, &mut frame)
-                        .map_err(|error| format!("プレビュー合成に失敗しました: {error}"))?;
-                    let render_ms = started.elapsed().as_secs_f64() * 1000.0;
-                    let scene_composition_ms =
-                        scene_composition_started.elapsed().as_secs_f64() * 1000.0;
-                    let rgba_to_egui_started = Instant::now();
-                    let image = egui::ColorImage::from_rgba_unmultiplied(
-                        [frame.width as usize, frame.height as usize],
-                        &frame.rgba,
-                    );
-                    let rgba_to_egui_ms = rgba_to_egui_started.elapsed().as_secs_f64() * 1000.0;
-                    let total_ms = worker_started.elapsed().as_secs_f64() * 1000.0;
-                    Ok(PreviewResult {
-                        revision,
-                        project,
-                        layer_lifetimes,
-                        time_secs: position_secs,
-                        image,
-                        render_ms,
-                        report,
-                        spectrum,
-                        modulator_values,
-                        timings: PreviewWorkerTimings {
-                            analysis_ms,
-                            scene_composition_ms,
-                            rgba_to_egui_ms,
-                            total_ms,
-                        },
-                    })
-                });
+                })();
+                let analysis_ms = analysis_started.elapsed().as_secs_f64() * 1000.0;
+                let result = spectrum_frame.and_then(
+                    |(spectrum_frame, analysis_key, frame_index, time_secs)| {
+                        if worker_cancel.load(Ordering::Relaxed) {
+                            return Err("プレビューをキャンセルしました".to_owned());
+                        }
+                        let scene_composition_started = Instant::now();
+                        let modulator_values = spectrum_frame.modulators.clone();
+                        let scene = evaluate(&project, time_secs, &spectrum_frame);
+                        let mut frame = Frame::new(project.output.width, project.output.height)
+                            .map_err(|error| format!("プレビューを確保できません: {error}"))?;
+                        let started = Instant::now();
+                        let report = render_frame(&scene, &assets, &mut frame)
+                            .map_err(|error| format!("プレビュー合成に失敗しました: {error}"))?;
+                        let render_ms = started.elapsed().as_secs_f64() * 1000.0;
+                        let scene_composition_ms =
+                            scene_composition_started.elapsed().as_secs_f64() * 1000.0;
+                        let rgba_to_egui_started = Instant::now();
+                        let image = egui::ColorImage::from_rgba_unmultiplied(
+                            [frame.width as usize, frame.height as usize],
+                            &frame.rgba,
+                        );
+                        let rgba_to_egui_ms = rgba_to_egui_started.elapsed().as_secs_f64() * 1000.0;
+                        let total_ms = worker_started.elapsed().as_secs_f64() * 1000.0;
+                        Ok(PreviewResult {
+                            revision,
+                            project,
+                            layer_lifetimes,
+                            time_secs,
+                            image,
+                            render_ms,
+                            report,
+                            analysis_key,
+                            frame_index,
+                            modulator_values,
+                            timings: PreviewWorkerTimings {
+                                analysis_ms,
+                                scene_composition_ms,
+                                rgba_to_egui_ms,
+                                total_ms,
+                            },
+                        })
+                    },
+                );
                 if !worker_cancel.load(Ordering::Relaxed) {
                     let _ = tx.send(result);
                     worker_ctx.request_repaint();
@@ -1565,7 +1673,7 @@ impl MusicVideoLabApp {
             Some(Ok(Ok(result))) => {
                 self.preview_pending = None;
                 if result.revision == self.preview_revision {
-                    self.preview_spectrum = result.spectrum;
+                    let _analysis_identity = (&result.analysis_key, result.frame_index);
                     self.preview_render_ms = result.render_ms;
                     self.preview_report = result.report;
                     let texture_started = Instant::now();
@@ -2469,7 +2577,7 @@ impl Drop for MusicVideoLabApp {
             let empty_assets = Arc::new(self.assets.fork_retain_images(&[]));
             let old_assets = std::mem::replace(&mut self.assets, empty_assets);
             let old_editor = std::mem::take(&mut self.editor_state);
-            let old_spectrum = self.preview_spectrum.take();
+            let old_timeline = Arc::clone(&self.preview_timeline);
             let old_runtime = std::mem::replace(
                 &mut self.runtime_resources,
                 RuntimeResourceState::Ready(ResourceManifest::default()),
@@ -2479,7 +2587,7 @@ impl Drop for MusicVideoLabApp {
                 ProjectLoadState::Ready(loaded) => store.defer_drop(loaded),
                 ProjectLoadState::Idle => {}
             }
-            store.defer_drop((old_assets, old_editor, old_runtime, old_spectrum));
+            store.defer_drop((old_assets, old_editor, old_runtime, old_timeline));
         }
     }
 }
@@ -2487,6 +2595,374 @@ impl Drop for MusicVideoLabApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn h3a_app() -> MusicVideoLabApp {
+        let mut app = MusicVideoLabApp::new(Arc::new(Assets::default()));
+        app.project = default_project(0.5);
+        app.project.output.width = 16;
+        app.project.output.height = 16;
+        app.project.output.fps = 60.0;
+        app.project.layers.clear();
+        app.project.audio = Some(AudioRef {
+            path: PathBuf::from("immutable-test-pcm.wav"),
+        });
+        let audio = Arc::new(AudioData {
+            stereo_pcm: vec![0.1; 8_000],
+            sample_rate: 8_000,
+            duration_secs: 0.5,
+        });
+        let mut manifest = ResourceManifest::default();
+        manifest.set_audio(Some(ResourceLease::new(Arc::clone(&audio))));
+        app.editor_state
+            .reset_for_project_with_resources(&app.project, manifest.clone());
+        app.runtime_resources = RuntimeResourceState::Ready(manifest);
+        app.audio = Some(audio);
+        app
+    }
+
+    fn h3a_request(app: &mut MusicVideoLabApp, ctx: &egui::Context) -> PreviewResult {
+        app.preview_dirty = true;
+        app.start_preview_if_needed(ctx);
+        let result = app
+            .preview_pending
+            .as_ref()
+            .expect("admitted preview")
+            .rx
+            .recv_timeout(Duration::from_secs(20))
+            .unwrap()
+            .unwrap();
+        app.preview_pending = None;
+        result
+    }
+
+    #[test]
+    fn h3a_cancelled_worker_keeps_admission_until_disconnect() {
+        let ctx = egui::Context::default();
+        let mut app = h3a_app();
+        app.position_secs = 0.14;
+        h3a_request(&mut app, &ctx);
+        assert_eq!(
+            app.preview_timeline.lock().unwrap().processed_frame(),
+            Some(8)
+        );
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.preview_pending = Some(PreviewPending {
+            cancel: Arc::clone(&cancel),
+            rx,
+        });
+        app.mark_preview_dirty();
+        app.start_preview_if_needed(&ctx);
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(app.preview_pending.as_ref().unwrap().rx.try_recv().is_err());
+        app.poll_preview(&ctx);
+        assert!(
+            app.preview_pending.is_some(),
+            "cancel notification is not completion"
+        );
+        assert_eq!(
+            app.preview_timeline.lock().unwrap().processed_frame(),
+            Some(8)
+        );
+        app.start_preview_if_needed(&ctx);
+        assert!(app.preview_dirty, "new worker must remain coalesced");
+        drop(tx);
+        app.poll_preview(&ctx);
+        assert!(app.preview_pending.is_none());
+        app.position_secs = 0.0;
+        let result = h3a_request(&mut app, &ctx);
+        assert_eq!(result.frame_index, 0);
+    }
+
+    #[test]
+    fn h3a_cancel_after_lock_wait_does_not_replace_key_or_progress() {
+        let app = h3a_app();
+        let audio = app.audio.as_ref().unwrap();
+        let pcm = pcm_view(
+            &audio.stereo_pcm,
+            audio.sample_rate,
+            app.project.duration_secs,
+        )
+        .unwrap();
+        let id = app
+            .editor_state
+            .resource_manifest()
+            .audio()
+            .unwrap()
+            .revision();
+        let key = AnalysisKey::new(
+            id,
+            audio.sample_rate,
+            pcm.logical_frames,
+            FrameGrid::new(60.0, 0.5).unwrap(),
+            16,
+            Smoothing::None,
+            &[],
+            &[],
+            0.0,
+        )
+        .unwrap();
+        let newer_id = ResourceLease::new(Arc::new(())).revision();
+        let newer_key = AnalysisKey::new(
+            newer_id,
+            audio.sample_rate,
+            pcm.logical_frames,
+            FrameGrid::new(60.0, 0.5).unwrap(),
+            16,
+            Smoothing::None,
+            &[],
+            &[],
+            0.0,
+        )
+        .unwrap();
+        let mut state = app.preview_timeline.lock().unwrap();
+        state.frame(&key, pcm, 8, &|| false).unwrap();
+        let cancel = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+            let timeline = &app.preview_timeline;
+            let worker_cancel = &cancel;
+            let worker = scope.spawn(move || {
+                ready_tx.send(()).unwrap();
+                analyze_preview(timeline, &newer_key, pcm, 1, worker_cancel)
+            });
+            ready_rx.recv().unwrap();
+            cancel.store(true, Ordering::Relaxed);
+            drop(state);
+            assert!(worker.join().unwrap().is_err());
+        });
+        let state = app.preview_timeline.lock().unwrap();
+        assert!(state.key() == Some(&key));
+        assert_eq!(state.processed_frame(), Some(8));
+    }
+
+    #[test]
+    fn h3a_preview_state_survives_error_stale_result_seek_switch_audio_and_undo() {
+        let ctx = egui::Context::default();
+        let mut app = h3a_app();
+        let owner = Arc::clone(&app.preview_timeline);
+        let initial_project = app.project.clone();
+        let initial_audio = app.audio.clone();
+        let initial_manifest = app.editor_state.resource_manifest().clone();
+        app.position_secs = 0.205;
+        let result = h3a_request(&mut app, &ctx);
+        assert_eq!(result.frame_index, 12);
+        assert_eq!(result.time_secs, 0.2);
+        let first_key = result.analysis_key.clone().unwrap();
+        // A completed analysis is retained even if composition fails afterward.
+        app.project.output.width = u32::MAX;
+        app.project.output.height = u32::MAX;
+        app.preview_dirty = true;
+        app.start_preview_if_needed(&ctx);
+        let failed = app
+            .preview_pending
+            .take()
+            .unwrap()
+            .rx
+            .recv_timeout(Duration::from_secs(20))
+            .unwrap();
+        assert!(
+            failed.is_err(),
+            "the real worker must reach its render allocation error"
+        );
+        app.project.output.width = 16;
+        app.project.output.height = 16;
+        let (tx, rx) = mpsc::channel();
+        app.preview_pending = Some(PreviewPending {
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx,
+        });
+        tx.send(failed).unwrap();
+        app.poll_preview(&ctx);
+        assert!(Arc::ptr_eq(&owner, &app.preview_timeline));
+        assert_eq!(owner.lock().unwrap().processed_frame(), Some(12));
+        app.mark_preview_dirty();
+        selection_deliver(&mut app, &ctx, result);
+        assert!(
+            app.displayed_preview.is_none(),
+            "revision mismatch discards only display adoption"
+        );
+        assert!(owner.lock().unwrap().key() == Some(&first_key));
+        app.seek_to(0.05);
+        assert_eq!(owner.lock().unwrap().processed_frame(), Some(12));
+        assert_eq!(h3a_request(&mut app, &ctx).frame_index, 3);
+        // A project replacement does not replace the session timeline owner.
+        app.apply_loaded_project(LoadedProject {
+            path: PathBuf::from("switch.mivmv.json"),
+            project: default_project(0.5),
+            audio: None,
+            waveform: None,
+            audio_error: None,
+            images: vec![],
+            image_errors: HashMap::new(),
+            resources: ResourceManifest::default(),
+        });
+        assert!(Arc::ptr_eq(&owner, &app.preview_timeline));
+        assert!(owner.lock().unwrap().key() == Some(&first_key));
+        // Record an audio replacement in real editor history without starting an audio device.
+        app.project = initial_project;
+        app.editor_state
+            .reset_for_project_with_resources(&app.project, initial_manifest.clone());
+        app.audio = initial_audio.clone();
+        let checkpoint = app.editor_state.begin_external_edit(&app.project);
+        let fixture = h3a_app();
+        let replacement = fixture.editor_state.resource_manifest().clone();
+        app.project.audio.as_mut().unwrap().path = PathBuf::from("replacement.wav");
+        app.editor_state.finish_external_edit_with_resources(
+            &app.project,
+            checkpoint,
+            replacement.clone(),
+        );
+        app.runtime_resources = RuntimeResourceState::Ready(replacement);
+        app.audio = fixture.audio.clone();
+        let new_result = h3a_request(&mut app, &ctx);
+        assert!(new_result.analysis_key.as_ref() != Some(&first_key));
+        assert_eq!(owner.lock().unwrap().processed_frame(), Some(0));
+        let new_key = new_result.analysis_key.clone().unwrap();
+        let checkpoint = app.editor_state.begin_external_edit(&app.project);
+        app.project.display_gain_db = 6.0;
+        app.editor_state
+            .finish_external_edit(&app.project, checkpoint);
+        assert!(h3a_request(&mut app, &ctx).analysis_key.as_ref() != Some(&new_key));
+        assert!(app.editor_state.undo(&mut app.project));
+        assert!(h3a_request(&mut app, &ctx).analysis_key.as_ref() == Some(&new_key));
+        assert!(
+            app.editor_state.undo(&mut app.project),
+            "undo audio replacement"
+        );
+        assert_eq!(app.editor_state.resource_manifest(), &initial_manifest);
+        app.audio = initial_audio;
+        app.runtime_resources = RuntimeResourceState::Ready(initial_manifest);
+        assert!(h3a_request(&mut app, &ctx).analysis_key.as_ref() == Some(&first_key));
+        assert!(Arc::ptr_eq(&owner, &app.preview_timeline));
+    }
+
+    #[test]
+    fn h3a_preview_pixels_match_png_at_containing_frame_time() {
+        use musicvideo_core::{Animatable, Interp, Keyframe, NormRect, Track};
+
+        let ctx = egui::Context::default();
+        let mut app = h3a_app();
+        let mut layer = musicvideo_core::new_solid_layer(&app.project);
+        layer.rect = Animatable::Const(NormRect::new(0.0, 0.0, 1.0, 1.0));
+        // The transition lies inside frame 12. Evaluating the raw playback
+        // position would show frame 13's appearance instead of frame 12's.
+        layer.opacity = Animatable::Track(
+            Track::new(vec![
+                Keyframe {
+                    t: 0.0,
+                    value: 0.0,
+                    interp: Interp::Step,
+                },
+                Keyframe {
+                    t: 0.205,
+                    value: 1.0,
+                    interp: Interp::Step,
+                },
+            ])
+            .unwrap(),
+        );
+        app.project.layers.push(layer);
+        app.position_secs = 0.205;
+        let preview = h3a_request(&mut app, &ctx);
+        let output = tempfile::tempdir().unwrap();
+        let outcome = export_png_sequence(
+            app.project.clone(),
+            Arc::clone(&app.assets),
+            app.audio.clone().unwrap(),
+            output.path(),
+            &AtomicBool::new(false),
+            &AtomicUsize::new(0),
+            || {},
+        )
+        .unwrap();
+        let ExportOutcome::Completed { output_dir, stats } = outcome else {
+            panic!("PNG sequence unexpectedly canceled");
+        };
+        assert_eq!(stats.frames, 30);
+        let same_frame = image::open(output_dir.join("frame_000012.png"))
+            .unwrap()
+            .to_rgba8();
+        let next_frame = image::open(output_dir.join("frame_000013.png"))
+            .unwrap()
+            .to_rgba8();
+        assert_ne!(
+            same_frame, next_frame,
+            "animated opacity must distinguish the two times"
+        );
+        assert_eq!(preview.frame_index, 12);
+        assert_eq!(
+            preview.image.pixels,
+            egui::ColorImage::from_rgba_unmultiplied([16, 16], same_frame.as_raw()).pixels
+        );
+    }
+
+    #[test]
+    fn h3a_calibration_key_tracks_duration_identity_and_request_bits() {
+        let mut app = h3a_app();
+        app.project
+            .modulators
+            .push(musicvideo_core::new_band_energy_modulator(&app.project));
+        let first = app.current_calibration_key().unwrap();
+        app.project.duration_secs = 0.25;
+        assert_ne!(app.current_calibration_key().unwrap(), first);
+        app.project.duration_secs = 0.5;
+        let mut manifest = app.editor_state.resource_manifest().clone();
+        manifest.set_audio(Some(ResourceLease::new(Arc::clone(
+            app.audio.as_ref().unwrap(),
+        ))));
+        app.editor_state
+            .reset_for_project_with_resources(&app.project, manifest);
+        assert_ne!(app.current_calibration_key().unwrap(), first);
+        let id = first.pcm_id;
+        let mut requests = modulator_calibration_requests(&app.project.modulators);
+        requests[0].gain_db = 0.0;
+        let positive = CalibrationKey::new(id, 0.5, &requests);
+        requests[0].gain_db = -0.0;
+        assert_ne!(positive, CalibrationKey::new(id, 0.5, &requests));
+    }
+
+    #[test]
+    fn h3a_calibration_discards_completed_old_duration() {
+        let ctx = egui::Context::default();
+        let mut app = h3a_app();
+        app.project
+            .modulators
+            .push(musicvideo_core::new_band_energy_modulator(&app.project));
+        let key = app.current_calibration_key().unwrap();
+        let audio = app.audio.as_ref().unwrap();
+        let view = pcm_view(&audio.stereo_pcm, audio.sample_rate, 0.5).unwrap();
+        let calibrations = calibrate_modulators_view(
+            view,
+            audio.sample_rate,
+            0.5,
+            0.5,
+            &app.project.modulators,
+            &|| false,
+        )
+        .unwrap();
+        let (tx, rx) = mpsc::channel();
+        app.calibration_pending = Some(CalibrationPending {
+            key: key.clone(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx,
+        });
+        app.calibration_key = Some(key);
+        app.project.duration_secs = 0.25;
+        tx.send(Ok(calibrations)).unwrap();
+        app.poll_calibration();
+        assert!(app.modulator_calibrations.is_empty());
+        assert!(!app.calibration_ready());
+        app.start_calibration_if_needed(&ctx);
+        let pending = app.calibration_pending.take().unwrap();
+        let result = pending.rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        let (tx, rx) = mpsc::channel();
+        tx.send(result).unwrap();
+        app.calibration_pending = Some(CalibrationPending { rx, ..pending });
+        app.poll_calibration();
+        assert!(app.calibration_ready());
+        assert_eq!(app.modulator_calibrations[0].sample_count, 15);
+    }
 
     fn selection_result(
         app: &MusicVideoLabApp,
@@ -2512,7 +2988,8 @@ mod tests {
             image: egui::ColorImage::filled([160, 90], color),
             render_ms: 0.0,
             report: RenderReport::default(),
-            spectrum: None,
+            analysis_key: None,
+            frame_index: 0,
             modulator_values: vec![ModulatorValue {
                 id: musicvideo_core::ModulatorId(1),
                 value: 0.5,
