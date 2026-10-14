@@ -1,8 +1,8 @@
 //! ランチャークレートのビルドスクリプト。
 //!
-//! - 内包する `mimageviewer-core.exe`、`mimageviewer-remote.exe`、`mimageviewer-epub-pdf.exe` と FFmpeg DLL のパスを `MIMV_*` 環境変数
+//! - 内包する core、remote、EPUB worker、music-video editor と FFmpeg DLL のパスを `MIMV_*` 環境変数
 //!   経由でソースに渡す (`include_bytes!(env!("..."))` で参照)。
-//! - core、remote、EPUB worker が先にビルドされていることを確認し、未ビルドなら明確なエラーで止める。
+//! - core、remote、EPUB worker、editor が先にビルドされていることを確認し、未ビルドなら明確なエラーで止める。
 //! - exe アイコンを埋め込む (本体と同じアイコン)。
 
 use std::path::PathBuf;
@@ -35,6 +35,9 @@ fn main() {
     let core_exe = target_dir.join("release").join("mimageviewer-core.exe");
     let remote_exe = target_dir.join("release").join("mimageviewer-remote.exe");
     let epub_worker_exe = target_dir.join("release").join("mimageviewer-epub-pdf.exe");
+    let musicvideo_exe = target_dir
+        .join("release")
+        .join("mimageviewer-musicvideo.exe");
 
     let missing = [
         (
@@ -52,6 +55,11 @@ fn main() {
             "mimageviewer-epub-pdf.exe",
             "cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf",
         ),
+        (
+            &musicvideo_exe,
+            "mimageviewer-musicvideo.exe",
+            "cargo build --release -p musicvideo-editor --bin mimageviewer-musicvideo",
+        ),
     ]
     .into_iter()
     .filter(|(path, _, _)| !path.exists())
@@ -65,7 +73,9 @@ fn main() {
             eprintln!("     build with: {command}");
         }
         eprintln!();
-        eprintln!(" Build core, remote, and EPUB worker before the launcher, or use the wrapper:");
+        eprintln!(
+            " Build core, remote, EPUB worker, and music-video editor before the launcher, or use the wrapper:"
+        );
         eprintln!("   bash scripts/build-release.sh        (Git Bash)");
         eprintln!("   .\\scripts\\build-release.ps1         (PowerShell)");
         eprintln!("================================================================");
@@ -134,6 +144,15 @@ fn main() {
         sha256_file_hex(&epub_worker_exe)
     );
     println!("cargo:rerun-if-changed={}", epub_worker_exe.display());
+    println!(
+        "cargo:rustc-env=MIMV_MUSICVIDEO_EXE={}",
+        musicvideo_exe.display()
+    );
+    println!(
+        "cargo:rustc-env=MIMV_MUSICVIDEO_EXE_SHA256={}",
+        sha256_file_hex(&musicvideo_exe)
+    );
+    println!("cargo:rerun-if-changed={}", musicvideo_exe.display());
 
     // Single-instance 用の Mutex / Event 名を core 側のソースから取り出して
     // 環境変数経由で渡す。core 側を変えると次のビルドで自動反映される。

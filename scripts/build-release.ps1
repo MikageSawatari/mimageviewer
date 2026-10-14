@@ -6,7 +6,7 @@
 #   1. Stops mimageviewer-* processes started from this repo or extracted to APPDATA
 #   2. Polls for file-handle release (up to 10 seconds)
 #   3. Rebuilds the VST3 C++ bridge before core embeds it
-#   4. Builds release core + remote + EPUB worker + launcher with CARGO_INCREMENTAL=0 (extra cargo args are passed through)
+#   4. Builds release core + remote + EPUB worker + editor + launcher with CARGO_INCREMENTAL=0 (extra cargo args are passed through)
 #   5. Clears the extracted VST3 bridge cache so next launch re-extracts it
 #
 # Usage:
@@ -137,6 +137,9 @@ $repoRootPrefixLower = $repoRootPrefix.ToLower()
 $releaseExe = Join-Path -Path $repoRoot -ChildPath 'target\release\mimageviewer.exe'
 $releaseRemoteExe = Join-Path -Path $repoRoot -ChildPath 'target\release\mimageviewer-remote.exe'
 $releaseEpubWorkerExe = Join-Path -Path $repoRoot -ChildPath 'target\release\mimageviewer-epub-pdf.exe'
+$releaseMusicvideoExe = Join-Path -Path $repoRoot -ChildPath 'target\release\mimageviewer-musicvideo.exe'
+. (Join-Path $PSScriptRoot 'musicvideo-build-safety.ps1')
+Assert-MivMusicvideoBuildOutputsIdle -OutputPaths @($releaseMusicvideoExe)
 $appDataRoot = Join-Path -Path $env:APPDATA -ChildPath 'mimageviewer'
 $appDataRootPrefix = $appDataRoot.TrimEnd('\') + '\'
 $appDataRootPrefixLower = $appDataRootPrefix.ToLower()
@@ -260,16 +263,17 @@ if (Test-Path $releaseExe) {
     }
 }
 
-# Four-stage Rust build (launcher scheme):
+# Five-stage Rust build (launcher scheme):
 #   1. core (the app, statically depends on FFmpeg DLLs) -> mimageviewer-core.exe
 #   2. remote service (protocol-coupled to core) -> mimageviewer-remote.exe
 #   3. EPUB PDF worker -> mimageviewer-epub-pdf.exe
-#   4. launcher (FFmpeg-independent, embeds core + remote + EPUB worker + FFmpeg DLLs via include_bytes!)
+#   4. music-video editor -> mimageviewer-musicvideo.exe
+#   5. launcher (FFmpeg-independent, embeds core + remote + EPUB worker + editor + FFmpeg DLLs via include_bytes!)
 #      -> mimageviewer.exe. This is the distributed single exe.
 #
 # VST3 bridge is built first because mimageviewer-core embeds it with
 # include_bytes!. Cargo also cannot express the inner executables -> launcher
-# ordering, so the three Rust binaries are built explicitly after the bridge.
+# ordering, so the four Rust binaries are built explicitly after the bridge.
 
 if (-not $SkipVst3Bridge) {
     $cmakeExe = Get-Command cmake -ErrorAction SilentlyContinue
@@ -293,7 +297,7 @@ if (-not $SkipVst3Bridge) {
     }
 
     if (-not $SkipVst3Bridge) {
-        Write-Host "[build-release] (1/5) cmake --build crates/vst3-host/build --config Release"
+        Write-Host "[build-release] (1/6) cmake --build crates/vst3-host/build --config Release"
         & cmake --build $vst3BuildDir --config Release
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         if (-not (Test-Path $vst3VendorExe)) {
@@ -351,7 +355,7 @@ Ensure-LibclangPath
 
 $coreCmd = @('build', '--release', '--bin', 'mimageviewer-core')
 if ($CargoArgs) { $coreCmd += $CargoArgs }
-Write-Host ("[build-release] (2/5) CARGO_INCREMENTAL=0 cargo {0}" -f ($coreCmd -join ' '))
+Write-Host ("[build-release] (2/6) CARGO_INCREMENTAL=0 cargo {0}" -f ($coreCmd -join ' '))
 Assert-MivVst3HostIdentity -RepoRoot $repoRoot
 $coreExit = Invoke-ReleaseCargo -Args $coreCmd
 if ($coreExit -ne 0) { exit $coreExit }
@@ -363,7 +367,7 @@ $remoteCmd = @(
     '--features', 'embedded-web-assets'
 )
 if ($CargoArgs) { $remoteCmd += $CargoArgs }
-Write-Host ("[build-release] (3/5) CARGO_INCREMENTAL=0 cargo {0}" -f ($remoteCmd -join ' '))
+Write-Host ("[build-release] (3/6) CARGO_INCREMENTAL=0 cargo {0}" -f ($remoteCmd -join ' '))
 $remoteExit = Invoke-ReleaseCargo -Args $remoteCmd
 if ($remoteExit -ne 0) { exit $remoteExit }
 if (-not (Test-Path $releaseRemoteExe -PathType Leaf)) {
@@ -372,11 +376,20 @@ if (-not (Test-Path $releaseRemoteExe -PathType Leaf)) {
 
 $epubWorkerCmd = @('build', '--release', '-p', 'epub-pdf-worker', '--bin', 'mimageviewer-epub-pdf')
 if ($CargoArgs) { $epubWorkerCmd += $CargoArgs }
-Write-Host ("[build-release] (4/5) CARGO_INCREMENTAL=0 cargo {0}" -f ($epubWorkerCmd -join ' '))
+Write-Host ("[build-release] (4/6) CARGO_INCREMENTAL=0 cargo {0}" -f ($epubWorkerCmd -join ' '))
 $epubWorkerExit = Invoke-ReleaseCargo -Args $epubWorkerCmd
 if ($epubWorkerExit -ne 0) { exit $epubWorkerExit }
 if (-not (Test-Path $releaseEpubWorkerExe -PathType Leaf)) {
     throw "[build-release] EPUB worker executable was not produced: $releaseEpubWorkerExe"
+}
+
+$musicvideoCmd = @('build', '--release', '-p', 'musicvideo-editor', '--bin', 'mimageviewer-musicvideo')
+if ($CargoArgs) { $musicvideoCmd += $CargoArgs }
+Write-Host ("[build-release] (5/6) CARGO_INCREMENTAL=0 cargo {0}" -f ($musicvideoCmd -join ' '))
+$musicvideoExit = Invoke-ReleaseCargo -Args $musicvideoCmd
+if ($musicvideoExit -ne 0) { exit $musicvideoExit }
+if (-not (Test-Path $releaseMusicvideoExe -PathType Leaf)) {
+    throw "[build-release] music-video editor executable was not produced: $releaseMusicvideoExe"
 }
 
 foreach ($name in @('msvcp140.dll', 'msvcp140_1.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')) {
@@ -390,15 +403,16 @@ if ($Sign) {
     $launcherEmbedExecutables = @(
         (Join-Path $repoRoot 'target\release\mimageviewer-core.exe'),
         $releaseRemoteExe,
-        $releaseEpubWorkerExe
+        $releaseEpubWorkerExe,
+        $releaseMusicvideoExe
     )
-    Write-Host "[build-release] signing core + remote + EPUB worker (pre-launcher)"
+    Write-Host "[build-release] signing core + remote + EPUB worker + music-video editor (pre-launcher)"
     Invoke-MivSign -Files $launcherEmbedExecutables
 }
 
 $launcherCmd = @('build', '--release', '-p', 'mimageviewer-launcher', '--bin', 'mimageviewer')
 if ($CargoArgs) { $launcherCmd += $CargoArgs }
-Write-Host ("[build-release] (5/5) CARGO_INCREMENTAL=0 cargo {0}" -f ($launcherCmd -join ' '))
+Write-Host ("[build-release] (6/6) CARGO_INCREMENTAL=0 cargo {0}" -f ($launcherCmd -join ' '))
 $oldEffetuneDir = $env:MIMV_EFFETUNE_DIR
 $hadEffetuneDir = Test-Path Env:MIMV_EFFETUNE_DIR
 $env:MIMV_EFFETUNE_DIR = $effetuneStage
@@ -421,7 +435,8 @@ $releasePe = @(
     (Join-Path $repoRoot 'target\release\mimageviewer.exe'),
     (Join-Path $repoRoot 'target\release\mimageviewer-core.exe'),
     (Join-Path $repoRoot 'target\release\mimageviewer-remote.exe'),
-    $releaseEpubWorkerExe
+    $releaseEpubWorkerExe,
+    $releaseMusicvideoExe
 )
 & (Join-Path $repoRoot 'scripts\check-vcrt-pe-dependencies.ps1') `
     -InputPaths $releasePe -RequireCompanionRuntime `

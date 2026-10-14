@@ -36,12 +36,15 @@
 
 ## 2. 現状アーキテクチャの整理
 
-### launcher + core + remote service + EPUB converter
+### launcher + core + remote service + EPUB converter + music-video editor
 
 配布 `mimageviewer.exe` は **ランチャー** ([crates/launcher/src/main.rs](../crates/launcher/src/main.rs))。
-起動時に `mimageviewer-core.exe` + `mimageviewer-remote.exe` + `mimageviewer-epub-pdf.exe` + FFmpeg 6 DLL を
+起動時に `mimageviewer-core.exe` + `mimageviewer-remote.exe` + `mimageviewer-epub-pdf.exe` + `mimageviewer-musicvideo.exe` + FFmpeg 6 DLL を
 `%APPDATA%\mimageviewer\runtime\<version>\` へ展開して core を spawn する。core は
 remote service と EPUB converter を自分の隣から起動する。core と remote service は同じ remote-ipc protocol source からビルドされる。
+音楽ビデオエディタも同じディレクトリから起動し、data-dir は本体から引数で受け取る。
+portable は `musicvideo-editor` の製品 bin を `target-portable` でビルドし、core の隣へ loose 同梱する。
+build は出力先や配布フォルダのエディタを停止せず、保存・終了を求めて中止する。
 ランチャーが存在する主な理由は **FFmpeg がロード時リンク**で、
 Rust コードが走る前に Windows ローダが DLL を解決する必要があるため
 ([build.rs:9-26](../build.rs)、[src/video/ffmpeg_loader.rs](../src/video/ffmpeg_loader.rs))。
@@ -319,6 +322,8 @@ portable は launcher を使わないので影響しないが、抽出ロジッ�
    `cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets`
    で同じ source tree の Web UI 資産内包 remote service を生成し、
    `cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf` で EPUB converter を生成。
+   続けて `cargo build --release -p musicvideo-editor --bin mimageviewer-musicvideo` で editor を生成する。
+   4 本とも `--target-dir target-portable` を付け、通常版の成果物を上書きしない。
    - launcher (`-p mimageviewer-launcher`) は**ビルドしない**。
    - VST3 bridge (`mimageviewer-vst3-host.exe`) は **同梱しない** (下記の注を参照)。
 2. 配布フォルダ `dist/portable/` を組み立て:
@@ -328,6 +333,7 @@ mImageViewer_portable/
 ├─ mimageviewer.exe                  (= mimageviewer-core.exe をリネーム)
 ├─ mimageviewer-remote.exe           (= core が同じディレクトリから起動)
 ├─ mimageviewer-epub-pdf.exe         (= core が同じディレクトリから起動)
+├─ mimageviewer-musicvideo.exe       (= core が同じディレクトリから起動)
 ├─ avcodec-61.dll  avformat-61.dll  avutil-59.dll
 ├─ avfilter-10.dll  swscale-8.dll  swresample-5.dll
 ├─ pdfium.dll

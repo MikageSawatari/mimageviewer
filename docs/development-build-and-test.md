@@ -10,7 +10,7 @@
 | 型・借用・依存関係だけ早く確認 | `cargo check -p mimageviewer --bin mimageviewer-core` | 本体 core |
 | 変更したモジュールのテスト | `cargo test -p mimageviewer --lib <filter>` | 本体の指定テストだけ実行 |
 | 診断用の窓固定・入力観測のテスト | `cargo test -p mimageviewer --lib <filter> --features test-script` | `test_script` / `native_ui_smoke`等の対象。通常core checkも別に行う |
-| 実アプリ用の軽量ビルド | `.\scripts\build-dev.ps1` | core と remote service を `dev-runtime` でビルド |
+| 実アプリ用の軽量ビルド | `.\scripts\build-dev.ps1` | core、remote、EPUB worker、music-video editor を `dev-runtime` でビルド |
 | 自動操作用の使い捨て環境を準備 | `.\scripts\prepare-portable-smoke.ps1 -TestScript` | 診断portableを別出力先でbuildし、固定sandboxへ配置。起動はしない |
 | 了承済みのリリース前実アプリ検証 | `.\scripts\ui-smoke.ps1 -Scenario <対象> -InteractiveApproved` | [実行確認](interactive-release-verification.md)後だけ。通常の開発反復・test-fullへ自動連結しない |
 | 毎リリースのidle／perf正規確認 | `.\scripts\ui-smoke.ps1 -Scenario ReleaseChecks -InteractiveApproved` | 2026-10-11採用。利用者がPowerShellで実行。隔離seed＋5 idle＋cached／uncached perf、全結果は `target/ui-smoke/runs/<run-id>/` |
@@ -203,6 +203,22 @@ cargo run --release --features dev-tools --bin bench_search -- --docs 50000
 これにより本体unit testはlib test executableに一本化され、lib用の互換`app` stubも不要になった。
 
 ## リリースゲート
+
+`test-full.ps1` の前提: launcher の build.rs は `target/release/` に core、remote、
+EPUB worker、音楽ビデオエディタの release exe が揃っていることを要求する。
+新しい clone や clean 後は `.\scripts\build-release.ps1 -PreserveRuntime`、または次の順で準備する。
+
+```powershell
+cargo build --release --bin mimageviewer-core
+cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets
+cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf
+cargo build --release -p musicvideo-editor --bin mimageviewer-musicvideo
+```
+
+launcher はこの 4 本の後にビルドする。`musicvideo-editor` は workspace 全体テストに含まれる。
+配布は test-full → clean → core → remote → EPUB worker → editor → launcher → installer → portable。
+エディタは全 build スクリプトで自動終了しない。出力先が使用中なら、保存・終了後に再実行する。
+portable の配布フォルダ置換は `-SkipBuild` / `-KeepRunning` でも同じ保護対象となる。
 
 `test-full.ps1` は次のコマンドを実行し、失敗すれば非ゼロで終了する。
 

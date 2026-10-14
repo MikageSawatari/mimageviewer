@@ -137,6 +137,7 @@ Assert-OrderedText $buildRelease @(
     '$coreExit = Invoke-ReleaseCargo -Args $coreCmd',
     '$remoteExit = Invoke-ReleaseCargo -Args $remoteCmd',
     '$epubWorkerExit = Invoke-ReleaseCargo -Args $epubWorkerCmd',
+    '$musicvideoExit = Invoke-ReleaseCargo -Args $musicvideoCmd',
     'Invoke-MivSign -Files $launcherEmbedExecutables',
     '$launcherExit = Invoke-ReleaseCargo -Args $launcherCmd',
     'Invoke-MivSign -Files @($releaseExe) -Verify',
@@ -151,6 +152,7 @@ Assert-OrderedText $buildPortable @(
     '& cargo build --release --bin mimageviewer-core',
     '& cargo build --release -p mimageviewer-remote --bin mimageviewer-remote',
     '& cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf',
+    '& cargo build --release -p musicvideo-editor --bin mimageviewer-musicvideo',
     'Remove-Item -LiteralPath $pkgDir -Recurse -Force',
     'Invoke-MivSign -Files $portablePe -Verify',
     "Compress-Archive -Path (Join-Path `$pkgDir '*')"
@@ -159,13 +161,74 @@ Assert-OrderedText $buildPortable @(
 foreach ($script in @($buildDist, $buildRelease, $buildPortable)) {
     Assert-True ($script.Contains("'mimageviewer-epub-pdf'")) 'EPUB worker is absent from a process-stop list'
 }
-Assert-True ($buildDist.Contains('-p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-launcher')) 'workspace clean omits EPUB worker'
+Assert-True ($buildDist.Contains('-p mimageviewer-remote -p epub-pdf-worker -p musicvideo-editor -p mimageviewer-launcher')) 'workspace clean omits EPUB worker or editor'
 Assert-True ($buildDist.Contains('-p mimageviewer-remote -p epub-pdf-worker')) 'portable clean omits EPUB worker'
 Assert-True ($buildDist.Contains("'target\release\mimageviewer-epub-pdf.exe'")) 'final PE list omits EPUB worker'
 Assert-True ($buildRelease.Contains('$releaseEpubWorkerExe') -and
     $buildRelease.Contains('Invoke-MivSign -Files $launcherEmbedExecutables')) 'EPUB worker is not signed before embedding'
 Assert-True ($buildPortable.Contains("@{ src = `$epubWorkerExe; dst = 'mimageviewer-epub-pdf.exe' }")) 'portable copy omits EPUB worker'
 Assert-True ($buildPortable.Contains("'mimageviewer-epub-pdf.exe'")) 'portable signing list omits EPUB worker'
+
+Assert-True ($buildDist.Contains('& cargo clean --release --target-dir $portableTargetDir -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p musicvideo-editor')) 'portable clean omits editor'
+$cleanCalls = @($buildDistAst.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.CommandAst] -and
+        $node.GetCommandName() -eq 'cargo' -and $node.Extent.Text.StartsWith('& cargo clean ')
+}, $true))
+Assert-True ($cleanCalls.Count -eq 2) 'distribution must clean both output trees'
+foreach ($clean in $cleanCalls) {
+    Assert-True ($clean.Extent.Text.Contains('-p musicvideo-editor')) 'actual cargo clean omits editor'
+}
+Assert-True ($buildDist.Contains("'target\release\mimageviewer-musicvideo.exe'")) 'final PE list omits editor'
+Assert-True ($buildRelease.Contains('$releaseMusicvideoExe')) 'release editor path is absent'
+Assert-True ($buildPortable.Contains("@{ src = `$musicvideoExe; dst = 'mimageviewer-musicvideo.exe' }")) 'portable copy omits editor'
+
+foreach ($case in @(
+    @{ Ast = $buildReleaseAst; Text = $buildRelease; Output = '$releaseMusicvideoExe' },
+    @{ Ast = $buildDistAst; Text = $buildDist; Output = 'release\mimageviewer-musicvideo.exe' },
+    @{ Ast = $buildPortableAst; Text = $buildPortable; Output = '$musicvideoExe' }
+)) {
+    $guards = @($case.Ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.CommandAst] -and
+            $node.GetCommandName() -eq 'Assert-MivMusicvideoBuildOutputsIdle'
+    }, $true))
+    Assert-True ($guards.Count -eq 1 -and $guards[0].Extent.Text.Contains($case.Output)) 'editor output guard is missing'
+    $stopLists = @($case.Ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+            $node.Left.Extent.Text -in @('$stoppableProcessNames', '$runningNames', '$appDataProcessNames')
+    }, $true))
+    foreach ($list in $stopLists) {
+        Assert-True (-not $list.Extent.Text.Contains('mimageviewer-musicvideo')) 'editor must not enter viewer process handling'
+    }
+    foreach ($action in @($case.Ast.FindAll({
+        param($node)
+        $parent = $node.Parent
+        while ($parent) {
+            if ($parent -is [System.Management.Automation.Language.FunctionDefinitionAst]) { return $false }
+            $parent = $parent.Parent
+        }
+        $node -is [System.Management.Automation.Language.CommandAst] -and
+            $node.GetCommandName() -in @('Stop-Process', 'cargo', 'powershell', 'Remove-Item') -and
+            $node.Extent.Text -match 'Stop-Process|cargo clean|cargo build|test-full.ps1|Remove-Item -LiteralPath \$pkgDir'
+    }, $true))) {
+        Assert-True ($guards[0].Extent.StartOffset -lt $action.Extent.StartOffset) 'editor guard runs after a destructive or expensive step'
+    }
+}
+
+foreach ($case in @(
+    @{ Ast = $buildReleaseAst; Variable = '$launcherEmbedExecutables'; Path = '$releaseMusicvideoExe' },
+    @{ Ast = $buildReleaseAst; Variable = '$releasePe'; Path = '$releaseMusicvideoExe' },
+    @{ Ast = $buildPortableAst; Variable = '$portablePe'; Path = 'mimageviewer-musicvideo.exe' }
+)) {
+    $lists = @($case.Ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+            $node.Left.Extent.Text -eq $case.Variable
+    }, $true))
+    Assert-True ($lists.Count -eq 1 -and $lists[0].Extent.Text.Contains($case.Path)) 'editor is missing from signing or PE inputs'
+}
 
 Assert-OrderedText $testFull @(
     'public static extern uint SetErrorMode(uint mode);',

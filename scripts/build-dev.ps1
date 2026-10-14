@@ -47,6 +47,7 @@ $coreExe = Join-Path $outputDir 'mimageviewer-core.exe'
 $remoteExe = Join-Path $outputDir 'mimageviewer-remote.exe'
 $epubWorkerExe = Join-Path $outputDir 'mimageviewer-epub-pdf.exe'
 $musicvideoExe = Join-Path $outputDir 'mimageviewer-musicvideo.exe'
+. (Join-Path $PSScriptRoot 'musicvideo-build-safety.ps1')
 $normalDataDir = if ($env:APPDATA) {
     Join-Path $env:APPDATA 'mimageviewer'
 } else {
@@ -222,14 +223,14 @@ try {
         Wait-ForOtherNativeBuilds
     }
 
-    # Stop only the development-profile executables when they lock the output.
+    Assert-MivMusicvideoBuildOutputsIdle -OutputPaths @($musicvideoExe)
+
+    # Stop only the development-profile viewer companions when they lock the output.
     Stop-StagedProcess -ExeName 'mimageviewer-core' -ExePath $coreExe -Label 'core' `
         -PreserveRuntime:$PreserveRuntime
     Stop-StagedProcess -ExeName 'mimageviewer-remote' -ExePath $remoteExe -Label 'remote service' `
         -PreserveRuntime:$PreserveRuntime
     Stop-StagedProcess -ExeName 'mimageviewer-epub-pdf' -ExePath $epubWorkerExe -Label 'EPUB converter' `
-        -PreserveRuntime:$PreserveRuntime
-    Stop-StagedProcess -ExeName 'mimageviewer-musicvideo' -ExePath $musicvideoExe -Label 'music-video editor' `
         -PreserveRuntime:$PreserveRuntime
 
     Ensure-LibclangPath

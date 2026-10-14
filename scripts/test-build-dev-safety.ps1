@@ -61,7 +61,7 @@ $stopCalls = @($buildDevAst.FindAll({
     $node -is [System.Management.Automation.Language.CommandAst] -and
         $node.GetCommandName() -eq 'Stop-StagedProcess'
 }, $true))
-Assert-True ($stopCalls.Count -eq 4) 'build-dev must check exactly the staged core, remote service, EPUB worker, and music-video editor'
+Assert-True ($stopCalls.Count -eq 3) 'build-dev must stop-check only core, remote service and EPUB worker'
 $stopCallText = @($stopCalls | ForEach-Object { $_.Extent.Text })
 Assert-True ($stopCallText[0].Contains("-ExeName 'mimageviewer-core'") -and
     $stopCallText[0].Contains('-ExePath $coreExe') -and
@@ -72,9 +72,9 @@ Assert-True ($stopCallText[1].Contains("-ExeName 'mimageviewer-remote'") -and
 Assert-True ($stopCallText[2].Contains("-ExeName 'mimageviewer-epub-pdf'") -and
     $stopCallText[2].Contains('-ExePath $epubWorkerExe') -and
     $stopCallText[2].Contains('-PreserveRuntime:$PreserveRuntime')) 'third staged-process check does not preserve the exact EPUB worker policy'
-Assert-True ($stopCallText[3].Contains("-ExeName 'mimageviewer-musicvideo'") -and
-    $stopCallText[3].Contains('-ExePath $musicvideoExe') -and
-    $stopCallText[3].Contains('-PreserveRuntime:$PreserveRuntime')) 'fourth staged-process check does not preserve the exact music-video editor policy'
+Assert-True ($buildDev.Contains('Assert-MivMusicvideoBuildOutputsIdle -OutputPaths @($musicvideoExe)')) 'editor output is not protected'
+Assert-True ($buildDev.IndexOf('Assert-MivMusicvideoBuildOutputsIdle -OutputPaths') -lt
+    $buildDev.IndexOf("Stop-StagedProcess -ExeName 'mimageviewer-core'")) 'editor guard must run before stopping companions'
 
 $cargoCalls = @($buildDevAst.FindAll({
     param($node)
@@ -127,7 +127,6 @@ try {
         @{ Name = 'mimageviewer-core'; File = 'mimageviewer-core.exe'; Label = 'core' },
         @{ Name = 'mimageviewer-remote'; File = 'mimageviewer-remote.exe'; Label = 'remote service' },
         @{ Name = 'mimageviewer-epub-pdf'; File = 'mimageviewer-epub-pdf.exe'; Label = 'EPUB converter' }
-        @{ Name = 'mimageviewer-musicvideo'; File = 'mimageviewer-musicvideo.exe'; Label = 'music-video editor' }
     )) {
         $exePath = Join-Path $testRootFull $case.File
         Set-Content -LiteralPath $exePath -Value 'mock executable' -Encoding Ascii

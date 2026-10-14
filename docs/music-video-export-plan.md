@@ -1,6 +1,6 @@
 # 音楽ビデオ書き出し (Music Video Export) — 設計計画
 
-Status: P1〜P3j、P4b-1〜4 の実装・非対話検証あり。H3a の契約と H3b の画素一致は非対話検証済み。P4c・P4d の実装・非対話検証あり。P4d の独立レビュー1回目はREVISE、対応後の再レビュー・実機検収、P4e 以降は未完了。
+Status: P1〜P3j、P4b-1〜4 の実装・非対話検証あり。H3a の契約と H3b の画素一致は非対話検証済み。P4c・P4d の実装・非対話検証あり。P4d の独立レビュー1回目はREVISE、対応後の再レビュー・実機検収は未完了。P4e は実装・非対話配布検証済み（独立レビュー・GUI 検収は未実施）。P4f は未完了。
 2026-10-09 に P4 の方式を「別 exe のエディタ」へ改訂（D10 / D16）、
 画面構成（D14）と文字装飾の初版範囲（D15）を追加。改訂は GPT-6.1 Sol / xhigh の独立レビュー 3 回で
 条件付き ACCEPT（P4a 完了、2026-10-09）。
@@ -12,7 +12,7 @@ Status: P1〜P3j、P4b-1〜4 の実装・非対話検証あり。H3a の契約�
 実機目視 = ユーザー。2026-09-07〜09-09 の Astra / Sol 体制の記録は
 [引き継ぎ監査](music-video-handoff-20260907.md) に残す。本書の過去の完了記録は当時の記録であり、
 監査で挙がった未解決事項の解消を意味しない。
-H3（H3a + H3b）の解析・画素一致は非対話検証済み（下記 H3b 検証記録）。P4 の実機検収は未完了。P4c・P4d の実装・非対話検証あり。P4d の独立レビュー1回目はREVISE、対応後の再レビューと P4e 以降は未完了。
+H3（H3a + H3b）の解析・画素一致は非対話検証済み（下記 H3b 検証記録）。P4 の実機検収は未完了。P4c・P4d の実装・非対話検証あり。P4d の独立レビュー1回目はREVISE、対応後の再レビューは未完了。P4e は実装・非対話配布検証済み、独立レビューは未実施。P4f は未完了。
 開発場所 = 別 worktree `C:\home\mimageviewer-musicvideo`（ブランチ `musicvideo`）。
 最終着地点 = **mIV に同梱して配布し、mIV から起動する機能**（ラボ止まりにしない。D10）。
 
@@ -3230,7 +3230,7 @@ GUI起動・実機検収と対応後の独立再レビューは未実施。コ�
 | **P4b** 実装完了・実機確認待ち（P4b-1〜4 すべて独立レビュー ACCEPT、2026-10-14。上書きの競合は利用者が許容。5 分 1080p60 は完走済み・速度は参考値で静かな環境での再計測が残る。音・GUI の実機確認は利用者へ依頼） | ホストの製品化（D16。段の分け方は D16 の「P4b の設計」）: ラボを `crates/musicvideo-editor` へ移し、FFmpeg デコードへ統一、スナップショット入力の MP4 書き出し（モーダル・進捗・キャンセル）、未保存の編集の確認、音声スレッドが stream を所有する再生と f32 以外の出力形式対応 | **P4b-3（2026-10-14、未コミット）**: 指定ゲート 365 passed、追加 18 件すべての変異失敗確認、既存 editor 101 件維持。共通 snapshot／解析／較正／PCM view AAC／原子的公開／モーダル終端を接続し、製品 editor・通常 CLI・dev CLI の release build 成功。編集済み 5 分 1080p60 を dev CLI で 18,000 frames 完走、184.441 秒／1.6265x（背景 Codex 4 件あり、参考値）。詳細は D16 の P4b-3 記録。P4b-2 の実機の音・GUI・H3b は未確認。**P4b-4（2026-10-14、未コミット）**: session 所属の単一意図、歌詞の先行解決、保存後のフレーム末尾の再判定、先行読込の receiver 退役、新規、CancelClose／承認済み Close と書き出し中止の終端待ちを実装。指定ゲート **396 passed**、追加 **31 件**すべて変異失敗確認。初回レビュー REVISE の P2／P3 に対応し、LRC モーダルの実クリック回帰、Project／保存完了の両順序、歌詞取消と同フレームの旧完了を検査。今回 3 件追加・既存 1 件補強、各テストの変異失敗確認、指定テスト **399 passed**。詳細は D16 の P4b-4 記録。修正後の独立レビュー・実機確認・H3b は未完了 |
 | **P4c** 実装完了・実機確認待ち（独立レビュー ACCEPT、2026-10-15） | 起動引数と診断（D10）: `--audio` / `--project` / `--data-dir`、最近使ったプロジェクト、ログ・panic ログ、引数エラーの画面表示、runtime shared lease と取得失敗の表示 | **初回2026-10-14**: 追加21件の変異検証記録あり。**2026-10-15、未コミット修正**: P2のUI出力全経路9か所をworker配送、追加6件すべてで同期出力の変異失敗、P3の実機未完了表記を訂正。指定gate **516 passed / 0 failed / 1 ignored**、fmt／glyph0／製品release build成功。再レビュー・実機検収未実施。詳細は「P4c 実装記録」の独立レビュー1回目対応 |
 | **P4d** 実装完了・実機確認待ち（独立レビュー ACCEPT、2026-10-15） | mIV 側の入口: 音楽ビュー・音声ファイルの右クリックから「音楽ビデオを作成」でエディタを起動 | Grid／Fullscreenの単一実Audioだけ。static ID／非表示設定、worker起動、絶対path引数、失敗通知、build-dev同梱を実装。既存保存順のstatic／動的枠を保つ末尾追加。追加8件の成功と各変異失敗、全対象14560 passed／0 failed／66 ignored、fmt／glyph0、通常featureの4exe確認build成功を記録済み。`261b10359`の独立レビューP2に対応し製品binのGUI属性／Subsystem gateを追加。製品GUI起動／実機検収／対応のcommitなし。詳細は「P4d実装記録」 |
-| **P4e** | 配布（下の表）: launcher 内包・runtime 展開・署名・portable 同梱・全 PE / VC runtime gate・build スクリプト・test-full 前提 | build-dist 相当の通しビルド。runtime 清掃: 旧版 core 終了後にエディタだけ稼働 / 起動との競合 / エディタ終了後の清掃。release のエディタ exe サイズとビルド時間を記録 |
+| **P4e** | 配布（下の表）: launcher 内包・runtime 展開・署名・portable 同梱・全 PE / VC runtime gate・build スクリプト・test-full 前提 | **実装・非対話検証済（2026-10-15）**。build-dist -NoSign の全段成功、全体 gate 14,562 passed / 0 failed / 66 ignored。editor 25,504,768 bytes、launcher 増分も同値。清掃は editor を含む fixture で検査し D10 の割り切りを維持。署名実行・GUI 検収・独立レビューは未実施。詳細は末尾「P4e 実装記録」 |
 | **P4f** | 文書: マニュアル・製品ページ・keymap-spec（固定ショートカットの理由）・privacy（通信なし・保存先） | CLAUDE.md「コード修正時のドキュメント同時更新」 |
 
 L1 自動検証記録（2026-10-09）:
@@ -3643,3 +3643,215 @@ P3b で Q1 の方式を実装して確認した。単発のクロスフェード
 各 2 個の opacity キーを打つだけで実用になる。一方、連続する多数の画像切替ではレイヤ追加と
 両側の opacity キー設定を繰り返すため煩雑さが残る。専用の slides モデルは追加せず、実利用後に
 「同じモデルへ複数操作をまとめて投入するショートカット」で足りるかを Q1 の判断材料とする。
+
+### P4e 実装記録（2026-10-15、実装担当による検証）
+
+基点: `musicvideo` / `369d312f5d33c1d5d19b31d4436f68e3b5156e77`。
+独立レビュー・設計担当の検収は別途。ここに記載する確認は実装担当自身の検証である。
+署名（SimplySign）・本体／launcher／エディタ GUI 起動・実プロファイル操作・コミットは行わない。
+開始時からの未追跡 `out.mp4` は操作しない。
+
+**EPUB worker の全参照列挙（基点 HEAD の `git grep -n`）**
+
+以下は全参照ファイルと基点での行番号。全文は `target/p4e-evidence/epub-inventory-head.txt`。
+launcher／build／清掃 fixture／現行運用文書へ editor を追加する。Cargo の EPUB 登録、
+EPUB 固有処理・過去の設計／検証記録・製品 readme（P4f）は変更しない。
+installer `.iss` は launcher のみ配置するため変更不要。PE gate の判定処理は不変。
+test-full は workspace の editor を既に実行するため、準備手順を文書へ追加する。
+
+| ファイル | 基点の行番号 |
+| --- | --- |
+| `CLAUDE.md` | 218, 1059, 1099, 1495, 1504, 1750, 2243, 2244, 2709 |
+| `Cargo.lock` | 2079 |
+| `Cargo.toml` | 5 |
+| `crates/epub-pdf-worker/Cargo.toml` | 2, 7 |
+| `crates/epub-pdf-worker/README.md` | 4, 9, 10, 11, 12, 13, 95, 175, 176, 194, 204 |
+| `crates/epub-pdf-worker/src/job_probe.rs` | 487, 775, 838 |
+| `crates/epub-pdf-worker/src/main.rs` | 18 |
+| `crates/epub-pdf-worker/src/webview.rs` | 200 |
+| `crates/epub-pdf-worker/tests/progress_cli.rs` | 33 |
+| `crates/launcher/build.rs` | 3, 37, 52, 53 |
+| `crates/launcher/src/main.rs` | 4, 107, 480, 1006, 1009, 1087 |
+| `docs/architecture-overview.md` | 331 |
+| `docs/book-composition-plan.md` | 140 |
+| `docs/book-resume-meter-plan.md` | 321 |
+| `docs/brief-musicvideo-p4e.md` | 14, 15 |
+| `docs/collection-implementation-plan.md` | 1695 |
+| `docs/effetune-now-playing-plan.md` | 898, 901 |
+| `docs/epub-pdf-integration-plan.md` | 4, 256, 381, 843, 1147, 1158, 1188 |
+| `docs/epub-pdf-spike-results.md` | 4, 43 |
+| `docs/file-organize-destinations-plan.md` | 311 |
+| `docs/pin-reload-audit.md` | 111 |
+| `docs/portable-build-plan.md` | 42, 321, 330 |
+| `docs/release-operations.md` | 102, 135 |
+| `docs/startup-diagnostics-plan.md` | 937 |
+| `installer/mimageviewer.iss` | 47 |
+| `installer/readme.txt` | 176 |
+| `installer/readme_portable.txt` | 64 |
+| `scripts/build-dev.ps1` | 7, 48, 230, 265 |
+| `scripts/build-dist.ps1` | 13, 107, 155, 156, 158, 159, 218 |
+| `scripts/build-portable.ps1` | 305, 343, 369, 370, 427, 518 |
+| `scripts/build-release.ps1` | 139, 146, 158, 266, 373 |
+| `scripts/build-release.sh` | 26, 86, 97, 98 |
+| `scripts/test-build-dev-safety.ps1` | 72, 129 |
+| `scripts/test-release-build-safety.ps1` | 153, 160, 162, 163, 164, 167, 168 |
+| `scripts/ui-smoke/release-checks/Support.ps1` | 74 |
+| `src/epub_convert.rs` | 45, 330 |
+
+**実装と保護範囲**
+
+- launcher: release editor の必須入力／hash／rerun、ASSETS と versioned runtime 展開。
+  EPUB worker と同じ内容 hash／atomic 置換を使い、既存 13 資産も内容一致で検証する。
+- release: core → remote → EPUB worker → editor → launcher。署名する経路は全 inner exe → launcher。
+  Bash wrapper も build 順と editor 保護を揃える（今回は PowerShell 経路だけ実行する）。
+- dist: 通常／portable の clean に editor package を含め、最終 PE 入力にも追加する。
+- portable: `target-portable` で editor を build／copy／署名／zip 化する。
+  診断 portable の manifest にも editor hash を追加し、ReleaseChecks の呼出し側を更新する。
+  data-dir の受け渡しは P4c／P4d の既存契約を維持する。
+- build safety: 共通 `musicvideo-build-safety.ps1` は出力 exe の稼働を検査し保存・終了を求めて中止する。
+  dev の停止対象から editor を除外する。PreserveRuntime の有無に関係なく適用し、portable の
+  `-SkipBuild`／`-KeepRunning` と配布フォルダ置換も保護する。core／remote／EPUB の停止 policy は不変。
+- runtime cleanup: 現行 fixture に editor を含め、旧 core／editor のそれぞれだけが残る process snapshot を
+  同じ既存テストで検査する。D10 の lease 取得前競合は割り切りのままで、製品の清掃処理は変更しない。
+
+**検証条件と完了済みの結果**
+
+すべて `MSBUILDDISABLENODEREUSE=1`。PowerShell build スクリプトは `*>&1` なしで呼び、
+標準出力／標準エラーを親 Python の別ファイルへ保存する。全 build は `-PreserveRuntime`。
+release／portable は既定の署名 OFF、dist は `-NoSign` を使う。
+本体 unit test は `RUST_MIN_STACK=67108864`。dist の全体 gate では P4d の有効な検証設定を
+再利用し、Cargo の薄い転送 exe で親 libtest にだけ CLI `--test-threads=1` を追加する。
+`RUST_TEST_THREADS` は未設定で、子の HWND 通知形式を保つ。テスト対象・assert・vendor gate は省略しない。
+この転送 exe／実行 runner は `target/p4e-evidence/cargo-wrapper/` と `target/p4e-run.py`（コミット対象外）。
+
+| 検証 | 結果 | 証跡（`target/p4e-evidence/`） |
+| --- | --- | --- |
+| `cargo fmt` / `cargo fmt --check` | 適用済み、check exit 0 | `fmt.{json,log,stderr.log}` |
+| UI glyph / 新規 PowerShell の ASCII | 危険 glyph 0、新規 2 本とも ASCII | `glyphs.{json,log,stderr.log}`、ソースの byte 検査 |
+| build safety 3 本 | dev／release／musicvideo とも PASS、偽プロセスのみ | `safety-{dev,release-final,editor}.{json,log,stderr.log}` |
+| launcher 全テスト | 初回・全改変復元後とも 42 passed / 0 failed / 1 ignored | `launcher-initial-tests.*`、`launcher-restored-tests.*` |
+| runtime cleanup | 25 passed / 0 failed / 0 ignored、editor を含む fixture | `cleanup.{json,log,stderr.log}` |
+| `build-release.ps1 -PreserveRuntime` | exit 0、819.940 秒。runtime gate は 5 PE、embedded gate は 12 PE | `release.{json,log,stderr.log}`、`target/vcrt-pe-reports/release-{runtime,embedded}.json` |
+
+release の editor 段は Cargo 表示 **2 分 08 秒**（依存の準備後の非 incremental build）。
+VST3 SDK は未配置だが、現行ソースとの identity 検査に成功した vendor host の再利用経路が成功した。
+
+**サイズの比較**
+
+editor は **25,504,768 bytes（24.32 MiB）**。
+core／remote／EPUB worker／DLL／bundle を同じ内包元に固定し、launcher の main.rs だけを基点 HEAD へ
+一時復帰して比較した。editor なし **492,850,176 bytes** → あり **518,354,944 bytes**、
+増分 **25,504,768 bytes**。全 workspace の過去版サイズとの比較ではない。
+基点版の比較 build は 19.394 秒、現行ソース復元 build は 12.228 秒で成功し、復元後のサイズも一致した。
+`sizes.json`、`launcher-baseline.*`、`launcher-restored-build.*`。
+
+**意図的な改変の検出（22 ケース）**
+
+- script 17 ケース: 拒否を削除、dev の guard を削除／editor を停止対象に変更、release の editor build／
+  埋め込み前署名／PE 入力を削除、release の停止 list へ editor を追加、通常／portable clean から editor を
+  削除、dist の PE 入力を削除、portable の build／copy／署名を削除、配布フォルダを稼働保護から除外、
+  manifest の editor hash の記録／照合を削除、ReleaseChecks の editor 引数を削除。
+  すべて対象 safety test が exit 1。実 editor は起動せず、各回で元の byte を復元した。
+  `script-mutations.json`、`mutation-*.{log,stderr.log}`、`target/p4e-script-mutations.py`。
+- launcher 4 ケース: editor ASSET を削除、editor を毎回 hash 対象から除外、既存 remote ASSET を削除すると、
+  新規テストがコンパイル後の assert で exit 101。release editor を一時退避すると build.rs が具体的な
+  editor の build コマンド付きで exit 101。元へ戻した後、全 42 テストが成功。
+  `mutation-launcher-*`、`target/p4e-launcher-mutations.py`。
+- cleanup 1 ケース: editor の process image だけを使用中判定から除くと、既存 core case は保持しつつ、
+  新しい editor case の assert で exit 101。製品の清掃処理を復元後、全 25 テストが成功。
+  `mutation-cleanup-ignores-editor.*`、`target/p4e-cleanup-mutation.py`。
+
+検証済みソース／script 13 本の SHA-256 は `source-freeze.json` に保存する。
+
+**環境上の制約と再実行**
+
+- portable 初回は cold target の `turbojpeg-sys` の CMake/MSBuild（`--parallel 24`）で exit 101、
+  88.355 秒。製品や editor の build 前に停止した。同じ生成済み CMake プロジェクトを `--parallel 1` で
+  build／install すると exit 0、114.473 秒。portable 再実行には `CARGO_BUILD_JOBS=1` を指定する。
+  最後の dist は Rust の通常並列を保ち、同じ検証用ディレクトリの CMake 転送 exe と
+  `CMAKE_BUILD_PARALLEL_LEVEL=1` で CMake/MSBuild の `--parallel` だけを 1 に制限する。
+  単一ジョブの portable 再実行は Rust の最適化も直列化したため、1,152.673 秒で今回のコンパイラ
+  （PID／名前／開始時刻／実行パスを照合）だけを実装担当が中断した。rustc の終了値 `0xffffffff` による
+  exit 101 は、この中断の結果であり製品の検証失敗ではない。ネイティブ依存の準備結果を再利用し、
+  portable も CMake/MSBuild だけを制限する転送経路へ戻して最後まで検証する。
+  依存や build スクリプトの実装・設定を変更せず、初回の失敗も成功に読み替えない。
+  `portable.*`、`portable-native-diagnostic.*`。
+- Bash wrapper の `bash -n` は Git Bash 自体の `CreateFileMapping` / Win32 error 5 で起動できず、
+  exit 256。Bash の構文・実行検証は未完了。今回は指定された PowerShell 経路で配布を検証する。
+  `bash-syntax.*`。
+
+**portable の完了結果**
+
+`build-portable.ps1 -PreserveRuntime`（Rust は通常並列、CMake/MSBuild のみ単一ジョブ）は
+exit 0、**594.028 秒**。専用 target の core／remote／EPUB worker／editor をビルドし、
+`dist/mImageViewer_portable_v4.6.0/` と同名 `.zip` を生成した。portable PE gate は **18 PE**。
+editor は製品 bin として x64／GUI subsystem 2。フォルダと zip 内の editor が
+`target-portable/release/mimageviewer-musicvideo.exe` と byte 単位で一致した。
+`portable-fast.{json,log,stderr.log}`、`artifacts.json`、`artifacts-before-dist.*`。
+
+同梱検査自体の感度も、editor を欠く小さい fixture zip と、editor の内容が違う fixture フォルダで確認した。
+いずれも assert により exit 1。実際の配布フォルダ／zip は変更していない。
+`artifact-negative.json`、`negative-{zip-no-editor,folder-wrong-editor}.*`、`target/p4e-artifact-negative.py`。
+
+**最後の build-dist の全体テスト gate**
+
+`build-dist.ps1 -NoSign -PreserveRuntime` の初回・通し実行で `test-full.ps1` は PASS。
+本体 lib は **12,737 passed / 0 failed / 59 ignored**、1,912.85 秒。
+workspace／統合／doc／vendor 4 crate を合わせて **14,562 passed / 0 failed / 66 ignored**。
+79 summary を集計し、親の対象数へ既に含まれる filtered helper subprocess の 1 件成功を 2 回分除外した。
+`full-summary.json`、`dist.{log,stderr.log}`。UI snapshot、launcher の新規 2 件、editor のテストもこの gate に含む。
+
+続く Python perf analyzer、EffeTune、VST3 identity／CRT preflight、build safety 3 本も成功した。
+通常と portable の clean の実コマンドに `-p musicvideo-editor` が含まれることを通しログで確認した。
+**build-dist の通し完了（署名なし）**
+
+`build-dist.ps1 -NoSign -PreserveRuntime` を最後に **1 回**実行し、全段 exit 0、
+**4,146.110 秒（69 分 06.110 秒）**で成功した。全体テスト → script regression → 通常／portable clean →
+core／remote／EPUB worker／editor／launcher → ISCC → portable build／copy／zip → 最終 PE gate。
+Rust は通常並列、親 libtest のみ CLI 直列、CMake/MSBuild のみ単一ジョブ。署名は実行しない。
+
+| 最終 gate | 結果 |
+| --- | --- |
+| 通常 runtime | 5 PE、companion CRT 検査成功 |
+| 内包する依存 PE | 12 PE、成功 |
+| portable | 18 PE、companion CRT 検査成功 |
+| dist runtime／portable | 24 PE、成功。通常版・portable の editor を含む |
+| installer wrapper | 1 PE、成功 |
+
+最終生成物:
+
+- `target/release/mimageviewer.exe`（launcher、**518,354,944 bytes**）。
+- `installer/Output/mImageViewer_setup.exe`。`.iss` は launcher のみ配置する従来の構成で成功し、変更不要。
+- `dist/mImageViewer_portable_v4.6.0/` と `dist/mImageViewer_portable_v4.6.0.zip`（editor loose 同梱）。
+
+最終 editor は **25,504,768 bytes**、SHA-256 は
+`f9e22f9245a90e8704a758a2a86bd9816badf70d1ccd02b62dea7a343d734d2f`。
+最終 launcher の PE 内に、この release editor の全 byte がそのまま内包されていることを確認した
+（payload offset 156,878,080）。最終 portable フォルダ／zip も専用 target の editor と全 byte が一致し、
+通常版・portable とも x64／GUI subsystem 2 を PE report で再確認した。
+初回のサイズ比較と同じ最終サイズだった。dist 内の editor 段は通常版 **2 分 06 秒**、
+portable **3 分 13 秒**（Cargo 表示。通常版は core の依存準備後、portable は非 portable lib の準備も含む）。
+
+`dist.{json,log,stderr.log}`、`artifacts-final.*`、`artifacts.json`、`final-validation.json`、
+`target/vcrt-pe-reports/dist-{runtime-portable,installer}.json`。
+最終のソース照合で **13 本すべて source-freeze.json と一致**。fmt の最終 check も exit 0
+（`format-final-before-dist.*`）。検証後に変更したのは運用文書とこの実装記録のみ。
+
+**正本との相違・残る範囲**
+
+正本の仕様との相違はない。Bash wrapper と診断 portable manifest／ReleaseChecks の呼出し側も、
+列挙で見つかった同型経路として同期した。Bash の実行検証は前述の環境制約で未完了。
+署名順と対象 list は回帰テストで検査したが、SimplySign／実 Authenticode 署名は指示により実行していない。
+実アプリ／launcher／editor GUI 起動、実 `%APPDATA%/mimageviewer` 操作、コミットはなし。
+独立レビュー・設計担当検収・GUI 検収は別担当／別セッションの範囲であり、ここで完了と扱わない。
+ブランチ `musicvideo`、HEAD `369d312f5d33c1d5d19b31d4436f68e3b5156e77` は変更なし。
+
+**変更ファイル（18 本、未コミット）**
+
+| 範囲 | ファイル |
+| --- | --- |
+| launcher | `crates/launcher/build.rs`、`crates/launcher/src/main.rs` |
+| build | `scripts/build-dev.ps1`、`scripts/build-release.ps1`、`scripts/build-dist.ps1`、`scripts/build-portable.ps1`、`scripts/build-release.sh` |
+| safety | 新規 `scripts/musicvideo-build-safety.ps1`、新規 `scripts/test-musicvideo-build-safety.ps1`、`scripts/test-build-dev-safety.ps1`、`scripts/test-release-build-safety.ps1` |
+| cleanup／診断 portable | `src/runtime_cleanup.rs`（fixture のみ）、`scripts/ui-smoke/release-checks/Support.ps1` |
+| 文書 | `CLAUDE.md`、`docs/development-build-and-test.md`、`docs/release-operations.md`、`docs/portable-build-plan.md`、`docs/music-video-export-plan.md` |

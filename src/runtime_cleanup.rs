@@ -453,6 +453,7 @@ mod tests {
         let runtime = temp.path().join("runtime");
         let current = runtime.join(VERSION);
         tree(&current);
+        fs::write(current.join("mimageviewer-musicvideo.exe"), b"editor").unwrap();
         let container = current.join("effetune");
         for generation in [ACTIVE, POINTER, OLD] {
             tree(&container.join(generation).join("EffeTune Mixwright.vst3"));
@@ -703,29 +704,38 @@ mod tests {
 
         #[test]
         fn legacy_process_snapshot_keeps_in_use_version_and_generation() {
-            let (temp, runtime, bundle) = fixture();
-            let old = runtime.join("3.0.0");
-            let idle = runtime.join("2.0.0");
-            tree(&old);
-            tree(&idle);
-            let generation = runtime.join(VERSION).join("effetune").join(OLD);
-            let images = vec![
-                (101, old.join("mimageviewer-core.exe")),
-                (102, generation.join("host.exe")),
-            ];
-            cleanup_with_processes(temp.path(), VERSION, Some(&bundle), || Ok(images));
-            assert!(old.join("nested/asset").exists());
-            assert!(
-                generation
-                    .join("EffeTune Mixwright.vst3/nested/asset")
-                    .exists()
-            );
-            assert!(!old.join(runtime_locks::IN_USE).exists());
-            assert!(!generation.join(runtime_locks::IN_USE).exists());
-            assert!(!idle.exists());
-            cleanup_with_processes(temp.path(), VERSION, Some(&bundle), || Ok(vec![]));
-            assert!(!old.exists());
-            assert!(!generation.exists());
+            for companion in ["mimageviewer-core.exe", "mimageviewer-musicvideo.exe"] {
+                let (temp, runtime, bundle) = fixture();
+                let old = runtime.join("3.0.0");
+                let idle = runtime.join("2.0.0");
+                tree(&old);
+                tree(&idle);
+                let generation = runtime.join(VERSION).join("effetune").join(OLD);
+                let images = vec![
+                    // Only the editor remains after the old core exited.
+                    (101, old.join(companion)),
+                    (102, generation.join("host.exe")),
+                ];
+                cleanup_with_processes(temp.path(), VERSION, Some(&bundle), || Ok(images));
+                assert!(old.join("nested/asset").exists());
+                assert!(
+                    runtime
+                        .join(VERSION)
+                        .join("mimageviewer-musicvideo.exe")
+                        .exists()
+                );
+                assert!(
+                    generation
+                        .join("EffeTune Mixwright.vst3/nested/asset")
+                        .exists()
+                );
+                assert!(!old.join(runtime_locks::IN_USE).exists());
+                assert!(!generation.join(runtime_locks::IN_USE).exists());
+                assert!(!idle.exists());
+                cleanup_with_processes(temp.path(), VERSION, Some(&bundle), || Ok(vec![]));
+                assert!(!old.exists());
+                assert!(!generation.exists());
+            }
         }
 
         #[test]
