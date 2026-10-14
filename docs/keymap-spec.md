@@ -239,11 +239,12 @@ focus 方向を最初の focusable widget 登録前に `FocusDirection::None` �
 する。no-repeat の <kbd>Tab</kbd> は repeat event も発火させず除去する。
 `wants_keyboard_input()` の gate はこの消費より先に維持し、TextEdit / IME やフォーカス中 UI が
 キーボードを所有している間は KeySlot と egui event の双方を残す。
-IME が処理した `NamedKey::Process` の press / repeat は egui-winit が Key / Text /
-clipboard event にせず、native presenter も `VK_PROCESSKEY` を egui key にしない。
+Windows の `allow_ime` が true のとき、IME が処理した `NamedKey::Process` の press / repeat は egui-winit が Key / Text /
+clipboard event にしない。native presenter は `VK_PROCESSKEY` を egui key にしない。
 本体 Win32 queue と native 生キー公開も 0xE5 の press / repeat を捨てるため、JIS 記号の
 scan-code shortcut に IME 処理済みキーが一致することはない。
-release と Ime event は残す。composition 中という理由で通常の Esc press は除去しない。
+egui-winit は処理済み物理キーを記録し、対応する release も遮断する（本家 0.34.0 #7967 と同じ）。
+Win32 queue / native 生キー経路の release と Ime event は残す。composition 中という理由で通常の Esc press は除去しない。
 取消の `Disabled` / 空 `Commit` に非空 `Commit` が無い場合だけ、input plugin が
 空の `Preedit("")` を補い、未確定文字を取り消す。アプリ操作の抑止は今 pass の Ime 列を
 反映した後の composing だけで決まり、Commit 後の通常 Enter / Escape / shortcut は即座に通る。

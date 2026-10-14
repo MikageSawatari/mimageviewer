@@ -349,7 +349,7 @@ Windows の owner rule (= owned は owner より常に手前) で、presenter HW
   viewport 単位で所有する。native event queue が次の egui pass を待つ間は、plugin snapshot に
   `pending_events` を read-only 投影して Ctrl+V/C/X と Enter/Esc の gate を決め、presenter-local な
   composition bool / timestamp は持たない。IME 処理済みの `VK_PROCESSKEY` は native key
-  変換で egui key にせず（winit 経路も Process press を遮断）、取消時の空 preedit 補完は
+  変換で egui key にせず（Windows の winit 経路は allow_ime=true のとき Process press と対応 release を遮断）、取消時の空 preedit 補完は
   plugin の RawInput 境界へ一本化する。shortcut の抑止は今 pass の composing のみで判定し、
   Commit / Disabled 後の通常キーは直ちに通す。focus 復帰と helper 所有の次 pass 限りの retry は
   pointer 無しの key press・他 widget の focus 無し・composing または Enter / Esc press 無しを条件にする。

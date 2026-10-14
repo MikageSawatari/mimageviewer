@@ -4996,7 +4996,7 @@ detached predicate/registry/viewport/scheduler/placementは変更せず、vendor
 確定後の通常 Enter を本文 TextEdit へ渡す。同じ実 fullscreen 経路の同一 / 別 pass 回帰を追加した。
 §2 を再読し、detached predicate、viewport 生成 / registry、host / placement / focus owner は変更しない。
 新しい状態・時間窓・geometry guard を足す症状パッチではなく、不要となった対症療法の撤去である。
-300ms grace 等の残す規則と自動検証結果は [I2 段 2a の記録](music-video-export-plan.md) に集約する。
+段 2a 時点の規則（grace は後の段 2b で撤去）と自動検証結果は [I2 段 2a の記録](ime-process-keys-plan.md) に集約する。
 実機確認と設計 lead の検収は未実施。
 
 ### §11 追補: I2 段 2b の共有 IME 所有境界（2026-10-14、未コミット）
@@ -5004,8 +5004,8 @@ detached predicate/registry/viewport/scheduler/placementは変更せず、vendor
 設計 lead の第5版と独立設計レビュー ACCEPT、および brief の小範囲修正許可に従い、
 共有 `egui-ime` の時刻 grace を撤去し、今 pass 反映後の composing に統一した。
 終端 event を失ったまま同じ viewport ID を再利用すると composing が残ることを回帰テストで確認したため、
-plugin が `RawInput.viewports` の生存集合で破棄済み viewport の状態を落とし、所有 viewport の focus 喪失でも終了する。
+plugin が `RawInput.viewports` の生存集合で破棄済み viewport の状態を落とし、所有 viewport の focus 喪失では shortcut claim を終了する。終端待ちは `UnfocusedComposition` として保持し、後続の取消補完を保つ。
 生存する兄弟 viewport の read-only 参照では変更しない。helper retry は既存 latch を pass 番号へ置換し、
 欄が消えた後へ復帰要求を持ち越さない。detached predicate / registry / 生成 / placement は変更しない。
 §2 の所有境界に沿う修正であり、遅延・時間窓・geometry guard を足す症状パッチではないことを実装側でも確認した。
-自動検証結果は [I2 段 2b の記録](music-video-export-plan.md) に集約し、正式な実装レビューと実機確認は別途とする。
+自動検証結果は [I2 段 2b の記録](ime-process-keys-plan.md) に集約し、正式な実装レビューと実機確認は別途とする。

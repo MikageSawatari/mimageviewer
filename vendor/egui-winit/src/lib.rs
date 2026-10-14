@@ -9,6 +9,9 @@
 
 #![allow(clippy::manual_range_contains)]
 
+#[cfg(target_os = "windows")]
+use std::collections::HashSet;
+
 #[cfg(feature = "accesskit")]
 pub use accesskit_winit;
 pub use egui;
@@ -108,6 +111,11 @@ pub struct State {
 
     allow_ime: bool,
     ime_rect_px: Option<egui::Rect>,
+
+    /// Physical keys whose IME-processed release must also be filtered.
+    /// Matches upstream egui-winit 0.34.0 (#7967).
+    #[cfg(target_os = "windows")]
+    pressed_processed_physical_keys: HashSet<winit::keyboard::PhysicalKey>,
 }
 
 impl State {
@@ -151,6 +159,8 @@ impl State {
 
             allow_ime: false,
             ime_rect_px: None,
+            #[cfg(target_os = "windows")]
+            pressed_processed_physical_keys: HashSet::new(),
         };
 
         slf.egui_input
@@ -417,15 +427,20 @@ impl State {
                         consumed: false,
                     }
                 } else {
-                    self.on_keyboard_input(event);
-
-                    // When pressing the Tab key, egui focuses the first focusable element, hence Tab always consumes.
-                    let consumed = self.egui_ctx.wants_keyboard_input()
-                        || event.logical_key
-                            == winit::keyboard::Key::Named(winit::keyboard::NamedKey::Tab);
-                    EventResponse {
-                        repaint: true,
-                        consumed,
+                    if self.on_keyboard_input(event) {
+                        // When pressing the Tab key, egui focuses the first focusable element, hence Tab always consumes.
+                        let consumed = self.egui_ctx.wants_keyboard_input()
+                            || event.logical_key
+                                == winit::keyboard::Key::Named(winit::keyboard::NamedKey::Tab);
+                        EventResponse {
+                            repaint: true,
+                            consumed,
+                        }
+                    } else {
+                        EventResponse {
+                            repaint: false,
+                            consumed: self.egui_ctx.wants_keyboard_input(),
+                        }
                     }
                 }
             }
@@ -774,7 +789,7 @@ impl State {
         }
     }
 
-    fn on_keyboard_input(&mut self, event: &winit::event::KeyEvent) {
+    fn on_keyboard_input(&mut self, event: &winit::event::KeyEvent) -> bool {
         append_keyboard_input(
             &mut self.egui_input,
             &event.logical_key,
@@ -782,8 +797,12 @@ impl State {
             event.text.as_ref().map(|text| text.as_str()),
             event.state,
             event.repeat,
+            #[cfg(target_os = "windows")]
+            self.allow_ime,
+            #[cfg(target_os = "windows")]
+            &mut self.pressed_processed_physical_keys,
             || self.clipboard.get(),
-        );
+        )
     }
 
     /// Call with the output given by `egui`.
@@ -1017,13 +1036,21 @@ fn append_keyboard_input(
     text: Option<&str>,
     state: winit::event::ElementState,
     _repeat: bool, // egui derives repeat itself, as before
+    #[cfg(target_os = "windows")] allow_ime: bool,
+    #[cfg(target_os = "windows")] pressed_processed_physical_keys: &mut HashSet<
+        winit::keyboard::PhysicalKey,
+    >,
     clipboard_text: impl FnOnce() -> Option<String>,
-) {
-    // Windows reports keys consumed by the IME as Process (VK_PROCESSKEY).
-    // Do not turn their physical fallback into application keys, text, or
-    // clipboard commands. Releases remain available to clear held keys.
-    if !should_forward_keyboard_input(winit_logical_key, state) {
-        return;
+) -> bool {
+    #[cfg(target_os = "windows")]
+    if try_on_ime_processed_keyboard_input(
+        allow_ime,
+        pressed_processed_physical_keys,
+        winit_logical_key,
+        winit_physical_key,
+        state,
+    ) {
+        return false;
     }
 
     let pressed = state == winit::event::ElementState::Pressed;
@@ -1053,10 +1080,10 @@ fn append_keyboard_input(
         if pressed {
             if is_cut_command(input.modifiers, active_key) {
                 input.events.push(egui::Event::Cut);
-                return;
+                return true;
             } else if is_copy_command(input.modifiers, active_key) {
                 input.events.push(egui::Event::Copy);
-                return;
+                return true;
             } else if is_paste_command(input.modifiers, active_key) {
                 if let Some(contents) = clipboard_text() {
                     let contents = contents.replace("\r\n", "\n");
@@ -1064,7 +1091,7 @@ fn append_keyboard_input(
                         input.events.push(egui::Event::Paste(contents));
                     }
                 }
-                return;
+                return true;
             }
         }
 
@@ -1091,14 +1118,34 @@ fn append_keyboard_input(
             }
         }
     }
+    true
 }
 
-fn should_forward_keyboard_input(
+/// The upstream 0.34.0 Windows predicate and state transition, factored over
+/// KeyEvent's public parts so delivery tests use the production path.
+/// https://github.com/emilk/egui/pull/7967
+#[cfg(target_os = "windows")]
+fn try_on_ime_processed_keyboard_input(
+    allow_ime: bool,
+    pressed_processed_physical_keys: &mut HashSet<winit::keyboard::PhysicalKey>,
     logical_key: &winit::keyboard::Key,
+    physical_key: winit::keyboard::PhysicalKey,
     state: winit::event::ElementState,
 ) -> bool {
-    state != winit::event::ElementState::Pressed
-        || *logical_key != winit::keyboard::Key::Named(winit::keyboard::NamedKey::Process)
+    if !allow_ime {
+        false
+    } else if *logical_key == winit::keyboard::NamedKey::Process {
+        // winit maps VK_PROCESSKEY to Process for IME-consumed presses.
+        pressed_processed_physical_keys.insert(physical_key);
+        true
+    } else if state == ElementState::Released
+        && pressed_processed_physical_keys.remove(&physical_key)
+    {
+        // Releases carry the original logical key, so match their physical key.
+        true
+    } else {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -1124,6 +1171,7 @@ mod keyboard_input_tests {
         }
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn delivery_process_presses_and_repeats_append_no_events_or_read_clipboard() {
         for physical in [
@@ -1157,6 +1205,10 @@ mod keyboard_input_tests {
                         Some("IME-handled text"),
                         ElementState::Pressed,
                         repeat,
+                        #[cfg(target_os = "windows")]
+                        true,
+                        #[cfg(target_os = "windows")]
+                        &mut HashSet::new(),
                         || panic!("Process must not read clipboard"),
                     );
                     assert_eq!(
@@ -1168,8 +1220,9 @@ mod keyboard_input_tests {
         }
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
-    fn delivery_process_releases_keep_the_physical_key_without_text_or_clipboard() {
+    fn delivery_processed_press_and_corresponding_release_append_no_events() {
         for (physical, expected) in [
             (KeyCode::Enter, egui::Key::Enter),
             (KeyCode::Escape, egui::Key::Escape),
@@ -1183,13 +1236,45 @@ mod keyboard_input_tests {
                 modifiers,
                 ..Default::default()
             };
-            append_keyboard_input(
+            let mut processed = HashSet::new();
+            let physical_key = PhysicalKey::Code(physical);
+            assert!(!append_keyboard_input(
                 &mut input,
                 &Key::Named(NamedKey::Process),
-                PhysicalKey::Code(physical),
+                physical_key,
+                Some("processed text"),
+                ElementState::Pressed,
+                false,
+                true,
+                &mut processed,
+                || panic!("Process must not read clipboard"),
+            ));
+            assert_eq!(processed, HashSet::from([physical_key]));
+            append_keyboard_input(
+                &mut input,
+                &Key::Character("original logical key".into()),
+                physical_key,
                 Some("release text"),
                 ElementState::Released,
                 false,
+                #[cfg(target_os = "windows")]
+                true,
+                #[cfg(target_os = "windows")]
+                &mut processed,
+                || panic!("Release must not read clipboard"),
+            );
+            assert!(input.events.is_empty());
+            assert!(processed.is_empty());
+            // The release of a physical key with no processed press still flows.
+            append_keyboard_input(
+                &mut input,
+                &Key::Character("original logical key".into()),
+                physical_key,
+                Some("release text"),
+                ElementState::Released,
+                false,
+                true,
+                &mut processed,
                 || panic!("Release must not read clipboard"),
             );
             assert_eq!(
@@ -1239,6 +1324,10 @@ mod keyboard_input_tests {
                         Some(text),
                         state,
                         repeat,
+                        #[cfg(target_os = "windows")]
+                        true,
+                        #[cfg(target_os = "windows")]
+                        &mut HashSet::new(),
                         || panic!("Ordinary key must not read clipboard"),
                     );
                     let mut expected_events = vec![key_event(
@@ -1268,6 +1357,10 @@ mod keyboard_input_tests {
             None,
             ElementState::Pressed,
             false,
+            #[cfg(target_os = "windows")]
+            true,
+            #[cfg(target_os = "windows")]
+            &mut HashSet::new(),
             || None,
         );
         assert_eq!(
@@ -1305,6 +1398,10 @@ mod keyboard_input_tests {
                         Some(character),
                         ElementState::Pressed,
                         repeat,
+                        #[cfg(target_os = "windows")]
+                        true,
+                        #[cfg(target_os = "windows")]
+                        &mut HashSet::new(),
                         || {
                             reads += 1;
                             Some("first\r\nsecond".into())
@@ -1320,6 +1417,10 @@ mod keyboard_input_tests {
                         Some(character),
                         ElementState::Released,
                         false,
+                        #[cfg(target_os = "windows")]
+                        true,
+                        #[cfg(target_os = "windows")]
+                        &mut HashSet::new(),
                         || panic!("Release must not read clipboard"),
                     );
                     let key = key_from_key_code(physical).unwrap();
@@ -1344,6 +1445,10 @@ mod keyboard_input_tests {
                 Some("v"),
                 ElementState::Pressed,
                 false,
+                #[cfg(target_os = "windows")]
+                true,
+                #[cfg(target_os = "windows")]
+                &mut HashSet::new(),
                 || {
                     reads += 1;
                     contents
@@ -1354,55 +1459,176 @@ mod keyboard_input_tests {
         }
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn ime_process_press_is_not_forwarded() {
         // The decision does not depend on physical key, text, modifiers, or
         // repeat: it precedes every Key/Text/Cut/Copy/Paste producer.
-        assert!(!should_forward_keyboard_input(
+        let mut processed = HashSet::new();
+        let physical = PhysicalKey::Code(KeyCode::Enter);
+        assert!(try_on_ime_processed_keyboard_input(
+            true,
+            &mut processed,
             &Key::Named(NamedKey::Process),
+            physical,
             ElementState::Pressed,
+        ));
+        assert_eq!(processed, HashSet::from([physical]));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn only_corresponding_processed_physical_releases_are_filtered() {
+        let enter = PhysicalKey::Code(KeyCode::Enter);
+        let tab = PhysicalKey::Code(KeyCode::Tab);
+        let mut processed = HashSet::from([enter]);
+        assert!(!try_on_ime_processed_keyboard_input(
+            true,
+            &mut processed,
+            &Key::Named(NamedKey::Tab),
+            tab,
+            ElementState::Released,
+        ));
+        assert_eq!(processed, HashSet::from([enter]));
+        assert!(try_on_ime_processed_keyboard_input(
+            true,
+            &mut processed,
+            &Key::Named(NamedKey::Enter),
+            enter,
+            ElementState::Released,
+        ));
+        assert!(processed.is_empty());
+        assert!(!try_on_ime_processed_keyboard_input(
+            true,
+            &mut processed,
+            &Key::Named(NamedKey::Enter),
+            enter,
+            ElementState::Released,
         ));
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
-    fn releases_are_forwarded_including_process() {
-        for key in [
-            NamedKey::Process,
-            NamedKey::Enter,
-            NamedKey::Escape,
-            NamedKey::Tab,
-            NamedKey::Space,
-        ] {
-            assert!(should_forward_keyboard_input(
-                &Key::Named(key),
-                ElementState::Released
+    fn disabled_ime_forwards_process_and_preserves_the_tracking_set() {
+        let physical = PhysicalKey::Code(KeyCode::KeyV);
+        let mut processed = HashSet::from([physical]);
+        for state in [ElementState::Pressed, ElementState::Released] {
+            assert!(!try_on_ime_processed_keyboard_input(
+                false,
+                &mut processed,
+                &Key::Named(NamedKey::Process),
+                physical,
+                state,
             ));
+            assert!(!try_on_ime_processed_keyboard_input(
+                false,
+                &mut processed,
+                &Key::Character("v".into()),
+                physical,
+                state,
+            ));
+            assert_eq!(processed, HashSet::from([physical]));
         }
+        let mut input = egui::RawInput {
+            modifiers: egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
+            ..Default::default()
+        };
+        let mut reads = 0;
+        assert!(append_keyboard_input(
+            &mut input,
+            &Key::Named(NamedKey::Process),
+            physical,
+            Some("v"),
+            ElementState::Pressed,
+            true,
+            false,
+            &mut processed,
+            || {
+                reads += 1;
+                Some("clipboard".into())
+            },
+        ));
+        assert_eq!(reads, 1);
+        assert_eq!(input.events, vec![egui::Event::Paste("clipboard".into())]);
+        assert!(append_keyboard_input(
+            &mut input,
+            &Key::Character("v".into()),
+            physical,
+            Some("v"),
+            ElementState::Released,
+            false,
+            false,
+            &mut processed,
+            || panic!("Release must not read clipboard"),
+        ));
+        assert_eq!(
+            input.events[1],
+            key_event(egui::Key::V, egui::Key::V, false, input.modifiers)
+        );
+        assert_eq!(processed, HashSet::from([physical]));
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn processed_keys_track_repeats_and_multiple_physical_keys_per_state() {
+        let enter = PhysicalKey::Code(KeyCode::Enter);
+        let tab = PhysicalKey::Code(KeyCode::Tab);
+        let mut owner = HashSet::new();
+        let mut sibling = HashSet::new();
+        for physical in [enter, enter, tab] {
+            assert!(try_on_ime_processed_keyboard_input(
+                true,
+                &mut owner,
+                &Key::Named(NamedKey::Process),
+                physical,
+                ElementState::Pressed,
+            ));
+        }
+        assert_eq!(owner, HashSet::from([enter, tab]));
+        assert!(!try_on_ime_processed_keyboard_input(
+            true,
+            &mut sibling,
+            &Key::Named(NamedKey::Enter),
+            enter,
+            ElementState::Released,
+        ));
+        assert_eq!(owner, HashSet::from([enter, tab]));
+        assert!(sibling.is_empty());
+        assert!(try_on_ime_processed_keyboard_input(
+            true,
+            &mut owner,
+            &Key::Named(NamedKey::Enter),
+            enter,
+            ElementState::Released,
+        ));
+        assert_eq!(owner, HashSet::from([tab]));
+    }
+
+    #[cfg(target_os = "windows")]
     #[test]
     fn ordinary_named_keys_are_forwarded() {
+        let mut processed = HashSet::new();
         for key in [
             NamedKey::Enter,
             NamedKey::Escape,
             NamedKey::Tab,
             NamedKey::Space,
         ] {
-            assert!(should_forward_keyboard_input(
+            assert!(!try_on_ime_processed_keyboard_input(
+                true,
+                &mut processed,
                 &Key::Named(key),
+                PhysicalKey::Code(KeyCode::Enter),
                 ElementState::Pressed
             ));
             assert!(key_from_winit_key(&Key::Named(key)).is_some());
         }
+        assert!(processed.is_empty());
     }
 
     #[test]
     fn non_latin_physical_fallback_keeps_clipboard_commands() {
         let logical = Key::Character("ж".into());
-        assert!(should_forward_keyboard_input(
-            &logical,
-            ElementState::Pressed
-        ));
         assert_eq!(key_from_winit_key(&logical), None);
         for (physical, expected) in [
             (KeyCode::KeyX, egui::Key::X),

@@ -536,6 +536,7 @@ C:\home\mimageviewer_vendor_backup\
   [docs/calculated-panel-height-audit.md](docs/calculated-panel-height-audit.md)。
 
 ### IME 対応 (日本語入力) ⚠️ 重要
+設計・先行実機記録・移植検証は [IME 処理済みキーの計画](docs/ime-process-keys-plan.md) を参照。
 TextEdit を含むダイアログで Enter / Escape を拾うときは **必ず専用ヘルパーを使う**こと。
 直接 `ctx.input(|i| i.key_pressed(Key::Enter/Escape))` を呼ぶと、**日本語 IME 変換中の Enter
 (変換確定) や Escape (変換キャンセル) をダイアログが奪ってしまい、変換が破壊される**。
@@ -577,8 +578,10 @@ viewport ごとに追跡する。`App::update_ime_state(ctx)` は helper-field �
 `ime_focus::ime_input_active_in_viewport` から共有 snapshot を読む。これは read-only の入口であり、
 対象 viewport の event queue や composition state を更新しない。更新は必ず所有 viewport の pass に残す。
 
-IME が処理した `NamedKey::Process` の press（repeat を含む）は vendored egui-winit が
-Key / Text / Cut / Copy / Paste にしない。release と Ime event は残す。native presenter も
+Windows の `allow_ime` が true の場合、vendored egui-winit は IME が処理した
+`NamedKey::Process` の press（repeat を含む）を Key / Text / Cut / Copy / Paste にしない。
+処理済み物理キーの集合で対応する release も遮断する（本家 0.34.0 #7967 と同じ）。
+それ以外の release と Ime event は残す。native presenter も
 `VK_PROCESSKEY` に egui key を割り当てない。本体 Win32 queue と native 生キー公開も
 同じく 0xE5 の press / repeat を捨て、release は残す。通常のキーを composition だけで
 取り除かない。TextEdit の未確定文字選択を保ったまま、Windows が

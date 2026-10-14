@@ -4,6 +4,27 @@ I2 段 1（2026-10-14）: IME が処理したキーの到着を調べる診断�
 段 1 はキー・IME の変換、egui イベントの生成・消費、EventResponse を変更しない。
 I2 段 2a（同日）: 実機記録に基づき、IME 処理済みキーの press を遮断する挙動変更を追加。
 
+## 現在の修正：本家 0.34.0 #7967 と同じ（2026-10-14）
+
+出典は [PR #7967](https://github.com/emilk/egui/pull/7967) と
+[egui-winit 0.34.0 の実装](https://raw.githubusercontent.com/emilk/egui/0.34.0/crates/egui-winit/src/lib.rs)
+（`try_on_ime_processed_keyboard_input`）。**egui 更新時はこの差分ごと消す**：
+`vendor/egui-winit`、workspace exclude と path patch を削除し、本家へ戻す。
+
+Windows の `allow_ime` が true の場合だけ、logical Process を遮断して
+`State::pressed_processed_physical_keys: HashSet<PhysicalKey>` に記録する。
+対応する release は logical が元のキーに戻るため、同集合から physical を remove して遮断する。
+allow_ime=false の入力は集合を変更せず渡し、Process press のなかった physical の release も渡す。
+本家と同じ条件順序で、追加の focus-reset / 期限は設けない。状態は State（viewport）ごとに所有する。
+遮断時の EventResponse も本家同様 repaint=false / consumed=wants_keyboard_input とする。
+Ime 変換と通常 Key / Text / clipboard producer、秘匿 trace は保持する。
+
+KeyEvent は private field を持つため、その公開部品を受ける同名の状態遷移 helper に判定を置く。
+`append_keyboard_input` はこの判定を全 producer の前で呼び、State と配送テストが同じ経路を通る。
+旧純関数・配送テストを対応 release の遮断へ更新し、allow_ime=false、非対応 release、repeat、
+複数 physical と sibling 状態の分離を追加検証する。移植全体の記録は
+[IME 計画](../../docs/ime-process-keys-plan.md)。
+
 ## 出典・取り込み
 
 - crates.io package: `egui-winit-0.33.3.crate`
@@ -88,7 +109,9 @@ IME が開いていても変換していないときの Enter は logical=Named(
 raw VK / scan code の観測結果は含まない。他の IME・PC まで一般化しない。
 P2 修正後の trace は Space の種類を全経路で秘匿するが、logical=Named(Process) は保持する。
 
-## 段 2a のキー配送規則（2026-10-14、挙動変更）
+## 段 2a の旧キー配送規則（2026-10-14、移植元の履歴）
+
+以下の release 通過・集合なしの判断は、冒頭の本家整合によって置き換えた。
 
 `on_keyboard_input` が呼ぶ配送関数の入口で、`logical=NamedKey::Process` かつ press を
 `should_forward_keyboard_input` の純関数で拒否する。repeat も同じ入口を通るため、
