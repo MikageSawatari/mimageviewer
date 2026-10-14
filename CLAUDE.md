@@ -580,8 +580,9 @@ viewport ごとに追跡する。`App::update_ime_state(ctx)` は helper-field �
 
 Windows の `allow_ime` が true の場合、vendored egui-winit は IME が処理した
 `NamedKey::Process` の press（repeat を含む）を Key / Text / Cut / Copy / Paste にしない。
-処理済み物理キーの集合で対応する release も遮断する（本家 0.34.0 #7967 が基礎）。
-本家との差分は、配送する press / repeat の記録除去、記録済み release の allow_ime にかかわらない除去・遮断、focus 喪失時の集合クリアの 3 点。
+本家 0.34.0 #7967 の HashSet を、物理キーごとの Hidden（press 未配送）/ Forwarded（配送済み）の型付き状態へ置換する。
+後続の Process repeat でも Forwarded を保持する。release は allow_ime にかかわらず状態を除去し Hidden のみ遮断する。
+focus 喪失時は全状態を消す（egui も keys_down を消去する）。
 それ以外の release と Ime event は残す。native presenter も
 `VK_PROCESSKEY` に egui key を割り当てない。本体 Win32 queue と native 生キー公開も
 同じく 0xE5 の press / repeat を捨て、release は残す。通常のキーを composition だけで

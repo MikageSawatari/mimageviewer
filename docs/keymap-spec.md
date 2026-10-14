@@ -243,8 +243,8 @@ Windows の `allow_ime` が true のとき、IME が処理した `NamedKey::Proc
 clipboard event にしない。native presenter は `VK_PROCESSKEY` を egui key にしない。
 本体 Win32 queue と native 生キー公開も 0xE5 の press / repeat を捨てるため、JIS 記号の
 scan-code shortcut に IME 処理済みキーが一致することはない。
-egui-winit は処理済み物理キーを記録し、対応する release を allow_ime にかかわらず除去・遮断する。
-本家 0.34.0 #7967 が基礎だが、この release 判定、配送する press / repeat の記録除去、focus 喪失時の集合クリアが異なる。
+egui-winit は物理キーの押下を Hidden（press 未配送）/ Forwarded（配送済み）として所有し、Process repeat でも Forwarded を保持する。
+本家 0.34.0 #7967 の HashSet との差分はこの型付き状態、allow_ime にかかわらない release の状態除去・Hidden のみ遮断、focus 喪失時の全消去。
 Win32 queue / native 生キー経路の release と Ime event は残す。composition 中という理由で通常の Esc press は除去しない。
 取消の `Disabled` / 空 `Commit` に非空 `Commit` が無い場合だけ、input plugin が
 空の `Preedit("")` を補い、未確定文字を取り消す。アプリ操作の抑止は今 pass の Ime 列を

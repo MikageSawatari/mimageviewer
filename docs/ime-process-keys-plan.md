@@ -35,16 +35,18 @@ I1 段 2a（`367f9c9d3`）と段 2b の本体部分（`fde3e819e`）は先行独
 | 段 1：`282f173c4` / `1cbe1888f` | egui-winit 0.33.3 を vendor に取り込み、既定無効の `MIV_IME_KEY_TRACE` で winit 入力と実際の egui 出力を観測。文字と Space は秘匿し、ファイル I/O は worker に置く。入力挙動を変更しない |
 | 段 2a：`62bc9f47c` / `29367ba4d` | Process press / repeat を Key・Text・clipboard producer の前で遮断。本体 text_mode / comic_lab の Enter 除去、共有 plugin の composing Esc 除去、helper の IME 専用 Tab lock を撤去。実配送関数 `append_keyboard_input` で回帰検証する |
 | 段 2b：`291dbf8e5` / `efce16eb0` | 300ms grace と timestamp、pending-event 有無版 API を撤去。今 pass の Ime 列を反映した composing と、queue 最終状態の投影へ統一。Win32 queue / native 生キー公開は 0xE5 press / repeat を生成境界で捨て、release は保持する |
-| 本家への整合と独立レビュー修正 | Windows の `allow_ime` が true のとき、Process を遮断して `pressed_processed_physical_keys: HashSet<PhysicalKey>` に記録する。配送する press / repeat は集合から除去する。記録済み release は allow_ime にかかわらず remove して遮断する。focus 喪失で集合を空にし、記録のない release は通す |
+| 本家への整合と独立レビュー修正 | Windows のみ `key_holds: HashMap<PhysicalKey, KeyHold>` で Hidden（未配送）/ Forwarded（配送済み）を所有する。allow_ime && Process の press は遮断し未登録なら Hidden、既存 Forwarded は保持。それ以外の press は配送して Forwarded。release はエントリを除去し Hidden のみ遮断、focus 喪失で全消去。未登録 release は従来どおり通す |
 
 段 2a の「release を通し、集合を持たない」判断は履歴であり、現在は press / release の整合性を優先する。
 本家 [PR #7967](https://github.com/emilk/egui/pull/7967) の egui-winit 0.34.0 を基にする。
 [本家実装](https://raw.githubusercontent.com/emilk/egui/0.34.0/crates/egui-winit/src/lib.rs) に対して、
-独立レビュー P2 の設計 lead 決定により、記録済み release は allow_ime 判定より先に除去・遮断し、
-配送する press / repeat は集合から除去し、`WindowEvent::Focused(false)` では当該 State の集合を空にする。
-この 3 点が挙動差分。不変条件は「集合には、今の押下について egui がまだ press を見ていない物理キーだけが入る」。
-通常リピートが届いて egui が press を見ると、その後の release も配送する。
-allow_ime=false で配送する Process press も同じ扱いにする。古い記録による release 遮断・keys_down 残留を防ぐ。
+独立レビュー P2 の設計 lead 決定により、本家の処理済み physical の HashSet を Hidden / Forwarded の型付き状態へ置換する。
+配送済み press の事実は同じ押下の release まで保持し、後続の Process repeat でも Hidden に戻さない。
+release は allow_ime / logical にかかわらずエントリを除去し、Hidden なら遮断、Forwarded / 未登録なら配送する。
+`WindowEvent::Focused(false)` では当該 State の全エントリを消す。egui InputState もこのイベントで keys_down を全消去することを実装前に確認した。
+この 3 点が挙動差分。不変条件は、同じ focus 区間で配送した press の release は配送し、配送していない press の release は遮断すること。
+通常 press → Process repeat → release、Process → 通常 repeat → Process repeat → release の両方で keys_down 残留を防ぐ。
+allow_ime=false で配送する Process press も Forwarded として扱う。未登録 release は従来の通過を維持する。
 処理済みキーの EventResponse も本家同様、repaint=false / consumed=wants_keyboard_input とする。
 時間窓は設けない。trace は既定無効で保持する。egui 更新時は上記 3 点の本家での解決を確認し、
 未解決なら差分を維持する（詳細は `vendor/egui-winit/PATCHES.md`）。
@@ -164,7 +166,7 @@ P2 は記録済み release の無条件除去・遮断と focus 喪失時の集�
 vendor の依存は 1 系統、build safety check も exit 0。今回は指定の検証範囲を実行し、上記の旧 full gate は再実行していない。
 成果物は `target/dev-runtime/mimageviewer-core.exe`。起動コマンド・実プロファイルの注意事項は前節を参照。
 
-## 再レビュー REVISE P2 の修正・検証（2026-10-14）
+## 第2回レビュー REVISE P2 の修正・検証（2026-10-14）
 
 前回修正は設計 lead が `dee11153e` にコミット済み。再レビューでは、Process press の記録後に
 通常リピートを配送すると、最後の release が遮断されて keys_down が残る P2 を受領した。
@@ -187,3 +189,35 @@ allow_ime=false で配送する Process の physical fallback も同じ不変条
 今回の指定範囲を実行し、前回の本体 filter tests / full gate は再実行していない。
 修正はコミットせず作業ツリーに残す。アプリ起動・実機確認と正式再レビューは行っていない。
 成果物・起動コマンドと実プロファイルの注意事項は前節を参照。
+
+## 第3回レビュー REVISE P2：物理押下の型付き状態（2026-10-14）
+
+前回修正は設計 lead が `4f85df34c` にコミット済み。通常 press → Process repeat → release と、
+Process → 通常 repeat → Process repeat → release で、集合への再登録が配送済み release を捨てる P2 を受領した。
+設計 lead の決定に従い、Windows の状態を `HashMap<PhysicalKey, KeyHold>` の Hidden / Forwarded へ変更する。
+配送済みの事実は release または focus 喪失まで維持し、Process repeat で Hidden に戻さない。
+実装前に egui の `InputState::begin_pass` が `WindowFocused(false)` で keys_down を全消去することを確認し、
+実 InputState を通す State の個別テストでも Forwarded の focus 喪失と次の新規 press を検証した。
+
+既存の個別テストは型付き状態の期待値へ更新して維持した。
+State の網羅テストは Process 初回 press / repeat、通常初回 press / repeat、release、focus 喪失の 6 入力と
+allow_ime true / false の 12 組について、長さ 1〜6 を全列挙する。
+列数は `12 + 12^2 + ... + 12^6 = 3,257,436`（空列は数えない）。prefix を復元しながら全列を配送し、省略・枝刈りはしない。
+模擬 egui keys_down は InputState と同じ press で挿入、release で除去、focus 喪失で全消去とし、
+記録のある release は down のときだけ配送されること、release 終端で down が空になること、
+同じ State に流す次の新規 press が repeat と推論されないことを検査する。
+初手・重複・focus 喪失後など未記録の release は「従来どおり配送する」指定を優先して別に検査する。
+この例外についてユーザーへ確認を提示し、全列を列挙して従来通過を別検査する前提を明示した。
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo fmt --check` / vendor `rustfmt --edition 2024 --check` / glyph check | すべて exit 0、危険 glyph 0 |
+| `cargo test -p egui-winit --lib` / `cargo test -p egui-ime` | 29 / 22 passed、失敗なし。egui-winit は網羅 3,257,436 列を含む |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0 |
+| `scripts/build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | exit 0（137.99 秒）。通常 feature / dev-runtime の core と companion を staging、起動なし |
+
+ログと command / exit code は `target/ime-port/review3-verification/*.log` / `*.json`。
+環境設定は前回と同じ。vendor の依存は 1 系統、build safety check も exit 0。
+今回の指定範囲を実行し、本体 filter tests / full gate は再実行していない。
+変更はコミットせず作業ツリーに残し、アプリ起動・実機確認・正式再レビューは行っていない。
+成果物は `target/dev-runtime/mimageviewer-core.exe`。起動コマンドと実プロファイルの注意事項は前節を参照。

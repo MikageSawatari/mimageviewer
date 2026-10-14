@@ -10,7 +10,7 @@
 #![allow(clippy::manual_range_contains)]
 
 #[cfg(target_os = "windows")]
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 #[cfg(feature = "accesskit")]
 pub use accesskit_winit;
@@ -75,6 +75,15 @@ pub struct EventResponse {
 
 // ----------------------------------------------------------------------------
 
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyHold {
+    /// No press in this physical hold has reached egui.
+    Hidden,
+    /// At least one press reached egui; its release must also reach egui.
+    Forwarded,
+}
+
 /// Handles the integration between egui and a winit Window.
 ///
 /// Instantiate one of these per viewport/window.
@@ -112,10 +121,10 @@ pub struct State {
     allow_ime: bool,
     ime_rect_px: Option<egui::Rect>,
 
-    /// Physical keys whose current press egui has not yet seen.
-    /// Based on upstream #7967; forwarding a press ends its release suppression.
+    /// Whether egui has seen a press during each current physical hold.
+    /// Forwarded survives later Process repeats until release or focus loss.
     #[cfg(target_os = "windows")]
-    pressed_processed_physical_keys: HashSet<winit::keyboard::PhysicalKey>,
+    key_holds: HashMap<winit::keyboard::PhysicalKey, KeyHold>,
 }
 
 impl State {
@@ -160,7 +169,7 @@ impl State {
             allow_ime: false,
             ime_rect_px: None,
             #[cfg(target_os = "windows")]
-            pressed_processed_physical_keys: HashSet::new(),
+            key_holds: HashMap::new(),
         };
 
         slf.egui_input
@@ -815,7 +824,7 @@ impl State {
             #[cfg(target_os = "windows")]
             self.allow_ime,
             #[cfg(target_os = "windows")]
-            &mut self.pressed_processed_physical_keys,
+            &mut self.key_holds,
             || self.clipboard.get(),
         )
     }
@@ -824,7 +833,7 @@ impl State {
         #[cfg(target_os = "windows")]
         if !focused {
             // Releases may go to another window while unfocused.
-            self.pressed_processed_physical_keys.clear();
+            self.key_holds.clear();
         }
         self.egui_input.focused = focused;
         self.egui_input
@@ -1064,15 +1073,13 @@ fn append_keyboard_input(
     state: winit::event::ElementState,
     _repeat: bool, // egui derives repeat itself, as before
     #[cfg(target_os = "windows")] allow_ime: bool,
-    #[cfg(target_os = "windows")] pressed_processed_physical_keys: &mut HashSet<
-        winit::keyboard::PhysicalKey,
-    >,
+    #[cfg(target_os = "windows")] key_holds: &mut HashMap<winit::keyboard::PhysicalKey, KeyHold>,
     clipboard_text: impl FnOnce() -> Option<String>,
 ) -> bool {
     #[cfg(target_os = "windows")]
     if try_on_ime_processed_keyboard_input(
         allow_ime,
-        pressed_processed_physical_keys,
+        key_holds,
         winit_logical_key,
         winit_physical_key,
         state,
@@ -1148,31 +1155,29 @@ fn append_keyboard_input(
     true
 }
 
-/// Based on upstream 0.34.0, tracking only presses egui has not yet seen.
+/// Based on upstream 0.34.0, with typed ownership for the entire physical hold.
 /// KeyEvent's public parts let delivery tests use the production path.
 /// https://github.com/emilk/egui/pull/7967
 #[cfg(target_os = "windows")]
 fn try_on_ime_processed_keyboard_input(
     allow_ime: bool,
-    pressed_processed_physical_keys: &mut HashSet<winit::keyboard::PhysicalKey>,
+    key_holds: &mut HashMap<winit::keyboard::PhysicalKey, KeyHold>,
     logical_key: &winit::keyboard::Key,
     physical_key: winit::keyboard::PhysicalKey,
     state: winit::event::ElementState,
 ) -> bool {
-    if state == ElementState::Released && pressed_processed_physical_keys.remove(&physical_key) {
-        // egui never saw this press, even if IME permission has changed since then.
-        true
-    } else if allow_ime && *logical_key == winit::keyboard::NamedKey::Process {
-        // winit maps VK_PROCESSKEY to Process for IME-consumed presses.
-        pressed_processed_physical_keys.insert(physical_key);
-        true
-    } else {
-        if state == ElementState::Pressed {
-            // A forwarded press (including a repeat) gives egui ownership of this
-            // physical hold. Its final release must reach egui as well.
-            pressed_processed_physical_keys.remove(&physical_key);
+    match state {
+        ElementState::Released => key_holds.remove(&physical_key) == Some(KeyHold::Hidden),
+        ElementState::Pressed => {
+            if allow_ime && *logical_key == winit::keyboard::NamedKey::Process {
+                // Never demote a hold whose earlier press already reached egui.
+                key_holds.entry(physical_key).or_insert(KeyHold::Hidden);
+                true
+            } else {
+                key_holds.insert(physical_key, KeyHold::Forwarded);
+                false
+            }
         }
-        false
     }
 }
 
@@ -1236,7 +1241,7 @@ mod keyboard_input_tests {
                         #[cfg(target_os = "windows")]
                         true,
                         #[cfg(target_os = "windows")]
-                        &mut HashSet::new(),
+                        &mut HashMap::new(),
                         || panic!("Process must not read clipboard"),
                     );
                     assert_eq!(
@@ -1264,7 +1269,7 @@ mod keyboard_input_tests {
                 modifiers,
                 ..Default::default()
             };
-            let mut processed = HashSet::new();
+            let mut processed = HashMap::new();
             let physical_key = PhysicalKey::Code(physical);
             assert!(!append_keyboard_input(
                 &mut input,
@@ -1277,7 +1282,7 @@ mod keyboard_input_tests {
                 &mut processed,
                 || panic!("Process must not read clipboard"),
             ));
-            assert_eq!(processed, HashSet::from([physical_key]));
+            assert_eq!(processed, HashMap::from([(physical_key, KeyHold::Hidden)]));
             append_keyboard_input(
                 &mut input,
                 &Key::Character("original logical key".into()),
@@ -1355,7 +1360,7 @@ mod keyboard_input_tests {
                         #[cfg(target_os = "windows")]
                         true,
                         #[cfg(target_os = "windows")]
-                        &mut HashSet::new(),
+                        &mut HashMap::new(),
                         || panic!("Ordinary key must not read clipboard"),
                     );
                     let mut expected_events = vec![key_event(
@@ -1388,7 +1393,7 @@ mod keyboard_input_tests {
             #[cfg(target_os = "windows")]
             true,
             #[cfg(target_os = "windows")]
-            &mut HashSet::new(),
+            &mut HashMap::new(),
             || None,
         );
         assert_eq!(
@@ -1429,7 +1434,7 @@ mod keyboard_input_tests {
                         #[cfg(target_os = "windows")]
                         true,
                         #[cfg(target_os = "windows")]
-                        &mut HashSet::new(),
+                        &mut HashMap::new(),
                         || {
                             reads += 1;
                             Some("first\r\nsecond".into())
@@ -1448,7 +1453,7 @@ mod keyboard_input_tests {
                         #[cfg(target_os = "windows")]
                         true,
                         #[cfg(target_os = "windows")]
-                        &mut HashSet::new(),
+                        &mut HashMap::new(),
                         || panic!("Release must not read clipboard"),
                     );
                     let key = key_from_key_code(physical).unwrap();
@@ -1476,7 +1481,7 @@ mod keyboard_input_tests {
                 #[cfg(target_os = "windows")]
                 true,
                 #[cfg(target_os = "windows")]
-                &mut HashSet::new(),
+                &mut HashMap::new(),
                 || {
                     reads += 1;
                     contents
@@ -1492,7 +1497,7 @@ mod keyboard_input_tests {
     fn ime_process_press_is_not_forwarded() {
         // The decision does not depend on physical key, text, modifiers, or
         // repeat: it precedes every Key/Text/Cut/Copy/Paste producer.
-        let mut processed = HashSet::new();
+        let mut processed = HashMap::new();
         let physical = PhysicalKey::Code(KeyCode::Enter);
         assert!(try_on_ime_processed_keyboard_input(
             true,
@@ -1501,7 +1506,7 @@ mod keyboard_input_tests {
             physical,
             ElementState::Pressed,
         ));
-        assert_eq!(processed, HashSet::from([physical]));
+        assert_eq!(processed, HashMap::from([(physical, KeyHold::Hidden)]));
     }
 
     #[cfg(target_os = "windows")]
@@ -1509,7 +1514,7 @@ mod keyboard_input_tests {
     fn only_corresponding_processed_physical_releases_are_filtered() {
         let enter = PhysicalKey::Code(KeyCode::Enter);
         let tab = PhysicalKey::Code(KeyCode::Tab);
-        let mut processed = HashSet::from([enter]);
+        let mut processed = HashMap::from([(enter, KeyHold::Hidden)]);
         assert!(!try_on_ime_processed_keyboard_input(
             true,
             &mut processed,
@@ -1517,7 +1522,7 @@ mod keyboard_input_tests {
             tab,
             ElementState::Released,
         ));
-        assert_eq!(processed, HashSet::from([enter]));
+        assert_eq!(processed, HashMap::from([(enter, KeyHold::Hidden)]));
         assert!(try_on_ime_processed_keyboard_input(
             true,
             &mut processed,
@@ -1539,7 +1544,7 @@ mod keyboard_input_tests {
     #[test]
     fn disabled_ime_forwards_unrecorded_input_but_removes_recorded_releases() {
         let physical = PhysicalKey::Code(KeyCode::KeyV);
-        let mut processed = HashSet::from([physical]);
+        let mut processed = HashMap::from([(physical, KeyHold::Hidden)]);
         let mut input = egui::RawInput {
             modifiers: egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
             ..Default::default()
@@ -1598,7 +1603,7 @@ mod keyboard_input_tests {
         for release_allowed in [false, true] {
             let ctx = egui::Context::default();
             let mut input = egui::RawInput::default();
-            let mut processed = HashSet::new();
+            let mut processed = HashMap::new();
             let physical = PhysicalKey::Code(KeyCode::Enter);
             for (logical, state, allowed, forwarded) in [
                 (NamedKey::Process, ElementState::Pressed, true, false),
@@ -1663,6 +1668,286 @@ mod keyboard_input_tests {
 
     #[cfg(target_os = "windows")]
     #[test]
+    fn forwarded_hold_survives_process_repeats_until_release_or_focus_loss() {
+        for initially_hidden in [false, true] {
+            for focus_loss in [false, true] {
+                let ctx = egui::Context::default();
+                let mut state = headless_state(ctx.clone(), ViewportId::ROOT);
+                state.on_focused(true);
+                let physical = PhysicalKey::Code(KeyCode::Enter);
+                if initially_hidden {
+                    state.allow_ime = true;
+                    assert!(!state.on_keyboard_input_parts(
+                        &Key::Named(NamedKey::Process),
+                        physical,
+                        None,
+                        ElementState::Pressed,
+                        false,
+                    ));
+                }
+                for (logical, allowed, repeat, forwarded) in [
+                    (NamedKey::Enter, true, initially_hidden, true),
+                    (NamedKey::Process, true, true, false),
+                    (NamedKey::Enter, false, true, true),
+                    (NamedKey::Process, true, true, false),
+                ] {
+                    state.allow_ime = allowed;
+                    assert_eq!(
+                        state.on_keyboard_input_parts(
+                            &Key::Named(logical),
+                            physical,
+                            None,
+                            ElementState::Pressed,
+                            repeat,
+                        ),
+                        forwarded
+                    );
+                    assert_eq!(state.key_holds.get(&physical), Some(&KeyHold::Forwarded));
+                    let _ = ctx.run(state.egui_input.take(), |ctx| {
+                        assert!(ctx.input(|input| input.key_down(egui::Key::Enter)));
+                    });
+                }
+                state.allow_ime = false;
+                if focus_loss {
+                    state.on_focused(false);
+                } else {
+                    assert!(state.on_keyboard_input_parts(
+                        &Key::Named(NamedKey::Enter),
+                        physical,
+                        None,
+                        ElementState::Released,
+                        false,
+                    ));
+                }
+                assert!(state.key_holds.is_empty());
+                let _ = ctx.run(state.egui_input.take(), |ctx| {
+                    assert!(!ctx.input(|input| input.key_down(egui::Key::Enter)));
+                });
+                state.on_focused(true);
+                assert!(state.on_keyboard_input_parts(
+                    &Key::Named(NamedKey::Enter),
+                    physical,
+                    None,
+                    ElementState::Pressed,
+                    false,
+                ));
+                let _ = ctx.run(state.egui_input.take(), |ctx| {
+                    ctx.input(|input| {
+                        assert!(input.key_down(egui::Key::Enter));
+                        assert!(input.events.iter().any(|event| matches!(
+                            event,
+                            egui::Event::Key {
+                                pressed: true,
+                                repeat: false,
+                                ..
+                            }
+                        )));
+                    });
+                });
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn all_key_hold_sequences_through_length_six_preserve_egui_key_state() {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Input {
+            ProcessPress,
+            ProcessRepeat,
+            Press,
+            Repeat,
+            Release,
+            FocusLost,
+        }
+        const INPUTS: [Input; 6] = [
+            Input::ProcessPress,
+            Input::ProcessRepeat,
+            Input::Press,
+            Input::Repeat,
+            Input::Release,
+            Input::FocusLost,
+        ];
+
+        // InputState::begin_pass inserts/removes keys on press/release and clears
+        // them on WindowFocused(false). Its repeat bit is the pre-insert down state.
+        // The real InputState is also exercised by the individual State tests.
+        fn apply_egui_events(input: &egui::RawInput, down: &mut bool) -> Option<bool> {
+            let mut inferred_repeat = None;
+            for event in &input.events {
+                match event {
+                    egui::Event::Key {
+                        key: egui::Key::Enter,
+                        pressed,
+                        ..
+                    } => {
+                        if *pressed {
+                            inferred_repeat = Some(std::mem::replace(down, true));
+                        } else {
+                            *down = false;
+                        }
+                    }
+                    egui::Event::WindowFocused(false) => *down = false,
+                    _ => panic!("unexpected event: {event:?}"),
+                }
+            }
+            inferred_repeat
+        }
+
+        fn visit(
+            state: &mut State,
+            down: bool,
+            path: &mut [(Input, bool); 6],
+            depth: usize,
+            count: &mut usize,
+        ) {
+            let physical = PhysicalKey::Code(KeyCode::Enter);
+            for input in INPUTS {
+                for allow_ime in [false, true] {
+                    path[depth] = (input, allow_ime);
+                    let sequence = &path[..=depth];
+                    let previous_hold = state.key_holds.get(&physical).copied();
+                    let previous_focus = state.egui_input.focused;
+                    let previous_allow = state.allow_ime;
+                    state.allow_ime = allow_ime;
+                    state.egui_input.events.clear();
+                    if input == Input::FocusLost {
+                        state.on_focused(false);
+                    } else {
+                        let logical = if matches!(input, Input::ProcessPress | Input::ProcessRepeat)
+                        {
+                            NamedKey::Process
+                        } else {
+                            NamedKey::Enter
+                        };
+                        let element = if input == Input::Release {
+                            ElementState::Released
+                        } else {
+                            ElementState::Pressed
+                        };
+                        let repeat = matches!(input, Input::ProcessRepeat | Input::Repeat);
+                        let forwarded = state.on_keyboard_input_parts(
+                            &Key::Named(logical),
+                            physical,
+                            None,
+                            element,
+                            repeat,
+                        );
+                        if input == Input::Release {
+                            if previous_hold.is_some() {
+                                // A known hold's release is delivered iff egui saw a press.
+                                assert_eq!(forwarded, down, "{sequence:?}");
+                            } else {
+                                // Arbitrary sequences include orphan/duplicate releases.
+                                // Preserve the specified legacy forwarding for these too.
+                                assert!(forwarded, "{sequence:?}");
+                            }
+                        } else {
+                            assert_eq!(
+                                forwarded,
+                                !(allow_ime && logical == NamedKey::Process),
+                                "{sequence:?}"
+                            );
+                        }
+                        assert_eq!(
+                            state.egui_input.events.len(),
+                            usize::from(forwarded),
+                            "{sequence:?}"
+                        );
+                        if forwarded {
+                            assert!(
+                                matches!(state.egui_input.events[0], egui::Event::Key {
+                                key: egui::Key::Enter, pressed, ..
+                            } if pressed == (element == ElementState::Pressed)),
+                                "{sequence:?}"
+                            );
+                        }
+                    }
+                    let mut next_down = down;
+                    apply_egui_events(&state.egui_input, &mut next_down);
+                    if matches!(input, Input::Release | Input::FocusLost) {
+                        assert!(!next_down, "{sequence:?}");
+                        assert!(state.key_holds.is_empty(), "{sequence:?}");
+                    } else {
+                        let expected = if next_down {
+                            KeyHold::Forwarded
+                        } else {
+                            KeyHold::Hidden
+                        };
+                        assert_eq!(
+                            state.key_holds.get(&physical),
+                            Some(&expected),
+                            "{sequence:?}"
+                        );
+                    }
+                    if input == Input::Release {
+                        // Probe the next fresh press through the same State delivery path.
+                        state.egui_input.events.clear();
+                        assert!(
+                            state.on_keyboard_input_parts(
+                                &Key::Named(NamedKey::Enter),
+                                physical,
+                                None,
+                                ElementState::Pressed,
+                                false,
+                            ),
+                            "{sequence:?}"
+                        );
+                        assert_eq!(
+                            apply_egui_events(&state.egui_input, &mut next_down),
+                            Some(false),
+                            "{sequence:?}"
+                        );
+                        state.egui_input.events.clear();
+                        assert!(
+                            state.on_keyboard_input_parts(
+                                &Key::Named(NamedKey::Enter),
+                                physical,
+                                None,
+                                ElementState::Released,
+                                false,
+                            ),
+                            "{sequence:?}"
+                        );
+                        apply_egui_events(&state.egui_input, &mut next_down);
+                        assert!(!next_down, "{sequence:?}");
+                        assert!(state.key_holds.is_empty(), "{sequence:?}");
+                    }
+                    *count += 1;
+                    if depth + 1 < path.len() {
+                        visit(state, next_down, path, depth + 1, count);
+                    }
+                    // Restore the parent prefix; no columns are skipped or merged.
+                    if let Some(hold) = previous_hold {
+                        state.key_holds.insert(physical, hold);
+                    } else {
+                        state.key_holds.remove(&physical);
+                    }
+                    state.egui_input.focused = previous_focus;
+                    state.allow_ime = previous_allow;
+                    state.egui_input.events.clear();
+                }
+            }
+        }
+
+        let mut state = headless_state(egui::Context::default(), ViewportId::ROOT);
+        let mut count = 0;
+        visit(
+            &mut state,
+            false,
+            &mut [(Input::Press, false); 6],
+            0,
+            &mut count,
+        );
+        assert_eq!(
+            count,
+            (1..=6).map(|length| 12_usize.pow(length)).sum::<usize>()
+        );
+        assert_eq!(count, 3_257_436);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
     fn forwarded_repeat_after_process_press_keeps_release_and_next_press() {
         for use_state in [false, true] {
             for (ordinary_allowed, ordinary_key) in [
@@ -1675,7 +1960,7 @@ mod keyboard_input_tests {
                 let mut state = headless_state(ctx.clone(), ViewportId::ROOT);
                 state.on_focused(true);
                 let mut raw_input = egui::RawInput::default();
-                let mut processed = HashSet::new();
+                let mut processed = HashMap::new();
                 let physical = PhysicalKey::Code(KeyCode::Enter);
                 for (logical, element, allowed, repeat, forwarded, egui_repeat) in [
                     (
@@ -1751,11 +2036,18 @@ mod keyboard_input_tests {
                     };
                     assert_eq!(delivered, forwarded);
                     let tracked = if use_state {
-                        &state.pressed_processed_physical_keys
+                        &state.key_holds
                     } else {
                         &processed
                     };
-                    assert_eq!(tracked.contains(&physical), !forwarded);
+                    let expected = if element == ElementState::Released {
+                        None
+                    } else if forwarded {
+                        Some(&KeyHold::Forwarded)
+                    } else {
+                        Some(&KeyHold::Hidden)
+                    };
+                    assert_eq!(tracked.get(&physical), expected);
                     let input = if use_state {
                         state.egui_input.take()
                     } else {
@@ -1848,7 +2140,7 @@ mod keyboard_input_tests {
                         });
                     });
                 if element == ElementState::Released {
-                    assert!(state.pressed_processed_physical_keys.is_empty());
+                    assert!(state.key_holds.is_empty());
                 }
             }
         }
@@ -1882,10 +2174,10 @@ mod keyboard_input_tests {
                     .events
                     .contains(&egui::Event::WindowFocused(false))
             );
-            assert!(owner.pressed_processed_physical_keys.is_empty());
+            assert!(owner.key_holds.is_empty());
             assert_eq!(
-                sibling.pressed_processed_physical_keys,
-                HashSet::from([physical])
+                sibling.key_holds,
+                HashMap::from([(physical, KeyHold::Hidden)])
             );
             // The old release goes to another window. After refocusing, the next ordinary
             // press/release must both reach egui, including when allow_ime changes.
@@ -1927,7 +2219,7 @@ mod keyboard_input_tests {
                 ElementState::Released,
                 false
             ));
-            assert!(sibling.pressed_processed_physical_keys.is_empty());
+            assert!(sibling.key_holds.is_empty());
         }
     }
 
@@ -1936,8 +2228,8 @@ mod keyboard_input_tests {
     fn processed_keys_track_repeats_and_multiple_physical_keys_per_state() {
         let enter = PhysicalKey::Code(KeyCode::Enter);
         let tab = PhysicalKey::Code(KeyCode::Tab);
-        let mut owner = HashSet::new();
-        let mut sibling = HashSet::new();
+        let mut owner = HashMap::new();
+        let mut sibling = HashMap::new();
         for physical in [enter, enter, tab] {
             assert!(try_on_ime_processed_keyboard_input(
                 true,
@@ -1947,7 +2239,10 @@ mod keyboard_input_tests {
                 ElementState::Pressed,
             ));
         }
-        assert_eq!(owner, HashSet::from([enter, tab]));
+        assert_eq!(
+            owner,
+            HashMap::from([(enter, KeyHold::Hidden), (tab, KeyHold::Hidden)])
+        );
         assert!(!try_on_ime_processed_keyboard_input(
             true,
             &mut sibling,
@@ -1955,7 +2250,10 @@ mod keyboard_input_tests {
             enter,
             ElementState::Released,
         ));
-        assert_eq!(owner, HashSet::from([enter, tab]));
+        assert_eq!(
+            owner,
+            HashMap::from([(enter, KeyHold::Hidden), (tab, KeyHold::Hidden)])
+        );
         assert!(sibling.is_empty());
         assert!(try_on_ime_processed_keyboard_input(
             true,
@@ -1964,13 +2262,13 @@ mod keyboard_input_tests {
             enter,
             ElementState::Released,
         ));
-        assert_eq!(owner, HashSet::from([tab]));
+        assert_eq!(owner, HashMap::from([(tab, KeyHold::Hidden)]));
     }
 
     #[cfg(target_os = "windows")]
     #[test]
     fn ordinary_named_keys_are_forwarded() {
-        let mut processed = HashSet::new();
+        let mut processed = HashMap::new();
         for key in [
             NamedKey::Enter,
             NamedKey::Escape,
@@ -1986,7 +2284,10 @@ mod keyboard_input_tests {
             ));
             assert!(key_from_winit_key(&Key::Named(key)).is_some());
         }
-        assert!(processed.is_empty());
+        assert_eq!(
+            processed,
+            HashMap::from([(PhysicalKey::Code(KeyCode::Enter), KeyHold::Forwarded)])
+        );
     }
 
     #[test]

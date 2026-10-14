@@ -462,11 +462,10 @@ pub(crate) fn ime_input_active(ctx: &egui::Context) -> bool {
 ///
 /// - main window と fullscreen viewport は winit / egui を通り、`Ime::Preedit` /
 ///   `Ime::Commit` / `Ime::Disabled` 相当の `egui::ImeEvent` を受ける。
-///   IME が処理した `NamedKey::Process` の press / repeat は egui-winit が
-///   Key / Text / clipboard event にせず、対応する物理キー release も遮断する。
-///   通常 press / repeat を配送した物理キーは記録から除去し、以後の release も渡す。
-///   記録済み release は allow_ime にかかわらず記録から除去して捨て、focus 喪失時は記録を空にする。
-///   記録のない release と Ime event はそのまま渡す。
+///   IME が処理した `NamedKey::Process` の press / repeat は allow_ime 有効時に egui-winit が
+///   Key / Text / clipboard event にしない。物理キーの押下を Hidden（未配送）/ Forwarded（配送済み）で持ち、
+///   配送済みは後続の Process repeat でも保持する。release は allow_ime にかかわらず状態を除去し Hidden のみ遮断する。
+///   focus 喪失時は全状態を消す。未登録の release と Ime event はそのまま渡す。
 /// - winit 管理外の独立 HWND である native video window は
 ///   `video/native_window.rs` で `WM_IME_STARTCOMPOSITION` /
 ///   `WM_IME_COMPOSITION` / `WM_IME_ENDCOMPOSITION` / `WM_IME_SETCONTEXT` を直接処理する。

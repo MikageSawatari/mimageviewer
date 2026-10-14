@@ -570,8 +570,9 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
   Keymap ownership 境界で一緒に consume する。no-repeat の Tab repeat も発火させず除去する。
   TextEdit / IME の keyboard owner gate は先に維持し、矢印の field-level focus lock / 復帰と
   直前 pass の helper-managed field に対する `FocusRecovery` claim は `ime_focus` が別に所有する。
-  Windows の allow_ime が true の場合、egui-winit は IME 処理済み Process press を物理キー集合に記録して遮断する。
-  本家 0.34.0 #7967 が基礎だが、配送する press / repeat は記録から除去し、記録済み release は allow_ime にかかわらず除去・遮断し、focus 喪失で集合を空にする。
+  Windows の allow_ime が true の場合、egui-winit は IME 処理済み Process press を遮断する。
+  本家 0.34.0 #7967 の HashSet を物理キーごとの Hidden / Forwarded に置換し、配送済みは Process repeat でも維持する。
+  release は allow_ime にかかわらず状態を除去して Hidden のみ遮断し、focus 喪失で全状態を消す。
   helper の IME 専用 Tab lock は置かない。
   本体 Win32 queue / native 生キーも 0xE5 の press / repeat を公開せず release を維持する。
   IME gate は今 pass 反映後の composing のみで、Commit 後の通常キーは直ちに通す。
