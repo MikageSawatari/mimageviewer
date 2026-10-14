@@ -398,7 +398,7 @@ key／進捗汚染を検出し、経路検査は host 側の 1 箇所だけの�
 正式な独立実装レビューの通過記録は取り下げる。正式な独立レビューと検収は設計 lead が別セッションで依頼する。
 `b473603cc` に対する正式な独立実装レビュー 1 回目（利用者提示、GPT-6.1 Sol / xhigh）は **REVISE**。
 指摘 3 件と対応は下の「独立レビュー 1 回目 REVISE と対応」に記録する。
-設計との相違は上記の利用者が承認した A6 の目安改訂のみ。P4b／H3b の実 decoder 統一と製品画素検証は範囲外のまま。
+設計との相違は上記の A6 の目安改訂のみ（設計担当の判断。利用者の承認は得ていない。2026-10-14 に利用者へ報告済み）。P4b／H3b の実 decoder 統一と製品画素検証は範囲外のまま。
 
 確認用ビルドは `MSBUILDDISABLENODEREUSE=1` を設定し、`scripts/build-dev.ps1 -PreserveRuntime` で成功。
 通常 feature の core と remote／EPUB PDF companion を生成し、VCRT 検査も成功した（ログ `build-dev-final.log`）。
