@@ -571,6 +571,10 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
   TextEdit / IME の keyboard owner gate は先に維持し、矢印の field-level focus lock / 復帰と
   直前 pass の helper-managed field に対する `FocusRecovery` claim は `ime_focus` が別に所有する。
   IME 処理済みの Process press は egui-winit が渡さず、helper の IME 専用 Tab lock は置かない。
+  本体 Win32 queue / native 生キーも 0xE5 の press / repeat を公開せず release を維持する。
+  IME gate は今 pass 反映後の composing のみで、Commit 後の通常キーは直ちに通す。
+  focus 復帰は所有 claim と分離し、pointer 無し・他 widget focus 無し・composing または Enter / Escape 無しを
+  条件とする。helper retry は次 pass 限りで同条件に従い、呼び出し側の初回 focus latch には書かない。
   Hover side panel 内の helper field が実 focus を持つ間は panel lifetime も維持し、widget を描かなかった
   ことによる egui end-pass の dead-man focus clear を起こさない。これは非 IME の focus recovery ではなく、
   focus が別 widget へ移れば解除される。`[text-input-key]` の通常ログには helper field の id 継続、focus 前後、

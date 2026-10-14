@@ -275,13 +275,13 @@ mod tests {
         assert_eq!(ctx.input(|input| input.events.len()), 1);
         let _ = ctx.end_pass();
         app.address_has_focus = false;
-        // IME preedit/commit grace and focus recovery are pass-owned claims; the
+        // IME composition and focus recovery are pass-owned claims; the
         // real dispatcher must retain their edge for the field, not just skip open.
         for phase in [
             TextInputPhase::PendingFocus,
             TextInputPhase::Focused,
             TextInputPhase::FocusRecovery,
-            TextInputPhase::ImeGrace,
+            TextInputPhase::ImeComposing,
         ] {
             key_pass(
                 &ctx,

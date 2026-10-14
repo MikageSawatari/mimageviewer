@@ -21961,10 +21961,8 @@ impl App {
         let _ = crate::ime_focus::ime_input_active(ctx);
     }
 
-    /// IME 変換中か (または直近 300ms 以内に Ime イベントがあったか)。
-    /// true の間は Enter / Escape をショートカット・ダイアログ確定/キャンセルとして拾ってはいけない。
-    /// 300ms グレースは Windows IME で `Ime::Disabled` と `Key::Escape` が別フレームに
-    /// 届くケースを吸収するため。
+    /// 今 pass の Ime イベントを反映した後も、この viewport が変換中か。
+    /// 変換中は Enter / Escape のアプリ操作を抑止する。Commit 後の通常キーは即座に通す。
     pub(crate) fn ime_input_active(&self, ctx: &egui::Context) -> bool {
         crate::ime_focus::ime_input_active(ctx)
     }
@@ -22040,7 +22038,7 @@ impl App {
                 self.ime_input_active(ctx).then(|| {
                     TextInputClaim::new(
                         focused_ui.unwrap_or(egui::Id::NULL),
-                        TextInputPhase::ImeGrace,
+                        TextInputPhase::ImeComposing,
                     )
                 })
             })
@@ -53711,21 +53709,6 @@ impl App {
         }
         // フルスクリーン、ダイアログ、テキスト入力中はショートカットを無効化
         if self.shortcuts_blocked_by_text_input(ctx) {
-            return None;
-        }
-
-        // IME 変換直後の Enter 漏れ対策:
-        // 検索バー / お気に入り検索バー / 全文検索バーが表示中で、かつ直近に IME イベントが
-        // あった場合、この `handle_keyboard` 呼び出しをスキップして Enter がグリッドの
-        // フルスクリーン起動ショートカットに回らないようにする。
-        // (IME が Commit を吐いたフレームで TextEdit が一瞬 lost_focus → *_has_focus
-        //  が false になり、次フレームで Enter が grid 側に漏れるレースをガードする)。
-        if (self.show_search_bar
-            || self.favsearch.active
-            || self.global_search.active
-            || self.tag_view.active)
-            && self.ime_input_active(ctx)
-        {
             return None;
         }
 
