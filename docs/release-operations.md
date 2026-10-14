@@ -1,13 +1,13 @@
 # リリース運用メモ (past-release field notes)
 
-このドキュメントは **CLAUDE.md「リリース手順チェックリスト」の補助資料**。
+このドキュメントは **[release-checklist.md](release-checklist.md)「リリース手順チェックリスト」の補助資料**。
 チェックリスト本体 (Phase 0〜5) が「何を順にやるか」の正本で、ここは過去リリースで
 実際に踏んだ **落とし穴・判断基準・復旧手順** を恒久メモとして 1 か所に集めたもの。
 開発担当からClaudeCode Opusの公開タスクへ引き継ぐときの「地雷マップ」として使う。
 
-- 正本 (手順そのもの): [CLAUDE.md](../CLAUDE.md) の「## リリース手順チェックリスト」。
+- 正本 (手順そのもの): [release-checklist.md](release-checklist.md) の「## リリース手順チェックリスト」。
 - 具体の確定値 (MS Store の Installer parameters・年齢区分・確定 URL 等) は
-  CLAUDE.md Phase 5 を参照。ここでは重複させない。
+  [release-checklist.md](release-checklist.md) Phase 5 を参照。ここでは重複させない。
 - このメモに個人情報・認証情報・証明書拇印・注文番号などは載せない
   (証明書 subject / 拇印は `scripts/sign-files.ps1` と環境変数に閉じる)。
 - EffeTune 説明ページの公開前は `python scripts/gen-effetune-docs.py --check` を通す（旧版残存と301の同期を検査。[版更新手順](effetune-integration-plan.md#105-説明ページの版を上げる手順-2026-10-12)）。
