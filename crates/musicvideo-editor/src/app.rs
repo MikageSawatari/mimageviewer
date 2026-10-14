@@ -7,6 +7,8 @@ mod document_intent_tests;
 mod mp4;
 #[cfg(test)]
 mod mp4_tests;
+#[cfg(test)]
+mod parity_tests;
 
 use chrome::{ChromeAction, ToolbarState};
 use document_intent::{DocumentIntent, DocumentIntentState};
@@ -82,6 +84,9 @@ struct PreviewResult {
     layer_lifetimes: HashMap<LayerId, EditTargetLifetime>,
     time_secs: f64,
     image: egui::ColorImage,
+    /// Test observation of the actual worker output, before egui conversion.
+    #[cfg(test)]
+    rgba: Vec<u8>,
     render_ms: f64,
     report: RenderReport,
     analysis_key: Option<AnalysisKey<ResourceRevision>>,
@@ -1797,6 +1802,8 @@ impl MusicVideoLabApp {
                             layer_lifetimes,
                             time_secs,
                             image,
+                            #[cfg(test)]
+                            rgba: frame.rgba,
                             render_ms,
                             report,
                             analysis_key,
@@ -3472,6 +3479,7 @@ mod tests {
             revision,
             time_secs,
             image: egui::ColorImage::filled([160, 90], color),
+            rgba: Vec::new(),
             render_ms: 0.0,
             report: RenderReport::default(),
             analysis_key: None,

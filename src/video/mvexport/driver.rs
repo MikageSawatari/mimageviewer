@@ -144,6 +144,7 @@ pub(super) fn export<I: Clone + Eq>(
         video.input_format,
     )?;
     let mut hasher = request.compute_frame_hash.then(Sha256::new);
+    let mut frame_hashes = request.compute_per_frame_hashes.then(Vec::new);
     let mut render_ms = Vec::with_capacity(plan.frames as usize);
     let mut convert_total_secs = 0.0;
     let mut encode_total_secs = 0.0;
@@ -170,6 +171,11 @@ pub(super) fn export<I: Clone + Eq>(
         if let Some(hasher) = hasher.as_mut() {
             let hash_started = Instant::now();
             hasher.update(&rgba.rgba);
+            frame_hash_secs += hash_started.elapsed().as_secs_f64();
+        }
+        if let Some(hashes) = frame_hashes.as_mut() {
+            let hash_started = Instant::now();
+            hashes.push(Sha256::digest(&rgba.rgba).into());
             frame_hash_secs += hash_started.elapsed().as_secs_f64();
         }
 
@@ -255,6 +261,7 @@ pub(super) fn export<I: Clone + Eq>(
             0.0
         },
         rgba_sha256,
+        rgba_frame_sha256: frame_hashes,
     })
 }
 

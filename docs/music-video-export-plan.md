@@ -1,6 +1,6 @@
 # 音楽ビデオ書き出し (Music Video Export) — 設計計画
 
-Status: P1〜P3j、P4b-1〜4 の実装・非対話検証あり。P4b-4 の独立レビュー、P4c 以降と H3b は未完了。
+Status: P1〜P3j、P4b-1〜4 の実装・非対話検証あり。H3a の契約と H3b の画素一致は非対話検証済み。P4c 以降は未完了。
 2026-10-09 に P4 の方式を「別 exe のエディタ」へ改訂（D10 / D16）、
 画面構成（D14）と文字装飾の初版範囲（D15）を追加。改訂は GPT-6.1 Sol / xhigh の独立レビュー 3 回で
 条件付き ACCEPT（P4a 完了、2026-10-09）。
@@ -12,7 +12,7 @@ Status: P1〜P3j、P4b-1〜4 の実装・非対話検証あり。P4b-4 の独立
 実機目視 = ユーザー。2026-09-07〜09-09 の Astra / Sol 体制の記録は
 [引き継ぎ監査](music-video-handoff-20260907.md) に残す。本書の過去の完了記録は当時の記録であり、
 監査で挙がった未解決事項の解消を意味しない。
-H3 の解析一致、編集済み Project から MP4 への導線、P4 は未完了。
+H3（H3a + H3b）の解析・画素一致は非対話検証済み（下記 H3b 検証記録）。P4 の実機検収・P4c 以降は未完了。
 開発場所 = 別 worktree `C:\home\mimageviewer-musicvideo`（ブランチ `musicvideo`）。
 最終着地点 = **mIV に同梱して配布し、mIV から起動する機能**（ラボ止まりにしない。D10）。
 
@@ -459,6 +459,103 @@ music-core の解析方式・格子・較正・step の演算・書き出し経�
 3 件の対応と対象自動検証は完了。**正式な独立再レビュー／検収は待ち**であり、自己確認を通過判定として記録しない。
 
 独立レビュー 2 回目（`b913d9408`、同日、GPT-6.1 Sol / xhigh）: 3 件とも解消、新しい指摘なし、**ACCEPT**。
+
+#### H3b 検証記録（2026-10-14）
+
+対象は `musicvideo` の `ff0cb6d4bf0e624b2e66fcb268272dd0894d00d0` 上の未コミット差分。
+正本は D1、改訂 D3（H3a）、§7 H3b と [実装 brief](brief-musicvideo-h3b.md)。
+**製品のプレビュー／書き出しに画素不一致は見つからなかった。契約・描画・解析の製品動作は変更していない。**
+検証用の観測口とテストを追加した。実装担当が作業内で別 context の確認を行い、指摘なしとした
+（設計担当が依頼する正式な独立レビューではない。2026-10-14 設計担当注記。正式な独立レビューは別に行う）。
+
+- mvexport の要求へ `compute_per_frame_hashes` を追加した。既存 `compute_frame_hash` と独立した opt-in で、
+  `ExportSummary::rgba_frame_sha256: Option<Vec<[u8; 32]>>` にゼロ始まりのフレーム順で SHA-256 を返す。
+  ハッシュは実 driver の `render_frame` 後、色変換／H.264 符号化前の straight RGBA から計算する。
+  両旗が false の通常出力では配列を確保せず、追加のハッシュを計算しない。計算時間は `frame_hash_secs` に含める。
+  GUI の既定設定／通常 CLI／dev CLI の動作は維持する。
+- editor の `PreviewResult` へ `#[cfg(test)] rgba` を追加し、実 worker が描いた `frame.rgba` を
+  `ColorImage` 作成後に移動して観測する。製品ビルドにはフィールドも追加確保もない。
+  headless harness は `start_calibration_if_needed` → 較正 worker → `poll_calibration` と
+  `start_preview_if_needed` → preview worker → `poll_preview` の実経路を通す。
+  channel の結果を観測後に同じ結果を戻し、通常の revision 判定・採用・texture upload まで確認する。
+- 同じ Project・Assets・PCM `Arc`・`ResourceRevision` を GUI 共通の `snapshot`／`export_snapshot` に渡し、
+  OpenH264 で使い捨て MP4 を実際に書く。独立した描画実装・解析参照の再実装は作らない。
+  圧縮後 MP4 のデコード画素との一致は対象外（H.264 は非可逆）。
+
+fixture は 160×90／60fps、48kHz stereo の合成音源 2.4 秒。画像・日本語文字・時刻・進捗バー・
+スペクトラム・鍵盤、Onset + Envelope、Energy + Average を含める。音源後半を強くし、
+短い出力尺での較正・窓への後続音混入も検出する。出力尺は 1.4／2.4／3.2 秒。
+各レイヤー・各モジュレータの binding・各 smoothing を一つずつ外した別 Project との比較で、
+それぞれが実際に画素に作用することを確認した。設定変更後・復元後は、固定 seek 位置に加え、
+モジュレータ／表示ゲインの変更で実際に画素が変わった番号も要求する。
+
+追加テスト（`crates/musicvideo-editor/src/app/parity_tests.rs`、10 件）:
+
+| テスト（共通 prefix `h3b_`） | 検査 | 失敗確認の変異 |
+| --- | --- | --- |
+| `forward_every_frame_matches_export` | 0..143 の毎フレーム前進 | 旧時刻解析 |
+| `dropped_frames_and_boundary_positions_match_export` | 2/5/3/4 枚おきの前進、境界の直前／一致／直後、60fps の n=123 | 旧時刻解析、シーンを再生位置で評価 |
+| `backward_far_direct_checkpoint_and_repeat_match_export` | 冷えた状態から末尾へ直接 seek、前後 seek、checkpoint 59/119、同じ番号の反復 | 旧時刻解析 |
+| `settings_change_and_restore_match_each_snapshot_export` | モジュレータだけの変更、表示ゲインだけの変更、元 Project へ復元。同じ timeline owner を維持 | 旧時刻解析、preview gain 無視、modulator smoothing 変更無視 |
+| `output_shorter_than_audio_matches_export` | 1.4 秒、先頭／末尾／中間の seek | 旧時刻解析、較正を音源全尺へ、出力 PCM view 除去 |
+| `output_longer_than_audio_matches_export_with_silence` | 3.2 秒、音源末尾前後／延長した無音／出力末尾 | 旧時刻解析、出力 PCM view 除去 |
+| `output_equal_to_audio_matches_export` | 2.4 秒、先頭／末尾／中間 | 旧時刻解析 |
+| `hash_flags_are_opt_in_and_independent` | 通常／列 hash のみ／frame hash のみ／両方、件数と既存列 hash の維持 | frame hash を無条件に計算 |
+| `fixture_features_each_affect_visible_pixels` | 画像／進捗／時刻／スペクトラム／鍵盤／文字、2 modulator と smoothing の可視性 | Image の未使用 FillBrightness へ Average binding を変更 |
+| `preview_texture_only_converts_rgba_and_downscales` | 下記 D1 の実表示経路 | 旧時刻解析、UV 左右反転、描画中の texture 再書換 |
+
+D1 は全要求で RGBA 各 pixel → `Color32::from_rgba_unmultiplied` → worker の `ColorImage` →
+採用 texture delta の全 pixel を検査する。最終 RGBA はラスタライザの黒不透明 canvas への合成結果で alpha=255。
+非不透明な出力の premultiplication を検証したとは扱わない。
+専用テストは実 `app.draw_preview` を小さい headless 領域へ描き、対象 mesh が一つ、WHITE tint、
+縦横比を保つ縮小、UV 全域と各頂点の座標対応、preview texture の書換なしを検査する。
+書換検査は `ctx.run` が返す `FullOutput.textures_delta` を使い、font atlas 更新は除外する。
+
+変異の記録は `target/h3b-verification/`。10 種類すべてコンパイル成功後に対象テスト失敗（exit 101）を検出し、
+新規 10 件すべてに少なくとも一つの失敗確認がある。`mutations.json` にコマンド・失敗名・復元 source SHA-256 を記録。
+各変異でソースの元 bytes を `finally` で復元し、通常コードで以下の gate が成功した。
+
+| 変異 | ログ（同ディレクトリ） |
+| --- | --- |
+| preview を旧 `SpectrumSource::full_frame_at` へ戻す | `mutation-legacy-time-analysis.log`（8 件失敗） |
+| metadata は `time(n)` のまま、scene だけ再生位置で評価 | `mutation-scene-transport-time.log`（画素 hash で失敗） |
+| 較正入力を音源全尺へ戻す | `mutation-calibration-full-source.log` |
+| preview の PCM view を音源実長へ戻す | `mutation-preview-without-output-view.log`（短尺／長尺が失敗） |
+| preview key で表示ゲインを 0 にする | `mutation-ignore-preview-display-gain.log`（変更後の frame 0 で画素不一致） |
+| Average binding を画素に届かない Image FillBrightness へ | `mutation-vacuous-average-fixture.log` |
+| UV を左右反転 | `mutation-texture-uv-flip.log` |
+| preview 描画中に同じ大きさの黒 texture へ差替 | `mutation-texture-rewrite-during-draw.log` |
+| frame hash の opt-in を外す | `mutation-hash-unconditionally.log` |
+| モジュレータ編集後も旧 Average smoothing を preview に使用 | `mutation-ignore-modulator-smoothing-edit.log`（変更後の frame 82 で画素不一致） |
+
+初回の gain 無視変異は固定 seek 3 点で画素が飽和し通ってしまった（`initial-undetected-gain.log`）。
+列全体の可視差だけで要求位置の感度を保証できないため、差がある番号への要求を追加し失敗を確認した。
+独立レビューで Image FillBrightness binding、UV の頂点対応、`ctx.run` 後の delta 観測先も補強した。
+いずれもテスト感度／観測口の問題で、製品の preview/export 不一致ではない。
+
+指定 gate（すべて `MSBUILDDISABLENODEREUSE=1`、test/dev profile、exit 0）:
+
+| コマンド | 結果／ログ |
+| --- | --- |
+| `cargo test -p musicvideo-editor` | 153 passed（既存 143 + 新規 10）、`editor.log` |
+| `cargo check -p musicvideo-editor --features dev-tools --bins` | 成功、`dev-tools.log`。test-only 観測口のない製品 build も確認 |
+| `cargo test -p musicvideo-core -p musicvideo-ui` | core 115 + 経路 2、UI 124 passed、`core-ui.log` |
+| `cargo test -p mimageviewer --lib mvexport` | 15 passed、`mvexport.log` |
+| `cargo fmt --check` | 成功、`format.log` |
+| `python scripts/check_ui_glyphs.py` | 危険 glyph 0、`glyphs.log` |
+
+指定範囲は **409 passed / 0 failed / 0 ignored**。`gates.json` に実行条件・時間・終了値を保存。
+最後にモジュレータの差番号への追加要求だけを補強し、影響する設定変更テスト 1 件を再実行して成功
+（`settings-final.log`、重複分は 409 件へ加算しない）。他のテスト／製品コードの有効な結果を再利用する。
+要求型の変更が通常 CLI にも届くため `cargo check -p mimageviewer --features dev-tools --bin mvexport_cli` も
+追加実行して成功（`cli-check.log`）。最終 `cargo fmt --check` も成功（`format-final.log`）。
+追加検証のコマンド・終了値は `additional.json`、変異 runner は `run.py`／`finish.py` に保存する。
+
+検証範囲は brief 指定の preview 開始 → worker → 結果採用の画素と、GUI 共通 lib の書き出し。
+headless fixture の `audio_player` は None。音声デバイス／clock／通常 transport の実サンプル丸めや
+音源末尾での seek clamp の実機検収を済ませたとは扱わない。延長した出力尺の番号は preview worker へ直接要求する。
+正本との仕様上の相違はない。描き手・解析器・通常出力の動作を変えない検証段なので、確認用 core binary は作らない。
+本体アプリ／エディタ GUI の起動とコミットなし。開始時からの未追跡 `out.mp4` は操作していない。
 
 ### D4. ラスタライザは CPU から始める（`comic-core` を土台にする）
 
@@ -2729,7 +2826,8 @@ frame n → t = n/fps → evaluate → rasterize(CPU, rayon) → RGBA→NV12/YUV
 | **T1** | 文字装飾（D15）: comic-core既存装飾をText / TimeText / Lyricsに共通接続 | 初版fce65bb15、巨大確保・昇格・clip修正f54b6e5b6、準備共有・旧注釈22hash固定338a38899は条件付きACCEPT。保持64MiB = 静的RGBA24 / 補間RGBA8 / 準備32、1焼成RGBA8MiB以下。straight RGBA修正は検収採用済み。今回P3: eviction前後・再準備のglyph RGBA比較、旧非空判定への復帰変異も検出。計測器をscripts/musicvideo/t1-measure.pyへ保存し、前/中のCPU・新規PID・終了後CPU・短命PID通知を監視、取得不可も棄却。16ケース各3回＋5分全補間/混在、3枠保持とOSメモリ時系列・合否目安・所要時間をJSON/表へ。core104 / UI121 / lab75 / Python15、計315件成功、計測feature付きeviction1件も成功。既存4hash・fmt維持、release headless例build成功。**P2正式性能計測は利用者指定で今回は未実施、後日利用者が python scripts/musicvideo/t1-measure.py を実行**。smokeは競合/WMI拒否で不採用。初回4.274ms等を現行の採用値にしない。今回comic-core変更・commit・アプリ起動・build-devなし。手順・旧経路未測定理由はD15参照 |
 | **I1 段 2a / 2b 実装・自動検証済み／実機確認待ち** | IME 補正の共有（D10「設定・入力」）: 本体 `ime_focus` の egui 依存部分（入力補正 plugin・single-line helper）を共有クレートへ挙動不変で切り出し、本体とエディタのホストが policy を登録する | **段 2a（2026-10-09、`367f9c9d3`・独立実装レビュー ACCEPT）**: `egui-ime` と本体 facade、既存呼び出し元を維持。既存 23 件は共有 16 / 本体 7 に配置、raw 禁止・adapter を追加（共有 17 / 本体 12 passed）。full gate 12,681 passed / 58 ignored、fmt / glyph、通常 profile の確認用 build 成功。**段 2b（同日、未コミット）**: 全域 Tab policy を挙動不変で共有化、本体 facade・既存 5 テストを維持。エディタの登録入口・5 欄 helper・Undo gate・raw 禁止を実装、歌詞 buffer / widget ID / native Undo と Hz DragValue を維持。利用者承認でモジュレータ見出しを不変 ID に固定し、同型箇所も調査。追加 13 テスト、UI 117 / ラボ 75 / core 80 / 共有 17 passed、既存 L1〜L3 全件維持、変異 6 件を検出。本体 Tab / IME / 関連・snapshot も通過。full gate **12,694 passed / 58 ignored / 0 failed**、fmt / glyph / 依存検査、ラボ release build 成功。独立実装レビュー **ACCEPT、指摘なし**。build-dev 再実行・コミット・アプリ起動なし。詳細は D10「I1 設計」§7・§8。**実装・自動検証は完了、実機確認・最終受け入れは未完了**。本体の確認用 exe は更新せず、ラボの確認用 exe は `target/release/musicvideo_lab.exe` |
 | **H3a** ✅ | 解析契約の確定と実装: 共通格子／PCM view／解析タイムライン（チェックポイント・型付き key）／較正入力を、プレビュー・書き出し・PNG・ベンチマークで共有 | **完了**（2026-10-14、`b473603cc` + `b913d9408`）。設計は実装前レビュー 3 回目で ACCEPT、実装は独立レビュー 1 回目 REVISE（P2 2・P3 1）を修正し 2 回目で ACCEPT。A6 は設計担当判断で 4 分位置 約 0.7 秒以内（並列）を採用、生の値のキャッシュなし。解析を使う書き出しの RGBA ハッシュは予定どおり変化、無変調ハッシュ維持。詳細は D3 の H3a 実装記録。画素の一致の確認は H3b（P4b 後） |
-| **H3b** | 一致の検証（P4b 接続後） | プレビューで表示したフレームが、同じ時刻の書き出しフレームと一致する: 表示フレームの欠落、前後への seek、直接 seek、音源より短い / 長い出力尺。これが通るまで H3 を完了扱いにしない |
+| **H3b** 非対話検証完了・独立レビュー ACCEPT | 一致の検証（P4b 接続後） | **2026-10-14、HEAD `ff0cb6d4b` 上の未コミット差分**: 実 preview worker／採用 texture と共通 snapshot export の RGBA が一致。毎 frame、欠落／境界、前後／直接 seek、checkpoint／反復、設定変更／復元、短尺／長尺／同尺。新規 10 件すべて変異失敗確認、指定 gate 409 passed。不一致なし・製品動作変更なし。詳細は D3 の H3b 検証記録 |
+| **H3（H3a + H3b）** 非対話検証完了 | 解析の契約と製品画素の一致 | H3a の共有格子／view／timeline／較正に、H3b の実 preview と snapshot export の画素検証を接続。実機 GUI／音声 transport の検収とは区別する |
 | **P4a** ✅ | 方式の設計確定: 本書 D10 / D14〜D16 の独立レビュー | GPT-6.1 Sol / xhigh の設計レビューで blocking 指摘なし。**完了**（2026-10-09）: 3 回目で条件付き ACCEPT（残った P3 の文言は反映済み）。runtime 競合の割り切りはユーザー判断で確定 |
 | **P4b** 実装完了・実機確認待ち（P4b-1〜4 すべて独立レビュー ACCEPT、2026-10-14。上書きの競合は利用者が許容。5 分 1080p60 は完走済み・速度は参考値で静かな環境での再計測が残る。音・GUI の実機確認は利用者へ依頼） | ホストの製品化（D16。段の分け方は D16 の「P4b の設計」）: ラボを `crates/musicvideo-editor` へ移し、FFmpeg デコードへ統一、スナップショット入力の MP4 書き出し（モーダル・進捗・キャンセル）、未保存の編集の確認、音声スレッドが stream を所有する再生と f32 以外の出力形式対応 | **P4b-3（2026-10-14、未コミット）**: 指定ゲート 365 passed、追加 18 件すべての変異失敗確認、既存 editor 101 件維持。共通 snapshot／解析／較正／PCM view AAC／原子的公開／モーダル終端を接続し、製品 editor・通常 CLI・dev CLI の release build 成功。編集済み 5 分 1080p60 を dev CLI で 18,000 frames 完走、184.441 秒／1.6265x（背景 Codex 4 件あり、参考値）。詳細は D16 の P4b-3 記録。P4b-2 の実機の音・GUI・H3b は未確認。**P4b-4（2026-10-14、未コミット）**: session 所属の単一意図、歌詞の先行解決、保存後のフレーム末尾の再判定、先行読込の receiver 退役、新規、CancelClose／承認済み Close と書き出し中止の終端待ちを実装。指定ゲート **396 passed**、追加 **31 件**すべて変異失敗確認。初回レビュー REVISE の P2／P3 に対応し、LRC モーダルの実クリック回帰、Project／保存完了の両順序、歌詞取消と同フレームの旧完了を検査。今回 3 件追加・既存 1 件補強、各テストの変異失敗確認、指定テスト **399 passed**。詳細は D16 の P4b-4 記録。修正後の独立レビュー・実機確認・H3b は未完了 |
 | **P4c** | 起動引数と診断（D10）: `--audio` / `--project` / `--data-dir`、最近使ったプロジェクト、ログ・panic ログ、引数エラーの画面表示、runtime の shared lease と取得失敗の表示 | 引数解析の単体テスト。最近使った一覧: 壊れた JSON・無いファイル・上限・取消 / 失敗 / 破棄された読込を入れない・一覧の書込失敗で保存成功が覆らない。`--data-dir` 無しで最近一覧とファイルログを永続化しないこと。mIV の設定・DB・ログに触れないこと |

@@ -127,6 +127,7 @@ fn run() -> Result<(), String> {
             encoder: args.encoder,
             video_bitrate_bps: args.video_bitrate_bps,
             compute_frame_hash: args.frame_hash,
+            compute_per_frame_hashes: false,
         },
         &progress,
         &cancel,

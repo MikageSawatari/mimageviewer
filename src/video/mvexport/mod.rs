@@ -89,6 +89,9 @@ pub struct MusicVideoExportRequest<I> {
     pub replace_existing: bool,
     /// 検証時だけ RGBA フレーム列の SHA-256 を計算する。
     pub compute_frame_hash: bool,
+    /// Verification only: SHA-256 of each straight RGBA frame, indexed from zero.
+    /// Independent of the hash of the complete frame sequence.
+    pub compute_per_frame_hashes: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -106,13 +109,16 @@ pub struct ExportSummary {
     /// `av_write_trailer` による MP4 確定と `+faststart` の moov 移動。
     pub faststart_secs: f64,
     pub rename_secs: f64,
-    /// `compute_frame_hash` が有効な検証時だけ発生する RGBA SHA-256 の計算。
+    /// Either opt-in RGBA hash flag's computation time; zero in ordinary exports.
     pub frame_hash_secs: f64,
     /// 上記区間とフレーム単位の 3 区間に含まれない初期化等。
     pub other_secs: f64,
     pub wall_secs: f64,
     pub realtime_ratio: f64,
     pub rgba_sha256: Option<String>,
+    /// Straight RGBA hashes before color conversion/encoding, in frame order.
+    /// Present only when `compute_per_frame_hashes` was requested.
+    pub rgba_frame_sha256: Option<Vec<[u8; 32]>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

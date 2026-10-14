@@ -50,6 +50,7 @@ fn p4b3_snapshot_shares_pcm_all_project_images_fonts_and_fixes_settings() {
         encoder: mimageviewer::video::mvexport::EncoderPreference::Qsv,
         video_bitrate_bps: 9_000_000,
         compute_frame_hash: true,
+        compute_per_frame_hashes: false,
     };
     let request = snapshot(
         &app.project,

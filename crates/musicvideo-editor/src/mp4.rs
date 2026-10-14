@@ -17,6 +17,7 @@ pub(crate) struct ExportSettings {
     pub encoder: EncoderPreference,
     pub video_bitrate_bps: u32,
     pub compute_frame_hash: bool,
+    pub compute_per_frame_hashes: bool,
 }
 
 impl Default for ExportSettings {
@@ -25,6 +26,7 @@ impl Default for ExportSettings {
             encoder: EncoderPreference::Auto,
             video_bitrate_bps: 12_000_000,
             compute_frame_hash: false,
+            compute_per_frame_hashes: false,
         }
     }
 }
@@ -54,6 +56,7 @@ pub(crate) fn snapshot(
         video_bitrate_bps: settings.video_bitrate_bps,
         replace_existing,
         compute_frame_hash: settings.compute_frame_hash,
+        compute_per_frame_hashes: settings.compute_per_frame_hashes,
     }
 }
 

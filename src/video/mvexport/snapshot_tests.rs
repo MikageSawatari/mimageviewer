@@ -97,6 +97,7 @@ fn request<I>(
         video_bitrate_bps: 1_000_000,
         replace_existing: false,
         compute_frame_hash: true,
+        compute_per_frame_hashes: false,
     }
 }
 
