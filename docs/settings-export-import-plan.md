@@ -115,7 +115,7 @@ import 専用の live rebuild や detached 述語・viewport 経路を新設し�
 | 除く | `video_seek_strip_span`, `video_autoplay`, `video_autoplay_mode`, `video_continuous_mode`, `video_muted`, `video_adjustments`, `video_scale_filter`, `video_downscale_smoothing_percent`, `video_anime4k_budget` | 環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier。各定義コメントと overwrite_non_preferences_from (settings.rs:9692) が根拠。 | `src/settings.rs:5467` |
 | 除く | `video_anime4k_measurement`, `video_preset_slots`, `video_tile_columns`, `video_in_window_mode`, `detached_viewer_enabled`, `vst3_gui_visible`, `vst3_video_compact`, `audio_normalize_enabled`, `audio_normalize_target_lufs_milli` | 環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier。各定義コメントと overwrite_non_preferences_from (settings.rs:9692) が根拠。 | `src/settings.rs:5544` |
 
-現在の内訳 (§1.342・§1.345・§1.365とv4.5.0 masterの結合後、音響調整のタスクバー表示追加、2026-10-12): 出す144 / 除く314 / 合計458フィールド（`all_settings_fields_are_classified` の確認値）。互換フィールドをまとめるため転送ファイルの項目数は142。音声の表示マーク `audio_thumbnail_indicator` は plain / plain で追加し、Unknown の import は採用しない。共通 sidecar 設定は保存名 `video_thumb_use_sidecar_image` を維持する。旧441 / 131 / 310、転送129および位置復元追加前の456 / 143 / 313、転送141という内訳は当時の記録。§1.333追加watched集合は個人の視聴履歴・pathとして除外する。§1.335の起動復元レコードは、最後に明示した利用者の一覧とその cursor を対で持つため利用データとして除外する。転送や Preferences OK で移行済み record を旧 `last_folder` から作り直さず、live record を保持する。表示・復元の実装と自動検証は完了、実機確認待ち。結果は [設計 §10](startup-restore-target-plan.md#10-phase-2-の安全な区切りと-viewport-完了経路への追加合意事項) に集約する。調査時点の432という記録は履歴として保持する。
+現在の内訳 (§1.342・§1.345・§1.365とv4.5.0 masterの結合後、音響調整のタスクバー表示と音楽配色の結合、2026-10-14): 出す144 / 除く315 / 合計459フィールド（`all_settings_fields_are_classified` の確認値）。互換フィールドをまとめるため転送ファイルの項目数は142。音声の表示マーク `audio_thumbnail_indicator` は plain / plain で追加し、Unknown の import は採用しない。共通 sidecar 設定は保存名 `video_thumb_use_sidecar_image` を維持する。旧441 / 131 / 310、転送129および位置復元追加前の456 / 143 / 313、転送141という内訳は当時の記録。§1.333追加watched集合は個人の視聴履歴・pathとして除外する。§1.335の起動復元レコードは、最後に明示した利用者の一覧とその cursor を対で持つため利用データとして除外する。転送や Preferences OK で移行済み record を旧 `last_folder` から作り直さず、live record を保持する。表示・復元の実装と自動検証は完了、実機確認待ち。結果は [設計 §10](startup-restore-target-plan.md#10-phase-2-の安全な区切りと-viewport-完了経路への追加合意事項) に集約する。調査時点の432という記録は履歴として保持する。
 
 ### 2.2 実装時の唯一の policy と強制テスト
 
@@ -127,7 +127,8 @@ DB migration は追加しない。当時の内訳は全457フィールドのう�
 2026-10-12 音響調整のタスクバー表示: `effetune_show_in_taskbar` は既定 ON の
 PC 固有設定として除外する。既存 EffeTune の自動表示・最小化設定と同じく、導入状態と窓の運用に
 依存し、書き出さず、取り込みでも移行先の値を保持する。portable でも Settings の互換値を保持し、
-UI と検索 anchor には出さない。現在の分類は全458 / 対象144 / 除外314、wire142項目。
+UI と検索 anchor には出さない。音楽ビューの音名配色 `music_note_color_scheme` も環境設定外の
+表示状態として除外し、取り込み先の最新値を保持する。両追加の結合後は全459 / 対象144 / 除外315、wire142項目。
 
 `src/settings_transfer.rs` に、全フィールドを一度ずつ記す policy macro を置く。
 各行は `export(field, wire_key, validator)` または `exclude(field, reason)`。
@@ -820,7 +821,7 @@ core check / settings_restore / ui_snapshot / glyph の成功を再利用した�
 転送キー欠落は転送先保持、不正・小数・範囲外はfield拒否。共通一値でfavoriteにはコピーしない。
 `fullscreen_specified_scale`の各軸はenabledとvalue（単位・数値）を必須とし、OFF中も検証・転送する。
 未リリースOption形を破壊的に改訂しmigrationなし。favorite外側の欠落は継承のまま保持する。
-§1.365・§1.364結合後、音響調整のタスクバー表示追加（2026-10-12）の現行分類は458 / 144 / 314、互換項目をまとめたwireは142。共通値転送と専用値保持の回帰を追加する。
+§1.365・§1.364結合後、音響調整のタスクバー表示と音楽配色の結合（2026-10-14）の現行分類は459 / 144 / 315、互換項目をまとめたwireは142。共通値転送と専用値保持の回帰を追加する。
 
 ### §1.242 G2 part B結合時の再確認（2026-10-11）
 

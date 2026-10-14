@@ -608,6 +608,7 @@ preferences_policy! {
         gamepad_enabled => "既存の操作カスタマイズ共有が正本";
         margin_fit_enabled => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         ui_scale_factor => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
+        music_note_color_scheme => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         ui_font => "フォント / ツール / LUT / Susie / VST の実ファイル・導入状態・任意 state に依存";
         first_setup_completed => "初回/学習/通知/保存版の内部記録";
         toolbar_cols_items => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -1906,7 +1907,7 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 458);
+        assert_eq!(entries.len(), 459);
         assert_eq!(
             entries
                 .iter()
@@ -1919,7 +1920,7 @@ mod tests {
                 .iter()
                 .filter(|(_, reason)| reason.is_some())
                 .count(),
-            314
+            315
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -2036,6 +2037,16 @@ mod tests {
         let exported = export_preferences(&source).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);
         let mut destination = private_destination();
+        assert_ne!(
+            source.music_note_color_scheme,
+            destination.music_note_color_scheme
+        );
+        let exported_document: Value = serde_json::from_str(&exported.json).unwrap();
+        assert!(
+            exported_document["preferences"]
+                .get("music_note_color_scheme")
+                .is_none()
+        );
         // The overlay's common projection is transferable. Align it before this
         // generic exclusion check, whose full runtime-owner equality stays strict.
         // The focused specified-scale test covers importing a changed common value.
@@ -2083,6 +2094,7 @@ mod tests {
     fn private_destination() -> Settings {
         let sentinel = r"C:\Users\private-alice\SECRET_PIN_184729";
         let mut settings = Settings::default();
+        settings.music_note_color_scheme = crate::music_note_color::MusicNoteColorScheme::Chromatic;
         settings.last_folder = Some(sentinel.into());
         settings.startup_list_restore = Some(crate::settings::StartupListRestore::V1 {
             target: crate::settings::StartupListTarget::PhysicalList {

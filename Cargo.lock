@@ -4288,6 +4288,7 @@ version = "0.1.0"
 dependencies = [
  "rustfft",
  "serde",
+ "sha2",
 ]
 
 [[package]]
