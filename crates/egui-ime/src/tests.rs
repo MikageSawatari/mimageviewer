@@ -261,8 +261,8 @@ fn composing_disabled_inserts_one_empty_preedit_before_disabled() {
 }
 
 /// The cancellation sequence captured from `[ime-raw]` on 2026-08-01, with
-/// the Process press now excluded by egui-winit and the Esc release preserved:
-/// `Disabled, Disabled, Commit(""), Disabled, Disabled, EscRelease`.
+/// the Process press and its physical Esc release both excluded by egui-winit:
+/// `Disabled, Disabled, Commit(""), Disabled, Disabled`.
 ///
 /// The empty commit is a cancellation, not a confirmation: egui's commit
 /// handler skips `delete_selected` for an empty prediction, so without the
@@ -281,7 +281,6 @@ fn windows_escape_cancel_sequence_clears_the_preedit() {
             egui::Event::Ime(egui::ImeEvent::Commit(String::new())),
             egui::Event::Ime(egui::ImeEvent::Disabled),
             egui::Event::Ime(egui::ImeEvent::Disabled),
-            key_event_state(egui::Key::Escape, false),
         ],
     ));
     let _ = ime_input_active(&ctx);
@@ -297,16 +296,10 @@ fn windows_escape_cancel_sequence_clears_the_preedit() {
                 event,
                 egui::Event::Key {
                     key: egui::Key::Escape,
-                    pressed: true,
                     ..
                 }
             )),
             "the cancelling Esc must not reach egui focus handling"
-        );
-        assert!(
-            input
-                .events
-                .contains(&key_event_state(egui::Key::Escape, false))
         );
         let first_ime = input
             .events
@@ -418,22 +411,17 @@ fn raw_multiline_text_edit_keeps_focus_and_cancels_preedit_across_delayed_disabl
     assert_eq!(body, "あ");
     assert_eq!(ctx.memory(|memory| memory.focused()), Some(field_id));
 
-    let mut escape_release_seen = false;
-    let _ = ctx.run(
-        viewport_raw_input(
-            egui::ViewportId::ROOT,
-            vec![key_event_state(egui::Key::Escape, false)],
-        ),
-        |ctx| {
-            escape_release_seen = ctx.input(|input| {
-                input
-                    .events
-                    .contains(&key_event_state(egui::Key::Escape, false))
-            });
-            draw(ctx, &mut body, &mut request_focus);
-        },
-    );
-    assert!(escape_release_seen);
+    // Neither half of the IME-processed Escape pair reaches the winit event queue.
+    let _ = ctx.run(viewport_raw_input(egui::ViewportId::ROOT, vec![]), |ctx| {
+        assert!(!ctx.input(|input| input.events.iter().any(|event| matches!(
+            event,
+            egui::Event::Key {
+                key: egui::Key::Escape,
+                ..
+            }
+        ))));
+        draw(ctx, &mut body, &mut request_focus);
+    });
     assert_eq!(ctx.memory(|memory| memory.focused()), Some(field_id));
 
     let mut cancel_preedit_count = 0;
@@ -604,10 +592,7 @@ fn ime_candidate_tab_keeps_the_editing_field_focus() {
     );
     let _ = ctx.run(
         egui::RawInput {
-            events: vec![
-                egui::Event::Ime(egui::ImeEvent::Preedit("亜".to_owned())),
-                key_event_state(egui::Key::Tab, false),
-            ],
+            events: vec![egui::Event::Ime(egui::ImeEvent::Preedit("亜".to_owned()))],
             ..Default::default()
         },
         |ctx| {
@@ -855,7 +840,6 @@ fn ime_enter_commit_and_escape_cancel_keep_the_editing_field_focus() {
                 events: vec![
                     terminal_ime_event,
                     egui::Event::Ime(egui::ImeEvent::Disabled),
-                    key_event_state(key, false),
                 ],
                 ..Default::default()
             },

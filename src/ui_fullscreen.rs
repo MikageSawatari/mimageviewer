@@ -84588,13 +84588,12 @@ mod specified_scale_consumer_tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         };
-        // The observed egui-winit sequence for commit. Process press is suppressed at the bridge;
-        // empty native Preedit arrives as Disabled, and the physical Enter release still arrives.
+        // egui-winit suppresses both the Process press and its physical release;
+        // empty native Preedit arrives as Disabled.
         let mut commit = vec![
             egui::Event::Ime(egui::ImeEvent::Disabled),
             egui::Event::Ime(egui::ImeEvent::Commit("日本".into())),
             egui::Event::Ime(egui::ImeEvent::Disabled),
-            enter(false),
         ];
         if same_pass {
             commit.push(enter(true));
@@ -84732,7 +84731,7 @@ mod specified_scale_consumer_tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         };
-        // The IME consumes the press. egui-winit forwards only IME events and the release.
+        // egui-winit forwards only IME events for the processed press/release pair.
         let mut end_events = if !with_ime {
             vec![key_event(false)]
         } else if key == egui::Key::Enter {
@@ -84740,7 +84739,6 @@ mod specified_scale_consumer_tests {
                 egui::Event::Ime(egui::ImeEvent::Disabled),
                 egui::Event::Ime(egui::ImeEvent::Commit("125".into())),
                 egui::Event::Ime(egui::ImeEvent::Disabled),
-                key_event(false),
             ]
         } else {
             vec![
@@ -84748,7 +84746,6 @@ mod specified_scale_consumer_tests {
                 egui::Event::Ime(egui::ImeEvent::Disabled),
                 egui::Event::Ime(egui::ImeEvent::Commit(String::new())),
                 egui::Event::Ime(egui::ImeEvent::Disabled),
-                key_event(false),
             ]
         };
         if same_pass {

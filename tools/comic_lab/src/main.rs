@@ -8097,13 +8097,12 @@ mod sample_tests {
             );
             assert_eq!(tb.text, "あ");
 
-            // egui-winit excludes the IME-handled Process press, preserving
-            // the Commit / Disabled sequence and the actual Enter release.
+            // egui-winit excludes the Process press and its physical release,
+            // preserving only the Commit / Disabled sequence.
             let mut events = vec![
                 egui::Event::Ime(egui::ImeEvent::Disabled),
                 egui::Event::Ime(egui::ImeEvent::Commit("あ".to_owned())),
                 egui::Event::Ime(egui::ImeEvent::Disabled),
-                enter_event(false),
             ];
             if same_pass {
                 events.push(enter_event(true));

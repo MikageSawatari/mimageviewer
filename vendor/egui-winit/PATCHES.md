@@ -4,25 +4,35 @@ I2 段 1（2026-10-14）: IME が処理したキーの到着を調べる診断�
 段 1 はキー・IME の変換、egui イベントの生成・消費、EventResponse を変更しない。
 I2 段 2a（同日）: 実機記録に基づき、IME 処理済みキーの press を遮断する挙動変更を追加。
 
-## 現在の修正：本家 0.34.0 #7967 と同じ（2026-10-14）
+## 現在の修正：本家 0.34.0 #7967 を基にした修正（2026-10-14）
 
 出典は [PR #7967](https://github.com/emilk/egui/pull/7967) と
 [egui-winit 0.34.0 の実装](https://raw.githubusercontent.com/emilk/egui/0.34.0/crates/egui-winit/src/lib.rs)
-（`try_on_ime_processed_keyboard_input`）。**egui 更新時はこの差分ごと消す**：
-`vendor/egui-winit`、workspace exclude と path patch を削除し、本家へ戻す。
+（`try_on_ime_processed_keyboard_input`）。独立レビューの P2 を受け、設計 lead は本家との一致より
+「egui が見ていない press の release も渡さない」整合性を優先した。
 
 Windows の `allow_ime` が true の場合だけ、logical Process を遮断して
 `State::pressed_processed_physical_keys: HashSet<PhysicalKey>` に記録する。
 対応する release は logical が元のキーに戻るため、同集合から physical を remove して遮断する。
-allow_ime=false の入力は集合を変更せず渡し、Process press のなかった physical の release も渡す。
-本家と同じ条件順序で、追加の focus-reset / 期限は設けない。状態は State（viewport）ごとに所有する。
+本家との差分は次の 2 点のみ。状態は State（viewport）ごとに所有し、期限は設けない。
+
+| 本家との差分 | 理由 | egui 更新時の確認 |
+| --- | --- | --- |
+| 記録済み physical の release は allow_ime 判定より先に必ず remove して遮断する | allow_ime=false 中に release が届いても記録を残さず、次の通常 release を誤って捨てて keys_down を残すことを防ぐ | true の Process press → false の release → true の通常 press/release を配送し、記録が空、keys_down が解除され、次の press が repeat にならないこと |
+| WindowEvent::Focused(false) で当該 State の集合を空にする | focus 喪失中の release が別窓へ届いても、古い記録で復帰後の通常 release を捨てない | focus 喪失・復帰後の通常 press/release と sibling State の記録が独立すること |
+
+記録のない release は従来どおり渡す。allow_ime=false の Process press の扱いも本家どおり。
 遮断時の EventResponse も本家同様 repaint=false / consumed=wants_keyboard_input とする。
 Ime 変換と通常 Key / Text / clipboard producer、秘匿 trace は保持する。
 
+egui 更新時は上記 2 点が本家で解決済みか実装と回帰テストで確認する。未解決なら差分を維持する。
+解決済みで診断 trace も不要になった時点で `vendor/egui-winit`、workspace exclude と path patch を削除し、本家へ戻す。
+
 KeyEvent は private field を持つため、その公開部品を受ける同名の状態遷移 helper に判定を置く。
 `append_keyboard_input` はこの判定を全 producer の前で呼び、State と配送テストが同じ経路を通る。
-旧純関数・配送テストを対応 release の遮断へ更新し、allow_ime=false、非対応 release、repeat、
-複数 physical と sibling 状態の分離を追加検証する。移植全体の記録は
+純関数・配送テストに加え、ウィンドウを作らない State の同じ入力 / focus 処理を検証する。
+allow_ime の切り替え、focus 喪失、非対応 release、repeat、複数 physical と sibling 状態の分離を固定する。
+winit 経路のホスト / 共有 crate fixture は Process press とその release の両方を含めない。移植全体の記録は
 [IME 計画](../../docs/ime-process-keys-plan.md)。
 
 ## 出典・取り込み

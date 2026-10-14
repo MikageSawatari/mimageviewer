@@ -113,7 +113,7 @@ pub struct State {
     ime_rect_px: Option<egui::Rect>,
 
     /// Physical keys whose IME-processed release must also be filtered.
-    /// Matches upstream egui-winit 0.34.0 (#7967).
+    /// Based on upstream #7967; releases are tracked across IME permission changes.
     #[cfg(target_os = "windows")]
     pressed_processed_physical_keys: HashSet<winit::keyboard::PhysicalKey>,
 }
@@ -454,10 +454,7 @@ impl State {
                     *focused
                 };
 
-                self.egui_input.focused = focused;
-                self.egui_input
-                    .events
-                    .push(egui::Event::WindowFocused(focused));
+                self.on_focused(focused);
                 EventResponse {
                     repaint: true,
                     consumed: false,
@@ -790,19 +787,49 @@ impl State {
     }
 
     fn on_keyboard_input(&mut self, event: &winit::event::KeyEvent) -> bool {
-        append_keyboard_input(
-            &mut self.egui_input,
+        self.on_keyboard_input_parts(
             &event.logical_key,
             event.physical_key,
             event.text.as_ref().map(|text| text.as_str()),
             event.state,
             event.repeat,
+        )
+    }
+
+    // KeyEvent has private platform fields; keep State's delivery path testable without a window.
+    fn on_keyboard_input_parts(
+        &mut self,
+        logical_key: &winit::keyboard::Key,
+        physical_key: winit::keyboard::PhysicalKey,
+        text: Option<&str>,
+        state: ElementState,
+        repeat: bool,
+    ) -> bool {
+        append_keyboard_input(
+            &mut self.egui_input,
+            logical_key,
+            physical_key,
+            text,
+            state,
+            repeat,
             #[cfg(target_os = "windows")]
             self.allow_ime,
             #[cfg(target_os = "windows")]
             &mut self.pressed_processed_physical_keys,
             || self.clipboard.get(),
         )
+    }
+
+    fn on_focused(&mut self, focused: bool) {
+        #[cfg(target_os = "windows")]
+        if !focused {
+            // Releases may go to another window while unfocused.
+            self.pressed_processed_physical_keys.clear();
+        }
+        self.egui_input.focused = focused;
+        self.egui_input
+            .events
+            .push(egui::Event::WindowFocused(focused));
     }
 
     /// Call with the output given by `egui`.
@@ -1121,8 +1148,8 @@ fn append_keyboard_input(
     true
 }
 
-/// The upstream 0.34.0 Windows predicate and state transition, factored over
-/// KeyEvent's public parts so delivery tests use the production path.
+/// Based on upstream 0.34.0, with recorded releases removed regardless of allow_ime.
+/// KeyEvent's public parts let delivery tests use the production path.
 /// https://github.com/emilk/egui/pull/7967
 #[cfg(target_os = "windows")]
 fn try_on_ime_processed_keyboard_input(
@@ -1132,16 +1159,14 @@ fn try_on_ime_processed_keyboard_input(
     physical_key: winit::keyboard::PhysicalKey,
     state: winit::event::ElementState,
 ) -> bool {
-    if !allow_ime {
+    if state == ElementState::Released && pressed_processed_physical_keys.remove(&physical_key) {
+        // egui never saw this press, even if IME permission has changed since then.
+        true
+    } else if !allow_ime {
         false
     } else if *logical_key == winit::keyboard::NamedKey::Process {
         // winit maps VK_PROCESSKEY to Process for IME-consumed presses.
         pressed_processed_physical_keys.insert(physical_key);
-        true
-    } else if state == ElementState::Released
-        && pressed_processed_physical_keys.remove(&physical_key)
-    {
-        // Releases carry the original logical key, so match their physical key.
         true
     } else {
         false
@@ -1509,30 +1534,34 @@ mod keyboard_input_tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn disabled_ime_forwards_process_and_preserves_the_tracking_set() {
+    fn disabled_ime_forwards_unrecorded_input_but_removes_recorded_releases() {
         let physical = PhysicalKey::Code(KeyCode::KeyV);
         let mut processed = HashSet::from([physical]);
-        for state in [ElementState::Pressed, ElementState::Released] {
-            assert!(!try_on_ime_processed_keyboard_input(
-                false,
-                &mut processed,
-                &Key::Named(NamedKey::Process),
-                physical,
-                state,
-            ));
-            assert!(!try_on_ime_processed_keyboard_input(
-                false,
-                &mut processed,
-                &Key::Character("v".into()),
-                physical,
-                state,
-            ));
-            assert_eq!(processed, HashSet::from([physical]));
-        }
+        assert!(!try_on_ime_processed_keyboard_input(
+            false,
+            &mut processed,
+            &Key::Named(NamedKey::Process),
+            physical,
+            ElementState::Pressed,
+        ));
+        assert_eq!(processed, HashSet::from([physical]));
         let mut input = egui::RawInput {
             modifiers: egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
             ..Default::default()
         };
+        assert!(!append_keyboard_input(
+            &mut input,
+            &Key::Character("v".into()),
+            physical,
+            None,
+            ElementState::Released,
+            false,
+            false,
+            &mut processed,
+            || panic!("Suppressed release must not read clipboard"),
+        ));
+        assert!(processed.is_empty());
+        assert!(input.events.is_empty());
         let mut reads = 0;
         assert!(append_keyboard_input(
             &mut input,
@@ -1554,7 +1583,7 @@ mod keyboard_input_tests {
             &mut input,
             &Key::Character("v".into()),
             physical,
-            Some("v"),
+            None,
             ElementState::Released,
             false,
             false,
@@ -1565,7 +1594,204 @@ mod keyboard_input_tests {
             input.events[1],
             key_event(egui::Key::V, egui::Key::V, false, input.modifiers)
         );
-        assert_eq!(processed, HashSet::from([physical]));
+        assert!(processed.is_empty());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn delivery_ime_permission_changes_do_not_leave_enter_down() {
+        for release_allowed in [false, true] {
+            let ctx = egui::Context::default();
+            let mut input = egui::RawInput::default();
+            let mut processed = HashSet::new();
+            let physical = PhysicalKey::Code(KeyCode::Enter);
+            for (logical, state, allowed, forwarded) in [
+                (NamedKey::Process, ElementState::Pressed, true, false),
+                (
+                    NamedKey::Enter,
+                    ElementState::Released,
+                    release_allowed,
+                    false,
+                ),
+                (NamedKey::Enter, ElementState::Pressed, true, true),
+                (NamedKey::Enter, ElementState::Released, true, true),
+                (NamedKey::Enter, ElementState::Pressed, true, true),
+                (NamedKey::Enter, ElementState::Released, false, true),
+            ] {
+                assert_eq!(
+                    append_keyboard_input(
+                        &mut input,
+                        &Key::Named(logical),
+                        physical,
+                        None,
+                        state,
+                        false,
+                        allowed,
+                        &mut processed,
+                        || panic!("Enter does not use clipboard"),
+                    ),
+                    forwarded
+                );
+                let _ =
+                    ctx.run(input.take(), |ctx| {
+                        ctx.input(|input| {
+                            assert_eq!(
+                                input.key_down(egui::Key::Enter),
+                                forwarded && state == ElementState::Pressed
+                            );
+                            assert!(!input.events.iter().any(|event| matches!(
+                                event,
+                                egui::Event::Key { repeat: true, .. }
+                            )));
+                        });
+                    });
+                if state == ElementState::Released {
+                    assert!(processed.is_empty());
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn headless_state(ctx: egui::Context, viewport_id: ViewportId) -> State {
+        struct NoDisplay;
+        impl HasDisplayHandle for NoDisplay {
+            fn display_handle(
+                &self,
+            ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError>
+            {
+                Err(raw_window_handle::HandleError::Unavailable)
+            }
+        }
+        State::new(ctx, viewport_id, &NoDisplay, None, None, None)
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn state_delivery_tracks_releases_across_ime_permission_changes() {
+        for release_allowed in [false, true] {
+            let ctx = egui::Context::default();
+            let mut state = headless_state(ctx.clone(), ViewportId::ROOT);
+            state.on_focused(true);
+            for (logical, element, allowed, forwarded) in [
+                (NamedKey::Process, ElementState::Pressed, true, false),
+                (
+                    NamedKey::Enter,
+                    ElementState::Released,
+                    release_allowed,
+                    false,
+                ),
+                (NamedKey::Enter, ElementState::Pressed, true, true),
+                (NamedKey::Enter, ElementState::Released, true, true),
+                (NamedKey::Enter, ElementState::Pressed, true, true),
+                (NamedKey::Enter, ElementState::Released, false, true),
+            ] {
+                state.allow_ime = allowed;
+                assert_eq!(
+                    state.on_keyboard_input_parts(
+                        &Key::Named(logical),
+                        PhysicalKey::Code(KeyCode::Enter),
+                        None,
+                        element,
+                        false
+                    ),
+                    forwarded
+                );
+                let _ =
+                    ctx.run(state.egui_input.take(), |ctx| {
+                        ctx.input(|input| {
+                            assert_eq!(
+                                input.key_down(egui::Key::Enter),
+                                forwarded && element == ElementState::Pressed
+                            );
+                            assert!(!input.events.iter().any(|event| matches!(
+                                event,
+                                egui::Event::Key { repeat: true, .. }
+                            )));
+                        });
+                    });
+                if element == ElementState::Released {
+                    assert!(state.pressed_processed_physical_keys.is_empty());
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn state_focus_loss_clears_only_its_own_processed_keys() {
+        for allowed in [false, true] {
+            let ctx = egui::Context::default();
+            let mut owner = headless_state(ctx.clone(), ViewportId::ROOT);
+            let mut sibling = headless_state(ctx.clone(), ViewportId::from_hash_of("sibling"));
+            let physical = PhysicalKey::Code(KeyCode::Enter);
+            for state in [&mut owner, &mut sibling] {
+                state.on_focused(true);
+                state.allow_ime = true;
+                assert!(!state.on_keyboard_input_parts(
+                    &Key::Named(NamedKey::Process),
+                    physical,
+                    None,
+                    ElementState::Pressed,
+                    false
+                ));
+            }
+            owner.allow_ime = allowed;
+            owner.on_focused(false);
+            assert!(!owner.egui_input.focused);
+            assert!(
+                owner
+                    .egui_input
+                    .events
+                    .contains(&egui::Event::WindowFocused(false))
+            );
+            assert!(owner.pressed_processed_physical_keys.is_empty());
+            assert_eq!(
+                sibling.pressed_processed_physical_keys,
+                HashSet::from([physical])
+            );
+            // The old release goes to another window. After refocusing, the next ordinary
+            // press/release must both reach egui, including when allow_ime changes.
+            let _ = ctx.run(owner.egui_input.take(), |_| {});
+            owner.on_focused(true);
+            owner.allow_ime = true;
+            for element in [
+                ElementState::Pressed,
+                ElementState::Released,
+                ElementState::Pressed,
+                ElementState::Released,
+            ] {
+                assert!(owner.on_keyboard_input_parts(
+                    &Key::Named(NamedKey::Enter),
+                    physical,
+                    None,
+                    element,
+                    false
+                ));
+                let _ =
+                    ctx.run(owner.egui_input.take(), |ctx| {
+                        ctx.input(|input| {
+                            assert_eq!(
+                                input.key_down(egui::Key::Enter),
+                                element == ElementState::Pressed
+                            );
+                            assert!(!input.events.iter().any(|event| matches!(
+                                event,
+                                egui::Event::Key { repeat: true, .. }
+                            )));
+                        });
+                    });
+            }
+            sibling.allow_ime = false;
+            assert!(!sibling.on_keyboard_input_parts(
+                &Key::Named(NamedKey::Enter),
+                physical,
+                None,
+                ElementState::Released,
+                false
+            ));
+            assert!(sibling.pressed_processed_physical_keys.is_empty());
+        }
     }
 
     #[cfg(target_os = "windows")]

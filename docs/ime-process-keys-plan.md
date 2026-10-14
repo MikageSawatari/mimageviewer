@@ -35,14 +35,17 @@ I1 段 2a（`367f9c9d3`）と段 2b の本体部分（`fde3e819e`）は先行独
 | 段 1：`282f173c4` / `1cbe1888f` | egui-winit 0.33.3 を vendor に取り込み、既定無効の `MIV_IME_KEY_TRACE` で winit 入力と実際の egui 出力を観測。文字と Space は秘匿し、ファイル I/O は worker に置く。入力挙動を変更しない |
 | 段 2a：`62bc9f47c` / `29367ba4d` | Process press / repeat を Key・Text・clipboard producer の前で遮断。本体 text_mode / comic_lab の Enter 除去、共有 plugin の composing Esc 除去、helper の IME 専用 Tab lock を撤去。実配送関数 `append_keyboard_input` で回帰検証する |
 | 段 2b：`291dbf8e5` / `efce16eb0` | 300ms grace と timestamp、pending-event 有無版 API を撤去。今 pass の Ime 列を反映した composing と、queue 最終状態の投影へ統一。Win32 queue / native 生キー公開は 0xE5 press / repeat を生成境界で捨て、release は保持する |
-| 本家への整合（今回追加） | Windows の `allow_ime` が true のとき、Process を遮断して `pressed_processed_physical_keys: HashSet<PhysicalKey>` に記録し、対応する release も遮断する。allow_ime=false なら状態を変えず通す。通常 press の物理キーの release は通す |
+| 本家への整合と独立レビュー修正 | Windows の `allow_ime` が true のとき、Process を遮断して `pressed_processed_physical_keys: HashSet<PhysicalKey>` に記録する。記録済み release は allow_ime にかかわらず remove して遮断する。focus 喪失で集合を空にし、記録のない release は通す |
 
-段 2a の「release を通し、集合を持たない」判断は履歴であり、現在は本家との整合が優先する。
-本家 [PR #7967](https://github.com/emilk/egui/pull/7967) の egui-winit 0.34.0 と同じ判定・状態。
-[本家実装](https://raw.githubusercontent.com/emilk/egui/0.34.0/crates/egui-winit/src/lib.rs) に揃え、
-egui 更新時は `vendor/egui-winit` と path patch をこの差分ごと削除する。
+段 2a の「release を通し、集合を持たない」判断は履歴であり、現在は press / release の整合性を優先する。
+本家 [PR #7967](https://github.com/emilk/egui/pull/7967) の egui-winit 0.34.0 を基にする。
+[本家実装](https://raw.githubusercontent.com/emilk/egui/0.34.0/crates/egui-winit/src/lib.rs) に対して、
+独立レビュー P2 の設計 lead 決定により、記録済み release は allow_ime 判定より先に除去・遮断し、
+`WindowEvent::Focused(false)` では当該 State の集合を空にする。この 2 点のみが挙動差分。
+egui が見ていない press の release を渡さず、古い記録が次の通常 release を捨てて keys_down を残すことを防ぐ。
 処理済みキーの EventResponse も本家同様、repaint=false / consumed=wants_keyboard_input とする。
-追加の focus 喪失時の集合リセットや時間窓は設けない。trace は既定無効で保持する。
+時間窓は設けない。trace は既定無効で保持する。egui 更新時は上記 2 点の本家での解決を確認し、
+未解決なら差分を維持する（詳細は `vendor/egui-winit/PATCHES.md`）。
 
 focus のキー所有と復帰は別責務。直前 pass の helper 欄に対する recovery claim は維持する。
 復帰は pointer 無し・他 widget focus 無し・composing または通常 Enter / Escape press 無しで決める。
@@ -76,14 +79,19 @@ focus 移動で Disabled だけ届く取消列は実機では未観測で、実 
 detached、他の PC / IME、今回の本家整合後の実機挙動は未確認。
 段 1 の Space 秘匿 P2、段 2a の実配送テスト P3、段 2b の focus 喪失取消 P2 と retry / 文書 P3 は
 修正後に先行正式独立レビュー ACCEPT。段 2b の設計は第 5 版で ACCEPT。
-これらは移植元の評価であり、今回の移植と本家整合の独立レビュー・検収は設計 lead が別途依頼する。
+これらは移植元の評価。今回の移植は設計 lead が別途正式レビューを依頼し、REVISE（P2 1 / P3 1）を受領した。
 
 ## 今回の移植・検証記録
 
 移植元 8 コミットをパス限定で順に適用。衝突なし。`fde3e819e` の Cargo.lock 差分は
 音楽ビデオ UI の依存追加だけなので除外。本体用の既存変更を保持し、音楽ビデオ専用ファイルは追加しない。
-本家整合の配送・状態遷移テストは release 遮断、allow_ime=false、非対応 release、repeat、複数キー、状態分離を検証する。
+配送・状態遷移テストは release 遮断、allow_ime 切り替え、非対応 release、repeat、複数キー、状態分離を検証する。
+true の Process press → false の release → true の通常 press/release、および focus 喪失・復帰後の入力を、
+`append_keyboard_input` とウィンドウを作らない State の実処理経路で検証し、keys_down と repeat の残留を防ぐ。
+独立レビュー P3 により、winit 経路の fullscreen / comic_lab / egui-ime fixture は Process press と対応 release の両方を除く。
+native presenter 経路の release 維持は変更しない。
 
+以下は移植直後（レビュー修正前）の検証記録。
 検証ログと command / exit code / 件数は `target/ime-port/verification/*.log` / `*.json`。
 通常 feature、test / dev profile、`RUST_MIN_STACK=67108864`。アプリ起動は行わない。
 
@@ -122,7 +130,8 @@ stack overflow は起こらず、crash-dialog 抑止の error mode は元の 0x0
 
 確認 build の CMake 依存は同 profile の `turbojpeg-sys` / `libwebp-sys` を単一並列で先に準備した
 （281.69 秒）。本体の build-dev は CARGO_BUILD_JOBS=24、feature / 最適化設定を維持して成功した。
-今回の port / 本家整合に対する実機確認と独立レビューは未実施。Google / MS-IME で、
+今回の port / 本家整合に対する実機確認は未実施。正式な独立レビューは REVISE（P2 1 / P3 1）で、
+上記の方針に従って修正する。修正後の再レビューは設計 lead に引き継ぐ。Google / MS-IME で、
 注釈本文の確定だけでは改行なし・確定→すぐ Enter で改行 1 つ、検索欄の確定→すぐ Enter / Escape、
 Alt 復帰後の Enter / Escape、別窓への focus 移動を設計 lead が隔離データで確認する。
 成果物は `target/dev-runtime/mimageviewer-core.exe`。通常起動は
@@ -131,4 +140,24 @@ Alt 復帰後の Enter / Escape、別窓への focus 移動を設計 lead が隔
 今回の隔離確認では同じ core へ `--data-dir .\target\dev-runtime\data` を渡す。
 
 Git 管理領域が作業ディレクトリ外のため、この実行環境では元 worktree の index / branch への書き込みが拒否された。
-コミット履歴は `target/ime-port/git` に保存し、元ブランチへの反映は保留する。
+コミット履歴は `target/ime-port/git` の bundle から設計 lead が取り込み済み（HEAD `874e9b2c1`）。
+今回のレビュー修正はユーザー指示によりコミットせず作業ツリーへ残す。
+
+## 独立レビュー REVISE の修正・検証（2026-10-14）
+
+P2 は記録済み release の無条件除去・遮断と focus 喪失時の集合クリアを実装し、
+配送と State の回帰テストを追加。P3 は winit fixture から対応 release も除去し、facade 説明を修正した。
+本家との差分・理由・更新時の確認事項を PATCHES.md に記録した。実機確認と正式再レビューは未実施。
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo fmt --check` / vendor `rustfmt --edition 2024 --check` / glyph check | すべて exit 0、危険 glyph 0 |
+| `cargo test -p egui-winit --lib` / `-p egui-ime` / `-p comic_lab` | 26 / 22 / 9 passed、失敗なし |
+| `cargo test -p mimageviewer --lib ime` / `focus` / `keyboard` / `text_mode` | 448 / 118 / 42 / 3 passed、失敗なし。ime の既存 ignored 2、子プロセス再掲は加算しない |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0 |
+| `scripts/build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | exit 0（46.68 秒）。通常 feature / dev-runtime の core と companion を staging、起動なし |
+
+ログと command / exit code は `target/ime-port/review-verification/*.log` / `*.json`。
+`MSBUILDDISABLENODEREUSE=1`、`RUST_MIN_STACK=67108864`、`CARGO_BUILD_JOBS=4`、`RUST_TEST_THREADS=4`。
+vendor の依存は 1 系統、build safety check も exit 0。今回は指定の検証範囲を実行し、上記の旧 full gate は再実行していない。
+成果物は `target/dev-runtime/mimageviewer-core.exe`。起動コマンド・実プロファイルの注意事項は前節を参照。
