@@ -32,6 +32,17 @@
 
 ## 1. 優先候補
 
+### 1.383 parked-live の音楽ウィンドウで Norm のゲインが鍵盤の明るさに反映されない — HarmNet 鍵盤の設計レビューで判明 (2026-10-12)
+
+音楽ビューの鍵盤は、Norm (ラウドネス正規化) の適用ゲインを明るさ (presence) に反映する。通常のフルスクリーンの描画
+(`src/ui_fullscreen.rs` の音楽ビュー) は `normalize_ui_state_for_player(...).applied_gain_db()` を渡すが、
+parked-live の音楽ウィンドウ (`draw_parked_live_music_window`) は `music_spectrum.draw(ui, rect, 0.0, ...)` で 0dB を
+渡しており、park / 復帰で鍵盤の明るさが変わる (設計レビュー GPT-6.1 Sol の指摘、コードの参照のみで実機未確認)。
+HarmNet 化の前から同じ式なので、今回の変更で生じた差ではない。
+- 直し方の案: parked-live でも既存の `info.normalize_ui_state.applied_gain_db()` を渡す。detached の描画経路に触れるので、
+  凍結ルールの手続き (双方の合意と `docs/detached-rework-plan.md` §11 への記録) が要る。
+- 経緯: `docs/music-keyboard-harmnet-plan.md` §10 / §12 (P4)。
+
 ### 1.382 egui / eframe / egui-wgpu を 0.33.3 から 0.36 系へ上げる — 次の版の次の最初の作業 (2026-10-14 利用者決定)
 
 依存物の更新確認で 3 段階遅れと判明。本家の更新履歴で見た主な差: 0.34 で文字描画の仕組みの交換 (ab_glyph から Skrifa + vello_cpu)、`App::update` から `App::ui`、`Panel` への統一、Area/Window/ScrollArea がフォーカスを取らない、MSRV 1.92。0.35 で非推奨 API の削除、IME の下線・カーソル表示と `owns_ime_events`、harfrust のシェーピング、Window はタイトルバーだけで移動。0.36 で `Modifiers` が入力イベント化、MSRV 1.95 (開発機は 1.94.1)。
