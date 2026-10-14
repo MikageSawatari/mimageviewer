@@ -64,6 +64,95 @@ fn composed_app(
     app
 }
 
+fn capture_composed_flat(ctx: &egui::Context, app: &mut App, anchor: usize) -> Arc<PaintedUnit> {
+    app.fullscreen_idx = Some(anchor);
+    frame(ctx, |ui, ctx| {
+        app.begin_page_turn_viewer_frame(ctx, false, None);
+        let (composition, sources) = draw_current(app, ui, ctx);
+        let decision = app.fs_page_turn_decision_for_frame(ctx, anchor);
+        app.emit_fs_page_turn_ready_for_display_unit(ctx, &composition, decision, &sources);
+    });
+    let PresentationState::Flat(unit) = &app.page_turn_presentation.state else {
+        panic!("explicit unit must reach the ordinary flat receipt at {anchor}");
+    };
+    assert!(unit.evidence.was_accepted());
+    unit.clone()
+}
+
+#[test]
+fn page_turn_merge_master_explicit_singletons_project_without_automatic_cover_proof() {
+    use crate::page_turn_animation::project_prepared;
+
+    for direction in [CompositionDirection::Ltr, CompositionDirection::Rtl] {
+        for placement in [
+            SinglePlacement::Center,
+            SinglePlacement::Leading,
+            SinglePlacement::Trailing,
+        ] {
+            for cover in [0, 3] {
+                let mut book = BookComposition::new(
+                    direction,
+                    vec![
+                        fixtures::single(0, placement, SingleCompanion::Vacant),
+                        fixtures::pair(1, 2),
+                        fixtures::single(3, SinglePlacement::Center, SingleCompanion::Vacant),
+                    ],
+                );
+                book.cover = Some(fixtures::document_page(cover));
+                let ctx = egui::Context::default();
+                install(&ctx);
+                let mut app = composed_app(&ctx, &book, 4);
+                app.spread_mode = if direction == CompositionDirection::Ltr {
+                    SpreadMode::LtrCover
+                } else {
+                    SpreadMode::RtlCover
+                };
+                let first = capture_composed_flat(&ctx, &mut app, 0);
+                let pair = capture_composed_flat(&ctx, &mut app, 1);
+                assert_eq!(
+                    first.layout[0].formation,
+                    SpreadDisplayUnitFormation::Singleton(
+                        SpreadDisplaySingletonCause::ExplicitComposition,
+                    )
+                );
+                let canonical = canonical_unit(&first).unwrap_or_else(|reason| {
+                    panic!("{direction:?}/{placement:?}/cover={cover}: {reason}")
+                });
+                let actual = canonical
+                    .pages
+                    .iter()
+                    .find(|page| page.occurrence.is_some())
+                    .unwrap();
+                assert_eq!(
+                    actual.rect, first.pages[0].transform.paint_rect,
+                    "saved placement is authoritative, including Center"
+                );
+                for (outgoing, incoming, forward) in [(&first, &pair, true), (&pair, &first, false)]
+                {
+                    let leaf = prepare_leaf(outgoing, incoming, forward).unwrap_or_else(|reason| {
+                        panic!(
+                            "{direction:?}/{placement:?}/cover={cover}/forward={forward}: {reason}"
+                        )
+                    });
+                    for progress in [0.0, 0.25, 0.6, 1.0] {
+                        let projection = project_prepared(
+                            &leaf.outgoing,
+                            &leaf.incoming,
+                            leaf.direction,
+                            leaf.recipe,
+                            progress,
+                            false,
+                        )
+                        .unwrap();
+                        assert!(!projection.meshes.is_empty());
+                        assert_eq!(projection.finished, progress == 1.0);
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn page_turn_merge_master_cached_incoming_requires_every_presentation_permission() {
     let _serial = crate::key_input::lock_test_input();

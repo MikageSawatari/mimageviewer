@@ -2679,3 +2679,52 @@ page_edit55、metadata journal1、subtract preview1とviewer_context_audit実行
  target/A-1341-merge-r3-full-first-results.txtに記録する。
 
 通常build-dev -PreserveRuntimeはexit0。core／Remote／EPUB workerとruntime4／PE3検査が成功。core生成日時=2026-10-14 11:20:04、328720384 bytes、FileVersion=4.6.0.0。アプリの起動・停止、git add／commitは行っていない。test-fullの追加実行は行っておらず、初回未完了の記録を維持する。
+
+### 26.18 merge再レビュー：通常許可受付と明示表紙の投影
+
+0f65c08b3の独立レビューでP2二件を確認した。§26.17の直接offer回帰は通常handlerの
+非同期許可受付を通らず、構成配置の回帰はcanonical投影まで検査していなかった。
+通常handlerは実permission serviceを使い、必要unitの全occurrenceが現在の採用済み構成／
+source identityと一致し、serviceが初期化済み・現在token・先行mutationなしの場合に限り、
+同じ許可owner内で即許可する。Admissionの既存Running状態で先行mutationを追跡し、
+未初期化・maintenance・旧token・不明source・Hiddenは従来のworker照合へ渡す。
+即許可は新しい操作のcontext／世代／source／role／slot／sliceに対する証明であり、
+textureや以前の表示episodeだけから復活させない。UIでI/O・全archive走査・待機を行わず、
+別pending／queue／bool／ownerや、許可後着による再offerは追加しない。
+
+明示構成の単ページをcacheへ写す境界で、既存SingletonCauseにExplicitCompositionを保持する。
+Automaticの「先頭unpaired Navigationが表紙側にある」証明はAutomaticに限定し、明示単ページは
+共通構成resolverのCenter／Leading／Trailing配置をcanonical正本にする。指定表紙が後方でも
+先頭を自動表紙と推定しない。ROI／source／許可・通常canonical geometryの拒否は変更しない。
+旧保存unitsに対する修正は由来の保持と証明分岐に限定する。next-bookの『組を保存しない』
+構成がmasterへ入った後は、共通builderの結果から同じ由来・配置を判定する形へ統合し、
+明示指定／構成優先配置／先頭と後方指定表紙／各handlerを再検証する。これは残件とする。
+
+構成のない本や既存許可済みunitを毎回Checkingへ落とさない実service＋通常navigation／
+slideshow handler回帰、LR／RL・中央／側配置・先頭／後方指定表紙の実builder→通常描画→
+canonical投影回帰を追加する。別mode制限やめくり後着再試行で組合せを減らす案は、
+既存の通常ページ送りを制限するため採用せず、同じ許可ownerとlayout型で成立条件を表す。
+設計担当の修正指示、実装premise確認と独立Sol/xhighの構造合意に基づく。
+通常／portable core check、fmt、glyph0、diff checkとviewer_context_audit実行が成功した。
+新しい実service handler3件、明示singleton投影1件、service境界1件が成功。
+handlerはPDF／ZIP×Automatic／Composed×Single／Spreadで通常前進・後退・slideshowのcurlを確認し、
+先行write待ちの通常着地・後着curlなし4caseと、無効な証明16caseを検査する。
+明示投影はLTR／RTL×Center／Leading／Trailing×先頭／後方指定表紙×前進／後退の
+実builder・通常描画から96 phase投影を検査した。page_turn206、book_composition202、
+registry89、UI snapshot177、構成editor snapshot10件も成功。独立Sol/xhighの最終静的レビューはACCEPT。
+通常build-dev -PreserveRuntimeはexit0。core／Remote／EPUB workerとruntime4／PE3検査が成功。core生成日時=2026-10-14 12:17:34、328766464 bytes、FileVersion=4.6.0.0。アプリ起動・停止、git add／commitなし。
+
+最後のtest-fullはjobs1／threads1、SuppressCrashDialogsで一回通し実行し、exit101で完了。
+workspace61 targetは14169成功／1失敗／64ignored、本体は12922成功／1失敗／57ignored。
+失敗は今回未変更のvideo::native_window_pump::tests::hud_focus_claim_uses_registered_editor_and_preserves_presenter_return。
+src/video/native_window_pump.rs:2012で使い捨てeditor子processのHWND通知が10秒以内に来ずTimeoutとなった。
+同じpack-build-tools libtest binaryのexact単独確認でも同じ10.02秒の失敗を再現し、原因は未確定。
+今回の二件の修正とnative/video経路を混ぜず、この失敗を設計担当へ引き継ぐ。timeoutやassertionは緩めない。
+スクリプトが失敗後に省略したvendor3 gateを別commandで補足し、egui25／egui-wgpu11／eframe18成功。
+合計64 targetは14223成功／1失敗／64ignored、全targetの完了結果を取得した。全体gateのPASSとはしない。
+前回のApp size／capture stack overflow／metadata journal／subtract previewの各回帰は今回の全体内で成功。
+今回追加した通常handler・投影・service境界の回帰も全体内で成功した。
+全64 targetの一覧はtarget/A-1341-permission-r4-full-results.txt、通しログはtarget/A-1341-permission-r4-full.log、
+単独失敗ログはtarget/A-1341-permission-r4-focus-isolated.log、vendorログは同prefixのvendor-*.log。
+修正・検証・隔離確認手順はtarget/A-1341-permission-r4-msg.txtに記録した。
+アプリ起動・停止、git add／commitは行っていない。

@@ -14919,6 +14919,8 @@ pub(crate) fn fs_cache_entry_page_dims(entry: &FsCacheEntry) -> Option<(u32, u32
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SpreadDisplaySingletonCause {
+    /// The accepted explicit composition owns this slot and placement.
+    ExplicitComposition,
     /// The canonical segment ended before a partner slot could be filled.
     UnpairedSlot,
     /// This page, or the page that would otherwise partner it, is landscape.
@@ -18147,7 +18149,7 @@ impl App {
                             [page] => Some(SpreadDisplayUnit::singleton(
                                 nav_start,
                                 *page,
-                                SpreadDisplaySingletonCause::UnpairedSlot,
+                                SpreadDisplaySingletonCause::ExplicitComposition,
                             )),
                             _ => None,
                         };

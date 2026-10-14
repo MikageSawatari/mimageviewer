@@ -5,6 +5,10 @@
 accepted構成のexplicit unitをSingle/Spread/Split/連結/portraitへ投影する。回転や寸法後着、休眠shiftで再pairしない。
 Blankはsource/readinessを持たず、補助はNavigation/resume/exportの実列へ追加しない。
 提示候補はcontext/世代/source/role/slot/sliceをworkerで確認し、相方はunit内でatomicに採用する。
+通常open／navigation／slideshowは、採用済みsource投影と現在のservice token／identity indexを
+証明でき、初期化済み・保守外・先行mutationなしなら、同じ提示許可owner内で新しいunitの
+全occurrenceを即許可する。不明source／旧token／Checking／Hiddenは従来のworker照合へ渡す。
+表示済みepisodeの許可を新規要求へ流用せず、UIのI/Oや別許可ownerは増やさない（紙めくり計画§26.18）。
 Checking/Hiddenはcached processed/raw/thumbnail/holdoverからもtexture選択・paint・transform/hit・読了traceへ渡さない。
 連結の測定extentと画像許可を分離し、bounded cacheの既知寸法だけで未許可画像を復活させない。
 scroll/reanchor/resizeで探索を更新しても、画面に残るoccurrenceの許可とChecking要求は保持する。

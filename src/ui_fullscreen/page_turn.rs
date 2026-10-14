@@ -17,6 +17,8 @@ mod merge_master_tests;
 mod merge_tests;
 #[cfg(test)]
 mod nonfinal_tests;
+#[cfg(all(test, windows))]
+mod permission_service_regression_tests;
 #[cfg(test)]
 mod roi_tests;
 #[cfg(test)]
@@ -2801,6 +2803,10 @@ fn canonical_unit(
                     .layout
                     .first()
                     .is_some_and(|first| first.pages.first() == Some(&page.occurrence.idx))
+                && unit.layout[0].formation
+                    != SpreadDisplayUnitFormation::Singleton(
+                        SpreadDisplaySingletonCause::ExplicitComposition,
+                    )
             {
                 let first = &unit.layout[0];
                 let cover_side = if unit.mode.is_rtl() {
@@ -2808,6 +2814,8 @@ fn canonical_unit(
                 } else {
                     SingletonSpreadPlacement::Right
                 };
+                // This proof belongs to Automatic. Explicit composition retains
+                // its own placement, independently of where its cover is saved.
                 // A raw cover index can also be a supplement or a shifted unit.
                 // Only the builder's real first unpaired Navigation leaf on its
                 // resolved cover side establishes a physical front cover.
