@@ -1904,10 +1904,10 @@ impl App {
                 root,
                 child: SmartPhysicalPreflight::PdfPassword { path, .. },
             } => {
-                let has_saved_spread = self
-                    .spread_db
-                    .as_ref()
-                    .is_ok_and(|db| db.get_state_with_fallback(&path, None).mode.is_some());
+                let has_saved_spread = self.spread_db.as_ref().is_ok_and(|db| {
+                    let stored = db.get_state_with_fallback(&path, None);
+                    !stored.needs_document_direction(true)
+                });
                 let want_direction =
                     self.settings.follow_document_reading_direction && !has_saved_spread;
                 let handle = crate::pdf_loader::enumerate_pages_async_with_options(
@@ -3647,20 +3647,22 @@ impl App {
             return false;
         }
         let rows = match &child {
-            SmartPhysicalReady::PdfPages { pages, .. } => {
-                Some(Self::build_pdf_page_rows(&path, pages))
-            }
+            SmartPhysicalReady::PdfPages { pages, .. } => Some(
+                super::book_materialization::materialize_document_rows(&path, pages),
+            ),
             SmartPhysicalReady::PdfWarm {
                 page_count,
                 mtime,
                 file_size,
                 ..
-            } => Some(Self::build_pdf_meta_placeholder_rows(
-                &path,
-                *page_count,
-                *mtime,
-                *file_size,
-            )),
+            } => Some(
+                super::book_materialization::materialize_cached_document_rows(
+                    &path,
+                    *page_count,
+                    *mtime,
+                    *file_size,
+                ),
+            ),
             _ => None,
         };
         let items = match &child {
@@ -4113,7 +4115,7 @@ impl App {
                     || {
                         self.spread_db.as_ref().is_ok_and(|db| {
                             let stored = db.get_state_with_fallback(&path, None);
-                            stored.mode.is_some() || stored.direction.is_some()
+                            !stored.needs_document_direction(true)
                         })
                     },
                 );
@@ -4803,7 +4805,7 @@ struct SmartFolderScanOptions {
     show_hidden_files: bool,
     include_convertible_archives: bool,
     include_epub: bool,
-    skip_zip_if_folder_exists: bool,
+    same_name_folder_book: crate::same_name_folder_book::SameNameFolderBookPolicy,
     skip_archive_if_zip_exists: bool,
     skip_epub_if_pdf_exists: bool,
     skip_image_if_video_exists: bool,
@@ -4819,7 +4821,7 @@ impl From<&crate::settings::Settings> for SmartFolderScanOptions {
             show_hidden_files: settings.show_hidden_files,
             include_convertible_archives: !settings.archive_file_handling_ignores_convertible(),
             include_epub: !settings.epub_file_handling_ignores_epub(),
-            skip_zip_if_folder_exists: settings.skip_zip_if_folder_exists,
+            same_name_folder_book: settings.same_name_folder_book,
             skip_archive_if_zip_exists: settings.skip_archive_if_zip_exists,
             skip_epub_if_pdf_exists: settings.skip_epub_if_pdf_exists,
             skip_image_if_video_exists: settings.skip_image_if_video_exists,
@@ -5112,8 +5114,12 @@ fn normalize_smart_folder_candidates(
             container_metas.push(Some((candidate.mtime, candidate.file_size.unwrap_or(0))));
         }
     }
-    if options.skip_zip_if_folder_exists {
-        super::folder_scan::filter_virtual_folder_duplicates(&mut containers, &mut container_metas);
+    {
+        super::folder_scan::filter_virtual_folder_duplicates(
+            options.same_name_folder_book,
+            &mut containers,
+            &mut container_metas,
+        );
     }
     if options.skip_archive_if_zip_exists {
         super::folder_scan::filter_convertible_archive_duplicates(
@@ -8400,6 +8406,9 @@ impl App {
         self.current_folder_last_mtime = None;
         self.current_folder_signature = None;
         self.items = items;
+        self.projection_recipe = super::book_materialization::ProjectionRecipe::ExtractedResult(
+            super::book_materialization::ExtractedSurface::SmartFolder,
+        );
         let retired_index = std::mem::replace(&mut self.page_identity_index, page_identity_index);
         self.retire_smart_folder_payloads([Box::new(retired_index) as RetiredSmartFolderPayload]);
         self.thumbnails = thumbnails;
@@ -9237,6 +9246,7 @@ impl App {
         self.video_thumb_overrides
             .extend(snapshot.video_thumb_overrides.clone());
         self.start_loading_subfolder_items(
+            super::book_materialization::ExtractedSurface::SmartFolder,
             synthetic_path,
             items,
             image_metas,
@@ -9862,6 +9872,118 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn g1_smart_real_handler_reopen_restores_legacy_flow_and_book_return() {
+        use crate::app::book_materialization::{ExtractedSurface, ProjectionRecipe};
+        use crate::settings::{ReadingDirection, ReadingFlow, SpreadMode};
+        for saved_flow in [None, Some(ReadingFlow::Vertical)] {
+            let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+            let mut app = crate::app::setup_app_for_test();
+            app.active_quick_folder_slot = None;
+            app.settings.detached_viewer_open_images_in_window = false;
+            app.settings.auto_fullscreen_image_folders = true;
+            app.settings.auto_fullscreen_zip_pdf = true;
+            app.settings.default_spread_mode = SpreadMode::RtlCover;
+            app.settings.default_reading_flow = ReadingFlow::Vertical;
+            app.settings.default_reading_direction = ReadingDirection::Rtl;
+            let book = app.tmp.path().join("smart-a2-original-book");
+            std::fs::create_dir_all(&book).unwrap();
+            for name in ["01.png", "02.png"] {
+                image::RgbImage::new(2, 3).save(book.join(name)).unwrap();
+            }
+            app.load_folder(book.clone());
+            app.settle_open_path_classification_for_test();
+            app.finish_page_identity_preparation_for_test();
+            assert!(matches!(app.projection_recipe, ProjectionRecipe::Book(_)));
+            assert_eq!(app.spread_mode, SpreadMode::RtlCover);
+            assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+            let mut definition = crate::settings::SmartFolderDefinition::new("A2 flow");
+            definition.rules.push(crate::settings::SmartFolderRule::new(
+                book.clone(),
+                true,
+                Default::default(),
+            ));
+            let id = definition.id;
+            let synthetic = smart_folder_synthetic_path(id);
+            if let Some(flow) = saved_flow {
+                let db = app.spread_db.as_ref().unwrap();
+                db.set(
+                    &synthetic,
+                    SpreadMode::RtlCover,
+                    SpreadMode::Single,
+                    ReadingFlow::Paged,
+                    ReadingDirection::Ltr,
+                )
+                .unwrap();
+                db.set_flow(
+                    &synthetic,
+                    flow,
+                    ReadingDirection::Rtl,
+                    SpreadMode::Single,
+                    ReadingFlow::Paged,
+                    ReadingDirection::Ltr,
+                )
+                .unwrap();
+            }
+            let stored = app
+                .spread_db
+                .as_ref()
+                .unwrap()
+                .get_state_with_fallback(&synthetic, None);
+            app.settings.smart_folders = vec![definition];
+            app.open_smart_folder(id, false);
+            let ctx = egui::Context::default();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !app.items_are_smart_folder_view || app.smart_folder_busy() {
+                assert!(Instant::now() < deadline, "Smart A2 scan did not settle");
+                app.poll_smart_folder(&ctx);
+                app.poll_sidecar_restore(&ctx);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            app.finish_page_identity_preparation_for_test();
+            assert_eq!(
+                app.extracted_result_surface(),
+                Some(ExtractedSurface::SmartFolder)
+            );
+            // New Smart scans use the released synthetic-key NON_BOOK restore. A moved
+            // root-session return bypasses it and preserves its already accepted flow.
+            let expected_flow = saved_flow.unwrap_or(ReadingFlow::Paged);
+            assert_eq!(app.reading_flow, expected_flow);
+            let index = app
+                .items
+                .iter()
+                .position(|item| matches!(item, GridItem::Image(_)))
+                .unwrap();
+            for _ in 0..2 {
+                app.open_fullscreen(index, crate::app::HistoryTrigger::UserChosen);
+                assert_eq!(app.fullscreen_idx, Some(index));
+                assert_eq!(app.spread_mode, SpreadMode::Single);
+                assert_eq!(app.reading_flow, expected_flow);
+                app.apply_fullscreen_spread_mode(&ctx, index, SpreadMode::RtlCover);
+                assert_eq!(app.spread_mode, SpreadMode::Rtl);
+                assert_eq!(app.reading_flow, expected_flow);
+                app.close_fullscreen();
+            }
+            assert_eq!(
+                app.spread_db
+                    .as_ref()
+                    .unwrap()
+                    .get_state_with_fallback(&synthetic, None),
+                stored
+            );
+            assert!(matches!(app.folder_history_back_target(),
+                Some(super::super::FolderNavHistoryTarget::Path(path)) if path == &book));
+            app.dispatch_main_folder_history_input(super::super::FolderHistoryDirection::Back);
+            app.settle_open_path_classification_for_test();
+            app.finish_history_restore_preparation_for_test();
+            assert_eq!(app.current_folder.as_deref(), Some(book.as_path()));
+            assert!(matches!(app.projection_recipe, ProjectionRecipe::Book(_)));
+            assert_eq!(app.spread_mode, SpreadMode::RtlCover);
+            assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+            assert_eq!(app.reading_direction, ReadingDirection::Rtl);
+        }
+    }
 
     #[test]
     fn section1339_smart_grid_classification_row_removal_cannot_reinterpret_original_path() {
@@ -11384,7 +11506,7 @@ mod tests {
             show_hidden_files: false,
             include_convertible_archives: true,
             include_epub: true,
-            skip_zip_if_folder_exists: false,
+            same_name_folder_book: crate::same_name_folder_book::SameNameFolderBookPolicy::ShowBoth,
             skip_archive_if_zip_exists: false,
             skip_epub_if_pdf_exists: false,
             skip_image_if_video_exists: false,
@@ -12580,6 +12702,53 @@ mod tests {
     }
 
     #[test]
+    fn same_name_folder_book_recursive_smart_scan_keeps_descendant_images() {
+        use crate::same_name_folder_book::SameNameFolderBookPolicy as Policy;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let child = root.join("book");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("page.jpg"), b"image").unwrap();
+        std::fs::write(root.join("book.zip"), b"zip").unwrap();
+        let mut definition = crate::settings::SmartFolderDefinition::new("recursive");
+        definition.rules.push(rule(
+            uuid::Uuid::new_v4(),
+            root,
+            true,
+            true,
+            Default::default(),
+        ));
+        for policy in [Policy::PreferBook, Policy::PreferFolder, Policy::ShowBoth] {
+            let mut options = unfiltered_scan_options();
+            options.same_name_folder_book = policy;
+            let result = run_test_scan(definition.clone(), options);
+            assert!(
+                result
+                    .snapshot
+                    .entries
+                    .iter()
+                    .any(|entry| entry.path == child.join("page.jpg"))
+            );
+            assert_eq!(
+                result
+                    .snapshot
+                    .entries
+                    .iter()
+                    .any(|entry| entry.path.file_name().is_some_and(|n| n == "book.zip")),
+                policy != Policy::PreferFolder
+            );
+            assert_eq!(
+                result
+                    .snapshot
+                    .entries
+                    .iter()
+                    .any(|entry| entry.path == child),
+                policy != Policy::PreferBook
+            );
+        }
+    }
+
+    #[test]
     fn scan_applies_container_and_image_duplicate_settings_per_directory() {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path().join("root");
@@ -12603,7 +12772,8 @@ mod tests {
             Default::default(),
         ));
         let mut options = unfiltered_scan_options();
-        options.skip_zip_if_folder_exists = true;
+        options.same_name_folder_book =
+            crate::same_name_folder_book::SameNameFolderBookPolicy::PreferFolder;
         options.skip_archive_if_zip_exists = true;
         options.skip_epub_if_pdf_exists = true;
         options.skip_duplicate_images = true;

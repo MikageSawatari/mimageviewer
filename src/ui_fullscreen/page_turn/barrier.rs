@@ -22,9 +22,32 @@ enum ResolvedNavigationIntent {
     Page {
         slice: Option<crate::page_split::PageSlice>,
     },
+    Slideshow {
+        slice: Option<crate::page_split::PageSlice>,
+        purpose: crate::app::book_composition_permission::BookTargetPurpose,
+    },
     SpreadShift {
         anchor: usize,
     },
+}
+
+#[cfg(test)]
+impl PageTurnPresentation {
+    pub(super) fn continuation_slideshow_purpose_for_test(
+        &self,
+    ) -> Option<crate::app::book_composition_permission::BookTargetPurpose> {
+        let PresentationState::Completing {
+            continuation: Some(command),
+            ..
+        } = &self.state
+        else {
+            return None;
+        };
+        match command.intent {
+            ResolvedNavigationIntent::Slideshow { purpose, .. } => Some(purpose),
+            _ => None,
+        }
+    }
 }
 
 impl App {
@@ -44,6 +67,14 @@ impl App {
                     && fact.cause == cause
             })
             .map(|fact| fact.operation_id)
+    }
+    pub(crate) fn page_turn_presentation_pending(&self) -> bool {
+        matches!(
+            self.page_turn_presentation.state,
+            PresentationState::Offered { .. }
+                | PresentationState::Turning { .. }
+                | PresentationState::Completing { .. }
+        )
     }
     pub(crate) fn page_turn_barrier_active(&self) -> bool {
         matches!(
@@ -112,6 +143,23 @@ impl App {
             contract,
             operation,
             ResolvedNavigationIntent::Page { slice },
+        )
+    }
+
+    pub(crate) fn page_turn_defer_slideshow_navigation(
+        &mut self,
+        ctx: &egui::Context,
+        target_idx: usize,
+        slice: Option<crate::page_split::PageSlice>,
+        purpose: crate::app::book_composition_permission::BookTargetPurpose,
+        operation: ViewerOperationId,
+    ) -> bool {
+        self.page_turn_defer_navigation_intent(
+            ctx,
+            target_idx,
+            crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+            Some(operation),
+            ResolvedNavigationIntent::Slideshow { slice, purpose },
         )
     }
 
@@ -346,7 +394,8 @@ impl App {
             &[("target_idx", command.target_idx.into())],
         );
         let slice = match command.intent {
-            ResolvedNavigationIntent::Page { slice } => slice,
+            ResolvedNavigationIntent::Page { slice }
+            | ResolvedNavigationIntent::Slideshow { slice, .. } => slice,
             ResolvedNavigationIntent::SpreadShift { .. } => None,
         };
         if let ResolvedNavigationIntent::SpreadShift { anchor } = command.intent {
@@ -355,32 +404,26 @@ impl App {
             }
             self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
         }
-        if command.target_idx == command.from_idx
-            && let ResolvedNavigationIntent::Page { slice: Some(slice) } = command.intent
-        {
-            self.set_fullscreen_page_slice_for_display_unit(slice);
-            self.update_fs_page_turn_burst_after_navigation(ctx, command.from_idx, None);
-            ctx.request_repaint();
-            return true;
-        }
-        if command.target_idx == command.from_idx
-            || command.contract == crate::fs_page_load_scheduler::FsPageLoadContract::LatestSeek
-            || self.begin_fs_page_navigation_sequence(
-                ctx,
-                command.from_idx,
-                command.target_idx,
-                false,
-            )
-        {
-            if matches!(command.fact.operation_id, ViewerOperationId::Slideshow(_)) {
-                self.open_fullscreen_from_fs_navigation_with_contract(
+        if let ResolvedNavigationIntent::Slideshow { slice, purpose } = command.intent {
+            self.complete_book_slideshow_target(ctx, command.target_idx, slice, purpose);
+        } else {
+            if command.target_idx == command.from_idx
+                && let ResolvedNavigationIntent::Page { slice: Some(slice) } = command.intent
+            {
+                self.set_fullscreen_page_slice_for_display_unit(slice);
+                self.update_fs_page_turn_burst_after_navigation(ctx, command.from_idx, None);
+                ctx.request_repaint();
+                return true;
+            }
+            if command.target_idx == command.from_idx
+                || command.contract == crate::fs_page_load_scheduler::FsPageLoadContract::LatestSeek
+                || self.begin_fs_page_navigation_sequence(
                     ctx,
+                    command.from_idx,
                     command.target_idx,
-                    slideshow_history_trigger(),
-                    command.contract,
-                    &mut perf,
-                );
-            } else {
+                    false,
+                )
+            {
                 self.land_still_page_navigation_target(
                     ctx,
                     command.from_idx,
@@ -388,11 +431,11 @@ impl App {
                     command.contract,
                     &mut perf,
                 );
-            }
-            if let Some(slice) = slice
-                && self.fullscreen_idx == Some(command.target_idx)
-            {
-                self.set_fullscreen_page_slice_for_display_unit(slice);
+                if let Some(slice) = slice
+                    && self.fullscreen_idx == Some(command.target_idx)
+                {
+                    self.set_fullscreen_page_slice_for_display_unit(slice);
+                }
             }
         }
         if let Some(before) = drawing_path_before {

@@ -2610,3 +2610,72 @@ UI snapshot163件も成功した。vendor追加gateもegui25、egui-wgpu11、efr
 全63 targetの結果は`target/A-1341-entry-r2-full-results.txt`、全ログは
 `target/A-1341-entry-r2-full.log`、修正・コマンド・隔離確認手順は
 `target/A-1341-entry-r2-msg.txt`に記録した。
+
+### 26.17 master旧形式の本の構成との統合（c1539a922へのmerge）
+
+§1.341の独立ACCEPT後、master `0d79f5077`を取り込む。ここで扱う§1.242はmasterにある旧形式であり、
+別ブランチで進行する組の作り直し・新形式の統合検証とは区別する。
+masterの構成提示許可を、既存のcontext内pagedフレーム準備と組み合わせる。Hidden／Checkingを
+通常表示・めくりの素材選択で迂回せず、即時に全occurrenceが許可されたunitだけをcurl候補にする。
+部分許可・待機・明示Blankは通常の許可済み描画へinstantで戻し、許可の後着で再offerしない。
+これは既存の即ready・全unit受理契約の接続であり、新しいpermission ownerは作らない。
+
+構成unitは通常描画と近傍需要で同じrole／slot resolverへ渡す。構成tokenの採用時に
+既存cacheのprimary頁→明示unit位置と画像unit位置を作り、補助表紙はprimary位置を上書きしない。
+各近傍で全layout／navを再探索しない。Single／Splitの通常一頁unitと、Spreadの明示Pair／Blank／
+補助表紙を区別し、Automaticの両端配置実効ONや補助表紙設定で保存構成を作り直さない。
+
+スライドショーは初回受付だけがoperation／offerを扱い、permission後着とbarrier完了はmasterの
+同じ通常completionへ戻す。既存typed continuationへsliceとNext／FirstInBookを保持し、
+grid cursor／範囲起点／scroll／deadlineを落とさない。Offered／Turning／Completing中の
+deadline更新は既存presentation状態で抑え、canonical flat採用から表示間隔を数える。
+別pending／queue／bool、別timerや再試行経路は増やさない。
+
+masterの局所補正pivotは内容identityを保持する新型のまま、元素材入場／左右切替の共通受付へ
+現在のpairを渡す。旧pivot型への変換でidentityを捨てない。HUDは構成本の編集制限と
+通常本のアニメーション中の両端設定無効化を保持し、overflow本文の縦spacing=0と行高式を合わせる。
+PNGは統合後の本体描画fixtureで再生成し、両側の画像の一方を採用しない。
+設計担当の統合指示・実装premise確認と、独立GPT-6.1 Sol/xhighの構造レビューACCEPTに基づく。
+自動検証とPNG目視の結果は本節へ追記する。新形式の§1.242統合後の明示指定・構成優先配置は残件。
+
+監査でmaster由来のpage-edit API 11件のA4明示登録漏れも検出した。全signature／本体が
+MERGE_HEADと同一で、masterのallowlistには登録がないことを確認した。§1.372／§1.376の
+History／Exitでのowner commit収集、context／target／documentを照合するproducer採用、
+同keyのdraftと別keyを保護するpublication／queue失効を独立レビューで確認し、exact fingerprint
+だけを理由付きで登録した。A4規則・除外範囲を広げず、既存ownerの実装も変更しない。
+
+通常／portable core check、fmt、glyphとviewer_context_audit（単体36件＋実行）が成功した。
+統合3、page_turn202、素材要求14、入口27、Original20、page_edit55、book_composition201、
+overflow38（既存1ignored）、設定転送28、keymap169、registry88、UI snapshot177、
+構成editor snapshot10件の関連検証が成功した。masterの追加fixtureではegui Context／KeyEdge
+operation IDと準備済みsource／identity pivotの前提を現入口へ揃え、保存対象のassertionは維持した。
+統合fixtureはON/OFF不変検査の後にONへ戻して近傍需要を検査する。
+
+overflow描画fixtureの4件をUPDATE_SNAPSHOTSで再生成し、Root／高さ十分のRoot／Navigator／
+アニメーションONをすべて目視した。製本行と紙めくり行、縦spacing=0、狭い画面でのscroll、
+高さ十分の末尾到達・scrollbarなしを確認した。競合Rootの再生成SHA256は
+`f81db21a31a95a6b50c724be84456352b7d5f00ad66bb088458143ae31b5744e`で、
+stage2／stage3の元画像と異なる。baseline比較以外にも共通scroll_layout helperの高さ／到達検査を通過した。
+VST3 SDKはmainのsource実体をこのworktreeへcopyし、masterのhostをCMake Releaseで再buildした。
+旧host cacheをimportせず、現ソースidentity
+`04e94b0d62c8d4eb0128a708aec1a70c7ecb2c7639d9899fc54f621098a869ad`の検査が成功した。
+
+統合後のtest-fullをCARGO_BUILD_JOBS=1／RUST_TEST_THREADS=8で一回実行したが、exit101で未完了。
+本体12974件はAppの既存stackサイズ上限違反の後、capture_regionの回帰で
+STATUS_STACK_OVERFLOWとなり、全件の結果は得られなかった。別のmetadata purge journalと
+大きいsubtract previewにも失敗行があり、同じbinaryでの単独再実行はいずれも成功した。
+本体以外のworkspace60 targetは1247成功／0失敗／7ignored、vendor追加gateは未実行。
+本体の子harnessの成功を親の完了と数えず、結果一覧ではINCOMPLETEと記録する。
+
+master統合によるAppの肥大化に対し、既存analysis_hist_cacheの固定長配列tupleだけを
+Option<Box<同じtuple>>へ移した。App／context bundleの所有・swap／無効化／dropとcache keyを
+変えず、新しいowner／pending／boolは加えない。上限110000を緩めず、サイズは
+111232から107720 bytesとなり、既存サイズ回帰が成功した。実context mount往復による
+値・heap所有先保持の回帰を追加し、独立GPT-6.1 Sol/xhighレビューはACCEPT。
+修正後は通常／portable check、fmt、capture1、heap cache1、分析22、registry89、page_turn202、
+page_edit55、metadata journal1、subtract preview1とviewer_context_audit実行が成功した。
+本体全体の修正後再実行はこの個別成功で代用せず、test-fullの未完了として残す。
+初回全ログ・全target結果はtarget/A-1341-merge-r3-full-first.logと
+ target/A-1341-merge-r3-full-first-results.txtに記録する。
+
+通常build-dev -PreserveRuntimeはexit0。core／Remote／EPUB workerとruntime4／PE3検査が成功。core生成日時=2026-10-14 11:20:04、328720384 bytes、FileVersion=4.6.0.0。アプリの起動・停止、git add／commitは行っていない。test-fullの追加実行は行っておらず、初回未完了の記録を維持する。

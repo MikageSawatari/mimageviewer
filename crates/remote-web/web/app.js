@@ -3195,7 +3195,13 @@ function dispatchCommand(requested, meta = {}) {
         "last"
       ) || changeImageTo(state.pageGroups.length - 1);
     } else if (requested.name === CommandName.SPREAD_CYCLE) {
-      handled = requestSpreadMode(nextSpreadMode(state.spreadMode));
+      handled = requestSpreadMode(extractedResultViewerContext()
+        ? (state.spreadMode === SpreadMode.SINGLE ? SpreadMode.LTR : SpreadMode.SINGLE)
+        : state.container?.compositionManaged
+          ? (state.spreadMode === SpreadMode.SINGLE ? (state.readingDirection === ReadingDirection.RTL ? SpreadMode.RTL : SpreadMode.LTR)
+            : [SpreadMode.SPLIT_LTR, SpreadMode.SPLIT_RTL].includes(state.spreadMode) ? SpreadMode.SINGLE
+            : state.readingDirection === ReadingDirection.RTL ? SpreadMode.SPLIT_RTL : SpreadMode.SPLIT_LTR)
+          : nextSpreadMode(state.spreadMode), Boolean(state.container?.compositionManaged));
     } else if (requested.name === CommandName.SET_RATING) {
       const stars = Number(requested.payload.stars);
       if (Number.isInteger(stars) && stars >= 0 && stars <= 5) {
@@ -3272,7 +3278,7 @@ function dispatchCommand(requested, meta = {}) {
         [CommandName.SPREAD_SPLIT_LTR]: SpreadMode.SPLIT_LTR,
         [CommandName.SPREAD_SPLIT_RTL]: SpreadMode.SPLIT_RTL,
       };
-      handled = requestSpreadMode(spreadModes[requested.name]);
+      handled = requestSpreadMode(spreadModes[requested.name], Boolean(state.container?.compositionManaged) && [CommandName.SPREAD_SINGLE, CommandName.SPREAD_SPLIT_LTR, CommandName.SPREAD_SPLIT_RTL].includes(requested.name));
     } else {
       let fitMode = null;
       if (requested.name === CommandName.FIT_CYCLE) {
@@ -4682,6 +4688,7 @@ export function applyContainerData(address, data, forceSinglePage, options = {})
     title: data.title ?? "コンテナ",
     address: effectiveAddress,
     requestedAddress: address,
+    compositionManaged: Boolean(data.composition_managed),
     truncated: Boolean(data.truncated),
     entryLimit: Number(data.entry_limit) || 0,
     configuredSpreadMode: data.configured_spread_mode ?? SpreadMode.SINGLE,
@@ -5065,8 +5072,6 @@ async function showSavedCollection(route) {
   state.requestController = controller;
   const data = await apiJson("/api/saved-collection", {
     id: route.collectionId,
-    spread: state.spreadMode,
-    direction: state.readingDirection,
     single: forceSinglePage ? 1 : 0,
   }, controller.signal);
   if (!persistentCollectionRouteRequestIsCurrent({
@@ -6193,7 +6198,22 @@ function shouldForceSinglePageForViewport() {
   }).forceSinglePage;
 }
 
-function requestSpreadMode(mode) {
+function extractedResultViewerContext() {
+  return !state.container && (Boolean(persistentDirectViewerContext()) ||
+    ["rating", "smart"].includes(state.collection?.kind));
+}
+
+export function extractedResultViewMode(mode, direction) {
+  if ([SpreadMode.LTR, SpreadMode.LTR_COVER, SpreadMode.RTL, SpreadMode.RTL_COVER].includes(mode)) {
+    return direction === ReadingDirection.RTL ? SpreadMode.RTL : SpreadMode.LTR;
+  }
+  if ([SpreadMode.SPLIT_LTR, SpreadMode.SPLIT_RTL].includes(mode)) {
+    return direction === ReadingDirection.RTL ? SpreadMode.SPLIT_RTL : SpreadMode.SPLIT_LTR;
+  }
+  return SpreadMode.SINGLE;
+}
+
+function requestSpreadMode(mode, modeOnly = false) {
   const collectionRoute = refreshableCollectionRoute();
   const persistentContext = persistentDirectViewerContext();
   if (
@@ -6205,10 +6225,13 @@ function requestSpreadMode(mode) {
   // アドレス (書庫そのもの) と、本体が見開き設定を引くときのキー (書庫の中のフォルダ)
   // がずれる。要求側へ書くと、書いた行が二度と読まれず**モードを変えられなくなる**
   // (2026-08-26 に実際に起きた: 書庫側の行が 1ページ表示、内側の行が横長分割のまま)。
+  const extracted = extractedResultViewerContext();
+  if (extracted) mode = extractedResultViewMode(mode, state.readingDirection);
   const address = state.container?.address ?? null;
   const spreadIntent = planSpreadIntent({
     address,
     selectedMode: mode,
+    modeOnly,
     currentDirection: state.readingDirection,
     portraitSinglePage: state.localSettings.portraitSinglePage,
     viewportWidth: window.innerWidth,
@@ -6216,7 +6239,7 @@ function requestSpreadMode(mode) {
   });
   const writeRequest = spreadIntent.writeRequest;
   if (!writeRequest && !persistentContext) return false;
-  const readingDirection = writeRequest?.reading_direction ?? spreadIntent.readingDirection;
+  const readingDirection = extracted ? state.readingDirection : writeRequest?.reading_direction ?? state.readingDirection;
   // 一方、文脈の同一性は要求側で見る (`activeSpreadContextIdentity` と揃える)。
   const identity = collectionRoute
     ? collectionHash(collectionRoute.collectionKind, collectionRoute.value)
@@ -10113,6 +10136,7 @@ function remoteBookContainerIdentity(address) {
 export function viewerMenuDefinitions({
   hasContainer,
   barsVisible,
+  extractedResult = false,
   supportsFinalCoverSetting = false,
   finalCoverPreference = "follow_global",
   finalCoverEnabled = true,
@@ -10133,7 +10157,7 @@ export function viewerMenuDefinitions({
     [MenuPageAction.RATING, "レーティング", "★を選択", { menuPage: "rating" }],
     [MenuPageAction.DISPLAY, "表示", "フィット / 原寸", { menuPage: "display" }],
     ...(hasContainer
-      ? [[MenuPageAction.SPREAD, "見開き設定", "1〜5", { menuPage: "spread" }]]
+      ? [[MenuPageAction.SPREAD, extractedResult ? "一時表示" : "見開き設定", extractedResult ? "記憶しません" : "1〜5", { menuPage: "spread" }]]
       : []),
     [
       CommandName.TOGGLE_VIEWER_BARS,
@@ -10157,7 +10181,7 @@ export function viewerMenuDefinitions({
         ["ズーム", "+ / −"],
         ["表示モード", "0 (全体 → 幅 → 原寸)"],
         ...(hasContainer
-          ? [["見開き", "1〜5 (単 / LTR / LTR表紙 / RTL / RTL表紙)"]]
+          ? [["見開き", extractedResult ? "1: 単 / 2〜5: 一時見開き" : "1〜5 (単 / LTR / LTR表紙 / RTL / RTL表紙)"]]
           : []),
         ["操作メニュー", "?"],
         ["先頭 / 最後", "Home / End"],
@@ -10188,8 +10212,13 @@ export function viewerMenuDefinitions({
       ],
     },
     spread: {
-      title: "見開き設定",
-      actions: [
+      title: extractedResult ? "一時表示（記憶しません）" : "見開き設定",
+      actions: extractedResult ? [
+        back,
+        [CommandName.SPREAD_SINGLE, "1ページ表示", "1"],
+        [CommandName.SPREAD_LTR, "見開き", "2〜5"],
+        [CommandName.SPREAD_SPLIT_LTR, "横長分割", "6 / 7"],
+      ] : [
         back,
         [CommandName.SPREAD_SINGLE, "1ページ表示", "1"],
         [CommandName.SPREAD_LTR, "見開き 左→右", "2"],
@@ -10352,8 +10381,9 @@ export function viewerMenuDefinitions({
 function menuDefinition(context, page = "main") {
   if (context === "viewer") {
     const definitions = viewerMenuDefinitions({
-      hasContainer: Boolean(state.container || refreshableCollectionRoute()),
+      hasContainer: Boolean(state.container || refreshableCollectionRoute() || persistentDirectViewerContext()),
       barsVisible: state.viewerBarsVisible,
+      extractedResult: extractedResultViewerContext(),
       supportsFinalCoverSetting: Boolean(state.container),
       finalCoverPreference: state.finalCoverSpreadPreference,
       finalCoverEnabled: state.finalCoverSpreadEnabled,

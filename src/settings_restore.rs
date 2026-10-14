@@ -726,17 +726,37 @@ pub(crate) fn full_reset_with_permit(
     data_dir: &Path,
     permit: &crate::settings_db::SettingsFamilyMutationPermit,
 ) -> Result<ResetReport, RestoreFailure> {
+    // Worker-only: share the composition maintenance writer boundary.
+    let _composition_lease = crate::book_composition::maintenance_at(data_dir)
+        .map_err(|error| RestoreFailure::Recoverable(RestoreError::ValidationFailed(error)))?;
+    let composition_path = data_dir.join("book_composition.db");
+    let composition_connection =
+        crate::book_composition::store::open_existing(&composition_path)
+            .map_err(|error| RestoreFailure::Recoverable(RestoreError::ValidationFailed(error)))?;
     let save_suppressed_before_reset = crate::settings_db::save_suppressed();
     crate::settings_db::set_save_suppressed(true);
 
     let ts = unix_seconds_now();
-    let snapshot_paths = match snapshot_current_family(data_dir, ts) {
+    let mut snapshot_paths = match snapshot_current_family(data_dir, ts) {
         Ok(s) => s,
         Err(e) => {
             crate::settings_db::set_save_suppressed(save_suppressed_before_reset);
             return Err(RestoreFailure::Recoverable(e));
         }
     };
+
+    if let Some(connection) = &composition_connection {
+        let backup = data_dir.join(format!("book_composition.db.before-reset-{ts}"));
+        if let Err(error) =
+            connection.execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])
+        {
+            crate::settings_db::set_save_suppressed(save_suppressed_before_reset);
+            return Err(RestoreFailure::Recoverable(RestoreError::ValidationFailed(
+                error.to_string(),
+            )));
+        }
+        snapshot_paths.push(backup);
+    }
 
     // GLOBAL_DB を落として SQLite ハンドルを閉じる (= remove_file がロック失敗
     // するのを避ける)。⚠️ ここから先の失敗はすべて Terminal。
@@ -747,6 +767,19 @@ pub(crate) fn full_reset_with_permit(
         )));
     }
 
+    if let Some(mut connection) = composition_connection {
+        let transaction = connection.transaction().map_err(|error| {
+            RestoreFailure::Terminal(RestoreError::ValidationFailed(error.to_string()))
+        })?;
+        transaction
+            .execute("DELETE FROM book_compositions", [])
+            .map_err(|error| {
+                RestoreFailure::Terminal(RestoreError::ValidationFailed(error.to_string()))
+            })?;
+        transaction.commit().map_err(|error| {
+            RestoreFailure::Terminal(RestoreError::ValidationFailed(error.to_string()))
+        })?;
+    }
     let mut deleted: Vec<PathBuf> = Vec::new();
     for name in family_deletion_order_main_last() {
         let p = data_dir.join(&name);
@@ -1089,6 +1122,86 @@ mod tests {
             }
         }
         result
+    }
+
+    #[test]
+    fn composition_full_reset_snapshots_and_clears_only_composition_records() {
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        std::fs::write(dir.join("settings.db"), b"main").unwrap();
+        let path = dir.join("book_composition.db");
+        crate::book_composition::initialize_database_at(&path).unwrap();
+        let root = dir.join("original.pdf");
+        let scope = crate::book_scope::BookScopeKey::document(&root).unwrap();
+        let composition = crate::book_composition::fixtures::four_page_book(
+            crate::book_composition::ReadingDirection::Ltr,
+        );
+        {
+            let connection = Connection::open(&path).unwrap();
+            crate::book_composition::store::replace_row_in(
+                &connection,
+                "book_compositions",
+                &scope.storage_key(),
+                &crate::book_composition::PageDomain::Document,
+                &composition,
+            )
+            .unwrap();
+        }
+        std::fs::write(dir.join("spread_shift.db"), b"untouched").unwrap();
+        std::fs::write(dir.join("mimageviewer.dat"), b"untouched backup").unwrap();
+        let report = full_reset(dir).unwrap();
+        let backup = report
+            .snapshot_paths
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("book_composition.db.before-reset-")
+            })
+            .unwrap();
+        let restored = Connection::open(backup).unwrap();
+        let rows = crate::book_composition::store::load_rows(&restored).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[&scope.storage_key()].composition.units,
+            composition.units
+        );
+        assert!(
+            crate::book_composition::store::load_rows(&Connection::open(path).unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            std::fs::read(dir.join("spread_shift.db")).unwrap(),
+            b"untouched"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("mimageviewer.dat")).unwrap(),
+            b"untouched backup"
+        );
+    }
+
+    #[test]
+    fn composition_full_reset_unknown_store_protects_settings_and_composition_bytes() {
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        std::fs::write(dir.join("settings.db"), b"settings-original").unwrap();
+        let path = dir.join("book_composition.db");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection.execute_batch("PRAGMA user_version=99;").unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+        assert!(matches!(
+            full_reset(dir),
+            Err(RestoreFailure::Recoverable(_))
+        ));
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        assert_eq!(
+            std::fs::read(dir.join("settings.db")).unwrap(),
+            b"settings-original"
+        );
     }
 
     /// `list_backups` は存在する世代だけ返し、無い世代はスキップする。

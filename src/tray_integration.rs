@@ -221,6 +221,12 @@ impl App {
     /// 閉じるボタン [×] が押されたか検出し、設定 ON + トレイ起動中なら hide に差し替える。
     /// 返り値は「hide に差し替えた (= アプリを終了させない)」かどうか。
     pub(crate) fn maybe_intercept_close(&mut self, ctx: &egui::Context) -> bool {
+        // The conversion owns its close barrier through resource/adoption completion.
+        // Keep the window visible now; its terminal uses this same tray-vs-exit policy.
+        if self.image_folder_zip_operation.is_some() {
+            self.defer_image_folder_zip_root_close(ctx);
+            return false;
+        }
         // トレイメニュー「終了」 / インストーラからの shutdown 要求は常に通す。
         let tray_wants_quit = self
             .tray_controller

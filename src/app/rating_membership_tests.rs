@@ -839,6 +839,7 @@ fn rating_edit_boundary_commits_local_gesture_to_outgoing_key_and_preserves_rati
     ]);
     app.local_adjust_mode = true;
     app.local_adjust_canvas_drag = Some(LocalAdjustCanvasDrag {
+        owner: app.capture_page_edit_owner(0).unwrap(),
         fs_idx: 0,
         layer_idx: 0,
         kind: LocalAdjustCanvasDragKind::LinearGradientStart,
@@ -885,6 +886,8 @@ fn rating_edit_boundary_commits_adjustment_drag_before_outgoing_slot_is_reused()
     app.adjustment_page_params.insert(0, after.clone());
     app.adjustment_drag_session = Some(AdjustmentDragSession {
         fs_idx: 0,
+        owner: app.capture_page_edit_owner(0).unwrap(),
+        draft: Some(after.clone()),
         before: None,
     });
     app.adjustment_dragging = true;
@@ -943,6 +946,8 @@ fn rating_poll_rejects_prepared_slots_when_finishing_old_page_edit_changes_read_
     app.adjustment_page_params.insert(0, after.clone());
     app.adjustment_drag_session = Some(AdjustmentDragSession {
         fs_idx: 0,
+        owner: app.capture_page_edit_owner(0).unwrap(),
+        draft: Some(after.clone()),
         before: None,
     });
     assert!(crate::page_edit_write_epoch::PAGE_EDIT_WRITES.accepts(prepared_stamp));
@@ -986,6 +991,7 @@ fn automatic_rating_open_and_close_finish_local_edit_without_losing_rating_redo(
         ]);
         app.local_adjust_mode = true;
         app.local_adjust_canvas_drag = Some(LocalAdjustCanvasDrag {
+            owner: app.capture_page_edit_owner(0).unwrap(),
             fs_idx: 0,
             layer_idx: 0,
             kind: LocalAdjustCanvasDragKind::LinearGradientStart,

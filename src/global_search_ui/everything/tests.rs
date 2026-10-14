@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Headless lifecycle checks. The name-search transport is never called: completed datasets
 //! enter the same Search prepare/adoption owner used by production.
 #![cfg(test)]
@@ -162,6 +164,15 @@ fn completed_dataset_publishes_rows_stamps_identity_and_source_at_one_ready_boun
     assert!(app.items_are_global_search_view);
     assert!(!app.everything_search_progress_visible());
     assert_eq!(app.global_search.last_executed, "ext:jpg");
+    assert_eq!(
+        app.projection_recipe,
+        crate::app::book_materialization::ProjectionRecipe::ExtractedResult(
+            crate::app::book_materialization::ExtractedSurface::Search(
+                crate::app::top_level_grid_view::TopLevelSearchView::Global,
+            ),
+        ),
+        "prepared Everything rows use the G1 extracted projection at adoption",
+    );
     for (index, item) in app.items.iter().enumerate() {
         assert_eq!(
             app.page_identity_index
@@ -583,6 +594,12 @@ fn physical_open_acceptance_keeps_logical_archive_identity_and_returns_exact_sel
     } if logical_source == &logical && return_anchor == &logical)
     );
     app.current_folder = Some(cache.clone());
+    app.projection_recipe = crate::app::book_materialization::ProjectionRecipe::Book(
+        crate::app::book_materialization::BookScope::Archive {
+            logical_root: logical.clone(),
+            prefix: Vec::new(),
+        },
+    );
     app.items = vec![GridItem::ZipImage {
         zip_path: cache,
         entry_name: "page.jpg".into(),
@@ -612,6 +629,15 @@ fn physical_open_acceptance_keeps_logical_archive_identity_and_returns_exact_sel
     assert_eq!(app.items[app.selected.unwrap()], archive);
     assert!(app.scroll_to_selected);
     assert_eq!(app.global_search.last_executed, "book");
+    assert_eq!(
+        app.projection_recipe,
+        crate::app::book_materialization::ProjectionRecipe::ExtractedResult(
+            crate::app::book_materialization::ExtractedSurface::Search(
+                crate::app::top_level_grid_view::TopLevelSearchView::Global,
+            ),
+        ),
+        "return from an Everything book child restores the extracted recipe",
+    );
 }
 
 #[test]
@@ -924,10 +950,11 @@ fn source_boundary_discards_index_owned_undo_before_new_rows_can_use_the_index()
     let ctx = egui::Context::default();
     let old = app.tmp.path().join("old.jpg");
     adopt(&mut app, &ctx, "old", dataset(vec![GridItem::Image(old)]));
+    let target = app.page_adjustment_target_for_idx(0).unwrap();
     app.meta_undo
         .push(crate::undo_stack::UndoEntry::LocalAdjustment {
             changes: vec![crate::undo_stack::LocalAdjustmentChange {
-                idx: 0,
+                target,
                 before: local_adjust_core::LocalAdjustmentLayers::default(),
                 after: local_adjust_core::LocalAdjustmentLayers::default(),
             }],

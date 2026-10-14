@@ -3,6 +3,10 @@
 //! Keep kittest's CPU-adapter preference and independent per-Harness renderer,
 //! but on Windows request only the backends that the product requests.
 
+#[path = "scroll_layout.rs"]
+#[allow(dead_code)] // Each integration test uses only the helpers it needs.
+pub(crate) mod scroll_layout;
+
 #[cfg(windows)]
 #[path = "../../src/wgpu_backend_policy.rs"]
 mod backend_policy;

@@ -101,6 +101,12 @@ struct KnownFindingEntry {
 
 const ALLOWLIST_ENTRIES: &[AllowlistEntry] = &[
     AllowlistEntry {
+        file: "src/app/book_composition_runtime.rs",
+        function: "adopt_book_projection",
+        rule: Rule::A2b,
+        reason: "G3 remaps pending trim and the local-adjustment layer/selection maps by stable page identity while replacing rows in the same mounted context. Every taken value is reinstalled there after install_prepared_aggregate_items; no viewer/window or sibling owns this temporary edit payload. Source/token/items generation and edit-write stamp are qualified before adoption, and pending saves remain on the existing FIFO.",
+    },
+    AllowlistEntry {
         file: "src/app/smart_folder.rs",
         function: "take_visible_smart_folder_grid",
         rule: Rule::A2b,
@@ -139,6 +145,21 @@ const ALLOWLIST_ENTRIES: &[AllowlistEntry] = &[
 // implemented. A6 is therefore deliberately defined against the implementation that exists:
 // cfg(test)-gated App methods/functions ending in _for_test, plus their call sites.
 const PUBLIC_API_ALLOWLIST: &[&str] = &[
+    // 1.372/1.376 already-reviewed master page-edit ownership APIs. History/Exit
+    // take owner commits; producers validate context/target/document, and accepted
+    // publication/eviction touches matching page keys in each owning bundle only.
+    // Keep exact fingerprints so A4 still rejects any unreviewed API expansion.
+    "inherent fn    App ::  pub (super) fn take_parked_page_edit_commits (& mut self) -> Vec < page_edit_owner :: PageEditCommit >",
+    "inherent fn    App ::  pub (super) fn take_parked_page_edit_exit_commits (& mut self ,) -> Vec < page_edit_owner :: PageEditCommit >",
+    "inherent fn    App ::  pub (crate) fn has_page_edit_producers (& self) -> bool",
+    "inherent fn    App ::  pub (crate) fn poll_all_page_edit_producers (& mut self , ctx : & egui :: Context)",
+    "inherent fn    App ::  pub (super) fn cancel_superseded_page_edit_producers (& mut self , key : & str , layers : & local_adjust_core :: LocalAdjustmentLayers , accepted : bool ,)",
+    "inherent fn    App ::  pub (crate) fn publish_accepted_adjustment_page_edits (& mut self , documents : & HashMap < String , Option < crate :: adjustment :: AdjustParams > > ,)",
+    "inherent fn    App ::  pub (crate) fn invalidate_thumb_adjust_for_page_key (& mut self , key : & str)",
+    "inherent fn    App ::  pub (super) fn evict_pinned_adjustment_materializations (& mut self , keys : & std :: collections :: HashSet < String > ,)",
+    "inherent fn    App ::  pub (super) fn publish_finished_adjustment_page_edit (& mut self , owner : & PageEditOwner , params : & Option < crate :: adjustment :: AdjustParams > ,)",
+    "inherent fn    App ::  pub (super) fn publish_accepted_local_page_edits (& mut self , documents : & HashMap < String , local_adjust_core :: LocalAdjustmentLayers > ,)",
+    "inherent fn    App ::  pub (super) fn refresh_pending_page_edit_projections (& mut self)",
     // 1.341 reads mounted/at-rest readiness and addresses the existing owning
     // context/viewport. Only explicit settings/tray operations visit all owners;
     // normal mount/deposit never invalidates a sibling's presentation.
@@ -147,6 +168,8 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     "inherent fn    App ::  pub (crate) fn page_turn_operation_tracking_needed (& self) -> bool",
     "inherent fn    App ::  pub (crate) fn deactivate_all_page_turn_presentations (& mut self , reason : & 'static str)",
     "inherent fn    App ::  pub (crate) fn cancel_all_page_turn_effects_for_settings (& mut self)",
+    // 1.242 G2B polls only pending or changed-scope retained owners; no sibling mutation.
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn book_composition_contexts_to_poll (& self , changed : & [String] ,) -> Vec < ViewerContextId >",
     // 1.364 D2 routes write replies by context ID and validates the owning command/scope.
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn deliver_spread_shift_reply_at_rest (& mut self , reply : & crate :: spread_shift :: ShiftWriteReply ,) -> Option < bool >",
     // 1.364 D2 applies the memory setting to retained owners without navigation or saving.
@@ -181,7 +204,8 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     "item enum # [cfg (windows)] pub (in crate :: app) enum BuildOutcome { Commit , Abort (& 'static str) , }",
     "item enum # [cfg (windows)] pub (in crate :: app) enum RetireContextError { Mount (MountError) , Retire (RetireError) , }",
     // 1.364 D2 keeps the accepted spread-shift owner in the bundle across mount/swap/fork.
-    "item struct # [cfg (windows)] pub (in crate :: app) struct ViewerContextBundle { pub (super) spread_shift : super :: spread_shift_owner :: ViewerSpreadShift }",
+    // 1.242 G1-G4 retains recipe/composition/editor state in this same context owner.
+    "item struct # [cfg (windows)] pub (in crate :: app) struct ViewerContextBundle { pub (super) spread_shift : super :: spread_shift_owner :: ViewerSpreadShift , pub (super) book_composition : super :: book_composition_runtime :: ViewerBookComposition , pub (super) composition_editor : super :: book_composition_editor :: CompositionEditorState , pub (super) book_composition_permission : super :: book_composition_permission :: ViewerPresentationPermission }",
     "trait impl # [cfg (windows)]   ViewerContextBundle  Drop {   fn drop (& mut self) }",
     "item struct # [cfg (windows)] pub (in crate :: app) struct ContextRef < 'a > { }",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn mounted (app : & 'a App) -> Self",
@@ -230,10 +254,12 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     "inherent fn # [cfg (not (windows))]   App ::  pub (in crate :: app) fn viewer_context_ids (& self) -> Vec < ViewerContextId >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn other_viewer_context_ids (& self) -> Vec < ViewerContextId >",
     // 1.364 D2 adds context-owned retained readoption with mounted poll and park cancellation.
-    "item enum # [cfg (windows)] pub (in crate :: app) enum ContextAsyncOwner { RetainedSpreadShift , PathClassification , HistoryTransition , CollectionGrid , CollectionNavigation , RatingNavigation , BookmarkOpen , FolderNavigation , FolderPaneScan , PdfEnumeration , ZipEnumeration , EpubConversion , PdfPassword , FullscreenDecode , RawPages , FinalAi , LocalAdjustment , ComicBake , EraseInpaint , SimilarPreview , }",
+    // 1.242 G1-G4 retains recipe/composition/editor state in this same context owner.
+    "item enum # [cfg (windows)] pub (in crate :: app) enum ContextAsyncOwner { BookCompositionRead , RetainedSpreadShift , PathClassification , HistoryTransition , CollectionGrid , CollectionNavigation , RatingNavigation , BookmarkOpen , FolderNavigation , FolderPaneScan , PdfEnumeration , ZipEnumeration , EpubConversion , PdfPassword , FullscreenDecode , RawPages , FinalAi , LocalAdjustment , ComicBake , EraseInpaint , SimilarPreview , }",
     "item enum # [cfg (windows)] pub (in crate :: app) enum ContextAsyncServicePhase { Background , Dialog , }",
-    // 1.364 D2 adds RetainedSpreadShift first; freeze the exact ordered 20-owner inventory.
-    "inherent const # [cfg (windows)]   ContextAsyncOwner :: pub (in crate :: app) const ALL : [Self ; 20] = [Self :: RetainedSpreadShift , Self :: EpubConversion , Self :: PdfPassword , Self :: PathClassification , Self :: HistoryTransition , Self :: CollectionGrid , Self :: CollectionNavigation , Self :: RatingNavigation , Self :: BookmarkOpen , Self :: FolderNavigation , Self :: FolderPaneScan , Self :: PdfEnumeration , Self :: ZipEnumeration , Self :: FullscreenDecode , Self :: RawPages , Self :: FinalAi , Self :: LocalAdjustment , Self :: ComicBake , Self :: EraseInpaint , Self :: SimilarPreview ,] ;",
+    // 1.242 G2B adds BookCompositionRead before the E owner; freeze all 21 in order.
+    // 1.242 G1-G4 retains recipe/composition/editor state in this same context owner.
+    "inherent const # [cfg (windows)]   ContextAsyncOwner :: pub (in crate :: app) const ALL : [Self ; 21] = [Self :: BookCompositionRead , Self :: RetainedSpreadShift , Self :: EpubConversion , Self :: PdfPassword , Self :: PathClassification , Self :: HistoryTransition , Self :: CollectionGrid , Self :: CollectionNavigation , Self :: RatingNavigation , Self :: BookmarkOpen , Self :: FolderNavigation , Self :: FolderPaneScan , Self :: PdfEnumeration , Self :: ZipEnumeration , Self :: FullscreenDecode , Self :: RawPages , Self :: FinalAi , Self :: LocalAdjustment , Self :: ComicBake , Self :: EraseInpaint , Self :: SimilarPreview ,] ;",
     "inherent fn # [cfg (windows)]   ContextAsyncOwner ::  pub (in crate :: app) fn is_pending (self , context : ContextRef < '_ >) -> bool",
     "inherent fn # [cfg (windows)]   ContextAsyncOwner ::  pub (in crate :: app) fn needs_mounted_service (self , context : ContextRef < '_ >) -> bool",
     "inherent fn # [cfg (windows)]   ContextAsyncOwner ::  pub (in crate :: app) fn service (self , app : & mut App , ctx : & egui :: Context , phase : ContextAsyncServicePhase ,)",

@@ -12,6 +12,8 @@ mod input_regression_tests;
 #[cfg(test)]
 mod landscape_tests;
 #[cfg(all(test, windows))]
+mod merge_master_tests;
+#[cfg(all(test, windows))]
 mod merge_tests;
 #[cfg(test)]
 mod nonfinal_tests;
@@ -1721,9 +1723,24 @@ impl App {
         }
         let composition = self.spread_display_composition_for_anchor(target);
         let occurrences = composition.pages_in_screen_order(self.spread_mode);
-        if let Some(reason) =
-            stage_one_shape_reason(self.spread_mode, occurrences.iter().copied(), false)
-        {
+        // Composition permission belongs to the ordinary presentation owner.
+        // A turn cannot select or pin a cached Hidden/Checking companion, or
+        // reinterpret a partially permitted unit as the full incoming paper.
+        let demand =
+            composition.presentation_demand(self.spread_mode, crate::page_split::PageSlice::Full);
+        if !matches!(
+            self.book_presentation_allowed(&demand),
+            crate::book_composition::PresentationDecision::Allowed(allowed)
+                if allowed.len() == demand.len() && allowed.iter().all(|allowed| *allowed)
+        ) {
+            emit(&fact, "skip", "book_presentation_not_fully_allowed", &[]);
+            return;
+        }
+        if let Some(reason) = stage_one_shape_reason(
+            self.spread_mode,
+            occurrences.iter().copied(),
+            composition.singleton_placement.has_white_companion(),
+        ) {
             emit(&fact, "skip", reason, &[]);
             return;
         }

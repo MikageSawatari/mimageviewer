@@ -1750,7 +1750,14 @@ fn mutation_refresh_navigation_retires_pin_materialization_owner_and_keeps_sibli
             None,
             mounted.settings.file_type_visibility.clone(),
         ));
-        mounted.install_prepared_aggregate_items(items, vec![None], page_identity_index);
+        mounted.install_prepared_aggregate_items(
+            crate::app::book_materialization::ProjectionRecipe::ExtractedResult(
+                crate::app::book_materialization::ExtractedSurface::Collection,
+            ),
+            items,
+            vec![None],
+            page_identity_index,
+        );
         assert!(sibling_cancel.load(Ordering::Relaxed));
         assert!(!mounted.current_view_pin_refreshes.contains_key(&sibling));
         assert!(!successor_cancel.load(Ordering::Relaxed));
@@ -20410,6 +20417,47 @@ mod phase_c_folder_nav_history_tests {
         );
     }
 
+    #[test]
+    fn g1_history_back_from_a2_adopts_original_book_view_without_writing_a2() {
+        use crate::app::book_materialization::{ExtractedSurface, ProjectionRecipe};
+        use crate::settings::{ReadingDirection, ReadingFlow, SpreadMode};
+        let mut app = setup_app();
+        let book = app.tmp.path().join("g1-return-book");
+        std::fs::create_dir_all(&book).unwrap();
+        std::fs::write(book.join("01.jpg"), []).unwrap();
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.settings.auto_fullscreen_image_folders = true;
+        app.active_quick_folder_slot = None;
+        let db_path = app.tmp.path().join("g1-return-spread.db");
+        app.spread_db = Ok(crate::spread_db::SpreadDb::open_at(&db_path).unwrap());
+        app.spread_db
+            .as_ref()
+            .unwrap()
+            .set(
+                &book,
+                SpreadMode::RtlCover,
+                SpreadMode::Single,
+                ReadingFlow::Paged,
+                ReadingDirection::Rtl,
+            )
+            .unwrap();
+        app.current_folder = Some(super::rating_view_synthetic_path());
+        app.projection_recipe = ProjectionRecipe::ExtractedResult(ExtractedSurface::Rating);
+        app.begin_extracted_result_view();
+        app.apply_fullscreen_spread_mode(&egui::Context::default(), 0, SpreadMode::Ltr);
+        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(book.clone()).into()];
+        app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
+        finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(app.current_folder.as_ref(), Some(&book));
+        assert!(matches!(app.projection_recipe, ProjectionRecipe::Book(_)));
+        assert_eq!(app.spread_mode, SpreadMode::RtlCover);
+        assert_eq!(app.reading_direction, ReadingDirection::Rtl);
+        assert_eq!(
+            app.spread_db.as_ref().unwrap().get(&book),
+            Some(SpreadMode::RtlCover)
+        );
+    }
+
     pub(super) fn finish_staged_physical_history_for_test(app: &mut App) {
         let ctx = egui::Context::default();
         for _ in 0..1000 {
@@ -29442,6 +29490,8 @@ mod phase_c_drill_nav_tests {
         app.adjustment_page_params.insert(0, after);
         app.adjustment_drag_session = Some(AdjustmentDragSession {
             fs_idx: 0,
+            owner: app.capture_page_edit_owner(0).unwrap(),
+            draft: app.adjustment_page_params.get(&0).cloned(),
             before: Some(before),
         });
         app.thumb_adjust_drag_color_dirty = true;
@@ -34165,12 +34215,14 @@ mod favorite_adjustment_defaults_tests {
         (app, folder)
     }
 
-    /// 唯一積まれている保存の (key, generation)。
-    fn only_pending_local_adjust_write(app: &App) -> (String, u64) {
+    /// 唯一積まれている保存の (key, generation, enqueue時のorigin)。
+    fn only_pending_local_adjust_write(
+        app: &App,
+    ) -> (String, u64, crate::app::LocalAdjustWriteOrigin) {
         assert_eq!(app.local_adjust_write_pending.len(), 1);
         app.local_adjust_write_pending
             .iter()
-            .map(|(key, pending)| (key.clone(), pending.generation))
+            .map(|(key, pending)| (key.clone(), pending.generation, pending.origin.clone()))
             .next()
             .unwrap()
     }
@@ -34225,7 +34277,7 @@ mod favorite_adjustment_defaults_tests {
     fn a_committed_write_mirrors_exactly_the_document_that_was_written() {
         let (mut app, folder) = app_with_one_page_for_local_adjust();
         app.set_local_adjust_layers_for_idx(0, local_adjust_doc("enqueued"));
-        let (key, generation) = only_pending_local_adjust_write(&app);
+        let (key, generation, origin) = only_pending_local_adjust_write(&app);
         // 完了までの間にもう一度編集された状況を作る。写るのは worker が書いた方。
         app.set_local_adjust_layers_for_idx_memory_only(0, local_adjust_doc("later"));
 
@@ -34233,6 +34285,7 @@ mod favorite_adjustment_defaults_tests {
             crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
                 key,
                 generation,
+                origin: Some(origin),
                 layers: local_adjust_doc("written"),
                 outcome: crate::app::EditStoreOutcome::Committed,
             },
@@ -34259,12 +34312,13 @@ mod favorite_adjustment_defaults_tests {
     fn a_write_with_no_store_open_is_not_mirrored_and_is_reported() {
         let (mut app, folder) = app_with_one_page_for_local_adjust();
         app.set_local_adjust_layers_for_idx(0, local_adjust_doc("edited"));
-        let (key, generation) = only_pending_local_adjust_write(&app);
+        let (key, generation, origin) = only_pending_local_adjust_write(&app);
 
         app.apply_local_adjust_write_completion(
             crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
                 key,
                 generation,
+                origin: Some(origin),
                 layers: local_adjust_doc("edited"),
                 outcome: crate::app::EditStoreOutcome::Unavailable,
             },
@@ -34290,12 +34344,13 @@ mod favorite_adjustment_defaults_tests {
     fn a_refused_write_is_not_mirrored_and_is_reported() {
         let (mut app, folder) = app_with_one_page_for_local_adjust();
         app.set_local_adjust_layers_for_idx(0, local_adjust_doc("edited"));
-        let (key, generation) = only_pending_local_adjust_write(&app);
+        let (key, generation, origin) = only_pending_local_adjust_write(&app);
 
         app.apply_local_adjust_write_completion(
             crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
                 key,
                 generation,
+                origin: Some(origin),
                 layers: local_adjust_doc("edited"),
                 outcome: crate::app::EditStoreOutcome::Failed("disk full".to_string()),
             },
@@ -34357,13 +34412,14 @@ mod favorite_adjustment_defaults_tests {
     fn an_older_committed_completion_still_publishes_while_a_newer_save_is_pending() {
         let (mut app, folder) = app_with_one_page_for_local_adjust();
         app.set_local_adjust_layers_for_idx(0, local_adjust_doc("first"));
-        let (key, stale_generation) = only_pending_local_adjust_write(&app);
+        let (key, stale_generation, stale_origin) = only_pending_local_adjust_write(&app);
         app.set_local_adjust_layers_for_idx(0, local_adjust_doc("second"));
 
         app.apply_local_adjust_write_completion(
             crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
                 key: key.clone(),
                 generation: stale_generation,
+                origin: Some(stale_origin),
                 layers: local_adjust_doc("first"),
                 outcome: crate::app::EditStoreOutcome::Committed,
             },
@@ -34390,14 +34446,15 @@ mod favorite_adjustment_defaults_tests {
     fn a_committed_save_stays_mirrored_when_the_next_save_fails() {
         let (mut app, folder) = app_with_one_page_for_local_adjust();
         app.set_local_adjust_layers_for_idx(0, local_adjust_doc("committed"));
-        let (key, committed_generation) = only_pending_local_adjust_write(&app);
+        let (key, committed_generation, committed_origin) = only_pending_local_adjust_write(&app);
         app.set_local_adjust_layers_for_idx(0, local_adjust_doc("doomed"));
-        let (_, doomed_generation) = only_pending_local_adjust_write(&app);
+        let (_, doomed_generation, doomed_origin) = only_pending_local_adjust_write(&app);
 
         app.apply_local_adjust_write_completion(
             crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
                 key: key.clone(),
                 generation: committed_generation,
+                origin: Some(committed_origin),
                 layers: local_adjust_doc("committed"),
                 outcome: crate::app::EditStoreOutcome::Committed,
             },
@@ -34406,6 +34463,7 @@ mod favorite_adjustment_defaults_tests {
             crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
                 key,
                 generation: doomed_generation,
+                origin: Some(doomed_origin),
                 layers: local_adjust_doc("doomed"),
                 outcome: crate::app::EditStoreOutcome::Failed("disk full".to_string()),
             },
@@ -34431,11 +34489,12 @@ mod favorite_adjustment_defaults_tests {
     fn a_committed_empty_document_removes_the_sidecar_entry() {
         let (mut app, folder) = app_with_one_page_for_local_adjust();
         app.set_local_adjust_layers_for_idx(0, local_adjust_doc("edited"));
-        let (key, generation) = only_pending_local_adjust_write(&app);
+        let (key, generation, origin) = only_pending_local_adjust_write(&app);
         app.apply_local_adjust_write_completion(
             crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
                 key: key.clone(),
                 generation,
+                origin: Some(origin),
                 layers: local_adjust_doc("edited"),
                 outcome: crate::app::EditStoreOutcome::Committed,
             },
@@ -34444,10 +34503,12 @@ mod favorite_adjustment_defaults_tests {
 
         app.set_local_adjust_layers_for_idx(0, local_adjust_core::LocalAdjustmentLayers::default());
         let generation = app.local_adjust_write_pending[&key].generation;
+        let origin = app.local_adjust_write_pending[&key].origin.clone();
         app.apply_local_adjust_write_completion(
             crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
                 key,
                 generation,
+                origin: Some(origin),
                 layers: local_adjust_core::LocalAdjustmentLayers::default(),
                 outcome: crate::app::EditStoreOutcome::Committed,
             },
@@ -34467,7 +34528,7 @@ mod favorite_adjustment_defaults_tests {
     fn the_mirror_target_is_the_one_fixed_when_the_save_was_enqueued() {
         let (mut app, folder) = app_with_one_page_for_local_adjust();
         app.set_local_adjust_layers_for_idx(0, local_adjust_doc("edited"));
-        let (key, generation) = only_pending_local_adjust_write(&app);
+        let (key, generation, origin) = only_pending_local_adjust_write(&app);
 
         // 一覧が入れ替わり、idx 0 は別フォルダの別ページを指すようになった。
         let other = app.tmp.path().join("other");
@@ -34480,6 +34541,7 @@ mod favorite_adjustment_defaults_tests {
             crate::local_adjust_write_worker::LocalAdjustWriteCompletion {
                 key,
                 generation,
+                origin: Some(origin),
                 layers: local_adjust_doc("written"),
                 outcome: crate::app::EditStoreOutcome::Committed,
             },
@@ -35511,6 +35573,7 @@ mod favorite_adjustment_defaults_tests {
         app.settings.global_preset = before.clone();
         app.adjustment_page_params.insert(idx, after.clone());
         app.adjustment_standard_drag_session = Some(AdjustmentStandardDragSession {
+            draft: after.clone(),
             scope: AdjustmentStandardScope::Global,
             before,
         });
@@ -38309,7 +38372,7 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(app.fullscreen_idx, Some(target_idx));
 
         // ツールが動いている間は戻さない。
-        app.local_adjust_spread_ctx = Some(pivot);
+        app.local_adjust_spread_ctx = app.capture_local_page_edit_pivot(pivot);
         app.local_adjust_mode = true;
         app.reconcile_page_edit_spread_pivots();
         assert_eq!(app.spread_mode, SpreadMode::Single, "ツール中は倒したまま");
@@ -38360,7 +38423,9 @@ mod favorite_adjustment_defaults_tests {
             (2, |app, p| app.text_spread_ctx = Some(p)),
             (3, |app, p| app.export_crop_spread_ctx = Some(p)),
             (4, |app, p| app.sns_split_spread_ctx = Some(p)),
-            (5, |app, p| app.local_adjust_spread_ctx = Some(p)),
+            (5, |app, p| {
+                app.local_adjust_spread_ctx = app.capture_local_page_edit_pivot(p)
+            }),
         ] {
             app.enter_page_edit_single_view(target_idx);
             put(&mut app, pivot);
@@ -38404,7 +38469,7 @@ mod favorite_adjustment_defaults_tests {
 
             // Select the physical cover source, as a left/right switch inside the editor does.
             app.enter_page_edit_single_view(0);
-            app.local_adjust_spread_ctx = Some(pivot);
+            app.local_adjust_spread_ctx = app.capture_local_page_edit_pivot(pivot);
             app.local_adjust_mode = true;
             assert_eq!(
                 app.fullscreen_idx,
@@ -38424,7 +38489,7 @@ mod favorite_adjustment_defaults_tests {
             // Closing or switching books tears the editor down instead of restoring the spread,
             // but the grid/resume cursor still comes from the saved navigation anchor.
             app.enter_page_edit_single_view(0);
-            app.local_adjust_spread_ctx = Some(pivot);
+            app.local_adjust_spread_ctx = app.capture_local_page_edit_pivot(pivot);
             app.local_adjust_mode = true;
             app.close_fullscreen();
             assert_eq!(app.fullscreen_idx, None);
@@ -49961,11 +50026,12 @@ mod favorite_adjustment_defaults_tests {
         app.fullscreen_idx = Some(0);
         app.spread_mode = SpreadMode::Single;
         app.local_adjust_mode = true;
-        app.local_adjust_spread_ctx = Some(crate::app::PageEditSpreadPivot {
-            saved_mode: SpreadMode::Ltr,
-            pair: (0, 1),
-            navigation_anchor_idx: 0,
-        });
+        app.local_adjust_spread_ctx =
+            app.capture_local_page_edit_pivot(crate::app::PageEditSpreadPivot {
+                saved_mode: SpreadMode::Ltr,
+                pair: (0, 1),
+                navigation_anchor_idx: 0,
+            });
 
         // 左ページで「投げ縄を描きかけ、図形を 1 つ選び、ドラッグ単位 Undo の退避も
         // 持っている」状態を作る。
@@ -72044,6 +72110,17 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     #[test]
     fn remote_session_barriers_keep_modal_until_final_release() {
         let mut app = setup_app();
+        // App startup admits an asynchronous meter read. This test isolates the AI
+        // terminal lease, so first fence that independent work by its actual receipt.
+        // A single UI poll cannot promise that the writer has finished under load.
+        let writer = app.book_resume_writer.as_ref().expect("resume writer");
+        let cutoff = writer.watermarks().admitted;
+        let startup = writer
+            .read_position_after("remote-session-startup", cutoff)
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("startup resume read completion");
+        startup.status.expect("startup resume read succeeded");
+        assert!(startup.completed_through >= cutoff);
         let ctx = egui::Context::default();
         let handle = crate::remote_ipc::session::SessionHandle::new();
         app.set_remote_session_handle(handle.clone());
@@ -72112,6 +72189,73 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             after_later_poll.control_return_sequence,
             released.control_return_sequence
         );
+    }
+
+    #[test]
+    fn remote_session_barriers_wait_for_resume_read_after_local_worker_release() {
+        use crate::remote_ipc::session::RemoteControlPhase;
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let handle = crate::remote_ipc::session::SessionHandle::new();
+        app.set_remote_session_handle(handle.clone());
+        assert!(app.spread_shift_service.is_none());
+        assert!(app.book_composition_service.is_none());
+        assert!(app.composition_editor_acquire_ready());
+
+        // This is the same Read command used by BookResumeMeters::reload at startup.
+        // Hold its real worker before admission, without sleeps or UI-poll retries.
+        let writer = app.book_resume_writer.as_ref().expect("resume writer");
+        let release = writer.pause_for_test();
+        let read = writer.read_all();
+        let pending = writer.watermarks();
+        assert_eq!(pending.admitted, pending.completed_through + 1);
+
+        let local_ai_activity = app.local_ai_activity_lease();
+        handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
+            client_id: "phone".to_owned(),
+            peer: mimageviewer_ipc::SessionPeerInfo {
+                connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+                device_name: None,
+            },
+        });
+        app.poll_remote_session(&ctx);
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::AcquiringRemote);
+        drop(local_ai_activity);
+        assert!(app.local_ai_remote_barrier_snapshot().is_quiesced());
+        assert_eq!(
+            app.local_viewer_close_state(None),
+            crate::app::LocalViewerCloseState::Closed
+        );
+        app.poll_remote_session(&ctx);
+        assert_eq!(
+            handle.snapshot().phase,
+            RemoteControlPhase::AcquiringRemote,
+            "AI completion alone cannot release an outstanding resume read"
+        );
+        assert_eq!(
+            app.book_resume_writer.as_ref().unwrap().watermarks(),
+            pending
+        );
+        assert!(app.remote_session_blocks_local_control());
+        assert_eq!(handle.snapshot().acquisition_sequence, 1);
+        assert_eq!(handle.snapshot().control_return_sequence, 0);
+
+        release.send(()).unwrap();
+        read.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("held resume read completion")
+            .expect("held resume read succeeded");
+        let completed = app.book_resume_writer.as_ref().unwrap().watermarks();
+        assert_eq!(completed.admitted, pending.admitted);
+        assert_eq!(completed.completed_through, pending.admitted);
+        app.poll_remote_session(&ctx);
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::RemoteActive);
+
+        handle.local_disconnect();
+        app.poll_remote_session(&ctx);
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::Local);
+        assert_eq!(handle.snapshot().control_return_sequence, 1);
+        assert!(!app.remote_session_blocks_local_control());
     }
 
     #[test]
@@ -73597,13 +73741,9 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert!(app.local_adjust_pages.contains(&image));
         assert_eq!(app.spread_mode, crate::settings::SpreadMode::Ltr);
         assert!(app.thumb_adjust_tex.contains_key(&image));
-        let same_page_params = app.effective_params(image).clone();
-        app.set_page_params(image, same_page_params);
-        assert!(
-            app.adjustment_page_params.contains_key(&image),
-            "live-park 後も既存ページ個別値を見て、標準への誤フォールバック削除をしない"
-        );
-
+        // Read-only fork must not copy the main editor's projection. Check this
+        // before the first durable page write, which intentionally publishes to
+        // every same-key context under the accepted-page contract.
         let parked_id = app.detached_image_windows[0].id;
         let main_items_len = app.items.len();
         app.with_window_viewer_context(parked_id, |parked| {
@@ -73619,6 +73759,30 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             assert!(parked.thumb_adjust_tex.is_empty());
         })
         .expect("parked bundle");
+        let same_page_params = app.effective_params(image).clone();
+        app.set_page_params(image, same_page_params.clone());
+        assert!(
+            app.adjustment_page_params.contains_key(&image),
+            "live-park 後も既存ページ個別値を見て、標準への誤フォールバック削除をしない"
+        );
+
+        app.with_window_viewer_context(parked_id, |parked| {
+            assert_eq!(parked.items.len(), main_items_len);
+            assert!(matches!(
+                parked.fs_cache.get(&video),
+                Some(FsCacheEntry::Video { .. })
+            ));
+            assert_eq!(parked.adjustment_page_params.len(), 1);
+            assert_eq!(
+                parked.adjustment_page_params.get(&image),
+                Some(&same_page_params)
+            );
+            assert!(parked.mask_pages.is_empty());
+            assert!(parked.local_adjust_pages.is_empty());
+            assert_eq!(parked.spread_mode, crate::settings::SpreadMode::Single);
+            assert!(parked.thumb_adjust_tex.is_empty());
+        })
+        .expect("accepted page publication to parked bundle");
     }
 
     #[test]
@@ -74581,12 +74745,23 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert!(!app.rename_migration_writers_busy());
 
         // 積んだが完了を回収していない状態。
+        let context = app.projected_viewer_context_id();
         app.local_adjust_write_pending.insert(
             "c:/pics/page.png".to_string(),
             crate::app::LocalAdjustWritePending {
                 generation: 1,
-                idx: 0,
-                sidecar: None,
+                origin: crate::app::LocalAdjustWriteOrigin {
+                    context,
+                    target: crate::app::PageAdjustmentTarget {
+                        page_key: "c:/pics/page.png".to_string(),
+                        location_path: Some(PathBuf::from("c:/pics")),
+                        sidecar_coords: None,
+                        compiled_book: false,
+                        idx_hint: crate::app::PageIndexHint::At(0),
+                    },
+                    revision: 0,
+                },
+                layers: Default::default(),
             },
         );
         assert!(
@@ -79535,6 +79710,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.adjustment_page_params.insert(idx, after.clone());
         app.adjustment_drag_session = Some(AdjustmentDragSession {
             fs_idx: idx,
+            owner: app.capture_page_edit_owner(idx).unwrap(),
+            draft: Some(after.clone()),
             before: Some(before),
         });
 
@@ -98952,6 +99129,7 @@ fn prepared_aggregate_installs_exact_per_item_edit_state() {
     };
 
     app.start_loading_subfolder_items(
+        crate::app::book_materialization::ExtractedSurface::SubfolderExpansion,
         PathBuf::from("__smart_folder__\\test"),
         vec![GridItem::Image(path)],
         vec![Some((1, 5))],

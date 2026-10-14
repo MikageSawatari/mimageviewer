@@ -1500,6 +1500,41 @@ R3採択からA0具体的接続の独立構造合意・完了レビューを推�
 複数窓の取消・park/mount・native batch lifetime/実解放、GPU/実present、性能/実用性の受入れは確認待ち。
 詳細と実績/未完了gateは[page-turn-animation-plan.md §12](page-turn-animation-plan.md#12-a0実装差分検証状況2026-10-11)。
 
+### 2026-10-13 §1.242 G: 画像folder→ZIPのprocess modalとcontext限定採用（実装中）
+
+画像folder→ZIP設計R3の独立ACCEPTは利用者報告（対象`7346683c6`）として記録済み。
+今回の製品実装の独立レビューと実機受入は未完了。設計・実装の証拠は
+[画像folder→ZIP計画](image-folder-to-zip-plan.md)へ集約する。
+
+変更caller familyはfolder右クリック、構成対象外案内、`app/image_folder_zip_operation`、
+共通main/fullscreen/detached modal受付と閉じる受付、既存metadata refresh/context registry分類。
+変換は一つのprocess operationが起点`ViewerContextId`・phase・worker・保存票とRemote local-modal leaseを
+所有し、背面のopen/navigationと重複開始を止める。新しいViewerContext owner、detached専用bool/Option、
+時間窓、rect/focus/placement/HWND/recreate述語を追加する変更ではない。
+  G4の既存viewer変更受付（F12独立化、DFS、改名、drop、slideshow、resume記録）を
+  同じprocess modalの共通述語へ接続する。各描画viewportのegui modal layerも入力を遮断し、
+  所有窓だけに同じ確認Windowを描く。embeddedはroot終端、dedicatedはそのcallbackだけで描く。
+  お気に入りの表示状態・標準補正とresume meterは既存FIFO/workerの完了値をメモリへ採用してから
+  完了表示へ進む。通常の保存完了が新しいメモリ上の操作を巻き戻すことはない。
+
+F12起点を同じIDの一覧へ変える経路が現行detachedにないため、設計§11.1の利用者決定に従い、
+元の閲覧を保ち、成功画面に出力先を示す。mainや兄弟へ選択を付け替えない。
+一覧を持つmain起点だけが既存の親folder再読込へ進み、可視ZIPのpath identityを選択する。
+同名3択や絞り込みでZIPが不可視でも変換成功を保ち、設定を変えない。
+
+source DAT補充・先行dirty保存は取消でも保持して採用する。source refreshはworkerで取得し、
+該当source keyを持つcontextとitems generationを照合して有界chunkで反映する。
+元一覧・選択・閲覧modeを維持し、関連しない兄弟のitems/cache/queueを一括resetしない。
+root/F12 closeと取消は同operationの完了境界へ送り、保存票や利用者データを放棄して窓を切り替えない。
+これは新機能の操作寿命と既存contextへの採用を接続する構造変更であり、detachedの既存症状へ
+guard/retry/repaintを足すパッチではない。完了時レビューではこの判断と所有境界を独立に確認する。
+
+ZIPrev3修正（2026-10-13、設計担当の今回指示に基づく構造変更）: 親scanをprocess operationへ
+移譲し、selection/terminalを既存hydration continuationの票へ接続する。F12は親一覧へ変更せず、
+source補充の採用だけを実際のitem keyとcontext世代で行う。closeは同operationの保存/返却境界を
+維持し、rootの既存終了/トレイ設定へ終端後に渡す。兄弟の退役・items/cacheへの一括変更はしない。
+詳細と実worker順序fixtureは画像folder→ZIP計画§11.3と修正検証記録へ記載する。
+
 ### 2026-10-12 §1.374 Everything の共通Search接続（未コミット・独立実装レビュー待ち）
 
 利用者の実装指示と承認済みEverything計画、先行PDF ownershipの独立ACCEPT実装
@@ -1582,6 +1617,27 @@ worker案。まれな失敗は既定のログ＋通知とし、回復機構/DB�
 今回のP2改訂へのreviewer再確認・full ACCEPTは未取得。利用者のcommitとreviewer確認後に
 PDF ownershipを独立stageとして先に実装する。実装済み・test成功・製品起動・実機受入を意味しない。
 今回の変更はPDF計画、本§11、引き継ぎTXTのみで、製品コード/.git/build/launchは未変更・未実行。
+
+### §1.372 ページ補正のcontext所有（2026-10-12）
+
+検索の同一覧再配置でdraft／Undoが別画像へ保存される件を、既存bundleの所有境界で修正する。
+設計R2 `a5648d3cb` の独立レビューは共有履歴受理と全context終了配送を確認し、残る同keyの
+before鮮度P2を反映後に実装することをcoordinator／利用者が許可した。
+通常／標準drag、localの単一文書と既存gesture、選択レイヤー、未完点列、pickerと非同期
+LUT／mask要求、およびlocal見開きpivotをbundleと一緒に交換する。
+保存writerはApp共有の既存1本を維持し、request／completionに安定targetとoriginを持たせる。
+viewport、detachedの述語、HWND／focus制御は変更しない。読取mount／depositはgestureを
+確定・取消せず、兄弟の編集世代やcacheを失効させない。§9の同ページ同時入力は別項目。
+2026-10-12の独立追補ソースレビューはP1／P2 0件でACCEPT。述語／viewport／HWNDを変更しない
+pureなbundle所有統合が構造的修正であることに実装担当と独立reviewerが合意した。
+2026-10-13には通常Pageの同key受付値と代表source materializationを全所有contextへ配送する
+追補もACCEPT。mountによる副作用を使わず、既存のqueued/materialized退去契約を維持する。
+`2bf8943a2` の追補では、pointer releaseの基点の確定順を維持し、localの最新受付／完了を
+同keyの非active ownerのsnapshot／volatileへ揃える。独立コードレビューはACCEPT。
+新しい状態・待機やdetached述語／viewport／HWND変更はなく、既存publicationで更新する。
+自動検証の証拠は
+[page-adjustment-owner-plan.md](page-adjustment-owner-plan.md)へ記録する。
+
 
 ### 2026-10-11 §1.371: 評価集合の公開を安定context境界へ移す構造合意（設計段階）
 
@@ -4823,7 +4879,7 @@ snapshot PNGは変更せず、既存の実metadata観測とsnapshot harnessを�
 vendorのAPI実装自体は変更せず、台帳へ破棄対象・呼出境界・更新時の保持差分を補う。
 snapshot PNG、runtime、metadata製品処理は変更しない。
 
-#### 2026-10-12 §1.341 見開きの横長素材正規化
+### 2026-10-12 §1.341 見開きの横長素材正規化
 
 §2を読み、利用者指定の構造変更として既存context単位page-turn presentationのshape admission、
 canonical projectionと実occurrence receiptの境界を揃える。横長の二faceは一つの通常resourceを
@@ -4849,6 +4905,156 @@ viewport述語/生成・mount/deposit、batch lease・VRAM dedup、終了/contin
 canonical rect全体で静止する。選択は既存TurnRecipeへ固定し、設定変更は既存全context
 取消を共用する。独立設計レビューはこの素材/投影境界の構成へ合意し、症状パッチではないと確認。
 detachedのviewport述語・生成・mount/deposit、素材leaseとcompletion ownerは追加・変更しない。
+
+### 2026-10-10 §1.242 本の構成 — context投影・提示許可の所有拡張 (設計)
+
+本の構成設計R6は独立再レビューACCEPT。330e070f6でreceiptの所有表現を訂正した。
+E §1.342統合済tree 76488f0ecをG0で再照合し、下記をcontext所有境界の構造的拡張として扱う。
+G0差分の合意記録: 2026-10-10 独立レビュー (GPT-6.1 Sol / xhigh) がG0差分をACCEPTし、本記録の方針を「症状パッチではなく構造的修正」と合意。設計担当 (起草) と ClaudeCode (検収) も同じ主張に合意。
+本記録は設計の接続範囲であり、製品実装/実行検証が完了したことを示さない。
+
+本の列挙後に一つのprojection ownerでitems/identity/order/explicit unitsを確定し、
+既存ViewerContextBundleが構成snapshot・revision・presentation permitを保持する。
+mount/deposit/fork/park/closeは同じ所有contextの値を移し、現在mountのApp値で兄弟の構成/editor所在を判定しない。
+DBサービスとsidecar同期receiptはApp共通storeに残す。receiptをF12 bundleへ運ばない。
+
+editor draftはcontext所有、操作ownerはUI routerがmount非依存に一つ登録する。
+start/save受付はRemote BeginAcquireと同じSessionHandle.innerの短い確定境界で順序付ける。
+後から取得するRemoteは既存の全ローカル窓closeにeditorを含め、未保存draftを終了する。
+送信済save ticketはApp共通worker完了管理へ残し、窓close/AI静止に加えてticket終端後に既存FinishAcquireする。
+新しい取得拒否gate/別session owner/終了後draft回復は作らない。
+
+★固定・元一覧・F12保持列の復帰はrecipeを保持する共通adoptionへ接続する。
+Bookの依存が変われば既存reloadで更新し、結果一覧は構成保存を理由にrefreshしない。
+各窓のidentity着地と、保存元から一回だけの共有resume intentを分け、復帰/自動reanchorから位置を奪わない。
+
+連結読みは既存continuous unit/viewport表示ownerが新入場候補の許可要求を作る。
+Checking/Hiddenをtexture選択・paint・layout/hit/traceへ渡さず、キャッシュを提示許可と同一視しない。
+mode切替の新相方も同じ許可済みunit projectionを使う。連結読みを禁止せず、全結果の事前照合も追加しない。
+EのContinuousSpecifiedFitReference/retained source/captured fit入力はそのcontextで維持し、
+新しいunitの参照選択は許可後だけ。source/role/slot/sliceが変わる投影では既存の失効/remap境界を使う。
+HUD editor entryはEのframe-local前面wheel ownerを共有し、閉じるframeに背面入力を漏らさない。
+
+予定接点: app.rsのitems install/resume/既存close、app/viewer_context_registry.rsのbundle/復帰adoption、
+app/snapshot_ops.rsの保持列復帰、ui_fullscreen.rsのunit/許可/連結表示/HUD、remote_ipc/session.rsとui.rsの取得barrier。
+window predicate/HWND同定/placement/focus/viewport生成やrect一致捕捉を変更せず、
+detached専用bool・repaint/retry/時間窓による症状修復を追加しない。
+検証はG0 source照合のみ。実装後はcontext後着・兄弟不変・取得順反転・退避復帰・cached Hidden新入場・
+mode新相方・E指定サイズ/前面wheelの自動回帰を実施し、実行証拠を別途記録する。
+
+### §11 追補: §1.242 G1 recipeのcontext所有（2026-10-10、実装記録）
+
+既存G0接点記録に基づき、itemsに付随するProjectionRecipeをViewerContextBundleの生成・
+mount/swap・forkへ登録した。snapshotの元一覧／固定一覧にもそれぞれ保持し、元一覧への
+F12復帰を含め、itemsと同時に対応するrecipeを戻す。Bookと抽出一覧の帰路をsurface名や
+anchorから推定しないための所有境界変更であり、detached述語/viewport/placementへの症状patchではない。
+A2の新規openはSingle、表示中forkはcapture-time modeを保持する。既存context退役/取消を使い、
+兄弟へのmutation invalidationは追加しない。独立レビューや実機観測の結果をこの記録では主張しない。
+
+2026-10-10 coordinator採択のA2帰還契約: 元の本の閲覧状態も既存snapshotに列と一緒に保存し、
+固定解除の同じadoption内で戻す。F12 forkのsnapshotはこの退避値を運び、fork内の解除はmainや
+兄弟の閲覧状態/列/workerを変更しない。DirectMediaの通常帰還は従来どおり。
+
+### §11 追補: §1.242 G2B immutable構成readのcontext所有（2026-10-11、実装記録）
+
+採択済みbook plan §7/§10の登録接点として、ViewerContextBundleへaccepted構成recordとscope/tokenを登録した。
+new/default/destructure/swap/mount/fork/park/drop、元一覧のSnapshotViewingStateで同じownerを運ぶ。
+forkはaccepted Arcを共有し、Prepare receiverは共有しない。読取PrepareはContextAsyncOwnerへ登録し、
+parkの終端とretained contextでの完了を既存routerへ通す。実変更scopeだけ再照合し、無関係な本のitems/cache/recordを失効させない。
+これは保存read payloadの構造的な所有拡張であり、detached述語/viewport/geometry/placementへの症状patchではない。
+G3の表示投影とeditorは未接続。独立レビュー・利用者実機観測の結果は主張しない。
+
+2026-10-11 G2B REVISE: 同じread ownerの応答採用で最新scope tokenを確認し、旧応答を最新Preparingへ
+置換する。既存mounted async serviceは初回/別scope/更新も照合し、service drainは表示pass後の
+共通更新境界へ移した。PreparingはROOTの既存遅延repaint契約へ接続し、退避ownerの完了を入力に
+依存させない。既存context residence/mount/park/retireとreceiver所有を維持し、detached述語・viewport
+生成・geometry・placement・新しいpending状態は変更していない。回帰と検証結果はG2B fix handoffに記録する。
+
+### §11 追補: §1.242 G3 projectionと提示許可（2026-10-11、実装記録）
+
+採択済みbook planのcommon projectionを、既存composition read ownerのProjecting phaseへ載せた。
+receiverは一つのcontextに属し、scope/token/items世代が一致したreplyだけrows・identity index・unitへ一括採用する。
+retained contextも既存async routerから回収し、forkはaccepted immutable projectionだけを共有する。
+提示許可は別窓・別世代・別role/slot/sliceへ流用せず、forkでpending/Hiddenを共有しない。
+park/abandon/close/source置換は同ownerのreceiverと連結要求をretireする。構成保存で抽出結果列をreloadしない。
+snapshot復帰時は提示許可を新しく取り、保持rowsに対応するprojectionを戻してから最新scopeを照合する。
+初回表示は既存deferred reopen、しおりは既存PendingBookOpenの資格確認phaseに継続を保持する。
+source列挙待ちのdeferred reopenはsource完了境界だけが消費し、composition pollからは消費しない。
+列挙・hydration完了後に構成が未採用なら、同contextの提示許可ownerの`AwaitingProjection`へ移す。
+Composed/Automaticの採用でscope/contextと世代を一括更新し、取消・close・source置換は同ownerで破棄する。
+待機表示もこのtyped要求に従う。全libで発覚したRAR/ZIP/CBR navigation失敗は、未完成rowsへ
+再開していた所有境界の違反として直し、detached専用guardや時間窓で回避しない（BA-7の状態所有）。
+これはG0で記録したcontext所有の実装であり、detached述語/HWND/viewport/placement/focusを変更しない。
+窓専用pending bool、時間窓による回復、兄弟窓の一括resetは追加しない。
+G4のeditor modal/save intentは未実装。独立レビューや実機観測の結果は主張しない。
+
+G3 REVISE追補（2026-10-11）: required Hiddenの初回open拒否も、Missing/空列と同じ
+`terminate_active_detached_open_before_viewport`へ渡す。通知だけでPreparingを残していたproducerの
+終端漏れを補完する変更（BA-7）であり、既存context bindingとsession content phaseだけを所有証明にする。
+loading shellがActiveとなった場合も同経路でClosing→context退去→session/runtime終了へ進む。
+main/兄弟のitems・generation・選択・composition・cancel tokenは不変としてconsumer fixtureで検査する。
+新しいdetached state、keep-alive guard、時間窓、HWND/placement操作は追加しない。
+
+G3 文書方向追補（2026-10-11）: 構成解除・PC再入場・Remoteのbinding/方向解決を共有resolverへ集約する。
+contextと共に保持する`BookCompositionSource::Document`に元EPUBのReadTarget/世代leaseを載せ、
+解除投影workerがその世代の方向を使う。別viewerの新世代公開へ読み直さず、既存bundle/snapshotの
+clone・swap・dropによるsource所有を維持する。PDF列挙は投影workerで行いUIで待機しない。
+新しいdetached state/述語/viewport/keep-alive機構は追加せず、元世代の保持をconsumer fixtureで検査する。
+
+### §11 追補: §1.242 G4 modal editorのcontext所有（2026-10-11、実装記録）
+
+採択済みbook plan §8.1/§10.1/§10.2に従い、構成editorのdraft/phaseを既存ViewerContextBundleの
+`composition_editor`へ登録する。new/default/destructure/swap/mountは一つのcontext所有stateを運び、
+App共通のtyped operation ownerだけがrequest/contextの所在を保持する。兄弟描画の
+`with_window_viewer_context`と既存async serviceの一時mountは許可し、global ownerを変更しない。
+forkは元contextのeditorを保持し、新しい兄弟はClosedから始める。draft/requestの複製や移植はしない。
+実際のindependent viewer開始はglobal modal ownerで受付を止め、owner contextのretireは
+`close_composition_editor_for_context`で同じterminal closeを呼んでからregistryを退去する。
+Remoteはeditor中でも後の取得を受け付け、mainのみ/fullscreenなしを含めglobal ownerを閉じる。
+送信済save ticketはApp共通完了管理へ残し、既存AcquiringRemote barrierが終端を待つ。
+
+これはBA-7のcontext状態所有と操作受付境界を採択済み構造へ揃えるG4の実装であり、
+detached専用bool/Option、geometry/placement/HWND/viewport生成、時間窓や回復guardは追加しない。
+独立レビュー・自動gate・利用者実機観測の完了は本記録では主張しない。
+
+### §11 追補: §1.242 G4F切り離しと送信済保存票の共通境界（2026-10-12 利用者決定）
+
+G4Fのfolder source/projection/editor/sidecar v2と専用fixturesを撤去し、G4直後のcontext所有へ戻す。
+G1〜G4の書庫/PDF/EPUB、A2/Q16、既存ViewerContextBundle、共通editor owner/save ticketは維持する。
+所有窓を閉じた後の保存票も完了・採用までprocess側に残り、metadata preview/import/exportとGeneric改名が
+maintenanceを先取りしないよう既存開始待ちへ接続する。context retireを待機機構として変更しない。
+通常/抽出/退避の物理Imageを構成候補へ渡さず、既存のAllowed(None)で提示する。
+類似previewのFileもworkerと採用の同じsource資格で除外し、ZIP/PDFのFIFO/proof契約を保つ。
+pure型/storeのfolder値は保持し、DB行の削除やviewer ownerの再設計は行わない。
+folder mirrorがなくなったため、migrationによるfolder cache claim・追加root-close待ちは外し、
+構成のないfolderの終了/tray flushをmasterと同じ既存v1 writerへ戻す。
+これは利用者指定の機能切り離しと既存保存票の所有境界の補完であり、detached述語・viewport/HWND・
+placement・keep-alive・新状態・時間窓・回復guardを追加しない。実worker完了順とcontext退役のfixturesで確認する。
+本記録は独立レビューや実機観測の完了を主張しない。
+### §11 追補: next-bookとmasterのPDF所有・検索採用の統合（2026-10-12）
+
+利用者指定のmaster統合で、G1〜G4のrecipe/構成/許可/editorと、§1.377のPDF epoch owner、
+EverythingのSearch採用とローカルmodal leaseを両立させる。PDF epochは既存bundleのfresh/swap/fork/retireを
+維持し、G4 editorの独立thumbnail workerは旧epoch=0と同じUnscoped＋専用cancelを明示する。
+Searchのworker準備metadata採用へG1のExtractedResult recipeを同時に渡し、Everythingの本から
+結果へ戻る場合も同じrecipeを戻す。兄弟のPDF ticket/queue/cacheは失効させない。
+
+masterの★キーによる同frame再着地では、G3の許可投影・実paint anchor・Checking mode surfaceを
+同じframe用解決へ再入力する。旧anchorの許可やtextureを新unitへ流用しない。
+構成確認待ちのfullscreen openは既存typed continuationにFsMetadataBoundaryを保持し、
+RatingMembershipの再開をManual navigationとして解除しない。manual close/seekの既存終端は保持し、
+masterで加わったRatingMembership closeも同じ構成許可ownerを退役させて古い再開要求を残さない。
+G3の再投影での選択remapとfullscreen再着地もmasterの共通move_grid_cursor（Automatic）へ通し、
+新しいitems世代のcursor/range anchorを対で確定する。範囲選択の検査例外は追加しない。
+これらは既存の所有・操作理由を共通consumerまで運ぶ統合であり、detached述語/HWND/viewport/
+placementの症状patch、新しい持続状態、時間窓、repaintによる回復は追加しない。
+
+監査はG側の既存APIをコード/callerで照合し、A4の3指紋を更新、既存のretained構成poll APIを1件登録。
+A6は11個の既存test-onlyファイルへcfg(test)を明記する（8個はinner属性、include先3個は
+各関数のouter属性で、既存のmodule階層を変えない）。A2bは同contextの編集状態を
+identity remapして戻す既存adopt_book_projectionだけを理由付きで限定登録する。
+規則・閾値・ファイル除外・known findingは変更しない。実行結果はtarget/G-1242-master-merge-msg.txtへ記録し、
+本記録で独立レビューや実機確認の完了を主張しない。
 
 ### 2026-10-12 v4.6.0 CI viewer-context audit の現行契約への追従
 
@@ -4942,3 +5148,30 @@ viewport／host／生成述語を追加せず、RAW編集受付も変更しな�
 接続し、準備中は旧編集targetを保持する。worker素材identityと単回操作を区別して通常Display
 への合流／取消を保ち、main/F12のviewport・host条件は変更しない。追加の構造合意と最終
 独立レビューACCEPTを得た。実context mount往復と入口／切替の回帰、viewer_context_auditが成功。
+
+### 2026-10-13 §1.378 利用者決定による前面判定の撤去（EV19）
+
+利用者が音響調整ボタンを「表示・前面化だけ」へ変更し、HideはEffeTuneの×/Shell操作へ限定した。
+mainのClickForeground/mouse/pointer/touch捕捉、専用Hide worker結果とpending_hide、前面判定の
+未使用DSP helperを撤去する。既存ShowIntent/GuiGateとhost GUI threadの表示・activate経路を使う。
+新しいinput owner/viewport分岐や判定guardを足す対症処置ではなく、不要になった所有境界の撤去である。
+main subclassの表示・最小化通知は維持し、Close/capture/通常矩形とDSP lifetimeは変更しない。
+detached predicate/registry/viewport/scheduler/placementは変更せず、vendor egui/eframeも変更しない。
+設計担当の利用者決定と実装premise確認に基づく範囲を記録し、独立実装レビューACCEPTとは区別する。
+仕様と検証は音響調整計画§17.12、target/ET-1378-impl-msg.txtへ記録する。
+
+### 2026-10-14 §1.341とmaster旧形式の構成・編集ownerの統合
+
+master `0d79f5077`の構成提示許可を、next-viewerの既存child context内paged準備へ接続する。
+フレーム・operationの配送先をROOTへ戻さず、各ownerのHidden／Checking／許可済みcompositionと
+source準備・ready採用を同じcontextで扱う。registryには両側の状態・G1／page-turn回帰を保持し、
+auditの明示API許可も両側を保持する。slideshowの延期完了は既存typed intentから同じpermission／
+grid／deadline ownerへ戻す。局所補正の新しい内容identity pivotは既存入口のpair読取へ投影する。
+新しいviewport／host／placement条件、待機状態、ownerやqueueを追加する症状パッチではない。
+設計担当の両意図保存の統合指示・実装premise確認と、独立GPT-6.1 Sol/xhighの構造レビューで合意。
+検証記録と新形式の残件はpage-turn plan §26.17および`target/A-1341-merge-r3-msg.txt`へ記録する。
+
+統合によるApp stack上限超過の修正では、既存解析histogram cacheの固定長tupleを
+App／bundleともBoxで持つ。context間のswap／無効化／dropを変えず、viewportや入力ownerは
+追加しない。実context mount往復でcacheの値とheap所有先が保存される回帰を追加し、独立
+GPT-6.1 Sol/xhighのACCEPTとregistry89件・監査実行の成功を得た。

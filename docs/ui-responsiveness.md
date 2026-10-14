@@ -448,6 +448,12 @@ sourceのFinalizedが先に届いても画像の採用/破棄まで再enqueueを
 
 ## 4. 新機能追加時のチェックリスト
 
+本の構成editor（§1.242 G4、next-book）はsource列挙/保存前fingerprint/保存待ち/thumbnail decodeを
+workerへ置く。純粋UIは元ページ・unit・変更previewをvirtualizedで描き、可視thumbnail要求は最大24件。
+全ページの名前・参照map・hidden状態をframeごとに作り直さず、draft変更時のviewを再利用する。
+thumbnail結果はeditor寿命のownerへだけ採用し、背景viewerのqueue/cacheへ要求を混在させない。
+この設計説明は実測結果の代わりではなく、実行証拠は[本の構成計画](book-composition-plan.md)の検証記録を参照する。
+
 機能追加・変更で以下を触るときは、この順で確認する。
 
 - [ ] **file I/O (read, open, metadata, `Path::exists` / `try_exists`)**: UI スレッドから呼ぶなら 1ms 以下に収まるか?

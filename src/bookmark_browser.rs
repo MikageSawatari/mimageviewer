@@ -1103,7 +1103,15 @@ pub struct PendingMediaOpen {
 }
 
 #[derive(Clone, Debug)]
+pub struct BookOpenQualification {
+    pub(crate) navigation: Option<crate::app::MainListNavigation>,
+    pub(crate) return_grid: crate::app::BookmarkViewReturnGridState,
+}
+
+#[derive(Clone, Debug)]
 pub enum PendingBookOpenStage {
+    /// Qualify the logical page before changing the source or the viewer surface.
+    Qualifying(Box<BookOpenQualification>),
     /// Path resolution or archive conversion has not yet selected the viewer
     /// context that will own page enumeration.
     Resolving,

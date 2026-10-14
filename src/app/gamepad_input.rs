@@ -1869,85 +1869,25 @@ impl App {
         let painter = ui.painter();
         painter.rect_filled(full_rect, 0.0, egui::Color32::from_black_alpha(120));
 
-        let rows = picker_rows_for_context(picker.context);
-        let row_h = 32.0;
-        let drill = picker.drill;
-        let panel_w = (full_rect.width() * 0.60).clamp(340.0, 560.0);
-        let panel_h = if drill.is_some() {
-            let count = drill
-                .map(|list| self.picker_list_len(picker, list))
-                .unwrap_or(0)
-                .max(1);
-            (104.0 + row_h * count as f32).min(full_rect.height() - 32.0)
-        } else {
-            96.0 + row_h * rows.len() as f32
-        };
-        let panel_rect =
-            egui::Rect::from_center_size(full_rect.center(), egui::vec2(panel_w, panel_h));
-
-        egui::Area::new(egui::Id::new("gamepad_ring_picker_overlay"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(panel_rect.min)
-            .show(ui.ctx(), |ui| {
-                ui.set_min_size(panel_rect.size());
-                egui::Frame::new()
-                    .fill(egui::Color32::from_black_alpha(220))
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)))
-                    .corner_radius(egui::CornerRadius::same(8))
-                    .inner_margin(egui::Margin::same(14))
-                    .show(ui, |ui| {
-                        ui.set_width(panel_w - 28.0);
-                        ui.label(
-                            egui::RichText::new(format!("ピッカー / {}", picker.context.label()))
-                                .size(17.0)
-                                .color(egui::Color32::WHITE),
-                        );
-                        ui.add_space(6.0);
-                        if let Some(drill) = drill {
-                            self.draw_gamepad_picker_list(ui, picker, drill);
-                        } else {
-                            for (idx, &row) in rows.iter().enumerate() {
-                                let selected = idx == picker.current_row();
-                                let (rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(ui.available_width(), row_h),
-                                    egui::Sense::hover(),
-                                );
-                                let fill = if selected {
-                                    egui::Color32::from_rgb(56, 94, 138)
-                                } else {
-                                    egui::Color32::from_black_alpha(0)
-                                };
-                                ui.painter().rect_filled(rect, 5.0, fill);
-                                let label_pos = egui::pos2(rect.min.x + 10.0, rect.center().y);
-                                let value_pos = egui::pos2(rect.max.x - 10.0, rect.center().y);
-                                ui.painter().text(
-                                    label_pos,
-                                    egui::Align2::LEFT_CENTER,
-                                    row.label(),
-                                    egui::FontId::proportional(14.5),
-                                    egui::Color32::from_white_alpha(if selected {
-                                        245
-                                    } else {
-                                        205
-                                    }),
-                                );
-                                ui.painter().text(
-                                    value_pos,
-                                    egui::Align2::RIGHT_CENTER,
-                                    self.picker_value_text(picker, row),
-                                    egui::FontId::proportional(14.5),
-                                    egui::Color32::WHITE,
-                                );
-                            }
-                            ui.add_space(8.0);
-                            ui.label(
-                                egui::RichText::new("上下:選択  左右:変更  A:一覧  B/X:確定")
-                                    .size(12.0)
-                                    .color(egui::Color32::from_white_alpha(190)),
-                            );
-                        }
-                    });
-            });
+        let rows = picker_rows_for_context(picker.context)
+            .iter()
+            .map(|&row| (row.label().to_string(), self.picker_value_text(picker, row)))
+            .collect::<Vec<_>>();
+        let drill_items = picker
+            .drill
+            .map(|list| self.picker_list_items(picker, list));
+        let drill = picker
+            .drill
+            .zip(drill_items.as_deref())
+            .map(|(list, items)| (self.picker_list_title(list), items, list.selected));
+        draw_gamepad_ring_picker_overlay_layout(
+            ui.ctx(),
+            full_rect,
+            &format!("ピッカー / {}", picker.context.label()),
+            &rows,
+            picker.current_row(),
+            drill,
+        );
     }
 
     pub(crate) fn draw_gamepad_favorite_picker_overlay(
@@ -1962,156 +1902,42 @@ impl App {
         if self.dispatched_input_surface() != surface {
             return;
         }
-        let painter = ui.painter();
-        painter.rect_filled(full_rect, 0.0, egui::Color32::from_black_alpha(120));
-
+        ui.painter()
+            .rect_filled(full_rect, 0.0, egui::Color32::from_black_alpha(120));
         let tab = picker.tab;
-        let cursor = picker.active_cursor();
         let len = match tab {
             GamepadFavoritePickerTab::Favorites => self.settings.favorites.len(),
             GamepadFavoritePickerTab::SmartFolders => self.settings.smart_folders.len(),
         };
-        let row_h = 34.0;
-        let visible_rows = len.min(GAMEPAD_LIST_VISIBLE_ROWS).max(1);
-        let panel_w = (full_rect.width() * 0.62).clamp(360.0, 640.0);
-        let panel_h = 116.0 + row_h * visible_rows as f32;
-        let panel_rect =
-            egui::Rect::from_center_size(full_rect.center(), egui::vec2(panel_w, panel_h));
-        let selected = cursor.selected.min(len.saturating_sub(1));
-        let start = cursor.scroll_top.min(len.saturating_sub(visible_rows));
-        let end = (start + visible_rows).min(len);
-
-        egui::Area::new(egui::Id::new("gamepad_favorite_picker_overlay"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(panel_rect.min)
-            .show(ui.ctx(), |ui| {
-                ui.set_min_size(panel_rect.size());
-                egui::Frame::new()
-                    .fill(egui::Color32::from_black_alpha(224))
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)))
-                    .corner_radius(egui::CornerRadius::same(8))
-                    .inner_margin(egui::Margin::same(14))
-                    .show(ui, |ui| {
-                        ui.set_width(panel_w - 28.0);
-                        ui.horizontal(|ui| {
-                            for candidate in [
-                                GamepadFavoritePickerTab::Favorites,
-                                GamepadFavoritePickerTab::SmartFolders,
-                            ] {
-                                let active = candidate == tab;
-                                ui.label(
-                                    egui::RichText::new(candidate.label())
-                                        .size(if active { 17.0 } else { 15.0 })
-                                        .color(egui::Color32::from_white_alpha(if active {
-                                            255
-                                        } else {
-                                            180
-                                        }))
-                                        .background_color(if active {
-                                            egui::Color32::from_rgb(56, 94, 138)
-                                        } else {
-                                            egui::Color32::TRANSPARENT
-                                        }),
-                                );
-                                ui.add_space(10.0);
-                            }
-                        });
-                        ui.add_space(6.0);
-                        let mut first_row_rect = None;
-                        let mut last_row_rect = None;
-                        let has_scrollbar = len > visible_rows;
-                        let scrollbar_gutter = if has_scrollbar { 18.0 } else { 0.0 };
-                        if len == 0 {
-                            let (rect, _) = ui.allocate_exact_size(
-                                egui::vec2(ui.available_width(), row_h),
-                                egui::Sense::hover(),
-                            );
-                            ui.painter().text(
-                                rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                "登録されていません",
-                                egui::FontId::proportional(14.5),
-                                egui::Color32::from_white_alpha(180),
-                            );
-                        }
-                        for idx in start..end {
-                            let (label, value) = match tab {
-                                GamepadFavoritePickerTab::Favorites => {
-                                    let favorite = &self.settings.favorites[idx];
-                                    (favorite.name.clone(), favorite.path.display().to_string())
-                                }
-                                GamepadFavoritePickerTab::SmartFolders => {
-                                    let definition = &self.settings.smart_folders[idx];
-                                    (
-                                        definition.name.clone(),
-                                        smart_folder_picker_value(definition),
-                                    )
-                                }
-                            };
-                            let is_selected = idx == selected;
-                            let (rect, _) = ui.allocate_exact_size(
-                                egui::vec2(ui.available_width(), row_h),
-                                egui::Sense::hover(),
-                            );
-                            first_row_rect.get_or_insert(rect);
-                            last_row_rect = Some(rect);
-                            let row_rect = egui::Rect::from_min_max(
-                                rect.min,
-                                egui::pos2(
-                                    (rect.max.x - scrollbar_gutter).max(rect.min.x),
-                                    rect.max.y,
-                                ),
-                            );
-                            ui.painter().rect_filled(
-                                row_rect,
-                                5.0,
-                                if is_selected {
-                                    egui::Color32::from_rgb(56, 94, 138)
-                                } else {
-                                    egui::Color32::TRANSPARENT
-                                },
-                            );
-                            ui.painter().text(
-                                egui::pos2(row_rect.min.x + 10.0, row_rect.center().y),
-                                egui::Align2::LEFT_CENTER,
-                                truncate_ring_overlay_label(&label, 22),
-                                egui::FontId::proportional(if is_selected { 15.5 } else { 14.5 }),
-                                egui::Color32::from_white_alpha(if is_selected {
-                                    255
-                                } else {
-                                    220
-                                }),
-                            );
-                            let value_right = row_rect.max.x - 10.0;
-                            ui.painter().text(
-                                egui::pos2(value_right, row_rect.center().y),
-                                egui::Align2::RIGHT_CENTER,
-                                truncate_ring_overlay_label(&value, 34),
-                                egui::FontId::proportional(12.5),
-                                egui::Color32::from_white_alpha(if is_selected {
-                                    235
-                                } else {
-                                    180
-                                }),
-                            );
-                        }
-                        if let (Some(first), Some(last)) = (first_row_rect, last_row_rect) {
-                            draw_picker_scrollbar(
-                                ui.painter(),
-                                egui::Rect::from_min_max(first.min, last.max),
-                                len,
-                                visible_rows,
-                                start,
-                            );
-                        }
-                        ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new("左右:タブ切替  上下:選択  A:移動  B/Start:閉じる")
-                                .size(12.0)
-                                .color(egui::Color32::from_white_alpha(190)),
-                        );
-                    });
-            });
+        draw_gamepad_list_picker_overlay_layout(
+            ui.ctx(),
+            full_rect,
+            egui::Id::new("gamepad_favorite_picker_overlay"),
+            GamepadListPickerHeading::FavoriteTabs(tab),
+            "左右:タブ切替  上下:選択  A:移動  B/Start:閉じる",
+            len,
+            picker.active_cursor().clone(),
+            Some("登録されていません"),
+            |idx| {
+                let (label, value) = match tab {
+                    GamepadFavoritePickerTab::Favorites => {
+                        let favorite = &self.settings.favorites[idx];
+                        (favorite.name.clone(), favorite.path.display().to_string())
+                    }
+                    GamepadFavoritePickerTab::SmartFolders => {
+                        let definition = &self.settings.smart_folders[idx];
+                        (
+                            definition.name.clone(),
+                            smart_folder_picker_value(definition),
+                        )
+                    }
+                };
+                (
+                    truncate_ring_overlay_label(&label, 22),
+                    truncate_ring_overlay_label(&value, 34),
+                )
+            },
+        );
     }
 
     pub(crate) fn draw_gamepad_video_marker_picker_overlay(
@@ -2136,111 +1962,28 @@ impl App {
         if markers.is_empty() {
             return;
         }
-        let painter = ui.painter();
-        painter.rect_filled(full_rect, 0.0, egui::Color32::from_black_alpha(120));
-
-        let row_h = 34.0;
-        let visible_rows = markers.len().min(GAMEPAD_LIST_VISIBLE_ROWS).max(1);
-        let panel_w = (full_rect.width() * 0.62).clamp(360.0, 640.0);
-        let panel_h = 92.0 + row_h * visible_rows as f32;
-        let panel_rect =
-            egui::Rect::from_center_size(full_rect.center(), egui::vec2(panel_w, panel_h));
-        let selected = picker.selected.min(markers.len().saturating_sub(1));
-        let start = picker
-            .scroll_top
-            .min(markers.len().saturating_sub(visible_rows));
-        let end = (start + visible_rows).min(markers.len());
-
-        egui::Area::new(egui::Id::new("gamepad_video_marker_picker_overlay"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(panel_rect.min)
-            .show(ui.ctx(), |ui| {
-                ui.set_min_size(panel_rect.size());
-                egui::Frame::new()
-                    .fill(egui::Color32::from_black_alpha(224))
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)))
-                    .corner_radius(egui::CornerRadius::same(8))
-                    .inner_margin(egui::Margin::same(14))
-                    .show(ui, |ui| {
-                        ui.set_width(panel_w - 28.0);
-                        ui.label(
-                            egui::RichText::new("ブックマーク / チャプター")
-                                .size(17.0)
-                                .color(egui::Color32::WHITE),
-                        );
-                        ui.add_space(6.0);
-                        let mut first_row_rect = None;
-                        let mut last_row_rect = None;
-                        let has_scrollbar = markers.len() > visible_rows;
-                        let scrollbar_gutter = if has_scrollbar { 18.0 } else { 0.0 };
-                        for idx in start..end {
-                            let marker = &markers[idx];
-                            let is_selected = idx == selected;
-                            let (rect, _) = ui.allocate_exact_size(
-                                egui::vec2(ui.available_width(), row_h),
-                                egui::Sense::hover(),
-                            );
-                            first_row_rect.get_or_insert(rect);
-                            last_row_rect = Some(rect);
-                            let row_rect = egui::Rect::from_min_max(
-                                rect.min,
-                                egui::pos2(
-                                    (rect.max.x - scrollbar_gutter).max(rect.min.x),
-                                    rect.max.y,
-                                ),
-                            );
-                            ui.painter().rect_filled(
-                                row_rect,
-                                5.0,
-                                if is_selected {
-                                    egui::Color32::from_rgb(56, 94, 138)
-                                } else {
-                                    egui::Color32::TRANSPARENT
-                                },
-                            );
-                            ui.painter().text(
-                                egui::pos2(row_rect.min.x + 10.0, row_rect.center().y),
-                                egui::Align2::LEFT_CENTER,
-                                video_marker_primary_label(marker),
-                                egui::FontId::proportional(if is_selected { 15.5 } else { 14.5 }),
-                                egui::Color32::from_white_alpha(if is_selected {
-                                    255
-                                } else {
-                                    220
-                                }),
-                            );
-                            ui.painter().text(
-                                egui::pos2(row_rect.max.x - 10.0, row_rect.center().y),
-                                egui::Align2::RIGHT_CENTER,
-                                truncate_ring_overlay_label(
-                                    &video_marker_secondary_label(marker),
-                                    34,
-                                ),
-                                egui::FontId::proportional(12.5),
-                                egui::Color32::from_white_alpha(if is_selected {
-                                    235
-                                } else {
-                                    180
-                                }),
-                            );
-                        }
-                        if let (Some(first), Some(last)) = (first_row_rect, last_row_rect) {
-                            draw_picker_scrollbar(
-                                ui.painter(),
-                                egui::Rect::from_min_max(first.min, last.max),
-                                markers.len(),
-                                visible_rows,
-                                start,
-                            );
-                        }
-                        ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new("上下:選択  A:移動  B/Select:閉じる")
-                                .size(12.0)
-                                .color(egui::Color32::from_white_alpha(190)),
-                        );
-                    });
-            });
+        ui.painter()
+            .rect_filled(full_rect, 0.0, egui::Color32::from_black_alpha(120));
+        draw_gamepad_list_picker_overlay_layout(
+            ui.ctx(),
+            full_rect,
+            egui::Id::new("gamepad_video_marker_picker_overlay"),
+            GamepadListPickerHeading::Title("ブックマーク / チャプター"),
+            "上下:選択  A:移動  B/Select:閉じる",
+            markers.len(),
+            GamepadListCursor {
+                selected: picker.selected,
+                scroll_top: picker.scroll_top,
+            },
+            None,
+            |idx| {
+                let marker = &markers[idx];
+                (
+                    video_marker_primary_label(marker),
+                    truncate_ring_overlay_label(&video_marker_secondary_label(marker), 34),
+                )
+            },
+        );
     }
 
     pub(crate) fn draw_gamepad_location_picker_overlay(
@@ -2255,159 +1998,28 @@ impl App {
         if surface != crate::app::ActionSurface::MainWindow {
             return;
         }
-        let painter = ui.painter();
-        painter.rect_filled(full_rect, 0.0, egui::Color32::from_black_alpha(120));
-
-        let row_h = 34.0;
-        let visible_rows = picker.entries.len().min(GAMEPAD_LIST_VISIBLE_ROWS).max(1);
-        let panel_w = (full_rect.width() * 0.62).clamp(360.0, 640.0);
-        let panel_h = 92.0 + row_h * visible_rows as f32;
-        let panel_rect =
-            egui::Rect::from_center_size(full_rect.center(), egui::vec2(panel_w, panel_h));
-        let selected = picker.selected.min(picker.entries.len().saturating_sub(1));
-        let start = picker
-            .scroll_top
-            .min(picker.entries.len().saturating_sub(visible_rows));
-        let end = (start + visible_rows).min(picker.entries.len());
-
-        egui::Area::new(egui::Id::new("gamepad_location_picker_overlay"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(panel_rect.min)
-            .show(ui.ctx(), |ui| {
-                ui.set_min_size(panel_rect.size());
-                egui::Frame::new()
-                    .fill(egui::Color32::from_black_alpha(224))
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)))
-                    .corner_radius(egui::CornerRadius::same(8))
-                    .inner_margin(egui::Margin::same(14))
-                    .show(ui, |ui| {
-                        ui.set_width(panel_w - 28.0);
-                        ui.label(
-                            egui::RichText::new("場所")
-                                .size(17.0)
-                                .color(egui::Color32::WHITE),
-                        );
-                        ui.add_space(6.0);
-                        let mut first_row_rect = None;
-                        let mut last_row_rect = None;
-                        let has_scrollbar = picker.entries.len() > visible_rows;
-                        let scrollbar_gutter = if has_scrollbar { 18.0 } else { 0.0 };
-                        for idx in start..end {
-                            let entry = &picker.entries[idx];
-                            let is_selected = idx == selected;
-                            let (rect, _) = ui.allocate_exact_size(
-                                egui::vec2(ui.available_width(), row_h),
-                                egui::Sense::hover(),
-                            );
-                            first_row_rect.get_or_insert(rect);
-                            last_row_rect = Some(rect);
-                            let row_rect = egui::Rect::from_min_max(
-                                rect.min,
-                                egui::pos2(
-                                    (rect.max.x - scrollbar_gutter).max(rect.min.x),
-                                    rect.max.y,
-                                ),
-                            );
-                            ui.painter().rect_filled(
-                                row_rect,
-                                5.0,
-                                if is_selected {
-                                    egui::Color32::from_rgb(56, 94, 138)
-                                } else {
-                                    egui::Color32::TRANSPARENT
-                                },
-                            );
-                            ui.painter().text(
-                                egui::pos2(row_rect.min.x + 10.0, row_rect.center().y),
-                                egui::Align2::LEFT_CENTER,
-                                truncate_ring_overlay_label(&entry.label, 22),
-                                egui::FontId::proportional(if is_selected { 15.5 } else { 14.5 }),
-                                egui::Color32::from_white_alpha(if is_selected {
-                                    255
-                                } else {
-                                    220
-                                }),
-                            );
-                            ui.painter().text(
-                                egui::pos2(row_rect.max.x - 10.0, row_rect.center().y),
-                                egui::Align2::RIGHT_CENTER,
-                                truncate_ring_overlay_label(&entry.value, 34),
-                                egui::FontId::proportional(12.5),
-                                egui::Color32::from_white_alpha(if is_selected {
-                                    235
-                                } else {
-                                    180
-                                }),
-                            );
-                        }
-                        if let (Some(first), Some(last)) = (first_row_rect, last_row_rect) {
-                            draw_picker_scrollbar(
-                                ui.painter(),
-                                egui::Rect::from_min_max(first.min, last.max),
-                                picker.entries.len(),
-                                visible_rows,
-                                start,
-                            );
-                        }
-                        ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new("上下:選択  A:移動  B/Select:閉じる")
-                                .size(12.0)
-                                .color(egui::Color32::from_white_alpha(190)),
-                        );
-                    });
-            });
-    }
-
-    fn draw_gamepad_picker_list(
-        &self,
-        ui: &mut egui::Ui,
-        picker: &RingPickerState,
-        list: PickerListState,
-    ) {
-        let title = self.picker_list_title(list);
-        let items = self.picker_list_items(picker, list);
-        ui.label(
-            egui::RichText::new(title)
-                .size(14.0)
-                .color(egui::Color32::from_white_alpha(200)),
+        ui.painter()
+            .rect_filled(full_rect, 0.0, egui::Color32::from_black_alpha(120));
+        draw_gamepad_list_picker_overlay_layout(
+            ui.ctx(),
+            full_rect,
+            egui::Id::new("gamepad_location_picker_overlay"),
+            GamepadListPickerHeading::Title("場所"),
+            "上下:選択  A:移動  B/Select:閉じる",
+            picker.entries.len(),
+            GamepadListCursor {
+                selected: picker.selected,
+                scroll_top: picker.scroll_top,
+            },
+            None,
+            |idx| {
+                let entry = &picker.entries[idx];
+                (
+                    truncate_ring_overlay_label(&entry.label, 22),
+                    truncate_ring_overlay_label(&entry.value, 34),
+                )
+            },
         );
-        ui.add_space(8.0);
-        let row_h = 32.0;
-        let selected = list.selected.min(items.len().saturating_sub(1));
-        for (idx, item) in items.iter().enumerate() {
-            let is_selected = idx == selected;
-            let (rect, _) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width(), row_h),
-                egui::Sense::hover(),
-            );
-            ui.painter().rect_filled(
-                rect,
-                5.0,
-                if is_selected {
-                    egui::Color32::from_rgb(56, 94, 138)
-                } else {
-                    egui::Color32::TRANSPARENT
-                },
-            );
-            ui.painter().text(
-                egui::pos2(rect.min.x + 10.0, rect.center().y),
-                egui::Align2::LEFT_CENTER,
-                item,
-                egui::FontId::proportional(if is_selected { 15.5 } else { 14.5 }),
-                egui::Color32::from_white_alpha(if is_selected { 255 } else { 215 }),
-            );
-        }
-        ui.add_space(8.0);
-        ui.label(
-            egui::RichText::new("上下:選択  A:選択  B/X:確定して閉じる")
-                .size(12.0)
-                .color(egui::Color32::from_white_alpha(190)),
-        );
-    }
-
-    fn picker_list_len(&self, picker: &RingPickerState, list: PickerListState) -> usize {
-        picker_list_len_for_state(picker, list, self.settings.ai_feature_mode)
     }
 
     fn picker_list_title(&self, list: PickerListState) -> &'static str {
@@ -3377,6 +2989,7 @@ impl App {
         &mut self,
         context: RingShortcutContext,
     ) -> RingPickerState {
+        self.prepare_page_edit_history_boundary();
         let fs_idx = self.fullscreen_idx;
         let params = fs_idx.map(|idx| self.effective_params(idx).clone());
         let item_rating_records = self.current_picker_item_rating_records(context);
@@ -7328,7 +6941,15 @@ impl App {
         if !self.vertical_reading_supported_idx(fs_idx) {
             return None;
         }
-        let next = self.spread_mode.next_in_spread_cycle();
+        let next = if self.extracted_result_surface().is_some() {
+            if self.spread_mode.is_spread() {
+                crate::settings::SpreadMode::Single
+            } else {
+                crate::settings::SpreadMode::Ltr.with_reading_direction(self.reading_direction)
+            }
+        } else {
+            self.spread_mode.next_in_spread_cycle()
+        };
         self.apply_fullscreen_spread_mode(ctx, fs_idx, next);
         // Report only the state actually applied: a rejected write keeps the old mode.
         if self.spread_mode == next {
@@ -8374,6 +7995,373 @@ fn truncate_ring_overlay_label(text: &str, max_chars: usize) -> String {
     out
 }
 
+#[allow(dead_code)] // Geometry is inspected by the headless layout regression.
+#[derive(Clone, Copy)]
+struct GamepadRingPickerDrawnLayout {
+    panel: egui::Rect,
+    actual_panel: egui::Rect,
+    content: egui::Rect,
+    selected: Option<egui::Rect>,
+    drawn_rows: usize,
+}
+
+// Pure drawing shared by the real picker and its headless fixture. Input and
+// draft ownership stay in App; pagination only projects the current selection.
+fn draw_gamepad_ring_picker_overlay_layout(
+    ctx: &egui::Context,
+    full_rect: egui::Rect,
+    title: &str,
+    rows: &[(String, String)],
+    selected_row: usize,
+    drill: Option<(&str, &[String], usize)>,
+) -> GamepadRingPickerDrawnLayout {
+    let frame = egui::Frame::new()
+        .fill(egui::Color32::from_black_alpha(220))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)))
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::same(14));
+    let frame_margin = frame.total_margin().sum();
+    let panel_w = (full_rect.width() * 0.60)
+        .clamp(340.0, 560.0)
+        .min((full_rect.width() - 32.0).max(120.0));
+    let inner_w = (panel_w - frame_margin.x).max(1.0);
+    let layout_text = |text: &str, size, color| {
+        ctx.fonts_mut(|fonts| {
+            fonts.layout(
+                text.to_string(),
+                egui::FontId::proportional(size),
+                color,
+                inner_w,
+            )
+        })
+    };
+    let heading = layout_text(title, 17.0, egui::Color32::WHITE);
+    let subtitle =
+        drill.map(|(title, _, _)| layout_text(title, 14.0, egui::Color32::from_white_alpha(200)));
+    let footer = layout_text(
+        if drill.is_some() {
+            "上下:選択  A:選択  B/X:確定して閉じる"
+        } else {
+            "上下:選択  左右:変更  A:一覧  B/X:確定"
+        },
+        12.0,
+        egui::Color32::from_white_alpha(190),
+    );
+    let row_h = 32.0;
+    let count = drill.map_or(rows.len(), |(_, items, _)| items.len());
+    // The exact galleys are drawn below, with zero inter-widget spacing.
+    let chrome_h = frame_margin.y
+        + heading.size().y
+        + 6.0
+        + footer.size().y
+        + 8.0
+        + subtitle
+            .as_ref()
+            .map_or(0.0, |galley| galley.size().y + 8.0);
+    let panel_h =
+        (chrome_h + row_h * count.max(1) as f32).min((full_rect.height() - 32.0).max(120.0));
+    let panel_rect = egui::Rect::from_center_size(full_rect.center(), egui::vec2(panel_w, panel_h));
+    let visible_rows = (((panel_h - chrome_h).max(row_h) / row_h).floor() as usize)
+        .max(1)
+        .min(count.max(1));
+    let selected = drill
+        .map_or(selected_row, |(_, _, selected)| selected)
+        .min(count.saturating_sub(1));
+    let start = selected
+        .saturating_sub(visible_rows / 2)
+        .min(count.saturating_sub(visible_rows));
+    let end = (start + visible_rows).min(count);
+    let scrollbar_gutter = if count > visible_rows { 18.0 } else { 0.0 };
+    let mut content_rect = egui::Rect::NOTHING;
+    let mut selected_rect = None;
+    let area = egui::Area::new(egui::Id::new("gamepad_ring_picker_overlay"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(panel_rect.min)
+        .show(ctx, |ui| {
+            ui.set_min_size(panel_rect.size());
+            frame.show(ui, |ui| {
+                ui.set_width(inner_w);
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.label(heading.clone());
+                ui.add_space(6.0);
+                if let Some(subtitle) = subtitle.as_ref() {
+                    ui.label(subtitle.clone());
+                    ui.add_space(8.0);
+                }
+                let mut first_row_rect = None;
+                let mut last_row_rect = None;
+                for idx in start..end {
+                    let is_selected = idx == selected;
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), row_h),
+                        egui::Sense::hover(),
+                    );
+                    first_row_rect.get_or_insert(rect);
+                    last_row_rect = Some(rect);
+                    if is_selected {
+                        selected_rect = Some(rect);
+                    }
+                    let row_rect = egui::Rect::from_min_max(
+                        rect.min,
+                        egui::pos2((rect.max.x - scrollbar_gutter).max(rect.min.x), rect.max.y),
+                    );
+                    ui.painter().rect_filled(
+                        row_rect,
+                        5.0,
+                        if is_selected {
+                            egui::Color32::from_rgb(56, 94, 138)
+                        } else {
+                            egui::Color32::TRANSPARENT
+                        },
+                    );
+                    if let Some((_, items, _)) = drill {
+                        ui.painter().text(
+                            egui::pos2(row_rect.min.x + 10.0, row_rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            &items[idx],
+                            egui::FontId::proportional(if is_selected { 15.5 } else { 14.5 }),
+                            egui::Color32::from_white_alpha(if is_selected { 255 } else { 215 }),
+                        );
+                    } else {
+                        ui.painter().text(
+                            egui::pos2(row_rect.min.x + 10.0, row_rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            &rows[idx].0,
+                            egui::FontId::proportional(14.5),
+                            egui::Color32::from_white_alpha(if is_selected { 245 } else { 205 }),
+                        );
+                        ui.painter().text(
+                            egui::pos2(row_rect.max.x - 10.0, row_rect.center().y),
+                            egui::Align2::RIGHT_CENTER,
+                            &rows[idx].1,
+                            egui::FontId::proportional(14.5),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                }
+                if let (Some(first), Some(last)) = (first_row_rect, last_row_rect) {
+                    draw_picker_scrollbar(
+                        ui.painter(),
+                        egui::Rect::from_min_max(first.min, last.max),
+                        count,
+                        visible_rows,
+                        start,
+                    );
+                }
+                ui.add_space(8.0);
+                ui.label(footer.clone());
+                content_rect = ui.min_rect();
+            });
+        });
+    GamepadRingPickerDrawnLayout {
+        panel: panel_rect,
+        actual_panel: area.response.rect,
+        content: content_rect,
+        selected: selected_rect,
+        drawn_rows: end - start,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum GamepadListPickerHeading<'a> {
+    Title(&'a str),
+    FavoriteTabs(GamepadFavoritePickerTab),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_gamepad_list_picker_overlay_layout(
+    ctx: &egui::Context,
+    full_rect: egui::Rect,
+    id: egui::Id,
+    heading: GamepadListPickerHeading<'_>,
+    footer: &str,
+    len: usize,
+    cursor: GamepadListCursor,
+    empty_label: Option<&str>,
+    mut row_text: impl FnMut(usize) -> (String, String),
+) -> GamepadRingPickerDrawnLayout {
+    let frame = egui::Frame::new()
+        .fill(egui::Color32::from_black_alpha(224))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)))
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::same(14));
+    let frame_margin = frame.total_margin().sum();
+    let panel_w = (full_rect.width() * 0.62)
+        .clamp(360.0, 640.0)
+        .min((full_rect.width() - 32.0).max(120.0));
+    let inner_w = (panel_w - frame_margin.x).max(1.0);
+    let text_galley = |text: &str, size, color, width| {
+        ctx.fonts_mut(|fonts| {
+            fonts.layout(
+                text.to_string(),
+                egui::FontId::proportional(size),
+                color,
+                width,
+            )
+        })
+    };
+    let style = ctx.style();
+    let headings = match heading {
+        GamepadListPickerHeading::Title(title) => {
+            vec![text_galley(title, 17.0, egui::Color32::WHITE, inner_w)]
+        }
+        GamepadListPickerHeading::FavoriteTabs(tab) => {
+            let mut remaining_w = inner_w;
+            [
+                GamepadFavoritePickerTab::Favorites,
+                GamepadFavoritePickerTab::SmartFolders,
+            ]
+            .iter()
+            .map(|candidate| {
+                let active = *candidate == tab;
+                let mut job = egui::text::LayoutJob::simple(
+                    candidate.label().to_string(),
+                    egui::FontId::proportional(if active { 17.0 } else { 15.0 }),
+                    egui::Color32::from_white_alpha(if active { 255 } else { 180 }),
+                    remaining_w.max(1.0),
+                );
+                if active {
+                    job.sections[0].format.background = egui::Color32::from_rgb(56, 94, 138);
+                }
+                let galley = ctx.fonts_mut(|fonts| fonts.layout_job(job));
+                remaining_w -= galley.size().x + style.spacing.item_spacing.x + 10.0;
+                galley
+            })
+            .collect()
+        }
+    };
+    let heading_h = headings
+        .iter()
+        .map(|galley| galley.size().y)
+        .fold(0.0_f32, f32::max)
+        .max(
+            if matches!(heading, GamepadListPickerHeading::FavoriteTabs(_)) {
+                style.spacing.interact_size.y
+            } else {
+                0.0
+            },
+        );
+    let footer = text_galley(footer, 12.0, egui::Color32::from_white_alpha(190), inner_w);
+    let chrome_h = frame_margin.y + heading_h + 6.0 + 8.0 + footer.size().y;
+    let row_h = 34.0;
+    let desired_rows = len.min(GAMEPAD_LIST_VISIBLE_ROWS).max(1);
+    let panel_h =
+        (chrome_h + row_h * desired_rows as f32).min((full_rect.height() - 32.0).max(120.0));
+    let panel = egui::Rect::from_center_size(full_rect.center(), egui::vec2(panel_w, panel_h));
+    let visible_rows = (((panel_h - chrome_h).max(row_h) / row_h).floor() as usize)
+        .max(1)
+        .min(desired_rows);
+    let selected = cursor.selected.min(len.saturating_sub(1));
+    // Preserve the existing cursor window where it fits. A smaller viewport
+    // changes only its projection, keeping the selected entry reachable.
+    let start = cursor
+        .scroll_top
+        .min(len.saturating_sub(visible_rows))
+        .min(selected)
+        .max(selected.saturating_sub(visible_rows - 1));
+    let end = (start + visible_rows).min(len);
+    let scrollbar_gutter = if len > visible_rows { 18.0 } else { 0.0 };
+    let mut content = egui::Rect::NOTHING;
+    let mut selected_rect = None;
+    let area = egui::Area::new(id)
+        .order(egui::Order::Foreground)
+        .fixed_pos(panel.min)
+        .show(ctx, |ui| {
+            ui.set_min_size(panel.size());
+            frame.show(ui, |ui| {
+                ui.set_width(inner_w);
+                ui.spacing_mut().item_spacing.y = 0.0;
+                if matches!(heading, GamepadListPickerHeading::FavoriteTabs(_)) {
+                    ui.horizontal(|ui| {
+                        for galley in &headings {
+                            ui.label(galley.clone());
+                            ui.add_space(10.0);
+                        }
+                    });
+                } else {
+                    ui.label(headings[0].clone());
+                }
+                ui.add_space(6.0);
+                let mut first_row_rect = None;
+                let mut last_row_rect = None;
+                if len == 0 {
+                    if let Some(label) = empty_label {
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), row_h),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            label,
+                            egui::FontId::proportional(14.5),
+                            egui::Color32::from_white_alpha(180),
+                        );
+                    }
+                }
+                for idx in start..end {
+                    let (label, value) = row_text(idx);
+                    let is_selected = idx == selected;
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), row_h),
+                        egui::Sense::hover(),
+                    );
+                    first_row_rect.get_or_insert(rect);
+                    last_row_rect = Some(rect);
+                    if is_selected {
+                        selected_rect = Some(rect);
+                    }
+                    let row_rect = egui::Rect::from_min_max(
+                        rect.min,
+                        egui::pos2((rect.max.x - scrollbar_gutter).max(rect.min.x), rect.max.y),
+                    );
+                    ui.painter().rect_filled(
+                        row_rect,
+                        5.0,
+                        if is_selected {
+                            egui::Color32::from_rgb(56, 94, 138)
+                        } else {
+                            egui::Color32::TRANSPARENT
+                        },
+                    );
+                    ui.painter().text(
+                        egui::pos2(row_rect.min.x + 10.0, row_rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        label,
+                        egui::FontId::proportional(if is_selected { 15.5 } else { 14.5 }),
+                        egui::Color32::from_white_alpha(if is_selected { 255 } else { 220 }),
+                    );
+                    ui.painter().text(
+                        egui::pos2(row_rect.max.x - 10.0, row_rect.center().y),
+                        egui::Align2::RIGHT_CENTER,
+                        value,
+                        egui::FontId::proportional(12.5),
+                        egui::Color32::from_white_alpha(if is_selected { 235 } else { 180 }),
+                    );
+                }
+                if let (Some(first), Some(last)) = (first_row_rect, last_row_rect) {
+                    draw_picker_scrollbar(
+                        ui.painter(),
+                        egui::Rect::from_min_max(first.min, last.max),
+                        len,
+                        visible_rows,
+                        start,
+                    );
+                }
+                ui.add_space(8.0);
+                ui.label(footer.clone());
+                content = ui.min_rect();
+            });
+        });
+    GamepadRingPickerDrawnLayout {
+        panel,
+        actual_panel: area.response.rect,
+        content,
+        selected: selected_rect,
+        drawn_rows: end - start,
+    }
+}
+
 fn draw_picker_scrollbar(
     painter: &egui::Painter,
     rows_rect: egui::Rect,
@@ -8896,6 +8884,219 @@ fn cycle_video_playback_speed(current: f64, delta: i32) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        GAMEPAD_LIST_VISIBLE_ROWS, GamepadListPickerHeading,
+        draw_gamepad_list_picker_overlay_layout, draw_gamepad_ring_picker_overlay_layout,
+    };
+
+    #[test]
+    fn calculated_gamepad_list_picker_siblings_fit_and_selected_end_is_reachable() {
+        use crate::test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
+        use std::sync::{Arc, Mutex};
+        for kind in 0..4 {
+            for len in [0_usize, 6, 20] {
+                for ppp in [1.0, 2.0] {
+                    for size in [egui::vec2(720.0, 900.0), egui::vec2(360.0, 240.0)] {
+                        let captured = Arc::new(Mutex::new(None));
+                        let captured_draw = Arc::clone(&captured);
+                        let mut fonts_ready = false;
+                        let mut harness = crate::test_ui::builder()
+                            .with_size(size)
+                            .with_pixels_per_point(ppp)
+                            .build(move |ctx| {
+                                if !fonts_ready {
+                                    crate::ui_fonts::configure_fonts(ctx);
+                                    fonts_ready = true;
+                                    ctx.request_repaint();
+                                    return;
+                                }
+                                let (heading, footer, empty) = match kind {
+                                    0 => (
+                                        GamepadListPickerHeading::FavoriteTabs(
+                                            GamepadFavoritePickerTab::Favorites,
+                                        ),
+                                        "左右:タブ切替  上下:選択  A:移動  B/Start:閉じる",
+                                        Some("登録されていません"),
+                                    ),
+                                    1 => (
+                                        GamepadListPickerHeading::FavoriteTabs(
+                                            GamepadFavoritePickerTab::SmartFolders,
+                                        ),
+                                        "左右:タブ切替  上下:選択  A:移動  B/Start:閉じる",
+                                        Some("登録されていません"),
+                                    ),
+                                    2 => (
+                                        GamepadListPickerHeading::Title(
+                                            "ブックマーク / チャプター",
+                                        ),
+                                        "上下:選択  A:移動  B/Select:閉じる",
+                                        None,
+                                    ),
+                                    _ => (
+                                        GamepadListPickerHeading::Title("場所"),
+                                        "上下:選択  A:移動  B/Select:閉じる",
+                                        None,
+                                    ),
+                                };
+                                *captured_draw.lock().unwrap() =
+                                    Some(draw_gamepad_list_picker_overlay_layout(
+                                        ctx,
+                                        egui::Rect::from_min_size(egui::Pos2::ZERO, size),
+                                        egui::Id::new("list_picker_geometry_fixture"),
+                                        heading,
+                                        footer,
+                                        len,
+                                        GamepadListCursor::new(len.saturating_sub(1)),
+                                        empty,
+                                        |idx| (format!("項目 {idx}"), "値".into()),
+                                    ));
+                            });
+                        harness.run();
+                        let layout = captured.lock().unwrap().unwrap();
+                        let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                        let inner = layout.panel.shrink(15.0);
+                        ScrollLayout {
+                            inner,
+                            content: layout.content.size(),
+                            offset: egui::Vec2::ZERO,
+                        }
+                        .assert_height(
+                            HeightExpectation::Fits,
+                            bounds,
+                            ppp,
+                        );
+                        assert!(
+                            inner.expand(1.0 / ppp).contains_rect(layout.content),
+                            "kind {kind}: content escaped calculated panel"
+                        );
+                        assert!(
+                            layout
+                                .panel
+                                .expand(1.0 / ppp)
+                                .contains_rect(layout.actual_panel),
+                            "kind {kind}: Area grew beyond calculated height"
+                        );
+                        if len == 0 {
+                            assert!(layout.selected.is_none());
+                            assert_eq!(layout.drawn_rows, 0);
+                        } else {
+                            let selected =
+                                layout.selected.expect("selected final entry must be drawn");
+                            // Area::fixed_pos snaps its origin to physical pixels.
+                            // In particular 720 * .62 yields a 446.4pt panel,
+                            // whose planned left edge is 136.8pt at 100%.
+                            // Apply the same one-pixel budget as the content and
+                            // Area checks; larger errors still indicate clipping.
+                            if !inner.contains_rect(selected) {
+                                eprintln!(
+                                    "picker pixel rounding: kind={kind}, len={len}, size={size:?}, ppp={ppp}, inner={inner:?}, selected={selected:?}, planned={:?}, actual={:?}",
+                                    layout.panel, layout.actual_panel
+                                );
+                            }
+                            assert!(
+                                inner.expand(1.0 / ppp).contains_rect(selected),
+                                "final entry clipped: kind={kind}, len={len}, size={size:?}, ppp={ppp}, inner={inner:?}, selected={selected:?}, planned={:?}, actual={:?}",
+                                layout.panel,
+                                layout.actual_panel,
+                            );
+                            if size.y == 900.0 {
+                                assert_eq!(
+                                    layout.drawn_rows,
+                                    len.min(GAMEPAD_LIST_VISIBLE_ROWS),
+                                    "ample space must keep the existing row limit"
+                                );
+                            } else {
+                                assert!(
+                                    (1..len).contains(&layout.drawn_rows),
+                                    "constrained picker must paginate"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn calculated_gamepad_ring_picker_height_fits_and_selected_end_is_reachable() {
+        use crate::test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
+        use std::sync::{Arc, Mutex};
+        for ppp in [1.0, 2.0] {
+            for size in [egui::vec2(720.0, 900.0), egui::vec2(360.0, 240.0)] {
+                for drill in [false, true] {
+                    let captured = Arc::new(Mutex::new(None));
+                    let captured_draw = Arc::clone(&captured);
+                    let rows = (0..14)
+                        .map(|idx| (format!("設定 {idx}"), "現在の値".into()))
+                        .collect::<Vec<_>>();
+                    let items = (0..14).map(|idx| format!("項目 {idx}")).collect::<Vec<_>>();
+                    let mut fonts_ready = false;
+                    let mut harness = crate::test_ui::builder()
+                        .with_size(size)
+                        .with_pixels_per_point(ppp)
+                        .build(move |ctx| {
+                            if !fonts_ready {
+                                crate::ui_fonts::configure_fonts(ctx);
+                                fonts_ready = true;
+                                ctx.request_repaint();
+                                return;
+                            }
+                            let full_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                            *captured_draw.lock().unwrap() =
+                                Some(draw_gamepad_ring_picker_overlay_layout(
+                                    ctx,
+                                    full_rect,
+                                    "ピッカー / 静止画の表示と補正と画質設定を確認する見出し",
+                                    &rows,
+                                    13,
+                                    drill.then_some((
+                                        "項目一覧の表示と補正と画質設定を確認する長い見出し",
+                                        items.as_slice(),
+                                        13,
+                                    )),
+                                ));
+                        });
+                    harness.run();
+                    let layout = captured.lock().unwrap().unwrap();
+                    if size.y == 900.0 {
+                        assert_eq!(layout.drawn_rows, 14, "ample space must show every row");
+                    } else {
+                        assert!(
+                            (1..14).contains(&layout.drawn_rows),
+                            "constrained picker must paginate"
+                        );
+                    }
+                    let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                    let inner = layout.panel.shrink(15.0);
+                    ScrollLayout {
+                        inner,
+                        content: layout.content.size(),
+                        offset: egui::Vec2::ZERO,
+                    }
+                    .assert_height(HeightExpectation::Fits, bounds, ppp);
+                    assert!(
+                        inner.expand(1.0 / ppp).contains_rect(layout.content),
+                        "content escaped calculated panel"
+                    );
+                    assert!(
+                        layout
+                            .panel
+                            .expand(1.0 / ppp)
+                            .contains_rect(layout.actual_panel),
+                        "Area grew beyond calculated height"
+                    );
+                    assert!(
+                        inner.contains_rect(
+                            layout.selected.expect("selected final item must be drawn")
+                        ),
+                        "final item clipped"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn rating_grid_undo_and_redo_manual_pad_choice_wins_before_replay_in_both_views() {
         use crate::app::rating_membership_tests::rating_grid_history_manual_input_case;

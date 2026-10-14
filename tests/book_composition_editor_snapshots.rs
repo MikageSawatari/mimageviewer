@@ -1,0 +1,386 @@
+//! Pure editor coverage. No App construction, disk mutation, or product launch.
+use egui_kittest::{
+    Harness,
+    kittest::{NodeT, Queryable},
+};
+use mimageviewer::book_composition::{ReadingDirection, SinglePlacement};
+use mimageviewer::ui_composition_editor::*;
+
+#[path = "support/ui_harness.rs"]
+mod test_ui;
+
+fn fixture(phase: EditorPhase) -> EditorView {
+    let pages = (0..600)
+        .map(|id| EditorPageView {
+            id,
+            name: format!(
+                "長い日本語のページ名_第{}章_見開きと余白を確認するための原稿.png",
+                id + 1
+            ),
+            physical_number: id + 1,
+            hidden: id == 7,
+            missing: id == 8,
+            excluded_by_policy: id == 9,
+            thumbnail: None,
+        })
+        .collect();
+    let mut units = vec![
+        EditorUnitView::Single {
+            page: 0,
+            placement: SinglePlacement::Center,
+            companion: EditorCompanionView::Vacant,
+        },
+        EditorUnitView::Single {
+            page: 1,
+            placement: SinglePlacement::Leading,
+            companion: EditorCompanionView::Blank,
+        },
+        EditorUnitView::Pair {
+            first: 2,
+            second: 3,
+        },
+        EditorUnitView::Single {
+            page: 4,
+            placement: SinglePlacement::Trailing,
+            companion: EditorCompanionView::Cover(0),
+        },
+    ];
+    units.extend((10..600).map(|page| EditorUnitView::Single {
+        page,
+        placement: SinglePlacement::Center,
+        companion: EditorCompanionView::Vacant,
+    }));
+    EditorView {
+        book_name: "長い名前の本_本の構成とページの保存先を確認するための書庫.zip".into(),
+        saved: true,
+        phase,
+        direction: ReadingDirection::Rtl,
+        cover: Some(0),
+        pages,
+        units,
+        can_undo: true,
+        can_redo: false,
+        can_save: phase == EditorPhase::Editing,
+        can_remove: true,
+        landing: "23ページ (現在のページが非表示になるため、次のページへ移動)".into(),
+        error: Some(
+            "ページが変更されています。読み直してください。編集中の変更は保持しています。".into(),
+        ),
+        pending_preview: None,
+    }
+}
+
+fn harness(
+    physical: egui::Vec2,
+    scale: f32,
+    theme: mimageviewer::os_theme::ResolvedTheme,
+    phase: EditorPhase,
+) -> Harness<'static, Vec<EditorUiAction>> {
+    let view = fixture(phase);
+    let state = EditorUiState {
+        selected_pages: vec![1],
+        selected_unit: Some(1),
+        ..Default::default()
+    };
+    view_harness(physical, scale, theme, view, state)
+}
+
+fn view_harness(
+    physical: egui::Vec2,
+    scale: f32,
+    theme: mimageviewer::os_theme::ResolvedTheme,
+    view: EditorView,
+    mut state: EditorUiState,
+) -> Harness<'static, Vec<EditorUiAction>> {
+    let mut fonts_ready = false;
+    test_ui::builder().with_size(physical).build_state(
+        move |ctx, actions: &mut Vec<EditorUiAction>| {
+            mimageviewer::os_theme::apply_resolved(ctx, theme);
+            // Geometry and interaction tests do not need real-time scrolling
+            // animation; the production ScrollArea still uses its normal style.
+            ctx.style_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
+            if !fonts_ready {
+                mimageviewer::ui_fonts::configure_fonts(ctx);
+                mimageviewer::settings::apply_ui_scale_factor(ctx, scale);
+                fonts_ready = true;
+                ctx.request_repaint();
+                return;
+            }
+            *actions = show_window(
+                ctx,
+                egui::Id::new("composition_snapshot"),
+                &view,
+                &mut state,
+                DialogKeys::default(),
+            );
+        },
+        Vec::new(),
+    )
+}
+
+#[test]
+fn composition_editor_small_screen_footer_and_snapshots() {
+    use mimageviewer::os_theme::ResolvedTheme::{Dark, Light};
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    for (width, height) in [(1093, 614), (1366, 728)] {
+        for scale in [1.0, 2.0] {
+            for (theme, name) in [(Light, "light"), (Dark, "dark")] {
+                let mut h = harness(
+                    egui::vec2(width as f32, height as f32),
+                    scale,
+                    theme,
+                    EditorPhase::Editing,
+                );
+                h.run();
+                assert!(
+                    (h.ctx.content_rect().size() * h.ctx.pixels_per_point()
+                        - egui::vec2(width as f32, height as f32))
+                    .length()
+                        < 1.0
+                );
+                assert!((h.ctx.pixels_per_point() - scale).abs() < 0.01);
+                for label in ["保存", "キャンセル", "構成を解除"] {
+                    assert_control_inside(&h, label, &format!("{width}x{height} scale={scale}"));
+                }
+                let requests: Vec<_> = h
+                    .state()
+                    .iter()
+                    .filter_map(|a| match a {
+                        EditorUiAction::RequestThumbnails(pages) => Some(pages),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(requests.iter().all(|p| p.len() <= 24));
+                assert!(
+                    !requests.iter().any(|p| p.contains(&9)),
+                    "policy-excluded pages never request a decode"
+                );
+                h.snapshot(format!(
+                    "composition_editor_{width}_{height}_{}_{}",
+                    (scale * 100.0) as u32,
+                    name
+                ));
+                snapshots.extend(h.take_snapshot_results());
+            }
+        }
+    }
+}
+
+#[test]
+fn composition_editor_all_phases_keep_cancel_reachable() {
+    for phase in [
+        EditorPhase::Preparing,
+        EditorPhase::Editing,
+        EditorPhase::Saving,
+        EditorPhase::Reloading,
+        EditorPhase::Blocked,
+    ] {
+        let mut h = harness(
+            egui::vec2(1093.0, 614.0),
+            2.0,
+            mimageviewer::os_theme::ResolvedTheme::Dark,
+            phase,
+        );
+        h.run();
+        let cancel = assert_control_inside(&h, "キャンセル", &format!("phase={phase:?}"));
+        assert_eq!(
+            cancel.enabled(),
+            !matches!(phase, EditorPhase::Saving | EditorPhase::Reloading)
+        );
+    }
+}
+
+#[test]
+fn composition_editor_remove_requires_confirmation() {
+    let mut h = harness(
+        egui::vec2(1093.0, 614.0),
+        1.0,
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        EditorPhase::Editing,
+    );
+    h.run();
+    h.get_by_label("構成を解除").click();
+    h.run_steps(4);
+    assert!(!h.state().contains(&EditorUiAction::Remove));
+    assert!(h.get_by_label("解除する").rect().is_positive());
+    h.get_by_label("解除する").click();
+    h.run_steps(4);
+    // The action is frame-local; the confirmation disappears after acceptance.
+    assert!(h.query_by_label("解除する").is_none());
+}
+
+#[test]
+fn composition_editor_confirmation_and_blocked_snapshots_at_200_percent() {
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    for (theme, name) in [
+        (mimageviewer::os_theme::ResolvedTheme::Light, "light"),
+        (mimageviewer::os_theme::ResolvedTheme::Dark, "dark"),
+    ] {
+        for kind in ["blocked", "preview", "remove"] {
+            let mut view = fixture(if kind == "blocked" {
+                EditorPhase::Blocked
+            } else {
+                EditorPhase::Editing
+            });
+            let mut state = EditorUiState::default();
+            if kind == "blocked" {
+                view.error = Some("保存された構成を読み取れません。元のデータは保持しています。読み直すか、今回は構成を使わず開いてください。".into());
+            } else if kind == "preview" {
+                view.pending_preview = Some(EditorChangePreview {
+                    explanation: "選択したページを組にすると、既存の見開きも変更されます。変更される組を確認してください。".into(),
+                    changed_units: (1..=100).map(|unit| format!("{unit}組目: 旧ページの組から新しい組へ変更 / 削除された組も確認できます")).collect(),
+                });
+            } else {
+                state.confirmation = EditorConfirmation::Remove;
+            }
+            let mut h = view_harness(egui::vec2(1093.0, 614.0), 2.0, theme, view, state);
+            h.run_steps(8);
+            for label in ["保存", "キャンセル", "構成を解除"] {
+                assert_control_inside(&h, label, &format!("{kind}/{name}"));
+            }
+            if kind == "preview" {
+                assert_control_inside(&h, "変更する", &format!("{kind}/{name}"));
+            } else if kind == "remove" {
+                assert_control_inside(&h, "解除する", &format!("{kind}/{name}"));
+            }
+            h.snapshot(format!("composition_editor_{kind}_1093_614_200_{name}"));
+            snapshots.extend(h.take_snapshot_results());
+        }
+    }
+}
+
+/// AccessKit exports physical-pixel bounds; egui responses use logical points.
+/// Check both, including the actual unclipped pointer interaction rectangle.
+fn assert_control_inside(
+    h: &Harness<'_, Vec<EditorUiAction>>,
+    label: &str,
+    detail: &str,
+) -> egui::Response {
+    let node = h.get_by_label(label);
+    let logical_screen = h.ctx.content_rect();
+    let physical_screen = egui::Rect::from_min_max(
+        logical_screen.min * h.ctx.pixels_per_point(),
+        logical_screen.max * h.ctx.pixels_per_point(),
+    );
+    assert!(
+        physical_screen.contains_rect(node.rect()),
+        "{detail} {label}: physical screen={physical_screen:?} bounds={:?}",
+        node.rect()
+    );
+    // AccessKit stores the original egui widget id (same bridge as ui_snapshot).
+    let id = unsafe { egui::Id::from_high_entropy_bits(node.accesskit_node().id().0) };
+    let response = h
+        .ctx
+        .read_response(id)
+        .expect("current editor widget response");
+    assert!(
+        logical_screen.contains_rect(response.rect),
+        "{detail} {label}: logical screen={logical_screen:?} rect={:?}",
+        response.rect
+    );
+    assert!(
+        response.interact_rect.contains_rect(response.rect),
+        "{detail} {label}: clipped interaction rect={:?} widget={:?}",
+        response.interact_rect,
+        response.rect
+    );
+    response
+}
+
+#[test]
+fn composition_editor_hud_real_entry_and_indicator_c9() {
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    for available in [false, true] {
+        for (theme, name) in [
+            (mimageviewer::os_theme::ResolvedTheme::Light, "light"),
+            (mimageviewer::os_theme::ResolvedTheme::Dark, "dark"),
+        ] {
+            let mut fonts_ready = false;
+            let mut h = test_ui::builder()
+                .with_size(egui::vec2(450.0, 200.0))
+                .build_state(
+                    move |ctx, activated: &mut bool| {
+                        mimageviewer::os_theme::apply_resolved(ctx, theme);
+                        if !fonts_ready {
+                            mimageviewer::ui_fonts::configure_fonts(ctx);
+                            fonts_ready = true;
+                            ctx.request_repaint();
+                            return;
+                        }
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            *activated |=
+                                mimageviewer::draw_composition_editor_hud_snapshot_fixture(
+                                    ui, available, true,
+                                );
+                        });
+                    },
+                    false,
+                );
+            h.run();
+            assert!(h.get_by_label("本の構成を編集").rect().is_positive());
+            h.snapshot(format!(
+                "composition_editor_hud_{}_{}",
+                if available { "available" } else { "blocked" },
+                name
+            ));
+            snapshots.extend(h.take_snapshot_results());
+            h.get_by_label("本の構成を編集").click();
+            h.run();
+            assert_eq!(
+                *h.state(),
+                available,
+                "disabled HUD entry cannot emit editor admission"
+            );
+        }
+    }
+}
+
+#[test]
+fn composition_editor_accepts_only_ime_filtered_dialog_keys() {
+    let ctx = egui::Context::default();
+    let view = fixture(EditorPhase::Editing);
+    let mut state = EditorUiState::default();
+    let mut actions = Vec::new();
+    for key in [egui::Key::Enter, egui::Key::Escape] {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1093.0, 614.0),
+                )),
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: Some(key),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                actions = show_window(
+                    ctx,
+                    egui::Id::new("filtered_keys"),
+                    &view,
+                    &mut state,
+                    DialogKeys::default(),
+                );
+            },
+        );
+        assert!(!actions.contains(&EditorUiAction::Save));
+        assert!(!actions.contains(&EditorUiAction::Cancel));
+    }
+    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        actions = show_window(
+            ctx,
+            egui::Id::new("filtered_keys"),
+            &view,
+            &mut state,
+            DialogKeys {
+                enter: false,
+                escape: true,
+            },
+        );
+    });
+    assert!(actions.contains(&EditorUiAction::Cancel));
+}

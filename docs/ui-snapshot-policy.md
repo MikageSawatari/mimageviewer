@@ -49,6 +49,25 @@ Light／Dark × 標準／強い、計8枚を保持する。前者は六分類・
 `preferences_restore_position_dark_off_narrow` の2枚で、本体と共通のチェック項目を描く。
 既定 ON のライト表示と、OFF のダーク表示・狭い幅での折り返しを確認する。
 
+音響調整のタスクバー表示 (§1.378) は既存の`preferences_effetune_input_limit_dark` /
+`preferences_effetune_auto_open_light`と、追加した320px幅の`preferences_effetune_taskbar_narrow_dark`で確認する。
+本体と共通の描画helperを使い、既定ONのcheckbox、明暗の文字コントラスト、狭幅での折り返しと到達性を検査する。
+native caption / taskbarの実Shell表示はこれらegui PNGの範囲外であり、利用者の実機確認で確定する。
+
+2026-10-13の表示・前面化専用ボタン (§1.378) は`effetune_show_only_active_tooltip_dark`と
+`effetune_show_only_inert_tooltip_light`で確認する。本体と共通のbutton/tooltip helperを使い、
+点灯はDSP状態、操作は表示・前面化、hideは×という説明の折り返しと明暗コントラストを検査する。
+App全体やhostを構築せず、単純な描画fixtureで生成する。2枚の基準PNGは目視確認済み。
+
+画像folder→ZIP (§1.242 G) は `image_folder_zip_{notice_small_light,confirm_small_200_dark,
+copying_small_light,result_small_dark}` の代表4枚を保持する。製品と共有する純粋なmodal描画を使い、
+1093×614の長い日本語path・確認本文・進捗・結果と固定操作行を検査する。
+`image_folder_zip_small_viewport_controls` は案内・準備・先行保存待ち・確認・画像保存・保存確定・
+表示反映・成功・失敗の9phase × 2画面（1093×614 / 1366×728）× 100%/200% × Light/Dark、
+計72条件で確定/取消/閉じる・タイトル×のviewport内矩形を確認する。全条件へPNGを増やさない。
+代表4枚は合計388,195 bytes（約0.37 MiB）。生成後に全4枚を目視確認した。
+App、変換worker、製品起動、実IME入力はこの純描画検査に含めない。
+
 ## ディレクトリ構成
 
 §1.341の両端配置は環境設定`preferences_singleton_spread_placement_setting*`と本別HUDの
@@ -114,6 +133,19 @@ Device / Renderer は独立し、並列性と画像比較は維持する。非 W
 背景と採取 stack は [GPU snapshot 調査記録](ui-snapshot-gpu-investigation.md) を参照。
 
 ### 3. サイズは固定
+
+高さを計算で決めるパネル・popup・メニューでは、`item_spacing`・separator・padding・
+Frame の margin を式へ含めるか、該当する間隔を 0 にする。`show_rows` の引数は
+spacing を含まない行高であり、Grid が gap 込みの slot を所有する場合は親の縦 spacing を 0 にする。
+折り返す本文は固定の行数だけで高さを見積もらない。
+
+`tests/support/scroll_layout.rs` の共通 helper（lib は `crate::test_ui::scroll_layout`、
+integration は `test_ui::scroll_layout`）で、十分な高さでは `HeightExpectation::Fits` により
+`content_size.y <= inner_rect.height()`（丸め許容は1物理pixel）・offset 0 を検査する。
+高さ不足では `HeightExpectation::Scrolls` と、実際の wheel 等の入力後の
+`assert_scrolled_to_end` で末尾の到達性を検査する。screen/panel 内の viewport も併せて検査する。
+採取値は最終描画 pass の `ScrollAreaOutput` を使い、offset を直接書き換えて成功扱いにしない。
+**snapshot は見た目の記録であり、スクロールの要否の検査にはならない。**
 
 デフォルトは 480 × 360 px。理由:
 

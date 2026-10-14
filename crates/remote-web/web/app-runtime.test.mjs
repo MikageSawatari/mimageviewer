@@ -5775,3 +5775,44 @@ test("current audio decode failure remains terminal for its listing", async () =
     globalThis.fetch = oldFetch;
   }
 });
+
+
+test("G1 extracted view keys select only a session view kind", async () => {
+  const { extractedResultViewMode } = await import("./app.js");
+  for (const direction of ["ltr", "rtl"]) {
+    for (const requested of ["ltr", "ltr_cover", "rtl", "rtl_cover"]) {
+      assert.equal(extractedResultViewMode(requested, direction), direction);
+    }
+    assert.equal(extractedResultViewMode("single", direction), "single");
+    assert.equal(extractedResultViewMode("split_ltr", direction), `split_${direction}`);
+    assert.equal(extractedResultViewMode("split_rtl", direction), `split_${direction}`);
+  }
+});
+
+test("G1 extracted menu exposes the three temporary display choices", () => {
+  const menu = viewerMenuDefinitions({ hasContainer: true, barsVisible: true, extractedResult: true,
+    supportsFinalCoverSetting: true, supportsSingletonPlacementSetting: true, supportsPageAloneSetting: true });
+  assert.equal(menu.spread.actions.length, 4);
+  assert.deepEqual(menu.spread.actions.slice(1).map(([,label])=>label), ["1ページ表示","見開き","横長分割"]);
+  assert.match(menu.spread.title, /記憶しません/);
+});
+
+
+test("G1 Remote return adoption restores the book response after temporary A2 spread", () => {
+  const address = {path:testPath("Book"),subresource:{kind:"file"}};
+  const entries = [1,2,3].map((i)=>({kind:"image",name:`${i}.jpg`,path:testPath(`Book/${i}.jpg`)}));
+  const book = {entries,configured_spread_mode:"rtl_cover",effective_spread_mode:"rtl_cover",
+    reading_direction:"rtl",page_groups:[[0],[1,2]]};
+  applyContainerData(address,book,false);
+  const before = containerRuntimeStateForTest();
+  const route = {collectionKind:"rating",value:4};
+  for (const mode of ["single","ltr"]) {
+    applyCollectionData(route,{entries,configured_spread_mode:mode,effective_spread_mode:mode,
+      reading_direction:"ltr",page_groups:mode === "single" ? [[0],[1],[2]] : [[0,1],[2]]},false);
+    assert.equal(containerRuntimeStateForTest().container,null);
+  }
+  applyContainerData(address,book,false);
+  const after = containerRuntimeStateForTest();
+  assert.deepEqual(after.container,before.container);
+  assert.deepEqual(after.pageGroups,before.pageGroups);
+});

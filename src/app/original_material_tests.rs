@@ -766,7 +766,7 @@ fn switch_fixture(ctx: &egui::Context, tool: PageEditTargetSwitchTool) -> AppTes
         }
         PageEditTargetSwitchTool::LocalAdjustment => {
             app.local_adjust_mode = true;
-            app.local_adjust_spread_ctx = Some(pivot);
+            app.local_adjust_spread_ctx = Some(app.capture_local_page_edit_pivot(pivot).unwrap());
             app.local_adjust_mask_lasso_points = vec![[0.1, 0.2], [0.3, 0.4]];
         }
         PageEditTargetSwitchTool::Conceal => {

@@ -3711,6 +3711,88 @@ mod ring_guide_tests {
     use super::*;
 
     #[test]
+    fn calculated_native_ring_picker_height_fits_and_selected_end_is_reachable() {
+        use crate::test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
+        use std::sync::{Arc, Mutex};
+        for ppp in [1.0, 2.0] {
+            for size in [egui::vec2(720.0, 900.0), egui::vec2(360.0, 240.0)] {
+                for drill in [false, true] {
+                    let captured = Arc::new(Mutex::new(None));
+                    let captured_draw = Arc::clone(&captured);
+                    let picker = NativeOverlayRingPicker {
+                        title: "ピッカー / 動画の表示と補正と画質設定を確認する見出し".into(),
+                        rows: (0..14)
+                            .map(|idx| super::super::NativeOverlayRingPickerRow {
+                                label: format!("設定 {idx}"),
+                                value: "現在の値".into(),
+                            })
+                            .collect(),
+                        selected_row: Some(13),
+                        footer: "上下:選択  左右:変更  A:一覧  B/X:確定".into(),
+                        drill: drill.then(|| super::super::NativeOverlayRingPickerDrill {
+                            title: "項目一覧の表示と補正と画質設定を確認する長い見出し".into(),
+                            items: (0..14).map(|idx| format!("項目 {idx}")).collect(),
+                            selected: 13,
+                            footer: "上下:選択  A:選択  B/X:確定して閉じる".into(),
+                        }),
+                    };
+                    let mut fonts_ready = false;
+                    let mut harness = crate::test_ui::builder()
+                        .with_size(size)
+                        .with_pixels_per_point(ppp)
+                        .build(move |ctx| {
+                            if !fonts_ready {
+                                crate::ui_fonts::configure_fonts(ctx);
+                                fonts_ready = true;
+                                ctx.request_repaint();
+                                return;
+                            }
+                            *captured_draw.lock().unwrap() =
+                                Some(draw_native_ring_picker_overlay_layout(
+                                    ctx, size.x, size.y, &picker,
+                                ));
+                        });
+                    harness.run();
+                    let layout = captured.lock().unwrap().unwrap();
+                    if size.y == 900.0 {
+                        assert_eq!(layout.drawn_rows, 14, "ample space must show every row");
+                    } else {
+                        assert!(
+                            (1..14).contains(&layout.drawn_rows),
+                            "constrained picker must paginate"
+                        );
+                    }
+                    let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                    let inner = layout.panel.shrink(15.0); // frame margin + stroke
+                    ScrollLayout {
+                        inner,
+                        content: layout.content.size(),
+                        offset: egui::Vec2::ZERO,
+                    }
+                    .assert_height(HeightExpectation::Fits, bounds, ppp);
+                    assert!(
+                        inner.expand(1.0 / ppp).contains_rect(layout.content),
+                        "content escaped calculated panel"
+                    );
+                    assert!(
+                        layout
+                            .panel
+                            .expand(1.0 / ppp)
+                            .contains_rect(layout.actual_panel),
+                        "Area grew beyond calculated height"
+                    );
+                    assert!(
+                        inner.contains_rect(
+                            layout.selected.expect("selected final item must be drawn")
+                        ),
+                        "final item clipped"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn native_ring_guide_center_converts_client_pixels_to_points() {
         let guide = NativeOverlayRingGuide {
             heading: String::new(),
@@ -3770,6 +3852,9 @@ mod ring_guide_tests {
     }
 }
 
+// Before the first draw there is no font/layout pass. Keep this existing size
+// estimate only for that initial native HWND region; subsequent regions use
+// the actual rectangle returned by draw_native_ring_picker_overlay.
 pub(super) fn native_ring_picker_overlay_rect(
     overlay_width_points: f32,
     overlay_height_points: f32,
@@ -3799,8 +3884,95 @@ pub(super) fn draw_native_ring_picker_overlay(
     overlay_height_points: f32,
     picker: &NativeOverlayRingPicker,
 ) -> Option<egui::Rect> {
-    let panel_rect =
+    Some(
+        draw_native_ring_picker_overlay_layout(
+            ctx,
+            overlay_width_points,
+            overlay_height_points,
+            picker,
+        )
+        .actual_panel,
+    )
+}
+
+#[allow(dead_code)] // Actual content/selection geometry is also checked headlessly.
+#[derive(Clone, Copy)]
+struct RingPickerDrawnLayout {
+    panel: egui::Rect,
+    actual_panel: egui::Rect,
+    content: egui::Rect,
+    selected: Option<egui::Rect>,
+    drawn_rows: usize,
+}
+
+fn draw_native_ring_picker_overlay_layout(
+    ctx: &egui::Context,
+    overlay_width_points: f32,
+    overlay_height_points: f32,
+    picker: &NativeOverlayRingPicker,
+) -> RingPickerDrawnLayout {
+    let fallback_rect =
         native_ring_picker_overlay_rect(overlay_width_points, overlay_height_points, picker);
+    let frame = egui::Frame::new()
+        .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 224))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)))
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::same(14));
+    let frame_margin = frame.total_margin().sum();
+    let inner_w = (fallback_rect.width() - frame_margin.x).max(1.0);
+    let layout_text = |text: String, size, color| {
+        ctx.fonts_mut(|fonts| fonts.layout(text, egui::FontId::proportional(size), color, inner_w))
+    };
+    let heading = layout_text(
+        truncate_overlay_text(&picker.title, 36),
+        17.0,
+        egui::Color32::WHITE,
+    );
+    let subtitle = picker.drill.as_ref().map(|drill| {
+        layout_text(
+            truncate_overlay_text(&drill.title, 36),
+            14.0,
+            egui::Color32::from_white_alpha(200),
+        )
+    });
+    let footer = layout_text(
+        truncate_overlay_text(
+            picker
+                .drill
+                .as_ref()
+                .map_or(&picker.footer, |drill| &drill.footer),
+            54,
+        ),
+        12.0,
+        egui::Color32::from_white_alpha(190),
+    );
+    let row_h = 32.0;
+    // All widgets below use these very galleys and zero item spacing. The
+    // frame (including its stroke), gaps and text are therefore counted once.
+    let chrome_h = frame_margin.y
+        + heading.size().y
+        + 6.0
+        + footer.size().y
+        + 8.0
+        + subtitle
+            .as_ref()
+            .map_or(0.0, |galley| galley.size().y + 8.0);
+    let row_count = picker
+        .drill
+        .as_ref()
+        .map_or(picker.rows.len(), |drill| drill.items.len());
+    let panel_h =
+        (chrome_h + row_h * row_count.max(1) as f32).min((overlay_height_points - 32.0).max(120.0));
+    let panel_rect = egui::Rect::from_center_size(
+        fallback_rect.center(),
+        egui::vec2(fallback_rect.width(), panel_h),
+    );
+    let visible_rows = (((panel_h - chrome_h).max(row_h) / row_h).floor() as usize)
+        .max(1)
+        .min(row_count.max(1));
+    let mut content_rect = egui::Rect::NOTHING;
+    let mut selected_rect = None;
+    let mut drawn_rows = 0;
     let selected_row = picker
         .selected_row
         .map(|row| row.min(picker.rows.len().saturating_sub(1)));
@@ -3811,138 +3983,142 @@ pub(super) fn draw_native_ring_picker_overlay(
         .interactable(false)
         .show(ctx, |ui| {
             ui.set_min_size(panel_rect.size());
-            egui::Frame::new()
-                .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 224))
-                .stroke(egui::Stroke::new(
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 90),
-                ))
-                .corner_radius(egui::CornerRadius::same(8))
-                .inner_margin(egui::Margin::same(14))
-                .show(ui, |ui| {
-                    let inner_w = (panel_rect.width() - 28.0).max(1.0);
-                    ui.set_width(inner_w);
-                    ui.label(
-                        egui::RichText::new(truncate_overlay_text(&picker.title, 36))
-                            .size(17.0)
-                            .color(egui::Color32::WHITE),
-                    );
-                    ui.add_space(6.0);
-                    if let Some(drill) = picker.drill.as_ref() {
-                        ui.label(
-                            egui::RichText::new(truncate_overlay_text(&drill.title, 36))
-                                .size(14.0)
-                                .color(egui::Color32::from_white_alpha(200)),
-                        );
-                        ui.add_space(8.0);
-                        let row_h = 32.0;
-                        let selected = drill.selected.min(drill.items.len().saturating_sub(1));
-                        for (idx, item) in drill.items.iter().enumerate() {
-                            let is_selected = idx == selected;
-                            let (rect, _) = ui.allocate_exact_size(
-                                egui::vec2(ui.available_width(), row_h),
-                                egui::Sense::hover(),
-                            );
-                            ui.painter().rect_filled(
-                                rect,
-                                5.0,
-                                if is_selected {
-                                    egui::Color32::from_rgb(56, 94, 138)
-                                } else {
-                                    egui::Color32::TRANSPARENT
-                                },
-                            );
-                            ui.painter().text(
-                                egui::pos2(rect.min.x + 10.0, rect.center().y),
-                                egui::Align2::LEFT_CENTER,
-                                truncate_overlay_text(item, 44),
-                                egui::FontId::proportional(if is_selected { 15.5 } else { 14.5 }),
-                                egui::Color32::from_white_alpha(if is_selected {
-                                    255
-                                } else {
-                                    215
-                                }),
-                            );
-                        }
-                        ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new(truncate_overlay_text(&drill.footer, 54))
-                                .size(12.0)
-                                .color(egui::Color32::from_white_alpha(190)),
-                        );
+            frame.show(ui, |ui| {
+                ui.set_width(inner_w);
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.label(heading.clone());
+                ui.add_space(6.0);
+                if let Some(drill) = picker.drill.as_ref() {
+                    ui.label(subtitle.as_ref().unwrap().clone());
+                    ui.add_space(8.0);
+                    let selected = drill.selected.min(drill.items.len().saturating_sub(1));
+                    let start = selected
+                        .saturating_sub(visible_rows / 2)
+                        .min(drill.items.len().saturating_sub(visible_rows));
+                    let end = (start + visible_rows).min(drill.items.len());
+                    let mut first_row_rect = None;
+                    let mut last_row_rect = None;
+                    let scrollbar_gutter = if drill.items.len() > visible_rows {
+                        18.0
                     } else {
-                        let row_h = 32.0;
-                        let available_h = (panel_rect.height() - 96.0).max(row_h);
-                        let visible_rows = ((available_h / row_h).floor() as usize)
-                            .max(1)
-                            .min(picker.rows.len().max(1));
-                        let focus_row = selected_row.unwrap_or(0);
-                        let start = focus_row
-                            .saturating_sub(visible_rows / 2)
-                            .min(picker.rows.len().saturating_sub(visible_rows));
-                        let end = (start + visible_rows).min(picker.rows.len());
-                        let mut first_row_rect = None;
-                        let mut last_row_rect = None;
-                        let has_scrollbar = picker.rows.len() > visible_rows;
-                        let scrollbar_gutter = if has_scrollbar { 18.0 } else { 0.0 };
-                        for (idx, row) in picker.rows.iter().enumerate().take(end).skip(start) {
-                            let selected = selected_row == Some(idx);
-                            let (rect, _) = ui.allocate_exact_size(
-                                egui::vec2(ui.available_width(), row_h),
-                                egui::Sense::hover(),
-                            );
-                            first_row_rect.get_or_insert(rect);
-                            last_row_rect = Some(rect);
-                            let row_rect = egui::Rect::from_min_max(
-                                rect.min,
-                                egui::pos2(
-                                    (rect.max.x - scrollbar_gutter).max(rect.min.x),
-                                    rect.max.y,
-                                ),
-                            );
-                            let fill = if selected {
+                        0.0
+                    };
+                    for (idx, item) in drill.items.iter().enumerate().take(end).skip(start) {
+                        drawn_rows += 1;
+                        let is_selected = idx == selected;
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), row_h),
+                            egui::Sense::hover(),
+                        );
+                        first_row_rect.get_or_insert(rect);
+                        last_row_rect = Some(rect);
+                        if is_selected {
+                            selected_rect = Some(rect);
+                        }
+                        let rect = egui::Rect::from_min_max(
+                            rect.min,
+                            egui::pos2((rect.max.x - scrollbar_gutter).max(rect.min.x), rect.max.y),
+                        );
+                        ui.painter().rect_filled(
+                            rect,
+                            5.0,
+                            if is_selected {
                                 egui::Color32::from_rgb(56, 94, 138)
                             } else {
                                 egui::Color32::TRANSPARENT
-                            };
-                            ui.painter().rect_filled(row_rect, 5.0, fill);
-                            let label_pos = egui::pos2(row_rect.min.x + 10.0, row_rect.center().y);
-                            let value_pos = egui::pos2(row_rect.max.x - 10.0, row_rect.center().y);
-                            ui.painter().text(
-                                label_pos,
-                                egui::Align2::LEFT_CENTER,
-                                truncate_overlay_text(&row.label, 16),
-                                egui::FontId::proportional(14.5),
-                                egui::Color32::from_white_alpha(if selected { 245 } else { 205 }),
-                            );
-                            ui.painter().text(
-                                value_pos,
-                                egui::Align2::RIGHT_CENTER,
-                                truncate_overlay_text(&row.value, 32),
-                                egui::FontId::proportional(14.5),
-                                egui::Color32::WHITE,
-                            );
-                        }
-                        if let (Some(first), Some(last)) = (first_row_rect, last_row_rect) {
-                            draw_native_overlay_scrollbar(
-                                ui.painter(),
-                                egui::Rect::from_min_max(first.min, last.max),
-                                picker.rows.len(),
-                                visible_rows,
-                                start,
-                            );
-                        }
-                        ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new(truncate_overlay_text(&picker.footer, 54))
-                                .size(12.0)
-                                .color(egui::Color32::from_white_alpha(190)),
+                            },
+                        );
+                        ui.painter().text(
+                            egui::pos2(rect.min.x + 10.0, rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            truncate_overlay_text(item, 44),
+                            egui::FontId::proportional(if is_selected { 15.5 } else { 14.5 }),
+                            egui::Color32::from_white_alpha(if is_selected { 255 } else { 215 }),
                         );
                     }
-                });
+                    if let (Some(first), Some(last)) = (first_row_rect, last_row_rect) {
+                        draw_native_overlay_scrollbar(
+                            ui.painter(),
+                            egui::Rect::from_min_max(first.min, last.max),
+                            drill.items.len(),
+                            visible_rows,
+                            start,
+                        );
+                    }
+                    ui.add_space(8.0);
+                    ui.label(footer.clone());
+                } else {
+                    let focus_row = selected_row.unwrap_or(0);
+                    let start = focus_row
+                        .saturating_sub(visible_rows / 2)
+                        .min(picker.rows.len().saturating_sub(visible_rows));
+                    let end = (start + visible_rows).min(picker.rows.len());
+                    let mut first_row_rect = None;
+                    let mut last_row_rect = None;
+                    let has_scrollbar = picker.rows.len() > visible_rows;
+                    let scrollbar_gutter = if has_scrollbar { 18.0 } else { 0.0 };
+                    for (idx, row) in picker.rows.iter().enumerate().take(end).skip(start) {
+                        drawn_rows += 1;
+                        let selected = selected_row == Some(idx);
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), row_h),
+                            egui::Sense::hover(),
+                        );
+                        first_row_rect.get_or_insert(rect);
+                        last_row_rect = Some(rect);
+                        if selected {
+                            selected_rect = Some(rect);
+                        }
+                        let row_rect = egui::Rect::from_min_max(
+                            rect.min,
+                            egui::pos2((rect.max.x - scrollbar_gutter).max(rect.min.x), rect.max.y),
+                        );
+                        let fill = if selected {
+                            egui::Color32::from_rgb(56, 94, 138)
+                        } else {
+                            egui::Color32::TRANSPARENT
+                        };
+                        ui.painter().rect_filled(row_rect, 5.0, fill);
+                        let label_pos = egui::pos2(row_rect.min.x + 10.0, row_rect.center().y);
+                        let value_pos = egui::pos2(row_rect.max.x - 10.0, row_rect.center().y);
+                        ui.painter().text(
+                            label_pos,
+                            egui::Align2::LEFT_CENTER,
+                            truncate_overlay_text(&row.label, 16),
+                            egui::FontId::proportional(14.5),
+                            egui::Color32::from_white_alpha(if selected { 245 } else { 205 }),
+                        );
+                        ui.painter().text(
+                            value_pos,
+                            egui::Align2::RIGHT_CENTER,
+                            truncate_overlay_text(&row.value, 32),
+                            egui::FontId::proportional(14.5),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                    if let (Some(first), Some(last)) = (first_row_rect, last_row_rect) {
+                        draw_native_overlay_scrollbar(
+                            ui.painter(),
+                            egui::Rect::from_min_max(first.min, last.max),
+                            picker.rows.len(),
+                            visible_rows,
+                            start,
+                        );
+                    }
+                    ui.add_space(8.0);
+                    ui.label(footer.clone());
+                }
+                content_rect = ui.min_rect();
+            });
         });
 
-    Some(area_response.response.rect)
+    RingPickerDrawnLayout {
+        panel: panel_rect,
+        actual_panel: area_response.response.rect,
+        content: content_rect,
+        selected: selected_rect,
+        drawn_rows,
+    }
 }
 
 fn draw_native_overlay_scrollbar(

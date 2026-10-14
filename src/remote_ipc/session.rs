@@ -92,7 +92,10 @@ struct RemoteControlLifecycle {
 enum RemoteControlOwner {
     #[default]
     Local,
-    LocalModal(u64),
+    LocalModal {
+        lease_id: u64,
+        notice: &'static str,
+    },
     AcquiringRemote,
     RemoteActive,
     DrainingRemote,
@@ -115,7 +118,7 @@ struct RemoteControlTransitionError {
 impl RemoteControlLifecycle {
     fn phase(self) -> RemoteControlPhase {
         match self.owner {
-            RemoteControlOwner::Local | RemoteControlOwner::LocalModal(_) => {
+            RemoteControlOwner::Local | RemoteControlOwner::LocalModal { .. } => {
                 RemoteControlPhase::Local
             }
             RemoteControlOwner::AcquiringRemote => RemoteControlPhase::AcquiringRemote,
@@ -124,16 +127,17 @@ impl RemoteControlLifecycle {
         }
     }
 
-    fn begin_local_modal(&mut self, lease_id: u64) -> bool {
+    fn begin_local_modal(&mut self, lease_id: u64, notice: &'static str) -> bool {
         if self.owner != RemoteControlOwner::Local {
             return false;
         }
-        self.owner = RemoteControlOwner::LocalModal(lease_id);
+        self.owner = RemoteControlOwner::LocalModal { lease_id, notice };
         true
     }
 
     fn end_local_modal(&mut self, lease_id: u64) {
-        if self.owner == RemoteControlOwner::LocalModal(lease_id) {
+        if matches!(self.owner,RemoteControlOwner::LocalModal {lease_id: current,..} if current == lease_id)
+        {
             self.owner = RemoteControlOwner::Local;
         }
     }
@@ -358,11 +362,8 @@ impl SessionStateMachine {
         if self.app_retired {
             return session_closing_response();
         }
-        if matches!(self.lifecycle.owner, RemoteControlOwner::LocalModal(_)) {
-            return status_response(
-                SessionStatus::LocalInUse,
-                "本体で処理中です。処理が終了してから再接続してください。",
-            );
+        if let RemoteControlOwner::LocalModal { notice, .. } = self.lifecycle.owner {
+            return status_response(SessionStatus::LocalInUse, notice);
         }
         match self.lifecycle.phase() {
             // The previous owner's resources still belong to that drain. A new acquire is a
@@ -1146,6 +1147,7 @@ struct UiRequestDispatch {
 
 struct QueuedRemoteWrite {
     request: RemoteWriteRequest,
+    composition_admission: crate::book_composition::CompositionWriteAdmission,
     operation: SessionOperation,
     reply: mpsc::SyncSender<UiWriteOutcome>,
     dispatch: Arc<UiRequestDispatch>,
@@ -1172,6 +1174,7 @@ enum QueuedRemoteUiRequest {
 
 pub(crate) struct ClaimedRemoteWrite {
     request: RemoteWriteRequest,
+    composition_admission: crate::book_composition::CompositionWriteAdmission,
     operation: SessionOperation,
     reply: mpsc::SyncSender<UiWriteOutcome>,
 }
@@ -1300,6 +1303,7 @@ pub(crate) struct SessionHandle {
     page_jobs: Arc<Mutex<Weak<super::page_jobs::PageJobRegistry>>>,
     archive_cache_db: Arc<Mutex<Option<Arc<crate::archive_cache::ArchiveCacheDb>>>>,
     spread_shift_service: Arc<Mutex<Option<crate::spread_shift::SpreadShiftService>>>,
+    book_composition_service: Arc<Mutex<Option<crate::book_composition::BookCompositionService>>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1348,6 +1352,11 @@ impl UiRequestDispatch {
 }
 
 impl ClaimedRemoteWrite {
+    pub(crate) fn composition_admission(
+        &self,
+    ) -> &crate::book_composition::CompositionWriteAdmission {
+        &self.composition_admission
+    }
     pub(crate) fn request(&self) -> &RemoteWriteRequest {
         &self.request
     }
@@ -1379,6 +1388,7 @@ impl ClaimedRemoteWrite {
         (
             Self {
                 request,
+                composition_admission: Default::default(),
                 operation,
                 reply,
             },
@@ -1461,13 +1471,21 @@ impl SessionHandle {
     /// Linearizes local modal admission against BeginAcquire under the existing short
     /// session mutex. No waiting/retry, OS work, or notifications run inside this lock.
     pub(crate) fn try_local_modal_lease(&self) -> Option<LocalModalLease> {
+        self.try_local_modal_lease_with_notice(
+            "本体で処理中です。処理が終了してから再接続してください。",
+        )
+    }
+    pub(crate) fn try_local_modal_lease_with_notice(
+        &self,
+        notice: &'static str,
+    ) -> Option<LocalModalLease> {
         let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         if state.app_retired {
             return None;
         }
         let lease_id = state.next_local_modal_lease;
         let next = lease_id.checked_add(1)?;
-        if !state.lifecycle.begin_local_modal(lease_id) {
+        if !state.lifecycle.begin_local_modal(lease_id, notice) {
             return None;
         }
         state.next_local_modal_lease = next;
@@ -1512,6 +1530,7 @@ impl SessionHandle {
             page_jobs: Arc::new(Mutex::new(Weak::new())),
             archive_cache_db: Arc::new(Mutex::new(None)),
             spread_shift_service: Arc::new(Mutex::new(None)),
+            book_composition_service: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1612,6 +1631,20 @@ impl SessionHandle {
         self.spread_shift_service.lock().unwrap().clone()
     }
 
+    /// Read-only registration for ContainerEngine workers. Remote exposes no composition write request.
+    pub(crate) fn install_book_composition_service(
+        &self,
+        service: Option<crate::book_composition::BookCompositionService>,
+    ) {
+        *self.book_composition_service.lock().unwrap() = service;
+    }
+
+    pub(crate) fn book_composition_service(
+        &self,
+    ) -> Option<crate::book_composition::BookCompositionService> {
+        self.book_composition_service.lock().unwrap().clone()
+    }
+
     fn has_nonterminal_long_jobs(&self) -> bool {
         self.ai_job_registry()
             .is_some_and(|jobs| RemoteLongJobRegistry::has_nonterminal_jobs(&*jobs))
@@ -1622,6 +1655,25 @@ impl SessionHandle {
 
     fn now(&self) -> Duration {
         self.origin.elapsed()
+    }
+
+    /// Linearize Local editor start/save admission with BeginAcquire. The callback may only
+    /// adopt App-owned operation state and enqueue nonblocking work; it must not reenter the
+    /// session or acquire service/registry/UI locks. Worker execution stays outside this lock.
+    pub(crate) fn with_local_composition_admission<F, R>(
+        &self,
+        admit: F,
+    ) -> Result<R, RemoteControlPhase>
+    where
+        F: FnOnce() -> R,
+    {
+        let state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        if state.lifecycle.phase() != RemoteControlPhase::Local {
+            return Err(state.lifecycle.phase());
+        }
+        let admitted = admit();
+        drop(state);
+        Ok(admitted)
     }
 
     pub(crate) fn acquire(&self, request: SessionAcquireRequest) -> SessionResponse {
@@ -2014,10 +2066,33 @@ impl SessionHandle {
         self.submit_write_with_timeout(request, operation, UI_REQUEST_ACCEPT_TIMEOUT)
     }
 
+    pub(crate) fn submit_write_with_composition(
+        &self,
+        request: RemoteWriteRequest,
+        operation: SessionOperation,
+        admission: crate::book_composition::CompositionWriteAdmission,
+    ) -> UiWriteOutcome {
+        self.submit_qualified_write_with_timeout(
+            request,
+            operation,
+            admission,
+            UI_REQUEST_ACCEPT_TIMEOUT,
+        )
+    }
+
     fn submit_write_with_timeout(
         &self,
         request: RemoteWriteRequest,
         operation: SessionOperation,
+        timeout: Duration,
+    ) -> UiWriteOutcome {
+        self.submit_qualified_write_with_timeout(request, operation, Default::default(), timeout)
+    }
+    fn submit_qualified_write_with_timeout(
+        &self,
+        request: RemoteWriteRequest,
+        operation: SessionOperation,
+        composition_admission: crate::book_composition::CompositionWriteAdmission,
         timeout: Duration,
     ) -> UiWriteOutcome {
         let generation = operation.generation();
@@ -2025,6 +2100,7 @@ impl SessionHandle {
         let (reply, receiver) = mpsc::sync_channel(1);
         let queued = QueuedRemoteUiRequest::Write(QueuedRemoteWrite {
             request,
+            composition_admission,
             operation,
             reply,
             dispatch: Arc::clone(&dispatch),
@@ -2234,6 +2310,7 @@ impl SessionHandle {
                     queued.operation.started();
                     claimed.push(ClaimedRemoteUiRequest::Write(ClaimedRemoteWrite {
                         request: queued.request,
+                        composition_admission: queued.composition_admission,
                         operation: queued.operation,
                         reply: queued.reply,
                     }));
@@ -2975,6 +3052,79 @@ mod tests {
     }
 
     #[test]
+    fn local_composition_admission_adopts_before_later_acquire_under_the_same_mutex() {
+        let handle = SessionHandle::new();
+        let mut owner = None;
+        let admitted = handle.with_local_composition_admission(|| {
+            assert!(matches!(
+                handle.inner.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            owner = Some(7);
+            "prepared"
+        });
+        assert_eq!(admitted, Ok("prepared"));
+        assert_eq!(owner, Some(7));
+        assert_eq!(
+            handle
+                .acquire(SessionAcquireRequest {
+                    client_id: "client".to_owned(),
+                    peer: peer(),
+                })
+                .status,
+            SessionStatus::Active
+        );
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::AcquiringRemote);
+        // BeginAcquire remains allowed. The UI close coordinator owns terminal editor close.
+        assert_eq!(owner, Some(7));
+    }
+
+    #[test]
+    fn local_composition_admission_rejects_without_callback_after_acquire_or_abort() {
+        let handle = SessionHandle::new();
+        handle.acquire(SessionAcquireRequest {
+            client_id: "client".to_owned(),
+            peer: peer(),
+        });
+        let mut admissions = 0;
+        assert_eq!(
+            handle.with_local_composition_admission(|| admissions += 1),
+            Err(RemoteControlPhase::AcquiringRemote)
+        );
+        assert!(handle.abort_acquire_barrier(handle.snapshot().generation));
+        assert_eq!(
+            handle.with_local_composition_admission(|| admissions += 1),
+            Err(RemoteControlPhase::DrainingRemote)
+        );
+        assert_eq!(admissions, 0);
+    }
+
+    #[test]
+    fn local_composition_admission_registers_save_before_nonblocking_send_and_acquire() {
+        let handle = SessionHandle::new();
+        let (tx, rx) = mpsc::sync_channel(1);
+        let mut tickets = Vec::new();
+        assert_eq!(
+            handle.with_local_composition_admission(|| {
+                tickets.push(11);
+                tx.try_send(11).unwrap();
+            }),
+            Ok(())
+        );
+        handle.acquire(SessionAcquireRequest {
+            client_id: "client".to_owned(),
+            peer: peer(),
+        });
+        assert_eq!(tickets, vec![11]);
+        assert_eq!(rx.try_recv(), Ok(11));
+        assert_eq!(
+            handle.with_local_composition_admission(|| tickets.push(12)),
+            Err(RemoteControlPhase::AcquiringRemote)
+        );
+        assert_eq!(tickets, vec![11]);
+    }
+
+    #[test]
     fn local_modal_lease_blocks_acquire_without_publishing_remote_ownership() {
         let handle = SessionHandle::new();
         let before = handle.snapshot();
@@ -3006,6 +3156,23 @@ mod tests {
             handle.snapshot().acquisition_sequence,
             before.acquisition_sequence + 1
         );
+    }
+
+    #[test]
+    fn folder_zip_modal_notice_belongs_to_the_admission_lease() {
+        let handle = SessionHandle::new();
+        let notice = "PC で ZIP を作成中です。完了してから接続してください。";
+        let lease = handle.try_local_modal_lease_with_notice(notice).unwrap();
+        let request = SessionAcquireRequest {
+            client_id: "client".into(),
+            peer: peer(),
+        };
+        let response = handle.acquire(request.clone());
+        assert_eq!(response.status, SessionStatus::LocalInUse);
+        assert_eq!(response.message, notice);
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::Local);
+        drop(lease);
+        assert_eq!(handle.acquire(request).status, SessionStatus::Active);
     }
 
     #[test]
@@ -4232,6 +4399,7 @@ mod tests {
             .try_enqueue_ui_request(
                 QueuedRemoteUiRequest::Write(QueuedRemoteWrite {
                     request: write_request(),
+                    composition_admission: Default::default(),
                     operation: write_operation,
                     reply: write_tx,
                     dispatch: write_dispatch,
