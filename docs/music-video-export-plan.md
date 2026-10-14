@@ -3230,7 +3230,7 @@ GUI起動・実機検収と対応後の独立再レビューは未実施。コ�
 | **P4b** 実装完了・実機確認待ち（P4b-1〜4 すべて独立レビュー ACCEPT、2026-10-14。上書きの競合は利用者が許容。5 分 1080p60 は完走済み・速度は参考値で静かな環境での再計測が残る。音・GUI の実機確認は利用者へ依頼） | ホストの製品化（D16。段の分け方は D16 の「P4b の設計」）: ラボを `crates/musicvideo-editor` へ移し、FFmpeg デコードへ統一、スナップショット入力の MP4 書き出し（モーダル・進捗・キャンセル）、未保存の編集の確認、音声スレッドが stream を所有する再生と f32 以外の出力形式対応 | **P4b-3（2026-10-14、未コミット）**: 指定ゲート 365 passed、追加 18 件すべての変異失敗確認、既存 editor 101 件維持。共通 snapshot／解析／較正／PCM view AAC／原子的公開／モーダル終端を接続し、製品 editor・通常 CLI・dev CLI の release build 成功。編集済み 5 分 1080p60 を dev CLI で 18,000 frames 完走、184.441 秒／1.6265x（背景 Codex 4 件あり、参考値）。詳細は D16 の P4b-3 記録。P4b-2 の実機の音・GUI・H3b は未確認。**P4b-4（2026-10-14、未コミット）**: session 所属の単一意図、歌詞の先行解決、保存後のフレーム末尾の再判定、先行読込の receiver 退役、新規、CancelClose／承認済み Close と書き出し中止の終端待ちを実装。指定ゲート **396 passed**、追加 **31 件**すべて変異失敗確認。初回レビュー REVISE の P2／P3 に対応し、LRC モーダルの実クリック回帰、Project／保存完了の両順序、歌詞取消と同フレームの旧完了を検査。今回 3 件追加・既存 1 件補強、各テストの変異失敗確認、指定テスト **399 passed**。詳細は D16 の P4b-4 記録。修正後の独立レビュー・実機確認・H3b は未完了 |
 | **P4c** 実装完了・実機確認待ち（独立レビュー ACCEPT、2026-10-15） | 起動引数と診断（D10）: `--audio` / `--project` / `--data-dir`、最近使ったプロジェクト、ログ・panic ログ、引数エラーの画面表示、runtime shared lease と取得失敗の表示 | **初回2026-10-14**: 追加21件の変異検証記録あり。**2026-10-15、未コミット修正**: P2のUI出力全経路9か所をworker配送、追加6件すべてで同期出力の変異失敗、P3の実機未完了表記を訂正。指定gate **516 passed / 0 failed / 1 ignored**、fmt／glyph0／製品release build成功。再レビュー・実機検収未実施。詳細は「P4c 実装記録」の独立レビュー1回目対応 |
 | **P4d** 実装完了・実機確認待ち（独立レビュー ACCEPT、2026-10-15） | mIV 側の入口: 音楽ビュー・音声ファイルの右クリックから「音楽ビデオを作成」でエディタを起動 | Grid／Fullscreenの単一実Audioだけ。static ID／非表示設定、worker起動、絶対path引数、失敗通知、build-dev同梱を実装。既存保存順のstatic／動的枠を保つ末尾追加。追加8件の成功と各変異失敗、全対象14560 passed／0 failed／66 ignored、fmt／glyph0、通常featureの4exe確認build成功を記録済み。`261b10359`の独立レビューP2に対応し製品binのGUI属性／Subsystem gateを追加。製品GUI起動／実機検収／対応のcommitなし。詳細は「P4d実装記録」 |
-| **P4e** | 配布（下の表）: launcher 内包・runtime 展開・署名・portable 同梱・全 PE / VC runtime gate・build スクリプト・test-full 前提 | **実装・非対話検証済（2026-10-15）**。build-dist -NoSign の全段成功、全体 gate 14,562 passed / 0 failed / 66 ignored。editor 25,504,768 bytes、launcher 増分も同値。清掃は editor を含む fixture で検査し D10 の割り切りを維持。独立レビュー 1・2 回目は REVISE、2 回目の P2／P3 対応と指定検証済・再レビュー待ち。署名実行・GUI 検収は未実施。詳細は末尾「P4e 実装記録」 |
+| **P4e** | 配布（下の表）: launcher 内包・runtime 展開・署名・portable 同梱・全 PE / VC runtime gate・build スクリプト・test-full 前提 | **実装・非対話検証済（2026-10-15）**。build-dist -NoSign の全段成功、全体 gate 14,562 passed / 0 failed / 66 ignored。editor 25,504,768 bytes、launcher 増分も同値。清掃は editor を含む fixture で検査し D10 の割り切りを維持。独立レビュー 1〜3 回目は REVISE。3 回目の指摘は OUT_DIR 導出で対応し、追加発見の build-dir 分離も設計回答に従い開始前に拒否する。指定検証・release 5 段は成功、独立再検収待ち。署名実行・GUI 検収は未実施。詳細は末尾「P4e 実装記録」 |
 | **P4f** | 文書: マニュアル・製品ページ・keymap-spec（固定ショートカットの理由）・privacy（通信なし・保存先） | CLAUDE.md「コード修正時のドキュメント同時更新」 |
 
 L1 自動検証記録（2026-10-09）:
@@ -3956,3 +3956,95 @@ offline 削除、metadata exit 無視、CLI config／portable config の無視�
 build-dist／全体 gate の再実行、配布生成、実署名、GUI／launcher 起動、実 `%APPDATA%/mimageviewer` 操作は行わない。
 以前の配布サイズ・byte 一致・full gate は初回実装の証拠として保持する。今回の変更後の配布 build の成功とは扱わない。
 独立再レビュー／設計担当の再検収は未完了。HEAD は `126c6cc17` のまま、コミットなし、未追跡 `out.mp4` は操作なし。
+
+#### 独立レビュー 3 回目 REVISE と対応（2026-10-15、未コミット）
+
+対象: `musicvideo` / `a1550d08bd5a1cd81fa858f035fc55f9aad594f0`。
+利用者提示の **GPT-6.1 Sol / xhigh の独立レビューは REVISE**（P2: `[env] CARGO_TARGET_DIR` が launcher の内包元だけを変え、署名先と分離できる）。
+以下は設計担当の判断に沿った実装と実装担当自身の検証であり、独立再レビューの結果ではない。
+
+- launcher build.rs は子プロセスの `CARGO_TARGET_DIR` と workspace の既定 target 推測を廃止した。
+  新規 `src/build_output_paths.rs` が Cargo の `OUT_DIR` の絶対 path、`build/<launcher-package>-<hex-hash>/out`、
+  profile の存在を検査し、実際の profile ディレクトリを返す。欠落／想定外の形は明示的に exit 1 とし、fallback しない。
+  core／remote／EPUB worker／editor の 4 本は、この profile の親の `release` から一括で内包する。
+  debug の launcher テストも release 4 本を要求する既存契約を保つ。通常 release では wrapper の署名先と同じ `target/release`。
+  `MIMV_EFFETUNE_DIR` 等の既存 override、DLL／EffeTune の供給元、metadata guard、署名順・停止 policy は変更しない。
+- 純粋関数の 5 テストは通常／別 target、debug／custom profile、cross-target の階層、7 種類の不正 OUT_DIR を検査する。
+  launcher テストには、Cargo が生成した 4 本の `MIMV_*_EXE` の path が OUT_DIR から導いた内包元と一致する検査を追加した。
+  実 Cargo に `--config env.CARGO_TARGET_DIR.value='<repo>/target-portable'` と `force=true` を渡しても成功する。
+  テスト用 `MIV_TEST_EXPECT_INJECTED_TARGET_DIR` が runtime の差し込み値も照合し、差し込みが実際に届いたことを確認する。
+- **build.target の割り切り**: 設定ファイルの `build.target` は引き続き対象外で、通常 target に古い exe が残る場合、存在検査だけでは stale を防げない限界を維持する。
+
+以下の最初の検証時点の変更は **6 本**: `crates/launcher/build.rs`、`crates/launcher/src/main.rs`、新規 `crates/launcher/src/build_output_paths.rs`、
+CLAUDE.md、development-build-and-test、本記録。EffeTune 計画と依頼 brief は変更しない。
+
+すべて `MSBUILDDISABLENODEREUSE=1`。PowerShell build は `*>&1` なしで呼び、Python runner が stdout／stderr を別ファイルへ保存する。
+release は `-PreserveRuntime`、署名は既定 OFF。GUI／製品 launcher／core／editor は起動せず、実 APPDATA と未追跡 `out.mp4` は操作しない。
+build-script helper と libtest executable の非対話検査だけを実行した。
+
+| 検証 | 結果 | 証跡（`target/p4e-evidence/`） |
+| --- | --- | --- |
+| launcher 通常構成・変異復元後 | 48 passed / 0 failed / 1 ignored（既存 42 件 + 追加 6 件） | `review3-launcher-{initial,restored}.*` |
+| Cargo `[env]` 差し込み | 全 48 passed / 0 failed / 1 ignored、復元後の内包元検査も 1 passed | `review3-launcher-injected.*`、`review3-injected-restored.*` |
+| 純粋関数の分離テスト | 5 passed / 0 failed。追加依存なしの偽 crate から同じ module を使用 | `review3-path-tests-restored.*` |
+| 不正 OUT_DIR の実 helper | 未設定／相対／誤った build 階層の 3 件とも理由付き exit 1、資産生成前に停止 | `review3-early-failure.*` |
+| 変異 10 件 | すべてテスト assert で exit 101、compile error ではない。各回 byte 復元 | `review3-mutations.json`、`review3-mutation-*` |
+| safety 4 本 | dev／release／editor／output とも PASS。output の実 Cargo 74 ケースを維持 | `review3-safety-{dev,release,editor,output}.*` |
+| fmt／fmt check／glyph | すべて exit 0、危険 glyph 0 | `review3-fmt*`、`review3-glyphs.*` |
+| `build-release.ps1 -PreserveRuntime` | exit 0、29.971 秒、Rust 5 段成功。runtime gate は PE 5、embedded gate は PE 12 | `review3-release.*`、`target/vcrt-pe-reports/release-{runtime,embedded}.json` |
+| 最終 release 内包 byte | 4 本すべて `target/release` の全 byte と一致。launcher は 518,354,944 bytes | `review3-artifacts.*` |
+
+VST3 SDK 未配置のため、既存の source identity を検査した vendor host の再利用経路を通った。
+変異は相対 path／out leaf／別 package／hash／build 階層／parent 成分の不正受理、既定 target 推測、debug 内包、
+build.rs の環境変数からの選択復帰、editor だけの別 target 化。最後の 2 件は実 Cargo の差し込み環境で、
+4 本の `MIMV_*_EXE` と OUT_DIR の一致 assert が失敗した。
+
+**追加発見: build-dir 分離の前提（発見時の報告、下記の追加対応で解決）**
+
+Cargo 1.94.1 は `build.build-dir` により中間生成物を target と分離できる。
+依存なしの偽 package で実 Cargo を実行すると、最終 exe は `<fixture>/target/release` へ作られるが、
+OUT_DIR は `<fixture>/build-cache/release/build/mimageviewer-launcher-<hash>/out` となり、
+新しい導出関数は `<fixture>/build-cache/release` を返した（`review3-build-dir-premise.*`）。
+metadata も `target_directory` と `build_directory` が別の値になることを確認した。
+発見時の metadata guard は target_directory だけを見るため、この構成は防げず、cache 側の古い exe が存在する場合は
+署名先との分離が残る。正常な OUT_DIR の形だけでは実際の最終 target と区別できない。
+
+brief §1 の「前提がコードと食い違ったら、実装で吸収せず止めて報告する」に従い設計担当へ報告し、
+metadata の build_directory も固定値と一致させる拒否を追加するか、明示的な対象外とするかを問い合わせた。
+この時点では判断待ちとして metadata guard を変更せず、上の成功は標準の target／build-dir 一致構成の証拠として報告した。
+その後の設計回答と追加対応は下記。独立再検収は未完了。
+
+**build-dir 分離の追加対応（設計回答反映、2026-10-15、未コミット）**
+
+設計担当の「wrapper 開始前に metadata の build_directory も固定値と照合する」判断を反映した。
+`scripts/build-output-safety.ps1` は target_directory と build_directory の両方に完全一致を要求し、
+不一致は ASCII の理由で停止する。4 本の wrapper の共通 guard のため、`-PreserveRuntime` の有無に依存しない。
+portable／診断 portable もそれぞれの固定 target に一致させる。launcher の OUT_DIR 導出と想定外の形の失敗処理は変更していない。
+
+現行 **Cargo 1.94.1 (29ea6fb6a 2026-03-24)** の実 metadata では通常構成の両フィールドが `<repo>/target`。
+`--config build.build-dir='<repo>/target/review3-build-dir-probe'` は target_directory を変えず build_directory だけを変更した
+（`review3-builddir-metadata.json`）。古い Cargo で build_directory フィールド自体がない場合は target_directory と同じ扱いとし、
+この互換処理は fake metadata で通過を検査した。旧 Cargo 実行ファイルは実行していない。
+フィールドが存在して値が null／空の場合は検証失敗として停止し、未出力時の互換処理には含めない。
+設定ファイルの build.target と古い exe が残る場合の限界は、上記の割り切りを維持する。
+
+追加変更は helper と `scripts/test-build-output-safety.ps1` の 2 本、文書は CLAUDE.md／development-build-and-test／本記録を更新。
+3 回目の対応全体は **8 本**（最初の 6 本 + スクリプト 2 本）。EffeTune 計画と依頼 brief は変更しない。
+以下は実装担当自身の再検証であり、独立再レビューの結果ではない。
+
+| 検証 | 結果 | 証跡（`target/p4e-evidence/`） |
+| --- | --- | --- |
+| output safety | 実 Cargo 88 ケース PASS（従来 74 + 追加 14）。全 wrapper／両 runtime policy の build-dir 環境変数拒否、診断 portable、`--config build.build-dir` の不一致拒否・一致通過を追加。fake metadata の未出力互換・不一致・空値も成功 | `review3-builddir-safety-output.*` |
+| 追加変異 4 件 | 比較削除／prefix 比較／フィールド無視／未出力拒否の全件を回帰検査で検出。syntax error ではなく期待する検査失敗、各回元の byte に復元 | `review3-builddir-mutations.json`、`review3-builddir-mutation-*` |
+| safety 残り 3 本 | dev／release／editor とも PASS | `review3-builddir-safety-{dev,release,editor}.*` |
+| launcher | 48 passed / 0 failed / 1 ignored | `review3-builddir-launcher.*` |
+| fmt／fmt check／glyph | すべて exit 0、危険 glyph 0 | `review3-builddir-fmt*`、`review3-builddir-glyphs.*` |
+| PowerShell 構文／ASCII | wrapper 4 本と helper／output safety test の計 6 本で PASS | `review3-builddir-syntax-ascii.json` |
+| 署名なし release 5 段 | `build-release.ps1 -PreserveRuntime` exit 0、29.806 秒。runtime PE 5／embedded PE 12 の gate も成功。SDK 未配置の既存検証済み vendor host 再利用経路 | `review3-builddir-release.*` |
+| 内包 byte | target/release の 4 本すべてと launcher 内包 byte が一致。launcher 518,354,944 bytes | `review3-builddir-artifacts.*` |
+
+全コマンドで `MSBUILDDISABLENODEREUSE=1`、build script は `*>&1` なし。署名 OFF、runtime 保持。
+先に実施した Rust 変異 10 件・Cargo `[env] CARGO_TARGET_DIR` 差し込みの検証は、Rust 3 本の byte が不変であることを確認して再利用した
+（`review3-builddir-source-freeze.json`）。追加の設計前提は対応済み、独立再検収待ち。
+
+実署名・build-dist／全体 gate の再実行・GUI 検収・コミットはなし。HEAD は `a1550d08b` のまま。

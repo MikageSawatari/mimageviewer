@@ -216,7 +216,8 @@ cargo build --release -p musicvideo-editor --bin mimageviewer-musicvideo
 ```
 
 launcher はこの 4 本の後にビルドする。`musicvideo-editor` は workspace 全体テストに含まれる。
-build-release／build-dist／build-portable／build-dev は開始前に実際の Cargo 実行場所・環境で `cargo metadata --format-version 1 --no-deps --offline` の `target_directory` を固定出力先と照合し、不一致と `CARGO_BUILD_TARGET` を `-PreserveRuntime` に関係なく拒否する（portable 自身の固定 `--target-dir` は維持、設定ファイルの `build.target` は検査対象外）。
+launcher の内包元は Cargo の `OUT_DIR` の profile と同じ出力 tree の `release` を導く。debug-profile テストも release 4 本を前提とし、`[env] CARGO_TARGET_DIR` による子プロセスの環境変更では内包元を変えない。想定外の `OUT_DIR` は fallback せず失敗し、`build.build-dir` による出力先の分離は wrapper が開始前に拒否する。
+build-release／build-dist／build-portable／build-dev は開始前に実際の Cargo 実行場所・環境で `cargo metadata --format-version 1 --no-deps --offline` の `target_directory` と `build_directory` を固定出力先と照合し、不一致と `CARGO_BUILD_TARGET` を `-PreserveRuntime` に関係なく拒否する（`build_directory` 未出力時は `target_directory` と同じ扱い、portable 自身の固定 `--target-dir` は維持、設定ファイルの `build.target` は検査対象外）。
 配布は test-full → clean → core → remote → EPUB worker → editor → launcher → installer → portable。
 エディタは全 build スクリプトで自動終了しない。出力先が使用中なら、保存・終了後に再実行する。
 portable の配布フォルダ置換は `-SkipBuild` / `-KeepRunning` でも同じ保護対象となる。

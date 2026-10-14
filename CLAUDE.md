@@ -1108,7 +1108,7 @@ rust-lld で stale incremental object が残ると `fast_image_resize` などの
 release link 時に未解決になることがあるため、配布ビルドは安定優先で incremental を切る。
 
 `cargo build --release` を直接打つ場合は ① → ② → ③ → ④ → ⑤ の順で 5 回打つこと。
-ランチャー側 build.rs が `target/release` の core / remote / EPUB worker / editor の 4 本の存在をチェックし、
+ランチャー側 build.rs は Cargo の `OUT_DIR` の形を検査し、その profile と同じ出力 tree の `release` から core / remote / EPUB worker / editor の 4 本を参照する（debug の launcher テストも release 4 本を使う）。子へ差し込まれた `CARGO_TARGET_DIR` や既定値の推測は使わず、想定外の `OUT_DIR` は明示的に失敗する。通常構成では `target/release` となる。wrapper は metadata の `target_directory` と `build_directory` を固定出力先と照合し、`build.build-dir` による分離も開始前に拒否する。
 無ければ復旧手順付きで止まる。EffeTune も `vendor/effetune-mixwright/VERSION` と
 `EffeTune Mixwright.vst3/` を必須検証する。`MIMV_EFFETUNE_DIR` で staging root を指定できる。
 配布署名時は build-dist.ps1 が bundle を target にコピーして PE を署名し、埋め込み元を指定する
@@ -1743,7 +1743,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 - **配布ビルド**: `.\scripts\build-dist.ps1` (全体テスト → clean → core → remote → EPUB worker → editor → launcher → ISCC → portable を 1 コマンド、
   stale 配布物を構造的に防ぐ)。開発中の素早い反復だけ `.\scripts\build-release.ps1` 単体を使う
   (配布用の clean／全体テストゲートがないので配布物には使わない)。
-- **出力先固定**: build-release／build-dist／build-portable／build-dev は開始前に実際の Cargo 実行場所・環境で `cargo metadata --format-version 1 --no-deps --offline` の `target_directory` を固定出力先と照合し、不一致と `CARGO_BUILD_TARGET` を `-PreserveRuntime` に関係なく拒否する（portable 自身の固定 `--target-dir` は維持、設定ファイルの `build.target` は検査対象外）。
+- **出力先固定**: build-release／build-dist／build-portable／build-dev は開始前に実際の Cargo 実行場所・環境で `cargo metadata --format-version 1 --no-deps --offline` の `target_directory` と `build_directory` を固定出力先と照合し、不一致と `CARGO_BUILD_TARGET` を `-PreserveRuntime` に関係なく拒否する（`build_directory` 未出力時は `target_directory` と同じ扱い、portable 自身の固定 `--target-dir` は維持、設定ファイルの `build.target` は検査対象外）。
 - **出力**: `installer/Output/mImageViewer_setup.exe`
 - **Vector 申請用 zip**: `mImageViewer_installer_v<VERSION>.zip` に `mImageViewer_setup.exe` と
   `installer/readme.txt` を同梱する (v1.1.0 で `mImageViewer_v<VERSION>.zip` から改名。ポータブル

@@ -62,11 +62,22 @@ function Assert-MivFixedCargoOutput {
             $metadata = ($json -join "`n") | ConvertFrom-Json -ErrorAction Stop
             if (-not $metadata.target_directory) { throw 'missing target_directory' }
             $actual = [IO.Path]::GetFullPath($metadata.target_directory).TrimEnd('\', '/')
+            $buildDirectory = $metadata.PSObject.Properties['build_directory']
+            # Older Cargo metadata omits build_directory; its default is target.
+            $actualBuild = if ($null -eq $buildDirectory) {
+                $actual
+            } else {
+                if (-not $buildDirectory.Value) { throw 'invalid build_directory' }
+                [IO.Path]::GetFullPath($buildDirectory.Value).TrimEnd('\', '/')
+            }
         } catch {
             throw '[build-output] Cargo metadata failed: fixed output paths could not be verified.'
         }
         if (-not $actual.Equals($expected, [StringComparison]::OrdinalIgnoreCase)) {
             throw '[build-output] Cargo target_directory differs from the fixed output path. Remove the output override before building; protection, clean, signing and packaging require fixed output paths.'
+        }
+        if (-not $actualBuild.Equals($expected, [StringComparison]::OrdinalIgnoreCase)) {
+            throw '[build-output] Cargo build_directory differs from the fixed output path. Remove the build-dir override before building; OUT_DIR embedding and signing require the same fixed output paths.'
         }
     } finally {
         Pop-Location

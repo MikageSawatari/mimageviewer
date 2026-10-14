@@ -93,9 +93,15 @@ try {
             $env:CARGO_BUILD_TARGET = 'x86_64-pc-windows-msvc'
             Assert-Preflight $true "$scriptName CARGO_BUILD_TARGET"
             Remove-Item Env:CARGO_BUILD_TARGET
+            $env:CARGO_BUILD_BUILD_DIR = Join-Path $fakeRepo 'other-build-cache'
+            Assert-Preflight $true "$scriptName CARGO_BUILD_BUILD_DIR"
+            Remove-Item Env:CARGO_BUILD_BUILD_DIR
             if ($portable) {
                 $SmokeTestScript = $true
                 Assert-Preflight $false 'portable diagnostic fixed target'
+                $env:CARGO_BUILD_BUILD_DIR = Join-Path $fakeRepo 'other-smoke-build-cache'
+                Assert-Preflight $true 'portable diagnostic split build dir'
+                Remove-Item Env:CARGO_BUILD_BUILD_DIR
                 $SmokeTestScript = $false
             }
             if ($scriptName -eq 'build-release.ps1') {
@@ -107,6 +113,12 @@ try {
                 }
                 $CargoArgs = @('--config', "build.target-dir='other-cli-target'")
                 Assert-Preflight $true 'release inline config output'
+                $buildPath = (Join-Path $fakeRepo 'other-cli-build-cache').Replace('\', '/')
+                $CargoArgs = @('--config', "build.build-dir='$buildPath'")
+                Assert-Preflight $true 'release --config build.build-dir mismatch'
+                $buildPath = (Join-Path $fakeRepo 'target').Replace('\', '/')
+                $CargoArgs = @('--config', "build.build-dir='$buildPath'")
+                Assert-Preflight $false 'release --config build.build-dir same target'
                 $configFile = Join-Path $fakeRoot 'extra.toml'
                 Write-Config $configFile "[build]`njobs=1`n" $true
                 $CargoArgs = @('--config', $configFile)
@@ -136,18 +148,25 @@ try {
         }
         if ($script:mode -eq 'json') { return 'invalid-json' }
         $dir = if ($script:mode -eq 'mismatch') { Join-Path $fakeRepo 'target-sibling' } else { $script:answerDirectory }
-        return (@{ target_directory = $dir } | ConvertTo-Json -Compress)
+        $result = @{ target_directory = $dir }
+        if ($script:mode -ne 'old-cargo') {
+            $result.build_directory = if ($script:mode -eq 'build-mismatch') { $dir + '-cache' } else { $dir }
+        }
+        if ($script:mode -eq 'empty-build') { $result.build_directory = $null }
+        return ($result | ConvertTo-Json -Compress)
     }
     Set-Location $fakeCaller
     Assert-MivFixedCargoOutput -WorkingDirectory $fakeRepo
     Assert-True ($script:capturedCwd -eq $fakeRepo) 'metadata used caller cwd'
     Assert-True (($script:capturedArgs -join ' ') -eq 'metadata --format-version 1 --no-deps --offline') 'metadata command contract changed'
-    foreach ($script:mode in @('exit', 'json', 'mismatch')) {
+    foreach ($script:mode in @('exit', 'json', 'mismatch', 'build-mismatch', 'empty-build')) {
         $message = $null
         try { Assert-MivFixedCargoOutput -WorkingDirectory $fakeRepo } catch { $message = $_.Exception.Message }
         Assert-True ($message -like '[[]build-output[]]*fixed*output*path*') "metadata failure accepted: $script:mode"
         Assert-True ((Get-Location).Path -eq $fakeCaller) 'failed metadata did not restore caller cwd'
     }
+    $script:mode = 'old-cargo'
+    Assert-MivFixedCargoOutput -WorkingDirectory $fakeRepo
     $script:mode = 'normal'
     foreach ($SmokeTestScript in @($false, $true)) {
         $name = if ($SmokeTestScript) { 'target-portable-test-script' } else { 'target-portable' }

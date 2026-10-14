@@ -11,6 +11,8 @@ use sha2::{Digest, Sha256};
 
 #[path = "src/build_const_parser.rs"]
 mod build_const_parser;
+#[path = "src/build_output_paths.rs"]
+mod build_output_paths;
 
 use build_const_parser::extract_const;
 
@@ -25,19 +27,26 @@ fn main() {
         .expect("workspace root inferable from CARGO_MANIFEST_DIR")
         .to_path_buf();
 
+    let out_dir = std::env::var_os("OUT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            eprintln!(
+                "Launcher build requires Cargo OUT_DIR; no target directory fallback is allowed."
+            );
+            std::process::exit(1);
+        });
+    let release_dir =
+        build_output_paths::release_inputs_dir_from_out_dir(&out_dir).unwrap_or_else(|error| {
+            eprintln!("Launcher build cannot resolve inputs from OUT_DIR: {error}");
+            std::process::exit(1);
+        });
+
     build_effetune::generate(&workspace_root);
 
-    // CARGO_TARGET_DIR を尊重 (環境変数が無ければ workspace_root/target)
-    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace_root.join("target"));
-
-    let core_exe = target_dir.join("release").join("mimageviewer-core.exe");
-    let remote_exe = target_dir.join("release").join("mimageviewer-remote.exe");
-    let epub_worker_exe = target_dir.join("release").join("mimageviewer-epub-pdf.exe");
-    let musicvideo_exe = target_dir
-        .join("release")
-        .join("mimageviewer-musicvideo.exe");
+    let core_exe = release_dir.join("mimageviewer-core.exe");
+    let remote_exe = release_dir.join("mimageviewer-remote.exe");
+    let epub_worker_exe = release_dir.join("mimageviewer-epub-pdf.exe");
+    let musicvideo_exe = release_dir.join("mimageviewer-musicvideo.exe");
 
     let missing = [
         (
@@ -177,6 +186,10 @@ fn main() {
     println!("cargo:rustc-env=MIMV_ACTIVATE_EVENT_NAME={activate_name}");
     println!("cargo:rustc-env=MIMV_OPEN_PATH_PIPE_NAME={open_path_pipe_name}");
     println!("cargo:rerun-if-changed={}", single_instance_rs.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("src/build_output_paths.rs").display()
+    );
     println!(
         "cargo:rerun-if-changed={}",
         manifest_dir

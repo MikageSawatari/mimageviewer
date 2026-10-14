@@ -29,6 +29,8 @@ mod build_const_parser;
 #[cfg(test)]
 #[path = "../build_effetune_source.rs"]
 mod build_effetune_source;
+#[cfg(test)]
+mod build_output_paths;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -822,6 +824,29 @@ fn show_error(msg: &str) {
 
 #[cfg(test)]
 mod diagnostics_tests {
+    #[test]
+    fn embedded_companion_paths_follow_cargo_out_dir_even_with_injected_target_env() {
+        let release_dir = super::build_output_paths::release_inputs_dir_from_out_dir(
+            std::path::Path::new(env!("OUT_DIR")),
+        )
+        .unwrap();
+        if let Some(injected) = std::env::var_os("MIV_TEST_EXPECT_INJECTED_TARGET_DIR") {
+            assert_eq!(std::env::var_os("CARGO_TARGET_DIR"), Some(injected.clone()));
+            assert_ne!(
+                release_dir,
+                std::path::PathBuf::from(injected).join("release")
+            );
+        }
+        for (actual, name) in [
+            (env!("MIMV_CORE_EXE"), "mimageviewer-core.exe"),
+            (env!("MIMV_REMOTE_EXE"), "mimageviewer-remote.exe"),
+            (env!("MIMV_EPUB_PDF_EXE"), "mimageviewer-epub-pdf.exe"),
+            (env!("MIMV_MUSICVIDEO_EXE"), "mimageviewer-musicvideo.exe"),
+        ] {
+            assert_eq!(std::path::Path::new(actual), release_dir.join(name));
+        }
+    }
+
     #[test]
     fn asset_disposition_preserves_content_verification_and_reuse() {
         let temp = tempfile::tempdir().unwrap();
