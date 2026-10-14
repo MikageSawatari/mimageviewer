@@ -647,7 +647,7 @@ C5–B5 の谷は再現しなかった。
 （約 1.85 半音ぶん）を同時に含む。1 kHz を越えると 8192-sample / 約 0.171 秒の窓へ切り替わるため、
 窓内を移動する信号の時間方向のにじみが音域差として現れていた。これは定常周波数応答の谷ではない。
 よって解析定数・窓選択・窓間ブレンドは変更せず、静かな素材は表示ゲインで持ち上げる。
-再測定は `cargo run -p musicvideo_lab --release -- --stationary-note-response` で半音別・音域別の値を
+再測定は `cargo run -p musicvideo-editor --release --features dev-tools --bin musicvideo-dev -- --stationary-note-response` で半音別・音域別の値を
 出力できる。
 
 ### D7. エンコードは既存資産を再利用し、出口だけ新規に作る
@@ -2158,6 +2158,76 @@ P4b-4 と H3b を検収に残す。
 歌詞の取消と読込完了が同じフレームになる順序、Ready / 待機中の読込がある状態での意図受理を加える。
 3 回目（同日）: 指摘なし、ACCEPT。実装では取消フラグだけで済ませず、既に受信可能になった成功結果も採用しないこと。
 
+#### P4b-1 実装記録（2026-10-14、未コミット）
+
+対象は `musicvideo` の `01f16465264f6c4b95ab862c3141db43cb59c723` 上の差分。
+`tools/musicvideo_lab` を `crates/musicvideo-editor` に移動し、旧ホストは残していない。
+`git mv` は worktree の git 管理領域に `index.lock` を作れず失敗したため、brief の許可に従い
+通常の移動を使った。コミット時の rename 判定は設計担当に引き継ぐ。未追跡の `out.mp4` は変更していない。
+
+- 共通ホストと既存テストは lib に集約。製品 bin `mimageviewer-musicvideo` は `run()` だけを呼び、
+  引数解析はまだ持たない。開発 bin `musicvideo-dev` は `required-features = ["dev-tools"]` で、
+  旧 main の全 10 種の診断・ベンチマーク引数を lib の `run_dev()` へ移した。
+  通常 GUI とプレビュー計測 GUI はどちらも既存の `setup_egui` 登録を維持した。
+- workspace member と lock、`musicvideo-core/tests/analysis_routes.rs` の監査パスを更新。
+  Cargo metadata で member に含まれ、default-members に含まれないことを確認した。
+  `scripts/test-full.ps1` は `cargo test --workspace --features pack-build-tools --no-fail-fast` を使うため、
+  このクレートの lib の既存・追加テストも従来どおり対象になる。スクリプトと `.gitignore` に旧パス参照は無かった。
+- 本体 lib の依存は `default-features = false`。本体には既定 feature の宣言がなく、通常 feature の
+  lib と build.rs の vendor 検査を使う。`portable` や本体の診断 feature は有効にしていない。
+- デコードは `mvexport::default_audio_stream_index` と
+  `audio_decode::decode_audio_file_to_stereo_f32` に統一し、worker の取消を渡す。
+  symphonia 依存と独自 resample を撤去。stereo f32 / 48kHz / PCM 由来の duration と
+  `ResourceRevision` / H3a key の所有は維持した。App・chrome・export・playback・project・
+  project_file・resource_blobs の移動済み 8 ファイルは、改行を除き HEAD のソースと一致した。
+- 現行の定常音再測定コマンドを `musicvideo-dev` へ更新した。過去の brief・実施記録は変更していない。
+  P4b-2〜4、P4c、H3b の実装やアプリの起動は行っていない。
+
+検証ログは `target/p4b1/`。ビルド・検査・テストには `MSBUILDDISABLENODEREUSE=1` を設定した。
+移動前の `before-list.log` / `before-test.log` と移動後の `editor-list.log` / `editor-test.log` を
+名前単位で突き合わせ、既存 **84 件は同名のまま全件成功、欠落・改名 0**。
+追加の decode テストは 3 件で、エディタは合計 **87 passed / 0 failed / 0 ignored**。
+照合結果と移動ファイルの同一性は `comparison.json` に保存した。
+
+追加の検査:
+
+- `ffmpeg_decode_matches_export_default_track_and_stereo_resampling`: 追跡済み合成素材
+  `multi-audio.m4a` / `multi.mkv` の既定が 2 番目の音声であること、書き出しの既定 stream と一致すること、
+  44.1kHz→48kHz と 5.1→stereo を含め PCM が本体 FFmpeg の出力と完全一致することを確認。
+  最初の音声トラックの PCM とは異なることも確認。
+- `ffmpeg_decode_receives_worker_cancellation`: worker の取消済み token でデコードが成功せず終了することを確認。
+- `shared_ffmpeg_decode_stops_when_cancelled_after_pcm_is_produced`: 全尺デコード API が委譲する共有 streaming
+  デコーダの最初の PCM 通知（約 2 秒）で取消し、6 秒の素材を最後まで処理せず `cancelled` を返すことを確認。
+  sleep や実時間に依存した競合は使っていない。
+
+先頭 stream を固定して既定トラック選択を壊すと PCM 一致テストが失敗し、worker の token を
+常に false の token に置換すると取消テストが失敗することを確認した（いずれも期待した exit 101、
+`mutation-first-track.log` / `mutation-ignore-cancel.log` / `mutations.json`）。
+各不正実装は元ソースの byte 列へ復元し、その後のエディタ全テストも 87 件成功した。
+
+| コマンド（通常 feature、指定箇所以外は通常 test profile） | 結果 | ログ |
+| --- | --- | --- |
+| `cargo test -p musicvideo-editor` | 87 passed / 0 failed / 0 ignored。移動前 84 件の名前・成功結果と一致、追加 3 件 | `editor-test.log` / `comparison.json` |
+| `cargo check -p musicvideo-editor --features dev-tools --bins` | exit 0。製品・開発の両 bin を検査 | `dev-check.log` |
+| `cargo test -p musicvideo-core -p musicvideo-ui -p music-core` | core 117（unit 115＋経路 2）/ UI 122 / music-core 69（unit 49＋integration 20）、計 308 passed、0 failed / 0 ignored | `shared-test.log` |
+| `cargo test -p mimageviewer --lib mvexport` | 8 passed / 0 failed / 0 ignored | `mvexport-test.log` |
+| `cargo fmt` / `cargo fmt --check` / `python scripts/check_ui_glyphs.py` / `git diff --check` | 成功、危険 glyph 0 | `fmt.log` / `fmt-check.log` / `glyphs.log` |
+| `cargo build --release -p musicvideo-editor --bin mimageviewer-musicvideo` | exit 0、**237.48 秒**。製品 exe **24,741,888 bytes（約 23.60 MiB）** | `release-build.log` / `release-build.json` |
+
+release の測定は既存の target キャッシュを利用した今回の実ビルドで、cold build の推測値ではない。
+成果物は `target/release/mimageviewer-musicvideo.exe`。`dumpbin /dependents` で FFmpeg の直接 import は
+`avcodec-61.dll` / `avformat-61.dll` / `avutil-59.dll` / `swresample-5.dll` と確認した
+（`release-imports.log`）。直接起動する場合は exe と同じディレクトリへ既存の FFmpeg DLL セットを配置する:
+
+```powershell
+Copy-Item .\vendor\ffmpeg\bin\*.dll .\target\release\
+```
+
+このセットには上の 4 DLL と `avfilter-10.dll` / `swscale-8.dll` を含む。
+テスト用の FFmpeg DLL は既に `target/debug/deps/` に配置済みで、追加コピーは不要だった。
+正本の P4b-1 との仕様上の相違はない。独立実装レビューは別担当に引き継ぐ。
+コミット・本体アプリ・製品エディタ・旧ラボ GUI の起動は行っていない。
+
 ---
 
 ## 4. データモデル（v1）
@@ -2308,7 +2378,7 @@ frame n → t = n/fps → evaluate → rasterize(CPU, rayon) → RGBA→NV12/YUV
 | **H3a** ✅ | 解析契約の確定と実装: 共通格子／PCM view／解析タイムライン（チェックポイント・型付き key）／較正入力を、プレビュー・書き出し・PNG・ベンチマークで共有 | **完了**（2026-10-14、`b473603cc` + `b913d9408`）。設計は実装前レビュー 3 回目で ACCEPT、実装は独立レビュー 1 回目 REVISE（P2 2・P3 1）を修正し 2 回目で ACCEPT。A6 は設計担当判断で 4 分位置 約 0.7 秒以内（並列）を採用、生の値のキャッシュなし。解析を使う書き出しの RGBA ハッシュは予定どおり変化、無変調ハッシュ維持。詳細は D3 の H3a 実装記録。画素の一致の確認は H3b（P4b 後） |
 | **H3b** | 一致の検証（P4b 接続後） | プレビューで表示したフレームが、同じ時刻の書き出しフレームと一致する: 表示フレームの欠落、前後への seek、直接 seek、音源より短い / 長い出力尺。これが通るまで H3 を完了扱いにしない |
 | **P4a** ✅ | 方式の設計確定: 本書 D10 / D14〜D16 の独立レビュー | GPT-6.1 Sol / xhigh の設計レビューで blocking 指摘なし。**完了**（2026-10-09）: 3 回目で条件付き ACCEPT（残った P3 の文言は反映済み）。runtime 競合の割り切りはユーザー判断で確定 |
-| **P4b** 設計 ACCEPT・P4b-1 実装中 | ホストの製品化（D16。段の分け方は D16 の「P4b の設計」）: ラボを `crates/musicvideo-editor` へ移し、FFmpeg デコードへ統一、スナップショット入力の MP4 書き出し（モーダル・進捗・キャンセル）、未保存の編集の確認、音声スレッドが stream を所有する再生と f32 以外の出力形式対応 | 書き出しがファイルを読み直さず、プレビューと同じ PCM・素材を使う（元ファイル変更・Undo 後の書き出しをテスト）。未保存確認の開く / 新規 / 最近 / 閉じる × 保存成功 / 失敗 / キャンセル、**保存は成功したが完了時点で再び未保存**、保存中・書き出し中の終了を handler テストで固定。書き出しの進捗・キャンセル・失敗が UI を止めない（[ui-responsiveness.md](ui-responsiveness.md) §4）。編集済みプロジェクトの 5 分 1080p60 完走と実測 |
+| **P4b** 設計 ACCEPT・P4b-1 実装／指定自動検証済み・独立レビュー待ち（P4b-2〜4 未実装） | ホストの製品化（D16。段の分け方は D16 の「P4b の設計」）: ラボを `crates/musicvideo-editor` へ移し、FFmpeg デコードへ統一、スナップショット入力の MP4 書き出し（モーダル・進捗・キャンセル）、未保存の編集の確認、音声スレッドが stream を所有する再生と f32 以外の出力形式対応 | 書き出しがファイルを読み直さず、プレビューと同じ PCM・素材を使う（元ファイル変更・Undo 後の書き出しをテスト）。未保存確認の開く / 新規 / 最近 / 閉じる × 保存成功 / 失敗 / キャンセル、**保存は成功したが完了時点で再び未保存**、保存中・書き出し中の終了を handler テストで固定。書き出しの進捗・キャンセル・失敗が UI を止めない（[ui-responsiveness.md](ui-responsiveness.md) §4）。編集済みプロジェクトの 5 分 1080p60 完走と実測 |
 | **P4c** | 起動引数と診断（D10）: `--audio` / `--project` / `--data-dir`、最近使ったプロジェクト、ログ・panic ログ、引数エラーの画面表示、runtime の shared lease と取得失敗の表示 | 引数解析の単体テスト。最近使った一覧: 壊れた JSON・無いファイル・上限・取消 / 失敗 / 破棄された読込を入れない・一覧の書込失敗で保存成功が覆らない。`--data-dir` 無しで最近一覧とファイルログを永続化しないこと。mIV の設定・DB・ログに触れないこと |
 | **P4d** | mIV 側の入口: 音楽ビュー・音声ファイルの右クリックから「音楽ビデオを作成」でエディタを起動 | 起動は非同期で UI を止めない。exe 不在・起動失敗は理由付きで通知。閲覧側の退行なし |
 | **P4e** | 配布（下の表）: launcher 内包・runtime 展開・署名・portable 同梱・全 PE / VC runtime gate・build スクリプト・test-full 前提 | build-dist 相当の通しビルド。runtime 清掃: 旧版 core 終了後にエディタだけ稼働 / 起動との競合 / エディタ終了後の清掃。release のエディタ exe サイズとビルド時間を記録 |

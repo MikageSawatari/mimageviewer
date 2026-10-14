@@ -86,8 +86,8 @@ fn export_driver_and_cli_share_the_frame_grid_view_and_timeline() {
 
 #[test]
 fn lab_preview_png_and_benchmark_share_analysis_inputs() {
-    let app = source("tools/musicvideo_lab/src/app.rs");
-    let export = source("tools/musicvideo_lab/src/export.rs");
+    let app = source("crates/musicvideo-editor/src/app.rs");
+    let export = source("crates/musicvideo-editor/src/export.rs");
     uses(
         function(&app, "start_preview_if_needed"),
         &[

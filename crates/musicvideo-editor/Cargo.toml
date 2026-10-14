@@ -1,0 +1,33 @@
+[package]
+name = "musicvideo-editor"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+autobins = false
+
+[features]
+dev-tools = []
+
+[[bin]]
+name = "mimageviewer-musicvideo"
+path = "src/main.rs"
+
+[[bin]]
+name = "musicvideo-dev"
+path = "src/bin/musicvideo-dev.rs"
+required-features = ["dev-tools"]
+
+[dependencies]
+comic-core = { path = "../comic-core" }
+cpal = "0.16"
+eframe = { version = "0.33", features = ["wgpu"] }
+egui = "0.33"
+image = { version = "0.25", features = ["jpeg", "png", "webp", "bmp"] }
+mimageviewer = { path = "../..", default-features = false }
+music-core = { path = "../music-core" }
+musicvideo-core = { path = "../musicvideo-core" }
+musicvideo-ui = { path = "../musicvideo-ui" }
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"

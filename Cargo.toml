@@ -12,6 +12,7 @@ members = [
     "crates/music-core",
     "crates/musicvideo-core",
     "crates/musicvideo-ui",
+    "crates/musicvideo-editor",
     "crates/remote-ipc",
     "crates/remote-web",
     "crates/vst3-host-tester",
@@ -20,7 +21,6 @@ members = [
     "tools/local_adjust_lab",
     "tools/comic_lab",
     "tools/music_lab",
-    "tools/musicvideo_lab",
     "tools/seek_strip_probe",
     "tools/viewer_context_audit",
 ]

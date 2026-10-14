@@ -1,4 +1,4 @@
-//! `musicvideo_lab` — 音楽ビデオ書き出しのラボ GUI。
+//! 音楽ビデオエディタの共通ホストと開発用の診断。
 //!
 //! 正本: `docs/music-video-export-plan.md`。各 increment のブリーフは `docs/brief-musicvideo-*.md`。
 
@@ -16,7 +16,8 @@ mod project;
 mod project_file;
 mod resource_blobs;
 
-fn main() {
+/// 開発用 bin の入口。診断の本体とテストは共通ホストに置く。
+pub fn run_dev() {
     let mut args = std::env::args().skip(1);
     let command = args.next();
     if command.as_deref() == Some("--benchmark") {
@@ -135,9 +136,7 @@ fn main() {
         }
         return;
     }
-    if let Err(error) = run_gui() {
-        eprintln!("musicvideo_lab を起動できません: {error}");
-    }
+    run();
 }
 
 fn run_preview_benchmark(frames: usize) -> Result<(), String> {
@@ -162,6 +161,13 @@ fn run_preview_benchmark(frames: usize) -> Result<(), String> {
         }),
     )
     .map_err(|error| error.to_string())
+}
+
+/// 製品の入口。診断引数は開発用 bin だけが扱う。
+pub fn run() {
+    if let Err(error) = run_gui() {
+        eprintln!("音楽ビデオエディタを起動できません: {error}");
+    }
 }
 
 fn run_gui() -> eframe::Result {
