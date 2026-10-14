@@ -66,7 +66,9 @@ impl MusicVideoLabApp {
     }
 
     pub(super) fn mp4_export_disabled_reason(&self) -> Option<&'static str> {
-        if self.export_state.pending().is_some() {
+        if self.intent_pending() || self.choosing_project_save() {
+            Some("プロジェクトの確認または保存先の選択が進行中です")
+        } else if self.export_state.pending().is_some() {
             Some("書き出しが進行中です")
         } else if !matches!(self.project_load, ProjectLoadState::Idle)
             || self.audio_pending.is_some()
@@ -213,6 +215,9 @@ impl MusicVideoLabApp {
         ctx: &egui::Context,
         actions: &mut Vec<ChromeAction>,
     ) {
+        if self.intent_pending() {
+            return;
+        }
         if let ExportState::Settings(settings) = &mut self.export_state {
             let mut accept = false;
             let mut cancel = false;

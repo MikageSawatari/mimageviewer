@@ -1,11 +1,15 @@
 mod chrome;
 #[cfg(test)]
 mod chrome_tests;
+mod document_intent;
+#[cfg(test)]
+mod document_intent_tests;
 mod mp4;
 #[cfg(test)]
 mod mp4_tests;
 
 use chrome::{ChromeAction, ToolbarState};
+use document_intent::{DocumentIntent, DocumentIntentState};
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -396,9 +400,17 @@ impl Drop for ResourceRestoreWorker {
     }
 }
 
-struct ProjectSavePending {
+struct ProjectSaveWrite {
     checkpoint: SaveCheckpoint,
     rx: mpsc::Receiver<Result<(), String>>,
+}
+
+enum ProjectSavePending {
+    Choosing {
+        session: DocumentSessionId,
+        rx: mpsc::Receiver<Option<PathBuf>>,
+    },
+    Writing(ProjectSaveWrite),
 }
 
 struct LrcLoadOwner {
@@ -622,6 +634,7 @@ pub struct MusicVideoLabApp {
     editor_state: EditorState,
     project_load: ProjectLoadState,
     project_save_pending: Option<ProjectSavePending>,
+    document_intent: DocumentIntentState,
     lrc_load: LrcLoadState,
     lrc_save_pending: Option<LrcSavePending>,
     preview_benchmark_target: Option<usize>,
@@ -688,6 +701,7 @@ impl MusicVideoLabApp {
             editor_state: EditorState::default(),
             project_load: ProjectLoadState::Idle,
             project_save_pending: None,
+            document_intent: DocumentIntentState::Idle,
             lrc_load: LrcLoadState::Idle,
             lrc_save_pending: None,
             preview_benchmark_target: None,
@@ -1298,7 +1312,10 @@ impl MusicVideoLabApp {
     /// Shared production frame boundary: all input and note_edit calls must
     /// precede completion admission. Headless input tests use this same entry.
     fn process_editor_frame(&mut self, ctx: &egui::Context) -> bool {
+        self.handle_close_request(ctx);
         let input_enabled = !self.load_choice_open()
+            && !self.intent_pending()
+            && !self.choosing_project_save()
             && !self.mp4_export_running()
             && !self.export_state.setup_open();
         let mut actions = Vec::new();
@@ -1308,6 +1325,7 @@ impl MusicVideoLabApp {
         self.draw_tool_windows(ctx, input_enabled, &mut actions);
         actions.extend(self.draw_load_choice(ctx));
         self.draw_mp4_dialogs(ctx, &mut actions);
+        self.draw_document_intent(ctx, &mut actions);
         let reset_preview_perf = self.apply_chrome_actions(ctx, actions);
         let add_image_layer_requested = response.add_image_layer_requested;
         let import_lrc_requested = response.import_lrc_requested;
@@ -1337,13 +1355,29 @@ impl MusicVideoLabApp {
             self.start_image_request(ImageLoadTarget::AddLayer, path, ctx);
         }
 
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
+            .show(ctx, |ui| {
+                ui.add_enabled_ui(
+                    !self.mp4_export_running()
+                        && !self.export_state.setup_open()
+                        && !self.intent_pending()
+                        && !self.choosing_project_save(),
+                    |ui| {
+                        self.draw_preview(ui);
+                    },
+                );
+            });
+
         // Project/LRC completion can replace the document or lyrics. Apply the current frame's
         // editor and timeline input first so that an asynchronous completion cannot skip its
         // generation/pending-edit conflict check.
         self.poll_projects(ctx);
         self.poll_lrc(ctx);
+        self.poll_project_save_choice(ctx);
         self.poll_mp4_choice(ctx);
         self.sync_runtime_resources(ctx);
+        self.finish_document_intent_frame(ctx);
         let title = format!("{} - mIV 音楽ビデオ", self.project_caption());
         if title != self.last_sent_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
@@ -1943,6 +1977,9 @@ impl MusicVideoLabApp {
     }
 
     fn start_project_load(&mut self, path: PathBuf, ctx: &egui::Context) {
+        if self.intent_pending() {
+            return;
+        }
         if let ProjectLoadState::Loading(pending) = &mut self.project_load {
             pending.cancel.store(true, Ordering::Relaxed);
             pending.queued = Some(path.clone());
@@ -2014,10 +2051,14 @@ impl MusicVideoLabApp {
         match spawned {
             Ok(_) => {
                 self.status = format!("プロジェクトを保存しています: {}", path.display());
-                self.project_save_pending = Some(ProjectSavePending { checkpoint, rx });
+                self.project_save_pending = Some(ProjectSavePending::Writing(ProjectSaveWrite {
+                    checkpoint,
+                    rx,
+                }));
             }
             Err(error) => {
                 self.status = format!("プロジェクト保存ワーカーを開始できません: {error}");
+                self.project_save_failed();
             }
         }
     }
@@ -2075,16 +2116,19 @@ impl MusicVideoLabApp {
             Some(Err(mpsc::TryRecvError::Empty)) | None => {}
         }
 
-        let save_result = self
-            .project_save_pending
-            .as_ref()
-            .map(|pending| pending.rx.try_recv());
+        let save_result = match &self.project_save_pending {
+            Some(ProjectSavePending::Writing(pending)) => Some(pending.rx.try_recv()),
+            _ => None,
+        };
         match save_result {
             Some(Ok(Ok(()))) => {
-                let pending = self
+                let ProjectSavePending::Writing(pending) = self
                     .project_save_pending
                     .take()
-                    .expect("the completed save request still exists");
+                    .expect("the completed save request still exists")
+                else {
+                    unreachable!()
+                };
                 let path = pending.checkpoint.path().to_path_buf();
                 if self.document.complete_save(pending.checkpoint) {
                     self.status = format!("プロジェクトを保存しました: {}", path.display());
@@ -2098,10 +2142,12 @@ impl MusicVideoLabApp {
             Some(Ok(Err(error))) => {
                 self.project_save_pending = None;
                 self.status = error;
+                self.project_save_failed();
             }
             Some(Err(mpsc::TryRecvError::Disconnected)) => {
                 self.project_save_pending = None;
                 self.status = "プロジェクト保存ワーカーが終了しました".to_owned();
+                self.project_save_failed();
             }
             Some(Err(mpsc::TryRecvError::Empty)) | None => {}
         }
@@ -2115,6 +2161,7 @@ impl MusicVideoLabApp {
     }
 
     fn apply_loaded_project(&mut self, loaded: LoadedProject) {
+        self.document_intent = DocumentIntentState::Idle;
         self.cancel_pending_resource_loads();
         if let Some(worker) = &mut self.restore_worker {
             worker.cancel();
@@ -2563,16 +2610,6 @@ impl eframe::App for MusicVideoLabApp {
         let egui_layout_started = Instant::now();
         let reset_preview_perf = self.process_editor_frame(ctx);
 
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
-            .show(ctx, |ui| {
-                ui.add_enabled_ui(
-                    !self.mp4_export_running() && !self.export_state.setup_open(),
-                    |ui| {
-                        self.draw_preview(ui);
-                    },
-                );
-            });
         let egui_layout_ms = egui_layout_started.elapsed().as_secs_f64() * 1000.0;
 
         self.start_calibration_if_needed(ctx);
@@ -3899,7 +3936,10 @@ mod tests {
             .document
             .begin_save(PathBuf::from("a.mivmv.json"), &app.project);
         let (tx, rx) = mpsc::channel();
-        app.project_save_pending = Some(ProjectSavePending { checkpoint, rx });
+        app.project_save_pending = Some(ProjectSavePending::Writing(ProjectSaveWrite {
+            checkpoint,
+            rx,
+        }));
 
         app.project = default_project(20.0);
         app.document
@@ -3922,7 +3962,10 @@ mod tests {
             .document
             .begin_save(PathBuf::from("a.mivmv.json"), &app.project);
         let (tx, rx) = mpsc::channel();
-        app.project_save_pending = Some(ProjectSavePending { checkpoint, rx });
+        app.project_save_pending = Some(ProjectSavePending::Writing(ProjectSaveWrite {
+            checkpoint,
+            rx,
+        }));
         app.project.display_gain_db = 6.0;
         app.document.note_edit();
 
@@ -4034,7 +4077,7 @@ mod tests {
         );
     }
 
-    fn loaded_project(path: &str, duration_secs: f64) -> LoadedProject {
+    pub(super) fn loaded_project(path: &str, duration_secs: f64) -> LoadedProject {
         LoadedProject {
             path: PathBuf::from(path),
             project: default_project(duration_secs),
@@ -4047,7 +4090,7 @@ mod tests {
         }
     }
 
-    fn editor_input(
+    pub(super) fn editor_input(
         app: &mut MusicVideoLabApp,
         context: &egui::Context,
         events: Vec<egui::Event>,
@@ -4067,7 +4110,7 @@ mod tests {
         )
     }
 
-    fn pointer_input(pos: egui::Pos2, pressed: bool) -> Vec<egui::Event> {
+    pub(super) fn pointer_input(pos: egui::Pos2, pressed: bool) -> Vec<egui::Event> {
         vec![
             egui::Event::PointerMoved(pos),
             egui::Event::PointerButton {
@@ -4079,7 +4122,7 @@ mod tests {
         ]
     }
 
-    fn rendered_editor_text(
+    pub(super) fn rendered_editor_text(
         app: &mut MusicVideoLabApp,
         context: &egui::Context,
         text: &str,
@@ -4135,7 +4178,6 @@ mod tests {
             },
             |ctx| {
                 app.process_editor_frame(ctx);
-                egui::CentralPanel::default().show(ctx, |ui| app.draw_preview(ui));
                 app.start_calibration_if_needed(ctx);
                 app.start_preview_if_needed(ctx);
             },

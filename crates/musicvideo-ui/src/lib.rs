@@ -457,6 +457,52 @@ impl EditorState {
             .any(LyricsTextBuffer::has_pending_resolution)
     }
 
+    /// Present the existing lyrics decision before the host replaces/closes a document.
+    /// Walk project order so unselected layers are resolved too; the buffers remain owners.
+    pub fn pending_lyrics_confirmation(
+        &mut self,
+        context: &egui::Context,
+        project: &mut Project,
+    ) -> EditorResponse {
+        let pending = project.layers.iter().find_map(|layer| {
+            self.lyrics_editors
+                .get(&layer.id)
+                .and_then(LyricsTextBuffer::pending_conflict)
+                .map(|conflict| (layer.id, layer.name.clone(), conflict))
+        });
+        let mut response = EditorResponse::default();
+        if let Some((id, name, conflict)) = pending {
+            let mut action = None;
+            egui::Modal::new(egui::Id::new("musicvideo-pending-lyrics")).show(context, |ui| {
+                ui.heading(name);
+                action = draw_lyrics_resolution(ui, &conflict);
+            });
+            if let Some(action) = action {
+                response = self.apply_pending_lyrics_confirmation(context, project, id, action);
+            }
+        }
+        response
+    }
+
+    fn apply_pending_lyrics_confirmation(
+        &mut self,
+        context: &egui::Context,
+        project: &mut Project,
+        id: LayerId,
+        action: LyricsConflictAction,
+    ) -> EditorResponse {
+        let checkpoint = self.begin_external_edit(project);
+        if let Some(layer) = project.layers.iter_mut().find(|layer| layer.id == id)
+            && let LayerKind::Lyrics(lyrics) = &mut layer.kind
+        {
+            apply_lyrics_conflict_action(self, context, id, lyrics, action);
+        }
+        EditorResponse {
+            project_changed: self.finish_external_edit(project, checkpoint),
+            ..Default::default()
+        }
+    }
+
     pub fn layer_has_pending_lyrics_edit(&self, layer: LayerId) -> bool {
         self.lyrics_editors
             .get(&layer)
@@ -1543,6 +1589,39 @@ enum LyricsConflictAction {
     Cancel,
 }
 
+fn apply_lyrics_conflict_action(
+    state: &mut EditorState,
+    context: &egui::Context,
+    layer_id: LayerId,
+    lyrics: &mut musicvideo_core::LyricsLayer,
+    action: LyricsConflictAction,
+) -> bool {
+    let editor = state
+        .lyrics_editors
+        .get_mut(&layer_id)
+        .expect("pending lyrics editor exists");
+    match action {
+        LyricsConflictAction::Resolve(choice) => {
+            if let Ok(LyricsPassResult::Applied(lines)) =
+                editor.resolve_pending(&lyrics.lines, choice)
+            {
+                lyrics.lines = lines;
+                if matches!(state.selected_detail, Some(DetailSelection::Lyric { .. })) {
+                    state.clear_detail_selection();
+                }
+                return true;
+            }
+        }
+        LyricsConflictAction::Cancel => {
+            let widget_id = editor.widget_id(layer_id);
+            if let Some(invalidation) = editor.cancel_pending() {
+                invalidation.restore_text_edit(context, widget_id);
+            }
+        }
+    }
+    false
+}
+
 fn draw_lyrics_resolution(
     ui: &mut egui::Ui,
     conflict: &LyricsEditConflict,
@@ -1698,7 +1777,7 @@ fn edit_lyrics(
     );
 
     let mut invalidation = None;
-    let (widget_id, pass_result) = {
+    let pass_result = {
         let editor = state
             .lyrics_editors
             .entry(layer_id)
@@ -1730,7 +1809,7 @@ fn edit_lyrics(
         {
             pass_result = refreshed;
         }
-        (widget_id, pass_result)
+        pass_result
     };
     if let Some(invalidation) = invalidation {
         state.pending_text_edit_restores.push(invalidation);
@@ -1753,31 +1832,7 @@ fn edit_lyrics(
         .and_then(LyricsTextBuffer::pending_conflict)
         && let Some(action) = draw_lyrics_resolution(ui, &conflict)
     {
-        match action {
-            LyricsConflictAction::Resolve(choice) => {
-                let resolution = state
-                    .lyrics_editors
-                    .get_mut(&layer_id)
-                    .expect("pending lyrics editor exists")
-                    .resolve_pending(&lyrics.lines, choice);
-                if let Ok(LyricsPassResult::Applied(lines)) = resolution {
-                    lyrics.lines = lines;
-                    result.changed = true;
-                    if matches!(state.selected_detail, Some(DetailSelection::Lyric { .. })) {
-                        state.clear_detail_selection();
-                    }
-                }
-            }
-            LyricsConflictAction::Cancel => {
-                if let Some(invalidation) = state
-                    .lyrics_editors
-                    .get_mut(&layer_id)
-                    .and_then(LyricsTextBuffer::cancel_pending)
-                {
-                    invalidation.restore_text_edit(ui.ctx(), widget_id);
-                }
-            }
-        }
+        result.changed |= apply_lyrics_conflict_action(state, ui.ctx(), layer_id, lyrics, action);
     }
 
     let next_unset = lyrics
@@ -2291,6 +2346,77 @@ mod tests {
         new_image_layer, new_solid_layer,
     };
     use std::sync::Arc;
+
+    fn pending_merge_choice(state: &EditorState, id: LayerId) -> LyricsConflictAction {
+        let conflict = state.lyrics_editors[&id].pending_conflict().unwrap();
+        let LyricsEditConflictKind::TimedLineMerge { choices } = conflict.kind else {
+            panic!("expected a timed merge");
+        };
+        LyricsConflictAction::Resolve(LyricsResolutionChoice::KeepTimedLine(choices[0].line_id))
+    }
+
+    #[test]
+    fn p4b4_lyrics_handler_continues_needs_resolution_and_records_one_transaction() {
+        let original = vec![
+            lyric_line("A", Some(1.0)),
+            lyric_line("B", Some(2.0)),
+            lyric_line("C", Some(3.0)),
+            lyric_line("D", Some(4.0)),
+        ];
+        let (mut project, id) = project_with_lyrics(original.clone());
+        let before = project.clone();
+        let mut state = EditorState::default();
+        state.reset_for_project(&project);
+        let editor = state.lyrics_editors.get_mut(&id).unwrap();
+        editor.begin_pass(&original, None).unwrap();
+        TextBuffer::delete_char_range(editor, 1..2);
+        TextBuffer::delete_char_range(editor, 4..5);
+        assert!(matches!(
+            editor.finish_pass(),
+            LyricsPassResult::NeedsResolution(_)
+        ));
+        let context = test_context();
+        let choice = pending_merge_choice(&state, id);
+        let response = state.apply_pending_lyrics_confirmation(&context, &mut project, id, choice);
+        assert!(!response.project_changed);
+        assert!(state.has_pending_lyrics_edit());
+        assert_eq!(project, before);
+        let choice = pending_merge_choice(&state, id);
+        let response = state.apply_pending_lyrics_confirmation(&context, &mut project, id, choice);
+        assert!(response.project_changed);
+        assert!(!state.has_pending_lyrics_edit());
+        assert_eq!(state.history_depths(), (1, 0));
+        assert_eq!(
+            lyrics_lines(&project, id),
+            vec![lyric_line("AB", Some(1.0)), lyric_line("CD", Some(3.0))]
+        );
+        assert!(state.undo(&mut project));
+        assert_eq!(project, before);
+    }
+
+    #[test]
+    fn p4b4_lyrics_handler_unchanged_is_complete_without_history() {
+        let original = vec![lyric_line("A", Some(1.0)), lyric_line("B", Some(2.0))];
+        let (mut project, id) = project_with_lyrics(original.clone());
+        let before = project.clone();
+        let mut state = EditorState::default();
+        state.reset_for_project(&project);
+        let editor = state.lyrics_editors.get_mut(&id).unwrap();
+        editor.begin_pass(&original, None).unwrap();
+        TextBuffer::delete_char_range(editor, 1..2);
+        TextBuffer::replace_with(editor, "A\nB");
+        assert!(matches!(
+            editor.finish_pass(),
+            LyricsPassResult::NeedsResolution(_)
+        ));
+        let context = test_context();
+        let choice = pending_merge_choice(&state, id);
+        let response = state.apply_pending_lyrics_confirmation(&context, &mut project, id, choice);
+        assert!(!response.project_changed);
+        assert!(!state.has_pending_lyrics_edit());
+        assert_eq!(project, before);
+        assert_eq!(state.history_depths(), (0, 0));
+    }
 
     fn assert_undo_redo_round_trip(
         state: &mut EditorState,

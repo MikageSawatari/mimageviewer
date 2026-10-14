@@ -1,6 +1,6 @@
 # 音楽ビデオ書き出し (Music Video Export) — 設計計画
 
-Status: P1〜P3j、P4b-1〜3 の実装・非対話検証あり。P4b-4 以降と H3b は未完了。
+Status: P1〜P3j、P4b-1〜4 の実装・非対話検証あり。P4b-4 の独立レビュー、P4c 以降と H3b は未完了。
 2026-10-09 に P4 の方式を「別 exe のエディタ」へ改訂（D10 / D16）、
 画面構成（D14）と文字装飾の初版範囲（D15）を追加。改訂は GPT-6.1 Sol / xhigh の独立レビュー 3 回で
 条件付き ACCEPT（P4a 完了、2026-10-09）。
@@ -2443,6 +2443,86 @@ P4b-4・H3b・実機 GUI 検収は未実施。コミットせず、既存の未�
   ごく短い間に、別のエディタ等が同じ名前で書き出しを完了した場合だけ。判断をコードのコメントに残した。
 - P3: §7 の P4b 行で P4b-3 が独立レビュー済みに読める誤記を直した。
 
+#### P4b-4 実装記録（2026-10-14）
+
+対象: `musicvideo` の `7413b649d0d224b326b41cffa92e369d9fd0240b` からの未コミット差分。
+正本は本節の P4b-4 と D10「未保存の編集と終了」、brief は
+[brief-musicvideo-p4b4.md](brief-musicvideo-p4b4.md)。独立実装レビューと実機 GUI 検収は別担当に残す。
+アプリ・製品エディタ・lab GUI の起動とコミットは行わず、既存の未追跡 `out.mp4` は変更していない。
+
+実装:
+
+- `app/document_intent.rs` の `Open(PathBuf)` / `New` / `Close` を session 付きの単一の保留意図とした。
+  未保存確認・保存待ち・書き出しの終了確認／終端待ちは同じ owner の phase。承認済み Close は終端状態とし、
+  自分で送った Close を CancelClose しない。確認中の close 要求は現在の意図だけを Close に置き換える。
+- 意図の受理時に H1 の Loading（待機中の次の path を含む）／Ready を取り外し、取消と H2 の遅延解放へ渡す。
+  receiver も取り外すため、取消より先に送信された成功結果も採用しない。保留中は通常の読込入口も拒否し、
+  判定を通った Open だけが再開する。UI は worker の終了を待たない。
+- toolbar に「新規」を追加。既存の Project の既定値を使い、`apply_loaded_project` と同じ素材・音声・履歴の
+  切り替え経路を通してから、保存先を持たない新しい session とする。P4c の最近一覧・起動引数は変更していない。
+- 全レイヤーの歌詞 buffer を project 順に確認するモーダルを `musicvideo-ui` に追加。
+  既存 `draw_lyrics_resolution` と同じ resolve / cancel handler を使い、取消は TextEdit rollback を復元する。
+  反映は既存 transaction / 履歴 / `EditorResponse` / `note_edit` 経由。NeedsResolution は確認を続け、
+  Unchanged でも全レイヤーの pending の消失をもって完了とする。別の歌詞確認 owner は追加していない。
+- 通常保存と意図の「保存」は同じ入口へ合流。保存先選択は worker に置き、既存の保存 pending を
+  Choosing / Writing の型へまとめた（互いに排他的な Option は追加しない）。取消・失敗は意図を捨てる。
+  `complete_save` は保存基準の更新にとどめ、保存成功を clean と解釈しない。
+- `process_editor_frame` にプレビュー入力も含め、editor／toolbar／preview の入力と
+  `poll_projects` / `poll_lrc` / 保存先選択／素材同期の後に共通の未保存判定を 1 回行う。
+  保存待ちもモーダルを維持し、保存中の LRC・素材採用で再び dirty なら再確認する。
+- 書き出し中の Close は中止確認を出す。拒否なら worker を継続し、承認なら cancel を送り、
+  worker の終端結果による export owner の解放まで待つ。取消フラグだけで終了扱いにしない。
+
+組み合わせの簡素化は受け入れ済み設計どおり、単一の保留意図・モーダル・先行 Project 読込の取消を採用した。
+まれな保存失敗はログと通知だけ。再試行・復旧機構は追加していない。D10／P4b-4 の仕様との相違はない。
+
+追加テストと失敗確認:
+
+- editor に handler テスト **29 件**。Open / New / Close × 保存成功／失敗／保存先取消／破棄／取消の 15 件、
+  clean の直接実行、同一フレームの保存完了と LRC 採用、保存中の素材採用、先行 Project 読込の既受信／待機中／Ready
+  の退役と完了順序、保存中の Close と置き換え、session 失効、書き出し中止の承認／拒否と終端待ち、
+  CancelClose／承認済み Close、新規の素材境界、保存中の入力 gate、未選択レイヤーの歌詞取消と cursor rollback、
+  実際の保存 worker と保存先選択結果の合流、toolbar 新規の確認を検査した。
+- UI に handler テスト **2 件**。同じ編集内の 2 回の NeedsResolution を経て 1 transaction で反映すること、
+  resolve が Unchanged でも pending を解消して履歴を増やさないことを検査した。
+- **31 件すべて**が次の変異のいずれかで失敗することを確認した（コンパイル失敗は検出と数えない）。
+  各実行の finally で変異を復元。各テスト名との対応とログは `target/p4b4-mutations/report.json` と
+  同ディレクトリの `M01`〜`M13` のログに記録した。
+
+| 変異 | 検出した追加テスト数 |
+| --- | ---: |
+| M01 フレーム末尾の共通判定を呼ばない | 27 |
+| M02 モーダル中の通常操作を dispatch する | 1 |
+| M03 意図のキャンセルを無視する | 4 |
+| M04 保存失敗後も意図を残す | 3 |
+| M05 保存先選択の取消後も意図を残す | 3 |
+| M06 Project 読込 receiver を取り外さない | 2 |
+| M07 保存完了を待たず判定する | 3 |
+| M08 書き出し worker の終端を待たず判定する | 1 |
+| M09 承認済み Close も CancelClose する | 1 |
+| M10 文書 session の所属を確認しない | 1 |
+| M11 共通判定を poll_lrc より前へ移す | 1 |
+| M12 歌詞の resolve を実行しない | 2 |
+| M13 歌詞取消の TextEdit rollback を復元しない | 1 |
+
+非対話 gate（全 Cargo コマンドに `MSBUILDDISABLENODEREUSE=1`、変異を復元した差分で実行）:
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo test -p musicvideo-editor` | **140 passed / 0 failed**（既存 111 + 追加 29） |
+| `cargo check -p musicvideo-editor --features dev-tools --bins` | exit 0 |
+| `cargo test -p musicvideo-core -p musicvideo-ui` | core **115** + 経路監査 **2** + UI **124 passed / 0 failed**（UI 既存 122 + 追加 2） |
+| `cargo test -p mimageviewer --lib mvexport` | **15 passed / 0 failed** |
+| `cargo fmt --check` | exit 0（`cargo fmt` 実行済み） |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険 glyph **0** |
+| `cargo build --release -p musicvideo-editor --bin mimageviewer-musicvideo` | exit 0、`target/release/mimageviewer-musicvideo.exe` 生成（起動なし） |
+
+指定テストの合計は **396 passed / 0 failed / 0 ignored**。既存 H1 / H2 / H3a / I1 / L1〜L3 / P4b-1〜3 を維持した。
+ログは `target/p4b4-editor.log`、`target/p4b4-{check,core-ui,mvexport,fmt,glyphs,release}.log`、
+コマンド／exit code／件数の集計は `target/p4b4-gates.json`。GUI 入力／描画の検査は headless egui のみで、
+保存待ちの確認表示も shape と handler で検査した。実機 close／OS 保存先ダイアログ・音声・H3b は未検証。
+
+
 ---
 
 ## 4. データモデル（v1）
@@ -2593,7 +2673,7 @@ frame n → t = n/fps → evaluate → rasterize(CPU, rayon) → RGBA→NV12/YUV
 | **H3a** ✅ | 解析契約の確定と実装: 共通格子／PCM view／解析タイムライン（チェックポイント・型付き key）／較正入力を、プレビュー・書き出し・PNG・ベンチマークで共有 | **完了**（2026-10-14、`b473603cc` + `b913d9408`）。設計は実装前レビュー 3 回目で ACCEPT、実装は独立レビュー 1 回目 REVISE（P2 2・P3 1）を修正し 2 回目で ACCEPT。A6 は設計担当判断で 4 分位置 約 0.7 秒以内（並列）を採用、生の値のキャッシュなし。解析を使う書き出しの RGBA ハッシュは予定どおり変化、無変調ハッシュ維持。詳細は D3 の H3a 実装記録。画素の一致の確認は H3b（P4b 後） |
 | **H3b** | 一致の検証（P4b 接続後） | プレビューで表示したフレームが、同じ時刻の書き出しフレームと一致する: 表示フレームの欠落、前後への seek、直接 seek、音源より短い / 長い出力尺。これが通るまで H3 を完了扱いにしない |
 | **P4a** ✅ | 方式の設計確定: 本書 D10 / D14〜D16 の独立レビュー | GPT-6.1 Sol / xhigh の設計レビューで blocking 指摘なし。**完了**（2026-10-09）: 3 回目で条件付き ACCEPT（残った P3 の文言は反映済み）。runtime 競合の割り切りはユーザー判断で確定 |
-| **P4b** 設計 ACCEPT・P4b-1 / P4b-2 独立レビュー ACCEPT・P4b-3 独立レビュー 1 回目 REVISE（P2 は設計担当の割り切り、再確認待ち）・P4b-3 の 5 分完走済み（参考値）・P4b-4 未実装 | ホストの製品化（D16。段の分け方は D16 の「P4b の設計」）: ラボを `crates/musicvideo-editor` へ移し、FFmpeg デコードへ統一、スナップショット入力の MP4 書き出し（モーダル・進捗・キャンセル）、未保存の編集の確認、音声スレッドが stream を所有する再生と f32 以外の出力形式対応 | **P4b-3（2026-10-14、未コミット）**: 指定ゲート 365 passed、追加 18 件すべての変異失敗確認、既存 editor 101 件維持。共通 snapshot／解析／較正／PCM view AAC／原子的公開／モーダル終端を接続し、製品 editor・通常 CLI・dev CLI の release build 成功。編集済み 5 分 1080p60 を dev CLI で 18,000 frames 完走、184.441 秒／1.6265x（背景 Codex 4 件あり、参考値）。詳細は D16 の P4b-3 記録。P4b-2 の実機の音・GUI・H3b は未確認。未保存確認／保存中・書き出し中の終了は P4b-4 に残す |
+| **P4b** 設計 ACCEPT・P4b-1 / P4b-2 独立レビュー ACCEPT・P4b-3 独立レビュー 1 回目 REVISE（P2 は設計担当の割り切り、再確認待ち）・P4b-3 の 5 分完走済み（参考値）・P4b-4 実装・非対話検証済み（独立レビュー待ち） | ホストの製品化（D16。段の分け方は D16 の「P4b の設計」）: ラボを `crates/musicvideo-editor` へ移し、FFmpeg デコードへ統一、スナップショット入力の MP4 書き出し（モーダル・進捗・キャンセル）、未保存の編集の確認、音声スレッドが stream を所有する再生と f32 以外の出力形式対応 | **P4b-3（2026-10-14、未コミット）**: 指定ゲート 365 passed、追加 18 件すべての変異失敗確認、既存 editor 101 件維持。共通 snapshot／解析／較正／PCM view AAC／原子的公開／モーダル終端を接続し、製品 editor・通常 CLI・dev CLI の release build 成功。編集済み 5 分 1080p60 を dev CLI で 18,000 frames 完走、184.441 秒／1.6265x（背景 Codex 4 件あり、参考値）。詳細は D16 の P4b-3 記録。P4b-2 の実機の音・GUI・H3b は未確認。**P4b-4（2026-10-14、未コミット）**: session 所属の単一意図、歌詞の先行解決、保存後のフレーム末尾の再判定、先行読込の receiver 退役、新規、CancelClose／承認済み Close と書き出し中止の終端待ちを実装。指定ゲート **396 passed**、追加 **31 件**すべて変異失敗確認。詳細は D16 の P4b-4 記録。独立レビュー・実機確認・H3b は未完了 |
 | **P4c** | 起動引数と診断（D10）: `--audio` / `--project` / `--data-dir`、最近使ったプロジェクト、ログ・panic ログ、引数エラーの画面表示、runtime の shared lease と取得失敗の表示 | 引数解析の単体テスト。最近使った一覧: 壊れた JSON・無いファイル・上限・取消 / 失敗 / 破棄された読込を入れない・一覧の書込失敗で保存成功が覆らない。`--data-dir` 無しで最近一覧とファイルログを永続化しないこと。mIV の設定・DB・ログに触れないこと |
 | **P4d** | mIV 側の入口: 音楽ビュー・音声ファイルの右クリックから「音楽ビデオを作成」でエディタを起動 | 起動は非同期で UI を止めない。exe 不在・起動失敗は理由付きで通知。閲覧側の退行なし |
 | **P4e** | 配布（下の表）: launcher 内包・runtime 展開・署名・portable 同梱・全 PE / VC runtime gate・build スクリプト・test-full 前提 | build-dist 相当の通しビルド。runtime 清掃: 旧版 core 終了後にエディタだけ稼働 / 起動との競合 / エディタ終了後の清掃。release のエディタ exe サイズとビルド時間を記録 |

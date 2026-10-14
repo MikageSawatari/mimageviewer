@@ -98,12 +98,12 @@ fn p4b3_admission_blocks_each_loading_saving_unready_and_missing_audio_state() {
             }
             1 => {
                 let (_tx, rx) = mpsc::channel();
-                app.project_save_pending = Some(ProjectSavePending {
+                app.project_save_pending = Some(ProjectSavePending::Writing(ProjectSaveWrite {
                     checkpoint: app
                         .document
                         .begin_save(PathBuf::from("project.json"), &app.project),
                     rx,
-                });
+                }));
             }
             2 => {
                 let (_tx, rx) = mpsc::channel();

@@ -3,6 +3,11 @@ use super::*;
 use egui::emath::GuiRounding;
 
 pub(super) enum ChromeAction {
+    NewProject,
+    SaveIntent,
+    DiscardIntent,
+    CancelIntent,
+    StopExportAndClose,
     OpenProject,
     SaveProject,
     SaveProjectAs,
@@ -59,6 +64,7 @@ impl ToolbarState {
 
     pub(super) fn draw(&self, ui: &mut egui::Ui, actions: &mut Vec<ChromeAction>) {
         for (enabled, label, action) in [
+            (self.can_open_project, "新規", ChromeAction::NewProject),
             (
                 self.can_open_project,
                 "プロジェクトを開く",
@@ -559,6 +565,19 @@ impl MusicVideoLabApp {
     ) -> bool {
         let mut reset_perf = false;
         for action in actions {
+            if matches!(
+                action,
+                ChromeAction::SaveIntent
+                    | ChromeAction::DiscardIntent
+                    | ChromeAction::CancelIntent
+                    | ChromeAction::StopExportAndClose
+            ) {
+                self.apply_intent_action(action, ctx);
+                continue;
+            }
+            if self.intent_pending() || self.choosing_project_save() {
+                continue;
+            }
             if self.mp4_export_running() && !matches!(action, ChromeAction::CancelExport) {
                 continue;
             }
@@ -576,6 +595,11 @@ impl MusicVideoLabApp {
                 "modal input reached dispatch"
             );
             match action {
+                ChromeAction::NewProject => self.accept_document_intent(DocumentIntent::New),
+                ChromeAction::SaveIntent
+                | ChromeAction::DiscardIntent
+                | ChromeAction::CancelIntent
+                | ChromeAction::StopExportAndClose => unreachable!(),
                 ChromeAction::ExportMp4 => {
                     if self.mp4_export_disabled_reason().is_none() {
                         self.export_state =
@@ -594,23 +618,11 @@ impl MusicVideoLabApp {
                         .add_filter("mIV 音楽ビデオ", &["json"])
                         .pick_file()
                     {
-                        self.start_project_load(path, ctx);
+                        self.accept_document_intent(DocumentIntent::Open(path));
                     }
                 }
                 ChromeAction::SaveProject | ChromeAction::SaveProjectAs => {
-                    let path = if matches!(action, ChromeAction::SaveProject) {
-                        self.document.path().map(PathBuf::from)
-                    } else {
-                        None
-                    };
-                    if let Some(path) = path.or_else(|| {
-                        rfd::FileDialog::new()
-                            .add_filter("mIV 音楽ビデオ", &["json"])
-                            .set_file_name("project.mivmv.json")
-                            .save_file()
-                    }) {
-                        self.start_project_save(ensure_project_extension(path), ctx);
-                    }
+                    self.request_project_save(matches!(action, ChromeAction::SaveProjectAs), ctx);
                 }
                 ChromeAction::OpenAudio => {
                     if let Some(path) = rfd::FileDialog::new()

@@ -402,7 +402,10 @@ fn l3_review_status_details_survives_async_completions_and_keeps_menu_actions() 
                     .document
                     .begin_save("saved.mivmv.json".into(), &h.app.project);
                 let (tx, rx) = mpsc::channel();
-                h.app.project_save_pending = Some(ProjectSavePending { checkpoint, rx });
+                h.app.project_save_pending = Some(ProjectSavePending::Writing(ProjectSaveWrite {
+                    checkpoint,
+                    rx,
+                }));
                 tx.send(Ok(())).unwrap();
             }
             for _ in 0..3 {
