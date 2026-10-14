@@ -281,6 +281,114 @@ fn composition_editor_confirmation_and_blocked_snapshots_at_200_percent() {
     }
 }
 
+#[test]
+fn composition_editor_confirmation_modals_small_screen_and_background_isolation() {
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    for scale in [1.0, 2.0] {
+        for (theme, name) in [
+            (mimageviewer::os_theme::ResolvedTheme::Light, "light"),
+            (mimageviewer::os_theme::ResolvedTheme::Dark, "dark"),
+        ] {
+            for (kind, confirmation, accept) in [
+                ("remove", EditorConfirmation::Remove, "解除する"),
+                ("reload", EditorConfirmation::Reload, "読み直す"),
+                ("reload_long", EditorConfirmation::Reload, "読み直す"),
+            ] {
+                let mut view = fixture(EditorPhase::Editing);
+                if kind == "reload_long" {
+                    view.error = Some("ページが変更されています。C:/とても長い日本語の書庫名/ページ名.pngを読み直してください。".repeat(80));
+                }
+                let state = EditorUiState {
+                    confirmation,
+                    ..Default::default()
+                };
+                let mut h = view_harness(egui::vec2(1093.0, 614.0), scale, theme, view, state);
+                h.run_steps(8);
+                assert_control_inside(&h, accept, kind);
+                assert_control_inside(&h, "キャンセル", kind);
+                for label in [
+                    "保存",
+                    "構成を解除",
+                    "元に戻す",
+                    "右開き",
+                    "表紙あり",
+                    "ページを読み直す",
+                    "Close window",
+                ] {
+                    assert!(
+                        !assert_control_inside(&h, label, kind).enabled(),
+                        "background {label}"
+                    );
+                }
+                let background = assert_control_inside(&h, "右開き", kind);
+                click_logical_response(&mut h, &background);
+                h.run();
+                assert!(
+                    h.state()
+                        .iter()
+                        .all(|action| matches!(action, EditorUiAction::RequestThumbnails(_)))
+                );
+                assert!(h.query_by_label(accept).is_some());
+                if !(kind == "remove" && scale == 2.0) {
+                    h.snapshot(format!(
+                        "composition_editor_{kind}_1093_614_{}_{}",
+                        (scale * 100.0) as u32,
+                        name
+                    ));
+                    snapshots.extend(h.take_snapshot_results());
+                }
+                let cancel = assert_control_inside(&h, "キャンセル", kind);
+                click_logical_response(&mut h, &cancel);
+                h.run_steps(4);
+                assert!(h.query_by_label(accept).is_none(), "{kind}/{name}/{scale}");
+                assert!(assert_control_inside(&h, "保存", kind).enabled());
+                assert!(!h.state().contains(&EditorUiAction::Cancel));
+                let entry = assert_control_inside(
+                    &h,
+                    if kind == "remove" {
+                        "構成を解除"
+                    } else {
+                        "ページを読み直す"
+                    },
+                    kind,
+                );
+                click_logical_response(&mut h, &entry);
+                h.run_steps(4);
+                let button = assert_control_inside(&h, accept, kind);
+                click_logical_response(&mut h, &button);
+                h.step();
+                assert!(
+                    h.state().contains(&if kind == "remove" {
+                        EditorUiAction::Remove
+                    } else {
+                        EditorUiAction::Reload
+                    }),
+                    "{kind}/{name}/{scale}: {:?}",
+                    h.state()
+                );
+                assert!(!h.state().contains(&EditorUiAction::Save));
+                h.run_steps(2);
+                assert!(h.query_by_label(accept).is_none());
+            }
+        }
+    }
+}
+
+// egui raw input uses logical points; AccessKit Node::click sends physical
+// bounds unchanged. Exercise real pointer hit testing at the response rect.
+fn click_logical_response(h: &mut Harness<'_, Vec<EditorUiAction>>, response: &egui::Response) {
+    let pos = response.rect.center();
+    h.event(egui::Event::PointerMoved(pos));
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+}
+
 /// AccessKit exports physical-pixel bounds; egui responses use logical points.
 /// Check both, including the actual unclipped pointer interaction rectangle.
 fn assert_control_inside(
@@ -288,7 +396,18 @@ fn assert_control_inside(
     label: &str,
     detail: &str,
 ) -> egui::Response {
-    let node = h.get_by_label(label);
+    let nodes = h.get_all_by_label(label).collect::<Vec<_>>();
+    // The modal and disabled editor both have a cancel button. Inspect the
+    // active response when present, retaining disabled controls for other cases.
+    let node = nodes
+        .iter()
+        .find(|node| {
+            let id = unsafe { egui::Id::from_high_entropy_bits(node.accesskit_node().id().0) };
+            h.ctx
+                .read_response(id)
+                .is_some_and(|response| response.enabled())
+        })
+        .unwrap_or(&nodes[0]);
     let logical_screen = h.ctx.content_rect();
     let physical_screen = egui::Rect::from_min_max(
         logical_screen.min * h.ctx.pixels_per_point(),

@@ -72,6 +72,7 @@ pub enum EditorConfirmation {
     #[default]
     None,
     Remove,
+    Reload,
 }
 #[derive(Clone, Debug, Default)]
 pub struct EditorUiState {
@@ -130,12 +131,19 @@ pub fn show_window(
         (screen.size() - egui::vec2(margin * 2.0, margin * 2.0)).max(egui::vec2(240.0, 140.0));
     let mut open = true;
     let mut actions = Vec::new();
-    ctx.memory_mut(|memory| {
-        memory.set_modal_layer(egui::LayerId::new(egui::Order::Foreground, id))
-    });
+    if view.phase != EditorPhase::Editing {
+        state.confirmation = EditorConfirmation::None;
+    }
+    let confirmation_at_start = state.confirmation;
+    if confirmation_at_start == EditorConfirmation::None {
+        ctx.memory_mut(|memory| {
+            memory.set_modal_layer(egui::LayerId::new(egui::Order::Foreground, id))
+        });
+    }
     egui::Window::new("本の構成を編集")
         .id(id)
         .order(egui::Order::Foreground)
+        .enabled(confirmation_at_start == EditorConfirmation::None)
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
@@ -148,18 +156,45 @@ pub fn show_window(
             ui.set_max_height((screen.bottom() - ui.min_rect().top() - margin).max(80.0));
             actions = render(ui, view, state);
         });
-    let can_close = !matches!(view.phase, EditorPhase::Saving | EditorPhase::Reloading);
-    if (!open || keys.escape) && can_close {
-        if state.confirmation != EditorConfirmation::None {
+    if state.confirmation != EditorConfirmation::None {
+        // A click opening a confirmation must not also accept it with a key
+        // from the same input pass. Keys are already qualified by App's IME helpers.
+        let confirmation_keys = if confirmation_at_start == state.confirmation {
+            keys
+        } else {
+            DialogKeys::default()
+        };
+        if let Some(choice) = show_confirmation(
+            ctx,
+            id.with("confirmation"),
+            view,
+            state.confirmation,
+            confirmation_keys,
+        ) {
+            let confirmation = state.confirmation;
             state.confirmation = EditorConfirmation::None;
-        } else if !actions.contains(&EditorUiAction::Cancel) {
-            actions.push(EditorUiAction::Cancel);
+            if choice {
+                actions.push(match confirmation {
+                    EditorConfirmation::Remove => EditorUiAction::Remove,
+                    EditorConfirmation::Reload => EditorUiAction::Reload,
+                    EditorConfirmation::None => unreachable!(),
+                });
+            }
         }
+        return actions;
+    }
+    // A cancellation only dismisses the front confirmation, never the editor.
+    if confirmation_at_start != EditorConfirmation::None {
+        return actions;
+    }
+    let can_close = !matches!(view.phase, EditorPhase::Saving | EditorPhase::Reloading);
+    if (!open || keys.escape) && can_close && !actions.contains(&EditorUiAction::Cancel) {
+        actions.push(EditorUiAction::Cancel);
     }
     if keys.enter
+        && !keys.escape
         && view.phase == EditorPhase::Editing
         && view.can_save
-        && state.confirmation == EditorConfirmation::None
         && !ctx.memory(|m| m.focused().is_some())
         && actions
             .iter()
@@ -170,6 +205,131 @@ pub fn show_window(
     actions
 }
 
+/// One bounded overlay for destructive editor choices. Header and actions stay
+/// outside the scrollable explanation, including long external-change errors.
+fn show_confirmation(
+    ctx: &egui::Context,
+    id: egui::Id,
+    view: &EditorView,
+    confirmation: EditorConfirmation,
+    keys: DialogKeys,
+) -> Option<bool> {
+    let (title, explanation, accept) = match confirmation {
+        EditorConfirmation::Remove => (
+            "構成を解除しますか",
+            "保存済みのページ順・非表示・ページごとの指定と、読む方向・表紙の指定を解除し、通常の本ごとの設定に戻します。原本のページは削除しません。".to_owned(),
+            "解除する",
+        ),
+        EditorConfirmation::Reload => (
+            "ページを読み直しますか",
+            format!("読み直すと、編集中の変更を破棄して、現在のページと保存済みの構成を読み込みます。\n\n{}", view.error.as_deref().unwrap_or("ページを読み直します。")),
+            "読み直す",
+        ),
+        EditorConfirmation::None => return None,
+    };
+    // egui also turns raw Enter into a click on a focused button. Suppress that
+    // route when the IME helper (or the opening input pass) denied Enter.
+    if !keys.enter {
+        ctx.input_mut(|input| {
+            input.events.retain(|event| {
+                !matches!(
+                    event,
+                    egui::Event::Key {
+                        key: egui::Key::Enter,
+                        pressed: true,
+                        ..
+                    }
+                )
+            });
+        });
+    }
+    let screen = ctx.content_rect();
+    let frame = egui::Frame::popup(&ctx.style());
+    let margin = frame.total_margin();
+    let size = (screen.size() - margin.sum() - egui::vec2(24.0, 24.0)).max(egui::vec2(1.0, 1.0));
+    let mut choice = None;
+    let response = egui::Modal::new(id).frame(frame).show(ctx, |ui| {
+        ui.set_width(size.x.min(420.0));
+        let heading = ui.add(egui::Label::new(RichText::new(title).heading()).wrap());
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        let row_height = [accept, "キャンセル"]
+            .into_iter()
+            .map(|text| {
+                ui.painter()
+                    .layout_no_wrap(text.to_owned(), font.clone(), ui.visuals().text_color())
+                    .size()
+                    .y
+                    + 2.0 * ui.spacing().button_padding.y
+            })
+            .fold(ui.spacing().interact_size.y, f32::max);
+        let width = ui.available_width();
+        let scroll = &mut ui.spacing_mut().scroll;
+        scroll.floating_allocated_width = scroll.bar_inner_margin + scroll.bar_width;
+        let natural = ui
+            .painter()
+            .layout(
+                explanation.clone(),
+                egui::TextStyle::Body.resolve(ui.style()),
+                ui.visuals().text_color(),
+                (width - ui.spacing().scroll.floating_allocated_width).max(1.0),
+            )
+            .size()
+            .y;
+        let budget =
+            (size.y - heading.rect.height() - row_height - 2.0 * ui.spacing().item_spacing.y)
+                .max(0.0);
+        let body_height = natural.min(budget);
+        ui.allocate_ui_with_layout(
+            egui::vec2(width, body_height),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(body_height)
+                    .min_scrolled_height(0.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.add(egui::Label::new(&explanation).wrap());
+                    });
+            },
+        );
+        let _buttons = ui.horizontal(|ui| {
+            let accept = ui.button(accept);
+            let cancel = ui.button("キャンセル");
+            if accept.clicked() {
+                choice = Some(true);
+            }
+            if cancel.clicked() {
+                choice = Some(false);
+            }
+            (accept, cancel)
+        });
+        #[cfg(test)]
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                id.with("geometry"),
+                (
+                    heading.rect,
+                    _buttons.inner.0.rect,
+                    _buttons.inner.0.interact_rect,
+                    _buttons.inner.1.rect,
+                    _buttons.inner.1.interact_rect,
+                    ui.min_rect(),
+                ),
+            )
+        });
+    });
+    // ModalResponse::should_close consumes raw Esc; use only the IME-qualified keys.
+    if response.is_top_modal && keys.escape {
+        Some(false)
+    } else if choice.is_some() {
+        choice
+    } else if response.is_top_modal && keys.enter && !ctx.memory(|m| m.focused().is_some()) {
+        Some(true)
+    } else {
+        None
+    }
+}
+
 pub fn render(
     ui: &mut egui::Ui,
     view: &EditorView,
@@ -177,6 +337,9 @@ pub fn render(
 ) -> Vec<EditorUiAction> {
     let mut actions = Vec::new();
     let mut thumbnails = Vec::new();
+    if state.confirmation != EditorConfirmation::None {
+        ui.disable();
+    }
     let editing = view.phase == EditorPhase::Editing;
     let narrow = ui.available_width() < 680.0;
     let landing = format!("保存後の元の窓: {}", view.landing);
@@ -255,7 +418,7 @@ pub fn render(
                     .on_hover_text(error)
                     .clicked()
                 {
-                    actions.push(EditorUiAction::Reload);
+                    state.confirmation = EditorConfirmation::Reload;
                 }
             }
             ui.add(egui::Label::new(RichText::new(&view.book_name).strong()).truncate())
@@ -287,18 +450,6 @@ pub fn render(
                     actions.push(EditorUiAction::SetCover(cover));
                 }
             });
-            if state.confirmation == EditorConfirmation::Remove {
-                ui.add(egui::Label::new("保存済みの順序・非表示・指定を解除しますか").truncate());
-                ui.horizontal(|ui| {
-                    if ui.button("解除する").clicked() {
-                        actions.push(EditorUiAction::Remove);
-                        state.confirmation = EditorConfirmation::None;
-                    }
-                    if ui.button("編集を続ける").clicked() {
-                        state.confirmation = EditorConfirmation::None;
-                    }
-                });
-            }
             ui.add_enabled_ui(state.confirmation == EditorConfirmation::None, |ui| {
                 if !narrow {
                     let height = ui.available_height().max(0.0);
@@ -1039,6 +1190,121 @@ mod row_tests {
             can_remove: true,
             landing: String::new(),
             error: None,
+        }
+    }
+
+    #[test]
+    fn confirmation_denied_enter_does_not_activate_focused_button() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        for accept in [true, false] {
+            let view = fixture(2);
+            let mut state = EditorUiState {
+                confirmation: EditorConfirmation::Remove,
+                ..Default::default()
+            };
+            let mut fonts_ready = false;
+            let mut h = crate::test_ui::builder()
+                .with_size(egui::vec2(1093.0, 614.0))
+                .build_state(
+                    move |ctx, actions: &mut Vec<EditorUiAction>| {
+                        if !fonts_ready {
+                            crate::ui_fonts::configure_fonts(ctx);
+                            fonts_ready = true;
+                            ctx.request_repaint();
+                            return;
+                        }
+                        *actions = show_window(
+                            ctx,
+                            egui::Id::new("denied_enter"),
+                            &view,
+                            &mut state,
+                            DialogKeys::default(),
+                        );
+                    },
+                    Vec::new(),
+                );
+            h.run_steps(6);
+            let node = h
+                .get_all_by_label(if accept {
+                    "解除する"
+                } else {
+                    "キャンセル"
+                })
+                .find(|node| {
+                    let id =
+                        unsafe { egui::Id::from_high_entropy_bits(node.accesskit_node().id().0) };
+                    h.ctx
+                        .read_response(id)
+                        .is_some_and(|response| response.enabled())
+                })
+                .unwrap();
+            node.focus();
+            h.step();
+            assert!(h.ctx.memory(|memory| memory.focused().is_some()));
+            h.key_press(egui::Key::Enter);
+            h.step();
+            assert!(
+                h.state()
+                    .iter()
+                    .all(|action| matches!(action, EditorUiAction::RequestThumbnails(_))),
+                "helper-denied Enter: {:?}",
+                h.state()
+            );
+            assert!(h.query_by_label("解除する").is_some());
+        }
+    }
+
+    #[test]
+    fn confirmation_modal_bounds_keep_actions_outside_long_scroll_body() {
+        for physical in [egui::vec2(1093.0, 614.0), egui::vec2(1366.0, 728.0)] {
+            for scale in [1.0, 2.0] {
+                for confirmation in [EditorConfirmation::Remove, EditorConfirmation::Reload] {
+                    let ctx = egui::Context::default();
+                    crate::ui_fonts::configure_fonts(&ctx);
+                    crate::settings::apply_ui_scale_factor(&ctx, scale);
+                    let mut view = fixture(8);
+                    view.error = Some("長いエラーの説明と変更された書庫のパス。".repeat(200));
+                    let mut state = EditorUiState {
+                        confirmation,
+                        ..Default::default()
+                    };
+                    let id = egui::Id::new("confirmation_bounds");
+                    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, physical / scale);
+                    for _ in 0..6 {
+                        let _ = ctx.run(
+                            egui::RawInput {
+                                screen_rect: Some(screen),
+                                ..Default::default()
+                            },
+                            |ctx| {
+                                show_window(ctx, id, &view, &mut state, DialogKeys::default());
+                            },
+                        );
+                    }
+                    let (heading, accept, accept_hit, cancel, cancel_hit, actual) = ctx
+                        .data(|data| {
+                            data.get_temp::<(
+                                egui::Rect,
+                                egui::Rect,
+                                egui::Rect,
+                                egui::Rect,
+                                egui::Rect,
+                                egui::Rect,
+                            )>(
+                                id.with("confirmation").with("geometry")
+                            )
+                        })
+                        .unwrap();
+                    assert!(
+                        screen.shrink(4.0).contains_rect(actual),
+                        "{physical:?}/{scale}/{confirmation:?}: {actual:?}"
+                    );
+                    assert!(screen.contains_rect(heading));
+                    assert!(screen.contains_rect(accept) && accept_hit.contains_rect(accept));
+                    assert!(screen.contains_rect(cancel) && cancel_hit.contains_rect(cancel));
+                    assert!(heading.bottom() < accept.top());
+                }
+            }
         }
     }
 

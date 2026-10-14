@@ -347,6 +347,139 @@ fn real_escape_cancels_direct_draft_without_a_second_confirmation_phase() {
     assert!(stored(&f.borrow()).is_none());
 }
 
+#[test]
+fn confirmation_keyboard_uses_ime_helpers_and_escape_only_dismisses_the_front_dialog() {
+    for confirmation in [
+        ui::EditorConfirmation::Remove,
+        ui::EditorConfirmation::Reload,
+    ] {
+        let mut f = fixture();
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        crate::ime_focus::install_ime_input_policy(&ctx);
+        start_editing(&mut f.app, &ctx);
+        let before = draft_record(&f);
+        let CompositionEditorState::Editing(session) = &mut f.app.composition_editor else {
+            panic!("editing");
+        };
+        session.ui.confirmation = confirmation;
+        let frame = |f: &mut Fixture, events| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1093.0, 614.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    f.app.update_ime_state(ctx);
+                    f.app.show_local_composition_editor(ctx);
+                },
+            );
+        };
+        frame(&mut f, vec![]);
+        frame(&mut f, vec![]);
+        for key in [egui::Key::Enter, egui::Key::Escape] {
+            frame(
+                &mut f,
+                vec![
+                    egui::Event::Ime(egui::ImeEvent::Enabled),
+                    egui::Event::Ime(egui::ImeEvent::Preedit("未確定".into())),
+                    egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            assert!(f.app.ime_input_active(&ctx));
+            assert!(
+                matches!(&f.app.composition_editor, CompositionEditorState::Editing(session) if session.ui.confirmation == confirmation)
+            );
+            assert_eq!(draft_record(&f), before);
+            frame(
+                &mut f,
+                vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        }
+        frame(
+            &mut f,
+            vec![egui::Event::Ime(egui::ImeEvent::Commit("".into()))],
+        );
+        frame(
+            &mut f,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(
+            matches!(&f.app.composition_editor, CompositionEditorState::Editing(session) if session.ui.confirmation == ui::EditorConfirmation::None)
+        );
+        assert_eq!(draft_record(&f), before);
+        // Qualified Enter confirms exactly the current choice.
+        frame(
+            &mut f,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let CompositionEditorState::Editing(session) = &mut f.app.composition_editor else {
+            panic!("editing");
+        };
+        session.ui.confirmation = confirmation;
+        let request = f
+            .app
+            .composition_editor_operations
+            .owner
+            .as_ref()
+            .unwrap()
+            .request_id;
+        frame(&mut f, vec![]);
+        frame(&mut f, vec![]);
+        frame(
+            &mut f,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        if confirmation == ui::EditorConfirmation::Remove {
+            assert!(f.app.composition_editor_writes_pending());
+        } else {
+            assert_ne!(
+                f.app
+                    .composition_editor_operations
+                    .owner
+                    .as_ref()
+                    .unwrap()
+                    .request_id,
+                request
+            );
+        }
+    }
+}
+
 pub(super) fn finish_editor_results(app: &mut App) {
     let CompositionEditorState::Editing(session) = &mut app.composition_editor else {
         return;
