@@ -12,6 +12,7 @@ pub(crate) enum Command {
     Add(PathBuf),
     Remove(PathBuf),
     Log(String),
+    Print(String),
     Panic(String),
     Stop,
 }
@@ -55,6 +56,14 @@ impl Persistence {
                 worker: Some(worker),
             },
         ))
+    }
+}
+
+/// Bootstrap and audio command senders share the host's writer. No synchronous
+/// stderr fallback: a missing writer is already reported by the host.
+pub(crate) fn log(tx: Option<&mpsc::Sender<Command>>, text: String) {
+    if let Some(tx) = tx {
+        let _ = tx.send(Command::Log(text));
     }
 }
 
@@ -195,6 +204,12 @@ fn run_worker(
                 .write(&text, false)
                 .err()
                 .map(|error| format!("音楽ビデオのログを書けません: {error}")),
+            Command::Print(text) => {
+                // Preview benchmark stdout is part of its CLI contract, but its
+                // producer is a GUI callback and must not wait for the stream.
+                println!("{text}");
+                None
+            }
             Command::Panic(text) => diagnostics
                 .write(&text, true)
                 .err()

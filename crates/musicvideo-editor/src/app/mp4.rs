@@ -31,7 +31,7 @@ impl MusicVideoLabApp {
             Ok(_) => self.export_state = ExportState::Choosing { settings, rx },
             Err(error) => {
                 self.status = format!("保存先ダイアログを開始できません: {error}");
-                eprintln!("{}", self.status);
+                self.log_status();
             }
         }
     }
@@ -53,7 +53,7 @@ impl MusicVideoLabApp {
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.export_state = ExportState::Idle;
                 self.status = "保存先ダイアログが終了しました".to_owned();
-                eprintln!("{}", self.status);
+                self.log_status();
             }
             Err(mpsc::TryRecvError::Empty) => {}
         }
@@ -171,7 +171,7 @@ impl MusicVideoLabApp {
             }
             Err(error) => {
                 self.status = format!("書き出しワーカーを開始できません: {error}");
-                eprintln!("{}", self.status);
+                self.log_status();
             }
         }
     }
@@ -203,11 +203,9 @@ impl MusicVideoLabApp {
                 output_path.display()
             ),
             Err(ExportError::Cancelled) => "MP4 の書き出しを中止しました".to_owned(),
-            Err(error) => {
-                eprintln!("MP4 の書き出しに失敗しました: {error}");
-                format!("MP4 の書き出しに失敗しました: {error}")
-            }
+            Err(error) => format!("MP4 の書き出しに失敗しました: {error}"),
         };
+        self.log_status();
         self.preview_dirty = true;
     }
 

@@ -150,6 +150,8 @@ pub fn run_dev() {
 }
 
 fn run_preview_benchmark(frames: usize) -> Result<(), String> {
+    let (services, _worker_guard) = persistence::Persistence::start(None)
+        .map_err(|error| format!("診断ワーカーを開始できません: {error}"))?;
     let font = project::load_default_font();
     let assets = project::create_assets(font.as_ref())?;
     assets.insert_image(
@@ -165,9 +167,15 @@ fn run_preview_benchmark(frames: usize) -> Result<(), String> {
         options,
         Box::new(move |creation| {
             project::setup_egui(&creation.egui_ctx, font.as_ref());
-            app::MusicVideoLabApp::new_preview_benchmark(assets, frames)
-                .map(|app| Box::new(app) as Box<dyn eframe::App>)
-                .map_err(Into::into)
+            let mut app = app::MusicVideoLabApp::new_preview_benchmark(assets, frames)?;
+            app.configure_startup(
+                startup::StartupArgs::default(),
+                Arc::new(startup::RuntimeAdmission::Ready { _lease: None }),
+                Some(services),
+                None,
+                &creation.egui_ctx,
+            );
+            Ok(Box::new(app))
         }),
     )
     .map_err(|error| error.to_string())
@@ -175,8 +183,29 @@ fn run_preview_benchmark(frames: usize) -> Result<(), String> {
 
 /// 製品の入口。診断引数は開発用 bin だけが扱う。
 pub fn run() {
-    if let Err(error) = run_gui() {
-        eprintln!("音楽ビデオエディタを起動できません: {error}");
+    // run_gui reports failure before its writer's final drain.
+    let _ = run_gui();
+}
+
+fn create_gui_assets(
+    font: Option<&project::FontData>,
+    diagnostics: Option<&std::sync::mpsc::Sender<persistence::Command>>,
+) -> Arc<Assets> {
+    project::create_assets(font).unwrap_or_else(|error| {
+        persistence::log(diagnostics, error);
+        Arc::new(Assets::default())
+    })
+}
+
+fn report_gui_result(
+    result: &eframe::Result,
+    diagnostics: Option<&std::sync::mpsc::Sender<persistence::Command>>,
+) {
+    if let Err(error) = result {
+        persistence::log(
+            diagnostics,
+            format!("音楽ビデオエディタを起動できません: {error}"),
+        );
     }
 }
 
@@ -204,6 +233,7 @@ fn run_gui() -> eframe::Result {
         ),
     };
     let previous_hook = std::panic::take_hook();
+    let diagnostic_tx = services.as_ref().map(|p| p.tx.clone());
     if let Some(services) = &services {
         std::panic::set_hook(Box::new(persistence::panic_hook(services.tx.clone())));
         let _ = services.tx.send(persistence::Command::Log(
@@ -211,10 +241,7 @@ fn run_gui() -> eframe::Result {
         ));
     }
     let font = project::load_default_font();
-    let assets = project::create_assets(font.as_ref()).unwrap_or_else(|error| {
-        eprintln!("{error}");
-        Arc::new(Assets::default())
-    });
+    let assets = create_gui_assets(font.as_ref(), diagnostic_tx.as_ref());
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 820.0]),
         ..Default::default()
@@ -235,6 +262,7 @@ fn run_gui() -> eframe::Result {
             Ok(Box::new(app))
         }),
     );
+    report_gui_result(&result, diagnostic_tx.as_ref());
     std::panic::set_hook(previous_hook);
     result
 }

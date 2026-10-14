@@ -331,7 +331,7 @@ impl MusicVideoLabApp {
     }
 
     pub(super) fn project_save_failed(&mut self) {
-        eprintln!("{}", self.status);
+        self.log_status();
         self.document_intent = DocumentIntentState::Idle;
     }
 }

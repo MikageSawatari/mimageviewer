@@ -34,6 +34,9 @@ impl MusicVideoLabApp {
         self.host.runtime = runtime;
         self.host.recent = args.data_dir.as_ref().map(|_| Vec::new());
         self.host.persistence = persistence;
+        if let Some(player) = &mut self.audio_player {
+            player.set_diagnostics(self.host.persistence.as_ref().map(|p| p.tx.clone()));
+        }
         if let Some(error) = service_error {
             self.host.notices.push(error);
         }

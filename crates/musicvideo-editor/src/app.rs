@@ -1,6 +1,8 @@
 mod chrome;
 #[cfg(test)]
 mod chrome_tests;
+#[cfg(test)]
+mod diagnostics_tests;
 mod document_intent;
 #[cfg(test)]
 mod document_intent_tests;
@@ -1291,7 +1293,10 @@ impl MusicVideoLabApp {
                     self.position_secs,
                 )
             } {
-                Ok(player) => self.audio_player = Some(player),
+                Ok(mut player) => {
+                    player.set_diagnostics(self.host.persistence.as_ref().map(|p| p.tx.clone()));
+                    self.audio_player = Some(player);
+                }
                 Err(error) => playback_error = Some(error),
             },
             (Some(player), None) => {
@@ -2693,12 +2698,18 @@ impl eframe::App for MusicVideoLabApp {
                 .max(0.0);
             self.preview_perf.push(sample);
         }
+        self.finish_preview_benchmark(ctx);
+    }
+}
+
+impl MusicVideoLabApp {
+    fn finish_preview_benchmark(&mut self, ctx: &egui::Context) {
         if self
             .preview_benchmark_target
             .is_some_and(|target| self.preview_perf.total_samples >= target)
         {
             if let Some(perf) = self.preview_perf.summary() {
-                println!(
+                let text = format!(
                     "musicvideo preview benchmark: frames={} resolution={}x{} fps={:.3} interval_ms={:.3} analysis_ms={:.3} scene_composition_ms={:.3} rgba_to_egui_ms={:.3} worker_other_ms={:.3} texture_update_ms={:.3} egui_layout_ms={:.3} audio_sync_ms={:.3} ui_other_ms={:.3} outside_worker_ms={:.3}",
                     self.preview_perf.total_samples,
                     self.project.output.width,
@@ -2715,6 +2726,7 @@ impl eframe::App for MusicVideoLabApp {
                     perf.ui_other_ms,
                     perf.outside_worker_ms,
                 );
+                self.send_host(crate::persistence::Command::Print(text));
             }
             self.preview_benchmark_target = None;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);

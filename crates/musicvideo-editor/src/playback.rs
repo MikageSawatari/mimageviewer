@@ -10,6 +10,7 @@ use crate::decode::AudioData;
 // The UI never owns a stream, callback state, or JoinHandle. WASAPI stream drop
 // can join internally, so even destruction belongs to musicvideo-audio.
 pub struct AudioPlayer {
+    diagnostics: Option<mpsc::Sender<crate::persistence::Command>>,
     tx: mpsc::Sender<Message>,
     published: Arc<Mutex<PlaybackSnapshot>>,
     repaint_ctx: Arc<Mutex<egui::Context>>,
@@ -145,6 +146,7 @@ impl AudioPlayer {
         let (tx, rx) = mpsc::channel();
         (
             Self {
+                diagnostics: None,
                 tx,
                 published: Arc::new(Mutex::new(PlaybackSnapshot::default())),
                 repaint_ctx: Arc::new(Mutex::new(egui::Context::default())),
@@ -165,13 +167,30 @@ impl AudioPlayer {
             .is_err()
         {
             let error = "音声スレッドが終了しました".to_owned();
-            eprintln!("音楽ビデオの音声出力エラー: {error}");
+            crate::persistence::log(
+                self.diagnostics.as_ref(),
+                format!("音楽ビデオの音声出力エラー: {error}"),
+            );
             self.published.lock().unwrap().error = Some(error);
         }
     }
 
     pub fn toggle(&mut self) {
         self.send(Command::Toggle);
+    }
+
+    pub(crate) fn set_diagnostics(
+        &mut self,
+        diagnostics: Option<mpsc::Sender<crate::persistence::Command>>,
+    ) {
+        self.diagnostics = diagnostics;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_disconnected_headless() -> Self {
+        let (player, rx) = Self::channel();
+        drop(rx);
+        player
     }
 
     pub fn pause(&mut self) {

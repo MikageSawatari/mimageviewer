@@ -12,7 +12,7 @@ Status: P1〜P3j、P4b-1〜4 の実装・非対話検証あり。H3a の契約�
 実機目視 = ユーザー。2026-09-07〜09-09 の Astra / Sol 体制の記録は
 [引き継ぎ監査](music-video-handoff-20260907.md) に残す。本書の過去の完了記録は当時の記録であり、
 監査で挙がった未解決事項の解消を意味しない。
-H3（H3a + H3b）の解析・画素一致は非対話検証済み（下記 H3b 検証記録）。P4 の実機検収・P4c の実装・非対話検証あり。P4d 以降は未完了。
+H3（H3a + H3b）の解析・画素一致は非対話検証済み（下記 H3b 検証記録）。P4 の実機検収は未完了。P4c の実装・非対話検証あり。P4d 以降は未完了。
 開発場所 = 別 worktree `C:\home\mimageviewer-musicvideo`（ブランチ `musicvideo`）。
 最終着地点 = **mIV に同梱して配布し、mIV から起動する機能**（ラボ止まりにしない。D10）。
 
@@ -2688,7 +2688,7 @@ UI **2 件**。今回の 3 件と補強した歌詞取消の 1 件は、上記�
 正本は D10 と §7 P4c、実装 brief は `docs/brief-musicvideo-p4c.md`。
 対象は `musicvideo` worktree、基点 HEAD `922727457330e82bf941b5c645dfcf599b1c164b`。
 以下は実装者自身によるコード確認・非対話検証の記録であり、独立レビューではない。
-**実装・指定自動 gate 完了。独立実装レビュー／実機検収は未実施。**
+**初回実装・指定自動 gate 完了（当時は独立実装レビュー／実機検収未実施）。後の独立レビュー1回目 REVISE と対応は下記。**
 
 - 製品入口は `args_os` を純粋な `parse_args(args, cwd)` に渡す。3 引数の値・重複・組み合わせ・
   未知引数を検査し、相対パスを cwd 基準の絶対パスへ解決する。解析エラー時は読込を開始せず、
@@ -2781,6 +2781,114 @@ P4d／P4e／P4f は範囲外のまま。
 - `crates/musicvideo-editor/src/app/chrome.rs`、`document_intent.rs`、`startup.rs`、`startup_tests.rs`。
 - `crates/musicvideo-editor/src/startup.rs`、`persistence.rs`、`persistence/tests.rs`。
 - `src/lib.rs`、`src/runtime_cleanup.rs`、`docs/music-video-export-plan.md`。
+
+**独立レビュー 1 回目 REVISE と対応（2026-10-15）**
+
+利用者提供の GPT-6.1 Sol / xhigh の独立実装レビュー: **REVISE（P2 1件・P3 1件）**。
+対象は `922727457` 以降の P4c（実装 commit `9d11390ff`）。独立レビュー担当は読み取り専用で、
+初回のソース／release hash・サイズ、510 passed／0 failed／1 ignored、追加21件の変異失敗を照合し、
+Cargo 再実行・GUI 起動・ファイル変更は行っていないとの報告。
+今回の修正は HEAD `b6e03127ca50dd4fbe084f780ed0a57b3d3b3c5d` を基点とする未コミット差分。
+以下の洗い出し・修正・再実行は実装者の作業であり、独立の再レビューではない。
+**指摘2件を修正し指定 gate は通過。独立再レビュー／実機検収は未実施。**
+
+**P2: 既存 GUI 経路の直接出力を取りこぼしていた。** 今回発生した新たな回帰ではなく、
+P4c の「stderr の追記で待たない」要件への対応漏れとして修正した。
+指摘の2か所に限定せず `eprintln!`／`println!`／`print!`／`dbg!`／stdout・stderr の直接利用、
+fs／File／Write／sync／persist と画像保存 API を editor 全体で検索し、呼び出し元と実行 thread を確認した。
+共有 `musicvideo-ui`／`musicvideo-core` の GUI 呼び出し先にも同期出力・ファイル書込がないことを確認。
+検索の素データは `target/p4c-review1/io-inventory.txt`。
+
+UI／GUI 起動・終了の main thread にあった直接出力の全一覧（path は `crates/musicvideo-editor/src/` 基準）:
+
+| 箇所 | 旧処理 | 修正後の配送 |
+| --- | --- | --- |
+| `app/document_intent.rs::project_save_failed` | 保存失敗の stderr | `log_status` → `Command::Log` |
+| `app/mp4.rs::choose_mp4_output` | 保存先 dialog worker の開始失敗の stderr | `log_status` → `Command::Log` |
+| `app/mp4.rs::poll_mp4_choice` | 保存先 dialog 切断の stderr | `log_status` → `Command::Log` |
+| `app/mp4.rs::begin_mp4_export` | 書出 worker の開始失敗の stderr | `log_status` → `Command::Log` |
+| `app/mp4.rs::complete_mp4_export` | MP4 書出失敗の stderr | 状態を採用後 `log_status` → `Command::Log` |
+| `playback.rs::AudioPlayer::send` | 音声 command channel 切断の stderr（Shutdown／Drop からも到達） | host の診断 sender → `Command::Log`。既存 error snapshot の通知を維持 |
+| `app.rs::eframe::App::update` の preview benchmark 終了 | GUI callback の計測 stdout | `finish_preview_benchmark` → `Command::Print` |
+| `lib.rs::run_gui` の assets 作成失敗 | GUI 起動準備の stderr | `create_gui_assets` → 診断 sender → `Command::Log` |
+| `lib.rs::run` の `run_gui` 失敗 | GUI 終了／起動失敗の stderr | `run_gui` の writer guard が生きている間に `report_gui_result` → `Command::Log` |
+
+上記 **9か所**に UI の同期出力を残していない。音声 player の診断 sender は host が生成／接続時に
+渡す同じ persistence writer への参照であり、別 logger／復旧 owner を作らない。
+GUI benchmark にも data-dir 無しの同 worker を保持し、CLI が読む stdout の形式と終了時 drain を保つ。
+writer が存在しない／切断した場合も UI から stderr へ同期 fallback しない。
+host の既存通知・音声 error snapshot を維持する。stdout／stderr は worker だけが追記する。
+
+同期ファイル書込の全経路の確認（GUI handler から直接書き込む箇所は検出しなかった）:
+
+| 書込処理 | 実行 owner／呼び出し経路 |
+| --- | --- |
+| Project JSON: 一時 file、write／sync／persist（`project_file.rs::save_project`） | `app.rs::start_project_save` が生成する `musicvideo-project-save` worker |
+| LRC: `std::fs::write` | `app.rs::start_lrc_save` の `musicvideo-lrc-save` worker |
+| PNG 連番: output dir 作成、画像保存（`export.rs::export_png_sequence`） | `app.rs::start_export` の `musicvideo-png-export` worker |
+| MP4: encode／一時出力／公開（`mp4.rs::export_snapshot` → 本体 `mvexport`） | `app/mp4.rs::begin_mp4_export` の `musicvideo-mp4-export` worker |
+| 素材履歴の匿名 blob: File 作成と画像／PCM の write・flush（`resource_blobs.rs::store_image/store_audio`） | 音声／画像／Project 読込 worker だけが呼ぶ。file の最終解放も既存 cleanup worker |
+| 最近一覧: 一時 file／JSON／sync／persist、log／panic log: create／append、rotation: remove／rename | `musicvideo-persistence` worker。今回追加の stdout も同 worker |
+| runtime shared lease の lock file 作成 | `run_gui` の最初、native UI を作る前の起動処理。既存 core と同じ規則・取得失敗の拒否・保持期間を変更していない。実行中 UI の handler から呼ばない |
+| CLI の sample／lyrics／zoom PNG・診断 export／測定 | `run_dev` の CLI 経路だけで、GUI handler から呼ばない（依頼の対象外） |
+
+残した出力は、`analyze_preview` の poisoned timeline 診断（preview worker）、
+`export_png_sequence` の計測診断（PNG worker）、`AudioWorker::note_error`（audio worker）、
+persistence worker 自身の出力、および test／開発 bin の CLI 出力だけ。
+これらは依頼で対象外とされた thread／用途であり、GUI callback の benchmark stdout とは区別した。
+GUI 入力からの同期ファイル書込を persistence へ移す追加箇所はなかった。
+
+追加回帰テスト **6件**は `app/diagnostics_tests.rs`。保存失敗・MP4 失敗・MP4 保存先切断・
+音声 command 切断・GUI benchmark stdout・GUI assets／起動失敗の実 handler を通す。
+各テストは独立した子の **Rust test harness** を `--exact --nocapture` で起動し、
+別 thread が実際の `StdoutLock`／`StderrLock` を channel で停止させる。persistence worker にも
+診断を配送して出力を止めた状態を作り、handler が **解放前の3秒以内に完了**することと状態遷移を検査する。
+解放後に通常の writer drain を行い、診断／計測結果が実際の出力へ届いたことも親で確認する。
+native GUI／実音声 device は生成しない。timeout を観測しても先に出力を解放してから assert／join するため、
+同期出力を再導入した場合は harness を停止させず、handler の待機として失敗する。
+
+**6件すべて**について同期出力を復元する変異で失敗した（コンパイル失敗は検出に数えない）。
+GUI bootstrap の assets と run result はそれぞれ別の変異で確認し、変異は毎回 finally で元の bytes に復元した。
+対応テスト名は `target/p4c-review1/mutations.json`、各ログは同ディレクトリの `mutation-*.log`。
+
+| 変異 | 失敗した回帰 |
+| --- | --- |
+| `save-direct-stderr` | 保存失敗 |
+| `mp4-direct-stderr` | MP4 書出失敗 |
+| `choice-direct-stderr` | MP4 保存先切断 |
+| `audio-direct-stderr` | 音声 command 切断 |
+| `benchmark-direct-stdout` | GUI benchmark 終了 |
+| `assets-direct-stderr` | GUI assets 作成失敗 |
+| `gui-result-direct-stderr` | GUI 起動失敗の終了処理 |
+
+**P3: 冒頭の実機検収状態を訂正。** 「P4 の実機検収・P4c の実装・非対話検証あり」を
+**「P4 の実機検収は未完了。P4c の実装・非対話検証あり」**へ変更した。
+実装・自動検証が緑であることを、実機検収や独立再レビューの受け入れとは扱わない。
+
+復元後の指定 gate（全 Cargo コマンドで `MSBUILDDISABLENODEREUSE=1`、全コマンド exit 0）:
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo test -p musicvideo-editor` | **177 passed / 0 failed**（初回171＋今回6） |
+| `cargo check -p musicvideo-editor --features dev-tools --bins` | 成功 |
+| `cargo test -p musicvideo-core -p musicvideo-ui` | core115＋経路監査2＋UI124＝**241 passed / 0 failed** |
+| `cargo test -p mimageviewer --lib runtime_` | **98 passed / 0 failed / 1 ignored** |
+| `cargo fmt --check` | 成功、`cargo fmt` 実行済み |
+| `python scripts/check_ui_glyphs.py` | 危険 glyph **0** |
+| `cargo build --release -p musicvideo-editor --bin mimageviewer-musicvideo` | 成功、起動なし |
+
+合計 **516 passed / 0 failed / 1 ignored**。既存 ignored を維持し、既存 P4c・H1〜P4b-4 を通過。
+command／feature／profile／exit／件数／所要時間とソース SHA-256 は `target/p4c-review1/gates.json`、
+ログは同ディレクトリの `editor,check,core-ui,runtime,fmt,glyphs,release.log`。
+初回 `target/p4c-validation` の証拠は上書きしていない。
+今回の release exe は `target/release/mimageviewer-musicvideo.exe`、**25,344,512 bytes**、
+SHA-256 **`aa0af7028e802e69f6c5a08ea27499f7ec0672bd1bd69570c15573178edafbc4`**（上の初回成果物の hash は当時の記録）。
+GUI 起動・実機入力・通常 `%APPDATA%\mimageviewer` へのアクセス・コミットは行っていない。
+既存 untracked `out.mp4`、P4d の brief、mIV の製品コードは未変更。
+
+今回の変更ファイルは editor の `app.rs`、`app/document_intent.rs`、`app/mp4.rs`、`app/startup.rs`、
+`lib.rs`、`persistence.rs`、`playback.rs`、追加 `app/diagnostics_tests.rs` と本設計書の **9ファイル**。
+仕様との相違・機能制限・回復機構の追加はない。独立再レビューにこの差分と証拠を引き継ぐ。
 
 ## 4. データモデル（v1）
 
@@ -2932,7 +3040,7 @@ frame n → t = n/fps → evaluate → rasterize(CPU, rayon) → RGBA→NV12/YUV
 | **H3（H3a + H3b）** 非対話検証完了 | 解析の契約と製品画素の一致 | H3a の共有格子／view／timeline／較正に、H3b の実 preview と snapshot export の画素検証を接続。実機 GUI／音声 transport の検収とは区別する |
 | **P4a** ✅ | 方式の設計確定: 本書 D10 / D14〜D16 の独立レビュー | GPT-6.1 Sol / xhigh の設計レビューで blocking 指摘なし。**完了**（2026-10-09）: 3 回目で条件付き ACCEPT（残った P3 の文言は反映済み）。runtime 競合の割り切りはユーザー判断で確定 |
 | **P4b** 実装完了・実機確認待ち（P4b-1〜4 すべて独立レビュー ACCEPT、2026-10-14。上書きの競合は利用者が許容。5 分 1080p60 は完走済み・速度は参考値で静かな環境での再計測が残る。音・GUI の実機確認は利用者へ依頼） | ホストの製品化（D16。段の分け方は D16 の「P4b の設計」）: ラボを `crates/musicvideo-editor` へ移し、FFmpeg デコードへ統一、スナップショット入力の MP4 書き出し（モーダル・進捗・キャンセル）、未保存の編集の確認、音声スレッドが stream を所有する再生と f32 以外の出力形式対応 | **P4b-3（2026-10-14、未コミット）**: 指定ゲート 365 passed、追加 18 件すべての変異失敗確認、既存 editor 101 件維持。共通 snapshot／解析／較正／PCM view AAC／原子的公開／モーダル終端を接続し、製品 editor・通常 CLI・dev CLI の release build 成功。編集済み 5 分 1080p60 を dev CLI で 18,000 frames 完走、184.441 秒／1.6265x（背景 Codex 4 件あり、参考値）。詳細は D16 の P4b-3 記録。P4b-2 の実機の音・GUI・H3b は未確認。**P4b-4（2026-10-14、未コミット）**: session 所属の単一意図、歌詞の先行解決、保存後のフレーム末尾の再判定、先行読込の receiver 退役、新規、CancelClose／承認済み Close と書き出し中止の終端待ちを実装。指定ゲート **396 passed**、追加 **31 件**すべて変異失敗確認。初回レビュー REVISE の P2／P3 に対応し、LRC モーダルの実クリック回帰、Project／保存完了の両順序、歌詞取消と同フレームの旧完了を検査。今回 3 件追加・既存 1 件補強、各テストの変異失敗確認、指定テスト **399 passed**。詳細は D16 の P4b-4 記録。修正後の独立レビュー・実機確認・H3b は未完了 |
-| **P4c** 実装・指定自動 gate 完了／独立実装レビュー・実機検収待ち | 起動引数と診断（D10）: `--audio` / `--project` / `--data-dir`、最近使ったプロジェクト、ログ・panic ログ、引数エラーの画面表示、runtime の shared lease と取得失敗の表示 | **2026-10-14、未コミット差分**: editor18＋本体lease3の追加21件すべてで変異失敗を確認。指定gate **510 passed / 0 failed / 1 ignored**、fmt／glyph0／製品release build成功。data-dir無しで一覧・ファイルログなし、mIVの設定・DB・ログ未接触。実装者の非対話検証であり独立レビューではない。詳細は「P4c 実装記録」 |
+| **P4c** 実装・独立レビュー1回目 REVISE 修正済み／再レビュー・実機検収待ち | 起動引数と診断（D10）: `--audio` / `--project` / `--data-dir`、最近使ったプロジェクト、ログ・panic ログ、引数エラーの画面表示、runtime shared lease と取得失敗の表示 | **初回2026-10-14**: 追加21件の変異検証記録あり。**2026-10-15、未コミット修正**: P2のUI出力全経路9か所をworker配送、追加6件すべてで同期出力の変異失敗、P3の実機未完了表記を訂正。指定gate **516 passed / 0 failed / 1 ignored**、fmt／glyph0／製品release build成功。再レビュー・実機検収未実施。詳細は「P4c 実装記録」の独立レビュー1回目対応 |
 | **P4d** | mIV 側の入口: 音楽ビュー・音声ファイルの右クリックから「音楽ビデオを作成」でエディタを起動 | 起動は非同期で UI を止めない。exe 不在・起動失敗は理由付きで通知。閲覧側の退行なし |
 | **P4e** | 配布（下の表）: launcher 内包・runtime 展開・署名・portable 同梱・全 PE / VC runtime gate・build スクリプト・test-full 前提 | build-dist 相当の通しビルド。runtime 清掃: 旧版 core 終了後にエディタだけ稼働 / 起動との競合 / エディタ終了後の清掃。release のエディタ exe サイズとビルド時間を記録 |
 | **P4f** | 文書: マニュアル・製品ページ・keymap-spec（固定ショートカットの理由）・privacy（通信なし・保存先） | CLAUDE.md「コード修正時のドキュメント同時更新」 |
