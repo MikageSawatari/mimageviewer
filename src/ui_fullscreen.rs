@@ -5858,9 +5858,17 @@ fn draw_fs_overflow_panel_surface(
         body.spacing_mut().item_spacing.y = 0.0;
         let output = egui::ScrollArea::vertical()
             .id_salt("fs_overflow_panel_body")
+            .min_scrolled_height(0.0)
             .max_height(body_rect.height())
             .auto_shrink([false, false])
             .show(&mut body, |ui| {
+                #[cfg(test)]
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(
+                        egui::Id::new("fs_overflow_scroll_test_clip"),
+                        ui.clip_rect(),
+                    );
+                });
                 ui.set_width(ui.available_width());
                 match view.state {
                     FsOverflowPanelState::Root => {
@@ -59509,7 +59517,11 @@ mod tests {
             FsOverflowPanelState::SpreadAdjustment,
             FsOverflowPanelState::MusicNoteColor,
         ] {
-            for size in [egui::vec2(1200.0, 800.0), egui::vec2(320.0, 200.0)] {
+            for size in [
+                egui::vec2(1200.0, 800.0),
+                egui::vec2(320.0, 200.0),
+                egui::vec2(320.0, 180.0),
+            ] {
                 let ctx = egui::Context::default();
                 crate::ui_fonts::configure_fonts(&ctx);
                 let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
@@ -59559,15 +59571,22 @@ mod tests {
                         data.get_temp(egui::Id::new("fs_overflow_scroll_test_layout"))
                             .unwrap()
                     });
-                    ScrollLayout {
-                        inner,
-                        content,
-                        offset,
-                    }
+                    let clip = ctx.data(|data| {
+                        data.get_temp::<egui::Rect>(egui::Id::new("fs_overflow_scroll_test_clip"))
+                            .unwrap()
+                    });
+                    (
+                        ScrollLayout {
+                            inner,
+                            content,
+                            offset,
+                        },
+                        clip,
+                    )
                 };
-                let mut before = draw(vec![]);
+                let (mut before, mut clip) = draw(vec![]);
                 for _ in 0..3 {
-                    before = draw(vec![]);
+                    (before, clip) = draw(vec![]);
                 }
                 before.assert_height(
                     if size.y > 400.0 {
@@ -59575,13 +59594,13 @@ mod tests {
                     } else {
                         HeightExpectation::Scrolls
                     },
-                    panel.intersect(viewport),
+                    clip.intersect(panel).intersect(viewport),
                     ctx.pixels_per_point(),
                 );
                 if size.y < 400.0 {
-                    let mut after = before;
+                    let (mut after, mut after_clip) = (before, clip);
                     for frame in 0..40 {
-                        after = draw(if frame == 0 {
+                        (after, after_clip) = draw(if frame == 0 {
                             vec![
                                 egui::Event::PointerMoved(before.inner.center()),
                                 egui::Event::MouseWheel {
@@ -59594,7 +59613,17 @@ mod tests {
                             vec![]
                         });
                     }
+                    after.assert_height(
+                        HeightExpectation::Scrolls,
+                        after_clip.intersect(panel).intersect(viewport),
+                        ctx.pixels_per_point(),
+                    );
                     after.assert_scrolled_to_end(before, ctx.pixels_per_point());
+                    let content_bottom = after.inner.top() + after.content.y - after.offset.y;
+                    assert!(
+                        content_bottom <= after_clip.bottom() + 1.0 / ctx.pixels_per_point(),
+                        "last content is clipped: state={state:?}, size={size:?}, layout={after:?}, clip={after_clip:?}"
+                    );
                 }
             }
         }
