@@ -32,6 +32,12 @@
 
 ## 1. 優先候補
 
+### 1.382 egui / eframe / egui-wgpu を 0.33.3 から 0.36 系へ上げる — 次の版の次の最初の作業 (2026-10-14 利用者決定)
+
+依存物の更新確認で 3 段階遅れと判明。本家の更新履歴で見た主な差: 0.34 で文字描画の仕組みの交換 (ab_glyph から Skrifa + vello_cpu)、`App::update` から `App::ui`、`Panel` への統一、Area/Window/ScrollArea がフォーカスを取らない、MSRV 1.92。0.35 で非推奨 API の削除、IME の下線・カーソル表示と `owns_ime_events`、harfrust のシェーピング、Window はタイトルバーだけで移動。0.36 で `Modifiers` が入力イベント化、MSRV 1.95 (開発機は 1.94.1)。
+- 影響の見込み: UI snapshot (約 350 枚) の描き直し、`ui_fonts` の baseline 補正 (ab_glyph の外形計測) と `ime_focus` の作り直し、vendor の egui/eframe/egui-wgpu の変更の付け直し、wgpu 27 から上がる場合の動画表示部分。
+- 別セッションの日本語入力修正 (次の版に入る) は、`vendor/egui-winit` を本家 0.34 以降と同じ形に揃えてあり、上げるときは `vendor/egui-winit` を消すだけで済む見込み。
+
 ### 1.381 自動テストが一時フォルダーを消せずに %TEMP% へ大量に残す — Everything が応答しなくなった件の調査で判明 (2026-10-14)
 
 利用者の Everything (約 2,860 万件) が頻繁に応答しなくなった件を調べたところ、`%LOCALAPPDATA%\Temp` に 1,475 万件 (全体の約半分) があり、大半が mIV のテストが残した `.tmpXXXXXX` フォルダー (約 77 万個、中身は設定 DB 一式や `cache`・`logs`) と `mimageviewer_*_test_*.db` (約 8 千個) だった (Everything の検索で設計担当が確認)。9 月より前 19.7 万、9 月中 約 18 万、10 月に入って約 40 万と、テストを流すたびに増えていた。
