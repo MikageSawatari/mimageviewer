@@ -15772,9 +15772,6 @@ fn compose_spread_navigation_unit(
     let mut base =
         SpreadDisplayComposition::from_navigation_pages(navigation_anchor_idx, navigation_pages)?;
     match unit.formation {
-        SpreadDisplayUnitFormation::Singleton(SpreadDisplaySingletonCause::ExplicitAlone) => {
-            base.singleton_placement = SingletonSpreadPlacement::Center;
-        }
         SpreadDisplayUnitFormation::Singleton(
             SpreadDisplaySingletonCause::ExplicitBlankOpposite(side),
         ) => {
@@ -15813,6 +15810,21 @@ fn compose_spread_navigation_unit(
                 navigation_anchor_idx,
             });
         }
+    }
+    // An explicit Alone restarts pairing like the front cover. Resolve the
+    // terminal cover pair first: its existing two-page layout takes precedence.
+    // Explicit directives also apply to a bounded Remote/facet projection.
+    if spread_mode.is_spread()
+        && base.pages.len() == 1
+        && unit.formation
+            == SpreadDisplayUnitFormation::Singleton(SpreadDisplaySingletonCause::ExplicitAlone)
+        && singleton_placement_enabled.first
+    {
+        base.singleton_placement = if spread_mode.is_rtl() {
+            SingletonSpreadPlacement::Left
+        } else {
+            SingletonSpreadPlacement::Right
+        };
     }
     if spread_mode.is_spread()
         && (singleton_placement_enabled.first || singleton_placement_enabled.last)
@@ -16436,9 +16448,11 @@ fn build_spread_display_units_with_page_alone(
 fn explicit_singleton_cause(
     directive: crate::book_composition::PageOverride,
     mode: SpreadMode,
+    is_landscape: bool,
 ) -> SpreadDisplaySingletonCause {
     use crate::book_composition::{PageOverride, PageSide};
     match directive {
+        PageOverride::Alone if is_landscape => SpreadDisplaySingletonCause::LandscapeBoundary,
         PageOverride::Alone => SpreadDisplaySingletonCause::ExplicitAlone,
         PageOverride::BlankOpposite { page_side } => {
             let right = matches!(page_side, PageSide::Leading) == mode.is_rtl();
@@ -16468,7 +16482,12 @@ fn build_spread_display_units_with_overrides(
     if forced {
         let first = nav[0];
         let cover_cause = if let Some(directive) = overrides.get(&first) {
-            explicit_singleton_cause(*directive, spread_mode)
+            explicit_singleton_cause(
+                *directive,
+                spread_mode,
+                *directive == crate::book_composition::PageOverride::Alone
+                    && is_landscape_idx(0, first),
+            )
         } else if !is_pairable_idx(first) {
             SpreadDisplaySingletonCause::NonPairableBoundary
         } else if is_landscape_idx(0, first) {
@@ -16489,7 +16508,14 @@ fn build_spread_display_units_with_overrides(
                 nav[1],
                 overrides
                     .get(&nav[1])
-                    .map(|value| explicit_singleton_cause(*value, spread_mode))
+                    .map(|value| {
+                        explicit_singleton_cause(
+                            *value,
+                            spread_mode,
+                            *value == crate::book_composition::PageOverride::Alone
+                                && is_landscape_idx(1, nav[1]),
+                        )
+                    })
                     .unwrap_or(SpreadDisplaySingletonCause::ForcedAfterCover(side)),
             ));
             pos = 2;
@@ -16569,7 +16595,14 @@ fn build_spread_display_units_with_overrides(
                 nav[body_end],
                 overrides
                     .get(&nav[body_end])
-                    .map(|value| explicit_singleton_cause(*value, spread_mode))
+                    .map(|value| {
+                        explicit_singleton_cause(
+                            *value,
+                            spread_mode,
+                            *value == crate::book_composition::PageOverride::Alone
+                                && is_landscape_idx(body_end, nav[body_end]),
+                        )
+                    })
                     .unwrap_or(SpreadDisplaySingletonCause::ForcedLast(side)),
             ));
         }
@@ -16580,7 +16613,12 @@ fn build_spread_display_units_with_overrides(
     if spread_mode.has_cover() && prefix_end > 0 {
         let first = nav[0];
         let cause = if let Some(directive) = overrides.get(&first) {
-            explicit_singleton_cause(*directive, spread_mode)
+            explicit_singleton_cause(
+                *directive,
+                spread_mode,
+                *directive == crate::book_composition::PageOverride::Alone
+                    && is_landscape_idx(0, first),
+            )
         } else if !is_pairable_idx(first) {
             SpreadDisplaySingletonCause::NonPairableBoundary
         } else if is_landscape_idx(0, first) {
@@ -16901,7 +16939,12 @@ fn append_spread_display_units_until(
             units.push(SpreadDisplayUnit::singleton(
                 *pos,
                 current,
-                explicit_singleton_cause(*directive, spread_mode),
+                explicit_singleton_cause(
+                    *directive,
+                    spread_mode,
+                    *directive == crate::book_composition::PageOverride::Alone
+                        && is_landscape_idx(*pos, current),
+                ),
             ));
             *pos += 1;
             continue;
@@ -18951,11 +18994,29 @@ impl App {
             None,
             crate::settings::PageAloneSettings::default(),
             &overrides,
-            |_, _| false,
+            |_, page| {
+                // No DB read: a facet-excluded shown page uses the same adopted
+                // rotation inputs as the composed navigation builder.
+                let rotation = self
+                    .rotation_cache
+                    .get(&page)
+                    .copied()
+                    .or_else(|| self.prepared_composed_rotation(page))
+                    .unwrap_or(crate::rotation_db::Rotation::None);
+                directive == Some(crate::book_composition::PageOverride::Alone)
+                    && self.page_is_landscape(page, rotation)
+            },
             |_| true,
         );
-        resolve_spread_display_composition(&units, 0, self.spread_mode, false, false, false)
-            .expect("facet singleton contains its anchor")
+        resolve_spread_display_composition(
+            &units,
+            0,
+            self.spread_mode,
+            false,
+            self.spread_singleton_display_endpoint_settings(),
+            false,
+        )
+        .expect("facet singleton contains its anchor")
     }
 
     fn spread_display_composition_for_cached_unit(
@@ -18978,11 +19039,9 @@ impl App {
         .and_then(|composition| composition.with_navigation_anchor(anchor_idx))
     }
 
-    fn spread_display_composition_policy_for_nav(
-        &mut self,
-        nav: &[usize],
-    ) -> (bool, crate::settings::SingletonSpreadEndpointSettings, bool) {
-        let final_cover_enabled = self.final_cover_spread_enabled_for_current_book();
+    fn spread_singleton_display_endpoint_settings(
+        &self,
+    ) -> crate::settings::SingletonSpreadEndpointSettings {
         let mut singleton_placement_enabled =
             self.singleton_spread_placement_enabled_for_current_book();
         // Presentation policy is local to paged composition. Stored book/global
@@ -18991,6 +19050,15 @@ impl App {
             singleton_placement_enabled.first = true;
             singleton_placement_enabled.last = true;
         }
+        singleton_placement_enabled
+    }
+
+    fn spread_display_composition_policy_for_nav(
+        &mut self,
+        nav: &[usize],
+    ) -> (bool, crate::settings::SingletonSpreadEndpointSettings, bool) {
+        let final_cover_enabled = self.final_cover_spread_enabled_for_current_book();
+        let singleton_placement_enabled = self.spread_singleton_display_endpoint_settings();
         let eligible = ((self.spread_mode.has_cover() && final_cover_enabled)
             || singleton_placement_enabled.first
             || singleton_placement_enabled.last

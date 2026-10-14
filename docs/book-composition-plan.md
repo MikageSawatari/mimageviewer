@@ -456,7 +456,8 @@ PageOverride = Alone | BlankOpposite { page_side: Leading | Trailing }
   subsetの表紙位相も通常builderへ揃え、completeでない列を完全な別本へ扱い直さない。
 - hiddenはorderの部分集合。隠れたページのoverrideも保持し再表示時に適用。Missingも指定を消さず別identityへ代用しない。
 - override不在が「自動」。Alone/BlankOppositeは排他的なenum一つ。
-  AloneはNavigation実ページ一枚の中央Singleを作り、直前の未完成Pairを閉じ、次から通常の組を再開する。
+  AloneはNavigation実ページ一枚のSingleを作り、直前の未完成Pairを閉じ、次から通常の組を再開する。
+  縦長のAloneは組み直しの起点として表紙と同じ配置規則を使う（§5.1）。横長の単独は中央を維持する。
   BlankOppositeも同じ境界で、一実ページを指定側へ置き反対側を白くする。
   既定Leading（LTR左/RTL右）、side選択は白紙指定の従属項目。独立した中央/片側指定は作らない。
   coverは先頭roleで扱い、そこにoverrideがあれば基礎配置はoverride優先だが表紙roleは変わらない。
@@ -518,7 +519,7 @@ append_spread_display_units_untilをページ指定の境界入力へ拡張す�
    segmentごとに先頭/末尾規則を繰り返さない。
 3. 指定なしは通常規則。明示境界→自動page_alone→横長/non-pairable→隣接Pairの優先で確定。
    横長に隣接する余りも通常の原因/中央配置。cover自身は先頭Singleを一度だけ作る。
-4. 基礎配置は明示Aloneが中央、BlankOppositeが指定側+白紙。自動after-cover/lastと重複しても一Singleで明示基礎配置を優先。
+4. 基礎配置は明示Aloneが表紙と同じ配置規則、BlankOppositeが指定側+白紙。自動after-cover/lastと重複しても一Singleで明示基礎配置を優先。
    明示境界直前の余りは中央（自然な本の先頭/末尾なら通常endpoint規則）。
    自動page_alone直前の余りは既存ForcedBoundary配置。残りは通常presentation resolverの端/強制単独を適用。
 5. 最後に、通常本と同じ実効final_coverと適格条件で末尾Singleへ表紙を添える。
@@ -551,10 +552,30 @@ Book subsetは残る実列から再生成し、complete限定のendpoint/page_al
 | --- | --- | --- |
 | 通常の端数/横長Single | 共通resolverの通常配置で表紙を添える | 通常の中央/端配置 |
 | 最後の元ページをhidden/Missing/policy除外 | 残りを繰り上げて再生成した真の最後がSingleなら添える。Pairなら添えない | 再生成結果の通常配置 |
-| 末尾にAlone指定 | Navigationは一枚のまま表紙を添える。通常のNavigation-first画面順を使用（LTRは末尾実ページ左/表紙右、RTLは鏡映） | 指定どおり中央Single |
+| 末尾にAlone指定 | Navigationは一枚のまま表紙を添える。通常のNavigation-first画面順を使用（LTRは末尾実ページ左/表紙右、RTLは鏡映） | 表紙と同じ先頭配置規則（横長なら中央） |
 | 末尾にBlankOpposite指定 | 明示指定を優先。指定実ページ側+白紙を保ち、表紙を添えない | 指定実ページ側+白紙 |
 | 自動after-cover/last/ForcedBoundaryによる末尾Single+白紙 | 通常本同様、実ページ側を保ち白紙を表紙へ置換 | 既存強制単独の側+白紙 |
-| 非末尾のAlone/BlankOpposite | 添えない。指定の中央/白紙を維持 | 同じ |
+| 非末尾のAlone/BlankOpposite | 添えない。Aloneの先頭配置規則／指定の白紙を維持 | 同じ |
+
+**2026-10-14 利用者決定: Aloneの配置と白い相方のページめくり**:
+
+- 「本来の側」は読む方向に対して表紙を置く側。LTRは画面右、RTLは画面左。
+  coverなしの構成本でも同じ定義を使い、ページ番号の奇偶や直前の組から推測しない。
+- 縦長Aloneは場所を問わず組み直しの起点。PCのpaged見開きでアニメONならこの側へ配置する。
+  OFFなら既存singleton_spread_first_enabledと本別先頭preferenceの実効値で片側／中央を決める。
+  全体／本別の保存値は変更しない。連結読み／Remoteも同じ共通resolverへ先頭の保存実効値を渡す。
+  Remoteの切詰めcomplete=falseは自動の端判定を外すだけで、取得範囲内の明示Alone指定は取り除かない。
+- 末尾Aloneにも先頭規則を使い、末尾endpoint設定で上書きしない。横長の単独は中央を維持する。
+  final_coverが適格なら添付を先に解決して実2ページのpresentationとなり、既存Navigation-firstの
+  末尾実ページ／添付表紙の左右を使う（LTR実ページ左／表紙右、RTLは鏡映）。単独の側配置は適用しない。
+  明示BlankOppositeは従来どおり白紙と指定側を優先し、末尾表紙を添えない。
+- 保存型や第二の配置ownerは足さない。共通builderの単独形成理由と共通presentation resolverで決める。
+  横長AloneはLandscapeBoundaryとして中央へ通し、指定の保存／組み直し境界は既存overrideに保持する。
+  アニメONの強制は既存local pagedの先頭endpoint入力を使い、通常本にExplicitAloneを生成しない。
+- 明示BlankOpposite／構成なし本の自動強制単独などの白い相方は、普通の見開きと同じく前後にめくる。
+  通常表示と同じWHITEを描画で塗り、白紙のtexture／decode／upload／source要求を作らない。
+  白紙は遮蔽面だが実ページのvisibility／receipt／位置の対象ではない。明示末尾白紙も対象。
+  split等の他のinstant理由は維持する。詳細は[ページめくり §26.21](page-turn-animation-plan.md#2621-aloneの表紙配置と白い相方のページめくり2026-10-14)。
 
 Aloneは実ページ一枚の組を作る指定で、末尾表紙を抑止しない。BlankOppositeは反対側の白紙も明示するので末尾表紙より優先。
 その末尾だけ白紙にしたければBlankOpposite、本全体の自動末尾表紙を使わないなら既存本別preferenceをOffにする。
@@ -582,10 +603,10 @@ PC/editor/連結/Remoteは同じ形成理由で処理し、cache/holdoverもそ�
 | --- | --- |
 | A B C D E、自動 | [A,B] [C,D] Single(E) |
 | B非表示 | [A,C] [D,E] |
-| BにAlone | Single(A) Center(B) [C,D] Single(E) |
+| BにAlone | Single(A) Alone(B:先頭配置規則) [C,D] Single(E) |
 | BにBlankOpposite(Leading) | Single(A) [B,白紙] [C,D] Single(E) |
 | B指定解除 | [A,B] [C,D] Single(E) |
-| B横長、自動 | Single(A) Center(B) [C,D] Single(E) |
+| B横長、自動 | Single(A) Single(B:中央) [C,D] Single(E) |
 
 direction変更は実列/membershipを逆転せず画面左右を鏡映。Singleは同実列、白紙なし。
 Splitは同実列を既存page_split::PresentationStepへ。端末portraitSinglePage/force_single_pageも投影だけ。
@@ -1039,7 +1060,7 @@ UI modal判定だけをRemoteの確定境界とみなさない。現treeの確�
 | 組単位の移動 / 組カードdrag | 消す。派生組に保存identityなし、順序ownerは左だけ |
 | 非表示・表示に戻す | 左だけ残す。右にhidden行/操作なし |
 | 単ページにする | 右の「単独で表示（以降を組み直す）」へ。相方も固定Singleにする旧Pair分割は消す |
-| 中央・片側 | 独立操作は消す。単独指定の基礎配置は中央、白紙指定の側だけ選択。末尾表紙を添える場合の最終配置は§5.1、自動端配置は環境/本別設定 |
+| 中央・片側 | 独立操作は消す。単独指定の基礎配置は表紙と同じ先頭配置規則、白紙指定の側だけ選択。末尾表紙を添える場合の最終配置は§5.1、自動端配置は環境/本別設定 |
 | 白紙の挿入・取り除き | 右の「隣を白紙にする」/「自動」へ。独立白紙の挿入なし |
 | 組ごとの表紙の補助表示 | 手動操作/保存指定は消す。自動の末尾表紙は環境/既存本別設定から結果へ表示 |
 | 元に戻す・やり直す | 残す。一操作一checkpoint、組変化一覧の承認不要 |
@@ -1140,7 +1161,7 @@ Unreadableを構成なしと扱わない。抽出A2は引き続きbinding/shift�
 | Ctrl左右等のSingle/Split branch | 従来の一ページ移動を維持。shift拒否の前に通常navへ分離してhidden許可へ |
 | 読む方向切替、HUD方向/表紙、方向/表紙を含むSpread/Split KeyAction | 引き続きeditorへ案内。recordを第二閲覧値でoverrideせず上部へ集約。editor外の小編集writerを増やさない |
 | 単ページ/見開き/横長分割、連結読み、Remote端末single強制 | 維持。view-mode/flow/orientationだけ、同可視実列/directionを投影。構成writeなし |
-| 先頭/末尾端配置（HUD、本別preference、Remote SetSingletonSpreadEndpointPreference等） | **許可へ変更**。共通presentation resolverの規則でunitsと競合しない。既存spread.db ownerへ保存し当該本の規則/cache更新。明示Alone/BlankOpposite優先 |
+| 先頭/末尾端配置（HUD、本別preference、Remote SetSingletonSpreadEndpointPreference等） | **許可へ変更**。共通presentation resolverの規則でunitsと競合しない。既存spread.db ownerへ保存し当該本の規則/cache更新。Aloneは先頭設定へ追従、BlankOppositeは指定側優先 |
 | 表紙次/最終単独（HUD、FsTogglePageAfterCoverAlone/FsToggleLastPageAlone、Remote SetPageAlonePreference） | **許可へ変更**。共通builderへ既存本別preferenceの実効値を渡す。coverなし/subsetは通常と同じ不適用。明示override優先、record変更なし |
 | 末尾表紙（HUD、Remote SetFinalCoverSpreadPreference） | **許可**。通常本と同じ既存preference ownerへ保存し、実効値/共通presentationを更新。構成record/revisionは変更せず手動の組補助は作らない |
 | Remote SetSpreadのページ構成/方向変更 | direction/coverを書こうとする結合要求は拒否。modeはSetViewModeで維持。order/hidden/overrideのRemote editor/APIは追加しない（PC限定Q6維持） |
@@ -1441,6 +1462,12 @@ metadata bundleは可視一覧選択からの画像exportとは別で、**非表
 
 ## 13. 段階・担当範囲・受入テスト
 
+2026-10-14の追加受入: AloneのLTR／RTL×アニメON／OFF×先頭全体／本別Center・Place・FollowGlobal、
+先頭／途中／末尾、横長／保存回転／末尾表紙on-offを実builder→通常描画→canonicalへ通す。
+白紙は明示Leading／Trailing・末尾白紙・構成なしの自動強制単独に対する前進／後退で、
+白いpaper・素材要求が実ページのみ・実receiptのみ・終端通常表示の一致を確認する。
+splitのinstantと構成なし本のAlone不在の配置は維持。UI snapshotは実paintとめくり途中の白い面を検査する。
+
 ### B1: 設計改訂のみ（採択済み）
 
 成果物は本書とhtdocs/mimageviewer/manual/books.html。製品コード/DB/実行時設定は変更しない。
@@ -1624,6 +1651,20 @@ test-fullは利用者の「前のmerge分と合わせて1回」に従い、上�
 `target/editor-modal-build-dev.log`）。実行前にcore／Remoteが未起動であることを確認し、
 稼働中coreを停止しない設定を使った。
 アプリ起動・git add／commitは行わない。
+
+#### Alone配置・白い相方の追加決定（2026-10-14、86b06c232からの未コミット差分）
+
+Q28／Q29を最初に§4.2／§5.1／§8／§9.1／§13とページめくり§26.21へ反映し、その後実装した。
+組の保存型を変更せず、共通builder／resolverと既存Blank materialへ集約した。
+横長Aloneの中央、末尾表紙の二枚化優先、明示白紙の添付抑止、split等のinstantを維持する。
+facet外で表示中のAloneも同じ実効先頭設定／採用済み回転入力を使う。UIでDB読取を追加しない。
+限定独立静的レビューは指摘なし。fmt／通常・portable check／glyph、page_turn 211／構成212、
+通常UI snapshot 177／editor11は成功。白い紙の新規PNG4枚を目視済み。
+検証の正本とログ・投影面積の検査前提は[ページめくり§26.21](page-turn-animation-plan.md#2621-aloneの表紙配置と白い相方のページめくり2026-10-14)へ集約する。
+この差分のtest-fullは一回exit101（editor snapshotのnative異常終了）。本体13,174成功／0失敗／59既存ignored、
+失敗targetは同一バイナリ直列11件成功、未実行vendor4も成功で補完した。全体scriptのPASSとは記録しない。
+build-devは起動中core6プロセスを-PreserveRuntimeで保護して中断（exit1）。exeは未更新、アプリ起動／停止・git add／commitなし。
+詳細と利用者のclose後のbuild／隔離確認手順は上記§26.21へ。過去のmerge／B2検証と区別し、実機確認は未完了。
 
 ### 旧G段階の実装・採択・検証履歴
 
@@ -2233,8 +2274,10 @@ Q25/Q26は利用者の新しい回答ではなく、今回伝達された設計�
 設計担当が「表紙の隣の空き側へ写しを薄く出す」と誤説明した経緯があり、正しい末尾添付の説明後、利用者がQ20を決め直した。
 
 **明示決定と設計判断の区別**: §9.1のshift/binding制限維持と自動端/単独許可、
-白紙側Leading/Trailing、明示Alone中央、先頭可視ページを表紙とする扱い、Q16結果列の例外、
-保存着地説明/解除確認を残す判断はB1で理由を付けた設計案。末尾表紙の通常規則適用は訂正後Q20の明示決定。
+白紙側Leading/Trailing、先頭可視ページを表紙とする扱い、Q16結果列の例外、
+保存着地説明/解除確認を残す判断はB1で理由を付けた設計案。
+明示Alone中央はB1での設計判断だったが、2026-10-14のQ28により表紙の配置規則へ置換した。
+末尾表紙の通常規則適用は訂正後Q20の明示決定。
 利用者が個別採択済みとは書かない。Q18〜Q24は今回の明示指示の記録。
 
 独立レビューの主要論点は共通境界走査の優先順位/余りの配置、値ownerで分ける操作資格、
@@ -2251,3 +2294,13 @@ shift/direction/coverのeditor外変更も許す意図があれば実装前に�
 | Q27 確認UI | 解除のインライン確認は気づきにくいため、編集画面に重なる確認モーダルにする。説明＋解除する／キャンセル、IME helper経由のEnter／Esc、背面操作不可。他の追加確認も棚卸しし、統一しないものは理由を記録。小画面100%／200%を検査 | §8・manual・snapshot／geometry回帰 |
 
 利用者の「軽く確認した範囲では良さそう、挙動も分かりやすくなった」は部分的な実機観測であり、全受入条件の実機確認完了とは扱わない。
+
+### 2026-10-14 Aloneと白紙の実機観測・利用者決定
+
+| # | 利用者の決定 | 反映先 |
+| --- | --- | --- |
+| Q28 Aloneの配置 | 途中のAloneがアニメONでも中央になる観測。Aloneは組み直しの起点なので表紙と同じ規則へ。アニメONは本来の側（LTR右／RTL左）、OFFは先頭単ページの全体／本別実効設定へ追従。横長の単独は中央。末尾表紙の適格時は既存実2頁presentation | §4.2／§5.1／§8／§9.1／§13、ページめくり§26.21、manual |
+| Q29 白い相方のページめくり | 明示白紙でアニメが出ない観測。白い側を通常の白紙と同色の紙として描画し普通の見開きと同じくめくる。構成なしの自動白紙と末尾明示白紙も対象。新texture／decodeなし。split等のinstantは維持 | §5.1／§13、ページめくり§26.21、manual |
+
+この改訂は86b06c232の独立ACCEPTと部分的な利用者実機確認後の追加決定。
+まれなI/O失敗の復旧機構・新保存値・別の提示許可ownerは足さない。

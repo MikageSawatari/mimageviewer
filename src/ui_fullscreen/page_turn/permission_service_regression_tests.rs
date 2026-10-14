@@ -41,7 +41,7 @@ fn book_fixture(
         }
     };
     if composed {
-        // Explicit centered first singleton followed by an automatic pair:
+        // Explicit Alone first singleton followed by an automatic pair:
         // exercise common-builder ownership and immediate permission admission.
         let mut book = BookComposition::new(
             if mode.is_rtl() {

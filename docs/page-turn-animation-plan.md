@@ -2775,7 +2775,8 @@ indexのUUは設計担当のgit addまで残す。今回の解消方針・確認
 navのimmutable Arc、unit位置索引、近傍画像unitだけを訪れるmasterの先読みを保持する。
 Single／Splitはページ指定でpairへ変えず、一頁ごとの通常topologyを使う。
 
-共通builderのExplicitAloneは通常resolverの中央配置をcanonical正本にする。
+共通builderのExplicitAloneは通常resolverの配置をcanonical正本にする。
+中央固定は§26.21の利用者決定で置換し、表紙と同じ先頭配置規則を使う。
 先頭のAloneをAutomaticの表紙と推定せず、AutomaticのUnpairedSlotには従来の
 Navigation／anchor／cover側配置の証明を要求する。任意の後方表紙PageRefは新形式にはなく、
 表紙on時の表紙は並べ替え・非表示適用後の先頭実ページである。
@@ -2828,3 +2829,94 @@ core生成日時は2026-10-14 17:47:52、329,547,776 bytes、FileVersion 4.6.0.0
 起動中だったこのworktreeのcore 6プロセスは停止していない。
 ビルド直前の再確認では起動中core／Remoteなし。ビルドは`-PreserveRuntime`で停止を禁止する。
 競合マーカーは除去済み。indexのUUは設計担当がgit addするまで残る。
+
+### 26.21 Aloneの表紙配置と白い相方のページめくり（2026-10-14）
+
+利用者の実機観測: 本の途中のAloneはONでも中央、BlankOppositeでは瞬時切替。
+以下は利用者の明示決定であり、§26.3／§26.4／§26.6／§26.7に記録したwhiteの拒否と
+§26.20のAlone中央固定を置換する。これらの過去の検証結果は履歴として保持する。
+
+**Alone**: 組み直しの起点を表紙（先頭の単ページ）と同じ性質として配置する。
+本来の側はLTRなら画面右、RTLなら画面左。cover on/offや途中の位置から別の側を推測しない。
+local paged見開きのアニメONでは既存§26.2の実効first=trueを共通resolverへ渡す。
+OFFではsingleton_spread_first_enabledと本別先頭preferenceの実効値に従い、保存値は変更しない。
+先頭・途中・末尾の縦長Aloneすべて同じ。末尾endpointでは上書きしない。横長単独は中央。
+末尾表紙が適格で添付されれば既存Navigation-firstの実2頁presentationを優先し、単独配置では扱わない。
+明示Aloneの由来をAutomaticのUnpairedSlot／表紙証明へ混ぜず、共通builderの形成理由を使う。
+横長AloneはLandscapeBoundaryの中央経路へ通す。通常本にはAlone指定がなく配置の挙動を変えない。
+連結／Remoteは保存済みの先頭実効設定を使い、アニメONのlocal強制は従来どおり適用しない。
+
+**白い相方**: BlankOpposite／自動after-cover・last・forced-boundaryの白面は
+普通の見開きと同じ物理paperとして前後にめくる。末尾の明示白紙も含める。
+通常paintと同じColor32::WHITEをPageMaterial::Blankで塗り、既存default texture／WHITE_UVを使う。
+白紙用のtexture／decode／upload／source request／navigation indexを生成しない。
+現行canonical_unitはすでに白い面をoccurrence=NoneのBlankとして投影しているので、この一経路を採用する。
+stage_one_shape_reasonの白紙一律拒否を撤去し、白紙つきspreadが実Navigation一枚／補助表紙なしで
+通常の白rectを持つことを同じ入出両方の検証で確認する。白紙は紙として遮蔽するがvisibility／receiptを作らない。
+Flat・curlの着地・終端通常表示は同じ白rect／clip／colorを使い、黒いVacantとの区別を維持する。
+末尾明示白紙のfinal cover抑止は変更しない。split_same_source_step／split_partial_leaf等の
+他のinstant理由、素材が未完成のときの通常提示契約、許可・完成素材・兄弟contextの所有も変更しない。
+
+新しいworker／queue／stateは不要。通常resolverの配置と既存のBlank materialへ集約し、
+別の「白紙アニメ」分岐や専用素材を作らない。まれな失敗は既定方針で扱い、復旧の状態機械を足さない。
+
+回帰: Aloneの中央／片側×LTR／RTL×ON／OFF（全体／本別、先頭／途中／末尾、横長、添付表紙）、
+明示白紙のLeading／Trailing×LTR／RTL×前進／後退と末尾、構成なし本の白い相方、
+白いmaterial／UV・遮蔽・実頁だけのreceipt・終端paint一致、trim後のclipを検査する。
+実handlerと共通builderの回帰、白い紙の中間pose snapshot、通常UI snapshot、fmt／通常・portable check、
+関連テスト／test-full一回／build-devで検証し、エージェントはアプリ起動・停止・commitを行わない。
+
+#### 追加決定の実装と焦点検証（86b06c232からの未コミット差分）
+
+共通builderの五つのoverride受付で横長AloneをLandscapeBoundaryへ通し、
+共通resolverでは末尾表紙の二枚化を先に解決してから、残るExplicitAloneへ先頭配置を適用した。
+local pagedの実効endpoint入力を一つのhelperへ集約し、facet外の表示中Aloneも同じ入力を使う。
+そのページの横長判定はcache／worker採用済みのidentity別回転と既知寸法だけを使い、DBを読まない。
+whiteの入出・保持画像・matching検証を同じ形資格へ通し、通常paintとcanonicalの白clipを一致させた。
+productionのmesh／shade／visibility rendererは変更せず、既存Blank materialを採用する。
+限定独立静的レビューは指摘なし。自動検証ownerは実装担当。
+
+| 焦点gate | 結果／ログ（target/alone-white-） |
+| --- | --- |
+| fmt／通常・portable core check／glyph | exit 0、危険glyph 0件。fmt.log、check.log、check-portable.log、glyph.log |
+| Alone全体／本別・facet外 | 設定matrix 1、採用済み回転／facet外1成功。related-alone.log、related-facet.log |
+| 実builder→paint→canonical／白紙前後進 | merge_master 6成功。明示白紙はLTR／RTL・表紙on/off・両側・先頭／末尾・両方向、素材とreceiptは実頁だけ。related-merge.log |
+| 白紙の投影／自動白紙／trim clip | 3成功。投影は8shape×4route×97phase、WHITE_UV・実occurrenceのみ・終端面積の一致を検査。related-white.log |
+| 関連広域 | page_turn 211、本の構成212成功。related-page-turn.log、related-composition.log |
+| 白い紙のsnapshot | 4routeの新規PNG4枚成功、目視済み。終端を通常primitiveへ置換した画像との完全一致も確認。snapshot-update.log、通常比較はrelated-page-turn.log |
+| 通常UI／editor snapshot | 177／11成功、既存PNG変更なし。ui-snapshots.log、editor-snapshots.log |
+
+新規dense testで当初置いた「可視面積はcanonical面積以下」は、遠近投影で拡大する到着leafには
+成立しないと確認した。後退pose0.8125では194814.3125対194400となり、既存逆方向leaf回帰と同じ
+投影面積を使う必要があった。検査を投影surface／leaf印刷域以下へ修正し、重複計上・白紙のreceipt混入・
+終端一致の検査を維持した。renderer本体を緩めていない。証跡はvisibility-diagnostic.log。
+
+#### 全体gateと確認用build（今回差分、2026-10-14）
+
+`test-full.ps1 -SuppressCrashDialogs`をjobs1／threads4で一回実行し、exit 101。
+本体は13,174成功／0失敗／59既存ignored、その他workspace targetも成功した。
+唯一の失敗targetはeditor snapshot。最後の200%確認／Blockedケース中にプロセスが
+0xc0000005（STATUS_ACCESS_VIOLATION）で異常終了し、Rust assertion失敗は記録されなかった。
+初回の異常終了の原因は未確定であり、全体scriptをPASSとは扱わない。full.log／full.exit。
+
+同じfeatureのtargetをthreads1で補完し11件成功（full-editor-supplement.log）。
+feature解決を含め初回と同一であることを確かめるため、失敗した同一バイナリ
+`book_composition_editor_snapshots-16a4793e4faef824.exe`もthreads1／process-local WER抑止で
+直接実行し11件成功、exit 0（full-editor-exact.log／full-editor-exact.exit）。
+PNG更新・製品コード変更で異常終了を回避したものではない。全体scriptの再実行はしていない。
+workspace失敗で未実行だったvendor4をscriptと同じ引数で補完し、
+egui25／egui-winit29／egui-wgpu11／eframe18が成功（vendor-*.log）。
+初回と補完を合わせ、要求された全gate targetの成功結果を揃えた。並列実行時の異常終了記録は保持する。
+
+確認用buildは`build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0`を実行し、exit 1。
+このworktreeのdev-runtime coreが6プロセス起動中で、PID3932のguardで停止防止のため中断した。
+アプリ起動・停止、ランタイムexeの更新、git add／commitは行っていない。build-dev.log／build-dev.exit。
+前のコメントの未起動報告はプロセス出力の確認不足だったため訂正し、JSONで稼働を確認した。
+現在のdev-runtimeはこの差分の検証用binaryではない。
+
+利用者が確認用coreを閉じた後、`scripts/build-dev.ps1 -PreserveRuntime`でビルドし、
+隔離`--data-dir G:\miv-iso\book\data`で起動して`G:\miv-iso\media`のbook_zip.zip／book_pdf.pdfを確認する。
+先頭設定を中央にしたAloneをONでLTR右／RTL左、OFFで中央へ戻す。先頭設定を片側へ変えたOFF、
+横長の中央も確認する。明示白紙の前後進／末尾白紙、構成なしの表紙次／最終単独の白面も同じくめくる。
+自動末尾白面を見る場合は末尾表紙をOFFにする。明示末尾白面は末尾表紙ONでも表紙を添えない。
+引数なしのnormal coreは実APPDATAを使うので、通常起動時はinstalled／常駐版を閉じ、実設定／データの更新に注意する。

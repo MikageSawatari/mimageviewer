@@ -699,25 +699,46 @@ fn page_turn_two_page_book_reuses_cover_texture_without_reusing_occurrence() {
 }
 
 #[test]
-fn page_turn_white_forced_last_companion_remains_rejected() {
+fn page_turn_white_automatic_companions_turn_both_ways_without_real_blank_pages() {
     for mode in [SpreadMode::LtrCover, SpreadMode::RtlCover] {
-        let ctx = egui::Context::default();
-        let mut app = book(&ctx, mode, 11, false, false, false);
-        app.settings.last_page_alone_enabled = true;
-        let tail = app.spread_display_composition_for_anchor(10);
-        assert!(tail.singleton_placement().has_white_companion());
-        assert_eq!(
-            tail.pages_in_reading_order(),
-            &[SpreadPageOccurrence::navigation(10, 10)]
-        );
-        navigate(
-            &ctx,
-            &mut app,
-            10,
-            8,
-            false,
-            BoundaryDiagnosis::OutgoingAdmission("stage1_cover_or_single_companion"),
-        );
+        for after_cover in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = book(&ctx, mode, 11, false, false, false);
+            app.settings.last_page_alone_enabled = !after_cover;
+            app.settings.page_after_cover_alone_enabled = after_cover;
+            let anchor = if after_cover { 1 } else { 10 };
+            let neighbor = if after_cover { 2 } else { 8 };
+            let tail = app.spread_display_composition_for_anchor(anchor);
+            assert!(tail.singleton_placement().has_white_companion());
+            assert_eq!(
+                tail.pages_in_reading_order(),
+                &[SpreadPageOccurrence::navigation(anchor, anchor)]
+            );
+            let white = capture(&ctx, &mut app, anchor);
+            let canonical = canonical_unit(&white).unwrap();
+            assert_eq!(
+                canonical
+                    .pages
+                    .iter()
+                    .filter(|p| p.occurrence.is_some())
+                    .count(),
+                1
+            );
+            assert_eq!(canonical.pages.iter().filter(|p| matches!(p.material, crate::page_turn_animation::PageMaterial::Blank { color } if color == egui::Color32::WHITE)).count(), 1);
+            for (from, to) in [(neighbor, anchor), (anchor, neighbor)] {
+                navigate(
+                    &ctx,
+                    &mut app,
+                    from,
+                    to,
+                    to > from,
+                    BoundaryDiagnosis::Ready,
+                );
+            }
+            let finished_white = capture(&ctx, &mut app, anchor);
+            assert_eq!(finished_white.white, white.white);
+            assert_eq!(finished_white.pages.len(), 1);
+        }
     }
 }
 

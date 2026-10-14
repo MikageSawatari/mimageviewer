@@ -2356,3 +2356,140 @@ fn temporary_viewing_ignore_does_not_bypass_selected_output_visibility() {
     assert!(!item.composition_check.unwrap().permits().unwrap());
     owner.shutdown_and_join();
 }
+
+#[test]
+fn book_composition_alone_uses_first_preference_everywhere_and_keeps_landscape_centered() {
+    use crate::settings::{
+        SingletonSpreadEndpointPreferences, SingletonSpreadPlacementPreference as Pref,
+    };
+    for direction in [CompositionDirection::Ltr, CompositionDirection::Rtl] {
+        let side = if direction == CompositionDirection::Ltr {
+            SingletonSpreadPlacement::Right
+        } else {
+            SingletonSpreadPlacement::Left
+        };
+        for cover in [false, true] {
+            for at in [0, 1, 3] {
+                let mut app =
+                    composed_app(&specified_book(direction, PageOverride::Alone, at, cover));
+                app.settings.final_cover_spread_enabled = false;
+                for landscape in [false, true] {
+                    app.rotation_cache
+                        .insert(at as usize, crate::rotation_db::Rotation::None);
+                    app.record_page_dims_for_spread(
+                        at as usize,
+                        if landscape { (1440, 960) } else { (960, 1440) },
+                    );
+                    for flow in [ReadingFlow::Paged, ReadingFlow::Vertical] {
+                        app.reading_flow = flow;
+                        for animation in [false, true] {
+                            app.settings.page_turn_animation_enabled = animation;
+                            for global in [false, true] {
+                                app.settings.singleton_spread_first_enabled = global;
+                                // Contradict the first setting to prove tail Alone
+                                // does not accidentally inherit the last endpoint.
+                                app.settings.singleton_spread_last_enabled = !global;
+                                for preference in [Pref::FollowGlobal, Pref::Place, Pref::Center] {
+                                    let saved = SingletonSpreadEndpointPreferences {
+                                        first: preference,
+                                        last: Pref::Place,
+                                    };
+                                    app.singleton_spread_endpoint_preferences = saved;
+                                    let composition =
+                                        app.spread_display_composition_for_anchor(at as usize);
+                                    let expected = if !landscape
+                                        && ((animation && flow.is_paged())
+                                            || preference.effective(global))
+                                    {
+                                        side
+                                    } else {
+                                        SingletonSpreadPlacement::Center
+                                    };
+                                    assert_eq!(
+                                        composition.singleton_placement(),
+                                        expected,
+                                        "{direction:?}/{cover}/{at}/{landscape}/{flow:?}/{animation}/{global}/{preference:?}"
+                                    );
+                                    assert_eq!(composition.navigation_pages(), vec![at as usize]);
+                                    assert_eq!(composition.pages_in_reading_order().len(), 1);
+                                    assert_eq!(app.singleton_spread_endpoint_preferences, saved);
+                                    assert_eq!(app.settings.singleton_spread_first_enabled, global);
+                                    assert_eq!(app.settings.singleton_spread_last_enabled, !global);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn book_composition_facet_excluded_alone_keeps_first_policy_and_prepared_rotation() {
+    use crate::rotation_db::Rotation;
+    for direction in [CompositionDirection::Ltr, CompositionDirection::Rtl] {
+        let mut app = composed_app(&specified_book(direction, PageOverride::Alone, 1, true));
+        // This pure fixture bypasses the projection worker. Supply the same
+        // complete identity-keyed rotation input that worker adoption installs.
+        let rotations = (0..app.items.len())
+            .map(|idx| (app.page_path_key(idx).unwrap(), Rotation::None))
+            .collect();
+        let crate::app::book_composition_runtime::ViewerBookComposition::Accepted {
+            layout: CompositionProjectionOutcome::Composed(projection),
+            ..
+        } = &mut app.book_composition
+        else {
+            panic!("composed fixture");
+        };
+        Arc::make_mut(projection).prepared_rotations = Arc::new(rotations);
+        app.settings.singleton_spread_first_enabled = false;
+        app.settings.singleton_spread_last_enabled = true;
+        app.settings.final_cover_spread_enabled = true;
+        app.settings.page_turn_animation_enabled = true;
+        app.record_page_dims_for_spread(1, (960, 1440));
+        app.visible_indices = vec![0, 2, 3];
+        app.details_order = app.visible_indices.clone();
+        app.viewer_navigation_caches.invalidate();
+        let side = if direction == CompositionDirection::Ltr {
+            SingletonSpreadPlacement::Right
+        } else {
+            SingletonSpreadPlacement::Left
+        };
+        let outside = app.spread_display_composition_for_anchor(1);
+        assert_eq!(outside.singleton_placement(), side);
+        assert_eq!(outside.navigation_pages(), vec![1]);
+        assert_eq!(
+            outside.pages_in_reading_order().len(),
+            1,
+            "no excluded cover or neighbor"
+        );
+        app.settings.page_turn_animation_enabled = false;
+        assert_eq!(
+            app.spread_display_composition_for_anchor(1)
+                .singleton_placement(),
+            SingletonSpreadPlacement::Center
+        );
+        app.settings.page_turn_animation_enabled = true;
+        // Cold index memo must still use the worker-prepared rotation of the
+        // shown page. There is no UI rotation DB or neighbor demand here.
+        app.update_prepared_composed_rotation(1, Rotation::Cw90);
+        assert_eq!(app.prepared_composed_rotation(1), Some(Rotation::Cw90));
+        app.rotation_cache.clear();
+        assert_eq!(
+            app.spread_display_composition_for_anchor(1)
+                .singleton_placement(),
+            SingletonSpreadPlacement::Center
+        );
+        app.reading_flow = ReadingFlow::Vertical;
+        app.settings.singleton_spread_first_enabled = true;
+        app.fullscreen_idx = Some(1);
+        let (units, at) = app.continuous_reading_units_and_pos(1).unwrap();
+        assert_eq!(units[at].anchor_idx, 1);
+        assert_eq!(
+            units[at].singleton_placement,
+            SingletonSpreadPlacement::Center
+        );
+        assert_eq!(units[at].presentation.len(), 1);
+    }
+}

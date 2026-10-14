@@ -129,8 +129,12 @@ fn page_turn_merge_master_explicit_singletons_project_without_automatic_cover_pr
                 assert_eq!(
                     app.spread_display_composition_for_anchor(0)
                         .singleton_placement(),
-                    SingletonSpreadPlacement::Center,
-                    "animation endpoint policy must preserve explicit Alone"
+                    if direction == CompositionDirection::Ltr {
+                        SingletonSpreadPlacement::Right
+                    } else {
+                        SingletonSpreadPlacement::Left
+                    },
+                    "explicit Alone uses the effective first endpoint policy"
                 );
                 assert_eq!(pair.layout[1].pages, vec![1, 2]);
                 let canonical = canonical_unit(&first).unwrap_or_else(|reason| {
@@ -143,7 +147,7 @@ fn page_turn_merge_master_explicit_singletons_project_without_automatic_cover_pr
                     .unwrap();
                 assert_eq!(
                     actual.rect, first.pages[0].transform.paint_rect,
-                    "the common resolver's central placement is authoritative"
+                    "the common resolver's placement is authoritative"
                 );
                 for (outgoing, incoming, forward) in [(&first, &pair, true), (&pair, &first, false)]
                 {
@@ -290,6 +294,86 @@ fn page_turn_merge_master_cached_incoming_requires_every_presentation_permission
 }
 
 #[test]
+fn page_turn_merge_master_alone_first_middle_last_follow_one_endpoint_policy() {
+    for direction in [CompositionDirection::Ltr, CompositionDirection::Rtl] {
+        for cover in [false, true] {
+            for animation in [false, true] {
+                let mut book =
+                    BookComposition::new(direction, (0..4).map(fixtures::document_page).collect());
+                book.cover_enabled = cover;
+                book.page_overrides = [0, 2, 3]
+                    .into_iter()
+                    .map(|idx| PageOverrideEntry {
+                        page: fixtures::document_page(idx),
+                        directive: PageOverride::Alone,
+                    })
+                    .collect();
+                let ctx = egui::Context::default();
+                install(&ctx);
+                let mut app = composed_app(&ctx, &book, 4);
+                app.spread_mode = match (direction, cover) {
+                    (CompositionDirection::Ltr, false) => SpreadMode::Ltr,
+                    (CompositionDirection::Ltr, true) => SpreadMode::LtrCover,
+                    (CompositionDirection::Rtl, false) => SpreadMode::Rtl,
+                    (CompositionDirection::Rtl, true) => SpreadMode::RtlCover,
+                };
+                app.settings.page_turn_animation_enabled = animation;
+                app.settings.singleton_spread_first_enabled = false;
+                app.settings.singleton_spread_last_enabled = true;
+                app.settings.final_cover_spread_enabled = false;
+                app.singleton_spread_endpoint_preferences = Default::default();
+                let side = if !animation {
+                    SingletonSpreadPlacement::Center
+                } else if direction == CompositionDirection::Ltr {
+                    SingletonSpreadPlacement::Right
+                } else {
+                    SingletonSpreadPlacement::Left
+                };
+                for anchor in [0, 2, 3] {
+                    let composition = app.spread_display_composition_for_anchor(anchor);
+                    assert_eq!(
+                        composition.singleton_placement(),
+                        side,
+                        "{direction:?}/cover={cover}/animation={animation}/anchor={anchor}"
+                    );
+                    if animation {
+                        let unit = capture_composed_flat(&ctx, &mut app, anchor);
+                        let canonical = canonical_unit(&unit).unwrap();
+                        assert_eq!(
+                            canonical.layout,
+                            crate::page_turn_animation::UnitLayout::Spread
+                        );
+                        let actual = canonical
+                            .pages
+                            .iter()
+                            .find(|p| p.occurrence.is_some())
+                            .unwrap();
+                        assert_eq!(actual.rect, unit.pages[0].transform.paint_rect);
+                        assert_eq!(
+                            canonical
+                                .pages
+                                .iter()
+                                .filter(|p| p.occurrence.is_some())
+                                .count(),
+                            1
+                        );
+                    } else {
+                        app.fullscreen_idx = Some(anchor);
+                        frame(&ctx, |ui, ctx| {
+                            let (_, sources) = draw_current(&mut app, ui, ctx);
+                            assert_eq!(sources.pages.len(), 1);
+                            assert!(
+                                matches!(&sources.submission, FsDisplayUnitSubmission::Paged(receipt) if !receipt.curl)
+                            );
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn page_turn_merge_master_shared_builder_controls_presentation_and_prefetch() {
     for direction in [CompositionDirection::Ltr, CompositionDirection::Rtl] {
         for directive in [
@@ -351,7 +435,13 @@ fn page_turn_merge_master_shared_builder_controls_presentation_and_prefetch() {
                     assert_eq!(
                         app.spread_display_composition_for_anchor(0)
                             .singleton_placement(),
-                        SingletonSpreadPlacement::Center,
+                        if !animation {
+                            SingletonSpreadPlacement::Center
+                        } else if direction == CompositionDirection::Ltr {
+                            SingletonSpreadPlacement::Right
+                        } else {
+                            SingletonSpreadPlacement::Left
+                        },
                     );
                 }
                 app.settings.page_turn_animation_enabled = true;
@@ -372,7 +462,16 @@ fn page_turn_merge_master_shared_builder_controls_presentation_and_prefetch() {
                         }
                     );
                 } else {
-                    assert_eq!(tail.singleton_placement(), SingletonSpreadPlacement::Center);
+                    assert_eq!(
+                        tail.singleton_placement(),
+                        if supplemented {
+                            SingletonSpreadPlacement::Center
+                        } else if direction == CompositionDirection::Ltr {
+                            SingletonSpreadPlacement::Right
+                        } else {
+                            SingletonSpreadPlacement::Left
+                        }
+                    );
                 }
                 assert_eq!(
                     tail.pages_in_reading_order().len(),
@@ -454,7 +553,7 @@ fn page_turn_merge_master_shared_builder_controls_presentation_and_prefetch() {
 }
 
 #[test]
-fn page_turn_merge_master_explicit_blank_paints_and_navigates_without_curl() {
+fn page_turn_merge_master_explicit_blank_turns_both_ways_with_only_real_receipts() {
     let _serial = crate::key_input::lock_test_input();
     for direction in [CompositionDirection::Ltr, CompositionDirection::Rtl] {
         for cover in [false, true] {
@@ -517,28 +616,44 @@ fn page_turn_merge_master_explicit_blank_paints_and_navigates_without_curl() {
                             ordinal: 0,
                         };
                         frame(&ctx, |ui, ctx| {
+                            app.begin_page_turn_viewer_frame(ctx, false, None);
                             app.page_turn_external_operation(
                                 ctx,
                                 operation,
                                 OperationPhase::Press,
                                 "merge",
                             );
-                            app.offer_page_turn_with_operation(
+                            app.handle_fs_navigation_with_operation(
                                 ctx,
-                                target,
-                                target > from,
+                                false,
+                                false,
+                                None,
+                                None,
+                                None,
+                                FsPageNav::Target(target),
+                                None,
+                                from,
                                 Some(operation),
                             );
-                            assert!(!matches!(
+                            assert!(matches!(
                                 app.page_turn_presentation.state,
                                 PresentationState::Offered { .. }
                             ));
-                            app.fullscreen_idx = Some(target);
+                            assert_eq!(app.fullscreen_idx, Some(target));
                             let (composition, sources) = draw_current(&mut app, ui, ctx);
-                            assert!(matches!(
-                                &sources.submission,
-                                FsDisplayUnitSubmission::Paged(receipt) if !receipt.curl
-                            ));
+                            let FsDisplayUnitSubmission::Paged(receipt) = &sources.submission
+                            else {
+                                panic!("paged white companion submission");
+                            };
+                            assert!(receipt.curl);
+                            assert_eq!(receipt.pages().len(), sources.pages.len());
+                            assert!(receipt.pages().iter().all(|(occurrence, _, _, _)| {
+                                occurrence.role == SpreadPageRole::Navigation
+                            }));
+                            if target == blank_idx {
+                                assert_eq!(sources.pages.len(), 1);
+                                assert_eq!(sources.pages[0].occurrence.idx, blank_idx);
+                            }
                             app.emit_fs_page_turn_ready_for_display_unit(
                                 ctx,
                                 &composition,
@@ -546,19 +661,72 @@ fn page_turn_merge_master_explicit_blank_paints_and_navigates_without_curl() {
                                 &sources,
                             );
                         });
+                        let PresentationState::Turning {
+                            incoming,
+                            offer,
+                            projection,
+                            ..
+                        } = &mut app.page_turn_presentation.state
+                        else {
+                            panic!("explicit white must turn");
+                        };
+                        assert_eq!(offer.forward, target > from);
+                        assert_eq!(offer.ready_sources.0.len(), incoming.pages.len());
+                        let white_canonical = if target == blank_idx {
+                            &projection.incoming
+                        } else {
+                            &projection.outgoing
+                        };
+                        let paper = white_canonical
+                            .pages
+                            .iter()
+                            .find(|p| p.occurrence.is_none())
+                            .unwrap();
+                        assert!(
+                            matches!(paper.material, crate::page_turn_animation::PageMaterial::Blank { color } if color == egui::Color32::WHITE)
+                        );
+                        let tracker = offer.submission.clone();
+                        assert_eq!(tracker.status(), SubmissionStatus::Started);
+                        offer.accepted_at -= offer.duration + Duration::from_millis(1);
+                        frame(&ctx, |ui, ctx| {
+                            app.begin_page_turn_viewer_frame(ctx, false, None);
+                            let (composition, sources) = draw_current(&mut app, ui, ctx);
+                            let FsDisplayUnitSubmission::Paged(receipt) = &sources.submission
+                            else {
+                                panic!("canonical white companion completion");
+                            };
+                            assert!(!receipt.curl);
+                            assert_eq!(receipt.pages().len(), sources.pages.len());
+                            assert!(receipt.pages().iter().all(|(_, _, _, area)| *area > 0.0));
+                            let decision = app.fs_page_turn_decision_for_frame(ctx, target);
+                            app.emit_fs_page_turn_ready_for_display_unit(
+                                ctx,
+                                &composition,
+                                decision,
+                                &sources,
+                            );
+                        });
+                        assert_eq!(tracker.status(), SubmissionStatus::Finished);
                         let events = take_test_events();
                         assert!(
                             events.iter().any(|(fact, kind, reason)| {
                                 fact.operation_id == operation
-                                    && *kind == "skip"
-                                    && *reason == "stage1_cover_or_single_companion"
+                                    && *kind == "start"
+                                    && *reason == "curl_submitted"
                             }),
                             "{direction:?}/cover={cover}/{page_side:?}/{from}->{target}: {events:?}"
                         );
-                        assert!(matches!(
-                            app.page_turn_presentation.state,
-                            PresentationState::Flat(_)
-                        ));
+                        assert!(
+                            !events
+                                .iter()
+                                .any(|(fact, kind, _)| fact.operation_id == operation
+                                    && matches!(*kind, "skip" | "cancel"))
+                        );
+                        let completed = capture_composed_flat(&ctx, &mut app, target);
+                        assert_eq!(completed.white.is_some(), target == blank_idx);
+                        if target == blank_idx {
+                            assert_eq!(completed.white, blank.white);
+                        }
                         assert_eq!(app.fullscreen_idx, Some(target));
                     }
                 }

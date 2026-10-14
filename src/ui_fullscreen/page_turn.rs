@@ -2590,7 +2590,10 @@ fn stage_one_shape_reason(
         });
     if mode.is_split() {
         Some("stage1_split_step")
-    } else if white || (cover_count != 0 && !cover_pair) {
+    } else if (white
+        && !(mode.is_spread() && real_pages == 1 && navigation_count == 1 && cover_count == 0))
+        || (cover_count != 0 && !cover_pair)
+    {
         Some("stage1_cover_or_single_companion")
     } else if !(1..=2).contains(&real_pages) {
         Some("invalid_actual_page_count")
@@ -2765,7 +2768,11 @@ fn canonical_unit(
         pages.push(CanonicalPage {
             occurrence: None,
             rect,
-            clip_rect,
+            // Match the ordinary white paint's effective scissor. The stored
+            // companion clip alone need not include the UI painter's clip.
+            clip_rect: clip_rect
+                .intersect(unit.pages[0].painter.clip_rect())
+                .intersect(unit.pages[0].transform.viewport_rect),
             material: PageMaterial::Blank {
                 color: egui::Color32::WHITE,
             },
@@ -2815,7 +2822,7 @@ fn canonical_unit(
                     SingletonSpreadPlacement::Right
                 };
                 // The common builder owns formation and the normal resolver owns
-                // placement. An explicit Alone stays centered even at the front;
+                // placement. Explicit Alone has its own first-endpoint policy;
                 // only an automatically formed cover needs this side proof.
                 // A raw cover index can also be a supplement or a shifted unit.
                 // Only the builder's real first unpaired Navigation leaf on its
@@ -3023,6 +3030,85 @@ mod tests {
             evidence: AcceptanceEvidence::Immediate,
             content: Vec::new(),
         })
+    }
+
+    #[test]
+    fn page_turn_white_canonical_uses_normal_trim_scissor_without_a_resource_or_receipt() {
+        use crate::displayed_image_transform::*;
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "white-trim-resource",
+            egui::ColorImage::filled([32, 32], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let mut painted = unit(&ctx, texture, 1);
+        let bytes = painted.retained_bytes();
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(80.0, 32.0));
+        let trim_clip = egui::Rect::from_min_max(egui::pos2(0.0, 2.0), egui::pos2(80.0, 30.0));
+        let white_rect = egui::Rect::from_min_size(egui::pos2(40.0, 0.0), egui::vec2(32.0, 32.0));
+        let actual = Arc::get_mut(&mut painted).unwrap();
+        actual.mode = SpreadMode::Ltr;
+        let real_rect = actual.pages[0].transform.paint_rect;
+        actual.pages[0].transform = DisplayedImageTransform::from_resolved_rect(
+            DisplayedImageTransformInput {
+                page_idx: 0,
+                viewport_rect: viewport,
+                source_size: real_rect.size(),
+                texture_size: real_rect.size(),
+                rotation: crate::rotation_db::Rotation::None,
+                free_rotation_rad: 0.0,
+                content_bbox: None,
+                fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
+                fit_scale_limits: FullscreenFitScaleLimits::default(),
+                pixels_per_point: 1.0,
+                placement: ResolvedDisplayPlacement::SingletonSpread {
+                    side: SingletonSpreadPlacement::LeftWhite,
+                    gap: 8.0,
+                    zoom_pan: None,
+                },
+                pixel_fit: RectPixelFit::Texels,
+            },
+            real_rect,
+        )
+        .unwrap();
+        actual.pages[0].painter = ctx.debug_painter().with_clip_rect(trim_clip);
+        actual.pages[0].spine = Some((36.0, 8.0));
+        actual.white = Some((white_rect, viewport.expand(10.0)));
+        let canonical = canonical_unit(&painted).unwrap();
+        assert_eq!(painted.retained_bytes(), bytes, "white holds no resource");
+        assert_eq!(canonical.pages.len(), 2);
+        assert_eq!(canonical.pages[0].rect, real_rect);
+        assert_eq!(canonical.spine_x, Some(36.0));
+        assert!(
+            canonical
+                .pages
+                .iter()
+                .all(|page| page.clip_rect == trim_clip)
+        );
+        assert_eq!(canonical.pages[1].rect, white_rect);
+        assert!(canonical.pages[1].occurrence.is_none());
+        let proof = flat_receipt(destination(1), &ctx, &painted.pages, false);
+        assert_eq!(proof.pages().len(), 1, "white has no presentation receipt");
+        for forward in [false, true] {
+            let direction = crate::page_turn_animation::TurnDirection {
+                reading_rtl: false,
+                forward,
+            };
+            let recipe =
+                crate::page_turn_animation::prepare_turn(&canonical, &canonical, direction)
+                    .unwrap();
+            let projected = crate::page_turn_animation::project_prepared(
+                &canonical, &canonical, direction, recipe, 0.5, false,
+            )
+            .unwrap();
+            assert_eq!(projected.visibility.incoming.len(), 1);
+            assert!(
+                projected
+                    .meshes
+                    .iter()
+                    .all(|draw| draw.clip_rect == trim_clip)
+            );
+        }
     }
 
     #[test]
@@ -3877,7 +3963,19 @@ mod tests {
         );
         assert_eq!(
             stage_one_shape_reason(SpreadMode::Ltr, [navigation(1)], true),
+            None
+        );
+        assert_eq!(
+            stage_one_shape_reason(SpreadMode::Single, [navigation(1)], true),
             Some("stage1_cover_or_single_companion")
+        );
+        assert_eq!(
+            stage_one_shape_reason(SpreadMode::Ltr, [navigation(1), navigation(2)], true),
+            Some("stage1_cover_or_single_companion")
+        );
+        assert_eq!(
+            stage_one_shape_reason(SpreadMode::SplitRtl, [navigation(1)], true),
+            Some("stage1_split_step")
         );
     }
 
